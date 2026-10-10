@@ -340,7 +340,7 @@ static bool weights_layer_has_required(const pulsar_layer_weights *l, uint32_t i
         return false;
     }
     /* 0731: a hash-routed layer without its table cannot route at all. */
-    if (il < PULSAR_N_HASH_LAYER && !l->ffn_gate_tid2eid) return false;
+    if (pulsar_layer_source(il) < PULSAR_N_HASH_LAYER && !l->ffn_gate_tid2eid) return false;
 
     const pulsar_layer_attn *a = pulsar_layer_attn_layout(il);
     if (pulsar_attn_owns_kv(a->mode) &&
@@ -559,6 +559,7 @@ static bool pulsar_shape_matches_metadata(
 
 
 static void pulsar_select_shape_from_metadata(
+        bool layer_subset,
         uint32_t n_layer,
         uint32_t n_embd,
         uint32_t n_vocab,
@@ -589,8 +590,10 @@ static void pulsar_select_shape_from_metadata(
     static const pulsar_shape *const profiles[] = { &PULSAR_SHAPE_V4, &PULSAR_SHAPE_V41 };
 
     for (size_t i = 0; i < sizeof(profiles) / sizeof(profiles[0]); i++) {
+        /* a layer-subset fixture (pulsar.fixture.source_layers) is identified by the
+         * other fields; its block count is checked against its map instead */
         if (pulsar_shape_matches_metadata(profiles[i],
-                                       n_layer, n_embd, n_vocab, n_head, n_head_kv,
+                                       layer_subset ? profiles[i]->n_layer : n_layer, n_embd, n_vocab, n_head, n_head_kv,
                                        n_head_dim, n_value_dim, n_rot, n_lora_q,
                                        n_lora_o, n_out_group, n_expert,
                                        n_expert_used, n_ff_exp, n_expert_shared,
@@ -863,8 +866,23 @@ void config_validate_model(const pulsar_model *m) {
     const uint32_t n_indexer_top_k = required_u32(m, "deepseek4.attention.indexer.top_k");
     const uint32_t n_hc = required_u32(m, "deepseek4.hyper_connection.count");
     const uint32_t n_hc_sinkhorn_iter = required_u32(m, "deepseek4.hyper_connection.sinkhorn_iterations");
+    /* L269 W2: a layer-subset fixture names the profile layers it keeps (model_layout.cpp) */
+    uint32_t fixture_src[PULSAR_MAX_LAYER];
+    uint32_t n_fixture = 0;
+    pulsar_array_ref fixture_probe;
+    if (model_get_array(m, "pulsar.fixture.source_layers", &fixture_probe)) {
+        n_fixture = model_read_u32_array(m, "pulsar.fixture.source_layers", fixture_src, PULSAR_MAX_LAYER);
+        if (pulsar_load_refusals()) return;
+        if (n_fixture != n_layer) {
+            fprintf(stderr, "pulsar: pulsar.fixture.source_layers names %u layers, block_count is %u -- refusing\n",
+                    n_fixture, n_layer);
+            pulsar_load_refuse();
+            return;
+        }
+    }
 
-    pulsar_select_shape_from_metadata(n_layer,
+    pulsar_select_shape_from_metadata(n_fixture != 0,
+                                   n_layer,
                                    n_embd,
                                    n_vocab,
                                    n_head,
@@ -886,6 +904,10 @@ void config_validate_model(const pulsar_model *m) {
                                    n_hc,
                                    n_hc_sinkhorn_iter);
     if (pulsar_load_refusals()) return;   /* L272: no shape was selected -- nothing below can be checked */
+    if (!pulsar_layer_subset_install(fixture_src, n_fixture)) {
+        pulsar_load_refuse();
+        return;
+    }
 
     config_expect_u32("embedding_length",            n_embd,         PULSAR_N_EMBD);
     config_expect_u32("vocab_size",                  n_vocab,        PULSAR_N_VOCAB);
@@ -1299,7 +1321,7 @@ static void weights_bind_layer(pulsar_layer_weights *l, const pulsar_model *m, u
     /* 0731's leading layers route by token id.  Required exactly on the hash
      * layers and REFUSED on any other, so an artifact cannot carry a table that
      * would silently replace the gate's routing. */
-    if (il < PULSAR_N_HASH_LAYER) {
+    if (pulsar_layer_source(il) < PULSAR_N_HASH_LAYER) {
         l->ffn_gate_tid2eid = required_tensorf(m, "blk.%u.ffn_gate_tid2eid.weight", il);
     } else {
         char tid_name[128];
@@ -1589,7 +1611,16 @@ bool vision_weights_bind(pulsar_vision_weights *w, const pulsar_model *m) {
     w->image_start   = required_tensor(m, "image_start");
     w->image_end     = required_tensor(m, "image_end");
     w->image_newline = required_tensor(m, "image_newline");
-    w->image_pad     = required_tensor(m, "image_pad");
+    /* The pad row exists only in the padded span (pulsar_shape::image_span_padded):
+     * V4.1's checkpoint has none, and an artifact carrying one there is not V4.1's. */
+    if (g_pulsar_shape.image_span_padded) {
+        w->image_pad = required_tensor(m, "image_pad");
+    } else if (model_find_tensor(m, "image_pad")) {
+        fprintf(stderr, "pulsar: the %s tower carries image_pad, which its image span has no slot for -- refusing\n",
+                PULSAR_MODEL_SHAPE_NAME);
+        pulsar_load_refuse();
+        return false;
+    }
 
     for (uint32_t li = 0; li < PULSAR_VISION_LAYERS; li++) {
         w->block[li].norm1     = required_tensorf(m, "vision.blocks.%u.norm1.weight", li);
@@ -1613,7 +1644,7 @@ bool vision_weights_bind(pulsar_vision_weights *w, const pulsar_model *m) {
     tensor_expect_f32_or_bf16(w->image_start, 1, T, 0, 0);
     tensor_expect_f32_or_bf16(w->image_end, 1, T, 0, 0);
     tensor_expect_f32_or_bf16(w->image_newline, 1, T, 0, 0);
-    tensor_expect_f32_or_bf16(w->image_pad, 1, T, 0, 0);
+    if (w->image_pad) tensor_expect_f32_or_bf16(w->image_pad, 1, T, 0, 0);
 
     for (uint32_t li = 0; li < PULSAR_VISION_LAYERS; li++) {
         tensor_expect_f32_or_bf16(w->block[li].norm1, 1, D, 0, 0);

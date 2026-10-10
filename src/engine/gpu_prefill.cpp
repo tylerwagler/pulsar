@@ -406,6 +406,19 @@ static bool gpu_graph_comp_ape_fold(
  * boundary, batched from there.
  * A zero-prefix chunk is the aligned run at row 0.  comp_counts[t] receives
  * the compressed rows visible to row t after its own emit, (pos+1)/ratio. */
+/* The latent's bf16 plane, reserved for the compressor kernel to write beside its f32 rows (rule 3: the producer
+ * emits).  Its one consumer is V4.1's index-key projection -- `indexer.wk`, a bf16 Linear in the reference and a bf16
+ * tensor in the container -- whose GEMM reads the bf16 plane and refuses a buffer no producer emitted (L159).  0731's
+ * indexer compresses its own key and reads no latent, so nothing is reserved there; nor for a batch that closes no
+ * group.  true with *out NULL = nothing to emit. */
+static bool csa2_latent_bf16_slot(const pulsar_gpu_tensor *latent, uint32_t n_rows, void **out) {
+    *out = NULL;
+    if (g_pulsar_shape.indexer_own_compressor || n_rows == 0) return true;
+    if (pulsar_gpu_bf16_act_slot(latent, n_rows, PULSAR_N_HEAD_DIM, out)) return true;
+    fprintf(stderr, "pulsar: compressor latent: no bf16 slot for %u rows -- refusing\n", n_rows);
+    return false;
+}
+
 static bool gpu_graph_csa2_produce(
         pulsar_gpu_graph           *g,
         const pulsar_model         *model,
@@ -508,12 +521,15 @@ static bool gpu_graph_csa2_produce(
             ok = false;
         }
         if (ok) ok = gpu_graph_comp_ape_fold(model, layer, sc, comp_width, ratio, rpos0, n);
-        if (ok) ok = pulsar_gpu_csa2_compressor_prefill_tensor(g->attn_comp_stage, kv, sc,
+        void *latent_b = NULL;
+        if (ok) ok = csa2_latent_bf16_slot(g->attn_comp_stage, n_groups, &latent_b);
+        if (ok) ok = pulsar_gpu_csa2_compressor_prefill_tensor(g->attn_comp_stage, latent_b, kv, sc,
                                                                st_kv, st_sc, tensor_map_base(model, layer->attn_compressor_norm), tensor_map_size(model, layer->attn_compressor_norm),
                                                                layer->attn_compressor_norm->abs_offset,
                                                                layer->attn_compressor_norm->type,
                                                                PULSAR_N_HEAD_DIM, ratio, rpos0, n,
                                                                PULSAR_RMS_EPS) != 0;
+        if (ok && latent_b) pulsar_gpu_bf16_act_note(g->attn_comp_stage, n_groups, PULSAR_N_HEAD_DIM);
         /* The indexer's own compression, before emit_rows: it needs this batch's
          * index projections and writes the index pool emit_rows would otherwise
          * fill from the latent -- and unlike the comp row it has no latent of its
@@ -567,12 +583,15 @@ static bool gpu_graph_csa2_produce(
                 ok = false;
             }
             if (ok) ok = gpu_graph_comp_ape_fold(model, layer, sc_view, comp_width, ratio, pos, 1u);
+            void *latent_b = NULL;
+            if (ok) ok = csa2_latent_bf16_slot(latent_row, 1u, &latent_b);
             ok = ok && kv_view && sc_view && latent_row && (!has_state || (st_kv && st_sc)) &&
-                 pulsar_gpu_csa2_compressor_update_tensor(latent_row, kv_view, sc_view, st_kv, st_sc,
+                 pulsar_gpu_csa2_compressor_update_tensor(latent_row, latent_b, kv_view, sc_view, st_kv, st_sc,
                                                           tensor_map_base(model, layer->attn_compressor_norm), tensor_map_size(model, layer->attn_compressor_norm),
                                                           layer->attn_compressor_norm->abs_offset,
                                                           layer->attn_compressor_norm->type,
                                                           PULSAR_N_HEAD_DIM, ratio, pos, PULSAR_RMS_EPS, &emitted) != 0;
+            if (ok && latent_b && emitted) pulsar_gpu_bf16_act_note(latent_row, 1u, PULSAR_N_HEAD_DIM);
             /* The indexer's own compressor walks the SAME rows on the same schedule:
              * it stores this token whether or not the group closes, and its frontier
              * IS the attention compressor's (one emit, one row -- the scorer reads
@@ -3025,7 +3044,11 @@ bool gpu_graph_encode_layer_batch(
         uint32_t                il,
         uint32_t                pos0,
         uint32_t                n_tokens) {
-    bool ok = true;
+    /* ENGRAM (V4.1 blocks 1 and 14, L242 slice 5): the reference adds the
+     * n-gram lookup into the HC copies BEFORE the anchor capture and the block
+     * (Transformer.forward), so the block's mixes and the drafter's anchor both
+     * see the gated stream.  No Engram on this block: a no-op. */
+    bool ok = gpu_graph_engram_apply(g, model, layer, il, n_tokens);
     /* DRAFTER ANCHORS: the reference appends `h.mean(dim=2)` for its target
      * layers at exactly one point in a layer, and the point is NOT the same in
      * both profiles.  V4.1 (Transformer.forward) appends BEFORE `h = layer(h)`,
@@ -3040,7 +3063,7 @@ bool gpu_graph_encode_layer_batch(
      * every batch position at the anchor layers, so the last-accepted position's
      * hidden is available without a replay decode. Off (0) during prefill and
      * plain decode. */
-    if (!g_pulsar_shape.dspark_anchor_after) ok = dspark_capture_anchors(g, il, n_tokens);
+    if (ok && !g_pulsar_shape.dspark_anchor_after) ok = dspark_capture_anchors(g, il, n_tokens);
     if (ok) ok = gpu_graph_encode_layer_attention_batch(g, model, layer, il, pos0, n_tokens);
     if (!ok) {
         fprintf(stderr, "pulsar: gpu layer %u attention batch encode failed\n", il);
@@ -3167,7 +3190,7 @@ bool gpu_graph_dspark_compressor_rollforward(
                      * exactly that: the compressed row for the group at positions
                      * 28..31 came out ~80% off dev's while every one of its raw
                      * projections was bit-exact (L218 s121). */
-                    pulsar_gpu_csa2_compressor_update_tensor(latent_row, kv_view, sc_view,
+                    pulsar_gpu_csa2_compressor_update_tensor(latent_row, NULL, kv_view, sc_view,
                             g->layer_attn_state_kv[il], g->layer_attn_state_score[il],
                             tensor_map_base(model, weights->layer[il].attn_compressor_norm), tensor_map_size(model, weights->layer[il].attn_compressor_norm),
                             weights->layer[il].attn_compressor_norm->abs_offset,

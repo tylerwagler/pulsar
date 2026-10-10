@@ -5,6 +5,8 @@
                                                      #  is generated from policy.py + the EXL3 source)
     plan    --hf DIR [--exl3 DIR] [--exl3-experts DIR] [--tessera DIR] [--recipe JSON] [--dump FILE]
     emit    ... --out DIR (--shard S | --all) [--mxfp8-scale rederive|verbatim]
+            DeepSeek: [--layers L,L,...] a layer-subset test fixture (names.py drop rule 4);
+                      [--engram-layout JSON] V4.1's Engram hash layout (tools/engram/engram_layout.py)
     verify  ... --out DIR (--shard S | --all)        # against the HF SOURCE
     audit   --out DIR                                # structure + index closed both ways
 
@@ -338,8 +340,12 @@ def context(args):
     rec = R.Recipe.load(args.recipe, fam.SETTINGS) if args.recipe else None
     if rec is not None and fam.SETTINGS:
         fam.check_recipe(rec)
+    keep = [int(x) for x in args.layers.split(',')] if args.layers else None
+    if (keep or args.engram_layout) and fam is not D:
+        raise SystemExit('--layers / --engram-layout: DeepSeek options (a layer-subset fixture, the Engram hash layout)')
     ctx = argparse.Namespace(sources=sources, recipe=rec, mxfp8_mode=args.mxfp8_scale,
-                             tokenizer_dir=args.tokenizer or args.hf, reap_map=args.reap_map, ple_rows=args.ple_rows)
+                             tokenizer_dir=args.tokenizer or args.hf, reap_map=args.reap_map, ple_rows=args.ple_rows,
+                             keep_layers=keep, engram_layout=args.engram_layout)
     return hf, fam, ctx
 
 
@@ -581,6 +587,10 @@ def main():
             p.add_argument('--tokenizer', metavar='DIR', help='tokenizer files (default: the HF dir)')
             p.add_argument('--reap-map', metavar='JSON')
             p.add_argument('--ple-rows', metavar='MANIFEST', help='qwen4_exp: the PLE row file manifest (ple_rows.py build)')
+            p.add_argument('--layers', metavar='L,L,...', help='DeepSeek: a LAYER-SUBSET FIXTURE keeping these source '
+                           'layers (renumbered densely; names.py drop rule 4, kv.py pulsar.fixture.source_layers)')
+            p.add_argument('--engram-layout', metavar='JSON', help='DeepSeek V4.1: the Engram hash layout '
+                           '(tools/engram/engram_layout.py) carried in the kv block with the row-table names')
         if name == 'plan':
             p.add_argument('--dump', metavar='FILE', help='write every shard\'s exact header and every entry\'s source '
                            'descriptor (no payload bytes): two plans that dump the same write the same bytes')

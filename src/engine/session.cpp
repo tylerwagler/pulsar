@@ -328,6 +328,8 @@ bool pulsar_ds4_family_load(pulsar_engine *e, const pulsar_engine_options *opt) 
     }
     weights_bind(&e->weights, &e->model);
     if (!ds4_load_stage_ok("the weights")) return false;
+    /* L242 slice 5: V4.1's Engram layers (layout, row tables, wkv / q / k) */
+    if (!engram_bind(&e->weights, &e->model, opt->model_path)) return false;
     /* the drafter binds before the inspect-only exit so --inspect proves the
      * whole artifact binds, drafter included */
     if (!opt->dspark_disable && model_find_tensor(&e->model, "dspark.main_proj.weight")) {
@@ -350,7 +352,14 @@ bool pulsar_ds4_family_load(pulsar_engine *e, const pulsar_engine_options *opt) 
      * vision_ready false; the image path is refused until it is true. */
     const bool vision = vision_weights_bind(&e->vision_weights, &e->model);
     if (!ds4_load_stage_ok("the vision tower")) return false;
-    if (vision) {
+    if (vision && !g_pulsar_shape.image_span_padded) {
+        /* V4.1 (L269 W2): the tower is bound and validated, but the image span it feeds -- reading-order rows, no
+         * pads, the type-tagged placeholder and its own resize limits -- is not the one vision.cpp builds, so the
+         * image path stays refused (vision_ready false: a request with an image gets the sync / front 400). */
+        fprintf(stderr, "pulsar: %s vision tower bound (%u blocks, dim %u); its image span layout is not implemented "
+                        "-- images are refused\n", PULSAR_MODEL_SHAPE_NAME, e->vision_weights.n_layers,
+                (unsigned)PULSAR_VISION_DIM);
+    } else if (vision) {
         e->vision_ready = true;
         fprintf(stderr, "pulsar: Vision-Exp tower bound (%u blocks, dim %u, %u heads, inter %u, "
                 "patch %u, aligner %ux%d -> %u)\n",
@@ -496,6 +505,8 @@ bool pulsar_ds4_family_after_gpu(pulsar_engine *e) {
         }
     }
 
+    /* the Engram gate weights (q*k), device-resident (L242 slice 5) */
+    if (!engram_upload(&e->weights, &e->model)) return false;
     /* the rank's attention output groups (one GPU: all of them); the slices are the core's plan (L272 P4b) */
     return ds4_tp_groups(e);
 }
@@ -954,6 +965,7 @@ void pulsar_engine::destroy() {
         e->tp_bulk_dev = NULL;
         e->tp_bulk_bytes = 0;
     }
+    engram_model_free(&e->weights);
     weights_free(&e->weights);
     pulsar_tp_plan_free(e);   /* the rank's built slices, before the device goes */
     if (e->qwen_weights) pulsar_qwen_s4_unload(e->qwen_weights);

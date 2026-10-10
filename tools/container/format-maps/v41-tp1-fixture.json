@@ -1,0 +1,100 @@
+{
+ "schema": "pulsar.recipe.v1",
+ "recipe": "v41-tp1-fixture",
+ "model_type": "deepseek_v41",
+ "about": "L269 W2: the one-Spark V4.1 bring-up fixture -- source layers 1,2,3,14,20,21,24 (build.py --layers), the FP4 source experts as cutlass_mxfp4 everywhere but layer 20, whose routed experts are our own EXL3 K3 (/mnt/models/v41-exl3-ours-est/l20/exl3-k3, --exl3).  Everything else in its source dtype's layout.",
+ "rows": [
+  {
+   "role": "dense",
+   "format": "mxfp8_lt"
+  },
+  {
+   "role": "embed",
+   "format": "native"
+  },
+  {
+   "role": "expert_down",
+   "block": "layers",
+   "layers": [
+    "1-3",
+    14,
+    21,
+    24
+   ],
+   "format": "cutlass_mxfp4"
+  },
+  {
+   "role": "expert_down",
+   "block": "layers",
+   "layers": [
+    20
+   ],
+   "format": "exl3m_k3",
+   "source": "exl3"
+  },
+  {
+   "role": "expert_gate",
+   "block": "layers",
+   "layers": [
+    "1-3",
+    14,
+    21,
+    24
+   ],
+   "format": "cutlass_mxfp4"
+  },
+  {
+   "role": "expert_gate",
+   "block": "layers",
+   "layers": [
+    20
+   ],
+   "format": "exl3m_k3",
+   "source": "exl3"
+  },
+  {
+   "role": "expert_up",
+   "block": "layers",
+   "layers": [
+    "1-3",
+    14,
+    21,
+    24
+   ],
+   "format": "cutlass_mxfp4"
+  },
+  {
+   "role": "expert_up",
+   "block": "layers",
+   "layers": [
+    20
+   ],
+   "format": "exl3m_k3",
+   "source": "exl3"
+  },
+  {
+   "role": "head",
+   "format": "native"
+  },
+  {
+   "role": "norm",
+   "format": "native"
+  },
+  {
+   "role": "other",
+   "format": "native"
+  },
+  {
+   "role": "router",
+   "format": "native"
+  },
+  {
+   "role": "shared_expert",
+   "format": "mxfp8_lt"
+  },
+  {
+   "role": "vision",
+   "format": "native"
+  }
+ ]
+}

@@ -103,6 +103,7 @@ static bool ds4_sync_state_agrees(pulsar_session *s) {
  * goes too (other banks hold other slots' positions; a reset here says nothing about them). */
 static bool ds4_sync_reset_bank(pulsar_session *s) {
     if (!gpu_graph_reset_prefill_state(s->graph)) return false;
+    gpu_graph_engram_forget(s->graph, gpu_graph_cur_bank(s->graph));
     s->mseq_dirty = false;
     return true;
 }

@@ -930,7 +930,7 @@ int pulsar_gpu_indexer_compressor_prefill_tensor(
      * two chunks pooled the wrong rows. */
     if (!pulsar_gpu_csa2_comp_ape_add_tensor(sc, model_map, model_size, ape_offset, ape_type,
                                              width, ratio, pos0, n_tokens)) return 0;
-    if (!pulsar_gpu_csa2_compressor_prefill_tensor(latent, kv, sc, state_kv, state_score,
+    if (!pulsar_gpu_csa2_compressor_prefill_tensor(latent, NULL, kv, sc, state_kv, state_score,
                                                    model_map, model_size, norm_offset, norm_type,
                                                    head_dim, ratio, pos0, n_tokens, rms_eps)) return 0;
     if (n_groups == 0u) return 1;   /* a remainder-only batch produces no row */
@@ -1001,7 +1001,7 @@ int pulsar_gpu_indexer_compressor_update_tensor(
      * batch, which is what makes the two paths write the same lane. */
     if (ratio > 1u && !pulsar_gpu_csa2_comp_ape_add_tensor(sc, model_map, model_size, ape_offset, ape_type,
                                                           width, ratio, pos, 1u)) return 0;
-    if (!pulsar_gpu_csa2_compressor_update_tensor(latent, kv, sc, state_kv, state_score,
+    if (!pulsar_gpu_csa2_compressor_update_tensor(latent, NULL, kv, sc, state_kv, state_score,
                                                   model_map, model_size, norm_offset, norm_type,
                                                   head_dim, ratio, pos, rms_eps, emitted)) return 0;
     if (!*emitted) return 1;

@@ -1659,6 +1659,7 @@ int pulsar_gpu_csa2_comp_ape_add_tensor(
  * that group's latent (sets *emitted).  At ratio 1 every position emits. */
 int pulsar_gpu_csa2_compressor_prefill_tensor(
         pulsar_gpu_tensor       *latent,       /* [n_tokens / ratio][head_dim] f32 out */
+        void                    *latent_b,     /* the rows' bf16 plane (pulsar_gpu_bf16_act_slot), or NULL */
         const pulsar_gpu_tensor *kv,
         const pulsar_gpu_tensor *sc,           /* ignored at ratio 1 */
         pulsar_gpu_tensor       *state_kv,     /* NULL at ratio 1 */
@@ -1675,6 +1676,7 @@ int pulsar_gpu_csa2_compressor_prefill_tensor(
 
 int pulsar_gpu_csa2_compressor_update_tensor(
         pulsar_gpu_tensor       *latent,       /* [1][head_dim] f32 out, written only when *emitted */
+        void                    *latent_b,     /* its bf16 plane, or NULL (written with it) */
         const pulsar_gpu_tensor *kv_cur,
         const pulsar_gpu_tensor *sc_cur,
         pulsar_gpu_tensor       *state_kv,

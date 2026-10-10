@@ -362,6 +362,14 @@ typedef struct {
      * HC swap (0731).  Getting this wrong feeds the drafter a structurally
      * different hidden (measured 20-64% off) and walks its proposals off dev. */
     bool dspark_anchor_after;
+    /** The image span this profile's tower feeds.  True (Vision-Exp, the V4
+     * profile): compressor-aligned pads, the N-layout and a learned image_pad row
+     * (vision.cpp vision_build_image_block) -- the one layout the image path
+     * implements.  False (V4.1): reading-order rows, no pad tensor, and its own
+     * preprocessing limits (inference/image_processor.py: 1024 tokens, 544^2
+     * minimum pixels, no aspect cap) -- the tower binds and is validated without
+     * image_pad, and the image path is refused until that layout exists. */
+    bool image_span_padded;
     /** The KV row family (see pulsar_kv_row_style).  Every row-geometry
      * question goes through pulsar_kv_row_bytes(), which reads this -- so no
      * caller names a format and the geometry cannot disagree with the packer. */
@@ -411,8 +419,9 @@ static inline uint32_t pulsar_comp_state_rows(uint32_t ratio) {
  * of FP8 tables that are DISK-RESIDENT BY DESIGN: per layer an `embed`
  * [384M, 256] fp8 with a [384M, 8] scale plane, a `wkv` [25600, 6144] fp8 and
  * `q_weight`/`k_weight` [4, 5120] bf16.  That is far too large to bind into the
- * 121 GiB the box has, so those tables are NOT in the GGUF artifact today (the
- * V4.1 build skipped them) and a V4.1 forward currently runs WITHOUT Engram.
+ * 121 GiB the box has, so the tables are side files beside the container (the
+ * `wkv` / q / k ride in it under their HF names), opened by engram_bind and read
+ * per step (L242 slice 5, below); a V4.1 artifact without them refuses to load.
  *
  * What makes a table this size viable at all is that its ADDRESSES ARE KNOWN
  * BEFORE THE FORWARD: the hash below depends only on token ids, so the rows a
@@ -537,6 +546,33 @@ pulsar_engram_gather *pulsar_engram_gather_start(pulsar_engram_io *io, const pul
                                                  unsigned char *dst);
 /** Block until the gather is complete; frees the handle.  1 = every row read. */
 int  pulsar_engram_gather_wait(pulsar_engram_gather *g);
+
+/** ---- Engram on the DeepSeek forward (L242 slice 5; L269 W2) ------------------
+ *
+ * The reference (inference/model.py Transformer.forward) runs, before block i's
+ * own forward and before the drafter's anchor capture, for every Engram layer:
+ *     h = engram(h, hashes[:, :, layer_hash_index], mask)
+ * hashes from the n-gram of COMPRESSED ids ending at each position (engram.py
+ * NgramHashState).  Here: the artifact carries the hash layout and names the row
+ * tables (tools/container/kv.py; deepseek4.engram.*), engram_bind opens them at
+ * load; every forward stages its rows' hashes and starts the gathers before the
+ * first layer (gpu_graph_engram_stage), and the Engram layer waits on its gather
+ * and runs rows -> MX slot -> `wkv` -> gate + add on the HC copies
+ * (gpu_graph_engram_apply), all in engram_forward.cpp.  The device path is slices 3-4's, gated by
+ * cuda-engram-gate. */
+typedef struct pulsar_engram_model {
+    uint32_t n_layers;                               ///< Engram layers in this artifact (V4.1: 2; a fixture may keep fewer)
+    uint32_t block[PULSAR_ENGRAM_MAX_LAYERS];        ///< the block each serves (the artifact's index)
+    pulsar_engram_layout layout;                     ///< the hash, over the arrays below (owned)
+    int32_t *token_map;
+    int64_t *multipliers;
+    uint32_t *primes;
+    uint64_t *offsets;
+    uint64_t num_embeddings[PULSAR_ENGRAM_MAX_LAYERS];
+    pulsar_engram_table table[PULSAR_ENGRAM_MAX_LAYERS];
+    pulsar_engram_io *io;                            ///< the pread pool every table's gathers go through
+    pulsar_gpu_tensor *qk[PULSAR_ENGRAM_MAX_LAYERS]; ///< f32 [n_hc][dim]: q_weight * k_weight, resident
+} pulsar_engram_model;
 
 /** IQ2_XXS weight block: 2-bit quants addressed through a shared codebook.
  *
@@ -830,6 +866,11 @@ typedef struct {
     pulsar_tensor *ffn_gate_shexp;   ///< SHARED expert gate projection (runs for every token)
     pulsar_tensor *ffn_up_shexp;     ///< shared expert up projection
     pulsar_tensor *ffn_down_shexp;   ///< shared expert down projection
+    /** Engram (V4.1 layers 1 and 14; engram_bind): the `wkv` projection of the
+     * gathered rows (mxfp8_lt [24*256 -> (n_hc+1)*dim]) and the layer's slot in
+     * pulsar_engram_model.  NULL on every other layer and on drafter blocks. */
+    pulsar_tensor *engram_wkv;
+    uint32_t engram_slot;
 } pulsar_layer_weights;
 
 /** Every weight tensor of the target model: the per-layer stacks plus the
@@ -848,7 +889,21 @@ typedef struct {
     pulsar_tensor *output_hc_scale;  ///< head mix row scale
     pulsar_tensor *output_hc_base;   ///< head mix per-stream bias
     pulsar_layer_weights layer[PULSAR_MAX_LAYER];  ///< per-layer weight stacks
+    /** Engram's tables, layout and pool (engram_bind); NULL for a model with no
+     * Engram layer.  Owned: engram_model_free. */
+    pulsar_engram_model *engram;
 } pulsar_weights;
+
+/** Open the artifact's Engram layers (deepseek4.engram.*): the hash layout, the
+ * row tables beside the container (`model_path` names it), the `wkv` / q / k
+ * tensors bound into `w->layer[block]` and `w->engram`.  An artifact that
+ * declares Engram layers but carries no layout or no table refuses -- V4.1
+ * without Engram is not the model.  No Engram layers -> w->engram stays NULL and
+ * the forward is unchanged.  Returns false with the reason printed. */
+bool engram_bind(pulsar_weights *w, const pulsar_model *m, const char *model_path);
+/** The device half of engram_bind (the q*k products), once the GPU is up. */
+bool engram_upload(pulsar_weights *w, const pulsar_model *m);
+void engram_model_free(pulsar_weights *w);
 
 /** DSpark drafter weights: the small model that proposes tokens for the target
  * to verify. Shipped inside the same GGUF as `dspark.*` tensors, so a drafter
@@ -1575,7 +1630,54 @@ typedef struct {
      * beside `tp` (see pulsar_engine::tp_group_lo).  The attention block runs
      * its heads, its grouped 'a' projection and its `low` gather on it. */
     uint32_t tp_group_lo, tp_group_hi;
+    /** Engram (L242 slice 5, engram_forward.cpp): the step's staged hashes and gathers,
+     * the device scratch the Engram layer runs in, and the token history the
+     * hashes read.  Allocated only when the weights carry Engram layers.
+     *
+     * The history is a per-bank RING of the last PULSAR_ENGRAM_RING positions'
+     * token ids, each tagged with its position: every row a forward stages writes
+     * its token at its position (a prefill also writes the three positions before
+     * its chunk from the prompt, which is authoritative), and a row's n-gram reads
+     * the three positions before it BY TAG -- a tag that does not match (a bank
+     * restored past the ring, a first row that is not where its bank's history
+     * ends) refuses the step rather than hash a stale token.  Rejected drafts leave
+     * their tokens at positions the next committed row overwrites before any row
+     * reads them, so a rewind needs no undo. */
+    struct {
+        const pulsar_engram_model *model;    ///< borrowed from the weights; NULL = no Engram
+        pulsar_gpu_tensor *rows;             ///< [cap][24][264] the gathered records, uploaded per layer
+        pulsar_gpu_tensor *x_key;            ///< f32 [cap][24*256]: the MX slot's key (never written)
+        pulsar_gpu_tensor *kv;               ///< f32 [cap][(n_hc+1)*dim]: the `wkv` output
+        unsigned char *host_rows[PULSAR_ENGRAM_MAX_LAYERS];   ///< [cap][24][264] gather targets
+        uint64_t *ids[PULSAR_ENGRAM_MAX_LAYERS];              ///< [cap][24] the staged row ids
+        pulsar_engram_gather *pending[PULSAR_ENGRAM_MAX_LAYERS];
+        uint32_t pending_n;                  ///< rows of the staged step (0 = none)
+        uint32_t cap, n_banks;
+        int32_t *ring_tok;                   ///< [n_banks][PULSAR_ENGRAM_RING]
+        uint32_t *ring_pos;                  ///< [n_banks][PULSAR_ENGRAM_RING], UINT32_MAX = empty
+    } engram;
 } pulsar_gpu_graph;
+
+/** Positions of token history each bank's Engram ring keeps (a power of two
+ * past the deepest rewind a staged step reads across: a verify block). */
+#define PULSAR_ENGRAM_RING 64u
+/** Stage the Engram hashes of a step's rows and start their gathers: row r is
+ * token tok[r] at position pos[r] of bank bank[r] (NULL bank = the graph's
+ * current bank for every row).  `hist` (may be NULL) is the sequence the rows
+ * continue, authoritative for the positions before pos[0].  No Engram -> a
+ * no-op.  false = refused, reason printed (a token outside the layout, history
+ * the ring does not hold). */
+bool gpu_graph_engram_stage(pulsar_gpu_graph *g, const int *tok, const int32_t *pos, const int32_t *bank,
+                            uint32_t n, const int *hist, uint32_t hist_len);
+/** The Engram layer's op at the top of block `layer` (before the drafter anchor
+ * capture, as the reference): wait its gather, rows -> MX slot -> `wkv` -> gate
+ * + gated add on g->batch_cur_hc.  A block with no Engram is a no-op. */
+bool gpu_graph_engram_apply(pulsar_gpu_graph *g, const pulsar_model *model, const pulsar_layer_weights *layer,
+                            uint32_t il, uint32_t n_tokens);
+bool gpu_graph_engram_alloc(pulsar_gpu_graph *g, const pulsar_weights *w, uint32_t cap, uint32_t n_banks);
+/** Empty `bank`'s Engram history ring (a restore or a reset replaced its state). */
+void gpu_graph_engram_forget(pulsar_gpu_graph *g, uint32_t bank);
+void gpu_graph_engram_release(pulsar_gpu_graph *g);
 
 /* ONE-STATE-MODEL stage 1a — the compressor frontier has ONE accessor.
  *
@@ -2787,6 +2889,18 @@ void pulsar_attn_layout_install(const uint32_t *ratios,
                                 const uint32_t *kv_sources, uint32_t n_kv,
                                 const uint32_t *index_sources, uint32_t n_index,
                                 int32_t candidate_source);
+/** A LAYER-SUBSET FIXTURE (L269 W2, model_layout.cpp): the artifact keeps `n`
+ * ascending layers of the profile just selected (`pulsar.fixture.source_layers`),
+ * renumbered densely.  Cuts g_pulsar_shape to them (n_layer, the source sets and
+ * the candidate in block indices) and announces it; n == 0 is the identity.
+ * Returns false (message printed) on a malformed map. */
+bool pulsar_layer_subset_install(const uint32_t *source_layers, uint32_t n);
+/** The profile's layer that block `il` of the loaded artifact is: il itself, or
+ * the fixture's map.  Everything a layer index means in the source model (its
+ * ratio, its Engram row table) is asked of this. */
+uint32_t pulsar_layer_source(uint32_t il);
+/** True when the loaded artifact is a layer-subset fixture. */
+bool pulsar_layer_subset(void);
 
 /** CSA2 (L218) ownership.  The compressed pool, the index-K pool, the
  * compressor state and the frontier a layer reads all live at its kv SOURCE's

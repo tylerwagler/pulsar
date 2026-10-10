@@ -315,9 +315,14 @@ static void blob_value(st_blob *b, const char **p, uint32_t type) {
     case PULSAR_META_INT16:
     case PULSAR_META_UINT32:
     case PULSAR_META_INT32:
-    case PULSAR_META_UINT64: {
+    case PULSAR_META_UINT64:
+    case PULSAR_META_INT64: {   /* i64: the Engram hash multipliers (tools/container kv.py) */
         double v = 0.0;
         if (!json_number(&q, &v)) st_die("safetensors: metadata integer did not parse");
+        /* the number goes through a double: a 64-bit value past 2^53 would arrive rounded, a wrong
+         * integer that still parses -- refused instead */
+        if (fabs(v) > 9007199254740992.0 || v != floor(v))
+            st_die("safetensors: metadata integer %.17g is not exactly representable", v);
         int w = (type == PULSAR_META_UINT8 || type == PULSAR_META_INT8) ? 1
               : (type == PULSAR_META_UINT16 || type == PULSAR_META_INT16) ? 2
               : (type == PULSAR_META_UINT32 || type == PULSAR_META_INT32) ? 4 : 8;

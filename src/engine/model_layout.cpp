@@ -15,6 +15,92 @@ static pulsar_layer_attn g_pulsar_attn_layout[PULSAR_MAX_LAYER];
 
 
 
+/* A LAYER-SUBSET FIXTURE (L269 W2): an artifact that keeps some of a profile's
+ * layers -- tools/container `build.py --layers`, which writes the map as
+ * `pulsar.fixture.source_layers`.  Block il of the artifact IS source layer
+ * g_layer_source[il] of the profile; everything a layer's index means in the
+ * source model (its compression ratio, which caches it reads, its Engram hash
+ * multipliers, its row table) is asked of the SOURCE index through
+ * pulsar_layer_source, and every per-block array the artifact declares (ratios,
+ * source sets, the drafter's anchors, the Engram layers) is in block indices.
+ * The full profile is kept so the layout can refuse a block whose source-model
+ * cache was dropped, instead of silently re-binding it to an earlier one.  No
+ * map -> the identity, and nothing below changes for a served artifact. */
+static uint32_t g_layer_source[PULSAR_MAX_LAYER];
+static bool g_layer_subset = false;
+static pulsar_shape g_source_profile;
+
+
+
+uint32_t pulsar_layer_source(uint32_t il) {
+    if (il >= PULSAR_N_LAYER) pulsar_die("DeepSeek4 layer index is outside the loaded model layout");
+    return g_layer_subset ? g_layer_source[il] : il;
+}
+
+
+
+bool pulsar_layer_subset(void) {
+    return g_layer_subset;
+}
+
+
+
+/* The block a source layer is in, or PULSAR_NO_LAYER when the fixture drops it. */
+static uint32_t block_of_source(uint32_t src, const uint32_t *map, uint32_t n) {
+    for (uint32_t i = 0; i < n; i++)
+        if (map[i] == src) return i;
+    return PULSAR_NO_LAYER;
+}
+
+
+
+bool pulsar_layer_subset_install(const uint32_t *source_layers, uint32_t n) {
+    g_layer_subset = false;
+    if (n == 0) return true;
+    const pulsar_shape *full = &g_pulsar_shape;   /* the profile the loader just selected, whole */
+    if (n > full->n_layer) {
+        fprintf(stderr, "pulsar: pulsar.fixture.source_layers names %u layers, %s has %u -- refusing\n", n,
+                full->name, full->n_layer);
+        return false;
+    }
+    for (uint32_t i = 0; i < n; i++) {
+        if (source_layers[i] >= full->n_layer || (i && source_layers[i] <= source_layers[i - 1])) {
+            fprintf(stderr, "pulsar: pulsar.fixture.source_layers[%u] = %u: ascending layers of %s's %u wanted "
+                            "-- refusing\n", i, source_layers[i], full->name, full->n_layer);
+            return false;
+        }
+    }
+    g_source_profile = *full;
+    memcpy(g_layer_source, source_layers, (size_t)n * sizeof(uint32_t));
+    /* the profile's source sets and candidate in block indices: the kept ones */
+    pulsar_shape cut = *full;
+    cut.n_layer = n;
+    cut.n_kv_source = cut.n_index_source = 0;
+    for (uint32_t i = 0; i < full->n_kv_source; i++) {
+        const uint32_t b = block_of_source(full->kv_source_layer[i], source_layers, n);
+        if (b != PULSAR_NO_LAYER) cut.kv_source_layer[cut.n_kv_source++] = b;
+    }
+    for (uint32_t i = 0; i < full->n_index_source; i++) {
+        const uint32_t b = block_of_source(full->index_source_layer[i], source_layers, n);
+        if (b != PULSAR_NO_LAYER) cut.index_source_layer[cut.n_index_source++] = b;
+    }
+    if (full->candidate_source_layer >= 0) {
+        const uint32_t b = block_of_source((uint32_t)full->candidate_source_layer, source_layers, n);
+        cut.candidate_source_layer = b == PULSAR_NO_LAYER ? -1 : (int32_t)b;
+    }
+    g_pulsar_shape = cut;
+    g_layer_subset = true;
+    char list[PULSAR_MAX_LAYER * 4 + 1];
+    size_t at = 0;
+    for (uint32_t i = 0; i < n && at + 5 < sizeof(list); i++)
+        at += (size_t)snprintf(list + at, sizeof(list) - at, "%s%u", i ? "," : "", source_layers[i]);
+    fprintf(stderr, "pulsar: LAYER-SUBSET FIXTURE: %u of %s's %u layers (source layers %s) -- a test artifact, "
+                    "not the model\n", n, g_source_profile.name, g_source_profile.n_layer, list);
+    return true;
+}
+
+
+
 /* Attention compression is read from the model's metadata after validating that it
  * matches the exact layout expected for the loaded model shape. */
 uint32_t pulsar_layer_compress_ratio(uint32_t il) {
@@ -63,7 +149,8 @@ bool pulsar_engine::is_pruned() const {
  * pulsar_attn_layout_install).  Nothing in the per-layer hot path may branch on
  * the variant -- downstream reads the derived layout table instead.
  * plans/96-SPIKE0-results.md S2. */
-static uint32_t expected_layer_compress_ratio(uint32_t il) {
+static uint32_t expected_layer_compress_ratio(uint32_t block) {
+    const uint32_t il = pulsar_layer_source(block);   /* the profile speaks of source layers */
     if (il < 2) return 0;   /* both profiles: the first two layers are window-only */
     switch (g_pulsar_shape.variant) {
     case PULSAR_VARIANT_V4:
@@ -192,6 +279,27 @@ void pulsar_attn_layout_install(const uint32_t *ratios,
         }
         a->candidate_source = candidate_source >= 0 && (uint32_t)candidate_source == il;
         a->uses_candidates = is_index && candidate_source >= 0 && (uint32_t)candidate_source < il;
+        if (g_layer_subset) {
+            /* A fixture block reads what its SOURCE layer reads in the full model, or it is refused: the latest
+             * kept source at or below it is a different cache when the real one was dropped. */
+            const pulsar_shape *f = &g_source_profile;
+            const uint32_t s = pulsar_layer_source(il);
+            const uint32_t want_kv = latest_source(s, f->kv_source_layer, f->n_kv_source);
+            const uint32_t want_ix = latest_source(s, f->index_source_layer, f->n_index_source);
+            const bool want_cand = s == want_ix && f->candidate_source_layer >= 0 &&
+                                   (uint32_t)f->candidate_source_layer < s;
+            const char *dropped = pulsar_layer_source(a->kv_source) != want_kv ? "kv source"
+                                : pulsar_attn_reads_index(a->mode) && pulsar_layer_source(a->index_source) != want_ix
+                                      ? "index source"
+                                : want_cand && !a->uses_candidates ? "candidate source" : NULL;
+            if (dropped) {
+                fprintf(stderr, "pulsar: fixture block %u (source layer %u) reads %s %u of the full model, which the "
+                                "fixture does not keep -- refusing\n", il, s, dropped,
+                        dropped[0] == 'k' ? want_kv : dropped[0] == 'i' ? want_ix
+                                                                         : (uint32_t)f->candidate_source_layer);
+                exit(1);
+            }
+        }
         if (a->candidate_source && !is_index) {
             fprintf(stderr, "pulsar: candidate source layer %u runs no indexer\n", il);
             exit(1);
