@@ -1,17 +1,22 @@
 // SPDX-License-Identifier: MIT
-// The Qwen routed-expert EXL3 arm for PROMPT CHUNKS (L251).
+// The EXL3 routed-expert arm for PROMPT CHUNKS, one arm for every family (L251 Qwen; L287 DeepSeek).
 //
 // The decode arm (ds4_exl3_gemv.cu) is a GEMV: f32 CUDA-core FMAs, at most 16 same-expert
-// assignments per weight decode -- on a 4096-row prompt it was 47% of the prefill.  This is the
-// GEMM over the same expert-sorted schedule (mm_ids_helper's ids_src1 / ids_dst / expert_bounds),
-// writing the same UNROTATED z the fold and the sum consume, so nothing downstream changes.
+// assignments per weight decode -- on a 4096-row prompt it was 47% of Qwen's prefill, and DeepSeek
+// ran every prompt row through it.  This is the GEMM over the same expert-sorted schedule
+// (mm_ids_helper's ids_src1 / ids_dst / expert_bounds), writing the same UNROTATED z the fold and the
+// sum consume, so nothing downstream changes.  Shapes are the call's (M, K, experts): nothing here is
+// a family's.
 //
-//   PREP  once per (assignment, 128-block): the token's bf16 row, times the expert's suh and
-//         rotated by H128 when the projection rotates its input (the fused gate_up; the down's
-//         input arrives rotated from the fold), a power-of-two prescale per block, rounded to ONE
-//         fp16 plane: 11 significant bits relative to the block's largest value -- 8x finer than
-//         the bf16 row it came from carries (exllamav3's and TensorFold's operand is the same one
-//         fp16 plane; a second "lo" plane doubled the MMAs for precision the input does not have).
+//   PREP  once per (assignment, 128-block): the row in the format its PRODUCER emitted (rule 3) --
+//         bf16 rows (Qwen) or the E4M3 slot with its per-32 ue8m0 scales (DeepSeek; e4m3 x 2^e is
+//         exact in f32) -- times the expert's suh and rotated by H128 when the projection rotates its
+//         input (gate / up, fused or split; the down's input arrives rotated from the fold), a
+//         power-of-two prescale per block, rounded to ONE fp16 plane: 11 significant bits relative
+//         to the block's largest value -- 8x finer than a bf16 row, and EXACT for an unrotated E4M3
+//         value (4 significant bits), so DeepSeek's down reads its slot's values bit for bit.
+//         (exllamav3's and TensorFold's operand is the same one fp16 plane; a second "lo" plane
+//         doubled the MMAs for precision the input does not have.)
 //   GEMM  one CTA per (128-output tile, <= 64 consecutive assignments of ONE expert; the plan
 //         kernel turns expert_bounds into that list): per 128-k block the A tiles go to shared
 //         memory by cp.async while each of the 8 warps decodes its n16 tile's 8 k-tiles of the
@@ -20,14 +25,23 @@
 //         then one MMA per n8 tile into a fresh f32 fragment, added into the accumulator
 //         scaled by the (row, block) inverse prescale -- a fresh fragment because the tensor
 //         core's own accumulate is not IEEE f32.
+//   The trellis is decoded straight into the mma B fragments (TensorFold's experts design, "D2R"),
+//   never to memory: decoding each routed expert ONCE to fp16 and running a cuBLASLt GEMM per expert
+//   (the dense prefill arm's shape) writes and re-reads 2 bytes per weight against the trellis's 3/8,
+//   and measured 4.0x slower on V4's gate projection at a 4096-token chunk (96 rows per expert) and
+//   5.6x on V4.1's (64 rows per expert) -- tests/exl3_moe_prefill_bench, L287.
 //
-// The first version staged A INSIDE the GEMM, so every assignment's row was gathered, rotated and
-// split once per 64-output tile (20x for the fused gate_up) with no load pipelining: 11 TFLOP/s.
-// A prefilled assignment and a decoded one agree to rounding, not to the bit (Tyler 2026-09-29,
-// "Don't use a decode kernel for prefill"); graded by qwen_s4_gate D and the NLL suite.
+// A row's arithmetic is a function of its own operand row and its expert's weights alone (its own
+// prescales, the fixed block / k-tile order, a fresh fragment per k-tile), so its bits never depend
+// on its chunk or its batchmates (exl3_moe_prefill_gate proves it).  The first version staged A
+// INSIDE the GEMM, so every assignment's row was gathered, rotated and split once per 64-output tile
+// (20x for the fused gate_up) with no load pipelining: 11 TFLOP/s.  A prefilled assignment and a
+// decoded one agree to rounding, not to the bit (Tyler 2026-09-29, "Don't use a decode kernel for
+// prefill"); graded by exl3_moe_prefill_gate, qwen_s4_gate D and the reference gates.
 
-#include "ds4_exl3_gemv.cuh"
+#include "exl3_moe_prefill.cuh"
 #include "ds4_exl3_dev.cuh"
+#include "cuda/pulsar_cuda_mx.cuh"
 #include "engine/exl3_trellis.h"
 
 #include <cstdio>
@@ -41,8 +55,18 @@ constexpr int kBN      = 128;         ///< outputs per CTA: eight n16 tiles
 constexpr int kThreads = 256;         ///< 8 warps: one n16 tile each
 constexpr int kApad    = 128 + 8;     ///< halves per staged A row: 16-byte rows, conflict-free ldmatrix
 constexpr int kHiExp   = 14;          ///< the prescale puts a block's largest |value| just under 2^14
-constexpr int kPlanCap = 1 << 15;     ///< work items the device plan holds (4096 rows x 10 slots / 64 + 512 << this)
+constexpr int kPlanCap = 1 << 15;     ///< work items one call may plan (8192 rows x 10 slots / 64 + 1024 << this)
 constexpr int kMaxE    = 1024;        ///< experts the one-block plan kernel scans
+
+/* The prefill arm reads exactly the rates the routed GEMV arms read (exl3_arm_has_rate is the one table):
+ * a prompt chunk can never meet a rate only decode serves, and the arm instantiates nothing no arm reads. */
+constexpr bool covers_gemv_rates(int k2 = 0) {
+    return k2 > 16 || (exl3_arm_has_rate(EXL3_ARM_MOE_PREFILL, k2) ==
+                           (exl3_arm_has_rate(EXL3_ARM_DOWN, k2) || exl3_arm_has_rate(EXL3_ARM_PAIR, k2) ||
+                            exl3_arm_has_rate(EXL3_ARM_GATE_UP_FUSED, k2)) &&
+                       covers_gemv_rates(k2 + 1));
+}
+static_assert(covers_gemv_rates(), "EXL3_ARM_MOE_PREFILL's rates must be the routed GEMV arms' rates");
 
 struct Smem {
     __half a_hi[2][kBM][kApad];       ///< A of block b in buffer b & 1: block b + 1 loads while b computes
@@ -71,9 +95,10 @@ __device__ __forceinline__ void cp_async16(void *smem, const void *gmem, int src
 
 /* The work list: expert e's assignments [bounds[e], bounds[e+1]) cut into
  * blocks of kBM, in expert order.  One block of E threads, an inclusive
- * Hillis-Steele scan over the per-expert block counts. */
-__global__ void qwen_moe_plan_kernel(const int32_t *__restrict__ bounds, int E, int2 *__restrict__ work,
-                                     int *__restrict__ n_work) {
+ * Hillis-Steele scan over the per-expert block counts.  `cap` is the list's
+ * length (the launch sizes it to n_assign / kBM + E + 1, which no routing exceeds). */
+__global__ void exl3_moe_plan_kernel(const int32_t *__restrict__ bounds, int E, int2 *__restrict__ work,
+                                     int *__restrict__ n_work, int cap) {
     __shared__ int s[kMaxE];
     const int e = threadIdx.x;
     int mb = 0;
@@ -88,27 +113,42 @@ __global__ void qwen_moe_plan_kernel(const int32_t *__restrict__ bounds, int E, 
     }
     const int start = s[e] - mb;
     for (int j = 0; j < mb; ++j)
-        if (start + j < kPlanCap) work[start + j] = make_int2(e, bounds[e] + j * kBM);
-    if (e == (int)blockDim.x - 1) *n_work = s[e] < kPlanCap ? s[e] : kPlanCap;
+        if (start + j < cap) work[start + j] = make_int2(e, bounds[e] + j * kBM);
+    if (e == (int)blockDim.x - 1) *n_work = s[e] < cap ? s[e] : cap;
 }
 
 
-/* PREP: one warp per (assignment, 128-block); lane l owns k = 4l..4l+3 of the block. */
-template <bool ROT>
+/* PREP: one warp per (assignment, 128-block); lane l owns k = 4l..4l+3 of the block.  FMT is the
+ * producer's activation format (exl3_moe_act_format): the row is read as given, never re-encoded. */
+template <int FMT, bool ROT>
 __global__ void __launch_bounds__(256)
-qwen_moe_prep_kernel(const void *__restrict__ table, const __nv_bfloat16 *__restrict__ x,
-                     const int32_t *__restrict__ ids_src, const int32_t *__restrict__ bounds, int E,
-                     int n_assign, int K, __half *__restrict__ phi,
-                     float *__restrict__ pinv) {
+exl3_moe_prep_kernel(const void *__restrict__ table, const void *__restrict__ xv, const uint8_t *__restrict__ xsf,
+                     int kbp, const int32_t *__restrict__ ids_src, const int32_t *__restrict__ bounds, int E,
+                     int n_assign, int K, __half *__restrict__ phi, float *__restrict__ pinv) {
     const int64_t task = (int64_t)blockIdx.x * 8 + (threadIdx.x >> 5);
     const int nblk = K >> 7;
     if (task >= (int64_t)n_assign * nblk) return;
     const int a = (int)(task / nblk), blk = (int)(task % nblk), lane = threadIdx.x & 31;
     const int k = blk * 128 + lane * 4;
-    const uint2 xw = *reinterpret_cast<const uint2 *>(x + (size_t)ids_src[a] * (size_t)K + (size_t)k);
-    const float2 b01 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162 *>(&xw.x));
-    const float2 b23 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162 *>(&xw.y));
-    float v[4] = {b01.x, b01.y, b23.x, b23.y};
+    const int row = ids_src[a];
+    float v[4];
+    if constexpr (FMT == EXL3_MOE_ACT_BF16_ROWS) {
+        const __nv_bfloat16 *x = static_cast<const __nv_bfloat16 *>(xv);
+        const uint2 xw = *reinterpret_cast<const uint2 *>(x + (size_t)row * (size_t)K + (size_t)k);
+        const float2 b01 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162 *>(&xw.x));
+        const float2 b23 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162 *>(&xw.y));
+        v[0] = b01.x; v[1] = b01.y; v[2] = b23.x; v[3] = b23.y;
+    } else {
+        /* the slot: [row][K] E4M3 and one ue8m0 byte per (row, 32-group); x 2^(byte - 127) by ldexpf,
+         * exact (byte 0, an all-zero group's, included) */
+        const uchar4 q = *reinterpret_cast<const uchar4 *>(static_cast<const uint8_t *>(xv) + (size_t)row * (size_t)K +
+                                                           (size_t)k);
+        const int e = (int)xsf[pulsar_mx_sfoff(row, k >> 5, kbp)] - 127;
+        v[0] = ldexpf(exl3dev::e4m3_to_f32(q.x), e);
+        v[1] = ldexpf(exl3dev::e4m3_to_f32(q.y), e);
+        v[2] = ldexpf(exl3dev::e4m3_to_f32(q.z), e);
+        v[3] = ldexpf(exl3dev::e4m3_to_f32(q.w), e);
+    }
     if constexpr (ROT) {
         int lo = 0, hi = E - 1;                     /* the assignment's expert: bounds is E+1 ascending */
         while (lo < hi) {
@@ -148,7 +188,7 @@ qwen_moe_prep_kernel(const void *__restrict__ table, const __nv_bfloat16 *__rest
  * scaled into the accumulator, blocks and k-tiles in order). */
 template <int K2>
 __global__ void __launch_bounds__(kThreads, 2)
-qwen_moe_gemm_kernel(const void *__restrict__ table, const __half *__restrict__ phi,
+exl3_moe_gemm_kernel(const void *__restrict__ table, const __half *__restrict__ phi,
                      const float *__restrict__ pinv,
                      const int32_t *__restrict__ ids_dst, const int32_t *__restrict__ bounds,
                      const int2 *__restrict__ work, const int *__restrict__ n_work, float *__restrict__ out,
@@ -275,92 +315,121 @@ bool launch_gemm(const dim3 &grid, cudaStream_t stream, const void *table, const
                  const int *n_work, float *out, int M, int K) {
     static bool attr = false;
     if (!attr) {
-        if (cudaFuncSetAttribute(qwen_moe_gemm_kernel<K2>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+        if (cudaFuncSetAttribute(exl3_moe_gemm_kernel<K2>, cudaFuncAttributeMaxDynamicSharedMemorySize,
                                  (int)sizeof(Smem)) != cudaSuccess) return false;
         attr = true;
     }
-    qwen_moe_gemm_kernel<K2><<<grid, kThreads, sizeof(Smem), stream>>>(table, phi, pinv, ids_dst, bounds, work,
+    exl3_moe_gemm_kernel<K2><<<grid, kThreads, sizeof(Smem), stream>>>(table, phi, pinv, ids_dst, bounds, work,
                                                                        n_work, out, M, K);
     return true;
 }
 
+template <int FMT>
+void launch_prep(bool rotate, unsigned grid, cudaStream_t stream, const void *table, const exl3_moe_act &act,
+                 const int32_t *ids_src, const int32_t *bounds, int E, int n_assign, int K, __half *phi,
+                 float *pinv) {
+    const uint8_t *sf = static_cast<const uint8_t *>(act.sf);
+    if (rotate)
+        exl3_moe_prep_kernel<FMT, true><<<grid, 256, 0, stream>>>(table, act.x, sf, act.kbp, ids_src, bounds, E,
+                                                                  n_assign, K, phi, pinv);
+    else
+        exl3_moe_prep_kernel<FMT, false><<<grid, 256, 0, stream>>>(table, act.x, sf, act.kbp, ids_src, bounds, E,
+                                                                   n_assign, K, phi, pinv);
+}
+
+size_t up256(size_t b) { return (b + 255u) & ~(size_t)255u; }
+
+/* The workspace's three slices, in order: the fp16 plane, the inverse prescales, the work list + its count. */
+struct ws_layout {
+    size_t plane, inv, work, total;
+    int64_t cap;
+};
+ws_layout layout_for(int64_t n_assign, int K, int n_experts) {
+    ws_layout l;
+    l.cap = n_assign / kBM + n_experts + 1;
+    l.plane = up256((size_t)n_assign * (size_t)K * sizeof(__half));
+    l.inv = up256((size_t)n_assign * (size_t)(K >> 7) * sizeof(float));
+    l.work = up256((size_t)l.cap * sizeof(int2) + sizeof(int));
+    l.total = l.plane + l.inv + l.work;
+    return l;
+}
+
 } // namespace
 
-/* The plan list and the prepared planes: device buffers for the process, grown to the largest call. */
-static int2 *g_plan_work = nullptr;
-static int  *g_plan_n    = nullptr;
-static uint8_t *g_planes = nullptr;
-static size_t g_planes_bytes = 0;
+size_t exl3_moe_prefill_ws_bytes(int64_t n_assign, int K, int n_experts) {
+    if (n_assign <= 0 || K <= 0 || n_experts <= 0) return 0;
+    return layout_for(n_assign, K, n_experts).total;
+}
 
-static size_t up256(size_t b) { return (b + 255u) & ~(size_t)255u; }
-
-int qwen_exl3_moe_prefill_launch(const void *table, int k2, bool rotate_input, const void *x_bf16,
-                                 const int32_t *ids_dst, const int32_t *ids_src, const int32_t *expert_bounds,
-                                 float *out, int M, int K, int64_t n_assign, int n_experts, cudaStream_t stream) {
-    const char *tag = "qwen_exl3_moe_prefill_launch";
-    if (!table || !x_bf16 || !ids_dst || !ids_src || !expert_bounds || !out || n_assign <= 0 ||
-        n_experts <= 0 || n_experts > kMaxE || M % kBN || K % EXL3_HAD_BLOCK) {
-        fprintf(stderr, "%s: bad arguments (M=%d K=%d n_assign=%lld E=%d; M %% %d, K %% 128, E <= %d) -- refusing\n",
-                tag, M, K, (long long)n_assign, n_experts, kBN, kMaxE);
+int exl3_moe_prefill_launch(const void *table, int k2, bool rotate_input, const exl3_moe_act &act,
+                            const int32_t *ids_dst, const int32_t *ids_src, const int32_t *expert_bounds,
+                            float *out, int M, int K, int64_t n_assign, int n_experts,
+                            void *ws, size_t ws_bytes, cudaStream_t stream) {
+    const char *tag = "exl3_moe_prefill_launch";
+    const bool e4m3 = act.format == EXL3_MOE_ACT_E4M3_SLOT;
+    if (!table || !act.x || !ids_dst || !ids_src || !expert_bounds || !out || !ws || n_assign <= 0 ||
+        n_experts <= 0 || n_experts > kMaxE || M <= 0 || M % kBN || K <= 0 || K % EXL3_HAD_BLOCK ||
+        (act.format != EXL3_MOE_ACT_BF16_ROWS && !e4m3) || (e4m3 && (!act.sf || act.kbp < K / 32)) ||
+        (!e4m3 && act.sf)) {
+        fprintf(stderr, "%s: bad arguments (M=%d K=%d n_assign=%lld E=%d act format %d sf=%p kbp=%d; M %% %d, "
+                        "K %% 128, E <= %d) -- refusing\n", tag, M, K, (long long)n_assign, n_experts, act.format,
+                act.sf, act.kbp, kBN, kMaxE);
         return -1;
     }
     if (!exl3_arm_has_rate(EXL3_ARM_MOE_PREFILL, k2)) {
-        fprintf(stderr, "%s: rate k2=%d has no prefill instance (K = 3, 4, 5, 6) -- refusing\n", tag, k2);
+        fprintf(stderr, "%s: rate k2=%d has no prefill instance -- refusing\n", tag, k2);
         return -1;
     }
-    const int64_t cap = n_assign / kBM + n_experts + 1;
-    if (cap > kPlanCap) {
+    const ws_layout l = layout_for(n_assign, K, n_experts);
+    if (l.cap > kPlanCap) {
         fprintf(stderr, "%s: %lld assignments over %d experts need %lld work items > %d -- refusing\n",
-                tag, (long long)n_assign, n_experts, (long long)cap, kPlanCap);
+                tag, (long long)n_assign, n_experts, (long long)l.cap, kPlanCap);
         return -1;
     }
-    if (!g_plan_work) {
-        if (cudaMalloc(&g_plan_work, (size_t)kPlanCap * sizeof(int2)) != cudaSuccess ||
-            cudaMalloc(&g_plan_n, sizeof(int)) != cudaSuccess) {
-            fprintf(stderr, "%s: plan buffer allocation failed -- refusing\n", tag);
-            return -1;
-        }
+    if (ws_bytes < l.total || ((uintptr_t)ws & 255u)) {
+        fprintf(stderr, "%s: workspace %zu B at %p < %zu B (256-aligned) -- refusing\n", tag, ws_bytes, ws, l.total);
+        return -1;
     }
-    const int nblk = K >> 7;
-    const size_t plane_b = up256((size_t)n_assign * K * sizeof(__half));
-    const size_t need = plane_b + up256((size_t)n_assign * nblk * sizeof(float));
-    if (need > g_planes_bytes) {
-        if (g_planes) cudaFree(g_planes);
-        g_planes = nullptr;
-        g_planes_bytes = 0;
-        if (cudaMalloc(&g_planes, need) != cudaSuccess) {
-            fprintf(stderr, "%s: operand planes of %zu bytes refused -- refusing\n", tag, need);
-            return -1;
-        }
-        g_planes_bytes = need;
+    static bool announced[2] = {false, false};
+    if (!announced[e4m3]) {
+        announced[e4m3] = true;
+        fprintf(stderr, "pulsar: EXL3 MoE prefill arm = fp16 tensor-core GEMM over %s rows (first call: K=%g, "
+                        "%d x %d, %lld assignments over %d experts)\n", e4m3 ? "E4M3-slot" : "bf16",
+                k2 / 2.0, K, M, (long long)n_assign, n_experts);
     }
-    __half *phi = reinterpret_cast<__half *>(g_planes);
-    float *pinv = reinterpret_cast<float *>(g_planes + plane_b);
+    uint8_t *base = static_cast<uint8_t *>(ws);
+    __half *phi = reinterpret_cast<__half *>(base);
+    float *pinv = reinterpret_cast<float *>(base + l.plane);
+    int2 *work = reinterpret_cast<int2 *>(base + l.plane + l.inv);
+    int *n_work = reinterpret_cast<int *>(work + l.cap);
     int threads = 32;
     while (threads < n_experts) threads <<= 1;
-    qwen_moe_plan_kernel<<<1, threads, 0, stream>>>(expert_bounds, n_experts, g_plan_work, g_plan_n);
-    const __nv_bfloat16 *x = static_cast<const __nv_bfloat16 *>(x_bf16);
-    const int64_t tasks = n_assign * nblk;
+    exl3_moe_plan_kernel<<<1, threads, 0, stream>>>(expert_bounds, n_experts, work, n_work, (int)l.cap);
+    const int64_t tasks = n_assign * (K >> 7);
     const unsigned pgrid = (unsigned)((tasks + 7) / 8);
-    if (rotate_input)
-        qwen_moe_prep_kernel<true><<<pgrid, 256, 0, stream>>>(table, x, ids_src, expert_bounds, n_experts, (int)n_assign, K,
-                                                              phi, pinv);
+    if (e4m3)
+        launch_prep<EXL3_MOE_ACT_E4M3_SLOT>(rotate_input, pgrid, stream, table, act, ids_src, expert_bounds,
+                                            n_experts, (int)n_assign, K, phi, pinv);
     else
-        qwen_moe_prep_kernel<false><<<pgrid, 256, 0, stream>>>(table, x, ids_src, expert_bounds, n_experts, (int)n_assign, K,
-                                                               phi, pinv);
-    const dim3 grid((unsigned)(M / kBN), (unsigned)cap, 1);
-    /* k2 = 6: the MTP layer's experts (turboderp's K = 3); 8 / 10 / 12: the trunk's (4.05 / 3.05 / 6.05 bpw) */
-    const bool ok = k2 == 6 ? launch_gemm<6>(grid, stream, table, phi, pinv, ids_dst, expert_bounds, g_plan_work,
-                                             g_plan_n, out, M, K)
-                  : k2 == 8 ? launch_gemm<8>(grid, stream, table, phi, pinv, ids_dst, expert_bounds, g_plan_work,
-                                             g_plan_n, out, M, K)
-                  : k2 == 10 ? launch_gemm<10>(grid, stream, table, phi, pinv, ids_dst, expert_bounds, g_plan_work,
-                                               g_plan_n, out, M, K)
-                             : launch_gemm<12>(grid, stream, table, phi, pinv, ids_dst, expert_bounds, g_plan_work,
-                                               g_plan_n, out, M, K);
+        launch_prep<EXL3_MOE_ACT_BF16_ROWS>(rotate_input, pgrid, stream, table, act, ids_src, expert_bounds,
+                                            n_experts, (int)n_assign, K, phi, pinv);
+    const dim3 grid((unsigned)(M / kBN), (unsigned)l.cap, 1);
+    /* the rates exl3_arm_has_rate(EXL3_ARM_MOE_PREFILL) names: every rate a routed GEMV arm reads, so a
+     * prompt chunk never meets a rate only decode serves -- k2 = 4 / 5 / 6 DeepSeek's (K2, 2.5, 3) and Qwen's
+     * MTP experts; 8 / 10 / 12 Qwen's trunk (4.05 / 3.05 / 6.05 bpw) */
+    bool ok = false;
+    switch (k2) {
+    case 4:  ok = launch_gemm<4>(grid, stream, table, phi, pinv, ids_dst, expert_bounds, work, n_work, out, M, K); break;
+    case 5:  ok = launch_gemm<5>(grid, stream, table, phi, pinv, ids_dst, expert_bounds, work, n_work, out, M, K); break;
+    case 6:  ok = launch_gemm<6>(grid, stream, table, phi, pinv, ids_dst, expert_bounds, work, n_work, out, M, K); break;
+    case 8:  ok = launch_gemm<8>(grid, stream, table, phi, pinv, ids_dst, expert_bounds, work, n_work, out, M, K); break;
+    case 10: ok = launch_gemm<10>(grid, stream, table, phi, pinv, ids_dst, expert_bounds, work, n_work, out, M, K); break;
+    case 12: ok = launch_gemm<12>(grid, stream, table, phi, pinv, ids_dst, expert_bounds, work, n_work, out, M, K); break;
+    default: break;
+    }
     const cudaError_t err = cudaGetLastError();
     if (!ok || err != cudaSuccess) {
-        fprintf(stderr, "%s: launch failed: %s\n", tag, ok ? cudaGetErrorString(err) : "shared-memory attribute");
+        fprintf(stderr, "%s: launch failed: %s\n", tag, ok ? cudaGetErrorString(err) : "shared-memory attribute / rate");
         return -3;
     }
     return 0;

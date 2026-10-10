@@ -136,6 +136,8 @@ tests/dspark_batch_gate
 /tests/exl3_dense_gate
 /tests/exl3_dense_bench
 /tests/exl3_dense_xcheck
+/tests/exl3_moe_prefill_gate
+/tests/exl3_moe_prefill_bench
 /tests/engram_table_test
 /tests/qwen_ngram_test
 /tests/qwen_s4_gate

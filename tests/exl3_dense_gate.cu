@@ -213,7 +213,7 @@ int main(void) {
                 rc = run(d, k2, max_rows, K, N, y);
                 CHECK(rc == 0, "prefill M=%d launch rc=%d", max_rows, rc);
                 if (!rc) {
-                    /* M > 16 is the PREFILL GEMM (qwen_exl3_moe_prefill.cu, L251): it sums in its own
+                    /* M > 16 is the PREFILL GEMM (qwen_exl3_dense_prefill.cu, L251): it sums in its own
                      * order, so its rows agree with the decode GEMV to rounding, not to the bit -- every
                      * row is graded against the double reference instead, rows 0..15 included */
                     /* ...its operand is ONE fp16 plane (qwen_exl3_dense_prefill.cu), so each output is graded

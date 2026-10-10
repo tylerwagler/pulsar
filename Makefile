@@ -268,13 +268,14 @@ pulsar-agent: $(AGENT_OBJS) src/lib/pulsar_help.o src/lib/pulsar_kvtext.o src/li
 # L278: the family kernel gates that need a GPU and no model run here, for every family -- Qwen's GDN, QSA and
 # S4 (router / MoE / GR / PLE) beside DeepSeek's and the shared EXL3 arms.
 cuda-regression: tests/cuda_long_context_smoke tests/moe_route_bounds_gate tests/expert_table_gate tests/exl3_gemv_gate \
-                 tests/exl3_dense_gate \
+                 tests/exl3_dense_gate tests/exl3_moe_prefill_gate \
                  tests/gdn_gate tests/qsa_attn_gate tests/qwen_s4_gate
 	./tests/cuda_long_context_smoke
 	./tests/moe_route_bounds_gate
 	./tests/expert_table_gate
 	./tests/exl3_gemv_gate
 	./tests/exl3_dense_gate
+	./tests/exl3_moe_prefill_gate
 	./tests/gdn_gate
 	./tests/qsa_attn_gate
 	./tests/qwen_s4_gate
@@ -498,6 +499,26 @@ tests/exl3_dense_gate: tests/exl3_dense_gate.cu tests/exl3_dense_ref.h src/cuda/
 .PHONY: exl3-dense-gate
 exl3-dense-gate: tests/exl3_dense_gate
 	./tests/exl3_dense_gate
+
+# L287: the routed experts' prompt-chunk arm (one arm, every family) vs an f32-weight
+# reference: DeepSeek V4 / V4.1 and Qwen shapes, both producer formats (E4M3 slot,
+# bf16 rows), every rate, 1..8192 tokens, ragged loads, chunk invariance bit-exact,
+# refusals.  Links the PRODUCTION object, so pass the served arch:
+# make exl3-moe-prefill-gate CUDA_ARCH=sm_120f.  Model-free.
+tests/exl3_moe_prefill_gate: tests/exl3_moe_prefill_gate.cu src/cuda/mmq/exl3_moe_prefill.o Makefile \
+                             src/cuda/mmq/exl3_moe_prefill.cuh src/cuda/pulsar_cuda_mx.cuh src/engine/exl3_trellis.h
+	$(NVCC) $(NVCCFLAGS) -std=c++17 -Isrc -Isrc/cuda -o $@ tests/exl3_moe_prefill_gate.cu src/cuda/mmq/exl3_moe_prefill.o
+
+.PHONY: exl3-moe-prefill-gate
+exl3-moe-prefill-gate: tests/exl3_moe_prefill_gate
+	./tests/exl3_moe_prefill_gate
+
+# L287: one DeepSeek routed EXL3 layer on a prompt chunk through the production
+# front door (ms/layer, tok/s at 512 / 4096 / 8192 tokens; V4 or V4.1 shapes), and
+# the D2R arm vs decode-once fp16 + cuBLASLt per expert.  Not a gate.
+tests/exl3_moe_prefill_bench: tests/exl3_moe_prefill_bench.cu $(CUDA_OBJS) $(CUTLASS_CUDA_OBJS) $(MMQ_OBJS) Makefile
+	$(NVCC) $(NVCCFLAGS) -std=c++17 -Isrc -Isrc/cuda -o $@ tests/exl3_moe_prefill_bench.cu \
+		$(CUDA_OBJS) $(CUTLASS_CUDA_OBJS) $(MMQ_OBJS) $(CUDA_LDLIBS)
 
 # L251: the dense arm on a REAL exllamav3-quantized weight, driven by
 # pulsar-notes research/l251/exl3-dense/xcheck.py (which compares it with
@@ -2108,7 +2129,7 @@ gates-dev:
 	fi; \
 	if [ $$exl3 -eq 1 ]; then \
 	  $(MAKE) --no-print-directory exl3-dequant-gate CUDA_ARCH=sm_120f || rc=1; \
-	  $(MAKE) --no-print-directory exl3-gemv-gate exl3-dense-gate CUDA_ARCH=sm_120f || rc=1; \
+	  $(MAKE) --no-print-directory exl3-gemv-gate exl3-dense-gate exl3-moe-prefill-gate CUDA_ARCH=sm_120f || rc=1; \
 	fi; \
 	if [ $$family -eq 1 ]; then \
 	  $(MAKE) --no-print-directory qwen-family-gate-device CUDA_ARCH=sm_120f || rc=1; \

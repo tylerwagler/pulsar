@@ -341,7 +341,7 @@ int ds4_exl3_dense_launch(const void *w, int k2, const void *xb, float *y,
         fprintf(stderr, "%s: w / y / workspace must be 16-byte aligned and xb 8-byte (the uint2 row loads) -- refusing\n", tag);
         return -1;
     }
-    /* L251: a prompt chunk takes the tensor-core GEMM (qwen_exl3_moe_prefill.cu's dense mode): this
+    /* L251: a prompt chunk takes the tensor-core GEMM (qwen_exl3_dense_prefill.cu): this
      * arm's GEMV re-decodes the trellis per 16 rows and re-reads the activation planes per 32 outputs,
      * a decode kernel doing a GEMM's work.  Decode widths keep the GEMV bit for bit. */
     if (prompt || M > kRows) return qwen_exl3_dense_prefill_launch(w, k2, xb, y, M, K, N, trellis_bytes, stream);

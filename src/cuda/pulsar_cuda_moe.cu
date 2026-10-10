@@ -3,6 +3,7 @@
 #ifdef PULSAR_HAVE_MMQ
 #include "mmq/ds4_mmq.h"     /* vendored llama.cpp MMQ adapter -- see mmq/VENDOR.md */
 #include "mmq/ds4_exl3_gemv.cuh" /* L245: the EXL3 fold and sum */
+#include "mmq/exl3_moe_prefill.cuh" /* L287: exl3_moe_prefill_takes, the prompt-chunk rule */
 #include "engine/exl3_trellis.h" /* L245: exl3_type_k2 */
 
 #endif
@@ -1232,11 +1233,14 @@ static int routed_moe_try_mmq_down(
  * dataflow is the IQ2 arm's -- the same sorted pairs, the same producer E4M3
  * staging, per-pair f32 outputs, a fixed-order sum -- with the trellis GEMV
  * in place of the D2R launch and the format's rotations in the fold and the
- * sum (mmq/ds4_exl3_gemv.cuh).  EVERY row takes it, decode and prefill: one
- * arithmetic, no row-kind boundary in this lane.  Under TP the routed entry
- * refuses it (expert_split serves type 40 only).  A prefill assignment
- * re-streams its expert, so long prompts are slow here; the tile arm for
- * prefill is a later slice, and the announce line says which arm ran. */
+ * sum (mmq/ds4_exl3_gemv.cuh).  L287: PREFILL rows (the row kind, L167:
+ * pulsar_gpu_matmul_batch_decode_rows() == 0) are a prompt chunk and take the
+ * tensor-core prefill GEMM over the producer's E4M3 slot at every width -- the
+ * arm Qwen's prompt chunks take, by the same rule (exl3_moe_prefill_takes) --
+ * so a prompt row's bits never depend on its chunk; decode rows take the GEMV
+ * below that rule's assignment count.  The fold, the down's E4M3 mid slot and
+ * the sum are one dataflow for both.  Under TP the routed entry refuses it
+ * (expert_split serves type 40 only). */
 static int routed_moe_launch_exl3(
         pulsar_gpu_tensor *out,
         pulsar_gpu_tensor *up,
@@ -1307,10 +1311,15 @@ static int routed_moe_launch_exl3(
         fprintf(stderr, "pulsar: EXL3 routed MoE: the MMQ drivers are unavailable on this device -- refusing\n");
         return 0;
     }
-    static int announced = 0;
-    if (!announced) {
-        announced = 1;
-        fprintf(stderr, "pulsar: L245 routed EXL3 arm = trellis GEMV on every row (gate/up K=%g, down K=%g)\n",
+    /* the row kind is the step's (L167): prefill rows are a prompt chunk */
+    const bool prompt = pulsar_gpu_matmul_batch_decode_rows() == 0;
+    static int announced[2] = {0, 0};
+    if (!announced[prompt]) {
+        announced[prompt] = 1;
+        fprintf(stderr, "pulsar: routed EXL3 arm, %s rows = %s (gate/up K=%g, down K=%g)\n",
+                prompt ? "prefill" : "decode",
+                prompt ? "fp16 tensor-core prefill GEMM (exl3_moe_prefill)"
+                       : "trellis GEMV (the prefill GEMM from EXL3_MOE_PREFILL_MIN_ASSIGN assignments)",
                 k2g / 2.0, k2d / 2.0);
     }
     /* the [trellis, scales] tables: row_bytes is the split point (routed_expert_side_layout) */
@@ -1344,7 +1353,7 @@ static int routed_moe_launch_exl3(
     int rc = ds4_exl3_moe_pair(gt, ut, k2g, selected_ptr, gate_z, up_z,
                                (int)expert_mid_dim, (int)expert_in_dim, (int)n_tokens,
                                (int)n_total_expert, (int)n_expert,
-                               cudaStreamPerThread, act_q, act_sf, act_kbp);
+                               cudaStreamPerThread, act_q, act_sf, act_kbp, prompt);
     if (rc != 0) {
         fprintf(stderr, "pulsar: EXL3 routed MoE gate/up declined (rc=%d) -- no fallback\n", rc);
         return 0;
@@ -1358,7 +1367,7 @@ static int routed_moe_launch_exl3(
     rc = ds4_exl3_moe_single(dt, k2d, selected_ptr, (float *)down->ptr,
                              (int)out_dim, (int)expert_mid_dim, (int)pairs,
                              (int)n_total_expert, 1,
-                             cudaStreamPerThread, mid_q, mid_sf, mid_kbp);
+                             cudaStreamPerThread, mid_q, mid_sf, mid_kbp, prompt);
     if (rc != 0) {
         fprintf(stderr, "pulsar: EXL3 routed MoE down declined (rc=%d) -- no fallback\n", rc);
         return 0;
