@@ -558,7 +558,7 @@ int  pulsar_engram_gather_wait(pulsar_engram_gather *g);
  * load; every forward stages its rows' hashes and starts the gathers before the
  * first layer (gpu_graph_engram_stage), and the Engram layer waits on its gather
  * and runs rows -> MX slot -> `wkv` -> gate + add on the HC copies
- * (gpu_graph_engram_apply).  The device path is slices 3-4's, gated by
+ * (gpu_graph_engram_apply), all in engram_forward.cpp.  The device path is slices 3-4's, gated by
  * cuda-engram-gate. */
 typedef struct pulsar_engram_model {
     uint32_t n_layers;                               ///< Engram layers in this artifact (V4.1: 2; a fixture may keep fewer)
@@ -1630,7 +1630,7 @@ typedef struct {
      * beside `tp` (see pulsar_engine::tp_group_lo).  The attention block runs
      * its heads, its grouped 'a' projection and its `low` gather on it. */
     uint32_t tp_group_lo, tp_group_hi;
-    /** Engram (L242 slice 5, engram.cpp): the step's staged hashes and gathers,
+    /** Engram (L242 slice 5, engram_forward.cpp): the step's staged hashes and gathers,
      * the device scratch the Engram layer runs in, and the token history the
      * hashes read.  Allocated only when the weights carry Engram layers.
      *
