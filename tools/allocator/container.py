@@ -78,13 +78,17 @@ def exl3_slices(blob, k, n, words):
     return tr, suh, svh
 
 
-def dequant_exl3(blob, k, n, words, dev="cuda"):
-    """Container blob -> bf16 [out, in] on `dev` (LinearEXL3 owns the decode; mul1 codebook)."""
+def exl3_linear(blob, k, n, words, dev="cuda"):
+    """Container blob -> exllamav3 LinearEXL3 on `dev` (the decode owner; mul1 codebook)."""
     from exllamav3.modules.quant.exl3 import LinearEXL3
     tr, suh, svh = exl3_slices(blob, k, n, words)
-    lin = LinearEXL3(None, k, n, suh=torch.from_numpy(suh.copy()).to(dev), svh=torch.from_numpy(svh.copy()).to(dev),
-                     trellis=torch.from_numpy(tr.copy()).to(dev), mul1=torch.zeros(1, dtype=torch.int32, device=dev))
-    return lin.get_weight_tensor().t().to(torch.bfloat16).contiguous()
+    return LinearEXL3(None, k, n, suh=torch.from_numpy(suh.copy()).to(dev), svh=torch.from_numpy(svh.copy()).to(dev),
+                      trellis=torch.from_numpy(tr.copy()).to(dev), mul1=torch.zeros(1, dtype=torch.int32, device=dev))
+
+
+def dequant_exl3(blob, k, n, words, dev="cuda"):
+    """Container blob -> bf16 [out, in] on `dev`."""
+    return exl3_linear(blob, k, n, words, dev).get_weight_tensor().t().to(torch.bfloat16).contiguous()
 
 
 def dequant_mxfp8(blob, k, n, dev="cuda"):
