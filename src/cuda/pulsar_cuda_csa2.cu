@@ -46,6 +46,7 @@ __device__ __forceinline__ static float csa2_bf16_round(float v) {
 template <bool NORM_BF16>
 __global__ static void csa2_compressor_pool_norm_kernel(
         float *latent,            /* [n_groups][head_dim] out */
+        __nv_bfloat16 *latent_b,  /* the same rows' bf16 plane (the index key's bf16 wk reads it), or NULL */
         const float *kv,          /* SRC_ROWS: [n_groups * ratio][coff * head_dim] */
         const float *sc,
         const float *state_kv,    /* SRC_STATE / overlap: [coff * ratio][coff * head_dim] */
@@ -163,7 +164,9 @@ __global__ static void csa2_compressor_pool_norm_kernel(
     k = 0;
     for (uint32_t d = threadIdx.x; d < head_dim; d += blockDim.x, k++) {
         const float w = pulsar_w_load_f32_or_bf16<NORM_BF16>(norm_w, d);
-        latent[(uint64_t)g * head_dim + d] = w * (pooled[k] * inv);
+        const float o = w * (pooled[k] * inv);
+        latent[(uint64_t)g * head_dim + d] = o;
+        if (latent_b) latent_b[(uint64_t)g * head_dim + d] = __float2bfloat16(o);
     }
 }
 
@@ -239,16 +242,18 @@ static bool csa2_norm_args_ok(const void *model_map, uint64_t model_size, uint64
     return true;
 }
 
-static int csa2_pool_norm_launch(float *latent, const float *kv, const float *sc,
+static int csa2_pool_norm_launch(float *latent, void *latent_b, const float *kv, const float *sc,
                                  const float *state_kv, const float *state_sc, const void *norm_w,
                                  int norm_bf16, uint32_t head_dim, uint32_t ratio, uint32_t coff,
                                  uint32_t n_groups, uint32_t src, uint32_t pos0, float eps) {
     if (n_groups == 0) return 1;
     if (norm_bf16)
-        csa2_compressor_pool_norm_kernel<true><<<n_groups, 256>>>(latent, kv, sc, state_kv, state_sc, norm_w,
+        csa2_compressor_pool_norm_kernel<true><<<n_groups, 256>>>(latent, (__nv_bfloat16 *)latent_b, kv, sc,
+                                                                  state_kv, state_sc, norm_w,
                                                                   head_dim, ratio, coff, n_groups, src, pos0, eps);
     else
-        csa2_compressor_pool_norm_kernel<false><<<n_groups, 256>>>(latent, kv, sc, state_kv, state_sc, norm_w,
+        csa2_compressor_pool_norm_kernel<false><<<n_groups, 256>>>(latent, (__nv_bfloat16 *)latent_b, kv, sc,
+                                                                   state_kv, state_sc, norm_w,
                                                                    head_dim, ratio, coff, n_groups, src, pos0, eps);
     return cuda_ok(cudaGetLastError(), "csa2 compressor pool+norm launch");
 }
@@ -332,6 +337,7 @@ int pulsar_gpu_csa2_comp_ape_add_tensor(
 
 int pulsar_gpu_csa2_compressor_prefill_tensor(
         pulsar_gpu_tensor       *latent,
+        void                    *latent_b,
         const pulsar_gpu_tensor *kv,
         const pulsar_gpu_tensor *sc,
         pulsar_gpu_tensor       *state_kv,
@@ -397,7 +403,7 @@ int pulsar_gpu_csa2_compressor_prefill_tensor(
             /* POOL FIRST.  At pos0 != 0 group 0 reads the incoming carry out of
              * rows 0..ratio-1, and the carry store below overwrites exactly those
              * rows -- so the order here is load-bearing, not stylistic. */
-            if (!csa2_pool_norm_launch((float *)latent->ptr, (const float *)kv->ptr, (const float *)sc->ptr,
+            if (!csa2_pool_norm_launch((float *)latent->ptr, latent_b, (const float *)kv->ptr, (const float *)sc->ptr,
                                        (const float *)state_kv->ptr, (const float *)state_score->ptr,
                                        norm_w, norm_type == PULSAR_TENSOR_BF16, head_dim, ratio, coff, n_groups,
                                        CSA2_SRC_ROWS, pos0, rms_eps)) return 0;
@@ -440,13 +446,14 @@ int pulsar_gpu_csa2_compressor_prefill_tensor(
             if (!cuda_ok(cudaGetLastError(), "csa2 state store launch")) return 0;
         }
     }
-    return csa2_pool_norm_launch((float *)latent->ptr, (const float *)kv->ptr,
+    return csa2_pool_norm_launch((float *)latent->ptr, latent_b, (const float *)kv->ptr,
                                  ratio > 1u ? (const float *)sc->ptr : NULL, NULL, NULL, norm_w,
                                  norm_type == PULSAR_TENSOR_BF16, head_dim, ratio, coff, n_groups, CSA2_SRC_ROWS, pos0, rms_eps);
 }
 
 int pulsar_gpu_csa2_compressor_update_tensor(
         pulsar_gpu_tensor       *latent,
+        void                    *latent_b,
         const pulsar_gpu_tensor *kv_cur,
         const pulsar_gpu_tensor *sc_cur,
         pulsar_gpu_tensor       *state_kv,
@@ -482,13 +489,13 @@ int pulsar_gpu_csa2_compressor_update_tensor(
     if (kv_cur->bytes < row_bytes || latent->bytes < (uint64_t)head_dim * sizeof(float)) return 0;
     if (ratio == 1u) {
         *emitted = 1;
-        return csa2_pool_norm_launch((float *)latent->ptr, (const float *)kv_cur->ptr, NULL, NULL, NULL, norm_w,
+        return csa2_pool_norm_launch((float *)latent->ptr, latent_b, (const float *)kv_cur->ptr, NULL, NULL, NULL, norm_w,
                                      norm_type == PULSAR_TENSOR_BF16, head_dim, 1u, 1u, 1u, CSA2_SRC_ROWS, pos, rms_eps);
     }
     if (!pulsar_gpu_csa2_compressor_store_tensor(kv_cur, sc_cur, state_kv, state_score, head_dim, ratio, pos)) return 0;
     if ((pos + 1u) % ratio != 0u) return 1;   /* the group is still filling */
     *emitted = 1;
-    if (!csa2_pool_norm_launch((float *)latent->ptr, NULL, NULL,
+    if (!csa2_pool_norm_launch((float *)latent->ptr, latent_b, NULL, NULL,
                                (const float *)state_kv->ptr, (const float *)state_score->ptr, norm_w,
                                norm_type == PULSAR_TENSOR_BF16, head_dim, ratio, coff, 1u, CSA2_SRC_STATE,
                                pos + 1u - ratio, rms_eps)) return 0;

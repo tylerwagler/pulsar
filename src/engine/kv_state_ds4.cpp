@@ -149,6 +149,9 @@ static bool ds4_prepare_restore(void *state, uint32_t G) {
 static void ds4_restored(void *state) {
     pulsar_gpu_graph *g = G_(state);
     g->ms_comp_state_stale[gpu_graph_cur_bank(g)] = false;
+    /* the bank's Engram history is whatever it held before the restore: the step that resumes from G re-seeds
+     * it from its prompt (gpu_graph_engram_stage), and a step that does not refuses instead of hashing stale ids */
+    gpu_graph_engram_forget(g, gpu_graph_cur_bank(g));
 }
 
 static void ds4_set_frontier_stale(void *state, uint32_t G) {

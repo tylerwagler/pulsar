@@ -34,8 +34,11 @@
  */
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#include <sys/wait.h>
+#include <unistd.h>
 
 #include "pulsar_engine_internal.h"
 
@@ -205,6 +208,75 @@ static void install_and_grade(const pulsar_shape *shape, const char *what,
     check(total == PULSAR_N_LAYER, "the mode counts do not cover the backbone", PULSAR_N_LAYER - 1, "count");
 }
 
+/* L269 W2: a LAYER-SUBSET FIXTURE of V4.1 (tools/container build.py --layers 1,2,3,14,20,21,24, what
+ * /mnt/models/v41-tp1-fixture keeps): the block table must be the source layers' own modes, the sources and the
+ * candidate re-bound to the kept blocks, and a fixture that drops a source its kept readers read must refuse
+ * (the install exits; run in a child). */
+static const uint32_t FIX_SRC[7] = { 1, 2, 3, 14, 20, 21, 24 };
+
+static void fixture_install(const uint32_t *src, uint32_t n, const uint32_t *ratios, const uint32_t *kv, uint32_t n_kv,
+                            const uint32_t *idx, uint32_t n_idx, int32_t cand) {
+    g_pulsar_shape = PULSAR_SHAPE_V41;
+    if (!pulsar_layer_subset_install(src, n)) exit(2);
+    pulsar_attn_layout_install(ratios, kv, n_kv, idx, n_idx, cand);
+}
+
+static int fixture_refuses(const uint32_t *src, uint32_t n, const uint32_t *ratios, const uint32_t *kv, uint32_t n_kv,
+                           const uint32_t *idx, uint32_t n_idx, int32_t cand) {
+    fflush(stdout);
+    const pid_t pid = fork();
+    if (pid == 0) {
+        fixture_install(src, n, ratios, kv, n_kv, idx, n_idx, cand);
+        _exit(0);   /* installed: the refusal did not fire */
+    }
+    int status = 0;
+    waitpid(pid, &status, 0);
+    return WIFEXITED(status) && WEXITSTATUS(status) != 0;
+}
+
+static void fixture_checks(void) {
+    static const uint32_t ratios[7] = { 0, 2, 2, 2, 1, 1, 1 };
+    static const uint32_t kv[3] = { 1, 3, 4 };            /* source 2, 14, 20 */
+    static const uint32_t idx[4] = { 1, 3, 4, 6 };        /* source 2, 14, 20, 24 */
+    fixture_install(FIX_SRC, 7, ratios, kv, 3, idx, 4, 4);
+    printf("--- V4.1 layer-subset fixture: %u blocks of source layers 1,2,3,14,20,21,24\n", (unsigned)PULSAR_N_LAYER);
+    static const pulsar_attn_mode want[7] = {
+        PULSAR_ATTN_WINDOW, PULSAR_ATTN_FULL, PULSAR_ATTN_REUSE, PULSAR_ATTN_FULL, PULSAR_ATTN_FULL,
+        PULSAR_ATTN_REUSE, PULSAR_ATTN_REINDEX,
+    };
+    for (uint32_t b = 0; b < 7; b++) {
+        const pulsar_layer_attn *a = pulsar_layer_attn_layout(b);
+        char detail[160];
+        snprintf(detail, sizeof detail, "source layer %u: got %s, want %s (V4.1 layer %u's own mode)", FIX_SRC[b],
+                 pulsar_attn_mode_name(a->mode), pulsar_attn_mode_name(want[b]), FIX_SRC[b]);
+        check(a->mode == want[b] && a->mode == V41_WANT[FIX_SRC[b]], "fixture block mode", b, detail);
+        check(pulsar_layer_source(b) == FIX_SRC[b], "fixture block's source layer", b, "pulsar_layer_source");
+    }
+    check(pulsar_layer_attn_layout(2)->kv_source == 1 && pulsar_layer_attn_layout(5)->kv_source == 4,
+          "a REUSE block reads its source's block", 2, "kv_source");
+    check(pulsar_layer_attn_layout(4)->candidate_source, "block 4 (source 20) publishes the candidate mask", 4, "cand");
+    check(pulsar_layer_attn_layout(6)->uses_candidates, "block 6 (source 24) scores inside the candidate mask", 6,
+          "uses_candidates");
+    check(pulsar_layer_subset(), "the fixture is announced as one", 0, "pulsar_layer_subset");
+
+    /* refusals: a reader whose source the fixture drops, and an index layer whose candidate source it drops */
+    static const uint32_t no2[6] = { 1, 3, 14, 20, 21, 24 };
+    static const uint32_t r_no2[6] = { 0, 2, 2, 1, 1, 1 };
+    static const uint32_t kv_no2[2] = { 2, 3 }, idx_no2[3] = { 2, 3, 5 };
+    check(fixture_refuses(no2, 6, r_no2, kv_no2, 2, idx_no2, 3, 3),
+          "a fixture keeping layer 3 without its kv source 2 refuses", 1, "reader of a dropped source");
+    static const uint32_t no20[4] = { 1, 2, 14, 24 };
+    static const uint32_t r_no20[4] = { 0, 2, 2, 1 };
+    static const uint32_t kv_no20[2] = { 1, 2 }, idx_no20[3] = { 1, 2, 3 };
+    check(fixture_refuses(no20, 4, r_no20, kv_no20, 2, idx_no20, 3, -1),
+          "a fixture keeping layer 24 without the kv / candidate source 20 refuses", 3, "dropped source 20");
+    static const uint32_t bad_order[3] = { 2, 1, 3 };
+    g_pulsar_shape = PULSAR_SHAPE_V41;
+    check(!pulsar_layer_subset_install(bad_order, 3), "a map that is not ascending refuses", 0, "ascending");
+    g_pulsar_shape = PULSAR_SHAPE_V41;
+    check(pulsar_layer_subset_install(NULL, 0) && !pulsar_layer_subset(), "an empty map is the identity", 0, "n = 0");
+}
+
 int main(void) {
     printf("attention layout gate: both profiles, from real artifact metadata\n");
 
@@ -228,6 +300,8 @@ int main(void) {
     check(pulsar_attn_reads_index(PULSAR_ATTN_REUSE) == true,
           "REUSE consumes a top-k it did not compute, so it does read an index source",
           3, "predicate");
+
+    fixture_checks();
 
     printf("attention layout gate: %u checks, %u failures\n", g_checks, g_failures);
     return g_failures ? 1 : 0;

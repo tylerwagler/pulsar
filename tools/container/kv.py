@@ -29,7 +29,15 @@ What is emitted, and why, in the served block's order
     (dspark_weights_bind reads exactly these four; the drafter's shape is pinned
     against its tensors, weights.cpp:1555-1569);
   * `deepseek4.engram.{layers,n_rows}` when the config declares Engram layers
-    (V4.1), naming the side row tables so L242 slice 5 can refuse a mismatch.
+    (V4.1), naming the side row tables so L242 slice 5 can refuse a mismatch;
+    with `build.py --engram-layout` also the hash layout the engine hashes with
+    (`deepseek4.engram.{compressed_vocab,pad_compressed_id,token_map,multipliers,
+    primes,offsets}`) and each table's file name beside the container
+    (`deepseek4.engram.rows_file.N`; engine engram.cpp engram_bind);
+  * for a LAYER-SUBSET FIXTURE (`build.py --layers`, names.py drop rule 4) the
+    per-layer keys cut to the kept layers, every layer index in block numbers,
+    the drafter's keys only when its anchors are kept, and the map itself,
+    `pulsar.fixture.source_layers` (engine model_layout.cpp).
 
 NOT emitted, because the direct builder has no source for them: the GGUF
 bookkeeping numbers (`general.file_type`, `general.quantization_version`,
@@ -139,6 +147,36 @@ class _Source:
         self.generation = gen
 
 
+def text_config(hf):
+    """The language model's config (V4.1 nests it under text_config)."""
+    return _Source(hf).text
+
+
+def _fixture_map(keep, cfg):
+    """A LAYER-SUBSET FIXTURE (build.py --layers; names.py drop rule 4): source layer keep[i] is the container's block
+    i.  Returns (block_of, sub): block_of(source layer) -> block or None; sub(per-layer list) -> the kept entries.  The
+    builder refuses what the loader would (model_layout.cpp pulsar_attn_layout_install): a kept compressed layer whose
+    kv / index source -- the last one at or below it in the source model -- is not kept, which would silently re-bind
+    the layer to an earlier cache."""
+    if keep is None:
+        return (lambda l: l), (lambda v: list(v))
+    pos = {l: i for i, l in enumerate(keep)}
+
+    def latest(l, srcs):
+        below = [x for x in srcs if x <= l]
+        return below[-1] if below else None
+    ratios = list(cfg['compress_ratios'])
+    for l in keep:
+        if not ratios[l]:
+            continue
+        for what in ('kv_source_layer_ids', 'index_source_layer_ids'):
+            src = latest(l, list(cfg.get(what, ())))
+            if what in cfg and src not in pos:
+                raise SystemExit(f'--layers: layer {l} reads {what[:-10].replace("_", " ")} {src}, which the fixture '
+                                 'drops -- keep it (a reader of a dropped source would re-bind to an earlier cache)')
+    return pos.get, (lambda v: [v[l] for l in keep])
+
+
 def _one_of(d, keys, what):
     present = [k for k in keys if k in d]
     if len(present) != 1:
@@ -186,18 +224,49 @@ def _reap_triples(reap_map):
     ]
 
 
-def build_kv(hf, tokenizer_dir, reap_map=None):
+def _engram_layout_triples(path, cfg, rows):
+    """The Engram hash layout (tools/engram/engram_layout.py) for the kept Engram layers `rows` (indices into the
+    checkpoint's engram_layer_ids), checked against config.json, plus each layer's row table by name (the side file
+    tools/engram/engram_rows.c writes, beside the container).  The engine hashes with exactly these numbers
+    (pulsar_engram_hash_pos) -- it never re-derives them."""
+    lay = _load_json(path)
+    for k, ck in (('layer_ids', 'engram_layer_ids'), ('num_embeddings', 'engram_num_embeddings'),
+                  ('compressed_vocab_size', 'engram_compressed_vocab_size'), ('max_ngram_size', 'engram_max_ngram_size'),
+                  ('n_heads', 'engram_n_heads'), ('head_dim', 'engram_head_dim')):
+        if lay[k] != cfg[ck]:
+            raise SystemExit(f'{path}: {k} {lay[k]} is not config.json {ck} {cfg[ck]}')
+    if len(lay['token_map']) != cfg['vocab_size']:
+        raise SystemExit(f'{path}: token_map has {len(lay["token_map"])} entries for vocab {cfg["vocab_size"]}')
+
+    def flat(xs):
+        return [v for x in xs for v in (flat(x) if isinstance(x, list) else [x])]
+    out = [
+        ('deepseek4.engram.compressed_vocab', 'u32', lay['compressed_vocab_size']),
+        ('deepseek4.engram.pad_compressed_id', 'u32', lay['pad_compressed_id']),
+        ('deepseek4.engram.token_map', 'array', ('i32', list(lay['token_map']))),
+        ('deepseek4.engram.multipliers', 'array', ('i64', flat([lay['multipliers'][r] for r in rows]))),
+        ('deepseek4.engram.primes', 'array', ('u32', flat([lay['primes'][r] for r in rows]))),
+        ('deepseek4.engram.offsets', 'array', ('u64', flat([lay['offsets'][r] for r in rows]))),
+    ]
+    out += [(f'deepseek4.engram.rows_file.{i}', 'string', f'engram-l{lay["layer_ids"][r]}.rows')
+            for i, r in enumerate(rows)]
+    return out
+
+
+def build_kv(hf, tokenizer_dir, reap_map=None, keep=None, engram_layout=None):
     src = _Source(hf)
     cfg = src.text
     gen = src.generation
     L = cfg['num_hidden_layers']
     rope = cfg['rope_scaling']
+    block_of, sub = _fixture_map(keep, cfg)
+    n_block = len(keep) if keep is not None else L
 
     kvs = [
         ('general.architecture', 'string', 'deepseek4'),
         ('general.type', 'string', 'model'),
         ('general.name', 'string', _family_name(src.model_type)),
-        ('deepseek4.block_count', 'u32', L),
+        ('deepseek4.block_count', 'u32', n_block),
         ('deepseek4.context_length', 'u32', cfg['max_position_embeddings']),
         ('deepseek4.embedding_length', 'u32', cfg['hidden_size']),
         ('deepseek4.attention.head_count', 'u32', cfg['num_attention_heads']),
@@ -218,7 +287,7 @@ def build_kv(hf, tokenizer_dir, reap_map=None):
         ('deepseek4.attention.q_lora_rank', 'u32', cfg['q_lora_rank']),
         ('deepseek4.attention.output_lora_rank', 'u32', cfg['o_lora_rank']),
         ('deepseek4.attention.output_group_count', 'u32', cfg['o_groups']),
-        ('deepseek4.attention.compress_ratios', 'array', ('u32', _compress_ratios(cfg, L))),
+        ('deepseek4.attention.compress_ratios', 'array', ('u32', sub(_compress_ratios(cfg, L)))),
         ('deepseek4.attention.compress_rope_freq_base', 'f32', cfg['compress_rope_theta']),
         ('deepseek4.expert_feed_forward_length', 'u32', cfg['moe_intermediate_size']),
         ('deepseek4.expert_count', 'u32', cfg['n_routed_experts']),
@@ -231,13 +300,18 @@ def build_kv(hf, tokenizer_dir, reap_map=None):
         kvs.append(('deepseek4.hash_layer_count', 'u32', cfg['num_hash_layers']))
     kvs += [
         ('deepseek4.expert_weights_norm', 'bool', bool(cfg['norm_topk_prob'])),
-        ('deepseek4.swiglu_clamp_exp', 'array', ('f32', [cfg['swiglu_limit']] * L)),
+        ('deepseek4.swiglu_clamp_exp', 'array', ('f32', [cfg['swiglu_limit']] * n_block)),
         ('deepseek4.attention.sliding_window', 'u32', cfg['sliding_window']),
         ('deepseek4.attention.indexer.head_count', 'u32', cfg['index_n_heads']),
         ('deepseek4.attention.indexer.key_length', 'u32', cfg['index_head_dim']),
         ('deepseek4.attention.indexer.top_k', 'u32', cfg['index_topk']),
-        ('deepseek4.nextn_predict_layers', 'u32', cfg['num_nextn_predict_layers']),
     ]
+    # a fixture whose drafter anchors are not all kept carries no drafter (names.py drop rule 4)
+    targets = list(cfg['dspark_target_layer_ids'])
+    if len(targets) != 3:
+        raise SystemExit(f'dspark_target_layer_ids must name 3 layers, got {targets}')
+    drafter = all(block_of(t) is not None for t in targets)
+    kvs.append(('deepseek4.nextn_predict_layers', 'u32', cfg['num_nextn_predict_layers'] if drafter else 0))
     # CSA2 sharing (V4.1): which layers write the shared caches and the shared
     # top-k, and the candidate pool.  All five or none -- the engine derives the
     # set from the profile when they are absent (validate_attention_layout_metadata).
@@ -247,10 +321,20 @@ def build_kv(hf, tokenizer_dir, reap_map=None):
     if have and len(have) != len(csa2):
         raise SystemExit(f'config.json declares only {have} of the CSA2 sharing keys {csa2}')
     if have:
+        def kept(srcs):
+            return [block_of(x) for x in srcs if block_of(x) is not None]
+        cand = block_of(cfg['candidate_source_layer_id'])
+        if cand is None and keep is not None and keep[-1] > cfg['candidate_source_layer_id']:
+            raise SystemExit(f'--layers: the candidate source {cfg["candidate_source_layer_id"]} is dropped but later '
+                             'layers are kept -- keep it')
+        # a fixture of window layers only keeps no source: the keys go (the engine reads no empty arrays, and
+        # cuts the profile's sets to the same nothing)
+        kvs += [(k, 'array', ('u32', kept(cfg[c]))) for k, c in
+                (('deepseek4.attention.kv_source_layers', 'kv_source_layer_ids'),
+                 ('deepseek4.attention.index_source_layers', 'index_source_layer_ids')) if kept(cfg[c])]
+        if cand is not None:
+            kvs.append(('deepseek4.attention.candidate_source_layer', 'u32', cand))
         kvs += [
-            ('deepseek4.attention.kv_source_layers', 'array', ('u32', list(cfg['kv_source_layer_ids']))),
-            ('deepseek4.attention.index_source_layers', 'array', ('u32', list(cfg['index_source_layer_ids']))),
-            ('deepseek4.attention.candidate_source_layer', 'u32', cfg['candidate_source_layer_id']),
             ('deepseek4.attention.candidate_topk_blocks', 'u32', cfg['candidate_topk_blocks']),
             ('deepseek4.attention.candidate_block_size', 'u32', cfg['candidate_block_size']),
         ]
@@ -271,23 +355,28 @@ def build_kv(hf, tokenizer_dir, reap_map=None):
     # The drafter: the anchor layers whose INPUT hiddens it conditions on.  No
     # derivation from the layer count -- a drafter trained on other anchors
     # would run and draft garbage (dspark_weights_bind).
-    targets = list(cfg['dspark_target_layer_ids'])
-    if len(targets) != 3:
-        raise SystemExit(f'dspark_target_layer_ids must name 3 layers, got {targets}')
-    kvs.append(('deepseek_v4_dspark.embedding_length', 'u32', cfg['hidden_size']))
-    kvs += [(f'dspark.target_layer_ids.{i}', 'u32', t) for i, t in enumerate(targets)]
+    if drafter:
+        kvs.append(('deepseek_v4_dspark.embedding_length', 'u32', cfg['hidden_size']))
+        kvs += [(f'dspark.target_layer_ids.{i}', 'u32', block_of(t)) for i, t in enumerate(targets)]
 
     # Engram (V4.1): the row tables are side files, named here so the loader can
     # refuse a table whose row count is not the checkpoint's (design s4, L242 slice 5).
     if 'engram_layer_ids' in cfg:
-        layers = list(cfg['engram_layer_ids'])
-        n_rows = list(cfg['engram_num_embeddings'])
-        if len(layers) != len(n_rows):
-            raise SystemExit(f'engram_layer_ids {layers} and engram_num_embeddings {n_rows} differ in length')
+        if len(cfg['engram_layer_ids']) != len(cfg['engram_num_embeddings']):
+            raise SystemExit(f'engram_layer_ids {cfg["engram_layer_ids"]} and engram_num_embeddings '
+                             f'{cfg["engram_num_embeddings"]} differ in length')
+        rows = [r for r, l in enumerate(cfg['engram_layer_ids']) if block_of(l) is not None]
+    if 'engram_layer_ids' in cfg and rows:          # a fixture may keep none (the engine reads no empty arrays)
         kvs += [
-            ('deepseek4.engram.layers', 'array', ('u32', layers)),
-            ('deepseek4.engram.n_rows', 'array', ('u64', n_rows)),
+            ('deepseek4.engram.layers', 'array', ('u32', [block_of(cfg['engram_layer_ids'][r]) for r in rows])),
+            ('deepseek4.engram.n_rows', 'array', ('u64', [cfg['engram_num_embeddings'][r] for r in rows])),
         ]
+        if engram_layout is not None:
+            kvs += _engram_layout_triples(engram_layout, cfg, rows)
+    elif engram_layout is not None:
+        raise SystemExit('--engram-layout: this build carries no Engram layer')
+    if keep is not None:
+        kvs.append(('pulsar.fixture.source_layers', 'array', ('u32', list(keep))))
 
     out = [entry(k, t, v) for k, t, v in kvs]
     keys = [e['key'] for e in out]

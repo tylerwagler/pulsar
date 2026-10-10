@@ -328,6 +328,41 @@ def main():
             h = json.loads(f.read(n))
         fams = {x["part"]: x["layout"] for x in json.loads(h["__metadata__"]["pulsar.experts"])}
         check(fams == {"w1": "exl3m_k4", "w3": "exl3m_k4", "w2": "exl3m_k4"}, f"mtp.0 families {fams}")
+
+        # L269 W2: a LAYER-SUBSET FIXTURE (--layers; names.py drop rule 4).  Keeping source layers 0 and 2: the
+        # blocks renumber (layers.2 binds as blk.1), the per-layer kv cut to the map, the map itself written, the
+        # drafter dropped (its anchors 0, 1, 2 are not all kept), the expert records naming their HF entries.
+        print("layer-subset fixture:")
+        of = os.path.join(tmp, "fixture")
+        ok, out = run("emit", "--hf", hf, "--exl3", ex, "--layers", "0,2", "--out", of, "--all")
+        check(ok, "emit --layers 0,2")
+        if not ok:
+            print(out[-600:])
+        ok, out = run("verify", "--hf", hf, "--exl3", ex, "--layers", "0,2", "--out", of, "--all")
+        check(ok and "failing: 0" in out, "verify PASS")
+        ok, out = run("audit", "--out", of)
+        check(ok and "AUDIT PASS" in out, "audit PASS")
+        files = sorted(f for f in os.listdir(of) if f.endswith(".safetensors"))
+        check(len(files) == 4, f"vision + 2 layers + top, no drafter shard ({files})")
+
+        def header(f):
+            with open(os.path.join(of, f), "rb") as fh:
+                (n,) = struct.unpack("<Q", fh.read(8))
+                return json.loads(fh.read(n))["__metadata__"]
+        kv = {e["key"]: e["value"] for e in json.loads(header(files[0])["pulsar.kv"])}
+        check(kv["deepseek4.block_count"] == 2 and kv["pulsar.fixture.source_layers"]["v"] == [0, 2]
+              and kv["deepseek4.attention.compress_ratios"]["v"] == [1, 128]
+              and kv["deepseek4.nextn_predict_layers"] == 0 and "dspark.target_layer_ids.0" not in kv,
+              "kv: block_count 2, the map, ratios cut to it, no drafter")
+        l2 = header(files[2])                                                            # source layer 2
+        tens = json.loads(l2["pulsar.tensors"])
+        exps = json.loads(l2["pulsar.experts"])
+        check(tens["layers.2.attn_norm.weight"]["gguf_name"] == "blk.1.attn_norm.weight"
+              and {x["entry_name"] for x in exps} == {f"layers.2.ffn.experts.{{e}}.{p}.weight" for p in ("w1", "w2", "w3")}
+              and {x["gguf_name"] for x in exps} == {f"blk.1.ffn_{p}_exps.weight" for p in ("gate", "down", "up")},
+              "layers.2 binds as blk.1, its expert records name their HF entries")
+        ok, out = run("plan", "--hf", hf, "--layers", "2,1", expect_fail=True, contains="ascending")
+        check(ok, "--layers not ascending -> refused")
     finally:
         shutil.rmtree(tmp)
     print(f"test_deepseek: {'PASS' if not FAILS else 'FAIL'} ({len(FAILS)} failing)")

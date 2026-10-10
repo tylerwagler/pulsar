@@ -26,8 +26,12 @@ EXPERT_FORMATS = {"cutlass_mxfp4", *EXL3}   # a routed expert: CUTLASS MXFP4 or 
 
 
 def shape(hf, ctx):
-    """From config.json alone (names.py's rule): the checkpoint's word, not a guess from its names."""
-    return N.ModelShape.from_config(hf.config["top_level"])
+    """From config.json alone (names.py's rule): the checkpoint's word, not a guess from its names; a layer-subset
+    fixture (--layers) keeps the source layers it names (names.ModelShape.subset)."""
+    full = N.ModelShape.from_config(hf.config["top_level"])
+    if not ctx.keep_layers:
+        return full
+    return full.subset(ctx.keep_layers, KV.text_config(hf).get("dspark_target_layer_ids", ()))
 
 
 shard_order = N.shard_order
@@ -104,11 +108,16 @@ def group_families(hf, key, slots, fmt, ctx):
                                            out)[0]) for e in range(n_exp)]
     else:
         srcs = [EN.expert_src(hf, slots[e][0], layout, out, inp) for e in range(n_exp)]
+    # A fixture's blocks are renumbered (names.py drop rule 4) while its entries keep the HF names, so the record
+    # names its entries (the loader's declared form, safetensors.cpp) instead of the blk.N -> layers.N default.
+    block_name = shard.split(".")[0]
+    extras = ({"entry_name": f"{block_name}.{layer}.ffn.experts.{{e}}.{part}.weight"}
+              if ctx.shape.keep is not None and block_name == "layers" else {})
     return [dict(gguf_name=m0.gguf_name, part=part, role=m0.role, layout=layout, inp=inp, n=out,
-                 entry_names=[slots[e][1].container_name for e in range(n_exp)], srcs=srcs, extras={})]
+                 entry_names=[slots[e][1].container_name for e in range(n_exp)], srcs=srcs, extras=extras)]
 
 
 def build_kv(hf, ctx):
     if ctx.ple_rows:
         raise SystemExit("--ple-rows: the PLE row file is a qwen4_exp table")
-    return KV.build_kv(hf, ctx.tokenizer_dir, ctx.reap_map)
+    return KV.build_kv(hf, ctx.tokenizer_dir, ctx.reap_map, keep=ctx.shape.keep, engram_layout=ctx.engram_layout)

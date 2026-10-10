@@ -129,7 +129,7 @@ int main(void) {
         dev_write(kv_d, kv.data(), kv.size() * 4); dev_write(sc_d, sc.data(), sc.size() * 4);
         pulsar_gpu_tensor *lat_d = dev_tensor(n_groups * D * 4);
         pulsar_gpu_tensor *st_kv = dev_tensor(ratio * D * 4), *st_sc = dev_tensor(ratio * D * 4);
-        CHECK(pulsar_gpu_csa2_compressor_prefill_tensor(lat_d, kv_d, sc_d, st_kv, st_sc, w_dev->ptr, D * 2, 0, 30u,
+        CHECK(pulsar_gpu_csa2_compressor_prefill_tensor(lat_d, NULL, kv_d, sc_d, st_kv, st_sc, w_dev->ptr, D * 2, 0, 30u,
                                                         D, ratio, pos0, n_tok, eps), "ratio-2 prefill launch");
         cudaDeviceSynchronize();
         std::vector<float> lat(n_groups * D), ref(D);
@@ -168,7 +168,7 @@ int main(void) {
             kvv.ptr = (char *)kv_d->ptr + (size_t)t * D * 4; kvv.bytes = D * 4;
             scv.ptr = (char *)sc_d->ptr + (size_t)t * D * 4; scv.bytes = D * 4;
             int emitted = 0;
-            CHECK(pulsar_gpu_csa2_compressor_update_tensor(row_d, &kvv, &scv, st_kv, st_sc, w_dev->ptr, D * 2, 0, 30u,
+            CHECK(pulsar_gpu_csa2_compressor_update_tensor(row_d, NULL, &kvv, &scv, st_kv, st_sc, w_dev->ptr, D * 2, 0, 30u,
                                                            D, ratio, pos0 + t, eps, &emitted), "ratio-2 update launch t=%u", t);
             cudaDeviceSynchronize();
             const int want_emit = ((pos0 + t + 1u) % ratio) == 0u;
@@ -204,7 +204,7 @@ int main(void) {
             CHECK(sbad == 0, "store: %d elements wrong (slot %u)", sbad, slot);
         }
         /* an unaligned start refuses */
-        CHECK(!pulsar_gpu_csa2_compressor_prefill_tensor(lat_d, kv_d, sc_d, st_kv, st_sc, w_dev->ptr, D * 2, 0, 30u,
+        CHECK(!pulsar_gpu_csa2_compressor_prefill_tensor(lat_d, NULL, kv_d, sc_d, st_kv, st_sc, w_dev->ptr, D * 2, 0, 30u,
                                                          D, ratio, pos0 + 1u, n_tok, eps),
               "ratio-2 prefill at an odd position was not refused");
     }
@@ -216,7 +216,7 @@ int main(void) {
         pulsar_gpu_tensor *kv_d = dev_tensor(kv.size() * 4);
         dev_write(kv_d, kv.data(), kv.size() * 4);
         pulsar_gpu_tensor *lat_d = dev_tensor(n_tok * D * 4);
-        CHECK(pulsar_gpu_csa2_compressor_prefill_tensor(lat_d, kv_d, NULL, NULL, NULL, w_dev->ptr, D * 2, 0, 30u,
+        CHECK(pulsar_gpu_csa2_compressor_prefill_tensor(lat_d, NULL, kv_d, NULL, NULL, NULL, w_dev->ptr, D * 2, 0, 30u,
                                                         D, ratio, pos0, n_tok, eps), "ratio-1 prefill launch");
         cudaDeviceSynchronize();
         std::vector<float> lat(n_tok * D), ref(D);
@@ -233,7 +233,7 @@ int main(void) {
         for (uint32_t t = 0; t < n_tok; t++) {
             pulsar_gpu_tensor kvv = *kv_d; kvv.ptr = (char *)kv_d->ptr + (size_t)t * D * 4; kvv.bytes = D * 4;
             int emitted = 0;
-            CHECK(pulsar_gpu_csa2_compressor_update_tensor(row_d, &kvv, NULL, NULL, NULL, w_dev->ptr, D * 2, 0, 30u,
+            CHECK(pulsar_gpu_csa2_compressor_update_tensor(row_d, NULL, &kvv, NULL, NULL, NULL, w_dev->ptr, D * 2, 0, 30u,
                                                            D, ratio, pos0 + t, eps, &emitted), "ratio-1 update launch");
             cudaDeviceSynchronize();
             CHECK(emitted == 1, "ratio-1 update t=%u did not emit", t);
@@ -270,7 +270,7 @@ int main(void) {
         pulsar_gpu_tensor *lat_d = dev_tensor(n_groups * D * 4);
         pulsar_gpu_tensor *st_kv = dev_tensor((size_t)lane_rows * W * 4);
         pulsar_gpu_tensor *st_sc = dev_tensor((size_t)lane_rows * W * 4);
-        CHECK(pulsar_gpu_csa2_compressor_prefill_tensor(lat_d, kv_d, sc_d, st_kv, st_sc, w_dev->ptr, D * 2, 0, 30u,
+        CHECK(pulsar_gpu_csa2_compressor_prefill_tensor(lat_d, NULL, kv_d, sc_d, st_kv, st_sc, w_dev->ptr, D * 2, 0, 30u,
                                                         D, ratio, pos0, n_tok, eps), "ratio-4 prefill launch");
         cudaDeviceSynchronize();
         std::vector<float> lat(n_groups * D), ref(D), gkv(lane_rows * W), gsc(lane_rows * W);
@@ -343,7 +343,7 @@ int main(void) {
             pulsar_gpu_tensor kvv = *kv_d; kvv.ptr = (char *)kv_d->ptr + (size_t)t * W * 4; kvv.bytes = W * 4;
             pulsar_gpu_tensor scv = *sc_d; scv.ptr = (char *)sc_d->ptr + (size_t)t * W * 4; scv.bytes = W * 4;
             int emitted = 0;
-            CHECK(pulsar_gpu_csa2_compressor_update_tensor(row_d, &kvv, &scv, st_kv, st_sc, w_dev->ptr, D * 2, 0, 30u,
+            CHECK(pulsar_gpu_csa2_compressor_update_tensor(row_d, NULL, &kvv, &scv, st_kv, st_sc, w_dev->ptr, D * 2, 0, 30u,
                                                            D, ratio, pos0 + t, eps, &emitted), "ratio-4 update launch");
             cudaDeviceSynchronize();
             const int want = ((pos0 + t + 1u) % ratio == 0u) ? 1 : 0;

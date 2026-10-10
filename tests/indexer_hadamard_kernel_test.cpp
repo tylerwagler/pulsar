@@ -304,7 +304,7 @@ int main(void) {
         /* route B: the parts, by hand, with the arguments written out here */
         CHECK(pulsar_gpu_csa2_comp_ape_add_tensor(scB, model_map, map_bytes, ape_offset, 0u,
                                                   width, ratio, pos0, n_tok), "ape add B");
-        CHECK(pulsar_gpu_csa2_compressor_prefill_tensor(latB, kvA, scB, sB_kv, sB_sc,
+        CHECK(pulsar_gpu_csa2_compressor_prefill_tensor(latB, NULL, kvA, scB, sB_kv, sB_sc,
                                                         model_map, map_bytes, norm_offset, 0u,
                                                         head_dim, ratio, pos0, n_tok, eps), "pool B");
         /* The rope position is the reference's rule and this line STATES it, so
@@ -374,7 +374,7 @@ int main(void) {
                   "remainder-only composite launch");
             CHECK(pulsar_gpu_csa2_comp_ape_add_tensor(scB, model_map, map_bytes, ape_offset, 0u,
                                                       width, ratio, pos0, r_tok), "remainder-only ape add B");
-            CHECK(pulsar_gpu_csa2_compressor_prefill_tensor(latB, kvA, scB, sB_kv, sB_sc,
+            CHECK(pulsar_gpu_csa2_compressor_prefill_tensor(latB, NULL, kvA, scB, sB_kv, sB_sc,
                                                             model_map, map_bytes, norm_offset, 0u,
                                                             head_dim, ratio, pos0, r_tok, eps),
                   "remainder-only pool B");

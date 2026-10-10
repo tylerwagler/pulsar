@@ -500,6 +500,14 @@ static bool gpu_graph_prefill_layer_major_inner(
 
     bool ok = gpu_graph_upload_prompt_tokens(g->prefill_tokens, prompt, start, n_tokens);
     if (!ok) return false;
+    /* L242 slice 5: the chunk's Engram hashes and gathers, before any layer (the prompt is the history) */
+    {
+        int32_t *pos = (int32_t *)xmalloc((size_t)n_tokens * sizeof(int32_t));
+        for (uint32_t i = 0; i < n_tokens; i++) pos[i] = (int32_t)(start + i);
+        ok = gpu_graph_engram_stage(g, prompt->v + start, pos, NULL, n_tokens, prompt->v, start);
+        free(pos);
+        if (!ok) return false;
+    }
 
 
     if (!gpu_graph_warmup_prefill_kernels(g, model, weights, n_tokens)) return false;
@@ -771,6 +779,12 @@ bool gpu_graph_verify_suffix_tops(
 
     bool ok = gpu_graph_upload_prompt_tokens(g->prefill_tokens, prompt, start, n_tokens);
     if (ok) ok = gpu_graph_upload_prompt_embeddings_hc(g, model, weights, prompt, start, n_tokens);
+    if (ok) {   /* L242 slice 5: the block's Engram hashes and gathers (the prompt is the history) */
+        int32_t *pos = (int32_t *)xmalloc((size_t)n_tokens * sizeof(int32_t));
+        for (uint32_t i = 0; i < n_tokens; i++) pos[i] = (int32_t)(start + i);
+        ok = gpu_graph_engram_stage(g, prompt->v + start, pos, NULL, n_tokens, prompt->v, start);
+        free(pos);
+    }
     if (!ok) return false;
 
 
@@ -975,6 +989,10 @@ int gpu_graph_decode_multiseq_batch(
      * declares them so their multi-row verify runs are not read as prefill. */
     const int32_t n_dec_declared = fused ? (int32_t)fused->n_dec
                                  : max_head_runs == PULSAR_MSEQ_HEAD_ALL_ROWS ? (int32_t)n_active : -1;
+    /* L242 slice 5: the rows' Engram hashes from each bank's history ring, and their gathers.  Before the step
+     * is armed, so a refusal (a history the ring does not hold) is the recoverable kind: the ring's writes are
+     * position-tagged and the next step's gathers drain these. */
+    if (!gpu_graph_engram_stage(g, tokens, pos, bank, n_active, NULL, 0)) return 0;
     if (!gpu_graph_multiseq_step_begin(g, pos, bank, n_active, capture_cur, n_dec_declared)) return 0;
     /* A fused step's prefill rows feed their banks' drafter prompt rings, as a
      * classic chunk does: arm the bulk anchor capture past the decode rows. */

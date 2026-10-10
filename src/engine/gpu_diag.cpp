@@ -1775,9 +1775,13 @@ bool gpu_graph_alloc_raw_cap(
     /* L264: the grid-checkpoint slabs size themselves from the layer views just
      * installed, so they come last. */
     const bool ckpt_ok = ok && pulsar_ckpt_alloc(&g->ckpt, &PULSAR_KV_STATE_DS4, g, banked ? g->banks.n_banks : 1u);
-    if (!ok || !ckpt_ok) {
-        fprintf(stderr, "pulsar: graph alloc failed: state lanes %s, layer caches %s, checkpoints %s -- refusing\n",
-                state_init_ok ? "ok" : "FAILED", layer_cache_ok ? "ok" : "FAILED", ckpt_ok ? "ok" : "FAILED");
+    /* L242 slice 5: the Engram step scratch and history ring (none without Engram layers) */
+    const bool engram_ok = ckpt_ok && gpu_graph_engram_alloc(g, weights, g->prefill_cap,
+                                                             banked ? g->banks.n_banks : 1u);
+    if (!ok || !ckpt_ok || !engram_ok) {
+        fprintf(stderr, "pulsar: graph alloc failed: state lanes %s, layer caches %s, checkpoints %s, engram %s -- "
+                        "refusing\n", state_init_ok ? "ok" : "FAILED", layer_cache_ok ? "ok" : "FAILED",
+                ckpt_ok ? "ok" : "FAILED", engram_ok ? "ok" : "FAILED");
         gpu_graph_release(g);
         return false;
     }

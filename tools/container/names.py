@@ -36,7 +36,7 @@ container.  Only the gguf_name is pinned -- both bind as
 embed = w1 (vocab -> rank) and head = w2 (rank -> vocab; the k-major
 fp8_e4m3_soa_k tensor, policy.py).
 
-Drop rules (emit=False), each the served artifact's behaviour:
+Drop rules (emit=False), each the served artifact's behaviour (4 is a test fixture's):
   1. `layers.N.ffn.gate.bias` on a hash-routed layer (N < n_hash): Vision-Exp
      allocates the router bias there but the forward never reads it (text
      tokens route through tid2eid, image tokens through bias_vl).
@@ -45,6 +45,12 @@ Drop rules (emit=False), each the served artifact's behaviour:
   3. `layers.N.engram.embed.{weight,scale}`: the Engram row table (L242) is a
      SIDE artifact, never a container tensor; `wkv`, `q_weight`, `k_weight` are
      ordinary layer-shard tensors under their HF names.
+  4. a LAYER-SUBSET FIXTURE (`build.py --layers`, ModelShape.keep): every tensor of
+     a main layer it does not keep, and the whole drafter unless its anchor layers
+     are all kept.  The kept layers renumber densely (source layer keep[i] binds as
+     blk.i; the container keys stay the HF names, so `verify` reads the source as
+     ever) and kv.py writes the map (`pulsar.fixture.source_layers`) with the
+     per-layer metadata cut to it.
 
 Unknown names return None and the caller refuses (rule 1 / rule 9); nothing
 is skipped silently.
@@ -65,6 +71,30 @@ class ModelShape:
     has_vision: bool
     v41: bool
     n_hash: int
+    # A LAYER-SUBSET FIXTURE (`build.py --layers`): the source layers kept, ascending; block i of the container is
+    # source layer keep[i] (gguf blk.i), every other main layer's tensors are consumed and not written (drop rule 4),
+    # and the drafter is kept only when every anchor layer it conditions on is (drafter).  None = the whole model.
+    keep: tuple | None = None
+    drafter: bool = True
+
+    def block_of(self, layer: int) -> int | None:
+        """The container block a source layer lands in, None when a fixture drops it."""
+        if self.keep is None:
+            return layer if 0 <= layer < self.n_layer else None
+        return self.keep.index(layer) if layer in self.keep else None
+
+    @property
+    def kept(self) -> tuple:
+        return self.keep if self.keep is not None else tuple(range(self.n_layer))
+
+    def subset(self, keep, anchors) -> "ModelShape":
+        """The fixture of this checkpoint that keeps `keep` (source layer indices); the drafter stays only when its
+        anchor layers (dspark_target_layer_ids) are all kept -- its conditioning hiddens are those layers' inputs."""
+        keep = tuple(int(x) for x in keep)
+        if not keep or list(keep) != sorted(set(keep)) or keep[0] < 0 or keep[-1] >= self.n_layer:
+            raise SystemExit(f"--layers {list(keep)}: ascending, distinct source layers in [0, {self.n_layer}) wanted")
+        return ModelShape(n_layer=self.n_layer, n_mtp=self.n_mtp, has_vision=self.has_vision, v41=self.v41,
+                          n_hash=self.n_hash, keep=keep, drafter=all(a in keep for a in anchors))
 
     @classmethod
     def from_config(cls, cfg: dict) -> "ModelShape":
@@ -104,8 +134,8 @@ def shard_order(shape: ModelShape) -> list[str]:
     """One shard per key: the vision/primary shard first (it carries pulsar.kv
     even when the tower is absent), one per layer, the top, one per drafter
     layer.  Files are model-{i:05d}-of-{n:05d}.safetensors in this order."""
-    return (["vision"] + [f"layers.{i}" for i in range(shape.n_layer)] + ["top"]
-            + [f"mtp.{i}" for i in range(shape.n_mtp)])
+    return (["vision"] + [f"layers.{i}" for i in shape.kept] + ["top"]
+            + [f"mtp.{i}" for i in range(shape.n_mtp if shape.drafter else 0)])
 
 
 def shard_file(shape: ModelShape, shard: str) -> str:
@@ -188,9 +218,9 @@ DRAFTER = {
 DRAFTER_UNNUMBERED = {"main_proj.weight", "main_norm.weight"}
 
 # Engram (L242): projections ride in the layer shard under their HF names; the
-# engine has no `blk.` spelling for them (slice 5 binds by these names or not at
-# all -- inventing a rename here would be a second authority).  The row table
-# is the side artifact.
+# engine has no `blk.` spelling for them (slice 5, engram.cpp engram_bind, binds
+# `layers.<source layer>.engram.*` -- inventing a rename here would be a second
+# authority).  The row table is the side artifact.
 ENGRAM_TENSORS = {"engram.wkv.weight", "engram.q_weight", "engram.k_weight"}
 ENGRAM_SIDECAR = {"engram.embed.weight"}
 
@@ -250,7 +280,9 @@ def _map_block(ns: str, idx: int, rest: str, shape: ModelShape) -> Mapped | None
     else:
         if idx >= shape.n_layer:
             return None
-        shard, prefix, family = f"layers.{idx}", f"blk.{idx}.", "layer"
+        shard, prefix, family = f"layers.{idx}", f"blk.{shape.block_of(idx)}.", "layer"
+    # drop rule 4: a layer-subset fixture consumes the layers (and the drafter) it does not keep
+    dropped = (not shape.drafter) if is_mtp else shape.block_of(idx) is None
 
     m = _EXPERT.match(rest)
     if m:
@@ -258,7 +290,7 @@ def _map_block(ns: str, idx: int, rest: str, shape: ModelShape) -> Mapped | None
         return Mapped(container_name=f"{ns}.{idx}.ffn.experts.{e}.{part}.weight",
                       gguf_name=f"{prefix}ffn_{EXPERT_PART_GGUF[part]}_exps.weight",
                       family="expert", shard=shard, layer=idx, expert=e, part=part,
-                      is_scale=leaf in COMPANION, role=EXPERT_ROLE[part])
+                      is_scale=leaf in COMPANION, emit=not dropped, role=EXPERT_ROLE[part])
 
     suffix, companion = _split_leaf(rest)
     if not is_mtp and suffix in ENGRAM_SIDECAR:
@@ -266,7 +298,7 @@ def _map_block(ns: str, idx: int, rest: str, shape: ModelShape) -> Mapped | None
                       None, None, companion, emit=False, role=role_of(suffix))
     if not is_mtp and suffix in ENGRAM_TENSORS:
         return Mapped(f"{ns}.{idx}.{suffix}", f"{ns}.{idx}.{suffix}", family, shard, idx,
-                      None, None, companion, role=role_of(suffix))
+                      None, None, companion, emit=not dropped, role=role_of(suffix))
 
     if suffix in LAYER:
         gguf = prefix + LAYER[suffix]
@@ -281,7 +313,7 @@ def _map_block(ns: str, idx: int, rest: str, shape: ModelShape) -> Mapped | None
     else:
         return None
     return Mapped(container_name=f"{ns}.{idx}.{suffix}", gguf_name=gguf, family=family,
-                  shard=shard, layer=idx, expert=None, part=None, is_scale=companion, emit=emit,
+                  shard=shard, layer=idx, expert=None, part=None, is_scale=companion, emit=emit and not dropped,
                   role=role_of(suffix))
 
 

@@ -37,7 +37,8 @@ names.py                                # DeepSeek's naming table
       role: str                         # the recipe's vocabulary: dense | shared_expert | expert_gate / _up / _down |
                                         #  router | route_table | norm | embed | head | draft_head | vision | other
   def map_hf(hf_name: str, shape: ModelShape) -> Mapped | None      # None = not a model tensor (refuse, never skip silently)
-  ModelShape = dataclass(n_layer, n_mtp, has_vision, v41: bool, n_hash: int)     # ModelShape.from_config(config.json)
+  ModelShape = dataclass(n_layer, n_mtp, has_vision, v41: bool, n_hash: int,     # ModelShape.from_config(config.json)
+                         keep: tuple | None, drafter: bool)  # .subset(keep, anchors): a layer-subset fixture (--layers)
   def shard_order(shape) -> [str]; shard_file(shape, shard) -> str               # the shard plan
   def exl3_expert_key(block, layer, e, part); exl3_layers(names)                 # DeepSeek's EXL3 keys
 
