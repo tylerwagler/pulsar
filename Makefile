@@ -268,7 +268,7 @@ pulsar-agent: $(AGENT_OBJS) src/lib/pulsar_help.o src/lib/pulsar_kvtext.o src/li
 # L278: the family kernel gates that need a GPU and no model run here, for every family -- Qwen's GDN, QSA and
 # S4 (router / MoE / GR / PLE) beside DeepSeek's and the shared EXL3 arms.
 cuda-regression: tests/cuda_long_context_smoke tests/moe_route_bounds_gate tests/expert_table_gate tests/exl3_gemv_gate \
-                 tests/exl3_dense_gate tests/exl3_moe_prefill_gate \
+                 tests/exl3_dense_gate tests/exl3_moe_prefill_gate tests/exl3_half_gate \
                  tests/gdn_gate tests/qsa_attn_gate tests/qwen_s4_gate
 	./tests/cuda_long_context_smoke
 	./tests/moe_route_bounds_gate
@@ -276,6 +276,7 @@ cuda-regression: tests/cuda_long_context_smoke tests/moe_route_bounds_gate tests
 	./tests/exl3_gemv_gate
 	./tests/exl3_dense_gate
 	./tests/exl3_moe_prefill_gate
+	./tests/exl3_half_gate $(EXL3_HALF_SCRATCH)
 	./tests/gdn_gate
 	./tests/qsa_attn_gate
 	./tests/qwen_s4_gate
@@ -512,6 +513,21 @@ tests/exl3_moe_prefill_gate: tests/exl3_moe_prefill_gate.cu src/cuda/mmq/exl3_mo
 .PHONY: exl3-moe-prefill-gate
 exl3-moe-prefill-gate: tests/exl3_moe_prefill_gate
 	./tests/exl3_moe_prefill_gate
+
+# L269 W1: a rank's EXL3 expert half (gate / up by output columns, down by input
+# rows) is a byte-exact piece of the whole, through the production builder; the
+# routed entry under expert_split on both halves == the whole (z and the folded
+# mid's E4M3 bit for bit, out_0 + out_1 within f32 reassociation) at decode and
+# prefill widths, every rate; refusals.  V4.1 shape, model-free, one GPU; the
+# stacks go to an unlinked scratch file in EXL3_HALF_SCRATCH.
+EXL3_HALF_SCRATCH ?= .
+tests/exl3_half_gate: tests/exl3_half_gate.cu $(CUDA_OBJS) $(CUTLASS_CUDA_OBJS) $(MMQ_OBJS) Makefile
+	$(NVCC) $(NVCCFLAGS) -std=c++17 -Isrc -Isrc/cuda -o $@ tests/exl3_half_gate.cu \
+		$(CUDA_OBJS) $(CUTLASS_CUDA_OBJS) $(MMQ_OBJS) $(CUDA_LDLIBS)
+
+.PHONY: exl3-half-gate
+exl3-half-gate: tests/exl3_half_gate
+	./tests/exl3_half_gate $(EXL3_HALF_SCRATCH)
 
 # L287: one DeepSeek routed EXL3 layer on a prompt chunk through the production
 # front door (ms/layer, tok/s at 512 / 4096 / 8192 tokens; V4 or V4.1 shapes), and
@@ -763,7 +779,10 @@ bank-residency-gate-qwen: tests/bank_residency_gate
 # DeepSeek's is the pair's model: its TP builds the expert halves from CUTLASS MXFP4 stacks, which FRONTIER_MODEL
 # (vexp, IQ2 experts) does not have.  A cold first run reads the artifact's scans over NFS (~7 min); cached, seconds.
 TP_PAIR_DS_MODEL ?= /mnt/models/DeepSeek-v4-Flash
-TP_PLAN_MODELS = $(TP_PAIR_DS_MODEL) $(QWEN_GATE_MODEL)
+# L269 W1: the V4.1 layer-subset fixture (layer 4 = source layer 20, OUR EXL3 K3; the rest CUTLASS MXFP4) -- the
+# plan's EXL3 expert halves beside the MXFP4 ones.
+TP_V41_FIXTURE ?= /mnt/models/v41-tp1-fixture
+TP_PLAN_MODELS = $(TP_PAIR_DS_MODEL) $(QWEN_GATE_MODEL) $(TP_V41_FIXTURE)
 .PHONY: tp-plan-gate tp-plan-golden
 tp-plan-gate: tests/tp_plan_test
 	@for m in $(TP_PLAN_MODELS); do for r in 0 1; do \
@@ -2129,7 +2148,7 @@ gates-dev:
 	fi; \
 	if [ $$exl3 -eq 1 ]; then \
 	  $(MAKE) --no-print-directory exl3-dequant-gate CUDA_ARCH=sm_120f || rc=1; \
-	  $(MAKE) --no-print-directory exl3-gemv-gate exl3-dense-gate exl3-moe-prefill-gate CUDA_ARCH=sm_120f || rc=1; \
+	  $(MAKE) --no-print-directory exl3-gemv-gate exl3-dense-gate exl3-moe-prefill-gate exl3-half-gate CUDA_ARCH=sm_120f || rc=1; \
 	fi; \
 	if [ $$family -eq 1 ]; then \
 	  $(MAKE) --no-print-directory qwen-family-gate-device CUDA_ARCH=sm_120f || rc=1; \

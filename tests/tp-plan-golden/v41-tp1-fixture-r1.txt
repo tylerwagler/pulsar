@@ -1,0 +1,87 @@
+# family DeepSeek V4 rank 1 of 2
+fp8_rows blk.0.attn_q_b.weight off 88205248 in 1280 out 32768 rows [16384,32768)
+fp8_rows blk.0.attn_output_a.weight off 3590080 in 4096 out 8192 rows [4096,8192)
+fp8_kslice blk.0.attn_output_b.weight off 38193088 in 8192 out 5120 cols [4096,8192) key engine+tensor
+fp8_rows blk.0.attn_q_a.weight off 81446848 in 5120 out 1280 rows [640,1280)
+fp8_rows blk.0.attn_kv.weight off 886720 in 5120 out 512 rows [256,512)
+fp8_rows blk.0.ffn_gate_shexp.weight off 297688000 in 5120 out 2304 rows [1152,2304)
+fp8_rows blk.0.ffn_up_shexp.weight off 322018240 in 5120 out 2304 rows [1152,2304)
+fp8_kslice blk.0.ffn_down_shexp.weight off 309853120 in 2304 out 5120 cols [1152,2304) key engine+tensor
+mxfp4_half blk.0.ffn_gate_exps.weight off 338125952 key 1254130450432 experts 384 k 5120 n 2304 rows [1152,2304) src 6266880/5898240 dst 3133440/2949120
+mxfp4_half blk.0.ffn_up_exps.weight off 5151089792 key 1262720385024 experts 384 k 5120 n 2304 rows [1152,2304) src 6266880/5898240 dst 3133440/2949120
+mxfp4_half blk.0.ffn_down_exps.weight off 2744607872 key 1258425417728 experts 384 k 2304 n 5120 kcols [1152,2304) src 6266880/5898240 dst 3133440/2949120
+fp8_rows blk.1.attn_q_b.weight off 104558752 in 1280 out 32768 rows [16384,32768)
+fp8_rows blk.1.attn_output_a.weight off 19943584 in 4096 out 8192 rows [4096,8192)
+fp8_kslice blk.1.attn_output_b.weight off 54546592 in 8192 out 5120 cols [4096,8192) key engine+tensor
+fp8_rows blk.1.attn_q_a.weight off 97800352 in 5120 out 1280 rows [640,1280)
+fp8_rows blk.1.attn_kv.weight off 17240224 in 5120 out 512 rows [256,512)
+view blk.1.attn_compressor_kv.weight off 6128032 rows [256,512) of 512
+view blk.1.attn_compressor_gate.weight off 885152 rows [256,512) of 512
+view blk.1.indexer.proj.weight off 11371168 rows [16,32) of 32
+fp8_rows blk.1.ffn_gate_shexp.weight off 151757984 in 5120 out 2304 rows [1152,2304)
+fp8_rows blk.1.ffn_up_shexp.weight off 176088224 in 5120 out 2304 rows [1152,2304)
+fp8_kslice blk.1.ffn_down_shexp.weight off 163923104 in 2304 out 5120 cols [1152,2304) key engine+tensor
+mxfp4_half blk.1.ffn_gate_exps.weight off 192195936 key 1391569403904 experts 384 k 5120 n 2304 rows [1152,2304) src 6266880/5898240 dst 3133440/2949120
+mxfp4_half blk.1.ffn_up_exps.weight off 5005159776 key 1400159338496 experts 384 k 5120 n 2304 rows [1152,2304) src 6266880/5898240 dst 3133440/2949120
+mxfp4_half blk.1.ffn_down_exps.weight off 2598677856 key 1395864371200 experts 384 k 2304 n 5120 kcols [1152,2304) src 6266880/5898240 dst 3133440/2949120
+fp8_rows blk.2.attn_q_b.weight off 88204544 in 1280 out 32768 rows [16384,32768)
+fp8_rows blk.2.attn_output_a.weight off 3589376 in 4096 out 8192 rows [4096,8192)
+fp8_kslice blk.2.attn_output_b.weight off 38192384 in 8192 out 5120 cols [4096,8192) key engine+tensor
+fp8_rows blk.2.attn_q_a.weight off 81446144 in 5120 out 1280 rows [640,1280)
+fp8_rows blk.2.attn_kv.weight off 886016 in 5120 out 512 rows [256,512)
+fp8_rows blk.2.ffn_gate_shexp.weight off 135403776 in 5120 out 2304 rows [1152,2304)
+fp8_rows blk.2.ffn_up_shexp.weight off 159734016 in 5120 out 2304 rows [1152,2304)
+fp8_kslice blk.2.ffn_down_shexp.weight off 147568896 in 2304 out 5120 cols [1152,2304) key engine+tensor
+mxfp4_half blk.2.ffn_gate_exps.weight off 175841728 key 1498943586304 experts 384 k 5120 n 2304 rows [1152,2304) src 6266880/5898240 dst 3133440/2949120
+mxfp4_half blk.2.ffn_up_exps.weight off 4988805568 key 1507533520896 experts 384 k 5120 n 2304 rows [1152,2304) src 6266880/5898240 dst 3133440/2949120
+mxfp4_half blk.2.ffn_down_exps.weight off 2582323648 key 1503238553600 experts 384 k 2304 n 5120 kcols [1152,2304) src 6266880/5898240 dst 3133440/2949120
+fp8_rows blk.3.attn_q_b.weight off 104560672 in 1280 out 32768 rows [16384,32768)
+fp8_rows blk.3.attn_output_a.weight off 19945504 in 4096 out 8192 rows [4096,8192)
+fp8_kslice blk.3.attn_output_b.weight off 54548512 in 8192 out 5120 cols [4096,8192) key engine+tensor
+fp8_rows blk.3.attn_q_a.weight off 97802272 in 5120 out 1280 rows [640,1280)
+fp8_rows blk.3.attn_kv.weight off 17242144 in 5120 out 512 rows [256,512)
+view blk.3.attn_compressor_kv.weight off 6129952 rows [256,512) of 512
+view blk.3.attn_compressor_gate.weight off 887072 rows [256,512) of 512
+view blk.3.indexer.proj.weight off 11373088 rows [16,32) of 32
+fp8_rows blk.3.ffn_gate_shexp.weight off 314043424 in 5120 out 2304 rows [1152,2304)
+fp8_rows blk.3.ffn_up_shexp.weight off 338373664 in 5120 out 2304 rows [1152,2304)
+fp8_kslice blk.3.ffn_down_shexp.weight off 326208544 in 2304 out 5120 cols [1152,2304) key engine+tensor
+mxfp4_half blk.3.ffn_gate_exps.weight off 354481376 key 1649267441664 experts 384 k 5120 n 2304 rows [1152,2304) src 6266880/5898240 dst 3133440/2949120
+mxfp4_half blk.3.ffn_up_exps.weight off 5167445216 key 1657857376256 experts 384 k 5120 n 2304 rows [1152,2304) src 6266880/5898240 dst 3133440/2949120
+mxfp4_half blk.3.ffn_down_exps.weight off 2760963296 key 1653562408960 experts 384 k 2304 n 5120 kcols [1152,2304) src 6266880/5898240 dst 3133440/2949120
+fp8_rows blk.4.attn_q_b.weight off 99316704 in 1280 out 32768 rows [16384,32768)
+fp8_rows blk.4.attn_output_a.weight off 14701536 in 4096 out 8192 rows [4096,8192)
+fp8_kslice blk.4.attn_output_b.weight off 49304544 in 8192 out 5120 cols [4096,8192) key engine+tensor
+fp8_rows blk.4.attn_q_a.weight off 92558304 in 5120 out 1280 rows [640,1280)
+fp8_rows blk.4.attn_kv.weight off 11998176 in 5120 out 512 rows [256,512)
+view blk.4.attn_compressor_kv.weight off 885984 rows [256,512) of 512
+view blk.4.indexer.proj.weight off 6129120 rows [16,32) of 32
+fp8_rows blk.4.ffn_gate_shexp.weight off 146515936 in 5120 out 2304 rows [1152,2304)
+fp8_rows blk.4.ffn_up_shexp.weight off 170846176 in 5120 out 2304 rows [1152,2304)
+fp8_kslice blk.4.ffn_down_shexp.weight off 158681056 in 2304 out 5120 cols [1152,2304) key engine+tensor
+exl3_half blk.4.ffn_gate_exps.weight off 186953888 key 1782411427840 experts 384 k 5120 n 2304 rows [1152,2304) k2 6 src 4438528/4423680 dst 2224384/2211840
+exl3_half blk.4.ffn_up_exps.weight off 3595743392 key 1791001362432 experts 384 k 5120 n 2304 rows [1152,2304) k2 6 src 4438528/4423680 dst 2224384/2211840
+exl3_half blk.4.ffn_down_exps.weight off 1891348640 key 1786706395136 experts 384 k 2304 n 5120 kcols [1152,2304) k2 6 src 4438528/4423680 dst 2224384/2211840
+fp8_rows blk.5.attn_q_b.weight off 88205760 in 1280 out 32768 rows [16384,32768)
+fp8_rows blk.5.attn_output_a.weight off 3590592 in 4096 out 8192 rows [4096,8192)
+fp8_kslice blk.5.attn_output_b.weight off 38193600 in 8192 out 5120 cols [4096,8192) key engine+tensor
+fp8_rows blk.5.attn_q_a.weight off 81447360 in 5120 out 1280 rows [640,1280)
+fp8_rows blk.5.attn_kv.weight off 887232 in 5120 out 512 rows [256,512)
+fp8_rows blk.5.ffn_gate_shexp.weight off 135404992 in 5120 out 2304 rows [1152,2304)
+fp8_rows blk.5.ffn_up_shexp.weight off 159735232 in 5120 out 2304 rows [1152,2304)
+fp8_kslice blk.5.ffn_down_shexp.weight off 147570112 in 2304 out 5120 cols [1152,2304) key engine+tensor
+mxfp4_half blk.5.ffn_gate_exps.weight off 175842944 key 1889785610240 experts 384 k 5120 n 2304 rows [1152,2304) src 6266880/5898240 dst 3133440/2949120
+mxfp4_half blk.5.ffn_up_exps.weight off 4988806784 key 1898375544832 experts 384 k 5120 n 2304 rows [1152,2304) src 6266880/5898240 dst 3133440/2949120
+mxfp4_half blk.5.ffn_down_exps.weight off 2582324864 key 1894080577536 experts 384 k 2304 n 5120 kcols [1152,2304) src 6266880/5898240 dst 3133440/2949120
+fp8_rows blk.6.attn_q_b.weight off 93940640 in 1280 out 32768 rows [16384,32768)
+fp8_rows blk.6.attn_output_a.weight off 9325472 in 4096 out 8192 rows [4096,8192)
+fp8_kslice blk.6.attn_output_b.weight off 43928480 in 8192 out 5120 cols [4096,8192) key engine+tensor
+fp8_rows blk.6.attn_q_a.weight off 87182240 in 5120 out 1280 rows [640,1280)
+fp8_rows blk.6.attn_kv.weight off 6622112 in 5120 out 512 rows [256,512)
+view blk.6.indexer.proj.weight off 884128 rows [16,32) of 32
+fp8_rows blk.6.ffn_gate_shexp.weight off 141139872 in 5120 out 2304 rows [1152,2304)
+fp8_rows blk.6.ffn_up_shexp.weight off 165470112 in 5120 out 2304 rows [1152,2304)
+fp8_kslice blk.6.ffn_down_shexp.weight off 153304992 in 2304 out 5120 cols [1152,2304) key engine+tensor
+mxfp4_half blk.6.ffn_gate_exps.weight off 181577824 key 2005749727232 experts 384 k 5120 n 2304 rows [1152,2304) src 6266880/5898240 dst 3133440/2949120
+mxfp4_half blk.6.ffn_up_exps.weight off 4994541664 key 2014339661824 experts 384 k 5120 n 2304 rows [1152,2304) src 6266880/5898240 dst 3133440/2949120
+mxfp4_half blk.6.ffn_down_exps.weight off 2588059744 key 2010044694528 experts 384 k 2304 n 5120 kcols [1152,2304) src 6266880/5898240 dst 3133440/2949120

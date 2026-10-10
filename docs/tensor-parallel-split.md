@@ -242,6 +242,23 @@ bug, not a design change.
       EXL3 zero-fill, the owned (clamping) expert tables for MXFP4 and EXL3,
       the owned byte-span helper and the 4f owned span.  The 4c/4f entries
       above are history.
+- **4g-2 EXL3 (L269 W1, 2026-10-10): the same split for EXL3 routed stacks**,
+      which is what lets V4.1 (all-EXL3 experts) fit the pair.  The plan's op
+      `exl3_half` (tp_slice.cpp) cuts every expert with `exl3_expert_cut`
+      (exl3_trellis.h: gate/up per k-tile row the n-tiles of the owned
+      columns + svh of them, suh whole; down the owned k-tile rows + suh of
+      them, svh whole -- 128-aligned, so the Hadamard blocks stay whole), and
+      `pulsar_gpu_register_exl3_expert_half` builds it through the same staged
+      reader as the MXFP4 half (`cuda_register_expert_half`).  The half is
+      `exl3_expert_layout` of the half shape, so the EXL3 arms (trellis GEMV,
+      fold, the L287 prefill GEMM, sum) run on it unchanged at
+      expert_mid_dim = the half width; their mid granule is the 128 block
+      (V4.1: 2304 -> 1152 = 9 x 128).  The routed entry's `expert_split`
+      admits pure MXFP4 or pure EXL3 stacks.  `make exl3-half-gate` proves the
+      halves byte-exact and the routed entry on both halves == the whole (z and
+      the folded mid bit for bit; out_0 + out_1 within f32 reassociation).
+      V4.1's shared-expert half (1152) also needed the MXFP4 small-batch FFN
+      and the SwiGLU MX emit to take a 128 / warp granule instead of 256.
 
 ## Open items for bring-up
 - **Slab (resolved on-pair 2026-09-02, allocator merged → dev):**

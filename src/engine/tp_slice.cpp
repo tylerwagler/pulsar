@@ -12,6 +12,7 @@
  *   bf16 / f32      OUT        view (one range: offset arithmetic)   <type>_channels, gathered
  *   CUTLASS MXFP4   OUT / IN   mxfp4_half of every expert            --
  *     (a stack)
+ *   EXL3 (a stack)  OUT / IN   exl3_half of every expert             --
  *   any stack       EXPERTS    --                                    stage_range, the rank's whole experts
  *
  * A pairing with no operation refuses by name at load.  A tensor whose slice REPLACES it (built, a half, a staged
@@ -56,6 +57,7 @@ static const char *op_name(pulsar_tp_op op) {
     case PULSAR_TP_OP_VIEW: return "view";
     case PULSAR_TP_OP_GATHER: return "gather";
     case PULSAR_TP_OP_MXFP4_HALF: return "mxfp4_half";
+    case PULSAR_TP_OP_EXL3_HALF: return "exl3_half";
     case PULSAR_TP_OP_EXPERTS: return "stage_range";
     case PULSAR_TP_OP_NONE: break;
     }
@@ -110,6 +112,7 @@ static pulsar_tp_op plan_op(const pulsar_tp_slice *s, pulsar_act_kind kind) {
         return !rows ? PULSAR_TP_OP_NONE : out ? PULSAR_TP_OP_EXL3_COLS : PULSAR_TP_OP_EXL3_ROWS;
     if (plain_type(t->type) && out) return rows ? PULSAR_TP_OP_GATHER : s->n == 1 ? PULSAR_TP_OP_VIEW : PULSAR_TP_OP_NONE;
     if (t->type == PULSAR_TENSOR_CUTLASS_MXFP4 && t->ndim == 3) return rows ? PULSAR_TP_OP_NONE : PULSAR_TP_OP_MXFP4_HALF;
+    if (exl3_type_k2(t->type) && t->ndim == 3) return rows ? PULSAR_TP_OP_NONE : PULSAR_TP_OP_EXL3_HALF;
     return PULSAR_TP_OP_NONE;
 }
 
@@ -117,7 +120,8 @@ static pulsar_tp_op plan_op(const pulsar_tp_slice *s, pulsar_act_kind kind) {
 static bool plan_ranges_ok(const pulsar_tp_slice *s, pulsar_tp_op op) {
     const uint64_t full = axis_full(s->t, s->axis);
     const bool multi = op == PULSAR_TP_OP_EXL3_COLS || op == PULSAR_TP_OP_GATHER;
-    const uint64_t align = op == PULSAR_TP_OP_EXL3_COLS || op == PULSAR_TP_OP_EXL3_ROWS || op == PULSAR_TP_OP_MXFP4_HALF
+    const uint64_t align = op == PULSAR_TP_OP_EXL3_COLS || op == PULSAR_TP_OP_EXL3_ROWS ||
+                                   op == PULSAR_TP_OP_MXFP4_HALF || op == PULSAR_TP_OP_EXL3_HALF
                                ? 128u : 1u;
     if (!full || (s->n > 1 && !multi)) return false;
     for (uint32_t i = 0; i < s->n; i++) {
@@ -129,7 +133,7 @@ static bool plan_ranges_ok(const pulsar_tp_slice *s, pulsar_tp_op op) {
 
 static bool op_replaces(pulsar_tp_op op) {
     return op == PULSAR_TP_OP_EXL3_COLS || op == PULSAR_TP_OP_EXL3_ROWS || op == PULSAR_TP_OP_GATHER ||
-           op == PULSAR_TP_OP_MXFP4_HALF || op == PULSAR_TP_OP_EXPERTS;
+           op == PULSAR_TP_OP_MXFP4_HALF || op == PULSAR_TP_OP_EXL3_HALF || op == PULSAR_TP_OP_EXPERTS;
 }
 
 bool pulsar_tp_plan_build(pulsar_engine *e) {
@@ -144,7 +148,7 @@ bool pulsar_tp_plan_build(pulsar_engine *e) {
     e->model.tp_plan = p;
     e->dspark_model.tp_plan = p;   /* the drafter's tensors are in the plan too (a merged drafter aliases the model) */
     if (!e->family->tp_slices(e, p)) return false;
-    uint32_t count[9] = {0};
+    uint32_t count[9] = {0};   /* one per operation bit */
     uint64_t unstaged = 0;
     for (const pulsar_tp_slice &s : p->slices) {
         const pulsar_tp_op op = plan_op(&s, e->family->act_kind);
@@ -168,9 +172,10 @@ bool pulsar_tp_plan_build(pulsar_engine *e) {
         }
     }
     fprintf(stderr, "pulsar: TP plan: rank %d/%u, %zu slices (fp8 rows %u, fp8 K %u, exl3 cols %u, exl3 rows %u, "
-                    "views %u, gathers %u, mxfp4 halves %u, expert ranges %u); %.2f GiB of stored tensors unstaged\n",
+                    "views %u, gathers %u, mxfp4 halves %u, expert ranges %u, exl3 halves %u); %.2f GiB of stored "
+                    "tensors unstaged\n",
             e->model.tp_rank, e->model.tp_n_ranks, p->slices.size(), count[0], count[1], count[2], count[3], count[4],
-            count[5], count[6], count[7], (double)unstaged / 1073741824.0);
+            count[5], count[6], count[7], count[8], (double)unstaged / 1073741824.0);
     return true;
 }
 
@@ -203,41 +208,25 @@ const void *pulsar_tp_built_ptr(const pulsar_model *m, const pulsar_tensor *t) {
 }
 
 /* ---- EXL3 [trellis | suh | svh], trellis in (k-tile, n-tile, word) order (exl3_trellis.h) ---------------------
- * An output-column slice is, per k-tile row, a run of n-tiles plus that range of svh (suh whole); an input-row
- * slice is a run of k-tile rows plus that range of suh (svh whole).  Every cut is 128-aligned, so the Hadamard
- * blocks on both sides stay whole and a slice is bytes copied -- the rank's matmul is exactly the full one's
- * rows / columns (a K slice's output is a partial the all-reduce sums). */
-static bool exl3_tile_geometry(const pulsar_tensor *t, uint64_t *K, uint64_t *N, uint64_t *trellis, uint64_t *tile) {
-    const int k2 = exl3_type_k2(t->type);
-    uint64_t sc = 0, stride = 0;
-    *K = t->dim[0];
-    *N = t->dim[1];
-    if (!k2 || !exl3_expert_layout(*K, *N, k2, trellis, &sc, &stride) || stride != t->bytes) return false;
-    *tile = *trellis / ((*K / 16u) * (*N / 16u));
-    return true;
-}
-
-static bool exl3_slice_cols(const uint8_t *src, const pulsar_tp_slice *s, std::vector<uint8_t> &out) {
-    uint64_t K = 0, N = 0, tr = 0, tile = 0;
-    if (!exl3_tile_geometry(s->t, &K, &N, &tr, &tile)) return false;
-    for (uint64_t kt = 0; kt < K / 16u; kt++)
-        for (uint32_t i = 0; i < s->n; i++) {
-            const uint8_t *p = src + (kt * (N / 16u) + s->lo[i] / 16u) * tile;
-            out.insert(out.end(), p, p + (s->hi[i] - s->lo[i]) / 16u * tile);
-        }
-    out.insert(out.end(), src + tr, src + tr + K * 2u);                       /* suh: the whole input */
-    for (uint32_t i = 0; i < s->n; i++)
-        out.insert(out.end(), src + tr + K * 2u + s->lo[i] * 2u, src + tr + K * 2u + s->hi[i] * 2u);
-    return true;
-}
-
-static bool exl3_slice_rows(const uint8_t *src, const pulsar_tp_slice *s, std::vector<uint8_t> &out) {
-    uint64_t K = 0, N = 0, tr = 0, tile = 0;
-    const uint64_t k0 = s->lo[0], k1 = s->hi[0];
-    if (!exl3_tile_geometry(s->t, &K, &N, &tr, &tile)) return false;
-    out.insert(out.end(), src + k0 / 16u * (N / 16u) * tile, src + k1 / 16u * (N / 16u) * tile);
-    out.insert(out.end(), src + tr + k0 * 2u, src + tr + k1 * 2u);            /* suh: the rank's inputs */
-    out.insert(out.end(), src + tr + K * 2u, src + tr + K * 2u + N * 2u);       /* svh: the whole output */
+ * A rows reader's slice of a 2-D EXL3 linear is its ranges cut into one destination of their summed extent
+ * (exl3_expert_cut: output columns -- per k-tile row a run of n-tiles plus that range of svh, suh whole -- or
+ * input rows -- a run of k-tile rows plus that range of suh, svh whole).  Every cut is 128-aligned, so the
+ * Hadamard blocks on both sides stay whole and a slice is bytes copied -- the rank's matmul is exactly the full
+ * one's rows / columns (a K slice's output is a partial the all-reduce sums). */
+static bool exl3_slice(const uint8_t *src, const pulsar_tp_slice *s, std::vector<uint8_t> &out) {
+    const int k2 = exl3_type_k2(s->t->type);
+    const bool in_axis = s->axis == PULSAR_TP_AXIS_IN;
+    uint64_t ext = 0, at = 0;
+    for (uint32_t i = 0; i < s->n; i++) ext += s->hi[i] - s->lo[i];
+    for (uint32_t i = 0; i < s->n; i++) {
+        exl3_cut c;
+        if (!exl3_expert_cut(s->t->dim[0], s->t->dim[1], k2, in_axis, s->lo[i], s->hi[i], at, ext, &c) ||
+            c.src_stride != s->t->bytes)
+            return false;
+        out.resize(c.dst_stride);
+        exl3_expert_cut_apply(&c, src, out.data());
+        at += s->hi[i] - s->lo[i];
+    }
     return true;
 }
 
@@ -295,8 +284,7 @@ static bool run_slice(pulsar_engine *e, pulsar_tp_plan *p, const pulsar_tp_slice
     case PULSAR_TP_OP_EXL3_COLS:
     case PULSAR_TP_OP_EXL3_ROWS: {
         std::vector<uint8_t> b;
-        const uint8_t *src = (const uint8_t *)tensor_data(m, t);
-        if (!(op == PULSAR_TP_OP_EXL3_COLS ? exl3_slice_cols(src, s, b) : exl3_slice_rows(src, s, b))) {
+        if (!exl3_slice((const uint8_t *)tensor_data(m, t), s, b)) {
             fprintf(stderr, "pulsar: TP: %s does not slice as EXL3 tiles -- refusing\n", nm);
             return false;
         }
@@ -333,6 +321,31 @@ static bool run_slice(pulsar_engine *e, pulsar_tp_plan *p, const pulsar_tp_slice
         return pulsar_gpu_register_mxfp4_expert_half(e, pulsar_tp_expert_half_offset(m, t), tensor_map_base(m, t),
                                                      t->abs_offset, n_exp, k, n, k_half ? 1 : 0, lo, hi, ss, sd, hs,
                                                      hd) != 0;
+    }
+    case PULSAR_TP_OP_EXL3_HALF: {
+        /* a stack [k][n] x experts: OUT halves the n output columns (gate / up), IN the k input rows (down); the
+         * cut is exl3_expert_cut's, the rank's half of every expert is exl3_expert_layout of the half shape */
+        const bool k_half = s->axis == PULSAR_TP_AXIS_IN;
+        const uint64_t k = t->dim[0], n = t->dim[1];
+        const uint32_t n_exp = (uint32_t)t->dim[2];
+        const int k2 = exl3_type_k2(t->type);
+        exl3_cut c;
+        if (!exl3_expert_cut(k, n, k2, k_half, lo, hi, 0, hi - lo, &c) || c.src_stride * n_exp != t->bytes) {
+            fprintf(stderr, "pulsar: TP: %s is not %u EXL3 experts of %llu x %llu cut at [%llu,%llu) -- refusing\n", nm,
+                    n_exp, (unsigned long long)k, (unsigned long long)n, lo, hi);
+            return false;
+        }
+        *bytes += (uint64_t)n_exp * c.dst_stride;
+        if (g_tp_record) {
+            fprintf(g_tp_record, "exl3_half %s off %llu key %llu experts %u k %llu n %llu %s [%llu,%llu) k2 %d src "
+                                 "%llu/%llu dst %llu/%llu\n", nm, off, (unsigned long long)pulsar_tp_expert_half_offset(m, t),
+                    n_exp, (unsigned long long)k, (unsigned long long)n, k_half ? "kcols" : "rows", lo, hi, k2,
+                    (unsigned long long)c.src_stride, (unsigned long long)c.src_trellis,
+                    (unsigned long long)c.dst_stride, (unsigned long long)c.dst_trellis);
+            return true;
+        }
+        return pulsar_gpu_register_exl3_expert_half(e, pulsar_tp_expert_half_offset(m, t), tensor_map_base(m, t),
+                                                    t->abs_offset, n_exp, k, n, k2, k_half ? 1 : 0, lo, hi) != 0;
     }
     case PULSAR_TP_OP_EXPERTS: {
         const uint64_t stride = t->bytes / t->dim[2], rel = lo * stride, n = (hi - lo) * stride;

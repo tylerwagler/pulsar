@@ -12,7 +12,7 @@
  *       EXL3 fused gate_up + down, or an EXL3 gate + up pair + down -> pulsar_rows_moe_routed_launch
  *
  * What a tensor-parallel rank reads is the rank's plan's (tp_slice.cpp), not the family's: a stack the plan
- * halved (expert tensor-parallel, MXFP4) reads the halves registered under the engine key; a stack the plan
+ * halved (expert tensor-parallel, MXFP4 or EXL3) reads the halves registered under the engine key; a stack the plan
  * ranged (expert parallel) reads that range of whole experts.  Every arm is today's launcher, unchanged. */
 #include "pulsar_engine_internal.h"
 #include "exl3_trellis.h"
@@ -56,12 +56,14 @@ bool pulsar_moe_routed_slot(const pulsar_moe_slot_call *c) {
     uint64_t gate_off = G->abs_offset, up_off = U->abs_offset, down_off = D->abs_offset;
     uint32_t split = 0;
     /* the rank's plan halved the stacks (expert tensor-parallel): every expert at the half intermediate width,
-     * from the compact half stacks built at open, resolved under the engine key -- a partial the FFN exchange sums */
+     * from the compact half stacks built at open, resolved under the engine key -- a partial the FFN exchange sums.
+     * One door for both formats' halves: a half is its format's own layout at the half width, so
+     * routed_expert_side_layout below is its byte model and the arm is the whole stack's */
     pulsar_tp_op op = PULSAR_TP_OP_NONE;
     uint64_t lo = 0, hi = 0;
     const void *key = NULL;
     if (pulsar_tp_slice_of(c->m, G, &op, &lo, &hi, &key)) {
-        if (op != PULSAR_TP_OP_MXFP4_HALF) {
+        if (op != PULSAR_TP_OP_MXFP4_HALF && op != PULSAR_TP_OP_EXL3_HALF) {
             fprintf(stderr, "pulsar: routed MoE: the plan's %s slice of %.*s has no slot arm -- refusing\n",
                     op == PULSAR_TP_OP_EXPERTS ? "expert-range" : "dense", (int)G->name.len, G->name.ptr);
             return false;

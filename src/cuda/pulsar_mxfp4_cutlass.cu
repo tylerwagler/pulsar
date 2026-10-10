@@ -1226,7 +1226,7 @@ int pulsar_cutlass_expert_ffn_gemv_small(
     float clamp, int n_tokens, int n_expert, unsigned n_total_expert,
     int in_dim, int mid_dim, int out_dim,
     const void *act_q, const void *act_sf, int act_kbp) {
-  if (in_dim % 256 || mid_dim % 256 || out_dim % 8) return 1;
+  if (in_dim % 256 || mid_dim % 128 || out_dim % 8) return 1;   /* mid % 128: V4.1 under TP halves 2304 to 1152 = 9 x 128 (L269 W1); the kernels need mid % 32 and the kbp identity below */
   if ((gate_stride & 3u) || (down_stride & 3u)) return 1;   /* uint32 row loads */
   if (mid_dim > GEMV_DOWN_MAX_K) return 1;                    /* the down GEMV stages mid rows in shared memory */
   const unsigned n_slots = (unsigned)(n_tokens * n_expert);
@@ -1238,7 +1238,7 @@ int pulsar_cutlass_expert_ffn_gemv_small(
    * The swizzled plane is NOT nblk bytes: mx_sfoff tiles it 128 rows x 4 blocks
    * into 512-byte groups, so it is sized ceil(rows/128) * (kbp/4) * 512.  The
    * tiling leaves holes past n_slots rows, and they are never read: the down
-   * GEMV indexes (slot < n_slots, kb < mid_dim/32) only, and mid_dim % 256 == 0
+   * GEMV indexes (slot < n_slots, kb < mid_dim/32) only, and mid_dim % 128 == 0
    * makes mid_kbp == mid_dim/32, so the epilogue writes every position it
    * reads.  No memset. */
   const int   x_kbp      = pulsar_mx_rup((int)(in_dim / 32u), 4);
@@ -1436,7 +1436,7 @@ int pulsar_cutlass_gemv_down(
     const uint8_t *const *down_tab, uint64_t down_stride, uint64_t down_data_bytes,
     int n_tokens, int n_expert, unsigned n_total_expert, int mid_dim, int out_dim,
     const void *mid_q, const void *mid_sf, int mid_kbp) {
-  if (mid_dim % 256 || out_dim % 8 || (down_stride & 3u) || mid_dim > GEMV_DOWN_MAX_K) return 1;
+  if (mid_dim % 128 || out_dim % 8 || (down_stride & 3u) || mid_dim > GEMV_DOWN_MAX_K) return 1;
   const unsigned n_slots = (unsigned)(n_tokens * n_expert);
   /* mid arrives as the MoE stage's E4M3 encoding (slot rows = pair slots,
    * VEC32 swizzle), or the call refuses. */

@@ -657,11 +657,14 @@ int pulsar_gpu_swiglu_mx_tensor(pulsar_gpu_tensor *out, const pulsar_gpu_tensor 
     /* FAIL LOUD rather than silently skip the emission: the caller arms the
      * activation cache off the same slot pointer, so a skipped emission leaves
      * the GEMM reading a memset-zero E4M3 buffer -- a well-formed WRONG answer.
-     * n must fill whole blocks (no lane exits before the warp shuffle) and
-     * mid_dim must be a whole number of MX blocks. */
-    if (out_q && ((n % 256u) != 0u || mid_dim == 0u || (mid_dim % 32u) != 0u)) {
+     * n must fill whole WARPS (the emit's amax shuffle is warp-wide, so no lane
+     * may exit before it: past n whole warps exit, never part of one) and
+     * mid_dim must be a whole number of MX blocks.  (Was n % 256, a whole thread
+     * block -- stricter than the shuffle needs; V4.1's TP shared-expert half,
+     * 1152 = 36 blocks, makes n % 256 != 0 at odd row counts, L269 W1.) */
+    if (out_q && ((n % 32u) != 0u || mid_dim == 0u || (mid_dim % 32u) != 0u)) {
         fprintf(stderr, "pulsar: swiglu cannot emit MX for n=%u mid_dim=%u "
-                        "(need n %% 256 == 0 and mid_dim %% 32 == 0)\n", n, mid_dim);
+                        "(need n %% 32 == 0 and mid_dim %% 32 == 0)\n", n, mid_dim);
         return 0;
     }
     /* Announce once per shape.  A byte-identical gate cannot tell "the store

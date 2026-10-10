@@ -1239,8 +1239,10 @@ static int routed_moe_try_mmq_down(
  * arm Qwen's prompt chunks take, by the same rule (exl3_moe_prefill_takes) --
  * so a prompt row's bits never depend on its chunk; decode rows take the GEMV
  * below that rule's assignment count.  The fold, the down's E4M3 mid slot and
- * the sum are one dataflow for both.  Under TP the routed entry refuses it
- * (expert_split serves type 40 only). */
+ * the sum are one dataflow for both.  Under TP (L269 W1) the stacks are the
+ * rank's halves (pulsar_gpu_register_exl3_expert_half) and expert_mid_dim is
+ * the half width: nothing here is tied to the full width, and the mid granule
+ * is the 128 Hadamard block (V4.1's 2304 halves to 1152 = 9 x 128). */
 static int routed_moe_launch_exl3(
         pulsar_gpu_tensor *out,
         pulsar_gpu_tensor *up,
@@ -1279,7 +1281,7 @@ static int routed_moe_launch_exl3(
     }
     if (!out || !up || !mid || !down || !model_map || !selected || !weights || !x ||
         n_tokens == 0 || n_total_expert == 0 || n_expert == 0 ||
-        expert_in_dim % 256u != 0 || expert_mid_dim % 256u != 0 || out_dim % 128u != 0 ||
+        expert_in_dim % 256u != 0 || expert_mid_dim % EXL3_HAD_BLOCK != 0 || out_dim % 128u != 0 ||
         gate_offset > model_size || up_offset > model_size || down_offset > model_size ||
         x->bytes < (uint64_t)n_tokens * expert_in_dim * sizeof(float) ||
         selected->bytes < (uint64_t)n_tokens * n_expert * sizeof(int32_t) ||
@@ -1786,23 +1788,27 @@ int pulsar_gpu_routed_moe_batch_tensor(pulsar_gpu_tensor *out, pulsar_gpu_tensor
         fprintf(stderr, "pulsar: routed MoE lane is f32-only; a narrowed tensor reached it\n");
         return 0;
     }
-    /* L241 4g-2 expert tensor-parallel: the stacks behind (model_map, offsets)
-     * are this rank's HALF of every expert (pulsar_gpu_register_mxfp4_expert_half)
-     * at expert_mid_dim = the half width.  Only the pure cutlass_mxfp4 arms read a
-     * stack through that geometry; every other arm (MMQ, mixed, EXL3) would read
-     * whole-expert bytes that are not there -- refuse by name (rule 1). */
+    /* L241 4g-2 / L269 W1 expert tensor-parallel: the stacks behind (model_map,
+     * offsets) are this rank's HALF of every expert at expert_mid_dim = the half
+     * width -- the pure cutlass_mxfp4 halves (pulsar_gpu_register_mxfp4_expert_half)
+     * or the pure EXL3 halves (pulsar_gpu_register_exl3_expert_half), each its
+     * format's own layout of the half shape.  Every other arm (MMQ, mixed) would
+     * read whole-expert bytes that are not there -- refuse by name (rule 1). */
     if (expert_split) {
-        if (gate_type != (uint32_t)PULSAR_TENSOR_CUTLASS_MXFP4 || down_type != (uint32_t)PULSAR_TENSOR_CUTLASS_MXFP4) {
-            fprintf(stderr, "pulsar: routed MoE: expert tensor-parallel serves only cutlass_mxfp4 "
-                            "(type 40) stacks; layer %u is gate %u / down %u -- refusing\n",
+        const int mx = gate_type == (uint32_t)PULSAR_TENSOR_CUTLASS_MXFP4 &&
+                       down_type == (uint32_t)PULSAR_TENSOR_CUTLASS_MXFP4;
+        const int ex = exl3_type_k2(gate_type) != 0 && exl3_type_k2(down_type) != 0;
+        if (!mx && !ex) {
+            fprintf(stderr, "pulsar: routed MoE: expert tensor-parallel serves cutlass_mxfp4 (type 40) or EXL3 "
+                            "stacks on both sides; layer %u is gate %u / down %u -- refusing\n",
                     layer_index, gate_type, down_type);
             return 0;
         }
-        static int split_said = 0;
-        if (!split_said) {
-            split_said = 1;
-            fprintf(stderr, "pulsar: routed MoE expert tensor-parallel lane on (every expert, "
-                            "intermediate half of width %u)\n", expert_mid_dim);
+        static int split_said[2] = {0, 0};
+        if (!split_said[ex]) {
+            split_said[ex] = 1;
+            fprintf(stderr, "pulsar: routed MoE expert tensor-parallel lane on (%s halves: every expert, "
+                            "intermediate half of width %u)\n", ex ? "EXL3" : "cutlass_mxfp4", expert_mid_dim);
         }
     }
     return routed_moe_batch_impl(out, up, mid, down, model_map, model_size,
