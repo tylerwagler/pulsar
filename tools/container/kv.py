@@ -33,7 +33,7 @@ What is emitted, and why, in the served block's order
     with `build.py --engram-layout` also the hash layout the engine hashes with
     (`deepseek4.engram.{compressed_vocab,pad_compressed_id,token_map,multipliers,
     primes,offsets}`) and each table's file name beside the container
-    (`deepseek4.engram.rows_file.N`; engine engram.cpp engram_bind);
+    (`deepseek4.engram.rows_file.N`; engine engram_forward.cpp engram_bind);
   * for a LAYER-SUBSET FIXTURE (`build.py --layers`, names.py drop rule 4) the
     per-layer keys cut to the kept layers, every layer index in block numbers,
     the drafter's keys only when its anchors are kept, and the map itself,

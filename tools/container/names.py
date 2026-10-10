@@ -218,7 +218,7 @@ DRAFTER = {
 DRAFTER_UNNUMBERED = {"main_proj.weight", "main_norm.weight"}
 
 # Engram (L242): projections ride in the layer shard under their HF names; the
-# engine has no `blk.` spelling for them (slice 5, engram.cpp engram_bind, binds
+# engine has no `blk.` spelling for them (slice 5, engram_forward.cpp engram_bind, binds
 # `layers.<source layer>.engram.*` -- inventing a rename here would be a second
 # authority).  The row table is the side artifact.
 ENGRAM_TENSORS = {"engram.wkv.weight", "engram.q_weight", "engram.k_weight"}
