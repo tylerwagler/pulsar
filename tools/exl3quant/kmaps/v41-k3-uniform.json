@@ -1,0 +1,5 @@
+{
+ "about": "The V4.1 baseline (2026-10-08): uniform K3 on every trunk layer's routed experts and on the drafter's. 3.01 bpw, 97.85 GiB of experts per rank, ~108.8 GiB per rank with every non-expert tensor replicated (an upper bound) against 110-115 usable. Uniform first: on Qwen every surrogate-chosen mixed-K recipe lost to uniform on full-model KL (L251 2026-09-27). Any deviation from this map needs a full-model KL grade before use.",
+ "layers": {"0-39": 3},
+ "mtp": {"0-2": 3}
+}
