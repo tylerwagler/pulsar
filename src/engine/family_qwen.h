@@ -650,6 +650,10 @@ bool pulsar_qwen_s4_draft_top(const pulsar_qwen_step *st);
 bool pulsar_qwen_s4_draft_top_read(const pulsar_qwen_state *q, const pulsar_qwen_weights *w, int32_t *id, float *conf);
 /** Its workspace bytes (the session allocates it once, beside the combine's). */
 uint64_t pulsar_qwen_s4_draft_top_ws_bytes(void);
+/** L289: warm the page cache with the PLE rows of `n` tokens a later step will embed after the n-gram context `ctx`
+ *  (oldest first; advanced over the tokens here, as the embed will) -- the verify's rows, issued while the draft
+ *  chain runs, so the verify's own gather reads cached rows.  A hint: the gather still reads every row. */
+void pulsar_qwen_s4_ple_prefetch(const pulsar_qwen_weights *w, int32_t ctx[2], const int32_t *tokens, uint32_t n);
 /** L251 MTP: after a verify step `vst` of R rows at positions p .. p + R - 1, keep rows 0 .. keep - 1
  *  and roll every recurrent state of the bank back to "after row keep - 1": GDN recurrent + conv and
  *  the PLE conv from the per-row capture, each QSA layer's index stage from its snapshot plus the kept

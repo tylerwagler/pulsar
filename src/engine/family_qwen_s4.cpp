@@ -27,7 +27,8 @@ struct pulsar_qwen_ple_io {
     pulsar_engram_table table;
     pulsar_engram_io *io;
     pulsar_qwen_ngram_layout layout;
-    unsigned char *rows;            ///< host [cap][16][320]: the gathered rows, head order
+    unsigned char *rows;            ///< pinned host [cap][16][320]: the gathered rows, head order (L289: uploaded async)
+    int32_t *map;                   ///< pinned host [cap][5]: the PLE op's row / sequence maps (uploaded async)
     uint64_t *ids;                  ///< host [cap][16]
     uint32_t cap;                   ///< tokens the host buffers hold
     pulsar_engram_gather *pending;  ///< the gather embed issued, waited on by the PLE op
@@ -479,7 +480,8 @@ void pulsar_qwen_s4_unload(pulsar_qwen_weights *w) {
     if (io->pending) (void)pulsar_engram_gather_wait(io->pending);
     pulsar_engram_io_destroy(io->io);
     pulsar_engram_table_close(&io->table);
-    free(io->rows);
+    pulsar_gpu_host_free(io->rows);
+    pulsar_gpu_host_free(io->map);
     free(io->ids);
     free(io);
     w->ple_io = NULL;
@@ -508,13 +510,13 @@ bool pulsar_qwen_s4_embed(const pulsar_qwen_step *st) {
         if (st->tokens[r] < 0 || (uint32_t)st->tokens[r] >= s->n_vocab) return fail("a token id outside the vocabulary");
     /* the MoE non-finite flag starts every step clear (read at pulsar_qwen_s4_step_end) */
     pulsar_gpu_tensor *moe_sc = st->st->scratch[PULSAR_QWEN_OP_MOE];
-    const uint32_t zero = 0;
-    if (!moe_sc || !pulsar_gpu_tensor_write(moe_sc, moe_layout(st->st->max_rows).nf, &zero, sizeof(zero)))
+    static const uint32_t zero = 0;   /* L289: an enqueued write reads it later */
+    if (!moe_sc || !pulsar_gpu_tensor_write_async(moe_sc, moe_layout(st->st->max_rows).nf, &zero, sizeof(zero)))
         return fail("could not clear the MoE non-finite flag");
     pulsar_gpu_tensor *tok = st->st->scratch[PULSAR_QWEN_OP_EMBED];
     const pulsar_tensor *te = st->w->token_embd;
     const uint16_t *table = (const uint16_t *)wptr(st, te, "qwen embed_tokens");
-    if (!tok || !table || !pulsar_gpu_tensor_write(tok, 0, st->tokens, (uint64_t)n * sizeof(int32_t))) return false;
+    if (!tok || !table || !pulsar_gpu_tensor_write_async(tok, 0, st->tokens, (uint64_t)n * sizeof(int32_t))) return false;
     if (pulsar_qwen_embed_launch(table, (const int32_t *)dptr(tok), (int)n, (int)s->n_vocab,
                                  (uint16_t *)dptr(st->streams), 0))
         return false;
@@ -524,11 +526,15 @@ bool pulsar_qwen_s4_embed(const pulsar_qwen_step *st) {
     if (!io) return fail("no PLE row file is open");
     if (io->pending) return fail("a previous step's PLE gather was never consumed");
     if (io->cap < n) {
-        free(io->rows);
+        /* the last step's uploads from these buffers finished at its drain */
+        pulsar_gpu_host_free(io->rows);
+        pulsar_gpu_host_free(io->map);
         free(io->ids);
-        io->rows = (unsigned char *)xmalloc((size_t)n * PULSAR_QWEN_NGRAM_COLS * PULSAR_QWEN_NGRAM_ROW_BYTES);
+        io->rows = (unsigned char *)pulsar_gpu_host_alloc((uint64_t)n * PULSAR_QWEN_NGRAM_COLS * PULSAR_QWEN_NGRAM_ROW_BYTES);
+        io->map = (int32_t *)pulsar_gpu_host_alloc((uint64_t)n * 5u * sizeof(int32_t));
         io->ids = (uint64_t *)xmalloc((size_t)n * PULSAR_QWEN_NGRAM_COLS * sizeof(uint64_t));
-        io->cap = n;
+        io->cap = io->rows && io->map ? n : 0;
+        if (!io->cap) return fail("could not allocate the pinned PLE row buffers");
     }
     const uint32_t nc = s->ngram_size - 1u;
     for (uint32_t r = 0; r < n; r++) {
@@ -541,6 +547,19 @@ bool pulsar_qwen_s4_embed(const pulsar_qwen_step *st) {
     io->pending = pulsar_engram_gather_start(io->io, &io->table, io->ids, n * PULSAR_QWEN_NGRAM_COLS, io->rows);
     io->pending_n = n;
     return io->pending != NULL || fail("the PLE gather did not start");
+}
+
+void pulsar_qwen_s4_ple_prefetch(const pulsar_qwen_weights *w, int32_t ctx[2], const int32_t *tokens, uint32_t n) {
+    pulsar_qwen_ple_io *io = w->ple_io;
+    if (!io || n == 0 || n > PULSAR_QWEN_SPEC_ROWS) return;
+    for (uint32_t r = 0; r < n; r++)
+        if (tokens[r] < 0 || (uint32_t)tokens[r] >= io->layout.vocab) return;   /* the embed refuses it by name */
+    uint64_t ids[PULSAR_QWEN_SPEC_ROWS * PULSAR_QWEN_NGRAM_COLS];
+    pulsar_qwen_ngram_ctx c = {{ctx[0], ctx[1]}};
+    pulsar_qwen_ngram_rows(&io->layout, &c, tokens, (int)n, ids);
+    ctx[0] = c.prev[0];
+    ctx[1] = c.prev[1];
+    pulsar_engram_prefetch(io->io, &io->table, ids, n * PULSAR_QWEN_NGRAM_COLS);
 }
 
 bool pulsar_qwen_s4_step_end(const pulsar_qwen_step *st, bool ok) {
@@ -582,7 +601,7 @@ bool pulsar_qwen_s4_ple(const pulsar_qwen_step *st, uint32_t il) {
     const bool decode = st->mode == PULSAR_QWEN_STEP_DECODE;
     const uint32_t runs = st->n_runs ? st->n_runs : 1u;
     const uint32_t n_seq = decode ? n : runs;
-    int32_t *map = (int32_t *)xmalloc((size_t)n * 5u * sizeof(int32_t));
+    int32_t *map = io->map;   /* pinned: the uploads below read it when the stream reaches them */
     int32_t *row_seq = map, *row_j = map + n, *seq_first = map + 2 * n, *seq_rows = map + 3 * n, *seq_bank = map + 4 * n;
     for (uint32_t q = 0; q < n_seq; q++) {
         const uint32_t f = decode ? q : (st->n_runs ? st->run_first[q] : 0u);
@@ -592,13 +611,13 @@ bool pulsar_qwen_s4_ple(const pulsar_qwen_step *st, uint32_t il) {
         seq_bank[q] = st->bank[f];
         for (uint32_t r = f; r < e; r++) { row_seq[r] = (int32_t)q; row_j[r] = (int32_t)(r - f); }
     }
-    bool ok = pulsar_gpu_tensor_write(sc, p.emb, io->rows, (uint64_t)n * PULSAR_QWEN_HIDDEN * 2u) &&
-              pulsar_gpu_tensor_write(sc, p.row_seq, row_seq, (uint64_t)n * 4u) &&
-              pulsar_gpu_tensor_write(sc, p.row_j, row_j, (uint64_t)n * 4u) &&
-              pulsar_gpu_tensor_write(sc, p.seq_first, seq_first, (uint64_t)n_seq * 4u) &&
-              pulsar_gpu_tensor_write(sc, p.seq_rows, seq_rows, (uint64_t)n_seq * 4u) &&
-              pulsar_gpu_tensor_write(sc, p.seq_bank, seq_bank, (uint64_t)n_seq * 4u);
-    free(map);
+    /* L289: enqueued behind layer 0, not waited for -- the host goes on queueing the step */
+    bool ok = pulsar_gpu_tensor_write_async(sc, p.emb, io->rows, (uint64_t)n * PULSAR_QWEN_HIDDEN * 2u) &&
+              pulsar_gpu_tensor_write_async(sc, p.row_seq, row_seq, (uint64_t)n * 4u) &&
+              pulsar_gpu_tensor_write_async(sc, p.row_j, row_j, (uint64_t)n * 4u) &&
+              pulsar_gpu_tensor_write_async(sc, p.seq_first, seq_first, (uint64_t)n_seq * 4u) &&
+              pulsar_gpu_tensor_write_async(sc, p.seq_rows, seq_rows, (uint64_t)n_seq * 4u) &&
+              pulsar_gpu_tensor_write_async(sc, p.seq_bank, seq_bank, (uint64_t)n_seq * 4u);
     if (!ok) return fail("could not stage the PLE rows");
 
     const pulsar_qwen_layer_weights &L = layer_w(st, il);
@@ -905,10 +924,10 @@ bool pulsar_qwen_s4_mtp_combine(const pulsar_qwen_step *st, const void *h) {
     for (uint32_t r = 0; r < n; r++)
         if (st->tokens[r] < 0 || (uint32_t)st->tokens[r] >= s->n_vocab) return fail("a token id outside the vocabulary");
     pulsar_gpu_tensor *moe_sc = st->st->scratch[PULSAR_QWEN_OP_MOE];
-    const uint32_t zero = 0;
-    if (!moe_sc || !pulsar_gpu_tensor_write(moe_sc, moe_layout(st->st->max_rows).nf, &zero, sizeof(zero)))
+    static const uint32_t zero = 0;   /* L289: an enqueued write reads it later */
+    if (!moe_sc || !pulsar_gpu_tensor_write_async(moe_sc, moe_layout(st->st->max_rows).nf, &zero, sizeof(zero)))
         return fail("could not clear the MoE non-finite flag");
-    if (!pulsar_gpu_tensor_write(st->st->mtp_tok, 0, st->tokens, (uint64_t)n * sizeof(int32_t)))
+    if (!pulsar_gpu_tensor_write_async(st->st->mtp_tok, 0, st->tokens, (uint64_t)n * sizeof(int32_t)))
         return fail("could not stage the MTP rows' tokens");
     const int H = (int)s->n_embd;
     pulsar_qwen_mtp_dev d{};

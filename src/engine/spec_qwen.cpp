@@ -202,6 +202,11 @@ static bool mtp_draft_record(pulsar_session *s, uint32_t b, uint64_t *rng, spec_
     if (K == 0) return true;
     const int32_t bb = (int32_t)b;
     int32_t tp = (int32_t)p - 1;
+    /* L289: the verify will embed [x, d_1 ..] after the bank's n-gram context: their PLE rows are read into the page
+     * cache while the chain runs (each as it is known), so the verify's gather finds them there */
+    const uint32_t nc = sh->ngram_size - 1u;
+    int32_t pctx[2] = {st->ngram_ctx[(size_t)b * nc], st->ngram_ctx[(size_t)b * nc + 1u]};
+    pulsar_qwen_s4_ple_prefetch(e->qwen_weights, pctx, &x, 1);
     /* the lockstep row (stack at p - 1, x), headed: d_1 */
     bool ok = pulsar_gpu_tensor_copy_async(st->mtp_h, 0, st->mtp_pend, (uint64_t)b * hc, hc) != 0 &&
               qwen_mtp_forward(s, PULSAR_QWEN_STEP_DECODE, &x, &tp, &bb, 1, 0, 1, L, &pick);
@@ -221,6 +226,7 @@ static bool mtp_draft_record(pulsar_session *s, uint32_t b, uint64_t *rng, spec_
         q->qn[j - 1] = 0;
         if (!sampled) {
             q->refined[j] = pick.id;
+            pulsar_qwen_s4_ple_prefetch(e->qwen_weights, pctx, &q->refined[j], 1);
             return true;
         }
         pulsar_sample_dist qd{};
@@ -228,6 +234,7 @@ static bool mtp_draft_record(pulsar_session *s, uint32_t b, uint64_t *rng, spec_
         const int d = pulsar_sample_dist_draw(&qd, rng);
         if (d < 0) { pulsar_sample_dist_free(&qd); return false; }
         q->refined[j] = (int32_t)d;
+        pulsar_qwen_s4_ple_prefetch(e->qwen_weights, pctx, &q->refined[j], 1);
         q->q_drawn[j - 1] = pulsar_sample_dist_prob(&qd, d);
         if (!pulsar_spec_q_record(q, j - 1, &qd)) {
             /* too wide to store: the walk rebuilds q from a row under the stored params -- the MTP
