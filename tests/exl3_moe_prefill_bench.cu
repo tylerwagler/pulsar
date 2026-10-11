@@ -1,6 +1,6 @@
 /* EXL3 MoE prefill bench (L287): the routed experts of ONE DeepSeek layer on a prompt chunk, at production
- * shapes, through the production front door -- ds4_exl3_moe_pair (gate / up), the fold, ds4_exl3_moe_single
- * (down), the sum -- over the producer's E4M3 slot, every expert a distinct random EXL3 slice (DRAM-resident
+ * shapes, through the production front door -- exl3_moe_routed_launch (the sort, gate / up, the fold, the
+ * down, the sum) -- over the producer's E4M3 slot, every expert a distinct random EXL3 slice (DRAM-resident
  * stacks of the real size), uniform top-k routing.  Prints ms per layer and the layer's tokens/s.  Also the
  * D2R-vs-decode-once comparison for one projection: the prefill arm (trellis decoded into the mma B
  * fragments) against decoding each routed expert ONCE into fp16 and a cuBLASLt GEMM per expert (the dense
@@ -12,7 +12,7 @@
 #include "cuda/pulsar_cuda_mx.cuh"
 #include "cuda/mmq/ds4_mmq.h"
 #include "cuda/mmq/ds4_exl3_gemv.cuh"
-#include "cuda/mmq/exl3_moe_prefill.cuh"
+#include "cuda/mmq/exl3_moe.cuh"
 #include "engine/exl3_trellis.h"
 
 #include <cuda_bf16.h>
@@ -144,12 +144,10 @@ int main(int argc, char **argv) {
     CUDA_OK(cudaDeviceSynchronize());
     cudaStream_t st = cudaStreamPerThread;
     auto layer = [&](int T) -> int {
-        const int64_t P = (int64_t)T * TOPK;
-        int rc = ds4_exl3_moe_pair(G.table, U.table, k2, sel, gz, uz, MID, H, T, E, TOPK, st, xq, xsf, kbx, true);
-        rc |= ds4_exl3_moe_fold_launch(gz, uz, sel, wts, G.table, U.table, D.table, H, MID, P, 10.0f, midq, midsf, kbm, st);
-        rc |= ds4_exl3_moe_single(D.table, k2, sel, dz, H, MID, (int)P, E, 1, st, midq, midsf, kbm, true);
-        rc |= ds4_exl3_moe_sum_launch(out, dz, sel, D.table, MID, H, TOPK, T, nf, 1u, st);
-        return rc;
+        const exl3_moe_stacks w{nullptr, G.table, U.table, D.table, k2, k2, E, H, MID, H};
+        const exl3_moe_bufs b{gz, uz, dz, exl3_moe_act{EXL3_MOE_ACT_E4M3_SLOT, midq, midsf, kbm}};
+        return exl3_moe_routed_launch(w, sel, wts, T, TOPK, 10.0f, exl3_moe_act{EXL3_MOE_ACT_E4M3_SLOT, xq, xsf, kbx}, b,
+                                      out, nf, 1u, true, st);
     };
     printf("1. one routed layer (pair + fold + down + sum) through the front door, uniform top-%d\n", TOPK);
     for (int T : toks) {

@@ -101,7 +101,13 @@ bool pulsar_moe_routed_rows(const pulsar_moe_rows_call *c) {
         w.tessera_down = c->tessera_down;
         w.ex_lo = 0;
         w.n_local = c->tessera_gate->E;
+        w.n_expert = c->tessera_gate->E;
+        w.top_k = (int)c->top_k;
+        w.in_dim = c->tessera_gate->K;
+        w.mid_dim = c->tessera_gate->N;
+        w.out_dim = c->tessera_down->N;
         w.prompt = c->prompt;
+        w.shared = c->shared;   /* the launcher refuses it: only the EXL3 front door carries a shared expert */
         return pulsar_rows_moe_routed_launch(&w, c->selected, c->weights, c->x_bf16, c->n_rows, c->out, c->ws,
                                              c->ws_bytes, c->nf_flag, c->nf_code, 0) == 0;
     }
@@ -123,7 +129,13 @@ bool pulsar_moe_routed_rows(const pulsar_moe_rows_call *c) {
     pulsar_rows_moe w{};
     w.ex_lo = (int)lo;
     w.n_local = (int)(hi - lo);
+    w.n_expert = (int)n_expert;
+    w.top_k = (int)c->top_k;
+    w.in_dim = (int)G->dim[0];
+    w.mid_dim = (int)D->dim[0];
+    w.out_dim = (int)D->dim[1];
     w.prompt = c->prompt;
+    w.shared = c->shared;
     w.k2_gate_up = exl3_type_k2(G->type);
     w.k2_down = exl3_type_k2(D->type);
     /* one stack's table over the rank's experts: [trellis, scales] pointer pairs (exl3_expert_layout) */

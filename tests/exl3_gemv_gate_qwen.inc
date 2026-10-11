@@ -41,31 +41,6 @@ static std::vector<float> from_dev(const float *d, size_t n) {
     return v;
 }
 
-/* the fold's mid (E4M3 + its scale bytes) re-staged as the down GEMV's input */
-static acts restage_mid(const routing &r, const std::vector<uint8_t> &mq, const std::vector<uint8_t> &msf,
-                        int MID, int kbp) {
-    acts am;
-    const int nbm = MID / 128;
-    am.resize((size_t)nbm * r.n_assign);
-    am.x.assign((size_t)r.n_assign * MID, 0.0);
-    for (int col = 0; col < r.n_assign; col++) {
-        const int pair = r.ids_dst[col];
-        for (int b = 0; b < nbm; b++) {
-            block_mx_act_mmq &blk = am.blk((size_t)b * r.n_assign + col);
-            for (int g = 0; g < 4; g++) {
-                const uint8_t sb = msf[pulsar_mx_sfoff(pair, b * 4 + g, kbp)];
-                blk.d4[g] = (float)sb;
-                for (int j = 0; j < 32; j++) {
-                    const uint8_t q = mq[(size_t)pair * MID + b * 128 + g * 32 + j];
-                    blk.qs[g * 32 + j] = (int8_t)q;
-                    am.x[(size_t)pair * MID + b * 128 + g * 32 + j] = (double)e4m3_to_f32(q) * exp2((double)sb - 127.0);
-                }
-            }
-        }
-    }
-    return am;
-}
-
 static int qwen_section(void) {
     const int K = 2560, MID = 640, GU = 2 * MID, E = 16, n_tok = 3, n_slot = 10;
     printf("exl3-gemv-gate (L251 Qwen): fused gate_up %d -> %d, down %d -> %d, top-%d of %d experts, K = 4 and 5\n",
@@ -73,8 +48,9 @@ static int qwen_section(void) {
     const routing r = make_routing(n_tok, n_slot, E);
     const acts a = make_acts(r, K);
     int32_t *d_ids = to_dev(r.ids_dst), *d_bounds = to_dev(r.bounds), *d_sel = to_dev(r.selected);
+    int32_t *d_src = to_dev(r.ids_tok);
     float *d_w = to_dev(r.weights);
-    const block_mx_act_mmq *d_act = (const block_mx_act_mmq *)to_dev(a.raw);
+    const exl3_moe_act d_act = upload_act(a);
     float *d_zgu = nullptr, *d_zd = nullptr, *d_out = nullptr;
     uint32_t *d_nf = nullptr;
     CUDA_OK(cudaMalloc((void **)&d_zgu, (size_t)r.n_assign * GU * sizeof(float)));
@@ -94,7 +70,7 @@ static int qwen_section(void) {
         if (upload_stack(gu, sgu) || upload_stack(down, sd)) return 1;
 
         /* fused gate_up */
-        int rc = ds4_exl3_moe_gemv_fused_launch(sgu.table, k2, d_act, d_ids, d_bounds, d_zgu, GU, K, r.n_assign, E, 0);
+        int rc = gemv_one(EXL3_ARM_GATE_UP_FUSED, sgu.table, k2, d_act, d_ids, d_src, d_bounds, d_zgu, GU, K, r.n_assign, E);
         CHECK(rc == 0, "Qwen fused launch k2=%d rc=%d", k2, rc);
         const std::vector<float> zgu = from_dev(d_zgu, (size_t)r.n_assign * GU);
         grade_fused("fused gate_up GEMV", r, a, K, GU, k2, gu, zgu, r.n_assign);
@@ -137,10 +113,10 @@ static int qwen_section(void) {
         printf("  Qwen fused fold K=%g: %d pairs x %d, %zu outside one E4M3 ulp of the host chain\n",
                k2 / 2.0, r.n_assign, MID, n_bad);
 
-        /* down 640 -> 2560: the K % 256 == 128 tail, on the fold's own mid */
-        const acts am = restage_mid(r, mq, msf, MID, kbp);
-        const block_mx_act_mmq *d_am = (const block_mx_act_mmq *)to_dev(am.raw);
-        rc = ds4_exl3_moe_gemv_single_launch(sd.table, k2, d_am, d_ids, d_bounds, d_zd, K, MID, r.n_assign, E, 0);
+        /* down 640 -> 2560: the K % 256 == 128 tail, on the fold's own mid, read in its slot (row = pair) */
+        const acts am = decode_slot(mq, msf, r.n_assign, MID, kbp);
+        const exl3_moe_act d_am{EXL3_MOE_ACT_E4M3_SLOT, d_mq, d_msf, kbp};
+        rc = gemv_one(EXL3_ARM_DOWN, sd.table, k2, d_am, d_ids, d_ids, d_bounds, d_zd, K, MID, r.n_assign, E);
         CHECK(rc == 0, "Qwen down launch k2=%d rc=%d", k2, rc);
         const std::vector<float> zd = from_dev(d_zd, (size_t)r.n_assign * K);
         double dworst = 0, dscale = 0;
@@ -190,14 +166,14 @@ static int qwen_section(void) {
             for (int e = 0; e < E; e++) tg.push_back(make_expert(MID, GU, k2));
             dev_stack stg;
             if (upload_stack(tg, stg)) return 1;
-            const block_mx_act_mmq *d_ap = (const block_mx_act_mmq *)to_dev(ap.raw);
-            int32_t *d_pids = to_dev(rp.ids_dst), *d_pb = to_dev(rp.bounds);
+            const exl3_moe_act d_ap = upload_act(ap);
+            int32_t *d_pids = to_dev(rp.ids_dst), *d_pb = to_dev(rp.bounds), *d_ptok = to_dev(rp.ids_tok);
             float *d_pz = nullptr;
             CUDA_OK(cudaMalloc((void **)&d_pz, (size_t)rp.n_assign * GU * sizeof(float)));
             std::vector<float> ref_z;
             size_t diff = 0;
             for (int Rb : {1, 4, 16}) {
-                rc = ds4_exl3_moe_gemv_fused_launch_rows(stg.table, k2, d_ap, d_pids, d_pb, d_pz, GU, MID, rp.n_assign, E, Rb, 0);
+                rc = gemv_one(EXL3_ARM_GATE_UP_FUSED, stg.table, k2, d_ap, d_pids, d_ptok, d_pb, d_pz, GU, MID, rp.n_assign, E, Rb);
                 CHECK(rc == 0, "Qwen tail rows R=%d rc=%d", Rb, rc);
                 const std::vector<float> z = from_dev(d_pz, (size_t)rp.n_assign * GU);
                 if (Rb == 1) { ref_z = z; continue; }
@@ -208,18 +184,18 @@ static int qwen_section(void) {
             printf("  Qwen tail row block R=1/4/16 on %d assignments: %s\n", rp.n_assign, diff ? "DIFFER" : "bit-identical");
             /* the 2560-in fused launch at 400 assignments takes R = 4 */
             const acts ak = make_acts(rp, K);
-            const block_mx_act_mmq *d_ak = (const block_mx_act_mmq *)to_dev(ak.raw);
+            const exl3_moe_act d_ak = upload_act(ak);
             float *d_kz = nullptr;
             CUDA_OK(cudaMalloc((void **)&d_kz, (size_t)rp.n_assign * GU * sizeof(float)));
-            rc = ds4_exl3_moe_gemv_fused_launch(sgu.table, k2, d_ak, d_pids, d_pb, d_kz, GU, K, rp.n_assign, E, 0);
+            rc = gemv_one(EXL3_ARM_GATE_UP_FUSED, sgu.table, k2, d_ak, d_pids, d_ptok, d_pb, d_kz, GU, K, rp.n_assign, E);
             CHECK(rc == 0, "Qwen fused at 400 assignments rc=%d", rc);
             grade_fused("fused gate_up at 400 assignments (R=4 rows)", rp, ak, K, GU, k2, gu, from_dev(d_kz, (size_t)rp.n_assign * GU), 24);
             /* the down at 400 assignments takes R = 4 on the tail */
             const acts apd = make_acts(rp, MID);
-            const block_mx_act_mmq *d_apd = (const block_mx_act_mmq *)to_dev(apd.raw);
+            const exl3_moe_act d_apd = upload_act(apd);
             float *d_pd = nullptr;
             CUDA_OK(cudaMalloc((void **)&d_pd, (size_t)rp.n_assign * K * sizeof(float)));
-            rc = ds4_exl3_moe_gemv_single_launch(sd.table, k2, d_apd, d_pids, d_pb, d_pd, K, MID, rp.n_assign, E, 0);
+            rc = gemv_one(EXL3_ARM_DOWN, sd.table, k2, d_apd, d_pids, d_ptok, d_pb, d_pd, K, MID, rp.n_assign, E);
             CHECK(rc == 0, "Qwen down R=4 rc=%d", rc);
             const std::vector<float> pd = from_dev(d_pd, (size_t)rp.n_assign * K);
             double w4 = 0;
@@ -233,7 +209,7 @@ static int qwen_section(void) {
             }
             CHECK(w4 < 2e-5, "Qwen down at 400 assignments (R=4): max rel %.3e", w4);
             printf("  Qwen down GEMV K=%g at %d assignments (R=4 rows, tail): max rel %.2e on 24\n", k2 / 2.0, rp.n_assign, w4);
-            cudaFree((void *)d_ap); cudaFree((void *)d_ak); cudaFree((void *)d_apd); cudaFree(d_pids); cudaFree(d_pb);
+            free_act(d_ap); free_act(d_ak); free_act(d_apd); cudaFree(d_pids); cudaFree(d_pb); cudaFree(d_ptok);
             cudaFree(d_pz); cudaFree(d_kz); cudaFree(d_pd);
             cudaFree(stg.arena); cudaFree((void *)stg.table);
         }
@@ -246,18 +222,18 @@ static int qwen_section(void) {
             CUDA_OK(cudaMemcpy(&byte, sd.arena + 777, 1, cudaMemcpyDeviceToHost));
             byte ^= 0x04u;
             CUDA_OK(cudaMemcpy(sd.arena + 777, &byte, 1, cudaMemcpyHostToDevice));
-            rc = ds4_exl3_moe_gemv_single_launch(sd.table, k2, d_am, d_ids, d_bounds, d_zd, K, MID, r.n_assign, E, 0);
+            rc = gemv_one(EXL3_ARM_DOWN, sd.table, k2, d_am, d_ids, d_ids, d_bounds, d_zd, K, MID, r.n_assign, E);
             const std::vector<float> zd2 = from_dev(d_zd, (size_t)r.n_assign * K);
             size_t moved = 0;
             for (size_t i = 0; i < zd.size(); i++) moved += zd[i] != zd2[i];
             CHECK(moved > 0, "Qwen mutation: a flipped bit in expert 0's down did not move z_d");
             printf("  Qwen mutation: one flipped down bit moved %zu outputs\n", moved);
             /* refusals: a K that is not a 128 multiple; a rate a kind does not instantiate */
-            CHECK(ds4_exl3_moe_gemv_single_launch(sd.table, k2, d_am, d_ids, d_bounds, d_zd, K, 704, r.n_assign, E, 0) != 0,
+            CHECK(gemv_one(EXL3_ARM_DOWN, sd.table, k2, d_am, d_ids, d_ids, d_bounds, d_zd, K, 704, r.n_assign, E) != 0,
                   "K=704 was accepted");
-            CHECK(ds4_exl3_moe_gemv_single_launch(sd.table, 7, d_am, d_ids, d_bounds, d_zd, K, MID, r.n_assign, E, 0) != 0,
+            CHECK(gemv_one(EXL3_ARM_DOWN, sd.table, 7, d_am, d_ids, d_ids, d_bounds, d_zd, K, MID, r.n_assign, E) != 0,
                   "k2=7 was accepted");
-            CHECK(ds4_exl3_moe_gemv_fused_launch(sgu.table, 6, d_act, d_ids, d_bounds, d_zgu, GU, K, r.n_assign, E, 0) != 0,
+            CHECK(gemv_one(EXL3_ARM_GATE_UP_FUSED, sgu.table, 6, d_act, d_ids, d_src, d_bounds, d_zgu, GU, K, r.n_assign, E) != 0,
                   "fused at K=3 was accepted (no container carries it)");
             CHECK(ds4_exl3_gemv_rate_supported(EXL3_ARM_GATE_UP_FUSED, 8) && ds4_exl3_gemv_rate_supported(EXL3_ARM_DOWN, 10) &&
                   ds4_exl3_gemv_rate_supported(EXL3_ARM_PAIR, 8) && !ds4_exl3_gemv_rate_supported(EXL3_ARM_GATE_UP_FUSED, 6) &&
@@ -267,10 +243,9 @@ static int qwen_section(void) {
                   "the per-kind rate table");
             printf("  refusals: K=704, k2=7, fused at K=3 -- refused; the per-kind rate table holds\n");
         }
-        cudaFree((void *)d_am);
         cudaFree(sgu.arena); cudaFree((void *)sgu.table); cudaFree(sd.arena); cudaFree((void *)sd.table);
     }
-    cudaFree(d_ids); cudaFree(d_bounds); cudaFree(d_sel); cudaFree(d_w); cudaFree((void *)d_act);
+    cudaFree(d_ids); cudaFree(d_bounds); cudaFree(d_sel); cudaFree(d_w); free_act(d_act); cudaFree(d_src);
     cudaFree(d_zgu); cudaFree(d_zd); cudaFree(d_out); cudaFree(d_nf); cudaFree(d_mq); cudaFree(d_msf);
     return 0;
 }

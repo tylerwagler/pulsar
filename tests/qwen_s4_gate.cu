@@ -584,6 +584,11 @@ static void section_moe_at(const int T, const bool split = false, const int k2_e
     pulsar_rows_moe w{};
     w.ex_lo = 0;
     w.n_local = E;
+    w.n_expert = E;
+    w.top_k = TOPK;
+    w.in_dim = H;
+    w.mid_dim = MID;
+    w.out_dim = H;
     const auto wr = rnd_bf((size_t)E * H, 0.02), wsg = rnd_bf(H, 0.02);
     const uint16_t *router_w = up(wr), *shared_gate_w = up(wsg);
     if (split) {
@@ -618,6 +623,27 @@ static void section_moe_at(const int T, const bool split = false, const int k2_e
     CHECK(rc == 0, "launch T=%d (workspace %.1f MB)", T, wsb / 1e6);
     const auto O = down(out, (size_t)T * H);
     const auto NF = down(nf, 1);
+    /* task #44: the EXL3 shared expert riding the routed launches (exl3_moe.cuh) == the routed launch then the
+     * shared expert's own launches, byte for byte -- the same arithmetic, fewer launches */
+    {
+        pulsar_qwen_moe_parts p;
+        int r = pulsar_qwen_moe_carve(T, ws, wsb, &p);
+        if (!r) r = pulsar_qwen_router_launch(dx, router_w, shared_gate_w, T, H, E, TOPK, p.logits, p.sel, p.wts, p.sgate, 0);
+        pulsar_rows_moe_shared sh{};
+        sh.gate = shg; sh.up = shu; sh.down = shd;
+        sh.scale = p.sgate; sh.yg = p.yg; sh.yu = p.yu; sh.ys = p.ys; sh.h = p.h_x;
+        sh.ws = p.lin; sh.ws_bytes = p.lin_bytes;
+        pulsar_rows_moe wr2 = w;
+        wr2.shared = &sh;
+        if (!r) r = pulsar_rows_moe_routed_launch(&wr2, p.sel, p.wts, dx, T, out, p.routed, p.routed_bytes, nf, 0x7351u, 0);
+        const auto OR = down(out, (size_t)T * H);
+        size_t diff = 0;
+        for (size_t i = 0; i < OR.size(); i++) diff += memcmp(&OR[i], &O[i], sizeof(float)) != 0;
+        CHECK(r == 0 && diff == 0, "T = %d%s: the riding shared expert differs from the separate launches in %zu of %zu "
+              "outputs (rc %d)", T, split ? " split experts" : "", diff, OR.size(), r);
+        printf("  T = %d%s: shared expert riding the routed launches == separate launches, byte for byte (%zu outputs)\n",
+               T, split ? " split experts" : "", OR.size());
+    }
     /* L266 step 7, expert parallelism: rank r runs experts [256 r, 256 r + 256) from its half of the tables
      * (and rank 0 the shared expert); the two partials summed in rank order -- the all-reduce -- are the
      * one-GPU block to f32 reassociation (each rank sums its own slots in order, then the two add). */

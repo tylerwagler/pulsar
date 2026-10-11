@@ -129,6 +129,7 @@ exl3_moe_prep_kernel(const void *__restrict__ table, const void *__restrict__ xv
     const int nblk = K >> 7;
     if (task >= (int64_t)n_assign * nblk) return;
     const int a = (int)(task / nblk), blk = (int)(task % nblk), lane = threadIdx.x & 31;
+    if (a < bounds[0] || a >= bounds[E]) return;    /* outside the schedule (a pick < 0 sorts below expert 0) */
     const int k = blk * 128 + lane * 4;
     const int row = ids_src[a];
     float v[4];

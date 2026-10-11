@@ -715,6 +715,7 @@ bool pulsar_qwen_s4_moe(const pulsar_qwen_step *st, uint32_t il) {
     rc.gate = L.moe_gate_up ? L.moe_gate_up : L.moe_gate;
     rc.up = L.moe_gate_up ? NULL : L.moe_up;
     rc.down = L.moe_down;
+    rc.top_k = K;
     rc.ws = parts.routed;
     rc.ws_bytes = parts.routed_bytes;
     rc.nf_flag = (uint32_t *)(base + m.nf);
@@ -736,7 +737,27 @@ bool pulsar_qwen_s4_moe(const pulsar_qwen_step *st, uint32_t il) {
         rc.tessera_up = &tp[PULSAR_QWEN_TESS_UP];
         rc.tessera_down = &tp[PULSAR_QWEN_TESS_DOWN];
     }
+    /* the shared expert, sigmoid-gated, added after the routed sum -- under expert parallelism rank 0's alone.
+     * Keyed on its FORMAT (task #44): three EXL3 dense slices ride the EXL3 routed launches (mmq/exl3_moe.cuh);
+     * any other format, or a Tessera routed arm, runs its own launches after the routed sum. */
+    const bool shared_here = !(pulsar_qwen_tp(s) > 1 && s->tp_rank != 0);
+    pulsar_rows_linear sg0{}, su0{}, sd0{};
+    if (shared_here && !(linear_dev(st, L.sh_gate, H, SMID, false, "qwen shared gate_proj", &sg0) &&
+                         linear_dev(st, L.sh_up, H, SMID, false, "qwen shared up_proj", &su0) &&
+                         linear_dev(st, L.sh_down, SMID, H, false, "qwen shared down_proj", &sd0)))
+        return false;
+    const bool ride = shared_here && !rc.tessera_gate && sg0.k2 && su0.k2 && sd0.k2;
     if (!arm_segments(st, 0, n, [&](bool prompt, uint32_t r0, uint32_t rows) {
+            pulsar_rows_moe_shared sh{};
+            if (ride) {
+                sh.gate = sg0; sh.up = su0; sh.down = sd0;
+                sh.gate.prompt = sh.up.prompt = sh.down.prompt = prompt;
+                sh.scale = parts.sgate + r0;   /* the gate row-indexed, the shared expert's buffers reused from 0 */
+                sh.yg = parts.yg; sh.yu = parts.yu; sh.ys = parts.ys;
+                sh.h = parts.h_x;
+                sh.ws = parts.lin; sh.ws_bytes = parts.lin_bytes;
+            }
+            rc.shared = ride ? &sh : NULL;
             rc.selected = parts.sel + (size_t)r0 * K;
             rc.weights = parts.wts + (size_t)r0 * K;
             rc.x_bf16 = x + (size_t)r0 * H;
@@ -746,13 +767,19 @@ bool pulsar_qwen_s4_moe(const pulsar_qwen_step *st, uint32_t il) {
             if (st->tap) pulsar_imatrix_note_routed_in(st->tap, rc.gate, rc.up, rc.x_bf16, rc.selected, rows, K, s->n_expert, H);
             if (!pulsar_moe_routed_rows(&rc)) return false;
             if (st->tap)
-                pulsar_imatrix_note_routed_mid(st->tap, rc.down, pulsar_rows_moe_routed_mid(rc.ws, rc.ws_bytes, (int)rows),
+                pulsar_imatrix_note_routed_mid(st->tap, rc.down, pulsar_rows_moe_routed_mid(rc.ws, rc.ws_bytes, (int)rows, (int)K,
+                                                                                      (int)s->n_ff_exp, H),
                                                rc.selected, rows, K, s->n_expert, (uint32_t)rc.down->dim[0]);
+            if (ride && st->tap) {
+                /* the shared expert's down read the SwiGLU rows the launch left in parts.h_x (bf16) */
+                pulsar_imatrix_note_dense(st->tap, L.sh_gate, rc.x_bf16, rows, (uint32_t)H);
+                pulsar_imatrix_note_dense(st->tap, L.sh_up, rc.x_bf16, rows, (uint32_t)H);
+                pulsar_imatrix_note_dense(st->tap, L.sh_down, parts.h_x, rows, (uint32_t)SMID);
+            }
             return true;
         }))
         return false;
-    /* the shared expert, sigmoid-gated, added after the routed sum -- under expert parallelism rank 0's alone */
-    if (pulsar_qwen_tp(s) > 1 && s->tp_rank != 0) return true;
+    if (!shared_here || ride) return true;
     return arm_segments(st, 0, n, [&](bool prompt, uint32_t r0, uint32_t rows) {
         pulsar_rows_linear sg, su, sd;
         pulsar_qwen_moe_parts p = parts;   /* the gate row-indexed, the shared expert's buffers reused from 0 */

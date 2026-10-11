@@ -3257,6 +3257,7 @@ bool pulsar_moe_routed_slot(const pulsar_moe_slot_call *c);
 /** The routed part over raw bf16 rows (pulsar_rows_moe_routed_launch): `selected` is localised in place under
  *  expert parallelism (the rank's plan's range of whole experts). */
 struct pulsar_tessera_proj;   /* src/cuda/mmq/pulsar_tessera.h (L255) */
+struct pulsar_rows_moe_shared; /* src/cuda/pulsar_cuda_qwen.h (task #44) */
 typedef struct {
     const pulsar_model *m;
     const pulsar_tensor *gate, *up, *down;   ///< up NULL = gate is the fused gate_up stack
@@ -3265,6 +3266,9 @@ typedef struct {
     const struct pulsar_tessera_proj *tessera_gate, *tessera_up, *tessera_down;
     int32_t *selected;
     const float *weights;
+    uint32_t top_k;                          ///< picks per row (selected / weights are [n_rows][top_k])
+    /** task #44: an EXL3 shared expert riding the routed launches (EXL3 routed arm only), or NULL */
+    const struct pulsar_rows_moe_shared *shared;
     const uint16_t *x_bf16;
     int n_rows;
     float *out;

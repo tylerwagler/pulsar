@@ -2,8 +2,7 @@
 #include "pulsar_cuda_mx.cuh"
 #ifdef PULSAR_HAVE_MMQ
 #include "mmq/ds4_mmq.h"     /* vendored llama.cpp MMQ adapter -- see mmq/VENDOR.md */
-#include "mmq/ds4_exl3_gemv.cuh" /* L245: the EXL3 fold and sum */
-#include "mmq/exl3_moe_prefill.cuh" /* L287: exl3_moe_prefill_takes, the prompt-chunk rule */
+#include "mmq/exl3_moe.cuh"   /* task #44: the one EXL3 routed front door */
 #include "engine/exl3_trellis.h" /* L245: exl3_type_k2 */
 
 #endif
@@ -1229,11 +1228,9 @@ static int routed_moe_try_mmq_down(
 
 
 /* L245: the EXL3 routed arm.  Both sides carry an EXL3 rate (the binder
- * refuses a mix with 40/44); gate/up and down may differ in rate.  The
- * dataflow is the IQ2 arm's -- the same sorted pairs, the same producer E4M3
- * staging, per-pair f32 outputs, a fixed-order sum -- with the trellis GEMV
- * in place of the D2R launch and the format's rotations in the fold and the
- * sum (mmq/ds4_exl3_gemv.cuh).  L287: PREFILL rows (the row kind, L167:
+ * refuses a mix with 40/44); gate/up and down may differ in rate.  Task #44:
+ * the dataflow is the one EXL3 routed front door every family takes
+ * (mmq/exl3_moe.cuh) over this family's E4M3 slots.  L287: PREFILL rows (the row kind, L167:
  * pulsar_gpu_matmul_batch_decode_rows() == 0) are a prompt chunk and take the
  * tensor-core prefill GEMM over the producer's E4M3 slot at every width -- the
  * arm Qwen's prompt chunks take, by the same rule (exl3_moe_prefill_takes) --
@@ -1303,16 +1300,6 @@ static int routed_moe_launch_exl3(
                                                  "moe_exl3_down");
     if (!gate_w || !up_w || !down_w) return 0;
 
-    static int mmq_ready = -1;
-    if (mmq_ready < 0) {
-        int dev = 0;
-        (void)cudaGetDevice(&dev);
-        mmq_ready = (ds4_mmq_init(dev) == 0) ? 1 : 0;
-    }
-    if (!mmq_ready) {
-        fprintf(stderr, "pulsar: EXL3 routed MoE: the MMQ drivers are unavailable on this device -- refusing\n");
-        return 0;
-    }
     /* the row kind is the step's (L167): prefill rows are a prompt chunk */
     const bool prompt = pulsar_gpu_matmul_batch_decode_rows() == 0;
     static int announced[2] = {0, 0};
@@ -1350,38 +1337,23 @@ static int routed_moe_launch_exl3(
                 expert_in_dim, n_tokens);
         return 0;
     }
-    float *gate_z = (float *)up->ptr;    /* pairs x mid f32, the unrotated gate z */
-    float *up_z = (float *)mid->ptr;     /* pairs x mid f32, the unrotated up z; the fold reads both */
-    int rc = ds4_exl3_moe_pair(gt, ut, k2g, selected_ptr, gate_z, up_z,
-                               (int)expert_mid_dim, (int)expert_in_dim, (int)n_tokens,
-                               (int)n_total_expert, (int)n_expert,
-                               cudaStreamPerThread, act_q, act_sf, act_kbp, prompt);
-    if (rc != 0) {
-        fprintf(stderr, "pulsar: EXL3 routed MoE gate/up declined (rc=%d) -- no fallback\n", rc);
-        return 0;
-    }
-    rc = ds4_exl3_moe_fold_launch(gate_z, up_z, selected_ptr, (const float *)weights->ptr, gt, ut, dt,
-                                  (int)expert_in_dim, (int)expert_mid_dim, (int64_t)pairs, clamp,
-                                  mid_q, mid_sf, mid_kbp, cudaStreamPerThread);
-    if (rc != 0) return 0;
-    pulsar_gpu_mxfp8_act_cache_arm(mid, pairs, expert_mid_dim);
-    pulsar_gpu_mxfp8_act_cache_note_mxfp8();
-    rc = ds4_exl3_moe_single(dt, k2d, selected_ptr, (float *)down->ptr,
-                             (int)out_dim, (int)expert_mid_dim, (int)pairs,
-                             (int)n_total_expert, 1,
-                             cudaStreamPerThread, mid_q, mid_sf, mid_kbp, prompt);
-    if (rc != 0) {
-        fprintf(stderr, "pulsar: EXL3 routed MoE down declined (rc=%d) -- no fallback\n", rc);
-        return 0;
-    }
     static uint32_t *nf_flag = NULL;
     if (!nf_flag && !cuda_ok(cudaGetSymbolAddress((void **)&nf_flag, g_moe_nonfinite),
                              "routed MoE non-finite flag address")) return 0;
-    rc = ds4_exl3_moe_sum_launch((float *)out->ptr, (const float *)down->ptr, selected_ptr, dt,
-                                 (int)expert_mid_dim, (int)out_dim, (int)n_expert, (int)n_tokens,
-                                 nf_flag, moe_nonfinite_code(layer_index, MOE_NF_ARM_EXL3_DOWN),
-                                 cudaStreamPerThread);
-    if (rc != 0) return 0;
+    /* the one EXL3 routed front door (mmq/exl3_moe.cuh): x from the producer's E4M3 slot, the fold's mid
+     * emitted into the mid tensor's E4M3 slot (the producer rule for the down); gate z in the up buffer and up z
+     * in the mid buffer, pairs x mid f32 each */
+    const exl3_moe_stacks st{NULL, gt, ut, dt, k2g, k2d, (int)n_total_expert, (int)expert_in_dim,
+                             (int)expert_mid_dim, (int)out_dim};
+    const exl3_moe_bufs bufs{(float *)up->ptr, (float *)mid->ptr, (float *)down->ptr,
+                             exl3_moe_act{EXL3_MOE_ACT_E4M3_SLOT, mid_q, mid_sf, mid_kbp}};
+    if (exl3_moe_routed_launch(st, selected_ptr, (const float *)weights->ptr, (int)n_tokens, (int)n_expert, clamp,
+                               exl3_moe_act{EXL3_MOE_ACT_E4M3_SLOT, act_q, act_sf, act_kbp}, bufs, (float *)out->ptr,
+                               nf_flag, moe_nonfinite_code(layer_index, MOE_NF_ARM_EXL3_DOWN), prompt,
+                               cudaStreamPerThread) != 0)
+        return 0;
+    pulsar_gpu_mxfp8_act_cache_arm(mid, pairs, expert_mid_dim);
+    pulsar_gpu_mxfp8_act_cache_note_mxfp8();
     return cuda_ok(cudaGetLastError(), "routed_moe exl3");
 #endif
 }

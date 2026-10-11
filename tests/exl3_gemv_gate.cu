@@ -2,7 +2,7 @@
  *
  * Model-free.  Random trellis words (any 16-bit word is a valid tile), random
  * fp16 scales in the real checkpoint's distribution (suh ~0.025 with signs,
- * svh ~+-1), random E4M3 activation blocks -- and every kernel of the EXL3 arm
+ * svh ~+-1), a random E4M3 activation slot -- and every kernel of the EXL3 arm
  * is graded against a reference built ONLY from src/engine/exl3_trellis.h
  * (the host dequant that tests/exl3_dequant_gate.cpp holds byte-exact to
  * exllamav3) and double-precision arithmetic:
@@ -138,39 +138,65 @@ static routing make_routing(int n_tok, int n_slot, int E) {
     return r;
 }
 
-/* Activations: per token a random E4M3 row [K] with ue8m0 group bytes; staged
- * per sorted assignment as block_mx_act_mmq [K/128][n_assign]. */
+/* Activations: the producer's E4M3 slot -- per token a random E4M3 row [K] and its ue8m0 group bytes in the
+ * plane's pulsar_mx_sfoff layout -- which the GEMV reads in place through ids_src (task #44: nothing stages it). */
 struct acts {
-    /* block_mx_act_mmq is not copyable (its union), so the staging lives in bytes */
-    std::vector<uint8_t> raw;               /* [K/128][n_assign] blocks */
-    std::vector<double> x;                  /* [n_tok][K] decoded */
-    void resize(size_t n) { raw.assign(n * sizeof(block_mx_act_mmq), 0); }
-    block_mx_act_mmq &blk(size_t i) { return *reinterpret_cast<block_mx_act_mmq *>(raw.data() + i * sizeof(block_mx_act_mmq)); }
-    size_t bytes() const { return raw.size(); }
+    std::vector<uint8_t> q, sf;             /* [rows][K] E4M3, the ue8m0 plane */
+    int kbp = 0;
+    std::vector<double> x;                  /* [rows][K] decoded */
 };
 static acts make_acts(const routing &r, int K) {
     acts a;
-    const int nb = K / 128;
-    std::vector<uint8_t> q((size_t)r.n_tok * K);
-    std::vector<uint8_t> sc((size_t)r.n_tok * K / 32);
+    a.kbp = pulsar_mx_kbp(K);
+    a.q.assign((size_t)r.n_tok * K, 0);
+    a.sf.assign(pulsar_mx_sf_slab_bytes(r.n_tok, a.kbp), 0);
     a.x.assign((size_t)r.n_tok * K, 0.0);
+    std::vector<uint8_t> sc((size_t)K / 32);
     for (int t = 0; t < r.n_tok; t++) {
-        for (int g = 0; g < K / 32; g++) sc[(size_t)t * (K / 32) + g] = (uint8_t)(120 + rnd() % 8);
-        for (int k = 0; k < K; k++) {
-            q[(size_t)t * K + k] = rnd_e4m3();
-            a.x[(size_t)t * K + k] = (double)e4m3_to_f32(q[(size_t)t * K + k]) * exp2((double)sc[(size_t)t * (K / 32) + k / 32] - 127.0);
+        for (int g = 0; g < K / 32; g++) {
+            sc[g] = (uint8_t)(120 + rnd() % 8);
+            a.sf[pulsar_mx_sfoff(t, g, a.kbp)] = sc[g];
         }
-    }
-    a.resize((size_t)nb * r.n_assign);
-    for (int col = 0; col < r.n_assign; col++) {
-        const int t = r.ids_tok[col];
-        for (int b = 0; b < nb; b++) {
-            block_mx_act_mmq &blk = a.blk((size_t)b * r.n_assign + col);
-            for (int g = 0; g < 4; g++) blk.d4[g] = (float)sc[(size_t)t * (K / 32) + b * 4 + g];
-            for (int j = 0; j < 128; j++) blk.qs[j] = (int8_t)q[(size_t)t * K + b * 128 + j];
+        for (int k = 0; k < K; k++) {
+            a.q[(size_t)t * K + k] = rnd_e4m3();
+            a.x[(size_t)t * K + k] = (double)e4m3_to_f32(a.q[(size_t)t * K + k]) * exp2((double)sc[k / 32] - 127.0);
         }
     }
     return a;
+}
+/* A device slot's rows decoded on the host (the fold's mid, read back). */
+static acts decode_slot(const std::vector<uint8_t> &q, const std::vector<uint8_t> &sf, int rows, int K, int kbp) {
+    acts a;
+    a.q = q; a.sf = sf; a.kbp = kbp;
+    a.x.assign((size_t)rows * K, 0.0);
+    for (int r = 0; r < rows; r++)
+        for (int k = 0; k < K; k++)
+            a.x[(size_t)r * K + k] = (double)e4m3_to_f32(q[(size_t)r * K + k]) * exp2((double)sf[pulsar_mx_sfoff(r, k / 32, kbp)] - 127.0);
+    return a;
+}
+/* the slot on the device, as the arm reads it; free with free_act */
+static exl3_moe_act upload_act(const acts &a) {
+    void *q = nullptr, *sf = nullptr;
+    if (cudaMalloc(&q, a.q.size()) != cudaSuccess || cudaMalloc(&sf, a.sf.size()) != cudaSuccess) { fprintf(stderr, "alloc\n"); exit(1); }
+    cudaMemcpy(q, a.q.data(), a.q.size(), cudaMemcpyHostToDevice);
+    cudaMemcpy(sf, a.sf.data(), a.sf.size(), cudaMemcpyHostToDevice);
+    return exl3_moe_act{EXL3_MOE_ACT_E4M3_SLOT, q, sf, a.kbp};
+}
+static void free_act(const exl3_moe_act &a) { cudaFree(const_cast<void *>(a.x)); cudaFree(const_cast<void *>(a.sf)); }
+static int32_t *upload_ids(const std::vector<int32_t> &v) {
+    int32_t *d = nullptr;
+    if (cudaMalloc((void **)&d, v.size() * sizeof(int32_t)) != cudaSuccess) { fprintf(stderr, "alloc\n"); exit(1); }
+    cudaMemcpy(d, v.data(), v.size() * sizeof(int32_t), cudaMemcpyHostToDevice);
+    return d;
+}
+/* the arm's one launch, per kind (rows_per_block 0 = the arm's choice) */
+static int gemv_pair(const void *gt, const void *ut, int k2, const exl3_moe_act &a, const int32_t *ids, const int32_t *src,
+                     const int32_t *bounds, float *zg, float *zu, int M, int K, int n, int E, int R = 0) {
+    return ds4_exl3_moe_gemv_launch(EXL3_ARM_PAIR, gt, ut, k2, a, ids, src, bounds, zg, zu, M, K, n, E, R, 0);
+}
+static int gemv_one(int kind, const void *t, int k2, const exl3_moe_act &a, const int32_t *ids, const int32_t *src,
+                    const int32_t *bounds, float *z, int M, int K, int n, int E, int R = 0) {
+    return ds4_exl3_moe_gemv_launch(kind, t, nullptr, k2, a, ids, src, bounds, z, nullptr, M, K, n, E, R, 0);
 }
 
 /* host reference z for one assignment: W_hat^T applied to the rotated (or
@@ -241,9 +267,8 @@ int main(void) {
     CUDA_OK(cudaMemcpy(d_w, r.weights.data(), r.n_assign * sizeof(float), cudaMemcpyHostToDevice));
 
     const acts a = make_acts(r, K);
-    block_mx_act_mmq *d_act = nullptr;
-    CUDA_OK(cudaMalloc((void **)&d_act, a.bytes()));
-    CUDA_OK(cudaMemcpy(d_act, a.raw.data(), a.bytes(), cudaMemcpyHostToDevice));
+    const exl3_moe_act d_act = upload_act(a);
+    int32_t *d_src = upload_ids(r.ids_tok);
 
     float *d_zg = nullptr, *d_zu = nullptr;
     CUDA_OK(cudaMalloc((void **)&d_zg, (size_t)r.n_assign * M * sizeof(float)));
@@ -259,7 +284,7 @@ int main(void) {
         dev_stack sg, su;
         if (upload_stack(gate, sg) || upload_stack(up, su)) return 1;
         CUDA_OK(cudaMemset(d_zg, 0, (size_t)r.n_assign * M * sizeof(float)));
-        const int rc = ds4_exl3_moe_gemv_pair_launch(sg.table, su.table, k2, d_act, d_ids, d_bounds, d_zg, d_zu, M, K, r.n_assign, E, 0);
+        const int rc = gemv_pair(sg.table, su.table, k2, d_act, d_ids, d_src, d_bounds, d_zg, d_zu, M, K, r.n_assign, E);
         CHECK(rc == 0, "pair launch k2=%d rc=%d", k2, rc);
         CUDA_OK(cudaDeviceSynchronize());
         CUDA_OK(cudaMemcpy(zg.data(), d_zg, zg.size() * sizeof(float), cudaMemcpyDeviceToHost));
@@ -369,33 +394,13 @@ int main(void) {
             CHECK(src_rc == 0 && nf == 0x501u, "sum did not flag a NaN input (flag 0x%x)", nf);
             printf("  sum: %d tokens x %d, max rel %.2e; NaN flagged 0x%x\n", n_tok, K, sum_worst, nf);
 
-            /* 2. the down GEMV: 2304 -> 5120, input = the fold's mid (E4M3) re-staged */
+            /* 2. the down GEMV: 2304 -> 5120, input = the fold's mid, read in its E4M3 slot (row = pair) */
             {
-                acts am;
-                const int nbm = M / 128;
-                am.resize((size_t)nbm * r.n_assign);
-                am.x.assign((size_t)r.n_assign * M, 0.0);
-                for (int col = 0; col < r.n_assign; col++) {
-                    const int pair = r.ids_dst[col];
-                    for (int b = 0; b < nbm; b++) {
-                        block_mx_act_mmq &blk = am.blk((size_t)b * r.n_assign + col);
-                        for (int g = 0; g < 4; g++) {
-                            const uint8_t sb = msf[pulsar_mx_sfoff(pair, b * 4 + g, kbp)];
-                            blk.d4[g] = (float)sb;
-                            for (int j = 0; j < 32; j++) {
-                                const uint8_t q = mq[(size_t)pair * M + b * 128 + g * 32 + j];
-                                blk.qs[g * 32 + j] = (int8_t)q;
-                                am.x[(size_t)pair * M + b * 128 + g * 32 + j] = (double)e4m3_to_f32(q) * exp2((double)sb - 127.0);
-                            }
-                        }
-                    }
-                }
-                block_mx_act_mmq *d_am = nullptr;
+                const acts am = decode_slot(mq, msf, r.n_assign, M, kbp);
+                const exl3_moe_act d_am{EXL3_MOE_ACT_E4M3_SLOT, d_mq, d_msf, kbp};
                 float *d_zdown = nullptr;
-                CUDA_OK(cudaMalloc((void **)&d_am, am.bytes()));
-                CUDA_OK(cudaMemcpy(d_am, am.raw.data(), am.bytes(), cudaMemcpyHostToDevice));
                 CUDA_OK(cudaMalloc((void **)&d_zdown, (size_t)r.n_assign * K * sizeof(float)));
-                const int drc = ds4_exl3_moe_gemv_single_launch(sd.table, 6, d_am, d_ids, d_bounds, d_zdown, K, M, r.n_assign, E, 0);
+                const int drc = gemv_one(EXL3_ARM_DOWN, sd.table, 6, d_am, d_ids, d_ids, d_bounds, d_zdown, K, M, r.n_assign, E);
                 CHECK(drc == 0, "down launch rc=%d", drc);
                 CUDA_OK(cudaDeviceSynchronize());
                 std::vector<float> zdown((size_t)r.n_assign * K);
@@ -427,13 +432,10 @@ int main(void) {
                     dev_stack sbg, sbu, sbd;
                     if (upload_stack(bg, sbg) || upload_stack(bu, sbu) || upload_stack(bd, sbd)) return 1;
                     const acts ab = make_acts(rb, K), abm = make_acts(rb, M);
-                    block_mx_act_mmq *d_ab = nullptr, *d_abm = nullptr;
+                    const exl3_moe_act d_ab = upload_act(ab), d_abm = upload_act(abm);
+                    int32_t *d_btok = upload_ids(rb.ids_tok);
                     int32_t *d_bids = nullptr, *d_bb = nullptr;
                     float *d_bzg = nullptr, *d_bzu = nullptr, *d_bzd = nullptr;
-                    CUDA_OK(cudaMalloc((void **)&d_ab, ab.bytes()));
-                    CUDA_OK(cudaMemcpy(d_ab, ab.raw.data(), ab.bytes(), cudaMemcpyHostToDevice));
-                    CUDA_OK(cudaMalloc((void **)&d_abm, abm.bytes()));
-                    CUDA_OK(cudaMemcpy(d_abm, abm.raw.data(), abm.bytes(), cudaMemcpyHostToDevice));
                     CUDA_OK(cudaMalloc((void **)&d_bids, 12 * sizeof(int32_t)));
                     CUDA_OK(cudaMemcpy(d_bids, rb.ids_dst.data(), 12 * sizeof(int32_t), cudaMemcpyHostToDevice));
                     CUDA_OK(cudaMalloc((void **)&d_bb, (Eb + 1) * sizeof(int32_t)));
@@ -445,35 +447,35 @@ int main(void) {
                     CUDA_OK(cudaEventCreate(&t0)); CUDA_OK(cudaEventCreate(&t1));
                     const int iters = 40;
                     float ms = 0;
-                    for (int i = 0; i < 3; i++) ds4_exl3_moe_gemv_pair_launch(sbg.table, sbu.table, 6, d_ab, d_bids, d_bb, d_bzg, d_bzu, M, K, 12, Eb, 0);
+                    for (int i = 0; i < 3; i++) gemv_pair(sbg.table, sbu.table, 6, d_ab, d_bids, d_btok, d_bb, d_bzg, d_bzu, M, K, 12, Eb);
                     CUDA_OK(cudaEventRecord(t0));
-                    for (int i = 0; i < iters; i++) ds4_exl3_moe_gemv_pair_launch(sbg.table, sbu.table, 6, d_ab, d_bids, d_bb, d_bzg, d_bzu, M, K, 12, Eb, 0);
+                    for (int i = 0; i < iters; i++) gemv_pair(sbg.table, sbu.table, 6, d_ab, d_bids, d_btok, d_bb, d_bzg, d_bzu, M, K, 12, Eb);
                     CUDA_OK(cudaEventRecord(t1)); CUDA_OK(cudaEventSynchronize(t1));
                     CUDA_OK(cudaEventElapsedTime(&ms, t0, t1)); ms /= iters;
                     const double pair_bytes = 2.0 * 12 * (double)bg[0].stride;
                     printf("  pair GEMV K=3 5120->2304 x 12 assignments (12 experts, DRAM): %.1f us, %.0f GB/s (%.1f MB; %.1f us per matrix)\n",
                            ms * 1000.0, pair_bytes / (ms * 1e-3) / 1e9, pair_bytes / 1e6, ms * 1000.0 / 24.0);
-                    for (int i = 0; i < 3; i++) ds4_exl3_moe_gemv_single_launch(sbd.table, 6, d_abm, d_bids, d_bb, d_bzd, K, M, 12, Eb, 0);
+                    for (int i = 0; i < 3; i++) gemv_one(EXL3_ARM_DOWN, sbd.table, 6, d_abm, d_bids, d_btok, d_bb, d_bzd, K, M, 12, Eb);
                     CUDA_OK(cudaEventRecord(t0));
-                    for (int i = 0; i < iters; i++) ds4_exl3_moe_gemv_single_launch(sbd.table, 6, d_abm, d_bids, d_bb, d_bzd, K, M, 12, Eb, 0);
+                    for (int i = 0; i < iters; i++) gemv_one(EXL3_ARM_DOWN, sbd.table, 6, d_abm, d_bids, d_btok, d_bb, d_bzd, K, M, 12, Eb);
                     CUDA_OK(cudaEventRecord(t1)); CUDA_OK(cudaEventSynchronize(t1));
                     CUDA_OK(cudaEventElapsedTime(&ms, t0, t1)); ms /= iters;
                     const double down_bytes = 12.0 * (double)bd[0].stride;
                     printf("  down GEMV K=3 2304->5120 x 12 assignments (12 experts, DRAM): %.1f us, %.0f GB/s (%.1f MB; %.1f us per matrix)\n",
                            ms * 1000.0, down_bytes / (ms * 1e-3) / 1e9, down_bytes / 1e6, ms * 1000.0 / 12.0);
                     /* the same at ONE assignment (the single-stream decode step of one expert) */
-                    for (int i = 0; i < 3; i++) ds4_exl3_moe_gemv_pair_launch(sbg.table, sbu.table, 6, d_ab, d_bids, d_bb, d_bzg, d_bzu, M, K, 1, Eb, 0);
+                    for (int i = 0; i < 3; i++) gemv_pair(sbg.table, sbu.table, 6, d_ab, d_bids, d_btok, d_bb, d_bzg, d_bzu, M, K, 1, Eb);
                     CUDA_OK(cudaEventRecord(t0));
-                    for (int i = 0; i < iters; i++) ds4_exl3_moe_gemv_pair_launch(sbg.table, sbu.table, 6, d_ab, d_bids, d_bb, d_bzg, d_bzu, M, K, 1, Eb, 0);
+                    for (int i = 0; i < iters; i++) gemv_pair(sbg.table, sbu.table, 6, d_ab, d_bids, d_btok, d_bb, d_bzg, d_bzu, M, K, 1, Eb);
                     CUDA_OK(cudaEventRecord(t1)); CUDA_OK(cudaEventSynchronize(t1));
                     CUDA_OK(cudaEventElapsedTime(&ms, t0, t1)); ms /= iters;
                     printf("  pair GEMV K=3 x 1 assignment (L2-warm after the first rep): %.1f us, %.0f GB/s equivalent\n",
                            ms * 1000.0, 2.0 * bg[0].stride / (ms * 1e-3) / 1e9);
-                    cudaFree(d_ab); cudaFree(d_abm); cudaFree(d_bids); cudaFree(d_bb); cudaFree(d_bzg); cudaFree(d_bzu); cudaFree(d_bzd);
+                    free_act(d_ab); free_act(d_abm); cudaFree(d_btok); cudaFree(d_bids); cudaFree(d_bb); cudaFree(d_bzg); cudaFree(d_bzu); cudaFree(d_bzd);
                     cudaFree(sbg.arena); cudaFree((void *)sbg.table); cudaFree(sbu.arena); cudaFree((void *)sbu.table);
                     cudaFree(sbd.arena); cudaFree((void *)sbd.table);
                 }
-                cudaFree(d_am); cudaFree(d_zdown);
+                cudaFree(d_zdown);
             }
             /* 4c. the row block is a performance choice: R = 1, 4, 16 must be bit-identical,
              * on the decode routing (6 assignments, distinct experts) and on a prefill-like
@@ -481,15 +483,15 @@ int main(void) {
              * many rows share one weight stream). */
             {
                 std::vector<float> z1(zg.size()), z4(zg.size()), z16(zg.size()), u1(zu.size()), u4(zu.size()), u16(zu.size());
-                ds4_exl3_moe_gemv_pair_launch_rows(sg.table, su.table, 6, d_act, d_ids, d_bounds, d_zg, d_zu, M, K, r.n_assign, E, 1, 0);
+                gemv_pair(sg.table, su.table, 6, d_act, d_ids, d_src, d_bounds, d_zg, d_zu, M, K, r.n_assign, E, 1);
                 CUDA_OK(cudaDeviceSynchronize());
                 CUDA_OK(cudaMemcpy(z1.data(), d_zg, zg.size() * sizeof(float), cudaMemcpyDeviceToHost));
                 CUDA_OK(cudaMemcpy(u1.data(), d_zu, zu.size() * sizeof(float), cudaMemcpyDeviceToHost));
-                ds4_exl3_moe_gemv_pair_launch_rows(sg.table, su.table, 6, d_act, d_ids, d_bounds, d_zg, d_zu, M, K, r.n_assign, E, 4, 0);
+                gemv_pair(sg.table, su.table, 6, d_act, d_ids, d_src, d_bounds, d_zg, d_zu, M, K, r.n_assign, E, 4);
                 CUDA_OK(cudaDeviceSynchronize());
                 CUDA_OK(cudaMemcpy(z4.data(), d_zg, zg.size() * sizeof(float), cudaMemcpyDeviceToHost));
                 CUDA_OK(cudaMemcpy(u4.data(), d_zu, zu.size() * sizeof(float), cudaMemcpyDeviceToHost));
-                ds4_exl3_moe_gemv_pair_launch_rows(sg.table, su.table, 6, d_act, d_ids, d_bounds, d_zg, d_zu, M, K, r.n_assign, E, 16, 0);
+                gemv_pair(sg.table, su.table, 6, d_act, d_ids, d_src, d_bounds, d_zg, d_zu, M, K, r.n_assign, E, 16);
                 CUDA_OK(cudaDeviceSynchronize());
                 CUDA_OK(cudaMemcpy(z16.data(), d_zg, zg.size() * sizeof(float), cudaMemcpyDeviceToHost));
                 CUDA_OK(cudaMemcpy(u16.data(), d_zu, zu.size() * sizeof(float), cudaMemcpyDeviceToHost));
@@ -500,11 +502,10 @@ int main(void) {
 
                 const routing rp = make_routing(32, 3, E);      /* 96 assignments, ~24 per expert (3 distinct of 4 per token) */
                 const acts ap = make_acts(rp, K);
-                block_mx_act_mmq *d_ap = nullptr;
+                const exl3_moe_act d_ap = upload_act(ap);
+                int32_t *d_ptok = upload_ids(rp.ids_tok);
                 int32_t *d_pids = nullptr, *d_pb = nullptr;
                 float *d_pz = nullptr, *d_pu = nullptr;
-                CUDA_OK(cudaMalloc((void **)&d_ap, ap.bytes()));
-                CUDA_OK(cudaMemcpy(d_ap, ap.raw.data(), ap.bytes(), cudaMemcpyHostToDevice));
                 CUDA_OK(cudaMalloc((void **)&d_pids, rp.n_assign * sizeof(int32_t)));
                 CUDA_OK(cudaMemcpy(d_pids, rp.ids_dst.data(), rp.n_assign * sizeof(int32_t), cudaMemcpyHostToDevice));
                 CUDA_OK(cudaMalloc((void **)&d_pb, (E + 1) * sizeof(int32_t)));
@@ -512,11 +513,11 @@ int main(void) {
                 CUDA_OK(cudaMalloc((void **)&d_pz, (size_t)rp.n_assign * M * sizeof(float)));
                 CUDA_OK(cudaMalloc((void **)&d_pu, (size_t)rp.n_assign * M * sizeof(float)));
                 std::vector<float> p1((size_t)rp.n_assign * M), p16(p1.size()), q1(p1.size()), q16(p1.size());
-                ds4_exl3_moe_gemv_pair_launch_rows(sg.table, su.table, 6, d_ap, d_pids, d_pb, d_pz, d_pu, M, K, rp.n_assign, E, 1, 0);
+                gemv_pair(sg.table, su.table, 6, d_ap, d_pids, d_ptok, d_pb, d_pz, d_pu, M, K, rp.n_assign, E, 1);
                 CUDA_OK(cudaDeviceSynchronize());
                 CUDA_OK(cudaMemcpy(p1.data(), d_pz, p1.size() * sizeof(float), cudaMemcpyDeviceToHost));
                 CUDA_OK(cudaMemcpy(q1.data(), d_pu, q1.size() * sizeof(float), cudaMemcpyDeviceToHost));
-                ds4_exl3_moe_gemv_pair_launch_rows(sg.table, su.table, 6, d_ap, d_pids, d_pb, d_pz, d_pu, M, K, rp.n_assign, E, 16, 0);
+                gemv_pair(sg.table, su.table, 6, d_ap, d_pids, d_ptok, d_pb, d_pz, d_pu, M, K, rp.n_assign, E, 16);
                 CUDA_OK(cudaDeviceSynchronize());
                 CUDA_OK(cudaMemcpy(p16.data(), d_pz, p16.size() * sizeof(float), cudaMemcpyDeviceToHost));
                 CUDA_OK(cudaMemcpy(q16.data(), d_pu, q16.size() * sizeof(float), cudaMemcpyDeviceToHost));
@@ -538,16 +539,16 @@ int main(void) {
                 CUDA_OK(cudaEventCreate(&t0)); CUDA_OK(cudaEventCreate(&t1));
                 float ms1 = 0, ms16 = 0;
                 for (int Rb : {1, 16}) {
-                    for (int i = 0; i < 2; i++) ds4_exl3_moe_gemv_pair_launch_rows(sg.table, su.table, 6, d_ap, d_pids, d_pb, d_pz, d_pu, M, K, rp.n_assign, E, Rb, 0);
+                    for (int i = 0; i < 2; i++) gemv_pair(sg.table, su.table, 6, d_ap, d_pids, d_ptok, d_pb, d_pz, d_pu, M, K, rp.n_assign, E, Rb);
                     CUDA_OK(cudaEventRecord(t0));
-                    for (int i = 0; i < 10; i++) ds4_exl3_moe_gemv_pair_launch_rows(sg.table, su.table, 6, d_ap, d_pids, d_pb, d_pz, d_pu, M, K, rp.n_assign, E, Rb, 0);
+                    for (int i = 0; i < 10; i++) gemv_pair(sg.table, su.table, 6, d_ap, d_pids, d_ptok, d_pb, d_pz, d_pu, M, K, rp.n_assign, E, Rb);
                     CUDA_OK(cudaEventRecord(t1)); CUDA_OK(cudaEventSynchronize(t1));
                     float ms = 0; CUDA_OK(cudaEventElapsedTime(&ms, t0, t1));
                     if (Rb == 1) ms1 = ms / 10; else ms16 = ms / 10;
                 }
                 printf("  96 assignments x pair GEMV K=3: R=1 %.0f us (%.1f us/assignment), R=16 %.0f us (%.1f us/assignment), %.1fx\n",
                        ms1 * 1000, ms1 * 1000 / 96, ms16 * 1000, ms16 * 1000 / 96, ms1 / ms16);
-                cudaFree(d_ap); cudaFree(d_pids); cudaFree(d_pb); cudaFree(d_pz); cudaFree(d_pu);
+                free_act(d_ap); cudaFree(d_ptok); cudaFree(d_pids); cudaFree(d_pb); cudaFree(d_pz); cudaFree(d_pu);
             }
             /* 5. the mutation: one flipped trellis bit in expert 0's gate must move z */
             {
@@ -556,7 +557,7 @@ int main(void) {
                 byte ^= 0x10u;
                 CUDA_OK(cudaMemcpy(sg.arena + 1000, &byte, 1, cudaMemcpyHostToDevice));
                 std::vector<float> zg2(zg.size());
-                ds4_exl3_moe_gemv_pair_launch(sg.table, su.table, 6, d_act, d_ids, d_bounds, d_zg, d_zu, M, K, r.n_assign, E, 0);
+                gemv_pair(sg.table, su.table, 6, d_act, d_ids, d_src, d_bounds, d_zg, d_zu, M, K, r.n_assign, E);
                 CUDA_OK(cudaDeviceSynchronize());
                 CUDA_OK(cudaMemcpy(zg2.data(), d_zg, zg2.size() * sizeof(float), cudaMemcpyDeviceToHost));
                 size_t moved = 0;
