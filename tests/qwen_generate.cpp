@@ -254,10 +254,15 @@ int main(int argc, char **argv) {
         }
         int *out = (int *)malloc((size_t)n_predict * sizeof(int));
         uint64_t rng = 1;
+        /* QWEN_SPEC_TEMP > 0: sampled speculation (top-k 20, top-p 0.95, the served chat defaults) -- timed the
+         * same way; its tokens are a draw, so it is not compared with the greedy run */
+        const float temp = getenv("QWEN_SPEC_TEMP") ? (float)atof(getenv("QWEN_SPEC_TEMP")) : 0.0f;
+        const int top_k = temp > 0.0f ? 20 : 0;
+        const float top_p = temp > 0.0f ? 0.95f : 1.0f;
         const double t0 = now_s();
         int n = 0, rounds = 0;
         while (n < generated) {
-            const int k = pulsar_session_generate_speculative(sess, 0.0f, 0, 1.0f, 0.0f, &rng, generated - n,
+            const int k = pulsar_session_generate_speculative(sess, temp, top_k, top_p, 0.0f, &rng, generated - n,
                                                               out + n, generated - n, err, sizeof(err));
             if (k < 0) {
                 fprintf(stderr, "qwen-generate: SPEC failed: %s\n", err);
@@ -270,18 +275,23 @@ int main(int argc, char **argv) {
         }
         const double dt = now_s() - t0;
         printf("qwen-generate: SPEC %d rounds, %.2f tokens a round\n", rounds, rounds ? (double)n / rounds : 0.0);
-        int same = 0;
-        while (same < n && same < generated && out[same] == ids[n_tok + same]) same++;
-        printf("qwen-generate: SPEC %d tokens in %.3f s = %.2f tok/s (%.1f ms/token after the first); identical to "
-               "greedy for %d of %d\n", n, dt, n > 1 ? (n - 1) / dt : 0.0, n > 1 ? 1e3 * dt / (n - 1) : 0.0, same,
-               n < generated ? n : generated);
-        if (same < (n < generated ? n : generated)) {
-            printf("qwen-generate: SPEC diverges at token %d: greedy %d, spec %d\n", same, ids[n_tok + same], out[same]);
-            free(out);
-            return 3;
+        if (temp > 0.0f) {
+            printf("qwen-generate: SPEC sampled at temperature %.2f: %d tokens in %.3f s = %.2f tok/s (%.1f ms/token "
+                   "after the first)\n", (double)temp, n, dt, n > 1 ? (n - 1) / dt : 0.0, n > 1 ? 1e3 * dt / (n - 1) : 0.0);
+        } else {
+            int same = 0;
+            while (same < n && same < generated && out[same] == ids[n_tok + same]) same++;
+            printf("qwen-generate: SPEC %d tokens in %.3f s = %.2f tok/s (%.1f ms/token after the first); identical to "
+                   "greedy for %d of %d\n", n, dt, n > 1 ? (n - 1) / dt : 0.0, n > 1 ? 1e3 * dt / (n - 1) : 0.0, same,
+                   n < generated ? n : generated);
+            if (same < (n < generated ? n : generated)) {
+                printf("qwen-generate: SPEC diverges at token %d: greedy %d, spec %d\n", same, ids[n_tok + same], out[same]);
+                free(out);
+                return 3;
+            }
         }
         free(out);
-        if (n < generated) {
+        if (n < generated && temp <= 0.0f) {   /* a sampled reply may draw a stop */
             printf("qwen-generate: SPEC stopped at %d of %d tokens after %d rounds\n", n, generated, rounds);
             return 3;
         }

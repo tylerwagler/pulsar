@@ -573,6 +573,7 @@ static int spec_round_end(pulsar_session *s, pulsar_spec_round *r,
         while ((uint32_t)commit_rc < K && pend[commit_rc] == forced_truth[commit_rc]) commit_rc++;
         carry_tok = (int)forced_truth[commit_rc];
     } else {
+        PULSAR_NVTX("spec: walk");
         commit_rc = spec_accept_walk(s, src->read, src->ud, src->compact, row0,
                                      row_tops, pend, K, pend_sampled,
                                      temperature, top_k, top_p, min_p,
@@ -726,8 +727,13 @@ static int spec_round_end(pulsar_session *s, pulsar_spec_round *r,
      * the committed rows 0..commit from its own captured features (row j = f(h_j)), each with the
      * token that follows it: the next committed token, or the carry after the last. */
     s->checkpoint.len = saved_len;
-    bool ok_state = spec_target(s)->commit(s, r, (uint32_t)commit, row0);
+    bool ok_state;
+    {
+        PULSAR_NVTX("spec: commit");   /* rule 5: the round's phases are named on the timeline */
+        ok_state = spec_target(s)->commit(s, r, (uint32_t)commit, row0);
+    }
     if (ok_state) {
+        PULSAR_NVTX("spec: absorb");
         s->checkpoint.len = saved_len + 1 + commit;
         int32_t next[PULSAR_SPEC_LOGITS_ROWS + 1];
         uint32_t n_abs = 0;
@@ -817,7 +823,11 @@ static int spec_round_end(pulsar_session *s, pulsar_spec_round *r,
         q->commit = commit;
         return n_accept;
     }
-    const uint32_t keep = spec_drafter(s)->draft(s, next_base, features_ready, temperature, top_k, top_p, min_p, rng);
+    uint32_t keep;
+    {
+        PULSAR_NVTX("spec: draft");
+        keep = spec_drafter(s)->draft(s, next_base, features_ready, temperature, top_k, top_p, min_p, rng);
+    }
     /* t0 == 0 marks a lane whose forward ran outside this round (the batched
      * lane) -- step_ms would print the epoch, so skip the line there. */
     if (dspark_stats && t0 > 0.0)
@@ -848,7 +858,12 @@ static int spec_single_round(pulsar_session *s, int first_token,
     }
     pulsar_spec_rows src;
     memset(&src, 0, sizeof src);
-    if (!spec_target(s)->verify_single(s, &r, &src, err, errlen)) {
+    bool verified;
+    {
+        PULSAR_NVTX("spec: verify");
+        verified = spec_target(s)->verify_single(s, &r, &src, err, errlen);
+    }
+    if (!verified) {
         s->checkpoint.len = r.saved_len;
         spec_round_undo(s, &r);
         s->checkpoint_valid = false;

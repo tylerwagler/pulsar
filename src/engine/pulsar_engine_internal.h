@@ -502,7 +502,10 @@ void pulsar_engram_hash_pos(const pulsar_engram_layout *L, uint32_t layer,
  * the one-part case (offset 64, 264-byte records). */
 #define PULSAR_ENGRAM_ROW_BYTES 264u
 #define PULSAR_ENGRAM_HDR_BYTES 64u
-#define PULSAR_ENGRAM_IO_THREADS 16u
+/** The row-gather pool's threads.  A cold row is one NVMe read (~150 us) and a pread blocks its thread, so the
+ *  pool is the gather's queue depth: 16 left a Qwen verify's ~72 rows four to eight reads deep while the GPU
+ *  waited at the PLE layer; 64 keeps a decode or verify gather one or two deep (qwen-perf, 2026-10-11). */
+#define PULSAR_ENGRAM_IO_THREADS 64u
 
 /** One row-contiguous range of a table: rows [i * rows_per_part, ...) at `base`. */
 typedef struct {

@@ -19,6 +19,7 @@
 #include "cuda/pulsar_cuda_qwen.h"
 #include "cuda/pulsar_cuda_gdn.h"
 #include "cuda/mmq/pulsar_tessera.h"
+#include "pulsar_nvtx.h"
 
 #include <sys/stat.h>
 
@@ -565,7 +566,11 @@ bool pulsar_qwen_s4_ple(const pulsar_qwen_step *st, uint32_t il) {
     const uint32_t n = st->n_rows;
     pulsar_qwen_ple_io *io = st->w->ple_io;
     if (!io || !io->pending || io->pending_n != n) return fail("the PLE op found no gather for this step");
-    const int got = pulsar_engram_gather_wait(io->pending);
+    int got;
+    {
+        PULSAR_NVTX("qwen: PLE gather wait");
+        got = pulsar_engram_gather_wait(io->pending);
+    }
     io->pending = NULL;
     if (!got) return fail("the PLE row gather failed (message above)");
 
