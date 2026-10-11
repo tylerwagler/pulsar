@@ -20,6 +20,14 @@
  *     pulsar_tp_wait_command_ack must return 0 with "rank 1 failed during eval" and must
  *     set the pulsar_tp_mark_failed latch (pulsar_tp_failed() == true) --
  *     the only auto-latch in the transport.
+ *  C. the LEADER refuses a step while the previous eval's ack is still
+ *     deferred (L241's pipelined identity check) and the worker is already
+ *     blocked in that step's big gate.  The leader's drain must settle the
+ *     deferred ack, find no answer to THIS step and abort the pair on the data
+ *     socket; the worker's gate must fail on the named abort within seconds,
+ *     while the leader still holds its transport open.  Before L269 the
+ *     deferred ack made the control socket look answered, no abort went out,
+ *     and the worker waited for the leader's rows until the leader exited.
  *
  * Every survivor runs under alarm(20); the parent enforces its own bound.
  */
@@ -95,6 +103,42 @@ static int create_rank(int rank, int port, pulsar_tp **out, char *err,
     return pulsar_tp_create(out, &opt, &id, err, errlen);
 }
 
+/* Mode C's agreed step-1 logits digest (both ranks compute the same bytes). */
+static uint64_t mode3_digest(void) {
+    static float logits[64];
+    for (uint32_t i = 0; i < 64; i++) logits[i] = pat(0, 7, i);
+    return pulsar_tp_logits_digest(logits, 1u, 64u);
+}
+#define MODE3_SID 9393u
+#define MODE3_GATE_BYTES 65536u
+static pid_t g_child = -1;
+static int g_child_reaped = 0, g_child_status = 0;
+
+static void run_worker_mode3(pulsar_tp *tp) {
+    char err[256];
+    static float out[MODE3_GATE_BYTES / 4], in[MODE3_GATE_BYTES / 4];
+    pulsar_tp_command cmd;
+    /* Step 1: a healthy eval -- one big gate, then the digest ack the leader defers. */
+    std::memset(&cmd, 0, sizeof(cmd));
+    CHECK(pulsar_tp_recv_command(tp, &cmd, err, sizeof(err)) == 1, "C: worker recv step 1: %s", err);
+    pulsar_tp_command_free(&cmd);
+    fill_pat(out, 1, 1, MODE3_GATE_BYTES / 4);
+    CHECK(pulsar_tp_big_gate_exchange(tp, 0, 1, out, in, MODE3_GATE_BYTES) == 1, "C: worker step-1 gate");
+    verify_pat(in, 0, 1, MODE3_GATE_BYTES / 4);
+    CHECK(pulsar_tp_send_command_ack_digest(tp, MODE3_SID, 0, mode3_digest()) == 1, "C: worker ack 1");
+    /* Step 2: the leader refuses it before its gate; ours must fail on the abort, promptly. */
+    std::memset(&cmd, 0, sizeof(cmd));
+    CHECK(pulsar_tp_recv_command(tp, &cmd, err, sizeof(err)) == 1, "C: worker recv step 2: %s", err);
+    pulsar_tp_command_free(&cmd);
+    const double t0 = tp_now_sec();
+    const int rc = pulsar_tp_big_gate_exchange(tp, 0, 2, out, in, MODE3_GATE_BYTES);
+    const double dt = tp_now_sec() - t0;
+    CHECK(rc == 0, "C: the worker's gate succeeded against a leader that refused the step");
+    CHECK(dt < 10.0, "C: the worker's gate took %.1f s to fail (the leader never aborted: the "
+                     "deferred ack made it look answered)", dt);
+    CHECK(pulsar_tp_send_command_ack(tp, MODE3_SID, 1) == 1, "C: worker failed ack 2");
+}
+
 static void run_worker(int port, int mode) {
     char err[256];
     pulsar_tp *tp = NULL;
@@ -103,6 +147,11 @@ static void run_worker(int port, int mode) {
     if (!tp) return;
 
     if (mode == 2) { /* control-death mode: die without acking anything */
+        pulsar_tp_free(tp);
+        return;
+    }
+    if (mode == 3) {
+        run_worker_mode3(tp);
         pulsar_tp_free(tp);
         return;
     }
@@ -156,6 +205,36 @@ static void run_leader(int port, int mode) {
         CHECK(pulsar_tp_failed(tp), "failed() not latched on ack failure");
         CHECK(e2[0] != '\0' && strstr(e2, "rank 1 failed during eval") != NULL,
               "ack err=%s (want the dead rank named, with the operation)", e2);
+        return;
+    }
+    if (mode == 3) {
+        static float out[MODE3_GATE_BYTES / 4], in[MODE3_GATE_BYTES / 4];
+        CHECK(pulsar_tp_send_eval(tp, MODE3_SID, 1, 11) == 1, "C: leader send_eval 1");
+        fill_pat(out, 0, 1, MODE3_GATE_BYTES / 4);
+        CHECK(pulsar_tp_big_gate_exchange(tp, 0, 1, out, in, MODE3_GATE_BYTES) == 1, "C: leader step-1 gate");
+        verify_pat(in, 1, 1, MODE3_GATE_BYTES / 4);
+        CHECK(pulsar_tp_defer_command_ack_digest(tp, MODE3_SID, "eval at position 1", mode3_digest()) == 1,
+              "C: leader defer 1");
+        CHECK(pulsar_tp_send_eval(tp, MODE3_SID, 2, 12) == 1, "C: leader send_eval 2");
+        /* this rank's body of step 2 fails before its gate: pulsar_session_eval's failure path */
+        const double t0 = tp_now_sec();
+        pulsar_tp_drain_command_acks(tp);
+        const double dt = tp_now_sec() - t0;
+        CHECK(dt < 10.0, "C: the leader's drain took %.1f s", dt);
+        CHECK(pulsar_tp_failed(tp), "C: the abort must mark the pair failed");
+        uint64_t frames = 0, matched = 0;
+        pulsar_tp_identity_stats(tp, &frames, &matched);
+        CHECK(frames == 1 && matched == 1, "C: the deferred step-1 ack must be settled and agree (%llu/%llu)",
+              (unsigned long long)matched, (unsigned long long)frames);
+        /* Hold the transport open (a server leader lives on) until the worker
+         * is done: its gate must have failed on the abort, not on our close. */
+        const double hold0 = tp_now_sec();
+        while (!g_child_reaped && tp_now_sec() - hold0 < 12.0) {
+            const pid_t r = waitpid(g_child, &g_child_status, WNOHANG);
+            if (r == g_child) g_child_reaped = 1;
+            else usleep(10000);
+        }
+        pulsar_tp_free(tp);
         return;
     }
 
@@ -250,12 +329,14 @@ static int run_mode(int mode) {
         _exit(g_failures != 0);
     }
 
-    alarm(20);
+    g_child = pid;
+    g_child_reaped = 0;
+    alarm(25);
     run_leader(port, mode);
     alarm(0);
 
-    int wstatus = 0;
-    if (waitpid(pid, &wstatus, 0) < 0) {
+    int wstatus = g_child_status;
+    if (!g_child_reaped && waitpid(pid, &wstatus, 0) < 0) {
         CHECK(0, "waitpid (mode %d): %s", mode, std::strerror(errno));
         return 1;
     }
@@ -272,14 +353,18 @@ int main(void) {
     /* mode 1: the gate pump runs into a dead peer (worker dies after two
      * exchanges; leader's exchanges must fail, never hang).  mode 2: control-
      * path latch (worker dies before acking; wait_command_ack must return an
-     * error naming the dead rank and the operation, and set failed()). */
+     * error naming the dead rank and the operation, and set failed()).  mode 3:
+     * the leader refuses a step with a deferred ack pending; the worker blocked
+     * in that step's gate must fail on the leader's named abort (C above). */
     int rc = 0;
     rc |= run_mode(1);
     rc |= run_mode(2);
+    rc |= run_mode(3);
     if (g_failures) {
         std::fprintf(stderr, "tp_fault_test: %d FAILURE(S)\n", g_failures);
         return 1;
     }
-    std::printf("tp_fault_test: ok (gate-pump death surfaced, no hang; control-ack latch)\n");
+    std::printf("tp_fault_test: ok (gate-pump death surfaced, no hang; control-ack latch; a leader "
+                "refusal with a deferred ack pending aborts the worker's gate)\n");
     return rc;
 }

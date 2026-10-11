@@ -165,6 +165,41 @@ static void big_phase(pulsar_tp *tp, int rank, uint32_t layer, uint64_t seq,
     std::free(in);
 }
 
+/* The pipelined identity check (L241 4g-2) leaves a worker's eval ack in the
+ * leader's CONTROL socket while the next step's data plane runs, so no data-
+ * plane exchange may read that socket.  Through protocol v26 the RDMA arming
+ * handshake did: the leader read the deferred ack as the peer's ARMED and
+ * refused the gate (L269).  Here the ack is sent, then a big gate and a batch
+ * gate run (each arms an RDMA receive window on an RDMA pair -- run this test
+ * in remote mode on an HCA to exercise that), then the leader settles the
+ * ack.  Over TCP it pins the same ordering. */
+static void acks_ahead_phase(pulsar_tp *tp, uint8_t *base, int rank, const pulsar_tp_slab *s,
+                             uint64_t vec) {
+    char err[256];
+    const uint64_t sid = 7171u;
+    float logits[64];
+    for (uint32_t i = 0; i < 64; i++) logits[i] = pat(1, 71, i);
+    const uint64_t digest = pulsar_tp_logits_digest(logits, 1u, 64u);
+    if (rank == 0) {
+        CHECK(pulsar_tp_send_eval(tp, sid, 1, 21) == 1, "acks ahead: send_eval");
+        CHECK(pulsar_tp_defer_command_ack_digest(tp, sid, "eval at position 1", digest) == 1,
+              "acks ahead: defer");
+    } else {
+        pulsar_tp_command cmd;
+        std::memset(&cmd, 0, sizeof(cmd));
+        CHECK(pulsar_tp_recv_command(tp, &cmd, err, sizeof(err)), "acks ahead: worker recv: %s", err);
+        pulsar_tp_command_free(&cmd);
+        CHECK(pulsar_tp_send_command_ack_digest(tp, sid, 0, digest) == 1, "acks ahead: worker ack");
+    }
+    big_phase(tp, rank, 2, 3, 262144ull, 1);
+    batch_phase(tp, base, rank, s, vec, 7, 2, 3, 0);
+    if (rank == 0) {
+        err[0] = 0;
+        CHECK(pulsar_tp_settle_deferred_ack(tp, err, sizeof(err)) == 1,
+              "acks ahead: the deferred ack must still be in the socket, unread: %s", err);
+    }
+}
+
 static void lockstep_phase(pulsar_tp *tp, int rank) {
     char err[256];
     const uint64_t sid = 4242u;
@@ -679,6 +714,7 @@ static int run_rank(pulsar_tp *tp, int rank) {
     big_phase(tp, rank, 0, 1, 262144ull, 0);   /* 256 KiB  L->W */
     big_phase(tp, rank, 1, 2, 3145728ull, 1);  /* 3 MiB   W->L (2 MiB round split) */
 
+    acks_ahead_phase(tp, base, rank, &s, vec);
     lockstep_phase(tp, rank);
     frames_phase(tp, rank);
     deferred_phase(tp, rank);
