@@ -1562,14 +1562,14 @@ static inline volatile uint32_t *tp_row_err(pulsar_tp *tp) {
 }
 
 /* ROW-LANE ABORT (L241 4g-2).  A rank that will not run a step its peer is
- * running -- a refused frame, a failed body -- leaves the peer's GPU spinning
- * in a combine for rows that never come, until the transport timeout (900 s:
- * the pair looked hung).  The failing rank sends this message on the DATA
+ * running -- a refused frame, a failed body -- leaves the peer's stream waiting
+ * for rows that never come, until the transport timeout (900 s: the pair looked
+ * hung).  The failing rank sends this message on the DATA
  * socket, idle during decode (the control socket may hold pipelined acks ahead
  * of it); the peer's proxy peeks for it while it waits on an exchange and
- * latches the lane's error word, which every spinning kernel watches -- the
- * stream drains in microseconds and the drain refuses the step
- * (pulsar_gpu_end_commands).  The message is never consumed: the pair is
+ * latches the lane's error word and releases the stream waits -- the stream
+ * drains in microseconds, every combine skips its add, and the drain refuses
+ * the step (pulsar_gpu_end_commands).  The message is never consumed: the pair is
  * failed from here on.  The magic is distinct from every data-socket header. */
 static const char TP_ROW_ABORT_MAGIC[8] = { 'P', 'T', 'P', 'A', 'B', 'O', 'R', 'T' };
 typedef struct {
@@ -1578,8 +1578,30 @@ typedef struct {
     char why[116];
 } tp_row_abort_msg;
 
+/* Latch the error word, THEN release the done word: every stream wait on it
+ * (GEQ, cyclic: done | RELEASE - exch >= 0) ends, and each combine behind one
+ * reads the latched word and skips.  The proxy re-releases after any later
+ * done store of its own (tp_row_done_publish), so a release is never undone.
+ * Both sides are seq_cst on the two words. */
 static void tp_row_err_latch(pulsar_tp *tp, uint32_t code) {
-    if (tp->slab && pulsar_tp_row_lane(tp) && *tp_row_err(tp) == 0) *tp_row_err(tp) = code;
+    if (!tp->slab || !pulsar_tp_row_lane(tp)) return;
+    uint32_t zero = 0;
+    (void)__atomic_compare_exchange_n((uint32_t *)tp_row_err(tp), &zero, code, false, __ATOMIC_SEQ_CST,
+                                      __ATOMIC_SEQ_CST);
+    tp_row_done(tp)->fetch_or(PULSAR_TP_DONE_RELEASE, std::memory_order_seq_cst);
+}
+
+/* The proxy's "exchange e complete" (the GPU's stream wait ends on it). */
+static void tp_row_done_publish(pulsar_tp *tp, uint64_t e) {
+    tp_row_done(tp)->store(e, std::memory_order_seq_cst);
+    if (__atomic_load_n((const uint32_t *)tp_row_err(tp), __ATOMIC_SEQ_CST) != 0u)
+        tp_row_done(tp)->fetch_or(PULSAR_TP_DONE_RELEASE, std::memory_order_seq_cst);
+}
+
+/* The proxy cannot complete exchanges any more: say so, latch, release. */
+static void tp_row_proxy_fail(pulsar_tp *tp) {
+    tp->proxy_failed.store(true, std::memory_order_release);
+    tp_row_err_latch(tp, 1u);
 }
 
 void pulsar_tp_row_lane_abort(pulsar_tp *tp, const char *why) {
@@ -1882,7 +1904,6 @@ static int tp_bulk_proxy_exchange(pulsar_tp *tp, uint64_t e, uint64_t bytes, uin
 static void *tp_row_proxy_main(void *arg) {
     pulsar_tp *tp = static_cast<pulsar_tp *>(arg);
     volatile uint64_t *desc = tp_row_desc(tp);
-    std::atomic<uint64_t> *done = tp_row_done(tp);
     uint64_t last_exch = 0, next_msg = 1;
     double idle_since = tp_now_sec();
     /* How long to keep busy-polling after the last exchange before backing off.
@@ -1911,15 +1932,15 @@ static void *tp_row_proxy_main(void *arg) {
                                 "(exchange %llu after %llu, %llu bytes, cap %llu) -- lane failed\n",
                         (unsigned long long)e, (unsigned long long)last_exch,
                         (unsigned long long)bytes, (unsigned long long)tp->bulk_cap);
-                tp->proxy_failed.store(true, std::memory_order_release);
+                tp_row_proxy_fail(tp);
                 break;
             }
             if (!tp_bulk_proxy_exchange(tp, e, bytes, buf)) {
-                tp->proxy_failed.store(true, std::memory_order_release);
+                tp_row_proxy_fail(tp);
                 break;
             }
             last_exch = e;
-            done->store(e, std::memory_order_release);
+            tp_row_done_publish(tp, e);
             idle_since = tp_now_sec();
             busy_window = 0.050;
             continue;
@@ -1932,16 +1953,16 @@ static void *tp_row_proxy_main(void *arg) {
                             "first msg %llu want %llu, %u rows) -- lane failed\n",
                     (unsigned long long)e, (unsigned long long)last_exch,
                     (unsigned long long)first, (unsigned long long)next_msg, rows);
-            tp->proxy_failed.store(true, std::memory_order_release);
+            tp_row_proxy_fail(tp);
             break;
         }
         if (!tp_row_proxy_exchange(tp, first, rows)) {
-            tp->proxy_failed.store(true, std::memory_order_release);
+            tp_row_proxy_fail(tp);
             break;
         }
         last_exch = e;
         next_msg = first + rows;
-        done->store(e, std::memory_order_release);
+        tp_row_done_publish(tp, e);
         idle_since = tp_now_sec();
     }
     return NULL;
@@ -3019,9 +3040,9 @@ int pulsar_tp_bulk_begin(pulsar_tp *tp, uint64_t bytes, uint64_t *exch, uint32_t
     }
     if (tp->proxy_failed.load(std::memory_order_acquire) || *tp_row_err(tp)) {
         fprintf(stderr, "pulsar-tp: bulk lane refused: an earlier exchange failed "
-                        "(proxy %s, device spin %s)\n",
+                        "(proxy %s, lane %s)\n",
                 tp->proxy_failed.load() ? "failed" : "ok",
-                *tp_row_err(tp) == 2u ? "aborted" : *tp_row_err(tp) ? "timed out" : "ok");
+                *tp_row_err(tp) == 2u ? "aborted" : *tp_row_err(tp) ? "failed" : "ok");
         return 0;
     }
     static int said = 0;
@@ -3052,7 +3073,6 @@ void pulsar_tp_row_lane_layout(const pulsar_tp *tp, pulsar_tp_row_lane_layout_t 
     out->err_off = tp->layout.gpu_flags_off;
     out->vec_bytes = tp->vec_bytes;
     out->n_slots = tp->n_slots;
-    out->timeout_ns = tp->timeout_sec * 1000000000ull;
 }
 
 
@@ -3065,8 +3085,8 @@ int pulsar_tp_row_lane_begin(pulsar_tp *tp, uint32_t rows, uint64_t *first_msg, 
     }
     if (tp->proxy_failed.load(std::memory_order_acquire) || *tp_row_err(tp)) {
         fprintf(stderr, "pulsar-tp: row lane refused: an earlier exchange failed "
-                        "(proxy %s, device spin %s)\n",
-                tp->proxy_failed.load() ? "failed" : "ok", *tp_row_err(tp) == 2u ? "aborted" : *tp_row_err(tp) ? "timed out" : "ok");
+                        "(proxy %s, lane %s)\n",
+                tp->proxy_failed.load() ? "failed" : "ok", *tp_row_err(tp) == 2u ? "aborted" : *tp_row_err(tp) ? "failed" : "ok");
         return 0;
     }
     static int said = 0;
@@ -3102,9 +3122,9 @@ int pulsar_tp_row_lane_check(pulsar_tp *tp) {
     const uint32_t err = *tp_row_err(tp);
     if (tp->proxy_failed.load(std::memory_order_acquire) || err || done != tp->row_exch) {
         fprintf(stderr, "pulsar-tp: row lane check FAILED at a drained stream: exchange %llu "
-                        "enqueued, %llu completed, proxy %s, device spin %s -- refusing\n",
+                        "enqueued, %llu completed, proxy %s, lane %s -- refusing\n",
                 (unsigned long long)tp->row_exch, (unsigned long long)done,
-                tp->proxy_failed.load() ? "failed" : "ok", err == 2u ? "aborted" : err ? "timed out" : "ok");
+                tp->proxy_failed.load() ? "failed" : "ok", err == 2u ? "aborted" : err ? "failed" : "ok");
         tp->failed.store(true, std::memory_order_release);
         return 0;
     }
@@ -4218,7 +4238,7 @@ int pulsar_tp_wait_command_ack_digest(pulsar_tp *tp, uint64_t session_id,
 
 void pulsar_tp_own_step_failed(pulsar_tp *tp, const char *operation) {
     /* A peer that failed the step too answers at once; one still running it is
-     * spinning on an exchange this rank will never join -- no step stays silent
+     * waiting on an exchange this rank will never join -- no step stays silent
      * for seconds between exchanges -- so after a short wait the lane is
      * aborted, which frees the peer's GPU and brings its (failed) ack.
      * "Answered" means THIS step's ack, so a pipelined eval's deferred ack --
@@ -4320,8 +4340,8 @@ int pulsar_tp_recv_command(pulsar_tp *tp, pulsar_tp_command *command,
      * that exits or crashes closes the socket, which wakes this wait and fails
      * the header read below; a peer HOST that vanishes is caught by the
      * socket's keepalive (tp_socket_tune).  Mid-operation silence is still
-     * bounded where it can occur: the ack collects, the exchanges and the
-     * device spins keep the transport timeout. */
+     * bounded where it can occur: the ack collects and the exchanges (the
+     * proxy, which releases the lane's stream waits) keep the transport timeout. */
     struct pollfd pfd;
     pfd.fd = tp->control_fd;
     pfd.events = POLLIN;

@@ -3,70 +3,47 @@
  *
  * The slab is host-pinned and GPU-mapped (pulsar_tp_gpu.h); on GB10 it is
  * coherent with the CPU, which runs the transport's proxy thread.  Per
- * exchange the stream carries two kernels, and the engine thread never
- * waits:
+ * exchange the stream carries a kernel, a wait and a kernel, and the engine
+ * thread never waits:
  *
  *   stage    this rank's rows -> the slab's out-slots (message seq t lives in
  *            slot (t-1) % n_slots, the transport's ring rule); the LAST block
  *            to finish publishes the descriptor {exchange id, first message,
  *            rows}, the id written LAST, release/system scope -- the proxy's
  *            go signal
- *   combine  spin on the done word until the proxy reports the exchange
- *            complete (the peer's rows landed and our sends retired), then
- *            own + peer, one add per element, own first -- the all-reduce's
+ *   wait     a STREAM wait (cuStreamWaitValue64, done >= exch) -- the GPU's
+ *            front end holds the stream until the proxy reports the exchange
+ *            complete (the peer's rows landed and our sends retired).  No SM
+ *            is held while the peer works: the combine kernels spun on the
+ *            done word until L269-perf, which on a shared GPU (the loopback
+ *            pair: two processes, time-sliced) kept the waiting rank's context
+ *            resident while the rank it waited for could not run.
+ *   combine  own + peer, one add per element, own first -- the all-reduce's
  *            arithmetic, bit-identical to the host lane it replaced.
  *
- * A spin that outlives the transport's timeout writes the error word and
- * leaves the destination untouched; the engine refuses at its next host
- * sync (pulsar_tp_row_lane_check), so a lost peer fails closed, loudly,
- * instead of hanging the device or returning numbers from a half exchange.
+ * A failed lane -- the proxy's transport timeout or error, or an abort
+ * (pulsar_tp_row_lane_abort) -- latches the error word and then releases every
+ * wait (pulsar_tp.cpp tp_row_err_latch); each combine reads the word first and
+ * leaves its destination untouched when it is set.  The engine refuses at its
+ * next host sync (pulsar_gpu_end_commands / pulsar_tp_row_lane_check), so a
+ * lost peer fails closed, loudly, instead of hanging the device or returning
+ * numbers from a half exchange.
  */
 
 #include "pulsar_cuda_internal.h"
 
+#include <cuda.h>
 #include <stdint.h>
-
-static __device__ __forceinline__ uint64_t tp_ld_acquire_sys(const uint64_t *p) {
-    uint64_t v;
-    asm volatile("ld.acquire.sys.global.u64 %0, [%1];" : "=l"(v) : "l"(p) : "memory");
-    return v;
-}
 
 static __device__ __forceinline__ void tp_st_release_sys(uint64_t *p, uint64_t v) {
     asm volatile("st.release.sys.global.u64 [%0], %1;" :: "l"(p), "l"(v) : "memory");
 }
 
-static __device__ __forceinline__ uint64_t tp_globaltimer_ns(void) {
-    uint64_t t;
-    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
-    return t;
-}
-
-/* Block-wide wait for done >= exch.  Returns false when the error word is
- * set -- by an earlier kernel's timeout, or by the host on a row-lane abort
- * (pulsar_tp_row_lane_abort: the peer will not run this step) -- or when the
- * timeout expires first, which latches it. */
-static __device__ bool tp_wait_done(const uint64_t *done, uint64_t exch,
-                                    uint32_t *err, uint64_t timeout_ns) {
-    __shared__ int ok;
-    if (threadIdx.x == 0) {
-        const uint64_t t0 = tp_globaltimer_ns();
-        ok = 1;
-        while (tp_ld_acquire_sys(done) < exch) {
-            if (*(volatile uint32_t *)err != 0u) {
-                ok = 0;
-                break;
-            }
-            if (tp_globaltimer_ns() - t0 > timeout_ns) {
-                atomicExch(err, 1u);
-                ok = 0;
-                break;
-            }
-            __nanosleep(200);
-        }
-    }
-    __syncthreads();
-    return ok != 0;
+/* The combines run behind the stream wait; a set error word means the wait
+ * was RELEASED by a failed lane, not satisfied by the peer's rows, so the
+ * combine leaves its destination alone.  Block-uniform. */
+static __device__ __forceinline__ bool tp_lane_failed(const uint32_t *err) {
+    return *(const volatile uint32_t *)err != 0u;
 }
 
 /* Stage + publish in ONE launch.  Every block copies its rows into the slab's
@@ -116,10 +93,8 @@ static __global__ void tp_stage_publish_kernel(float *src, float *addend, uint8_
 static __global__ void tp_combine_sum_kernel(float *dst, const uint8_t *slab,
                                              uint64_t in_off, uint64_t vec_floats,
                                              uint64_t first_msg, uint32_t n_slots,
-                                             uint32_t rows, const uint64_t *done,
-                                             uint64_t exch, uint32_t *err,
-                                             uint64_t timeout_ns) {
-    if (!tp_wait_done(done, exch, err, timeout_ns)) return;
+                                             uint32_t rows, const uint32_t *err) {
+    if (tp_lane_failed(err)) return;
     const uint64_t n = (uint64_t)rows * vec_floats;
     for (uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x; i < n;
          i += (uint64_t)gridDim.x * blockDim.x) {
@@ -132,7 +107,7 @@ static __global__ void tp_combine_sum_kernel(float *dst, const uint8_t *slab,
 
 /* The vocab gather's two halves (4g-2).  A head slice travels as a packed
  * payload -- row r of this rank's `width` logits at r * width -- cut into
- * vec-sized messages.  Each chunk's combine waits on the done word like the
+ * vec-sized messages.  Each chunk's combine runs behind the stream wait like the
  * sum does, then scatters payload element e (chunk start elem0 + i) to row
  * e / width, column col0 + e % width of the pitched destination; the own
  * slice is scattered the same way with no wait.  Copies only: the assembled
@@ -143,9 +118,8 @@ static __global__ void tp_combine_scatter_kernel(float *dst, const uint8_t *slab
                                                  uint32_t msgs, uint64_t elem0,
                                                  uint64_t n_elem, uint64_t width,
                                                  uint64_t pitch, uint64_t col0,
-                                                 const uint64_t *done, uint64_t exch,
-                                                 uint32_t *err, uint64_t timeout_ns) {
-    if (!tp_wait_done(done, exch, err, timeout_ns)) return;
+                                                 const uint32_t *err) {
+    if (tp_lane_failed(err)) return;
     const uint64_t n = (uint64_t)msgs * vec_floats;
     for (uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x; i < n;
          i += (uint64_t)gridDim.x * blockDim.x) {
@@ -174,10 +148,8 @@ typedef struct {
 static __global__ void tp_combine_gather_blocks_kernel(tp_gather_blocks_t B, const float *own,
                                                        const uint8_t *slab, uint64_t in_off,
                                                        uint64_t vec_floats, uint64_t first_msg,
-                                                       uint32_t n_slots, const uint64_t *done,
-                                                       uint64_t exch, uint32_t *err,
-                                                       uint64_t timeout_ns) {
-    if (!tp_wait_done(done, exch, err, timeout_ns)) return;
+                                                       uint32_t n_slots, const uint32_t *err) {
+    if (tp_lane_failed(err)) return;
     const uint64_t n = B.elem0[B.n];
     for (uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x; i < n;
          i += (uint64_t)gridDim.x * blockDim.x) {
@@ -231,14 +203,13 @@ static __global__ void tp_bulk_stage_kernel(float *out, const float *src, float 
     }
 }
 
-/* The bulk lane's combine: dst[i] = own[i] + peer[i] once the proxy reports
- * the exchange done, own being this rank's staged partial in the out-region --
+/* The bulk lane's combine: dst[i] = own[i] + peer[i] behind the stream wait (the proxy reported
+ * the exchange done), own being this rank's staged partial in the out-region --
  * the all-reduce's own + peer, one add per element, bit-identical to the host
  * big gate it replaces (acc[i] += peer[i]). */
 static __global__ void tp_bulk_combine_sum_kernel(float *dst, const float *own, const float *peer,
-                                                  uint64_t n, const uint64_t *done, uint64_t exch,
-                                                  uint32_t *err, uint64_t timeout_ns) {
-    if (!tp_wait_done(done, exch, err, timeout_ns)) return;
+                                                  uint64_t n, const uint32_t *err) {
+    if (tp_lane_failed(err)) return;
     for (uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x; i < n;
          i += (uint64_t)gridDim.x * blockDim.x)
         dst[i] = own[i] + __ldcv(peer + i);
@@ -252,6 +223,53 @@ static unsigned tp_bulk_grid(uint64_t n) {
 static unsigned tp_grid(uint64_t n) {
     const uint64_t b = (n + 255u) / 256u;
     return (unsigned)(b > 256u ? 256u : (b ? b : 1u));
+}
+
+/* cuStreamWaitValue64, resolved once through the runtime (the engine links no
+ * libcuda).  pulsar_gpu_tp_wait_init runs at the row lane's bring-up and
+ * refuses a device without 64-bit stream memory operations; the lane has no
+ * other way to wait. */
+typedef CUresult (*tp_wait_value_fn)(CUstream, CUdeviceptr, cuuint64_t, unsigned int);
+typedef CUresult (*tp_dev_attr_fn)(int *, CUdevice_attribute, CUdevice);
+static tp_wait_value_fn g_tp_wait_value = NULL;
+
+int pulsar_gpu_tp_wait_init(char *err, size_t errlen) {
+    if (g_tp_wait_value) return 1;
+    void *wv = NULL, *ga = NULL;
+    cudaDriverEntryPointQueryResult q1 = cudaDriverEntryPointSymbolNotFound, q2 = q1;
+    int dev = 0, can64 = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess ||
+        cudaGetDriverEntryPointByVersion("cuStreamWaitValue64", &wv, 12000, cudaEnableDefault, &q1) != cudaSuccess ||
+        cudaGetDriverEntryPointByVersion("cuDeviceGetAttribute", &ga, 12000, cudaEnableDefault, &q2) != cudaSuccess ||
+        q1 != cudaDriverEntryPointSuccess || q2 != cudaDriverEntryPointSuccess || !wv || !ga) {
+        snprintf(err, errlen, "tp row lane: the driver exports no cuStreamWaitValue64 / cuDeviceGetAttribute");
+        return 0;
+    }
+    if (((tp_dev_attr_fn)ga)(&can64, CU_DEVICE_ATTRIBUTE_CAN_USE_64_BIT_STREAM_MEM_OPS, (CUdevice)dev) !=
+            CUDA_SUCCESS || !can64) {
+        snprintf(err, errlen, "tp row lane: device %d has no 64-bit stream memory operations "
+                              "(the lane's stream wait)", dev);
+        return 0;
+    }
+    g_tp_wait_value = (tp_wait_value_fn)wv;
+    return 1;
+}
+
+/* Hold this thread's stream until done >= exch (GEQ compares cyclically, as
+ * int64(done - exch) >= 0: the release bit a failed lane ORs in satisfies it). */
+static int tp_stream_wait_done(const void *done_dev, uint64_t exch) {
+    if (!g_tp_wait_value) {
+        fprintf(stderr, "pulsar: tp row lane stream wait used before pulsar_gpu_tp_wait_init -- refusing\n");
+        return 0;
+    }
+    const CUresult r = g_tp_wait_value(CU_STREAM_PER_THREAD, (CUdeviceptr)(uintptr_t)done_dev, exch,
+                                       CU_STREAM_WAIT_VALUE_GEQ);
+    if (r != CUDA_SUCCESS) {
+        fprintf(stderr, "pulsar: tp row lane stream wait (exchange %llu) failed: CUresult %d\n",
+                (unsigned long long)exch, (int)r);
+        return 0;
+    }
+    return 1;
 }
 
 int pulsar_gpu_tp_stage_publish(pulsar_gpu_tensor *src, pulsar_gpu_tensor *addend,
@@ -278,13 +296,14 @@ int pulsar_gpu_tp_stage_publish(pulsar_gpu_tensor *src, pulsar_gpu_tensor *adden
 int pulsar_gpu_tp_combine_sum(pulsar_gpu_tensor *dst, const void *slab_dev,
                               uint64_t in_off, uint64_t vec_bytes, uint64_t first_msg,
                               uint32_t n_slots, uint32_t rows, const void *done_dev,
-                              uint64_t exch, void *err_dev, uint64_t timeout_ns) {
+                              uint64_t exch, const void *err_dev) {
     const uint64_t vf = vec_bytes / sizeof(float);
     if (!dst || !slab_dev || !done_dev || !err_dev || rows == 0 || n_slots == 0 || vf == 0 ||
         (uint64_t)rows * vec_bytes > dst->bytes) return 0;
+    if (!tp_stream_wait_done(done_dev, exch)) return 0;
     tp_combine_sum_kernel<<<tp_grid((uint64_t)rows * vf), 256>>>(
         (float *)dst->ptr, (const uint8_t *)slab_dev, in_off, vf, first_msg, n_slots, rows,
-        (const uint64_t *)done_dev, exch, (uint32_t *)err_dev, timeout_ns);
+        (const uint32_t *)err_dev);
     return cuda_ok(cudaGetLastError(), "tp combine sum launch");
 }
 
@@ -292,17 +311,16 @@ int pulsar_gpu_tp_combine_scatter(pulsar_gpu_tensor *dst, const void *slab_dev,
                                   uint64_t in_off, uint64_t vec_bytes, uint64_t first_msg,
                                   uint32_t n_slots, uint32_t msgs, uint64_t elem0,
                                   uint32_t rows, uint64_t width, uint64_t pitch, uint64_t col0,
-                                  const void *done_dev, uint64_t exch, void *err_dev,
-                                  uint64_t timeout_ns) {
+                                  const void *done_dev, uint64_t exch, const void *err_dev) {
     const uint64_t vf = vec_bytes / sizeof(float);
     const uint64_t n_elem = (uint64_t)rows * width;
     if (!dst || !slab_dev || !done_dev || !err_dev || msgs == 0 || n_slots == 0 || vf == 0 ||
         width == 0 || col0 + width > pitch || elem0 >= n_elem ||
         (uint64_t)rows * pitch * sizeof(float) > dst->bytes) return 0;
+    if (!tp_stream_wait_done(done_dev, exch)) return 0;
     tp_combine_scatter_kernel<<<tp_grid((uint64_t)msgs * vf), 256>>>(
         (float *)dst->ptr, (const uint8_t *)slab_dev, in_off, vf, first_msg, n_slots, msgs,
-        elem0, n_elem, width, pitch, col0, (const uint64_t *)done_dev, exch,
-        (uint32_t *)err_dev, timeout_ns);
+        elem0, n_elem, width, pitch, col0, (const uint32_t *)err_dev);
     return cuda_ok(cudaGetLastError(), "tp combine scatter launch");
 }
 
@@ -340,16 +358,16 @@ int pulsar_gpu_tp_publish_bulk(void *desc_dev, uint64_t exch, uint64_t bytes, ui
 
 int pulsar_gpu_tp_bulk_combine_sum(pulsar_gpu_tensor *dst, uint64_t dst_off, const void *own_dev,
                                    const void *peer_dev, uint64_t bytes, const void *done_dev,
-                                   uint64_t exch, void *err_dev, uint64_t timeout_ns) {
+                                   uint64_t exch, const void *err_dev) {
     if (!dst || !own_dev || !peer_dev || !done_dev || !err_dev || bytes == 0 ||
         bytes % sizeof(float) != 0 || dst_off % sizeof(float) != 0 || dst_off > dst->bytes ||
         bytes > dst->bytes - dst_off) return 0;
     const uint64_t n = bytes / sizeof(float);
+    if (!tp_stream_wait_done(done_dev, exch)) return 0;
     tp_bulk_combine_sum_kernel<<<tp_bulk_grid(n), 256>>>((float *)((uint8_t *)dst->ptr + dst_off),
                                                          (const float *)own_dev,
                                                          (const float *)peer_dev, n,
-                                                         (const uint64_t *)done_dev, exch,
-                                                         (uint32_t *)err_dev, timeout_ns);
+                                                         (const uint32_t *)err_dev);
     return cuda_ok(cudaGetLastError(), "tp bulk combine sum launch");
 }
 
@@ -357,7 +375,7 @@ int pulsar_gpu_tp_combine_gather_blocks(const pulsar_tp_gather_block *blocks, ui
                                         uint32_t rows, const pulsar_gpu_tensor *own,
                                         const void *slab_dev, uint64_t in_off, uint64_t vec_bytes,
                                         uint64_t first_msg, uint32_t n_slots, const void *done_dev,
-                                        uint64_t exch, void *err_dev, uint64_t timeout_ns) {
+                                        uint64_t exch, const void *err_dev) {
     const uint64_t vf = vec_bytes / sizeof(float);
     if (!blocks || n_blocks == 0 || n_blocks > PULSAR_TP_GATHER_BLOCKS_MAX || rows == 0 || !own ||
         !slab_dev || !done_dev || !err_dev || vf == 0 || n_slots == 0) return 0;
@@ -380,10 +398,9 @@ int pulsar_gpu_tp_combine_gather_blocks(const pulsar_tp_gather_block *blocks, ui
     B.elem0[n_blocks] = e0;
     B.n = n_blocks;
     if (e0 * sizeof(float) > own->bytes) return 0;
+    if (!tp_stream_wait_done(done_dev, exch)) return 0;
     tp_combine_gather_blocks_kernel<<<tp_grid(e0), 256>>>(B, (const float *)own->ptr,
                                                           (const uint8_t *)slab_dev, in_off, vf,
-                                                          first_msg, n_slots,
-                                                          (const uint64_t *)done_dev, exch,
-                                                          (uint32_t *)err_dev, timeout_ns);
+                                                          first_msg, n_slots, (const uint32_t *)err_dev);
     return cuda_ok(cudaGetLastError(), "tp combine gather blocks launch");
 }

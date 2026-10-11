@@ -113,7 +113,7 @@ typedef struct {
  *   in  seq flags  S*8     [0] = row lane done word (proxy-written exchange id)
  *   token slot     16      {seq u64, token i32, pad} leader->worker
  *   out flag sats  S*8     [0..2] = row lane descriptor (GPU-written, id last)
- *   gpu flags      S*4     [0] = row lane device spin-timeout latch
+ *   gpu flags      S*4     [0] = row lane error latch (1 failed, 2 aborted)
  *   batch out      n_layer*MAX_ROWS*vec   (verify-block partial rows)
  *   batch in       n_layer*MAX_ROWS*vec
  */
@@ -298,8 +298,8 @@ int pulsar_tp_gate_exchange(pulsar_tp *tp, uint32_t layer, uint32_t gate,
  *    never touches the control socket);
  *  - the engine then enqueues the GPU half (pulsar_gpu_tp_stage_publish,
  *    pulsar_gpu_tp_combine_*): stage own rows into the out-slots and, from the
- *    last block to finish, publish the descriptor; combine once the done word
- *    reaches the exchange id;
+ *    last block to finish, publish the descriptor; a stream wait (no SM held) on
+ *    the done word reaching the exchange id, then the combine;
  *  - the proxy thread (verbs only, NO CUDA -- port rule 1) polls the
  *    descriptor, posts the sends, waits for the peer's rows AND its own send
  *    completions, re-posts the window, then writes the done word.
@@ -313,16 +313,18 @@ int pulsar_tp_gate_exchange(pulsar_tp *tp, uint32_t layer, uint32_t gate,
  * combines exchange e
  * before it stages e+1 -- so no slot is rewritten or re-posted while live.
  * Both ranks number exchanges identically by lockstep.  A proxy timeout
- * latches failed(); a device spin timeout sets the slab's error word; the
+ * or transport error latches the slab's error word (1) and then RELEASES the
+ * done word (ORs PULSAR_TP_DONE_RELEASE in), so every stream wait on it ends and
+ * every combine behind one sees the error and leaves its destination alone; the
  * engine refuses at its next host sync through pulsar_tp_row_lane_check. */
+#define PULSAR_TP_DONE_RELEASE (1ull << 62)
 typedef struct {
     uint64_t out_off, in_off;   /* gate-slot rings (message slots) */
     uint64_t desc_off;          /* u64[3] {exchange id (written last), first msg, rows} */
     uint64_t done_off;          /* u64: last exchange the proxy completed */
-    uint64_t err_off;           /* u32: device spin timeout latch */
+    uint64_t err_off;           /* u32: error latch (1 failed, 2 aborted) */
     uint64_t vec_bytes;
     uint32_t n_slots;
-    uint64_t timeout_ns;        /* device spin bound = the transport timeout */
 } pulsar_tp_row_lane_layout_t;
 
 bool pulsar_tp_row_lane(const pulsar_tp *tp);
@@ -553,13 +555,14 @@ int pulsar_tp_defer_command_ack_digest(pulsar_tp *tp, uint64_t session_id,
 /* Read and check the deferred acks now (1 = none pending, or they matched). */
 int pulsar_tp_settle_deferred_ack(pulsar_tp *tp, char *err, size_t errlen);
 /* This rank will not run (or could not finish) a step its peer is running:
- * mark the group failed, latch the row lane's error word (this rank's spinning
- * kernels exit), and send the peer the abort on the data socket so its proxy
- * latches the same -- a refusal fails the pair in milliseconds instead of
- * leaving the peer's GPU spinning until the transport timeout.  Idempotent. */
+ * mark the group failed, latch the row lane's error word and release its
+ * stream waits (this rank's stream drains), and send the peer the abort on the
+ * data socket so its proxy latches the same -- a refusal fails the pair in
+ * milliseconds instead of leaving the peer's stream waiting until the transport
+ * timeout.  Idempotent. */
 void pulsar_tp_row_lane_abort(pulsar_tp *tp, const char *why);
 /* The leader's own body of a mirrored step failed: give the peers 5 s to
- * answer (they failed it too), else abort the row lane (they are spinning on
+ * answer (they failed it too), else abort the row lane (their streams wait on
  * exchanges this rank will not join).  A pipelined eval's deferred ack is
  * settled first, so the 5 s wait is for THIS step's answer.  Call before
  * collecting their acks; pulsar_tp_drain_command_acks does. */

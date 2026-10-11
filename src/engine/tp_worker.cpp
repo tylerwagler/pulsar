@@ -143,7 +143,7 @@ static int worker_refused(pulsar_engine *e, const pulsar_tp_command *c, const ch
 
 /* A MODEL-RUNNING frame this rank refused or failed: the leader is running
  * the step (its exchanges wait on this rank's rows), so the row lane is
- * aborted -- the leader's spinning kernels exit and its step refuses at once,
+ * aborted -- the leader's stream waits are released and its step refuses at once,
  * instead of waiting out the transport timeout (L241 4g-2).  The pair is
  * failed from here on, which is what a rank leaving lockstep means. */
 static void worker_abort_step(pulsar_engine *e, const char *op, const char *why) {

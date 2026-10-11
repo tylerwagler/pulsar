@@ -2634,11 +2634,17 @@ int pulsar_gpu_tp_stage_publish(pulsar_gpu_tensor *src, pulsar_gpu_tensor *adden
                                 void *slab_dev, uint64_t out_off, uint64_t vec_bytes,
                                 uint64_t first_msg, uint32_t n_slots, uint32_t rows,
                                 void *desc_dev, uint64_t exch, pulsar_gpu_tensor *ticket);
-/* dst[r][*] = dst[r][*] + peer[r][*]; waits for done >= exch first. */
+/* The row lane's stream wait (L269-perf): resolves cuStreamWaitValue64 and
+ * checks the device has 64-bit stream memory operations.  Called once at the
+ * lane's bring-up; 0 with `err` filled = the lane cannot run here. */
+int pulsar_gpu_tp_wait_init(char *err, size_t errlen);
+/* dst[r][*] = dst[r][*] + peer[r][*]; the stream first waits (front end, no SM
+ * held) for done >= exch.  A set error word (`err_dev`: the lane failed and
+ * released the wait) leaves dst untouched -- every combine below does the same. */
 int pulsar_gpu_tp_combine_sum(pulsar_gpu_tensor *dst, const void *slab_dev,
                               uint64_t in_off, uint64_t vec_bytes, uint64_t first_msg,
                               uint32_t n_slots, uint32_t rows, const void *done_dev,
-                              uint64_t exch, void *err_dev, uint64_t timeout_ns);
+                              uint64_t exch, const void *err_dev);
 /* The vocab gather's peer half: waits for done >= exch, then scatters this
  * chunk (`msgs` messages holding payload elements elem0..) of the peer's
  * packed [rows][width] slice to dst[r * pitch + col0 + c]. */
@@ -2646,8 +2652,7 @@ int pulsar_gpu_tp_combine_scatter(pulsar_gpu_tensor *dst, const void *slab_dev,
                                   uint64_t in_off, uint64_t vec_bytes, uint64_t first_msg,
                                   uint32_t n_slots, uint32_t msgs, uint64_t elem0,
                                   uint32_t rows, uint64_t width, uint64_t pitch, uint64_t col0,
-                                  const void *done_dev, uint64_t exch, void *err_dev,
-                                  uint64_t timeout_ns);
+                                  const void *done_dev, uint64_t exch, const void *err_dev);
 /* The own half: packed [rows][width] src -> dst[r * pitch + col0 + c]. */
 int pulsar_gpu_tp_scatter_cols(pulsar_gpu_tensor *dst, const pulsar_gpu_tensor *src,
                                uint32_t rows, uint64_t width, uint64_t pitch, uint64_t col0);
@@ -2662,7 +2667,7 @@ void pulsar_gpu_tp_err_word_set(const volatile uint32_t *word);
  * After the exchange this scatters BOTH halves of every block into the full
  * destination rows: dst_k[r * pitch_k + own_col0_k + c] = own payload,
  * dst_k[r * pitch_k + peer_col0_k + c] = the peer's (the same layout, in the
- * row-lane in-slots).  Copies only.  Waits on the done word like the sums. */
+ * row-lane in-slots).  Copies only.  Behind the stream wait like the sums. */
 #define PULSAR_TP_GATHER_BLOCKS_MAX 8
 typedef struct {
     pulsar_gpu_tensor *dst;
@@ -2672,7 +2677,7 @@ int pulsar_gpu_tp_combine_gather_blocks(const pulsar_tp_gather_block *blocks, ui
                                         uint32_t rows, const pulsar_gpu_tensor *own,
                                         const void *slab_dev, uint64_t in_off, uint64_t vec_bytes,
                                         uint64_t first_msg, uint32_t n_slots, const void *done_dev,
-                                        uint64_t exch, void *err_dev, uint64_t timeout_ns);
+                                        uint64_t exch, const void *err_dev);
 /* The BULK lane (prefill-sized exchanges, v14; pulsar_tp.h): stage `bytes` of
  * `src` from `off` into the mapped bulk out-region with an SM kernel -- plus
  * the addend at the same offset when there is one, which is then zeroed --
@@ -2684,7 +2689,7 @@ int pulsar_gpu_tp_bulk_stage(const pulsar_gpu_tensor *src, pulsar_gpu_tensor *ad
 int pulsar_gpu_tp_publish_bulk(void *desc_dev, uint64_t exch, uint64_t bytes, uint64_t word2);
 int pulsar_gpu_tp_bulk_combine_sum(pulsar_gpu_tensor *dst, uint64_t dst_off, const void *own_dev,
                                    const void *peer_dev, uint64_t bytes, const void *done_dev,
-                                   uint64_t exch, void *err_dev, uint64_t timeout_ns);
+                                   uint64_t exch, const void *err_dev);
 
 /* ---- Qwen3.8-Flash-Next full attention + QSA (L251 stream S3) ----------------
  * One of the 12 full-attention layers (3, 7, ..., 47) between its Linears: the

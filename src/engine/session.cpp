@@ -787,6 +787,12 @@ int pulsar_engine::open(pulsar_engine **out, const pulsar_engine_options *opt) {
             return 1;
         }
         if (pulsar_tp_row_lane(e->tp)) {
+            if (!pulsar_gpu_tp_wait_init(tperr, sizeof(tperr))) {
+                fprintf(stderr, "pulsar: tensor parallelism row lane refused: %s\n", tperr);
+                e->destroy();
+                *out = NULL;
+                return 1;
+            }
             pulsar_tp_row_lane_layout_t L;
             pulsar_tp_row_lane_layout(e->tp, &L);
             pulsar_gpu_tp_err_word_set((const volatile uint32_t *)((uint8_t *)e->tp_slab_base + L.err_off));
