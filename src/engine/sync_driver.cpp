@@ -10,6 +10,8 @@
  *   - otherwise resume from the deepest grid checkpoint the prompt still shares (the one resume rule,
  *     pulsar_session_resume_point -- one token short of the prompt, so the stale-logits case re-evaluates
  *     its last row), else reset the bank and prefill from 0;
+ *   - L289: or, the same prompt the bank last prefilled, from its PROMPT END when the resume rule picks it
+ *     (kv_state.h): it stands there with its prefill's logits and evaluates nothing;
  *   - the prefill runs on the core loop: interruptible, with progress, cut by the one rule over the family's
  *     prefill shape (prefill_loop.cpp).
  * Qwen (L266, L272 P2) and DeepSeek (L284; its L148 self-heal is its state_agrees: a stale compressor or a
@@ -178,6 +180,25 @@ int pulsar_session_sync_default(pulsar_session *s, const pulsar_tokens *prompt, 
             G = 0;
         }
         s->checkpoint_valid = false;   /* the state moves below; the prefill loop re-establishes the view */
+        pulsar_ckpt_store *st = pulsar_session_kv_store(s);
+        if (G && G == (uint32_t)prompt->len) {
+            /* L289: the resume rule picks the whole prompt only at the bank's prompt end: the record's state is the
+             * prefill's own at G, copied whole (its tokens are the prompt's: the rule matched them), with the
+             * logits that prefill headed -- nothing is evaluated */
+            if (!pulsar_ckpt_end_restore(st, live, s->logits, (uint32_t)pulsar_engine_logits_width(e))) {
+                if (err) snprintf(err, errlen, "%s: restoring bank %u's prompt end at %u failed", ops->name, live, G);
+                return 1;
+            }
+            s->live_images.n = 0;   /* a prompt end is recorded for a text history only */
+            s->checkpoint.len = (int)G;
+            s->checkpoint_valid = true;
+            s->prefill_frontier = (int)G;
+            s->logits_stale = false;
+            s->resume_origin = (int)G;
+            fprintf(stderr, "pulsar: %s: bank %u resumes at its prompt end %u -- the same prompt, no row evaluated\n",
+                    ops->name, live, G);
+            return 0;
+        }
         if (G) {
             if (!pulsar_ckpt_restore(pulsar_session_kv_store(s), live, G)) {
                 if (err) snprintf(err, errlen, "%s: restoring bank %u's checkpoint at %u failed", ops->name, live, G);

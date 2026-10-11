@@ -181,5 +181,11 @@ int pulsar_prefill_loop(pulsar_session *s, const pulsar_tokens *prompt, uint32_t
      * at a boundary, a failure leaves it at the last chunk that landed) */
     s->logits_stale = rc != 0;
     if (rc == 1) s->checkpoint_valid = false;
+    /* L289: the prompt end is recorded -- the state, open rows and logits this prefill left at `end` -- so the
+     * same prompt resumes here without evaluating a row.  A text history only: a KV holding an image block is
+     * matched by its image identity, which the record does not keep (such a prompt resumes from the grid). */
+    if (rc == 0 && s->sync_n_images == 0 && s->live_images.n == 0)
+        (void)pulsar_ckpt_end_capture(ckpt, c.bank, end, prompt->v, s->logits,
+                                      (uint32_t)pulsar_engine_logits_width(s->engine));
     return rc;
 }

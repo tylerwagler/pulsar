@@ -756,7 +756,10 @@ void server::gen_begin(session_slot *sl) {
          * starts -- the match itself when the sync continues the bank where it stands, else the grid
          * checkpoint it resumes from (every family: decode rows past the prefill are recomputed) */
         const int resume = pulsar_session_bank_resume_at(s->sess, sl->bank, &j->req.prompt);
-        cached = (pm.prompt_cut > 0 && !trivial) ? resume : 0;
+        /* L289: a bank that serves the WHOLE prompt (its prompt end, or a history it continues) is never declined
+         * as shallow -- nothing serves that prompt better (a short repeated prompt sat under the trivial line and
+         * was counted cold, and with the disk on, persisted and searched for nothing) */
+        cached = (pm.prompt_cut > 0 && (!trivial || resume == j->req.prompt.len)) ? resume : 0;
         cache_source = cached <= 0 ? "none" : cached == pm.prompt_cut ? "memory-token" : "memory-checkpoint";
     }
     if (cached == 0 && old_pos > 0) {

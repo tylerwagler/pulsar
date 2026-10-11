@@ -537,7 +537,13 @@ session_slot *server::choose_slot_for_job(job *j, int *reject_ctx,
         session_slot *sl = &s->slots[i];
         if (sl->active_job || !sl->provisioned || sl->ctx_size < needed) continue;
         const int common = s->slot_common_prefix(sl, &j->req.prompt);
-        const int score = pulsar_session_bank_checkpoint_best(s->sess, sl->bank, common);
+        int score = pulsar_session_bank_checkpoint_best(s->sess, sl->bank, common);
+        /* L289: a bank holding the whole prompt scores where its sync starts (its prompt end, past every grid
+         * checkpoint below it) */
+        if (common >= j->req.prompt.len) {
+            const int at = pulsar_session_bank_resume_at(s->sess, sl->bank, &j->req.prompt);
+            if (at > score) score = at;
+        }
         if (route_debug)
             server_log(PULSAR_LOG_DEFAULT,
                        "pulsar-server: route-scan slot %d bank %u: frontier=%d common=%d score=%d",
@@ -1473,11 +1479,21 @@ static bool server_spec_lane_carries(bool spec_rounds, uint32_t verify_rows, ses
  *   - prices go stale with the content (acceptance) and the context (cost): once the lane in force has run
  *     LANE_PRICE_REPROBE_STEPS steps since its last weighing, the other lane is probed again.  Counted in
  *     steps, not quanta (a spec quantum at twelve decoders is one round): one 32-step probe per 512 steps is
- *     ~6% of the decode time, so at the measured 10-15% gap probing costs about 1% at most. */
+ *     ~6% of the decode time, so at the measured 10-15% gap probing costs about 1% at most;
+ *   - but a re-measure is evidence-based, not a clock (L289): while the lane in force's MEASURED price clears
+ *     the other lane's MEASURED price at this N by LANE_PRICE_CLEAR, a flip needs the other lane to move by more
+ *     than its price moves between weighings, so the scheduled re-measure waits LANE_PRICE_CLEAR_SPAN times as
+ *     long -- the bound on how old a measurement may grow before it is taken again.  The lane in force is
+ *     measured every step it runs, so the clearance is read fresh at each pick; a narrower gap, a predicted
+ *     price or a new N re-measures on the plain schedule.  (L288, Qwen one stream: spec 51-78 tok/s against
+ *     plain 33.8-36.1 measured, and the 512-step clock re-probed plain 13 times in 48 requests at ~0.67 s each,
+ *     ~9% of a probed request; the plain price it re-measured moved 7% end to end.) */
 #define LANE_PRICE_MARGIN        0.04
 #define LANE_PRICE_HOLD_STEPS    32u
 #define LANE_PRICE_PROBE_STEPS   32u
 #define LANE_PRICE_REPROBE_STEPS 512u
+#define LANE_PRICE_CLEAR         1.25   /* six margins: past the 7% the plain price drifted over L288's whole run */
+#define LANE_PRICE_CLEAR_SPAN    8u     /* 4096 steps: ~16k tokens of one Qwen stream before the price is re-taken */
 #define LANE_PRICE_ALPHA         0.0625f   /* the measured prices' and yield's EW weight: a probe's 32 steps
                                               carry ~7/8 of the price it ends on */
 
@@ -1544,6 +1560,7 @@ static int lane_price_pick(lane_price *lp, const pulsar_lane_cost *plain, const 
     if (lp->lane == 0) {   /* the spec lane until a price says otherwise */
         lp->lane = 3;
         lp->held_n0 = spec->n;
+        lp->deferral = 0;
     }
     const double mp = lane_price_measured(lp, PULSAR_LANE_PLAIN, n);
     const double msp = lane_price_measured(lp, PULSAR_LANE_SPEC, n);
@@ -1569,6 +1586,7 @@ static int lane_price_pick(lane_price *lp, const pulsar_lane_cost *plain, const 
             lp->why = "measured: the lane in force holds";
         }
         lp->held_n0 = lp->lane == 3 ? spec->n : plain->n;
+        lp->deferral = 0;
         return lp->lane;
     }
     if (!inc_measured) {
@@ -1578,6 +1596,7 @@ static int lane_price_pick(lane_price *lp, const pulsar_lane_cost *plain, const 
         if (!other_measured && t_inc > 0.0 && t_other > t_inc * (1.0 + LANE_PRICE_MARGIN)) {
             lp->lane = other;
             lp->held_n0 = other == 3 ? spec->n : plain->n;
+            lp->deferral = 0;
             lp->why = "priced faster: measuring";
             return other;
         }
@@ -1593,14 +1612,23 @@ static int lane_price_pick(lane_price *lp, const pulsar_lane_cost *plain, const 
     if (faster && other_measured) {   /* both measured at this N: the switch needs no probe */
         lp->lane = other;
         lp->held_n0 = other == 3 ? spec->n : plain->n;
+        lp->deferral = 0;
         lp->why = "measured faster";
         return other;
     }
-    if (t_other <= 0.0 || faster || ran >= LANE_PRICE_REPROBE_STEPS) {
+    /* L289: both measured and the lane in force clears the other by LANE_PRICE_CLEAR -- the re-measure waits */
+    const bool clears = other_measured && t_other > 0.0 && t_inc >= t_other * LANE_PRICE_CLEAR;
+    const uint32_t reprobe = clears ? LANE_PRICE_REPROBE_STEPS * LANE_PRICE_CLEAR_SPAN : LANE_PRICE_REPROBE_STEPS;
+    if (t_other <= 0.0 || faster || ran >= reprobe) {
         lp->probe = other;
         lp->probe_n0 = other == 3 ? spec->n : plain->n;
         lp->why = t_other <= 0.0 ? "no price here: measuring" : faster ? "priced faster: measuring" : "re-measuring";
         return other;
+    }
+    if (clears && ran >= LANE_PRICE_REPROBE_STEPS) {
+        if (lp->deferral == 0) lp->deferral = 1;   /* the caller announces it once a weighing */
+        lp->why = "clears the other lane: the re-measure waits";
+        return inc;
     }
     lp->why = "priced";
     return inc;
@@ -3418,6 +3446,20 @@ void *worker_main(void *arg) {
                 server_log(PULSAR_LOG_GENERATION,
                            "pulsar-server: decode lane %d -> %d (%d decoders, %d in the plain batch)",
                            s->w_decode_lane, lane, n_dec, n_batched);
+        }
+        /* L289: a deferred re-measure is a decision the lane line does not show (the lane holds): said once a
+         * weighing, with the prices that cleared it */
+        if (priced && s->w_lane_price.deferral == 1) {
+            const lane_price *lp = &s->w_lane_price;
+            const bool spec_in = lp->lane == 3;
+            server_log(PULSAR_LOG_GENERATION,
+                       "pulsar-server: decode lane %d holds (%d decoders; %s %.1f clears %s %.1f tok/s, both measured, "
+                       "x%.2f >= %.2f): the re-measure waits up to %u steps",
+                       lp->lane, n_dec, spec_in ? "spec" : "plain", spec_in ? lp->t_spec : lp->t_plain,
+                       spec_in ? "plain" : "spec", spec_in ? lp->t_plain : lp->t_spec,
+                       spec_in ? lp->t_spec / lp->t_plain : lp->t_plain / lp->t_spec, LANE_PRICE_CLEAR,
+                       LANE_PRICE_REPROBE_STEPS * LANE_PRICE_CLEAR_SPAN);
+            s->w_lane_price.deferral = 2;
         }
         s->w_decode_lane = lane;
         const bool use_spec_batched = s->w_decode_lane == 3;

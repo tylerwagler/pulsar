@@ -968,6 +968,9 @@ static bool qwen_state_reset_bank(pulsar_qwen_state *st, const pulsar_qwen_shape
     st->prefill_pos[bank] = 0;
     st->frontier_stale[bank] = false;
     st->mtp_pend_pos[bank] = UINT32_MAX;
+    /* L289: the MTP layer's index tail was zeroed above, so the stage holds no draft rows over it (a stale mark
+     * from the previous conversation's last round refused every later frontier: payloads, prompt ends) */
+    if (st->mtp) st->mtp_stage_dirty[bank] = false;
     if (st->ckpt && st->ckpt->ops) pulsar_ckpt_drop_bank(st->ckpt, bank);   /* its history is gone */
     return ok;
 }

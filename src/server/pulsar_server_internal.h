@@ -1487,6 +1487,9 @@ typedef struct {
     bool meas_plain;      ///< ...and whether each was measured at the decoders' count (else predicted)
     bool meas_spec;
     const char *why;      ///< the last pick's reason, announced with the lane
+    /** L289: the scheduled re-measure deferred since the last weighing (the lane in force clears the other by
+     *  LANE_PRICE_CLEAR): 0 not deferred, 1 deferred and not yet announced, 2 announced */
+    int deferral;
 } lane_price;
 
 /** The whole server: engine, session pool, scheduler queue, caches, metrics.

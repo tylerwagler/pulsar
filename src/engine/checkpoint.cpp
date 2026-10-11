@@ -12,6 +12,16 @@
 #include <stdio.h>
 #include <string.h>
 
+/* L289: the prompt-end record's bytes: the model's frontier walk, aligned as a slot is.  Nothing else: every pool's
+ * rows below T are never rewritten while the history reaches T, and a row T leaves open (a part-filled indexer
+ * block, the MTP layer's lagging row) is written whole by the token that closes it, from the lanes the walk holds,
+ * before any step reads it (qsa_block_keys_kernel). */
+static uint64_t ckpt_end_bytes(const pulsar_ckpt_store *st) {
+    uint64_t front = 0;
+    (void)st->ops->walk(st->state, -1, true, NULL, 0, st->ops->min_checkpoint(st->state), &front);
+    return (front + 255u) & ~(uint64_t)255u;
+}
+
 bool pulsar_ckpt_alloc(pulsar_ckpt_store *st, const pulsar_kv_state_ops *ops, void *state, uint32_t n_banks) {
     if (n_banks < 1u) n_banks = 1u;
     if (n_banks > PULSAR_MSEQ_MAX || ops->ckpt_slots < 1u || ops->ckpt_slots > PULSAR_CKPT_SLOTS_MAX ||
@@ -31,6 +41,18 @@ bool pulsar_ckpt_alloc(pulsar_ckpt_store *st, const pulsar_kv_state_ops *ops, vo
             return false;
         }
     }
+    /* L289: each bank's prompt-end record, allocated with the ladder so a session's dry run prices it */
+    memset(st->end_pos, 0, sizeof(st->end_pos));
+    const uint64_t end = ckpt_end_bytes(st);
+    for (uint32_t b = 0; b < n_banks; b++) {
+        st->end_slab[b] = pulsar_gpu_tensor_alloc(end);
+        if (!st->end_slab[b]) {
+            fprintf(stderr, "pulsar: prompt-end record for bank %u (%llu bytes, %s) allocation failed\n", b,
+                    (unsigned long long)end, ops->name);
+            return false;
+        }
+        st->end_cap[b] = end;
+    }
     return true;
 }
 
@@ -38,8 +60,17 @@ void pulsar_ckpt_release(pulsar_ckpt_store *st) {
     for (uint32_t b = 0; b < PULSAR_MSEQ_MAX; b++) {
         pulsar_gpu_tensor_free(st->slab[b]);
         st->slab[b] = NULL;
+        pulsar_gpu_tensor_free(st->end_slab[b]);
+        st->end_slab[b] = NULL;
+        st->end_cap[b] = 0;
+        free(st->end_logits[b]);
+        st->end_logits[b] = NULL;
+        free(st->end_tokens[b]);
+        st->end_tokens[b] = NULL;
+        st->end_tokens_cap[b] = 0;
     }
     memset(st->pos, 0, sizeof(st->pos));
+    memset(st->end_pos, 0, sizeof(st->end_pos));
 }
 
 /* The slot a capture at G writes: the one already holding G, else an empty one, else the victim
@@ -127,6 +158,77 @@ bool pulsar_ckpt_restore(pulsar_ckpt_store *st, uint32_t bank, uint32_t G) {
     st->ops->restored(st->state);
     for (uint32_t k = 0; k < st->ops->ckpt_slots; k++)
         if (st->pos[bank][k] > G) st->pos[bank][k] = 0u;
+    if (st->end_pos[bank] > G) st->end_pos[bank] = 0u;
+    return true;
+}
+
+bool pulsar_ckpt_end_capture(pulsar_ckpt_store *st, uint32_t bank, uint32_t T, const int *tokens, const float *logits,
+                             uint32_t width) {
+    if (bank >= PULSAR_MSEQ_MAX || !st->end_slab[bank] || T == 0u || !tokens || !logits || width == 0u) return false;
+    st->end_pos[bank] = 0u;   /* not a record until the copy is issued whole */
+    char why[192];
+    if (!st->ops->frontier_at(st->state, T, why, sizeof(why))) {
+        fprintf(stderr, "pulsar: prompt end at %u on bank %u not recorded: %s\n", T, bank, why);
+        return false;
+    }
+    const uint64_t need = ckpt_end_bytes(st);
+    if (st->end_cap[bank] < need) {   /* a drafter loaded after the store adds its rings to the frontier */
+        pulsar_gpu_tensor_free(st->end_slab[bank]);
+        st->end_slab[bank] = pulsar_gpu_tensor_alloc(need);
+        st->end_cap[bank] = st->end_slab[bank] ? need : 0u;
+        if (!st->end_slab[bank]) {
+            fprintf(stderr, "pulsar: prompt-end record for bank %u (%llu bytes) allocation failed\n", bank,
+                    (unsigned long long)need);
+            return false;
+        }
+    }
+    if (st->end_width != width) {   /* one logits width a store (the engine's) */
+        for (uint32_t b = 0; b < PULSAR_MSEQ_MAX; b++) {
+            free(st->end_logits[b]);
+            st->end_logits[b] = NULL;
+            st->end_pos[b] = 0u;
+        }
+        st->end_width = width;
+    }
+    if (!st->end_logits[bank]) st->end_logits[bank] = (float *)xmalloc((size_t)width * sizeof(float));
+    if (st->end_tokens_cap[bank] < T) {
+        free(st->end_tokens[bank]);
+        st->end_tokens[bank] = (int32_t *)xmalloc((size_t)T * sizeof(int32_t));
+        st->end_tokens_cap[bank] = T;
+    }
+    if (!st->ops->walk(st->state, 0, true, st->end_slab[bank], 0, T, NULL)) {
+        fprintf(stderr, "pulsar: prompt end at %u on bank %u: copy failed\n", T, bank);
+        return false;
+    }
+    memcpy(st->end_logits[bank], logits, (size_t)width * sizeof(float));
+    for (uint32_t i = 0; i < T; i++) st->end_tokens[bank][i] = (int32_t)tokens[i];
+    st->end_pos[bank] = T;
+    return true;
+}
+
+bool pulsar_ckpt_end_matches(const pulsar_ckpt_store *st, uint32_t bank, const int *tokens, uint32_t len) {
+    const uint32_t T = pulsar_ckpt_end(st, bank);
+    if (T == 0u || !tokens || len < T) return false;
+    for (uint32_t i = 0; i < T; i++)
+        if ((int32_t)tokens[i] != st->end_tokens[bank][i]) return false;
+    return true;
+}
+
+bool pulsar_ckpt_end_restore(pulsar_ckpt_store *st, uint32_t bank, float *logits, uint32_t width) {
+    const uint32_t T = pulsar_ckpt_end(st, bank);
+    if (T == 0u || (logits && width != st->end_width)) return false;
+    /* the counters at T, prefilled to T (Qwen: the MTP layer's pending row at T - 1, its stage clean); the walk
+     * brings every lane back */
+    if (!st->ops->install_frontier(st->state, T, T) ||
+        !st->ops->walk(st->state, 1, true, st->end_slab[bank], 0, T, NULL)) {
+        fprintf(stderr, "pulsar: prompt-end restore to %u on bank %u: copy failed\n", T, bank);
+        st->end_pos[bank] = 0u;
+        return false;
+    }
+    st->ops->restored(st->state);
+    for (uint32_t k = 0; k < st->ops->ckpt_slots; k++)
+        if (st->pos[bank][k] > T) st->pos[bank][k] = 0u;
+    if (logits) memcpy(logits, st->end_logits[bank], (size_t)width * sizeof(float));
     return true;
 }
 
@@ -144,10 +246,13 @@ void pulsar_ckpt_frontier_lowered(pulsar_ckpt_store *st, uint32_t bank, uint32_t
     if (bank >= PULSAR_MSEQ_MAX) return;
     for (uint32_t k = 0; k < PULSAR_CKPT_SLOTS_MAX; k++)
         if (st->pos[bank][k] > tokens) st->pos[bank][k] = 0u;
+    if (st->end_pos[bank] > tokens) st->end_pos[bank] = 0u;
 }
 
 void pulsar_ckpt_drop_bank(pulsar_ckpt_store *st, uint32_t bank) {
-    if (bank < PULSAR_MSEQ_MAX) memset(st->pos[bank], 0, sizeof(st->pos[bank]));
+    if (bank >= PULSAR_MSEQ_MAX) return;
+    memset(st->pos[bank], 0, sizeof(st->pos[bank]));
+    st->end_pos[bank] = 0u;
 }
 
 bool pulsar_ckpt_locate(pulsar_ckpt_store *st, uint32_t bank, uint32_t G, pulsar_gpu_tensor **slab, uint64_t *off) {
