@@ -3159,6 +3159,7 @@ typedef enum {
     PULSAR_TP_OP_GATHER = 1u << 5,
     PULSAR_TP_OP_MXFP4_HALF = 1u << 6,
     PULSAR_TP_OP_EXPERTS = 1u << 7,
+    PULSAR_TP_OP_EXL3_HALF = 1u << 8,   ///< L269 W1: the EXL3 twin of MXFP4_HALF (a routed stack, slot reader)
 } pulsar_tp_op;
 #define PULSAR_TP_SLICE_RANGES 3
 typedef struct {

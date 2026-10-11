@@ -52,7 +52,7 @@ server-live-gate	server	all	manual	a live pulsar-server per family over HTTP (to
 runner:chat-smoke-gate	server	all	battery	greedy chat answer on the public text API, every hosted model
 runner:cuda-tp-head-split-gate	tp	deepseek4	battery	one box
 tp-plan-gate	tp	all	manual	cold NFS scan; outside the runner overlap -- L278 contract 7
-cuda-regression	kernel:gdn,exl3,qsa,s4,moe-route,expert-table	all	battery
+cuda-regression	kernel:gdn,exl3,exl3-half,qsa,s4,moe-route,expert-table	all	battery
 cuda-attn-gates	kernel:attn-f16,hc,vision	deepseek4	battery
 vision-qwen-pixel-gate	kernel:vision-preprocess	qwen4_exp	battery	bit-exact vs HF's Qwen2VLImageProcessorPil (host)
 vision-qwen-tower-gate	kernel:vision-tower	qwen4_exp	battery	vs HF stage dumps, the reference's bf16 floor (L268)

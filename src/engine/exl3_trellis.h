@@ -280,6 +280,66 @@ EXL3_HD static inline bool exl3_expert_layout(uint64_t k, uint64_t n, int k2,
     return true;
 }
 
+/** One strided byte copy: `height` runs of `width` bytes, run i from src + i * src_pitch to dst + i * dst_pitch
+ *  (cudaMemcpy2D's shape; a single run when height == 1). */
+typedef struct {
+    uint64_t src, src_pitch, dst, dst_pitch, width, height;
+} exl3_copy2d;
+
+/** A tensor-parallel cut of one expert-projection (exl3_expert_cut): the source and destination layouts and the
+ *  three copies that move the bytes -- the trellis, suh, svh. */
+typedef struct {
+    uint64_t src_stride, src_trellis;   ///< exl3_expert_layout of the whole (k, n)
+    uint64_t dst_stride, dst_trellis;   ///< exl3_expert_layout of the destination shape
+    exl3_copy2d copy[3];                ///< trellis, suh, svh
+} exl3_cut;
+
+/**
+ * The bytes of a range [lo, hi) of one expert-projection (in = k, out = n, rate k2) along one axis -- OUT: output
+ * columns (a gate / up's intermediate), IN: input rows (a down's intermediate) -- landing at [at, at + hi - lo) of
+ * a destination of extent `ext` along that axis (the other axis whole).  The destination is exl3_expert_layout of
+ * its own shape, so a rank's half of every expert (at = 0, ext = hi - lo: L269 W1, the tensor-parallel expert
+ * half) and the rows reader's gathered slices (several ranges into one destination: tp_slice.cpp) are the same
+ * cut, and the arms read either unchanged.
+ *   OUT: per k-tile row the n-tiles [lo/16, hi/16) (one run per k-tile row), suh whole, svh[lo, hi);
+ *   IN:  the k-tile rows [lo/16, hi/16) (one run), suh[lo, hi), svh whole.
+ * Every bound is 128-aligned, so the Hadamard blocks on both sides stay whole and the cut is bytes copied: the
+ * destination's matmul is exactly the whole's columns / its rows' partial.  Returns false (refuses) on an invalid
+ * rate, a dim off the 128 block, or a range unaligned, empty or out of bounds.
+ */
+static inline bool exl3_expert_cut(uint64_t k, uint64_t n, int k2, bool in_axis, uint64_t lo, uint64_t hi,
+                                   uint64_t at, uint64_t ext, exl3_cut *c) {
+    uint64_t ss = 0, ds = 0;
+    const uint64_t full = in_axis ? k : n, w = hi - lo;
+    if (lo >= hi || hi > full || at + w > ext || lo % EXL3_HAD_BLOCK || hi % EXL3_HAD_BLOCK ||
+        at % EXL3_HAD_BLOCK || ext % EXL3_HAD_BLOCK)
+        return false;
+    const uint64_t dk = in_axis ? ext : k, dn = in_axis ? n : ext;
+    if (!exl3_expert_layout(k, n, k2, &c->src_trellis, &ss, &c->src_stride) ||
+        !exl3_expert_layout(dk, dn, k2, &c->dst_trellis, &ds, &c->dst_stride))
+        return false;
+    const uint64_t tile = (uint64_t)exl3_words_per_tile(k2) * 2u, st = c->src_trellis, dt = c->dst_trellis;
+    if (in_axis) {
+        c->copy[0] = {lo / 16u * (n / 16u) * tile, 0, at / 16u * (n / 16u) * tile, 0, w / 16u * (n / 16u) * tile, 1};
+        c->copy[1] = {st + lo * 2u, 0, dt + at * 2u, 0, w * 2u, 1};
+        c->copy[2] = {st + k * 2u, 0, dt + dk * 2u, 0, n * 2u, 1};
+    } else {
+        c->copy[0] = {lo / 16u * tile, n / 16u * tile, at / 16u * tile, dn / 16u * tile, w / 16u * tile, k / 16u};
+        c->copy[1] = {st, 0, dt, 0, k * 2u, 1};
+        c->copy[2] = {st + k * 2u + lo * 2u, 0, dt + k * 2u + at * 2u, 0, w * 2u, 1};
+    }
+    return true;
+}
+
+/** Run a cut on the host: one expert's bytes from `src` (the whole's layout) into `dst` (the destination's). */
+static inline void exl3_expert_cut_apply(const exl3_cut *c, const uint8_t *src, uint8_t *dst) {
+    for (int i = 0; i < 3; i++) {
+        const exl3_copy2d *p = &c->copy[i];
+        for (uint64_t r = 0; r < p->height; r++)
+            memcpy(dst + p->dst + r * p->dst_pitch, src + p->src + r * p->src_pitch, (size_t)p->width);
+    }
+}
+
 /**
  * Natural-order Sylvester Hadamard of one 128-vector in place, scaled by
  * 1/sqrt(128): the basis exllamav3 quantizes in (`hadamard_inner.cuh`, and the

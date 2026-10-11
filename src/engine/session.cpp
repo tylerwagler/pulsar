@@ -228,7 +228,8 @@ static void register_model_fds(const pulsar_model *m) {
  * gate/up by intermediate ROWS (OUT), down by intermediate (input) COLUMNS (IN), the same owned range for all
  * three, so the SwiGLU halves line up and the rank's down output is a partial the FFN exchange sums.  Both ranks
  * do identical work (every selected expert, half width), so there is no skew by construction.  How a half is
- * built is the format's (tp_slice.cpp: a CUTLASS MXFP4 stack's half; another format refuses there by name). */
+ * built is the format's (tp_slice.cpp: a CUTLASS MXFP4 or an EXL3 stack's half -- L269 W1; another format refuses
+ * there by name). */
 static bool tp_declare_expert_half(pulsar_tp_plan *p, pulsar_model *m, const pulsar_layer_weights *L, int rank,
                                    uint32_t nr) {
     if (!L->ffn_gate_exps || !L->ffn_up_exps || !L->ffn_down_exps) return true;   /* no routed experts */

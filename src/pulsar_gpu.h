@@ -731,6 +731,16 @@ int pulsar_gpu_register_mxfp4_expert_half(const void *key_map, uint64_t key_offs
                                           uint64_t lo, uint64_t hi,
                                           uint64_t src_stride, uint64_t src_data,
                                           uint64_t dst_stride, uint64_t dst_data);
+/* L269 W1: the EXL3 twin -- this rank's half of every expert of one routed
+ * EXL3 stack (in = k, out = n, rate k2): output columns [lo,hi) for gate/up,
+ * input rows [lo,hi) for down when k_half.  The cut is exl3_expert_cut's (the
+ * one byte model; the half of every expert is exl3_expert_layout of the half
+ * shape); registered as a model range under (key_map, key_offset) like the
+ * MXFP4 half.  Returns 1, or 0 with the reason printed. */
+int pulsar_gpu_register_exl3_expert_half(const void *key_map, uint64_t key_offset,
+                                         const void *model_map, uint64_t src_offset,
+                                         uint32_t n_expert, uint64_t k, uint64_t n, int k2, int k_half,
+                                         uint64_t lo, uint64_t hi);
 /* L241 4g-2: register the INPUT-COLUMN half [k_lo, k_hi) of a pre-stored
  * MXFP8_LT weight (a row-parallel TP split: the rank's share of the
  * reduction).  Repacked once into device buffers the backend owns (freed with
