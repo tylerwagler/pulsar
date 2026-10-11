@@ -819,14 +819,20 @@ static int tp_read_frame_header(int fd, uint32_t *type, uint32_t *bytes) {
 
 /* UC queue pairs do not report a dead remote reliably.  The control socket
  * does, so sample it while polling an RDMA completion and abort before the
- * GPU command-buffer watchdog fires. */
+ * GPU command-buffer watchdog fires.  The test is the socket's hang-up state,
+ * not a peek: a peer that wrote a frame and then exited (the leader's pipelined
+ * acks, its STOP) leaves UNREAD bytes ahead of the FIN, and a 1-byte peek then
+ * returns data, never 0 -- the survivor waited out the whole transport timeout
+ * against a dead peer (L269, 2026-10-11).  POLLRDHUP is raised by the FIN
+ * whatever is still queued. */
 static int tp_peer_closed(const pulsar_tp *tp) {
-    char byte;
-    const ssize_t n = recv(tp->control_fd, &byte, 1,
-                           MSG_PEEK | MSG_DONTWAIT);
-    if (n == 0) return 1;
-    if (n > 0) return 0;
-    return errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR;
+    struct pollfd pfd;
+    pfd.fd = tp->control_fd;
+    pfd.events = POLLRDHUP;
+    pfd.revents = 0;
+    const int rc = poll(&pfd, 1, 0);
+    if (rc < 0) return errno != EINTR;
+    return (pfd.revents & (POLLRDHUP | POLLHUP | POLLERR | POLLNVAL)) != 0;
 }
 
 static int tp_rdma_load_api(pulsar_tp_verbs_api *api) {
@@ -1493,6 +1499,8 @@ static int tp_rdma_post_gate_send(pulsar_tp *tp, uint64_t seq, uint32_t slot) {
     return 1;
 }
 
+static int tp_rdma_armed_handshake(pulsar_tp *tp, int data_fd);
+
 /* One decode gate: ensure the receive window is armed, send our partial,
  * wait for the peer's receive completion, and advance the window. */
 static int tp_rdma_gate_exchange(pulsar_tp *tp, uint32_t layer, uint32_t gate,
@@ -1513,15 +1521,9 @@ static int tp_rdma_gate_exchange(pulsar_tp *tp, uint32_t layer, uint32_t gate,
          * its first N messages under UC (no error, no completion), shifting
          * every later pairing by one.  That happens on the pair because the
          * leader runs ahead of the worker while it is still in create/the
-         * control handshake.  The control socket is full-duplex, so: after
-         * arming, both sides exchange RDMA_GATE_ARMED and only then send. */
-        if (ok) ok = tp_send_frame(tp->control_fd,
-                                   PULSAR_TP_FRAME_RDMA_GATE_ARMED, NULL, 0);
-        if (ok) {
-            uint32_t rtype = 0, rbytes = 0;
-            ok = tp_read_frame_header(tp->control_fd, &rtype, &rbytes) &&
-                 rtype == PULSAR_TP_FRAME_RDMA_GATE_ARMED && rbytes == 0;
-        }
+         * control handshake.  So: after arming, both sides exchange
+         * RDMA_GATE_ARMED (tp_rdma_armed_handshake) and only then send. */
+        if (ok) ok = tp_rdma_armed_handshake(tp, tp->data_fd);
         if (ok) r->recv_window_active = true;
     }
     if (ok) ok = tp_rdma_post_gate_send(tp, seq, slot);
@@ -1597,19 +1599,89 @@ void pulsar_tp_row_lane_abort(pulsar_tp *tp, const char *why) {
         if (tp->peers[i].data_fd >= 0) (void)tp_write_full(tp->peers[i].data_fd, &m, sizeof(m));
 }
 
-/* 1 = the peer sent the abort (printed once, `why` filled). */
-static int tp_peer_aborted(pulsar_tp *tp) {
+/* 1 = the peer's abort is queued on this data socket (peeked, never consumed:
+ * the pair is failed from here on); printed, named.  `flags` MSG_DONTWAIT
+ * samples, MSG_WAITALL waits for a message that has started to arrive. */
+static int tp_abort_queued(int data_fd, int flags) {
     tp_row_abort_msg m;
-    const ssize_t n = recv(tp->data_fd, &m, sizeof(m), MSG_PEEK | MSG_DONTWAIT);
-    if (n < (ssize_t)sizeof(m) || memcmp(m.magic, TP_ROW_ABORT_MAGIC, sizeof(m.magic)) != 0) return 0;
+    ssize_t n;
+    do n = recv(data_fd, &m, sizeof(m), MSG_PEEK | flags);
+    while (n < 0 && errno == EINTR);
+    if (n != (ssize_t)sizeof(m) || memcmp(m.magic, TP_ROW_ABORT_MAGIC, sizeof(m.magic)) != 0) return 0;
     m.why[sizeof(m.why) - 1] = '\0';
     fprintf(stderr, "pulsar-tp: rank %d aborted the pair's row lane: %s\n", (int)m.rank, m.why);
     return 1;
 }
 
+/* Read the peer's gate header off a data socket -- or, when the peer aborted
+ * the step instead (pulsar_tp_row_lane_abort writes its message where this
+ * header would be), name the abort and refuse rather than report a desync. */
+static int tp_read_gate_header(int data_fd, pulsar_tp_gate_header *ph) {
+    ssize_t n;
+    do n = recv(data_fd, ph, sizeof(*ph), MSG_PEEK | MSG_WAITALL);
+    while (n < 0 && errno == EINTR);
+    if (n == (ssize_t)sizeof(*ph) && memcmp(ph, TP_ROW_ABORT_MAGIC, sizeof(TP_ROW_ABORT_MAGIC)) == 0 &&
+        tp_abort_queued(data_fd, MSG_WAITALL))
+        return 0;
+    if (n != (ssize_t)sizeof(*ph) || !tp_read_full(data_fd, ph, sizeof(*ph))) {
+        fprintf(stderr, "pulsar-tp: the peer's data socket closed before its gate header (%s) -- the peer "
+                        "exited or tore the pair down\n", n < 0 ? strerror(errno) : "end of stream");
+        return 0;
+    }
+    return 1;
+}
+
+/* 1 = the peer will not answer this exchange: it sent the abort, or it is gone
+ * (its control socket hung up -- a rank that died without aborting, killed or
+ * crashed, must not leave the survivor spinning until the transport timeout).
+ * The reason is printed, named. */
+static int tp_peer_lost(pulsar_tp *tp) {
+    if (tp_abort_queued(tp->data_fd, MSG_DONTWAIT)) return 1;
+    if (tp_peer_closed(tp)) {
+        fprintf(stderr, "pulsar-tp: rank %d: the peer's control socket hung up mid-exchange (the peer "
+                        "exited) -- failing the row lane\n", tp->rank);
+        return 1;
+    }
+    return 0;
+}
+
+/* THE RDMA ARMING HANDSHAKE (v27), every site that posts a receive window
+ * before sending: the decode gate's first window, the row lane's arm, each
+ * big-gate round.  Both ranks send RDMA_GATE_ARMED and read the peer's; once
+ * both crossed, both windows are posted.  It rides the link's DATA socket,
+ * which carries nothing but this lockstep data plane (gate headers, the TCP
+ * payloads, a peer's row-lane abort).  Through v26 it rode the CONTROL socket,
+ * whose comment called it "quiescent" there -- false since the pipelined
+ * identity check (L241 4g-2): a worker's deferred eval ack sits in the
+ * leader's control socket while the next step runs, so the leader read THAT
+ * as the peer's ARMED, refused the gate without a word, and the worker waited
+ * for the leader's rows until the transport timeout (L269: V4.1 TP=2 plain
+ * generation, second decode step, whenever the row lane was off).  A peer's
+ * abort queued ahead of the ARMED is named, not read as a frame. */
+static int tp_rdma_armed_handshake(pulsar_tp *tp, int data_fd) {
+    if (!tp_send_frame(data_fd, PULSAR_TP_FRAME_RDMA_GATE_ARMED, NULL, 0)) {
+        fprintf(stderr, "pulsar-tp: rank %d: the rdma armed handshake could not be sent\n", tp->rank);
+        return 0;
+    }
+    pulsar_tp_frame_header h;
+    ssize_t n;
+    do n = recv(data_fd, &h, sizeof(h), MSG_PEEK | MSG_WAITALL);
+    while (n < 0 && errno == EINTR);
+    if (n == (ssize_t)sizeof(h) && h.magic != PULSAR_TP_MAGIC && tp_abort_queued(data_fd, MSG_WAITALL))
+        return 0;
+    uint32_t type = 0, bytes = 0;
+    if (!tp_read_frame_header(data_fd, &type, &bytes) ||
+        type != PULSAR_TP_FRAME_RDMA_GATE_ARMED || bytes != 0) {
+        fprintf(stderr, "pulsar-tp: rank %d: the rdma armed handshake failed (got frame %u, %u bytes; "
+                        "the data socket is out of lockstep or the peer is gone)\n", tp->rank, type, bytes);
+        return 0;
+    }
+    return 1;
+}
+
 /* Arm the row lane's receive window at message `first`: post WINDOW
- * receives, then the ARMED handshake on the control socket (a rank that sends
- * before the peer's window is armed silently loses messages under UC).
+ * receives, then the ARMED handshake (tp_rdma_armed_handshake: a rank that
+ * sends before the peer's window is armed silently loses messages under UC).
  * Engine thread only. */
 static int tp_row_lane_arm(pulsar_tp *tp, uint64_t first) {
     pulsar_tp_rdma_link *r = tp_pair_link(tp);
@@ -1617,12 +1689,7 @@ static int tp_row_lane_arm(pulsar_tp *tp, uint64_t first) {
     int ok = 1;
     for (uint64_t s = first; ok && s < first + PULSAR_TP_RDMA_RECV_WINDOW; s++)
         ok = tp_rdma_post_gate_recv(tp, s, tp_row_slot(tp, s));
-    if (ok) ok = tp_send_frame(tp->control_fd, PULSAR_TP_FRAME_RDMA_GATE_ARMED, NULL, 0);
-    if (ok) {
-        uint32_t rtype = 0, rbytes = 0;
-        ok = tp_read_frame_header(tp->control_fd, &rtype, &rbytes) &&
-             rtype == PULSAR_TP_FRAME_RDMA_GATE_ARMED && rbytes == 0;
-    }
+    if (ok) ok = tp_rdma_armed_handshake(tp, tp->data_fd);
     if (ok) r->recv_window_active = true;
     pthread_mutex_unlock(&r->post_lock);
     return ok;
@@ -1649,7 +1716,7 @@ static int tp_row_proxy_exchange(pulsar_tp *tp, uint64_t first, uint32_t rows) {
         ok = tp_rdma_drain_cq(tp);
         if (ok && tp_now_sec() > next_abort_check) {
             next_abort_check = tp_now_sec() + 1e-3;
-            if (tp_peer_aborted(tp)) {
+            if (tp_peer_lost(tp)) {
                 tp_row_err_latch(tp, 2u);
                 pulsar_tp_mark_failed(tp);
                 ok = 0;
@@ -1777,7 +1844,7 @@ static int tp_bulk_proxy_exchange(pulsar_tp *tp, uint64_t e, uint64_t bytes, uin
         const double now = tp_now_sec();
         if (now > next_abort_check) {
             next_abort_check = now + 1e-3;
-            if (tp_peer_aborted(tp)) {
+            if (tp_peer_lost(tp)) {
                 tp_row_err_latch(tp, 2u);
                 pulsar_tp_mark_failed(tp);
                 return 0;
@@ -1994,10 +2061,14 @@ static int tp_rdma_drain_decode_window(pulsar_tp *tp) {
  * are queued, so each round can post its 1 MiB receive window before sending
  * the matching 16 KiB messages.  Verify scratch provides already-registered
  * staging memory and is idle during normal prefill. */
-static int tp_rdma_big_gate_exchange(pulsar_tp *tp, pulsar_tp_rdma_link *link,
+static int tp_rdma_big_gate_exchange(pulsar_tp *tp, pulsar_tp_rdma_link *link, int data_fd,
                                      const void *out, void *in, uint64_t bytes) {
     pulsar_tp_rdma_link *r = link;
-    if (!tp_rdma_big_gate_capable(tp, r) || r->recv_window_active) return 0;
+    if (!tp_rdma_big_gate_capable(tp, r) || r->recv_window_active) {
+        fprintf(stderr, "pulsar-tp: rank %d: rdma big gate refused (%s)\n", tp->rank,
+                r->recv_window_active ? "a decode receive window is still armed" : "the link cannot stage it");
+        return 0;
+    }
 
     /* Payloads already inside the registered slab (the engine's <=
      * PULSAR_TP_BATCH_MAX_ROWS gate rows) ride DIRECT; ordinary prefill tensors
@@ -2056,18 +2127,10 @@ static int tp_rdma_big_gate_exchange(pulsar_tp *tp, pulsar_tp_rdma_link *link,
          * peer has posted this round's recv window, UC drops the tail of the
          * batch and the round wait hangs forever (bisected with a settle: a
          * 2 ms pause before sending makes the whole transport test pass).
-         * Deterministic fix: exchange an armed ack over the control socket
-         * (quiescent here after the batch header handshake) before sending —
+         * Deterministic fix: exchange an armed ack on the link's data socket
+         * (in lockstep here after the gate header handshake) before sending --
          * both sides have the round's recvs posted once both acks crossed. */
-        if (!tp_send_frame(tp->control_fd, PULSAR_TP_FRAME_RDMA_GATE_ARMED,
-                           NULL, 0))
-            return 0;
-        {
-            uint32_t rtype = 0, rbytes = 0;
-            if (!tp_read_frame_header(tp->control_fd, &rtype, &rbytes) ||
-                rtype != PULSAR_TP_FRAME_RDMA_GATE_ARMED || rbytes != 0)
-                return 0;
-        }
+        if (!tp_rdma_armed_handshake(tp, data_fd)) return 0;
         std::atomic_thread_fence(std::memory_order_release);
         struct tp_ibv_sge send_sge[PULSAR_TP_RDMA_BULK_SLOTS];
         struct tp_ibv_send_wr send_wr[PULSAR_TP_RDMA_BULK_SLOTS];
@@ -3114,7 +3177,7 @@ static int tp_gate_exchange_fd(int fd, uint32_t layer, uint32_t gate, uint64_t s
             return 0;
     }
     pulsar_tp_gate_header ph;
-    if (!tp_read_full(fd, &ph, sizeof(ph))) return 0;
+    if (!tp_read_gate_header(fd, &ph)) return 0;
     if (ph.magic != PULSAR_TP_MAGIC || ph.layer != layer || ph.gate != gate || ph.seq != seq) {
         fprintf(stderr,
                 "pulsar-tp: gate desync: got l=%u g=%u seq=%llu, want l=%u g=%u seq=%llu\n",
@@ -3189,7 +3252,7 @@ static int tp_batch_gate_exchange_fd(int fd, uint32_t layer, uint32_t rows,
      * ways).  Rounds of PULSAR_TP_TCP_ROUND are safe under any sane clamp. */
     if (!tp_write_full(fd, &h, sizeof(h))) return 0;
     pulsar_tp_gate_header ph;
-    if (!tp_read_full(fd, &ph, sizeof(ph))) return 0;
+    if (!tp_read_gate_header(fd, &ph)) return 0;
     if (ph.magic != PULSAR_TP_BATCH_MAGIC || ph.layer != layer ||
         ph.gate != rows || ph.seq != seq) {
         fprintf(stderr,
@@ -3225,7 +3288,7 @@ int pulsar_tp_batch_gate_exchange(pulsar_tp *tp, uint32_t layer, uint32_t rows,
         if (tp->rdma_active && tp_rdma_big_gate_capable(tp, tp_pair_link(tp))) {
             if (!tp_write_full(tp->data_fd, &h, sizeof(h))) return 0;
             pulsar_tp_gate_header ph;
-            if (!tp_read_full(tp->data_fd, &ph, sizeof(ph))) return 0;
+            if (!tp_read_gate_header(tp->data_fd, &ph)) return 0;
             if (ph.magic != PULSAR_TP_BATCH_MAGIC || ph.layer != layer ||
                 ph.gate != rows || ph.seq != seq) {
                 fprintf(stderr,
@@ -3236,7 +3299,7 @@ int pulsar_tp_batch_gate_exchange(pulsar_tp *tp, uint32_t layer, uint32_t rows,
                 return 0;
             }
             if (!tp_rdma_drain_decode_window(tp)) return 0;
-            return tp_rdma_big_gate_exchange(tp, tp_pair_link(tp),
+            return tp_rdma_big_gate_exchange(tp, tp_pair_link(tp), tp->data_fd,
                                              tp->slab + batch_out,
                                              tp->slab + batch_in, bytes);
         }
@@ -3313,7 +3376,7 @@ int pulsar_tp_big_gate_exchange(pulsar_tp *tp, uint32_t layer, uint64_t seq,
     pulsar_tp_gate_header h = { PULSAR_TP_BATCH_MAGIC, (uint16_t)layer, 0xB16u, seq };
     if (!tp_write_full(tp->data_fd, &h, sizeof(h))) return 0;
     pulsar_tp_gate_header ph;
-    if (!tp_read_full(tp->data_fd, &ph, sizeof(ph))) return 0;
+    if (!tp_read_gate_header(tp->data_fd, &ph)) return 0;
     if (ph.magic != PULSAR_TP_BATCH_MAGIC || ph.layer != layer ||
         ph.gate != 0xB16u || ph.seq != seq) {
         fprintf(stderr,
@@ -3324,7 +3387,7 @@ int pulsar_tp_big_gate_exchange(pulsar_tp *tp, uint32_t layer, uint64_t seq,
     }
     if (tp->rdma_active && tp_rdma_big_gate_capable(tp, tp_pair_link(tp))) {
         if (!tp_rdma_drain_decode_window(tp)) return 0;
-        return tp_rdma_big_gate_exchange(tp, tp_pair_link(tp), out, in, bytes);
+        return tp_rdma_big_gate_exchange(tp, tp_pair_link(tp), tp->data_fd, out, in, bytes);
     }
     uint64_t off = 0;
     while (off < bytes) {
@@ -3346,7 +3409,7 @@ static int tp_big_gate_exchange_fd(int fd, uint32_t layer,
     pulsar_tp_gate_header h = { PULSAR_TP_BATCH_MAGIC, (uint16_t)layer, 0xB16u, seq };
     if (!tp_write_full(fd, &h, sizeof(h))) return 0;
     pulsar_tp_gate_header ph;
-    if (!tp_read_full(fd, &ph, sizeof(ph))) return 0;
+    if (!tp_read_gate_header(fd, &ph)) return 0;
     if (ph.magic != PULSAR_TP_BATCH_MAGIC || ph.layer != layer ||
         ph.gate != 0xB16u || ph.seq != seq) {
         fprintf(stderr,
@@ -3386,7 +3449,7 @@ static int tp_big_gate_exchange_peer(pulsar_tp *tp, pulsar_tp_peer *pp,
     pulsar_tp_gate_header h = { PULSAR_TP_BATCH_MAGIC, (uint16_t)layer, 0xB16u, seq };
     if (!tp_write_full(pp->data_fd, &h, sizeof(h))) return 0;
     pulsar_tp_gate_header ph;
-    if (!tp_read_full(pp->data_fd, &ph, sizeof(ph))) return 0;
+    if (!tp_read_gate_header(pp->data_fd, &ph)) return 0;
     if (ph.magic != PULSAR_TP_BATCH_MAGIC || ph.layer != layer ||
         ph.gate != 0xB16u || ph.seq != seq) {
         fprintf(stderr, "pulsar-tp: peer big gate desync with rank %d: got l=%u tag=%x "
@@ -3402,7 +3465,7 @@ static int tp_big_gate_exchange_peer(pulsar_tp *tp, pulsar_tp_peer *pp,
                         "drain is not implemented -- refusing\n", pp->rank);
         return 0;
     }
-    return tp_rdma_big_gate_exchange(tp, &pp->rdma, out, in, bytes);
+    return tp_rdma_big_gate_exchange(tp, &pp->rdma, pp->data_fd, out, in, bytes);
 }
 
 int pulsar_tp_allreduce_sum(pulsar_tp *tp, uint32_t layer, uint64_t seq,
@@ -4157,7 +4220,16 @@ void pulsar_tp_own_step_failed(pulsar_tp *tp, const char *operation) {
     /* A peer that failed the step too answers at once; one still running it is
      * spinning on an exchange this rank will never join -- no step stays silent
      * for seconds between exchanges -- so after a short wait the lane is
-     * aborted, which frees the peer's GPU and brings its (failed) ack. */
+     * aborted, which frees the peer's GPU and brings its (failed) ack.
+     * "Answered" means THIS step's ack, so a pipelined eval's deferred ack --
+     * already in the socket, ahead of it -- is settled first: left there it
+     * made the socket readable at once, the abort was never sent, and the peer
+     * spun on this step's exchange until the transport timeout (L269). */
+    char why[256];
+    why[0] = '\0';
+    if (tp && tp->rank == 0 && !tp_settle_deferred(tp, why, sizeof(why)))
+        fprintf(stderr, "pulsar-tp: settling the previous step's ack after this rank's %s failed: %s\n",
+                operation ? operation : "step", why);
     for (int i = 0; tp && i < tp->n_peers; i++) {
         const int pfd = tp->peers[i].control_fd;
         if (pfd >= 0 && !tp_wait_readable(pfd, tp_now_sec() + 5.0)) {
