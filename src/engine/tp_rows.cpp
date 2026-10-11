@@ -37,7 +37,7 @@ bool pulsar_tp_allreduce_rows(const pulsar_tp_rows *g, uint32_t il, uint32_t n_t
                                                  exch, g->ticket) != 0;
         if (ok) ok = pulsar_gpu_tp_combine_sum(t, slab, L.in_off, L.vec_bytes,
                                                first, L.n_slots, n_tokens, slab + L.done_off,
-                                               exch, slab + L.err_off, L.timeout_ns) != 0;
+                                               exch, slab + L.err_off) != 0;
         if (!ok) fprintf(stderr, "pulsar: tp row lane: layer %u %s exchange refused (%u rows)\n", il, what, n_tokens);
         return ok;
     }
@@ -74,7 +74,7 @@ bool pulsar_tp_allreduce_rows(const pulsar_tp_rows *g, uint32_t il, uint32_t n_t
                                             PULSAR_TP_DESC_BULK_FLAG | (uint64_t)buf) != 0 &&
                  pulsar_gpu_tp_bulk_combine_sum(t, off, bulk + BL.out_off, bulk + BL.in_off[buf], len,
                                                 slab + L.done_off,
-                                                exch, slab + L.err_off, L.timeout_ns) != 0;
+                                                exch, slab + L.err_off) != 0;
         }
         if (!ok) fprintf(stderr, "pulsar: tp bulk lane: layer %u %s exchange refused (%u rows)\n",
                          il, what, n_tokens);
@@ -194,8 +194,7 @@ bool pulsar_tp_vocab_gather(const pulsar_tp_vocab *g, uint32_t n_rows, const pul
                                              slab + L.desc_off, exch, g->ticket) != 0 &&
                  pulsar_gpu_tp_combine_scatter(out, slab, L.in_off, L.vec_bytes, first, L.n_slots, m,
                                                (uint64_t)m0 * vf, n_rows, phi - plo, n_vocab, plo,
-                                               slab + L.done_off, exch, slab + L.err_off,
-                                               L.timeout_ns) != 0;
+                                               slab + L.done_off, exch, slab + L.err_off) != 0;
             pulsar_gpu_tensor_free(chunk);
         }
         if (!ok) fprintf(stderr, "pulsar: tp vocab gather: row lane refused (%u rows, %u messages)\n",

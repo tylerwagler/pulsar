@@ -1260,7 +1260,7 @@ static bool tp_attn_input_split(pulsar_gpu_graph *g, const pulsar_model *model,
                                              msgs, slab + L.desc_off, exch, g->tp_stage_ticket) != 0;
     if (ok) ok = pulsar_gpu_tp_combine_gather_blocks(blocks, n, n_tokens, g->tp_ain_own, slab, L.in_off,
                                                      L.vec_bytes, first, L.n_slots, slab + L.done_off, exch,
-                                                     slab + L.err_off, L.timeout_ns) != 0;
+                                                     slab + L.err_off) != 0;
     pulsar_gpu_tensor_free(payload);
     if (!ok) fprintf(stderr, "pulsar: layer %u: attention-input row split refused (%u rows, %u blocks)\n",
                      il, n_tokens, n);

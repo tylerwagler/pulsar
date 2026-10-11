@@ -1847,8 +1847,8 @@ int pulsar_gpu_seg_exit(uint64_t key, int body_ok) {
 
 
 
-/* The TP row lane's error word (pulsar_gpu_tp_err_word_set): 1 = a device spin
- * timed out, 2 = the lane was aborted (pulsar_tp_row_lane_abort).  Latched:
+/* The TP row lane's error word (pulsar_gpu_tp_err_word_set): 1 = the proxy
+ * failed an exchange (transport timeout or error), 2 = the lane was aborted (pulsar_tp_row_lane_abort).  Latched:
  * once set the lane is dead, so every later drain refuses too. */
 static const volatile uint32_t *g_tp_err_word = NULL;
 
@@ -1859,7 +1859,7 @@ static int tp_err_word_ok(void) {
     fprintf(stderr, "pulsar: a tensor-parallel row-lane exchange %s -- refusing the step "
                     "(its logits are not the pair's; 4g-2)\n",
             *g_tp_err_word == 2u ? "was aborted (a rank would not run this step; see the pulsar-tp line)"
-                                 : "timed out on the device");
+                                 : "failed in the transport (see the pulsar-tp line)");
     return 0;
 }
 
