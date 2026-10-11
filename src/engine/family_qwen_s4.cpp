@@ -927,6 +927,25 @@ bool pulsar_qwen_s4_mtp_combine(const pulsar_qwen_step *st, const void *h) {
            fail("the MTP combine failed");
 }
 
+uint64_t pulsar_qwen_s4_draft_top_ws_bytes(void) { return pulsar_qwen_draft_top_ws_bytes(); }
+
+bool pulsar_qwen_s4_draft_top(const pulsar_qwen_step *st) {
+    if (!st->draft_head || !st->st->mtp_top || !st->w->n_draft) return fail("the draft pick outside a drafting MTP step");
+    return pulsar_qwen_draft_top_launch((const float *)dptr(st->st->logits), (int)st->w->n_draft, dptr(st->st->mtp_top),
+                                        0) == 0 ||
+           fail("the draft pick launch failed");
+}
+
+bool pulsar_qwen_s4_draft_top_read(const pulsar_qwen_state *q, const pulsar_qwen_weights *w, int32_t *id, float *conf) {
+    pulsar_qwen_draft_top rec{};
+    if (!q->mtp_top || !pulsar_gpu_tensor_read(q->mtp_top, 0, &rec, sizeof rec)) return fail("could not read the draft pick");
+    if (rec.nan) return fail("the draft head's logits hold a NaN");
+    if (rec.index < 0 || (uint32_t)rec.index >= w->n_draft) return fail("the draft pick is outside the draft head");
+    *id = w->draft_ids[rec.index];
+    if (conf) *conf = rec.conf;
+    return true;
+}
+
 /* L251 MTP: roll one bank's run of the last verify step back to its first `keep` rows (family_qwen.h).  `v`
  * names the bank (bank[0]) and carries that run's tokens; the run is found in the capture's record (L272 P1
  * S4: a verify step carries one run per bank).  Every copy is on the stream after the step, so it lands
