@@ -6,15 +6,13 @@
  *
  * What this covers that the fixed-n_embd=4096 tests cannot:
  *
- *  F4 (chunked-gate boundary).  At n_embd 4096 a gate partial is exactly one
- *     16 KiB message, so the RDMA path's "2 chunked messages, final-chunk-
- *     carries-seq" branch never fires and nothing > 16 KiB ever flows.  Here
- *     the pair also runs at n_embd 8192 (vec_bytes == 2*MSG: the exact chunked
- *     branch boundary) and n_embd 16384 (vec_bytes > 2*MSG: the size RDMA
- *     registration REJECTS -- the host slab plumbing must still round-trip
- *     both widths cleanly, because the scheduler, slab offsets and gate
- *     exchanges are exactly what a wider-embd model will run on).  These
- *     widths exist only to exercise the plumbing; the DS model is 4096.
+ *  F4 (wide gate vectors).  At n_embd 4096 a gate partial is 16 KiB.  Here
+ *     the pair also runs at n_embd 8192 and 16384 (32 and 64 KiB vectors) --
+ *     the host slab plumbing must round-trip both widths cleanly, because the
+ *     scheduler, slab offsets and gate exchanges are exactly what a wider-embd
+ *     model runs on (V4.1 is 5120).  Over RDMA every width is one SEND per
+ *     vector (v26), bounded by the port's max_msg_sz (1 GiB on the mlx5
+ *     ports); the 16 KiB chunk these widths once straddled is retired.
  *
  *  F8 (slot-reuse soak, host half).  N full decode tokens (env
  *     PULSAR_TP_SOAK_TOKENS, default 8) x 86 gate exchanges each, reusing the
@@ -56,9 +54,8 @@ static int g_failures = 0;
 #define BASE_CTX 1048576u
 #define SOAK_DEFAULT 8
 
-/* n_embd 4096 = the DS model (one 16 KiB gate message); 8192 = vec 2*MSG, the
- * RDMA chunked-branch boundary; 16384 = vec > 2*MSG (RDMA would reject the
- * registration -- the host path must still be correct). */
+/* n_embd 4096 = V4 (16 KiB gate vectors); 8192 and 16384 = wider models'
+ * 32 and 64 KiB vectors (one RDMA SEND each since v26). */
 static const uint32_t WIDTHS[] = { 4096u, 8192u, 16384u };
 #define N_WIDTHS ((int)(sizeof(WIDTHS) / sizeof(WIDTHS[0])))
 

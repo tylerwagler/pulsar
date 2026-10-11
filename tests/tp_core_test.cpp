@@ -92,6 +92,23 @@ static void test_slab_layout(void) {
     CHECK(pulsar_tp_slab_out_offset(&s, 0, PULSAR_TP_GATE_ATTN, vec) <
           pulsar_tp_slab_out_offset(&s, 0, PULSAR_TP_GATE_FFN, vec),
           "ATTN slot must precede FFN slot");
+
+    /* The gate ring (v26): one slot per gate, never fewer than the row lane's
+     * window 16 + 8 rows -- a 7-layer fixture's ring is 24 slots, not 14, so
+     * the row lane arms on it; 12+ layers are unchanged. */
+    CHECK(pulsar_tp_gate_ring_slots(43u) == 86u, "ring(43)=%u want 86", pulsar_tp_gate_ring_slots(43u));
+    CHECK(pulsar_tp_gate_ring_slots(12u) == 24u, "ring(12)=%u want 24", pulsar_tp_gate_ring_slots(12u));
+    CHECK(pulsar_tp_gate_ring_slots(7u) == 24u, "ring(7)=%u want 24", pulsar_tp_gate_ring_slots(7u));
+    CHECK(pulsar_tp_gate_ring_slots(1u) == 24u, "ring(1)=%u want 24", pulsar_tp_gate_ring_slots(1u));
+    pulsar_tp_slab s7;
+    pulsar_tp_slab_layout_init(7u, 5120u, &s7);
+    const uint64_t vec7 = (uint64_t)5120 * sizeof(float);
+    CHECK(s7.in_off == 24u * vec7, "7-layer in_off=%llu want %llu (24-slot ring)",
+          (unsigned long long)s7.in_off, (unsigned long long)(24u * vec7));
+    CHECK(s7.batch_in_off + 7u * 8u * vec7 == s7.slab_bytes &&
+          pulsar_tp_slab_bytes(7u, 5120u) == s7.slab_bytes,
+          "7-layer slab bytes disagree (layout %llu, slab_bytes %llu)",
+          (unsigned long long)s7.slab_bytes, (unsigned long long)pulsar_tp_slab_bytes(7u, 5120u));
 }
 
 static void test_hello_wire(void) {

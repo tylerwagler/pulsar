@@ -24,7 +24,7 @@
 #include "pulsar.h"   /* pulsar_image_ref (SYNC_MM) */
 
 #define PULSAR_TP_MAGIC UINT32_C(0x44533454)     /* "DS4T", same wire magic as upstream */
-#define PULSAR_TP_PROTOCOL_VERSION 25u           /* v25: REWRITE_FROM_COMMON retired -- the tool-checkpoint canonicalization is a mirrored sync -- and the spec frames no longer carry an eos id (the round stops at the engine's whole stop set) (L284); v24: SPEC_ROUND_END_BATCH's header carries the leader's measured spec cost (flat_us, row_us, valid in i1..i3) so every rank prices the yield quench from the same integers (L263); v23: SEGMENT_SAVE/LOAD/DROP/RECONCILE -- the disk KV cache's segment chains mirrored per rank (L264 S4e); v22: BANK_FORK retired -- the server never forks a bank since L264's checkpoint routing; v21: BANK_KV_SAVE/LOAD and KVSTORE_SAVE/LOAD/DROP/RECONCILE retired -- the bank KV snapshot and the mirrored disk KV cache are gone with the segment store (L264); v20: BANK_FORK_PARTIAL retired -- the partial fork is gone with the grid checkpoints (L264); v19: FUSED_BATCH + NOTE_PREFILLED -- the fused step (verify rows and queued prompts' chunks in one forward) and the record of a chunk it prefilled (L260); v18: the rdma info carries the bulk lane's second rail (PULSAR_TP_RDMA_DEV2: rkey, QP, address) -- every bulk exchange splits over both HCA functions of the port (L260); v17: SPEC_*_BATCH -- the batched spec lane's per-bank bookkeeping as one frame per phase, per-bank records after the header (L260); v16: SYNC_CHECK -- before a mirrored sync the leader states its cached position + prefix digest and waits for the workers to agree (L250); v15: CHUNK_VERDICT -- a mirrored prefill yields at a chunk boundary on both ranks; v14: the bulk lane -- rdma info carries a bulk buffer + second QP; v13: a NODE frame after bring-up carries each rank's host, build and RDMA device; v12: SESSION_CREATE carries the bank-pool size; v11: the command ack carries a logits digest (L243); v10: batch header carries max_head_runs; v9: row payload + RNG_STATE; v8: rank + n_ranks in the hello */
+#define PULSAR_TP_PROTOCOL_VERSION 26u           /* v26: the gate QP carries ONE SEND per vector at any width (the 16 KiB chunk retired -- the port's max_msg_sz bounds a row, bring-up refuses past it) and the gate ring holds at least WINDOW + MAX_ROWS slots, so the row lane arms for every pair model -- n_embd 5120 (V4.1) and layer-subset fixtures included (L269); v25: REWRITE_FROM_COMMON retired -- the tool-checkpoint canonicalization is a mirrored sync -- and the spec frames no longer carry an eos id (the round stops at the engine's whole stop set) (L284); v24: SPEC_ROUND_END_BATCH's header carries the leader's measured spec cost (flat_us, row_us, valid in i1..i3) so every rank prices the yield quench from the same integers (L263); v23: SEGMENT_SAVE/LOAD/DROP/RECONCILE -- the disk KV cache's segment chains mirrored per rank (L264 S4e); v22: BANK_FORK retired -- the server never forks a bank since L264's checkpoint routing; v21: BANK_KV_SAVE/LOAD and KVSTORE_SAVE/LOAD/DROP/RECONCILE retired -- the bank KV snapshot and the mirrored disk KV cache are gone with the segment store (L264); v20: BANK_FORK_PARTIAL retired -- the partial fork is gone with the grid checkpoints (L264); v19: FUSED_BATCH + NOTE_PREFILLED -- the fused step (verify rows and queued prompts' chunks in one forward) and the record of a chunk it prefilled (L260); v18: the rdma info carries the bulk lane's second rail (PULSAR_TP_RDMA_DEV2: rkey, QP, address) -- every bulk exchange splits over both HCA functions of the port (L260); v17: SPEC_*_BATCH -- the batched spec lane's per-bank bookkeeping as one frame per phase, per-bank records after the header (L260); v16: SYNC_CHECK -- before a mirrored sync the leader states its cached position + prefix digest and waits for the workers to agree (L250); v15: CHUNK_VERDICT -- a mirrored prefill yields at a chunk boundary on both ranks; v14: the bulk lane -- rdma info carries a bulk buffer + second QP; v13: a NODE frame after bring-up carries each rank's host, build and RDMA device; v12: SESSION_CREATE carries the bank-pool size; v11: the command ack carries a logits digest (L243); v10: batch header carries max_head_runs; v9: row payload + RNG_STATE; v8: rank + n_ranks in the hello */
 
 enum { PULSAR_TP_GATE_ATTN = 0, PULSAR_TP_GATE_FFN = 1, PULSAR_TP_GATES_PER_LAYER = 2 };
 /** Layer tag for exchanges that are NOT per-layer (slice 4d's vocab gather).
@@ -103,7 +103,8 @@ typedef struct {
     uint32_t n_ranks;    /* group size */
 } pulsar_tp_hello_fixed;
 
-/* Registered-slab layout.  S = n_layer * GATES_PER_LAYER slots, all offsets
+/* Registered-slab layout.  S = pulsar_tp_gate_ring_slots(n_layer) slots (one
+ * per gate, at least the row lane's window + MAX_ROWS), all offsets
  * are from the base VA; vec_bytes = n_embd * 4 (f32 partials, never
  * quantized on the wire).  Region order matches upstream ds4_tp_slab_layout:
  *
@@ -128,6 +129,7 @@ typedef struct {
     uint64_t slab_bytes;
 } pulsar_tp_slab;
 
+uint32_t pulsar_tp_gate_ring_slots(uint32_t n_layer);
 void pulsar_tp_slab_layout_init(uint32_t n_layer, uint32_t n_embd, pulsar_tp_slab *out);
 uint64_t pulsar_tp_slab_bytes(uint32_t n_layer, uint32_t n_embd);
 uint64_t pulsar_tp_slab_out_offset(const pulsar_tp_slab *s, uint32_t layer, uint32_t gate, uint64_t vec_bytes);
@@ -302,8 +304,13 @@ int pulsar_tp_gate_exchange(pulsar_tp *tp, uint32_t layer, uint32_t gate,
  *    descriptor, posts the sends, waits for the peer's rows AND its own send
  *    completions, re-posts the window, then writes the done word.
  *
- * Ring invariants (checked by pulsar_tp_row_lane): WINDOW + MAX_ROWS <=
- * n_slots, and at most one exchange in flight -- the GPU combines exchange e
+ * A row is one RDMA SEND of vec_bytes (v26); bring-up refuses a model whose
+ * row exceeds the port's max_msg_sz, so the lane is ON for every RDMA pair and
+ * the bring-up line says so ("row lane ON/OFF").
+ *
+ * Ring invariants (sized by pulsar_tp_gate_ring_slots, asserted at attach):
+ * WINDOW + MAX_ROWS <= n_slots, and at most one exchange in flight -- the GPU
+ * combines exchange e
  * before it stages e+1 -- so no slot is rewritten or re-posted while live.
  * Both ranks number exchanges identically by lockstep.  A proxy timeout
  * latches failed(); a device spin timeout sets the slab's error word; the
@@ -774,7 +781,8 @@ int pulsar_tp_recv_verify_commit(pulsar_tp *tp, int32_t *full_accept,
                                  int32_t *replay_n);
 
 /* Decode gate schedule -> slab slot.  per_token 0 falls back to the identity
- * mapping slot = (seq-1) % n_slots; otherwise slot = gate_slot_start +
+ * mapping slot = (seq-1) % n_slots, n_slots = the model's gate count (n_layer * 2 --
+ * the per-gate lane's schedule, not the row lane's ring); otherwise slot = gate_slot_start +
  * ((seq-1) % gates_per_token) * gate_slot_step.  Both ranks compute this
  * from the exchanged identity so their recv placement matches exactly. */
 uint32_t pulsar_tp_gate_slot(uint32_t n_slots, uint64_t seq,
