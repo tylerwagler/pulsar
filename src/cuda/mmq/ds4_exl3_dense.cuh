@@ -10,8 +10,9 @@
 // there is no E4M3 activation slot in this family).
 //
 // Where the two rotations go:
-//   * INPUT (suh, then H128): the arm's first kernel applies them in f32 to the
-//     block input's bf16 rows, once per (row, 128-block), into its workspace.
+//   * INPUT (suh, then H128): the arm's kernel applies them in f32 to the
+//     block input's bf16 rows, per (row, 128-block) of each CTA's k-range,
+//     straight into the CTA's tensor-core operand tiles.
 //     That is a multiplication by part of W, not an activation re-encode: the
 //     bf16 row IS the one activation encoding, read as bf16 (rule 3).  It is not
 //     hoisted into the producer because suh is per Linear and one activation
@@ -26,16 +27,14 @@
 //   * OUTPUT (H128, then svh): a dense Linear has no fold/sum epilogue, and the
 //     output Hadamard mixes 128 outputs a GEMV CTA does not own together (a CTA
 //     owns 32), so the arm's split-K GEMV writes unrotated f32 partials into the
-//     workspace and its third kernel sums the splits in split order, rotates
-//     each 128-block and scales by svh.
+//     workspace and the last CTA of each 128-output block to finish sums the
+//     splits in split order, rotates the block and scales by svh.
 //
 // Every row is bit-identical at every M: the split count depends on (K, N)
 // only, every row block is 16 rows (the MMA's M; rows past M are zero), a
-// row's k order, warp order and split order do not depend on its batchmates,
-// and rows beyond 128 are further slabs of the same three launches -- decode
-// and prefill are one arithmetic, as in the routed-expert arm.  Prefill rows
-// are correct and slow: every 16-row block re-reads and re-decodes the weight
-// (an E4M3-tile + FP8 MMA prefill arm is the one to build, L251 slice 2d).
+// row's k order, warp order and split order do not depend on its batchmates.
+// M > 16 rows and prompt chunks take the tensor-core prefill GEMM
+// (qwen_exl3_dense_prefill.cu), which agrees to rounding.
 
 #pragma once
 
@@ -48,10 +47,9 @@
  *  instantiates: K = 2, 3, 4, 5. */
 bool ds4_exl3_dense_rate_supported(int k2);
 
-/** Workspace bytes ds4_exl3_dense_launch needs for (M, K, N): for one slab of
- *  min(M, 128) rows, the split partials (f32 [splits][rows][N]), the rotated
- *  rows' hi and lo planes (fp16 [rows][K] each) and their inverse prescales
- *  (f32 [rows][K/128]).  0 for a shape the arm refuses. */
+/** Workspace bytes ds4_exl3_dense_launch needs for (M, K, N): the split
+ *  partials and the prep planes of min(M, 16) rows (more than 16 rows are the
+ *  prefill GEMM's, which needs none).  0 for a shape the arm refuses. */
 size_t ds4_exl3_dense_workspace_bytes(int M, int K, int N);
 
 /** The number of K splits the arm uses for (K, N) -- a function of the weight's
@@ -63,8 +61,8 @@ int ds4_exl3_dense_splits(int K, int N);
  *  (16-byte aligned), `xb` the bf16 block input of the M rows (8-byte aligned,
  *  the uint2 row loads).  K % 128 == 0,
  *  N % 128 == 0, M >= 1, k2 a supported rate, `workspace` (16-byte aligned) at
- *  least ds4_exl3_dense_workspace_bytes(M, K, N).  Three kernels per 128-row
- *  slab on `stream`; refuses (returns -1) on any contract violation, -3 on a
+ *  least ds4_exl3_dense_workspace_bytes(M, K, N).  Two kernels on `stream`
+ *  (the prep, the GEMV with its epilogue); refuses (returns -1) on any contract violation, -3 on a
  *  launch failure. */
 int ds4_exl3_dense_launch(
     const void   * w,
@@ -79,4 +77,22 @@ int ds4_exl3_dense_launch(
     cudaStream_t   stream,
     /* L266: a prompt chunk takes the prefill GEMM at every M (qwen_exl3_dense_prefill.cu), so a
      * prompt cut anywhere is byte-identical to one prefilled whole; false: M > 16 does */
+    bool           prompt = false);
+
+/** Two projections of the same (K, N, k2) over the same rows -- a shared expert's gate and up -- in ONE launch
+ *  (prompt chunks and M > 16: the prefill GEMM, once per projection).  Each output is bit for bit what
+ *  ds4_exl3_dense_launch writes for it alone.  `workspace` holds 2 x ds4_exl3_dense_workspace_bytes(M, K, N). */
+int ds4_exl3_dense_pair_launch(
+    const void   * w0,
+    const void   * w1,
+    int            k2,
+    const void   * xb,
+    float        * y0,
+    float        * y1,
+    int            M,
+    int            K,
+    int            N,
+    void         * workspace,
+    size_t         workspace_bytes,
+    cudaStream_t   stream,
     bool           prompt = false);
