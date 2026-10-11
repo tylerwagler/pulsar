@@ -1041,9 +1041,26 @@ int pulsar_gpu_rope_tail_mx_tensor(pulsar_gpu_tensor *x, uint32_t n_tok, uint32_
      * kernel is templated now, so the width selects an instantiation instead of
      * rejecting the call, and the bound below is computed from that same width
      * rather than from a hardcoded sizeof(float) -- which is what made the
-     * bound too weak to stand alone in the first place. */
+     * bound too weak to stand alone in the first place.
+     *
+     * The FORMAT picks the instantiation, never the width alone: f16 and bf16
+     * are both two bytes, and keying on the width ran V4.1's f16 Q
+     * (PULSAR_Q_ELT_FMT -- the standalone prefill rope behind a "Qcur" dump, and
+     * the DSpark drafter's Q rope) through the bf16 kernel, which read and
+     * wrote f16 bit patterns as bf16: the rotated tail came back scaled and
+     * skewed (|q| +9-20% at every position past 0), and the "Qcur" dump moved
+     * the fixture's logits by KL 1.2 (L269).  Every stored format has its own
+     * arm; anything else refuses. */
     const size_t esz = pulsar_tensor_esz(x);
-    if (esz != sizeof(float) && esz != sizeof(__nv_bfloat16)) return 0;
+    const pulsar_elt_fmt fmt = pulsar_tensor_fmt(x);
+    const bool f32 = fmt == PULSAR_ELT_F32 && esz == sizeof(float);
+    const bool bf16 = fmt == PULSAR_ELT_BF16 && esz == sizeof(__nv_bfloat16);
+    const bool f16 = fmt == PULSAR_ELT_F16 && esz == sizeof(__half);
+    if (!f32 && !bf16 && !f16) {
+        fprintf(stderr, "pulsar: rope_tail: stored element format %u (%zu bytes) has no rope arm -- refusing\n",
+                (unsigned)fmt, esz);
+        return 0;
+    }
     if (x->bytes < (uint64_t)n_tok * n_head * head_dim * esz) return 0;
     if (positions && positions->bytes < (uint64_t)n_tok * sizeof(int32_t)) return 0;
     /* The MX epilogue owns exactly the blocks covering [head_dim - n_rot,
@@ -1058,8 +1075,12 @@ int pulsar_gpu_rope_tail_mx_tensor(pulsar_gpu_tensor *x, uint32_t n_tok, uint32_
         return 0;
     }
     uint32_t pairs = n_tok * n_head * (n_rot / 2);
-    if (esz == sizeof(float))
+    if (f32)
         rope_tail_kernel<float><<<(pairs + 255) / 256, 256>>>((float *)x->ptr, n_tok, n_head, head_dim, n_rot, pos0, 1, n_ctx_orig, inverse ? 1 : 0, freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow, positions ? (const int32_t *)positions->ptr : NULL,
+                (__nv_fp8_e4m3 *)gact_data, (unsigned char *)gact_scale, gact_kbp, gact_slab, n_groups,
+                gact_tok0, gact_ntok);
+    else if (f16)
+        rope_tail_kernel<__half><<<(pairs + 255) / 256, 256>>>((__half *)x->ptr, n_tok, n_head, head_dim, n_rot, pos0, 1, n_ctx_orig, inverse ? 1 : 0, freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow, positions ? (const int32_t *)positions->ptr : NULL,
                 (__nv_fp8_e4m3 *)gact_data, (unsigned char *)gact_scale, gact_kbp, gact_slab, n_groups,
                 gact_tok0, gact_ntok);
     else

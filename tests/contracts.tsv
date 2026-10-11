@@ -54,6 +54,7 @@ runner:cuda-tp-head-split-gate	tp	deepseek4	battery	one box
 tp-plan-gate	tp	all	manual	cold NFS scan; outside the runner overlap -- L278 contract 7
 cuda-regression	kernel:gdn,exl3,exl3-half,qsa,s4,moe-route,expert-table	all	battery
 cuda-attn-gates	kernel:attn-f16,hc,vision	deepseek4	battery
+rope-tail-format-gate	kernel:rope	all	battery	the tail rope on f32 / f16 / bf16 storage at the V4.1 Q shape; f16 Q ran the bf16 kernel (L269)
 vision-qwen-pixel-gate	kernel:vision-preprocess	qwen4_exp	battery	bit-exact vs HF's Qwen2VLImageProcessorPil (host)
 vision-qwen-tower-gate	kernel:vision-tower	qwen4_exp	battery	vs HF stage dumps, the reference's bf16 floor (L268)
 tessera-kernel-gate	kernel:tessera	qwen4_exp	battery	byte-identical to Tessera 37742e0f's own build, dense + MoE, E=32 and E=512 (L255)

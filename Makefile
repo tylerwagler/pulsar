@@ -424,6 +424,19 @@ tests/indexer_hadamard_kernel_test: tests/indexer_hadamard_kernel_test.o $(CUDA_
 indexer-hadamard-kernel-check: tests/indexer_hadamard_kernel_test
 	./tests/indexer_hadamard_kernel_test
 
+# L269: the tail rope on every stored element format -- f16 and bf16 against the f32 rotation rounded to their
+# format, at V4.1's Q shape and rope sets, plus the refusal of a two-byte buffer that is neither.  The rope used to
+# pick its kernel by width alone and ran V4.1's f16 Q as bf16.  Host side -fno-fast-math (IEEE tolerances).
+tests/rope_tail_format_gate.o: tests/rope_tail_format_gate.cpp src/pulsar_gpu.h
+	$(CXX) $(CXXFLAGS) -fno-fast-math -Isrc -c -o $@ tests/rope_tail_format_gate.cpp
+
+tests/rope_tail_format_gate: tests/rope_tail_format_gate.o $(CUDA_OBJS) $(CUTLASS_CUDA_OBJS) $(MMQ_OBJS)
+	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
+
+.PHONY: rope-tail-format-gate
+rope-tail-format-gate: tests/rope_tail_format_gate
+	./tests/rope_tail_format_gate
+
 # DELIBERATELY NOT in PROBES: tests/flashinfer_sparse_mla_bench.cu needs
 # FlashInfer's csrc/sparse_mla_sm120_prefill.cu, which is not vendored here.
 
@@ -1887,7 +1900,7 @@ render-gate: pulsar_test
 # separate engine load for it.
 GATE_TARGETS = unit-test-gate agent-test-gate \
 	cuda-regression cuda-kv-rows-pack-gate cuda-minp-prefilter-gate cuda-chat-smoke-gate \
-	cuda-attn-gates cuda-attn-pack-gate indexer-hadamard-kernel-check \
+	cuda-attn-gates cuda-attn-pack-gate indexer-hadamard-kernel-check rope-tail-format-gate \
 	cuda-prefill-gate-cutlass-mxfp4 qwen-family-gate-device vision-qwen-tower-gate tessera-kernel-gate \
 	\
 	cuda-runner-gate
@@ -2054,7 +2067,7 @@ GATES_DEV_UNIT ?= --ctxmem --sampler --sampler-prefilter --spec-math --lib-utf8 
 GATES_DEV_UNIT_SERVER ?= --server --api-sampling-flags --api-min-p-range --api-logprobs-parse --api-count-tokens
 # attention kernels: their own oracle (cuda-attn-gates) + the fused mixed step,
 # which is where an attention/compressor row change shows up as a logits delta.
-GATES_DEV_ATTN   = cuda-mixed-prefill-gate cuda-row-neutrality-gate-deep cuda-vision-chunk-gate
+GATES_DEV_ATTN   = cuda-mixed-prefill-gate cuda-row-neutrality-gate-deep cuda-vision-chunk-gate rope-tail-format-gate
 # kernel dispatch: row-kind/batch-composition neutrality and the width sweep.
 GATES_DEV_CUDA   = cuda-mixed-neutrality-gate cuda-algo-stability-gate cuda-mixed-prefill-gate cuda-row-neutrality-gate-deep
 # engine lanes: the batched driver, the spec lane, the bank pool.
