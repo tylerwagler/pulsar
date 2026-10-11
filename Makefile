@@ -424,6 +424,20 @@ tests/indexer_hadamard_kernel_test: tests/indexer_hadamard_kernel_test.o $(CUDA_
 indexer-hadamard-kernel-check: tests/indexer_hadamard_kernel_test
 	./tests/indexer_hadamard_kernel_test
 
+# L269: the tail rope on every stored element format -- f16 and bf16 against the f32 rotation rounded to their
+# format, at V4.1's Q shape and rope sets, plus the refusal of a two-byte buffer that is neither.  The rope used to
+# pick its kernel by width alone and ran V4.1's f16 Q as bf16.  Host side -fno-fast-math (IEEE tolerances).  Runs
+# in cuda-attn-gates (battery, and gates-dev's attention tier); the target below is for iterating on it alone.
+tests/rope_tail_format_gate.o: tests/rope_tail_format_gate.cpp src/pulsar_gpu.h
+	$(CXX) $(CXXFLAGS) -fno-fast-math -Isrc -c -o $@ tests/rope_tail_format_gate.cpp
+
+tests/rope_tail_format_gate: tests/rope_tail_format_gate.o $(CUDA_OBJS) $(CUTLASS_CUDA_OBJS) $(MMQ_OBJS)
+	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
+
+.PHONY: rope-tail-format-gate
+rope-tail-format-gate: tests/rope_tail_format_gate
+	./tests/rope_tail_format_gate
+
 # DELIBERATELY NOT in PROBES: tests/flashinfer_sparse_mla_bench.cu needs
 # FlashInfer's csrc/sparse_mla_sm120_prefill.cu, which is not vendored here.
 
@@ -912,7 +926,7 @@ tests/hc_carry_kernel_test: tests/hc_carry_kernel_test.cu Makefile \
 # attn_f16_banked_test took a "p" argument selecting packed comp banks over
 # f32 ones; the comp format parameter is gone from the kernels (2026-08-18), so
 # there is one mode and one invocation.
-cuda-attn-gates: tests/attn_f16_kernel_test tests/attn_f16_banked_test tests/kv_rows_pack_gate tests/hc_carry_kernel_test tests/minp_prefilter_gate tests/dspark_batch_gate tests/nt_crossover_sweep tests/exl3_dense_gate tests/exl3_dense_bench tests/exl3_dense_xcheck tests/vision_router_gate tests/vision_hc_gate
+cuda-attn-gates: tests/attn_f16_kernel_test tests/attn_f16_banked_test tests/kv_rows_pack_gate tests/hc_carry_kernel_test tests/minp_prefilter_gate tests/dspark_batch_gate tests/nt_crossover_sweep tests/exl3_dense_gate tests/exl3_dense_bench tests/exl3_dense_xcheck tests/vision_router_gate tests/vision_hc_gate tests/rope_tail_format_gate
 	./tests/attn_f16_kernel_test
 	./tests/attn_f16_kernel_test 40 24 32 x 8 4          # compressed tail
 	./tests/attn_f16_kernel_test 40 24 32 x 8 4 3        # indexed top-k selection
@@ -932,6 +946,7 @@ cuda-attn-gates: tests/attn_f16_kernel_test tests/attn_f16_banked_test tests/kv_
 	./tests/hc_carry_kernel_test
 	./tests/vision_router_gate $(VISION_ROUTER_GOLDENS)
 	./tests/vision_hc_gate
+	./tests/rope_tail_format_gate   # L269: the tail rope on f32 / f16 / bf16 storage
 
 # The host-only MODEL-FREE oracles, plus the eval extractor self-test.  Every
 # one of these was a loose target that no battery ran -- the shape L224 found
