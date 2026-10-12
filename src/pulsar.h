@@ -643,10 +643,15 @@ int pulsar_session_argmax_excluding(pulsar_session *s, int excluded_id);
  * is printed, and the caller must fail its request (L188).  Never a valid id. */
 #define PULSAR_SAMPLE_REFUSED (-1)
 /** Sample one token from a logits row under (temperature, top-k, top-p,
- * min-p); the row twin of pulsar_session_sample.  Greedy (temperature <= 0)
- * consumes no rng word.
+ * min-p); the row twin of pulsar_session_sample.  `rng` is the request's
+ * sampler stream (seed it with the request's seed): the draw reads the key
+ * of the stream's next token and steps the stream past it -- greedy too (it
+ * reads nothing), so the stream's index stays the count of tokens drawn.  The
+ * key is a function of (seed, index) only, and the speculative lanes draw
+ * each token at the same key, so a seeded request is the same text whichever
+ * lane decodes which of its tokens (L288 sdet).
  * @return the token id, or -1 for a row no distribution can be drawn from
- * (no finite logit). */
+ * (no finite logit) or no stream. */
 int pulsar_sample_logits(const float *logits, int n_vocab, float temperature,
                       int top_k, float top_p, float min_p, uint64_t *rng);
 /** pulsar_sample_logits over the session's live logits. @return the token, or -1. */
@@ -857,7 +862,8 @@ uint32_t pulsar_session_bank_pending_confs(const pulsar_session *s, uint32_t ban
                                         float out[16]);
 /** The carry-or-sample base draw (the head of generate_speculative). Never
  * returns EOS handling -- the caller checks and short-circuits like
- * generate_speculative does. */
+ * generate_speculative does.  A fresh draw reads the stream's next key and
+ * does not step it: the round that emits the base steps past it. */
 int pulsar_session_spec_next_base(pulsar_session *s, float temperature,
                                int top_k, float top_p, float min_p,
                                uint64_t *rng);
@@ -878,7 +884,9 @@ uint32_t pulsar_spec_round_fill_reqs(const pulsar_spec_round *r, uint32_t bank, 
  * at the block, and this round's rows start at block row `row0` (row stride =
  * pulsar_engine_logits_width floats). Emits into accepted[] and returns the
  * count, or -1 (session poisoned). Row argmaxes for the greedy walk are
- * computed host-side from the block. */
+ * computed host-side from the block.  The walk draws each row's token at its
+ * own key in `rng` (the stream at the round's base) and steps the stream past
+ * every token it emits (L288 sdet). */
 int pulsar_session_spec_round_end(pulsar_session *s, pulsar_spec_round *r,
                                int first_token,
                                float temperature, int top_k, float top_p,
@@ -911,7 +919,8 @@ void pulsar_session_spec_round_abort(pulsar_session *s, pulsar_spec_round *r);
 void pulsar_session_spec_arm_capture(pulsar_session *s, uint32_t n_rows);
 /** L150: the batched lane's round_end DEFERS drafting; after every bank's
  * round_end (and bank_state_save) call this once with the live rounds, their
- * banks and each bank's rng: it runs ONE drafter pass over all requesting banks
+ * banks and each bank's rng (read, never stepped: a sampled draft is drawn at
+ * the key of the token it proposes): it runs ONE drafter pass over all requesting banks
  * and leaves each bank's draft in its round. Never switches banks. Returns 0
  * (banks that could not be served keep no pendings and take a plain step next),
  * -1 with err on a device failure. Then, per bank, under the server's own bank

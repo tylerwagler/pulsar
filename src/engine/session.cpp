@@ -1161,7 +1161,6 @@ void pulsar_session::destroy() {
     token_vec_free(&s->checkpoint);
     pulsar_sample_scratch_free(&s->sample_scratch);
     s->bank_carry_free();
-    free(s->pend_qrows);
     free(s->spec_row_scratch);
     free(s->logits);
     free(s);
@@ -1345,15 +1344,21 @@ int pulsar_sample_logits(const float *logits, int n_vocab, float temperature,
     if (!logits || n_vocab <= 0) return PULSAR_SAMPLE_REFUSED;   /* was token 0 (L188) */
     /* No session here, so no scratch to borrow: this public entry keeps the
      * malloc path. Session callers below pass their own. */
-    return sample_top_p_min_p(logits, (uint32_t)n_vocab, temperature, top_k, top_p,
-                              min_p, rng, NULL);
+    if (!rng) return PULSAR_SAMPLE_REFUSED;
+    const int tok = sample_top_p_min_p(logits, (uint32_t)n_vocab, temperature, top_k, top_p,
+                                       min_p, pulsar_sample_key(*rng, 0u), NULL);
+    if (tok >= 0) pulsar_sample_advance(rng, 1u);   /* the drawn token is the stream's next (L288 sdet) */
+    return tok;
 }
 
 
 int pulsar_session::sample(float temperature, int top_k, float top_p, float min_p, uint64_t *rng) {
     auto *s = this;
-    return sample_top_p_min_p(s->logits, (uint32_t)s->engine->logits_width(), temperature, top_k, top_p,
-                              min_p, rng, &s->sample_scratch);
+    if (!rng) return PULSAR_SAMPLE_REFUSED;
+    const int tok = sample_top_p_min_p(s->logits, (uint32_t)s->engine->logits_width(), temperature, top_k, top_p,
+                                       min_p, pulsar_sample_key(*rng, 0u), &s->sample_scratch);
+    if (tok >= 0) pulsar_sample_advance(rng, 1u);
+    return tok;
 }
 
 

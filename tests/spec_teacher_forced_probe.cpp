@@ -10,22 +10,31 @@
  * the server's lane, as the L160 oracle does) along a corpus prefix, but the
  * round END is teacher-forced (pulsar_session_spec_round_end_forced): a draft is
  * accepted iff it IS the corpus token, and the carry is the next corpus token.
- * The drafter's proposal q for a position is then a deterministic function of
- * (model, drafter, corpus prefix), and so is the target's distribution p over
- * the same prefix, read from the round's base row.  Per measured position:
- *   E[accept] = sum_v min(p_v, q_v)   -- the exact acceptance probability of the
- *                                      temperature-matched rule at that context
- *   argmax agreement                  -- greedy acceptance
- *   draft == truth                    -- what teacher forcing itself accepted
- * A one-ulp kernel change shows as a 1e-4 move; two points is unambiguous.
+ * The drafter's proposal for a position is then a deterministic function of
+ * (model, drafter, corpus prefix, the stream's key at that index), and so
+ * is the target's distribution p over the same prefix, read from the round's
+ * base row.  Per measured position:
+ *   draft == target draw   -- the production walk's verdict (L288 sdet: a
+ *                             draft is accepted iff it IS the target's own
+ *                             draw at the token's key), the realized
+ *                             acceptance, one Bernoulli per position from a
+ *                             fixed stream
+ *   draft == p's argmax    -- how often the sampled draft lands on p's mode
+ *   draft == truth         -- what teacher forcing itself accepted
+ * The walk no longer keeps the drafter's q (it never reads it), so the exact
+ * per-position expectation the probe used to print (sum_v min(p_v, q_v), the
+ * old accept / residual rule's) is gone with it: the realized rate carries
+ * ~1 point of standard error at 2000 positions -- run more for a finer read.
+ * The base build's exact common-draw expectation was measured once, L288.
  *
- * Both p and q are built with the production sampling transform (temperature
- * 1.0, top_k 0, top_p 1.0, min_p 0.05), the shape the served lane runs.  The
- * corpus is tests/teacher_forced_corpus.txt, a FROZEN snapshot of three
- * engineering documents (never edit it: the numbers are only comparable over
- * the same tokens).
+ * p is built with the production sampling transform (temperature 1.0, top_k
+ * 0, top_p 1.0, min_p 0.05 by default), the shape the served lane runs, and
+ * the drafter drafts under the same params.  The corpus is
+ * tests/teacher_forced_corpus.txt, a FROZEN snapshot of three engineering
+ * documents (never edit it: the numbers are only comparable over the same
+ * tokens).
  *
- *   ./tests/spec_teacher_forced_probe MODEL [positions=2000] [start=512]
+ *   ./tests/spec_teacher_forced_probe MODEL [positions=2000] [start=512] [temp=1] [top_k=0] [top_p=1] [min_p=0.05]
  */
 #include "pulsar.h"
 #include "pulsar_engine_internal.h"
@@ -52,45 +61,15 @@ static char *read_file(const char *path, size_t *len_out) {
     return buf;
 }
 
-/* The drafter's stored proposal for pending position 0, as a distribution:
- * the sparse store when the min-p prefilter kept it, else the full row it
- * fell back to.  Returns 0 when there is no pending draft, -1 on a failure. */
-static int pending_q0(pulsar_session *s, uint32_t width, float temperature, int top_k,
-                      float top_p, float min_p, pulsar_sample_scratch *scratch,
-                      pulsar_sample_dist *qd, int *sparse) {
-    /* LIVE state (the caller restored bank 0): the saved carry is what the
-     * sweep reads between rounds, the live shadow is what round_begin will
-     * consume.  Harvest first: the chain may still be in flight. */
-    pulsar_session_spec_chain_harvest(s);
-    if (s->spec.n_pend == 0u) return 0;
-    const uint32_t qn = s->spec.pend_qn[0];
-    memset(qd, 0, sizeof *qd);
-    if (qn > 0) {
-        qd->n = qn;
-        qd->ids = (int *)malloc((size_t)qn * sizeof(int));
-        qd->probs = (float *)malloc((size_t)qn * sizeof(float));
-        if (!qd->ids || !qd->probs) return -1;
-        for (uint32_t k = 0; k < qn; k++) {
-            qd->ids[k] = s->spec.pend_qids[0][k];
-            qd->probs[k] = s->spec.pend_qprobs[0][k];
-        }
-        *sparse = 1;
-        return 1;
-    }
-    const float *qrow = s->pend_qrows;
-    if (!qrow) return -1;
-    if (!pulsar_sample_dist_build(qrow, width, temperature, top_k, top_p, min_p, scratch, qd)) return -1;
-    *sparse = 0;
-    return 1;
-}
-
 int GATE_ENTRY(int argc, char **argv) {
     setvbuf(stdout, NULL, _IOLBF, 0);
-    if (argc < 2) { fprintf(stderr, "usage: %s MODEL [positions] [start]\n", argv[0]); return 2; }
+    if (argc < 2) { fprintf(stderr, "usage: %s MODEL [positions] [start] [temp] [top_k] [top_p] [min_p]\n", argv[0]); return 2; }
     const int n_pos = argc > 2 ? atoi(argv[2]) : 2000;
     const int start = argc > 3 ? atoi(argv[3]) : 512;
-    const float temperature = 1.0f, top_p = 1.0f, min_p = 0.05f;
-    const int top_k = 0;
+    const float temperature = argc > 4 ? (float)atof(argv[4]) : 1.0f;
+    const int top_k = argc > 5 ? atoi(argv[5]) : 0;
+    const float top_p = argc > 6 ? (float)atof(argv[6]) : 1.0f;
+    const float min_p = argc > 7 ? (float)atof(argv[7]) : 0.05f;
 
     pulsar_engine_options opt; memset(&opt, 0, sizeof opt);
     opt.model_path = argv[1]; opt.backend = PULSAR_BACKEND_CUDA;
@@ -141,20 +120,21 @@ int GATE_ENTRY(int argc, char **argv) {
             if (pulsar_session_sync(s, &p, err, sizeof err) != 0) { fprintf(stderr, "sync: %s\n", err); goto done; }
         }
         pulsar_session_bank_state_save(s, 0u);
-        uint64_t rng = 0x5eed1182ull;   /* never drawn from: every end is forced */
+        /* the stream the drafts read: a forced end draws nothing and leaves it alone, so the probe steps it past
+         * each round's committed tokens itself, as a production round end does */
+        uint64_t rng = 0x5eed1182ull;
         uint64_t *rngp = &rng;
         const uint32_t bank0 = 0u;
 
-        double sum_acc = 0.0, sum_q_at_pmode = 0.0;
-        int agree = 0, greedy_hit = 0, n_meas = 0, n_sparse = 0, n_rounds = 0;
+        int accept = 0, mode_hit = 0, truth_hit = 0, n_meas = 0, n_rounds = 0;
         int pos = start;   /* committed prefix length; toks.v[pos] is the next true token */
         while (n_meas < n_pos) {
             if (pos + 20 > ctx) { fprintf(stderr, "context exhausted at pos %d after %d measured positions\n", pos, n_meas); break; }
             if (!pulsar_session_bank_state_restore(s, bank0)) { fprintf(stderr, "bank restore failed\n"); goto done; }
-            /* q for the token at pos+1, drafted by the previous forced end (none before the first round) */
-            pulsar_sample_dist qd; int sparse = 0;
-            const int have_q = pending_q0(s, (uint32_t)width, temperature, top_k, top_p, min_p, &scratch, &qd, &sparse);
-            if (have_q < 0) { fprintf(stderr, "q read failed at pos %d\n", pos); goto done; }
+            /* the draft for the token at pos+1, drafted by the previous forced end (none before the first round);
+             * harvest first: the chain may still be in flight */
+            pulsar_session_spec_chain_harvest(s);
+            const bool have_q = s->spec.n_pend > 0u;
             const int draft0 = have_q ? (int)s->spec.pend[0] : -1;
             if (!have_q && n_rounds >= 3 && n_meas == 0) {
                 /* the first round has nothing pending by construction; from
@@ -170,13 +150,11 @@ int GATE_ENTRY(int argc, char **argv) {
                 first = pulsar_session_spec_next_base(s, temperature, top_k, top_p, min_p, rngp);
                 if (first != toks.v[pos]) {
                     fprintf(stderr, "forced carry lost: next_base=%d truth=%d at pos %d\n", first, toks.v[pos], pos);
-                    if (have_q) pulsar_sample_dist_free(&qd);
                     goto done;
                 }
             }
             if (pulsar_session_spec_round_begin(s, r, first, 17, 17, temperature, top_k, top_p, min_p, err, sizeof err) != 0) {
                 fprintf(stderr, "round_begin at %d: %s\n", pos, err);
-                if (have_q) pulsar_sample_dist_free(&qd);
                 goto done;
             }
             pulsar_multiseq_req reqs[17];
@@ -191,7 +169,6 @@ int GATE_ENTRY(int argc, char **argv) {
                 pulsar_session_bank_state_restore(s, bank0);
                 pulsar_session_spec_round_abort(s, r);
                 fprintf(stderr, "decode_mixed at %d: rc=%d rows=%u/%u %s\n", pos, drc, out_rows, rows, err);
-                if (have_q) pulsar_sample_dist_free(&qd);
                 goto done;
             }
             /* p: the target after `first` = the round's row 0, read from the
@@ -202,35 +179,22 @@ int GATE_ENTRY(int argc, char **argv) {
             if (have_q) {
                 if (!gpu_graph_read_spec_logits_row(s->graph, 0u, prow)) {
                     fprintf(stderr, "spec logits row 0 read failed at %d\n", pos);
-                    pulsar_sample_dist_free(&qd);
                     goto done;
                 }
                 pulsar_sample_dist pd; memset(&pd, 0, sizeof pd);
                 if (!pulsar_sample_dist_build(prow, (uint32_t)width, temperature, top_k, top_p, min_p, &scratch, &pd)) {
                     fprintf(stderr, "p build failed at %d\n", pos);
-                    pulsar_sample_dist_free(&qd);
                     goto done;
                 }
-                int p_mode = -1; float p_mode_v = -1.0f;
-                for (uint32_t k = 0; k < pd.n; k++) if (pd.probs[k] > p_mode_v) { p_mode_v = pd.probs[k]; p_mode = pd.ids[k]; }
-                int q_mode = -1; float q_mode_v = -1.0f;
-                double acc = 0.0, q_at_pmode = 0.0;
-                for (uint32_t k = 0; k < qd.n; k++) {
-                    const float qv = qd.probs[k], pv = pulsar_sample_dist_prob(&pd, qd.ids[k]);
-                    acc += (double)(qv < pv ? qv : pv);
-                    if (qv > q_mode_v) { q_mode_v = qv; q_mode = qd.ids[k]; }
-                    if (qd.ids[k] == p_mode) q_at_pmode = qv;
-                }
+                /* the draft sits one place past the base: the key the walk's target draw reads */
+                accept += pulsar_sample_dist_draw(&pd, pulsar_sample_key(rng, 1u)) == draft0;
+                mode_hit += pd.ids[0] == draft0;
                 pulsar_sample_dist_free(&pd);
-                pulsar_sample_dist_free(&qd);
-                sum_acc += acc; sum_q_at_pmode += q_at_pmode;
-                agree += (q_mode == p_mode);
-                greedy_hit += (draft0 == toks.v[pos + 1]);
-                n_sparse += sparse;
+                truth_hit += (draft0 == toks.v[pos + 1]);
                 n_meas++;
                 if (n_meas % 250 == 0)
-                    printf("  %5d positions: E[accept]=%.5f  argmax agreement=%.4f  draft==truth=%.4f\n",
-                           n_meas, sum_acc / n_meas, (double)agree / n_meas, (double)greedy_hit / n_meas);
+                    printf("  %5d positions: draft==target draw=%.4f  draft==p argmax=%.4f  draft==truth=%.4f\n",
+                           n_meas, (double)accept / n_meas, (double)mode_hit / n_meas, (double)truth_hit / n_meas);
             }
             /* forced end: the corpus decides acceptance and the carry */
             if (!pulsar_session_bank_state_restore(s, bank0)) { fprintf(stderr, "bank restore failed\n"); goto done; }
@@ -246,6 +210,7 @@ int GATE_ENTRY(int argc, char **argv) {
                 }
             }
             pos += na;
+            pulsar_sample_advance(&rng, (uint32_t)na);
             n_rounds++;
             /* The yield-quench controller is a SPEED policy: it latches when
              * rounds convert too little and routes the request to plain
@@ -264,10 +229,10 @@ int GATE_ENTRY(int argc, char **argv) {
             pulsar_session_bank_state_save(s, bank0);
         }
         if (n_meas == 0) { fprintf(stderr, "nothing measured\n"); goto done; }
-        printf("TEACHER-FORCED: positions=%d start=%d rounds=%d temp=%.2f min_p=%.2f | E[accept]=%.6f  "
-               "argmax agreement=%.5f  draft==truth=%.5f  mean q(p-mode)=%.5f  (sparse q at %d positions)\n",
-               n_meas, start, n_rounds, temperature, min_p, sum_acc / n_meas, (double)agree / n_meas,
-               (double)greedy_hit / n_meas, sum_q_at_pmode / n_meas, n_sparse);
+        printf("TEACHER-FORCED: positions=%d start=%d rounds=%d temp=%.2f top_k=%d top_p=%.2f min_p=%.2f | "
+               "draft==target draw=%.5f  draft==p argmax=%.5f  draft==truth=%.5f\n",
+               n_meas, start, n_rounds, temperature, top_k, top_p, min_p, (double)accept / n_meas,
+               (double)mode_hit / n_meas, (double)truth_hit / n_meas);
         rc = 0;
     }
 done:

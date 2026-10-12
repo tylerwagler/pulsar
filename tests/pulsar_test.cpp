@@ -2117,12 +2117,12 @@ static void test_sampler_dist_equivalence(void) {
                 TEST_ASSERT(pulsar_sample_dist_build(logits, n, cfg->temp, cfg->top_k, cfg->top_p,
                                                   cfg->min_p, &scratch, &got) == 0);
                 TEST_ASSERT(got.n == 0 && got.ids == NULL && got.probs == NULL);
-                uint64_t r2 = 0xABCD0000u, r3 = r2;
+                uint64_t r2 = 0xABCD0000u;
+                TEST_ASSERT(pulsar_sample_logits(logits, (int)n, cfg->temp, cfg->top_k, cfg->top_p,
+                                                 cfg->min_p, &r2) == PULSAR_SAMPLE_REFUSED);
                 TEST_ASSERT(sample_top_p_min_p(logits, n, cfg->temp, cfg->top_k, cfg->top_p,
-                                               cfg->min_p, &r2, NULL) == PULSAR_SAMPLE_REFUSED);
-                TEST_ASSERT(sample_top_p_min_p(logits, n, cfg->temp, cfg->top_k, cfg->top_p,
-                                               cfg->min_p, &r3, &plain_scratch) == PULSAR_SAMPLE_REFUSED);
-                TEST_ASSERT(r2 == 0xABCD0000u && r3 == r2);
+                                               cfg->min_p, 1u, &plain_scratch) == PULSAR_SAMPLE_REFUSED);
+                TEST_ASSERT(r2 == 0xABCD0000u);
                 refused++;
                 checked++;
                 continue;
@@ -2143,10 +2143,10 @@ static void test_sampler_dist_equivalence(void) {
             if (!got_rc) {
                 TEST_ASSERT(got.n == 0 && got.ids == NULL && got.probs == NULL);
                 uint64_t r = 0xABCD0000u;
+                TEST_ASSERT(pulsar_sample_logits(logits, (int)n, cfg->temp, cfg->top_k, cfg->top_p,
+                                                 cfg->min_p, &r) == -1);
                 TEST_ASSERT(sample_top_p_min_p(logits, n, cfg->temp, cfg->top_k, cfg->top_p,
-                                               cfg->min_p, &r, NULL) == -1);
-                TEST_ASSERT(sample_top_p_min_p(logits, n, cfg->temp, cfg->top_k, cfg->top_p,
-                                               cfg->min_p, &r, &plain_scratch) == -1);
+                                               cfg->min_p, 1u, &plain_scratch) == -1);
                 TEST_ASSERT(r == 0xABCD0000u);
                 refused++;
                 checked++;
@@ -2171,49 +2171,46 @@ static void test_sampler_dist_equivalence(void) {
                 TEST_ASSERT(memcmp(&ref.probs[i], &got.probs[i], sizeof(float)) == 0);
             }
 
-            /* (b) the rng-driven sequences the spec acceptance walk consumes:
-             * same seed must select the same tokens through accept / draw /
-             * draw_excluding. This is the property that actually decides the
-             * emitted token stream. */
+            /* (b) the draws the spec walk makes: the same key must select the
+             * same token from both builds -- the property that decides the
+             * emitted token stream (L288 sdet: every lane draws a token at its
+             * own key). */
             for (int trial = 0; trial < 64; trial++) {
                 const uint64_t seed = 0x5EED0000u + (uint64_t)trial * 7919u;
-                uint64_t r1 = seed, r2 = seed;
+                const uint64_t key = pulsar_sample_key(seed, (uint32_t)trial);
                 const int probe = ref.ids[(uint32_t)trial % ref.n];
-                TEST_ASSERT(pulsar_sample_dist_accept(&ref, probe, &r1) ==
-                            pulsar_sample_dist_accept(&got, probe, &r2));
-                TEST_ASSERT(r1 == r2);
-                TEST_ASSERT(pulsar_sample_dist_draw(&ref, &r1) == pulsar_sample_dist_draw(&got, &r2));
-                TEST_ASSERT(r1 == r2);
-                TEST_ASSERT(pulsar_sample_dist_draw_excluding(&ref, probe, &r1) ==
-                            pulsar_sample_dist_draw_excluding(&got, probe, &r2));
-                TEST_ASSERT(r1 == r2);
+                TEST_ASSERT(pulsar_sample_dist_draw(&ref, key) == pulsar_sample_dist_draw(&got, key));
                 TEST_ASSERT(pulsar_sample_dist_prob(&ref, probe) == pulsar_sample_dist_prob(&got, probe));
             }
 
-            /* (c) THE plain sampler is build -> draw (L186). Under a fixed seed
+            /* (c) THE plain sampler is build -> draw (L186). At a fixed key
              * it must return the token pulsar_sample_dist_draw pulls from the
              * REFERENCE nucleus -- the independent qsort build, walked in the
-             * one sorted order -- and from the shipped one, and leave the rng
-             * where draw leaves it. This is the plain-lane == spec-lane
-             * identity: server_sched's per-token draw and session_spec's
-             * accept walk now map one rng state to one token. Greedy takes the
-             * point mass and spends no rng word (the spec lane's greedy walk
-             * draws nothing either). Both allocation modes run: the scratch
+             * one sorted order -- and from the shipped one.  This is the
+             * plain-lane == spec-lane identity: server_sched's per-token draw
+             * and session_spec's walk map one key to one token.  Greedy
+             * takes the point mass.  Both allocation modes run: the scratch
              * path reuses session-owned buffers and is deliberately shared
              * across trials AND configs, as a session shares it -- a
-             * stale-state bug shows up on the second call, not the first. */
+             * stale-state bug shows up on the second call, not the first.
+             * The public row entry draws at the stream's next key and steps
+             * the stream once, greedy too. */
             for (int trial = 0; trial < 16; trial++) {
                 const uint64_t seed = 0xABCD0000u + (uint64_t)trial;
-                uint64_t r_ref = seed, r_got = seed, r_plain = seed, r_scr = seed;
-                const int want = cfg->temp <= 0.0f ? ref.ids[0]
-                                                   : pulsar_sample_dist_draw(&ref, &r_ref);
-                const int via_got = cfg->temp <= 0.0f ? got.ids[0]
-                                                      : pulsar_sample_dist_draw(&got, &r_got);
+                const uint64_t key = pulsar_sample_key(seed, 0u);
+                const int want = cfg->temp <= 0.0f ? ref.ids[0] : pulsar_sample_dist_draw(&ref, key);
+                const int via_got = cfg->temp <= 0.0f ? got.ids[0] : pulsar_sample_dist_draw(&got, key);
                 const int plain = sample_top_p_min_p(logits, n, cfg->temp, cfg->top_k,
-                                                     cfg->top_p, cfg->min_p, &r_plain, NULL);
+                                                     cfg->top_p, cfg->min_p, key, NULL);
                 const int scr = sample_top_p_min_p(logits, n, cfg->temp, cfg->top_k,
-                                                   cfg->top_p, cfg->min_p, &r_scr,
+                                                   cfg->top_p, cfg->min_p, key,
                                                    &plain_scratch);
+                uint64_t r_pub = seed, r_ref = seed;
+                const int pub = pulsar_sample_logits(logits, (int)n, cfg->temp, cfg->top_k, cfg->top_p,
+                                                     cfg->min_p, &r_pub);
+                pulsar_sample_advance(&r_ref, 1u);
+                TEST_ASSERT(pub == plain);
+                TEST_ASSERT(r_pub == r_ref);
                 if (plain != want)
                     fprintf(stderr, "sampler: shape=%s cfg=%s plain draw %d != draw(build) %d\n",
                             sname, cfg->name, plain, want);
@@ -2223,9 +2220,6 @@ static void test_sampler_dist_equivalence(void) {
                 TEST_ASSERT(plain == want);
                 TEST_ASSERT(via_got == want);
                 TEST_ASSERT(scr == plain);
-                TEST_ASSERT(r_plain == r_ref);
-                TEST_ASSERT(r_got == r_ref);
-                TEST_ASSERT(r_scr == r_plain);
                 identity_trials++;
             }
 
@@ -2282,8 +2276,8 @@ static void test_sampler_dist_equivalence(void) {
                                                  &scratch, &nd) == 0);
             TEST_ASSERT(nd.n == 0 && nd.ids == NULL && nd.probs == NULL);
             uint64_t r = 0xABCD0000u;
-            TEST_ASSERT(sample_top_p_min_p(row, 256, temp_bad[i], 0, 1.0f, 0.05f, &r, NULL) == -1);
-            TEST_ASSERT(r == 0xABCD0000u);
+            TEST_ASSERT(pulsar_sample_logits(row, 256, temp_bad[i], 0, 1.0f, 0.05f, &r) == -1);
+            TEST_ASSERT(r == 0xABCD0000u);   /* a refused draw does not step the stream */
         }
         const float tp_bad[2] = {NAN, INFINITY};
         for (int i = 0; i < 2; i++) {
@@ -2496,30 +2490,33 @@ static void test_sampler_prefilter_equivalence(void) {
 
 
 /* =====
- * Sampled-proposal (p/q) speculative math — the pure-CPU oracle for
- * temperature-matched draft sampling. No model, no GPU, no batch numerics, so
- * a failure here is the math, not the engine.
+ * The speculative walk's draw rule (L288 sdet) -- the pure-CPU oracle.  No
+ * model, no GPU, no batch numerics, so a failure here is the math, not the
+ * engine.
  *
- * The property: drawing x ~ q, accepting w.p. min(1, p(x)/q(x)), and otherwise
- * drawing from the residual (p-q)+ must reproduce p EXACTLY — for ANY proposal
- * q, including one that proposes tokens p rules out. That is what lets the
- * drafter propose from a temperature-matched q without biasing the output.
- *
- * Also pins the two bugs fixed in pulsar_sample_dist_accept_pq / _draw_residual
- * (see the block comment in tokenizer.c), which are silent-corruption bugs:
- * both emit a *plausible* wrong token, so only a distributional test catches
- * them.
+ * The rule: the token at stream index i is draw(p_i, k_i) with k_i =
+ * pulsar_sample_key(seed, i) -- whichever lane computes it -- and a draw is an
+ * exponential race with one uniform per candidate hashed from (k_i, id).  A
+ * sampled draft is draw(q_i, k_i) and is accepted iff it equals the target's
+ * draw; the emitted token is the target's draw either way.  So the marginal is
+ * p by construction, and the acceptance is the race coupling's
+ * P(draw(q, k) == draw(p, k)) >= (1 - TV) / (1 + TV).  Pinned here:
+ *   - the stream: key(advance(seed, n), k) == key(seed, k + n);
+ *   - the race draws p exactly: a chi-square for a flat and for each trial's p
+ *     (emitted tokens), for any proposal q, including one peaked on a token p
+ *     rules out; no p == 0 token is ever emitted;
+ *   - the realized acceptance clears the coupling bound, and p == q accepts
+ *     every draw.
  */
 #define SPEC_V 64u
 
-/* total (p-q)+ mass, computed independently of _draw_residual's own loop */
-static float spec_residual_mass(const pulsar_sample_dist *p, const pulsar_sample_dist *q) {
-    float m = 0.0f;
+static double spec_tv(const pulsar_sample_dist *p, const pulsar_sample_dist *q) {
+    double tv = 0.0;
     for (uint32_t i = 0; i < p->n; i++) {
-        const float r = p->probs[i] - pulsar_sample_dist_prob(q, p->ids[i]);
-        if (r > 0.0f) m += r;
+        const double d = (double)p->probs[i] - (double)pulsar_sample_dist_prob(q, p->ids[i]);
+        if (d > 0.0) tv += d;
     }
-    return m;
+    return tv;
 }
 
 static void test_spec_pq_math(void) {
@@ -2528,29 +2525,70 @@ static void test_spec_pq_math(void) {
     sampler_warn_if_flush_to_zero();
     float pl[SPEC_V], ql[SPEC_V];
     long counts[SPEC_V];
-    uint64_t rng = 12345;
     int fails = 0, checked = 0;
+
+    /* the stream's index arithmetic, and the race over a flat distribution (every candidate's own uniform) */
+    {
+        const uint64_t seed = 1234u;
+        for (uint32_t n = 0; n < 40; n++) {
+            uint64_t r = seed;
+            pulsar_sample_advance(&r, n);
+            for (uint32_t k = 0; k < 8; k++) TEST_ASSERT(pulsar_sample_key(r, k) == pulsar_sample_key(seed, k + n));
+        }
+        /* seeds spaced by the golden-ratio gamma (the spec-sampling oracle's trajectory seeds) must not share
+         * shifted streams */
+        for (uint64_t t = 0; t < 64; t++) {
+            const uint64_t s0 = 0x9E3779B97F4A7C15ull * (t + 1u), s1 = 0x9E3779B97F4A7C15ull * (t + 2u);
+            for (uint32_t k = 0; k < 64; k++) TEST_ASSERT(pulsar_sample_key(s0, k + 1u) != pulsar_sample_key(s1, k));
+        }
+        float flat[SPEC_V];
+        for (uint32_t i = 0; i < SPEC_V; i++) flat[i] = 0.0f;
+        pulsar_sample_dist f;
+        pulsar_sample_dist_build(flat, SPEC_V, 1.0f, 0, 1.0f, 0.0f, &scratch, &f);
+        TEST_ASSERT(f.n == SPEC_V);
+        memset(counts, 0, sizeof(counts));
+        const long N = 640000;
+        for (long i = 0; i < N; i++) counts[pulsar_sample_dist_draw(&f, pulsar_sample_key(seed, (uint32_t)i))]++;
+        double chi = 0.0;
+        const double e = (double)N / (double)SPEC_V;
+        for (uint32_t b = 0; b < SPEC_V; b++) chi += ((double)counts[b] - e) * ((double)counts[b] - e) / e;
+        const double crit = 63.0 + 3.1 * sqrt(2.0 * 63.0) + 4.0;
+        printf("  spec-math stream: flat 64-way race chi2=%.1f crit=%.1f -> %s\n", chi, crit, chi > crit ? "FAIL" : "OK");
+        if (chi > crit) fails++;
+        pulsar_sample_dist_free(&f);
+    }
 
     for (int trial = 0; trial < 8; trial++) {
         /* p and q are built from DIFFERENT logits (target row vs drafter's
-         * refined row) filtered at the SAME request params — the production
+         * refined row) filtered at the SAME request params -- the production
          * shape. Params vary across trials to cover top_p / top_k / min_p. */
         samp_seed(0xBEEF0000u + (uint64_t)trial);
         for (uint32_t i = 0; i < SPEC_V; i++) pl[i] = (float)(samp_u01() * 8.0 - 4.0);
         for (uint32_t i = 0; i < SPEC_V; i++) ql[i] = (float)(samp_u01() * 8.0 - 4.0);
         const char *shape = "disjoint-logits";
         if (trial == 6) {
-            /* q is sharply peaked on a token p ranks last — forces the
-             * rejection branch (and thus the residual) almost every draw. */
+            /* q is sharply peaked on a token p ranks last: the draft is almost
+             * never the target's token */
             shape = "q-peaked-off-p";
             for (uint32_t i = 0; i < SPEC_V; i++) ql[i] = -8.0f;
             ql[SPEC_V - 1] = 12.0f;
             pl[SPEC_V - 1] = -9.0f;
         } else if (trial == 7) {
-            /* p == q: the ratio is 1 everywhere, acceptance must be total and
-             * the residual must never be reached. */
+            /* p == q: every draft is the target's draw */
             shape = "p-equals-q";
             memcpy(ql, pl, sizeof(pl));
+        } else if (trial == 4) {
+            /* q is p with its two leaders swapped: nearly the same distribution in a different order -- the
+             * shape an inverse-CDF draw at one shared uniform coupled worst */
+            shape = "swapped-leaders";
+            memcpy(ql, pl, sizeof(pl));
+            int a = 0, b = 1;
+            for (uint32_t i = 0; i < SPEC_V; i++) if (pl[i] > pl[a]) a = (int)i;
+            b = a == 0 ? 1 : 0;
+            for (uint32_t i = 0; i < SPEC_V; i++) if ((int)i != a && pl[i] > pl[b]) b = (int)i;
+            pl[b] = pl[a] - 0.05f;
+            ql[a] = pl[b];
+            ql[b] = pl[a];
         }
         const float temp = (trial % 2) ? 0.95f : 0.7f;
         const float topp = (trial % 3 == 0) ? 1.0f : 0.38f;
@@ -2560,27 +2598,18 @@ static void test_spec_pq_math(void) {
         pulsar_sample_dist p, q;
         pulsar_sample_dist_build(pl, SPEC_V, temp, topk, topp, minp, &scratch, &p);
         pulsar_sample_dist_build(ql, SPEC_V, temp, topk, topp, minp, &scratch, &q);
-        const float rmass = spec_residual_mass(&p, &q);
+        const double tv = spec_tv(&p, &q);
+        const double bound = (1.0 - tv) / (1.0 + tv);
 
         memset(counts, 0, sizeof(counts));
         const long N = 400000;
-        long accepts = 0, zero_p = 0, zero_resid = 0;
+        long accepts = 0, zero_p = 0;
+        const uint64_t seed = 12345u + (uint64_t)trial;
         for (long it = 0; it < N; it++) {
-            const int x = pulsar_sample_dist_draw(&q, &rng);
-            int tok;
-            if (pulsar_sample_dist_accept_pq(&p, x, pulsar_sample_dist_prob(&q, x), &rng)) {
-                tok = x;
-                accepts++;
-            } else {
-                tok = pulsar_sample_dist_draw_residual(&p, &q, &scratch, &rng);
-                /* bug (b): a residual draw must carry strictly positive
-                 * residual mass. Only the mass<=0 fallback (plain draw from p)
-                 * is exempt, and it cannot occur while rmass > 0. */
-                if (rmass > 0.0f &&
-                    pulsar_sample_dist_prob(&p, tok) - pulsar_sample_dist_prob(&q, tok) <= 0.0f)
-                    zero_resid++;
-            }
-            /* bug (a): an emitted token must be possible under the target. */
+            const uint64_t key = pulsar_sample_key(seed, (uint32_t)it);
+            const int x = pulsar_sample_dist_draw(&q, key);   /* the draft */
+            const int tok = pulsar_sample_dist_draw(&p, key); /* the walk's target draw: the emitted token */
+            accepts += x == tok;
             if (pulsar_sample_dist_prob(&p, tok) <= 0.0f) zero_p++;
             counts[tok]++;
         }
@@ -2597,15 +2626,18 @@ static void test_spec_pq_math(void) {
         }
         df = df > 1 ? df - 1 : 1;
         const double crit = df + 3.1 * sqrt(2.0 * df) + 4.0;
-        const int bad = chi > crit || zero_p || zero_resid;
+        /* the realized acceptance against the coupling's floor, 6 sigma of binomial slack */
+        const double alpha = (double)accepts / (double)N;
+        const double sd = sqrt(bound * (1.0 - bound) / (double)N) + 1e-6;
+        const bool alpha_bad = alpha < bound - 6.0 * sd;
+        const int bad = chi > crit || zero_p || alpha_bad;
         printf("  spec-math trial %d (%s temp=%.2f top_k=%d top_p=%.2f min_p=%.2f "
-               "|p|=%u |q|=%u): alpha=%.3f chi2=%.1f df=%d crit=%.1f%s%s -> %s\n",
+               "|p|=%u |q|=%u): alpha=%.4f (1-TV=%.4f, floor (1-TV)/(1+TV)=%.4f) chi2=%.1f df=%d crit=%.1f%s%s -> %s\n",
                trial, shape, (double)temp, topk, (double)topp, (double)minp, p.n, q.n,
-               (double)accepts / (double)N, chi, df, crit,
-               zero_p ? " ZERO-P-EMITTED" : "", zero_resid ? " ZERO-RESIDUAL" : "",
+               alpha, 1.0 - tv, bound, chi, df, crit,
+               zero_p ? " ZERO-P-EMITTED" : "", alpha_bad ? " BELOW-FLOOR" : "",
                bad ? "FAIL" : "OK");
         if (bad) fails++;
-        /* p == q must accept every single draw: min(1,p/q) == 1 identically. */
         if (trial == 7 && accepts != N) {
             printf("  spec-math: p==q accepted only %ld/%ld\n", accepts, N);
             fails++;
@@ -2615,78 +2647,10 @@ static void test_spec_pq_math(void) {
         pulsar_sample_dist_free(&q);
     }
 
-    /* Deterministic guards for the two reference bugs. The distributional loop
-     * above is necessary but NOT sufficient for bug (a): `u <= p/q` only
-     * misfires when u is exactly 0, which 3.2M random draws will usually miss.
-     * What makes the bug impossible is that the p<=0 rejection happens BEFORE
-     * any rng is drawn — so pin exactly that, by asserting the rng state is
-     * untouched. A `u <= ap` implementation consumes a word here and fails,
-     * whatever u happens to be. */
-    {
-        float l[SPEC_V];
-        samp_seed(0x5AFE01u);
-        for (uint32_t i = 0; i < SPEC_V; i++) l[i] = (float)(samp_u01() * 8.0 - 4.0);
-        l[0] = 20.0f;                      /* one dominant token */
-        pulsar_sample_dist p;
-        /* top_p=0.5 with a dominant token => a small nucleus, so most of the
-         * vocab sits strictly outside it with p(x) == 0. */
-        pulsar_sample_dist_build(l, SPEC_V, 1.0f, 0, 0.5f, 0.0f, &scratch, &p);
-        int off = -1;
-        for (uint32_t i = 0; i < SPEC_V && off < 0; i++)
-            if (pulsar_sample_dist_prob(&p, (int)i) <= 0.0f) off = (int)i;
-        TEST_ASSERT(off >= 0);
-
-        uint64_t r_before = 0xD15EA5Eull, r_after = 0xD15EA5Eull;
-        const int acc = pulsar_sample_dist_accept_pq(&p, off, 0.5f, &r_after);
-        TEST_ASSERT(acc == 0);             /* bug (a): p(x)==0 is never accepted */
-        TEST_ASSERT(r_after == r_before);  /* ...and the guard fired before the rng */
-
-        /* A certain accept (p >= q) must likewise consume no rng — this is what
-         * keeps temperature<=0 byte-identical, where p and q are both point
-         * masses of 1.0 at the argmax. */
-        r_after = r_before;
-        const float pmode = p.probs[0];
-        const int acc2 = pulsar_sample_dist_accept_pq(&p, p.ids[0], pmode * 0.5f, &r_after);
-        TEST_ASSERT(acc2 == 1);
-        TEST_ASSERT(r_after == r_before);
-        pulsar_sample_dist_free(&p);
-    }
-    {
-        /* bug (b): the residual must never return a zero-(p-q)+ token. Build a
-         * q that exactly covers p's LAST-ranked support element (residual 0
-         * there, positive earlier) — the element a "return the last index"
-         * fallback would wrongly emit on a rounding overrun. */
-        float pl2[SPEC_V], ql2[SPEC_V];
-        samp_seed(0x5AFE02u);
-        for (uint32_t i = 0; i < SPEC_V; i++) pl2[i] = (float)(samp_u01() * 4.0 - 2.0);
-        memcpy(ql2, pl2, sizeof(pl2));
-        pulsar_sample_dist p2, q2;
-        pulsar_sample_dist_build(pl2, SPEC_V, 1.0f, 4, 1.0f, 0.0f, &scratch, &p2);
-        /* q2 == p2 on the tail but heavier there => tail residual is <= 0 */
-        ql2[p2.ids[p2.n - 1]] += 3.0f;
-        pulsar_sample_dist_build(ql2, SPEC_V, 1.0f, 4, 1.0f, 0.0f, &scratch, &q2);
-        const int tail = p2.ids[p2.n - 1];
-        TEST_ASSERT(pulsar_sample_dist_prob(&p2, tail) -
-                    pulsar_sample_dist_prob(&q2, tail) <= 0.0f);
-        uint64_t r2 = 777;
-        int tail_emits = 0;
-        for (int it = 0; it < 200000; it++) {
-            const int tok = pulsar_sample_dist_draw_residual(&p2, &q2, &scratch, &r2);
-            if (tok == tail) tail_emits++;
-            if (pulsar_sample_dist_prob(&p2, tok) <= 0.0f) tail_emits++;
-        }
-        if (tail_emits)
-            printf("  spec-math: residual emitted a zero-residual token %d times\n",
-                   tail_emits);
-        TEST_ASSERT(tail_emits == 0);
-        pulsar_sample_dist_free(&p2);
-        pulsar_sample_dist_free(&q2);
-    }
-
     TEST_ASSERT(fails == 0);
     pulsar_sample_scratch_free(&scratch);
-    printf("  spec-math: %d p/q accept+residual trials reproduce the target "
-           "distribution; p=0 reject and zero-residual guards pinned\n", checked);
+    printf("  spec-math: %d race-coupled trials emit the target distribution above the (1-TV)/(1+TV) acceptance "
+           "floor; the stream's index arithmetic pinned\n", checked);
 }
 
 
@@ -4629,7 +4593,7 @@ static const pulsar_test_entry test_entries[] = {
 #endif
     {"--sampler", "sampler", "sampler: build is the one authority; plain == draw(build) under fixed seeds; byte-exact vs re-derived reference", test_sampler_dist_equivalence},
     {"--sampler-prefilter", "sampler-prefilter", "min-p prefilter: survivor set/order identity vs old-sum reference + boundary teeth", test_sampler_prefilter_equivalence},
-    {"--spec-math", "spec-math", "sampled-proposal p/q accept + residual reproduces the target", test_spec_pq_math},
+    {"--spec-math", "spec-math", "the speculative walk's race-coupled draw emits the target; the stream's index arithmetic", test_spec_pq_math},
     {"--lib-utf8", "lib-utf8", "shared UTF-8 rule: strict lead ranges + Table 3-7 second bytes", test_lib_utf8},
     {"--lib-think", "lib-think", "shared <think> scanner: split tags, hold-back, spacing, seeded state", test_lib_think_scan},
     {"--attn-layout", "attn-layout", "CSA2 attention layout table: modes + sources derived from the V4.1 source sets (L218)", test_attn_layout_table},

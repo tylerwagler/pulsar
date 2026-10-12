@@ -32,7 +32,6 @@ void pulsar_bank_carry::free_one() {
     if (!c) return;
     token_vec_free(&c->checkpoint);
     free(c->logits);
-    free(c->pend_qrows);
     memset(c, 0, sizeof(*c));
 }
 
@@ -103,7 +102,7 @@ void pulsar_bank_carry_save_view(pulsar_session *s, uint32_t bank) {
      * s->mseq_dirty is NOT saved: it describes the graph's scalar frontier
      * counters, not this bank's conversation, and _restore re-establishes
      * per-bank frontier truth and clears it unconditionally. */
-    pulsar_spec_shadow_save(s, &c->spec, &c->pend_qrows, &c->pend_qrows_cap);
+    pulsar_spec_shadow_save(s, &c->spec);
     c->valid = true;
 }
 
@@ -133,8 +132,8 @@ bool pulsar_bank_carry_restore_view(pulsar_session *s, uint32_t bank) {
     s->logits_stale           = c->logits_stale;
     s->prefill_frontier       = c->prefill_frontier;   /* L195 */
     s->live_images            = c->live_images;        /* L226 / L281 */
-    /* Mirror of the save above: the whole shadow and its q rows. */
-    pulsar_spec_shadow_restore(s, &c->spec, c->pend_qrows, c->pend_qrows_cap);
+    /* Mirror of the save above: the whole shadow. */
+    pulsar_spec_shadow_restore(s, &c->spec);
     return true;
 }
 

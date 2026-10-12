@@ -308,6 +308,11 @@ static int dspark_draft_group(pulsar_session *s, spec_redraft_req *const *qs, co
     int n_g = 0;
     for (int j = 0; j < n_sel; j++) if (!qs[j]->sample_drafts) n_g++;
     const int n_s = n_sel - n_g;
+    for (int j = n_g; j < n_sel; j++)
+        if (!rngs || !rngs[j]) {
+            snprintf(err, errlen, "dspark draft: sampled drafting needs the request's stream");
+            return -1;
+        }
     /* rows */
     int32_t draft_ids[PULSAR_DSPARK_DRAFT_ROWS_MAX];
     uint32_t row_bank[PULSAR_DSPARK_DRAFT_ROWS_MAX];
@@ -336,7 +341,7 @@ static int dspark_draft_group(pulsar_session *s, spec_redraft_req *const *qs, co
         else         { if (q->n_draft > max_draft_s) max_draft_s = q->n_draft; }
         q->refined[0] = q->next_base;
         for (int k = 1; k < 17; k++) q->refined[k] = 0;
-        for (int k = 0; k < 16; k++) { q->qn[k] = 0; q->q_drawn[k] = 0.0f; q->conf[k] = -1.0f; }
+        for (int k = 0; k < 16; k++) q->conf[k] = -1.0f;
         q->have_conf = false;
         q->keep = q->n_draft;
     }
@@ -395,8 +400,10 @@ static int dspark_draft_group(pulsar_session *s, spec_redraft_req *const *qs, co
         }
     }
     /* sampled records: temperature-matched drafting -- each draft drawn from the refined logits filtered at
-     * the REQUEST's params (q), so the walk's min(1, p/q) is not capped at p(mode).  One step per position
-     * across records, the host draws between.  L149: in the sparse min-p contract the device prefilter hands
+     * the REQUEST's params (q) at the draft's own key (draft pos + 1 sits pos + 1 places past the carry,
+     * pulsar_sample_key: the key the target's draw for that token reads), so a draft is the target's token
+     * with probability at least (1 - TV) / (1 + TV) of q and p (L288 sdet).  One step per position across
+     * records, the host draws between.  L149: in the sparse min-p contract the device prefilter hands
      * back the few candidates above the floor instead of the 517 KB row; a row with more candidates than the
      * compact block holds, or any other shape, reads the full row; a device failure or a refused candidate
      * block refuses the pass (L190 D3: no full-row fallback). */
@@ -472,29 +479,19 @@ static int dspark_draft_group(pulsar_session *s, spec_redraft_req *const *qs, co
                         built = true;
                     }
                 }
-                /* the full row: the build needs it when nothing was prefiltered, the walk when q is too
-                 * wide for the compact store */
-                const bool need_row = !built || !pulsar_spec_q_compact(qd.n);
-                if (need_row) {
-                    if (!pulsar_spec_redraft_qrows_reserve(q, spec_vocab(s))) {
-                        if (built) pulsar_sample_dist_free(&qd);
-                        ok = false; break;
-                    }
-                    float *row = q->qrows + (size_t)pos * spec_vocab(s);
-                    if (!pulsar_gpu_tensor_read(refined_s, (uint64_t)(j - n_g) * vocab_bytes, row, vocab_bytes)) {
-                        if (built) pulsar_sample_dist_free(&qd);
-                        ok = false; break;
-                    }
-                    if (!built &&
+                /* the full row: the build needs it when nothing was prefiltered */
+                if (!built) {
+                    if (!s->spec_row_scratch)
+                        s->spec_row_scratch = (float *)xmalloc((size_t)spec_vocab(s) * sizeof(float));
+                    float *row = s->spec_row_scratch;
+                    if (!pulsar_gpu_tensor_read(refined_s, (uint64_t)(j - n_g) * vocab_bytes, row, vocab_bytes) ||
                         !pulsar_sample_dist_build(row, spec_vocab(s), q->temperature, q->top_k,
                                                   q->top_p, q->min_p, &s->sample_scratch, &qd)) {
                         ok = false; break;
                     }
                 }
-                if (built) (void)pulsar_spec_q_record(q, pos, &qd);   /* a row-built q stays a row */
-                const int drawn = pulsar_sample_dist_draw(&qd, rngs[j]);
+                const int drawn = pulsar_sample_dist_draw(&qd, pulsar_sample_key(*rngs[j], pos + 1u));
                 q->refined[pos + 1] = (int32_t)drawn;   /* the chain continues SAMPLED */
-                q->q_drawn[pos] = pulsar_sample_dist_prob(&qd, drawn);
                 pulsar_sample_dist_free(&qd);
             }
         }
@@ -589,7 +586,6 @@ static uint32_t dspark_draft(pulsar_session *s, int next_base, bool, float tempe
         }
         keep = rec.keep;
     }
-    free(rec.qrows);
     return keep;
 }
 

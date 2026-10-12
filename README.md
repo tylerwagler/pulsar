@@ -411,13 +411,22 @@ speculative decoding when it detects them at load — no extra file or flag
 needed. `--no-dspark` opts out. The `pulsar-bench` development tool
 intentionally measures the plain-decode baseline.
 
-Acceptance is **exact sampled acceptance at all temperatures**: a draft token
-is accepted with its filtered target probability, and on rejection the engine
-samples from the residual distribution. The speculative path filters logits
-exactly like the plain sampler (temperature scale, top-k, min-p, top-p), so
-the acceptance rule itself introduces no bias — greedy decoding is just the
-point-mass special case of the same walk. Speculative decoding is a speed
-knob, not a quality knob, and it applies to the sampling recipes people
+Acceptance is **the plain sampler's own draw at all temperatures**: every
+token of a request has its own key in the request's seeded stream, a function
+of (seed, token index) only, and a draw at a key is an exponential race (the
+Gumbel-max trick) with one uniform per candidate hashed from (key, token id).
+The verify walk draws the target's token at each row at that key -- exactly
+what plain decode would emit there -- and a draft is accepted iff it IS that
+token; the drafter draws its sampled drafts at the same keys, so a draft is
+the target's token with probability at least (1 - TV) / (1 + TV) of the two
+distributions, whatever order either ranks its candidates in (the
+drafter-invariant coupling). The speculative path filters logits exactly
+like the plain sampler (temperature scale, top-k, min-p, top-p), so the walk
+introduces no bias -- greedy decoding is just the point-mass special case of
+the same walk -- and a seeded request is the same text whichever lane decodes
+which of its tokens (the server's lane price moves a stream between the plain
+and speculative lanes on measured wall-clock prices). Speculative decoding is a
+speed knob, not a quality knob, and it applies to the sampling recipes people
 actually use, not only temperature 0.
 
 One honest numerics caveat: the verify pass evaluates draft rows through the
@@ -1167,7 +1176,7 @@ dropped as measurements come in.
 Shipped and off the roadmap: the measured-allocation release artifact (the
 `v5mx` build, then the v4/0731 line), **temperature-matched draft sampling**
 (drafts are now sampled from the drafter's own distribution at the request's
-sampling parameters and verified with exact `min(1, p/q)` acceptance —
+sampling parameters, at the key the target's draw for that token reads —
 see Speculative decoding), **batched multi-session decode** (Tier-2, since
 v0.3.1 — see Server), and the **CPU inference path retirement** (deleted;
 the engine is CUDA-only end to end).

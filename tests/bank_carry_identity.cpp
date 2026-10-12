@@ -6,11 +6,10 @@
  * Drives three banks exactly as server_sched.cpp's worker_spec_batched_quantum does -- per bank restore ->
  * next_base -> round_begin -> rows -> save; ONE decode_mixed ALL_ROWS forward; per bank restore -> round_end ->
  * save; one batched redraft; per bank restore -> redraft_commit -> save -- with WIDE sampling (temperature TEMP,
- * default 1.0; no top-k, top-p 1, min-p 0), so a drafted q can exceed the compact cap and the verify walk must
- * rebuild it from the draft's full row: the carry path L260 changed.  Prints every bank's accepted tokens per
- * tick and an FNV hash per bank; a bookkeeping change must reproduce the output byte for byte on the same model
- * (run the same source against both trees and diff).  It also counts the pending drafts that took the full-row
- * path at save time -- zero means this run did not exercise that path and proves nothing about it.
+ * default 1.0; no top-k, top-p 1, min-p 0).  Prints every bank's accepted tokens per tick and an FNV hash per
+ * bank; a bookkeeping change must reproduce the output byte for byte on the same model (run the same source
+ * against both trees and diff).  (L288 sdet deleted the drafts' stored q and its full-row carry path, which
+ * this instrument used to count.)
  *
  * MODE `batch` drives the same lane through the phase batch calls (pulsar_session_spec_assemble_batch /
  * round_end_batch / redraft_commit_batch, L260 phase 2); its token lines must equal MODE `bank`'s on the same
@@ -70,18 +69,6 @@ static uint64_t fnv(uint64_t h, int v) {
     return h;
 }
 
-/* pending drafts a bank's saved carry holds as full rows (the non-compact q path).  The compact test is spelled out
- * here, not taken from pulsar_spec_q_compact, because this instrument must also build against the tree from
- * BEFORE that helper existed (the "before" half of the identity check). */
-static uint32_t full_row_pendings(const pulsar_spec_carry_state &sp) {
-    if (!sp.pend_sampled) return 0;
-    const uint32_t n = sp.n_pend < 16u ? sp.n_pend : 16u;
-    uint32_t k = 0;
-    for (uint32_t j = 0; j < n; j++)
-        k += !(sp.pend_qn[j] > 0 && sp.pend_qn[j] <= PULSAR_DSPARK_QDIST_CAP);
-    return k;
-}
-
 int GATE_ENTRY(int argc, char **argv) {
     if (argc < 2) { fprintf(stderr, "usage: %s MODEL [TICKS] [TEMP] [bank|batch]\n", argv[0]); return 2; }
     const int ticks = argc > 2 ? atoi(argv[2]) : 24;
@@ -127,7 +114,7 @@ int GATE_ENTRY(int argc, char **argv) {
     for (int b = 0; b < NB; b++) r[b] = pulsar_spec_round_new();
     uint64_t rngs[NB] = {0x2545F4914F6CDD1Dull, 0x9E3779B97F4A7C15ull, 0xD1B54A32D192ED03ull};
     uint64_t hash[NB] = {1469598103934665603ull, 1469598103934665603ull, 1469598103934665603ull};
-    uint64_t full_rows = 0, drafted = 0;
+    uint64_t drafted = 0;
     double ph_us[3] = {0.0, 0.0, 0.0};   /* assemble, round_end, commit */
     pulsar_spec_step steps[NB];
     int acc_b[NB][17];
@@ -240,15 +227,11 @@ int GATE_ENTRY(int argc, char **argv) {
             timed_save(s, (uint32_t)b);
         }
         ph_us[2] += now_us() - t0;
-        for (int b = 0; b < NB; b++) {
-            drafted += s->bank_carry[b].spec.n_pend;
-            full_rows += full_row_pendings(s->bank_carry[b].spec);
-        }
+        for (int b = 0; b < NB; b++) drafted += s->bank_carry[b].spec.n_pend;
     }
     printf("hash b0 %016llx b1 %016llx b2 %016llx\n", (unsigned long long)hash[0], (unsigned long long)hash[1],
            (unsigned long long)hash[2]);
-    printf("pending drafts %llu, of them full-row (non-compact q) %llu%s\n", (unsigned long long)drafted,
-           (unsigned long long)full_rows, full_rows ? "" : "  -- the full-row path was NOT exercised");
+    printf("pending drafts %llu\n", (unsigned long long)drafted);
     printf("host: %llu saves %.1f us mean, %llu restores %.1f us mean (the timing lines differ run to run; the "
            "token lines above are the identity)\n", (unsigned long long)g_saves,
            g_saves ? g_save_us / (double)g_saves : 0.0, (unsigned long long)g_restores,
