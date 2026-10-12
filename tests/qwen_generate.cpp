@@ -253,12 +253,35 @@ int main(int argc, char **argv) {
             return 1;
         }
         int *out = (int *)malloc((size_t)n_predict * sizeof(int));
-        uint64_t rng = 1;
-        /* QWEN_SPEC_TEMP > 0: sampled speculation (top-k 20, top-p 0.95, the served chat defaults) -- timed the
-         * same way; its tokens are a draw, so it is not compared with the greedy run */
+        /* QWEN_SPEC_TEMP > 0: sampled speculation (top-k 20, top-p 0.95, the served chat defaults) under the stream
+         * seeded QWEN_SPEC_SEED (default 1).  L288 sdet: a token's draw is a function of (seed, index) whichever
+         * lane makes it, so the sampled spec run must BE the plain sampled run under the same seed -- drawn first
+         * here (sample + eval a token at a time), then compared token for token like the greedy run is. */
         const float temp = getenv("QWEN_SPEC_TEMP") ? (float)atof(getenv("QWEN_SPEC_TEMP")) : 0.0f;
         const int top_k = temp > 0.0f ? 20 : 0;
         const float top_p = temp > 0.0f ? 0.95f : 1.0f;
+        const uint64_t seed = getenv("QWEN_SPEC_SEED") ? strtoull(getenv("QWEN_SPEC_SEED"), NULL, 0) : 1u;
+        uint64_t rng = seed;
+        int *plain = NULL;
+        int n_plain = 0;
+        if (temp > 0.0f) {
+            plain = (int *)xmalloc((size_t)generated * sizeof(int));
+            uint64_t prng = seed;
+            while (n_plain < generated) {
+                const int tok = pulsar_session_sample(sess, temp, top_k, top_p, 0.0f, &prng);
+                if (tok < 0) { fprintf(stderr, "qwen-generate: PLAIN sampled: the sampler refused a row\n"); return 1; }
+                plain[n_plain++] = tok;
+                if (pulsar_token_is_stop(e, tok) || n_plain == generated) break;
+                if (pulsar_session_eval(sess, tok, err, sizeof(err)) != 0) {
+                    fprintf(stderr, "qwen-generate: PLAIN sampled eval: %s\n", err);
+                    return 1;
+                }
+            }
+            if (pulsar_session_sync(sess, &t, err, sizeof(err)) != 0) {
+                fprintf(stderr, "qwen-generate: SPEC re-sync after the plain sampled run: %s\n", err);
+                return 1;
+            }
+        }
         const double t0 = now_s();
         int n = 0, rounds = 0;
         while (n < generated) {
@@ -276,8 +299,22 @@ int main(int argc, char **argv) {
         const double dt = now_s() - t0;
         printf("qwen-generate: SPEC %d rounds, %.2f tokens a round\n", rounds, rounds ? (double)n / rounds : 0.0);
         if (temp > 0.0f) {
-            printf("qwen-generate: SPEC sampled at temperature %.2f: %d tokens in %.3f s = %.2f tok/s (%.1f ms/token "
-                   "after the first)\n", (double)temp, n, dt, n > 1 ? (n - 1) / dt : 0.0, n > 1 ? 1e3 * dt / (n - 1) : 0.0);
+            uint64_t h = 1469598103934665603ull;
+            for (int i = 0; i < n; i++) { h ^= (uint64_t)(uint32_t)out[i]; h *= 1099511628211ull; }
+            int same = 0;
+            while (same < n && same < n_plain && out[same] == plain[same]) same++;
+            printf("qwen-generate: SPEC sampled at temperature %.2f seed %llu: %d tokens in %.3f s = %.2f tok/s (%.1f "
+                   "ms/token after the first); fnv %016llx; identical to the plain sampled run for %d of %d\n",
+                   (double)temp, (unsigned long long)seed, n, dt, n > 1 ? (n - 1) / dt : 0.0,
+                   n > 1 ? 1e3 * dt / (n - 1) : 0.0, (unsigned long long)h, same, n_plain);
+            if (same < n_plain || n != n_plain) {
+                printf("qwen-generate: SPEC sampled diverges at token %d: plain %d, spec %d\n", same,
+                       same < n_plain ? plain[same] : -1, same < n ? out[same] : -1);
+                free(plain);
+                free(out);
+                return 3;
+            }
+            free(plain);
         } else {
             int same = 0;
             while (same < n && same < generated && out[same] == ids[n_tok + same]) same++;

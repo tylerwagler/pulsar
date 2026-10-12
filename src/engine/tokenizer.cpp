@@ -1312,21 +1312,31 @@ int sample_argmax(const float *logits, uint32_t n_vocab) {
 
 
 
-static uint64_t sample_rng_next(uint64_t *state) {
-    uint64_t x = *state;
-    if (x == 0) x = 0x9e3779b97f4a7c15ULL;
-    x ^= x >> 12;
-    x ^= x << 25;
-    x ^= x >> 27;
-    *state = x;
-    return x * 0x2545f4914f6cdd1dULL;
+/* The request's sampler stream (L288 sdet): a Weyl state.  The KEY of the token `ahead` places past the stream's
+ * next undrawn one is mix(state + (ahead + 1) * STEP) -- a function of (seed, token index) only, so a lane reads a
+ * token's key without consuming anything, and a token's draw is the same whichever lane makes it, whatever was
+ * drafted around it (session_spec.cpp's walk is why that matters).  Every committed token advances the state one
+ * STEP (pulsar_sample_advance).
+ *
+ * STEP is deliberately NOT SplitMix64's golden-ratio gamma: two seeds that differ by k steps share their streams
+ * shifted by k tokens, and seeds spaced by that gamma are a common idiom -- the spec-sampling oracle seeds its
+ * trajectories gamma * (t + 1), which made trajectory t's token i + 1 draw at trajectory t + 1's token i key and
+ * inflated its chi-squares with correlated samples.  An arbitrary odd constant puts any seed family nobody builds
+ * from it ~2^63 steps apart. */
+#define SAMPLE_STREAM_STEP 0xa0761d6478bd642fULL
+
+static uint64_t sample_mix64(uint64_t z) {
+    z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ULL;
+    z = (z ^ (z >> 27)) * 0x94d049bb133111ebULL;
+    return z ^ (z >> 31);
 }
 
+uint64_t pulsar_sample_key(uint64_t rng, uint32_t ahead) {
+    return sample_mix64(rng + ((uint64_t)ahead + 1u) * SAMPLE_STREAM_STEP);
+}
 
-
-static float sample_rng_f32(uint64_t *state) {
-    const uint64_t x = sample_rng_next(state);
-    return (float)((x >> 40) & 0xffffffu) / 16777216.0f;
+void pulsar_sample_advance(uint64_t *rng, uint32_t n) {
+    *rng += (uint64_t)n * SAMPLE_STREAM_STEP;
 }
 
 
@@ -1379,9 +1389,9 @@ static inline uint32_t sample_desc_key(float f) {
  * MEMBERSHIP, not just order within the nucleus. Concretely, all-equal logits
  * with top_p=0.5 give filtered=64640 of 129280: ascending ties yield
  * ids [0..64639], descending ties yield ids [64640..129279] — disjoint.
- * pulsar_sample_dist_prob returns 0 for an id outside the nucleus, so
- * pulsar_sample_dist_accept would then REJECT a draft the other order ACCEPTS,
- * changing the emitted token stream.
+ * A draw at the same key then races a different candidate set, so the
+ * speculative walk would REJECT a draft the other order ACCEPTS, changing the
+ * emitted token stream.
  *
  * So: the caller fills `a` in ascending-id order and this sort is stable,
  * making ascending-id the canonical tie order. That also matches what the
@@ -1471,11 +1481,6 @@ static void sample_radix_sort_desc(uint64_t *a, uint64_t *tmp, uint32_t n) {
 
 
 
-/* NOTE: the free below also drops `qmap` (and its all-zero invariant with it),
- * because pulsar_sample_scratch_free clears the whole struct. That is safe only
- * because no caller holds live qmap state across a dist_build — the residual
- * draw scatters, reads and re-zeros within one call. Do not cache anything in
- * qmap across calls without decoupling this. */
 static void sample_scratch_reserve(pulsar_sample_scratch *s, uint32_t cap) {
     if (s->cap >= cap) return;
     pulsar_sample_scratch_free(s);
@@ -1493,21 +1498,7 @@ void pulsar_sample_scratch_free(pulsar_sample_scratch *s) {
     free(s->keys);
     free(s->tmp);
     free(s->cand2);
-    free(s->qmap);
     memset(s, 0, sizeof(*s));
-}
-
-
-
-/* Reserve the dense q map, zero-filled. Sized by token id, independent of
- * sample_scratch_reserve's `cap` (which is top_k on the preselect path). Grows
- * by free+calloc: callers restore every entry they set, so a fresh all-zero
- * buffer preserves the invariant. */
-static void sample_qmap_reserve(pulsar_sample_scratch *s, uint32_t cap) {
-    if (s->qmap_cap >= cap) return;
-    free(s->qmap);
-    s->qmap = (float *)xcalloc((size_t)cap, sizeof(*s->qmap));
-    s->qmap_cap = cap;
 }
 
 
@@ -1519,10 +1510,10 @@ static void sample_qmap_reserve(pulsar_sample_scratch *s, uint32_t cap) {
  * top-p, min-p) into the filtered, renormalised nucleus every lane draws
  * from.  The plain per-token samplers (sample_top_p_min_p, behind
  * pulsar_sample_logits / pulsar_session_sample) are build -> draw; the
- * speculative lane builds the same object to query p(token), draw, and draw
- * the residual of a rejected proposal.  One candidate order -- descending
+ * speculative walk builds the same object for every verified row and draws
+ * the target's own token from it.  One candidate order -- descending
  * logit, ascending id on ties, the order pulsar_sample_dist_draw walks -- so
- * a given rng state yields the same token whether or not speculation is
+ * a given key yields the same token whether or not speculation is
  * armed; tests/pulsar_test.cpp --sampler pins plain == draw(build) under
  * fixed seeds.  Before L186 the plain sampler carried its own cutoff loops
  * and, at top_p >= 1, walked candidates in VOCAB order: the same marginals,
@@ -1880,127 +1871,28 @@ float pulsar_sample_dist_prob(const pulsar_sample_dist *d, int token) {
     return 0.0f;
 }
 
-int pulsar_sample_dist_accept(const pulsar_sample_dist *d, int token, uint64_t *rng) {
-    const float pd = pulsar_sample_dist_prob(d, token);
-    if (pd >= 1.0f) return 1;
-    if (pd <= 0.0f) return 0;
-    return sample_rng_f32(rng) < pd;
-}
-
-int pulsar_sample_dist_draw(const pulsar_sample_dist *d, uint64_t *rng) {
-    float r = sample_rng_f32(rng);
+/* The draw at `key`: an exponential race (the Gumbel-max trick) -- every candidate v gets its own uniform u_v, a
+ * hash of (key, v), and the token is the argmin of -ln(u_v) / p_v, exactly a draw from p.  The race is what lets
+ * two distributions share their randomness token by token: the speculative walk draws the target's token from p
+ * and the drafter its draft from q at the same key, and the two coincide with probability at least
+ * (1 - TV) / (1 + TV) whatever order either keeps its candidates in -- the drafter-invariant coupling (Daliri et
+ * al. 2024).  An inverse-CDF draw at one shared uniform matched only where p and q rank their candidates alike
+ * (two near-tied leaders in swapped order shared almost no mass).  Ties go to the earlier candidate in the stored
+ * order. */
+int pulsar_sample_dist_draw(const pulsar_sample_dist *d, uint64_t key) {
+    int best = d->ids[0];
+    double best_s = INFINITY;
     for (uint32_t i = 0; i < d->n; i++) {
-        r -= d->probs[i];
-        if (r <= 0.0f) return d->ids[i];
-    }
-    return d->ids[d->n - 1];
-}
-
-/* =====
- * Sampled-proposal speculative rule (Leviathan/Chen). The pair above
- * (_accept / _draw_excluding) is the DETERMINISTIC-proposal rule: it accepts an
- * argmax draft with probability p(draft), so its acceptance is mathematically
- * capped at p(mode). Drawing the draft from a temperature-matched q instead and
- * accepting w.p. min(1, p/q) removes that cap; both rules emit exactly p.
- *
- * Two bugs in the reference implementation this is modelled on
- * (xangel82/DS4-GB10-GX10-DSpark-CUDA — technique only, no code taken) are
- * fixed here, and the unit gate tests/pulsar_test.cpp --spec-math pins both:
- *   (a) its `u <= ap` accept test can emit a token with p(x) == 0 (u==0 draws
- *       accept an impossible token). We reject p <= 0 outright and use a
- *       strict `<`, matching pulsar_sample_dist_accept's discipline.
- *   (b) its residual fallback can land on a token whose residual mass is zero.
- *       We track the last STRICTLY POSITIVE residual index instead.
- */
-int pulsar_sample_dist_accept_pq(const pulsar_sample_dist *p, int token, float q, uint64_t *rng) {
-    const float pd = pulsar_sample_dist_prob(p, token);
-    /* bug (a): a token outside p's nucleus is impossible under the target and
-     * must never be emitted, whatever u is. */
-    if (pd <= 0.0f) return 0;
-    /* Defensive: the token was drawn from q, so q(token) > 0 by construction.
-     * A non-positive q here would mean the stored q lost sync with the draft;
-     * accepting is the exact-preserving choice (p(token) > 0 is established). */
-    if (q <= 0.0f) return 1;
-    /* min(1, p/q) == 1: certain accept, and — like _accept's `pd >= 1` fast
-     * path — consume no rng. Load-bearing for temperature<=0 byte-identity:
-     * greedy makes p and q both point masses of 1.0 at the argmax, so this
-     * returns 1 having touched neither the rng stream nor its ordering. */
-    if (pd >= q) return 1;
-    /* u < p/q, written without the divide. u in [0,1). */
-    return sample_rng_f32(rng) * q < pd;
-}
-
-int pulsar_sample_dist_draw_residual(const pulsar_sample_dist *p, const pulsar_sample_dist *q,
-                                  pulsar_sample_scratch *scratch, uint64_t *rng) {
-    /* r(x) = max(0, p(x) - q(x)). r(x) > 0 requires p(x) > 0, so the union of
-     * the two supports collapses to p's support: an x in q but not in p has
-     * r = max(0, 0 - q(x)) = 0 and cannot be drawn. Iterating p alone is
-     * therefore complete, and every id considered already has p(x) > 0. */
-    uint32_t maxid = 0;
-    for (uint32_t i = 0; i < q->n; i++) {
-        if (q->ids[i] < 0) continue;
-        if ((uint32_t)q->ids[i] > maxid) maxid = (uint32_t)q->ids[i];
-    }
-    sample_qmap_reserve(scratch, maxid + 1u);
-    for (uint32_t i = 0; i < q->n; i++)
-        if (q->ids[i] >= 0) scratch->qmap[q->ids[i]] = q->probs[i];
-
-    float mass = 0.0f;
-    for (uint32_t i = 0; i < p->n; i++) {
-        const int id = p->ids[i];
-        const float qv = (id >= 0 && (uint32_t)id <= maxid) ? scratch->qmap[id] : 0.0f;
-        const float r = p->probs[i] - qv;
-        if (r > 0.0f) mass += r;
-    }
-
-    int out;
-    if (mass <= 0.0f) {
-        /* Degenerate: q dominates p across p's whole support. Exactness is
-         * already lost in the numerics here; emit SOMETHING p can produce
-         * rather than an impossible token. */
-        out = pulsar_sample_dist_draw(p, rng);
-    } else {
-        float r_acc = sample_rng_f32(rng) * mass;
-        int last = -1;
-        out = -1;
-        for (uint32_t i = 0; i < p->n; i++) {
-            const int id = p->ids[i];
-            const float qv = (id >= 0 && (uint32_t)id <= maxid) ? scratch->qmap[id] : 0.0f;
-            const float r = p->probs[i] - qv;
-            if (r <= 0.0f) continue;
-            /* bug (b): remember the last id with STRICTLY POSITIVE residual, so
-             * the float-rounding overrun below cannot land on a zero-residual
-             * token. Every candidate here has p(x) > 0 by construction. */
-            last = id;
-            r_acc -= r;
-            if (r_acc <= 0.0f) { out = id; break; }
+        if (!(d->probs[i] > 0.0f)) continue;
+        const uint64_t h = sample_mix64(key ^ ((uint64_t)(uint32_t)d->ids[i] * 0xd1b54a32d192ed03ULL));
+        const double u = ((double)(h >> 11) + 0.5) * (1.0 / 9007199254740992.0);   /* (0, 1): 53 bits, never 0 */
+        const double sc = -log(u) / (double)d->probs[i];
+        if (sc < best_s) {
+            best_s = sc;
+            best = d->ids[i];
         }
-        if (out < 0) out = last;   /* overrun: mass > 0 guarantees last >= 0 */
     }
-
-    /* restore the all-zero invariant (only q's own ids were touched) */
-    for (uint32_t i = 0; i < q->n; i++)
-        if (q->ids[i] >= 0) scratch->qmap[q->ids[i]] = 0.0f;
-    return out;
-}
-
-int pulsar_sample_dist_draw_excluding(const pulsar_sample_dist *d, int excluded, uint64_t *rng) {
-    /* residual of a rejected deterministic proposal: p with `excluded`
-     * removed, renormalized. If the nucleus is exactly {excluded}, there is
-     * no residual mass — the caller treats that as accept-forced. */
-    float mass = 0.0f;
-    for (uint32_t i = 0; i < d->n; i++)
-        if (d->ids[i] != excluded) mass += d->probs[i];
-    if (mass <= 0.0f) return excluded;
-    float r = sample_rng_f32(rng) * mass;
-    int last = excluded;
-    for (uint32_t i = 0; i < d->n; i++) {
-        if (d->ids[i] == excluded) continue;
-        last = d->ids[i];
-        r -= d->probs[i];
-        if (r <= 0.0f) return d->ids[i];
-    }
-    return last;
+    return best;
 }
 
 
@@ -2012,7 +1904,7 @@ int sample_top_p_min_p(
         int          top_k,
         float        top_p,
         float        min_p,
-        uint64_t    *rng,
+        uint64_t     key,
         pulsar_sample_scratch *scratch) {
     /* build -> draw, nothing else: the candidate set, its order and every
      * clamp live in pulsar_sample_dist_build (L186).  A caller with no
@@ -2027,11 +1919,9 @@ int sample_top_p_min_p(
     pulsar_sample_dist d;
     if (pulsar_sample_dist_build(logits, n_vocab, temperature, top_k, top_p, min_p,
                                  scratch, &d)) {
-        /* Greedy is a point mass and draws nothing: no rng word, the same
-         * decision the speculative lane's greedy walk makes, so the two
-         * lanes' rng streams stay in step across a greedy stretch (a
-         * tool-call payload forcing temperature 0 mid-request). */
-        tok = temperature <= 0.0f ? d.ids[0] : pulsar_sample_dist_draw(&d, rng);
+        /* Greedy is a point mass: the key is not read (the token still holds
+         * its index in the stream; the caller advances past it like any other). */
+        tok = temperature <= 0.0f ? d.ids[0] : pulsar_sample_dist_draw(&d, key);
         pulsar_sample_dist_free(&d);
     }
     if (scratch == &local) pulsar_sample_scratch_free(&local);

@@ -25,11 +25,6 @@ typedef struct {
     bool     have_conf;
     int32_t  refined[17];
     float    conf[16];
-    float    q_drawn[16];                                  ///< q(pend[i]) per position (sampled)
-    uint32_t qn[16];                                       ///< stored proposal dist size (0 = row fallback)
-    int32_t  qids[16][PULSAR_DSPARK_QDIST_CAP];
-    float    qprobs[16][PULSAR_DSPARK_QDIST_CAP];
-    float   *qrows;                                        ///< [16][logits width] fallback rows, lazily owned
 } spec_redraft_req;
 
 typedef struct pulsar_spec_round {
@@ -37,10 +32,9 @@ typedef struct pulsar_spec_round {
     uint32_t K;             ///< draft depth this round: tokens the drafter proposed
     uint32_t n_batch;       ///< rows the verify forward evaluates (K + the base row)
     int saved_len;          ///< checkpoint length before the round, to trim back to on rejection
-    bool pend_sampled;      ///< the pendings below were sampled rather than left from a prior round
     int32_t pend[16];       ///< the drafted token ids, in draft order
     float pend_conf[16];    ///< confidence head's score per draft position
-    int row_tops[16];       ///< the target's argmax per verify row; the accept comparison
+    int row_tops[16];       ///< the target's argmax per verify row; the greedy walk's comparison
     /** The target's state snapshot taken before the verify (pulsar_spec_target_ops snapshot / restore /
      * release own its contents; malloc'd, freed with the round), so a partial accept can roll back. */
     void *snap;
@@ -82,10 +76,6 @@ static inline uint32_t pulsar_spec_conf_keep(const float *conf, uint32_t n, floa
  *  params -- what a drafter's draft / draft_batch fills (the rest of the record is the caller's). */
 void pulsar_spec_draft_req_init(pulsar_session *s, spec_redraft_req *q, int next_base, float temperature, int top_k,
                                 float top_p, float min_p);
-/** Keep sampled draft `pos`'s proposal q for the walk's residual: its support when it fits the compact
- *  store (true), else false and q->qn[pos] = 0 -- the caller keeps q's full row at q->qrows + pos * vocab,
- *  from which the walk rebuilds q under the record's params. */
-bool pulsar_spec_q_record(spec_redraft_req *q, uint32_t pos, const pulsar_sample_dist *qd);
 /** The core's reader over `rows->block`. */
 bool pulsar_spec_row_read_block(void *ud, uint32_t row, float *out);
 /** Stamp a drafter's result record into the installed bank's pendings (the one way pendings are written). */
@@ -95,13 +85,10 @@ void pulsar_spec_redraft_stamp(pulsar_session *s, spec_redraft_req *q);
 const pulsar_spec_carry_state *pulsar_spec_bank_shadow(pulsar_session *s, uint32_t bank);
 /** The adaptive draft controller's CURRENT depth for `bank` (0 = no drafter or nothing valid). */
 int pulsar_spec_bank_depth(pulsar_session *s, uint32_t bank);
-/** A redraft record's lazily-owned full q rows ([16][vocab]); false = out of memory. */
-bool pulsar_spec_redraft_qrows_reserve(spec_redraft_req *q, uint32_t vocab);
-/** Save / restore the session's speculative shadow (s->spec and the q rows its sampled pendings read)
- *  into / from a bank carry's copy -- every family's bank save and restore call these. */
-void pulsar_spec_shadow_save(pulsar_session *s, pulsar_spec_carry_state *dst, float **dst_rows, uint32_t *dst_cap);
-void pulsar_spec_shadow_restore(pulsar_session *s, const pulsar_spec_carry_state *src, const float *src_rows,
-                                uint32_t src_cap);
+/** Save / restore the session's speculative shadow (s->spec) into / from a bank carry's copy -- every family's
+ *  bank save and restore call these. */
+void pulsar_spec_shadow_save(pulsar_session *s, pulsar_spec_carry_state *dst);
+void pulsar_spec_shadow_restore(pulsar_session *s, const pulsar_spec_carry_state *src);
 static inline const pulsar_spec_target_ops *spec_target(const pulsar_session *s) { return s->engine->family->spec; }
 static inline const pulsar_drafter_ops *spec_drafter(const pulsar_session *s) { return s->engine->drafter_ops; }
 /** The bank save / restore the batched lane runs per step: the family's bank ops. */

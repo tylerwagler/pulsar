@@ -112,7 +112,9 @@ typedef struct pulsar_drafter_ops {
                           const int32_t *next, uint32_t n);
     /** Draft the installed bank's next chain after `next_base`: up to the session's depth, cut by the stop
      *  rule, each draft with a confidence (or -1), sampled drafts (temperature > 0) drawn from the
-     *  request-filtered proposal q with q(id) and q's support recorded -- stamped into the bank's pendings.
+     *  request-filtered proposal q at the draft's own key -- draft j at pulsar_sample_key(*rng, j), the key the
+     *  target's draw for that token reads; `rng` is read, never advanced (L288 sdet) -- stamped into the bank's
+     *  pendings.
      *  Returns the pending count kept.  `features_ready` = the drafter's conditioning features are those of the last
      *  committed row. */
     uint32_t (*draft)(struct pulsar_session *s, int next_base, bool features_ready, float temperature,

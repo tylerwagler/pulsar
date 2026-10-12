@@ -188,7 +188,7 @@ static bool mtp_draft_chains(pulsar_session *s, const uint32_t *banks, uint64_t 
     pulsar_qwen_state *st = s->qwen;
     const pulsar_qwen_shape *sh = &g_qwen_shape;
     const pulsar_qwen_weights *w = e->qwen_weights;
-    const uint32_t il_mtp = e->plan.n_layer, V = sh->n_vocab, nc = sh->ngram_size - 1u;
+    const uint32_t il_mtp = e->plan.n_layer, nc = sh->ngram_size - 1u;
     const uint64_t hc = pulsar_qwen_hc_dim(sh) * PULSAR_QWEN_STREAM_ELT_SIZE;
     const uint64_t itb = pulsar_qwen_index_tail_bytes(sh);
     const float tau = pulsar_spec_tau(e);
@@ -246,7 +246,6 @@ static bool mtp_draft_chains(pulsar_session *s, const uint32_t *banks, uint64_t 
         const qwen_mtp_pick &pk = pick[c[i].row];
         const float *row = L ? L + (size_t)c[i].row * w->n_draft : NULL;
         q->conf[j - 1] = pk.conf;
-        q->qn[j - 1] = 0;
         q->keep = j;
         if (pulsar_spec_conf_stops(pk.conf, tau) || j == c[i].K) c[i].live = false;   /* the chain's last */
         if (!c[i].sampled) {
@@ -256,20 +255,12 @@ static bool mtp_draft_chains(pulsar_session *s, const uint32_t *banks, uint64_t 
         }
         pulsar_sample_dist qd{};
         if (!qwen_mtp_dist(s, row, q->temperature, q->top_k, q->top_p, q->min_p, &qd)) return false;
-        const int d = pulsar_sample_dist_draw(&qd, rngs[i]);
-        if (d < 0) { pulsar_sample_dist_free(&qd); return false; }
+        /* draft j sits j places past the carry: the key the target's draw for that token reads */
+        const int d = pulsar_sample_dist_draw(&qd, pulsar_sample_key(*rngs[i], j));
+        pulsar_sample_dist_free(&qd);
+        if (d < 0) return false;
         q->refined[j] = (int32_t)d;
         pulsar_qwen_s4_ple_prefetch(w, c[i].pctx, &q->refined[j], 1);
-        q->q_drawn[j - 1] = pulsar_sample_dist_prob(&qd, d);
-        if (!pulsar_spec_q_record(q, j - 1, &qd)) {
-            /* too wide to store: the walk rebuilds q from a row under the stored params -- the MTP
-             * logits scattered to the vocabulary, every other id -inf (the same support) */
-            if (!pulsar_spec_redraft_qrows_reserve(q, V)) { pulsar_sample_dist_free(&qd); return false; }
-            float *full = q->qrows + (size_t)(j - 1) * V;
-            for (uint32_t t = 0; t < V; t++) full[t] = -INFINITY;
-            for (uint32_t t = 0; t < w->n_draft; t++) full[w->draft_ids[t]] = row[t];
-        }
-        pulsar_sample_dist_free(&qd);
         return true;
     };
     int32_t tok[PULSAR_QWEN_HEAD_ROWS_MAX], pos[PULSAR_QWEN_HEAD_ROWS_MAX], bank[PULSAR_QWEN_HEAD_ROWS_MAX];
@@ -331,7 +322,6 @@ static uint32_t mtp_draft(pulsar_session *s, int next_base, bool, float temperat
         fprintf(stderr, "pulsar: %s (the round takes a plain step next)\n", err);
         pulsar_spec_drop_pendings(&s->spec);
     }
-    free(rec.qrows);
     return keep;
 }
 

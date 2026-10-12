@@ -2057,15 +2057,6 @@ typedef struct {
      * all-equal-logits case keeps every candidate (m == cap). */
     sample_candidate *cand2;
     uint32_t cap;  ///< elements reserved in each
-    /** Dense token->q(prob) map for pulsar_sample_dist_draw_residual, which needs
-     * q(x) for each x in p's support: the linear pulsar_sample_dist_prob scan
-     * would make that O(|p|*|q|) — 1.6e10 at full vocab. Sized by token id
-     * (NOT by `cap`, which is top_k on the preselect path while ids still run
-     * to n_vocab), and INVARIANT: all-zero on entry and on exit. The residual
-     * draw scatters q in, reads, then re-zeros only q's own ids, so the clear
-     * is O(|q|) rather than a full-vocab memset. */
-    float *qmap;
-    uint32_t qmap_cap;  ///< entries allocated in qmap; sized by n_vocab, not by `cap`
 } pulsar_sample_scratch;
 
 void pulsar_sample_scratch_free(pulsar_sample_scratch *s);
@@ -2081,9 +2072,9 @@ void pulsar_sample_scratch_free(pulsar_sample_scratch *s);
  * conversation's speculative state.  Add new spec/DSpark scalars HERE and
  * both paths pick them up for free.
  *
- * Deliberately EXCLUDED: heap-backed state (checkpoint, logits,
- * pend_qrows) — those need deep copies with per-side ownership, so
- * they stay as explicit members of each struct. */
+ * Deliberately EXCLUDED: heap-backed state (checkpoint, logits) -- those
+ * need deep copies with per-side ownership, so they stay as explicit members
+ * of each struct. */
 /** L149: device min-p prefilter (pulsar_gpu_minp_prefilter_rows) output row:
  * i32 [0] candidate count, [1] max id, [2] max logit bits, then
  * PULSAR_DSPARK_PREFILTER_CAP ids and PULSAR_DSPARK_PREFILTER_CAP f32 logits
@@ -2091,13 +2082,6 @@ void pulsar_sample_scratch_free(pulsar_sample_scratch *s);
  * reads the full row instead. Rows are stored back-to-back. */
 #define PULSAR_DSPARK_PREFILTER_CAP 2048u
 #define PULSAR_DSPARK_PREFILTER_ROW_I32 (3u + 2u * PULSAR_DSPARK_PREFILTER_CAP)
-/** L149: widest proposal distribution stored per pending draft position. */
-#define PULSAR_DSPARK_QDIST_CAP 256u
-/** L149/L260: a pending draft's proposal q is held in the compact form (qids/qprobs, qn entries) exactly when
- *  this holds; otherwise the verify walk rebuilds q from the draft's full row in pend_qrows.  The one
- *  test for both the walk and the bank carry's row copy. */
-static inline bool pulsar_spec_q_compact(uint32_t qn) { return qn > 0 && qn <= PULSAR_DSPARK_QDIST_CAP; }
-
 typedef struct pulsar_spec_carry_state {
     /** Fused DSpark loop (P2): drafts produced LAST step from the last-accepted
      * position's hidden, pending verification in THIS step's single batched
@@ -2115,12 +2099,6 @@ typedef struct pulsar_spec_carry_state {
     bool dspark_chain_conf;      ///< the confidence head ran for the in-flight chain
     uint32_t dspark_chain_n;     ///< drafted depth of the in-flight chain
     uint32_t n_pend;   ///< drafts proposed and awaiting verification
-    /** L260: draft positions whose proposal q may still be read from the session's pend_qrows (the
-     *  non-compact ones, pulsar_spec_q_compact).  Set where the rows are written (the drafting loop, redraft
-     *  commit); NOT reset by pulsar_spec_drop_pendings, because round_begin drops the pendings before the
-     *  in-flight round's walk reads their rows; cleared once that walk is done.  The bank carry copies these
-     *  rows and no others. */
-    uint32_t qrows_n;
     /** The base token the pending drafts continue from (predicted greedy next).
      * If the caller's next first_token differs (non-greedy interruption, tool
      * injection), the pending drafts are stale and dropped. */
@@ -2175,44 +2153,18 @@ typedef struct pulsar_spec_carry_state {
     bool spec_depth_down_forgiven;  ///< L107 v2: one down-signal was vetoed on a still-confident tail; a second consecutive one backs off regardless
     uint8_t spec_depth_rounds_since_up;  ///< L107 v5: rounds since the last UP, saturating at 255; a down within 2 of an up is a FAILED EXCURSION and triggers the cooldown; a down after a sustained ride carries no penalty (v4's blanket cooldown cost ~0.9 t/s on BOTH server workloads by suppressing profitable climbs).
     uint8_t spec_depth_climb_cooldown;  ///< L107 v4: rounds remaining in which UP is suppressed after a failed excursion. Raw-completion prose oscillated 2->3->4-> crash forever (29 transitions/192 tok, -14%): each failed excursion burns a deep round, and tail conf does NOT separate good climbs from bad (a 0.93 tail climbed into commit=0). Cooldown makes excursions rare after they fail; structured's downs are rare (and v3-forgiven rounds are not downs), so its climb is untouched.
-    /** --- Temperature-matched draft sampling (spec-decode Item 1) ---
+    /** --- Temperature-matched draft sampling (spec-decode Item 1; L288 sdet) ---
      * At temperature > 0 the drafts above are DRAWN from a temperature-matched
      * proposal q (the drafter's refined logits filtered at the request's
-     * params) rather than taken as the drafter's argmax. Verification then uses
-     * the standard sampled-proposal rule — accept w.p. min(1, p/q), else draw
-     * the residual (p-q)+ — which is not capped at p(mode) the way the
-     * deterministic-proposal rule is.
+     * params) at each draft's own key in the request's stream -- the key the
+     * target's draw for that token reads, so a draft is the target's token
+     * with probability at least (1 - TV) / (1 + TV) of q and p.
+     * The verify walk emits the target's draw and needs nothing of q.
      *
-     * `pend_sampled` records which rule the pendings were PROPOSED
-     * under, so verify applies the matching rule: false => argmax proposal =>
-     * the deterministic rule (accept w.p. p(x), residual p-excluding). The two
-     * rules are not interchangeable; applying p/q to an argmax proposal (or
-     * vice versa) silently breaks exactness. */
-    bool pend_sampled;
-    /** q(pend[i]) at draft time — the accept denominator. */
-    float pend_q[16];
-    /** L149: the proposal distribution q_i exactly as BUILT at draft time,
-     * kept for the residual draw. pend_qn[i] == 0 means "not
-     * stored": rebuild it from the full row in pend_qrows under the
-     * pending params, as before. When stored it IS that rebuild (same inputs,
-     * same params, deterministic build), so the walk skips both the 517 KB
-     * row read and the rebuild. Carried by value with the rest of the shadow. */
-    uint32_t pend_qn[16];
-    int32_t  pend_qids[16][PULSAR_DSPARK_QDIST_CAP];
-    float    pend_qprobs[16][PULSAR_DSPARK_QDIST_CAP];
-    /** The sampling params the pendings were sampled under. TWO consumers, and
-     * they are different in kind:
-     *   1) EXACTNESS (load-bearing): the verify walk rebuilds the rejecting
-     *      position's q from pend_qrows using THESE params, so the
-     *      stored accept denominator pend_q[i] and the residual's q
-     *      name the same proposal q_X by construction. This is why the rebuild
-     *      must never be fed the live request params.
-     *   2) THROUGHPUT (the guard in the verify path): drafts sampled under X and
-     *      verified under Y are still exact — the rule is proposal-agnostic and
-     *      returns exactly p_Y for any q — but q_X is a badly-matched proposal
-     *      for p_Y, so acceptance craters. The guard drops them to avoid wasting
-     *      verify rows, not to avoid bias.
-     * Mirrors the spec_carry_* params guard. Greedy never needed this. */
+     * The sampling params the pendings were drawn under: drafts drawn under X
+     * and verified under Y are still exact (the walk emits the target's draw
+     * under Y), but they rarely match it, so the verify guard drops them
+     * rather than spend rows on them.  Mirrors the spec_carry_* params guard. */
     float pend_temp;   ///< temperature the pending drafts were proposed under
     float pend_top_p;  ///< top-p the drafts were proposed under
     float pend_min_p;  ///< min-p the drafts were proposed under
@@ -2404,8 +2356,6 @@ typedef struct pulsar_bank_carry {
     /** heap-backed (owned): */
     token_vec checkpoint;  ///< deep copy of s->checkpoint
     float    *logits;  ///< PULSAR_N_VOCAB floats, owned
-    float    *pend_qrows;  ///< pend_qrows_cap floats, owned
-    uint32_t  pend_qrows_cap;  ///< floats allocated in pend_qrows
     /** scalar mirrors: */
     bool      checkpoint_valid;
     bool      logits_stale;     ///< mirror of pulsar_session::logits_stale
@@ -2597,27 +2547,6 @@ struct pulsar_session {
     uint64_t resident_bytes;
     /** Live speculative/DSpark shadow; see pulsar_spec_carry_state. */
     pulsar_spec_carry_state spec;
-    /** The refined-logits row each pending draft was sampled from, 16 rows of
-     * PULSAR_N_VOCAB floats, allocated lazily on first sampled draft. The residual
-     * needs the FULL q, but only for the single rejected position — unknown
-     * until verify — so every position's row is persisted and the one that
-     * rejects rebuilds its q via pulsar_sample_dist_build.
-     *
-     * Rebuilding from these PERSISTED logits is bit-identical to the draft-time
-     * q: dist_build is a pure function of (logits, params), and the rebuild is
-     * handed BOTH persisted halves — this row and pend_temp/top_k/
-     * top_p/min_p below. Feeding it either half from live state is the trap: the
-     * live drafter state has advanced, and the live REQUEST params may differ
-     * from the draft-time ones, which would leave the stored accept denominator
-     * pend_q[i] (computed under the draft-time params) and the
-     * residual's q describing two different proposals inside one rule.
-     *
-     * Device-first note (Item 2): storing the logits ROW + params rather than a
-     * materialized nucleus is deliberate — the GPU accept kernel wants exactly
-     * this, so it swaps this host pool for a resident device buffer instead of
-     * reshaping the format. */
-    float *pend_qrows;
-    uint32_t pend_qrows_cap;  ///< floats reserved
     /** Tier-2 PATH A: per-bank host carry, one entry per pool bank.  Lazily
      * allocated on the first pulsar_session_bank_state_save; NULL / bank_carry_n==0
      * when the pool is disabled (single-session use never touches it). */
@@ -4283,25 +4212,19 @@ int pulsar_sample_dist_build_prefiltered(const int32_t *ids, const float *vals, 
                                          pulsar_sample_scratch *scratch, pulsar_sample_dist *out);
 void pulsar_sample_dist_free(pulsar_sample_dist *d);
 float pulsar_sample_dist_prob(const pulsar_sample_dist *d, int token);
-int pulsar_sample_dist_accept(const pulsar_sample_dist *d, int token, uint64_t *rng);
-int pulsar_sample_dist_draw(const pulsar_sample_dist *d, uint64_t *rng);
-int pulsar_sample_dist_draw_excluding(const pulsar_sample_dist *d, int excluded, uint64_t *rng);
-/** Sampled-proposal speculative rule (the deterministic-proposal pair above is
- * pulsar_sample_dist_accept / _draw_excluding). `token` was drawn from a proposal
- * q; `q` is q(token). Accepts with probability min(1, p(token)/q(token)).
- * Never accepts a token with p(token) <= 0. Consumes no rng when the outcome
- * is certain (p >= q), matching pulsar_sample_dist_accept's p >= 1 fast path —
- * which is what keeps the temperature<=0 path byte-identical. */
-int pulsar_sample_dist_accept_pq(const pulsar_sample_dist *p, int token, float q, uint64_t *rng);
-/** The matching residual: draw from (p-q)+ normalized. Every token it can
- * return has p(token) > 0 AND strictly positive residual mass; if the total
- * residual mass is <= 0 it falls back to a plain draw from p. `scratch` is
- * working memory (see pulsar_sample_scratch::qmap); it must not alias p or q. */
-int pulsar_sample_dist_draw_residual(const pulsar_sample_dist *p, const pulsar_sample_dist *q,
-                                  pulsar_sample_scratch *scratch, uint64_t *rng);
+/** The token drawn at `key`: an exponential race over the candidates, each with its own uniform hashed from
+ *  (key, id) -- exactly a draw from the dist, and the same token for two dists that agree (tokenizer.cpp). */
+int pulsar_sample_dist_draw(const pulsar_sample_dist *d, uint64_t key);
+/** L288 sdet: the key of the token `ahead` places past the stream's next undrawn one -- a function of the request's
+ *  seed and the token's index only, read without consuming anything.  Every lane draws a token from its own row at
+ *  this key, the plain samplers and the speculative walk alike, so a seeded stream's tokens do not depend on the
+ *  lane or the drafts that produced them. */
+uint64_t pulsar_sample_key(uint64_t rng, uint32_t ahead);
+/** Step the stream past `n` committed tokens. */
+void pulsar_sample_advance(uint64_t *rng, uint32_t n);
 
-/** The plain per-token sampler: pulsar_sample_dist_build -> pulsar_sample_dist_draw,
- * nothing else (greedy takes the point mass without an rng word).  `scratch`
+/** The plain per-token sampler: pulsar_sample_dist_build -> pulsar_sample_dist_draw at `key`,
+ * nothing else (greedy takes the point mass and does not read the key).  `scratch`
  * is optional reusable working memory; pass the calling session's
  * sample_scratch, or NULL for a call-local one (pulsar_sample_logits, which
  * has no session) -- the same path, ~5 MB of malloc/free per call.
@@ -4313,7 +4236,7 @@ int sample_top_p_min_p(
         int          top_k,
         float        top_p,
         float        min_p,
-        uint64_t    *rng,
+        uint64_t     key,
         pulsar_sample_scratch *scratch);
 void pulsar_linux_graph_backend_set_oom_score(pulsar_backend backend);
 void pulsar_release_instance_lock(void);
