@@ -734,7 +734,9 @@ static void section_moe_at(const int T, const bool split = false, const int k2_e
     const auto O = down(out, (size_t)T * H);
     const auto NF = down(nf, 1);
     /* task #44: the EXL3 shared expert riding the routed launches (exl3_moe.cuh) == the routed launch then the
-     * shared expert's own launches, byte for byte -- the same arithmetic, fewer launches */
+     * shared expert's own launches, byte for byte -- the same arithmetic, fewer launches.  L288 exl3-dense: it is
+     * forked onto its own stream first and joined at the routed sum; a riding shared expert that was not forked is
+     * refused */
     {
         pulsar_qwen_moe_parts p;
         int r = pulsar_qwen_moe_carve(T, ws, wsb, &p);
@@ -745,6 +747,10 @@ static void section_moe_at(const int T, const bool split = false, const int k2_e
         sh.ws = p.lin; sh.ws_bytes = p.lin_bytes;
         pulsar_rows_moe wr2 = w;
         wr2.shared = &sh;
+        if (!r)
+            CHECK(pulsar_rows_moe_routed_launch(&wr2, p.sel, p.wts, dx, T, out, p.routed, p.routed_bytes, nf, 0x7351u, 0) != 0,
+                  "T = %d: a riding shared expert that was not forked is refused", T);
+        if (!r) r = pulsar_rows_moe_shared_fork(&sh, dx, T, 0);
         if (!r) r = pulsar_rows_moe_routed_launch(&wr2, p.sel, p.wts, dx, T, out, p.routed, p.routed_bytes, nf, 0x7351u, 0);
         const auto OR = down(out, (size_t)T * H);
         size_t diff = 0;

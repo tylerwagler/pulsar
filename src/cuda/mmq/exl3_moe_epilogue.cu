@@ -15,18 +15,6 @@
 
 namespace {
 
-/* the riding shared expert's SwiGLU: warps of 128 elements after the routed fold's */
-static int64_t shared_swiglu_tasks(const exl3_moe_shared_swiglu *sh) {
-    return sh ? ((int64_t)sh->rows * sh->mid + 127) / 128 : 0;
-}
-static bool shared_swiglu_ok(const exl3_moe_shared_swiglu *sh) {
-    if (sh && (!sh->g || !sh->u || !sh->h || sh->rows <= 0 || sh->mid <= 0)) {
-        fprintf(stderr, "ds4_exl3_moe_fold: a shared-expert SwiGLU with a null plane or no rows -- refusing\n");
-        return false;
-    }
-    return true;
-}
-
 /* One warp per (pair, 128-block of mid); lane l holds mid columns 4l..4l+3
  * of the block.  The four values per lane make one 32-element MX group an
  * EIGHT-lane group, as in moe_mmq_swiglu_fold_v4_kernel. */
@@ -45,21 +33,10 @@ exl3_moe_fold_kernel(const float *__restrict__ gate_z,
                      unsigned char *__restrict__ mid_sf,
                      __nv_bfloat16 *__restrict__ mid_bf16,   /* the format the down arm reads */
                      int mid_kbp,
-                     const exl3_moe_shared_swiglu sh,
                      int z_splits, int64_t z_split_stride) {
     const int64_t task = ((int64_t)blockIdx.x * (blockDim.x >> 5)) + (threadIdx.x >> 5);
     const int n_blk = mid_dim >> 7;
-    const int64_t n_tasks = pairs * n_blk;
-    if (task >= n_tasks) {
-        /* a riding shared expert's SwiGLU, emitted bf16 for its down (the producer rule): 128 elements of the
-         * [rows][mid] planes per warp, the plain silu(g) * u of the family's shared expert */
-        const int64_t i0 = (task - n_tasks) * 128 + (int64_t)(threadIdx.x & 31) * 4;
-        const int64_t n = (int64_t)sh.rows * sh.mid;
-#pragma unroll
-        for (int j = 0; j < 4; ++j)
-            if (i0 + j < n) sh.h[i0 + j] = __float2bfloat16(pulsar_swiglu_elem(sh.g[i0 + j], sh.u[i0 + j], 1.0f, 0.0f));
-        return;
-    }
+    if (task >= pairs * n_blk) return;
     const int64_t pair = task / n_blk;
     const int blk = (int)(task - pair * n_blk);
     const int lane = threadIdx.x & 31;
@@ -195,20 +172,19 @@ int ds4_exl3_moe_fold_launch(const float *gate_z, const float *up_z, const int32
                              const float *weights, const void *gate_table, const void *up_table,
                              const void *down_table, int in_dim, int mid_dim, int64_t pairs,
                              float clamp, void *mid_q, void *mid_sf, int mid_kbp, cudaStream_t stream, void *mid_bf16,
-                             const exl3_moe_shared_swiglu *shared, int z_splits, int64_t z_split_stride) {
-    if (!shared_swiglu_ok(shared)) return -1;
+                             int z_splits, int64_t z_split_stride) {
     if (!gate_z || !up_z || !selected || !weights || !gate_table || !up_table || !down_table ||
         (!mid_q || !mid_sf) && !mid_bf16 || pairs <= 0 || in_dim <= 0 || mid_dim <= 0 || mid_dim % EXL3_HAD_BLOCK ||
         z_splits < 1) {
         fprintf(stderr, "ds4_exl3_moe_fold_launch: null pointer or bad shape (mid_dim %% 128)\n");
         return -1;
     }
-    const int64_t tasks = pairs * (mid_dim >> 7) + shared_swiglu_tasks(shared);
+    const int64_t tasks = pairs * (mid_dim >> 7);
     const unsigned blocks = (unsigned)((tasks + 7) / 8);
     exl3_moe_fold_kernel<<<blocks, 256, 0, stream>>>(
         gate_z, up_z, mid_dim, selected, weights, gate_table, up_table, in_dim, down_table, in_dim, mid_dim, pairs,
-        clamp, (__nv_fp8_e4m3 *)mid_q, (unsigned char *)mid_sf, (__nv_bfloat16 *)mid_bf16, mid_kbp,
-        shared ? *shared : exl3_moe_shared_swiglu{}, z_splits, z_split_stride);
+        clamp, (__nv_fp8_e4m3 *)mid_q, (unsigned char *)mid_sf, (__nv_bfloat16 *)mid_bf16, mid_kbp, z_splits,
+        z_split_stride);
     const cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
         fprintf(stderr, "ds4_exl3_moe_fold_launch: launch failed: %s\n", cudaGetErrorString(err));
@@ -220,9 +196,7 @@ int ds4_exl3_moe_fold_launch(const float *gate_z, const float *up_z, const int32
 int ds4_exl3_moe_fold_fused_launch(const float *gate_up_z, const int32_t *selected, const float *weights,
                                    const void *gate_up_table, const void *down_table, int in_dim, int mid_dim,
                                    int64_t pairs, float clamp, void *mid_q, void *mid_sf, int mid_kbp,
-                                   cudaStream_t stream, void *mid_bf16, const exl3_moe_shared_swiglu *shared,
-                                   int z_splits, int64_t z_split_stride) {
-    if (!shared_swiglu_ok(shared)) return -1;
+                                   cudaStream_t stream, void *mid_bf16, int z_splits, int64_t z_split_stride) {
     if (!gate_up_z || !selected || !weights || !gate_up_table || !down_table || (!mid_q || !mid_sf) && !mid_bf16 || pairs <= 0 ||
         in_dim <= 0 || mid_dim <= 0 || mid_dim % EXL3_HAD_BLOCK || z_splits < 1) {
         fprintf(stderr, "ds4_exl3_moe_fold_fused_launch: null pointer or bad shape (mid_dim %% 128)\n");
@@ -230,12 +204,12 @@ int ds4_exl3_moe_fold_fused_launch(const float *gate_up_z, const int32_t *select
     }
     /* gate = rows 0..mid-1 of the fused output, up = rows mid..2 mid-1; the scales
      * plane is suh [in_dim] | svh [2 mid], so up's svh starts at in_dim + mid */
-    const int64_t tasks = pairs * (mid_dim >> 7) + shared_swiglu_tasks(shared);
+    const int64_t tasks = pairs * (mid_dim >> 7);
     const unsigned blocks = (unsigned)((tasks + 7) / 8);
     exl3_moe_fold_kernel<<<blocks, 256, 0, stream>>>(
         gate_up_z, gate_up_z + mid_dim, 2 * mid_dim, selected, weights, gate_up_table, gate_up_table, in_dim + mid_dim,
         down_table, in_dim, mid_dim, pairs, clamp, (__nv_fp8_e4m3 *)mid_q, (unsigned char *)mid_sf, (__nv_bfloat16 *)mid_bf16, mid_kbp,
-        shared ? *shared : exl3_moe_shared_swiglu{}, z_splits, z_split_stride);
+        z_splits, z_split_stride);
     const cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
         fprintf(stderr, "ds4_exl3_moe_fold_fused_launch: launch failed: %s\n", cudaGetErrorString(err));

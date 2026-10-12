@@ -288,6 +288,69 @@ int main(void) {
             release(d);
         }
     }
+    /* 6. L288 exl3-dense: the multi launch.  Up to four projections of one input -- mixed widths and rates, the
+     * shapes the GDN / QSA blocks and the shared expert give it -- each output bit for bit its single launch's,
+     * at every decode width, from one prep launch and one GEMV launch per rate; prompt chunks too. */
+    {
+        struct set { int K, n; int N[4], k2[4]; const char *what; };
+        const set sets[] = {
+            {2560, 4, {12288, 512, 512, 640}, {10, 10, 10, 10}, "Qwen QSA q / k / v / index (one rate)"},
+            {2560, 2, {10240, 6144, 0, 0}, {10, 10, 0, 0}, "Qwen GDN in_proj_qkv / _z"},
+            {2560, 2, {640, 640, 0, 0}, {10, 8, 0, 0}, "a shared gate / up at two rates (two GEMVs)"},
+            {2560, 3, {1280, 512, 640, 0}, {8, 10, 8, 0}, "three projections, rates 8 / 10 / 8"},
+        };
+        for (const set &c : sets) {
+            const int K = c.K;
+            slot s = make_slot(16, K);
+            std::vector<weight> w;
+            std::vector<dev> d(c.n);
+            for (int j = 0; j < c.n; j++) {
+                w.push_back(make_weight(K, c.N[j], c.k2[j]));
+                upload(w[j], s, 16, d[j]);
+            }
+            ds4_exl3_dense_proj p[4] = {};
+            size_t yb[4] = {};
+            float *ym = nullptr;
+            size_t ytot = 0;
+            for (int j = 0; j < c.n; j++) { yb[j] = ytot; ytot += (size_t)16 * c.N[j]; }
+            CUDA_OK(cudaMalloc((void **)&ym, ytot * sizeof(float)));
+            for (int j = 0; j < c.n; j++) p[j] = ds4_exl3_dense_proj{d[j].w, c.k2[j], c.N[j], ym + yb[j]};
+            const size_t mws = ds4_exl3_dense_multi_workspace_bytes(p, c.n, 16, K);
+            size_t sum = 0;
+            for (int j = 0; j < c.n; j++) sum += ds4_exl3_dense_workspace_bytes(16, K, c.N[j]);
+            CHECK(mws == sum, "%s: multi workspace %zu != the singles' sum %zu", c.what, mws, sum);
+            void *mw = nullptr;
+            CUDA_OK(cudaMalloc(&mw, mws));
+            size_t diff = 0, checked = 0;
+            for (int M : {1, 2, 3, 5, 8, 16}) {
+                for (bool prompt : {false, true}) {
+                    if (prompt && M != 5 && M != 16) continue;
+                    CUDA_OK(cudaMemset(ym, 0xff, ytot * sizeof(float)));
+                    const int rc = ds4_exl3_dense_multi_launch(p, c.n, d[0].q, M, K, mw, mws, 0, prompt);
+                    CHECK(rc == 0, "%s: multi launch refused at M=%d (rc=%d)", c.what, M, rc);
+                    CUDA_OK(cudaDeviceSynchronize());
+                    for (int j = 0; j < c.n; j++) {
+                        std::vector<float> one, many((size_t)M * c.N[j]);
+                        CUDA_OK(cudaMemcpy(many.data(), ym + yb[j], many.size() * sizeof(float), cudaMemcpyDeviceToHost));
+                        CHECK(run(d[j], c.k2[j], M, K, c.N[j], one, prompt) == 0, "%s: single launch refused", c.what);
+                        diff += std::memcmp(one.data(), many.data(), many.size() * sizeof(float)) != 0;
+                        checked++;
+                    }
+                }
+            }
+            CHECK(diff == 0, "%s: %zu of %zu (width, projection) outputs differ from the single launch", c.what, diff, checked);
+            CHECK(ds4_exl3_dense_multi_launch(p, c.n, d[0].q, 16, K, mw, mws - 16, 0) == -1, "%s: short workspace accepted",
+                  c.what);
+            printf("  multi %-44s %zu (width, projection) outputs bit-identical to their single launches\n", c.what,
+                   checked);
+            cudaFree(mw);
+            cudaFree(ym);
+            for (dev &x : d) release(x);
+        }
+        ds4_exl3_dense_proj five[5] = {};
+        CHECK(ds4_exl3_dense_multi_launch(five, 5, (void *)16, 1, 2560, (void *)16, 1 << 20, 0) == -1, "five projections accepted");
+        printf("  multi refusals: a short workspace, five projections -- refused\n");
+    }
     printf(g_fail ? "EXL3-DENSE GATE FAIL\n" : "EXL3-DENSE GATE PASS\n");
     return g_fail;
 }

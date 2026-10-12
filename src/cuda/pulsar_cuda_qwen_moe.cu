@@ -308,6 +308,42 @@ extern "C" int pulsar_rows_linear_launch(const pulsar_rows_linear *l, const uint
     return ds4_exl3_dense_launch(l->w, l->k2, x_bf16, y, rows, l->in, l->out, ws, ws_bytes, stream, l->prompt);
 }
 
+extern "C" size_t pulsar_rows_linear_multi_workspace_bytes(const pulsar_rows_linear *const *ls, int n, int rows) {
+    if (!ls || n < 1 || n > DS4_EXL3_DENSE_MAX_PROJ || rows <= 0) return 0;
+    ds4_exl3_dense_proj p[DS4_EXL3_DENSE_MAX_PROJ] = {};
+    int ne = 0;
+    for (int j = 0; j < n; ++j) {
+        if (!ls[j] || ls[j]->in != ls[0]->in) return 0;
+        if (ls[j]->out % 128 == 0) p[ne++].N = ls[j]->out;   /* an EXL3 shape (mxfp8_lt-only widths need none) */
+    }
+    return ne ? ds4_exl3_dense_multi_workspace_bytes(p, ne, rows, ls[0]->in) : 0;
+}
+
+extern "C" int pulsar_rows_linear_multi_launch(const pulsar_rows_linear *const *ls, int n, const uint16_t *x_bf16,
+                                               int rows, float *const *y, void *ws, size_t ws_bytes, cudaStream_t stream) {
+    if (!ls || n < 1 || n > DS4_EXL3_DENSE_MAX_PROJ || !y || !x_bf16 || rows <= 0) {
+        fprintf(stderr, "pulsar: qwen linears: %d Linears (1..%d), no input or no rows -- refusing\n", n,
+                DS4_EXL3_DENSE_MAX_PROJ);
+        return -1;
+    }
+    ds4_exl3_dense_proj p[DS4_EXL3_DENSE_MAX_PROJ];
+    int ne = 0;
+    for (int j = 0; j < n; ++j) {
+        const pulsar_rows_linear *l = ls[j];
+        if (!l || !l->w || !y[j] || l->in != ls[0]->in || l->prompt != ls[0]->prompt) {
+            fprintf(stderr, "pulsar: qwen linears: Linear %d has no weight / output, or not the first one's input width "
+                            "and row kind -- refusing\n", j);
+            return -1;
+        }
+        if (l->k2) p[ne++] = ds4_exl3_dense_proj{l->w, l->k2, l->out, y[j]};
+    }
+    if (ne && ds4_exl3_dense_multi_launch(p, ne, x_bf16, rows, ls[0]->in, ws, ws_bytes, stream, ls[0]->prompt) != 0)
+        return -1;
+    for (int j = 0; j < n; ++j)   /* the mxfp8_lt tier, one by one (its own arm) */
+        if (!ls[j]->k2 && pulsar_rows_linear_launch(ls[j], x_bf16, rows, y[j], ws, ws_bytes, stream) != 0) return -1;
+    return 0;
+}
+
 /* The MX slab geometry, for the engine TUs that cannot include pulsar_cuda_mx.cuh
  * (g++ does not know __host__/__device__).  One authority: these delegate. */
 int pulsar_gpu_mx_kbp(int in_dim) { return pulsar_mx_kbp(in_dim); }
@@ -353,6 +389,35 @@ extern "C" size_t pulsar_rows_moe_shared_ws_bytes(int T, int in, int mid, int ou
 
 extern "C" size_t pulsar_rows_moe_routed_workspace_bytes(int T, int top_k, int mid, int out_dim) {
     return T > 0 && top_k > 0 && mid > 0 && out_dim > 0 ? routed_ws_layout(T, top_k, mid, out_dim, nullptr, 0, nullptr) : 0;
+}
+
+/* A riding shared expert's descriptor in the front door's terms: three EXL3 slices hidden -> mid -> hidden. */
+static bool rows_moe_shared(const pulsar_rows_moe_shared *q, int H, exl3_moe_shared *sh) {
+    const int smid = q->gate.out;
+    if (!q->gate.w || !q->up.w || !q->down.w || !q->gate.k2 || !q->up.k2 || !q->down.k2 || q->gate.in != H ||
+        q->up.in != H || q->up.out != smid || q->down.in != smid || q->down.out != H) {
+        fprintf(stderr, "pulsar: routed MoE (bf16 rows): a riding shared expert is three EXL3 slices %d -> %d -> %d "
+                        "(got %d->%d / %d->%d / %d->%d) -- refusing\n", H, smid, H, q->gate.in, q->gate.out,
+                q->up.in, q->up.out, q->down.in, q->down.out);
+        return false;
+    }
+    *sh = exl3_moe_shared{q->gate.w, q->up.w, q->down.w, q->gate.k2, q->up.k2, q->down.k2, smid, q->scale, q->yg, q->yu,
+                          q->ys, reinterpret_cast<__nv_bfloat16 *>(q->h), q->ws, q->ws_bytes};
+    return true;
+}
+
+extern "C" int pulsar_rows_moe_shared_fork(const pulsar_rows_moe_shared *q, const uint16_t *x_bf16, int T,
+                                           cudaStream_t stream) {
+    exl3_moe_shared sh{};
+    if (!q || !x_bf16 || T <= 0 || !rows_moe_shared(q, q->gate.in, &sh)) return -1;
+#ifndef PULSAR_HAVE_MMQ
+    (void)stream;
+    fprintf(stderr, "pulsar: shared expert fork: built without the MMQ drivers the front door rides -- refusing\n");
+    return -1;
+#else
+    return exl3_moe_shared_fork(sh, exl3_moe_act{EXL3_MOE_ACT_BF16_ROWS, x_bf16, nullptr, 0}, T, q->gate.in, q->down.out,
+                                q->gate.prompt, stream);
+#endif
 }
 
 extern "C" int pulsar_rows_moe_routed_launch(const pulsar_rows_moe *w, int32_t *sel, const float *wts,
@@ -444,18 +509,7 @@ extern "C" int pulsar_rows_moe_routed_launch(const pulsar_rows_moe *w, int32_t *
     const exl3_moe_bufs bufs{m.gu_z, split ? m.gu_z + (size_t)pairs * mid : nullptr, m.down_z,
                              exl3_moe_act{EXL3_MOE_ACT_BF16_ROWS, m.mid_x, nullptr, 0}};
     exl3_moe_shared sh{};
-    if (const pulsar_rows_moe_shared *q = w->shared) {
-        const int smid = q->gate.out;
-        if (!q->gate.w || !q->up.w || !q->down.w || !q->gate.k2 || !q->up.k2 || !q->down.k2 || q->gate.in != H ||
-            q->up.in != H || q->up.out != smid || q->down.in != smid || q->down.out != H) {
-            fprintf(stderr, "pulsar: routed MoE (bf16 rows): a riding shared expert is three EXL3 slices %d -> %d -> %d "
-                            "(got %d->%d / %d->%d / %d->%d) -- refusing\n", H, smid, H, q->gate.in, q->gate.out,
-                    q->up.in, q->up.out, q->down.in, q->down.out);
-            return -1;
-        }
-        sh = exl3_moe_shared{q->gate.w, q->up.w, q->down.w, q->gate.k2, q->up.k2, q->down.k2, smid, q->scale, q->yg, q->yu,
-                             q->ys, reinterpret_cast<__nv_bfloat16 *>(q->h), q->ws, q->ws_bytes};
-    }
+    if (w->shared && !rows_moe_shared(w->shared, H, &sh)) return -1;
     if (exl3_moe_routed_launch(st, sel, wts, T, top_k, 0.0f, exl3_moe_act{EXL3_MOE_ACT_BF16_ROWS, x_bf16, nullptr, 0},
                                bufs, out, nf_flag, nf_code, w->prompt, stream, w->shared ? &sh : nullptr) != 0)
         return -1;

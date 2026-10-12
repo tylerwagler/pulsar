@@ -241,6 +241,44 @@ bool step_linear(const pulsar_qwen_step *st, const pulsar_tensor *t, int in, int
     });
 }
 
+/* L288 exl3-dense: n (1..4) dense linears of the SAME input x [n_rows][in] -- y[j] [n_rows][out[j]] f32 = t[j] x --
+ * in one call per row-kind segment (pulsar_rows_linear_multi_launch: the EXL3 ones share one prep and one GEMV
+ * launch per rate; every output the bytes step_linear gives it alone).  `ws` is sized by multi_lin_ws. */
+bool step_linear_multi(const pulsar_qwen_step *st, int n, const pulsar_tensor *const *t, int in, const int *out,
+                       const char *const *what, const uint16_t *x, float *const *y, void *ws, uint64_t ws_bytes) {
+    if (st->tap)
+        for (int j = 0; j < n; j++) pulsar_imatrix_note_dense(st->tap, t[j], x, st->n_rows, (uint32_t)in);
+    return arm_segments(st, 0, st->n_rows, [&](bool prompt, uint32_t r0, uint32_t m) {
+        pulsar_rows_linear l[4];
+        const pulsar_rows_linear *lp[4];
+        float *yr[4];
+        for (int j = 0; j < n; j++) {
+            if (!linear_dev(st, t[j], in, out[j], prompt, what[j], &l[j])) return false;
+            lp[j] = &l[j];
+            yr[j] = y[j] + (size_t)r0 * (size_t)out[j];
+        }
+        return pulsar_rows_linear_multi_launch(lp, n, x + (size_t)r0 * in, (int)m, yr, ws, ws_bytes, 0) == 0;
+    });
+}
+
+/* The dense-arm workspace of a block whose n input projections (in -> out[j]) run as one multi launch and whose
+ * output projection (out_in -> out_out) runs alone after them: the larger of the two. */
+uint64_t multi_lin_ws(int in, int n, const int *out, int out_in, int out_out, uint32_t rows) {
+    pulsar_rows_linear l[4] = {};
+    const pulsar_rows_linear *lp[4];
+    for (int j = 0; j < n; j++) {
+        l[j].in = in;
+        l[j].out = out[j];
+        lp[j] = &l[j];
+    }
+    pulsar_rows_linear o{};
+    o.in = out_in;
+    o.out = out_out;
+    const uint64_t a = a256(pulsar_rows_linear_multi_workspace_bytes(lp, n, (int)rows));
+    const uint64_t b = a256(pulsar_rows_linear_workspace_bytes(&o, (int)rows));
+    return a > b ? a : b;
+}
+
 /* L251 S2: the Gated DeltaNet op's scratch.  qkv/z/a/b hold the four f32
  * projections; `ws` is pulsar_gdn_forward's own scratch; a8/a8_sf are the A8
  * output slot the kernel emits and out_proj then reads -- sized with the
@@ -252,15 +290,8 @@ struct gdn_scratch { uint64_t qkv, z, a, b, ws, ws_bytes, a8, a8_sf, obf16, lin_
 uint64_t gdn_lin_ws(const pulsar_qwen_shape *s, uint32_t rows) {
     const int H = (int)s->n_embd, CD = (int)pulsar_qwen_gdn_conv_dim(s);
     const int VT = (int)pulsar_qwen_gdn_v_total(s), NV = (int)(s->gdn_n_v_head * pulsar_qwen_tp(s));   /* a / b whole */
-    const int dims[5][2] = {{H, CD}, {H, VT}, {H, NV}, {H, NV}, {VT, H}};
-    uint64_t m = 0;
-    for (int i = 0; i < 5; i++) {
-        pulsar_rows_linear l{};
-        l.in = dims[i][0]; l.out = dims[i][1];
-        const uint64_t b = a256(pulsar_rows_linear_workspace_bytes(&l, (int)rows));
-        if (b > m) m = b;
-    }
-    return m;
+    const int outs[4] = {CD, VT, NV, NV};   /* in_proj_qkv / _z / _a / _b as one multi launch, then out_proj */
+    return multi_lin_ws(H, 4, outs, VT, H, rows);
 }
 
 gdn_scratch gdn_layout(const pulsar_qwen_shape *s, uint32_t rows) {
@@ -290,16 +321,9 @@ struct qsa_scratch { uint64_t qg, k, v, idx, a8, a8_sf, obf16, ws, ws_bytes, lin
 
 uint64_t qsa_lin_ws(const pulsar_qwen_shape *s, uint32_t rows) {
     const int H = (int)s->n_embd;
-    const int dims[5][2] = {{H, (int)pulsar_qwen_qsa_q_in(s)}, {H, (int)pulsar_qwen_qsa_kv_in(s)}, {H, (int)pulsar_qwen_qsa_kv_in(s)},
-                            {H, PULSAR_QSA_IDX_IN}, {(int)pulsar_qwen_qsa_out_dim(s), H}};
-    uint64_t m = 0;
-    for (int i = 0; i < 5; i++) {
-        pulsar_rows_linear l{};
-        l.in = dims[i][0]; l.out = dims[i][1];
-        const uint64_t b = a256(pulsar_rows_linear_workspace_bytes(&l, (int)rows));
-        if (b > m) m = b;
-    }
-    return m;
+    const int outs[4] = {(int)pulsar_qwen_qsa_q_in(s), (int)pulsar_qwen_qsa_kv_in(s), (int)pulsar_qwen_qsa_kv_in(s),
+                         PULSAR_QSA_IDX_IN};   /* q / k / v / index_qk as one multi launch, then o_proj */
+    return multi_lin_ws(H, 4, outs, (int)pulsar_qwen_qsa_out_dim(s), H, rows);
 }
 
 qsa_scratch qsa_layout(const pulsar_qwen_shape *s, uint32_t rows, uint32_t ctx) {
@@ -716,6 +740,35 @@ bool pulsar_qwen_s4_moe(const pulsar_qwen_step *st, uint32_t il) {
     uint8_t *base = (uint8_t *)dptr(sc);
     pulsar_qwen_moe_parts parts;
     if (pulsar_qwen_moe_carve((int)n, base + m.ws, m.ws_bytes, &parts) != 0) return false;
+    /* the shared expert, sigmoid-gated, added after the routed sum -- under expert parallelism rank 0's alone.
+     * Keyed on its FORMAT (task #44): three EXL3 dense slices ride the EXL3 routed launches (mmq/exl3_moe.cuh);
+     * any other format, or a Tessera routed arm, runs its own launches after the routed sum.  L288 exl3-dense: a
+     * riding one is FORKED here, ahead of the router, per row-kind segment over that segment's own rows of its
+     * buffers (the dense workspace is its stream's alone), and each segment's routed launch joins its fork. */
+    const bool shared_here = !(pulsar_qwen_tp(s) > 1 && s->tp_rank != 0);
+    pulsar_rows_linear sg0{}, su0{}, sd0{};
+    if (shared_here && !(linear_dev(st, L.sh_gate, H, SMID, false, "qwen shared gate_proj", &sg0) &&
+                         linear_dev(st, L.sh_up, H, SMID, false, "qwen shared up_proj", &su0) &&
+                         linear_dev(st, L.sh_down, SMID, H, false, "qwen shared down_proj", &sd0)))
+        return false;
+    const bool tess_layer = L.moe_tess[PULSAR_QWEN_TESS_GATE][PULSAR_QWEN_TESS_WORDS] != NULL;
+    const bool ride = shared_here && !tess_layer && sg0.k2 && su0.k2 && sd0.k2;
+    pulsar_rows_moe_shared shs[2];   /* arm_segments: at most a decode and a prompt segment */
+    int n_sh = 0;
+    if (ride && !arm_segments(st, 0, n, [&](bool prompt, uint32_t r0, uint32_t rows) {
+            pulsar_rows_moe_shared &sh = shs[n_sh++];
+            sh = pulsar_rows_moe_shared{};
+            sh.gate = sg0; sh.up = su0; sh.down = sd0;
+            sh.gate.prompt = sh.up.prompt = sh.down.prompt = prompt;
+            sh.scale = parts.sgate + r0;   /* the router writes it, on this stream, before the sum reads it */
+            sh.yg = parts.yg + (size_t)r0 * SMID;
+            sh.yu = parts.yu + (size_t)r0 * SMID;
+            sh.ys = parts.ys + (size_t)r0 * H;
+            sh.h = parts.h_x + (size_t)r0 * SMID;
+            sh.ws = parts.lin; sh.ws_bytes = parts.lin_bytes;
+            return pulsar_rows_moe_shared_fork(&sh, x + (size_t)r0 * H, (int)rows, 0) == 0;
+        }))
+        return fail("the shared expert's fork was refused");
     /* the router: softmax top-k over the experts and the shared expert's sigmoid gate (the architecture's) */
     const uint16_t *router_w = (const uint16_t *)wptr(st, L.moe_router, "qwen router");
     const uint16_t *shared_gate_w = (const uint16_t *)wptr(st, L.sh_gate_scalar, "qwen shared_expert_gate");
@@ -756,27 +809,9 @@ bool pulsar_qwen_s4_moe(const pulsar_qwen_step *st, uint32_t il) {
         rc.tessera_up = &tp[PULSAR_QWEN_TESS_UP];
         rc.tessera_down = &tp[PULSAR_QWEN_TESS_DOWN];
     }
-    /* the shared expert, sigmoid-gated, added after the routed sum -- under expert parallelism rank 0's alone.
-     * Keyed on its FORMAT (task #44): three EXL3 dense slices ride the EXL3 routed launches (mmq/exl3_moe.cuh);
-     * any other format, or a Tessera routed arm, runs its own launches after the routed sum. */
-    const bool shared_here = !(pulsar_qwen_tp(s) > 1 && s->tp_rank != 0);
-    pulsar_rows_linear sg0{}, su0{}, sd0{};
-    if (shared_here && !(linear_dev(st, L.sh_gate, H, SMID, false, "qwen shared gate_proj", &sg0) &&
-                         linear_dev(st, L.sh_up, H, SMID, false, "qwen shared up_proj", &su0) &&
-                         linear_dev(st, L.sh_down, SMID, H, false, "qwen shared down_proj", &sd0)))
-        return false;
-    const bool ride = shared_here && !rc.tessera_gate && sg0.k2 && su0.k2 && sd0.k2;
+    int seg = 0;
     if (!arm_segments(st, 0, n, [&](bool prompt, uint32_t r0, uint32_t rows) {
-            pulsar_rows_moe_shared sh{};
-            if (ride) {
-                sh.gate = sg0; sh.up = su0; sh.down = sd0;
-                sh.gate.prompt = sh.up.prompt = sh.down.prompt = prompt;
-                sh.scale = parts.sgate + r0;   /* the gate row-indexed, the shared expert's buffers reused from 0 */
-                sh.yg = parts.yg; sh.yu = parts.yu; sh.ys = parts.ys;
-                sh.h = parts.h_x;
-                sh.ws = parts.lin; sh.ws_bytes = parts.lin_bytes;
-            }
-            rc.shared = ride ? &sh : NULL;
+            rc.shared = ride ? &shs[seg++] : NULL;   /* the fork above, joined before this segment's sum */
             rc.selected = parts.sel + (size_t)r0 * K;
             rc.weights = parts.wts + (size_t)r0 * K;
             rc.x_bf16 = x + (size_t)r0 * H;
@@ -790,10 +825,10 @@ bool pulsar_qwen_s4_moe(const pulsar_qwen_step *st, uint32_t il) {
                                                                                       (int)s->n_ff_exp, H),
                                                rc.selected, rows, K, s->n_expert, (uint32_t)rc.down->dim[0]);
             if (ride && st->tap) {
-                /* the shared expert's down read the SwiGLU rows the launch left in parts.h_x (bf16) */
+                /* the shared expert's down read the SwiGLU rows its fork left in its rows of parts.h_x (bf16) */
                 pulsar_imatrix_note_dense(st->tap, L.sh_gate, rc.x_bf16, rows, (uint32_t)H);
                 pulsar_imatrix_note_dense(st->tap, L.sh_up, rc.x_bf16, rows, (uint32_t)H);
-                pulsar_imatrix_note_dense(st->tap, L.sh_down, parts.h_x, rows, (uint32_t)SMID);
+                pulsar_imatrix_note_dense(st->tap, L.sh_down, parts.h_x + (size_t)r0 * SMID, rows, (uint32_t)SMID);
             }
             return true;
         }))
@@ -1080,11 +1115,14 @@ bool pulsar_qwen_s2_gdn(const pulsar_qwen_step *st, uint32_t il) {
     uint8_t *base = (uint8_t *)dptr(sc);
     const gdn_scratch g = gdn_layout(s, st->st->max_rows);
     void *linws = base + g.lin_ws;
-    if (!step_linear(st, L.gdn_in_qkv, H, CD,  "qwen GDN in_proj_qkv", xin, (float *)(base + g.qkv), linws, g.lin_ws_bytes) ||
-        !step_linear(st, L.gdn_in_z,   H, VT,  "qwen GDN in_proj_z",   xin, (float *)(base + g.z),   linws, g.lin_ws_bytes) ||
-        !step_linear(st, L.gdn_in_a,   H, NVG, "qwen GDN in_proj_a",   xin, (float *)(base + g.a),   linws, g.lin_ws_bytes) ||
-        !step_linear(st, L.gdn_in_b,   H, NVG, "qwen GDN in_proj_b",   xin, (float *)(base + g.b),   linws, g.lin_ws_bytes))
-        return fail("a GDN projection launch failed");
+    {
+        const pulsar_tensor *const t[4] = {L.gdn_in_qkv, L.gdn_in_z, L.gdn_in_a, L.gdn_in_b};
+        const int outs[4] = {CD, VT, NVG, NVG};
+        const char *const what[4] = {"qwen GDN in_proj_qkv", "qwen GDN in_proj_z", "qwen GDN in_proj_a", "qwen GDN in_proj_b"};
+        float *const y[4] = {(float *)(base + g.qkv), (float *)(base + g.z), (float *)(base + g.a), (float *)(base + g.b)};
+        if (!step_linear_multi(st, 4, t, H, outs, what, xin, y, linws, g.lin_ws_bytes))
+            return fail("a GDN projection launch failed");
+    }
     pulsar_gdn_weights gw;
     gw.conv_w  = (const uint16_t *)wptr(st, L.gdn_conv,    "qwen GDN conv1d");
     gw.A_log   = (const uint16_t *)wptr(st, L.gdn_a_log,   "qwen GDN A_log");
@@ -1201,11 +1239,11 @@ bool pulsar_qwen_s3_qsa(const pulsar_qwen_step *st, uint32_t il) {
     const uint32_t nb = st->st->n_banks;
     if (nv != 4 || nb == 0 || nb > 64) { drop(); return fail("the QSA op needs 4 projection views and 1..64 banks"); }
     const int QI = (int)pulsar_qwen_qsa_q_in(s), KVI = (int)pulsar_qwen_qsa_kv_in(s);
-    bool ok = step_linear(st, L.attn_q, H, QI,  "qwen QSA q_proj", xin, (float *)dptr(vq), linws, g.lin_ws_bytes) &&
-              step_linear(st, L.attn_k, H, KVI, "qwen QSA k_proj", xin, (float *)dptr(vk), linws, g.lin_ws_bytes) &&
-              step_linear(st, L.attn_v, H, KVI, "qwen QSA v_proj", xin, (float *)dptr(vv), linws, g.lin_ws_bytes) &&
-              step_linear(st, L.idx_qk, H, PULSAR_QSA_IDX_IN, "qwen QSA index_qk_proj", xin, (float *)dptr(vi), linws,
-                          g.lin_ws_bytes);
+    const pulsar_tensor *const qt[4] = {L.attn_q, L.attn_k, L.attn_v, L.idx_qk};
+    const int qouts[4] = {QI, KVI, KVI, PULSAR_QSA_IDX_IN};
+    const char *const qwhat[4] = {"qwen QSA q_proj", "qwen QSA k_proj", "qwen QSA v_proj", "qwen QSA index_qk_proj"};
+    float *const qy[4] = {(float *)dptr(vq), (float *)dptr(vk), (float *)dptr(vv), (float *)dptr(vi)};
+    bool ok = step_linear_multi(st, 4, qt, H, qouts, qwhat, xin, qy, linws, g.lin_ws_bytes);
     if (!ok) { drop(); return fail("a QSA projection launch failed"); }
 
     /* the per-bank caches: each bank's own KV and pooled-key tensors (L284 #3), its slice of the bank-major

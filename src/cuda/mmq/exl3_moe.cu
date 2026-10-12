@@ -7,6 +7,7 @@
 #include "ds4_mmid.cuh"
 #include "ds4_mmq.h"
 #include "../pulsar_cuda_scratch.h"
+#include "cuda/pulsar_cuda_mx.cuh"
 #include "engine/exl3_trellis.h"
 
 #include <cstdio>
@@ -40,12 +41,124 @@ int project(int kind, const void *table, const void *up_table, int k2, const exl
     return rc;
 }
 
+/* The riding shared expert's lane (L288 exl3-dense): its own stream, one per (host thread, device, caller
+ * stream).  exl3_moe_shared_fork puts the WHOLE shared expert on it -- gate / up (one dense multi launch), its
+ * SwiGLU, its down -- forked off the caller's stream at x, before the family's router: those latency-bound
+ * launches (a 2 MB and a 1 MB projection, 1-2 blocks per CTA) then run beside the router, the schedule and the
+ * routed GEMMs instead of after them, and exl3_moe_routed_launch joins the lane right before the sum that adds
+ * the shared output.  Only the schedule changes: every value is the arithmetic it had (the SwiGLU rows are the
+ * fold's own expression; the dense arm's epilogue counters are per stream already, counter_slice).  A lane holds
+ * up to kLanePending forks the caller has not joined yet (one per row-kind segment of a step, each over its own
+ * rows' buffers).  The lanes live as long as their thread. */
+constexpr int kLanePending = 4;
+struct shared_lane {
+    int dev;
+    cudaStream_t caller, s;
+    cudaEvent_t fork;
+    cudaEvent_t done[kLanePending];
+    const float *ys[kLanePending];   ///< the pending forks' outputs, oldest first
+    int n;
+};
+
+shared_lane *shared_lane_for(cudaStream_t caller) {
+    thread_local shared_lane t_lanes[8];
+    thread_local int t_n = 0;
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess) return nullptr;
+    for (int i = 0; i < t_n; ++i)
+        if (t_lanes[i].dev == dev && t_lanes[i].caller == caller) return &t_lanes[i];
+    if (t_n == 8) return nullptr;
+    shared_lane l{};
+    l.dev = dev;
+    l.caller = caller;
+    if (cudaStreamCreateWithFlags(&l.s, cudaStreamNonBlocking) != cudaSuccess ||
+        cudaEventCreateWithFlags(&l.fork, cudaEventDisableTiming) != cudaSuccess)
+        return nullptr;
+    for (cudaEvent_t &e : l.done)
+        if (cudaEventCreateWithFlags(&e, cudaEventDisableTiming) != cudaSuccess) return nullptr;
+    t_lanes[t_n] = l;
+    static bool announced = false;
+    if (!__atomic_exchange_n(&announced, true, __ATOMIC_RELAXED))
+        fprintf(stderr, "pulsar: EXL3 shared expert = gate / up + SwiGLU + down on its own stream, forked at x ahead of "
+                        "the router, joined at the routed sum\n");
+    return &t_lanes[t_n++];
+}
+
+/* The shared expert's SwiGLU rows for its down: h = silu(g) * u, bf16 -- the expression the fold emitted them with
+ * (pulsar_swiglu_elem, weight 1, no clamp), now the lane's producer of h. */
+__global__ void __launch_bounds__(256)
+exl3_shared_swiglu_kernel(const float *__restrict__ g, const float *__restrict__ u, __nv_bfloat16 *__restrict__ h,
+                          int64_t n) {
+    const int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) h[i] = __float2bfloat16(pulsar_swiglu_elem(g[i], u[i], 1.0f, 0.0f));
+}
+
 } // namespace
 
 size_t exl3_moe_shared_ws_bytes(int T, int in_dim, int mid, int out_dim) {
-    const size_t gu = 2 * ds4_exl3_dense_workspace_bytes(T, in_dim, mid), d = ds4_exl3_dense_workspace_bytes(T, mid, out_dim);
+    const ds4_exl3_dense_proj p[2] = {{nullptr, 0, mid, nullptr}, {nullptr, 0, mid, nullptr}};
+    const size_t gu = ds4_exl3_dense_multi_workspace_bytes(p, 2, T, in_dim), d = ds4_exl3_dense_workspace_bytes(T, mid, out_dim);
     return gu > d ? gu : d;
 }
+
+int exl3_moe_shared_fork(const exl3_moe_shared &sh, const exl3_moe_act &x, int T, int in_dim, int out_dim, bool prompt,
+                         cudaStream_t stream) {
+    const char *tag = "exl3_moe_shared_fork";
+    if (!sh.gate || !sh.up || !sh.down || !sh.yg || !sh.yu || !sh.ys || !sh.h || !sh.ws || sh.mid <= 0 || T <= 0 ||
+        in_dim <= 0 || out_dim <= 0 || x.format != EXL3_MOE_ACT_BF16_ROWS || !x.x) {
+        fprintf(stderr, "%s: a shared expert needs its three slices, its buffers and a bf16-rows activation (the dense "
+                        "arm reads bf16; act format %d) -- refusing\n", tag, x.format);
+        return -1;
+    }
+    shared_lane *lane = shared_lane_for(stream);
+    if (!lane || lane->n == kLanePending) {
+        fprintf(stderr, "%s: no lane, or %d forks already pending on it -- refusing\n", tag, lane ? lane->n : 0);
+        return -1;
+    }
+    if (cudaEventRecord(lane->fork, stream) != cudaSuccess || cudaStreamWaitEvent(lane->s, lane->fork, 0) != cudaSuccess)
+        return -3;
+    const ds4_exl3_dense_proj gu[2] = {{sh.gate, sh.k2_gate, sh.mid, sh.yg}, {sh.up, sh.k2_up, sh.mid, sh.yu}};
+    int rc = ds4_exl3_dense_multi_launch(gu, 2, x.x, T, in_dim, sh.ws, sh.ws_bytes, lane->s, prompt);
+    if (rc == 0) {
+        const int64_t n = (int64_t)T * sh.mid;
+        exl3_shared_swiglu_kernel<<<(unsigned)((n + 255) / 256), 256, 0, lane->s>>>(sh.yg, sh.yu, sh.h, n);
+        rc = cudaGetLastError() == cudaSuccess ? 0 : -3;
+    }
+    if (rc == 0)
+        rc = ds4_exl3_dense_launch(sh.down, sh.k2_down, sh.h, sh.ys, T, sh.mid, out_dim, sh.ws, sh.ws_bytes, lane->s,
+                                   prompt);
+    if (rc == 0 && cudaEventRecord(lane->done[lane->n], lane->s) != cudaSuccess) rc = -3;
+    if (rc) {
+        fprintf(stderr, "%s: the shared expert's launches declined (rc=%d) -- no fallback\n", tag, rc);
+        (void)cudaStreamSynchronize(lane->s);   /* nothing of a refused fork outlives the call */
+        return -1;
+    }
+    lane->ys[lane->n++] = sh.ys;
+    return 0;
+}
+
+namespace {
+
+/* The caller's stream waits for the OLDEST pending fork, which must be the one whose output is `ys`. */
+int shared_join(const float *ys, cudaStream_t stream, const char *tag) {
+    shared_lane *lane = shared_lane_for(stream);
+    if (!lane || lane->n == 0 || lane->ys[0] != ys) {
+        fprintf(stderr, "%s: a riding shared expert was not forked first (exl3_moe_shared_fork) on this stream -- "
+                        "refusing\n", tag);
+        return -1;
+    }
+    if (cudaStreamWaitEvent(stream, lane->done[0], 0) != cudaSuccess) return -3;
+    /* pop: the events rotate with their entries */
+    const cudaEvent_t e = lane->done[0];
+    for (int i = 1; i < lane->n; ++i) {
+        lane->done[i - 1] = lane->done[i];
+        lane->ys[i - 1] = lane->ys[i];
+    }
+    lane->done[--lane->n] = e;
+    return 0;
+}
+
+} // namespace
 
 int exl3_moe_routed_launch(const exl3_moe_stacks &w, const int32_t *sel, const float *wts, int T, int top_k,
                            float clamp, const exl3_moe_act &x, const exl3_moe_bufs &b, float *out,
@@ -69,10 +182,9 @@ int exl3_moe_routed_launch(const exl3_moe_stacks &w, const int32_t *sel, const f
         return -1;
     }
     const exl3_moe_shared *sh = shared;
-    if (sh && (!sh->gate || !sh->up || !sh->down || !sh->yg || !sh->yu || !sh->ys || !sh->h || !sh->ws || sh->mid <= 0 ||
-               x.format != EXL3_MOE_ACT_BF16_ROWS)) {
-        fprintf(stderr, "%s: a riding shared expert needs its three slices, its buffers and a bf16-rows activation "
-                        "(the dense arm reads bf16; act format %d) -- refusing\n", tag, x.format);
+    if (sh && x.format != EXL3_MOE_ACT_BF16_ROWS) {
+        fprintf(stderr, "%s: a riding shared expert needs a bf16-rows activation (act format %d) -- refusing\n", tag,
+                x.format);
         return -1;
     }
     static int mmq_ready = -1;   /* the sort's device-info singleton */
@@ -110,18 +222,6 @@ int exl3_moe_routed_launch(const exl3_moe_stacks &w, const int32_t *sel, const f
     void *tc_ws = cuda_arena_take(&ar, tc_bytes, 256);
     if (!tc_ws) return -1;   /* take() latches */
 
-    /* a riding shared expert's gate and up: one dense launch when they share a rate */
-    if (sh) {
-        int rc = sh->k2_gate == sh->k2_up
-            ? ds4_exl3_dense_pair_launch(sh->gate, sh->up, sh->k2_gate, x.x, sh->yg, sh->yu, T, w.in_dim, sh->mid, sh->ws,
-                                         sh->ws_bytes, stream, prompt)
-            : ds4_exl3_dense_launch(sh->gate, sh->k2_gate, x.x, sh->yg, T, w.in_dim, sh->mid, sh->ws, sh->ws_bytes, stream,
-                                    prompt);
-        if (rc == 0 && sh->k2_gate != sh->k2_up)
-            rc = ds4_exl3_dense_launch(sh->up, sh->k2_up, x.x, sh->yu, T, w.in_dim, sh->mid, sh->ws, sh->ws_bytes, stream,
-                                       prompt);
-        if (rc) { fprintf(stderr, "%s: the shared expert's gate / up declined (rc=%d) -- no fallback\n", tag, rc); return -1; }
-    }
     /* the schedule, once: every consumer stops at the schedule's ends (expert_bounds[0], expert_bounds[E]), so
      * the unwritten head of a schedule with dropped picks is never read */
     ds4_launch_mm_ids_helper(sel, ids_src, ids_dst, bounds, E, T, top_k, /*nchannels_y=*/1, /*si1=*/top_k,
@@ -141,22 +241,17 @@ int exl3_moe_routed_launch(const exl3_moe_stacks &w, const int32_t *sel, const f
     const bool mid_e4m3 = b.mid.format == EXL3_MOE_ACT_E4M3_SLOT;
     void *mq = mid_e4m3 ? const_cast<void *>(b.mid.x) : nullptr, *msf = mid_e4m3 ? const_cast<void *>(b.mid.sf) : nullptr;
     void *mb = mid_e4m3 ? nullptr : const_cast<void *>(b.mid.x);
-    const exl3_moe_shared_swiglu shs{sh ? sh->yg : nullptr, sh ? sh->yu : nullptr, sh ? sh->h : nullptr, T,
-                                     sh ? sh->mid : 0};
     rc = fused ? ds4_exl3_moe_fold_fused_launch(gz, sel, wts, s.gate_up, s.down, s.in_dim, s.mid_dim, pairs, clamp, mq,
-                                                msf, b.mid.kbp, stream, mb, sh ? &shs : nullptr, gp.splits, gp.split_stride)
+                                                msf, b.mid.kbp, stream, mb, gp.splits, gp.split_stride)
                : ds4_exl3_moe_fold_launch(gz, uz, sel, wts, s.gate, s.up, s.down, s.in_dim, s.mid_dim, pairs, clamp, mq,
-                                          msf, b.mid.kbp, stream, mb, sh ? &shs : nullptr, gp.splits, gp.split_stride);
+                                          msf, b.mid.kbp, stream, mb, gp.splits, gp.split_stride);
     if (rc) return -1;
-    if (sh && ds4_exl3_dense_launch(sh->down, sh->k2_down, sh->h, sh->ys, T, sh->mid, w.out_dim, sh->ws, sh->ws_bytes,
-                                    stream, prompt) != 0) {
-        fprintf(stderr, "%s: the shared expert's down declined -- no fallback\n", tag);
-        return -1;
-    }
     /* the down: its source row is the pair (the fold wrote one mid row per pair) */
     rc = project(EXL3_ARM_DOWN, s.down, nullptr, s.k2_down, b.mid, ids_dst, ids_dst, bounds, b.down_z, nullptr,
                  s.out_dim, s.mid_dim, pairs, E, gemm, tc_ws, tc_bytes, &dp, stream);
     if (rc) { fprintf(stderr, "%s: down declined (rc=%d) -- no fallback\n", tag, rc); return -1; }
+    /* the sum adds the shared expert's output: its fork joins here */
+    if (sh && shared_join(sh->ys, stream, tag) != 0) return -1;
     rc = ds4_exl3_moe_sum_launch(out, dp.z[0], sel, s.down, s.mid_dim, s.out_dim, top_k, T, nf_flag, nf_code, stream,
                                  sh ? sh->ys : nullptr, sh ? sh->scale : nullptr, dp.splits, dp.split_stride);
     return rc ? -1 : 0;
