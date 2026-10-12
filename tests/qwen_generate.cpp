@@ -282,9 +282,17 @@ int main(int argc, char **argv) {
                 return 1;
             }
         }
+        /* QWEN_SPEC_TRACE=path (L288 acceptance curves): one line a round -- the drafts it verified, how many
+         * of them it kept (tokens - 1) and each draft's head confidence -- read before the round from the
+         * bank's pendings (the chain the previous round drafted).  Run with PULSAR_SPEC_TAU=off for the
+         * unstopped chain: greedy output is the same under any draft schedule, so one trace prices them all. */
+        FILE *trace = getenv("QWEN_SPEC_TRACE") ? fopen(getenv("QWEN_SPEC_TRACE"), "w") : NULL;
+        if (getenv("QWEN_SPEC_TRACE") && !trace) { fprintf(stderr, "qwen-generate: cannot write the trace\n"); return 1; }
         const double t0 = now_s();
         int n = 0, rounds = 0;
         while (n < generated) {
+            float conf[16];
+            const uint32_t n_pend = trace ? pulsar_session_bank_pending_confs(sess, 0u, conf) : 0u;
             const int k = pulsar_session_generate_speculative(sess, temp, top_k, top_p, 0.0f, &rng, generated - n,
                                                               out + n, generated - n, err, sizeof(err));
             if (k < 0) {
@@ -292,11 +300,17 @@ int main(int argc, char **argv) {
                 return 1;
             }
             if (k == 0) break;
+            if (trace) {
+                fprintf(trace, "%u %d", n_pend, k - 1);
+                for (uint32_t i = 0; i < n_pend; i++) fprintf(trace, " %.6f", (double)conf[i]);
+                fprintf(trace, "\n");
+            }
             n += k;
             rounds++;
             if (pulsar_token_is_stop(e, out[n - 1])) break;
         }
         const double dt = now_s() - t0;
+        if (trace) fclose(trace);
         printf("qwen-generate: SPEC %d rounds, %.2f tokens a round\n", rounds, rounds ? (double)n / rounds : 0.0);
         if (temp > 0.0f) {
             uint64_t h = 1469598103934665603ull;
