@@ -367,7 +367,11 @@ static int mtp_draft_batch(pulsar_session *s, pulsar_spec_round **rounds, const 
  * serve_matrix 512 tok x3, code / codex / prose / story at T0 and T0.7): depth 4 / 5 / 6 summed 504 / 498 / 500 tok/s
  * over the eight single-stream cells (code greedy 77.8 / 79.8 / 79.8 at 3.88 / 4.29 / 4.48 tokens a round; codex
  * and story T0.7 lose 4-8 % deeper), 2 streams 86.7 / 83.7 / 83.8, 4 streams 101.4 / 102.5 / 101.7: a deeper
- * chain buys tokens on code but each verify row costs more than it returns elsewhere, so 4 stays. */
+ * chain buys tokens on code but each verify row costs more than it returns elsewhere, so 4 stays.  L288
+ * (2026-10-12, sdet accept rule, td305 + U-e4-d5): this drafter accepts as well as TensorFold's on the same tokens
+ * (teacher-forced, tools/qwen/accept); the deeper chains TF runs pay there because a draft costs 3.43 ms against
+ * 4.45 here (verify row 2.49 + MTP step 1.74, 0.98 of it this draft head's MXFP8 read).  Depth 6 vs 4: single
+ * stream -1..+4 %, 4 / 8 streams -3 % on both models -- 4 stays until a draft step is cheaper. */
 const pulsar_drafter_ops k_mtp_drafter = {
     /* .name          = */ "MTP",
     /* .depth         = */ 4u,
