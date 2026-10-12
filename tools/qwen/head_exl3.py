@@ -104,20 +104,23 @@ def draft_ids(extra=None):
 # ---- hessian ------------------------------------------------------------------------------------------------------
 def cmd_hessian(a):
     import torch
-    H = torch.zeros(N_EMBD, N_EMBD, dtype=torch.float64)
+    dev = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+    H = torch.zeros(N_EMBD, N_EMBD, dtype=torch.float64, device=dev)
     count = 0
     for fn in a.rows:
         n = os.path.getsize(fn) // (2 * N_EMBD)
         if os.path.getsize(fn) != n * 2 * N_EMBD:
             raise SystemExit(f'{fn}: not whole bf16 [n][{N_EMBD}] rows')
         mm = np.memmap(fn, dtype=np.uint16, mode='r', shape=(n, N_EMBD))
-        for s in range(0, n, 32768):
-            x = torch.from_numpy((mm[s:s + 32768].astype(np.uint32) << 16).view(np.float32)).double()
+        for s in range(0, n, 16384):
+            # each chunk's sum in f32 (16k terms), the chunks summed in f64
+            x = torch.from_numpy((mm[s:s + 16384].astype(np.uint32) << 16).view(np.float32)).to(dev)
             if not torch.isfinite(x).all():
                 raise SystemExit(f'{fn}: non-finite rows near {s}')
-            H += x.T @ x
+            H += (x.T @ x).double()
         count += n
         print(f'{fn}: {n:,} rows', flush=True)
+    H = H.cpu()
     torch.save({'H': H.float(), 'count': count, 'files': a.rows}, a.out)
     d = torch.diagonal(H) / count
     print(f'H over {count:,} rows -> {a.out}: diag mean {d.mean():.4e} min {d.min():.3e} max {d.max():.3e}')

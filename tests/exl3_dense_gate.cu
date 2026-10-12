@@ -425,6 +425,24 @@ int main(void) {
                    "its columns %s, vs double max rel %.2e (median <= %.2e)\n", hd.what, N, k2 / 2,
                    ds4_exl3_dense_splits(K, N), N / 128, diff_m ? "DIFFER" : "bit-identical to M=16's rows", W,
                    wdiff ? "DIFFER" : "bit for bit", wmx, wmed);
+            /* timed (information, not graded): a call at 1 / 4 / 16 rows, GB/s over the weight's bytes */
+            cudaEvent_t e0, e1;
+            CUDA_OK(cudaEventCreate(&e0));
+            CUDA_OK(cudaEventCreate(&e1));
+            printf("    time:");
+            for (const int M : {1, 4, 16}) {
+                for (int i = 0; i < 3; i++) (void)ds4_exl3_dense_launch(d.w, k2, d.q, d.y, M, K, N, d.ws, d.ws_bytes, 0);
+                CUDA_OK(cudaEventRecord(e0));
+                for (int i = 0; i < 20; i++) (void)ds4_exl3_dense_launch(d.w, k2, d.q, d.y, M, K, N, d.ws, d.ws_bytes, 0);
+                CUDA_OK(cudaEventRecord(e1));
+                CUDA_OK(cudaEventSynchronize(e1));
+                float ms = 0;
+                CUDA_OK(cudaEventElapsedTime(&ms, e0, e1));
+                printf("  %2d rows %.3f ms (%.0f GB/s)", M, ms / 20, (double)w.stride / (ms / 20 * 1e-3) / 1e9);
+            }
+            printf("\n");
+            cudaEventDestroy(e0);
+            cudaEventDestroy(e1);
             release(d);
         }
     }
