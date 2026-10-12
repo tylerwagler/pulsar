@@ -10,11 +10,13 @@
  *   - a coff-1 (ratio 128) lane: canonical-empty at a 128 boundary (every slot is rewritten before
  *     the next emit reads it), so it is reset, not stored.
  * A session payload's FRONTIER T (L284, the kv-state payload) is the same state at any position: the
- * frontier walk adds the coff-1 lanes, which hold T's open group off a 128 boundary, and the drafter's rings
- * (a restored session speculates on as the saved one would).
+ * frontier walk adds the coff-1 lanes, which hold T's open group off a 128 boundary, the drafter's rings
+ * (a restored session speculates on as the saved one would) and, on an Engram model, the bank's history ring
+ * (L289: the next row's n-gram reads the positions before it by tag, and a frontier restore -- a payload, a
+ * prompt end -- evaluates no row that would re-seed it).
  * Nothing else carries across a position: the HC residual is per token, logits are not kept (a
- * resume always evaluates at least one token past G), and the drafter rings are rebuilt from the
- * prompt the way every rewind already does.
+ * grid resume always evaluates at least one token past G; a prompt end keeps its own, kv_state.h), and the
+ * drafter rings are rebuilt from the prompt the way every rewind already does.
  *
  * THE RESUME GRID (L195/L218): a continuation is a cold prefill from G = the last multiple of the
  * grid at or below the PREFILL frontier (decode rows are the decode kernels' and can never equal a
@@ -101,6 +103,18 @@ static bool ds4_walk(void *state, int dir, bool frontier, pulsar_gpu_tensor *sla
         }
         off += sizeof(c);
     }
+    /* L289: the frontier's Engram history ring (host), the bank's PULSAR_ENGRAM_RING tagged ids */
+    if (frontier && g->engram.model) {
+        const uint32_t bank = gpu_graph_cur_bank(g);
+        int32_t *tok = g->engram.ring_tok + (size_t)bank * PULSAR_ENGRAM_RING;
+        uint32_t *pos = g->engram.ring_pos + (size_t)bank * PULSAR_ENGRAM_RING;
+        const uint64_t tb = PULSAR_ENGRAM_RING * sizeof(int32_t), pb = PULSAR_ENGRAM_RING * sizeof(uint32_t);
+        if (ok && dir == 0)
+            ok = pulsar_gpu_tensor_write(slab, off, tok, tb) != 0 && pulsar_gpu_tensor_write(slab, off + tb, pos, pb) != 0;
+        else if (ok && dir > 0)
+            ok = pulsar_gpu_tensor_read(slab, off, tok, tb) != 0 && pulsar_gpu_tensor_read(slab, off + tb, pos, pb) != 0;
+        off += tb + pb;
+    }
     if (bytes_out) *bytes_out = off - slot_off;
     return ok;
 }
@@ -141,17 +155,18 @@ static bool ds4_prepare_restore(void *state, uint32_t G) {
     const uint32_t bank = gpu_graph_cur_bank(g);
     /* Frontier first: lowering it drops the checkpoints above G (not this one, which sits exactly
      * at G/ratio).  Then every lane to the canonical boundary state; the walk brings the coff-2
-     * lanes back from the slot, and a coff-1 lane at G IS the canonical state. */
+     * lanes back from the slot, and a coff-1 lane at G IS the canonical state.  The bank's Engram history
+     * is whatever it held before the restore: the step that resumes from G re-seeds it from its prompt
+     * (gpu_graph_engram_stage), and a step that does not refuses instead of hashing stale ids (a FRONTIER
+     * restore -- install_frontier -- brings the ring back with its walk instead, L289). */
     ds4_set_frontier(g, bank, G);
+    gpu_graph_engram_forget(g, bank);
     return gpu_graph_compressor_state_reset(g, bank);
 }
 
 static void ds4_restored(void *state) {
     pulsar_gpu_graph *g = G_(state);
     g->ms_comp_state_stale[gpu_graph_cur_bank(g)] = false;
-    /* the bank's Engram history is whatever it held before the restore: the step that resumes from G re-seeds
-     * it from its prompt (gpu_graph_engram_stage), and a step that does not refuses instead of hashing stale ids */
-    gpu_graph_engram_forget(g, gpu_graph_cur_bank(g));
 }
 
 static void ds4_set_frontier_stale(void *state, uint32_t G) {

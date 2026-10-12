@@ -1155,7 +1155,17 @@ uint32_t pulsar_session_resume_point(pulsar_session *s, uint32_t bank, int commo
     if (limit > frontier) limit = frontier;
     if (limit > (uint32_t)prompt_len - 1u) limit = (uint32_t)prompt_len - 1u;
     const pulsar_ckpt_store *st = pulsar_session_kv_store(s);
-    return limit && st && st->ops ? pulsar_ckpt_best(st, bank, limit) : 0u;
+    if (!st || !st->ops) return 0u;
+    const uint32_t G = limit ? pulsar_ckpt_best(st, bank, limit) : 0u;
+    /* L289: the bank's prompt end T, when the prompt IS that prompt: it resumes AT T with the logits its prefill
+     * left -- no row evaluated, every family.  (A longer prompt resumes from the grid as before: a payload carries
+     * the grid checkpoint, so a restored session resumes as the saved one would.) */
+    const uint32_t T = pulsar_ckpt_end(st, bank);
+    if (T > G && T == (uint32_t)prompt_len && T <= (uint32_t)common && T <= frontier) {
+        const pulsar_tokens *h = pulsar_bank_history(s, bank);
+        if (h && pulsar_ckpt_end_matches(st, bank, h->v, (uint32_t)h->len)) return T;
+    }
+    return G;
 }
 bool pulsar_session_bank_continues(pulsar_session *s, uint32_t bank, int len) {
     const pulsar_ckpt_store *st = pulsar_session_kv_store(s);

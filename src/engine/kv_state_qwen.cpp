@@ -98,6 +98,7 @@ static bool qwen_prepare_restore(void *state, uint32_t G) {
     qwen_bank_set_pos(st, bank, G);
     st->prefill_pos[bank] = G;
     st->mtp_pend_pos[bank] = st->mtp ? G - 1u : UINT32_MAX;
+    if (st->mtp) st->mtp_stage_dirty[bank] = false;   /* L289: the walk writes the true tail; no draft rows over it */
     return true;   /* the logits: the caller's (s->logits_stale after a restore) */
 }
 

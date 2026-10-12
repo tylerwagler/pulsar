@@ -1736,9 +1736,14 @@ static inline uint32_t gpu_graph_n_comp(const pulsar_gpu_graph *g, uint32_t bank
 static inline void gpu_graph_set_n_comp(pulsar_gpu_graph *g, uint32_t bank, uint32_t il, uint32_t rows) {
     /* L264: rows below a checkpoint's frontier may be rewritten once the counter
      * drops under them, so the checkpoint goes with them -- here, where every
-     * rewind, cut and invalidate already passes. */
-    if (rows < g->ms_n_comp[bank][il])
-        pulsar_ckpt_frontier_lowered(&g->ckpt, bank, rows * pulsar_layer_compress_ratio(il));
+     * rewind, cut and invalidate already passes.  The intact rows [0, rows) serve
+     * every position up to rows * R + R - 1 (a position's open group is its lanes'):
+     * a grid checkpoint (a multiple of R) is dropped exactly as at rows * R, and a
+     * prompt end inside the group (L289) survives a round's rollback to it. */
+    if (rows < g->ms_n_comp[bank][il]) {
+        const uint32_t R = pulsar_layer_compress_ratio(il);
+        pulsar_ckpt_frontier_lowered(&g->ckpt, bank, rows * R + R - 1u);
+    }
     g->ms_n_comp[bank][il] = rows;
     if (rows > g->ms_comp_hw[bank][il]) g->ms_comp_hw[bank][il] = rows;
 }

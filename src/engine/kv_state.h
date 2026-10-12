@@ -134,6 +134,20 @@ typedef struct pulsar_ckpt_store {
     struct pulsar_gpu_tensor *slab[PULSAR_MSEQ_MAX];
     uint64_t slot_bytes;
     uint32_t pos[PULSAR_MSEQ_MAX][PULSAR_CKPT_SLOTS_MAX];
+    /** L289: per bank, its PROMPT END -- the state a classic sync's prefill left at the prompt's last token T: the
+     *  model's FRONTIER walk at T and the logits row that prefill headed.  Valid by the frontier rule like a grid checkpoint (end_pos 0 once
+     *  the history falls below T).  A sync of the same prompt resumes AT T with no row prefilled (every family:
+     *  the state is the prefill's own, copied whole). */
+    struct pulsar_gpu_tensor *end_slab[PULSAR_MSEQ_MAX];
+    uint64_t end_cap[PULSAR_MSEQ_MAX];      ///< end_slab[b]'s bytes (it grows when a drafter loads after the store)
+    uint32_t end_pos[PULSAR_MSEQ_MAX];      ///< T, 0 = none
+    float *end_logits[PULSAR_MSEQ_MAX];     ///< host, end_width floats
+    uint32_t end_width;
+    /** host: the T token ids the record's state is the prefill of -- the match authority at a resume (a history
+     *  rewound inside T's last compressor group and re-prefilled with other ids keeps the record's rows, not its
+     *  tokens) */
+    int32_t *end_tokens[PULSAR_MSEQ_MAX];
+    uint32_t end_tokens_cap[PULSAR_MSEQ_MAX];
 } pulsar_ckpt_store;
 
 bool pulsar_ckpt_alloc(pulsar_ckpt_store *st, const pulsar_kv_state_ops *ops, void *state, uint32_t n_banks);
@@ -147,7 +161,8 @@ bool pulsar_ckpt_landed(pulsar_ckpt_store *st, uint32_t bank, uint32_t T);
 bool pulsar_ckpt_restore(pulsar_ckpt_store *st, uint32_t bank, uint32_t G);
 /** The deepest checkpoint G <= limit `bank` holds; 0 when none. */
 uint32_t pulsar_ckpt_best(const pulsar_ckpt_store *st, uint32_t bank, uint32_t limit);
-/** `bank`'s history now reaches only `tokens`: the checkpoints above it go. */
+/** `bank`'s history now reaches only `tokens`: the checkpoints above it go (and a prompt end above it -- a model
+ *  whose pools hold R tokens a whole row passes the deepest position its intact rows serve, R * rows + R - 1). */
 void pulsar_ckpt_frontier_lowered(pulsar_ckpt_store *st, uint32_t bank, uint32_t tokens);
 /** Drop every checkpoint of `bank`: its history was replaced wholesale. */
 void pulsar_ckpt_drop_bank(pulsar_ckpt_store *st, uint32_t bank);
@@ -162,6 +177,21 @@ void pulsar_ckpt_commit(pulsar_ckpt_store *st, uint32_t bank, uint32_t slot, uin
 static inline uint32_t pulsar_ckpt_grid_floor(const pulsar_ckpt_store *st, uint32_t pos) {
     return pos / st->ops->resume_grid * st->ops->resume_grid;
 }
+/** L289: capture the installed `bank`'s prompt end at T with the logits the prefill left there (`width` floats).
+ *  The model confirms a live frontier at T (ops->frontier_at); false, said, when not or when a copy fails (the bank
+ *  then holds no prompt end). */
+bool pulsar_ckpt_end_capture(pulsar_ckpt_store *st, uint32_t bank, uint32_t T, const int *tokens, const float *logits,
+                             uint32_t width);
+/** Is `bank`'s prompt end the prefill of tokens[0, T) -- T its position, len >= T and the ids equal? */
+bool pulsar_ckpt_end_matches(const pulsar_ckpt_store *st, uint32_t bank, const int *tokens, uint32_t len);
+/** `bank`'s prompt end T, 0 when none. */
+static inline uint32_t pulsar_ckpt_end(const pulsar_ckpt_store *st, uint32_t bank) {
+    return bank < PULSAR_MSEQ_MAX ? st->end_pos[bank] : 0u;
+}
+/** Put the installed `bank` back at its prompt end T: the counters at T (prefilled to T), every lane and open row
+ *  from the record, the grid checkpoints above T dropped; *logits (width floats, when non-NULL) is the row the
+ *  prefill left at T.  False when the bank holds none or a copy failed (its state then describes no position). */
+bool pulsar_ckpt_end_restore(pulsar_ckpt_store *st, uint32_t bank, float *logits, uint32_t width);
 /** Where a walk's FINAL chunk [pos0, end) ends (P13, every walk's): at the prompt's last grid point when that lies
  *  strictly inside it -- so the prefill leaves the checkpoint the next turn resumes from -- else at `end`.  The
  *  caller keeps an image block whole around it. */
