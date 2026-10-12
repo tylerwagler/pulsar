@@ -997,22 +997,31 @@ bool pulsar_qwen_s4_spec_rollback(const pulsar_qwen_step *v, uint32_t keep) {
     if (run == sp.n_runs) return fail("a rollback names a bank the last verify step did not carry");
     const uint32_t f = sp.run_first[run], R = sp.run_first[run + 1] - f;
     if (keep == 0 || keep > R) return fail("a rollback keeps 1 .. the run's rows");
-    if (keep == R) return true;
     const pulsar_qwen_shape *s = v->shape;
     const uint64_t b = (uint64_t)sp.run_bank[run];
+    /* L288: every GDN layer's recurrent state advances by the kept rows -- the verify left it as it found it --
+     * at every keep, a full accept included */
+    const int tp = (int)pulsar_qwen_tp(s);
+    const size_t uf = pulsar_gdn_upd_floats(tp);
+    bool ok = true;
+    for (uint32_t il = 0; ok && il < v->plan->n_layer; il++)
+        if (v->plan->kind[il] == PULSAR_LAYER_QWEN_GDN)
+            ok = pulsar_gdn_commit((float *)dptr(q->layer[il].gdn_state), (int)b,
+                                   (const float *)dptr(sp.gdn_upd) + ((size_t)sp.ord[il] * PULSAR_QWEN_SPEC_ROWS + f) * uf,
+                                   (int)keep, tp, 0) == 0;
+    if (!ok) return fail("a verify commit of the recurrent state failed");
+    if (keep == R) return true;
     const uint32_t p0 = (uint32_t)sp.run_pos0[run], pnext = p0 + keep;
-    const uint64_t gsb = pulsar_qwen_gdn_state_bytes(s), gcb = pulsar_qwen_gdn_conv_bytes(s);
+    const uint64_t gcb = pulsar_qwen_gdn_conv_bytes(s);
     const uint64_t pcb = pulsar_qwen_ple_conv_bytes(s), itb = pulsar_qwen_index_tail_bytes(s);
     const uint64_t kb = PULSAR_QSA_IDX_DIM * sizeof(float);
     const uint64_t key_off = (uint64_t)PULSAR_QSA_IDX_HEADS * PULSAR_QSA_IDX_DIM * sizeof(float);
-    bool ok = true;
     for (uint32_t il = 0; ok && il < v->plan->n_layer; il++) {
         pulsar_qwen_layer_state &L = q->layer[il];
         const uint64_t o = sp.ord[il];
         if (v->plan->kind[il] == PULSAR_LAYER_QWEN_GDN) {
             const uint64_t slot = o * PULSAR_QWEN_SPEC_ROWS + f + (keep - 1u);
-            ok = pulsar_gpu_tensor_copy_async(L.gdn_state, b * gsb, sp.gdn_rec, slot * gsb, gsb) != 0 &&
-                 pulsar_gpu_tensor_copy_async(L.gdn_conv, b * gcb, sp.gdn_conv, slot * gcb, gcb) != 0;
+            ok = pulsar_gpu_tensor_copy_async(L.gdn_conv, b * gcb, sp.gdn_conv, slot * gcb, gcb) != 0;
         } else {
             /* the stage as the step found it, then the kept rows of the block that is open at pnext */
             ok = pulsar_gpu_tensor_copy_async(L.idx_tail, b * itb, sp.qsa_stage, (o * PULSAR_QWEN_SPEC_ROWS + run) * itb,
@@ -1124,11 +1133,12 @@ bool pulsar_qwen_s2_gdn(const pulsar_qwen_step *st, uint32_t il) {
             v.n_seq = 1;
             v.seq_rows = (int)st->n_dec;
         }
-        if (st->verify) {                           /* L251 MTP: the per-row states a rollback copies back */
+        if (st->verify) {   /* L251 MTP: the per-row conv states a rollback copies back; L288: the recurrent
+                             * state is left for the commit, which applies the kept rows' updates */
             const pulsar_qwen_spec_capture &sp = st->st->spec;
             const size_t slot = (size_t)sp.ord[il] * PULSAR_QWEN_SPEC_ROWS;   /* row r of the step at slot + r */
             v.conv_rows = (float *)dptr(sp.gdn_conv) + slot * (pulsar_qwen_gdn_conv_bytes(s) / sizeof(float));
-            v.rec_rows  = (float *)dptr(sp.gdn_rec) + slot * (pulsar_qwen_gdn_state_bytes(s) / sizeof(float));
+            v.rec_upd   = (float *)dptr(sp.gdn_upd) + slot * pulsar_gdn_upd_floats(c.tp_ranks);
         }
         if (pulsar_gdn_forward(&gw, &v, 0) != 0) return fail("pulsar_gdn_forward failed (the verify rows)");
     }

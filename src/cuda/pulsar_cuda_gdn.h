@@ -123,14 +123,18 @@ typedef struct {
     void          *out_e4m3;          /**< A8 slot data [rows][6144] or NULL */
     void          *out_scale;         /**< A8 slot ue8m0 scales (zeroed by the slot owner) */
     int            out_kbp;           /**< must equal pulsar_mx_kbp(6144) = 192 */
-    /** L251 MTP verify: the state AFTER each row of a sequence but its last (the last row's is the pool's),
-     *  so a rejected draft rolls back by copying that row's back.  Indexed by the call's ROW (L272 P1 S4:
-     *  any number of sequences -- row r of sequence s at slot seq_first[s] + r; each sequence's last-row
-     *  slot is unused).  Both NULL (every other call) or both set:
-     *    conv_rows [rows][PULSAR_GDN_CONV_STATE_FLOATS], rec_rows [rows][PULSAR_GDN_REC_STATE_FLOATS].
-     *  The arithmetic is unchanged -- the kernels only also store what they hold. */
+    /** L251 MTP verify: conv_rows holds the conv state AFTER each row of a sequence but its last (the last
+     *  row's is the pool's), so a rejected draft rolls back by copying that row's back.  Indexed by the call's
+     *  ROW (L272 P1 S4: any number of sequences -- row r of sequence s at slot seq_first[s] + r; each sequence's
+     *  last-row slot is unused).
+     *  L288: the RECURRENT state is not captured per row (3 MiB a row a layer was the verify's cost at 4
+     *  streams): with rec_upd set the call READS the pool's recurrent state and leaves it as it was, and stores
+     *  each row's rank-1 update instead -- [rows][pulsar_gdn_upd_floats(tp)]: the row's delta [NV][DV], its k^
+     *  [NK][DK] and its decay [NV] -- so pulsar_gdn_commit advances a sequence by any prefix of its rows with
+     *  exactly the arithmetic this call ran.  Both NULL (every other call) or both set.  The outputs are
+     *  unchanged. */
     float         *conv_rows;
-    float         *rec_rows;
+    float         *rec_upd;
     /** L266 step 7: the tensor-parallel degree (0 or 1 = the whole layer).  At 2 the call is ONE rank's
      *  heads -- NK / 2 key heads and the NV / 2 value heads reading them -- with its own qkv / z / a / b
      *  rows, conv channels, A_log and dt_bias (the caller offsets the pointers), state pools of
@@ -146,8 +150,19 @@ size_t pulsar_gdn_scratch_bytes(int rows);
 size_t pulsar_gdn_conv_state_floats(int tp_ranks);
 size_t pulsar_gdn_rec_state_floats(int tp_ranks);
 
+/** L288: floats per row of a verify's recurrent update (pulsar_gdn_call::rec_upd) for one rank at the
+ *  tensor-parallel degree tp_ranks: NV x DV deltas, NK x DK k^, NV decays (the rank's heads), padded to 4. */
+size_t pulsar_gdn_upd_floats(int tp_ranks);
+
+/** L288: advance ONE slot's recurrent state by the first `keep` rows of a verify sequence: `upd` is the
+ *  sequence's first row in the verify's rec_upd.  Each state element takes S = fmaf(k^_k, delta_v, decay * S)
+ *  per row, the operation pulsar_gdn_forward's recurrence performs, on the same f32 values -- so the state is
+ *  BIT-IDENTICAL to a forward over those rows.  keep 1 .. the sequence's rows.  0, or -1 refused. */
+int pulsar_gdn_commit(float *rec_state, int slot, const float *upd, int keep, int tp_ranks, cudaStream_t stream);
+
 /** Run the whole non-Linear GDN block for one layer on `stream` (two
- *  kernels).  Advances both states of every sequence in the call.
+ *  kernels).  Advances both states of every sequence in the call (L288: the recurrent state stays as it was
+ *  under rec_upd -- the commit advances it).
  *  Distinct sequences of one call must be on distinct slots.
  *  @return 0 on success, -1 on a refused contract (named on stderr, nothing
  *  launched), -3 on a launch failure. */

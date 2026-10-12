@@ -7,8 +7,10 @@
  *            lane reaches the same step through decode_mixed with heads on every row).  k + 1 <= 7, so
  *            every kernel takes its decode-width arm and each row's logits are the bytes one-token
  *            decode would give.
- *   commit   the recurrent state rolls back to the last kept row (pulsar_qwen_s4_spec_rollback over the
- *            capture), the bank's position counter moves, the logits are the kept row's.
+ *   commit   the recurrent state is set to the last kept row's (pulsar_qwen_s4_spec_rollback over the
+ *            capture: L288 the GDN recurrent state, which the verify left untouched, advanced by the kept
+ *            rows' updates; the rest rolled back), the bank's position counter moves, the logits are the
+ *            kept row's.
  *   absorb   the MTP layer catches up: its stage back to the snapshot the draft chain took, the kept
  *            rows' MTP rows (stack at p + i, the token after it) in one PREFILL step of decode rows (L288),
  *            the last kept row's stack parked in mtp_pend for the next draft.

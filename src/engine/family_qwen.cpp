@@ -13,6 +13,7 @@
 #include "tp/pulsar_tp.h"
 #include "spec_internal.h"
 #include "qwen_forward.h"
+#include "cuda/pulsar_cuda_gdn.h"
 
 #include <algorithm>
 
@@ -859,7 +860,7 @@ static void qwen_state_free(pulsar_qwen_state *st) {
     pulsar_gpu_tensor_free(st->mtp_pend);
     free(st->mtp_pend_pos);
     free(st->spec_logits);
-    pulsar_gpu_tensor_free(st->spec.gdn_rec);
+    pulsar_gpu_tensor_free(st->spec.gdn_upd);
     pulsar_gpu_tensor_free(st->spec.gdn_conv);
     pulsar_gpu_tensor_free(st->spec.ple);
     pulsar_gpu_tensor_free(st->spec.qsa_stage);
@@ -944,21 +945,23 @@ static pulsar_qwen_state *qwen_state_alloc(const pulsar_qwen_shape *s, const pul
     for (uint32_t b = 0; b < n_banks; b++) st->mtp_pend_pos[b] = UINT32_MAX;
     if (mtp) st->spec_logits = (float *)xmalloc((size_t)PULSAR_QWEN_SPEC_ROWS * s->n_vocab * sizeof(float));
     if (ok && mtp) {
-        /* the verify capture (L272 P1 S4: every bank's run of one step): per-row recurrent states at the row's
-         * step index, each QSA layer's stage per run + the rows' raw keys; the MTP layer's stage per bank */
+        /* the verify capture (L272 P1 S4: every bank's run of one step): per-row conv states and (L288) recurrent
+         * updates at the row's step index, each QSA layer's stage per run + the rows' raw keys; the MTP layer's
+         * stage per bank */
         pulsar_qwen_spec_capture &sp = st->spec;
         for (uint32_t il = 0; il < plan->n_layer; il++)
             sp.ord[il] = (uint8_t)(plan->kind[il] == PULSAR_LAYER_QWEN_GDN ? sp.n_gdn++ : sp.n_qsa++);
         sp.ord[plan->n_layer] = (uint8_t)sp.n_qsa;           /* the MTP layer's stage slot */
         const uint64_t D = PULSAR_QWEN_SPEC_ROWS;
-        sp.gdn_rec   = pulsar_gpu_tensor_alloc((uint64_t)sp.n_gdn * D * pulsar_qwen_gdn_state_bytes(s));
+        sp.gdn_upd   = pulsar_gpu_tensor_alloc((uint64_t)sp.n_gdn * D * pulsar_gdn_upd_floats((int)pulsar_qwen_tp(s)) *
+                                               sizeof(float));
         sp.gdn_conv  = pulsar_gpu_tensor_alloc((uint64_t)sp.n_gdn * D * pulsar_qwen_gdn_conv_bytes(s));
         sp.ple       = pulsar_gpu_tensor_alloc(D * pulsar_qwen_ple_conv_bytes(s));
         sp.qsa_stage = pulsar_gpu_tensor_alloc((uint64_t)sp.n_qsa * D * pulsar_qwen_index_tail_bytes(s));
         sp.qsa_keys  = pulsar_gpu_tensor_alloc((uint64_t)sp.n_qsa * D * PULSAR_QSA_IDX_IN * sizeof(float));
         st->mtp_stage = pulsar_gpu_tensor_alloc((uint64_t)n_banks * pulsar_qwen_index_tail_bytes(s));
         st->run_first_dev = pulsar_gpu_tensor_alloc((uint64_t)(D + 1u) * sizeof(int32_t));
-        ok = sp.gdn_rec && sp.gdn_conv && sp.ple && sp.qsa_stage && sp.qsa_keys && st->mtp_stage && st->run_first_dev;
+        ok = sp.gdn_upd && sp.gdn_conv && sp.ple && sp.qsa_stage && sp.qsa_keys && st->mtp_stage && st->run_first_dev;
     }
     if (mtp) st->mtp_stage_dirty = (bool *)xcalloc(n_banks, sizeof(bool));
     if (ok && mtp) {
