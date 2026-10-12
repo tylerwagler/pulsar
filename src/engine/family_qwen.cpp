@@ -14,6 +14,8 @@
 #include "spec_internal.h"
 #include "qwen_forward.h"
 
+#include <algorithm>
+
 const pulsar_qwen_shape PULSAR_QWEN_SHAPE_FLASH_NEXT = {
     /* .name              = */ "Qwen3.8-Flash-Next",
     /* .n_layer           = */ 48,
@@ -569,6 +571,62 @@ static bool qwen_load_tokenizer(pulsar_engine *e, const char *model_path) {
     return true;
 }
 
+#include "qwen_draft_vocab.inc"
+
+/* L288: the MTP draft head's ids (pulsar_qwen_weights::draft_ids, ascending): [0, QWEN_DRAFT_PREFIX), the first
+ * `extra` ids of the frequency-ranked list above it (qwen_draft_vocab.inc, tools/qwen/draft_vocab.py), and the
+ * added / special ids [eos_id, n_vocab).  The list was ranked under this checkpoint's tokenizer: the digest of its
+ * ids' token bytes is recomputed here and a mismatch refuses (it would rank another tokenizer's tokens).  The head
+ * itself is gathered on the device at the first MTP head (family_qwen_s4.cpp). */
+static bool qwen_draft_vocab(pulsar_engine *e) {
+    const pulsar_qwen_shape *s = &g_qwen_shape;
+    pulsar_qwen_weights *w = e->qwen_weights;
+    const uint32_t n_list = (uint32_t)(sizeof k_qwen_draft_extra / sizeof k_qwen_draft_extra[0]);
+    uint64_t h = 1469598103934665603ull;
+    bool ok = QWEN_DRAFT_PREFIX <= s->eos_id;
+    for (uint32_t i = 0; ok && i < n_list; i++) {
+        const int32_t id = k_qwen_draft_extra[i];
+        size_t len = 0;
+        const char *b = id >= (int32_t)QWEN_DRAFT_PREFIX && (uint32_t)id < s->eos_id
+                            ? qwen_tokenizer_token_bytes(e->qwen_tok, id, &len) : NULL;
+        ok = b != NULL;
+        for (size_t j = 0; ok && j <= len; j++) {
+            h ^= j < len ? (uint8_t)b[j] : 0xffu;
+            h *= 1099511628211ull;
+        }
+    }
+    if (!ok || h != QWEN_DRAFT_VOCAB_DIGEST) {
+        fprintf(stderr, "pulsar: %s: the MTP draft vocabulary (qwen_draft_vocab.inc) was ranked under another "
+                        "tokenizer (digest %016llx, want %016llx) -- regenerate it with tools/qwen/draft_vocab.py; "
+                        "refusing\n", PULSAR_QWEN_ARCH, (unsigned long long)h,
+                (unsigned long long)QWEN_DRAFT_VOCAB_DIGEST);
+        return false;
+    }
+    /* PULSAR_QWEN_MTP_DRAFT_EXTRA: how many of the ranked ids the head carries (the sweep's knob; proposals only) */
+    uint32_t extra = QWEN_DRAFT_EXTRA_DEFAULT;
+    const char *ev = getenv("PULSAR_QWEN_MTP_DRAFT_EXTRA");
+    if (ev && ev[0]) extra = (uint32_t)strtoul(ev, NULL, 10);
+    if (extra > n_list) {
+        fprintf(stderr, "pulsar: %s: PULSAR_QWEN_MTP_DRAFT_EXTRA=%u exceeds the %u ranked ids; refusing\n",
+                PULSAR_QWEN_ARCH, extra, n_list);
+        return false;
+    }
+    std::vector<int32_t> top(k_qwen_draft_extra, k_qwen_draft_extra + extra);
+    std::sort(top.begin(), top.end());
+    const uint32_t nd = QWEN_DRAFT_PREFIX + extra + (s->n_vocab - s->eos_id);
+    int32_t *ids = (int32_t *)xmalloc((size_t)nd * sizeof(int32_t));
+    uint32_t k = 0;
+    for (uint32_t i = 0; i < QWEN_DRAFT_PREFIX; i++) ids[k++] = (int32_t)i;
+    for (int32_t id : top) ids[k++] = id;
+    for (uint32_t i = s->eos_id; i < s->n_vocab; i++) ids[k++] = (int32_t)i;
+    free(w->draft_ids);
+    w->draft_ids = ids;
+    w->n_draft = nd;
+    fprintf(stderr, "pulsar: %s: MTP draft vocabulary: ids [0, %u) + %u ranked + [%u, %u) = %u rows\n",
+            PULSAR_QWEN_ARCH, QWEN_DRAFT_PREFIX, extra, s->eos_id, s->n_vocab, nd);
+    return true;
+}
+
 static bool qwen_family_load(pulsar_engine *e, const pulsar_engine_options *opt) {
     /* The options that name a DeepSeek-only feature refuse here, by name,
      * rather than being ignored. */
@@ -640,6 +698,7 @@ static bool qwen_family_load(pulsar_engine *e, const pulsar_engine_options *opt)
     /* L272 P1: the MTP layer is the drafter behind the round API (spec_qwen.cpp); the drafter option
      * (--no-dspark) turns drafting off for this family as it does for DeepSeek's */
     if (e->qwen_weights->mtp.present && !opt->dspark_disable) e->drafter_ops = &k_mtp_drafter;
+    if (e->qwen_weights->mtp.present && !qwen_draft_vocab(e)) return false;
     fprintf(stderr, "pulsar: %s: %s, %u GDN + %u QSA layers, PLE at layer %u\n",
             PULSAR_QWEN_ARCH, g_qwen_shape.name,
             pulsar_layer_plan_count(&e->plan, PULSAR_LAYER_QWEN_GDN),

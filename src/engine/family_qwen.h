@@ -263,11 +263,11 @@ typedef struct {
     /** L251: the lm_head as MXFP8 (mxfp8_lt), made on the device from `output` at the first head
      *  step (the bf16 head is 1.27 GB read per decode row; this is half); freed at unload. */
     struct pulsar_gpu_tensor *head_mx;
-    /** L251 MTP: the DRAFT head -- lm_head rows [0, N) and [eos_id, n_vocab) (the added / special ids,
-     *  the stop tokens among them) gathered into one MXFP8 matrix, made at the first MTP head.  The
-     *  drafter's argmax runs over these; verification keeps the full head, so the output is unchanged
-     *  and only the draft cost moves.  N = PULSAR_QWEN_MTP_DRAFT_VOCAB (default 65536; 0 = the full
-     *  head).  draft_ids[i] is row i's token id. */
+    /** L251 MTP: the DRAFT head -- the lm_head rows of draft_ids (ascending: [0, 65536), L288's
+     *  frequency-ranked ids above it, and the added / special ids [eos_id, n_vocab), the stop tokens among
+     *  them; chosen at load by qwen_draft_vocab) gathered into one MXFP8 matrix, made at the first MTP head.
+     *  The drafter's argmax runs over these; verification keeps the full head, so the output is unchanged
+     *  and only the draft cost moves.  draft_ids[i] is row i's token id. */
     struct pulsar_gpu_tensor *draft_head_mx, *draft_ids_dev;
     int32_t *draft_ids;
     uint32_t n_draft;

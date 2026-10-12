@@ -19,6 +19,10 @@ Three modes, one JSON line per cell on stdout (and --out FILE appends them):
 Neither pulsar nor TensorFold's Flash Next CUDA engine honours ignore_eos, so a reply can end early: every cell
 reports the tokens it actually ran.
 
+Against a server with pulsar's /metrics, every single / conc cell also reports the server's own speculation counters
+over its timed runs: srv_tok_per_round (accepted drafts + the base token, per round that carried drafts) and
+srv_drafts_per_round.
+
   serve_matrix.py single  --port 8000 --prompts code,codex,prose,story --temps 0,0.7,1.0 --tokens 512 --reps 3
   serve_matrix.py conc    --port 8000 --streams 4 --temps 0 --tokens 256
   serve_matrix.py prefill --port 8000 --lengths 1024,8192,32768 --tokenizer /srv/models/.../tokenizer.json
@@ -114,6 +118,36 @@ def request(port, kind, text, tokens, temp, seed, model, host="127.0.0.1"):
     return {"t0": t0, "first_evt": first_evt, "stamps": stamps, "tokens": n, "prompt_tokens": pt, "text": "".join(out)}
 
 
+def spec_counters(port, host="127.0.0.1"):
+    """The server's speculation counters (pulsar's /metrics, vLLM names): drafted / accepted tokens and draft rounds.
+    None when the server has no such endpoint (TensorFold), so a cell then reports the client's view only."""
+    want = {"vllm:spec_decode_num_draft_tokens_total": "drafted", "vllm:spec_decode_num_accepted_tokens_total":
+            "accepted", "vllm:spec_decode_num_drafts_total": "rounds"}
+    try:
+        with urllib.request.urlopen(f"http://{host}:{port}/metrics", timeout=10) as resp:
+            text = resp.read().decode(errors="replace")
+    except Exception:
+        return None
+    out = {}
+    for line in text.splitlines():
+        name = line.split("{", 1)[0].split(" ", 1)[0]
+        if name in want:
+            out[want[name]] = int(float(line.rsplit(" ", 1)[1]))
+    return out if len(out) == len(want) else None
+
+
+def spec_delta(m0, m1):
+    """Server-side tokens per round over a cell: (drafts accepted + one base token) per draft round, and drafts per
+    round -- the rounds that carried drafts (a plain step has none)."""
+    if not m0 or not m1:
+        return {}
+    r = m1["rounds"] - m0["rounds"]
+    if r <= 0:
+        return {"srv_rounds": 0}
+    return {"srv_rounds": r, "srv_tok_per_round": round(1 + (m1["accepted"] - m0["accepted"]) / r, 3),
+            "srv_drafts_per_round": round((m1["drafted"] - m0["drafted"]) / r, 3)}
+
+
 def bursts(stamps):
     return [stamps[0]] + [b for a, b in zip(stamps, stamps[1:]) if b - a > 0.002] if stamps else []
 
@@ -141,7 +175,9 @@ def run_single(a):
         text = text if text is not None else story_prompt()
         for temp in [float(t) for t in a.temps.split(",")]:
             request(a.port, kind, text, min(a.tokens, 64), temp, 1233, a.model)          # warm-up
+            m0 = spec_counters(a.port)
             runs = [request(a.port, kind, text, a.tokens, temp, 1234 + i, a.model) for i in range(a.reps)]
+            m1 = spec_counters(a.port)
             stats = [one_stats(r) for r in runs]
             tps = [s["decode_tps"] for s in stats if s["decode_tps"]]
             emit({"mode": "single", "label": a.label, "prompt": name, "temp": temp, "max_tokens": a.tokens,
@@ -150,6 +186,7 @@ def run_single(a):
                   "decode_tps_all": [round(x, 2) for x in tps],
                   "tok_per_burst": round(statistics.median(s["tok_per_burst"] for s in stats), 2),
                   "ttft_s_median": round(statistics.median(s["ttft_s"] for s in stats), 3),
+                  **spec_delta(m0, m1),
                   "sample": runs[0]["text"][:100]}, a.out)
 
 
@@ -163,11 +200,13 @@ def run_conc(a):
                              temp, 1234 + i, a.model)
 
         th = [threading.Thread(target=go, args=(i,)) for i in range(n)]
+        m0 = spec_counters(a.port)
         start = time.perf_counter()
         for t in th:
             t.start()
         for t in th:
             t.join()
+        m1 = spec_counters(a.port)
         bad = [i for i, r in enumerate(res) if r is None or len(r["stamps"]) < 2]
         if bad:
             sys.exit(f"serve_matrix: stream(s) {bad} failed or produced < 2 chunks -- no measurement")
@@ -185,7 +224,7 @@ def run_conc(a):
               "per_stream_min": round(min(p for p in per if p), 2),
               "end_to_end_tps": round(sum(r["tokens"] for r in res) / (max(ends) - start), 2),
               "tok_per_burst": round(statistics.median(one_stats(r)["tok_per_burst"] for r in res), 2),
-              "ttft_max_s": round(max(f - r["t0"] for f, r in zip(firsts, res)), 2)}, a.out)
+              "ttft_max_s": round(max(f - r["t0"] for f, r in zip(firsts, res)), 2), **spec_delta(m0, m1)}, a.out)
 
 
 def run_prefill(a):
