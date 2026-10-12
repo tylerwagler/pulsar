@@ -41,15 +41,20 @@
 //              kernels on one stream are serialised, so a slice never serves
 //              two live launches.
 //
-// A launch may carry two projections of one shape and rate over the same rows
-// (gridDim.z / gridDim.y of the prep; a shared expert's gate and up), each with
-// exactly the arithmetic it has alone.
+// A call may carry up to kMaxProj projections of one input over the same rows
+// (L288 exl3-dense: a GDN block's in_proj_qkv + in_proj_z, an attention's
+// q / k / v / index, a shared expert's gate and up), each with its own output
+// width and exactly the arithmetic it has alone: ONE prep launch for all of
+// them (gridDim.y), then ONE GEMV launch per rate among them, whose flat grid
+// runs each projection's (n-tile, split) CTAs in turn.  Fewer, fuller launches:
+// a 512-wide projection alone is 16 x 18 CTAs of a 48-SM GPU, latency-bound.
 
 #include "ds4_exl3_dense.cuh"
 #include "ds4_exl3_dev.cuh"
 #include "cuda/pulsar_cuda_mx.cuh"
 #include "engine/exl3_trellis.h"
 
+#include <climits>
 #include <cstdio>
 #include <cuda_bf16.h>
 
@@ -105,7 +110,26 @@ struct dense_proj {
     __half *hi, *lo;                 ///< the prep planes
     float *inv;
     unsigned *ctr;
+    int N, S;                        ///< its outputs and its split count (dense_splits(K, N))
 };
+
+/** Projections one call carries at most. */
+constexpr int kMaxProj = 4;
+
+/** A launch's projections: GEMV CTA c belongs to the first j with c < end[j] (unused slots end at INT_MAX
+ *  past the last), its local index c - end[j - 1] = split * (N / 32) + n-tile -- the order one projection's own
+ *  (N / 32, S) grid runs in. */
+struct dense_set {
+    dense_proj p[kMaxProj];
+    int end[kMaxProj];
+};
+
+__device__ __forceinline__ int proj_of(const dense_set &P, int c) {
+    return (c >= P.end[0]) + (c >= P.end[1]) + (c >= P.end[2]);
+}
+__device__ __forceinline__ const dense_proj &proj_at(const dense_set &P, int j) {
+    return j == 0 ? P.p[0] : j == 1 ? P.p[1] : j == 2 ? P.p[2] : P.p[3];
+}
 
 __device__ __forceinline__ float pow2f(int e) { return __int_as_float((127 + e) << 23); }   /* e in [-126, 127] */
 
@@ -172,8 +196,8 @@ __device__ __forceinline__ float prep_block(const __nv_bfloat16 *__restrict__ x,
 
 /* 1. PREP: one warp per (row, 128-block), projection blockIdx.y. */
 __global__ void __launch_bounds__(256)
-exl3_dense_prep_kernel(const dense_proj p0, const dense_proj p1, const __nv_bfloat16 *__restrict__ xb, int rows, int K) {
-    const dense_proj &p = blockIdx.y ? p1 : p0;
+exl3_dense_prep_kernel(const dense_set P, const __nv_bfloat16 *__restrict__ xb, int rows, int K) {
+    const dense_proj &p = proj_at(P, (int)blockIdx.y);
     const int64_t task = (int64_t)blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
     const int blocks = K >> 7;
     if (task >= (int64_t)rows * blocks) return;            /* whole warps: task is per warp */
@@ -187,13 +211,16 @@ exl3_dense_prep_kernel(const dense_proj p0, const dense_proj p1, const __nv_bflo
     if ((threadIdx.x & 31) == 0) p.inv[(size_t)m * blocks + blk] = inv;
 }
 
-/* 2. GEMV + EPILOGUE.  grid (N / 32, S, projections): CTA (x, split) owns outputs 32x..32x+31 and the split's
- * k-range. */
+/* 2. GEMV + EPILOGUE.  A flat grid over the set's projections (dense_set): CTA (x, split) of projection j owns
+ * its outputs 32x..32x+31 and the split's k-range. */
 template <int K2>
 __global__ void __launch_bounds__(kOut * kWarps)
-exl3_dense_kernel(const dense_proj p0, const dense_proj p1, const __nv_bfloat16 *__restrict__ xb, int M, int K, int N,
-                  int S) {
-    const dense_proj &p = blockIdx.z ? p1 : p0;
+exl3_dense_kernel(const dense_set P, const __nv_bfloat16 *__restrict__ xb, int M, int K) {
+    const int c = (int)blockIdx.x, j = proj_of(P, c);
+    const dense_proj &p = proj_at(P, j);
+    const int cl = c - (j == 0 ? 0 : j == 1 ? P.end[0] : j == 2 ? P.end[1] : P.end[2]);
+    const int N = p.N, S = p.S, ntiles = N / kOut;
+    const int bx = cl % ntiles;                                   /* the CTA's 32-output tile */
     constexpr int W32 = exl3dev::Rate<K2>::words32;
     constexpr int kTile = kRows * 16;                             /* halves per 16 x 16 A tile */
     static_assert(kWarps * kRows * kOut * 4 <= kWarps * kMaxBlocks * 2 * kTile * 2, "the reduction view must fit the A slots");
@@ -205,7 +232,7 @@ exl3_dense_kernel(const dense_proj p0, const dense_proj p1, const __nv_bfloat16 
     const int warp   = threadIdx.y;
     const int tid    = warp * kOut + lane;
     const int ntn    = N >> 4;
-    const int split  = blockIdx.y;
+    const int split  = cl / ntiles;
     const int nr     = M;                                         /* 1..kRows */
     const int blocks = K >> 7;
     const int b_lo   = (int)((int64_t)split * blocks / S);
@@ -226,7 +253,7 @@ exl3_dense_kernel(const dense_proj p0, const dense_proj p1, const __nv_bfloat16 
             const int kt = (b_lo + i) * 8 + warp;
 #pragma unroll
             for (int j = 0; j < 2; ++j) {
-                const uint32_t *t = p.trellis + ((size_t)kt * (size_t)ntn + (size_t)(blockIdx.x * 2 + j)) * W32;
+                const uint32_t *t = p.trellis + ((size_t)kt * (size_t)ntn + (size_t)(bx * 2 + j)) * W32;
 #pragma unroll
                 for (int h = 0; h < 2; ++h) {
                     wd[i][j][h][0] = t[lo[h]];
@@ -318,13 +345,13 @@ exl3_dense_kernel(const dense_proj p0, const dense_proj p1, const __nv_bfloat16 
         float z = 0.0f;
 #pragma unroll
         for (int w = 0; w < kWarps; ++w) z += s_red[(w * kRows + r) * kOut + lane];
-        p.part[((size_t)split * (size_t)M + (size_t)r) * (size_t)N + (size_t)(blockIdx.x * kOut + lane)] = z;
+        p.part[((size_t)split * (size_t)M + (size_t)r) * (size_t)N + (size_t)(bx * kOut + lane)] = z;
     }
 
     /* 4. the last of the 128-output block's 4 x S CTAs finishes it: splits in split order, H128, svh */
     __threadfence();
     __syncthreads();
-    const int ob = blockIdx.x >> 2;                               /* the 128-output block */
+    const int ob = bx >> 2;                               /* the 128-output block */
     if (tid == 0) s_last = atomicInc(&p.ctr[ob], 4u * (unsigned)S - 1u) == 4u * (unsigned)S - 1u;
     __syncthreads();
     if (!s_last) return;
@@ -364,16 +391,21 @@ unsigned *counter_slice(cudaStream_t stream) {
     return t_slices[t_n++].p;
 }
 
-void gemv_launch(int k2, const dim3 &grid, const dim3 &block, cudaStream_t stream, const dense_proj &p0,
-                 const dense_proj &p1, const __nv_bfloat16 *xb, int M, int K, int N, int S) {
+void gemv_launch(int k2, const dim3 &grid, const dim3 &block, cudaStream_t stream, const dense_set &P,
+                 const __nv_bfloat16 *xb, int M, int K) {
     switch (k2) {
-    case 4:  exl3_dense_kernel<4><<<grid, block, 0, stream>>>(p0, p1, xb, M, K, N, S); break;
-    case 6:  exl3_dense_kernel<6><<<grid, block, 0, stream>>>(p0, p1, xb, M, K, N, S); break;
-    case 8:  exl3_dense_kernel<8><<<grid, block, 0, stream>>>(p0, p1, xb, M, K, N, S); break;
-    case 10: exl3_dense_kernel<10><<<grid, block, 0, stream>>>(p0, p1, xb, M, K, N, S); break;
-    case 12: exl3_dense_kernel<12><<<grid, block, 0, stream>>>(p0, p1, xb, M, K, N, S); break;
-    default: exl3_dense_kernel<16><<<grid, block, 0, stream>>>(p0, p1, xb, M, K, N, S); break;  /* k2 == 16, checked */
+    case 4:  exl3_dense_kernel<4><<<grid, block, 0, stream>>>(P, xb, M, K); break;
+    case 6:  exl3_dense_kernel<6><<<grid, block, 0, stream>>>(P, xb, M, K); break;
+    case 8:  exl3_dense_kernel<8><<<grid, block, 0, stream>>>(P, xb, M, K); break;
+    case 10: exl3_dense_kernel<10><<<grid, block, 0, stream>>>(P, xb, M, K); break;
+    case 12: exl3_dense_kernel<12><<<grid, block, 0, stream>>>(P, xb, M, K); break;
+    default: exl3_dense_kernel<16><<<grid, block, 0, stream>>>(P, xb, M, K); break;  /* k2 == 16, checked */
     }
+}
+
+/* One projection's workspace bytes at (M <= kRows, K, N), 16-byte aligned so the next one's starts aligned. */
+size_t proj_ws_bytes(int M, int K, int N) {
+    return (Workspace(dense_splits(K, N), M, K, N).bytes + 15) & ~(size_t)15;
 }
 
 } // namespace
@@ -385,36 +417,54 @@ int ds4_exl3_dense_splits(int K, int N) {
     return dense_splits(K, N);
 }
 
-size_t ds4_exl3_dense_workspace_bytes(int M, int K, int N) {
-    const int S = ds4_exl3_dense_splits(K, N);
-    if (S == 0 || M <= 0) return 0;
-    return Workspace(S, M < kRows ? M : kRows, K, N).bytes;   /* M > kRows is the prefill GEMM's: none */
+size_t ds4_exl3_dense_multi_workspace_bytes(const ds4_exl3_dense_proj *p, int n, int M, int K) {
+    if (!p || n < 1 || n > DS4_EXL3_DENSE_MAX_PROJ || M <= 0) return 0;
+    size_t b = 0;
+    for (int j = 0; j < n; ++j) {
+        if (ds4_exl3_dense_splits(K, p[j].N) == 0) return 0;
+        b += proj_ws_bytes(M < kRows ? M : kRows, K, p[j].N);   /* M > kRows is the prefill GEMM's: none */
+    }
+    return b;
 }
 
-namespace {
+size_t ds4_exl3_dense_workspace_bytes(int M, int K, int N) {
+    const ds4_exl3_dense_proj p{nullptr, 0, N, nullptr};
+    return ds4_exl3_dense_multi_workspace_bytes(&p, 1, M, K);
+}
 
-/* The launch of n_proj (1 or 2) projections of one (K, N, k2) over the same M <= kRows rows. */
-int dense_launch(const char *tag, const void *const w[2], int n_proj, int k2, const void *xb, float *const y[2], int M,
-                 int K, int N, void *workspace, size_t workspace_bytes, cudaStream_t stream, bool prompt) {
-    uint64_t trellis_bytes = 0, scale_bytes = 0, stride = 0;
-    if (!w[0] || (n_proj == 2 && !w[1]) || !xb || !y[0] || (n_proj == 2 && !y[1]) || !workspace || M <= 0) {
-        fprintf(stderr, "%s: null pointer or M=%d -- refusing\n", tag, M);
+int ds4_exl3_dense_multi_launch(const ds4_exl3_dense_proj *p, int n, const void *xb, int M, int K, void *workspace,
+                                size_t workspace_bytes, cudaStream_t stream, bool prompt) {
+    const char *tag = "ds4_exl3_dense_launch";
+    static_assert(DS4_EXL3_DENSE_MAX_PROJ == kMaxProj, "the header's projection cap is the kernel's");
+    if (!p || n < 1 || n > kMaxProj || !xb || !workspace || M <= 0) {
+        fprintf(stderr, "%s: %d projections (1..%d), a null pointer or M=%d -- refusing\n", tag, n, kMaxProj, M);
         return -1;
     }
-    if (!exl3_expert_layout((uint64_t)(K > 0 ? K : 0), (uint64_t)(N > 0 ? N : 0), k2, &trellis_bytes, &scale_bytes, &stride)) {
-        fprintf(stderr, "%s: K=%d N=%d k2=%d is not an EXL3 layout (both dims %% 128, a valid rate) -- refusing\n",
-                tag, K, N, k2);
-        return -1;
-    }
-    if (!ds4_exl3_dense_rate_supported(k2)) {
-        fprintf(stderr, "%s: rate k2=%d has no instance (K = 2, 3, 4, 5, 6, 8) -- refusing\n", tag, k2);
-        return -1;
-    }
-    for (int j = 0; j < n_proj; ++j)
-        if ((uintptr_t)w[j] % 16 || (uintptr_t)y[j] % 16) {
+    uint64_t trellis_bytes[kMaxProj] = {};
+    int n_ctr = 0;
+    for (int j = 0; j < n; ++j) {
+        uint64_t scale_bytes = 0, stride = 0;
+        const int N = p[j].N;
+        if (!p[j].w || !p[j].y) {
+            fprintf(stderr, "%s: projection %d has no weight or no output -- refusing\n", tag, j);
+            return -1;
+        }
+        if (!exl3_expert_layout((uint64_t)(K > 0 ? K : 0), (uint64_t)(N > 0 ? N : 0), p[j].k2, &trellis_bytes[j],
+                                &scale_bytes, &stride)) {
+            fprintf(stderr, "%s: K=%d N=%d k2=%d is not an EXL3 layout (both dims %% 128, a valid rate) -- refusing\n",
+                    tag, K, N, p[j].k2);
+            return -1;
+        }
+        if (!ds4_exl3_dense_rate_supported(p[j].k2)) {
+            fprintf(stderr, "%s: rate k2=%d has no instance (K = 2, 3, 4, 5, 6, 8) -- refusing\n", tag, p[j].k2);
+            return -1;
+        }
+        if ((uintptr_t)p[j].w % 16 || (uintptr_t)p[j].y % 16) {
             fprintf(stderr, "%s: w / y must be 16-byte aligned -- refusing\n", tag);
             return -1;
         }
+        n_ctr += N / 128;
+    }
     if ((uintptr_t)xb % 8 || (uintptr_t)workspace % 16) {
         fprintf(stderr, "%s: the workspace must be 16-byte aligned and xb 8-byte (the uint2 row loads) -- refusing\n", tag);
         return -1;
@@ -423,20 +473,22 @@ int dense_launch(const char *tag, const void *const w[2], int n_proj, int k2, co
      * arm's GEMV re-decodes the trellis per 16 rows and re-reads the activation planes per 32 outputs,
      * a decode kernel doing a GEMM's work.  Decode widths keep the GEMV bit for bit. */
     if (prompt || M > kRows) {
-        for (int j = 0; j < n_proj; ++j) {
-            const int rc = qwen_exl3_dense_prefill_launch(w[j], k2, xb, y[j], M, K, N, trellis_bytes, stream);
+        for (int j = 0; j < n; ++j) {
+            const int rc = qwen_exl3_dense_prefill_launch(p[j].w, p[j].k2, xb, p[j].y, M, K, p[j].N, trellis_bytes[j],
+                                                          stream);
             if (rc) return rc;
         }
         return 0;
     }
-    const size_t one = ds4_exl3_dense_workspace_bytes(M, K, N);
-    if (workspace_bytes < (size_t)n_proj * one) {
-        fprintf(stderr, "%s: workspace %zu bytes < %zu for %d projection(s) at M=%d K=%d N=%d -- refusing\n", tag,
-                workspace_bytes, (size_t)n_proj * one, n_proj, M, K, N);
+    const size_t need = ds4_exl3_dense_multi_workspace_bytes(p, n, M, K);
+    if (workspace_bytes < need) {
+        fprintf(stderr, "%s: workspace %zu bytes < %zu for %d projection(s) at M=%d K=%d -- refusing\n", tag,
+                workspace_bytes, need, n, M, K);
         return -1;
     }
-    if (n_proj * (N / 128) > kMaxCounters) {
-        fprintf(stderr, "%s: %d x N=%d is past the epilogue's %d counters -- refusing\n", tag, n_proj, N, kMaxCounters);
+    if (n_ctr > kMaxCounters) {
+        fprintf(stderr, "%s: %d 128-output blocks are past the epilogue's %d counters -- refusing\n", tag, n_ctr,
+                kMaxCounters);
         return -1;
     }
     unsigned *ctr = counter_slice(stream);
@@ -445,21 +497,48 @@ int dense_launch(const char *tag, const void *const w[2], int n_proj, int k2, co
                         "-- refusing\n", tag, kCounterSlices);
         return -1;
     }
-    const int S = dense_splits(K, N);
-    const Workspace L(S, M, K, N);
-    dense_proj p[2] = {};
-    for (int j = 0; j < n_proj; ++j) {
-        uint8_t *ws = static_cast<uint8_t *>(workspace) + (size_t)j * one;
-        const __half *suh = reinterpret_cast<const __half *>(static_cast<const uint8_t *>(w[j]) + trellis_bytes);
-        p[j] = dense_proj{static_cast<const uint32_t *>(w[j]), suh, suh + K, reinterpret_cast<float *>(ws + L.part), y[j],
-                          reinterpret_cast<__half *>(ws + L.hi), reinterpret_cast<__half *>(ws + L.lo),
-                          reinterpret_cast<float *>(ws + L.inv), ctr + (size_t)j * (size_t)(N / 128)};
+    /* every projection's planes and partials, and its own counters */
+    dense_set all{};
+    {
+        uint8_t *ws = static_cast<uint8_t *>(workspace);
+        unsigned *c = ctr;
+        for (int j = 0; j < n; ++j) {
+            const int N = p[j].N, S = dense_splits(K, N);
+            const Workspace L(S, M, K, N);
+            const __half *suh = reinterpret_cast<const __half *>(static_cast<const uint8_t *>(p[j].w) + trellis_bytes[j]);
+            all.p[j] = dense_proj{static_cast<const uint32_t *>(p[j].w), suh, suh + K, reinterpret_cast<float *>(ws + L.part),
+                                  p[j].y, reinterpret_cast<__half *>(ws + L.hi), reinterpret_cast<__half *>(ws + L.lo),
+                                  reinterpret_cast<float *>(ws + L.inv), c, N, S};
+            ws += proj_ws_bytes(M, K, N);
+            c += N / 128;
+        }
     }
     const __nv_bfloat16 *xb16 = static_cast<const __nv_bfloat16 *>(xb);
-    const dim3 grid((unsigned)(N / kOut), (unsigned)S, (unsigned)n_proj), block(kOut, kWarps, 1);
+    /* ONE prep for every projection (the input is shared; each takes its own suh) */
     const int64_t tasks = (int64_t)M * (K / EXL3_HAD_BLOCK);
-    exl3_dense_prep_kernel<<<dim3((unsigned)((tasks + 7) / 8), (unsigned)n_proj), 256, 0, stream>>>(p[0], p[1], xb16, M, K);
-    gemv_launch(k2, grid, block, stream, p[0], p[1], xb16, M, K, N, S);
+    exl3_dense_prep_kernel<<<dim3((unsigned)((tasks + 7) / 8), (unsigned)n), 256, 0, stream>>>(all, xb16, M, K);
+    if (n > 1) {
+        static bool announced = false;
+        if (!__atomic_exchange_n(&announced, true, __ATOMIC_RELAXED))
+            fprintf(stderr, "pulsar: EXL3 dense multi launch = one prep + one GEMV per rate over up to %d projections of "
+                            "one input (first call: %d at K=%d, M=%d)\n", kMaxProj, n, K, M);
+    }
+    /* ONE GEMV per rate among them, in the order the projections were given */
+    bool done[kMaxProj] = {};
+    for (int j0 = 0; j0 < n; ++j0) {
+        if (done[j0]) continue;
+        dense_set g{};
+        int m = 0, ctas = 0;
+        for (int j = j0; j < n; ++j) {
+            if (done[j] || p[j].k2 != p[j0].k2) continue;
+            done[j] = true;
+            g.p[m] = all.p[j];
+            ctas += (all.p[j].N / kOut) * all.p[j].S;
+            g.end[m++] = ctas;
+        }
+        for (int i = m; i < kMaxProj; ++i) g.end[i] = INT_MAX;
+        gemv_launch(p[j0].k2, dim3((unsigned)ctas), dim3(kOut, kWarps, 1), stream, g, xb16, M, K);
+    }
     const cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
         fprintf(stderr, "%s: launch failed: %s\n", tag, cudaGetErrorString(err));
@@ -468,20 +547,8 @@ int dense_launch(const char *tag, const void *const w[2], int n_proj, int k2, co
     return 0;
 }
 
-} // namespace
-
 int ds4_exl3_dense_launch(const void *w, int k2, const void *xb, float *y,
                           int M, int K, int N, void *workspace, size_t workspace_bytes, cudaStream_t stream, bool prompt) {
-    const void *const ws[2] = {w, nullptr};
-    float *const ys[2] = {y, nullptr};
-    return dense_launch("ds4_exl3_dense_launch", ws, 1, k2, xb, ys, M, K, N, workspace, workspace_bytes, stream, prompt);
-}
-
-int ds4_exl3_dense_pair_launch(const void *w0, const void *w1, int k2, const void *xb, float *y0, float *y1,
-                               int M, int K, int N, void *workspace, size_t workspace_bytes, cudaStream_t stream,
-                               bool prompt) {
-    const void *const ws[2] = {w0, w1};
-    float *const ys[2] = {y0, y1};
-    return dense_launch("ds4_exl3_dense_pair_launch", ws, 2, k2, xb, ys, M, K, N, workspace, workspace_bytes, stream,
-                        prompt);
+    const ds4_exl3_dense_proj p{w, k2, N, y};
+    return ds4_exl3_dense_multi_launch(&p, 1, xb, M, K, workspace, workspace_bytes, stream, prompt);
 }

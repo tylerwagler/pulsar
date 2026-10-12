@@ -17,15 +17,6 @@
 #include "engine/exl3_trellis.h"   /* the scales layout */
 #include "exl3_moe_prefill.cuh"     /* exl3_moe_partials */
 
-/** A shared expert riding the routed launches (exl3_moe.cuh): its SwiGLU h = silu(g) * u over [rows][mid] f32
- *  planes, emitted bf16 for its down, in the fold's launch.  g, u, h are 16-byte aligned. */
-struct exl3_moe_shared_swiglu {
-    const float   * g;
-    const float   * u;
-    __nv_bfloat16 * h;
-    int             rows, mid;
-};
-
 /** The EXL3 SwiGLU fold: per pair (pair = tok * n_expert + slot, expert =
  *  selected[pair]) and per 128-block of mid: y_g = svh_g * H(z_g),
  *  y_u = svh_u * H(z_u), v = swiglu(y_g, y_u) * weight, then the DOWN input
@@ -50,7 +41,6 @@ int ds4_exl3_moe_fold_launch(
     int             mid_kbp,
     cudaStream_t    stream,
     void          * mid_bf16 = nullptr,
-    const exl3_moe_shared_swiglu * shared = nullptr,
     int             z_splits = 1,
     int64_t         z_split_stride = 0);
 
@@ -73,7 +63,6 @@ int ds4_exl3_moe_fold_fused_launch(
     int             mid_kbp,
     cudaStream_t    stream,
     void          * mid_bf16 = nullptr,
-    const exl3_moe_shared_swiglu * shared = nullptr,
     int             z_splits = 1,
     int64_t         z_split_stride = 0);
 

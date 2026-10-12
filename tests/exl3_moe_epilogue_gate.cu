@@ -469,7 +469,7 @@ int main(void) {
                 CUDA_OK(cudaMemcpy(f0.data(), d_msf, sfb, cudaMemcpyDeviceToHost));
                 CUDA_OK(cudaMemset(d_msf, 0, sfb));
                 prc |= ds4_exl3_moe_fold_launch(zp.z[0], zp.z[1], d_sel, d_w, sg.table, su.table, sd.table, K, M, r.n_assign, 0.0f, d_mq, d_msf, kbp, 0,
-                                                nullptr, nullptr, zp.splits, zp.split_stride);
+                                                nullptr, zp.splits, zp.split_stride);
                 CUDA_OK(cudaDeviceSynchronize());
                 CUDA_OK(cudaMemcpy(q1.data(), d_mq, mb, cudaMemcpyDeviceToHost));
                 CUDA_OK(cudaMemcpy(f1.data(), d_msf, sfb, cudaMemcpyDeviceToHost));

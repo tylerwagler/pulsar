@@ -17,12 +17,13 @@
 //   sum       the slot-ordered sum with the down's output rotation; a non-finite value records nf_code
 //
 // A shared expert whose three Linears are EXL3 dense slices RIDES these launches (keyed on that format, not on
-// a family; exl3_moe_shared): its gate and up are one dense launch (ds4_exl3_dense_pair_launch) ahead of the
-// routed gate / up, its SwiGLU is emitted in the fold's launch, its down is one dense launch ahead of the
-// routed down, and its scaled output is added in the sum's launch -- after the routed sum, the order the
-// separate launches had, each value the arithmetic it had alone.  A shared expert in another format, or none,
-// is the family's to run.  The dense arm reads bf16 rows, so a riding shared expert needs a bf16 activation:
-// over an E4M3 slot the call refuses.
+// a family; exl3_moe_shared): the family forks it first (exl3_moe_shared_fork, ahead of its router) onto its own
+// stream -- gate and up as one dense multi launch, its SwiGLU rows, its down -- and the routed launch joins it
+// right before the sum, which adds its scaled output after the routed sum: the order the separate launches had,
+// each value the arithmetic it had alone (L288 exl3-dense: those latency-bound launches now run beside the router,
+// the schedule and the routed GEMMs instead of after them).  A shared expert in another format, or none, is the
+// family's to run.  The dense arm reads bf16 rows, so a riding shared expert needs a bf16 activation: over
+// an E4M3 slot the call refuses.
 //
 // Shapes come from the call (the model's), never from a family's constants.  A pick < 0 (another rank's
 // expert under expert parallelism, or the router's NaN path) is not in the schedule and adds nothing.
@@ -70,9 +71,17 @@ struct exl3_moe_shared {
 /** The dense-arm workspace a riding shared expert needs for T rows. */
 size_t exl3_moe_shared_ws_bytes(int T, int in_dim, int mid, int out_dim);
 
+/** Fork the shared expert of T rows of x (bf16 rows, in_dim wide) off `stream` onto its lane: ys [T][out_dim] f32 =
+ *  down(swiglu(gate x, up x)) (unscaled; yg / yu / h hold the intermediates).  The exl3_moe_routed_launch on the same
+ *  stream that is given the same `sh` joins it (forks are joined oldest first, at most 4 pending; give each pending
+ *  fork its own buffers -- the workspace may be shared).  `prompt`: the rows' kind, as the routed launch's.  Refuses
+ *  (-1) on a contract violation; a refused fork leaves nothing running. */
+int exl3_moe_shared_fork(const exl3_moe_shared &sh, const exl3_moe_act &x, int T, int in_dim, int out_dim, bool prompt,
+                         cudaStream_t stream);
+
 /** out [T][out_dim] f32 = sum over each row's top_k picks (sel [T][top_k], wts [T][top_k]) of
  *  w * down(swiglu(gate x, up x)), x the activation as its producer emitted it, plus a riding shared expert's
- *  scale * down(swiglu(gate x, up x)) when `shared` is given.  `prompt`: a prompt chunk
+ *  scale * ys when `shared` is given -- forked first by exl3_moe_shared_fork (refused otherwise).  `prompt`: a prompt chunk
  *  (the prefill GEMM at every width, writing gate_z / up_z / down_z); otherwise decode rows (the decode GEMM
  *  at every width, whose split partials live in the scratch: b's z buffers are not written).  Scratch (the
  *  schedule, the operand planes, the decode partials) is the MMQ arena slot's.  Refuses (-1) on any contract violation; nothing is launched past a refusal. */

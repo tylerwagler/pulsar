@@ -166,6 +166,16 @@ size_t pulsar_rows_linear_workspace_bytes(const pulsar_rows_linear *l, int rows)
 int pulsar_rows_linear_launch(const pulsar_rows_linear *l, const uint16_t *x_bf16, int rows, float *y,
                               void *ws, size_t ws_bytes, cudaStream_t stream);
 
+/** L288 exl3-dense: workspace bytes pulsar_rows_linear_multi_launch needs for n Linears of one input at `rows`
+ *  rows -- each 128-multiple width sized as an EXL3 projection, the most it takes (an mxfp8_lt one runs alone
+ *  after the EXL3 launch and reuses it). */
+size_t pulsar_rows_linear_multi_workspace_bytes(const pulsar_rows_linear *const *ls, int n, int rows);
+/** L288 exl3-dense: y[j] [rows][ls[j]->out] f32 = Linear j of the SAME bf16 rows, for n (1..4) Linears of one
+ *  input width and row kind -- the EXL3 ones in one dense multi launch (one prep, one GEMV per rate: each output
+ *  bit for bit what pulsar_rows_linear_launch writes for it alone), then each mxfp8_lt one by itself. */
+int pulsar_rows_linear_multi_launch(const pulsar_rows_linear *const *ls, int n, const uint16_t *x_bf16, int rows,
+                                    float *const *y, void *ws, size_t ws_bytes, cudaStream_t stream);
+
 /* ======================================================================== */
 /* MoE block (Qwen4ExpTextSparseMoeBlock)                                     */
 
@@ -201,6 +211,10 @@ typedef struct pulsar_rows_moe_shared {
 } pulsar_rows_moe_shared;
 /** The dense-arm workspace a riding shared expert needs for T rows (in -> mid -> out). */
 size_t pulsar_rows_moe_shared_ws_bytes(int T, int in, int mid, int out);
+/** L288 exl3-dense: fork the riding shared expert of T bf16 rows onto its own stream (exl3_moe_shared_fork) --
+ *  call it AHEAD of the router, then pulsar_rows_moe_routed_launch with the same descriptor joins it before its
+ *  sum.  Each pending fork needs its own yg / yu / ys / h rows.  0 on success. */
+int pulsar_rows_moe_shared_fork(const pulsar_rows_moe_shared *q, const uint16_t *x_bf16, int T, cudaStream_t stream);
 typedef struct pulsar_rows_moe {
     const void *const *gate_up_table;   /**< exl3_expert_table pairs, the fused form, or NULL */
     const void *const *gate_table, *const *up_table;   /**< the pair form, or NULL */

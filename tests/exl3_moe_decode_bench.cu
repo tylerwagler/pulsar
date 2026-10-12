@@ -14,8 +14,11 @@
  *
  *   qwenp the same with turboderp's split gate / up stacks (td305: K3 experts)
  *
- * usage: [EXL3_BENCH_PROMPT=1] ./tests/exl3_moe_decode_bench qwen|qwenp|v4|v41 k2_gate_up k2_down keep S:R [S:R ...]
- * (EXL3_BENCH_PROMPT=1 runs the rows as a prompt chunk: the grouped GEMM, for the A/B against the decode arm)
+ * usage: [EXL3_BENCH_PROMPT=1] [EXL3_BENCH_SHARED=k2] ./tests/exl3_moe_decode_bench qwen|qwenp|v4|v41 k2_gate_up k2_down
+ *        keep S:R [S:R ...]
+ * (EXL3_BENCH_PROMPT=1 runs the rows as a prompt chunk: the grouped GEMM, for the A/B against the decode arm;
+ *  EXL3_BENCH_SHARED=k2 (Qwen shapes) adds the riding shared expert -- three EXL3 dense slices 2560 -> 640 -> 2560 at
+ *  rate k2, sigmoid-scaled -- as the family passes it, L288 exl3-dense)
  */
 #include "pulsar_gpu.h"
 #include "cuda/pulsar_cuda_mx.cuh"
@@ -115,14 +118,24 @@ int main(int argc, char **argv) {
     if (ds4_mmq_init(dev) != 0) { fprintf(stderr, "bench: MMQ init\n"); return 2; }
     constexpr int NL = 3, NROUTE = 16;
     printf("exl3-moe-decode-bench: %s, %d -> %d (%s) -> %d, %d experts top-%d, K gate_up %g down %g, keep %.2f, "
-           "%d layer copies x %d routings (DRAM-cold)\n", argv[1], H, MID, fused ? "fused gate_up" : "gate + up pair", H,
-           E, TOPK, k2gu / 2.0, k2d / 2.0, keep, NL, NROUTE);
+           "%d layer copies x %d routings (DRAM-cold)%s\n", argv[1], H, MID, fused ? "fused gate_up" : "gate + up pair", H,
+           E, TOPK, k2gu / 2.0, k2d / 2.0, keep, NL, NROUTE, getenv("EXL3_BENCH_SHARED") ? ", + the shared expert" : "");
     stack GU[NL], G[NL], U[NL], D[NL];
     for (int l = 0; l < NL; l++) {
         if (fused) GU[l] = make_stack(H, 2 * MID, k2gu, E, 11 + 100 * l);
         else { G[l] = make_stack(H, MID, k2gu, E, 11 + 100 * l); U[l] = make_stack(H, MID, k2gu, E, 22 + 100 * l); }
         D[l] = make_stack(MID, H, k2d, E, 33 + 100 * l);
     }
+    /* the riding shared expert (Qwen): one [trellis | suh | svh] slice per projection per layer copy */
+    const int k2s = getenv("EXL3_BENCH_SHARED") ? atoi(getenv("EXL3_BENCH_SHARED")) : 0;
+    if (k2s && !qwen) { fprintf(stderr, "bench: EXL3_BENCH_SHARED is the Qwen shapes' shared expert\n"); return 2; }
+    stack SG[NL], SU[NL], SD[NL];
+    if (k2s)
+        for (int l = 0; l < NL; l++) {
+            SG[l] = make_stack(H, MID, k2s, 1, 44 + 100 * l);
+            SU[l] = make_stack(H, MID, k2s, 1, 55 + 100 * l);
+            SD[l] = make_stack(MID, H, k2s, 1, 66 + 100 * l);
+        }
     const int64_t maxP = (int64_t)maxT * TOPK;
     const int kbx = pulsar_mx_kbp(H), kbm = pulsar_mx_kbp(MID);
     void *x = nullptr, *xsf = nullptr, *mid = nullptr, *midsf = nullptr;
@@ -153,6 +166,18 @@ int main(int argc, char **argv) {
     CUDA_OK(cudaMalloc(&sel, (size_t)NROUTE * maxP * 4));
     CUDA_OK(cudaMalloc(&nf, 4));
     CUDA_OK(cudaMemset(nf, 0, 4));
+    float *syg = nullptr, *syu = nullptr, *sys = nullptr, *ssc = nullptr;
+    void *sh_h = nullptr, *sws = nullptr;
+    const size_t sws_bytes = k2s ? exl3_moe_shared_ws_bytes(maxT, H, MID, H) : 0;
+    if (k2s) {
+        CUDA_OK(cudaMalloc(&syg, (size_t)maxT * MID * 4));
+        CUDA_OK(cudaMalloc(&syu, (size_t)maxT * MID * 4));
+        CUDA_OK(cudaMalloc(&sys, (size_t)maxT * H * 4));
+        CUDA_OK(cudaMalloc(&ssc, (size_t)maxT * 4));
+        CUDA_OK(cudaMemset(ssc, 0, (size_t)maxT * 4));
+        CUDA_OK(cudaMalloc(&sh_h, (size_t)maxT * MID * 2));
+        CUDA_OK(cudaMalloc(&sws, sws_bytes));
+    }
     {
         std::vector<float> w((size_t)NROUTE * maxP);
         for (auto &v : w) v = 0.1f + (float)(rnd() % 1000) / 4000.0f;
@@ -199,8 +224,11 @@ int main(int argc, char **argv) {
             const exl3_moe_stacks w = fused ? exl3_moe_stacks{GU[l].table, nullptr, nullptr, D[l].table, k2gu, k2d, E, H, MID, H}
                                            : exl3_moe_stacks{nullptr, G[l].table, U[l].table, D[l].table, k2gu, k2d, E, H, MID, H};
             const exl3_moe_bufs b{gz, uz, dz, ma};
+            const exl3_moe_shared sh{SG[l].arena, SU[l].arena, SD[l].arena, k2s, k2s, k2s, MID, ssc, syg, syu, sys,
+                                     static_cast<__nv_bfloat16 *>(sh_h), sws, sws_bytes};
+            if (k2s && exl3_moe_shared_fork(sh, xa, T, H, H, as_prompt, st) != 0) return -1;   /* the family's order */
             return exl3_moe_routed_launch(w, sel + (size_t)q * maxP, wts + (size_t)q * maxP, T, TOPK, 10.0f, xa, b, out,
-                                          nf, 1u, as_prompt, st);
+                                          nf, 1u, as_prompt, st, k2s ? &sh : nullptr);
         };
         for (int i = 0; i < NROUTE * NL; i++)
             if (layer(i) != 0) { fprintf(stderr, "bench: layer T=%d refused\n", T); return 1; }

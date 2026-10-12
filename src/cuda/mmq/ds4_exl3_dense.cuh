@@ -85,20 +85,26 @@ int ds4_exl3_dense_launch(
 int qwen_exl3_dense_prefill_launch(const void *w, int k2, const void *x_bf16, float *y, int M, int K, int N,
                                    uint64_t trellis_bytes, cudaStream_t stream);
 
-/** Two projections of the same (K, N, k2) over the same rows -- a shared expert's gate and up -- in ONE launch
- *  (prompt chunks and M > 16: the prefill GEMM, once per projection).  Each output is bit for bit what
- *  ds4_exl3_dense_launch writes for it alone.  `workspace` holds 2 x ds4_exl3_dense_workspace_bytes(M, K, N). */
-int ds4_exl3_dense_pair_launch(
-    const void   * w0,
-    const void   * w1,
-    int            k2,
-    const void   * xb,
-    float        * y0,
-    float        * y1,
-    int            M,
-    int            K,
-    int            N,
-    void         * workspace,
-    size_t         workspace_bytes,
-    cudaStream_t   stream,
-    bool           prompt = false);
+/** The most projections one ds4_exl3_dense_multi_launch carries. */
+#define DS4_EXL3_DENSE_MAX_PROJ 4
+
+/** One projection of a multi launch: its [trellis | suh | svh] slice (16-byte aligned), rate, output width and
+ *  output y [M][N] f32 (16-byte aligned). */
+struct ds4_exl3_dense_proj {
+    const void *w;
+    int         k2;
+    int         N;
+    float      *y;
+};
+
+/** Workspace bytes ds4_exl3_dense_multi_launch needs for these projections at (M, K): the sum of each one's
+ *  ds4_exl3_dense_workspace_bytes(M, K, N).  0 for a set the arm refuses. */
+size_t ds4_exl3_dense_multi_workspace_bytes(const ds4_exl3_dense_proj *p, int n, int M, int K);
+
+/** n (1..DS4_EXL3_DENSE_MAX_PROJ) projections of ONE input xb [M][K] bf16 (L288 exl3-dense: a GDN block's
+ *  in_proj_qkv and _z, an attention's q / k / v / index, a shared expert's gate and up): one prep launch for all of
+ *  them, then one GEMV launch per rate among them.  Each output is bit for bit what ds4_exl3_dense_launch writes for
+ *  it alone.  Prompt chunks and M > 16 take the prefill GEMM, once per projection.  ds4_exl3_dense_launch is the
+ *  n = 1 call. */
+int ds4_exl3_dense_multi_launch(const ds4_exl3_dense_proj *p, int n, const void *xb, int M, int K, void *workspace,
+                                size_t workspace_bytes, cudaStream_t stream, bool prompt = false);
