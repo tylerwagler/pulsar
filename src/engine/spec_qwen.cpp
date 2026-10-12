@@ -371,7 +371,11 @@ static int mtp_draft_batch(pulsar_session *s, pulsar_spec_round **rounds, const 
  * already adapts inside every round, and the rule's down-signal fires on chains that stopped early by design.
  * L284: dropping the stopping draft instead of verifying it cost 4-11% here (code greedy / chat greedy / chat
  * T0.7, 3 reps median: 49.1 / 49.8 / 45.6 tok/s at 0.7, 50.9 / 50.6 / 47.4 at 0.5, vs 54.9 / 52.2 / 50.6
- * verified), which is why the shared rule verifies it. */
+ * verified), which is why the shared rule verifies it.  L288 (2026-10-11, work/qwen-draft step 3, U-e4-d5, tau 0.7,
+ * serve_matrix 512 tok x3, code / codex / prose / story at T0 and T0.7): depth 4 / 5 / 6 summed 504 / 498 / 500 tok/s
+ * over the eight single-stream cells (code greedy 77.8 / 79.8 / 79.8 at 3.88 / 4.29 / 4.48 tokens a round; codex
+ * and story T0.7 lose 4-8 % deeper), 2 streams 86.7 / 83.7 / 83.8, 4 streams 101.4 / 102.5 / 101.7: a deeper
+ * chain buys tokens on code but each verify row costs more than it returns elsewhere, so 4 stays. */
 const pulsar_drafter_ops k_mtp_drafter = {
     /* .name          = */ "MTP",
     /* .depth         = */ 4u,
