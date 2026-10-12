@@ -157,6 +157,12 @@ int pulsar_qwen_draft_top_launch(const float *rows, int n, int n_rows, void *ws,
  *  per output row, ordered); no workspace. */
 int pulsar_qwen_mxfp8_linear_launch(const pulsar_qwen_lowrank *l, const uint16_t *x_bf16, int rows, float *y,
                                     void *ws, size_t ws_bytes, cudaStream_t stream);
+/** L288: the head (lm_head, the MTP draft head): y [rows][out] f32 = W x for an mxfp8_lt W and bf16 rows x, 1 .. 16
+ *  rows, on the tensor cores (W decoded exactly into bf16, mma.m16n8k16 with a fresh fragment per 16 k added into
+ *  an f32 accumulator), the weight read once for every row.  A row's result does not depend on the rows beside it.
+ *  `in` a multiple of 256 and the same at every call; w and x 16-byte aligned.  0 on success. */
+int pulsar_qwen_mxfp8_head_launch(const pulsar_qwen_lowrank *l, const uint16_t *x_bf16, int rows, float *y,
+                                  cudaStream_t stream);
 /** L251: bytes of an [out][in] mxfp8_lt matrix (E4M3 then the swizzled E8M0 plane); 0 if in % 32. */
 uint64_t pulsar_qwen_mxfp8_bytes(int out, int in);
 /** L251: a bf16 [out][in] matrix into mxfp8_lt at `dst` (pulsar_qwen_mxfp8_bytes), with the

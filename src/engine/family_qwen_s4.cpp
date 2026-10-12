@@ -870,7 +870,8 @@ bool pulsar_qwen_s4_head(const pulsar_qwen_step *st, uint32_t row0, uint32_t n, 
     if (ok) {
         /* L251: the lm_head in MXFP8, made once on the device from the container's bf16 head (the
          * producers' own encoder) -- half the bytes of the bf16 GEMV that was 5.1 ms of a 33 ms
-         * token -- through the W8A16 arms (the GEMV at decode widths). */
+         * token.  L288: multiplied on the tensor cores, the weight read once for all the call's rows
+         * (pulsar_qwen_mxfp8_head_launch). */
         pulsar_qwen_weights *wm = const_cast<pulsar_qwen_weights *>(st->w);
         /* L266 step 7: under TP a rank's head is its vocab range [rank * V / tp, +V / tp) -- the rows it
          * computes, the gather below fills the rest; the draft head stays whole on every rank */
@@ -902,8 +903,7 @@ bool pulsar_qwen_s4_head(const pulsar_qwen_step *st, uint32_t row0, uint32_t n, 
              * gather asks for under TP (the rank's own; the gather assembles the rest) */
             auto head = [&](uint32_t lo, uint32_t width, pulsar_gpu_tensor *dst) {
                 if (!dh && tp > 1 && (lo != v_lo || width != Vl)) return false;
-                return pulsar_qwen_mxfp8_linear_launch(&l, (const uint16_t *)xb, (int)n, (float *)dptr(dst), NULL, 0,
-                                                       0) == 0;
+                return pulsar_qwen_mxfp8_head_launch(&l, (const uint16_t *)xb, (int)n, (float *)dptr(dst), 0) == 0;
             };
             if (tp == 1 || dh) {
                 ok = head(0, rows, dst);
