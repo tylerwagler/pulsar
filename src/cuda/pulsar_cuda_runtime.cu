@@ -1500,6 +1500,25 @@ int pulsar_gpu_tensor_write(pulsar_gpu_tensor *tensor, uint64_t offset, const vo
 
 
 
+int pulsar_gpu_tensor_write_async(pulsar_gpu_tensor *tensor, uint64_t offset, const void *data, uint64_t bytes) {
+    if (!tensor || !data || offset > tensor->bytes || bytes > tensor->bytes - offset) return 0;
+    if (tensor->dry || bytes == 0) return 1;
+    return cuda_ok(cudaMemcpyAsync((char *)tensor->ptr + offset, data, (size_t)bytes, cudaMemcpyHostToDevice,
+                                   cudaStreamPerThread), "tensor write async");
+}
+
+void *pulsar_gpu_host_alloc(uint64_t bytes) {
+    void *p = NULL;
+    if (bytes == 0 || !cuda_ok(cudaMallocHost(&p, (size_t)bytes), "pinned host alloc")) return NULL;
+    return p;
+}
+
+void pulsar_gpu_host_free(void *p) {
+    if (p) (void)cudaFreeHost(p);
+}
+
+
+
 /* The write counterpart of pulsar_read_q_f32: host f32 in, stored Q element
  * type out.  Exists so host code -- tests, tools -- can fill a Q buffer
  * without a second copy of the conversion living outside this file. */

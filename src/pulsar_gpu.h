@@ -201,6 +201,15 @@ uint64_t pulsar_gpu_tensor_bytes(const pulsar_gpu_tensor *tensor);
 void *pulsar_gpu_tensor_device_ptr(const pulsar_gpu_tensor *tensor);
 int pulsar_gpu_tensor_fill_f32(pulsar_gpu_tensor *tensor, float value, uint64_t count);
 int pulsar_gpu_tensor_write(pulsar_gpu_tensor *tensor, uint64_t offset, const void *data, uint64_t bytes);
+/** L289: the same write ENQUEUED on the per-thread stream (cudaMemcpyAsync H2D): the host does not wait for the
+ *  GPU work queued before it, so a write in the middle of a step does not drain the step.  From pageable memory
+ *  the driver stages `data` before returning; from pinned memory (pulsar_gpu_host_alloc) the copy reads `data`
+ *  when the stream reaches it, so the caller keeps those bytes until the stream passes it (the step's drain). */
+int pulsar_gpu_tensor_write_async(pulsar_gpu_tensor *tensor, uint64_t offset, const void *data, uint64_t bytes);
+/** L289: page-locked host memory (cudaMallocHost) for buffers a step uploads with pulsar_gpu_tensor_write_async;
+ *  NULL on failure.  pulsar_gpu_host_free(NULL) is a no-op. */
+void *pulsar_gpu_host_alloc(uint64_t bytes);
+void pulsar_gpu_host_free(void *p);
 
 /** Fill a Q buffer from host f32, converting to the stored Q element type.
  * Host callers cannot see pulsar_q_t (it is CUDA-only), so a plain

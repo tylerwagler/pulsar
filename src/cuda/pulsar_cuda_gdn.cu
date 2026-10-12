@@ -27,6 +27,9 @@ template <int TP> struct gdn_shape {
     static constexpr int CONV_HEADS = QKV / 128;         /* 80 at TP 1 */
     static constexpr size_t CONV_STATE = (size_t)(PULSAR_GDN_KCONV - 1) * QKV;
     static constexpr size_t REC_STATE = (size_t)NV * DK * DV;
+    /* L288: a verify row's stored update (pulsar_gdn_call::rec_upd): deltas [NV][DV], k^ [NK][DK], decays [NV] */
+    static constexpr int U_K = NV * DV, U_DEC = U_K + NK * DK;
+    static constexpr size_t UPD = (size_t)(U_DEC + NV + 3) / 4 * 4;
     static_assert(PULSAR_GDN_NK % TP == 0 && PULSAR_GDN_NV % TP == 0, "whole heads per rank");
     static_assert(NV % NK == 0, "GQA");
 };
@@ -216,7 +219,7 @@ gdn_recur_norm_kernel(const float *__restrict__ qkvn,
                       const int32_t *__restrict__ seq_first,
                       const int32_t *__restrict__ row_slot,
                       float *__restrict__ rec_state,
-                      float *__restrict__ rec_rows,
+                      float *__restrict__ rec_upd,
                       float *__restrict__ out_f32,
                       __nv_bfloat16 *__restrict__ out_bf16,
                       __nv_fp8_e4m3 *__restrict__ out_q,
@@ -299,10 +302,11 @@ gdn_recur_norm_kernel(const float *__restrict__ qkvn,
             if (w == 0) so[j][lane] = fmaf(d, KQ, dec * acc.y);
             #pragma unroll
             for (int i = 0; i < RPW; i++) s[i] = fmaf(kr[i], d, dec * s[i]);
-            if (rec_rows && t0 + j < T - 1) {               /* the verify capture: S after this row */
-                float *R = rec_rows + (size_t)(r0 + t0 + j) * Sh::REC_STATE + (size_t)h * DK * DV;
-                #pragma unroll
-                for (int i = 0; i < RPW; i++) R[(w * RPW + i) * DV + col] = s[i];
+            if (rec_upd) {                                   /* L288: the row's update, for the commit */
+                float *U = rec_upd + (size_t)(r0 + t0 + j) * Sh::UPD;
+                if (w == 0) U[h * DV + col] = d;
+                if (w == 1 && qr == 0 && h % Sh::GQA == 0) reinterpret_cast<float4 *>(U + Sh::U_K + kh * DK)[lane] = sk[j][lane];
+                if (w == 2 && qr == 0 && lane == 0) U[Sh::U_DEC + h] = dec;
             }
             par ^= 1;
         }
@@ -337,9 +341,38 @@ gdn_recur_norm_kernel(const float *__restrict__ qkvn,
         __syncthreads();                                   /* tiles and so[] reused */
     }
 
-    #pragma unroll
-    for (int i = 0; i < RPW; i++) S[(w * RPW + i) * DV + col] = s[i];
+    if (!rec_upd) {                                        /* L288: a verify leaves the state to its commit */
+        #pragma unroll
+        for (int i = 0; i < RPW; i++) S[(w * RPW + i) * DV + col] = s[i];
+    }
     cluster.sync();                                        /* no CTA leaves while a peer may read its ssp */
+}
+
+/* ---- L288: the verify's commit -- one slot's state advanced by the first `keep` rows' stored updates ------
+ * Thread = 4 adjacent columns of one state row k of one V head; per row r: S = fmaf(k^_k, delta_v, decay * S),
+ * the recurrence's own operation (gdn_recur_norm_kernel: s[i] = fmaf(kr[i], d, dec * s[i])) on the same f32
+ * values, in row order -- bit-identical to the forward that skipped the write. */
+constexpr int CT = 256;                                    /* threads per commit CTA */
+static_assert((DK * DV / 4) % CT == 0, "a head's float4s tile the commit's CTAs");
+
+template <int TP>
+__global__ void __launch_bounds__(CT)
+gdn_commit_kernel(float *__restrict__ S, const float *__restrict__ upd, int keep) {
+    using Sh = gdn_shape<TP>;
+    const int h = blockIdx.x, kh = h / Sh::GQA;
+    const int i4 = blockIdx.y * CT + threadIdx.x, k = i4 / (DV / 4), q = i4 % (DV / 4);
+    float4 *p = reinterpret_cast<float4 *>(S + (size_t)h * DK * DV + (size_t)k * DV) + q;
+    float4 s = *p;
+    for (int r = 0; r < keep; r++) {
+        const float *U = upd + (size_t)r * Sh::UPD;
+        const float dec = U[Sh::U_DEC + h], kk = U[Sh::U_K + kh * DK + k];
+        const float4 d = reinterpret_cast<const float4 *>(U + h * DV)[q];
+        s.x = fmaf(kk, d.x, dec * s.x);
+        s.y = fmaf(kk, d.y, dec * s.y);
+        s.z = fmaf(kk, d.z, dec * s.z);
+        s.w = fmaf(kk, d.w, dec * s.w);
+    }
+    *p = s;
 }
 
 bool aligned16(const void *p) { return ((uintptr_t)p & 15u) == 0; }
@@ -362,6 +395,33 @@ extern "C" size_t pulsar_gdn_conv_state_floats(int tp_ranks) {
 extern "C" size_t pulsar_gdn_rec_state_floats(int tp_ranks) {
     return tp_ranks == 2 ? gdn_shape<2>::REC_STATE : gdn_shape<1>::REC_STATE;
 }
+extern "C" size_t pulsar_gdn_upd_floats(int tp_ranks) {
+    return tp_ranks == 2 ? gdn_shape<2>::UPD : gdn_shape<1>::UPD;
+}
+
+extern "C" int pulsar_gdn_commit(float *rec_state, int slot, const float *upd, int keep, int tp_ranks,
+                                 cudaStream_t stream) {
+    if (!rec_state || !upd || slot < 0 || keep < 1 || keep > (1 << 16) || ((uintptr_t)rec_state & 15u) ||
+        ((uintptr_t)upd & 15u))
+        return refuse("commit: a null or misaligned pointer, or keep outside 1 ..");
+    if (tp_ranks == 2) {
+        using Sh = gdn_shape<2>;
+        gdn_commit_kernel<2><<<dim3(Sh::NV, DK * DV / 4 / CT), CT, 0, stream>>>(rec_state + (size_t)slot * Sh::REC_STATE,
+                                                                              upd, keep);
+    } else if (tp_ranks <= 1) {
+        using Sh = gdn_shape<1>;
+        gdn_commit_kernel<1><<<dim3(Sh::NV, DK * DV / 4 / CT), CT, 0, stream>>>(rec_state + (size_t)slot * Sh::REC_STATE,
+                                                                              upd, keep);
+    } else {
+        return refuse("commit: tp_ranks is not 1 or 2");
+    }
+    const cudaError_t e = cudaGetLastError();
+    if (e != cudaSuccess) {
+        fprintf(stderr, "pulsar: gdn: commit launch failed: %s\n", cudaGetErrorString(e));
+        return -3;
+    }
+    return 0;
+}
 
 namespace {
 template <int TP>
@@ -375,7 +435,7 @@ int gdn_forward_tp(const pulsar_gdn_weights *w, const pulsar_gdn_call *c, cudaSt
     float *qkvn = static_cast<float *>(c->scratch);
     float *gb   = qkvn + (size_t)rows * Sh::QKV;
     const int tiles = (c->seq_rows + T1 - 1) / T1;
-    if ((c->conv_rows == nullptr) != (c->rec_rows == nullptr))
+    if ((c->conv_rows == nullptr) != (c->rec_upd == nullptr))
         return refuse("the verify capture needs both row buffers");
     if (c->conv_rows && c->seq_rows > 1)
         gdn_conv_rows_kernel<TP><<<dim3((unsigned)(c->n_seq * (c->seq_rows - 1)), Sh::CONV_HEADS), 128, 0, stream>>>(
@@ -385,7 +445,7 @@ int gdn_forward_tp(const pulsar_gdn_weights *w, const pulsar_gdn_call *c, cudaSt
         c->qkv, c->ld_qkv, c->a, c->ld_a, c->b, c->ld_b, w->conv_w, w->A_log, w->dt_bias,
         c->seq_rows, c->seq_first, c->row_slot, c->conv_state, qkvn, gb, tiles);
     gdn_recur_norm_kernel<TP><<<dim3((unsigned)c->n_seq, Sh::NV, VQ), 256, 0, stream>>>(
-        qkvn, gb, c->z, c->ld_z, w->norm_w, c->seq_rows, c->seq_first, c->row_slot, c->rec_state, c->rec_rows,
+        qkvn, gb, c->z, c->ld_z, w->norm_w, c->seq_rows, c->seq_first, c->row_slot, c->rec_state, c->rec_upd,
         c->out_f32, static_cast<__nv_bfloat16 *>(c->out_bf16),
         static_cast<__nv_fp8_e4m3 *>(c->out_e4m3), static_cast<unsigned char *>(c->out_scale), c->out_kbp);
     const cudaError_t e = cudaGetLastError();

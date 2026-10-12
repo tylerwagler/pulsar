@@ -19,6 +19,12 @@
  *   D. MoE block over 512 experts (an aliased pool of 12 distinct slices per
  *      projection, gate/up K=4, down K=5; shared K=5/5/4) vs double with the
  *      device's routing; T = 1 bit-identical; the non-finite flag stays clear.
+ *   I. L288 the head's tensor-core arm (pulsar_qwen_mxfp8_head_launch): 1 .. 16 rows vs the same quantized
+ *      operands in double; every row of a call BIT-IDENTICAL to that row alone; 17 rows and a null activation
+ *      refused.
+ *   H. L289 draft pick: the device's first maximum and f32 softmax probability of a draft-head row
+ *      (65812 logits) BIT-EXACT vs the host scan it replaced, over random rows, ties, an all-but-one
+ *      -inf row and a narrow row; a NaN row is flagged; the record is the same bytes run to run.
  *
  * usage: ./tests/qwen_s4_gate */
 #include "../src/pulsar_gpu.h"
@@ -105,6 +111,109 @@ static double bf_ulps(double got, double want) {
 
 /* ======================================================================== */
 static void section_mxfp8_linear(void);   /* defined at the end */
+static void section_head(void);           /* defined at the end */
+
+/* H. L289: the draft head's pick on the device vs the host scan it replaced (the old qwen_mtp_argmax, verbatim:
+ * the first maximum by a strict > scan, and (float)(1.0 / sum exp((double)(row[i] - m))) in index order). */
+static int32_t host_pick(const float *row, int n, float *prob) {
+    int a = 0;
+    for (int i = 1; i < n; i++) if (row[i] > row[a]) a = i;
+    double z = 0.0;
+    const float m = row[a];
+    for (int i = 0; i < n; i++) z += exp((double)(row[i] - m));
+    *prob = (float)(1.0 / z);
+    return a;
+}
+
+static void section_draft_top(void) {
+    printf("H. draft pick (L289): device first-max + f32 confidence vs the host scan\n");
+    const int N = 65812;   /* the served draft head: ids [0, 65536) + the 276 specials */
+    const size_t wsb = pulsar_qwen_draft_top_ws_bytes();
+    float *drow = (float *)dalloc((size_t)N * 4);
+    void *ws = dalloc(wsb);
+    std::vector<float> row(N);
+    int idx_bad = 0, conf_bad = 0, rows = 0;
+    float worst_got = 0, worst_want = 0;
+    auto run = [&](int n, pulsar_qwen_draft_top *rec) {
+        CK(cudaMemcpy(drow, row.data(), (size_t)n * 4, cudaMemcpyHostToDevice));
+        const int rc = pulsar_qwen_draft_top_launch(drow, n, 1, ws, 0);
+        CK(cudaDeviceSynchronize());
+        CK(cudaMemcpy(rec, ws, sizeof *rec, cudaMemcpyDeviceToHost));
+        return rc;
+    };
+    auto grade = [&](int n) {
+        pulsar_qwen_draft_top rec{};
+        float want = 0;
+        const int a = host_pick(row.data(), n, &want);
+        if (run(n, &rec) != 0 || rec.nan) { idx_bad++; return; }
+        rows++;
+        idx_bad += rec.index != a;
+        if (memcmp(&rec.conf, &want, 4) != 0) { conf_bad++; worst_got = rec.conf; worst_want = want; }
+    };
+    /* logits-like rows: a heavy body, a few strong candidates (the confident and the unsure draft) */
+    for (int r = 0; r < 400; r++) {
+        const double sc = 1.0 + 6.0 * rndu();
+        for (int i = 0; i < N; i++) row[i] = (float)(sc * rndn());
+        const int peaks = 1 + (int)(rnd() % 4);
+        for (int k = 0; k < peaks; k++) row[rnd() % N] = (float)(sc * (3.0 + 4.0 * rndu()));
+        grade(N);
+    }
+    /* ties: the maximum at two and at many places -> the lowest index */
+    for (int r = 0; r < 40; r++) {
+        for (int i = 0; i < N; i++) row[i] = (float)rndn();
+        const float m = 9.5f;
+        for (int k = 0; k < 1 + r % 7; k++) row[rnd() % N] = m;
+        grade(N);
+    }
+    /* one finite logit in a row of -inf (a draft head over a masked vocabulary), and a narrow row */
+    for (int i = 0; i < N; i++) row[i] = -INFINITY;
+    row[N - 3] = 0.25f;
+    grade(N);
+    for (int i = 0; i < 37; i++) row[i] = (float)rndn();
+    grade(37);
+    CHECK(idx_bad == 0 && conf_bad == 0, "%d rows: pick %d differ, confidence %d not bit-exact%s", rows, idx_bad,
+          conf_bad, conf_bad ? " (one shown below)" : "");
+    if (conf_bad) printf("        got %.9g want %.9g\n", (double)worst_got, (double)worst_want);
+    /* run to run: the same record bytes */
+    for (int i = 0; i < N; i++) row[i] = (float)(3.0 * rndn());
+    pulsar_qwen_draft_top r1{}, r2{};
+    run(N, &r1);
+    run(N, &r2);
+    CHECK(memcmp(&r1, &r2, sizeof r1) == 0, "the record is the same bytes run to run");
+    /* L288: one launch over every bank's row of a draft step -- each record the bytes its row gives alone */
+    {
+        const int R = PULSAR_QWEN_DRAFT_TOP_ROWS_MAX;
+        std::vector<float> rows((size_t)R * N);
+        for (int r = 0; r < R; r++) {
+            const double sc = 1.0 + 6.0 * rndu();
+            for (int i = 0; i < N; i++) rows[(size_t)r * N + i] = (float)(sc * rndn());
+            rows[(size_t)r * N + rnd() % N] = (float)(sc * 6.0);
+        }
+        float *drows = (float *)dalloc(rows.size() * 4);
+        CK(cudaMemcpy(drows, rows.data(), rows.size() * 4, cudaMemcpyHostToDevice));
+        std::vector<pulsar_qwen_draft_top> all(R);
+        const int rc = pulsar_qwen_draft_top_launch(drows, N, R, ws, 0);
+        CK(cudaDeviceSynchronize());
+        CK(cudaMemcpy(all.data(), ws, R * sizeof(pulsar_qwen_draft_top), cudaMemcpyDeviceToHost));
+        int diff = rc != 0;
+        for (int r = 0; r < R; r++) {
+            pulsar_qwen_draft_top one{};
+            std::copy(rows.begin() + (size_t)r * N, rows.begin() + (size_t)(r + 1) * N, row.begin());
+            diff += run(N, &one) != 0 || memcmp(&one, &all[r], sizeof one) != 0;
+        }
+        CHECK(diff == 0, "%d rows in one launch: each record == its row alone (%d differ)", R, diff);
+        cudaFree(drows);
+    }
+    row[12345] = NAN;
+    pulsar_qwen_draft_top rn{};
+    CHECK(run(N, &rn) == 0 && rn.nan != 0, "a NaN in the row is flagged (the caller refuses the draft)");
+    CHECK(pulsar_qwen_draft_top_launch(drow, 0, 1, ws, 0) != 0 && pulsar_qwen_draft_top_launch(nullptr, N, 1, ws, 0) != 0 &&
+              pulsar_qwen_draft_top_launch(drow, N, 0, ws, 0) != 0 &&
+              pulsar_qwen_draft_top_launch(drow, N, PULSAR_QWEN_DRAFT_TOP_ROWS_MAX + 1, ws, 0) != 0,
+          "no logits / a null row / no rows / too many rows is refused");
+    cudaFree(drow);
+    cudaFree(ws);
+}
 static void section_router(void) {
     printf("A. router (bf16 logits, softmax top-%d of %d, renormalised)\n", TOPK, E);
     const int T = 37;
@@ -747,6 +856,8 @@ int main(void) {
     section_ple();
     section_moe();
     section_mxfp8_linear();
+    section_head();
+    section_draft_top();
     printf(g_fail ? "QWEN-S4 GATE FAIL\n" : "QWEN-S4 GATE PASS\n");
     return g_fail;
 }
@@ -799,10 +910,12 @@ static void section_mxfp8_linear(void) {
              * decode GEMV -- unchanged -- read 1.09e-03 on a new near-zero element.  The GEMV keeps a
              * 10x tighter bar than the prefill GEMM (measured 0.9-1.5e-08 vs 5.7-8.5e-08), since it
              * sums in f32 FMAs where the GEMM sums 16-k tensor-core fragments. */
-            const bool gemv = T <= 16;
+            /* L288: a decode-width Linear of >= 256 outputs is the tensor-core rows kernel (16-k fragments, the GEMM's bar) */
+            const bool gemv = T <= 16 && sh.out < 256;
             CHECK(worst_l1n < (gemv ? 1e-7 : 1e-6), "%d -> %d at T = %d (%s) vs the same quantized operands in double: "
                   "max |err|/sum|terms| %.2e (max rel %.2e at ref %.3e, sum|terms| %.3e; t=%d o=%d got %.6e)",
-                  sh.in, sh.out, T, gemv ? "decode GEMV" : "prefill GEMM", worst_l1n, worst, w_ref, w_l1, w_t, w_o, w_got);
+                  sh.in, sh.out, T, gemv ? "decode GEMV" : T <= 16 ? "decode rows kernel" : "prefill GEMM", worst_l1n,
+                  worst, w_ref, w_l1, w_t, w_o, w_got);
         }
         /* a missing activation is refused, not mis-read.  The old negative control was a slot
          * declaring the wrong kbp; with a bf16 activation there is no slot width to get wrong, so
@@ -810,5 +923,109 @@ static void section_mxfp8_linear(void) {
         CHECK(rc == 0 && pulsar_qwen_mxfp8_linear_launch(&l, nullptr, T, y, nullptr, 0, 0) != 0,
               "a null activation is refused");
         cudaFree(dx); cudaFree(y);
+    }
+}
+
+/* ======================================================================== */
+/* I. L288: the head (lm_head / MTP draft head) on the tensor cores.  The weight decodes exactly into bf16 and the
+ * activation is the bf16 row, so every product is exact: the grade is the summation order's alone (16-k fragments
+ * summed in f32, the prefill GEMM's bar).  A row's logits must not depend on the rows beside it -- a verify row's
+ * bytes are a one-row decode's -- so every row of a call is compared with that row alone, byte for byte. */
+static void section_head(void) {
+    printf("I. head on the tensor cores (mxfp8_lt 2560 -> 3001, a partial 16-row tile; 1 .. 16 rows)\n");
+    const int in = H, out = 3001, TM = 16;
+    std::vector<double> wd((size_t)out * in);
+    for (auto &v : wd) v = rndn() * 0.03;
+    mx8 w;
+    w.encode(wd, out, in);
+    const std::vector<uint16_t> act = rnd_act(TM, in, 0.9);
+    uint16_t *dx = up(act);
+    float *y = (float *)dalloc((size_t)TM * out * 4);
+    float *y1 = (float *)dalloc((size_t)out * 4);
+    const pulsar_qwen_lowrank l{up(w.q), up(w.sf), out, in};
+    for (const int T : {1, 5, 8, 9, 16}) {
+        const int rc = pulsar_qwen_mxfp8_head_launch(&l, dx, T, y, 0);
+        CHECK(rc == 0, "%2d rows launch", T);
+        if (rc) continue;
+        const auto Y = down(y, (size_t)T * out);
+        double worst_l1n = 0;
+        int w_t = -1, w_o = -1;
+        for (int t = 0; t < T; t++)
+            for (int o = 0; o < out; o++) {
+                double ref = 0, l1 = 0;
+                for (int k = 0; k < in; k++) {
+                    const double p = w.at(o, k) * bf(act[(size_t)t * in + k]);
+                    ref += p;
+                    l1 += fabs(p);
+                }
+                const double e = l1 > 0 ? fabs(Y[(size_t)t * out + o] - ref) / l1 : 0;
+                if (e > worst_l1n) { worst_l1n = e; w_t = t; w_o = o; }
+            }
+        CHECK(worst_l1n < 1e-6, "%2d rows vs the same quantized operands in double: max |err|/sum|terms| %.2e "
+              "(t=%d o=%d)", T, worst_l1n, w_t, w_o);
+        int differ = 0;
+        for (int t = 0; t < T; t++) {
+            CK(cudaMemset(y1, 0xFF, (size_t)out * 4));
+            if (pulsar_qwen_mxfp8_head_launch(&l, dx + (size_t)t * in, 1, y1, 0) != 0) { differ = -1; break; }
+            const auto Y1 = down(y1, (size_t)out);
+            differ += memcmp(Y1.data(), Y.data() + (size_t)t * out, (size_t)out * 4) != 0;
+        }
+        CHECK(differ == 0, "%2d rows: every row bit-identical to that row alone (%d differ)", T, differ);
+    }
+    {
+        /* the weight decode is EXACT for every code: one-hot activations read single weights back -- every E4M3 code
+         * (subnormals and both zeros included, the NaN codes excepted) under block scales 2^-60 .. 2^10 */
+        const int R = 256;
+        mx8 wx;
+        wx.out = R; wx.in = in;
+        wx.q.assign((size_t)R * in, 0);
+        wx.sf.assign(pulsar_mx_sf_slab_bytes(R, pulsar_mx_kbp(in)), 0);
+        for (int r = 0; r < R; r++) {
+            for (int k = 0; k < in; k++) {
+                const uint8_t q = k < TM ? (uint8_t)((r * TM + k) % 256) : (uint8_t)rnd();
+                wx.q[(size_t)r * in + k] = (q & 0x7F) == 0x7F ? 0 : q;
+            }
+            for (int b = 0; b < in / 32; b++) wx.sf[pulsar_mx_sfoff(r, b, pulsar_mx_kbp(in))] = (uint8_t)(67 + (r * 7 + b) % 71);
+        }
+        std::vector<uint16_t> oh((size_t)TM * in, 0);
+        for (int t = 0; t < TM; t++) oh[(size_t)t * in + t] = 0x3F80;   /* bf16 1.0 */
+        uint16_t *dxo = up(oh);
+        float *yo = (float *)dalloc((size_t)TM * R * 4);
+        const pulsar_qwen_lowrank lx{up(wx.q), up(wx.sf), R, in};
+        const int rc = pulsar_qwen_mxfp8_head_launch(&lx, dxo, TM, yo, 0);
+        const auto Y = down(yo, (size_t)TM * R);
+        int bad = 0;
+        for (int t = 0; t < TM; t++)
+            for (int r = 0; r < R; r++) bad += (double)Y[(size_t)t * R + r] != wx.at(r, t);
+        CHECK(rc == 0 && bad == 0, "every E4M3 code x scale decodes exactly (%d of %d single-weight reads differ)", bad, TM * R);
+        cudaFree(dxo); cudaFree(yo);
+    }
+    CHECK(pulsar_qwen_mxfp8_head_launch(&l, dx, TM + 1, y, 0) != 0, "17 rows refused");
+    CHECK(pulsar_qwen_mxfp8_head_launch(&l, nullptr, 1, y, 0) != 0, "a null activation refused");
+    cudaFree(dx); cudaFree(y); cudaFree(y1);
+    /* the production shape, timed (information, not graded): the lm_head 248320 x 2560 and the draft head
+     * 82196 x 2560, random codes, at 1 / 4 / 16 rows; GB/s over the weight bytes */
+    for (const int V : {248320, 82196}) {
+        const uint64_t wb = (uint64_t)V * in, sb = pulsar_mx_sf_slab_bytes(V, pulsar_mx_kbp(in));
+        uint8_t *dw = (uint8_t *)dalloc(wb + sb);
+        CK(cudaMemset(dw, 0x31, wb + sb));                    /* finite codes, scale 2^-78 */
+        uint16_t *dxv = up(act);
+        float *dy = (float *)dalloc((size_t)TM * V * 4);
+        const pulsar_qwen_lowrank lv{dw, dw + wb, V, in};
+        cudaEvent_t e0, e1;
+        CK(cudaEventCreate(&e0)); CK(cudaEventCreate(&e1));
+        for (const int T : {1, 4, 16}) {
+            for (int i = 0; i < 3; i++) (void)pulsar_qwen_mxfp8_head_launch(&lv, dxv, T, dy, 0);
+            CK(cudaEventRecord(e0));
+            for (int i = 0; i < 20; i++) (void)pulsar_qwen_mxfp8_head_launch(&lv, dxv, T, dy, 0);
+            CK(cudaEventRecord(e1));
+            CK(cudaEventSynchronize(e1));
+            float ms = 0;
+            CK(cudaEventElapsedTime(&ms, e0, e1));
+            printf("  time  %6d x %d, %2d rows: %.3f ms a call, %.0f GB/s of weight\n", V, in, T, ms / 20,
+                   (double)(wb + sb) / (ms / 20 * 1e-3) / 1e9);
+        }
+        cudaEventDestroy(e0); cudaEventDestroy(e1);
+        cudaFree(dw); cudaFree(dxv); cudaFree(dy);
     }
 }

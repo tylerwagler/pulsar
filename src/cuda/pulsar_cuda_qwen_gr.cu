@@ -10,7 +10,8 @@
  *              dot W_inj . xn is taken here on the f32 xn as per-stream partials.
  *              At prefill widths (3') the down GEMM stages xn from the streams with
  *              the same three operations, so the norm does not write it there
- *   2. down    d = W_down xn (320 x 10240), split-K in 5 fixed splits
+ *   2. down    d = W_down xn (320 x 10240), split-K in 5 fixed splits (L288: on the tensor
+ *              cores at decode widths too -- the rows kernel, W read once for <= 16 rows)
  *   3. up      mid: a = silu(d / 4) in shared memory, in the format W_up reads
  *              (each CTA derives it for its tokens), inj = 2 sigmoid(z / 4) with
  *              z the partials summed in stream order; then for each channel c
@@ -298,8 +299,8 @@ qwen_gr_down_kernel(const void *__restrict__ wv, const uint8_t *__restrict__ wsf
  * shared memory as bf16 and the product runs as mma.m16n8k16 bf16 x bf16 -> f32, a fresh fragment per
  * 16-k step added into the f32 accumulator.
  *
- * Decode widths keep the GEMV (2): a decode kernel run over a prompt re-reads the activation once per
- * 8 weight rows (40x per call for W_down), which was 22% of a 4096-row prefill.  The two kernels sum in
+ * Decode widths keep a decode kernel (the GEMV (2); L288: the rows kernel for the head and the read's
+ * W_down): a decode kernel run over a prompt re-reads the activation once per 8 weight rows (40x per call for W_down), which was 22% of a 4096-row prefill.  The two kernels sum in
  * different orders, so a prefilled row and a decoded row agree to rounding, not to the bit (Tyler
  * 2026-09-29: "Don't use a decode kernel for prefill"); within this kernel a row's arithmetic depends
  * on nothing but its own x and W, so the chunk width changes no bit -- nor does the CTA's output
@@ -732,8 +733,20 @@ static int gr_down_tokens_per_cta(int in, int n_split) {
     return tb < 1 ? 0 : tb < kDownTB ? tb : kDownTB;
 }
 
+namespace {
+/* L288: the tensor-core rows kernel (below, with the head) -- the read's W_down takes it at decode widths */
+constexpr int kHeadChunk = 64;                    ///< k per lane load: 16 codes a row
+constexpr int kHeadUnroll = 4;                    ///< chunks per step: two 4-block scale words a row
+constexpr int kHeadKStep = kHeadChunk * kHeadUnroll;
+constexpr int kHeadRowsMax = 16;
+constexpr int kRowsLinearOutMin = 256;             ///< a plain Linear this wide takes the rows kernel at decode widths
+template <int NT>
+int rows_launch(const uint8_t *wq, const uint8_t *sf, const uint16_t *x_bf16, int out, int in, int rows, int n_split,
+                float *y, bool persistent, cudaStream_t stream);
+} // namespace
+
 template <bool W8>
-static void gr_read_kernels(const pulsar_qwen_gr_dev *w, const uint16_t *streams, int T, uint16_t *x_bf16,
+static int gr_read_kernels(const pulsar_qwen_gr_dev *w, const uint16_t *streams, int T, uint16_t *x_bf16,
                             float *inj, const gr_ws &m, cudaStream_t stream) {
     /* W8 selects the WEIGHT format only; the activation is bf16 either way -- the W8A16 arm, on the
      * tensor cores (2') at prefill widths, where the GEMM's staging takes xn from the streams itself
@@ -746,9 +759,17 @@ static void gr_read_kernels(const pulsar_qwen_gr_dev *w, const uint16_t *streams
     if (gemm) {
         qwen_w8a16_prefill_kernel<GR_NORM, kDnNJ><<<dim3((kR + kDnOut - 1) / kDnOut, kDownSplit, (T + kMmaTok - 1) / kMmaTok), 128, 0, stream>>>(
             (const uint8_t *)w->down.w, w->down.sf, (const __nv_bfloat16 *)streams, kR, kHC, T, kDownSplit, m.part, ga);
+    } else if (W8) {
+        /* L288: decode widths on the tensor cores too -- the W_down read once for all <= 16 rows (the GEMV re-read
+         * it per 8-row group and re-decoded every code per row: 42 us at 9-16 rows vs 22 at <= 8) */
+        static_assert(kHC / kDownSplit % kHeadKStep == 0 && kDecodeRowsMax <= kHeadRowsMax, "W_down splits into whole steps");
+        const int rc = T > 8 ? rows_launch<2>((const uint8_t *)w->down.w, w->down.sf, (const uint16_t *)m.xn, kR, kHC, T,
+                                              kDownSplit, m.part, false, stream)
+                             : rows_launch<1>((const uint8_t *)w->down.w, w->down.sf, (const uint16_t *)m.xn, kR, kHC, T,
+                                              kDownSplit, m.part, false, stream);
+        if (rc) return rc;
     } else {
         const int tb = gr_down_tokens_per_cta(kHC, kDownSplit);
-        static_assert(kHC / kDownSplit * 2 * kDownTB <= kDownStageBytes, "W_down stages a whole token tile");
         qwen_gr_down_kernel<W8, false><<<dim3((kR + 7) / 8, kDownSplit, (T + tb - 1) / tb), 256,
                                          W8 ? (size_t)tb * kHC / kDownSplit * 2 : 0, stream>>>(
             w->down.w, w->down.sf, m.xn, nullptr, 0, kR, kHC, T, kDownSplit, tb, m.part);
@@ -761,7 +782,7 @@ static void gr_read_kernels(const pulsar_qwen_gr_dev *w, const uint16_t *streams
         static_assert(kH % (kGrOut / kS) == 0, "the gate tiles the channels by kGrOut / 4");
         qwen_w8a16_prefill_kernel<GR_GATE, kGrNJ><<<dim3(kH / (kGrOut / kS), 1, (T + kMmaTok - 1) / kMmaTok), 128, 0, stream>>>(
             (const uint8_t *)w->up.w, w->up.sf, m.a, kHC, kR, T, 1, nullptr, ga);
-        return;
+        return 0;
     }
     if (W8) {
         static bool attr = false;                 /* idempotent; set once, not per launch */
@@ -781,12 +802,13 @@ static void gr_read_kernels(const pulsar_qwen_gr_dev *w, const uint16_t *streams
             qwen_gr_up_kernel<W8, kUpTB><<<grid, 32 * kS, smem, stream>>>(
                 w->up.w, w->up.sf, m.part, injp, inj, (const __nv_bfloat16 *)streams, (const __nv_bfloat16 *)w->norm_w,
                 m.rstd, T, (__nv_bfloat16 *)x_bf16);
-            return;
+            return 0;
         }
     }
     qwen_gr_up_kernel<W8, kUpTBDecode><<<grid, 32 * kS, smem, stream>>>(
         w->up.w, w->up.sf, m.part, injp, inj, (const __nv_bfloat16 *)streams, (const __nv_bfloat16 *)w->norm_w,
         m.rstd, T, (__nv_bfloat16 *)x_bf16);
+    return 0;
 }
 
 extern "C" int pulsar_qwen_gr_read_launch(const pulsar_qwen_gr_dev *w, const uint16_t *streams, int T,
@@ -820,14 +842,18 @@ extern "C" int pulsar_qwen_gr_read_launch(const pulsar_qwen_gr_dev *w, const uin
     static int announced[2] = {0, 0};
     if (!announced[w8]) {
         announced[w8] = 1;
-        fprintf(stderr, "pulsar: L251 qwen GR read = grouped norm -> %s W_down (split-K %d) -> silu/4 -> %s W_up "
+        fprintf(stderr, "pulsar: L251 qwen GR read = grouped norm -> %s W_down (split-K %d%s) -> silu/4 -> %s W_up "
                         "sigmoid gate, stream mean -> bf16 row; streams bf16, activation bf16\n",
-                w8 ? "MXFP8" : "BF16", kDownSplit, w8 ? "MXFP8" : "BF16");
+                w8 ? "MXFP8" : "BF16", kDownSplit, w8 ? "; L288 tensor cores at every width" : "", w8 ? "MXFP8" : "BF16");
     }
     /* L251 / ac69748f: there is no scale slab to clear and no slot to fill -- xn is bf16, so the
      * norm writes every element the down GEMV reads and nothing else owns this buffer. */
-    if (w8) gr_read_kernels<true>(w, streams, T, x_bf16, inj, m, stream);
-    else    gr_read_kernels<false>(w, streams, T, x_bf16, inj, m, stream);
+    const int rc = w8 ? gr_read_kernels<true>(w, streams, T, x_bf16, inj, m, stream)
+                      : gr_read_kernels<false>(w, streams, T, x_bf16, inj, m, stream);
+    if (rc) {
+        fprintf(stderr, "pulsar: qwen GR read: the W_down of %d rows could not be launched -- refusing\n", T);
+        return -3;
+    }
     return launch_ok("read") ? 0 : -3;
 }
 
@@ -869,6 +895,28 @@ extern "C" int pulsar_qwen_mxfp8_linear_launch(const pulsar_qwen_lowrank *l, con
         const dim3 grid((l->out + kMmaOut - 1) / kMmaOut, 1, (rows + kMmaTok - 1) / kMmaTok);
         qwen_w8a16_prefill_kernel<GR_PLAIN, kMmaNJ><<<grid, 128, 0, stream>>>((const uint8_t *)l->w, l->sf, (const __nv_bfloat16 *)x_bf16,
                                                                    l->out, l->in, rows, 1, y, gr_gate_args{});
+    } else if (l->out >= kRowsLinearOutMin && l->in % kHeadKStep == 0) {
+        /* L288: a wide Linear (the MTP fc, the PLE projections) takes the rows kernel at decode widths -- its weight
+         * read once for all <= 16 rows; the narrow ones (GDN in_proj_a / _b, 48 rows: 3 MMA tiles) keep the GEMV,
+         * whose split of each row over 32 lanes fills the GPU */
+        if ((((uintptr_t)l->w | (uintptr_t)x_bf16) & 15u) != 0) {
+            fprintf(stderr, "pulsar: qwen mxfp8 linear: %d -> %d needs 16-byte aligned weight and rows -- refusing\n",
+                    l->in, l->out);
+            return -1;
+        }
+        static int announced = 0;
+        if (!announced) {
+            announced = 1;
+            fprintf(stderr, "pulsar: L288 qwen mxfp8 linear at decode widths = the tensor-core rows kernel for >= %d "
+                            "outputs (first: %d -> %d), the GEMV below\n", kRowsLinearOutMin, l->in, l->out);
+        }
+        const int rc = rows > 8 ? rows_launch<2>((const uint8_t *)l->w, l->sf, x_bf16, l->out, l->in, rows, 1, y, true, stream)
+                                : rows_launch<1>((const uint8_t *)l->w, l->sf, x_bf16, l->out, l->in, rows, 1, y, true, stream);
+        if (rc) {
+            fprintf(stderr, "pulsar: qwen mxfp8 linear: %d -> %d at %d rows could not be launched -- refusing\n", l->in,
+                    l->out, rows);
+            return -1;
+        }
     } else {
         const int tb = gr_down_tokens_per_cta(l->in, 1);
         if (tb == 0) {
@@ -886,6 +934,209 @@ extern "C" int pulsar_qwen_mxfp8_linear_launch(const pulsar_qwen_lowrank *l, con
         return -1;
     }
     return 0;
+}
+
+/* L288 (work/qwen-rows): the ROWS kernel -- an mxfp8_lt weight against 1 .. 16 bf16 rows on the tensor cores,
+ * reading the weight ONCE per call for all rows.  Two users: the HEAD -- lm_head (~248k x 2560) and the MTP draft
+ * head (~82k x 2560), at every width the head runs -- and the GR read's W_down (320 x 10240, split-K 5) at decode
+ * widths (the read's GEMV took 42 us at 9-16 rows vs 22 at <= 8 for the same reason as below).
+ *
+ * Why not the GEMV (2): it stages at most kDownTB = 8 rows a CTA, so a 9..16-row verify re-read the 0.66 GB head
+ * per 8-row group, and inside a group it re-decoded every E4M3 code once per row on the CUDA cores -- 3.0 ms at
+ * ~4 rows (the 0.66 GB floor at 273 GB/s is 2.4 ms) and 7.7 ms at 9-16 (L288 a2a profile: 4 streams).  This
+ * kernel: 2.82 / 2.87 / 2.90 ms at 1 / 4 / 16 rows, ~230 GB/s (qwen_s4_gate section I times it).
+ *
+ * Arithmetic.  W = E4M3 * 2^(e8m0 - 127) is EXACT in bf16 (3 mantissa bits, a power-of-two scale), and so is the
+ * activation (the mixer's bf16 row), so every product of mma.m16n8k16.bf16 is exact; only the summation order
+ * differs from the GEMV (a fresh 16-k fragment, added into an f32 accumulator in k order -- the prefill GEMM's
+ * pattern, 2').  A token's column of the MMA reads only its own activation, so a row's logits do not depend on how
+ * many rows ride with it: a verify row's bytes equal a one-row decode's.
+ *
+ * Mapping.  A warp owns 16 weight rows (the MMA's M) and the call's tokens are its N (one or two n8 tiles).  The k
+ * order inside a 64-wide chunk is permuted -- any permutation applied to both operands is the same dot product --
+ * so that lane (g, c) loads 16 CONTIGUOUS codes of each of its two rows (one uint4 each) and the matching 16 bf16
+ * of its token from shared memory (two uint4): logical k {2c, 2c+1 | 2c+8, 2c+9} of 16-k step s is actual
+ * k 16c + 4s + {0, 1 | 2, 3}.  The activation rows are staged once per CTA (persistent CTAs, a grid-stride walk
+ * over 16-row tiles); the row stride is padded to 16 mod 128 bytes, so a quarter-warp's eight 16-byte loads hit
+ * eight distinct bank groups. */
+namespace {
+constexpr int kHeadWarps = 8;
+
+/* 4 E4M3 codes (one word, code i in byte i) -> bf16 pairs lo = codes 0, 1 and hi = codes 2, 3, each the code's value
+ * times the block scale, EXACTLY.  The code's sign and 7 magnitude bits, placed at bf16 bits 15 and 4..10, read as a
+ * bf16 of value code x 2^-120 -- the normal codes and the subnormal ones alike (a bf16 subnormal), zero staying
+ * zero; two exact power-of-two products (2^120, then the block's 2^(e8m0 - 127)) give the value. */
+__device__ __forceinline__ __nv_bfloat162 bf2_bits(uint32_t v) { return *reinterpret_cast<const __nv_bfloat162 *>(&v); }
+__device__ __forceinline__ uint32_t bf2_u32(__nv_bfloat162 v) { return *reinterpret_cast<const uint32_t *>(&v); }
+__device__ __forceinline__ void e4m3x4_bf16(uint32_t w, __nv_bfloat162 sc, uint32_t &lo, uint32_t &hi) {
+    const __nv_bfloat162 k120 = bf2_bits(0x7B807B80u);             /* 2^120 in each half */
+    const uint32_t a = __byte_perm(w, 0u, 0x1404u), b = __byte_perm(w, 0u, 0x3424u);   /* code << 8 per half */
+    const uint32_t ma = (a & 0x80008000u) | ((a >> 4) & 0x07F007F0u), mb = (b & 0x80008000u) | ((b >> 4) & 0x07F007F0u);
+    lo = bf2_u32(__hmul2(__hmul2(bf2_bits(ma), k120), sc));
+    hi = bf2_u32(__hmul2(__hmul2(bf2_bits(mb), k120), sc));
+}
+/* 2^(b - 127) as a bf16 pair: the E8M0 byte IS the bf16 exponent field (b = 0: 2^-127, a bf16 subnormal) */
+__device__ __forceinline__ __nv_bfloat162 mx_scale_bf16x2(uint32_t b) {
+    const uint32_t h = b ? b << 7 : 0x0040u;
+    return bf2_bits(h | h << 16);
+}
+
+template <int NT>
+__global__ void __launch_bounds__(32 * kHeadWarps)
+qwen_w8a16_rows_kernel(const uint8_t *__restrict__ wq, const uint8_t *__restrict__ wsf,
+                       const __nv_bfloat16 *__restrict__ x, int out, int in, int T, int n_split,
+                       float *__restrict__ y) {
+    extern __shared__ __align__(16) uint8_t hx[];
+    /* split-K (the GR read's W_down): CTA row blockIdx.y owns k [k_lo, k_lo + kin) and stages only that slice;
+     * y is then part[t][split][row], the GEMV's layout (n_split 1: y[t][row]) */
+    const int split = blockIdx.y, kin = in / n_split, k_lo = split * kin;
+    const int stride = kin * 2 + 16;              /* bytes per staged token row: 16 mod 128 */
+    const int n16 = kin / 8;
+    for (int i = threadIdx.x; i < NT * 8 * n16; i += blockDim.x) {
+        const int t = i / n16, q = i - t * n16;
+        const uint4 v = t < T ? reinterpret_cast<const uint4 *>(x + (size_t)t * in + k_lo)[q] : make_uint4(0u, 0u, 0u, 0u);
+        *reinterpret_cast<uint4 *>(hx + (size_t)t * stride + q * 16) = v;
+    }
+    __syncthreads();
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, c = lane & 3;
+    const int kbp = pulsar_mx_kbp(in), n_tiles = (out + 15) / 16;
+    const uint8_t *xs = hx + 32 * c;
+    for (int tile = blockIdx.x * kHeadWarps + warp; tile < n_tiles; tile += gridDim.x * kHeadWarps) {
+        const int r0 = tile * 16 + g, r1 = r0 + 8;
+        const bool v0 = r0 < out, v1 = r1 < out;
+        const uint4 *w0 = reinterpret_cast<const uint4 *>(wq + (size_t)(v0 ? r0 : 0) * in + 16 * c);
+        const uint4 *w1 = reinterpret_cast<const uint4 *>(wq + (size_t)(v1 ? r1 : 0) * in + 16 * c);
+        float acc[NT][4];
+#pragma unroll
+        for (int j = 0; j < NT; ++j)
+#pragma unroll
+            for (int e = 0; e < 4; ++e) acc[j][e] = 0.0f;
+        /* the step's codes (4 chunks x 2 rows) and its 8 MX blocks' scales (two words a row); the NEXT step's are
+         * loaded before this step's MMAs, so a warp keeps a step's bytes in flight */
+        uint4 a0[kHeadUnroll], a1[kHeadUnroll];
+        uint32_t s0[2], s1[2];
+        auto load = [&](int k0) {
+            const int ch0 = k0 / kHeadChunk, kb = k0 / 32;   /* kb a multiple of 8: two aligned 4-block words */
+#pragma unroll
+            for (int u = 0; u < kHeadUnroll; ++u) {
+                a0[u] = v0 ? __ldcs(w0 + (ch0 + u) * (kHeadChunk / 16)) : make_uint4(0u, 0u, 0u, 0u);
+                a1[u] = v1 ? __ldcs(w1 + (ch0 + u) * (kHeadChunk / 16)) : make_uint4(0u, 0u, 0u, 0u);
+            }
+#pragma unroll
+            for (int h = 0; h < 2; ++h) {
+                s0[h] = v0 ? *reinterpret_cast<const uint32_t *>(wsf + pulsar_mx_sfoff(r0, kb + 4 * h, kbp)) : 0u;
+                s1[h] = v1 ? *reinterpret_cast<const uint32_t *>(wsf + pulsar_mx_sfoff(r1, kb + 4 * h, kbp)) : 0u;
+            }
+        };
+        load(k_lo);
+        for (int k0 = k_lo; k0 < k_lo + kin; k0 += kHeadKStep) {
+            uint32_t A0[kHeadUnroll][8], A1[kHeadUnroll][8];   /* bf16 pairs: [2s] = k 4s, 4s+1; [2s+1] = k 4s+2, 4s+3 */
+#pragma unroll
+            for (int u = 0; u < kHeadUnroll; ++u) {
+                /* lane c's 16 codes of chunk u are k 64u + 16c .. +15: MX block 2u + c / 2 of the step */
+                const int b = 2 * u + (c >> 1), sh = 8 * (b & 3);
+                const __nv_bfloat162 sc0 = mx_scale_bf16x2((s0[b >> 2] >> sh) & 0xFFu);
+                const __nv_bfloat162 sc1 = mx_scale_bf16x2((s1[b >> 2] >> sh) & 0xFFu);
+                const uint32_t *p0 = reinterpret_cast<const uint32_t *>(&a0[u]);
+                const uint32_t *p1 = reinterpret_cast<const uint32_t *>(&a1[u]);
+#pragma unroll
+                for (int w = 0; w < 4; ++w) {
+                    e4m3x4_bf16(p0[w], sc0, A0[u][2 * w], A0[u][2 * w + 1]);
+                    e4m3x4_bf16(p1[w], sc1, A1[u][2 * w], A1[u][2 * w + 1]);
+                }
+            }
+            if (k0 + kHeadKStep < k_lo + kin) load(k0 + kHeadKStep);
+#pragma unroll
+            for (int u = 0; u < kHeadUnroll; ++u) {
+                const int xoff = (k0 - k_lo + u * kHeadChunk) * 2;
+#pragma unroll
+                for (int j = 0; j < NT; ++j) {
+                    const uint8_t *xr = xs + (size_t)(j * 8 + g) * stride + xoff;
+                    const uint4 q0 = *reinterpret_cast<const uint4 *>(xr);
+                    const uint4 q1 = *reinterpret_cast<const uint4 *>(xr + 16);
+                    const uint32_t B[8] = {q0.x, q0.y, q0.z, q0.w, q1.x, q1.y, q1.z, q1.w};
+#pragma unroll
+                    for (int s = 0; s < 4; ++s) {
+                        const uint32_t af[4] = {A0[u][2 * s], A1[u][2 * s], A0[u][2 * s + 1], A1[u][2 * s + 1]};
+                        float d[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+                        mma_bf16_16816(d, af, B[2 * s], B[2 * s + 1]);
+#pragma unroll
+                        for (int e = 0; e < 4; ++e) acc[j][e] += d[e];
+                    }
+                }
+            }
+        }
+        /* acc[j][0..1] = row r0, tokens 8j + 2c, +1; acc[j][2..3] = row r1 */
+#pragma unroll
+        for (int j = 0; j < NT; ++j)
+#pragma unroll
+            for (int e = 0; e < 4; ++e) {
+                const int t = 8 * j + 2 * c + (e & 1), row = e < 2 ? r0 : r1;
+                if (t < T && (e < 2 ? v0 : v1)) y[((size_t)t * n_split + split) * out + row] = acc[j][e];
+            }
+    }
+}
+
+/* One launch of the rows kernel.  `persistent`: as many CTAs as fit the GPU, each walking 16-row tiles (the
+ * head: thousands of tiles); otherwise one tile a warp (a split-K W_down: 20 tiles x 5 splits).  The dynamic
+ * shared memory a CTA stages is NT x 8 rows of the split's slice. */
+template <int NT>
+int rows_launch(const uint8_t *wq, const uint8_t *sf, const uint16_t *x_bf16, int out, int in, int rows, int n_split,
+                float *y, bool persistent, cudaStream_t stream) {
+    static int sms = 0;
+    static size_t smem_set = 0;                    /* the attribute grows to the widest slice seen */
+    const size_t smem = (size_t)NT * 8 * (in / n_split * 2 + 16);
+    if (!sms) {
+        int dev = 0;
+        if (cudaGetDevice(&dev) != cudaSuccess || cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev) != cudaSuccess)
+            return -1;
+    }
+    if (smem > smem_set) {
+        if (cudaFuncSetAttribute(qwen_w8a16_rows_kernel<NT>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem) !=
+            cudaSuccess) {
+            fprintf(stderr, "pulsar: qwen mxfp8 rows: %d rows of a %d-wide slice do not fit an SM -- refusing\n", NT * 8,
+                    in / n_split);
+            return -1;
+        }
+        smem_set = smem;
+    }
+    const int tiles = (out + 15) / 16;
+    int gx = (tiles + kHeadWarps - 1) / kHeadWarps;
+    if (persistent) {
+        int per = 0;
+        if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per, qwen_w8a16_rows_kernel<NT>, 32 * kHeadWarps, smem) !=
+                cudaSuccess || per < 1)
+            return -1;
+        gx = gx < sms * per ? gx : sms * per;
+    }
+    qwen_w8a16_rows_kernel<NT><<<dim3(gx, n_split), 32 * kHeadWarps, smem, stream>>>(
+        wq, sf, (const __nv_bfloat16 *)x_bf16, out, in, rows, n_split, y);
+    return 0;
+}
+} // namespace
+
+extern "C" int pulsar_qwen_mxfp8_head_launch(const pulsar_qwen_lowrank *l, const uint16_t *x_bf16, int rows, float *y,
+                                             cudaStream_t stream) {
+    if (!l || !l->w || !l->sf || !x_bf16 || !y || rows <= 0 || rows > kHeadRowsMax || l->out <= 0 ||
+        l->in <= 0 || l->in % kHeadKStep != 0 || (((uintptr_t)l->w | (uintptr_t)x_bf16) & 15u)) {
+        fprintf(stderr, "pulsar: qwen mxfp8 head: %d rows (1 .. %d) of width %d (a multiple of %d), 16-byte aligned "
+                        "-- refusing\n", rows, kHeadRowsMax, l ? l->in : -1, kHeadKStep);
+        return -1;
+    }
+    static int announced = 0;
+    if (!announced) {
+        announced = 1;
+        fprintf(stderr, "pulsar: L288 qwen head = MXFP8 -> bf16 on the tensor cores (mma m16n8k16, f32 accumulate), the "
+                        "weight read once for all <= %d rows, persistent CTAs\n", kHeadRowsMax);
+    }
+    const uint8_t *wq = (const uint8_t *)l->w;
+    const int rc = rows > 8 ? rows_launch<2>(wq, l->sf, x_bf16, l->out, l->in, rows, 1, y, true, stream)
+                            : rows_launch<1>(wq, l->sf, x_bf16, l->out, l->in, rows, 1, y, true, stream);
+    if (rc) {
+        fprintf(stderr, "pulsar: qwen mxfp8 head: %d rows of width %d could not be launched -- refusing\n", rows, l->in);
+        return rc;
+    }
+    return launch_ok("head") ? 0 : -1;
 }
 
 /* L251: the lm_head as MXFP8, made once at load from the container's bf16 head.  The bf16 head

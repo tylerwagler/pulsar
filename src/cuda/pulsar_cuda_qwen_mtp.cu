@@ -113,7 +113,130 @@ bool launch_ok(const char *what) {
     return true;
 }
 
+/* ---- L289: the draft head's greedy pick and confidence on the device ---------------------------------
+ * Three launches over kTopBlocks contiguous chunks of each row (blockIdx.y = the row): each block's first
+ * maximum; each block's double sum of exp((double)(row[i] - m)) at the row's maximum m; one thread a row folds
+ * both in block order.  The pick is order-free (max, ties to the lower index); the sum's order is fixed, so a
+ * row's record is the same bytes run to run and whatever rows ride with it (L288: one launch for every bank's
+ * draft row of a step). */
+constexpr int kTopBlocks = 64;
+constexpr int kTopThreads = 256;
+
+/* one row's scratch; the workspace is PULSAR_QWEN_DRAFT_TOP_ROWS_MAX records, then as many of these */
+struct top_ws {
+    float best[kTopBlocks];
+    int32_t idx[kTopBlocks];
+    uint32_t nan[kTopBlocks];
+    double z[kTopBlocks];
+};
+
+__device__ __forceinline__ bool top_takes(float v, int32_t i, float bv, int32_t bi) {
+    return v > bv || (v == bv && i < bi);
+}
+
+__device__ __forceinline__ int top_chunk(int n) { return (n + kTopBlocks - 1) / kTopBlocks; }
+
+__device__ __forceinline__ top_ws *top_row_ws(void *ws) {
+    return (top_ws *)((pulsar_qwen_draft_top *)ws + PULSAR_QWEN_DRAFT_TOP_ROWS_MAX) + blockIdx.y;
+}
+
+__global__ void __launch_bounds__(kTopThreads) draft_top_max_kernel(const float *rows, int n, void *wsv) {
+    const float *row = rows + (size_t)blockIdx.y * n;
+    top_ws *ws = top_row_ws(wsv);
+    __shared__ float sv[kTopThreads / 32];
+    __shared__ int32_t si[kTopThreads / 32];
+    __shared__ uint32_t sn[kTopThreads / 32];
+    const int c = top_chunk(n), lo = blockIdx.x * c, hi = min(n, lo + c);
+    float bv = -INFINITY;
+    int32_t bi = INT32_MAX;
+    uint32_t nan = 0;
+    for (int i = lo + (int)threadIdx.x; i < hi; i += kTopThreads) {
+        const float v = row[i];
+        nan |= isnan(v) ? 1u : 0u;
+        if (top_takes(v, i, bv, bi)) { bv = v; bi = i; }
+    }
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) {
+        const float ov = __shfl_xor_sync(0xffffffffu, bv, o);
+        const int32_t oi = __shfl_xor_sync(0xffffffffu, bi, o);
+        nan |= __shfl_xor_sync(0xffffffffu, nan, o);
+        if (top_takes(ov, oi, bv, bi)) { bv = ov; bi = oi; }
+    }
+    const int warp = threadIdx.x >> 5;
+    if ((threadIdx.x & 31) == 0) { sv[warp] = bv; si[warp] = bi; sn[warp] = nan; }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        for (int w = 1; w < kTopThreads / 32; ++w) {
+            if (top_takes(sv[w], si[w], bv, bi)) { bv = sv[w]; bi = si[w]; }
+            nan |= sn[w];
+        }
+        ws->best[blockIdx.x] = bv;
+        ws->idx[blockIdx.x] = bi;
+        ws->nan[blockIdx.x] = nan;
+    }
+}
+
+/* The row's maximum from the blocks' -- every block folds the same kTopBlocks entries in the same order. */
+__device__ __forceinline__ void top_fold(const top_ws *ws, float *bv, int32_t *bi) {
+    *bv = ws->best[0];
+    *bi = ws->idx[0];
+    for (int b = 1; b < kTopBlocks; ++b)
+        if (top_takes(ws->best[b], ws->idx[b], *bv, *bi)) { *bv = ws->best[b]; *bi = ws->idx[b]; }
+}
+
+__global__ void __launch_bounds__(kTopThreads) draft_top_sum_kernel(const float *rows, int n, void *wsv) {
+    __shared__ double sz[kTopThreads];
+    const float *row = rows + (size_t)blockIdx.y * n;
+    const top_ws *ws = top_row_ws(wsv);
+    float m;
+    int32_t a;
+    top_fold(ws, &m, &a);
+    m = a < n ? row[a] : m;   /* the host rule's m is row[a] itself */
+    const int c = top_chunk(n), lo = blockIdx.x * c, hi = min(n, lo + c);
+    double z = 0.0;
+    for (int i = lo + (int)threadIdx.x; i < hi; i += kTopThreads) z += exp((double)(row[i] - m));
+    sz[threadIdx.x] = z;
+    __syncthreads();
+    for (int s = kTopThreads / 2; s > 0; s >>= 1) {
+        if ((int)threadIdx.x < s) sz[threadIdx.x] += sz[threadIdx.x + s];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) top_row_ws(wsv)->z[blockIdx.x] = sz[0];
+}
+
+__global__ void draft_top_record_kernel(void *wsv) {
+    const top_ws *ws = top_row_ws(wsv);
+    pulsar_qwen_draft_top *rec = (pulsar_qwen_draft_top *)wsv + blockIdx.y;
+    float m;
+    int32_t a;
+    top_fold(ws, &m, &a);
+    double z = 0.0;
+    uint32_t nan = 0;
+    for (int b = 0; b < kTopBlocks; ++b) { z += ws->z[b]; nan |= ws->nan[b]; }
+    rec->index = a;
+    rec->conf = (float)(1.0 / z);
+    rec->nan = nan;
+    rec->pad = 0;
+}
+
 } // namespace
+
+extern "C" size_t pulsar_qwen_draft_top_ws_bytes(void) {
+    return PULSAR_QWEN_DRAFT_TOP_ROWS_MAX * (sizeof(pulsar_qwen_draft_top) + sizeof(top_ws));
+}
+
+extern "C" int pulsar_qwen_draft_top_launch(const float *rows, int n, int n_rows, void *ws, cudaStream_t stream) {
+    if (!rows || !ws || n <= 0 || n_rows <= 0 || n_rows > PULSAR_QWEN_DRAFT_TOP_ROWS_MAX) {
+        fprintf(stderr, "pulsar: qwen draft top: a null row / workspace, no logits or %d rows (1..%d) -- refusing\n",
+                n_rows, PULSAR_QWEN_DRAFT_TOP_ROWS_MAX);
+        return -1;
+    }
+    const dim3 grid(kTopBlocks, (unsigned)n_rows);
+    draft_top_max_kernel<<<grid, kTopThreads, 0, stream>>>(rows, n, ws);
+    draft_top_sum_kernel<<<grid, kTopThreads, 0, stream>>>(rows, n, ws);
+    draft_top_record_kernel<<<dim3(1, (unsigned)n_rows), 1, 0, stream>>>(ws);
+    return launch_ok("draft top") ? 0 : -3;
+}
 
 extern "C" size_t pulsar_qwen_mtp_combine_workspace_bytes(void) { return mtp_ws_layout(nullptr, nullptr); }
 

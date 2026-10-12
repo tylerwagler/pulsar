@@ -132,13 +132,38 @@ size_t pulsar_qwen_mtp_combine_workspace_bytes(void);
 int pulsar_qwen_mtp_combine_launch(const pulsar_qwen_mtp_dev *w, const uint16_t *h_streams, const int32_t *tokens,
                                    int T, uint16_t *out_streams, void *ws, size_t ws_bytes, cudaStream_t stream);
 
+/** L289: one draft-head row's greedy pick and its confidence, reduced on the device so a draft step reads back
+ *  this record instead of the row (263 KB) and the host no longer scans it.  L288: up to
+ *  PULSAR_QWEN_DRAFT_TOP_ROWS_MAX rows a launch (every bank's draft row of a step), one record each. */
+#define PULSAR_QWEN_DRAFT_TOP_ROWS_MAX 16
+typedef struct {
+    int32_t index;      /**< the FIRST index of the row's maximum (a strict > scan from index 0) */
+    float conf;         /**< (float)(1.0 / sum_i exp((double)(row[i] - row[index]))): its softmax probability */
+    uint32_t nan;       /**< nonzero: the row holds a NaN -- the pick means nothing and the caller refuses */
+    uint32_t pad;
+} pulsar_qwen_draft_top;
+/** Device bytes of the reduction's workspace (PULSAR_QWEN_DRAFT_TOP_ROWS_MAX records first, row 0's at offset 0). */
+size_t pulsar_qwen_draft_top_ws_bytes(void);
+/** rows [n_rows][n] f32 (device) -> record r at the start of `ws` (device, pulsar_qwen_draft_top_ws_bytes) is row r's.
+ *  The pick is the host scan's (ties to the lower index); the sum is in double, each term exp((double)(row[i] - m))
+ *  with the f32 difference the host rule takes, so the f32 confidence is the host rule's value; a row's record does
+ *  not depend on the rows beside it.  n_rows 1 .. PULSAR_QWEN_DRAFT_TOP_ROWS_MAX.  0 on success. */
+int pulsar_qwen_draft_top_launch(const float *rows, int n, int n_rows, void *ws, cudaStream_t stream);
+
 /** A plain MXFP8 dense Linear: y [rows][out] f32 = W x, W stored mxfp8_lt
  *  ([out][in] E4M3 then the swizzled E8M0 plane) and x the block input's bf16 row
  *  of width `l->in` -- there is no E4M3 activation slot in this family (L251 /
- *  ac69748f).  The same arithmetic the GR arm's W_down uses (split-K, one warp
- *  per output row, ordered); no workspace. */
+ *  ac69748f).  At decode widths (<= 16 rows) a Linear of >= 256 outputs takes the tensor-core rows kernel the
+ *  head uses (L288: the weight read once for all rows), a narrower one the GEMV (one warp per output row,
+ *  ordered); prompt widths the tensor-core GEMM.  No workspace. */
 int pulsar_qwen_mxfp8_linear_launch(const pulsar_qwen_lowrank *l, const uint16_t *x_bf16, int rows, float *y,
                                     void *ws, size_t ws_bytes, cudaStream_t stream);
+/** L288: the head (lm_head, the MTP draft head): y [rows][out] f32 = W x for an mxfp8_lt W and bf16 rows x, 1 .. 16
+ *  rows, on the tensor cores (W decoded exactly into bf16, mma.m16n8k16 with a fresh fragment per 16 k added into
+ *  an f32 accumulator), the weight read once for every row.  A row's result does not depend on the rows beside it.
+ *  `in` a multiple of 256 and the same at every call; w and x 16-byte aligned.  0 on success. */
+int pulsar_qwen_mxfp8_head_launch(const pulsar_qwen_lowrank *l, const uint16_t *x_bf16, int rows, float *y,
+                                  cudaStream_t stream);
 /** L251: bytes of an [out][in] mxfp8_lt matrix (E4M3 then the swizzled E8M0 plane); 0 if in % 32. */
 uint64_t pulsar_qwen_mxfp8_bytes(int out, int in);
 /** L251: a bf16 [out][in] matrix into mxfp8_lt at `dst` (pulsar_qwen_mxfp8_bytes), with the

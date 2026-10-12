@@ -204,6 +204,7 @@ struct pulsar_engram_gather {
     uint32_t failed;        ///< rows whose read failed
     uint64_t first_bad;     ///< the first failing row id, for the message
     int      first_errno;
+    int      detached;      ///< a prefetch (L289): nobody waits; the worker finishing its last row frees it
     pulsar_engram_gather *q_next;
 };
 
@@ -231,6 +232,8 @@ static void *engram_io_worker(void *arg) {
             io->head = g->q_next;
             if (!io->head) io->tail = NULL;
         }
+        /* a prefetch wakes one reader (L289); each reader wakes the next while slices remain */
+        if (io->head) pthread_cond_signal(&io->work);
         pthread_mutex_unlock(&io->lock);
 
         uint32_t failed = 0, first_errno = 0;
@@ -256,8 +259,11 @@ static void *engram_io_worker(void *arg) {
         pthread_mutex_lock(&io->lock);
         g->done += i1 - i0;
         if (failed) { if (!g->failed) { g->first_bad = first_bad; g->first_errno = (int)first_errno; } g->failed += failed; }
-        pthread_cond_broadcast(&io->idle);
+        /* a prefetch is out of the take-queue once its last slice is taken, so its last finisher is its last user */
+        const bool reap = g->detached && g->done >= g->n_rows;
+        if (!g->detached) pthread_cond_broadcast(&io->idle);
         pthread_mutex_unlock(&io->lock);
+        if (reap) { free(g->dst); free((void *)g->rows); free(g); }
     }
 }
 
@@ -294,11 +300,12 @@ void pulsar_engram_io_destroy(pulsar_engram_io *io) {
     free(io);
 }
 
-pulsar_engram_gather *pulsar_engram_gather_start(pulsar_engram_io *io, const pulsar_engram_table *t,
-                                                 const uint64_t *rows, uint32_t n_rows,
-                                                 unsigned char *dst) {
+static pulsar_engram_gather *engram_gather_issue(pulsar_engram_io *io, const pulsar_engram_table *t,
+                                                 const uint64_t *rows, uint32_t n_rows, unsigned char *dst,
+                                                 int detached) {
     if (!io || !t || !t->parts || !rows || !dst || n_rows == 0) return NULL;
     pulsar_engram_gather *g = (pulsar_engram_gather *)xcalloc(1, sizeof *g);
+    g->detached = detached;
     g->io = io;
     g->table = t;
     g->rows = rows;
@@ -309,9 +316,26 @@ pulsar_engram_gather *pulsar_engram_gather_start(pulsar_engram_io *io, const pul
     pthread_mutex_lock(&io->lock);
     if (io->tail) io->tail->q_next = g; else io->head = g;
     io->tail = g;
-    pthread_cond_broadcast(&io->work);
+    /* a gather someone waits on wakes the whole pool now; a prefetch (L289) runs off the critical path, so its
+     * issuer -- the draft chain, between MTP steps -- pays one wake and the readers wake each other */
+    if (detached) pthread_cond_signal(&io->work);
+    else pthread_cond_broadcast(&io->work);
     pthread_mutex_unlock(&io->lock);
     return g;
+}
+
+pulsar_engram_gather *pulsar_engram_gather_start(pulsar_engram_io *io, const pulsar_engram_table *t,
+                                                 const uint64_t *rows, uint32_t n_rows,
+                                                 unsigned char *dst) {
+    return engram_gather_issue(io, t, rows, n_rows, dst, 0);
+}
+
+void pulsar_engram_prefetch(pulsar_engram_io *io, const pulsar_engram_table *t, const uint64_t *rows, uint32_t n_rows) {
+    if (!io || !t || !t->parts || !rows || n_rows == 0) return;
+    uint64_t *ids = (uint64_t *)xmalloc((size_t)n_rows * sizeof(uint64_t));
+    memcpy(ids, rows, (size_t)n_rows * sizeof(uint64_t));
+    unsigned char *dst = (unsigned char *)xmalloc((size_t)n_rows * t->row_bytes);
+    (void)engram_gather_issue(io, t, ids, n_rows, dst, 1);   /* the pool owns ids and dst now */
 }
 
 /* Blocks until every row is accounted for.  A worker adds its slice to `done`
