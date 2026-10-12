@@ -132,13 +132,38 @@ size_t pulsar_qwen_mtp_combine_workspace_bytes(void);
 int pulsar_qwen_mtp_combine_launch(const pulsar_qwen_mtp_dev *w, const uint16_t *h_streams, const int32_t *tokens,
                                    int T, uint16_t *out_streams, void *ws, size_t ws_bytes, cudaStream_t stream);
 
+/** L289: one draft-head row's greedy pick and its confidence, reduced on the device so a draft step reads back
+ *  this record instead of the row (263 KB) and the host no longer scans it.  L288: up to
+ *  PULSAR_QWEN_DRAFT_TOP_ROWS_MAX rows a launch (every bank's draft row of a step), one record each. */
+#define PULSAR_QWEN_DRAFT_TOP_ROWS_MAX 16
+typedef struct {
+    int32_t index;      /**< the FIRST index of the row's maximum (a strict > scan from index 0) */
+    float conf;         /**< (float)(1.0 / sum_i exp((double)(row[i] - row[index]))): its softmax probability */
+    uint32_t nan;       /**< nonzero: the row holds a NaN -- the pick means nothing and the caller refuses */
+    uint32_t pad;
+} pulsar_qwen_draft_top;
+/** Device bytes of the reduction's workspace (PULSAR_QWEN_DRAFT_TOP_ROWS_MAX records first, row 0's at offset 0). */
+size_t pulsar_qwen_draft_top_ws_bytes(void);
+/** rows [n_rows][n] f32 (device) -> record r at the start of `ws` (device, pulsar_qwen_draft_top_ws_bytes) is row r's.
+ *  The pick is the host scan's (ties to the lower index); the sum is in double, each term exp((double)(row[i] - m))
+ *  with the f32 difference the host rule takes, so the f32 confidence is the host rule's value; a row's record does
+ *  not depend on the rows beside it.  n_rows 1 .. PULSAR_QWEN_DRAFT_TOP_ROWS_MAX.  0 on success. */
+int pulsar_qwen_draft_top_launch(const float *rows, int n, int n_rows, void *ws, cudaStream_t stream);
+
 /** A plain MXFP8 dense Linear: y [rows][out] f32 = W x, W stored mxfp8_lt
  *  ([out][in] E4M3 then the swizzled E8M0 plane) and x the block input's bf16 row
  *  of width `l->in` -- there is no E4M3 activation slot in this family (L251 /
- *  ac69748f).  The same arithmetic the GR arm's W_down uses (split-K, one warp
- *  per output row, ordered); no workspace. */
+ *  ac69748f).  At decode widths (<= 16 rows) a Linear of >= 256 outputs takes the tensor-core rows kernel the
+ *  head uses (L288: the weight read once for all rows), a narrower one the GEMV (one warp per output row,
+ *  ordered); prompt widths the tensor-core GEMM.  No workspace. */
 int pulsar_qwen_mxfp8_linear_launch(const pulsar_qwen_lowrank *l, const uint16_t *x_bf16, int rows, float *y,
                                     void *ws, size_t ws_bytes, cudaStream_t stream);
+/** L288: the head (lm_head, the MTP draft head): y [rows][out] f32 = W x for an mxfp8_lt W and bf16 rows x, 1 .. 16
+ *  rows, on the tensor cores (W decoded exactly into bf16, mma.m16n8k16 with a fresh fragment per 16 k added into
+ *  an f32 accumulator), the weight read once for every row.  A row's result does not depend on the rows beside it.
+ *  `in` a multiple of 256 and the same at every call; w and x 16-byte aligned.  0 on success. */
+int pulsar_qwen_mxfp8_head_launch(const pulsar_qwen_lowrank *l, const uint16_t *x_bf16, int rows, float *y,
+                                  cudaStream_t stream);
 /** L251: bytes of an [out][in] mxfp8_lt matrix (E4M3 then the swizzled E8M0 plane); 0 if in % 32. */
 uint64_t pulsar_qwen_mxfp8_bytes(int out, int in);
 /** L251: a bf16 [out][in] matrix into mxfp8_lt at `dst` (pulsar_qwen_mxfp8_bytes), with the
@@ -166,6 +191,16 @@ size_t pulsar_rows_linear_workspace_bytes(const pulsar_rows_linear *l, int rows)
 int pulsar_rows_linear_launch(const pulsar_rows_linear *l, const uint16_t *x_bf16, int rows, float *y,
                               void *ws, size_t ws_bytes, cudaStream_t stream);
 
+/** L288 exl3-dense: workspace bytes pulsar_rows_linear_multi_launch needs for n Linears of one input at `rows`
+ *  rows -- each 128-multiple width sized as an EXL3 projection, the most it takes (an mxfp8_lt one runs alone
+ *  after the EXL3 launch and reuses it). */
+size_t pulsar_rows_linear_multi_workspace_bytes(const pulsar_rows_linear *const *ls, int n, int rows);
+/** L288 exl3-dense: y[j] [rows][ls[j]->out] f32 = Linear j of the SAME bf16 rows, for n (1..4) Linears of one
+ *  input width and row kind -- the EXL3 ones in one dense multi launch (one prep, one GEMV per rate: each output
+ *  bit for bit what pulsar_rows_linear_launch writes for it alone), then each mxfp8_lt one by itself. */
+int pulsar_rows_linear_multi_launch(const pulsar_rows_linear *const *ls, int n, const uint16_t *x_bf16, int rows,
+                                    float *const *y, void *ws, size_t ws_bytes, cudaStream_t stream);
+
 /* ======================================================================== */
 /* MoE block (Qwen4ExpTextSparseMoeBlock)                                     */
 
@@ -188,6 +223,23 @@ int pulsar_qwen_router_launch(const uint16_t *x_bf16, const uint16_t *router_w, 
  *  [ex_lo, ex_lo + n_local) -- all of them on one GPU; under expert parallelism a token's picks of another
  *  rank's experts are dropped here and summed there. */
 struct pulsar_tessera_proj;   /* src/cuda/mmq/pulsar_tessera.h (L255) */
+/** Task #44: a shared expert whose three Linears are EXL3 dense slices rides the routed launches (the EXL3 routed
+ *  front door, mmq/exl3_moe.cuh) -- keyed on that format; any other format runs pulsar_qwen_moe_shared_launch.
+ *  out += scale[t] * down(silu(gate x) * up x), added after the routed sum. */
+typedef struct pulsar_rows_moe_shared {
+    pulsar_rows_linear gate, up, down;   /**< EXL3 (k2 != 0) all three */
+    const float *scale;                  /**< [T] the shared term's multiplier (a sigmoid gate), or NULL = 1 */
+    float *yg, *yu, *ys;                 /**< [T][mid], [T][mid], [T][out] f32 */
+    uint16_t *h;                         /**< [T][mid] bf16: the SwiGLU rows the down reads (the imatrix tap's) */
+    void *ws;                            /**< the dense arm's workspace, pulsar_rows_moe_shared_ws_bytes */
+    size_t ws_bytes;
+} pulsar_rows_moe_shared;
+/** The dense-arm workspace a riding shared expert needs for T rows (in -> mid -> out). */
+size_t pulsar_rows_moe_shared_ws_bytes(int T, int in, int mid, int out);
+/** L288 exl3-dense: fork the riding shared expert of T bf16 rows onto its own stream (exl3_moe_shared_fork) --
+ *  call it AHEAD of the router, then pulsar_rows_moe_routed_launch with the same descriptor joins it before its
+ *  sum.  Each pending fork needs its own yg / yu / ys / h rows.  0 on success. */
+int pulsar_rows_moe_shared_fork(const pulsar_rows_moe_shared *q, const uint16_t *x_bf16, int T, cudaStream_t stream);
 typedef struct pulsar_rows_moe {
     const void *const *gate_up_table;   /**< exl3_expert_table pairs, the fused form, or NULL */
     const void *const *gate_table, *const *up_table;   /**< the pair form, or NULL */
@@ -197,16 +249,19 @@ typedef struct pulsar_rows_moe {
      *  with both or neither, and (no expert range in that arm yet) one whose tables are not every expert. */
     const struct pulsar_tessera_proj *tessera_gate, *tessera_up, *tessera_down;
     int k2_gate_up, k2_down;             /**< rates (half-bit units); k2_gate_up is the pair's in the split form */
+    int n_expert, top_k;                 /**< the model's experts (the router's picks index them) and picks per row */
+    int in_dim, mid_dim, out_dim;        /**< the expert shape (the model's): in == out, the block's hidden */
     int ex_lo, n_local;                  /**< the experts the tables hold */
+    const pulsar_rows_moe_shared *shared; /**< an EXL3 shared expert riding the launches, or NULL */
     /** a PROMPT chunk (not a verify): the routed prefill GEMM at every row count, so a prompt cut anywhere is
-     *  byte-identical to one prefilled whole (session_contract_gate C1); false: decode widths take the GEMV. */
+     *  byte-identical to one prefilled whole (session_contract_gate C1); false: decode rows, the decode GEMM. */
     bool prompt;
 } pulsar_rows_moe;
 /** Workspace bytes for T rows of the routed part. */
-size_t pulsar_rows_moe_routed_workspace_bytes(int T);
+size_t pulsar_rows_moe_routed_workspace_bytes(int T, int top_k, int mid, int out_dim);
 /** The bf16 rows [T * k][mid] the last pulsar_rows_moe_routed_launch left in `ws` -- each pick's SwiGLU row with
  *  its route weight folded in, the down projection's input (the importance-matrix collection reads it). */
-const uint16_t *pulsar_rows_moe_routed_mid(void *ws, size_t ws_bytes, int T);
+const uint16_t *pulsar_rows_moe_routed_mid(void *ws, size_t ws_bytes, int T, int top_k, int mid, int out_dim);
 /** out [T][hidden] f32 = sum over each row's top-k picks (`sel` [T][k], localised IN PLACE under expert
  *  parallelism; `wts` [T][k]) of w_k * down_k(silu(gate_k x) * up_k x), x the bf16 rows.  Non-finite outputs
  *  record `nf_code` in *nf_flag (first writer wins).  Needs the MMQ drivers (PULSAR_HAVE_MMQ). */

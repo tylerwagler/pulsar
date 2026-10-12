@@ -449,16 +449,20 @@ int main() {
         }
     }
 
-    /* ---- 8. ragged runs + the verify capture over several sequences (L272 P1 S4) -------------------
-     * A multi-bank verify is one ragged run per bank, every row's state captured.  Runs of 5, 3 and 7 rows
-     * on slots {2, 9, 15} in ONE call, capture on: each run's output, final states and captured states
-     * (row r of run s at row seq_first[s] + r) must be its solo captured call's, byte for byte. */
+    /* ---- 8. ragged runs + the verify capture over several sequences (L272 P1 S4; L288 the commit) ----------
+     * A multi-bank verify is one ragged run per bank, every row's conv state and recurrent UPDATE captured; the
+     * recurrent state stays as it was for the commit.  Runs of 5, 3 and 7 rows on slots {2, 9, 15} in ONE call,
+     * capture on: each run's output, conv state, captured conv rows and updates (row r of run s at row
+     * seq_first[s] + r) must be its solo captured call's, byte for byte, and every recurrent state untouched.
+     * Then for every run and every keep 1 .. len, pulsar_gdn_commit over the stored updates must leave the
+     * state BIT-IDENTICAL to an uncaptured forward over the first keep rows. */
     {
-        printf("== 8. ragged runs + the verify capture\n");
+        printf("== 8. ragged runs + the verify capture + the commit\n");
         const std::vector<int> lens = {5, 3, 7}, slots = {2, 9, 15};
         std::vector<int32_t> first = {0};
         for (int l : lens) first.push_back(first.back() + l);
         const int rows = first.back(), longest = 7, base = 100;
+        const size_t UF = pulsar_gdn_upd_floats(1);
         std::vector<std::vector<float>> cs_i(lens.size()), rs_i(lens.size());
         for (size_t i = 0; i < lens.size(); i++) {
             cs_i[i] = cs0; rs_i[i] = rs0;
@@ -471,46 +475,76 @@ int main() {
         int32_t *dfirst = dalloc<int32_t>(first.size());
         h2d(dfirst, first.data(), first.size());
         h2d(R.d_slot, rslot.data(), rslot.size());
-        float *dcr = dalloc<float>(CSF * rows), *drr = dalloc<float>(RSF * rows);
-        auto mk = [&](int row0) {
+        float *dcr = dalloc<float>(CSF * rows), *dru = dalloc<float>(UF * rows);
+        auto mk = [&](int row0, bool capture) {
             pulsar_gdn_call c{};
             c.row_slot = R.d_slot; c.conv_state = R.d_cs; c.rec_state = R.d_rs;
             c.qkv = R.d_qkv + (size_t)row0 * QKV; c.ld_qkv = QKV; c.z = R.d_z + (size_t)row0 * VD; c.ld_z = VD;
             c.a = R.d_a + (size_t)row0 * NV; c.ld_a = NV; c.b = R.d_b + (size_t)row0 * NV; c.ld_b = NV;
             c.scratch = R.d_scratch; c.scratch_bytes = R.scratch_bytes; c.out_f32 = R.d_out + (size_t)row0 * VD;
-            c.conv_rows = dcr; c.rec_rows = drr;
+            if (capture) { c.conv_rows = dcr; c.rec_upd = dru; }
             return c;
         };
         const pulsar_gdn_weights w = R.weights();
-        pulsar_gdn_call c = mk(base);
+        pulsar_gdn_call c = mk(base, true);
         c.n_seq = (int)lens.size(); c.seq_rows = longest; c.seq_first = dfirst; c.n_rows = rows;
         const int rc = pulsar_gdn_forward(&w, &c, 0);
         CK(cudaDeviceSynchronize());
         check(rc == 0, "ragged call (5 + 3 + 7 rows, capture on) returns 0 (%d)", rc);
         const std::vector<float> yb = R.out(base, rows);
-        std::vector<float> crb(CSF * rows), rrb(RSF * rows);
-        d2h(crb.data(), dcr, crb.size()); d2h(rrb.data(), drr, rrb.size());
+        std::vector<float> crb(CSF * rows), urb(UF * rows);
+        d2h(crb.data(), dcr, crb.size()); d2h(urb.data(), dru, urb.size());
         std::vector<std::vector<float>> csb(lens.size()), rsb(lens.size());
-        for (size_t i = 0; i < lens.size(); i++) R.get_slot(slots[i], csb[i], rsb[i]);
+        bool untouched = true;
+        for (size_t i = 0; i < lens.size(); i++) {
+            R.get_slot(slots[i], csb[i], rsb[i]);
+            untouched = untouched && same(rsb[i], rs_i[i]);
+        }
+        check(untouched, "the captured call left every recurrent state as it found it");
         bool ok = true;
         for (size_t i = 0; i < lens.size(); i++) {
             R.set_slot(1, cs_i[i], rs_i[i]);
             std::vector<int32_t> one(lens[i], 1);
             h2d(R.d_slot, one.data(), one.size());
-            pulsar_gdn_call s1 = mk(base + first[i]);
+            pulsar_gdn_call s1 = mk(base + first[i], true);
             s1.n_seq = 1; s1.seq_rows = lens[i];
             ok = ok && pulsar_gdn_forward(&w, &s1, 0) == 0;
             CK(cudaDeviceSynchronize());
             std::vector<float> ya = R.out(base + first[i], lens[i]), csa, rsa; R.get_slot(1, csa, rsa);
-            std::vector<float> cra(CSF * (lens[i] - 1)), rra(RSF * (lens[i] - 1));
-            d2h(cra.data(), dcr, cra.size()); d2h(rra.data(), drr, rra.size());
+            std::vector<float> cra(CSF * (lens[i] - 1)), ura(UF * lens[i]);
+            d2h(cra.data(), dcr, cra.size()); d2h(ura.data(), dru, ura.size());
             ok = ok && memcmp(ya.data(), yb.data() + (size_t)first[i] * VD, ya.size() * sizeof(float)) == 0
-                    && same(csa, csb[i]) && same(rsa, rsb[i])
+                    && same(csa, csb[i]) && same(rsa, rs_i[i])
                     && memcmp(cra.data(), crb.data() + CSF * first[i], cra.size() * sizeof(float)) == 0
-                    && memcmp(rra.data(), rrb.data() + RSF * first[i], rra.size() * sizeof(float)) == 0;
+                    && memcmp(ura.data(), urb.data() + UF * first[i], ura.size() * sizeof(float)) == 0;
         }
-        check(ok, "every ragged run == its solo captured run: output, final states and every captured row state");
-        cudaFree(dfirst); cudaFree(dcr); cudaFree(drr);
+        check(ok, "every ragged run == its solo captured run: output, conv state, captured conv rows and updates");
+        /* the commit over the ragged call's stored updates, every keep, vs a forward over the kept rows */
+        int differ = 0, n_keep = 0;
+        float *dub = dalloc<float>(UF * rows);
+        h2d(dub, urb.data(), urb.size());
+        for (size_t i = 0; i < lens.size(); i++)
+            for (int keep = 1; keep <= lens[i]; keep++) {
+                R.set_slot(1, cs_i[i], rs_i[i]);
+                std::vector<int32_t> one(keep, 1);
+                h2d(R.d_slot, one.data(), one.size());
+                pulsar_gdn_call f = mk(base + first[i], false);
+                f.n_seq = 1; f.seq_rows = keep;
+                const int frc = pulsar_gdn_forward(&w, &f, 0);
+                CK(cudaDeviceSynchronize());
+                std::vector<float> csf, rsf; R.get_slot(1, csf, rsf);
+                R.set_slot(1, cs_i[i], rs_i[i]);
+                const int crc = pulsar_gdn_commit(R.d_rs, 1, dub + UF * first[i], keep, 1, 0);
+                CK(cudaDeviceSynchronize());
+                std::vector<float> csc, rsc; R.get_slot(1, csc, rsc);
+                differ += frc != 0 || crc != 0 || !same(rsc, rsf);
+                n_keep++;
+            }
+        check(differ == 0, "the commit at every keep (%d cases) == the forward over the kept rows: recurrent state "
+              "bit-identical (%d differ)", n_keep, differ);
+        check(pulsar_gdn_commit(R.d_rs, 1, dub, 0, 1, 0) != 0 && pulsar_gdn_commit(nullptr, 1, dub, 1, 1, 0) != 0,
+              "the commit refuses keep 0 and a null state");
+        cudaFree(dfirst); cudaFree(dcr); cudaFree(dru); cudaFree(dub);
     }
 
     printf("gdn_gate: %s\n", g_fail ? "FAIL" : "PASS");

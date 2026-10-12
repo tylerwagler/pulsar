@@ -314,20 +314,15 @@ one new dispatch branch); re-apply them after any re-sync.
 `gguf-tools/d2r_iq2_single_launch.inc` and `gguf-tools/patch_iq2_d2r_single.py`
 reproduce both mechanically.
 
-## Local modifications: `ds4_mmq.cu` (L251 / `ac69748f`)
+## Local modifications: `ds4_mmq.cu` -- the EXL3 arms left (task #44)
 
-Recorded for the next upstream sync.  One change, additive and defaulted off:
+`ds4_mmq_moe_impl` / `ds4_mmq_moe_pair_impl` serve the IQ2 D2R arm only.  The EXL3 routed experts (L245's
+`exl3_k2`, L251's `exl3_fused` and `act_bf16`, L266's `prompt` parameters, and the five `ds4_exl3_moe_*`
+wrappers that set them) moved to their own front door, `exl3_moe.cu`: it reuses `ds4_launch_mm_ids_helper`
+for the expert-sorted schedule (once per layer -- the down reads the gate / up schedule with the pair as its
+source row) and hands the producer's activation to the GEMV in place (no `ds4_gather_mmq_e4m3_cuda` staging,
+no id-map memsets: every consumer stops at `expert_bounds[E]`).
 
-* **`ds4_mmq_moe_impl` gained a trailing `bool act_bf16 = false`.**  With it false nothing differs.  With it
-  true the function refuses a bf16 activation on the IQ2 arm by name, **skips** the D2R precondition, the
-  `src1_e4m3_p` memset and the whole `ds4_gather_mmq_e4m3_cuda` gather (bf16 has nothing to encode), and calls
-  `ds4_exl3_moe_gemv_{fused,single}_bf16_launch` with `ids_src1` — the source row, not `ids_dst`, which is the
-  flat output row.  Two public wrappers were added beside the A8 ones: `ds4_exl3_moe_fused_bf16` and
-  `ds4_exl3_moe_single_bf16`.
-
-  Reason: the contract `ac69748f` says the Qwen family has no E4M3 activation slot.  Keeping the gather would
-  have meant encoding a format the family does not use, and reading it back through `ids_dst` would have been
-  silently wrong for every slot past the first.
-
-**On re-sync:** if upstream changes the activation staging or the `mm_ids_helper` contract, re-apply this on top
-rather than merging it; the guard's shape (refuse, do not fall back) is the part that matters.
+**On re-sync:** nothing EXL3-specific is left in the vendored drivers; `mm_ids_helper`'s contract
+(`ids_src1` = source row, `ids_dst` = flat output row, picks below expert 0 sorting first) is what
+`exl3_moe.cu` relies on.

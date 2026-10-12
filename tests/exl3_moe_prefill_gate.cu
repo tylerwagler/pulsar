@@ -1,5 +1,5 @@
-/* EXL3 MoE PREFILL GATE (L287): the routed experts' prompt-chunk arm (src/cuda/mmq/exl3_moe_prefill.cu),
- * one arm for every family, against an f32-weight reference.
+/* EXL3 MoE PREFILL GATE (L287, task #46): the routed experts' tensor-core arms (src/cuda/mmq/exl3_moe_prefill.cu)
+ * -- the prompt-chunk GEMM and the decode GEMM -- one arm each for every family, against an f32-weight reference.
  *
  * Model-free.  Random trellis words (any word is a valid tile), suh / svh in the checkpoint's distribution,
  * ragged expert loads (a Zipf-like router: experts with hundreds of assignments -- several CTA work items --
@@ -17,6 +17,14 @@
  *   4. chunk invariance: a prompt cut into chunks of 1 / 3 / 17 / 64 / 200 / ... tokens gives every
  *      (token, slot) output the SAME BITS as the prompt in one call.
  *   5. refusals: a rate without an instance, a short workspace, an E4M3 slot without its scales, M % 128.
+ * and the DECODE arm (task #46; exl3_moe_decode_launch, its split partials summed in split order as the fold
+ * and the sum add them):
+ *   6-7. every rate x shape x projection x format at 16 tokens, against the same reference and bounds;
+ *   8. rows 1, 2, 3, 5, 8, 16, 40 at the production rates (incl. turboderp's K3 Qwen pair), and BATCH
+ *      invariance: the rows cut into calls of 1 / 3 / 17 / ... tokens give every output the SAME BITS as one
+ *      call -- the arm's promise (its split count is a function of K alone; a row's m16 tile, k order and
+ *      warp / split order do not depend on its batchmates);
+ *   9. a gate + up pair in one launch == the two projections launched alone, bit for bit; the refusals.
  * Error per assignment row: rel Frobenius ||z - ref|| / ||ref|| and max |z - ref| / max |ref|; reported as the
  * max and mean over the sampled rows.  The operand is ONE fp16 plane per (row, 128-block) prescale: an
  * input the arm rotates rounds once to 11 significant bits (row error ~2^-12 / sqrt 3), an E4M3 value
@@ -243,6 +251,30 @@ static dev_act upload_act(const act_rows &a) {
     return d;
 }
 
+/* The arm under test: false = the prompt-chunk GEMM, true = the decode GEMM (task #46). */
+static bool g_decode = false;
+
+/* One launch of the arm under test; for the decode arm `out` is unused and the split partials are summed in
+ * split order (the fold's / sum's order) into *dec_out [n_assign][N] f32 on the host. */
+static int launch_arm(const pool &pl, bool rotate, const exl3_moe_act &act, const int32_t *d_dst, const int32_t *d_src,
+                      const int32_t *d_b, float *d_out, int64_t n_assign, void *ws, size_t wsb,
+                      std::vector<float> *dec_out) {
+    if (!g_decode)
+        return exl3_moe_prefill_launch(pl.d_table, pl.k2, rotate, act, d_dst, d_src, d_b, d_out, pl.N, pl.K, n_assign,
+                                       pl.E, ws, wsb, 0);
+    exl3_moe_partials zp{};
+    const int rc = exl3_moe_decode_launch(pl.d_table, nullptr, pl.k2, rotate, act, d_dst, d_src, d_b, pl.N, pl.K,
+                                          n_assign, pl.E, ws, wsb, &zp, 0);
+    if (rc || !dec_out) return rc;
+    std::vector<float> part((size_t)zp.splits * zp.split_stride);
+    CUDA_OK(cudaDeviceSynchronize());
+    CUDA_OK(cudaMemcpy(part.data(), zp.z[0], part.size() * 4, cudaMemcpyDeviceToHost));
+    dec_out->assign(part.begin(), part.begin() + zp.split_stride);
+    for (int sp = 1; sp < zp.splits; sp++)
+        for (int64_t i = 0; i < zp.split_stride; i++) (*dec_out)[i] += part[(size_t)sp * zp.split_stride + i];
+    return 0;
+}
+
 /* Run the arm over pairs [p0, p1) of sel; out_host gets [p1 - p0][N] in pair order. */
 static int run_arm(const pool &pl, bool rotate, const exl3_moe_act &act, const std::vector<int32_t> &sel, int topk,
                    int p0, int p1, bool per_pair, std::vector<float> &out_host, sched *keep = nullptr,
@@ -252,7 +284,8 @@ static int run_arm(const pool &pl, bool rotate, const exl3_moe_act &act, const s
     int32_t *d_dst, *d_src, *d_b;
     float *d_out;
     void *ws;
-    const size_t wsb = exl3_moe_prefill_ws_bytes(n_assign, pl.K, pl.E);
+    const size_t wsb = g_decode ? exl3_moe_decode_ws_bytes(1, n_assign, pl.K, pl.N)
+                                : exl3_moe_prefill_ws_bytes(n_assign, pl.K, pl.E);
     CUDA_OK(cudaMalloc(&d_dst, n_assign * 4));
     CUDA_OK(cudaMalloc(&d_src, n_assign * 4));
     CUDA_OK(cudaMalloc(&d_b, (pl.E + 1) * 4));
@@ -262,16 +295,15 @@ static int run_arm(const pool &pl, bool rotate, const exl3_moe_act &act, const s
     CUDA_OK(cudaMemcpy(d_src, s.ids_src.data(), n_assign * 4, cudaMemcpyHostToDevice));
     CUDA_OK(cudaMemcpy(d_b, s.bounds.data(), (pl.E + 1) * 4, cudaMemcpyHostToDevice));
     CUDA_OK(cudaMemset(d_out, 0xff, (size_t)n_assign * pl.N * 4));   /* NaN: an unwritten output cannot pass */
-    int rc = exl3_moe_prefill_launch(pl.d_table, pl.k2, rotate, act, d_dst, d_src, d_b, d_out, pl.N, pl.K,
-                                     n_assign, pl.E, ws, wsb, 0);
+    CUDA_OK(cudaMemset(ws, 0xff, wsb));                              /* (the decode arm's partials live here) */
+    std::vector<float> dec;
+    int rc = launch_arm(pl, rotate, act, d_dst, d_src, d_b, d_out, n_assign, ws, wsb, &dec);
     CUDA_OK(cudaDeviceSynchronize());
     if (rc == 0 && ms) {
         cudaEvent_t a, b;
         cudaEventCreate(&a); cudaEventCreate(&b);
         cudaEventRecord(a);
-        for (int i = 0; i < 5; i++)
-            rc |= exl3_moe_prefill_launch(pl.d_table, pl.k2, rotate, act, d_dst, d_src, d_b, d_out, pl.N, pl.K,
-                                          n_assign, pl.E, ws, wsb, 0);
+        for (int i = 0; i < 5; i++) rc |= launch_arm(pl, rotate, act, d_dst, d_src, d_b, d_out, n_assign, ws, wsb, nullptr);
         cudaEventRecord(b);
         CUDA_OK(cudaEventSynchronize(b));
         cudaEventElapsedTime(ms, a, b);
@@ -279,7 +311,8 @@ static int run_arm(const pool &pl, bool rotate, const exl3_moe_act &act, const s
         cudaEventDestroy(a); cudaEventDestroy(b);
     }
     out_host.resize((size_t)n_assign * pl.N);
-    CUDA_OK(cudaMemcpy(out_host.data(), d_out, out_host.size() * 4, cudaMemcpyDeviceToHost));
+    if (g_decode && rc == 0) out_host = dec;
+    else CUDA_OK(cudaMemcpy(out_host.data(), d_out, out_host.size() * 4, cudaMemcpyDeviceToHost));
     cudaFree(d_dst); cudaFree(d_src); cudaFree(d_b); cudaFree(d_out); cudaFree(ws);
     if (keep) *keep = s;
     return rc;
@@ -354,7 +387,8 @@ static void section_case(const shape &sh, bool gate, int k2, int n_tok, int fmt,
     sched s;
     float ms = 0.0f;
     int rc = run_arm(pl, rotate, da.desc, sel, sh.topk, 0, n_pairs, per_pair, whole, &s, timed ? &ms : nullptr);
-    CHECK(rc == 0, "%s %s K=%g T=%d: launch rc=%d", sh.what, gate ? "gate" : "down", k2 / 2.0, n_tok, rc);
+    CHECK(rc == 0, "%s %s %s K=%g T=%d: launch rc=%d", g_decode ? "decode" : "prefill", sh.what, gate ? "gate" : "down",
+          k2 / 2.0, n_tok, rc);
     int maxload = 0, empty = 0;
     for (int e = 0; e < sh.E; e++) {
         const int c = s.bounds[e + 1] - s.bounds[e];
@@ -363,7 +397,8 @@ static void section_case(const shape &sh, bool gate, int k2, int n_tok, int fmt,
     }
     const errs er = grade(pl, rotate, da, sel, sh.topk, n_pairs, per_pair, whole, max_samples);
     const double bound = frob_bound(rotate);
-    CHECK(er.frob_max < bound, "%s %s K=%g T=%d: worst row rel Frobenius %.3e >= %.1e", sh.what,
+    CHECK(er.frob_max < bound, "%s %s %s K=%g T=%d: worst row rel Frobenius %.3e >= %.1e",
+          g_decode ? "decode" : "prefill", sh.what,
           gate ? "gate" : "down", k2 / 2.0, n_tok, er.frob_max, bound);
     printf("  %-10s %-4s %-5s K=%-3g T=%-5d %5d x %-5d | load max %4d, %3d of %d experts empty | rows %4d: "
            "rel Frob max %.2e mean %.2e, max|err|/max|ref| %.2e",
@@ -406,10 +441,11 @@ static void section_case(const shape &sh, bool gate, int k2, int n_tok, int fmt,
         }
         size_t diff = 0;
         for (size_t i = 0; i < got.size(); i++) diff += memcmp(&got[i], &whole[i], 4) != 0;
-        CHECK(diff == 0, "%s %s K=%g T=%d: %zu of %zu outputs differ between %d chunks and one call", sh.what,
+        CHECK(diff == 0, "%s %s %s K=%g T=%d: %zu of %zu outputs differ between %d calls and one call",
+              g_decode ? "decode" : "prefill", sh.what,
               gate ? "gate" : "down", k2 / 2.0, n_tok, diff, got.size(), nchunks);
-        printf("    chunk invariance: %d chunks (1..200 tokens) vs one call: %s (%zu outputs)\n", nchunks,
-               diff ? "DIFFER" : "bit-identical", got.size());
+        printf("    %s invariance: %d calls (1..200 tokens) vs one call: %s (%zu outputs)\n",
+               g_decode ? "batch" : "chunk", nchunks, diff ? "DIFFER" : "bit-identical", got.size());
     }
     da.release();
     pl.release();
@@ -449,6 +485,62 @@ static void section_refusals(void) {
     pl.release();
 }
 
+/* 9. the decode arm's pair launch (two slices, one PREP + one GEMM launch) gives each projection exactly the bits
+ * of that projection launched alone; and its refusals. */
+static void section_decode_pair(void) {
+    printf("9. decode pair launch == two single launches; decode refusals\n");
+    const int K = 4096, N = 2048, E = 8, topk = 6, n_tok = 7;
+    pool g = make_pool(K, N, 6, 2, E), u = make_pool(K, N, 6, 2, E);
+    act_rows a = make_act(EXL3_MOE_ACT_E4M3_SLOT, n_tok, K);
+    dev_act da = upload_act(a);
+    const std::vector<int32_t> sel = make_selection(n_tok, topk, E);
+    sched s = make_sched(sel, topk, E, 0, n_tok * topk, false);
+    const int64_t n = n_tok * topk;
+    int32_t *d_dst, *d_src, *d_b;
+    CUDA_OK(cudaMalloc(&d_dst, n * 4)); CUDA_OK(cudaMalloc(&d_src, n * 4)); CUDA_OK(cudaMalloc(&d_b, (E + 1) * 4));
+    CUDA_OK(cudaMemcpy(d_dst, s.ids_dst.data(), n * 4, cudaMemcpyHostToDevice));
+    CUDA_OK(cudaMemcpy(d_src, s.ids_src.data(), n * 4, cudaMemcpyHostToDevice));
+    CUDA_OK(cudaMemcpy(d_b, s.bounds.data(), (E + 1) * 4, cudaMemcpyHostToDevice));
+    const size_t w2 = exl3_moe_decode_ws_bytes(2, n, K, N), w1 = exl3_moe_decode_ws_bytes(1, n, K, N);
+    void *ws;
+    CUDA_OK(cudaMalloc(&ws, w2));
+    auto read = [&](const exl3_moe_partials &zp, int j) {
+        std::vector<float> v((size_t)zp.splits * zp.split_stride);
+        CUDA_OK(cudaDeviceSynchronize());
+        CUDA_OK(cudaMemcpy(v.data(), zp.z[j], v.size() * 4, cudaMemcpyDeviceToHost));
+        return v;
+    };
+    exl3_moe_partials zp{}, z1{};
+    int rc = exl3_moe_decode_launch(g.d_table, u.d_table, 6, true, da.desc, d_dst, d_src, d_b, N, K, n, E, ws, w2, &zp, 0);
+    CHECK(rc == 0 && zp.z[1] && zp.splits >= 1, "pair launch rc=%d", rc);
+    const std::vector<float> pg = read(zp, 0), pu = read(zp, 1);
+    rc = exl3_moe_decode_launch(g.d_table, nullptr, 6, true, da.desc, d_dst, d_src, d_b, N, K, n, E, ws, w1, &z1, 0);
+    const std::vector<float> sg = read(z1, 0);
+    rc |= exl3_moe_decode_launch(u.d_table, nullptr, 6, true, da.desc, d_dst, d_src, d_b, N, K, n, E, ws, w1, &z1, 0);
+    const std::vector<float> su = read(z1, 0);
+    CHECK(rc == 0 && pg.size() == sg.size() && pu.size() == su.size(), "single launches rc=%d", rc);
+    size_t diff = 0;
+    for (size_t i = 0; i < pg.size() && i < sg.size(); i++) diff += memcmp(&pg[i], &sg[i], 4) != 0;
+    for (size_t i = 0; i < pu.size() && i < su.size(); i++) diff += memcmp(&pu[i], &su[i], 4) != 0;
+    CHECK(diff == 0, "pair launch differs from the single launches in %zu partials", diff);
+    printf("  V4 gate + up pair, %lld assignments, %d splits: %s (%zu partials)\n", (long long)n, zp.splits,
+           diff ? "DIFFER" : "bit-identical to two single launches", pg.size() + pu.size());
+    const int r_rate = exl3_moe_decode_launch(g.d_table, nullptr, 7, true, da.desc, d_dst, d_src, d_b, N, K, n, E, ws, w1, &z1, 0);
+    const int r_ws = exl3_moe_decode_launch(g.d_table, u.d_table, 6, true, da.desc, d_dst, d_src, d_b, N, K, n, E, ws, w1, &z1, 0);
+    exl3_moe_act nosf = da.desc;
+    nosf.sf = nullptr;
+    const int r_sf = exl3_moe_decode_launch(g.d_table, nullptr, 6, true, nosf, d_dst, d_src, d_b, N, K, n, E, ws, w1, &z1, 0);
+    const int r_m = exl3_moe_decode_launch(g.d_table, nullptr, 6, true, da.desc, d_dst, d_src, d_b, 2000, K, n, E, ws, w1, &z1, 0);
+    const int r_pr = exl3_moe_decode_launch(g.d_table, u.d_table, 6, false, da.desc, d_dst, d_src, d_b, N, K, n, E, ws, w2, &z1, 0);
+    CHECK(r_rate && r_ws && r_sf && r_m && r_pr, "decode refusals: rate %d, workspace %d, E4M3 without scales %d, M %% 128 %d, "
+          "unrotated pair %d (all must be nonzero)", r_rate, r_ws, r_sf, r_m, r_pr);
+    printf("  k2=7 rc=%d, a pair in a one-projection workspace rc=%d, E4M3 slot without its scales rc=%d, M=2000 rc=%d, "
+           "an unrotated pair rc=%d\n", r_rate, r_ws, r_sf, r_m, r_pr);
+    CUDA_OK(cudaDeviceSynchronize());
+    cudaFree(d_dst); cudaFree(d_src); cudaFree(d_b); cudaFree(ws);
+    da.release(); g.release(); u.release();
+}
+
 int main(void) {
     setvbuf(stdout, NULL, _IONBF, 0);
     for (uint32_t s = 0; s < 65536; s++) g_mul1[s] = exl3_f16_to_f32(exl3_mul1_decode(s));
@@ -475,6 +567,28 @@ int main(void) {
                 section_case(*sh, gate, gate ? sh->k2_gate : sh->k2_down, t, sh->fmt, t >= 4096 ? 192 : 256,
                              t > 1 && t <= 1024, 4, t >= 512);
     section_refusals();
+
+    g_decode = true;
+    printf("6-7. the DECODE arm (task #46): every rate, both projections, each family's format, 16 tokens (Zipf "
+           "routing: experts with several 16-row tiles beside single rows), batch invariance\n");
+    for (const shape *sh : {&v4, &v41, &qw})
+        for (int k2 : k2s)
+            for (int gate = 1; gate >= 0; gate--)
+                section_case(*sh, gate, k2, 16, sh->fmt, 160, k2 == sh->k2_gate || k2 == sh->k2_down, 2, false);
+    printf("   the other producer format on the same shapes\n");
+    section_case(v4, true, 6, 16, EXL3_MOE_ACT_BF16_ROWS, 96, true, 2, false);
+    section_case(v4, false, 6, 16, EXL3_MOE_ACT_BF16_ROWS, 96, true, 2, false);
+    section_case(qw, true, 8, 16, EXL3_MOE_ACT_E4M3_SLOT, 160, true, 2, false);
+    section_case(qw, false, 10, 16, EXL3_MOE_ACT_E4M3_SLOT, 160, true, 2, false);
+    printf("8. decode rows 1..40 at the production rates (DeepSeek K3, Qwen K4 / K5 and turboderp's K3 pair), "
+           "batch invariance: a row's bits never depend on how many rows ride with it\n");
+    static const int dtoks[] = {1, 2, 3, 5, 8, 16, 40};
+    const shape qwp = {"Qwen-td305", 2560, 640, 512, 10, false, 6, 6, EXL3_MOE_ACT_BF16_ROWS};
+    for (const shape *sh : {&v4, &v41, &qw, &qwp})
+        for (int t : dtoks)
+            for (int gate = 1; gate >= 0; gate--)
+                section_case(*sh, gate, gate ? sh->k2_gate : sh->k2_down, t, sh->fmt, 160, t > 1, 4, t == 5 || t == 40);
+    section_decode_pair();
     printf(g_fail ? "EXL3-MOE-PREFILL GATE FAIL\n" : "EXL3-MOE-PREFILL GATE PASS\n");
     return g_fail;
 }

@@ -10,8 +10,9 @@
 // there is no E4M3 activation slot in this family).
 //
 // Where the two rotations go:
-//   * INPUT (suh, then H128): the arm's first kernel applies them in f32 to the
-//     block input's bf16 rows, once per (row, 128-block), into its workspace.
+//   * INPUT (suh, then H128): the arm's kernel applies them in f32 to the
+//     block input's bf16 rows, per (row, 128-block) of each CTA's k-range,
+//     straight into the CTA's tensor-core operand tiles.
 //     That is a multiplication by part of W, not an activation re-encode: the
 //     bf16 row IS the one activation encoding, read as bf16 (rule 3).  It is not
 //     hoisted into the producer because suh is per Linear and one activation
@@ -26,16 +27,14 @@
 //   * OUTPUT (H128, then svh): a dense Linear has no fold/sum epilogue, and the
 //     output Hadamard mixes 128 outputs a GEMV CTA does not own together (a CTA
 //     owns 32), so the arm's split-K GEMV writes unrotated f32 partials into the
-//     workspace and its third kernel sums the splits in split order, rotates
-//     each 128-block and scales by svh.
+//     workspace and the last CTA of each 128-output block to finish sums the
+//     splits in split order, rotates the block and scales by svh.
 //
 // Every row is bit-identical at every M: the split count depends on (K, N)
 // only, every row block is 16 rows (the MMA's M; rows past M are zero), a
-// row's k order, warp order and split order do not depend on its batchmates,
-// and rows beyond 128 are further slabs of the same three launches -- decode
-// and prefill are one arithmetic, as in the routed-expert arm.  Prefill rows
-// are correct and slow: every 16-row block re-reads and re-decodes the weight
-// (an E4M3-tile + FP8 MMA prefill arm is the one to build, L251 slice 2d).
+// row's k order, warp order and split order do not depend on its batchmates.
+// M > 16 rows and prompt chunks take the tensor-core prefill GEMM
+// (qwen_exl3_dense_prefill.cu), which agrees to rounding.
 
 #pragma once
 
@@ -48,10 +47,9 @@
  *  instantiates: K = 2, 3, 4, 5. */
 bool ds4_exl3_dense_rate_supported(int k2);
 
-/** Workspace bytes ds4_exl3_dense_launch needs for (M, K, N): for one slab of
- *  min(M, 128) rows, the split partials (f32 [splits][rows][N]), the rotated
- *  rows' hi and lo planes (fp16 [rows][K] each) and their inverse prescales
- *  (f32 [rows][K/128]).  0 for a shape the arm refuses. */
+/** Workspace bytes ds4_exl3_dense_launch needs for (M, K, N): the split
+ *  partials and the prep planes of min(M, 16) rows (more than 16 rows are the
+ *  prefill GEMM's, which needs none).  0 for a shape the arm refuses. */
 size_t ds4_exl3_dense_workspace_bytes(int M, int K, int N);
 
 /** The number of K splits the arm uses for (K, N) -- a function of the weight's
@@ -63,8 +61,8 @@ int ds4_exl3_dense_splits(int K, int N);
  *  (16-byte aligned), `xb` the bf16 block input of the M rows (8-byte aligned,
  *  the uint2 row loads).  K % 128 == 0,
  *  N % 128 == 0, M >= 1, k2 a supported rate, `workspace` (16-byte aligned) at
- *  least ds4_exl3_dense_workspace_bytes(M, K, N).  Three kernels per 128-row
- *  slab on `stream`; refuses (returns -1) on any contract violation, -3 on a
+ *  least ds4_exl3_dense_workspace_bytes(M, K, N).  Two kernels on `stream`
+ *  (the prep, the GEMV with its epilogue); refuses (returns -1) on any contract violation, -3 on a
  *  launch failure. */
 int ds4_exl3_dense_launch(
     const void   * w,
@@ -80,3 +78,33 @@ int ds4_exl3_dense_launch(
     /* L266: a prompt chunk takes the prefill GEMM at every M (qwen_exl3_dense_prefill.cu), so a
      * prompt cut anywhere is byte-identical to one prefilled whole; false: M > 16 does */
     bool           prompt = false);
+
+/** L251: the dense arm's prompt chunks through a decode-once tensor-core GEMM: w is the dense layout
+ *  (trellis | suh[K] | svh[N]); writes y [M][N] finished (output rotation and svh applied).
+ *  ds4_exl3_dense_launch calls it for prompt chunks and M > 16. */
+int qwen_exl3_dense_prefill_launch(const void *w, int k2, const void *x_bf16, float *y, int M, int K, int N,
+                                   uint64_t trellis_bytes, cudaStream_t stream);
+
+/** The most projections one ds4_exl3_dense_multi_launch carries. */
+#define DS4_EXL3_DENSE_MAX_PROJ 4
+
+/** One projection of a multi launch: its [trellis | suh | svh] slice (16-byte aligned), rate, output width and
+ *  output y [M][N] f32 (16-byte aligned). */
+struct ds4_exl3_dense_proj {
+    const void *w;
+    int         k2;
+    int         N;
+    float      *y;
+};
+
+/** Workspace bytes ds4_exl3_dense_multi_launch needs for these projections at (M, K): the sum of each one's
+ *  ds4_exl3_dense_workspace_bytes(M, K, N).  0 for a set the arm refuses. */
+size_t ds4_exl3_dense_multi_workspace_bytes(const ds4_exl3_dense_proj *p, int n, int M, int K);
+
+/** n (1..DS4_EXL3_DENSE_MAX_PROJ) projections of ONE input xb [M][K] bf16 (L288 exl3-dense: a GDN block's
+ *  in_proj_qkv and _z, an attention's q / k / v / index, a shared expert's gate and up): one prep launch for all of
+ *  them, then one GEMV launch per rate among them.  Each output is bit for bit what ds4_exl3_dense_launch writes for
+ *  it alone.  Prompt chunks and M > 16 take the prefill GEMM, once per projection.  ds4_exl3_dense_launch is the
+ *  n = 1 call. */
+int ds4_exl3_dense_multi_launch(const ds4_exl3_dense_proj *p, int n, const void *xb, int M, int K, void *workspace,
+                                size_t workspace_bytes, cudaStream_t stream, bool prompt = false);

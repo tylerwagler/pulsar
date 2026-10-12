@@ -502,7 +502,10 @@ void pulsar_engram_hash_pos(const pulsar_engram_layout *L, uint32_t layer,
  * the one-part case (offset 64, 264-byte records). */
 #define PULSAR_ENGRAM_ROW_BYTES 264u
 #define PULSAR_ENGRAM_HDR_BYTES 64u
-#define PULSAR_ENGRAM_IO_THREADS 16u
+/** The row-gather pool's threads.  A cold row is one NVMe read (~150 us) and a pread blocks its thread, so the
+ *  pool is the gather's queue depth: 16 left a Qwen verify's ~72 rows four to eight reads deep while the GPU
+ *  waited at the PLE layer; 64 keeps a decode or verify gather one or two deep (qwen-perf, 2026-10-11). */
+#define PULSAR_ENGRAM_IO_THREADS 64u
 
 /** One row-contiguous range of a table: rows [i * rows_per_part, ...) at `base`. */
 typedef struct {
@@ -546,6 +549,10 @@ pulsar_engram_gather *pulsar_engram_gather_start(pulsar_engram_io *io, const pul
                                                  unsigned char *dst);
 /** Block until the gather is complete; frees the handle.  1 = every row read. */
 int  pulsar_engram_gather_wait(pulsar_engram_gather *g);
+/** L289: warm the page cache with rows a gather will read soon (the pool reads them into its own buffer, and
+ *  nothing waits on it): the later gather reads the same bytes, faster.  A hint -- it changes no bytes and a
+ *  failed read is the later gather's to report. */
+void pulsar_engram_prefetch(pulsar_engram_io *io, const pulsar_engram_table *t, const uint64_t *rows, uint32_t n_rows);
 
 /** ---- Engram on the DeepSeek forward (L242 slice 5; L269 W2) ------------------
  *
@@ -1729,9 +1736,14 @@ static inline uint32_t gpu_graph_n_comp(const pulsar_gpu_graph *g, uint32_t bank
 static inline void gpu_graph_set_n_comp(pulsar_gpu_graph *g, uint32_t bank, uint32_t il, uint32_t rows) {
     /* L264: rows below a checkpoint's frontier may be rewritten once the counter
      * drops under them, so the checkpoint goes with them -- here, where every
-     * rewind, cut and invalidate already passes. */
-    if (rows < g->ms_n_comp[bank][il])
-        pulsar_ckpt_frontier_lowered(&g->ckpt, bank, rows * pulsar_layer_compress_ratio(il));
+     * rewind, cut and invalidate already passes.  The intact rows [0, rows) serve
+     * every position up to rows * R + R - 1 (a position's open group is its lanes'):
+     * a grid checkpoint (a multiple of R) is dropped exactly as at rows * R, and a
+     * prompt end inside the group (L289) survives a round's rollback to it. */
+    if (rows < g->ms_n_comp[bank][il]) {
+        const uint32_t R = pulsar_layer_compress_ratio(il);
+        pulsar_ckpt_frontier_lowered(&g->ckpt, bank, rows * R + R - 1u);
+    }
     g->ms_n_comp[bank][il] = rows;
     if (rows > g->ms_comp_hw[bank][il]) g->ms_comp_hw[bank][il] = rows;
 }
@@ -3254,6 +3266,7 @@ bool pulsar_moe_routed_slot(const pulsar_moe_slot_call *c);
 /** The routed part over raw bf16 rows (pulsar_rows_moe_routed_launch): `selected` is localised in place under
  *  expert parallelism (the rank's plan's range of whole experts). */
 struct pulsar_tessera_proj;   /* src/cuda/mmq/pulsar_tessera.h (L255) */
+struct pulsar_rows_moe_shared; /* src/cuda/pulsar_cuda_qwen.h (task #44) */
 typedef struct {
     const pulsar_model *m;
     const pulsar_tensor *gate, *up, *down;   ///< up NULL = gate is the fused gate_up stack
@@ -3262,6 +3275,9 @@ typedef struct {
     const struct pulsar_tessera_proj *tessera_gate, *tessera_up, *tessera_down;
     int32_t *selected;
     const float *weights;
+    uint32_t top_k;                          ///< picks per row (selected / weights are [n_rows][top_k])
+    /** task #44: an EXL3 shared expert riding the routed launches (EXL3 routed arm only), or NULL */
+    const struct pulsar_rows_moe_shared *shared;
     const uint16_t *x_bf16;
     int n_rows;
     float *out;

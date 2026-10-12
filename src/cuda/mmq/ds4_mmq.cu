@@ -20,9 +20,6 @@
 #include "mmid.cuh"
 #include "ds4_mmid.cuh"
 #include "ds4_mmq_d2r.cuh"
-#include "ds4_exl3_gemv.cuh"
-#include "exl3_moe_prefill.cuh"
-#include "engine/exl3_trellis.h"   /* EXL3_HAD_BLOCK: the EXL3 arm's K granule */
 
 #include <cstdio>
 #include <cstdlib>
@@ -246,11 +243,9 @@ extern "C" int ds4_mmq_should_use(uint32_t layout, int64_t ne11, int64_t n_exper
 //   3. the D2R expert matmul with ids_dst + expert_bounds.
 // ----------------------------------------------------------------------------
 
-/* The K granule each expert arm reads: the IQ2 D2R kernels walk 256-value
- * super-blocks; the EXL3 trellis GEMV walks 128-value Hadamard blocks (Qwen's
- * expert down is 640 = 5 x 128).  The E4M3 staging below is 128-block
- * granular either way. */
-static inline int moe_k_granule(int exl3_k2) { return exl3_k2 ? EXL3_HAD_BLOCK : 256; }
+/* The K granule the IQ2 D2R kernels walk: 256-value super-blocks.  (The EXL3
+ * routed experts have their own front door since task #44: exl3_moe.cuh.) */
+static constexpr int kMoeKGranule = 256;
 
 namespace {
 
@@ -274,20 +269,7 @@ int ds4_mmq_moe_impl(
          * every activation stride below is derived from K. */
         const void    * act_q      = NULL,
         const void    * act_sf     = NULL,
-        int             act_kbp    = 0,
-        /* L245: 0 = the IQ2 D2R arm over x_soa; a rate in half-bit units
-         * (4/5/6) = the EXL3 trellis GEMV over the [trellis, scales] table W
-         * (the same sorted pairs and E4M3 staging feed it). */
-        int             exl3_k2    = 0,
-        /* L251: the EXL3 slice is a fused gate_up that rotates its own input
-         * (EXL3_ARM_GATE_UP_FUSED) rather than a down on a pre-rotated one. */
-        bool            exl3_fused = false,
-        /* L251 / ac69748f: true = the activation is the Qwen family's row-major bf16, not an E4M3
-         * slot.  There is nothing to encode, so the D2R precondition, the memset and the whole
-         * gather are skipped and the gemv indexes the token's row through ids_src1 instead. */
-        bool            act_bf16   = false,
-        /* L266: a prompt chunk -- the grouped prefill GEMM at every assignment count (ds4_mmq.h) */
-        bool            prompt     = false) {
+        int             act_kbp    = 0) {
 
     if (!W || !ids || !out_f32) {
         fprintf(stderr, "%s: null pointer\n", tag);
@@ -298,13 +280,8 @@ int ds4_mmq_moe_impl(
                 tag, M, K, n_tokens, n_experts, n_expert_used);
         return -1;
     }
-    if (act_bf16 && exl3_k2 == 0) {
-        fprintf(stderr, "%s: act_bf16 needs the EXL3 arm (k2=%d) -- the bf16 activation is the Qwen "
-                        "family's and the IQ2 D2R arm is E4M3-only\n", tag, exl3_k2);
-        return -1;
-    }
-    if (K % moe_k_granule(exl3_k2) != 0) {
-        fprintf(stderr, "%s: K=%d must be a multiple of %d\n", tag, K, moe_k_granule(exl3_k2));
+    if (K % kMoeKGranule != 0) {
+        fprintf(stderr, "%s: K=%d must be a multiple of %d\n", tag, K, kMoeKGranule);
         return -1;
     }
     if (n_expert_used > n_experts) {
@@ -333,15 +310,9 @@ int ds4_mmq_moe_impl(
      * instead of five pool round-trips.  All five are live simultaneously --
      * D2R is mandatory below (the non-D2R arm returns -1), so nothing here is
      * reserved for a path that will not run. */
-    /* The EXL3 arm's ONE decision, made before anything is sized or staged (exl3_moe_prefill_takes, every
-     * family's rule): the prefill GEMM reads the producer's activation as handed over -- bf16 rows or the
-     * E4M3 slot -- into operand planes of its own; the GEMV and the IQ2 D2R read gathered E4M3 blocks. */
-    const bool exl3_tc = exl3_k2 != 0 && exl3_moe_prefill_takes(prompt, ne_get_rows);
-    const bool stage_e4m3 = !act_bf16 && !exl3_tc;
-    const size_t nbytes_src1_act = !stage_e4m3 ? 0 :
+    const size_t nbytes_src1_act =
         ne_get_rows * ne10_padded * sizeof(block_mx_act_mmq) / DS4_ACT_BLOCK_VALS +
         ds4_mmq_x_max() * sizeof(block_mx_act_mmq);
-    const size_t tc_bytes = exl3_tc ? exl3_moe_prefill_ws_bytes(ne_get_rows, K, n_experts) : 0;
     const size_t w_bytes =
         ds4_mmq_iq2_xxs_moe_d2r_pair_scratch_bytes(ne_get_rows, n_experts);
     if (w_bytes == 0) {
@@ -356,18 +327,16 @@ int ds4_mmq_moe_impl(
     cuda_arena ar;
     if (!cuda_arena_begin_slot(&ar, CUDA_SCRATCH_MMQ,
                                ds4_mmq_a256(ids_bytes) * 2 + ds4_mmq_a256(eb_bytes) +
-                               ds4_mmq_a256(nbytes_src1_act) + ds4_mmq_a256(w_bytes) +
-                               ds4_mmq_a256(tc_bytes), tag)) {
+                               ds4_mmq_a256(nbytes_src1_act) + ds4_mmq_a256(w_bytes), tag)) {
         fprintf(stderr, "%s: scratch reservation failed\n", tag);
         return -1;
     }
     int32_t *ids_src1      = (int32_t *)cuda_arena_take(&ar, ids_bytes, 256);
     int32_t *ids_dst       = (int32_t *)cuda_arena_take(&ar, ids_bytes, 256);
     int32_t *expert_bounds = (int32_t *)cuda_arena_take(&ar, eb_bytes, 256);
-    char    *src1_e4m3_p   = stage_e4m3 ? (char *)cuda_arena_take(&ar, nbytes_src1_act, 256) : nullptr;
+    char    *src1_e4m3_p   = (char *)cuda_arena_take(&ar, nbytes_src1_act, 256);
     char    *d2r_work      = (char *)cuda_arena_take(&ar, w_bytes, 256);
-    void    *tc_ws         = exl3_tc ? cuda_arena_take(&ar, tc_bytes, 256) : nullptr;
-    if (!d2r_work || (exl3_tc && !tc_ws)) return -1;   /* take() latches: one check covers them all */
+    if (!d2r_work) return -1;   /* take() latches: one check covers them all */
 
     // Task #22 root-cause fix: mm_ids_helper COMPACTS - it only writes ids_src1
     // entries for in-range router ids and drops invalid ones (the router's NaN
@@ -419,7 +388,7 @@ int ds4_mmq_moe_impl(
         d2r_iq2s_cc = cc;
         d2r_iq2s_avail = ds4_mmq_iq2_xxs_moe_d2r_available(cc) ? 1 : 0;
     }
-    const bool d2r_iq2 = ((x_soa != nullptr || exl3_k2 != 0) && K % moe_k_granule(exl3_k2) == 0 && d2r_iq2s_avail != 0);
+    const bool d2r_iq2 = (x_soa != nullptr && K % kMoeKGranule == 0 && d2r_iq2s_avail != 0);
 
 
     // S1.1a fix (same as the dense path): the mmq Y buffer is over-allocated for the
@@ -447,27 +416,12 @@ int ds4_mmq_moe_impl(
      * version of exactly it is what once hid the down conversion for two days.
      * Fail closed instead: one activation format, every batch size, or an
      * error that says which precondition broke. */
-    if (act_bf16) {
-        /* One format, and on this path it is bf16: nothing is staged, nothing is encoded, and the
-         * activation buffer the caller handed over IS what the gemv reads. */
-        if (!act_q) {
-            fprintf(stderr, "%s: no bf16 activation (K=%d rows=%lld) -- refusing\n",
-                    tag, (int)K, (long long)ne_get_rows);
-            return -1;
-        }
-    } else if (exl3_tc) {
-        /* the prefill GEMM reads the producer's E4M3 slot itself: nothing is gathered */
-        if (!act_q || !act_sf) {
-            fprintf(stderr, "%s: no producer E4M3 slot for the activation (K=%d rows=%lld) -- refusing\n",
-                    tag, (int)K, (long long)ne_get_rows);
-            return -1;
-        }
-    } else {
+    {
         if (!d2r_iq2) {
             fprintf(stderr,
                     "%s: D2R E4M3 preconditions not met (soa=%p K=%d K%%%d=%d avail=%d) -- "
                     "refusing to run these expert activations in another format\n",
-                    tag, (const void *)x_soa, (int)K, moe_k_granule(exl3_k2), (int)(K % moe_k_granule(exl3_k2)), d2r_iq2s_avail);
+                    tag, (const void *)x_soa, (int)K, kMoeKGranule, (int)(K % kMoeKGranule), d2r_iq2s_avail);
             return -1;
         }
         if (!act_q || !act_sf) {
@@ -516,25 +470,7 @@ int ds4_mmq_moe_impl(
      * two days of cross-arm measurements came back bit-identical.
      * One path, one activation format, every batch size. */
     {
-        const exl3_moe_act act = act_bf16 ? exl3_moe_act{EXL3_MOE_ACT_BF16_ROWS, act_q, nullptr, 0}
-                                          : exl3_moe_act{EXL3_MOE_ACT_E4M3_SLOT, act_q, act_sf, act_kbp};
-        const int rc = exl3_k2
-            ? (exl3_tc
-               /* a prompt chunk: the grouped tensor-core GEMM, not the decode GEMV (L251, L287) */
-               ? exl3_moe_prefill_launch(W, exl3_k2, exl3_fused, act, ids_dst, ids_src1, expert_bounds,
-                                         out_f32, M, K, ne_get_rows, n_experts, tc_ws, tc_bytes, stream)
-               : act_bf16
-               ? (exl3_fused ? ds4_exl3_moe_gemv_fused_bf16_launch(W, exl3_k2, act_q, ids_dst, ids_src1,
-                                                                   expert_bounds, out_f32, M, K, ne_get_rows,
-                                                                   n_experts, stream)
-                             : ds4_exl3_moe_gemv_single_bf16_launch(W, exl3_k2, act_q, ids_dst, ids_src1,
-                                                                    expert_bounds, out_f32, M, K, ne_get_rows,
-                                                                    n_experts, stream))
-               : (exl3_fused ? ds4_exl3_moe_gemv_fused_launch(W, exl3_k2, src1_e4m3_p, ids_dst, expert_bounds,
-                                                              out_f32, M, K, ne_get_rows, n_experts, stream)
-                             : ds4_exl3_moe_gemv_single_launch(W, exl3_k2, src1_e4m3_p, ids_dst, expert_bounds,
-                                                               out_f32, M, K, ne_get_rows, n_experts, stream)))
-            : ds4_mmq_iq2_xxs_moe_d2r_single_launch(
+        const int rc = ds4_mmq_iq2_xxs_moe_d2r_single_launch(
             x_soa, soa_blocks,
             src1_e4m3_p,
             ids_dst, expert_bounds,
@@ -589,14 +525,7 @@ int ds4_mmq_moe_pair_impl(
          * its ue8m0 plane and pitch.  Required. */
         const void    * act_q      = NULL,
         const void    * act_sf     = NULL,
-        int             act_kbp    = 0,
-        /* L245: see ds4_mmq_moe_impl; the EXL3 tables ride in W_a / W_b. */
-        int             exl3_k2    = 0,
-        /* L251 MTP: the activation is the Qwen family's row-major bf16 (act_q), as in ds4_mmq_moe_impl:
-         * nothing is staged or encoded and the gemv reads the token's row through ids_src1. */
-        bool            act_bf16   = false,
-        /* L266: a prompt chunk -- the grouped prefill GEMM at every assignment count (ds4_mmq.h) */
-        bool            prompt     = false) {
+        int             act_kbp    = 0) {
 
     if (!W_a || !W_b || !ids || !out_a || !out_b) {
         fprintf(stderr, "%s: null pointer\n", tag);
@@ -607,8 +536,8 @@ int ds4_mmq_moe_pair_impl(
                 tag, M, K, n_tokens, n_experts, n_expert_used);
         return -1;
     }
-    if (K % moe_k_granule(exl3_k2) != 0) {
-        fprintf(stderr, "%s: K=%d must be a multiple of %d\n", tag, K, moe_k_granule(exl3_k2));
+    if (K % kMoeKGranule != 0) {
+        fprintf(stderr, "%s: K=%d must be a multiple of %d\n", tag, K, kMoeKGranule);
         return -1;
     }
     if (n_expert_used > n_experts) {
@@ -636,14 +565,9 @@ int ds4_mmq_moe_pair_impl(
     const int64_t ne11         = 1;
     const int64_t ne12         = n_tokens;
 
-    /* The EXL3 arm's one decision, before sizing or staging (see ds4_mmq_moe_impl): the prefill GEMM runs
-     * once per slice over one workspace, each slice rotating the input by its own suh. */
-    const bool exl3_tc = exl3_k2 != 0 && exl3_moe_prefill_takes(prompt, ne_get_rows);
-    const bool stage_e4m3 = !act_bf16 && !exl3_tc;
-    const size_t nbytes_src1_act = !stage_e4m3 ? 0 :
+    const size_t nbytes_src1_act =
         ne_get_rows * ne10_padded * sizeof(block_mx_act_mmq) / DS4_ACT_BLOCK_VALS +
         ds4_mmq_x_max() * sizeof(block_mx_act_mmq);
-    const size_t tc_bytes = exl3_tc ? exl3_moe_prefill_ws_bytes(ne_get_rows, K, n_experts) : 0;
     /* One arena on the MMQ scratch slot for every buffer this call needs; see
      * the note in ds4_mmq_moe_impl.  D2R is mandatory on both arms below, so
      * nothing reserved here is for a path that will not run. */
@@ -655,7 +579,7 @@ int ds4_mmq_moe_pair_impl(
     if (!cuda_arena_begin_slot(&ar, CUDA_SCRATCH_MMQ,
                                ds4_mmq_a256(ids_bytes) * 2 + ds4_mmq_a256(eb_bytes) +
                                ds4_mmq_a256(nbytes_src1_act) +
-                               ds4_mmq_a256(d2r_work_bytes) + ds4_mmq_a256(tc_bytes), tag)) {
+                               ds4_mmq_a256(d2r_work_bytes), tag)) {
         fprintf(stderr, "%s: scratch reservation failed\n", tag);
         return -1;
     }
@@ -702,7 +626,7 @@ int ds4_mmq_moe_pair_impl(
      * down Q8_1. The direct path needs both simultaneously, but writes down
      * Q8_1 into caller-owned gate scratch instead of growing the CUDA pool. */
     {
-    char *src1_e4m3 = stage_e4m3 ? (char *)cuda_arena_take(&ar, nbytes_src1_act, 256) : nullptr;
+    char *src1_e4m3 = (char *)cuda_arena_take(&ar, nbytes_src1_act, 256);
 
     /* ONE decision, made once, BEFORE staging.  IQ2 experts are E4M3-only.
      * ⚠ This comment used to add "q8_1 exists solely for the generic MMQ
@@ -717,8 +641,7 @@ int ds4_mmq_moe_pair_impl(
         d2r_iq2_avail_cc = cc;
         d2r_iq2_avail = ds4_mmq_iq2_xxs_moe_d2r_available(cc) ? 1 : 0;
     }
-    const bool d2r_iq2 = ((xa_soa != nullptr && xb_soa != nullptr) || exl3_k2 != 0) &&
-                         K % moe_k_granule(exl3_k2) == 0 && d2r_iq2_avail != 0;
+    const bool d2r_iq2 = xa_soa != nullptr && xb_soa != nullptr && K % kMoeKGranule == 0 && d2r_iq2_avail != 0;
 
     // S1.1a fix (same as the dense/moe paths): zero the over-allocated mmq Y buffer
     // so the kernel's unconditional masked-out tail-tile read (mmq.cuh:3528) returns
@@ -731,27 +654,13 @@ int ds4_mmq_moe_pair_impl(
                 "ds4/prefill/moe/input_quant",
                 ds4_mmq_nvtx_payload((uint32_t)ne_get_rows, (uint32_t)K),
                 nvtx_prefill);
-        /* E4M3 or nothing -- same requirement as the single-tensor impl -- except on the bf16 path,
-         * where the caller's buffer IS what the gemv reads. */
-        if (act_bf16) {
-            if (!act_q || exl3_k2 == 0) {
-                fprintf(stderr, "%s: the bf16 activation needs the EXL3 arm and a buffer (k2=%d) -- refusing\n",
-                        tag, exl3_k2);
-                return -1;
-            }
-        } else if (exl3_tc) {
-            /* the prefill GEMM reads the producer's E4M3 slot itself: nothing is gathered */
-            if (!act_q || !act_sf) {
-                fprintf(stderr, "%s: no producer E4M3 slot for the activation (K=%d rows=%lld) -- refusing\n",
-                        tag, (int)K, (long long)ne_get_rows);
-                return -1;
-            }
-        } else {
+        /* E4M3 or nothing -- same requirement as the single-tensor impl */
+        {
         if (!d2r_iq2) {
             fprintf(stderr,
                     "%s: D2R E4M3 preconditions not met (soa=%p K=%d K%%%d=%d avail=%d) -- "
                     "refusing to run these expert activations in another format\n",
-                    tag, (const void *)xa_soa, (int)K, moe_k_granule(exl3_k2), (int)(K % moe_k_granule(exl3_k2)), d2r_iq2_avail);
+                    tag, (const void *)xa_soa, (int)K, kMoeKGranule, (int)(K % kMoeKGranule), d2r_iq2_avail);
             return -1;
         }
         if (!src1_e4m3) return -1;   /* take() latches */
@@ -786,29 +695,12 @@ int ds4_mmq_moe_pair_impl(
     if (d2r_iq2) {
         {
             char *d2r_work = (char *)cuda_arena_take(&ar, d2r_work_bytes, 256);
-            void *tc_ws = exl3_tc ? cuda_arena_take(&ar, tc_bytes, 256) : nullptr;
-            if (d2r_work && (!exl3_tc || tc_ws)) {
+            if (d2r_work) {
                 ds4_mmq_nvtx_scope stage(
                         "ds4/prefill/moe/iq2_gate_up_d2r",
                         ds4_mmq_nvtx_payload((uint32_t)ne_get_rows, (uint32_t)M),
                         nvtx_prefill);
-                const exl3_moe_act act = act_bf16 ? exl3_moe_act{EXL3_MOE_ACT_BF16_ROWS, act_q, nullptr, 0}
-                                                  : exl3_moe_act{EXL3_MOE_ACT_E4M3_SLOT, act_q, act_sf, act_kbp};
-                const int d2r_rc = exl3_k2
-                    ? (exl3_tc
-                       /* a prompt chunk: the grouped tensor-core GEMM, once per slice, each rotating the
-                        * input by its own suh (L251 MTP, L287 DeepSeek's split stacks) */
-                       ? (exl3_moe_prefill_launch(W_a, exl3_k2, true, act, ids_dst, ids_src1, expert_bounds,
-                                                  out_a, M, K, ne_get_rows, n_experts, tc_ws, tc_bytes, stream) ||
-                          exl3_moe_prefill_launch(W_b, exl3_k2, true, act, ids_dst, ids_src1, expert_bounds,
-                                                  out_b, M, K, ne_get_rows, n_experts, tc_ws, tc_bytes, stream))
-                       : act_bf16
-                       ? ds4_exl3_moe_gemv_pair_bf16_launch(W_a, W_b, exl3_k2, act_q, ids_dst, ids_src1,
-                                                            expert_bounds, out_a, out_b, M, K, ne_get_rows,
-                                                            n_experts, stream)
-                       : ds4_exl3_moe_gemv_pair_launch(W_a, W_b, exl3_k2, src1_e4m3, ids_dst, expert_bounds,
-                                                       out_a, out_b, M, K, ne_get_rows, n_experts, stream))
-                    : ds4_mmq_iq2_xxs_moe_d2r_pair_launch(
+                const int d2r_rc = ds4_mmq_iq2_xxs_moe_d2r_pair_launch(
                         xa_soa, xb_soa, soa_blocks,
                         src1_e4m3, ids_dst,
                         expert_bounds, out_a, out_b, M, K, ne_get_rows, n_experts,
@@ -929,89 +821,3 @@ extern "C" int ds4_mmq_iq2_xxs_moe_soa(
                                                (const char *)W_soa, nblk,
                                                act_q, act_sf, act_kbp);
 }
-
-/* L245: the EXL3 twins.  Same drivers -- the expert-major sort and the E4M3
- * staging are format-independent -- with the trellis GEMV in place of the
- * D2R launch, and (L287) the tensor-core prefill GEMM over the producer's slot
- * for a prompt chunk.  The tables are exl3_expert_table()'s [trellis, scales]
- * pairs; k2 is the rate in half-bit units (one per family; gate/up share one). */
-extern "C" int ds4_exl3_moe_pair(
-        const void * gate_table, const void * up_table, int k2,
-        const int32_t * ids, float * out_a, float * out_b,
-        int M, int K, int n_tokens, int n_experts, int n_expert_used,
-        cudaStream_t stream,
-        const void * act_q, const void * act_sf, int act_kbp, bool prompt) {
-    if (!ds4_exl3_gemv_rate_supported(EXL3_ARM_PAIR, k2) || M <= 0 || K <= 0 || K % moe_k_granule(k2) != 0 || n_experts <= 0) {
-        fprintf(stderr, "ds4_exl3_moe_pair: bad shape M=%d K=%d nexp=%d k2=%d\n", M, K, n_experts, k2);
-        return -1;
-    }
-    return ds4_mmq_moe_pair_impl(
-        "ds4_exl3_moe_pair", gate_table, up_table, ids, out_a, out_b,
-        M, K, n_tokens, n_experts, n_expert_used, stream,
-        NULL, NULL, 0, act_q, act_sf, act_kbp, k2, false, prompt);
-}
-
-extern "C" int ds4_exl3_moe_single(
-        const void * table, int k2, const int32_t * ids, float * out,
-        int M, int K, int n_tokens, int n_experts, int n_expert_used,
-        cudaStream_t stream,
-        const void * act_q, const void * act_sf, int act_kbp, bool prompt) {
-    if (!ds4_exl3_gemv_rate_supported(EXL3_ARM_DOWN, k2) || M <= 0 || K <= 0 || K % moe_k_granule(k2) != 0 || n_experts <= 0) {
-        fprintf(stderr, "ds4_exl3_moe_single: bad shape M=%d K=%d nexp=%d k2=%d\n", M, K, n_experts, k2);
-        return -1;
-    }
-    return ds4_mmq_moe_impl("ds4_exl3_moe_single", table, ids, out,
-                            M, K, n_tokens, n_experts, n_expert_used, stream,
-                            NULL, 0, act_q, act_sf, act_kbp, k2, false, false, prompt);
-}
-
-/* L251 MTP: the split gate / up arm over the Qwen family's row-major bf16 activation (the MTP layer's
- * routed experts): the pair GEMV at decode widths, the grouped prefill GEMM per slice at prompt widths
- * (the trunk's rule, ds4_mmq_moe_impl). */
-extern "C" int ds4_exl3_moe_pair_bf16(
-        const void * gate_table, const void * up_table, int k2,
-        const int32_t * ids, float * out_a, float * out_b,
-        int M, int K, int n_tokens, int n_experts, int n_expert_used,
-        cudaStream_t stream, const void * act_bf16, bool prompt) {
-    if (!ds4_exl3_gemv_rate_supported(EXL3_ARM_PAIR, k2) || M <= 0 || K <= 0 || K % moe_k_granule(k2) != 0 ||
-        n_experts <= 0) {
-        fprintf(stderr, "ds4_exl3_moe_pair_bf16: bad shape M=%d K=%d nexp=%d k2=%d\n", M, K, n_experts, k2);
-        return -1;
-    }
-    return ds4_mmq_moe_pair_impl(
-        "ds4_exl3_moe_pair_bf16", gate_table, up_table, ids, out_a, out_b,
-        M, K, n_tokens, n_experts, n_expert_used, stream,
-        NULL, NULL, 0, act_bf16, NULL, 0, k2, true, prompt);
-}
-
-/* L251 / ac69748f: the same two arms over the Qwen family's row-major bf16 activation.  Separate
- * entry points rather than a flag, which is upstream's own shape (exl3_gemv / exl3_gemv_int8).  The
- * activation is [n_tokens, K] bf16 and the gemv addresses each assignment's row through ids_src1. */
-extern "C" int ds4_exl3_moe_fused_bf16(
-        const void * table, int k2, const int32_t * ids, float * out,
-        int M, int K, int n_tokens, int n_experts, int n_expert_used,
-        cudaStream_t stream, const void * act_bf16, bool prompt) {
-    if (!ds4_exl3_gemv_rate_supported(EXL3_ARM_GATE_UP_FUSED, k2) || M <= 0 || K <= 0 ||
-        K % moe_k_granule(k2) != 0 || n_experts <= 0) {
-        fprintf(stderr, "ds4_exl3_moe_fused_bf16: bad shape M=%d K=%d nexp=%d k2=%d\n", M, K, n_experts, k2);
-        return -1;
-    }
-    return ds4_mmq_moe_impl("ds4_exl3_moe_fused_bf16", table, ids, out,
-                            M, K, n_tokens, n_experts, n_expert_used, stream,
-                            NULL, 0, act_bf16, NULL, 0, k2, true, true, prompt);
-}
-
-extern "C" int ds4_exl3_moe_single_bf16(
-        const void * table, int k2, const int32_t * ids, float * out,
-        int M, int K, int n_tokens, int n_experts, int n_expert_used,
-        cudaStream_t stream, const void * act_bf16, bool prompt) {
-    if (!ds4_exl3_gemv_rate_supported(EXL3_ARM_DOWN, k2) || M <= 0 || K <= 0 ||
-        K % moe_k_granule(k2) != 0 || n_experts <= 0) {
-        fprintf(stderr, "ds4_exl3_moe_single_bf16: bad shape M=%d K=%d nexp=%d k2=%d\n", M, K, n_experts, k2);
-        return -1;
-    }
-    return ds4_mmq_moe_impl("ds4_exl3_moe_single_bf16", table, ids, out,
-                            M, K, n_tokens, n_experts, n_expert_used, stream,
-                            NULL, 0, act_bf16, NULL, 0, k2, false, true, prompt);
-}
-

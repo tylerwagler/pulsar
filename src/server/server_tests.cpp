@@ -6838,6 +6838,53 @@ static void test_l284_lane_price_pick(void) {
     TEST_ASSERT(lp.meas_n == 9 && lp.meas_steps[PULSAR_LANE_PLAIN] == 0u && lp.meas_steps[PULSAR_LANE_SPEC] == 1u);
 }
 
+/* L289 -- the scheduled re-measure is evidence-based.  Qwen one stream (L288): spec measured ~75 tok/s, plain ~35:
+ * the lane in force clears the other by LANE_PRICE_CLEAR, so the 512-step re-probe waits (announced once a
+ * weighing) until LANE_PRICE_CLEAR_SPAN times as long; a gap inside the clearance re-measures on the plain
+ * schedule; and the higher-N case where plain legitimately wins is untouched (both measured, plain in force). */
+static void test_l289_lane_reprobe_evidence(void) {
+    lane_price lp;
+    memset(&lp, 0, sizeof lp);
+    pulsar_lane_cost spec = l284_cost(34400, 4150, true, 100u, 4.0f, 51.0f);
+    pulsar_lane_cost plain = l284_cost(28000, 1000, true, 100u, 1.0f, 29.0f);
+    TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 1, 16u) == 3);
+    /* spec: 3.8 tokens a 50.7 ms round = 75 tok/s; plain probed and measured: 1 token a 28.6 ms step = 35 */
+    l284_steps(&lp, &spec, PULSAR_LANE_SPEC, LANE_PRICE_PROBE_STEPS, 1, 4, 5, 53.3);
+    lp.probe = 2;
+    lp.probe_n0 = plain.n;
+    l284_steps(&lp, &plain, PULSAR_LANE_PLAIN, LANE_PRICE_PROBE_STEPS, 1, 1, 1, 28.6);
+    TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 1, 16u) == 3 && lp.probe == 0 && lp.meas_plain && lp.meas_spec);
+    TEST_ASSERT(lp.held_n0 == spec.n && lp.deferral == 0);
+    /* the 512-step clock passes: x2.1 clears, no probe, the deferral is flagged for its one announce */
+    l284_steps(&lp, &spec, PULSAR_LANE_SPEC, LANE_PRICE_REPROBE_STEPS, 1, 4, 5, 53.3);
+    TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 1, 16u) == 3 && lp.probe == 0 && lp.deferral == 1);
+    lp.deferral = 2;   /* the caller announced it */
+    l284_steps(&lp, &spec, PULSAR_LANE_SPEC, LANE_PRICE_REPROBE_STEPS * (LANE_PRICE_CLEAR_SPAN - 1u) - 1u, 1, 4, 5,
+               53.3);
+    TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 1, 16u) == 3 && lp.probe == 0 && lp.deferral == 2);
+    /* ...until the measurement is LANE_PRICE_CLEAR_SPAN re-probes old: it is taken again */
+    l284_steps(&lp, &spec, PULSAR_LANE_SPEC, 1u, 1, 4, 5, 53.3);
+    TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 1, 16u) == 2 && lp.probe == 2 && lp.lane == 3);
+    l284_steps(&lp, &plain, PULSAR_LANE_PLAIN, LANE_PRICE_PROBE_STEPS, 1, 1, 1, 28.6);
+    TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 1, 16u) == 3 && lp.probe == 0 && lp.deferral == 0);
+    /* hard content: spec falls to 2 tokens a 50 ms round (40 tok/s, x1.14) -- inside the clearance, so the plain
+     * 512-step schedule re-measures */
+    for (uint32_t k = 0; k < 64u; k++) l284_steps(&lp, &spec, PULSAR_LANE_SPEC, 1u, 1, 2, 5, 50.0);
+    TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 1, 16u) == 3 && lp.t_spec < 35.0 * LANE_PRICE_CLEAR);
+    l284_steps(&lp, &spec, PULSAR_LANE_SPEC, LANE_PRICE_REPROBE_STEPS - 64u, 1, 2, 5, 50.0);
+    TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 1, 16u) == 2 && lp.probe == 2 && lp.deferral == 0);
+    /* eight decoders, plain in force at 105 against spec measured 100 (L288): no clearance either way, the plain
+     * schedule re-measures spec at 512 */
+    memset(&lp, 0, sizeof lp);
+    lp.lane = 2;
+    lp.held_n0 = plain.n;
+    l284_steps(&lp, &plain, PULSAR_LANE_PLAIN, LANE_PRICE_PROBE_STEPS, 8, 8, 8, 76.2);
+    l284_steps(&lp, &spec, PULSAR_LANE_SPEC, LANE_PRICE_PROBE_STEPS, 8, 10, 16, 100.0);
+    TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 8, 16u) == 2 && lp.meas_plain && lp.meas_spec);
+    l284_steps(&lp, &plain, PULSAR_LANE_PLAIN, LANE_PRICE_REPROBE_STEPS, 8, 8, 8, 76.2);
+    TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 8, 16u) == 3 && lp.probe == 3 && lp.lane == 2);
+}
+
 /* Geometric survival for one bank: np pendings at per-position confidence c,
  * surv[j] = c^(j+1) -- the cumprod spec_alloc_rows' caller derives from the
  * drafter carry. */
@@ -8533,6 +8580,7 @@ static void pulsar_server_unit_tests_run(void) {
     test_l179_lane_select_spec_needs_every_decoder();
     test_l284_batch_leave_when_spec_lane_carries_all();
     test_l284_lane_price_pick();
+    test_l289_lane_reprobe_evidence();
     test_l179_spec_alloc_rows_isolation_and_ranked_overflow();
     test_l179_lane_abandon_needs_decode_and_hangup();
     test_l190_mem_floor_warn_is_rate_limited();

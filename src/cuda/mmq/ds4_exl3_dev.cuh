@@ -8,7 +8,7 @@
 // state ends.  The codebook decode is the same three instructions as
 // exllamav3's decode_3inst<2>, whose values the header's host decode is held
 // to (tests/exl3_dequant_gate.cpp), and every kernel built on these helpers is
-// graded against that host decode (tests/exl3_gemv_gate.cu,
+// graded against that host decode (tests/exl3_moe_prefill_gate.cu,
 // tests/exl3_dense_gate.cu).
 
 #pragma once
@@ -108,6 +108,39 @@ __device__ __forceinline__ void run4_split(uint64_t v, int p0, uint32_t st[4]) {
  *  arguments reschedules them (SASS-compared, 2026-09-26); the expression
  *  itself is written once, here. */
 #define EXL3_RUN4_JOIN(wlo, whi, sh) ((((uint64_t)(wlo) << 32) | (uint64_t)(whi)) >> (sh))
+
+/** run4_slack for a run of EIGHT positions starting at p0 % 8 == 0 -- a lane's whole share of an mma
+ *  B fragment (positions 8t..8t+7) -- from ONE 64-bit window: >= 0 when every such run fits (K2 <= 6 and
+ *  K2 == 8; TensorFold's experts_grouped.cuh window table agrees), < 0 when it does not (the run then takes
+ *  two run4 windows). */
+__host__ __device__ constexpr int run8_slack(int K2) {
+    int least = 64;
+    for (int p0 = 0; p0 < 256; p0 += 8) {
+        const int e7 = exl3_state_end_bit(K2, p0 + 7);
+        const int spare = exl3_state_end_bit(K2, p0) - 16 - (((e7 - 1) >> 5) - 1) * 32;
+        least = spare < least ? spare : least;
+    }
+    return least;
+}
+
+/** run4_window for the eight-position run at p0 (p0 % 8 == 0; run8_slack(K2) >= 0). */
+template <int K2>
+__device__ __forceinline__ void run8_window(int p0, int &lo, int &hi, int &sh) {
+    static_assert(run8_slack(K2) >= 0, "an eight-position run of this rate does not fit one 64-bit window");
+    constexpr int nw = Rate<K2>::words32;
+    const int e7 = exl3_state_end_bit(K2, p0 + 7);
+    hi = (e7 - 1) >> 5;
+    lo = (hi + nw - 1) % nw;
+    sh = ((hi + 1) << 5) - e7;
+}
+
+/** The eight states of the run at p0 from its window value (EXL3_RUN4_JOIN with run8_window's shift). */
+template <int K2>
+__device__ __forceinline__ void run8_split(uint64_t v, int p0, uint32_t st[8]) {
+    const int e7 = exl3_state_end_bit(K2, p0 + 7);
+#pragma unroll
+    for (int j = 0; j < 8; ++j) st[j] = (uint32_t)(v >> (e7 - exl3_state_end_bit(K2, p0 + j))) & 0xffffu;
+}
 
 /** The four states of positions p0..p0+3 of one tile, `w` = the tile's words. */
 template <int K2>
