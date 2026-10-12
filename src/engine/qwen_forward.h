@@ -5,7 +5,8 @@
  * each -- a verify's [0, n_verify), then the fused step's prompt runs), the `heads` rows headed into `logits_out`
  * (host, n_vocab a row); n_verify > 0 arms the per-row state capture pulsar_qwen_s4_spec_rollback reads over
  * the verify rows.  qwen_mtp_forward: the MTP layer over the
- * trunk stacks staged in mtp_h, `head_n` rows through the draft head (n_draft logits a row).
+ * trunk stacks staged in mtp_h, `head_n` rows through the draft head (n_draft logits a row); `decode_rows` (L288)
+ * takes a PREFILL step's rows -- runs of any number of banks -- as decode rows (the speculation's absorb).
  * With `pick` (L289; L288: pick[head_n], every headed row) each head row's greedy draft is reduced on the device --
  * its vocabulary id and softmax probability, the draft's confidence -- and logits_out (NULL allowed) is read back
  * only when a caller needs the rows themselves (a sampled draft's q); qwen_mtp_dist: the sampled q over the draft
@@ -38,7 +39,7 @@ struct qwen_mtp_pick {
 };
 bool qwen_mtp_forward(pulsar_session *s, pulsar_qwen_step_mode mode, const int32_t *tokens, const int32_t *pos,
                       const int32_t *bank, uint32_t n_rows, uint32_t head_row0, uint32_t head_n, float *logits_out,
-                      qwen_mtp_pick *pick = NULL);
+                      qwen_mtp_pick *pick = NULL, bool decode_rows = false);
 bool qwen_mtp_dist(pulsar_session *s, const float *row, float temperature, int top_k, float top_p, float min_p,
                    pulsar_sample_dist *q);
 uint32_t qwen_argmax(const float *v, uint32_t n);

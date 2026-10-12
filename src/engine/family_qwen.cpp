@@ -1320,13 +1320,35 @@ bool qwen_forward(pulsar_session *s, pulsar_qwen_step_mode mode, const int32_t *
 
 /* The MTP layer over rows [0, n_rows) of mtp_h (trunk stacks), tokens = x_{p+1} per row; heads rows
  * [head_row0, head_row0 + head_n) into logits_out.  Its failure leaves the trunk untouched; the MTP
- * rows' banks lose their pending row (their MTP cache has a hole the drafter must not read past). */
+ * rows' banks lose their pending row (their MTP cache has a hole the drafter must not read past).
+ * `decode_rows` (PREFILL only, L288): the rows are runs of any number of banks (one run a bank, consecutive
+ * positions) taken as decode rows -- the decode arms, the verify's row kind -- the speculation's absorb of every
+ * bank's kept rows in one step; without it a PREFILL step is one bank's prompt rows (a sync chunk's). */
 bool qwen_mtp_forward(pulsar_session *s, pulsar_qwen_step_mode mode, const int32_t *tokens,
                       const int32_t *pos, const int32_t *bank, uint32_t n_rows,
-                      uint32_t head_row0, uint32_t head_n, float *logits_out, qwen_mtp_pick *pick) {
+                      uint32_t head_row0, uint32_t head_n, float *logits_out, qwen_mtp_pick *pick, bool decode_rows) {
     pulsar_engine *e = s->engine;
     const pulsar_qwen_ops *ops = &g_qwen_ops;
     const uint32_t il = e->plan.n_layer;                /* the MTP layer's slot */
+    uint32_t run_first[PULSAR_QWEN_SPEC_ROWS + 1] = {0};
+    uint32_t n_runs = 0;
+    if (decode_rows) {
+        bool runs_ok = mode == PULSAR_QWEN_STEP_PREFILL && n_rows > 0 && n_rows <= PULSAR_QWEN_SPEC_ROWS;
+        for (uint32_t r = 0; runs_ok && r < n_rows; r++) {
+            if (r > 0 && bank[r] == bank[r - 1]) {
+                runs_ok = pos[r] == pos[r - 1] + 1;
+                continue;
+            }
+            for (uint32_t k = 0; k < n_runs; k++) runs_ok &= bank[run_first[k]] != bank[r];
+            run_first[n_runs++] = r;
+        }
+        if (!runs_ok) {
+            fprintf(stderr, "pulsar: %s: an MTP step of %u decode rows that are not one run a bank -- refusing\n",
+                    PULSAR_QWEN_ARCH, n_rows);
+            return false;
+        }
+        run_first[n_runs] = n_rows;
+    }
     pulsar_qwen_step st{};
     st.model = &e->model;
     st.shape = &g_qwen_shape;
@@ -1343,7 +1365,9 @@ bool qwen_mtp_forward(pulsar_session *s, pulsar_qwen_step_mode mode, const int32
     st.streams = s->qwen->mtp_streams;
     st.mixer = &e->qwen_weights->mtp.mixer;
     st.draft_head = true;                               /* the drafter's head: n_draft logits a row */
-    st.n_dec = pulsar_qwen_step_n_dec(mode, 0u, n_rows);
+    st.n_dec = decode_rows ? n_rows : pulsar_qwen_step_n_dec(mode, 0u, n_rows);
+    st.n_runs = n_runs;
+    st.run_first = n_runs ? run_first : NULL;
     /* L289: enqueued, not waited for -- the step's uploads never drain the stream */
     bool ok = pulsar_gpu_tensor_write_async(s->qwen->row_pos, 0, pos, (uint64_t)n_rows * sizeof(int32_t)) != 0 &&
               pulsar_gpu_tensor_write_async(s->qwen->row_bank, 0, bank, (uint64_t)n_rows * sizeof(int32_t)) != 0;

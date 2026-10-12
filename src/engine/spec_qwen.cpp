@@ -10,8 +10,8 @@
  *   commit   the recurrent state rolls back to the last kept row (pulsar_qwen_s4_spec_rollback over the
  *            capture), the bank's position counter moves, the logits are the kept row's.
  *   absorb   the MTP layer catches up: its stage back to the snapshot the draft chain took, the kept
- *            rows' MTP rows (stack at p + i, the token after it) in one PREFILL step, the last kept
- *            row's stack parked in mtp_pend for the next draft.
+ *            rows' MTP rows (stack at p + i, the token after it) in one PREFILL step of decode rows (L288),
+ *            the last kept row's stack parked in mtp_pend for the next draft.
  *   draft    the lockstep row (pending stack at p - 1, the carry) headed gives d_1; each further step
  *            feeds the MTP's own streams with d_j; the chain is the shared stop rule (spec_ops.h) run token
  *            by token: it ends at the depth or at the first draft whose head was unsure (top probability
@@ -20,10 +20,10 @@
  *
  * L272 P1 S4: the batched lane verifies several banks in one step (one run each through decode_mixed,
  * every kernel at its decode-width arm while the step stays within PULSAR_QWEN_SPEC_ROWS); each bank's
- * commit rolls its own run back, and the absorb serves each bank in turn.  L288: the draft chains of every
- * bank run in lockstep -- one MTP step a position for all of them, the draft head once a step, not once a bank.
- * L284: any number of banks -- the server's allocator fits their drafts to the step's rows (fused_heads_max =
- * SPEC_ROWS), so N decoders keep speculating with shallower drafts. */
+ * commit rolls its own run back.  L288: the absorb of every bank's kept rows is one MTP step (decode rows), and
+ * the draft chains of every bank run in lockstep -- one MTP step a position for all of them, the draft head once
+ * a step, not once a bank.  L284: any number of banks -- the server's allocator fits their drafts to the step's
+ * rows (fused_heads_max = SPEC_ROWS), so N decoders keep speculating with shallower drafts. */
 #include "pulsar_engine_internal.h"
 #include "family_qwen.h"
 #include "spec_internal.h"
@@ -111,54 +111,65 @@ const pulsar_spec_target_ops k_qwen_spec_target = {
 
 /* ---- the MTP drafter --------------------------------------------------------------------------- */
 
-/* One bank's committed rows: the MTP layer's stage back to the snapshot its draft chain took, the kept rows'
- * MTP rows (stack at row i, next[i]) in one PREFILL step, the last kept row's stack parked for the next draft. */
-static bool mtp_absorb_bank(pulsar_session *s, const uint32_t *rows, uint32_t b, const int32_t *next, uint32_t n) {
+/* The committed rows of the last verify, any number of banks (each bank's rows one run, in the step's row order):
+ * every bank's MTP layer back to the stage its draft chain snapshotted, the kept rows' MTP rows (stack at row i,
+ * next[i]) of EVERY bank in one step (L288: one run a bank, decode rows -- it was one prefill step a bank, at the
+ * prompt arms), each bank's last kept row's stack parked for its next draft. */
+static bool mtp_absorb_banked(pulsar_session *s, const uint32_t *rows, const uint32_t *banks, const int32_t *next,
+                              uint32_t n) {
     pulsar_engine *e = s->engine;
     pulsar_qwen_state *q = s->qwen;
     const pulsar_qwen_shape *sh = &g_qwen_shape;
     const uint32_t il_mtp = e->plan.n_layer;
-    for (uint32_t i = 1; i < n; i++)
-        if (rows[i] != rows[0] + i) {
-            fprintf(stderr, "pulsar: %s: bank %u's absorbed rows are not one run -- refusing\n", PULSAR_QWEN_ARCH, b);
-            return false;
-        }
-    if (b >= q->n_banks || q->bank_pos[b] < n) return false;
     const uint64_t hc = pulsar_qwen_hc_dim(sh) * PULSAR_QWEN_STREAM_ELT_SIZE;
     const uint64_t itb = pulsar_qwen_index_tail_bytes(sh);
-    const uint32_t p0 = q->bank_pos[b] - n;   /* the commit moved the counter past the kept rows */
-    bool ok = true;
-    if (q->mtp_stage_dirty[b]) {
-        ok = pulsar_gpu_tensor_copy_async(q->layer[il_mtp].idx_tail, (uint64_t)b * itb, q->mtp_stage, (uint64_t)b * itb,
-                                          itb) != 0;
-        q->mtp_stage_dirty[b] = false;
-    }
-    if (ok && n > 1) {
-        int32_t pos[PULSAR_QWEN_SPEC_ROWS], bank[PULSAR_QWEN_SPEC_ROWS];
-        for (uint32_t i = 0; i + 1 < n; i++) { pos[i] = (int32_t)(p0 + i); bank[i] = (int32_t)b; }
-        ok = pulsar_gpu_tensor_copy_async(q->mtp_h, 0, q->streams, (uint64_t)rows[0] * hc, (uint64_t)(n - 1) * hc) != 0 &&
-             qwen_mtp_forward(s, PULSAR_QWEN_STEP_PREFILL, next, pos, bank, n - 1, 0, 0, NULL);
-    }
-    if (ok) ok = pulsar_gpu_tensor_copy_async(q->mtp_pend, (uint64_t)b * hc, q->streams, (uint64_t)rows[n - 1] * hc, hc) != 0;
-    if (!ok) {
-        q->mtp_pend_pos[b] = UINT32_MAX;
-        fprintf(stderr, "pulsar: %s: the MTP absorb failed; bank %u drafts nothing until its next row\n", PULSAR_QWEN_ARCH, b);
-        return false;
-    }
-    q->mtp_pend_pos[b] = p0 + n - 1;
-    return true;
-}
-
-/* The committed rows of the last verify, any number of banks: each bank's rows in turn (L272 P1 S4). */
-static bool mtp_absorb_banked(pulsar_session *s, const uint32_t *rows, const uint32_t *banks, const int32_t *next,
-                              uint32_t n) {
-    bool ok = true;
-    for (uint32_t i = 0; i < n;) {
+    int32_t tok[PULSAR_QWEN_SPEC_ROWS], pos[PULSAR_QWEN_SPEC_ROWS], bank[PULSAR_QWEN_SPEC_ROWS];
+    uint32_t m = 0;   /* the step's rows */
+    bool ok = n <= PULSAR_QWEN_SPEC_ROWS;
+    for (uint32_t i = 0; ok && i < n;) {
+        const uint32_t b = banks[i];
         uint32_t j = i + 1;
-        while (j < n && banks[j] == banks[i]) j++;
-        ok = mtp_absorb_bank(s, rows + i, banks[i], next + i, j - i) && ok;
+        while (j < n && banks[j] == b) j++;
+        const uint32_t k = j - i;
+        for (uint32_t r = i + 1; ok && r < j; r++) ok = rows[r] == rows[i] + (r - i);
+        if (!ok || b >= q->n_banks || q->bank_pos[b] < k) {
+            fprintf(stderr, "pulsar: %s: bank %u's absorbed rows are not one run of its kept rows -- refusing\n",
+                    PULSAR_QWEN_ARCH, b);
+            ok = false;
+            break;
+        }
+        const uint32_t p0 = q->bank_pos[b] - k;   /* the commit moved the counter past the kept rows */
+        if (q->mtp_stage_dirty[b]) {
+            ok = pulsar_gpu_tensor_copy_async(q->layer[il_mtp].idx_tail, (uint64_t)b * itb, q->mtp_stage,
+                                              (uint64_t)b * itb, itb) != 0;
+            q->mtp_stage_dirty[b] = false;
+        }
+        if (ok && k > 1)
+            ok = pulsar_gpu_tensor_copy_async(q->mtp_h, (uint64_t)m * hc, q->streams, (uint64_t)rows[i] * hc,
+                                              (uint64_t)(k - 1) * hc) != 0;
+        for (uint32_t r = 0; r + 1 < k; r++, m++) {
+            tok[m] = next[i + r];
+            pos[m] = (int32_t)(p0 + r);
+            bank[m] = (int32_t)b;
+        }
         i = j;
     }
+    if (ok && m > 0) ok = qwen_mtp_forward(s, PULSAR_QWEN_STEP_PREFILL, tok, pos, bank, m, 0, 0, NULL, NULL, true);
+    for (uint32_t i = 0; i < n;) {
+        const uint32_t b = banks[i];
+        uint32_t j = i + 1;
+        while (j < n && banks[j] == b) j++;
+        bool parked = ok && b < q->n_banks && q->bank_pos[b] >= j - i;
+        if (parked)
+            parked = pulsar_gpu_tensor_copy_async(q->mtp_pend, (uint64_t)b * hc, q->streams, (uint64_t)rows[j - 1] * hc,
+                                                  hc) != 0;
+        if (b < q->n_banks) q->mtp_pend_pos[b] = parked ? q->bank_pos[b] - 1u : UINT32_MAX;
+        ok = ok && parked;
+        i = j;
+    }
+    if (!ok)
+        fprintf(stderr, "pulsar: %s: the MTP absorb failed; its banks draft nothing until their next row\n",
+                PULSAR_QWEN_ARCH);
     return ok;
 }
 
