@@ -442,6 +442,7 @@ typedef struct pulsar_qwen_state {
     pulsar_gpu_tensor *mtp_h;       ///< [max_rows + 1][n_hc][n_embd] bf16, the trunk stacks the MTP rows read
     pulsar_gpu_tensor *mtp_tok;     ///< [max_rows] i32, x_{p+1} per MTP row
     pulsar_gpu_tensor *mtp_ws;      ///< pulsar_qwen_mtp_combine_workspace_bytes
+    pulsar_gpu_tensor *mtp_top;     ///< L289: pulsar_qwen_draft_top_ws_bytes, a draft row's pick + confidence
     pulsar_gpu_tensor *mtp_pend;    ///< [n_banks][n_hc][n_embd] bf16, the trunk stack awaiting its next token
     uint32_t *mtp_pend_pos;         ///< [n_banks] the pending row's position; UINT32_MAX = none
     uint64_t mtp_probe_n, mtp_probe_hit;   ///< PULSAR_QWEN_MTP_PROBE counters (qwen_session_eval)
@@ -642,6 +643,17 @@ bool pulsar_qwen_s4_head(const pulsar_qwen_step *st, uint32_t row0, uint32_t n, 
 bool pulsar_qwen_s4_mtp_combine(const pulsar_qwen_step *st, const void *h);
 /** The combine's workspace bytes (a fixed size; the session allocates it once). */
 uint64_t pulsar_qwen_s4_mtp_combine_ws_bytes(void);
+/** L289: the draft head's greedy pick over logits row 0 of an MTP step that headed one row, reduced on the device
+ *  into st->st->mtp_top (enqueued after the head); pulsar_qwen_s4_draft_top_read, after the step's drain, gives
+ *  the vocabulary id and its softmax probability -- the bytes the host scan gave -- and refuses a NaN row. */
+bool pulsar_qwen_s4_draft_top(const pulsar_qwen_step *st);
+bool pulsar_qwen_s4_draft_top_read(const pulsar_qwen_state *q, const pulsar_qwen_weights *w, int32_t *id, float *conf);
+/** Its workspace bytes (the session allocates it once, beside the combine's). */
+uint64_t pulsar_qwen_s4_draft_top_ws_bytes(void);
+/** L289: warm the page cache with the PLE rows of `n` tokens a later step will embed after the n-gram context `ctx`
+ *  (oldest first; advanced over the tokens here, as the embed will) -- the verify's rows, issued while the draft
+ *  chain runs, so the verify's own gather reads cached rows.  A hint: the gather still reads every row. */
+void pulsar_qwen_s4_ple_prefetch(const pulsar_qwen_weights *w, int32_t ctx[2], const int32_t *tokens, uint32_t n);
 /** L251 MTP: after a verify step `vst` of R rows at positions p .. p + R - 1, keep rows 0 .. keep - 1
  *  and roll every recurrent state of the bank back to "after row keep - 1": GDN recurrent + conv and
  *  the PLE conv from the per-row capture, each QSA layer's index stage from its snapshot plus the kept

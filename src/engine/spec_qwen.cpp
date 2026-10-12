@@ -181,7 +181,9 @@ static bool mtp_draft_record(pulsar_session *s, uint32_t b, uint64_t *rng, spec_
     const uint32_t p = st->bank_pos[b];   /* the carry's position */
     const bool sampled = temperature > 0.0f;
     const float tau = pulsar_spec_tau(e);
-    float *L = st->spec_logits;
+    /* L289: the pick is the device's; the row comes back only for a sampled draft's q */
+    float *L = sampled ? st->spec_logits : NULL;
+    qwen_mtp_pick pick;
     q->keep = 0;
     q->have_conf = true;
     q->refined[0] = x;
@@ -200,9 +202,14 @@ static bool mtp_draft_record(pulsar_session *s, uint32_t b, uint64_t *rng, spec_
     if (K == 0) return true;
     const int32_t bb = (int32_t)b;
     int32_t tp = (int32_t)p - 1;
+    /* L289: the verify will embed [x, d_1 ..] after the bank's n-gram context: their PLE rows are read into the page
+     * cache while the chain runs (each as it is known), so the verify's gather finds them there */
+    const uint32_t nc = sh->ngram_size - 1u;
+    int32_t pctx[2] = {st->ngram_ctx[(size_t)b * nc], st->ngram_ctx[(size_t)b * nc + 1u]};
+    pulsar_qwen_s4_ple_prefetch(e->qwen_weights, pctx, &x, 1);
     /* the lockstep row (stack at p - 1, x), headed: d_1 */
     bool ok = pulsar_gpu_tensor_copy_async(st->mtp_h, 0, st->mtp_pend, (uint64_t)b * hc, hc) != 0 &&
-              qwen_mtp_forward(s, PULSAR_QWEN_STEP_DECODE, &x, &tp, &bb, 1, 0, 1, L);
+              qwen_mtp_forward(s, PULSAR_QWEN_STEP_DECODE, &x, &tp, &bb, 1, 0, 1, L, &pick);
     st->mtp_pend_pos[b] = UINT32_MAX;   /* consumed; the absorb re-parks */
     /* the MTP layer's stage after its last TRUE row: the chain below writes draft rows into it */
     if (ok) {
@@ -210,17 +217,16 @@ static bool mtp_draft_record(pulsar_session *s, uint32_t b, uint64_t *rng, spec_
                                           (uint64_t)b * itb, itb) != 0;
         st->mtp_stage_dirty[b] = true;
     }
-    /* position j from the MTP row in L: its confidence (whether it is the chain's last), then its draft: the
-     * argmax (greedy) or a draw from q (sampled) */
+    /* position j from the MTP row's pick: its confidence (whether it is the chain's last), then its draft: the
+     * pick (greedy) or a draw from q over the row in L (sampled) */
     bool stop = false;
     auto draft = [&](uint32_t j) -> bool {
-        float conf;
-        const int32_t top = qwen_mtp_argmax(e, L, &conf);
-        q->conf[j - 1] = conf;
-        stop = pulsar_spec_conf_stops(conf, tau);   /* the stop rule: this draft is the chain's last */
+        q->conf[j - 1] = pick.conf;
+        stop = pulsar_spec_conf_stops(pick.conf, tau);   /* the stop rule: this draft is the chain's last */
         q->qn[j - 1] = 0;
         if (!sampled) {
-            q->refined[j] = top;
+            q->refined[j] = pick.id;
+            pulsar_qwen_s4_ple_prefetch(e->qwen_weights, pctx, &q->refined[j], 1);
             return true;
         }
         pulsar_sample_dist qd{};
@@ -228,6 +234,7 @@ static bool mtp_draft_record(pulsar_session *s, uint32_t b, uint64_t *rng, spec_
         const int d = pulsar_sample_dist_draw(&qd, rng);
         if (d < 0) { pulsar_sample_dist_free(&qd); return false; }
         q->refined[j] = (int32_t)d;
+        pulsar_qwen_s4_ple_prefetch(e->qwen_weights, pctx, &q->refined[j], 1);
         q->q_drawn[j - 1] = pulsar_sample_dist_prob(&qd, d);
         if (!pulsar_spec_q_record(q, j - 1, &qd)) {
             /* too wide to store: the walk rebuilds q from a row under the stored params -- the MTP
@@ -247,7 +254,7 @@ static bool mtp_draft_record(pulsar_session *s, uint32_t b, uint64_t *rng, spec_
     for (uint32_t j = 2; ok && !stop && j <= K; j++) {
         tp = (int32_t)p + (int32_t)j - 2;
         ok = pulsar_gpu_tensor_copy_async(st->mtp_h, 0, st->mtp_streams, 0, hc) != 0 &&
-             qwen_mtp_forward(s, PULSAR_QWEN_STEP_DECODE, &q->refined[j - 1], &tp, &bb, 1, 0, 1, L);
+             qwen_mtp_forward(s, PULSAR_QWEN_STEP_DECODE, &q->refined[j - 1], &tp, &bb, 1, 0, 1, L, &pick);
         if (ok) ok = draft(j);
         if (ok) k = j;
     }

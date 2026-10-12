@@ -19,6 +19,9 @@
  *   D. MoE block over 512 experts (an aliased pool of 12 distinct slices per
  *      projection, gate/up K=4, down K=5; shared K=5/5/4) vs double with the
  *      device's routing; T = 1 bit-identical; the non-finite flag stays clear.
+ *   H. L289 draft pick: the device's first maximum and f32 softmax probability of a draft-head row
+ *      (65812 logits) BIT-EXACT vs the host scan it replaced, over random rows, ties, an all-but-one
+ *      -inf row and a narrow row; a NaN row is flagged; the record is the same bytes run to run.
  *
  * usage: ./tests/qwen_s4_gate */
 #include "../src/pulsar_gpu.h"
@@ -105,6 +108,82 @@ static double bf_ulps(double got, double want) {
 
 /* ======================================================================== */
 static void section_mxfp8_linear(void);   /* defined at the end */
+
+/* H. L289: the draft head's pick on the device vs the host scan it replaced (the old qwen_mtp_argmax, verbatim:
+ * the first maximum by a strict > scan, and (float)(1.0 / sum exp((double)(row[i] - m))) in index order). */
+static int32_t host_pick(const float *row, int n, float *prob) {
+    int a = 0;
+    for (int i = 1; i < n; i++) if (row[i] > row[a]) a = i;
+    double z = 0.0;
+    const float m = row[a];
+    for (int i = 0; i < n; i++) z += exp((double)(row[i] - m));
+    *prob = (float)(1.0 / z);
+    return a;
+}
+
+static void section_draft_top(void) {
+    printf("H. draft pick (L289): device first-max + f32 confidence vs the host scan\n");
+    const int N = 65812;   /* the served draft head: ids [0, 65536) + the 276 specials */
+    const size_t wsb = pulsar_qwen_draft_top_ws_bytes();
+    float *drow = (float *)dalloc((size_t)N * 4);
+    void *ws = dalloc(wsb);
+    std::vector<float> row(N);
+    int idx_bad = 0, conf_bad = 0, rows = 0;
+    float worst_got = 0, worst_want = 0;
+    auto run = [&](int n, pulsar_qwen_draft_top *rec) {
+        CK(cudaMemcpy(drow, row.data(), (size_t)n * 4, cudaMemcpyHostToDevice));
+        const int rc = pulsar_qwen_draft_top_launch(drow, n, ws, 0);
+        CK(cudaDeviceSynchronize());
+        CK(cudaMemcpy(rec, ws, sizeof *rec, cudaMemcpyDeviceToHost));
+        return rc;
+    };
+    auto grade = [&](int n) {
+        pulsar_qwen_draft_top rec{};
+        float want = 0;
+        const int a = host_pick(row.data(), n, &want);
+        if (run(n, &rec) != 0 || rec.nan) { idx_bad++; return; }
+        rows++;
+        idx_bad += rec.index != a;
+        if (memcmp(&rec.conf, &want, 4) != 0) { conf_bad++; worst_got = rec.conf; worst_want = want; }
+    };
+    /* logits-like rows: a heavy body, a few strong candidates (the confident and the unsure draft) */
+    for (int r = 0; r < 400; r++) {
+        const double sc = 1.0 + 6.0 * rndu();
+        for (int i = 0; i < N; i++) row[i] = (float)(sc * rndn());
+        const int peaks = 1 + (int)(rnd() % 4);
+        for (int k = 0; k < peaks; k++) row[rnd() % N] = (float)(sc * (3.0 + 4.0 * rndu()));
+        grade(N);
+    }
+    /* ties: the maximum at two and at many places -> the lowest index */
+    for (int r = 0; r < 40; r++) {
+        for (int i = 0; i < N; i++) row[i] = (float)rndn();
+        const float m = 9.5f;
+        for (int k = 0; k < 1 + r % 7; k++) row[rnd() % N] = m;
+        grade(N);
+    }
+    /* one finite logit in a row of -inf (a draft head over a masked vocabulary), and a narrow row */
+    for (int i = 0; i < N; i++) row[i] = -INFINITY;
+    row[N - 3] = 0.25f;
+    grade(N);
+    for (int i = 0; i < 37; i++) row[i] = (float)rndn();
+    grade(37);
+    CHECK(idx_bad == 0 && conf_bad == 0, "%d rows: pick %d differ, confidence %d not bit-exact%s", rows, idx_bad,
+          conf_bad, conf_bad ? " (one shown below)" : "");
+    if (conf_bad) printf("        got %.9g want %.9g\n", (double)worst_got, (double)worst_want);
+    /* run to run: the same record bytes */
+    for (int i = 0; i < N; i++) row[i] = (float)(3.0 * rndn());
+    pulsar_qwen_draft_top r1{}, r2{};
+    run(N, &r1);
+    run(N, &r2);
+    CHECK(memcmp(&r1, &r2, sizeof r1) == 0, "the record is the same bytes run to run");
+    row[12345] = NAN;
+    pulsar_qwen_draft_top rn{};
+    CHECK(run(N, &rn) == 0 && rn.nan != 0, "a NaN in the row is flagged (the caller refuses the draft)");
+    CHECK(pulsar_qwen_draft_top_launch(drow, 0, ws, 0) != 0 && pulsar_qwen_draft_top_launch(nullptr, N, ws, 0) != 0,
+          "no logits / a null row is refused");
+    cudaFree(drow);
+    cudaFree(ws);
+}
 static void section_router(void) {
     printf("A. router (bf16 logits, softmax top-%d of %d, renormalised)\n", TOPK, E);
     const int T = 37;
@@ -769,6 +848,7 @@ int main(void) {
     section_ple();
     section_moe();
     section_mxfp8_linear();
+    section_draft_top();
     printf(g_fail ? "QWEN-S4 GATE FAIL\n" : "QWEN-S4 GATE PASS\n");
     return g_fail;
 }

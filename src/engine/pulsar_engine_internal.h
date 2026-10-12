@@ -549,6 +549,10 @@ pulsar_engram_gather *pulsar_engram_gather_start(pulsar_engram_io *io, const pul
                                                  unsigned char *dst);
 /** Block until the gather is complete; frees the handle.  1 = every row read. */
 int  pulsar_engram_gather_wait(pulsar_engram_gather *g);
+/** L289: warm the page cache with rows a gather will read soon (the pool reads them into its own buffer, and
+ *  nothing waits on it): the later gather reads the same bytes, faster.  A hint -- it changes no bytes and a
+ *  failed read is the later gather's to report. */
+void pulsar_engram_prefetch(pulsar_engram_io *io, const pulsar_engram_table *t, const uint64_t *rows, uint32_t n_rows);
 
 /** ---- Engram on the DeepSeek forward (L242 slice 5; L269 W2) ------------------
  *
