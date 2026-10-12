@@ -459,7 +459,7 @@ extern "C" int pulsar_rows_moe_routed_launch(const pulsar_rows_moe *w, int32_t *
     if (exl3_moe_routed_launch(st, sel, wts, T, top_k, 0.0f, exl3_moe_act{EXL3_MOE_ACT_BF16_ROWS, x_bf16, nullptr, 0},
                                bufs, out, nf_flag, nf_code, w->prompt, stream, w->shared ? &sh : nullptr) != 0)
         return -1;
-    /* DIAGNOSTIC (PULSAR_MOE_SPILL_MID=<prefix>): the fold's bf16 output -- the down GEMV's input -- so the xcheck
+    /* DIAGNOSTIC (PULSAR_MOE_SPILL_MID=<prefix>): the fold's bf16 output -- the down's input -- so the xcheck
      * can compare the DEVICE's own values against its emulation's per element.  Armed only by the env var;
      * nothing runs and nothing allocates when it is unset. */
     { const char *sp = getenv("PULSAR_MOE_SPILL_MID");

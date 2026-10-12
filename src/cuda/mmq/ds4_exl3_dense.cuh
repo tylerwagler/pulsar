@@ -79,6 +79,12 @@ int ds4_exl3_dense_launch(
      * prompt cut anywhere is byte-identical to one prefilled whole; false: M > 16 does */
     bool           prompt = false);
 
+/** L251: the dense arm's prompt chunks through a decode-once tensor-core GEMM: w is the dense layout
+ *  (trellis | suh[K] | svh[N]); writes y [M][N] finished (output rotation and svh applied).
+ *  ds4_exl3_dense_launch calls it for prompt chunks and M > 16. */
+int qwen_exl3_dense_prefill_launch(const void *w, int k2, const void *x_bf16, float *y, int M, int K, int N,
+                                   uint64_t trellis_bytes, cudaStream_t stream);
+
 /** Two projections of the same (K, N, k2) over the same rows -- a shared expert's gate and up -- in ONE launch
  *  (prompt chunks and M > 16: the prefill GEMM, once per projection).  Each output is bit for bit what
  *  ds4_exl3_dense_launch writes for it alone.  `workspace` holds 2 x ds4_exl3_dense_workspace_bytes(M, K, N). */

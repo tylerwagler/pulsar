@@ -267,13 +267,13 @@ pulsar-agent: $(AGENT_OBJS) src/lib/pulsar_help.o src/lib/pulsar_kvtext.o src/li
 
 # L278: the family kernel gates that need a GPU and no model run here, for every family -- Qwen's GDN, QSA and
 # S4 (router / MoE / GR / PLE) beside DeepSeek's and the shared EXL3 arms.
-cuda-regression: tests/cuda_long_context_smoke tests/moe_route_bounds_gate tests/expert_table_gate tests/exl3_gemv_gate \
+cuda-regression: tests/cuda_long_context_smoke tests/moe_route_bounds_gate tests/expert_table_gate tests/exl3_moe_epilogue_gate \
                  tests/exl3_dense_gate tests/exl3_moe_prefill_gate tests/exl3_half_gate \
                  tests/gdn_gate tests/qsa_attn_gate tests/qwen_s4_gate
 	./tests/cuda_long_context_smoke
 	./tests/moe_route_bounds_gate
 	./tests/expert_table_gate
-	./tests/exl3_gemv_gate
+	./tests/exl3_moe_epilogue_gate
 	./tests/exl3_dense_gate
 	./tests/exl3_moe_prefill_gate
 	./tests/exl3_half_gate $(EXL3_HALF_SCRATCH)
@@ -488,18 +488,19 @@ tests/expert_table_gate: tests/expert_table_gate.cu Makefile \
                          src/engine/exl3_trellis.h
 	$(NVCC) -O3 -arch=$(ATTN_GATE_ARCH) -Isrc -Isrc/cuda -o $@ $<
 
-# L245 step 3: the EXL3 routed-expert arm -- both GEMVs, the fold and the sum
-# -- graded against the host authority (exl3_trellis.h + double arithmetic)
-# on random tiles at the V4.1 expert shape, plus the arm's GB/s.  Model-free;
-# needs a device.  Includes the kernel TU directly, as the table gate does.
-tests/exl3_gemv_gate: tests/exl3_gemv_gate.cu tests/exl3_gemv_gate_qwen.inc Makefile src/cuda/mmq/ds4_exl3_gemv.cu \
-                      src/cuda/mmq/ds4_exl3_gemv.cuh src/cuda/mmq/exl3_moe_prefill.cuh \
-                      src/cuda/pulsar_cuda_mx.cuh src/engine/exl3_trellis.h
+# L245 step 3 / task #46: the EXL3 routed arm's projections (the decode arm) and its epilogues -- the fold
+# and the sum, incl. their K-split partials -- graded against the host authority (exl3_trellis.h + double
+# arithmetic) on random tiles at the V4.1 and Qwen expert shapes.  Model-free; needs a device.  Includes the
+# kernel TUs directly, as the table gate does.
+tests/exl3_moe_epilogue_gate: tests/exl3_moe_epilogue_gate.cu tests/exl3_moe_epilogue_gate_qwen.inc Makefile \
+                              src/cuda/mmq/exl3_moe_epilogue.cu src/cuda/mmq/exl3_moe_epilogue.cuh \
+                              src/cuda/mmq/exl3_moe_prefill.cu src/cuda/mmq/exl3_moe_prefill.cuh \
+                              src/cuda/mmq/ds4_exl3_dev.cuh src/cuda/pulsar_cuda_mx.cuh src/engine/exl3_trellis.h
 	$(NVCC) -O3 -std=c++17 -arch=$(ATTN_GATE_ARCH) -Isrc -Isrc/cuda -Isrc/cuda/mmq -o $@ $<
 
-.PHONY: exl3-gemv-gate
-exl3-gemv-gate: tests/exl3_gemv_gate
-	./tests/exl3_gemv_gate
+.PHONY: exl3-moe-epilogue-gate
+exl3-moe-epilogue-gate: tests/exl3_moe_epilogue_gate
+	./tests/exl3_moe_epilogue_gate
 
 # L251: the EXL3 dense-Linear arm -- the complete Linear (input rotation,
 # split-K trellis GEMV, output Hadamard + svh) at the Qwen dense shapes and a
@@ -515,10 +516,10 @@ tests/exl3_dense_gate: tests/exl3_dense_gate.cu tests/exl3_dense_ref.h src/cuda/
 exl3-dense-gate: tests/exl3_dense_gate
 	./tests/exl3_dense_gate
 
-# L287: the routed experts' prompt-chunk arm (one arm, every family) vs an f32-weight
-# reference: DeepSeek V4 / V4.1 and Qwen shapes, both producer formats (E4M3 slot,
-# bf16 rows), every rate, 1..8192 tokens, ragged loads, chunk invariance bit-exact,
-# refusals.  Links the PRODUCTION object, so pass the served arch:
+# L287 / task #46: the routed experts' tensor-core arms -- the prompt-chunk GEMM and the
+# decode GEMM, one each for every family -- vs an f32-weight reference: DeepSeek V4 / V4.1
+# and Qwen shapes, both producer formats (E4M3 slot, bf16 rows), every rate, 1..8192 tokens
+# (decode: 1..40), ragged loads, chunk (decode: batch) invariance bit-exact, refusals.  Links the PRODUCTION object, so pass the served arch:
 # make exl3-moe-prefill-gate CUDA_ARCH=sm_120f.  Model-free.
 tests/exl3_moe_prefill_gate: tests/exl3_moe_prefill_gate.cu src/cuda/mmq/exl3_moe_prefill.o Makefile \
                              src/cuda/mmq/exl3_moe_prefill.cuh src/cuda/pulsar_cuda_mx.cuh src/engine/exl3_trellis.h
@@ -548,6 +549,12 @@ exl3-half-gate: tests/exl3_half_gate
 # the D2R arm vs decode-once fp16 + cuBLASLt per expert.  Not a gate.
 tests/exl3_moe_prefill_bench: tests/exl3_moe_prefill_bench.cu $(CUDA_OBJS) $(CUTLASS_CUDA_OBJS) $(MMQ_OBJS) Makefile
 	$(NVCC) $(NVCCFLAGS) -std=c++17 -Isrc -Isrc/cuda -o $@ tests/exl3_moe_prefill_bench.cu \
+		$(CUDA_OBJS) $(CUTLASS_CUDA_OBJS) $(MMQ_OBJS) $(CUDA_LDLIBS)
+
+# Task #46: one routed EXL3 layer at DECODE / VERIFY widths (S streams x R rows, expert overlap between a
+# stream's consecutive rows) through the production front door, Qwen / V4 / V4.1 shapes, DRAM-cold.  Not a gate.
+tests/exl3_moe_decode_bench: tests/exl3_moe_decode_bench.cu $(CUDA_OBJS) $(CUTLASS_CUDA_OBJS) $(MMQ_OBJS) Makefile
+	$(NVCC) $(NVCCFLAGS) -std=c++17 -Isrc -Isrc/cuda -o $@ tests/exl3_moe_decode_bench.cu \
 		$(CUDA_OBJS) $(CUTLASS_CUDA_OBJS) $(MMQ_OBJS) $(CUDA_LDLIBS)
 
 # L251: the dense arm on a REAL exllamav3-quantized weight, driven by
@@ -2163,7 +2170,7 @@ gates-dev:
 	fi; \
 	if [ $$exl3 -eq 1 ]; then \
 	  $(MAKE) --no-print-directory exl3-dequant-gate CUDA_ARCH=sm_120f || rc=1; \
-	  $(MAKE) --no-print-directory exl3-gemv-gate exl3-dense-gate exl3-moe-prefill-gate exl3-half-gate CUDA_ARCH=sm_120f || rc=1; \
+	  $(MAKE) --no-print-directory exl3-moe-epilogue-gate exl3-dense-gate exl3-moe-prefill-gate exl3-half-gate CUDA_ARCH=sm_120f || rc=1; \
 	fi; \
 	if [ $$family -eq 1 ]; then \
 	  $(MAKE) --no-print-directory qwen-family-gate-device CUDA_ARCH=sm_120f || rc=1; \

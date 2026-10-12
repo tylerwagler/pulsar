@@ -17,9 +17,10 @@
  *      16x16 tile of the half is the whole's tile at the shifted index, suh / svh the whole's ranges -- so the
  *      two halves partition every expert, and each half is exl3_expert_layout of the half shape.  The host cut
  *      (exl3_expert_cut_apply, what tp_slice.cpp's rows reader uses) equals the device bytes too.
- *   2. CHAIN, decode rows (1, 5 and 16 tokens: the trellis GEMV) and prefill rows (33 and 300 tokens: the L287
+ *   2. CHAIN, decode rows (1, 5 and 16 tokens: the decode GEMM) and prefill rows (33 and 300 tokens: the L287
  *      tensor-core GEMM): the whole stack and each rank's half through the routed entry, then
- *        - the gate and up z of each half == the whole's columns [lo, hi), bit for bit;
+ *        - the gate and up z of each half == the whole's columns [lo, hi), bit for bit (prefill rows: decode
+ *          rows' z are the decode arm's split partials, not written to the caller's buffers -- their mid is);
  *        - the folded mid's E4M3 slot of each half == the whole's columns: every value byte and every per-32
  *          scale (the 32-groups and the 128 Hadamard blocks align with the cut), bit for bit;
  *        - out_0 + out_1 (what the FFN exchange computes) vs the whole: NOT bit-exact by construction -- the
@@ -203,7 +204,7 @@ int main(int argc, char **argv) {
         printf("  1. bytes: %d ranks x gate / up (output columns) + down (input rows), %d experts each: %s\n", NR, E,
                g_fail ? "FAIL" : "every tile, suh and svh == the whole's, host cut == device");
 
-        /* 2. CHAIN: decode rows (GEMV) and prefill rows (tensor-core GEMM) */
+        /* 2. CHAIN: decode rows (the decode GEMM) and prefill rows (the prefill GEMM) */
         for (const int n_tok : {1, 5, 16, 33, 300}) {
             const bool decode = n_tok <= 16;
             const uint64_t pairs = (uint64_t)n_tok * TOPK;
@@ -235,8 +236,12 @@ int main(int argc, char **argv) {
                 for (int r = 0; r < NR; r++)
                     for (uint64_t p = 0; p < pairs; p++) {
                         const uint64_t w0 = p * MID + r * HALF, h0 = p * HALF;
-                        zbad += memcmp(&whole.gz[w0], &half[r].gz[h0], HALF * 4) != 0;
-                        zbad += memcmp(&whole.uz[w0], &half[r].uz[h0], HALF * 4) != 0;
+                        /* decode rows' z are the decode arm's split partials in its scratch (task #46): the
+                         * caller's z buffers are written by prompt chunks only; the mid below is their image */
+                        if (!decode) {
+                            zbad += memcmp(&whole.gz[w0], &half[r].gz[h0], HALF * 4) != 0;
+                            zbad += memcmp(&whole.uz[w0], &half[r].uz[h0], HALF * 4) != 0;
+                        }
                         qbad += memcmp(&whole.mq[w0], &half[r].mq[h0], HALF) != 0;
                         sbad += memcmp(&whole.msf[p * (MID / 32) + r * (HALF / 32)], &half[r].msf[p * (HALF / 32)],
                                        HALF / 32) != 0;
@@ -255,9 +260,10 @@ int main(int argc, char **argv) {
                 worst_max = fmax(worst_max, rmax);
                 const bool ok = zbad == 0 && qbad == 0 && sbad == 0 && rel <= 1e-5 && rmax <= 1e-4 && std::isfinite(rel);
                 CHECK(ok, "%d tokens", n_tok);
-                printf("  2. %-7s %3d tokens: gate/up z rows differing %llu, mid E4M3 value rows %llu, scale rows %llu "
+                printf("  2. %-7s %3d tokens: gate/up z rows differing %llu%s, mid E4M3 value rows %llu, scale rows %llu "
                        "(of %llu x %d); out_0 + out_1 vs whole: rel Frob %.3g, max %.3g of max|out| -- %s\n",
-                       decode ? "decode" : "prefill", n_tok, (unsigned long long)zbad, (unsigned long long)qbad,
+                       decode ? "decode" : "prefill", n_tok, (unsigned long long)zbad, decode ? " (not read)" : "",
+                       (unsigned long long)qbad,
                        (unsigned long long)sbad, (unsigned long long)pairs, NR, rel, rmax, ok ? "ok" : "FAIL");
             }
             pulsar_gpu_act_slot_drop(x);

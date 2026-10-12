@@ -2,7 +2,7 @@
 // The EXL3 routed MoE's one front door (exl3_moe.cuh has the contract and the dataflow).
 
 #include "exl3_moe.cuh"
-#include "ds4_exl3_gemv.cuh"
+#include "exl3_moe_epilogue.cuh"
 #include "ds4_exl3_dense.cuh"
 #include "ds4_mmid.cuh"
 #include "ds4_mmq.h"
@@ -20,20 +20,23 @@ bool act_ok(const exl3_moe_act &a) {
                    (a.format == EXL3_MOE_ACT_E4M3_SLOT && a.sf && a.kbp > 0));
 }
 
-/* One projection of the schedule, through the arm the rule picks. */
+/* One projection of the schedule, through the arm the rule picks: a prompt chunk's grouped GEMM (once per slice,
+ * each rotating its input by its own suh) writes the caller's z; the decode GEMM (a pair's two slices in one
+ * launch) leaves split partials in the workspace, which *z points the fold / sum at. */
 int project(int kind, const void *table, const void *up_table, int k2, const exl3_moe_act &act,
             const int32_t *ids_dst, const int32_t *ids_src, const int32_t *bounds, float *out, float *out_up,
-            int M, int K, int64_t pairs, int E, bool gemm, void *tc_ws, size_t tc_bytes, cudaStream_t stream) {
-    if (!gemm)
-        return ds4_exl3_moe_gemv_launch(kind, table, up_table, k2, act, ids_dst, ids_src, bounds, out, out_up, M, K,
-                                        pairs, E, 0, stream);
-    /* a prompt chunk: the grouped tensor-core GEMM, once per slice, each rotating its input by its own suh */
+            int M, int K, int64_t pairs, int E, bool gemm, void *tc_ws, size_t tc_bytes, exl3_moe_partials *z,
+            cudaStream_t stream) {
     const bool rotate = kind != EXL3_ARM_DOWN;
+    if (!gemm)
+        return exl3_moe_decode_launch(table, kind == EXL3_ARM_PAIR ? up_table : nullptr, k2, rotate, act, ids_dst,
+                                      ids_src, bounds, M, K, pairs, E, tc_ws, tc_bytes, z, stream);
     int rc = exl3_moe_prefill_launch(table, k2, rotate, act, ids_dst, ids_src, bounds, out, M, K, pairs, E, tc_ws,
                                      tc_bytes, stream);
     if (rc == 0 && kind == EXL3_ARM_PAIR)
         rc = exl3_moe_prefill_launch(up_table, k2, true, act, ids_dst, ids_src, bounds, out_up, M, K, pairs, E,
                                      tc_ws, tc_bytes, stream);
+    *z = exl3_moe_partials{{out, out_up}, 1, 0};
     return rc;
 }
 
@@ -58,7 +61,7 @@ int exl3_moe_routed_launch(const exl3_moe_stacks &w, const int32_t *sel, const f
                         "buffer present -- refusing\n", tag);
         return -1;
     }
-    if (!ds4_exl3_gemv_rate_supported(gu_kind, w.k2_gate_up) || !ds4_exl3_gemv_rate_supported(EXL3_ARM_DOWN, w.k2_down) ||
+    if (!exl3_arm_has_rate(gu_kind, w.k2_gate_up) || !exl3_arm_has_rate(EXL3_ARM_DOWN, w.k2_down) ||
         w.in_dim % EXL3_HAD_BLOCK || w.mid_dim % EXL3_HAD_BLOCK || w.out_dim % EXL3_HAD_BLOCK) {
         fprintf(stderr, "%s: %s K=%g / down K=%g at %d -> %d -> %d has no instance (128-multiples, "
                         "exl3_arm_has_rate) -- refusing\n", tag, fused ? "fused gate_up" : "gate / up", w.k2_gate_up / 2.0,
@@ -85,10 +88,14 @@ int exl3_moe_routed_launch(const exl3_moe_stacks &w, const int32_t *sel, const f
     const int64_t pairs = (int64_t)T * top_k;
     if (pairs > INT32_MAX) return -1;
     const int E = w.n_experts;
-    const bool gemm = exl3_moe_prefill_takes(prompt, pairs);
+    const bool gemm = prompt;   /* the row kind is the one rule: a prompt chunk the grouped GEMM, decode rows the decode arm */
     size_t tc_bytes = 0;
-    if (gemm) {
-        const size_t a = exl3_moe_prefill_ws_bytes(pairs, w.in_dim, E), d = exl3_moe_prefill_ws_bytes(pairs, w.mid_dim, E);
+    {
+        /* gate / up's workspace, then the down's over it: the fold has read gate / up's z before the down's PREP */
+        const size_t a = gemm ? exl3_moe_prefill_ws_bytes(pairs, w.in_dim, E)
+                              : exl3_moe_decode_ws_bytes(fused ? 1 : 2, pairs, w.in_dim, fused ? 2 * w.mid_dim : w.mid_dim);
+        const size_t d = gemm ? exl3_moe_prefill_ws_bytes(pairs, w.mid_dim, E)
+                              : exl3_moe_decode_ws_bytes(1, pairs, w.mid_dim, w.out_dim);
         tc_bytes = a > d ? a : d;
     }
     const uint64_t ids_bytes = (uint64_t)pairs * sizeof(int32_t), eb_bytes = (uint64_t)(E + 1) * sizeof(int32_t);
@@ -100,8 +107,8 @@ int exl3_moe_routed_launch(const exl3_moe_stacks &w, const int32_t *sel, const f
     int32_t *ids_src = (int32_t *)cuda_arena_take(&ar, ids_bytes, 256);
     int32_t *ids_dst = (int32_t *)cuda_arena_take(&ar, ids_bytes, 256);
     int32_t *bounds = (int32_t *)cuda_arena_take(&ar, eb_bytes, 256);
-    void *tc_ws = gemm ? cuda_arena_take(&ar, tc_bytes, 256) : nullptr;
-    if (!bounds || (gemm && !tc_ws)) return -1;   /* take() latches */
+    void *tc_ws = cuda_arena_take(&ar, tc_bytes, 256);
+    if (!tc_ws) return -1;   /* take() latches */
 
     /* a riding shared expert's gate and up: one dense launch when they share a rate */
     if (sh) {
@@ -125,20 +132,21 @@ int exl3_moe_routed_launch(const exl3_moe_stacks &w, const int32_t *sel, const f
         return -3;
     }
     const exl3_moe_stacks &s = w;
-    float *gz = b.gate_z, *uz = fused ? nullptr : b.up_z;
+    exl3_moe_partials gp{}, dp{};
     int rc = project(gu_kind, fused ? s.gate_up : s.gate, fused ? nullptr : s.up, s.k2_gate_up, x, ids_dst, ids_src,
-                     bounds, gz, uz, fused ? 2 * s.mid_dim : s.mid_dim, s.in_dim, pairs, E, gemm, tc_ws, tc_bytes,
-                     stream);
+                     bounds, b.gate_z, fused ? nullptr : b.up_z, fused ? 2 * s.mid_dim : s.mid_dim, s.in_dim, pairs, E,
+                     gemm, tc_ws, tc_bytes, &gp, stream);
     if (rc) { fprintf(stderr, "%s: gate / up declined (rc=%d) -- no fallback\n", tag, rc); return -1; }
+    float *gz = gp.z[0], *uz = gp.z[1];
     const bool mid_e4m3 = b.mid.format == EXL3_MOE_ACT_E4M3_SLOT;
     void *mq = mid_e4m3 ? const_cast<void *>(b.mid.x) : nullptr, *msf = mid_e4m3 ? const_cast<void *>(b.mid.sf) : nullptr;
     void *mb = mid_e4m3 ? nullptr : const_cast<void *>(b.mid.x);
     const exl3_moe_shared_swiglu shs{sh ? sh->yg : nullptr, sh ? sh->yu : nullptr, sh ? sh->h : nullptr, T,
                                      sh ? sh->mid : 0};
     rc = fused ? ds4_exl3_moe_fold_fused_launch(gz, sel, wts, s.gate_up, s.down, s.in_dim, s.mid_dim, pairs, clamp, mq,
-                                                msf, b.mid.kbp, stream, mb, sh ? &shs : nullptr)
+                                                msf, b.mid.kbp, stream, mb, sh ? &shs : nullptr, gp.splits, gp.split_stride)
                : ds4_exl3_moe_fold_launch(gz, uz, sel, wts, s.gate, s.up, s.down, s.in_dim, s.mid_dim, pairs, clamp, mq,
-                                          msf, b.mid.kbp, stream, mb, sh ? &shs : nullptr);
+                                          msf, b.mid.kbp, stream, mb, sh ? &shs : nullptr, gp.splits, gp.split_stride);
     if (rc) return -1;
     if (sh && ds4_exl3_dense_launch(sh->down, sh->k2_down, sh->h, sh->ys, T, sh->mid, w.out_dim, sh->ws, sh->ws_bytes,
                                     stream, prompt) != 0) {
@@ -147,9 +155,9 @@ int exl3_moe_routed_launch(const exl3_moe_stacks &w, const int32_t *sel, const f
     }
     /* the down: its source row is the pair (the fold wrote one mid row per pair) */
     rc = project(EXL3_ARM_DOWN, s.down, nullptr, s.k2_down, b.mid, ids_dst, ids_dst, bounds, b.down_z, nullptr,
-                 s.out_dim, s.mid_dim, pairs, E, gemm, tc_ws, tc_bytes, stream);
+                 s.out_dim, s.mid_dim, pairs, E, gemm, tc_ws, tc_bytes, &dp, stream);
     if (rc) { fprintf(stderr, "%s: down declined (rc=%d) -- no fallback\n", tag, rc); return -1; }
-    rc = ds4_exl3_moe_sum_launch(out, b.down_z, sel, s.down, s.mid_dim, s.out_dim, top_k, T, nf_flag, nf_code, stream,
-                                 sh ? sh->ys : nullptr, sh ? sh->scale : nullptr);
+    rc = ds4_exl3_moe_sum_launch(out, dp.z[0], sel, s.down, s.mid_dim, s.out_dim, top_k, T, nf_flag, nf_code, stream,
+                                 sh ? sh->ys : nullptr, sh ? sh->scale : nullptr, dp.splits, dp.split_stride);
     return rc ? -1 : 0;
 }

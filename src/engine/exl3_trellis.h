@@ -232,7 +232,7 @@ EXL3_HD static inline int exl3_type_k2(uint32_t type) {
 
 /**
  * The EXL3 arms and the rates each reads -- the ONE table, used by the CUDA
- * arms' dispatch (mmq/ds4_exl3_gemv.cu, which instantiates exactly these) and
+ * arms' dispatch (mmq/exl3_moe_prefill.cu, whose tensor-core arms instantiate them) and
  * by the binders that admit a container's tensors (a rate no arm reads is
  * refused at load, not at first use):
  *   DOWN   a routed down on the fold's pre-rotated mid: 2, 2.5, 3 (DeepSeek /
@@ -241,8 +241,8 @@ EXL3_HD static inline int exl3_type_k2(uint32_t type) {
  *          K3) and 4, 6 (turboderp's Qwen trunk, which ships gate and up apart with their own suh)
  *   GATE_UP_FUSED   one [in -> 2 mid] gate | up slice (our Qwen quant): 4, 5
  *   DENSE  the dense-Linear arm (mmq/ds4_exl3_dense.cuh): 2, 3, 4, 5, 6, 8
- *   MOE_PREFILL     the routed-expert prefill GEMM, every family (mmq/exl3_moe_prefill.cu): every
- *          rate a routed GEMV arm reads -- 2, 2.5, 3, 4, 5, 6
+ *   MOE_PREFILL     the routed-expert tensor-core arms (prompt and decode), every family
+ *          (mmq/exl3_moe_prefill.cu): every rate DOWN / PAIR / GATE_UP_FUSED admit -- 2, 2.5, 3, 4, 5, 6
  * Qwen's rates are turboderp's packs (L266): 4.05 bpw = K4 experts, K6 dense and
  * shared; 6.05 = K6 experts, K8 dense and shared; the MTP layer's experts K3.
  */

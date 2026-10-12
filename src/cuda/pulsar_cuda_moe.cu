@@ -1233,9 +1233,9 @@ static int routed_moe_try_mmq_down(
  * (mmq/exl3_moe.cuh) over this family's E4M3 slots.  L287: PREFILL rows (the row kind, L167:
  * pulsar_gpu_matmul_batch_decode_rows() == 0) are a prompt chunk and take the
  * tensor-core prefill GEMM over the producer's E4M3 slot at every width -- the
- * arm Qwen's prompt chunks take, by the same rule (exl3_moe_prefill_takes) --
- * so a prompt row's bits never depend on its chunk; decode rows take the GEMV
- * below that rule's assignment count.  The fold, the down's E4M3 mid slot and
+ * arm Qwen's prompt chunks take, by the same rule (the row kind) --
+ * so a prompt row's bits never depend on its chunk; decode rows take the
+ * tensor-core decode GEMM at every width (task #46).  The fold, the down's E4M3 mid slot and
  * the sum are one dataflow for both.  Under TP (L269 W1) the stacks are the
  * rank's halves (pulsar_gpu_register_exl3_expert_half) and expert_mid_dim is
  * the half width: nothing here is tied to the full width, and the mid granule
@@ -1308,7 +1308,7 @@ static int routed_moe_launch_exl3(
         fprintf(stderr, "pulsar: routed EXL3 arm, %s rows = %s (gate/up K=%g, down K=%g)\n",
                 prompt ? "prefill" : "decode",
                 prompt ? "fp16 tensor-core prefill GEMM (exl3_moe_prefill)"
-                       : "trellis GEMV (the prefill GEMM from EXL3_MOE_PREFILL_MIN_ASSIGN assignments)",
+                       : "fp16 tensor-core split-K decode GEMM (exl3_moe_decode)",
                 k2g / 2.0, k2d / 2.0);
     }
     /* the [trellis, scales] tables: row_bytes is the split point (routed_expert_side_layout) */

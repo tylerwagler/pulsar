@@ -589,6 +589,7 @@ static void section_moe_at(const int T, const bool split = false, const int k2_e
     w.in_dim = H;
     w.mid_dim = MID;
     w.out_dim = H;
+    w.prompt = T > 16;   /* the T = 37 run is a prompt chunk (the prefill GEMMs); T <= 16 decode rows */
     const auto wr = rnd_bf((size_t)E * H, 0.02), wsg = rnd_bf(H, 0.02);
     const uint16_t *router_w = up(wr), *shared_gate_w = up(wsg);
     if (split) {
@@ -698,44 +699,21 @@ static void section_moe_at(const int T, const bool split = false, const int k2_e
         rows_f32 += sqrt(num / den) < 1e-5;
         printf("        row %d: rel Frobenius %.2e\n", t, sqrt(num / den));
     }
-    /* f32 order for most rows, except where a ROUNDING TIE at the fold's mid or the shared
-     * expert's h sees the device's f32 value and the double reference on two sides of a
-     * boundary: one flipped element moves its row off f32 order.
-     *
-     * L251 / ac69748f RE-DERIVED this bar rather than inheriting it.  The tie step was E4M3;
-     * it is now bf16 for both intermediates.  Measured on the bf16 build: 3 of 5 rows at f32
-     * order with worst 2.30e-05 -- so the absolute bound is TIGHTENED 10x here (1e-3 -> 1e-4,
-     * still 4x clear of the measured value and 1000x below the 2.5e-02 a real format error
-     * produced on this very line before the references were fixed), while the f32-order count
-     * allows the two tie-affected rows.  The count is a proxy; the bound is the check. */
-    if (T <= 16) {
-        /* split: K = 3 slices put more fold-mid values near a bf16 tie (3 of 5 rows off f32 order on the
-         * first draw, worst 3.2e-5) -- the count is the proxy and is graded for the fused arm only */
-        /* L266 RE-MEASURED the bound over 20 RNG draws per arm (80 runs): the worst row is a tie flip's
-         * size, a property of the draw -- fused K4/K5 (production) max 1.53e-4 (2 draws over 1e-4), split
-         * K3 7.67e-5, 4.05 split K4 + shared K6 1.47e-4, 6.05 split K6 + shared K8 1.04e-4 (lowest median,
-         * 2.99e-5).  The 1e-4 bar was one draw's 4x and failed every arm somewhere; 5e-4 is 3x the
-         * 80-draw maximum and still 50x below the 2.5e-2 a real format error read on this line. */
-        CHECK((split || rows_f32 >= T - 2) && frob_worst < 5e-4, "T = %d%s (decode GEMV) out vs double: %d of %d rows at f32 order "
-              "(< 1e-5), worst row rel Frobenius %.2e, max |err| / max|ref| %.2e", T, split ? " split experts" : "",
-              rows_f32, T, frob_worst, worst);
-    } else {
-        /* the prefill GEMMs (routed: exl3_moe_prefill.cu, shared: qwen_exl3_dense_prefill.cu).
-         * The shared expert's cuBLAS GEMM is ~4e-6 per element (tests/exl3_dense_gate), not the GEMV's
-         * 3e-7, so more of h's (and the fold mid's) bf16 roundings land across a tie.  ONE flipped
-         * element moves its row by up to ~2^-9 of that element's share of the output, so the worst row
-         * is a property of the draw, not of the kernels: 1.07e-4 on the first draw, 4.51e-4 when an
-         * added section B check shifted the RNG (2026-09-29).  The prefill GEMMs' operand is ONE fp16
-         * plane (2^-12 per element; each GEMM's exact envelope is graded in tests/exl3_dense_gate), which
-         * adds ~5e-4 through the block's GEMMs in series: the bound is 2e-3 -- the tie envelope plus that,
-         * 12x below the 2.5e-2 a real format error read on this line.  End to end the one-plane build was
-         * graded by the per-layer local error against the container reference (code d = 2048, layers
-         * 2..47): mean 7.88e-3 vs 7.90e-3 two-plane and 7.93e-3 all-GEMV -- no measurable change.  The
-         * f32-order count is reported, not graded. */
-        CHECK(frob_worst < 2e-3, "T = %d%s (prefill GEMMs%s) out vs double: worst row rel Frobenius %.2e, max |err| / "
-              "max|ref| %.2e (%d of %d rows at f32 order)", T, split ? " split experts" : "",
-              split ? "; the pair as two rotated slices" : "", frob_worst, worst, rows_f32, T);
-    }
+    /* Task #46: the routed experts' DECODE rows take the fp16 tensor-core decode GEMM, so every width now
+     * carries the routed arms' one-fp16-plane operand (2^-12 per element, the prefill arm's -- graded per
+     * projection in tests/exl3_moe_prefill_gate); the shared expert stays f32-class at decode widths (the dense
+     * arm's two planes) and ~4e-6 per element in its prefill GEMM.  Until #46 decode rows were graded at f32
+     * order (the CUDA-core GEMV: 5e-4 for the bf16 tie flips at the fold's mid and h); now both kinds share the
+     * prefill rows' bound and its reasoning: ONE flipped bf16 tie moves its row by up to ~2^-9 of that
+     * element's share, the fp16 plane adds ~5e-4 through the block's GEMMs in series, so 2e-3 -- 12x below
+     * the 2.5e-2 a real format error read on this line.  End to end the one-plane prefill build was graded by
+     * the per-layer local error against the container reference (code d = 2048, layers 2..47): mean 7.88e-3
+     * vs 7.90e-3 two-plane and 7.93e-3 all-GEMV -- no measurable change.  The f32-order count is reported,
+     * not graded. */
+    CHECK(frob_worst < 2e-3, "T = %d%s (%s) out vs double: worst row rel Frobenius %.2e, max |err| / "
+          "max|ref| %.2e (%d of %d rows at f32 order)", T, split ? " split experts" : "",
+          T <= 16 ? "decode GEMM" : split ? "prefill GEMMs; the pair as two rotated slices" : "prefill GEMMs",
+          frob_worst, worst, rows_f32, T);
     CHECK(NF[0] == 0, "non-finite flag clear (0x%x)", NF[0]);
     if (T <= 16) {
         /* the T = 1 run reads row 2's bf16 row -- the MoE indexes the activation itself now */
@@ -748,9 +726,9 @@ static void section_moe_at(const int T, const bool split = false, const int k2_e
 
 static void section_moe(void) {
     printf("D. MoE block (512 experts over an aliased pool of 12; fused gate_up K=4, down K=5; shared K=5/5/4)\n");
-    section_moe_at(5);    /* 50 assignments: the decode GEMV */
-    section_moe_at(37);   /* 370 assignments: the prefill GEMM (exl3_moe_prefill_takes: >= EXL3_MOE_PREFILL_MIN_ASSIGN) */
-    section_moe_at(5, true);    /* the MTP layer's split experts (pair GEMV + pair fold), decode width */
+    section_moe_at(5);    /* 50 assignments, decode rows: the decode GEMM */
+    section_moe_at(37);   /* a prompt chunk of 37 rows: the prefill GEMM */
+    section_moe_at(5, true);    /* the MTP layer's split experts (the pair in one decode launch + pair fold) */
     section_moe_at(37, true);   /* ... and a prompt width: the prefill GEMM per slice, k2 = 6 */
     printf("D'. MoE block at turboderp's rates: split gate / up (the pair arm), 4.05 = experts K4 + shared K6, "
            "6.05 = experts K6 + shared K8\n");

@@ -2,7 +2,7 @@
 // The EXL3 dense-Linear arm (L251).  See ds4_exl3_dense.cuh for the contract
 // and where the rotations go; src/engine/exl3_trellis.h for the format; the
 // tile decode, codebook and Hadamard are ds4_exl3_dev.cuh's, shared with the
-// routed-expert arm (ds4_exl3_gemv.cu).
+// routed-expert arms (exl3_moe_prefill.cu).
 //
 // Two launches per call (task #44: it was three -- prep, GEMV, epilogue):
 //
@@ -377,9 +377,6 @@ void gemv_launch(int k2, const dim3 &grid, const dim3 &block, cudaStream_t strea
 }
 
 } // namespace
-
-int qwen_exl3_dense_prefill_launch(const void *w, int k2, const void *x_bf16, float *y, int M, int K, int N,
-                                   uint64_t trellis_bytes, cudaStream_t stream);
 
 bool ds4_exl3_dense_rate_supported(int k2) { return exl3_arm_has_rate(EXL3_ARM_DENSE, k2); }
 

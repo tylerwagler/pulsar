@@ -6,10 +6,10 @@
 //   sort      mm_ids_helper ONCE: the expert-sorted schedule (ids_src = token, ids_dst = pair, expert_bounds).
 //             The down's schedule is the same sort with the pair as its source row (ids_src = ids_dst), so it
 //             is not recomputed.
-//   gate/up   the trellis GEMV (ds4_exl3_gemv.cuh) at decode widths, the grouped tensor-core GEMM
-//             (exl3_moe_prefill.cuh) for a prompt chunk -- exl3_moe_prefill_takes is the one rule; a FUSED
-//             gate_up slice or a gate + up PAIR, over the activation as its producer emitted it (bf16 rows or
-//             the E4M3 slot)
+//   gate/up   fp16 tensor-core arms (exl3_moe_prefill.cuh), chosen by the row kind alone: decode rows the
+//             split-K decode GEMM (task #46; a gate + up PAIR in one launch), a prompt chunk the grouped
+//             GEMM; a FUSED gate_up slice or a gate + up PAIR, over the activation as its producer emitted
+//             it (bf16 rows or the E4M3 slot)
 //   fold      svh, H128, SwiGLU (clamp; the route weight folded in), the down's input rotation, emitted in the
 //             format the down reads -- the caller's choice of mid (bf16 rows or an E4M3 slot), the producer
 //             rule
@@ -73,8 +73,9 @@ size_t exl3_moe_shared_ws_bytes(int T, int in_dim, int mid, int out_dim);
 /** out [T][out_dim] f32 = sum over each row's top_k picks (sel [T][top_k], wts [T][top_k]) of
  *  w * down(swiglu(gate x, up x)), x the activation as its producer emitted it, plus a riding shared expert's
  *  scale * down(swiglu(gate x, up x)) when `shared` is given.  `prompt`: a prompt chunk
- *  (the prefill GEMM at every width).  Scratch (the schedule, the prefill operand planes) is the MMQ arena
- *  slot's.  Refuses (-1) on any contract violation; nothing is launched past a refusal. */
+ *  (the prefill GEMM at every width, writing gate_z / up_z / down_z); otherwise decode rows (the decode GEMM
+ *  at every width, whose split partials live in the scratch: b's z buffers are not written).  Scratch (the
+ *  schedule, the operand planes, the decode partials) is the MMQ arena slot's.  Refuses (-1) on any contract violation; nothing is launched past a refusal. */
 int exl3_moe_routed_launch(const exl3_moe_stacks &w, const int32_t *sel, const float *wts, int T, int top_k,
                            float clamp, const exl3_moe_act &x, const exl3_moe_bufs &b, float *out,
                            uint32_t *nf_flag, uint32_t nf_code, bool prompt, cudaStream_t stream,

@@ -132,7 +132,7 @@ tests/dspark_batch_gate
 /tests/minp_prefilter_gate
 # gate binaries the battery builds in-tree (2026-09-23: a clean run left these untracked)
 /tests/expert_table_gate
-/tests/exl3_gemv_gate
+/tests/exl3_moe_epilogue_gate
 /tests/exl3_dense_gate
 /tests/exl3_dense_bench
 /tests/exl3_dense_xcheck
@@ -140,6 +140,7 @@ tests/dspark_batch_gate
 /tests/exl3_half_gate
 /tests/rope_tail_format_gate
 /tests/exl3_moe_prefill_bench
+/tests/exl3_moe_decode_bench
 /tests/engram_table_test
 /tests/qwen_ngram_test
 /tests/qwen_s4_gate

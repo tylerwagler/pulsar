@@ -11,7 +11,7 @@
 #include "pulsar_gpu.h"
 #include "cuda/pulsar_cuda_mx.cuh"
 #include "cuda/mmq/ds4_mmq.h"
-#include "cuda/mmq/ds4_exl3_gemv.cuh"
+#include "cuda/mmq/ds4_exl3_dense.cuh"
 #include "cuda/mmq/exl3_moe.cuh"
 #include "engine/exl3_trellis.h"
 

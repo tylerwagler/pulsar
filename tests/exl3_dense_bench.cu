@@ -102,6 +102,8 @@ int main(int argc, char **argv) {
         {6144, 2560,  "DeltaNet out_proj"},
         {2560, 1280,  "2560->1280"},
         {4096, 1024,  "DeepSeek attn_q_a"},
+        {2560, 640,   "Qwen shared gate/up"},
+        {640, 2560,   "Qwen shared down"},
     };
     const int widths[] = {1, 2, 4, 8, 16, 128, 512, 2048};
     const int kMaxRows = 2048;

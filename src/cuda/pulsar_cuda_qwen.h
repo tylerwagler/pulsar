@@ -215,7 +215,7 @@ typedef struct pulsar_rows_moe {
     int ex_lo, n_local;                  /**< the experts the tables hold */
     const pulsar_rows_moe_shared *shared; /**< an EXL3 shared expert riding the launches, or NULL */
     /** a PROMPT chunk (not a verify): the routed prefill GEMM at every row count, so a prompt cut anywhere is
-     *  byte-identical to one prefilled whole (session_contract_gate C1); false: decode widths take the GEMV. */
+     *  byte-identical to one prefilled whole (session_contract_gate C1); false: decode rows, the decode GEMM. */
     bool prompt;
 } pulsar_rows_moe;
 /** Workspace bytes for T rows of the routed part. */
