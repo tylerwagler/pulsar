@@ -739,6 +739,7 @@ constexpr int kHeadChunk = 64;                    ///< k per lane load: 16 codes
 constexpr int kHeadUnroll = 4;                    ///< chunks per step: two 4-block scale words a row
 constexpr int kHeadKStep = kHeadChunk * kHeadUnroll;
 constexpr int kHeadRowsMax = 16;
+constexpr int kRowsLinearOutMin = 256;             ///< a plain Linear this wide takes the rows kernel at decode widths
 template <int NT>
 int rows_launch(const uint8_t *wq, const uint8_t *sf, const uint16_t *x_bf16, int out, int in, int rows, int n_split,
                 float *y, bool persistent, cudaStream_t stream);
@@ -894,6 +895,28 @@ extern "C" int pulsar_qwen_mxfp8_linear_launch(const pulsar_qwen_lowrank *l, con
         const dim3 grid((l->out + kMmaOut - 1) / kMmaOut, 1, (rows + kMmaTok - 1) / kMmaTok);
         qwen_w8a16_prefill_kernel<GR_PLAIN, kMmaNJ><<<grid, 128, 0, stream>>>((const uint8_t *)l->w, l->sf, (const __nv_bfloat16 *)x_bf16,
                                                                    l->out, l->in, rows, 1, y, gr_gate_args{});
+    } else if (l->out >= kRowsLinearOutMin && l->in % kHeadKStep == 0) {
+        /* L288: a wide Linear (the MTP fc, the PLE projections) takes the rows kernel at decode widths -- its weight
+         * read once for all <= 16 rows; the narrow ones (GDN in_proj_a / _b, 48 rows: 3 MMA tiles) keep the GEMV,
+         * whose split of each row over 32 lanes fills the GPU */
+        if ((((uintptr_t)l->w | (uintptr_t)x_bf16) & 15u) != 0) {
+            fprintf(stderr, "pulsar: qwen mxfp8 linear: %d -> %d needs 16-byte aligned weight and rows -- refusing\n",
+                    l->in, l->out);
+            return -1;
+        }
+        static int announced = 0;
+        if (!announced) {
+            announced = 1;
+            fprintf(stderr, "pulsar: L288 qwen mxfp8 linear at decode widths = the tensor-core rows kernel for >= %d "
+                            "outputs (first: %d -> %d), the GEMV below\n", kRowsLinearOutMin, l->in, l->out);
+        }
+        const int rc = rows > 8 ? rows_launch<2>((const uint8_t *)l->w, l->sf, x_bf16, l->out, l->in, rows, 1, y, true, stream)
+                                : rows_launch<1>((const uint8_t *)l->w, l->sf, x_bf16, l->out, l->in, rows, 1, y, true, stream);
+        if (rc) {
+            fprintf(stderr, "pulsar: qwen mxfp8 linear: %d -> %d at %d rows could not be launched -- refusing\n", l->in,
+                    l->out, rows);
+            return -1;
+        }
     } else {
         const int tb = gr_down_tokens_per_cta(l->in, 1);
         if (tb == 0) {

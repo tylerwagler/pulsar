@@ -932,10 +932,12 @@ static void section_mxfp8_linear(void) {
              * decode GEMV -- unchanged -- read 1.09e-03 on a new near-zero element.  The GEMV keeps a
              * 10x tighter bar than the prefill GEMM (measured 0.9-1.5e-08 vs 5.7-8.5e-08), since it
              * sums in f32 FMAs where the GEMM sums 16-k tensor-core fragments. */
-            const bool gemv = T <= 16;
+            /* L288: a decode-width Linear of >= 256 outputs is the tensor-core rows kernel (16-k fragments, the GEMM's bar) */
+            const bool gemv = T <= 16 && sh.out < 256;
             CHECK(worst_l1n < (gemv ? 1e-7 : 1e-6), "%d -> %d at T = %d (%s) vs the same quantized operands in double: "
                   "max |err|/sum|terms| %.2e (max rel %.2e at ref %.3e, sum|terms| %.3e; t=%d o=%d got %.6e)",
-                  sh.in, sh.out, T, gemv ? "decode GEMV" : "prefill GEMM", worst_l1n, worst, w_ref, w_l1, w_t, w_o, w_got);
+                  sh.in, sh.out, T, gemv ? "decode GEMV" : T <= 16 ? "decode rows kernel" : "prefill GEMM", worst_l1n,
+                  worst, w_ref, w_l1, w_t, w_o, w_got);
         }
         /* a missing activation is refused, not mis-read.  The old negative control was a slot
          * declaring the wrong kbp; with a bf16 activation there is no slot width to get wrong, so

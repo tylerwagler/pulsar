@@ -153,8 +153,9 @@ int pulsar_qwen_draft_top_launch(const float *rows, int n, int n_rows, void *ws,
 /** A plain MXFP8 dense Linear: y [rows][out] f32 = W x, W stored mxfp8_lt
  *  ([out][in] E4M3 then the swizzled E8M0 plane) and x the block input's bf16 row
  *  of width `l->in` -- there is no E4M3 activation slot in this family (L251 /
- *  ac69748f).  The same arithmetic the GR arm's W_down uses (split-K, one warp
- *  per output row, ordered); no workspace. */
+ *  ac69748f).  At decode widths (<= 16 rows) a Linear of >= 256 outputs takes the tensor-core rows kernel the
+ *  head uses (L288: the weight read once for all rows), a narrower one the GEMV (one warp per output row,
+ *  ordered); prompt widths the tensor-core GEMM.  No workspace. */
 int pulsar_qwen_mxfp8_linear_launch(const pulsar_qwen_lowrank *l, const uint16_t *x_bf16, int rows, float *y,
                                     void *ws, size_t ws_bytes, cudaStream_t stream);
 /** L288: the head (lm_head, the MTP draft head): y [rows][out] f32 = W x for an mxfp8_lt W and bf16 rows x, 1 .. 16
