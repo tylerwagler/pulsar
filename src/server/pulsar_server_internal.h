@@ -1872,8 +1872,9 @@ struct server {
      * live id has no safe prefix to reconstruct, so report a clear client error.
      */
     bool anthropic_validate_tool_results(const chat_msgs *msgs, bool *requires_live_tool_state, char *err, size_t errlen);
-    /** Append only the newly-rendered suffix onto the live session, leaving the
-     * committed prefix untouched. */
+    /** Append only the newly-rendered suffix (a family tail) onto the live session,
+     * joined where build_live_continuation_prompt joins one: before a trailing
+     * sampled stop row (L290), the rest of the committed prefix untouched. */
     bool append_rendered_suffix_to_live_session(session_slot *sl, const char *suffix,
                                                 const pulsar_text_span *spans, uint32_t n_spans,
                                                 int *tokens_appended, char *err, size_t errlen);
@@ -3102,6 +3103,16 @@ void build_prompt_from_exact_prefix_and_text_suffix(
         const pulsar_text_span *spans,
         uint32_t n_spans,
         pulsar_tokens *out);
+/** L290: the live history a family tail continues, joined to the tail's tokens: `live` without its last
+ *  row when that row is a sampled stop (`live_ends_at_stop`), then `tail`.  Every family's tail opens with
+ *  its template's turn close, which the full render writes after the sampled turn; whether the KV already
+ *  holds the stop is the decode lane's (kv_cache.cpp).  `out` is overwritten. */
+void join_live_history_and_tail(const pulsar_tokens *live, bool live_ends_at_stop, const pulsar_tokens *tail,
+                                pulsar_tokens *out);
+/** L290: the live session's tokens continued by a family tail's rendered text (join_live_history_and_tail
+ *  with the engine's stop set and the rendered-chat tokenizer); returns the tokens `out` shares with `live`. */
+int build_live_continuation_prompt(pulsar_engine *engine, const pulsar_tokens *live, const char *tail_text,
+                                   const pulsar_text_span *spans, uint32_t n_spans, pulsar_tokens *out);
 int kv_cache_sys_prefix_cut(const kv_disk_cache *kc, int anchor);
 int kv_cache_chat_anchor_pos(const kv_disk_cache *kc, const pulsar_tokens *prompt, const pulsar_turn_markers *m);
 /* Trivial-match classifier for the memory-token resolver (defined in

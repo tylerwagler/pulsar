@@ -10,6 +10,7 @@
 #include "pulsar_server_internal.h"
 #include "lib/pulsar_writeback.h"
 #include "lib/pulsar_segstore.h"
+#include "lib/qwen_tokenizer.h"
 
 #ifdef PULSAR_SERVER_TEST
 
@@ -3029,7 +3030,7 @@ static void qwen_test_call(chat_msg *m, const char *id, const char *name, const 
 
 /* Render `msgs` with the Qwen family and no engine (the text is the whole contract); `thinking_off`
  * sends enable_thinking=false.  The messages are TAKEN. */
-static char *qwen_test_full_render(chat_msgs *msgs, bool thinking_off) {
+static char *qwen_test_full_render(chat_msgs *msgs, bool thinking_off, std::vector<chat_text_span> *spans = NULL) {
     chat_conversation c = {};
     c.msgs = *msgs;
     memset(msgs, 0, sizeof(*msgs));
@@ -3043,6 +3044,7 @@ static char *qwen_test_full_render(chat_msgs *msgs, bool thinking_off) {
     if (!ok) fprintf(stderr, "qwen render refused: %s\n", err);
     TEST_ASSERT(ok);
     char *text = xstrdup(r.prompt_text);
+    if (spans) spans->assign(r.prompt_spans, r.prompt_spans + r.prompt_n_spans);
     request_free(&r);
     chat_conversation_free(&c);
     return text;
@@ -3481,6 +3483,189 @@ static void test_qwen_tool_error_suffix_reminds_the_system_turn(void) {
 }
 
 
+
+/* ---- L290: a turn's tokens never change after the next user message arrives ------------------------------ */
+
+/* The checkpoint's tokenizer, host-side (src/lib/qwen_tokenizer): PULSAR_TEST_QWEN_TOKENIZER names a directory
+ * with tokenizer.json and generation_config.json, by default the served Qwen checkpoint's.  A missing one fails
+ * the test by name. */
+static const qwen_tokenizer *qwen_test_tokenizer(void) {
+    static qwen_tokenizer *tok = NULL;
+    static bool tried = false;
+    if (tried) return tok;
+    tried = true;
+    const char *env = getenv("PULSAR_TEST_QWEN_TOKENIZER");
+    const std::string dir = env && env[0] ? env : "/mnt/models/qwen38fn-u-e4-d5-mtp";
+    std::string tj, gj;
+    const auto slurp = [](const std::string &path, std::string *out) {
+        FILE *f = fopen(path.c_str(), "rb");
+        if (!f) return false;
+        char b[65536];
+        size_t n;
+        while ((n = fread(b, 1, sizeof b, f)) > 0) out->append(b, n);
+        fclose(f);
+        return true;
+    };
+    char err[256] = "";
+    if (!slurp(dir + "/tokenizer.json", &tj) || !slurp(dir + "/generation_config.json", &gj))
+        snprintf(err, sizeof err, "no tokenizer.json + generation_config.json in %s", dir.c_str());
+    else
+        tok = qwen_tokenizer_load(tj.data(), tj.size(), gj.data(), gj.size(), err, sizeof err);
+    if (!tok) fprintf(stderr, "L290 tests: the Qwen tokenizer (PULSAR_TEST_QWEN_TOKENIZER): %s\n", err);
+    TEST_ASSERT(tok != NULL);
+    return tok;
+}
+
+static std::vector<int> qwen_test_encode(const qwen_tokenizer *tok, const char *text, const chat_text_span *spans,
+                                         size_t n_spans) {
+    std::vector<int> out;
+    char err[200] = "";
+    const bool ok = qwen_tokenizer_encode(tok, text, strlen(text), spans, (uint32_t)n_spans, &out, err, sizeof err);
+    if (!ok) fprintf(stderr, "qwen encode refused: %s\n", err);
+    TEST_ASSERT(ok);
+    return out;
+}
+
+/* One Anthropic body through the server's parse and the family's render, with no server state. */
+static char *anthropic_test_render(const char *body, pulsar_chat_format fmt, std::vector<chat_text_span> *spans) {
+    request r;
+    request_init(&r, REQ_CHAT, 256);
+    chat_conversation c = {};
+    char err[300] = "";
+    const bool ok = parse_chat_conversation_anthropic(body, &c, &r, err, sizeof err) &&
+                    render_chat_conversation(NULL, fmt, NULL, &c, &r, err, sizeof err);
+    if (!ok) fprintf(stderr, "anthropic render refused: %s\n", err);
+    TEST_ASSERT(ok);
+    char *text = ok ? xstrdup(r.prompt_text) : NULL;
+    if (ok && spans) spans->assign(r.prompt_spans, r.prompt_spans + r.prompt_n_spans);
+    chat_conversation_free(&c);
+    request_free(&r);
+    return text;
+}
+
+/* Claude Code's turn after a tool loop, the shape the 2026-10-12 trace caught (requests #4 -> #5): the next
+ * request moves the cache_control marker off the tool_use and appends an assistant [thinking, text] turn and a
+ * text-only user turn.  Every family renders the first request as a byte prefix of the second, and Qwen's
+ * tokens are a strict token prefix (DeepSeek's first render ends at its "<think>" marker, which its tokenizer
+ * cuts before any text, so the byte prefix is a token prefix there too). */
+static void test_anthropic_turn_render_is_stable_across_the_next_user_turn(void) {
+    const char *head =
+        "{\"model\":\"m\",\"max_tokens\":64,\"stream\":true,\"thinking\":{\"type\":\"enabled\",\"budget_tokens\":1024},"
+        "\"system\":\"Be terse.\",\"tools\":[{\"name\":\"bash\",\"description\":\"Run a command.\",\"input_schema\":"
+        "{\"type\":\"object\",\"properties\":{\"command\":{\"type\":\"string\"}},\"required\":[\"command\"]}}],"
+        "\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"List the files.\"}]},"
+        "{\"role\":\"assistant\",\"content\":[{\"type\":\"thinking\",\"thinking\":\"Use ls.\",\"signature\":\"sig1\"},"
+        "{\"type\":\"text\",\"text\":\"Listing.\"},{\"type\":\"tool_use\",\"id\":\"toolu_1\",\"name\":\"bash\","
+        "\"input\":{\"command\":\"ls\"}";
+    const char *result =
+        "}]},{\"role\":\"user\",\"content\":[{\"type\":\"tool_result\",\"tool_use_id\":\"toolu_1\","
+        "\"content\":\"a.txt\\nb.txt\"}]}";
+    const std::string before = std::string(head) + ",\"cache_control\":{\"type\":\"ephemeral\"}" + result + "]}";
+    const std::string after = std::string(head) + result +
+        ",{\"role\":\"assistant\",\"content\":[{\"type\":\"thinking\",\"thinking\":\"Two files.\",\"signature\":\"sig2\"},"
+        "{\"type\":\"text\",\"text\":\"Two files: a.txt and b.txt.\"}]},"
+        "{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"Recap what you did.\","
+        "\"cache_control\":{\"type\":\"ephemeral\"}}]}]}";
+    const pulsar_chat_format fmts[] = {PULSAR_CHAT_QWEN, PULSAR_CHAT_DS4_V41, PULSAR_CHAT_DS4_V4};
+    for (pulsar_chat_format fmt : fmts) {
+        std::vector<chat_text_span> sa, sb;
+        char *a = anthropic_test_render(before.c_str(), fmt, &sa);
+        char *b = anthropic_test_render(after.c_str(), fmt, &sb);
+        TEST_ASSERT(a && b && strlen(a) < strlen(b) && !strncmp(a, b, strlen(a)));
+        /* the old turn kept its reasoning: the official templates' defaults with tools (Qwen preserve_thinking,
+         * DeepSeek's tool context) */
+        TEST_ASSERT(b && strstr(b, "Use ls.") && strstr(b, "Two files."));
+        if (fmt == PULSAR_CHAT_QWEN && a && b) {
+            const qwen_tokenizer *tok = qwen_test_tokenizer();
+            if (tok) {
+                const std::vector<int> ta = qwen_test_encode(tok, a, sa.data(), sa.size());
+                const std::vector<int> tb = qwen_test_encode(tok, b, sb.data(), sb.size());
+                TEST_ASSERT(!ta.empty() && ta.size() < tb.size() && std::equal(ta.begin(), ta.end(), tb.begin()));
+            }
+        }
+        free(a);
+        free(b);
+    }
+}
+
+/* The live side of the same identity: a Qwen tool turn ends at the stop token, and whether the KV holds it is the
+ * decode lane's (a batched lane evaluates the token it emits; a speculative round's base stop is never
+ * evaluated).  The tool-result tail opens with the template's own "<|im_end|>\n", so it joins the history before
+ * any committed stop row: the continued bank is the full render's tokens with no stop, with <|im_end|> and with
+ * <|endoftext|> committed.  Joined after the stop (the pre-L290 join) the history doubled the close and the next
+ * full render diverged there. */
+static void test_live_tail_joins_before_a_committed_stop(void) {
+    const qwen_tokenizer *tok = qwen_test_tokenizer();
+    if (!tok) return;
+    chat_msgs prefix = {0};
+    chat_msgs_push(&prefix, qwen_test_msg("system", "Be terse."));
+    chat_msgs_push(&prefix, qwen_test_msg("user", "List the files."));
+    chat_msgs full = {0};
+    chat_msgs_push(&full, qwen_test_msg("system", "Be terse."));
+    chat_msgs_push(&full, qwen_test_msg("user", "List the files."));
+    chat_msg a = qwen_test_msg("assistant", "Listing.");
+    a.reasoning = xstrdup("Use ls.");
+    qwen_test_call(&a, "toolu_1", "bash", "{\"command\":\"ls\"}");
+    chat_msgs_push(&full, a);
+    chat_msgs_push(&full, qwen_test_msg("tool", "a.txt\nb.txt"));
+    full.v[3].tool_call_id = xstrdup("toolu_1");
+
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    r.api = API_ANTHROPIC;
+    r.family = server_family_for_format(PULSAR_CHAT_QWEN);
+    r.family_effort = QWEN_EFFORT_XHIGH;
+    r.think_mode = PULSAR_THINK_DEFAULT;
+    chat_text_span *turn_spans = NULL, *tail_spans = NULL;
+    uint32_t turn_n = 0, tail_n = 0;
+    char *turn = r.family->assistant_turn_sampled(&r, true, "Use ls.", "Listing.", &full.v[2].calls, &turn_spans,
+                                                  &turn_n);
+    char *tail = r.family->tool_result_tail(&r, &full, 3, &tail_spans, &tail_n);
+    std::vector<chat_text_span> prompt_spans, full_spans;
+    char *prompt = qwen_test_full_render(&prefix, false, &prompt_spans);
+    char *want_text = qwen_test_full_render(&full, false, &full_spans);
+    TEST_ASSERT(turn && tail && prompt && want_text);
+    if (turn && tail && prompt && want_text) {
+        /* the live history the turn left: its prompt and the sampled bytes, which end at the call */
+        const uint32_t at = (uint32_t)strlen(prompt);
+        const std::string live_text = std::string(prompt) + turn;
+        std::vector<chat_text_span> live_spans = prompt_spans;
+        for (uint32_t i = 0; i < turn_n; i++) live_spans.push_back({turn_spans[i].lo + at, turn_spans[i].hi + at});
+        const std::vector<int> sampled = qwen_test_encode(tok, live_text.c_str(), live_spans.data(), live_spans.size());
+        const std::vector<int> tail_toks = qwen_test_encode(tok, tail, tail_spans, tail_n);
+        const std::vector<int> want = qwen_test_encode(tok, want_text, full_spans.data(), full_spans.size());
+        const int im_end = qwen_tokenizer_added_id(tok, "<|im_end|>");
+        const int endoftext = qwen_tokenizer_added_id(tok, "<|endoftext|>");
+        TEST_ASSERT(im_end >= 0 && endoftext >= 0 && tail_toks.size() > 1 && tail_toks[0] == im_end);
+        const int stops[] = {-1, im_end, endoftext};
+        for (int stop : stops) {
+            pulsar_tokens live = {0}, tail_t = {0}, joined = {0};
+            for (int t : sampled) pulsar_tokens_push(&live, t);
+            if (stop >= 0) pulsar_tokens_push(&live, stop);
+            for (int t : tail_toks) pulsar_tokens_push(&tail_t, t);
+            join_live_history_and_tail(&live, stop >= 0, &tail_t, &joined);
+            TEST_ASSERT(joined.len == (int)want.size() && std::equal(want.begin(), want.end(), joined.v));
+            if (stop == im_end) {
+                /* the pre-L290 join: the history after the committed stop doubles the close */
+                pulsar_tokens doubled = {0};
+                join_live_history_and_tail(&live, false, &tail_t, &doubled);
+                TEST_ASSERT(doubled.len == (int)want.size() + 1 && doubled.v[sampled.size()] == im_end &&
+                            doubled.v[sampled.size() + 1] == im_end);
+                pulsar_tokens_free(&doubled);
+            }
+            pulsar_tokens_free(&live);
+            pulsar_tokens_free(&tail_t);
+            pulsar_tokens_free(&joined);
+        }
+    }
+    free(turn);
+    free(tail);
+    free(turn_spans);
+    free(tail_spans);
+    free(prompt);
+    free(want_text);
+    request_free(&r);
+}
 
 static void test_anthropic_full_replay_allows_unknown_live_id(void) {
     server s = {0};
@@ -8522,6 +8707,8 @@ static void pulsar_server_unit_tests_run(void) {
     test_tool_name_token_allowed();
     test_qwen_payload_is_sampled_structure_greedy();
     test_qwen_tool_error_suffix_reminds_the_system_turn();
+    test_anthropic_turn_render_is_stable_across_the_next_user_turn();
+    test_live_tail_joins_before_a_committed_stop();
     test_anthropic_tool_result_id_validation();
     test_anthropic_full_replay_allows_unknown_live_id();
     test_anthropic_tool_use_parses_before_role();

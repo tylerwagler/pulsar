@@ -330,6 +330,36 @@ void build_prompt_from_exact_prefix_and_text_suffix(
         engine, exact_prefix, suffix_text, spans, n_spans, out);
 }
 
+/* L290: where a family tail joins the live history.  Every family's tail (tool_result_tail, tool_error_suffix)
+ * opens with its template's turn close -- Qwen "<|im_end|>\n", DeepSeek EOS -- because the full render writes
+ * that close after the sampled turn (test_qwen_hooks_compose_to_the_full_render).  Whether the KV already holds
+ * the sampled stop is the decode lane's: the batched lanes evaluate the token they emit and a speculative round
+ * commits an accepted draft stop, while a round whose base token is the stop never evaluates it.  So the tail
+ * joins the history WITHOUT a trailing stop row, and the continued bank is the full render's tokens whichever
+ * lane sampled the turn.  Joined after a committed stop, a Qwen tool loop's history read
+ * "</tool_call><|im_end|><|im_end|>\n" -- a history no render spells -- and the next request that was not a
+ * tool-result continuation (a text-only user turn) resumed from the grid checkpoint before the first doubled
+ * close (a 6.4k-token re-prefill in the 2026-10-12 production trace).  A stop the tail re-spells (<|im_end|>)
+ * leaves the history untouched; any other stop row (<|endoftext|>) is rewound past by the sync. */
+void join_live_history_and_tail(const pulsar_tokens *live, bool live_ends_at_stop, const pulsar_tokens *tail,
+                                pulsar_tokens *out) {
+    tokens_copy_prefix(out, live, live->len - (live_ends_at_stop && live->len > 0 ? 1 : 0));
+    for (int i = 0; i < tail->len; i++) pulsar_tokens_push(out, tail->v[i]);
+}
+
+int build_live_continuation_prompt(pulsar_engine *engine, const pulsar_tokens *live, const char *tail_text,
+                                   const pulsar_text_span *spans, uint32_t n_spans, pulsar_tokens *out) {
+    pulsar_tokens tail = {};
+    /* the tail opens with chat markers: the rendered-chat tokenizer, its client ranges plain text (L223) */
+    pulsar_tokenize_rendered_chat_spans(engine, tail_text ? tail_text : "", spans, n_spans, &tail);
+    join_live_history_and_tail(live, live->len > 0 && pulsar_token_is_stop(engine, live->v[live->len - 1]), &tail,
+                               out);
+    pulsar_tokens_free(&tail);
+    int common = 0;
+    while (common < live->len && common < out->len && live->v[common] == out->v[common]) common++;
+    return common;
+}
+
 /* The stable rendered chat prefix is everything before the user message that
  * asks this specific task.  Some clients put stable user-role scaffolding
  * first, so the anchor is the last user marker before the first assistant. */
@@ -511,12 +541,12 @@ int server::responses_live_continuation_prompt(session_slot *sl,
     const pulsar_tokens *live_tokens = pulsar_session_tokens(s->sess);
     if (!live_tokens || live_tokens->len != live_pos) return 0;
 
-    build_prompt_from_exact_prefix_and_text_suffix(
+    const int common = build_live_continuation_prompt(
         s->engine, live_tokens, req->responses_live_suffix_text,
         req->responses_live_suffix_spans, req->responses_live_suffix_n_spans,
         effective_prompt);
     if (matched_ids) *matched_ids = req->responses_live_call_ids.len;
-    return live_tokens->len;
+    return common;
 }
 
 
@@ -542,12 +572,12 @@ int server::anthropic_live_continuation_prompt(session_slot *sl,
     const pulsar_tokens *live_tokens = pulsar_session_tokens(s->sess);
     if (!live_tokens || live_tokens->len != live_pos) return 0;
 
-    build_prompt_from_exact_prefix_and_text_suffix(
+    const int common = build_live_continuation_prompt(
         s->engine, live_tokens, req->anthropic_live_suffix_text,
         req->anthropic_live_suffix_spans, req->anthropic_live_suffix_n_spans,
         effective_prompt);
     if (matched_ids) *matched_ids = req->anthropic_live_call_ids.len;
-    return live_tokens->len;
+    return common;
 }
 
 

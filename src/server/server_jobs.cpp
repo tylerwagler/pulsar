@@ -50,7 +50,7 @@ bool server::append_rendered_suffix_to_live_session(session_slot *sl,
     }
 
     pulsar_tokens target = {0};
-    build_prompt_from_exact_prefix_and_text_suffix(s->engine, live, suffix, spans, n_spans, &target);
+    (void)build_live_continuation_prompt(s->engine, live, suffix, spans, n_spans, &target);
     const int before = pulsar_session_pos(s->sess);
     bool ok = pulsar_session_sync(s->sess, &target, err, errlen) == 0;
     if (ok && tokens_appended) {
