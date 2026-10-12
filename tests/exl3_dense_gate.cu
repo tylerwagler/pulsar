@@ -25,6 +25,9 @@
  *   4. mutations: one flipped trellis bit must move outputs, and a sign-flipped
  *      suh block must push the error far past the tolerance;
  *   5. refusals: K % 128, an uninstantiated rate, a short workspace, M = 0.
+ *   6. the multi launch (L288 exl3-dense): each output bit for bit its single launch.
+ *   7. the heads (L288 qwen-exl3-head): lm_head 2560 -> 248320 and the draft head 2560 -> 82304 at K = 3..5 --
+ *      M-independent rows, and windows cut from the head equal its columns bit for bit and grade vs double.
  *
  * usage: ./tests/exl3_dense_gate
  */
@@ -350,6 +353,80 @@ int main(void) {
         ds4_exl3_dense_proj five[5] = {};
         CHECK(ds4_exl3_dense_multi_launch(five, 5, (void *)16, 1, 2560, (void *)16, 1 << 20, 0) == -1, "five projections accepted");
         printf("  multi refusals: a short workspace, five projections -- refused\n");
+    }
+    /* 7. L288 qwen-exl3-head: the heads through this arm -- Qwen's lm_head 2560 -> 248320 (1940 128-output blocks,
+     * past the epilogue's former 1024 counters) and the MTP draft head 2560 -> 82304, at K = 3 / 4 / 5 (and the draft
+     * head at K = 3 / 4).  Too wide for the double reference over every output, so: (a) the head's rows at M = 1, 5,
+     * 9 are bit for bit its M = 16 rows; (b) three 2560-output windows (the first, one inside, the last) cut from the
+     * head's bytes (exl3_expert_cut) and run alone are bit for bit the head's columns -- the split count is K's alone
+     * at both widths -- and are graded against the double reference at the section-1 limit. */
+    {
+        struct head { int N, k2; const char *what; };
+        const head heads[] = {{248320, 6, "lm_head"}, {248320, 8, "lm_head"}, {248320, 10, "lm_head"},
+                              {82304, 6, "MTP draft head"}, {82304, 8, "MTP draft head"}};
+        const int K = 2560, W = 2560;
+        const slot s = make_slot(16, K);
+        for (const head &hd : heads) {
+            const int N = hd.N, k2 = hd.k2;
+            CHECK(ds4_exl3_dense_splits(K, N) == ds4_exl3_dense_splits(K, W), "%s: the window's split count is not the "
+                  "head's -- the window comparison below would not be bit-exact by construction", hd.what);
+            const weight w = make_weight(K, N, k2);
+            dev d;
+            upload(w, s, 16, d);
+            std::vector<float> y16, y;
+            int rc = run(d, k2, 16, K, N, y16);
+            CHECK(rc == 0, "%s 2560 -> %d K=%d: launch rc=%d", hd.what, N, k2 / 2, rc);
+            if (rc) { release(d); continue; }
+            size_t nonfinite = 0;
+            for (float v : y16) nonfinite += !std::isfinite(v);
+            CHECK(nonfinite == 0, "%s K=%d: %zu non-finite outputs (an unwritten NaN canary)", hd.what, k2 / 2, nonfinite);
+            size_t diff_m = 0;
+            for (int M : {1, 5, 9}) {
+                rc = run(d, k2, M, K, N, y);
+                CHECK(rc == 0, "%s K=%d M=%d: launch rc=%d", hd.what, k2 / 2, M, rc);
+                if (!rc) diff_m += memcmp(y.data(), y16.data(), y.size() * sizeof(float)) != 0;
+            }
+            CHECK(diff_m == 0, "%s K=%d: %zu of 3 widths (M=1,5,9) differ from the same rows at M=16", hd.what, k2 / 2, diff_m);
+            double wmx = 0, wmed = 0;
+            size_t wdiff = 0;
+            for (const int lo : {0, (N / 2 / 128) * 128, N - W}) {
+                exl3_cut c;
+                weight sub;
+                sub.K = K; sub.N = W; sub.k2 = k2;
+                if (!exl3_expert_cut(K, N, k2, false, lo, lo + W, 0, W, &c) ||
+                    !exl3_expert_layout(K, W, k2, &sub.trellis, &sub.scales, &sub.stride)) {
+                    CHECK(false, "%s K=%d: the window [%d, %d) does not cut", hd.what, k2 / 2, lo, lo + W);
+                    continue;
+                }
+                sub.bytes.resize(sub.stride);
+                exl3_expert_cut_apply(&c, w.bytes.data(), sub.bytes.data());
+                std::vector<double> what, yref;
+                exl3t_dequant(sub.bytes.data(), K, W, k2, what);
+                exl3t_reference(sub.bytes.data(), what, K, W, k2, s.x.data(), 16, yref);
+                dev ds;
+                upload(sub, s, 16, ds);
+                std::vector<float> ys;
+                rc = run(ds, k2, 16, K, W, ys);
+                CHECK(rc == 0, "%s K=%d window %d: launch rc=%d", hd.what, k2 / 2, lo, rc);
+                if (!rc) {
+                    double mx, med;
+                    grade(ys, yref, 16, W, 0, &mx, &med);
+                    wmx = fmax(wmx, mx);
+                    wmed = fmax(wmed, med);
+                    for (int r = 0; r < 16; r++)
+                        wdiff += memcmp(ys.data() + (size_t)r * W, y16.data() + (size_t)r * N + lo, (size_t)W * sizeof(float)) != 0;
+                }
+                release(ds);
+            }
+            CHECK(wmx < tol, "%s 2560 -> %d K=%d: a window's max rel %.3e (limit %.0e)", hd.what, N, k2 / 2, wmx, tol);
+            CHECK(wmed > 1e-10, "%s K=%d: window median rel %.3e -- a degenerate fixture, not a pass", hd.what, k2 / 2, wmed);
+            CHECK(wdiff == 0, "%s K=%d: %zu of 48 window rows differ from the head's columns", hd.what, k2 / 2, wdiff);
+            printf("  head %-15s 2560 -> %-6d K=%d splits %d (%d blocks): M=1,5,9 %s; 3 windows of %d cut from it == "
+                   "its columns %s, vs double max rel %.2e (median <= %.2e)\n", hd.what, N, k2 / 2,
+                   ds4_exl3_dense_splits(K, N), N / 128, diff_m ? "DIFFER" : "bit-identical to M=16's rows", W,
+                   wdiff ? "DIFFER" : "bit for bit", wmx, wmed);
+            release(d);
+        }
     }
     printf(g_fail ? "EXL3-DENSE GATE FAIL\n" : "EXL3-DENSE GATE PASS\n");
     return g_fail;

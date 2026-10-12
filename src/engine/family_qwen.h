@@ -242,7 +242,14 @@ typedef struct {
     pulsar_tensor *norm_hidden;    ///< mtp.pre_fc_norm_hidden.weight [n_hc * n_embd] (ONE RMS over all of it)
     pulsar_tensor *fc_embd;        ///< mtp.fc_embedding.weight [n_embd -> n_embd]
     pulsar_tensor *fc_hidden;      ///< mtp.fc_hidden.weight [n_embd -> n_embd], applied per stream
-    pulsar_qwen_gr_weights mixer;  ///< mtp.hyper_connection_mixer (no inject), then the trunk's lm_head
+    pulsar_qwen_gr_weights mixer;  ///< mtp.hyper_connection_mixer (no inject), then the draft head
+    /** L288 qwen-exl3-head: the drafter's OWN head, mtp.draft_head.weight [n_embd -> n_draft], when the artifact
+     *  carries one -- stored in whatever format the container gives it (a format the dense bf16-rows arm serves,
+     *  EXL3 in the built containers), its row i the logit of mtp.draft_head.ids[i] (I32 [n_draft]), which the load
+     *  checks against qwen_draft_vocab's ids.  NULL: the draft rows are gathered from a bf16 lm_head into MXFP8
+     *  (pulsar_qwen_weights::draft_head_mx).  Both or neither are present. */
+    pulsar_tensor *draft_head;
+    pulsar_tensor *draft_head_ids;   ///< mtp.draft_head.ids I32 [n_draft]: the ids of draft_head's rows, in order
 } pulsar_qwen_mtp_weights;
 
 typedef struct {
@@ -260,12 +267,14 @@ typedef struct {
     /** S4: the PLE row file (the container's pulsar.ple_rows.*), its pread pool
      * and the host gather in flight; opened by pulsar_qwen_s4_load. */
     struct pulsar_qwen_ple_io *ple_io;
-    /** L251: the lm_head as MXFP8 (mxfp8_lt), made on the device from `output` at the first head
-     *  step (the bf16 head is 1.27 GB read per decode row; this is half); freed at unload. */
+    /** L251: the lm_head as MXFP8 (mxfp8_lt), made on the device from a bf16 `output` at the first head
+     *  step (the bf16 head is 1.27 GB read per decode row; this is half); freed at unload.  L288
+     *  qwen-exl3-head: NULL when the container stores `output` in a format the dense arm reads itself. */
     struct pulsar_gpu_tensor *head_mx;
     /** L251 MTP: the DRAFT head -- the lm_head rows of draft_ids (ascending: [0, 65536), L288's
      *  frequency-ranked ids above it, and the added / special ids [eos_id, n_vocab), the stop tokens among
-     *  them; chosen at load by qwen_draft_vocab) gathered into one MXFP8 matrix, made at the first MTP head.
+     *  them; chosen at load by qwen_draft_vocab) gathered into one MXFP8 matrix, made at the first MTP head
+     *  when the artifact carries no mtp.draft_head of its own (else NULL; the ids are the same either way).
      *  The drafter's argmax runs over these; verification keeps the full head, so the output is unchanged
      *  and only the draft cost moves.  draft_ids[i] is row i's token id. */
     struct pulsar_gpu_tensor *draft_head_mx, *draft_ids_dev;
@@ -570,7 +579,8 @@ typedef struct {
      *  from row n_dec, one bank each.  n_runs 1 = the classic one-bank chunk, or a one-bank verify. */
     uint32_t n_runs;
     const uint32_t *run_first;
-    /** L251 MTP: the head runs the DRAFT head (pulsar_qwen_weights::draft_head_mx): n_draft logits a row. */
+    /** L251 MTP: the head runs the DRAFT head (the artifact's mtp.draft_head, or the gathered
+     *  pulsar_qwen_weights::draft_head_mx): n_draft logits a row. */
     bool draft_head;
     /** L284 #2: the row-kind boundary.  Rows [0, n_dec) take the decode arms (what decode / verify rows are
      *  graded against), rows [n_dec, n_rows) the prompt arms (the same bytes at every row count, L266).  The
