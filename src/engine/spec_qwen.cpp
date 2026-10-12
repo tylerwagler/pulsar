@@ -61,6 +61,28 @@ static bool qwen_verify_single(pulsar_session *s, pulsar_spec_round *r, pulsar_s
     return true;
 }
 
+/* The batched lane's round end (L288 qwen-graph): this round's rows [row0, row0 + n_batch) of the last verify, whose
+ * argmaxes that step reduced on the device (qwen_forward, pulsar_gpu_rows_argmax: the host rule) -- the walk's
+ * row_tops without a host scan of the rows; the block holds every row for the reads. */
+static bool qwen_verify_rows_tops(pulsar_session *s, pulsar_spec_round *r, const float *block, uint32_t row0,
+                                  pulsar_spec_rows *out, char *err, size_t errlen) {
+    const pulsar_qwen_state *q = s->qwen;
+    const uint32_t K = r->K < 16u ? r->K : 16u;
+    if ((uint64_t)row0 + K > q->verify_tops_n) {
+        snprintf(err, errlen, "%s: a round's rows %u + %u outside the last verify's %u argmaxes", PULSAR_QWEN_ARCH,
+                 row0, K, q->verify_tops_n);
+        return false;
+    }
+    for (uint32_t i = 0; i < K; i++) r->row_tops[i] = (int)q->verify_tops[row0 + i];
+    out->read = pulsar_spec_row_read_block;
+    out->ud = out;
+    out->compact = NULL;
+    out->block.rows = block;
+    out->block.row0 = row0;
+    out->block.vocab = g_qwen_shape.n_vocab;
+    return true;
+}
+
 /* The walk kept `commit` drafts: the installed bank's run of the last verify back to its last kept row
  * (rows 1 + commit .. of the run undone; the rollback finds the bank's run in the capture, wherever it sat
  * in the step -- row0), the bank's position counter there, the kept row's logits fresh. */
@@ -105,7 +127,7 @@ const pulsar_spec_target_ops k_qwen_spec_target = {
     /* .round_note    = */ NULL,   /* one logits readback: the block */
     /* .arm_verify    = */ NULL,   /* a heads-on-every-row decode_mixed IS the verify */
     /* .verify_single = */ qwen_verify_single,
-    /* .verify_rows   = */ NULL,   /* the block holds every row */
+    /* .verify_rows   = */ qwen_verify_rows_tops,   /* the block holds every row; the argmaxes are the device's */
     /* .commit        = */ qwen_spec_commit,
     /* .cut           = */ qwen_spec_cut,
     /* .readback      = */ NULL,   /* its batched steps read back full rows */

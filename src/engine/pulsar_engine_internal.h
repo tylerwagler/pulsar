@@ -506,6 +506,9 @@ void pulsar_engram_hash_pos(const pulsar_engram_layout *L, uint32_t layer,
  *  pool is the gather's queue depth: 16 left a Qwen verify's ~72 rows four to eight reads deep while the GPU
  *  waited at the PLE layer; 64 keeps a decode or verify gather one or two deep (qwen-perf, 2026-10-11). */
 #define PULSAR_ENGRAM_IO_THREADS 64u
+/** L288 qwen-graph: a gather this small (a decode or verify step's rows) copies its page-cache rows on the issuing
+ *  thread before the pool sees the rest (engram.cpp, the pread pool). */
+#define PULSAR_ENGRAM_INLINE_ROWS 256u
 
 /** One row-contiguous range of a table: rows [i * rows_per_part, ...) at `base`. */
 typedef struct {
@@ -543,15 +546,17 @@ int  pulsar_engram_table_open_parts(pulsar_engram_table *t, uint32_t layer, uint
 void pulsar_engram_table_close(pulsar_engram_table *t);
 pulsar_engram_io *pulsar_engram_io_create(uint32_t n_threads);
 void pulsar_engram_io_destroy(pulsar_engram_io *io);
-/** Issue: the pool starts reading immediately; returns NULL only on a bad argument. */
+/** Issue: a gather of at most PULSAR_ENGRAM_INLINE_ROWS rows copies the rows the page cache holds on the calling
+ *  thread first (L288 qwen-graph); the pool starts reading the rest immediately.  NULL only on a bad argument. */
 pulsar_engram_gather *pulsar_engram_gather_start(pulsar_engram_io *io, const pulsar_engram_table *t,
                                                  const uint64_t *rows, uint32_t n_rows,
                                                  unsigned char *dst);
 /** Block until the gather is complete; frees the handle.  1 = every row read. */
 int  pulsar_engram_gather_wait(pulsar_engram_gather *g);
-/** L289: warm the page cache with rows a gather will read soon (the pool reads them into its own buffer, and
- *  nothing waits on it): the later gather reads the same bytes, faster.  A hint -- it changes no bytes and a
- *  failed read is the later gather's to report. */
+/** L289: warm the page cache with rows a gather will read soon (L288 qwen-graph: posix_fadvise WILLNEED on the
+ *  calling thread -- the kernel reads them in the background, nothing waits on it): the later gather finds them
+ *  there and copies them on its issuing thread.  A hint -- it changes no bytes and a failed read is the later
+ *  gather's to report. */
 void pulsar_engram_prefetch(pulsar_engram_io *io, const pulsar_engram_table *t, const uint64_t *rows, uint32_t n_rows);
 
 /** ---- Engram on the DeepSeek forward (L242 slice 5; L269 W2) ------------------

@@ -25,6 +25,8 @@
  *   H. L289 draft pick: the device's first maximum and f32 softmax probability of a draft-head row
  *      (65812 logits) BIT-EXACT vs the host scan it replaced, over random rows, ties, an all-but-one
  *      -inf row and a narrow row; a NaN row is flagged; the record is the same bytes run to run.
+ *   J. L288 qwen-graph verify row argmaxes: pulsar_gpu_rows_argmax over 16 rows of the served vocabulary == the
+ *      host's sample_argmax on every row (random, ties, +-inf / NaN / signed zeros, no finite value, narrow).
  *
  * usage: ./tests/qwen_s4_gate */
 #include "../src/pulsar_gpu.h"
@@ -214,6 +216,95 @@ static void section_draft_top(void) {
     cudaFree(drow);
     cudaFree(ws);
 }
+/* J. L288 qwen-graph: the verify rows' argmaxes on the device (pulsar_gpu_rows_argmax) vs the host rule they
+ * replaced in the batched round end -- tokenizer.cpp's sample_argmax, verbatim below: a non-finite logit counts as
+ * -inf, the first index of the largest finite value, -1 when there is none. */
+static bool host_finite_bits(float v) {
+    uint32_t b;
+    memcpy(&b, &v, sizeof(b));
+    return (b & 0x7f800000u) != 0x7f800000u;
+}
+static int host_sample_argmax(const float *logits, uint32_t n_vocab) {
+    constexpr uint32_t BLOCK = 256u, LANES = 8u;
+    int best = -1;
+    float best_v = 0.0f;
+    for (uint32_t b0 = 0; b0 < n_vocab; b0 += BLOCK) {
+        const uint32_t b1 = n_vocab - b0 < BLOCK ? n_vocab : b0 + BLOCK;
+        float acc[LANES];
+        for (uint32_t k = 0; k < LANES; k++) acc[k] = -INFINITY;
+        uint32_t i = b0;
+        for (; i + LANES <= b1; i += LANES)
+            for (uint32_t k = 0; k < LANES; k++) {
+                const float v = logits[i + k];
+                const float f = host_finite_bits(v) ? v : -INFINITY;
+                acc[k] = f > acc[k] ? f : acc[k];
+            }
+        for (; i < b1; i++) {
+            const float v = logits[i];
+            const float f = host_finite_bits(v) ? v : -INFINITY;
+            acc[0] = f > acc[0] ? f : acc[0];
+        }
+        float m = acc[0];
+        for (uint32_t k = 1; k < LANES; k++) m = acc[k] > m ? acc[k] : m;
+        if (m == -INFINITY || (best >= 0 && !(m > best_v))) continue;
+        for (uint32_t j = b0; j < b1; j++)
+            if (logits[j] == m) { best = (int)j; best_v = m; break; }
+    }
+    return best;
+}
+
+static void section_rows_argmax(void) {
+    printf("J. verify row argmaxes (L288 qwen-graph): pulsar_gpu_rows_argmax vs the host's sample_argmax\n");
+    const uint32_t N = 248320, R = 16;   /* the served vocabulary, the widest verify */
+    std::vector<float> rows((size_t)N * R);
+    float *d = (float *)dalloc(rows.size() * 4);
+    int32_t *o = (int32_t *)dalloc(R * 4);
+    int bad = 0, graded = 0;
+    auto grade = [&](uint32_t n, uint32_t nr) {
+        CK(cudaMemcpy(d, rows.data(), (size_t)n * nr * 4, cudaMemcpyHostToDevice));
+        const int rc = pulsar_gpu_rows_argmax(d, n, nr, o);
+        std::vector<int32_t> got = down(o, nr);
+        for (uint32_t r = 0; r < nr; r++) {
+            graded++;
+            bad += rc != 1 || got[r] != host_sample_argmax(rows.data() + (size_t)r * n, n);
+        }
+    };
+    for (int rep = 0; rep < 20; rep++) {   /* logits-like rows, a few strong candidates */
+        for (uint32_t r = 0; r < R; r++) {
+            const double sc = 1.0 + 6.0 * rndu();
+            float *row = rows.data() + (size_t)r * N;
+            for (uint32_t i = 0; i < N; i++) row[i] = (float)(sc * rndn());
+            for (int k = 0; k < 1 + (int)(rnd() % 4); k++) row[rnd() % N] = (float)(sc * (3.0 + 4.0 * rndu()));
+        }
+        grade(N, R);
+    }
+    for (uint32_t r = 0; r < R; r++) {     /* ties (lowest index), non-finite values around the maximum */
+        float *row = rows.data() + (size_t)r * N;
+        for (uint32_t i = 0; i < N; i++) row[i] = (float)rndn();
+        for (uint32_t k = 0; k < 1 + r % 7; k++) row[rnd() % N] = 9.5f;
+        if (r % 4 == 1) row[rnd() % N] = INFINITY;
+        if (r % 4 == 2) row[rnd() % N] = NAN;
+        if (r % 4 == 3) { row[rnd() % N] = -INFINITY; row[7] = 0.0f; row[3] = -0.0f; }
+    }
+    grade(N, R);
+    {                                      /* no finite value: -1; one finite value among -inf / NaN */
+        for (uint32_t i = 0; i < N; i++) rows[i] = (i & 1) ? NAN : INFINITY;
+        float *r1 = rows.data() + N;
+        for (uint32_t i = 0; i < N; i++) r1[i] = -INFINITY;
+        r1[N - 3] = -1e30f;
+        grade(N, 2);
+        CHECK(host_sample_argmax(rows.data(), N) == -1, "a row with no finite logit is -1 on the host (and graded)");
+    }
+    for (uint32_t i = 0; i < 37; i++) rows[i] = (float)rndn();   /* a narrow row */
+    grade(37, 1);
+    CHECK(bad == 0, "%d rows: %d argmaxes differ from the host rule", graded, bad);
+    CHECK(pulsar_gpu_rows_argmax(nullptr, N, 1, o) == 0 && pulsar_gpu_rows_argmax(d, 0, 1, o) == 0 &&
+              pulsar_gpu_rows_argmax(d, N, 0, o) == 0 && pulsar_gpu_rows_argmax(d, N, 1, nullptr) == 0,
+          "no rows / no logits / a null pointer is refused");
+    cudaFree(d);
+    cudaFree(o);
+}
+
 static void section_router(void) {
     printf("A. router (bf16 logits, softmax top-%d of %d, renormalised)\n", TOPK, E);
     const int T = 37;
@@ -864,6 +955,7 @@ int main(void) {
     section_mxfp8_linear();
     section_head();
     section_draft_top();
+    section_rows_argmax();
     printf(g_fail ? "QWEN-S4 GATE FAIL\n" : "QWEN-S4 GATE PASS\n");
     return g_fail;
 }

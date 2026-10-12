@@ -221,6 +221,9 @@ int pulsar_gpu_tensor_read(const pulsar_gpu_tensor *tensor, uint64_t offset, voi
 /** Copy `bytes` from a raw DEVICE pointer (a slice of a scratch tensor a kernel wrote) to the host, after the
  *  work queued before it -- the importance-matrix collection's observation (L284 P15).  1 on success. */
 int pulsar_gpu_device_read(const void *device, void *host, uint64_t bytes);
+/** L288 qwen-graph: device -> host enqueued on the calling thread's stream, not waited for -- `host` must be pinned
+ *  (pulsar_gpu_host_alloc); it holds the bytes once a later synchronous read or drain on that stream returns. */
+int pulsar_gpu_device_read_async(const void *device, void *host, uint64_t bytes);
 int pulsar_gpu_tensor_copy(pulsar_gpu_tensor *dst, uint64_t dst_offset,
                           const pulsar_gpu_tensor *src, uint64_t src_offset,
                           uint64_t bytes);
@@ -665,6 +668,10 @@ int pulsar_gpu_candidate_blocks_tensor(pulsar_gpu_tensor *mask, pulsar_gpu_tenso
 int pulsar_gpu_candidate_mask_scores_tensor(pulsar_gpu_tensor *scores, const pulsar_gpu_tensor *mask,
                                             uint32_t n_comp, uint32_t n_rows, uint32_t mask_words, uint32_t block_size);
 
+/** L288 qwen-graph: the argmax of each of n_rows rows of n F32 logits (row-major) into out[n_rows] -- the host
+ * rule sample_argmax exactly (non-finite counts as -inf, the first index of the largest finite value, -1 for a row
+ * with none).  Enqueued; 1 = launched. */
+int pulsar_gpu_rows_argmax(const float *rows, uint32_t n, uint32_t n_rows, int32_t *out);
 /** GPU argmax over n_vocab F32 logits. Writes the winning index as int32 at
  * out_idx[0]. Tie-break: lower index wins (matches host sample_argmax). */
 int pulsar_gpu_argmax_tensor(

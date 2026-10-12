@@ -45,6 +45,51 @@ __global__ static void argmax_kernel(int32_t *out_idx, const float *logits, uint
 }
 
 
+/* L288 qwen-graph: the batched round end's argmax of every verify row, on the device -- the host rule
+ * (sample_argmax, tokenizer.cpp) exactly: a non-finite logit counts as -inf, the FIRST index of the largest
+ * finite value wins, -1 when the row has no finite value.  One CTA a row; max is order-free and ties go to the
+ * lower index at every level, so the index is the host's whatever the reduction order. */
+__device__ static inline bool rows_argmax_takes(float v, int32_t i, float bv, int32_t bi) {
+    return bi < 0 || v > bv || (v == bv && i < bi);
+}
+
+__global__ static void __launch_bounds__(1024) rows_argmax_kernel(const float *rows, uint32_t n, int32_t *out) {
+    __shared__ float sv[32];
+    __shared__ int32_t si[32];
+    const float *row = rows + (uint64_t)blockIdx.x * n;
+    float bv = -INFINITY;
+    int32_t bi = -1;   /* no finite value seen */
+    for (uint32_t i = threadIdx.x; i < n; i += blockDim.x) {
+        const float v = row[i];
+        const bool finite = (__float_as_uint(v) & 0x7f800000u) != 0x7f800000u;   /* the host rule's bit test */
+        if (finite && rows_argmax_takes(v, (int32_t)i, bv, bi)) { bv = v; bi = (int32_t)i; }
+    }
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) {
+        const float ov = __shfl_xor_sync(0xffffffffu, bv, o);
+        const int32_t oi = __shfl_xor_sync(0xffffffffu, bi, o);
+        if (oi >= 0 && rows_argmax_takes(ov, oi, bv, bi)) { bv = ov; bi = oi; }
+    }
+    const int warp = threadIdx.x >> 5;
+    if ((threadIdx.x & 31) == 0) { sv[warp] = bv; si[warp] = bi; }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        for (int w = 1; w < (int)(blockDim.x >> 5); ++w)
+            if (si[w] >= 0 && rows_argmax_takes(sv[w], si[w], bv, bi)) { bv = sv[w]; bi = si[w]; }
+        out[blockIdx.x] = bi;
+    }
+}
+
+int pulsar_gpu_rows_argmax(const float *rows, uint32_t n, uint32_t n_rows, int32_t *out) {
+    if (!rows || !out || n == 0 || n_rows == 0) {
+        fprintf(stderr, "pulsar: rows argmax: no rows, no logits or a null pointer -- refusing\n");
+        return 0;
+    }
+    rows_argmax_kernel<<<n_rows, 1024>>>(rows, n, out);
+    return cuda_ok(cudaGetLastError(), "rows argmax launch");
+}
+
+
 __global__ static void indexer_topk_kernel(uint32_t *selected, const float *scores, uint32_t n_comp, uint32_t n_tokens, uint32_t top_k) {
     uint32_t t = blockIdx.x;
     if (t >= n_tokens || threadIdx.x != 0) return;

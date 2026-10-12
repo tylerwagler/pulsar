@@ -1552,6 +1552,11 @@ int pulsar_gpu_device_read(const void *device, void *host, uint64_t bytes) {
     return cuda_ok(cudaMemcpy(host, device, (size_t)bytes, cudaMemcpyDeviceToHost), "device read");
 }
 
+int pulsar_gpu_device_read_async(const void *device, void *host, uint64_t bytes) {
+    if (!device || !host) return 0;
+    return cuda_ok(cudaMemcpyAsync(host, device, (size_t)bytes, cudaMemcpyDeviceToHost), "device read (async)");
+}
+
 
 
 

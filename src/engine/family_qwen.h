@@ -454,6 +454,12 @@ typedef struct pulsar_qwen_state {
     bool *mtp_stage_dirty;
     pulsar_gpu_tensor *run_first_dev;   ///< L272 P1 S4: [SPEC_ROWS + 1] i32, a multi-run step's run offsets (GDN)
     float *spec_logits;             ///< host [SPEC_ROWS][n_vocab]: a round's verify / draft rows (mtp only)
+    /** L288 qwen-graph: the last verify step's row argmaxes (pulsar_gpu_rows_argmax, the host rule): [SPEC_ROWS]
+     *  i32 on the device and its pinned host copy, read back behind the step's logits; verify_tops_n = that step's
+     *  verify rows, 0 after any other trunk step (mtp only). */
+    pulsar_gpu_tensor *verify_top;
+    int32_t *verify_tops;
+    uint32_t verify_tops_n;
     /* host-side sequence state */
     int32_t *ngram_ctx;     ///< [n_banks][ngram_size - 1] last token ids per bank (PLE hashing; reset at EOS)
     uint32_t *bank_pos;     ///< [n_banks] tokens each bank's state holds (written by qwen_bank_set_pos)

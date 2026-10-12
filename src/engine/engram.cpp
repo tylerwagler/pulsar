@@ -23,6 +23,7 @@
 #include <fcntl.h>
 #include <pthread.h>
 #include <sys/stat.h>
+#include <sys/uio.h>
 #include <unistd.h>
 
 void pulsar_engram_hash_pos(const pulsar_engram_layout *L, uint32_t layer,
@@ -181,7 +182,7 @@ void pulsar_engram_table_close(pulsar_engram_table *t) {
 
 /* ---- the pread pool ----------------------------------------------------------
  *
- * A gather is split into slices of consecutive row ids; workers take slices off
+ * A gather is split into slices of consecutive row ids; readers take slices off
  * one queue and pread each row of a slice into its place in the destination.
  * A slice is at most PULSAR_ENGRAM_IO_SLICE rows (a 98k-row prefill gather keeps
  * every thread busy without contending on the lock) and at least one, sized so a
@@ -189,7 +190,18 @@ void pulsar_engram_table_close(pulsar_engram_table *t) {
  * a 16-row Qwen decode gather in slices of 4 kept 4 of 16 threads busy, four reads
  * deep -- 1.2 ms the GPU sat idle at the PLE layer of every decode step (nsys,
  * qwen-perf 2026-10-11).  Failures are counted on the gather and reported once at
- * wait. */
+ * wait.
+ *
+ * L288 qwen-graph: the pool is for COLD rows.  A gather of at most
+ * PULSAR_ENGRAM_INLINE_ROWS rows first copies every row the page cache already
+ * holds on the issuing thread (preadv2 RWF_NOWAIT: a few us a row, never a disk
+ * wait) and queues only the rest; a prefetch is a page-cache hint on the calling
+ * thread (posix_fadvise WILLNEED), not a pool gather.  Every row a decode / verify
+ * step gathered went through the pool before, and its lock convoyed (nsys, td305:
+ * a reader's lock 454 us median against its 3 us page-cache pread; the waiter
+ * blocked up to 10 ms): the verify's PLE wait was 1.7 ms median for 80 rows its
+ * prefetch had already warmed, and at 4 streams the drafting host blocked 1.4 ms a
+ * round queueing prefetches.  Who reads a row, and when, changes no byte of it. */
 #define PULSAR_ENGRAM_IO_SLICE 4u
 
 struct pulsar_engram_gather {
@@ -197,14 +209,15 @@ struct pulsar_engram_gather {
     const pulsar_engram_table *table;
     const uint64_t *rows;
     uint32_t n_rows;
-    uint32_t slice;         ///< rows a worker takes at once (1 .. PULSAR_ENGRAM_IO_SLICE)
+    uint32_t *take;         ///< the rows the pool reads (indices into rows / dst), owned; NULL = all, in order
+    uint32_t n_take;        ///< entries of take (n_rows when take is NULL)
+    uint32_t slice;         ///< take entries a reader takes at once (1 .. PULSAR_ENGRAM_IO_SLICE)
     unsigned char *dst;
-    uint32_t next;          ///< next row index a worker takes (under the pool lock)
-    uint32_t done;          ///< rows finished (ok or failed)
+    uint32_t next;          ///< next take entry a reader takes (under the pool lock)
+    uint32_t done;          ///< rows finished (ok or failed), the issuer's own included
     uint32_t failed;        ///< rows whose read failed
     uint64_t first_bad;     ///< the first failing row id, for the message
     int      first_errno;
-    int      detached;      ///< a prefetch (L289): nobody waits; the worker finishing its last row frees it
     pulsar_engram_gather *q_next;
 };
 
@@ -218,6 +231,28 @@ struct pulsar_engram_io {
     int stopping;
 };
 
+/* Row i of g into its place in dst: 0 = read, else the errno (EAGAIN with `nowait`: not all of it is in the page
+ * cache). */
+static int engram_read_row(const pulsar_engram_gather *g, uint32_t i, bool nowait) {
+    const uint64_t r = g->rows[i];
+    const pulsar_engram_table *tb = g->table;
+    const uint32_t rb = tb->row_bytes;
+    unsigned char *d = g->dst + (uint64_t)i * rb;
+    if (r >= tb->n_rows) return EINVAL;
+    const pulsar_engram_part *pt = &tb->parts[r / tb->rows_per_part];
+    const off_t off = (off_t)(pt->base + (r % tb->rows_per_part) * rb);
+    size_t got = 0;
+    while (got < rb) {
+        struct iovec v = {d + got, rb - got};
+        const ssize_t n = preadv2(pt->fd, &v, 1, off + (off_t)got, nowait ? RWF_NOWAIT : 0);
+        if (n < 0 && errno == EINTR) continue;
+        if (n < 0) return errno;
+        if (n == 0) return nowait ? EAGAIN : EIO;   /* the file ends inside the row */
+        got += (size_t)n;
+    }
+    return 0;
+}
+
 static void *engram_io_worker(void *arg) {
     pulsar_engram_io *io = (pulsar_engram_io *)arg;
     for (;;) {
@@ -225,45 +260,28 @@ static void *engram_io_worker(void *arg) {
         while (!io->head && !io->stopping) pthread_cond_wait(&io->work, &io->lock);
         if (io->stopping && !io->head) { pthread_mutex_unlock(&io->lock); return NULL; }
         pulsar_engram_gather *g = io->head;
-        const uint32_t i0 = g->next;
-        const uint32_t i1 = i0 + g->slice < g->n_rows ? i0 + g->slice : g->n_rows;
-        g->next = i1;
-        if (g->next >= g->n_rows) {   /* nothing left to take: drop it from the take-queue */
+        const uint32_t j0 = g->next;
+        const uint32_t j1 = j0 + g->slice < g->n_take ? j0 + g->slice : g->n_take;
+        g->next = j1;
+        if (g->next >= g->n_take) {   /* nothing left to take: drop it from the take-queue */
             io->head = g->q_next;
             if (!io->head) io->tail = NULL;
         }
-        /* a prefetch wakes one reader (L289); each reader wakes the next while slices remain */
-        if (io->head) pthread_cond_signal(&io->work);
         pthread_mutex_unlock(&io->lock);
 
-        uint32_t failed = 0, first_errno = 0;
+        uint32_t failed = 0;
+        int first_errno = 0;
         uint64_t first_bad = 0;
-        for (uint32_t i = i0; i < i1; i++) {
-            const uint64_t r = g->rows[i];
-            const pulsar_engram_table *tb = g->table;
-            const uint32_t rb = tb->row_bytes;
-            unsigned char *d = g->dst + (uint64_t)i * rb;
-            int ok = r < tb->n_rows;
-            if (ok) {
-                const pulsar_engram_part *pt = &tb->parts[r / tb->rows_per_part];
-                const off_t off = (off_t)(pt->base + (r % tb->rows_per_part) * rb);
-                size_t got = 0;
-                while (ok && got < rb) {
-                    const ssize_t n = pread(pt->fd, d + got, rb - got, off + (off_t)got);
-                    if (n <= 0) { if (n < 0 && errno == EINTR) continue; ok = 0; break; }
-                    got += (size_t)n;
-                }
-            }
-            if (!ok) { if (!failed) { first_bad = r; first_errno = errno; } failed++; }
+        for (uint32_t j = j0; j < j1; j++) {
+            const uint32_t i = g->take ? g->take[j] : j;
+            const int err = engram_read_row(g, i, false);
+            if (err) { if (!failed) { first_bad = g->rows[i]; first_errno = err; } failed++; }
         }
         pthread_mutex_lock(&io->lock);
-        g->done += i1 - i0;
-        if (failed) { if (!g->failed) { g->first_bad = first_bad; g->first_errno = (int)first_errno; } g->failed += failed; }
-        /* a prefetch is out of the take-queue once its last slice is taken, so its last finisher is its last user */
-        const bool reap = g->detached && g->done >= g->n_rows;
-        if (!g->detached) pthread_cond_broadcast(&io->idle);
+        g->done += j1 - j0;
+        if (failed) { if (!g->failed) { g->first_bad = first_bad; g->first_errno = first_errno; } g->failed += failed; }
+        pthread_cond_broadcast(&io->idle);
         pthread_mutex_unlock(&io->lock);
-        if (reap) { free(g->dst); free((void *)g->rows); free(g); }
     }
 }
 
@@ -300,58 +318,68 @@ void pulsar_engram_io_destroy(pulsar_engram_io *io) {
     free(io);
 }
 
-static pulsar_engram_gather *engram_gather_issue(pulsar_engram_io *io, const pulsar_engram_table *t,
-                                                 const uint64_t *rows, uint32_t n_rows, unsigned char *dst,
-                                                 int detached) {
+pulsar_engram_gather *pulsar_engram_gather_start(pulsar_engram_io *io, const pulsar_engram_table *t,
+                                                 const uint64_t *rows, uint32_t n_rows,
+                                                 unsigned char *dst) {
     if (!io || !t || !t->parts || !rows || !dst || n_rows == 0) return NULL;
     pulsar_engram_gather *g = (pulsar_engram_gather *)xcalloc(1, sizeof *g);
-    g->detached = detached;
     g->io = io;
     g->table = t;
     g->rows = rows;
     g->n_rows = n_rows;
-    const uint32_t even = n_rows / io->n_threads;   /* the pool's share of the gather */
-    g->slice = even < 1u ? 1u : even > PULSAR_ENGRAM_IO_SLICE ? PULSAR_ENGRAM_IO_SLICE : even;
     g->dst = dst;
+    g->n_take = n_rows;
+    if (n_rows <= PULSAR_ENGRAM_INLINE_ROWS) {
+        /* the page cache's rows here and now; the pool reads the rest */
+        g->take = (uint32_t *)xmalloc((size_t)n_rows * sizeof(uint32_t));
+        g->n_take = 0;
+        for (uint32_t i = 0; i < n_rows; i++)
+            if (engram_read_row(g, i, true) != 0) g->take[g->n_take++] = i;
+        g->done = n_rows - g->n_take;
+        if (g->n_take == 0) return g;
+    }
+    const uint32_t even = g->n_take / io->n_threads;   /* the pool's share of the gather */
+    g->slice = even < 1u ? 1u : even > PULSAR_ENGRAM_IO_SLICE ? PULSAR_ENGRAM_IO_SLICE : even;
     pthread_mutex_lock(&io->lock);
     if (io->tail) io->tail->q_next = g; else io->head = g;
     io->tail = g;
-    /* a gather someone waits on wakes the whole pool now; a prefetch (L289) runs off the critical path, so its
-     * issuer -- the draft chain, between MTP steps -- pays one wake and the readers wake each other */
-    if (detached) pthread_cond_signal(&io->work);
-    else pthread_cond_broadcast(&io->work);
+    /* as many readers as the gather has slices (a decode step's few cold rows wake a few, not the pool) */
+    const uint32_t n_slices = (g->n_take + g->slice - 1u) / g->slice;
+    if (n_slices >= io->n_threads) pthread_cond_broadcast(&io->work);
+    else for (uint32_t k = 0; k < n_slices; k++) pthread_cond_signal(&io->work);
     pthread_mutex_unlock(&io->lock);
     return g;
 }
 
-pulsar_engram_gather *pulsar_engram_gather_start(pulsar_engram_io *io, const pulsar_engram_table *t,
-                                                 const uint64_t *rows, uint32_t n_rows,
-                                                 unsigned char *dst) {
-    return engram_gather_issue(io, t, rows, n_rows, dst, 0);
-}
-
 void pulsar_engram_prefetch(pulsar_engram_io *io, const pulsar_engram_table *t, const uint64_t *rows, uint32_t n_rows) {
-    if (!io || !t || !t->parts || !rows || n_rows == 0) return;
-    uint64_t *ids = (uint64_t *)xmalloc((size_t)n_rows * sizeof(uint64_t));
-    memcpy(ids, rows, (size_t)n_rows * sizeof(uint64_t));
-    unsigned char *dst = (unsigned char *)xmalloc((size_t)n_rows * t->row_bytes);
-    (void)engram_gather_issue(io, t, ids, n_rows, dst, 1);   /* the pool owns ids and dst now */
+    if (!io || !t || !t->parts || !rows) return;
+    for (uint32_t k = 0; k < n_rows; k++) {
+        const uint64_t r = rows[k];
+        if (r >= t->n_rows) continue;   /* the gather that reads it reports it */
+        const pulsar_engram_part *pt = &t->parts[r / t->rows_per_part];
+        (void)posix_fadvise(pt->fd, (off_t)(pt->base + (r % t->rows_per_part) * t->row_bytes), (off_t)t->row_bytes,
+                            POSIX_FADV_WILLNEED);
+    }
 }
 
-/* Blocks until every row is accounted for.  A worker adds its slice to `done`
+/* Blocks until every row is accounted for.  A reader adds its slice to `done`
  * only after its last touch of the handle, so once done == n_rows no thread
- * holds it and it can be freed here. */
+ * holds it and it can be freed here; a gather the issuer read whole never
+ * entered the pool. */
 int pulsar_engram_gather_wait(pulsar_engram_gather *g) {
     if (!g) return 0;
     pulsar_engram_io *io = g->io;
-    pthread_mutex_lock(&io->lock);
-    while (g->done < g->n_rows) pthread_cond_wait(&io->idle, &io->lock);
-    pthread_mutex_unlock(&io->lock);
+    if (g->n_take > 0) {
+        pthread_mutex_lock(&io->lock);
+        while (g->done < g->n_rows) pthread_cond_wait(&io->idle, &io->lock);
+        pthread_mutex_unlock(&io->lock);
+    }
     const int ok = g->failed == 0;
     if (!ok)
         fprintf(stderr, "pulsar: engram gather from %s: %u of %u rows failed (first: row %llu, %s)\n",
                 g->table->path, g->failed, g->n_rows, (unsigned long long)g->first_bad,
                 g->first_errno ? strerror(g->first_errno) : "row id past the table");
+    free(g->take);
     free(g);
     return ok;
 }

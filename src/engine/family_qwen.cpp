@@ -860,6 +860,8 @@ static void qwen_state_free(pulsar_qwen_state *st) {
     pulsar_gpu_tensor_free(st->mtp_pend);
     free(st->mtp_pend_pos);
     free(st->spec_logits);
+    pulsar_gpu_tensor_free(st->verify_top);
+    pulsar_gpu_host_free(st->verify_tops);
     pulsar_gpu_tensor_free(st->spec.gdn_upd);
     pulsar_gpu_tensor_free(st->spec.gdn_conv);
     pulsar_gpu_tensor_free(st->spec.ple);
@@ -939,7 +941,10 @@ static pulsar_qwen_state *qwen_state_alloc(const pulsar_qwen_shape *s, const pul
         st->mtp_ws      = pulsar_gpu_tensor_alloc(pulsar_qwen_s4_mtp_combine_ws_bytes());
         st->mtp_top     = pulsar_gpu_tensor_alloc(pulsar_qwen_s4_draft_top_ws_bytes());
         st->mtp_pend    = pulsar_gpu_tensor_alloc(nb * hc);
-        ok = st->mtp_streams && st->mtp_h && st->mtp_tok && st->mtp_ws && st->mtp_top && st->mtp_pend;
+        st->verify_top  = pulsar_gpu_tensor_alloc(PULSAR_QWEN_SPEC_ROWS * sizeof(int32_t));
+        st->verify_tops = (int32_t *)pulsar_gpu_host_alloc(PULSAR_QWEN_SPEC_ROWS * sizeof(int32_t));
+        ok = st->mtp_streams && st->mtp_h && st->mtp_tok && st->mtp_ws && st->mtp_top && st->mtp_pend &&
+             st->verify_top && st->verify_tops;
     }
     st->mtp_pend_pos = (uint32_t *)xmalloc(n_banks * sizeof(uint32_t));
     for (uint32_t b = 0; b < n_banks; b++) st->mtp_pend_pos[b] = UINT32_MAX;
@@ -1164,6 +1169,7 @@ bool qwen_forward(pulsar_session *s, pulsar_qwen_step_mode mode, const int32_t *
                   const qwen_heads &heads, float *logits_out, uint32_t n_verify) {
     pulsar_engine *e = s->engine;
     const pulsar_qwen_ops *ops = &g_qwen_ops;
+    s->qwen->verify_tops_n = 0;   /* any trunk step ends the last verify's argmaxes; a verify sets its own */
     uint32_t at = 0;
     const pulsar_qwen_op_id miss = pulsar_qwen_first_missing_op(ops, &e->plan, &g_qwen_shape, &at);
     if (miss != PULSAR_QWEN_OP_COUNT) {
@@ -1298,6 +1304,15 @@ bool qwen_forward(pulsar_session *s, pulsar_qwen_step_mode mode, const int32_t *
                         heads.row[j] < st.n_dec; j++) {}
         ok = ops->head(&st, heads.row[i], j - i, i);
     }
+    /* L288 qwen-graph: a verify's row argmaxes on the device (the walk's row_tops, k_qwen_spec_target.verify_rows),
+     * read back behind the logits -- the host scanned every verify row's 248k logits for them */
+    if (ok && st.verify) {
+        pulsar_qwen_state *q = s->qwen;
+        ok = pulsar_gpu_rows_argmax((const float *)pulsar_gpu_tensor_device_ptr(q->logits), g_qwen_shape.n_vocab,
+                                    n_verify, (int32_t *)pulsar_gpu_tensor_device_ptr(q->verify_top)) != 0 &&
+             pulsar_gpu_device_read_async(pulsar_gpu_tensor_device_ptr(q->verify_top), q->verify_tops,
+                                          (uint64_t)n_verify * sizeof(int32_t)) != 0;
+    }
     if (ok) ok = pulsar_gpu_end_commands() != 0;
     else (void)pulsar_gpu_synchronize();
     /* S4's step end: settles a PLE gather a failed step left in flight and, on a
@@ -1315,6 +1330,15 @@ bool qwen_forward(pulsar_session *s, pulsar_qwen_step_mode mode, const int32_t *
     if (ok && heads.n)
         ok = pulsar_gpu_tensor_read(s->qwen->logits, 0, logits_out,
                                     (uint64_t)heads.n * g_qwen_shape.n_vocab * sizeof(float)) != 0;
+    if (ok && st.verify) {   /* the synchronous reads above drained the stream: the tops have landed */
+        s->qwen->verify_tops_n = n_verify;
+        static bool announced = false;
+        if (!announced) {
+            announced = true;
+            fprintf(stderr, "pulsar: %s: verify row argmaxes on the device (%u rows), read back with the logits\n",
+                    PULSAR_QWEN_ARCH, n_verify);
+        }
+    }
     return ok;
 }
 
