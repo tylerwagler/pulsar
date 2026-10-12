@@ -960,20 +960,27 @@ bool pulsar_qwen_s4_mtp_combine(const pulsar_qwen_step *st, const void *h) {
 
 uint64_t pulsar_qwen_s4_draft_top_ws_bytes(void) { return pulsar_qwen_draft_top_ws_bytes(); }
 
-bool pulsar_qwen_s4_draft_top(const pulsar_qwen_step *st) {
+static_assert(PULSAR_QWEN_HEAD_ROWS_MAX <= PULSAR_QWEN_DRAFT_TOP_ROWS_MAX, "every headed MTP row can be picked");
+
+bool pulsar_qwen_s4_draft_top(const pulsar_qwen_step *st, uint32_t n) {
     if (!st->draft_head || !st->st->mtp_top || !st->w->n_draft) return fail("the draft pick outside a drafting MTP step");
-    return pulsar_qwen_draft_top_launch((const float *)dptr(st->st->logits), (int)st->w->n_draft, dptr(st->st->mtp_top),
-                                        0) == 0 ||
+    return pulsar_qwen_draft_top_launch((const float *)dptr(st->st->logits), (int)st->w->n_draft, (int)n,
+                                        dptr(st->st->mtp_top), 0) == 0 ||
            fail("the draft pick launch failed");
 }
 
-bool pulsar_qwen_s4_draft_top_read(const pulsar_qwen_state *q, const pulsar_qwen_weights *w, int32_t *id, float *conf) {
-    pulsar_qwen_draft_top rec{};
-    if (!q->mtp_top || !pulsar_gpu_tensor_read(q->mtp_top, 0, &rec, sizeof rec)) return fail("could not read the draft pick");
-    if (rec.nan) return fail("the draft head's logits hold a NaN");
-    if (rec.index < 0 || (uint32_t)rec.index >= w->n_draft) return fail("the draft pick is outside the draft head");
-    *id = w->draft_ids[rec.index];
-    if (conf) *conf = rec.conf;
+bool pulsar_qwen_s4_draft_top_read(const pulsar_qwen_state *q, const pulsar_qwen_weights *w, uint32_t n, int32_t *id,
+                                   float *conf) {
+    pulsar_qwen_draft_top rec[PULSAR_QWEN_HEAD_ROWS_MAX];
+    if (n == 0 || n > PULSAR_QWEN_HEAD_ROWS_MAX) return fail("a draft pick of no rows or past the head's rows");
+    if (!q->mtp_top || !pulsar_gpu_tensor_read(q->mtp_top, 0, rec, n * sizeof rec[0]))
+        return fail("could not read the draft pick");
+    for (uint32_t r = 0; r < n; r++) {
+        if (rec[r].nan) return fail("the draft head's logits hold a NaN");
+        if (rec[r].index < 0 || (uint32_t)rec[r].index >= w->n_draft) return fail("the draft pick is outside the draft head");
+        id[r] = w->draft_ids[rec[r].index];
+        conf[r] = rec[r].conf;
+    }
     return true;
 }
 

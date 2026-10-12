@@ -643,11 +643,13 @@ bool pulsar_qwen_s4_head(const pulsar_qwen_step *st, uint32_t row0, uint32_t n, 
 bool pulsar_qwen_s4_mtp_combine(const pulsar_qwen_step *st, const void *h);
 /** The combine's workspace bytes (a fixed size; the session allocates it once). */
 uint64_t pulsar_qwen_s4_mtp_combine_ws_bytes(void);
-/** L289: the draft head's greedy pick over logits row 0 of an MTP step that headed one row, reduced on the device
- *  into st->st->mtp_top (enqueued after the head); pulsar_qwen_s4_draft_top_read, after the step's drain, gives
- *  the vocabulary id and its softmax probability -- the bytes the host scan gave -- and refuses a NaN row. */
-bool pulsar_qwen_s4_draft_top(const pulsar_qwen_step *st);
-bool pulsar_qwen_s4_draft_top_read(const pulsar_qwen_state *q, const pulsar_qwen_weights *w, int32_t *id, float *conf);
+/** L289: the draft head's greedy pick over logits rows [0, n) of an MTP step that headed n rows (L288: every bank's
+ *  draft row of a step, n <= PULSAR_QWEN_HEAD_ROWS_MAX), reduced on the device into st->st->mtp_top (enqueued after
+ *  the head); pulsar_qwen_s4_draft_top_read, after the step's drain, gives each row's vocabulary id and softmax
+ *  probability -- the bytes the host scan gave -- and refuses a NaN row. */
+bool pulsar_qwen_s4_draft_top(const pulsar_qwen_step *st, uint32_t n);
+bool pulsar_qwen_s4_draft_top_read(const pulsar_qwen_state *q, const pulsar_qwen_weights *w, uint32_t n, int32_t *id,
+                                   float *conf);
 /** Its workspace bytes (the session allocates it once, beside the combine's). */
 uint64_t pulsar_qwen_s4_draft_top_ws_bytes(void);
 /** L289: warm the page cache with the PLE rows of `n` tokens a later step will embed after the n-gram context `ctx`

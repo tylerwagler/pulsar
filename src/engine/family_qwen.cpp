@@ -1357,16 +1357,22 @@ bool qwen_mtp_forward(pulsar_session *s, pulsar_qwen_step_mode mode, const int32
     if (ok) ok = ops->moe(&st, il);
     if (ok) ok = qwen_tp_allreduce_y(s, il, n_rows, "MTP moe");
     if (ok) ok = ops->gr_write(&st, il, PULSAR_QWEN_GR_MLP);
-    if (pick && head_n != 1) {
-        fprintf(stderr, "pulsar: %s: a draft pick from an MTP step heading %u rows -- refusing\n", PULSAR_QWEN_ARCH, head_n);
+    if (pick && head_n == 0) {
+        fprintf(stderr, "pulsar: %s: a draft pick from an MTP step heading no row -- refusing\n", PULSAR_QWEN_ARCH);
         ok = false;
     }
     if (ok && head_n) ok = ops->head(&st, head_row0, head_n, 0);
-    if (ok && pick) ok = pulsar_qwen_s4_draft_top(&st);   /* L289: the pick reduced on the device, behind the head */
+    /* L289: the picks reduced on the device, behind the head (L288: every headed row in one launch) */
+    if (ok && pick) ok = pulsar_qwen_s4_draft_top(&st, head_n);
     if (ok) ok = pulsar_gpu_end_commands() != 0;
     else (void)pulsar_gpu_synchronize();
     ok = pulsar_qwen_s4_step_end(&st, ok);
-    if (ok && pick) ok = pulsar_qwen_s4_draft_top_read(s->qwen, e->qwen_weights, &pick->id, &pick->conf);
+    if (ok && pick) {
+        int32_t id[PULSAR_QWEN_HEAD_ROWS_MAX];
+        float conf[PULSAR_QWEN_HEAD_ROWS_MAX];
+        ok = pulsar_qwen_s4_draft_top_read(s->qwen, e->qwen_weights, head_n, id, conf);
+        for (uint32_t r = 0; ok && r < head_n; r++) pick[r] = {id[r], conf[r]};
+    }
     if (!ok) {
         fprintf(stderr, "pulsar: %s: the MTP step failed; its banks' drafter state is dropped\n", PULSAR_QWEN_ARCH);
         for (uint32_t r = 0; r < n_rows; r++) s->qwen->mtp_pend_pos[bank[r]] = UINT32_MAX;

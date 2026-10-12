@@ -132,7 +132,7 @@ static void section_draft_top(void) {
     float worst_got = 0, worst_want = 0;
     auto run = [&](int n, pulsar_qwen_draft_top *rec) {
         CK(cudaMemcpy(drow, row.data(), (size_t)n * 4, cudaMemcpyHostToDevice));
-        const int rc = pulsar_qwen_draft_top_launch(drow, n, ws, 0);
+        const int rc = pulsar_qwen_draft_top_launch(drow, n, 1, ws, 0);
         CK(cudaDeviceSynchronize());
         CK(cudaMemcpy(rec, ws, sizeof *rec, cudaMemcpyDeviceToHost));
         return rc;
@@ -176,11 +176,37 @@ static void section_draft_top(void) {
     run(N, &r1);
     run(N, &r2);
     CHECK(memcmp(&r1, &r2, sizeof r1) == 0, "the record is the same bytes run to run");
+    /* L288: one launch over every bank's row of a draft step -- each record the bytes its row gives alone */
+    {
+        const int R = PULSAR_QWEN_DRAFT_TOP_ROWS_MAX;
+        std::vector<float> rows((size_t)R * N);
+        for (int r = 0; r < R; r++) {
+            const double sc = 1.0 + 6.0 * rndu();
+            for (int i = 0; i < N; i++) rows[(size_t)r * N + i] = (float)(sc * rndn());
+            rows[(size_t)r * N + rnd() % N] = (float)(sc * 6.0);
+        }
+        float *drows = (float *)dalloc(rows.size() * 4);
+        CK(cudaMemcpy(drows, rows.data(), rows.size() * 4, cudaMemcpyHostToDevice));
+        std::vector<pulsar_qwen_draft_top> all(R);
+        const int rc = pulsar_qwen_draft_top_launch(drows, N, R, ws, 0);
+        CK(cudaDeviceSynchronize());
+        CK(cudaMemcpy(all.data(), ws, R * sizeof(pulsar_qwen_draft_top), cudaMemcpyDeviceToHost));
+        int diff = rc != 0;
+        for (int r = 0; r < R; r++) {
+            pulsar_qwen_draft_top one{};
+            std::copy(rows.begin() + (size_t)r * N, rows.begin() + (size_t)(r + 1) * N, row.begin());
+            diff += run(N, &one) != 0 || memcmp(&one, &all[r], sizeof one) != 0;
+        }
+        CHECK(diff == 0, "%d rows in one launch: each record == its row alone (%d differ)", R, diff);
+        cudaFree(drows);
+    }
     row[12345] = NAN;
     pulsar_qwen_draft_top rn{};
     CHECK(run(N, &rn) == 0 && rn.nan != 0, "a NaN in the row is flagged (the caller refuses the draft)");
-    CHECK(pulsar_qwen_draft_top_launch(drow, 0, ws, 0) != 0 && pulsar_qwen_draft_top_launch(nullptr, N, ws, 0) != 0,
-          "no logits / a null row is refused");
+    CHECK(pulsar_qwen_draft_top_launch(drow, 0, 1, ws, 0) != 0 && pulsar_qwen_draft_top_launch(nullptr, N, 1, ws, 0) != 0 &&
+              pulsar_qwen_draft_top_launch(drow, N, 0, ws, 0) != 0 &&
+              pulsar_qwen_draft_top_launch(drow, N, PULSAR_QWEN_DRAFT_TOP_ROWS_MAX + 1, ws, 0) != 0,
+          "no logits / a null row / no rows / too many rows is refused");
     cudaFree(drow);
     cudaFree(ws);
 }

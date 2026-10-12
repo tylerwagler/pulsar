@@ -133,19 +133,22 @@ int pulsar_qwen_mtp_combine_launch(const pulsar_qwen_mtp_dev *w, const uint16_t 
                                    int T, uint16_t *out_streams, void *ws, size_t ws_bytes, cudaStream_t stream);
 
 /** L289: one draft-head row's greedy pick and its confidence, reduced on the device so a draft step reads back
- *  this record instead of the row (263 KB) and the host no longer scans it. */
+ *  this record instead of the row (263 KB) and the host no longer scans it.  L288: up to
+ *  PULSAR_QWEN_DRAFT_TOP_ROWS_MAX rows a launch (every bank's draft row of a step), one record each. */
+#define PULSAR_QWEN_DRAFT_TOP_ROWS_MAX 16
 typedef struct {
     int32_t index;      /**< the FIRST index of the row's maximum (a strict > scan from index 0) */
     float conf;         /**< (float)(1.0 / sum_i exp((double)(row[i] - row[index]))): its softmax probability */
     uint32_t nan;       /**< nonzero: the row holds a NaN -- the pick means nothing and the caller refuses */
     uint32_t pad;
 } pulsar_qwen_draft_top;
-/** Device bytes of the reduction's workspace (the record first). */
+/** Device bytes of the reduction's workspace (PULSAR_QWEN_DRAFT_TOP_ROWS_MAX records first, row 0's at offset 0). */
 size_t pulsar_qwen_draft_top_ws_bytes(void);
-/** row [n] f32 (device) -> the record at the start of `ws` (device, pulsar_qwen_draft_top_ws_bytes).  The pick is the
- *  host scan's (ties to the lower index); the sum is in double, each term exp((double)(row[i] - m)) with the f32
- *  difference the host rule takes, so the f32 confidence is the host rule's value.  0 on success. */
-int pulsar_qwen_draft_top_launch(const float *row, int n, void *ws, cudaStream_t stream);
+/** rows [n_rows][n] f32 (device) -> record r at the start of `ws` (device, pulsar_qwen_draft_top_ws_bytes) is row r's.
+ *  The pick is the host scan's (ties to the lower index); the sum is in double, each term exp((double)(row[i] - m))
+ *  with the f32 difference the host rule takes, so the f32 confidence is the host rule's value; a row's record does
+ *  not depend on the rows beside it.  n_rows 1 .. PULSAR_QWEN_DRAFT_TOP_ROWS_MAX.  0 on success. */
+int pulsar_qwen_draft_top_launch(const float *rows, int n, int n_rows, void *ws, cudaStream_t stream);
 
 /** A plain MXFP8 dense Linear: y [rows][out] f32 = W x, W stored mxfp8_lt
  *  ([out][in] E4M3 then the swizzled E8M0 plane) and x the block input's bf16 row

@@ -6,9 +6,10 @@
  * (host, n_vocab a row); n_verify > 0 arms the per-row state capture pulsar_qwen_s4_spec_rollback reads over
  * the verify rows.  qwen_mtp_forward: the MTP layer over the
  * trunk stacks staged in mtp_h, `head_n` rows through the draft head (n_draft logits a row).
- * With `pick` (head_n = 1, L289) the head row's greedy draft is reduced on the device -- its vocabulary id
- * and softmax probability, the draft's confidence -- and logits_out (NULL allowed) is read back only when a
- * caller needs the row itself (a sampled draft's q); qwen_mtp_dist: the sampled q over the draft vocabulary, ids mapped;
+ * With `pick` (L289; L288: pick[head_n], every headed row) each head row's greedy draft is reduced on the device --
+ * its vocabulary id and softmax probability, the draft's confidence -- and logits_out (NULL allowed) is read back
+ * only when a caller needs the rows themselves (a sampled draft's q); qwen_mtp_dist: the sampled q over the draft
+ * vocabulary, ids mapped;
  * qwen_argmax: the argmax of a row of n floats.  qwen_verify_rows: a verify's rows (one run a bank, each at its bank's
  * next position) as the forward's token / position / bank arrays, false with `err` naming the first row that is
  * not. */
