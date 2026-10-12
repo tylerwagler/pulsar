@@ -82,8 +82,10 @@ int dense_splits(int K, int N) {
 }
 
 /** Counters per (thread, device, stream) slice -- one per 128-output block of
- *  each projection, so n_proj * N <= kMaxCounters * 128 -- and the slices. */
-constexpr int kMaxCounters = 1024;
+ *  each projection, so n_proj * N <= kMaxCounters * 128 -- and the slices.
+ *  L288 qwen-exl3-head: 2048, the widest Linear served being a head (Qwen's
+ *  lm_head 2560 -> 248320 = 1940 blocks); 512 KB for the 64 slices. */
+constexpr int kMaxCounters = 2048;
 constexpr int kCounterSlices = 64;
 __device__ unsigned g_dense_ctr[kCounterSlices][kMaxCounters];   /* zero at load; every launch leaves it zero */
 

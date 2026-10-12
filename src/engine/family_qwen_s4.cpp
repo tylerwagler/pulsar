@@ -158,13 +158,21 @@ moe_scratch moe_layout(uint32_t rows) {
     m.total = m.ws + m.ws_bytes;
     return m;
 }
-struct head_scratch { uint64_t ws, ws_bytes, xkey, total; };
-head_scratch head_layout(void) {
+/* L288 qwen-exl3-head: lin_ws is the head Linear's dense-arm workspace at the head's widest call -- sized for an
+ * n_embd -> n_vocab head whatever format the container stores (the draft head's rows are fewer; an mxfp8_lt head
+ * takes none), because the scratch is laid out from the shape, before any head is admitted. */
+struct head_scratch { uint64_t ws, ws_bytes, xkey, lin_ws, lin_ws_bytes, total; };
+head_scratch head_layout(const pulsar_qwen_shape *s) {
     head_scratch h{};
     h.ws = 0;
     h.ws_bytes = a256(pulsar_qwen_gr_workspace_bytes((int)PULSAR_QWEN_HEAD_ROWS_MAX));
     h.xkey = h.ws_bytes;   /* the key of the head's bf16 activation slot: [16][2560] f32-sized */
-    h.total = h.xkey + (uint64_t)PULSAR_QWEN_HEAD_ROWS_MAX * PULSAR_QWEN_HIDDEN * sizeof(float);
+    h.lin_ws = h.xkey + a256((uint64_t)PULSAR_QWEN_HEAD_ROWS_MAX * PULSAR_QWEN_HIDDEN * sizeof(float));
+    pulsar_rows_linear head{};
+    head.in = (int)s->n_embd;
+    head.out = (int)s->n_vocab;
+    h.lin_ws_bytes = a256(pulsar_rows_linear_workspace_bytes(&head, (int)PULSAR_QWEN_HEAD_ROWS_MAX));
+    h.total = h.lin_ws + h.lin_ws_bytes;
     return h;
 }
 
@@ -362,6 +370,31 @@ static bool admit_role(const pulsar_tensor *t, pulsar_weight_role role) {
 }
 /* a dense Linear the shared launcher (linear_dev) reads */
 static bool admit_linear(const pulsar_tensor *t) { return admit_role(t, PULSAR_ROLE_DENSE); }
+/* L288 qwen-exl3-head: the heads' formats are the container's.  lm_head: bf16 (encoded to MXFP8 on the device at the
+ * first head, L251) or a format the dense bf16-rows arm reads (EXL3 at a dense-arm rate) -- under tensor parallelism
+ * only bf16, whose rank slices the MXFP8 encode cuts.  The MTP draft head: the artifact's mtp.draft_head in a format
+ * the dense arm reads, or -- absent -- the rows gathered from a bf16 lm_head; an lm_head in another format leaves no
+ * rows to gather, so such an artifact must carry its own.  One path per artifact; nothing is converted to fit. */
+static bool admit_head(const pulsar_engine *e, const pulsar_qwen_weights *w) {
+    const pulsar_tensor *out = w->output;
+    const bool bf16 = out->type == PULSAR_TENSOR_BF16;
+    if (!bf16 && !admit_linear(out)) return false;
+    if (!bf16 && e->model.tp_n_ranks > 1) {
+        fprintf(stderr, "pulsar: %s: lm_head.weight is %s; under tensor parallelism the head is a bf16 tensor the ranks "
+                        "encode their vocab slices from -- refusing\n", PULSAR_QWEN_ARCH, tensor_type_name(out->type));
+        return false;
+    }
+    if (!w->mtp.present) return true;
+    if (w->mtp.draft_head) return admit_linear(w->mtp.draft_head);
+    if (!bf16) {
+        fprintf(stderr, "pulsar: %s: lm_head.weight is %s, which leaves no bf16 rows to gather the MTP draft head from, "
+                        "and the artifact carries no mtp.draft_head -- refusing\n", PULSAR_QWEN_ARCH,
+                tensor_type_name(out->type));
+        return false;
+    }
+    return true;
+}
+
 /* the low-rank pair: MXFP8 (the per-layer sites) or BF16 (the mixer, as the
  * graded recipe stores it) -- both arms of the GR read, one format per pair */
 static bool admit_gr(const pulsar_qwen_gr_weights &g) {
@@ -407,7 +440,7 @@ static bool admit_moe(const pulsar_qwen_layer_weights &L) {
 bool pulsar_qwen_s4_load(pulsar_engine *e, const pulsar_engine_options *opt) {
     pulsar_qwen_weights *w = e->qwen_weights;
     const pulsar_qwen_shape *s = &g_qwen_shape;
-    bool ok = admit_bf16(w->token_embd) & admit_bf16(w->output) & admit_gr(w->mixer);
+    bool ok = admit_bf16(w->token_embd) & admit_head(e, w) & admit_gr(w->mixer);
     uint32_t tessera_layers = 0;
     for (uint32_t il = 0; il < e->plan.n_layer; il++) {
         const pulsar_qwen_layer_weights &L = w->layer[il];
@@ -477,9 +510,17 @@ bool pulsar_qwen_s4_load(pulsar_engine *e, const pulsar_engine_options *opt) {
     w->ple_io = io;
     fprintf(stderr, "pulsar: L251 qwen PLE rows: %s (%llu rows x %u B, %u per token, %u pread threads); S4 tensors "
                     "admitted (routed experts: %u layers fused gate_up + down EXL3, %u layers Tessera value family "
-                    "[L255]; dense EXL3, GR low-rank MXFP8, head bf16)\n",
+                    "[L255]; dense EXL3, GR low-rank MXFP8)\n",
             path, (unsigned long long)n_rows, PULSAR_QWEN_NGRAM_ROW_BYTES, PULSAR_QWEN_NGRAM_COLS,
             PULSAR_ENGRAM_IO_THREADS, e->plan.n_layer - tessera_layers, tessera_layers);
+    /* L288 qwen-exl3-head: the path each head takes, by the format the container stores it in */
+    const bool out_bf16 = w->output->type == PULSAR_TENSOR_BF16;
+    fprintf(stderr, "pulsar: %s: lm_head %s -> %s", PULSAR_QWEN_ARCH, tensor_type_name(w->output->type),
+            out_bf16 ? "MXFP8 on the device, the mxfp8_lt rows arm" : "the dense bf16-rows arm as stored");
+    if (w->mtp.present)
+        fprintf(stderr, "; MTP draft head %s", w->mtp.draft_head ? tensor_type_name(w->mtp.draft_head->type)
+                                                                 : "gathered from lm_head into MXFP8");
+    fprintf(stderr, "\n");
     return true;
 }
 
@@ -517,7 +558,7 @@ uint64_t pulsar_qwen_s4_scratch_bytes(pulsar_qwen_op_id op, const pulsar_qwen_sh
     case PULSAR_QWEN_OP_PLE:     return ple_layout(max_rows).total;
     case PULSAR_QWEN_OP_GR_READ: return gr_layout(max_rows).total;
     case PULSAR_QWEN_OP_MOE:     return moe_layout(max_rows).total;
-    case PULSAR_QWEN_OP_HEAD:    return head_layout().total;
+    case PULSAR_QWEN_OP_HEAD:    return head_layout(s).total;
     case PULSAR_QWEN_OP_GDN:     return gdn_layout(s, max_rows).total;
     case PULSAR_QWEN_OP_QSA:     return qsa_layout(s, max_rows, pulsar_qwen_qsa_cap(s, ctx)).total;
     default:                     return 0;   /* GR write reads GR read's inj; GDN / QSA are S2's / S3's */
@@ -884,7 +925,7 @@ bool pulsar_qwen_s4_head(const pulsar_qwen_step *st, uint32_t row0, uint32_t n, 
     const pulsar_qwen_shape *s = st->shape;
     const int H = (int)s->n_embd;
     if (n == 0 || out0 + n > PULSAR_QWEN_HEAD_ROWS_MAX || row0 + n > st->n_rows) return fail("head rows out of range");
-    const head_scratch h = head_layout();
+    const head_scratch h = head_layout(s);
     pulsar_gpu_tensor *sc = st->st->scratch[PULSAR_QWEN_OP_HEAD];
     if (!sc) return fail("no head scratch");
     uint8_t *base = (uint8_t *)dptr(sc);
@@ -903,18 +944,22 @@ bool pulsar_qwen_s4_head(const pulsar_qwen_step *st, uint32_t row0, uint32_t n, 
                                           base + h.ws, h.ws_bytes, 0) == 0;
     });
     if (ok) {
-        /* L251: the lm_head in MXFP8, made once on the device from the container's bf16 head (the
-         * producers' own encoder) -- half the bytes of the bf16 GEMV that was 5.1 ms of a 33 ms
-         * token.  L288: multiplied on the tensor cores, the weight read once for all the call's rows
-         * (pulsar_qwen_mxfp8_head_launch). */
+        /* The head is a dense Linear of the mixer's bf16 rows, through the core's bf16-rows front door
+         * (pulsar_rows_linear_launch: the arm by the weight's format, the decode arm at every call -- a row's logits
+         * never depend on the rows beside it, a prompt's last row included).  L288 qwen-exl3-head: the weight is the
+         * container's -- an lm_head / mtp.draft_head stored EXL3 runs the EXL3 dense arm as stored; a bf16 lm_head
+         * is L251's: MXFP8 made once on the device (the producers' own encoder), multiplied by the mxfp8_lt rows
+         * arm on the tensor cores, the weight read once for all the call's rows. */
         pulsar_qwen_weights *wm = const_cast<pulsar_qwen_weights *>(st->w);
+        const bool dh = st->draft_head;
+        const pulsar_tensor *stored = dh ? wm->mtp.draft_head : wm->output->type != PULSAR_TENSOR_BF16 ? wm->output : NULL;
         /* L266 step 7: under TP a rank's head is its vocab range [rank * V / tp, +V / tp) -- the rows it
          * computes, the gather below fills the rest; the draft head stays whole on every rank */
         const uint32_t tp = pulsar_qwen_tp(s);
         uint32_t v_lo = 0, v_hi = s->n_vocab;
         if (tp > 1 && !pulsar_tp_owned_range((int)s->tp_rank, tp, s->n_vocab, &v_lo, &v_hi)) ok = false;
         const uint32_t Vl = v_hi - v_lo;
-        if (ok && !wm->head_mx) {
+        if (ok && !dh && !stored && !wm->head_mx) {
             const uint16_t *hb = (const uint16_t *)wptr(st, st->w->output, "qwen lm_head");
             if (hb) hb += (uint64_t)v_lo * H;
             const uint64_t bytes = pulsar_qwen_mxfp8_bytes((int)Vl, H);
@@ -924,25 +969,30 @@ bool pulsar_qwen_s4_head(const pulsar_qwen_step *st, uint32_t row0, uint32_t n, 
                             (double)bytes / 1e9, (double)s->n_vocab * H * 2 / 1e9);
             else if (wm->head_mx) { pulsar_gpu_tensor_free(wm->head_mx); wm->head_mx = NULL; }
         }
-        if (ok && st->draft_head && !wm->draft_head_mx) ok = build_draft_head(st, wm);
+        if (ok && dh && !stored && !wm->draft_head_mx) ok = build_draft_head(st, wm);
         /* logits rows [out0, out0 + n) of the slab (the draft head's rows are n_draft wide) */
-        const uint64_t row_bytes = (uint64_t)(st->draft_head ? wm->n_draft : s->n_vocab) * sizeof(float);
+        const uint64_t row_bytes = (uint64_t)(dh ? wm->n_draft : s->n_vocab) * sizeof(float);
         pulsar_gpu_tensor *dst = ok ? pulsar_gpu_tensor_view(st->st->logits, out0 * row_bytes, n * row_bytes) : NULL;
         ok = ok && dst;
         if (ok) {
-            const bool dh = st->draft_head;
             const uint32_t rows = dh ? wm->n_draft : Vl;
-            const uint8_t *hq = (const uint8_t *)dptr(dh ? wm->draft_head_mx : wm->head_mx);
-            const pulsar_qwen_lowrank l = {hq, hq + (uint64_t)rows * H, (int)rows, H};
+            pulsar_rows_linear l{};
+            if (stored) {
+                ok = linear_dev(st, stored, H, (int)rows, false, dh ? "qwen MTP draft head" : "qwen lm_head", &l);
+            } else {
+                const uint8_t *hq = (const uint8_t *)dptr(dh ? wm->draft_head_mx : wm->head_mx);
+                l = pulsar_rows_linear{hq, hq + (uint64_t)rows * H, 0, H, (int)rows, false};
+            }
             /* this rank's rows of the head into `dst` -- the whole head on one GPU, the vocab range the engine's
              * gather asks for under TP (the rank's own; the gather assembles the rest) */
             auto head = [&](uint32_t lo, uint32_t width, pulsar_gpu_tensor *dst) {
                 if (!dh && tp > 1 && (lo != v_lo || width != Vl)) return false;
-                return pulsar_qwen_mxfp8_head_launch(&l, (const uint16_t *)xb, (int)n, (float *)dptr(dst), 0) == 0;
+                return pulsar_rows_linear_launch(&l, (const uint16_t *)xb, (int)n, (float *)dptr(dst), base + h.lin_ws,
+                                                 h.lin_ws_bytes, 0) == 0;
             };
-            if (tp == 1 || dh) {
+            if (ok && (tp == 1 || dh)) {
                 ok = head(0, rows, dst);
-            } else {
+            } else if (ok) {
                 pulsar_qwen_state *q = st->st;
                 const pulsar_tp_vocab x = {q->tp, q->tp_slab_dev, q->tp_ticket, q->tp_vocab_own, &q->tp_vocab_seq,
                                            s->n_vocab, PULSAR_QWEN_HEAD_ROWS_MAX};

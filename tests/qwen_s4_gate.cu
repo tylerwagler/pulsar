@@ -19,9 +19,9 @@
  *   D. MoE block over 512 experts (an aliased pool of 12 distinct slices per
  *      projection, gate/up K=4, down K=5; shared K=5/5/4) vs double with the
  *      device's routing; T = 1 bit-identical; the non-finite flag stays clear.
- *   I. L288 the head's tensor-core arm (pulsar_qwen_mxfp8_head_launch): 1 .. 16 rows vs the same quantized
- *      operands in double; every row of a call BIT-IDENTICAL to that row alone; 17 rows and a null activation
- *      refused.
+ *   I. L288 the head's tensor-core arm (an mxfp8_lt head is the front door's mxfp8_lt rows arm,
+ *      pulsar_qwen_mxfp8_linear_launch at decode widths; qwen-exl3-head): 1 .. 16 rows vs the same quantized
+ *      operands in double; every row of a call BIT-IDENTICAL to that row alone; a null activation refused.
  *   H. L289 draft pick: the device's first maximum and f32 softmax probability of a draft-head row
  *      (65812 logits) BIT-EXACT vs the host scan it replaced, over random rows, ties, an all-but-one
  *      -inf row and a narrow row; a NaN row is flagged; the record is the same bytes run to run.
@@ -950,7 +950,7 @@ static void section_head(void) {
     float *y1 = (float *)dalloc((size_t)out * 4);
     const pulsar_qwen_lowrank l{up(w.q), up(w.sf), out, in};
     for (const int T : {1, 5, 8, 9, 16}) {
-        const int rc = pulsar_qwen_mxfp8_head_launch(&l, dx, T, y, 0);
+        const int rc = pulsar_qwen_mxfp8_linear_launch(&l, dx, T, y, nullptr, 0, 0);
         CHECK(rc == 0, "%2d rows launch", T);
         if (rc) continue;
         const auto Y = down(y, (size_t)T * out);
@@ -972,7 +972,7 @@ static void section_head(void) {
         int differ = 0;
         for (int t = 0; t < T; t++) {
             CK(cudaMemset(y1, 0xFF, (size_t)out * 4));
-            if (pulsar_qwen_mxfp8_head_launch(&l, dx + (size_t)t * in, 1, y1, 0) != 0) { differ = -1; break; }
+            if (pulsar_qwen_mxfp8_linear_launch(&l, dx + (size_t)t * in, 1, y1, nullptr, 0, 0) != 0) { differ = -1; break; }
             const auto Y1 = down(y1, (size_t)out);
             differ += memcmp(Y1.data(), Y.data() + (size_t)t * out, (size_t)out * 4) != 0;
         }
@@ -998,7 +998,7 @@ static void section_head(void) {
         uint16_t *dxo = up(oh);
         float *yo = (float *)dalloc((size_t)TM * R * 4);
         const pulsar_qwen_lowrank lx{up(wx.q), up(wx.sf), R, in};
-        const int rc = pulsar_qwen_mxfp8_head_launch(&lx, dxo, TM, yo, 0);
+        const int rc = pulsar_qwen_mxfp8_linear_launch(&lx, dxo, TM, yo, nullptr, 0, 0);
         const auto Y = down(yo, (size_t)TM * R);
         int bad = 0;
         for (int t = 0; t < TM; t++)
@@ -1006,8 +1006,7 @@ static void section_head(void) {
         CHECK(rc == 0 && bad == 0, "every E4M3 code x scale decodes exactly (%d of %d single-weight reads differ)", bad, TM * R);
         cudaFree(dxo); cudaFree(yo);
     }
-    CHECK(pulsar_qwen_mxfp8_head_launch(&l, dx, TM + 1, y, 0) != 0, "17 rows refused");
-    CHECK(pulsar_qwen_mxfp8_head_launch(&l, nullptr, 1, y, 0) != 0, "a null activation refused");
+    CHECK(pulsar_qwen_mxfp8_linear_launch(&l, nullptr, 1, y, nullptr, 0, 0) != 0, "a null activation refused");
     cudaFree(dx); cudaFree(y); cudaFree(y1);
     /* the production shape, timed (information, not graded): the lm_head 248320 x 2560 and the draft head
      * 82196 x 2560, random codes, at 1 / 4 / 16 rows; GB/s over the weight bytes */
@@ -1021,9 +1020,9 @@ static void section_head(void) {
         cudaEvent_t e0, e1;
         CK(cudaEventCreate(&e0)); CK(cudaEventCreate(&e1));
         for (const int T : {1, 4, 16}) {
-            for (int i = 0; i < 3; i++) (void)pulsar_qwen_mxfp8_head_launch(&lv, dxv, T, dy, 0);
+            for (int i = 0; i < 3; i++) (void)pulsar_qwen_mxfp8_linear_launch(&lv, dxv, T, dy, nullptr, 0, 0);
             CK(cudaEventRecord(e0));
-            for (int i = 0; i < 20; i++) (void)pulsar_qwen_mxfp8_head_launch(&lv, dxv, T, dy, 0);
+            for (int i = 0; i < 20; i++) (void)pulsar_qwen_mxfp8_linear_launch(&lv, dxv, T, dy, nullptr, 0, 0);
             CK(cudaEventRecord(e1));
             CK(cudaEventSynchronize(e1));
             float ms = 0;
