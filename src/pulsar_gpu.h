@@ -837,6 +837,12 @@ int pulsar_gpu_matmul_set_batch_decode_rows(int n);
  *  width past the exact range); everything else stays at the M-neutral cap. */
 int pulsar_gpu_matmul_set_batch_decode_rows_capped(int n, int cap);
 int pulsar_gpu_matmul_batch_decode_rows(void);
+/** The row-kind fact a dense call of `n_tok` rows chooses its arms by (L167): its effective decode prefix,
+ *  min(declared decode rows, n_tok) -- 0 = every row prefill (tensor-core arms), n_tok = every row decode
+ *  (M-independent arms), between = split there.  Two calls with the same n_tok and the same prefix take the
+ *  same arms; a different prefix is different arithmetic.  Anything that caches an encoded call (a captured
+ *  CUDA graph) keys on this (L292). */
+uint32_t pulsar_gpu_matmul_decode_prefix(uint32_t n_tok);
 /** L260: the widest decode step whose rows are still BYTE-IDENTICAL to the same
  *  rows at any narrower width (and alone).  Wider decode steps take width-
  *  dependent arithmetic (Tyler 2026-10-01: the fastest arm per width), graded,
