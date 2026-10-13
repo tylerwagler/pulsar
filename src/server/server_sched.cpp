@@ -1483,11 +1483,13 @@ static bool server_spec_lane_carries(bool spec_rounds, uint32_t verify_rows, ses
  *     steps, not quanta (a spec quantum at twelve decoders is one round): one 32-step probe per 512 steps is
  *     ~6% of the decode time, so at the measured 10-15% gap probing costs about 1% at most;
  *   - but a re-measure is evidence-based, not a clock (L289): while the lane in force's MEASURED price clears
- *     the other lane's MEASURED price at this N by LANE_PRICE_CLEAR, a flip needs the other lane to move by more
- *     than its price moves between weighings, so the scheduled re-measure waits LANE_PRICE_CLEAR_SPAN times as
- *     long -- the bound on how old a measurement may grow before it is taken again.  The lane in force is
- *     measured every step it runs, so the clearance is read fresh at each pick; a narrower gap, a predicted
- *     price or a new N re-measures on the plain schedule.  (L288, Qwen one stream: spec 51-78 tok/s against
+ *     the other lane's price at this N -- measured, or predicted by its fit (L288) -- by LANE_PRICE_CLEAR, a flip
+ *     needs the other lane to move by more than its price moves between weighings, so the scheduled re-measure
+ *     waits LANE_PRICE_CLEAR_SPAN times as long -- the bound on how old a measurement may grow before it is taken
+ *     again.  The lane in force is measured every step it runs, so the clearance is read fresh at each pick; a
+ *     narrower gap, an unmeasured lane in force or no price for the other lane re-measures on the plain schedule.
+ *     (A fit's misprediction seen so far was optimistic for the other lane -- DeepSeek N8, plain 111 predicted
+ *     against 80 measured -- and the clearance is 25%: a cleared prediction does not hide a faster lane.)  (L288, Qwen one stream: spec 51-78 tok/s against
  *     plain 33.8-36.1 measured, and the 512-step clock re-probed plain 13 times in 48 requests at ~0.67 s each,
  *     ~9% of a probed request; the plain price it re-measured moved 7% end to end.) */
 #define LANE_PRICE_MARGIN        0.04
@@ -1621,8 +1623,11 @@ static int lane_price_pick(lane_price *lp, const pulsar_lane_cost *plain, const 
         lp->why = "measured faster";
         return other;
     }
-    /* L289: both measured and the lane in force clears the other by LANE_PRICE_CLEAR -- the re-measure waits */
-    const bool clears = other_measured && t_other > 0.0 && t_inc >= t_other * LANE_PRICE_CLEAR;
+    /* L289: the lane in force, measured, clears the other by LANE_PRICE_CLEAR -- the re-measure waits.  L288: the
+     * other's price measured at this N or predicted by its fit (a new N drops the measurements, so with the decoder
+     * count moving the other lane is mostly predicted, and the 512-step clock re-probed it inside every busy
+     * stretch: a 32-step plain probe at four Qwen decoders, ~2 s at 96 tok/s against the spec lane's 165) */
+    const bool clears = t_other > 0.0 && t_inc >= t_other * LANE_PRICE_CLEAR;
     const uint32_t reprobe = clears ? LANE_PRICE_REPROBE_STEPS * LANE_PRICE_CLEAR_SPAN : LANE_PRICE_REPROBE_STEPS;
     if (t_other <= 0.0 || faster || ran >= reprobe) {
         lp->probe = other;
@@ -3469,10 +3474,11 @@ void *worker_main(void *arg) {
             const lane_price *lp = &s->w_lane_price;
             const bool spec_in = lp->lane == 3;
             server_log(PULSAR_LOG_GENERATION,
-                       "pulsar-server: decode lane %d holds (%d decoders; %s %.1f clears %s %.1f tok/s, both measured, "
+                       "pulsar-server: decode lane %d holds (%d decoders; %s %.1f measured clears %s %.1f%s tok/s, "
                        "x%.2f >= %.2f): the re-measure waits up to %u steps",
                        lp->lane, n_dec, spec_in ? "spec" : "plain", spec_in ? lp->t_spec : lp->t_plain,
                        spec_in ? "plain" : "spec", spec_in ? lp->t_plain : lp->t_spec,
+                       (spec_in ? lp->meas_plain : lp->meas_spec) ? " measured" : " predicted",
                        spec_in ? lp->t_spec / lp->t_plain : lp->t_plain / lp->t_spec, LANE_PRICE_CLEAR,
                        LANE_PRICE_REPROBE_STEPS * LANE_PRICE_CLEAR_SPAN);
             s->w_lane_price.deferral = 2;
