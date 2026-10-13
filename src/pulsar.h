@@ -1174,9 +1174,12 @@ const pulsar_tokens *pulsar_session_tokens(pulsar_session *s);
  * row.  Disk segments are unchanged.
  * v3 (L284): the draft-depth controller (depth and its counters, 4 u32) after the image
  * section, so a restored session speculates as the saved one would; v2 refuses on the
- * version. */
+ * version.
+ * v4 (L292): the 0731 NVFP4 KV rows are quantized with IEEE divides (attnpack): same layout,
+ * rows written before differ in a few codes, so a resumed v3 payload would not equal a
+ * fresh prefill -- v3 refuses on the version and the bank re-prefills. */
 #define PULSAR_SESSION_KV_PAYLOAD_MAGIC UINT32_C(0x3150564b) /* "KVP1" */
-#define PULSAR_SESSION_KV_PAYLOAD_VERSION UINT32_C(3)
+#define PULSAR_SESSION_KV_PAYLOAD_VERSION UINT32_C(4)
 
 uint64_t pulsar_session_payload_bytes(pulsar_session *s);
 int pulsar_session_save_payload(pulsar_session *s, FILE *fp, char *err, size_t errlen);
@@ -1196,7 +1199,7 @@ int pulsar_session_save_snapshot(pulsar_session *s, pulsar_session_snapshot *sna
 #define PULSAR_SESSION_SEGMENT_MAGIC UINT32_C(0x31474553) /* "SEG1" */
 /* v2 (L265): the header names the state layout by a digest (the model's state ops) instead of
  * DeepSeek's strides; v1 segments are refused and the chain rewrites itself. */
-#define PULSAR_SESSION_SEGMENT_VERSION UINT32_C(4)   /* v3 (L281): the span's image block records; v4 (L268): with each block's 2D grid */
+#define PULSAR_SESSION_SEGMENT_VERSION UINT32_C(5)   /* v3 (L281): the span's image block records; v4 (L268): with each block's 2D grid; v5 (L292): NVFP4 KV rows from IEEE divides -- v4 rows differ in a few codes, so they are refused and rewritten */
 uint64_t pulsar_session_segment_bytes(pulsar_session *s, int G_prev, int G);
 /** `key`: the segment's store key (pulsar_segstore_child_key).  Off a TP group
  *  it is unused (NULL is fine); on one it names every worker's own copy, and
