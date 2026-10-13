@@ -224,6 +224,14 @@ __device__ static inline uint8_t dsv4_e2m1fn_encode_dev(float x) {
     }
     return (uint8_t)((best & 7) | ((x < 0.0f) ? 0x8u : 0u));
 }
+/* The E2M1 data code of `v` under block scale `s` (s > 0): the ONE quotient + encode every FP4 KV writer uses
+ * (V4.1's MAIN row and FP4 index-K row, 0731's unified NVFP4 row).  The divide is IEEE (__fdiv_rn) whatever the
+ * TU's fast-math flags: E2M1's RNE ties sit on exactly representable ratios, and --use_fast_math's `/`
+ * (div.approx = MUFU.RCP x FMUL, a rounded reciprocal) lands next to them -- b12x e2bdfc80, L292.  Saturates at
+ * +-6. */
+__device__ static inline uint8_t pulsar_e2m1_quant_dev(float v, float s) {
+    return dsv4_e2m1fn_encode_dev(fminf(6.0f, fmaxf(-6.0f, __fdiv_rn(v, s))));
+}
 __device__ static inline float dsv4_e2m1fn_decode_dev(uint8_t nib, float scale) {
     return pulsar_e2m1_times(nib, scale);
 }
