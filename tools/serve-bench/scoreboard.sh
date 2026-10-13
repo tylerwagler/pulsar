@@ -63,7 +63,9 @@ for i in $(seq 1 900); do
 done
 echo "[$LABEL] up after ~$((i*2)) s ($WHAT) model $MODEL args: $*"
 python3 "$SM" single --port $PORT --prompts code,prose --temps 0,0.7 --tokens 128 --reps 1 > /dev/null 2>&1   # warm-up
-python3 "$SM" conc --port $PORT --streams 4 --temps 0 --tokens 64 > /dev/null 2>&1
+# warm the concurrent widths too: a fresh pulsar-server prices its plain lane once per unseen decoder count (a
+# 32-step probe, L284) until its plain fit has spread, which would land inside the first concurrent cells
+for n in 2 4 8; do python3 "$SM" conc --port $PORT --streams $n --temps 0 --tokens 192 > /dev/null 2>&1; done
 rm -f "$OUT/$LABEL.jsonl"
 LOGARG=(); [ "$ENGINE" = tensorfold ] && LOGARG=(--server-log "$OUT/server-$LABEL.log")
 python3 "$SM" scoreboard "${LOGARG[@]}" --streams-set "${STREAMS_SET-4,8}" --port $PORT --label "$LABEL" --out "$OUT/$LABEL.jsonl" > /dev/null || exit 4

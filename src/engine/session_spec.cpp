@@ -35,12 +35,30 @@ uint32_t pulsar_spec_cur_depth(const pulsar_session *s) {
     return d < 1u ? 1u : d;
 }
 
+/* L288 (tf-gap): the depth `n` chains drafted together run at.  A fixed-depth drafter (no adaptive policy) with
+ * no configured depth drafts to its depth_max while every chain at that depth fits ONE shared verify forward --
+ * n x (1 + depth_max) rows within the family's verify width (pulsar_engine_fused_heads_max, the one authority the
+ * server's row budget is cut from) -- and at its depth past that: there the server's allocator rations the drafts
+ * by survival (spec_alloc_rows), so the deeper steps would be drafted for rows it cuts.  Only which drafts are
+ * proposed changes (proposals only: every emitted token is the target's, greedy or keyed).  Measured on td305-qh-h5d4
+ * (2026-10-13, serve_matrix untraced, MTP depth 4 vs 6): code T0 92.2 -> 93.8 tok/s, code T0.7 90.0 -> 94.3, prose
+ * 72.3 -> 72.6, two streams 111.1 -> 115.6 (2 x 7 rows <= 16), four 152.7 -> 150.1 and eight 169.5 -> 165.1 (past
+ * the width).  An adaptive drafter (DSpark) moves its own depth; --spec-depth pins it. */
+uint32_t pulsar_spec_batch_depth(const pulsar_session *s, uint32_t n) {
+    const pulsar_engine *e = s->engine;
+    const pulsar_drafter_ops *d = e->drafter_ops;
+    const uint32_t cur = pulsar_spec_cur_depth(s);
+    if (!d || d->adapt || e->spec_depth > 0 || n == 0u) return cur;
+    const uint32_t width = pulsar_engine_fused_heads_max(e);
+    return (uint64_t)n * (1u + d->depth_max) <= width && d->depth_max > cur ? d->depth_max : cur;
+}
+
 void pulsar_spec_draft_req_init(pulsar_session *s, spec_redraft_req *q, int next_base, float temperature, int top_k,
                                 float top_p, float min_p) {
     q->valid = true;
     q->done = false;
     q->next_base = (int32_t)next_base;
-    q->n_draft = pulsar_spec_cur_depth(s);
+    q->n_draft = pulsar_spec_batch_depth(s, 1u);   /* one chain; a batched redraft re-sets it for its n */
     q->temperature = temperature;
     q->top_k = top_k;
     q->top_p = top_p;
@@ -1103,6 +1121,15 @@ int pulsar_session_spec_redraft_batch_local(pulsar_session *s, pulsar_spec_round
     if (!spec_drafter(s)) {
         snprintf(err, errlen, "redraft batch: no drafter is loaded");
         return -1;
+    }
+    /* a fixed-depth drafter's chains draft together at the batch's depth (pulsar_spec_batch_depth); an adaptive
+     * drafter's records keep each bank's own controller depth from its round_end */
+    if (!spec_drafter(s)->adapt) {
+        uint32_t live = 0;
+        for (int i = 0; i < n; i++) live += rounds[i] && rounds[i]->redraft.valid ? 1u : 0u;
+        const uint32_t depth = pulsar_spec_batch_depth(s, live);
+        for (int i = 0; i < n; i++)
+            if (rounds[i] && rounds[i]->redraft.valid) rounds[i]->redraft.n_draft = depth;
     }
     return spec_drafter(s)->draft_batch(s, rounds, banks, rngs, n, err, errlen);
 }

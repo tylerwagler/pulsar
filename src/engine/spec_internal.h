@@ -12,7 +12,7 @@
 typedef struct {
     bool     valid;         ///< round_end reached the drafting point with the drafter's features ready
     int32_t  next_base;     ///< the carry: batch position 0 of the next round
-    uint32_t n_draft;       ///< the bank's depth at round_end (pulsar_spec_cur_depth), <= 16
+    uint32_t n_draft;       ///< the chain's depth (pulsar_spec_batch_depth: one chain at round_end, the batch's in the redraft), <= 16
     uint32_t n_batch;
     int      commit;
     float    temperature, top_p, min_p;
@@ -61,6 +61,9 @@ typedef struct pulsar_spec_rows {
 static inline uint32_t spec_vocab(const pulsar_session *s) { return (uint32_t)s->engine->logits_width(); }
 /** The session's current draft depth (the adaptive controller's, else the starting depth), 1..16. */
 uint32_t pulsar_spec_cur_depth(const pulsar_session *s);
+/** The depth `n` chains drafted together run at: a fixed-depth drafter's depth_max while n full chains fit one
+ *  verify forward, else the session's depth (session_spec.cpp has the rule and its measurement). */
+uint32_t pulsar_spec_batch_depth(const pulsar_session *s, uint32_t n);
 /** The draft stop threshold in force: --spec-tau / PULSAR_SPEC_TAU, else the drafter's; 0 = no stop. */
 float pulsar_spec_tau(const pulsar_engine *e);
 /** THE stop rule (spec_ops.h): a draft whose confidence is under tau is its chain's last (tau <= 0: none is). */

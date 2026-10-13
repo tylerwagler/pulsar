@@ -371,7 +371,9 @@ static int mtp_draft_batch(pulsar_session *s, pulsar_spec_round **rounds, const 
  * (2026-10-12, sdet accept rule, td305 + U-e4-d5): this drafter accepts as well as TensorFold's on the same tokens
  * (teacher-forced, tools/qwen/accept); the deeper chains TF runs pay there because a draft costs 3.43 ms against
  * 4.45 here (verify row 2.49 + MTP step 1.74, 0.98 of it this draft head's MXFP8 read).  Depth 6 vs 4: single
- * stream -1..+4 %, 4 / 8 streams -3 % on both models -- 4 stays until a draft step is cheaper. */
+ * stream -1..+4 %, 4 / 8 streams -3 % on both models.  L288 (2026-10-13, EXL3 heads, a draft step 1.2 ms): depth 6
+ * pays while every chain fits one verify forward and loses past it, so `depth` is the depth past the verify width
+ * and depth_max the depth within it (pulsar_spec_batch_depth). */
 const pulsar_drafter_ops k_mtp_drafter = {
     /* .name          = */ "MTP",
     /* .depth         = */ 4u,
