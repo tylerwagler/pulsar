@@ -1494,7 +1494,14 @@ context-coherence-probe:
 # Controls run at the same time: the tree itself grades +0.00%, and the
 # SUPERSEDED arithmetic grades +48.88% FURTHER and FAILS -- so the gate rejects
 # regression as well as accepting improvement.
-PREFILL_BASELINE_REF ?= f5bea7aa
+# MOVED f5bea7aa -> 13bcbab1 on 2026-10-13 (L292), BY TYLER'S OVERRIDE, not by
+# the CLOSER rule above.  The 0731 NVFP4 KV row's two divides are IEEE
+# (__fdiv_rn) instead of fast-math MUFU.RCP x FMUL, which makes the device row
+# exactly the host recipe (rule 7) and moves a rare KV code.  The reference gate
+# graded it a noise-level AWAY from an FP8-KV B300 capture that cannot arbitrate
+# NVFP4 rounding; see the dated note at cuda-reference-gate-budget.  13bcbab1 is
+# the pre-squash tip of the fix; the landed commit's engine sources equal it.
+PREFILL_BASELINE_REF ?= 13bcbab1
 # The baseline blob is COMMITTED (L046): a fresh clone can run cuda-prefill-gate
 # with no bootstrap step, and the gate's guarantee no longer depends on a loose
 # file surviving in somebody's tree. The name carries the anchor ref, and the
@@ -1517,9 +1524,10 @@ PREFILL_BASELINE_REF ?= f5bea7aa
 # that same file -- so the default, the battery's model and the symlink are ONE
 # fact and the trap cannot be re-entered by taking a different route to the
 # default.  The 684fa8d blob documents the deleted 0731 artifact and is kept as
-# history; it is not the baseline for anything this tree runs now.  f5bea7aa is
-# the Vision-Exp blob the battery names, dumped by ~/devref-clean's own binary
-# so the anchor is still the REFERENCE engine, not this branch.
+# history; it is not the baseline for anything this tree runs now.  13bcbab1 is
+# the Vision-Exp blob the battery names (the f5bea7aa one it replaced was dumped
+# by ~/devref-clean's own binary; this one by `cuda-prefill-gate-baseline` at the
+# ref, see its .md).
 PREFILL_BASELINE     ?= tests/test-vectors/prefill_bitexact_baseline-$(PREFILL_BASELINE_REF).bin
 # CUTLASS MXFP4 byte coverage, ON THE PROMOTION LANE.
 #
@@ -1544,7 +1552,7 @@ PREFILL_BASELINE     ?= tests/test-vectors/prefill_bitexact_baseline-$(PREFILL_B
 CUTLASS_MXFP4_GATE_MODEL        ?= /srv/models/vexp-promoted-L30
 PREFILL_CUTLASS_MXFP4_BASELINE_REF ?= e823df67
 PREFILL_CUTLASS_MXFP4_BASELINE  ?= tests/test-vectors/prefill_cutlass_mxfp4_baseline-$(PREFILL_CUTLASS_MXFP4_BASELINE_REF).bin
-PREFILL_DECODE_BASELINE_REF ?= f5bea7aa
+PREFILL_DECODE_BASELINE_REF ?= 13bcbab1
 PREFILL_DECODE_BASELINE     ?= tests/test-vectors/prefill_decode_baseline-$(PREFILL_DECODE_BASELINE_REF).bin
 PREFILL_DECODE_BASELINE_WT  ?= temp/wt-prefill-decode-baseline
 PREFILL_DECODE_BASELINE_REF_SHORT := $(shell git rev-parse --short $(PREFILL_DECODE_BASELINE_REF) 2>/dev/null || echo $(PREFILL_DECODE_BASELINE_REF))
@@ -1693,7 +1701,9 @@ PULSAR_REF_TOL ?= 1e-4
 # which cannot see direction -- see the 2026-08-24 note in
 # pulsar-notes/bit-exact-vs-source-2026-08-24.md.  RECORDED FROM THE SERVED
 # MODEL (Vision-Exp, dev 4499f93d, L240, 2026-09-23, `--dump-kl`); the 0731
-# budgets they replaced graded a different model's numbers.
+# budgets they replaced graded a different model's numbers.  RE-RECORDED
+# 2026-10-13 at 13bcbab1 (L292 NVFP4 exact divide) under Tyler's documented
+# OVERRIDE -- see the dated note at cuda-reference-gate-budget.
 KL_BUDGET_STORY ?= tests/test-vectors/kl-budget-story.txt
 KL_BUDGET_CODE  ?= tests/test-vectors/kl-budget-code.txt
 # The reference capture the battery grades against BY DEFAULT (L240): the
@@ -1740,6 +1750,16 @@ cuda-reference-gate: tests/gates_runner
 # CLOSER change put it, so sub-floor moves accumulate against that anchor and
 # the first one to cross the floor votes -- re-recording after each would reset
 # the drift to zero and let it walk.
+#
+# ⚠ OVERRIDE ON RECORD (2026-10-13, Tyler: "I'd land the nvfp4"; ledger L292).
+# The budgets were re-recorded on an AWAY grade, the one thing this note forbids,
+# as an explicit, documented exception: the L292 NVFP4 exact divide (13bcbab1)
+# graded story NET over the confident depths 1.54e-5 -> 1.96e-5 (2048 and 4102
+# closer, 4096 and 6144 farther; every top-1 matches; code blob PASS), and the
+# B300 capture was taken with kv_cache_dtype = fp8 (vllm 0.28.1rc1.dev137), so
+# it cannot arbitrate FP4 rounding.  The exact divide makes the device row equal
+# the host recipe (rule 7).  Next re-grade: an NVFP4-KV B300 capture (#42).  This
+# is not a precedent: any other AWAY grade still means reject, not re-record.
 .PHONY: cuda-reference-gate-budget
 cuda-reference-gate-budget:
 	@if [ -z "$(PULSAR_REF_DIR)" ] || [ ! -f "$(PULSAR_REF_DIR)/story.ref.bin" ]; then \

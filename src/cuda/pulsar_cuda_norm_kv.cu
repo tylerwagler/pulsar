@@ -395,7 +395,7 @@ __device__ static inline void indexer_fp4_pack_row_dev(const indexer_fp4_t &h, c
      * bit fields (pulsar_cuda_internal.h); IEEE division for the RNE ties */
     const uint32_t e8 = pulsar_e8m0_round_up(amax * (1.0f / 6.0f));
     const float scale = pulsar_e8m0_scale(e8);
-    const uint8_t nib = dsv4_e2m1fn_encode_dev(fminf(6.0f, fmaxf(-6.0f, __fdiv_rn(h.v, scale))));
+    const uint8_t nib = pulsar_e2m1_quant_dev(h.v, scale);
     /* The dequantised writeback is for OBSERVERS only -- the packed rows are
      * what every consumer reads (L094). */
     if (keep_f32_slot) *keep_f32_slot = dsv4_e2m1fn_decode_dev(nib, scale);

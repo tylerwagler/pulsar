@@ -343,30 +343,27 @@ static bool segment_span_ok(const pulsar_ckpt_store *st, uint32_t G_prev, uint32
     return G > G_prev && G_prev % grid == 0u && G % grid == 0u;
 }
 
-/* the bytes of a segment over [G_prev, G) carrying `n_images` image records (a v2 segment has no image section:
- * written before L281, when no chain held a block, it loads as carrying none; v3, L281's 4-u32 records, never
- * shipped and is refused) */
-static uint64_t segment_bytes_for(pulsar_ckpt_store *st, uint32_t G_prev, uint32_t G, uint32_t n_images,
-                                  uint32_t version = PULSAR_SESSION_SEGMENT_VERSION) {
+/* the bytes of a segment over [G_prev, G) carrying `n_images` image records.  Only the current version loads:
+ * older segments are refused and the chain rewrites itself (on-disk KV carries no back-compat, Tyler 2026-10-13). */
+static uint64_t segment_bytes_for(pulsar_ckpt_store *st, uint32_t G_prev, uint32_t G, uint32_t n_images) {
     pulsar_kv_pool pools[PULSAR_KV_POOLS_MAX];
     const uint32_t n = segment_pools(st, pools);
     uint64_t bytes = (uint64_t)SEGMENT_U32_FIELDS * sizeof(uint32_t);
     bytes += (uint64_t)(G - G_prev) * sizeof(uint32_t);
-    if (version >= 4u) bytes += sizeof(uint32_t) + (uint64_t)n_images * SEGMENT_IMAGE_U32 * sizeof(uint32_t);
+    bytes += sizeof(uint32_t) + (uint64_t)n_images * SEGMENT_IMAGE_U32 * sizeof(uint32_t);
     bytes += st->slot_bytes;
     bytes += pools_span_bytes(pools, n, G_prev, G);
     return bytes + sizeof(uint64_t);   /* the trailing digest */
 }
 
-/* L281: a stored segment's image records, read from its payload's head without loading it (a v2 segment carries
- * none).  The bytes are the payload digest's to vouch for; this only decides how far a restore goes, and the load
- * that follows re-reads and checks everything. */
+/* L281: a stored segment's image records, read from its payload's head without loading it.  The bytes are the
+ * payload digest's to vouch for; this only decides how far a restore goes, and the load that follows re-reads and
+ * checks everything. */
 int pulsar_session_segment_images(FILE *fp, uint64_t bytes, uint64_t *hashes, uint32_t cap, uint32_t *n_out) {
     *n_out = 0;
     uint32_t h[SEGMENT_U32_FIELDS];
     if (!fp || bytes < sizeof(h) || fread(h, sizeof(uint32_t), SEGMENT_U32_FIELDS, fp) != SEGMENT_U32_FIELDS) return 1;
     if (h[0] != PULSAR_SESSION_SEGMENT_MAGIC || h[7] <= h[6]) return 1;
-    if (h[1] == 2u) return 0;
     if (h[1] != PULSAR_SESSION_SEGMENT_VERSION) return 1;
     if (fseek(fp, (long)((uint64_t)(h[7] - h[6]) * sizeof(uint32_t)), SEEK_CUR) != 0) return 1;
     uint32_t n = 0;
@@ -457,7 +454,7 @@ int pulsar_session::load_segment(FILE *fp, uint64_t bytes, bool last, uint32_t *
     uint32_t h[SEGMENT_U32_FIELDS];
     for (uint32_t i = 0; i < SEGMENT_U32_FIELDS; i++)
         if (payload_read_u32(&io, &h[i], &remaining, err, errlen) != 0) return 1;
-    if (h[0] != PULSAR_SESSION_SEGMENT_MAGIC || (h[1] != PULSAR_SESSION_SEGMENT_VERSION && h[1] != 2u)) {
+    if (h[0] != PULSAR_SESSION_SEGMENT_MAGIC || h[1] != PULSAR_SESSION_SEGMENT_VERSION) {
         payload_set_err(err, errlen, "load segment: unsupported segment version");
         return 1;
     }
@@ -493,7 +490,7 @@ int pulsar_session::load_segment(FILE *fp, uint64_t bytes, bool last, uint32_t *
     /* L281: the span's image records, appended to the identity at commit (the size check needs their count) */
     pulsar_image_block imgs[PULSAR_IMAGE_BLOCKS_MAX];
     uint32_t n_img = 0;
-    if (h[1] >= 4u && payload_read_u32(&io, &n_img, &remaining, err, errlen) != 0) { token_vec_free(&toks); return 1; }
+    if (payload_read_u32(&io, &n_img, &remaining, err, errlen) != 0) { token_vec_free(&toks); return 1; }
     if (n_img > PULSAR_IMAGE_BLOCKS_MAX - s->live_images.n) {
         token_vec_free(&toks);
         payload_set_err(err, errlen, "load segment: more image blocks than a session holds");
@@ -510,7 +507,7 @@ int pulsar_session::load_segment(FILE *fp, uint64_t bytes, bool last, uint32_t *
             return 1;
         }
     }
-    if (bytes != segment_bytes_for(st, G_prev, G, n_img, h[1])) {
+    if (bytes != segment_bytes_for(st, G_prev, G, n_img)) {
         token_vec_free(&toks);
         payload_set_err(err, errlen, "load segment: size does not match its span");
         return 1;
