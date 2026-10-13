@@ -488,6 +488,9 @@ bool server::send_metrics(int fd) {
     const unsigned long long prefill_chunk_tokens =
         (unsigned long long)s->m_prefill_chunk_tokens;
     const int decode_lane = s->m_decode_lane;
+    double phase_ms[SERVER_ROUND_PHASE_COUNT];
+    memcpy(phase_ms, s->m_spec_phase_ms, sizeof phase_ms);
+    const unsigned long long phase_rounds = (unsigned long long)s->m_spec_phase_rounds;
     pthread_mutex_unlock(&s->mu);
     if (running < 0) running = 0;
     if (waiting < 0) waiting = 0;
@@ -568,6 +571,15 @@ bool server::send_metrics(int fd) {
     buf_puts(&b, "# TYPE pulsar:spec_thr_cut_rows_total counter\n");
     buf_printf(&b, "pulsar:spec_thr_cut_rows_total %llu\n",
                (unsigned long long)s->m_spec_thr_cut_rows);
+    /* L288: the spec lane's decode-only rounds by phase, host wall (server_round_phase) -- a client's delta over
+     * a window over the rounds' delta is ms/round per phase, measured untraced. */
+    buf_puts(&b, "# HELP pulsar:spec_round_phase_ms_total Decode-only spec rounds' host wall by phase, ms.\n");
+    buf_puts(&b, "# TYPE pulsar:spec_round_phase_ms_total counter\n");
+    for (int p = 0; p < SERVER_ROUND_PHASE_COUNT; p++)
+        buf_printf(&b, "pulsar:spec_round_phase_ms_total{phase=\"%s\"} %.3f\n", server_round_phase_name[p], phase_ms[p]);
+    buf_puts(&b, "# HELP pulsar:spec_round_phase_rounds_total Decode-only spec rounds timed by phase.\n");
+    buf_puts(&b, "# TYPE pulsar:spec_round_phase_rounds_total counter\n");
+    buf_printf(&b, "pulsar:spec_round_phase_rounds_total %llu\n", phase_rounds);
     /* Prefix-cache hit rate (scraper computes hits/queries). */
     buf_puts(&b, "# HELP vllm:prefix_cache_queries_total Cumulative prompt tokens looked up in the prefix cache.\n");
     buf_puts(&b, "# TYPE vllm:prefix_cache_queries_total counter\n");

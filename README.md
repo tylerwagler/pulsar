@@ -141,6 +141,9 @@ next sections.
   vector generation, and usage.
 - [speed-bench/README.md](speed-bench/README.md): benchmark commands, charts,
   and CSV generation.
+- [tools/serve-bench/scoreboard.sh](tools/serve-bench/scoreboard.sh): the served-speed scoreboard against
+  another engine (pulsar-server or TensorFold, untraced, same client and prompts; tok/s, tokens a round and ms a
+  round per cell, plus TensorFold's own public client); `serve_matrix.py table` prints the comparison.
 - [tests/test-vectors/README.md](tests/test-vectors/README.md): official
   continuation vectors used for regression checks.
 

@@ -1273,6 +1273,8 @@ void server::publish_metrics_snapshot() {
     s->m_prefill_chunk_tokens = s->w_prefill_chunk_tokens;
     s->m_spec_overflow_rounds = s->w_spec_overflow_rounds;
     s->m_spec_thr_cut_rows = s->w_spec_thr_cut_rows;
+    memcpy(s->m_spec_phase_ms, s->w_spec_phase_ms, sizeof s->m_spec_phase_ms);
+    s->m_spec_phase_rounds = s->w_spec_phase_rounds;
     s->m_decode_lane = s->w_decode_lane;
     /* Bump and wake the /metrics/stream subscribers. A generation counter
      * rather than a payload comparison on purpose: "did anything move" over a
@@ -1481,11 +1483,13 @@ static bool server_spec_lane_carries(bool spec_rounds, uint32_t verify_rows, ses
  *     steps, not quanta (a spec quantum at twelve decoders is one round): one 32-step probe per 512 steps is
  *     ~6% of the decode time, so at the measured 10-15% gap probing costs about 1% at most;
  *   - but a re-measure is evidence-based, not a clock (L289): while the lane in force's MEASURED price clears
- *     the other lane's MEASURED price at this N by LANE_PRICE_CLEAR, a flip needs the other lane to move by more
- *     than its price moves between weighings, so the scheduled re-measure waits LANE_PRICE_CLEAR_SPAN times as
- *     long -- the bound on how old a measurement may grow before it is taken again.  The lane in force is
- *     measured every step it runs, so the clearance is read fresh at each pick; a narrower gap, a predicted
- *     price or a new N re-measures on the plain schedule.  (L288, Qwen one stream: spec 51-78 tok/s against
+ *     the other lane's price at this N -- measured, or predicted by its fit (L288) -- by LANE_PRICE_CLEAR, a flip
+ *     needs the other lane to move by more than its price moves between weighings, so the scheduled re-measure
+ *     waits LANE_PRICE_CLEAR_SPAN times as long -- the bound on how old a measurement may grow before it is taken
+ *     again.  The lane in force is measured every step it runs, so the clearance is read fresh at each pick; a
+ *     narrower gap, an unmeasured lane in force or no price for the other lane re-measures on the plain schedule.
+ *     (A fit's misprediction seen so far was optimistic for the other lane -- DeepSeek N8, plain 111 predicted
+ *     against 80 measured -- and the clearance is 25%: a cleared prediction does not hide a faster lane.)  (L288, Qwen one stream: spec 51-78 tok/s against
  *     plain 33.8-36.1 measured, and the 512-step clock re-probed plain 13 times in 48 requests at ~0.67 s each,
  *     ~9% of a probed request; the plain price it re-measured moved 7% end to end.) */
 #define LANE_PRICE_MARGIN        0.04
@@ -1496,6 +1500,9 @@ static bool server_spec_lane_carries(bool spec_rounds, uint32_t verify_rows, ses
 #define LANE_PRICE_CLEAR_SPAN    8u     /* 4096 steps: ~16k tokens of one Qwen stream before the price is re-taken */
 #define LANE_PRICE_ALPHA         0.0625f   /* the measured prices' and yield's EW weight: a probe's 32 steps
                                               carry ~7/8 of the price it ends on */
+
+const char *const server_round_phase_name[SERVER_ROUND_PHASE_COUNT] = {"plan", "forward", "round_end", "emit",
+                                                                       "draft", "commit"};
 
 /* One decode step on lane `li` (PULSAR_LANE_PLAIN / _SPEC) by `n` decoders: `tokens` committed in `ms`. */
 static void lane_price_measure(lane_price *lp, int li, int n, int tokens, double ms) {
@@ -1616,8 +1623,11 @@ static int lane_price_pick(lane_price *lp, const pulsar_lane_cost *plain, const 
         lp->why = "measured faster";
         return other;
     }
-    /* L289: both measured and the lane in force clears the other by LANE_PRICE_CLEAR -- the re-measure waits */
-    const bool clears = other_measured && t_other > 0.0 && t_inc >= t_other * LANE_PRICE_CLEAR;
+    /* L289: the lane in force, measured, clears the other by LANE_PRICE_CLEAR -- the re-measure waits.  L288: the
+     * other's price measured at this N or predicted by its fit (a new N drops the measurements, so with the decoder
+     * count moving the other lane is mostly predicted, and the 512-step clock re-probed it inside every busy
+     * stretch: a 32-step plain probe at four Qwen decoders, ~2 s at 96 tok/s against the spec lane's 165) */
+    const bool clears = t_other > 0.0 && t_inc >= t_other * LANE_PRICE_CLEAR;
     const uint32_t reprobe = clears ? LANE_PRICE_REPROBE_STEPS * LANE_PRICE_CLEAR_SPAN : LANE_PRICE_REPROBE_STEPS;
     if (t_other <= 0.0 || faster || ran >= reprobe) {
         lp->probe = other;
@@ -2569,6 +2579,7 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n, int quantum_
         }
 
         /* ---- ONE shared forward over every bank's rows ------------------- */
+        const double fwd_t0 = server_now_sec();   /* L288: the round's phases (server::w_spec_phase_ms) */
         char err[160];
         pulsar_session_spec_arm_capture(pool, rows);
         uint32_t got = 0;
@@ -2618,6 +2629,7 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n, int quantum_
                                              err, sizeof err);
         }
         pulsar_session_spec_arm_capture(pool, 0u);
+        const double fwd_t1 = server_now_sec();
         s->live_bank = -1;   /* pool is multiseq-poisoned until a bank_switch */
         if (rc != 0 || got != rows) {
             for (int r = 0; r < n_fr; r++) {
@@ -2693,6 +2705,7 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n, int quantum_
             st->accepted_cap = (int)(PULSAR_SPEC_LOGITS_ROWS + 1);
         }
         (void)pulsar_session_spec_round_end_batch(pool, steps, m, logits);
+        const double end_t1 = server_now_sec();
         for (int q = 0; q < m; q++) {
             session_slot *sl = dec[live_idx[q]];
             gen_state *g = sl->gen;
@@ -2789,6 +2802,8 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n, int quantum_
          * draft into its shadow in one batched commit. A
          * device failure here is not fatal: the banks keep no pendings and take
          * a plain n=1 step next round. */
+        const double draft_t0 = server_now_sec();
+        double draft_t1 = draft_t0;
         {
             pulsar_spec_round *live_rounds[PULSAR_SPEC_LOGITS_ROWS];
             uint32_t live_banks[PULSAR_SPEC_LOGITS_ROWS];
@@ -2811,6 +2826,7 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n, int quantum_
                 server_log(PULSAR_LOG_KVCACHE,
                            "pulsar-server: batched redraft failed: %s (banks take a plain step)",
                            rerr);
+            draft_t1 = server_now_sec();
             /* One call stamps every bank's draft into its shadow (restore,
              * commit, save per bank). */
             for (int q = 0; q < nl; q++) {
@@ -2843,6 +2859,11 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n, int quantum_
          * is part of this one's step).  A round that carried prompt rows is
          * not a decode round and is left out. */
         if (n_fr == 0 && rows > 0) {
+            const double round_t1 = server_now_sec();
+            const double cut[SERVER_ROUND_PHASE_COUNT + 1] = {round_t0, fwd_t0, fwd_t1, end_t1, draft_t0, draft_t1,
+                                                              round_t1};
+            for (int p = 0; p < SERVER_ROUND_PHASE_COUNT; p++) s->w_spec_phase_ms[p] += (cut[p + 1] - cut[p]) * 1e3;
+            s->w_spec_phase_rounds++;
             pulsar_engine_lane_cost_observe(s->engine, PULSAR_LANE_SPEC, rows, (server_now_sec() - round_t0) * 1e3);
             /* L284 lane cost: the same round's yield, per bank -- what the lane choice prices the spec lane's
              * rows by (lane_price_pick) */
@@ -3453,10 +3474,11 @@ void *worker_main(void *arg) {
             const lane_price *lp = &s->w_lane_price;
             const bool spec_in = lp->lane == 3;
             server_log(PULSAR_LOG_GENERATION,
-                       "pulsar-server: decode lane %d holds (%d decoders; %s %.1f clears %s %.1f tok/s, both measured, "
+                       "pulsar-server: decode lane %d holds (%d decoders; %s %.1f measured clears %s %.1f%s tok/s, "
                        "x%.2f >= %.2f): the re-measure waits up to %u steps",
                        lp->lane, n_dec, spec_in ? "spec" : "plain", spec_in ? lp->t_spec : lp->t_plain,
                        spec_in ? "plain" : "spec", spec_in ? lp->t_plain : lp->t_spec,
+                       (spec_in ? lp->meas_plain : lp->meas_spec) ? " measured" : " predicted",
                        spec_in ? lp->t_spec / lp->t_plain : lp->t_plain / lp->t_spec, LANE_PRICE_CLEAR,
                        LANE_PRICE_REPROBE_STEPS * LANE_PRICE_CLEAR_SPAN);
             s->w_lane_price.deferral = 2;
