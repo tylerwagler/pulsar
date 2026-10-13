@@ -7068,6 +7068,25 @@ static void test_l289_lane_reprobe_evidence(void) {
     TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 8, 16u) == 2 && lp.meas_plain && lp.meas_spec);
     l284_steps(&lp, &plain, PULSAR_LANE_PLAIN, LANE_PRICE_REPROBE_STEPS, 8, 8, 8, 76.2);
     TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 8, 16u) == 3 && lp.probe == 3 && lp.lane == 2);
+    /* L288: the other lane PREDICTED (a moving decoder count drops the measurements) and cleared by the measured
+     * lane in force: the re-measure waits the same way.  Four Qwen decoders: spec 13 tokens a 80 ms round = 162.5
+     * tok/s measured, plain predicted 4 / 44 ms = 90.9 -- x1.79 */
+    memset(&lp, 0, sizeof lp);
+    plain = l284_cost(20000, 6000, true, 100u, 4.0f, 44.0f);
+    TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 4, 16u) == 3);
+    l284_steps(&lp, &spec, PULSAR_LANE_SPEC, LANE_PRICE_PROBE_STEPS, 4, 13, 16, 80.0);
+    TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 4, 16u) == 3 && lp.meas_spec && !lp.meas_plain && lp.probe == 0);
+    l284_steps(&lp, &spec, PULSAR_LANE_SPEC, LANE_PRICE_REPROBE_STEPS, 4, 13, 16, 80.0);
+    TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 4, 16u) == 3 && lp.probe == 0 && lp.deferral == 1);
+    lp.deferral = 2;
+    l284_steps(&lp, &spec, PULSAR_LANE_SPEC, LANE_PRICE_REPROBE_STEPS * (LANE_PRICE_CLEAR_SPAN - 1u), 4, 13, 16, 80.0);
+    TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 4, 16u) == 2 && lp.probe == 2 && lp.lane == 3);
+    /* ...and a prediction inside the clearance keeps the 512-step clock: plain predicted 4 / 30 ms = 133 */
+    memset(&lp, 0, sizeof lp);
+    plain = l284_cost(10000, 5000, true, 100u, 4.0f, 30.0f);
+    TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 4, 16u) == 3);
+    l284_steps(&lp, &spec, PULSAR_LANE_SPEC, LANE_PRICE_PROBE_STEPS + LANE_PRICE_REPROBE_STEPS, 4, 13, 16, 80.0);
+    TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 4, 16u) == 2 && lp.probe == 2 && lp.deferral == 0);
 }
 
 /* Geometric survival for one bank: np pendings at per-position confidence c,
