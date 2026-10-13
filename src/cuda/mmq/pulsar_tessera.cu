@@ -1,4 +1,4 @@
-/* pulsar_tessera.cu -- the host side of Tessera's fused window kernel, value (BF16, folded) family (L255).
+/* pulsar_tessera.cu -- the host side of Tessera's fused window kernel, value (BF16) family (L255).
  *
  * Made with Tessera by Robert Tand - https://github.com/RobTand/tessera
  *
@@ -43,7 +43,7 @@ void tessera_host_check(bool ok, const char *msg) {
 #define TESSERA_HOST_CUDA(expr) tessera_host_cuda((expr), #expr)
 #define TESSERA_HOST_CHECK(cond, msg) tessera_host_check((cond), (msg))
 #define TESSERA_HOST_REFUSE_PAIR(mode, r_lo, two, tile_words, K) tessera_host_refuse_pair((mode), (r_lo), (two), (tile_words), (K))
-/* nvcc #549-D "cm_nxt is used before its value is set" fires inside the vendored header (upstream 37742e0f
+/* nvcc #549-D "cm_nxt is used before its value is set" fires inside the vendored header (upstream c4fe8376
  * routed_fused_window.cu, the producer loop's advance_micro; present since 1381c3b7): the last chunk's advance
  * copies a next-chunk ColMap that was never loaded, and the copy is dead -- the next work item reloads cm_cur
  * (load_prev at kc0) before any read.  Upstream's own build carries the same copy; patching it would break the
@@ -215,7 +215,7 @@ __global__ void __launch_bounds__(kRouteThreads) route_place_kernel(const int32_
 }
 
 void announce(const char *what, int N, int K, int E, int extra_a, int extra_b) {
-    fprintf(stderr, "pulsar: L255 tessera %s = Tessera fused window kernel (value family, folded bf16), "
+    fprintf(stderr, "pulsar: L255 tessera %s = Tessera fused window kernel (value family, fp32 row-scale epilogue), "
                     "N %d K %d E %d (%d, %d)\n", what, N, K, E, extra_a, extra_b);
 }
 

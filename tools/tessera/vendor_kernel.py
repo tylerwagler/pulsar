@@ -7,18 +7,19 @@ Keeps every device function byte for byte and replaces only the torch host glue 
 replaced line is asserted first, so when upstream moves a seam this fails by name instead of vendoring a
 half-edited file; update the line numbers here after reading the new upstream.
 
-Seams as of upstream 37742e0f (2026-10-08, contract v64; the file is 3778 lines, four families):
+Seams as of upstream c4fe8376 (2026-10-12, contract v67; the file is 3779 lines, four families; the device code
+last changed in 76a9f568, the value family's row scale moved from a folded bf16 weight to the fp32 accumulator):
   68-72      the torch / c10 / ATen includes                                  -> dropped
-  1966-1970  max_dynamic_smem_bytes: C10_CUDA_CHECK                           -> TESSERA_HOST_CUDA
-  1972-1983  launch_variant: C10_CUDA_CHECK(cudaFuncSetAttribute), LAUNCH_CHECK -> TESSERA_HOST_CUDA
-  2016-2026  launch: the three piece-major TORCH_CHECKs                        -> TESSERA_HOST_CHECK
-  2054-2057  launch: the run-pair refusal TORCH_CHECK                          -> TESSERA_HOST_REFUSE_PAIR
-  2063-2080  check_words / check_slot (torch::Tensor)                          -> dropped
-  2081-2109  dense_reduce_kernel                                               kept verbatim
-  2110-2131  i32_ptr / f32_ptr / TABLE_DTYPE / check_run_tables (torch)        -> dropped
-  2132-3048  the E2M1 (FP4) family, under #if TESSERA_ROUTED_FUSED_FP4         -> dropped (we build FP4=0)
-  3049       the anonymous namespace's close                                   kept
-  3051-end   the torch host entries and the PYBIND module                      -> dropped (pulsar_tessera.cu)
+  1964-1968  max_dynamic_smem_bytes: C10_CUDA_CHECK                           -> TESSERA_HOST_CUDA
+  1970-1981  launch_variant: C10_CUDA_CHECK(cudaFuncSetAttribute), LAUNCH_CHECK -> TESSERA_HOST_CUDA
+  2014-2024  launch: the three piece-major TORCH_CHECKs                        -> TESSERA_HOST_CHECK
+  2052-2055  launch: the run-pair refusal TORCH_CHECK                          -> TESSERA_HOST_REFUSE_PAIR
+  2058-2078  check_words / check_slot (torch::Tensor)                          -> dropped
+  2079-2110  dense_reduce_kernel (with its comment)                            kept verbatim
+  2112-2132  i32_ptr / f32_ptr / TABLE_DTYPE / check_run_tables (torch)        -> dropped
+  2133-3048  the E2M1 (FP4) family, under #if TESSERA_ROUTED_FUSED_FP4         -> dropped (we build FP4=0)
+  3050       the anonymous namespace's close                                   kept
+  3052-end   the torch host entries and the PYBIND module                      -> dropped (pulsar_tessera.cu)
 
 Made with Tessera by Robert Tand - https://github.com/RobTand/tessera
 """
@@ -54,29 +55,30 @@ def main():
     expect(68, "#include <torch/extension.h>")
     expect(72, "#include <c10/cuda/CUDAException.h>")
     expect(73, "#include <cuda_runtime.h>")
-    expect(1966, "int max_dynamic_smem_bytes")
-    expect(1968, "C10_CUDA_CHECK(cudaDeviceGetAttribute")
-    expect(1977, "C10_CUDA_CHECK(cudaFuncSetAttribute(routed_fused_kernel<FP8, MODE, DENSE, SPLIT, RL, TWO, BMT, PM, PAIRED>,")
-    expect(1978, "cudaFuncAttributeMaxDynamicSharedMemorySize, smem));")
-    expect(1982, "C10_CUDA_KERNEL_LAUNCH_CHECK();")
-    expect(2016, "TORCH_CHECK(!p.piece_major || (FAMILY_MMA8 && FP8),")
-    expect(2017, '"the piece-major reader is the E4M3 MMA reader only");')
-    expect(2020, "TORCH_CHECK(!k.two && k.r_lo == 4,")
-    expect(2021, '"the piece-major reader is the one-run rate-4 routed body only");')
-    expect(2026, 'TORCH_CHECK(false, "no piece-major rate-4 launch for this mode/width");')
-    expect(2054, 'TORCH_CHECK(false, "the ", (MODE == 2')
-    expect(2057, '(DENSE ? RATE_MAX : ROUTED_RATE_MAX)')
-    expect(2058, "}")
-    expect(2063, "void check_words(const torch::Tensor& words")
-    expect(2081, "// DENSE && SPLIT")
-    expect(2085, "template <bool FP8>")
-    expect(2086, "__global__ void dense_reduce_kernel")
-    expect(2109, "}")
-    expect(2111, "const int32_t* i32_ptr(const torch::Tensor& t)")
-    expect(2132, "#if TESSERA_ROUTED_FUSED_FP4")
-    expect(3047, "#endif  // TESSERA_ROUTED_FUSED_FP4")
-    expect(3049, "}  // namespace")
-    expect(3055, "void routed_fused_forward(")
+    expect(1964, "int max_dynamic_smem_bytes")
+    expect(1966, "C10_CUDA_CHECK(cudaDeviceGetAttribute")
+    expect(1975, "C10_CUDA_CHECK(cudaFuncSetAttribute(routed_fused_kernel<FP8, MODE, DENSE, SPLIT, RL, TWO, BMT, PM, PAIRED>,")
+    expect(1976, "cudaFuncAttributeMaxDynamicSharedMemorySize, smem));")
+    expect(1980, "C10_CUDA_KERNEL_LAUNCH_CHECK();")
+    expect(2014, "TORCH_CHECK(!p.piece_major || (FAMILY_MMA8 && FP8),")
+    expect(2015, '"the piece-major reader is the E4M3 MMA reader only");')
+    expect(2018, "TORCH_CHECK(!k.two && k.r_lo == 4,")
+    expect(2019, '"the piece-major reader is the one-run rate-4 routed body only");')
+    expect(2024, 'TORCH_CHECK(false, "no piece-major rate-4 launch for this mode/width");')
+    expect(2052, 'TORCH_CHECK(false, "the ", (MODE == 2')
+    expect(2055, '(DENSE ? RATE_MAX : ROUTED_RATE_MAX)')
+    expect(2056, "}")
+    expect(2061, "void check_words(const torch::Tensor& words")
+    expect(2079, "// DENSE && SPLIT")
+    expect(2082, "// ``acc * w_scale[n]`` for the BF16 family")
+    expect(2083, "template <bool FP8>")
+    expect(2084, "__global__ void dense_reduce_kernel")
+    expect(2110, "}")
+    expect(2112, "const int32_t* i32_ptr(const torch::Tensor& t)")
+    expect(2133, "#if TESSERA_ROUTED_FUSED_FP4")
+    expect(3048, "#endif  // TESSERA_ROUTED_FUSED_FP4")
+    expect(3050, "}  // namespace")
+    expect(3056, "void routed_fused_forward(")
 
     out = [
         "// VENDORED from Tessera (https://github.com/RobTand/tessera), src/tessera/serving/csrc/routed_fused_window.cu",
@@ -90,9 +92,9 @@ def main():
         "//   * the three piece-major TORCH_CHECKs in launch call TESSERA_HOST_CHECK(cond, msg), and its run-pair refusal",
         "//     calls TESSERA_HOST_REFUSE_PAIR(mode, r_lo, two, tile_words, K);",
         "//   * check_words / check_slot / i32_ptr / f32_ptr / TABLE_DTYPE / check_run_tables (torch::Tensor helpers of the",
-        "//     host entries, upstream 2063-2080 and 2110-2131), the E2M1 family (2132-3048, built only at",
-        "//     TESSERA_ROUTED_FUSED_FP4=1) and the torch host entries + PYBIND module (3051-end) are dropped; pulsar's",
-        "//     launcher (pulsar_tessera.cu) replaces the entries.  dense_reduce_kernel (upstream 2081-2109) is kept verbatim.",
+        "//     host entries, upstream 2058-2078 and 2111-2132), the E2M1 family (2133-3048, built only at",
+        "//     TESSERA_ROUTED_FUSED_FP4=1) and the torch host entries + PYBIND module (3052-end) are dropped; pulsar's",
+        "//     launcher (pulsar_tessera.cu) replaces the entries.  dense_reduce_kernel (upstream 2079-2110) is kept verbatim.",
         "// The includer defines TESSERA_ROUTED_FUSED_FP8 and the three hooks before including this file, and compiles the",
         "// translation unit WITHOUT --use_fast_math (upstream builds -O3 -lineinfo; the SwiGLU epilogue calls expf and",
         "// divides, which fast-math would approximate).",
@@ -100,24 +102,24 @@ def main():
     ]
     out += lines(1, 67)
     out += ["// (upstream lines 68-72: the torch / c10 / ATen includes -- dropped, see the header above)"]
-    out += lines(73, 1967)
+    out += lines(73, 1965)
     out += ["    TESSERA_HOST_CUDA(cudaDeviceGetAttribute(&v, cudaDevAttrMaxSharedMemoryPerBlockOptin, device));"]
-    out += lines(1969, 1976)
+    out += lines(1967, 1974)
     out += ["        TESSERA_HOST_CUDA(cudaFuncSetAttribute(routed_fused_kernel<FP8, MODE, DENSE, SPLIT, RL, TWO, BMT, PM, PAIRED>,",
-            "   " + src[1977]]
-    out += lines(1979, 1981)
+            "   " + src[1975]]
+    out += lines(1977, 1979)
     out += ["    TESSERA_HOST_CUDA(cudaGetLastError());"]
-    out += lines(1983, 2015)
+    out += lines(1981, 2013)
     out += ['    TESSERA_HOST_CHECK(!p.piece_major || (FAMILY_MMA8 && FP8), "the piece-major reader is the E4M3 MMA reader only");']
-    out += lines(2018, 2019)
+    out += lines(2016, 2017)
     out += ['            TESSERA_HOST_CHECK(!k.two && k.r_lo == 4, "the piece-major reader is the one-run rate-4 routed body only");']
-    out += lines(2022, 2025)
+    out += lines(2020, 2023)
     out += ['            TESSERA_HOST_CHECK(false, "no piece-major rate-4 launch for this mode/width");']
-    out += lines(2027, 2053)
+    out += lines(2025, 2051)
     out += ["    TESSERA_HOST_REFUSE_PAIR(MODE, k.r_lo, k.two, p.tile_words, p.K);"]
-    out += lines(2058, 2058)
+    out += lines(2056, 2056)
     out += [""]
-    out += lines(2081, 2109)
+    out += lines(2079, 2110)
     out += ["", "}  // namespace", ""]
     with open(OUT, "w") as f:
         f.write("\n".join(out))

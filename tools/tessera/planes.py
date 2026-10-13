@@ -2,7 +2,8 @@
 
 The one place pulsar's tools turn encoded unit blobs into the arrays src/cuda/mmq/pulsar_tessera.cu reads:
 tests/tessera_kernel_gate's fixture (kernel_fixture.py) and the container builder (overlay_layer.py) both come
-through here, so the engine is fed exactly the planes the byte gate proved.  Value family (BF16 grid, folded).
+through here, so the engine is fed exactly the planes the byte gate proved.  Value family (BF16 grid; the row scale on the fp32 accumulator
+after the dot since Tessera 76a9f568).
 
 Made with Tessera by Robert Tand - https://github.com/RobTand/tessera
 """
@@ -20,8 +21,8 @@ def fused_stack(blobs, device):
     from tessera.compact_prep import parse_compact_wire, prepare_window_compact
 
     unit = lambda b: prepare_window_compact(parse_compact_wire(b), device=device, family="value")
-    bundles = {k: wgg.prepare_grouped_window_gemm([unit(b) for b in blobs[k]], block_m=32, block_n=64, block_k=64,
-                                                  arithmetic="folded") for k in PROJS}
+    bundles = {k: wgg.prepare_grouped_window_gemm([unit(b) for b in blobs[k]], block_m=32, block_n=64, block_k=64)
+               for k in PROJS}
     # Tessera 37742e0f (the routed class cutover): from_bundles takes the expert classes -- ordered contiguous
     # partitions of the experts, each with its q256 profile per projection group (w13 = gate, up; w2 = down).
     # One class over every expert here; its q256 is the stored schedule's own rung (what _profile_schedule

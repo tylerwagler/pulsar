@@ -4,8 +4,8 @@
 Runs Tessera's OWN fused window kernels (its torch extension, built from Tessera's source by Tessera's loader)
 on Qwen3.8-Flash-Next layer-12 weights, and writes every kernel input plus the output bytes to one fixture
 file.  The gate then runs pulsar's launcher (src/cuda/mmq/pulsar_tessera.cu, the same device code vendored)
-on the same inputs and requires the same bytes.  Value family (BF16 grid, folded arithmetic) only -- the one
-pulsar vendors.
+on the same inputs and requires the same bytes.  Value family (BF16 grid; since Tessera 76a9f568 the row scale multiplies the fp32
+accumulator after the dot -- one arithmetic, no ``arithmetic=`` argument) only -- the one pulsar vendors.
 
     python3 kernel_fixture.py --blobs BLOBS_BF16.pt --act /mnt/models/qwen38fn-act-L12 --out tessera_kernel.fx
 
@@ -83,8 +83,7 @@ def main():
     # ---- dense: one role per Linear, x = the layer's real inputs
     dense_cases = () if a.moe_only else (("qkv", "gdn_in.pt", (1, 8, 64, 4096)), ("oproj", "oproj_in.pt", (1, 8, 4096)))
     for role, act_file, ms in dense_cases:
-        bundle = wg.prepare_window_gemm(unit(blobs[role][0]), block_m=64, block_n=64, block_k=64,
-                                        arithmetic="folded")
+        bundle = wg.prepare_window_gemm(unit(blobs[role][0]), block_m=64, block_n=64, block_k=64)
         why = rf.fused_dense_window_supported(bundle)
         if why is not None:
             raise SystemExit(f"dense {role}: Tessera refuses the fused dense identity: {why}")

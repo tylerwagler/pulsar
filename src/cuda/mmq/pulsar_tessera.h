@@ -1,4 +1,4 @@
-/* pulsar_tessera.h -- Tessera window-trellis projections, value (BF16, folded) family (L255).
+/* pulsar_tessera.h -- Tessera window-trellis projections, value (BF16) family (L255).
  *
  * Made with Tessera by Robert Tand - https://github.com/RobTand/tessera
  *
@@ -42,7 +42,7 @@ typedef struct pulsar_tessera_proj {
     const uint16_t *table;    /**< [E, 16384] composed bf16 table (``compose_table16``) */
     const int32_t *init;      /**< [E, K] initial window state per column (permuted order) */
     const int32_t *has_init;  /**< [E] 1 when the expert carries initial states */
-    const float *wscale;      /**< [E, N] row scales (folded into the bf16 weight before the dot) */
+    const float *wscale;      /**< [E, N] row scales (on the fp32 accumulator after the dot) */
     const int32_t *runs;      /**< [E, 8] run pair (``run_pair``) */
     const int32_t *bdesc;     /**< [E, K / 32, 12] block descriptors (``block_desc``), 16-byte aligned */
     int tile_words;           /**< int32 words per 512-row tile: 16 * (sum of the column rates) */
