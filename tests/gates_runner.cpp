@@ -87,6 +87,7 @@ int gate_tp_head_split_gate_main(int, char **);
 int gate_decode_reference_gate_main(int, char **);
 int gate_session_contract_gate_main(int, char **);
 int gate_chat_decode_smoke_main(int, char **);
+int gate_head_graph_replay_gate_main(int, char **);
 
 /* ---- the engine broker ------------------------------------------------- */
 
@@ -493,6 +494,8 @@ int main(int argc, char **argv) {
         {"cuda-mixed-prefill-gate",   gate_mixed_prefill_gate_main,     2, NULL, NULL, {NULL}, DS4},
         {"cuda-mixed-neutrality-gate", gate_mixed_neutrality_gate_main, 3, "PULSAR_GATE_ROWS_FATAL", "5,5 8,8", {NULL}, DS4},
         {"cuda-mixed-neutrality-gate-wide", gate_mixed_neutrality_gate_main, 13, "PULSAR_GATE_NDEC", "12", {NULL}, DS4},
+        /* L292: the captured output-head graph replays only for a head of the same row kinds (pure decode vs fused) */
+        {"cuda-head-graph-replay-gate", gate_head_graph_replay_gate_main, 4, NULL, NULL, {NULL}, DS4},
         {"cuda-spec-sampling-gate",   gate_spec_sampling_gate_main,    16, NULL, NULL, {"0.95", "0", "1250", NULL}, NEED_SPEC | NEED_TOKENIZER},
         {"cuda-row-neutrality-gate",  gate_mseq_short_ctx_probe_main,   2, NULL, NULL, {NULL}, NEED_TOKENIZER},
         /* L170: the same probe past 2048 tokens, where the top-k selection is

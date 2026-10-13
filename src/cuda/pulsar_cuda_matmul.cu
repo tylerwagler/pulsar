@@ -2622,6 +2622,9 @@ int pulsar_gpu_matmul_set_batch_decode_rows(int n) {
  * and by the prefill encoder's f32-store skips (the split's offset views key no
  * slot, so the skips apply only when no decode prefix is in flight). */
 int pulsar_gpu_matmul_batch_decode_rows(void) { return g_batch_decode_rows; }
+uint32_t pulsar_gpu_matmul_decode_prefix(uint32_t n_tok) {
+    return (uint32_t)g_batch_decode_rows < n_tok ? (uint32_t)g_batch_decode_rows : n_tok;
+}
 
 
 static int cuda_matmul_mxfp8_tensor_labeled(pulsar_gpu_tensor *out, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim, const pulsar_gpu_tensor *x, uint64_t n_tok, const char *label) {

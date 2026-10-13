@@ -4525,6 +4525,32 @@ static void test_lib_image_identity(void) {
     TEST_ASSERT(pulsar_image_persist_end(NULL, NULL, qwen_like, 3, &none) == 3);
 }
 
+/* L292: the output head's captured graph must not replay one step's arm choice for another.  Every
+ * (parity, rows, decode prefix) the head can be encoded with is its own key, and the prefix follows the
+ * lane's declared decode rows exactly as the dense dispatchers read them. */
+static void test_head_graph_key(void) {
+    uint64_t keys[2 * 152];   /* 2 parities x sum over rows 1..16 of (rows + 1) prefixes */
+    int n = 0;
+    for (int par = 0; par < 2; par++)
+        for (uint32_t rows = 1; rows <= 16; rows++)
+            for (uint32_t pre = 0; pre <= rows; pre++) keys[n++] = gpu_graph_output_head_seg_key(par != 0, rows, pre);
+    TEST_ASSERT(n == 2 * 152);
+    int dup = 0;
+    for (int i = 0; i < n; i++)
+        for (int j = i + 1; j < n; j++) dup += keys[i] == keys[j];
+    TEST_ASSERT(dup == 0);
+    /* the pre-L292 key named only parity and rows: a 3-row pure decode head and a fused 2-decode +
+     * 1-prompt-row head collided */
+    TEST_ASSERT(gpu_graph_output_head_seg_key(false, 3, 3) != gpu_graph_output_head_seg_key(false, 3, 2));
+    const int saved = pulsar_gpu_matmul_batch_decode_rows();
+    for (int dec = 0; dec <= 16; dec++) {
+        TEST_ASSERT(pulsar_gpu_matmul_set_batch_decode_rows(dec) == 1);
+        for (uint32_t rows = 1; rows <= 16; rows++)
+            TEST_ASSERT(pulsar_gpu_matmul_decode_prefix(rows) == ((uint32_t)dec < rows ? (uint32_t)dec : rows));
+    }
+    TEST_ASSERT(pulsar_gpu_matmul_set_batch_decode_rows(saved) == 1);
+}
+
 static void test_context_memory_shape(void) {
     install_profile_attn_layout();
     const int ctx = 32768;
@@ -4600,6 +4626,7 @@ static const pulsar_test_entry test_entries[] = {
     {"--lane-cost", "lane-cost", "lane cost fit: a step's measured cost to its terms, its centre, or no price at all (L263, L284)", test_lane_cost_fit},
     {"--lib-image-rope", "lib-image-rope", "multi-axis rope positions from the image records vs HF get_rope_index (L268)", test_lib_image_rope},
     {"--lib-image-identity", "lib-image-identity", "the core image identity: records per block, rewind keeps survivors, a chain persists past a block only with its record (L281)", test_lib_image_identity},
+    {"--head-graph-key", "head-graph-key", "the output head's graph key carries its row kinds: a fused step's head never replays a decode step's graph (L292)", test_head_graph_key},
     {"--ctxmem", "ctxmem", "context-buffers estimate: one bank's KV in the stored row formats == the engine's KV-policy sizing", test_context_memory_shape},
     {"--server", "server", "server parser/rendering/cache unit tests", test_server_unit_group},
     {"--render-cases", "render-cases", "render the PULSAR_RENDER_CASES request bodies for tests/render_gate.py (no model)", test_render_cases},

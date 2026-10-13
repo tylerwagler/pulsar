@@ -1789,6 +1789,12 @@ void pulsar_gpu_seg_reset(void) {
     g_seg_reset_pending = 0;
 }
 
+/* L292: the counters an instrument reads to prove which lane it ran (replays served, captures begun since start). */
+void pulsar_gpu_seg_counts(uint64_t *replays, uint64_t *captures) {
+    if (replays) *replays = g_seg_n_replay;
+    if (captures) *captures = g_seg_n_capture;
+}
+
 
 /* L119/L117 root-cause hook: captured segment graphs bake pointers into
  * grow-realloc device scratch (tmp slots, arenas, act buffers). ANY

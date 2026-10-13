@@ -1037,17 +1037,28 @@ static bool gpu_graph_encode_output_head_batch_impl(
         uint64_t               vocab_dim,
         pulsar_gpu_tensor      *out);
 
-/* L119 segment bracket: the output head is round-invariant at fixed n_tokens
- * (2026-08-27 audit — norm/mix/weights/vocab GEMM take only n_tokens and
- * vocab_dim; no position, no frontier, no readback), so at decode widths it
- * is captured once per n_tokens and replayed. Distinct head row counts
- * (mixed-lane head_cap modes) key separately.
+/* L119 segment bracket: the output head reads no position, no frontier and no
+ * readback, so at decode widths it is captured once per KEY and replayed.  The
+ * key is everything host-side the body's launches depend on
+ * (gpu_graph_output_head_seg_key): the carrier parity, n_tokens, and -- since
+ * L292 -- the row kinds.  The 2026-08-27 audit said "norm/mix/weights/vocab GEMM
+ * take only n_tokens and vocab_dim"; L167 made row KIND choose every dense arm
+ * (pulsar_gpu_matmul_decode_prefix), so a fused step's head (decode rows, then
+ * headed prompt rows on the tensor-core arm) and a pure decode step of the same
+ * width recorded different launches under one key, and whichever was captured
+ * replayed for both (vllm 877f6df88 is the same class: a host decision baked
+ * into a graph).
  *
  * Slice 4d: the bracket is taken only for the FULL-vocab range.  A gate recv is
  * a host-side wait (design rule 1) and cannot live inside a captured graph, and
  * the recorded body also writes to whichever destination the capture ran with,
  * so a sliced/TP head must run eager.  `vocab_lo == 0 && vocab_dim == N_VOCAB`
  * is exactly the single-box range, so the capture key needs no new dimension. */
+uint64_t gpu_graph_output_head_seg_key(bool hc_parity, uint32_t n_tokens, uint32_t decode_prefix) {
+    return ((hc_parity ? 1ull : 0ull) << 40) | ((uint64_t)(decode_prefix & 0xFFu) << 24) |
+           (0xFFull << 16) | (2ull << 8) | (uint64_t)(n_tokens & 0xFFu);
+}
+
 bool gpu_graph_encode_output_head_batch(
         pulsar_gpu_graph *g,
         const pulsar_model       *model,
@@ -1059,14 +1070,13 @@ bool gpu_graph_encode_output_head_batch(
         pulsar_gpu_tensor      *out) {
     const bool full_range = vocab_lo == 0u && vocab_dim == (uint64_t)PULSAR_N_VOCAB;
     if (full_range && row0 == 0u && n_tokens >= 1 && n_tokens <= 16 && g->banks.n_banks) {
-        /* L119: parity-keyed like the FFN bracket — the head reads the
-         * sweep-final hidden buffer, whose identity alternates per sweep
-         * (odd layer count x per-layer pointer swap). */
-        const uint64_t hc_parity =
-            (uintptr_t)(const void *)g->batch_cur_hc >
-            (uintptr_t)(const void *)g->batch_next_hc ? 1ull : 0ull;
-        const uint64_t key = (hc_parity << 40) |
-                             (0xFFull << 16) | (2ull << 8) | n_tokens;
+        /* L119: parity-keyed -- the head reads the sweep-final hidden buffer,
+         * whose identity alternates per sweep (odd layer count x per-layer
+         * pointer swap). */
+        const bool hc_parity =
+            (uintptr_t)(const void *)g->batch_cur_hc > (uintptr_t)(const void *)g->batch_next_hc;
+        const uint64_t key = gpu_graph_output_head_seg_key(hc_parity, n_tokens,
+                                                           pulsar_gpu_matmul_decode_prefix(n_tokens));
         const int st = pulsar_gpu_seg_enter(key);
         if (st == 2) return true;
         if (st == 1) {
@@ -1277,6 +1287,12 @@ static bool gpu_graph_encode_output_head_batch_impl(
                                 output_norm, n_tokens);
 
     pulsar_gpu_act_slot_drop(output_norm);   /* L159: planes die with the buffer */
+    /* L292: and the head's flat_hc plane dies with the head.  It is keyed (batch_flat_hc, head rows, hc_dim) and
+     * noted valid; left behind, the NEXT step's layer-0 hc_attn_fn GEMM of a fused step -- whose decode-prefix
+     * call takes the TIGHTEST window over batch_flat_hc (act_slot_find_window) -- read this head's rows instead of
+     * its own (every fused step after an eagerly-encoded head).  A replayed head acquires no slot, so the leak
+     * also made the bytes depend on whether the previous head replayed. */
+    pulsar_gpu_act_slot_drop(g->batch_flat_hc);
     pulsar_gpu_tensor_free(logits);
     pulsar_gpu_tensor_free(output_norm);
     pulsar_gpu_tensor_free(output_embd);
@@ -1387,6 +1403,12 @@ bool gpu_graph_encode_dspark_output_head_batch(
     if (ok) ok = g->tp ? tp_vocab_split(g, n_tokens, project, g->spec_logits)
                        : project(0u, (uint32_t)vocab_dim, logits);
     pulsar_gpu_act_slot_drop(output_norm);   /* L159: planes die with the buffer */
+    /* L292: and the head's flat_hc plane dies with the head.  It is keyed (batch_flat_hc, head rows, hc_dim) and
+     * noted valid; left behind, the NEXT step's layer-0 hc_attn_fn GEMM of a fused step -- whose decode-prefix
+     * call takes the TIGHTEST window over batch_flat_hc (act_slot_find_window) -- read this head's rows instead of
+     * its own (every fused step after an eagerly-encoded head).  A replayed head acquires no slot, so the leak
+     * also made the bytes depend on whether the previous head replayed. */
+    pulsar_gpu_act_slot_drop(g->batch_flat_hc);
     pulsar_gpu_tensor_free(logits);
     pulsar_gpu_tensor_free(output_norm);
     pulsar_gpu_tensor_free(output_embd);

@@ -277,6 +277,9 @@ void pulsar_gpu_seg_reset(void);   /* REQUIRED on gpu-graph teardown: cached
                                     * execs bake that graph's device pointers */
 void pulsar_gpu_seg_note_device_free(void); /* REQUIRED at every grow-realloc
                                     * scratch free: baked pointers go stale */
+/** Process-lifetime segment counters: graphs replayed and captures begun (L292: a gate proves it ran the replay
+ *  lane, or the eager one, by their movement across its steps). */
+void pulsar_gpu_seg_counts(uint64_t *replays, uint64_t *captures);
 
 int pulsar_gpu_set_model_map(const void *model_map, uint64_t model_size);
 int pulsar_gpu_set_model_fd(int fd);
@@ -837,6 +840,12 @@ int pulsar_gpu_matmul_set_batch_decode_rows(int n);
  *  width past the exact range); everything else stays at the M-neutral cap. */
 int pulsar_gpu_matmul_set_batch_decode_rows_capped(int n, int cap);
 int pulsar_gpu_matmul_batch_decode_rows(void);
+/** The row-kind fact a dense call of `n_tok` rows chooses its arms by (L167): its effective decode prefix,
+ *  min(declared decode rows, n_tok) -- 0 = every row prefill (tensor-core arms), n_tok = every row decode
+ *  (M-independent arms), between = split there.  Two calls with the same n_tok and the same prefix take the
+ *  same arms; a different prefix is different arithmetic.  Anything that caches an encoded call (a captured
+ *  CUDA graph) keys on this (L292). */
+uint32_t pulsar_gpu_matmul_decode_prefix(uint32_t n_tok);
 /** L260: the widest decode step whose rows are still BYTE-IDENTICAL to the same
  *  rows at any narrower width (and alone).  Wider decode steps take width-
  *  dependent arithmetic (Tyler 2026-10-01: the fastest arm per width), graded,

@@ -3848,6 +3848,10 @@ bool gpu_graph_encode_output_head(
  * into `out` rows [0, n_tokens), covering the vocab range
  * [vocab_lo, vocab_lo + vocab_dim).  The single-box caller passes
  * (0, N_VOCAB, g->spec_logits). */
+/** L292: the output head's graph-capture key -- the carrier parity, the head's row count, and its decode
+ *  prefix (pulsar_gpu_matmul_decode_prefix: which rows take the decode arms).  Every host-side fact the
+ *  captured launches depend on is a field; n_tokens <= 16, so each fits its byte. */
+uint64_t gpu_graph_output_head_seg_key(bool hc_parity, uint32_t n_tokens, uint32_t decode_prefix);
 bool gpu_graph_encode_output_head_batch(
         pulsar_gpu_graph *g,
         const pulsar_model       *model,
