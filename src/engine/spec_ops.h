@@ -90,7 +90,10 @@ typedef struct pulsar_spec_target_ops {
  *  sampled chain's kept drafts are still draws from q.  How a drafter reaches the stop is its own: DSpark
  *  drafts the whole chain in one forward and trims after; MTP drafts token by token and stops there.
  *  --spec-depth / --spec-tau (PULSAR_SPEC_DEPTH / PULSAR_SPEC_TAU) override the numbers for whichever
- *  drafter the model carries. */
+ *  drafter the model carries.  L288: a drafter that drafts token by token also stops a chain whose survival no
+ *  longer pays one more step and its verify row (pulsar_spec_chain_price), and a bank that repeats its history
+ *  takes a copy chain instead of the drafter's (pulsar_spec_copy_chain, up to depth_max): the record arrives from
+ *  pulsar_spec_draft_req_init with `copied` set and its drafts in place, and the drafter leaves them. */
 typedef struct pulsar_drafter_ops {
     const char *name;
     uint32_t depth;       ///< the depth a fresh session drafts at (the adaptive controller moves it from here)

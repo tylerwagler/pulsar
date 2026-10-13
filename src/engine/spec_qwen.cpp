@@ -4,9 +4,9 @@
  *
  *   verify   the trunk runs [base, d_1 .. d_k] at p .. p + k as ONE PREFILL step of one bank with every
  *            row headed and the per-row state capture armed (qwen_forward verify = true; the server's
- *            lane reaches the same step through decode_mixed with heads on every row).  k + 1 <= 7, so
- *            every kernel takes its decode-width arm and each row's logits are the bytes one-token
- *            decode would give.
+ *            lane reaches the same step through decode_mixed with heads on every row).  k + 1 <= 16 (a copy
+ *            chain's, L288; an MTP chain's <= 8), so every kernel takes its decode-width arm and each row's
+ *            logits are the bytes one-token decode would give.
  *   commit   the recurrent state is set to the last kept row's (pulsar_qwen_s4_spec_rollback over the
  *            capture: L288 the GDN recurrent state, which the verify left untouched, advanced by the kept
  *            rows' updates; the rest rolled back), the bank's position counter moves, the logits are the
@@ -32,6 +32,8 @@
 #include "qwen_forward.h"
 
 #include <math.h>
+
+static_assert(PULSAR_QWEN_SPEC_DRAFT_MAX + 1u <= PULSAR_QWEN_SPEC_ROWS, "a bank's verify run fits the verify width");
 
 /* ---- the target hooks ------------------------------------------------------------------------- */
 
@@ -208,8 +210,9 @@ static bool mtp_draft_chains(pulsar_session *s, const uint32_t *banks, uint64_t 
         int32_t pctx[2];        /* the bank's n-gram context, for the PLE prefetch */
         bool sampled, live;     /* live: the chain takes the next step */
         uint32_t row;           /* its row in the last step */
+        float run;              /* its survival: the product of its drafts' confidences */
+        bool copy;              /* L288: its drafts are a copy chain; it takes step 1 only (its MTP row) */
     } c[PULSAR_QWEN_HEAD_ROWS_MAX];
-    bool any_sampled = false;
     for (uint32_t i = 0; i < n; i++) {
         spec_redraft_req *q = reqs[i];
         chain &ch = c[i];
@@ -217,9 +220,13 @@ static bool mtp_draft_chains(pulsar_session *s, const uint32_t *banks, uint64_t 
         ch.p = st->bank_pos[ch.b];
         ch.sampled = q->temperature > 0.0f;
         ch.live = false;
-        q->keep = 0;
-        q->have_conf = true;
-        q->refined[0] = q->next_base;
+        ch.copy = q->copied;   /* L288: the record holds a copy chain (pulsar_spec_draft_req_init) */
+        ch.run = 1.0f;
+        if (!ch.copy) {
+            q->keep = 0;
+            q->have_conf = true;
+            q->refined[0] = q->next_base;
+        }
         if (ch.sampled && !rngs[i]) {
             snprintf(err, errlen, "%s: sampled speculation needs the request's rng", PULSAR_QWEN_ARCH);
             return false;
@@ -227,28 +234,56 @@ static bool mtp_draft_chains(pulsar_session *s, const uint32_t *banks, uint64_t 
         /* no pending row (a failed MTP step, a fresh restore): this round verifies the carry alone */
         if (st->mtp_pend_pos[ch.b] == UINT32_MAX || st->mtp_pend_pos[ch.b] + 1u != ch.p) continue;
         /* the drafts and the carry must fit the context */
+        if (q->n_draft > PULSAR_QWEN_SPEC_DRAFT_MAX) {
+            snprintf(err, errlen, "%s: a chain of %u drafts is past the verify capture's %u", PULSAR_QWEN_ARCH,
+                     q->n_draft, PULSAR_QWEN_SPEC_DRAFT_MAX);
+            return false;
+        }
         ch.K = q->n_draft;
         if ((uint64_t)ch.p + 1u + ch.K > (uint64_t)st->ctx) ch.K = st->ctx > ch.p + 1u ? st->ctx - ch.p - 1u : 0u;
         if (ch.K == 0) continue;
         ch.live = true;
-        any_sampled |= ch.sampled;
         /* L289: the verify will embed [x, d_1 ..] after the bank's n-gram context: their PLE rows are read into the
          * page cache while the chain runs (each as it is known), so the verify's gather finds them there */
         ch.pctx[0] = st->ngram_ctx[(size_t)ch.b * nc];
         ch.pctx[1] = st->ngram_ctx[(size_t)ch.b * nc + 1u];
-        pulsar_qwen_s4_ple_prefetch(w, ch.pctx, &q->refined[0], 1);
+        pulsar_qwen_s4_ple_prefetch(w, ch.pctx, &q->refined[0], ch.copy ? 1u + q->keep : 1u);
     }
+    /* L288 pass 2: the price a further step must clear (session_spec.cpp, the priced depth), and every survival the
+     * round has drafted so far -- what outranks a chain for the shared verify width */
+    uint32_t n_live = 0;
+    for (uint32_t i = 0; i < n; i++) n_live += c[i].live ? 1u : 0u;
+    const pulsar_spec_chain_price price = pulsar_spec_chain_price_for(s, n_live);
+    float drafted[PULSAR_QWEN_HEAD_ROWS_MAX * PULSAR_QWEN_SPEC_DRAFT_MAX];
+    uint32_t n_drafted = 0;
+    /* L288 copy drafts: a record that holds a copy chain (pulsar_spec_draft_req_init) keeps it; its drafts outrank the
+     * MTP drafts by their survival like any other.  It still takes step 1 when its bank has a parked MTP row -- the
+     * lockstep row writes the bank's MTP row at p - 1, which the next round's chain conditions on -- and its pick
+     * there is dropped. */
+    for (uint32_t i = 0; i < n; i++) {
+        if (!c[i].copy) continue;
+        float run = 1.0f;
+        for (uint32_t k = 0; k < reqs[i]->keep; k++) drafted[n_drafted++] = run *= reqs[i]->conf[k];
+    }
+    bool any_sampled = false;
+    for (uint32_t i = 0; i < n; i++) any_sampled |= c[i].live && !c[i].copy && c[i].sampled;
     /* L289: the picks are the device's; the rows come back only when a chain samples (its q) */
     float *L = any_sampled ? st->spec_logits : NULL;
     qwen_mtp_pick pick[PULSAR_QWEN_HEAD_ROWS_MAX];
     /* position j of chain i from its row's pick: its confidence (whether it is the chain's last), then its draft:
      * the pick (greedy) or a draw from q over the row in L (sampled) */
     auto draft = [&](uint32_t i, uint32_t j) -> bool {
+        if (c[i].copy) {   /* its drafts are the copy; step 1 wrote its MTP row */
+            c[i].live = false;
+            return true;
+        }
         spec_redraft_req *q = reqs[i];
         const qwen_mtp_pick &pk = pick[c[i].row];
         const float *row = L ? L + (size_t)c[i].row * w->n_draft : NULL;
         q->conf[j - 1] = pk.conf;
         q->keep = j;
+        c[i].run *= pk.conf;
+        drafted[n_drafted++] = c[i].run;   /* j <= K <= PULSAR_QWEN_SPEC_DRAFT_MAX (refused above) */
         if (pulsar_spec_conf_stops(pk.conf, tau) || j == c[i].K) c[i].live = false;   /* the chain's last */
         if (!c[i].sampled) {
             q->refined[j] = pk.id;
@@ -271,9 +306,11 @@ static bool mtp_draft_chains(pulsar_session *s, const uint32_t *banks, uint64_t 
         /* the step's rows: step 1 is every chain's lockstep row (the pending stack at p - 1, x); step j > 1 feeds
          * each live chain's MTP streams of its last row with d_{j-1} at p + j - 2 */
         uint32_t m = 0;
+        bool headed = false;   /* a chain that drafts from this step's pick rides it (a copy chain needs no head) */
         for (uint32_t i = 0; ok && i < n; i++) {
             chain &ch = c[i];
             if (!ch.live) continue;
+            headed |= !ch.copy;
             ok = j == 1 ? pulsar_gpu_tensor_copy_async(st->mtp_h, (uint64_t)m * hc, st->mtp_pend, (uint64_t)ch.b * hc,
                                                        hc) != 0
                         : pulsar_gpu_tensor_copy_async(st->mtp_h, (uint64_t)m * hc, st->mtp_streams,
@@ -284,7 +321,9 @@ static bool mtp_draft_chains(pulsar_session *s, const uint32_t *banks, uint64_t 
             ch.row = m++;
         }
         if (!ok || m == 0) break;
-        ok = qwen_mtp_forward(s, PULSAR_QWEN_STEP_DECODE, tok, pos, bank, m, 0, m, L, pick);
+        const double step_t0 = now_sec();
+        ok = headed ? qwen_mtp_forward(s, PULSAR_QWEN_STEP_DECODE, tok, pos, bank, m, 0, m, L, pick)
+                    : qwen_mtp_forward(s, PULSAR_QWEN_STEP_DECODE, tok, pos, bank, m, 0, 0, NULL, NULL);
         if (j == 1) {
             for (uint32_t i = 0; i < n; i++) {
                 if (!c[i].live) continue;
@@ -299,6 +338,17 @@ static bool mtp_draft_chains(pulsar_session *s, const uint32_t *banks, uint64_t 
         }
         for (uint32_t i = 0; ok && i < n; i++)
             if (c[i].live) ok = draft(i, j);
+        /* the step's wall, picks and draws included (the picks' readback waited for the device): the drafter's step
+         * price.  Off TP only, as the lane fits are (a group's ranks must price alike). */
+        if (ok && headed && !e->tp) lane_cost_fit_observe(&e->draft_step_cost, m, (now_sec() - step_t0) * 1e3);
+        /* the priced depth: a chain goes on while its survival pays one more step and its row, and fewer drafts than
+         * the shared verify carries already outrank it */
+        for (uint32_t i = 0; ok && i < n; i++) {
+            if (!c[i].live) continue;
+            uint32_t ahead = 0;
+            for (uint32_t k = 0; k < n_drafted; k++) ahead += drafted[k] >= c[i].run ? 1u : 0u;
+            if (!pulsar_spec_chain_more(&price, c[i].run, ahead)) c[i].live = false;
+        }
     }
     if (!ok) {
         snprintf(err, errlen, "%s: the MTP draft chain failed (see the log)", PULSAR_QWEN_ARCH);
@@ -371,10 +421,14 @@ static int mtp_draft_batch(pulsar_session *s, pulsar_spec_round **rounds, const 
  * (2026-10-12, sdet accept rule, td305 + U-e4-d5): this drafter accepts as well as TensorFold's on the same tokens
  * (teacher-forced, tools/qwen/accept); the deeper chains TF runs pay there because a draft costs 3.43 ms against
  * 4.45 here (verify row 2.49 + MTP step 1.74, 0.98 of it this draft head's MXFP8 read).  Depth 6 vs 4: single
- * stream -1..+4 %, 4 / 8 streams -3 % on both models -- 4 stays until a draft step is cheaper. */
+ * stream -1..+4 %, 4 / 8 streams -3 % on both models.  L288 (2026-10-13, tf-gap pass 2): no fixed depth -- the chain
+ * runs to `depth` while its survival pays one more MTP step and its verify row at the lane's yield and the shared
+ * verify width still has room for it (pulsar_spec_chain_price), the stop rule beside it; a copy chain (a repeat of
+ * the bank's history) runs to depth_max, the verify capture. */
 const pulsar_drafter_ops k_mtp_drafter = {
     /* .name          = */ "MTP",
-    /* .depth         = */ 4u,
+    /* .depth         = */ 7u,   /* the MTP chain's cap (the L288 depth sweep's best code cell: 97.5 tok/s against
+                                  * 96.2 at 8 and 94.5 at 6); the priced depth stops a chain short of it */
     /* .depth_max     = */ PULSAR_QWEN_SPEC_DRAFT_MAX,
     /* .tau           = */ 0.7f,
     /* .adapt         = */ NULL,

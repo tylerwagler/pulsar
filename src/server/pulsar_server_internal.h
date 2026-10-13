@@ -1644,11 +1644,6 @@ struct server {
      * attribution instrument). */
     uint64_t w_prefill_chunk_tokens;  ///< worker-owned running count
     uint64_t m_prefill_chunk_tokens;  ///< published copy, read by send_metrics
-    /** L117: live EMA of ms per emitted token in the spec-batched lane
-     * (worker-owned). Denominator of the overflow argmax's cost threshold:
-     * a marginal draft row is admitted while survival >= marginal_ms / this.
-     * 0 until the first quantum; the argmax uses a 45 ms prior until then. */
-    float    spec_ms_per_tok_ema;
     /** L136: how often the overflow argmax actually binds.  overflow_rounds
      * counts sweeps whose demand exceeded the shared row budget; thr_cut_rows
      * counts candidate rows the COST THRESHOLD priced out (budget still
