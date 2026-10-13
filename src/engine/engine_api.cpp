@@ -1567,6 +1567,12 @@ pulsar_lane_cost pulsar_engine_lane_cost(const pulsar_engine *e, pulsar_decode_l
     }
     return lane_cost_fit_view(&e->lane_cost[lane]);
 }
+void pulsar_engine_spec_yield_observe(pulsar_engine *e, int tokens, double ms) {
+    if (!e || tokens <= 0 || !(ms > 0.0)) return;
+    const float v = (float)(ms / (double)tokens);
+    e->spec_token_ms = e->spec_token_ms <= 0.0f ? v : 0.9f * e->spec_token_ms + 0.1f * v;
+}
+float pulsar_engine_spec_token_ms(const pulsar_engine *e) { return e ? e->spec_token_ms : 0.0f; }
 void pulsar_engine_spec_cost_set(pulsar_engine *e, int32_t flat_us, int32_t row_us, bool valid) {
     if (!e) return;
     pulsar_lane_cost_fit *f = &e->lane_cost[PULSAR_LANE_SPEC];

@@ -23,6 +23,7 @@ typedef struct {
     bool     sample_drafts;
     uint32_t keep;
     bool     have_conf;
+    bool     copied;        ///< L288: the drafts are a copy chain (pulsar_spec_copy_chain), not the drafter's
     int32_t  refined[17];
     float    conf[16];
 } spec_redraft_req;
@@ -34,6 +35,7 @@ typedef struct pulsar_spec_round {
     int saved_len;          ///< checkpoint length before the round, to trim back to on rejection
     int32_t pend[16];       ///< the drafted token ids, in draft order
     float pend_conf[16];    ///< confidence head's score per draft position
+    bool copy;              ///< L288: the drafts are a copy chain (their verdict feeds the copy acceptance)
     int row_tops[16];       ///< the target's argmax per verify row; the greedy walk's comparison
     /** The target's state snapshot taken before the verify (pulsar_spec_target_ops snapshot / restore /
      * release own its contents; malloc'd, freed with the round), so a partial accept can roll back. */
@@ -72,6 +74,30 @@ static inline uint32_t pulsar_spec_conf_keep(const float *conf, uint32_t n, floa
         if (pulsar_spec_conf_stops(conf[k], tau)) return k + 1u;
     return n;
 }
+/** L288: the price one more draft step must clear (session_spec.cpp has the rule): a chain whose survival so far is
+ *  under run_min (0 = no price yet) or that `budget` of the round's drafts already outrank stops. */
+typedef struct {
+    float run_min;      ///< survival a chain needs to take one more drafter step (the step and its verify row)
+    float run_min_row;  ///< survival a draft that costs no drafter step needs (a copy draft: its verify row alone)
+    uint32_t budget;    ///< draft rows the shared verify carries beside every chain's base row
+} pulsar_spec_chain_price;
+pulsar_spec_chain_price pulsar_spec_chain_price_for(const pulsar_session *s, uint32_t chains);
+/** Does a chain whose survival is `run`, with `ahead` of the round's drafts at or above it, take another step? */
+static inline bool pulsar_spec_chain_more(const pulsar_spec_chain_price *p, float run, uint32_t ahead) {
+    return run >= p->run_min && ahead < p->budget;
+}
+/** L288: the copy chain of `bank` -- when its last PULSAR_SPEC_COPY_MATCH tokens (its history, then `next_base`)
+ *  occurred earlier in its history, the tokens that followed the latest such copy, at most `max`, into out[]; their
+ *  count, 0 for none (session_spec.cpp has the rule). */
+#define PULSAR_SPEC_COPY_MATCH 8u
+uint32_t pulsar_spec_copy_chain(pulsar_session *s, uint32_t bank, int32_t next_base, uint32_t max, int32_t *out);
+/** The confidence the installed bank's copy drafts carry: this request's measured copy acceptance
+ *  (pulsar_spec_carry_state::copy_accept), 1 until one is measured. */
+float pulsar_spec_copy_conf(const pulsar_session *s);
+/** How many of a copy chain's n drafts the price keeps (each at conf `c`): the first, then each while the chain's
+ *  survival pays the next one's verify row and fewer than the budget's drafts outrank it.  `drafted` holds the
+ *  survivals already drafted this round (n_drafted of them); the kept drafts' are appended. */
+uint32_t pulsar_spec_copy_keep(const pulsar_spec_chain_price *p, float c, uint32_t n, float *drafted, uint32_t *n_drafted);
 /** A draft record for the installed bank's next chain after `next_base` at the session's depth and these
  *  params -- what a drafter's draft / draft_batch fills (the rest of the record is the caller's). */
 void pulsar_spec_draft_req_init(pulsar_session *s, spec_redraft_req *q, int next_base, float temperature, int top_k,

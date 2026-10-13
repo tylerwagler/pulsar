@@ -567,6 +567,10 @@ static uint32_t dspark_draft(pulsar_session *s, int next_base, bool, float tempe
     spec_redraft_req rec;
     memset(&rec, 0, sizeof rec);
     pulsar_spec_draft_req_init(s, &rec, next_base, temperature, top_k, top_p, min_p);
+    if (rec.copied) {   /* L288: the bank repeats its history -- the copy chain is the round's drafts */
+        pulsar_spec_redraft_stamp(s, &rec);
+        return rec.keep;
+    }
     /* greedy with no host consumer at draft time (no dump) defers the readback */
     const bool defer = !rec.sample_drafts && !gpu_graph_spec_dump_active();
     spec_redraft_req *qs[1] = {&rec};
@@ -858,7 +862,8 @@ static int dspark_draft_batch(pulsar_session *s, pulsar_spec_round **rounds,
     for (int pass = 0; pass < 2; pass++)
         for (int i = 0; i < n; i++) {
             spec_redraft_req *q = &rounds[i]->redraft;
-            if (!q->valid || q->n_draft == 0 || (pass == 0) != !q->sample_drafts) continue;
+            if (pass == 0 && q->valid && q->copied) q->done = true;   /* L288: a copy chain, drafted at its record */
+            if (!q->valid || q->copied || q->n_draft == 0 || (pass == 0) != !q->sample_drafts) continue;
             qs[n_sel] = q;
             bk[n_sel] = banks[i];
             rg[n_sel] = rngs[i];

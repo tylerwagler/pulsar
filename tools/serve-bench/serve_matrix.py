@@ -28,7 +28,7 @@ srv_ms_per_round = 1000 x srv_tok_per_round / decode_tps: a round's wall price a
 stream, from the median stream's rate).
 
   scoreboard  the fixed L288 cell set against one engine: single code T0 / prose T0 / code T0.7 (median of --reps x
-           --tokens), then --streams-set (default 4,8) concurrent streams at T0 (--conc-tokens each).
+           --tokens) and edit T0 (1024 tokens: a quoted module re-stated with a rename), then --streams-set (default 4,8) concurrent streams at T0 (--conc-tokens each).
            tools/serve-bench/scoreboard.sh starts either engine (pulsar-server or TensorFold) and runs it plus
            TensorFold's own public client (tools/bench_openai.py); `serve_matrix.py table A.jsonl B.jsonl` compares.
 
@@ -60,7 +60,11 @@ PROMPTS = {
                      "Include type hints, docstrings, and a set of unittest test cases."),
     # A raw mid-document continuation (L271's losing workload: low MTP acceptance).
     "story": ("raw", None),
+    # L288: an edit / refactor -- the prompt quotes a ~165-line module (edit_fixture.txt) and the reply re-states most
+    # of it with small changes: the workload copy / prompt-lookup drafts are for (TensorFold #468).
+    "edit": ("chat", None),
 }
+EDIT_FILE = os.path.join(HERE, "edit_fixture.txt")
 
 CONC_TASKS = [
     "Write a Python LRU cache class with O(1) get and put, with type hints and unittest cases.",
@@ -82,6 +86,14 @@ def story_text():
         if marker in t:
             t = t.split(marker, 1)[1]
     return t
+
+
+def edit_prompt():
+    with open(EDIT_FILE, encoding="utf-8") as f:
+        src = f.read()
+    return ("Here is a Python module:\n\n```python\n" + src + "```\n\nRename the class `Inventory` to `Warehouse` and "
+            "the method `restock_plan` to `reorder_plan` everywhere, add type hints to every function and method "
+            "signature, and reply with the complete updated module in one code block and nothing else.")
 
 
 def story_prompt():
@@ -223,7 +235,7 @@ def emit(rec, out):
 def run_single(a):
     for name in a.prompts.split(","):
         kind, text = PROMPTS[name]
-        text = text if text is not None else story_prompt()
+        text = text if text is not None else edit_prompt() if name == "edit" else story_prompt()
         for temp in [float(t) for t in a.temps.split(",")]:
             request(a.port, kind, text, min(a.tokens, 64), temp, 1233, a.model)          # warm-up
             m0, lm = spec_counters(a.port), log_mark(a)
@@ -302,14 +314,17 @@ def run_prefill(a):
                   "prefill_tps": round((pt or n) / ttft, 1) if ttft else None}, a.out)
 
 
-# The L288 scoreboard's single-stream cells (prompt, temperature); the concurrent cells run at T0.
-SCOREBOARD_SINGLE = [("code", 0.0), ("prose", 0.0), ("code", 0.7)]
+# The L288 scoreboard's single-stream cells (prompt, temperature, tokens -- None: --tokens); the concurrent cells run
+# at T0.  The edit cell runs 1024 tokens: its reply re-states the quoted module, and 512 would end inside the copy.
+SCOREBOARD_SINGLE = [("code", 0.0, None), ("prose", 0.0, None), ("code", 0.7, None), ("edit", 0.0, 1024)]
 
 
 def run_scoreboard(a):
-    for name, temp in SCOREBOARD_SINGLE:
+    for name, temp, tokens in SCOREBOARD_SINGLE:
         b = argparse.Namespace(**vars(a))
         b.prompts, b.temps = name, str(temp)
+        if tokens:
+            b.tokens = tokens
         run_single(b)
     for n in [int(x) for x in a.streams_set.split(",") if x]:
         conc_cell(a, n, 0.0, a.conc_tokens)

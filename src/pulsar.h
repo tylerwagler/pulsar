@@ -1154,6 +1154,13 @@ pulsar_lane_cost pulsar_engine_lane_cost(const pulsar_engine *e, pulsar_decode_l
  *  when `rows` sits at the fit's centre (within half a row, 16+ steps: the slope does not enter); else 0 -- no
  *  number. */
 double pulsar_lane_cost_ms(const pulsar_lane_cost *c, double rows);
+/** L288 (tf-gap pass 2): the spec lane's yield -- the wall one emitted token costs, ms, an exponentially weighted
+ *  mean (weight 0.1) over what the lanes report: the server's decode quanta, the single lane's rounds (`tokens`
+ *  emitted in `ms`).  It is the VALUE OF A TOKEN both draft prices read: the server's K-allocator admits a verify
+ *  row while its chain survival pays the spec lane's row_us against it, and a drafter takes one more step while
+ *  the survival pays that step and its row (session_spec.cpp pulsar_spec_chain_price).  0 until observed. */
+void pulsar_engine_spec_yield_observe(pulsar_engine *e, int tokens, double ms);
+float pulsar_engine_spec_token_ms(const pulsar_engine *e);
 const pulsar_tokens *pulsar_session_tokens(pulsar_session *s);
 
 /** Session payload helpers.  HTTP/agent code owns the outer file header and

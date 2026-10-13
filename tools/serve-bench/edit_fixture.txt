@@ -1,0 +1,160 @@
+"""inventory.py -- a small warehouse inventory with reservations and a restock planner."""
+
+from __future__ import annotations
+
+import dataclasses
+import datetime as dt
+import json
+from collections import defaultdict
+
+
+class InventoryError(Exception):
+    """Raised when an operation would leave the inventory inconsistent."""
+
+
+@dataclasses.dataclass
+class Item:
+    sku: str
+    name: str
+    unit_cost: float
+    on_hand: int = 0
+    reserved: int = 0
+    reorder_point: int = 10
+    reorder_qty: int = 50
+
+    @property
+    def available(self):
+        return self.on_hand - self.reserved
+
+    def to_dict(self):
+        return dataclasses.asdict(self)
+
+
+@dataclasses.dataclass
+class Reservation:
+    rid: int
+    sku: str
+    qty: int
+    created: dt.datetime
+    expires: dt.datetime
+
+    def expired(self, now):
+        return now >= self.expires
+
+
+class Inventory:
+    def __init__(self, hold_minutes=30):
+        self.items = {}
+        self.reservations = {}
+        self.next_rid = 1
+        self.hold = dt.timedelta(minutes=hold_minutes)
+        self.log = []
+
+    def add_item(self, sku, name, unit_cost, reorder_point=10, reorder_qty=50):
+        if sku in self.items:
+            raise InventoryError(f"duplicate sku {sku}")
+        if unit_cost < 0:
+            raise InventoryError(f"negative cost for {sku}")
+        self.items[sku] = Item(sku, name, unit_cost, 0, 0, reorder_point, reorder_qty)
+        self._record("add", sku, 0)
+        return self.items[sku]
+
+    def receive(self, sku, qty):
+        item = self._get(sku)
+        if qty <= 0:
+            raise InventoryError(f"receive of {qty} units of {sku}")
+        item.on_hand += qty
+        self._record("receive", sku, qty)
+        return item.on_hand
+
+    def reserve(self, sku, qty, now=None):
+        now = now or dt.datetime.now()
+        self.expire(now)
+        item = self._get(sku)
+        if qty <= 0:
+            raise InventoryError(f"reservation of {qty} units of {sku}")
+        if item.available < qty:
+            raise InventoryError(f"only {item.available} of {sku} available, {qty} requested")
+        item.reserved += qty
+        res = Reservation(self.next_rid, sku, qty, now, now + self.hold)
+        self.reservations[res.rid] = res
+        self.next_rid += 1
+        self._record("reserve", sku, qty)
+        return res.rid
+
+    def release(self, rid):
+        res = self.reservations.pop(rid, None)
+        if res is None:
+            raise InventoryError(f"no reservation {rid}")
+        self.items[res.sku].reserved -= res.qty
+        self._record("release", res.sku, res.qty)
+
+    def ship(self, rid):
+        res = self.reservations.pop(rid, None)
+        if res is None:
+            raise InventoryError(f"no reservation {rid}")
+        item = self.items[res.sku]
+        item.reserved -= res.qty
+        item.on_hand -= res.qty
+        self._record("ship", res.sku, res.qty)
+        return item.on_hand
+
+    def expire(self, now):
+        stale = [rid for rid, res in self.reservations.items() if res.expired(now)]
+        for rid in stale:
+            self.release(rid)
+        return len(stale)
+
+    def value(self):
+        return sum(item.on_hand * item.unit_cost for item in self.items.values())
+
+    def restock_plan(self):
+        plan = []
+        for item in sorted(self.items.values(), key=lambda i: i.sku):
+            if item.available <= item.reorder_point:
+                shortfall = item.reorder_point - item.available
+                qty = max(item.reorder_qty, shortfall)
+                plan.append((item.sku, qty, qty * item.unit_cost))
+        return plan
+
+    def movements(self, sku=None):
+        totals = defaultdict(int)
+        for entry in self.log:
+            if sku is None or entry["sku"] == sku:
+                totals[entry["kind"]] += entry["qty"]
+        return dict(totals)
+
+    def save(self, path):
+        data = {"items": [item.to_dict() for item in self.items.values()],
+                "next_rid": self.next_rid, "log": self.log}
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+
+    @classmethod
+    def load(cls, path, hold_minutes=30):
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+        inv = cls(hold_minutes)
+        for raw in data["items"]:
+            inv.items[raw["sku"]] = Item(**raw)
+        inv.next_rid = data["next_rid"]
+        inv.log = data["log"]
+        return inv
+
+    def _get(self, sku):
+        try:
+            return self.items[sku]
+        except KeyError:
+            raise InventoryError(f"unknown sku {sku}") from None
+
+    def _record(self, kind, sku, qty):
+        self.log.append({"kind": kind, "sku": sku, "qty": qty, "at": dt.datetime.now().isoformat()})
+
+
+def report(inv):
+    lines = [f"{'sku':<10}{'name':<24}{'on hand':>9}{'reserved':>10}{'value':>12}"]
+    for item in sorted(inv.items.values(), key=lambda i: i.sku):
+        lines.append(f"{item.sku:<10}{item.name:<24}{item.on_hand:>9}{item.reserved:>10}"
+                     f"{item.on_hand * item.unit_cost:>12.2f}")
+    lines.append(f"{'total':<43}{inv.value():>22.2f}")
+    return "\n".join(lines)
