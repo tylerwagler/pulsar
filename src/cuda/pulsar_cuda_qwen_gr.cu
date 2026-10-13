@@ -1115,30 +1115,6 @@ int rows_launch(const uint8_t *wq, const uint8_t *sf, const uint16_t *x_bf16, in
 }
 } // namespace
 
-extern "C" int pulsar_qwen_mxfp8_head_launch(const pulsar_qwen_lowrank *l, const uint16_t *x_bf16, int rows, float *y,
-                                             cudaStream_t stream) {
-    if (!l || !l->w || !l->sf || !x_bf16 || !y || rows <= 0 || rows > kHeadRowsMax || l->out <= 0 ||
-        l->in <= 0 || l->in % kHeadKStep != 0 || (((uintptr_t)l->w | (uintptr_t)x_bf16) & 15u)) {
-        fprintf(stderr, "pulsar: qwen mxfp8 head: %d rows (1 .. %d) of width %d (a multiple of %d), 16-byte aligned "
-                        "-- refusing\n", rows, kHeadRowsMax, l ? l->in : -1, kHeadKStep);
-        return -1;
-    }
-    static int announced = 0;
-    if (!announced) {
-        announced = 1;
-        fprintf(stderr, "pulsar: L288 qwen head = MXFP8 -> bf16 on the tensor cores (mma m16n8k16, f32 accumulate), the "
-                        "weight read once for all <= %d rows, persistent CTAs\n", kHeadRowsMax);
-    }
-    const uint8_t *wq = (const uint8_t *)l->w;
-    const int rc = rows > 8 ? rows_launch<2>(wq, l->sf, x_bf16, l->out, l->in, rows, 1, y, true, stream)
-                            : rows_launch<1>(wq, l->sf, x_bf16, l->out, l->in, rows, 1, y, true, stream);
-    if (rc) {
-        fprintf(stderr, "pulsar: qwen mxfp8 head: %d rows of width %d could not be launched -- refusing\n", rows, l->in);
-        return rc;
-    }
-    return launch_ok("head") ? 0 : -1;
-}
-
 /* L251: the lm_head as MXFP8, made once at load from the container's bf16 head.  The bf16 head
  * is 1.27 GB read per decode row (5.1 ms of a 33 ms token, nsys); MXFP8 is half the bytes and
  * the W8A16 arms above read it.  One warp per (row, 32-block), the producers' own encoder

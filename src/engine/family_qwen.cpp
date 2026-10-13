@@ -494,8 +494,29 @@ static bool qwen_bind_mtp(const pulsar_model *m, const pulsar_qwen_shape *s, con
     w->mtp.fc_hidden   = qbind(m, &ok, "mtp.fc_hidden.weight", 2, E, E);
     qwen_bind_gr(m, &ok, s, "mtp.hyper_connection_mixer.", &w->mtp.mixer, false);
     qwen_bind_layer(m, &ok, s, PULSAR_LAYER_QWEN_QSA, "mtp.layers.0.", false, true, &w->layer[plan->n_layer]);
-    if (!ok) fprintf(stderr, "pulsar: %s: the artifact carries mtp.* but not all of it -- refusing\n", PULSAR_QWEN_ARCH);
-    return ok;
+    if (!ok) {
+        fprintf(stderr, "pulsar: %s: the artifact carries mtp.* but not all of it -- refusing\n", PULSAR_QWEN_ARCH);
+        return false;
+    }
+    /* L288 qwen-exl3-head: the drafter's own head, when the artifact carries it -- the weight and the ids of its rows,
+     * both or neither; the ids are checked against the draft vocabulary at qwen_draft_vocab */
+    w->mtp.draft_head = model_find_tensor(m, "mtp.draft_head.weight");
+    w->mtp.draft_head_ids = model_find_tensor(m, "mtp.draft_head.ids");
+    if (!w->mtp.draft_head != !w->mtp.draft_head_ids) {
+        fprintf(stderr, "pulsar: %s: the artifact carries mtp.draft_head.%s without mtp.draft_head.%s -- refusing\n",
+                PULSAR_QWEN_ARCH, w->mtp.draft_head ? "weight" : "ids", w->mtp.draft_head ? "ids" : "weight");
+        return false;
+    }
+    if (w->mtp.draft_head) {
+        const pulsar_tensor *t = w->mtp.draft_head, *ids = w->mtp.draft_head_ids;
+        if (t->ndim != 2 || t->dim[0] != E || t->dim[1] == 0 || t->dim[1] >= s->n_vocab || ids->ndim != 1 ||
+            ids->dim[0] != t->dim[1] || ids->type != PULSAR_TENSOR_I32) {
+            fprintf(stderr, "pulsar: %s: mtp.draft_head.weight must be [%llu -> rows < %u] with mtp.draft_head.ids I32 "
+                            "[rows] -- refusing\n", PULSAR_QWEN_ARCH, (unsigned long long)E, s->n_vocab);
+            return false;
+        }
+    }
+    return true;
 }
 
 static bool qwen_bind_weights(const pulsar_model *m, const pulsar_qwen_shape *s,
@@ -578,7 +599,8 @@ static bool qwen_load_tokenizer(pulsar_engine *e, const char *model_path) {
  * `extra` ids of the frequency-ranked list above it (qwen_draft_vocab.inc, tools/qwen/draft_vocab.py), and the
  * added / special ids [eos_id, n_vocab).  The list was ranked under this checkpoint's tokenizer: the digest of its
  * ids' token bytes is recomputed here and a mismatch refuses (it would rank another tokenizer's tokens).  The head
- * itself is gathered on the device at the first MTP head (family_qwen_s4.cpp). */
+ * itself is gathered on the device at the first MTP head (family_qwen_s4.cpp), or (L288 qwen-exl3-head) is the
+ * artifact's mtp.draft_head, whose row count fixes `extra` and whose stated ids must be these. */
 static bool qwen_draft_vocab(pulsar_engine *e) {
     const pulsar_qwen_shape *s = &g_qwen_shape;
     pulsar_qwen_weights *w = e->qwen_weights;
@@ -603,13 +625,25 @@ static bool qwen_draft_vocab(pulsar_engine *e) {
                 (unsigned long long)QWEN_DRAFT_VOCAB_DIGEST);
         return false;
     }
-    /* PULSAR_QWEN_MTP_DRAFT_EXTRA: how many of the ranked ids the head carries (the sweep's knob; proposals only) */
-    uint32_t extra = QWEN_DRAFT_EXTRA_DEFAULT;
+    /* PULSAR_QWEN_MTP_DRAFT_EXTRA: how many of the ranked ids the head carries (the sweep's knob; proposals only).
+     * L288 qwen-exl3-head: an artifact's own draft head fixes it -- its rows are the prefix, `extra` ranked ids and the
+     * specials -- and a knob that says otherwise contradicts the artifact */
+    const uint32_t fixed = QWEN_DRAFT_PREFIX + (s->n_vocab - s->eos_id);
+    const pulsar_tensor *dh = w->mtp.draft_head;
+    uint32_t extra = dh ? (dh->dim[1] > fixed ? (uint32_t)(dh->dim[1] - fixed) : UINT32_MAX) : QWEN_DRAFT_EXTRA_DEFAULT;
     const char *ev = getenv("PULSAR_QWEN_MTP_DRAFT_EXTRA");
-    if (ev && ev[0]) extra = (uint32_t)strtoul(ev, NULL, 10);
+    if (ev && ev[0]) {
+        const uint32_t want = (uint32_t)strtoul(ev, NULL, 10);
+        if (dh && want != extra) {
+            fprintf(stderr, "pulsar: %s: PULSAR_QWEN_MTP_DRAFT_EXTRA=%u contradicts the artifact's draft head (%llu rows "
+                            "= %u ranked ids); refusing\n", PULSAR_QWEN_ARCH, want, (unsigned long long)dh->dim[1], extra);
+            return false;
+        }
+        extra = want;
+    }
     if (extra > n_list) {
-        fprintf(stderr, "pulsar: %s: PULSAR_QWEN_MTP_DRAFT_EXTRA=%u exceeds the %u ranked ids; refusing\n",
-                PULSAR_QWEN_ARCH, extra, n_list);
+        fprintf(stderr, "pulsar: %s: a draft head of %u ranked ids (PULSAR_QWEN_MTP_DRAFT_EXTRA or the artifact's "
+                        "mtp.draft_head) exceeds the %u the list ranks; refusing\n", PULSAR_QWEN_ARCH, extra, n_list);
         return false;
     }
     std::vector<int32_t> top(k_qwen_draft_extra, k_qwen_draft_extra + extra);
@@ -620,11 +654,18 @@ static bool qwen_draft_vocab(pulsar_engine *e) {
     for (uint32_t i = 0; i < QWEN_DRAFT_PREFIX; i++) ids[k++] = (int32_t)i;
     for (int32_t id : top) ids[k++] = id;
     for (uint32_t i = s->eos_id; i < s->n_vocab; i++) ids[k++] = (int32_t)i;
+    if (dh && memcmp(tensor_data(&e->model, w->mtp.draft_head_ids), ids, (size_t)nd * sizeof(int32_t)) != 0) {
+        fprintf(stderr, "pulsar: %s: mtp.draft_head.ids are not the draft vocabulary's ids (qwen_draft_vocab.inc, %u "
+                        "ranked) -- the head was built for another list; refusing\n", PULSAR_QWEN_ARCH, extra);
+        free(ids);
+        return false;
+    }
     free(w->draft_ids);
     w->draft_ids = ids;
     w->n_draft = nd;
-    fprintf(stderr, "pulsar: %s: MTP draft vocabulary: ids [0, %u) + %u ranked + [%u, %u) = %u rows\n",
-            PULSAR_QWEN_ARCH, QWEN_DRAFT_PREFIX, extra, s->eos_id, s->n_vocab, nd);
+    fprintf(stderr, "pulsar: %s: MTP draft vocabulary: ids [0, %u) + %u ranked + [%u, %u) = %u rows (%s)\n",
+            PULSAR_QWEN_ARCH, QWEN_DRAFT_PREFIX, extra, s->eos_id, s->n_vocab, nd,
+            dh ? "the artifact's mtp.draft_head" : "gathered from the bf16 lm_head");
     return true;
 }
 
