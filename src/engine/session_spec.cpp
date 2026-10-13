@@ -178,6 +178,12 @@ void pulsar_spec_draft_req_init(pulsar_session *s, spec_redraft_req *q, int next
     }
     q->have_conf = true;
     q->copied = true;
+    static bool announced = false;   /* rule 5: the copy lane says once that it ran */
+    if (!announced) {
+        announced = true;
+        fprintf(stderr, "pulsar: copy drafts ran: %u of a %u-token repeat drafted (conf %.2f) after a %u-token match\n",
+                q->keep, n_cp, (double)c, PULSAR_SPEC_COPY_MATCH);
+    }
 }
 
 /* The target's undo of a round: the snapshot back on the installed bank, then released. */
