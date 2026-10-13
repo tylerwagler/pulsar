@@ -1273,6 +1273,8 @@ void server::publish_metrics_snapshot() {
     s->m_prefill_chunk_tokens = s->w_prefill_chunk_tokens;
     s->m_spec_overflow_rounds = s->w_spec_overflow_rounds;
     s->m_spec_thr_cut_rows = s->w_spec_thr_cut_rows;
+    memcpy(s->m_spec_phase_ms, s->w_spec_phase_ms, sizeof s->m_spec_phase_ms);
+    s->m_spec_phase_rounds = s->w_spec_phase_rounds;
     s->m_decode_lane = s->w_decode_lane;
     /* Bump and wake the /metrics/stream subscribers. A generation counter
      * rather than a payload comparison on purpose: "did anything move" over a
@@ -1496,6 +1498,9 @@ static bool server_spec_lane_carries(bool spec_rounds, uint32_t verify_rows, ses
 #define LANE_PRICE_CLEAR_SPAN    8u     /* 4096 steps: ~16k tokens of one Qwen stream before the price is re-taken */
 #define LANE_PRICE_ALPHA         0.0625f   /* the measured prices' and yield's EW weight: a probe's 32 steps
                                               carry ~7/8 of the price it ends on */
+
+const char *const server_round_phase_name[SERVER_ROUND_PHASE_COUNT] = {"plan", "forward", "round_end", "emit",
+                                                                       "draft", "commit"};
 
 /* One decode step on lane `li` (PULSAR_LANE_PLAIN / _SPEC) by `n` decoders: `tokens` committed in `ms`. */
 static void lane_price_measure(lane_price *lp, int li, int n, int tokens, double ms) {
@@ -2569,6 +2574,7 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n, int quantum_
         }
 
         /* ---- ONE shared forward over every bank's rows ------------------- */
+        const double fwd_t0 = server_now_sec();   /* L288: the round's phases (server::w_spec_phase_ms) */
         char err[160];
         pulsar_session_spec_arm_capture(pool, rows);
         uint32_t got = 0;
@@ -2618,6 +2624,7 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n, int quantum_
                                              err, sizeof err);
         }
         pulsar_session_spec_arm_capture(pool, 0u);
+        const double fwd_t1 = server_now_sec();
         s->live_bank = -1;   /* pool is multiseq-poisoned until a bank_switch */
         if (rc != 0 || got != rows) {
             for (int r = 0; r < n_fr; r++) {
@@ -2693,6 +2700,7 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n, int quantum_
             st->accepted_cap = (int)(PULSAR_SPEC_LOGITS_ROWS + 1);
         }
         (void)pulsar_session_spec_round_end_batch(pool, steps, m, logits);
+        const double end_t1 = server_now_sec();
         for (int q = 0; q < m; q++) {
             session_slot *sl = dec[live_idx[q]];
             gen_state *g = sl->gen;
@@ -2789,6 +2797,8 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n, int quantum_
          * draft into its shadow in one batched commit. A
          * device failure here is not fatal: the banks keep no pendings and take
          * a plain n=1 step next round. */
+        const double draft_t0 = server_now_sec();
+        double draft_t1 = draft_t0;
         {
             pulsar_spec_round *live_rounds[PULSAR_SPEC_LOGITS_ROWS];
             uint32_t live_banks[PULSAR_SPEC_LOGITS_ROWS];
@@ -2811,6 +2821,7 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n, int quantum_
                 server_log(PULSAR_LOG_KVCACHE,
                            "pulsar-server: batched redraft failed: %s (banks take a plain step)",
                            rerr);
+            draft_t1 = server_now_sec();
             /* One call stamps every bank's draft into its shadow (restore,
              * commit, save per bank). */
             for (int q = 0; q < nl; q++) {
@@ -2843,6 +2854,11 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n, int quantum_
          * is part of this one's step).  A round that carried prompt rows is
          * not a decode round and is left out. */
         if (n_fr == 0 && rows > 0) {
+            const double round_t1 = server_now_sec();
+            const double cut[SERVER_ROUND_PHASE_COUNT + 1] = {round_t0, fwd_t0, fwd_t1, end_t1, draft_t0, draft_t1,
+                                                              round_t1};
+            for (int p = 0; p < SERVER_ROUND_PHASE_COUNT; p++) s->w_spec_phase_ms[p] += (cut[p + 1] - cut[p]) * 1e3;
+            s->w_spec_phase_rounds++;
             pulsar_engine_lane_cost_observe(s->engine, PULSAR_LANE_SPEC, rows, (server_now_sec() - round_t0) * 1e3);
             /* L284 lane cost: the same round's yield, per bank -- what the lane choice prices the spec lane's
              * rows by (lane_price_pick) */
