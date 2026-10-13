@@ -11,7 +11,7 @@ static int fails = 0;
 #define CHECK(c, ...) do { const bool ok_ = (c); printf("  %s  ", ok_ ? "ok  " : "FAIL"); printf(__VA_ARGS__); printf("\n"); fails += !ok_; } while (0)
 
 int main() {
-    const pulsar_spec_depth_policy ds = {2, 5, 0.70f, 5, 0.90f, 8u, 2u};
+    const pulsar_spec_depth_policy ds = {2, 5, 0.70f, 5, 0.90f, 8u, 2u, 0u};
     const float hi[16] = {0.99f, 0.99f, 0.99f, 0.99f, 0.99f, 0.99f}, lo[16] = {0.5f, 0.5f, 0.5f, 0.5f, 0.5f, 0.5f};
     const float none[16] = {-1, -1, -1, -1, -1, -1};
     printf("spec-depth-gate: the shared adaptive draft depth rule\n");
@@ -51,6 +51,18 @@ int main() {
         CHECK(pulsar_spec_depth_next(&ds, &st, 5, 5, 5, hi) == 5, "clamped at max 5");
         pulsar_spec_depth_state s2{false, 10, 0};
         CHECK(pulsar_spec_depth_next(&ds, &s2, 2, 2, 0, lo) == 2, "clamped at min 2");
+    }
+    {   /* L288: the MTP policy (spec_qwen.cpp k_mtp_depth, 4..7, up_slack 1): a chain that converts all its depth but one
+         * draft climbs, one that converts every draft too, less than half backs off; DSpark (up_slack 0) needs the whole */
+        const pulsar_spec_depth_policy mtp = {4, 7, 0.0f, 0, 0.0f, 0u, 0u, 1u};
+        pulsar_spec_depth_state st{false, 10, 0};
+        CHECK(pulsar_spec_depth_next(&mtp, &st, 5, 5, 4, lo) == 6, "MTP: UP on all but one draft converted");
+        CHECK(pulsar_spec_depth_next(&mtp, &st, 6, 6, 6, lo) == 7, "MTP: UP on a whole chain");
+        CHECK(pulsar_spec_depth_next(&mtp, &st, 7, 7, 7, hi) == 7, "MTP: clamped at max 7");
+        CHECK(pulsar_spec_depth_next(&mtp, &st, 7, 5, 3, lo) == 6, "MTP: DOWN when < half the depth converts");
+        CHECK(pulsar_spec_depth_next(&mtp, &st, 5, 4, 3, lo) == 5, "MTP: hold when a short chain converts depth - 2");
+        pulsar_spec_depth_state s2{false, 10, 0};
+        CHECK(pulsar_spec_depth_next(&ds, &s2, 4, 4, 3, hi) == 4, "DSpark: no UP on all but one (up_slack 0)");
     }
     printf("SPEC-DEPTH GATE %s\n", fails ? "FAIL" : "PASS");
     return fails ? 1 : 0;

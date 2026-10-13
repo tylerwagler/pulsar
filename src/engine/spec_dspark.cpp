@@ -977,7 +977,7 @@ static bool dspark_absorb_banked(pulsar_session *s, const uint32_t *rows, const 
  * even transient excursions there are purchased losses; re-tune only with a drafter retrained at a wider block
  * (L092).  UP needs a tail confidence >= 0.70 (calibrated >= 0.82 accept); the v3 veto
  * only at depth 5 with a >= 0.90 tail; the v4/v5 8-round cooldown after a down within 2 rounds of an up. */
-static const pulsar_spec_depth_policy k_dspark_depth = {2, 5, 0.70f, 5, 0.90f, 8u, 2u};
+static const pulsar_spec_depth_policy k_dspark_depth = {2, 5, 0.70f, 5, 0.90f, 8u, 2u, 0u};
 
 /* DSpark's numbers.
  * Depth 3 to start: the v5mx optimum (2026-07-17 k-sweep at the tau 0.25 stop, quench disarmed).  k = 3 beat
