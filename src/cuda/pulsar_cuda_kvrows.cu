@@ -72,7 +72,7 @@ __global__ static void mainkv_pack_kernel(float *x, const float *src, uint8_t *o
     a = fmaxf(a, 6.0f * 0.001953125f);                 /* 6 * 2^-9 */
     const __nv_fp8_e4m3 se(__fdiv_rn(a, 6.0f));        /* RNE, saturating -- T.Cast(FP8, amax / 6) */
     const float s = (float)se;
-    const uint8_t nib = dsv4_e2m1fn_encode_dev(fminf(6.0f, fmaxf(-6.0f, __fdiv_rn(v, s))));
+    const uint8_t nib = pulsar_e2m1_quant_dev(v, s);
     const uint8_t other = (uint8_t)__shfl_xor_sync(0xffffffffu, (uint32_t)nib, 1);
     uint8_t *outr = out + ((uint64_t)out_row0 + row) * PULSAR_MAINKV_ROWBYTES(head_dim);
     if ((d & 1u) == 0u) outr[d >> 1] = (uint8_t)(nib | (other << 4));   /* low nibble = even dim */

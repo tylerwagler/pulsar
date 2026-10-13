@@ -91,23 +91,26 @@ __global__ static void attn_pack_store_kernel(float *x, const float *src, uint8_
         /* The DECODED scale (e4m3 roundtrip x row scale) is what both the encode
          * below and every reader use; a round-down clips the block's extremes
          * into the top code -- the standard NVFP4 trade, measured in the L111
-         * verdict. */
-        const float t = fminf(448.0f, samax[bk] * (1.0f / 6.0f) / srow);
+         * verdict.  IEEE division (__fdiv_rn), not the TU's fast-math `/`
+         * (a rounded reciprocal): the code is RNE on t, so t must be the
+         * correctly rounded quotient tests/attn_pack_fixture.h computes (L292). */
+        const float t = fminf(448.0f, __fdiv_rn(samax[bk] * (1.0f / 6.0f), srow));
         sc[bk] = dsv4_e4m3fn_encode_dev(t);
         sscale[bk] = dsv4_e4m3fn_dequant_dev(t) * srow;
     }
     __syncthreads();
 
     /* Nibble pairs: thread t owns packed bytes t, t+64, ... (dims 2t, 2t+1).
-     * dsv4_e2m1fn_encode_dev is the tree's ONE reference E2M1 encoder
-     * (round-to-nearest, tie to the even code).  A zero block decodes zero
-     * whatever its code; guard the quotient so it encodes code 0, not NaN. */
+     * pulsar_e2m1_quant_dev is the tree's ONE E2M1 quotient + encoder
+     * (IEEE divide, round-to-nearest, tie to the even code).  A zero block
+     * decodes zero whatever its code; guard the quotient so it encodes code 0,
+     * not NaN. */
     for (uint32_t i = tid; i < nib_bytes; i += blockDim.x) {
         const uint32_t d0 = i * 2u;
         const float s0 = sscale[d0 / PULSAR_KV4_NV_BLOCK];
         const float s1 = sscale[(d0 + 1u) / PULSAR_KV4_NV_BLOCK];
-        const uint32_t v0 = dsv4_e2m1fn_encode_dev(s0 > 0.0f ? sr[d0] / s0 : 0.0f);
-        const uint32_t v1 = dsv4_e2m1fn_encode_dev(s1 > 0.0f ? sr[d0 + 1u] / s1 : 0.0f);
+        const uint32_t v0 = s0 > 0.0f ? pulsar_e2m1_quant_dev(sr[d0], s0) : 0u;
+        const uint32_t v1 = s1 > 0.0f ? pulsar_e2m1_quant_dev(sr[d0 + 1u], s1) : 0u;
         outr[i] = (uint8_t)(v0 | (v1 << 4));
         if (xr) {
             xr[d0]      = attn_kv4_e2m1(v0, s0);
