@@ -45,6 +45,7 @@
 
 #include <algorithm>
 #include <functional>
+#include <mutex>
 #include <thread>
 #include <array>
 #include <vector>
@@ -961,6 +962,18 @@ int main() {
             /* encode: every stored element within its format's rounding of the (rotated) double value */
             std::vector<uint64_t> bad(TA), allow(TA);
             std::vector<double> e2(TA), x2(TA);
+            /* the elements outside the format's rounding of the DOUBLE value with no slack: printed, so a slack
+             * that absorbs them shows what it absorbed (L291: 2 bf16 / 5 mx32-rot on fixture A, all f32-vs-double) */
+            std::mutex smu;
+            std::vector<std::string> strict;
+            auto note = [&](size_t p, uint32_t row, uint32_t d, double x, double dq, double bound, double ramax) {
+                std::lock_guard<std::mutex> lk(smu);
+                char b[256];
+                snprintf(b, sizeof b, "tok %zu row %u dim %u: x %.9g stored %.9g |err| %.3g > bound %.3g by %.3g = %.2g x "
+                         "row amax %.4g", p, row, d, x, dq, fabs(dq - x), bound, fabs(dq - x) - bound,
+                         (fabs(dq - x) - bound) / ramax, ramax);
+                strict.push_back(b);
+            };
             par_for(TA, [&](size_t p) {
                 Tok t = host_tok(FIX_A, (uint32_t)p, Mut());
                 const uint8_t *rec = &F.kv[0][p * rec_bytes()];
@@ -968,18 +981,41 @@ int main() {
                     std::vector<double> &src = row < NKV ? t.k[row] : t.v[row - NKV];
                     if (fmt_rot()) had256(src.data());
                 }
-                if (f == PULSAR_QSA_KV_MX32_ROT) { bad[p] = check_encode(rec, t, &allow[p]); }
+                /* The device rounds ITS f32 row (norm, rope and, rotated, an f32 butterfly), the reference a double one:
+                 * a value within ~1e-6 of the row's amax of a rounding boundary may land either side, so every bound
+                 * below carries that much absolute slack (1e-5 x row amax), which no layout or scale fault fits in. */
                 for (uint32_t row = 0; row < 2 * NKV; row++) {
                     const std::vector<double> &x = row < NKV ? t.k[row] : t.v[row - NKV];
                     double dq[HD];
                     decode_stored(rec, row, dq);
+                    double ramax = 0;
+                    for (uint32_t d = 0; d < HD; d++) ramax = std::max(ramax, fabs(x[d]));
                     for (uint32_t d = 0; d < HD; d++) { e2[p] += (dq[d] - x[d]) * (dq[d] - x[d]); x2[p] += x[d] * x[d]; }
-                    if (f == PULSAR_QSA_KV_BF16) {
-                        for (uint32_t d = 0; d < HD; d++) bad[p] += fabs(dq[d] - x[d]) > ldexp(fabs(x[d]), -8);
+                    if (f == PULSAR_QSA_KV_BF16) {   /* bf16 RNE: half an ulp, 2^-9 relative */
+                        for (uint32_t d = 0; d < HD; d++) {
+                            const double bound = ldexp(fabs(x[d]), -8);
+                            if (fabs(dq[d] - x[d]) > bound) note(p, row, d, x[d], dq[d], bound, ramax);
+                            bad[p] += fabs(dq[d] - x[d]) > bound + 1e-5 * ramax;
+                        }
+                    } else if (f == PULSAR_QSA_KV_MX32_ROT) {   /* the MX rule on the rotated row: scale, then E4M3 RNE */
+                        const uint8_t *sc = rec + 2 * NKV * HD + row * (HD / 32);
+                        for (uint32_t b = 0; b < HD / 32; b++) {
+                            double amax = 0;
+                            for (uint32_t e = 0; e < 32; e++) amax = std::max(amax, fabs(x[b * 32 + e]));
+                            const int se = (int)sc[b] - 127;
+                            if (abs(se - mx_exp(amax)) > 1 || (se != mx_exp(amax) && !near_pow2(amax))) { bad[p]++; continue; }
+                            if (se != mx_exp(amax)) allow[p]++;
+                            for (uint32_t e = 0; e < 32; e++) {
+                                const double v = fabs(x[b * 32 + e]) / ldexp(1.0, se);
+                                const double step = v < ldexp(1.0, -6) ? ldexp(1.0, -9) : ldexp(1.0, (int)floor(log2(v)) - 3);
+                                const double bound = 0.5 * step * ldexp(1.0, se) * 1.0001;
+                                if (fabs(dq[b * 32 + e] - x[b * 32 + e]) > bound)
+                                    note(p, row, b * 32 + e, x[b * 32 + e], dq[b * 32 + e], bound, ramax);
+                                bad[p] += fabs(dq[b * 32 + e] - x[b * 32 + e]) > bound + 1e-5 * ramax;
+                            }
+                        }
                     } else if (fmt_nv()) {
                         const uint8_t *sc = rec + 2 * NKV * pulsar_qsa_kv_row_data_bytes(f) + row * pulsar_qsa_kv_row_scale_bytes(f);
-                        double ramax = 0;
-                        for (uint32_t d = 0; d < HD; d++) ramax = std::max(ramax, fabs(x[d]));
                         float rs;
                         memcpy(&rs, sc + HD / 16, 4);
                         bad[p] += fabs((double)rs - std::max(ramax, 1e-4) / 2688.0) > 1e-5 * ramax / 2688.0;   /* row scale (f32 vs double) */
@@ -1000,6 +1036,8 @@ int main() {
             uint64_t nb = 0, na = 0;
             double se = 0, sx = 0;
             for (uint32_t p = 0; p < TA; p++) { nb += bad[p]; na += allow[p]; se += e2[p]; sx += x2[p]; }
+            std::sort(strict.begin(), strict.end());
+            for (size_t i = 0; i < strict.size() && i < 12; i++) printf("  info  %s no-slack: %s\n", nm, strict[i].c_str());
             CHECK(nb == 0, "%s encode: %llu out-of-bound elements/scales of %llu elements (%llu MX midpoints); K/V rel RMS "
                   "%.4g", nm, (unsigned long long)nb, (unsigned long long)TA * 4 * HD, (unsigned long long)na, sqrt(se / sx));
             uint64_t same_sel = 0;
