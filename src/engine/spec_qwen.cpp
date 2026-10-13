@@ -341,13 +341,21 @@ static bool mtp_draft_chains(pulsar_session *s, const uint32_t *banks, uint64_t 
         /* the step's wall, picks and draws included (the picks' readback waited for the device): the drafter's step
          * price.  Off TP only, as the lane fits are (a group's ranks must price alike). */
         if (ok && headed && !e->tp) lane_cost_fit_observe(&e->draft_step_cost, m, (now_sec() - step_t0) * 1e3);
-        /* the priced depth: a chain goes on while its survival pays one more step and its row, and fewer drafts than
-         * the shared verify carries already outrank it */
-        for (uint32_t i = 0; ok && i < n; i++) {
-            if (!c[i].live) continue;
-            uint32_t ahead = 0;
-            for (uint32_t k = 0; k < n_drafted; k++) ahead += drafted[k] >= c[i].run ? 1u : 0u;
-            if (!pulsar_spec_chain_more(&price, c[i].run, ahead)) c[i].live = false;
+        /* the priced depth: the live chains that pay the next lockstep step between them, each its row, and that
+         * fewer drafts than the shared verify carries already outrank (pulsar_spec_chain_step) */
+        if (ok) {
+            float run[PULSAR_QWEN_HEAD_ROWS_MAX];
+            uint32_t ahead[PULSAR_QWEN_HEAD_ROWS_MAX], at[PULSAR_QWEN_HEAD_ROWS_MAX], nl = 0;
+            bool go[PULSAR_QWEN_HEAD_ROWS_MAX];
+            for (uint32_t i = 0; i < n; i++) {
+                if (!c[i].live) continue;
+                run[nl] = c[i].run;
+                ahead[nl] = 0;
+                for (uint32_t k = 0; k < n_drafted; k++) ahead[nl] += drafted[k] >= c[i].run ? 1u : 0u;
+                at[nl++] = i;
+            }
+            (void)pulsar_spec_chain_step(&price, run, ahead, nl, go);
+            for (uint32_t x = 0; x < nl; x++) c[at[x]].live = go[x];
         }
     }
     if (!ok) {

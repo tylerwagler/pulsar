@@ -74,18 +74,22 @@ static inline uint32_t pulsar_spec_conf_keep(const float *conf, uint32_t n, floa
         if (pulsar_spec_conf_stops(conf[k], tau)) return k + 1u;
     return n;
 }
-/** L288: the price one more draft step must clear (session_spec.cpp has the rule): a chain whose survival so far is
- *  under run_min (0 = no price yet) or that `budget` of the round's drafts already outrank stops. */
+/** L288: what one more draft costs (session_spec.cpp has the rule): its verify row, and -- for a drafter that steps
+ *  in lockstep -- the step, flat + slope a chain, the flat part paid by the chains that keep it alive. */
 typedef struct {
-    float run_min;      ///< survival a chain needs to take one more drafter step (the step and its verify row)
-    float run_min_row;  ///< survival a draft that costs no drafter step needs (a copy draft: its verify row alone)
-    uint32_t budget;    ///< draft rows the shared verify carries beside every chain's base row
+    float token_ms;      ///< the lane's yield, what an accepted draft is worth (0: no price yet)
+    float row_ms;        ///< the spec lane's marginal verify row
+    float run_min_row;   ///< survival a draft that costs no drafter step needs (a copy draft: its verify row alone)
+    float step_flat_ms;  ///< the lockstep step's flat part (with one chain only: the whole step)
+    float step_slope_ms; ///< what each chain in the step adds
+    bool step_priced;    ///< the step and the row are known; else no chain is priced out
+    uint32_t budget;     ///< draft rows the shared verify carries beside every chain's base row
 } pulsar_spec_chain_price;
 pulsar_spec_chain_price pulsar_spec_chain_price_for(const pulsar_session *s, uint32_t chains);
-/** Does a chain whose survival is `run`, with `ahead` of the round's drafts at or above it, take another step? */
-static inline bool pulsar_spec_chain_more(const pulsar_spec_chain_price *p, float run, uint32_t ahead) {
-    return run >= p->run_min && ahead < p->budget;
-}
+/** Which of `n` live chains take the next lockstep step: chain i's survival run[i], ahead[i] of the round's drafts at
+ *  or above it; go[i] set for those that go on.  Returns how many. */
+uint32_t pulsar_spec_chain_step(const pulsar_spec_chain_price *p, const float *run, const uint32_t *ahead, uint32_t n,
+                                bool *go);
 /** L288: the copy chain of `bank` -- when its last PULSAR_SPEC_COPY_MATCH tokens (its history, then `next_base`)
  *  occurred earlier in its history, the tokens that followed the latest such copy, at most `max`, into out[]; their
  *  count, 0 for none (session_spec.cpp has the rule). */

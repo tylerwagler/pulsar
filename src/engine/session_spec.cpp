@@ -37,35 +37,80 @@ uint32_t pulsar_spec_cur_depth(const pulsar_session *s) {
 
 /* L288 (tf-gap pass 2): the priced depth.  A drafter that drafts token by token (the MTP chain) pays one drafter
  * step for every draft and the verify one row for it; the draft returns its chain's survival -- the product of the
- * confidences up to it, the chance it is accepted -- times what a token is worth.  So a chain takes one more step
- * only while its survival so far (the bound on the next draft's) pays that step and that row at the spec lane's
- * yield (TensorFold's zig/src/core/draft_depth.zig `more`, power 1):
- *     run >= (step_ms(n) / n + row_ms) / token_ms
- * with step_ms the drafter's measured lockstep step at the n chains it carries (pulsar_engine::draft_step_cost: the
- * step is shared, so a chain's part is its n-th), row_ms the spec lane's marginal row (lane_cost[PULSAR_LANE_SPEC],
- * the allocator's price) and token_ms the lane's measured yield (pulsar_engine_spec_token_ms).  And the verify width
- * is shared: a draft is verified only if it ranks among the budget's best by survival (the allocator's global
- * admission, spec_alloc_rows), so a chain also stops once `budget` drafts of the round already outrank it --
- * vLLM's adaptive verification (a global top-k of draft slots under a budget) drawn on the draft side.  One rule
- * at every stream count: one chain alone is priced by its yield, N chains also by the width they share.  Without
- * a price (a fresh engine, a TP group -- the clocks are the leader's, and a chain's depth must be the same on
- * every rank) run_min is 0 and the chain runs to its depth and the stop rule alone.  Which drafts are proposed is
- * all it moves: every emitted token is the target's, greedy or keyed. */
+ * confidences up to it, the chance it is accepted -- times what a token is worth (token_ms: the lane's measured
+ * yield, pulsar_engine_spec_token_ms).  The chains of a round draft in LOCKSTEP: one step carries every chain that
+ * goes on, and costs step(k) = flat + slope * k for k chains (pulsar_engine::draft_step_cost, measured), so the
+ * step's flat part is paid by whichever chains keep it alive -- in the end the round's deepest chains alone.
+ * Charging each chain step(n) / n of the round's n (the first form) undercharged exactly those: at 4 streams the
+ * deepest chain kept a whole step alive for a quarter of its price.  So the step is charged to the chains that
+ * extend it (pulsar_spec_chain_step): every candidate pays its own verify row and its marginal slope,
+ *     run_i * token_ms >= row_ms + slope,
+ * and the set that goes on -- the best by survival, dropping the weakest until it holds -- pays the step's flat part
+ * out of what it earns past that:
+ *     sum_i (run_i * token_ms - row_ms - slope) >= flat.
+ * One chain alone pays the whole step (TensorFold's zig/src/core/draft_depth.zig `more`, power 1).  And the verify
+ * width is shared: a draft is verified only if it ranks among the budget's best by survival (the allocator's global
+ * admission, spec_alloc_rows), so a chain also stops once `budget` drafts of the round already outrank it -- vLLM's
+ * adaptive verification (a global top-k of draft slots under a budget) drawn on the draft side.  Without a price (a
+ * fresh engine, a TP group -- the clocks are the leader's, and a chain's depth must be the same on every rank) no
+ * chain is priced out: its depth and the stop rule alone.  Which drafts are proposed is all it moves: every emitted
+ * token is the target's, greedy or keyed. */
 pulsar_spec_chain_price pulsar_spec_chain_price_for(const pulsar_session *s, uint32_t chains) {
     const pulsar_engine *e = s->engine;
     pulsar_spec_chain_price p;
-    p.run_min = p.run_min_row = 0.0f;
+    memset(&p, 0, sizeof p);
     const uint32_t width = pulsar_engine_fused_heads_max(e);
     p.budget = width > chains ? width - chains : 0u;
     if (e->tp || chains == 0u || !(e->spec_token_ms > 0.0f)) return p;
     const pulsar_lane_cost row = lane_cost_fit_view(&e->lane_cost[PULSAR_LANE_SPEC]);
     if (!row.valid) return p;
-    p.run_min_row = (float)((double)row.row_us / 1000.0 / (double)e->spec_token_ms);
+    p.token_ms = e->spec_token_ms;
+    p.row_ms = (float)row.row_us / 1000.0f;
+    p.run_min_row = p.row_ms / p.token_ms;
     const pulsar_lane_cost step = lane_cost_fit_view(&e->draft_step_cost);
-    const double step_ms = pulsar_lane_cost_ms(&step, (double)chains);
-    if (step_ms > 0.0)
-        p.run_min = (float)((step_ms / (double)chains + (double)row.row_us / 1000.0) / (double)e->spec_token_ms);
+    if (step.valid) {   /* the steps' widths spread: flat + slope * k */
+        p.step_flat_ms = (float)step.flat_us / 1000.0f;
+        p.step_slope_ms = (float)step.row_us / 1000.0f;
+        p.step_priced = true;
+    } else {            /* one width only (a lone stream: k = 1 every step): its mean is the whole step */
+        const double one = pulsar_lane_cost_ms(&step, 1.0);
+        p.step_flat_ms = (float)one;
+        p.step_priced = one > 0.0;
+    }
     return p;
+}
+
+uint32_t pulsar_spec_chain_step(const pulsar_spec_chain_price *p, const float *run, const uint32_t *ahead, uint32_t n,
+                                bool *go) {
+    uint32_t idx[64];   /* n is a round's chains: <= the verify width (16 on Qwen) */
+    uint32_t k = 0;
+    for (uint32_t i = 0; i < n; i++) {
+        go[i] = false;
+        if (ahead[i] >= p->budget) continue;
+        if (!p->step_priced) { go[i] = true; continue; }
+        if (run[i] * p->token_ms < p->row_ms + p->step_slope_ms) continue;
+        if (k < sizeof idx / sizeof idx[0]) idx[k++] = i;
+    }
+    if (!p->step_priced) {
+        uint32_t m = 0;
+        for (uint32_t i = 0; i < n; i++) m += go[i] ? 1u : 0u;
+        return m;
+    }
+    /* the best by survival first; drop the weakest until the set pays the step's flat part */
+    for (uint32_t x = 1; x < k; x++)
+        for (uint32_t y = x; y > 0 && run[idx[y]] > run[idx[y - 1]]; y--) {
+            const uint32_t t = idx[y];
+            idx[y] = idx[y - 1];
+            idx[y - 1] = t;
+        }
+    while (k > 0) {
+        float surplus = 0.0f;
+        for (uint32_t x = 0; x < k; x++) surplus += run[idx[x]] * p->token_ms - p->row_ms - p->step_slope_ms;
+        if (surplus >= p->step_flat_ms) break;
+        k--;
+    }
+    for (uint32_t x = 0; x < k; x++) go[idx[x]] = true;
+    return k;
 }
 
 /* L288 (tf-gap pass 2): copy drafts (TensorFold #468, after its Nemotron CopyIndex; vLLM's MRV2 n-gram speculator and
