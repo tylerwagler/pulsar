@@ -26,7 +26,8 @@
  * (coff-2) sources' compressor and indexer lanes (~3.8 MB); grid 128; 16 slots.
  *
  * Qwen3.8-Flash-Next (`qwen4_exp`, the L251 lane -- family_qwen.h on work/l251-serve) maps as:
- *   pools  per QSA layer (12): KV rows, 1 token/row, pulsar_qwen_kv_row_bytes (1056 B, E4M3 + E8M0);
+ *   pools  per QSA layer (12): KV rows, 1 token/row, pulsar_qwen_kv_row_bytes (1056 B, E4M3 + E8M0, in production;
+ *          L291 measurement formats differ);
  *          pooled indexer keys, idx_block (4) tokens/row, pulsar_qwen_index_row_bytes (256 B);
  *   slot   per GDN layer (36): the DeltaNet recurrent state (pulsar_qwen_gdn_state_bytes, 3.1 MB
  *          fp32) and the causal-conv tail (pulsar_qwen_gdn_conv_bytes); per QSA layer: the partial

@@ -24,19 +24,9 @@
 
 #include "pulsar_cuda_internal.h"
 
-/* Native e4m3 conversions.  dev proved these bit-identical to a 7-iteration
- * binary search over all 2^32 finite float bit patterns (4278190080 checked,
- * zero mismatches, every RNE tie and the subnormal range); the ctor IS the
- * cvt.rn.satfinite encoding, so the byte pattern and the round-trip agree by
- * construction.  Static: this TU is their only caller. */
-__device__ static uint8_t dsv4_e4m3fn_encode_dev(float x) {
-    __nv_fp8_e4m3 f(x);
-    return *(const uint8_t *)&f;
-}
-
-__device__ static float dsv4_e4m3fn_dequant_dev(float x) {
-    return (float)__nv_fp8_e4m3(x);
-}
+/* The recipe's arithmetic (row scale, block code, nibble) is pulsar_cuda_internal.h's pulsar_nvfp4_* -- the ONE
+ * NVFP4 codec, shared by format with the Qwen QSA NVFP4 arms (L291).  dev proved its e4m3 conversions
+ * bit-identical to a 7-iteration binary search over all 2^32 finite float bit patterns. */
 
 /* Quantise `n_rows` f32 rows of `src` and store them as 0731 unified rows at
  * rows [out_row0, out_row0+n_rows) -- or, when raw_cap != 0, at the ring slot
@@ -82,7 +72,7 @@ __global__ static void attn_pack_store_kernel(float *x, const float *src, uint8_
         for (uint32_t bk = 0; bk < nblk; bk++) ra = fmaxf(ra, samax[bk]);
         /* Row scale keyed so every block scale amax/(6*row_scale) fits E4M3's
          * [0, 448]; the 1e-4 amax floor matches the retired fp8 recipe's. */
-        const float rs = fmaxf(ra, 1.0e-4f) * (1.0f / (6.0f * 448.0f));
+        const float rs = pulsar_nvfp4_row_scale(ra);
         srow = rs;
         *(float *)(sc + nblk) = rs;   /* 4-aligned: nib 224 + 28 codes */
     }
@@ -92,9 +82,7 @@ __global__ static void attn_pack_store_kernel(float *x, const float *src, uint8_
          * below and every reader use; a round-down clips the block's extremes
          * into the top code -- the standard NVFP4 trade, measured in the L111
          * verdict. */
-        const float t = fminf(448.0f, samax[bk] * (1.0f / 6.0f) / srow);
-        sc[bk] = dsv4_e4m3fn_encode_dev(t);
-        sscale[bk] = dsv4_e4m3fn_dequant_dev(t) * srow;
+        sc[bk] = pulsar_nvfp4_block_code(samax[bk], srow, &sscale[bk]);
     }
     __syncthreads();
 
@@ -106,8 +94,8 @@ __global__ static void attn_pack_store_kernel(float *x, const float *src, uint8_
         const uint32_t d0 = i * 2u;
         const float s0 = sscale[d0 / PULSAR_KV4_NV_BLOCK];
         const float s1 = sscale[(d0 + 1u) / PULSAR_KV4_NV_BLOCK];
-        const uint32_t v0 = dsv4_e2m1fn_encode_dev(s0 > 0.0f ? sr[d0] / s0 : 0.0f);
-        const uint32_t v1 = dsv4_e2m1fn_encode_dev(s1 > 0.0f ? sr[d0 + 1u] / s1 : 0.0f);
+        const uint32_t v0 = pulsar_nvfp4_encode(sr[d0], s0);
+        const uint32_t v1 = pulsar_nvfp4_encode(sr[d0 + 1u], s1);
         outr[i] = (uint8_t)(v0 | (v1 << 4));
         if (xr) {
             xr[d0]      = attn_kv4_e2m1(v0, s0);

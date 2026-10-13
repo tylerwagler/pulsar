@@ -228,6 +228,37 @@ __device__ static inline float dsv4_e2m1fn_decode_dev(uint8_t nib, float scale) 
     return pulsar_e2m1_times(nib, scale);
 }
 
+/* THE NVFP4 ROW RECIPE (L111), keyed by format: 0731's unified KV row (pulsar_cuda_attnpack.cu) and the Qwen
+ * QSA NVFP4 arms (L291, pulsar_cuda_qsa.cu) quantise through these and nothing else.  A row of elements in
+ * blocks of PULSAR_KV4_NV_BLOCK:
+ *   row scale  rs = max(row amax, 1e-4) / (6 * 448), stored f32 -- every block scale amax / (6 rs) then fits
+ *              E4M3's [0, 448];
+ *   block      code = e4m3(min(448, amax / 6 / rs)); the DECODED scale e4m3(code) * rs is what the encode
+ *              and every reader use (a round-down clips the block's extremes into the top code -- the standard
+ *              NVFP4 trade, measured in the L111 verdict);
+ *   element    the E2M1 nibble of x / scale (dsv4_e2m1fn_encode_dev: RNE, ties to the even code); a zero block
+ *              encodes code 0, not NaN.
+ * Decode: pulsar_e2m1_times(nib, pulsar_e4m3_times(code, rs)). */
+__device__ static inline uint8_t dsv4_e4m3fn_encode_dev(float x) {
+    __nv_fp8_e4m3 f(x);   /* the ctor IS cvt.rn.satfinite: the byte and the round trip agree by construction */
+    return *(const uint8_t *)&f;
+}
+__device__ static inline float dsv4_e4m3fn_dequant_dev(float x) {
+    return (float)__nv_fp8_e4m3(x);
+}
+__device__ static inline float pulsar_nvfp4_row_scale(float row_amax) {
+    return fmaxf(row_amax, 1.0e-4f) * (1.0f / (6.0f * 448.0f));
+}
+/* One block's E4M3 code; *scale receives its decoded scale. */
+__device__ static inline uint8_t pulsar_nvfp4_block_code(float block_amax, float rs, float *scale) {
+    const float t = fminf(448.0f, block_amax * (1.0f / 6.0f) / rs);
+    *scale = dsv4_e4m3fn_dequant_dev(t) * rs;
+    return dsv4_e4m3fn_encode_dev(t);
+}
+__device__ static inline uint32_t pulsar_nvfp4_encode(float x, float scale) {
+    return dsv4_e2m1fn_encode_dev(scale > 0.0f ? x / scale : 0.0f);
+}
+
 /* WHERE A BATCH ROW LANDS IN THE RING.  One definition, deliberately: the
  * window packer (quantise then store) and the scatter (copy packed bytes)
  * write the same ring from the same batch, and a disagreement puts a token's

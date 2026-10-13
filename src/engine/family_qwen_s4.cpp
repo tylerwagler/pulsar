@@ -1349,6 +1349,7 @@ bool pulsar_qwen_s3_qsa(const pulsar_qwen_step *st, uint32_t il) {
         io.out_sf_pitch = pulsar_gpu_mx_kbp(pulsar_qwen_qsa_out_dim(s));
         io.tap_out_f32 = NULL; io.tap_sel = NULL;              /* the lane, not a gate */
         io.tp_ranks = (int)pulsar_qwen_tp(s);
+        io.kv_format = s->kv_format;                           /* L291: production MX32 unless a measurement arm */
         io.row_rope = st->rope ? st->rope + (size_t)r0 * 6u : NULL;   /* L268: multi-axis rope, NULL for text */
         /* row_seq / row_pos are HOST arrays -- pulsar_gpu_qsa_forward walks them on
          * the host to build its row list.  The step already carries them as `bank` /

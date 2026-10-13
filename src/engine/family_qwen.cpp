@@ -690,6 +690,22 @@ static bool qwen_family_load(pulsar_engine *e, const pulsar_engine_options *opt)
         return false;
     }
     g_qwen_shape = s;
+    /* L291: PULSAR_QWEN_KV -- the QSA K/V cache format, a MEASUREMENT flag read once here (unset = mx32, the
+     * production format; anything else is an arm of the KV-format campaign).  An unknown name refuses; the
+     * live format is announced, and every qsa attention announce names it again. */
+    {
+        const char *kv = getenv("PULSAR_QWEN_KV");
+        pulsar_qsa_kv_format f = PULSAR_QSA_KV_MX32;
+        if (kv && kv[0] && !pulsar_qsa_kv_format_parse(kv, &f)) {
+            fprintf(stderr, "pulsar: %s: PULSAR_QWEN_KV=%s names no QSA K/V format (mx32, bf16, nvfp4, nvfp4-rot, "
+                            "mx32-rot); refusing\n", PULSAR_QWEN_ARCH, kv);
+            return false;
+        }
+        g_qwen_shape.kv_format = (uint32_t)f;
+        fprintf(stderr, "pulsar: %s: QSA K/V cache %s, %llu B/token/layer%s\n", PULSAR_QWEN_ARCH,
+                pulsar_qsa_kv_format_name(f), (unsigned long long)pulsar_qwen_kv_row_bytes(&g_qwen_shape),
+                f == PULSAR_QSA_KV_MX32 ? "" : " (PULSAR_QWEN_KV measurement arm, not production)");
+    }
     if (!qwen_read_plan(&e->model, s.n_layer, &e->plan)) return false;
     if (e->plan.kind[s.ple_layer] == PULSAR_LAYER_NONE) return false;
     e->qwen_weights = (pulsar_qwen_weights *)xcalloc(1, sizeof(*e->qwen_weights));
@@ -704,6 +720,9 @@ static bool qwen_family_load(pulsar_engine *e, const pulsar_engine_options *opt)
             mix(&t->type, sizeof(t->type));
             mix(&t->bytes, sizeof(t->bytes));
         }
+        /* L291: a measurement K/V format's rows never load into another format's bank (segments and payloads
+         * key on this digest); production MX32 leaves the digest as it was */
+        if (g_qwen_shape.kv_format != PULSAR_QSA_KV_MX32) mix(&g_qwen_shape.kv_format, sizeof(g_qwen_shape.kv_format));
         e->qwen_weights->artifact_digest = h;
     }
     /* L272 B7: the whole-artifact scans DeepSeek's bind runs -- a tensor type no reader takes, a NaN
@@ -754,6 +773,11 @@ bool pulsar_qwen_tp_load(pulsar_engine *e) {
     if (m->tp_n_ranks <= 1) return true;
     pulsar_qwen_shape *s = &g_qwen_shape;
     const uint32_t nr = m->tp_n_ranks;
+    if (s->kv_format != PULSAR_QSA_KV_MX32) {
+        fprintf(stderr, "pulsar: %s: PULSAR_QWEN_KV=%s is a one-GPU measurement arm; tensor parallelism runs mx32 "
+                        "only -- refusing\n", PULSAR_QWEN_ARCH, pulsar_qsa_kv_format_name((pulsar_qsa_kv_format)s->kv_format));
+        return false;
+    }
     if (nr != 2 || m->tp_rank < 0 || m->tp_rank >= 2 || s->gdn_n_k_head % nr || s->gdn_n_v_head % nr ||
         s->n_head_kv % nr || s->n_head % nr || s->n_expert % nr || s->n_vocab % nr) {
         fprintf(stderr, "pulsar: %s: tensor parallelism is built for 2 ranks over whole heads, experts and vocab "

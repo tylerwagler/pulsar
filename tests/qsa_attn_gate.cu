@@ -27,6 +27,11 @@
  *       query/gate order swapped, interleaved RoPE pairs, w in place of 1 + w,
  *       the tie rule reversed, the tail dropped, pooling after the norm, the
  *       block key roped at the block's end, one cache byte flipped.
+ *   G10 L291's K/V measurement formats (bf16, NVFP4, Hadamard-rotated NVFP4 / MX32): every stored element
+ *       within its format's rounding of the (rotated) double value, block keys and selections == production's,
+ *       G4 over each format's decoded cache (rotated back in double), a reference that never rotates back
+ *       caught, and decode == prefill per format; information: each format's output error against attention
+ *       over the UNQUANTISED K/V.
  *
  * usage: qsa_attn_gate            (needs a device; ~1-2 min on GB10) */
 #include "pulsar_gpu.h"
@@ -50,6 +55,9 @@ constexpr uint32_t HD = PULSAR_QSA_HEAD_DIM, NQ = PULSAR_QSA_N_HEAD, NKV = PULSA
 constexpr uint32_t IH = PULSAR_QSA_IDX_HEADS, ID = PULSAR_QSA_IDX_DIM, TOPB = PULSAR_QSA_TOP_BLOCKS;
 constexpr uint32_t QIN = PULSAR_QSA_Q_IN, KVIN = PULSAR_QSA_KV_IN, IIN = PULSAR_QSA_IDX_IN, OUT = PULSAR_QSA_OUT_DIM;
 constexpr uint32_t REC = PULSAR_QSA_KV_TOKEN_BYTES;
+/* L291: the K/V format the harness runs (G10 walks the measurement arms; every other check is production MX32) */
+pulsar_qsa_kv_format g_fmt = PULSAR_QSA_KV_MX32;
+uint32_t rec_bytes() { return pulsar_qsa_kv_token_bytes(1, g_fmt); }
 constexpr uint32_t KBP_OUT = OUT / 32u;   /* 192, a multiple of 4: the slot's KBp */
 
 int g_fail;
@@ -170,6 +178,49 @@ bool near_pow2(double a) { int e; const double f = frexp(a, &e); return fabs(f -
 
 double bf16_to_d(uint16_t b) { uint32_t u = (uint32_t)b << 16; float f; memcpy(&f, &u, 4); return f; }
 
+/* L291: the K/V formats' host decode.  Row `row` of a token record: 0..NKV-1 the K heads, NKV.. the V heads. */
+bool fmt_rot() { return g_fmt == PULSAR_QSA_KV_NVFP4_ROT || g_fmt == PULSAR_QSA_KV_MX32_ROT; }
+bool fmt_nv() { return g_fmt == PULSAR_QSA_KV_NVFP4 || g_fmt == PULSAR_QSA_KV_NVFP4_ROT; }
+bool g_skip_unrot = false;   /* G10's mutation: the rotation never undone */
+double e2m1_decode(uint32_t nib) {
+    static const double mag[8] = {0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0};
+    return (nib & 8u) ? -mag[nib & 7u] : mag[nib & 7u];
+}
+/* natural-order Sylvester H256 / 16, in double: its own inverse */
+void had256(double *x) {
+    for (uint32_t m = 1; m < HD; m <<= 1)
+        for (uint32_t i = 0; i < HD; i++)
+            if (!(i & m)) { const double a = x[i], b = x[i + m]; x[i] = a + b; x[i + m] = a - b; }
+    for (uint32_t i = 0; i < HD; i++) x[i] /= 16.0;
+}
+/* the NVFP4 block's decoded scale: e4m3(code) x the f32 row scale, the f32 product the kernels form */
+double nv_scale(const uint8_t *sc, uint32_t blk) {
+    float rs;
+    memcpy(&rs, sc + HD / 16, 4);
+    return (double)(float)(e4m3_decode(sc[blk]) * (double)rs);
+}
+/* the values the record STORES for a row (the rotated domain under a rotated format) */
+void decode_stored(const uint8_t *rec, uint32_t row, double *out) {
+    const uint32_t D = pulsar_qsa_kv_row_data_bytes(g_fmt), S = pulsar_qsa_kv_row_scale_bytes(g_fmt);
+    const uint8_t *data = rec + row * D, *sc = rec + 2 * NKV * D + row * S;
+    for (uint32_t d = 0; d < HD; d++) {
+        if (g_fmt == PULSAR_QSA_KV_BF16) {
+            uint16_t u;
+            memcpy(&u, data + 2 * d, 2);
+            out[d] = bf16_to_d(u);
+        } else if (fmt_nv()) {
+            out[d] = e2m1_decode((data[d >> 1] >> ((d & 1u) * 4u)) & 0xFu) * nv_scale(sc, d / 16);
+        } else {
+            out[d] = e4m3_decode(data[d]) * ldexp(1.0, (int)sc[d / 32] - 127);
+        }
+    }
+}
+/* ... and the row itself */
+void decode_row(const uint8_t *rec, uint32_t row, double *out) {
+    decode_stored(rec, row, out);
+    if (fmt_rot() && !g_skip_unrot) had256(out);
+}
+
 /* ------------------------------------------------------------ device harness */
 struct Seq {
     int fix;
@@ -220,7 +271,7 @@ Seq make_seq(int fix, uint32_t T) {
     s.fix = fix;
     s.T = T;
     s.cap = (T + 3u) & ~3u;
-    s.kv = zeros((uint64_t)s.cap * REC);
+    s.kv = zeros((uint64_t)s.cap * pulsar_qsa_kv_token_bytes(1, PULSAR_QSA_KV_BF16));   /* the widest format's */
     s.bkey = zeros((uint64_t)(s.cap / 4) * PULSAR_QSA_BKEY_BYTES);
     s.stage = zeros(PULSAR_QSA_STAGE_BYTES);
     return s;
@@ -280,6 +331,7 @@ void call(std::vector<Seq> &seqs, const std::vector<Piece> &pieces,
     io.out_sf_pitch = (int)KBP_OUT;
     io.tap_out_f32 = d.tap;
     io.tap_sel = d.sel;
+    io.kv_format = g_fmt;
     std::vector<uint32_t> rope;   /* L268 G9: the layout's positions, the row's and its block start's */
     if (g_rope3) {
         rope.resize((size_t)n * 6);
@@ -334,7 +386,7 @@ Run run(std::vector<Seq> &seqs, const std::vector<std::vector<Piece>> &schedule,
     R.kv.resize(seqs.size());
     R.bkey.resize(seqs.size());
     for (size_t s = 0; s < seqs.size(); s++) {
-        R.kv[s].resize((size_t)seqs[s].T * REC);
+        R.kv[s].resize((size_t)seqs[s].T * rec_bytes());
         R.bkey[s].resize((size_t)(seqs[s].T / 4) * PULSAR_QSA_BKEY_BYTES);
         pulsar_gpu_tensor_read(seqs[s].kv, 0, R.kv[s].data(), R.kv[s].size());
         pulsar_gpu_tensor_read(seqs[s].bkey, 0, R.bkey[s].data(), R.bkey[s].size());
@@ -457,7 +509,8 @@ std::vector<uint32_t> host_select(const Tok &t, const std::vector<std::vector<do
 }
 
 /* G4: max |ours - ref| / max|ref| for one row, attention over the DEVICE cache + selection. */
-double check_row_out(const Seq &s, const std::vector<uint8_t> &kv, uint32_t pos, const RowOut &o, const Mut &m) {
+double check_row_out(const Seq &s, const std::vector<uint8_t> &kv, uint32_t pos, const RowOut &o, const Mut &m,
+                     bool exact_kv = false) {   /* L291 exact_kv: attention over the UNQUANTISED K/V (G10's information) */
     Tok t = host_tok(s.fix, pos, m);
     const uint32_t n = pos + 1, nb = n / 4;
     std::vector<uint32_t> list;
@@ -469,12 +522,16 @@ double check_row_out(const Seq &s, const std::vector<uint8_t> &kv, uint32_t pos,
     }
     std::vector<double> kd(list.size() * NKV * HD), vd(list.size() * NKV * HD);
     for (size_t i = 0; i < list.size(); i++) {
-        const uint8_t *rec = &kv[(size_t)list[i] * REC];
+        const uint8_t *rec = &kv[(size_t)list[i] * rec_bytes()];
+        if (exact_kv) {
+            const Tok u = host_tok(s.fix, list[i], Mut());
+            for (uint32_t g = 0; g < NKV; g++)
+                for (uint32_t d = 0; d < HD; d++) { kd[(i * NKV + g) * HD + d] = u.k[g][d]; vd[(i * NKV + g) * HD + d] = u.v[g][d]; }
+            continue;
+        }
         for (uint32_t g = 0; g < NKV; g++) {
-            for (uint32_t d = 0; d < HD; d++) {
-                kd[(i * NKV + g) * HD + d] = e4m3_decode(rec[g * HD + d]) * ldexp(1.0, (int)rec[2 * NKV * HD + g * 8 + d / 32] - 127);
-                vd[(i * NKV + g) * HD + d] = e4m3_decode(rec[(NKV + g) * HD + d]) * ldexp(1.0, (int)rec[2 * NKV * HD + (NKV + g) * 8 + d / 32] - 127);
-            }
+            decode_row(rec, g, &kd[(i * NKV + g) * HD]);          /* rotated formats: rotated back, in double */
+            decode_row(rec, NKV + g, &vd[(i * NKV + g) * HD]);
         }
     }
     double maxref = 0, maxerr = 0;
@@ -816,7 +873,7 @@ int main() {
 
     printf("G8 tensor parallelism (L266 step 7): each rank's KV head + its 12 query heads == the full layer's (fixture A)\n");
     {
-        const uint32_t REC2 = pulsar_qsa_kv_token_bytes(2), QIN2 = QIN / 2u, KVIN2 = KVIN / 2u, OUT2 = OUT / 2u;
+        const uint32_t REC2 = pulsar_qsa_kv_token_bytes(2, PULSAR_QSA_KV_MX32), QIN2 = QIN / 2u, KVIN2 = KVIN / 2u, OUT2 = OUT / 2u;
         CHECK(REC2 == REC / 2u, "a rank's KV record is half the full one (%u of %u B)", REC2, REC);
         Dev &d = g_dev;
         for (uint32_t r = 0; r < 2; r++) {
@@ -876,6 +933,103 @@ int main() {
                   r, (unsigned long long)dout, TA, (unsigned long long)dkv);
             seq_free(s);
         }
+    }
+
+    /* ---------------- G10 (L291): the K/V measurement formats */
+    printf("G10 K/V measurement formats (L291, fixture A): encode bound, selection, output vs double over the decoded "
+           "cache, decode == prefill\n");
+    {
+        std::vector<uint32_t> info_rows;   /* the format's own attention error, against unquantised K/V */
+        for (uint32_t p = 64; p < TA; p += 397) info_rows.push_back(p);
+        auto exact_err = [&](const Run &R) {
+            std::vector<double> err(info_rows.size());
+            par_for(info_rows.size(), [&](size_t i) {
+                err[i] = check_row_out(SA[0], R.kv[0], info_rows[i], R.outs[0][info_rows[i]], Mut(), true);
+            });
+            std::sort(err.begin(), err.end());
+            return err[err.size() / 2];
+        };
+        printf("  info  mx32 (production): output vs attention over unquantised K/V, median rel err %.3g over %zu rows\n",
+               exact_err(A), info_rows.size());
+        const pulsar_qsa_kv_format arms[] = {PULSAR_QSA_KV_BF16, PULSAR_QSA_KV_NVFP4, PULSAR_QSA_KV_NVFP4_ROT,
+                                             PULSAR_QSA_KV_MX32_ROT};
+        auto none = [](uint32_t, uint32_t) { return false; };
+        for (pulsar_qsa_kv_format f : arms) {
+            g_fmt = f;
+            const char *nm = pulsar_qsa_kv_format_name(f);
+            Run F = run(SA, chunks(0, TA, {1000}), all);
+            /* encode: every stored element within its format's rounding of the (rotated) double value */
+            std::vector<uint64_t> bad(TA), allow(TA);
+            std::vector<double> e2(TA), x2(TA);
+            par_for(TA, [&](size_t p) {
+                Tok t = host_tok(FIX_A, (uint32_t)p, Mut());
+                const uint8_t *rec = &F.kv[0][p * rec_bytes()];
+                for (uint32_t row = 0; row < 2 * NKV; row++) {
+                    std::vector<double> &src = row < NKV ? t.k[row] : t.v[row - NKV];
+                    if (fmt_rot()) had256(src.data());
+                }
+                if (f == PULSAR_QSA_KV_MX32_ROT) { bad[p] = check_encode(rec, t, &allow[p]); }
+                for (uint32_t row = 0; row < 2 * NKV; row++) {
+                    const std::vector<double> &x = row < NKV ? t.k[row] : t.v[row - NKV];
+                    double dq[HD];
+                    decode_stored(rec, row, dq);
+                    for (uint32_t d = 0; d < HD; d++) { e2[p] += (dq[d] - x[d]) * (dq[d] - x[d]); x2[p] += x[d] * x[d]; }
+                    if (f == PULSAR_QSA_KV_BF16) {
+                        for (uint32_t d = 0; d < HD; d++) bad[p] += fabs(dq[d] - x[d]) > ldexp(fabs(x[d]), -8);
+                    } else if (fmt_nv()) {
+                        const uint8_t *sc = rec + 2 * NKV * pulsar_qsa_kv_row_data_bytes(f) + row * pulsar_qsa_kv_row_scale_bytes(f);
+                        double ramax = 0;
+                        for (uint32_t d = 0; d < HD; d++) ramax = std::max(ramax, fabs(x[d]));
+                        float rs;
+                        memcpy(&rs, sc + HD / 16, 4);
+                        bad[p] += fabs((double)rs - std::max(ramax, 1e-4) / 2688.0) > 1e-5 * ramax / 2688.0;   /* row scale (f32 vs double) */
+                        for (uint32_t b = 0; b < HD / 16; b++) {
+                            double amax = 0;
+                            for (uint32_t e = 0; e < 16; e++) amax = std::max(amax, fabs(x[b * 16 + e]));
+                            const double s = nv_scale(sc, b);
+                            /* the block code: e4m3 RNE of amax / 6 / rs (relative 2^-4), or the f32 noise of a tiny block */
+                            bad[p] += fabs(6.0 * s - amax) > amax / 16.0 * 1.0001 + 1e-5 * ramax;
+                            for (uint32_t e = 0; e < 16; e++) {   /* E2M1 RNE: half the widest gap (1 code unit), or the clip */
+                                const double xv = fabs(x[b * 16 + e]);
+                                bad[p] += fabs(dq[b * 16 + e] - x[b * 16 + e]) > s * 1.0001 + std::max(0.0, xv - 6.0 * s) + 1e-5 * ramax;
+                            }
+                        }
+                    }
+                }
+            });
+            uint64_t nb = 0, na = 0;
+            double se = 0, sx = 0;
+            for (uint32_t p = 0; p < TA; p++) { nb += bad[p]; na += allow[p]; se += e2[p]; sx += x2[p]; }
+            CHECK(nb == 0, "%s encode: %llu out-of-bound elements/scales of %llu elements (%llu MX midpoints); K/V rel RMS "
+                  "%.4g", nm, (unsigned long long)nb, (unsigned long long)TA * 4 * HD, (unsigned long long)na, sqrt(se / sx));
+            uint64_t same_sel = 0;
+            for (uint32_t p = 0; p < TA; p++) same_sel += F.outs[0][p].sel == A.outs[0][p].sel;
+            CHECK(F.bkey[0] == A.bkey[0] && same_sel == TA, "%s: block keys and every row's selection == production's "
+                  "(the indexer is format-independent): %llu of %u rows", nm, (unsigned long long)same_sel, TA);
+            std::vector<double> err(out_rows.size());
+            par_for(out_rows.size(), [&](size_t i) { err[i] = check_row_out(SA[0], F.kv[0], out_rows[i], F.outs[0][out_rows[i]], Mut()); });
+            std::vector<double> se4(err);
+            std::sort(se4.begin(), se4.end());
+            CHECK(se4.back() <= g4_bar, "%s: output vs double attention over the decoded cache: %zu rows, max rel err "
+                  "%.3g, median %.3g (bar %.0e)", nm, err.size(), se4.back(), se4[se4.size() / 2], g4_bar);
+            printf("  info  %s: output vs attention over unquantised K/V, median rel err %.3g\n", nm, exact_err(F));
+            if (fmt_rot()) {
+                g_skip_unrot = true;
+                std::vector<double> em(out_rows.size());
+                par_for(out_rows.size(), [&](size_t i) { em[i] = check_row_out(SA[0], F.kv[0], out_rows[i], F.outs[0][out_rows[i]], Mut()); });
+                g_skip_unrot = false;
+                CHECK(*std::max_element(em.begin(), em.end()) > g4_bar, "%s: a reference that never rotates back -> caught",
+                      nm);
+            }
+            Run D = run(SA, chunks(0, TA, {1}), none);
+            char what[96];
+            snprintf(what, sizeof what, "%s: one row per call (3000 calls)", nm);
+            same_run(F, D, 0, TA, what);
+            Run C = run(SA, chunks(0, TA, {1, 2, 3, 5, 7, 513, 1027, 2, 900, 11}), none);
+            snprintf(what, sizeof what, "%s: odd chunks", nm);
+            same_run(F, C, 0, TA, what);
+        }
+        g_fmt = PULSAR_QSA_KV_MX32;
     }
 
     seq_free(SA[0]);

@@ -29,6 +29,7 @@
 #include <stdbool.h>
 
 #include "family.h"
+#include "pulsar_gpu.h"   /* L291: the QSA K/V formats' row widths (pulsar_qwen_kv_row_bytes) */
 
 /* ---- 1. Shape -------------------------------------------------------------
  *
@@ -84,6 +85,9 @@ typedef struct {
      * container against the whole model, then pulsar_qwen_tp_load halves them, so every derived width,
      * state size and scratch layout below is the rank's.  n_vocab and n_expert stay whole. */
     uint32_t tp_rank, tp_ranks;
+    /* L291: the QSA K/V cache format (pulsar_qsa_kv_format): PULSAR_QSA_KV_MX32 in production; a measurement arm
+     * when PULSAR_QWEN_KV names another at load.  Not an artifact field (qwen_shape_check ignores it). */
+    uint32_t kv_format;
 } pulsar_qwen_shape;
 
 extern const pulsar_qwen_shape PULSAR_QWEN_SHAPE_FLASH_NEXT;
@@ -314,14 +318,15 @@ static inline uint64_t pulsar_qwen_gdn_state_bytes(const pulsar_qwen_shape *s) {
 static inline uint64_t pulsar_qwen_gdn_conv_bytes(const pulsar_qwen_shape *s) {
     return (uint64_t)(s->gdn_conv_kernel - 1u) * pulsar_qwen_gdn_conv_dim(s) * sizeof(float);
 }
-/** S3: one token's K and V for one QSA layer: n_head_kv x head_dim E4M3 each
- * (K post-norm post-RoPE, V raw), then one E8M0 byte per 32 elements -- 8 per
- * head, 2 x 2 x 8 = 32 B.  2 x 2 x 256 + 32 = **1056 B**, the kernel's
- * PULSAR_QSA_KV_TOKEN_BYTES.  (This said 1040 -- it charged a f32 per (head,
- * K|V) instead of head_dim/32 scale bytes; the kernel refused every sequence's
- * cache as "short" until it was corrected, 2026-09-27.) */
+/** S3: one token's K and V for one QSA layer: n_head_kv K rows and V rows (K post-norm post-RoPE, V raw) in
+ * the loaded K/V format -- production MX32: 256 E4M3 + 8 E8M0 a row, 2 x 2 x 264 = **1056 B**, the kernel's
+ * PULSAR_QSA_KV_TOKEN_BYTES; L291's arms bf16 2048 B, NVFP4 592 B.  The per-row widths are pulsar_gpu.h's
+ * (pulsar_qsa_kv_row_*_bytes, which the kernel's pulsar_qsa_kv_token_bytes reads too); n_head_kv is this
+ * rank's.  (This once said 1040 -- it charged a f32 per (head, K|V) instead of head_dim/32 scale bytes; the
+ * kernel refused every sequence's cache as "short" until it was corrected, 2026-09-27.) */
 static inline uint64_t pulsar_qwen_kv_row_bytes(const pulsar_qwen_shape *s) {
-    return 2ull * s->n_head_kv * s->head_dim + 2ull * s->n_head_kv * (s->head_dim / 32ull);
+    const pulsar_qsa_kv_format f = (pulsar_qsa_kv_format)s->kv_format;
+    return 2ull * s->n_head_kv * (pulsar_qsa_kv_row_data_bytes(f) + pulsar_qsa_kv_row_scale_bytes(f));
 }
 /** S3: the per-bank QSA cache capacity for a requested context of `ctx` tokens.
  *  The indexer pools idx_block tokens into ONE key block (the kernel's name for

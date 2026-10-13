@@ -2527,6 +2527,12 @@ tests/qwen_generate.o: tests/qwen_generate.cpp
 	$(CXX) $(CXXFLAGS) -Isrc -Isrc/engine -c -o $@ $<
 tests/qwen_generate: tests/qwen_generate.o src/lib/pulsar_help.o $(CORE_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
+# L291: the KV-format walk -- teacher-forced windows ending at a depth, one engine load (tools/qwen/kv_grade.py
+# grades its outputs).  The K/V format is the engine's (PULSAR_QWEN_KV).  Needs a real container.
+tests/qwen_kv_walk.o: tests/qwen_kv_walk.cpp
+	$(CXX) $(CXXFLAGS) -Isrc -Isrc/engine -c -o $@ $<
+tests/qwen_kv_walk: tests/qwen_kv_walk.o src/lib/pulsar_help.o $(CORE_OBJS)
+	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 tests/qwen_chat_smoke.o: tests/qwen_chat_smoke.cpp
 	$(CXX) $(CXXFLAGS) -Isrc -Isrc/engine -c -o $@ $<
 tests/qwen_chat_smoke: tests/qwen_chat_smoke.o src/lib/pulsar_help.o $(CORE_OBJS)

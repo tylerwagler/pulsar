@@ -2724,7 +2724,12 @@ int pulsar_gpu_tp_bulk_combine_sum(pulsar_gpu_tensor *dst, uint64_t dst_off, con
  *   bkey  cap/4 x 128 bf16: each COMPLETE block's pooled, normed, roped key --
  *         what the scorer reads; raw per-token indexer keys are not kept
  *   stage 4 x 128 f32: the raw indexer keys of the open (incomplete) block
- * KV/token/layer = 1056 + 64 (bkey) B; 12 layers = 13.1 KiB/token. */
+ * KV/token/layer = 1056 + 64 (bkey) B; 12 layers = 13.1 KiB/token.
+ *
+ * L291: that record is the PRODUCTION format (PULSAR_QSA_KV_MX32).  The other K/V formats below are
+ * measurement arms chosen per call (pulsar_qsa_io::kv_format); every format keeps the record's shape --
+ * every row's data (K h0 | K h1 | V h0 | V h1), then every row's scale bytes in the same order -- and only
+ * the per-row data / scale widths differ.  The bkey and stage are bf16 / f32 in every format. */
 enum {
     PULSAR_QSA_N_HEAD     = 24,
     PULSAR_QSA_N_KV       = 2,
@@ -2742,6 +2747,43 @@ enum {
     PULSAR_QSA_BKEY_BYTES = 256,
     PULSAR_QSA_STAGE_BYTES = 2048
 };
+/** L291: the QSA K/V cache format.  MX32 is production; the others are measurement arms (PULSAR_QWEN_KV),
+ * kernels keyed by format, not family:
+ *   MX32      E4M3 data + one E8M0 per 32 (the record above)
+ *   BF16      the K/V rows as bf16 (what vLLM / TensorFold / HF keep), no scales
+ *   NVFP4     the L111 NVFP4 row recipe (pulsar_cuda_internal.h, pulsar_nvfp4_*): E2M1 nibbles (low nibble = even
+ *             dim), one E4M3 code per 16, then the row's f32 scale
+ *   *_ROT     the same storage of the rows rotated by the natural-order Sylvester H256 / 16 over head_dim: K and V
+ *             are rotated before they are quantised, q by the same matrix (q.k unchanged), and the attention output
+ *             is rotated back before the output gate (H is symmetric and orthogonal). */
+typedef enum {
+    PULSAR_QSA_KV_MX32      = 0,
+    PULSAR_QSA_KV_BF16      = 1,
+    PULSAR_QSA_KV_NVFP4     = 2,
+    PULSAR_QSA_KV_NVFP4_ROT = 3,
+    PULSAR_QSA_KV_MX32_ROT  = 4,
+    PULSAR_QSA_KV_FORMATS   = 5
+} pulsar_qsa_kv_format;
+/** Bytes of ONE K or V row (one KV head, 256 elements) per format: its data, then its scale bytes. */
+enum {
+    PULSAR_QSA_KV_MX32_DATA  = 256, PULSAR_QSA_KV_MX32_SC  = 8,    /* 8 E8M0 */
+    PULSAR_QSA_KV_BF16_DATA  = 512, PULSAR_QSA_KV_BF16_SC  = 0,
+    PULSAR_QSA_KV_NVFP4_DATA = 128, PULSAR_QSA_KV_NVFP4_SC = 20    /* 16 E4M3 codes + the f32 row scale */
+};
+static inline PULSAR_GPU_HD uint32_t pulsar_qsa_kv_row_data_bytes(pulsar_qsa_kv_format f) {
+    return f == PULSAR_QSA_KV_BF16 ? (uint32_t)PULSAR_QSA_KV_BF16_DATA
+         : (f == PULSAR_QSA_KV_NVFP4 || f == PULSAR_QSA_KV_NVFP4_ROT) ? (uint32_t)PULSAR_QSA_KV_NVFP4_DATA
+         : (uint32_t)PULSAR_QSA_KV_MX32_DATA;
+}
+static inline PULSAR_GPU_HD uint32_t pulsar_qsa_kv_row_scale_bytes(pulsar_qsa_kv_format f) {
+    return f == PULSAR_QSA_KV_BF16 ? (uint32_t)PULSAR_QSA_KV_BF16_SC
+         : (f == PULSAR_QSA_KV_NVFP4 || f == PULSAR_QSA_KV_NVFP4_ROT) ? (uint32_t)PULSAR_QSA_KV_NVFP4_SC
+         : (uint32_t)PULSAR_QSA_KV_MX32_SC;
+}
+/** The format's name as PULSAR_QWEN_KV spells it ("mx32", "bf16", "nvfp4", "nvfp4-rot", "mx32-rot"); NULL past the enum. */
+const char *pulsar_qsa_kv_format_name(pulsar_qsa_kv_format f);
+/** Parse a name; 0 (and *out untouched) on an unknown one. */
+int pulsar_qsa_kv_format_parse(const char *name, pulsar_qsa_kv_format *out);
 #define PULSAR_QSA_ROPE_THETA 10000000.0
 #define PULSAR_QSA_RMS_EPS    1e-6f
 
@@ -2794,10 +2836,14 @@ typedef struct {
      *  earlier call's).  Rotary pair j takes H when j % 3 == 1, W when j % 3 == 2, else T (HF's
      *  apply_interleaved_mrope over mrope_section [11, 11, 10]).  The KV row is still `row_pos`. */
     const uint32_t *row_rope;
+    /** L291: the K/V cache format of every sequence in the call (0 = PULSAR_QSA_KV_MX32, production).  A
+     *  measurement arm runs at tp_ranks 1 only; any other combination refuses. */
+    uint32_t kv_format;
 } pulsar_qsa_io;
 
-/** Bytes of one token's KV record for one rank at the tensor-parallel degree tp_ranks (0 / 1: 1056). */
-uint32_t pulsar_qsa_kv_token_bytes(int tp_ranks);
+/** Bytes of one token's KV record for one rank at the tensor-parallel degree tp_ranks in format `fmt`
+ * (TP 1 MX32: 1056 = PULSAR_QSA_KV_TOKEN_BYTES). */
+uint32_t pulsar_qsa_kv_token_bytes(int tp_ranks, pulsar_qsa_kv_format fmt);
 
 /** Workspace for a call of up to n_rows rows whose positions are < max_ctx. */
 uint64_t pulsar_gpu_qsa_workspace_bytes(uint32_t n_rows, uint32_t max_ctx);
