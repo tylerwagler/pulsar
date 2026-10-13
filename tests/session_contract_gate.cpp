@@ -43,8 +43,8 @@
  *       again; an invalidate drops the lookahead and re-arms too
  *   S2  a bank that drafts nothing in a round (the allocator's K = 0) leaves its state as a plain decode of the same
  *       token (L288, after vLLM 0eac15270): the round's base row through the verify (capture armed, every row
- *       headed) and the commit of that one row, against the token decoded plain on a twin bank -- alone, and beside
- *       a bank whose drafts ride the same verify.  The next-token logits and four decode steps after, byte for byte;
+ *       headed) and the commit of that one row, against the token decoded plain in a one-bank twin session --
+ *       alone, and beside a bank (another prompt) whose drafts ride the same verify.  The next-token logits and four decode steps after, byte for byte;
  *       on Qwen also every trunk layer's recurrent state (GDN state + conv, the PLE conv, the QSA index stage and the
  *       token's KV row), the bytes a policy that yields K = 0 rows relies on
  * In the battery for every family as a runner gate (L278: tests/gates_runner.cpp hosts each family's model); the
@@ -1072,97 +1072,115 @@ static int differ_at(const std::vector<std::vector<float>> &a, const std::vector
     return -1;
 }
 
+/* S2 sessions: `pool` banks, bank b prefilled with prompts[b]; NULL on a refusal (err says which) */
+static pulsar_session *s2_session(pulsar_engine *e, const pulsar_tokens *const *prompts, uint32_t pool, char *err,
+                                  size_t errlen) {
+    pulsar_engine_set_bank_pool(pool);
+    pulsar_session *s = NULL;
+    if (pulsar_session_create(&s, e, 4096) != 0 || !s) return NULL;
+    for (uint32_t b = 0; b < pool; b++) {
+        if (!pulsar_session_bank_state_restore(s, b) || pulsar_session_sync(s, prompts[b], err, errlen) != 0) {
+            pulsar_session_free(s);
+            return NULL;
+        }
+        pulsar_session_bank_state_save(s, b);
+    }
+    return s;
+}
+
 static void part_spec_zero_draft(pulsar_engine *e, int W) {
     if (!pulsar_engine_has_spec_rounds(e)) {
         printf("  skip  S2 (no drafter on this model)\n");
         return;
     }
-    pulsar_tokens A = text_tokens(e, "def merge_sorted(a, b):\n    \"\"\"Merge two sorted lists into one sorted list.\"\"\"\n"
-                                     "    out = []\n");
-    pulsar_engine_set_bank_pool(4);
-    pulsar_session *s = NULL;
+    /* part_banks' two prompts (B6 verifies their runs on both families) */
+    pulsar_tokens A = text_tokens(e, "The lighthouse keeper counted the ships every evening, writing each name in a small");
+    pulsar_tokens B = text_tokens(e, "def fibonacci(n):\n    \"\"\"Return the n-th Fibonacci number.\"\"\"\n    if n < 2:\n        return");
     char err[256] = "";
-    CHECK(pulsar_session_create(&s, e, 4096) == 0 && s, "S2 a 4-bank session");
-    if (!s) { pulsar_tokens_free(&A); return; }
-    bool ok = true;
-    for (uint32_t b = 0; ok && b < 4; b++) {
-        ok = pulsar_session_bank_state_restore(s, b) && pulsar_session_sync(s, &A, err, sizeof(err)) == 0;
-        if (ok) pulsar_session_bank_state_save(s, b);
-    }
-    CHECK(ok, "S2 banks 0-3 prefill the same prompt (%d tokens): %s", A.len, err);
-    /* the twin: bank 0 decodes the greedy base plain */
+    /* the twin: a one-bank session decodes the greedy base after A plain, then kDecode; its state after the base.
+     * Every S2 session holds A on its bank 0, so the twin's bytes sit at the same offsets. */
+    const pulsar_tokens *pa[1] = {&A};
+    pulsar_session *t = s2_session(e, pa, 1, err, sizeof(err));
     int x = -1;
-    if (ok && (ok = pulsar_session_bank_state_restore(s, 0))) {
-        const std::vector<float> l = logits_of(s, W);
+    bool ok = t != NULL;
+    if (ok) {
+        const std::vector<float> l = logits_of(t, W);
         x = l.empty() ? -1 : (int)(std::max_element(l.begin(), l.end()) - l.begin());
-        ok = x >= 0 && pulsar_session_eval(s, x, err, sizeof(err)) == 0;
-        pulsar_session_bank_state_save(s, 0);
+        ok = x >= 0 && pulsar_session_eval(t, x, err, sizeof(err)) == 0;
+        pulsar_session_bank_state_save(t, 0);
     }
-    const std::vector<uint8_t> plain_state = ok ? qwen_bank_state(s, 0, A.len) : std::vector<uint8_t>();
+    const std::vector<uint8_t> plain_state = ok ? qwen_bank_state(t, 0, A.len) : std::vector<uint8_t>();
     const std::vector<std::vector<float>> plain =
-        ok ? decode_after(s, 0, W, err, sizeof(err)) : std::vector<std::vector<float>>();
-    CHECK(ok && plain.size() == 5, "S2 bank 0 decodes the base %d plain, then 4 tokens: %s", x, err);
-    uint64_t rngs[2] = {1, 2};
-    pulsar_spec_round *r[2] = {pulsar_spec_round_new(), pulsar_spec_round_new()};
-    /* (a) bank 1 alone at K = 0 */
+        ok ? decode_after(t, 0, W, err, sizeof(err)) : std::vector<std::vector<float>>();
+    CHECK(ok && plain.size() == 5, "S2 the twin decodes the base %d plain after A (%d tokens), then 4 tokens: %s", x,
+          A.len, err);
+    if (t) pulsar_session_free(t);
+    /* (a) bank 0 of a one-bank session at K = 0 */
     {
-        const uint32_t banks[1] = {1};
+        pulsar_session *s = s2_session(e, pa, 1, err, sizeof(err));
+        const uint32_t banks[1] = {0};
         const int k0[1] = {0};
         int na[1] = {0};
-        const bool ran = ok && spec_lane_round(s, banks, k0, 1, rngs, r, na, W, err, sizeof(err));
-        CHECK(ran && na[0] == 1, "S2 (alone) bank 1's K = 0 round committed its base alone (%d): %s", na[0], err);
-        const std::vector<uint8_t> st = ran ? qwen_bank_state(s, 1, A.len) : std::vector<uint8_t>();
-        if (s->qwen)
+        uint64_t rng[1] = {1};
+        pulsar_spec_round *r[1] = {pulsar_spec_round_new()};
+        const bool ran = s && spec_lane_round(s, banks, k0, 1, rng, r, na, W, err, sizeof(err));
+        CHECK(ran && na[0] == 1, "S2 (alone) the K = 0 round committed its base alone (%d): %s", na[0], err);
+        const std::vector<uint8_t> st = ran ? qwen_bank_state(s, 0, A.len) : std::vector<uint8_t>();
+        if (s && s->qwen)
             CHECK(ran && !st.empty() && st == plain_state,
                   "S2 (alone) the K = 0 bank's recurrent state == the plain decode's, byte for byte (%zu bytes)",
                   st.size());
         const std::vector<std::vector<float>> got =
-            ran ? decode_after(s, 1, W, err, sizeof(err)) : std::vector<std::vector<float>>();
+            ran ? decode_after(s, 0, W, err, sizeof(err)) : std::vector<std::vector<float>>();
         const int at = differ_at(got, plain);
         CHECK(at == -1, "S2 (alone) the K = 0 bank's next-token logits and 4 decode steps == the plain twin's (first "
               "difference at step %d): %s", at, err);
+        pulsar_spec_round_free(r[0]);
+        if (s) pulsar_session_free(s);
     }
-    /* (b) bank 3 at K = 0 beside bank 2, whose drafts ride the same verify: bank 2's first round (no pendings yet)
-     * and its redraft, then the shared round */
+    /* (b) bank 0 (A) at K = 0 beside bank 1 (B), whose drafts ride the same verify: bank 1's first round (no
+     * pendings yet) and its redraft, then the shared round */
     {
-        const uint32_t b2[1] = {2};
+        const pulsar_tokens *pab[2] = {&A, &B};
+        pulsar_session *s = s2_session(e, pab, 2, err, sizeof(err));
+        uint64_t rngs[2] = {1, 2};
+        pulsar_spec_round *r[2] = {pulsar_spec_round_new(), pulsar_spec_round_new()};
+        const uint32_t b1[1] = {1};
         const int kall[1] = {-1};
         int na[2] = {0, 0};
-        bool ran = ok && spec_lane_round(s, b2, kall, 1, &rngs[1], &r[1], na, W, err, sizeof(err));
-        uint32_t banks_r[1] = {2};
+        bool ran = s && spec_lane_round(s, b1, kall, 1, &rngs[1], &r[1], na, W, err, sizeof(err));
+        uint32_t banks_r[1] = {1};
         uint64_t *rp[1] = {&rngs[1]};
         ran = ran && pulsar_session_spec_redraft_batch(s, &r[1], banks_r, rp, 1, err, sizeof(err)) == 0;
         pulsar_spec_step cs;
         memset(&cs, 0, sizeof cs);
-        cs.bank = 2;
+        cs.bank = 1;
         cs.round = r[1];
         ran = ran && pulsar_session_spec_redraft_commit_batch(s, &cs, 1) == 0 && cs.status == PULSAR_SPEC_STEP_OK;
         float conf[16];
-        const uint32_t pend = ran ? pulsar_session_bank_pending_confs(s, 2, conf) : 0u;
-        CHECK(ran && pend > 0, "S2 (beside) bank 2 holds %u drafts for the shared round: %s", pend, err);
-        const uint32_t banks[2] = {3, 2};
+        const uint32_t pend = ran ? pulsar_session_bank_pending_confs(s, 1, conf) : 0u;
+        CHECK(ran && pend > 0, "S2 (beside) bank 1 holds %u drafts for the shared round: %s", pend, err);
+        const uint32_t banks[2] = {0, 1};
         const int k[2] = {0, -1};
-        uint64_t rg[2] = {rngs[0], rngs[1]};
-        pulsar_spec_round *rr[2] = {pulsar_spec_round_new(), r[1]};   /* bank 3's own round; bank 2 keeps its */
-        ran = ran && pend > 0 && spec_lane_round(s, banks, k, 2, rg, rr, na, W, err, sizeof(err));
-        pulsar_spec_round_free(rr[0]);
-        CHECK(ran && na[0] == 1, "S2 (beside) bank 3's K = 0 round beside bank 2's %u drafts committed its base alone "
-              "(%d; bank 2 kept %d): %s", pend, na[0], na[1], err);
-        const std::vector<uint8_t> st = ran ? qwen_bank_state(s, 3, A.len) : std::vector<uint8_t>();
-        if (s->qwen)
+        ran = ran && pend > 0 && spec_lane_round(s, banks, k, 2, rngs, r, na, W, err, sizeof(err));
+        CHECK(ran && na[0] == 1, "S2 (beside) bank 0's K = 0 round beside bank 1's %u drafts committed its base alone "
+              "(%d; bank 1 kept %d): %s", pend, na[0], na[1], err);
+        const std::vector<uint8_t> st = ran ? qwen_bank_state(s, 0, A.len) : std::vector<uint8_t>();
+        if (s && s->qwen)
             CHECK(ran && !st.empty() && st == plain_state,
                   "S2 (beside) the K = 0 bank's recurrent state == the plain decode's, byte for byte (%zu bytes)",
                   st.size());
         const std::vector<std::vector<float>> got =
-            ran ? decode_after(s, 3, W, err, sizeof(err)) : std::vector<std::vector<float>>();
+            ran ? decode_after(s, 0, W, err, sizeof(err)) : std::vector<std::vector<float>>();
         const int at = differ_at(got, plain);
         CHECK(at == -1, "S2 (beside) the K = 0 bank's next-token logits and 4 decode steps == the plain twin's (first "
               "difference at step %d): %s", at, err);
+        pulsar_spec_round_free(r[0]);
+        pulsar_spec_round_free(r[1]);
+        if (s) pulsar_session_free(s);
     }
-    pulsar_spec_round_free(r[0]);
-    pulsar_spec_round_free(r[1]);
-    pulsar_session_free(s);
     pulsar_tokens_free(&A);
+    pulsar_tokens_free(&B);
 }
 
 int GATE_ENTRY(int argc, char **argv) {
