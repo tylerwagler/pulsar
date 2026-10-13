@@ -36,21 +36,27 @@ uint32_t pulsar_spec_cur_depth(const pulsar_session *s) {
 }
 
 /* L288 (tf-gap): the depth `n` chains drafted together run at.  A fixed-depth drafter (no adaptive policy) with
- * no configured depth drafts to its depth_max while every chain at that depth fits ONE shared verify forward --
- * n x (1 + depth_max) rows within the family's verify width (pulsar_engine_fused_heads_max, the one authority the
- * server's row budget is cut from) -- and at its depth past that: there the server's allocator rations the drafts
- * by survival (spec_alloc_rows), so the deeper steps would be drafted for rows it cuts.  Only which drafts are
- * proposed changes (proposals only: every emitted token is the target's, greedy or keyed).  Measured on td305-qh-h5d4
- * (2026-10-13, serve_matrix untraced, MTP depth 4 vs 6): code T0 92.2 -> 93.8 tok/s, code T0.7 90.0 -> 94.3, prose
- * 72.3 -> 72.6, two streams 111.1 -> 115.6 (2 x 7 rows <= 16), four 152.7 -> 150.1 and eight 169.5 -> 165.1 (past
- * the width).  An adaptive drafter (DSpark) moves its own depth; --spec-depth pins it. */
+ * no configured depth drafts each chain as deep as every bank's full chain can be verified in ONE shared forward --
+ * width / n - 1 drafts beside its base row, the width being the family's verify width (pulsar_engine_fused_heads_max,
+ * the one authority the server's row budget is cut from) -- capped at its depth_max and never below its depth.
+ * Past that width the server's allocator rations the drafts by survival (spec_alloc_rows), so deeper steps would be
+ * drafted for rows it cuts.  Which drafts are verified stays the allocator's price (a row is admitted while its
+ * chain survival is worth its measured cost); only which drafts are proposed changes, so every emitted token is the
+ * target's, greedy or keyed.  Measured on td305-qh-h5d4 (2026-10-13, serve_matrix untraced, --spec-depth pinned,
+ * tok/s at depth 4 / 6 / 7 / 8): code T0 92.6 / 94.5 / 97.5 / 96.2, code T0.7 89.6 / 94.5 / 94.1 / 92.2, prose
+ * 72.3 / 71.4 / 71.3 / 71.7, two streams 130.0 / 133.6 / 132.7 / 130.5, four 171.9 / 169.1 / 168.5 / 163.6, eight
+ * 171.4 / 165.8 / 162.4 / 150.9 -- this rule's picks (7, 7, 4, 4) are the best or within 1.5 % of it in every cell
+ * but prose (-1.4 %).  Dropping the draft under tau unverified (TensorFold's rule) won no cell at any depth.  An
+ * adaptive drafter (DSpark) moves its own depth; --spec-depth pins it. */
 uint32_t pulsar_spec_batch_depth(const pulsar_session *s, uint32_t n) {
     const pulsar_engine *e = s->engine;
     const pulsar_drafter_ops *d = e->drafter_ops;
     const uint32_t cur = pulsar_spec_cur_depth(s);
     if (!d || d->adapt || e->spec_depth > 0 || n == 0u) return cur;
-    const uint32_t width = pulsar_engine_fused_heads_max(e);
-    return (uint64_t)n * (1u + d->depth_max) <= width && d->depth_max > cur ? d->depth_max : cur;
+    const uint32_t per = pulsar_engine_fused_heads_max(e) / n;   /* rows each bank's chain may take, base included */
+    const uint32_t fit = per > 1u ? per - 1u : 0u;
+    const uint32_t depth = fit < d->depth_max ? fit : d->depth_max;
+    return depth > cur ? depth : cur;
 }
 
 void pulsar_spec_draft_req_init(pulsar_session *s, spec_redraft_req *q, int next_base, float temperature, int top_k,
