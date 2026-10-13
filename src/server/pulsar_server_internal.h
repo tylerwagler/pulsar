@@ -1468,6 +1468,17 @@ bool warn_limiter_due(warn_limiter *w, double now_sec, double period_sec, unsign
 /** Period of the MemAvailable-floor provisioning refusal line. */
 #define PULSAR_SERVER_MEM_FLOOR_WARN_SEC 10.0
 
+/** L288: the phases of a spec-lane round, in order (server::w_spec_phase_ms): plan = the fusion pick, the
+ *  draft-row allocation and the assemble; forward = the shared verify forward until its logits are on the host;
+ *  round_end = every bank's walk and commit; emit = streaming the accepted tokens; draft = the redraft pass
+ *  (the drafter's absorb and draft steps); commit = stamping the drafts into the banks. */
+enum server_round_phase {
+    SERVER_ROUND_PHASE_PLAN, SERVER_ROUND_PHASE_FORWARD, SERVER_ROUND_PHASE_ROUND_END, SERVER_ROUND_PHASE_EMIT,
+    SERVER_ROUND_PHASE_DRAFT, SERVER_ROUND_PHASE_COMMIT, SERVER_ROUND_PHASE_COUNT
+};
+/** /metrics' label for each server_round_phase. */
+extern const char *const server_round_phase_name[SERVER_ROUND_PHASE_COUNT];
+
 /** L284 lane cost: the scheduler's priced choice between the plain and spec decode lanes, one rule for every
  *  family (server_sched.cpp lane_price_pick).  The spec lane's acceptance is measured here, per bank per decode
  *  round; both lanes' step costs are the engine's fits (pulsar_engine_lane_cost).  All-zero is the start state. */
@@ -1647,6 +1658,14 @@ struct server {
     uint64_t m_spec_overflow_rounds;
     uint64_t w_spec_thr_cut_rows;
     uint64_t m_spec_thr_cut_rows;
+    /** L288: a decode-only spec round's wall split by phase (server_sched.cpp's spec quantum, the host clock,
+     *  no device sync added) -- what /metrics publishes as pulsar:spec_round_phase_ms_total, so a client
+     *  decomposes ms/round untraced.  Device work a phase enqueues without waiting for it is paid where the next
+     *  blocking call waits (the commit's GDN updates land in the draft phase).  Worker-owned / mirrored. */
+    double   w_spec_phase_ms[SERVER_ROUND_PHASE_COUNT];
+    uint64_t w_spec_phase_rounds;
+    double   m_spec_phase_ms[SERVER_ROUND_PHASE_COUNT];
+    uint64_t m_spec_phase_rounds;
     /** L123: the batched lane's shared ALL_ROWS logits landing buffer
      * (PULSAR_SPEC_LOGITS_ROWS x vocab floats, ~16.5 MB), allocated once on
      * first quantum. It was a per-quantum malloc/free — 16.5 MB of

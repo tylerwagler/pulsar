@@ -21,7 +21,16 @@ reports the tokens it actually ran.
 
 Against a server with pulsar's /metrics, every single / conc cell also reports the server's own speculation counters
 over its timed runs: srv_tok_per_round (accepted drafts + the base token, per round that carried drafts) and
-srv_drafts_per_round.
+srv_drafts_per_round.  TensorFold's /metrics has no round counter; with --server-log (its server's stdout) the
+cell sums the per-request "done ... rounds=R accepted=A/D" lines into the same two fields.  pulsar also publishes a
+decode-only round's host wall by phase (pulsar:spec_round_phase_ms_total), reported as srv_phase_ms (ms a round).  With either,
+srv_ms_per_round = 1000 x srv_tok_per_round / decode_tps: a round's wall price as the client sees it (conc: per
+stream, from the median stream's rate).
+
+  scoreboard  the fixed L288 cell set against one engine: single code T0 / prose T0 / code T0.7 (median of --reps x
+           --tokens), then --streams-set (default 4,8) concurrent streams at T0 (--conc-tokens each).
+           tools/serve-bench/scoreboard.sh starts either engine (pulsar-server or TensorFold) and runs it plus
+           TensorFold's own public client (tools/bench_openai.py); `serve_matrix.py table A.jsonl B.jsonl` compares.
 
   serve_matrix.py single  --port 8000 --prompts code,codex,prose,story --temps 0,0.7,1.0 --tokens 512 --reps 3
   serve_matrix.py conc    --port 8000 --streams 4 --temps 0 --tokens 256
@@ -128,12 +137,17 @@ def spec_counters(port, host="127.0.0.1"):
             text = resp.read().decode(errors="replace")
     except Exception:
         return None
-    out = {}
+    out, phases = {}, {}
     for line in text.splitlines():
         name = line.split("{", 1)[0].split(" ", 1)[0]
         if name in want:
             out[want[name]] = int(float(line.rsplit(" ", 1)[1]))
-    return out if len(out) == len(want) else None
+        elif name == "pulsar:spec_round_phase_ms_total":       # L288: a round's wall by phase
+            phases[line.split('phase="', 1)[1].split('"', 1)[0]] = float(line.rsplit(" ", 1)[1])
+        elif name == "pulsar:spec_round_phase_rounds_total":
+            out["phase_rounds"] = int(line.rsplit(" ", 1)[1])
+    out["phases"] = phases
+    return out if all(k in out for k in want.values()) else None
 
 
 def spec_delta(m0, m1):
@@ -144,8 +158,45 @@ def spec_delta(m0, m1):
     r = m1["rounds"] - m0["rounds"]
     if r <= 0:
         return {"srv_rounds": 0}
-    return {"srv_rounds": r, "srv_tok_per_round": round(1 + (m1["accepted"] - m0["accepted"]) / r, 3),
-            "srv_drafts_per_round": round((m1["drafted"] - m0["drafted"]) / r, 3)}
+    rec = {"srv_rounds": r, "srv_tok_per_round": round(1 + (m1["accepted"] - m0["accepted"]) / r, 3),
+           "srv_drafts_per_round": round((m1["drafted"] - m0["drafted"]) / r, 3)}
+    pr = m1.get("phase_rounds", 0) - m0.get("phase_rounds", 0)
+    if pr > 0:   # pulsar: ms per decode-only round by phase (host wall, untraced)
+        rec["srv_phase_ms"] = {k: round((v - m0["phases"].get(k, 0.0)) / pr, 3) for k, v in m1["phases"].items()}
+    return rec
+
+
+def log_mark(a):
+    """Where --server-log ends now (None without one): log_spec reads the requests finished after it."""
+    return os.path.getsize(a.server_log) if a.server_log else None
+
+
+def log_spec(a, mark):
+    """The same two fields from TensorFold's per-request log line ("[tensorfold] done ... rounds=R accepted=A/D"),
+    summed over the requests that finished since `mark`; {} without --server-log or such lines."""
+    if mark is None:
+        return {}
+    time.sleep(0.3)   # the line is printed as the reply closes
+    with open(a.server_log, errors="replace") as f:
+        f.seek(mark)
+        lines = [l for l in f.read().splitlines() if "] done " in l and " rounds=" in l]
+    r = acc = dr = 0
+    for l in lines:
+        kv = dict(t.split("=", 1) for t in l.split() if "=" in t)
+        r += int(kv["rounds"])
+        a_, d_ = kv["accepted"].split("/")
+        acc, dr = acc + int(a_), dr + int(d_)
+    if r <= 0:
+        return {}
+    return {"srv_rounds": r, "srv_tok_per_round": round(1 + acc / r, 3), "srv_drafts_per_round": round(dr / r, 3)}
+
+
+def round_price(rec, tps):
+    """srv_ms_per_round from a stream's decode rate and its tokens per round."""
+    tpr = rec.get("srv_tok_per_round")
+    if tps and tpr:
+        rec["srv_ms_per_round"] = round(1000.0 * tpr / tps, 2)
+    return rec
 
 
 def bursts(stamps):
@@ -175,32 +226,36 @@ def run_single(a):
         text = text if text is not None else story_prompt()
         for temp in [float(t) for t in a.temps.split(",")]:
             request(a.port, kind, text, min(a.tokens, 64), temp, 1233, a.model)          # warm-up
-            m0 = spec_counters(a.port)
+            m0, lm = spec_counters(a.port), log_mark(a)
             runs = [request(a.port, kind, text, a.tokens, temp, 1234 + i, a.model) for i in range(a.reps)]
             m1 = spec_counters(a.port)
             stats = [one_stats(r) for r in runs]
             tps = [s["decode_tps"] for s in stats if s["decode_tps"]]
-            emit({"mode": "single", "label": a.label, "prompt": name, "temp": temp, "max_tokens": a.tokens,
-                  "tokens": [r["tokens"] for r in runs],
-                  "decode_tps_median": round(statistics.median(tps), 2) if tps else None,
-                  "decode_tps_all": [round(x, 2) for x in tps],
-                  "tok_per_burst": round(statistics.median(s["tok_per_burst"] for s in stats), 2),
-                  "ttft_s_median": round(statistics.median(s["ttft_s"] for s in stats), 3),
-                  **spec_delta(m0, m1),
-                  "sample": runs[0]["text"][:100]}, a.out)
+            med = statistics.median(tps) if tps else None
+            emit(round_price({"mode": "single", "label": a.label, "prompt": name, "temp": temp,
+                              "max_tokens": a.tokens, "tokens": [r["tokens"] for r in runs],
+                              "decode_tps_median": round(med, 2) if med else None,
+                              "decode_tps_all": [round(x, 2) for x in tps],
+                              "tok_per_burst": round(statistics.median(s["tok_per_burst"] for s in stats), 2),
+                              "ttft_s_median": round(statistics.median(s["ttft_s"] for s in stats), 3),
+                              **(spec_delta(m0, m1) or log_spec(a, lm)),
+                              "sample": runs[0]["text"][:100]}, med), a.out)
 
 
 def run_conc(a):
     for temp in [float(t) for t in a.temps.split(",")]:
-        n = a.streams
+        conc_cell(a, a.streams, temp, a.tokens)
+
+
+def conc_cell(a, n, temp, tokens):
         res = [None] * n
 
         def go(i):
-            res[i] = request(a.port, "chat", CONC_TASKS[i % len(CONC_TASKS)] + f" (variant {i})", a.tokens,
+            res[i] = request(a.port, "chat", CONC_TASKS[i % len(CONC_TASKS)] + f" (variant {i})", tokens,
                              temp, 1234 + i, a.model)
 
         th = [threading.Thread(target=go, args=(i,)) for i in range(n)]
-        m0 = spec_counters(a.port)
+        m0, lm = spec_counters(a.port), log_mark(a)
         start = time.perf_counter()
         for t in th:
             t.start()
@@ -217,14 +272,16 @@ def run_conc(a):
         in_win = sum(sum(1 for s in r["stamps"] if w0 < s <= w1) for r in res)
         agg = in_win / chunks_per_tok / (w1 - w0) if w1 > w0 else 0.0
         per = [one_stats(r)["decode_tps"] for r in res]
-        emit({"mode": "conc", "label": a.label, "streams": n, "temp": temp, "max_tokens": a.tokens,
-              "tokens": [r["tokens"] for r in res],
-              "decode_tps": round(agg, 2),
-              "per_stream_tps": round(statistics.median(p for p in per if p), 2),
-              "per_stream_min": round(min(p for p in per if p), 2),
-              "end_to_end_tps": round(sum(r["tokens"] for r in res) / (max(ends) - start), 2),
-              "tok_per_burst": round(statistics.median(one_stats(r)["tok_per_burst"] for r in res), 2),
-              "ttft_max_s": round(max(f - r["t0"] for f, r in zip(firsts, res)), 2), **spec_delta(m0, m1)}, a.out)
+        per_med = statistics.median(p for p in per if p)
+        emit(round_price({"mode": "conc", "label": a.label, "streams": n, "temp": temp, "max_tokens": tokens,
+                          "tokens": [r["tokens"] for r in res],
+                          "decode_tps": round(agg, 2),
+                          "per_stream_tps": round(per_med, 2),
+                          "per_stream_min": round(min(p for p in per if p), 2),
+                          "end_to_end_tps": round(sum(r["tokens"] for r in res) / (max(ends) - start), 2),
+                          "tok_per_burst": round(statistics.median(one_stats(r)["tok_per_burst"] for r in res), 2),
+                          "ttft_max_s": round(max(f - r["t0"] for f, r in zip(firsts, res)), 2),
+                          **(spec_delta(m0, m1) or log_spec(a, lm))}, per_med), a.out)
 
 
 def run_prefill(a):
@@ -245,9 +302,53 @@ def run_prefill(a):
                   "prefill_tps": round((pt or n) / ttft, 1) if ttft else None}, a.out)
 
 
+# The L288 scoreboard's single-stream cells (prompt, temperature); the concurrent cells run at T0.
+SCOREBOARD_SINGLE = [("code", 0.0), ("prose", 0.0), ("code", 0.7)]
+
+
+def run_scoreboard(a):
+    for name, temp in SCOREBOARD_SINGLE:
+        b = argparse.Namespace(**vars(a))
+        b.prompts, b.temps = name, str(temp)
+        run_single(b)
+    for n in [int(x) for x in a.streams_set.split(",") if x]:
+        conc_cell(a, n, 0.0, a.conc_tokens)
+
+
+def run_table(a):
+    """One row per cell, one column per label (file order): tok/s (tokens/round, ms/round), and the first two
+    labels' tok/s ratio.  Concurrent cells: aggregate tok/s; tokens/round and ms/round per stream."""
+    cells, labels = {}, []
+    for path in a.files:
+        for line in open(path):
+            d = json.loads(line)
+            if d["mode"] not in ("single", "conc"):
+                continue
+            key = f"{d['prompt']} T{d['temp']:g}" if d["mode"] == "single" else f"{d['streams']} streams T{d['temp']:g}"
+            lab = d.get("label") or os.path.basename(path)
+            if lab not in labels:
+                labels.append(lab)
+            cells.setdefault(key, {})[lab] = d
+    two = len(labels) >= 2
+    print("| cell | " + " | ".join(f"{l} tok/s (tok/round, ms/round)" for l in labels)
+          + (f" | {labels[0]} / {labels[1]}" if two else "") + " |")
+    print("|---|" + "---:|" * (len(labels) + (1 if two else 0)))
+    for key, by in cells.items():
+        row, tps = [], []
+        for l in labels:
+            d = by.get(l)
+            t = (d.get("decode_tps_median", d.get("decode_tps")) if d else None)
+            tps.append(t)
+            row.append(f"{t} ({d.get('srv_tok_per_round', '-')}, {d.get('srv_ms_per_round', '-')})" if d else "")
+        if two:
+            row.append(f"{tps[0] / tps[1]:.3f}" if tps[0] and tps[1] else "")
+        print(f"| {key} | " + " | ".join(row) + " |")
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("mode", choices=["single", "conc", "prefill"])
+    p.add_argument("mode", choices=["single", "conc", "prefill", "scoreboard", "table"])
+    p.add_argument("files", nargs="*", help="table: the .jsonl files to compare (labels in file order)")
     p.add_argument("--port", type=int, default=8000)
     p.add_argument("--model", default="m")
     p.add_argument("--label", default="")
@@ -259,8 +360,12 @@ def main():
     p.add_argument("--streams", type=int, default=2)
     p.add_argument("--lengths", default="1024,8192,32768")
     p.add_argument("--tokenizer")
+    p.add_argument("--server-log", help="TensorFold: its server's log, read for the per-request round counts")
+    p.add_argument("--streams-set", default="4,8", help="scoreboard: the concurrent-stream cells")
+    p.add_argument("--conc-tokens", type=int, default=256, help="scoreboard: tokens per concurrent stream")
     a = p.parse_args()
-    {"single": run_single, "conc": run_conc, "prefill": run_prefill}[a.mode](a)
+    {"single": run_single, "conc": run_conc, "prefill": run_prefill, "scoreboard": run_scoreboard,
+     "table": run_table}[a.mode](a)
 
 
 if __name__ == "__main__":
