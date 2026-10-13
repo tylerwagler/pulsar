@@ -421,17 +421,26 @@ static int mtp_draft_batch(pulsar_session *s, pulsar_spec_round **rounds, const 
  * (2026-10-12, sdet accept rule, td305 + U-e4-d5): this drafter accepts as well as TensorFold's on the same tokens
  * (teacher-forced, tools/qwen/accept); the deeper chains TF runs pay there because a draft costs 3.43 ms against
  * 4.45 here (verify row 2.49 + MTP step 1.74, 0.98 of it this draft head's MXFP8 read).  Depth 6 vs 4: single
- * stream -1..+4 %, 4 / 8 streams -3 % on both models.  L288 (2026-10-13, tf-gap pass 2): no fixed depth -- the chain
- * runs to `depth` while its survival pays one more MTP step and its verify row at the lane's yield and the shared
- * verify width still has room for it (pulsar_spec_chain_price), the stop rule beside it; a copy chain (a repeat of
- * the bank's history) runs to depth_max, the verify capture. */
+ * stream -1..+4 %, 4 / 8 streams -3 % on both models.  L288 (2026-10-13, tf-gap pass 2): the chain runs to the
+ * session's depth while its survival pays one more MTP step and its verify row at the lane's yield and the shared
+ * verify width still has room for it (pulsar_spec_chain_price), the stop rule beside it; the depth is the shared
+ * adaptive controller's (spec_depth.h) between 4 and 7 -- up a level after a round that converted its whole depth,
+ * down after one that converted less than half.  Replayed on the unstopped depth-8 traces (td305; the 2026-10-13
+ * costs: base 27.5, row 2.4, step 1.3 ms) against a fixed 7: the chat reply's first 18 rounds 76.5 vs 70.6 tok/s
+ * (fixed 4: 77.3 -- TensorFold's 64-token chat fixture lives there), the whole prose reply 72.4 vs 72.9, code
+ * 99.0 vs 99.8 and 75.3 vs 74.6; the confidence is miscalibrated early in a reply (drafts at 0.999 rejected) and no
+ * survival price separates those rounds, a depth earned by full rounds does.  The L270 loss above was the
+ * controller at a fixed 4 with a 2.7 ms draft step.  A copy chain (a repeat of the bank's history) runs to
+ * depth_max, the verify capture, and does not move the depth. */
+static const pulsar_spec_depth_policy k_mtp_depth = {4, 7, 0.0f, 0, 0.0f, 0u, 0u};
+
 const pulsar_drafter_ops k_mtp_drafter = {
     /* .name          = */ "MTP",
-    /* .depth         = */ 7u,   /* the MTP chain's cap (the L288 depth sweep's best code cell: 97.5 tok/s against
-                                  * 96.2 at 8 and 94.5 at 6); the priced depth stops a chain short of it */
+    /* .depth         = */ 4u,   /* where a session starts; k_mtp_depth moves it 4..7 (7: the L288 sweep's best code
+                                  * cell, 97.5 tok/s against 96.2 at 8 and 94.5 at 6) */
     /* .depth_max     = */ PULSAR_QWEN_SPEC_DRAFT_MAX,
     /* .tau           = */ 0.7f,
-    /* .adapt         = */ NULL,
+    /* .adapt         = */ &k_mtp_depth,
     /* .prime         = */ NULL,   /* the trunk's stacks are the conditioning; the prefill parks the last one */
     /* .absorb        = */ NULL,   /* a round's rows together: the kept rows' MTP rows are one PREFILL step */
     /* .absorb_banked = */ mtp_absorb_banked,
