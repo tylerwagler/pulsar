@@ -1663,6 +1663,11 @@ static uint32_t width_price_pick(width_price *wp, int n, uint32_t blk, uint32_t 
     };
     const int inc = wp->force[n], other = 1 - inc;
     const uint32_t at = wp->rounds[n];
+    auto event = [&]() {   /* a probe begins or ends: the caller announces it, with the prices it weighed */
+        wp->ann_n = n;
+        wp->ann_blk = price(0);
+        wp->ann_whole = price(1);
+    };
     if (wp->probe[n] >= 0) {
         if (at - wp->mark[n] < LANE_PRICE_PROBE_STEPS) {
             wp->why = "measuring";
@@ -1676,12 +1681,14 @@ static uint32_t width_price_pick(width_price *wp, int n, uint32_t blk, uint32_t 
         } else {
             wp->why = "measured: the width in force holds";
         }
+        event();
         return wp->force[n] ? full : blk;
     }
     if (price(inc) > 0.0 && (price(other) <= 0.0 || at - wp->mark[n] >= LANE_PRICE_REPROBE_STEPS)) {
         wp->probe[n] = (int8_t)other;
         wp->mark[n] = at;
         wp->why = price(other) <= 0.0 ? "no price here: measuring" : "re-measuring";
+        event();
         return other ? full : blk;
     }
     wp->why = price(inc) > 0.0 ? "priced" : "measuring the width in force";
@@ -2531,10 +2538,12 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n, int quantum_
             if (n_fin == 0 && !pulsar_engine_is_tp(s->engine))
                 width = width_price_pick(&s->w_width_price, n_live, PULSAR_GPU_MNEUTRAL_ROWS_MAX, heads_max);
             (void)pulsar_engine_set_spec_width(s->engine, width);
-            if (width != s->w_spec_width && n_live > 1) {   /* rule 5: a width change says which and why */
-                server_log(PULSAR_LOG_DEFAULT, "pulsar-server: spec verify width %u -> %u rows (%d decoders; %s)",
-                           s->w_spec_width, width, n_live, s->w_width_price.why ? s->w_width_price.why : "");
-                s->w_spec_width = width;
+            width_price &wp = s->w_width_price;
+            if (wp.ann_n > 0) {   /* rule 5: a probe's start and its verdict, with the prices weighed */
+                server_log(PULSAR_LOG_DEFAULT, "pulsar-server: spec verify width at %d decoders: %u rows (%s; the %u-row "
+                           "block %.1f vs the whole %u rows %.1f tok/s)", wp.ann_n, width, wp.why ? wp.why : "",
+                           (unsigned)PULSAR_GPU_MNEUTRAL_ROWS_MAX, wp.ann_blk, heads_max, wp.ann_whole);
+                wp.ann_n = 0;
             }
             int thr_cut_rows = 0;
             const int bound = spec_alloc_rows(surv, npend, n, n_live, (int)width - n_fin, thr,

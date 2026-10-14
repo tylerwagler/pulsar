@@ -1495,7 +1495,11 @@ typedef struct {
     uint32_t mark[WIDTH_PRICE_N];      ///< rounds at n when the probe began, or when the width in force was weighed
     uint32_t rounds[WIDTH_PRICE_N];    ///< rounds run at n
     bool init;                         ///< probe[] set to -1
-    const char *why;                   ///< the last pick's reason, announced with a change
+    const char *why;                   ///< the last pick's reason
+    /** a probe began or ended at `ann_n` decoders (the caller announces it once and clears ann_n; 0 none), with the
+     *  two prices it was weighed on, tokens/s (0: no number) */
+    int ann_n;
+    double ann_blk, ann_whole;
 } width_price;
 
 /** L284 lane cost: the scheduler's priced choice between the plain and spec decode lanes, one rule for every
@@ -1704,7 +1708,6 @@ struct server {
      *  every decoder (server_sched.cpp lane_price_pick).  Worker-owned. */
     lane_price w_lane_price;
     width_price w_width_price;     ///< L288 C1: the spec lane's verify width, measured per decoder count
-    uint32_t w_spec_width;         ///< the width the last spec round carried at most (announced on a change)
     uint64_t m_prompt_tokens;  ///< cumulative prompt tokens prefilled
     uint64_t m_prefix_queries;  ///< cumulative prompt tokens seen (hit-rate denom)
     uint64_t m_prefix_hits;  ///< cumulative prompt tokens served from prefix cache
