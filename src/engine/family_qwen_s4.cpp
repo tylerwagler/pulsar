@@ -945,9 +945,9 @@ bool pulsar_qwen_s4_head(const pulsar_qwen_step *st, uint32_t row0, uint32_t n, 
     });
     if (ok) {
         /* The head is a dense Linear of the mixer's bf16 rows, through the core's bf16-rows front door
-         * (pulsar_rows_linear_launch: the arm by the weight's format, the decode arm at every call -- within the
-         * M-independent width a row's logits never depend on the rows beside it, a prompt's last row included; a
-         * span past it, a wide verify's (L288 C1), takes the format's GEMM arm, graded).  L288 qwen-exl3-head: the weight is the
+         * (pulsar_rows_linear_launch: the arm by the weight's format, the decode arm at every call -- a row's logits
+         * never depend on the rows beside it, a prompt's last row included; L288 C1: a wide verify's span in 16-row
+         * blocks).  L288 qwen-exl3-head: the weight is the
          * container's -- an lm_head / mtp.draft_head stored EXL3 runs the EXL3 dense arm as stored; a bf16 lm_head
          * is L251's: MXFP8 made once on the device (the producers' own encoder), multiplied by the mxfp8_lt rows
          * arm on the tensor cores, the weight read once for all the call's rows. */

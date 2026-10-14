@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-// The dense EXL3 arm for PROMPT CHUNKS (L251): M > 16 rows of ds4_exl3_dense_launch.
+// The dense EXL3 arm for PROMPT CHUNKS (L251): every prompt chunk of ds4_exl3_dense_launch (decode rows keep the GEMV).
 //
 // The decode arm (ds4_exl3_dense.cu) is a GEMV: every CTA decodes its trellis tiles for 16 rows and
 // reads the activation planes for 32 outputs, so a 4096-row prompt re-decodes each weight 256 times

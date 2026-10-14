@@ -306,7 +306,7 @@ qwen_gr_down_kernel(const void *__restrict__ wv, const uint8_t *__restrict__ wsf
  * on nothing but its own x and W, so the chunk width changes no bit -- nor does the CTA's output
  * width.  CTA = 4 warps = 64 tokens x 8 NJ outputs (warp w: tokens 16w..16w+15, NJ n8 tiles); a wider
  * CTA re-stages the activation fewer times.  kMmaStage MX blocks staged per barrier. */
-constexpr int kDecodeRowsMax = 16;               ///< widths at or below take the decode GEMV
+constexpr int kDecodeRowsMax = PULSAR_QWEN_DECODE_ROWS_MAX;   ///< widths at or below take the decode GEMV
 constexpr int kMmaTok = 64, kMmaStage = 4;
 constexpr int kMmaNJ = 8, kMmaOut = 8 * kMmaNJ;  ///< the plain Linear's CTA output width
 constexpr int kGrNJ = 8, kGrOut = 8 * kGrNJ;     ///< the read's W_up (GATE): 16 channels x 4 streams
@@ -751,7 +751,7 @@ static int gr_read_kernels(const pulsar_qwen_gr_dev *w, const uint16_t *streams,
     /* W8 selects the WEIGHT format only; the activation is bf16 either way -- the W8A16 arm, on the
      * tensor cores (2') at prefill widths, where the GEMM's staging takes xn from the streams itself
      * (GR_NORM), so the norm emits only rstd and the inject partials there. */
-    const bool gemm = W8 && (w->prompt || T > kDecodeRowsMax);
+    const bool gemm = W8 && w->prompt;   /* decode rows arrive <= kDecodeRowsMax at a time (the launcher's blocks) */
     const gr_gate_args ga{(const __nv_bfloat16 *)streams, (const __nv_bfloat16 *)w->norm_w, m.rstd, (__nv_bfloat16 *)x_bf16};
     qwen_gr_norm_kernel<<<dim3(kS, T), kNormThreads, 0, stream>>>(
         (const __nv_bfloat16 *)streams, (const __nv_bfloat16 *)w->norm_w, (const __nv_bfloat16 *)w->inject,
@@ -793,7 +793,7 @@ static int gr_read_kernels(const pulsar_qwen_gr_dev *w, const uint16_t *streams,
         }
     }
     /* W8 is at decode widths here; the BF16 mixer takes the 16-token tile at prefill widths */
-    const int tb = !W8 && (w->prompt || T > kDecodeRowsMax) ? kUpTB : kUpTBDecode;
+    const int tb = !W8 && w->prompt ? kUpTB : kUpTBDecode;
     const dim3 grid(kH / 32, (T + tb - 1) / tb);
     const size_t smem = W8 ? kUpTileBytes : 0;
     const float *injp = w->inject ? m.injp : nullptr;
@@ -847,9 +847,19 @@ extern "C" int pulsar_qwen_gr_read_launch(const pulsar_qwen_gr_dev *w, const uin
                 w8 ? "MXFP8" : "BF16", kDownSplit, w8 ? "; L288 tensor cores at every width" : "", w8 ? "MXFP8" : "BF16");
     }
     /* L251 / ac69748f: there is no scale slab to clear and no slot to fill -- xn is bf16, so the
-     * norm writes every element the down GEMV reads and nothing else owns this buffer. */
-    const int rc = w8 ? gr_read_kernels<true>(w, streams, T, x_bf16, inj, m, stream)
-                      : gr_read_kernels<false>(w, streams, T, x_bf16, inj, m, stream);
+     * norm writes every element the down GEMV reads and nothing else owns this buffer.
+     * L288 C1: decode rows past kDecodeRowsMax (a wide verify) take the decode arms a block at a time -- every kernel
+     * of the read indexes its row alone, the workspace's per-row planes from 0 reused in stream order -- so a row's
+     * bytes are a one-row decode's at any width (the prefill GEMM's here cost a wide verify more than it saved). */
+    int rc = 0;
+    const int blk = w->prompt ? T : kDecodeRowsMax;
+    for (int r0 = 0; rc == 0 && r0 < T; r0 += blk) {
+        const int t = T - r0 < blk ? T - r0 : blk;
+        const uint16_t *s = streams + (size_t)r0 * kHC;
+        uint16_t *xb = x_bf16 + (size_t)r0 * kH;
+        float *in = inj ? inj + (size_t)r0 * PULSAR_QWEN_HC : nullptr;
+        rc = w8 ? gr_read_kernels<true>(w, s, t, xb, in, m, stream) : gr_read_kernels<false>(w, s, t, xb, in, m, stream);
+    }
     if (rc) {
         fprintf(stderr, "pulsar: qwen GR read: the W_down of %d rows could not be launched -- refusing\n", T);
         return -3;

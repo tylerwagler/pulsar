@@ -6,7 +6,7 @@
  *            row headed and the per-row state capture armed (qwen_forward verify = true; the server's
  *            lane reaches the same step through decode_mixed with heads on every row).  k + 1 <= 16 (a copy
  *            chain's, L288; an MTP chain's <= 8), so every kernel takes its decode-width arm and each row's
- *            logits are the bytes one-token decode would give (asserted below).
+ *            logits are the bytes one-token decode would give.
  *   commit   the recurrent state is set to the last kept row's (pulsar_qwen_s4_spec_rollback over the
  *            capture: L288 the GDN recurrent state, which the verify left untouched, advanced by the kept
  *            rows' updates; the rest rolled back), the bank's position counter moves, the logits are the
@@ -20,9 +20,9 @@
  *            under tau), that draft still verified.  Sampled drafts are draws from the MTP's q, recorded for
  *            the core's accept walk.
  *
- * L272 P1 S4: the batched lane verifies several banks in one step (one run each through decode_mixed, up to
- * PULSAR_QWEN_SPEC_ROWS rows; L288 C1: a step past the M-independent 16 takes the kernels' tensor-core GEMM arms,
- * graded, ENGINEERING-RULES rule 7); each bank's commit rolls its own run back.  L288: the absorb of every bank's kept rows is one MTP step (decode rows), and
+ * L272 P1 S4: the batched lane verifies several banks in one step (one run each through decode_mixed, every kernel
+ * at its decode arm up to PULSAR_QWEN_SPEC_ROWS rows -- L288 C1: 32, in 16-row blocks past 16); each bank's
+ * commit rolls its own run back.  L288: the absorb of every bank's kept rows is one MTP step (decode rows), and
  * the draft chains of every bank run in lockstep -- one MTP step a position for all of them, the draft head once
  * a step, not once a bank.  L284: any number of banks -- the server's allocator fits their drafts to the step's
  * rows (fused_heads_max = SPEC_ROWS), so N decoders keep speculating with shallower drafts. */
@@ -34,8 +34,6 @@
 #include <math.h>
 
 static_assert(PULSAR_QWEN_SPEC_DRAFT_MAX + 1u <= PULSAR_QWEN_SPEC_ROWS, "a bank's verify run fits the verify width");
-static_assert(PULSAR_QWEN_SPEC_DRAFT_MAX + 1u <= PULSAR_GPU_MNEUTRAL_ROWS_MAX,
-              "one bank's verify run keeps the decode-width arms: a lone stream's verify is byte-exact (L288 C1)");
 
 /* ---- the target hooks ------------------------------------------------------------------------- */
 

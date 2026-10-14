@@ -1254,8 +1254,9 @@ verify-width-probe: tests/verify_width_probe
 	PULSAR_MSEQ_BANKS=2 ./tests/verify_width_probe $(FRONTIER_MODEL) $(PULSAR_REF_DIR)/story.ref.bin $(PULSAR_REF_DIR)/story.tokens.bin --max-depth 6144 --extra 1024,3072,5120
 	PULSAR_MSEQ_BANKS=4 ./tests/verify_width_probe $(FRONTIER_MODEL) $(PULSAR_REF_DIR)/story.ref.bin $(PULSAR_REF_DIR)/story.tokens.bin --banks 4 --widths 4,8,16,24,32 --max-depth 6144 --extra 1024,3072,5120
 	PULSAR_MSEQ_BANKS=2 ./tests/verify_width_probe $(FRONTIER_MODEL) $(PULSAR_REF_DIR)/code.ref.bin $(PULSAR_REF_DIR)/code.tokens.bin --extra 1024,1536,2560,3072
-# L288 C1: Qwen's wide verify (32 rows: 8 streams x 4) graded the same way -- every row against the one-token
-# decode (plain decode steps: Qwen's verify leaves its bank for the commit to move) and the container capture.
+# L288 C1: Qwen's wide verify (32 rows: 8 streams x 4) the same way -- every row against the one-token decode
+# (plain decode steps: Qwen's verify leaves its bank for the commit to move; expected identical, the decode arms
+# run 16-row blocks) and the container capture.
 .PHONY: verify-width-probe-qwen
 verify-width-probe-qwen: tests/verify_width_probe
 	PULSAR_MSEQ_BANKS=8 ./tests/verify_width_probe $(QWEN_GATE_MODEL) $(QWEN_REF_ANCHOR_DIR)/story.ref.bin $(QWEN_REF_ANCHOR_DIR)/story.tokens.bin --banks 8 --widths 8,16,24,32 --max-depth 6144 --extra 1024,3072,5120 --serial plain
@@ -1846,8 +1847,8 @@ cuda-vision-chunk-gate: tests/vision_chunk_gate
 	./tests/vision_chunk_gate $(FRONTIER_MODEL) $(VISION_IMAGE_GOLDENS)
 cuda-spec-sampling-gate: tests/spec_sampling_gate
 	./tests/spec_sampling_gate $(SPEC_GATE_MODEL) $(SPEC_GATE_ARGS)
-# L288 C1: the same oracle with its spec arm at 8 banks (up to 32 rows: the shared verify width, past the
-# M-independent 16), so the wide verify's GEMM arms are graded by the sampled distribution.  Measurement beside the
+# L288 C1: the same oracle with its spec arm at 8 banks (up to 32 rows: the shared verify width, past the 16 the
+# decode kernels take in one block), so the wide verify is checked by the sampled distribution.  Measurement beside the
 # gate (its chi2 is informational, as the narrow one's); dump both builds (argv 6) and compare the spec arms with
 # tests/spec_sampling_compare.py for the like-with-like grade.
 .PHONY: cuda-spec-sampling-gate-wide

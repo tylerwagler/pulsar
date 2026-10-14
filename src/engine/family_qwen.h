@@ -366,11 +366,10 @@ static inline uint64_t pulsar_qwen_ple_conv_bytes(const pulsar_qwen_shape *s) {
 #define PULSAR_QWEN_X_ELT_SIZE      2u   ///< x, bf16 (+ the armed E4M3 slot)
 #define PULSAR_QWEN_Y_ELT_SIZE      4u   ///< y, f32
 /** Rows the head may emit per step (the logits slab): the batched lane's bound -- the shared verify width,
- *  PULSAR_SPEC_ROW_BUDGET (32), DeepSeek's too (L288 C1, 2026-10-14: it was 16, the M-independent width).  A
- *  step of up to PULSAR_GPU_MNEUTRAL_ROWS_MAX decode rows keeps the decode arms, each row the bytes a one-token
- *  decode gives; a wider one takes the tensor-core GEMM arms the kernels already pick past that width (the EXL3
- *  dense prefill GEMM, the W8A16 MMA, the head through them), so its rows agree with one-token decode to rounding,
- *  graded (ENGINEERING-RULES rule 7: the spec oracle at the wide width, KL of the rows), not byte-gated. */
+ *  PULSAR_SPEC_ROW_BUDGET (32), DeepSeek's too (L288 C1, 2026-10-14: it was 16, the M-independent width).  Decode
+ *  rows past PULSAR_GPU_MNEUTRAL_ROWS_MAX keep the decode arms in 16-row blocks (the dense EXL3 GEMV, the W8A16
+ *  rows kernel, the GR read; the routed EXL3 decode GEMM is M-independent at any width), so every row of a wide
+ *  verify is the bytes a one-token decode gives (verify-width-probe-qwen: identical rows). */
 #define PULSAR_QWEN_HEAD_ROWS_MAX   PULSAR_SPEC_ROW_BUDGET
 
 
@@ -403,15 +402,14 @@ typedef enum {
 } pulsar_qwen_op_id;
 
 /** L251 MTP: the deepest chain one bank drafts (its verify run is at most this + 1 rows).  L288 (2026-10-13): 15 --
- *  a copy chain runs this deep; the MTP chain's own cap is the drafter's depth (spec_qwen.cpp).  L288 C1: one bank's
- *  run stays within the M-independent width (PULSAR_GPU_MNEUTRAL_ROWS_MAX), so a lone stream's verify is exact; only
- *  several banks together pass it. */
+ *  a copy chain runs this deep; the MTP chain's own cap is the drafter's depth (spec_qwen.cpp).  L288 C1: kept at 15
+ *  when the verify width went to 32 -- several banks fill the wider step; one bank's run is what a lone stream
+ *  verifies, unchanged. */
 #define PULSAR_QWEN_SPEC_DRAFT_MAX 15u
-/** L272 P1 S4: the rows one verify step carries, every bank's run together -- the head's row cap.  The family's
- *  verify width (fused_heads_max, L284): the server's allocator fits N banks' drafts within it, one base row each.
- *  L288 C1: past PULSAR_GPU_MNEUTRAL_ROWS_MAX rows the step leaves the decode-width arms (PULSAR_QWEN_HEAD_ROWS_MAX);
- *  one bank's run never does (PULSAR_QWEN_SPEC_DRAFT_MAX + 1 <= the M-independent width, asserted in spec_qwen.cpp),
- *  so a lone stream's verify stays byte-exact. */
+/** L272 P1 S4: the rows one verify step carries, every bank's run together -- the head's row cap, at every width
+ *  of which the kernels keep their decode arms (each row's logits the bytes a one-token decode gives; L288 C1: in
+ *  16-row blocks past 16).  The family's verify width (fused_heads_max, L284): the server's allocator fits N banks'
+ *  drafts within it, one base row each. */
 #define PULSAR_QWEN_SPEC_ROWS PULSAR_QWEN_HEAD_ROWS_MAX
 
 /** L251 MTP: what a verify step keeps so a rejected draft rolls back (qwen_spec_*): the conv states

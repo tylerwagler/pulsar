@@ -109,7 +109,8 @@ typedef struct { int id; long a, b; } bucket;
  * DEPTH - 1 by round_begin, so 4 banks are at most 16 rows.  L288 C1: the
  * wide build (make cuda-spec-sampling-gate-wide, SAMPLED_BANKS_SPEC=8) runs
  * the spec arm at 8 banks, up to 32 rows -- the shared verify width, past the
- * M-independent 16 -- so the oracle grades the wide verify's arms. */
+ * 16 rows the decode kernels take in one block -- so the oracle covers the
+ * wide verify (and on DeepSeek, its width-dependent arms). */
 #ifndef SAMPLED_BANKS_PLAIN
 #define SAMPLED_BANKS_PLAIN 16
 #endif

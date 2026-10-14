@@ -32,9 +32,10 @@
 //
 // Every row is bit-identical at every M: the split count depends on (K, N)
 // only, every row block is 16 rows (the MMA's M; rows past M are zero), a
-// row's k order, warp order and split order do not depend on its batchmates.
-// M > 16 rows and prompt chunks take the tensor-core prefill GEMM
-// (qwen_exl3_dense_prefill.cu), which agrees to rounding.
+// row's k order, warp order and split order do not depend on its batchmates;
+// decode rows past 16 run 16-row blocks in turn (L288 C1).  Prompt chunks take
+// the tensor-core prefill GEMM (qwen_exl3_dense_prefill.cu), which agrees to
+// rounding.
 
 #pragma once
 
@@ -48,8 +49,9 @@
 bool ds4_exl3_dense_rate_supported(int k2);
 
 /** Workspace bytes ds4_exl3_dense_launch needs for (M, K, N): the split
- *  partials and the prep planes of min(M, 16) rows (more than 16 rows are the
- *  prefill GEMM's, which needs none).  0 for a shape the arm refuses. */
+ *  partials and the prep planes of min(M, 16) rows (decode rows past 16 reuse
+ *  them a block at a time; a prompt chunk's prefill GEMM needs none).  0 for a
+ *  shape the arm refuses. */
 size_t ds4_exl3_dense_workspace_bytes(int M, int K, int N);
 
 /** The number of K splits the arm uses for (K, N) -- a function of the weight's
@@ -76,12 +78,13 @@ int ds4_exl3_dense_launch(
     size_t         workspace_bytes,
     cudaStream_t   stream,
     /* L266: a prompt chunk takes the prefill GEMM at every M (qwen_exl3_dense_prefill.cu), so a
-     * prompt cut anywhere is byte-identical to one prefilled whole; false: M > 16 does */
+     * prompt cut anywhere is byte-identical to one prefilled whole; false: decode rows, the GEMV at
+     * every M (16-row blocks past 16, L288 C1) */
     bool           prompt = false);
 
 /** L251: the dense arm's prompt chunks through a decode-once tensor-core GEMM: w is the dense layout
  *  (trellis | suh[K] | svh[N]); writes y [M][N] finished (output rotation and svh applied).
- *  ds4_exl3_dense_launch calls it for prompt chunks and M > 16. */
+ *  ds4_exl3_dense_launch calls it for prompt chunks. */
 int qwen_exl3_dense_prefill_launch(const void *w, int k2, const void *x_bf16, float *y, int M, int K, int N,
                                    uint64_t trellis_bytes, cudaStream_t stream);
 
@@ -104,7 +107,8 @@ size_t ds4_exl3_dense_multi_workspace_bytes(const ds4_exl3_dense_proj *p, int n,
 /** n (1..DS4_EXL3_DENSE_MAX_PROJ) projections of ONE input xb [M][K] bf16 (L288 exl3-dense: a GDN block's
  *  in_proj_qkv and _z, an attention's q / k / v / index, a shared expert's gate and up): one prep launch for all of
  *  them, then one GEMV launch per rate among them.  Each output is bit for bit what ds4_exl3_dense_launch writes for
- *  it alone.  Prompt chunks and M > 16 take the prefill GEMM, once per projection.  ds4_exl3_dense_launch is the
+ *  it alone.  Prompt chunks take the prefill GEMM, once per projection; decode rows past 16 run 16-row blocks in
+ *  turn.  ds4_exl3_dense_launch is the
  *  n = 1 call. */
 int ds4_exl3_dense_multi_launch(const ds4_exl3_dense_proj *p, int n, const void *xb, int M, int K, void *workspace,
                                 size_t workspace_bytes, cudaStream_t stream, bool prompt = false);
