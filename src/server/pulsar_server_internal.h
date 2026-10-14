@@ -1653,11 +1653,6 @@ struct server {
     uint64_t m_spec_overflow_rounds;
     uint64_t w_spec_thr_cut_rows;
     uint64_t m_spec_thr_cut_rows;
-    /** L288 C1: draft rows the decode-block price dropped (spec_alloc_rows: past a block they did not pay), and
-     *  whether that cut has been announced (rule 5, once).  Worker-owned / mirrored like the counters above. */
-    uint64_t w_spec_blk_cut_rows;
-    uint64_t m_spec_blk_cut_rows;
-    bool blk_cut_announced;
     /** L288: a decode-only spec round's wall split by phase (server_sched.cpp's spec quantum, the host clock,
      *  no device sync added) -- what /metrics publishes as pulsar:spec_round_phase_ms_total, so a client
      *  decomposes ms/round untraced.  Device work a phase enqueues without waiting for it is paid where the next

@@ -1549,19 +1549,14 @@ void pulsar_engine_lane_cost_observe(pulsar_engine *e, pulsar_decode_lane lane, 
     const bool first = f->ann_flat_us == 0;
     const bool moved = !first && f->n - f->ann_n >= 256u &&
                        (abs(f->flat_us - f->ann_flat_us) * 2 > f->ann_flat_us ||
-                        abs(f->row_us - f->ann_row_us) * 2 > f->ann_row_us || f->blk_known != f->ann_blk_known);
+                        abs(f->row_us - f->ann_row_us) * 2 > f->ann_row_us);
     if (first || moved) {
         f->ann_flat_us = f->flat_us;
         f->ann_row_us = f->row_us;
-        f->ann_blk_known = f->blk_known;
         f->ann_n = f->n;
-        char blk[64] = "";
-        if (f->blk_known)
-            snprintf(blk, sizeof blk, " + %.2f a %u-row block past the first", (double)f->blk_us / 1000.0,
-                     (unsigned)PULSAR_GPU_MNEUTRAL_ROWS_MAX);
-        fprintf(stderr, "pulsar: %s lane cost measured: step = %.1f + %.2f x rows%s ms (%u steps%s)\n",
+        fprintf(stderr, "pulsar: %s lane cost measured: step = %.1f + %.2f x rows ms (%u steps%s)\n",
                 lane == PULSAR_LANE_SPEC ? "spec" : "plain", (double)f->flat_us / 1000.0,
-                (double)f->row_us / 1000.0, blk, f->n, first ? "" : ", moved");
+                (double)f->row_us / 1000.0, f->n, first ? "" : ", moved");
     }
 }
 pulsar_lane_cost pulsar_engine_lane_cost(const pulsar_engine *e, pulsar_decode_lane lane) {
