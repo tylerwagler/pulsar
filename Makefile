@@ -1254,6 +1254,12 @@ verify-width-probe: tests/verify_width_probe
 	PULSAR_MSEQ_BANKS=2 ./tests/verify_width_probe $(FRONTIER_MODEL) $(PULSAR_REF_DIR)/story.ref.bin $(PULSAR_REF_DIR)/story.tokens.bin --max-depth 6144 --extra 1024,3072,5120
 	PULSAR_MSEQ_BANKS=4 ./tests/verify_width_probe $(FRONTIER_MODEL) $(PULSAR_REF_DIR)/story.ref.bin $(PULSAR_REF_DIR)/story.tokens.bin --banks 4 --widths 4,8,16,24,32 --max-depth 6144 --extra 1024,3072,5120
 	PULSAR_MSEQ_BANKS=2 ./tests/verify_width_probe $(FRONTIER_MODEL) $(PULSAR_REF_DIR)/code.ref.bin $(PULSAR_REF_DIR)/code.tokens.bin --extra 1024,1536,2560,3072
+# L288 C1: Qwen's wide verify (32 rows: 8 streams x 4) graded the same way -- every row against the one-token
+# decode (plain decode steps: Qwen's verify leaves its bank for the commit to move) and the container capture.
+.PHONY: verify-width-probe-qwen
+verify-width-probe-qwen: tests/verify_width_probe
+	PULSAR_MSEQ_BANKS=8 ./tests/verify_width_probe $(QWEN_GATE_MODEL) $(QWEN_REF_ANCHOR_DIR)/story.ref.bin $(QWEN_REF_ANCHOR_DIR)/story.tokens.bin --banks 8 --widths 8,16,24,32 --max-depth 6144 --extra 1024,3072,5120 --serial plain
+	PULSAR_MSEQ_BANKS=8 ./tests/verify_width_probe $(QWEN_GATE_MODEL) $(QWEN_REF_ANCHOR_DIR)/code.ref.bin $(QWEN_REF_ANCHOR_DIR)/code.tokens.bin --banks 8 --widths 8,16,24,32 --extra 1024,1536,2560,3072,3500 --serial plain
 
 # Artifact-only, no GPU, seconds: does the ROUTER agree with the artifact's own
 # REAP declaration? A router left in source expert order against compacted
