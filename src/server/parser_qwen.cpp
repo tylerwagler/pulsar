@@ -172,7 +172,7 @@ static bool qwen_parser_finish(void *st, server *s, session_slot *sl, gen_state 
      * undeclared call is in them, so that turn re-renders canonically (a prefix miss, never a wrong prompt) */
     if (out->calls.len && q->undeclared == 0 && q->parser.raw_span(&raw_lo, &raw_hi)) {
         if (raw_hi > g->text.len || raw_lo >= raw_hi) pulsar_die("qwen parser: raw span outside the turn's text");
-        out->calls.raw_dsml = xstrndup(g->text.ptr + raw_lo, raw_hi - raw_lo);
+        out->calls.raw_calls = xstrndup(g->text.ptr + raw_lo, raw_hi - raw_lo);
     }
     /* as text, the stream stopped at the call: the rest goes out at the finish */
     const char *t = g->text.ptr ? g->text.ptr : "";

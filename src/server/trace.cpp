@@ -307,7 +307,7 @@ void request_ctx_span(char *buf, size_t len, int cached, int prompt) {
 
 void log_flags(char *buf, size_t len, bool responses_protocol,
                       bool tools, bool thinking,
-                      bool dsml_start, bool dsml_end) {
+                      bool tool_start, bool tool_end) {
     size_t used = 0;
     buf[0] = '\0';
 #define ADD_FLAG(name) do { \
@@ -317,8 +317,8 @@ void log_flags(char *buf, size_t len, bool responses_protocol,
     if (responses_protocol) ADD_FLAG("RESPPROTO");
     if (tools) ADD_FLAG("TOOLS");
     if (thinking) ADD_FLAG("THINKING");
-    if (dsml_start) ADD_FLAG("DSML_START");
-    if (dsml_end) ADD_FLAG("DSML_END");
+    if (tool_start) ADD_FLAG("DSML_START");
+    if (tool_end) ADD_FLAG("DSML_END");
 #undef ADD_FLAG
 }
 
@@ -327,7 +327,7 @@ void log_flags(char *buf, size_t len, bool responses_protocol,
 void log_decode_progress(req_kind kind, int prompt_tokens, int completion,
                                 bool responses_protocol,
                                 bool tools, bool thinking,
-                                bool dsml_start, bool dsml_end,
+                                bool tool_start, bool tool_end,
                                 double decode_t0,
                                 double *last_t, int *last_completion) {
     const double now = server_now_sec();
@@ -342,7 +342,7 @@ void log_decode_progress(req_kind kind, int prompt_tokens, int completion,
                      prompt_tokens + completion);
     char flags[80];
     log_flags(flags, sizeof(flags), responses_protocol,
-              tools, thinking, dsml_start, dsml_end);
+              tools, thinking, tool_start, tool_end);
     server_log(PULSAR_LOG_GENERATION,
                "pulsar-server: %s ctx=%s gen=%d%s%s decoding chunk=%.2f t/s avg=%.2f t/s %.3fs",
                kind == REQ_CHAT ? "chat" : "completion",

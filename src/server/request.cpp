@@ -110,7 +110,7 @@ static void tool_call_free(tool_call *tc) {
 
 void tool_calls_free(tool_calls *calls) {
     for (int i = 0; i < calls->len; i++) tool_call_free(&calls->v[i]);
-    free(calls->raw_dsml);
+    free(calls->raw_calls);
     free(calls->v);
     memset(calls, 0, sizeof(*calls));
 }

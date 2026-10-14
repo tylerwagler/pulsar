@@ -23,6 +23,7 @@
 #include "../src/server/api_parse.cpp"
 #include "../src/server/chat_family.cpp"
 #include "../src/server/genmsg.cpp"
+#include "../src/server/deepseek_dsml.cpp"
 #include "../src/server/deepseek_stream.cpp"
 #include "../src/server/parser_deepseek.cpp"
 #include "../src/server/parser_qwen.cpp"

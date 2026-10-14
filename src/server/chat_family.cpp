@@ -10,6 +10,7 @@
  * step 4), and refuses by name what that template cannot express.  A new family adds one arm here; a
  * new protocol adds one parser and no arm. */
 #include "pulsar_server_internal.h"
+#include "deepseek_dsml.h"
 #include "../lib/qwen_chat.h"
 
 #include <string>
@@ -383,7 +384,7 @@ static bool qwen_messages(const chat_msgs *msgs, int start, bool tail, std::vect
             const qwen_msg_images &mi = (*imgs)[(size_t)i];
             qm->push_back({m->role, m->images_len > 0 ? mi.content.c_str() : m->content, m->reasoning,
                            (*qc)[(size_t)i].empty() ? NULL : (*qc)[(size_t)i].data(), m->calls.len,
-                           m->calls.raw_dsml, mi.at.empty() ? NULL : mi.at.data(), (int)mi.at.size()});
+                           m->calls.raw_calls, mi.at.empty() ? NULL : mi.at.data(), (int)mi.at.size()});
         }
     }
     return true;
@@ -462,7 +463,7 @@ static char *qwen_assistant_turn_sampled(const request *, bool think, const char
     std::vector<qwen_tool_call_in> qc;
     for (int k = 0; calls && k < calls->len; k++) qc.push_back({calls->v[k].name, calls->v[k].arguments});
     const qwen_msg_in m = {"assistant", content, reasoning, qc.empty() ? NULL : qc.data(), calls ? calls->len : 0,
-                           calls ? calls->raw_dsml : NULL};
+                           calls ? calls->raw_calls : NULL};
     qwen_render_out out;
     char err[200];
     if (!qwen_chat_render_assistant_turn(m, think, &out, err, sizeof err)) {

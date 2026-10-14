@@ -112,28 +112,28 @@ static void tool_block_unlink_entry(tool_memory_block *b, tool_memory_entry *e) 
 
 
 tool_memory_block *tool_memory_find_block_locked(tool_memory *m,
-                                                        const char *dsml,
+                                                        const char *raw,
                                                         size_t len) {
-    if (!m->by_block || !dsml || len == 0) return NULL;
-    auto it = m->by_block->find(std::string(dsml, len));
+    if (!m->by_block || !raw || len == 0) return NULL;
+    auto it = m->by_block->find(std::string(raw, len));
     return it == m->by_block->end() ? NULL : it->second;
 }
 
 
 
 static tool_memory_block *tool_memory_get_block_locked(tool_memory *m,
-                                                       const char *dsml,
+                                                       const char *raw,
                                                        size_t len) {
-    tool_memory_block *b = tool_memory_find_block_locked(m, dsml, len);
+    tool_memory_block *b = tool_memory_find_block_locked(m, raw, len);
     if (b) return b;
 
     b = (tool_memory_block *)server_xmalloc(sizeof(*b));
     memset(b, 0, sizeof(*b));
-    b->dsml = xstrndup(dsml, len);
+    b->raw = xstrndup(raw, len);
     b->len = len;
     b->bytes = len + 1 + sizeof(*b);
-    if (!m->by_block->emplace(std::string(b->dsml, b->len), b).second) {
-        free(b->dsml);
+    if (!m->by_block->emplace(std::string(b->raw, b->len), b).second) {
+        free(b->raw);
         free(b);
         die("out of memory");
     }
@@ -146,10 +146,10 @@ static tool_memory_block *tool_memory_get_block_locked(tool_memory *m,
 static void tool_memory_release_block_locked(tool_memory *m, tool_memory_block *b) {
     if (!b) return;
     if (--b->refs > 0) return;
-    if (m->by_block) m->by_block->erase(std::string(b->dsml, b->len));
+    if (m->by_block) m->by_block->erase(std::string(b->raw, b->len));
     if (m->bytes >= b->bytes) m->bytes -= b->bytes;
     else m->bytes = 0;
-    free(b->dsml);
+    free(b->raw);
     free(b);
 }
 
@@ -190,14 +190,14 @@ static tool_memory_entry *tool_memory_find_entry_locked(tool_memory *m,
 
 
 static void tool_memory_put_locked(tool_memory *m, const char *id,
-                                   const char *dsml, tool_memory_source source) {
-    if (!id || !id[0] || !dsml || !dsml[0]) return;
+                                   const char *raw, tool_memory_source source) {
+    if (!id || !id[0] || !raw || !raw[0]) return;
     tool_memory_init_locked(m);
 
-    size_t dsml_len = strlen(dsml);
+    size_t raw_len = strlen(raw);
     tool_memory_entry *old = tool_memory_find_entry_locked(m, id);
-    if (old && old->block && old->block->len == dsml_len &&
-        !memcmp(old->block->dsml, dsml, dsml_len))
+    if (old && old->block && old->block->len == raw_len &&
+        !memcmp(old->block->raw, raw, raw_len))
     {
         if (source == TOOL_MEMORY_RAM) old->source = TOOL_MEMORY_RAM;
         tool_memory_touch(m, old);
@@ -206,7 +206,7 @@ static void tool_memory_put_locked(tool_memory *m, const char *id,
     }
     if (old) tool_memory_remove_entry_locked(m, old);
 
-    tool_memory_block *b = tool_memory_get_block_locked(m, dsml, dsml_len);
+    tool_memory_block *b = tool_memory_get_block_locked(m, raw, raw_len);
     tool_memory_entry *e = (tool_memory_entry *)server_xmalloc(sizeof(*e));
     memset(e, 0, sizeof(*e));
     e->id = xstrdup(id);
@@ -484,17 +484,17 @@ static const char *tool_memory_lookup_locked(tool_memory *m, const char *id,
     tool_memory_touch(m, e);
     if (source) *source = e->source;
     if (block) *block = e->block;
-    return e->block->dsml;
+    return e->block->raw;
 }
 
 
 
 void server::tool_memory_remember(const tool_calls *calls) {
     auto *s = this;
-    if (!s || !calls || !calls->raw_dsml || !calls->raw_dsml[0]) return;
+    if (!s || !calls || !calls->raw_calls || !calls->raw_calls[0]) return;
     pthread_mutex_lock(&s->tool_mu);
     for (int i = 0; i < calls->len; i++) {
-        tool_memory_put_locked(&s->tool_mem, calls->v[i].id, calls->raw_dsml,
+        tool_memory_put_locked(&s->tool_mem, calls->v[i].id, calls->raw_calls,
                                TOOL_MEMORY_RAM);
     }
     pthread_mutex_unlock(&s->tool_mu);
@@ -502,12 +502,12 @@ void server::tool_memory_remember(const tool_calls *calls) {
 
 
 
-void server::tool_memory_put_source(const char *id, const char *dsml,
+void server::tool_memory_put_source(const char *id, const char *raw,
                                    tool_memory_source source) {
     auto *s = this;
-    if (!s || !id || !id[0] || !dsml || !dsml[0]) return;
+    if (!s || !id || !id[0] || !raw || !raw[0]) return;
     pthread_mutex_lock(&s->tool_mu);
-    tool_memory_put_locked(&s->tool_mem, id, dsml, source);
+    tool_memory_put_locked(&s->tool_mem, id, raw, source);
     pthread_mutex_unlock(&s->tool_mu);
 }
 
@@ -515,9 +515,9 @@ void server::tool_memory_put_source(const char *id, const char *dsml,
 
 #ifdef PULSAR_SERVER_TEST
 
-void server::tool_memory_put(const char *id, const char *dsml) {
+void server::tool_memory_put(const char *id, const char *raw) {
     auto *s = this;
-    s->tool_memory_put_source(id, dsml, TOOL_MEMORY_RAM);
+    s->tool_memory_put_source(id, raw, TOOL_MEMORY_RAM);
 }
 
 
@@ -532,7 +532,7 @@ void server::tool_memory_attach_to_messages(chat_msgs *msgs,
         if (stats) {
             for (int i = 0; i < msgs->len; i++) {
                 tool_calls *calls = &msgs->v[i].calls;
-                if (calls->len == 0 || calls->raw_dsml) continue;
+                if (calls->len == 0 || calls->raw_calls) continue;
                 stats->canonical++;
                 stats->missing_ids += calls->len;
             }
@@ -542,7 +542,7 @@ void server::tool_memory_attach_to_messages(chat_msgs *msgs,
     pthread_mutex_lock(&s->tool_mu);
     for (int i = 0; i < msgs->len; i++) {
         tool_calls *calls = &msgs->v[i].calls;
-        if (calls->len == 0 || calls->raw_dsml) continue;
+        if (calls->len == 0 || calls->raw_calls) continue;
         tool_memory_block *matched = NULL;
         tool_memory_source matched_source = TOOL_MEMORY_DISK;
         bool exact = true;
@@ -550,10 +550,10 @@ void server::tool_memory_attach_to_messages(chat_msgs *msgs,
         for (int j = 0; j < calls->len; j++) {
             tool_memory_source source = TOOL_MEMORY_DISK;
             tool_memory_block *block = NULL;
-            const char *dsml =
+            const char *raw =
                 tool_memory_lookup_locked(&s->tool_mem, calls->v[j].id,
                                           &source, &block);
-            if (!dsml) {
+            if (!raw) {
                 exact = false;
                 missing++;
                 continue;
@@ -567,7 +567,7 @@ void server::tool_memory_attach_to_messages(chat_msgs *msgs,
             if (source == TOOL_MEMORY_RAM) matched_source = TOOL_MEMORY_RAM;
         }
         if (exact && matched) {
-            calls->raw_dsml = xstrdup(matched->dsml);
+            calls->raw_calls = xstrdup(matched->raw);
             if (stats) {
                 if (matched_source == TOOL_MEMORY_RAM) stats->mem++;
                 else stats->disk++;
@@ -609,16 +609,4 @@ void server::assign_tool_call_ids(tool_calls *calls, api_style api) {
 
 
 
-void apply_stream_tool_ids(tool_calls *calls, const dsml_tool_stream *ts) {
-    if (!calls || !ts) return;
-    /* The SSE stream may have exposed tool ids before final DSML parsing.  The
-     * parsed calls must inherit those ids before assign_tool_call_ids() and
-     * tool_memory_remember(), otherwise the client returns a tool_result for an
-     * id that the continuation fast path does not know. */
-    int n = calls->len < ts->ids_cap ? calls->len : ts->ids_cap;
-    for (int i = 0; i < n; i++) {
-        if (calls->v[i].id && calls->v[i].id[0]) continue;
-        if (ts->ids[i] && ts->ids[i][0]) calls->v[i].id = xstrdup(ts->ids[i]);
-    }
-}
 

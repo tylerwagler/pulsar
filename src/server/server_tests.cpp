@@ -8,6 +8,7 @@
  * A standalone compile (no PULSAR_SERVER_TEST) yields an empty object
  * for the pulsar-server link. */
 #include "pulsar_server_internal.h"
+#include "deepseek_dsml.h"
 #include "lib/pulsar_writeback.h"
 #include "lib/pulsar_segstore.h"
 #include "lib/qwen_tokenizer.h"
@@ -2846,7 +2847,7 @@ static void test_tool_memory_replays_sampled_dsml(void) {
 
     tool_replay_stats stats = {0};
     s.tool_memory_attach_to_messages(&msgs, &stats);
-    TEST_ASSERT(msgs.v[0].calls.raw_dsml != NULL);
+    TEST_ASSERT(msgs.v[0].calls.raw_calls != NULL);
     TEST_ASSERT(stats.mem == 1);
     TEST_ASSERT(stats.disk == 0);
     TEST_ASSERT(stats.canonical == 0);
@@ -2909,7 +2910,7 @@ static void test_anthropic_tool_memory_replays_sampled_dsml(void) {
 
     tool_replay_stats stats = {0};
     s.tool_memory_attach_to_messages(&msgs, &stats);
-    TEST_ASSERT(msgs.v[0].calls.raw_dsml != NULL);
+    TEST_ASSERT(msgs.v[0].calls.raw_calls != NULL);
     TEST_ASSERT(stats.mem == 1);
     TEST_ASSERT(stats.canonical == 0);
 
@@ -3224,7 +3225,7 @@ static void test_qwen_raw_calls_replay_verbatim(void) {
     a.reasoning = xstrdup("I will.");
     qwen_test_call(&a, "call_1", "bash", "{\"cmd\":\"pwd\"}");
     qwen_test_call(&a, "call_2", "bash", "{\"n\":\"007\"}");
-    a.calls.raw_dsml = xstrdup(raw);
+    a.calls.raw_calls = xstrdup(raw);
     chat_msgs_push(&msgs, a);
     chat_msgs_push(&msgs, qwen_test_msg("tool", "ok"));
     char *text = qwen_test_full_render(&msgs, false);
@@ -3241,7 +3242,7 @@ static void test_qwen_raw_calls_replay_verbatim(void) {
     chat_msg k = qwen_test_msg("assistant", NULL);
     qwen_test_call(&k, "call_1", "bash", "{\"cmd\":\"pwd\"}");
     qwen_test_call(&k, "call_2", "bash", "{\"n\":\"007\"}");
-    k.calls.raw_dsml = xstrdup(raw);
+    k.calls.raw_calls = xstrdup(raw);
     char *turn = r.family->assistant_turn_sampled(&r, true, "I will.", "On it.", &k.calls, NULL, NULL);
     TEST_ASSERT(turn && !strcmp(turn, sampled));
     free(turn);
@@ -3759,7 +3760,7 @@ static void test_tool_checkpoint_canonicalization_gate_exact_replay(void) {
     tc.name = xstrdup("bash");
     tc.arguments = xstrdup("{}");
     tool_calls_push(&calls, tc);
-    calls.raw_dsml = xstrdup(
+    calls.raw_calls = xstrdup(
         "\n\n" PULSAR_TOOL_CALLS_START "\n"
         "<｜DSML｜ invoke name=\"bash\">\n"
         "</｜DSML｜ invoke>\n"
@@ -3767,8 +3768,8 @@ static void test_tool_checkpoint_canonicalization_gate_exact_replay(void) {
 
     TEST_ASSERT(!s.should_canonicalize_tool_checkpoint(&calls));
 
-    free(calls.raw_dsml);
-    calls.raw_dsml = NULL;
+    free(calls.raw_calls);
+    calls.raw_calls = NULL;
     TEST_ASSERT(s.should_canonicalize_tool_checkpoint(&calls));
 
     tool_calls_free(&calls);
@@ -4048,7 +4049,7 @@ static void test_tool_memory_max_ids_prunes_oldest(void) {
 
     tool_replay_stats stats = {0};
     s.tool_memory_attach_to_messages(&msgs, &stats);
-    TEST_ASSERT(msgs.v[0].calls.raw_dsml == NULL);
+    TEST_ASSERT(msgs.v[0].calls.raw_calls == NULL);
     TEST_ASSERT(stats.canonical == 1);
     TEST_ASSERT(stats.missing_ids == 1);
 
@@ -5600,13 +5601,13 @@ static void test_kv_tool_map_filters_by_dsml_text(void) {
     chat_msgs_push(&msgs, b);
     tool_replay_stats stats = {0};
     dst.tool_memory_attach_to_messages(&msgs, &stats);
-    TEST_ASSERT(msgs.v[0].calls.raw_dsml != NULL);
-    TEST_ASSERT(msgs.v[1].calls.raw_dsml == NULL);
+    TEST_ASSERT(msgs.v[0].calls.raw_calls != NULL);
+    TEST_ASSERT(msgs.v[1].calls.raw_calls == NULL);
     TEST_ASSERT(stats.disk == 1);
     TEST_ASSERT(stats.canonical == 1);
     TEST_ASSERT(stats.missing_ids == 1);
-    TEST_ASSERT(strstr(msgs.v[0].calls.raw_dsml, "pwd") != NULL);
-    TEST_ASSERT(strstr(msgs.v[0].calls.raw_dsml, "zzzz") == NULL);
+    TEST_ASSERT(strstr(msgs.v[0].calls.raw_calls, "pwd") != NULL);
+    TEST_ASSERT(strstr(msgs.v[0].calls.raw_calls, "zzzz") == NULL);
 
     chat_msgs_free(&msgs);
     if (fp) fclose(fp);
@@ -5672,7 +5673,7 @@ static void test_kv_tool_map_restores_before_prompt_render(void) {
     dst.kv_cache_restore_tool_memory_for_messages(&msgs);
     tool_replay_stats stats = {0};
     dst.tool_memory_attach_to_messages(&msgs, &stats);
-    TEST_ASSERT(msgs.v[0].calls.raw_dsml != NULL);
+    TEST_ASSERT(msgs.v[0].calls.raw_calls != NULL);
     TEST_ASSERT(stats.disk == 1);
     TEST_ASSERT(stats.canonical == 0);
     char *prompt = render_chat_prompt_text(&msgs, NULL, NULL, PULSAR_THINK_HIGH);
