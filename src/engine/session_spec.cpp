@@ -379,24 +379,51 @@ static float spec_quench_guard(const pulsar_lane_cost_fit *c, int banks, uint32_
 #define SPEC_COST_DECAY   (1.0 - 1.0 / 256.0)
 #define SPEC_COST_MIN_OBS 16u
 #define SPEC_COST_MIN_VAR 0.25
+/* L288 C1: the block term needs steps on both sides of a boundary -- an EW variance of b of at least 0.05 (~5% of the
+ * window on the minority side) -- and rows and b not collinear (their squared correlation under 0.95); otherwise the
+ * two-term fit carries the window as before (a lone stream's rows never pass a block: its fit is unchanged). */
+#define SPEC_COST_BLK_MIN_VAR 0.05
+#define SPEC_COST_BLK_MAX_R2  0.95
+static double lane_cost_blocks(uint32_t rows) { return (double)((rows - 1u) / PULSAR_GPU_MNEUTRAL_ROWS_MAX); }
 void lane_cost_fit_observe(pulsar_lane_cost_fit *f, uint32_t rows, double ms) {
     if (!f || rows == 0 || !(ms > 0.0)) return;
-    const double x = (double)rows, y = ms;
+    const double x = (double)rows, y = ms, b = lane_cost_blocks(rows);
     f->w   = f->w   * SPEC_COST_DECAY + 1.0;
     f->sx  = f->sx  * SPEC_COST_DECAY + x;
     f->sy  = f->sy  * SPEC_COST_DECAY + y;
     f->sxx = f->sxx * SPEC_COST_DECAY + x * x;
     f->sxy = f->sxy * SPEC_COST_DECAY + x * y;
+    f->sb  = f->sb  * SPEC_COST_DECAY + b;
+    f->sbb = f->sbb * SPEC_COST_DECAY + b * b;
+    f->sxb = f->sxb * SPEC_COST_DECAY + x * b;
+    f->sby = f->sby * SPEC_COST_DECAY + b * y;
     f->n++;
     f->valid = false;
-    const double mx = f->sx / f->w, my = f->sy / f->w;
+    f->blk_known = false;
+    f->blk_us = 0;
+    const double mx = f->sx / f->w, my = f->sy / f->w, mb = f->sb / f->w;
     const double vx = f->sxx / f->w - mx * mx;
     const double cxy = f->sxy / f->w - mx * my;
     if (f->n < SPEC_COST_MIN_OBS || vx < SPEC_COST_MIN_VAR) return;
-    const double row = cxy / vx, flat = my - row * mx;
-    if (!(row > 0.0) || !(flat > 0.0)) return;
+    double row = cxy / vx, flat = my - row * mx, blk = 0.0;
+    const double vb = f->sbb / f->w - mb * mb, cxb = f->sxb / f->w - mx * mb, cby = f->sby / f->w - mb * my;
+    const double det = vx * vb - cxb * cxb;
+    if (vb >= SPEC_COST_BLK_MIN_VAR && cxb * cxb < SPEC_COST_BLK_MAX_R2 * vx * vb && det > 0.0) {
+        const double r3 = (cxy * vb - cby * cxb) / det, b3 = (cby * vx - cxy * cxb) / det;
+        if (r3 > 0.0 && b3 >= 0.0) {   /* a block that costs less than nothing is noise: the two-term fit holds */
+            row = r3;
+            blk = b3;
+            flat = my - row * mx - blk * mb;
+            f->blk_known = true;
+        }
+    }
+    if (!(row > 0.0) || !(flat > 0.0)) {
+        f->blk_known = false;
+        return;
+    }
     f->flat_us = (int32_t)(flat * 1000.0 + 0.5);
     f->row_us = (int32_t)(row * 1000.0 + 0.5);
+    f->blk_us = f->blk_known ? (int32_t)(blk * 1000.0 + 0.5) : 0;
     f->valid = f->flat_us > 0 && f->row_us > 0;
 }
 
@@ -405,6 +432,9 @@ pulsar_lane_cost lane_cost_fit_view(const pulsar_lane_cost_fit *f) {
     memset(&c, 0, sizeof c);
     c.flat_us = f->flat_us;
     c.row_us = f->row_us;
+    c.blk_us = f->valid && f->blk_known ? f->blk_us : 0;
+    c.blk_rows = PULSAR_GPU_MNEUTRAL_ROWS_MAX;
+    c.blk_known = f->valid && f->blk_known;
     c.n = f->n;
     c.valid = f->valid;
     if (f->w > 0.0) {
@@ -418,7 +448,10 @@ pulsar_lane_cost lane_cost_fit_view(const pulsar_lane_cost_fit *f) {
  * never spread (a steady N on the plain lane) still knows its cost at N. */
 double pulsar_lane_cost_ms(const pulsar_lane_cost *c, double rows) {
     if (!c || !(rows > 0.0)) return 0.0;
-    if (c->valid) return ((double)c->flat_us + (double)c->row_us * rows) / 1000.0;
+    if (c->valid) {
+        const double blocks = c->blk_known && c->blk_rows ? floor((rows - 1.0) / (double)c->blk_rows) : 0.0;
+        return ((double)c->flat_us + (double)c->row_us * rows + (double)c->blk_us * (blocks > 0.0 ? blocks : 0.0)) / 1000.0;
+    }
     if (c->n >= SPEC_COST_MIN_OBS && c->mean_ms > 0.0f && fabs(rows - (double)c->mean_rows) <= 0.5)
         return (double)c->mean_ms;
     return 0.0;

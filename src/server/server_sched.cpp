@@ -1273,6 +1273,7 @@ void server::publish_metrics_snapshot() {
     s->m_prefill_chunk_tokens = s->w_prefill_chunk_tokens;
     s->m_spec_overflow_rounds = s->w_spec_overflow_rounds;
     s->m_spec_thr_cut_rows = s->w_spec_thr_cut_rows;
+    s->m_spec_blk_cut_rows = s->w_spec_blk_cut_rows;
     memcpy(s->m_spec_phase_ms, s->w_spec_phase_ms, sizeof s->m_spec_phase_ms);
     s->m_spec_phase_rounds = s->w_spec_phase_rounds;
     s->m_decode_lane = s->w_decode_lane;
@@ -2154,23 +2155,36 @@ void server::worker_batched_decode_quantum(session_slot **dec, int n, int quantu
  * stops admission once the best remaining candidate's survival is below thr
  * (= marginal row ms / the lane yield, pulsar_engine_spec_token_ms): every remaining candidate is
  * then <= it, and *thr_cut_rows counts the rows that cut left unadmitted (0
- * when the cut did not fire). */
+ * when the cut did not fire).
+ *
+ * L288 C1: the decode block.  The decode arms take blk_rows rows a block, so a step one row past a block pays a
+ * block's weight reads again (pulsar_lane_cost::blk_us, measured).  The drafts a step carries past the last full block
+ * -- the weakest admitted, admission runs best first -- must pay that block between them: their surplus over their
+ * own rows, sum (survival - thr), at least blk_tok (= blk_us / the lane yield, in tokens, as thr is); otherwise they
+ * are dropped and the step ends at the block, and the rule looks at the block below.  A block whose base rows alone
+ * reach into it is not optional.  blk_rows 0 (no fitted block): no rule.  *blk_cut_rows counts what it dropped. */
 static int spec_alloc_rows(const float surv[][16], const uint32_t *npend, int n, int n_live,
-                           int row_budget, float thr, int *k_alloc, int *thr_cut_rows) {
+                           int row_budget, float thr, int blk_rows, float blk_tok, int *k_alloc, int *thr_cut_rows,
+                           int *blk_cut_rows) {
     uint32_t demand = (uint32_t)n_live;
     for (int i = 0; i < n; i++) demand += npend[i];
     *thr_cut_rows = 0;
+    *blk_cut_rows = 0;
     const bool overflow = demand > (uint32_t)row_budget;
     bool priced_out = false;
     for (int i = 0; i < n && !priced_out; i++)
         for (uint32_t j = 0; j < npend[i] && !priced_out; j++) priced_out = surv[i][j] < thr;
-    if (!overflow && !priced_out) {
+    const bool blocks = blk_rows > 0 && blk_tok > 0.0f && demand > (uint32_t)blk_rows;
+    if (!overflow && !priced_out && !blocks) {
         for (int i = 0; i < n; i++) k_alloc[i] = (int)npend[i];
         return 0;
     }
     for (int i = 0; i < n; i++) k_alloc[i] = 0;
     int budget = row_budget - n_live;
-    while (budget > 0) {
+    int order[PULSAR_SPEC_LOGITS_ROWS];   /* the admitted drafts, best first: their bank, their survival */
+    float val[PULSAR_SPEC_LOGITS_ROWS];
+    int n_adm = 0;
+    while (budget > 0 && n_adm < (int)PULSAR_SPEC_LOGITS_ROWS) {
         int bi = -1;
         float bv = -1.0f;
         for (int i = 0; i < n; i++) {
@@ -2187,8 +2201,23 @@ static int spec_alloc_rows(const float surv[][16], const uint32_t *npend, int n,
             break;
         }
         k_alloc[bi]++;
+        order[n_adm] = bi;
+        val[n_adm++] = bv;
         budget--;
     }
+    for (int total = n_live + n_adm; blocks && total > blk_rows;) {
+        const int below = (total - 1) / blk_rows * blk_rows;   /* rows in the full blocks under the last one */
+        if (below < n_live) break;                              /* base rows reach into it: not optional */
+        const int last = total - below;
+        float surplus = 0.0f;
+        for (int t = n_adm - last; t < n_adm; t++) surplus += val[t] - thr;
+        if (surplus >= blk_tok) break;
+        for (int t = n_adm - 1; t >= n_adm - last; t--) k_alloc[order[t]]--;   /* each bank keeps a prefix */
+        n_adm -= last;
+        total -= last;
+        *blk_cut_rows += last;
+    }
+    if (!overflow && !priced_out && *blk_cut_rows == 0) return 0;   /* everything admitted whole: as before */
     return overflow ? 2 : 1;
 }
 
@@ -2466,12 +2495,24 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n, int quantum_
             const pulsar_lane_cost cost = pulsar_engine_lane_cost(s->engine, PULSAR_LANE_SPEC);
             const float tok_ms = pulsar_engine_spec_token_ms(s->engine);   /* L288: the engine's, the drafter's too */
             const float thr = cost.valid && tok_ms > 1.0f ? (float)cost.row_us / (1000.0f * tok_ms) : 0.0f;
-            int thr_cut_rows = 0;
+            /* L288 C1: the measured decode block, priced in tokens as thr is (none until the fit has seen both
+             * sides of a block boundary) */
+            const bool blk = cost.blk_known && tok_ms > 1.0f;
+            const float blk_tok = blk ? (float)cost.blk_us / (1000.0f * tok_ms) : 0.0f;
+            int thr_cut_rows = 0, blk_cut_rows = 0;
             const int bound = spec_alloc_rows(surv, npend, n, n_live, (int)heads_max - n_fin, thr,
-                                              k_alloc, &thr_cut_rows);
+                                              blk ? (int)cost.blk_rows : 0, blk_tok, k_alloc, &thr_cut_rows,
+                                              &blk_cut_rows);
             k_overflow = bound != 0;
             if (bound == 2) s->w_spec_overflow_rounds++;
             s->w_spec_thr_cut_rows += (uint64_t)thr_cut_rows;
+            s->w_spec_blk_cut_rows += (uint64_t)blk_cut_rows;
+            if (blk_cut_rows > 0 && !s->blk_cut_announced) {   /* rule 5: the block rule says once that it cut */
+                s->blk_cut_announced = true;
+                server_log(PULSAR_LOG_DEFAULT, "pulsar-server: L288 C1 decode-block price ran: %d drafts past a %u-row "
+                           "block did not pay its %.2f ms (%.2f tokens) -- the round ends at the block", blk_cut_rows,
+                           cost.blk_rows, (double)cost.blk_us / 1000.0, (double)blk_tok);
+            }
         }
         /* ---- assemble: ONE call restores each bank, draws its base, begins
          * its round and lays its rows, saving it after (L260: one mirrored

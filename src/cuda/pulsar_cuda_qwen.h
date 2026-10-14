@@ -45,6 +45,8 @@ typedef struct CUstream_st *cudaStream_t;
 #include <stddef.h>
 #include <stdint.h>
 
+#include "pulsar_gpu.h"   /* PULSAR_GPU_MNEUTRAL_ROWS_MAX */
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -152,10 +154,10 @@ size_t pulsar_qwen_draft_top_ws_bytes(void);
  *  not depend on the rows beside it.  n_rows 1 .. PULSAR_QWEN_DRAFT_TOP_ROWS_MAX.  0 on success. */
 int pulsar_qwen_draft_top_launch(const float *rows, int n, int n_rows, void *ws, cudaStream_t stream);
 
-/** The widest call the W8A16 decode arms take (the rows kernel's two n8 token tiles, the GEMV's staging): decode
- *  rows past it go through the front door (pulsar_rows_linear_launch) and the GR read in calls of at most this many,
- *  each row the bytes a one-row decode gives (L288 C1). */
-#define PULSAR_QWEN_DECODE_ROWS_MAX 16
+/** The widest call the W8A16 decode arms take (the rows kernel's two n8 token tiles, the GEMV's staging) -- the
+ *  M-independent width: decode rows past it go through the front door (pulsar_rows_linear_launch) and the GR read in
+ *  calls of at most this many, each row the bytes a one-row decode gives (L288 C1). */
+#define PULSAR_QWEN_DECODE_ROWS_MAX ((int)PULSAR_GPU_MNEUTRAL_ROWS_MAX)
 
 /** A plain MXFP8 dense Linear: y [rows][out] f32 = W x, W stored mxfp8_lt
  *  ([out][in] E4M3 then the swizzled E8M0 plane) and x the block input's bf16 row

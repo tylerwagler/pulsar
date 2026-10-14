@@ -7171,7 +7171,7 @@ static void l179_spec_alloc_rows_at(const int B) {
     float surv[PULSAR_SESSION_POOL_CAP][16];
     uint32_t npend[PULSAR_SESSION_POOL_CAP];
     int k_alloc[PULSAR_SESSION_POOL_CAP];
-    int cut = -1;
+    int cut = -1, bcut = -1;
     memset(surv, 0, sizeof surv);
     memset(npend, 0, sizeof npend);
     /* thresholds are the allocator's INPUT (row price / ms per token, both
@@ -7190,11 +7190,11 @@ static void l179_spec_alloc_rows_at(const int B) {
         l179_fill_surv(surv, npend, 2, (uint32_t)d - 2u * third, 0.99f);
         npend[3] = 0;
         const float thr = 0.0f;   /* no fit yet: the budget alone admits */
-        TEST_ASSERT(spec_alloc_rows(surv, npend, 4, 3, B, thr, k_alloc, &cut) == 0);
+        TEST_ASSERT(spec_alloc_rows(surv, npend, 4, 3, B, thr, 0, 0.0f, k_alloc, &cut, &bcut) == 0);
         for (int i = 0; i < 4; i++) TEST_ASSERT(k_alloc[i] == (int)npend[i]);
         TEST_ASSERT(cut == 0);
         l179_fill_surv(surv, npend, 1, third, 0.01f);
-        TEST_ASSERT(spec_alloc_rows(surv, npend, 4, 3, B, thr_live, k_alloc, &cut) == 1);
+        TEST_ASSERT(spec_alloc_rows(surv, npend, 4, 3, B, thr_live, 0, 0.0f, k_alloc, &cut, &bcut) == 1);
         TEST_ASSERT(k_alloc[1] == 0 && k_alloc[3] == 0);
         int above = 0;
         for (uint32_t j = 0; j < npend[0]; j++) above += surv[0][j] >= thr_live;
@@ -7217,7 +7217,7 @@ static void l179_spec_alloc_rows_at(const int B) {
             if (all[y] > all[x]) { const float t = all[x]; all[x] = all[y]; all[y] = t; }
     const float kth = all[B - 3 - 1];
     TEST_ASSERT(kth > thr_fallback && all[B - 3] < kth);
-    TEST_ASSERT(spec_alloc_rows(surv, npend, 4, 3, B, thr_fallback, k_alloc, &cut) == 2);
+    TEST_ASSERT(spec_alloc_rows(surv, npend, 4, 3, B, thr_fallback, 0, 0.0f, k_alloc, &cut, &bcut) == 2);
     TEST_ASSERT(cut == 0);
     int admitted = 0;
     for (int i = 0; i < 4; i++) {
@@ -7242,7 +7242,7 @@ static void l179_spec_alloc_rows_at(const int B) {
     l179_fill_surv(surv, npend, 0, 16, 0.95f);
     l179_fill_surv(surv, npend, 1, 16, 0.90f);
     l179_fill_surv(surv, npend, 2, 16, 0.80f);
-    TEST_ASSERT(spec_alloc_rows(surv, npend, 4, 3, B, 0.99f, k_alloc, &cut) == 2);
+    TEST_ASSERT(spec_alloc_rows(surv, npend, 4, 3, B, 0.99f, 0, 0.0f, k_alloc, &cut, &bcut) == 2);
     for (int i = 0; i < 4; i++) TEST_ASSERT(k_alloc[i] == 0);
     TEST_ASSERT(cut == 48);
     /* partial cut at the live threshold (0.239): demand 3 + 48 > B, but only
@@ -7252,7 +7252,7 @@ static void l179_spec_alloc_rows_at(const int B) {
     l179_fill_surv(surv, npend, 0, 16, 0.80f);
     l179_fill_surv(surv, npend, 1, 16, 0.50f);
     l179_fill_surv(surv, npend, 2, 16, 0.50f);
-    TEST_ASSERT(spec_alloc_rows(surv, npend, 4, 3, B, thr_live, k_alloc, &cut) == 2);
+    TEST_ASSERT(spec_alloc_rows(surv, npend, 4, 3, B, thr_live, 0, 0.0f, k_alloc, &cut, &bcut) == 2);
     TEST_ASSERT(k_alloc[0] == 6 && k_alloc[1] == 2 && k_alloc[2] == 2 && k_alloc[3] == 0);
     TEST_ASSERT(cut == 38);
     TEST_ASSERT(3 + 10 < B);
@@ -7263,6 +7263,45 @@ static void l179_spec_alloc_rows_at(const int B) {
 static void test_l179_spec_alloc_rows_isolation_and_ranked_overflow(void) {
     l179_spec_alloc_rows_at(16);
     l179_spec_alloc_rows_at((int)PULSAR_SPEC_LOGITS_ROWS);
+}
+
+/* L288 C1: the decode-block price.  Width 32, a 16-row block costing 2 tokens (blk_tok), the row price 0.2 tokens
+ * (thr).  (a) 4 banks whose drafts past row 16 are weak (0.3 each: surplus 0.1 a row, 4 rows -> 0.4 < 2): the step
+ * ends at the block, the weakest drafts dropped, every bank a prefix, the cut counted, the round's demand in budget;
+ * (b) strong drafts past it (0.9: surplus 0.7 x 4 = 2.8 >= 2): nothing cut, admitted whole (return 0 as before);
+ * (c) base rows alone pass the block (9 banks, an 8-row block): it is not optional, nothing cut; (d) no block (blk_rows 0): the
+ * allocation (a)'s inputs give without the rule. */
+static void test_l288_spec_alloc_rows_decode_block(void) {
+    float surv[PULSAR_SESSION_POOL_CAP][16];
+    uint32_t npend[PULSAR_SESSION_POOL_CAP];
+    int k_alloc[PULSAR_SESSION_POOL_CAP];
+    int cut = -1, bcut = -1;
+    memset(surv, 0, sizeof surv);
+    memset(npend, 0, sizeof npend);
+    const int W = 32;
+    const float thr = 0.2f, blk = 2.0f;
+    /* (a) 4 banks x 4 drafts: survivals 0.99, 0.98, 0.97 then 0.3 -- 4 + 16 = 20 rows, 4 past the block */
+    for (int i = 0; i < 4; i++) {
+        npend[i] = 4;
+        surv[i][0] = 0.99f; surv[i][1] = 0.98f; surv[i][2] = 0.97f; surv[i][3] = 0.3f;
+    }
+    TEST_ASSERT(spec_alloc_rows(surv, npend, 4, 4, W, thr, 16, blk, k_alloc, &cut, &bcut) == 1);
+    TEST_ASSERT(bcut == 4 && cut == 0);
+    for (int i = 0; i < 4; i++) TEST_ASSERT(k_alloc[i] == 3);
+    TEST_ASSERT(spec_alloc_rows(surv, npend, 4, 4, W, thr, 0, 0.0f, k_alloc, &cut, &bcut) == 0);   /* (d) */
+    TEST_ASSERT(bcut == 0);
+    for (int i = 0; i < 4; i++) TEST_ASSERT(k_alloc[i] == 4);
+    /* (b) the drafts past the block strong: they pay it */
+    for (int i = 0; i < 4; i++) surv[i][3] = 0.9f;
+    TEST_ASSERT(spec_alloc_rows(surv, npend, 4, 4, W, thr, 16, blk, k_alloc, &cut, &bcut) == 0);
+    TEST_ASSERT(bcut == 0);
+    for (int i = 0; i < 4; i++) TEST_ASSERT(k_alloc[i] == 4);
+    /* (c) 9 bases past an 8-row block: the block holds base rows, so it stays; the weak drafts are the cost cut's */
+    memset(npend, 0, sizeof npend);
+    npend[0] = 2;
+    surv[0][0] = 0.3f; surv[0][1] = 0.25f;
+    TEST_ASSERT(spec_alloc_rows(surv, npend, 9, 9, W, thr, 8, blk, k_alloc, &cut, &bcut) == 0);
+    TEST_ASSERT(bcut == 0 && k_alloc[0] == 2);
 }
 
 /* L179 branch 13 -- the per-quantum client-disconnect poll shared by the
@@ -8841,6 +8880,7 @@ static void pulsar_server_unit_tests_run(void) {
     test_l284_lane_price_pick();
     test_l289_lane_reprobe_evidence();
     test_l179_spec_alloc_rows_isolation_and_ranked_overflow();
+    test_l288_spec_alloc_rows_decode_block();
     test_l179_lane_abandon_needs_decode_and_hangup();
     test_l190_mem_floor_warn_is_rate_limited();
     test_l184_every_consumer_loops_the_syntax_table();

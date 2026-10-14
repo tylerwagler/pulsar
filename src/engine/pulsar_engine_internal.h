@@ -1871,13 +1871,20 @@ struct pulsar_vocab {
 /* L263 / L284: a decode lane's self-measured step cost (pulsar.h pulsar_lane_cost
  * is the read-only view), one structure for both lanes.  Exponentially weighted
  * least squares of a step's wall time on the rows its forward carried:
- * step_ms = flat + row * rows. */
+ * step_ms = flat + row * rows (+ blk * blocks past the first, L288 C1: the decode arms
+ * take PULSAR_GPU_MNEUTRAL_ROWS_MAX rows a block, so a step one row past a block pays
+ * the block's weight reads again -- fitted once the window holds steps on both sides
+ * of a boundary, else the two-term fit alone). */
 typedef struct {
     double w, sx, sy, sxx, sxy;  ///< EW sums: weight, rows, ms, rows^2, rows*ms
+    double sb, sbb, sxb, sby;    ///< EW sums of b = the blocks past the first: b, b^2, rows*b, b*ms
     uint32_t n;                  ///< steps observed
     int32_t flat_us, row_us;     ///< the fit, in microseconds, when `valid`
+    int32_t blk_us;              ///< a block past the first, us, when `blk_known` (else 0: inside flat / row)
     bool valid;                  ///< enough evidence (lane_cost_fit_observe says what)
+    bool blk_known;              ///< the window spans a block boundary and the block term is fitted
     int32_t ann_flat_us, ann_row_us;  ///< the last announced terms (0: never)
+    bool ann_blk_known;               ///< whether the block term was fitted at that announcement
     uint32_t ann_n;                   ///< `n` at that announcement
 } pulsar_lane_cost_fit;
 

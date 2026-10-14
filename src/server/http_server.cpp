@@ -571,6 +571,9 @@ bool server::send_metrics(int fd) {
     buf_puts(&b, "# TYPE pulsar:spec_thr_cut_rows_total counter\n");
     buf_printf(&b, "pulsar:spec_thr_cut_rows_total %llu\n",
                (unsigned long long)s->m_spec_thr_cut_rows);
+    buf_puts(&b, "# HELP pulsar:spec_blk_cut_rows_total Draft rows past a decode block that did not pay the block (L288 C1).\n");
+    buf_puts(&b, "# TYPE pulsar:spec_blk_cut_rows_total counter\n");
+    buf_printf(&b, "pulsar:spec_blk_cut_rows_total %llu\n", (unsigned long long)s->m_spec_blk_cut_rows);
     /* L288: the spec lane's decode-only rounds by phase, host wall (server_round_phase) -- a client's delta over
      * a window over the rounds' delta is ms/round per phase, measured untraced. */
     buf_puts(&b, "# HELP pulsar:spec_round_phase_ms_total Decode-only spec rounds' host wall by phase, ms.\n");

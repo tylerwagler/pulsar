@@ -1142,6 +1142,12 @@ typedef enum { PULSAR_LANE_PLAIN = 0, PULSAR_LANE_SPEC = 1, PULSAR_LANE_COUNT = 
 typedef struct {
     int32_t flat_us;    ///< the step's fixed cost (drafting, launch, the base row), us
     int32_t row_us;     ///< the marginal row, us
+    /** L288 C1: a decode block past the first, us -- a step of blk_rows + 1 rows pays it once more (the decode arms
+     *  run blk_rows rows a block); 0 unless `blk_known` (the window spans a block boundary: then the three terms are
+     *  fitted together, else the two above carry it). */
+    int32_t blk_us;
+    uint32_t blk_rows;  ///< the block's rows (PULSAR_GPU_MNEUTRAL_ROWS_MAX)
+    bool blk_known;     ///< blk_us is fitted
     uint32_t n;         ///< steps observed
     bool valid;         ///< the terms may be used
     float mean_rows;    ///< weighted mean rows of the observed steps (0: none)
@@ -1150,9 +1156,9 @@ typedef struct {
 /** One decode step's observation on `lane`: `rows` the forward carried, `ms` its wall. */
 void pulsar_engine_lane_cost_observe(pulsar_engine *e, pulsar_decode_lane lane, uint32_t rows, double ms);
 pulsar_lane_cost pulsar_engine_lane_cost(const pulsar_engine *e, pulsar_decode_lane lane);
-/** The lane's predicted step wall at `rows`, ms: flat + row * rows when the fit is valid; else the observed mean
- *  when `rows` sits at the fit's centre (within half a row, 16+ steps: the slope does not enter); else 0 -- no
- *  number. */
+/** The lane's predicted step wall at `rows`, ms: flat + row * rows (+ blk_us per block past the first, when known)
+ *  when the fit is valid; else the observed mean when `rows` sits at the fit's centre (within half a row, 16+ steps:
+ *  the slope does not enter); else 0 -- no number. */
 double pulsar_lane_cost_ms(const pulsar_lane_cost *c, double rows);
 /** L288 (tf-gap pass 2): the spec lane's yield -- the wall one emitted token costs, ms, an exponentially weighted
  *  mean (weight 0.1) over what the lanes report: the server's decode quanta, the single lane's rounds (`tokens`
