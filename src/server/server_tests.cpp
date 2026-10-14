@@ -6937,6 +6937,58 @@ static void test_l284_batch_leave_when_spec_lane_carries_all(void) {
     TEST_ASSERT(server_pick_decode_lane(4, true, 2u, dec, 2, 0) == 3);
 }
 
+/* L293 -- a decoder leaving the plain batch for the spec lane (server::batch_leave) never commits past its budget.
+ * The shape that leaked: a plain quantum's LAST step emitted the request's max_tokens-th token, then sampled the next
+ * feed token; the budget check sits at the top of the next step, so the slot stayed in GEN_DECODE with that token
+ * pending.  The next sweep priced lane 3 ("decode lane 2 -> 3"), the leave fed and emitted the token -- 65 for 64,
+ * usage 65 (both count at gen_emit_token).  Invariant: at a spent budget (or a server stop) the leave drops the
+ * sampled token -- never evaluated, never emitted -- and finishes the slot with "length"; below it, the token is
+ * committed as before.  No engine: classic pool (pool_banks 0, the bank switch is a no-op) and no session, so a
+ * commit attempt shows as the session's refusal. */
+static void test_l293_batch_leave_stops_at_the_budget(void) {
+    server s;
+    memset(&s, 0, sizeof s);
+    job j;
+    memset(&j, 0, sizeof j);
+    gen_state g;
+    session_slot sl;
+    const int max_tokens = 64;
+    auto plain_quantum_left = [&](int completion) {
+        memset(&g, 0, sizeof g);
+        memset(&sl, 0, sizeof sl);
+        g.j = &j;
+        g.finish = "length";
+        g.phase = GEN_DECODE;
+        g.max_tokens = max_tokens;
+        g.completion = completion;
+        g.batch_active = true;
+        g.batch_feed_valid = true;   /* the last step sampled the next feed token */
+        g.batch_feed_token = 42;
+        g.batch_feed_pos = 100 + completion;
+        sl.gen = &g;
+        sl.active_job = &j;
+        sl.tokens_emitted = (uint64_t)completion;
+    };
+    /* the budget's last token went out on the quantum's last step: the leave emits nothing more */
+    plain_quantum_left(max_tokens);
+    TEST_ASSERT(slot_is_batchable_decode(&sl));
+    TEST_ASSERT(s.batch_leave(&sl));
+    TEST_ASSERT(g.completion == max_tokens && sl.tokens_emitted == (uint64_t)max_tokens);
+    TEST_ASSERT(g.phase == GEN_FINISH && !g.batch_feed_valid && !g.batch_active);
+    TEST_ASSERT(g.finish && !strcmp(g.finish, "length") && g.err[0] == '\0');
+    TEST_ASSERT(!slot_is_batchable_decode(&sl));   /* the spec lane never sees it */
+    /* a server stop with budget left drops it the same way */
+    plain_quantum_left(max_tokens - 8);
+    g_stop_requested = 1;
+    TEST_ASSERT(s.batch_leave(&sl));
+    g_stop_requested = 0;
+    TEST_ASSERT(g.completion == max_tokens - 8 && g.phase == GEN_FINISH && !g.batch_feed_valid);
+    /* one token of budget left: the leave still commits the carried token (here the absent session refuses it) */
+    plain_quantum_left(max_tokens - 1);
+    TEST_ASSERT(!s.batch_leave(&sl));
+    TEST_ASSERT(strstr(g.err, "leaving the batch") != NULL && !g.batch_feed_valid);
+}
+
 /* L284 lane cost -- the priced plain/spec choice (lane_price_pick), on Qwen-shaped numbers (L284 specrows: a round
  * 25 + 7.7 ms/row; a plain step ~20 + 7.7 ms/row; ~0.55 acceptance) and DeepSeek's N8 case.  Invariants: no
  * number, no decision (at a new N the better-predicted lane is measured before anything is weighed); a PREDICTED
@@ -8785,6 +8837,7 @@ static void pulsar_server_unit_tests_run(void) {
     test_l179_park_live_bank_only_when_not_in_quantum();
     test_l179_lane_select_spec_needs_every_decoder();
     test_l284_batch_leave_when_spec_lane_carries_all();
+    test_l293_batch_leave_stops_at_the_budget();
     test_l284_lane_price_pick();
     test_l289_lane_reprobe_evidence();
     test_l179_spec_alloc_rows_isolation_and_ranked_overflow();
