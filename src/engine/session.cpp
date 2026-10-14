@@ -3,7 +3,7 @@
 #include "spec_internal.h"
 #include "tp/pulsar_tp.h"
 #include "tp/pulsar_tp_gpu.h"
-#include "lib/qwen_tokenizer.h"
+#include "lib/bpe_tokenizer.h"
 
 
 int pulsar_engine::routed_quant_bits() {
@@ -859,8 +859,8 @@ void pulsar_engine::summary() {
 int pulsar_engine::vocab_size() {
     auto *e = this;
     if (!e) return 0;
-    /* the tokenizer TABLE length (L272 B3: Qwen never loads e->vocab; its table is the checkpoint's) */
-    return e->qwen_tok ? qwen_tokenizer_n_tokens(e->qwen_tok) : e->vocab.n_vocab;
+    /* the tokenizer TABLE length: the family's tokenizer says (L272 B3, L295 F5) */
+    return e->family->tokenizer->n_tokens(e);
 }
 
 
@@ -976,7 +976,7 @@ void pulsar_engine::destroy() {
     weights_free(&e->weights);
     pulsar_tp_plan_free(e);   /* the rank's built slices, before the device goes */
     if (e->qwen_weights) pulsar_qwen_s4_unload(e->qwen_weights);
-    if (e->qwen_tok) qwen_tokenizer_free(e->qwen_tok);
+    if (e->qwen_tok) bpe_tokenizer_free(e->qwen_tok);
     e->qwen_tok = NULL;
     free(e->qwen_weights);
     e->vocab.vocab_free();

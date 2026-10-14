@@ -358,7 +358,7 @@ void request_free(request *r) {
     r->anthropic_live_suffix_spans = NULL;
     r->anthropic_live_suffix_n_spans = 0;
     tool_schema_orders_free(&r->tool_orders);
-    free(r->qwen_tools_json);
+    free(r->tools_json);
     memset(r, 0, sizeof(*r));
 }
 

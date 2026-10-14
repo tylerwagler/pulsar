@@ -508,11 +508,25 @@ typedef struct {
 struct chat_conversation;
 struct server;
 struct request;
-/** How a family's generated text is read. */
-typedef enum {
-    SERVER_PARSER_DSML = 0,   ///< DeepSeek's DSML machinery: the stream walk, the decode tracker, recovery, tool memory, the canonical rewrite, live tool state
-    SERVER_PARSER_QWEN = 1,   ///< ONE qwen_output_parser per generation (gen_state::qwen); the turn ends at the family's stop token
-} server_parser_kind;
+/** L295 F5: the number of effort NAMES any protocol sends (chat_family.cpp's k_effort_names: none, minimal,
+ *  low, medium, high, xhigh, max) -- the columns every family's effort map declares. */
+enum { CHAT_EFFORT_NAMES = 7 };
+/** L295 F5: a family's EFFORT MAP -- what each effort name means in its template, what an integer 1..100
+ *  means, what nothing sent means -- applied by the ONE thinking rule (chat_family.cpp
+ *  chat_resolve_thinking) for every family.  Levels are the family's own numbers: DeepSeek's are think modes
+ *  (its 1..100 axis), Qwen's its template's qwen_effort, Inkling's hundredths of its [0, 0.99] effort. */
+typedef struct server_effort_map {
+    /** The level per effort name, in k_effort_names' order; [0] ("none") is also thinking off's. */
+    int named[CHAT_EFFORT_NAMES];
+    /** An integer effort 1..100 -> the level; NULL = the level of the nearest preset name (low 50, high 75,
+     *  max 100). */
+    int (*integer)(int value);
+    /** Nothing sent, thinking on: the template's default level. */
+    int (*default_level)(pulsar_engine *e);
+    /** The level IS a pulsar_think_mode, into r->think_mode (DeepSeek's renderer reads it); otherwise
+     *  r->think_mode is PULSAR_THINK_DEFAULT (the enabled marker) and the renderer reads r->family_effort. */
+    bool think_mode_level;
+} server_effort_map;
 typedef struct server_family_ops {
     const char *name;
     pulsar_chat_format format;
@@ -522,11 +536,8 @@ typedef struct server_family_ops {
      *  DSML renderer and every KV-key suffix builder, so the live KV and the replay cannot disagree
      *  about which template produced the bytes (L218 s123).  Meaningless to another family. */
     bool v41;
-    server_parser_kind parser;
-    /** Thinking is ON (the shared rule, chat_family.cpp): the level the template has nearest the asked
-     *  effort (a row of the one effort-name table, an integer, or nothing sent: the template's default),
-     *  into r->think_mode and the family's own r->family_effort. */
-    void (*effort)(pulsar_engine *e, const struct chat_effort_ask *a, struct request *r);
+    /** The family's effort map (L295 F5). */
+    const server_effort_map *effort;
     /** Render the conversation into r->prompt_text / prompt_spans / prompt; refuse by name what the
      *  template cannot express (a forced tool call, a live tool continuation, ...). */
     bool (*render)(pulsar_engine *e, struct server *s, struct chat_conversation *c, struct request *r, char *err,
@@ -583,9 +594,9 @@ typedef struct server_family_ops {
  * decode-time state (the greedy region of a tool call, whether a closed call ends the turn) and
  * projects the released bytes into the request's protocol sink (chat_sink: text deltas, section ends,
  * the generic tool events); at the finish it gives the turn's final reading.  DeepSeek's is the
- * <think> / DSML machinery (parser_deepseek.cpp), Qwen's the incremental qwen_output_parser
- * (parser_qwen.cpp).  The server owns the stop-string scan, the plain (completion) stream, the
- * protocol finish and the response. */
+ * <think> / DSML machinery (parser_deepseek.cpp); Qwen's is the output-parser kit in Qwen's
+ * configuration (qwen_output_parser), behind the kit's shared hooks (parser_kit.cpp).  The server owns the
+ * stop-string scan, the plain (completion) stream, the protocol finish and the response. */
 struct gen_state;
 struct session_slot;
 /** The turn's final reading. */
@@ -626,7 +637,6 @@ typedef struct server_output_parser_ops {
     bool (*finish)(void *st, server *s, struct session_slot *sl, struct gen_state *g, server_turn *out);
 } server_output_parser_ops;
 extern const server_output_parser_ops k_parser_deepseek;
-extern const server_output_parser_ops k_parser_qwen;
 /** The table for a chat format (every format has one), and for the loaded engine's. */
 const server_family_ops *server_family_for_format(pulsar_chat_format fmt);
 const server_family_ops *server_family_for_engine(const pulsar_engine *e);
@@ -732,12 +742,12 @@ typedef struct request {
      *  sets it from the engine (server_family_for_engine), request_init defaults it to the compile-time
      *  profile's (DeepSeek V4.1) so hand-built requests keep that profile's bytes.  Never NULL. */
     const struct server_family_ops *family;
-    /** The family's own resolved thinking control, when its template has one beyond think_mode (Qwen's
-     *  qwen_effort); written by family->resolve, read by family->render. */
+    /** The family's level from its effort map (L295 F5: Qwen's qwen_effort, Inkling's hundredths; a DeepSeek
+     *  level is its think_mode); written by chat_resolve_thinking, read by family->render. */
     int family_effort;
-    /** L251: the request's tools array as the client sent it (JSON text), for
-     * the Qwen output parser's argument typing; owned, NULL = no tools. */
-    char *qwen_tools_json;
+    /** L251: the request's tools array in OpenAI's shape (JSON text) for a family that renders it as JSON
+     * and reads arguments by its schema (Qwen's template and output parser); owned, NULL = no tools. */
+    char *tools_json;
 } request;
 
 /** One key/value pair from a parsed JSON object. */
@@ -2315,29 +2325,37 @@ typedef enum {
     GEN_DONE,
 } gen_phase;
 
-/** L251: one Qwen generation's output side.  The ONE qwen_output_parser of the
- * generation is fed g->text's bytes as the stop-string scan releases them, and
- * its events become the response: reasoning and content deltas, and each
- * completed tool call, which is given its id here and kept in `calls` for the
- * final message.  A call reaches the client only when complete (TOOL_END): a
- * call the parser later rejects (ERROR) was never announced, so a stream never
- * carries a call the final message lacks. */
-struct qwen_gen {
-    qwen_output_parser parser;
-    std::vector<qwen_out_event> ev;  ///< scratch, reused per feed
+/** L251 / L295 F5: one generation's output side for a family whose output parser is the kit
+ * (out_parse_kit.h; parser_kit.cpp).  The ONE configured out_parser of the decode attempt is fed g->text's
+ * bytes as the stop-string scan releases them, and its events become the response: reasoning and content
+ * deltas, and each tool call as it is read, given its id here and kept in `calls` for the final message. */
+struct kit_gen {
+    out_parser *parser = nullptr;    ///< owned: the family's configured parser (its create's)
+    std::vector<out_event> ev;       ///< scratch, reused per feed
     size_t fed = 0;                  ///< bytes of g->text fed to the parser
     tool_calls calls = {};           ///< completed calls, ids assigned, in emission order
     bool finished = false;           ///< the end of the turn was fed (the finish did it)
     bool stream_ok = true;           ///< no client write failed while projecting
     std::string last_error;          ///< the last malformed-call report (the retry's detail)
     int undeclared = 0;              ///< calls dropped for naming an undeclared tool (L272)
-    std::vector<qwen_out_event> pending;   ///< a forced seed's announcement, sent by the first feed
+    std::vector<out_event> pending;  ///< a forced seed's announcement, sent by the first feed
     bool open = false;               ///< the last of `calls` is announced and still being read (L284 P5)
     bool open_args = false;          ///< its argument object's "{" went out
     int wire_open = -1;              ///< its index on the stream
     int wire_n = 0;                  ///< calls announced on the stream (a broken one keeps its index)
-    ~qwen_gen();                     ///< frees `calls` (parser_qwen.cpp)
+    ~kit_gen();                      ///< frees `calls` and the parser (parser_kit.cpp)
 };
+/** The kit's server_output_parser_ops hooks (parser_kit.cpp): a family whose parser is a kit configuration
+ *  fills its table with these and its own `create`, which builds the configured parser (per request: its
+ *  tools, the state the prompt left the turn in) and returns parser_kit_start(it) -- the kit owns it. */
+void *parser_kit_start(out_parser *p);
+void parser_kit_destroy(void *st);
+void parser_kit_seed(void *st, struct gen_state *g);
+bool parser_kit_feed(void *st, server *s, struct gen_state *g, size_t upto, bool final);
+bool parser_kit_in_tool_call(const void *st, const struct gen_state *g);
+bool parser_kit_turn_complete(const void *st, const struct gen_state *g);
+void parser_kit_tool_progress(const void *st, bool *opened, bool *closed);
+bool parser_kit_finish(void *st, server *s, struct session_slot *sl, struct gen_state *g, server_turn *out);
 
 /** Everything one in-flight generation needs, for the whole life of the
  * request.

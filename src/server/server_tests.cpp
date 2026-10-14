@@ -11,7 +11,7 @@
 #include "deepseek_dsml.h"
 #include "lib/pulsar_writeback.h"
 #include "lib/pulsar_segstore.h"
-#include "lib/qwen_tokenizer.h"
+#include "lib/bpe_tokenizer.h"
 
 #ifdef PULSAR_SERVER_TEST
 
@@ -1936,10 +1936,10 @@ static void test_effort_names_one_table(void) {
         {"\"max\"", PULSAR_THINK_MAX, QWEN_EFFORT_XHIGH},   {"37", 37, QWEN_EFFORT_LOW},
         {"80", 80, QWEN_EFFORT_XHIGH},                      {"null", PULSAR_THINK_DEFAULT, QWEN_EFFORT_XHIGH},
     };
-    TEST_ASSERT(!strcmp(k_effort_names[k_effort_row_none].name, "none") &&
-                !strcmp(k_effort_names[k_effort_row_low].name, "low") &&
-                !strcmp(k_effort_names[k_effort_row_high].name, "high") &&
-                !strcmp(k_effort_names[k_effort_row_max].name, "max"));
+    TEST_ASSERT(!strcmp(k_effort_names[k_effort_row_none], "none") &&
+                !strcmp(k_effort_names[k_effort_row_low], "low") &&
+                !strcmp(k_effort_names[k_effort_row_high], "high") &&
+                !strcmp(k_effort_names[k_effort_row_max], "max"));
     char body[256], err[256];
     request r;
     for (const row &w : rows) {
@@ -2000,7 +2000,7 @@ static void test_api_thinking_controls_parse(void) {
     chat_effort_ask a;
     char err[160];
     TEST_ASSERT(chat_effort_ask_read(&oc, 1, &a, err, sizeof err));
-    TEST_ASSERT(a.level >= 0 && !strcmp(k_effort_names[a.level].name, "max"));
+    TEST_ASSERT(a.level >= 0 && !strcmp(k_effort_names[a.level], "max"));
     free(oc.raw);
 }
 
@@ -2523,7 +2523,7 @@ static void test_broken_call_one_rule_every_family(void) {
         r->stream = true;   /* a stream: no retry, the turn is text */
         r->tool_orders = make_bash_order();
         if (c.fmt == PULSAR_CHAT_QWEN)
-            r->qwen_tools_json = xstrdup("[{\"type\":\"function\",\"function\":{\"name\":\"bash\",\"parameters\":"
+            r->tools_json = xstrdup("[{\"type\":\"function\",\"function\":{\"name\":\"bash\",\"parameters\":"
                                          "{\"type\":\"object\",\"properties\":{\"command\":{\"type\":\"string\"}}}}}]");
         gen_state g;
         memset(&g, 0, sizeof g);
@@ -3199,7 +3199,7 @@ static void test_qwen_raw_calls_replay_verbatim(void) {
     qwen_output_parser p;
     char err[100];
     TEST_ASSERT(p.init(true, NULL, err, sizeof err));
-    std::vector<qwen_out_event> ev;
+    std::vector<out_event> ev;
     for (size_t i = 0; sampled[i]; i++) p.feed(sampled + i, 1, &ev);   /* one byte at a time */
     p.finish(&ev);
     TEST_ASSERT(p.calls().size() == 2 && p.errors() == 1);
@@ -3283,8 +3283,8 @@ static void test_qwen_forced_call_prefill_and_seed(void) {
                                                    : "\n</think>\n\n<tool_call>\n<function=search>\n"));
         /* the parser reads the seed as an open call, then the model's body as its arguments */
         qwen_output_parser p;
-        TEST_ASSERT(p.init(!thinking_off, r.qwen_tools_json, err, sizeof err));
-        std::vector<qwen_out_event> ev;
+        TEST_ASSERT(p.init(!thinking_off, r.tools_json, err, sizeof err));
+        std::vector<out_event> ev;
         p.feed(seed.ptr, seed.len, &ev);
         TEST_ASSERT(p.in_tool_call() && p.calls().empty());
         const char *body = "<parameter=q>\npulsars\n</parameter>\n</function>\n</tool_call>";
@@ -3302,8 +3302,8 @@ static void test_qwen_forced_call_prefill_and_seed(void) {
         TEST_ASSERT(!strcmp(useed.ptr, thinking_off ? "<tool_call>\n<function" : "\n</think>\n\n<tool_call>\n<function"));
         TEST_ASSERT(!strcmp(r.family->forced_name_open, "=") && !strcmp(r.family->forced_name_close, ">"));
         qwen_output_parser u;
-        TEST_ASSERT(u.init(!thinking_off, r.qwen_tools_json, err, sizeof err));
-        std::vector<qwen_out_event> uev;
+        TEST_ASSERT(u.init(!thinking_off, r.tools_json, err, sizeof err));
+        std::vector<out_event> uev;
         u.feed(useed.ptr, useed.len, &uev);
         TEST_ASSERT(u.in_tool_call() && u.calls().empty());
         const std::string rest = std::string("=search>\n") + body;
@@ -3376,7 +3376,7 @@ static void test_qwen_payload_is_sampled_structure_greedy(void) {
     qwen_output_parser p;
     char err[160];
     TEST_ASSERT(p.init(false, tools, err, sizeof err));
-    std::vector<qwen_out_event> ev;
+    std::vector<out_event> ev;
     /* each step: bytes fed, then whether the NEXT byte is payload */
     struct step { const char *bytes; bool tool; bool payload; };
     static const step steps[] = {
@@ -3487,11 +3487,11 @@ static void test_qwen_tool_error_suffix_reminds_the_system_turn(void) {
 
 /* ---- L290: a turn's tokens never change after the next user message arrives ------------------------------ */
 
-/* The checkpoint's tokenizer, host-side (src/lib/qwen_tokenizer): PULSAR_TEST_QWEN_TOKENIZER names a directory
- * with tokenizer.json and generation_config.json, by default the served Qwen checkpoint's.  A missing one fails
- * the test by name. */
-static const qwen_tokenizer *qwen_test_tokenizer(void) {
-    static qwen_tokenizer *tok = NULL;
+/* The checkpoint's tokenizer, host-side (src/lib/bpe_tokenizer, its HF configuration): PULSAR_TEST_QWEN_TOKENIZER
+ * names a directory with tokenizer.json and generation_config.json, by default the served Qwen checkpoint's.  A
+ * missing one fails the test by name. */
+static const bpe_tokenizer *qwen_test_tokenizer(void) {
+    static bpe_tokenizer *tok = NULL;
     static bool tried = false;
     if (tried) return tok;
     tried = true;
@@ -3511,17 +3511,17 @@ static const qwen_tokenizer *qwen_test_tokenizer(void) {
     if (!slurp(dir + "/tokenizer.json", &tj) || !slurp(dir + "/generation_config.json", &gj))
         snprintf(err, sizeof err, "no tokenizer.json + generation_config.json in %s", dir.c_str());
     else
-        tok = qwen_tokenizer_load(tj.data(), tj.size(), gj.data(), gj.size(), err, sizeof err);
+        tok = bpe_tokenizer_load_hf(tj.data(), tj.size(), gj.data(), gj.size(), err, sizeof err);
     if (!tok) fprintf(stderr, "L290 tests: the Qwen tokenizer (PULSAR_TEST_QWEN_TOKENIZER): %s\n", err);
     TEST_ASSERT(tok != NULL);
     return tok;
 }
 
-static std::vector<int> qwen_test_encode(const qwen_tokenizer *tok, const char *text, const chat_text_span *spans,
+static std::vector<int> qwen_test_encode(const bpe_tokenizer *tok, const char *text, const chat_text_span *spans,
                                          size_t n_spans) {
     std::vector<int> out;
     char err[200] = "";
-    const bool ok = qwen_tokenizer_encode(tok, text, strlen(text), spans, (uint32_t)n_spans, &out, err, sizeof err);
+    const bool ok = bpe_tokenizer_encode(tok, text, strlen(text), spans, (uint32_t)n_spans, &out, err, sizeof err);
     if (!ok) fprintf(stderr, "qwen encode refused: %s\n", err);
     TEST_ASSERT(ok);
     return out;
@@ -3577,7 +3577,7 @@ static void test_anthropic_turn_render_is_stable_across_the_next_user_turn(void)
          * DeepSeek's tool context) */
         TEST_ASSERT(b && strstr(b, "Use ls.") && strstr(b, "Two files."));
         if (fmt == PULSAR_CHAT_QWEN && a && b) {
-            const qwen_tokenizer *tok = qwen_test_tokenizer();
+            const bpe_tokenizer *tok = qwen_test_tokenizer();
             if (tok) {
                 const std::vector<int> ta = qwen_test_encode(tok, a, sa.data(), sa.size());
                 const std::vector<int> tb = qwen_test_encode(tok, b, sb.data(), sb.size());
@@ -3596,7 +3596,7 @@ static void test_anthropic_turn_render_is_stable_across_the_next_user_turn(void)
  * <|endoftext|> committed.  Joined after the stop (the pre-L290 join) the history doubled the close and the next
  * full render diverged there. */
 static void test_live_tail_joins_before_a_committed_stop(void) {
-    const qwen_tokenizer *tok = qwen_test_tokenizer();
+    const bpe_tokenizer *tok = qwen_test_tokenizer();
     if (!tok) return;
     chat_msgs prefix = {0};
     chat_msgs_push(&prefix, qwen_test_msg("system", "Be terse."));
@@ -3635,8 +3635,8 @@ static void test_live_tail_joins_before_a_committed_stop(void) {
         const std::vector<int> sampled = qwen_test_encode(tok, live_text.c_str(), live_spans.data(), live_spans.size());
         const std::vector<int> tail_toks = qwen_test_encode(tok, tail, tail_spans, tail_n);
         const std::vector<int> want = qwen_test_encode(tok, want_text, full_spans.data(), full_spans.size());
-        const int im_end = qwen_tokenizer_added_id(tok, "<|im_end|>");
-        const int endoftext = qwen_tokenizer_added_id(tok, "<|endoftext|>");
+        const int im_end = bpe_tokenizer_added_id(tok, "<|im_end|>");
+        const int endoftext = bpe_tokenizer_added_id(tok, "<|endoftext|>");
         TEST_ASSERT(im_end >= 0 && endoftext >= 0 && tail_toks.size() > 1 && tail_toks[0] == im_end);
         const int stops[] = {-1, im_end, endoftext};
         for (int stop : stops) {

@@ -1894,10 +1894,10 @@ struct pulsar_engine {
     /** L284 P15: the Qwen importance-matrix collection's observer while one runs (imatrix_qwen.cpp), else NULL --
      *  the trunk's steps note their linears' input rows into it. */
     struct pulsar_imatrix_tap *imatrix_tap;
-    /** The Qwen4-exp family's tokenizer (L251 S5, src/lib/qwen_tokenizer.h), built at open from the
-     * checkpoint's own tokenizer.json + generation_config.json; NULL on a DeepSeek engine.  When set,
+    /** The Qwen4-exp family's tokenizer (L251 S5; the shared engine src/lib/bpe_tokenizer.h in its HF
+     * configuration), built at open from the checkpoint's own tokenizer.json + generation_config.json; NULL on a DeepSeek engine.  When set,
      * the engine's tokenizer entries (tokenizer.cpp) dispatch to it instead of `vocab`. */
-    struct qwen_tokenizer *qwen_tok;
+    struct bpe_tokenizer *qwen_tok;
     pulsar_model model;         ///< the target model's mapping and directory
     pulsar_model dspark_model;  ///< drafter mapping; a distinct file only when dspark_external
     pulsar_vocab vocab;         ///< tokenizer tables and special ids

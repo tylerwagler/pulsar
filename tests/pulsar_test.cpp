@@ -9,7 +9,7 @@
 #include "../src/server/deepseek_dsml.cpp"
 #include "../src/server/deepseek_stream.cpp"
 #include "../src/server/parser_deepseek.cpp"
-#include "../src/server/parser_qwen.cpp"
+#include "../src/server/parser_kit.cpp"
 #include "../src/server/openai_stream.cpp"
 #include "../src/server/responses_stream.cpp"
 #include "../src/server/anthropic_stream.cpp"
