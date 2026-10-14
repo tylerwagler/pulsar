@@ -35,7 +35,13 @@
  * sent is 0.9.
  *
  * OUTPUT.  `inkling_output_grammar` is the output-parser kit's configuration for Inkling's typed content
- * blocks (vllm/parser/inkling.py's transition table): see out_parse_kit.h. */
+ * blocks (vllm/parser/inkling.py's transition table), read with the kit's shared JSON call body
+ * (out_json_call_body: `{"name":...,"args":{...}}`, the arguments the args object as sampled): see
+ * out_parse_kit.h.  Reasoning is the turn's thinking text with its trailing whitespace dropped; content is
+ * verbatim unless it is only whitespace and a call opened or was read (vLLM's
+ * strip_trailing_reasoning_whitespace and drop_whitespace_only_content_before_tools).  The one departure
+ * from vLLM's reading: a call the turn ENDS inside is broken (an ERROR, the rule every family shares), where
+ * vLLM carves arguments out of the unterminated wrapper. */
 #pragma once
 
 #include <stddef.h>
@@ -97,6 +103,8 @@ struct inkling_render_out {
 /** Render.  false + "<refusal key>: detail" on refusal. */
 bool inkling_chat_render(const inkling_render_in &in, inkling_render_out *out, char *err, size_t errlen);
 
-/** Inkling's output grammar for the kit: its eight content-block markers and the transition table.  The
- * parser starts in the message header the generation prompt opened. */
+/** Inkling's output grammar for the kit: its eight content-block markers, the transition table, and the
+ * tokenizer's other special tokens as dropped markers (vLLM drops a special token that is not a terminal;
+ * inkling-chat-gate asserts the two lists are special_tokens_map.json's).  A turn after the generation
+ * prompt's `<|message_model|>` starts in OUT_HEADER. */
 const out_grammar &inkling_output_grammar(void);
