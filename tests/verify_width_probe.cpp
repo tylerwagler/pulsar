@@ -64,6 +64,24 @@ typedef struct {
     int    n_ref, top_wide, top_serial;
 } width_stats;
 
+/* L288 C1: a bank at the prefix toks[0, len), through the public bank surface (every family's: the server's prefill
+ * flow, pulsar.h) -- the DeepSeek-graph fixture (gate_populate_bank) does not reach a Qwen session. */
+static bool populate_bank(pulsar_session *s, uint32_t bank, const int *v, int len, const char *what) {
+    char err[256];
+    if (pulsar_session_bank_repoint(s, bank) != 0) {
+        fprintf(stderr, "%s: bank %u repoint failed\n", what, bank);
+        return false;
+    }
+    pulsar_session_invalidate(s);
+    pulsar_tokens p = {(int *)v, len, len};
+    if (pulsar_session_sync(s, &p, err, sizeof err) != 0) {
+        fprintf(stderr, "%s: bank %u sync failed: %s\n", what, bank, err);
+        return false;
+    }
+    pulsar_session_bank_state_save(s, bank);
+    return true;
+}
+
 static uint32_t parse_list(char *s, uint32_t *out, uint32_t cap) {
     uint32_t n = 0;
     for (char *p = strtok(s, ","); p && n < cap; p = strtok(NULL, ",")) out[n++] = (uint32_t)atoi(p);
@@ -146,10 +164,15 @@ int GATE_ENTRY(int argc, char **argv) {
         const int ctx = (int)(((dmax + SERIAL_ROWS + 4095u) / 4096u + 1u) * 4096u);
         pulsar_session *s = NULL;
         if (pulsar_session_create(&s, e, ctx) != 0) { fprintf(stderr, "session create failed\n"); rc = 1; break; }
-        if (!gate_pool_fits(s, nb < 2 ? 2 : nb)) { pulsar_session_free(s); rc = 1; break; }
+        if (pulsar_session_bank_count(s) < (int)(nb < 2 ? 2 : nb)) {
+            fprintf(stderr, "pool too small: %d < %u (set PULSAR_MSEQ_BANKS)\n", pulsar_session_bank_count(s), nb < 2 ? 2 : nb);
+            pulsar_session_free(s);
+            rc = 1;
+            break;
+        }
         /* serial truth: every bank prefilled, then one-row steps bank by bank */
         bool ok = true;
-        for (uint32_t b = 0; ok && b < nb; b++) ok = gate_populate_bank(s, b, toks, (int)P[b], NULL, "serial prefix");
+        for (uint32_t b = 0; ok && b < nb; b++) ok = populate_bank(s, b, toks, (int)P[b], "serial prefix");
         for (uint32_t b = 0; ok && b < nb; b++)
             for (uint32_t k = 0; ok && k < SERIAL_ROWS; k++) {
                 pulsar_multiseq_req q = {b, (int32_t)(P[b] + k), toks[P[b] + k]};
@@ -163,7 +186,7 @@ int GATE_ENTRY(int argc, char **argv) {
             const uint32_t w = widths[wi];
             if (w % nb) continue;
             const uint32_t r = w / nb;
-            for (uint32_t b = 0; ok && b < nb; b++) ok = gate_populate_bank(s, b, toks, (int)P[b], NULL, "wide prefix");
+            for (uint32_t b = 0; ok && b < nb; b++) ok = populate_bank(s, b, toks, (int)P[b], "wide prefix");
             pulsar_multiseq_req q[PULSAR_SPEC_LOGITS_ROWS];
             for (uint32_t b = 0; b < nb; b++)
                 for (uint32_t k = 0; k < r; k++) q[b * r + k] = {b, (int32_t)(P[b] + k), toks[P[b] + k]};
