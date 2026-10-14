@@ -3,12 +3,13 @@
  * One round's update of the draft-depth cap from what the round converted.  The rule is DSpark's
  * (spec_dspark.cpp's k_dspark_depth, the 2026-08-25 sweep and its v2..v5 refinements), moved here in
  * L251 so it has one home and a gate (tests/spec_depth_gate.cpp pins DSpark's schedule).  The Qwen MTP
- * drafter measured it and does NOT use it (spec_qwen.cpp: its in-round stop wins); a drafter opts in
- * through pulsar_drafter_ops::adapt.  Pure host
+ * drafter uses it since L288 (4..7, no veto or cooldown; spec_qwen.cpp k_mtp_depth has the replay); a drafter
+ * opts in through pulsar_drafter_ops::adapt.  Pure host
  * logic: no engine state, no CUDA.
  *
- *   UP:    commit == depth (the whole chain was kept and accepted), no cooldown running, and the tail
- *          draft's confidence clears conf_up (a negative confidence -- no head ran -- passes).
+ *   UP:    commit >= depth - up_slack (up_slack 0: the whole chain was kept and accepted), no cooldown running,
+ *          and the last verified draft's confidence clears conf_up (a negative confidence -- no head ran --
+ *          passes).
  *   DOWN:  2 * commit < depth (less than half the depth converted) -- except that at veto_depth a
  *          still-confident tail (>= veto_conf) forgives ONE down-signal; a second consecutive one backs
  *          off regardless.  A down within excursion_rounds of the last up is a FAILED EXCURSION and
@@ -38,6 +39,7 @@ typedef struct {
     float veto_conf;          ///< ... when the last verified draft's confidence >= this
     uint8_t cooldown_rounds;  ///< UP suppressed this long after a failed excursion
     uint8_t excursion_rounds; ///< a down within this many rounds of an up is a failed excursion
+    uint8_t up_slack;         ///< UP once commit >= depth - up_slack (0: only a whole chain accepted climbs)
 } pulsar_spec_depth_policy;
 
 typedef struct {
@@ -62,8 +64,8 @@ static inline int pulsar_spec_depth_next(const pulsar_spec_depth_policy *p, puls
             if (st->rounds_since_up <= p->excursion_rounds) st->climb_cooldown = p->cooldown_rounds;
             next--;
         }
-    } else if ((uint32_t)commit == depth && st->climb_cooldown == 0u &&
-               (conf[depth - 1] >= p->conf_up || conf[depth - 1] < 0.0f)) {
+    } else if (K > 0 && (uint32_t)commit + p->up_slack >= depth && st->climb_cooldown == 0u &&
+               (conf[K - 1] >= p->conf_up || conf[K - 1] < 0.0f)) {
         st->down_forgiven = false;
         st->rounds_since_up = 0u;
         next++;

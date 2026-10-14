@@ -567,6 +567,10 @@ static uint32_t dspark_draft(pulsar_session *s, int next_base, bool, float tempe
     spec_redraft_req rec;
     memset(&rec, 0, sizeof rec);
     pulsar_spec_draft_req_init(s, &rec, next_base, temperature, top_k, top_p, min_p);
+    if (rec.copied) {   /* L288: the bank repeats its history -- the copy chain is the round's drafts */
+        pulsar_spec_redraft_stamp(s, &rec);
+        return rec.keep;
+    }
     /* greedy with no host consumer at draft time (no dump) defers the readback */
     const bool defer = !rec.sample_drafts && !gpu_graph_spec_dump_active();
     spec_redraft_req *qs[1] = {&rec};
@@ -858,7 +862,8 @@ static int dspark_draft_batch(pulsar_session *s, pulsar_spec_round **rounds,
     for (int pass = 0; pass < 2; pass++)
         for (int i = 0; i < n; i++) {
             spec_redraft_req *q = &rounds[i]->redraft;
-            if (!q->valid || q->n_draft == 0 || (pass == 0) != !q->sample_drafts) continue;
+            if (pass == 0 && q->valid && q->copied) q->done = true;   /* L288: a copy chain, drafted at its record */
+            if (!q->valid || q->copied || q->n_draft == 0 || (pass == 0) != !q->sample_drafts) continue;
             qs[n_sel] = q;
             bk[n_sel] = banks[i];
             rg[n_sel] = rngs[i];
@@ -972,7 +977,7 @@ static bool dspark_absorb_banked(pulsar_session *s, const uint32_t *rows, const 
  * even transient excursions there are purchased losses; re-tune only with a drafter retrained at a wider block
  * (L092).  UP needs a tail confidence >= 0.70 (calibrated >= 0.82 accept); the v3 veto
  * only at depth 5 with a >= 0.90 tail; the v4/v5 8-round cooldown after a down within 2 rounds of an up. */
-static const pulsar_spec_depth_policy k_dspark_depth = {2, 5, 0.70f, 5, 0.90f, 8u, 2u};
+static const pulsar_spec_depth_policy k_dspark_depth = {2, 5, 0.70f, 5, 0.90f, 8u, 2u, 0u};
 
 /* DSpark's numbers.
  * Depth 3 to start: the v5mx optimum (2026-07-17 k-sweep at the tau 0.25 stop, quench disarmed).  k = 3 beat

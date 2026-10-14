@@ -1912,6 +1912,13 @@ struct pulsar_engine {
      * SPEC_ROUND_END_BATCH; the spec lane's is read by the quench guard and the allocator, both by
      * the server's lane choice. */
     pulsar_lane_cost_fit lane_cost[PULSAR_LANE_COUNT];
+    /** L288 (tf-gap pass 2): a drafter's lockstep step, measured the same way -- its wall on the chains it
+     * carried (one row a chain), fed by a drafter that drafts token by token (the MTP chain) off TP.  What one
+     * more draft costs beside its verify row (pulsar_spec_chain_price). */
+    pulsar_lane_cost_fit draft_step_cost;
+    /** L288: the spec lane's yield, ms of wall an emitted token costs (an EMA; 0 = none observed) -- the value of
+     * a token every draft and verify row is priced against (pulsar_engine_spec_token_ms). */
+    float spec_token_ms;
     char *directional_steering_file;   ///< steering-vector file path, or NULL
     float *directional_steering_dirs;  ///< loaded steering directions, or NULL
     float directional_steering_attn_scale;  ///< steering strength on the attention stream
@@ -2148,6 +2155,13 @@ typedef struct pulsar_spec_carry_state {
      * UNCONDITIONALLY (-1 when the head didn't run): the L107 adaptive-depth
      * controller reads the verified chain's tail confidence in round_end. */
     float   pend_conf[16];
+    /** L288: the pendings are a copy chain (pulsar_spec_copy_chain), not the drafter's: their verdict feeds the
+     * copy acceptance (pulsar_engine::spec_copy_accept). */
+    bool    pend_copy;
+    /** L288: this request's copy drafts' measured chance to be accepted once the one before was (an EMA over its
+     * verified copy chains, weight 0.1 a round; 0 = none yet) -- the confidence its copy drafts carry.  A request
+     * boundary clears it (spec_lookahead_reset). */
+    float   copy_accept;
     /** L107 adaptive draft depth: the session's CURRENT draft depth, moved
      * +/-1 per round by the controller in spec_round_end from the realized
      * accept count and the verified tail confidence. 0 = uninitialized (first
@@ -2216,6 +2230,7 @@ typedef struct pulsar_spec_carry_state {
  * the stale ids at the next harvest. */
 static inline void pulsar_spec_drop_pendings(pulsar_spec_carry_state *sp) {
     sp->n_pend = 0;
+    sp->pend_copy = false;
     sp->dspark_chain_unharvested = false;
 }
 

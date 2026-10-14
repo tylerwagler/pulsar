@@ -41,13 +41,20 @@
  *   S1  a request boundary re-arms it: a bank whose yield quench latched (forced by its field -- the one reach past
  *       the public API) carries the latch across a bank switch, and the next request's sync on that bank speculates
  *       again; an invalidate drops the lookahead and re-arms too
+ *   S2  a bank that drafts nothing in a round (the allocator's K = 0) leaves its state as a plain decode of the same
+ *       token (L288, after vLLM 0eac15270): the round's base row through the verify (capture armed, every row
+ *       headed) and the commit of that one row, against the token decoded plain in a one-bank twin session --
+ *       alone, and beside a bank (another prompt) whose drafts ride the same verify.  The next-token logits and four decode steps after, byte for byte;
+ *       on Qwen also every trunk layer's recurrent state (GDN state + conv, the PLE conv, the QSA index stage and the
+ *       token's KV row), the bytes a policy that yields K = 0 rows relies on
  * In the battery for every family as a runner gate (L278: tests/gates_runner.cpp hosts each family's model); the
  * standalone `make session-contract-gate-qwen` / `-ds` remain for iterating.  Replaces L266's
  * qwen_chunk_neutrality_gate and qwen_banks_gate. */
 #include "pulsar.h"
 #include "gate_entry.h"
 #include "gate_util.h"
-#include "pulsar_engine_internal.h"   /* S1 forces the quench latch by its field */
+#include "pulsar_engine_internal.h"   /* S1 forces the quench latch by its field; S2 reads the recurrent state */
+#include "family_qwen.h"              /* S2: the Qwen bank's state slices */
 
 #include <algorithm>
 #include <math.h>
@@ -950,6 +957,232 @@ static void part_spec_lookahead(pulsar_engine *e) {
     pulsar_tokens_free(&more);
 }
 
+/* S2 (L288): a bank's recurrent state, read off the device (Qwen; empty on a family whose per-bank state this gate
+ * does not lay out -- its logits and decode steps are graded instead): every trunk layer's GDN state and conv, the
+ * PLE conv, the QSA index stage and the KV row the token at `pos` wrote. */
+static std::vector<uint8_t> qwen_bank_state(pulsar_session *s, uint32_t b, int pos) {
+    std::vector<uint8_t> out;
+    if (!s->qwen) return out;
+    const pulsar_qwen_shape *sh = &g_qwen_shape;
+    const pulsar_qwen_state *q = s->qwen;
+    bool ok = true;
+    auto grab = [&](const pulsar_gpu_tensor *t, uint64_t off, uint64_t n) {
+        if (!ok || !t) return;
+        const size_t at = out.size();
+        out.resize(at + n);
+        ok = pulsar_gpu_tensor_read(t, off, out.data() + at, n) != 0;
+    };
+    for (uint32_t il = 0; ok && il < s->engine->plan.n_layer; il++) {
+        const pulsar_qwen_layer_state *L = &q->layer[il];
+        grab(L->gdn_state, b * pulsar_qwen_gdn_state_bytes(sh), pulsar_qwen_gdn_state_bytes(sh));
+        grab(L->gdn_conv, b * pulsar_qwen_gdn_conv_bytes(sh), pulsar_qwen_gdn_conv_bytes(sh));
+        grab(L->idx_tail, b * pulsar_qwen_index_tail_bytes(sh), pulsar_qwen_index_tail_bytes(sh));
+        grab(L->ple_conv, b * pulsar_qwen_ple_conv_bytes(sh), pulsar_qwen_ple_conv_bytes(sh));
+        if (L->kv) grab(L->kv[b], (uint64_t)pos * pulsar_qwen_kv_row_bytes(sh), pulsar_qwen_kv_row_bytes(sh));
+    }
+    if (!ok) out.clear();
+    return out;
+}
+
+/* One round of the server's spec lane over `n` banks (assemble, the shared verify forward with the capture armed,
+ * round_end); k_alloc[i] = 0 makes bank i's round its base row alone, -1 admits its pendings.  The banks' accepted
+ * counts in na[]; false on any refusal (err says which). */
+static bool spec_lane_round(pulsar_session *s, const uint32_t *banks, const int *k_alloc, int n, uint64_t *rngs,
+                            pulsar_spec_round **rounds, int *na, int W, char *err, size_t errlen) {
+    const uint32_t width = pulsar_engine_fused_heads_max(s->engine);
+    pulsar_spec_step st[4];
+    static int acc[4][PULSAR_SPEC_LOGITS_ROWS + 1];
+    if (n > 4) return false;
+    std::vector<pulsar_multiseq_req> reqs(width);
+    for (int i = 0; i < n; i++) {
+        memset(&st[i], 0, sizeof st[i]);
+        st[i].bank = banks[i];
+        st[i].round = rounds[i];
+        st[i].top_p = 1.0f;
+        st[i].rng = &rngs[i];
+        st[i].max_tokens = 64;
+        st[i].k_alloc = k_alloc[i];
+        st[i].accepted_cap = k_alloc[i] >= 0 ? k_alloc[i] + 1 : (int)(PULSAR_SPEC_LOGITS_ROWS + 1);
+    }
+    uint32_t rows = 0;
+    if (pulsar_session_spec_assemble_batch(s, st, n, width, reqs.data(), &rows) != 0 || rows == 0) {
+        snprintf(err, errlen, "assemble refused (%u rows)", rows);
+        return false;
+    }
+    for (int i = 0; i < n; i++)
+        if (st[i].status != PULSAR_SPEC_STEP_OK) {
+            snprintf(err, errlen, "assemble bank %u: status %d %s", banks[i], st[i].status, st[i].err);
+            return false;
+        }
+    std::vector<float> logits((size_t)rows * W);
+    uint32_t got = 0;
+    pulsar_session_spec_arm_capture(s, rows);
+    const int rc = pulsar_session_decode_mixed(s, reqs.data(), rows, logits.data(), (int)rows * W, &got,
+                                               PULSAR_MSEQ_HEAD_ALL_ROWS, err, errlen);
+    pulsar_session_spec_arm_capture(s, 0u);
+    if (rc != 0 || got != rows) return false;
+    for (int i = 0; i < n; i++) {
+        const uint32_t row0 = st[i].row0;
+        const int first = st[i].first_token;
+        memset(&st[i], 0, sizeof st[i]);
+        st[i].bank = banks[i];
+        st[i].round = rounds[i];
+        st[i].top_p = 1.0f;
+        st[i].rng = &rngs[i];
+        st[i].first_token = first;
+        st[i].row0 = row0;
+        st[i].accepted = acc[i];
+        st[i].accepted_cap = (int)(PULSAR_SPEC_LOGITS_ROWS + 1);
+    }
+    if (pulsar_session_spec_round_end_batch(s, st, n, logits.data()) != 0) {
+        snprintf(err, errlen, "round_end refused");
+        return false;
+    }
+    for (int i = 0; i < n; i++) {
+        if (st[i].status != PULSAR_SPEC_STEP_OK) {
+            snprintf(err, errlen, "round_end bank %u: %s", banks[i], st[i].err);
+            return false;
+        }
+        na[i] = st[i].n_accepted;
+    }
+    return true;
+}
+
+/* `bank`'s logits as it stands, then after each of kDecode decoded plain */
+static std::vector<std::vector<float>> decode_after(pulsar_session *s, uint32_t bank, int W, char *err, size_t errlen) {
+    std::vector<std::vector<float>> out;
+    if (!pulsar_session_bank_state_restore(s, bank)) return out;
+    out.push_back(logits_of(s, W));
+    for (int t = 0; t < 4; t++) {
+        if (pulsar_session_eval(s, kDecode[t], err, errlen) != 0) { out.clear(); break; }
+        out.push_back(logits_of(s, W));
+    }
+    pulsar_session_bank_state_save(s, bank);
+    return out;
+}
+
+/* the first of the steps whose logits differ (0 = the token the round committed, 1..4 the decode steps after it),
+ * -1 when every one is identical, -2 when either side did not run */
+static int differ_at(const std::vector<std::vector<float>> &a, const std::vector<std::vector<float>> &b) {
+    if (a.size() != b.size() || a.empty()) return -2;
+    for (size_t i = 0; i < a.size(); i++) {
+        double d;
+        if (!same(a[i], b[i], &d)) return (int)i;
+    }
+    return -1;
+}
+
+/* S2 sessions: `pool` banks, bank b prefilled with prompts[b]; NULL on a refusal (err says which) */
+static pulsar_session *s2_session(pulsar_engine *e, const pulsar_tokens *const *prompts, uint32_t pool, char *err,
+                                  size_t errlen) {
+    pulsar_engine_set_bank_pool(pool);
+    pulsar_session *s = NULL;
+    if (pulsar_session_create(&s, e, 4096) != 0 || !s) return NULL;
+    for (uint32_t b = 0; b < pool; b++) {
+        if (!pulsar_session_bank_state_restore(s, b) || pulsar_session_sync(s, prompts[b], err, errlen) != 0) {
+            pulsar_session_free(s);
+            return NULL;
+        }
+        pulsar_session_bank_state_save(s, b);
+    }
+    return s;
+}
+
+static void part_spec_zero_draft(pulsar_engine *e, int W) {
+    if (!pulsar_engine_has_spec_rounds(e)) {
+        printf("  skip  S2 (no drafter on this model)\n");
+        return;
+    }
+    /* part_banks' two prompts (B6 verifies their runs on both families) */
+    pulsar_tokens A = text_tokens(e, "The lighthouse keeper counted the ships every evening, writing each name in a small");
+    pulsar_tokens B = text_tokens(e, "def fibonacci(n):\n    \"\"\"Return the n-th Fibonacci number.\"\"\"\n    if n < 2:\n        return");
+    char err[256] = "";
+    /* the twin: a one-bank session decodes the greedy base after A plain, then kDecode; its state after the base.
+     * Every S2 session holds A on its bank 0, so the twin's bytes sit at the same offsets. */
+    const pulsar_tokens *pa[1] = {&A};
+    pulsar_session *t = s2_session(e, pa, 1, err, sizeof(err));
+    int x = -1;
+    bool ok = t != NULL;
+    if (ok) {
+        const std::vector<float> l = logits_of(t, W);
+        x = l.empty() ? -1 : (int)(std::max_element(l.begin(), l.end()) - l.begin());
+        ok = x >= 0 && pulsar_session_eval(t, x, err, sizeof(err)) == 0;
+        pulsar_session_bank_state_save(t, 0);
+    }
+    const std::vector<uint8_t> plain_state = ok ? qwen_bank_state(t, 0, A.len) : std::vector<uint8_t>();
+    const std::vector<std::vector<float>> plain =
+        ok ? decode_after(t, 0, W, err, sizeof(err)) : std::vector<std::vector<float>>();
+    CHECK(ok && plain.size() == 5, "S2 the twin decodes the base %d plain after A (%d tokens), then 4 tokens: %s", x,
+          A.len, err);
+    if (t) pulsar_session_free(t);
+    /* (a) bank 0 of a one-bank session at K = 0 */
+    {
+        pulsar_session *s = s2_session(e, pa, 1, err, sizeof(err));
+        const uint32_t banks[1] = {0};
+        const int k0[1] = {0};
+        int na[1] = {0};
+        uint64_t rng[1] = {1};
+        pulsar_spec_round *r[1] = {pulsar_spec_round_new()};
+        const bool ran = s && spec_lane_round(s, banks, k0, 1, rng, r, na, W, err, sizeof(err));
+        CHECK(ran && na[0] == 1, "S2 (alone) the K = 0 round committed its base alone (%d): %s", na[0], err);
+        const std::vector<uint8_t> st = ran ? qwen_bank_state(s, 0, A.len) : std::vector<uint8_t>();
+        if (s && s->qwen)
+            CHECK(ran && !st.empty() && st == plain_state,
+                  "S2 (alone) the K = 0 bank's recurrent state == the plain decode's, byte for byte (%zu bytes)",
+                  st.size());
+        const std::vector<std::vector<float>> got =
+            ran ? decode_after(s, 0, W, err, sizeof(err)) : std::vector<std::vector<float>>();
+        const int at = differ_at(got, plain);
+        CHECK(at == -1, "S2 (alone) the K = 0 bank's next-token logits and 4 decode steps == the plain twin's (first "
+              "difference at step %d): %s", at, err);
+        pulsar_spec_round_free(r[0]);
+        if (s) pulsar_session_free(s);
+    }
+    /* (b) bank 0 (A) at K = 0 beside bank 1 (B), whose drafts ride the same verify: bank 1's first round (no
+     * pendings yet) and its redraft, then the shared round */
+    {
+        const pulsar_tokens *pab[2] = {&A, &B};
+        pulsar_session *s = s2_session(e, pab, 2, err, sizeof(err));
+        uint64_t rngs[2] = {1, 2};
+        pulsar_spec_round *r[2] = {pulsar_spec_round_new(), pulsar_spec_round_new()};
+        const uint32_t b1[1] = {1};
+        const int kall[1] = {-1};
+        int na[2] = {0, 0};
+        bool ran = s && spec_lane_round(s, b1, kall, 1, &rngs[1], &r[1], na, W, err, sizeof(err));
+        uint32_t banks_r[1] = {1};
+        uint64_t *rp[1] = {&rngs[1]};
+        ran = ran && pulsar_session_spec_redraft_batch(s, &r[1], banks_r, rp, 1, err, sizeof(err)) == 0;
+        pulsar_spec_step cs;
+        memset(&cs, 0, sizeof cs);
+        cs.bank = 1;
+        cs.round = r[1];
+        ran = ran && pulsar_session_spec_redraft_commit_batch(s, &cs, 1) == 0 && cs.status == PULSAR_SPEC_STEP_OK;
+        float conf[16];
+        const uint32_t pend = ran ? pulsar_session_bank_pending_confs(s, 1, conf) : 0u;
+        CHECK(ran && pend > 0, "S2 (beside) bank 1 holds %u drafts for the shared round: %s", pend, err);
+        const uint32_t banks[2] = {0, 1};
+        const int k[2] = {0, -1};
+        ran = ran && pend > 0 && spec_lane_round(s, banks, k, 2, rngs, r, na, W, err, sizeof(err));
+        CHECK(ran && na[0] == 1, "S2 (beside) bank 0's K = 0 round beside bank 1's %u drafts committed its base alone "
+              "(%d; bank 1 kept %d): %s", pend, na[0], na[1], err);
+        const std::vector<uint8_t> st = ran ? qwen_bank_state(s, 0, A.len) : std::vector<uint8_t>();
+        if (s && s->qwen)
+            CHECK(ran && !st.empty() && st == plain_state,
+                  "S2 (beside) the K = 0 bank's recurrent state == the plain decode's, byte for byte (%zu bytes)",
+                  st.size());
+        const std::vector<std::vector<float>> got =
+            ran ? decode_after(s, 0, W, err, sizeof(err)) : std::vector<std::vector<float>>();
+        const int at = differ_at(got, plain);
+        CHECK(at == -1, "S2 (beside) the K = 0 bank's next-token logits and 4 decode steps == the plain twin's (first "
+              "difference at step %d): %s", at, err);
+        pulsar_spec_round_free(r[0]);
+        pulsar_spec_round_free(r[1]);
+        if (s) pulsar_session_free(s);
+    }
+    pulsar_tokens_free(&A);
+    pulsar_tokens_free(&B);
+}
+
 int GATE_ENTRY(int argc, char **argv) {
     n_fail = 0;
     if (argc < 2) { fprintf(stderr, "usage: %s <model> [prefill_chunk]\n", argv[0]); return 2; }
@@ -966,6 +1199,7 @@ int GATE_ENTRY(int argc, char **argv) {
     part_fused(e, W);
     part_fused_runs(e, W);
     part_spec_lookahead(e);
+    part_spec_zero_draft(e, W);
     gate_engine_close(e);
     printf(n_fail ? "SESSION-CONTRACT GATE FAIL (%d)\n" : "SESSION-CONTRACT GATE PASS\n", n_fail);
     return n_fail != 0;

@@ -28,7 +28,8 @@ srv_ms_per_round = 1000 x srv_tok_per_round / decode_tps: a round's wall price a
 stream, from the median stream's rate).
 
   scoreboard  the fixed L288 cell set against one engine: single code T0 / prose T0 / code T0.7 (median of --reps x
-           --tokens), then --streams-set (default 4,8) concurrent streams at T0 (--conc-tokens each).
+           --tokens) and edit T0 (1024 tokens: a quoted module re-stated with a rename), then --streams-set (default 4,8) concurrent streams at T0 (--conc-tokens each): one discarded
+           warm run, then --conc-reps (5) timed runs, quoted as their median [min-max] -- never a single run.
            tools/serve-bench/scoreboard.sh starts either engine (pulsar-server or TensorFold) and runs it plus
            TensorFold's own public client (tools/bench_openai.py); `serve_matrix.py table A.jsonl B.jsonl` compares.
 
@@ -60,7 +61,11 @@ PROMPTS = {
                      "Include type hints, docstrings, and a set of unittest test cases."),
     # A raw mid-document continuation (L271's losing workload: low MTP acceptance).
     "story": ("raw", None),
+    # L288: an edit / refactor -- the prompt quotes a ~165-line module (edit_fixture.txt) and the reply re-states most
+    # of it with small changes: the workload copy / prompt-lookup drafts are for (TensorFold #468).
+    "edit": ("chat", None),
 }
+EDIT_FILE = os.path.join(HERE, "edit_fixture.txt")
 
 CONC_TASKS = [
     "Write a Python LRU cache class with O(1) get and put, with type hints and unittest cases.",
@@ -82,6 +87,14 @@ def story_text():
         if marker in t:
             t = t.split(marker, 1)[1]
     return t
+
+
+def edit_prompt():
+    with open(EDIT_FILE, encoding="utf-8") as f:
+        src = f.read()
+    return ("Here is a Python module:\n\n```python\n" + src + "```\n\nRename the class `Inventory` to `Warehouse` and "
+            "the method `restock_plan` to `reorder_plan` everywhere, add type hints to every function and method "
+            "signature, and reply with the complete updated module in one code block and nothing else.")
 
 
 def story_prompt():
@@ -223,7 +236,7 @@ def emit(rec, out):
 def run_single(a):
     for name in a.prompts.split(","):
         kind, text = PROMPTS[name]
-        text = text if text is not None else story_prompt()
+        text = text if text is not None else edit_prompt() if name == "edit" else story_prompt()
         for temp in [float(t) for t in a.temps.split(",")]:
             request(a.port, kind, text, min(a.tokens, 64), temp, 1233, a.model)          # warm-up
             m0, lm = spec_counters(a.port), log_mark(a)
@@ -247,7 +260,8 @@ def run_conc(a):
         conc_cell(a, a.streams, temp, a.tokens)
 
 
-def conc_cell(a, n, temp, tokens):
+def conc_cell(a, n, temp, tokens, out=True):
+        """One concurrent run: its record (emitted when `out`)."""
         res = [None] * n
 
         def go(i):
@@ -273,7 +287,7 @@ def conc_cell(a, n, temp, tokens):
         agg = in_win / chunks_per_tok / (w1 - w0) if w1 > w0 else 0.0
         per = [one_stats(r)["decode_tps"] for r in res]
         per_med = statistics.median(p for p in per if p)
-        emit(round_price({"mode": "conc", "label": a.label, "streams": n, "temp": temp, "max_tokens": tokens,
+        rec = round_price({"mode": "conc", "label": a.label, "streams": n, "temp": temp, "max_tokens": tokens,
                           "tokens": [r["tokens"] for r in res],
                           "decode_tps": round(agg, 2),
                           "per_stream_tps": round(per_med, 2),
@@ -281,7 +295,26 @@ def conc_cell(a, n, temp, tokens):
                           "end_to_end_tps": round(sum(r["tokens"] for r in res) / (max(ends) - start), 2),
                           "tok_per_burst": round(statistics.median(one_stats(r)["tok_per_burst"] for r in res), 2),
                           "ttft_max_s": round(max(f - r["t0"] for f, r in zip(firsts, res)), 2),
-                          **(spec_delta(m0, m1) or log_spec(a, lm))}, per_med), a.out)
+                          **(spec_delta(m0, m1) or log_spec(a, lm))}, per_med)
+        if out:
+            emit(rec, a.out)
+        return rec
+
+
+def conc_repeated(a, n, temp, tokens):
+    """L288: a concurrent cell the scoreboard can quote -- one discarded warm run, then --conc-reps runs; ONE record
+    whose decode_tps is their median, with min / max and every run.  The first concurrent run after a warm-up (or an
+    idle stretch) measured ~12 % slow on every build (2026-10-13: 4 streams 150-153 then 170-174), so one run is not
+    a number."""
+    warm = conc_cell(a, n, temp, tokens, out=False)
+    runs = [conc_cell(a, n, temp, tokens, out=False) for _ in range(a.conc_reps)]
+    tps = [r["decode_tps"] for r in runs]
+    med = statistics.median(tps)
+    rec = dict(min(runs, key=lambda r: abs(r["decode_tps"] - med)))   # the median run's counters
+    rec.update({"decode_tps": round(med, 2), "decode_tps_min": round(min(tps), 2), "decode_tps_max": round(max(tps), 2),
+                "decode_tps_all": [round(x, 2) for x in tps], "decode_tps_warm_discarded": round(warm["decode_tps"], 2),
+                "reps": a.conc_reps})
+    emit(rec, a.out)
 
 
 def run_prefill(a):
@@ -302,17 +335,20 @@ def run_prefill(a):
                   "prefill_tps": round((pt or n) / ttft, 1) if ttft else None}, a.out)
 
 
-# The L288 scoreboard's single-stream cells (prompt, temperature); the concurrent cells run at T0.
-SCOREBOARD_SINGLE = [("code", 0.0), ("prose", 0.0), ("code", 0.7)]
+# The L288 scoreboard's single-stream cells (prompt, temperature, tokens -- None: --tokens); the concurrent cells run
+# at T0.  The edit cell runs 1024 tokens: its reply re-states the quoted module, and 512 would end inside the copy.
+SCOREBOARD_SINGLE = [("code", 0.0, None), ("prose", 0.0, None), ("code", 0.7, None), ("edit", 0.0, 1024)]
 
 
 def run_scoreboard(a):
-    for name, temp in SCOREBOARD_SINGLE:
+    for name, temp, tokens in SCOREBOARD_SINGLE:
         b = argparse.Namespace(**vars(a))
         b.prompts, b.temps = name, str(temp)
+        if tokens:
+            b.tokens = tokens
         run_single(b)
     for n in [int(x) for x in a.streams_set.split(",") if x]:
-        conc_cell(a, n, 0.0, a.conc_tokens)
+        conc_repeated(a, n, 0.0, a.conc_tokens)
 
 
 def run_table(a):
@@ -339,7 +375,8 @@ def run_table(a):
             d = by.get(l)
             t = (d.get("decode_tps_median", d.get("decode_tps")) if d else None)
             tps.append(t)
-            row.append(f"{t} ({d.get('srv_tok_per_round', '-')}, {d.get('srv_ms_per_round', '-')})" if d else "")
+            span = f" [{d['decode_tps_min']}-{d['decode_tps_max']}]" if d and "decode_tps_min" in d else ""
+            row.append(f"{t}{span} ({d.get('srv_tok_per_round', '-')}, {d.get('srv_ms_per_round', '-')})" if d else "")
         if two:
             row.append(f"{tps[0] / tps[1]:.3f}" if tps[0] and tps[1] else "")
         print(f"| {key} | " + " | ".join(row) + " |")
@@ -363,6 +400,8 @@ def main():
     p.add_argument("--server-log", help="TensorFold: its server's log, read for the per-request round counts")
     p.add_argument("--streams-set", default="4,8", help="scoreboard: the concurrent-stream cells")
     p.add_argument("--conc-tokens", type=int, default=256, help="scoreboard: tokens per concurrent stream")
+    p.add_argument("--conc-reps", type=int, default=5,
+                   help="scoreboard: timed runs of each concurrent cell (after one discarded warm run): median, min, max")
     a = p.parse_args()
     {"single": run_single, "conc": run_conc, "prefill": run_prefill, "scoreboard": run_scoreboard,
      "table": run_table}[a.mode](a)

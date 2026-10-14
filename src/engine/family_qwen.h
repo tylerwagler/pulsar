@@ -396,8 +396,10 @@ typedef enum {
     PULSAR_QWEN_OP_COUNT,
 } pulsar_qwen_op_id;
 
-/** L251 MTP: the draft depth the verify capture holds (a verify step is at most this + 1 rows). */
-#define PULSAR_QWEN_SPEC_DRAFT_MAX 6u
+/** L251 MTP: the draft depth the verify capture holds (a verify step is at most this + 1 rows).  L288 (2026-10-13):
+ *  15, the whole verify width (PULSAR_QWEN_SPEC_ROWS) -- a copy chain runs this deep; the MTP chain's own cap is the
+ *  drafter's depth (spec_qwen.cpp). */
+#define PULSAR_QWEN_SPEC_DRAFT_MAX 15u
 /** L272 P1 S4: the rows one verify step carries, every bank's run together -- the head's row cap, which is
  *  also the widest step whose kernels keep their decode-width arms (each row's logits the bytes a one-token
  *  decode gives).  The family's verify width (fused_heads_max, L284): the server's allocator fits N banks'

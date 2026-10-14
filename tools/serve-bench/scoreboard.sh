@@ -11,8 +11,9 @@
 #   flock -o ~/gpu.lock -c 'timeout 1800 tools/serve-bench/scoreboard.sh tensorfold /srv/models/tf-exl3-305 ~/sb tf'
 #   tools/serve-bench/serve_matrix.py table ~/sb/ours.jsonl ~/sb/tf.jsonl
 #
-# Cells (serve_matrix.py scoreboard, untraced): single code T0 / prose T0 / code T0.7 (median of 3 x 512 tokens),
-# 4 and 8 concurrent streams T0 (256 tokens each); each with tok/s, tokens/round and ms/round from the server's own
+# Cells (serve_matrix.py scoreboard, untraced): single code T0 / prose T0 / code T0.7 (median of 3 x 512 tokens), edit T0
+# (1024 tokens: a quoted ~165-line module re-stated with a rename -- the copy-draft workload),
+# 4 and 8 concurrent streams T0 (256 tokens each; one discarded warm run, then the median [min-max] of 5); each with tok/s, tokens/round and ms/round from the server's own
 # counters (pulsar /metrics, TensorFold's per-request "done ... rounds=" log lines).  Then TensorFold's public client
 # (tools/bench_openai.py of its tree, TF_BENCH; its two fixtures, 64 tokens, T1.0 and T0, REPS_PUB=10 runs) into
 # LABEL-pub.json, so both engines also compare with TensorFold's published table.  Never under nsys: tracing slows

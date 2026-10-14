@@ -2143,7 +2143,7 @@ void server::worker_batched_decode_quantum(session_slot **dec, int n, int quantu
  * (row_budget - n_live) is spent; survival is monotone within a
  * bank so each bank's admitted set is a prefix. The cost table (L117/L136)
  * stops admission once the best remaining candidate's survival is below thr
- * (= marginal row ms / live ms-per-token EMA): every remaining candidate is
+ * (= marginal row ms / the lane yield, pulsar_engine_spec_token_ms): every remaining candidate is
  * then <= it, and *thr_cut_rows counts the rows that cut left unadmitted (0
  * when the cut did not fire). */
 static int spec_alloc_rows(const float surv[][16], const uint32_t *npend, int n, int n_live,
@@ -2455,8 +2455,8 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n, int quantum_
              * sits on one plateau; a 30 ms positive control costs 12-19%).
              * No fit yet, or no EMA yet: no cut, the cap alone admits. */
             const pulsar_lane_cost cost = pulsar_engine_lane_cost(s->engine, PULSAR_LANE_SPEC);
-            const float thr = cost.valid && s->spec_ms_per_tok_ema > 1.0f ?
-                              (float)cost.row_us / (1000.0f * s->spec_ms_per_tok_ema) : 0.0f;
+            const float tok_ms = pulsar_engine_spec_token_ms(s->engine);   /* L288: the engine's, the drafter's too */
+            const float thr = cost.valid && tok_ms > 1.0f ? (float)cost.row_us / (1000.0f * tok_ms) : 0.0f;
             int thr_cut_rows = 0;
             const int bound = spec_alloc_rows(surv, npend, n, n_live, (int)heads_max - n_fin, thr,
                                               k_alloc, &thr_cut_rows);
@@ -2885,12 +2885,8 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n, int quantum_
                    c->bank, pulsar_session_bank_pos(pool, (uint32_t)c->bank), len, rv[k].rows, rv[k].rounds,
                    round_ix, rv[k].why ? "; last miss: " : "", rv[k].why ? rv[k].why : "");
     }
-    if (emitted_total > 0) {
-        const float ms_per_tok = (float)((server_now_sec() - quantum_t0) * 1e3 /
-                                         (double)emitted_total);
-        s->spec_ms_per_tok_ema = s->spec_ms_per_tok_ema <= 0.0f ?
-                ms_per_tok : 0.9f * s->spec_ms_per_tok_ema + 0.1f * ms_per_tok;
-    }
+    if (emitted_total > 0)
+        pulsar_engine_spec_yield_observe(s->engine, emitted_total, (server_now_sec() - quantum_t0) * 1e3);
     for (int i = 0; i < n; i++) {
         if (rounds[i]) pulsar_spec_round_free(rounds[i]);
         dec[i]->last_serviced_us = (uint64_t)(server_now_sec() * 1e6);
