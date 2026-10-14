@@ -349,6 +349,34 @@ static void section_gr(void) {
     const auto I1 = down(inj, S);
     CHECK(rc == 0 && memcmp(X1.data(), &X[(size_t)3 * H], H * 2) == 0 && memcmp(I1.data(), &I[3 * S], S * 4) == 0,
           "T = 1 row bit-identical to the T = %d batch's row (block input + inj)", T);
+    /* L288 C2: every decode width, across the up's 8-token tile (1..16 rows, one and two tiles): each row's block
+     * input and inj are the bytes it gets launched alone */
+    {
+        const int TW = 16;
+        const std::vector<uint16_t> sw = rnd_act(TW, HC, 0.8);
+        uint16_t *dsw = up(sw), *xw = (uint16_t *)dalloc((size_t)TW * H * 2), *x1 = (uint16_t *)dalloc((size_t)H * 2);
+        float *injw = (float *)dalloc((size_t)TW * S * 4), *inj1 = (float *)dalloc((size_t)S * 4);
+        const size_t wsw = pulsar_qwen_gr_workspace_bytes(TW);
+        void *ww = dalloc(wsw);
+        std::vector<std::vector<uint16_t>> X1(TW);
+        std::vector<std::vector<float>> I1(TW);
+        for (int t = 0; t < TW; t++) {
+            rc |= pulsar_qwen_gr_read_launch(&w, dsw + (size_t)t * HC, 1, x1, inj1, ww, wsw, 0);
+            X1[t] = down(x1, H);
+            I1[t] = down(inj1, S);
+        }
+        int bad = 0;
+        for (const int Tn : {2, 4, 5, 8, 9, 12, 16}) {
+            rc |= pulsar_qwen_gr_read_launch(&w, dsw, Tn, xw, injw, ww, wsw, 0);
+            const auto XW = down(xw, (size_t)Tn * H);
+            const auto IW = down(injw, (size_t)Tn * S);
+            for (int t = 0; t < Tn; t++)
+                bad += memcmp(&XW[(size_t)t * H], X1[t].data(), H * 2) != 0 || memcmp(&IW[(size_t)t * S], I1[t].data(), S * 4) != 0;
+        }
+        CHECK(rc == 0 && bad == 0, "decode widths 2..16 (the up's 8-token tile and two): every row bit-identical to the "
+              "row alone (%d rows differ)", bad);
+        cudaFree(dsw); cudaFree(xw); cudaFree(x1); cudaFree(injw); cudaFree(inj1); cudaFree(ww);
+    }
     /* prefill widths (T > 16): the up runs as the W8A16 GEMM (3'), graded against double like T = 6 */
     for (const int TP : {37, 300}) {
         const std::vector<uint16_t> sp = rnd_act(TP, HC, 0.8);
@@ -922,6 +950,18 @@ static void section_mxfp8_linear(void) {
                   "max |err|/sum|terms| %.2e (max rel %.2e at ref %.3e, sum|terms| %.3e; t=%d o=%d got %.6e)",
                   sh.in, sh.out, T, gemv ? "decode GEMV" : T <= 16 ? "decode rows kernel" : "prefill GEMM", worst_l1n,
                   worst, w_ref, w_l1, w_t, w_o, w_got);
+            if (gemv) {   /* L288 C2: one token a CTA -- each row is the bytes it gets alone */
+                int bad = 0;
+                float *y1 = (float *)dalloc((size_t)sh.out * 4);
+                for (int t = 0; t < T; t++) {
+                    bad += pulsar_qwen_mxfp8_linear_launch(&l, dx + (size_t)t * sh.in, 1, y1, nullptr, 0, 0) != 0;
+                    const auto Y1 = down(y1, (size_t)sh.out);
+                    bad += memcmp(Y1.data(), &Y[(size_t)t * sh.out], (size_t)sh.out * 4) != 0;
+                }
+                CHECK(bad == 0, "%d -> %d decode GEMV at T = %d: every row bit-identical to the row alone (%d differ)",
+                      sh.in, sh.out, T, bad);
+                cudaFree(y1);
+            }
         }
         /* a missing activation is refused, not mis-read.  The old negative control was a slot
          * declaring the wrong kbp; with a bf16 activation there is no slot width to get wrong, so
