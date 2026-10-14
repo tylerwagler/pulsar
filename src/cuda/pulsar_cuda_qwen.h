@@ -134,8 +134,9 @@ int pulsar_qwen_mtp_combine_launch(const pulsar_qwen_mtp_dev *w, const uint16_t 
 
 /** L289: one draft-head row's greedy pick and its confidence, reduced on the device so a draft step reads back
  *  this record instead of the row (263 KB) and the host no longer scans it.  L288: up to
- *  PULSAR_QWEN_DRAFT_TOP_ROWS_MAX rows a launch (every bank's draft row of a step), one record each. */
-#define PULSAR_QWEN_DRAFT_TOP_ROWS_MAX 16
+ *  PULSAR_QWEN_DRAFT_TOP_ROWS_MAX rows a launch (every bank's draft row of a step), one record each -- at least the
+ *  head's rows (static_assert in family_qwen_s4.cpp; L288 C1: 32, the shared verify width). */
+#define PULSAR_QWEN_DRAFT_TOP_ROWS_MAX 32
 typedef struct {
     int32_t index;      /**< the FIRST index of the row's maximum (a strict > scan from index 0) */
     float conf;         /**< (float)(1.0 / sum_i exp((double)(row[i] - row[index]))): its softmax probability */

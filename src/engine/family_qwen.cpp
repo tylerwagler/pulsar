@@ -1245,6 +1245,15 @@ bool qwen_forward(pulsar_session *s, pulsar_qwen_step_mode mode, const int32_t *
                 n_verify);
         return false;
     }
+    if (st.verify && n_verify > PULSAR_GPU_MNEUTRAL_ROWS_MAX) {
+        static bool announced = false;   /* rule 5: the wide verify says once that it ran */
+        if (!announced) {
+            announced = true;
+            fprintf(stderr, "pulsar: %s: L288 C1 wide verify ran: %u rows past the M-independent %u take the GEMM "
+                            "arms (graded, not byte-exact against one-token decode)\n", PULSAR_QWEN_ARCH, n_verify,
+                    PULSAR_GPU_MNEUTRAL_ROWS_MAX);
+        }
+    }
     /* L272 P1 S4 / L284 #2: a PREFILL step's rows as runs -- one bank each, consecutive positions, a bank in one
      * run.  The verify rows [0, n_verify) are one run a bank (every row headed); a run never crosses n_verify; the
      * rows after it are the fused step's prompt runs, at most PULSAR_FUSED_PF_MAX of them. */
@@ -1681,8 +1690,8 @@ static int qwen_session_decode_mixed(pulsar_session *s, const pulsar_multiseq_re
     if (max_head_runs == PULSAR_MSEQ_HEAD_ALL_ROWS) {
         /* L272 P1 S3/S4: the speculation lane's verify -- one run per bank, each [p, p + k] at its bank's next
          * position, every row headed into the caller's block, the per-row state capture armed (the target's
-         * commit rolls each bank's rejected rows back, pulsar_qwen_s4_spec_rollback).  At most SPEC_ROWS rows,
-         * so every kernel keeps its decode-width arm. */
+         * commit rolls each bank's rejected rows back, pulsar_qwen_s4_spec_rollback).  At most SPEC_ROWS rows;
+         * past the M-independent width the kernels take their GEMM arms (L288 C1, graded). */
         const uint32_t nv = g_qwen_shape.n_vocab;
         if (!reqs || n_rows == 0 || n_rows > PULSAR_QWEN_SPEC_ROWS || !logits || logits_cap < 0 ||
             (uint64_t)logits_cap < (uint64_t)n_rows * nv || !s->qwen->mtp) {

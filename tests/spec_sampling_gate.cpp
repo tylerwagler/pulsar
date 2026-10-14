@@ -456,7 +456,7 @@ int GATE_ENTRY(int argc, char **argv) {
     if (pulsar_session_create(&session, engine, ctx) != 0) { fprintf(stderr, "session failed\n"); goto done; }
     /* L278: the widths are the family's -- the plain arm one bank per trajectory up to the pool, the spec arm
      * SAMPLED_BANKS_SPEC banks at most SAMPLED_ROWS_MAX rows, which the family's verify width must hold (L284:
-     * pulsar_engine_fused_heads_max, DSpark 32, Qwen's MTP 16 -- the one authority the server's lane reads). */
+     * pulsar_engine_fused_heads_max, 32 on both families since L288 C1 -- the one authority the server's lane reads). */
     const int width_plain = pulsar_session_bank_count(session) < SAMPLED_BANKS_PLAIN
                           ? pulsar_session_bank_count(session) : SAMPLED_BANKS_PLAIN;
     const int width_spec = pulsar_session_bank_count(session) < SAMPLED_BANKS_SPEC

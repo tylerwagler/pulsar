@@ -7258,8 +7258,8 @@ static void l179_spec_alloc_rows_at(const int B) {
     TEST_ASSERT(3 + 10 < B);
 }
 
-/* L284: one allocator for both families, at each one's verify width (pulsar_engine_fused_heads_max: Qwen's 16-row
- * logits slab, DeepSeek's spec-logits block). */
+/* L284: one allocator for both families, at each one's verify width (pulsar_engine_fused_heads_max -- since L288 C1
+ * both families' PULSAR_SPEC_ROW_BUDGET; the 16-row case keeps a narrower width covered). */
 static void test_l179_spec_alloc_rows_isolation_and_ranked_overflow(void) {
     l179_spec_alloc_rows_at(16);
     l179_spec_alloc_rows_at((int)PULSAR_SPEC_LOGITS_ROWS);

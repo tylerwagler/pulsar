@@ -82,7 +82,7 @@ pulsar_spec_chain_price pulsar_spec_chain_price_for(const pulsar_session *s, uin
 
 uint32_t pulsar_spec_chain_step(const pulsar_spec_chain_price *p, const float *run, const uint32_t *ahead, uint32_t n,
                                 bool *go) {
-    uint32_t idx[64];   /* n is a round's chains: <= the verify width (16 on Qwen) */
+    uint32_t idx[64];   /* n is a round's chains: <= the verify width (32) */
     uint32_t k = 0;
     for (uint32_t i = 0; i < n; i++) {
         go[i] = false;

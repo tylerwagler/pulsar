@@ -1430,8 +1430,8 @@ static bool slot_is_batchable_decode(const session_slot *sl) {
  * (pulsar_engine_has_spec_rounds), every decoder speculates (spec_enabled: a
  * logprobs request does not), none sits in the plain multiseq batch, and the
  * decoders are no more than one shared verify forward carries, one base row each
- * (pulsar_engine_fused_heads_max, the family's verify width -- L284: DeepSeek 32,
- * Qwen 16; the allocator shortens the drafts to fit, spec_alloc_rows);
+ * (pulsar_engine_fused_heads_max, the family's verify width -- L284: DeepSeek 32;
+ * L288 C1: Qwen 32 too; the allocator shortens the drafts to fit, spec_alloc_rows);
  * the plain batched lane (2) otherwise; the classic lane (1) with no pool.  Lane 3
  * keeps the spec_decode counters advancing; lane 2 does not.  Where lane 3 COULD
  * carry every decoder (server_spec_lane_carries), whether it does is priced
@@ -1466,7 +1466,7 @@ static bool server_spec_lane_carries(bool spec_rounds, uint32_t verify_rows, ses
  * A prediction only ever starts a MEASUREMENT (a probe of the other lane); the decoders change lanes on
  * measured prices at their N.  A linear fit extrapolated past the rows it has seen was 15% off on DeepSeek at
  * N8 (spec priced 84 tok/s against the 99.5 it serves) and moved eight decoders to a slower plain lane.
- * No family constant enters: Qwen's 16-row and DeepSeek's 32-row widths, their drafters' acceptance and their
+ * No family constant enters: the families' verify widths, their drafters' acceptance and their
  * kernels' costs are all in the measured numbers.  (L284 specrows measured why it must be priced: Qwen's spec
  * lane at ~0.55 acceptance lost to plain at N >= 3, 64.6 vs 67.2 tok/s at N3 and 76.0 vs 91.1 at N6, where a
  * lone DeepSeek stream gains 11% from it.)
