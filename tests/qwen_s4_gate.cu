@@ -305,6 +305,7 @@ static pulsar_qwen_gr_dev dev_gr(const gr_host &g, bool with_inject) {
     w.down = {up(g.down_w.q), up(g.down_w.sf), R, HC};
     w.up = {up(g.up_w.q), up(g.up_w.sf), HC, R};
     w.inject = with_inject ? up(g.inject) : nullptr;
+    w.prompt = false;   /* decode rows; the prefill-width runs below set their own */
     return w;
 }
 
@@ -349,7 +350,11 @@ static void section_gr(void) {
     const auto I1 = down(inj, S);
     CHECK(rc == 0 && memcmp(X1.data(), &X[(size_t)3 * H], H * 2) == 0 && memcmp(I1.data(), &I[3 * S], S * 4) == 0,
           "T = 1 row bit-identical to the T = %d batch's row (block input + inj)", T);
-    /* prefill widths (T > 16): the up runs as the W8A16 GEMM (3'), graded against double like T = 6 */
+    /* prefill widths (a prompt chunk, T > 16): the up runs as the W8A16 GEMM (3'), graded against double like T = 6;
+     * L288 C1: the same rows as decode rows take the decode kernels, 16 rows a call -- the launch blocks them itself,
+     * so a T-row decode call is bit for bit the 16-row calls below */
+    pulsar_qwen_gr_dev wpf = w;
+    wpf.prompt = true;
     for (const int TP : {37, 300}) {
         const std::vector<uint16_t> sp = rnd_act(TP, HC, 0.8);
         uint16_t *dsp = up(sp), *xp = (uint16_t *)dalloc((size_t)TP * H * 2);
@@ -357,6 +362,8 @@ static void section_gr(void) {
         const size_t wsp = pulsar_qwen_gr_workspace_bytes(TP);
         void *wp = dalloc(wsp);
         rc = pulsar_qwen_gr_read_launch(&w, dsp, TP, xp, injp, wp, wsp, 0);
+        const auto XW = down(xp, (size_t)TP * H);   /* the whole call as decode rows */
+        rc |= pulsar_qwen_gr_read_launch(&wpf, dsp, TP, xp, injp, wp, wsp, 0);
         const auto XP = down(xp, (size_t)TP * H);
         const auto IP = down(injp, (size_t)TP * S);
         /* the same rows at decode widths (16, 16, 5), graded the same way */
@@ -396,6 +403,7 @@ static void section_gr(void) {
         CHECK(pd <= (size_t)(TP * H) / 1000 && wpd <= wd,
               "prefill vs decode widths on the same rows agree to rounding: %zu of %d differ, by at most %.2f ulp "
               "(<= the decode kernels' own worst vs double, %.2f)", pd, TP * H, wpd, wd);
+        CHECK(rc == 0 && XW == XD, "decode rows T = %d in one call bit-identical to the same rows 16 at a time", TP);
         cudaFree(dsp); cudaFree(xp); cudaFree(injp); cudaFree(wp);
     }
     /* the mixer: no inject */

@@ -19,8 +19,10 @@
  *      vs the double reference, max and median relative error (tolerance = f32
  *      accumulation order; the median proves the fixture is not degenerate);
  *   2. M = 1, 2, 4, 8 are BIT-IDENTICAL to the same rows of the M = 16 run (a
- *      row's bytes do not depend on the batch width -- the decode-row contract);
- *   3. prefill: M = 40 / 97 / 300 at several shapes -- the prefill GEMM (one fp16 operand plane):
+ *      row's bytes do not depend on the batch width -- the decode-row contract); L288 C1: so are DECODE rows past
+ *      16 (M = 17, 32 and the shape's widest: two row blocks in one GEMV, 32-row calls past it) -- every 16-row
+ *      block bit for bit a launch of those rows alone, and graded against the double reference;
+ *   3. prefill: prompt chunks of M = 40 / 97 / 300 at several shapes -- the prefill GEMM (one fp16 operand plane):
  *      every output within the fp16-operand envelope (exl3t_fp16_operand_bound) plus f32 order;
  *   4. mutations: one flipped trellis bit must move outputs, and a sign-flipped
  *      suh block must push the error far past the tolerance;
@@ -151,9 +153,10 @@ static void upload(const weight &w, const slot &s, int max_rows, dev &d) {
 }
 static void release(dev &d) { cudaFree(d.w); cudaFree(d.q); cudaFree(d.y); cudaFree(d.ws); d = dev(); }
 
-static int run(const dev &d, int k2, int M, int K, int N, std::vector<float> &y, bool prompt = false) {
+static int run(const dev &d, int k2, int M, int K, int N, std::vector<float> &y, bool prompt = false, int r0 = 0) {
     CUDA_OK(cudaMemset(d.y, 0xff, (size_t)M * N * sizeof(float)));      /* NaN canary: every output must be written */
-    const int rc = ds4_exl3_dense_launch(d.w, k2, d.q, d.y, M, K, N, d.ws, d.ws_bytes, 0, prompt);
+    /* r0: the call's rows start at activation row r0 (a block of a wider call, run alone) */
+    const int rc = ds4_exl3_dense_launch(d.w, k2, d.q + (size_t)r0 * K * 2, d.y, M, K, N, d.ws, d.ws_bytes, 0, prompt);
     if (rc) return rc;
     CUDA_OK(cudaDeviceSynchronize());
     y.resize((size_t)M * N);
@@ -211,12 +214,38 @@ int main(void) {
                    sh.what, K, N, k2 / 2, ds4_exl3_dense_splits(K, N), mx, med,
                    diff_m ? "DIFFER" : "bit-identical to M=16's rows");
 
-            if (max_rows > 16) {   /* every rate: the prefill GEMM instantiates each */
-                /* 3. prefill rows: row blocks of 16 (the last partial), and slabs of 128 */
-                rc = run(d, k2, max_rows, K, N, y);
+            if (max_rows > 16) {
+                /* 2b. L288 C1: decode rows past 16 -- every 16-row block of the call bit for bit those rows run alone
+                 * (rows 0..15 the M = 16 run's), every row graded against the double reference */
+                size_t diff_w = 0, blocks = 0;
+                double wmx = 0, wmed = 0;
+                std::vector<float> yb;
+                for (int Mw : {17, 32, max_rows}) {
+                    rc = run(d, k2, Mw, K, N, y);
+                    CHECK(rc == 0, "%s K=%d decode M=%d: launch rc=%d", sh.what, k2 / 2, Mw, rc);
+                    if (rc) continue;
+                    grade(y, yref, Mw, N, 0, &mx, &med);
+                    wmx = fmax(wmx, mx);
+                    wmed = med;
+                    CHECK(mx < tol, "%s K=%d decode M=%d: max rel %.3e (limit %.0e)", sh.what, k2 / 2, Mw, mx, tol);
+                    const std::vector<float> yw = y;
+                    for (int r0 = 0; r0 < Mw; r0 += 16) {
+                        const int m = Mw - r0 < 16 ? Mw - r0 : 16;
+                        rc = run(d, k2, m, K, N, yb, false, r0);
+                        CHECK(rc == 0, "%s K=%d decode rows %d..%d alone: launch rc=%d", sh.what, k2 / 2, r0, r0 + m - 1, rc);
+                        if (!rc) diff_w += memcmp(yb.data(), yw.data() + (size_t)r0 * N, yb.size() * sizeof(float)) != 0;
+                        blocks++;
+                    }
+                }
+                CHECK(diff_w == 0, "%s K=%d: %zu of %zu 16-row blocks of decode calls past 16 rows differ from those rows "
+                      "alone", sh.what, k2 / 2, diff_w, blocks);
+                printf("  decode M=17/32/%d: %zu row blocks bit-identical to their rows alone; max rel %.2e median %.2e\n",
+                       max_rows, blocks - diff_w, wmx, wmed);
+                /* 3. prefill rows: a prompt chunk, row blocks of 16 (the last partial), and slabs of 128 */
+                rc = run(d, k2, max_rows, K, N, y, true);
                 CHECK(rc == 0, "prefill M=%d launch rc=%d", max_rows, rc);
                 if (!rc) {
-                    /* M > 16 is the PREFILL GEMM (qwen_exl3_dense_prefill.cu, L251): it sums in its own
+                    /* a prompt chunk is the PREFILL GEMM (qwen_exl3_dense_prefill.cu, L251): it sums in its own
                      * order, so its rows agree with the decode GEMV to rounding, not to the bit -- every
                      * row is graded against the double reference instead, rows 0..15 included */
                     /* ...its operand is ONE fp16 plane (qwen_exl3_dense_prefill.cu), so each output is graded
