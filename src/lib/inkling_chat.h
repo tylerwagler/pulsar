@@ -108,3 +108,16 @@ bool inkling_chat_render(const inkling_render_in &in, inkling_render_out *out, c
  * inkling-chat-gate asserts the two lists are special_tokens_map.json's).  A turn after the generation
  * prompt's `<|message_model|>` starts in OUT_HEADER. */
 const out_grammar &inkling_output_grammar(void);
+
+/** The sampled-text parser for one Inkling assistant turn: the kit's parser in Inkling's configuration (its
+ * grammar and the shared JSON call body).  The family's server `create` builds one per decode attempt and
+ * hands it to parser_kit_start. */
+class inkling_output_parser : public out_parser {
+public:
+    /** `initial`: where the prompt left the turn -- OUT_HEADER after the generation prompt's
+     *  `<|message_model|>`. */
+    void init(out_state initial);
+
+private:
+    out_json_call_body body_;
+};

@@ -325,9 +325,8 @@ struct reading {
 /* Parse one sampled turn with the input cut at `cuts`, and check the events against the final reading: the
  * text deltas concatenate to it; each call's TOOL_ARGS fragments plus "}" are its arguments. */
 static reading run_parser(const std::string &out, const std::vector<size_t> &cuts) {
-    out_json_call_body body;
-    out_parser p;
-    p.init(&inkling_output_grammar(), &body, OUT_HEADER);
+    inkling_output_parser p;
+    p.init(OUT_HEADER);
     std::vector<out_event> ev;
     size_t at = 0;
     for (size_t c : cuts) {

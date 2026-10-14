@@ -309,3 +309,5 @@ const out_grammar &inkling_output_grammar(void) {
     };
     return g;
 }
+
+void inkling_output_parser::init(out_state initial) { out_parser::init(&inkling_output_grammar(), &body_, initial); }
