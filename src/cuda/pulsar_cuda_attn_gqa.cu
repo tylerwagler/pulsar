@@ -27,6 +27,7 @@
 #include <algorithm>
 #include <math.h>
 #include <stdio.h>
+#include <string.h>
 #include <vector>
 
 namespace {
@@ -262,18 +263,29 @@ __global__ void __launch_bounds__(128) gqa_attn_kernel(const gqa_args a) {
             if (x0 > RL.pos) break;
             if (x0 + GQA_SPLIT <= R0.lo) continue;
             __syncthreads();                       /* the previous split is done with ks / vs / bs */
-            for (uint32_t i = tid; i < GQA_SPLIT * V8; i += blockDim.x) {
-                const uint32_t t = i / V8, part = i % V8, x = x0 + t;
-                uint4 kv = make_uint4(0u, 0u, 0u, 0u), vv = kv;
-                if (x >= R0.lo && x <= RL.pos) {
-                    const uint8_t *rec = x >= R0.p0
-                            ? a.fresh + (uint64_t)(R0.fresh0 + (x - R0.p0)) * a.token_bytes
-                            : R0.cache + (uint64_t)(R0.ring ? x % R0.cap : x) * a.token_bytes;
-                    kv = *reinterpret_cast<const uint4 *>(rec + koff + part * 16u);
-                    vv = *reinterpret_cast<const uint4 *>(rec + voff + part * 16u);
+            /* the K tile, then the V tile: each thread's LPT 16-byte loads all issued before its stores */
+            #pragma unroll
+            for (uint32_t kvh = 0; kvh < 2u; kvh++) {
+                constexpr uint32_t LPT = GQA_SPLIT * V8 / 128u;
+                const uint32_t off = kvh ? voff : koff;
+                __nv_bfloat16 *dst = kvh ? vs : ks;
+                uint4 ld[LPT];
+                #pragma unroll
+                for (uint32_t it = 0; it < LPT; it++) {
+                    const uint32_t i = tid + 128u * it, t = i / V8, part = i % V8, x = x0 + t;
+                    ld[it] = make_uint4(0u, 0u, 0u, 0u);
+                    if (x >= R0.lo && x <= RL.pos) {
+                        const uint8_t *rec = x >= R0.p0
+                                ? a.fresh + (uint64_t)(R0.fresh0 + (x - R0.p0)) * a.token_bytes
+                                : R0.cache + (uint64_t)(R0.ring ? x % R0.cap : x) * a.token_bytes;
+                        ld[it] = *reinterpret_cast<const uint4 *>(rec + off + part * 16u);
+                    }
                 }
-                *reinterpret_cast<uint4 *>(&ks[t * P + part * 8u]) = kv;
-                *reinterpret_cast<uint4 *>(&vs[t * P + part * 8u]) = vv;
+                #pragma unroll
+                for (uint32_t it = 0; it < LPT; it++) {
+                    const uint32_t i = tid + 128u * it, t = i / V8, part = i % V8;
+                    *reinterpret_cast<uint4 *>(&dst[t * P + part * 8u]) = ld[it];
+                }
             }
             __syncthreads();
             if (!warp_live) continue;
@@ -678,10 +690,15 @@ int pulsar_gqa_forward(const pulsar_gqa_layer *L, const pulsar_gqa_seq *seqs, ui
                 fold ? "chunks folded in the CTA" : "chunks in parallel + combine");
     }
 
-    if (cudaMemcpyAsync(ws.rows, h_rows.data(), (uint64_t)n_rows * sizeof(gqa_row), cudaMemcpyHostToDevice, st) != cudaSuccess ||
-        cudaMemcpyAsync(ws.tiles, h_tiles.data(), (uint64_t)n_tiles * sizeof(gqa_tile), cudaMemcpyHostToDevice, st) != cudaSuccess) {
-        fprintf(stderr, "pulsar: gqa attention: descriptor upload failed\n");
-        return -3;
+    {   /* rows and tiles are adjacent in the workspace: one upload, staged in their workspace layout */
+        const uint64_t toff = (uint64_t)((uint8_t *)ws.tiles - (uint8_t *)ws.rows);
+        std::vector<uint8_t> stage(toff + (uint64_t)n_tiles * sizeof(gqa_tile));
+        memcpy(stage.data(), h_rows.data(), (uint64_t)n_rows * sizeof(gqa_row));
+        memcpy(stage.data() + toff, h_tiles.data(), (uint64_t)n_tiles * sizeof(gqa_tile));
+        if (cudaMemcpyAsync(ws.rows, stage.data(), stage.size(), cudaMemcpyHostToDevice, st) != cudaSuccess) {
+            fprintf(stderr, "pulsar: gqa attention: descriptor upload failed\n");
+            return -3;
+        }
     }
 
     gqa_prep_args pa{};
