@@ -318,6 +318,16 @@ bool pulsar_engine_has_fused_step(const pulsar_engine *e) { return e && e->famil
 uint32_t pulsar_engine_fused_heads_max(const pulsar_engine *e) {
     return pulsar_engine_has_fused_step(e) ? e->family->session->fused_heads_max : 0u;
 }
+bool pulsar_engine_set_spec_width(pulsar_engine *e, uint32_t width) {
+    if (!e || e->tp) return false;
+    const uint32_t max = pulsar_engine_fused_heads_max(e);
+    e->spec_width = width == 0 || width > max ? 0u : width;
+    return true;
+}
+uint32_t pulsar_engine_spec_width(const pulsar_engine *e) {
+    const uint32_t max = pulsar_engine_fused_heads_max(e);
+    return e && e->spec_width > 0 && e->spec_width < max ? e->spec_width : max;
+}
 bool pulsar_engine_has_mixed_prefill(const pulsar_engine *e) {
     return e && (e->family->caps & PULSAR_FAMILY_CAP_MIXED_PREFILL) != 0;
 }

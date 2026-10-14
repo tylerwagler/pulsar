@@ -59,7 +59,7 @@ pulsar_spec_chain_price pulsar_spec_chain_price_for(const pulsar_session *s, uin
     const pulsar_engine *e = s->engine;
     pulsar_spec_chain_price p;
     memset(&p, 0, sizeof p);
-    const uint32_t width = pulsar_engine_fused_heads_max(e);
+    const uint32_t width = pulsar_engine_spec_width(e);   /* L288 C1: the width in force */
     p.budget = width > chains ? width - chains : 0u;
     if (e->tp || chains == 0u || !(e->spec_token_ms > 0.0f)) return p;
     const pulsar_lane_cost row = lane_cost_fit_view(&e->lane_cost[PULSAR_LANE_SPEC]);
@@ -204,7 +204,7 @@ void pulsar_spec_draft_req_init(pulsar_session *s, spec_redraft_req *q, int next
     const pulsar_drafter_ops *d = spec_drafter(s);
     const float c = pulsar_spec_copy_conf(s);
     if (pulsar_spec_conf_stops(c, pulsar_spec_tau(s->engine))) return;
-    const uint32_t width = pulsar_engine_fused_heads_max(s->engine);
+    const uint32_t width = pulsar_engine_spec_width(s->engine);
     const int room = s->ctx() - (int)s->checkpoint.len - 1;
     uint32_t cap = d && width > 1u ? (d->depth_max < width - 1u ? d->depth_max : width - 1u) : 0u;
     if (cap > 16u) cap = 16u;

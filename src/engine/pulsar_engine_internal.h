@@ -1912,6 +1912,9 @@ struct pulsar_engine {
      * SPEC_ROUND_END_BATCH; the spec lane's is read by the quench guard and the allocator, both by
      * the server's lane choice. */
     pulsar_lane_cost_fit lane_cost[PULSAR_LANE_COUNT];
+    /** L288 C1: the verify width in force (pulsar_engine_set_spec_width; 0 = fused_heads_max) -- what the drafter
+     *  budgets a round's chains against. */
+    uint32_t spec_width;
     /** L288 (tf-gap pass 2): a drafter's lockstep step, measured the same way -- its wall on the chains it
      * carried (one row a chain), fed by a drafter that drafts token by token (the MTP chain) off TP.  What one
      * more draft costs beside its verify row (pulsar_spec_chain_price). */
