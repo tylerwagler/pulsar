@@ -106,15 +106,17 @@ typedef struct { int id; long a, b; } bucket;
 
 /* L160: banks per forward in the sampled arm.  Plain trajectories are one row
  * each; speculative ones are 1 + K rows with K trimmed to max_tokens - 1 <=
- * DEPTH - 1 by round_begin, so 4 banks are at most 16 rows.  16 is the
- * ALL_ROWS head cap. */
+ * DEPTH - 1 by round_begin, so 4 banks are at most 16 rows.  L288 C1: the
+ * wide build (make cuda-spec-sampling-gate-wide, SAMPLED_BANKS_SPEC=8) runs
+ * the spec arm at 8 banks, up to 32 rows -- the shared verify width, past the
+ * M-independent 16 -- so the oracle grades the wide verify's arms. */
 #ifndef SAMPLED_BANKS_PLAIN
 #define SAMPLED_BANKS_PLAIN 16
 #endif
 #ifndef SAMPLED_BANKS_SPEC
 #define SAMPLED_BANKS_SPEC  4
 #endif
-#define SAMPLED_ROWS_MAX    16
+#define SAMPLED_ROWS_MAX    (SAMPLED_BANKS_SPEC * DEPTH)
 
 /* The state every trajectory starts from (L278: family-generic).  A family with snapshots
  * (pulsar_engine_has_snapshots) loads the one taken after the prompt's sync; one without re-syncs the prompt
@@ -504,9 +506,9 @@ int GATE_ENTRY(int argc, char **argv) {
         printf("trajectories: %d of the %d asked (no snapshots: each reset is a prefill)\n", reduced, traj);
         traj = reduced;
     }
-    printf("start state: %s; widths: plain %d, spec %d banks per forward\n",
+    printf("start state: %s; widths: plain %d, spec %d banks per forward (at most %d rows)\n",
            snapshots ? "a session snapshot" : "the prompt re-synced (the family has no snapshots)",
-           width_plain, width_spec);
+           width_plain, width_spec, SAMPLED_ROWS_MAX);
     /* Mode 0 stays PLAIN DECODE by default: spec-vs-plain is the question a
      * reader of this gate actually has, and the 1-row batch arm below buys no
      * hard gate (measured -- see gate_step_batched). Set
