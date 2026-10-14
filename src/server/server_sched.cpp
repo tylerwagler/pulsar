@@ -1921,6 +1921,15 @@ static void park_live_bank(server *s, session_slot **dec, int n, const session_s
     pulsar_session_bank_state_save(s->sess, (uint32_t)s->live_bank);
 }
 
+/* L293: the request's token budget is spent (or the server is stopping).  The ONE check every site that commits a
+ * decode token reads first: the plain and mixed lanes' steps, the spec lane's round assembly (whose round_begin then
+ * caps the accepted run at the remaining budget), and a decoder leaving the plain batch for the spec lane.  The leave
+ * committed the batch's sampled token without it: a plain quantum whose last step emitted the budget's last token
+ * left the slot in GEN_DECODE with the next token sampled, and a switch to the spec lane emitted it -- 65 for 64. */
+static bool gen_budget_spent(const gen_state *g) {
+    return g_stop_requested || g->completion >= g->max_tokens;
+}
+
 /* L118 per-quantum client-liveness poll, shared by the three batched lanes
  * (L179 branch 13). A slot is abandoned iff it is mid-decode (GEN_DECODE),
  * its client is gone and -- on the lanes that ask for it -- its batch_feed is
@@ -2036,7 +2045,7 @@ void server::worker_batched_decode_quantum(session_slot **dec, int n, int quantu
             session_slot *sl = dec[i];
             gen_state *g = sl->gen;
             if (!g->batch_feed_valid) continue;            /* already stopped */
-            if (g_stop_requested || g->completion >= g->max_tokens) {
+            if (gen_budget_spent(g)) {
                 g->batch_feed_valid = false; g->phase = GEN_FINISH; continue;
             }
             if (g->batch_feed_pos >= pulsar_session_ctx(pool)) {
@@ -2472,7 +2481,7 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n, int quantum_
             session_slot *sl = dec[i];
             gen_state *g = sl->gen;
             if (!g || g->phase != GEN_DECODE) continue;
-            if (g_stop_requested || g->completion >= g->max_tokens) {
+            if (gen_budget_spent(g)) {
                 if (g->completion >= g->max_tokens && !g->finish) g->finish = "length";
                 g->phase = GEN_FINISH;
                 continue;
@@ -2914,6 +2923,13 @@ bool server::batch_leave(session_slot *sl) {
     pulsar_tokens_free(&g->batch_pending);
     g->batch_active = false;
     if (!g->batch_feed_valid) return true;
+    /* L293: the budget is read before the commit, as the batch's next step would have: a spent budget drops the
+     * sampled token (never committed, never emitted) and finishes the slot -- truncate the run, never the stream */
+    if (gen_budget_spent(g)) {
+        g->batch_feed_valid = false;
+        g->phase = GEN_FINISH;
+        return true;
+    }
     /* the token the batch sampled (its logprob already captured) is committed here as the batch's next
      * step would have: fed, counted, emitted -- so the session's logits are fresh for the family's
      * generate, which draws the token after it */
@@ -3130,7 +3146,7 @@ void server::worker_mixed_batch_quantum(session_slot **dec, int n, session_slot 
             session_slot *sl = dec[i];
             gen_state *g = sl->gen;
             if (!g->batch_feed_valid) continue;
-            if (g_stop_requested || g->completion >= g->max_tokens) {
+            if (gen_budget_spent(g)) {
                 g->batch_feed_valid = false; g->phase = GEN_FINISH; continue;
             }
             if (g->batch_feed_pos >= pulsar_session_ctx(pool)) {
