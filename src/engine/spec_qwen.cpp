@@ -20,8 +20,8 @@
  *            under tau), that draft still verified.  Sampled drafts are draws from the MTP's q, recorded for
  *            the core's accept walk.
  *
- * L272 P1 S4: the batched lane verifies several banks in one step (one run each through decode_mixed,
- * every kernel at its decode-width arm while the step stays within PULSAR_QWEN_SPEC_ROWS); each bank's
+ * L272 P1 S4: the batched lane verifies several banks in one step (one run each through decode_mixed, every kernel
+ * at its decode arm up to PULSAR_QWEN_SPEC_ROWS rows -- L288 C1: 32, in 16-row blocks past 16); each bank's
  * commit rolls its own run back.  L288: the absorb of every bank's kept rows is one MTP step (decode rows), and
  * the draft chains of every bank run in lockstep -- one MTP step a position for all of them, the draft head once
  * a step, not once a bank.  L284: any number of banks -- the server's allocator fits their drafts to the step's

@@ -45,6 +45,8 @@ typedef struct CUstream_st *cudaStream_t;
 #include <stddef.h>
 #include <stdint.h>
 
+#include "pulsar_gpu.h"   /* PULSAR_GPU_MNEUTRAL_ROWS_MAX */
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -108,7 +110,8 @@ typedef struct pulsar_rows_linear {
     int in, out;
     /** L266: a PROMPT chunk (a prefill step, not a verify): the prefill GEMM at every row count, so a
      *  prompt cut anywhere is byte-identical to one prefilled whole (session_contract_gate C1).
-     *  false: decode widths (<= 16 rows) take the GEMV, wider ones the GEMM. */
+     *  false: decode rows -- the decode arms at every width, in blocks of PULSAR_QWEN_DECODE_ROWS_MAX past it
+     *  (L288 C1), so a row's bytes never depend on how many ride with it. */
     bool prompt;
 } pulsar_rows_linear;
 
@@ -134,8 +137,9 @@ int pulsar_qwen_mtp_combine_launch(const pulsar_qwen_mtp_dev *w, const uint16_t 
 
 /** L289: one draft-head row's greedy pick and its confidence, reduced on the device so a draft step reads back
  *  this record instead of the row (263 KB) and the host no longer scans it.  L288: up to
- *  PULSAR_QWEN_DRAFT_TOP_ROWS_MAX rows a launch (every bank's draft row of a step), one record each. */
-#define PULSAR_QWEN_DRAFT_TOP_ROWS_MAX 16
+ *  PULSAR_QWEN_DRAFT_TOP_ROWS_MAX rows a launch (every bank's draft row of a step), one record each -- at least the
+ *  head's rows (static_assert in family_qwen_s4.cpp; L288 C1: 32, the shared verify width). */
+#define PULSAR_QWEN_DRAFT_TOP_ROWS_MAX 32
 typedef struct {
     int32_t index;      /**< the FIRST index of the row's maximum (a strict > scan from index 0) */
     float conf;         /**< (float)(1.0 / sum_i exp((double)(row[i] - row[index]))): its softmax probability */
@@ -149,6 +153,11 @@ size_t pulsar_qwen_draft_top_ws_bytes(void);
  *  with the f32 difference the host rule takes, so the f32 confidence is the host rule's value; a row's record does
  *  not depend on the rows beside it.  n_rows 1 .. PULSAR_QWEN_DRAFT_TOP_ROWS_MAX.  0 on success. */
 int pulsar_qwen_draft_top_launch(const float *rows, int n, int n_rows, void *ws, cudaStream_t stream);
+
+/** The widest call the W8A16 decode arms take (the rows kernel's two n8 token tiles, the GEMV's staging) -- the
+ *  M-independent width: decode rows past it go through the front door (pulsar_rows_linear_launch) and the GR read in
+ *  calls of at most this many, each row the bytes a one-row decode gives (L288 C1). */
+#define PULSAR_QWEN_DECODE_ROWS_MAX ((int)PULSAR_GPU_MNEUTRAL_ROWS_MAX)
 
 /** A plain MXFP8 dense Linear: y [rows][out] f32 = W x, W stored mxfp8_lt
  *  ([out][in] E4M3 then the swizzled E8M0 plane) and x the block input's bf16 row
@@ -305,7 +314,8 @@ size_t pulsar_qwen_gr_workspace_bytes(int T);
  *  silu(W_down xn / 4)) (.) xn) -> x_bf16 [T][2560] and, when `x` is given,
  *  its E4M3 slot (the mixer before the bf16 head has no A8 consumer and
  *  passes NULL); when the site has a write, inj [T][4] = 2 sigmoid(W_inj xn / 4).
- *  streams bf16 [T][4][2560]. */
+ *  streams bf16 [T][4][2560].  Decode rows (w->prompt false) past PULSAR_QWEN_DECODE_ROWS_MAX run in blocks of
+ *  that many, each the decode arm's bytes (L288 C1). */
 /* L251 / ac69748f: x_bf16 only.  The read emits bf16 inside and out -- there is no E4M3 activation
  * slot in this family for it to fill. */
 int pulsar_qwen_gr_read_launch(const pulsar_qwen_gr_dev *w, const uint16_t *streams, int T,

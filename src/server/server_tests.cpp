@@ -7258,8 +7258,58 @@ static void l179_spec_alloc_rows_at(const int B) {
     TEST_ASSERT(3 + 10 < B);
 }
 
-/* L284: one allocator for both families, at each one's verify width (pulsar_engine_fused_heads_max: Qwen's 16-row
- * logits slab, DeepSeek's spec-logits block). */
+/* L288 C1: the verify width, measured per decoder count (width_price_pick).  One decoder, or a count the decode block
+ * holds base rows for, has no choice.  At 4 decoders: the whole width (in force at the start) is measured first, then
+ * the block is probed for LANE_PRICE_PROBE_STEPS rounds, and the faster by the margin holds -- here the block (the
+ * 4-stream case: 16 rows cheaper than 17-20 for what they return); the whole width is re-measured after
+ * LANE_PRICE_REPROBE_STEPS rounds at that count, and wins back when it has become the faster.  Another count keeps
+ * its own measurements (8 decoders: the whole width holds). */
+static void test_l288_width_price_pick(void) {
+    width_price wp;
+    memset(&wp, 0, sizeof wp);
+    TEST_ASSERT(width_price_pick(&wp, 1, 16u, 32u) == 32u);
+    TEST_ASSERT(width_price_pick(&wp, 16, 16u, 32u) == 32u);
+    TEST_ASSERT(width_price_pick(&wp, 4, 16u, 16u) == 16u);
+    /* 4 decoders: the whole width first, measured: 14 tokens in 80 ms a round (175 tok/s) */
+    for (uint32_t i = 0; i < LANE_PRICE_PROBE_STEPS; i++) {
+        TEST_ASSERT(width_price_pick(&wp, 4, 16u, 32u) == 32u);
+        width_price_observe(&wp, 4, true, 14, 80.0);
+    }
+    /* then the block probed: 13.5 tokens in 70 ms (193 tok/s) */
+    for (uint32_t i = 0; i < LANE_PRICE_PROBE_STEPS; i++) {
+        TEST_ASSERT(width_price_pick(&wp, 4, 16u, 32u) == 16u && wp.probe[4] == 0);
+        width_price_observe(&wp, 4, false, 13, 70.0);
+    }
+    TEST_ASSERT(width_price_pick(&wp, 4, 16u, 32u) == 16u && wp.force[4] == 0 && wp.probe[4] == -1);
+    /* 8 decoders meanwhile: their own count, the whole width measured and holding against a slower block */
+    for (uint32_t i = 0; i < LANE_PRICE_PROBE_STEPS; i++) {
+        TEST_ASSERT(width_price_pick(&wp, 8, 16u, 32u) == 32u);
+        width_price_observe(&wp, 8, true, 27, 135.0);
+    }
+    for (uint32_t i = 0; i < LANE_PRICE_PROBE_STEPS; i++) {
+        TEST_ASSERT(width_price_pick(&wp, 8, 16u, 32u) == 16u);
+        width_price_observe(&wp, 8, false, 23, 125.0);
+    }
+    TEST_ASSERT(width_price_pick(&wp, 8, 16u, 32u) == 32u && wp.force[8] == 1);
+    TEST_ASSERT(wp.force[4] == 0);   /* untouched by the other count */
+    /* back at 4: the block holds until the re-measure, which finds the whole width faster now (15 in 70 ms) */
+    for (uint32_t i = 0; i + 1 < LANE_PRICE_REPROBE_STEPS; i++) {
+        TEST_ASSERT(width_price_pick(&wp, 4, 16u, 32u) == 16u);
+        width_price_observe(&wp, 4, false, 13, 70.0);
+    }
+    TEST_ASSERT(width_price_pick(&wp, 4, 16u, 32u) == 16u);
+    width_price_observe(&wp, 4, false, 13, 70.0);
+    TEST_ASSERT(width_price_pick(&wp, 4, 16u, 32u) == 32u && wp.probe[4] == 1);
+    width_price_observe(&wp, 4, true, 15, 70.0);
+    for (uint32_t i = 1; i < LANE_PRICE_PROBE_STEPS; i++) {
+        TEST_ASSERT(width_price_pick(&wp, 4, 16u, 32u) == 32u);
+        width_price_observe(&wp, 4, true, 15, 70.0);
+    }
+    TEST_ASSERT(width_price_pick(&wp, 4, 16u, 32u) == 32u && wp.force[4] == 1 && wp.probe[4] == -1);
+}
+
+/* L284: one allocator for both families, at each one's verify width (pulsar_engine_fused_heads_max -- since L288 C1
+ * both families' PULSAR_SPEC_ROW_BUDGET; the 16-row case keeps a narrower width covered). */
 static void test_l179_spec_alloc_rows_isolation_and_ranked_overflow(void) {
     l179_spec_alloc_rows_at(16);
     l179_spec_alloc_rows_at((int)PULSAR_SPEC_LOGITS_ROWS);
@@ -8841,6 +8891,7 @@ static void pulsar_server_unit_tests_run(void) {
     test_l284_lane_price_pick();
     test_l289_lane_reprobe_evidence();
     test_l179_spec_alloc_rows_isolation_and_ranked_overflow();
+    test_l288_width_price_pick();
     test_l179_lane_abandon_needs_decode_and_hangup();
     test_l190_mem_floor_warn_is_rate_limited();
     test_l184_every_consumer_loops_the_syntax_table();

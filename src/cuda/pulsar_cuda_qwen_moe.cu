@@ -303,7 +303,16 @@ extern "C" int pulsar_rows_linear_launch(const pulsar_rows_linear *l, const uint
             return -1;
         }
         const pulsar_qwen_lowrank lr{l->w, l->sf, l->out, l->in, l->prompt};
-        return pulsar_qwen_mxfp8_linear_launch(&lr, x_bf16, rows, y, ws, ws_bytes, stream);
+        /* L288 C1: decode rows past the decode arm's width (a wide verify, its head) in blocks of that width -- each
+         * row the bytes a one-row decode gives at any width (the EXL3 tier blocks inside its own launch) */
+        const int blk = l->prompt ? rows : PULSAR_QWEN_DECODE_ROWS_MAX;
+        for (int r0 = 0; r0 < rows; r0 += blk) {
+            const int m = rows - r0 < blk ? rows - r0 : blk;
+            const int rc = pulsar_qwen_mxfp8_linear_launch(&lr, x_bf16 + (size_t)r0 * l->in, m, y + (size_t)r0 * l->out,
+                                                           ws, ws_bytes, stream);
+            if (rc) return rc;
+        }
+        return 0;
     }
     return ds4_exl3_dense_launch(l->w, l->k2, x_bf16, y, rows, l->in, l->out, ws, ws_bytes, stream, l->prompt);
 }
