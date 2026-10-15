@@ -701,6 +701,15 @@ typedef struct {
      * the overlay file's mapping instead of the owning model's map. */
     const uint8_t *ext_map;
     uint64_t ext_size;   ///< size of that overlay mapping, for the bounds check
+    /** L295 E1: the builder's BIND RECORD for this entry -- its pulsar.tensors / pulsar.experts `role`, `block`,
+     *  `layer` and `index` -- what a role-driven binder (role_bind.h) binds by instead of the name.  Each part is
+     *  absent (empty / has_* false) when the record does not carry it: DeepSeek's and Qwen's containers write none
+     *  (their binders go by name; Qwen's expert records carry a layer and block, unread). */
+    pulsar_str bind_role;
+    pulsar_str bind_block;
+    int32_t bind_layer;   ///< valid when has_bind_layer
+    int32_t bind_index;   ///< valid when has_bind_index
+    bool has_bind_layer, has_bind_index;
 } pulsar_tensor;
 
 /** A memory-mapped GGUF file plus its parsed directory.
@@ -1896,6 +1905,10 @@ struct pulsar_engine {
     /** L295 F3: the family's state declaration (state_kinds.h), built by family->load for a family whose sessions
      *  keep declared state (pulsar_session::states); unused (n_decl 0) on DeepSeek. */
     pulsar_state_plan state_plan;
+    /** L295 E1: the loaded family's own state, opaque to the core -- built by family->load, released by
+     *  family->unload at destroy (the plugin contract's opaque family state; DeepSeek and Qwen still keep typed
+     *  members below).  NULL = the family keeps none here. */
+    void *family_state;
     /** The Qwen4-exp family's bound weights; NULL on a DeepSeek engine. */
     pulsar_qwen_weights *qwen_weights;
     /** L284 P15: the Qwen importance-matrix collection's observer while one runs (imatrix_qwen.cpp), else NULL --

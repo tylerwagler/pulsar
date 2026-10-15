@@ -146,7 +146,8 @@ typedef struct pulsar_driver_ops {
     /** tokens -> the step's slots */
     bool (*embed)(const pulsar_driver_step *st);
     /** ONE block op per layer kind, indexed by pulsar_layer_kind (NULL = the family has no such layer: a plan that
-     *  holds one is refused at create) */
+     *  holds one is refused at create).  The plan's kind[il] is the only dispatch key; block[PULSAR_LAYER_BLOCKS]
+     *  composes layer il from the plan's desc[il] (family.h pulsar_layer_desc) -- one layer description, the plan. */
     pulsar_block_fn block[PULSAR_LAYER_KIND_COUNT];
     /** Step rows [row0, row0 + n) -> logits rows [out0, out0 + n) of the driver's slab, out0 + n <=
      *  PULSAR_DRIVER_HEADS_MAX.  Called once per span of the head list (consecutive rows of one row kind). */

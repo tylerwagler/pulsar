@@ -607,6 +607,16 @@ int pulsar_engine::open(pulsar_engine **out, const pulsar_engine_options *opt) {
         *out = NULL;
         return 1;
     }
+    {
+        uint32_t at = 0;
+        if (const char *bad = pulsar_layer_plan_check(&e->plan, &at)) {   /* L295: the one layer description, asserted */
+            fprintf(stderr, "pulsar: %s: the layer plan is malformed at layer %u: %s -- refusing\n", e->family->name,
+                    at, bad);
+            e->destroy();
+            *out = NULL;
+            return 1;
+        }
+    }
     fprintf(stderr, "pulsar: model family %s (%s): %u layers\n",
             e->family->name, e->family->arch, e->plan.n_layer);
 
@@ -859,7 +869,13 @@ void pulsar_engine::summary() {
 int pulsar_engine::vocab_size() {
     auto *e = this;
     if (!e) return 0;
-    /* the tokenizer TABLE length: the family's tokenizer says (L272 B3, L295 F5) */
+    /* the tokenizer TABLE length: the family's tokenizer says (L272 B3, L295 F5).  A family with no tokenizer (Inkling
+     * until E6) has no table: refused by name, 0 as for no engine -- never a stand-in length (rule 9). */
+    if (!e->family->tokenizer) {
+        fprintf(stderr, "pulsar: %s: pulsar_engine_vocab_size: the family has no tokenizer table -- refusing\n",
+                e->family->name);
+        return 0;
+    }
     return e->family->tokenizer->n_tokens(e);
 }
 
@@ -972,6 +988,7 @@ void pulsar_engine::destroy() {
         e->tp_bulk_dev = NULL;
         e->tp_bulk_bytes = 0;
     }
+    if (e->family && e->family->unload) e->family->unload(e);   /* L295: the family's opaque state */
     engram_model_free(&e->weights);
     weights_free(&e->weights);
     pulsar_tp_plan_free(e);   /* the rank's built slices, before the device goes */
