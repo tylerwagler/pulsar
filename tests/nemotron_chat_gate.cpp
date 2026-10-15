@@ -266,7 +266,6 @@ static void r2_corpus(const bpe_tokenizer *t, const std::string &dir, const std:
             ncmp++;
             ntok += (long)ids.size();
             const std::string li = std::to_string(idx) + " " + sha1_hex(ids_text(ids)) + "\n";
-            if (const char *d = getenv("NEMOTRON_GATE_DUMP")) if (f[0] == d && !cfg_b) fprintf(stderr, "R2 %s", li.c_str());
             hi.update(li.data(), li.size());
         }
         uint8_t d1[20], d2[20];
@@ -638,7 +637,6 @@ static void p2_vllm(const std::string &dir, const std::string &cases_dir) {
                     n++;
                     const std::string l = canon_line(run_parser(sampled, true, cv.has_tools ? cv.tools.c_str() : NULL, {}));
                     h.update(l.data(), l.size());
-                    if (const char *d = getenv("NEMOTRON_GATE_DUMP")) if (file == d) fprintf(stderr, "%s", l.c_str());
                 }
             }
             turns += n;
