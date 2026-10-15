@@ -176,7 +176,7 @@ static inline const pulsar_nemotron_h_model *pulsar_nemotron_h_of(const pulsar_e
 /** The ids of the family's state declarations (state_kinds.h kinds), in the plan's table order.  A Mamba-2 layer
  *  carries SSM + CONV, an attention layer KV; the drafter's slot (after the trunk's, when the container holds the MTP
  *  module) KV. */
-enum {
+enum pulsar_nemotron_h_state_id {
     PULSAR_NEMOTRON_H_STATE_SSM = 0,   ///< FIXED, DELTA: the selective-scan state f32 [heads][head_dim][d_state]
     PULSAR_NEMOTRON_H_STATE_CONV,      ///< FIXED, SNAPSHOT: the x | B | C convolution's tail bf16 [conv_k - 1][channels]
     PULSAR_NEMOTRON_H_STATE_KV,        ///< POOL, one token a row: an attention layer's K | V rows (F1's BF16 rows)

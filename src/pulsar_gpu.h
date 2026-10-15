@@ -2083,7 +2083,7 @@ int pulsar_gpu_router_select_batch_tensor(
  *  front door (moe.cpp, pulsar_cuda_qwen.h: the routed experts and the shared ones), never a family's name.  The
  *  route weight (or the gamma) is folded in after it, before the bf16 rounding the down reads (pulsar_cuda_mx.cuh:
  *  one element expression each). */
-typedef enum {
+typedef enum pulsar_expert_act {
     PULSAR_EXPERT_ACT_SWIGLU = 0,   /**< gated: silu(gate x) * up x -- a gate AND an up projection */
     PULSAR_EXPERT_ACT_RELU2 = 1,    /**< non-gated: relu(up x)^2 -- an up projection only (no gate); BF16 arms today */
 } pulsar_expert_act;
