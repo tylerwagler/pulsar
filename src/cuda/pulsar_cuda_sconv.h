@@ -26,13 +26,19 @@
  * capture" kind).  One slot per (sequence, stream):
  *   bf16 [K-1][C], SHIFT order: row i holds the stream's INPUT x at position
  *   p - (K-1) + i, where p is the sequence's next position (row K-2 is the
- *   newest).  Channels contiguous; the slot's rows are C apart.
- *   Slot s of a pool is at  state + s * state_stride  (elements, a multiple
- *   of 8, >= (K-1) * C).  A FRESH sequence starts from a zeroed slot.
+ *   newest).  Channels contiguous; the slot's rows are state_ld apart.
+ *   Slot s of a pool starts at  state + s * state_stride  (elements; both
+ *   strides multiples of 8, state_ld >= C, state_stride >= (K-2) * state_ld
+ *   + C).  So several streams can share ONE record a sequence and layer:
+ *   Inkling's four streams as [K-1][10240] with the streams at channel
+ *   offsets 0 / 1024 / 2048 / 6144 (each stream's `state` pointer offset by
+ *   its channels, state_ld 10240) -- one 60 KiB record to price, page,
+ *   snapshot and restore.  A FRESH sequence starts from a zeroed slot.
  * A call reads each sequence's slot and leaves it holding the state after the
  * sequence's last row (the slot is advanced in place).  With capture set, the
  * call also writes, for every call row r, the state AFTER row r -- the same
- * [K-1][C] layout -- at capture + r * capture_stride: a verify that accepts
+ * layout, rows capture_ld apart -- at capture + r * capture_stride (a packed
+ * record per row works the same way): a verify that accepts
  * its rows up to row r rolls back by copying that record into the slot
  * (pulsar_sconv_restore).  Restoring to BEFORE a call's first row is the
  * caller's own snapshot (a speculative verify always keeps its first row).
@@ -81,10 +87,12 @@ typedef struct {
     uint64_t        ld_x;       /**< >= C */
     uint16_t       *y;          /**< output rows at y + r * ld_y; must not overlap the input rows */
     uint64_t        ld_y;       /**< >= C */
-    uint16_t       *state;      /**< the pool: slot s at state + s * state_stride */
-    uint64_t        state_stride;   /**< >= (K-1) * C */
-    uint16_t       *capture;    /**< NULL, or the state after each call row r at capture + r * capture_stride */
-    uint64_t        capture_stride; /**< >= (K-1) * C when capture is set */
+    uint16_t       *state;      /**< the pool: slot s at state + s * state_stride, its row i at + i * state_ld */
+    uint64_t        state_ld;       /**< row stride inside a slot, >= C */
+    uint64_t        state_stride;   /**< slot stride, >= (K-2) * state_ld + C */
+    uint16_t       *capture;    /**< NULL, or the state after call row r at capture + r * capture_stride, rows capture_ld apart */
+    uint64_t        capture_ld;     /**< >= C when capture is set */
+    uint64_t        capture_stride; /**< >= (K-2) * capture_ld + C when capture is set */
 } pulsar_sconv_stream;
 
 /** The call's rows: n_seqs sequences, each ONE contiguous run of its next
@@ -100,7 +108,7 @@ typedef struct {
     const int32_t *seq_slot;      /**< device [n_seqs] */
 } pulsar_sconv_rows;
 
-/** Elements of one state slot / capture record: (K-1) * C. */
+/** Elements of one stream's state, (K-1) * C: a slot / capture record at row stride C. */
 uint64_t pulsar_sconv_state_elems(const pulsar_sconv_decl *decl);
 
 /** Run n_streams (1 .. PULSAR_SCONV_STREAMS_MAX) convolutions over the same
@@ -111,8 +119,10 @@ uint64_t pulsar_sconv_state_elems(const pulsar_sconv_decl *decl);
 int pulsar_sconv_forward(const pulsar_sconv_stream *streams, uint32_t n_streams, const pulsar_sconv_rows *rows,
                          cudaStream_t stream);
 
-/** Roll a slot back to the state after call row `row` of a captured call: one
- *  record copy, state + slot * state_stride <- capture + row * capture_stride.
+/** Roll a slot back to the state after call row `row` of a captured call: the
+ *  stream's K-1 rows of C, from capture + row * capture_stride (rows capture_ld
+ *  apart) to state + slot * state_stride (rows state_ld apart).  A caller whose
+ *  streams share one packed record may copy the record whole instead.
  *  @return 0, or -1 refused / -3 on a copy failure. */
 int pulsar_sconv_restore(const pulsar_sconv_stream *s, uint32_t slot, uint32_t row, cudaStream_t stream);
 

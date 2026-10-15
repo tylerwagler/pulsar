@@ -54,8 +54,8 @@ int main() {
         auto mk = [&](const pulsar_sconv_decl *d, const uint16_t *x, uint64_t ldx, uint16_t *yy, int si) {
             pulsar_sconv_stream s{};
             s.decl = d; s.x = x; s.ld_x = ldx; s.y = yy; s.ld_y = d->channels;
-            s.state = pool + (uint64_t)si * 16 * ss; s.state_stride = ss;
-            if (L.capture) { s.capture = cap + (uint64_t)si * 16 * 6 * ss; s.capture_stride = ss; }
+            s.state = pool + (uint64_t)si * 16 * ss; s.state_ld = d->channels; s.state_stride = ss;
+            if (L.capture) { s.capture = cap + (uint64_t)si * 16 * 6 * ss; s.capture_ld = d->channels; s.capture_stride = ss; }
             return s;
         };
         const pulsar_sconv_stream kv[2] = {mk(&kd, qkvr + 4096, QKVR, y, 0), mk(&vd, qkvr + 5120, QKVR, y + (size_t)MAXR * 1024, 1)};

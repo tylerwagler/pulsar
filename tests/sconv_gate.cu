@@ -81,7 +81,7 @@ struct Case {
     uint16_t *d_w = nullptr;
     uint32_t N = 0;                          /* rows per sequence */
     uint64_t ld = 0;                         /* the call buffers' row stride (> C: strided rows) */
-    uint64_t sstride = 0;                    /* pool slot stride */
+    uint64_t sld = 0, sstride = 0;           /* a slot's row stride (> C: strided records) and the pool's slot stride */
     std::vector<std::vector<float>> X;       /* per sequence: [N][C] bf16-exact inputs */
     uint16_t *d_pool = nullptr;              /* 32 slots */
     uint16_t *d_x = nullptr, *d_y = nullptr, *d_cap = nullptr;   /* call buffers, up to kMaxRows rows */
@@ -101,7 +101,8 @@ static void case_init(Case &c, const char *name, int C, int K, bool residual, ui
     CK(cudaMemcpy(c.d_w, wb.data(), wb.size() * 2, cudaMemcpyHostToDevice));
     c.D.channels = (uint32_t)C; c.D.kernel = (uint32_t)K; c.D.residual = residual ? 1 : 0; c.D.weight = c.d_w;
     c.ld = (uint64_t)C + 16;
-    c.sstride = (uint64_t)(K - 1) * C + 8;
+    c.sld = (uint64_t)C + 8;
+    c.sstride = (uint64_t)(K - 1) * c.sld + 8;
     c.X.resize(kSeqs);
     for (uint32_t q = 0; q < kSeqs; ++q) {
         Rng gq(seed * 131 + q + 1);
@@ -121,9 +122,11 @@ static void case_free(Case &c) {
 }
 
 static void zero_slot(Case &c, uint32_t slot) { CK(cudaMemset(c.d_pool + slot * c.sstride, 0, c.sstride * 2)); }
+/* a slot's K-1 rows of C, gathered from its row stride */
 static std::vector<uint16_t> get_slot(Case &c, uint32_t slot) {
     std::vector<uint16_t> h(pulsar_sconv_state_elems(&c.D));
-    CK(cudaMemcpy(h.data(), c.d_pool + slot * c.sstride, h.size() * 2, cudaMemcpyDeviceToHost));
+    CK(cudaMemcpy2D(h.data(), (size_t)c.R.C * 2, c.d_pool + slot * c.sstride, c.sld * 2, (size_t)c.R.C * 2, c.R.K - 1,
+                    cudaMemcpyDeviceToHost));
     return h;
 }
 
@@ -157,8 +160,8 @@ static int call(Case &c, const std::vector<Run> &runs, std::vector<uint16_t> *ou
     CK(cudaMemset(c.d_y, 0xff, (size_t)rows * c.ld * 2));
     pulsar_sconv_stream s{};
     s.decl = &c.D; s.x = c.d_x; s.ld_x = c.ld; s.y = c.d_y; s.ld_y = c.ld;
-    s.state = c.d_pool; s.state_stride = c.sstride;
-    s.capture = capture ? c.d_cap : nullptr; s.capture_stride = c.sstride;
+    s.state = c.d_pool; s.state_ld = c.sld; s.state_stride = c.sstride;
+    s.capture = capture ? c.d_cap : nullptr; s.capture_ld = c.sld; s.capture_stride = c.sstride;
     pulsar_sconv_rows rw{(uint32_t)runs.size(), rows, longest, c.d_first, c.d_slot};
     const int rc = pulsar_sconv_forward(&s, 1, &rw, 0);
     if (rc) return rc;
@@ -167,8 +170,10 @@ static int call(Case &c, const std::vector<Run> &runs, std::vector<uint16_t> *ou
     CK(cudaMemcpy2D(out->data(), (size_t)C * 2, c.d_y, c.ld * 2, (size_t)C * 2, rows, cudaMemcpyDeviceToHost));
     if (capture && cap) {
         const uint64_t se = pulsar_sconv_state_elems(&c.D);
-        cap->resize((size_t)rows * se);
-        CK(cudaMemcpy2D(cap->data(), se * 2, c.d_cap, c.sstride * 2, se * 2, rows, cudaMemcpyDeviceToHost));
+        cap->resize((size_t)rows * se);   /* record r's K-1 rows of C, gathered from the capture's row stride */
+        CK(cudaMemcpy2D(cap->data(), (size_t)C * 2, c.d_cap, c.sld * 2, (size_t)C * 2, (size_t)rows * (c.R.K - 1),
+                        cudaMemcpyDeviceToHost));
+        (void)se;
     }
     return 0;
 }
@@ -325,7 +330,8 @@ static void run_case(Case &c) {
                 ok = ok && call(c, {v}, &o, true, &cap) == 0;
                 for (uint32_t r = 0; ok && r <= j; ++r) so.put(c, P + r, &o[(size_t)r * C]);
                 pulsar_sconv_stream s{};
-                s.decl = &c.D; s.state = c.d_pool; s.state_stride = c.sstride; s.capture = c.d_cap; s.capture_stride = c.sstride;
+                s.decl = &c.D; s.state = c.d_pool; s.state_ld = c.sld; s.state_stride = c.sstride;
+                s.capture = c.d_cap; s.capture_ld = c.sld; s.capture_stride = c.sstride;
                 if (restore) ok = ok && pulsar_sconv_restore(&s, slot, j, 0) == 0;
                 for (uint32_t p = P + j + 1; ok && p < N; ++p) {
                     ok = call(c, {{0, slot, p, 1}}, &o, false) == 0;
@@ -390,9 +396,11 @@ static void run_case(Case &c) {
     }
 }
 
-/* Inkling's K and V: strided columns of one fused qkvr row, one launch == two launches */
+/* Inkling's layer: K and V as strided columns of one fused qkvr row plus the two 4096 deltas, their state in ONE
+ * packed record a sequence ([3][10240], streams at channels 0 / 1024 / 2048 / 6144); one launch == four launches */
 static void multi_stream() {
-    printf("\n== multi-stream: K and V from a fused [q 4096 | k 1024 | v 1024 | r 512] row, + two 4096 streams ==\n");
+    printf("\n== multi-stream: K and V from a fused [q 4096 | k 1024 | v 1024 | r 512] row + two 4096 streams, one packed "
+           "[3][10240] record ==\n");
     const uint32_t T = 37, LD = 6656;
     Rng g(77);
     std::vector<uint16_t> hrow((size_t)T * LD), hw((size_t)1024 * 4 * 2 + (size_t)4096 * 4 * 2);
@@ -407,18 +415,20 @@ static void multi_stream() {
     for (auto &v : hbig) v = sref_f2bf((float)g.n());
     CK(cudaMalloc(&d_big, hbig.size() * 2));
     CK(cudaMemcpy(d_big, hbig.data(), hbig.size() * 2, cudaMemcpyHostToDevice));
-    const uint64_t ss = 3 * 4096;
-    CK(cudaMalloc(&d_pool, 8 * ss * 2));
-    CK(cudaMemset(d_pool, 0, 8 * ss * 2));
+    const uint64_t RW = 10240, REC = 3 * RW;            /* the record's row width and size */
+    const uint64_t off[4] = {0, 1024, 2048, 6144};      /* each stream's channels in the record */
+    CK(cudaMalloc(&d_pool, 2 * REC * 2));
+    CK(cudaMemset(d_pool, 0, 2 * REC * 2));
     int32_t hfirst[2] = {0, (int32_t)T}, hslot[1] = {0};
     int32_t *d_first, *d_slot;
     CK(cudaMalloc(&d_first, 8)); CK(cudaMalloc(&d_slot, 4));
     CK(cudaMemcpy(d_first, hfirst, 8, cudaMemcpyHostToDevice)); CK(cudaMemcpy(d_slot, hslot, 4, cudaMemcpyHostToDevice));
     pulsar_sconv_decl kd{1024, 4, 1, d_w}, vd{1024, 4, 1, d_w + 4096}, ad{4096, 4, 1, d_w + 8192}, md{4096, 4, 1, d_w + 8192 + 16384};
     const pulsar_sconv_rows rows{1, T, T, d_first, d_slot};
-    auto stream_of = [&](const pulsar_sconv_decl *d, const uint16_t *x, uint64_t ldx, uint16_t *y, uint32_t slot) {
+    auto stream_of = [&](const pulsar_sconv_decl *d, const uint16_t *x, uint64_t ldx, uint16_t *y, uint32_t i) {
         pulsar_sconv_stream s{};
-        s.decl = d; s.x = x; s.ld_x = ldx; s.y = y; s.ld_y = 4096; s.state = d_pool + slot * ss; s.state_stride = ss;
+        s.decl = d; s.x = x; s.ld_x = ldx; s.y = y; s.ld_y = 4096;
+        s.state = d_pool + off[i]; s.state_ld = RW; s.state_stride = REC;
         return s;
     };
     /* one launch: K, V, and the two 4096 streams (4 streams, two widths) */
@@ -429,23 +439,31 @@ static void multi_stream() {
     for (int i = 0; i < 4; ++i) {
         pulsar_sconv_stream s = four[i];
         s.y = d_bigy + (size_t)i * T * 4096;
-        s.state = d_pool + (4 + i) * ss;
+        s.state = d_pool + REC + off[i];   /* record 1 */
         if (pulsar_sconv_forward(&s, 1, &rows, 0) != 0) check(false, "single-stream launch %d", i);
     }
     CK(cudaDeviceSynchronize());
-    std::vector<uint16_t> a((size_t)4 * T * 4096), b(a.size()), sa(4 * ss), sb(4 * ss);
+    std::vector<uint16_t> a((size_t)4 * T * 4096), b(a.size()), rec(2 * REC);
     CK(cudaMemcpy(a.data(), d_y, a.size() * 2, cudaMemcpyDeviceToHost));
     CK(cudaMemcpy(b.data(), d_bigy, b.size() * 2, cudaMemcpyDeviceToHost));
-    CK(cudaMemcpy(sa.data(), d_pool, sa.size() * 2, cudaMemcpyDeviceToHost));
-    CK(cudaMemcpy(sb.data(), d_pool + 4 * ss, sb.size() * 2, cudaMemcpyDeviceToHost));
+    CK(cudaMemcpy(rec.data(), d_pool, rec.size() * 2, cudaMemcpyDeviceToHost));
     bool eq = true;
     for (int i = 0; i < 4 && eq; ++i) {
         const uint32_t C = i < 2 ? 1024 : 4096;
         for (uint32_t t = 0; t < T && eq; ++t)
             eq = memcmp(&a[(size_t)i * T * 4096 + (size_t)t * 4096], &b[(size_t)i * T * 4096 + (size_t)t * 4096], C * 2) == 0;
-        eq = eq && memcmp(&sa[i * ss], &sb[i * ss], (size_t)3 * C * 2) == 0;
     }
-    check(eq, "4 streams in one launch == 4 launches (outputs and slots), K / V read strided from the fused row");
+    check(eq && memcmp(rec.data(), rec.data() + REC, REC * 2) == 0,
+          "4 streams in one launch == 4 launches (outputs and the whole packed record)");
+    /* the record holds each stream's last 3 inputs in its channel range */
+    bool laid = true;
+    for (int i = 0; i < 4; ++i)
+        for (uint64_t r = 0; r < 3; ++r) {
+            const uint32_t C = i < 2 ? 1024 : 4096;
+            const uint16_t *src = i < 2 ? &hrow[(size_t)(T - 3 + r) * LD + 4096 + 1024 * i] : &hbig[(size_t)(T - 3 + r) * 8192 + 4096 * (i - 2)];
+            laid = laid && memcmp(&rec[r * RW + off[i]], src, (size_t)C * 2) == 0;
+        }
+    check(laid, "the packed record's row r holds every stream's input at position T-3+r in its channel range");
     /* the K stream against the host replay, on its strided input */
     {
         sref_conv R; R.C = 1024; R.K = 4; R.residual = true; R.w.resize(4096);
@@ -470,7 +488,7 @@ static void refusals() {
     CK(cudaMemcpy(d, hf, 12, cudaMemcpyHostToDevice));
     pulsar_sconv_decl D{64, 4, 1, b};
     pulsar_sconv_stream s{};
-    s.decl = &D; s.x = b + 4096; s.ld_x = 64; s.y = b + 8192; s.ld_y = 64; s.state = b + 16384; s.state_stride = 192;
+    s.decl = &D; s.x = b + 4096; s.ld_x = 64; s.y = b + 8192; s.ld_y = 64; s.state = b + 16384; s.state_ld = 64; s.state_stride = 192;
     pulsar_sconv_rows r{1, 4, 4, d, d + 2};
     check(pulsar_sconv_forward(&s, 1, &r, 0) == 0, "the base call is accepted");
     CK(cudaDeviceSynchronize());
@@ -487,8 +505,10 @@ static void refusals() {
     t = s; t.ld_x = 60; refused("ld_x below the channels", t, r);
     t = s; t.ld_y = 68; refused("ld_y not a multiple of 8", t, r);
     t = s; t.y = b + 4096 + 64; refused("an output overlapping the input rows", t, r);
-    t = s; t.state_stride = 184; refused("a slot stride below (K-1) * C", t, r);
-    t = s; t.capture = b + 32768; t.capture_stride = 64; refused("a capture stride below one record", t, r);
+    t = s; t.state_stride = 184; refused("a slot stride below (K-2) * state_ld + C", t, r);
+    t = s; t.state_ld = 56; refused("a slot row stride below the channels", t, r);
+    t = s; t.state_ld = 68; t.state_stride = 208; refused("a slot row stride not a multiple of 8", t, r);
+    t = s; t.capture = b + 32768; t.capture_ld = 64; t.capture_stride = 64; refused("a capture stride below one record", t, r);
     t = s; refused("no streams", t, r, 0);
     refused("five streams", t, r, 5);
     r2 = r; r2.n_seqs = 0; refused("no sequences", s, r2);
@@ -535,7 +555,7 @@ static int fixture(const char *dir) {
         CK(cudaMalloc(&d_first, (T + 1) * 4)); CK(cudaMalloc(&d_slot, T * 4));
         pulsar_sconv_decl D{C, 4, 1, d_w};
         pulsar_sconv_stream s{};
-        s.decl = &D; s.x = d_x; s.ld_x = C; s.y = d_y; s.ld_y = C; s.state = d_pool; s.state_stride = (uint64_t)3 * C;
+        s.decl = &D; s.x = d_x; s.ld_x = C; s.y = d_y; s.ld_y = C; s.state = d_pool; s.state_ld = C; s.state_stride = (uint64_t)3 * C;
         const int32_t one[2] = {0, (int32_t)T}, zero = 0;
         CK(cudaMemcpy(d_first, one, 8, cudaMemcpyHostToDevice)); CK(cudaMemcpy(d_slot, &zero, 4, cudaMemcpyHostToDevice));
         pulsar_sconv_rows r{1, T, T, d_first, d_slot};

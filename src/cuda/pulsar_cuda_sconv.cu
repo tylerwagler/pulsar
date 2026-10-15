@@ -26,7 +26,7 @@ static_assert(kRows >= PULSAR_SCONV_KMAX - 1, "a later row tile must find its wh
 struct stream_args {
     const uint16_t *w, *x;
     uint16_t *y, *state, *cap;
-    uint64_t ld_x, ld_y, state_stride, cap_stride;
+    uint64_t ld_x, ld_y, state_ld, state_stride, cap_ld, cap_stride;
     uint32_t C;
     int residual;
 };
@@ -84,7 +84,7 @@ __global__ void __launch_bounds__(kThreads) sconv_kernel(const call_args a) {
     if (t0 == 0) {
 #pragma unroll
         for (int i = 0; i < K - 1; ++i) {
-            old[i] = *(const uint4 *)(slot + (uint64_t)i * S.C);
+            old[i] = *(const uint4 *)(slot + (uint64_t)i * S.state_ld);
             unpack8(old[i], hist[i]);
         }
     } else {
@@ -115,7 +115,7 @@ __global__ void __launch_bounds__(kThreads) sconv_kernel(const call_args a) {
         if (S.cap) {
             uint16_t *cp = S.cap + (uint64_t)(f0 + t) * S.cap_stride + c0;
 #pragma unroll
-            for (int i = 0; i < K - 1; ++i) *(uint4 *)(cp + (uint64_t)i * S.C) = pack8_exact(hist[i]);
+            for (int i = 0; i < K - 1; ++i) *(uint4 *)(cp + (uint64_t)i * S.cap_ld) = pack8_exact(hist[i]);
         }
     }
 
@@ -132,7 +132,7 @@ __global__ void __launch_bounds__(kThreads) sconv_kernel(const call_args a) {
                 for (int j = 0; j < K - 2; ++j)   /* a select, so `old` stays in registers */
                     if (idx == j) v = old[j];
             }
-            *(uint4 *)(slot + (uint64_t)i * S.C) = v;
+            *(uint4 *)(slot + (uint64_t)i * S.state_ld) = v;
         }
     }
 }
@@ -150,6 +150,11 @@ void span(const uint16_t *p, uint64_t ld, uint32_t rows, uint32_t C, uintptr_t *
     *hi = (uintptr_t)(p + (uint64_t)(rows - 1) * ld + C);
 }
 
+/* a record of K-1 rows of C at row stride ld, records `stride` apart */
+bool record_ok(uint64_t ld, uint64_t stride, const pulsar_sconv_decl *d) {
+    return ld >= d->channels && ld % kVec == 0 && stride % kVec == 0 && stride >= (uint64_t)(d->kernel - 2) * ld + d->channels;
+}
+
 bool stream_ok(const pulsar_sconv_stream &s, uint32_t i, uint32_t n_rows, uint32_t K0) {
     const pulsar_sconv_decl *d = s.decl;
     if (!d) return refuse("no declaration", i);
@@ -160,12 +165,13 @@ bool stream_ok(const pulsar_sconv_stream &s, uint32_t i, uint32_t n_rows, uint32
     if (!d->weight || !aligned16(d->weight)) return refuse("no weight, or a weight not 16-byte aligned", i);
     if (!s.x || !s.y || !s.state || !aligned16(s.x) || !aligned16(s.y) || !aligned16(s.state))
         return refuse("x, y and state must be set and 16-byte aligned", i);
-    const uint64_t se = pulsar_sconv_state_elems(d);
     if (s.ld_x < d->channels || s.ld_y < d->channels || s.ld_x % kVec || s.ld_y % kVec)
         return refuse("ld_x / ld_y must be >= channels and multiples of 8", i);
-    if (s.state_stride < se || s.state_stride % kVec) return refuse("state_stride must be >= (K-1) * C and a multiple of 8", i);
-    if (s.capture && (!aligned16(s.capture) || s.capture_stride < se || s.capture_stride % kVec))
-        return refuse("capture must be 16-byte aligned with a stride >= (K-1) * C, a multiple of 8", i);
+    if (!record_ok(s.state_ld, s.state_stride, d)) return refuse("state_ld must be >= C and state_stride >= (K-2) * state_ld + C, "
+                                                                 "both multiples of 8", i);
+    if (s.capture && (!aligned16(s.capture) || !record_ok(s.capture_ld, s.capture_stride, d)))
+        return refuse("capture must be 16-byte aligned, capture_ld >= C and capture_stride >= (K-2) * capture_ld + C, "
+                      "multiples of 8", i);
     uintptr_t xl, xh, yl, yh;
     span(s.x, s.ld_x, n_rows, d->channels, &xl, &xh);
     span(s.y, s.ld_y, n_rows, d->channels, &yl, &yh);
@@ -208,7 +214,8 @@ extern "C" int pulsar_sconv_forward(const pulsar_sconv_stream *streams, uint32_t
     for (uint32_t i = 0; i < n_streams; ++i) {
         const pulsar_sconv_stream &s = streams[i];
         if (!stream_ok(s, i, rows->n_rows, K)) return -1;
-        a.s[i] = stream_args{s.decl->weight, s.x, s.y, s.state, s.capture, s.ld_x, s.ld_y, s.state_stride,
+        a.s[i] = stream_args{s.decl->weight, s.x,          s.y,          s.state,        s.capture,
+                             s.ld_x,          s.ld_y,       s.state_ld,   s.state_stride, s.capture_ld,
                              s.capture_stride, s.decl->channels, s.decl->residual};
         if (s.decl->channels > cmax) cmax = s.decl->channels;
     }
@@ -234,13 +241,16 @@ extern "C" int pulsar_sconv_forward(const pulsar_sconv_stream *streams, uint32_t
 }
 
 extern "C" int pulsar_sconv_restore(const pulsar_sconv_stream *s, uint32_t slot, uint32_t row, cudaStream_t stream) {
-    if (!s || !s->decl || !s->state || !s->capture || s->state_stride < pulsar_sconv_state_elems(s->decl) ||
-        s->capture_stride < pulsar_sconv_state_elems(s->decl)) {
-        fprintf(stderr, "pulsar: sconv restore: no stream, state, capture, or a stride below one record -- refusing\n");
+    if (!s || !s->decl || !s->state || !s->capture || s->decl->kernel < 2 || s->decl->kernel > PULSAR_SCONV_KMAX ||
+        !record_ok(s->state_ld, s->state_stride, s->decl) || !record_ok(s->capture_ld, s->capture_stride, s->decl)) {
+        fprintf(stderr, "pulsar: sconv restore: no stream, state or capture, or a record layout pulsar_sconv_forward refuses "
+                        "-- refusing\n");
         return -1;
     }
-    const cudaError_t e = cudaMemcpyAsync(s->state + (uint64_t)slot * s->state_stride, s->capture + (uint64_t)row * s->capture_stride,
-                                          pulsar_sconv_state_elems(s->decl) * sizeof(uint16_t), cudaMemcpyDeviceToDevice, stream);
+    const cudaError_t e = cudaMemcpy2DAsync(s->state + (uint64_t)slot * s->state_stride, s->state_ld * sizeof(uint16_t),
+                                            s->capture + (uint64_t)row * s->capture_stride, s->capture_ld * sizeof(uint16_t),
+                                            (size_t)s->decl->channels * sizeof(uint16_t), s->decl->kernel - 1,
+                                            cudaMemcpyDeviceToDevice, stream);
     if (e != cudaSuccess) {
         fprintf(stderr, "pulsar: sconv restore: %s\n", cudaGetErrorString(e));
         return -3;
