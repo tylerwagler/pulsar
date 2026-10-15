@@ -27,6 +27,7 @@ straight into the file.
 import argparse
 import json
 import os
+import shutil
 import struct
 import sys
 
@@ -392,6 +393,7 @@ def cmd_plan(args):
 def cmd_emit(args):
     shape, order, files, shards, consumed = make_plan(args)
     todo = order if args.all else [args.shard]
+    sides = side_files(args) if args.all else []   # refused before any shard is written
     os.makedirs(args.out, exist_ok=True)
     import time
     for s in todo:
@@ -404,7 +406,18 @@ def cmd_emit(args):
     if args.all:
         n, total = write_index(args.out)
         print(f'index: {n} tensors, total_size {total / 1e9:.2f} GB')
+        for name, src in sides:
+            shutil.copyfile(src, os.path.join(args.out, name))
+            print(f'side file: {name} <- {src} ({os.path.getsize(src)} B)')
     return 0
+
+
+def side_files(args):
+    """The family's files beside the shards (fam.side_files: [(container name, source path)]; none when the family
+    declares none).  Today Inkling's tokenizer; Qwen's tokenizer.json / generation_config.json are still copied by
+    hand."""
+    hf, fam, ctx = context(args)
+    return fam.side_files(hf, ctx) if hasattr(fam, 'side_files') else []
 
 
 def cmd_verify(args):
@@ -502,6 +515,13 @@ def cmd_verify(args):
                   f'worst relative Frobenius error {rt_worst[w]:.3e} ({w})')
         else:
             print('roundtrip: no BF16-sourced mxfp8_lt entries in the checked shards')
+    if args.all:
+        for name, src in side_files(args):
+            p = os.path.join(args.out, name)
+            same = os.path.isfile(p) and open(p, 'rb').read() == open(src, 'rb').read()
+            failing += 0 if same else 1
+            print(f'side file {name}: {"byte-equal to " + src if same else "MISSING or DIFFERS from " + src} -> '
+                  f'{"PASS" if same else "FAIL"}')
     print(f'shards checked: {len(todo)}  failing: {failing}')
     return 1 if failing else 0
 

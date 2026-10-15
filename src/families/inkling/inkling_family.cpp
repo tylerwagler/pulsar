@@ -2,6 +2,7 @@
  * entries, which refuse by name until the forward is wired (inkling.h). */
 #include "inkling.h"
 #include "engine/exl3_trellis.h"
+#include "lib/bpe_tokenizer.h"
 
 namespace {
 
@@ -16,6 +17,7 @@ const char *const NOT_WIRED =
     "attention, F2 router, E3 SConv, E5 head on the core row-step driver) and its state declaration (F3 kinds)";
 
 void unload(pulsar_engine *e) {
+    if (e->family_state) bpe_tokenizer_free(((pulsar_inkling_model *)e->family_state)->tok);
     free(e->family_state);
     e->family_state = NULL;
 }
@@ -55,6 +57,8 @@ bool load(pulsar_engine *e, const pulsar_engine_options *opt) {
                 pulsar_load_refusals());
         return false;
     }
+    /* stage 4: the tokenizer beside the shards */
+    if (!pulsar_inkling_load_tokenizer(w, opt->model_path)) return false;
     const pulsar_inkling_shape *s = &w->shape;
     uint32_t n_window = 0, n_dense = 0;
     for (uint32_t il = 0; il < e->plan.n_layer; il++) {
@@ -67,8 +71,6 @@ bool load(pulsar_engine *e, const pulsar_engine_options *opt) {
             s->n_expert_used, s->n_expert, s->n_shared,
             s->mtp_written ? "bound (MTP layers; drafting is F6's)" : "not in the container",
             s->vision_written ? "bound (images are refused until E9's image front)" : "not in the container");
-    fprintf(stderr, "pulsar: %s: no tokenizer table yet (E6: F5's BPE engine + o200k, not wired for this family) -- "
-                    "the front ends refuse this engine; %s\n", ARCH, NOT_WIRED);
     return true;
 }
 
@@ -82,15 +84,9 @@ const pulsar_inkling_model *model_of(const pulsar_engine *e) { return (const pul
 uint32_t logits_width(const pulsar_engine *e) { return model_of(e)->shape.n_vocab; }
 const char *model_name(const pulsar_engine *e) { return model_of(e)->shape.name; }
 const char *served_model_id(const pulsar_engine *) { return "inkling-small"; }
-/* No chat format exists for Inkling until E6 wires F5's renderer (src/lib/inkling_chat.h) and a server table (a
- * PULSAR_CHAT_INKLING id, its case in chat_family.cpp's family switch): the family declares no CAP_CHAT
- * and no tokenizer, so a front end refuses the engine before it asks (pulsar_engine_has_tokenizer).  One that asks
- * anyway is a caller bug, not an artifact's: no other family's template is a stand-in (rule 9). */
-pulsar_chat_format chat_format(const pulsar_engine *) {
-    pulsar_die("inkling: the family has no chat format until E6 wires F5's renderer; a front end asked past "
-               "pulsar_engine_has_tokenizer");
-    return PULSAR_CHAT_DS4_V4;   /* unreachable: pulsar_die exits */
-}
+/* F5's renderer (src/lib/inkling_chat.h): the engine's chat front (inkling_tokenizer.cpp) and the server's family
+ * table (src/server/family_inkling.cpp) */
+pulsar_chat_format chat_format(const pulsar_engine *) { return PULSAR_CHAT_INKLING; }
 /* Disk-KV compatibility id: 0 and 1 are DeepSeek's profiles, 2 Qwen's. */
 int model_id(const pulsar_engine *) { return 3; }
 /* positions: no RoPE; the log-scaled global attention is trained to model_max_length */
@@ -152,7 +148,8 @@ const pulsar_family PULSAR_FAMILY_INKLING = {
     /* .id           = */ PULSAR_FAMILY_ID_INKLING,
     /* .arch         = */ PULSAR_INKLING_ARCH,
     /* .name         = */ "Inkling",
-    /* .caps         = */ 0,   /* text forward first (F4); then CHAT (F5), SPEC (F6), TP (E8), VISION (E9) */
+    /* .caps         = */ PULSAR_FAMILY_CAP_CHAT,   /* the tokenizer + chat front (E6); the forward (F4), SPEC (F6), TP
+                                                     * (E8), VISION (E9) next */
     /* .load         = */ load,
     /* .after_gpu    = */ after_gpu,
     /* .logits_width = */ logits_width,
@@ -166,7 +163,7 @@ const pulsar_family PULSAR_FAMILY_INKLING = {
     /* .quant_bits   = */ quant_bits,
     /* .spec         = */ NULL,
     /* .session      = */ &k_session_ops,
-    /* .tokenizer    = */ NULL,   /* the frontend seam: pulsar_inkling_model::tok (F5) */
+    /* .tokenizer    = */ &PULSAR_INKLING_TOKENIZER,   /* inkling_tokenizer.cpp (F5's BPE engine + renderer) */
     /* .tp_slices    = */ NULL,
     /* .act_kind     = */ PULSAR_ACT_KIND_ROWS,
     /* .vision       = */ NULL,   /* E9: the hmlp image front; the tower binds today, images are refused */

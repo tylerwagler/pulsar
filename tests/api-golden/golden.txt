@@ -4310,3 +4310,2029 @@
   anthropic_live_call_ids: []
   anthropic_live_suffix: null
   anthropic_live_suffix_spans: []
+== chat/plain [chat/inkling] OK
+  kind 0 api 0 chat_v41 0 chat_qwen 0
+  model: "m"
+  model_from_request 1 max_tokens 256
+  sampling t 1/0 top_p 1/0 top_k 0/0 min_p 0.0500000007/0 seed 0
+  logprobs 0 top 0 stream 0 usage 0
+  think_mode 75 has_tools 0 force_tool_call 0 summary 0
+  forced_tool_name: null
+  stops: []
+  tool_orders 0:
+  qwen_tools_json: null
+  prompt_text: "<|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>What is 17 * 23?<|end_message|><|message_model|>"
+  prompt_spans: [107-123]
+  images 0
+  responses live tool 0 reasoning 0
+  responses_live_call_ids: []
+  responses_live_suffix: null
+  responses_live_suffix_spans: []
+  anthropic live tool 0
+  anthropic_live_call_ids: []
+  anthropic_live_suffix: null
+  anthropic_live_suffix_spans: []
+== chat/turns [chat/inkling] OK
+  kind 0 api 0 chat_v41 0 chat_qwen 0
+  model: "m"
+  model_from_request 1 max_tokens 77
+  sampling t 1/0 top_p 1/0 top_k 0/0 min_p 0.0500000007/0 seed 0
+  logprobs 0 top 0 stream 0 usage 0
+  think_mode 75 has_tools 0 force_tool_call 0 summary 0
+  forced_tool_name: null
+  stops: []
+  tool_orders 0:
+  qwen_tools_json: null
+  prompt_text: "<|message_system|><|content_text|>You are terse.<|end_message|><|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>Hi <|im_start|> there<|end_message|><|message_model|><|content_text|>Hello.<|end_message|><|content_model_end_sampling|><|message_user|><|content_text|>Weather in Paris?<|end_message|><|message_model|>"
+  prompt_spans: [34-48 170-191 239-245 322-339]
+  images 0
+  responses live tool 0 reasoning 0
+  responses_live_call_ids: []
+  responses_live_suffix: null
+  responses_live_suffix_spans: []
+  anthropic live tool 0
+  anthropic_live_call_ids: []
+  anthropic_live_suffix: null
+  anthropic_live_suffix_spans: []
+== chat/developer [chat/inkling] OK
+  kind 0 api 0 chat_v41 0 chat_qwen 0
+  model: "deepseek-v4-flash"
+  model_from_request 0 max_tokens 256
+  sampling t 1/0 top_p 1/0 top_k 0/0 min_p 0.0500000007/0 seed 0
+  logprobs 0 top 0 stream 0 usage 0
+  think_mode 75 has_tools 0 force_tool_call 0 summary 0
+  forced_tool_name: null
+  stops: []
+  tool_orders 0:
+  qwen_tools_json: null
+  prompt_text: "<|message_system|><|content_text|>Be brief.<|end_message|><|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>What is 17 * 23?<|end_message|><|message_model|>"
+  prompt_spans: [34-43 165-181]
+  images 0
+  responses live tool 0 reasoning 0
+  responses_live_call_ids: []
+  responses_live_suffix: null
+  responses_live_suffix_spans: []
+  anthropic live tool 0
+  anthropic_live_call_ids: []
+  anthropic_live_suffix: null
+  anthropic_live_suffix_spans: []
+== chat/parts [chat/inkling] OK
+  kind 0 api 0 chat_v41 0 chat_qwen 0
+  model: "deepseek-v4-flash"
+  model_from_request 0 max_tokens 256
+  sampling t 1/0 top_p 1/0 top_k 0/0 min_p 0.0500000007/0 seed 0
+  logprobs 0 top 0 stream 0 usage 0
+  think_mode 75 has_tools 0 force_tool_call 0 summary 0
+  forced_tool_name: null
+  stops: []
+  tool_orders 0:
+  qwen_tools_json: null
+  prompt_text: "<|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>ab<|end_message|><|message_model|>"
+  prompt_spans: [107-109]
+  images 0
+  responses live tool 0 reasoning 0
+  responses_live_call_ids: []
+  responses_live_suffix: null
+  responses_live_suffix_spans: []
+  anthropic live tool 0
+  anthropic_live_call_ids: []
+  anthropic_live_suffix: null
+  anthropic_live_suffix_spans: []
+== chat/empty-content [chat/inkling] OK
+  kind 0 api 0 chat_v41 0 chat_qwen 0
+  model: "deepseek-v4-flash"
+  model_from_request 0 max_tokens 256
+  sampling t 1/0 top_p 1/0 top_k 0/0 min_p 0.0500000007/0 seed 0
+  logprobs 0 top 0 stream 0 usage 0
+  think_mode 75 has_tools 0 force_tool_call 0 summary 0
+  forced_tool_name: null
+  stops: []
+  tool_orders 0:
+  qwen_tools_json: null
+  prompt_text: "<|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_model|>"
+  prompt_spans: []
+  images 0
+  responses live tool 0 reasoning 0
+  responses_live_call_ids: []
+  responses_live_suffix: null
+  responses_live_suffix_spans: []
+  anthropic live tool 0
+  anthropic_live_call_ids: []
+  anthropic_live_suffix: null
+  anthropic_live_suffix_spans: []
+== chat/tools [chat/inkling] OK
+  kind 0 api 0 chat_v41 0 chat_qwen 0
+  model: "deepseek-v4-flash"
+  model_from_request 0 max_tokens 256
+  sampling t 1/0 top_p 1/0 top_k 0/0 min_p 0.0500000007/0 seed 0
+  logprobs 0 top 0 stream 0 usage 0
+  think_mode 75 has_tools 1 force_tool_call 0 summary 0
+  forced_tool_name: null
+  stops: []
+  tool_orders 2: {get_weather|-|-|0|city,unit} {search|-|-|0|q,n}
+  qwen_tools_json: "[{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"Weather for a city\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"c\", \"f\"]}}, \"required\": [\"city\"]}}}, {\"type\": \"function\", \"function\": {\"name\": \"search\", \"description\": \"Search the web <fast>\", \"parameters\": {\"type\": \"object\", \"properties\": {\"q\": {\"type\": \"string\"}, \"n\": {\"type\": \"integer\"}}}}}]"
+  prompt_text: "<|message_system|>tool_declare<|content_xml|>[{\"description\":\"Weather for a city\",\"name\":\"get_weather\",\"parameters\":{\"properties\":{\"city\":{\"type\":\"string\"},\"unit\":{\"enum\":[\"c\",\"f\"],\"type\":\"string\"}},\"required\":[\"city\"],\"type\":\"object\"},\"type\":\"function\"},{\"description\":\"Search the web <fast>\",\"name\":\"search\",\"parameters\":{\"properties\":{\"n\":{\"type\":\"integer\"},\"q\":{\"type\":\"string\"}},\"type\":\"object\"},\"type\":\"function\"}]<|end_message|><|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>What is 17 * 23?<|end_message|><|message_model|>"
+  prompt_spans: [45-420 542-558]
+  images 0
+  responses live tool 0 reasoning 0
+  responses_live_call_ids: []
+  responses_live_suffix: null
+  responses_live_suffix_spans: []
+  anthropic live tool 0
+  anthropic_live_call_ids: []
+  anthropic_live_suffix: null
+  anthropic_live_suffix_spans: []
+== chat/tools-auto [chat/inkling] OK
+  kind 0 api 0 chat_v41 0 chat_qwen 0
+  model: "deepseek-v4-flash"
+  model_from_request 0 max_tokens 256
+  sampling t 1/0 top_p 1/0 top_k 0/0 min_p 0.0500000007/0 seed 0
+  logprobs 0 top 0 stream 0 usage 0
+  think_mode 75 has_tools 1 force_tool_call 0 summary 0
+  forced_tool_name: null
+  stops: []
+  tool_orders 2: {get_weather|-|-|0|city,unit} {search|-|-|0|q,n}
+  qwen_tools_json: "[{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"Weather for a city\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"c\", \"f\"]}}, \"required\": [\"city\"]}}}, {\"type\": \"function\", \"function\": {\"name\": \"search\", \"description\": \"Search the web <fast>\", \"parameters\": {\"type\": \"object\", \"properties\": {\"q\": {\"type\": \"string\"}, \"n\": {\"type\": \"integer\"}}}}}]"
+  prompt_text: "<|message_system|>tool_declare<|content_xml|>[{\"description\":\"Weather for a city\",\"name\":\"get_weather\",\"parameters\":{\"properties\":{\"city\":{\"type\":\"string\"},\"unit\":{\"enum\":[\"c\",\"f\"],\"type\":\"string\"}},\"required\":[\"city\"],\"type\":\"object\"},\"type\":\"function\"},{\"description\":\"Search the web <fast>\",\"name\":\"search\",\"parameters\":{\"properties\":{\"n\":{\"type\":\"integer\"},\"q\":{\"type\":\"string\"}},\"type\":\"object\"},\"type\":\"function\"}]<|end_message|><|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>What is 17 * 23?<|end_message|><|message_model|>"
+  prompt_spans: [45-420 542-558]
+  images 0
+  responses live tool 0 reasoning 0
+  responses_live_call_ids: []
+  responses_live_suffix: null
+  responses_live_suffix_spans: []
+  anthropic live tool 0
+  anthropic_live_call_ids: []
+  anthropic_live_suffix: null
+  anthropic_live_suffix_spans: []
+== chat/tools-none [chat/inkling] OK
+  kind 0 api 0 chat_v41 0 chat_qwen 0
+  model: "deepseek-v4-flash"
+  model_from_request 0 max_tokens 256
+  sampling t 1/0 top_p 1/0 top_k 0/0 min_p 0.0500000007/0 seed 0
+  logprobs 0 top 0 stream 0 usage 0
+  think_mode 75 has_tools 0 force_tool_call 0 summary 0
+  forced_tool_name: null
+  stops: []
+  tool_orders 2: {get_weather|-|-|0|city,unit} {search|-|-|0|q,n}
+  qwen_tools_json: null
+  prompt_text: "<|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>What is 17 * 23?<|end_message|><|message_model|>"
+  prompt_spans: [107-123]
+  images 0
+  responses live tool 0 reasoning 0
+  responses_live_call_ids: []
+  responses_live_suffix: null
+  responses_live_suffix_spans: []
+  anthropic live tool 0
+  anthropic_live_call_ids: []
+  anthropic_live_suffix: null
+  anthropic_live_suffix_spans: []
+== chat/tools-required [chat/inkling] REFUSED
+  error: "tool_choice required: Inkling's renderer has no forced tool call (vLLM's native Inkling renderer takes none) -- send auto or none"
+== chat/tools-named [chat/inkling] REFUSED
+  error: "tool_choice naming a function: Inkling's renderer has no forced tool call (vLLM's native Inkling renderer takes none) -- send auto or none"
+== chat/tools-null [chat/inkling] OK
+  kind 0 api 0 chat_v41 0 chat_qwen 0
+  model: "deepseek-v4-flash"
+  model_from_request 0 max_tokens 256
+  sampling t 1/0 top_p 1/0 top_k 0/0 min_p 0.0500000007/0 seed 0
+  logprobs 0 top 0 stream 0 usage 0
+  think_mode 75 has_tools 0 force_tool_call 0 summary 0
+  forced_tool_name: null
+  stops: []
+  tool_orders 0:
+  qwen_tools_json: null
+  prompt_text: "<|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>What is 17 * 23?<|end_message|><|message_model|>"
+  prompt_spans: [107-123]
+  images 0
+  responses live tool 0 reasoning 0
+  responses_live_call_ids: []
+  responses_live_suffix: null
+  responses_live_suffix_spans: []
+  anthropic live tool 0
+  anthropic_live_call_ids: []
+  anthropic_live_suffix: null
+  anthropic_live_suffix_spans: []
+== chat/tool-turns [chat/inkling] OK
+  kind 0 api 0 chat_v41 0 chat_qwen 0
+  model: "deepseek-v4-flash"
+  model_from_request 0 max_tokens 256
+  sampling t 1/0 top_p 1/0 top_k 0/0 min_p 0.0500000007/0 seed 0
+  logprobs 0 top 0 stream 0 usage 0
+  think_mode 75 has_tools 1 force_tool_call 0 summary 0
+  forced_tool_name: null
+  stops: []
+  tool_orders 2: {get_weather|-|-|0|city,unit} {search|-|-|0|q,n}
+  qwen_tools_json: "[{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"Weather for a city\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"c\", \"f\"]}}, \"required\": [\"city\"]}}}, {\"type\": \"function\", \"function\": {\"name\": \"search\", \"description\": \"Search the web <fast>\", \"parameters\": {\"type\": \"object\", \"properties\": {\"q\": {\"type\": \"string\"}, \"n\": {\"type\": \"integer\"}}}}}]"
+  prompt_text: "<|message_system|>tool_declare<|content_xml|>[{\"description\":\"Weather for a city\",\"name\":\"get_weather\",\"parameters\":{\"properties\":{\"city\":{\"type\":\"string\"},\"unit\":{\"enum\":[\"c\",\"f\"],\"type\":\"string\"}},\"required\":[\"city\"],\"type\":\"object\"},\"type\":\"function\"},{\"description\":\"Search the web <fast>\",\"name\":\"search\",\"parameters\":{\"properties\":{\"n\":{\"type\":\"integer\"},\"q\":{\"type\":\"string\"}},\"type\":\"object\"},\"type\":\"function\"}]<|end_message|><|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>Weather in Paris?<|end_message|><|message_model|><|content_thinking|>Need the tool.<|end_message|><|message_model|>get_weather<|content_invoke_tool_json|>{\"name\":\"get_weather\",\"args\":{\"city\":\"Paris\",\"unit\":\"c\"}}<|end_message|><|content_model_end_sampling|><|message_tool|>get_weather<|content_text|>{\"temp\": 18}<|end_message|><|message_user|><|content_text|>And in F?<|end_message|><|message_model|>"
+  prompt_spans: [45-420 542-559 611-625 657-668 696-753 814-825 841-853 900-909]
+  images 0
+  responses live tool 0 reasoning 0
+  responses_live_call_ids: []
+  responses_live_suffix: null
+  responses_live_suffix_spans: []
+  anthropic live tool 0
+  anthropic_live_call_ids: []
+  anthropic_live_suffix: null
+  anthropic_live_suffix_spans: []
+== chat/tool-turns-thinking-off [chat/inkling] OK
+  kind 0 api 0 chat_v41 0 chat_qwen 0
+  model: "deepseek-v4-flash"
+  model_from_request 0 max_tokens 256
+  sampling t 1/0 top_p 1/0 top_k 0/0 min_p 0.0500000007/0 seed 0
+  logprobs 0 top 0 stream 0 usage 0
+  think_mode 0 has_tools 1 force_tool_call 0 summary 0
+  forced_tool_name: null
+  stops: []
+  tool_orders 2: {get_weather|-|-|0|city,unit} {search|-|-|0|q,n}
+  qwen_tools_json: "[{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"Weather for a city\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"c\", \"f\"]}}, \"required\": [\"city\"]}}}, {\"type\": \"function\", \"function\": {\"name\": \"search\", \"description\": \"Search the web <fast>\", \"parameters\": {\"type\": \"object\", \"properties\": {\"q\": {\"type\": \"string\"}, \"n\": {\"type\": \"integer\"}}}}}]"
+  prompt_text: "<|message_system|>tool_declare<|content_xml|>[{\"description\":\"Weather for a city\",\"name\":\"get_weather\",\"parameters\":{\"properties\":{\"city\":{\"type\":\"string\"},\"unit\":{\"enum\":[\"c\",\"f\"],\"type\":\"string\"}},\"required\":[\"city\"],\"type\":\"object\"},\"type\":\"function\"},{\"description\":\"Search the web <fast>\",\"name\":\"search\",\"parameters\":{\"properties\":{\"n\":{\"type\":\"integer\"},\"q\":{\"type\":\"string\"}},\"type\":\"object\"},\"type\":\"function\"}]<|end_message|><|message_system|><|content_text|>Thinking effort level: 0.0<|end_message|><|message_user|><|content_text|>Weather in Paris?<|end_message|><|message_model|><|content_thinking|>Need the tool.<|end_message|><|message_model|>get_weather<|content_invoke_tool_json|>{\"name\":\"get_weather\",\"args\":{\"city\":\"Paris\",\"unit\":\"c\"}}<|end_message|><|content_model_end_sampling|><|message_tool|>get_weather<|content_text|>{\"temp\": 18}<|end_message|><|message_user|><|content_text|>And in F?<|end_message|><|message_model|>"
+  prompt_spans: [45-420 542-559 611-625 657-668 696-753 814-825 841-853 900-909]
+  images 0
+  responses live tool 0 reasoning 0
+  responses_live_call_ids: []
+  responses_live_suffix: null
+  responses_live_suffix_spans: []
+  anthropic live tool 0
+  anthropic_live_call_ids: []
+  anthropic_live_suffix: null
+  anthropic_live_suffix_spans: []
+== chat/think-false [chat/inkling] OK
+  kind 0 api 0 chat_v41 0 chat_qwen 0
+  model: "deepseek-v4-flash"
+  model_from_request 0 max_tokens 256
+  sampling t 1/0 top_p 1/0 top_k 0/0 min_p 0.0500000007/0 seed 0
+  logprobs 0 top 0 stream 0 usage 0
+  think_mode 0 has_tools 0 force_tool_call 0 summary 0
+  forced_tool_name: null
+  stops: []
+  tool_orders 0:
+  qwen_tools_json: null
+  prompt_text: "<|message_system|><|content_text|>Thinking effort level: 0.0<|end_message|><|message_user|><|content_text|>What is 17 * 23?<|end_message|><|message_model|>"
+  prompt_spans: [107-123]
+  images 0
+  responses live tool 0 reasoning 0
+  responses_live_call_ids: []
+  responses_live_suffix: null
+  responses_live_suffix_spans: []
+  anthropic live tool 0
+  anthropic_live_call_ids: []
+  anthropic_live_suffix: null
+  anthropic_live_suffix_spans: []
+== chat/enable-thinking-false [chat/inkling] OK
+  kind 0 api 0 chat_v41 0 chat_qwen 0
+  model: "deepseek-v4-flash"
+  model_from_request 0 max_tokens 256
+  sampling t 1/0 top_p 1/0 top_k 0/0 min_p 0.0500000007/0 seed 0
+  logprobs 0 top 0 stream 0 usage 0
+  think_mode 0 has_tools 0 force_tool_call 0 summary 0
+  forced_tool_name: null
+  stops: []
+  tool_orders 0:
+  qwen_tools_json: null
+  prompt_text: "<|message_system|><|content_text|>Thinking effort level: 0.0<|end_message|><|message_user|><|content_text|>What is 17 * 23?<|end_message|><|message_model|>"
+  prompt_spans: [107-123]
+  images 0
+  responses live tool 0 reasoning 0
+  responses_live_call_ids: []
+  responses_live_suffix: null
+  responses_live_suffix_spans: []
+  anthropic live tool 0
+  anthropic_live_call_ids: []
+  anthropic_live_suffix: null
+  anthropic_live_suffix_spans: []
+== chat/enable-thinking-true [chat/inkling] OK
+  kind 0 api 0 chat_v41 0 chat_qwen 0
+  model: "deepseek-v4-flash"
+  model_from_request 0 max_tokens 256
+  sampling t 1/0 top_p 1/0 top_k 0/0 min_p 0.0500000007/0 seed 0
+  logprobs 0 top 0 stream 0 usage 0
+  think_mode 75 has_tools 0 force_tool_call 0 summary 0
+  forced_tool_name: null
+  stops: []
+  tool_orders 0:
+  qwen_tools_json: null
+  prompt_text: "<|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>What is 17 * 23?<|end_message|><|message_model|>"
+  prompt_spans: [107-123]
+  images 0
+  responses live tool 0 reasoning 0
+  responses_live_call_ids: []
+  responses_live_suffix: null
+  responses_live_suffix_spans: []
+  anthropic live tool 0
+  anthropic_live_call_ids: []
+  anthropic_live_suffix: null
+  anthropic_live_suffix_spans: []
+== chat/thinking-disabled [chat/inkling] OK
+  kind 0 api 0 chat_v41 0 chat_qwen 0
+  model: "deepseek-v4-flash"
+  model_from_request 0 max_tokens 256
+  sampling t 1/0 top_p 1/0 top_k 0/0 min_p 0.0500000007/0 seed 0
+  logprobs 0 top 0 stream 0 usage 0
+  think_mode 0 has_tools 0 force_tool_call 0 summary 0
+  forced_tool_name: null
+  stops: []
+  tool_orders 0:
+  qwen_tools_json: null
+  prompt_text: "<|message_system|><|content_text|>Thinking effort level: 0.0<|end_message|><|message_user|><|content_text|>What is 17 * 23?<|end_message|><|message_model|>"
+  prompt_spans: [107-123]
+  images 0
+  responses live tool 0 reasoning 0
+  responses_live_call_ids: []
+  responses_live_suffix: null
+  responses_live_suffix_spans: []
+  anthropic live tool 0
+  anthropic_live_call_ids: []
+  anthropic_live_suffix: null
+  anthropic_live_suffix_spans: []
+== chat/thinking-enabled [chat/inkling] OK
+  kind 0 api 0 chat_v41 0 chat_qwen 0
+  model: "deepseek-v4-flash"
+  model_from_request 0 max_tokens 256
+  sampling t 1/0 top_p 1/0 top_k 0/0 min_p 0.0500000007/0 seed 0
+  logprobs 0 top 0 stream 0 usage 0
+  think_mode 75 has_tools 0 force_tool_call 0 summary 0
+  forced_tool_name: null
+  stops: []
+  tool_orders 0:
+  qwen_tools_json: null
+  prompt_text: "<|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>What is 17 * 23?<|end_message|><|message_model|>"
+  prompt_spans: [107-123]
+  images 0
+  responses live tool 0 reasoning 0
+  responses_live_call_ids: []
+  responses_live_suffix: null
+  responses_live_suffix_spans: []
+  anthropic live tool 0
+  anthropic_live_call_ids: []
+  anthropic_live_suffix: null
+  anthropic_live_suffix_spans: []
+== chat/thinking-null [chat/inkling] OK
+  kind 0 api 0 chat_v41 0 chat_qwen 0
+  model: "deepseek-v4-flash"
+  model_from_request 0 max_tokens 256
+  sampling t 1/0 top_p 1/0 top_k 0/0 min_p 0.0500000007/0 seed 0
+  logprobs 0 top 0 stream 0 usage 0
+  think_mode 75 has_tools 0 force_tool_call 0 summary 0
+  forced_tool_name: null
+  stops: []
+  tool_orders 0:
+  qwen_tools_json: null
+  prompt_text: "<|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>What is 17 * 23?<|end_message|><|message_model|>"
+  prompt_spans: [107-123]
+  images 0
+  responses live tool 0 reasoning 0
+  responses_live_call_ids: []
+  responses_live_suffix: null
+  responses_live_suffix_spans: []
+  anthropic live tool 0
+  anthropic_live_call_ids: []
+  anthropic_live_suffix: null
+  anthropic_live_suffix_spans: []
+== chat/effort-low [chat/inkling] OK
+  kind 0 api 0 chat_v41 0 chat_qwen 0
+  model: "deepseek-v4-flash"
+  model_from_request 0 max_tokens 256
+  sampling t 1/0 top_p 1/0 top_k 0/0 min_p 0.0500000007/0 seed 0
+  logprobs 0 top 0 stream 0 usage 0
+  think_mode 75 has_tools 0 force_tool_call 0 summary 0
+  forced_tool_name: null
+  stops: []
+  tool_orders 0:
+  qwen_tools_json: null
+  prompt_text: "<|message_system|><|content_text|>Thinking effort level: 0.2<|end_message|><|message_user|><|content_text|>What is 17 * 23?<|end_message|><|message_model|>"
+  prompt_spans: [107-123]
+  images 0
+  responses live tool 0 reasoning 0
+  responses_live_call_ids: []
+  responses_live_suffix: null
+  responses_live_suffix_spans: []
+  anthropic live tool 0
+  anthropic_live_call_ids: []
+  anthropic_live_suffix: null
+  anthropic_live_suffix_spans: []
+== chat/effort-medium [chat/inkling] OK
+  kind 0 api 0 chat_v41 0 chat_qwen 0
+  model: "deepseek-v4-flash"
+  model_from_request 0 max_tokens 256
+  sampling t 1/0 top_p 1/0 top_k 0/0 min_p 0.0500000007/0 seed 0
+  logprobs 0 top 0 stream 0 usage 0
+  think_mode 75 has_tools 0 force_tool_call 0 summary 0
+  forced_tool_name: null
+  stops: []
+  tool_orders 0:
+  qwen_tools_json: null
+  prompt_text: "<|message_system|><|content_text|>Thinking effort level: 0.7<|end_message|><|message_user|><|content_text|>What is 17 * 23?<|end_message|><|message_model|>"
+  prompt_spans: [107-123]
+  images 0
+  responses live tool 0 reasoning 0
+  responses_live_call_ids: []
+  responses_live_suffix: null
+  responses_live_suffix_spans: []
+  anthropic live tool 0
+  anthropic_live_call_ids: []
+  anthropic_live_suffix: null
+  anthropic_live_suffix_spans: []
+== chat/effort-high [chat/inkling] OK
+  kind 0 api 0 chat_v41 0 chat_qwen 0
+  model: "deepseek-v4-flash"
+  model_from_request 0 max_tokens 256
+  sampling t 1/0 top_p 1/0 top_k 0/0 min_p 0.0500000007/0 seed 0
+  logprobs 0 top 0 stream 0 usage 0
+  think_mode 75 has_tools 0 force_tool_call 0 summary 0
+  forced_tool_name: null
+  stops: []
+  tool_orders 0:
+  qwen_tools_json: null
+  prompt_text: "<|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>What is 17 * 23?<|end_message|><|message_model|>"
+  prompt_spans: [107-123]
+  images 0
+  responses live tool 0 reasoning 0
+  responses_live_call_ids: []
+  responses_live_suffix: null
+  responses_live_suffix_spans: []
+  anthropic live tool 0
+  anthropic_live_call_ids: []
+  anthropic_live_suffix: null
+  anthropic_live_suffix_spans: []
+== chat/effort-max [chat/inkling] OK
+  kind 0 api 0 chat_v41 0 chat_qwen 0
+  model: "deepseek-v4-flash"
+  model_from_request 0 max_tokens 256
+  sampling t 1/0 top_p 1/0 top_k 0/0 min_p 0.0500000007/0 seed 0
+  logprobs 0 top 0 stream 0 usage 0
+  think_mode 75 has_tools 0 force_tool_call 0 summary 0
+  forced_tool_name: null
+  stops: []
+  tool_orders 0:
+  qwen_tools_json: null
+  prompt_text: "<|message_system|><|content_text|>Thinking effort level: 0.99<|end_message|><|message_user|><|content_text|>What is 17 * 23?<|end_message|><|message_model|>"
+  prompt_spans: [108-124]
+  images 0
+  responses live tool 0 reasoning 0
+  responses_live_call_ids: []
+  responses_live_suffix: null
+  responses_live_suffix_spans: []
+  anthropic live tool 0
+  anthropic_live_call_ids: []
+  anthropic_live_suffix: null
+  anthropic_live_suffix_spans: []
+== chat/effort-xhigh [chat/inkling] OK
+  kind 0 api 0 chat_v41 0 chat_qwen 0
+  model: "deepseek-v4-flash"
+  model_from_request 0 max_tokens 256
+  sampling t 1/0 top_p 1/0 top_k 0/0 min_p 0.0500000007/0 seed 0
+  logprobs 0 top 0 stream 0 usage 0
+  think_mode 75 has_tools 0 force_tool_call 0 summary 0
+  forced_tool_name: null
+  stops: []
+  tool_orders 0:
+  qwen_tools_json: null
+  prompt_text: "<|message_system|><|content_text|>Thinking effort level: 0.99<|end_message|><|message_user|><|content_text|>What is 17 * 23?<|end_message|><|message_model|>"
+  prompt_spans: [108-124]
+  images 0
+  responses live tool 0 reasoning 0
+  responses_live_call_ids: []
+  responses_live_suffix: null
+  responses_live_suffix_spans: []
+  anthropic live tool 0
+  anthropic_live_call_ids: []
+  anthropic_live_suffix: null
+  anthropic_live_suffix_spans: []
+== chat/effort-none [chat/inkling] OK
+  kind 0 api 0 chat_v41 0 chat_qwen 0
+  model: "deepseek-v4-flash"
+  model_from_request 0 max_tokens 256
+  sampling t 1/0 top_p 1/0 top_k 0/0 min_p 0.0500000007/0 seed 0
+  logprobs 0 top 0 stream 0 usage 0
+  think_mode 0 has_tools 0 force_tool_call 0 summary 0
+  forced_tool_name: null
+  stops: []
+  tool_orders 0:
+  qwen_tools_json: null
+  prompt_text: "<|message_system|><|content_text|>Thinking effort level: 0.0<|end_message|><|message_user|><|content_text|>What is 17 * 23?<|end_message|><|message_model|>"
+  prompt_spans: [107-123]
+  images 0
+  responses live tool 0 reasoning 0
+  responses_live_call_ids: []
+  responses_live_suffix: null
+  responses_live_suffix_spans: []
+  anthropic live tool 0
+  anthropic_live_call_ids: []
+  anthropic_live_suffix: null
+  anthropic_live_suffix_spans: []
+== chat/effort-minimal [chat/inkling] OK
+  kind 0 api 0 chat_v41 0 chat_qwen 0
+  model: "deepseek-v4-flash"
+  model_from_request 0 max_tokens 256
+  sampling t 1/0 top_p 1/0 top_k 0/0 min_p 0.0500000007/0 seed 0
+  logprobs 0 top 0 stream 0 usage 0
+  think_mode 75 has_tools 0 force_tool_call 0 summary 0
+  forced_tool_name: null
+  stops: []
+  tool_orders 0:
+  qwen_tools_json: null
+  prompt_text: "<|message_system|><|content_text|>Thinking effort level: 0.1<|end_message|><|message_user|><|content_text|>What is 17 * 23?<|end_message|><|message_model|>"
+  prompt_spans: [107-123]
+  images 0
+  responses live tool 0 reasoning 0
+  responses_live_call_ids: []
+  responses_live_suffix: null
+  responses_live_suffix_spans: []
+  anthropic live tool 0
+  anthropic_live_call_ids: []
+  anthropic_live_suffix: null
+  anthropic_live_suffix_spans: []
+== chat/effort-bogus [chat/inkling] REFUSED
+  error: "reasoning_effort: \"bogus\" is not an effort -- send none, minimal, low, medium, high, xhigh, max or an integer 1..100"
+== chat/effort-50 [chat/inkling] OK
+  kind 0 api 0 chat_v41 0 chat_qwen 0
+  model: "deepseek-v4-flash"
+  model_from_request 0 max_tokens 256
+  sampling t 1/0 top_p 1/0 top_k 0/0 min_p 0.0500000007/0 seed 0
+  logprobs 0 top 0 stream 0 usage 0
+  think_mode 75 has_tools 0 force_tool_call 0 summary 0
+  forced_tool_name: null
+  stops: []
+  tool_orders 0:
+  qwen_tools_json: null
+  prompt_text: "<|message_system|><|content_text|>Thinking effort level: 0.5<|end_message|><|message_user|><|content_text|>What is 17 * 23?<|end_message|><|message_model|>"
+  prompt_spans: [107-123]
+  images 0
+  responses live tool 0 reasoning 0
+  responses_live_call_ids: []
+  responses_live_suffix: null
+  responses_live_suffix_spans: []
+  anthropic live tool 0
+  anthropic_live_call_ids: []
+  anthropic_live_suffix: null
+  anthropic_live_suffix_spans: []
+== chat/effort-101 [chat/inkling] REFUSED
+  error: "reasoning_effort: an effort is a name or an integer 1..100"
+== chat/effort-None [chat/inkling] OK
+  kind 0 api 0 chat_v41 0 chat_qwen 0
+  model: "deepseek-v4-flash"
+  model_from_request 0 max_tokens 256
+  sampling t 1/0 top_p 1/0 top_k 0/0 min_p 0.0500000007/0 seed 0
+  logprobs 0 top 0 stream 0 usage 0
+  think_mode 75 has_tools 0 force_tool_call 0 summary 0
+  forced_tool_name: null
+  stops: []
+  tool_orders 0:
+  qwen_tools_json: null
+  prompt_text: "<|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>What is 17 * 23?<|end_message|><|message_model|>"
+  prompt_spans: [107-123]
+  images 0
+  responses live tool 0 reasoning 0
+  responses_live_call_ids: []
+  responses_live_suffix: null
+  responses_live_suffix_spans: []
+  anthropic live tool 0
+  anthropic_live_call_ids: []
+  anthropic_live_suffix: null
+  anthropic_live_suffix_spans: []
+== chat/effort-and-off [chat/inkling] OK
+  kind 0 api 0 chat_v41 0 chat_qwen 0
+  model: "deepseek-v4-flash"
+  model_from_request 0 max_tokens 256
+  sampling t 1/0 top_p 1/0 top_k 0/0 min_p 0.0500000007/0 seed 0
+  logprobs 0 top 0 stream 0 usage 0
+  think_mode 0 has_tools 0 force_tool_call 0 summary 0
+  forced_tool_name: null
+  stops: []
+  tool_orders 0:
+  qwen_tools_json: null
+  prompt_text: "<|message_system|><|content_text|>Thinking effort level: 0.0<|end_message|><|message_user|><|content_text|>What is 17 * 23?<|end_message|><|message_model|>"
+  prompt_spans: [107-123]
+  images 0
+  responses live tool 0 reasoning 0
+  responses_live_call_ids: []
+  responses_live_suffix: null
+  responses_live_suffix_spans: []
+  anthropic live tool 0
+  anthropic_live_call_ids: []
+  anthropic_live_suffix: null
+  anthropic_live_suffix_spans: []
+== chat/kwargs [chat/inkling] OK
+  kind 0 api 0 chat_v41 0 chat_qwen 0
+  model: "deepseek-v4-flash"
+  model_from_request 0 max_tokens 256
+  sampling t 1/0 top_p 1/0 top_k 0/0 min_p 0.0500000007/0 seed 0
+  logprobs 0 top 0 stream 0 usage 0
+  think_mode 0 has_tools 0 force_tool_call 0 summary 0
+  forced_tool_name: null
+  stops: []
+  tool_orders 0:
+  qwen_tools_json: null
+  prompt_text: "<|message_system|><|content_text|>Thinking effort level: 0.0<|end_message|><|message_user|><|content_text|>What is 17 * 23?<|end_message|><|message_model|>"
+  prompt_spans: [107-123]
+  images 0
+  responses live tool 0 reasoning 0
+  responses_live_call_ids: []
+  responses_live_suffix: null
+  responses_live_suffix_spans: []
+  anthropic live tool 0
+  anthropic_live_call_ids: []
+  anthropic_live_suffix: null
+  anthropic_live_suffix_spans: []
+== chat/kwargs-effort [chat/inkling] OK
+  kind 0 api 0 chat_v41 0 chat_qwen 0
+  model: "deepseek-v4-flash"
+  model_from_request 0 max_tokens 256
+  sampling t 1/0 top_p 1/0 top_k 0/0 min_p 0.0500000007/0 seed 0
+  logprobs 0 top 0 stream 0 usage 0
+  think_mode 75 has_tools 0 force_tool_call 0 summary 0
+  forced_tool_name: null
+  stops: []
+  tool_orders 0:
+  qwen_tools_json: null
+  prompt_text: "<|message_system|><|content_text|>Thinking effort level: 0.2<|end_message|><|message_user|><|content_text|>What is 17 * 23?<|end_message|><|message_model|>"
+  prompt_spans: [107-123]
+  images 0
+  responses live tool 0 reasoning 0
+  responses_live_call_ids: []
+  responses_live_suffix: null
+  responses_live_suffix_spans: []
+  anthropic live tool 0
+  anthropic_live_call_ids: []
+  anthropic_live_suffix: null
+  anthropic_live_suffix_spans: []
+== chat/kwargs-unknown [chat/inkling] REFUSED
+  error: "chat_template_kwargs.add_vision_id is not a template variable this server renders (enable_thinking, reasoning_effort)"
+== chat/alias-chat [chat/inkling] OK
+  kind 0 api 0 chat_v41 0 chat_qwen 0
+  model: "deepseek-chat"
+  model_from_request 1 max_tokens 256
+  sampling t 1/0 top_p 1/0 top_k 0/0 min_p 0.0500000007/0 seed 0
+  logprobs 0 top 0 stream 0 usage 0
+  think_mode 0 has_tools 0 force_tool_call 0 summary 0
+  forced_tool_name: null
+  stops: []
+  tool_orders 0:
+  qwen_tools_json: null
+  prompt_text: "<|message_system|><|content_text|>Thinking effort level: 0.0<|end_message|><|message_user|><|content_text|>What is 17 * 23?<|end_message|><|message_model|>"
+  prompt_spans: [107-123]
+  images 0
+  responses live tool 0 reasoning 0
+  responses_live_call_ids: []
+  responses_live_suffix: null
+  responses_live_suffix_spans: []
+  anthropic live tool 0
+  anthropic_live_call_ids: []
+  anthropic_live_suffix: null
+  anthropic_live_suffix_spans: []
+== chat/alias-reasoner [chat/inkling] OK
+  kind 0 api 0 chat_v41 0 chat_qwen 0
+  model: "deepseek-reasoner"
+  model_from_request 1 max_tokens 256
+  sampling t 1/0 top_p 1/0 top_k 0/0 min_p 0.0500000007/0 seed 0
+  logprobs 0 top 0 stream 0 usage 0
+  think_mode 0 has_tools 0 force_tool_call 0 summary 0
+  forced_tool_name: null
+  stops: []
+  tool_orders 0:
+  qwen_tools_json: null
+  prompt_text: "<|message_system|><|content_text|>Thinking effort level: 0.0<|end_message|><|message_user|><|content_text|>What is 17 * 23?<|end_message|><|message_model|>"
+  prompt_spans: [107-123]
+  images 0
+  responses live tool 0 reasoning 0
+  responses_live_call_ids: []
+  responses_live_suffix: null
+  responses_live_suffix_spans: []
+  anthropic live tool 0
+  anthropic_live_call_ids: []
+  anthropic_live_suffix: null
+  anthropic_live_suffix_spans: []
+== chat/stop [chat/inkling] OK
+  kind 0 api 0 chat_v41 0 chat_qwen 0
+  model: "deepseek-v4-flash"
+  model_from_request 0 max_tokens 256
+  sampling t 1/0 top_p 1/0 top_k 0/0 min_p 0.0500000007/0 seed 0
+  logprobs 0 top 0 stream 0 usage 0
+  think_mode 75 has_tools 0 force_tool_call 0 summary 0
+  forced_tool_name: null
+  stops: ["\n\n" "END"]
+  tool_orders 0:
+  qwen_tools_json: null
+  prompt_text: "<|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>What is 17 * 23?<|end_message|><|message_model|>"
+  prompt_spans: [107-123]
+  images 0
+  responses live tool 0 reasoning 0
+  responses_live_call_ids: []
+  responses_live_suffix: null
+  responses_live_suffix_spans: []
+  anthropic live tool 0
+  anthropic_live_call_ids: []
+  anthropic_live_suffix: null
+  anthropic_live_suffix_spans: []
+== chat/stop-str [chat/inkling] OK
+  kind 0 api 0 chat_v41 0 chat_qwen 0
+  model: "deepseek-v4-flash"
+  model_from_request 0 max_tokens 256
+  sampling t 1/0 top_p 1/0 top_k 0/0 min_p 0.0500000007/0 seed 0
+  logprobs 0 top 0 stream 0 usage 0
+  think_mode 75 has_tools 0 force_tool_call 0 summary 0
+  forced_tool_name: null
+  stops: ["STOP"]
+  tool_orders 0:
+  qwen_tools_json: null
+  prompt_text: "<|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>What is 17 * 23?<|end_message|><|message_model|>"
+  prompt_spans: [107-123]
+  images 0
+  responses live tool 0 reasoning 0
+  responses_live_call_ids: []
+  responses_live_suffix: null
+  responses_live_suffix_spans: []
+  anthropic live tool 0
+  anthropic_live_call_ids: []
+  anthropic_live_suffix: null
+  anthropic_live_suffix_spans: []
+== chat/sampling [chat/inkling] OK
+  kind 0 api 0 chat_v41 0 chat_qwen 0
+  model: "deepseek-v4-flash"
+  model_from_request 0 max_tokens 99
+  sampling t 0.699999988/1 top_p 0.899999976/1 top_k 40/1 min_p 0.0500000007/1 seed 1234
+  logprobs 0 top 0 stream 0 usage 0
+  think_mode 75 has_tools 0 force_tool_call 0 summary 0
+  forced_tool_name: null
+  stops: []
+  tool_orders 0:
+  qwen_tools_json: null
+  prompt_text: "<|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>What is 17 * 23?<|end_message|><|message_model|>"
+  prompt_spans: [107-123]
+  images 0
+  responses live tool 0 reasoning 0
+  responses_live_call_ids: []
+  responses_live_suffix: null
+  responses_live_suffix_spans: []
+  anthropic live tool 0
+  anthropic_live_call_ids: []
+  anthropic_live_suffix: null
+  anthropic_live_suffix_spans: []
+== chat/logprobs [chat/inkling] OK
+  kind 0 api 0 chat_v41 0 chat_qwen 0
+  model: "deepseek-v4-flash"
+  model_from_request 0 max_tokens 256
+  sampling t 1/0 top_p 1/0 top_k 0/0 min_p 0.0500000007/0 seed 0
+  logprobs 1 top 5 stream 0 usage 0
+  think_mode 75 has_tools 0 force_tool_call 0 summary 0
+  forced_tool_name: null
+  stops: []
+  tool_orders 0:
+  qwen_tools_json: null
+  prompt_text: "<|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>What is 17 * 23?<|end_message|><|message_model|>"
+  prompt_spans: [107-123]
+  images 0
+  responses live tool 0 reasoning 0
+  responses_live_call_ids: []
+  responses_live_suffix: null
+  responses_live_suffix_spans: []
+  anthropic live tool 0
+  anthropic_live_call_ids: []
+  anthropic_live_suffix: null
+  anthropic_live_suffix_spans: []
+== chat/logprobs-null [chat/inkling] OK
+  kind 0 api 0 chat_v41 0 chat_qwen 0
+  model: "deepseek-v4-flash"
+  model_from_request 0 max_tokens 256
+  sampling t 1/0 top_p 1/0 top_k 0/0 min_p 0.0500000007/0 seed 0
+  logprobs 0 top 0 stream 0 usage 0
+  think_mode 75 has_tools 0 force_tool_call 0 summary 0
+  forced_tool_name: null
+  stops: []
+  tool_orders 0:
+  qwen_tools_json: null
+  prompt_text: "<|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>What is 17 * 23?<|end_message|><|message_model|>"
+  prompt_spans: [107-123]
+  images 0
+  responses live tool 0 reasoning 0
+  responses_live_call_ids: []
+  responses_live_suffix: null
+  responses_live_suffix_spans: []
+  anthropic live tool 0
+  anthropic_live_call_ids: []
+  anthropic_live_suffix: null
+  anthropic_live_suffix_spans: []
+== chat/top-logprobs-alone [chat/inkling] REFUSED
+  error: "top_logprobs requires logprobs to be true"
+== chat/top-logprobs-big [chat/inkling] REFUSED
+  error: "top_logprobs must be an integer between 0 and 20"
+== chat/stream [chat/inkling] OK
+  kind 0 api 0 chat_v41 0 chat_qwen 0
+  model: "deepseek-v4-flash"
+  model_from_request 0 max_tokens 256
+  sampling t 1/0 top_p 1/0 top_k 0/0 min_p 0.0500000007/0 seed 0
+  logprobs 0 top 0 stream 1 usage 1
+  think_mode 75 has_tools 0 force_tool_call 0 summary 0
+  forced_tool_name: null
+  stops: []
+  tool_orders 0:
+  qwen_tools_json: null
+  prompt_text: "<|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>What is 17 * 23?<|end_message|><|message_model|>"
+  prompt_spans: [107-123]
+  images 0
+  responses live tool 0 reasoning 0
+  responses_live_call_ids: []
+  responses_live_suffix: null
+  responses_live_suffix_spans: []
+  anthropic live tool 0
+  anthropic_live_call_ids: []
+  anthropic_live_suffix: null
+  anthropic_live_suffix_spans: []
+== chat/image [chat/inkling] REFUSED
+  error: "inkling: a message carries an image -- the family's image front (E9) is not wired; this engine renders text only"
+== chat/missing-messages [chat/inkling] REFUSED
+  error: "missing messages"
+== chat/not-object [chat/inkling] REFUSED
+  error: "invalid JSON request"
+== chat/system-late [chat/inkling] OK
+  kind 0 api 0 chat_v41 0 chat_qwen 0
+  model: "deepseek-v4-flash"
+  model_from_request 0 max_tokens 256
+  sampling t 1/0 top_p 1/0 top_k 0/0 min_p 0.0500000007/0 seed 0
+  logprobs 0 top 0 stream 0 usage 0
+  think_mode 75 has_tools 0 force_tool_call 0 summary 0
+  forced_tool_name: null
+  stops: []
+  tool_orders 0:
+  qwen_tools_json: null
+  prompt_text: "<|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>What is 17 * 23?<|end_message|><|message_system|><|content_text|>late<|end_message|><|message_model|>"
+  prompt_spans: [107-123 172-176]
+  images 0
+  responses live tool 0 reasoning 0
+  responses_live_call_ids: []
+  responses_live_suffix: null
+  responses_live_suffix_spans: []
+  anthropic live tool 0
+  anthropic_live_call_ids: []
+  anthropic_live_suffix: null
+  anthropic_live_suffix_spans: []
+== chat/extension-keys [chat/inkling] OK
+  kind 0 api 0 chat_v41 0 chat_qwen 0
+  model: "deepseek-v4-flash"
+  model_from_request 0 max_tokens 256
+  sampling t 1/0 top_p 1/0 top_k 0/0 min_p 0.0500000007/0 seed 0
+  logprobs 0 top 0 stream 0 usage 0
+  think_mode 75 has_tools 0 force_tool_call 0 summary 0
+  forced_tool_name: null
+  stops: []
+  tool_orders 0:
+  qwen_tools_json: null
+  prompt_text: "<|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>What is 17 * 23?<|end_message|><|message_model|>"
+  prompt_spans: [107-123]
+  images 0
+  responses live tool 0 reasoning 0
+  responses_live_call_ids: []
+  responses_live_suffix: null
+  responses_live_suffix_spans: []
+  anthropic live tool 0
+  anthropic_live_call_ids: []
+  anthropic_live_suffix: null
+  anthropic_live_suffix_spans: []
+== an/plain [anthropic/inkling] OK
+  kind 0 api 1 chat_v41 0 chat_qwen 0
+  model: "m"
+  model_from_request 1 max_tokens 100
+  sampling t 1/0 top_p 1/0 top_k 0/0 min_p 0.0500000007/0 seed 0
+  logprobs 0 top 0 stream 0 usage 0
+  think_mode 75 has_tools 0 force_tool_call 0 summary 0
+  forced_tool_name: null
+  stops: []
+  tool_orders 0:
+  qwen_tools_json: null
+  prompt_text: "<|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>What is 17 * 23?<|end_message|><|message_model|>"
+  prompt_spans: [107-123]
+  images 0
+  responses live tool 0 reasoning 0
+  responses_live_call_ids: []
+  responses_live_suffix: null
+  responses_live_suffix_spans: []
+  anthropic live tool 0
+  anthropic_live_call_ids: []
+  anthropic_live_suffix: null
+  anthropic_live_suffix_spans: []
+== an/system-str [anthropic/inkling] OK
+  kind 0 api 1 chat_v41 0 chat_qwen 0
+  model: "deepseek-v4-flash"
+  model_from_request 0 max_tokens 50
+  sampling t 1/0 top_p 1/0 top_k 0/0 min_p 0.0500000007/0 seed 0
+  logprobs 0 top 0 stream 0 usage 0
+  think_mode 75 has_tools 0 force_tool_call 0 summary 0
+  forced_tool_name: null
+  stops: []
+  tool_orders 0:
+  qwen_tools_json: null
+  prompt_text: "<|message_system|><|content_text|>You are terse.<|end_message|><|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>What is 17 * 23?<|end_message|><|message_model|>"
+  prompt_spans: [34-48 170-186]
+  images 0
+  responses live tool 0 reasoning 0
+  responses_live_call_ids: []
+  responses_live_suffix: null
+  responses_live_suffix_spans: []
+  anthropic live tool 0
+  anthropic_live_call_ids: []
+  anthropic_live_suffix: null
+  anthropic_live_suffix_spans: []
+== an/system-blocks [anthropic/inkling] OK
+  kind 0 api 1 chat_v41 0 chat_qwen 0
+  model: "deepseek-v4-flash"
+  model_from_request 0 max_tokens 50
+  sampling t 1/0 top_p 1/0 top_k 0/0 min_p 0.0500000007/0 seed 0
+  logprobs 0 top 0 stream 0 usage 0
+  think_mode 75 has_tools 0 force_tool_call 0 summary 0
+  forced_tool_name: null
+  stops: []
+  tool_orders 0:
+  qwen_tools_json: null
+  prompt_text: "<|message_system|><|content_text|>Block one.\nBlock two.<|end_message|><|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>What is 17 * 23?<|end_message|><|message_model|>"
+  prompt_spans: [34-55 177-193]
+  images 0
+  responses live tool 0 reasoning 0
+  responses_live_call_ids: []
+  responses_live_suffix: null
+  responses_live_suffix_spans: []
+  anthropic live tool 0
+  anthropic_live_call_ids: []
+  anthropic_live_suffix: null
+  anthropic_live_suffix_spans: []
+== an/blocks [anthropic/inkling] OK
+  kind 0 api 1 chat_v41 0 chat_qwen 0
+  model: "deepseek-v4-flash"
+  model_from_request 0 max_tokens 50
+  sampling t 1/0 top_p 1/0 top_k 0/0 min_p 0.0500000007/0 seed 0
+  logprobs 0 top 0 stream 0 usage 0
+  think_mode 75 has_tools 0 force_tool_call 0 summary 0
+  forced_tool_name: null
+  stops: []
+  tool_orders 0:
+  qwen_tools_json: null
+  prompt_text: "<|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>ab<|end_message|><|message_model|>"
+  prompt_spans: [107-109]
+  images 0
+  responses live tool 0 reasoning 0
+  responses_live_call_ids: []
+  responses_live_suffix: null
+  responses_live_suffix_spans: []
+  anthropic live tool 0
+  anthropic_live_call_ids: []
+  anthropic_live_suffix: null
+  anthropic_live_suffix_spans: []
+== an/tools [anthropic/inkling] OK
+  kind 0 api 1 chat_v41 0 chat_qwen 0
+  model: "deepseek-v4-flash"
+  model_from_request 0 max_tokens 50
+  sampling t 1/0 top_p 1/0 top_k 0/0 min_p 0.0500000007/0 seed 0
+  logprobs 0 top 0 stream 0 usage 0
+  think_mode 75 has_tools 1 force_tool_call 0 summary 0
+  forced_tool_name: null
+  stops: []
+  tool_orders 2: {get_weather|-|-|0|city,unit} {search|-|-|0|q,n}
+  qwen_tools_json: "[{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"Weather for a city\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"c\", \"f\"]}}, \"required\": [\"city\"]}}}, {\"type\": \"function\", \"function\": {\"name\": \"search\", \"description\": \"Search the web <fast>\", \"parameters\": {\"type\": \"object\", \"properties\": {\"q\": {\"type\": \"string\"}, \"n\": {\"type\": \"integer\"}}}}}]"
+  prompt_text: "<|message_system|>tool_declare<|content_xml|>[{\"description\":\"Weather for a city\",\"name\":\"get_weather\",\"parameters\":{\"properties\":{\"city\":{\"type\":\"string\"},\"unit\":{\"enum\":[\"c\",\"f\"],\"type\":\"string\"}},\"required\":[\"city\"],\"type\":\"object\"},\"type\":\"function\"},{\"description\":\"Search the web <fast>\",\"name\":\"search\",\"parameters\":{\"properties\":{\"n\":{\"type\":\"integer\"},\"q\":{\"type\":\"string\"}},\"type\":\"object\"},\"type\":\"function\"}]<|end_message|><|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>What is 17 * 23?<|end_message|><|message_model|>"
+  prompt_spans: [45-420 542-558]
+  images 0
+  responses live tool 0 reasoning 0
+  responses_live_call_ids: []
+  responses_live_suffix: null
+  responses_live_suffix_spans: []
+  anthropic live tool 0
+  anthropic_live_call_ids: []
+  anthropic_live_suffix: null
+  anthropic_live_suffix_spans: []
+== an/tools-turns [anthropic/inkling] OK
+  kind 0 api 1 chat_v41 0 chat_qwen 0
+  model: "deepseek-v4-flash"
+  model_from_request 0 max_tokens 50
+  sampling t 1/0 top_p 1/0 top_k 0/0 min_p 0.0500000007/0 seed 0
+  logprobs 0 top 0 stream 0 usage 0
+  think_mode 75 has_tools 1 force_tool_call 0 summary 0
+  forced_tool_name: null
+  stops: []
+  tool_orders 2: {get_weather|-|-|0|city,unit} {search|-|-|0|q,n}
+  qwen_tools_json: "[{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"Weather for a city\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"c\", \"f\"]}}, \"required\": [\"city\"]}}}, {\"type\": \"function\", \"function\": {\"name\": \"search\", \"description\": \"Search the web <fast>\", \"parameters\": {\"type\": \"object\", \"properties\": {\"q\": {\"type\": \"string\"}, \"n\": {\"type\": \"integer\"}}}}}]"
+  prompt_text: "<|message_system|>tool_declare<|content_xml|>[{\"description\":\"Weather for a city\",\"name\":\"get_weather\",\"parameters\":{\"properties\":{\"city\":{\"type\":\"string\"},\"unit\":{\"enum\":[\"c\",\"f\"],\"type\":\"string\"}},\"required\":[\"city\"],\"type\":\"object\"},\"type\":\"function\"},{\"description\":\"Search the web <fast>\",\"name\":\"search\",\"parameters\":{\"properties\":{\"n\":{\"type\":\"integer\"},\"q\":{\"type\":\"string\"}},\"type\":\"object\"},\"type\":\"function\"}]<|end_message|><|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>Weather in Paris?<|end_message|><|message_model|><|content_thinking|>Need the tool.<|end_message|><|message_model|><|content_text|>Checking.<|end_message|><|message_model|>get_weather<|content_invoke_tool_json|>{\"name\":\"get_weather\",\"args\":{\"city\":\"Paris\"}}<|end_message|><|content_model_end_sampling|><|message_tool|>get_weather<|content_text|>18C<|end_message|><|message_user|><|content_text|>And tomorrow?<|end_message|><|message_model|>"
+  prompt_spans: [45-420 542-559 611-625 673-682 714-725 753-799 860-871 887-890 937-950]
+  images 0
+  responses live tool 0 reasoning 0
+  responses_live_call_ids: []
+  responses_live_suffix: null
+  responses_live_suffix_spans: []
+  anthropic live tool 0
+  anthropic_live_call_ids: []
+  anthropic_live_suffix: null
+  anthropic_live_suffix_spans: []
+== an/tool-result-array [anthropic/inkling] OK
+  kind 0 api 1 chat_v41 0 chat_qwen 0
+  model: "deepseek-v4-flash"
+  model_from_request 0 max_tokens 50
+  sampling t 1/0 top_p 1/0 top_k 0/0 min_p 0.0500000007/0 seed 0
+  logprobs 0 top 0 stream 0 usage 0
+  think_mode 75 has_tools 1 force_tool_call 0 summary 0
+  forced_tool_name: null
+  stops: []
+  tool_orders 2: {get_weather|-|-|0|city,unit} {search|-|-|0|q,n}
+  qwen_tools_json: "[{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"Weather for a city\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"c\", \"f\"]}}, \"required\": [\"city\"]}}}, {\"type\": \"function\", \"function\": {\"name\": \"search\", \"description\": \"Search the web <fast>\", \"parameters\": {\"type\": \"object\", \"properties\": {\"q\": {\"type\": \"string\"}, \"n\": {\"type\": \"integer\"}}}}}]"
+  prompt_text: "<|message_system|>tool_declare<|content_xml|>[{\"description\":\"Weather for a city\",\"name\":\"get_weather\",\"parameters\":{\"properties\":{\"city\":{\"type\":\"string\"},\"unit\":{\"enum\":[\"c\",\"f\"],\"type\":\"string\"}},\"required\":[\"city\"],\"type\":\"object\"},\"type\":\"function\"},{\"description\":\"Search the web <fast>\",\"name\":\"search\",\"parameters\":{\"properties\":{\"n\":{\"type\":\"integer\"},\"q\":{\"type\":\"string\"}},\"type\":\"object\"},\"type\":\"function\"}]<|end_message|><|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>Weather in Paris?<|end_message|><|message_model|><|content_thinking|>Need the tool.<|end_message|><|message_model|><|content_text|>Checking.<|end_message|><|message_model|>get_weather<|content_invoke_tool_json|>{\"name\":\"get_weather\",\"args\":{\"city\":\"Paris\"}}<|end_message|><|content_model_end_sampling|><|message_tool|>get_weather<|content_text|>18C<|end_message|><|message_model|>"
+  prompt_spans: [45-420 542-559 611-625 673-682 714-725 753-799 860-871 887-890]
+  images 0
+  responses live tool 0 reasoning 0
+  responses_live_call_ids: []
+  responses_live_suffix: null
+  responses_live_suffix_spans: []
+  anthropic live tool 0
+  anthropic_live_call_ids: ["toolu_1"]
+  anthropic_live_suffix: "<|content_model_end_sampling|><|message_tool|>get_weather<|content_text|>18C<|end_message|><|message_model|>"
+  anthropic_live_suffix_spans: [46-57 73-76]
+== an/tools-websearch [anthropic/inkling] OK
+  kind 0 api 1 chat_v41 0 chat_qwen 0
+  model: "deepseek-v4-flash"
+  model_from_request 0 max_tokens 50
+  sampling t 1/0 top_p 1/0 top_k 0/0 min_p 0.0500000007/0 seed 0
+  logprobs 0 top 0 stream 0 usage 0
+  think_mode 75 has_tools 1 force_tool_call 0 summary 0
+  forced_tool_name: null
+  stops: []
+  tool_orders 2: {get_weather|-|-|0|city,unit} {search|-|-|0|q,n}
+  qwen_tools_json: "[{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"Weather for a city\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"c\", \"f\"]}}, \"required\": [\"city\"]}}}, {\"type\": \"function\", \"function\": {\"name\": \"search\", \"description\": \"Search the web <fast>\", \"parameters\": {\"type\": \"object\", \"properties\": {\"q\": {\"type\": \"string\"}, \"n\": {\"type\": \"integer\"}}}}}]"
+  prompt_text: "<|message_system|>tool_declare<|content_xml|>[{\"description\":\"Weather for a city\",\"name\":\"get_weather\",\"parameters\":{\"properties\":{\"city\":{\"type\":\"string\"},\"unit\":{\"enum\":[\"c\",\"f\"],\"type\":\"string\"}},\"required\":[\"city\"],\"type\":\"object\"},\"type\":\"function\"},{\"description\":\"Search the web <fast>\",\"name\":\"search\",\"parameters\":{\"properties\":{\"n\":{\"type\":\"integer\"},\"q\":{\"type\":\"string\"}},\"type\":\"object\"},\"type\":\"function\"}]<|end_message|><|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>What is 17 * 23?<|end_message|><|message_model|>"
+  prompt_spans: [45-420 542-558]
+  images 0
+  responses live tool 0 reasoning 0
+  responses_live_call_ids: []
+  responses_live_suffix: null
+  responses_live_suffix_spans: []
+  anthropic live tool 0
+  anthropic_live_call_ids: []
+  anthropic_live_suffix: null
+  anthropic_live_suffix_spans: []
+== an/tools-custom [anthropic/inkling] OK
+  kind 0 api 1 chat_v41 0 chat_qwen 0
+  model: "deepseek-v4-flash"
+  model_from_request 0 max_tokens 50
+  sampling t 1/0 top_p 1/0 top_k 0/0 min_p 0.0500000007/0 seed 0
+  logprobs 0 top 0 stream 0 usage 0
+  think_mode 75 has_tools 1 force_tool_call 0 summary 0
+  forced_tool_name: null
+  stops: []
+  tool_orders 1: {get_weather|-|-|0|city,unit}
+  qwen_tools_json: "[{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"Weather for a city\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"c\", \"f\"]}}, \"required\": [\"city\"]}}}]"
+  prompt_text: "<|message_system|>tool_declare<|content_xml|>[{\"description\":\"Weather for a city\",\"name\":\"get_weather\",\"parameters\":{\"properties\":{\"city\":{\"type\":\"string\"},\"unit\":{\"enum\":[\"c\",\"f\"],\"type\":\"string\"}},\"required\":[\"city\"],\"type\":\"object\"},\"type\":\"function\"}]<|end_message|><|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>What is 17 * 23?<|end_message|><|message_model|>"
+  prompt_spans: [45-255 377-393]
+  images 0
+  responses live tool 0 reasoning 0
+  responses_live_call_ids: []
+  responses_live_suffix: null
+  responses_live_suffix_spans: []
+  anthropic live tool 0
+  anthropic_live_call_ids: []
+  anthropic_live_suffix: null
+  anthropic_live_suffix_spans: []
+== an/tools-unsupported [anthropic/inkling] REFUSED
+  error: "tools.2: Input tag 'advisor_20260301' found using 'type' does not match any of the expected tags"
+== an/tool-choice-auto [anthropic/inkling] OK
+  kind 0 api 1 chat_v41 0 chat_qwen 0
+  model: "deepseek-v4-flash"
+  model_from_request 0 max_tokens 50
+  sampling t 1/0 top_p 1/0 top_k 0/0 min_p 0.0500000007/0 seed 0
+  logprobs 0 top 0 stream 0 usage 0
+  think_mode 75 has_tools 1 force_tool_call 0 summary 0
+  forced_tool_name: null
+  stops: []
+  tool_orders 2: {get_weather|-|-|0|city,unit} {search|-|-|0|q,n}
+  qwen_tools_json: "[{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"Weather for a city\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"c\", \"f\"]}}, \"required\": [\"city\"]}}}, {\"type\": \"function\", \"function\": {\"name\": \"search\", \"description\": \"Search the web <fast>\", \"parameters\": {\"type\": \"object\", \"properties\": {\"q\": {\"type\": \"string\"}, \"n\": {\"type\": \"integer\"}}}}}]"
+  prompt_text: "<|message_system|>tool_declare<|content_xml|>[{\"description\":\"Weather for a city\",\"name\":\"get_weather\",\"parameters\":{\"properties\":{\"city\":{\"type\":\"string\"},\"unit\":{\"enum\":[\"c\",\"f\"],\"type\":\"string\"}},\"required\":[\"city\"],\"type\":\"object\"},\"type\":\"function\"},{\"description\":\"Search the web <fast>\",\"name\":\"search\",\"parameters\":{\"properties\":{\"n\":{\"type\":\"integer\"},\"q\":{\"type\":\"string\"}},\"type\":\"object\"},\"type\":\"function\"}]<|end_message|><|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>What is 17 * 23?<|end_message|><|message_model|>"
+  prompt_spans: [45-420 542-558]
+  images 0
+  responses live tool 0 reasoning 0
+  responses_live_call_ids: []
+  responses_live_suffix: null
+  responses_live_suffix_spans: []
+  anthropic live tool 0
+  anthropic_live_call_ids: []
+  anthropic_live_suffix: null
+  anthropic_live_suffix_spans: []
+== an/tool-choice-any [anthropic/inkling] REFUSED
+  error: "tool_choice required: Inkling's renderer has no forced tool call (vLLM's native Inkling renderer takes none) -- send auto or none"
+== an/tool-choice-none [anthropic/inkling] OK
+  kind 0 api 1 chat_v41 0 chat_qwen 0
+  model: "deepseek-v4-flash"
+  model_from_request 0 max_tokens 50
+  sampling t 1/0 top_p 1/0 top_k 0/0 min_p 0.0500000007/0 seed 0
+  logprobs 0 top 0 stream 0 usage 0
+  think_mode 75 has_tools 0 force_tool_call 0 summary 0
+  forced_tool_name: null
+  stops: []
+  tool_orders 2: {get_weather|-|-|0|city,unit} {search|-|-|0|q,n}
+  qwen_tools_json: null
+  prompt_text: "<|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>What is 17 * 23?<|end_message|><|message_model|>"
+  prompt_spans: [107-123]
+  images 0
+  responses live tool 0 reasoning 0
+  responses_live_call_ids: []
+  responses_live_suffix: null
+  responses_live_suffix_spans: []
+  anthropic live tool 0
+  anthropic_live_call_ids: []
+  anthropic_live_suffix: null
+  anthropic_live_suffix_spans: []
+== an/tool-choice-tool [anthropic/inkling] REFUSED
+  error: "tool_choice naming a function: Inkling's renderer has no forced tool call (vLLM's native Inkling renderer takes none) -- send auto or none"
+== an/thinking-enabled [anthropic/inkling] OK
+  kind 0 api 1 chat_v41 0 chat_qwen 0
+  model: "deepseek-v4-flash"
+  model_from_request 0 max_tokens 50
+  sampling t 1/0 top_p 1/0 top_k 0/0 min_p 0.0500000007/0 seed 0
+  logprobs 0 top 0 stream 0 usage 0
+  think_mode 75 has_tools 0 force_tool_call 0 summary 0
+  forced_tool_name: null
+  stops: []
+  tool_orders 0:
+  qwen_tools_json: null
+  prompt_text: "<|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>What is 17 * 23?<|end_message|><|message_model|>"
+  prompt_spans: [107-123]
+  images 0
+  responses live tool 0 reasoning 0
+  responses_live_call_ids: []
+  responses_live_suffix: null
+  responses_live_suffix_spans: []
+  anthropic live tool 0
+  anthropic_live_call_ids: []
+  anthropic_live_suffix: null
+  anthropic_live_suffix_spans: []
+== an/thinking-disabled [anthropic/inkling] OK
+  kind 0 api 1 chat_v41 0 chat_qwen 0
+  model: "deepseek-v4-flash"
+  model_from_request 0 max_tokens 50
+  sampling t 1/0 top_p 1/0 top_k 0/0 min_p 0.0500000007/0 seed 0
+  logprobs 0 top 0 stream 0 usage 0
+  think_mode 0 has_tools 0 force_tool_call 0 summary 0
+  forced_tool_name: null
+  stops: []
+  tool_orders 0:
+  qwen_tools_json: null
+  prompt_text: "<|message_system|><|content_text|>Thinking effort level: 0.0<|end_message|><|message_user|><|content_text|>What is 17 * 23?<|end_message|><|message_model|>"
+  prompt_spans: [107-123]
+  images 0
+  responses live tool 0 reasoning 0
+  responses_live_call_ids: []
+  responses_live_suffix: null
+  responses_live_suffix_spans: []
+  anthropic live tool 0
+  anthropic_live_call_ids: []
+  anthropic_live_suffix: null
+  anthropic_live_suffix_spans: []
+== an/thinking-adaptive [anthropic/inkling] OK
+  kind 0 api 1 chat_v41 0 chat_qwen 0
+  model: "deepseek-v4-flash"
+  model_from_request 0 max_tokens 50
+  sampling t 1/0 top_p 1/0 top_k 0/0 min_p 0.0500000007/0 seed 0
+  logprobs 0 top 0 stream 0 usage 0
+  think_mode 75 has_tools 0 force_tool_call 0 summary 0
+  forced_tool_name: null
+  stops: []
+  tool_orders 0:
+  qwen_tools_json: null
+  prompt_text: "<|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>What is 17 * 23?<|end_message|><|message_model|>"
+  prompt_spans: [107-123]
+  images 0
+  responses live tool 0 reasoning 0
+  responses_live_call_ids: []
+  responses_live_suffix: null
+  responses_live_suffix_spans: []
+  anthropic live tool 0
+  anthropic_live_call_ids: []
+  anthropic_live_suffix: null
+  anthropic_live_suffix_spans: []
+== an/output-effort-low [anthropic/inkling] OK
+  kind 0 api 1 chat_v41 0 chat_qwen 0
+  model: "deepseek-v4-flash"
+  model_from_request 0 max_tokens 50
+  sampling t 1/0 top_p 1/0 top_k 0/0 min_p 0.0500000007/0 seed 0
+  logprobs 0 top 0 stream 0 usage 0
+  think_mode 75 has_tools 0 force_tool_call 0 summary 0
+  forced_tool_name: null
+  stops: []
+  tool_orders 0:
+  qwen_tools_json: null
+  prompt_text: "<|message_system|><|content_text|>Thinking effort level: 0.2<|end_message|><|message_user|><|content_text|>What is 17 * 23?<|end_message|><|message_model|>"
+  prompt_spans: [107-123]
+  images 0
+  responses live tool 0 reasoning 0
+  responses_live_call_ids: []
+  responses_live_suffix: null
+  responses_live_suffix_spans: []
+  anthropic live tool 0
+  anthropic_live_call_ids: []
+  anthropic_live_suffix: null
+  anthropic_live_suffix_spans: []
+== an/output-effort-medium [anthropic/inkling] OK
+  kind 0 api 1 chat_v41 0 chat_qwen 0
+  model: "deepseek-v4-flash"
+  model_from_request 0 max_tokens 50
+  sampling t 1/0 top_p 1/0 top_k 0/0 min_p 0.0500000007/0 seed 0
+  logprobs 0 top 0 stream 0 usage 0
+  think_mode 75 has_tools 0 force_tool_call 0 summary 0
+  forced_tool_name: null
+  stops: []
+  tool_orders 0:
+  qwen_tools_json: null
+  prompt_text: "<|message_system|><|content_text|>Thinking effort level: 0.7<|end_message|><|message_user|><|content_text|>What is 17 * 23?<|end_message|><|message_model|>"
+  prompt_spans: [107-123]
+  images 0
+  responses live tool 0 reasoning 0
+  responses_live_call_ids: []
+  responses_live_suffix: null
+  responses_live_suffix_spans: []
+  anthropic live tool 0
+  anthropic_live_call_ids: []
+  anthropic_live_suffix: null
+  anthropic_live_suffix_spans: []
+== an/output-effort-high [anthropic/inkling] OK
+  kind 0 api 1 chat_v41 0 chat_qwen 0
+  model: "deepseek-v4-flash"
+  model_from_request 0 max_tokens 50
+  sampling t 1/0 top_p 1/0 top_k 0/0 min_p 0.0500000007/0 seed 0
+  logprobs 0 top 0 stream 0 usage 0
+  think_mode 75 has_tools 0 force_tool_call 0 summary 0
+  forced_tool_name: null
+  stops: []
+  tool_orders 0:
+  qwen_tools_json: null
+  prompt_text: "<|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>What is 17 * 23?<|end_message|><|message_model|>"
+  prompt_spans: [107-123]
+  images 0
+  responses live tool 0 reasoning 0
+  responses_live_call_ids: []
+  responses_live_suffix: null
+  responses_live_suffix_spans: []
+  anthropic live tool 0
+  anthropic_live_call_ids: []
+  anthropic_live_suffix: null
+  anthropic_live_suffix_spans: []
+== an/output-effort-max [anthropic/inkling] OK
+  kind 0 api 1 chat_v41 0 chat_qwen 0
+  model: "deepseek-v4-flash"
+  model_from_request 0 max_tokens 50
+  sampling t 1/0 top_p 1/0 top_k 0/0 min_p 0.0500000007/0 seed 0
+  logprobs 0 top 0 stream 0 usage 0
+  think_mode 75 has_tools 0 force_tool_call 0 summary 0
+  forced_tool_name: null
+  stops: []
+  tool_orders 0:
+  qwen_tools_json: null
+  prompt_text: "<|message_system|><|content_text|>Thinking effort level: 0.99<|end_message|><|message_user|><|content_text|>What is 17 * 23?<|end_message|><|message_model|>"
+  prompt_spans: [108-124]
+  images 0
+  responses live tool 0 reasoning 0
+  responses_live_call_ids: []
+  responses_live_suffix: null
+  responses_live_suffix_spans: []
+  anthropic live tool 0
+  anthropic_live_call_ids: []
+  anthropic_live_suffix: null
+  anthropic_live_suffix_spans: []
+== an/output-effort-xhigh [anthropic/inkling] OK
+  kind 0 api 1 chat_v41 0 chat_qwen 0
+  model: "deepseek-v4-flash"
+  model_from_request 0 max_tokens 50
+  sampling t 1/0 top_p 1/0 top_k 0/0 min_p 0.0500000007/0 seed 0
+  logprobs 0 top 0 stream 0 usage 0
+  think_mode 75 has_tools 0 force_tool_call 0 summary 0
+  forced_tool_name: null
+  stops: []
+  tool_orders 0:
+  qwen_tools_json: null
+  prompt_text: "<|message_system|><|content_text|>Thinking effort level: 0.99<|end_message|><|message_user|><|content_text|>What is 17 * 23?<|end_message|><|message_model|>"
+  prompt_spans: [108-124]
+  images 0
+  responses live tool 0 reasoning 0
+  responses_live_call_ids: []
+  responses_live_suffix: null
+  responses_live_suffix_spans: []
+  anthropic live tool 0
+  anthropic_live_call_ids: []
+  anthropic_live_suffix: null
+  anthropic_live_suffix_spans: []
+== an/output-effort-bogus [anthropic/inkling] REFUSED
+  error: "output_config.effort: \"bogus\" is not an effort -- send none, minimal, low, medium, high, xhigh, max or an integer 1..100"
+== an/output-format [anthropic/inkling] OK
+  kind 0 api 1 chat_v41 0 chat_qwen 0
+  model: "deepseek-v4-flash"
+  model_from_request 0 max_tokens 50
+  sampling t 1/0 top_p 1/0 top_k 0/0 min_p 0.0500000007/0 seed 0
+  logprobs 0 top 0 stream 0 usage 0
+  think_mode 75 has_tools 0 force_tool_call 0 summary 0
+  forced_tool_name: null
+  stops: []
+  tool_orders 0:
+  qwen_tools_json: null
+  prompt_text: "<|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>What is 17 * 23?<|end_message|><|message_model|>"
+  prompt_spans: [107-123]
+  images 0
+  responses live tool 0 reasoning 0
+  responses_live_call_ids: []
+  responses_live_suffix: null
+  responses_live_suffix_spans: []
+  anthropic live tool 0
+  anthropic_live_call_ids: []
+  anthropic_live_suffix: null
+  anthropic_live_suffix_spans: []
+== an/effort-then-output [anthropic/inkling] OK
+  kind 0 api 1 chat_v41 0 chat_qwen 0
+  model: "deepseek-v4-flash"
+  model_from_request 0 max_tokens 50
+  sampling t 1/0 top_p 1/0 top_k 0/0 min_p 0.0500000007/0 seed 0
+  logprobs 0 top 0 stream 0 usage 0
+  think_mode 75 has_tools 0 force_tool_call 0 summary 0
+  forced_tool_name: null
+  stops: []
+  tool_orders 0:
+  qwen_tools_json: null
+  prompt_text: "<|message_system|><|content_text|>Thinking effort level: 0.2<|end_message|><|message_user|><|content_text|>What is 17 * 23?<|end_message|><|message_model|>"
+  prompt_spans: [107-123]
+  images 0
+  responses live tool 0 reasoning 0
+  responses_live_call_ids: []
+  responses_live_suffix: null
+  responses_live_suffix_spans: []
+  anthropic live tool 0
+  anthropic_live_call_ids: []
+  anthropic_live_suffix: null
+  anthropic_live_suffix_spans: []
+== an/output-then-effort [anthropic/inkling] OK
+  kind 0 api 1 chat_v41 0 chat_qwen 0
+  model: "deepseek-v4-flash"
+  model_from_request 0 max_tokens 50
+  sampling t 1/0 top_p 1/0 top_k 0/0 min_p 0.0500000007/0 seed 0
+  logprobs 0 top 0 stream 0 usage 0
+  think_mode 75 has_tools 0 force_tool_call 0 summary 0
+  forced_tool_name: null
+  stops: []
+  tool_orders 0:
+  qwen_tools_json: null
+  prompt_text: "<|message_system|><|content_text|>Thinking effort level: 0.2<|end_message|><|message_user|><|content_text|>What is 17 * 23?<|end_message|><|message_model|>"
+  prompt_spans: [107-123]
+  images 0
+  responses live tool 0 reasoning 0
+  responses_live_call_ids: []
+  responses_live_suffix: null
+  responses_live_suffix_spans: []
+  anthropic live tool 0
+  anthropic_live_call_ids: []
+  anthropic_live_suffix: null
+  anthropic_live_suffix_spans: []
+== an/thinking-off-effort [anthropic/inkling] OK
+  kind 0 api 1 chat_v41 0 chat_qwen 0
+  model: "deepseek-v4-flash"
+  model_from_request 0 max_tokens 50
+  sampling t 1/0 top_p 1/0 top_k 0/0 min_p 0.0500000007/0 seed 0
+  logprobs 0 top 0 stream 0 usage 0
+  think_mode 0 has_tools 0 force_tool_call 0 summary 0
+  forced_tool_name: null
+  stops: []
+  tool_orders 0:
+  qwen_tools_json: null
+  prompt_text: "<|message_system|><|content_text|>Thinking effort level: 0.0<|end_message|><|message_user|><|content_text|>What is 17 * 23?<|end_message|><|message_model|>"
+  prompt_spans: [107-123]
+  images 0
+  responses live tool 0 reasoning 0
+  responses_live_call_ids: []
+  responses_live_suffix: null
+  responses_live_suffix_spans: []
+  anthropic live tool 0
+  anthropic_live_call_ids: []
+  anthropic_live_suffix: null
+  anthropic_live_suffix_spans: []
+== an/alias-chat [anthropic/inkling] OK
+  kind 0 api 1 chat_v41 0 chat_qwen 0
+  model: "deepseek-chat"
+  model_from_request 1 max_tokens 50
+  sampling t 1/0 top_p 1/0 top_k 0/0 min_p 0.0500000007/0 seed 0
+  logprobs 0 top 0 stream 0 usage 0
+  think_mode 0 has_tools 0 force_tool_call 0 summary 0
+  forced_tool_name: null
+  stops: []
+  tool_orders 0:
+  qwen_tools_json: null
+  prompt_text: "<|message_system|><|content_text|>Thinking effort level: 0.0<|end_message|><|message_user|><|content_text|>What is 17 * 23?<|end_message|><|message_model|>"
+  prompt_spans: [107-123]
+  images 0
+  responses live tool 0 reasoning 0
+  responses_live_call_ids: []
+  responses_live_suffix: null
+  responses_live_suffix_spans: []
+  anthropic live tool 0
+  anthropic_live_call_ids: []
+  anthropic_live_suffix: null
+  anthropic_live_suffix_spans: []
+== an/stop [anthropic/inkling] OK
+  kind 0 api 1 chat_v41 0 chat_qwen 0
+  model: "deepseek-v4-flash"
+  model_from_request 0 max_tokens 50
+  sampling t 0.200000003/1 top_p 1/0 top_k 5/1 min_p 0.0500000007/0 seed 0
+  logprobs 0 top 0 stream 1 usage 0
+  think_mode 75 has_tools 0 force_tool_call 0 summary 0
+  forced_tool_name: null
+  stops: ["END"]
+  tool_orders 0:
+  qwen_tools_json: null
+  prompt_text: "<|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>What is 17 * 23?<|end_message|><|message_model|>"
+  prompt_spans: [107-123]
+  images 0
+  responses live tool 0 reasoning 0
+  responses_live_call_ids: []
+  responses_live_suffix: null
+  responses_live_suffix_spans: []
+  anthropic live tool 0
+  anthropic_live_call_ids: []
+  anthropic_live_suffix: null
+  anthropic_live_suffix_spans: []
+== an/image [anthropic/inkling] REFUSED
+  error: "inkling: a message carries an image -- the family's image front (E9) is not wired; this engine renders text only"
+== an/missing-messages [anthropic/inkling] REFUSED
+  error: "missing messages"
+== an/prefill [anthropic/inkling] OK
+  kind 0 api 1 chat_v41 0 chat_qwen 0
+  model: "deepseek-v4-flash"
+  model_from_request 0 max_tokens 50
+  sampling t 1/0 top_p 1/0 top_k 0/0 min_p 0.0500000007/0 seed 0
+  logprobs 0 top 0 stream 0 usage 0
+  think_mode 75 has_tools 0 force_tool_call 0 summary 0
+  forced_tool_name: null
+  stops: []
+  tool_orders 0:
+  qwen_tools_json: null
+  prompt_text: "<|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>What is 17 * 23?<|end_message|><|message_model|><|content_text|>The answer is<|end_message|><|content_model_end_sampling|><|message_model|>"
+  prompt_spans: [107-123 171-184]
+  images 0
+  responses live tool 0 reasoning 0
+  responses_live_call_ids: []
+  responses_live_suffix: null
+  responses_live_suffix_spans: []
+  anthropic live tool 0
+  anthropic_live_call_ids: []
+  anthropic_live_suffix: null
+  anthropic_live_suffix_spans: []
+== rs/string [responses/inkling] OK
+  kind 0 api 2 chat_v41 0 chat_qwen 0
+  model: "m"
+  model_from_request 1 max_tokens 256
+  sampling t 1/0 top_p 1/0 top_k 0/0 min_p 0.0500000007/0 seed 0
+  logprobs 0 top 0 stream 0 usage 0
+  think_mode 75 has_tools 0 force_tool_call 0 summary 0
+  forced_tool_name: null
+  stops: []
+  tool_orders 0:
+  qwen_tools_json: null
+  prompt_text: "<|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>Hello<|end_message|><|message_model|>"
+  prompt_spans: [107-112]
+  images 0
+  responses live tool 0 reasoning 0
+  responses_live_call_ids: []
+  responses_live_suffix: null
+  responses_live_suffix_spans: []
+  anthropic live tool 0
+  anthropic_live_call_ids: []
+  anthropic_live_suffix: null
+  anthropic_live_suffix_spans: []
+== rs/array [responses/inkling] OK
+  kind 0 api 2 chat_v41 0 chat_qwen 0
+  model: "deepseek-v4-flash"
+  model_from_request 0 max_tokens 256
+  sampling t 1/0 top_p 1/0 top_k 0/0 min_p 0.0500000007/0 seed 0
+  logprobs 0 top 0 stream 0 usage 0
+  think_mode 75 has_tools 0 force_tool_call 0 summary 0
+  forced_tool_name: null
+  stops: []
+  tool_orders 0:
+  qwen_tools_json: null
+  prompt_text: "<|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>Hello<|end_message|><|message_model|>"
+  prompt_spans: [107-112]
+  images 0
+  responses live tool 0 reasoning 0
+  responses_live_call_ids: []
+  responses_live_suffix: null
+  responses_live_suffix_spans: []
+  anthropic live tool 0
+  anthropic_live_call_ids: []
+  anthropic_live_suffix: null
+  anthropic_live_suffix_spans: []
+== rs/instructions [responses/inkling] OK
+  kind 0 api 2 chat_v41 0 chat_qwen 0
+  model: "deepseek-v4-flash"
+  model_from_request 0 max_tokens 256
+  sampling t 1/0 top_p 1/0 top_k 0/0 min_p 0.0500000007/0 seed 0
+  logprobs 0 top 0 stream 0 usage 0
+  think_mode 75 has_tools 0 force_tool_call 0 summary 0
+  forced_tool_name: null
+  stops: []
+  tool_orders 0:
+  qwen_tools_json: null
+  prompt_text: "<|message_system|><|content_text|>You are terse.<|end_message|><|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>Hello<|end_message|><|message_model|>"
+  prompt_spans: [34-48 170-175]
+  images 0
+  responses live tool 0 reasoning 0
+  responses_live_call_ids: []
+  responses_live_suffix: null
+  responses_live_suffix_spans: []
+  anthropic live tool 0
+  anthropic_live_call_ids: []
+  anthropic_live_suffix: null
+  anthropic_live_suffix_spans: []
+== rs/instructions-null [responses/inkling] OK
+  kind 0 api 2 chat_v41 0 chat_qwen 0
+  model: "deepseek-v4-flash"
+  model_from_request 0 max_tokens 256
+  sampling t 1/0 top_p 1/0 top_k 0/0 min_p 0.0500000007/0 seed 0
+  logprobs 0 top 0 stream 0 usage 0
+  think_mode 75 has_tools 0 force_tool_call 0 summary 0
+  forced_tool_name: null
+  stops: []
+  tool_orders 0:
+  qwen_tools_json: null
+  prompt_text: "<|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>Hello<|end_message|><|message_model|>"
+  prompt_spans: [107-112]
+  images 0
+  responses live tool 0 reasoning 0
+  responses_live_call_ids: []
+  responses_live_suffix: null
+  responses_live_suffix_spans: []
+  anthropic live tool 0
+  anthropic_live_call_ids: []
+  anthropic_live_suffix: null
+  anthropic_live_suffix_spans: []
+== rs/tools [responses/inkling] OK
+  kind 0 api 2 chat_v41 0 chat_qwen 0
+  model: "deepseek-v4-flash"
+  model_from_request 0 max_tokens 256
+  sampling t 1/0 top_p 1/0 top_k 0/0 min_p 0.0500000007/0 seed 0
+  logprobs 0 top 0 stream 0 usage 0
+  think_mode 75 has_tools 1 force_tool_call 0 summary 0
+  forced_tool_name: null
+  stops: []
+  tool_orders 2: {get_weather|-|-|0|city,unit} {search|-|-|0|q,n}
+  qwen_tools_json: "[{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"Weather for a city\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"c\", \"f\"]}}, \"required\": [\"city\"]}}}, {\"type\": \"function\", \"function\": {\"name\": \"search\", \"description\": \"Search the web <fast>\", \"parameters\": {\"type\": \"object\", \"properties\": {\"q\": {\"type\": \"string\"}, \"n\": {\"type\": \"integer\"}}}}}]"
+  prompt_text: "<|message_system|>tool_declare<|content_xml|>[{\"description\":\"Weather for a city\",\"name\":\"get_weather\",\"parameters\":{\"properties\":{\"city\":{\"type\":\"string\"},\"unit\":{\"enum\":[\"c\",\"f\"],\"type\":\"string\"}},\"required\":[\"city\"],\"type\":\"object\"},\"type\":\"function\"},{\"description\":\"Search the web <fast>\",\"name\":\"search\",\"parameters\":{\"properties\":{\"n\":{\"type\":\"integer\"},\"q\":{\"type\":\"string\"}},\"type\":\"object\"},\"type\":\"function\"}]<|end_message|><|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>Weather?<|end_message|><|message_model|>"
+  prompt_spans: [45-420 542-550]
+  images 0
+  responses live tool 0 reasoning 0
+  responses_live_call_ids: []
+  responses_live_suffix: null
+  responses_live_suffix_spans: []
+  anthropic live tool 0
+  anthropic_live_call_ids: []
+  anthropic_live_suffix: null
+  anthropic_live_suffix_spans: []
+== rs/tool-turns [responses/inkling] OK
+  kind 0 api 2 chat_v41 0 chat_qwen 0
+  model: "deepseek-v4-flash"
+  model_from_request 0 max_tokens 256
+  sampling t 1/0 top_p 1/0 top_k 0/0 min_p 0.0500000007/0 seed 0
+  logprobs 0 top 0 stream 0 usage 0
+  think_mode 75 has_tools 1 force_tool_call 0 summary 0
+  forced_tool_name: null
+  stops: []
+  tool_orders 2: {get_weather|-|-|0|city,unit} {search|-|-|0|q,n}
+  qwen_tools_json: "[{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"Weather for a city\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"c\", \"f\"]}}, \"required\": [\"city\"]}}}, {\"type\": \"function\", \"function\": {\"name\": \"search\", \"description\": \"Search the web <fast>\", \"parameters\": {\"type\": \"object\", \"properties\": {\"q\": {\"type\": \"string\"}, \"n\": {\"type\": \"integer\"}}}}}]"
+  prompt_text: "<|message_system|>tool_declare<|content_xml|>[{\"description\":\"Weather for a city\",\"name\":\"get_weather\",\"parameters\":{\"properties\":{\"city\":{\"type\":\"string\"},\"unit\":{\"enum\":[\"c\",\"f\"],\"type\":\"string\"}},\"required\":[\"city\"],\"type\":\"object\"},\"type\":\"function\"},{\"description\":\"Search the web <fast>\",\"name\":\"search\",\"parameters\":{\"properties\":{\"n\":{\"type\":\"integer\"},\"q\":{\"type\":\"string\"}},\"type\":\"object\"},\"type\":\"function\"}]<|end_message|><|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>Weather in Paris?<|end_message|><|message_model|><|content_thinking|>Need the tool.<|end_message|><|message_model|>get_weather<|content_invoke_tool_json|>{\"name\":\"get_weather\",\"args\":{\"city\":\"Paris\"}}<|end_message|><|content_model_end_sampling|><|message_tool|>get_weather<|content_text|>18C<|end_message|><|message_user|><|content_text|>And tomorrow?<|end_message|><|message_model|>"
+  prompt_spans: [45-420 542-559 611-625 657-668 696-742 803-814 830-833 880-893]
+  images 0
+  responses live tool 0 reasoning 0
+  responses_live_call_ids: []
+  responses_live_suffix: null
+  responses_live_suffix_spans: []
+  anthropic live tool 0
+  anthropic_live_call_ids: []
+  anthropic_live_suffix: null
+  anthropic_live_suffix_spans: []
+== rs/tool-turns-off [responses/inkling] OK
+  kind 0 api 2 chat_v41 0 chat_qwen 0
+  model: "deepseek-v4-flash"
+  model_from_request 0 max_tokens 256
+  sampling t 1/0 top_p 1/0 top_k 0/0 min_p 0.0500000007/0 seed 0
+  logprobs 0 top 0 stream 0 usage 0
+  think_mode 0 has_tools 1 force_tool_call 0 summary 0
+  forced_tool_name: null
+  stops: []
+  tool_orders 2: {get_weather|-|-|0|city,unit} {search|-|-|0|q,n}
+  qwen_tools_json: "[{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"Weather for a city\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"c\", \"f\"]}}, \"required\": [\"city\"]}}}, {\"type\": \"function\", \"function\": {\"name\": \"search\", \"description\": \"Search the web <fast>\", \"parameters\": {\"type\": \"object\", \"properties\": {\"q\": {\"type\": \"string\"}, \"n\": {\"type\": \"integer\"}}}}}]"
+  prompt_text: "<|message_system|>tool_declare<|content_xml|>[{\"description\":\"Weather for a city\",\"name\":\"get_weather\",\"parameters\":{\"properties\":{\"city\":{\"type\":\"string\"},\"unit\":{\"enum\":[\"c\",\"f\"],\"type\":\"string\"}},\"required\":[\"city\"],\"type\":\"object\"},\"type\":\"function\"},{\"description\":\"Search the web <fast>\",\"name\":\"search\",\"parameters\":{\"properties\":{\"n\":{\"type\":\"integer\"},\"q\":{\"type\":\"string\"}},\"type\":\"object\"},\"type\":\"function\"}]<|end_message|><|message_system|><|content_text|>Thinking effort level: 0.0<|end_message|><|message_user|><|content_text|>Weather in Paris?<|end_message|><|message_model|><|content_thinking|>Need the tool.<|end_message|><|message_model|>get_weather<|content_invoke_tool_json|>{\"name\":\"get_weather\",\"args\":{\"city\":\"Paris\"}}<|end_message|><|content_model_end_sampling|><|message_tool|>get_weather<|content_text|>18C<|end_message|><|message_user|><|content_text|>And tomorrow?<|end_message|><|message_model|>"
+  prompt_spans: [45-420 542-559 611-625 657-668 696-742 803-814 830-833 880-893]
+  images 0
+  responses live tool 0 reasoning 0
+  responses_live_call_ids: []
+  responses_live_suffix: null
+  responses_live_suffix_spans: []
+  anthropic live tool 0
+  anthropic_live_call_ids: []
+  anthropic_live_suffix: null
+  anthropic_live_suffix_spans: []
+== rs/namespace-tools [responses/inkling] OK
+  kind 0 api 2 chat_v41 0 chat_qwen 0
+  model: "deepseek-v4-flash"
+  model_from_request 0 max_tokens 256
+  sampling t 1/0 top_p 1/0 top_k 0/0 min_p 0.0500000007/0 seed 0
+  logprobs 0 top 0 stream 0 usage 0
+  think_mode 75 has_tools 1 force_tool_call 0 summary 0
+  forced_tool_name: null
+  stops: []
+  tool_orders 1: {fsread|read|fs|0|path}
+  qwen_tools_json: "[{\"type\": \"function\", \"function\": {\"name\": \"fsread\", \"description\": \"read a file\", \"parameters\": {\"type\": \"object\", \"properties\": {\"path\": {\"type\": \"string\"}}}}}]"
+  prompt_text: "<|message_system|>tool_declare<|content_xml|>[{\"description\":\"read a file\",\"name\":\"fsread\",\"parameters\":{\"properties\":{\"path\":{\"type\":\"string\"}},\"type\":\"object\"},\"type\":\"function\"}]<|end_message|><|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>x<|end_message|><|message_model|>"
+  prompt_spans: [45-181 303-304]
+  images 0
+  responses live tool 0 reasoning 0
+  responses_live_call_ids: []
+  responses_live_suffix: null
+  responses_live_suffix_spans: []
+  anthropic live tool 0
+  anthropic_live_call_ids: []
+  anthropic_live_suffix: null
+  anthropic_live_suffix_spans: []
+== rs/tool-choice-auto [responses/inkling] OK
+  kind 0 api 2 chat_v41 0 chat_qwen 0
+  model: "deepseek-v4-flash"
+  model_from_request 0 max_tokens 256
+  sampling t 1/0 top_p 1/0 top_k 0/0 min_p 0.0500000007/0 seed 0
+  logprobs 0 top 0 stream 0 usage 0
+  think_mode 75 has_tools 1 force_tool_call 0 summary 0
+  forced_tool_name: null
+  stops: []
+  tool_orders 2: {get_weather|-|-|0|city,unit} {search|-|-|0|q,n}
+  qwen_tools_json: "[{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"Weather for a city\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"c\", \"f\"]}}, \"required\": [\"city\"]}}}, {\"type\": \"function\", \"function\": {\"name\": \"search\", \"description\": \"Search the web <fast>\", \"parameters\": {\"type\": \"object\", \"properties\": {\"q\": {\"type\": \"string\"}, \"n\": {\"type\": \"integer\"}}}}}]"
+  prompt_text: "<|message_system|>tool_declare<|content_xml|>[{\"description\":\"Weather for a city\",\"name\":\"get_weather\",\"parameters\":{\"properties\":{\"city\":{\"type\":\"string\"},\"unit\":{\"enum\":[\"c\",\"f\"],\"type\":\"string\"}},\"required\":[\"city\"],\"type\":\"object\"},\"type\":\"function\"},{\"description\":\"Search the web <fast>\",\"name\":\"search\",\"parameters\":{\"properties\":{\"n\":{\"type\":\"integer\"},\"q\":{\"type\":\"string\"}},\"type\":\"object\"},\"type\":\"function\"}]<|end_message|><|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>x<|end_message|><|message_model|>"
+  prompt_spans: [45-420 542-543]
+  images 0
+  responses live tool 0 reasoning 0
+  responses_live_call_ids: []
+  responses_live_suffix: null
+  responses_live_suffix_spans: []
+  anthropic live tool 0
+  anthropic_live_call_ids: []
+  anthropic_live_suffix: null
+  anthropic_live_suffix_spans: []
+== rs/tool-choice-none [responses/inkling] OK
+  kind 0 api 2 chat_v41 0 chat_qwen 0
+  model: "deepseek-v4-flash"
+  model_from_request 0 max_tokens 256
+  sampling t 1/0 top_p 1/0 top_k 0/0 min_p 0.0500000007/0 seed 0
+  logprobs 0 top 0 stream 0 usage 0
+  think_mode 75 has_tools 0 force_tool_call 0 summary 0
+  forced_tool_name: null
+  stops: []
+  tool_orders 2: {get_weather|-|-|0|city,unit} {search|-|-|0|q,n}
+  qwen_tools_json: null
+  prompt_text: "<|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>x<|end_message|><|message_model|>"
+  prompt_spans: [107-108]
+  images 0
+  responses live tool 0 reasoning 0
+  responses_live_call_ids: []
+  responses_live_suffix: null
+  responses_live_suffix_spans: []
+  anthropic live tool 0
+  anthropic_live_call_ids: []
+  anthropic_live_suffix: null
+  anthropic_live_suffix_spans: []
+== rs/tool-choice-required [responses/inkling] REFUSED
+  error: "tool_choice=required not supported"
+== rs/tool-choice-object [responses/inkling] REFUSED
+  error: "forced tool_choice not supported"
+== rs/effort-low [responses/inkling] OK
+  kind 0 api 2 chat_v41 0 chat_qwen 0
+  model: "deepseek-v4-flash"
+  model_from_request 0 max_tokens 256
+  sampling t 1/0 top_p 1/0 top_k 0/0 min_p 0.0500000007/0 seed 0
+  logprobs 0 top 0 stream 0 usage 0
+  think_mode 75 has_tools 0 force_tool_call 0 summary 0
+  forced_tool_name: null
+  stops: []
+  tool_orders 0:
+  qwen_tools_json: null
+  prompt_text: "<|message_system|><|content_text|>Thinking effort level: 0.2<|end_message|><|message_user|><|content_text|>x<|end_message|><|message_model|>"
+  prompt_spans: [107-108]
+  images 0
+  responses live tool 0 reasoning 0
+  responses_live_call_ids: []
+  responses_live_suffix: null
+  responses_live_suffix_spans: []
+  anthropic live tool 0
+  anthropic_live_call_ids: []
+  anthropic_live_suffix: null
+  anthropic_live_suffix_spans: []
+== rs/effort-medium [responses/inkling] OK
+  kind 0 api 2 chat_v41 0 chat_qwen 0
+  model: "deepseek-v4-flash"
+  model_from_request 0 max_tokens 256
+  sampling t 1/0 top_p 1/0 top_k 0/0 min_p 0.0500000007/0 seed 0
+  logprobs 0 top 0 stream 0 usage 0
+  think_mode 75 has_tools 0 force_tool_call 0 summary 0
+  forced_tool_name: null
+  stops: []
+  tool_orders 0:
+  qwen_tools_json: null
+  prompt_text: "<|message_system|><|content_text|>Thinking effort level: 0.7<|end_message|><|message_user|><|content_text|>x<|end_message|><|message_model|>"
+  prompt_spans: [107-108]
+  images 0
+  responses live tool 0 reasoning 0
+  responses_live_call_ids: []
+  responses_live_suffix: null
+  responses_live_suffix_spans: []
+  anthropic live tool 0
+  anthropic_live_call_ids: []
+  anthropic_live_suffix: null
+  anthropic_live_suffix_spans: []
+== rs/effort-high [responses/inkling] OK
+  kind 0 api 2 chat_v41 0 chat_qwen 0
+  model: "deepseek-v4-flash"
+  model_from_request 0 max_tokens 256
+  sampling t 1/0 top_p 1/0 top_k 0/0 min_p 0.0500000007/0 seed 0
+  logprobs 0 top 0 stream 0 usage 0
+  think_mode 75 has_tools 0 force_tool_call 0 summary 0
+  forced_tool_name: null
+  stops: []
+  tool_orders 0:
+  qwen_tools_json: null
+  prompt_text: "<|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>x<|end_message|><|message_model|>"
+  prompt_spans: [107-108]
+  images 0
+  responses live tool 0 reasoning 0
+  responses_live_call_ids: []
+  responses_live_suffix: null
+  responses_live_suffix_spans: []
+  anthropic live tool 0
+  anthropic_live_call_ids: []
+  anthropic_live_suffix: null
+  anthropic_live_suffix_spans: []
+== rs/effort-xhigh [responses/inkling] OK
+  kind 0 api 2 chat_v41 0 chat_qwen 0
+  model: "deepseek-v4-flash"
+  model_from_request 0 max_tokens 256
+  sampling t 1/0 top_p 1/0 top_k 0/0 min_p 0.0500000007/0 seed 0
+  logprobs 0 top 0 stream 0 usage 0
+  think_mode 75 has_tools 0 force_tool_call 0 summary 0
+  forced_tool_name: null
+  stops: []
+  tool_orders 0:
+  qwen_tools_json: null
+  prompt_text: "<|message_system|><|content_text|>Thinking effort level: 0.99<|end_message|><|message_user|><|content_text|>x<|end_message|><|message_model|>"
+  prompt_spans: [108-109]
+  images 0
+  responses live tool 0 reasoning 0
+  responses_live_call_ids: []
+  responses_live_suffix: null
+  responses_live_suffix_spans: []
+  anthropic live tool 0
+  anthropic_live_call_ids: []
+  anthropic_live_suffix: null
+  anthropic_live_suffix_spans: []
+== rs/effort-none [responses/inkling] OK
+  kind 0 api 2 chat_v41 0 chat_qwen 0
+  model: "deepseek-v4-flash"
+  model_from_request 0 max_tokens 256
+  sampling t 1/0 top_p 1/0 top_k 0/0 min_p 0.0500000007/0 seed 0
+  logprobs 0 top 0 stream 0 usage 0
+  think_mode 0 has_tools 0 force_tool_call 0 summary 0
+  forced_tool_name: null
+  stops: []
+  tool_orders 0:
+  qwen_tools_json: null
+  prompt_text: "<|message_system|><|content_text|>Thinking effort level: 0.0<|end_message|><|message_user|><|content_text|>x<|end_message|><|message_model|>"
+  prompt_spans: [107-108]
+  images 0
+  responses live tool 0 reasoning 0
+  responses_live_call_ids: []
+  responses_live_suffix: null
+  responses_live_suffix_spans: []
+  anthropic live tool 0
+  anthropic_live_call_ids: []
+  anthropic_live_suffix: null
+  anthropic_live_suffix_spans: []
+== rs/effort-minimal [responses/inkling] OK
+  kind 0 api 2 chat_v41 0 chat_qwen 0
+  model: "deepseek-v4-flash"
+  model_from_request 0 max_tokens 256
+  sampling t 1/0 top_p 1/0 top_k 0/0 min_p 0.0500000007/0 seed 0
+  logprobs 0 top 0 stream 0 usage 0
+  think_mode 75 has_tools 0 force_tool_call 0 summary 0
+  forced_tool_name: null
+  stops: []
+  tool_orders 0:
+  qwen_tools_json: null
+  prompt_text: "<|message_system|><|content_text|>Thinking effort level: 0.1<|end_message|><|message_user|><|content_text|>x<|end_message|><|message_model|>"
+  prompt_spans: [107-108]
+  images 0
+  responses live tool 0 reasoning 0
+  responses_live_call_ids: []
+  responses_live_suffix: null
+  responses_live_suffix_spans: []
+  anthropic live tool 0
+  anthropic_live_call_ids: []
+  anthropic_live_suffix: null
+  anthropic_live_suffix_spans: []
+== rs/effort-bogus [responses/inkling] REFUSED
+  error: "reasoning.effort: \"bogus\" is not an effort -- send none, minimal, low, medium, high, xhigh, max or an integer 1..100"
+== rs/summary [responses/inkling] OK
+  kind 0 api 2 chat_v41 0 chat_qwen 0
+  model: "deepseek-v4-flash"
+  model_from_request 0 max_tokens 256
+  sampling t 1/0 top_p 1/0 top_k 0/0 min_p 0.0500000007/0 seed 0
+  logprobs 0 top 0 stream 0 usage 0
+  think_mode 75 has_tools 0 force_tool_call 0 summary 1
+  forced_tool_name: null
+  stops: []
+  tool_orders 0:
+  qwen_tools_json: null
+  prompt_text: "<|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>x<|end_message|><|message_model|>"
+  prompt_spans: [107-108]
+  images 0
+  responses live tool 0 reasoning 0
+  responses_live_call_ids: []
+  responses_live_suffix: null
+  responses_live_suffix_spans: []
+  anthropic live tool 0
+  anthropic_live_call_ids: []
+  anthropic_live_suffix: null
+  anthropic_live_suffix_spans: []
+== rs/summary-only [responses/inkling] OK
+  kind 0 api 2 chat_v41 0 chat_qwen 0
+  model: "deepseek-v4-flash"
+  model_from_request 0 max_tokens 256
+  sampling t 1/0 top_p 1/0 top_k 0/0 min_p 0.0500000007/0 seed 0
+  logprobs 0 top 0 stream 0 usage 0
+  think_mode 75 has_tools 0 force_tool_call 0 summary 1
+  forced_tool_name: null
+  stops: []
+  tool_orders 0:
+  qwen_tools_json: null
+  prompt_text: "<|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>x<|end_message|><|message_model|>"
+  prompt_spans: [107-108]
+  images 0
+  responses live tool 0 reasoning 0
+  responses_live_call_ids: []
+  responses_live_suffix: null
+  responses_live_suffix_spans: []
+  anthropic live tool 0
+  anthropic_live_call_ids: []
+  anthropic_live_suffix: null
+  anthropic_live_suffix_spans: []
+== rs/reasoning-null [responses/inkling] OK
+  kind 0 api 2 chat_v41 0 chat_qwen 0
+  model: "deepseek-v4-flash"
+  model_from_request 0 max_tokens 256
+  sampling t 1/0 top_p 1/0 top_k 0/0 min_p 0.0500000007/0 seed 0
+  logprobs 0 top 0 stream 0 usage 0
+  think_mode 75 has_tools 0 force_tool_call 0 summary 0
+  forced_tool_name: null
+  stops: []
+  tool_orders 0:
+  qwen_tools_json: null
+  prompt_text: "<|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>x<|end_message|><|message_model|>"
+  prompt_spans: [107-108]
+  images 0
+  responses live tool 0 reasoning 0
+  responses_live_call_ids: []
+  responses_live_suffix: null
+  responses_live_suffix_spans: []
+  anthropic live tool 0
+  anthropic_live_call_ids: []
+  anthropic_live_suffix: null
+  anthropic_live_suffix_spans: []
+== rs/alias-chat [responses/inkling] OK
+  kind 0 api 2 chat_v41 0 chat_qwen 0
+  model: "deepseek-chat"
+  model_from_request 1 max_tokens 256
+  sampling t 1/0 top_p 1/0 top_k 0/0 min_p 0.0500000007/0 seed 0
+  logprobs 0 top 0 stream 0 usage 0
+  think_mode 0 has_tools 0 force_tool_call 0 summary 0
+  forced_tool_name: null
+  stops: []
+  tool_orders 0:
+  qwen_tools_json: null
+  prompt_text: "<|message_system|><|content_text|>Thinking effort level: 0.0<|end_message|><|message_user|><|content_text|>x<|end_message|><|message_model|>"
+  prompt_spans: [107-108]
+  images 0
+  responses live tool 0 reasoning 0
+  responses_live_call_ids: []
+  responses_live_suffix: null
+  responses_live_suffix_spans: []
+  anthropic live tool 0
+  anthropic_live_call_ids: []
+  anthropic_live_suffix: null
+  anthropic_live_suffix_spans: []
+== rs/prev-null [responses/inkling] OK
+  kind 0 api 2 chat_v41 0 chat_qwen 0
+  model: "deepseek-v4-flash"
+  model_from_request 0 max_tokens 256
+  sampling t 1/0 top_p 1/0 top_k 0/0 min_p 0.0500000007/0 seed 0
+  logprobs 0 top 0 stream 0 usage 0
+  think_mode 75 has_tools 0 force_tool_call 0 summary 0
+  forced_tool_name: null
+  stops: []
+  tool_orders 0:
+  qwen_tools_json: null
+  prompt_text: "<|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>x<|end_message|><|message_model|>"
+  prompt_spans: [107-108]
+  images 0
+  responses live tool 0 reasoning 0
+  responses_live_call_ids: []
+  responses_live_suffix: null
+  responses_live_suffix_spans: []
+  anthropic live tool 0
+  anthropic_live_call_ids: []
+  anthropic_live_suffix: null
+  anthropic_live_suffix_spans: []
+== rs/prev-set [responses/inkling] REFUSED
+  error: "previous_response_id is not supported; replay full input instead"
+== rs/conversation [responses/inkling] REFUSED
+  error: "conversation is not supported; replay full input instead"
+== rs/params [responses/inkling] OK
+  kind 0 api 2 chat_v41 0 chat_qwen 0
+  model: "deepseek-v4-flash"
+  model_from_request 0 max_tokens 64
+  sampling t 0.300000012/1 top_p 1/0 top_k 0/0 min_p 0.0500000007/0 seed 0
+  logprobs 0 top 0 stream 1 usage 0
+  think_mode 75 has_tools 0 force_tool_call 0 summary 0
+  forced_tool_name: null
+  stops: []
+  tool_orders 0:
+  qwen_tools_json: null
+  prompt_text: "<|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>x<|end_message|><|message_model|>"
+  prompt_spans: [107-108]
+  images 0
+  responses live tool 0 reasoning 0
+  responses_live_call_ids: []
+  responses_live_suffix: null
+  responses_live_suffix_spans: []
+  anthropic live tool 0
+  anthropic_live_call_ids: []
+  anthropic_live_suffix: null
+  anthropic_live_suffix_spans: []
+== rs/image [responses/inkling] REFUSED
+  error: "inkling: a message carries an image -- the family's image front (E9) is not wired; this engine renders text only"
+== rs/missing-input [responses/inkling] REFUSED
+  error: "missing input"
+== chat/mid-system [chat/inkling] OK
+  kind 0 api 0 chat_v41 0 chat_qwen 0
+  model: "deepseek-v4-flash"
+  model_from_request 0 max_tokens 256
+  sampling t 1/0 top_p 1/0 top_k 0/0 min_p 0.0500000007/0 seed 0
+  logprobs 0 top 0 stream 0 usage 0
+  think_mode 75 has_tools 0 force_tool_call 0 summary 0
+  forced_tool_name: null
+  stops: []
+  tool_orders 0:
+  qwen_tools_json: null
+  prompt_text: "<|message_system|><|content_text|>You are terse.<|end_message|><|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>hi<|end_message|><|message_model|><|content_text|>hello<|end_message|><|content_model_end_sampling|><|message_system|><|content_text|>todo list empty<|end_message|><|message_user|><|content_text|>recent pushes?<|end_message|><|message_model|>"
+  prompt_spans: [34-48 170-172 220-225 304-319 366-380]
+  images 0
+  responses live tool 0 reasoning 0
+  responses_live_call_ids: []
+  responses_live_suffix: null
+  responses_live_suffix_spans: []
+  anthropic live tool 0
+  anthropic_live_call_ids: []
+  anthropic_live_suffix: null
+  anthropic_live_suffix_spans: []
+== an/mid-system [anthropic/inkling] OK
+  kind 0 api 1 chat_v41 0 chat_qwen 0
+  model: "deepseek-v4-flash"
+  model_from_request 0 max_tokens 50
+  sampling t 1/0 top_p 1/0 top_k 0/0 min_p 0.0500000007/0 seed 0
+  logprobs 0 top 0 stream 0 usage 0
+  think_mode 75 has_tools 0 force_tool_call 0 summary 0
+  forced_tool_name: null
+  stops: []
+  tool_orders 0:
+  qwen_tools_json: null
+  prompt_text: "<|message_system|><|content_text|>You are Claude Code.<|end_message|><|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>hi<|end_message|><|message_model|><|content_text|>hello<|end_message|><|content_model_end_sampling|><|message_system|><|content_text|>todo list empty<|end_message|><|message_user|><|content_text|>recent pushes?<|end_message|><|message_model|>"
+  prompt_spans: [34-54 176-178 226-231 310-325 372-386]
+  images 0
+  responses live tool 0 reasoning 0
+  responses_live_call_ids: []
+  responses_live_suffix: null
+  responses_live_suffix_spans: []
+  anthropic live tool 0
+  anthropic_live_call_ids: []
+  anthropic_live_suffix: null
+  anthropic_live_suffix_spans: []
+== an/mid-system-lead [anthropic/inkling] OK
+  kind 0 api 1 chat_v41 0 chat_qwen 0
+  model: "deepseek-v4-flash"
+  model_from_request 0 max_tokens 50
+  sampling t 1/0 top_p 1/0 top_k 0/0 min_p 0.0500000007/0 seed 0
+  logprobs 0 top 0 stream 0 usage 0
+  think_mode 75 has_tools 0 force_tool_call 0 summary 0
+  forced_tool_name: null
+  stops: []
+  tool_orders 0:
+  qwen_tools_json: null
+  prompt_text: "<|message_system|><|content_text|>lead<|end_message|><|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>hi<|end_message|><|message_model|><|content_text|>hello<|end_message|><|content_model_end_sampling|><|message_system|><|content_text|>todo list empty<|end_message|><|message_user|><|content_text|>recent pushes?<|end_message|><|message_model|>"
+  prompt_spans: [34-38 160-162 210-215 294-309 356-370]
+  images 0
+  responses live tool 0 reasoning 0
+  responses_live_call_ids: []
+  responses_live_suffix: null
+  responses_live_suffix_spans: []
+  anthropic live tool 0
+  anthropic_live_call_ids: []
+  anthropic_live_suffix: null
+  anthropic_live_suffix_spans: []

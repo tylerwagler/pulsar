@@ -166,14 +166,18 @@ typedef struct {
     pulsar_tensor *vis_final_norm;   ///< vision_final_norm [n_embd]
     /** What the binding priced (role_bind.h): every byte the core stages, by role. */
     pulsar_role_census census;
-    /** The frontend seam (L295 F5 / E6): the tokenizer the family's tokenizer table will dispatch to -- F5's shared
-     *  BPE engine (src/lib/bpe_tokenizer.h, bpe_tokenizer_load_tiktoken with "o200k") in its tiktoken configuration, loaded at open
-     *  from the container directory's tokenizer files, with Inkling's renderer and output parser
-     *  (src/lib/inkling_chat.h) behind the server's family table.  NULL until E6 loads it: the family declares no
-     *  PULSAR_FAMILY_CAP_CHAT and no tokenizer table, so the front ends refuse the engine at startup by name
-     *  (pulsar_engine_has_tokenizer); eos_id above is the stop id that table's eos() answers. */
+    /** The tokenizer (inkling_tokenizer.cpp): F5's shared BPE engine in its tiktoken configuration ("o200k"), loaded
+     *  at open from the files beside the container's shards.  The family's tokenizer table dispatches to it; the
+     *  chat front is F5's renderer (src/lib/inkling_chat.h), behind the engine's table here and the server's family
+     *  table (src/server/family_inkling.cpp). */
     struct bpe_tokenizer *tok;
 } pulsar_inkling_model;
+
+/** The family's tokenizer table (inkling_tokenizer.cpp) and its load: tokenizer.model (the checkpoint's
+ *  tiktoken/tokenizer.model), tokenizer_config.json and config.json beside the shards of `model_path`.  false =
+ *  refused (said). */
+extern const pulsar_family_tokenizer PULSAR_INKLING_TOKENIZER;
+bool pulsar_inkling_load_tokenizer(pulsar_inkling_model *w, const char *model_path);
 
 /** Bind every tensor the shape declares, admit its format, price it (inkling_weights.cpp).  false = refused. */
 bool pulsar_inkling_bind(const pulsar_model *m, pulsar_inkling_model *w);

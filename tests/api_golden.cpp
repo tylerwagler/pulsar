@@ -7,8 +7,9 @@
  *   diff tests/api-golden/golden.txt out.txt
  *
  * The corpus is JSONL, one case a line: {"name":..., "endpoint":"chat|anthropic|responses",
- * "family":"deepseek|qwen", "body":{...}}.  The golden was recorded from the parsers before L267 moved
- * them; any difference is a change in what a request means. */
+ * "family":"deepseek|qwen|inkling", "body":{...}}.  The golden was recorded from the parsers before L267 moved
+ * them; any difference is a change in what a request means.  The Inkling rows (L294 E6) are appended after the
+ * others, recorded from family_inkling.cpp's first build (its render is graded against vLLM by inkling-chat-gate). */
 #define PULSAR_SERVER_TEST
 #define PULSAR_SERVER_TEST_NO_MAIN
 #include "../src/server/util.cpp"
@@ -16,6 +17,7 @@
 #include "../src/server/prompt_render.cpp"
 #include "../src/server/api_parse.cpp"
 #include "../src/server/chat_family.cpp"
+#include "../src/server/family_inkling.cpp"
 #include "../src/server/genmsg.cpp"
 #include "../src/server/deepseek_dsml.cpp"
 #include "../src/server/deepseek_stream.cpp"
@@ -101,7 +103,9 @@ static void dump(const request *r) {
 /* one case: parse it the way the server's router would for that endpoint and family */
 static bool golden_parse(const char *endpoint, const char *family, const char *body, request *r, char *err,
                          size_t errlen) {
-    const bool qwen = !strcmp(family, "qwen");
+    const pulsar_chat_format fmt = !strcmp(family, "qwen")      ? PULSAR_CHAT_QWEN
+                                 : !strcmp(family, "inkling") ? PULSAR_CHAT_INKLING
+                                                              : PULSAR_CHAT_DS4_V41;
     bool (*protocol)(const char *, chat_conversation *, request *, char *, size_t) =
         !strcmp(endpoint, "chat")      ? parse_chat_conversation_openai
       : !strcmp(endpoint, "anthropic") ? parse_chat_conversation_anthropic
@@ -116,8 +120,7 @@ static bool golden_parse(const char *endpoint, const char *family, const char *b
     chat_conversation c;
     memset(&c, 0, sizeof(c));
     const bool ok = protocol(body, &c, r, err, errlen) &&
-                    render_chat_conversation(NULL, qwen ? PULSAR_CHAT_QWEN : PULSAR_CHAT_DS4_V41, NULL, &c, r,
-                                             err, errlen);
+                    render_chat_conversation(NULL, fmt, NULL, &c, r, err, errlen);
     chat_conversation_free(&c);
     if (!ok) {
         if (!err[0]) snprintf(err, errlen, "invalid JSON request");

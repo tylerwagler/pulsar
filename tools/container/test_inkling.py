@@ -16,11 +16,16 @@ pins:
   * refusals by name: an unknown tensor, a missing tensor, a tensor whose shape disagrees with the declaration, an
     architecture switch the role table does not describe, a moe_intermediate_size that is not intermediate_size,
     half a drafter omitted, an omitted main-model tensor, routed experts at a rate the pair arm lacks (K5)
-  * GOLDEN: the SHA-256 of every emitted file of the BF16 and the K3 build (the byte-identity instrument, rule 7)
+  * GOLDEN: the SHA-256 of every emitted shard and the index of the BF16 and the K3 build (the byte-identity
+    instrument, rule 7)
+  * the side files (L294 E6): emit --all writes the tokenizer beside the shards byte-equal to the checkpoint's
+    (tiktoken/tokenizer.model as tokenizer.model, tokenizer_config.json, config.json), verify --all checks them; a
+    checkpoint without them refuses naming --tokenizer, and --tokenizer DIR supplies them
 """
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import os
 import shutil
@@ -33,11 +38,11 @@ import numpy as np
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
-from test_deepseek import digest  # noqa: E402
 from test_qwen import bf16, write_st, exl3_parts  # noqa: E402
 
 FAILS: list[str] = []
-# sha256 over (file name, sha256(file)) of every emitted file (test_deepseek.digest); fixed when the family landed (L295 E1)
+# sha256 over (file name, sha256(file)) of every emitted file but the side files (test_deepseek.digest's rule); fixed
+# when the family landed (L295 E1)
 GOLDEN = {
     "bf16": "9ad19c8f08c6befd6bef34b1a2126fd00809ee0d9e270a70eb9ad73345947818",
     "k3": "7716f2f45a7ce7f45bf375db989dbfb1e6e136a1eb70d505db78fb2ba753e5ff",
@@ -45,6 +50,10 @@ GOLDEN = {
 H, V, NQ, NKV, HD, DREL, EXT, WIN, CK = 256, 64, 8, 4, 32, 16, 32, 16, 4
 L, NDENSE, DFF, FF, E, S, NMTP = 3, 1, 256, 128, 4, 2, 2
 LLM, MTP = "model.llm.", "model.mtp."
+# the side files (inkling.side_files) and the synthetic checkpoint's tokenizer bytes they copy
+SIDE = ("config.json", "tokenizer.model", "tokenizer_config.json")
+TOK_MODEL = b"IQ== 0\nIg== 1\n"
+TOK_CONFIG = b'{"added_tokens_decoder": {}}\n'
 
 
 def check(ok, what):
@@ -76,8 +85,10 @@ def config():
 
 def make_hf(root, rng, cfg=None, edit=None):
     """The synthetic checkpoint; `edit(t)` mutates the tensor dict before it is written (the refusal cases)."""
-    os.makedirs(root, exist_ok=True)
+    os.makedirs(os.path.join(root, "tiktoken"), exist_ok=True)
     json.dump(cfg or config(), open(os.path.join(root, "config.json"), "w"))
+    open(os.path.join(root, "tiktoken", "tokenizer.model"), "wb").write(TOK_MODEL)
+    open(os.path.join(root, "tokenizer_config.json"), "wb").write(TOK_CONFIG)
     t = {}
 
     def mat(name, *shape, dt="BF16"):
@@ -181,6 +192,22 @@ def entry_bytes(d, f, name):
         return g.read(o1 - o0)
 
 
+def shard_digest(d):
+    """test_deepseek.digest over the shards and the index (the side files are checked byte-equal on their own)."""
+    h = hashlib.sha256()
+    for f in sorted(x for x in os.listdir(d) if x not in SIDE):
+        h.update(f.encode() + b"\0" + hashlib.sha256(open(os.path.join(d, f), "rb").read()).digest())
+    return h.hexdigest()
+
+
+def sides_equal(o, tok_dir, hf):
+    src = {"tokenizer.model": os.path.join(tok_dir, "tiktoken", "tokenizer.model"),
+           "tokenizer_config.json": os.path.join(tok_dir, "tokenizer_config.json"),
+           "config.json": os.path.join(hf, "config.json")}
+    return all(os.path.isfile(os.path.join(o, n)) and open(os.path.join(o, n), "rb").read() == open(p, "rb").read()
+               for n, p in src.items())
+
+
 def recipe(tmp, label, rows):
     p = os.path.join(tmp, f"recipe-{label}.json")
     json.dump({"recipe": f"test-{label}", "model_type": "inkling_mm_model", "rows": rows}, open(p, "w"))
@@ -198,9 +225,11 @@ def build_grade(tmp, label, args, n_files):
     files = sorted(os.listdir(o1)) if ok1 else []
     same = ok1 and ok2 and files == sorted(os.listdir(o2)) and all(
         open(os.path.join(o1, f), "rb").read() == open(os.path.join(o2, f), "rb").read() for f in files)
-    check(same and len(files) == n_files + 1, f"{label}: emit --all twice, byte-identical ({len(files)} files)")
+    check(same and len(files) == n_files + 1 + len(SIDE),
+          f"{label}: emit --all twice, byte-identical ({len(files)} files: shards, index, side files)")
     ok, out = run("verify", *args, "--out", o1, "--all")
-    check(ok and "failing: 0" in out, f"{label}: verify --all PASS")
+    check(ok and "failing: 0" in out and out.count("side file ") == len(SIDE) and "-> FAIL" not in out,
+          f"{label}: verify --all PASS (the side files byte-equal)")
     ok, out = run("audit", "--out", o1)
     check(ok and "AUDIT PASS" in out, f"{label}: audit PASS")
     return o1
@@ -219,8 +248,10 @@ def main():
 
         print("BF16 reference build:")
         o = build_grade(tmp, "bf16", ["--hf", hf, "--recipe", rbf], n_files)
-        got = digest(o)
+        got = shard_digest(o)
         check(got == GOLDEN["bf16"], f"GOLDEN bf16: {got}")
+        check(sides_equal(o, hf, hf), "side files: tokenizer.model == tiktoken/tokenizer.model, tokenizer_config.json, "
+                                      "config.json, as shipped")
         shards = sorted(f for f in os.listdir(o) if f.endswith(".safetensors"))
         f_l1, f_l0 = shards[2], shards[1]
 
@@ -283,7 +314,7 @@ def main():
             *[{"role": r, "format": "exl3m_k3"} for r in ("shared_expert", "expert_gate", "expert_up", "expert_down")],
             *[{"role": r, "format": "native"} for r in ("router", "norm", "embed", "head", "other", "vision")]])
         o = build_grade(tmp, "k3", ["--hf", hf, "--exl3", ex, "--recipe", rk3], n_files)
-        got = digest(o)
+        got = shard_digest(o)
         check(got == GOLDEN["k3"], f"GOLDEN k3: {got}")
         key = p1 + "experts.2.up_proj"
         key_d = LLM + "layers.0.mlp.w2_md"
@@ -362,8 +393,24 @@ def main():
                                                                              "vision")]])
         ok, _ = run("plan", "--hf", hf, "--exl3", ex5, "--recipe", r5, expect_fail=True, contains="pair arm")
         check(ok, "routed gate / up at K5 (split, the pair arm reads no K5) -> refused")
-        ok, _ = run("plan", "--hf", hf, "--recipe", rbf, "--tokenizer", tmp, expect_fail=True, contains="tokenizer")
-        check(ok, "--tokenizer on an Inkling build (no tokenizer.* entries yet) -> refused")
+        print("side files:")
+        bare = os.path.join(tmp, "hf-no-tokenizer")   # the mini's case: a checkpoint without tiktoken/
+        shutil.copytree(hf, bare, ignore=shutil.ignore_patterns("tiktoken", "tokenizer_config.json"))
+        tok = os.path.join(tmp, "tok")
+        os.makedirs(os.path.join(tok, "tiktoken"))
+        open(os.path.join(tok, "tiktoken", "tokenizer.model"), "wb").write(TOK_MODEL + b"Iw== 2\n")
+        open(os.path.join(tok, "tokenizer_config.json"), "wb").write(TOK_CONFIG)
+        o = os.path.join(tmp, "bare")
+        ok, _ = run("emit", "--hf", bare, "--recipe", rom, "--out", o, "--all", expect_fail=True, contains="--tokenizer")
+        check(ok and not os.path.exists(o), "a checkpoint without its tokenizer -> refused naming --tokenizer, before "
+                                            "any shard is written")
+        ok, _ = run("emit", "--hf", bare, "--recipe", rom, "--tokenizer", tok, "--out", o, "--all")
+        check(ok and sides_equal(o, tok, bare), "--tokenizer DIR: the tokenizer files from DIR, config.json the "
+                                                "checkpoint's")
+        open(os.path.join(o, "tokenizer.model"), "ab").write(b"x")
+        ok, out = run("verify", "--hf", bare, "--recipe", rom, "--tokenizer", tok, "--out", o, "--all",
+                      expect_fail=True, contains="side file tokenizer.model: MISSING or DIFFERS")
+        check(ok, "verify --all: a side file that differs -> FAIL")
     finally:
         shutil.rmtree(tmp)
     print(f"test_inkling: {'PASS' if not FAILS else 'FAIL'} ({len(FAILS)} failing)")

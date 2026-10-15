@@ -116,6 +116,7 @@ typedef enum {
     PULSAR_CHAT_DS4_V4  = 0,  ///< DeepSeek V4 (0731) template
     PULSAR_CHAT_DS4_V41 = 1,  ///< DeepSeek V4.1 / Vision-Exp template
     PULSAR_CHAT_QWEN    = 2,  ///< Qwen chat template (L251 S5)
+    PULSAR_CHAT_INKLING = 3,  ///< Inkling-Small native renderer (L294 E6: src/lib/inkling_chat)
 } pulsar_chat_format;
 
 /** The speculative drafter a family's artifacts carry. */
