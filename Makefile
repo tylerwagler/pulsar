@@ -269,7 +269,7 @@ pulsar-agent: $(AGENT_OBJS) src/lib/pulsar_help.o src/lib/pulsar_kvtext.o src/li
 # S4 (router / MoE / GR / PLE) beside DeepSeek's and the shared EXL3 arms.
 CUDA_REGRESSION_BINS = tests/cuda_long_context_smoke tests/moe_route_bounds_gate tests/expert_table_gate \
                        tests/exl3_moe_epilogue_gate tests/exl3_dense_gate tests/exl3_moe_prefill_gate tests/exl3_half_gate \
-                       tests/gdn_gate tests/qsa_attn_gate tests/qwen_s4_gate
+                       tests/gdn_gate tests/qsa_attn_gate tests/qwen_s4_gate tests/gqa_attn_gate
 # 2026-10-14: the ten run CONCURRENTLY, each one's output kept together (-O).  They are model-free and mostly
 # host-bound (their references run on the CPU: measured alone, 258 s in series, the longest 114 s of which 113 s
 # user time), so in series they were 258 s of the battery's serial front.  No gate here grades a time.
@@ -600,6 +600,35 @@ tests/gdn_gate: tests/gdn_gate.cu tests/gdn_ref.h src/cuda/pulsar_cuda_gdn.o src
 .PHONY: gdn-gate
 gdn-gate: tests/gdn_gate
 	./tests/gdn_gate
+
+# L295 F1: the family-neutral GQA attention block (runtime geometry, BF16 KV rows,
+# full / window-ring spans, q/k norm, relative-bias + temperature score mod,
+# output gate) vs the double host authority (tests/gqa_ref.h), graded; decode ==
+# prefill == chunked == verify == batched bit-exact; ring rollback; mutations;
+# a long position past the temperature floor; refusals.  Links the PRODUCTION
+# object; pass the served arch (CUDA_ARCH=sm_120f).  Model-free.
+src/cuda/pulsar_cuda_attn_gqa.o: src/cuda/pulsar_cuda_attn_gqa.h
+tests/gqa_attn_gate: tests/gqa_attn_gate.cu tests/gqa_ref.h src/cuda/pulsar_cuda_attn_gqa.o src/cuda/pulsar_cuda_attn_gqa.h Makefile
+	$(NVCC) $(NVCCFLAGS) -std=c++17 -Isrc -Isrc/cuda -o $@ tests/gqa_attn_gate.cu src/cuda/pulsar_cuda_attn_gqa.o
+
+.PHONY: gqa-attn-gate
+gqa-attn-gate: tests/gqa_attn_gate
+	./tests/gqa_attn_gate
+
+# The same block on the Inkling-Small mini checkpoint's window and global layers (L294's 3-layer
+# mini, source layers 0 / 2 / 5), graded against transformers' InklingAttention in fp32 and required
+# to be at least as close to it as transformers' bf16 run.  GQA_MINI_FIXTURE is the directory
+# tests/gqa_mini_fixture.py writes (CPU, seconds): python3 tests/gqa_mini_fixture.py
+# /mnt/models/inkling-small-mini /mnt/models/inkling-small-mini-ref/ref_fp32.pt DIR.
+# The block's decode / verify / prefill timings at Inkling's shapes against a measured read-bandwidth and
+# mma.sync roofline (L295 F1).  Not a gate.
+tests/gqa_attn_bench: tests/gqa_attn_bench.cu src/cuda/pulsar_cuda_attn_gqa.o src/cuda/pulsar_cuda_attn_gqa.h Makefile
+	$(NVCC) $(NVCCFLAGS) -std=c++17 -Isrc -Isrc/cuda -o $@ tests/gqa_attn_bench.cu src/cuda/pulsar_cuda_attn_gqa.o
+
+.PHONY: gqa-attn-mini-grade
+gqa-attn-mini-grade: tests/gqa_attn_gate
+	@test -n "$(GQA_MINI_FIXTURE)" || { echo "gqa-attn-mini-grade: set GQA_MINI_FIXTURE (see tests/gqa_mini_fixture.py)"; exit 1; }
+	./tests/gqa_attn_gate --fixture $(GQA_MINI_FIXTURE)
 
 # L251: the GDN microbenchmark -- decode steps at 1/4/8/16 sequences, DRAM-cold
 # (state slots rotated past L2), prefill throughput, and a streaming-copy
@@ -943,7 +972,7 @@ tests/hc_carry_kernel_test: tests/hc_carry_kernel_test.cu Makefile \
 # attn_f16_banked_test took a "p" argument selecting packed comp banks over
 # f32 ones; the comp format parameter is gone from the kernels (2026-08-18), so
 # there is one mode and one invocation.
-cuda-attn-gates: tests/attn_f16_kernel_test tests/attn_f16_banked_test tests/kv_rows_pack_gate tests/hc_carry_kernel_test tests/minp_prefilter_gate tests/dspark_batch_gate tests/nt_crossover_sweep tests/exl3_dense_gate tests/exl3_dense_bench tests/exl3_dense_xcheck tests/vision_router_gate tests/vision_hc_gate tests/rope_tail_format_gate
+cuda-attn-gates: tests/gqa_attn_gate tests/attn_f16_kernel_test tests/attn_f16_banked_test tests/kv_rows_pack_gate tests/hc_carry_kernel_test tests/minp_prefilter_gate tests/dspark_batch_gate tests/nt_crossover_sweep tests/exl3_dense_gate tests/exl3_dense_bench tests/exl3_dense_xcheck tests/vision_router_gate tests/vision_hc_gate tests/rope_tail_format_gate
 	./tests/attn_f16_kernel_test
 	./tests/attn_f16_kernel_test 40 24 32 x 8 4          # compressed tail
 	./tests/attn_f16_kernel_test 40 24 32 x 8 4 3        # indexed top-k selection
@@ -964,6 +993,7 @@ cuda-attn-gates: tests/attn_f16_kernel_test tests/attn_f16_banked_test tests/kv_
 	./tests/vision_router_gate $(VISION_ROUTER_GOLDENS)
 	./tests/vision_hc_gate
 	./tests/rope_tail_format_gate   # L269: the tail rope on f32 / f16 / bf16 storage
+	./tests/gqa_attn_gate           # L295 F1: the family-neutral GQA attention block
 
 # The host-only MODEL-FREE oracles, plus the eval extractor self-test.  Every
 # one of these was a loose target that no battery ran -- the shape L224 found
