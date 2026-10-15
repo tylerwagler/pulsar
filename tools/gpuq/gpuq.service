@@ -1,0 +1,14 @@
+# gpuq -- the Spark's GPU job queue (pulsar tools/gpuq).  Installed by tools/gpuq/install.sh.
+[Unit]
+Description=gpuq GPU job queue
+
+[Service]
+ExecStart=/usr/bin/python3 %h/.local/lib/gpuq/gpuq.py daemon
+# Only the daemon stops on stop/restart: running jobs (and their shims, which hold ~/gpu.lock) live on,
+# and the next daemon re-adopts them from the spool.
+KillMode=process
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
