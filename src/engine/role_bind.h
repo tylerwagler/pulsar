@@ -60,10 +60,6 @@ pulsar_role_binder *pulsar_role_binder_open(const pulsar_model *m, const char *o
 pulsar_tensor *pulsar_role_bind(pulsar_role_binder *b, pulsar_role_key k, const pulsar_role_admit &a, uint32_t nd,
                                 uint64_t d0, uint64_t d1 = 0, uint64_t d2 = 0);
 
-/** The tensor the container records at `k`, or NULL -- a look only (an optional block's presence, a width the
- *  config does not name): nothing is bound, charged or said. */
-const pulsar_tensor *pulsar_role_find(const pulsar_role_binder *b, pulsar_role_key k);
-
 /** Close the binding: every entry not bound is refused (said, counted) -- the container holds a tensor the family
  *  did not declare.  Prints the price by role, fills `out`, frees `b`.  false = something was refused. */
 bool pulsar_role_binder_close(pulsar_role_binder *b, pulsar_role_census *out);

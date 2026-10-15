@@ -833,14 +833,14 @@ loader-contract-gate: tests/loader_open
 # L295 E1: the Inkling family's load on a built container (tests/inkling_family_gate.{cpp,py}): every tensor bound by
 # its bind record, every byte priced, the plan, the facts, the session refusals -- on the container and its header
 # clone; then each Inkling mutant (a missing tensor, a wrong shape, an unknown or flipped switch, ...) refused by
-# name, the loader contract's neutral faults on it, and the BF16 build refused whole (no bf16-rows routed arm: F7).
-# Host-only.  The container: tools/container/build.py with format-maps/inkling-mini-k3.json on the 3-layer mini.
+# name, and the loader contract's neutral faults on it (its `format` fault is the BF16 build's refusal: no bf16-rows
+# routed arm until F7).  Host-only.  The container: tools/container/build.py emit --hf /mnt/models/inkling-small-mini
+# --exl3 <the mini's K3 pack> --recipe format-maps/inkling-mini-k3.json (L294 / L295 E1).
 INKLING_GATE_MODEL ?= /mnt/models/inkling-mini-k3-pulsar
-INKLING_GATE_REFUSE ?= /mnt/models/inkling-mini-bf16-pulsar
 .PHONY: inkling-family-gate
 inkling-family-gate: tests/inkling_family_gate tests/loader_open
 	python3 tests/inkling_family_gate.py --probe ./tests/inkling_family_gate --open ./tests/loader_open \
-	    --work $(LOADER_CONTRACT_WORK)/inkling $(INKLING_GATE_MODEL) $(foreach r,$(INKLING_GATE_REFUSE),--refuse $(r))
+	    --work $(LOADER_CONTRACT_WORK)/inkling $(INKLING_GATE_MODEL)
 	python3 tests/loader_contract.py --open ./tests/loader_open --work $(LOADER_CONTRACT_WORK) $(INKLING_GATE_MODEL)
 tp-plan-golden: tests/tp_plan_test
 	@mkdir -p tests/tp-plan-golden; for m in $(TP_PLAN_MODELS); do for r in 0 1; do \

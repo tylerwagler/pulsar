@@ -41,6 +41,8 @@ const pulsar_inkling_shape PULSAR_INKLING_SHAPE_SMALL = {
     /* .vis_temporal    = */ 2,
     /* .vis_channels    = */ 3,
     /* .vis_layers      = */ 4,
+    /* .vis_in          = */ {75, 512, 5120, 9600},
+    /* .vis_mid         = */ {128, 320, 4800},
     /* .n_mtp_max       = */ 8,
 };
 
@@ -281,7 +283,6 @@ bool pulsar_inkling_read_shape(const pulsar_model *m, pulsar_inkling_shape *s) {
         }
     }
     if (s->mtp_written && !has_mtp) ok = refuse("%s is true but the container has no inkling.mtp config%s", "pulsar.mtp_present");
-    if (s->vision_written && s->vis_layers > PULSAR_INKLING_VISION_MAX) ok = refuse("%s exceeds the tower's linears%s", "inkling.vision.n_layers");
     return ok;
 }
 

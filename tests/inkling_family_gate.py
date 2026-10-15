@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """inkling_family_gate.py -- L295 E1: the Inkling family's load, on a built container.
 
-  inkling_family_gate.py --probe tests/inkling_family_gate --open tests/loader_open --work DIR MODEL [--refuse MODEL ...]
+  inkling_family_gate.py --probe tests/inkling_family_gate --open tests/loader_open --work DIR MODEL
 
 1. The REAL container: tests/inkling_family_gate opens it inspect-only and checks every claim of the load (the plan,
    every tensor bound by its bind record, every byte priced, the slots, the facts, the session refusals).
@@ -11,8 +11,6 @@
    a wrong shape, an unknown switch, a flipped switch, a geometry the profile does not have, a bad plan list, a
    tensor with no bind record, an undeclared tensor, two tensors with one record, a linear in a format no arm reads,
    a drafter the config does not describe.  (The family-neutral faults are loader_contract.py's `inkling` row.)
-4. --refuse MODEL: a container the family must refuse as a whole (the BF16 build: its routed stacks have no arm at
-   bf16 rows until L295 F7) -- the open returns an error and names why.
 
 The targets are the container's own names (the builder's: the HF / EXL3-pack names), chosen from the clone's
 records by bind role -- the only Inkling knowledge here."""
@@ -144,7 +142,6 @@ def main():
     ap.add_argument('--probe', required=True, help='tests/inkling_family_gate')
     ap.add_argument('--open', required=True, help='tests/loader_open')
     ap.add_argument('--work', required=True, help='a scratch directory for the clones (sparse: ~no disk)')
-    ap.add_argument('--refuse', action='append', default=[], help='a container the family must refuse whole')
     ap.add_argument('model')
     a = ap.parse_args()
     os.makedirs(a.work, exist_ok=True)
@@ -179,13 +176,6 @@ def main():
             print(f'  ok    {what}: {desc} -- refused by name: {said[0].strip()[:170]}')
         shutil.rmtree(out)
     shutil.rmtree(clean)
-    for r in a.refuse:
-        returned, rc, log, dt = LC.open_model(a.open, r, lock)
-        said = [x for x in log.splitlines() if 'refus' in x or 'refuses' in x]
-        ok = returned and rc != 0 and said
-        print(f'  {"ok  " if ok else "FAIL"}  refuse {os.path.basename(os.path.normpath(r))}: '
-              f'{"refused" if ok else "NOT refused by name"} ({dt:.1f} s): {said[0].strip()[:170] if said else ""}')
-        fails += not ok
     print('INKLING-FAMILY GATE ' + ('PASS' if fails == 0 else f'FAIL ({fails})'))
     return 1 if fails else 0
 

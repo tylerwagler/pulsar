@@ -75,11 +75,6 @@ pulsar_role_binder *pulsar_role_binder_open(const pulsar_model *m, const char *o
     return b;
 }
 
-const pulsar_tensor *pulsar_role_find(const pulsar_role_binder *b, pulsar_role_key k) {
-    const auto it = b->by_key.find(key_of(k));
-    return it == b->by_key.end() ? NULL : &b->m->tensors[it->second];
-}
-
 static bool role_admit(const pulsar_role_binder *b, const pulsar_tensor *t, const pulsar_role_admit &a) {
     if (t->type < 32u && (a.plain >> t->type & 1u)) return true;
     if (a.linear) return pulsar_tensor_admit_role(t, b->owner, a.wrole, a.acts);

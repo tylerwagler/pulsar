@@ -83,7 +83,13 @@ typedef struct {
     uint32_t vis_temporal;     ///< temporal_patch_size (2)
     uint32_t vis_channels;     ///< n_channels (3)
     uint32_t vis_layers;       ///< n_layers (4): the hmlp tower's linears
-    uint32_t n_mtp_max;        ///< num_nextn_predict_layers of the profile (8); the loaded value is n_mtp
+    /** The tower's linear widths, in -> out per layer: vLLM's plan_out_scales (inkling/common/towers.py) for the
+     *  pinned patch / temporal / channels / layers above -- each layer folds a (t, h, w) block into channels and
+     *  rounds the width up to 64: (5x5x3 = 75 -> 128), (2x2 -> 512 -> 320), (4x4 -> 5120 -> 4800), (t 2 -> 9600 ->
+     *  n_embd).  The config names none of them; they follow from the pinned keys, so the profile carries them. */
+    uint32_t vis_in[PULSAR_INKLING_VISION_MAX];
+    uint32_t vis_mid[PULSAR_INKLING_VISION_MAX - 1];   ///< the inner outputs; the last linear writes n_embd
+    uint32_t n_mtp_max;       ///< num_nextn_predict_layers of the profile (8); the loaded value is n_mtp
     /* the plan: the container's */
     uint32_t n_layer;          ///< num_hidden_layers
     uint32_t n_dense;          ///< dense_mlp_idx: layers [0, n_dense) run the dense MLP, the rest the MoE

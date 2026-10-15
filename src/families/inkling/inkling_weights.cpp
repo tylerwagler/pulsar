@@ -71,20 +71,14 @@ void bind_block(pulsar_role_binder *b, const pulsar_inkling_shape *s, const char
     }
 }
 
-/* The hmlp tower: linear i maps the previous width to the next -- the first reads a flattened patch
- * (patch^2 x channels x temporal), the last writes n_embd -- with a norm between linears and a final norm after.
- * The inner widths are the checkpoint's own (the config does not name them): each is the stored linear's output,
- * and the next linear's input is checked against it. */
+/* The hmlp tower: linear i at the profile's widths (pulsar_inkling_shape::vis_in / vis_mid, the last writing n_embd),
+ * an RMSNorm after each but the last, a final norm on the n_embd output. */
 void bind_tower(pulsar_role_binder *b, const pulsar_inkling_shape *s, pulsar_inkling_model *w) {
-    uint64_t in = (uint64_t)s->vis_patch * s->vis_patch * s->vis_channels * s->vis_temporal;
     for (uint32_t i = 0; i < s->vis_layers; i++) {
         const bool last = i + 1 == s->vis_layers;
-        const pulsar_role_key k = pulsar_role_top("vision_linear", (int32_t)i);
-        const pulsar_tensor *t = pulsar_role_find(b, k);
-        const uint64_t out = last ? s->n_embd : t && t->ndim == 2 ? t->dim[1] : 0;
-        w->vis_linear[i] = pulsar_role_bind(b, k, A_BF16, 2, in, out);
+        const uint64_t out = last ? s->n_embd : s->vis_mid[i];
+        w->vis_linear[i] = pulsar_role_bind(b, pulsar_role_top("vision_linear", (int32_t)i), A_BF16, 2, s->vis_in[i], out);
         if (!last) w->vis_norm[i] = pulsar_role_bind(b, pulsar_role_top("vision_norm", (int32_t)i), A_BF16, 1, out);
-        in = out;
     }
     w->vis_final_norm = pulsar_role_bind(b, pulsar_role_top("vision_final_norm"), A_BF16, 1, s->n_embd);
 }

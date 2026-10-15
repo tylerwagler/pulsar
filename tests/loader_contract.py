@@ -55,6 +55,8 @@ FAMILIES = {
     },
     'inkling': {   # L295 E1: the 3-layer mini (layer 1 is MoE) and Inkling-Small alike
         'tensor': 'model.llm.layers.1.attn.wk_dv.weight',   # a packed (EXL3) projection
+        # a role-bound family names a MISSING tensor by its bind record (role_bind.h): the container's name is gone
+        'tensor_record': 'role attn_k, block layers, layer 1',
         'plain': 'model.llm.layers.1.mlp.gate.weight',      # the router, bf16 [4096 -> 258]
         'kv': 'inkling.hidden_size',
         'stack': 'model.llm.layers.1.mlp.experts.gate_proj',
@@ -153,7 +155,7 @@ def mutate(shards, family, row, what):
         if what == 'tensor':
             del s['header'][cname]
             edit_meta_json(s, 'pulsar.tensors', lambda t: {k: v for k, v in t.items() if k != cname})
-            return f'{target} dropped', names
+            return f'{target} dropped', names + ([row['tensor_record']] if 'tensor_record' in row else [])
         if what == 'shape':
             # transposed in both tables: the same element count and bytes, so the file is consistent -- only the
             # binder, checking the dims its reader needs, can refuse it
