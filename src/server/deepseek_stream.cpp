@@ -4,9 +4,9 @@
  * in unclosed reasoning).  The walk decides what each released byte is -- reasoning, answer, a tool
  * call, or held protocol syntax -- and drives the request's protocol sink (chat_sink): OpenAI deltas,
  * Anthropic content blocks or Responses items.  Before L267 each protocol carried its own copy of this
- * walk; tests/sse_golden pins the bytes they sent.  The final DSML parse is genmsg.cpp's, and the
+ * walk; tests/sse_golden pins the bytes they sent.  The final DSML parse is deepseek_dsml.cpp's, and the
  * finish is the protocol's. */
-#include "pulsar_server_internal.h"
+#include "deepseek_dsml.h"
 
 void deepseek_stream_walk_init(deepseek_stream_walk *w, const request *r) {
     memset(w, 0, sizeof(*w));

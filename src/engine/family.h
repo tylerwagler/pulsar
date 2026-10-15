@@ -220,6 +220,9 @@ typedef struct pulsar_family_tokenizer {
     bool (*turn_markers)(pulsar_engine *e, pulsar_turn_markers *out);
     /** --dump-tokens: the ids, then one line per token. */
     void (*dump)(pulsar_engine *e, FILE *fp, const pulsar_tokens *tokens);
+    /** Ids in the tokenizer's TABLE (pulsar_engine_vocab_size), not the logits row width (L295 F5: the
+     *  hook replaces the engine's branch on which family's tokenizer is loaded). */
+    int (*n_tokens)(pulsar_engine *e);
 } pulsar_family_tokenizer;
 
 /** A family's bank pool (L251; every family's since L284 dd-banks -- DeepSeek's is its graph pool,

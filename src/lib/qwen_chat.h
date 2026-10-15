@@ -39,11 +39,13 @@
  * the family's one default -- the template's own `default('xhigh')` -- and
  * the only way an unspecified effort resolves.
  *
- * OUTPUT PARSER.  `qwen_output_parser` splits sampled text into reasoning,
- * content and tool calls, incrementally (any chunking gives the same events)
- * and in the template's normal form -- reasoning and content stripped the
- * way the template strips them on replay -- so a turn the parser read
- * re-renders to the bytes the model sampled.  See the class. */
+ * OUTPUT PARSER.  `qwen_output_parser` is the output-parser kit (L295 F5,
+ * out_parse_kit.h) in Qwen's configuration -- its grammar and its XML call
+ * body -- and splits sampled text into reasoning, content and tool calls,
+ * incrementally (any chunking gives the same events) and in the template's
+ * normal form -- reasoning and content stripped the way the template strips
+ * them on replay -- so a turn the parser read re-renders to the bytes the
+ * model sampled. */
 #pragma once
 
 #include <stddef.h>
@@ -52,6 +54,7 @@
 #include <string>
 #include <vector>
 
+#include "out_parse_kit.h"
 #include "pulsar.h"
 #include "pyjson.h"
 
@@ -156,121 +159,51 @@ bool qwen_chat_render_turn(const qwen_msg_in *msgs, int n, qwen_effort effort, b
  * front ends use. */
 std::string qwen_system_reminder(const char *content);
 
-/** Python's str.strip() whitespace (what Jinja's |trim removes): the one
- * definition the renderer and the output parser share. */
-bool qwen_py_isspace(uint32_t cp);
-
-/** One thing the output parser recognised. */
-struct qwen_out_event {
-    enum kind_t {
-        REASONING,   ///< `text` is a reasoning delta
-        CONTENT,     ///< `text` is a content delta
-        TOOL_BEGIN,  ///< call `index` named `name` opened
-        TOOL_ARGS,   ///< `text` is the next fragment of call `index`'s arguments (one closed parameter:
-                     ///< `{"key": value` first, `, "key": value` after; the object's "}" is the caller's)
-        TOOL_END,    ///< call `index` complete: `name`, `arguments` (a JSON object's text)
-        ERROR,       ///< `text` says what was malformed; the call it concerns is dropped
-    } kind;
-    std::string text;
-    int index = -1;
-    std::string name;
-    std::string arguments;
-};
-
-/** One complete tool call the parser read. */
-struct qwen_out_call {
-    std::string name;
-    std::string arguments;   ///< a JSON object, Python-dumps spelling
-};
-
-/** The sampled-text parser for one assistant turn.
- *
- * Format (the template's, and the tools prompt it gives the model):
+/** Qwen's tool-call body for the output-parser kit (out_parse_kit.h): XML parameters inside one
+ * \<tool_call\> block.
  * @verbatim
-   [reasoning] </think> [content] <tool_call>\n<function=NAME>\n
-   <parameter=KEY>\nVALUE\n</parameter>\n ... </function>\n</tool_call> ...
+   <function=NAME>\n<parameter=KEY>\nVALUE\n</parameter>\n ... </function>
    @endverbatim
- * With thinking on the generation prompt already opened `<think>\n`, so the
- * turn starts in reasoning; with thinking off it closed an empty block and the
- * turn starts in content.  Inside reasoning nothing but `</think>` is
- * structure.  A parameter VALUE is the text between the tags minus one
- * leading and one trailing newline (the template writes exactly those).
+ * A parameter VALUE is the text between the tags minus one leading and one trailing newline (the template
+ * writes exactly those).  Arguments are rebuilt as JSON.  The template wrote strings raw and every other
+ * value with tojson, so a value is JSON exactly when (a) the tool schema does not declare the property a
+ * string (type "string" or a type list that includes it) and (b) the text parses AND is the tojson spelling
+ * of what it parses to; anything else is the text as a string.  Either way the value re-renders to the
+ * bytes the model sampled.
  *
- * Arguments are rebuilt as JSON.  The template wrote strings raw and every
- * other value with tojson, so a value is JSON exactly when (a) the tool schema
- * does not declare the property a string (type "string" or a type list that
- * includes it) and (b) the text parses AND is the tojson spelling of what it
- * parses to; anything else is the text as a string.  Either way the value
- * re-renders to the bytes the model sampled.
+ * L284 P5: a call streams as it is read -- TOOL_BEGIN when its name is complete, TOOL_ARGS as each
+ * parameter CLOSES (a value's JSON spelling is known only then: the schema and the whole text decide it),
+ * TOOL_END (or ERROR) at its close.  The fragments plus "}" are the arguments; a repeated key streams twice
+ * (a JSON reader keeps the last, as `arguments` does).
  *
- * Reasoning and content are reported STRIPPED (the template strips both on
- * replay); whitespace is held back until the next non-space proves it
- * interior.  Text after a tool call is content again (the prompt forbids it;
- * the client still sees it).  A malformed or unterminated call is an ERROR
- * event naming the fault, and is not reported as a call.
- *
- * L284 P5: a call streams as it is read -- TOOL_BEGIN when its name is
- * complete, TOOL_ARGS as each parameter CLOSES (a value's JSON spelling is
- * known only then: the schema and the whole text decide it), TOOL_END (or
- * ERROR) at its close.  The fragments plus "}" are the arguments; a repeated
- * key streams twice (a JSON reader keeps the last, as `arguments` does). */
-class qwen_output_parser {
+ * L284 P6: the payload is inside a parameter value the schema declares a string, or inside a JSON string
+ * literal of any other value -- past the value's leading newline (the template's) and not on a partial
+ * closer ("</" onward). */
+class qwen_xml_call_body : public out_call_body {
 public:
-    /** `thinking`: the generation prompt opened a think block.  `tools_json`:
-     * the request's tools (NULL for none) -- the schema that types arguments.
-     * false + reason if tools_json is not a JSON array. */
-    bool init(bool thinking, const char *tools_json, char *err, size_t errlen);
-    void feed(const char *p, size_t n, std::vector<qwen_out_event> *ev);
-    /** End of the turn (a stop token, or the length cap). */
-    void finish(std::vector<qwen_out_event> *ev);
+    /** The request's tools (the schema that types arguments). */
+    pyjson_value tools;
 
-    const std::string &reasoning() const { return reasoning_; }
-    const std::string &content() const { return content_; }
-    const std::vector<qwen_out_call> &calls() const { return calls_; }
-    int errors() const { return errors_; }
-    /** The parser sits inside an open \<tool_call\> block. */
-    bool in_tool_call() const { return mode_ == M_TOOL; }
-    /** L284 P6: the next byte is a call's PAYLOAD -- inside a parameter value the schema declares a
-     * string, or inside a JSON string literal of any other value -- past the value's leading newline
-     * (the template's) and not on a partial closer ("</" onward).  The shared decode rule: a call's
-     * structure decodes greedily, its payload is sampled (DeepSeek's DSML tracker draws the same line). */
-    bool in_payload() const { return mode_ == M_TOOL && pay_.value && pay_.payload; }
-    /** The turn's calls as SAMPLED: [lo, hi) in the fed stream, from the first "<tool_call>" to the
-     * last "</tool_call>" that closed (a malformed block among them included -- these are the bytes
-     * the live KV holds; qwen_msg_in::raw_calls replays them).  false until a call was read. */
-    bool raw_span(size_t *lo, size_t *hi) const;
+    void open() override;
+    void grow(const std::string &b, size_t held, bool closing, int index, std::vector<out_event> *ev) override;
+    bool in_payload() const override { return pay_.value && pay_.payload; }
+    bool close(const std::string &b, int index, std::vector<out_event> *ev, out_call *call, const char **why,
+               size_t *at) override;
 
 private:
-    enum mode_t { M_REASONING, M_CONTENT, M_TOOL, M_AFTER_TOOL };
-    struct section {           /* a stripped text stream */
-        bool started = false;  ///< a non-space codepoint went out
-        std::string ws;        ///< interior whitespace held back
-        std::string partial;   ///< an incomplete UTF-8 sequence
-    };
-    void emit_text(bool reasoning, const char *p, size_t n, std::vector<qwen_out_event> *ev);
-    void end_section(bool reasoning);
-    void close_call(std::vector<qwen_out_event> *ev);
-    void scan_payload();
+    void scan_payload(const std::string &b, size_t held);
     int read_param(const std::string &b, size_t *i, const std::string &fn, std::string *key, pyjson_value *v,
                    const char **why) const;
-    void stream_params(std::vector<qwen_out_event> *ev);
+    void stream_params(const std::string &b, int index, std::vector<out_event> *ev);
     const char *param_type(const std::string &fn, const std::string &key) const;
 
-    mode_t mode_ = M_CONTENT;
-    std::string hold_;         ///< bytes not yet classified
-    size_t fed_ = 0;           ///< bytes fed so far; hold_ is the stream's unclassified tail
-    bool block_seen_ = false;  ///< a \<tool_call\> opened: raw_lo_ is set
-    size_t raw_lo_ = 0;        ///< stream offset of the first \<tool_call\>
-    size_t raw_hi_ = 0;        ///< stream offset past the last \</tool_call\>
-    section sec_[2];           ///< [0] content, [1] reasoning
-    std::string block_;        ///< the open tool-call block body
     bool began_ = false;       ///< TOOL_BEGIN sent for the open call
     std::string fn_;           ///< the open call's function name, once complete
-    size_t arg_pos_ = 0;       ///< block_ offset past the last parameter streamed (TOOL_ARGS)
+    size_t arg_pos_ = 0;       ///< body offset past the last parameter streamed (TOOL_ARGS)
     int arg_n_ = 0;            ///< parameters streamed for the open call
     bool arg_stop_ = false;    ///< the open call stopped streaming: its next bytes are not a parameter
     struct payload_scan {      ///< where the open block's decode is (in_payload), scanned incrementally
-        size_t pos = 0;        ///< bytes of block_ classified
+        size_t pos = 0;        ///< bytes of the body classified
         bool value = false;    ///< inside a parameter value
         size_t vstart = 0;     ///< where its text starts (past the tag)
         bool is_string = false;///< the schema declares it a string
@@ -278,9 +211,22 @@ private:
         bool esc = false;      ///< the previous byte was a backslash in that literal
         bool payload = false;  ///< the result for the next byte
     } pay_;
-    int index_ = 0;
-    int errors_ = 0;
-    std::string reasoning_, content_;
-    std::vector<qwen_out_call> calls_;
-    pyjson_value tools_;       ///< the request's tools, for typing arguments
+};
+
+/** Qwen's output grammar for the kit: `</think>` ends the reasoning the generation prompt opened (thinking
+ * on); `<tool_call>` ... `</tool_call>` is a call; text after a call is content again (the prompt forbids
+ * it; the client still sees it).  Reasoning and content are reported STRIPPED (the template strips both on
+ * replay), so a turn the parser read re-renders to the bytes the model sampled. */
+const out_grammar &qwen_output_grammar(void);
+
+/** The sampled-text parser for one Qwen assistant turn: the kit's parser in Qwen's configuration. */
+class qwen_output_parser : public out_parser {
+public:
+    /** `thinking`: the generation prompt opened a think block (the turn starts in reasoning).  `tools_json`:
+     * the request's tools (NULL for none) -- the schema that types arguments.  false + reason if tools_json
+     * is not a JSON array. */
+    bool init(bool thinking, const char *tools_json, char *err, size_t errlen);
+
+private:
+    qwen_xml_call_body body_;
 };

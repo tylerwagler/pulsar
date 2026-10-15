@@ -134,6 +134,7 @@ AGENT_SRCS = $(wildcard src/agent/*.cpp)
 AGENT_OBJS = $(AGENT_SRCS:.cpp=.o)
 SERVER_SRCS = $(wildcard src/server/*.cpp)
 SERVER_OBJS = $(SERVER_SRCS:.cpp=.o)
+SERVER_HDRS = $(wildcard src/server/*.h)
 # CUTLASS TUs need the CUTLASS include path + c++17; they build via dedicated rules below,
 # so keep them out of the generic src/cuda/%.o rule.
 CUTLASS_CUDA_OBJS = src/cuda/pulsar_mxfp4_cutlass.o
@@ -156,10 +157,11 @@ LIB_HDRS = src/lib/pulsar_help.h src/lib/pulsar_kvtext.h src/lib/pulsar_segstore
 # scans shard headers and __metadata__ as JSON), so every target that links
 # $(CORE_OBJS) needs it.  ALL_OBJS globs src/lib/*.cpp but is only used to
 # derive .d files, and link rules use $^, so there is no duplicate object.
-# The Qwen tokenizer (L251 S5) rides here too: the Qwen family loads it at open and the engine's
+# The frontend (L251 S5; the shared kit since L295 F5) rides here too -- the BPE engine, the output-parser
+# kit, Qwen's renderer and parser configuration: the Qwen family loads its tokenizer at open and the engine's
 # tokenizer entries dispatch to it, so every target linking $(CORE_OBJS) references it.
-QWEN_TOK_OBJS = src/lib/qwen_tokenizer.o src/lib/pyjson.o src/lib/qwen_chat.o src/lib/qwen_output.o
-CORE_OBJS = $(ENGINE_OBJS) $(CUDA_OBJS) $(CUTLASS_CUDA_OBJS) $(MMQ_OBJS) src/lib/pulsar_json.o $(QWEN_TOK_OBJS) $(TP_OBJS)
+FRONTEND_OBJS = src/lib/bpe_tokenizer.o src/lib/pyjson.o src/lib/qwen_chat.o src/lib/qwen_output.o src/lib/out_parse_kit.o
+CORE_OBJS = $(ENGINE_OBJS) $(CUDA_OBJS) $(CUTLASS_CUDA_OBJS) $(MMQ_OBJS) src/lib/pulsar_json.o $(FRONTEND_OBJS) $(TP_OBJS)
 
 # ---------------------------------------------------------------------------
 # AUTOMATIC HEADER DEPENDENCIES  (-MMD -MP)
@@ -984,14 +986,29 @@ qwen-ngram-test: tests/qwen_ngram_test
 QWEN_TOK_DIR ?= /mnt/models/hub/models--Qwen--Qwen3.8-Flash-Next/snapshots/de4b8e4d43b917e7706784d8bb445c9af86a3540
 QWEN_RENDER_CASES ?= /mnt/models/reap-corpus/cases
 QWEN_CALIB ?= /mnt/models/qwen38-calib/calib-qwen38-v1.jsonl
-QWEN_CHAT_SRCS = src/lib/qwen_tokenizer.cpp src/lib/pyjson.cpp src/lib/qwen_chat.cpp src/lib/qwen_output.cpp
-tests/qwen_chat_gate: tests/qwen_chat_gate.cpp $(QWEN_CHAT_SRCS) src/lib/qwen_tokenizer.h \
-                      src/lib/qwen_unicode_tables.inc src/lib/pyjson.h src/lib/qwen_chat.h src/lib/pulsar_utf8.h \
+QWEN_CHAT_SRCS = src/lib/bpe_tokenizer.cpp src/lib/pyjson.cpp src/lib/qwen_chat.cpp src/lib/qwen_output.cpp src/lib/out_parse_kit.cpp
+tests/qwen_chat_gate: tests/qwen_chat_gate.cpp tests/bpe_gate_util.h $(QWEN_CHAT_SRCS) src/lib/bpe_tokenizer.h \
+                      src/lib/bpe_unicode_tables.inc src/lib/pyjson.h src/lib/qwen_chat.h src/lib/out_parse_kit.h src/lib/pulsar_utf8.h \
                       src/lib/sha1.hpp Makefile
 	$(CXX) $(CXXFLAGS) -Isrc -Isrc/lib -o $@ tests/qwen_chat_gate.cpp $(QWEN_CHAT_SRCS)
 .PHONY: qwen-chat-gate
 qwen-chat-gate: tests/qwen_chat_gate
 	./tests/qwen_chat_gate --tok $(QWEN_TOK_DIR) --vectors tests/test-vectors/qwen38 \
+	    --cases $(QWEN_RENDER_CASES) --calib $(QWEN_CALIB)
+
+# L295 F5 / L294 E6: the Inkling-Small frontend -- the shared BPE engine in its tiktoken configuration graded
+# against HF tokenizers on tokenizer.json, the renderer against vLLM's native Inkling renderer, the output-parser
+# kit's Inkling configuration against vLLM's parser engine (goldens from tests/inkling/gen_inkling_goldens.py).
+# Model-free; the inputs are the checkpoint's tokenizer files (hf download, no weights) and the L216 corpus.
+INKLING_TOK_DIR ?= /mnt/models/inkling-small-tokenizer
+INKLING_CHAT_SRCS = src/lib/bpe_tokenizer.cpp src/lib/pyjson.cpp src/lib/inkling_chat.cpp src/lib/out_parse_kit.cpp
+tests/inkling_chat_gate: tests/inkling_chat_gate.cpp tests/bpe_gate_util.h $(INKLING_CHAT_SRCS) src/lib/bpe_tokenizer.h \
+                         src/lib/bpe_unicode_tables.inc src/lib/pyjson.h src/lib/inkling_chat.h src/lib/out_parse_kit.h \
+                         src/lib/pulsar_utf8.h src/lib/sha1.hpp Makefile
+	$(CXX) $(CXXFLAGS) -Isrc -Isrc/lib -o $@ tests/inkling_chat_gate.cpp $(INKLING_CHAT_SRCS)
+.PHONY: inkling-chat-gate
+inkling-chat-gate: tests/inkling_chat_gate
+	./tests/inkling_chat_gate --tok $(INKLING_TOK_DIR) --vectors tests/test-vectors/inkling \
 	    --cases $(QWEN_RENDER_CASES) --calib $(QWEN_CALIB)
 
 # The attention layout table gate (two profiles, one engine) -- HOST ONLY.  The
@@ -2079,14 +2096,16 @@ GATE_TARGETS = unit-test-gate agent-test-gate \
 # it.  The runner is the only target after them, and every gate binary and
 # CORE_OBJS is built by the targets above, so the background sub-makes only
 # RUN -- they do not race the runner's build (which reads the same objects).
-# L278: plus the chat / tokenizer contract (qwen-chat-gate: tokenize, render, parser vs HF goldens), the server
+# L278: plus the chat / tokenizer contract (qwen-chat-gate: tokenize, render, parser vs HF goldens; inkling-chat-gate:
+# the same against HF and vLLM, L295 F5), the server
 # goldens for both families (api-golden: parsed requests, DeepSeek and Qwen rows; sse-golden: stream bytes) and
 # the speculation depth rule both drafters share, and render-gate (the V4.1 reference encoder's goldens, pinned in the
 # shared hub) -- seconds each, overlapping the runner.  (tp-plan-gate stays out of the overlap: its scan of the pair's
 # DeepSeek is a 12 GB process over 167 GB of NFS page cache beside a 90 GB engine on unified memory.)
 HOST_GATE_TARGETS = cuda-reap-router-audit vision-layout-gate vision-pixel-gate \
 	vision-codec-gate vision-span-gate vision-visible-gate vision-placeholder-gate vision-qwen-pixel-gate seam-check \
-	exl3-dequant-gate host-checks qwen-chat-gate api-golden-gate sse-golden-gate spec-depth-gate \
+	exl3-dequant-gate host-checks qwen-chat-gate inkling-chat-gate api-golden-gate sse-golden-gate \
+	spec-depth-gate \
 	loader-contract-gate render-gate
 # Every gate target is phony, declared HERE where the list is defined (the
 # .PHONY line at the top of the file expands before GATE_TARGETS exists).  A
@@ -2384,7 +2403,7 @@ src/tp/%.o: src/tp/%.cpp src/tp/pulsar_tp.h
 src/tp/pulsar_tp_gpu.o: src/tp/pulsar_tp_gpu.cpp src/tp/pulsar_tp_gpu.h
 	$(NVCC) $(NVCCFLAGS) -Isrc -c -o $@ $<
 
-src/server/%.o: src/server/%.cpp src/server/pulsar_server_internal.h src/pulsar.h $(LIB_HDRS)
+src/server/%.o: src/server/%.cpp $(SERVER_HDRS) src/pulsar.h $(LIB_HDRS)
 	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -c -o $@ $<
 
 src/agent/%.o: src/agent/%.cpp src/agent/pulsar_agent_internal.h src/pulsar.h $(LIB_HDRS) src/vendor/linenoise.h
@@ -2399,7 +2418,7 @@ src/lib/%.o: src/lib/%.cpp src/pulsar.h $(LIB_HDRS) src/lib/sha1.hpp
 src/vendor/%.o: src/vendor/%.cpp src/vendor/linenoise.h
 	$(CXX) $(CXXFLAGS) -Wno-write-strings -c -o $@ $<
 
-tests/pulsar_test.o: tests/pulsar_test.cpp $(SERVER_SRCS) src/server/pulsar_server_internal.h src/pulsar.h $(LIB_HDRS)
+tests/pulsar_test.o: tests/pulsar_test.cpp $(SERVER_SRCS) $(SERVER_HDRS) src/pulsar.h $(LIB_HDRS)
 	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -Wno-unused-function -c -o $@ tests/pulsar_test.cpp
 
 tests/pulsar_agent_test.o: tests/pulsar_agent_test.cpp $(AGENT_SRCS) src/agent/pulsar_agent_internal.h src/pulsar.h $(LIB_HDRS) src/vendor/linenoise.h
@@ -2814,7 +2833,7 @@ pulsar_test: tests/pulsar_test.o src/lib/pulsar_help.o src/lib/pulsar_kvtext.o s
 
 # L267: the API parsers' requests dumped field by field (host-only; see tests/api_golden.cpp).
 # api-golden-gate compares them with the golden recorded before L267 moved the parse/render layers.
-tests/api_golden.o: tests/api_golden.cpp $(SERVER_SRCS) src/server/pulsar_server_internal.h src/pulsar.h $(LIB_HDRS)
+tests/api_golden.o: tests/api_golden.cpp $(SERVER_SRCS) $(SERVER_HDRS) src/pulsar.h $(LIB_HDRS)
 	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -Wno-unused-function -c -o $@ tests/api_golden.cpp
 
 tests/api_golden: tests/api_golden.o src/lib/pulsar_help.o src/lib/pulsar_kvtext.o src/lib/pulsar_segstore.o src/lib/pulsar_kvchain.o src/lib/pulsar_dsml.o $(CORE_OBJS)
@@ -2826,7 +2845,7 @@ api-golden-gate: tests/api_golden
 	diff -u tests/api-golden/golden.txt tests/api-golden/out.txt && echo "API-GOLDEN GATE PASS"
 
 # L267: the DeepSeek stream projections' bytes per protocol (host-only; see tests/sse_golden.cpp).
-tests/sse_golden.o: tests/sse_golden.cpp $(SERVER_SRCS) src/server/pulsar_server_internal.h src/pulsar.h $(LIB_HDRS)
+tests/sse_golden.o: tests/sse_golden.cpp $(SERVER_SRCS) $(SERVER_HDRS) src/pulsar.h $(LIB_HDRS)
 	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -Wno-unused-function -c -o $@ tests/sse_golden.cpp
 
 tests/sse_golden: tests/sse_golden.o src/lib/pulsar_help.o src/lib/pulsar_kvtext.o src/lib/pulsar_segstore.o src/lib/pulsar_kvchain.o src/lib/pulsar_dsml.o $(CORE_OBJS)

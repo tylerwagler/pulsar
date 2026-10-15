@@ -67,7 +67,7 @@ int main(int argc, char **argv) {
     qwen_output_parser parser;
     /* the generation prompt opens a think block unless thinking is off */
     if (!parser.init(effort != QWEN_EFFORT_NONE, NULL, err, sizeof(err))) { fprintf(stderr, "qwen-chat-smoke: parser: %s\n", err); return 1; }
-    std::vector<qwen_out_event> ev;
+    std::vector<out_event> ev;
     std::vector<float> row((size_t)W);
 
     const double t0 = now_s();
