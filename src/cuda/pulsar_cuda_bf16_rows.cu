@@ -36,9 +36,9 @@ constexpr int kRoutedNT = 8;           ///< the routed arm's n8 tiles: 64 assign
 constexpr int kMaxE = 1024;            ///< experts the one-block plan kernel scans
 
 /** Elements of K a chunk stages for NT n8 tiles: kStageBytes over 8 NT rows, a multiple of 64. */
-template <int NT> constexpr int chunk_k() { return kStageBytes / (8 * NT) / 2 / 64 * 64; }
-template <int NT> constexpr int stage_stride() { return chunk_k<NT>() * 2 + 16; }   /* bytes; 16 mod 128 */
-template <int NT> constexpr size_t stage_bytes() { return (size_t)8 * NT * stage_stride<NT>(); }
+template <int NT> __host__ __device__ constexpr int chunk_k() { return kStageBytes / (8 * NT) / 2 / 64 * 64; }
+template <int NT> __host__ __device__ constexpr int stage_stride() { return chunk_k<NT>() * 2 + 16; }   /* 16 mod 128 */
+template <int NT> __host__ __device__ constexpr size_t stage_bytes() { return (size_t)8 * NT * stage_stride<NT>(); }
 static_assert(stage_bytes<1>() <= 48 * 1024 && stage_bytes<2>() <= 48 * 1024 && stage_bytes<kRoutedNT>() <= 48 * 1024,
               "the staged chunk must fit the default dynamic shared memory");
 
