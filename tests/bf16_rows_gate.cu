@@ -450,7 +450,7 @@ static void section_shared_relu2(void) {
     const out r = run(T, 0);
     CHECK(r.rc == 0, "shared relu^2: the launcher refused (rc=%d)", r.rc);
     std::vector<double> y, env;
-    double w = 0, uworst = 0, dworst = 0;
+    double uworst = 0, dworst = 0;
     size_t uover = 0, hbad = 0, dover = 0, obad = 0;
     ref_linear(U.data(), X.data(), 0, T, H, M, y, env);
     uover = over_env(r.yu.data(), y, env, (size_t)T * M, &uworst);
@@ -470,7 +470,6 @@ static void section_shared_relu2(void) {
         const out r1 = run(1, t);
         inv += memcmp(r1.o.data(), r.o.data() + (size_t)t * H, (size_t)H * 4) != 0;
     }
-    (void)w;
     CHECK(uover == 0 && hbad == 0 && dover == 0 && obad == 0 && inv == 0,
           "shared relu^2: up %zu / rows %zu / down %zu outside, out != routed + shared at %zu, %zu rows differ alone",
           uover, hbad, dover, obad, inv);
