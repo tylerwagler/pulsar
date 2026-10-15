@@ -1,5 +1,5 @@
-# vLLM flags for every fmtcmp LOGPROB CAPTURE (BF16 on the H100s, NVFP4 on Sparky).  One authority: both
-# sparky_vllm_job.sh and h100/run_reference.sh read this file, so the two sides differ only in the weights,
+# vLLM flags for every fmtcmp LOGPROB CAPTURE (BF16 on the R1 4-GPU box, NVFP4 on Sparky).  One authority: both
+# sparky_vllm_job.sh and r1/run_reference.sh read this file, so the two sides differ only in the weights,
 # the platform (TP4 Hopper vs one GB10) and --gpu-memory-utilization.
 # Deliberately NOT the cards' serving flags: no speculation (the capture is teacher-forced prefill), no prefix
 # caching (a cached prefix has no prompt logprobs), and the Mamba state dtype left at the checkpoint's own

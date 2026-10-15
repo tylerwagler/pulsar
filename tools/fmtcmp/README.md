@@ -9,7 +9,7 @@ both formats the same way: teacher-forced next-token distributions against BF16,
 
 | arm | weights | runs on | logprob capture | agentic |
 |---|---|---|---|---|
-| **BF16** (reference) | `nemotron35-super-vl-bf16`, 249 GB | Tyler's 4x H100, vLLM TP4 (the card's build) | `h100/run_reference.sh capture` | `h100/run_reference.sh agentic` (card recipe, MTP 3) |
+| **BF16** (reference) | `nemotron35-super-vl-bf16`, 249 GB | any 4x 80 GB box (Tyler's H100s or the Vast rental), vLLM TP4, the card's build (Docker or venv) | `r1/run_reference.sh capture` | `r1/run_reference.sh agentic` (card recipe, MTP 3) |
 | **NVFP4** | `nemotron35-super-vl-nvfp4`, 70 GB | Sparky, vLLM, the card's Spark recipe | `sparky_vllm_job.sh capture` | `sparky_vllm_job.sh agentic` (LiLiCorr, card default) |
 | **EXL3 K4 / K5** | quant session's packs (below) | Sparky, exllamav3's own forward | `sparky_exl3_job.sh capture` | `sparky_exl3_job.sh agentic` (`exl3_openai_shim.py`) |
 
@@ -64,14 +64,14 @@ chunked prefill 8192, Mamba state dtype at the checkpoint default.  Sparky adds 
 ## Agentic eval
 
 tool-eval-bench at the pinned commit `b60e2f0` (v2.8.0 + 1; our tool-eval anchor's instrument, L292), the standard
-69 scenarios, args in `h100/AGENTIC_ARGS` (seed 42, the card's sampling T 1.0 / top-p 0.95), against each arm's
+69 scenarios, args in `r1/AGENTIC_ARGS` (seed 42, the card's sampling T 1.0 / top-p 0.95), against each arm's
 OpenAI-compatible endpoint.  One seed is a screen, not a grade: the anchor's seed-to-seed spread is 5 points, so a
 verdict needs 4 seeds per arm.
 
 ## EXL3 arms: what the quant session produces
 
 - **Source:** `/mnt/models/nemotron35-super-vl-bf16` — the snapshot the suite was built from
-  (`h100/bf16-identity.sha256` pins config, index, tokenizer, template).
+  (`r1/bf16-identity.sha256` pins config, index, tokenizer, template).
 - **Converter:** our exllamav3 fork with plan 121's Q1 Nemotron-Omni adapter (Omni wrapper config,
   `layers_block_type` lists, `language_model.` prefix, vision skipped), at a recorded sha.  `CUDA_LAUNCH_BLOCKING=1`
   (L294's GB10 hang) and `calibration_all_experts`.
@@ -94,7 +94,7 @@ How the harness runs them (on Sparky, copied to `/srv/models/nemotron35-exl3/k{4
 gpuq submit --class short --timeout 20m --mem 90G --label fmtcmp --wait -- \
   ~/fmtcmp/tools/sparky_exl3_job.sh capture /srv/models/nemotron35-exl3/k4 ~/fmtcmp/caps/exl3-k4   # repeat until done
 gpuq submit --class short --timeout 20m --mem 90G --label fmtcmp --wait -- \
-  ~/fmtcmp/tools/sparky_exl3_job.sh agentic /srv/models/nemotron35-exl3/k4 ~/fmtcmp/teb-k4 -- $(cat h100/AGENTIC_ARGS)
+  ~/fmtcmp/tools/sparky_exl3_job.sh agentic /srv/models/nemotron35-exl3/k4 ~/fmtcmp/teb-k4 -- $(cat r1/AGENTIC_ARGS)
 python3 grade.py --suite /mnt/models/fmtcmp/suite-v1 --ref /mnt/models/fmtcmp/r1/caps/bf16 \
   nvfp4=~/fmtcmp/caps/nvfp4 k4=~/fmtcmp/caps/exl3-k4 k5=~/fmtcmp/caps/exl3-k5
 ```
@@ -111,4 +111,4 @@ python3 grade.py --suite /mnt/models/fmtcmp/suite-v1 --ref /mnt/models/fmtcmp/r1
 | `exl3_openai_shim.py` | OpenAI chat-completions over exllamav3 for the EXL3 agentic arm |
 | `sparky_exl3_job.sh` | one gpuq job for an EXL3 arm |
 | `grade.py` | the grade (KL / NLL / top-1, CIs, ratios) |
-| `h100/` | the R1 hand-off kit: `RUNBOOK.md`, `run_reference.sh`, `pack_kit.sh`, the H100 agentic flags |
+| `r1/` | the R1 hand-off kit: `RUNBOOK.md`, `run_reference.sh`, `pack_kit.sh`, the 4-GPU agentic flags |
