@@ -43,6 +43,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <algorithm>
+#include <thread>
 #include <vector>
 
 static int g_fail;
@@ -87,24 +89,36 @@ static pool make_pool(int K, int N, int k2, int P, int E) {
     std::vector<uint8_t> bytes(p.stride * P);
     std::vector<float> w((size_t)P * K * N);
     const int words = exl3_words_per_tile(k2);
-    for (int b = 0; b < P; b++) {
+    for (int b = 0; b < P; b++) {   /* the random words and scales: one stream, in order */
         uint8_t *s = bytes.data() + b * p.stride;
         uint16_t *t = (uint16_t *)s;
         for (uint64_t i = 0; i < p.trellis / 2; i++) t[i] = (uint16_t)rnd();
         uint16_t *sc = (uint16_t *)(s + p.trellis);
         for (int i = 0; i < K; i++) sc[i] = rnd_suh();
         for (int i = 0; i < N; i++) sc[K + i] = rnd_svh();
-        float *wb = w.data() + (size_t)b * K * N;
-        for (int kt = 0; kt < K / 16; kt++)
-            for (int nt = 0; nt < N / 16; nt++) {
-                const uint16_t *tile = t + ((size_t)kt * (N / 16) + nt) * words;
-                for (int q = 0; q < EXL3_TILE_WEIGHTS; q++) {
-                    int r, c;
-                    exl3_tile_position(q, &r, &c);
-                    wb[(size_t)(kt * 16 + r) * N + nt * 16 + c] = g_mul1[exl3_tile_state(tile, k2, q)];
+    }
+    /* W_hat: a pure function of the words, decoded on every core (2026-10-14: this host decode was ~all of the
+     * gate's 114 s, single-threaded; each thread owns whole 16-row tile bands, so the bytes are the same) */
+    const int bands = P * (K / 16);
+    const unsigned nt_threads = std::max(1u, std::min(std::thread::hardware_concurrency(), 16u));
+    std::vector<std::thread> th;
+    for (unsigned w0 = 0; w0 < nt_threads; w0++)
+        th.emplace_back([&, w0]() {
+            for (int band = (int)w0; band < bands; band += (int)nt_threads) {
+                const int b = band / (K / 16), kt = band % (K / 16);
+                const uint16_t *t = (const uint16_t *)(bytes.data() + b * p.stride);
+                float *wb = w.data() + (size_t)b * K * N;
+                for (int nt = 0; nt < N / 16; nt++) {
+                    const uint16_t *tile = t + ((size_t)kt * (N / 16) + nt) * words;
+                    for (int q = 0; q < EXL3_TILE_WEIGHTS; q++) {
+                        int r, c;
+                        exl3_tile_position(q, &r, &c);
+                        wb[(size_t)(kt * 16 + r) * N + nt * 16 + c] = g_mul1[exl3_tile_state(tile, k2, q)];
+                    }
                 }
             }
-    }
+        });
+    for (std::thread &x : th) x.join();
     CUDA_OK(cudaMalloc(&p.d_arena, bytes.size()));
     CUDA_OK(cudaMemcpy(p.d_arena, bytes.data(), bytes.size(), cudaMemcpyHostToDevice));
     CUDA_OK(cudaMalloc(&p.d_w, w.size() * sizeof(float)));

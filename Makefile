@@ -267,19 +267,18 @@ pulsar-agent: $(AGENT_OBJS) src/lib/pulsar_help.o src/lib/pulsar_kvtext.o src/li
 
 # L278: the family kernel gates that need a GPU and no model run here, for every family -- Qwen's GDN, QSA and
 # S4 (router / MoE / GR / PLE) beside DeepSeek's and the shared EXL3 arms.
-cuda-regression: tests/cuda_long_context_smoke tests/moe_route_bounds_gate tests/expert_table_gate tests/exl3_moe_epilogue_gate \
-                 tests/exl3_dense_gate tests/exl3_moe_prefill_gate tests/exl3_half_gate \
-                 tests/gdn_gate tests/qsa_attn_gate tests/qwen_s4_gate
-	./tests/cuda_long_context_smoke
-	./tests/moe_route_bounds_gate
-	./tests/expert_table_gate
-	./tests/exl3_moe_epilogue_gate
-	./tests/exl3_dense_gate
-	./tests/exl3_moe_prefill_gate
-	./tests/exl3_half_gate $(EXL3_HALF_SCRATCH)
-	./tests/gdn_gate
-	./tests/qsa_attn_gate
-	./tests/qwen_s4_gate
+CUDA_REGRESSION_BINS = tests/cuda_long_context_smoke tests/moe_route_bounds_gate tests/expert_table_gate \
+                       tests/exl3_moe_epilogue_gate tests/exl3_dense_gate tests/exl3_moe_prefill_gate tests/exl3_half_gate \
+                       tests/gdn_gate tests/qsa_attn_gate tests/qwen_s4_gate
+# 2026-10-14: the ten run CONCURRENTLY, each one's output kept together (-O).  They are model-free and mostly
+# host-bound (their references run on the CPU: measured alone, 258 s in series, the longest 114 s of which 113 s
+# user time), so in series they were 258 s of the battery's serial front.  No gate here grades a time.
+CUDA_REGRESSION_RUNS = $(CUDA_REGRESSION_BINS:tests/%=cuda-regression-run/%)
+cuda-regression: $(CUDA_REGRESSION_BINS)
+	@$(MAKE) --no-print-directory -O -k -j$(words $(CUDA_REGRESSION_BINS)) $(CUDA_REGRESSION_RUNS)
+.PHONY: $(CUDA_REGRESSION_RUNS)
+$(CUDA_REGRESSION_RUNS): cuda-regression-run/%: tests/%
+	./tests/$* $(if $(filter exl3_half_gate,$*),$(EXL3_HALF_SCRATCH))
 
 # L218: the two KV row packers (window E4M3/E8M0, main E2M1/E4M3) byte-exact
 # against the host replica in tests/kv_row_fixture.h, plus the ring slot rule.
@@ -1907,8 +1906,10 @@ cuda-runner-gate: tests/gates_runner
 # it to HOST_GATE_TARGETS: it still runs in the battery, just alongside the GPU
 # tail instead of in front of pulsar_test.  A seam-check failure still fails the
 # battery (it lands in the same pass/fail fold).
+# 2026-10-14: --gating, every test but the informational ones (logprob-vectors: a drift dashboard whose mismatches
+# can never fail the suite, at the price of its own model load).  `make test` still runs everything.
 unit-test-gate: pulsar_test
-	PULSAR_TEST_MODEL="$(FRONTIER_MODEL)" ./pulsar_test
+	PULSAR_TEST_MODEL="$(FRONTIER_MODEL)" ./pulsar_test --gating
 
 # The AGENT's host-only unit suite (the DSML parser/detector over every syntax
 # row, the edit anchors, and the KV store's stripped-checkpoint refusal).  It is
@@ -2029,8 +2030,10 @@ gates-preflight:
 	if [ $$bad -ne 0 ]; then echo "gates-preflight: REFUSING"; exit 1; fi; \
 	echo "gates-preflight: ok ($${avail} GiB available, /tmp $${tmp:-0} GiB in tmpfs)"
 
+# The binaries of the serial GPU targets are prerequisites too (2026-10-14): they build here, in one parallel make,
+# instead of one target at a time inside the timed loop (pulsar_test alone was ~40 s of unit-test-gate).
 gates: tests/gates_runner pulsar-eval tests/qwen_chat_gate tests/api_golden tests/sse_golden tests/spec_depth_gate \
-       tests/loader_open
+       tests/loader_open pulsar_test pulsar_agent_test pulsar $(CUDA_REGRESSION_BINS)
 	@$(MAKE) --no-print-directory gates-preflight || exit 1
 	@rc=0; passed=""; failed=""; times=""; suite0=$$(date +%s); \
 	hostdir=$$(mktemp -d /tmp/pulsar-gates-XXXXXX); host_pids=""; \
@@ -2079,8 +2082,8 @@ gates: tests/gates_runner pulsar-eval tests/qwen_chat_gate tests/api_golden test
 
 # ---- gates-dev: the ITERATION tier (L220 phase 4) --------------------------
 #
-# `make gates` is the PRE-MERGE instrument: every release-blocking gate, ~44
-# minutes measured (2,612 s on 2026-10-06; L278 is cutting it), one engine open per configuration.  `make gates-dev` is the ITERATION
+# `make gates` is the PRE-MERGE instrument: every release-blocking gate, one engine open per configuration (its wall
+# time: docs/QA_BEFORE_RELEASES.md, "Battery wall time").  `make gates-dev` is the ITERATION
 # tier: a fast subset chosen from what the working tree actually touches, so the
 # loop between an edit and a numeric answer is one-to-two minutes.
 #

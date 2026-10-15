@@ -16,6 +16,9 @@
  *   - the prefill/reference gate scrubs every PULSAR_* variable from the
  *     environment before it opens (numerics hygiene), so it and the other
  *     drafter-off configurations run LAST;
+ *   - a gate on the default configuration never follows a drafter-off one
+ *     (each such change is a model load: two per hosted model since
+ *     2026-10-14; the draft depth is shared, see spec_depth_shareable);
  *   - the GPU-only kernel tests, the unit tests (their own engine dance is part
  *     of what they assert) and the CLI chat smoke stay separate `make` targets.
  *
@@ -108,6 +111,17 @@ static bool same_str(const char *a, const char *b) {
  * battery (the drafter-off multiseq gate vs the prefill gates, L194). */
 static uint32_t prefill_chunk_resolved(uint32_t v) { return v ? v : PULSAR_PREFILL_CHUNK_DEFAULT; }
 
+/* The draft depth a session STARTS at is not part of the engine's shape: it is
+ * one engine field (pulsar_engine::spec_depth) read when a session drafts its
+ * first round (pulsar_spec_depth_start), never at open.  So a gate that pins
+ * the depth (the dspark batch legs: 1, 4, 2) runs on the live engine with that
+ * field set, instead of paying a model load per depth (three per battery until
+ * 2026-10-14).  main() refuses PULSAR_SPEC_DEPTH in the environment, so an
+ * option of 0 resolves to 0 (the drafter's own depth) here exactly as it does
+ * in pulsar_engine_open; a depth outside [0, 16] -- which the engine would
+ * clamp -- is not shared. */
+static bool spec_depth_shareable(int v) { return v >= 0 && v <= 16; }
+
 /* The fields a gate may set.  Anything else non-zero is a configuration this
  * runner does not know how to share, so it is treated as different. */
 static bool same_config(const pulsar_engine_options *a, const pulsar_engine_options *b) {
@@ -116,7 +130,9 @@ static bool same_config(const pulsar_engine_options *a, const pulsar_engine_opti
            same_str(a->expert_overlay, b->expert_overlay) &&
            a->backend == b->backend &&
            prefill_chunk_resolved(a->prefill_chunk) == prefill_chunk_resolved(b->prefill_chunk) &&
-           a->spec_depth == b->spec_depth && a->spec_tau == b->spec_tau &&
+           (a->spec_depth == b->spec_depth ||
+            (spec_depth_shareable(a->spec_depth) && spec_depth_shareable(b->spec_depth))) &&
+           a->spec_tau == b->spec_tau &&
            same_str(a->directional_steering_file, b->directional_steering_file) &&
            a->directional_steering_attn == b->directional_steering_attn &&
            a->directional_steering_ffn == b->directional_steering_ffn &&
@@ -135,6 +151,13 @@ int gate_engine_open(pulsar_engine **e, const pulsar_engine_options *want) {
     if (gate_tp_options_from_env(&o)) return 1;
     const pulsar_engine_options *opt = &o;
     if (g_live && same_config(&g_live_opt, opt)) {
+        if (g_live->spec_depth != opt->spec_depth) {
+            /* announce it: the log must show which depth the gate ran on the shared engine */
+            fprintf(stderr, "gates_runner: draft depth %d -> %d on the live engine (no reload)\n", g_live->spec_depth,
+                    opt->spec_depth);
+            g_live->spec_depth = opt->spec_depth;
+            g_live_opt.spec_depth = opt->spec_depth;
+        }
         *e = g_live;
         return 0;
     }
@@ -417,6 +440,13 @@ int main(int argc, char **argv) {
                         "default prefill grid -- unset it and rerun\n");
         return 2;
     }
+    /* The same for the draft depth: the broker sets it on the live engine per gate (spec_depth_shareable), which is
+     * the engine's own resolution only while the environment cannot override an option of 0. */
+    if (getenv("PULSAR_SPEC_DEPTH")) {
+        fprintf(stderr, "gates_runner: PULSAR_SPEC_DEPTH is set; the gates pin their own draft depth -- unset it and "
+                        "rerun\n");
+        return 2;
+    }
     if (argc < 2) {
         fprintf(stderr, "usage: %s MODEL --prefill-baseline BLOB --prefill-ref SHORT [--ref-dir DIR] "
                         "[--model PATH [ANCHORS]]... [--only=a,b] [--except=a,b] [--shape]  (see the header)\n", argv[0]);
@@ -520,16 +550,14 @@ int main(int argc, char **argv) {
          * instead of paying its own 92 GB load (the Makefile's last
          * not-yet-folded target).  1 bank: the classic payload layout. */
         {"cuda-session-payload-gate", gate_session_payload_gate_main,    1, NULL, NULL, {NULL}, DS4},
-        /* L241 (slice 4g): a rank's attn_q_b / attn_output_a row slices are
-         * byte-identical pieces of the whole projection on both GEMM arms. */
         /* L272 P5 / L278: the session contract every family meets (chunks C1-C5, banks B1-B6), public API only --
          * it runs on every hosted model, on the default configuration's engine. */
         {"session-contract-gate",     gate_session_contract_gate_main,  4, NULL, NULL, {NULL}, 0},
         /* L278 contract 6: one greedy chat answer, graded on content -- every hosted model's semantic smoke */
         {"chat-smoke-gate",           gate_chat_decode_smoke_main,      1, NULL, NULL, {NULL}, NEED_TOKENIZER},
-        {"cuda-tp-head-split-gate",   gate_tp_head_split_gate_main,     1, NULL, NULL, {NULL}, DS4},
     };
-    /* Configuration D: drafter depth 1 (the gate sets spec_depth). */
+    /* Configuration A at a pinned draft depth (the gate sets spec_depth; the broker runs it on the default group's
+     * engine, spec_depth_shareable -- 2026-10-14, three model loads per battery before). */
     const gate_spec group_depth1[] = {
         {"cuda-dspark-batch-gate-depth1", gate_dspark_batch_gate_main, 3, NULL, NULL, {"6", "1", NULL}, DS4 | NEED_DSPARK},
         /* L177: the widest admissible speculative step -- 3 banks x (1 + 4) = 15
@@ -540,11 +568,16 @@ int main(int argc, char **argv) {
         {"cuda-dspark-batch-gate-wide", gate_dspark_batch_gate_main, 10, NULL, NULL, {"4", "2", "10", NULL}, DS4 | NEED_DSPARK},
     };
     /* Configuration B: drafter off -- the prefill gates below pin the chunk
-     * to the default grid, so they share this engine (four opens per battery,
-     * not five: A, D depth 1, D depth 4, B). */
+     * to the default grid, so they share this engine (two opens per hosted
+     * model: A, B). */
     const gate_spec group_nodspark[] = {
         {"cuda-multiseq-gate-nodspark", gate_multiseq_decode_gate_main, 2, "PULSAR_GATE_NO_DSPARK", "1", {"2", "64", NULL}, NEED_TOKENIZER},
     };
+    /* L241 (slice 4g): a rank's attn_q_b / attn_output_a row slices are byte-identical pieces of the whole projection
+     * on both GEMM arms.  Configuration B (drafter off, default grid) -- it ran last in A until 2026-10-14 and cost
+     * two model loads there (its own, then A's again for the decode-reference gates).  It registers row slices on
+     * the live engine's weights, so it runs LAST on B, after every gate that reads those weights whole. */
+    const gate_spec tp_head_split = {"cuda-tp-head-split-gate", gate_tp_head_split_gate_main, 1, NULL, NULL, {NULL}, DS4};
     const gate_spec prefill = {"cuda-prefill-gate", gate_prefill_bitexact_gate_main, 1, NULL, NULL,
                                {"--check", prefill_baseline, prefill_ref, NULL}, NEED_FIXTURES};
     /* L181: one classic decode step after each unaligned prefill, byte-compared
@@ -580,6 +613,7 @@ int main(int argc, char **argv) {
     KNOWN(prefill); KNOWN(prefill_decode); KNOWN(chunk_neutrality); KNOWN(vision_chunk);
 #undef KNOWN
     for (int i = 0; i < 4; i++) known[n_known++] = ref_names[i];
+    known[n_known++] = tp_head_split.name;   /* runs last: after the reference gates, on B */
     if (validate_names(g_only, "--only", known, n_known) ||
         validate_names(g_except, "--except", known, n_known)) return 2;
     if (g_only || g_except) {
@@ -678,6 +712,7 @@ int main(int argc, char **argv) {
             printf("\n  SKIP  cuda-reference-gate, cuda-decode-reference-gate [%s]: no --ref-dir for this model\n"
                    "        (blobs live outside the repo; without them these gates grade nothing)\n", hm.family);
         }
+        RUN(tp_head_split);
     }
 #undef RUN
 
