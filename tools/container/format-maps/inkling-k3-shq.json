@@ -1,0 +1,22 @@
+{
+ "schema": "pulsar.recipe.v1",
+ "recipe": "inkling-k3-shq",
+ "model_type": "inkling_mm_model",
+ "about": "Inkling-Small on the quant lane's k3_shq EXL3 pack (L294: routed experts K3; attention, dense MLP and the shared experts K6 -- the shared experts' quantized arm), byte copies of the pack.  The head BF16 from the checkpoint (the pack's K6 head has no engine arm at the unembed's 201024 rows yet: F7).  Norms, short convs, relative bases, router, scales, embed and the hmlp tower in their source dtype.  The drafter is omitted until F6 (chained MTP) runs it.",
+ "rows": [
+  {"role": "dense", "block": "layers", "format": "exl3m_k6"},
+  {"role": "shared_expert", "block": "layers", "format": "exl3m_k6"},
+  {"role": "expert_gate", "block": "layers", "format": "exl3m_k3"},
+  {"role": "expert_up", "block": "layers", "format": "exl3m_k3"},
+  {"role": "expert_down", "block": "layers", "format": "exl3m_k3"},
+  {"role": "router", "block": "layers", "format": "native"},
+  {"role": "norm", "block": "layers", "format": "native"},
+  {"role": "other", "block": "layers", "format": "native"},
+  {"name": "model.mtp.*", "format": "omit"},
+  {"name": "model.llm.norm.weight", "format": "native"},
+  {"name": "model.llm.embed_norm.weight", "format": "native"},
+  {"role": "embed", "format": "native"},
+  {"role": "head", "format": "native"},
+  {"role": "vision", "format": "native"}
+ ]
+}

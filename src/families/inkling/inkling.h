@@ -166,14 +166,19 @@ typedef struct {
     pulsar_tensor *vis_final_norm;   ///< vision_final_norm [n_embd]
     /** What the binding priced (role_bind.h): every byte the core stages, by role. */
     pulsar_role_census census;
-    /** The frontend seam (L295 F5 / E6): the tokenizer the family's tokenizer table will dispatch to -- F5's shared
-     *  BPE engine (src/lib/bpe_tokenizer.h, bpe_tokenizer_load_tiktoken with "o200k") in its tiktoken configuration, loaded at open
-     *  from the container directory's tokenizer files, with Inkling's renderer and output parser
-     *  (src/lib/inkling_chat.h) behind the server's family table.  NULL until E6 loads it: the family declares no
-     *  PULSAR_FAMILY_CAP_CHAT and no tokenizer table, so the front ends refuse the engine at startup by name
-     *  (pulsar_engine_has_tokenizer); eos_id above is the stop id that table's eos() answers. */
+    /** The tokenizer (inkling_tokenizer.cpp): F5's shared BPE engine in its tiktoken configuration ("o200k"), loaded
+     *  at open from the files beside the container's shards.  The family's tokenizer table dispatches to it; the
+     *  chat front (CAP_CHAT, the server table) is E6's. */
     struct bpe_tokenizer *tok;
+    /** The artifact's digest (its directory: names, types, bytes): what the session's disk segments are keyed by. */
+    uint64_t artifact_digest;
 } pulsar_inkling_model;
+
+/** The family's tokenizer table (inkling_tokenizer.cpp) and its load: tokenizer.model (the checkpoint's
+ *  tiktoken/tokenizer.model), tokenizer_config.json and config.json beside the shards of `model_path`.  false =
+ *  refused (said). */
+extern const pulsar_family_tokenizer PULSAR_INKLING_TOKENIZER;
+bool pulsar_inkling_load_tokenizer(pulsar_inkling_model *w, const char *model_path);
 
 /** Bind every tensor the shape declares, admit its format, price it (inkling_weights.cpp).  false = refused. */
 bool pulsar_inkling_bind(const pulsar_model *m, pulsar_inkling_model *w);
@@ -183,5 +188,37 @@ static inline const pulsar_inkling_model *pulsar_inkling_of(const pulsar_engine 
     return e && e->family && e->family->id == PULSAR_FAMILY_ID_INKLING ? (const pulsar_inkling_model *)e->family_state
                                                                        : NULL;
 }
+
+/* ---- 3. The forward on the core row-step driver (inkling_forward.cpp) ------------------------------------------ */
+
+/** The ids of Inkling's state declarations (state_kinds.h kinds), in the plan's table order.  Every layer slot
+ *  carries SCONV; a window layer KV_WIN, a global layer KV. */
+enum {
+    PULSAR_INKLING_STATE_SCONV = 0,   ///< FIXED, SNAPSHOT: the layer's four short-conv tails, one packed record
+    PULSAR_INKLING_STATE_KV_WIN,      ///< RING: a window layer's K|V rows (F1's ring, W - 1 + verify rows slots)
+    PULSAR_INKLING_STATE_KV,          ///< POOL, one token a row: a global layer's K|V rows
+    PULSAR_INKLING_STATE_COUNT
+};
+
+/** The SConv record of one (layer, bank): bf16 [conv_k - 1][PULSAR_INKLING_SCONV_LD] in E3's shift order, the four
+ *  streams at their channel offsets (pulsar_cuda_sconv.h STATE) -- K, V, the attention delta, the FFN delta. */
+typedef enum {
+    PULSAR_INKLING_SCONV_K = 0,
+    PULSAR_INKLING_SCONV_V,
+    PULSAR_INKLING_SCONV_ATTN,
+    PULSAR_INKLING_SCONV_FFN,
+    PULSAR_INKLING_SCONV_STREAMS
+} pulsar_inkling_sconv_stream;
+/** A stream's first channel in the record, and its width (the record's row is their sum: 10240 on the profile). */
+uint32_t pulsar_inkling_sconv_offset(const pulsar_inkling_shape *s, pulsar_inkling_sconv_stream k);
+uint32_t pulsar_inkling_sconv_channels(const pulsar_inkling_shape *s, pulsar_inkling_sconv_stream k);
+uint32_t pulsar_inkling_sconv_ld(const pulsar_inkling_shape *s);
+
+/** Build Inkling's state declaration into e->state_plan (the load, after the plan). */
+void pulsar_inkling_state_plan(pulsar_engine *e);
+
+/** The family's ops on the core row-step driver (step_driver.h): block[PULSAR_LAYER_BLOCKS] composes each layer
+ *  from its pulsar_layer_desc. */
+extern const pulsar_driver_ops PULSAR_INKLING_DRIVER;
 
 #endif /* PULSAR_FAMILY_INKLING_H */

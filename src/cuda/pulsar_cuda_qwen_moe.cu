@@ -170,6 +170,14 @@ extern "C" int pulsar_rows_linear_launch(const pulsar_rows_linear *l, const uint
         fprintf(stderr, "pulsar: qwen linear: no weight or no bf16 activation of width %d -- refusing\n", l ? l->in : -1);
         return -1;
     }
+    if (l->bf16) {   /* L295: a bf16 weight -- the one fixed-order bf16 rows product (the router's logits kernel) */
+        if (l->k2 || l->sf) {
+            fprintf(stderr, "pulsar: rows linear: a %d->%d bf16 weight with an EXL3 rate or an E8M0 plane -- refusing\n",
+                    l->in, l->out);
+            return -1;
+        }
+        return pulsar_router_logits_launch(x_bf16, rows, l->in, (const uint16_t *)l->w, l->out, nullptr, 0, y, stream);
+    }
     if (l->k2 == 0) {                       /* the recipe's mxfp8_lt dense tier */
         if (!l->sf) {
             fprintf(stderr, "pulsar: qwen linear: a %d->%d tensor is neither EXL3 nor mxfp8_lt -- refusing\n",

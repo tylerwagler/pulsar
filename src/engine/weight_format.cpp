@@ -7,11 +7,12 @@
  * this table's answer -- one per kernel the engine has (research/family-plugin-audit-2026-10-06/09):
  *
  *   dense            slot bf16 plane: F32, BF16 (cuBLAS)            slot E4M3: MXFP8_LT (cuBLASLt)
- *                    bf16 rows: MXFP8_LT (split-K GEMV / MMA), EXL3 at a dense-arm rate
+ *                    bf16 rows: MXFP8_LT (split-K GEMV / MMA), EXL3 at a dense-arm rate, BF16 (the fixed-order
+ *                               bf16 rows product, L295)
  *   expert gate/up   slot E4M3: CUTLASS MXFP4, IQ2 MMQ, EXL3 at a pair-arm rate   rows: EXL3 pair-arm
  *   expert down      slot E4M3: CUTLASS MXFP4, IQ2 MMQ, EXL3 at a down-arm rate   rows: EXL3 down-arm
  *   fused gate_up    bf16 rows: EXL3 at a fused-arm rate
- *   shared expert    bf16 rows: EXL3 at a dense-arm rate
+ *   shared expert    bf16 rows: EXL3 at a dense-arm rate (riding the routed launches), BF16 (after the sum)
  *
  * A combination with no kernel refuses by name at load -- never a converted activation (rule 3: producers emit,
  * consumers never convert).  Filling one (an E4M3-activation EXL3 dense arm for a DeepSeek EXL3 artifact, a bf16
@@ -37,6 +38,7 @@ pulsar_dense_arm pulsar_dense_arm_for(uint32_t type, pulsar_act_format act) {
         return type == PULSAR_TENSOR_MXFP8_LT ? PULSAR_DENSE_ARM_MXFP8_SLOT : PULSAR_DENSE_ARM_NONE;
     case PULSAR_ACT_ROWS_BF16:
         return type == PULSAR_TENSOR_MXFP8_LT ? PULSAR_DENSE_ARM_MXFP8_ROWS
+             : type == PULSAR_TENSOR_BF16 ? PULSAR_DENSE_ARM_BF16_ROWS
              : exl3_arm(type, EXL3_ARM_DENSE) ? PULSAR_DENSE_ARM_EXL3_ROWS : PULSAR_DENSE_ARM_NONE;
     case PULSAR_ACT_COUNT: break;
     }
@@ -58,7 +60,7 @@ bool pulsar_format_serves(uint32_t type, pulsar_weight_role role, pulsar_act_for
     case PULSAR_ROLE_EXPERT_GATE_UP_FUSED:
         return act == PULSAR_ACT_ROWS_BF16 && exl3_arm(type, EXL3_ARM_GATE_UP_FUSED);
     case PULSAR_ROLE_SHARED_EXPERT:
-        return act == PULSAR_ACT_ROWS_BF16 && exl3_arm(type, EXL3_ARM_DENSE);
+        return act == PULSAR_ACT_ROWS_BF16 && (exl3_arm(type, EXL3_ARM_DENSE) || type == PULSAR_TENSOR_BF16);
     }
     return false;
 }

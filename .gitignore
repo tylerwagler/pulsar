@@ -174,6 +174,7 @@ tests/dspark_batch_gate
 /tests/sconv_gate
 /tests/sconv_bench
 /tests/head_gate
+/tests/rowops_gate
 /tests/qwen_chat_gate
 /tests/inkling_chat_gate
 tests/api-golden/out.txt
@@ -188,6 +189,8 @@ tests/sse-golden/out.txt
 /tests/verify_width_probe
 /tests/loader_open
 /tests/inkling_family_gate
+/tests/inkling_fwd_gate
+/tests/inkling_generate
 /tests/prefill_chunk_census_probe
 /tests/vision_merge_gate
 /tests/vision_tower_gate

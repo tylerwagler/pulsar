@@ -274,7 +274,8 @@ pulsar-agent: $(AGENT_OBJS) src/lib/pulsar_help.o src/lib/pulsar_kvtext.o src/li
 # S4 (router / MoE / GR / PLE) beside DeepSeek's and the shared EXL3 arms.
 CUDA_REGRESSION_BINS = tests/cuda_long_context_smoke tests/moe_route_bounds_gate tests/expert_table_gate \
                        tests/exl3_moe_epilogue_gate tests/exl3_dense_gate tests/exl3_moe_prefill_gate tests/exl3_half_gate \
-                       tests/gdn_gate tests/qsa_attn_gate tests/qwen_s4_gate tests/router_gate tests/gqa_attn_gate tests/sconv_gate tests/head_gate
+                       tests/gdn_gate tests/qsa_attn_gate tests/qwen_s4_gate tests/router_gate tests/gqa_attn_gate tests/sconv_gate tests/head_gate \
+                       tests/rowops_gate
 # 2026-10-14: they run CONCURRENTLY, each one's output kept together (-O).  They are model-free and mostly
 # host-bound (their references run on the CPU: measured alone, 258 s in series, the longest 114 s of which 113 s
 # user time), so in series they were 258 s of the battery's serial front.  No gate here grades a time.
@@ -709,6 +710,17 @@ tests/head_gate: tests/head_gate.cu tests/sconv_ref.h src/cuda/pulsar_cuda_head.
 head-gate: tests/head_gate
 	./tests/head_gate
 
+# L295: the row operations between a layer plan's blocks (pulsar_cuda_rowops.h) -- the RMSNorm and the fused residual
+# add bit-exact against a host replica of their one arithmetic and graded vs double, the f32 -> bf16 emit bit-exact,
+# a row's bytes independent of its batch; refusals.  Model-free.
+src/cuda/pulsar_cuda_rowops.o: src/cuda/pulsar_cuda_rowops.h
+tests/rowops_gate: tests/rowops_gate.cu tests/sconv_ref.h src/cuda/pulsar_cuda_rowops.o src/cuda/pulsar_cuda_rowops.h Makefile
+	$(NVCC) $(NVCCFLAGS) -std=c++17 -Isrc -Isrc/cuda -o $@ tests/rowops_gate.cu src/cuda/pulsar_cuda_rowops.o
+
+.PHONY: rowops-gate
+rowops-gate: tests/rowops_gate
+	./tests/rowops_gate
+
 # The same on the Inkling-Small mini against its transformers fp32 capture: the embedding
 # norm, and the 1/16 logit scale + padding on the head's unscaled f32 output.
 # HEAD_MINI_FIXTURE is the directory tests/head_mini_fixture.py writes.
@@ -957,6 +969,12 @@ inkling-family-gate: tests/inkling_family_gate tests/loader_open
 	python3 tests/inkling_family_gate.py --probe ./tests/inkling_family_gate --open ./tests/loader_open \
 	    --work $(LOADER_CONTRACT_WORK)/inkling $(INKLING_GATE_MODEL)
 	python3 tests/loader_contract.py --open ./tests/loader_open --work $(LOADER_CONTRACT_WORK) $(INKLING_GATE_MODEL)
+# L294 / L295: the Inkling forward's byte invariants on the core driver (tests/inkling_fwd_gate.cpp exact): a prompt cut
+# anywhere == the cold prefill, a batched decode == each bank's own, prefix reuse from a grid checkpoint, payload and
+# snapshot round trips, the bank carry -- bytes; decode vs prefill graded.  Needs the GPU and the container.
+.PHONY: inkling-fwd-gate
+inkling-fwd-gate: tests/inkling_fwd_gate
+	./tests/inkling_fwd_gate exact $(INKLING_GATE_MODEL) synthetic
 tp-plan-golden: tests/tp_plan_test
 	@mkdir -p tests/tp-plan-golden; for m in $(TP_PLAN_MODELS); do for r in 0 1; do \
 	  g=tests/tp-plan-golden/$$(basename $$m)-r$$r.txt; \
@@ -2315,7 +2333,7 @@ gates-dev:
 	        src/engine/family*|src/families/*|src/engine/role_bind*|tests/inkling_*|src/engine/*qwen*|tests/qwen_*|tests/session_contract*|src/engine/state_kinds*|src/engine/step_driver*|tests/state_kinds*|src/engine/session*|src/engine/safetensors*|src/engine/model.cpp|src/engine/weights*|src/engine/tensor_bind*|tests/loader_*|src/engine/sync_driver*|src/engine/prefill_loop*|src/engine/checkpoint*|src/engine/kv_state*) cls=engine; family=1 ;; \
 	        *exl3*) cls=exl3; exl3=1 ;; \
 	        *gdn*) cls=gdn; gdn=1 ;; \
-	        *sconv*|src/cuda/pulsar_cuda_head*|tests/head_*) cls=blocks; blocks=1 ;; \
+	        *sconv*|src/cuda/pulsar_cuda_head*|tests/head_*|*rowops*) cls=blocks; blocks=1 ;; \
 	        src/cuda/*attn*|src/cuda/*attention*) cls=attn; attn=1 ;; \
 	        src/cuda/*norm_kv*) cls=attn; attn=1 ;; \
 	        src/cuda/*) cls=cuda ;; \
@@ -2349,7 +2367,7 @@ gates-dev:
 	if [ $$family -eq 1 ]; then printf '  family gates: selected (the family interface; the session contract on both families)\n'; fi; \
 	if [ $$attn -eq 1 ]; then printf '  cuda-attn-gates: selected (attention kernels)\n'; fi; \
 	if [ $$router -eq 1 ]; then printf '  router-gate + qwen-s4-gate: selected (the shared router, the rows MoE block)\n'; fi; \
-	if [ $$blocks -eq 1 ]; then printf '  block gates: sconv-gate, head-gate (the L295 short convolution and head options)\n'; fi; \
+	if [ $$blocks -eq 1 ]; then printf '  block gates: sconv-gate, head-gate, rowops-gate (the L295 short convolution, head options, row operations)\n'; fi; \
 	if [ $$server -eq 1 ]; then printf '  server: chat smoke + the --server/--api unit switches\n'; fi; \
 	$(MAKE) --no-print-directory seam-check CUDA_ARCH=sm_120f || rc=1; \
 	$(MAKE) --no-print-directory cuda-reap-router-audit CUDA_ARCH=sm_120f \
@@ -2376,7 +2394,7 @@ gates-dev:
 	  $(MAKE) --no-print-directory gdn-gate CUDA_ARCH=sm_120f || rc=1; \
 	fi; \
 	if [ $$blocks -eq 1 ]; then \
-	  $(MAKE) --no-print-directory sconv-gate head-gate CUDA_ARCH=sm_120f || rc=1; \
+	  $(MAKE) --no-print-directory sconv-gate head-gate rowops-gate CUDA_ARCH=sm_120f || rc=1; \
 	fi; \
 	if [ $$exl3 -eq 1 ]; then \
 	  $(MAKE) --no-print-directory exl3-dequant-gate CUDA_ARCH=sm_120f || rc=1; \
@@ -2387,6 +2405,7 @@ gates-dev:
 	  $(MAKE) --no-print-directory state-kinds-gate CUDA_ARCH=sm_120f || rc=1; \
 	  $(MAKE) --no-print-directory loader-contract-gate CUDA_ARCH=sm_120f || rc=1; \
 	  $(MAKE) --no-print-directory inkling-family-gate CUDA_ARCH=sm_120f || rc=1; \
+	  $(MAKE) --no-print-directory inkling-fwd-gate CUDA_ARCH=sm_120f || rc=1; \
 	fi; \
 	if [ -n "$$sel" ]; then \
 	  hosted=''; if [ $$family -eq 1 ]; then hosted='$(RUNNER_HOSTED_ARGS)'; fi; \
@@ -2756,6 +2775,16 @@ tests/inkling_family_gate.o: tests/inkling_family_gate.cpp src/families/inkling/
 	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -c -o $@ $<
 tests/inkling_family_gate: tests/inkling_family_gate.o $(CORE_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
+# L294 / L295: the Inkling forward on the core driver, on a container (tests/inkling_fwd_gate.cpp; public API only)
+tests/inkling_fwd_gate.o: tests/inkling_fwd_gate.cpp tests/gate_entry.h tests/gate_util.h src/pulsar.h
+	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -c -o $@ $<
+tests/inkling_fwd_gate: tests/inkling_fwd_gate.o $(CORE_OBJS)
+	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
+# ... and its greedy generation on a container, rendered by F5's Inkling renderer (tests/inkling_generate.cpp)
+tests/inkling_generate.o: tests/inkling_generate.cpp tests/gate_entry.h tests/gate_util.h src/pulsar.h src/lib/inkling_chat.h
+	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -c -o $@ $<
+tests/inkling_generate: tests/inkling_generate.o src/lib/inkling_chat.o $(CORE_OBJS)
+	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 tests/tp_plan_test.o: tests/tp_plan_test.cpp
 	$(CXX) $(CXXFLAGS) -Isrc -Isrc/engine -c -o $@ $<
 tests/tp_plan_test: tests/tp_plan_test.o src/lib/pulsar_help.o $(CORE_OBJS)
@@ -3043,7 +3072,7 @@ test: pulsar_test seam-check
 clean:
 	rm -rf .build
 	rm -rf tests/runner
-	rm -f tests/gates_runner pulsar pulsar-server pulsar-bench pulsar-eval pulsar-agent pulsar_test pulsar_agent_test src/engine/*.o src/families/*/*.o src/families/*/*.d src/tp/*.o src/agent/*.o src/server/*.o src/cuda/*.o src/cuda/mmq/*.o src/cuda/mmq/test/*.o src/cli/*.o src/lib/*.o src/vendor/*.o tests/*.o src/engine/*.d src/agent/*.d src/server/*.d src/cuda/*.d src/cuda/mmq/*.d src/cuda/mmq/test/*.d src/cli/*.d src/lib/*.d src/vendor/*.d tests/*.d tests/vision_visible_gate tests/vision_hc_gate tests/vision_image_gate tests/vision_placeholder_gate tests/vision_image_sync_gate tests/vision_chunk_gate tests/cuda_long_context_smoke tests/moe_route_bounds_gate tests/expert_table_gate tests/multiseq_frontier_gate tests/multiseq_decode_gate tests/prefill_bitexact_gate tests/bank_spec_gate tests/spec_sampling_gate tests/spec_sampling_gate_wide tests/accounting_gate tests/bank_evict_restore_gate tests/session_payload_gate tests/algo_stability_gate tests/mixed_prefill_gate tests/mixed_zero_prefill_gate tests/fused_step_gate tests/head_graph_replay_gate tests/decode_reference_gate tests/verify_width_probe tests/mixed_neutrality_gate tests/comp_state_gate tests/spec_teacher_forced_probe tests/attn_f16_kernel_test tests/attn_f16_banked_test tests/kv_rows_pack_gate tests/kv_rows_pack_gate_fastmath tests/minp_prefilter_gate tests/dspark_batch_gate tests/nt_crossover_sweep tests/vision_router_gate tests/router_gate tests/qwen_family_gate tests/inkling_family_gate tests/state_kinds_gate tests/payload_frontier_gate tests/prompt_end_gate tests/bank_residency_gate
+	rm -f tests/gates_runner pulsar pulsar-server pulsar-bench pulsar-eval pulsar-agent pulsar_test pulsar_agent_test src/engine/*.o src/families/*/*.o src/families/*/*.d src/tp/*.o src/agent/*.o src/server/*.o src/cuda/*.o src/cuda/mmq/*.o src/cuda/mmq/test/*.o src/cli/*.o src/lib/*.o src/vendor/*.o tests/*.o src/engine/*.d src/agent/*.d src/server/*.d src/cuda/*.d src/cuda/mmq/*.d src/cuda/mmq/test/*.d src/cli/*.d src/lib/*.d src/vendor/*.d tests/*.d tests/vision_visible_gate tests/vision_hc_gate tests/vision_image_gate tests/vision_placeholder_gate tests/vision_image_sync_gate tests/vision_chunk_gate tests/cuda_long_context_smoke tests/moe_route_bounds_gate tests/expert_table_gate tests/multiseq_frontier_gate tests/multiseq_decode_gate tests/prefill_bitexact_gate tests/bank_spec_gate tests/spec_sampling_gate tests/spec_sampling_gate_wide tests/accounting_gate tests/bank_evict_restore_gate tests/session_payload_gate tests/algo_stability_gate tests/mixed_prefill_gate tests/mixed_zero_prefill_gate tests/fused_step_gate tests/head_graph_replay_gate tests/decode_reference_gate tests/verify_width_probe tests/mixed_neutrality_gate tests/comp_state_gate tests/spec_teacher_forced_probe tests/attn_f16_kernel_test tests/attn_f16_banked_test tests/kv_rows_pack_gate tests/kv_rows_pack_gate_fastmath tests/minp_prefilter_gate tests/dspark_batch_gate tests/nt_crossover_sweep tests/vision_router_gate tests/router_gate tests/qwen_family_gate tests/inkling_family_gate tests/inkling_fwd_gate tests/inkling_generate tests/state_kinds_gate tests/payload_frontier_gate tests/prompt_end_gate tests/bank_residency_gate
 
 # Pull in the generated header dependencies.  `-include` (not `include`) so a
 # tree with no .d files yet -- a fresh clone, or right after `make clean` -- is

@@ -4,10 +4,10 @@
  *
  * The formats.  The forward hands its linears raw bf16 rows (pulsar_act_kind ROWS, as Qwen's), so every linear --
  * attention q / k / v / r / o, the dense MLP, the shared experts, the drafter's input projection -- takes what the
- * registry serves a dense linear (or a shared expert) at bf16 rows: EXL3 at a dense-arm rate, or mxfp8_lt.  The
- * routed experts take the registry's split gate / up pair and down arms at bf16 rows (EXL3 at a pair / down rate);
- * a K5 gate / up and a bf16 linear at bf16 rows have no arm today and are refused by name (L295 F7).  The head is
- * bf16 as the recipe writes it (the head op, E5, reads it) or a dense-arm format.  Norms, short convs, the relative
+ * registry serves a dense linear (or a shared expert) at bf16 rows: EXL3 at a dense-arm rate, mxfp8_lt, or bf16 (the
+ * fixed-order bf16 rows product).  The routed experts take the registry's split gate / up pair and down arms at bf16
+ * rows (EXL3 at a pair / down rate); a K5 gate / up and bf16 routed experts have no arm today and are refused by name
+ * (L295 F7).  The head is bf16 as the recipe writes it or a dense-arm format, through the same front door.  Norms, short convs, the relative
  * bases, the router and the tower are read as stored: bf16, the router's selection bias and output scale f32. */
 #include "inkling.h"
 

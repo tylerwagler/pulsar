@@ -3198,6 +3198,7 @@ typedef enum {
     PULSAR_DENSE_ARM_MXFP8_SLOT,   ///< mxfp8_lt, the slot's E4M3 (cuBLASLt)
     PULSAR_DENSE_ARM_MXFP8_ROWS,   ///< mxfp8_lt, raw bf16 rows (W8A16 split-K GEMV / MMA)
     PULSAR_DENSE_ARM_EXL3_ROWS,    ///< EXL3 at a dense-arm rate, raw bf16 rows
+    PULSAR_DENSE_ARM_BF16_ROWS,    ///< L295: bf16 weight, raw bf16 rows (the fixed-order bf16 rows product, f32 out)
 } pulsar_dense_arm;
 pulsar_dense_arm pulsar_dense_arm_for(uint32_t type, pulsar_act_format act);
 /** L272 P4c: the dense linear's front door (linear.cpp).  A weight's device pointer: the rank's TP slice, else the

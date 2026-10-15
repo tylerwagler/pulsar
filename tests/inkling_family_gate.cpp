@@ -5,8 +5,10 @@
  * Opens MODEL inspect-only (no GPU, no weight byte staged) and checks the family's load: the family is chosen by
  * `general.architecture`; the plan is the config's (window vs full attention, dense vs MoE per layer); EVERY tensor
  * of the directory is bound by its bind record, every byte priced by a role, and the price is what the core stages
- * and admission charges; every slot the plan declares is bound; the engine facts; and the session entries refuse by
- * name (Inkling's blocks on F4's core driver are not written yet).  The refusals (a missing tensor, a wrong shape, an unknown switch, ...) are graded by
+ * and admission charges; every slot the plan declares is bound; the engine facts; the tokenizer table; and the session
+ * side as declared -- the core driver's table covers the plan, the declared state is one SConv record a layer plus a
+ * window ring or a global pool (the forward itself is tests/inkling_fwd_gate's, on the GPU).  The refusals (a missing
+ * tensor, a wrong shape, an unknown switch, ...) are graded by
  * tests/inkling_family_gate.py, which runs this probe on the clean container and tests/loader_open on each mutant.
  * Exit 0 = every check passed. */
 #include "families/inkling/inkling.h"
@@ -114,8 +116,9 @@ int main(int argc, char **argv) {
           pulsar_engine_logits_width(e));
     check(!strcmp(pulsar_engine_model_name(e), "Inkling-Small"), "model name '%s'", pulsar_engine_model_name(e));
     check(pulsar_engine_model_id(e) == 3, "disk-KV model id %d (0/1 DeepSeek, 2 Qwen)", pulsar_engine_model_id(e));
-    check(!pulsar_engine_has_tokenizer(e), "no tokenizer table yet (E6): the front ends refuse this engine");
-    check(pulsar_engine_vocab_size(e) == 0, "the vocab size refuses by name (no table), never another family's length");
+    check(!pulsar_engine_has_tokenizer(e), "no chat front yet (E6, no CAP_CHAT): the front ends refuse this engine");
+    check(pulsar_engine_vocab_size(e) > 0 && (uint32_t)pulsar_engine_vocab_size(e) <= s->n_vocab_real,
+          "the tokenizer table: %d ids (<= the head's %u real rows)", pulsar_engine_vocab_size(e), s->n_vocab_real);
     check(pulsar_engine_drafter(e) == PULSAR_DRAFTER_NONE, "no drafter runs (F6)");
     int k2 = 0;
     for (uint32_t il = s->n_dense; il < s->n_layer; il++) {
@@ -125,20 +128,30 @@ int main(int argc, char **argv) {
     check(e->routed_quant_bits() == (k2 ? 20 + k2 : 0), "routed quant tier %d (EXL3: 20 + the highest half-bit rate)",
           e->routed_quant_bits());
 
-    /* the session entries refuse by name: Inkling's driver blocks are not written (F4's driver is in) */
-    pulsar_session *dummy = (pulsar_session *)xcalloc(1, sizeof(pulsar_session));
-    dummy->engine = e;
-    const pulsar_family_session_ops *so = e->family->session;
-    check(so->create(dummy, 1) != 0, "a session's create refuses (the log names the driver blocks)");
-    char err[512] = "";
-    check(so->eval_row(dummy, 0, err, sizeof(err)) != 0 && strstr(err, "driver blocks"), "eval_row refuses: %s", err);
-    err[0] = 0;
-    check(so->decode_multiseq(dummy, NULL, 0, NULL, 0, err, sizeof(err)) != 0 && strstr(err, "driver blocks"),
-          "decode_multiseq refuses by name");
-    err[0] = 0;
-    check(so->decode_mixed(dummy, NULL, 0, NULL, 0, NULL, 0, err, sizeof(err)) != 0 && strstr(err, "driver blocks"),
-          "decode_mixed refuses by name");
-    free(dummy);
+    /* the session side as declared: the driver's table covers the plan; the state is one SConv record a layer and a
+     * window ring or a global pool by the layer's mixer; the caps are the driver's (no spec, TP, images, chat) */
+    uint32_t at = 0;
+    const char *miss = pulsar_driver_first_missing(e->family->driver, p, &at);
+    check(!miss, "the core driver's ops cover the plan (missing: %s at layer %d)", miss ? miss : "nothing",
+          miss ? (int)at : -1);
+    const pulsar_state_plan *sp = &e->state_plan;
+    bool state_ok = sp->n_decl == PULSAR_INKLING_STATE_COUNT && sp->n_trunk == s->n_layer && sp->n_slots == s->n_layer &&
+                   sp->decl[PULSAR_INKLING_STATE_SCONV].kind == PULSAR_STATE_FIXED &&
+                   sp->decl[PULSAR_INKLING_STATE_SCONV].capture == PULSAR_STATE_CAPTURE_SNAPSHOT &&
+                   sp->decl[PULSAR_INKLING_STATE_SCONV].bytes == (uint64_t)(s->conv_k - 1u) * pulsar_inkling_sconv_ld(s) * 2u &&
+                   sp->decl[PULSAR_INKLING_STATE_KV_WIN].kind == PULSAR_STATE_RING &&
+                   sp->decl[PULSAR_INKLING_STATE_KV_WIN].tokens == s->window &&
+                   sp->decl[PULSAR_INKLING_STATE_KV].kind == PULSAR_STATE_POOL && sp->decl[PULSAR_INKLING_STATE_KV].tokens == 1u;
+    for (uint32_t il = 0; state_ok && il < s->n_layer; il++) {
+        const bool win = p->desc[il].mixer == PULSAR_MIXER_ATTN_WINDOW;
+        state_ok = sp->slot[il] == (1u << PULSAR_INKLING_STATE_SCONV |
+                                   1u << (win ? PULSAR_INKLING_STATE_KV_WIN : PULSAR_INKLING_STATE_KV));
+    }
+    check(state_ok, "the declared state: sconv FIXED SNAPSHOT %llu B a layer, kv_win RING W %u, kv POOL; each layer its "
+          "record + its ring or pool", (unsigned long long)sp->decl[PULSAR_INKLING_STATE_SCONV].bytes, s->window);
+    const uint32_t want = PULSAR_FAMILY_CAP_BANKS | PULSAR_FAMILY_CAP_SEGMENTS | PULSAR_FAMILY_CAP_PAYLOAD;
+    check(e->family->caps == want && e->family->spec == NULL, "caps 0x%x (banks, segments, payload; no spec / TP / "
+          "images / chat yet)", e->family->caps);
     pulsar_engine_close(e);
     fprintf(stderr, "INKLING-FAMILY PROBE %s\n", n_fail ? "FAIL" : "PASS");
     return n_fail ? 1 : 0;

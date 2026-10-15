@@ -115,6 +115,10 @@ typedef struct pulsar_rows_linear {
      *  false: decode rows -- the decode arms at every width, in blocks of PULSAR_QWEN_DECODE_ROWS_MAX past it
      *  (L288 C1), so a row's bytes never depend on how many ride with it. */
     bool prompt;
+    /** L295: a bf16 [out][in] weight (k2 0, sf NULL): the fixed-order bf16 rows product -- the shared router's logits
+     *  kernel (pulsar_router_logits_launch), one f32 accumulation order per (row, output) at any row count, so a
+     *  row's output is the same bytes for decode, verify and prompt rows alike (`prompt` changes nothing). */
+    bool bf16;
 } pulsar_rows_linear;
 
 /** L251 MTP: the head-side weights of the input combine (the sidecar's tensors). */
