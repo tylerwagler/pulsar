@@ -185,105 +185,16 @@ thinking_state thinking_state_from_prompt(const request *r) {
 
 
 
-static char *rendered_chat_system_region(const char *prompt_text) {
-    if (!prompt_text) return xstrdup("");
-    const char *p = prompt_text;
-    const char *bos = PULSAR_SERVER_RENDER_BOS;
-    const size_t bos_len = strlen(bos);
-    if (!strncmp(p, bos, bos_len)) p += bos_len;
-    /* V4.1 leads a thinking conversation with the System token and the effort
-     * line; neither belongs to the client's system region. */
-    const size_t sys_len = strlen(PULSAR_RENDER_SYSTEM);
-    if (!strncmp(p, PULSAR_RENDER_SYSTEM, sys_len)) p += sys_len;
-    p += pulsar_think_effort_prefix_len(p);
-    while (*p && isspace((unsigned char)*p)) p++;
-
-    const char *user = strstr(p, PULSAR_RENDER_USER);
-    const char *assistant = strstr(p, PULSAR_RENDER_ASSISTANT);
-    const char *end = NULL;
-    if (user && assistant) end = user < assistant ? user : assistant;
-    else end = user ? user : assistant;
-    if (!end) end = p + strlen(p);
-    while (end > p && isspace((unsigned char)end[-1])) end--;
-    return xstrndup(p, (size_t)(end - p));
-}
 
 
 
-/* A server-side tool result appended to the live session mid-turn: close an
- * open think block, then exactly what the replay path renders for ONE tool
- * message after the assistant's call turn -- EOS, the tool_result, the
- * generation prefix (render_live_tool_tail) -- or next-turn prefix reuse dies. */
-static char *build_live_tool_result_suffix_spans(const request *r,
-                                                 const thinking_state *thinking,
-                                                 const char *result_text,
-                                                 chat_text_span **spans_out,
-                                                 uint32_t *n_spans_out) {
-    if (spans_out) *spans_out = NULL;
-    if (n_spans_out) *n_spans_out = 0;
-    const pulsar_think_mode mode = r ? r->think_mode : PULSAR_THINK_NONE;
-    buf suffix = {0};
-    if (pulsar_think_mode_enabled(mode) && thinking && thinking->inside) {
-        buf_puts(&suffix, "</think>");
-    }
-    chat_msgs msgs = {0};
-    chat_msg result = {0};
-    result.role = xstrdup("tool");
-    result.content = xstrdup(result_text ? result_text : "");
-    chat_msgs_push(&msgs, result);
-    /* The tool body is CLIENT data (L223): the tail marks it, and the ranges ride
-     * along so the caller tokenises those bytes as plain text. */
-    chat_text_span *tail_spans = NULL;
-    uint32_t tail_n = 0;
-    char *tail = render_live_tool_tail_spans(&msgs, 0, r && r->has_tools, mode, r ? r->family->v41 : true,
-                                             &tail_spans, &tail_n);
-    buf_puts_spanned(&suffix, tail, tail_spans, tail_n);
-    free(tail);
-    free(tail_spans);
-    chat_msgs_free(&msgs);
-    if (spans_out) {
-        *spans_out = suffix.spans;
-        *n_spans_out = suffix.n_spans;
-        suffix.spans = NULL;
-        suffix.n_spans = suffix.cap_spans = 0;
-    }
-    return buf_take(&suffix);
-}
 
-char *build_invalid_dsml_tool_error_suffix_spans(const request *r,
-                                                 const thinking_state *thinking,
-                                                 const char *detail,
-                                                 chat_text_span **spans_out,
-                                                 uint32_t *n_spans_out) {
-    char *system = rendered_chat_system_region(r ? r->prompt_text : NULL);
-    buf tool_error = {0};
-    buf_puts(&tool_error, "Tool error: invalid DSML tool call");
-    if (detail && detail[0]) {
-        buf_puts(&tool_error, ": ");
-        buf_puts(&tool_error, detail);
-    }
-    buf_puts(&tool_error,
-             "\nThe previous assistant output was not executed because the DSML syntax was malformed. "
-             "Emit a new valid DSML tool call, or answer normally if no tool is needed.");
-    if (system && system[0]) {
-        buf_puts(&tool_error, "\n\nSystem prompt reminder:\n");
-        buf_puts(&tool_error, system);
-    }
-
-    char *suffix = build_live_tool_result_suffix_spans(r, thinking,
-                                                       tool_error.ptr ? tool_error.ptr : "",
-                                                       spans_out, n_spans_out);
-
-    free(system);
-    buf_free(&tool_error);
-    return suffix;
-}
 
 /* L284 P4: the rule every family's parser applies to a turn whose tool text is not a valid call --
  * malformed, unterminated (the cap cut it; no tag is ever repaired), or naming an undeclared tool.  Its
  * valid calls are kept and the broken ones dropped.  With none kept it loops ONCE through the
  * model-visible tool error -- non-streaming (a stream already carried the text), a chat with tools,
- * forced or not (the retry re-opens a forced call: continue_after_invalid_dsml) -- otherwise the turn
+ * forced or not (the retry re-opens a forced call: continue_after_tool_error) -- otherwise the turn
  * is TEXT (turn_as_text) with a truthful finish (turn_finish).  parser_finish_turn applies it. */
 bool turn_tool_retry_allowed(const gen_state *g) {
     const request *r = &g->j->req;
@@ -297,7 +208,7 @@ static bool turn_tool_retry(server *s, session_slot *sl, gen_state *g, const cha
                g->ctx_span, g->req_flags[0] ? " " : "", g->req_flags);
     s->trace_event(g->trace_id, "continuing with model-visible tool error");
     tool_calls_free(&out->calls);
-    if (!s->continue_after_invalid_dsml(sl, &g->j->req, &g->thinking, detail, &recovery_tokens, recovery_err,
+    if (!s->continue_after_tool_error(sl, &g->j->req, &g->thinking, detail, &recovery_tokens, recovery_err,
                                         sizeof(recovery_err))) {
         g->finish = "error";
         out->finish = g->finish;
@@ -360,8 +271,8 @@ bool parser_finish_turn(server *s, session_slot *sl, gen_state *g, server_turn *
         }
         if (kept < out->calls.len) {
             /* the sampled bytes hold the dropped call: no tool memory for this turn (a prefix miss) */
-            free(out->calls.raw_dsml);
-            out->calls.raw_dsml = NULL;
+            free(out->calls.raw_calls);
+            out->calls.raw_calls = NULL;
         }
         out->calls.len = kept;
     }
@@ -391,11 +302,6 @@ bool parser_finish_turn(server *s, session_slot *sl, gen_state *g, server_turn *
     return ok;
 }
 
-char *build_invalid_dsml_tool_error_suffix(const request *r,
-                                                  const thinking_state *thinking,
-                                                  const char *detail) {
-    return build_invalid_dsml_tool_error_suffix_spans(r, thinking, detail, NULL, NULL);
-}
 
 
 
@@ -459,6 +365,6 @@ char *build_responses_visible_assistant_suffix(const request *r,
 
 bool server::should_canonicalize_tool_checkpoint(const tool_calls *calls) const {
     if (!calls || calls->len == 0) return false;
-    return !(calls->raw_dsml && calls->raw_dsml[0]);
+    return !(calls->raw_calls && calls->raw_calls[0]);
 }
 

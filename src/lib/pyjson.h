@@ -59,3 +59,15 @@ void pyjson_dump(const pyjson_value &v, std::string *out);
 
 /** Append a JSON string literal for the UTF-8 bytes s[0..n), Python-escaped. */
 void pyjson_dump_string(const char *s, size_t n, std::string *out);
+
+/** Append `json.dumps(sort(v), ensure_ascii=False, separators=(",", ":"), allow_nan=False)` -- every
+ * object's keys sorted, recursively (the canonical JSON vLLM's Inkling renderer writes).  false = a
+ * non-finite float (Python raises). */
+bool pyjson_dump_canonical(const pyjson_value &v, std::string *out);
+
+/** Python's truthiness of the value json.loads produced (`x or default`). */
+bool pyjson_truthy(const pyjson_value &v);
+
+/** Python's str.isspace() for one codepoint -- the whitespace str.strip() removes (and Jinja's |trim): the
+ * one definition the renderers and the output parsers share. */
+bool py_isspace(uint32_t cp);

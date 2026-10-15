@@ -9,7 +9,7 @@
  * step).  What is NOT here: any op (family_qwen_s4.cpp). */
 #include "pulsar_engine_internal.h"
 #include "exl3_trellis.h"
-#include "lib/qwen_tokenizer.h"
+#include "lib/bpe_tokenizer.h"
 #include "tp/pulsar_tp.h"
 #include "spec_internal.h"
 #include "qwen_forward.h"
@@ -489,14 +489,14 @@ static bool qwen_load_tokenizer(pulsar_engine *e, const char *model_path) {
         return false;
     }
     char err[256] = "";
-    e->qwen_tok = qwen_tokenizer_load(tj.data(), tj.size(), gc.data(), gc.size(), err, sizeof(err));
+    e->qwen_tok = bpe_tokenizer_load_hf(tj.data(), tj.size(), gc.data(), gc.size(), err, sizeof(err));
     if (!e->qwen_tok) {
         fprintf(stderr, "pulsar: %s: tokenizer refused: %s\n", PULSAR_QWEN_ARCH, err);
         return false;
     }
-    const std::vector<int> &stop = qwen_tokenizer_stop_ids(e->qwen_tok);
+    const std::vector<int> &stop = bpe_tokenizer_stop_ids(e->qwen_tok);
     fprintf(stderr, "pulsar: %s: tokenizer %d ids from %s; stop ids", PULSAR_QWEN_ARCH,
-            qwen_tokenizer_n_tokens(e->qwen_tok), tp.c_str());
+            bpe_tokenizer_n_tokens(e->qwen_tok), tp.c_str());
     for (int id : stop) fprintf(stderr, " %d", id);
     fprintf(stderr, "\n");
     return true;
@@ -520,7 +520,7 @@ static bool qwen_draft_vocab(pulsar_engine *e) {
         const int32_t id = k_qwen_draft_extra[i];
         size_t len = 0;
         const char *b = id >= (int32_t)QWEN_DRAFT_PREFIX && (uint32_t)id < s->eos_id
-                            ? qwen_tokenizer_token_bytes(e->qwen_tok, id, &len) : NULL;
+                            ? bpe_tokenizer_token_bytes(e->qwen_tok, id, &len) : NULL;
         ok = b != NULL;
         for (size_t j = 0; ok && j <= len; j++) {
             h ^= j < len ? (uint8_t)b[j] : 0xffu;
@@ -637,7 +637,7 @@ static bool qwen_family_load(pulsar_engine *e, const pulsar_engine_options *opt)
     if (!qwen_vision_bind(&e->model, &e->qwen_weights->vision, &e->qwen_weights->vision_present)) return false;
     e->qwen_weights->vision_pad_id = -1;
     if (e->qwen_weights->vision_present) {
-        e->qwen_weights->vision_pad_id = qwen_tokenizer_added_id(e->qwen_tok, "<|image_pad|>");
+        e->qwen_weights->vision_pad_id = bpe_tokenizer_added_id(e->qwen_tok, "<|image_pad|>");
         if (e->qwen_weights->vision_pad_id < 0 || g_qwen_shape.n_embd != PULSAR_QWEN_VISION_OUT) {
             fprintf(stderr, "pulsar: %s: the vision tower needs <|image_pad|> in the tokenizer and a %u-wide model "
                             "(pad %d, n_embd %u) -- refusing\n", PULSAR_QWEN_ARCH, (unsigned)PULSAR_QWEN_VISION_OUT,

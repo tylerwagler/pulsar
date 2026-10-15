@@ -311,46 +311,6 @@ static const sink_tool_ops anthropic_tool_ops = {anthropic_tool_begin, anthropic
 
 
 
-size_t text_stream_safe_limit(const char *raw, size_t start,
-                                     size_t raw_len, bool has_tools,
-                                     bool final) {
-    if (raw_len <= start) return raw_len;
-
-    size_t limit = raw_len;
-    if (has_tools) {
-        const char *tool = find_any_tool_start(raw + start);
-        if (tool) {
-            limit = trim_tool_separator_ws(raw, start, (size_t)(tool - raw));
-            return utf8_stream_safe_len(raw, start, limit, true);
-        }
-
-        if (!final) {
-            /* Tool calls are hidden from the API client and returned as
-             * structured tool_use/tool_calls blocks.  The whitespace just
-             * before the DSML marker is syntax too: if we stream it as
-             * assistant text, the next client request sends it back and our
-             * renderer adds the canonical "\n\n" separator again.  Hold
-             * trailing whitespace until a following non-whitespace byte proves
-             * it is ordinary text, or until a tool marker proves it should be
-             * dropped. */
-            while (limit > start && isspace((unsigned char)raw[limit - 1])) limit--;
-
-            /* Also hold a partial '<...tool_calls...' marker that may be split
-             * across generated tokens. */
-            const size_t max_marker = 80;
-            size_t scan = raw_len - start > max_marker ? raw_len - max_marker : start;
-            for (size_t i = raw_len; i > scan; i--) {
-                if (raw[i - 1] == '<') {
-                    size_t marker = i - 1;
-                    if (marker < limit) limit = marker;
-                    break;
-                }
-            }
-            limit = trim_tool_separator_ws(raw, start, limit);
-        }
-    }
-    return utf8_stream_safe_len(raw, start, limit, final);
-}
 
 
 

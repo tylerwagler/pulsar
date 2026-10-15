@@ -87,14 +87,6 @@ static const char kToolsTail[] =
 
 /* ---- Python str.strip ------------------------------------------------------ */
 
-bool qwen_py_isspace(uint32_t cp) {
-    /* str.isspace: bidi class WS, B or S, or category Zs */
-    if (cp >= 0x09 && cp <= 0x0d) return true;
-    if (cp >= 0x1c && cp <= 0x20) return true;
-    if (cp == 0x85 || cp == 0xa0 || cp == 0x1680) return true;
-    if (cp >= 0x2000 && cp <= 0x200a) return true;
-    return cp == 0x2028 || cp == 0x2029 || cp == 0x202f || cp == 0x205f || cp == 0x3000;
-}
 
 namespace {
 
@@ -114,7 +106,7 @@ void py_strip_bounds(const char *s, size_t n, size_t *lo_out, size_t *hi_out) {
     size_t lo = 0;
     while (lo < n) {
         const int k = utf8_seq_ok(u + lo, n - lo);
-        if (!k || !qwen_py_isspace(cp_at(u + lo, k))) break;
+        if (!k || !py_isspace(cp_at(u + lo, k))) break;
         lo += (size_t)k;
     }
     size_t hi = n;
@@ -122,7 +114,7 @@ void py_strip_bounds(const char *s, size_t n, size_t *lo_out, size_t *hi_out) {
         size_t b = hi - 1;
         while (b > lo && (u[b] & 0xc0) == 0x80 && hi - b < 4) b--;
         const int k = utf8_seq_ok(u + b, hi - b);
-        if (!k || b + (size_t)k != hi || !qwen_py_isspace(cp_at(u + b, k))) break;
+        if (!k || b + (size_t)k != hi || !py_isspace(cp_at(u + b, k))) break;
         hi = b;
     }
     *lo_out = lo;

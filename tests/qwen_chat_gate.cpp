@@ -32,102 +32,11 @@
 #include <string>
 #include <vector>
 
-#include "../src/lib/qwen_tokenizer.h"
-#include "../src/lib/pyjson.h"
+#include "bpe_gate_util.h"
 #include "../src/lib/qwen_chat.h"
-#include "../src/lib/sha1.hpp"
 
-static int g_fail = 0;
-static int g_checks = 0;
-
-static void fail(const char *fmt, ...) {
-    va_list ap;
-    va_start(ap, fmt);
-    fprintf(stderr, "  FAIL: ");
-    vfprintf(stderr, fmt, ap);
-    fprintf(stderr, "\n");
-    va_end(ap);
-    g_fail++;
-}
-
-#define CHECK(cond, ...)                 \
-    do {                                 \
-        g_checks++;                      \
-        if (!(cond)) fail(__VA_ARGS__);  \
-    } while (0)
-
-static bool read_file(const std::string &path, std::string *out) {
-    FILE *f = fopen(path.c_str(), "rb");
-    if (!f) return false;
-    char buf[1 << 16];
-    size_t n;
-    out->clear();
-    while ((n = fread(buf, 1, sizeof buf, f)) > 0) out->append(buf, n);
-    fclose(f);
-    return true;
-}
-
-static pyjson_value load_json(const std::string &path) {
-    std::string text;
-    if (!read_file(path, &text)) {
-        fprintf(stderr, "qwen_chat_gate: cannot read %s\n", path.c_str());
-        exit(2);
-    }
-    pyjson_value v;
-    char err[200];
-    if (!pyjson_parse(text.data(), text.size(), &v, err, sizeof err)) {
-        fprintf(stderr, "qwen_chat_gate: %s: %s\n", path.c_str(), err);
-        exit(2);
-    }
-    return v;
-}
-
-static std::string sha1_hex(const std::string &s) {
-    char hex[41];
-    pulsar::Sha1::bytes_hex(s.data(), s.size(), hex);
-    return hex;
-}
-
-static std::string ids_text(const std::vector<int> &ids) {
-    std::string s;
-    char b[16];
-    for (int id : ids) {
-        snprintf(b, sizeof b, "%d,", id);
-        s += b;
-    }
-    return s;
-}
-
-static std::vector<int> json_ids(const pyjson_value &v) {
-    std::vector<int> ids;
-    for (const auto &x : v.a) ids.push_back(atoi(x.num.c_str()));
-    return ids;
-}
-
-static std::vector<pulsar_text_span> json_spans(const pyjson_value &v) {
-    std::vector<pulsar_text_span> spans;
-    for (const auto &x : v.a) spans.push_back({(uint32_t)atoi(x.a[0].num.c_str()), (uint32_t)atoi(x.a[1].num.c_str())});
-    return spans;
-}
-
-static std::vector<int> encode(const qwen_tokenizer *t, const std::string &text,
-                               const std::vector<pulsar_text_span> *spans = NULL) {
-    std::vector<int> ids;
-    char err[200];
-    if (!qwen_tokenizer_encode(t, text.data(), text.size(), spans ? spans->data() : NULL,
-                               spans ? (uint32_t)spans->size() : 0, &ids, err, sizeof err))
-        fail("encode refused: %s", err);
-    return ids;
-}
-
-static std::string first_diff(const std::vector<int> &a, const std::vector<int> &b) {
-    size_t i = 0;
-    while (i < a.size() && i < b.size() && a[i] == b[i]) i++;
-    char m[160];
-    snprintf(m, sizeof m, "len %zu vs %zu, first difference at %zu (%d vs %d)", a.size(), b.size(), i,
-             i < a.size() ? a[i] : -1, i < b.size() ? b[i] : -1);
-    return m;
-}
+/* T3's context for one codepoint c (tests/qwen/gen_qwen_goldens.py sweep_text) */
+static std::string qwen_sweep_context(const std::string &c) { return "x" + c + c + c + " " + c + "1'" + c + "\n"; }
 
 /* ---- the API conversation -> renderer input ---------------------------------- */
 
@@ -238,120 +147,7 @@ static std::string spans_text(const std::vector<pulsar_text_span> &spans) {
 
 /* ---- sections ---------------------------------------------------------------- */
 
-static void t1_adversarial(const qwen_tokenizer *t, const std::string &dir) {
-    const pyjson_value v = load_json(dir + "/tok_adversarial.json");
-    int bad = 0;
-    for (const auto &c : v.a) {
-        const std::string &text = c.get("text")->s;
-        const std::vector<int> want = json_ids(*c.get("ids"));
-        const std::vector<int> got = encode(t, text);
-        g_checks++;
-        if (got != want) {
-            std::string q;
-            pyjson_dump_string(text.data(), std::min<size_t>(text.size(), 80), &q);
-            if (bad++ < 10) fail("T1 %s: %s", q.c_str(), first_diff(got, want).c_str());
-        }
-    }
-    printf("T1 adversarial strings: %zu, %d mismatched\n", v.a.size(), bad);
-}
-
-static void t2_spans(const qwen_tokenizer *t, const std::string &dir) {
-    const pyjson_value v = load_json(dir + "/tok_spans.json");
-    int bad = 0, guarded = 0;
-    for (const auto &c : v.a) {
-        const std::string &text = c.get("text")->s;
-        const std::vector<pulsar_text_span> spans = json_spans(*c.get("spans"));
-        const std::vector<int> want = json_ids(*c.get("ids"));
-        const std::vector<int> got = encode(t, text, &spans);
-        g_checks++;
-        if (got != want) {
-            bad++;
-            fail("T2 %s", first_diff(got, want).c_str());
-        }
-        guarded += encode(t, text) != got;
-    }
-    printf("T2 span guard: %zu cases (%d where the guard changes the ids), %d mismatched\n", v.a.size(), guarded,
-           bad);
-}
-
-static void t3_sweep(const qwen_tokenizer *t, const std::string &dir) {
-    std::string tsv;
-    if (!read_file(dir + "/tok_sweep.tsv", &tsv)) { fail("T3: no tok_sweep.tsv"); return; }
-    int chunks = 0, bad = 0;
-    long total = 0;
-    for (size_t pos = 0; pos < tsv.size();) {
-        const size_t nl = tsv.find('\n', pos);
-        const std::string line = tsv.substr(pos, nl - pos);
-        pos = nl + 1;
-        int chunk = 0, n = 0;
-        char sha[64];
-        if (sscanf(line.c_str(), "%d\t%d\t%63s", &chunk, &n, sha) != 3) continue;
-        std::string text;
-        for (uint32_t cp = (uint32_t)chunk * 4096; cp < (uint32_t)chunk * 4096 + 4096; cp++) {
-            if (cp >= 0xd800 && cp <= 0xdfff) continue;
-            std::string c;
-            if (cp < 0x80) c.push_back((char)cp);
-            else if (cp < 0x800) { c.push_back((char)(0xc0 | (cp >> 6))); c.push_back((char)(0x80 | (cp & 0x3f))); }
-            else if (cp < 0x10000) {
-                c.push_back((char)(0xe0 | (cp >> 12))); c.push_back((char)(0x80 | ((cp >> 6) & 0x3f)));
-                c.push_back((char)(0x80 | (cp & 0x3f)));
-            } else {
-                c.push_back((char)(0xf0 | (cp >> 18))); c.push_back((char)(0x80 | ((cp >> 12) & 0x3f)));
-                c.push_back((char)(0x80 | ((cp >> 6) & 0x3f))); c.push_back((char)(0x80 | (cp & 0x3f)));
-            }
-            text += "x" + c + c + c + " " + c + "1'" + c + "\n";
-        }
-        const std::vector<int> ids = encode(t, text);
-        total += (long)ids.size();
-        chunks++;
-        g_checks++;
-        if ((int)ids.size() != n || sha1_hex(ids_text(ids)) != sha) {
-            bad++;
-            fail("T3 chunk %d (U+%04X..): %zu ids vs HF %d", chunk, chunk * 4096, ids.size(), n);
-        }
-    }
-    printf("T3 codepoint sweep: %d chunks, %ld tokens, %d mismatched\n", chunks, total, bad);
-}
-
-static void t4_calib(const qwen_tokenizer *t, const std::string &dir, const std::string &calib) {
-    std::string tsv, rows;
-    if (!read_file(dir + "/tok_calib.tsv", &tsv) || !read_file(calib, &rows)) {
-        fail("T4: cannot read tok_calib.tsv or %s", calib.c_str());
-        return;
-    }
-    std::vector<std::pair<int, std::string>> want;
-    for (size_t pos = 0; pos < tsv.size();) {
-        const size_t nl = tsv.find('\n', pos);
-        int idx, n;
-        char sha[64];
-        if (sscanf(tsv.substr(pos, nl - pos).c_str(), "%d\t%d\t%63s", &idx, &n, sha) == 3) want.push_back({n, sha});
-        pos = nl + 1;
-    }
-    int row = 0, bad = 0;
-    long total = 0;
-    for (size_t pos = 0; pos < rows.size();) {
-        const size_t nl = rows.find('\n', pos);
-        const std::string line = rows.substr(pos, nl - pos);
-        pos = nl == std::string::npos ? rows.size() : nl + 1;
-        if (line.empty()) continue;
-        pyjson_value r;
-        char err[200];
-        if (!pyjson_parse(line.data(), line.size(), &r, err, sizeof err)) { fail("T4 row %d: %s", row, err); row++; continue; }
-        const std::vector<int> ids = encode(t, r.get("text")->s);
-        total += (long)ids.size();
-        g_checks++;
-        if (row >= (int)want.size() || (int)ids.size() != want[(size_t)row].first ||
-            sha1_hex(ids_text(ids)) != want[(size_t)row].second) {
-            bad++;
-            fail("T4 row %d: %zu ids", row, ids.size());
-        }
-        row++;
-    }
-    CHECK(row == (int)want.size(), "T4: %d rows vs %zu golden", row, want.size());
-    printf("T4 calibration corpus: %d rows, %ld tokens, %d mismatched\n", row, total, bad);
-}
-
-static void r1_hand(const qwen_tokenizer *t, const std::string &dir) {
+static void r1_hand(const bpe_tokenizer *t, const std::string &dir) {
     const pyjson_value v = load_json(dir + "/render_cases.json");
     int bad = 0, refusals = 0, guarded = 0;
     for (const auto &c : v.a) {
@@ -396,7 +192,7 @@ static void r1_hand(const qwen_tokenizer *t, const std::string &dir) {
            "encode), %d mismatched\n", v.a.size(), refusals, guarded, bad);
 }
 
-static void r2_corpus(const qwen_tokenizer *t, const std::string &dir, const std::string &cases_dir) {
+static void r2_corpus(const bpe_tokenizer *t, const std::string &dir, const std::string &cases_dir) {
     std::string tsv;
     if (!read_file(dir + "/render_corpus.tsv", &tsv)) { fail("R2: no render_corpus.tsv"); return; }
     static const char *efforts[] = {"none", "low", "medium", "xhigh"};
@@ -494,7 +290,7 @@ static parse_result run_parser(const std::string &out, bool thinking, const char
     char err[200];
     parse_result r;
     if (!p.init(thinking, tools, err, sizeof err)) { fail("parser init: %s", err); return r; }
-    std::vector<qwen_out_event> ev;
+    std::vector<out_event> ev;
     size_t at = 0;
     for (size_t cut : cuts) {
         p.feed(out.data() + at, cut - at, &ev);
@@ -506,11 +302,11 @@ static parse_result run_parser(const std::string &out, bool thinking, const char
     int fragments = 0;
     for (const auto &e : ev) {
         switch (e.kind) {
-        case qwen_out_event::REASONING: r.ev_reasoning += e.text; break;
-        case qwen_out_event::CONTENT: r.ev_content += e.text; break;
-        case qwen_out_event::TOOL_BEGIN: r.begins++; streamed.clear(); fragments = 0; break;
-        case qwen_out_event::TOOL_ARGS: streamed += e.text; fragments++; break;
-        case qwen_out_event::TOOL_END: {
+        case out_event::REASONING: r.ev_reasoning += e.text; break;
+        case out_event::CONTENT: r.ev_content += e.text; break;
+        case out_event::TOOL_BEGIN: r.begins++; streamed.clear(); fragments = 0; break;
+        case out_event::TOOL_ARGS: streamed += e.text; fragments++; break;
+        case out_event::TOOL_END: {
             r.calls += std::to_string(e.index) + ":" + e.name + ":" + e.arguments + "\n";
             /* the fragments + "}" are the arguments, byte for byte, unless a key repeated (streamed twice) */
             pyjson_value a;
@@ -521,7 +317,7 @@ static parse_result run_parser(const std::string &out, bool thinking, const char
                       "parser: TOOL_ARGS fragments do not add up to the arguments");
             break;
         }
-        case qwen_out_event::ERROR: r.errors += e.text + "\n"; break;
+        case out_event::ERROR: r.errors += e.text + "\n"; break;
         }
     }
     r.reasoning = p.reasoning();
@@ -731,7 +527,7 @@ static void e1_effort(void) {
  * piece is the full render and its KV continues across turns.  The one edge that is the model's is where a
  * generation prompt meets the sampled turn: the whole text may merge across it (an empty reasoning's
  * "<think>\n" + "\n</think>" holds one "\n\n" token), so there the piece's last token is not compared. */
-static void c1_composition(const qwen_tokenizer *t) {
+static void c1_composition(const bpe_tokenizer *t) {
     struct piece { std::string text; std::vector<pulsar_text_span> spans; bool sampled; };
     const qwen_tool_call_in call = {"read_file", "{\"path\": \"a.txt\", \"lines\": 3}"};
     const std::string note = qwen_system_reminder("Current local date and time: now.");
@@ -798,7 +594,7 @@ static void c1_composition(const qwen_tokenizer *t) {
                 std::vector<size_t> at(want.size() + 1, 0);
                 for (size_t k = 0; k < want.size(); k++) {
                     size_t nb = 0;
-                    qwen_tokenizer_token_bytes(t, want[k], &nb);
+                    bpe_tokenizer_token_bytes(t, want[k], &nb);
                     at[k + 1] = at[k] + nb;
                 }
                 size_t lo = 0;
@@ -812,7 +608,7 @@ static void c1_composition(const qwen_tokenizer *t) {
                         size_t got_hi = lo;
                         for (int id : got) {
                             size_t nb = 0;
-                            qwen_tokenizer_token_bytes(t, id, &nb);
+                            bpe_tokenizer_token_bytes(t, id, &nb);
                             got_hi += nb;
                         }
                         const auto a = std::find(at.begin(), at.end(), lo);
@@ -858,29 +654,29 @@ int main(int argc, char **argv) {
         return 2;
     }
     char err[512];
-    qwen_tokenizer *t = qwen_tokenizer_load(tj.data(), tj.size(), gj.data(), gj.size(), err, sizeof err);
+    bpe_tokenizer *t = bpe_tokenizer_load_hf(tj.data(), tj.size(), gj.data(), gj.size(), err, sizeof err);
     if (!t) {
         fprintf(stderr, "qwen_chat_gate: %s\n", err);
         return 1;
     }
     const pyjson_value meta = load_json(vec_dir + "/meta.json");
     printf("qwen_chat_gate: tokenizer %s (%d ids), goldens from transformers %s / tokenizers %s\n", tok_dir.c_str(),
-           qwen_tokenizer_n_tokens(t), meta.get("transformers")->s.c_str(), meta.get("tokenizers")->s.c_str());
-    CHECK(qwen_tokenizer_n_tokens(t) == atoi(meta.get("n_tokens")->num.c_str()), "token count %d vs HF %s",
-          qwen_tokenizer_n_tokens(t), meta.get("n_tokens")->num.c_str());
-    CHECK(json_ids(*meta.get("stop_ids")) == qwen_tokenizer_stop_ids(t), "stop ids differ from generation_config");
+           bpe_tokenizer_n_tokens(t), meta.get("transformers")->s.c_str(), meta.get("tokenizers")->s.c_str());
+    CHECK(bpe_tokenizer_n_tokens(t) == atoi(meta.get("n_tokens")->num.c_str()), "token count %d vs HF %s",
+          bpe_tokenizer_n_tokens(t), meta.get("n_tokens")->num.c_str());
+    CHECK(json_ids(*meta.get("stop_ids")) == bpe_tokenizer_stop_ids(t), "stop ids differ from generation_config");
     CHECK(qwen_effort_default() == QWEN_EFFORT_XHIGH, "the family default effort is not the template's xhigh");
     printf("stop ids:");
-    for (int id : qwen_tokenizer_stop_ids(t)) {
+    for (int id : bpe_tokenizer_stop_ids(t)) {
         size_t n = 0;
-        const char *b = qwen_tokenizer_token_bytes(t, id, &n);
+        const char *b = bpe_tokenizer_token_bytes(t, id, &n);
         printf(" %d %.*s", id, (int)n, b);
     }
     printf("; default effort %s\n", qwen_effort_name(qwen_effort_default()));
 
     t1_adversarial(t, vec_dir);
     t2_spans(t, vec_dir);
-    t3_sweep(t, vec_dir);
+    t3_sweep(t, vec_dir, qwen_sweep_context);
     if (!calib.empty()) t4_calib(t, vec_dir, calib);
     else printf("T4 calibration corpus: SKIPPED (no --calib)\n");
     r1_hand(t, vec_dir);
@@ -893,7 +689,7 @@ int main(int argc, char **argv) {
     p2_units();
     e1_effort();
     c1_composition(t);
-    qwen_tokenizer_free(t);
+    bpe_tokenizer_free(t);
     printf("\nqwen_chat_gate: %d checks, %d failed -- %s\n", g_checks, g_fail, g_fail ? "FAIL" : "PASS");
     return g_fail ? 1 : 0;
 }
