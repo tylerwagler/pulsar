@@ -199,7 +199,8 @@ no job classes and no memory, and shows little.
          --label inkling-k3 -- bash ~/inkling/runs/k3_slice.sh                      # prints the job id
     gpuq status [--json]    gpuq log [-f] ID    gpuq cancel ID
 
-- **Classes, in priority order.**  `quiet` > `short` > `long`; FIFO within a class; one job at a time.
+- **Classes, in priority order.**  `quiet` > `short` > `long`; FIFO within a class; one job at a time,
+  except `--shared` short jobs (below).
   `short`: timeout at most 20m (refused otherwise; default 20m).  `quiet`: the exclusive box for batteries
   (default timeout 2h) -- it starts when nothing runs, nothing is admitted while it runs, and the daemon
   creates `~/BATTERY_RUNNING` before it and removes it after.  `long` (default timeout 24h): preemptible.
@@ -218,13 +219,36 @@ no job classes and no memory, and shows little.
   then `sync` + drop_caches (once per admission; the page cache masks GB10 unified-memory pressure;
   `GPUQ_DROP_CACHES=0` in the unit turns it off), then MemAvailable >= `--mem` (default 8G short, 16G
   otherwise) + a 6G margin.  A head job short of memory waits holding the lock.
+- **Shared jobs** (`submit --class short --shared`): "timing-insensitive and safe to co-run".  Refused on
+  `quiet` and `long`.  Rules, in the daemon's order:
+  - A shared job starts only from the **head** of the queue (FIFO stays the rule: an exclusive job is never
+    overtaken).  An exclusive head -- a non-shared short, a quiet, a long -- waits until the running shared
+    group drains, and no new shared job starts past it, so it cannot be starved.
+  - It never starts beside a non-shared job, nor while a quiet job waits (a waiting quiet job is the head) or
+    runs, nor while a foreign `~/BATTERY_RUNNING` exists.
+  - At most `GPUQ_MAX_SHARED` (default 3; `Environment=` in the unit) run at once.
+  - Memory, measured fresh at each admission: MemAvailable >= `--mem` + 6G, plus the `--mem` of every group
+    member started under 60 s ago (it may not have allocated yet).  drop_caches runs only on an admission
+    onto an idle resource; a job joining a running group skips it (it would disturb the running jobs) and
+    the daemon logs "drop_caches skipped".
+  - The lock: the first job of a group starts a **lock holder** process (`gpuq.py _hold`, pid in
+    `~/.gpuq/holders.json`) that keeps `~/gpu.lock` until the daemon sees the group drained, so legacy
+    `flock` callers serialize with the whole group; shared shims get no lock fd.  The holder survives a
+    daemon restart like the shims, and the next daemon re-adopts it.
+  - A waiting shared job is a waiter for a running long job's yield, exactly like any short job.
+  - `gpuq status` lists every running job (`shared` tagged) and the group's lock holder.  `status --json`:
+    `resources.<res>.running` is a **list** (was one object or null); `running_first` is the old
+    single-object shape (or null) for existing readers; `queue` is unchanged, entries gain `shared`.
+
+  **Migration for callers:** model-free kernel gates and host-side tests add `--shared --mem 8G`.  Anything
+  loading a 60+ GB model, any perf / timing measurement, and batteries stay exclusive (no `--shared`).
 - **Exit codes of `--wait`:** the job's own; 124 timeout; 125 cancelled (also when the waiter itself gets
   INT/TERM/HUP -- the job is tied to its waiter, like a `flock` child); 120 lost (its shim vanished while
   the daemon was down); 127/126 cmd not found / not executable; 2 usage.  `gpuq status` exits 1 on an
   anomaly: an orphaned lock (a dead holder, the lock kept by an inherited fd) or a GPU process that is
   neither the running job's nor under a legacy holder.
-- **Legacy callers.**  While a job runs its shim holds `~/gpu.lock` (flock), so `flock -o ~/gpu.lock`
-  callers still serialize with gpuq; a legacy holder makes gpuq wait (it joins the kernel's queue like any
+- **Legacy callers.**  While a job runs its shim (a shared group: its holder) holds `~/gpu.lock` (flock),
+  so `flock -o ~/gpu.lock` callers still serialize with gpuq; a legacy holder makes gpuq wait (it joins the kernel's queue like any
   flock waiter, so it is not ahead of legacy waiters), and `gpuq status` shows it as LEGACY HOLDER with the
   legacy waiters.  Migrate: a battery script's `flock -o ~/gpu.lock -c 'timeout 5400 ~/x-battery.sh'`
   becomes `gpuq submit --class quiet --timeout 90m --wait -- ~/x-battery.sh` (gpuq owns
@@ -238,7 +262,7 @@ no job classes and no memory, and shows little.
   The user unit needs `loginctl enable-linger claude` to outlive the last login session.
 - **Tests.**  `python3 tools/gpuq/test_gpuq.py -v` on Sparky (scratch in `~/gpuq-test/`): a real daemon per
   test in test mode (`GPUQ_TEST=1` with its own `GPUQ_HOME`, `GPUQ_LOCK`, `GPUQ_MARKER`, a fake
-  `GPUQ_MEMINFO` and drop_caches command), dummy jobs, no GPU, ~1 min.  Install: `tools/gpuq/install.sh`.
+  `GPUQ_MEMINFO` and drop_caches command), dummy jobs, no GPU, ~75 s.  Install: `tools/gpuq/install.sh`.
 - **Spool format, version 1, and the v2 plan.**  Every job record, outcome and the daemon state carry
   `"version": 1`, and every job names its resources (`"resources": ["sparky:gpu0"]`, from the hostname;
   `--gpus gpu0` or `--gpus sparky:gpu0`).  The lock and the memory pool are per resource; v1 owns one
