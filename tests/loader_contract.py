@@ -53,6 +53,12 @@ FAMILIES = {
         'kv': 'qwen4_exp.num_hidden_layers',
         'stack': 'model.language_model.layers.3.mlp.experts.gate_up_proj',
     },
+    'inkling': {   # L295 E1: the 3-layer mini (layer 1 is MoE) and Inkling-Small alike
+        'tensor': 'model.llm.layers.1.attn.wk_dv.weight',   # a packed (EXL3) projection
+        'plain': 'model.llm.layers.1.mlp.gate.weight',      # the router, bf16 [4096 -> 258]
+        'kv': 'inkling.hidden_size',
+        'stack': 'model.llm.layers.1.mlp.experts.gate_proj',
+    },
 }
 MUTATIONS = ('arch', 'kv', 'tensor', 'dtype', 'shape', 'native-dtype', 'format')
 REFUSAL_WORDS = ('refus', 'missing', 'declares', 'expected', 'unsupported', 'disagrees', 'not ', 'unknown', 'no arm', 'want ',

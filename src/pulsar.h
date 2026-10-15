@@ -105,6 +105,7 @@ typedef struct pulsar_family pulsar_family;
 typedef enum {
     PULSAR_FAMILY_ID_DEEPSEEK4 = 0,  ///< DeepSeek V4 Flash (0731), Vision-Exp, V4.1 Flash
     PULSAR_FAMILY_ID_QWEN4_EXP = 1,  ///< Qwen3.8-Flash-Next (HF model_type qwen4_exp)
+    PULSAR_FAMILY_ID_INKLING   = 2,  ///< Thinking Machines' Inkling (HF model_type inkling_mm_model; src/families/inkling)
 } pulsar_family_id;
 
 /** The conversation format a front end must render for the loaded model: the

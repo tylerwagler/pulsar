@@ -972,6 +972,7 @@ void pulsar_engine::destroy() {
         e->tp_bulk_dev = NULL;
         e->tp_bulk_bytes = 0;
     }
+    if (e->family && e->family->unload) e->family->unload(e);   /* L295: the family's opaque state */
     engram_model_free(&e->weights);
     weights_free(&e->weights);
     pulsar_tp_plan_free(e);   /* the rank's built slices, before the device goes */
