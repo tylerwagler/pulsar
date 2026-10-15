@@ -4219,21 +4219,30 @@ typedef struct {
 int pulsar_sample_dist_build(const float *logits, uint32_t n_vocab,
                           float temperature, int top_k, float top_p, float min_p,
                           pulsar_sample_scratch *scratch, pulsar_sample_dist *out);
-/** L149: smallest min_p the device-prefiltered build accepts. Below it the
- * full path's top_p == 1.0f check is no longer provably redundant (it needs
- * min_p / filtered_sum > 2 ulp(1.0f) with filtered_sum <= PULSAR_N_VOCAB);
- * the production default is 0.05. */
+/** L149: the sparse min-p contract's floor, at every vocabulary (production default min_p 0.05). */
 #define PULSAR_SAMPLE_SPARSE_MINP_MIN 0.02f
-/** ... and the widest vocab that bound was derived for (the caller refuses the
- * sparse path above it; the shape's vocab is a runtime value). */
-#define PULSAR_SAMPLE_SPARSE_VOCAB_MAX 131072u
-static_assert(PULSAR_SAMPLE_SPARSE_MINP_MIN > 2.0f * 5.9604645e-8f * (float)PULSAR_SAMPLE_SPARSE_VOCAB_MAX,
-              "sparse min-p floor must dominate the top_p==1 rounding band over the vocab");
-/** Byte-identical to pulsar_sample_dist_build(row, PULSAR_N_VOCAB, temperature, 0,
- * 1.0f, min_p) when fed the device prefilter's candidates (contract at the
- * definition). Returns 0, `out` untouched, for anything outside it. */
+/** L295 F7 (Tyler 2026-10-14): THE sparse min-p predicate -- the full-nucleus arm of pulsar_sample_dist_build and
+ * the device-prefiltered build (pulsar_sample_dist_build_prefiltered) are taken iff
+ *     min_p >= max(PULSAR_SAMPLE_SPARSE_MINP_MIN, 2.5 * 2^-24 * n_vocab).
+ * The proof it rests on: with top_p == 1.0f the full path's `filtered_sum / sum >= 1.0f` break is redundant with
+ * the min-p cut.  While a further survivor exists, sum >= filtered_sum + min_p (every survivor's prob is >= min_p
+ * times the max's, and the max's is expf(0) == 1), so the ratio is at most 1 - min_p / (filtered_sum + min_p);
+ * L149's bound asks that gap to clear the rounding band under 1.0f, min_p / filtered_sum > 2 * 2^-24, and
+ * filtered_sum <= n_vocab (each prob <= 1), so min_p > 2 * 2^-24 * n_vocab makes the break unreachable before
+ * the cut, and when it fires the next candidate fails min-p anyway; the 2.5 is that bound with a 25% margin.  At n_vocab <= 131072 the
+ * vocabulary term is under 0.0196, so DeepSeek (129280) is exactly the old `min_p >= 0.02` at every min_p; Qwen
+ * (248320) needs 0.037, Inkling (201024) 0.030, a 262144 vocabulary 0.039.  (It replaced a compile-time
+ * PULSAR_SAMPLE_SPARSE_VOCAB_MAX of 131072 that sent every wider vocabulary down the full path.)  Pinned by
+ * pulsar_test --sampler at 129280 / 201024 / 248320 / 262144. */
+static inline bool pulsar_sample_sparse_minp(float min_p, uint32_t n_vocab) {
+    const float band = 2.5f * 5.9604645e-8f * (float)n_vocab;
+    return min_p >= (band > PULSAR_SAMPLE_SPARSE_MINP_MIN ? band : PULSAR_SAMPLE_SPARSE_MINP_MIN);
+}
+/** Byte-identical to pulsar_sample_dist_build(row, n_vocab, temperature, 0, 1.0f, min_p) when fed the device
+ * prefilter's candidates of that row (contract at the definition), for pulsar_sample_sparse_minp(min_p, n_vocab).
+ * Returns 0, `out` untouched, for anything outside it. */
 int pulsar_sample_dist_build_prefiltered(const int32_t *ids, const float *vals, uint32_t n_cand,
-                                         float max_logit, float temperature, float min_p,
+                                         uint32_t n_vocab, float max_logit, float temperature, float min_p,
                                          pulsar_sample_scratch *scratch, pulsar_sample_dist *out);
 void pulsar_sample_dist_free(pulsar_sample_dist *d);
 float pulsar_sample_dist_prob(const pulsar_sample_dist *d, int token);

@@ -2053,7 +2053,7 @@ static int samp_check_prefiltered(const float *logits, uint32_t n, const samp_cf
     }
     if (nc == 0 || nc > CAP) return 0;
     pulsar_sample_dist sp;
-    TEST_ASSERT(pulsar_sample_dist_build_prefiltered(ids, vals, nc, mx, cfg->temp, cfg->min_p,
+    TEST_ASSERT(pulsar_sample_dist_build_prefiltered(ids, vals, nc, n, mx, cfg->temp, cfg->min_p,
                                                      scratch, &sp) == 1);
     if (sp.n != got->n)
         fprintf(stderr, "sampler/prefiltered: shape=%s cfg=%s n %u != %u\n",
@@ -2069,7 +2069,7 @@ static int samp_check_prefiltered(const float *logits, uint32_t n, const samp_cf
             if (ids[c] != drop) { ids[m] = ids[c]; vals[m] = vals[c]; m++; }
         TEST_ASSERT(m == nc - 1);
         pulsar_sample_dist mut;
-        if (pulsar_sample_dist_build_prefiltered(ids, vals, m, mx, cfg->temp, cfg->min_p,
+        if (pulsar_sample_dist_build_prefiltered(ids, vals, m, n, mx, cfg->temp, cfg->min_p,
                                                  scratch, &mut) == 1) {
             TEST_ASSERT(mut.n != got->n ||
                         memcmp(mut.ids, got->ids, (size_t)mut.n * sizeof(int)) != 0);
@@ -2078,6 +2078,87 @@ static int samp_check_prefiltered(const float *logits, uint32_t n, const samp_cf
     }
     pulsar_sample_dist_free(&sp);
     return 1;
+}
+
+/* L295 F7: the sparse min-p predicate (pulsar_sample_sparse_minp) at the vocabularies the families serve --
+ * DeepSeek 129280, Inkling 201024, Qwen 248320, and 262144.
+ *   (a) the proof's premise at every width up to 2^20: the floor dominates the rounding band, 2 * 2^-24 * n_vocab
+ *       (what the retired static_assert said at one width), and is never below PULSAR_SAMPLE_SPARSE_MINP_MIN;
+ *   (b) DeepSeek's path choice is the old one at every min_p (the floor is exactly 0.02 below 131072 + change);
+ *   (c) at each vocabulary, every shape x every top_p == 1 config whose min_p straddles that vocabulary's floor:
+ *       the build is byte-exact vs the re-derived reference (whichever arm the predicate sends it down), the
+ *       device-prefiltered build equals it where the predicate holds and refuses where it does not. */
+static void sampler_sparse_vocabs(void) {
+    const float two_band = 2.0f * 5.9604645e-8f;
+    for (uint32_t n = 1; n <= (1u << 20); n += 1 + n / 64) {
+        const float b = 2.5f * 5.9604645e-8f * (float)n;
+        const float floor_p = b > PULSAR_SAMPLE_SPARSE_MINP_MIN ? b : PULSAR_SAMPLE_SPARSE_MINP_MIN;
+        TEST_ASSERT(floor_p > two_band * (float)n && floor_p >= PULSAR_SAMPLE_SPARSE_MINP_MIN);
+        TEST_ASSERT(pulsar_sample_sparse_minp(floor_p, n) && !pulsar_sample_sparse_minp(nextafterf(floor_p, 0.0f), n));
+    }
+    for (int i = 0; i <= 100000; i++) {   /* (b): DeepSeek's vocabulary, min_p over [0, 1] and around 0.02 */
+        const float mp = i <= 50000 ? (float)i / 50000.0f : 0.02f + (float)(i - 75000) * 1e-8f;
+        TEST_ASSERT(pulsar_sample_sparse_minp(mp, 129280u) == (mp >= PULSAR_SAMPLE_SPARSE_MINP_MIN));
+    }
+    TEST_ASSERT(!pulsar_sample_sparse_minp(NAN, 129280u));
+    static const uint32_t vocabs[] = {129280u, 201024u, 248320u, 262144u};
+    static const float mps[] = {0.02f, 0.025f, 0.03f, 0.035f, 0.038f, 0.04f, 0.05f};
+    static const float temps[] = {1.0f, 0.1f};
+    pulsar_sample_scratch scratch, sparse_scratch;
+    memset(&scratch, 0, sizeof(scratch));
+    memset(&sparse_scratch, 0, sizeof(sparse_scratch));
+    for (uint32_t n : vocabs) {
+        float *logits = (float *)malloc((size_t)n * sizeof(float));
+        TEST_ASSERT(logits != NULL);
+        const float b = 2.5f * 5.9604645e-8f * (float)n;
+        int exact = 0, sparse = 0, full = 0, refused_out = 0;
+        for (int shape = 0; shape <= 12; shape++) {
+            const char *sname = "?";
+            samp_fill_shape(logits, n, shape, &sname);
+            for (float t : temps)
+                for (float mp : mps) {
+                    const samp_cfg cfg = {t, 0, 1.0f, mp, "sparse-vocab"};
+                    pulsar_sample_dist ref, got;
+                    const int ref_rc = ref_sample_dist_build(logits, n, t, 0, 1.0f, mp, &ref);
+                    const int got_rc = pulsar_sample_dist_build(logits, n, t, 0, 1.0f, mp, &scratch, &got);
+                    TEST_ASSERT(ref_rc == got_rc);
+                    if (!got_rc) continue;
+                    if (ref.n != got.n)
+                        fprintf(stderr, "sampler/vocab %u: shape=%s T=%g min_p=%g n %u != %u\n", n, sname, t, mp,
+                                ref.n, got.n);
+                    TEST_ASSERT(ref.n == got.n);
+                    const uint32_t k = ref.n < got.n ? ref.n : got.n;
+                    TEST_ASSERT(memcmp(ref.ids, got.ids, (size_t)k * sizeof(int)) == 0);
+                    TEST_ASSERT(memcmp(ref.probs, got.probs, (size_t)k * sizeof(float)) == 0);
+                    exact++;
+                    if (pulsar_sample_sparse_minp(mp, n)) {
+                        sparse++;
+                        samp_check_prefiltered(logits, n, &cfg, &got, &sparse_scratch, sname);
+                    } else {
+                        /* below the vocabulary's floor the prefiltered build refuses: the caller reads the row */
+                        full++;
+                        int32_t id0 = (int32_t)got.ids[0];
+                        const float v0 = logits[id0];
+                        pulsar_sample_dist nd;
+                        memset(&nd, 0, sizeof(nd));
+                        TEST_ASSERT(pulsar_sample_dist_build_prefiltered(&id0, &v0, 1, n, v0, t, mp, &sparse_scratch,
+                                                                         &nd) == 0);
+                        TEST_ASSERT(nd.n == 0);
+                        refused_out++;
+                    }
+                    pulsar_sample_dist_free(&ref);
+                    pulsar_sample_dist_free(&got);
+                }
+        }
+        printf("  sampler: vocab %u: sparse floor %.5f; %d builds byte-exact vs the reference (%d in the sparse "
+               "contract, %d below its floor, the prefiltered build refusing all %d)\n", n,
+               b > PULSAR_SAMPLE_SPARSE_MINP_MIN ? b : PULSAR_SAMPLE_SPARSE_MINP_MIN, exact, sparse, full,
+               refused_out);
+        TEST_ASSERT(sparse > 0 && (n <= 131072u || full > 0));
+        free(logits);
+    }
+    pulsar_sample_scratch_free(&scratch);
+    pulsar_sample_scratch_free(&sparse_scratch);
 }
 
 static void test_sampler_dist_equivalence(void) {
@@ -2154,7 +2235,7 @@ static void test_sampler_dist_equivalence(void) {
             }
             /* L149: the device-prefiltered build must be the same distribution */
             if (cfg->temp > 0.0f && cfg->top_k <= 0 && cfg->top_p == 1.0f &&
-                cfg->min_p >= PULSAR_SAMPLE_SPARSE_MINP_MIN && cfg->min_p <= 1.0f)
+                pulsar_sample_sparse_minp(cfg->min_p, n) && cfg->min_p <= 1.0f)
                 sparse_checked += samp_check_prefiltered(logits, n, cfg, &got, &sparse_scratch, sname);
 
             /* (a) the distribution itself, bit-for-bit */
@@ -2299,6 +2380,7 @@ static void test_sampler_dist_equivalence(void) {
     printf("  sampler: %d shape x config combinations byte-exact vs re-derived reference; "
            "plain == draw(build) on %d fixed-seed trials; %d degenerate combos refused\n",
            checked, identity_trials, refused);
+    sampler_sparse_vocabs();
 }
 
 
