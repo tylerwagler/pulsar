@@ -484,7 +484,7 @@ int main(void) {
                 prc |= gemv_one(EXL3_ARM_DOWN, sd.table, 6, d_am2, d_ids, d_ids, d_bounds, d_zd2, K, M, r.n_assign, E, &dp);
                 prc |= ds4_exl3_moe_sum_launch(d_o0, d_zd2, d_sel, sd.table, M, K, n_slot, n_tok, d_nf, 0x501u, 0);
                 prc |= ds4_exl3_moe_sum_launch(d_o1, dp.z[0], d_sel, sd.table, M, K, n_slot, n_tok, d_nf, 0x501u, 0, nullptr,
-                                               nullptr, dp.splits, dp.split_stride);
+                                               dp.splits, dp.split_stride);
                 std::vector<float> o0((size_t)n_tok * K), o1(o0.size());
                 CUDA_OK(cudaDeviceSynchronize());
                 CUDA_OK(cudaMemcpy(o0.data(), d_o0, o0.size() * 4, cudaMemcpyDeviceToHost));

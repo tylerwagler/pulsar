@@ -16,6 +16,15 @@
 
 #include "engine/exl3_trellis.h"   /* the scales layout */
 #include "exl3_moe_prefill.cuh"     /* exl3_moe_partials */
+#include "cuda/pulsar_cuda_router.h" /* PULSAR_ROUTER_SHARED_MAX */
+
+/** The shared experts' outputs the sum adds after the routed sum, in order: out += scale[j][tok] * y[j] (scale 1
+ *  when scale[j] is NULL), j = 0 .. n-1. */
+struct exl3_moe_shared_add {
+    const float *y[PULSAR_ROUTER_SHARED_MAX];
+    const float *scale[PULSAR_ROUTER_SHARED_MAX];
+    int n;
+};
 
 /** The EXL3 SwiGLU fold: per pair (pair = tok * n_expert + slot, expert =
  *  selected[pair]) and per 128-block of mid: y_g = svh_g * H(z_g),
@@ -69,10 +78,10 @@ int ds4_exl3_moe_fold_fused_launch(
 /** The EXL3 sum: out[tok][o] = sum over slots (in slot order) of
  *  svh_d * H(z_d[pair]) -- the down projection's output rotation folded into
  *  the fixed-order reduction.  A non-finite sum records nf_code in *nf_flag
- *  (first writer wins), the L188 contract.  out_dim % 128 == 0.  A riding shared
- *  expert's output is added after the routed sum (the flag sees the routed sum
- *  alone): out = sum + shared_scale[tok] * shared_y (scale 1 when NULL).  z_splits > 1: down_z is a decode
- *  launch's K-split partials, z_split_stride floats apart, added in split order first. */
+ *  (first writer wins), the L188 contract.  out_dim % 128 == 0.  Riding shared
+ *  experts' outputs are added after the routed sum (the flag sees the routed sum
+ *  alone): out = sum + scale_0[tok] * y_0 + scale_1[tok] * y_1 + ... (`shared`, NULL = none).  z_splits > 1:
+ *  down_z is a decode launch's K-split partials, z_split_stride floats apart, added in split order first. */
 int ds4_exl3_moe_sum_launch(
     float         * out,
     const float   * down_z,
@@ -85,7 +94,6 @@ int ds4_exl3_moe_sum_launch(
     uint32_t      * nf_flag,
     uint32_t        nf_code,
     cudaStream_t    stream,
-    const float   * shared_y = nullptr,
-    const float   * shared_scale = nullptr,
+    const exl3_moe_shared_add * shared = nullptr,
     int             z_splits = 1,
     int64_t         z_split_stride = 0);
