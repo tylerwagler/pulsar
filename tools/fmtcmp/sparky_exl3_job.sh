@@ -4,7 +4,7 @@
 #   gpuq submit --class short --timeout 20m --mem 90G --label fmtcmp --wait -- \
 #       ~/fmtcmp/repo/tools/fmtcmp/sparky_exl3_job.sh PACK ~/fmtcmp/caps/exl3-k4 [BUDGET_S]
 #
-# capture_exl3.py over the frozen suite, --selfcheck on the first job of a pack (the chunk-plumbing proof; a pack
+# capture_exl3.py over the frozen suite (speed.json first, once), --selfcheck on the first job of a pack (the chunk-plumbing proof; a pack
 # that fails it is not captured), resumable per document; it stops starting documents 60 s before the budget.
 # PY defaults to the exllamav3 fork's venv on Sparky (~/inkling/.venv; the fork at ~/inkling/exllamav3).
 set -euo pipefail
@@ -23,6 +23,6 @@ SC=()
 [ -e "$OUT/.selfcheck-pass" ] || SC=(--selfcheck)
 rc=0
 timeout --signal=TERM $(( BUDGET - 20 )) "$PY" "$HERE/capture_exl3.py" --model "$PACK" --suite "$SUITE" \
-  --out "$OUT" --deadline $(( T0 + BUDGET - 60 )) "${SC[@]}" || rc=$?
+  --out "$OUT" --deadline $(( T0 + BUDGET - 60 )) --speed "${SC[@]}" || rc=$?
 if [ "$rc" = 0 ] && [ ${#SC[@]} -gt 0 ]; then touch "$OUT/.selfcheck-pass"; fi
 exit "$rc"

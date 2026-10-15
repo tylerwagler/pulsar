@@ -99,6 +99,56 @@ def selfcheck(model, cache, pages, ids_list, n, chunk, vocab):
     return ok
 
 
+def speed(config, model, cache, pages, suite, man, out_path):
+    """The NVFP4 arms' speed.py numbers, measured through exllamav3: prefill tok/s at 4k / 32k (one chunked cached
+    pass at 2048-token chunks, wall time incl. logits of the last chunk only via last_tokens_only), decode tok/s at 1
+    and 4 streams through exllamav3's Generator (greedy, 256 tokens, stop conditions off)."""
+    from exllamav3 import Generator, Job, Tokenizer
+    from exllamav3.generator.sampler import ArgmaxSampler
+    by = {f["name"]: f for f in man["files"]}
+    pool = json.load(open(os.path.join(suite, by["story"]["tokens"]))) + \
+        json.load(open(os.path.join(suite, by["code"]["tokens"])))
+    res = {"engine": "exllamav3", "prefill": {}, "decode": {}}
+    for n in (4096, 32768):
+        if n > pages:
+            continue
+        rates = []
+        for rep in range(3):
+            ids = torch.tensor([pool[:n]], dtype=torch.long)
+            params = {"attn_mode": "flash_attn", "cache": cache, "past_len": 0, "batch_shape": (1, pages),
+                      "last_tokens_only": 1}
+            torch.cuda.synchronize()
+            t0 = time.perf_counter()
+            for s in range(0, n, 2048):
+                params["past_len"] = s
+                model.forward(ids[:, s:s + 2048], params)
+            torch.cuda.synchronize()
+            for rs in params.get("recurrent_states") or []:
+                rs.free()
+            if rep:                                     # the first pass warms the kernels
+                rates.append(n / (time.perf_counter() - t0))
+        res["prefill"][n] = {"tok_s": sorted(rates)[len(rates) // 2], "runs": rates}
+        print(f"[speed] prefill {n}: {res['prefill'][n]['tok_s']:.0f} tok/s", file=sys.stderr)
+    gen = Generator(model=model, cache=cache, tokenizer=Tokenizer.from_config(config))
+    for streams in (1, 4):
+        jobs = [Job(input_ids=torch.tensor([pool[i * 512:(i + 1) * 512]], dtype=torch.long), max_new_tokens=256,
+                    sampler=ArgmaxSampler(), stop_conditions=[]) for i in range(streams)]
+        for j in jobs:
+            gen.enqueue(j)
+        first, last, ntok = None, None, 0
+        while gen.num_remaining_jobs():
+            for r in gen.iterate():
+                if r.get("stage") == "streaming" and r.get("token_ids") is not None:
+                    now = time.perf_counter()
+                    first = first or now
+                    last = now
+                    ntok += r["token_ids"].numel()
+        res["decode"][streams] = {"aggregate_tok_s": (ntok - streams) / (last - first), "tokens": ntok}
+        print(f"[speed] decode {streams} stream(s): {res['decode'][streams]['aggregate_tok_s']:.1f} tok/s",
+              file=sys.stderr)
+    json.dump(res, open(out_path, "w"), indent=1)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", required=True, help="EXL3 pack directory")
@@ -107,6 +157,7 @@ def main():
     ap.add_argument("--chunk", type=int, default=2048)
     ap.add_argument("--only", default=None, help="comma list of document names")
     ap.add_argument("--selfcheck", action="store_true")
+    ap.add_argument("--speed", action="store_true", help="also write speed.json (once per output dir)")
     ap.add_argument("--selfcheck-len", type=int, default=1024)
     ap.add_argument("--selfcheck-chunk", type=int, default=160)
     ap.add_argument("--deadline", type=float, default=0, help="unix time: stop before starting a doc past it")
@@ -121,7 +172,8 @@ def main():
     os.makedirs(a.out, exist_ok=True)
 
     t0 = time.time()
-    config, model, cache, pages = load_model(a.model, max_len)
+    # room for the 32k speed prompt and four 768-token decode streams as well as the longest document
+    config, model, cache, pages = load_model(a.model, max(max_len, 32768) + 4096)
     vocab = config.vocab_size
     print(f"[exl3] loaded {a.model} in {time.time() - t0:.0f}s; vocab {vocab}, cache {pages} tokens",
           file=sys.stderr)
@@ -131,6 +183,8 @@ def main():
             first = json.load(open(os.path.join(a.suite, man["files"][0]["tokens"])))
             if not selfcheck(model, cache, pages, first, min(a.selfcheck_len, len(first)), a.selfcheck_chunk, vocab):
                 sys.exit(1)
+        if a.speed and not os.path.exists(os.path.join(a.out, "speed.json")):
+            speed(config, model, cache, pages, a.suite, man, os.path.join(a.out, "speed.json"))
         for d in docs:
             outp = os.path.join(a.out, d["name"] + ".jsonl")
             if os.path.exists(outp):
