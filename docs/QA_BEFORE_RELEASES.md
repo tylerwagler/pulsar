@@ -28,7 +28,8 @@ and any non-default flags for every manual run.
 
 - Run the default suite:
   `make test` (also the first entry of `make gates`, as `unit-test-gate`,
-  since 2026-09-03 -- a battery run covers it).
+  since 2026-09-03 -- a battery run covers it, as `pulsar_test --gating` since
+  2026-10-14: every test but the informational `logprob-vectors`).
 - Run the CUDA smoke regression:
   `make cuda-regression`.
 - Run the vector checks explicitly after any tokenizer, template, KV, kernel,
@@ -105,6 +106,146 @@ model.  Record pass/fail against the release commit:
 - `make cuda-mixed-prefill-gate`, `make cuda-mixed-neutrality-gate` — mixed
   decode+prefill batching neutrality.
 - `make cuda-spec-sampling-gate` — speculative-sampling chi-square exactness.
+
+### Battery wall time
+
+The one home for what `make gates` costs and why (Phase 5 #39: back under ~35 min).  The battery prints
+its own table at the end -- `seconds per gate` in the runner summary and in the GATE SUMMARY -- so every
+battery log is a fresh measurement; this section records the levers.
+
+**Before (2026-10-13, 1b33c1d4, sparky `~/qland2-battery-1013-2134`):** 3,324 s wall, of which 3,240 s
+suite: the runner 2,629 s (52 sub-gates, 9 engine opens), the serial GPU targets in front of it 611 s.
+The slowest sub-gates:
+
+| s | gate | where it went |
+|---:|---|---|
+| 392 | cuda-decode-reference-gate-story | a model reload, then 48 prefills from 0 (6 depths x 4 widths x wide/serial; 380k tokens) |
+| 380 | cuda-chunk-neutrality-gate | 17 schedules from 0; schedule K's 4,600 single-row decode steps are ~230 s of it |
+| 262 | cuda-regression (make target) | ten model-free kernel gates, one after another |
+| 231 | unit-test-gate (make target) | the pulsar_test compile (~40 s) and FIVE model loads (shared, logprob-vectors, tensor-equivalence x2, the image tests re-opening the shared one) |
+| 225 | cuda-chunk-neutrality-gate [Qwen4-exp] | as above on the hosted Qwen |
+| 171 / 150 | cuda-spec-sampling-gate [Qwen4-exp] / DeepSeek | 1,250 trajectories per mode (L163) |
+| 107 | cuda-accounting-gate | prefill to 64k in three levels |
+| 78 | cuda-head-graph-replay-gate | three 120-step runs (eager, graphs, eager) |
+| 70 | cuda-prefill-gate | the byte gate's five depths, cold |
+| 67 | cuda-decode-reference-gate-code | as the story gate, 3 depths |
+| 66 / 43 | cuda-row-neutrality-gate-deeper [Qwen4-exp] / DeepSeek | ~10k-token probe |
+| 65 | qwen-family-gate-device (make target) | seven zero-weight containers, the loader refusals, one device session |
+| 49 / 46 | session-contract-gate [Qwen4-exp] / DeepSeek | |
+| 47, 30, 30 | cuda-dspark-batch-gate-wide / -depth4 / -depth1 | each a full model reload for its draft depth (~22 s of each) |
+| 45 / 41 | cuda-reference-gate-story [Qwen4-exp] / DeepSeek | |
+| 42, 29 | cuda-multiseq-gate-nodspark [Qwen4-exp] / DeepSeek | the drafter-off engine's open |
+| 20 | cuda-tp-head-split-gate | its own model load (drafter off), and one more for the gates after it |
+
+**2026-10-14 (work/battery-trim).  No release-blocking gate left the battery; one informational test did
+(`pulsar_test --logprob-vectors`, below):**
+- *Engine opens 9 -> 4* (two per hosted model).  The draft depth is a session-start field the broker sets
+  on the live engine (`spec_depth_shareable`, tests/gates_runner.cpp), so the three dspark depth legs run on
+  the default engine; `cuda-tp-head-split-gate` moved from the end of the default group to the end of the
+  drafter-off group whose configuration it has, so it no longer costs its own load AND the default
+  engine's reload for the decode-reference gates.
+- *Decode-reference gates: one cold prefill per depth.*  Every other run restores the grid checkpoint it
+  left and prefills the rest -- the cold computation (L264) -- announced per depth
+  (`[resume] depth D: ... resumed from grid checkpoint G`) and ASSERTED: the depth's widest wide run is
+  computed on the cold prefill and again over a resumed one, and must be byte-identical (it is, at
+  every depth of both blobs).
+- *cuda-regression runs its ten model-free gates concurrently* (`make -O`: each one's output stays together).
+  They are host-bound -- measured alone 2026-10-14: exl3_moe_prefill 114 s (113 s of it single-threaded user
+  time; its W_hat decode now runs on 16 threads -- the same bytes), qsa_attn 46, qwen_s4 36, exl3_moe_epilogue
+  30, exl3_dense 25, the other five 7 together; 258 s in series.  None grades a time.
+- *unit-test-gate runs `pulsar_test --gating`*: every test but the informational `logprob-vectors` (it
+  can never fail the suite; `make test` still runs it), and the image tests moved in front of the two
+  own-engine tests so they reuse the shared engine.  Five model loads -> three.  pulsar_test, pulsar,
+  pulsar_agent_test and the cuda-regression binaries are `gates` prerequisites, built in the one parallel
+  make before the timed loop.
+- **Measured per piece** (2026-10-14, a targeted run on sparky, not a battery: the changed runner gates on
+  both hosted models, cuda-regression and unit-test-gate): decode-reference story 392 -> 93 s, code 67 -> 31;
+  dspark-batch depth1 30 -> 8, depth4 30 -> 9, wide 47 -> 25; tp-head-split 20 -> 0; cuda-regression 262 -> 77;
+  unit-test-gate 231 -> 167 (its compile now in the prerequisite build); 4 engine opens for two hosted models.
+- **Predicted battery: ~2,670 s (44 min)**, from 3,324: the runner ~2,210 s, the serial front ~370 s, the
+  build ~90 s.  The first battery after this lands measures it (its GATE SUMMARY).
+
+**Not cut, and what each would take** (each removes coverage or changes a gate's premise -- a decision,
+not hygiene):
+- cuda-chunk-neutrality-gate schedule K's 4,600 single-row decode steps past the raw ring (~230 s DeepSeek;
+  on Qwen schedule P owns it, ~140 s): no compared row reads those rows, so 16 teacher-forced rows a step would
+  do -- but neither family's session supports it today.  Tried 2026-10-14 (the server's fold: carry saved,
+  `decode_mixed` ALL_ROWS steps, carry restored, `pulsar_session_note_committed_tokens`): on DeepSeek's
+  classic (unpooled) session the noted view does not agree with the state, so the payload K shares refuses
+  ("no valid checkpoint to snapshot"); on Qwen an ALL_ROWS step is a verify step that does not advance the
+  bank, so the next step is refused ("not its run's next position").  An engine API for a teacher-forced
+  multi-row decode on a classic session is the lever (~-300 s across both families).
+- cuda-accounting-gate's 64k peak (107 s): levels 8k/16k/32k would halve it.
+- cuda-head-graph-replay-gate's run C (26 s): it only proves eager determinism, the premise of B == A.
+- The spec-sampling oracles' 1,250 trajectories per mode (L163 already halved them).
+
+**Outside `make gates`:** the landing scripts' extra legs (`~/*-battery.sh` after `make gates`:
+`session-contract-gate-qwen`, `cuda-chunk-neutrality-gate` and `cuda-spec-sampling-gate` on
+`$(QWEN_GATE_MODEL)`, ~12 min on 2026-10-13) repeat what the runner already runs on the hosted Qwen
+(`session-contract-gate [Qwen4-exp]`, `cuda-chunk-neutrality-gate [Qwen4-exp]`,
+`cuda-spec-sampling-gate [Qwen4-exp]`, the last at the battery's 1,250 trajectories).  Drop them; keep the
+vision, image-smoke and live / abandon server legs, which the runner does not cover.
+
+### The GPU queue (gpuq)
+
+Sparky's GPU is shared through `gpuq` (`tools/gpuq/`, installed as `~/bin/gpuq`, daemon `gpuq.service`, a
+systemd user unit; spool `~/.gpuq/`).  It replaces `tools/gpu-run.sh` and `tools/gpu-lock-status.sh` (#43)
+and a bare `flock -o ~/gpu.lock`, which is not FIFO (seven waiters ran in random order on 2026-10-14), knows
+no job classes and no memory, and shows little.
+
+    gpuq submit --class short --timeout 20m --wait -- make gates-dev PATHS=src/engine/session.cpp
+    gpuq submit --class quiet --timeout 75m --wait -- ~/qland3-battery.sh <sha>     # a battery
+    gpuq submit --class long --timeout 20h --mem 40G --min-hold 1h --yield-grace 90m \
+         --label inkling-k3 -- bash ~/inkling/runs/k3_slice.sh                      # prints the job id
+    gpuq status [--json]    gpuq log [-f] ID    gpuq cancel ID
+
+- **Classes, in priority order.**  `quiet` > `short` > `long`; FIFO within a class; one job at a time.
+  `short`: timeout at most 20m (refused otherwise; default 20m).  `quiet`: the exclusive box for batteries
+  (default timeout 2h) -- it starts when nothing runs, nothing is admitted while it runs, and the daemon
+  creates `~/BATTERY_RUNNING` before it and removes it after.  `long` (default timeout 24h): preemptible.
+  Once `--min-hold` (default 5m) has passed and a quiet or short job waits, the daemon sends SIGUSR1 to the
+  job's process group, once.  The job exits **75 (EX_TEMPFAIL)** at its next checkpoint: re-queued with the
+  same cmd, `GPUQ_ATTEMPT` + 1, and it resumes when no quiet or short job waits.  Any other exit is final.
+  Not exited within `--yield-grace` (default 20m): logged once, and the daemon keeps waiting -- it never
+  kills for a yield.  SIGUSR1's default action terminates a process, so submit as `long` only a job that
+  handles it.  `gpuq status` shows "yield requested at" from the SIGUSR1 to the job's exit.
+- **The job** runs in its cwd (`--cwd`, default the submitter's), with the submitter's environment plus
+  `GPUQ_JOB_ID`, `GPUQ_CLASS`, `GPUQ_ATTEMPT`, `GPUQ_RESOURCES`; stdout+stderr to `~/.gpuq/logs/ID.log`
+  (`--wait` streams it).  It gets no lock fd.  Timeout is wall time per attempt: SIGTERM to the process
+  group, SIGKILL 30 s later.  On any exit every process still carrying the attempt's environment token (a
+  daemonized child included) is killed before the lock is released.
+- **Admission.**  Head of the queue, no foreign `~/BATTERY_RUNNING` (a legacy battery), `~/gpu.lock` taken,
+  then `sync` + drop_caches (once per admission; the page cache masks GB10 unified-memory pressure;
+  `GPUQ_DROP_CACHES=0` in the unit turns it off), then MemAvailable >= `--mem` (default 8G short, 16G
+  otherwise) + a 6G margin.  A head job short of memory waits holding the lock.
+- **Exit codes of `--wait`:** the job's own; 124 timeout; 125 cancelled (also when the waiter itself gets
+  INT/TERM/HUP -- the job is tied to its waiter, like a `flock` child); 120 lost (its shim vanished while
+  the daemon was down); 127/126 cmd not found / not executable; 2 usage.  `gpuq status` exits 1 on an
+  anomaly: an orphaned lock (a dead holder, the lock kept by an inherited fd) or a GPU process that is
+  neither the running job's nor under a legacy holder.
+- **Legacy callers.**  While a job runs its shim holds `~/gpu.lock` (flock), so `flock -o ~/gpu.lock`
+  callers still serialize with gpuq; a legacy holder makes gpuq wait (it joins the kernel's queue like any
+  flock waiter, so it is not ahead of legacy waiters), and `gpuq status` shows it as LEGACY HOLDER with the
+  legacy waiters.  Migrate: a battery script's `flock -o ~/gpu.lock -c 'timeout 5400 ~/x-battery.sh'`
+  becomes `gpuq submit --class quiet --timeout 90m --wait -- ~/x-battery.sh` (gpuq owns
+  `~/BATTERY_RUNNING` now; a script's own `touch` + `trap 'rm -f'` is harmless and can go.  A marker gpuq did
+  not create -- a legacy battery's -- blocks every admission until it is removed); an agent's
+  `flock -o ~/gpu.lock -c 'timeout 1200 cmd'` becomes `gpuq submit --class short --timeout 20m --wait -- cmd`.
+- **Robustness.**  The daemon restarts without touching jobs (`KillMode=process`): each attempt runs under
+  a shim that holds the lock and writes the outcome, and the next daemon re-adopts live shims, finalizes
+  those that finished while it was down, and marks the rest lost (killing what is left of them).  Every
+  state file is written atomically; every scheduling decision is in `~/.gpuq/gpuq.log` and the journal.
+  The user unit needs `loginctl enable-linger claude` to outlive the last login session.
+- **Tests.**  `python3 tools/gpuq/test_gpuq.py -v` on Sparky (scratch in `~/gpuq-test/`): a real daemon per
+  test in test mode (`GPUQ_TEST=1` with its own `GPUQ_HOME`, `GPUQ_LOCK`, `GPUQ_MARKER`, a fake
+  `GPUQ_MEMINFO` and drop_caches command), dummy jobs, no GPU, ~1 min.  Install: `tools/gpuq/install.sh`.
+- **Spool format, version 1, and the v2 plan.**  Every job record, outcome and the daemon state carry
+  `"version": 1`, and every job names its resources (`"resources": ["sparky:gpu0"]`, from the hostname;
+  `--gpus gpu0` or `--gpus sparky:gpu0`).  The lock and the memory pool are per resource; v1 owns one
+  resource per host and refuses any other by name.  v2 (not built): a coordinator reads several hosts'
+  spools over ssh (`~/.gpuq/jobs/*.json`, `state.json`) and adds gang jobs that need every listed resource
+  at once (the two-Spark pair: `--gpus sparky:gpu0,spark2:gpu0`), taking each host's lock before starting.
+
 
 ## 3. Flash Inference Path
 

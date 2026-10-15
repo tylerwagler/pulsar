@@ -557,6 +557,34 @@ static void dir_push(st_dir *d, const char *gguf_name, uint32_t type,
     t->ext_size = shard_size;
 }
 
+/* L295 E1: the bind record of the declaration at `p` (a pulsar.tensors value or a pulsar.experts entry) onto the
+ * entry just pushed: `role` / `block` strings (kept for the model's lifetime, as the gguf_name is), `layer` /
+ * `index` non-negative integers.  Each is optional; one that is present but malformed is refused. */
+static void st_bind_record(pulsar_tensor *t, const char *p, const char *what) {
+    const char *q = p;
+    char *str = NULL;
+    if (st_obj_key(&q, "role")) {
+        if (!json_string(&q, &str)) st_die("safetensors: %s: its bind record's role is not a string", what);
+        t->bind_role = pulsar_str{str, strlen(str)};
+    }
+    q = p;
+    if (st_obj_key(&q, "block")) {
+        if (!json_string(&q, &str)) st_die("safetensors: %s: its bind record's block is not a string", what);
+        t->bind_block = pulsar_str{str, strlen(str)};
+    }
+    struct { const char *key; int32_t *out; bool *has; } nums[2] = {
+        {"layer", &t->bind_layer, &t->has_bind_layer}, {"index", &t->bind_index, &t->has_bind_index}};
+    for (const auto &n : nums) {
+        q = p;
+        double v = 0.0;
+        if (!st_obj_key(&q, n.key)) continue;
+        if (!json_number(&q, &v) || v < 0 || v > 2147483647.0 || v != (double)(int32_t)v)
+            st_die("safetensors: %s: its bind record's %s is not a non-negative integer", what, n.key);
+        *n.out = (int32_t)v;
+        *n.has = true;
+    }
+}
+
 static void st_add_declared(st_dir *d, st_shard *s) {
     const char *md = st_meta_get(s, "pulsar.tensors");
     if (!md) return;
@@ -612,6 +640,7 @@ static void st_add_declared(st_dir *d, st_shard *s) {
         }
         dir_push(d, gguf_name, type, dim, nd, s->map, s->size,
                  s->buf_off + ft->off0, want);
+        st_bind_record(&d->v[d->n - 1], p, gguf_name);
         free(hf);
         free(layout);
 
@@ -734,6 +763,7 @@ static void st_add_expert_stacks(st_dir *d, st_shard *s) {
         }
         dir_push(d, gguf_name, type, dim, 3, s->map, s->size,
                  s->buf_off + first_off, n_experts * expert_bytes);
+        st_bind_record(&d->v[d->n - 1], p, gguf_name);
         free(part);
         free(layout);
         free(entry_name);

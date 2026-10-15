@@ -45,6 +45,7 @@ __pycache__/
 /tests/router_gate
 /tests/bf16_rows_gate
 /tests/qwen_family_gate
+/tests/state_kinds_gate
 /tests/fixed_tile_gemm_probe
 /tests/nt_crossover_sweep
 /tests/tp_identity_test
@@ -68,6 +69,7 @@ __pycache__/
 /tests/resume_suffix_probe
 /tests/token_seam_gate
 /tests/spec_sampling_gate
+/tests/spec_sampling_gate_wide
 /tests/attn_pack_fixture_test
 /tests/attn_pack_gate
 /gguf-tools/test_quants
@@ -168,7 +170,13 @@ tests/dspark_batch_gate
 /tests/qsa_attn_gate
 /tests/qsa_layer_replay
 /tests/qsa_attn_bench
+/tests/gqa_attn_gate
+/tests/gqa_attn_bench
+/tests/sconv_gate
+/tests/sconv_bench
+/tests/head_gate
 /tests/qwen_chat_gate
+/tests/inkling_chat_gate
 tests/api-golden/out.txt
 tests/sse-golden/out.txt
 /tests/comp_state_gate
@@ -180,6 +188,7 @@ tests/sse-golden/out.txt
 /tests/decode_reference_gate
 /tests/verify_width_probe
 /tests/loader_open
+/tests/inkling_family_gate
 /tests/prefill_chunk_census_probe
 /tests/vision_merge_gate
 /tests/vision_tower_gate

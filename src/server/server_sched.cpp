@@ -1430,8 +1430,8 @@ static bool slot_is_batchable_decode(const session_slot *sl) {
  * (pulsar_engine_has_spec_rounds), every decoder speculates (spec_enabled: a
  * logprobs request does not), none sits in the plain multiseq batch, and the
  * decoders are no more than one shared verify forward carries, one base row each
- * (pulsar_engine_fused_heads_max, the family's verify width -- L284: DeepSeek 32,
- * Qwen 16; the allocator shortens the drafts to fit, spec_alloc_rows);
+ * (pulsar_engine_fused_heads_max, the family's verify width -- L284: DeepSeek 32;
+ * L288 C1: Qwen 32 too; the allocator shortens the drafts to fit, spec_alloc_rows);
  * the plain batched lane (2) otherwise; the classic lane (1) with no pool.  Lane 3
  * keeps the spec_decode counters advancing; lane 2 does not.  Where lane 3 COULD
  * carry every decoder (server_spec_lane_carries), whether it does is priced
@@ -1466,7 +1466,7 @@ static bool server_spec_lane_carries(bool spec_rounds, uint32_t verify_rows, ses
  * A prediction only ever starts a MEASUREMENT (a probe of the other lane); the decoders change lanes on
  * measured prices at their N.  A linear fit extrapolated past the rows it has seen was 15% off on DeepSeek at
  * N8 (spec priced 84 tok/s against the 99.5 it serves) and moved eight decoders to a slower plain lane.
- * No family constant enters: Qwen's 16-row and DeepSeek's 32-row widths, their drafters' acceptance and their
+ * No family constant enters: the families' verify widths, their drafters' acceptance and their
  * kernels' costs are all in the measured numbers.  (L284 specrows measured why it must be priced: Qwen's spec
  * lane at ~0.55 acceptance lost to plain at N >= 3, 64.6 vs 67.2 tok/s at N3 and 76.0 vs 91.1 at N6, where a
  * lone DeepSeek stream gains 11% from it.)
@@ -1642,6 +1642,68 @@ static int lane_price_pick(lane_price *lp, const pulsar_lane_cost *plain, const 
     }
     lp->why = "priced";
     return inc;
+}
+
+/* L288 C1: the verify width for `n` decoding banks -- the decode block `blk` or the whole width `full`, measured (see
+ * width_price).  One decoder, or as many as the block holds base rows for, have no choice (the whole width).  At a
+ * count: the width in force is measured first (LANE_PRICE_PROBE_STEPS rounds), then the other is probed as long, and
+ * the faster by LANE_PRICE_MARGIN holds; every LANE_PRICE_REPROBE_STEPS rounds the other is probed again. */
+static uint32_t width_price_pick(width_price *wp, int n, uint32_t blk, uint32_t full) {
+    if (!wp->init) {
+        for (int i = 0; i < WIDTH_PRICE_N; i++) { wp->probe[i] = -1; wp->force[i] = 1; }
+        wp->init = true;
+    }
+    if (n <= 1 || n >= WIDTH_PRICE_N || full <= blk || (uint32_t)n >= blk) {
+        wp->why = "no choice";
+        return full;
+    }
+    auto price = [&](int w) {
+        return wp->steps[n][w] >= LANE_PRICE_PROBE_STEPS && wp->ms[n][w] > 0.0 ? 1000.0 * wp->tok[n][w] / wp->ms[n][w]
+                                                                               : 0.0;
+    };
+    const int inc = wp->force[n], other = 1 - inc;
+    const uint32_t at = wp->rounds[n];
+    auto event = [&]() {   /* a probe begins or ends: the caller announces it, with the prices it weighed */
+        wp->ann_n = n;
+        wp->ann_blk = price(0);
+        wp->ann_whole = price(1);
+    };
+    if (wp->probe[n] >= 0) {
+        if (at - wp->mark[n] < LANE_PRICE_PROBE_STEPS) {
+            wp->why = "measuring";
+            return wp->probe[n] ? full : blk;
+        }
+        wp->probe[n] = -1;
+        wp->mark[n] = at;
+        if (price(other) > price(inc) * (1.0 + LANE_PRICE_MARGIN)) {
+            wp->force[n] = (uint8_t)other;
+            wp->why = "measured faster";
+        } else {
+            wp->why = "measured: the width in force holds";
+        }
+        event();
+        return wp->force[n] ? full : blk;
+    }
+    if (price(inc) > 0.0 && (price(other) <= 0.0 || at - wp->mark[n] >= LANE_PRICE_REPROBE_STEPS)) {
+        wp->probe[n] = (int8_t)other;
+        wp->mark[n] = at;
+        wp->why = price(other) <= 0.0 ? "no price here: measuring" : "re-measuring";
+        event();
+        return other ? full : blk;
+    }
+    wp->why = price(inc) > 0.0 ? "priced" : "measuring the width in force";
+    return inc ? full : blk;
+}
+
+/* One decode-only spec round at `n` decoders and `width` (the whole width or not): `tokens` committed in `ms`. */
+static void width_price_observe(width_price *wp, int n, bool whole, int tokens, double ms) {
+    if (n <= 0 || n >= WIDTH_PRICE_N || tokens < 0 || !(ms > 0.0)) return;
+    const int w = whole ? 1 : 0;
+    const double a = wp->steps[n][w] ? (double)LANE_PRICE_ALPHA : 1.0;
+    wp->tok[n][w] += a * ((double)tokens - wp->tok[n][w]);
+    wp->ms[n][w] += a * (ms - wp->ms[n][w]);
+    wp->steps[n][w]++;
+    wp->rounds[n]++;
 }
 
 static int server_pick_decode_lane(int pool_banks, bool spec_rounds, uint32_t verify_rows,
@@ -2430,6 +2492,8 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n, int quantum_
          * sit a whole bank out of the round (assemble's SKIPPED). */
         int k_alloc[PULSAR_SESSION_POOL_CAP];
         bool k_overflow = false;
+        uint32_t width = heads_max;   /* L288 C1: the verify width this round carries (below) */
+        int n_live_w = 0;
         {
             float surv[PULSAR_SESSION_POOL_CAP][16];
             uint32_t npend[PULSAR_SESSION_POOL_CAP];
@@ -2466,8 +2530,23 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n, int quantum_
             const pulsar_lane_cost cost = pulsar_engine_lane_cost(s->engine, PULSAR_LANE_SPEC);
             const float tok_ms = pulsar_engine_spec_token_ms(s->engine);   /* L288: the engine's, the drafter's too */
             const float thr = cost.valid && tok_ms > 1.0f ? (float)cost.row_us / (1000.0f * tok_ms) : 0.0f;
+            /* L288 C1: the width -- the decode block or the whole verify width, measured per decoder count
+             * (width_price_pick); a round a prompt finishes in keeps the whole width (its head rows ride in it), and
+             * a tensor-parallel group the whole width always (its ranks draft against the same width).  The drafter
+             * budgets the next round's chains against it (pulsar_engine_set_spec_width). */
+            n_live_w = n_live;
+            if (n_fin == 0 && !pulsar_engine_is_tp(s->engine))
+                width = width_price_pick(&s->w_width_price, n_live, PULSAR_GPU_MNEUTRAL_ROWS_MAX, heads_max);
+            (void)pulsar_engine_set_spec_width(s->engine, width);
+            width_price &wp = s->w_width_price;
+            if (wp.ann_n > 0) {   /* rule 5: a probe's start and its verdict, with the prices weighed */
+                server_log(PULSAR_LOG_DEFAULT, "pulsar-server: spec verify width at %d decoders: %u rows (%s; the %u-row "
+                           "block %.1f vs the whole %u rows %.1f tok/s)", wp.ann_n, width, wp.why ? wp.why : "",
+                           (unsigned)PULSAR_GPU_MNEUTRAL_ROWS_MAX, wp.ann_blk, heads_max, wp.ann_whole);
+                wp.ann_n = 0;
+            }
             int thr_cut_rows = 0;
-            const int bound = spec_alloc_rows(surv, npend, n, n_live, (int)heads_max - n_fin, thr,
+            const int bound = spec_alloc_rows(surv, npend, n, n_live, (int)width - n_fin, thr,
                                               k_alloc, &thr_cut_rows);
             k_overflow = bound != 0;
             if (bound == 2) s->w_spec_overflow_rounds++;
@@ -2522,7 +2601,7 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n, int quantum_
         uint32_t rows = 0;
         if (ns > 0)
             (void)pulsar_session_spec_assemble_batch(pool, steps, ns,
-                                                     heads_max - (uint32_t)n_fin, reqs, &rows);
+                                                     width - (uint32_t)n_fin, reqs, &rows);
         int m = 0;
         for (int j = 0; j < ns; j++) {
             const pulsar_spec_step *st = &steps[j];
@@ -2878,6 +2957,9 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n, int quantum_
              * rows by (lane_price_pick) */
             lane_price_observe_spec(&s->w_lane_price, emitted_total - round_emitted0, (int)rows, m,
                                     (server_now_sec() - round_t0) * 1e3);
+            /* L288 C1: and the width's price at this decoder count */
+            width_price_observe(&s->w_width_price, n_live_w, width == heads_max, emitted_total - round_emitted0,
+                                (server_now_sec() - round_t0) * 1e3);
         }
         s->publish_metrics_snapshot();
         /* L260 fusion: a prompt finished this round -- end the quantum so its

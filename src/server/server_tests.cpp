@@ -8,9 +8,10 @@
  * A standalone compile (no PULSAR_SERVER_TEST) yields an empty object
  * for the pulsar-server link. */
 #include "pulsar_server_internal.h"
+#include "deepseek_dsml.h"
 #include "lib/pulsar_writeback.h"
 #include "lib/pulsar_segstore.h"
-#include "lib/qwen_tokenizer.h"
+#include "lib/bpe_tokenizer.h"
 
 #ifdef PULSAR_SERVER_TEST
 
@@ -1935,10 +1936,10 @@ static void test_effort_names_one_table(void) {
         {"\"max\"", PULSAR_THINK_MAX, QWEN_EFFORT_XHIGH},   {"37", 37, QWEN_EFFORT_LOW},
         {"80", 80, QWEN_EFFORT_XHIGH},                      {"null", PULSAR_THINK_DEFAULT, QWEN_EFFORT_XHIGH},
     };
-    TEST_ASSERT(!strcmp(k_effort_names[k_effort_row_none].name, "none") &&
-                !strcmp(k_effort_names[k_effort_row_low].name, "low") &&
-                !strcmp(k_effort_names[k_effort_row_high].name, "high") &&
-                !strcmp(k_effort_names[k_effort_row_max].name, "max"));
+    TEST_ASSERT(!strcmp(k_effort_names[k_effort_row_none], "none") &&
+                !strcmp(k_effort_names[k_effort_row_low], "low") &&
+                !strcmp(k_effort_names[k_effort_row_high], "high") &&
+                !strcmp(k_effort_names[k_effort_row_max], "max"));
     char body[256], err[256];
     request r;
     for (const row &w : rows) {
@@ -1999,7 +2000,7 @@ static void test_api_thinking_controls_parse(void) {
     chat_effort_ask a;
     char err[160];
     TEST_ASSERT(chat_effort_ask_read(&oc, 1, &a, err, sizeof err));
-    TEST_ASSERT(a.level >= 0 && !strcmp(k_effort_names[a.level].name, "max"));
+    TEST_ASSERT(a.level >= 0 && !strcmp(k_effort_names[a.level], "max"));
     free(oc.raw);
 }
 
@@ -2522,7 +2523,7 @@ static void test_broken_call_one_rule_every_family(void) {
         r->stream = true;   /* a stream: no retry, the turn is text */
         r->tool_orders = make_bash_order();
         if (c.fmt == PULSAR_CHAT_QWEN)
-            r->qwen_tools_json = xstrdup("[{\"type\":\"function\",\"function\":{\"name\":\"bash\",\"parameters\":"
+            r->tools_json = xstrdup("[{\"type\":\"function\",\"function\":{\"name\":\"bash\",\"parameters\":"
                                          "{\"type\":\"object\",\"properties\":{\"command\":{\"type\":\"string\"}}}}}]");
         gen_state g;
         memset(&g, 0, sizeof g);
@@ -2846,7 +2847,7 @@ static void test_tool_memory_replays_sampled_dsml(void) {
 
     tool_replay_stats stats = {0};
     s.tool_memory_attach_to_messages(&msgs, &stats);
-    TEST_ASSERT(msgs.v[0].calls.raw_dsml != NULL);
+    TEST_ASSERT(msgs.v[0].calls.raw_calls != NULL);
     TEST_ASSERT(stats.mem == 1);
     TEST_ASSERT(stats.disk == 0);
     TEST_ASSERT(stats.canonical == 0);
@@ -2909,7 +2910,7 @@ static void test_anthropic_tool_memory_replays_sampled_dsml(void) {
 
     tool_replay_stats stats = {0};
     s.tool_memory_attach_to_messages(&msgs, &stats);
-    TEST_ASSERT(msgs.v[0].calls.raw_dsml != NULL);
+    TEST_ASSERT(msgs.v[0].calls.raw_calls != NULL);
     TEST_ASSERT(stats.mem == 1);
     TEST_ASSERT(stats.canonical == 0);
 
@@ -3198,7 +3199,7 @@ static void test_qwen_raw_calls_replay_verbatim(void) {
     qwen_output_parser p;
     char err[100];
     TEST_ASSERT(p.init(true, NULL, err, sizeof err));
-    std::vector<qwen_out_event> ev;
+    std::vector<out_event> ev;
     for (size_t i = 0; sampled[i]; i++) p.feed(sampled + i, 1, &ev);   /* one byte at a time */
     p.finish(&ev);
     TEST_ASSERT(p.calls().size() == 2 && p.errors() == 1);
@@ -3224,7 +3225,7 @@ static void test_qwen_raw_calls_replay_verbatim(void) {
     a.reasoning = xstrdup("I will.");
     qwen_test_call(&a, "call_1", "bash", "{\"cmd\":\"pwd\"}");
     qwen_test_call(&a, "call_2", "bash", "{\"n\":\"007\"}");
-    a.calls.raw_dsml = xstrdup(raw);
+    a.calls.raw_calls = xstrdup(raw);
     chat_msgs_push(&msgs, a);
     chat_msgs_push(&msgs, qwen_test_msg("tool", "ok"));
     char *text = qwen_test_full_render(&msgs, false);
@@ -3241,7 +3242,7 @@ static void test_qwen_raw_calls_replay_verbatim(void) {
     chat_msg k = qwen_test_msg("assistant", NULL);
     qwen_test_call(&k, "call_1", "bash", "{\"cmd\":\"pwd\"}");
     qwen_test_call(&k, "call_2", "bash", "{\"n\":\"007\"}");
-    k.calls.raw_dsml = xstrdup(raw);
+    k.calls.raw_calls = xstrdup(raw);
     char *turn = r.family->assistant_turn_sampled(&r, true, "I will.", "On it.", &k.calls, NULL, NULL);
     TEST_ASSERT(turn && !strcmp(turn, sampled));
     free(turn);
@@ -3282,8 +3283,8 @@ static void test_qwen_forced_call_prefill_and_seed(void) {
                                                    : "\n</think>\n\n<tool_call>\n<function=search>\n"));
         /* the parser reads the seed as an open call, then the model's body as its arguments */
         qwen_output_parser p;
-        TEST_ASSERT(p.init(!thinking_off, r.qwen_tools_json, err, sizeof err));
-        std::vector<qwen_out_event> ev;
+        TEST_ASSERT(p.init(!thinking_off, r.tools_json, err, sizeof err));
+        std::vector<out_event> ev;
         p.feed(seed.ptr, seed.len, &ev);
         TEST_ASSERT(p.in_tool_call() && p.calls().empty());
         const char *body = "<parameter=q>\npulsars\n</parameter>\n</function>\n</tool_call>";
@@ -3301,8 +3302,8 @@ static void test_qwen_forced_call_prefill_and_seed(void) {
         TEST_ASSERT(!strcmp(useed.ptr, thinking_off ? "<tool_call>\n<function" : "\n</think>\n\n<tool_call>\n<function"));
         TEST_ASSERT(!strcmp(r.family->forced_name_open, "=") && !strcmp(r.family->forced_name_close, ">"));
         qwen_output_parser u;
-        TEST_ASSERT(u.init(!thinking_off, r.qwen_tools_json, err, sizeof err));
-        std::vector<qwen_out_event> uev;
+        TEST_ASSERT(u.init(!thinking_off, r.tools_json, err, sizeof err));
+        std::vector<out_event> uev;
         u.feed(useed.ptr, useed.len, &uev);
         TEST_ASSERT(u.in_tool_call() && u.calls().empty());
         const std::string rest = std::string("=search>\n") + body;
@@ -3375,7 +3376,7 @@ static void test_qwen_payload_is_sampled_structure_greedy(void) {
     qwen_output_parser p;
     char err[160];
     TEST_ASSERT(p.init(false, tools, err, sizeof err));
-    std::vector<qwen_out_event> ev;
+    std::vector<out_event> ev;
     /* each step: bytes fed, then whether the NEXT byte is payload */
     struct step { const char *bytes; bool tool; bool payload; };
     static const step steps[] = {
@@ -3486,11 +3487,11 @@ static void test_qwen_tool_error_suffix_reminds_the_system_turn(void) {
 
 /* ---- L290: a turn's tokens never change after the next user message arrives ------------------------------ */
 
-/* The checkpoint's tokenizer, host-side (src/lib/qwen_tokenizer): PULSAR_TEST_QWEN_TOKENIZER names a directory
- * with tokenizer.json and generation_config.json, by default the served Qwen checkpoint's.  A missing one fails
- * the test by name. */
-static const qwen_tokenizer *qwen_test_tokenizer(void) {
-    static qwen_tokenizer *tok = NULL;
+/* The checkpoint's tokenizer, host-side (src/lib/bpe_tokenizer, its HF configuration): PULSAR_TEST_QWEN_TOKENIZER
+ * names a directory with tokenizer.json and generation_config.json, by default the served Qwen checkpoint's.  A
+ * missing one fails the test by name. */
+static const bpe_tokenizer *qwen_test_tokenizer(void) {
+    static bpe_tokenizer *tok = NULL;
     static bool tried = false;
     if (tried) return tok;
     tried = true;
@@ -3510,17 +3511,17 @@ static const qwen_tokenizer *qwen_test_tokenizer(void) {
     if (!slurp(dir + "/tokenizer.json", &tj) || !slurp(dir + "/generation_config.json", &gj))
         snprintf(err, sizeof err, "no tokenizer.json + generation_config.json in %s", dir.c_str());
     else
-        tok = qwen_tokenizer_load(tj.data(), tj.size(), gj.data(), gj.size(), err, sizeof err);
+        tok = bpe_tokenizer_load_hf(tj.data(), tj.size(), gj.data(), gj.size(), err, sizeof err);
     if (!tok) fprintf(stderr, "L290 tests: the Qwen tokenizer (PULSAR_TEST_QWEN_TOKENIZER): %s\n", err);
     TEST_ASSERT(tok != NULL);
     return tok;
 }
 
-static std::vector<int> qwen_test_encode(const qwen_tokenizer *tok, const char *text, const chat_text_span *spans,
+static std::vector<int> qwen_test_encode(const bpe_tokenizer *tok, const char *text, const chat_text_span *spans,
                                          size_t n_spans) {
     std::vector<int> out;
     char err[200] = "";
-    const bool ok = qwen_tokenizer_encode(tok, text, strlen(text), spans, (uint32_t)n_spans, &out, err, sizeof err);
+    const bool ok = bpe_tokenizer_encode(tok, text, strlen(text), spans, (uint32_t)n_spans, &out, err, sizeof err);
     if (!ok) fprintf(stderr, "qwen encode refused: %s\n", err);
     TEST_ASSERT(ok);
     return out;
@@ -3576,7 +3577,7 @@ static void test_anthropic_turn_render_is_stable_across_the_next_user_turn(void)
          * DeepSeek's tool context) */
         TEST_ASSERT(b && strstr(b, "Use ls.") && strstr(b, "Two files."));
         if (fmt == PULSAR_CHAT_QWEN && a && b) {
-            const qwen_tokenizer *tok = qwen_test_tokenizer();
+            const bpe_tokenizer *tok = qwen_test_tokenizer();
             if (tok) {
                 const std::vector<int> ta = qwen_test_encode(tok, a, sa.data(), sa.size());
                 const std::vector<int> tb = qwen_test_encode(tok, b, sb.data(), sb.size());
@@ -3595,7 +3596,7 @@ static void test_anthropic_turn_render_is_stable_across_the_next_user_turn(void)
  * <|endoftext|> committed.  Joined after the stop (the pre-L290 join) the history doubled the close and the next
  * full render diverged there. */
 static void test_live_tail_joins_before_a_committed_stop(void) {
-    const qwen_tokenizer *tok = qwen_test_tokenizer();
+    const bpe_tokenizer *tok = qwen_test_tokenizer();
     if (!tok) return;
     chat_msgs prefix = {0};
     chat_msgs_push(&prefix, qwen_test_msg("system", "Be terse."));
@@ -3634,8 +3635,8 @@ static void test_live_tail_joins_before_a_committed_stop(void) {
         const std::vector<int> sampled = qwen_test_encode(tok, live_text.c_str(), live_spans.data(), live_spans.size());
         const std::vector<int> tail_toks = qwen_test_encode(tok, tail, tail_spans, tail_n);
         const std::vector<int> want = qwen_test_encode(tok, want_text, full_spans.data(), full_spans.size());
-        const int im_end = qwen_tokenizer_added_id(tok, "<|im_end|>");
-        const int endoftext = qwen_tokenizer_added_id(tok, "<|endoftext|>");
+        const int im_end = bpe_tokenizer_added_id(tok, "<|im_end|>");
+        const int endoftext = bpe_tokenizer_added_id(tok, "<|endoftext|>");
         TEST_ASSERT(im_end >= 0 && endoftext >= 0 && tail_toks.size() > 1 && tail_toks[0] == im_end);
         const int stops[] = {-1, im_end, endoftext};
         for (int stop : stops) {
@@ -3759,7 +3760,7 @@ static void test_tool_checkpoint_canonicalization_gate_exact_replay(void) {
     tc.name = xstrdup("bash");
     tc.arguments = xstrdup("{}");
     tool_calls_push(&calls, tc);
-    calls.raw_dsml = xstrdup(
+    calls.raw_calls = xstrdup(
         "\n\n" PULSAR_TOOL_CALLS_START "\n"
         "<｜DSML｜ invoke name=\"bash\">\n"
         "</｜DSML｜ invoke>\n"
@@ -3767,8 +3768,8 @@ static void test_tool_checkpoint_canonicalization_gate_exact_replay(void) {
 
     TEST_ASSERT(!s.should_canonicalize_tool_checkpoint(&calls));
 
-    free(calls.raw_dsml);
-    calls.raw_dsml = NULL;
+    free(calls.raw_calls);
+    calls.raw_calls = NULL;
     TEST_ASSERT(s.should_canonicalize_tool_checkpoint(&calls));
 
     tool_calls_free(&calls);
@@ -4048,7 +4049,7 @@ static void test_tool_memory_max_ids_prunes_oldest(void) {
 
     tool_replay_stats stats = {0};
     s.tool_memory_attach_to_messages(&msgs, &stats);
-    TEST_ASSERT(msgs.v[0].calls.raw_dsml == NULL);
+    TEST_ASSERT(msgs.v[0].calls.raw_calls == NULL);
     TEST_ASSERT(stats.canonical == 1);
     TEST_ASSERT(stats.missing_ids == 1);
 
@@ -5600,13 +5601,13 @@ static void test_kv_tool_map_filters_by_dsml_text(void) {
     chat_msgs_push(&msgs, b);
     tool_replay_stats stats = {0};
     dst.tool_memory_attach_to_messages(&msgs, &stats);
-    TEST_ASSERT(msgs.v[0].calls.raw_dsml != NULL);
-    TEST_ASSERT(msgs.v[1].calls.raw_dsml == NULL);
+    TEST_ASSERT(msgs.v[0].calls.raw_calls != NULL);
+    TEST_ASSERT(msgs.v[1].calls.raw_calls == NULL);
     TEST_ASSERT(stats.disk == 1);
     TEST_ASSERT(stats.canonical == 1);
     TEST_ASSERT(stats.missing_ids == 1);
-    TEST_ASSERT(strstr(msgs.v[0].calls.raw_dsml, "pwd") != NULL);
-    TEST_ASSERT(strstr(msgs.v[0].calls.raw_dsml, "zzzz") == NULL);
+    TEST_ASSERT(strstr(msgs.v[0].calls.raw_calls, "pwd") != NULL);
+    TEST_ASSERT(strstr(msgs.v[0].calls.raw_calls, "zzzz") == NULL);
 
     chat_msgs_free(&msgs);
     if (fp) fclose(fp);
@@ -5672,7 +5673,7 @@ static void test_kv_tool_map_restores_before_prompt_render(void) {
     dst.kv_cache_restore_tool_memory_for_messages(&msgs);
     tool_replay_stats stats = {0};
     dst.tool_memory_attach_to_messages(&msgs, &stats);
-    TEST_ASSERT(msgs.v[0].calls.raw_dsml != NULL);
+    TEST_ASSERT(msgs.v[0].calls.raw_calls != NULL);
     TEST_ASSERT(stats.disk == 1);
     TEST_ASSERT(stats.canonical == 0);
     char *prompt = render_chat_prompt_text(&msgs, NULL, NULL, PULSAR_THINK_HIGH);
@@ -7258,8 +7259,58 @@ static void l179_spec_alloc_rows_at(const int B) {
     TEST_ASSERT(3 + 10 < B);
 }
 
-/* L284: one allocator for both families, at each one's verify width (pulsar_engine_fused_heads_max: Qwen's 16-row
- * logits slab, DeepSeek's spec-logits block). */
+/* L288 C1: the verify width, measured per decoder count (width_price_pick).  One decoder, or a count the decode block
+ * holds base rows for, has no choice.  At 4 decoders: the whole width (in force at the start) is measured first, then
+ * the block is probed for LANE_PRICE_PROBE_STEPS rounds, and the faster by the margin holds -- here the block (the
+ * 4-stream case: 16 rows cheaper than 17-20 for what they return); the whole width is re-measured after
+ * LANE_PRICE_REPROBE_STEPS rounds at that count, and wins back when it has become the faster.  Another count keeps
+ * its own measurements (8 decoders: the whole width holds). */
+static void test_l288_width_price_pick(void) {
+    width_price wp;
+    memset(&wp, 0, sizeof wp);
+    TEST_ASSERT(width_price_pick(&wp, 1, 16u, 32u) == 32u);
+    TEST_ASSERT(width_price_pick(&wp, 16, 16u, 32u) == 32u);
+    TEST_ASSERT(width_price_pick(&wp, 4, 16u, 16u) == 16u);
+    /* 4 decoders: the whole width first, measured: 14 tokens in 80 ms a round (175 tok/s) */
+    for (uint32_t i = 0; i < LANE_PRICE_PROBE_STEPS; i++) {
+        TEST_ASSERT(width_price_pick(&wp, 4, 16u, 32u) == 32u);
+        width_price_observe(&wp, 4, true, 14, 80.0);
+    }
+    /* then the block probed: 13.5 tokens in 70 ms (193 tok/s) */
+    for (uint32_t i = 0; i < LANE_PRICE_PROBE_STEPS; i++) {
+        TEST_ASSERT(width_price_pick(&wp, 4, 16u, 32u) == 16u && wp.probe[4] == 0);
+        width_price_observe(&wp, 4, false, 13, 70.0);
+    }
+    TEST_ASSERT(width_price_pick(&wp, 4, 16u, 32u) == 16u && wp.force[4] == 0 && wp.probe[4] == -1);
+    /* 8 decoders meanwhile: their own count, the whole width measured and holding against a slower block */
+    for (uint32_t i = 0; i < LANE_PRICE_PROBE_STEPS; i++) {
+        TEST_ASSERT(width_price_pick(&wp, 8, 16u, 32u) == 32u);
+        width_price_observe(&wp, 8, true, 27, 135.0);
+    }
+    for (uint32_t i = 0; i < LANE_PRICE_PROBE_STEPS; i++) {
+        TEST_ASSERT(width_price_pick(&wp, 8, 16u, 32u) == 16u);
+        width_price_observe(&wp, 8, false, 23, 125.0);
+    }
+    TEST_ASSERT(width_price_pick(&wp, 8, 16u, 32u) == 32u && wp.force[8] == 1);
+    TEST_ASSERT(wp.force[4] == 0);   /* untouched by the other count */
+    /* back at 4: the block holds until the re-measure, which finds the whole width faster now (15 in 70 ms) */
+    for (uint32_t i = 0; i + 1 < LANE_PRICE_REPROBE_STEPS; i++) {
+        TEST_ASSERT(width_price_pick(&wp, 4, 16u, 32u) == 16u);
+        width_price_observe(&wp, 4, false, 13, 70.0);
+    }
+    TEST_ASSERT(width_price_pick(&wp, 4, 16u, 32u) == 16u);
+    width_price_observe(&wp, 4, false, 13, 70.0);
+    TEST_ASSERT(width_price_pick(&wp, 4, 16u, 32u) == 32u && wp.probe[4] == 1);
+    width_price_observe(&wp, 4, true, 15, 70.0);
+    for (uint32_t i = 1; i < LANE_PRICE_PROBE_STEPS; i++) {
+        TEST_ASSERT(width_price_pick(&wp, 4, 16u, 32u) == 32u);
+        width_price_observe(&wp, 4, true, 15, 70.0);
+    }
+    TEST_ASSERT(width_price_pick(&wp, 4, 16u, 32u) == 32u && wp.force[4] == 1 && wp.probe[4] == -1);
+}
+
+/* L284: one allocator for both families, at each one's verify width (pulsar_engine_fused_heads_max -- since L288 C1
+ * both families' PULSAR_SPEC_ROW_BUDGET; the 16-row case keeps a narrower width covered). */
 static void test_l179_spec_alloc_rows_isolation_and_ranked_overflow(void) {
     l179_spec_alloc_rows_at(16);
     l179_spec_alloc_rows_at((int)PULSAR_SPEC_LOGITS_ROWS);
@@ -8841,6 +8892,7 @@ static void pulsar_server_unit_tests_run(void) {
     test_l284_lane_price_pick();
     test_l289_lane_reprobe_evidence();
     test_l179_spec_alloc_rows_isolation_and_ranked_overflow();
+    test_l288_width_price_pick();
     test_l179_lane_abandon_needs_decode_and_hangup();
     test_l190_mem_floor_warn_is_rate_limited();
     test_l184_every_consumer_loops_the_syntax_table();

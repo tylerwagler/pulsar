@@ -105,6 +105,7 @@ typedef struct pulsar_family pulsar_family;
 typedef enum {
     PULSAR_FAMILY_ID_DEEPSEEK4 = 0,  ///< DeepSeek V4 Flash (0731), Vision-Exp, V4.1 Flash
     PULSAR_FAMILY_ID_QWEN4_EXP = 1,  ///< Qwen3.8-Flash-Next (HF model_type qwen4_exp)
+    PULSAR_FAMILY_ID_INKLING   = 2,  ///< Thinking Machines' Inkling (HF model_type inkling_mm_model; src/families/inkling)
 } pulsar_family_id;
 
 /** The conversation format a front end must render for the loaded model: the
@@ -1105,6 +1106,13 @@ bool pulsar_engine_has_fused_step(const pulsar_engine *e);
  *  spec lane takes up to this many decoders (each keeps its base row; past it they ride the plain batched lane)
  *  and its allocator rations the drafts within this less the round's finishing chunks. */
 uint32_t pulsar_engine_fused_heads_max(const pulsar_engine *e);
+/** L288 C1: the verify width IN FORCE -- the rows the server's next spec rounds carry at most, which its drafter
+ *  budgets against (a chain stops once the round's drafts that outrank it fill the width beside the base rows; a copy
+ *  chain stays under it).  The server prices it (server_sched.cpp width_price_pick) between the decode block and
+ *  pulsar_engine_fused_heads_max.  Clamped to [1, fused_heads_max]; 0 restores the full width.  A tensor-parallel
+ *  engine keeps the full width (its ranks draft alike from the same numbers) and returns false. */
+bool pulsar_engine_set_spec_width(pulsar_engine *e, uint32_t width);
+uint32_t pulsar_engine_spec_width(const pulsar_engine *e);
 /** Does pulsar_session_decode_mixed carry prefill runs beside its decode rows (the plain batched lane's mixed
  *  quantum)?  A family without it refuses such a step by name; its prompts ride only the fused step. */
 bool pulsar_engine_has_mixed_prefill(const pulsar_engine *e);

@@ -6,9 +6,10 @@
 #include "../src/server/api_parse.cpp"
 #include "../src/server/chat_family.cpp"
 #include "../src/server/genmsg.cpp"
+#include "../src/server/deepseek_dsml.cpp"
 #include "../src/server/deepseek_stream.cpp"
 #include "../src/server/parser_deepseek.cpp"
-#include "../src/server/parser_qwen.cpp"
+#include "../src/server/parser_kit.cpp"
 #include "../src/server/openai_stream.cpp"
 #include "../src/server/responses_stream.cpp"
 #include "../src/server/anthropic_stream.cpp"
@@ -4679,7 +4680,9 @@ static const pulsar_test_entry test_entries[] = {
     /* Order matters for the engine: every test that shares test_engine runs
      * first, so the model loads once for all of them; the two that must open
      * their own engine (logprob-vectors reads PULSAR_CUDA_PREFILL_CHUNK at
-     * open; tensor-equivalence asserts across engine instances) run last. */
+     * open; tensor-equivalence asserts across engine instances) run last.
+     * (The image tests sat after those two until 2026-10-14, which re-opened
+     * the shared engine: one model load more per run.) */
     {"--long-context", "long-context", "long-context story fact-recall regression", test_long_story_fact_recall},
     {"--tool-call-quality", "tool-call-quality", "model emits valid DSML tool calls", test_tool_call_quality},
     {"--think-tool-recovery", "think-tool-recovery", "complete tool call recovered from unclosed reasoning", test_think_tool_recovery},
@@ -4692,12 +4695,12 @@ static const pulsar_test_entry test_entries[] = {
     {"--api-min-p-range", "api-min-p-range", "out-of-range min_p disables the filter at parse (top_p convention)", test_api_min_p_range_validation},
     {"--api-logprobs-parse", "api-logprobs-parse", "logprobs/top_logprobs parse: out-of-domain rejects, never clamps", test_api_logprobs_parse_validation},
     {"--api-count-tokens", "api-count-tokens", "anthropic count_tokens parse: deterministic, monotonic, tools counted", test_anthropic_count_tokens_parse},
-    {"--logprob-vectors", "logprob-vectors", "official API top-logprob vector comparison on the standard path", test_official_logprob_vectors},
-    {"--tensor-equivalence", "tensor-equivalence", "prompt-logit and greedy run-to-run determinism", test_mpp_equivalence},
     {"--image-reuse", "image-reuse", "an image conversation's reused continuation equals its cold prefill, byte for byte (L226)", test_image_conversation_reuse_matches_cold},
     {"--image-chain", "image-chain", "an image conversation's disk chain carries its rows past the image and restores them only for the same image (L281)", test_image_chain_round_trip},
     {"--image-interrupt", "image-interrupt", "an image prefill interrupted at every chunk and resumed equals its cold prefill, byte for byte, never restarting from 0 (L281)", test_image_prefill_interrupt_resumes},
     {"--image-span-cache", "image-span-cache", "the encoded-span cache is transparent: cached == freshly encoded, byte for byte (L226)", test_image_span_cache_is_transparent},
+    {"--logprob-vectors", "logprob-vectors", "official API top-logprob vector comparison on the standard path", test_official_logprob_vectors},
+    {"--tensor-equivalence", "tensor-equivalence", "prompt-logit and greedy run-to-run determinism", test_mpp_equivalence},
 #endif
     {"--sampler", "sampler", "sampler: build is the one authority; plain == draw(build) under fixed seeds; byte-exact vs re-derived reference", test_sampler_dist_equivalence},
     {"--sampler-prefilter", "sampler-prefilter", "min-p prefilter: survivor set/order identity vs old-sum reference + boundary teeth", test_sampler_prefilter_equivalence},
@@ -4723,6 +4726,8 @@ static void test_print_help(const char *prog) {
     for (size_t i = 0; i < sizeof(test_entries) / sizeof(test_entries[0]); i++) {
         printf("  %-20s %s\n", test_entries[i].flag, test_entries[i].desc);
     }
+    puts("  --gating");
+    puts("      Every test except the informational ones (the battery's unit-test-gate).");
     puts("  --list");
     puts("      Print test names only.");
 #ifndef PULSAR_NO_GPU
@@ -4793,6 +4798,12 @@ int main(int argc, char **argv) {
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--all")) {
             run_all = true;
+        } else if (!strcmp(argv[i], "--gating")) {
+            /* the release-blocking set: an informational test can never fail the suite (test_run_entry folds its
+             * mismatches away), so the battery does not pay for it -- logprob-vectors' own model load and its
+             * vectors (2026-10-14) */
+            for (size_t j = 0; j < sizeof(test_entries) / sizeof(test_entries[0]); j++)
+                selected[j] = selected[j] || !test_entry_is_informational(&test_entries[j]);
         } else if (!strcmp(argv[i], "--list")) {
             for (size_t j = 0; j < sizeof(test_entries) / sizeof(test_entries[0]); j++) {
                 puts(test_entries[j].flag);

@@ -14,13 +14,16 @@
  * KL(ref || wide) beside KL(ref || serial): which arm is closer to the source.
  *
  *   PULSAR_MSEQ_BANKS=NB ./tests/verify_width_probe MODEL REF.bin TOKENS.bin
- *        [--widths 1,4,8,10,11,16,24,32] [--banks NB] [--extra D,D,...] [--max-depth D]
+ *        [--widths 1,4,8,10,11,16,24,32] [--banks NB] [--extra D,D,...] [--max-depth D] [--serial plain]
  *
  * --banks NB groups the depths NB at a time, one bank each, and spreads every width
  * over them (widths not divisible by NB are skipped) -- the production verify shape
  * (several streams, a few rows each).  --extra adds depths with no reference row (KL
  * vs one-token decode only); --max-depth drops deeper captured depths (prefill cost).
- * Measurement only: it never fails on a number. */
+ * --serial plain (L288 C1) takes the one-token truth from plain decode steps (decode_mixed with no
+ * verify heads: the row commits and its bank advances) instead of one-row verify steps -- the form a
+ * family whose verify leaves its bank where it was (Qwen: the commit moves it) needs; for DeepSeek the
+ * two are the same decode row.  Measurement only: it never fails on a number. */
 #include "pulsar.h"
 #include "pulsar_engine_internal.h"
 #include "gate_entry.h"
@@ -61,6 +64,24 @@ typedef struct {
     int    n_ref, top_wide, top_serial;
 } width_stats;
 
+/* L288 C1: a bank at the prefix toks[0, len), through the public bank surface (every family's: the server's prefill
+ * flow, pulsar.h) -- the DeepSeek-graph fixture (gate_populate_bank) does not reach a Qwen session. */
+static bool populate_bank(pulsar_session *s, uint32_t bank, const int *v, int len, const char *what) {
+    char err[256];
+    if (pulsar_session_bank_repoint(s, bank) != 0) {
+        fprintf(stderr, "%s: bank %u repoint failed\n", what, bank);
+        return false;
+    }
+    pulsar_session_invalidate(s);
+    pulsar_tokens p = {(int *)v, len, len};
+    if (pulsar_session_sync(s, &p, err, sizeof err) != 0) {
+        fprintf(stderr, "%s: bank %u sync failed: %s\n", what, bank, err);
+        return false;
+    }
+    pulsar_session_bank_state_save(s, bank);
+    return true;
+}
+
 static uint32_t parse_list(char *s, uint32_t *out, uint32_t cap) {
     uint32_t n = 0;
     for (char *p = strtok(s, ","); p && n < cap; p = strtok(NULL, ",")) out[n++] = (uint32_t)atoi(p);
@@ -75,11 +96,13 @@ int GATE_ENTRY(int argc, char **argv) {
     }
     uint32_t widths[MAX_W] = {1, 4, 8, 10, 11, 16, 24, 32};
     uint32_t n_w = 8, nb = 1, max_depth = 0xffffffffu, extra[16], n_extra = 0;
+    bool serial_plain = false;
     for (int a = 4; a + 1 < argc; a += 2) {
         if (!strcmp(argv[a], "--widths")) n_w = parse_list(argv[a + 1], widths, MAX_W);
         else if (!strcmp(argv[a], "--banks")) nb = (uint32_t)atoi(argv[a + 1]);
         else if (!strcmp(argv[a], "--extra")) n_extra = parse_list(argv[a + 1], extra, 16);
         else if (!strcmp(argv[a], "--max-depth")) max_depth = (uint32_t)atoi(argv[a + 1]);
+        else if (!strcmp(argv[a], "--serial") && !strcmp(argv[a + 1], "plain")) serial_plain = true;
         else { fprintf(stderr, "unknown option %s\n", argv[a]); return 2; }
     }
     if (nb < 1 || nb > 8) { fprintf(stderr, "--banks %u out of [1, 8]\n", nb); return 2; }
@@ -123,8 +146,8 @@ int GATE_ENTRY(int argc, char **argv) {
     if (gate_engine_open(&e, &o) != 0) { fprintf(stderr, "engine open failed\n"); free(traw); return 1; }
     const int V = pulsar_engine_logits_width(e);
     const int ncmp = (int)h.width < V ? (int)h.width : V;
-    printf("verify width probe: %s, %u depths, %u bank(s) per step, exact rows <= %d\n", argv[2], nd, nb,
-           pulsar_gpu_matmul_decode_exact_rows());
+    printf("verify width probe: %s, %u depths, %u bank(s) per step, exact rows <= %d, serial truth: %s\n", argv[2],
+           nd, nb, pulsar_gpu_matmul_decode_exact_rows(), serial_plain ? "plain decode steps" : "one-row verify steps");
 
     width_stats st[MAX_W];
     memset(st, 0, sizeof st);
@@ -141,23 +164,29 @@ int GATE_ENTRY(int argc, char **argv) {
         const int ctx = (int)(((dmax + SERIAL_ROWS + 4095u) / 4096u + 1u) * 4096u);
         pulsar_session *s = NULL;
         if (pulsar_session_create(&s, e, ctx) != 0) { fprintf(stderr, "session create failed\n"); rc = 1; break; }
-        if (!gate_pool_fits(s, nb < 2 ? 2 : nb)) { pulsar_session_free(s); rc = 1; break; }
+        if (pulsar_session_bank_count(s) < (int)(nb < 2 ? 2 : nb)) {
+            fprintf(stderr, "pool too small: %d < %u (set PULSAR_MSEQ_BANKS)\n", pulsar_session_bank_count(s), nb < 2 ? 2 : nb);
+            pulsar_session_free(s);
+            rc = 1;
+            break;
+        }
         /* serial truth: every bank prefilled, then one-row steps bank by bank */
         bool ok = true;
-        for (uint32_t b = 0; ok && b < nb; b++) ok = gate_populate_bank(s, b, toks, (int)P[b], NULL, "serial prefix");
+        for (uint32_t b = 0; ok && b < nb; b++) ok = populate_bank(s, b, toks, (int)P[b], "serial prefix");
         for (uint32_t b = 0; ok && b < nb; b++)
             for (uint32_t k = 0; ok && k < SERIAL_ROWS; k++) {
                 pulsar_multiseq_req q = {b, (int32_t)(P[b] + k), toks[P[b] + k]};
                 uint32_t got = 0;
                 ok = pulsar_session_decode_mixed(s, &q, 1, serial.data() + ((size_t)b * SERIAL_ROWS + k) * V, V, &got,
-                                                 PULSAR_MSEQ_HEAD_ALL_ROWS, err, sizeof err) == 0 && got == 1;
+                                                 serial_plain ? 0u : PULSAR_MSEQ_HEAD_ALL_ROWS, err, sizeof err) == 0 &&
+                     got == 1;
                 if (!ok) fprintf(stderr, "serial step b%u k%u: %s\n", b, k, err);
             }
         for (uint32_t wi = 0; ok && wi < n_w; wi++) {
             const uint32_t w = widths[wi];
             if (w % nb) continue;
             const uint32_t r = w / nb;
-            for (uint32_t b = 0; ok && b < nb; b++) ok = gate_populate_bank(s, b, toks, (int)P[b], NULL, "wide prefix");
+            for (uint32_t b = 0; ok && b < nb; b++) ok = populate_bank(s, b, toks, (int)P[b], "wide prefix");
             pulsar_multiseq_req q[PULSAR_SPEC_LOGITS_ROWS];
             for (uint32_t b = 0; b < nb; b++)
                 for (uint32_t k = 0; k < r; k++) q[b * r + k] = {b, (int32_t)(P[b] + k), toks[P[b] + k]};

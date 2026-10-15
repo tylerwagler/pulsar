@@ -1,0 +1,272 @@
+[
+{
+"text": "<|content_text|>plain answer<|end_message|>",
+"expect": {
+"reasoning": "",
+"content": "plain answer",
+"calls": []
+}
+},
+{
+"text": "<|content_thinking|>think  \n<|end_message|><|message_model|><|content_text|>answer<|end_message|>",
+"expect": {
+"reasoning": "think",
+"content": "answer",
+"calls": []
+}
+},
+{
+"text": "<|content_thinking|>a \n<|end_message|><|message_model|><|content_thinking|> b\t<|end_message|><|message_model|><|content_text|>c<|end_message|>",
+"expect": {
+"reasoning": "a \n b",
+"content": "c",
+"calls": []
+}
+},
+{
+"text": "<|content_thinking|>only thinking, cut by the cap",
+"expect": {
+"reasoning": "only thinking, cut by the cap",
+"content": "",
+"calls": []
+}
+},
+{
+"text": "<|content_thinking|>t<|end_message|><|message_model|>get_weather<|content_invoke_tool_json|>{\"name\":\"get_weather\",\"args\":{\"city\":\"Paris\",\"days\":3}}<|end_message|>",
+"expect": {
+"reasoning": "t",
+"content": "",
+"calls": [
+{
+"name": "get_weather",
+"arguments": "{\"city\":\"Paris\",\"days\":3}"
+}
+]
+}
+},
+{
+"text": "<|content_text|>  \n<|end_message|><|message_model|>f<|content_invoke_tool_json|>{\"name\":\"f\",\"args\":{}}<|end_message|><|message_model|><|content_text|>after<|end_message|>",
+"expect": {
+"reasoning": "",
+"content": "after",
+"calls": [
+{
+"name": "f",
+"arguments": "{}"
+}
+]
+}
+},
+{
+"text": "<|content_text|>before<|end_message|><|message_model|>f<|content_invoke_tool_json|>{\"name\":\"f\",\"args\":{\"a\":[1,{\"b\":\"}\"}]}}<|end_message|><|message_model|>g<|content_invoke_tool_json|>{\"name\":\"g\",\"args\":{\"x\":\"\\\"quoted\\\" \u00e9\"}}<|end_message|><|message_model|><|content_text|>\n<|end_message|>",
+"expect": {
+"reasoning": "",
+"content": "before\n",
+"calls": [
+{
+"name": "f",
+"arguments": "{\"a\":[1,{\"b\":\"}\"}]}"
+},
+{
+"name": "g",
+"arguments": "{\"x\":\"\\\"quoted\\\" \u00e9\"}"
+}
+]
+}
+},
+{
+"text": "<|content_text|> \n<|end_message|>",
+"expect": {
+"reasoning": "",
+"content": " \n",
+"calls": []
+}
+},
+{
+"text": "f<|content_invoke_tool_json|>{\"name\":\"f\",\"args\":{}}<|end_message|><|message_model|><|content_text|>\n<|end_message|>",
+"expect": {
+"reasoning": "",
+"content": "",
+"calls": [
+{
+"name": "f",
+"arguments": "{}"
+}
+]
+}
+},
+{
+"text": "<|content_text|>\n\n<|end_message|><|message_model|>f<|content_invoke_tool_json|>{\"name\":\"f\",\"args\":{}}<|end_message|>",
+"expect": {
+"reasoning": "",
+"content": "",
+"calls": [
+{
+"name": "f",
+"arguments": "{}"
+}
+]
+}
+},
+{
+"text": "<|content_text|> <|end_message|><|message_model|>f<|content_invoke_tool_json|>{\"args\":{}}<|end_message|><|message_model|><|content_text|> \n<|end_message|>",
+"expect": {
+"reasoning": "",
+"content": " \n",
+"calls": []
+}
+},
+{
+"text": "header text with no kind<|end_message|>",
+"expect": {
+"reasoning": "",
+"content": "header text with no kind",
+"calls": []
+}
+},
+{
+"text": "header text and the turn ends",
+"expect": {
+"reasoning": "",
+"content": "header text and the turn ends",
+"calls": []
+}
+},
+{
+"text": "name<|content_text|>visible<|end_message|>",
+"expect": {
+"reasoning": "",
+"content": "visible",
+"calls": []
+}
+},
+{
+"text": "<|content_invoke_tool_text|>raw tool text<|end_message|>",
+"expect": {
+"reasoning": "",
+"content": "raw tool text",
+"calls": []
+}
+},
+{
+"text": "<|content_tool_error|>error text<|end_message|>",
+"expect": {
+"reasoning": "",
+"content": "error text",
+"calls": []
+}
+},
+{
+"text": "<|content_text|>a<|message_user|>b<|endoftext|>c<|end_message|>",
+"expect": {
+"reasoning": "",
+"content": "abc",
+"calls": []
+}
+},
+{
+"text": "<|content_thinking|>x<|content_text|>y<|message_model|>z<|end_message|>",
+"expect": {
+"reasoning": "x<|content_text|>y<|message_model|>z",
+"content": "",
+"calls": []
+}
+},
+{
+"text": "<|content_thinking|>open thinking then a call<|content_invoke_tool_json|>{\"name\":\"f\",\"args\":{\"k\":\"v\"}}<|end_message|>",
+"expect": {
+"reasoning": "open thinking then a call",
+"content": "",
+"calls": [
+{
+"name": "f",
+"arguments": "{\"k\":\"v\"}"
+}
+]
+}
+},
+{
+"text": "<|content_text|>txt<|content_model_end_sampling|>",
+"expect": {
+"reasoning": "",
+"content": "txt",
+"calls": []
+}
+},
+{
+"text": "<|content_text|>a <|end_message|<|end_message|>",
+"expect": {
+"reasoning": "",
+"content": "a <|end_message|",
+"calls": []
+}
+},
+{
+"text": "f<|content_invoke_tool_json|>{\"args\":{\"k\":1},\"name\":\"f\"}<|end_message|>",
+"expect": {
+"reasoning": "",
+"content": "",
+"calls": [
+{
+"name": "f",
+"arguments": "{\"k\":1}"
+}
+]
+}
+},
+{
+"text": "f<|content_invoke_tool_json|>{\"name\":\"f\"}<|end_message|>",
+"expect": {
+"reasoning": "",
+"content": "",
+"calls": [
+{
+"name": "f",
+"arguments": "{}"
+}
+]
+}
+},
+{
+"text": "f<|content_invoke_tool_json|> {\"name\" : \"f\" , \"args\" : { \"k\" : [ 1 ] } } <|end_message|>",
+"expect": {
+"reasoning": "",
+"content": "",
+"calls": [
+{
+"name": "f",
+"arguments": "{ \"k\" : [ 1 ] }"
+}
+]
+}
+},
+{
+"text": "f<|content_invoke_tool_json|>{\"args\":{}}<|end_message|>",
+"expect": {
+"reasoning": "",
+"content": "",
+"calls": []
+}
+},
+{
+"text": "f<|content_invoke_tool_json|>not json<|end_message|>",
+"expect": {
+"reasoning": "",
+"content": "",
+"calls": []
+}
+},
+{
+"text": "f<|content_invoke_tool_json|>{\"name\":\"f\",\"args\":{\"k\":1}",
+"expect": {
+"reasoning": "",
+"content": "",
+"calls": [
+{
+"name": "f",
+"arguments": "{\"k\":1}"
+}
+]
+}
+}
+]

@@ -55,10 +55,12 @@ constexpr int kDownSplit = 5;                 ///< W_down split-K: 320 blocks of
 constexpr int kDownTB = 8;                    ///< tokens per down CTA
 constexpr int kDownStageBytes = 48 * 1024;    ///< the W8A16 GEMV's staged activation slice, at most
 constexpr int kUpTB = 16;                     ///< tokens per up CTA, BF16 mixer at prefill widths
-constexpr int kUpTBDecode = 4;                ///< tokens per up CTA at decode widths: small enough that two
-                                              ///< CTAs (staged W_up tile + a, prod) share an SM, so the 80
-                                              ///< CTAs are one wave on 48 SMs.  The row arithmetic does not
-                                              ///< depend on the tile, so the two widths are bit-identical.
+constexpr int kUpTBDecode = 8;                ///< tokens per up CTA at decode widths: a verify of <= 8 rows reads
+                                              ///< W_up once (L288 C2; it was 4), and still small enough that two
+                                              ///< CTAs (the staged W_up tile + a; the W8 gated products reuse the
+                                              ///< tile's memory) share an SM, so the 80 CTAs are one wave on 48
+                                              ///< SMs.  The row arithmetic does not depend on the tile, so every
+                                              ///< tile width is bit-identical.
 static_assert(kH % kNormThreads == 0, "the norm walks a stream in whole passes of 256");
 static_assert((kHC / 32) % kDownSplit == 0, "W_down's 32-blocks split evenly");
 static_assert(kR % 32 == 0 && kR / 32 <= 12, "the low rank is whole 32-blocks");
@@ -151,6 +153,37 @@ __device__ __forceinline__ float e4m3_bf16_dot32(const uint4 &w0, const uint4 &w
             s = fmaf(wf.x, af.x, s);
             s = fmaf(wf.y, af.y, s);
         }
+    }
+    return s;
+}
+
+/* L288 C2: e4m3_bf16_dot32 in two halves -- the 32 E4M3 codes decoded once (the same conversions, element order
+ * 0..31), then applied to any number of bf16 activation rows: the same 32 fmaf in the same order, so a row's dot
+ * is bit-identical to e4m3_bf16_dot32's. */
+__device__ __forceinline__ void e4m3x32_f32(const uint4 &w0, const uint4 &w1, float (&wf)[32]) {
+    const uint32_t *wa = reinterpret_cast<const uint32_t *>(&w0), *wb = reinterpret_cast<const uint32_t *>(&w1);
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        const uint32_t wv = i < 4 ? wa[i] : wb[i - 4];
+#pragma unroll
+        for (int h = 0; h < 2; ++h) {
+            const __half2_raw wr = __nv_cvt_fp8x2_to_halfraw2((__nv_fp8x2_storage_t)(wv >> (16 * h)), __NV_E4M3);
+            const float2 f = __half22float2(*reinterpret_cast<const __half2 *>(&wr));
+            wf[4 * i + 2 * h] = f.x;
+            wf[4 * i + 2 * h + 1] = f.y;
+        }
+    }
+}
+__device__ __forceinline__ float f32_bf16_dot32(const float (&wf)[32], const uint4 &b0, const uint4 &b1,
+                                                const uint4 &b2, const uint4 &b3) {
+    const uint32_t x[16] = {b0.x, b0.y, b0.z, b0.w, b1.x, b1.y, b1.z, b1.w,
+                            b2.x, b2.y, b2.z, b2.w, b3.x, b3.y, b3.z, b3.w};
+    float s = 0.0f;
+#pragma unroll
+    for (int j = 0; j < 16; ++j) {
+        const float2 a = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162 *>(&x[j]));
+        s = fmaf(wf[2 * j], a.x, s);
+        s = fmaf(wf[2 * j + 1], a.y, s);
     }
     return s;
 }
@@ -306,7 +339,7 @@ qwen_gr_down_kernel(const void *__restrict__ wv, const uint8_t *__restrict__ wsf
  * on nothing but its own x and W, so the chunk width changes no bit -- nor does the CTA's output
  * width.  CTA = 4 warps = 64 tokens x 8 NJ outputs (warp w: tokens 16w..16w+15, NJ n8 tiles); a wider
  * CTA re-stages the activation fewer times.  kMmaStage MX blocks staged per barrier. */
-constexpr int kDecodeRowsMax = 16;               ///< widths at or below take the decode GEMV
+constexpr int kDecodeRowsMax = PULSAR_QWEN_DECODE_ROWS_MAX;   ///< widths at or below take the decode GEMV
 constexpr int kMmaTok = 64, kMmaStage = 4;
 constexpr int kMmaNJ = 8, kMmaOut = 8 * kMmaNJ;  ///< the plain Linear's CTA output width
 constexpr int kGrNJ = 8, kGrOut = 8 * kGrNJ;     ///< the read's W_up (GATE): 16 channels x 4 streams
@@ -514,7 +547,12 @@ qwen_w8a16_prefill_kernel(const uint8_t *__restrict__ wq, const uint8_t *__restr
  *        loaded once and applied to every token of the CTA (a token's z sums
  *        its blocks in order 0..9, so the row arithmetic does not depend on T);
  *        the gated products go to shared memory and one warp per token takes
- *        the stream mean and emits the row. */
+ *        the stream mean and emits the row.
+ * L288 C2: the W8 block is DECODED once (32 E4M3 codes -> f32, the conversions e4m3_bf16_dot32 makes) and
+ * that f32 row applied to each of the CTA's tokens (f32_bf16_dot32: the same 32 fmaf in the same k order),
+ * where every token used to decode the codes again; and the decode tile is 8 tokens, so a verify of up to 8
+ * rows reads W_up once.  A token's arithmetic is unchanged, so the output is bit-identical (and still does
+ * not depend on T). */
 /* The W8 up's weight tile (decode widths), staged whole: the CTA's 4 x 32 rows of 320 E4M3 bytes, copied by
  * cp.async in coalesced 16-byte chunks at kernel entry so the load overlaps the mid.  The row
  * stride is padded to 336 B (84 words): a quarter-warp's 8 lanes, reading rows l .. l + 7 at the
@@ -538,10 +576,12 @@ qwen_gr_up_kernel(const void *__restrict__ wv, const uint8_t *__restrict__ wsf,
                   const float *__restrict__ rstd, int T,
                   __nv_bfloat16 *__restrict__ x_out) {
     constexpr int NB = kR / 32;
-    __shared__ float prod[TB][kS][32];
+    /* the gated products: in the staged W_up tile's memory once the up has read it (W8 -- L288 C2: that keeps the
+     * 8-token CTA at two an SM), their own array otherwise */
+    __shared__ float prod_own[W8 ? 1 : TB][kS][32];
     /* L251 / ac69748f: `a` is bf16 whatever W_up's WEIGHT format is -- this was the last op-internal
      * E4M3 activation in the read.  W8 now means E4M3 weights against a bf16 activation, the same
-     * W8A16 shape the down already uses, so e4m3_bf16_dot32 serves here too. */
+     * W8A16 shape the down already uses, so e4m3_bf16_dot32's arithmetic serves here too. */
     __shared__ __align__(16) uint8_t s_a[TB][2 * kR];
     const int s = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const int c = blockIdx.x * 32 + lane;
@@ -551,6 +591,8 @@ qwen_gr_up_kernel(const void *__restrict__ wv, const uint8_t *__restrict__ wsf,
     static_assert(!W8 || TB == kUpTBDecode, "the W8 up at prefill widths is the GEMM (3')");
     constexpr bool STAGE = W8;
     extern __shared__ __align__(16) uint8_t s_w[];
+    static_assert(!W8 || sizeof(float) * TB * kS * 32 <= kUpTileBytes, "the gated products fit the W_up tile");
+    float (*prod)[kS][32] = W8 ? reinterpret_cast<float (*)[kS][32]>(s_w) : prod_own;
     if constexpr (STAGE) {
         /* stream ss's 32 rows are one contiguous 10,240 B run of W_up */
         constexpr int kChunks = kUpRowBytes / 16;                 /* 20 per row */
@@ -587,19 +629,20 @@ qwen_gr_up_kernel(const void *__restrict__ wv, const uint8_t *__restrict__ wsf,
         const int w_kbp = pulsar_mx_kbp(kR);
         const uint4 *wp = reinterpret_cast<const uint4 *>(s_w + (s * 32 + lane) * kUpRowStride);
         for (int b = 0; b < NB; ++b) {
-            const uint4 w0 = wp[2 * b], w1 = wp[2 * b + 1];
-            const unsigned sw = wsf[pulsar_mx_sfoff(row, b, w_kbp)];
+            /* the block's 32 codes decoded once for all the CTA's tokens (L288 C2); 32 bf16 activations are FOUR
+             * uint4, and the weight's E8M0 is the only scale left to apply (bf16 carries its own exponent) */
+            float wf[32];
+            e4m3x32_f32(wp[2 * b], wp[2 * b + 1], wf);
+            const float sc = mx_scale1(wsf[pulsar_mx_sfoff(row, b, w_kbp)]);
 #pragma unroll
             for (int tt = 0; tt < TB; ++tt) {
                 if (tt < nt) {
-                    /* 32 bf16 activations are FOUR uint4 where 32 E4M3 were two, and the weight's
-                     * E8M0 is the only scale left to apply (bf16 carries its own exponent). */
                     const uint4 *ap = reinterpret_cast<const uint4 *>(s_a[tt]) + 4 * b;
-                    z[tt] = fmaf(e4m3_bf16_dot32(w0, w1, ap[0], ap[1], ap[2], ap[3]),
-                                 mx_scale1(sw), z[tt]);
+                    z[tt] = fmaf(f32_bf16_dot32(wf, ap[0], ap[1], ap[2], ap[3]), sc, z[tt]);
                 }
             }
         }
+        __syncthreads();   /* every warp is past its last read of the tile: the products take its memory */
     } else {
         const uint4 *wp = reinterpret_cast<const uint4 *>((const __nv_bfloat16 *)wv + (size_t)row * kR);
         for (int ci = 0; ci < kR / 8; ++ci) {
@@ -751,7 +794,7 @@ static int gr_read_kernels(const pulsar_qwen_gr_dev *w, const uint16_t *streams,
     /* W8 selects the WEIGHT format only; the activation is bf16 either way -- the W8A16 arm, on the
      * tensor cores (2') at prefill widths, where the GEMM's staging takes xn from the streams itself
      * (GR_NORM), so the norm emits only rstd and the inject partials there. */
-    const bool gemm = W8 && (w->prompt || T > kDecodeRowsMax);
+    const bool gemm = W8 && w->prompt;   /* decode rows arrive <= kDecodeRowsMax at a time (the launcher's blocks) */
     const gr_gate_args ga{(const __nv_bfloat16 *)streams, (const __nv_bfloat16 *)w->norm_w, m.rstd, (__nv_bfloat16 *)x_bf16};
     qwen_gr_norm_kernel<<<dim3(kS, T), kNormThreads, 0, stream>>>(
         (const __nv_bfloat16 *)streams, (const __nv_bfloat16 *)w->norm_w, (const __nv_bfloat16 *)w->inject,
@@ -793,7 +836,7 @@ static int gr_read_kernels(const pulsar_qwen_gr_dev *w, const uint16_t *streams,
         }
     }
     /* W8 is at decode widths here; the BF16 mixer takes the 16-token tile at prefill widths */
-    const int tb = !W8 && (w->prompt || T > kDecodeRowsMax) ? kUpTB : kUpTBDecode;
+    const int tb = !W8 && w->prompt ? kUpTB : kUpTBDecode;
     const dim3 grid(kH / 32, (T + tb - 1) / tb);
     const size_t smem = W8 ? kUpTileBytes : 0;
     const float *injp = w->inject ? m.injp : nullptr;
@@ -847,9 +890,19 @@ extern "C" int pulsar_qwen_gr_read_launch(const pulsar_qwen_gr_dev *w, const uin
                 w8 ? "MXFP8" : "BF16", kDownSplit, w8 ? "; L288 tensor cores at every width" : "", w8 ? "MXFP8" : "BF16");
     }
     /* L251 / ac69748f: there is no scale slab to clear and no slot to fill -- xn is bf16, so the
-     * norm writes every element the down GEMV reads and nothing else owns this buffer. */
-    const int rc = w8 ? gr_read_kernels<true>(w, streams, T, x_bf16, inj, m, stream)
-                      : gr_read_kernels<false>(w, streams, T, x_bf16, inj, m, stream);
+     * norm writes every element the down GEMV reads and nothing else owns this buffer.
+     * L288 C1: decode rows past kDecodeRowsMax (a wide verify) take the decode arms a block at a time -- every kernel
+     * of the read indexes its row alone, the workspace's per-row planes from 0 reused in stream order -- so a row's
+     * bytes are a one-row decode's at any width (the prefill GEMM's here cost a wide verify more than it saved). */
+    int rc = 0;
+    const int blk = w->prompt ? T : kDecodeRowsMax;
+    for (int r0 = 0; rc == 0 && r0 < T; r0 += blk) {
+        const int t = T - r0 < blk ? T - r0 : blk;
+        const uint16_t *s = streams + (size_t)r0 * kHC;
+        uint16_t *xb = x_bf16 + (size_t)r0 * kH;
+        float *in = inj ? inj + (size_t)r0 * PULSAR_QWEN_HC : nullptr;
+        rc = w8 ? gr_read_kernels<true>(w, s, t, xb, in, m, stream) : gr_read_kernels<false>(w, s, t, xb, in, m, stream);
+    }
     if (rc) {
         fprintf(stderr, "pulsar: qwen GR read: the W_down of %d rows could not be launched -- refusing\n", T);
         return -3;
@@ -898,7 +951,7 @@ extern "C" int pulsar_qwen_mxfp8_linear_launch(const pulsar_qwen_lowrank *l, con
     } else if (l->out >= kRowsLinearOutMin && l->in % kHeadKStep == 0) {
         /* L288: a wide Linear (the MTP fc, the PLE projections) takes the rows kernel at decode widths -- its weight
          * read once for all <= 16 rows; the narrow ones (GDN in_proj_a / _b, 48 rows: 3 MMA tiles) keep the GEMV,
-         * whose split of each row over 32 lanes fills the GPU */
+         * each row split over 32 lanes, one token a CTA (below) */
         if ((((uintptr_t)l->w | (uintptr_t)x_bf16) & 15u) != 0) {
             fprintf(stderr, "pulsar: qwen mxfp8 linear: %d -> %d needs 16-byte aligned weight and rows -- refusing\n",
                     l->in, l->out);
@@ -918,7 +971,10 @@ extern "C" int pulsar_qwen_mxfp8_linear_launch(const pulsar_qwen_lowrank *l, con
             return -1;
         }
     } else {
-        const int tb = gr_down_tokens_per_cta(l->in, 1);
+        /* L288 C2: one token a CTA -- the narrow Linear is out / 8 CTAs a token, so a verify's rows run side by side
+         * (it was every row in one CTA's loop: 6 CTAs on 48 SMs at every width); a token's sum is its own, so the
+         * bytes do not move */
+        const int tb = gr_down_tokens_per_cta(l->in, 1) ? 1 : 0;
         if (tb == 0) {
             fprintf(stderr, "pulsar: qwen mxfp8 linear: a %d-wide row does not stage in %d bytes -- refusing\n", l->in,
                     kDownStageBytes);

@@ -4,7 +4,8 @@
  * -- the fastest arm at each width.  Rule 7 says that is graded, not argued, and
  * the reference gate grades PREFILL rows only.  This probe grades DECODE rows on
  * the same blobs: for each reference depth d and width w, bank 0 is prefilled
- * classically to d - w, then ONE decode step carries the w teacher-forced tokens
+ * classically to d - w (since 2026-10-14 from the depth's one cold prefill's grid
+ * checkpoint, asserted byte-identical to cold: prefix_resumed), then ONE decode step carries the w teacher-forced tokens
  * at positions d - w .. d - 1 as a verify-shaped run (decode row kind, every row
  * headed), and its LAST row -- the prediction after d tokens -- is compared with
  * the reference row for d:
@@ -79,14 +80,52 @@ static double maxabs_of(const float *a, const float *b, int n) {
     return m;
 }
 
-/* the w rows of the w tokens ending at depth d over a prefill to d - w: one
- * w-wide decode step, or (serial) w one-row steps -- into `out` (w x width) */
-static bool decode_rows(pulsar_engine *e, const int *toks, uint32_t d, uint32_t w, float *out, int width,
+/* Bank 0 of `s` brought to the prefix [0, n) the cheap way (2026-10-14, battery time): the depth's ONE cold
+ * prefill (prefix_cold) left a grid checkpoint at the last grid point below its end, and every later run restores
+ * the deepest checkpoint at or below n and prefills the rest -- the cold prefill's computation (L264; the
+ * chunk-neutrality gate's L / M / N schedules).  Before, every (width, arm) prefilled its prefix from 0: 8
+ * prefills per depth, 380k tokens of the story gate's 392 s.  The resume is ANNOUNCED (origin) and the identity
+ * is ASSERTED in this gate, not argued: the depth's widest wide run is the one cold run, repeated at the end
+ * through this path and compared byte for byte (see the depth loop). */
+static bool prefix_cold(pulsar_session *s, const int *toks, uint32_t n) {
+    if (!gate_populate_bank(s, 0, toks, (int)n, NULL, "decode reference prefix")) return false;
+    pulsar_session_bank_state_save(s, 0);   /* the carry a later run re-installs after its multiseq step */
+    return true;
+}
+static bool prefix_resumed(pulsar_session *s, const int *toks, uint32_t n, int *origin) {
+    char err[256];
+    /* a multiseq step left the classic view stale (session_multiseq.cpp); the carry saved after the last sync
+     * re-establishes it, as the server's bank switch does */
+    if (!pulsar_session_bank_state_restore(s, 0)) { fprintf(stderr, "decode reference: bank 0 restore failed\n"); return false; }
+    const int G = pulsar_session_checkpoint_best(s, (int)n);
+    if (G <= 0) {
+        fprintf(stderr, "decode reference: no grid checkpoint at or below %u -- the cold prefill left none\n", n);
+        return false;
+    }
+    if (pulsar_session_restore_checkpoint(s, G, err, sizeof err) != 0) {
+        fprintf(stderr, "decode reference: %s\n", err);
+        return false;
+    }
+    pulsar_tokens p = { .v = (int *)toks, .len = (int)n, .cap = (int)n };
+    if (pulsar_session_sync(s, &p, err, sizeof err) != 0) {
+        fprintf(stderr, "decode reference: resume sync to %u failed: %s\n", n, err);
+        return false;
+    }
+    if (pulsar_session_resume_origin(s) != G) {
+        fprintf(stderr, "decode reference: the sync to %u resumed from %d, not the restored checkpoint %d\n", n,
+                pulsar_session_resume_origin(s), G);
+        return false;
+    }
+    pulsar_session_bank_state_save(s, 0);
+    *origin = G;
+    return true;
+}
+
+/* the w rows of the w tokens ending at depth d over bank 0's prefix [0, d - w): one w-wide decode step, or
+ * (serial) w one-row steps -- into `out` (w x width) */
+static bool decode_rows(pulsar_session *s, const int *toks, uint32_t d, uint32_t w, float *out, int width,
                         bool serial) {
-    pulsar_session *s = NULL;
-    const int ctx = (int)(((d + 4095u) / 4096u + 1u) * 4096u);
-    if (pulsar_session_create(&s, e, ctx) != 0) { fprintf(stderr, "session create failed (ctx %d)\n", ctx); return false; }
-    bool ok = gate_pool_fits(s, 2) && gate_populate_bank(s, 0, toks, (int)(d - w), NULL, "decode reference prefix");
+    bool ok = true;
     pulsar_multiseq_req rq[PULSAR_SPEC_LOGITS_ROWS];
     for (uint32_t j = 0; j < w; j++) { rq[j].bank = 0; rq[j].pos = (int32_t)(d - w + j); rq[j].token = toks[d - w + j]; }
     float *lg = (float *)malloc((size_t)w * (size_t)width * sizeof(float));
@@ -104,7 +143,6 @@ static bool decode_rows(pulsar_engine *e, const int *toks, uint32_t d, uint32_t 
     }
     if (ok) memcpy(out, lg, (size_t)w * (size_t)width * sizeof(float));
     free(lg);
-    pulsar_session_free(s);
     return ok;
 }
 
@@ -166,6 +204,7 @@ int GATE_ENTRY(int argc, char **argv) {
     const int ncmp = (int)h.width < width ? (int)h.width : width;
     float *one_all = (float *)malloc((size_t)PULSAR_SPEC_LOGITS_ROWS * (size_t)width * sizeof(float));
     float *cur_all = (float *)malloc((size_t)PULSAR_SPEC_LOGITS_ROWS * (size_t)width * sizeof(float));
+    float *cold_all = (float *)malloc((size_t)PULSAR_SPEC_LOGITS_ROWS * (size_t)width * sizeof(float));
     /* L284: every row of the step against the same row of the serial run (rows < w carry no reference row) */
     double rows_kl[8] = {0}, rows_kl_max[8] = {0};
     long rows_n[8] = {0}, rows_flip[8] = {0};
@@ -179,11 +218,45 @@ int GATE_ENTRY(int argc, char **argv) {
     for (uint32_t i = 0; i < h.n_depths && rc == 0; i++) {
         const uint32_t d = h.depths[i];
         const float *rr = ref + (size_t)i * h.width;
+        /* one session per depth; its one cold prefill is to the SHORTEST prefix any width needs (d - the widest
+         * width), so the grid checkpoint it leaves lies at or below every run's prefix */
+        uint32_t wmax = 0;
+        for (int k = 0; k < n_w; k++) if (d >= widths[k] + 1 && widths[k] > wmax) wmax = widths[k];
+        if (wmax == 0) continue;
+        pulsar_session *s = NULL;
+        const int ctx = (int)(((d + 4095u) / 4096u + 1u) * 4096u);
+        if (pulsar_session_create(&s, e, ctx) != 0) { fprintf(stderr, "session create failed (ctx %d)\n", ctx); rc = 1; break; }
+        if (!gate_pool_fits(s, 2) || !prefix_cold(s, toks, d - wmax) ||
+            !decode_rows(s, toks, d, wmax, cold_all, width, false)) {
+            pulsar_session_free(s);
+            rc = 1;
+            break;
+        }
+        int origin_lo = 1 << 30, origin_hi = 0, resumed = 0;
+        bool identical = false;
         for (int k = 0; k < n_w && rc == 0; k++) {
             const uint32_t w = widths[k];
             if (d < w + 1) continue;
-            if (!decode_rows(e, toks, d, w, cur_all, width, false)) { rc = 1; break; }
-            if (w > 1 && !decode_rows(e, toks, d, w, one_all, width, true)) { rc = 1; break; }
+            int origin = 0;
+            if (!prefix_resumed(s, toks, d - w, &origin) || !decode_rows(s, toks, d, w, cur_all, width, false)) { rc = 1; break; }
+            origin_lo = origin < origin_lo ? origin : origin_lo;
+            origin_hi = origin > origin_hi ? origin : origin_hi;
+            resumed++;
+            if (w == wmax) {
+                /* the resumed prefix's run against the depth's cold run: the premise of every row above */
+                identical = memcmp(cur_all, cold_all, (size_t)w * (size_t)width * sizeof(float)) == 0;
+                if (!identical) {
+                    printf("  depth %u w %u: the run over the resumed prefix DIFFERS from the cold prefill's -- "
+                           "FAIL (a resume is not the cold computation)\n", d, w);
+                    violations++;
+                }
+            }
+            if (w > 1) {
+                if (!prefix_resumed(s, toks, d - w, &origin) || !decode_rows(s, toks, d, w, one_all, width, true)) { rc = 1; break; }
+                origin_lo = origin < origin_lo ? origin : origin_lo;
+                origin_hi = origin > origin_hi ? origin : origin_hi;
+                resumed++;
+            }
             if (w == 1) memcpy(one_all, cur_all, (size_t)width * sizeof(float));
             const float *one = one_all + (size_t)(w - 1) * width, *cur = cur_all + (size_t)(w - 1) * width;
             double step_kl = 0;
@@ -230,6 +303,11 @@ int GATE_ENTRY(int argc, char **argv) {
             sum_kw[k] += klw;
             flips[k] += ar != ao;
         }
+        pulsar_session_free(s);
+        if (rc == 0)
+            printf("    [resume] depth %u: one cold prefill to %u; %d runs resumed from grid checkpoint %d..%d; "
+                   "w %u over the resumed prefix %s the cold run\n", d, d - wmax, resumed, origin_lo, origin_hi,
+                   wmax, identical ? "== (byte-identical)" : "!=");
     }
     if (rc == 0) {
         printf("  summary (mean over %u depths):\n", h.n_depths);
@@ -245,6 +323,7 @@ int GATE_ENTRY(int argc, char **argv) {
     }
     free(one_all);
     free(cur_all);
+    free(cold_all);
     free(ref);
     free(traw);
     gate_engine_close(e);

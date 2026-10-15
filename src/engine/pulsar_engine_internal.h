@@ -701,6 +701,15 @@ typedef struct {
      * the overlay file's mapping instead of the owning model's map. */
     const uint8_t *ext_map;
     uint64_t ext_size;   ///< size of that overlay mapping, for the bounds check
+    /** L295 E1: the builder's BIND RECORD for this entry -- its pulsar.tensors / pulsar.experts `role`, `block`,
+     *  `layer` and `index` -- what a role-driven binder (role_bind.h) binds by instead of the name.  Each part is
+     *  absent (empty / has_* false) when the record does not carry it: DeepSeek's and Qwen's containers write none
+     *  (their binders go by name; Qwen's expert records carry a layer and block, unread). */
+    pulsar_str bind_role;
+    pulsar_str bind_block;
+    int32_t bind_layer;   ///< valid when has_bind_layer
+    int32_t bind_index;   ///< valid when has_bind_index
+    bool has_bind_layer, has_bind_index;
 } pulsar_tensor;
 
 /** A memory-mapped GGUF file plus its parsed directory.
@@ -771,6 +780,8 @@ typedef struct {
 /* The model-family interface (L251 S1): the family descriptor, the layer plan,
  * and the Qwen4-exp family's shape/weights/state/op contract. */
 #include "family.h"
+/* L295 F4: the core row-step driver's types (a driver family's session state and step extend them). */
+#include "step_driver.h"
 #include "family_qwen.h"
 static_assert(PULSAR_FAMILY_MAX_LAYER >= PULSAR_MAX_LAYER,
               "a layer plan must hold every layer a DeepSeek profile can have");
@@ -1036,6 +1047,8 @@ static_assert(PULSAR_MSEQ_MAX <= PULSAR_GPU_MNEUTRAL_ROWS_MAX,
 
 /* L264/L265: the KV state model's model-neutral half; DeepSeek V4's answer is kv_state_ds4.cpp. */
 #include "kv_state.h"
+/* L295 F3: declared session state -- a family's state kinds, the core's alloc / paging / kv-state / capture. */
+#include "state_kinds.h"
 uint32_t pulsar_layer_compress_ratio(uint32_t il);   /* the frontier hook below needs it */
 
 /** Declares the rows of every GEMM / MoE call issued inside its scope as
@@ -1889,15 +1902,22 @@ struct pulsar_engine {
     /** The family's layer plan, built by family->load: THE authority for which
      * op runs at layer il.  DeepSeek: n_layer x PULSAR_LAYER_DS4_BLOCK. */
     pulsar_layer_plan plan;
+    /** L295 F3: the family's state declaration (state_kinds.h), built by family->load for a family whose sessions
+     *  keep declared state (pulsar_session::states); unused (n_decl 0) on DeepSeek. */
+    pulsar_state_plan state_plan;
+    /** L295 E1: the loaded family's own state, opaque to the core -- built by family->load, released by
+     *  family->unload at destroy (the plugin contract's opaque family state; DeepSeek and Qwen still keep typed
+     *  members below).  NULL = the family keeps none here. */
+    void *family_state;
     /** The Qwen4-exp family's bound weights; NULL on a DeepSeek engine. */
     pulsar_qwen_weights *qwen_weights;
     /** L284 P15: the Qwen importance-matrix collection's observer while one runs (imatrix_qwen.cpp), else NULL --
      *  the trunk's steps note their linears' input rows into it. */
     struct pulsar_imatrix_tap *imatrix_tap;
-    /** The Qwen4-exp family's tokenizer (L251 S5, src/lib/qwen_tokenizer.h), built at open from the
-     * checkpoint's own tokenizer.json + generation_config.json; NULL on a DeepSeek engine.  When set,
+    /** The Qwen4-exp family's tokenizer (L251 S5; the shared engine src/lib/bpe_tokenizer.h in its HF
+     * configuration), built at open from the checkpoint's own tokenizer.json + generation_config.json; NULL on a DeepSeek engine.  When set,
      * the engine's tokenizer entries (tokenizer.cpp) dispatch to it instead of `vocab`. */
-    struct qwen_tokenizer *qwen_tok;
+    struct bpe_tokenizer *qwen_tok;
     pulsar_model model;         ///< the target model's mapping and directory
     pulsar_model dspark_model;  ///< drafter mapping; a distinct file only when dspark_external
     pulsar_vocab vocab;         ///< tokenizer tables and special ids
@@ -1912,6 +1932,9 @@ struct pulsar_engine {
      * SPEC_ROUND_END_BATCH; the spec lane's is read by the quench guard and the allocator, both by
      * the server's lane choice. */
     pulsar_lane_cost_fit lane_cost[PULSAR_LANE_COUNT];
+    /** L288 C1: the verify width in force (pulsar_engine_set_spec_width; 0 = fused_heads_max) -- what the drafter
+     *  budgets a round's chains against. */
+    uint32_t spec_width;
     /** L288 (tf-gap pass 2): a drafter's lockstep step, measured the same way -- its wall on the chains it
      * carried (one row a chain), fed by a drafter that drafts token by token (the MTP chain) off TP.  What one
      * more draft costs beside its verify row (pulsar_spec_chain_price). */
@@ -2489,7 +2512,12 @@ struct pulsar_session {
         int32_t next_tok[PULSAR_SPEC_LOGITS_ROWS + 1];   ///< the token after each row (a drafter that pairs rows with their successor, L272 P1)
     } seed_defer;
     pulsar_gpu_graph *graph;  ///< L272 P6: the DeepSeek family's device state (KV, scratch, bank views), owned by its create / destroy; NULL on any other family
-    pulsar_qwen_state *qwen;  ///< the Qwen4-exp family's device state (family_qwen.h); NULL on a DeepSeek session
+    /** L295 F4: the core row-step driver's buffers (step_driver.h) -- the base of the family's own session state
+     *  (Qwen: pulsar_qwen_state) on a family that runs on the driver; NULL on a DeepSeek session. */
+    pulsar_driver_state *driver;
+    /** L295 F3: the session's declared state (state_kinds.h) -- every bank's per-layer state, positions and grid
+     *  checkpoints, built from the engine's state_plan by the family's create; NULL on a DeepSeek session. */
+    pulsar_state_set *states;
     token_vec checkpoint;     ///< tokens whose KV the graph currently holds, current bank
     float *logits;            ///< last decoded row, pulsar_engine_logits_width() floats
     /** Reused working set for the sampled speculative acceptance walk's
@@ -3388,6 +3416,35 @@ typedef bool (*pulsar_prefill_chunk_fn)(pulsar_session *s, const pulsar_tokens *
  *  stale), 1 when a chunk failed. */
 int pulsar_prefill_loop(pulsar_session *s, const pulsar_tokens *prompt, uint32_t start, pulsar_prefill_chunk_fn chunk,
                         void *ud);
+
+/* L295 F4: the core row-step driver's session operations (step_driver.cpp) -- a driver family's session ops and sync
+ * are these, built by the two macros below (the sync carries the family's name for its messages). */
+int pulsar_driver_session_create(pulsar_session *s, uint32_t n_banks);
+void pulsar_driver_session_destroy(pulsar_session *s);
+bool pulsar_driver_sync_state_agrees(pulsar_session *s);
+bool pulsar_driver_sync_reset_bank(pulsar_session *s);
+int pulsar_driver_prefill(pulsar_session *s, const pulsar_tokens *prompt, uint32_t start);
+void pulsar_driver_prefill_shape(pulsar_session *s, pulsar_prefill_shape *out);
+int pulsar_driver_eval_row(pulsar_session *s, int token, char *err, size_t errlen);
+int pulsar_driver_decode_multiseq(pulsar_session *s, const pulsar_multiseq_req *reqs, uint32_t n, float *logits,
+                                  int logits_cap, char *err, size_t errlen);
+int pulsar_driver_decode_mixed(pulsar_session *s, const pulsar_multiseq_req *reqs, uint32_t n_rows, float *logits,
+                               int logits_cap, uint32_t *out_n_rows, uint32_t max_head_runs, char *err, size_t errlen);
+int pulsar_driver_decode_fused(pulsar_session *s, const pulsar_multiseq_req *reqs, uint32_t n_rows,
+                               const pulsar_fused_shape *shape, float *logits, int logits_cap, uint32_t *out_n_rows,
+                               char *err, size_t errlen);
+/** A driver family's sync ops (`NAME` in its messages). */
+#define PULSAR_DRIVER_SYNC_OPS(NAME)                                                                                \
+    { NAME, pulsar_driver_sync_state_agrees, pulsar_driver_sync_reset_bank, pulsar_driver_prefill,                  \
+      pulsar_driver_prefill_shape }
+/** A driver family's session ops over its sync ops `SYNC`.  invalidate is NULL: the core's forgets the HOST view;
+ *  the device state is left alone -- the next sync of that bank finds the view invalid and resets the bank before
+ *  it prefills, so a stale state is never decoded, and the server's invalidate (a bank provision, an eviction, a
+ *  stop string mid-batch) cannot wipe OTHER banks' conversations.  The fused step heads the driver's slab. */
+#define PULSAR_DRIVER_SESSION_OPS(SYNC)                                                                             \
+    { pulsar_driver_session_create, pulsar_driver_session_destroy, SYNC, pulsar_driver_eval_row,                     \
+      pulsar_driver_decode_multiseq, pulsar_driver_decode_mixed, NULL, pulsar_driver_decode_fused,                   \
+      PULSAR_DRIVER_HEADS_MAX }
 
 /* L216 image-layout math: a port of the checkpoint's inference/image_processor.py.
  * Pure functions of the image dimensions and the block's position in the prompt,

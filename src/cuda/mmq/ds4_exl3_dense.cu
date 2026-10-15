@@ -426,7 +426,7 @@ size_t ds4_exl3_dense_multi_workspace_bytes(const ds4_exl3_dense_proj *p, int n,
     size_t b = 0;
     for (int j = 0; j < n; ++j) {
         if (ds4_exl3_dense_splits(K, p[j].N) == 0) return 0;
-        /* M > kRows is the prefill GEMM's: none; the partials are the stored width's */
+        /* M > kRows: 16-row blocks in turn (decode rows); the partials are the stored width's */
         b += proj_ws_bytes(M < kRows ? M : kRows, K, (int)exl3_out_stored((uint64_t)p[j].N));
     }
     return b;
@@ -478,11 +478,33 @@ int ds4_exl3_dense_multi_launch(const ds4_exl3_dense_proj *p, int n, const void 
     }
     /* L251: a prompt chunk takes the tensor-core GEMM (qwen_exl3_dense_prefill.cu): this
      * arm's GEMV re-decodes the trellis per 16 rows and re-reads the activation planes per 32 outputs,
-     * a decode kernel doing a GEMM's work.  Decode widths keep the GEMV bit for bit. */
-    if (prompt || M > kRows) {
+     * a decode kernel doing a GEMM's work.  Decode rows keep the GEMV bit for bit at every width. */
+    if (prompt) {
         for (int j = 0; j < n; ++j) {
             const int rc = qwen_exl3_dense_prefill_launch(p[j].w, p[j].k2, xb, p[j].y, M, K, p[j].N, trellis_bytes[j],
                                                           stream);
+            if (rc) return rc;
+        }
+        return 0;
+    }
+    if (M > kRows) {
+        /* L288 C1: decode rows past the MMA's 16 (a wide verify) run the GEMV a 16-row block at a time -- each block
+         * the call it is alone, so every row is the bytes a one-row decode gives at ANY width.  The GEMM above lost
+         * here: it decodes the whole weight to fp16 for a handful of rows (+11 ms a 32-row Qwen verify, L288 C1).
+         * The blocks reuse the workspace in stream order (each block's prep follows the last one's GEMV). */
+        static bool announced = false;
+        if (!__atomic_exchange_n(&announced, true, __ATOMIC_RELAXED))
+            fprintf(stderr, "pulsar: EXL3 dense decode rows past %d run as %d-row GEMV blocks (first call: M=%d K=%d)\n",
+                    kRows, kRows, M, K);
+        for (int r0 = 0; r0 < M; r0 += kRows) {
+            ds4_exl3_dense_proj q[kMaxProj];
+            for (int j = 0; j < n; ++j) {
+                q[j] = p[j];
+                q[j].y = p[j].y + (size_t)r0 * p[j].N;
+            }
+            const int m = M - r0 < kRows ? M - r0 : kRows;
+            const int rc = ds4_exl3_dense_multi_launch(q, n, static_cast<const __nv_bfloat16 *>(xb) + (size_t)r0 * K, m, K,
+                                                       workspace, workspace_bytes, stream, false);
             if (rc) return rc;
         }
         return 0;

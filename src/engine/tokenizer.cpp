@@ -1980,6 +1980,8 @@ static bool ds4_tok_turn_markers(pulsar_engine *e, pulsar_turn_markers *out) {
 
 static void ds4_tok_dump(pulsar_engine *e, FILE *fp, const pulsar_tokens *tokens) { dump_tokens_fp(fp, &e->vocab, tokens); }
 
+static int ds4_tok_n_tokens(pulsar_engine *e) { return e->vocab.n_vocab; }
+
 const pulsar_family_tokenizer k_ds4_tokenizer = {
     /* .encode_text              = */ ds4_tok_encode_text,
     /* .encode_rendered          = */ ds4_tok_encode_rendered,
@@ -1992,4 +1994,5 @@ const pulsar_family_tokenizer k_ds4_tokenizer = {
     /* .think_close              = */ ds4_tok_think_close,
     /* .turn_markers             = */ ds4_tok_turn_markers,
     /* .dump                     = */ ds4_tok_dump,
+    /* .n_tokens                 = */ ds4_tok_n_tokens,
 };

@@ -10,26 +10,6 @@
 
 
 
-/* A completed tool block inside unclosed reasoning can be recovered without
- * predicting what the model will emit after an injected close marker
- * (upstream ds4 51a1c14; replaces the forced-</think> injection recovery,
- * which sometimes made the model read the call as already issued and end the
- * turn without it). Keep a short overlap until the opening appears, then wait
- * for its matching end — a lone "<" or partial marker keeps decoding
- * untouched. */
-bool complete_tool_call_inside_thinking(const char *text, size_t len,
-                                        size_t *scan_from) {
-    if (!text || !scan_from) return false;
-    if (*scan_from > len) *scan_from = len;
-    const char *start = find_any_tool_start(text + *scan_from);
-    if (!start) {
-        const size_t hold = 80; /* > longest stanza opening */
-        *scan_from = len > hold ? len - hold : 0;
-        return false;
-    }
-    *scan_from = (size_t)(start - text);
-    return find_any_tool_end(start) != NULL;
-}
 
 
 
@@ -63,7 +43,7 @@ bool server::append_rendered_suffix_to_live_session(session_slot *sl,
 
 
 
-bool server::continue_after_invalid_dsml(session_slot *sl,
+bool server::continue_after_tool_error(session_slot *sl,
                                         const request *r,
                                         const thinking_state *thinking,
                                         const char *detail,
@@ -123,12 +103,12 @@ static void log_tool_calls_summary(const char *ctx, const tool_calls *calls,
     char flags[32];
     log_flags(flags, sizeof(flags), responses_protocol, false, false, false, false);
     server_log(PULSAR_LOG_TOOL,
-               "pulsar-server: tool calls ctx=%s%s%s n=%d raw_dsml=%d ids=[%s] names=[%s]",
+               "pulsar-server: tool calls ctx=%s%s%s n=%d raw_calls=%d ids=[%s] names=[%s]",
                ctx,
                flags[0] ? " " : "",
                flags,
                calls->len,
-               calls->raw_dsml && calls->raw_dsml[0] ? 1 : 0,
+               calls->raw_calls && calls->raw_calls[0] ? 1 : 0,
                ids.ptr ? ids.ptr : "",
                names.ptr ? names.ptr : "");
     buf_free(&ids);
