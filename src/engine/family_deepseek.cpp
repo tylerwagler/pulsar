@@ -259,4 +259,5 @@ const pulsar_family PULSAR_FAMILY_DEEPSEEK4 = {
     /* .vision       = */ &k_ds4_vision,
     /* .banks        = */ &k_ds4_bank_ops,
     /* .imatrix      = */ &k_ds4_imatrix,
+    /* .driver       = */ NULL,   /* L295 F4: its own forward (gpu_decode.cpp, gpu_prefill.cpp) */
 };

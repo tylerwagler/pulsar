@@ -20,19 +20,20 @@
  *     stays in pulsar_attn_layout, which is that fact's authority);
  *   - session state: create/destroy/price (DeepSeek: the pulsar_gpu_graph
  *     with its SWA rings, compressed KV, compressor and indexer frontiers and
- *     bank slabs; Qwen: DeltaNet recurrent + conv state per GDN layer, FP8 KV
- *     for the QSA layers, the PLE conv state -- src/engine/family_qwen.h);
+ *     bank slabs; Qwen: DECLARED -- state kinds per layer, state_kinds.h, which
+ *     the core allocates, prices, pages, walks and commits, L295 F3);
  *   - the forward at session-operation granularity (sync, eval, batched and
- *     mixed decode, invalidate);
+ *     mixed decode, invalidate) -- or, on the core step driver (step_driver.h,
+ *     L295 F4), only its blocks: embed, one block per layer kind, the head;
  *   - capabilities: every session feature beyond that core (banks, fork,
  *     speculation, disk KV payloads, rewind, vision, TP, imatrix, chat) is a
  *     CAP bit.  The C API refuses an operation whose cap the loaded family
  *     does not declare, by name, before any family state is touched (rule 9).
  *
  * DeepSeek's implementation is the engine as it stood at L250 (family_deepseek.cpp
- * points at it; the numerics are untouched).  Qwen's is family_qwen.cpp; its
- * per-layer ops are the pulsar_qwen_ops table (family_qwen.h) that streams
- * S2-S4 implement. */
+ * points at it; the numerics are untouched).  Qwen's is family_qwen.cpp: its
+ * state declaration and its blocks on the core driver, over the ops S2-S4
+ * implemented (family_qwen_s4.cpp). */
 #ifndef PULSAR_FAMILY_H
 #define PULSAR_FAMILY_H
 
@@ -53,6 +54,8 @@ typedef enum : uint8_t {
     PULSAR_LAYER_QWEN_GDN  = 2,  ///< Qwen4-exp `linear_attention`: Gated DeltaNet mixer + gated residual + MoE
     PULSAR_LAYER_QWEN_QSA  = 3,  ///< Qwen4-exp `full_attention`: QSA (gated GQA + block indexer) mixer + gated residual + MoE
 } pulsar_layer_kind;
+/** Layer kinds there are (a block table's width, step_driver.h). */
+#define PULSAR_LAYER_KIND_COUNT 4u
 
 /** Printable name of a layer kind ("ds4_block", "qwen_gdn", "qwen_qsa"). */
 const char *pulsar_layer_kind_name(pulsar_layer_kind k);
@@ -328,6 +331,9 @@ struct pulsar_family {
     const pulsar_family_bank_ops *banks;
     /** The family's importance-matrix collection (PULSAR_FAMILY_CAP_IMATRIX), or NULL. */
     const pulsar_family_imatrix *imatrix;
+    /** L295 F4: the family's blocks on the core row-step driver (step_driver.h; its session ops are then the driver's),
+     *  or NULL -- a family with its own forward (DeepSeek). */
+    const struct pulsar_driver_ops *driver;
 };
 
 extern const pulsar_family PULSAR_FAMILY_DEEPSEEK4;
