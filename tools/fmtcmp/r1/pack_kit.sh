@@ -17,7 +17,7 @@ AGENTIC_ARGS=${AGENTIC_ARGS:-$(cat "$HERE/AGENTIC_ARGS")}
 STAMP=$(date +%Y%m%d)
 STAGE=$(mktemp -d "$HOME/fmtcmp/kitstage.XXXX")
 K=$STAGE/fmtcmp-r1-kit
-mkdir -p "$K/tools/fidelity" "$K/selfcheck/nvfp4" "$K/r1"
+mkdir -p "$K/tools/fmtcmp" "$K/tools/fidelity" "$K/selfcheck/nvfp4" "$K/r1"
 cp "$TOOLS/fidelity/capture_vllm_prompt_logprobs.py" "$TOOLS/fidelity/fidelity_compare.py" "$K/tools/fidelity/"
 cp "$TOOLS/fmtcmp/grade.py" "$TOOLS/fmtcmp/vllm_capture.flags" "$K/tools/fmtcmp/"
 cp "$HERE/run_reference.sh" "$HERE/one_doc_suite.py" "$HERE/vllm_agentic_4gpu.flags" "$HERE/RUNBOOK.md" "$K/r1/"
