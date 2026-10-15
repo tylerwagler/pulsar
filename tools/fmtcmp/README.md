@@ -16,6 +16,26 @@ both formats the same way: teacher-forced next-token distributions against BF16,
 vLLM is the pinned card image `vllm/vllm-openai:nightly-3f1bcfd82bb2e93fcd364fc7a5491718453a77e2`
 (`@sha256:cb9bc64f...`, vLLM 0.32.0rc1.dev190+g3f1bcfd82, multi-arch) on both hosts.
 
+## NVFP4 activation modes (Tyler 2026-10-15: how much of NVFP4's loss is activation quantization, and W4A4's speed)
+
+What the checkpoint actually is (`hf_quant_config.json`: `MIXED_PRECISION`, `kv_cache_quant_algo: FP8`):
+routed experts (20,480 up + 20,480 down) and the shared experts are **NVFP4**; Mamba `in_proj` / `out_proj`,
+attention q/k/v/o and the **LM head are FP8 (W8A8 per-tensor)**; latent fc1/fc2, router, conv1d and embeddings are
+BF16; **the KV cache is FP8**.  vLLM's kernel choice (vLLM source, `kernels/linear/__init__.py`,
+`fused_moe/oracle/nvfp4.py`; the old `VLLM_NVFP4_GEMM_BACKEND`-style env vars are gone):
+
+| mode | out dir | extra serve args (`EXTRA_ARGS`) | experts | dense FP8 layers | KV |
+|---|---|---|---|---|---|
+| **W4A4** (card default) | `caps/nvfp4` | none: MoE `FLASHINFER_CUTLASS`, shared experts `FlashInferCutlassNvFp4LinearKernel` | FP4 x FP4 | W8A8 (`FlashInferFP8ScaledMM`) | FP8 |
+| **W4A16** | `caps/nvfp4-w4a16` | `--moe-backend marlin --kernel-config {"linear_backend_per_quant":{"nvfp4_w4a4":"marlin"}}` | FP4 weights, bf16 acts (Marlin) | W8A8 | FP8 |
+| **all-A16** | `caps/nvfp4-a16` | the above with `"fp8_w8a8":"marlin"` too, and `--kv-cache-dtype bfloat16` | Marlin | W8A16 (FP8 Marlin) | bf16 |
+| W4A8 | -- | **not reachable**: `VLLM_MARLIN_INPUT_DTYPE=fp8` raises for NVFP4 weights (`marlin_utils_fp4.py`), and b12x's `w4a8_nvfp4` MoE mode cannot be selected from a ModelOpt checkpoint | | | |
+
+W4A4 -> W4A16 isolates the experts' FP4 activation rounding; W4A16 -> all-A16 the dense layers' FP8 activations
+and the FP8 KV; all-A16 vs BF16 is the weight rounding alone.  Each capture job also runs `speed.py` first (prefill
+tok/s at 4k / 32k prompts, decode tok/s at 1 and 4 streams, no speculation) in the same exclusive gpuq job, and
+records `kernels.txt` (vLLM's kernel-selection log lines) so each mode proves which kernels it ran.
+
 ## The prompt set (`build_suite.py` -> `/mnt/models/fmtcmp/suite-v1`, frozen, sha256 per file)
 
 50 documents, 108,013 scored positions, all as token ids (every arm forwards the same ids; no arm tokenizes):

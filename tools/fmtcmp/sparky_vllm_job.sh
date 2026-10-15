@@ -53,7 +53,9 @@ flags_from() {  # one flag a line; "--flag value with spaces" -> two argv entrie
 ARGS=("$MODEL" --host 127.0.0.1 --port "$PORT" --load-format "$LOAD_FORMAT")
 if [ "$MODE" = capture ]; then
   flags_from "$HERE/vllm_capture.flags"
-  ARGS+=(--gpu-memory-utilization "$GPU_UTIL")
+  # --max-num-seqs 4 overrides the file's 1 (argparse: last wins) so speed.py can run 4 streams; scheduling only,
+  # the capture sends one request at a time.
+  ARGS+=(--gpu-memory-utilization "$GPU_UTIL" --max-num-seqs 4)
 elif [ "$MODE" = agentic ]; then
   flags_from "$HERE/vllm_agentic_spark.flags"
   if [ "$SPEC" = lilicorr ]; then
@@ -64,13 +66,20 @@ else
   echo "unknown mode $MODE"; exit 2
 fi
 
+# EXTRA_ARGS="--flag value ...": extra vllm serve args, word-split (write JSON without spaces), e.g. an activation mode
+for x in ${EXTRA_ARGS:-}; do ARGS+=("$x"); done
+echo "[fmtcmp] extra args: ${EXTRA_ARGS:-none}" | tee "$OUT/extra-args.txt"
+# DOCKER_ENV="K=V K2=V2": extra container env, e.g. the NVFP4 activation-mode knobs (README "Activation modes")
+DENV=()
+for kv in ${DOCKER_ENV:-}; do DENV+=(-e "$kv"); done
+echo "[fmtcmp] env: ${DOCKER_ENV:-none}" | tee "$OUT/docker-env.txt"
 echo "[fmtcmp] $(date -Is) $MODE image=$IMAGE model=$MODEL port=$PORT budget=${BUDGET}s spec=$SPEC"
 echo "[fmtcmp] vllm serve ${ARGS[*]}"
 docker run -d --name "$NAME" --gpus all --ipc=host --network host \
   -v /srv/models:/srv/models:ro -v /mnt/models:/mnt/models:ro \
   -v ~/fmtcmp/cache/vllm:/root/.cache/vllm -v ~/fmtcmp/cache/flashinfer:/root/.cache/flashinfer \
   -v ~/fmtcmp/cache/triton:/root/.triton \
-  -e HF_HUB_OFFLINE=1 -e VLLM_NO_USAGE_STATS=1 \
+  -e HF_HUB_OFFLINE=1 -e VLLM_NO_USAGE_STATS=1 "${DENV[@]}" \
   --entrypoint vllm "$IMAGE" serve "${ARGS[@]}" >/dev/null
 docker logs -f "$NAME" > "$LOG" 2>&1 &
 
@@ -90,6 +99,12 @@ curl -s "http://127.0.0.1:$PORT/v1/models" > "$OUT/served-models.json"
 
 rc=0
 if [ "$MODE" = capture ]; then
+  grep -E "Selected|backend|Using" "$LOG" | sort -u > "$OUT/kernels.txt" || true
+  if [ "${SPEED:-1}" = 1 ] && [ ! -s "$OUT/speed.json" ]; then
+    timeout --signal=TERM "$LEFT" python3 "$HERE/speed.py" --endpoint "http://127.0.0.1:$PORT" --suite "$SUITE" \
+      --out "$OUT/speed.json" || echo "[fmtcmp] speed failed rc=$?"
+    LEFT=$(( BUDGET - ($(date +%s) - T0) - 30 ))
+  fi
   timeout --signal=TERM "$LEFT" python3 "$HERE/../fidelity/capture_vllm_prompt_logprobs.py" \
     --endpoint "http://127.0.0.1:$PORT" --suite "$SUITE" --tokens-dir "$SUITE/tokens" \
     --topk 64 --out "$OUT" || rc=$?
