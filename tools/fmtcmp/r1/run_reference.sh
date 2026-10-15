@@ -5,7 +5,6 @@
 #
 #   r1/run_reference.sh check      # ~1 min: kit checksums, runtime + vLLM build, GPUs, checkpoint identity
 #   r1/run_reference.sh capture    # server up, 1-min smoke vs the shipped NVFP4 capture, then the full capture
-#   r1/run_reference.sh agentic    # the BF16 card's 4-GPU server (MTP 3) + tool-eval-bench, same args as Sparky
 #   r1/run_reference.sh bundle     # results -> fmtcmp-r1-results-<host>-<date>.tar + .sha256 (bring this back)
 #
 # RUNTIME=docker (default when docker works) | venv.  venv: r1/run_reference.sh venv  builds $WORK/venv first.
@@ -90,16 +89,12 @@ check() {
   say "check: PASS"
 }
 
-serve() {  # $1 = capture|agentic
+serve() {  # $1 = capture
   local mpath=$MODEL
   [ "$RUNTIME" = docker ] && mpath=/model
   ARGS=("$mpath" --host 127.0.0.1 --port "$PORT" --tensor-parallel-size "$TP")
-  if [ "$1" = capture ]; then
-    flags_from "$KIT/tools/fmtcmp/vllm_capture.flags"
-    ARGS+=(--gpu-memory-utilization "$GPU_UTIL")
-  else
-    flags_from "$KIT/r1/vllm_agentic_4gpu.flags"
-  fi
+  flags_from "$KIT/tools/fmtcmp/vllm_capture.flags"
+  ARGS+=(--gpu-memory-utilization "$GPU_UTIL")
   say "serve ($1, $RUNTIME): vllm serve ${ARGS[*]}"
   if [ "$RUNTIME" = docker ]; then
     docker run -d --name "$NAME" --gpus all --ipc=host --network host -v "$MODEL":/model:ro \
@@ -154,26 +149,14 @@ EOF
   say "capture complete: $n documents"
 }
 
-agentic() {
-  check
-  serve agentic
-  local teb="$KIT/tool-eval-bench-b60e2f0" args; args=$(cat "$KIT/r1/AGENTIC_ARGS")
-  mkdir -p "$WORK/agentic"
-  if [ ! -x "$WORK/teb/.venv/bin/tool-eval-bench" ]; then
-    command -v uv >/dev/null || python3 -m pip install -q uv
-    rm -rf "$WORK/teb" && cp -r "$teb" "$WORK/teb" && (cd "$WORK/teb" && uv sync --frozen -q -p 3.12)
-  fi
-  say "tool-eval-bench (pinned b60e2f0): $args"
-  # shellcheck disable=SC2086
-  (cd "$WORK/agentic" && "$WORK/teb/.venv/bin/tool-eval-bench" run --base-url "http://127.0.0.1:$PORT" \
-     --backend vllm --no-live $args) 2>&1 | tee -a "$WORK/logs/agentic.log"
-  say "agentic done"
-}
-
 bundle() {
   local out="$KIT/fmtcmp-r1-results-$(hostname -s)-$(date +%Y%m%d-%H%M).tar"
-  (cd "$WORK" && find caps logs smoke agentic -type f -print0 2>/dev/null | sort -z | xargs -0 sha256sum > MANIFEST.sha256)
-  tar -C "$WORK" -cf "$out" MANIFEST.sha256 caps logs smoke $( [ -d "$WORK/agentic" ] && echo agentic )
+  [ -d "$WORK/caps/bf16" ] || die "nothing to bundle: no $WORK/caps/bf16 (run capture first)"
+  local dirs=() d
+  for d in caps logs smoke; do [ -d "$WORK/$d" ] && dirs+=("$d"); done
+  echo "R1 = check -> capture -> bundle; no agentic eval (Tyler 2026-10-15)" > "$WORK/logs/scope.txt"
+  (cd "$WORK" && find "${dirs[@]}" -type f -print0 | sort -z | xargs -0 sha256sum > MANIFEST.sha256)
+  tar -C "$WORK" -cf "$out" MANIFEST.sha256 "${dirs[@]}"
   sha256sum "$out" > "$out.sha256"
   say "bring back: $out and $out.sha256 ($(du -h "$out" | cut -f1))"
 }
@@ -182,7 +165,6 @@ case "${1:-}" in
   venv) venv;;
   check) check;;
   capture) capture;;
-  agentic) agentic;;
   bundle) bundle;;
-  *) echo "usage: MODEL=/path/to/bf16 [RUNTIME=docker|venv] $0 venv|check|capture|agentic|bundle"; exit 2;;
+  *) echo "usage: MODEL=/path/to/bf16 [RUNTIME=docker|venv] $0 venv|check|capture|bundle"; exit 2;;
 esac

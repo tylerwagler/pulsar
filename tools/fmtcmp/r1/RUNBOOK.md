@@ -19,8 +19,7 @@ on Sparky.  Nothing here writes outside the kit directory (`work/` by default) e
   `hf download nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-BF16 --local-dir /data/nemotron35-bf16`.
   `check` compares config, index, tokenizer, template and generation-config hashes, the shard count and the total
   bytes with the copy the suite was built from (`r1/bf16-identity.sha256`, `bf16-shard-count`, `bf16-shard-bytes`).
-- ~2 GB free for results; `python3` (stdlib only) and `curl` on the host; internet for the image or wheels and,
-  for the agentic step, PyPI.
+- ~2 GB free for results; `python3` (stdlib only) and `curl` on the host; internet for the image or the wheels.
 
 ## Steps (each resumable: rerun the same command)
 
@@ -32,7 +31,6 @@ export MODEL=/data/nemotron35-bf16
 
 r1/run_reference.sh check      # ~1 min. Fails fast on: kit checksums, vLLM build, GPUs, checkpoint identity.
 r1/run_reference.sh capture    # server start 5-15 min, then ~1 min smoke, then the capture (~20-40 min).
-r1/run_reference.sh agentic    # wanted: BF16's own agentic score (~1-2 h).
 r1/run_reference.sh bundle     # -> fmtcmp-r1-results-<host>-<date>.tar + .sha256
 ```
 
@@ -47,14 +45,11 @@ prefix caching, `--max-logprobs 64`, Mamba state dtype at the checkpoint default
 2. **The capture**: 50 documents, 108,013 positions (48 chat rows <= 2,048 tokens, `code` 3,956, `story` 31,314),
    top-64 log-probs per position into `work/caps/bf16/` (~150-200 MB).  Resumable per document.
 
-**agentic** serves the BF16 card's 4-GPU recipe (`r1/vllm_agentic_4gpu.flags`: MTP 3, the card's parsers) and runs
-tool-eval-bench at the pinned commit `b60e2f0` (shipped in the kit, installed from its lock file) with
-`r1/AGENTIC_ARGS`, the arguments every other arm uses.  Results land in `work/agentic/`.
 
 ## Bring back
 
 `fmtcmp-r1-results-*.tar` + `.sha256`: `caps/bf16/*.jsonl`, the smoke grade, logs (vLLM version, GPUs, flags,
-server log) and `agentic/`, with `MANIFEST.sha256` over every file.  Put it on the NAS under
+server log), with `MANIFEST.sha256` over every file.  The scope is check -> capture -> bundle (no agentic eval).  Put it on the NAS under
 `/mnt/models/fmtcmp/r1/` and tell the L296 thread.
 
 ## If something fails

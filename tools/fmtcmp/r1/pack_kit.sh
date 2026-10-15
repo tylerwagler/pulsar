@@ -2,17 +2,15 @@
 # Assemble the R1 hand-off kit (any 4x 80 GB GPU box) (run on Sparky, after the NVFP4 capture has the smoke document):
 #   tools/fmtcmp/r1/pack_kit.sh [OUT_DIR]      -> OUT_DIR/fmtcmp-r1-kit-<date>.tar + .sha256
 # Contents: the frozen suite, the capture/grade tools, the R1 scripts, the NVFP4 capture of the smoke document,
-# tool-eval-bench at the pinned sha, the BF16 checkpoint identity, and SHA256SUMS over all of it.
+# the BF16 checkpoint identity, and SHA256SUMS over all of it.
 set -euo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
 TOOLS=$(cd "$HERE/../.." && pwd)                      # <repo>/tools
-OUT=${1:-/mnt/models/fmtcmp/kit}
+OUT=${1:-/mnt/models/fmtcmp/r1-kit}
 SUITE=${SUITE:-/mnt/models/fmtcmp/suite-v1}
 NVFP4_CAPS=${NVFP4_CAPS:-$HOME/fmtcmp/caps/nvfp4}
-TEB=${TEB:-$HOME/fmtcmp/tool-eval-bench-b60e2f0}
 BF16=${BF16:-/mnt/models/nemotron35-super-vl-bf16}
 SMOKE_DOC=${SMOKE_DOC:-chat-11}                          # a ~1k-token code row: fast, and in every capture
-AGENTIC_ARGS=${AGENTIC_ARGS:-$(cat "$HERE/AGENTIC_ARGS")}
 
 STAMP=$(date +%Y%m%d)
 STAGE=$(mktemp -d "$HOME/fmtcmp/kitstage.XXXX")
@@ -20,13 +18,11 @@ K=$STAGE/fmtcmp-r1-kit
 mkdir -p "$K/tools/fmtcmp" "$K/tools/fidelity" "$K/selfcheck/nvfp4" "$K/r1"
 cp "$TOOLS/fidelity/capture_vllm_prompt_logprobs.py" "$TOOLS/fidelity/fidelity_compare.py" "$K/tools/fidelity/"
 cp "$TOOLS/fmtcmp/grade.py" "$TOOLS/fmtcmp/vllm_capture.flags" "$K/tools/fmtcmp/"
-cp "$HERE/run_reference.sh" "$HERE/one_doc_suite.py" "$HERE/vllm_agentic_4gpu.flags" "$HERE/RUNBOOK.md" "$K/r1/"
+cp "$HERE/run_reference.sh" "$HERE/one_doc_suite.py" "$HERE/RUNBOOK.md" "$K/r1/"
 cp -r "$SUITE" "$K/suite-v1"
 [ -f "$NVFP4_CAPS/$SMOKE_DOC.jsonl" ] || { echo "no NVFP4 capture of $SMOKE_DOC yet"; exit 1; }
 cp "$NVFP4_CAPS/$SMOKE_DOC.jsonl" "$K/selfcheck/nvfp4/"
-rsync -a --exclude .venv --exclude runs --exclude data/benchmarks.sqlite "$TEB/" "$K/tool-eval-bench-b60e2f0/"
 echo "$SMOKE_DOC" > "$K/r1/SMOKE_DOC"
-echo "$AGENTIC_ARGS" > "$K/r1/AGENTIC_ARGS"
 (cd "$BF16" && sha256sum config.json model.safetensors.index.json tokenizer.json tokenizer_config.json \
    chat_template.jinja generation_config.json) > "$K/r1/bf16-identity.sha256"
 ls "$BF16"/model-*.safetensors | wc -l | tr -d ' ' > "$K/r1/bf16-shard-count"
