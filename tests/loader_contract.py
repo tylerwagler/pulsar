@@ -61,6 +61,13 @@ FAMILIES = {
         'kv': 'inkling.hidden_size',
         'stack': 'model.llm.layers.1.mlp.experts.gate_proj',
     },
+    'nemotron_h': {   # L296 N1: the 5-block mini and Nemotron 3.5 Super alike (HF blocks 0 Mamba-2, 1 MoE in both)
+        'tensor': 'language_model.backbone.layers.0.mixer.in_proj.weight',   # a dense linear (bf16 / EXL3 / mxfp8)
+        'tensor_record': 'role ssm_in, block layers, layer 0',
+        'plain': 'language_model.backbone.layers.1.mixer.gate.weight',      # the router, bf16 [4096 -> 512]
+        'kv': 'nemotron_h.hidden_size',
+        'stack': 'language_model.backbone.layers.1.mixer.experts.up_proj',
+    },
 }
 MUTATIONS = ('arch', 'kv', 'tensor', 'dtype', 'shape', 'native-dtype', 'format')
 REFUSAL_WORDS = ('refus', 'missing', 'declares', 'expected', 'unsupported', 'disagrees', 'not ', 'unknown', 'no arm', 'want ',

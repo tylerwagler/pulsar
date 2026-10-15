@@ -29,6 +29,11 @@ struct bpe_tokenizer {
     /** tiktoken ranks: a BPE token's bytes -> its id (= its rank); the views point into `bytes`, which is
      *  never resized after the map is built.  Empty for an HF configuration. */
     std::unordered_map<std::string_view, int> rank_of;
+    /** HF model.vocab with ignore_merges: a vocab token's bytes -> its id (views into `bytes`, as rank_of's). */
+    std::unordered_map<std::string_view, int> vocab_of;
+    /** The whole-piece lookup a piece takes before any merge (tokenizers' ignore_merges, tiktoken's encoder
+     *  lookup): &rank_of (tiktoken), &vocab_of (HF with ignore_merges), or NULL (HF without). */
+    const std::unordered_map<std::string_view, int> *whole = nullptr;
     struct added { std::string text; int id; };
     std::vector<added> added_tokens;      ///< longest first
     bool added_first[256] = {};           ///< first bytes that can open an added token
@@ -262,14 +267,18 @@ size_t qwen35_match_at(const uint32_t *s, const uint32_t *cl, size_t n, size_t i
     return i + 1;   /* unreachable: every codepoint class is covered above */
 }
 
-/* o200k -- tiktoken's o200k_base split (Inkling):
- * [^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?
- *   |[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?
- *   |\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+
+/* The cased-word family of splits: o200k (tiktoken's o200k_base, Inkling) and tekken (Mistral's Tekken,
+ * Nemotron-H) share every alternative but two -- whether a word takes a trailing contraction C, and how many
+ * digits \p{N} takes (D):
+ * [^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+C
+ *   |[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*C
+ *   |\p{N}{1,D}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+
+ * o200k: C = (?i:'s|'t|'re|'ve|'m|'ll|'d)?, D = 3; tekken: no C, D = 1.
  * The two word alternatives backtrack: the optional prefix is tried taken first, then not; the greedy
  * upper-class run gives back one codepoint at a time until the lower class can start (Lm, Lo and M are in
  * both classes). */
-size_t o200k_match_at(const uint32_t *s, const uint32_t *cl, size_t n, size_t i) {
+template <bool CONTRACTIONS, size_t DIGITS>
+size_t cased_word_match_at(const uint32_t *s, const uint32_t *cl, size_t n, size_t i) {
     constexpr uint32_t UP = CL_LU | CL_LT | CL_LM | CL_LO | CL_M;   /* [\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}] */
     constexpr uint32_t LO = CL_LL | CL_LM | CL_LO | CL_M;           /* [\p{Ll}\p{Lm}\p{Lo}\p{M}] */
     const bool prefix = s[i] != '\r' && s[i] != '\n' && !(cl[i] & (CL_L | CL_N));
@@ -277,17 +286,18 @@ size_t o200k_match_at(const uint32_t *s, const uint32_t *cl, size_t n, size_t i)
         while (k < n && (cl[k] & mask)) k++;
         return k;
     };
+    auto tail = [&](size_t k) { return CONTRACTIONS ? contraction_at(s, n, k) : k; };
     /* UP* LO+ from k: 0 = no match */
     auto word_lower = [&](size_t k) -> size_t {
         const size_t j0 = run(k, UP);
         for (size_t j = j0 + 1; j-- > k;)
-            if (j < n && (cl[j] & LO)) return contraction_at(s, n, run(j, LO));
+            if (j < n && (cl[j] & LO)) return tail(run(j, LO));
         return 0;
     };
     /* UP+ LO* from k: 0 = no match */
     auto word_upper = [&](size_t k) -> size_t {
         if (k >= n || !(cl[k] & UP)) return 0;
-        return contraction_at(s, n, run(run(k, UP), LO));
+        return tail(run(run(k, UP), LO));
     };
     if (prefix && i + 1 < n)
         if (const size_t e = word_lower(i + 1)) return e;
@@ -295,10 +305,10 @@ size_t o200k_match_at(const uint32_t *s, const uint32_t *cl, size_t n, size_t i)
     if (prefix && i + 1 < n)
         if (const size_t e = word_upper(i + 1)) return e;
     if (const size_t e = word_upper(i)) return e;
-    /* \p{N}{1,3} */
+    /* \p{N}{1,D} */
     if (cl[i] & CL_N) {
         size_t k = i + 1;
-        while (k < n && k < i + 3 && (cl[k] & CL_N)) k++;
+        while (k < n && k < i + DIGITS && (cl[k] & CL_N)) k++;
         return k;
     }
     /*  ?[^\s\p{L}\p{N}]+[\r\n/]* */
@@ -315,14 +325,30 @@ size_t o200k_match_at(const uint32_t *s, const uint32_t *cl, size_t n, size_t i)
     return i + 1;   /* unreachable: every codepoint class is covered above */
 }
 
+/* o200k -- tiktoken's o200k_base split (Inkling): contractions, \p{N}{1,3} */
+size_t o200k_match_at(const uint32_t *s, const uint32_t *cl, size_t n, size_t i) {
+    return cased_word_match_at<true, 3>(s, cl, n, i);
+}
+
+/* tekken -- Mistral's Tekken split (Nemotron-H): no contractions, \p{N} one digit.  tokenizer_config.json's
+ * fix_mistral_regex names this same pattern (transformers' replacement string is byte-equal to the stored one), so
+ * the flag changes nothing. */
+size_t tekken_match_at(const uint32_t *s, const uint32_t *cl, size_t n, size_t i) {
+    return cased_word_match_at<false, 1>(s, cl, n, i);
+}
+
 const char kQwen35Pattern[] =
     R"re((?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|\p{N}| ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+)re";
 const char kO200kPattern[] =
     R"re([^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+)re";
 
+const char kTekkenPattern[] =
+    R"re([^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+)re";
+
 const bpe_pretok_pattern k_patterns[] = {
     {"qwen35", kQwen35Pattern, qwen35_match_at},
     {"o200k", kO200kPattern, o200k_match_at},
+    {"tekken", kTekkenPattern, tekken_match_at},
 };
 
 }  // namespace
@@ -383,9 +409,9 @@ void bpe(const bpe_tokenizer *t, const unsigned char *p, size_t n, std::vector<i
         out->push_back(t->byte_id[p[0]]);
         return;
     }
-    if (!t->rank_of.empty()) {   /* a piece that is a token is that token */
-        auto it = t->rank_of.find(std::string_view((const char *)p, n));
-        if (it != t->rank_of.end()) {
+    if (t->whole) {   /* a piece that is a token is that token */
+        auto it = t->whole->find(std::string_view((const char *)p, n));
+        if (it != t->whole->end()) {
             out->push_back(it->second);
             return;
         }
@@ -549,6 +575,32 @@ bool base64_decode(const char *p, size_t n, std::string *out) {
     return true;
 }
 
+/* The HF pipelines the loader implements, one per registered pattern it serves: every tokenizer.json section
+ * around the Split, as the checkpoint's file spells it (pyjson_dump form).  Options that move only offsets (a
+ * ByteLevel step's trim_offsets; the post-processor's and decoder's add_prefix_space / use_regex, which read
+ * offsets and decode text, never ids) are part of the spelling, so a file is one row or refused -- the gates grade
+ * each row's ids against HF tokenizers. */
+struct hf_pipeline {
+    const char *pattern;         ///< the registered pattern's name
+    const char *normalizer;      ///< the normaliser (NFC or none)
+    bool nfc;                    ///< ... as the engine runs it
+    const char *byte_level;      ///< the ByteLevel step after the Split
+    const char *decoder;
+    const char *post_processor;
+    const char *affix;           ///< model.continuing_subword_prefix and .end_of_word_suffix
+    bool ignore_merges;          ///< a piece found whole in the vocab is that token (tokenizers' BPE::ignore_merges)
+};
+const hf_pipeline k_hf_pipelines[] = {
+    {"qwen35", R"({"type": "NFC"})", true,
+     R"({"type": "ByteLevel", "add_prefix_space": false, "trim_offsets": false, "use_regex": false})",
+     R"({"type": "ByteLevel", "add_prefix_space": false, "trim_offsets": false, "use_regex": false})",
+     R"({"type": "ByteLevel", "add_prefix_space": false, "trim_offsets": false, "use_regex": false})", "\"\"", false},
+    {"tekken", "null", false,
+     R"({"type": "ByteLevel", "add_prefix_space": false, "trim_offsets": true, "use_regex": false})",
+     R"({"type": "ByteLevel", "add_prefix_space": true, "trim_offsets": true, "use_regex": true})",
+     R"({"type": "ByteLevel", "add_prefix_space": true, "trim_offsets": false, "use_regex": true})", "null", true},
+};
+
 }  // namespace
 
 bpe_tokenizer *bpe_tokenizer_load_hf(const char *tokenizer_json, size_t tokenizer_len, const char *eos_config_json,
@@ -560,9 +612,8 @@ bpe_tokenizer *bpe_tokenizer_load_hf(const char *tokenizer_json, size_t tokenize
         return NULL;
     }
     /* The pipeline, section by section: anything else is a different tokenizer.  The pre-tokenizer's
-     * regex names its pattern in the registry. */
-    static const char kByteLevel[] =
-        R"({"type": "ByteLevel", "add_prefix_space": false, "trim_offsets": false, "use_regex": false})";
+     * regex names its pattern in the registry, and the pattern names the one pipeline around it this engine
+     * implements (k_hf_pipelines). */
     const pyjson_value *pre = doc.get("pre_tokenizer");
     const pyjson_value *steps = pre ? pre->get("pretokenizers") : NULL;
     const pyjson_value *split = steps && steps->kind == pyjson_value::ARR && !steps->a.empty() ? &steps->a[0] : NULL;
@@ -573,25 +624,32 @@ bpe_tokenizer *bpe_tokenizer_load_hf(const char *tokenizer_json, size_t tokenize
         refuse(err, errlen, "the pre-tokenizer's Split regex is not a registered pattern (bpe_pretok_*)");
         return NULL;
     }
+    const hf_pipeline *pl = NULL;
+    for (const hf_pipeline &x : k_hf_pipelines)
+        if (!strcmp(x.pattern, pattern->name)) pl = &x;
+    if (!pl) {
+        refuse(err, errlen, "pattern \"%s\" has no HF pipeline row (k_hf_pipelines)", pattern->name);
+        return NULL;
+    }
     std::string pre_expect = R"({"type": "Sequence", "pretokenizers": [{"type": "Split", "pattern": {"Regex": )";
     pyjson_dump_string(pattern->regex, strlen(pattern->regex), &pre_expect);
     pre_expect += R"(}, "behavior": "Isolated", "invert": false}, )";
-    pre_expect += kByteLevel;
+    pre_expect += pl->byte_level;
     pre_expect += "]}";
-    if (!expect_dump(doc.get("normalizer"), R"({"type": "NFC"})", "the normalizer", err, errlen) ||
+    if (!expect_dump(doc.get("normalizer"), pl->normalizer, "the normalizer", err, errlen) ||
         !expect_dump(pre, pre_expect.c_str(), "the pre-tokenizer", err, errlen) ||
-        !expect_dump(doc.get("decoder"), kByteLevel, "the decoder", err, errlen) ||
-        !expect_dump(doc.get("post_processor"), kByteLevel, "the post-processor", err, errlen))
+        !expect_dump(doc.get("decoder"), pl->decoder, "the decoder", err, errlen) ||
+        !expect_dump(doc.get("post_processor"), pl->post_processor, "the post-processor", err, errlen))
         return NULL;
     const pyjson_value *model = doc.get("model");
     if (!model || model->kind != pyjson_value::OBJ) {
         refuse(err, errlen, "tokenizer.json has no model object");
         return NULL;
     }
-    static const struct { const char *key, *value; } model_expect[] = {
+    const struct { const char *key, *value; } model_expect[] = {
         {"type", "\"BPE\""}, {"dropout", "null"}, {"unk_token", "null"},
-        {"continuing_subword_prefix", "\"\""}, {"end_of_word_suffix", "\"\""},
-        {"fuse_unk", "false"}, {"byte_fallback", "false"}, {"ignore_merges", "false"},
+        {"continuing_subword_prefix", pl->affix}, {"end_of_word_suffix", pl->affix},
+        {"fuse_unk", "false"}, {"byte_fallback", "false"}, {"ignore_merges", pl->ignore_merges ? "true" : "false"},
     };
     for (const auto &e : model_expect) {
         char what[64];
@@ -609,7 +667,7 @@ bpe_tokenizer *bpe_tokenizer_load_hf(const char *tokenizer_json, size_t tokenize
 
     bpe_tokenizer *t = new bpe_tokenizer();
     t->pattern = pattern;
-    t->nfc = true;
+    t->nfc = pl->nfc;
     uint32_t cp_of[256];
     byte_level_map(cp_of);
     std::unordered_map<uint32_t, int> byte_of_cp;
@@ -620,6 +678,8 @@ bpe_tokenizer *bpe_tokenizer_load_hf(const char *tokenizer_json, size_t tokenize
     int max_id = -1;
     std::vector<std::pair<int, std::string>> entries;
     entries.reserve(vocab->o.size() + added->a.size());
+    std::unordered_map<int, size_t> vocab_at;   /* a vocab id -> its entry */
+    vocab_at.reserve(vocab->o.size() * 2);
     for (const auto &kv : vocab->o) {
         if (kv.second.kind != pyjson_value::INT) { refuse(err, errlen, "vocab id is not an int"); delete t; return NULL; }
         const int id = atoi(kv.second.num.c_str());
@@ -638,6 +698,7 @@ bpe_tokenizer *bpe_tokenizer_load_hf(const char *tokenizer_json, size_t tokenize
             raw.push_back((char)it->second);
             i += (size_t)k;
         }
+        vocab_at[id] = entries.size();
         entries.emplace_back(id, std::move(raw));
         max_id = std::max(max_id, id);
     }
@@ -650,7 +711,17 @@ bpe_tokenizer *bpe_tokenizer_load_hf(const char *tokenizer_json, size_t tokenize
         }
         if (!check_added_flags(a, content->s, err, errlen)) { delete t; return NULL; }
         const int iid = atoi(id->num.c_str());
-        entries.emplace_back(iid, content->s);
+        /* an added token the vocab also holds (Nemotron-H's 1000 specials) is ONE entry: the same bytes, or refused */
+        auto in_vocab = vocab_at.find(iid);
+        if (in_vocab != vocab_at.end()) {
+            if (entries[in_vocab->second].second != content->s) {
+                refuse(err, errlen, "added token %s (id %d) is not the vocab's bytes at that id", content->s.c_str(), iid);
+                delete t;
+                return NULL;
+            }
+        } else {
+            entries.emplace_back(iid, content->s);
+        }
         t->added_tokens.push_back({content->s, iid});
         max_id = std::max(max_id, iid);
     }
@@ -664,16 +735,27 @@ bpe_tokenizer *bpe_tokenizer_load_hf(const char *tokenizer_json, size_t tokenize
     t->merges.reserve(merges->a.size() * 2);
     for (size_t r = 0; r < merges->a.size(); r++) {
         const pyjson_value &m = merges->a[r];
-        const size_t sp = m.kind == pyjson_value::STR ? m.s.find(' ') : std::string::npos;
-        if (sp == std::string::npos || m.s.find(' ', sp + 1) != std::string::npos) {
-            refuse(err, errlen, "merge %zu is not one \"a b\" string", r);
+        /* tokenizers writes a merge as one "a b" string (byte-level text has no raw space) or an [a, b] pair */
+        std::string a, b;
+        if (m.kind == pyjson_value::STR) {
+            const size_t sp = m.s.find(' ');
+            if (sp != std::string::npos && m.s.find(' ', sp + 1) == std::string::npos) {
+                a = m.s.substr(0, sp);
+                b = m.s.substr(sp + 1);
+            }
+        } else if (m.kind == pyjson_value::ARR && m.a.size() == 2 && m.a[0].kind == pyjson_value::STR &&
+                   m.a[1].kind == pyjson_value::STR) {
+            a = m.a[0].s;
+            b = m.a[1].s;
+        }
+        if (a.empty() || b.empty()) {
+            refuse(err, errlen, "merge %zu is neither one \"a b\" string nor an [a, b] pair", r);
             delete t;
             return NULL;
         }
-        const std::string a = m.s.substr(0, sp), b = m.s.substr(sp + 1);
         auto ia = id_of.find(a), ib = id_of.find(b), im = id_of.find(a + b);
         if (ia == id_of.end() || ib == id_of.end() || im == id_of.end()) {
-            refuse(err, errlen, "merge %zu (%s) names a token the vocab lacks", r, m.s.c_str());
+            refuse(err, errlen, "merge %zu (%s %s) names a token the vocab lacks", r, a.c_str(), b.c_str());
             delete t;
             return NULL;
         }
@@ -683,6 +765,11 @@ bpe_tokenizer *bpe_tokenizer_load_hf(const char *tokenizer_json, size_t tokenize
     if (!finish_table(t, &entries, max_id, eos_config_json, eos_len, err, errlen)) {
         delete t;
         return NULL;
+    }
+    if (pl->ignore_merges) {   /* the vocab's tokens, whole (views into t->bytes, fixed from here on) */
+        t->vocab_of.reserve(vocab_at.size() * 2);
+        for (const auto &v : vocab_at) t->vocab_of.emplace(std::string_view(t->bytes[(size_t)v.first]), v.first);
+        t->whole = &t->vocab_of;
     }
     return t;
 }
@@ -766,6 +853,7 @@ bpe_tokenizer *bpe_tokenizer_load_tiktoken(const char *ranks, size_t ranks_len, 
         if (it == t->rank_of.end()) { refuse(err, errlen, "byte 0x%02x has no token", b); delete t; return NULL; }
         t->byte_id[b] = it->second;
     }
+    t->whole = &t->rank_of;
     return t;
 }
 

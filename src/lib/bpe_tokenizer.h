@@ -12,7 +12,7 @@
  *   3. The run is split by the configuration's pre-tokenizer pattern (Oniguruma semantics, UCD 16.0.0
  *      classes), each piece mapped byte -> GPT-2 codepoint, and merged:
  *      - HF merges (tokenizer.json): by merge rank exactly as tokenizers' Word::merge_all does (lowest rank
- *        first, leftmost among equals);
+ *        first, leftmost among equals) -- after, with ignore_merges, the whole-piece lookup below;
  *      - tiktoken ranks: a piece that IS a token is that token (tokenizers' ignore_merges, tiktoken's
  *        encoder lookup); otherwise the adjacent pair whose concatenation has the lowest rank merges
  *        first, leftmost among equals (tiktoken's byte_pair_merge).
@@ -41,7 +41,7 @@ struct bpe_tokenizer;
  * (JSON-decoded), and the hand-written matcher that IS that regex under Oniguruma (graded over every scalar
  * value against tokenizers' own Split).  The registry is the one place a pattern lives. */
 struct bpe_pretok_pattern {
-    const char *name;   ///< "qwen35" (Qwen3.5 / 3.8), "o200k" (Inkling; tiktoken's o200k_base split)
+    const char *name;   ///< "qwen35" (Qwen3.5 / 3.8), "o200k" (Inkling; tiktoken's o200k_base split), "tekken" (Nemotron-H)
     const char *regex;  ///< the spelling tokenizer.json carries
     /** The end of the first alternative that matches at `i` of the codepoints `s` (classes `cl`, from the
      *  engine's Unicode table), `n` long. */
@@ -52,10 +52,11 @@ const bpe_pretok_pattern *bpe_pretok_by_name(const char *name);
 /** The registered pattern whose regex is spelled exactly `regex`, or NULL. */
 const bpe_pretok_pattern *bpe_pretok_by_regex(const char *regex);
 
-/** HF tokenizer.json (BPE model, NFC normaliser, Split(registered regex) + ByteLevel pre-tokenizer,
- * ByteLevel decoder and post-processor -- the Qwen pipeline) plus the config file whose `eos_token_id`
- * (an int or a list, in its order) lists the stop ids (Qwen: generation_config.json).  NULL + a one-line
- * reason on refusal. */
+/** HF tokenizer.json (BPE model, Split(registered regex) + ByteLevel pre-tokenizer, ByteLevel decoder and
+ * post-processor) in one of the pipelines the registered pattern names -- Qwen's (NFC normaliser, every merge
+ * applied) or Nemotron-H's (no normaliser, ignore_merges: a piece found whole in the vocab is that token) --
+ * plus the config file whose `eos_token_id` (an int or a list, in its order) lists the stop ids (Qwen,
+ * Nemotron-H: generation_config.json).  NULL + a one-line reason on refusal. */
 bpe_tokenizer *bpe_tokenizer_load_hf(const char *tokenizer_json, size_t tokenizer_len, const char *eos_config_json,
                                      size_t eos_len, char *err, size_t errlen);
 

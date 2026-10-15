@@ -643,6 +643,8 @@ const server_family_ops *server_family_for_format(pulsar_chat_format fmt);
 const server_family_ops *server_family_for_engine(const pulsar_engine *e);
 /** A family table in its own file (chat_family.cpp's switch names it): Inkling's (family_inkling.cpp). */
 extern const server_family_ops k_family_inkling;
+/** Nemotron-H's (family_nemotron_h.cpp). */
+extern const server_family_ops k_family_nemotron_h;
 /** The effort names, in the order of server_effort_map::named's columns (chat_family.cpp). */
 extern const char *const k_effort_names[CHAT_EFFORT_NAMES];
 /* What every family's render shares (chat_family.cpp), for a table in its own file: */
