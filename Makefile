@@ -273,9 +273,12 @@ CUDA_REGRESSION_BINS = tests/cuda_long_context_smoke tests/moe_route_bounds_gate
 # 2026-10-14: the ten run CONCURRENTLY, each one's output kept together (-O).  They are model-free and mostly
 # host-bound (their references run on the CPU: measured alone, 258 s in series, the longest 114 s of which 113 s
 # user time), so in series they were 258 s of the battery's serial front.  No gate here grades a time.
+# The sub-make gets its own -j: the parent's job-slot flags are dropped from MAKEFLAGS (command-line variables are
+# kept), else make warns "-jN forced in submake" -- a warning in the battery log, whose baseline is zero.
 CUDA_REGRESSION_RUNS = $(CUDA_REGRESSION_BINS:tests/%=cuda-regression-run/%)
 cuda-regression: $(CUDA_REGRESSION_BINS)
-	@$(MAKE) --no-print-directory -O -k -j$(words $(CUDA_REGRESSION_BINS)) $(CUDA_REGRESSION_RUNS)
+	@MAKEFLAGS='$(filter-out -j% --jobserver%,$(MAKEFLAGS))' \
+	  $(MAKE) --no-print-directory -O -k -j$(words $(CUDA_REGRESSION_BINS)) $(CUDA_REGRESSION_RUNS)
 .PHONY: $(CUDA_REGRESSION_RUNS)
 $(CUDA_REGRESSION_RUNS): cuda-regression-run/%: tests/%
 	./tests/$* $(if $(filter exl3_half_gate,$*),$(EXL3_HALF_SCRATCH))
