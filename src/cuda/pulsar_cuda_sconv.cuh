@@ -17,19 +17,21 @@ __device__ __forceinline__ uint16_t pulsar_sconv_f2bf(float f) { return __bfloat
 
 /** The tap sum for one (row, channel): hist[0 .. K-2] are the inputs at the
  *  K-1 positions before the row, oldest first (0 before the sequence's
- *  start); x is the row's own input; w[0 .. K-1] the channel's taps.  An f32
- *  fma chain, oldest tap first. */
+ *  start); x is the row's own input; w[0 .. K-1] the channel's taps; b the
+ *  channel's bias (0 without one).  An f32 fma chain from b, oldest tap first. */
 template <int K>
-__device__ __forceinline__ float pulsar_sconv_taps(const float *w, const float *hist, float x) {
-    float acc = 0.0f;
+__device__ __forceinline__ float pulsar_sconv_taps(const float *w, const float *hist, float x, float b) {
+    float acc = b;
 #pragma unroll
     for (int i = 0; i < K - 1; ++i) acc = __fmaf_rn(w[i], hist[i], acc);
     return __fmaf_rn(w[K - 1], x, acc);
 }
 
 /** The block's output for one (row, channel) from its tap sum: the residual
- *  (when declared) added in f32, then one bf16 rounding. */
-__device__ __forceinline__ uint16_t pulsar_sconv_out(float acc, float x, int residual) {
+ *  (when declared) added in f32, or the SiLU (when declared) in f32, then one
+ *  bf16 rounding.  The two are exclusive (pulsar_sconv_forward refuses both). */
+__device__ __forceinline__ uint16_t pulsar_sconv_out(float acc, float x, int residual, int silu) {
+    if (silu) return pulsar_sconv_f2bf(acc / (1.0f + __expf(-acc)));
     return pulsar_sconv_f2bf(residual ? __fadd_rn(acc, x) : acc);
 }
 

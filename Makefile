@@ -274,7 +274,8 @@ pulsar-agent: $(AGENT_OBJS) src/lib/pulsar_help.o src/lib/pulsar_kvtext.o src/li
 # S4 (router / MoE / GR / PLE) beside DeepSeek's and the shared EXL3 arms.
 CUDA_REGRESSION_BINS = tests/cuda_long_context_smoke tests/moe_route_bounds_gate tests/expert_table_gate \
                        tests/exl3_moe_epilogue_gate tests/exl3_dense_gate tests/exl3_moe_prefill_gate tests/exl3_half_gate \
-                       tests/gdn_gate tests/qsa_attn_gate tests/qwen_s4_gate tests/router_gate tests/gqa_attn_gate tests/sconv_gate tests/head_gate
+                       tests/gdn_gate tests/qsa_attn_gate tests/qwen_s4_gate tests/router_gate tests/gqa_attn_gate tests/sconv_gate tests/head_gate \
+                       tests/mamba2_gate
 # 2026-10-14: they run CONCURRENTLY, each one's output kept together (-O).  They are model-free and mostly
 # host-bound (their references run on the CPU: measured alone, 258 s in series, the longest 114 s of which 113 s
 # user time), so in series they were 258 s of the battery's serial front.  No gate here grades a time.
@@ -697,6 +698,33 @@ tests/sconv_bench: tests/sconv_bench.cu src/cuda/pulsar_cuda_sconv.o src/cuda/pu
 sconv-mini-grade: tests/sconv_gate
 	@test -n "$(SCONV_MINI_FIXTURE)" || { echo "sconv-mini-grade: set SCONV_MINI_FIXTURE (see tests/sconv_mini_fixture.py)"; exit 1; }
 	./tests/sconv_gate --fixture $(SCONV_MINI_FIXTURE)
+
+# L296 N2: the family-neutral Mamba-2 (SSD) mixer block (runtime heads / groups / norm group / conv kernel; the
+# conv is E3's block) vs a double reference with its bf16 rounding points; decode == prefill == chunked == verify
+# == batched bit-exact; DELTA + SNAPSHOT verify capture, commit and rollback to any accepted row; mutations;
+# refusals.  Links the PRODUCTION objects; pass the served arch (CUDA_ARCH=sm_120f).  Model-free.
+src/cuda/pulsar_cuda_mamba2.o: src/cuda/pulsar_cuda_mamba2.h src/cuda/pulsar_cuda_sconv.h src/cuda/pulsar_cuda_sconv.cuh
+tests/mamba2_gate: tests/mamba2_gate.cu tests/mamba2_ref.h tests/sconv_ref.h src/cuda/pulsar_cuda_mamba2.o src/cuda/pulsar_cuda_sconv.o src/cuda/pulsar_cuda_mamba2.h Makefile
+	$(NVCC) $(NVCCFLAGS) -std=c++17 -Isrc -Isrc/cuda -o $@ tests/mamba2_gate.cu src/cuda/pulsar_cuda_mamba2.o src/cuda/pulsar_cuda_sconv.o
+
+.PHONY: mamba2-gate
+mamba2-gate: tests/mamba2_gate
+	./tests/mamba2_gate
+
+# The block's launches at Nemotron 3.5 Super's shapes (decode 1 / 16 sequences, a verify with capture + commit,
+# a 4096-row prefill) against a measured streaming roofline.  Not a gate.
+tests/mamba2_bench: tests/mamba2_bench.cu src/cuda/pulsar_cuda_mamba2.o src/cuda/pulsar_cuda_sconv.o src/cuda/pulsar_cuda_mamba2.h Makefile
+	$(NVCC) $(NVCCFLAGS) -std=c++17 -Isrc -Isrc/cuda -o $@ tests/mamba2_bench.cu src/cuda/pulsar_cuda_mamba2.o src/cuda/pulsar_cuda_sconv.o
+
+# The block on real Nemotron 3.5 Super VL Mamba layers (HF blocks 0 / 2 / 4) against transformers'
+# NemotronHMamba2Mixer in fp32: the block's distance must be its declared bf16 rounding points' (vLLM's) and
+# nothing more; the f32 state and arithmetic graded against a double with those rounding points.
+# MAMBA2_MINI_FIXTURE is the directory tests/mamba2_mini_fixture.py writes (CPU, a few minutes):
+# python3 tests/mamba2_mini_fixture.py /mnt/models/nemotron35-super-vl-bf16 DIR.
+.PHONY: mamba2-mini-grade
+mamba2-mini-grade: tests/mamba2_gate
+	@test -n "$(MAMBA2_MINI_FIXTURE)" || { echo "mamba2-mini-grade: set MAMBA2_MINI_FIXTURE (see tests/mamba2_mini_fixture.py)"; exit 1; }
+	./tests/mamba2_gate --fixture $(MAMBA2_MINI_FIXTURE)
 
 # L295 E5: the family head options -- the embedding RMSNorm (graded vs double,
 # batch-independent bytes), the logits finish (scale bit-exact, padding -inf,
@@ -2315,7 +2343,7 @@ gates-dev:
 	        src/engine/family*|src/families/*|src/engine/role_bind*|tests/inkling_*|src/engine/*qwen*|tests/qwen_*|tests/session_contract*|src/engine/state_kinds*|src/engine/step_driver*|tests/state_kinds*|src/engine/session*|src/engine/safetensors*|src/engine/model.cpp|src/engine/weights*|src/engine/tensor_bind*|tests/loader_*|src/engine/sync_driver*|src/engine/prefill_loop*|src/engine/checkpoint*|src/engine/kv_state*) cls=engine; family=1 ;; \
 	        *exl3*) cls=exl3; exl3=1 ;; \
 	        *gdn*) cls=gdn; gdn=1 ;; \
-	        *sconv*|src/cuda/pulsar_cuda_head*|tests/head_*) cls=blocks; blocks=1 ;; \
+	        *sconv*|*mamba2*|src/cuda/pulsar_cuda_head*|tests/head_*) cls=blocks; blocks=1 ;; \
 	        src/cuda/*attn*|src/cuda/*attention*) cls=attn; attn=1 ;; \
 	        src/cuda/*norm_kv*) cls=attn; attn=1 ;; \
 	        src/cuda/*) cls=cuda ;; \
@@ -2349,7 +2377,7 @@ gates-dev:
 	if [ $$family -eq 1 ]; then printf '  family gates: selected (the family interface; the session contract on both families)\n'; fi; \
 	if [ $$attn -eq 1 ]; then printf '  cuda-attn-gates: selected (attention kernels)\n'; fi; \
 	if [ $$router -eq 1 ]; then printf '  router-gate + qwen-s4-gate: selected (the shared router, the rows MoE block)\n'; fi; \
-	if [ $$blocks -eq 1 ]; then printf '  block gates: sconv-gate, head-gate (the L295 short convolution and head options)\n'; fi; \
+	if [ $$blocks -eq 1 ]; then printf '  block gates: sconv-gate, head-gate, mamba2-gate (the L295 short convolution and head options, the L296 Mamba-2 block)\n'; fi; \
 	if [ $$server -eq 1 ]; then printf '  server: chat smoke + the --server/--api unit switches\n'; fi; \
 	$(MAKE) --no-print-directory seam-check CUDA_ARCH=sm_120f || rc=1; \
 	$(MAKE) --no-print-directory cuda-reap-router-audit CUDA_ARCH=sm_120f \
@@ -2376,7 +2404,7 @@ gates-dev:
 	  $(MAKE) --no-print-directory gdn-gate CUDA_ARCH=sm_120f || rc=1; \
 	fi; \
 	if [ $$blocks -eq 1 ]; then \
-	  $(MAKE) --no-print-directory sconv-gate head-gate CUDA_ARCH=sm_120f || rc=1; \
+	  $(MAKE) --no-print-directory sconv-gate head-gate mamba2-gate CUDA_ARCH=sm_120f || rc=1; \
 	fi; \
 	if [ $$exl3 -eq 1 ]; then \
 	  $(MAKE) --no-print-directory exl3-dequant-gate CUDA_ARCH=sm_120f || rc=1; \
