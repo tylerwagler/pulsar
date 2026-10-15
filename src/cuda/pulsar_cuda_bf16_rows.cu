@@ -187,7 +187,9 @@ bf16_moe_fold_kernel(const float *__restrict__ g, const float *__restrict__ u, c
     const int64_t p = i / mid;
     if (sel[p] < 0) return;
     if constexpr (ACT == PULSAR_FFN_ACT_RELU2) {
-        h[i] = __float2bfloat16(pulsar_relu2_elem(u[i], wts[p]));   /* L296 N4: the one relu^2 expression */
+        /* pulsar_relu2_elem: F7 18f2278f's NaN-keeping relu^2 (x <= 0 ? 0 : x, then r * r * w), the one expression the
+         * non-gated shared expert's producer reads too */
+        h[i] = __float2bfloat16(pulsar_relu2_elem(u[i], wts[p]));
     } else {
         h[i] = __float2bfloat16(pulsar_swiglu_elem(g[i], u[i], wts[p], clamp));
     }
