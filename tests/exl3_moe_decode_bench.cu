@@ -228,7 +228,7 @@ int main(int argc, char **argv) {
                                      static_cast<__nv_bfloat16 *>(sh_h), sws, sws_bytes};
             if (k2s && exl3_moe_shared_fork(sh, xa, T, H, H, as_prompt, st) != 0) return -1;   /* the family's order */
             return exl3_moe_routed_launch(w, sel + (size_t)q * maxP, wts + (size_t)q * maxP, T, TOPK, 10.0f, xa, b, out,
-                                          nf, 1u, as_prompt, st, k2s ? &sh : nullptr);
+                                          nf, 1u, as_prompt, st, k2s ? &sh : nullptr, k2s ? 1 : 0);
         };
         for (int i = 0; i < NROUTE * NL; i++)
             if (layer(i) != 0) { fprintf(stderr, "bench: layer T=%d refused\n", T); return 1; }
