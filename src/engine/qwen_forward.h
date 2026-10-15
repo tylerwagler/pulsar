@@ -3,8 +3,8 @@
  *
  * qwen_forward: one step of the trunk over `n_rows` rows (DECODE: one row per bank; PREFILL: runs of one bank
  * each -- a verify's [0, n_verify), then the fused step's prompt runs), the `heads` rows headed into `logits_out`
- * (host, n_vocab a row); n_verify > 0 arms the per-row state capture pulsar_qwen_s4_spec_rollback reads over
- * the verify rows.  qwen_mtp_forward: the MTP layer over the
+ * (host, n_vocab a row); n_verify > 0 arms the declared state's verify capture (state_kinds.h) its commit,
+ * pulsar_state_commit, reads over the verify rows.  qwen_mtp_forward: the MTP layer over the
  * trunk stacks staged in mtp_h, `head_n` rows through the draft head (n_draft logits a row); `decode_rows` (L288)
  * takes a PREFILL step's rows -- runs of any number of banks -- as decode rows (the speculation's absorb).
  * With `pick` (L289; L288: pick[head_n], every headed row) each head row's greedy draft is reduced on the device --

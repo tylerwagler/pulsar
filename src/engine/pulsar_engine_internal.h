@@ -1036,6 +1036,8 @@ static_assert(PULSAR_MSEQ_MAX <= PULSAR_GPU_MNEUTRAL_ROWS_MAX,
 
 /* L264/L265: the KV state model's model-neutral half; DeepSeek V4's answer is kv_state_ds4.cpp. */
 #include "kv_state.h"
+/* L295 F3: declared session state -- a family's state kinds, the core's alloc / paging / kv-state / capture. */
+#include "state_kinds.h"
 uint32_t pulsar_layer_compress_ratio(uint32_t il);   /* the frontier hook below needs it */
 
 /** Declares the rows of every GEMM / MoE call issued inside its scope as
@@ -1889,6 +1891,9 @@ struct pulsar_engine {
     /** The family's layer plan, built by family->load: THE authority for which
      * op runs at layer il.  DeepSeek: n_layer x PULSAR_LAYER_DS4_BLOCK. */
     pulsar_layer_plan plan;
+    /** L295 F3: the family's state declaration (state_kinds.h), built by family->load for a family whose sessions
+     *  keep declared state (pulsar_session::states); unused (n_decl 0) on DeepSeek. */
+    pulsar_state_plan state_plan;
     /** The Qwen4-exp family's bound weights; NULL on a DeepSeek engine. */
     pulsar_qwen_weights *qwen_weights;
     /** L284 P15: the Qwen importance-matrix collection's observer while one runs (imatrix_qwen.cpp), else NULL --
@@ -2490,6 +2495,9 @@ struct pulsar_session {
     } seed_defer;
     pulsar_gpu_graph *graph;  ///< L272 P6: the DeepSeek family's device state (KV, scratch, bank views), owned by its create / destroy; NULL on any other family
     pulsar_qwen_state *qwen;  ///< the Qwen4-exp family's device state (family_qwen.h); NULL on a DeepSeek session
+    /** L295 F3: the session's declared state (state_kinds.h) -- every bank's per-layer state, positions and grid
+     *  checkpoints, built from the engine's state_plan by the family's create; NULL on a DeepSeek session. */
+    pulsar_state_set *states;
     token_vec checkpoint;     ///< tokens whose KV the graph currently holds, current bank
     float *logits;            ///< last decoded row, pulsar_engine_logits_width() floats
     /** Reused working set for the sampled speculative acceptance walk's

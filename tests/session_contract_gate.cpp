@@ -957,14 +957,14 @@ static void part_spec_lookahead(pulsar_engine *e) {
     pulsar_tokens_free(&more);
 }
 
-/* S2 (L288): a bank's recurrent state, read off the device (Qwen; empty on a family whose per-bank state this gate
- * does not lay out -- its logits and decode steps are graded instead): every trunk layer's GDN state and conv, the
- * PLE conv, the QSA index stage and the KV row the token at `pos` wrote. */
-static std::vector<uint8_t> qwen_bank_state(pulsar_session *s, uint32_t b, int pos) {
+/* S2 (L288): a bank's declared state, read off the device (L295 F3: any family whose state is declared; empty on
+ * one whose is not -- its logits and decode steps are graded instead): every trunk slot's resident state (Qwen: GDN
+ * state and conv, the PLE conv, the QSA index stage) and the row the token at `pos` wrote in every one-token pool. */
+static std::vector<uint8_t> declared_bank_state(pulsar_session *s, uint32_t b, int pos) {
     std::vector<uint8_t> out;
-    if (!s->qwen) return out;
-    const pulsar_qwen_shape *sh = &g_qwen_shape;
-    const pulsar_qwen_state *q = s->qwen;
+    const pulsar_state_set *ss = s->states;
+    if (!ss) return out;
+    const pulsar_state_plan *p = ss->plan;
     bool ok = true;
     auto grab = [&](const pulsar_gpu_tensor *t, uint64_t off, uint64_t n) {
         if (!ok || !t) return;
@@ -972,13 +972,17 @@ static std::vector<uint8_t> qwen_bank_state(pulsar_session *s, uint32_t b, int p
         out.resize(at + n);
         ok = pulsar_gpu_tensor_read(t, off, out.data() + at, n) != 0;
     };
-    for (uint32_t il = 0; ok && il < s->engine->plan.n_layer; il++) {
-        const pulsar_qwen_layer_state *L = &q->layer[il];
-        grab(L->gdn_state, b * pulsar_qwen_gdn_state_bytes(sh), pulsar_qwen_gdn_state_bytes(sh));
-        grab(L->gdn_conv, b * pulsar_qwen_gdn_conv_bytes(sh), pulsar_qwen_gdn_conv_bytes(sh));
-        grab(L->idx_tail, b * pulsar_qwen_index_tail_bytes(sh), pulsar_qwen_index_tail_bytes(sh));
-        grab(L->ple_conv, b * pulsar_qwen_ple_conv_bytes(sh), pulsar_qwen_ple_conv_bytes(sh));
-        if (L->kv) grab(L->kv[b], (uint64_t)pos * pulsar_qwen_kv_row_bytes(sh), pulsar_qwen_kv_row_bytes(sh));
+    for (uint32_t k = 0; ok && k < p->n_trunk; k++) {
+        for (uint32_t id = 0; id < p->n_decl; id++) {
+            const pulsar_state_decl *d = &p->decl[id];
+            if (!(p->slot[k] >> id & 1u)) continue;
+            if (d->kind != PULSAR_STATE_POOL) {
+                const uint64_t bb = pulsar_state_decl_bank_bytes(d);
+                grab(pulsar_state_tensor(ss, k, id), b * bb, bb);
+            } else if (d->tokens == 1u) {   /* the row the token at pos wrote (a one-token pool: the KV) */
+                grab(pulsar_state_pool(ss, k, id, b), (uint64_t)pos / d->tokens * d->bytes, d->bytes);
+            }
+        }
     }
     if (!ok) out.clear();
     return out;
@@ -1109,7 +1113,7 @@ static void part_spec_zero_draft(pulsar_engine *e, int W) {
         ok = x >= 0 && pulsar_session_eval(t, x, err, sizeof(err)) == 0;
         pulsar_session_bank_state_save(t, 0);
     }
-    const std::vector<uint8_t> plain_state = ok ? qwen_bank_state(t, 0, A.len) : std::vector<uint8_t>();
+    const std::vector<uint8_t> plain_state = ok ? declared_bank_state(t, 0, A.len) : std::vector<uint8_t>();
     const std::vector<std::vector<float>> plain =
         ok ? decode_after(t, 0, W, err, sizeof(err)) : std::vector<std::vector<float>>();
     CHECK(ok && plain.size() == 5, "S2 the twin decodes the base %d plain after A (%d tokens), then 4 tokens: %s", x,
@@ -1125,8 +1129,8 @@ static void part_spec_zero_draft(pulsar_engine *e, int W) {
         pulsar_spec_round *r[1] = {pulsar_spec_round_new()};
         const bool ran = s && spec_lane_round(s, banks, k0, 1, rng, r, na, W, err, sizeof(err));
         CHECK(ran && na[0] == 1, "S2 (alone) the K = 0 round committed its base alone (%d): %s", na[0], err);
-        const std::vector<uint8_t> st = ran ? qwen_bank_state(s, 0, A.len) : std::vector<uint8_t>();
-        if (s && s->qwen)
+        const std::vector<uint8_t> st = ran ? declared_bank_state(s, 0, A.len) : std::vector<uint8_t>();
+        if (s && s->states)
             CHECK(ran && !st.empty() && st == plain_state,
                   "S2 (alone) the K = 0 bank's recurrent state == the plain decode's, byte for byte (%zu bytes)",
                   st.size());
@@ -1165,8 +1169,8 @@ static void part_spec_zero_draft(pulsar_engine *e, int W) {
         ran = ran && pend > 0 && spec_lane_round(s, banks, k, 2, rngs, r, na, W, err, sizeof(err));
         CHECK(ran && na[0] == 1, "S2 (beside) bank 0's K = 0 round beside bank 1's %u drafts committed its base alone "
               "(%d; bank 1 kept %d): %s", pend, na[0], na[1], err);
-        const std::vector<uint8_t> st = ran ? qwen_bank_state(s, 0, A.len) : std::vector<uint8_t>();
-        if (s && s->qwen)
+        const std::vector<uint8_t> st = ran ? declared_bank_state(s, 0, A.len) : std::vector<uint8_t>();
+        if (s && s->states)
             CHECK(ran && !st.empty() && st == plain_state,
                   "S2 (beside) the K = 0 bank's recurrent state == the plain decode's, byte for byte (%zu bytes)",
                   st.size());
