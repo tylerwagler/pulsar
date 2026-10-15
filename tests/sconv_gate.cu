@@ -4,8 +4,9 @@
  * plus kernels 2, 3 and 8 with and without the residual):
  *
  *   1. bytes      a one-call prefill == the host replay of the block's own
- *                 arithmetic (tests/sconv_ref.h sref_seq_bits), every byte, and
- *                 the advanced slot == the last K-1 inputs.
+ *                 arithmetic (tests/sconv_ref.h sref_seq_bits), every byte (not
+ *                 for SiLU: its fast-math exp has no host replay), and the
+ *                 advanced slot == the last K-1 inputs.
  *   2. fidelity   the same call against the DOUBLE reference: TOLERANCE-graded
  *                 (relative Frobenius; the share of outputs equal to
  *                 bf16(reference); the worst distance in bf16 ulps).
@@ -21,8 +22,9 @@
  *                 rows) then a mixed decode + verify call == each sequence
  *                 alone, bit-exact.
  *   8. mutations  the double reference with the taps reversed, the residual
- *                 flipped, or the window lagged one row must FAIL the grade
- *                 (>= 20x the bar), so the grade sees each feature.
+ *                 flipped, the window lagged one row, the bias or the SiLU
+ *                 dropped must FAIL the grade (>= 20x the bar), so the grade
+ *                 sees each feature.
  * Then the multi-stream launch (Inkling's K and V read strided from one fused
  * qkvr row, in one launch == two launches), and refusals.
  *
@@ -78,7 +80,7 @@ struct Case {
     const char *name;
     sref_conv R;
     pulsar_sconv_decl D{};
-    uint16_t *d_w = nullptr;
+    uint16_t *d_w = nullptr, *d_b = nullptr;
     uint32_t N = 0;                          /* rows per sequence */
     uint64_t ld = 0;                         /* the call buffers' row stride (> C: strided rows) */
     uint64_t sld = 0, sstride = 0;           /* a slot's row stride (> C: strided records) and the pool's slot stride */
@@ -89,9 +91,10 @@ struct Case {
 };
 static const uint32_t kSlots = 32, kSeqs = 16, kMaxRows = 4096;
 
-static void case_init(Case &c, const char *name, int C, int K, bool residual, uint32_t N, uint64_t seed) {
+static void case_init(Case &c, const char *name, int C, int K, bool residual, uint32_t N, uint64_t seed,
+                      bool bias = false, bool silu = false) {
     c.name = name; c.N = N;
-    c.R.C = C; c.R.K = K; c.R.residual = residual;
+    c.R.C = C; c.R.K = K; c.R.residual = residual; c.R.silu = silu;
     Rng g(seed);
     c.R.w.resize((size_t)C * K);
     for (auto &w : c.R.w) w = sref_round((float)(0.4 * g.n()));
@@ -100,6 +103,16 @@ static void case_init(Case &c, const char *name, int C, int K, bool residual, ui
     CK(cudaMalloc(&c.d_w, wb.size() * 2));
     CK(cudaMemcpy(c.d_w, wb.data(), wb.size() * 2, cudaMemcpyHostToDevice));
     c.D.channels = (uint32_t)C; c.D.kernel = (uint32_t)K; c.D.residual = residual ? 1 : 0; c.D.weight = c.d_w;
+    c.D.act = silu ? PULSAR_SCONV_ACT_SILU : PULSAR_SCONV_ACT_NONE;
+    if (bias) {
+        c.R.b.resize((size_t)C);
+        for (auto &b : c.R.b) b = sref_round((float)(0.5 * g.n()));
+        std::vector<uint16_t> bb((size_t)C);
+        for (int i = 0; i < C; ++i) bb[(size_t)i] = sref_f2bf(c.R.b[(size_t)i]);
+        CK(cudaMalloc(&c.d_b, bb.size() * 2));
+        CK(cudaMemcpy(c.d_b, bb.data(), bb.size() * 2, cudaMemcpyHostToDevice));
+        c.D.bias = c.d_b;
+    }
     c.ld = (uint64_t)C + 16;
     c.sld = (uint64_t)C + 8;
     c.sstride = (uint64_t)(K - 1) * c.sld + 8;
@@ -117,7 +130,7 @@ static void case_init(Case &c, const char *name, int C, int K, bool residual, ui
     CK(cudaMalloc(&c.d_slot, kSeqs * 4));
 }
 static void case_free(Case &c) {
-    cudaFree(c.d_w); cudaFree(c.d_pool); cudaFree(c.d_x); cudaFree(c.d_y); cudaFree(c.d_cap);
+    cudaFree(c.d_w); cudaFree(c.d_b); cudaFree(c.d_pool); cudaFree(c.d_x); cudaFree(c.d_y); cudaFree(c.d_cap);
     cudaFree(c.d_first); cudaFree(c.d_slot);
 }
 
@@ -230,7 +243,8 @@ static Grade grade(const std::vector<uint16_t> &y, const std::vector<double> &re
 static void run_case(Case &c) {
     const int C = c.R.C, K = c.R.K;
     const uint32_t N = c.N;
-    printf("\n== %s: C %d, K %d, residual %d, %u rows ==\n", c.name, C, K, (int)c.R.residual, N);
+    printf("\n== %s: C %d, K %d, residual %d, bias %d, SiLU %d, %u rows ==\n", c.name, C, K, (int)c.R.residual,
+           (int)!c.R.b.empty(), (int)c.R.silu, N);
     const uint64_t se = pulsar_sconv_state_elems(&c.D);
 
     /* references for sequence 0 */
@@ -251,9 +265,11 @@ static void run_case(Case &c) {
     check(call(c, {{0, 3, 0, N}}, &pf, false) == 0, "prefill call");
     const std::vector<uint16_t> pf_state = get_slot(c, 3);
     size_t fd = 0;
-    const bool by = same(pf, bits, &fd);
-    check(by, "bytes: prefill == the host replay of the block's arithmetic (%zu outputs)%s", pf.size(),
-          by ? "" : (" -- first diff at " + std::to_string(fd)).c_str());
+    if (!c.R.silu) {
+        const bool by = same(pf, bits, &fd);
+        check(by, "bytes: prefill == the host replay of the block's arithmetic (%zu outputs)%s", pf.size(),
+              by ? "" : (" -- first diff at " + std::to_string(fd)).c_str());
+    }
     check(same(pf_state, state_after(c, 0, N - 1)), "bytes: the advanced slot == the last %d inputs", K - 1);
     const Grade g = grade(pf, ref);
     check(g.fro <= kFroBar && g.exact_share >= kExactShareBar && g.max_ulp <= 1,
@@ -387,11 +403,13 @@ static void run_case(Case &c) {
     }
 
     /* 8: mutations */
-    for (sref_mut m : {SREF_REVERSED, SREF_NO_RESIDUAL, SREF_LAGGED}) {
+    for (sref_mut m : {SREF_REVERSED, SREF_NO_RESIDUAL, SREF_LAGGED, SREF_NO_BIAS, SREF_NO_SILU}) {
+        if ((m == SREF_NO_BIAS && c.R.b.empty()) || (m == SREF_NO_SILU && !c.R.silu)) continue;
         std::vector<double> mref((size_t)N * C), ms(se, 0.0);
         sref_seq_double(c.R, (int)N, c.X[0].data(), (size_t)C, ms.data(), mref.data(), m);
         const Grade mg = grade(pf, mref);
-        const char *nm = m == SREF_REVERSED ? "taps reversed" : m == SREF_NO_RESIDUAL ? "residual flipped" : "window lagged";
+        const char *nm = m == SREF_REVERSED ? "taps reversed" : m == SREF_NO_RESIDUAL ? "residual flipped"
+                       : m == SREF_LAGGED ? "window lagged" : m == SREF_NO_BIAS ? "bias dropped" : "SiLU dropped";
         check(mg.fro >= 20 * kFroBar, "mutation (%s) fails the grade: fro %.3e (>= %.0e)", nm, mg.fro, 20 * kFroBar);
     }
 }
@@ -509,6 +527,9 @@ static void refusals() {
     t = s; t.state_ld = 56; refused("a slot row stride below the channels", t, r);
     t = s; t.state_ld = 68; t.state_stride = 208; refused("a slot row stride not a multiple of 8", t, r);
     t = s; t.capture = b + 32768; t.capture_ld = 64; t.capture_stride = 64; refused("a capture stride below one record", t, r);
+    d2 = D; d2.bias = b + 1; refused("a misaligned bias", t, r);
+    d2 = D; d2.act = 2; refused("act 2 (not a PULSAR_SCONV_ACT_*)", t, r);
+    d2 = D; d2.act = PULSAR_SCONV_ACT_SILU; refused("SiLU with the residual", t, r);
     t = s; refused("no streams", t, r, 0);
     refused("five streams", t, r, 5);
     r2 = r; r2.n_seqs = 0; refused("no sequences", s, r2);
@@ -603,12 +624,14 @@ int main(int argc, char **argv) {
     if (argc == 3 && !strcmp(argv[1], "--fixture")) return fixture(argv[2]);
     if (argc != 1) { fprintf(stderr, "usage: %s [--fixture DIR]\n", argv[0]); return 2; }
     printf("sconv gate (L295 E3): the family-neutral short convolution block\n");
-    Case cases[5];
+    Case cases[7];
     case_init(cases[0], "Inkling K / V stream", 1024, 4, true, 300, 11);
     case_init(cases[1], "Inkling residual stream", 4096, 4, true, 300, 12);
     case_init(cases[2], "kernel 2, plain", 64, 2, false, 120, 13);
     case_init(cases[3], "kernel 8", 256, 8, true, 120, 14);
     case_init(cases[4], "kernel 3, plain, 8 channels", 8, 3, false, 90, 15);
+    case_init(cases[5], "kernel 4, bias, plain", 512, 4, false, 120, 16, true, false);
+    case_init(cases[6], "Mamba-2 x|B|C stream: kernel 4, bias, SiLU", 10240, 4, false, 100, 17, true, true);
     for (Case &c : cases) run_case(c);
     for (Case &c : cases) case_free(c);
     multi_stream();

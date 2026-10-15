@@ -8,17 +8,23 @@
  *   kernel     K taps, 2 .. PULSAR_SCONV_KMAX; tap K-1 multiplies the current row
  *   weight     bf16 [C][K] as a checkpoint stores a depthwise Conv1d ([C][1][K])
  *   residual   1: the block's output adds its own input (y = x + conv(x))
+ *   bias       NULL, or bf16 [C]: the tap sum starts from it (Conv1d's bias)
+ *   act        PULSAR_SCONV_ACT_NONE, or PULSAR_SCONV_ACT_SILU: the sum goes
+ *              through SiLU before its one rounding (exclusive with residual:
+ *              no family declares both, so the order is not built)
  *
  * The arithmetic, per (row, channel) -- ONE arithmetic, whoever calls it
  * (pulsar_cuda_sconv.cuh is its single authority, for this kernel and for any
  * epilogue that fuses it later):
- *   acc = 0;  for i = 0 .. K-1:  acc = fmaf(w[c][i], x[t - (K-1) + i][c], acc)   (f32, oldest tap first)
- *   y[t][c] = bf16_rn(residual ? acc + x[t][c] : acc)
+ *   acc = bias ? bias[c] : 0;  for i = 0 .. K-1:  acc = fmaf(w[c][i], x[t - (K-1) + i][c], acc)
+ *                                                       (f32, oldest tap first)
+ *   y[t][c] = bf16_rn(residual ? acc + x[t][c] : act == SILU ? acc / (1 + exp(-acc)) : acc)
  * where x at a position before the sequence's first token is 0 (a fresh
  * sequence's state is zero).  Inputs, weights, state and output are bf16;
- * every tap widens exactly, so the only roundings are the f32 fma chain and the
- * one bf16 store.  Nothing a row computes depends on the rows beside it, its
- * call, its CTA or the call's row count: decode (1 row a sequence), verify (a
+ * every tap widens exactly, so the only roundings are the f32 fma chain, the
+ * SiLU's f32 ops (the engine's fast-math exp and divide) and the one bf16
+ * store.  Nothing a row computes depends on the rows beside it, its call, its
+ * CTA or the call's row count: decode (1 row a sequence), verify (a
  * run of rows), a prefill chunk cut anywhere and any batch of them give the
  * SAME bytes -- asserted by tests/sconv_gate.
  *
@@ -48,7 +54,10 @@
  * K and V after their projections (1024 channels each, read strided from the
  * fused qkvr row) before the k-norm; the attention-output delta and the
  * MLP-output delta (4096 each) before the residual add.  3 x 10240 x 2 B =
- * 60 KiB of state a layer and sequence. */
+ * 60 KiB of state a layer and sequence.
+ *
+ * A Mamba-2 mixer (pulsar_cuda_mamba2.h, the second user) declares one stream
+ * over its x | B | C columns with a bias and SiLU, residual 0. */
 #ifndef PULSAR_CUDA_SCONV_H
 #define PULSAR_CUDA_SCONV_H
 
@@ -70,12 +79,20 @@ extern "C" {
 /** The most streams one call carries. */
 #define PULSAR_SCONV_STREAMS_MAX 4
 
+/** The activation a stream's tap sum goes through before its rounding. */
+enum {
+    PULSAR_SCONV_ACT_NONE = 0,
+    PULSAR_SCONV_ACT_SILU = 1,  /**< acc / (1 + exp(-acc)), f32 */
+};
+
 /** One stream's convolution as its family declares it. */
 typedef struct {
     uint32_t        channels;   /**< C, a multiple of 8 */
     uint32_t        kernel;     /**< K taps, 2 .. PULSAR_SCONV_KMAX */
     int             residual;   /**< 1: y = x + conv(x); 0: y = conv(x) */
     const uint16_t *weight;     /**< device bf16 [C][K], 16-byte aligned; tap K-1 multiplies the current row */
+    const uint16_t *bias;       /**< NULL, or device bf16 [C], 16-byte aligned: the tap sum's start */
+    uint32_t        act;        /**< PULSAR_SCONV_ACT_*; SILU needs residual 0 */
 } pulsar_sconv_decl;
 
 /** One stream of a call: where its rows, output, state pool and capture live.
