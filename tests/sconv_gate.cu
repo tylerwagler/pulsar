@@ -170,10 +170,10 @@ static int call(Case &c, const std::vector<Run> &runs, std::vector<uint16_t> *ou
     CK(cudaMemcpy2D(out->data(), (size_t)C * 2, c.d_y, c.ld * 2, (size_t)C * 2, rows, cudaMemcpyDeviceToHost));
     if (capture && cap) {
         const uint64_t se = pulsar_sconv_state_elems(&c.D);
-        cap->resize((size_t)rows * se);   /* record r's K-1 rows of C, gathered from the capture's row stride */
-        CK(cudaMemcpy2D(cap->data(), (size_t)C * 2, c.d_cap, c.sld * 2, (size_t)C * 2, (size_t)rows * (c.R.K - 1),
-                        cudaMemcpyDeviceToHost));
-        (void)se;
+        cap->resize((size_t)rows * se);   /* record r's K-1 rows of C, gathered from its row stride */
+        for (uint32_t r = 0; r < rows; ++r)
+            CK(cudaMemcpy2D(cap->data() + (size_t)r * se, (size_t)C * 2, c.d_cap + (size_t)r * c.sstride, c.sld * 2,
+                            (size_t)C * 2, c.R.K - 1, cudaMemcpyDeviceToHost));
     }
     return 0;
 }
