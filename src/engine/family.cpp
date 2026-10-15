@@ -8,6 +8,7 @@ const char *pulsar_layer_kind_name(pulsar_layer_kind k) {
     case PULSAR_LAYER_DS4_BLOCK: return "ds4_block";
     case PULSAR_LAYER_QWEN_GDN:  return "qwen_gdn";
     case PULSAR_LAYER_QWEN_QSA:  return "qwen_qsa";
+    case PULSAR_LAYER_BLOCKS:    return "blocks";
     }
     return "unknown";
 }
@@ -18,11 +19,15 @@ uint32_t pulsar_layer_plan_count(const pulsar_layer_plan *p, pulsar_layer_kind k
     return n;
 }
 
+/* A family module under src/families/<name>/ (L295) declares its descriptor here, beside its registry row. */
+extern const pulsar_family PULSAR_FAMILY_INKLING;
+
 /* Every family the engine serves.  The ONE place an architecture string is
  * mapped to code. */
 static const pulsar_family *const k_families[] = {
     &PULSAR_FAMILY_DEEPSEEK4,
     &PULSAR_FAMILY_QWEN4_EXP,
+    &PULSAR_FAMILY_INKLING,
 };
 
 const pulsar_family *pulsar_family_for_model(const pulsar_model *m) {

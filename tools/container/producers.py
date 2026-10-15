@@ -374,8 +374,18 @@ def tessera_planes(*_a, **_k) -> bytes:
                      "PULSAR_QWEN_TESS_* binding) -- not on dev; refusing")
 
 
+def rows_strided(buf: bytes, n_rows: int, row_bytes: int, start: int, step: int) -> bytes:
+    """Rows start, start + step, ... of a row-major [n_rows][row_bytes] buffer, verbatim: one half of a
+    row-interleaved fused gate/up tensor (gate on the even rows, up on the odd -- gpt-oss, Inkling's w13).  Not a
+    format conversion: a family's source view (inkling.Source) names each half as a tensor of its own, and this is
+    how that tensor's bytes are read out of the checkpoint."""
+    if len(buf) != n_rows * row_bytes or not 0 <= start < step or n_rows % step:
+        raise ValueError(f"rows_strided: {len(buf)} bytes as {n_rows} x {row_bytes}, rows {start}::{step}")
+    return np.frombuffer(buf, dtype=np.uint8).reshape(n_rows, row_bytes)[start::step].tobytes()
+
+
 PRODUCERS = {f.__name__: f for f in (mxfp8_lt, mxfp8_lt_from_bf16, cutlass_mxfp4, fp8_e4m3_soa_k_from_bf16,
-                                      i64_to_i32, tessera_planes)}
+                                      i64_to_i32, tessera_planes, rows_strided)}
 # the engine's native layouts, by the stored dtype (`st_layout_type`): the recipe's `native` format
 NATIVE_LAYOUT = {"BF16": "bf16", "F32": "f32", "I32": "i32"}
 

@@ -53,12 +53,34 @@ typedef enum : uint8_t {
     PULSAR_LAYER_DS4_BLOCK = 1,  ///< DeepSeek V4 block: HC mix, MLA attention (SWA + compressed/indexed per pulsar_attn_layout), MoE
     PULSAR_LAYER_QWEN_GDN  = 2,  ///< Qwen4-exp `linear_attention`: Gated DeltaNet mixer + gated residual + MoE
     PULSAR_LAYER_QWEN_QSA  = 3,  ///< Qwen4-exp `full_attention`: QSA (gated GQA + block indexer) mixer + gated residual + MoE
+    PULSAR_LAYER_BLOCKS    = 4,  ///< L295: a layer composed from the shared block library, described by pulsar_layer_plan::desc[il]
 } pulsar_layer_kind;
 /** Layer kinds there are (a block table's width, step_driver.h). */
 #define PULSAR_LAYER_KIND_COUNT 4u
 
-/** Printable name of a layer kind ("ds4_block", "qwen_gdn", "qwen_qsa"). */
+/** Printable name of a layer kind ("ds4_block", "qwen_gdn", "qwen_qsa", "blocks"). */
 const char *pulsar_layer_kind_name(pulsar_layer_kind k);
+
+/** L295 E1: the token mixer of a PULSAR_LAYER_BLOCKS layer -- which shared attention span it runs (F1's GQA block:
+ *  every key, or a window of the most recent ones).  The family's geometry (heads, widths, score mods) is its own
+ *  declaration; this is the plan's fact of WHICH block runs. */
+typedef enum : uint8_t {
+    PULSAR_MIXER_NONE        = 0,
+    PULSAR_MIXER_ATTN_FULL   = 1,  ///< attention over every earlier key
+    PULSAR_MIXER_ATTN_WINDOW = 2,  ///< attention over the last pulsar_layer_desc::window keys (self included)
+} pulsar_mixer_kind;
+/** L295 E1: the channel mixer of a PULSAR_LAYER_BLOCKS layer. */
+typedef enum : uint8_t {
+    PULSAR_FFN_NONE  = 0,
+    PULSAR_FFN_DENSE = 1,  ///< one dense gated MLP
+    PULSAR_FFN_MOE   = 2,  ///< the routed MoE (with whatever shared experts the family's router config declares)
+} pulsar_ffn_kind;
+/** A PULSAR_LAYER_BLOCKS layer's blocks, family-neutral (the core row-step driver, L295 F4, reads this). */
+typedef struct {
+    pulsar_mixer_kind mixer;
+    pulsar_ffn_kind ffn;
+    uint32_t window;   ///< keys a PULSAR_MIXER_ATTN_WINDOW layer attends to; 0 otherwise
+} pulsar_layer_desc;
 
 /** The widest plan any family builds.  DeepSeek V4 Pro reserved 61 layers
  * (PULSAR_MAX_LAYER); Qwen4-exp has 48.  Checked against PULSAR_MAX_LAYER in
@@ -127,6 +149,8 @@ typedef struct {
 typedef struct {
     uint32_t n_layer;
     pulsar_layer_kind kind[PULSAR_FAMILY_MAX_LAYER];
+    /** desc[il] is the layer's blocks when kind[il] is PULSAR_LAYER_BLOCKS, zero otherwise. */
+    pulsar_layer_desc desc[PULSAR_FAMILY_MAX_LAYER];
 } pulsar_layer_plan;
 
 /** Count the layers of one kind. */
@@ -337,6 +361,9 @@ struct pulsar_family {
     /** L295 F4: the family's blocks on the core row-step driver (step_driver.h; its session ops are then the driver's),
      *  or NULL -- a family with its own forward (DeepSeek). */
     const struct pulsar_driver_ops *driver;
+    /** L295 E1: release what load built into pulsar_engine::family_state (engine destroy, before the model is
+     *  unmapped; also after a load that failed part way).  NULL = the family keeps nothing there. */
+    void (*unload)(pulsar_engine *e);
 };
 
 extern const pulsar_family PULSAR_FAMILY_DEEPSEEK4;

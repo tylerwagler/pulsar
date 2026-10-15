@@ -153,6 +153,16 @@ def declared_shape(m, hshape):
     return list(hshape)                 # no reshapes: the declared shape is the source's
 
 
+def source(hf):
+    """The HF checkpoint as the plan reads it: as stored (an expert stack is split by stack_families)."""
+    return hf
+
+
+def gate_up_key(rec):
+    """The layer a routed family belongs to, for the gate / up layout check: the stack name's prefix."""
+    return rec["gguf_name"].rsplit(".", 1)[0]
+
+
 def admit(hf, m, fmt, name):
     if fmt not in ADMITS:
         raise SystemExit(f"{name}: the qwen4_exp loader binds {sorted(ADMITS)}, not {fmt}")
@@ -198,37 +208,6 @@ def stack_families(hf, m, fmt, ctx):
 # ---------------------------------------------------------------------------
 # pulsar.kv
 # ---------------------------------------------------------------------------
-def config_kvs(prefix, value, out):
-    """The HF text_config -> (key, type, value) triples, mechanically (S1's contract, family_qwen.h section 2):
-    every key verbatim under `prefix`, nested dicts flattened with '.', None and empty lists skipped (nothing to
-    type); bool -> bool, int -> u32 (u64 past 2^32, i64 if negative), float -> f32, str -> string, a list of str
-    -> string array, a list of non-negative int -> u32 array (u64 past 2^32).  Anything else refuses."""
-    if value is None:
-        return
-    if isinstance(value, dict):
-        for k, v in value.items():
-            config_kvs(f"{prefix}.{k}", v, out)
-    elif isinstance(value, bool):
-        out.append((prefix, "bool", value))
-    elif isinstance(value, int):
-        out.append((prefix, "u32" if 0 <= value <= 0xFFFFFFFF else "u64" if value >= 0 else "i64", value))
-    elif isinstance(value, float):
-        out.append((prefix, "f32", value))
-    elif isinstance(value, str):
-        out.append((prefix, "string", value))
-    elif isinstance(value, list):
-        if not value:
-            return
-        if all(isinstance(v, str) for v in value):
-            out.append((prefix, "array", ("string", list(value))))
-        elif all(isinstance(v, int) and not isinstance(v, bool) for v in value) and min(value) >= 0:
-            out.append((prefix, "array", ("u64" if max(value) > 0xFFFFFFFF else "u32", list(value))))
-        else:
-            raise SystemExit(f"{prefix}: unsupported list {value!r}")
-    else:
-        raise SystemExit(f"{prefix}: unsupported config value {value!r}")
-
-
 # the three int64 buffers HF keeps under ple.ple_embedding: config, not weights (S1's contract names)
 PLE_BUFFERS = {"layer_multipliers": "ple_layer_multipliers",
                "ngram_heads_vocab_sizes": "ple_ngram_heads_vocab_sizes",
@@ -263,7 +242,7 @@ def build_kv(hf, ctx):
         ("general.type", "string", "model"),
         ("general.name", "string", "Qwen3.8-Flash-Next"),
     ]
-    config_kvs(A, text, kvs)
+    KV.config_kvs(A, text, kvs)
     bufs = {}
     for hf_key, key in PLE_BUFFERS.items():
         name = pre + hf_key
