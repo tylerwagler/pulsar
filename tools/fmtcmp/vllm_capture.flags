@@ -1,0 +1,15 @@
+# vLLM flags for every fmtcmp LOGPROB CAPTURE (BF16 on the H100s, NVFP4 on Sparky).  One authority: both
+# sparky_vllm_job.sh and h100/run_reference.sh read this file, so the two sides differ only in the weights,
+# the platform (TP4 Hopper vs one GB10) and --gpu-memory-utilization.
+# Deliberately NOT the cards' serving flags: no speculation (the capture is teacher-forced prefill), no prefix
+# caching (a cached prefix has no prompt logprobs), and the Mamba state dtype left at the checkpoint's own
+# default (config mamba_ssm_cache_dtype) on both sides instead of the Spark card's fp16 + stochastic rounding,
+# so the comparison isolates the checkpoint.  Lines starting with # are comments; one flag (with value) a line.
+--served-model-name fmtcmp
+--trust-remote-code
+--max-num-seqs 1
+--max-num-batched-tokens 8192
+--max-model-len 40960
+--max-logprobs 64
+--no-enable-prefix-caching
+--seed 0

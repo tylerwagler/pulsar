@@ -1,0 +1,1 @@
+--seed 42 --temperature 1.0 --top-p 0.95 --timeout 900
