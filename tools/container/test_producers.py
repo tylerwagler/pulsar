@@ -455,12 +455,15 @@ def run_bytes_for_all(served: Tree) -> None:
              ("iq2_xxs_mmq_k", [2048, 4096], 2048 * 4096 // 256 * 66),
              ("cutlass_mxfp4", [4096, 2000], 2000 * 4096 // 2 + (2048 // 32) * 4096),
              ("mxfp8_lt", [160, 200], 200 * 160 + 256 * 8),
-             ("fp8_e4m3_soa_k", [160, 200], 200 * 160 + 200 * 5)]
+             ("fp8_e4m3_soa_k", [160, 200], 200 * 160 + 200 * 5),
+             # L295 F7: a dense Linear's logical out, stored padded to 128 (exllamav3; exl3_linear_layout)
+             ("exl3m_k6", [4096, 201024], 256 * 12568 * 96 * 2 + (4096 + 201088) * 2)]
     for layout, dims, want in cases:
         got = P.bytes_for(layout, dims)
         if got != want:
             fail(f"bytes_for({layout}, {dims}) = {got}, want {want}")
-    for layout, dims in [("exl3m_k2", [4096, 2000]), ("mxfp8_lt", [100, 128]), ("native", [4])]:
+    for layout, dims in [("exl3m_k2", [4096, 2000, 2]), ("exl3m_k2", [4000, 2048]), ("mxfp8_lt", [100, 128]),
+                         ("native", [4])]:
         try:
             P.bytes_for(layout, dims)
             fail(f"bytes_for({layout}, {dims}) did not refuse")

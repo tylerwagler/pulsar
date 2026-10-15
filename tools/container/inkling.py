@@ -9,8 +9,9 @@ Sources (no GGUF anywhere, L247):
            (L294's tensor-name contract): attention keeps the checkpoint names (wq_du, wk_dv, wv_dv, wr_du, wo_ud);
            the fused gate/up tensors are split into `...mlp.{gate,up}_proj` (dense), `...mlp.experts.<e>.
            {gate,up,down}_proj` (routed), `...mlp.shared_experts.<j>.{gate,up,down}_proj` (shared); the dense down
-           keeps `...mlp.w2_md`; the head is `model.llm.unembed`, which no recipe can read from the pack yet: the
-           role `head` runs no EXL3 arm (exl3_rates.ROLE_ARM), so the head is written from --hf.
+           keeps `...mlp.w2_md`; the head is `model.llm.unembed`, its 201024 outputs stored 201088 wide (exllamav3
+           pads every Linear to 128; the container declares the logical width and carries the stored bytes,
+           exl3_rates.out_stored -- L295 F7), read by the dense arm (exl3_rates.ROLE_ARM).
   --recipe a pulsar.recipe.v1 (format-maps/inkling-*.json): required, as for qwen4_exp.
 
 The Source view.  Inkling's checkpoint fuses what pulsar binds separately: `w13` tensors hold gate and up
@@ -42,8 +43,8 @@ The container:
     experts fold to one U8 entry per expert-projection `model.llm.layers.L.mlp.experts.<e>.<part>.weight`,
     contiguous in expert order, part in {gate_proj, up_proj, down_proj}; each family in pulsar.experts carries
     entry_name, layer and role.  The gguf_name of a family is `model.llm.layers.L.mlp.experts.<part>`.
-  * layouts: bf16 / f32 native; exl3m_k* for the dense / shared / routed Linears from the EXL3 pack (the rate per
-    engine arm, exl3_rates.admit); mxfp8_lt for a dense Linear from BF16.  The short-conv weights are declared
+  * layouts: bf16 / f32 native; exl3m_k* for the dense / shared / routed Linears and the head from the EXL3 pack
+    (the rate per engine arm, exl3_rates.admit); mxfp8_lt for a dense Linear or the head from BF16.  The short-conv weights are declared
     [channels, kernel] (the HF [channels, 1, kernel] minus its unit dim; the same bytes).
   * shards: `vision` (primary: pulsar.kv + the hmlp tower), `layers.0..L-1`, `top` (embed, embed norm, final norm,
     head), `mtp.0..N-1` when the recipe writes the drafter (all of it or none).
@@ -523,9 +524,9 @@ LINEAR_ROLES = {"dense", "shared_expert", "expert_gate", "expert_up", "expert_do
 def admit(hf, m, fmt, name):
     native = PR.NATIVE_LAYOUT.get(hf.dtype(name))
     allowed = {"native", native}
-    if m.role in LINEAR_ROLES:
+    if m.role in LINEAR_ROLES or m.role == "head":   # the head: a dense Linear over the rows front door (L295 F7)
         allowed |= EXL3
-        if m.role in ("dense", "shared_expert"):
+        if m.role in ("dense", "shared_expert", "head"):
             allowed.add("mxfp8_lt")
     if m.shard.startswith("mtp.") or m.shard == "vision":
         allowed.add("omit")

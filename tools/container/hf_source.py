@@ -11,6 +11,8 @@ import json
 import os
 import struct
 
+import exl3_rates
+
 
 
 class HFCheckpoint:
@@ -159,7 +161,9 @@ class Exl3Checkpoint:
     def linear(self, key, k, n, rates):
         """One EXL3 Linear `key` (the name minus `.trellis` etc.): its [trellis | suh | svh]
         source ranges and the words per 16x16 tile, refused unless the rate is in `rates`
-        ({words: layout}) and every byte count matches the layout."""
+        ({words: layout}) and every byte count matches the layout.  `n` is the logical output
+        width; the planes hold exl3_rates.out_stored(n) (exllamav3's pad, L295 F7)."""
+        n = exl3_rates.out_stored(n)
         if f'{key}.mcg' in self.entries:
             raise SystemExit(f'{key}: mcg codebook -- pulsar reads the mul1 codebook only')
         for sub in ('trellis', 'suh', 'svh', 'mul1'):
