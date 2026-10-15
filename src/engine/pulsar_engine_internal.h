@@ -3224,9 +3224,9 @@ typedef enum {
 } pulsar_moe_arm;
 pulsar_moe_arm pulsar_moe_arm_for(const pulsar_tensor *gate, const pulsar_tensor *up, const pulsar_tensor *down,
                                   pulsar_act_format act);
-/** L296 N4: the arm of UP-ONLY experts (pulsar_expert_act RELU2: an up and a down stack, no gate) at activation `act`:
- *  BF16 up + down at raw bf16 rows (the BF16 routed arm's relu^2), else NONE -- no quant format has an up-only arm
- *  yet.  The one authority the forward's front door and a family's load both ask. */
+/** L296 N4: the arm of UP-ONLY experts (pulsar_ffn_act RELU2: an up and a down stack, no gate) at activation `act`:
+ *  BF16 up + down at raw bf16 rows (the BF16 routed arm's relu^2, L295 F7), else NONE -- no quant format has an
+ *  up-only arm yet.  The one authority the forward's front door and a family's load both ask. */
 pulsar_moe_arm pulsar_moe_arm_up_only(const pulsar_tensor *up, const pulsar_tensor *down, pulsar_act_format act);
 /** The routed part over the MX slot: out = the selected experts' weighted SwiGLU FFN of the activation armed for
  *  `x`; the up / mid / experts buffers are the backend's scratch.  A stack the rank's plan halved reads its halves. */
@@ -3247,11 +3247,10 @@ struct pulsar_tessera_proj;   /* src/cuda/mmq/pulsar_tessera.h (L255) */
 struct pulsar_rows_moe_shared; /* src/cuda/pulsar_cuda_qwen.h (task #44) */
 typedef struct {
     const pulsar_model *m;
-    /** up NULL = gate is the fused gate_up stack; under act RELU2 (up-only experts) gate is NULL and up the up stack */
-    const pulsar_tensor *gate, *up, *down;
-    /** L296 N4: the experts' activation (pulsar_gpu.h pulsar_expert_act): SWIGLU, or RELU2 -- relu(up x)^2, no gate
-     *  (BF16 stacks only today; a quant format's up-only arm is refused by name) */
-    pulsar_expert_act act;
+    const pulsar_tensor *gate, *up, *down;   ///< up NULL = gate is the fused gate_up stack; gate NULL = up-only (RELU2)
+    /** L295 F7: the experts' activation, a pulsar_ffn_act (src/cuda/pulsar_cuda_qwen.h): 0 SWIGLU (gate + up);
+     *  RELU2 runs the BF16 arm's up-only stacks (gate NULL) */
+    int act;
     /** L296 N4: a LATENT MoE (both or neither): the routed experts run on latent_in's output width --
      *  x_lat = bf16(latent_in x), the routed sum over x_lat (f32), out = latent_out(bf16(that sum)) -- each projection
      *  through the dense front door (pulsar_linear_rows_ref) at the call's row kind.  The buffers are the rows MoE

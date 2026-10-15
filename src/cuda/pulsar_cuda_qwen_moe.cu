@@ -10,7 +10,7 @@
  *              fold's mid emitted bf16; expert parallelism localises the picks first
  *   shared     each shared expert either RIDES the EXL3 routed launches (pulsar_rows_moe_shared_fork, joined at
  *              the routed sum) or runs after it (pulsar_rows_moe_shared_launch): gate, up, the SwiGLU emitted
- *              bf16 by its producer, the down -- or (L296 N4, pulsar_expert_act RELU2) up, relu^2, the down
+ *              bf16 by its producer, the down -- or (L296 N4, pulsar_ffn_act RELU2) up, relu^2, the down
  *   latent     (L296 N4) a latent block's routed experts run on the latent width: the block's workspace carries the
  *              latent rows and the projections' workspace (moe.cpp composes fc1 -> routed -> fc2)
  *   out        routed + gamma_0 * shared_0 + gamma_1 * shared_1 + ... -- in that order
@@ -36,7 +36,7 @@ namespace {
 /* The shared expert's SwiGLU, emitted in the format its consumer reads (rule 3).  L251 / ac69748f:
  * the shared down projection reads a bf16 row, so the producer emits bf16 -- and bf16 carries its own
  * exponent, so there is no per-32 block and no scale slab any more. */
-/* L296 N4: the same producer for the non-gated activation (pulsar_expert_act): relu(u)^2, g unread. */
+/* L296 N4: the same producer for the non-gated activation (pulsar_ffn_act RELU2): relu(u)^2, g unread. */
 __global__ void __launch_bounds__(256)
 rows_act_emit_kernel(const float *__restrict__ g, const float *__restrict__ u, int D, int act,
                      __nv_bfloat16 *__restrict__ xb) {
@@ -45,8 +45,8 @@ rows_act_emit_kernel(const float *__restrict__ g, const float *__restrict__ u, i
         const int c = c0 + (int)threadIdx.x;
         if (c < D) {
             const size_t i = (size_t)t * D + c;
-            xb[i] = __float2bfloat16(act == PULSAR_EXPERT_ACT_RELU2 ? pulsar_relu2_elem(u[i], 1.0f)
-                                                                    : pulsar_swiglu_elem(g[i], u[i], 1.0f, 0.0f));
+            xb[i] = __float2bfloat16(act == PULSAR_FFN_ACT_RELU2 ? pulsar_relu2_elem(u[i], 1.0f)
+                                                                 : pulsar_swiglu_elem(g[i], u[i], 1.0f, 0.0f));
         }
     }
 }
@@ -284,7 +284,7 @@ extern "C" size_t pulsar_rows_moe_routed_workspace_bytes(int T, int top_k, int m
 /* A riding shared expert's descriptor in the front door's terms: three EXL3 slices hidden -> mid -> hidden. */
 static bool rows_moe_shared(const pulsar_rows_moe_shared *q, int H, exl3_moe_shared *sh) {
     const int smid = q->gate.out;
-    if (q->act != PULSAR_EXPERT_ACT_SWIGLU) {
+    if (q->act != PULSAR_FFN_ACT_SWIGLU) {
         fprintf(stderr, "pulsar: routed MoE (bf16 rows): a riding shared expert is SwiGLU (the EXL3 front door's fold); "
                         "activation %d runs pulsar_rows_moe_shared_launch -- refusing\n", (int)q->act);
         return false;
@@ -323,22 +323,25 @@ extern "C" int pulsar_rows_moe_routed_launch(const pulsar_rows_moe *w, int32_t *
         return -1;
     }
     /* the routed experts are ONE of: EXL3 fused gate_up + down, EXL3 gate + up pair + down, Tessera (L255), BF16
-     * gate / up / down stacks (L295 F7), or BF16 up / down stacks of up-only relu^2 experts (L296 N4) */
+     * gate / up / down stacks (L295 F7) */
     const bool tessera = w->tessera_gate != nullptr;
+    const bool bf16 = w->bf16_gate != nullptr || w->bf16_up != nullptr;
     const bool split = w->gate_table != nullptr;
     const bool exl3 = split || w->gate_up_table != nullptr || w->down_table != nullptr;
-    const bool relu2 = w->act == PULSAR_EXPERT_ACT_RELU2;
-    if (relu2 ? (!w->bf16_up || w->bf16_gate || tessera || exl3) : w->act != PULSAR_EXPERT_ACT_SWIGLU) {
-        fprintf(stderr, "pulsar: routed MoE (bf16 rows): activation %d -- the up-only relu^2 experts are BF16 up + down "
-                        "stacks with no gate (no EXL3 / Tessera up-only arm yet) -- refusing\n", (int)w->act);
-        return -1;
-    }
-    const bool bf16 = w->bf16_gate != nullptr || relu2;
     if (tessera && bf16) {
         fprintf(stderr, "pulsar: routed MoE (bf16 rows): both Tessera and BF16 stacks -- refusing\n");
         return -1;
     }
-    if (tessera || bf16 ? (tessera ? (!w->tessera_up || !w->tessera_down) : (!w->bf16_up || !w->bf16_down)) || exl3
+    /* L295 F7: a non-gated activation runs only where an arm reads it -- the BF16 arm, up-only (no gate stack) */
+    if (w->act != PULSAR_FFN_ACT_SWIGLU &&
+        (!bf16 || w->act != PULSAR_FFN_ACT_RELU2 || w->bf16_gate != nullptr)) {
+        fprintf(stderr, "pulsar: routed MoE (bf16 rows): activation %d runs on the BF16 arm's up-only stacks alone (the "
+                        "EXL3 and Tessera arms are SwiGLU) -- refusing\n", (int)w->act);
+        return -1;
+    }
+    if (tessera || bf16 ? (tessera ? (!w->tessera_up || !w->tessera_down)
+                                   : (!w->bf16_up || !w->bf16_down ||
+                                      (w->act == PULSAR_FFN_ACT_SWIGLU) != (w->bf16_gate != nullptr))) || exl3
                         : (!w->down_table || split != (w->up_table != nullptr) || split == (w->gate_up_table != nullptr))) {
         fprintf(stderr, "pulsar: routed MoE (bf16 rows): the experts must be ONE of an EXL3 fused gate_up table, an "
                         "EXL3 gate + up pair, a Tessera gate / up / down triple or a BF16 one -- refusing\n");
@@ -458,9 +461,9 @@ extern "C" int pulsar_rows_moe_routed_launch(const pulsar_rows_moe *w, int32_t *
 
 extern "C" int pulsar_rows_moe_shared_launch(const pulsar_rows_moe_shared *q, const uint16_t *x_bf16, int T,
                                              float *out, cudaStream_t stream) {
-    const bool gated = q && q->act == PULSAR_EXPERT_ACT_SWIGLU;
+    const bool gated = q && q->act == PULSAR_FFN_ACT_SWIGLU;
     const int smid = q ? q->up.out : 0, H = q ? q->up.in : 0;
-    if (!q || !x_bf16 || !out || T <= 0 || (q->act != PULSAR_EXPERT_ACT_SWIGLU && q->act != PULSAR_EXPERT_ACT_RELU2) ||
+    if (!q || !x_bf16 || !out || T <= 0 || (q->act != PULSAR_FFN_ACT_SWIGLU && q->act != PULSAR_FFN_ACT_RELU2) ||
         (gated && (!q->yg || q->gate.in != H || q->gate.out != smid)) || !q->yu || !q->ys || !q->h ||
         q->down.in != smid || q->down.out != H) {
         fprintf(stderr, "pulsar: MoE shared expert: activation %d, %s%d->%d / %d->%d (in -> mid -> in), its buffers, rows "

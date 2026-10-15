@@ -639,7 +639,7 @@ bool moe(const nh_step *st, uint32_t il, float *fo, uint8_t *base, const ffn_scr
     c.gate = NULL;
     c.up = L.exp_up;
     c.down = L.exp_down;
-    c.act = PULSAR_EXPERT_ACT_RELU2;
+    c.act = PULSAR_FFN_ACT_RELU2;
     c.latent_in = L.latent_in;
     c.latent_out = L.latent_out;
     c.lat_ws = parts.lat_lin;
@@ -665,7 +665,7 @@ bool moe(const nh_step *st, uint32_t il, float *fo, uint8_t *base, const ffn_scr
     /* the shared expert: out += down(relu(up xn)^2), ungated */
     const bool ok = arm_segments(st, 0, n, [&](bool prompt, uint32_t r0, uint32_t rows) {
         pulsar_rows_moe_shared q{};
-        q.act = PULSAR_EXPERT_ACT_RELU2;
+        q.act = PULSAR_FFN_ACT_RELU2;
         q.scale = NULL;
         q.yu = parts.yu;
         q.ys = parts.ys;
