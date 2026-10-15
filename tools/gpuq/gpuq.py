@@ -1,22 +1,27 @@
 #!/usr/bin/env python3
 """gpuq -- the Spark's GPU job queue: one user daemon, a spool dir, a CLI.  Standard library only.
 
-  gpuq submit --class {quiet,short,long} [--timeout DUR] [--mem SIZE] [--min-hold DUR] [--yield-grace DUR]
-              [--gpus RES[,RES]] [--label TEXT] [--cwd DIR] [--wait] -- CMD [ARG...]
+  gpuq submit --class {quiet,short,long} [--shared] [--timeout DUR] [--mem SIZE] [--min-hold DUR]
+              [--yield-grace DUR] [--gpus RES[,RES]] [--label TEXT] [--cwd DIR] [--wait] -- CMD [ARG...]
   gpuq status [--json]      gpuq cancel ID      gpuq log [-f] ID      gpuq daemon
 
 Classes, in priority order: quiet (exclusive; the daemon owns ~/BATTERY_RUNNING while it runs) > short (FIFO,
 timeout <= 20m) > long (preemptible: after --min-hold, while a quiet/short job waits, its process group gets
 SIGUSR1; it exits 75 at its next checkpoint and is re-queued with the same cmd, GPUQ_ATTEMPT+1; never killed
-for a yield).  One job runs per resource; while it runs its shim holds the resource's flock (~/gpu.lock), so
-legacy `flock -o ~/gpu.lock` callers still serialize with it.  Before each admission: sync + drop_caches (the
-page cache masks GB10 unified-memory pressure), then MemAvailable >= --mem + 6G.
+for a yield).  One job runs per resource, except `--shared` short jobs (timing-insensitive, safe to co-run):
+up to GPUQ_MAX_SHARED (default 3) of them run together, never beside a non-shared job; a shared job starts
+only from the head of the queue, and an exclusive head waits for the running group to drain.  gpuq holds the
+resource's flock (~/gpu.lock) while any job runs -- an exclusive job's shim, or one holder process for a
+shared group -- so legacy `flock -o ~/gpu.lock` callers still serialize with it.  Before an admission onto
+an idle resource: sync + drop_caches (the page cache masks GB10 unified-memory pressure); a shared job
+joining a running group skips it.  Then MemAvailable (fresh) >= --mem + 6G (+ the --mem of group members
+started under GPUQ_RAMP s ago, default 60, which may not have allocated yet).
 
 Exit codes of `submit --wait`: the job's own code; 124 timeout; 125 cancelled; 120 lost (its shim vanished);
 127/126 cmd not found / not executable; 2 usage.  Docs: docs/QA_BEFORE_RELEASES.md "The GPU queue".
 Spool format (version 1): GPUQ_HOME (default ~/.gpuq)/{jobs/ID.json,ID.run,ID.out,ID.cancel; logs/ID.log;
 state.json; gpuq.log}.  Test mode (GPUQ_TEST=1) needs GPUQ_HOME, GPUQ_LOCK and GPUQ_MARKER set elsewhere and
-honours GPUQ_MEMINFO, GPUQ_TICK, GPUQ_KILL_AFTER.
+honours GPUQ_MEMINFO, GPUQ_TICK, GPUQ_KILL_AFTER, GPUQ_RAMP.
 """
 import argparse, fcntl, json, os, secrets, signal, socket, subprocess, sys, threading, time
 
@@ -27,6 +32,8 @@ LOCK = os.path.expanduser(os.environ.get("GPUQ_LOCK", "~/gpu.lock"))
 MARKER = os.path.expanduser(os.environ.get("GPUQ_MARKER", "~/BATTERY_RUNNING"))
 TICK = float(os.environ.get("GPUQ_TICK", "0.5")) if TEST else 0.5
 KILL_AFTER = float(os.environ.get("GPUQ_KILL_AFTER", "30")) if TEST else 30.0
+RAMP = float(os.environ.get("GPUQ_RAMP", "60")) if TEST else 60.0
+MAX_SHARED = int(os.environ.get("GPUQ_MAX_SHARED", "3"))
 DROP = os.environ.get("GPUQ_DROP_CACHES", "1") == "1"
 DROP_CMD = os.environ.get("GPUQ_DROP_CACHES_CMD", "sync; sudo -n sh -c 'echo 3 > /proc/sys/vm/drop_caches'")
 HOST = socket.gethostname().split(".")[0]
@@ -42,6 +49,7 @@ SHORT_MAX, DEF_MIN_HOLD, DEF_GRACE = 1200, 300, 1200
 EX_TEMPFAIL, RC_TIMEOUT, RC_CANCEL, RC_LOST = 75, 124, 125, 120
 FINAL = ("done", "timeout", "cancelled", "lost")
 JOBS, LOGS = os.path.join(HOME, "jobs"), os.path.join(HOME, "logs")
+HOLDERS = os.path.join(HOME, "holders.json")   # {res: {"pid", "since"}}: each running shared group's lock holder
 
 if TEST and ("GPUQ_HOME" not in os.environ or LOCK == os.path.expanduser("~/gpu.lock")
              or MARKER == os.path.expanduser("~/BATTERY_RUNNING")):
@@ -262,6 +270,20 @@ def shim(jid, fd):
     write_json(jp(jid, "out"), out)
 
 
+def hold(res, fd):
+    """Holds a resource's lock (fd, inherited from the daemon) for a shared group until the daemon -- which
+    alone decides when the group has drained -- sends SIGTERM.  A daemon restart leaves it holding."""
+    for s in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
+        signal.signal(s, lambda *_: sys.exit(0))
+    while True:
+        signal.pause()
+
+
+def holder_of(res):   # the live lock holder pid of res's shared group, or None
+    h = (read_json(HOLDERS) or {}).get(res)
+    return h["pid"] if h and alive(h["pid"], ["_hold", res]) else None
+
+
 # --------------------------------------------------------------------------------------------- the daemon
 class LockWaiter:   # a blocking flock in a thread: the daemon joins the kernel's queue like any legacy waiter
     def __init__(self, path):
@@ -277,6 +299,7 @@ class LockWaiter:   # a blocking flock in a thread: the daemon joins the kernel'
 class Daemon:
     def __init__(self):
         self.procs, self.waiters, self.said, self.dropped = {}, {}, {}, {}
+        self.holders = {r: h for r, h in (read_json(HOLDERS) or {}).items() if r in RESOURCES}
         self.stop = False
         ensure_dirs()
         self.logf = open(os.path.join(HOME, "gpuq.log"), "a", buffering=1)
@@ -325,6 +348,25 @@ class Daemon:
                 self.log(f"recover: re-adopted running job {j['id']} (shim pid {j['shim_pid']})")
             else:
                 self.lost(j, "recover: its shim is gone")
+        for res in RESOURCES:
+            if holder_of(res):
+                self.log(f"recover: re-adopted {res}'s shared-group lock holder (pid {self.holders[res]['pid']})")
+                continue
+            self.holders.pop(res, None)
+            group = [j for j in all_jobs() if j["state"] == "running" and j["resources"][0] == res
+                     and j.get("shared")]
+            if group:   # only if someone killed the holder: take the lock back if it is free
+                fd = os.open(RESOURCES[res]["lock"], os.O_RDWR | os.O_CREAT, 0o664)
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except OSError:
+                    os.close(fd)
+                    self.log(f"recover: WARNING {res}'s shared group {[j['id'] for j in group]} runs, its lock "
+                             "holder is gone and someone else holds the lock; no job joins the group")
+                    continue
+                self.spawn_holder(res, fd)
+                self.log(f"recover: {res}'s shared-group lock holder was gone; lock re-taken")
+        self.save_holders()
 
     def lost(self, j, why):
         self.log(f"job {j['id']} lost ({why}); killing what is left of it")
@@ -419,7 +461,11 @@ class Daemon:
             self.log(f"job {j['id']}: not yielded {fdur(now - yra)} after SIGUSR1 (grace "
                      f"{fdur(j['yield_grace'])}) -- still waiting, never killed for a yield")
 
-    def schedule(self, res, queued):
+    def schedule(self, res, queued, running):
+        if running:
+            return self.join(res, queued, running)
+        if res in self.holders:   # the shared group has drained (watch finalized its last job)
+            self.release_holder(res)
         w = self.waiters.get(res)
         if not queued:
             if w and w.got.is_set():
@@ -445,7 +491,65 @@ class Daemon:
             return self.note(res, f"{res}: job {head['id']} waits for memory: MemAvailable {fsize(avail)}"
                              f" < {fsize(head['mem'])} + 6G margin (holding the lock)")
         del self.waiters[res]
+        if head.get("shared"):
+            self.spawn_holder(res, w.fd)
+            return self.start(head, None, avail)
         self.start(head, w.fd, avail)
+
+    def join(self, res, queued, running):
+        """Something runs on res.  Only a shared head may start, and only beside a group that is all shared."""
+        if not queued or any(not j.get("shared") for j in running):
+            return
+        head, ids = order(queued)[0], ", ".join(str(j["id"]) for j in running)
+        if not head.get("shared"):   # FIFO: nothing starts past an exclusive head, so it is never starved
+            return self.note(res, f"{res}: job {head['id']} ({head['cls']}, exclusive) waits for the shared "
+                             f"group ({ids}) to drain")
+        if len(running) >= MAX_SHARED:
+            return self.note(res, f"{res}: job {head['id']} (shared) waits: {len(running)} shared jobs run "
+                             f"(GPUQ_MAX_SHARED={MAX_SHARED})")
+        if os.path.exists(MARKER):
+            return self.note(res, f"{res}: job {head['id']} waits: {MARKER} present (a legacy battery)")
+        if not holder_of(res):   # recover could not re-take the lock: never co-run outside it
+            return self.note(res, f"{res}: job {head['id']} (shared) waits: the group ({ids}) has no lock holder")
+        now = time.time()
+        ramp = [j for j in running if now - (j.get("started") or now) < RAMP]
+        avail = mem_available(res)
+        need = head["mem"] + MARGIN + sum(j["mem"] for j in ramp)
+        if avail < need:
+            return self.note(res, f"{res}: job {head['id']} (shared) waits for memory: MemAvailable "
+                             f"{fsize(avail)} < {fsize(head['mem'])} + 6G margin"
+                             + (f" + {fsize(need - head['mem'] - MARGIN)} of jobs still ramping "
+                                f"({', '.join(str(j['id']) for j in ramp)})" if ramp else ""))
+        self.log(f"{res}: job {head['id']} joins the running shared group ({ids}): drop_caches skipped (it "
+                 "would disturb the running jobs)")
+        self.start(head, None, avail)
+
+    def save_holders(self):
+        write_json(HOLDERS, self.holders)
+
+    def spawn_holder(self, res, fd):
+        p = subprocess.Popen([sys.executable, os.path.abspath(__file__), "_hold", res, str(fd)],
+                             pass_fds=(fd,), start_new_session=True, stdin=subprocess.DEVNULL)
+        os.close(fd)
+        self.procs[p.pid] = p
+        self.holders[res] = {"pid": p.pid, "since": time.time()}
+        self.save_holders()
+        self.log(f"{res}: shared group starts; lock holder pid {p.pid}")
+
+    def release_holder(self, res):   # only once the group has drained: nothing of it runs
+        pid = self.holders.pop(res)["pid"]
+        if alive(pid, ["_hold", res]):
+            os.kill(pid, signal.SIGTERM)
+            for _ in range(100):
+                p = self.procs.get(pid)
+                if (p.poll() is not None) if p else not alive(pid, ["_hold", res]):
+                    break
+                time.sleep(0.05)
+            else:
+                os.kill(pid, signal.SIGKILL)
+        self.procs.pop(pid, None)
+        self.save_holders()
+        self.log(f"{res}: shared group drained; lock holder pid {pid} released the lock")
 
     def start(self, j, fd, avail):
         if j["cls"] == "quiet":
@@ -455,14 +559,17 @@ class Daemon:
         j.update(state="running", started=time.time(), shim_pid=None, yield_requested_at=None,
                  token=f"gpuq-{j['id']}-{j['attempt']}-{secrets.token_hex(4)}")
         self.save(j)
-        p = subprocess.Popen([sys.executable, os.path.abspath(__file__), "_shim", str(j["id"]), str(fd)],
-                             pass_fds=(fd,), start_new_session=True, stdin=subprocess.DEVNULL)
-        os.close(fd)
+        p = subprocess.Popen([sys.executable, os.path.abspath(__file__), "_shim", str(j["id"]),
+                              str(-1 if fd is None else fd)], pass_fds=() if fd is None else (fd,),
+                             start_new_session=True, stdin=subprocess.DEVNULL)
+        if fd is not None:   # a shared job's shim gets no lock fd: the group's holder has it
+            os.close(fd)
         self.procs[p.pid] = p
         j["shim_pid"] = p.pid
         self.save(j)
         self.said.clear()
-        self.log(f"start job {j['id']} attempt {j['attempt']} ({j['cls']}, {j['label']}) on "
+        self.log(f"start job {j['id']} attempt {j['attempt']} ({j['cls']}{', shared' if j.get('shared') else ''}"
+                 f", {j['label']}) on "
                  f"{','.join(j['resources'])}: MemAvailable {fsize(avail)}, shim pid {p.pid}")
 
     def run(self):
@@ -490,11 +597,11 @@ class Daemon:
         for res in RESOURCES:
             mine = [j for j in jobs if j["resources"][0] == res]
             queued = [j for j in mine if j["state"] == "queued"]
-            running = [j for j in mine if j["state"] == "running"]
-            if running:
-                self.watch(running[0], queued)
-            else:
-                self.schedule(res, queued)
+            for j in [j for j in mine if j["state"] == "running"]:
+                self.watch(j, queued)
+            mine = [j for j in all_jobs() if j["resources"][0] == res]
+            self.schedule(res, [j for j in mine if j["state"] == "queued"],
+                          [j for j in mine if j["state"] == "running"])
         write_json(os.path.join(HOME, "state.json"), {"version": VERSION, "daemon_pid": os.getpid(),
                    "heartbeat": time.time(), "host": HOST, "resources": list(RESOURCES),
                    "waiting": {r: self.said.get(r) for r in RESOURCES}})
@@ -508,6 +615,9 @@ def cmd_submit(a):
     tmo = parse_dur(a.timeout) if a.timeout else DEF_TMO[a.cls]
     if a.cls == "short" and tmo > SHORT_MAX:
         die(f"a short job's timeout is at most 20m (got {fdur(tmo)}); use --class long")
+    if a.shared and a.cls != "short":
+        die(f"--shared is for short jobs only (got --class {a.cls}): a quiet job is exclusive by definition, a "
+            "long one is preempted, not co-run")
     res = [r if ":" in r else f"{HOST}:{r}" for r in (a.gpus.split(",") if a.gpus else ["gpu0"])]
     foreign = [r for r in res if r not in RESOURCES]
     if foreign:
@@ -529,7 +639,8 @@ def cmd_submit(a):
          "mem": parse_size(a.mem) if a.mem else DEF_MEM[a.cls],
          "min_hold": parse_dur(a.min_hold) if a.min_hold else DEF_MIN_HOLD,
          "yield_grace": parse_dur(a.yield_grace) if a.yield_grace else DEF_GRACE,
-         "state": "queued", "attempt": 1, "submitted": time.time(), "submitter_pid": os.getppid(), "attempts": []}
+         "shared": a.shared, "state": "queued", "attempt": 1, "submitted": time.time(),
+         "submitter_pid": os.getppid(), "attempts": []}
     write_json(jp(jid), j)
     if not daemon_up(read_json(os.path.join(HOME, "state.json"))):
         print(f"gpuq: warning: the daemon is not running; job {jid} waits until it is "
@@ -537,7 +648,7 @@ def cmd_submit(a):
     if not a.wait:
         print(jid)
         return 0
-    print(f"gpuq: job {jid} queued ({a.cls}); waiting", file=sys.stderr)
+    print(f"gpuq: job {jid} queued ({a.cls}{', shared' if a.shared else ''}); waiting", file=sys.stderr)
     return wait_job(jid)
 
 
@@ -595,35 +706,43 @@ def snapshot():
         pass
     for res, cfg in RESOURCES.items():
         mine = [j for j in jobs if j["resources"][0] == res]
-        run = next((j for j in mine if j["state"] == "running"), None)
+        runs = [j for j in mine if j["state"] == "running"]
         holders, waiters = lock_info(cfg["lock"])
-        dpid = st.get("daemon_pid")
-        legacy = [] if run else [{"pid": p, "cmd": cmdline(p), "alive": alive(p)} for p in holders if p != dpid]
+        dpid, gpid = st.get("daemon_pid"), holder_of(res)
+        legacy = [] if runs else [{"pid": p, "cmd": cmdline(p), "alive": alive(p)} for p in holders
+                                  if p not in (dpid, gpid)]
         for h in legacy:
             if not h["alive"]:
                 s["anomalies"].append(f"ORPHANED LOCK: holder {h['pid']} is gone, an inherited fd holds {cfg['lock']}")
+        if any(j.get("shared") for j in runs) and not gpid:
+            s["anomalies"].append(f"UNLOCKED GROUP: shared jobs run on {res} but no gpuq lock holder holds "
+                                  f"{cfg['lock']}")
         r = {"lock": cfg["lock"], "mem_available": mem_available(res), "legacy_holders": legacy,
-             "legacy_waiters": [{"pid": p, "cmd": cmdline(p)} for p in waiters if p != dpid],
-             "running": None, "queue": [], "recent": []}
+             "legacy_waiters": [{"pid": p, "cmd": cmdline(p)} for p in waiters if p not in (dpid, gpid)],
+             "group_lock_holder": gpid, "running": [], "running_first": None, "queue": [], "recent": []}
         t = now
-        if run:
+        for run in runs:
             el = now - (run.get("started") or now)
-            r["running"] = {k: run.get(k) for k in ("id", "label", "cls", "attempt", "mem", "timeout", "resources",
-                                                   "yield_requested_at", "yield_grace", "min_hold")}
-            r["running"].update(pid=(read_json(jp(run["id"], "run")) or {}).get("pgid"), elapsed=el)
-            t += max(0, run["timeout"] - el)
+            x = {k: run.get(k) for k in ("id", "label", "cls", "attempt", "mem", "timeout", "resources",
+                                         "yield_requested_at", "yield_grace", "min_hold")}
+            x.update(shared=bool(run.get("shared")), pid=(read_json(jp(run["id"], "run")) or {}).get("pgid"),
+                     elapsed=el)
+            r["running"].append(x)
+        if runs:   # conservative: the queue starts once every running job has hit its timeout
+            r["running_first"] = r["running"][0]   # the pre-shared single-object shape, for old readers
+            t += max(max(0, x["timeout"] - x["elapsed"]) for x in r["running"])
         for q in order([j for j in mine if j["state"] == "queued"]):
             r["queue"].append({"id": q["id"], "label": q["label"], "cls": q["cls"], "attempt": q["attempt"],
-                               "mem": q["mem"], "timeout": q["timeout"], "resources": q["resources"],
-                               "waited": now - q["submitted"], "eta_start": t})
+                               "shared": bool(q.get("shared")), "mem": q["mem"], "timeout": q["timeout"],
+                               "resources": q["resources"], "waited": now - q["submitted"], "eta_start": t})
             t += q["timeout"]
         done = sorted((j for j in mine if j["state"] in FINAL), key=lambda j: j.get("ended", 0))[-5:]
         r["recent"] = [{k: j.get(k) for k in ("id", "label", "cls", "state", "rc", "ended")} for j in done]
         s["resources"][res] = r
-        tok = run and run.get("token")
+        mine_pids = {p for j in runs if j.get("token") for p in tagged(j["token"])} if gpu else set()
         for g in gpu:
             pid = int(g[0])
-            if tok and pid in tagged(tok):
+            if pid in mine_pids:
                 continue
             if any(h["alive"] and descends(pid, h["pid"]) for h in legacy):
                 continue
@@ -663,18 +782,22 @@ def cmd_status(a):
             print(f"  legacy waiters on the lock: {len(r['legacy_waiters'])}")
             for w in r["legacy_waiters"]:
                 print(f"    {w['pid']} {w['cmd']}")
-        x = r["running"]
-        if x:
-            print(f"  RUNNING #{x['id']} {x['cls']} \"{x['label']}\" pid {x['pid']} attempt {x['attempt']} "
-                  f"{fdur(x['elapsed'])} / {fdur(x['timeout'])} mem {fsize(x['mem'])}")
+        if r["group_lock_holder"]:
+            print(f"  shared group: {len(r['running'])} running (max {MAX_SHARED}), lock holder pid "
+                  f"{r['group_lock_holder']}")
+        for x in r["running"]:
+            print(f"  RUNNING #{x['id']} {x['cls']}{' shared' if x['shared'] else ''} \"{x['label']}\" pid "
+                  f"{x['pid']} attempt {x['attempt']} {fdur(x['elapsed'])} / {fdur(x['timeout'])} "
+                  f"mem {fsize(x['mem'])}")
             if x["yield_requested_at"]:
                 print(f"    yield requested at {fclock(x['yield_requested_at'])} "
                       f"({fdur(now - x['yield_requested_at'])} ago, grace {fdur(x['yield_grace'])})")
         w = d["waiting"].get(res)
-        if not x and w and r["queue"]:
+        if w and r["queue"]:
             print(f"  waiting: {w}")
         for i, q in enumerate(r["queue"], 1):
-            print(f"  {i:2d}. #{q['id']} {q['cls']:5s} \"{q['label']}\" attempt {q['attempt']} waited "
+            print(f"  {i:2d}. #{q['id']} {q['cls']:5s}{' shared' if q['shared'] else ''} \"{q['label']}\" "
+                  f"attempt {q['attempt']} waited "
                   f"{fdur(q['waited'])}, start <= {fclock(q['eta_start'])} (+{fdur(q['eta_start'] - now)}), "
                   f"timeout {fdur(q['timeout'])} mem {fsize(q['mem'])}")
         if not r["queue"]:
@@ -714,6 +837,8 @@ def cmd_log(a):
 def main():
     if len(sys.argv) == 4 and sys.argv[1] == "_shim":
         return shim(int(sys.argv[2]), int(sys.argv[3]))
+    if len(sys.argv) == 4 and sys.argv[1] == "_hold":
+        return hold(sys.argv[2], int(sys.argv[3]))
     ap = argparse.ArgumentParser(prog="gpuq", description=__doc__.split("\n\n")[0])
     sub = ap.add_subparsers(dest="op", required=True)
     s = sub.add_parser("submit")
@@ -721,6 +846,7 @@ def main():
     for o in ("timeout", "mem", "min-hold", "yield-grace", "label", "cwd", "gpus"):
         s.add_argument(f"--{o}")
     s.add_argument("--wait", action="store_true")
+    s.add_argument("--shared", action="store_true")
     s.add_argument("cmd", nargs=argparse.REMAINDER)
     sub.add_parser("status").add_argument("--json", action="store_true")
     sub.add_parser("cancel").add_argument("id", type=int)

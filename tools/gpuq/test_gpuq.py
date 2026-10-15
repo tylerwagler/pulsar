@@ -49,7 +49,8 @@ class Q(unittest.TestCase):
         meminfo(self.mem, 100)
         self.env = dict(os.environ, GPUQ_TEST="1", GPUQ_HOME=os.path.join(self.dir, "spool"),
                         GPUQ_LOCK=self.lock, GPUQ_MARKER=self.marker, GPUQ_MEMINFO=self.mem, GPUQ_TICK="0.1",
-                        GPUQ_KILL_AFTER="2", GPUQ_DROP_CACHES_CMD=f"echo drop >> {self.drops}")
+                        GPUQ_KILL_AFTER="2", GPUQ_DROP_CACHES_CMD=f"echo drop >> {self.drops}",
+                        GPUQ_RAMP="0", GPUQ_MAX_SHARED="3")
         self.daemon = None
         self.start_daemon()
 
@@ -63,6 +64,9 @@ class Q(unittest.TestCase):
                     pid and kill(pid, signal.SIGKILL)
                 except OSError:
                     pass
+        h = self.holder()
+        if h:
+            os.kill(h, signal.SIGKILL)
         if os.environ.get("GPUQ_KEEP") != "1":
             shutil.rmtree(self.dir, ignore_errors=True)
 
@@ -124,6 +128,28 @@ class Q(unittest.TestCase):
 
     def status(self):
         return json.loads(self.q("status", "--json").stdout)["resources"]
+
+    def res(self):   # this host's one resource in `status --json`
+        return next(iter(self.status().values()))
+
+    def holder(self):   # the shared group's live lock-holder pid, or None
+        p = os.path.join(self.dir, "spool", "holders.json")
+        h = next(iter(json.loads(rd(p)).values()), None) if os.path.exists(p) else None
+        return h["pid"] if h and os.path.exists(f"/proc/{h['pid']}") and \
+            rd(f"/proc/{h['pid']}/stat").split(")")[1].split()[0] != "Z" else None
+
+    def locked(self):   # does anyone hold the test lock?
+        return subprocess.run(["flock", "-n", self.lock, "true"]).returncode == 1
+
+    def gated(self, tag, cls="short", opts=("--shared",)):
+        """A job that logs tag-start, waits for the file `go-<tag>`, logs tag-end."""
+        go = os.path.join(self.dir, f"go-{tag}")
+        return self.sh(cls, f"echo {tag}-start >> {self.out}; while [ ! -e {go} ]; do sleep 0.05; done;"
+                            f" echo {tag}-end >> {self.out}", opts=opts)
+
+    def go(self, *tags):
+        for t in tags:
+            wr(os.path.join(self.dir, f"go-{t}"), "")
 
     # ------------------------------------------------------------------------------------------ tests
     def test_fifo_short(self):
@@ -215,8 +241,9 @@ class Q(unittest.TestCase):
         self.until(lambda: os.path.exists(self.out))
         self.sh("short", "true")
         self.until(lambda: self.job(lg).get("yield_requested_at"), what="yield request")
-        run = self.status()[next(iter(self.status()))]["running"]
+        run = self.res()["running_first"]
         self.assertEqual(run["id"], lg)
+        self.assertEqual([x["id"] for x in self.res()["running"]], [lg])
         self.assertIsNotNone(run["yield_requested_at"])
         text = self.q("status").stdout
         self.assertIn("yield requested at", text)
@@ -225,7 +252,9 @@ class Q(unittest.TestCase):
         self.assertEqual(self.state(lg), "running")
         self.assertNotIn("never killed for a yield", self.dlogtext())
         self.assertEqual(self.final(lg)["rc"], 0)
-        self.assertIsNone(self.status()[next(iter(self.status()))]["running"])
+        r = self.res()   # the queued short may already have started in the same tick
+        self.assertNotIn(lg, [x["id"] for x in r["running"]])
+        self.assertEqual(r["running_first"], r["running"][0] if r["running"] else None)
 
     def test_timeout_kills_process_group_and_leftovers(self):
         pids = os.path.join(self.dir, "pids")
@@ -373,6 +402,138 @@ class Q(unittest.TestCase):
         self.assertEqual(r.returncode, 2)
         self.assertIn("otherhost:gpu0", r.stderr)
         self.assertEqual(self.final(self.sh("short", "true", opts=("--gpus", "gpu0")))["rc"], 0)
+
+    # ------------------------------------------------------------------------------- shared (co-run) jobs
+    def test_shared_corun_and_cap(self):
+        ids = [self.gated(t) for t in ("a", "b", "c", "d")]
+        self.until(lambda: [self.state(i) for i in ids[:3]] == ["running"] * 3, what="3 shared jobs co-running")
+        self.until(lambda: "GPUQ_MAX_SHARED=3" in self.dlogtext(), what="cap note")
+        time.sleep(0.4)
+        self.assertEqual(self.state(ids[3]), "queued")   # the 4th waits for the cap
+        self.assertTrue(self.locked())                    # legacy flock callers still serialize
+        self.assertEqual(rd(self.drops).split(), ["drop"])   # only the first (idle-resource) admission drops
+        self.assertEqual(self.dlogtext().count("drop_caches skipped"), 2)
+        r = self.res()
+        self.assertEqual(sorted(x["id"] for x in r["running"]), ids[:3])
+        self.assertTrue(all(x["shared"] for x in r["running"]))
+        self.assertEqual(r["running_first"]["id"], r["running"][0]["id"])
+        self.assertEqual(r["group_lock_holder"], self.holder())
+        self.assertEqual([q["id"] for q in r["queue"]], [ids[3]])
+        text = self.q("status").stdout
+        self.assertEqual(text.count("RUNNING #"), 3)
+        self.assertIn("shared group: 3 running (max 3)", text)
+        self.go("a")
+        self.until(lambda: self.state(ids[3]) == "running", what="the 4th starts when one finishes")
+        self.assertIn(self.state(ids[1]), ("running",))
+        self.go("b", "c", "d")
+        for i in ids:
+            self.assertEqual(self.final(i)["rc"], 0)
+        self.until(lambda: not self.locked() and not self.holder(), what="lock released after the group")
+        self.until(lambda: "released the lock" in self.dlogtext(), what="release logged")
+
+    def test_shared_memory_gate(self):
+        meminfo(self.mem, 20)   # 8G + 6G fits once
+        a = self.gated("a", opts=("--shared", "--mem", "8G"))
+        self.until(lambda: self.state(a) == "running")
+        meminfo(self.mem, 10)   # measured fresh at admission: what A uses shows up here
+        b = self.gated("b", opts=("--shared", "--mem", "8G"))
+        self.until(lambda: "(shared) waits for memory" in self.dlogtext(), what="memory wait")
+        time.sleep(0.4)
+        self.assertEqual(self.state(b), "queued")
+        meminfo(self.mem, 14.5)
+        self.until(lambda: self.state(b) == "running", what="b joins once memory is there")
+        self.assertEqual(self.state(a), "running")   # co-running
+        self.go("a", "b")
+        self.final(a)
+        self.final(b)
+        # GPUQ_RAMP: a member started under RAMP s ago still owes its --mem
+        self.stop_daemon()
+        self.env["GPUQ_RAMP"] = "3"
+        self.start_daemon()
+        meminfo(self.mem, 20)
+        c = self.gated("c", opts=("--shared", "--mem", "8G"))
+        self.until(lambda: self.state(c) == "running")
+        d = self.gated("d", opts=("--shared", "--mem", "4G"))   # 4 + 6 + 8 (c ramping) = 18 <= 20: joins
+        e = self.gated("e", opts=("--shared", "--mem", "4G"))   # + 4 (d ramping) = 22 > 20: waits for the ramp
+        self.until(lambda: self.state(d) == "running")
+        self.until(lambda: "still ramping" in self.dlogtext(), what="ramp wait")
+        self.assertEqual(self.state(e), "queued")
+        self.until(lambda: self.state(e) == "running", what="e joins once the ramp window passes")
+        self.go("c", "d", "e")
+        for i in (c, d, e):
+            self.final(i)
+
+    def test_exclusive_head_blocks_shared(self):
+        a = self.gated("a")
+        self.until(lambda: self.state(a) == "running")
+        x = self.sh("short", f"echo X >> {self.out}; sleep 0.3")   # exclusive short at the head
+        c = self.sh("short", f"echo C >> {self.out}", opts=("--shared",))
+        self.until(lambda: "exclusive) waits for the shared group" in self.dlogtext(), what="drain wait")
+        time.sleep(0.5)
+        self.assertEqual((self.state(x), self.state(c)), ("queued", "queued"))   # C is not let past X
+        self.go("a")
+        self.final(c)
+        self.assertEqual(self.lines(), ["a-start", "a-end", "X", "C"])
+        self.assertLessEqual(self.job(a)["ended"], self.job(x)["attempts"][0]["started"])
+        self.assertLessEqual(self.job(x)["ended"], self.job(c)["attempts"][0]["started"])
+        # and a shared job waits behind a running exclusive job and a waiting quiet one
+        e = self.gated("e", opts=())
+        self.until(lambda: self.state(e) == "running")
+        qt = self.sh("quiet", f"echo Q >> {self.out}")
+        s = self.sh("short", f"echo S >> {self.out}", opts=("--shared",))
+        time.sleep(0.5)
+        self.assertEqual((self.state(qt), self.state(s)), ("queued", "queued"))
+        self.go("e")
+        self.final(s)
+        self.assertEqual(self.lines()[-4:], ["e-start", "e-end", "Q", "S"])
+
+    def test_shared_refused_on_quiet_and_long(self):
+        for cls in ("quiet", "long"):
+            r = self.q("submit", "--class", cls, "--shared", "--", "true", check=False)
+            self.assertEqual(r.returncode, 2, cls)
+            self.assertIn("short jobs only", r.stderr)
+        self.assertEqual(self.jobs(), [])
+
+    def test_yield_with_shared_waiters(self):
+        lg = self.submit("long", PY, "-c", LONG_JOB, self.out, "3", "yield", opts=("--min-hold", "0.3"))
+        self.until(lambda: os.path.exists(self.out))
+        s1 = self.gated("s1")
+        s2 = self.gated("s2")
+        self.until(lambda: self.job(lg).get("yield_requested_at"), what="yield for a shared waiter")
+        self.assertIn(f"job {s1} (short) waits", self.dlogtext())
+        self.until(lambda: (self.state(s1), self.state(s2)) == ("running", "running"), what="s1+s2 co-run")
+        self.assertEqual(self.state(lg), "queued")
+        self.go("s1", "s2")
+        j = self.final(lg)
+        self.assertEqual([a["rc"] for a in j["attempts"]], [75, 0])
+        self.assertEqual(self.lines()[0], "long:1")
+        self.assertEqual(self.lines()[-1], "long:2")
+
+    def test_daemon_restart_readopts_shared_group(self):
+        ids = [self.gated(t) for t in ("a", "b", "c")]
+        self.until(lambda: [self.state(i) for i in ids] == ["running"] * 3, what="group running")
+        h = self.holder()
+        self.stop_daemon()
+        time.sleep(0.5)
+        self.assertEqual([self.state(i) for i in ids], ["running"] * 3)
+        self.assertEqual(self.holder(), h)
+        self.assertTrue(self.locked())
+        later = self.gated("d")   # queued while the daemon is down
+        self.start_daemon()
+        self.until(lambda: self.dlogtext().count("re-adopted running job") == 3, what="re-adopt all 3")
+        res = self.job(ids[0])["resources"][0]
+        self.assertIn(f"re-adopted {res}'s shared-group lock holder (pid {h})", self.dlogtext())
+        time.sleep(0.4)
+        self.assertEqual(self.state(later), "queued")   # the cap still holds after the restart
+        self.go("a")
+        self.until(lambda: self.state(later) == "running", what="d joins the re-adopted group")
+        self.assertEqual(self.holder(), h)   # same holder, never released while the group ran
+        self.go("b", "c", "d")
+        for i in ids + [later]:
+            self.assertEqual(self.final(i)["rc"], 0)
+        self.until(lambda: not self.locked() and not self.holder(), what="lock released")
+        k = self.sh("short", "true")   # the queue still works, exclusive
+        self.assertEqual(self.final(k)["rc"], 0)
 
 
 if __name__ == "__main__":

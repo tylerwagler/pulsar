@@ -1080,10 +1080,11 @@ indexer-score-check: tests/indexer_score_test
 
 # Single-pass mHC hand-over (L218): the fused split collapses with the pre it
 # was handed and leaves its own behind; two chained calls vs a host oracle.
-# Built the way the engine builds the TU (--use_fast_math).
-tests/hc_carry_kernel_test: tests/hc_carry_kernel_test.cu Makefile \
+# Built the way the engine builds the TU (--use_fast_math).  L295 F2: the TU's router select is the shared router's
+# (pulsar_router_select_launch), linked from its production object.
+tests/hc_carry_kernel_test: tests/hc_carry_kernel_test.cu Makefile src/cuda/pulsar_cuda_router.o \
                             src/cuda/pulsar_cuda_hc_router.cu src/cuda/pulsar_cuda_internal.h src/pulsar_gpu.h
-	$(NVCC) -O3 --use_fast_math -arch=$(ATTN_GATE_ARCH) -Isrc -Isrc/cuda -o $@ $<
+	$(NVCC) -O3 --use_fast_math -arch=$(ATTN_GATE_ARCH) -Isrc -Isrc/cuda -o $@ $< src/cuda/pulsar_cuda_router.o
 
 # attn_f16_kernel_test takes [n_tokens window n_head bench n_comp ratio top_k
 # raw_cap] and its own header argues the compressed and indexed halves matter --
