@@ -28,7 +28,8 @@ and any non-default flags for every manual run.
 
 - Run the default suite:
   `make test` (also the first entry of `make gates`, as `unit-test-gate`,
-  since 2026-09-03 -- a battery run covers it).
+  since 2026-09-03 -- a battery run covers it, as `pulsar_test --gating` since
+  2026-10-14: every test but the informational `logprob-vectors`).
 - Run the CUDA smoke regression:
   `make cuda-regression`.
 - Run the vector checks explicitly after any tokenizer, template, KV, kernel,
@@ -105,6 +106,106 @@ model.  Record pass/fail against the release commit:
 - `make cuda-mixed-prefill-gate`, `make cuda-mixed-neutrality-gate` — mixed
   decode+prefill batching neutrality.
 - `make cuda-spec-sampling-gate` — speculative-sampling chi-square exactness.
+
+### Battery wall time
+
+The one home for what `make gates` costs and why (Phase 5 #39: back under ~35 min).  The battery prints
+its own table at the end -- `seconds per gate` in the runner summary and in the GATE SUMMARY -- so every
+battery log is a fresh measurement; this section records the levers.
+
+**Before (2026-10-13, 1b33c1d4, sparky `~/qland2-battery-1013-2134`):** 3,324 s wall, of which 3,240 s
+suite: the runner 2,629 s (52 sub-gates, 9 engine opens), the serial GPU targets in front of it 611 s.
+The slowest sub-gates:
+
+| s | gate | where it went |
+|---:|---|---|
+| 392 | cuda-decode-reference-gate-story | a model reload, then 48 prefills from 0 (6 depths x 4 widths x wide/serial; 380k tokens) |
+| 380 | cuda-chunk-neutrality-gate | 17 schedules from 0; schedule K's 4,600 single-row decode steps are ~230 s of it |
+| 262 | cuda-regression (make target) | ten model-free kernel gates, one after another |
+| 231 | unit-test-gate (make target) | the pulsar_test compile (~40 s) and FIVE model loads (shared, logprob-vectors, tensor-equivalence x2, the image tests re-opening the shared one) |
+| 225 | cuda-chunk-neutrality-gate [Qwen4-exp] | as above on the hosted Qwen |
+| 171 / 150 | cuda-spec-sampling-gate [Qwen4-exp] / DeepSeek | 1,250 trajectories per mode (L163) |
+| 107 | cuda-accounting-gate | prefill to 64k in three levels |
+| 78 | cuda-head-graph-replay-gate | three 120-step runs (eager, graphs, eager) |
+| 70 | cuda-prefill-gate | the byte gate's five depths, cold |
+| 67 | cuda-decode-reference-gate-code | as the story gate, 3 depths |
+| 66 / 43 | cuda-row-neutrality-gate-deeper [Qwen4-exp] / DeepSeek | ~10k-token probe |
+| 65 | qwen-family-gate-device (make target) | seven zero-weight containers, the loader refusals, one device session |
+| 49 / 46 | session-contract-gate [Qwen4-exp] / DeepSeek | |
+| 47, 30, 30 | cuda-dspark-batch-gate-wide / -depth4 / -depth1 | each a full model reload for its draft depth (~22 s of each) |
+| 45 / 41 | cuda-reference-gate-story [Qwen4-exp] / DeepSeek | |
+| 42, 29 | cuda-multiseq-gate-nodspark [Qwen4-exp] / DeepSeek | the drafter-off engine's open |
+| 20 | cuda-tp-head-split-gate | its own model load (drafter off), and one more for the gates after it |
+
+**2026-10-14 (work/battery-trim).  No release-blocking gate left the battery; one informational test did
+(`pulsar_test --logprob-vectors`, below):**
+- *Engine opens 9 -> 4* (two per hosted model).  The draft depth is a session-start field the broker sets
+  on the live engine (`spec_depth_shareable`, tests/gates_runner.cpp), so the three dspark depth legs run on
+  the default engine; `cuda-tp-head-split-gate` moved from the end of the default group to the end of the
+  drafter-off group whose configuration it has, so it no longer costs its own load AND the default
+  engine's reload for the decode-reference gates.
+- *Decode-reference gates: one cold prefill per depth.*  Every other run restores the grid checkpoint it
+  left and prefills the rest -- the cold computation (L264) -- announced per depth
+  (`[resume] depth D: ... resumed from grid checkpoint G`) and ASSERTED: the depth's widest wide run is
+  computed on the cold prefill and again over a resumed one, and must be byte-identical (it is, at
+  every depth of both blobs).
+- *cuda-regression runs its ten model-free gates concurrently* (`make -O`: each one's output stays together).
+  They are host-bound -- measured alone 2026-10-14: exl3_moe_prefill 114 s (113 s of it single-threaded user
+  time; its W_hat decode now runs on 16 threads -- the same bytes), qsa_attn 46, qwen_s4 36, exl3_moe_epilogue
+  30, exl3_dense 25, the other five 7 together; 258 s in series.  None grades a time.
+- *unit-test-gate runs `pulsar_test --gating`*: every test but the informational `logprob-vectors` (it
+  can never fail the suite; `make test` still runs it), and the image tests moved in front of the two
+  own-engine tests so they reuse the shared engine.  Five model loads -> three.  pulsar_test, pulsar,
+  pulsar_agent_test and the cuda-regression binaries are `gates` prerequisites, built in the one parallel
+  make before the timed loop.
+- **Measured per piece** (2026-10-14, a targeted run on sparky, not a battery: the changed runner gates on
+  both hosted models, cuda-regression and unit-test-gate): decode-reference story 392 -> 93 s, code 67 -> 31;
+  dspark-batch depth1 30 -> 8, depth4 30 -> 9, wide 47 -> 25; tp-head-split 20 -> 0; cuda-regression 262 -> 77;
+  unit-test-gate 231 -> 167 (its compile now in the prerequisite build); 4 engine opens for two hosted models.
+- **Predicted battery: ~2,670 s (44 min)**, from 3,324: the runner ~2,210 s, the serial front ~370 s, the
+  build ~90 s.  The first battery after this lands measures it (its GATE SUMMARY).
+
+**Not cut, and what each would take** (each removes coverage or changes a gate's premise -- a decision,
+not hygiene):
+- cuda-chunk-neutrality-gate schedule K's 4,600 single-row decode steps past the raw ring (~230 s DeepSeek;
+  on Qwen schedule P owns it, ~140 s): no compared row reads those rows, so 16 teacher-forced rows a step would
+  do -- but neither family's session supports it today.  Tried 2026-10-14 (the server's fold: carry saved,
+  `decode_mixed` ALL_ROWS steps, carry restored, `pulsar_session_note_committed_tokens`): on DeepSeek's
+  classic (unpooled) session the noted view does not agree with the state, so the payload K shares refuses
+  ("no valid checkpoint to snapshot"); on Qwen an ALL_ROWS step is a verify step that does not advance the
+  bank, so the next step is refused ("not its run's next position").  An engine API for a teacher-forced
+  multi-row decode on a classic session is the lever (~-300 s across both families).
+- cuda-accounting-gate's 64k peak (107 s): levels 8k/16k/32k would halve it.
+- cuda-head-graph-replay-gate's run C (26 s): it only proves eager determinism, the premise of B == A.
+- The spec-sampling oracles' 1,250 trajectories per mode (L163 already halved them).
+
+**Outside `make gates`:** the landing scripts' extra legs (`~/*-battery.sh` after `make gates`:
+`session-contract-gate-qwen`, `cuda-chunk-neutrality-gate` and `cuda-spec-sampling-gate` on
+`$(QWEN_GATE_MODEL)`, ~12 min on 2026-10-13) repeat what the runner already runs on the hosted Qwen
+(`session-contract-gate [Qwen4-exp]`, `cuda-chunk-neutrality-gate [Qwen4-exp]`,
+`cuda-spec-sampling-gate [Qwen4-exp]`, the last at the battery's 1,250 trajectories).  Drop them; keep the
+vision, image-smoke and live / abandon server legs, which the runner does not cover.
+
+### The GPU lock
+
+Sparky's GPU is shared through one lock file, `~/gpu.lock`, and one marker, `~/BATTERY_RUNNING`
+(nothing else runs while it exists: the accounting gate measures system-wide free memory).  Two ways to
+take the lock have bitten (#43):
+- `flock ~/gpu.lock cmd` (no `-o`) gives cmd the lock's fd, and every process cmd starts inherits it: a
+  pulsar-server started in the background keeps the GPU LOCKED after cmd and flock are gone, and
+  `/proc/locks` names a dead pid as the holder.
+- `flock -o ~/gpu.lock -c '...'` inherits nothing, but a server the job leaves running -- or a job orphaned
+  by a killed flock or a dropped ssh session -- keeps the GPU BUSY with the lock free, and the next job
+  loads beside it.
+
+Use the wrapper, which holds the lock itself (the job never gets the fd), runs the job in its own session
+tagged by an environment token, and on any exit (the job's end, `-t`, Ctrl-C, SIGTERM, SIGHUP) kills every
+process of the job that is left before the lock is released:
+
+    tools/gpu-run.sh -t 1200 -- make gates-dev PATHS=src/engine/session.cpp
+    tools/gpu-run.sh --battery -t 4000 -- make gates CUDA_ARCH=sm_120f   # owns ~/BATTERY_RUNNING
+    tools/gpu-lock-status.sh   # holder + queue; exit 1 on an orphaned lock, an inherited fd,
+                               # or a GPU process outside the holder's tree
 
 ## 3. Flash Inference Path
 
