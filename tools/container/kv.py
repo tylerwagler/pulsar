@@ -383,3 +383,35 @@ def build_kv(hf, tokenizer_dir, reap_map=None, keep=None, engram_layout=None):
     if len(set(keys)) != len(keys):
         raise SystemExit('duplicate kv key: ' + ', '.join(sorted(k for k in set(keys) if keys.count(k) > 1)))
     return out
+
+
+def config_kvs(prefix, value, out):
+    """An HF config block -> (key, type, value) triples, mechanically (the families that carry their config verbatim:
+    qwen4_exp's text_config, S1's contract, family_qwen.h section 2; Inkling's text / vision / mtp configs):
+    every key verbatim under `prefix`, nested dicts flattened with '.', None and empty lists skipped (nothing to
+    type); bool -> bool, int -> u32 (u64 past 2^32, i64 if negative), float -> f32, str -> string, a list of str
+    -> string array, a list of non-negative int -> u32 array (u64 past 2^32).  Anything else refuses."""
+    if value is None:
+        return
+    if isinstance(value, dict):
+        for k, v in value.items():
+            config_kvs(f"{prefix}.{k}", v, out)
+    elif isinstance(value, bool):
+        out.append((prefix, "bool", value))
+    elif isinstance(value, int):
+        out.append((prefix, "u32" if 0 <= value <= 0xFFFFFFFF else "u64" if value >= 0 else "i64", value))
+    elif isinstance(value, float):
+        out.append((prefix, "f32", value))
+    elif isinstance(value, str):
+        out.append((prefix, "string", value))
+    elif isinstance(value, list):
+        if not value:
+            return
+        if all(isinstance(v, str) for v in value):
+            out.append((prefix, "array", ("string", list(value))))
+        elif all(isinstance(v, int) and not isinstance(v, bool) for v in value) and min(value) >= 0:
+            out.append((prefix, "array", ("u64" if max(value) > 0xFFFFFFFF else "u32", list(value))))
+        else:
+            raise SystemExit(f"{prefix}: unsupported list {value!r}")
+    else:
+        raise SystemExit(f"{prefix}: unsupported config value {value!r}")

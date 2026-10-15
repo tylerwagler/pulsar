@@ -14,8 +14,8 @@ for the file:line evidence behind every statement here.
 
 ```
 hf_source.py                            # the source readers, family-neutral, header-only until bytes are asked for
-  class HFCheckpoint(hf_dir)            # .names(), .shape(n), .dtype(n), .span(n), .raw(n) -> bytes,
-                                        #  .config (text_config merged), .generation_config
+  class HFCheckpoint(hf_dir)            # .names(), .shape(n), .dtype(n), .span(n), .raw(n) -> bytes, .copy_src(n),
+                                        #  .config (text_config merged), .generation_config; `X#i` = slice i of stack X
   class Exl3Checkpoint(dir)             # .names(), .linear(key, k, n, rates) -> (ranges, words); the family names the key
   class TesseraBundle(dir)              # .names(): <stack>.pt unit-blob files (the producer lands with L255)
 
@@ -47,9 +47,13 @@ policy.py                               # DeepSeek's default formats (the five d
                                         #  FP4 experts -> cutlass_mxfp4; markov_w2 -> fp8_e4m3_soa_k; tid2eid -> i32
   def declared_shape(m: Mapped, shape: list[int]) -> list[int]   # decision 5: what the container HOLDS; dims_ne = reversed
 
-deepseek.py / qwen.py                   # the family modules (build.FAMILIES, by config.json model_type): META, SETTINGS,
-                                        #  EXPERT_STACKS, GATE_UP_PARTS, shape, shard_order, map_hf, declared_shape,
-                                        #  admit (what the loader binds), default_recipe, group_* / stack_families, build_kv
+deepseek.py / qwen.py / inkling.py      # the family modules (build.FAMILIES, by config.json model_type): META, SETTINGS,
+                                        #  EXPERT_STACKS, GATE_UP_PARTS, source (the HF view the plan reads), shape,
+                                        #  shard_order, map_hf, declared_shape, admit (what the loader binds),
+                                        #  default_recipe, group_* / stack_families, gate_up_key, build_kv.
+                                        #  inkling.Source names the projections Inkling's fused w13 / expert stacks hold
+                                        #  (the EXL3 pack's names) and checks names, dtypes, shapes against the declared
+                                        #  Shape both ways; Mapped.bind carries the role table into pulsar.tensors
 
 producers.py                            # every producer: bytes in, bytes out, no I/O; each gated byte-identical
   PRODUCER_FOR[(source kind, format)]   # THE producer table; producer_for(kind, fmt, what) refuses a missing pair by name

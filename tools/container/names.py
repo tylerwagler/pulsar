@@ -128,6 +128,10 @@ class Mapped:
     is_scale: bool
     emit: bool = True
     role: str = ""              # what the tensor IS, in the recipe's vocabulary
+    # the binder's record, carried into the tensor's pulsar.tensors declaration as (key, value) pairs: the family's
+    # role table ({"role": ..., "block": ..., "layer": ...}) so the loader binds by role, not by parsing names.
+    # Empty for the families whose loaders bind by name (DeepSeek's blk.N gguf names, qwen4_exp's HF names).
+    bind: tuple = ()
 
 
 def shard_order(shape: ModelShape) -> list[str]:
