@@ -230,7 +230,7 @@ void out_parser::feed(const char *p, size_t n, std::vector<out_event> *ev) {
             hold_.erase(0, at + len);
             body_->grow(block_, 0, true, index_, ev);
             close_call(ev);
-            if (tr->to == OUT_HEADER) header_at_ = marker_at;
+            if (tr->to == OUT_HEADER) header_at_ = marker_at + len;
             state_ = tr->to;
             continue;
         }
@@ -258,7 +258,7 @@ void out_parser::feed(const char *p, size_t n, std::vector<out_event> *ev) {
             block_.clear();
             body_->open();
         }
-        if (tr->to == OUT_HEADER) header_at_ = marker_at;
+        if (tr->to == OUT_HEADER) header_at_ = marker_at + len;
         hold_.erase(0, at + len);
         state_ = tr->to;
     }

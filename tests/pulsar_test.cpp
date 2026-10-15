@@ -5,6 +5,7 @@
 #include "../src/server/prompt_render.cpp"
 #include "../src/server/api_parse.cpp"
 #include "../src/server/chat_family.cpp"
+#include "../src/server/family_inkling.cpp"
 #include "../src/server/genmsg.cpp"
 #include "../src/server/deepseek_dsml.cpp"
 #include "../src/server/deepseek_stream.cpp"

@@ -85,6 +85,11 @@ struct inkling_msg_in {
     int n_calls;
     const char *name;           ///< a tool result's tool name (NULL = look it up by tool_call_id)
     const char *tool_call_id;   ///< a tool result's call id
+    /** An assistant message's calls as SAMPLED (the tool memory's bytes, inkling_find_call_block's key: from the
+     *  first call's author to the last call's <|end_message|>); NULL = none.  Written verbatim in place of the
+     *  canonical call blocks when they are one run of call blocks (each call is still read, and refused, as
+     *  vLLM reads it); otherwise the calls render canonically. */
+    const char *raw_calls;
 };
 
 struct inkling_render_in {
@@ -102,6 +107,35 @@ struct inkling_render_out {
 
 /** Render.  false + "<refusal key>: detail" on refusal. */
 bool inkling_chat_render(const inkling_render_in &in, inkling_render_out *out, char *err, size_t errlen);
+
+/* ---- the pieces a live conversation appends (the server's suffix hooks, the engine's chat front).  Each is
+ * the full render's own writer, so the prompt so far + a piece == the full render of the longer conversation,
+ * byte for byte (inkling-chat-gate S1). */
+
+/** msgs[from, n) as the full render writes them after its effort block (no tool declaration, no effort line:
+ * the conversation's start wrote both); the messages before `from` only name the calls a tool result answers.
+ * `close_turn`: first the <|content_model_end_sampling|> that ends the sampled turn the piece follows (the
+ * transcript stopped before it); `add_generation_prompt`: last, <|message_model|>.  A piece with none of the
+ * three is refused (no_messages). */
+bool inkling_chat_render_turn(const inkling_msg_in *msgs, int n, int from, bool close_turn, bool add_generation_prompt,
+                              inkling_render_out *out, char *err, size_t errlen);
+
+/** One assistant turn as SAMPLED after the generation prompt: the message's full render without its first
+ * <|message_model|> (the generation prompt wrote it), closed by <|content_model_end_sampling|> only when it
+ * made no call (a tool-call turn's close is its tail's: inkling_chat_render_turn's close_turn).  A turn with
+ * no reasoning, content or call has no such render (empty_turn). */
+bool inkling_chat_render_assistant_turn(const inkling_msg_in &m, inkling_render_out *out, char *err, size_t errlen);
+
+/** The tool memory's key in a transcript's text: the earliest complete run of call blocks at or after `p`,
+ * from a call's author (just past its <|message_model|>, or `p` itself when the author starts it) through the
+ * <|end_message|> of the last call that follows block after block; `*end` = one past it.  NULL = none (an
+ * unclosed block is none).  The output parser's raw span of a turn's calls has exactly these bounds. */
+const char *inkling_find_call_block(const char *p, const char **end);
+
+/** The system turn of a rendered prompt, for the model-visible tool error's reminder: the bodies of its leading
+ * system blocks -- the tool declaration, the system messages -- without the effort line, joined by a blank line;
+ * empty when it has none. */
+std::string inkling_rendered_system_text(const char *prompt);
 
 /** Inkling's output grammar for the kit: its eight content-block markers, the transition table, and the
  * tokenizer's other special tokens as dropped markers (vLLM drops a special token that is not a terminal;

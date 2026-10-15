@@ -161,9 +161,10 @@ LIB_HDRS = src/lib/pulsar_help.h src/lib/pulsar_kvtext.h src/lib/pulsar_segstore
 # $(CORE_OBJS) needs it.  ALL_OBJS globs src/lib/*.cpp but is only used to
 # derive .d files, and link rules use $^, so there is no duplicate object.
 # The frontend (L251 S5; the shared kit since L295 F5) rides here too -- the BPE engine, the output-parser
-# kit, Qwen's renderer and parser configuration: the Qwen family loads its tokenizer at open and the engine's
+# kit, the Qwen and Inkling renderers and parser configurations: each family loads its tokenizer at open and the engine's
 # tokenizer entries dispatch to it, so every target linking $(CORE_OBJS) references it.
-FRONTEND_OBJS = src/lib/bpe_tokenizer.o src/lib/pyjson.o src/lib/qwen_chat.o src/lib/qwen_output.o src/lib/out_parse_kit.o
+FRONTEND_OBJS = src/lib/bpe_tokenizer.o src/lib/pyjson.o src/lib/qwen_chat.o src/lib/qwen_output.o src/lib/out_parse_kit.o \
+                src/lib/inkling_chat.o
 CORE_OBJS = $(ENGINE_OBJS) $(CUDA_OBJS) $(CUTLASS_CUDA_OBJS) $(MMQ_OBJS) src/lib/pulsar_json.o $(FRONTEND_OBJS) $(TP_OBJS)
 
 # ---------------------------------------------------------------------------

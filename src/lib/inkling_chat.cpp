@@ -182,38 +182,22 @@ bool tool_call_json(const inkling_tool_call_in &c, std::string *out, char *err, 
     return true;
 }
 
-}  // namespace
-
-bool inkling_chat_render(const inkling_render_in &in, inkling_render_out *out, char *err, size_t errlen) {
-    out->text.clear();
-    out->spans.clear();
-    writer w{out};
-    std::string effort_text;
-    if (!inkling_effort_text(in.effort, &effort_text))
-        return refuse(err, errlen, "effort_out_of_range", "reasoning_effort must be in [0.0, 0.99]");
-    bool effort_pending = true;
+/* One message as render_inkling_messages writes it (its loop body after the effort block), with the
+ * tool_call_id -> name map the earlier calls filled.  `end_sampling`: an assistant message closes with
+ * <|content_model_end_sampling|> (false: a sampled tool-call turn, whose close is its tail's first bytes). */
+struct message_writer {
+    writer w;
     std::map<std::string, std::string> call_name_of_id;   /* tool_call_id -> name, filled as calls render */
 
-    if (in.tools_json) {
-        std::string declare;
-        if (!tool_declare_json(in.tools_json, &declare, err, errlen)) return false;
-        if (declare != "[]") {   /* `if all_tools:` -- an empty list declares nothing */
-            w.put(kMessageSystem);
-            w.out->text += "tool_declare";
-            w.put(kContentXml);
-            w.client(declare);
-            w.put(kEndMessage);
-        }
+    /* the ids only: a message before a turn, whose calls the turn's tool results may name */
+    void note_calls(const inkling_msg_in &m) {
+        if (!m.role || strcmp(m.role, "assistant")) return;
+        for (int k = 0; k < m.n_calls; k++)
+            if (m.calls[k].id && m.calls[k].id[0] && m.calls[k].name) call_name_of_id[m.calls[k].id] = m.calls[k].name;
     }
-    for (int i = 0; i < in.n_msgs; i++) {
-        const inkling_msg_in &m = in.msgs[i];
+
+    bool message(const inkling_msg_in &m, int i, bool end_sampling, char *err, size_t errlen) {
         const char *marker = role_marker(m.role);
-        if (!marker) return refuse(err, errlen, "unexpected_role", "message %d has role %s", i, m.role ? m.role : "(none)");
-        const bool system = !strcmp(m.role, "system") || !strcmp(m.role, "developer");
-        if (!system && effort_pending) {
-            w.block(kMessageSystem, "", kContentText, "Thinking effort level: " + effort_text, true);
-            effort_pending = false;
-        }
         if (!strcmp(m.role, "tool")) {
             std::string name = m.name && m.name[0] ? m.name : "";
             if (name.empty()) {
@@ -230,7 +214,7 @@ bool inkling_chat_render(const inkling_render_in &in, inkling_render_out *out, c
                 }
             }
             w.block(kMessageTool, name, kContentText, text);
-            continue;
+            return true;
         }
         const bool assistant = !strcmp(m.role, "assistant");
         if (assistant && m.reasoning && m.reasoning[0]) w.block(kMessageModel, "", kContentThinking, m.reasoning);
@@ -247,21 +231,171 @@ bool inkling_chat_render(const inkling_render_in &in, inkling_render_out *out, c
         } else if (m.content && m.content[0]) {
             w.block(marker, "", kContentText, m.content);
         }
-        if (assistant) {
-            for (int k = 0; k < m.n_calls; k++) {
-                const inkling_tool_call_in &c = m.calls[k];
-                std::string body;
-                if (!tool_call_json(c, &body, err, errlen)) return false;
-                if (c.id && c.id[0]) call_name_of_id[c.id] = c.name;
-                w.block(kMessageModel, c.name, kContentInvokeToolJson, body);
-            }
-            w.put(kContentModelEndSampling);
+        if (!assistant) return true;
+        /* every call is read as vLLM reads it (its refusals, in its order) whether or not its sampled bytes
+         * replay */
+        std::vector<std::string> bodies((size_t)(m.n_calls > 0 ? m.n_calls : 0));
+        for (int k = 0; k < m.n_calls; k++) {
+            const inkling_tool_call_in &c = m.calls[k];
+            if (!tool_call_json(c, &bodies[(size_t)k], err, errlen)) return false;
+            if (c.id && c.id[0]) call_name_of_id[c.id] = c.name;
         }
+        const size_t raw_len = m.raw_calls ? strlen(m.raw_calls) : 0;
+        if (raw_len && m.n_calls <= 0)
+            return refuse(err, errlen, "raw_calls_without_calls", "message %d carries sampled call bytes but no call", i);
+        const char *end = NULL;
+        if (raw_len && inkling_find_call_block(m.raw_calls, &end) == m.raw_calls && end == m.raw_calls + raw_len) {
+            /* the calls as sampled (the model's own bytes, never client data), after the role marker the
+             * generation prompt -- or, in a replay, the renderer -- wrote before the first one */
+            w.put(kMessageModel);
+            w.out->text.append(m.raw_calls, raw_len);
+        } else {
+            /* canonical -- also for sampled bytes that are not ONE run of call blocks (text sampled between two
+             * calls): replayed, that text would follow the content a second time.  The turn re-renders, a
+             * prefix miss, never a wrong prompt (parser_kit_finish's rule for a dropped call). */
+            for (int k = 0; k < m.n_calls; k++) w.block(kMessageModel, m.calls[k].name, kContentInvokeToolJson, bodies[(size_t)k]);
+        }
+        if (end_sampling) w.put(kContentModelEndSampling);
+        return true;
+    }
+};
+
+bool check_role(const inkling_msg_in &m, int i, char *err, size_t errlen) {
+    if (role_marker(m.role)) return true;
+    return refuse(err, errlen, "unexpected_role", "message %d has role %s", i, m.role ? m.role : "(none)");
+}
+
+bool fits(const inkling_render_out *out, char *err, size_t errlen) {
+    if (out->text.size() > UINT32_MAX) return refuse(err, errlen, "prompt_too_large", "the render passes 4 GiB");
+    return true;
+}
+
+/* where one call block that starts at `q` (just past its role marker) ends: the author (no marker inside), the
+ * call kind, the body up to the first <|end_message|> -- the parser's reading of it; NULL if `q` starts none */
+const char *call_block_end(const char *q) {
+    const char *kind = strstr(q, kContentInvokeToolJson);
+    if (!kind) return NULL;
+    for (const char *a = q; a < kind; a++)
+        if (a[0] == '<' && a[1] == '|') return NULL;
+    const char *close = strstr(kind + (sizeof kContentInvokeToolJson - 1), kEndMessage);
+    return close ? close + (sizeof kEndMessage - 1) : NULL;
+}
+
+}  // namespace
+
+const char *inkling_find_call_block(const char *p, const char **end) {
+    static const size_t lm = sizeof kMessageModel - 1, lk = sizeof kContentInvokeToolJson - 1;
+    for (const char *k = strstr(p, kContentInvokeToolJson); k; k = strstr(k + lk, kContentInvokeToolJson)) {
+        /* the header this kind marker closes starts past the last marker before it (or at p); a call's header
+         * follows <|message_model|> -- or starts p itself: a turn's sampled bytes begin there, right after the
+         * generation prompt's marker */
+        const char *start = k;
+        while (start > p && !(start - p >= 2 && start[-2] == '|' && start[-1] == '>')) start--;
+        if (start > p && !(start - p >= (ptrdiff_t)lm && !strncmp(start - lm, kMessageModel, lm))) continue;
+        const char *e = call_block_end(start);
+        if (!e) return NULL;   /* an unclosed block is not a key */
+        while (!strncmp(e, kMessageModel, lm)) {
+            const char *n = call_block_end(e + lm);
+            if (!n) break;
+            e = n;
+        }
+        *end = e;
+        return start;
+    }
+    return NULL;
+}
+
+bool inkling_chat_render(const inkling_render_in &in, inkling_render_out *out, char *err, size_t errlen) {
+    out->text.clear();
+    out->spans.clear();
+    message_writer mw{writer{out}, {}};
+    writer &w = mw.w;
+    std::string effort_text;
+    if (!inkling_effort_text(in.effort, &effort_text))
+        return refuse(err, errlen, "effort_out_of_range", "reasoning_effort must be in [0.0, 0.99]");
+    bool effort_pending = true;
+
+    if (in.tools_json) {
+        std::string declare;
+        if (!tool_declare_json(in.tools_json, &declare, err, errlen)) return false;
+        if (declare != "[]") {   /* `if all_tools:` -- an empty list declares nothing */
+            w.put(kMessageSystem);
+            w.out->text += "tool_declare";
+            w.put(kContentXml);
+            w.client(declare);
+            w.put(kEndMessage);
+        }
+    }
+    for (int i = 0; i < in.n_msgs; i++) {
+        const inkling_msg_in &m = in.msgs[i];
+        if (!check_role(m, i, err, errlen)) return false;
+        const bool system = !strcmp(m.role, "system") || !strcmp(m.role, "developer");
+        if (!system && effort_pending) {
+            w.block(kMessageSystem, "", kContentText, "Thinking effort level: " + effort_text, true);
+            effort_pending = false;
+        }
+        if (!mw.message(m, i, true, err, errlen)) return false;
     }
     if (effort_pending) w.block(kMessageSystem, "", kContentText, "Thinking effort level: " + effort_text, true);
     if (in.add_generation_prompt) w.put(kMessageModel);
-    if (out->text.size() > UINT32_MAX) return refuse(err, errlen, "prompt_too_large", "the render passes 4 GiB");
-    return true;
+    return fits(out, err, errlen);
+}
+
+bool inkling_chat_render_turn(const inkling_msg_in *msgs, int n, int from, bool close_turn, bool add_generation_prompt,
+                              inkling_render_out *out, char *err, size_t errlen) {
+    out->text.clear();
+    out->spans.clear();
+    if (from < 0 || from > n || (from == n && !close_turn && !add_generation_prompt))
+        return refuse(err, errlen, "no_messages", "the turn starts at message %d of %d", from, n);
+    message_writer mw{writer{out}, {}};
+    for (int i = 0; i < from; i++) mw.note_calls(msgs[i]);
+    if (close_turn) mw.w.put(kContentModelEndSampling);
+    for (int i = from; i < n; i++)
+        if (!check_role(msgs[i], i, err, errlen) || !mw.message(msgs[i], i, true, err, errlen)) return false;
+    if (add_generation_prompt) mw.w.put(kMessageModel);
+    return fits(out, err, errlen);
+}
+
+std::string inkling_rendered_system_text(const char *prompt) {
+    static const size_t ls = sizeof kMessageSystem - 1, le = sizeof kEndMessage - 1;
+    static const char effort[] = "Thinking effort level: ";
+    std::string out;
+    const char *p = prompt ? prompt : "";
+    while (!strncmp(p, kMessageSystem, ls)) {
+        const char *close = strstr(p, kEndMessage);
+        if (!close) break;
+        const char *body = NULL;
+        if (!strncmp(p + ls, kContentText, sizeof kContentText - 1)) body = p + ls + sizeof kContentText - 1;
+        else if (!strncmp(p + ls, "tool_declare", 12) && !strncmp(p + ls + 12, kContentXml, sizeof kContentXml - 1))
+            body = p + ls + 12 + sizeof kContentXml - 1;
+        if (body && body <= close) {
+            const std::string b(body, (size_t)(close - body));
+            const bool effort_line = !b.compare(0, sizeof effort - 1, effort);
+            if (!effort_line && !b.empty()) out += (out.empty() ? "" : "\n\n") + b;
+        }
+        p = close + le;
+    }
+    return out;
+}
+
+bool inkling_chat_render_assistant_turn(const inkling_msg_in &m, inkling_render_out *out, char *err, size_t errlen) {
+    out->text.clear();
+    out->spans.clear();
+    if (!m.role || strcmp(m.role, "assistant"))
+        return refuse(err, errlen, "unexpected_role", "a sampled turn is the assistant's");
+    message_writer mw{writer{out}, {}};
+    if (!mw.message(m, 0, m.n_calls <= 0, err, errlen)) return false;
+    /* the full render's first block opens with the role marker the generation prompt already wrote */
+    static const size_t lm = sizeof kMessageModel - 1;
+    if (out->text.compare(0, lm, kMessageModel) != 0)
+        return refuse(err, errlen, "empty_turn", "a turn with no reasoning, content or call renders no block, so "
+                      "the generation prompt's <|message_model|> has no replay");
+    out->text.erase(0, lm);
+    for (pulsar_text_span &s : out->spans) {
+        s.lo -= (uint32_t)lm;
+        s.hi -= (uint32_t)lm;
+    }
+    return fits(out, err, errlen);
 }
 
 /* ---- the output grammar --------------------------------------------------------------------------- */
