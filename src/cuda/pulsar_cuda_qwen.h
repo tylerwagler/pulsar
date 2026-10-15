@@ -1,7 +1,8 @@
 /* Qwen3.8-Flash-Next (HF `qwen4_exp`) block pieces -- L251 stream S4.
  *
- * The MoE block (softmax top-10 router, EXL3 routed experts, sigmoid-gated
- * shared expert), the Gated Residual (GR: the 4-stream low-rank read, the
+ * The MoE block (the family's router declaration for the shared router of
+ * pulsar_cuda_router.h -- softmax top-10, a sigmoid-gated shared expert -- and
+ * the rows MoE front door's routed experts and N shared experts), the Gated Residual (GR: the 4-stream low-rank read, the
  * per-stream scalar write, and the collapse-only top-level mixer) and the PLE
  * n-gram injection at layer index 1.  The reference for every one of them is
  * transformers' modeling_qwen4_exp.py (Qwen4ExpTextSparseMoeBlock,
@@ -44,6 +45,8 @@ typedef struct CUstream_st *cudaStream_t;
 #endif
 #include <stddef.h>
 #include <stdint.h>
+
+#include "pulsar_cuda_router.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -198,18 +201,24 @@ int pulsar_rows_linear_multi_launch(const pulsar_rows_linear *const *ls, int n, 
 /* ======================================================================== */
 /* MoE block (Qwen4ExpTextSparseMoeBlock)                                     */
 
-/** The router alone: logits = W_r x (bf16 x bf16, f32 accumulate in a fixed
- *  order), rounded to bf16; softmax over the experts; the top-k by probability
- *  (ties to the LOWER expert id); weights renormalised over the k and rounded
- *  to bf16.  Row PULSAR_QWEN_N_EXPERT of `logits` is the shared-expert gate
- *  logit (w_sg . x), and `sgate` = sigmoid of its bf16 rounding.
- *  x_bf16 [T][2560]; router_w bf16 [512][2560]; shared_gate_w bf16 [2560];
- *  logits [T][513] f32 (workspace, left readable); selected [T][10] int32 in
- *  descending probability; weights [T][10] f32 (bf16 values); sgate [T]. */
-int pulsar_qwen_router_launch(const uint16_t *x_bf16, const uint16_t *router_w, const uint16_t *shared_gate_w,
-                              int T, int hidden, int n_expert, int top_k,
-                              float *logits, int32_t *selected, float *weights, float *sgate,
-                              cudaStream_t stream);
+/** L295 F2: the family's router, declared for the shared router (pulsar_cuda_router.h): logits = W_r x (bf16 x
+ *  bf16, f32 in a fixed order) rounded to bf16; softmax over the experts; the top-k by probability (ties to the
+ *  LOWER expert id); weights renormalised over the k (no floor, no scale) and rounded to bf16.  One shared expert,
+ *  gated by its own logit row (W_r's row n_expert is shared_expert_gate): gamma = bf16(sigmoid(bf16 logit)). */
+static inline pulsar_router_cfg pulsar_qwen_router_cfg(int n_expert, int top_k) {
+    pulsar_router_cfg c;
+    c.n_expert = n_expert;
+    c.top_k = top_k;
+    c.n_shared = 1;
+    c.shared_gate = PULSAR_ROUTER_SHARED_SIGMOID;
+    c.score = PULSAR_ROUTER_SCORE_SOFTMAX;
+    c.renorm = PULSAR_ROUTER_RENORM_SUM;
+    c.logits_bf16 = true;
+    c.weights_bf16 = true;
+    c.sum_floor = 0.0f;
+    c.route_scale = 1.0f;
+    return c;
+}
 
 /** L272 P4c: the routed MoE over bf16 ROWS -- the core front door's arm (moe.cpp builds it from the expert
  *  stacks' formats; family-neutral).  EXL3 experts: a FUSED gate_up stack (output rows 0..mid-1 gate, mid..2mid-1
@@ -217,12 +226,13 @@ int pulsar_qwen_router_launch(const uint16_t *x_bf16, const uint16_t *router_w, 
  *  [ex_lo, ex_lo + n_local) -- all of them on one GPU; under expert parallelism a token's picks of another
  *  rank's experts are dropped here and summed there. */
 struct pulsar_tessera_proj;   /* src/cuda/mmq/pulsar_tessera.h (L255) */
-/** Task #44: a shared expert whose three Linears are EXL3 dense slices rides the routed launches (the EXL3 routed
- *  front door, mmq/exl3_moe.cuh) -- keyed on that format; any other format runs pulsar_qwen_moe_shared_launch.
- *  out += scale[t] * down(silu(gate x) * up x), added after the routed sum. */
+/** One shared expert: out += scale[t] * down(silu(gate x) * up x), added after the routed sum (a block's N shared
+ *  experts in order).  Task #44: one whose three Linears are EXL3 dense slices rides the routed launches (the EXL3
+ *  routed front door, mmq/exl3_moe.cuh) -- keyed on that format; any other format runs
+ *  pulsar_rows_moe_shared_launch. */
 typedef struct pulsar_rows_moe_shared {
-    pulsar_rows_linear gate, up, down;   /**< EXL3 (k2 != 0) all three */
-    const float *scale;                  /**< [T] the shared term's multiplier (a sigmoid gate), or NULL = 1 */
+    pulsar_rows_linear gate, up, down;   /**< EXL3 (k2 != 0) all three to ride */
+    const float *scale;                  /**< [T] the shared term's multiplier (its router gamma), or NULL = 1 */
     float *yg, *yu, *ys;                 /**< [T][mid], [T][mid], [T][out] f32 */
     uint16_t *h;                         /**< [T][mid] bf16: the SwiGLU rows the down reads (the imatrix tap's) */
     void *ws;                            /**< the dense arm's workspace, pulsar_rows_moe_shared_ws_bytes */
@@ -232,8 +242,14 @@ typedef struct pulsar_rows_moe_shared {
 size_t pulsar_rows_moe_shared_ws_bytes(int T, int in, int mid, int out);
 /** L288 exl3-dense: fork the riding shared expert of T bf16 rows onto its own stream (exl3_moe_shared_fork) --
  *  call it AHEAD of the router, then pulsar_rows_moe_routed_launch with the same descriptor joins it before its
- *  sum.  Each pending fork needs its own yg / yu / ys / h rows.  0 on success. */
+ *  sum.  Each pending fork needs its own yg / yu / ys / h rows; a block's shared experts fork in their order.
+ *  0 on success. */
 int pulsar_rows_moe_shared_fork(const pulsar_rows_moe_shared *q, const uint16_t *x_bf16, int T, cudaStream_t stream);
+/** A shared expert that does not ride (another format, or a Tessera routed arm), after the routed sum is in `out`:
+ *  out += scale * down(silu(gate x) * up x), the three linears through the front door's references
+ *  (pulsar_linear_rows_ref), over q's buffers. */
+int pulsar_rows_moe_shared_launch(const pulsar_rows_moe_shared *q, const uint16_t *x_bf16, int T, float *out,
+                                  cudaStream_t stream);
 typedef struct pulsar_rows_moe {
     const void *const *gate_up_table;   /**< exl3_expert_table pairs, the fused form, or NULL */
     const void *const *gate_table, *const *up_table;   /**< the pair form, or NULL */
@@ -246,7 +262,9 @@ typedef struct pulsar_rows_moe {
     int n_expert, top_k;                 /**< the model's experts (the router's picks index them) and picks per row */
     int in_dim, mid_dim, out_dim;        /**< the expert shape (the model's): in == out, the block's hidden */
     int ex_lo, n_local;                  /**< the experts the tables hold */
-    const pulsar_rows_moe_shared *shared; /**< an EXL3 shared expert riding the launches, or NULL */
+    const pulsar_rows_moe_shared *shared; /**< [n_shared] EXL3 shared experts riding the launches (each forked
+                                           *  first), added after the routed sum in order; NULL when none */
+    int n_shared;                        /**< 0..PULSAR_ROUTER_SHARED_MAX */
     /** a PROMPT chunk (not a verify): the routed prefill GEMM at every row count, so a prompt cut anywhere is
      *  byte-identical to one prefilled whole (session_contract_gate C1); false: decode rows, the decode GEMM. */
     bool prompt;
@@ -263,27 +281,31 @@ int pulsar_rows_moe_routed_launch(const pulsar_rows_moe *w, int32_t *sel, const 
                                   int T, float *out, void *ws, size_t ws_bytes, uint32_t *nf_flag, uint32_t nf_code,
                                   cudaStream_t stream);
 
-/** The Qwen MoE block's workspace, carved: the router's outputs, the routed part's region, the shared expert's. */
-typedef struct {
-    float *logits;      /**< [T][513] the router's logits (row 512: the shared gate's) */
-    int32_t *sel;       /**< [T][10] */
-    float *wts;         /**< [T][10] */
-    float *sgate;       /**< [T] sigmoid of the shared gate */
+/** L295 F2: a rows MoE block's shape (the model's): the router's logit rows (pulsar_router_logit_rows), the routed
+ *  experts, and N shared experts. */
+typedef struct pulsar_moe_block_shape {
+    int n_expert, top_k, n_logit_rows;
+    int hidden, expert_mid;
+    int n_shared, shared_mid;     /**< 0..PULSAR_ROUTER_SHARED_MAX shared experts, hidden -> shared_mid -> hidden */
+} pulsar_moe_block_shape;
+/** The block's workspace, carved: the router's outputs, the routed part's region, the shared experts'. */
+typedef struct pulsar_moe_block_parts {
+    float *logits;      /**< [T][n_logit_rows] the router's logits */
+    int32_t *sel;       /**< [T][top_k] */
+    float *wts;         /**< [T][top_k] */
+    float *gammas;      /**< [n_shared][T] the shared experts' gates (pulsar_router_select_launch's planes) */
     void *routed;       /**< pulsar_rows_moe_routed_launch's workspace */
     size_t routed_bytes;
-    float *yg, *yu, *ys;
-    uint16_t *h_x;      /**< the shared SwiGLU's bf16 rows */
-    void *lin;          /**< the shared expert's dense-arm workspace */
+    float *yg, *yu;     /**< [n_shared][T][shared_mid] */
+    float *ys;          /**< [n_shared][T][hidden] */
+    uint16_t *h;        /**< [n_shared][T][shared_mid] the shared SwiGLUs' bf16 rows */
+    void *lin;          /**< the shared experts' dense-arm workspace (one, shared) */
     size_t lin_bytes;
-} pulsar_qwen_moe_parts;
-/** Workspace bytes for T rows of the whole block (a function of the shape alone). */
-size_t pulsar_qwen_moe_workspace_bytes(int T);
-int pulsar_qwen_moe_carve(int T, void *ws, size_t ws_bytes, pulsar_qwen_moe_parts *parts);
-/** The block's shared expert, after the routed sum is in `out`: out += sgate * down(silu(gate x) * up x), the
- *  three linears through the front door's references (pulsar_linear_rows_ref). */
-int pulsar_qwen_moe_shared_launch(const pulsar_rows_linear *gate, const pulsar_rows_linear *up,
-                                  const pulsar_rows_linear *down, const uint16_t *x_bf16, int T, float *out,
-                                  const pulsar_qwen_moe_parts *p, cudaStream_t stream);
+} pulsar_moe_block_parts;
+/** Workspace bytes for T rows of the whole block (a function of the shape alone); 0 for no shape. */
+size_t pulsar_moe_block_workspace_bytes(const pulsar_moe_block_shape *s, int T);
+int pulsar_moe_block_carve(const pulsar_moe_block_shape *s, int T, void *ws, size_t ws_bytes,
+                           pulsar_moe_block_parts *parts);
 
 /* ======================================================================== */
 /* Gated Residual (Qwen4ExpTextGatedResidual) + the top-level mixer           */

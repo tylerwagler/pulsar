@@ -16,7 +16,7 @@
 //   down      the same two arms over the mid
 //   sum       the slot-ordered sum with the down's output rotation; a non-finite value records nf_code
 //
-// A shared expert whose three Linears are EXL3 dense slices RIDES these launches (keyed on that format, not on
+// A shared expert (of a block's N, in order) whose three Linears are EXL3 dense slices RIDES these launches (keyed on that format, not on
 // a family; exl3_moe_shared): the family forks it first (exl3_moe_shared_fork, ahead of its router) onto its own
 // stream -- gate and up as one dense multi launch, its SwiGLU rows, its down -- and the routed launch joins it
 // right before the sum, which adds its scaled output after the routed sum: the order the separate launches had,
@@ -73,19 +73,20 @@ size_t exl3_moe_shared_ws_bytes(int T, int in_dim, int mid, int out_dim);
 
 /** Fork the shared expert of T rows of x (bf16 rows, in_dim wide) off `stream` onto its lane: ys [T][out_dim] f32 =
  *  down(swiglu(gate x, up x)) (unscaled; yg / yu / h hold the intermediates).  The exl3_moe_routed_launch on the same
- *  stream that is given the same `sh` joins it (forks are joined oldest first, at most 4 pending; give each pending
+ *  stream that is given the same `sh` joins it (forks are joined oldest first, at most 8 pending; give each pending
  *  fork its own buffers -- the workspace may be shared).  `prompt`: the rows' kind, as the routed launch's.  Refuses
  *  (-1) on a contract violation; a refused fork leaves nothing running. */
 int exl3_moe_shared_fork(const exl3_moe_shared &sh, const exl3_moe_act &x, int T, int in_dim, int out_dim, bool prompt,
                          cudaStream_t stream);
 
 /** out [T][out_dim] f32 = sum over each row's top_k picks (sel [T][top_k], wts [T][top_k]) of
- *  w * down(swiglu(gate x, up x)), x the activation as its producer emitted it, plus a riding shared expert's
- *  scale * ys when `shared` is given -- forked first by exl3_moe_shared_fork (refused otherwise).  `prompt`: a prompt chunk
+ *  w * down(swiglu(gate x, up x)), x the activation as its producer emitted it, plus each riding shared expert's
+ *  scale * ys, shared[0] first, when `shared` [n_shared] is given -- each forked first by exl3_moe_shared_fork, in
+ *  that order (refused otherwise).  `prompt`: a prompt chunk
  *  (the prefill GEMM at every width, writing gate_z / up_z / down_z); otherwise decode rows (the decode GEMM
  *  at every width, whose split partials live in the scratch: b's z buffers are not written).  Scratch (the
  *  schedule, the operand planes, the decode partials) is the MMQ arena slot's.  Refuses (-1) on any contract violation; nothing is launched past a refusal. */
 int exl3_moe_routed_launch(const exl3_moe_stacks &w, const int32_t *sel, const float *wts, int T, int top_k,
                            float clamp, const exl3_moe_act &x, const exl3_moe_bufs &b, float *out,
                            uint32_t *nf_flag, uint32_t nf_code, bool prompt, cudaStream_t stream,
-                           const exl3_moe_shared *shared = nullptr);
+                           const exl3_moe_shared *shared = nullptr, int n_shared = 0);

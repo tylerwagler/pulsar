@@ -3220,8 +3220,9 @@ typedef struct {
     int32_t *selected;
     const float *weights;
     uint32_t top_k;                          ///< picks per row (selected / weights are [n_rows][top_k])
-    /** task #44: an EXL3 shared expert riding the routed launches (EXL3 routed arm only), or NULL */
+    /** task #44: [n_shared] EXL3 shared experts riding the routed launches (EXL3 routed arm only), or NULL */
     const struct pulsar_rows_moe_shared *shared;
+    int n_shared;
     const uint16_t *x_bf16;
     int n_rows;
     float *out;

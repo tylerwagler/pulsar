@@ -108,8 +108,7 @@ exl3_moe_sum_kernel(float *__restrict__ out,
                     const void *__restrict__ down_table,
                     int mid_dim, int out_dim, int n_expert, int n_tokens,
                     uint32_t *__restrict__ nf_flag, uint32_t nf_code,
-                    const float *__restrict__ shared_y, const float *__restrict__ shared_scale,
-                    int z_splits, int64_t z_split_stride) {
+                    const exl3_moe_shared_add shared, int z_splits, int64_t z_split_stride) {
     const int64_t task = ((int64_t)blockIdx.x * (blockDim.x >> 5)) + (threadIdx.x >> 5);
     const int n_blk = out_dim >> 7;
     if (task >= (int64_t)n_tokens * n_blk) return;
@@ -152,11 +151,13 @@ exl3_moe_sum_kernel(float *__restrict__ out,
 #pragma unroll
     for (int j = 0; j < 4; ++j) bad |= !isfinite(acc[j]);
     if (bad) atomicCAS(nf_flag, 0u, nf_code);
-    if (shared_y) {
-        /* a riding shared expert's output, added after the routed sum: out + scale * y (scale 1 when absent) */
-        const float4 y4 = *reinterpret_cast<const float4 *>(shared_y + (size_t)tok * out_dim + col0);
+#pragma unroll
+    for (int e = 0; e < PULSAR_ROUTER_SHARED_MAX; ++e) {
+        if (e >= shared.n) break;
+        /* the riding shared experts' outputs, in order, after the routed sum: out + scale * y (scale 1 when absent) */
+        const float4 y4 = *reinterpret_cast<const float4 *>(shared.y[e] + (size_t)tok * out_dim + col0);
         const float y[4] = {y4.x, y4.y, y4.z, y4.w};
-        const float sc = shared_scale ? shared_scale[tok] : 1.0f;
+        const float sc = shared.scale[e] ? shared.scale[e][tok] : 1.0f;
 #pragma unroll
         for (int j = 0; j < 4; ++j) {
             const float s = sc * y[j];
@@ -221,17 +222,26 @@ int ds4_exl3_moe_fold_fused_launch(const float *gate_up_z, const int32_t *select
 int ds4_exl3_moe_sum_launch(float *out, const float *down_z, const int32_t *selected,
                             const void *down_table, int mid_dim, int out_dim, int n_expert,
                             int n_tokens, uint32_t *nf_flag, uint32_t nf_code, cudaStream_t stream,
-                            const float *shared_y, const float *shared_scale, int z_splits, int64_t z_split_stride) {
+                            const exl3_moe_shared_add *shared, int z_splits, int64_t z_split_stride) {
     if (!out || !down_z || !selected || !down_table || !nf_flag || mid_dim <= 0 || out_dim <= 0 ||
-        out_dim % EXL3_HAD_BLOCK || n_expert <= 0 || n_tokens <= 0 || z_splits < 1) {
-        fprintf(stderr, "ds4_exl3_moe_sum_launch: null pointer or bad shape (out_dim %% 128)\n");
+        out_dim % EXL3_HAD_BLOCK || n_expert <= 0 || n_tokens <= 0 || z_splits < 1 ||
+        (shared && (shared->n < 0 || shared->n > PULSAR_ROUTER_SHARED_MAX))) {
+        fprintf(stderr, "ds4_exl3_moe_sum_launch: null pointer or bad shape (out_dim %% 128, 0..%d shared)\n",
+                PULSAR_ROUTER_SHARED_MAX);
         return -1;
     }
+    exl3_moe_shared_add sh{};
+    if (shared) sh = *shared;
+    for (int e = 0; e < sh.n; ++e)
+        if (!sh.y[e]) {
+            fprintf(stderr, "ds4_exl3_moe_sum_launch: shared expert %d has no output -- refusing\n", e);
+            return -1;
+        }
     const int64_t tasks = (int64_t)n_tokens * (out_dim >> 7);
     const unsigned blocks = (unsigned)((tasks + 7) / 8);
     exl3_moe_sum_kernel<<<blocks, 256, 0, stream>>>(
-        out, down_z, selected, down_table, mid_dim, out_dim, n_expert, n_tokens, nf_flag, nf_code, shared_y, shared_scale,
-        z_splits, z_split_stride);
+        out, down_z, selected, down_table, mid_dim, out_dim, n_expert, n_tokens, nf_flag, nf_code, sh, z_splits,
+        z_split_stride);
     const cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
         fprintf(stderr, "ds4_exl3_moe_sum_launch: launch failed: %s\n", cudaGetErrorString(err));

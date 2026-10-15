@@ -149,12 +149,27 @@ gr_scratch gr_layout(uint32_t rows) {
     g.total = g.inj[1] + a256((uint64_t)rows * kGrInjStride);
     return g;
 }
+/* L295 F2: the MoE block as the shared router and the rows MoE front door see it -- the router this family declares
+ * (pulsar_qwen_router_cfg), the routed experts, one shared expert gated by its own logit row */
+pulsar_moe_block_shape moe_block_shape(const pulsar_qwen_shape *s) {
+    const pulsar_router_cfg rc = pulsar_qwen_router_cfg((int)s->n_expert, (int)s->n_expert_used);
+    pulsar_moe_block_shape b{};
+    b.n_expert = rc.n_expert;
+    b.top_k = rc.top_k;
+    b.n_logit_rows = pulsar_router_logit_rows(&rc);
+    b.hidden = (int)s->n_embd;
+    b.expert_mid = (int)s->n_ff_exp;
+    b.n_shared = rc.n_shared;
+    b.shared_mid = (int)s->n_ff_shexp;
+    return b;
+}
 struct moe_scratch { uint64_t nf, ws, ws_bytes, total; };
-moe_scratch moe_layout(uint32_t rows) {
+moe_scratch moe_layout(const pulsar_qwen_shape *s, uint32_t rows) {
     moe_scratch m{};
     m.nf = 0;
     m.ws = 256;
-    m.ws_bytes = pulsar_qwen_moe_workspace_bytes((int)rows);
+    const pulsar_moe_block_shape b = moe_block_shape(s);
+    m.ws_bytes = pulsar_moe_block_workspace_bytes(&b, (int)rows);
     m.total = m.ws + m.ws_bytes;
     return m;
 }
@@ -557,7 +572,7 @@ uint64_t pulsar_qwen_s4_scratch_bytes(pulsar_qwen_op_id op, const pulsar_qwen_sh
     case PULSAR_QWEN_OP_EMBED:   return (uint64_t)max_rows * sizeof(int32_t);
     case PULSAR_QWEN_OP_PLE:     return ple_layout(max_rows).total;
     case PULSAR_QWEN_OP_GR_READ: return gr_layout(max_rows).total;
-    case PULSAR_QWEN_OP_MOE:     return moe_layout(max_rows).total;
+    case PULSAR_QWEN_OP_MOE:     return moe_layout(s, max_rows).total;
     case PULSAR_QWEN_OP_HEAD:    return head_layout(s).total;
     case PULSAR_QWEN_OP_GDN:     return gdn_layout(s, max_rows).total;
     case PULSAR_QWEN_OP_QSA:     return qsa_layout(s, max_rows, pulsar_qwen_qsa_cap(s, ctx)).total;
@@ -576,7 +591,7 @@ bool pulsar_qwen_s4_embed(const pulsar_qwen_step *st) {
     /* the MoE non-finite flag starts every step clear (read at pulsar_qwen_s4_step_end) */
     pulsar_gpu_tensor *moe_sc = st->st->scratch[PULSAR_QWEN_OP_MOE];
     static const uint32_t zero = 0;   /* L289: an enqueued write reads it later */
-    if (!moe_sc || !pulsar_gpu_tensor_write_async(moe_sc, moe_layout(st->st->max_rows).nf, &zero, sizeof(zero)))
+    if (!moe_sc || !pulsar_gpu_tensor_write_async(moe_sc, moe_layout(st->shape, st->st->max_rows).nf, &zero, sizeof(zero)))
         return fail("could not clear the MoE non-finite flag");
     pulsar_gpu_tensor *tok = st->st->scratch[PULSAR_QWEN_OP_EMBED];
     const pulsar_tensor *te = st->w->token_embd;
@@ -636,7 +651,7 @@ bool pulsar_qwen_s4_step_end(const pulsar_qwen_step *st, bool ok) {
     if (!ok) return false;
     pulsar_gpu_tensor *sc = st->st->scratch[PULSAR_QWEN_OP_MOE];
     uint32_t nf = 0;
-    if (!sc || !pulsar_gpu_tensor_read(sc, moe_layout(st->st->max_rows).nf, &nf, sizeof(nf)))
+    if (!sc || !pulsar_gpu_tensor_read(sc, moe_layout(st->shape, st->st->max_rows).nf, &nf, sizeof(nf)))
         return fail("could not read the MoE non-finite flag");
     if (nf) {
         fprintf(stderr, "pulsar: %s: the MoE output of layer %u went non-finite (code 0x%08x) -- refusing the step\n",
@@ -775,12 +790,13 @@ bool pulsar_qwen_s4_moe(const pulsar_qwen_step *st, uint32_t il) {
      * directly -- the router, the routed arm (by ids_src1) and the shared expert as a plain row. */
     const uint16_t *x = (const uint16_t *)dptr(st->st->x);
     float *y = (float *)dptr(st->st->y);
-    const moe_scratch m = moe_layout(st->st->max_rows);
+    const moe_scratch m = moe_layout(st->shape, st->st->max_rows);
     pulsar_gpu_tensor *sc = st->st->scratch[PULSAR_QWEN_OP_MOE];
     if (!sc) return fail("no MoE scratch");
     uint8_t *base = (uint8_t *)dptr(sc);
-    pulsar_qwen_moe_parts parts;
-    if (pulsar_qwen_moe_carve((int)n, base + m.ws, m.ws_bytes, &parts) != 0) return false;
+    const pulsar_moe_block_shape bs = moe_block_shape(s);
+    pulsar_moe_block_parts parts;
+    if (pulsar_moe_block_carve(&bs, (int)n, base + m.ws, m.ws_bytes, &parts) != 0) return false;
     /* the shared expert, sigmoid-gated, added after the routed sum -- under expert parallelism rank 0's alone.
      * Keyed on its FORMAT (task #44): three EXL3 dense slices ride the EXL3 routed launches (mmq/exl3_moe.cuh);
      * any other format, or a Tessera routed arm, runs its own launches after the routed sum.  L288 exl3-dense: a
@@ -801,21 +817,26 @@ bool pulsar_qwen_s4_moe(const pulsar_qwen_step *st, uint32_t il) {
             sh = pulsar_rows_moe_shared{};
             sh.gate = sg0; sh.up = su0; sh.down = sd0;
             sh.gate.prompt = sh.up.prompt = sh.down.prompt = prompt;
-            sh.scale = parts.sgate + r0;   /* the router writes it, on this stream, before the sum reads it */
+            sh.scale = parts.gammas + r0;   /* the router writes it, on this stream, before the sum reads it */
             sh.yg = parts.yg + (size_t)r0 * SMID;
             sh.yu = parts.yu + (size_t)r0 * SMID;
             sh.ys = parts.ys + (size_t)r0 * H;
-            sh.h = parts.h_x + (size_t)r0 * SMID;
+            sh.h = parts.h + (size_t)r0 * SMID;
             sh.ws = parts.lin; sh.ws_bytes = parts.lin_bytes;
             return pulsar_rows_moe_shared_fork(&sh, x + (size_t)r0 * H, (int)rows, 0) == 0;
         }))
         return fail("the shared expert's fork was refused");
-    /* the router: softmax top-k over the experts and the shared expert's sigmoid gate (the architecture's) */
+    /* the router (L295 F2: the shared router, this family's cfg): softmax top-k over the experts and the shared
+     * expert's sigmoid gate, whose weight row (shared_expert_gate) follows the router's */
     const uint16_t *router_w = (const uint16_t *)wptr(st, L.moe_router, "qwen router");
     const uint16_t *shared_gate_w = (const uint16_t *)wptr(st, L.sh_gate_scalar, "qwen shared_expert_gate");
+    const pulsar_router_cfg rcfg = pulsar_qwen_router_cfg((int)s->n_expert, (int)s->n_expert_used);
+    const pulsar_router_layer rlayer{};   /* no selection bias, no table, no global scale */
     if (!router_w || !shared_gate_w ||
-        pulsar_qwen_router_launch(x, router_w, shared_gate_w, (int)n, H, (int)s->n_expert, (int)s->n_expert_used,
-                                  parts.logits, parts.sel, parts.wts, parts.sgate, 0) != 0)
+        pulsar_router_logits_launch(x, (int)n, H, router_w, rcfg.n_expert, shared_gate_w, rcfg.n_shared, parts.logits,
+                                    0) != 0 ||
+        pulsar_router_select_launch(&rcfg, &rlayer, parts.logits, nullptr, (int)n, parts.sel, parts.wts, parts.gammas,
+                                    nullptr, 0) != 0)
         return false;
     /* the routed experts through the core's front door (moe.cpp): the trunk's gate_up is ONE fused stack, the MTP
      * layer's gate and up are two; under TP the rank reads its plan's range of whole experts.  L284 #2: the router
@@ -853,6 +874,7 @@ bool pulsar_qwen_s4_moe(const pulsar_qwen_step *st, uint32_t il) {
     int seg = 0;
     if (!arm_segments(st, 0, n, [&](bool prompt, uint32_t r0, uint32_t rows) {
             rc.shared = ride ? &shs[seg++] : NULL;   /* the fork above, joined before this segment's sum */
+            rc.n_shared = ride ? 1 : 0;
             rc.selected = parts.sel + (size_t)r0 * K;
             rc.weights = parts.wts + (size_t)r0 * K;
             rc.x_bf16 = x + (size_t)r0 * H;
@@ -866,29 +888,34 @@ bool pulsar_qwen_s4_moe(const pulsar_qwen_step *st, uint32_t il) {
                                                                                       (int)s->n_ff_exp, H),
                                                rc.selected, rows, K, s->n_expert, (uint32_t)rc.down->dim[0]);
             if (ride && st->tap) {
-                /* the shared expert's down read the SwiGLU rows its fork left in its rows of parts.h_x (bf16) */
+                /* the shared expert's down read the SwiGLU rows its fork left in its rows of parts.h (bf16) */
                 pulsar_imatrix_note_dense(st->tap, L.sh_gate, rc.x_bf16, rows, (uint32_t)H);
                 pulsar_imatrix_note_dense(st->tap, L.sh_up, rc.x_bf16, rows, (uint32_t)H);
-                pulsar_imatrix_note_dense(st->tap, L.sh_down, parts.h_x + (size_t)r0 * SMID, rows, (uint32_t)SMID);
+                pulsar_imatrix_note_dense(st->tap, L.sh_down, parts.h + (size_t)r0 * SMID, rows, (uint32_t)SMID);
             }
             return true;
         }))
         return false;
     if (!shared_here || ride) return true;
     return arm_segments(st, 0, n, [&](bool prompt, uint32_t r0, uint32_t rows) {
-        pulsar_rows_linear sg, su, sd;
-        pulsar_qwen_moe_parts p = parts;   /* the gate row-indexed, the shared expert's buffers reused from 0 */
-        p.sgate = parts.sgate + r0;
-        if (!(linear_dev(st, L.sh_gate, H, SMID, prompt, "qwen shared gate_proj", &sg) &&
-              linear_dev(st, L.sh_up, H, SMID, prompt, "qwen shared up_proj", &su) &&
-              linear_dev(st, L.sh_down, SMID, H, prompt, "qwen shared down_proj", &sd) &&
-              pulsar_qwen_moe_shared_launch(&sg, &su, &sd, x + (size_t)r0 * H, (int)rows, y + (size_t)r0 * H, &p, 0) == 0))
+        pulsar_rows_moe_shared q{};   /* the gate row-indexed, the shared expert's buffers reused from 0 */
+        q.scale = parts.gammas + r0;
+        q.yg = parts.yg;
+        q.yu = parts.yu;
+        q.ys = parts.ys;
+        q.h = parts.h;
+        q.ws = parts.lin;
+        q.ws_bytes = parts.lin_bytes;
+        if (!(linear_dev(st, L.sh_gate, H, SMID, prompt, "qwen shared gate_proj", &q.gate) &&
+              linear_dev(st, L.sh_up, H, SMID, prompt, "qwen shared up_proj", &q.up) &&
+              linear_dev(st, L.sh_down, SMID, H, prompt, "qwen shared down_proj", &q.down) &&
+              pulsar_rows_moe_shared_launch(&q, x + (size_t)r0 * H, (int)rows, y + (size_t)r0 * H, 0) == 0))
             return false;
         if (st->tap) {
-            /* the shared expert's down reads the SwiGLU rows the launch left in p.h_x (bf16) */
+            /* the shared expert's down reads the SwiGLU rows the launch left in q.h (bf16) */
             pulsar_imatrix_note_dense(st->tap, L.sh_gate, x + (size_t)r0 * H, rows, (uint32_t)H);
             pulsar_imatrix_note_dense(st->tap, L.sh_up, x + (size_t)r0 * H, rows, (uint32_t)H);
-            pulsar_imatrix_note_dense(st->tap, L.sh_down, p.h_x, rows, (uint32_t)SMID);
+            pulsar_imatrix_note_dense(st->tap, L.sh_down, q.h, rows, (uint32_t)SMID);
         }
         return true;
     });
@@ -1022,7 +1049,7 @@ bool pulsar_qwen_s4_mtp_combine(const pulsar_qwen_step *st, const void *h) {
         if (st->tokens[r] < 0 || (uint32_t)st->tokens[r] >= s->n_vocab) return fail("a token id outside the vocabulary");
     pulsar_gpu_tensor *moe_sc = st->st->scratch[PULSAR_QWEN_OP_MOE];
     static const uint32_t zero = 0;   /* L289: an enqueued write reads it later */
-    if (!moe_sc || !pulsar_gpu_tensor_write_async(moe_sc, moe_layout(st->st->max_rows).nf, &zero, sizeof(zero)))
+    if (!moe_sc || !pulsar_gpu_tensor_write_async(moe_sc, moe_layout(st->shape, st->st->max_rows).nf, &zero, sizeof(zero)))
         return fail("could not clear the MoE non-finite flag");
     if (!pulsar_gpu_tensor_write_async(st->st->mtp_tok, 0, st->tokens, (uint64_t)n * sizeof(int32_t)))
         return fail("could not stage the MTP rows' tokens");
