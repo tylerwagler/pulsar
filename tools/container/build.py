@@ -37,6 +37,7 @@ import producers as PR     # noqa: E402
 import recipe as R         # noqa: E402
 import qwen as Q           # noqa: E402
 import deepseek as D       # noqa: E402
+import inkling as I        # noqa: E402
 import entries as EN       # noqa: E402
 
 ALIGN = 32
@@ -51,7 +52,8 @@ def align_for(nbytes):
 
 
 # ---------------------------------------------------------------------------
-# the plan: ONE walk for every family; the family module supplies only what is its own (deepseek.py, qwen.py)
+# the plan: ONE walk for every family; the family module supplies only what is its own (deepseek.py, qwen.py,
+# inkling.py)
 # ---------------------------------------------------------------------------
 def shard_file(order, shard):
     return f'model-{order.index(shard) + 1:05d}-of-{len(order):05d}.safetensors'
@@ -63,6 +65,8 @@ def expert_dtype(layouts):
         return 'none'
     if layouts <= {'cutlass_mxfp4'}:
         return 'mxfp4_cutlass'
+    if layouts <= {'bf16'}:
+        return 'bf16'
     return 'exl3' if all(x.startswith('exl3m_') for x in layouts) else 'mixed'
 
 
@@ -174,7 +178,7 @@ def plan(hf, fam, ctx):
         entry, dims_ne = dense_entry(hf, fam, m, name, fmt[name], ctx)
         shards[m.shard]['entries'].append(entry)
         shards[m.shard]['tensors'][m.container_name] = {'layout': entry['layout'], 'dims_ne': dims_ne,
-                                                        'gguf_name': m.gguf_name}
+                                                        'gguf_name': m.gguf_name, **dict(m.bind)}
     for key, slots in sorted(groups.items()):
         add_families(shards[key[0]], fam.group_families(hf, key, slots, fmt, ctx))
 
@@ -188,8 +192,7 @@ def plan(hf, fam, ctx):
         gu = {}
         for e in p['experts']:
             if e['part'] in fam.GATE_UP_PARTS:
-                gu.setdefault(e['gguf_name'].rsplit('.', 1)[0] if fam.EXPERT_STACKS else e['gguf_name'].split('.')[1],
-                              set()).add(e['layout'])
+                gu.setdefault(fam.gate_up_key(e), set()).add(e['layout'])
         for lay, ls in gu.items():
             if len(ls) > 1:
                 raise SystemExit(f'{s}: layer {lay} gate/up layouts differ: {sorted(ls)}')
@@ -318,8 +321,9 @@ def write_index(out_dir):
 # commands
 # ---------------------------------------------------------------------------
 # The family modules, registered by the checkpoint's config.json model_type -- the one authority for which naming
-# table applies.  deepseek.py: V4 Flash / Vision-Exp and V4.1; qwen.py: qwen4_exp.
-FAMILIES = {'deepseek_v4': D, 'deepseek_v41': D, 'qwen4_exp': Q}
+# table applies.  deepseek.py: V4 Flash / Vision-Exp and V4.1; qwen.py: qwen4_exp; inkling.py: Inkling
+# (InklingForConditionalGeneration, model_type inkling_mm_model).
+FAMILIES = {'deepseek_v4': D, 'deepseek_v41': D, 'qwen4_exp': Q, I.MODEL_TYPE: I}
 
 
 def family_of(hf):
@@ -506,8 +510,11 @@ _HF = {}
 
 
 def hf_of(args):
+    """The HF source as its family reads it (fam.source: the checkpoint itself, or a view that names the tensors a
+    fused HF tensor holds -- inkling.Source)."""
     if args.hf not in _HF:
-        _HF[args.hf] = HFCheckpoint(args.hf)
+        hf = HFCheckpoint(args.hf)
+        _HF[args.hf] = family_of(hf).source(hf)
     return _HF[args.hf]
 
 

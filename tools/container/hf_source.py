@@ -68,7 +68,18 @@ class HFCheckpoint:
         return self._shard_header(self.weight_map[name])[name]['dtype']
 
     def span(self, name):
-        """(absolute path, absolute byte offset, byte count) -- a copy range."""
+        """(absolute path, absolute byte offset, byte count) -- a copy range.  `X#i` names slice i of a stacked
+        tensor X along its leading dim (the contiguous [i, ...] block): what a family's source view reads when one
+        HF tensor holds several of the tensors it writes (an [E, out, in] expert stack)."""
+        if '#' in name:
+            base, i = name.rsplit('#', 1)
+            i = int(i)
+            shape = self.shape(base)
+            path, off, n = self.span(base)
+            if not shape or not 0 <= i < shape[0] or n % shape[0]:
+                raise SystemExit(f'{name}: no slice {i} of {self.dtype(base)} {shape}')
+            per = n // shape[0]
+            return path, off + i * per, per
         shard = self.weight_map[name]
         h = self._shard_header(shard)
         start, end = h[name]['data_offsets']
@@ -86,6 +97,11 @@ class HFCheckpoint:
         if len(buf) != n:
             raise SystemExit(f'{name}: short read from {path}')
         return buf
+
+    def copy_src(self, name):
+        """(source descriptor, byte count) of the tensor's own bytes verbatim: one copy range."""
+        path, off, n = self.span(name)
+        return ('ranges', [(path, off, n)]), n
 
 
 # ---------------------------------------------------------------------------
