@@ -31,6 +31,9 @@ pulsar_moe_arm pulsar_moe_arm_for(const pulsar_tensor *gate, const pulsar_tensor
         return ok ? PULSAR_MOE_ARM_SLOT : PULSAR_MOE_ARM_NONE;
     }
     if (act == PULSAR_ACT_ROWS_BF16 && pulsar_format_serves(down->type, PULSAR_ROLE_EXPERT_DOWN, act)) {
+        /* L295 F7: BF16 experts are BF16 on all three stacks (the BF16 routed arm), never paired with EXL3 */
+        if ((gate->type == PULSAR_TENSOR_BF16) != (down->type == PULSAR_TENSOR_BF16)) return PULSAR_MOE_ARM_NONE;
+        if (up && gate->type == PULSAR_TENSOR_BF16) return PULSAR_MOE_ARM_ROWS_BF16;
         if (!up && pulsar_format_serves(gate->type, PULSAR_ROLE_EXPERT_GATE_UP_FUSED, act)) return PULSAR_MOE_ARM_ROWS_FUSED;
         if (up && pulsar_format_serves(gate->type, PULSAR_ROLE_EXPERT_GATE_UP, act)) return PULSAR_MOE_ARM_ROWS_PAIR;
     }
@@ -114,7 +117,7 @@ bool pulsar_moe_routed_rows(const pulsar_moe_rows_call *c) {
     }
     const pulsar_tensor *G = c->gate, *U = c->up, *D = c->down;
     const pulsar_moe_arm arm = pulsar_moe_arm_for(G, U, D, PULSAR_ACT_ROWS_BF16);
-    if (arm != PULSAR_MOE_ARM_ROWS_FUSED && arm != PULSAR_MOE_ARM_ROWS_PAIR) {
+    if (arm != PULSAR_MOE_ARM_ROWS_FUSED && arm != PULSAR_MOE_ARM_ROWS_PAIR && arm != PULSAR_MOE_ARM_ROWS_BF16) {
         say_no_arm(G, D, "raw bf16 rows");
         return false;
     }
@@ -140,24 +143,37 @@ bool pulsar_moe_routed_rows(const pulsar_moe_rows_call *c) {
     w.n_shared = c->n_shared;
     w.k2_gate_up = exl3_type_k2(G->type);
     w.k2_down = exl3_type_k2(D->type);
+    /* one stack's experts [lo, hi) on the device: their base pointer, and their stride / split point
+     * (routed_expert_side_layout: EXL3's [trellis | scales], BF16's [out][in] rows) */
+    auto stack = [&](const pulsar_tensor *t, const char *what, uint64_t *stride, uint64_t *split) -> const void * {
+        if (t->ndim != 3 || t->dim[2] != n_expert || !routed_expert_side_layout(t->type, t->dim[0], t->dim[1], stride, split) ||
+            t->bytes != *stride * n_expert) {
+            fprintf(stderr, "pulsar: routed MoE: %.*s is not %llu %s expert slices -- refusing\n", (int)t->name.len,
+                    t->name.ptr, (unsigned long long)n_expert, tensor_type_name(t->type));
+            return NULL;
+        }
+        const void *p = pulsar_gpu_weight_range_ptr(tensor_map_base(c->m, t), t->abs_offset + lo * *stride,
+                                                    (hi - lo) * *stride, what);
+        if (!p)
+            fprintf(stderr, "pulsar: routed MoE: no device copy of experts [%llu, %llu) of %.*s -- refusing\n",
+                    (unsigned long long)lo, (unsigned long long)hi, (int)t->name.len, t->name.ptr);
+        return p;
+    };
+    if (arm == PULSAR_MOE_ARM_ROWS_BF16) {
+        /* L295 F7: the BF16 stacks themselves (pulsar_cuda_bf16_rows.cuh reads [expert][out][in] by stride) */
+        uint64_t s = 0, r = 0;
+        w.bf16_gate = stack(G, "routed experts gate", &s, &r);
+        w.bf16_up = stack(U, "routed experts up", &s, &r);
+        w.bf16_down = stack(D, "routed experts down", &s, &r);
+        if (!w.bf16_gate || !w.bf16_up || !w.bf16_down) return false;
+        return pulsar_rows_moe_routed_launch(&w, c->selected, c->weights, c->x_bf16, c->n_rows, c->out, c->ws,
+                                             c->ws_bytes, c->nf_flag, c->nf_code, 0) == 0;
+    }
     /* one stack's table over the rank's experts: [trellis, scales] pointer pairs (exl3_expert_layout) */
     auto table = [&](const pulsar_tensor *t, const char *what) -> const void *const * {
         uint64_t stride = 0, split = 0;
-        if (t->ndim != 3 || t->dim[2] != n_expert || !routed_expert_side_layout(t->type, t->dim[0], t->dim[1], &stride, &split) ||
-            t->bytes != stride * n_expert) {
-            fprintf(stderr, "pulsar: routed MoE: %.*s is not %llu EXL3 expert slices -- refusing\n", (int)t->name.len,
-                    t->name.ptr, (unsigned long long)n_expert);
-            return NULL;
-        }
-        /* routed_expert_side_layout's (expert bytes, row bytes) are EXL3's (stride, trellis / scales split) */
-        const void *p = pulsar_gpu_weight_range_ptr(tensor_map_base(c->m, t), t->abs_offset + lo * stride,
-                                                    (hi - lo) * stride, what);
-        if (!p) {
-            fprintf(stderr, "pulsar: routed MoE: no device copy of experts [%llu, %llu) of %.*s -- refusing\n",
-                    (unsigned long long)lo, (unsigned long long)hi, (int)t->name.len, t->name.ptr);
-            return NULL;
-        }
-        return pulsar_exl3_expert_table(p, (uint32_t)(hi - lo), stride, split);
+        const void *p = stack(t, what, &stride, &split);
+        return p ? pulsar_exl3_expert_table(p, (uint32_t)(hi - lo), stride, split) : NULL;
     };
     if (arm == PULSAR_MOE_ARM_ROWS_PAIR) {
         w.gate_table = table(G, "routed experts gate");

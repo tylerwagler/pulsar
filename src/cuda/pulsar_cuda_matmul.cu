@@ -2973,7 +2973,7 @@ int pulsar_gpu_matmul_mxfp8_tensor(pulsar_gpu_tensor *out, const void *model_map
  * remainder chunk and the frontier row too; cublasLtMatmulAlgoCheck confirms it
  * supports each row count before use, and an unsupported one refuses.  The
  * per-(shape, ntok) entries below cache the layouts and that check. */
-static int bf16_lt_matmul(void *out, const uint16_t *w, const uint16_t *xb,
+static int bf16_lt_matmul(void *out, const uint16_t *w, const uint16_t *xb, cudaStream_t stream,
                           uint64_t in_dim, uint64_t out_dim, uint64_t n_tok) {
     if (!cublaslt_ensure()) {
         fprintf(stderr, "pulsar: bf16 GEMM on prefill rows: cuBLASLt handle not ready -- refusing\n");
@@ -3065,12 +3065,20 @@ static int bf16_lt_matmul(void *out, const uint16_t *w, const uint16_t *xb,
     if (!ws) return 0;
     const float al = 1.0f, be = 0.0f;
     cublasStatus_t st = cublasLtMatmul(g_cublaslt, sh->op, &al, w, sh->la, xb, e->lb, &be,
-                                       out, e->ld, out, e->ld, &sh->algo, ws, wz, cudaStreamPerThread);
+                                       out, e->ld, out, e->ld, &sh->algo, ws, wz, stream);
     if (st != CUBLAS_STATUS_SUCCESS) {
         fprintf(stderr, "pulsar: cuBLASLt bf16 matmul failed: status %d\n", (int)st);
         return 0;
     }
     return 1;
+}
+
+/* L295 F7: the BF16-weight dense arm over raw bf16 ROWS (pulsar_cuda_bf16_rows.cuh) takes this GEMM for prompt
+ * chunks and past the M-independent width: the bf16 row pointer is the producer's emission, read as given. */
+int pulsar_gpu_bf16_rows_gemm(float *y, const uint16_t *w, const uint16_t *x_bf16, uint64_t in_dim, uint64_t out_dim,
+                              uint64_t rows, cudaStream_t stream) {
+    if (!y || !w || !x_bf16 || in_dim == 0 || out_dim == 0 || rows == 0) return 0;
+    return bf16_lt_matmul(y, w, x_bf16, stream, in_dim, out_dim, rows);
 }
 
 /* L268: the image towers' GEMM (pulsar_cuda_vision.cu, both families): C (f32, row-major [m x n], ldc) =
@@ -3312,7 +3320,7 @@ static int matmul_bf16_wptr(pulsar_gpu_tensor *out, const uint16_t *w,
          * the one-row kernel at 1. */
         const int decode_kind = g_batch_decode_rows > 0;
         if (!decode_kind) {
-            return bf16_lt_matmul(out->ptr, w, (const uint16_t *)xb16, in_dim, out_dim, n_tok);
+            return bf16_lt_matmul(out->ptr, w, (const uint16_t *)xb16, cudaStreamPerThread, in_dim, out_dim, n_tok);
         }
         if (n_tok >= PULSAR_LT_DECODE_MIN_ROWS) {
             return bf16_lt_decode_matmul(out->ptr, w, (const uint16_t *)xb16, in_dim, out_dim, n_tok);

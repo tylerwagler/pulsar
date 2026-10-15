@@ -238,7 +238,9 @@ EXL3_HD static inline int exl3_type_k2(uint32_t type) {
  *   DOWN   a routed down on the fold's pre-rotated mid: 2, 2.5, 3 (DeepSeek /
  *          V4.1) and 4, 5, 6 (Qwen3.8-Flash-Next)
  *   PAIR   split gate / up stacks, each rotating its own input: 2, 2.5, 3 (DeepSeek; Qwen's MTP layer
- *          K3) and 4, 6 (turboderp's Qwen trunk, which ships gate and up apart with their own suh)
+ *          K3), 4, 6 (turboderp's Qwen trunk, which ships gate and up apart with their own suh) and 5
+ *          (Inkling's pair build, L295 F7: the tensor-core arms instantiate every routed rate, so a rate is
+ *          this table's line)
  *   GATE_UP_FUSED   one [in -> 2 mid] gate | up slice (our Qwen quant): 4, 5
  *   DENSE  the dense-Linear arm (mmq/ds4_exl3_dense.cuh): 2, 3, 4, 5, 6, 8
  *   MOE_PREFILL     the routed-expert tensor-core arms (prompt and decode), every family
@@ -251,7 +253,7 @@ enum { EXL3_ARM_DOWN = 0, EXL3_ARM_PAIR = 1, EXL3_ARM_GATE_UP_FUSED = 2, EXL3_AR
 EXL3_HD static constexpr inline bool exl3_arm_has_rate(int arm, int k2) {
     switch (arm) {
     case EXL3_ARM_DOWN:          return k2 == 4 || k2 == 5 || k2 == 6 || k2 == 8 || k2 == 10 || k2 == 12;
-    case EXL3_ARM_PAIR:          return k2 == 4 || k2 == 5 || k2 == 6 || k2 == 8 || k2 == 12;
+    case EXL3_ARM_PAIR:          return k2 == 4 || k2 == 5 || k2 == 6 || k2 == 8 || k2 == 10 || k2 == 12;
     case EXL3_ARM_GATE_UP_FUSED: return k2 == 8 || k2 == 10;
     case EXL3_ARM_DENSE:         return k2 == 4 || k2 == 6 || k2 == 8 || k2 == 10 || k2 == 12 || k2 == 16;
     case EXL3_ARM_MOE_PREFILL:   return k2 == 4 || k2 == 5 || k2 == 6 || k2 == 8 || k2 == 10 || k2 == 12;

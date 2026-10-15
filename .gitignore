@@ -43,6 +43,7 @@ __pycache__/
 /tests/tp_plan_test
 /tests/qwen_s4_gate
 /tests/router_gate
+/tests/bf16_rows_gate
 /tests/qwen_family_gate
 /tests/fixed_tile_gemm_probe
 /tests/nt_crossover_sweep

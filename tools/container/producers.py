@@ -492,6 +492,8 @@ def bytes_for(layout: str, dims_ne: list, dtype: str | None = None) -> int:
         if len(dims_ne) < 2:
             raise ValueError(f"bytes_for: {layout} tensor must be at least 2D")
         k, n = int(dims_ne[0]), int(dims_ne[1])
+        if len(dims_ne) == 2:   # a dense Linear: its logical out, stored padded (exl3_linear_layout; L295 F7)
+            n = exl3_rates.out_stored(n)
         if k % EXL3_HAD_BLOCK or n % EXL3_HAD_BLOCK:
             raise ValueError(f"bytes_for: {layout} refuses dims [{k}, {n}] (both must be multiples of {EXL3_HAD_BLOCK})")
         words = exl3_rates.words_for(layout)

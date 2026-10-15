@@ -944,6 +944,10 @@ int main(void) {
     section_mxfp8_linear();
     section_head();
     section_draft_top();
+    /* L295 F7: the pair arm at K5 (Inkling's pair build) -- run last, so the sections above keep their draws */
+    printf("D''. MoE block with split gate / up experts at K5 (the pair arm's K5, L295 F7), shared K5/5/4\n");
+    section_moe_at(5, true, 10);
+    section_moe_at(37, true, 10);
     printf(g_fail ? "QWEN-S4 GATE FAIL\n" : "QWEN-S4 GATE PASS\n");
     return g_fail;
 }

@@ -25,6 +25,8 @@
  *      call -- the arm's promise (its split count is a function of K alone; a row's m16 tile, k order and
  *      warp / split order do not depend on its batchmates);
  *   9. a gate + up pair in one launch == the two projections launched alone, bit for bit; the refusals.
+ *  10. (L295 F7) the pair at K5 at Inkling's routed shape (4096 -> 2048 -> 4096, 256 experts, top-6, bf16 rows):
+ *      prompt rows 1..4096 and decode rows 1..40 of both projections, and the pair launch, as above.
  * Error per assignment row: rel Frobenius ||z - ref|| / ||ref|| and max |z - ref| / max |ref|; reported as the
  * max and mean over the sampled rows.  The operand is ONE fp16 plane per (row, 128-block) prescale: an
  * input the arm rotates rounds once to 11 significant bits (row error ~2^-12 / sqrt 3), an E4M3 value
@@ -487,11 +489,12 @@ static void section_refusals(void) {
 
 /* 9. the decode arm's pair launch (two slices, one PREP + one GEMM launch) gives each projection exactly the bits
  * of that projection launched alone; and its refusals. */
-static void section_decode_pair(void) {
-    printf("9. decode pair launch == two single launches; decode refusals\n");
+static void section_decode_pair(const char *what = "V4", int k2 = 6, int fmt = EXL3_MOE_ACT_E4M3_SLOT,
+                                bool refusals = true) {
+    if (refusals) printf("9. decode pair launch == two single launches; decode refusals\n");
     const int K = 4096, N = 2048, E = 8, topk = 6, n_tok = 7;
-    pool g = make_pool(K, N, 6, 2, E), u = make_pool(K, N, 6, 2, E);
-    act_rows a = make_act(EXL3_MOE_ACT_E4M3_SLOT, n_tok, K);
+    pool g = make_pool(K, N, k2, 2, E), u = make_pool(K, N, k2, 2, E);
+    act_rows a = make_act(fmt, n_tok, K);
     dev_act da = upload_act(a);
     const std::vector<int32_t> sel = make_selection(n_tok, topk, E);
     sched s = make_sched(sel, topk, E, 0, n_tok * topk, false);
@@ -511,20 +514,27 @@ static void section_decode_pair(void) {
         return v;
     };
     exl3_moe_partials zp{}, z1{};
-    int rc = exl3_moe_decode_launch(g.d_table, u.d_table, 6, true, da.desc, d_dst, d_src, d_b, N, K, n, E, ws, w2, &zp, 0);
-    CHECK(rc == 0 && zp.z[1] && zp.splits >= 1, "pair launch rc=%d", rc);
+    int rc = exl3_moe_decode_launch(g.d_table, u.d_table, k2, true, da.desc, d_dst, d_src, d_b, N, K, n, E, ws, w2, &zp, 0);
+    CHECK(rc == 0 && zp.z[1] && zp.splits >= 1, "%s pair launch rc=%d", what, rc);
     const std::vector<float> pg = read(zp, 0), pu = read(zp, 1);
-    rc = exl3_moe_decode_launch(g.d_table, nullptr, 6, true, da.desc, d_dst, d_src, d_b, N, K, n, E, ws, w1, &z1, 0);
+    rc = exl3_moe_decode_launch(g.d_table, nullptr, k2, true, da.desc, d_dst, d_src, d_b, N, K, n, E, ws, w1, &z1, 0);
     const std::vector<float> sg = read(z1, 0);
-    rc |= exl3_moe_decode_launch(u.d_table, nullptr, 6, true, da.desc, d_dst, d_src, d_b, N, K, n, E, ws, w1, &z1, 0);
+    rc |= exl3_moe_decode_launch(u.d_table, nullptr, k2, true, da.desc, d_dst, d_src, d_b, N, K, n, E, ws, w1, &z1, 0);
     const std::vector<float> su = read(z1, 0);
-    CHECK(rc == 0 && pg.size() == sg.size() && pu.size() == su.size(), "single launches rc=%d", rc);
+    CHECK(rc == 0 && pg.size() == sg.size() && pu.size() == su.size(), "%s single launches rc=%d", what, rc);
     size_t diff = 0;
     for (size_t i = 0; i < pg.size() && i < sg.size(); i++) diff += memcmp(&pg[i], &sg[i], 4) != 0;
     for (size_t i = 0; i < pu.size() && i < su.size(); i++) diff += memcmp(&pu[i], &su[i], 4) != 0;
-    CHECK(diff == 0, "pair launch differs from the single launches in %zu partials", diff);
-    printf("  V4 gate + up pair, %lld assignments, %d splits: %s (%zu partials)\n", (long long)n, zp.splits,
+    CHECK(diff == 0, "%s pair launch differs from the single launches in %zu partials", what, diff);
+    printf("  %s gate + up pair K=%g (%s rows), %lld assignments, %d splits: %s (%zu partials)\n", what, k2 / 2.0,
+           fmt == EXL3_MOE_ACT_E4M3_SLOT ? "e4m3" : "bf16", (long long)n, zp.splits,
            diff ? "DIFFER" : "bit-identical to two single launches", pg.size() + pu.size());
+    if (!refusals) {
+        CUDA_OK(cudaDeviceSynchronize());
+        cudaFree(d_dst); cudaFree(d_src); cudaFree(d_b); cudaFree(ws);
+        da.release(); g.release(); u.release();
+        return;
+    }
     const int r_rate = exl3_moe_decode_launch(g.d_table, nullptr, 7, true, da.desc, d_dst, d_src, d_b, N, K, n, E, ws, w1, &z1, 0);
     const int r_ws = exl3_moe_decode_launch(g.d_table, u.d_table, 6, true, da.desc, d_dst, d_src, d_b, N, K, n, E, ws, w1, &z1, 0);
     exl3_moe_act nosf = da.desc;
@@ -589,6 +599,25 @@ int main(void) {
             for (int gate = 1; gate >= 0; gate--)
                 section_case(*sh, gate, gate ? sh->k2_gate : sh->k2_down, t, sh->fmt, 160, t > 1, 4, t == 5 || t == 40);
     section_decode_pair();
+    /* 10. L295 F7: the pair arm at K5 -- Inkling's pair build (routed 4096 -> 2048 -> 4096, 256 experts, top-6, bf16
+     * rows; gate and up split, each rotating its own input).  The tensor-core arms instantiate K5 for every routed
+     * kind already (EXL3_ARM_MOE_PREFILL), so the pair's K5 is the rate table's line, and this proves the arms
+     * serve it at Inkling's shapes: the gate (rotating) and the down, prompt rows 1..4096 (chunk invariance to
+     * 1024) and decode rows 1..40 (batch invariance), graded against the f32-weight reference; the pair in one
+     * decode launch == its two single launches, bit for bit.  Last, so the sections above keep their draws. */
+    printf("10. Inkling's pair at K5 (L295 F7): prompt rows 1..4096 and decode rows 1..40, both projections, bf16 "
+           "rows; the pair launch\n");
+    const shape ink = {"Inkling-K5", 4096, 2048, 256, 6, false, 10, 10, EXL3_MOE_ACT_BF16_ROWS};
+    g_decode = false;
+    for (int t : {1, 5, 16, 64, 512, 4096})
+        for (int gate = 1; gate >= 0; gate--)
+            section_case(ink, gate, 10, t, ink.fmt, t >= 4096 ? 192 : 256, t > 1 && t <= 1024, 4, t >= 512);
+    g_decode = true;
+    for (int t : dtoks)
+        for (int gate = 1; gate >= 0; gate--)
+            section_case(ink, gate, 10, t, ink.fmt, 160, t > 1, 4, t == 5 || t == 40);
+    section_decode_pair("Inkling", 10, EXL3_MOE_ACT_BF16_ROWS, false);
+    CHECK(exl3_arm_has_rate(EXL3_ARM_PAIR, 10), "the pair arm's rate table has no K5");
     printf(g_fail ? "EXL3-MOE-PREFILL GATE FAIL\n" : "EXL3-MOE-PREFILL GATE PASS\n");
     return g_fail;
 }

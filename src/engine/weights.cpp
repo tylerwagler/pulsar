@@ -250,6 +250,15 @@ bool routed_expert_side_layout(uint32_t type, uint64_t k, uint64_t n,
         *expert_bytes = n * *row_bytes;
         return true;
     }
+    if (type == PULSAR_TENSOR_BF16) {
+        /* L295 F7: an expert is its [out = n][in = k] bf16 rows (the HF orientation, ne [k, n]): a row is k * 2 bytes
+         * -- the BF16 routed arm (pulsar_cuda_bf16_rows.cuh) reads 16-byte runs, so k % 64 is its contract and this
+         * model's */
+        if (k == 0 || n == 0 || k % 64 || n > UINT64_MAX / (k * 2)) return false;
+        *row_bytes = k * 2;
+        *expert_bytes = n * *row_bytes;
+        return true;
+    }
     return false;
 }
 
