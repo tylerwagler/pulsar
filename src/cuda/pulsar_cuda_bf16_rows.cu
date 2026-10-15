@@ -187,7 +187,7 @@ bf16_moe_fold_kernel(const float *__restrict__ g, const float *__restrict__ u, c
     const int64_t p = i / mid;
     if (sel[p] < 0) return;
     if constexpr (ACT == PULSAR_FFN_ACT_RELU2) {
-        const float r = fmaxf(u[i], 0.0f);
+        const float x = u[i], r = x <= 0.0f ? 0.0f : x;   /* not fmaxf: a NaN up projection stays NaN (rule 9) */
         h[i] = __float2bfloat16(r * r * wts[p]);
     } else {
         h[i] = __float2bfloat16(pulsar_swiglu_elem(g[i], u[i], wts[p], clamp));
