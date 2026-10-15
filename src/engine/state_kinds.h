@@ -51,7 +51,7 @@
 #define PULSAR_STATE_SLOTS_MAX PULSAR_FAMILY_MAX_LAYER
 /** The rows one verify step carries, every bank's run together: the depth of every capture, and the core
  *  driver's head width (row_driver.h). */
-#define PULSAR_STATE_VERIFY_ROWS 16u
+#define PULSAR_STATE_VERIFY_ROWS PULSAR_DRIVER_HEADS_MAX
 
 /** What a piece of state IS (the header's four kinds). */
 typedef enum : uint8_t {

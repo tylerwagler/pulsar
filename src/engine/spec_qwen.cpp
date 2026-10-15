@@ -1,19 +1,12 @@
-/* spec_qwen.cpp -- Qwen4-exp's verify hooks and its MTP drafter behind the speculation round API
- * (L272 P1 S3).  What qwen_session_generate_speculative did in one private loop (L251 / L270 / L271)
- * is now the core's round (session_spec.cpp) with these hooks under it:
+/* spec_qwen.cpp -- Qwen4-exp's MTP drafter behind the speculation round API (L272 P1 S3).  What
+ * qwen_session_generate_speculative did in one private loop (L251 / L270 / L271) is the core's round
+ * (session_spec.cpp) with the core driver's verify target under it (step_driver.cpp PULSAR_DRIVER_SPEC_TARGET, L295
+ * F4: the verify is ONE PREFILL step of the bank's rows with every row headed and the declared state's capture armed;
+ * the commit sets the bank's state to its last kept row's, pulsar_state_commit) and this drafter beside it:
  *
- *   verify   the trunk runs [base, d_1 .. d_k] at p .. p + k as ONE PREFILL step of one bank with every
- *            row headed and the per-row state capture armed (qwen_forward verify = true; the server's
- *            lane reaches the same step through decode_mixed with heads on every row).  k + 1 <= 16 (a copy
- *            chain's, L288; an MTP chain's <= 8), so every kernel takes its decode-width arm and each row's
- *            logits are the bytes one-token decode would give.
- *   commit   the bank's declared state is set to the last kept row's (pulsar_state_commit over the
- *            capture, L295 F3: L288 the GDN recurrent state, which the verify left untouched, advanced by the
- *            kept rows' updates; the rest rolled back), the bank's position counter moves, the logits are the
- *            kept row's.
  *   absorb   the MTP layer catches up: its stage back to the snapshot the draft chain took, the kept
  *            rows' MTP rows (stack at p + i, the token after it) in one PREFILL step of decode rows (L288),
- *            the last kept row's stack parked in mtp_pend for the next draft.
+ *            the last kept row's stack parked in the MTP_PEND state for the next draft.
  *   draft    the lockstep row (pending stack at p - 1, the carry) headed gives d_1; each further step
  *            feeds the MTP's own streams with d_j; the chain is the shared stop rule (spec_ops.h) run token
  *            by token: it ends at the depth or at the first draft whose head was unsure (top probability
@@ -35,73 +28,6 @@
 
 static_assert(PULSAR_QWEN_SPEC_DRAFT_MAX + 1u <= PULSAR_QWEN_SPEC_ROWS, "a bank's verify run fits the verify width");
 
-/* ---- the target hooks ------------------------------------------------------------------------- */
-
-/* The single lane's verify: the trunk over the round's rows, every row headed into the host rows the
- * core reads; the row argmaxes for the walk. */
-static bool qwen_verify_single(pulsar_session *s, pulsar_spec_round *r, pulsar_spec_rows *out, char *err,
-                               size_t errlen) {
-    pulsar_qwen_state *q = s->qwen;
-    const uint32_t V = g_qwen_shape.n_vocab, R = r->n_batch;
-    if (R > PULSAR_QWEN_SPEC_DRAFT_MAX + 1u) {
-        snprintf(err, errlen, "%s: a verify step of %u rows is outside the capture", PULSAR_QWEN_ARCH, R);
-        return false;
-    }
-    /* the batched lane's verify (decode_mixed, every row headed) over this round's rows alone */
-    pulsar_multiseq_req reqs[PULSAR_QWEN_SPEC_DRAFT_MAX + 1];
-    pulsar_spec_round_fill_reqs(r, s->states->live_bank, reqs);
-    if (s->engine->family->session->decode_mixed(s, reqs, R, q->spec_logits, (int)(R * V), NULL,
-                                                 PULSAR_MSEQ_HEAD_ALL_ROWS, err, errlen) != 0)
-        return false;
-    for (uint32_t i = 0; i < r->K && i < 16u; i++) r->row_tops[i] = (int)qwen_argmax(q->spec_logits + (size_t)i * V, V);
-    out->read = pulsar_spec_row_read_block;
-    out->ud = out;
-    out->compact = NULL;
-    out->block.rows = q->spec_logits;
-    out->block.row0 = 0;
-    out->block.vocab = V;
-    return true;
-}
-
-/* The walk kept `commit` drafts: the installed bank's run of the last verify back to its last kept row
- * (rows 1 + commit .. of the run undone; the rollback finds the bank's run in the capture, wherever it sat
- * in the step -- row0), the bank's position counter there, the kept row's logits fresh. */
-static bool qwen_spec_commit(pulsar_session *s, pulsar_spec_round *r, uint32_t commit, uint32_t) {
-    pulsar_state_set *ss = s->states;
-    pulsar_multiseq_req reqs[PULSAR_QWEN_SPEC_DRAFT_MAX + 1];
-    int32_t tok[PULSAR_QWEN_SPEC_DRAFT_MAX + 1], pos[PULSAR_QWEN_SPEC_DRAFT_MAX + 1], bank[PULSAR_QWEN_SPEC_DRAFT_MAX + 1];
-    if (r->n_batch > PULSAR_QWEN_SPEC_DRAFT_MAX + 1u) return false;
-    pulsar_spec_round_fill_reqs(r, ss->live_bank, reqs);
-    if (!qwen_verify_rows(s, reqs, r->n_batch, tok, pos, bank, NULL, 0)) return false;
-    const uint32_t keep = 1u + commit;
-    if (!pulsar_state_commit(ss, ss->live_bank, tok, keep)) return false;
-    pulsar_state_set_pos(ss, ss->live_bank, (uint32_t)r->saved_len + keep);
-    s->logits_stale = false;
-    return true;
-}
-
-/* The L155 trim (the caller's accepted[] bound below what the round committed): a recurrent state has no
- * rewind, so the bank's view is invalidated and its next sync prefills it (a grid checkpoint at or below
- * the cut would do; S4). */
-static void qwen_spec_cut(pulsar_session *s, int) {
-    s->checkpoint_valid = false;
-    s->checkpoint.len = 0;
-    s->logits_stale = true;
-}
-
-const pulsar_spec_target_ops k_qwen_spec_target = {
-    /* .snapshot      = */ NULL,   /* the verify step captures its own undo state (qwen_forward verify) */
-    /* .restore       = */ NULL,
-    /* .release       = */ NULL,
-    /* .round_note    = */ NULL,   /* one logits readback: the block */
-    /* .arm_verify    = */ NULL,   /* a heads-on-every-row decode_mixed IS the verify */
-    /* .verify_single = */ qwen_verify_single,
-    /* .verify_rows   = */ NULL,   /* the block holds every row */
-    /* .commit        = */ qwen_spec_commit,
-    /* .cut           = */ qwen_spec_cut,
-    /* .readback      = */ NULL,   /* its batched steps read back full rows */
-};
-
 /* ---- the MTP drafter --------------------------------------------------------------------------- */
 
 /* The committed rows of the last verify, any number of banks (each bank's rows one run, in the step's row order):
@@ -111,7 +37,7 @@ const pulsar_spec_target_ops k_qwen_spec_target = {
 static bool mtp_absorb_banked(pulsar_session *s, const uint32_t *rows, const uint32_t *banks, const int32_t *next,
                               uint32_t n) {
     pulsar_engine *e = s->engine;
-    pulsar_qwen_state *q = s->qwen;
+    pulsar_qwen_state *q = qwen_st(s);
     pulsar_state_set *ss = s->states;
     const pulsar_qwen_shape *sh = &g_qwen_shape;
     const uint32_t il_mtp = e->plan.n_layer;
@@ -149,7 +75,7 @@ static bool mtp_absorb_banked(pulsar_session *s, const uint32_t *rows, const uin
         }
         i = j;
     }
-    if (ok && m > 0) ok = qwen_mtp_forward(s, PULSAR_QWEN_STEP_PREFILL, tok, pos, bank, m, 0, 0, NULL, NULL, true);
+    if (ok && m > 0) ok = qwen_mtp_forward(s, PULSAR_STEP_PREFILL, tok, pos, bank, m, 0, 0, NULL, NULL, true);
     for (uint32_t i = 0; i < n;) {
         const uint32_t b = banks[i];
         uint32_t j = i + 1;
@@ -180,7 +106,7 @@ static bool mtp_absorb_banked(pulsar_session *s, const uint32_t *rows, const uin
 static bool mtp_draft_chains(pulsar_session *s, const uint32_t *banks, uint64_t *const *rngs,
                              spec_redraft_req *const *reqs, uint32_t n, char *err, size_t errlen) {
     pulsar_engine *e = s->engine;
-    pulsar_qwen_state *st = s->qwen;
+    pulsar_qwen_state *st = qwen_st(s);
     pulsar_state_set *ss = s->states;
     const pulsar_qwen_shape *sh = &g_qwen_shape;
     const pulsar_qwen_weights *w = e->qwen_weights;
@@ -261,7 +187,7 @@ static bool mtp_draft_chains(pulsar_session *s, const uint32_t *banks, uint64_t 
     bool any_sampled = false;
     for (uint32_t i = 0; i < n; i++) any_sampled |= c[i].live && !c[i].copy && c[i].sampled;
     /* L289: the picks are the device's; the rows come back only when a chain samples (its q) */
-    float *L = any_sampled ? st->spec_logits : NULL;
+    float *L = any_sampled ? st->host_logits : NULL;   /* the driver's verify rows, idle while the chain drafts */
     qwen_mtp_pick pick[PULSAR_QWEN_HEAD_ROWS_MAX];
     /* position j of chain i from its row's pick: its confidence (whether it is the chain's last), then its draft:
      * the pick (greedy) or a draw from q over the row in L (sampled) */
@@ -316,8 +242,8 @@ static bool mtp_draft_chains(pulsar_session *s, const uint32_t *banks, uint64_t 
         }
         if (!ok || m == 0) break;
         const double step_t0 = now_sec();
-        ok = headed ? qwen_mtp_forward(s, PULSAR_QWEN_STEP_DECODE, tok, pos, bank, m, 0, m, L, pick)
-                    : qwen_mtp_forward(s, PULSAR_QWEN_STEP_DECODE, tok, pos, bank, m, 0, 0, NULL, NULL);
+        ok = headed ? qwen_mtp_forward(s, PULSAR_STEP_DECODE, tok, pos, bank, m, 0, m, L, pick)
+                    : qwen_mtp_forward(s, PULSAR_STEP_DECODE, tok, pos, bank, m, 0, 0, NULL, NULL);
         if (j == 1) {
             for (uint32_t i = 0; i < n; i++) {
                 if (!c[i].live) continue;

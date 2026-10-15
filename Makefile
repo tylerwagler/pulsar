@@ -2151,7 +2151,7 @@ gates-dev:
 	    for p in $$paths; do \
 	      case "$$p" in \
 	        *vision*) cls=vision; vision=1 ;; \
-	        src/engine/family*|src/engine/*qwen*|tests/qwen_*|tests/session_contract*|src/engine/state_kinds*|tests/state_kinds*|src/engine/session*|src/engine/safetensors*|src/engine/model.cpp|src/engine/weights*|src/engine/tensor_bind*|tests/loader_*|src/engine/sync_driver*|src/engine/prefill_loop*|src/engine/checkpoint*|src/engine/kv_state*) cls=engine; family=1 ;; \
+	        src/engine/family*|src/engine/*qwen*|tests/qwen_*|tests/session_contract*|src/engine/state_kinds*|src/engine/step_driver*|tests/state_kinds*|src/engine/session*|src/engine/safetensors*|src/engine/model.cpp|src/engine/weights*|src/engine/tensor_bind*|tests/loader_*|src/engine/sync_driver*|src/engine/prefill_loop*|src/engine/checkpoint*|src/engine/kv_state*) cls=engine; family=1 ;; \
 	        *exl3*) cls=exl3; exl3=1 ;; \
 	        *gdn*) cls=gdn; gdn=1 ;; \
 	        src/cuda/*attn*|src/cuda/*attention*) cls=attn; attn=1 ;; \

@@ -209,7 +209,7 @@ bool attention_calls(const pulsar_qwen_step *st, Launch &&launch) {
     if (st->n_dec > 0 && !launch(0u, st->n_dec)) return false;
     if (st->n_dec >= n) return true;
     if (!st->n_runs) return launch(st->n_dec, n - st->n_dec);
-    for (uint32_t k = pulsar_qwen_step_verify_runs(st); k < st->n_runs; k++)
+    for (uint32_t k = pulsar_step_verify_runs(st); k < st->n_runs; k++)
         if (!launch(st->run_first[k], st->run_first[k + 1] - st->run_first[k])) return false;
     return true;
 }
@@ -662,7 +662,7 @@ bool pulsar_qwen_s4_ple(const pulsar_qwen_step *st, uint32_t il) {
     if (!sc) return fail("no PLE scratch");
     /* the rows, and where each row sits: DECODE = one row per bank, PREFILL = its runs (one bank's chunk, or
      * L272 P1 S4: one run per bank of a verify) */
-    const bool decode = st->mode == PULSAR_QWEN_STEP_DECODE;
+    const bool decode = st->mode == PULSAR_STEP_DECODE;
     const uint32_t runs = st->n_runs ? st->n_runs : 1u;
     const uint32_t n_seq = decode ? n : runs;
     int32_t *map = io->map;   /* pinned: the uploads below read it when the stream reaches them */
@@ -1147,14 +1147,14 @@ bool pulsar_qwen_s2_gdn(const pulsar_qwen_step *st, uint32_t il) {
     c.scratch = base + g.ws; c.scratch_bytes = g.ws_bytes;
     c.out_f32 = NULL;                               /* the bf16 row is the consumer's input, not f32 */
     c.out_bf16 = base + g.obf16;                    /* L251 / ac69748f: no E4M3 slot in this family */
-    if (st->mode == PULSAR_QWEN_STEP_DECODE) {      /* one row per bank */
+    if (st->mode == PULSAR_STEP_DECODE) {      /* one row per bank */
         c.n_seq = (int)n;
         c.seq_rows = 1;
         return (pulsar_gdn_forward(&gw, &c, 0) == 0 || fail("pulsar_gdn_forward failed")) && gdn_out();
     }
     /* PREFILL: the verify's rows [0, n_dec) -- one sequence, or (L272 P1 S4) one ragged run a bank, each row's
      * state captured for the rollback -- then (L284 #2) the prompt runs after them, uncaptured */
-    const uint32_t nvr = pulsar_qwen_step_verify_runs(st);
+    const uint32_t nvr = pulsar_step_verify_runs(st);
     if (st->n_dec > 0) {
         pulsar_gdn_call v = c;
         if (nvr > 1) {

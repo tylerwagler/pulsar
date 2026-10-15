@@ -771,6 +771,8 @@ typedef struct {
 /* The model-family interface (L251 S1): the family descriptor, the layer plan,
  * and the Qwen4-exp family's shape/weights/state/op contract. */
 #include "family.h"
+/* L295 F4: the core row-step driver's types (a driver family's session state and step extend them). */
+#include "step_driver.h"
 #include "family_qwen.h"
 static_assert(PULSAR_FAMILY_MAX_LAYER >= PULSAR_MAX_LAYER,
               "a layer plan must hold every layer a DeepSeek profile can have");
@@ -2494,7 +2496,9 @@ struct pulsar_session {
         int32_t next_tok[PULSAR_SPEC_LOGITS_ROWS + 1];   ///< the token after each row (a drafter that pairs rows with their successor, L272 P1)
     } seed_defer;
     pulsar_gpu_graph *graph;  ///< L272 P6: the DeepSeek family's device state (KV, scratch, bank views), owned by its create / destroy; NULL on any other family
-    pulsar_qwen_state *qwen;  ///< the Qwen4-exp family's device state (family_qwen.h); NULL on a DeepSeek session
+    /** L295 F4: the core row-step driver's buffers (step_driver.h) -- the base of the family's own session state
+     *  (Qwen: pulsar_qwen_state) on a family that runs on the driver; NULL on a DeepSeek session. */
+    pulsar_driver_state *driver;
     /** L295 F3: the session's declared state (state_kinds.h) -- every bank's per-layer state, positions and grid
      *  checkpoints, built from the engine's state_plan by the family's create; NULL on a DeepSeek session. */
     pulsar_state_set *states;
@@ -3393,6 +3397,35 @@ typedef bool (*pulsar_prefill_chunk_fn)(pulsar_session *s, const pulsar_tokens *
  *  stale), 1 when a chunk failed. */
 int pulsar_prefill_loop(pulsar_session *s, const pulsar_tokens *prompt, uint32_t start, pulsar_prefill_chunk_fn chunk,
                         void *ud);
+
+/* L295 F4: the core row-step driver's session operations (step_driver.cpp) -- a driver family's session ops and sync
+ * are these, built by the two macros below (the sync carries the family's name for its messages). */
+int pulsar_driver_session_create(pulsar_session *s, uint32_t n_banks);
+void pulsar_driver_session_destroy(pulsar_session *s);
+bool pulsar_driver_sync_state_agrees(pulsar_session *s);
+bool pulsar_driver_sync_reset_bank(pulsar_session *s);
+int pulsar_driver_prefill(pulsar_session *s, const pulsar_tokens *prompt, uint32_t start);
+void pulsar_driver_prefill_shape(pulsar_session *s, pulsar_prefill_shape *out);
+int pulsar_driver_eval_row(pulsar_session *s, int token, char *err, size_t errlen);
+int pulsar_driver_decode_multiseq(pulsar_session *s, const pulsar_multiseq_req *reqs, uint32_t n, float *logits,
+                                  int logits_cap, char *err, size_t errlen);
+int pulsar_driver_decode_mixed(pulsar_session *s, const pulsar_multiseq_req *reqs, uint32_t n_rows, float *logits,
+                               int logits_cap, uint32_t *out_n_rows, uint32_t max_head_runs, char *err, size_t errlen);
+int pulsar_driver_decode_fused(pulsar_session *s, const pulsar_multiseq_req *reqs, uint32_t n_rows,
+                               const pulsar_fused_shape *shape, float *logits, int logits_cap, uint32_t *out_n_rows,
+                               char *err, size_t errlen);
+/** A driver family's sync ops (`NAME` in its messages). */
+#define PULSAR_DRIVER_SYNC_OPS(NAME)                                                                                \
+    { NAME, pulsar_driver_sync_state_agrees, pulsar_driver_sync_reset_bank, pulsar_driver_prefill,                  \
+      pulsar_driver_prefill_shape }
+/** A driver family's session ops over its sync ops `SYNC`.  invalidate is NULL: the core's forgets the HOST view;
+ *  the device state is left alone -- the next sync of that bank finds the view invalid and resets the bank before
+ *  it prefills, so a stale state is never decoded, and the server's invalidate (a bank provision, an eviction, a
+ *  stop string mid-batch) cannot wipe OTHER banks' conversations.  The fused step heads the driver's slab. */
+#define PULSAR_DRIVER_SESSION_OPS(SYNC)                                                                             \
+    { pulsar_driver_session_create, pulsar_driver_session_destroy, SYNC, pulsar_driver_eval_row,                     \
+      pulsar_driver_decode_multiseq, pulsar_driver_decode_mixed, NULL, pulsar_driver_decode_fused,                   \
+      PULSAR_DRIVER_HEADS_MAX }
 
 /* L216 image-layout math: a port of the checkpoint's inference/image_processor.py.
  * Pure functions of the image dimensions and the block's position in the prompt,
