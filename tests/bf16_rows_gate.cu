@@ -185,7 +185,7 @@ static void section_dense(void) {
               sh.what);
         cudaFree(dW); cudaFree(dX); cudaFree(dY);
     }
-    CHECK(pulsar_bf16_rows_linear_launch((void *)256, (const uint16_t *)256, 4, 4064 + 32, 64, (float *)256, false, 0) == -1,
+    CHECK(pulsar_bf16_rows_linear_launch((void *)256, (const uint16_t *)256, 4, 4096 + 32, 64, (float *)256, false, 0) == -1,
           "in %% 64 != 0 accepted");
     printf("  dense refusals: in %% 64, a BF16 reference carrying an EXL3 rate -- refused\n");
 }
