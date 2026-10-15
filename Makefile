@@ -269,7 +269,7 @@ pulsar-agent: $(AGENT_OBJS) src/lib/pulsar_help.o src/lib/pulsar_kvtext.o src/li
 # S4 (router / MoE / GR / PLE) beside DeepSeek's and the shared EXL3 arms.
 CUDA_REGRESSION_BINS = tests/cuda_long_context_smoke tests/moe_route_bounds_gate tests/expert_table_gate \
                        tests/exl3_moe_epilogue_gate tests/exl3_dense_gate tests/exl3_moe_prefill_gate tests/exl3_half_gate \
-                       tests/gdn_gate tests/qsa_attn_gate tests/qwen_s4_gate tests/gqa_attn_gate
+                       tests/gdn_gate tests/qsa_attn_gate tests/qwen_s4_gate tests/gqa_attn_gate tests/sconv_gate tests/head_gate
 # 2026-10-14: the ten run CONCURRENTLY, each one's output kept together (-O).  They are model-free and mostly
 # host-bound (their references run on the CPU: measured alone, 258 s in series, the longest 114 s of which 113 s
 # user time), so in series they were 258 s of the battery's serial front.  No gate here grades a time.
@@ -635,6 +635,54 @@ gqa-attn-mini-grade: tests/gqa_attn_gate
 # roofline measured in the same process.  Not a gate.
 tests/gdn_bench: tests/gdn_bench.cu src/cuda/pulsar_cuda_gdn.o src/cuda/pulsar_cuda_gdn.h Makefile
 	$(NVCC) $(NVCCFLAGS) -std=c++17 -Isrc -Isrc/cuda -o $@ tests/gdn_bench.cu src/cuda/pulsar_cuda_gdn.o
+
+# L295 E3: the family-neutral short convolution block (depthwise causal, K taps,
+# bf16, a [K-1][C] state slot a sequence) vs the host replay of its arithmetic
+# (bit-exact) and the double reference (graded); decode == prefill == chunked ==
+# verify == batched bit-exact; per-row capture and rollback; mutations; the
+# 4-stream launch; refusals.  Links the PRODUCTION object; pass the served arch
+# (CUDA_ARCH=sm_120f).  Model-free.
+src/cuda/pulsar_cuda_sconv.o: src/cuda/pulsar_cuda_sconv.h src/cuda/pulsar_cuda_sconv.cuh
+tests/sconv_gate: tests/sconv_gate.cu tests/sconv_ref.h src/cuda/pulsar_cuda_sconv.o src/cuda/pulsar_cuda_sconv.h Makefile
+	$(NVCC) $(NVCCFLAGS) -std=c++17 -Isrc -Isrc/cuda -o $@ tests/sconv_gate.cu src/cuda/pulsar_cuda_sconv.o
+
+.PHONY: sconv-gate
+sconv-gate: tests/sconv_gate
+	./tests/sconv_gate
+
+# The block's launches at Inkling-Small's shapes (K+V, the two residual deltas;
+# decode, verify with capture, a 4096-row prefill chunk).  Not a gate.
+tests/sconv_bench: tests/sconv_bench.cu src/cuda/pulsar_cuda_sconv.o src/cuda/pulsar_cuda_sconv.h Makefile
+	$(NVCC) $(NVCCFLAGS) -std=c++17 -Isrc -Isrc/cuda -o $@ tests/sconv_bench.cu src/cuda/pulsar_cuda_sconv.o
+
+# The block on the Inkling-Small mini checkpoint's layer 0 (L294's 3-layer mini): the four
+# streams' real inputs and weights against transformers' InklingShortConvolution in fp32.
+# SCONV_MINI_FIXTURE is the directory tests/sconv_mini_fixture.py writes (CPU, about a
+# minute): python3 tests/sconv_mini_fixture.py /mnt/models/inkling-small-mini
+# /mnt/models/inkling-small-mini-ref/ref_fp32.pt DIR.
+.PHONY: sconv-mini-grade
+sconv-mini-grade: tests/sconv_gate
+	@test -n "$(SCONV_MINI_FIXTURE)" || { echo "sconv-mini-grade: set SCONV_MINI_FIXTURE (see tests/sconv_mini_fixture.py)"; exit 1; }
+	./tests/sconv_gate --fixture $(SCONV_MINI_FIXTURE)
+
+# L295 E5: the family head options -- the embedding RMSNorm (graded vs double,
+# batch-independent bytes), the logits finish (scale bit-exact, padding -inf,
+# argmax never a pad), the identity head launches nothing; refusals.  Model-free.
+src/cuda/pulsar_cuda_head.o: src/cuda/pulsar_cuda_head.h
+tests/head_gate: tests/head_gate.cu tests/sconv_ref.h src/cuda/pulsar_cuda_head.o src/cuda/pulsar_cuda_head.h Makefile
+	$(NVCC) $(NVCCFLAGS) -std=c++17 -Isrc -Isrc/cuda -o $@ tests/head_gate.cu src/cuda/pulsar_cuda_head.o
+
+.PHONY: head-gate
+head-gate: tests/head_gate
+	./tests/head_gate
+
+# The same on the Inkling-Small mini against its transformers fp32 capture: the embedding
+# norm, and the 1/16 logit scale + padding on the head's unscaled f32 output.
+# HEAD_MINI_FIXTURE is the directory tests/head_mini_fixture.py writes.
+.PHONY: head-mini-grade
+head-mini-grade: tests/head_gate
+	@test -n "$(HEAD_MINI_FIXTURE)" || { echo "head-mini-grade: set HEAD_MINI_FIXTURE (see tests/head_mini_fixture.py)"; exit 1; }
+	./tests/head_gate --fixture $(HEAD_MINI_FIXTURE)
 
 # L251: the same TU as a shared object for the real-weight harness in
 # pulsar-notes research/l251/gdn/ (ctypes from torch, against transformers'
@@ -2180,7 +2228,7 @@ gates-dev:
 	fi; \
 	$(MAKE) -j$(GATE_JOBS) --no-print-directory tests/gates_runner pulsar_test CUDA_ARCH=sm_120f || exit 1; \
 	$(MAKE) --no-print-directory gates-preflight || exit 1; \
-	paths='$(PATHS)'; why=''; attn=0; server=0; vision=0; exl3=0; family=0; gdn=0; \
+	paths='$(PATHS)'; why=''; attn=0; server=0; vision=0; exl3=0; family=0; gdn=0; blocks=0; \
 	if [ -z "$$paths" ]; then \
 	  paths=$$( { git diff --name-only HEAD; git ls-files --others --exclude-standard; } 2>/dev/null \
 	            | grep -E '\.(c|cc|cpp|cu|cuh|h|hpp)$$' | sort -u ); \
@@ -2198,6 +2246,7 @@ gates-dev:
 	        src/engine/family*|src/engine/*qwen*|tests/qwen_*|tests/session_contract*|src/engine/session*|src/engine/safetensors*|src/engine/model.cpp|src/engine/weights*|src/engine/tensor_bind*|tests/loader_*|src/engine/sync_driver*|src/engine/prefill_loop*|src/engine/checkpoint*|src/engine/kv_state*) cls=engine; family=1 ;; \
 	        *exl3*) cls=exl3; exl3=1 ;; \
 	        *gdn*) cls=gdn; gdn=1 ;; \
+	        *sconv*|src/cuda/pulsar_cuda_head*|tests/head_*) cls=blocks; blocks=1 ;; \
 	        src/cuda/*attn*|src/cuda/*attention*) cls=attn; attn=1 ;; \
 	        src/cuda/*norm_kv*) cls=attn; attn=1 ;; \
 	        src/cuda/*) cls=cuda ;; \
@@ -2214,6 +2263,7 @@ gates-dev:
 	        vision) for g in $(GATES_DEV_VISION); do add $$g; done ;; \
 	        exl3) for g in $(GATES_DEV_DEFAULT); do add $$g; done ;; \
 	        gdn) for g in $(GATES_DEV_DEFAULT); do add $$g; done ;; \
+	        blocks) ;; \
 	        *) for g in $(GATES_DEV_DEFAULT); do add $$g; done ;; \
 	      esac; \
 	    done; \
@@ -2228,6 +2278,7 @@ gates-dev:
 	if [ $$vision -eq 1 ]; then printf '  vision host gates: selected\n'; fi; \
 	if [ $$family -eq 1 ]; then printf '  family gates: selected (the family interface; the session contract on both families)\n'; fi; \
 	if [ $$attn -eq 1 ]; then printf '  cuda-attn-gates: selected (attention kernels)\n'; fi; \
+	if [ $$blocks -eq 1 ]; then printf '  block gates: sconv-gate, head-gate (the L295 short convolution and head options)\n'; fi; \
 	if [ $$server -eq 1 ]; then printf '  server: chat smoke + the --server/--api unit switches\n'; fi; \
 	$(MAKE) --no-print-directory seam-check CUDA_ARCH=sm_120f || rc=1; \
 	$(MAKE) --no-print-directory cuda-reap-router-audit CUDA_ARCH=sm_120f \
@@ -2249,6 +2300,9 @@ gates-dev:
 	fi; \
 	if [ $$gdn -eq 1 ]; then \
 	  $(MAKE) --no-print-directory gdn-gate CUDA_ARCH=sm_120f || rc=1; \
+	fi; \
+	if [ $$blocks -eq 1 ]; then \
+	  $(MAKE) --no-print-directory sconv-gate head-gate CUDA_ARCH=sm_120f || rc=1; \
 	fi; \
 	if [ $$exl3 -eq 1 ]; then \
 	  $(MAKE) --no-print-directory exl3-dequant-gate CUDA_ARCH=sm_120f || rc=1; \
