@@ -381,12 +381,12 @@ class Daemon:
                 continue
             if j["state"] == "queued":
                 self.finalize(j, "cancelled", RC_CANCEL)
-            elif j["state"] == "running" and not j.get("cancel_sent"):
+            elif j["state"] == "running" and not j.get("cancel_sent") and self.pgid(j):
                 j["cancel_sent"] = time.time()
                 self.save(j)
                 self.log(f"cancel job {j['id']}: SIGTERM to its process group")
                 self.signal_job(j, signal.SIGTERM)
-            elif j["state"] == "running" and not j.get("cancel_killed") and \
+            elif j["state"] == "running" and j.get("cancel_sent") and not j.get("cancel_killed") and \
                     time.time() - j["cancel_sent"] > KILL_AFTER:
                 j["cancel_killed"] = True
                 self.save(j)
@@ -407,7 +407,7 @@ class Daemon:
         now = time.time()
         if j["cls"] == "long" and not j.get("yield_requested_at"):
             urgent = [q for q in queued if q["cls"] != "long"]
-            if urgent and now - j["started"] >= j["min_hold"]:
+            if urgent and now - j["started"] >= j["min_hold"] and self.pgid(j):   # pgid: the shim has started it
                 j["yield_requested_at"] = now
                 self.save(j)
                 self.log(f"job {j['id']}: SIGUSR1 (yield) -- job {urgent[0]['id']} ({urgent[0]['cls']}) waits")
