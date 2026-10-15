@@ -280,6 +280,31 @@ EXL3_HD static inline bool exl3_expert_layout(uint64_t k, uint64_t n, int k2,
     return true;
 }
 
+/**
+ * The output width a dense EXL3 Linear's planes STORE for a logical width n: n
+ * rounded up to the Hadamard block.  exllamav3 pads every Linear it quantizes
+ * that way (`Linear(pad_to = 128)`: the weight zero-padded before the
+ * quantizer, svh 0 on the pad columns), so a head of 201024 outputs ships as a
+ * 201088-wide trellis; the logical width is the model's and the pad never
+ * leaves the arm (L295 F7).  The input width carries no pad: a Linear's input
+ * is the previous layer's output, a multiple of 128 by construction.
+ */
+EXL3_HD static inline uint64_t exl3_out_stored(uint64_t n) {
+    return (n + EXL3_HAD_BLOCK - 1) / EXL3_HAD_BLOCK * EXL3_HAD_BLOCK;
+}
+
+/**
+ * Bytes of one dense Linear (in = k, logical out = n) at rate k2: the
+ * exl3_expert_layout of (k, exl3_out_stored(n)) -- [trellis | suh[k] |
+ * svh[stored]] -- for every n >= 1.  A routed expert-projection keeps
+ * exl3_expert_layout's 128-multiples (its slices are cut and addressed by the
+ * MoE arms at the stored widths); this is the 2-D tensor's model.
+ */
+EXL3_HD static inline bool exl3_linear_layout(uint64_t k, uint64_t n, int k2, uint64_t *trellis_bytes,
+                                              uint64_t *scale_bytes, uint64_t *stride) {
+    return n != 0 && exl3_expert_layout(k, exl3_out_stored(n), k2, trellis_bytes, scale_bytes, stride);
+}
+
 /** One strided byte copy: `height` runs of `width` bytes, run i from src + i * src_pitch to dst + i * dst_pitch
  *  (cudaMemcpy2D's shape; a single run when height == 1). */
 typedef struct {

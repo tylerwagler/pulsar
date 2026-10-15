@@ -1145,8 +1145,11 @@ static void e8m0_scan_blocks(
  * no invalid encoding and are not scanned. */
 static void exl3_scan_scales(const pulsar_model *m, const pulsar_tensor *t) {
     uint64_t trellis = 0, scales = 0, stride = 0;
-    if (!exl3_expert_layout(t->dim[0], t->dim[1], exl3_type_k2(t->type), &trellis, &scales, &stride)) return;
-    const uint64_t n_exp = t->ndim >= 3 ? t->dim[2] : 1;   /* a dense Linear is one slice */
+    const int k2 = exl3_type_k2(t->type);
+    if (t->ndim >= 3 ? !exl3_expert_layout(t->dim[0], t->dim[1], k2, &trellis, &scales, &stride)
+                     : !exl3_linear_layout(t->dim[0], t->dim[1], k2, &trellis, &scales, &stride))
+        return;
+    const uint64_t n_exp = t->ndim >= 3 ? t->dim[2] : 1;   /* a dense Linear is one slice (its svh stored padded) */
     if (n_exp == 0 || stride > t->bytes / n_exp) return;
     const uint8_t *map = t->ext_map ? t->ext_map : m->map;
     const uint64_t map_size = t->ext_map ? t->ext_size : m->size;

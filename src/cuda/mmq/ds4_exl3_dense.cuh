@@ -44,23 +44,27 @@
 #include <stdint.h>
 
 /** True when `k2` (rate in half-bit units) is a rate the dense arm
- *  instantiates: K = 2, 3, 4, 5. */
+ *  instantiates: exl3_arm_has_rate(EXL3_ARM_DENSE), K = 2, 3, 4, 5, 6, 8. */
 bool ds4_exl3_dense_rate_supported(int k2);
 
 /** Workspace bytes ds4_exl3_dense_launch needs for (M, K, N): the split
- *  partials and the prep planes of min(M, 16) rows (more than 16 rows are the
- *  prefill GEMM's, which needs none).  0 for a shape the arm refuses. */
+ *  partials (at the stored width) and the prep planes of min(M, 16) rows (more
+ *  than 16 rows are the prefill GEMM's, which needs none).  0 for a shape the
+ *  arm refuses. */
 size_t ds4_exl3_dense_workspace_bytes(int M, int K, int N);
 
 /** The number of K splits the arm uses for (K, N) -- a function of the weight's
- *  shape alone, which is what keeps every row M-independent.  0 on a refused
- *  shape. */
+ *  (stored) shape alone, which is what keeps every row M-independent.  0 on a
+ *  refused shape. */
 int ds4_exl3_dense_splits(int K, int N);
 
 /** y [M][N] f32 = the complete Linear.  `w` is the [trellis | suh | svh] slice
- *  (16-byte aligned), `xb` the bf16 block input of the M rows (8-byte aligned,
- *  the uint2 row loads).  K % 128 == 0,
- *  N % 128 == 0, M >= 1, k2 a supported rate, `workspace` (16-byte aligned) at
+ *  (16-byte aligned) in exl3_linear_layout(K, N, k2): N is the LOGICAL output
+ *  width, stored at exl3_out_stored(N) (a 128 multiple, exllamav3's pad); the
+ *  arm computes the stored width and writes the N logical columns, y's row
+ *  width (L295 F7: a 201024-wide head stored 201088).  `xb` the bf16 block
+ *  input of the M rows (8-byte aligned, the uint2 row loads).  K % 128 == 0,
+ *  N % 4 == 0, M >= 1, k2 a supported rate, `workspace` (16-byte aligned) at
  *  least ds4_exl3_dense_workspace_bytes(M, K, N).  Two kernels on `stream`
  *  (the prep, the GEMV with its epilogue); refuses (returns -1) on any contract violation, -3 on a
  *  launch failure. */
@@ -80,7 +84,8 @@ int ds4_exl3_dense_launch(
     bool           prompt = false);
 
 /** L251: the dense arm's prompt chunks through a decode-once tensor-core GEMM: w is the dense layout
- *  (trellis | suh[K] | svh[N]); writes y [M][N] finished (output rotation and svh applied).
+ *  (trellis | suh[K] | svh[stored N], exl3_linear_layout); writes y [M][N] finished (output rotation and svh
+ *  applied), N the logical width.
  *  ds4_exl3_dense_launch calls it for prompt chunks and M > 16. */
 int qwen_exl3_dense_prefill_launch(const void *w, int k2, const void *x_bf16, float *y, int M, int K, int N,
                                    uint64_t trellis_bytes, cudaStream_t stream);

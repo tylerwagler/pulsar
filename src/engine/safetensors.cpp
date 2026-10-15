@@ -502,11 +502,14 @@ static uint64_t st_bytes_for(uint32_t type, const uint64_t *dim, uint32_t nd) {
     default: {
         /* EXL3 on a pulsar.tensors entry (L251): one [trellis | suh | svh] slice per
          * [in, out] (ne order), and a 3-D [in, out, n] entry is n of them back to
-         * back -- exl3_expert_layout is the one byte model */
+         * back -- exl3_linear_layout (a 2-D Linear's logical out, stored padded to
+         * 128 as exllamav3 writes it; L295 F7) and exl3_expert_layout are the byte
+         * models */
         const int k2 = exl3_type_k2(type);
         uint64_t trellis = 0, scales = 0, stride = 0;
-        if (k2 && (nd == 2 || nd == 3) && exl3_expert_layout(dim[0], dim[1], k2, &trellis, &scales, &stride))
-            return stride * (nd == 3 ? dim[2] : 1);
+        if (k2 && nd == 2 && exl3_linear_layout(dim[0], dim[1], k2, &trellis, &scales, &stride)) return stride;
+        if (k2 && nd == 3 && exl3_expert_layout(dim[0], dim[1], k2, &trellis, &scales, &stride))
+            return stride * dim[2];
         if (k2) st_die("safetensors: EXL3 dense tensor has a bad shape (%u dims, in %llu, out %llu)", nd,
                        (unsigned long long)(nd > 0 ? dim[0] : 0), (unsigned long long)(nd > 1 ? dim[1] : 0));
         st_die("safetensors: no byte model for tensor type %u", type);

@@ -112,7 +112,8 @@ struct dense_proj {
     __half *hi, *lo;                 ///< the prep planes
     float *inv;
     unsigned *ctr;
-    int N, S;                        ///< its outputs and its split count (dense_splits(K, N))
+    int N, S;                        ///< its STORED outputs (exl3_out_stored) and its split count (dense_splits(K, N))
+    int Ny;                          ///< its logical outputs: y's row width, the columns stored (<= N)
 };
 
 /** Projections one call carries at most. */
@@ -365,11 +366,12 @@ exl3_dense_kernel(const dense_set P, const __nv_bfloat16 *__restrict__ xb, int M
             const float4 v = __ldcg(reinterpret_cast<const float4 *>(p.part + ((size_t)s * (size_t)M + (size_t)m) * (size_t)N + n0));
             z[0] += v.x; z[1] += v.y; z[2] += v.z; z[3] += v.w;
         }
-        exl3dev::had128(z);
+        exl3dev::had128(z);   /* the whole warp: a stored block mixes its pad columns in */
         const __half2 v01 = *reinterpret_cast<const __half2 *>(p.svh + n0);
         const __half2 v23 = *reinterpret_cast<const __half2 *>(p.svh + n0 + 2);
-        *reinterpret_cast<float4 *>(p.y + (size_t)m * (size_t)N + n0) =
-            make_float4(z[0] * __low2float(v01), z[1] * __high2float(v01), z[2] * __low2float(v23), z[3] * __high2float(v23));
+        if (n0 < p.Ny)        /* L295 F7: a stored pad column (exl3_out_stored) is never written */
+            *reinterpret_cast<float4 *>(p.y + (size_t)m * (size_t)p.Ny + n0) =
+                make_float4(z[0] * __low2float(v01), z[1] * __high2float(v01), z[2] * __low2float(v23), z[3] * __high2float(v23));
     }
 }
 
@@ -415,8 +417,8 @@ size_t proj_ws_bytes(int M, int K, int N) {
 bool ds4_exl3_dense_rate_supported(int k2) { return exl3_arm_has_rate(EXL3_ARM_DENSE, k2); }
 
 int ds4_exl3_dense_splits(int K, int N) {
-    if (K <= 0 || N <= 0 || K % EXL3_HAD_BLOCK || N % EXL3_HAD_BLOCK) return 0;
-    return dense_splits(K, N);
+    if (K <= 0 || N <= 0 || K % EXL3_HAD_BLOCK || N % 4) return 0;
+    return dense_splits(K, (int)exl3_out_stored((uint64_t)N));
 }
 
 size_t ds4_exl3_dense_multi_workspace_bytes(const ds4_exl3_dense_proj *p, int n, int M, int K) {
@@ -424,7 +426,8 @@ size_t ds4_exl3_dense_multi_workspace_bytes(const ds4_exl3_dense_proj *p, int n,
     size_t b = 0;
     for (int j = 0; j < n; ++j) {
         if (ds4_exl3_dense_splits(K, p[j].N) == 0) return 0;
-        b += proj_ws_bytes(M < kRows ? M : kRows, K, p[j].N);   /* M > kRows is the prefill GEMM's: none */
+        /* M > kRows is the prefill GEMM's: none; the partials are the stored width's */
+        b += proj_ws_bytes(M < kRows ? M : kRows, K, (int)exl3_out_stored((uint64_t)p[j].N));
     }
     return b;
 }
@@ -451,9 +454,11 @@ int ds4_exl3_dense_multi_launch(const ds4_exl3_dense_proj *p, int n, const void 
             fprintf(stderr, "%s: projection %d has no weight or no output -- refusing\n", tag, j);
             return -1;
         }
-        if (!exl3_expert_layout((uint64_t)(K > 0 ? K : 0), (uint64_t)(N > 0 ? N : 0), p[j].k2, &trellis_bytes[j],
-                                &scale_bytes, &stride)) {
-            fprintf(stderr, "%s: K=%d N=%d k2=%d is not an EXL3 layout (both dims %% 128, a valid rate) -- refusing\n",
+        if (N <= 0 || N % 4 ||
+            !exl3_linear_layout((uint64_t)(K > 0 ? K : 0), (uint64_t)N, p[j].k2, &trellis_bytes[j], &scale_bytes,
+                                &stride)) {
+            fprintf(stderr, "%s: K=%d N=%d k2=%d is not an EXL3 dense layout (K %% 128, N %% 4 -- the epilogue's "
+                            "float4 stores; N stored at its 128 multiple -- and a valid rate) -- refusing\n",
                     tag, K, N, p[j].k2);
             return -1;
         }
@@ -465,7 +470,7 @@ int ds4_exl3_dense_multi_launch(const ds4_exl3_dense_proj *p, int n, const void 
             fprintf(stderr, "%s: w / y must be 16-byte aligned -- refusing\n", tag);
             return -1;
         }
-        n_ctr += N / 128;
+        n_ctr += (int)(exl3_out_stored((uint64_t)N) / 128);
     }
     if ((uintptr_t)xb % 8 || (uintptr_t)workspace % 16) {
         fprintf(stderr, "%s: the workspace must be 16-byte aligned and xb 8-byte (the uint2 row loads) -- refusing\n", tag);
@@ -505,12 +510,12 @@ int ds4_exl3_dense_multi_launch(const ds4_exl3_dense_proj *p, int n, const void 
         uint8_t *ws = static_cast<uint8_t *>(workspace);
         unsigned *c = ctr;
         for (int j = 0; j < n; ++j) {
-            const int N = p[j].N, S = dense_splits(K, N);
+            const int N = (int)exl3_out_stored((uint64_t)p[j].N), S = dense_splits(K, N);   /* the stored width */
             const Workspace L(S, M, K, N);
             const __half *suh = reinterpret_cast<const __half *>(static_cast<const uint8_t *>(p[j].w) + trellis_bytes[j]);
             all.p[j] = dense_proj{static_cast<const uint32_t *>(p[j].w), suh, suh + K, reinterpret_cast<float *>(ws + L.part),
                                   p[j].y, reinterpret_cast<__half *>(ws + L.hi), reinterpret_cast<__half *>(ws + L.lo),
-                                  reinterpret_cast<float *>(ws + L.inv), c, N, S};
+                                  reinterpret_cast<float *>(ws + L.inv), c, N, S, p[j].N};
             ws += proj_ws_bytes(M, K, N);
             c += N / 128;
         }

@@ -188,7 +188,8 @@ extern "C" size_t pulsar_rows_linear_multi_workspace_bytes(const pulsar_rows_lin
     int ne = 0;
     for (int j = 0; j < n; ++j) {
         if (!ls[j] || ls[j]->in != ls[0]->in) return 0;
-        if (ls[j]->out % 128 == 0) p[ne++].N = ls[j]->out;   /* an EXL3 shape (mxfp8_lt-only widths need none) */
+        /* an EXL3 Linear (any logical width, L295 F7), or a width an EXL3 one could have (mxfp8_lt needs none) */
+        if (ls[j]->k2 || ls[j]->out % 128 == 0) p[ne++].N = ls[j]->out;
     }
     return ne ? ds4_exl3_dense_multi_workspace_bytes(p, ne, rows, ls[0]->in) : 0;
 }
