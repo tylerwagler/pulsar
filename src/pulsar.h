@@ -118,7 +118,7 @@ typedef enum {
     PULSAR_CHAT_DS4_V41 = 1,  ///< DeepSeek V4.1 / Vision-Exp template
     PULSAR_CHAT_QWEN    = 2,  ///< Qwen chat template (L251 S5)
     PULSAR_CHAT_INKLING = 3,  ///< Inkling-Small native renderer (L294 E6: src/lib/inkling_chat)
-    PULSAR_CHAT_NEMOTRON_H = 4,  ///< Nemotron-H ChatML + <think> renderer (L296 N8: src/lib/nemotron_chat)
+    PULSAR_CHAT_NEMOTRON_H = 4,  ///< Nemotron-H ChatML + think-tag renderer (L296 N8: src/lib/nemotron_chat)
 } pulsar_chat_format;
 
 /** The speculative drafter a family's artifacts carry. */

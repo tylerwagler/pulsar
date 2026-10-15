@@ -459,7 +459,7 @@ bool write_messages(writer &w, const nemotron_msg_in *msgs, int n, const char *p
             if (last || strcmp(msgs[i + 1].role ? msgs[i + 1].role : "", "tool")) w.lit("<|im_end|>\n");
         } else {
             w.lit("<|im_start|>");
-            w.client(role);
+            w.lit(role);   /* the API's role word: the template writes it, not client text */
             w.lit("\n");
             w.client(content);
             w.lit("<|im_end|>\n");
@@ -618,7 +618,7 @@ const out_grammar &nemotron_output_grammar(void) {
             {OUT_CALL, CALL_CLOSE, OUT_CONTENT, 0},
         },
         /* .reasoning   = */ OUT_TEXT_RSTRIP,
-        /* .content     = */ OUT_TEXT_KEEP_UNLESS_BLANK,
+        /* .content     = */ OUT_TEXT_TRIM_AT_CALLS,
         /* .call_open   = */ "<tool_call>",
         /* .dropped     = */ {},
     };
@@ -627,6 +627,7 @@ const out_grammar &nemotron_output_grammar(void) {
 
 bool nemotron_output_parser::init(bool thinking, const char *tools_json, char *err, size_t errlen) {
     body_.tools = pyjson_value();
+    body_.python_scalars = true;   /* the template writes `args_value | string`: True / False / None */
     if (tools_json) {
         char jerr[160] = "not a JSON array";
         if (!pyjson_parse(tools_json, strlen(tools_json), &body_.tools, jerr, sizeof jerr) ||

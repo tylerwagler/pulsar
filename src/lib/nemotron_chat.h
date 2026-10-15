@@ -116,7 +116,7 @@ bool nemotron_chat_render_turn(const nemotron_msg_in *msgs, int n, nemotron_effo
 /** The generation prompt for `effort` (the template's last bytes with add_generation_prompt). */
 const char *nemotron_generation_prompt(nemotron_effort effort);
 
-/** Tool memory: the run of consecutive <tool_call> blocks (whitespace between them) at or after `p` -- one turn's
+/** Tool memory: the run of consecutive tool-call blocks (whitespace between them) at or after `p` -- one turn's
  *  calls; `*end` = one past it.  NULL = none (an unclosed block is not a key). */
 const char *nemotron_find_call_block(const char *p, const char **end);
 
@@ -127,7 +127,7 @@ std::string nemotron_rendered_system_text(const char *prompt);
 /** Nemotron's output grammar for the kit (vLLM's nemotron_v3: qwen3_config + strip_trailing_reasoning_whitespace):
  *  `</think>` ends the reasoning the generation prompt opened (a stray one in content is dropped, a repeated
  *  `<think>` in reasoning too); `<tool_call>` opens a call from reasoning or content; `</tool_call>` closes it.
- *  Reasoning is reported with its trailing whitespace dropped; content verbatim, except a blank one beside calls. */
+ *  Reasoning is reported with its trailing whitespace dropped; content verbatim until a call opens, then trimmed. */
 const out_grammar &nemotron_output_grammar(void);
 
 /** The sampled-text parser for one Nemotron assistant turn: the kit in Nemotron's configuration. */

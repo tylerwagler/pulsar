@@ -69,6 +69,12 @@ enum out_text_policy {
      *  and at the turn's end sent only if no call was read (Inkling's content, vLLM's
      *  drop_whitespace_only_content_before_tools). */
     OUT_TEXT_KEEP_UNLESS_BLANK,
+    /** The turn's text verbatim until a call opens; from there each section str.strip()'d: whitespace is held until
+     *  more text proves it interior, sent at the turn's end when no call opened, dropped where a call opens; after a
+     *  call, a section's leading whitespace is dropped too (vLLM's strip_content_whitespace_with_tools as far as a
+     *  stream can follow it: a turn with calls reads its content stripped, except leading whitespace already sent
+     *  before the first call; L296 Nemotron-H's content). */
+    OUT_TEXT_TRIM_AT_CALLS,
 };
 
 /** A transition's extra action. */
