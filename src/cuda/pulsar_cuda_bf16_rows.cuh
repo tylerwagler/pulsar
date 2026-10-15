@@ -25,6 +25,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "pulsar_cuda_qwen.h"   /* pulsar_ffn_act: the rows front door's neutral activation enum */
+
 /** The rows one launch of the M-independent rows kernel takes (wider decode calls run blocks of it). */
 #define PULSAR_BF16_ROWS_DECODE_MAX 16
 
@@ -39,16 +41,20 @@ int pulsar_gpu_bf16_rows_gemm(float *y, const uint16_t *w, const uint16_t *x_bf1
                               uint64_t rows, cudaStream_t stream);
 
 /** One layer's routed BF16 stacks over the experts this rank holds: gate / up [n_experts][mid][in], down
- *  [n_experts][out][in = mid], bf16, 16-byte aligned. */
+ *  [n_experts][out][in = mid], bf16, 16-byte aligned.  `act` the activation (pulsar_cuda_qwen.h pulsar_ffn_act):
+ *  SWIGLU reads gate and up, RELU2 up alone (gate NULL -- an up-only, non-gated expert). */
 struct pulsar_bf16_moe {
     const void *gate, *up, *down;
     int n_experts;
     int in_dim, mid_dim, out_dim;
+    pulsar_ffn_act act;
 };
 
 /** out [T][out_dim] f32 = sum over each row's top_k picks (sel [T][top_k], local expert ids; < 0 is another rank's
- *  or the router's NaN route and adds nothing) of down(bf16(swiglu(gate x, up x) * w)), slots in order.  The
- *  caller's buffers: gate_z / up_z [T * top_k][mid] f32, mid [T * top_k][mid] bf16, down_z [T * top_k][out] f32.  A
+ *  or the router's NaN route and adds nothing) of down(bf16(act(...) * w)), slots in order: act swiglu(gate x, up x)
+ *  or relu(up x)^2, the route weight folded in before the one bf16 rounding (as the EXL3 fold does).  The
+ *  caller's buffers: gate_z (unused for RELU2) / up_z [T * top_k][mid] f32, mid [T * top_k][mid] bf16, down_z
+ *  [T * top_k][out] f32.  A
  *  non-finite output records nf_code in *nf_flag (first writer wins).  Needs the MMQ drivers' schedule
  *  (PULSAR_HAVE_MMQ).  Refuses (-1) on a contract violation. */
 int pulsar_bf16_moe_routed_launch(const pulsar_bf16_moe &w, const int32_t *sel, const float *wts, int T, int top_k,

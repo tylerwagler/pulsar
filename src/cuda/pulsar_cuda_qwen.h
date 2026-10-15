@@ -238,6 +238,10 @@ static inline pulsar_router_cfg pulsar_qwen_router_cfg(int n_expert, int top_k) 
  *  [ex_lo, ex_lo + n_local) -- all of them on one GPU; under expert parallelism a token's picks of another
  *  rank's experts are dropped here and summed there. */
 struct pulsar_tessera_proj;   /* src/cuda/mmq/pulsar_tessera.h (L255) */
+/** L295 F7: an FFN's activation, family-neutral -- the expert arms key on it, never on a family.  SWIGLU: h =
+ *  silu(gate x) * up x (gate + up stacks); RELU2: h = relu(up x)^2 (up-only stacks, no gate: Nemotron-H's experts).
+ *  Zero is SWIGLU, so a descriptor that never names one keeps every arm's behaviour. */
+typedef enum { PULSAR_FFN_ACT_SWIGLU = 0, PULSAR_FFN_ACT_RELU2 = 1 } pulsar_ffn_act;
 /** One shared expert: out += scale[t] * down(silu(gate x) * up x), added after the routed sum (a block's N shared
  *  experts in order).  Task #44: one whose three Linears are EXL3 dense slices rides the routed launches (the EXL3
  *  routed front door, mmq/exl3_moe.cuh) -- keyed on that format; any other format runs
@@ -272,8 +276,9 @@ typedef struct pulsar_rows_moe {
     const struct pulsar_tessera_proj *tessera_gate, *tessera_up, *tessera_down;
     /** L295 F7: the routed experts in BF16 -- gate / up [n_local][mid][in], down [n_local][out][mid] -- set INSTEAD
      *  of every table above (pulsar_cuda_bf16_rows.cuh); no riding shared expert (a BF16 one runs
-     *  pulsar_rows_moe_shared_launch). */
+     *  pulsar_rows_moe_shared_launch).  bf16_gate NULL = up-only experts (a non-gated activation, `act`). */
     const void *bf16_gate, *bf16_up, *bf16_down;
+    pulsar_ffn_act act;                  /**< the experts' activation; every arm but BF16 runs SWIGLU only */
     int k2_gate_up, k2_down;             /**< rates (half-bit units); k2_gate_up is the pair's in the split form */
     int n_expert, top_k;                 /**< the model's experts (the router's picks index them) and picks per row */
     int in_dim, mid_dim, out_dim;        /**< the expert shape (the model's): in == out, the block's hidden */

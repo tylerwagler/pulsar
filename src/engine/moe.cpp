@@ -116,18 +116,30 @@ bool pulsar_moe_routed_rows(const pulsar_moe_rows_call *c) {
                                              c->ws_bytes, c->nf_flag, c->nf_code, 0) == 0;
     }
     const pulsar_tensor *G = c->gate, *U = c->up, *D = c->down;
-    const pulsar_moe_arm arm = pulsar_moe_arm_for(G, U, D, PULSAR_ACT_ROWS_BF16);
+    /* L295 F7: a non-gated activation (RELU2) reads up-only experts, which only the BF16 arm runs */
+    const pulsar_ffn_act act = (pulsar_ffn_act)c->act;
+    if (act != PULSAR_FFN_ACT_SWIGLU) {
+        if (act != PULSAR_FFN_ACT_RELU2 || G || !U || !D || U->type != PULSAR_TENSOR_BF16 ||
+            D->type != PULSAR_TENSOR_BF16 || !pulsar_format_serves(U->type, PULSAR_ROLE_EXPERT_GATE_UP, PULSAR_ACT_ROWS_BF16)) {
+            fprintf(stderr, "pulsar: routed MoE: activation %d runs BF16 up-only experts (no gate stack) alone -- "
+                            "refusing\n", (int)act);
+            return false;
+        }
+    }
+    const pulsar_tensor *G0 = G ? G : U;   /* the first projection: its input width, its plan slice */
+    const pulsar_moe_arm arm = act == PULSAR_FFN_ACT_RELU2 ? PULSAR_MOE_ARM_ROWS_BF16
+                                                           : pulsar_moe_arm_for(G, U, D, PULSAR_ACT_ROWS_BF16);
     if (arm != PULSAR_MOE_ARM_ROWS_FUSED && arm != PULSAR_MOE_ARM_ROWS_PAIR && arm != PULSAR_MOE_ARM_ROWS_BF16) {
-        say_no_arm(G, D, "raw bf16 rows");
+        say_no_arm(G0, D, "raw bf16 rows");
         return false;
     }
     const uint64_t n_expert = D->dim[2];
     /* the experts this rank reads: the plan's range of whole experts (expert parallel), else all of them */
     pulsar_tp_op op = PULSAR_TP_OP_NONE;
     uint64_t lo = 0, hi = n_expert;
-    if (pulsar_tp_slice_of(c->m, G, &op, &lo, &hi, NULL) && op != PULSAR_TP_OP_EXPERTS) {
+    if (pulsar_tp_slice_of(c->m, G0, &op, &lo, &hi, NULL) && op != PULSAR_TP_OP_EXPERTS) {
         fprintf(stderr, "pulsar: routed MoE: the plan's slice of %.*s is not a range of whole experts -- refusing\n",
-                (int)G->name.len, G->name.ptr);
+                (int)G0->name.len, G0->name.ptr);
         return false;
     }
     pulsar_rows_moe w{};
@@ -135,13 +147,14 @@ bool pulsar_moe_routed_rows(const pulsar_moe_rows_call *c) {
     w.n_local = (int)(hi - lo);
     w.n_expert = (int)n_expert;
     w.top_k = (int)c->top_k;
-    w.in_dim = (int)G->dim[0];
+    w.in_dim = (int)G0->dim[0];
     w.mid_dim = (int)D->dim[0];
     w.out_dim = (int)D->dim[1];
     w.prompt = c->prompt;
     w.shared = c->shared;
     w.n_shared = c->n_shared;
-    w.k2_gate_up = exl3_type_k2(G->type);
+    w.k2_gate_up = exl3_type_k2(G0->type);
+    w.act = act;
     w.k2_down = exl3_type_k2(D->type);
     /* one stack's experts [lo, hi) on the device: their base pointer, and their stride / split point
      * (routed_expert_side_layout: EXL3's [trellis | scales], BF16's [out][in] rows) */
@@ -162,10 +175,10 @@ bool pulsar_moe_routed_rows(const pulsar_moe_rows_call *c) {
     if (arm == PULSAR_MOE_ARM_ROWS_BF16) {
         /* L295 F7: the BF16 stacks themselves (pulsar_cuda_bf16_rows.cuh reads [expert][out][in] by stride) */
         uint64_t s = 0, r = 0;
-        w.bf16_gate = stack(G, "routed experts gate", &s, &r);
+        w.bf16_gate = G ? stack(G, "routed experts gate", &s, &r) : NULL;   /* NULL: up-only (RELU2) */
         w.bf16_up = stack(U, "routed experts up", &s, &r);
         w.bf16_down = stack(D, "routed experts down", &s, &r);
-        if (!w.bf16_gate || !w.bf16_up || !w.bf16_down) return false;
+        if ((G && !w.bf16_gate) || !w.bf16_up || !w.bf16_down) return false;
         return pulsar_rows_moe_routed_launch(&w, c->selected, c->weights, c->x_bf16, c->n_rows, c->out, c->ws,
                                              c->ws_bytes, c->nf_flag, c->nf_code, 0) == 0;
     }

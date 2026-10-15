@@ -3243,7 +3243,10 @@ struct pulsar_tessera_proj;   /* src/cuda/mmq/pulsar_tessera.h (L255) */
 struct pulsar_rows_moe_shared; /* src/cuda/pulsar_cuda_qwen.h (task #44) */
 typedef struct {
     const pulsar_model *m;
-    const pulsar_tensor *gate, *up, *down;   ///< up NULL = gate is the fused gate_up stack
+    const pulsar_tensor *gate, *up, *down;   ///< up NULL = gate is the fused gate_up stack; gate NULL = up-only (RELU2)
+    /** L295 F7: the experts' activation, a pulsar_ffn_act (src/cuda/pulsar_cuda_qwen.h): 0 SWIGLU (gate + up);
+     *  RELU2 runs the BF16 arm's up-only stacks (gate NULL) */
+    int act;
     /** L255: the layer's routed experts as Tessera planes instead -- the three kernel-ready stacks the family
      *  built from them (family_qwen.h PULSAR_QWEN_TESS_*), or NULL; then gate / up / down are unread. */
     const struct pulsar_tessera_proj *tessera_gate, *tessera_up, *tessera_down;

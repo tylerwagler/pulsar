@@ -303,14 +303,23 @@ extern "C" int pulsar_rows_moe_routed_launch(const pulsar_rows_moe *w, int32_t *
     /* the routed experts are ONE of: EXL3 fused gate_up + down, EXL3 gate + up pair + down, Tessera (L255), BF16
      * gate / up / down stacks (L295 F7) */
     const bool tessera = w->tessera_gate != nullptr;
-    const bool bf16 = w->bf16_gate != nullptr;
+    const bool bf16 = w->bf16_gate != nullptr || w->bf16_up != nullptr;
     const bool split = w->gate_table != nullptr;
     const bool exl3 = split || w->gate_up_table != nullptr || w->down_table != nullptr;
     if (tessera && bf16) {
         fprintf(stderr, "pulsar: routed MoE (bf16 rows): both Tessera and BF16 stacks -- refusing\n");
         return -1;
     }
-    if (tessera || bf16 ? (tessera ? (!w->tessera_up || !w->tessera_down) : (!w->bf16_up || !w->bf16_down)) || exl3
+    /* L295 F7: a non-gated activation runs only where an arm reads it -- the BF16 arm, up-only (no gate stack) */
+    if (w->act != PULSAR_FFN_ACT_SWIGLU &&
+        (!bf16 || w->act != PULSAR_FFN_ACT_RELU2 || w->bf16_gate != nullptr)) {
+        fprintf(stderr, "pulsar: routed MoE (bf16 rows): activation %d runs on the BF16 arm's up-only stacks alone (the "
+                        "EXL3 and Tessera arms are SwiGLU) -- refusing\n", (int)w->act);
+        return -1;
+    }
+    if (tessera || bf16 ? (tessera ? (!w->tessera_up || !w->tessera_down)
+                                   : (!w->bf16_up || !w->bf16_down ||
+                                      (w->act == PULSAR_FFN_ACT_SWIGLU) != (w->bf16_gate != nullptr))) || exl3
                         : (!w->down_table || split != (w->up_table != nullptr) || split == (w->gate_up_table != nullptr))) {
         fprintf(stderr, "pulsar: routed MoE (bf16 rows): the experts must be ONE of an EXL3 fused gate_up table, an "
                         "EXL3 gate + up pair, a Tessera gate / up / down triple or a BF16 one -- refusing\n");
@@ -350,7 +359,7 @@ extern "C" int pulsar_rows_moe_routed_launch(const pulsar_rows_moe *w, int32_t *
             qwen_ep_localize_kernel<<<(unsigned)((pairs + 255) / 256), 256, 0, stream>>>(sel, (int)pairs, w->ex_lo, nE);
             if (!launch_ok("expert localize")) return -3;
         }
-        const pulsar_bf16_moe bw{w->bf16_gate, w->bf16_up, w->bf16_down, nE, H, mid, H};
+        const pulsar_bf16_moe bw{w->bf16_gate, w->bf16_up, w->bf16_down, nE, H, mid, H, w->act};
         return pulsar_bf16_moe_routed_launch(bw, sel, wts, T, top_k, 0.0f, x_bf16, m.gu_z, m.gu_z + (size_t)pairs * mid,
                                              reinterpret_cast<uint16_t *>(m.mid_x), m.down_z, out, nf_flag, nf_code,
                                              stream) == 0 ? 0 : -1;
