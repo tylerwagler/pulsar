@@ -6,15 +6,14 @@
 // take them.  Admission is weight_format.cpp's (PULSAR_DENSE_ARM_BF16_ROWS; the expert roles at bf16 rows); the
 // launchers are the rows front doors' (pulsar_rows_linear_launch, pulsar_rows_moe_routed_launch).
 //
-//   dense, decode rows (<= PULSAR_BF16_ROWS_DECODE_MAX, not a prompt chunk): the tensor-core ROWS kernel -- a warp
-//       owns 16 weight rows (the MMA's M), the call's rows are its N, bf16 x bf16 products exact in f32, a fresh
-//       16-k fragment added into the row's accumulator in k order.  A row's column reads only its own activation,
-//       so its bytes do not depend on how many rows ride with it (M-independent at 1..16, as the EXL3 and mxfp8
-//       decode arms are).
-//   dense, prompt chunks and wider rows: cuBLASLt with ONE kernel per weight shape, chosen at the canonical prefill
-//       row count, split-K masked out (pulsar_gpu_bf16_rows_gemm, the L183 contract): a prompt row's bytes do not
-//       depend on its chunk.  It agrees with the rows kernel to rounding, not to the bit (a decode row past 16 rows
-//       is a numerics change, graded -- ENGINEERING-RULES 7).
+//   dense, decode rows (not a prompt chunk): the tensor-core ROWS kernel -- a warp owns 16 weight rows (the MMA's
+//       M), up to PULSAR_BF16_ROWS_DECODE_MAX of the call's rows are its N (wider calls run blocks of that many in
+//       turn), bf16 x bf16 products exact in f32, a fresh 16-k fragment added into the row's accumulator in k order.
+//       A row's column reads only its own activation, so its bytes do not depend on how many rows ride with it
+//       (M-independent at every width, as the EXL3 and mxfp8 decode arms are).
+//   dense, prompt chunks: cuBLASLt with ONE kernel per weight shape, chosen at the canonical prefill row count,
+//       split-K masked out (pulsar_gpu_bf16_rows_gemm, the L183 contract): a prompt row's bytes do not depend on its
+//       chunk.  It agrees with the rows kernel to rounding, not to the bit (as the other arms' prompt GEMMs do).
 //   routed (gate + up pair and a down, each [n_expert][out][in] bf16): the same rows kernel over the expert-sorted
 //       schedule (mm_ids_helper), up to 64 of an expert's assignments a work item -- every width and row kind, so a
 //       prompt row and a decode row are the same bytes; the SwiGLU with the route weight folded in, rounded to the
@@ -26,7 +25,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-/** The widest call the M-independent rows kernel takes (decode rows). */
+/** The rows one launch of the M-independent rows kernel takes (wider decode calls run blocks of it). */
 #define PULSAR_BF16_ROWS_DECODE_MAX 16
 
 /** y [rows][out] f32 = W x for a bf16 weight W [out][in] (row-major, the container's [in, out] ne order) and bf16

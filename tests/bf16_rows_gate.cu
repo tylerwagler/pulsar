@@ -6,8 +6,9 @@
  * 2^-18 of its own sum |w x| (the envelope's slack over the tensor cores' fragment sums and the f32 adds).
  *
  *   1. dense, decode rows (the tensor-core rows kernel): Inkling-width shapes 4096 -> 2048 / 2048 -> 4096, an output
- *      width off 16 (4096 -> 1000) and a wide one (1024 -> 201024); M = 16 graded, and M = 1, 5, 9 BIT-IDENTICAL to
- *      the same rows at M = 16 (the decode contract: a row's bytes do not depend on the batch width);
+ *      width off 16 (4096 -> 1000) and a wide one (1024 -> 201024); M = 16 graded, and M = 1, 5, 9 and 40 (16-row
+ *      blocks) BIT-IDENTICAL to the same rows at M = 16 (the decode contract: a row's bytes do not depend on the
+ *      batch width);
  *   2. dense, prompt chunks (cuBLASLt, one fixed-order kernel per shape): M = 40 graded, and the rows of a prompt cut
  *      at 1 / 7 / 33 bit-identical to the M = 40 call's (chunk invariance);
  *   3. the front door: pulsar_rows_linear_launch with a BF16 reference == the arm, bit for bit; refusals (in % 64,
@@ -141,9 +142,18 @@ static void section_dense(void) {
             const std::vector<float> y = run(M, false, 0);
             diff += memcmp(y.data(), y16.data(), y.size() * sizeof(float)) != 0;
         }
+        if (out < 100000) {   /* decode rows past 16 (a wide verify): 16-row blocks, each row a one-row call's bytes */
+            const std::vector<float> y40 = run(MR, false, 0);
+            diff += memcmp(y40.data(), y16.data(), y16.size() * sizeof(float)) != 0;
+            for (int r : {16, 23, MR - 1}) {
+                const std::vector<float> y1 = run(1, false, r);
+                diff += memcmp(y1.data(), y40.data() + (size_t)r * out, (size_t)out * sizeof(float)) != 0;
+            }
+        }
         CHECK(over == 0, "%s decode: %zu outputs past the f32 envelope (worst err / sum|wx| %.2e)", sh.what, over, worst);
-        CHECK(diff == 0, "%s: %zu of 3 decode widths (M = 1, 5, 9) differ from the same rows at M = 16", sh.what, diff);
-        printf("  dense %-22s %5d -> %-6d decode M=16: worst err/sum|wx| %.2e; M=1,5,9 %s\n", sh.what, in, out, worst,
+        CHECK(diff == 0, "%s: %zu decode calls (M = 1, 5, 9; M = 40 in 16-row blocks, and its rows 16, 23, 39 alone) differ "
+              "from the same rows of the M = 16 call", sh.what, diff);
+        printf("  dense %-22s %5d -> %-6d decode M=16: worst err/sum|wx| %.2e; M=1,5,9,40 %s\n", sh.what, in, out, worst,
                diff ? "DIFFER" : "bit-identical to M=16's rows");
         if (out > 100000) {
             cudaFree(dW); cudaFree(dX); cudaFree(dY);

@@ -224,11 +224,11 @@ int pulsar_bf16_rows_linear_launch(const void *w, const uint16_t *x_bf16, int ro
                         "weight, rows and output -- refusing\n", in, out, rows);
         return -1;
     }
-    if (prompt || rows > PULSAR_BF16_ROWS_DECODE_MAX) {
+    if (prompt) {
         static bool announced = false;
         if (!__atomic_exchange_n(&announced, true, __ATOMIC_RELAXED))
-            fprintf(stderr, "pulsar: BF16 linear (bf16 rows), prompt chunks and > %d rows = cuBLASLt, one fixed-order "
-                            "kernel per shape (first: %d -> %d at %d rows)\n", PULSAR_BF16_ROWS_DECODE_MAX, in, out, rows);
+            fprintf(stderr, "pulsar: BF16 linear (bf16 rows), prompt chunks = cuBLASLt, one fixed-order kernel per shape "
+                            "(first: %d -> %d at %d rows)\n", in, out, rows);
         if (!pulsar_gpu_bf16_rows_gemm(y, (const uint16_t *)w, x_bf16, (uint64_t)in, (uint64_t)out, (uint64_t)rows,
                                        stream)) {
             fprintf(stderr, "pulsar: BF16 linear (bf16 rows): the GEMM %d -> %d at %d rows refused -- no fallback\n", in,
@@ -239,14 +239,22 @@ int pulsar_bf16_rows_linear_launch(const void *w, const uint16_t *x_bf16, int ro
     }
     static bool announced = false;
     if (!__atomic_exchange_n(&announced, true, __ATOMIC_RELAXED))
-        fprintf(stderr, "pulsar: BF16 linear (bf16 rows), decode widths = the tensor-core rows kernel, M-independent at "
-                        "1..%d rows (first: %d -> %d at %d rows)\n", PULSAR_BF16_ROWS_DECODE_MAX, in, out, rows);
+        fprintf(stderr, "pulsar: BF16 linear (bf16 rows), decode rows = the tensor-core rows kernel, %d-row blocks, "
+                        "M-independent at every width (first: %d -> %d at %d rows)\n", PULSAR_BF16_ROWS_DECODE_MAX, in,
+                out, rows);
     const dim3 grid((unsigned)((out + kOutPerCta - 1) / kOutPerCta));
     const __nv_bfloat16 *W = static_cast<const __nv_bfloat16 *>(w), *X = reinterpret_cast<const __nv_bfloat16 *>(x_bf16);
-    if (rows > 8)
-        bf16_rows_dense_kernel<2><<<grid, 32 * kWarps, stage_bytes<2>(), stream>>>(W, out, in, X, rows, y);
-    else
-        bf16_rows_dense_kernel<1><<<grid, 32 * kWarps, stage_bytes<1>(), stream>>>(W, out, in, X, rows, y);
+    /* decode rows past the kernel's 16 run 16-row blocks in turn: each block is the call it is alone (as the EXL3 and
+     * mxfp8 decode arms do, L288 C1) */
+    for (int r0 = 0; r0 < rows; r0 += PULSAR_BF16_ROWS_DECODE_MAX) {
+        const int m = rows - r0 < PULSAR_BF16_ROWS_DECODE_MAX ? rows - r0 : PULSAR_BF16_ROWS_DECODE_MAX;
+        if (m > 8)
+            bf16_rows_dense_kernel<2><<<grid, 32 * kWarps, stage_bytes<2>(), stream>>>(W, out, in, X + (size_t)r0 * in, m,
+                                                                                      y + (size_t)r0 * out);
+        else
+            bf16_rows_dense_kernel<1><<<grid, 32 * kWarps, stage_bytes<1>(), stream>>>(W, out, in, X + (size_t)r0 * in, m,
+                                                                                      y + (size_t)r0 * out);
+    }
     return launch_ok("dense") ? 0 : -3;
 }
 
