@@ -1,20 +1,21 @@
-# fmtcmp — Nemotron 3.5 Super VL: NVIDIA's NVFP4 vs our EXL3 K4 / K5, graded against BF16 (L296)
+# fmtcmp — Nemotron 3.5 Super VL: NVIDIA's NVFP4 vs our EXL3, graded against BF16 (L296)
 
 The engine format decision for Nemotron waits on this.  NVIDIA's card shows the NVFP4 checkpoint (Model Optimizer +
 quantization-aware distillation, W4A4 on Blackwell) holding most rows but dropping on agentic ones (Terminal-Bench
 2.1 66.7 -> 60.8, DeepSWE 24.65 -> 18.2, WebVoyager 77.7 -> 66.3, MMLU-ProX 76.9 -> 73.8).  This harness measures
-both formats the same way: teacher-forced next-token distributions against BF16, plus a small agentic eval.
+every format the same way: teacher-forced next-token distributions against BF16 (KL, NLL, top-1), plus speed on
+Sparky.  No agentic eval (Tyler 2026-10-15).
 
 ## Arms
 
-| arm | weights | runs on | logprob capture | agentic |
-|---|---|---|---|---|
-| **BF16** (reference) | `nemotron35-super-vl-bf16`, 249 GB | any 4x 80 GB box (Tyler's H100s or the Vast rental), vLLM TP4, the card's build (Docker or venv) | `r1/run_reference.sh capture` | `r1/run_reference.sh agentic` (card recipe, MTP 3) |
-| **NVFP4** | `nemotron35-super-vl-nvfp4`, 70 GB | Sparky, vLLM, the card's Spark recipe | `sparky_vllm_job.sh capture` | `sparky_vllm_job.sh agentic` (LiLiCorr, card default) |
-| **EXL3 K4 / K5** | quant session's packs (below) | Sparky, exllamav3's own forward | `sparky_exl3_job.sh capture` | `sparky_exl3_job.sh agentic` (`exl3_openai_shim.py`) |
+| arm | weights | runs on | capture |
+|---|---|---|---|
+| **BF16** (reference, R1) | `nemotron35-super-vl-bf16`, 249 GB | any 4-GPU box with >= 79 GB per GPU, vLLM TP4, the card's build (Docker or venv) | `r1/run_reference.sh check / capture / bundle` |
+| **NVFP4** (3 activation modes) | `nemotron35-super-vl-nvfp4`, 70 GB | Sparky, vLLM | `sparky_vllm_job.sh capture` |
+| **EXL3** (K4 size-matched to NVFP4, K5, K8) | the quant session's packs (below) | Sparky, exllamav3's own forward | `sparky_exl3_job.sh` |
 
 vLLM is the pinned card image `vllm/vllm-openai:nightly-3f1bcfd82bb2e93fcd364fc7a5491718453a77e2`
-(`@sha256:cb9bc64f...`, vLLM 0.32.0rc1.dev190+g3f1bcfd82, multi-arch) on both hosts.
+(`@sha256:cb9bc64f...`, vLLM 0.32.0rc1.dev190+g3f1bcfd82, multi-arch), or the same build's wheel in a venv.
 
 ## NVFP4 activation modes (Tyler 2026-10-15: how much of NVFP4's loss is activation quantization, and W4A4's speed)
 
@@ -61,54 +62,41 @@ Capture flags (`vllm_capture.flags`, shared by both vLLM hosts): no speculation,
 chunked prefill 8192, Mamba state dtype at the checkpoint default.  Sparky adds `--load-format fastsafetensors`
 (the default mmap loader thrashes GB10's unified memory: 260 s per shard).
 
-## Agentic eval
-
-tool-eval-bench at the pinned commit `b60e2f0` (v2.8.0 + 1; our tool-eval anchor's instrument, L292), the standard
-69 scenarios, args in `r1/AGENTIC_ARGS` (seed 42, the card's sampling T 1.0 / top-p 0.95), against each arm's
-OpenAI-compatible endpoint.  One seed is a screen, not a grade: the anchor's seed-to-seed spread is 5 points, so a
-verdict needs 4 seeds per arm.
-
 ## EXL3 arms: what the quant session produces
 
-- **Source:** `/mnt/models/nemotron35-super-vl-bf16` — the snapshot the suite was built from
+- **Source:** `/mnt/models/nemotron35-super-vl-bf16`, the snapshot the suite was built from
   (`r1/bf16-identity.sha256` pins config, index, tokenizer, template).
 - **Converter:** our exllamav3 fork with plan 121's Q1 Nemotron-Omni adapter (Omni wrapper config,
-  `layers_block_type` lists, `language_model.` prefix, vision skipped), at a recorded sha.  `CUDA_LAUNCH_BLOCKING=1`
-  (L294's GB10 hang) and `calibration_all_experts`.
-- **Two uniform packs** (L251: uniform beats mixed until a full-model KL says otherwise):
-  - `/mnt/models/nemotron35-exl3/k4` — every quantized Linear at 4 bpw: routed experts, shared expert, Mamba-2
-    in/out projections, attention q/k/v/o, latent fc1/fc2 at exllamav3's latent rate (`latent_hq_bits` default);
-    head 6 bpw; embedding, router (f32 logits) and norms unquantized.  Plan 121: ~60 GiB.
-  - `/mnt/models/nemotron35-exl3/k5` — the same at 5 bpw (head 6).  ~75 GiB.
-  - MTP: include it if the adapter converts it; the grade does not use it.
-- **Calibration** must not include the graded text: not the 48 held-out rows (`l251_row` in the suite manifest), nor
-  the story / code fixtures.  exllamav3's default calibration set is fine.
-- **Each pack directory** also holds `tokenizer.json`, `tokenizer_config.json`, `chat_template.jinja`,
-  `generation_config.json` copied from the source, and a `CONVERT.md` with the fork sha, the exact command, the
-  calibration set and the wall time.
-- **Check before handing over:** `capture_exl3.py --selfcheck --only chat-11` passes on the pack (it loads the pack,
-  runs a cache-less forward and the chunked cached forward over the same 1,024 tokens, and requires them to agree).
+  `layers_block_type` lists, `language_model.` prefix, vision skipped), at a recorded sha.
+- **Packs:** K4 size-matched to NVFP4's ~67 GB, K5, K8 (the quant session's recipes; each pack records its recipe).
+  Each pack directory also holds `tokenizer.json`, `tokenizer_config.json`, `chat_template.jinja`,
+  `generation_config.json` from the source, and a `CONVERT.md` with the fork sha, the command, the calibration set
+  and the wall time.  MTP: optional, the grade does not use it.
+- **Calibration** must not include the graded text: not the 48 held-out rows (`l251_row` in the suite manifest),
+  nor the story / code fixtures.
+- **Check before handing over:** `capture_exl3.py --selfcheck --only chat-11` passes on the pack (cache-less forward
+  vs the chunked cached forward over the same 1,024 tokens must agree).
 
-How the harness runs them (on Sparky, copied to `/srv/models/nemotron35-exl3/k{4,5}` first for load speed):
+How the harness runs them on Sparky (copied to local NVMe first for load speed):
 ```bash
 gpuq submit --class short --timeout 20m --mem 90G --label fmtcmp --wait -- \
-  ~/fmtcmp/tools/sparky_exl3_job.sh capture /srv/models/nemotron35-exl3/k4 ~/fmtcmp/caps/exl3-k4   # repeat until done
-gpuq submit --class short --timeout 20m --mem 90G --label fmtcmp --wait -- \
-  ~/fmtcmp/tools/sparky_exl3_job.sh agentic /srv/models/nemotron35-exl3/k4 ~/fmtcmp/teb-k4 -- $(cat r1/AGENTIC_ARGS)
+  ~/fmtcmp/repo/tools/fmtcmp/sparky_exl3_job.sh /srv/models/nemotron35-exl3/k4 ~/fmtcmp/caps/exl3-k4   # until done
 python3 grade.py --suite /mnt/models/fmtcmp/suite-v1 --ref /mnt/models/fmtcmp/r1/caps/bf16 \
-  nvfp4=~/fmtcmp/caps/nvfp4 k4=~/fmtcmp/caps/exl3-k4 k5=~/fmtcmp/caps/exl3-k5
+  nvfp4=~/fmtcmp/caps/nvfp4 nvfp4-w4a16=~/fmtcmp/caps/nvfp4-w4a16 nvfp4-a16=~/fmtcmp/caps/nvfp4-a16 \
+  k4=~/fmtcmp/caps/exl3-k4 k5=~/fmtcmp/caps/exl3-k5 k8=~/fmtcmp/caps/exl3-k8
 ```
+EXL3 speed (prefill at 4k / 32k, decode at 1 / 4 streams) is measured with exllamav3 on the same prompts; it is
+exllamav3's speed, not the speed pulsar would reach.
 
 ## Files
 
 | file | what |
 |---|---|
 | `build_suite.py` | builds the frozen suite (Sparky, CPU) |
-| `vllm_capture.flags` | the capture server flags, one authority for both vLLM hosts |
-| `vllm_agentic_spark.flags` | NVIDIA's Spark serving recipe (card Quick Start) |
-| `sparky_vllm_job.sh` | one gpuq job: pinned vLLM container + capture or agentic client, inside an 18-min budget |
+| `vllm_capture.flags` | the capture server flags, one authority for every vLLM host |
+| `sparky_vllm_job.sh` | one gpuq job: pinned vLLM container, `speed.py`, then the capture, inside an 18-min budget |
+| `speed.py` | prefill / decode speed against an OpenAI completions endpoint |
 | `capture_exl3.py` | EXL3 capture through exllamav3 (chunked, recurrent state carried), `--selfcheck` |
-| `exl3_openai_shim.py` | OpenAI chat-completions over exllamav3 for the EXL3 agentic arm |
 | `sparky_exl3_job.sh` | one gpuq job for an EXL3 arm |
 | `grade.py` | the grade (KL / NLL / top-1, CIs, ratios) |
-| `r1/` | the R1 hand-off kit: `RUNBOOK.md`, `run_reference.sh`, `pack_kit.sh`, the 4-GPU agentic flags |
+| `r1/` | the R1 hand-off kit: `RUNBOOK.md`, `run_reference.sh`, `pack_kit.sh`, `one_doc_suite.py` |

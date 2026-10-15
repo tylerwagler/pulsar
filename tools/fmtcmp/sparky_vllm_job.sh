@@ -4,17 +4,14 @@
 #
 #   gpuq submit --class short --timeout 20m --mem 96G --label fmtcmp --wait -- \
 #       ~/fmtcmp/tools/sparky_vllm_job.sh capture   ~/fmtcmp/caps/nvfp4      [BUDGET_S]
-#   gpuq submit ... -- ~/fmtcmp/tools/sparky_vllm_job.sh agentic ~/fmtcmp/teb [BUDGET_S] -- <tool-eval-bench args>
 #
-# capture: tools/fidelity/capture_vllm_prompt_logprobs.py over the frozen suite (resumable per document: run the
-#          same job again until it prints "done"); flags from vllm_capture.flags.
-# agentic: tool-eval-bench (pinned b60e2f0) against the card's Spark server (vllm_agentic_spark.flags; SPEC=lilicorr
-#          default, SPEC=none to serve without the drafter); pass --resume RUN_ID to continue a run.
+# capture: speed.py (once per output dir), then tools/fidelity/capture_vllm_prompt_logprobs.py over the frozen suite
+#          (resumable per document: run the same job again until it prints "done"); flags from vllm_capture.flags.
 # The whole job, server start included, stays under BUDGET_S (default 1080 s = 18 min) so gpuq's 20-min timeout never
 # has to kill it; the EXIT/TERM trap removes the container either way.  Never port 8000; no scratch in /tmp.
 set -euo pipefail
 
-MODE=${1:?mode: capture|agentic}
+MODE=${1:?mode: capture}
 OUT=${2:?output dir}
 BUDGET=${3:-1080}
 shift 3 || shift $#
@@ -23,10 +20,8 @@ shift 3 || shift $#
 HERE=$(cd "$(dirname "$0")" && pwd)
 IMAGE=${IMAGE:-vllm/vllm-openai@sha256:cb9bc64f0f038c2c2ebf13b31248fb87aca40c356c3d20f363be087cfcff1fcd}  # nightly-3f1bcfd82 (card pin), arm64
 MODEL=${MODEL:-/srv/models/nemotron35-super-vl-nvfp4}       # local NVMe copy of /mnt/models/nemotron35-super-vl-nvfp4
-DRAFT=${DRAFT:-/mnt/models/nemotron35-super-lilicorr}
 SUITE=${SUITE:-/mnt/models/fmtcmp/suite-v1}
 PORT=${PORT:-8300}
-SPEC=${SPEC:-lilicorr}
 GPU_UTIL=${GPU_UTIL:-0.75}
 # GB10 is unified memory: the default mmap loader keeps the 70 GB checkpoint in page cache WHILE the weights fill
 # the GPU allocation, and the load thrashes (measured 2026-10-15: 260 s per shard, 88 shards).  fastsafetensors
@@ -56,12 +51,6 @@ if [ "$MODE" = capture ]; then
   # --max-num-seqs 4 overrides the file's 1 (argparse: last wins) so speed.py can run 4 streams; scheduling only,
   # the capture sends one request at a time.
   ARGS+=(--gpu-memory-utilization "$GPU_UTIL" --max-num-seqs 4)
-elif [ "$MODE" = agentic ]; then
-  flags_from "$HERE/vllm_agentic_spark.flags"
-  if [ "$SPEC" = lilicorr ]; then
-    ARGS+=(--speculative_config.model "$DRAFT" --speculative_config.num_speculative_tokens 7
-           --speculative_config.method dflash)
-  elif [ "$SPEC" != none ]; then echo "SPEC must be lilicorr or none"; exit 2; fi
 else
   echo "unknown mode $MODE"; exit 2
 fi
@@ -73,7 +62,7 @@ echo "[fmtcmp] extra args: ${EXTRA_ARGS:-none}" | tee "$OUT/extra-args.txt"
 DENV=()
 for kv in ${DOCKER_ENV:-}; do DENV+=(-e "$kv"); done
 echo "[fmtcmp] env: ${DOCKER_ENV:-none}" | tee "$OUT/docker-env.txt"
-echo "[fmtcmp] $(date -Is) $MODE image=$IMAGE model=$MODEL port=$PORT budget=${BUDGET}s spec=$SPEC"
+echo "[fmtcmp] $(date -Is) $MODE image=$IMAGE model=$MODEL port=$PORT budget=${BUDGET}s"
 echo "[fmtcmp] vllm serve ${ARGS[*]}"
 docker run -d --name "$NAME" --gpus all --ipc=host --network host \
   -v /srv/models:/srv/models:ro -v /mnt/models:/mnt/models:ro \
@@ -108,10 +97,6 @@ if [ "$MODE" = capture ]; then
   timeout --signal=TERM "$LEFT" python3 "$HERE/../fidelity/capture_vllm_prompt_logprobs.py" \
     --endpoint "http://127.0.0.1:$PORT" --suite "$SUITE" --tokens-dir "$SUITE/tokens" \
     --topk 64 --out "$OUT" || rc=$?
-else
-  mkdir -p "$OUT" && cd "$OUT"
-  timeout --signal=INT "$LEFT" ~/fmtcmp/venv-teb/bin/tool-eval-bench run \
-    --base-url "http://127.0.0.1:$PORT" --backend vllm --no-live "$@" || rc=$?
 fi
 echo "[fmtcmp] client rc=$rc after $(( $(date +%s) - T0 ))s (124 = budget reached; rerun to resume)"
 grep -E "throughput" "$LOG" | tail -3 || true

@@ -6,7 +6,7 @@
 - prefill: a 4,096- and a 32,768-token prompt (the suite's story ids, then code ids, cut), max_tokens 1, streamed;
   prefill tok/s = prompt tokens / time to the first token.  One warm-up request first, each length measured
   --reps times, and the cache-busting first token differs per request (the capture flags disable prefix caching
-  anyway; the agentic recipe does not, hence the distinct first token).
+  already; the distinct first token keeps the numbers honest on a server that caches).
 - decode: --gen tokens with ignore_eos at temperature 0 after a 512-token prompt, streamed;
   decode tok/s = (tokens - 1) / (last token time - first token time).  1 stream, then --streams concurrent
   streams (aggregate and per stream).
