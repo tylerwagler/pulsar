@@ -180,12 +180,15 @@ __global__ void bf16_moe_plan_kernel(const int32_t *__restrict__ bounds, int E, 
  * the schedule: its row is not written and nothing reads it. */
 __global__ void __launch_bounds__(256)
 bf16_moe_fold_kernel(const float *__restrict__ g, const float *__restrict__ u, const int32_t *__restrict__ sel,
-                     const float *__restrict__ wts, float clamp, int64_t pairs, int mid, __nv_bfloat16 *__restrict__ h) {
+                     const float *__restrict__ wts, float clamp, int act, int64_t pairs, int mid,
+                     __nv_bfloat16 *__restrict__ h) {
     const int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= pairs * mid) return;
     const int64_t p = i / mid;
     if (sel[p] < 0) return;
-    h[i] = __float2bfloat16(pulsar_swiglu_elem(g[i], u[i], wts[p], clamp));
+    /* L296 N4: the up-only experts' relu^2 (pulsar_relu2_elem), the route weight folded at the same point */
+    h[i] = __float2bfloat16(act == PULSAR_EXPERT_ACT_RELU2 ? pulsar_relu2_elem(u[i], wts[p])
+                                                           : pulsar_swiglu_elem(g[i], u[i], wts[p], clamp));
 }
 
 /* The sum: out[t][o] = the row's scheduled slots' down outputs, slots in order; a non-finite sum records nf_code. */
@@ -262,12 +265,14 @@ int pulsar_bf16_moe_routed_launch(const pulsar_bf16_moe &w, const int32_t *sel, 
                                   float clamp, const uint16_t *x_bf16, float *gate_z, float *up_z, uint16_t *mid,
                                   float *down_z, float *out, uint32_t *nf_flag, uint32_t nf_code, cudaStream_t stream) {
     const char *tag = "pulsar: routed MoE (bf16 rows, BF16 experts)";
-    if (!w.gate || !w.up || !w.down || !sel || !wts || !x_bf16 || !gate_z || !up_z || !mid || !down_z || !out ||
+    const bool relu2 = w.act == PULSAR_EXPERT_ACT_RELU2;
+    if ((relu2 ? w.gate != nullptr : (w.act != PULSAR_EXPERT_ACT_SWIGLU || !w.gate)) || !w.up || !w.down || !sel || !wts || !x_bf16 || !gate_z || !up_z || !mid || !down_z || !out ||
         !nf_flag || T <= 0 || top_k <= 0 || w.n_experts <= 0 || w.n_experts > kMaxE || w.in_dim <= 0 ||
-        w.mid_dim <= 0 || w.out_dim <= 0 || w.in_dim % 64 || w.mid_dim % 64 || !aligned16(w.gate) ||
+        w.mid_dim <= 0 || w.out_dim <= 0 || w.in_dim % 64 || w.mid_dim % 64 || (!relu2 && !aligned16(w.gate)) ||
         !aligned16(w.up) || !aligned16(w.down) || !aligned16(x_bf16) || !aligned16(mid)) {
-        fprintf(stderr, "%s: the three stacks, every buffer, %d -> %d -> %d (in and mid %% 64), 1..%d experts and "
-                        "16-byte alignment -- refusing\n", tag, w.in_dim, w.mid_dim, w.out_dim, kMaxE);
+        fprintf(stderr, "%s: activation %d with its stacks (SwiGLU: gate + up + down; relu^2: up + down, no gate), every "
+                        "buffer, %d -> %d -> %d (in and mid %% 64), 1..%d experts and 16-byte alignment -- refusing\n",
+                tag, (int)w.act, w.in_dim, w.mid_dim, w.out_dim, kMaxE);
         return -1;
     }
 #ifndef PULSAR_HAVE_MMQ
@@ -295,8 +300,9 @@ int pulsar_bf16_moe_routed_launch(const pulsar_bf16_moe &w, const int32_t *sel, 
     static bool announced = false;
     if (!__atomic_exchange_n(&announced, true, __ATOMIC_RELAXED))
         fprintf(stderr, "%s = the tensor-core rows kernel over the expert-sorted schedule (%d assignments a work item), "
-                        "gate + up in one launch, bf16 SwiGLU rows, down, slot-ordered sum (%d -> %d -> %d, top-%d of "
-                        "%d)\n", tag, 8 * kRoutedNT, w.in_dim, w.mid_dim, w.out_dim, top_k, E);
+                        "%s, down, slot-ordered sum (%d -> %d -> %d, top-%d of %d)\n", tag, 8 * kRoutedNT,
+                relu2 ? "up, bf16 relu^2 rows" : "gate + up in one launch, bf16 SwiGLU rows", w.in_dim, w.mid_dim,
+                w.out_dim, top_k, E);
     const uint64_t ids_b = (uint64_t)pairs * sizeof(int32_t), eb_b = (uint64_t)(E + 1) * sizeof(int32_t);
     const uint64_t work_b = (uint64_t)cap * sizeof(int4);
     cuda_arena ar;
@@ -315,15 +321,21 @@ int pulsar_bf16_moe_routed_launch(const pulsar_bf16_moe &w, const int32_t *sel, 
     const __nv_bfloat16 *X = reinterpret_cast<const __nv_bfloat16 *>(x_bf16);
     const int H = w.in_dim, M = w.mid_dim, O = w.out_dim;
     const size_t smem = stage_bytes<kRoutedNT>();
-    /* gate and up: the source row is the token, the destination the pair */
-    bf16_rows_routed_kernel<<<dim3((unsigned)((M + kOutPerCta - 1) / kOutPerCta), (unsigned)cap, 2), 32 * kWarps, smem,
-                              stream>>>(routed_proj{static_cast<const __nv_bfloat16 *>(w.gate), gate_z},
-                                        routed_proj{static_cast<const __nv_bfloat16 *>(w.up), up_z}, M, H, X, ids_src,
-                                        ids_dst, work, n_work);
+    /* gate and up (up alone under relu^2: projection 0 of a one-deep grid): the source row is the token, the
+     * destination the pair */
+    const routed_proj up_p{static_cast<const __nv_bfloat16 *>(w.up), up_z};
+    if (relu2)
+        bf16_rows_routed_kernel<<<dim3((unsigned)((M + kOutPerCta - 1) / kOutPerCta), (unsigned)cap, 1), 32 * kWarps,
+                                  smem, stream>>>(up_p, routed_proj{nullptr, nullptr}, M, H, X, ids_src, ids_dst, work,
+                                                  n_work);
+    else
+        bf16_rows_routed_kernel<<<dim3((unsigned)((M + kOutPerCta - 1) / kOutPerCta), (unsigned)cap, 2), 32 * kWarps,
+                                  smem, stream>>>(routed_proj{static_cast<const __nv_bfloat16 *>(w.gate), gate_z}, up_p,
+                                                  M, H, X, ids_src, ids_dst, work, n_work);
     if (!launch_ok("gate / up")) return -3;
     const int64_t nm = pairs * M;
-    bf16_moe_fold_kernel<<<(unsigned)((nm + 255) / 256), 256, 0, stream>>>(gate_z, up_z, sel, wts, clamp, pairs, M,
-                                                                          reinterpret_cast<__nv_bfloat16 *>(mid));
+    bf16_moe_fold_kernel<<<(unsigned)((nm + 255) / 256), 256, 0, stream>>>(gate_z, up_z, sel, wts, clamp, (int)w.act,
+                                                                          pairs, M, reinterpret_cast<__nv_bfloat16 *>(mid));
     if (!launch_ok("fold")) return -3;
     /* the down: its source row is the pair (the fold wrote one row per pair) */
     bf16_rows_routed_kernel<<<dim3((unsigned)((O + kOutPerCta - 1) / kOutPerCta), (unsigned)cap, 1), 32 * kWarps, smem,

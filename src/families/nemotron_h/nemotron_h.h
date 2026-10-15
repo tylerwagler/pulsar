@@ -16,9 +16,11 @@
  * WHAT IS HERE (N1): the shape (the container's nemotron_h.* keys, every geometry field pinned to the profile, every
  * switch pinned to the value the blocks implement, every training-only key named as such, any unknown key refused),
  * the layer plan, the role-driven binding of every tensor with its format admitted through the core's front doors,
- * the byte census, and the tokenizer + chat front (N8, nemotron_h_tokenizer.cpp).  The forward is NOT here: the
- * Mamba-2 block (N2), the state declaration (N3), the latent relu^2 MoE (N4) and the driver ops (N7) are not built,
- * so a session refuses by name (nemotron_h_family.cpp).
+ * the byte census, and the tokenizer + chat front (N8, nemotron_h_tokenizer.cpp).  THE FORWARD (N3-N7,
+ * nemotron_h_forward.cpp): the family's ops on the core row-step driver -- block[PULSAR_LAYER_BLOCKS] composes each
+ * layer from its pulsar_layer_desc over shared blocks (the Mamba-2 block N2, F1 attention, F2's router with the
+ * 512 / 22 instance, the rows MoE front door's latent wrapper and relu^2 option N4, E5's head), and the declared
+ * state (N3: SSM FIXED / DELTA, conv FIXED / SNAPSHOT, attention KV POOL; the drafter slot's KV POOL).
  *
  * FORMAT-NEUTRAL: every linear (Mamba in / out, attention, the latent projections, the shared expert, the drafter's
  * eh_proj, the head) is admitted through the format registry at bf16 rows -- BF16 today, an EXL3 dense-arm rate or
@@ -145,6 +147,8 @@ typedef struct {
     pulsar_nemotron_h_draft mtp;
     /** What the binding priced (role_bind.h): every byte the core stages, by role. */
     pulsar_role_census census;
+    /** The digest a session's disk segments are keyed by: the directory's names, types and sizes (FNV-1a). */
+    uint64_t artifact_digest;
     /** The tokenizer (nemotron_h_tokenizer.cpp): F5's shared BPE engine in its HF configuration (the "tekken"
      *  pre-tokenizer, ignore_merges), loaded at open from tokenizer.json + generation_config.json beside the
      *  container's shards; the chat front is src/lib/nemotron_chat (the engine's table here, the server's family
@@ -166,5 +170,24 @@ static inline const pulsar_nemotron_h_model *pulsar_nemotron_h_of(const pulsar_e
                ? (const pulsar_nemotron_h_model *)e->family_state
                : NULL;
 }
+
+/* ---- 3. The forward on the core row-step driver (nemotron_h_forward.cpp) -------------------------------------- */
+
+/** The ids of the family's state declarations (state_kinds.h kinds), in the plan's table order.  A Mamba-2 layer
+ *  carries SSM + CONV, an attention layer KV; the drafter's slot (after the trunk's, when the container holds the MTP
+ *  module) KV. */
+enum {
+    PULSAR_NEMOTRON_H_STATE_SSM = 0,   ///< FIXED, DELTA: the selective-scan state f32 [heads][head_dim][d_state]
+    PULSAR_NEMOTRON_H_STATE_CONV,      ///< FIXED, SNAPSHOT: the x | B | C convolution's tail bf16 [conv_k - 1][channels]
+    PULSAR_NEMOTRON_H_STATE_KV,        ///< POOL, one token a row: an attention layer's K | V rows (F1's BF16 rows)
+    PULSAR_NEMOTRON_H_STATE_COUNT
+};
+
+/** Build the family's state declaration into e->state_plan (the load, after the plan and the bind). */
+void pulsar_nemotron_h_state_plan(pulsar_engine *e);
+
+/** The family's ops on the core row-step driver (step_driver.h): block[PULSAR_LAYER_BLOCKS] composes each layer
+ *  from its pulsar_layer_desc. */
+extern const pulsar_driver_ops PULSAR_NEMOTRON_H_DRIVER;
 
 #endif /* PULSAR_FAMILY_NEMOTRON_H_H */

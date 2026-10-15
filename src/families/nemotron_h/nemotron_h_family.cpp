@@ -1,5 +1,5 @@
-/* nemotron_h_family.cpp -- the Nemotron-H family's descriptor (family.h): load, the engine facts, and the session
- * entries, which refuse by name until the forward is wired (nemotron_h.h). */
+/* nemotron_h_family.cpp -- the Nemotron-H family's descriptor (family.h): load, the engine facts, and the session --
+ * the core row-step driver over the family's blocks (nemotron_h_forward.cpp) and its declared state (state_kinds.h). */
 #include "nemotron_h.h"
 #include "engine/exl3_trellis.h"
 #include "lib/bpe_tokenizer.h"
@@ -7,15 +7,6 @@
 namespace {
 
 const char *const ARCH = PULSAR_NEMOTRON_H_ARCH;
-
-/* What a session needs that is not built yet, named once for every entry that refuses for it (plan 121 section 5):
- * the Mamba-2 block (N2), the state declaration (N3: SSM FIXED / DELTA, conv FIXED / SNAPSHOT, attention KV POOL),
- * the latent relu^2 MoE and the router's 512 / 22 instance (N4), and the driver ops composing them (N7).
- * pulsar_family::driver stays NULL until then. */
-const char *const NOT_WIRED =
-    "forward not yet wired: Nemotron-H's driver blocks (pulsar_family::driver -- block[PULSAR_LAYER_BLOCKS] over the "
-    "Mamba-2 block N2, F1 attention, the latent relu^2 MoE N4 on the core row-step driver, N7) and its state "
-    "declaration (N3: F3 kinds)";
 
 void unload(pulsar_engine *e) {
     if (e->family_state) bpe_tokenizer_free(((pulsar_nemotron_h_model *)e->family_state)->tok);
@@ -59,6 +50,22 @@ bool load(pulsar_engine *e, const pulsar_engine_options *opt) {
     }
     /* stage 4: the tokenizer beside the shards */
     if (!pulsar_nemotron_h_load_tokenizer(w, opt->model_path)) return false;
+    /* the session's declared state (N3, F3) and the digest its disk segments are keyed by: the directory's names,
+     * types and sizes */
+    pulsar_nemotron_h_state_plan(e);
+    {
+        uint64_t h = 1469598103934665603ull;
+        auto mix = [&h](const void *p, size_t n) {
+            for (size_t i = 0; i < n; i++) { h ^= ((const uint8_t *)p)[i]; h *= 1099511628211ull; }
+        };
+        for (uint64_t i = 0; i < e->model.n_tensors; i++) {
+            const pulsar_tensor *t = &e->model.tensors[i];
+            mix(t->name.ptr, t->name.len);
+            mix(&t->type, sizeof(t->type));
+            mix(&t->bytes, sizeof(t->bytes));
+        }
+        w->artifact_digest = h;
+    }
     const pulsar_nemotron_h_shape *s = &w->shape;
     uint32_t n_mamba = 0, n_moe = 0;
     for (uint32_t il = 0; il < e->plan.n_layer; il++) {
@@ -72,8 +79,18 @@ bool load(pulsar_engine *e, const pulsar_engine_options *opt) {
     return true;
 }
 
-bool after_gpu(pulsar_engine *) {
-    fprintf(stderr, "pulsar: %s: %s -- every session refuses\n", ARCH, NOT_WIRED);
+/* The lane, announced once at open (rule 5): the core driver over the family's blocks, and what its table lacks for
+ * the plan (a session refuses with exactly that). */
+bool after_gpu(pulsar_engine *e) {
+    uint32_t at = 0;
+    const char *miss = pulsar_driver_first_missing(e->family->driver, &e->plan, &at);
+    const pulsar_state_plan *sp = &e->state_plan;
+    fprintf(stderr, "pulsar: %s: the core step driver over %u layers of shared blocks (N2 Mamba-2, F1 GQA, F2 router "
+                    "512 / 22 + the rows MoE's latent relu^2 experts, E5 head); state: ssm FIXED DELTA + ssm_conv FIXED "
+                    "SNAPSHOT + kv POOL%s%s%s\n", ARCH,
+            pulsar_layer_plan_count(&e->plan, PULSAR_LAYER_BLOCKS),
+            sp->n_slots > sp->n_trunk ? " (+ the drafter slot's kv POOL)" : "", miss ? "; MISSING " : "",
+            miss ? miss : "");
     return true;
 }
 
@@ -104,40 +121,10 @@ int quant_bits(pulsar_engine *e) {
     return bits;
 }
 
-/* ---- the session: refused by name until the driver blocks -------------------------------------------------------- */
+/* ---- the session: the core row-step driver (step_driver.cpp) over the family's ops (nemotron_h_forward.cpp) ----- */
 
-int session_create(pulsar_session *, uint32_t) {
-    fprintf(stderr, "pulsar: %s: %s -- refusing the session\n", ARCH, NOT_WIRED);
-    return 1;
-}
-/* create refuses, so no session of this family exists to destroy, sync or step; the step entries say why anyway */
-int step_refused(char *err, size_t errlen) {
-    if (err) snprintf(err, errlen, "%s: %s", ARCH, NOT_WIRED);
-    return -1;
-}
-int eval_row(pulsar_session *, int, char *err, size_t errlen) { return step_refused(err, errlen); }
-int decode_multiseq(pulsar_session *, const pulsar_multiseq_req *, uint32_t, float *, int, char *err, size_t errlen) {
-    return step_refused(err, errlen);
-}
-int decode_mixed(pulsar_session *, const pulsar_multiseq_req *, uint32_t, float *, int, uint32_t *, uint32_t, char *err,
-                 size_t errlen) {
-    return step_refused(err, errlen);
-}
-
-const pulsar_family_session_ops k_session_ops = {
-    /* .create          = */ session_create,
-    /* .destroy         = */ NULL,   /* no session is ever built (create refuses) */
-    /* .sync            = */ NULL,   /* N3 / N7: the state kinds and the driver's prefill chunk */
-    /* .eval_row        = */ eval_row,
-    /* .decode_multiseq = */ decode_multiseq,
-    /* .decode_mixed    = */ decode_mixed,
-    /* .invalidate      = */ NULL,
-    /* .decode_fused    = */ NULL,
-    /* .fused_heads_max = */ 0,
-};
-
-/* The bank pool: every hook takes a session, and none can exist (create refuses); the family declares no CAP_BANKS. */
-const pulsar_family_bank_ops k_bank_ops = {};
+const pulsar_sync_ops k_sync = PULSAR_DRIVER_SYNC_OPS(PULSAR_NEMOTRON_H_ARCH);
+const pulsar_family_session_ops k_session_ops = PULSAR_DRIVER_SESSION_OPS(&k_sync);
 
 }  // namespace
 
@@ -145,8 +132,10 @@ const pulsar_family PULSAR_FAMILY_NEMOTRON_H = {
     /* .id           = */ PULSAR_FAMILY_ID_NEMOTRON_H,
     /* .arch         = */ PULSAR_NEMOTRON_H_ARCH,
     /* .name         = */ "Nemotron-H",
-    /* .caps         = */ PULSAR_FAMILY_CAP_CHAT,   /* the tokenizer + chat front (N8); the forward (N7), SPEC (N9), TP
-                                                     * (N12), VISION (N11) next */
+    /* .caps         = */ PULSAR_FAMILY_CAP_CHAT | PULSAR_FAMILY_CAP_BANKS | PULSAR_FAMILY_CAP_SEGMENTS |
+                          PULSAR_FAMILY_CAP_PAYLOAD,
+                          /* the tokenizer + chat front (N8); the driver's session ops over the declared state (N3,
+                           * N7); then SPEC (N9), TP (N12), VISION (N11) */
     /* .load         = */ load,
     /* .after_gpu    = */ after_gpu,
     /* .logits_width = */ logits_width,
@@ -164,8 +153,8 @@ const pulsar_family PULSAR_FAMILY_NEMOTRON_H = {
     /* .tp_slices    = */ NULL,
     /* .act_kind     = */ PULSAR_ACT_KIND_ROWS,
     /* .vision       = */ NULL,   /* N11: the RADIO tower; v1 containers hold none */
-    /* .banks        = */ &k_bank_ops,
+    /* .banks        = */ &PULSAR_BANK_OPS_DECLARED,   /* state_kinds.cpp over the declared state */
     /* .imatrix      = */ NULL,
-    /* .driver       = */ NULL,   /* its blocks on the core driver are not written yet (NOT_WIRED) */
+    /* .driver       = */ &PULSAR_NEMOTRON_H_DRIVER,   /* nemotron_h_forward.cpp */
     /* .unload       = */ unload,
 };

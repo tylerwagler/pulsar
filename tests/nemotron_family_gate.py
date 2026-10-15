@@ -5,7 +5,7 @@
 
 1. The REAL container: tests/nemotron_family_gate opens it inspect-only and checks every claim of the load (the plan,
    every tensor bound by its bind record, every byte priced, the slots, the facts, the tokenizer and chat front, the
-   session refusals).
+   session side as declared: the driver's table, the state declaration, the caps).
 2. Its HEADER CLONE (tests/loader_contract.py's: the headers and metadata, the data region a hole): the same probe.
 3. Each Nemotron-H MUTANT of the clone must be REFUSED BY NAME, the open returning (tests/loader_open): a missing
    tensor, a wrong shape, an unknown switch, a flipped switch, a geometry the profile does not have, a block-kind list

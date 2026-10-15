@@ -19,6 +19,13 @@
  *      bit; every token's output at T = 16 (decode) and T = 40 (a prompt chunk) BIT-IDENTICAL to the token alone
  *      (T = 1); a NaN in a row raises the non-finite flag; the front door (pulsar_rows_moe_routed_launch with BF16
  *      stacks) == the arm; refusals (BF16 with Tessera, BF16 with a riding shared expert);
+ *   4b. (L296 N4) the same for UP-ONLY relu^2 experts (pulsar_expert_act RELU2, no gate stack) at Nemotron-H's latent
+ *      expert shape 1024 -> 2688 -> 1024, 64 experts, top-22: up z graded, the mid within one bf16 ulp of
+ *      relu(u)^2 x w of the device's own z, down, the slot-ordered sum, token invariance, the front door == the arm,
+ *      a NaN row's flag; refusals (a gate stack beside RELU2, RELU2 against an EXL3 table, an unknown activation);
+ *   4c. (L296 N4) the non-gated shared expert through pulsar_rows_moe_shared_launch (BF16 4096 -> 5376 -> 4096,
+ *      RELU2): up graded, the bf16 relu^2 rows within one ulp, the down graded on them, out == the routed sum + the
+ *      expert's f32 output bit for bit, every row at T = 16 == the row alone;
  *   5. timing (information): the 4096 -> 201024 BF16 head at 1 / 4 / 16 rows.
  *
  * usage: ./tests/bf16_rows_gate
@@ -192,6 +199,7 @@ static void section_dense(void) {
 
 struct moe_fix {
     int E, H, mid, k;
+    pulsar_expert_act act = PULSAR_EXPERT_ACT_SWIGLU;   ///< RELU2: no gate stack (G empty, dG NULL)
     std::vector<uint16_t> G, U, D;
     uint16_t *dG = nullptr, *dU = nullptr, *dD = nullptr;
 };
@@ -224,17 +232,17 @@ static moe_run run_moe(const moe_fix &f, const std::vector<uint16_t> &X, const s
         CUDA_OK(cudaMalloc((void **)&duz, P * M * 4));
         CUDA_OK(cudaMalloc((void **)&ddz, P * H * 4));
         CUDA_OK(cudaMalloc((void **)&dmid, P * M * 2));
-        const pulsar_bf16_moe w{f.dG, f.dU, f.dD, f.E, H, M, H};
+        const pulsar_bf16_moe w{f.dG, f.dU, f.dD, f.E, H, M, H, f.act};
         const int rc = pulsar_bf16_moe_routed_launch(w, dS, dWt, T, k, 0.0f, dX, dgz, duz, dmid, ddz, dO, dnf, 7u, 0);
         CHECK(rc == 0, "routed T=%d: the arm refused (rc=%d)", T, rc);
-        r.gz = download(dgz, P * M);
+        if (f.act == PULSAR_EXPERT_ACT_SWIGLU) r.gz = download(dgz, P * M);
         r.uz = download(duz, P * M);
         r.dz = download(ddz, P * H);
         r.mid = download(dmid, P * M);
         cudaFree(dgz); cudaFree(duz); cudaFree(ddz); cudaFree(dmid);
     } else {
         pulsar_rows_moe w{};
-        w.bf16_gate = f.dG; w.bf16_up = f.dU; w.bf16_down = f.dD;
+        w.bf16_gate = f.dG; w.bf16_up = f.dU; w.bf16_down = f.dD; w.act = f.act;
         w.n_expert = f.E; w.top_k = k; w.in_dim = H; w.mid_dim = M; w.out_dim = H; w.ex_lo = 0; w.n_local = f.E;
         const size_t wsb = pulsar_rows_moe_routed_workspace_bytes(T, k, M, H);
         void *dws = nullptr;
@@ -250,13 +258,17 @@ static moe_run run_moe(const moe_fix &f, const std::vector<uint16_t> &X, const s
     return r;
 }
 
-static void section_routed(void) {
+static void section_routed(pulsar_expert_act act) {
+    const bool relu2 = act == PULSAR_EXPERT_ACT_RELU2;
+    const char *an = relu2 ? "relu^2 (up-only)" : "SwiGLU";
     moe_fix f;
-    f.E = 16; f.H = 4096; f.mid = 2048; f.k = 6;
-    f.G = rnd_bf16((size_t)f.E * f.mid * f.H, 0.02, f.H);
+    f.act = act;
+    if (relu2) { f.E = 64; f.H = 1024; f.mid = 2688; f.k = 22; }   /* Nemotron-H's latent experts, fewer of them */
+    else { f.E = 16; f.H = 4096; f.mid = 2048; f.k = 6; }          /* Inkling's */
+    if (!relu2) f.G = rnd_bf16((size_t)f.E * f.mid * f.H, 0.02, f.H);
     f.U = rnd_bf16((size_t)f.E * f.mid * f.H, 0.02, f.H);
     f.D = rnd_bf16((size_t)f.E * f.H * f.mid, 0.02, f.mid);
-    f.dG = upload(f.G); f.dU = upload(f.U); f.dD = upload(f.D);
+    f.dG = relu2 ? nullptr : upload(f.G); f.dU = upload(f.U); f.dD = upload(f.D);
     const int T = 40, k = f.k, H = f.H, M = f.mid;
     const std::vector<uint16_t> X = rnd_bf16((size_t)T * H, 1.0, H);
     std::vector<int32_t> sel((size_t)T * k);
@@ -285,15 +297,22 @@ static void section_routed(void) {
             if (e < 0) continue;
             pairs++;
             double w = 0;
-            for (int pr = 0; pr < 2; pr++) {   /* gate, up */
+            for (int pr = relu2 ? 1 : 0; pr < 2; pr++) {   /* gate (SwiGLU only), up */
                 const std::vector<uint16_t> &S = pr ? f.U : f.G;
                 ref_linear(S.data() + (size_t)e * M * H, X.data(), t, t + 1, H, M, y, env);
                 zover += over_env((pr ? r.uz : r.gz).data() + p * M, y, env, M, &w);
                 zworst = fmax(zworst, w);
             }
-            for (int i = 0; i < M; i++) {   /* the mid: the SwiGLU of the device's own z, within one bf16 ulp */
-                const double g = r.gz[p * M + i], u = r.uz[p * M + i];
-                const double h = g / (1.0 + exp(-g)) * u * wts[p];
+            for (int i = 0; i < M; i++) {   /* the mid: the activation of the device's own z, within one bf16 ulp */
+                const double u = r.uz[p * M + i];
+                double h;
+                if (relu2) {
+                    const double rl = u > 0 ? u : 0.0;
+                    h = rl * rl * wts[p];
+                } else {
+                    const double g = r.gz[p * M + i];
+                    h = g / (1.0 + exp(-g)) * u * wts[p];
+                }
                 const double got = bf16_val(r.mid[p * M + i]);
                 const double ulp = ldexp(1.0, (int)floor(log2(fmax(fabs(h), 1e-30))) - 7);
                 mid_bad += !(fabs(got - h) <= ulp);
@@ -309,14 +328,14 @@ static void section_routed(void) {
                 if (sel[(size_t)t * k + j] >= 0) acc += r.dz[((size_t)t * k + j) * H + o];
             sum_bad += memcmp(&acc, &r.out[(size_t)t * H + o], 4) != 0;
         }
-    CHECK(zover == 0, "routed gate / up: %zu outputs past the f32 envelope (worst %.2e)", zover, zworst);
-    CHECK(mid_bad == 0, "routed mid: %zu values past one bf16 ulp of the SwiGLU of the device's z", mid_bad);
-    CHECK(dover == 0, "routed down: %zu outputs past the f32 envelope (worst %.2e)", dover, dworst);
-    CHECK(sum_bad == 0, "routed sum: %zu outputs differ from the slots' down z added in slot order", sum_bad);
-    CHECK(r.nf == 0, "routed: the non-finite flag raised on finite rows (%u)", r.nf);
-    printf("  routed %d -> %d -> %d, %d experts, top-%d, T=16 (%zu pairs, dropped picks skipped): gate / up worst %.2e, "
-           "mid within 1 bf16 ulp, down worst %.2e, sum == slot order %s\n", H, M, H, f.E, k, pairs, zworst, dworst,
-           sum_bad ? "DIFFERS" : "bit for bit");
+    CHECK(zover == 0, "routed %s gate / up: %zu outputs past the f32 envelope (worst %.2e)", an, zover, zworst);
+    CHECK(mid_bad == 0, "routed %s mid: %zu values past one bf16 ulp of the activation of the device's z", an, mid_bad);
+    CHECK(dover == 0, "routed %s down: %zu outputs past the f32 envelope (worst %.2e)", an, dover, dworst);
+    CHECK(sum_bad == 0, "routed %s sum: %zu outputs differ from the slots' down z added in slot order", an, sum_bad);
+    CHECK(r.nf == 0, "routed %s: the non-finite flag raised on finite rows (%u)", an, r.nf);
+    printf("  routed %s %d -> %d -> %d, %d experts, top-%d, T=16 (%zu pairs, dropped picks skipped): %s worst %.2e, "
+           "mid within 1 bf16 ulp, down worst %.2e, sum == slot order %s\n", an, H, M, H, f.E, k, pairs,
+           relu2 ? "up" : "gate / up", zworst, dworst, sum_bad ? "DIFFERS" : "bit for bit");
     /* batch / chunk invariance: every token of a T = 16 and a T = 40 call == the token alone */
     const moe_run r40 = run_moe(f, X, sel, wts, T, 0, false);
     size_t inv_bad = 0;
@@ -325,15 +344,48 @@ static void section_routed(void) {
         inv_bad += memcmp(r1.out.data(), r40.out.data() + (size_t)t * H, (size_t)H * 4) != 0;
         if (t < 16) inv_bad += memcmp(r1.out.data(), r.out.data() + (size_t)t * H, (size_t)H * 4) != 0;
     }
-    CHECK(inv_bad == 0, "routed: %zu token outputs at T = 16 / 40 differ from the token alone", inv_bad);
+    CHECK(inv_bad == 0, "routed %s: %zu token outputs at T = 16 / 40 differ from the token alone", an, inv_bad);
     /* the front door == the arm */
     const moe_run rf = run_moe(f, X, sel, wts, T, 0, true);
-    CHECK(memcmp(rf.out.data(), r40.out.data(), rf.out.size() * 4) == 0, "routed: the front door != the arm");
-    /* a NaN row raises the flag */
+    CHECK(memcmp(rf.out.data(), r40.out.data(), rf.out.size() * 4) == 0, "routed %s: the front door != the arm", an);
+    /* a NaN row raises the flag (relu^2 keeps a NaN: pulsar_relu2_elem) */
     std::vector<uint16_t> Xn = X;
     Xn[(size_t)5 * H + 17] = 0x7fc0;
     const moe_run rn = run_moe(f, Xn, sel, wts, 8, 0, false);
-    CHECK(rn.nf == 7u, "routed: a NaN row did not raise the non-finite flag (%u)", rn.nf);
+    CHECK(rn.nf == 7u, "routed %s: a NaN row did not raise the non-finite flag (%u)", an, rn.nf);
+    if (relu2) {   /* the activation's own refusals */
+        int32_t *dS = upload(std::vector<int32_t>(sel.begin(), sel.begin() + k));
+        float *dWt = upload(std::vector<float>(wts.begin(), wts.begin() + k)), *dO = nullptr, *dz = nullptr;
+        uint16_t *dX = upload(std::vector<uint16_t>(X.begin(), X.begin() + H)), *dmid = nullptr;
+        uint32_t *dnf = nullptr;
+        CUDA_OK(cudaMalloc((void **)&dO, (size_t)H * 4));
+        CUDA_OK(cudaMalloc((void **)&dz, (size_t)k * (M + H) * 4));
+        CUDA_OK(cudaMalloc((void **)&dmid, (size_t)k * M * 2));
+        CUDA_OK(cudaMalloc((void **)&dnf, 4));
+        const pulsar_bf16_moe gated{f.dU, f.dU, f.dD, f.E, H, M, H, PULSAR_EXPERT_ACT_RELU2};
+        CHECK(pulsar_bf16_moe_routed_launch(gated, dS, dWt, 1, k, 0.0f, dX, dz, dz, dmid, dz + (size_t)k * M, dO, dnf, 7u,
+                                            0) == -1, "routed relu^2: a gate stack beside RELU2 accepted");
+        const pulsar_bf16_moe odd{nullptr, f.dU, f.dD, f.E, H, M, H, (pulsar_expert_act)7};
+        CHECK(pulsar_bf16_moe_routed_launch(odd, dS, dWt, 1, k, 0.0f, dX, dz, dz, dmid, dz + (size_t)k * M, dO, dnf, 7u,
+                                            0) == -1, "routed: an unknown activation accepted");
+        pulsar_rows_moe w{};
+        w.bf16_up = f.dU; w.bf16_down = f.dD; w.act = PULSAR_EXPERT_ACT_RELU2;
+        w.n_expert = f.E; w.top_k = k; w.in_dim = H; w.mid_dim = M; w.out_dim = H; w.n_local = f.E;
+        w.bf16_up = nullptr; w.down_table = reinterpret_cast<const void *const *>(dz);
+        const size_t wsb = pulsar_rows_moe_routed_workspace_bytes(1, k, M, H);
+        void *dws = nullptr;
+        CUDA_OK(cudaMalloc(&dws, wsb));
+        CHECK(pulsar_rows_moe_routed_launch(&w, dS, dWt, dX, 1, dO, dws, wsb, dnf, 7u, 0) == -1,
+              "routed relu^2: up-only experts against an EXL3 table accepted (no quant up-only arm is built)");
+        cudaFree(dws); cudaFree(dS); cudaFree(dWt); cudaFree(dO); cudaFree(dz); cudaFree(dmid); cudaFree(dX);
+        cudaFree(dnf);
+        printf("  routed relu^2: T=16 and T=40 tokens bit-identical to each token alone; the front door == the arm %s; "
+               "a NaN row raises the flag %s; refusals (a gate stack beside RELU2, an unknown activation, an EXL3 "
+               "table)\n", memcmp(rf.out.data(), r40.out.data(), rf.out.size() * 4) ? "NO" : "yes",
+               rn.nf == 7u ? "yes" : "NO");
+        cudaFree(f.dU); cudaFree(f.dD);
+        return;
+    }
     /* refusals at the front door */
     {
         pulsar_rows_moe w{};
@@ -362,6 +414,69 @@ static void section_routed(void) {
            "%s; a NaN row raises the flag %s; refusals (a riding shared expert, an EXL3 table beside BF16)\n", T,
            memcmp(rf.out.data(), r40.out.data(), rf.out.size() * 4) ? "NO" : "yes", rn.nf == 7u ? "yes" : "NO");
     cudaFree(f.dG); cudaFree(f.dU); cudaFree(f.dD);
+}
+
+/* L296 N4: the non-gated shared expert (RELU2) through the shared launcher, on BF16 linears at Nemotron-H's width */
+static void section_shared_relu2(void) {
+    const int H = 4096, M = 5376, T = 16;
+    const std::vector<uint16_t> U = rnd_bf16((size_t)M * H, 0.02, H), D = rnd_bf16((size_t)H * M, 0.02, M);
+    const std::vector<uint16_t> X = rnd_bf16((size_t)T * H, 1.0, H);
+    std::vector<float> pre((size_t)T * H);
+    for (auto &v : pre) v = (float)(rndu() - 0.5);
+    uint16_t *dU = upload(U), *dD = upload(D);
+    struct out { std::vector<float> o, yu, ys; std::vector<uint16_t> h; int rc; };
+    auto run = [&](int rows, int r0) {
+        uint16_t *dX = upload(std::vector<uint16_t>(X.begin() + (size_t)r0 * H, X.begin() + (size_t)(r0 + rows) * H));
+        float *dO = upload(std::vector<float>(pre.begin() + (size_t)r0 * H, pre.begin() + (size_t)(r0 + rows) * H));
+        float *dyu = nullptr, *dys = nullptr;
+        uint16_t *dh = nullptr;
+        CUDA_OK(cudaMalloc((void **)&dyu, (size_t)rows * M * 4));
+        CUDA_OK(cudaMalloc((void **)&dys, (size_t)rows * H * 4));
+        CUDA_OK(cudaMalloc((void **)&dh, (size_t)rows * M * 2));
+        pulsar_rows_moe_shared q{};
+        q.act = PULSAR_EXPERT_ACT_RELU2;
+        q.up = pulsar_rows_linear{dU, nullptr, 0, H, M, false, true};
+        q.down = pulsar_rows_linear{dD, nullptr, 0, M, H, false, true};
+        q.yu = dyu; q.ys = dys; q.h = dh;   /* no gate, no yg */
+        out r;
+        r.rc = pulsar_rows_moe_shared_launch(&q, dX, rows, dO, 0);
+        r.o = download(dO, (size_t)rows * H);
+        r.yu = download(dyu, (size_t)rows * M);
+        r.ys = download(dys, (size_t)rows * H);
+        r.h = download(dh, (size_t)rows * M);
+        cudaFree(dX); cudaFree(dO); cudaFree(dyu); cudaFree(dys); cudaFree(dh);
+        return r;
+    };
+    const out r = run(T, 0);
+    CHECK(r.rc == 0, "shared relu^2: the launcher refused (rc=%d)", r.rc);
+    std::vector<double> y, env;
+    double w = 0, uworst = 0, dworst = 0;
+    size_t uover = 0, hbad = 0, dover = 0, obad = 0;
+    ref_linear(U.data(), X.data(), 0, T, H, M, y, env);
+    uover = over_env(r.yu.data(), y, env, (size_t)T * M, &uworst);
+    for (size_t i = 0; i < (size_t)T * M; i++) {
+        const double u = r.yu[i], rl = u > 0 ? u : 0.0, h = rl * rl, got = bf16_val(r.h[i]);
+        const double ulp = ldexp(1.0, (int)floor(log2(fmax(fabs(h), 1e-30))) - 7);
+        hbad += !(fabs(got - h) <= ulp);
+    }
+    ref_linear(D.data(), r.h.data(), 0, T, M, H, y, env);
+    dover = over_env(r.ys.data(), y, env, (size_t)T * H, &dworst);
+    for (size_t i = 0; i < (size_t)T * H; i++) {
+        const float want = pre[i] + r.ys[i];
+        obad += memcmp(&want, &r.o[i], 4) != 0;
+    }
+    size_t inv = 0;
+    for (int t = 0; t < T; t += 5) {
+        const out r1 = run(1, t);
+        inv += memcmp(r1.o.data(), r.o.data() + (size_t)t * H, (size_t)H * 4) != 0;
+    }
+    (void)w;
+    CHECK(uover == 0 && hbad == 0 && dover == 0 && obad == 0 && inv == 0,
+          "shared relu^2: up %zu / rows %zu / down %zu outside, out != routed + shared at %zu, %zu rows differ alone",
+          uover, hbad, dover, obad, inv);
+    printf("  shared relu^2 (BF16 %d -> %d -> %d, %d rows): up worst %.2e, relu^2 rows within 1 bf16 ulp, down worst "
+           "%.2e, out == the routed sum + the expert bit for bit, rows alone == batched\n", H, M, H, T, uworst, dworst);
+    cudaFree(dU); cudaFree(dD);
 }
 
 static void section_time(void) {
@@ -397,7 +512,9 @@ int main(void) {
     setvbuf(stdout, NULL, _IONBF, 0);
     printf("bf16-rows-gate: BF16 weights x raw bf16 rows (dense and routed) vs double\n");
     section_dense();
-    section_routed();
+    section_routed(PULSAR_EXPERT_ACT_SWIGLU);
+    section_routed(PULSAR_EXPERT_ACT_RELU2);
+    section_shared_relu2();
     section_time();
     printf(g_fail ? "BF16-ROWS GATE FAIL\n" : "BF16-ROWS GATE PASS\n");
     return g_fail;
