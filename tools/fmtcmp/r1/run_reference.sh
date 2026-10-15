@@ -70,6 +70,13 @@ check() {
   else
     [ -x "$WORK/venv/bin/python" ] || die "no venv: run  r1/run_reference.sh venv  first"
   fi
+  if [ "$RUNTIME" = venv ]; then
+    # Triton compiles a C launcher against Python.h; FlashInfer JITs its kernels with ninja.  A bare CUDA base image
+    # (e.g. nvidia/cuda:13.0.1-devel-ubuntu24.04) has neither: apt-get install python3.12-dev ninja-build
+    "$WORK/venv/bin/python" -c "import sysconfig, os, sys; sys.exit(not os.path.exists(os.path.join(sysconfig.get_paths()['include'], 'Python.h')))" \
+      || die "Python.h missing (Triton needs it): apt-get install python3.12-dev"
+    (PATH=$WORK/venv/bin:$PATH; command -v ninja >/dev/null) || die "ninja missing (FlashInfer JIT needs it): apt-get install ninja-build"
+  fi
   vpy -c "import vllm; print(vllm.__version__)" 2>/dev/null | tail -1 > "$WORK/logs/vllm-version.txt"
   [ "$(cat "$WORK/logs/vllm-version.txt")" = "$VLLM_VERSION" ] || die "vLLM is $(cat "$WORK/logs/vllm-version.txt"), need $VLLM_VERSION"
   say "check: GPUs"
@@ -157,7 +164,7 @@ bundle() {
   echo "R1 = check -> capture -> bundle; no agentic eval (Tyler 2026-10-15)" > "$WORK/logs/scope.txt"
   (cd "$WORK" && find "${dirs[@]}" -type f -print0 | sort -z | xargs -0 sha256sum > MANIFEST.sha256)
   tar -C "$WORK" -cf "$out" MANIFEST.sha256 "${dirs[@]}"
-  sha256sum "$out" > "$out.sha256"
+  (cd "$(dirname "$out")" && sha256sum "$(basename "$out")" > "$(basename "$out").sha256")   # relative: -c works after a copy
   say "bring back: $out and $out.sha256 ($(du -h "$out" | cut -f1))"
 }
 

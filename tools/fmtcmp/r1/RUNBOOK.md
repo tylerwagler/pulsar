@@ -14,7 +14,9 @@ on Sparky.  Nothing here writes outside the kit directory (`work/` by default) e
     `vllm/vllm-openai:nightly-3f1bcfd82bb2e93fcd364fc7a5491718453a77e2` by digest (~25 GB); or
   - **a venv** (`RUNTIME=venv`; the usual case inside a rental container): `r1/run_reference.sh venv` installs the
     same build, vLLM `0.32.0rc1.dev190+g3f1bcfd82`, from vLLM's per-commit wheel index with `uv` (Python 3.12).
-  `check` refuses any other vLLM version.
+  `check` refuses any other vLLM version.  On a bare CUDA image (e.g. `nvidia/cuda:13.0.1-devel-ubuntu24.04`) install
+  `apt-get install -y python3.12-dev ninja-build` first: Triton needs `Python.h`, FlashInfer's JIT needs `ninja`.
+  `check` tests for both and fails fast.
 - **The BF16 checkpoint** `nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-BF16`, local (249 GB, ~1 h on a fast link):
   `hf download nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-BF16 --local-dir /data/nemotron35-bf16`.
   `check` compares config, index, tokenizer, template and generation-config hashes, the shard count and the total

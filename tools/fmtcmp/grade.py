@@ -80,7 +80,10 @@ def paired_ratio(da, db, key, draws, seed):
     """mean_a / mean_b over the same documents, paired bootstrap."""
     pa = [(sum(d[key]), len(d[key])) for d in da]
     pb = [(sum(d[key]), len(d[key])) for d in db]
-    r0 = (sum(s for s, _ in pa) / sum(n for _, n in pa)) / max(1e-30, sum(s for s, _ in pb) / sum(n for _, n in pb))
+    mb = sum(s for s, _ in pb) / sum(n for _, n in pb)
+    if mb < 1e-9:                     # e.g. a deterministic rerun: KL 0, a ratio means nothing
+        return None, None, None
+    r0 = (sum(s for s, _ in pa) / sum(n for _, n in pa)) / mb
     if len(pa) < 2:
         return r0, None, None
     rng = random.Random(seed)
@@ -95,6 +98,8 @@ def paired_ratio(da, db, key, draws, seed):
 
 
 def fmt_ci(v, lo, hi, f="{:.3e}"):
+    if v is None:
+        return "n/a (denominator ~0)"
     return f.format(v) + ("" if lo is None else f" [{f.format(lo)}, {f.format(hi)}]")
 
 
