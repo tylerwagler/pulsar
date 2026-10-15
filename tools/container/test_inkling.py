@@ -15,7 +15,7 @@ pins:
   * the drafter and the tower omitted whole -> no mtp shards, pulsar.mtp_present false
   * refusals by name: an unknown tensor, a missing tensor, a tensor whose shape disagrees with the declaration, an
     architecture switch the role table does not describe, a moe_intermediate_size that is not intermediate_size,
-    half a drafter omitted, an omitted main-model tensor, routed experts at a rate the pair arm lacks (K8; K5 plans
+    half a drafter omitted, an omitted main-model tensor, routed experts at a rate no routed arm reads (K8; K5 plans
     since L295 F7)
   * L295 F7: the pack's K6 head -- stored at the 128 multiple, declared at its logical width, bytes the pack's
   * GOLDEN: the SHA-256 of every emitted file of the BF16 and the K3 build (the byte-identity instrument, rule 7)
@@ -372,8 +372,8 @@ def main():
         make_exl3(ex8, np.random.default_rng(8), expert_K=8)
         r8 = recipe(tmp, "k8", [x if not x["role"].startswith("expert_") else {**x, "format": "exl3m_k8"}
                                 for x in json.load(open(r5))["rows"]])
-        ok, _ = run("plan", "--hf", hf, "--exl3", ex8, "--recipe", r8, expect_fail=True, contains="pair arm")
-        check(ok, "routed gate / up at K8 (the pair arm reads no K8) -> refused")
+        ok, _ = run("plan", "--hf", hf, "--exl3", ex8, "--recipe", r8, expect_fail=True, contains="exl3_arm_has_rate")
+        check(ok, "routed experts at K8 (no routed arm reads K8) -> refused by the rate table")
         print("the pack's K6 head (L295 F7: stored at the 128 multiple, the logical width declared):")
         exh = os.path.join(tmp, "exl3-head")
         exth = make_exl3(exh, np.random.default_rng(11), head_K=6)
