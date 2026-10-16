@@ -110,7 +110,7 @@ static void tool_call_free(tool_call *tc) {
 
 void tool_calls_free(tool_calls *calls) {
     for (int i = 0; i < calls->len; i++) tool_call_free(&calls->v[i]);
-    free(calls->raw_dsml);
+    free(calls->raw_calls);
     free(calls->v);
     memset(calls, 0, sizeof(*calls));
 }
@@ -358,7 +358,7 @@ void request_free(request *r) {
     r->anthropic_live_suffix_spans = NULL;
     r->anthropic_live_suffix_n_spans = 0;
     tool_schema_orders_free(&r->tool_orders);
-    free(r->qwen_tools_json);
+    free(r->tools_json);
     memset(r, 0, sizeof(*r));
 }
 

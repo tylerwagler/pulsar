@@ -107,7 +107,8 @@ bool pulsar_moe_routed_rows(const pulsar_moe_rows_call *c) {
         w.mid_dim = c->tessera_gate->N;
         w.out_dim = c->tessera_down->N;
         w.prompt = c->prompt;
-        w.shared = c->shared;   /* the launcher refuses it: only the EXL3 front door carries a shared expert */
+        w.shared = c->shared;   /* the launcher refuses them: only the EXL3 front door carries shared experts */
+        w.n_shared = c->n_shared;
         return pulsar_rows_moe_routed_launch(&w, c->selected, c->weights, c->x_bf16, c->n_rows, c->out, c->ws,
                                              c->ws_bytes, c->nf_flag, c->nf_code, 0) == 0;
     }
@@ -136,6 +137,7 @@ bool pulsar_moe_routed_rows(const pulsar_moe_rows_call *c) {
     w.out_dim = (int)D->dim[1];
     w.prompt = c->prompt;
     w.shared = c->shared;
+    w.n_shared = c->n_shared;
     w.k2_gate_up = exl3_type_k2(G->type);
     w.k2_down = exl3_type_k2(D->type);
     /* one stack's table over the rank's experts: [trellis, scales] pointer pairs (exl3_expert_layout) */

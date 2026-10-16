@@ -7,7 +7,7 @@
  * projection into the protocol sink (deepseek_stream.cpp's one walk), and the finish -- the final DSML
  * parse, the shared rule for a broken call (L284 P4: retry or text, never a repaired tag), the stream's
  * ids onto the parsed calls, tool memory.  Nothing here is reached except through k_parser_deepseek. */
-#include "pulsar_server_internal.h"
+#include "deepseek_dsml.h"
 
 static void *ds_parser_create(server *, gen_state *g, char *, size_t) {
     job *j = g->j;
@@ -136,7 +136,7 @@ static bool ds_parser_feed(void *st, server *s, gen_state *g, size_t upto, bool 
     if (hold_from > ps->tool_scan_from) ps->tool_scan_from = hold_from;
     if (s->trace && g->completion >= ps->next_tool_progress) {
         s->trace_event(g->trace_id,
-                    "progress gen=%d dsml_start=%d dsml_end=%d",
+                    "progress gen=%d tool_start=%d tool_end=%d",
                     g->completion, ps->saw_tool_start ? 1 : 0, ps->saw_tool_end ? 1 : 0);
         ps->next_tool_progress += 128;
     }

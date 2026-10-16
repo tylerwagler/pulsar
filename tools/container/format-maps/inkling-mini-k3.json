@@ -1,0 +1,19 @@
+{
+ "schema": "pulsar.recipe.v1",
+ "recipe": "inkling-mini-k3",
+ "model_type": "inkling_mm_model",
+ "about": "The 3-layer Inkling mini (/mnt/models/inkling-small-mini, L294) on its uniform K3 EXL3 pack: every attention / dense / shared / routed Linear exl3m_k3 from --exl3, byte copies of the pack. The head BF16 from the checkpoint (the pack's K6 head has no engine arm yet); norms, short convs, relative bases, router, scales, embed and the hmlp tower in their source dtype. The mini has no drafter.",
+ "rows": [
+  {"role": "dense", "format": "exl3m_k3"},
+  {"role": "shared_expert", "format": "exl3m_k3"},
+  {"role": "expert_gate", "format": "exl3m_k3"},
+  {"role": "expert_up", "format": "exl3m_k3"},
+  {"role": "expert_down", "format": "exl3m_k3"},
+  {"role": "router", "format": "native"},
+  {"role": "norm", "format": "native"},
+  {"role": "embed", "format": "native"},
+  {"role": "head", "format": "native"},
+  {"role": "other", "format": "native"},
+  {"role": "vision", "format": "native"}
+ ]
+}

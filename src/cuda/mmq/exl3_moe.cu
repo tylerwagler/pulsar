@@ -48,9 +48,9 @@ int project(int kind, const void *table, const void *up_table, int k2, const exl
  * routed GEMMs instead of after them, and exl3_moe_routed_launch joins the lane right before the sum that adds
  * the shared output.  Only the schedule changes: every value is the arithmetic it had (the SwiGLU rows are the
  * fold's own expression; the dense arm's epilogue counters are per stream already, counter_slice).  A lane holds
- * up to kLanePending forks the caller has not joined yet (one per row-kind segment of a step, each over its own
- * rows' buffers).  The lanes live as long as their thread. */
-constexpr int kLanePending = 4;
+ * up to kLanePending forks the caller has not joined yet (one per shared expert per row-kind segment of a step,
+ * each over its own rows' buffers).  The lanes live as long as their thread. */
+constexpr int kLanePending = 8;
 struct shared_lane {
     int dev;
     cudaStream_t caller, s;
@@ -163,7 +163,7 @@ int shared_join(const float *ys, cudaStream_t stream, const char *tag) {
 int exl3_moe_routed_launch(const exl3_moe_stacks &w, const int32_t *sel, const float *wts, int T, int top_k,
                            float clamp, const exl3_moe_act &x, const exl3_moe_bufs &b, float *out,
                            uint32_t *nf_flag, uint32_t nf_code, bool prompt, cudaStream_t stream,
-                           const exl3_moe_shared *shared) {
+                           const exl3_moe_shared *shared, int n_shared) {
     const char *tag = "exl3_moe_routed_launch";
     const bool fused = w.gate_up != nullptr;
     const int gu_kind = fused ? EXL3_ARM_GATE_UP_FUSED : EXL3_ARM_PAIR;
@@ -181,10 +181,10 @@ int exl3_moe_routed_launch(const exl3_moe_stacks &w, const int32_t *sel, const f
                 w.k2_down / 2.0, w.in_dim, w.mid_dim, w.out_dim);
         return -1;
     }
-    const exl3_moe_shared *sh = shared;
-    if (sh && x.format != EXL3_MOE_ACT_BF16_ROWS) {
-        fprintf(stderr, "%s: a riding shared expert needs a bf16-rows activation (act format %d) -- refusing\n", tag,
-                x.format);
+    if ((shared != nullptr) != (n_shared > 0) || n_shared < 0 || n_shared > PULSAR_ROUTER_SHARED_MAX ||
+        (n_shared && x.format != EXL3_MOE_ACT_BF16_ROWS)) {
+        fprintf(stderr, "%s: %d riding shared experts (0..%d, with descriptors; they need a bf16-rows activation, act "
+                        "format %d) -- refusing\n", tag, n_shared, PULSAR_ROUTER_SHARED_MAX, x.format);
         return -1;
     }
     static int mmq_ready = -1;   /* the sort's device-info singleton */
@@ -250,9 +250,15 @@ int exl3_moe_routed_launch(const exl3_moe_stacks &w, const int32_t *sel, const f
     rc = project(EXL3_ARM_DOWN, s.down, nullptr, s.k2_down, b.mid, ids_dst, ids_dst, bounds, b.down_z, nullptr,
                  s.out_dim, s.mid_dim, pairs, E, gemm, tc_ws, tc_bytes, &dp, stream);
     if (rc) { fprintf(stderr, "%s: down declined (rc=%d) -- no fallback\n", tag, rc); return -1; }
-    /* the sum adds the shared expert's output: its fork joins here */
-    if (sh && shared_join(sh->ys, stream, tag) != 0) return -1;
+    /* the sum adds the shared experts' outputs: their forks join here, oldest first */
+    exl3_moe_shared_add add{};
+    for (int j = 0; j < n_shared; ++j) {
+        if (shared_join(shared[j].ys, stream, tag) != 0) return -1;
+        add.y[j] = shared[j].ys;
+        add.scale[j] = shared[j].scale;
+    }
+    add.n = n_shared;
     rc = ds4_exl3_moe_sum_launch(out, dp.z[0], sel, s.down, s.mid_dim, s.out_dim, top_k, T, nf_flag, nf_code, stream,
-                                 sh ? sh->ys : nullptr, sh ? sh->scale : nullptr, dp.splits, dp.split_stride);
+                                 &add, dp.splits, dp.split_stride);
     return rc ? -1 : 0;
 }

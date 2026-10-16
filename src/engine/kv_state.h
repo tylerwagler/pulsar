@@ -25,17 +25,9 @@
  * index-K rows (ratio 4); slot = the raw SWA window [G - W, G) of every layer + the overlapping
  * (coff-2) sources' compressor and indexer lanes (~3.8 MB); grid 128; 16 slots.
  *
- * Qwen3.8-Flash-Next (`qwen4_exp`, the L251 lane -- family_qwen.h on work/l251-serve) maps as:
- *   pools  per QSA layer (12): KV rows, 1 token/row, pulsar_qwen_kv_row_bytes (1056 B, E4M3 + E8M0);
- *          pooled indexer keys, idx_block (4) tokens/row, pulsar_qwen_index_row_bytes (256 B);
- *   slot   per GDN layer (36): the DeltaNet recurrent state (pulsar_qwen_gdn_state_bytes, 3.1 MB
- *          fp32) and the causal-conv tail (pulsar_qwen_gdn_conv_bytes); per QSA layer: the partial
- *          index tail block (pulsar_qwen_index_tail_bytes); the PLE layer's dilated-conv history
- *          (pulsar_qwen_ple_conv_bytes) -- ~118 MB, so the slot budget is ~2 per bank, not 16;
- *          the n-gram context is a function of the tokens and needs no copy;
- *   grid   a multiple of idx_block (4) that its GDN chunked-prefill kernel makes a resume exact on
- *          -- a census of Qwen's own kernels decides it (L183/L195 for V4), not this file.
- * Qwen's state lives in pulsar_qwen_state, not pulsar_gpu_graph: the ops take an opaque `state`,
+ * L295 F3: a family whose state is DECLARED (state_kinds.h -- Qwen3.8-Flash-Next's is family_qwen.cpp
+ * qwen_state_plan) gets its answer from the core: the declaration's POOL kinds are the pools, its FIXED / STAGED /
+ * RING kinds the slot, walked in the declaration's order (pulsar_state_set::ops).  The ops take an opaque `state`,
  * and the store below is a plain struct any family's state embeds. */
 #ifndef PULSAR_KV_STATE_H
 #define PULSAR_KV_STATE_H
@@ -202,7 +194,5 @@ static inline uint32_t pulsar_ckpt_final_cut(const pulsar_ckpt_store *st, uint32
 
 /** DeepSeek V4's answer (kv_state_ds4.cpp); its state is the pulsar_gpu_graph. */
 extern const pulsar_kv_state_ops PULSAR_KV_STATE_DS4;
-/** Qwen3.8-Flash-Next's (kv_state_qwen.cpp, L266); its state is the pulsar_qwen_state. */
-extern const pulsar_kv_state_ops PULSAR_KV_STATE_QWEN;
 
 #endif

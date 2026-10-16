@@ -214,6 +214,17 @@ static void section_draft_top(void) {
     cudaFree(drow);
     cudaFree(ws);
 }
+/* L295 F2: the family's router as the engine runs it -- the shared router's two launches with Qwen's declared cfg
+ * (pulsar_qwen_router_cfg), the shared_expert_gate row after the router's; sgate is the one gamma plane. */
+static int qwen_router(const uint16_t *x, const uint16_t *wr, const uint16_t *wsg, int T, int hidden, float *lg,
+                       int32_t *sel, float *w, float *sg, int top_k = TOPK) {
+    const pulsar_router_cfg c = pulsar_qwen_router_cfg(E, top_k);
+    const pulsar_router_layer l{};
+    int rc = pulsar_router_logits_launch(x, T, hidden, wr, c.n_expert, wsg, c.n_shared, lg, 0);
+    if (!rc) rc = pulsar_router_select_launch(&c, &l, lg, nullptr, T, sel, w, sg, nullptr, 0);
+    return rc;
+}
+
 static void section_router(void) {
     printf("A. router (bf16 logits, softmax top-%d of %d, renormalised)\n", TOPK, E);
     const int T = 37;
@@ -228,7 +239,7 @@ static void section_router(void) {
     uint16_t *dx = up(x), *dwr = up(wr), *dwsg = up(wsg);
     float *lg = (float *)dalloc((size_t)T * (E + 1) * 4), *w = (float *)dalloc((size_t)T * TOPK * 4), *sg = (float *)dalloc(T * 4);
     int32_t *sel = (int32_t *)dalloc((size_t)T * TOPK * 4);
-    int rc = pulsar_qwen_router_launch(dx, dwr, dwsg, T, H, E, TOPK, lg, sel, w, sg, 0);
+    int rc = qwen_router(dx, dwr, dwsg, T, H, lg, sel, w, sg);
     CHECK(rc == 0, "launch T=%d", T);
     const auto L = down(lg, (size_t)T * (E + 1));
     const auto Sel = down(sel, (size_t)T * TOPK);
@@ -262,7 +273,7 @@ static void section_router(void) {
     size_t diff = 0;
     for (int Tn : {1, 8}) {
         const int t0 = 5;
-        rc = pulsar_qwen_router_launch(dx + (size_t)t0 * H, dwr, dwsg, Tn, H, E, TOPK, lg, sel, w, sg, 0);
+        rc = qwen_router(dx + (size_t)t0 * H, dwr, dwsg, Tn, H, lg, sel, w, sg);
         const auto L2 = down(lg, (size_t)Tn * (E + 1));
         const auto S2 = down(sel, (size_t)Tn * TOPK);
         diff += memcmp(L2.data(), &L[(size_t)t0 * (E + 1)], L2.size() * 4) != 0;
@@ -273,13 +284,14 @@ static void section_router(void) {
     std::vector<uint16_t> xn(x.begin(), x.begin() + H);
     xn[17] = 0x7fc0;
     uint16_t *dxn = up(xn);
-    rc = pulsar_qwen_router_launch(dxn, dwr, dwsg, 1, H, E, TOPK, lg, sel, w, sg, 0);
+    rc = qwen_router(dxn, dwr, dwsg, 1, H, lg, sel, w, sg);
     const auto S3 = down(sel, TOPK);
     const auto W3 = down(w, TOPK);
     bool nan_ok = rc == 0;
     for (int k = 0; k < TOPK; k++) nan_ok &= S3[k] == k && std::isnan(W3[k]);
     CHECK(nan_ok, "a NaN row routes to experts 0..9 with NaN weights (the NaN reaches the output)");
-    CHECK(pulsar_qwen_router_launch(dx, dwr, dwsg, T, 2048, E, TOPK, lg, sel, w, sg, 0) != 0, "a foreign hidden size is refused");
+    CHECK(qwen_router(dx, dwr, dwsg, T, H - 4, lg, sel, w, sg) != 0 && qwen_router(dx, dwr, dwsg, T, H, lg, sel, w, sg, 9) != 0,
+          "a row that is not whole uint4 chunks, and a top-k the router has no instance for, are refused");
     cudaFree(dx); cudaFree(dwr); cudaFree(dwsg); cudaFree(lg); cudaFree(w); cudaFree(sg); cudaFree(sel); cudaFree(dxn);
 }
 
@@ -753,16 +765,25 @@ static void section_moe_at(const int T, const bool split = false, const int k2_e
     uint16_t *dx = up(x);
     float *out = (float *)dalloc((size_t)T * H * 4);
     uint32_t *nf = (uint32_t *)dalloc(4);
-    const size_t wsb = pulsar_qwen_moe_workspace_bytes(T);
+    const pulsar_moe_block_shape bs{E, TOPK, E + 1, H, MID, 1, (int)shg.out};
+    const size_t wsb = pulsar_moe_block_workspace_bytes(&bs, T);
     void *ws = dalloc(wsb);
+    /* the block's one shared expert over the carved buffers, gated by the router's gamma plane */
+    auto shared_desc = [&](const pulsar_moe_block_parts &p) {
+        pulsar_rows_moe_shared sh{};
+        sh.gate = shg; sh.up = shu; sh.down = shd;
+        sh.scale = p.gammas; sh.yg = p.yg; sh.yu = p.yu; sh.ys = p.ys; sh.h = p.h;
+        sh.ws = p.lin; sh.ws_bytes = p.lin_bytes;
+        return sh;
+    };
     auto block = [&](const pulsar_rows_moe &rm, const uint16_t *xr, int rows, bool shared) -> int {
-        pulsar_qwen_moe_parts p;
-        if (pulsar_qwen_moe_carve(rows, ws, wsb, &p) != 0) return -1;
-        int r = pulsar_qwen_router_launch(xr, router_w, shared_gate_w, rows, H, E, TOPK, p.logits, p.sel, p.wts,
-                                          p.sgate, 0);
+        pulsar_moe_block_parts p;
+        if (pulsar_moe_block_carve(&bs, rows, ws, wsb, &p) != 0) return -1;
+        int r = qwen_router(xr, router_w, shared_gate_w, rows, H, p.logits, p.sel, p.wts, p.gammas);
         if (!r) r = pulsar_rows_moe_routed_launch(&rm, p.sel, p.wts, xr, rows, out, p.routed, p.routed_bytes, nf,
                                                   0x7351u, 0);
-        if (!r && shared) r = pulsar_qwen_moe_shared_launch(&shg, &shu, &shd, xr, rows, out, &p, 0);
+        const pulsar_rows_moe_shared sh = shared_desc(p);
+        if (!r && shared) r = pulsar_rows_moe_shared_launch(&sh, xr, rows, out, 0);
         return r;
     };
     int rc = block(w, dx, T, true);
@@ -774,15 +795,13 @@ static void section_moe_at(const int T, const bool split = false, const int k2_e
      * forked onto its own stream first and joined at the routed sum; a riding shared expert that was not forked is
      * refused */
     {
-        pulsar_qwen_moe_parts p;
-        int r = pulsar_qwen_moe_carve(T, ws, wsb, &p);
-        if (!r) r = pulsar_qwen_router_launch(dx, router_w, shared_gate_w, T, H, E, TOPK, p.logits, p.sel, p.wts, p.sgate, 0);
-        pulsar_rows_moe_shared sh{};
-        sh.gate = shg; sh.up = shu; sh.down = shd;
-        sh.scale = p.sgate; sh.yg = p.yg; sh.yu = p.yu; sh.ys = p.ys; sh.h = p.h_x;
-        sh.ws = p.lin; sh.ws_bytes = p.lin_bytes;
+        pulsar_moe_block_parts p;
+        int r = pulsar_moe_block_carve(&bs, T, ws, wsb, &p);
+        if (!r) r = qwen_router(dx, router_w, shared_gate_w, T, H, p.logits, p.sel, p.wts, p.gammas);
+        const pulsar_rows_moe_shared sh = shared_desc(p);
         pulsar_rows_moe wr2 = w;
         wr2.shared = &sh;
+        wr2.n_shared = 1;
         if (!r)
             CHECK(pulsar_rows_moe_routed_launch(&wr2, p.sel, p.wts, dx, T, out, p.routed, p.routed_bytes, nf, 0x7351u, 0) != 0,
                   "T = %d: a riding shared expert that was not forked is refused", T);
@@ -795,6 +814,67 @@ static void section_moe_at(const int T, const bool split = false, const int k2_e
               "outputs (rc %d)", T, split ? " split experts" : "", diff, OR.size(), r);
         printf("  T = %d%s: shared expert riding the routed launches == separate launches, byte for byte (%zu outputs)\n",
                T, split ? " split experts" : "", OR.size());
+    }
+    /* L295 F2: N shared experts on the rows front door -- two here, each with its own gamma plane (an Inkling-style
+     * block: the router's sink gammas).  Riding (both forked, in order, joined at the routed sum) == the routed
+     * launch then each expert's own launch in order, byte for byte; and the block == the double reference */
+    if (!split) {
+        const linear sg2 = make_linear(H, MID, 10), su2 = make_linear(H, MID, 10), sd2 = make_linear(MID, H, 8);
+        const pulsar_rows_linear shg2 = dev_linear(sg2), shu2 = dev_linear(su2), shd2 = dev_linear(sd2);
+        const pulsar_moe_block_shape bs2{E, TOPK, E + 1, H, MID, 2, MID};
+        const size_t wsb2 = pulsar_moe_block_workspace_bytes(&bs2, T);
+        void *ws2 = dalloc(wsb2);
+        pulsar_moe_block_parts p;
+        int r = pulsar_moe_block_carve(&bs2, T, ws2, wsb2, &p);
+        std::vector<float> gam((size_t)2 * T);
+        for (auto &g : gam) g = (float)(0.1 + 1.4 * rndu());
+        if (!r) r = qwen_router(dx, router_w, shared_gate_w, T, H, p.logits, p.sel, p.wts, p.gammas);
+        CK(cudaMemcpy(p.gammas, gam.data(), gam.size() * 4, cudaMemcpyHostToDevice));   /* this check's gammas */
+        pulsar_rows_moe_shared sh2[2]{};
+        for (int j = 0; j < 2; j++) {
+            sh2[j].gate = j ? shg2 : shg; sh2[j].up = j ? shu2 : shu; sh2[j].down = j ? shd2 : shd;
+            sh2[j].scale = p.gammas + (size_t)j * T;
+            sh2[j].yg = p.yg + (size_t)j * T * MID; sh2[j].yu = p.yu + (size_t)j * T * MID;
+            sh2[j].ys = p.ys + (size_t)j * T * H; sh2[j].h = p.h + (size_t)j * T * MID;
+            sh2[j].ws = p.lin; sh2[j].ws_bytes = p.lin_bytes;
+        }
+        pulsar_rows_moe wn = w;
+        wn.shared = sh2;
+        wn.n_shared = 2;
+        for (int j = 0; j < 2 && !r; j++) r = pulsar_rows_moe_shared_fork(&sh2[j], dx, T, 0);
+        if (!r) r = pulsar_rows_moe_routed_launch(&wn, p.sel, p.wts, dx, T, out, p.routed, p.routed_bytes, nf, 0x7351u, 0);
+        const auto ORN = down(out, (size_t)T * H);
+        if (!r) r = pulsar_rows_moe_routed_launch(&w, p.sel, p.wts, dx, T, out, p.routed, p.routed_bytes, nf, 0x7351u, 0);
+        for (int j = 0; j < 2 && !r; j++) r = pulsar_rows_moe_shared_launch(&sh2[j], dx, T, out, 0);
+        const auto OSN = down(out, (size_t)T * H);
+        size_t diff = 0;
+        for (size_t i = 0; i < ORN.size(); i++) diff += memcmp(&ORN[i], &OSN[i], sizeof(float)) != 0;
+        CHECK(r == 0 && diff == 0, "T = %d: two riding shared experts == the routed launch then each shared expert's own "
+              "launch, byte for byte (%zu of %zu differ, rc %d)", T, diff, ORN.size(), r);
+        const auto SelN = down(p.sel, (size_t)T * TOPK);
+        const auto RWN = down(p.wts, (size_t)T * TOPK);
+        double frob = 0;
+        std::vector<double> ref(H);
+        for (int t = 0; t < T; t++) {
+            double wk[TOPK];
+            for (int k = 0; k < TOPK; k++) wk[k] = RWN[(size_t)t * TOPK + k];
+            moe_token(&xd[(size_t)t * H], &SelN[(size_t)t * TOPK], wk, gam[t], ex, sg, su, sd, ref.data());
+            shared_token(&xd[(size_t)t * H], gam[(size_t)T + t], sg2, su2, sd2, ref.data());
+            double num = 0, den = 0;
+            for (int o = 0; o < H; o++) {
+                const double d = ORN[(size_t)t * H + o] - ref[o];
+                num += d * d; den += ref[o] * ref[o];
+            }
+            frob = fmax(frob, sqrt(num / den));
+        }
+        CHECK(frob < 2e-3, "T = %d: the block with two gamma-gated shared experts vs double: worst row rel Frobenius "
+              "%.2e (the one-shared bar)", T, frob);
+        pulsar_rows_moe wbad = w;
+        wbad.shared = sh2;
+        wbad.n_shared = PULSAR_ROUTER_SHARED_MAX + 1;
+        CHECK(pulsar_rows_moe_routed_launch(&wbad, p.sel, p.wts, dx, T, out, p.routed, p.routed_bytes, nf, 0x7351u, 0) != 0,
+              "more shared experts than the front door carries (%d) is refused", PULSAR_ROUTER_SHARED_MAX);
+        cudaFree(ws2);
     }
     /* L266 step 7, expert parallelism: rank r runs experts [256 r, 256 r + 256) from its half of the tables
      * (and rank 0 the shared expert); the two partials summed in rank order -- the all-reduce -- are the
@@ -828,7 +908,7 @@ static void section_moe_at(const int T, const bool split = false, const int k2_e
     /* the device's routing, from the router alone on the same rows */
     float *lg = (float *)dalloc((size_t)T * (E + 1) * 4), *rw = (float *)dalloc((size_t)T * TOPK * 4), *rs = (float *)dalloc(T * 4);
     int32_t *sel = (int32_t *)dalloc((size_t)T * TOPK * 4);
-    pulsar_qwen_router_launch(dx, router_w, shared_gate_w, T, H, E, TOPK, lg, sel, rw, rs, 0);
+    qwen_router(dx, router_w, shared_gate_w, T, H, lg, sel, rw, rs);
     const auto Sel = down(sel, (size_t)T * TOPK);
     const auto RW = down(rw, (size_t)T * TOPK);
     const auto RS = down(rs, T);

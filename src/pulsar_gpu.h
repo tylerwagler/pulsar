@@ -2056,6 +2056,9 @@ int pulsar_gpu_directional_steering_project_tensor(
         uint32_t                rows,
         float                   scale);
 
+/** DeepSeek's router binding (L295 F2): resolves the layer's correction bias, image-slot bias (bias_vl) and hash
+ *  table (tid2eid) from the model map and routes n_tokens rows of logits through the shared router
+ *  (src/cuda/pulsar_cuda_router.h) with DeepSeek's declared cfg.  Nonzero on success. */
 int pulsar_gpu_router_select_batch_tensor(
         pulsar_gpu_tensor       *selected,
         pulsar_gpu_tensor       *weights,

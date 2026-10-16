@@ -8,6 +8,8 @@ const char *pulsar_layer_kind_name(pulsar_layer_kind k) {
     case PULSAR_LAYER_DS4_BLOCK: return "ds4_block";
     case PULSAR_LAYER_QWEN_GDN:  return "qwen_gdn";
     case PULSAR_LAYER_QWEN_QSA:  return "qwen_qsa";
+    case PULSAR_LAYER_BLOCKS:    return "blocks";
+    case PULSAR_LAYER_KIND_COUNT: break;
     }
     return "unknown";
 }
@@ -18,11 +20,36 @@ uint32_t pulsar_layer_plan_count(const pulsar_layer_plan *p, pulsar_layer_kind k
     return n;
 }
 
+const char *pulsar_layer_plan_check(const pulsar_layer_plan *p, uint32_t *at_layer) {
+    *at_layer = UINT32_MAX;
+    if (p->n_layer == 0 || p->n_layer > PULSAR_FAMILY_MAX_LAYER) return "a layer count outside 1 .. PULSAR_FAMILY_MAX_LAYER";
+    static const pulsar_layer_desc zero = {};
+    for (uint32_t il = 0; il < p->n_layer; il++) {
+        *at_layer = il;
+        const pulsar_layer_kind k = p->kind[il];
+        const pulsar_layer_desc &d = p->desc[il];
+        if (k == PULSAR_LAYER_NONE || k >= PULSAR_LAYER_KIND_COUNT) return "a layer with no kind";
+        if (k != PULSAR_LAYER_BLOCKS) {
+            if (memcmp(&d, &zero, sizeof d) != 0) return "a block description on a layer that is not a blocks layer";
+            continue;
+        }
+        if (d.mixer != PULSAR_MIXER_ATTN_FULL && d.mixer != PULSAR_MIXER_ATTN_WINDOW) return "a blocks layer with no mixer";
+        if (d.ffn != PULSAR_FFN_DENSE && d.ffn != PULSAR_FFN_MOE) return "a blocks layer with no FFN";
+        if ((d.window != 0) != (d.mixer == PULSAR_MIXER_ATTN_WINDOW)) return "a window on a full-attention layer, or none on a window layer";
+    }
+    *at_layer = UINT32_MAX;
+    return NULL;
+}
+
+/* A family module under src/families/<name>/ (L295) declares its descriptor here, beside its registry row. */
+extern const pulsar_family PULSAR_FAMILY_INKLING;
+
 /* Every family the engine serves.  The ONE place an architecture string is
  * mapped to code. */
 static const pulsar_family *const k_families[] = {
     &PULSAR_FAMILY_DEEPSEEK4,
     &PULSAR_FAMILY_QWEN4_EXP,
+    &PULSAR_FAMILY_INKLING,
 };
 
 const pulsar_family *pulsar_family_for_model(const pulsar_model *m) {
