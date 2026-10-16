@@ -242,14 +242,15 @@ struct pulsar_tessera_proj;   /* src/cuda/mmq/pulsar_tessera.h (L255) */
  *  silu(gate x) * up x (gate + up stacks); RELU2: h = relu(up x)^2 (up-only stacks, no gate: Nemotron-H's experts).
  *  Zero is SWIGLU, so a descriptor that never names one keeps every arm's behaviour. */
 typedef enum { PULSAR_FFN_ACT_SWIGLU = 0, PULSAR_FFN_ACT_RELU2 = 1 } pulsar_ffn_act;
-/** One shared expert: out += scale[t] * down(silu(gate x) * up x), added after the routed sum (a block's N shared
+/** One shared expert: out += scale[t] * down(act(gate x, up x)), added after the routed sum (a block's N shared
  *  experts in order).  Task #44: one whose three Linears are EXL3 dense slices rides the routed launches (the EXL3
- *  routed front door, mmq/exl3_moe.cuh) -- keyed on that format; any other format runs
+ *  routed front door, mmq/exl3_moe.cuh) -- keyed on that format, SwiGLU only; any other runs
  *  pulsar_rows_moe_shared_launch. */
 typedef struct pulsar_rows_moe_shared {
-    pulsar_rows_linear gate, up, down;   /**< EXL3 (k2 != 0) all three to ride */
+    pulsar_rows_linear gate, up, down;   /**< EXL3 (k2 != 0) all three to ride; gate unread under RELU2 */
+    pulsar_ffn_act act;                  /**< L296 N4: SWIGLU (gate + up) or RELU2 (up only: a non-gated expert) */
     const float *scale;                  /**< [T] the shared term's multiplier (its router gamma), or NULL = 1 */
-    float *yg, *yu, *ys;                 /**< [T][mid], [T][mid], [T][out] f32 */
+    float *yg, *yu, *ys;                 /**< [T][mid] (SwiGLU's gate only), [T][mid], [T][out] f32 */
     uint16_t *h;                         /**< [T][mid] bf16: the SwiGLU rows the down reads (the imatrix tap's) */
     void *ws;                            /**< the dense arm's workspace, pulsar_rows_moe_shared_ws_bytes */
     size_t ws_bytes;
@@ -261,8 +262,8 @@ size_t pulsar_rows_moe_shared_ws_bytes(int T, int in, int mid, int out);
  *  sum.  Each pending fork needs its own yg / yu / ys / h rows; a block's shared experts fork in their order.
  *  0 on success. */
 int pulsar_rows_moe_shared_fork(const pulsar_rows_moe_shared *q, const uint16_t *x_bf16, int T, cudaStream_t stream);
-/** A shared expert that does not ride (another format, or a Tessera routed arm), after the routed sum is in `out`:
- *  out += scale * down(silu(gate x) * up x), the three linears through the front door's references
+/** A shared expert that does not ride (another format, a Tessera or BF16 routed arm, or RELU2), after the routed sum
+ *  is in `out`: out += scale * down(act(gate x, up x)), the linears through the front door's references
  *  (pulsar_linear_rows_ref), over q's buffers. */
 int pulsar_rows_moe_shared_launch(const pulsar_rows_moe_shared *q, const uint16_t *x_bf16, int T, float *out,
                                   cudaStream_t stream);
@@ -303,11 +304,14 @@ int pulsar_rows_moe_routed_launch(const pulsar_rows_moe *w, int32_t *sel, const 
                                   cudaStream_t stream);
 
 /** L295 F2: a rows MoE block's shape (the model's): the router's logit rows (pulsar_router_logit_rows), the routed
- *  experts, and N shared experts. */
+ *  experts, and N shared experts.  L296 N4: a LATENT block runs its routed experts on a narrower width -- the
+ *  latent projection's output (latent -> expert_mid -> latent), its sum projected back to hidden; 0 = none (the
+ *  routed experts on hidden). */
 typedef struct pulsar_moe_block_shape {
     int n_expert, top_k, n_logit_rows;
     int hidden, expert_mid;
     int n_shared, shared_mid;     /**< 0..PULSAR_ROUTER_SHARED_MAX shared experts, hidden -> shared_mid -> hidden */
+    int latent;                   /**< the routed experts' width (latent), or 0 */
 } pulsar_moe_block_shape;
 /** The block's workspace, carved: the router's outputs, the routed part's region, the shared experts'. */
 typedef struct pulsar_moe_block_parts {
@@ -322,6 +326,12 @@ typedef struct pulsar_moe_block_parts {
     uint16_t *h;        /**< [n_shared][T][shared_mid] the shared SwiGLUs' bf16 rows */
     void *lin;          /**< the shared experts' dense-arm workspace (one, shared) */
     size_t lin_bytes;
+    /* a latent block (shape.latent > 0; NULL otherwise) */
+    float *lat_f;       /**< [T][latent] f32: the latent projection's output, then the routed sum on the latent */
+    uint16_t *lat_x;    /**< [T][latent] bf16: the routed experts' input */
+    uint16_t *lat_y;    /**< [T][latent] bf16: the routed sum, the back projection's input */
+    void *lat_lin;      /**< the latent projections' dense-arm workspace */
+    size_t lat_lin_bytes;
 } pulsar_moe_block_parts;
 /** Workspace bytes for T rows of the whole block (a function of the shape alone); 0 for no shape. */
 size_t pulsar_moe_block_workspace_bytes(const pulsar_moe_block_shape *s, int T);

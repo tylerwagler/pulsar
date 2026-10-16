@@ -755,14 +755,20 @@ static void encode_chat_lead_in(const pulsar_vocab *vocab, bool has_system,
 
 
 
-/* The tokenizer and chat entries serve a family that declares a tokenizer
- * (family.h PULSAR_FAMILY_CAP_CHAT).  These entries return no error, so a
- * family without one ends the process here, by name, instead of tokenizing
- * with an empty vocabulary; the front ends refuse such an engine at startup
- * (pulsar_engine_has_tokenizer) before they can reach this. */
+/* The tokenizer entries serve a family with a tokenizer table (pulsar_family::tokenizer); the chat front's entries
+ * (chat_open / chat_turn / chat_end_assistant) a family that also declares its chat front (family.h
+ * PULSAR_FAMILY_CAP_CHAT) -- L295: a family's tokenizer can be wired before its chat renderer is (Inkling: token ids
+ * and text in and out, its turn-by-turn chat front still E6's).  These entries return no error, so a family without
+ * what they need ends the process here, by name, instead of tokenizing with an empty vocabulary; the front ends
+ * refuse such an engine at startup (pulsar_engine_has_tokenizer, which asks for both) before they can reach this. */
 static const pulsar_family_tokenizer *tokenizer_require(const pulsar_engine *e, const char *op) {
-    if (e && pulsar_family_require(e, PULSAR_FAMILY_CAP_CHAT, op) && e->family->tokenizer) return e->family->tokenizer;
-    fprintf(stderr, "pulsar: %s has no tokenizer in this build -- exiting\n", e ? e->family->name : "(no engine)");
+    if (e && e->family->tokenizer) return e->family->tokenizer;
+    fprintf(stderr, "pulsar: %s has no tokenizer table (%s) -- exiting\n", e ? e->family->name : "(no engine)", op);
+    exit(1);
+}
+static const pulsar_family_tokenizer *chat_require(const pulsar_engine *e, const char *op) {
+    if (e && pulsar_family_require(e, PULSAR_FAMILY_CAP_CHAT, op)) return tokenizer_require(e, op);
+    fprintf(stderr, "pulsar: %s has no chat front in this build -- exiting\n", e ? e->family->name : "(no engine)");
     exit(1);
 }
 
@@ -929,16 +935,16 @@ pulsar_text_span *pulsar_text_spans_slice(const pulsar_text_span *spans, uint32_
 
 void pulsar_chat_open(pulsar_engine *e, pulsar_tokens *tokens, const char *trusted, const char *system,
                       pulsar_think_mode think_mode) {
-    tokenizer_require(e, "pulsar_chat_open")->chat_open(e, tokens, trusted, system, think_mode);
+    chat_require(e, "pulsar_chat_open")->chat_open(e, tokens, trusted, system, think_mode);
 }
 
 void pulsar_chat_append_turn(pulsar_engine *e, pulsar_tokens *tokens, const pulsar_chat_message *msgs, int n,
                              bool generation_prompt, pulsar_think_mode think_mode) {
-    tokenizer_require(e, "pulsar_chat_append_turn")->chat_turn(e, tokens, msgs, n, generation_prompt, think_mode);
+    chat_require(e, "pulsar_chat_append_turn")->chat_turn(e, tokens, msgs, n, generation_prompt, think_mode);
 }
 
 void pulsar_chat_end_assistant(pulsar_engine *e, pulsar_tokens *tokens) {
-    tokenizer_require(e, "pulsar_chat_end_assistant")->chat_end_assistant(e, tokens);
+    chat_require(e, "pulsar_chat_end_assistant")->chat_end_assistant(e, tokens);
 }
 
 void pulsar_encode_chat_prompt(pulsar_engine *e, const char *system, const char *prompt, pulsar_think_mode think_mode,

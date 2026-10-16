@@ -177,6 +177,7 @@ tests/dspark_batch_gate
 /tests/mamba2_gate
 /tests/mamba2_bench
 /tests/head_gate
+/tests/rowops_gate
 /tests/qwen_chat_gate
 /tests/inkling_chat_gate
 /tests/nemotron_chat_gate
@@ -193,6 +194,7 @@ tests/sse-golden/out.txt
 /tests/loader_open
 /tests/inkling_family_gate
 /tests/nemotron_family_gate
+/tests/nemotron_fwd_gate
 /tests/prefill_chunk_census_probe
 /tests/vision_merge_gate
 /tests/vision_tower_gate

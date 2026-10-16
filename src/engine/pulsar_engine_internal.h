@@ -3224,6 +3224,10 @@ typedef enum {
 } pulsar_moe_arm;
 pulsar_moe_arm pulsar_moe_arm_for(const pulsar_tensor *gate, const pulsar_tensor *up, const pulsar_tensor *down,
                                   pulsar_act_format act);
+/** L296 N4: the arm of UP-ONLY experts (pulsar_ffn_act RELU2: an up and a down stack, no gate) at activation `act`:
+ *  BF16 up + down at raw bf16 rows (the BF16 routed arm's relu^2, L295 F7), else NONE -- no quant format has an
+ *  up-only arm yet.  The one authority the forward's front door and a family's load both ask. */
+pulsar_moe_arm pulsar_moe_arm_up_only(const pulsar_tensor *up, const pulsar_tensor *down, pulsar_act_format act);
 /** The routed part over the MX slot: out = the selected experts' weighted SwiGLU FFN of the activation armed for
  *  `x`; the up / mid / experts buffers are the backend's scratch.  A stack the rank's plan halved reads its halves. */
 typedef struct {
@@ -3247,6 +3251,16 @@ typedef struct {
     /** L295 F7: the experts' activation, a pulsar_ffn_act (src/cuda/pulsar_cuda_qwen.h): 0 SWIGLU (gate + up);
      *  RELU2 runs the BF16 arm's up-only stacks (gate NULL) */
     int act;
+    /** L296 N4: a LATENT MoE (both or neither): the routed experts run on latent_in's output width --
+     *  x_lat = bf16(latent_in x), the routed sum over x_lat (f32), out = latent_out(bf16(that sum)) -- each projection
+     *  through the dense front door (pulsar_linear_rows_ref) at the call's row kind.  The buffers are the rows MoE
+     *  block's latent parts (pulsar_cuda_qwen.h pulsar_moe_block_parts lat_*): lat_f f32 [n_rows][latent], lat_x /
+     *  lat_y bf16 [n_rows][latent], the projections' workspace.  No riding shared expert (it reads the full width). */
+    const pulsar_tensor *latent_in, *latent_out;
+    float *lat_f;
+    uint16_t *lat_x, *lat_y;
+    void *lat_ws;
+    size_t lat_ws_bytes;
     /** L255: the layer's routed experts as Tessera planes instead -- the three kernel-ready stacks the family
      *  built from them (family_qwen.h PULSAR_QWEN_TESS_*), or NULL; then gate / up / down are unread. */
     const struct pulsar_tessera_proj *tessera_gate, *tessera_up, *tessera_down;

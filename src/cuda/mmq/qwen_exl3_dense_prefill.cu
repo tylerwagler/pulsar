@@ -284,8 +284,21 @@ int qwen_exl3_dense_prefill_launch(const void *w, int k2, const void *x_bf16, fl
         fprintf(stderr, "%s: rate k2=%d has no instance (K = 2, 3, 4, 5, 6, 8) -- refusing\n", tag, k2);
         return -1;
     }
-    dense_prep_kernel<<<M, 256, (size_t)K * sizeof(float), stream>>>(static_cast<const __nv_bfloat16 *>(x_bf16), suh,
-                                                                       xhi, inv, K);
+    /* the prep holds one row's K f32 in shared memory: past the 48 KiB a launch gets by default (K > 12288 -- L295:
+     * Inkling's dense down, K 16384) the kernel opts in once to the larger carve-out.  The arithmetic is unchanged. */
+    const size_t prep_smem = (size_t)K * sizeof(float);
+    static size_t prep_smem_set = 48u * 1024u;
+    if (prep_smem > prep_smem_set) {
+        if (cudaFuncSetAttribute(dense_prep_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)prep_smem) !=
+            cudaSuccess) {
+            fprintf(stderr, "%s: the prep's %zu B of shared memory (K=%d) is refused by the device -- refusing\n", tag,
+                    prep_smem, K);
+            (void)cudaGetLastError();
+            return -1;
+        }
+        prep_smem_set = prep_smem;
+    }
+    dense_prep_kernel<<<M, 256, prep_smem, stream>>>(static_cast<const __nv_bfloat16 *>(x_bf16), suh, xhi, inv, K);
     const float one = 1.0f, zero = 0.0f;
     for (const lt_call *c : {call, tcall}) {
         if (!c) continue;

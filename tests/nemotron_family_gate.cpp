@@ -7,7 +7,9 @@
  * EVERY tensor of the directory is bound by its bind record, every byte priced by a role, and the price is what the
  * core stages and admission charges; every slot the plan declares is bound (and none it does not); the drafter's;
  * the engine facts; the tokenizer and chat front (N8: the container's tokenizer.json, the renderer turn by turn); and
- * the session entries refuse by name (the forward, N2-N7, is not wired).  The refusals (a missing tensor, a wrong
+ * the session side as declared (N3 / N7) -- the core driver's table covers the plan, the declared state is SSM FIXED
+ * DELTA + conv FIXED SNAPSHOT on each Mamba-2 layer and a KV POOL on each attention layer (and the drafter's slot), the
+ * caps (the forward itself is tests/nemotron_fwd_gate's, on the GPU).  The refusals (a missing tensor, a wrong
  * shape, an unknown switch, ...) are graded by tests/nemotron_family_gate.py, which runs this probe on the clean
  * container and tests/loader_open on each mutant.  Exit 0 = every check passed. */
 #include "families/nemotron_h/nemotron_h.h"
@@ -185,20 +187,40 @@ int main(int argc, char **argv) {
     check(e->routed_quant_bits() == (k2 ? 20 + k2 : 0), "routed quant tier %d (EXL3: 20 + the highest half-bit rate; "
           "BF16: 0)", e->routed_quant_bits());
 
-    /* the session entries refuse by name: the forward is not wired */
-    pulsar_session *dummy = (pulsar_session *)xcalloc(1, sizeof(pulsar_session));
-    dummy->engine = e;
-    const pulsar_family_session_ops *so = e->family->session;
-    check(so->create(dummy, 1) != 0, "a session's create refuses (the log names the driver blocks)");
-    char err[512] = "";
-    check(so->eval_row(dummy, 0, err, sizeof(err)) != 0 && strstr(err, "driver blocks"), "eval_row refuses: %s", err);
-    err[0] = 0;
-    check(so->decode_multiseq(dummy, NULL, 0, NULL, 0, err, sizeof(err)) != 0 && strstr(err, "driver blocks"),
-          "decode_multiseq refuses by name");
-    err[0] = 0;
-    check(so->decode_mixed(dummy, NULL, 0, NULL, 0, NULL, 0, err, sizeof(err)) != 0 && strstr(err, "driver blocks"),
-          "decode_mixed refuses by name");
-    free(dummy);
+    /* the session side as declared (N3 / N7): the driver's table covers the plan; the state is the Mamba-2 layers'
+     * SSM (FIXED, DELTA with its commit) + conv tail (FIXED, SNAPSHOT), the attention layers' K|V pool, the drafter's
+     * slot's K|V pool when the container holds the MTP module */
+    uint32_t miss_at = 0;
+    const char *miss = pulsar_driver_first_missing(e->family->driver, p, &miss_at);
+    check(e->family->driver && !miss, "the core driver's table covers the plan (%s)", miss ? miss : "nothing missing");
+    const pulsar_state_plan *sp = &e->state_plan;
+    const pulsar_state_decl &ssm = sp->decl[PULSAR_NEMOTRON_H_STATE_SSM], &conv = sp->decl[PULSAR_NEMOTRON_H_STATE_CONV],
+                            &kv = sp->decl[PULSAR_NEMOTRON_H_STATE_KV];
+    const uint64_t ssm_bytes = (uint64_t)s->ssm_n_head * s->ssm_head_dim * s->ssm_state * 4u;
+    const uint64_t conv_ch = (uint64_t)s->ssm_n_head * s->ssm_head_dim + 2ull * s->ssm_groups * s->ssm_state;
+    const uint64_t upd = ((uint64_t)s->ssm_n_head * s->ssm_head_dim + (uint64_t)s->ssm_groups * s->ssm_state +
+                          2ull * s->ssm_n_head + 3u) / 4u * 4u * 4u;
+    bool state_ok = sp->n_decl == PULSAR_NEMOTRON_H_STATE_COUNT && sp->split_invariant && sp->resume_grid > 0 &&
+                    ssm.kind == PULSAR_STATE_FIXED && ssm.capture == PULSAR_STATE_CAPTURE_DELTA && ssm.commit &&
+                    ssm.bytes == ssm_bytes && ssm.capture_bytes == upd &&
+                    conv.kind == PULSAR_STATE_FIXED && conv.capture == PULSAR_STATE_CAPTURE_SNAPSHOT &&
+                    conv.bytes == (uint64_t)(s->conv_k - 1u) * conv_ch * 2u &&
+                    kv.kind == PULSAR_STATE_POOL && kv.tokens == 1u &&
+                    kv.bytes == 2ull * s->n_head_kv * s->head_dim * 2u &&
+                    sp->n_trunk == s->n_layer && sp->n_slots == s->n_layer + (s->mtp_written ? 1u : 0u);
+    for (uint32_t il = 0; state_ok && il < s->n_layer; il++)
+        state_ok = sp->slot[il] == (p->desc[il].mixer == PULSAR_MIXER_MAMBA2
+                                        ? (1u << PULSAR_NEMOTRON_H_STATE_SSM | 1u << PULSAR_NEMOTRON_H_STATE_CONV)
+                                        : 1u << PULSAR_NEMOTRON_H_STATE_KV);
+    if (state_ok && s->mtp_written) state_ok = sp->slot[s->n_layer] == 1u << PULSAR_NEMOTRON_H_STATE_KV;
+    check(state_ok, "the declared state: ssm FIXED DELTA %llu B (+ %llu B a verify row), ssm_conv FIXED SNAPSHOT %llu B "
+          "a Mamba-2 layer; kv POOL %llu B a token an attention layer%s", (unsigned long long)ssm.bytes,
+          (unsigned long long)ssm.capture_bytes, (unsigned long long)conv.bytes, (unsigned long long)kv.bytes,
+          s->mtp_written ? " and the drafter's slot" : "");
+    const uint32_t want = PULSAR_FAMILY_CAP_CHAT | PULSAR_FAMILY_CAP_BANKS | PULSAR_FAMILY_CAP_SEGMENTS |
+                          PULSAR_FAMILY_CAP_PAYLOAD;
+    check(e->family->caps == want && e->family->spec == NULL, "caps 0x%x (chat, banks, segments, payload; no spec / TP "
+          "/ images yet)", e->family->caps);
     pulsar_engine_close(e);
     fprintf(stderr, "NEMOTRON-FAMILY PROBE %s\n", n_fail ? "FAIL" : "PASS");
     return n_fail ? 1 : 0;

@@ -8,8 +8,10 @@
  *
  *   the MX SLOT (E4M3 armed in the backend's cache for the f32 block input -- DeepSeek; pulsar_moe_routed_slot):
  *       CUTLASS MXFP4, IQ2 MMQ, EXL3, and the mixed CUTLASS / MMQ shapes -> the backend's routed dispatcher
- *   raw bf16 ROWS (Qwen; pulsar_moe_routed_rows):
- *       EXL3 fused gate_up + down, or an EXL3 gate + up pair + down -> pulsar_rows_moe_routed_launch
+ *   raw bf16 ROWS (Qwen, Nemotron-H; pulsar_moe_routed_rows):
+ *       EXL3 fused gate_up + down, or an EXL3 gate + up pair + down, or BF16 stacks (L295 F7; up-only relu^2 among
+ *       them, pulsar_ffn_act) -> pulsar_rows_moe_routed_launch; a LATENT block (L296 N4) wraps the routed part in its
+ *       two projections (latent_in -> the routed experts on the latent -> latent_out), each through the dense front door
  *
  * What a tensor-parallel rank reads is the rank's plan's (tp_slice.cpp), not the family's: a stack the plan
  * halved (expert tensor-parallel, MXFP4 or EXL3) reads the halves registered under the engine key; a stack the plan
@@ -17,6 +19,7 @@
 #include "pulsar_engine_internal.h"
 #include "exl3_trellis.h"
 #include "cuda/pulsar_cuda_qwen.h"
+#include "cuda/pulsar_cuda_rowops.h"
 #include "cuda/mmq/pulsar_tessera.h"
 
 pulsar_moe_arm pulsar_moe_arm_for(const pulsar_tensor *gate, const pulsar_tensor *up, const pulsar_tensor *down,
@@ -38,6 +41,14 @@ pulsar_moe_arm pulsar_moe_arm_for(const pulsar_tensor *gate, const pulsar_tensor
         if (up && pulsar_format_serves(gate->type, PULSAR_ROLE_EXPERT_GATE_UP, act)) return PULSAR_MOE_ARM_ROWS_PAIR;
     }
     return PULSAR_MOE_ARM_NONE;
+}
+
+pulsar_moe_arm pulsar_moe_arm_up_only(const pulsar_tensor *up, const pulsar_tensor *down, pulsar_act_format act) {
+    if (!up || !down || act != PULSAR_ACT_ROWS_BF16) return PULSAR_MOE_ARM_NONE;
+    const bool bf16 = up->type == PULSAR_TENSOR_BF16 && down->type == PULSAR_TENSOR_BF16 &&
+                      pulsar_format_serves(up->type, PULSAR_ROLE_EXPERT_GATE_UP, act) &&
+                      pulsar_format_serves(down->type, PULSAR_ROLE_EXPERT_DOWN, act);
+    return bf16 ? PULSAR_MOE_ARM_ROWS_BF16 : PULSAR_MOE_ARM_NONE;
 }
 
 static void say_no_arm(const pulsar_tensor *gate, const pulsar_tensor *down, const char *against) {
@@ -93,7 +104,44 @@ bool pulsar_moe_routed_slot(const pulsar_moe_slot_call *c) {
                                               c->layer, c->n_tokens, split) != 0;
 }
 
+/* L296 N4: the latent wrapper -- x_lat = bf16(latent_in x); the routed experts on x_lat into lat_f (f32, the block's
+ * routed sum on the latent); out = latent_out(bf16(lat_f)).  The two bf16 roundings are the producers' (rule 3): the
+ * routed experts read bf16 rows, the back projection reads bf16 rows. */
+static bool latent_rows(const pulsar_moe_rows_call *c) {
+    const pulsar_tensor *Li = c->latent_in, *Lo = c->latent_out;
+    if (!Li || !Lo || Li->ndim != 2 || Lo->ndim != 2 || Lo->dim[0] != Li->dim[1] || Lo->dim[1] != Li->dim[0] ||
+        !c->lat_f || !c->lat_x || !c->lat_y || c->shared || c->n_shared) {
+        fprintf(stderr, "pulsar: routed MoE: a latent block needs both projections (hidden -> latent -> hidden), its "
+                        "latent buffers and no riding shared expert -- refusing\n");
+        return false;
+    }
+    const int H = (int)Li->dim[0], L = (int)Li->dim[1], n = c->n_rows;
+    pulsar_rows_linear fc1{}, fc2{};
+    if (!pulsar_linear_rows_ref(c->m, Li, H, L, c->prompt, "MoE latent in", &fc1) ||
+        !pulsar_linear_rows_ref(c->m, Lo, L, H, c->prompt, "MoE latent out", &fc2))
+        return false;
+    if (pulsar_rows_linear_launch(&fc1, c->x_bf16, n, c->lat_f, c->lat_ws, c->lat_ws_bytes, 0) != 0 ||
+        pulsar_rows_emit_bf16_launch(c->lat_f, (uint64_t)L, (uint32_t)n, (uint32_t)L, NULL, PULSAR_ROWS_SCALE_NONE,
+                                     c->lat_x, (uint64_t)L, 0) != 0) {
+        fprintf(stderr, "pulsar: routed MoE: the latent projection %d -> %d refused\n", H, L);
+        return false;
+    }
+    pulsar_moe_rows_call r = *c;
+    r.latent_in = r.latent_out = NULL;
+    r.x_bf16 = c->lat_x;
+    r.out = c->lat_f;   /* the routed sum on the latent (the fc1 output is consumed: lat_x holds its bf16 rows) */
+    if (!pulsar_moe_routed_rows(&r)) return false;
+    if (pulsar_rows_emit_bf16_launch(c->lat_f, (uint64_t)L, (uint32_t)n, (uint32_t)L, NULL, PULSAR_ROWS_SCALE_NONE,
+                                     c->lat_y, (uint64_t)L, 0) != 0 ||
+        pulsar_rows_linear_launch(&fc2, c->lat_y, n, c->out, c->lat_ws, c->lat_ws_bytes, 0) != 0) {
+        fprintf(stderr, "pulsar: routed MoE: the latent back projection %d -> %d refused\n", L, H);
+        return false;
+    }
+    return true;
+}
+
 bool pulsar_moe_routed_rows(const pulsar_moe_rows_call *c) {
+    if (c->latent_in || c->latent_out) return latent_rows(c);
     if (c->tessera_gate) {
         /* L255: Tessera planes carry no format the registry names -- the family admitted them plane by plane
          * (admit_tessera) and built the three descriptors; the arm takes every expert (no range: the family refuses
@@ -119,8 +167,8 @@ bool pulsar_moe_routed_rows(const pulsar_moe_rows_call *c) {
     /* L295 F7: a non-gated activation (RELU2) reads up-only experts, which only the BF16 arm runs */
     const pulsar_ffn_act act = (pulsar_ffn_act)c->act;
     if (act != PULSAR_FFN_ACT_SWIGLU) {
-        if (act != PULSAR_FFN_ACT_RELU2 || G || !U || !D || U->type != PULSAR_TENSOR_BF16 ||
-            D->type != PULSAR_TENSOR_BF16 || !pulsar_format_serves(U->type, PULSAR_ROLE_EXPERT_GATE_UP, PULSAR_ACT_ROWS_BF16)) {
+        if (act != PULSAR_FFN_ACT_RELU2 || G ||
+            pulsar_moe_arm_up_only(U, D, PULSAR_ACT_ROWS_BF16) != PULSAR_MOE_ARM_ROWS_BF16) {
             fprintf(stderr, "pulsar: routed MoE: activation %d runs BF16 up-only experts (no gate stack) alone -- "
                             "refusing\n", (int)act);
             return false;
