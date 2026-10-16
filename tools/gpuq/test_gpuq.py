@@ -388,6 +388,23 @@ class Q(unittest.TestCase):
         self.assertEqual(self.lines(), [])
         self.assertEqual(self.q("cancel", str(a), check=False).returncode, 1)
 
+    def test_bump(self):
+        a = self.sh("short", "sleep 100")
+        b = self.sh("short", f"echo B >> {self.out}")
+        c = self.sh("short", f"echo C >> {self.out}")
+        d = self.sh("short", f"echo D >> {self.out}")
+        self.until(lambda: self.state(a) == "running")
+        self.q("bump", str(d))
+        time.sleep(0.05)
+        self.q("bump", str(c))
+        self.assertEqual(self.q("bump", str(a), check=False).returncode, 1)   # running: not queued
+        self.q("cancel", str(a))
+        for i in (b, c, d):
+            self.final(i)
+        self.assertEqual(self.lines(), ["D", "C", "B"])
+        self.assertFalse(os.path.exists(os.path.join(self.dir, "spool", "jobs", f"{d}.bump")))
+        self.assertEqual(self.q("bump", str(d), check=False).returncode, 1)   # done: not queued
+
     def test_env_and_resources(self):
         i = self.sh("short", f"echo $GPUQ_JOB_ID $GPUQ_CLASS $GPUQ_ATTEMPT >> {self.out};"
                              f" ls -l /proc/$$/fd >> {os.path.join(self.dir, 'fds')}")
