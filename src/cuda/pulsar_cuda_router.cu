@@ -70,10 +70,17 @@ __device__ __forceinline__ float softplus_dev(float x) {
     return log1pf(expf(x));
 }
 
-/* (a, ai) ranks before (b, bi): the larger value, ties to the lower expert id. */
-__device__ __forceinline__ bool ranks_before(float av, int ai, float bv, int bi) {
-    return av > bv || (av == bv && ai < bi);
+/* A finite selection score as an unsigned key whose integer order is the float order (the larger value, the larger
+ * key).  +0, -0 and the subnormals map to one key: the kernels build with --use_fast_math, whose float compares
+ * flush subnormal operands, so they are all equal there too -- the keys order exactly as the float compares do. */
+__device__ __forceinline__ uint32_t score_key(float v) {
+    uint32_t u = __float_as_uint(v);
+    if ((u & 0x7f800000u) == 0u) u = 0u;
+    return (u & 0x80000000u) ? ~u : (u | 0x80000000u);
 }
+
+/* The bits an expert id below n + 1 takes. */
+__host__ __device__ constexpr int id_bits(int n) { return n > 0 ? 1 + id_bits(n >> 1) : 0; }
 
 /* The device copy of the cfg and the layer, by value. */
 struct router_args {
@@ -82,16 +89,26 @@ struct router_args {
     int n_rows;               ///< logit row width
 };
 
-/* One warp per row: each lane holds the NE / 32 experts lane, lane + 32, ...; the TOPK picks are a TOPK-round warp
- * argmax over the selection score carrying the weight's source value (the unbiased score, or for the sink
- * renormalisation the raw logit); lane 0 renormalises and writes. */
+/* One warp per row: each lane holds the NE / 32 experts lane, lane + 32, ...  The picks are the TOPK first experts in
+ * the total order (selection score descending, ties to the lower expert id), in that order, each carrying its
+ * weight's source value (the unbiased score, or for the sink renormalisation the raw logit); lane 0 renormalises
+ * and writes.  The pick (L296 dec2): the TOPK-th largest score key by a bitwise search over warp counts, the ties at
+ * it resolved by a second search over the expert id, the TOPK chosen compacted into shared memory and placed by
+ * their rank among themselves -- the same set in the same order as a TOPK-round argmax, in a short loop (the
+ * unrolled 22-round argmax was 415 KB of code, and a decode step's cold instruction fetches made it 33 us). */
 template <int NE, int TOPK>
 __global__ void __launch_bounds__(kSelectWarps * 32)
 router_select_kernel(router_args a, const float *__restrict__ logits, const int32_t *__restrict__ tokens, int T,
                      int32_t *__restrict__ selected, float *__restrict__ weights, float *__restrict__ gammas,
                      float *__restrict__ probs) {
     static_assert(NE % 32 == 0, "experts per lane must be whole");
+    static_assert(TOPK <= 32, "the picks are placed by one lane each");
     constexpr int PER = NE / 32;
+    __shared__ uint32_t s_key[kSelectWarps][32];
+    __shared__ int32_t s_id[kSelectWarps][32];
+    __shared__ float s_carry[kSelectWarps][32];
+    __shared__ int32_t s_pick_id[kSelectWarps][TOPK];
+    __shared__ float s_pick_val[kSelectWarps][TOPK];
     const pulsar_router_cfg &c = a.c;
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const int t = blockIdx.x * kSelectWarps + warp;
@@ -132,17 +149,21 @@ router_select_kernel(router_args a, const float *__restrict__ logits, const int3
         for (int i = 0; i < PER; ++i) probs[(size_t)t * NE + lane + 32 * i] = p[i];
     }
     /* A non-finite score row has no routing (rule 9): experts 0..k-1 with NaN weights, so the NaN reaches the block
-     * output and the sum's non-finite flag names the layer -- never a plausible routing. */
-    bool bad = false;
-#pragma unroll
-    for (int i = 0; i < PER; ++i) bad |= !isfinite(p[i]);
-    if (__any_sync(0xffffffffu, bad)) {
+     * output and the sum's non-finite flag names the layer -- never a plausible routing.  The same for a row whose
+     * SELECTION score (score + bias) is not finite. */
+    const auto no_routing = [&]() {
         const float qnan = __int_as_float(0x7fc00000);
         if (lane < TOPK) {
             sel[lane] = lane;
             w[lane] = qnan;
         }
         if (lane < S) gammas[(size_t)lane * T + t] = qnan;
+    };
+    bool bad = false;
+#pragma unroll
+    for (int i = 0; i < PER; ++i) bad |= !isfinite(p[i]);
+    if (__any_sync(0xffffffffu, bad)) {
+        no_routing();
         return;
     }
 
@@ -172,33 +193,103 @@ router_select_kernel(router_args a, const float *__restrict__ logits, const int3
         }
     } else {
         const float *bias = alt ? a.l.alt_bias : a.l.bias;
-        float score[PER], carry[PER];
+        uint32_t key[PER];
+        float carry[PER];
+        bool nf = false;
 #pragma unroll
         for (int i = 0; i < PER; ++i) {
-            score[i] = bias ? p[i] + bias[lane + 32 * i] : p[i];
+            const float score = bias ? p[i] + bias[lane + 32 * i] : p[i];
+            nf |= !isfinite(score);
+            key[i] = score_key(score);
             carry[i] = sinks ? raw[i] : p[i];
         }
+        if (__any_sync(0xffffffffu, nf)) {
+            no_routing();
+            return;
+        }
+        /* kt = the TOPK-th largest key: the largest kt with at least TOPK keys >= kt, built bit by bit below the
+         * bits every key of the row shares (the high bits of the smallest and largest key that agree) */
+        uint32_t lo = key[0], hi = key[0];
+#pragma unroll
+        for (int i = 1; i < PER; ++i) {
+            lo = min(lo, key[i]);
+            hi = max(hi, key[i]);
+        }
+        lo = __reduce_min_sync(0xffffffffu, lo);
+        hi = __reduce_max_sync(0xffffffffu, hi);
+        const int free_bits = lo == hi ? 0 : 32 - __clz((int)(lo ^ hi));
+        uint32_t kt = free_bits == 32 ? 0u : hi >> free_bits << free_bits;
+#pragma unroll 1
+        for (int b = free_bits - 1; b >= 0; --b) {
+            const uint32_t cand = kt | (1u << b);
+            int n = 0;
+#pragma unroll
+            for (int i = 0; i < PER; ++i) n += key[i] >= cand ? 1 : 0;
+            if (__reduce_add_sync(0xffffffffu, n) >= TOPK) kt = cand;
+        }
+        /* the keys above kt are all picks; the remaining picks are the keys equal to kt with the lowest ids: the
+         * last one's id xt is the largest x with fewer than `need` ties below it */
+        int n_gt = 0, n_eq = 0;
+#pragma unroll
+        for (int i = 0; i < PER; ++i) {
+            n_gt += key[i] > kt ? 1 : 0;
+            n_eq += key[i] == kt ? 1 : 0;
+        }
+        n_gt = __reduce_add_sync(0xffffffffu, n_gt);
+        n_eq = __reduce_add_sync(0xffffffffu, n_eq);
+        const int need = TOPK - n_gt;
+        int xt = NE;
+        if (n_eq > need) {
+            constexpr int kIdBits = id_bits(NE - 1);
+            xt = 0;
+#pragma unroll 1
+            for (int b = kIdBits - 1; b >= 0; --b) {
+                const int cand = xt | (1 << b);
+                int n = 0;
+#pragma unroll
+                for (int i = 0; i < PER; ++i) n += key[i] == kt && lane + 32 * i < cand ? 1 : 0;
+                if (__reduce_add_sync(0xffffffffu, n) < need) xt = cand;
+            }
+        }
+        /* compact the TOPK picks into shared memory (lane order), then each lands at its rank among the picks */
+        uint32_t mine = 0;
+#pragma unroll
+        for (int i = 0; i < PER; ++i)
+            if (key[i] > kt || (key[i] == kt && lane + 32 * i <= xt)) mine |= 1u << i;
+        const int cnt = __popc(mine);
+        int off = cnt;
+#pragma unroll
+        for (int o = 1; o < 32; o <<= 1) {
+            const int v = __shfl_up_sync(0xffffffffu, off, o);
+            if (lane >= o) off += v;
+        }
+        off -= cnt;
+#pragma unroll
+        for (int i = 0; i < PER; ++i)
+            if (mine >> i & 1u) {
+                s_key[warp][off] = key[i];
+                s_id[warp][off] = lane + 32 * i;
+                s_carry[warp][off] = carry[i];
+                ++off;
+            }
+        __syncwarp();
+        if (lane < TOPK) {
+            const uint32_t k0 = s_key[warp][lane];
+            const int32_t e0 = s_id[warp][lane];
+            int rank = 0;
+#pragma unroll
+            for (int m = 0; m < TOPK; ++m) {
+                const uint32_t km = s_key[warp][m];
+                rank += km > k0 || (km == k0 && s_id[warp][m] < e0) ? 1 : 0;
+            }
+            s_pick_id[warp][rank] = e0;
+            s_pick_val[warp][rank] = s_carry[warp][lane];
+        }
+        __syncwarp();
 #pragma unroll
         for (int k = 0; k < TOPK; ++k) {
-            float bs = -INFINITY, bv = 0.0f;
-            int be = 0x7fffffff;
-#pragma unroll
-            for (int i = 0; i < PER; ++i) {
-                const int e = lane + 32 * i;
-                if (ranks_before(score[i], e, bs, be)) { bs = score[i]; bv = carry[i]; be = e; }
-            }
-#pragma unroll
-            for (int o = 16; o > 0; o >>= 1) {
-                const float os = __shfl_xor_sync(0xffffffffu, bs, o);
-                const float ov = __shfl_xor_sync(0xffffffffu, bv, o);
-                const int oe = __shfl_xor_sync(0xffffffffu, be, o);
-                if (ranks_before(os, oe, bs, be)) { bs = os; bv = ov; be = oe; }
-            }
-#pragma unroll
-            for (int i = 0; i < PER; ++i)
-                if (lane + 32 * i == be) score[i] = -INFINITY;
-            ids[k] = be;
-            vals[k] = bv;
+            ids[k] = s_pick_id[warp][k];
+            vals[k] = s_pick_val[warp][k];
         }
     }
     if (lane != 0) return;
