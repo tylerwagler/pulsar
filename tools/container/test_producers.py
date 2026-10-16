@@ -497,7 +497,20 @@ def check_refusals() -> None:
         fail("cutlass_mxfp4 accepted in=48")
     except ValueError:
         pass
-    ok("refusals: mxfp8_lt non-128-aligned shapes and non-{32,128} blocks, cutlass_mxfp4 in%32")
+    try:
+        P.nvfp4(bytes(8 * 48), bytes(8 * 6), bytes(4), 8, 96)
+        fail("nvfp4 accepted in=96 (not a multiple of 64)")
+    except ValueError:
+        pass
+    try:
+        P.bytes_for("nvfp4", [96, 8])
+        fail("bytes_for nvfp4 accepted in=96")
+    except ValueError:
+        pass
+    if P.bytes_for("nvfp4", [128, 200]) != 200 * 64 + 256 * 8 + 32:
+        fail("bytes_for nvfp4 [in 128, out 200] != out*in/2 + rup(out,128)*in/16 + 32")
+    ok("refusals: mxfp8_lt non-128-aligned shapes and non-{32,128} blocks, cutlass_mxfp4 in%32, nvfp4 in%64; "
+       "bytes_for nvfp4")
 
 
 def main() -> int:

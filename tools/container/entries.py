@@ -2,7 +2,8 @@
 
 Both families' plans call these.  What decides the bytes is (source kind, target format) -> producer
 (producers.PRODUCER_FOR); a pair the table lacks refuses by name.  The source kind is the HF tensor's stored dtype,
-`+scale` when it carries an FP8 / FP4 block-scale companion (`X.scale` beside `X.weight`), or `exl3` for an
+`+scale` when it carries an FP8 / FP4 block-scale companion (`X.scale` beside `X.weight`), `+nvfp4` for a ModelOpt
+NVFP4 Linear (`X.weight_scale` + `X.weight_scale_2` beside `X.weight`), or `exl3` for an
 exllamav3 Linear (trellis | suh | svh, copied verbatim)."""
 from __future__ import annotations
 
@@ -17,7 +18,11 @@ def scale_of(name: str) -> str | None:
 def kind_of(hf, name: str) -> str:
     """The source kind of HF tensor `name`."""
     s = scale_of(name)
-    return PR.source_kind(hf.dtype(name), s is not None and hf.has(s))
+    if s is None:
+        return PR.source_kind(hf.dtype(name), None)
+    if hf.has(name + "_scale"):             # ModelOpt NVFP4: X.weight_scale + X.weight_scale_2
+        return PR.source_kind(hf.dtype(name), "nvfp4")
+    return PR.source_kind(hf.dtype(name), "scale" if hf.has(s) else None)
 
 
 def dense(hf, name: str, layout: str, dshape: list, mxfp8_mode: str = "rederive") -> dict:
@@ -44,6 +49,11 @@ def dense(hf, name: str, layout: str, dshape: list, mxfp8_mode: str = "rederive"
     elif prod == "mxfp8_lt_from_bf16":
         out, inp = hshape
         desc = PR.spec(prod, [name], out=out, inp=inp)
+    elif prod == "nvfp4":
+        out, inp = dshape                   # the LOGICAL [out, in] (the source holds [out, in/2] bytes)
+        if PR.matrix_dims(kind, hshape) != (out, inp):
+            raise SystemExit(f"{name}: nvfp4 declared [{out}, {inp}], the source holds {kind} {hshape}")
+        desc = PR.spec(prod, [name, name + "_scale", name + "_scale_2"], out=out, inp=inp)
     elif prod == "fp8_e4m3_soa_k_from_bf16":
         rows, cols = hshape
         desc = PR.spec(prod, [name], rows=rows, cols=cols)
