@@ -17,6 +17,13 @@ module, vision tensors):
   * refusals by name: an unknown tensor, a missing tensor, a wrong shape, a switch (relu2 -> silu), a dt clamp
     (time_step_limit [0.001, inf]), a moe with no mixer before it, an `mlp` block, half a drafter omitted, an
     omitted main-model tensor
+  * the LiLiCorr drafter (--drafter lilicorr DIR, L298) on a synthetic ModelOpt W4A16_NVFP4 checkpoint at small dims
+    (the real key set and tensor list): the target's MTP omitted -> shard `drafter` after `top`, pulsar.mtp_present
+    false, pulsar.drafter "lilicorr"; the exact lilicorr.* kv set; every tensor's role / block / layer / layout /
+    dims_ne; an nvfp4 payload == nibbles + the E4M3 scales tiled by a direct loop of the 128x4 formula + scale_2 +
+    zeros; refusals: an unknown config key (top level and dflash_config), a pinned switch, an unknown / missing tensor,
+    a wrong dtype, the exclude list disagreeing both ways, the target disagreeing, --drafter with the MTP written, the
+    drafter recipe without --drafter, --drafter on another family
 """
 from __future__ import annotations
 
@@ -37,9 +44,11 @@ sys.path.insert(0, HERE)
 from test_qwen import bf16, write_st, exl3_parts  # noqa: E402
 
 FAILS: list[str] = []
-# sha256 over (file name, sha256(file)) of every emitted file but the side files; fixed when the family landed (L296 N1)
+# sha256 over (file name, sha256(file)) of every emitted file but the side files; fixed when the family landed (L296 N1),
+# moved once by L298: pulsar.kv gained `pulsar.drafter` = "" (and its pulsar.kv_arch copy) -- every tensor header and
+# payload byte-identical to L296's (graded against origin/dev 8e9d4c13's builder on this checkpoint, bf16 and k4)
 GOLDEN = {
-    "bf16": "5b1b9a7921dc9fbe143774827d9ee7e60f3637def4fc2dfe390beec4ea4a8289",
+    "bf16": "fb82c1c902bf57de861545a4c7cb8f0598b16cb1284af1eb4679fbcce25e9b06",
 }
 H, V, NQ, NKV, HD = 128, 64, 4, 2, 32
 NH, HDM, N, G, CK = 8, 32, 16, 2, 4          # Mamba: heads, head dim (d_inner 256 = 2 x H), state, groups, conv
@@ -147,6 +156,274 @@ def make_exl3(root, hf_t, rng, K=4, experts=False, prefixed=False):
     return t
 
 
+# ---------------------------------------------------------------------------
+# the LiLiCorr drafter (L298): small dims, the real key set and tensor list
+# ---------------------------------------------------------------------------
+DL, DNQ, DNKV, DHD, DI_, DTAPS, DGRP = 5, 4, 2, 32, 128, 2, 16      # layers, heads, kv heads, head dim, mlp, conv
+LL, LNH, LTOPK, LBLK, LF, LNL = 64, 2, 2, 4, 32, 2                  # lattice hidden, heads, top-k, block, factor, layers
+DTL = [1, 3]                                                        # target_layer_ids (HF blocks of the 5-block target)
+D_EXCLUDE = ["*attention_conv*", "*mlp_conv*", "*self_attn*", "*norm", "*lilicorr.anchor_out_head",
+             "*lilicorr.factor_input_proj", "*lilicorr.feature_mlp*", "*lilicorr.in_head", "*lilicorr.out_head",
+             "*qkv_proj"]
+
+
+def drafter_config():
+    return {
+        "architectures": ["LiLiCorrDraftModel"], "model_type": "qwen3", "block_size": LBLK,
+        "dflash_config": {"mask_token_id": 3, "target_layer_ids": list(DTL), "causal": False,
+                          "projector_type": "lilicorr", "lilicorr_enabled": True, "lilicorr_candidate_topk": LTOPK,
+                          "lilicorr_hidden_size": LL, "lilicorr_num_layers": LNL, "lilicorr_num_heads": LNH,
+                          "lilicorr_mlp_ratio": 2.0, "lilicorr_factor_dim": LF, "lilicorr_vector_eps": 0.0001,
+                          "lilicorr_logit_scale": 8.0, "conv_kernel_size": DTAPS, "conv_group_size": DGRP,
+                          "use_swa": True, "swa_window_size": 64},
+        "hidden_size": H, "num_hidden_layers": DL, "num_attention_heads": DNQ, "num_key_value_heads": DNKV,
+        "head_dim": DHD, "intermediate_size": DI_, "hidden_act": "silu", "rms_norm_eps": 1e-05, "vocab_size": V,
+        "max_position_embeddings": 4096, "initializer_range": 0.02, "attention_bias": False, "attention_dropout": 0.0,
+        "rope_theta": 1000000.0, "rope_scaling": None, "tie_word_embeddings": False, "torch_dtype": "bfloat16",
+        "num_target_layers": len(BLOCKS), "layer_types": ["sliding_attention"] * DL, "sliding_window": 64,
+        "use_sliding_window": True, "max_window_layers": 0, "has_own_lm_head": True, "draft_vocab_size": V,
+        "quantization_config": {"quant_algo": "W4A16_NVFP4", "kv_cache_quant_algo": None, "group_size": 16,
+                                "exclude_modules": list(D_EXCLUDE), "quant_method": "modelopt_fp4",
+                                "ignore": list(D_EXCLUDE)},
+    }
+
+
+def drafter_shapes():
+    """{HF name: (shape, nvfp4?)}: the LOGICAL [out, in] of a quantized Linear."""
+    kp = [2 * DTAPS * H // DGRP, H]
+    s = {"fc.weight": ([H, len(DTL) * H], True), "hidden_norm.weight": ([H], False), "norm.weight": ([H], False),
+         "lm_head.weight": ([V, H], True)}
+    for i in range(DL):
+        p = f"layers.{i}."
+        s.update({p + "input_layernorm.weight": ([H], False), p + "post_attention_layernorm.weight": ([H], False),
+                  p + "self_attn.q_proj.weight": ([DNQ * DHD, H], False),
+                  p + "self_attn.k_proj.weight": ([DNKV * DHD, H], False),
+                  p + "self_attn.v_proj.weight": ([DNKV * DHD, H], False),
+                  p + "self_attn.o_proj.weight": ([H, DNQ * DHD], False),
+                  p + "self_attn.q_norm.weight": ([DHD], False), p + "self_attn.k_norm.weight": ([DHD], False),
+                  p + "attention_conv.base_kernel": ([2, DTAPS, H], False),
+                  p + "attention_conv.kernel_projection.weight": (kp, False),
+                  p + "mlp_conv.base_kernel": ([2, DTAPS, H], False),
+                  p + "mlp_conv.kernel_projection.weight": (kp, False),
+                  p + "mlp.gate_proj.weight": ([DI_, H], True), p + "mlp.up_proj.weight": ([DI_, H], True),
+                  p + "mlp.down_proj.weight": ([H, DI_], True)})
+    q = "lilicorr."
+    for n in ("token_proj", "pass_hidden_proj", "context_proj"):
+        s[q + n + ".weight"], s[q + n + ".bias"] = ([LL, H], True), ([LL], False)
+    s.update({q + "feature_norm.weight": ([5], False), q + "feature_norm.bias": ([5], False),
+              q + "feature_mlp.up_proj.weight": ([LL, 5], False), q + "feature_mlp.up_proj.bias": ([LL], False),
+              q + "feature_mlp.down_proj.weight": ([LL, LL], False), q + "feature_mlp.down_proj.bias": ([LL], False),
+              q + "slot_embedding": ([1, 1, LBLK - 1, 1, LL], False), q + "rank_embedding": ([1, 1, 1, LTOPK, LL], False),
+              q + "relative_slot_bias": ([LNH, 2 * LBLK - 1], False), q + "same_slot_bias": ([LNH], False),
+              q + "output_norm.weight": ([LL], False), q + "anchor_norm.weight": ([LL], False),
+              q + "factor_input_proj.weight": ([LL, 3 * LL], False), q + "factor_input_proj.bias": ([LL], False)})
+    for n in ("out_head", "in_head", "anchor_out_head"):
+        s[q + n + ".weight"], s[q + n + ".bias"] = ([LF, LL], False), ([LF], False)
+    for i in range(LNL):
+        p = f"{q}layers.{i}."
+        s.update({p + "attn_norm.weight": ([LL], False), p + "attn.in_proj_weight": ([3 * LL, LL], False),
+                  p + "attn.in_proj_bias": ([3 * LL], False), p + "attn.out_proj.weight": ([LL, LL], True),
+                  p + "attn.out_proj.bias": ([LL], False), p + "mlp_norm.weight": ([LL], False),
+                  p + "mlp.up_proj.weight": ([2 * LL, LL], True), p + "mlp.up_proj.bias": ([2 * LL], False),
+                  p + "mlp.down_proj.weight": ([LL, 2 * LL], True), p + "mlp.down_proj.bias": ([LL], False)})
+    return s
+
+
+def make_drafter(root, rng, cfg=None, edit=None):
+    """A one-file ModelOpt W4A16_NVFP4 checkpoint (config.json + model.safetensors, no index -- as shipped)."""
+    os.makedirs(root, exist_ok=True)
+    json.dump(cfg or drafter_config(), open(os.path.join(root, "config.json"), "w"))
+    t = {}
+    for n, (shape, q) in drafter_shapes().items():
+        if q:
+            out, inp = shape
+            t[n] = ("U8", [out, inp // 2], rng.integers(0, 256, out * inp // 2, dtype=np.uint8).tobytes())
+            t[n + "_scale"] = ("F8_E4M3", [out, inp // 16], rng.integers(0, 0x7F, out * inp // 16, dtype=np.uint8).tobytes())
+            t[n + "_scale_2"] = ("F32", [], np.float32(rng.uniform(1e-4, 1e-2)).tobytes())
+        else:
+            a = rng.standard_normal(shape).astype(np.float32) * 0.05
+            t[n] = ("BF16", list(shape), bf16(a).tobytes())
+    if edit:
+        edit(t)
+    write_st(os.path.join(root, "model.safetensors"), t)
+    return t
+
+
+def nvfp4_ref(w, sc, s2, out, inp):
+    """The nvfp4 entry by a direct loop over the engine's 128x4 tile formula (not producers.swizzle_sf)."""
+    kb_n, rows_pad = inp // 16, (out + 127) // 128 * 128
+    plane = bytearray(rows_pad * kb_n)
+    for r in range(out):
+        for kb in range(kb_n):
+            plane[((r // 128) * (inp // 64) + kb // 4) * 512 + (r % 32) * 16 + ((r % 128) // 32) * 4 + kb % 4] = \
+                sc[r * kb_n + kb]
+    return w + bytes(plane) + s2 + bytes(28)
+
+
+DRAFTER_KV = (["block_size", "hidden_size", "num_hidden_layers", "num_attention_heads", "num_key_value_heads",
+               "head_dim", "intermediate_size", "hidden_act", "rms_norm_eps", "vocab_size", "max_position_embeddings",
+               "attention_bias", "rope_theta", "tie_word_embeddings", "num_target_layers", "layer_types",
+               "sliding_window", "use_sliding_window", "max_window_layers", "has_own_lm_head", "draft_vocab_size"]
+              + ["dflash." + k for k in drafter_config()["dflash_config"]])
+
+
+def drafter_tests(tmp, hf, t):
+    import nemotron_h as NH
+    dd = os.path.join(tmp, "lilicorr")
+    dt = make_drafter(dd, np.random.default_rng(298))
+    rl = os.path.join(HERE, "format-maps", "nemotron_h-k4-lilicorr.json")
+    rows = [
+        *[{"role": r, "block": "layers", "format": "native"} for r in ("dense", "norm", "other", "shared_expert",
+                                                                        "expert_up", "expert_down", "router")],
+        ["language_model.backbone.norm_f.weight", "native"],
+        *[{"role": r, "format": "native"} for r in ("embed", "head")],
+        ["language_model.mtp.*", "omit"],
+        {"role": "drafter_quantized", "format": "nvfp4"}, {"role": "drafter_native", "format": "native"}]
+    rd = recipe(tmp, "lilicorr", rows)
+    args = ["--hf", hf, "--recipe", rd, "--drafter", "lilicorr", dd]
+    o = build_grade(tmp, "lilicorr", args, 1 + 3 + 1 + 1)
+    shards = sorted(f for f in os.listdir(o) if f.endswith(".safetensors"))
+    hv, _ = header(os.path.join(o, shards[0]))
+    kvl = json.loads(hv["__metadata__"]["pulsar.kv"])
+    kv = {e["key"]: e["value"] for e in kvl}
+    cfg = drafter_config()
+    lili = [e["key"] for e in kvl if e["key"].startswith("lilicorr.")]
+    check(kv.get("pulsar.drafter") == "lilicorr" and kv.get("pulsar.mtp_present") is False
+          and kv.get("pulsar.source.drafter") == "lilicorr"
+          and lili == ["lilicorr." + k for k in DRAFTER_KV]
+          and kv["lilicorr.dflash.target_layer_ids"] == {"__array__": "u32", "n": 2, "v": DTL}
+          and kv["lilicorr.dflash.causal"] is False and kv["lilicorr.hidden_act"] == "silu"
+          and kv["lilicorr.dflash.lilicorr_mlp_ratio"] == 2.0 and kv["lilicorr.num_target_layers"] == len(BLOCKS)
+          and kv["lilicorr.layer_types"]["v"] == ["sliding_attention"] * DL
+          and not any(k.startswith("lilicorr.quantization") or k == "lilicorr.dflash_config.causal" for k in kv),
+          "pulsar.kv: pulsar.drafter lilicorr, mtp_present false, exactly the written lilicorr.* keys in order "
+          "(dflash_config as lilicorr.dflash.*; quantization_config consumed)")
+    last, _ = header(os.path.join(o, shards[-1]))
+    md = last["__metadata__"]
+    decl = json.loads(md["pulsar.tensors"])
+    shapes = drafter_shapes()
+    want = {"drafter." + n for n in shapes}
+    ok_rec = md["pulsar.shard_key"] == "drafter" and set(decl) == want and set(last) - {"__metadata__"} == want
+    bad = []
+    for n, (shape, q) in shapes.items():
+        d = decl.get("drafter." + n, {})
+        if n.startswith("lilicorr."):
+            rest = n[len("lilicorr."):]
+            if rest.startswith("layers."):
+                _l, i, sfx = rest.split(".", 2)
+                role, block, layer = NH.LILI_HEAD_LAYER[sfx][0], "lilicorr", int(i)
+            else:
+                role, block, layer = NH.LILI_HEAD[rest][0], "lilicorr", None
+        elif n.startswith("layers."):
+            _l, i, sfx = n.split(".", 2)
+            role, block, layer = NH.LILI_LAYER[sfx][0], "drafter", int(i)
+        else:
+            role, block, layer = NH.LILI_TOP[n][0], "drafter", None
+        exp = {"role": role, "block": block, "layout": "nvfp4" if q else "bf16", "dims_ne": list(reversed(shape)),
+               "gguf_name": "drafter." + n, **({"layer": layer} if layer is not None else {})}
+        if d != exp:
+            bad.append((n, d, exp))
+    if bad:
+        print(f"    {bad[:2]}")
+    check(ok_rec and not bad, f"shard `drafter` last: every one of {len(want)} tensors (scales folded) declared with "
+                              f"its role / block / layer, nvfp4 or bf16, dims_ne [in, out]")
+    check(decl["drafter.fc.weight"]["role"] == "fc" and "layer" not in decl["drafter.fc.weight"]
+          and decl["drafter.norm.weight"]["role"] == "out_norm" and decl["drafter.lm_head.weight"]["role"] == "head"
+          and decl["drafter.layers.4.mlp_conv.kernel_projection.weight"] == {
+              "role": "mlp_conv_proj", "block": "drafter", "layer": 4, "layout": "bf16", "dims_ne": [H, 32],
+              "gguf_name": "drafter.layers.4.mlp_conv.kernel_projection.weight"}
+          and decl["drafter.lilicorr.layers.1.attn.in_proj_bias"]["role"] == "attn_in_bias"
+          and decl["drafter.lilicorr.same_slot_bias"]["block"] == "lilicorr",
+          "spot records: fc / out_norm / head (no layer), mlp_conv_proj layer 4, lattice attn_in_bias layer 1")
+    pay_ok = True
+    for n in ("fc.weight", "lm_head.weight", "layers.2.mlp.down_proj.weight", "lilicorr.layers.1.attn.out_proj.weight"):
+        out, inp = shapes[n][0]
+        exp = nvfp4_ref(dt[n][2], dt[n + "_scale"][2], dt[n + "_scale_2"][2], out, inp)
+        pay_ok &= entry_bytes(o, shards[-1], "drafter." + n) == exp and len(exp) == \
+            out * inp // 2 + (out + 127) // 128 * 128 * inp // 16 + 32
+    check(pay_ok, "nvfp4 payload == nibbles + E4M3 scales tiled by a direct loop of the 128x4 formula (rows padded "
+                  "to 128 with zero scales) + scale_2 + 28 zero bytes")
+    check(all(entry_bytes(o, shards[-1], "drafter." + n) == dt[n][2] for n in
+              ("norm.weight", "layers.0.attention_conv.base_kernel", "lilicorr.rank_embedding",
+               "lilicorr.layers.0.attn.in_proj_weight")),
+          "native drafter tensors == their source bytes")
+    big = {}
+    for h in shards[:-1]:
+        hh, _ = header(os.path.join(o, h))
+        big.update({k: v for k, v in hh.items() if k != "__metadata__"})
+    check(not any(k.startswith(MTPP) for k in big), "the target's MTP module written nowhere")
+
+    print("drafter refusals:")
+    cases = []
+
+    def cfg_case(label, f, msg):
+        c = drafter_config()
+        f(c)
+        cases.append((label, c, None, msg))
+    cfg_case("an unknown config key", lambda c: c.__setitem__("rope_type", "yarn"), "'rope_type' is neither written")
+    cfg_case("an unknown dflash_config key", lambda c: c["dflash_config"].__setitem__("num_anchors", 2),
+             "'num_anchors' is not one")
+    cfg_case("a causal drafter", lambda c: c["dflash_config"].__setitem__("causal", True), "causal = True")
+    cfg_case("another quant_algo", lambda c: c["quantization_config"].__setitem__("quant_algo", "NVFP4"),
+             "quant_algo = 'NVFP4'")
+    cfg_case("target_layer_ids past the target", lambda c: c["dflash_config"].__setitem__("target_layer_ids", [1, 5]),
+             "target_layer_ids")
+    cfg_case("num_target_layers != the target's blocks", lambda c: c.__setitem__("num_target_layers", 88),
+             "num_target_layers 88")
+    cfg_case("a hidden size != the target's", lambda c: c.__setitem__("hidden_size", 256), "the target's hidden")
+
+    def drop_excl(c):
+        c["quantization_config"]["exclude_modules"].remove("*self_attn*")
+        c["quantization_config"]["ignore"].remove("*self_attn*")
+    cfg_case("exclude list misses a BF16 Linear", drop_excl, "no exclude pattern names it")
+
+    def add_excl(c):
+        c["quantization_config"]["exclude_modules"].append("*mlp.gate_proj")
+        c["quantization_config"]["ignore"].append("*mlp.gate_proj")
+    cfg_case("exclude list names an NVFP4 Linear", add_excl, "excluded by '*mlp.gate_proj'")
+    cfg_case("exclude_modules != ignore", lambda c: c["quantization_config"]["ignore"].pop(), "exclude_modules != ignore")
+    cases += [
+        ("an unknown tensor", None, lambda t: t.__setitem__("lilicorr.extra_bias", t["lilicorr.same_slot_bias"]),
+         "does not map"),
+        ("a missing tensor", None, lambda t: t.pop("layers.3.self_attn.k_norm.weight"), "missing from"),
+        ("a missing weight_scale_2", None, lambda t: t.pop("lm_head.weight_scale_2"), "missing from"),
+        ("a quantized Linear stored BF16", None,
+         lambda t: t.__setitem__("layers.1.mlp.up_proj.weight", ("BF16", [DI_, H], bytes(DI_ * H * 2))),
+         "disagree with the declaration"),
+        ("an F16 norm", None, lambda t: t.__setitem__("norm.weight", ("F16", [H], t["norm.weight"][2])),
+         "disagree with the declaration"),
+    ]
+    for i, (label, c, edit, msg) in enumerate(cases):
+        d = os.path.join(tmp, f"bad-drafter-{i}")
+        make_drafter(d, np.random.default_rng(1), cfg=c, edit=edit)
+        ok, _ = run("plan", "--hf", hf, "--recipe", rd, "--drafter", "lilicorr", d, expect_fail=True, contains=msg)
+        check(ok, f"{label} -> refused")
+    ok, _ = run("plan", "--hf", hf, "--recipe", rd, "--drafter", "medusa", dd, expect_fail=True,
+                contains="the Nemotron-H build reads ['lilicorr']")
+    check(ok, "--drafter medusa -> refused by name")
+    rbf = os.path.join(HERE, "format-maps", "nemotron_h-bf16.json")
+    rmtp = recipe(tmp, "lilicorr-mtp", json.load(open(rbf))["rows"] + rows[-2:])
+    ok, _ = run("plan", "--hf", hf, "--recipe", rmtp, "--drafter", "lilicorr", dd, expect_fail=True,
+                contains="writes the MTP module too")
+    check(ok, "--drafter with a recipe that writes the MTP module -> refused (one drafter)")
+    ok, _ = run("plan", "--hf", hf, "--recipe", rd, expect_fail=True, contains="match no checkpoint tensor")
+    check(ok, "the drafter recipe without --drafter -> refused (its drafter rows are dead)")
+    ok, _ = run("plan", "--hf", hf, "--recipe", rbf, "--drafter", "lilicorr", dd, expect_fail=True,
+                contains="no row of")
+    check(ok, "--drafter with a recipe that has no drafter rows -> refused")
+    import test_qwen
+    qd = os.path.join(tmp, "qwen")
+    os.makedirs(qd)
+    test_qwen.make_hf(qd, np.random.default_rng(3))
+    ok, _ = run("plan", "--hf", qd, "--drafter", "lilicorr", dd, expect_fail=True,
+                contains="the qwen family reads no drafter input")
+    check(ok, "--drafter on another family (qwen4_exp) -> refused by name")
+    r = json.load(open(rl))
+    check(r["recipe"] == "nemotron_h-k4-lilicorr" and ["language_model.mtp.*", "omit"] in r["rows"]
+          and {"role": "drafter_quantized", "format": "nvfp4"} in r["rows"],
+          "format-maps/nemotron_h-k4-lilicorr.json: MTP omitted, drafter rows")
+
+
 def run(*args, expect_fail=False, contains=None):
     r = subprocess.run([sys.executable, os.path.join(HERE, "build.py")] + list(args), capture_output=True, text=True)
     out = r.stdout + r.stderr
@@ -228,6 +505,8 @@ def main():
               and kv["nemotron_h.time_step_limit.min"] == 0.0 and kv["nemotron_h.time_step_limit.max_inf"] is True
               and "nemotron_h.time_step_limit" not in kv and kv["nemotron_h.moe_latent_size"] == LAT
               and kv["pulsar.mtp_present"] is True and kv["pulsar.vision_present"] is False
+              and kv["pulsar.drafter"] == "" and not any(k.startswith("lilicorr.") for k in kv)
+              and "pulsar.source.drafter" not in kv
               and not any(k.startswith("nemotron_h.vision") for k in kv)
               and [k for k in hv if k != "__metadata__"] == [],
               "pulsar.kv: llm_config verbatim, time_step_limit as min 0 + max_inf, presence; the primary shard holds no "
@@ -342,6 +621,9 @@ def main():
               "no mtp shard, pulsar.mtp_present false")
         ok, out = run("verify", "--hf", hf, "--recipe", rom, "--out", oo, "--all")
         check(ok and "failing: 0" in out, "verify PASS (drafter omitted)")
+
+        print("LiLiCorr drafter (--drafter lilicorr, L298):")
+        drafter_tests(tmp, hf, t)
 
         print("refusals:")
         cases = [
