@@ -37,7 +37,8 @@
  *       banks across a recapture (the attention bound's doubling); the replay counter moved (rule 5)
  *
  * bench (info, ./tests/nemotron_fwd_gate bench <container> synthetic): ms a batched decode step, graphed and eager, at
- *   PULSAR_BENCH_ROWS banks (default 1,4,16) over PULSAR_BENCH_STEPS steps (default 80, the first 16 untimed).
+ *   PULSAR_BENCH_ROWS banks (default 1,4,16) over PULSAR_BENCH_STEPS steps (default 80, the first 16 untimed);
+ *   PULSAR_BENCH_LANES=eager|graphed runs one lane (a profile's).
  *
  * Public API only, but for two instruments of pulsar_gpu.h: the segment counters and the eager switch (X7, bench). */
 #include "pulsar.h"
@@ -465,6 +466,8 @@ static void bench(pulsar_engine *e, const std::vector<int32_t> &ids, int W) {
     const char *rows_env = getenv("PULSAR_BENCH_ROWS");
     std::string rl = rows_env ? rows_env : "1,4,16";
     const int steps = getenv("PULSAR_BENCH_STEPS") ? atoi(getenv("PULSAR_BENCH_STEPS")) : 80;
+    const char *lanes = getenv("PULSAR_BENCH_LANES");   /* "eager" or "graphed": one lane (a profile); default both */
+    const bool run_e = !lanes || strcmp(lanes, "graphed") != 0, run_g = !lanes || strcmp(lanes, "eager") != 0;
     for (size_t at = 0; at < rl.size();) {
         const int banks = atoi(rl.c_str() + at);
         const size_t comma = rl.find(',', at);
@@ -472,9 +475,9 @@ static void bench(pulsar_engine *e, const std::vector<int32_t> &ids, int W) {
         if (banks < 1) continue;
         double ms_e = 0, ms_g = 0;
         uint64_t r0 = 0, c0 = 0, r1 = 0, c1 = 0;
-        const bool a = decode_run(e, ids, banks, 512, steps, W, false, NULL, &ms_e, 16);
+        const bool a = !run_e || decode_run(e, ids, banks, 512, steps, W, false, NULL, &ms_e, 16);
         pulsar_gpu_seg_counts(&r0, &c0);
-        const bool b = decode_run(e, ids, banks, 512, steps, W, true, NULL, &ms_g, 16);
+        const bool b = !run_g || decode_run(e, ids, banks, 512, steps, W, true, NULL, &ms_g, 16);
         pulsar_gpu_seg_counts(&r1, &c1);
         printf("bench: %2d row(s): eager %.3f ms/step, graphed %.3f ms/step (%.1f%%), %llu replays %llu captures%s\n",
                banks, ms_e, ms_g, ms_e > 0 ? 100.0 * (ms_e - ms_g) / ms_e : 0.0, (unsigned long long)(r1 - r0),
