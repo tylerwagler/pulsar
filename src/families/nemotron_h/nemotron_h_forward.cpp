@@ -691,8 +691,7 @@ bool moe(const nh_step *st, uint32_t il, float *fo, uint8_t *base, const ffn_scr
     const pulsar_moe_block_shape bs = moe_shape(s);
     pulsar_moe_block_parts parts;
     if (pulsar_moe_block_carve(&bs, (int)n, base + F.u, F.moe_bytes, &parts) != 0) return failf("the MoE workspace", il);
-    /* the shared expert, ungated: down(relu(up xn)^2) -- its decode rows forked onto their own stream here, ahead of
-     * the router and the routed experts they overlap (L296 dec2), joined and added after the routed sum below */
+    /* the shared expert, ungated: down(relu(up xn)^2) */
     const auto shared_q = [&](bool prompt, pulsar_rows_moe_shared &q) {
         q = pulsar_rows_moe_shared{};
         q.act = PULSAR_FFN_ACT_RELU2;
@@ -705,21 +704,30 @@ bool moe(const nh_step *st, uint32_t il, float *fo, uint8_t *base, const ffn_scr
         return pulsar_linear_rows_ref(st->model, L.sh_up, E, SM, prompt, "nemotron_h shared up", &q.up) &&
                pulsar_linear_rows_ref(st->model, L.sh_down, SM, E, prompt, "nemotron_h shared down", &q.down);
     };
-    if (!arm_segments(st, 0, n, [&](bool prompt, uint32_t r0, uint32_t rows) {
-            pulsar_rows_moe_shared q;
-            return prompt ||
-                   (shared_q(false, q) && pulsar_rows_moe_shared_side_fork(&q, xn + (size_t)r0 * E, (int)rows, 0) == 0);
-        }))
-        return failf("the shared expert's fork refused", il);
+    /* L296 dec2: a decode step runs the router and the routed experts on the priority stream (rs) while its shared
+     * expert's ys runs here; the join comes before the shared add.  A step with prompt rows runs them in turn. */
+    const bool split = st->n_dec == n;
+    cudaStream_t rs = NULL;
+    if (split) {
+        pulsar_rows_moe_shared q;
+        if (!shared_q(false, q) || !(rs = pulsar_rows_moe_routed_fork(NULL)) ||
+            pulsar_rows_moe_shared_ys_launch(&q, xn, (int)n, NULL) != 0)
+            return failf("the shared expert alongside the routed experts refused", il);
+    }
+    /* a refusal past the fork joins first: nothing of the routed chain outlives the call */
+    const auto refuse = [&](const char *what) {
+        if (rs) (void)pulsar_rows_moe_routed_join(NULL);
+        return failf(what, il);
+    };
     /* the router: f32 logits over the routed rows (no gate rows), then the select */
     const pulsar_router_cfg rc = router_cfg(s);
     pulsar_router_layer rl{};
     rl.bias = (const float *)wp(st, L.router_select_bias, "nemotron_h router bias");
     const uint16_t *rw = (const uint16_t *)wp(st, L.router, "nemotron_h router");
     if (!rw || !rl.bias ||
-        pulsar_router_logits_launch(xn, (int)n, E, rw, bs.n_logit_rows, NULL, 0, parts.logits, 0) != 0 ||
-        pulsar_router_select_launch(&rc, &rl, parts.logits, NULL, (int)n, parts.sel, parts.wts, NULL, NULL, 0) != 0)
-        return failf("the router refused", il);
+        pulsar_router_logits_launch(xn, (int)n, E, rw, bs.n_logit_rows, NULL, 0, parts.logits, rs) != 0 ||
+        pulsar_router_select_launch(&rc, &rl, parts.logits, NULL, (int)n, parts.sel, parts.wts, NULL, NULL, rs) != 0)
+        return refuse("the router refused");
     /* the routed experts through the core's front door (moe.cpp): up-only relu^2 on the latent, wrapped in the two
      * latent projections */
     const rows_scratch R = rows_layout(st->st->max_rows);
@@ -738,6 +746,7 @@ bool moe(const nh_step *st, uint32_t il, float *fo, uint8_t *base, const ffn_scr
     c.ws_bytes = parts.routed_bytes;
     c.nf_flag = (uint32_t *)((uint8_t *)dptr(st->st->scratch[ARENA_ROWS]) + R.nf);
     c.nf_code = 0x4E000000u | il;
+    c.stream = rs;
     if (!arm_segments(st, 0, n, [&](bool prompt, uint32_t r0, uint32_t rows) {
             c.selected = parts.sel + (size_t)r0 * K;
             c.weights = parts.wts + (size_t)r0 * K;
@@ -750,14 +759,19 @@ bool moe(const nh_step *st, uint32_t il, float *fo, uint8_t *base, const ffn_scr
             c.prompt = prompt;
             return pulsar_moe_routed_rows(&c);
         }))
-        return failf("the routed experts refused", il);
-    /* the shared expert added: the decode rows' fork joined, a prompt chunk's run here (rows past the decode rows,
-     * after their join: the buffers are one) */
+        return refuse("the routed experts refused");
+    /* the shared expert added after the routed sum: a decode step's ys (above) once the routed chain is joined, else
+     * the whole shared expert per row-kind segment */
+    if (split) {
+        pulsar_rows_moe_shared q;
+        return (shared_q(false, q) && pulsar_rows_moe_routed_join(NULL) == 0 &&
+                pulsar_rows_moe_shared_add_launch(&q, (int)n, fo, NULL) == 0) ||
+               failf("the shared add after the routed join refused", il);
+    }
     const bool ok = arm_segments(st, 0, n, [&](bool prompt, uint32_t r0, uint32_t rows) {
         pulsar_rows_moe_shared q;
-        if (!shared_q(prompt, q)) return false;
-        return prompt ? pulsar_rows_moe_shared_launch(&q, xn + (size_t)r0 * E, (int)rows, fo + (size_t)r0 * E, 0) == 0
-                      : pulsar_rows_moe_shared_side_join(&q, (int)rows, fo + (size_t)r0 * E, 0) == 0;
+        return shared_q(prompt, q) &&
+               pulsar_rows_moe_shared_launch(&q, xn + (size_t)r0 * E, (int)rows, fo + (size_t)r0 * E, 0) == 0;
     });
     return ok || failf("the shared expert refused", il);
 }

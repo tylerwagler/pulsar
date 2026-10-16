@@ -532,72 +532,78 @@ extern "C" int pulsar_rows_moe_shared_launch(const pulsar_rows_moe_shared *q, co
     return rc ? rc : shared_add(q, T, out, stream);
 }
 
+extern "C" int pulsar_rows_moe_shared_ys_launch(const pulsar_rows_moe_shared *q, const uint16_t *x_bf16, int T,
+                                                cudaStream_t stream) {
+    if (!shared_ok(q, "ys") || !x_bf16 || T <= 0) return -1;
+    return shared_ys(q, x_bf16, T, stream);
+}
+
+extern "C" int pulsar_rows_moe_shared_add_launch(const pulsar_rows_moe_shared *q, int T, float *out, cudaStream_t stream) {
+    if (!shared_ok(q, "add") || !out || T <= 0) return -1;
+    return shared_add(q, T, out, stream);
+}
+
 namespace {
 
-/* L296 dec2: a side stream per (thread, device, caller stream) for a non-riding shared expert's ys, with the fork
- * and join events -- one fork pending at a time.  Captured into a decode graph as a branch. */
-struct side_lane {
+/* L296 dec2: the routed chain's stream per (thread, device, caller stream) -- the device's GREATEST priority, so its
+ * latency-bound launches take the SMs ahead of the bandwidth-bound shared expert left on the caller (in a captured
+ * step the nodes keep it: kernel nodes copy their stream's priority, and the segment cache instantiates with
+ * cudaGraphInstantiateFlagUseNodePriority) -- with the fork and join events.  One fork pending at a time. */
+struct routed_lane {
     int dev;
     cudaStream_t caller, s;
     cudaEvent_t fork, done;
-    const float *ys;   ///< the pending fork's output, or NULL
+    bool pending;
 };
 
-side_lane *side_lane_for(cudaStream_t caller) {
-    thread_local side_lane t_lanes[8];
+routed_lane *routed_lane_for(cudaStream_t caller) {
+    thread_local routed_lane t_lanes[8];
     thread_local int t_n = 0;
     int dev = 0;
     if (cudaGetDevice(&dev) != cudaSuccess) return nullptr;
     for (int i = 0; i < t_n; ++i)
         if (t_lanes[i].dev == dev && t_lanes[i].caller == caller) return &t_lanes[i];
     if (t_n == 8) return nullptr;
-    side_lane l{};
+    routed_lane l{};
     l.dev = dev;
     l.caller = caller;
-    if (cudaStreamCreateWithFlags(&l.s, cudaStreamNonBlocking) != cudaSuccess ||
+    int least = 0, greatest = 0;
+    if (cudaDeviceGetStreamPriorityRange(&least, &greatest) != cudaSuccess ||
+        cudaStreamCreateWithPriority(&l.s, cudaStreamNonBlocking, greatest) != cudaSuccess ||
         cudaEventCreateWithFlags(&l.fork, cudaEventDisableTiming) != cudaSuccess ||
         cudaEventCreateWithFlags(&l.done, cudaEventDisableTiming) != cudaSuccess)
         return nullptr;
     t_lanes[t_n] = l;
     static bool announced = false;
     if (!__atomic_exchange_n(&announced, true, __ATOMIC_RELAXED))
-        fprintf(stderr, "pulsar: MoE shared expert (decode rows) = its linears + activation on its own stream, forked "
-                        "ahead of the routed experts, added after the routed sum\n");
+        fprintf(stderr, "pulsar: MoE decode = the router + routed experts on a priority-%d stream, the shared expert "
+                        "alongside on the caller's (priority %d), joined before the shared add\n", greatest, least);
     return &t_lanes[t_n++];
 }
 
 } // namespace
 
-extern "C" int pulsar_rows_moe_shared_side_fork(const pulsar_rows_moe_shared *q, const uint16_t *x_bf16, int T,
-                                                cudaStream_t stream) {
-    if (!shared_ok(q, "fork") || !x_bf16 || T <= 0) return -1;
-    side_lane *lane = side_lane_for(stream);
-    if (!lane || lane->ys) {
-        fprintf(stderr, "pulsar: MoE shared expert fork: no side stream, or a fork already pending on it -- refusing\n");
-        return -1;
+extern "C" cudaStream_t pulsar_rows_moe_routed_fork(cudaStream_t caller) {
+    routed_lane *lane = routed_lane_for(caller);
+    if (!lane || lane->pending) {
+        fprintf(stderr, "pulsar: MoE routed fork: no priority stream, or a fork already pending on it -- refusing\n");
+        return nullptr;
     }
-    if (cudaEventRecord(lane->fork, stream) != cudaSuccess || cudaStreamWaitEvent(lane->s, lane->fork, 0) != cudaSuccess)
-        return -3;
-    int rc = shared_ys(q, x_bf16, T, lane->s);
-    if (!rc && cudaEventRecord(lane->done, lane->s) != cudaSuccess) rc = -3;
-    if (rc) {
-        fprintf(stderr, "pulsar: MoE shared expert fork: its launches declined (rc=%d) -- no fallback\n", rc);
-        (void)cudaStreamSynchronize(lane->s);   /* nothing of a refused fork outlives the call */
-        return -1;
+    if (cudaEventRecord(lane->fork, caller) != cudaSuccess || cudaStreamWaitEvent(lane->s, lane->fork, 0) != cudaSuccess) {
+        fprintf(stderr, "pulsar: MoE routed fork: the fork event failed -- refusing\n");
+        return nullptr;
     }
-    lane->ys = q->ys;
-    return 0;
+    lane->pending = true;
+    return lane->s;
 }
 
-extern "C" int pulsar_rows_moe_shared_side_join(const pulsar_rows_moe_shared *q, int T, float *out,
-                                                cudaStream_t stream) {
-    if (!shared_ok(q, "join") || !out || T <= 0) return -1;
-    side_lane *lane = side_lane_for(stream);
-    if (!lane || lane->ys != q->ys) {
-        fprintf(stderr, "pulsar: MoE shared expert join: no fork of this expert pending on this stream -- refusing\n");
+extern "C" int pulsar_rows_moe_routed_join(cudaStream_t caller) {
+    routed_lane *lane = routed_lane_for(caller);
+    if (!lane || !lane->pending) {
+        fprintf(stderr, "pulsar: MoE routed join: no fork pending on this stream -- refusing\n");
         return -1;
     }
-    lane->ys = nullptr;
-    if (cudaStreamWaitEvent(stream, lane->done, 0) != cudaSuccess) return -3;
-    return shared_add(q, T, out, stream);
+    lane->pending = false;
+    return cudaEventRecord(lane->done, lane->s) == cudaSuccess && cudaStreamWaitEvent(caller, lane->done, 0) == cudaSuccess
+               ? 0 : -3;
 }
