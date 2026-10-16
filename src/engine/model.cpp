@@ -29,6 +29,7 @@ static const struct { const char *name; uint32_t id; } pulsar_layout_names[] = {
     {"exl3m_k5",       PULSAR_TENSOR_EXL3M_K5},
     {"exl3m_k6",       PULSAR_TENSOR_EXL3M_K6},
     {"exl3m_k8",       PULSAR_TENSOR_EXL3M_K8},
+    {"nvfp4",          PULSAR_TENSOR_NVFP4},
 };
 
 
