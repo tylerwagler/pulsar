@@ -5,7 +5,7 @@
  *
  *   embed      E5   pulsar_head_embed_launch: the gather (no embedding norm) -> the residual h (bf16)
  *   per layer  (pulsar_layer_desc: a Mamba-2 or an attention mixer, the MoE or no FFN -- one HF block each)
- *       xn = rmsnorm(h) * mixer_norm                                              row ops (pulsar_cuda_rowops.h)
+ *       xn = rmsnorm(h) * mixer_norm  (layer 0; then the previous layer's last add) row ops (pulsar_cuda_rowops.h)
  *     Mamba-2:  p = bf16(xn W_in) = [z | x B C | dt]                              rows front door (linear.cpp)
  *               y = Mamba2(p) (conv + bias + SiLU, selective scan, D skip,         N2 (pulsar_cuda_mamba2.h; the
  *                   gated grouped RMSNorm)                                         SSM and conv state: F3's)
@@ -20,7 +20,9 @@
  *               f = latent_out(bf16(sum_k w_k relu2_expert_k(bf16(latent_in xn))))  the rows MoE front door: the
  *                   + shared(xn), the shared expert relu^2 on the full width          latent wrapper + relu^2 (N4)
  *               h += bf16(f)                                                      row ops
- *   head       rmsnorm(h) * output_norm -> the head linear (untied, every id real) -> E5 finish (nothing to scale)
+ *       the layer's last add also writes xn = rmsnorm(h) * the next reader's norm (the next layer's mixer norm, or
+ *       output_norm after the last layer) -- one launch (L296 perf)
+ *   head       xn -> the head linear (untied, every id real) -> E5 finish (nothing to scale)
  *
  * vLLM's NemotronHForCausalLM (models/nemotron_h.py) is the order: each HF block is `x += mixer(RMSNorm(x))`, the
  * residual bf16, each add and each norm one rounding (vLLM's fused add_rmsnorm).  pulsar groups a mixer with the MoE
@@ -244,13 +246,12 @@ ffn_scratch ffn_layout(uint32_t R) {
     return f;
 }
 
-/* HEAD: the head rows' final-norm bf16 rows and the head linear's workspace (at most PULSAR_DRIVER_HEADS_MAX rows) */
-struct head_scratch { uint64_t xb, lin, lin_bytes, total; };
+/* HEAD: the head linear's workspace (at most PULSAR_DRIVER_HEADS_MAX rows; its input is xn, the final norm) */
+struct head_scratch { uint64_t lin, lin_bytes, total; };
 head_scratch head_layout() {
     const pulsar_nemotron_h_shape &s = G();
     head_scratch h{};
-    h.xb = 0;
-    h.lin = a256((uint64_t)PULSAR_DRIVER_HEADS_MAX * s.n_embd * 2u);
+    h.lin = 0;
     h.lin_bytes = lin_ws((int)s.n_embd, (int)s.n_vocab, PULSAR_DRIVER_HEADS_MAX);
     h.total = h.lin + h.lin_bytes;
     return h;
@@ -744,6 +745,19 @@ bool moe(const nh_step *st, uint32_t il, float *fo, uint8_t *base, const ffn_scr
 
 /* ---- the layer --------------------------------------------------------------------------------------------------- */
 
+/* layer il's mixer pre-norm weight */
+const uint16_t *mixer_norm(const nh_step *st, uint32_t il) {
+    const pulsar_nemotron_h_block &L = st->w->layer[il];
+    return (const uint16_t *)wp(st, st->plan->desc[il].mixer == PULSAR_MIXER_MAMBA2 ? L.ssm_pre_norm : L.attn_norm,
+                                "nemotron_h mixer norm");
+}
+/* L296 perf: the norm whatever reads h after layer il applies -- layer il + 1's mixer pre-norm, or the final norm the
+ * head reads after the last layer.  Layer il's last add writes it into xn in the same launch. */
+const uint16_t *next_norm(const nh_step *st, uint32_t il) {
+    if (il + 1u < st->plan->n_layer) return mixer_norm(st, il + 1u);
+    return (const uint16_t *)wp(st, st->w->output_norm, "nemotron_h norm_f");
+}
+
 /* block[PULSAR_LAYER_BLOCKS]: one layer as its description says -- the mixer's HF block, then the MoE's when it has
  * one, each `h += sublayer(rmsnorm(h))` */
 bool block(const pulsar_driver_step *st0, uint32_t il) {
@@ -757,19 +771,24 @@ bool block(const pulsar_driver_step *st0, uint32_t il) {
         return failf("a layer description that is not {Mamba-2 | full attention} x {MoE | none}", il);
     const uint32_t n = st->n_rows, E = s.n_embd;
     uint16_t *h = (uint16_t *)dptr(q->h), *xn = (uint16_t *)dptr(q->xn);
-    /* the mixer's HF block */
-    const uint16_t *mn = (const uint16_t *)wp(st, is_mamba ? L.ssm_pre_norm : L.attn_norm, "nemotron_h mixer norm");
-    if (!mn || pulsar_rows_rmsnorm_launch(h, E, n, E, mn, s.rms_eps, xn, E, 0) != 0)
-        return failf("the mixer norm refused", il);
+    /* the mixer's HF block: its pre-norm is the previous layer's last add's (L296 perf: next_norm); layer 0 norms the
+     * embedding here */
+    if (il == 0) {
+        const uint16_t *mn = mixer_norm(st, 0);
+        if (!mn || pulsar_rows_rmsnorm_launch(h, E, n, E, mn, s.rms_eps, xn, E, 0) != 0)
+            return failf("the mixer norm refused", il);
+    }
+    /* the layer's last add also norms the new h for what reads it next (vLLM's fused add_rmsnorm; the norm of the
+     * rounded sum, rowops: the bytes of the add then the norm) */
+    const uint16_t *nn = next_norm(st, il);
+    if (!nn) return failf("the next pre-norm's weight is missing", il);
     const mix_scratch M = mix_layout(q->max_rows, st->states->ctx);
     uint8_t *mbase = (uint8_t *)dptr(q->scratch[ARENA_MIX]);
     if (!(is_mamba ? mamba(st, il, mbase, M) : attention(st, il, mbase, M))) return false;
     dump_rows(st, "nemotron_mix", q->scratch[ARENA_MIX], M.db, E, il);
-    /* h += delta, and the MoE's pre-norm of the new h in the same launch (vLLM's fused add_rmsnorm) */
-    const uint16_t *fn = is_moe ? (const uint16_t *)wp(st, L.ffn_norm, "nemotron_h ffn norm") : NULL;
-    if ((is_moe && !fn) ||
-        pulsar_rows_add_launch(h, E, (const uint16_t *)(mbase + M.db), E, n, E, fn, s.rms_eps, is_moe ? xn : NULL, E,
-                               0) != 0)
+    /* h += delta, and the pre-norm of the new h in the same launch: the MoE's, else the next reader's */
+    const uint16_t *fn = is_moe ? (const uint16_t *)wp(st, L.ffn_norm, "nemotron_h ffn norm") : nn;
+    if (!fn || pulsar_rows_add_launch(h, E, (const uint16_t *)(mbase + M.db), E, n, E, fn, s.rms_eps, xn, E, 0) != 0)
         return failf("the mixer's residual add refused", il);
     if (!is_moe) return true;
     dump_rows(st, "nemotron_mid", q->h, 0, E, il);
@@ -781,23 +800,20 @@ bool block(const pulsar_driver_step *st0, uint32_t il) {
     if (!moe(st, il, fo, fbase, F)) return false;
     if (!emit(fo, db, n, E)) return failf("the MoE bf16 emit refused", il);
     dump_rows(st, "nemotron_ffn", q->scratch[ARENA_FFN], F.db, E, il);
-    return pulsar_rows_add_launch(h, E, db, E, n, E, NULL, 0.0f, NULL, 0, 0) == 0 ||
+    return pulsar_rows_add_launch(h, E, db, E, n, E, nn, s.rms_eps, xn, E, 0) == 0 ||
            failf("the MoE's residual add refused", il);
 }
 
-/* step rows [row0, row0 + n) -> logits rows [out0, out0 + n): the final norm, the head linear (the decode arm at every
- * call: a row's logits never depend on the rows beside it), E5's finish (no scale, no padding: nothing launches) */
+/* step rows [row0, row0 + n) -> logits rows [out0, out0 + n): the head linear over the final norm of h (the last
+ * layer's last add wrote it into xn, next_norm; the decode arm at every call: a row's logits never depend on the rows
+ * beside it), E5's finish (no scale, no padding: nothing launches) */
 bool head(const pulsar_driver_step *st0, uint32_t row0, uint32_t n, uint32_t out0) {
     const nh_step *st = S(st0);
     const pulsar_nemotron_h_shape &s = st->w->shape;
     if (n == 0 || out0 + n > PULSAR_DRIVER_HEADS_MAX || row0 + n > st->n_rows) return fail("head rows out of range");
     const head_scratch H = head_layout();
     uint8_t *base = (uint8_t *)dptr(st->st->scratch[ARENA_HEAD]);
-    uint16_t *xb = (uint16_t *)(base + H.xb);
-    const uint16_t *on = (const uint16_t *)wp(st, st->w->output_norm, "nemotron_h norm_f");
-    if (!on || pulsar_rows_rmsnorm_launch((const uint16_t *)dptr(st->st->h) + (size_t)row0 * s.n_embd, s.n_embd, n,
-                                          s.n_embd, on, s.rms_eps, xb, s.n_embd, 0) != 0)
-        return fail("the final norm refused");
+    const uint16_t *xb = (const uint16_t *)dptr(st->st->xn) + (size_t)row0 * s.n_embd;
     pulsar_rows_linear l{};
     float *logits = (float *)dptr(st->buf->logits) + (size_t)out0 * s.n_vocab;
     if (!pulsar_linear_rows_ref(st->model, st->w->head, (int)s.n_embd, (int)s.n_vocab, false, "nemotron_h lm_head", &l) ||

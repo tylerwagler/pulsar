@@ -121,11 +121,11 @@ uint64_t pulsar_mamba2_conv_state_elems(const pulsar_mamba2_geom *g);
 uint64_t pulsar_mamba2_ssm_state_floats(const pulsar_mamba2_geom *g);
 /** f32 elements of one row's DELTA record: H*P + G*N + 2*H, padded to 4. */
 uint64_t pulsar_mamba2_upd_floats(const pulsar_mamba2_geom *g);
-/** Scratch bytes a call of `rows` rows needs (the conv output, y, dt and dA). */
+/** Scratch bytes a call of `rows` rows needs (the conv output and y). */
 size_t pulsar_mamba2_scratch_bytes(const pulsar_mamba2_geom *g, uint32_t rows);
 
-/** Run the block for one layer on `stream` (four launches: conv, dt, scan,
- *  norm).  Advances every sequence's conv slot and (without ssm_capture) its
+/** Run the block for one layer on `stream` (three launches: conv, the scan with
+ *  its dt / dA, the norm).  Advances every sequence's conv slot and (without ssm_capture) its
  *  SSM slot; writes the captures when set.
  *  @return 0, -1 on a refused contract (named on stderr, nothing launched),
  *  -3 on a launch failure. */
