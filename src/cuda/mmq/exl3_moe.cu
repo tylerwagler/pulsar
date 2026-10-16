@@ -7,6 +7,7 @@
 #include "ds4_mmid.cuh"
 #include "ds4_mmq.h"
 #include "../pulsar_cuda_scratch.h"
+#include "../pulsar_cuda_qwen.h"   /* pulsar_ffn_act */
 #include "cuda/pulsar_cuda_mx.cuh"
 #include "engine/exl3_trellis.h"
 
@@ -166,18 +167,27 @@ int exl3_moe_routed_launch(const exl3_moe_stacks &w, const int32_t *sel, const f
                            const exl3_moe_shared *shared, int n_shared) {
     const char *tag = "exl3_moe_routed_launch";
     const bool fused = w.gate_up != nullptr;
-    const int gu_kind = fused ? EXL3_ARM_GATE_UP_FUSED : EXL3_ARM_PAIR;
-    if (fused == (w.gate != nullptr) || (!fused && !w.up) || !w.down || !sel || !wts || !out || !nf_flag ||
-        !b.gate_z || (!fused && !b.up_z) || !b.down_z || !act_ok(x) || !act_ok(b.mid) || T <= 0 || top_k <= 0 ||
-        w.n_experts <= 0 || w.in_dim <= 0 || w.mid_dim <= 0 || w.out_dim <= 0) {
-        fprintf(stderr, "%s: the stacks must be ONE of a fused gate_up or a gate + up pair, with a down, and every "
-                        "buffer present -- refusing\n", tag);
+    /* L296: the UP-ONLY form -- one up slice per expert, no gate, the ungated activation (relu^2) */
+    const bool up_only = !fused && !w.gate && w.up;
+    if (up_only != (w.act == PULSAR_FFN_ACT_RELU2) || (up_only && clamp != 0.0f) ||
+        (w.act != PULSAR_FFN_ACT_SWIGLU && w.act != PULSAR_FFN_ACT_RELU2)) {
+        fprintf(stderr, "%s: activation %d with %s stacks -- SwiGLU reads a fused gate_up or a gate + up pair, relu^2 an "
+                        "up stack alone (no clamp) -- refusing\n", tag, w.act, up_only ? "up-only" : "gated");
+        return -1;
+    }
+    const int gu_kind = fused ? EXL3_ARM_GATE_UP_FUSED : EXL3_ARM_PAIR;   /* up-only: the pair's up side, its rates */
+    if ((!up_only && fused == (w.gate != nullptr)) || (!fused && !w.up) || !w.down || !sel || !wts || !out || !nf_flag ||
+        !b.gate_z || (!fused && !up_only && !b.up_z) || !b.down_z || !act_ok(x) || !act_ok(b.mid) || T <= 0 ||
+        top_k <= 0 || w.n_experts <= 0 || w.in_dim <= 0 || w.mid_dim <= 0 || w.out_dim <= 0) {
+        fprintf(stderr, "%s: the stacks must be ONE of a fused gate_up, a gate + up pair or an up stack alone, with a "
+                        "down, and every buffer present -- refusing\n", tag);
         return -1;
     }
     if (!exl3_arm_has_rate(gu_kind, w.k2_gate_up) || !exl3_arm_has_rate(EXL3_ARM_DOWN, w.k2_down) ||
         w.in_dim % EXL3_HAD_BLOCK || w.mid_dim % EXL3_HAD_BLOCK || w.out_dim % EXL3_HAD_BLOCK) {
         fprintf(stderr, "%s: %s K=%g / down K=%g at %d -> %d -> %d has no instance (128-multiples, "
-                        "exl3_arm_has_rate) -- refusing\n", tag, fused ? "fused gate_up" : "gate / up", w.k2_gate_up / 2.0,
+                        "exl3_arm_has_rate) -- refusing\n", tag,
+                fused ? "fused gate_up" : up_only ? "up-only up" : "gate / up", w.k2_gate_up / 2.0,
                 w.k2_down / 2.0, w.in_dim, w.mid_dim, w.out_dim);
         return -1;
     }
@@ -205,7 +215,8 @@ int exl3_moe_routed_launch(const exl3_moe_stacks &w, const int32_t *sel, const f
     {
         /* gate / up's workspace, then the down's over it: the fold has read gate / up's z before the down's PREP */
         const size_t a = gemm ? exl3_moe_prefill_ws_bytes(pairs, w.in_dim, E)
-                              : exl3_moe_decode_ws_bytes(fused ? 1 : 2, pairs, w.in_dim, fused ? 2 * w.mid_dim : w.mid_dim);
+                              : exl3_moe_decode_ws_bytes(fused || up_only ? 1 : 2, pairs, w.in_dim,
+                                                         fused ? 2 * w.mid_dim : w.mid_dim);
         const size_t d = gemm ? exl3_moe_prefill_ws_bytes(pairs, w.mid_dim, E)
                               : exl3_moe_decode_ws_bytes(1, pairs, w.mid_dim, w.out_dim);
         tc_bytes = a > d ? a : d;
@@ -233,15 +244,20 @@ int exl3_moe_routed_launch(const exl3_moe_stacks &w, const int32_t *sel, const f
     }
     const exl3_moe_stacks &s = w;
     exl3_moe_partials gp{}, dp{};
-    int rc = project(gu_kind, fused ? s.gate_up : s.gate, fused ? nullptr : s.up, s.k2_gate_up, x, ids_dst, ids_src,
-                     bounds, b.gate_z, fused ? nullptr : b.up_z, fused ? 2 * s.mid_dim : s.mid_dim, s.in_dim, pairs, E,
-                     gemm, tc_ws, tc_bytes, &gp, stream);
+    /* up-only: ONE rotated slice per expert, projected as a fused slice is (its z into gate_z) */
+    int rc = up_only ? project(EXL3_ARM_GATE_UP_FUSED, s.up, nullptr, s.k2_gate_up, x, ids_dst, ids_src, bounds, b.gate_z,
+                               nullptr, s.mid_dim, s.in_dim, pairs, E, gemm, tc_ws, tc_bytes, &gp, stream)
+                     : project(gu_kind, fused ? s.gate_up : s.gate, fused ? nullptr : s.up, s.k2_gate_up, x, ids_dst,
+                               ids_src, bounds, b.gate_z, fused ? nullptr : b.up_z, fused ? 2 * s.mid_dim : s.mid_dim,
+                               s.in_dim, pairs, E, gemm, tc_ws, tc_bytes, &gp, stream);
     if (rc) { fprintf(stderr, "%s: gate / up declined (rc=%d) -- no fallback\n", tag, rc); return -1; }
     float *gz = gp.z[0], *uz = gp.z[1];
     const bool mid_e4m3 = b.mid.format == EXL3_MOE_ACT_E4M3_SLOT;
     void *mq = mid_e4m3 ? const_cast<void *>(b.mid.x) : nullptr, *msf = mid_e4m3 ? const_cast<void *>(b.mid.sf) : nullptr;
     void *mb = mid_e4m3 ? nullptr : const_cast<void *>(b.mid.x);
-    rc = fused ? ds4_exl3_moe_fold_fused_launch(gz, sel, wts, s.gate_up, s.down, s.in_dim, s.mid_dim, pairs, clamp, mq,
+    rc = up_only ? ds4_exl3_moe_fold_up_launch(gz, sel, wts, s.up, s.down, s.in_dim, s.mid_dim, pairs, mq, msf, b.mid.kbp,
+                                               stream, mb, gp.splits, gp.split_stride)
+       : fused ? ds4_exl3_moe_fold_fused_launch(gz, sel, wts, s.gate_up, s.down, s.in_dim, s.mid_dim, pairs, clamp, mq,
                                                 msf, b.mid.kbp, stream, mb, gp.splits, gp.split_stride)
                : ds4_exl3_moe_fold_launch(gz, uz, sel, wts, s.gate, s.up, s.down, s.in_dim, s.mid_dim, pairs, clamp, mq,
                                           msf, b.mid.kbp, stream, mb, gp.splits, gp.split_stride);

@@ -17,7 +17,11 @@ namespace {
 
 /* One warp per (pair, 128-block of mid); lane l holds mid columns 4l..4l+3
  * of the block.  The four values per lane make one 32-element MX group an
- * EIGHT-lane group, as in moe_mmq_swiglu_fold_v4_kernel. */
+ * EIGHT-lane group, as in moe_mmq_swiglu_fold_v4_kernel.  UP_ONLY (L296): the
+ * up-only fold -- no gate projection (gate_z / gate_table unread), the
+ * activation relu(y_u)^2 (pulsar_relu2_elem) with the route weight folded in;
+ * every other step is the gated fold's, unchanged. */
+template <bool UP_ONLY>
 __global__ void __launch_bounds__(256)
 exl3_moe_fold_kernel(const float *__restrict__ gate_z,
                      const float *__restrict__ up_z,
@@ -42,32 +46,47 @@ exl3_moe_fold_kernel(const float *__restrict__ gate_z,
     const int lane = threadIdx.x & 31;
     const int e = selected[pair];
     if (e < 0) return;                                /* another rank's expert (L266 EP) or the router's NaN path */
-    const void *const *pg = reinterpret_cast<const void *const *>(gate_table);
     const void *const *pu = reinterpret_cast<const void *const *>(up_table);
     const void *const *pd = reinterpret_cast<const void *const *>(down_table);
     /* gate/up scales: suh[in_dim] | svh[mid_dim]; down scales: suh[mid_dim] | svh[out] */
-    const __half *svh_g = reinterpret_cast<const __half *>(pg[2 * (size_t)e + 1]) + in_dim;
     const __half *svh_u = reinterpret_cast<const __half *>(pu[2 * (size_t)e + 1]) + up_svh_off;
     const __half *suh_d = reinterpret_cast<const __half *>(pd[2 * (size_t)e + 1]);
     const int col0 = blk * 128 + lane * 4;
     const float wv = weights[pair];
-    const float4 g4 = *reinterpret_cast<const float4 *>(gate_z + pair * z_stride + col0);
+    float g[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    if constexpr (!UP_ONLY) {
+        const float4 g4 = *reinterpret_cast<const float4 *>(gate_z + pair * z_stride + col0);
+        g[0] = g4.x; g[1] = g4.y; g[2] = g4.z; g[3] = g4.w;
+    }
     const float4 u4 = *reinterpret_cast<const float4 *>(up_z + pair * z_stride + col0);
-    float g[4] = {g4.x, g4.y, g4.z, g4.w}, u[4] = {u4.x, u4.y, u4.z, u4.w};
+    float u[4] = {u4.x, u4.y, u4.z, u4.w};
     for (int s = 1; s < z_splits; ++s) {             /* a decode launch's K splits, in split order */
-        const float4 gs = *reinterpret_cast<const float4 *>(gate_z + s * z_split_stride + pair * z_stride + col0);
+        if constexpr (!UP_ONLY) {
+            const float4 gs = *reinterpret_cast<const float4 *>(gate_z + s * z_split_stride + pair * z_stride + col0);
+            g[0] += gs.x; g[1] += gs.y; g[2] += gs.z; g[3] += gs.w;
+        }
         const float4 us = *reinterpret_cast<const float4 *>(up_z + s * z_split_stride + pair * z_stride + col0);
-        g[0] += gs.x; g[1] += gs.y; g[2] += gs.z; g[3] += gs.w;
         u[0] += us.x; u[1] += us.y; u[2] += us.z; u[3] += us.w;
     }
-    exl3dev::had128(g);
+    if constexpr (!UP_ONLY) exl3dev::had128(g);
     exl3dev::had128(u);
     float t[4];
+    if constexpr (UP_ONLY) {
+        (void)gate_table; (void)clamp; (void)in_dim;
 #pragma unroll
-    for (int j = 0; j < 4; ++j) {
-        const float yg = g[j] * __half2float(svh_g[col0 + j]);
-        const float yu = u[j] * __half2float(svh_u[col0 + j]);
-        t[j] = pulsar_swiglu_elem(yg, yu, wv, clamp) * __half2float(suh_d[col0 + j]);
+        for (int j = 0; j < 4; ++j) {
+            const float yu = u[j] * __half2float(svh_u[col0 + j]);
+            t[j] = pulsar_relu2_elem(yu, wv) * __half2float(suh_d[col0 + j]);
+        }
+    } else {
+        const void *const *pg = reinterpret_cast<const void *const *>(gate_table);
+        const __half *svh_g = reinterpret_cast<const __half *>(pg[2 * (size_t)e + 1]) + in_dim;
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const float yg = g[j] * __half2float(svh_g[col0 + j]);
+            const float yu = u[j] * __half2float(svh_u[col0 + j]);
+            t[j] = pulsar_swiglu_elem(yg, yu, wv, clamp) * __half2float(suh_d[col0 + j]);
+        }
     }
     exl3dev::had128(t);
     float a = fmaxf(fmaxf(fabsf(t[0]), fabsf(t[1])), fmaxf(fabsf(t[2]), fabsf(t[3])));
@@ -182,7 +201,7 @@ int ds4_exl3_moe_fold_launch(const float *gate_z, const float *up_z, const int32
     }
     const int64_t tasks = pairs * (mid_dim >> 7);
     const unsigned blocks = (unsigned)((tasks + 7) / 8);
-    exl3_moe_fold_kernel<<<blocks, 256, 0, stream>>>(
+    exl3_moe_fold_kernel<false><<<blocks, 256, 0, stream>>>(
         gate_z, up_z, mid_dim, selected, weights, gate_table, up_table, in_dim, down_table, in_dim, mid_dim, pairs,
         clamp, (__nv_fp8_e4m3 *)mid_q, (unsigned char *)mid_sf, (__nv_bfloat16 *)mid_bf16, mid_kbp, z_splits,
         z_split_stride);
@@ -207,13 +226,34 @@ int ds4_exl3_moe_fold_fused_launch(const float *gate_up_z, const int32_t *select
      * plane is suh [in_dim] | svh [2 mid], so up's svh starts at in_dim + mid */
     const int64_t tasks = pairs * (mid_dim >> 7);
     const unsigned blocks = (unsigned)((tasks + 7) / 8);
-    exl3_moe_fold_kernel<<<blocks, 256, 0, stream>>>(
+    exl3_moe_fold_kernel<false><<<blocks, 256, 0, stream>>>(
         gate_up_z, gate_up_z + mid_dim, 2 * mid_dim, selected, weights, gate_up_table, gate_up_table, in_dim + mid_dim,
         down_table, in_dim, mid_dim, pairs, clamp, (__nv_fp8_e4m3 *)mid_q, (unsigned char *)mid_sf, (__nv_bfloat16 *)mid_bf16, mid_kbp,
         z_splits, z_split_stride);
     const cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
         fprintf(stderr, "ds4_exl3_moe_fold_fused_launch: launch failed: %s\n", cudaGetErrorString(err));
+        return -3;
+    }
+    return 0;
+}
+
+int ds4_exl3_moe_fold_up_launch(const float *up_z, const int32_t *selected, const float *weights, const void *up_table,
+                                const void *down_table, int in_dim, int mid_dim, int64_t pairs, void *mid_q, void *mid_sf,
+                                int mid_kbp, cudaStream_t stream, void *mid_bf16, int z_splits, int64_t z_split_stride) {
+    if (!up_z || !selected || !weights || !up_table || !down_table || (!mid_q || !mid_sf) && !mid_bf16 || pairs <= 0 ||
+        in_dim <= 0 || mid_dim <= 0 || mid_dim % EXL3_HAD_BLOCK || z_splits < 1) {
+        fprintf(stderr, "ds4_exl3_moe_fold_up_launch: null pointer or bad shape (mid_dim %% 128)\n");
+        return -1;
+    }
+    const int64_t tasks = pairs * (mid_dim >> 7);
+    const unsigned blocks = (unsigned)((tasks + 7) / 8);
+    exl3_moe_fold_kernel<true><<<blocks, 256, 0, stream>>>(
+        nullptr, up_z, mid_dim, selected, weights, nullptr, up_table, in_dim, down_table, in_dim, mid_dim, pairs, 0.0f,
+        (__nv_fp8_e4m3 *)mid_q, (unsigned char *)mid_sf, (__nv_bfloat16 *)mid_bf16, mid_kbp, z_splits, z_split_stride);
+    const cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        fprintf(stderr, "ds4_exl3_moe_fold_up_launch: launch failed: %s\n", cudaGetErrorString(err));
         return -3;
     }
     return 0;

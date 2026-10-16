@@ -328,23 +328,29 @@ extern "C" int pulsar_rows_moe_routed_launch(const pulsar_rows_moe *w, int32_t *
     const bool bf16 = w->bf16_gate != nullptr || w->bf16_up != nullptr;
     const bool split = w->gate_table != nullptr;
     const bool exl3 = split || w->gate_up_table != nullptr || w->down_table != nullptr;
+    /* L296: EXL3 up-only (an up table alone: ungated experts) */
+    const bool exl3_up = exl3 && !split && w->gate_up_table == nullptr && w->up_table != nullptr;
     if (tessera && bf16) {
         fprintf(stderr, "pulsar: routed MoE (bf16 rows): both Tessera and BF16 stacks -- refusing\n");
         return -1;
     }
-    /* L295 F7: a non-gated activation runs only where an arm reads it -- the BF16 arm, up-only (no gate stack) */
-    if (w->act != PULSAR_FFN_ACT_SWIGLU &&
-        (!bf16 || w->act != PULSAR_FFN_ACT_RELU2 || w->bf16_gate != nullptr)) {
-        fprintf(stderr, "pulsar: routed MoE (bf16 rows): activation %d runs on the BF16 arm's up-only stacks alone (the "
-                        "EXL3 and Tessera arms are SwiGLU) -- refusing\n", (int)w->act);
+    /* L295 F7 / L296: a non-gated activation (relu^2) runs on up-only stacks alone -- BF16 (no gate stack) or EXL3
+     * (an up table alone); an EXL3 up table alone is relu^2 only */
+    if ((w->act != PULSAR_FFN_ACT_SWIGLU &&
+         (w->act != PULSAR_FFN_ACT_RELU2 || (bf16 ? w->bf16_gate != nullptr : !exl3_up))) ||
+        (exl3_up && w->act != PULSAR_FFN_ACT_RELU2)) {
+        fprintf(stderr, "pulsar: routed MoE (bf16 rows): activation %d runs on up-only stacks (BF16 without a gate, or an "
+                        "EXL3 up table alone) and only there; the gated arms are SwiGLU -- refusing\n", (int)w->act);
         return -1;
     }
     if (tessera || bf16 ? (tessera ? (!w->tessera_up || !w->tessera_down)
                                    : (!w->bf16_up || !w->bf16_down ||
                                       (w->act == PULSAR_FFN_ACT_SWIGLU) != (w->bf16_gate != nullptr))) || exl3
-                        : (!w->down_table || split != (w->up_table != nullptr) || split == (w->gate_up_table != nullptr))) {
+                        : (!w->down_table || (!exl3_up && (split != (w->up_table != nullptr) ||
+                                                           split == (w->gate_up_table != nullptr))))) {
         fprintf(stderr, "pulsar: routed MoE (bf16 rows): the experts must be ONE of an EXL3 fused gate_up table, an "
-                        "EXL3 gate + up pair, a Tessera gate / up / down triple or a BF16 one -- refusing\n");
+                        "EXL3 gate + up pair, an EXL3 up table alone, a Tessera gate / up / down triple or a BF16 one -- "
+                        "refusing\n");
         return -1;
     }
     const int H = w->out_dim, mid = w->mid_dim, top_k = w->top_k, E = w->n_expert;
@@ -415,13 +421,14 @@ extern "C" int pulsar_rows_moe_routed_launch(const pulsar_rows_moe *w, int32_t *
         qwen_tessera_routed_kernel<<<(unsigned)((n + 255) / 256), 256, 0, stream>>>(out, routed, n, nf_flag, nf_code);
         return launch_ok("tessera routed term") ? 0 : -3;
     }
-    static int announced[2] = {0, 0};
-    if (!announced[split]) {
-        announced[split] = 1;
+    static int announced[3] = {0, 0, 0};
+    const int form = exl3_up ? 2 : split ? 1 : 0;
+    if (!announced[form]) {
+        announced[form] = 1;
         fprintf(stderr, "pulsar: routed MoE (bf16 rows) = EXL3 %s K=%g, down K=%g, top-%d of %d (experts [%d, +%d)) "
                         "through the EXL3 routed front door (exl3_moe.cuh)\n",
-                split ? "gate + up pair" : "fused gate_up", w->k2_gate_up / 2.0, w->k2_down / 2.0, top_k, E, w->ex_lo,
-                w->n_local);
+                exl3_up ? "up-only relu^2 up" : split ? "gate + up pair" : "fused gate_up", w->k2_gate_up / 2.0,
+                w->k2_down / 2.0, top_k, E, w->ex_lo, w->n_local);
     }
     if (nE != E) {
         qwen_ep_localize_kernel<<<(unsigned)((pairs + 255) / 256), 256, 0, stream>>>(sel, (int)pairs, w->ex_lo, nE);
@@ -429,7 +436,7 @@ extern "C" int pulsar_rows_moe_routed_launch(const pulsar_rows_moe *w, int32_t *
     }
     /* L251 / ac69748f: the block input's bf16 row and the fold's bf16 output -- no E4M3 slot in this lane */
     const exl3_moe_stacks st{w->gate_up_table, w->gate_table, w->up_table, w->down_table, w->k2_gate_up, w->k2_down,
-                             nE, H, mid, H};
+                             nE, H, mid, H, (int)w->act};
     const exl3_moe_bufs bufs{m.gu_z, split ? m.gu_z + (size_t)pairs * mid : nullptr, m.down_z,
                              exl3_moe_act{EXL3_MOE_ACT_BF16_ROWS, m.mid_x, nullptr, 0}};
     exl3_moe_shared sh[PULSAR_ROUTER_SHARED_MAX]{};

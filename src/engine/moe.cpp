@@ -9,9 +9,10 @@
  *   the MX SLOT (E4M3 armed in the backend's cache for the f32 block input -- DeepSeek; pulsar_moe_routed_slot):
  *       CUTLASS MXFP4, IQ2 MMQ, EXL3, and the mixed CUTLASS / MMQ shapes -> the backend's routed dispatcher
  *   raw bf16 ROWS (Qwen, Nemotron-H; pulsar_moe_routed_rows):
- *       EXL3 fused gate_up + down, or an EXL3 gate + up pair + down, or BF16 stacks (L295 F7; up-only relu^2 among
- *       them, pulsar_ffn_act) -> pulsar_rows_moe_routed_launch; a LATENT block (L296 N4) wraps the routed part in its
- *       two projections (latent_in -> the routed experts on the latent -> latent_out), each through the dense front door
+ *       EXL3 fused gate_up + down, an EXL3 gate + up pair + down, an EXL3 up + down (L296: up-only relu^2), or BF16
+ *       stacks (L295 F7; up-only relu^2 among them, pulsar_ffn_act) -> pulsar_rows_moe_routed_launch; a LATENT block
+ *       (L296 N4) wraps the routed part in its two projections (latent_in -> the routed experts on the latent ->
+ *       latent_out), each through the dense front door
  *
  * What a tensor-parallel rank reads is the rank's plan's (tp_slice.cpp), not the family's: a stack the plan
  * halved (expert tensor-parallel, MXFP4 or EXL3) reads the halves registered under the engine key; a stack the plan
@@ -48,7 +49,12 @@ pulsar_moe_arm pulsar_moe_arm_up_only(const pulsar_tensor *up, const pulsar_tens
     const bool bf16 = up->type == PULSAR_TENSOR_BF16 && down->type == PULSAR_TENSOR_BF16 &&
                       pulsar_format_serves(up->type, PULSAR_ROLE_EXPERT_GATE_UP, act) &&
                       pulsar_format_serves(down->type, PULSAR_ROLE_EXPERT_DOWN, act);
-    return bf16 ? PULSAR_MOE_ARM_ROWS_BF16 : PULSAR_MOE_ARM_NONE;
+    if (bf16) return PULSAR_MOE_ARM_ROWS_BF16;
+    /* L296: EXL3 up + down (never paired with BF16): the EXL3 routed front door's up-only form */
+    const bool exl3 = exl3_type_k2(up->type) != 0 && exl3_type_k2(down->type) != 0 &&
+                      pulsar_format_serves(up->type, PULSAR_ROLE_EXPERT_GATE_UP, act) &&
+                      pulsar_format_serves(down->type, PULSAR_ROLE_EXPERT_DOWN, act);
+    return exl3 ? PULSAR_MOE_ARM_ROWS_UP : PULSAR_MOE_ARM_NONE;
 }
 
 static void say_no_arm(const pulsar_tensor *gate, const pulsar_tensor *down, const char *against) {
@@ -164,20 +170,20 @@ bool pulsar_moe_routed_rows(const pulsar_moe_rows_call *c) {
                                              c->ws_bytes, c->nf_flag, c->nf_code, 0) == 0;
     }
     const pulsar_tensor *G = c->gate, *U = c->up, *D = c->down;
-    /* L295 F7: a non-gated activation (RELU2) reads up-only experts, which only the BF16 arm runs */
+    /* L295 F7 / L296: a non-gated activation (RELU2) reads up-only experts (no gate stack): the BF16 arm or EXL3's
+     * up-only form, pulsar_moe_arm_up_only's answer */
     const pulsar_ffn_act act = (pulsar_ffn_act)c->act;
-    if (act != PULSAR_FFN_ACT_SWIGLU) {
-        if (act != PULSAR_FFN_ACT_RELU2 || G ||
-            pulsar_moe_arm_up_only(U, D, PULSAR_ACT_ROWS_BF16) != PULSAR_MOE_ARM_ROWS_BF16) {
-            fprintf(stderr, "pulsar: routed MoE: activation %d runs BF16 up-only experts (no gate stack) alone -- "
-                            "refusing\n", (int)act);
-            return false;
-        }
+    const pulsar_moe_arm up_arm = act == PULSAR_FFN_ACT_RELU2 && !G ? pulsar_moe_arm_up_only(U, D, PULSAR_ACT_ROWS_BF16)
+                                                                    : PULSAR_MOE_ARM_NONE;
+    if (act != PULSAR_FFN_ACT_SWIGLU && up_arm == PULSAR_MOE_ARM_NONE) {
+        fprintf(stderr, "pulsar: routed MoE: activation %d runs up-only experts (no gate stack) in BF16 or EXL3 alone -- "
+                        "refusing\n", (int)act);
+        return false;
     }
     const pulsar_tensor *G0 = G ? G : U;   /* the first projection: its input width, its plan slice */
-    const pulsar_moe_arm arm = act == PULSAR_FFN_ACT_RELU2 ? PULSAR_MOE_ARM_ROWS_BF16
-                                                           : pulsar_moe_arm_for(G, U, D, PULSAR_ACT_ROWS_BF16);
-    if (arm != PULSAR_MOE_ARM_ROWS_FUSED && arm != PULSAR_MOE_ARM_ROWS_PAIR && arm != PULSAR_MOE_ARM_ROWS_BF16) {
+    const pulsar_moe_arm arm = act == PULSAR_FFN_ACT_RELU2 ? up_arm : pulsar_moe_arm_for(G, U, D, PULSAR_ACT_ROWS_BF16);
+    if (arm != PULSAR_MOE_ARM_ROWS_FUSED && arm != PULSAR_MOE_ARM_ROWS_PAIR && arm != PULSAR_MOE_ARM_ROWS_BF16 &&
+        arm != PULSAR_MOE_ARM_ROWS_UP) {
         say_no_arm(G0, D, "raw bf16 rows");
         return false;
     }
@@ -240,6 +246,9 @@ bool pulsar_moe_routed_rows(const pulsar_moe_rows_call *c) {
         w.gate_table = table(G, "routed experts gate");
         w.up_table = table(U, "routed experts up");
         if (!w.gate_table || !w.up_table) return false;
+    } else if (arm == PULSAR_MOE_ARM_ROWS_UP) {
+        w.up_table = table(U, "routed experts up");   /* up-only: no gate table (w.act RELU2) */
+        if (!w.up_table) return false;
     } else {
         w.gate_up_table = table(G, "routed experts gate_up");
         if (!w.gate_up_table) return false;

@@ -513,7 +513,8 @@ tests/expert_table_gate: tests/expert_table_gate.cu Makefile \
 # and the sum, incl. their K-split partials -- graded against the host authority (exl3_trellis.h + double
 # arithmetic) on random tiles at the V4.1 and Qwen expert shapes.  Model-free; needs a device.  Includes the
 # kernel TUs directly, as the table gate does.
-tests/exl3_moe_epilogue_gate: tests/exl3_moe_epilogue_gate.cu tests/exl3_moe_epilogue_gate_qwen.inc Makefile \
+tests/exl3_moe_epilogue_gate: tests/exl3_moe_epilogue_gate.cu tests/exl3_moe_epilogue_gate_qwen.inc \
+                              tests/exl3_moe_epilogue_gate_uponly.inc Makefile \
                               src/cuda/mmq/exl3_moe_epilogue.cu src/cuda/mmq/exl3_moe_epilogue.cuh \
                               src/cuda/mmq/exl3_moe_prefill.cu src/cuda/mmq/exl3_moe_prefill.cuh \
                               src/cuda/mmq/ds4_exl3_dev.cuh src/cuda/pulsar_cuda_mx.cuh src/engine/exl3_trellis.h

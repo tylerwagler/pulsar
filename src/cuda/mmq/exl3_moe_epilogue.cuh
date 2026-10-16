@@ -75,6 +75,27 @@ int ds4_exl3_moe_fold_fused_launch(
     int             z_splits = 1,
     int64_t         z_split_stride = 0);
 
+/** L296: the UP-ONLY fold (an ungated expert: no gate projection): y_u = svh_u * H(z_u), v = relu(y_u)^2 * weight
+ *  (pulsar_relu2_elem), then the down input rotation and the emit exactly as ds4_exl3_moe_fold_launch -- the same
+ *  kernel with the gate side compiled out.  up_z [pairs][mid] (the up slice's svh at suh + in_dim); no clamp.  The
+ *  K-split partials as ds4_exl3_moe_fold_launch. */
+int ds4_exl3_moe_fold_up_launch(
+    const float   * up_z,
+    const int32_t * selected,
+    const float   * weights,
+    const void    * up_table,
+    const void    * down_table,
+    int             in_dim,
+    int             mid_dim,
+    int64_t         pairs,
+    void          * mid_q,
+    void          * mid_sf,
+    int             mid_kbp,
+    cudaStream_t    stream,
+    void          * mid_bf16 = nullptr,
+    int             z_splits = 1,
+    int64_t         z_split_stride = 0);
+
 /** The EXL3 sum: out[tok][o] = sum over slots (in slot order) of
  *  svh_d * H(z_d[pair]) -- the down projection's output rotation folded into
  *  the fixed-order reduction.  A non-finite sum records nf_code in *nf_flag
