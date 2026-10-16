@@ -208,6 +208,13 @@ size_t pulsar_rows_linear_multi_workspace_bytes(const pulsar_rows_linear *const 
  *  bit for bit what pulsar_rows_linear_launch writes for it alone), then each mxfp8_lt one by itself. */
 int pulsar_rows_linear_multi_launch(const pulsar_rows_linear *const *ls, int n, const uint16_t *x_bf16, int rows,
                                     float *const *y, void *ws, size_t ws_bytes, cudaStream_t stream);
+/** L296 dec2: the multi launch with bf16 outputs yb[j] [rows][ls[j]->out] -- the f32 outputs rounded to nearest even,
+ *  byte for byte, for a consumer that reads bf16 (rule 3: the producer emits).  The EXL3 decode GEMV emits them in its
+ *  epilogue (no f32 round trip, no emit launch); every other arm (a prompt chunk, mxfp8_lt, BF16) writes its f32 rows
+ *  into stage[j] [rows][out] and the front door emits them. */
+int pulsar_rows_linear_multi_bf16_launch(const pulsar_rows_linear *const *ls, int n, const uint16_t *x_bf16, int rows,
+                                         float *const *stage, uint16_t *const *yb, void *ws, size_t ws_bytes,
+                                         cudaStream_t stream);
 
 /* ======================================================================== */
 /* MoE block (Qwen4ExpTextSparseMoeBlock)                                     */
@@ -267,6 +274,21 @@ int pulsar_rows_moe_shared_fork(const pulsar_rows_moe_shared *q, const uint16_t 
  *  (pulsar_linear_rows_ref), over q's buffers. */
 int pulsar_rows_moe_shared_launch(const pulsar_rows_moe_shared *q, const uint16_t *x_bf16, int T, float *out,
                                   cudaStream_t stream);
+/** L296 dec2: the launch's two halves, for a block that runs the shared expert alongside its routed experts:
+ *  ys = down(act(gate x, up x)) (q->ys), then -- once the routed sum is in `out` -- out += scale * ys.  The launch is
+ *  exactly the two in turn: the same bytes.  0 on success. */
+int pulsar_rows_moe_shared_ys_launch(const pulsar_rows_moe_shared *q, const uint16_t *x_bf16, int T,
+                                     cudaStream_t stream);
+int pulsar_rows_moe_shared_add_launch(const pulsar_rows_moe_shared *q, int T, float *out, cudaStream_t stream);
+/** L296 dec2: the routed chain's priority stream.  pulsar_rows_moe_routed_fork returns a stream of the device's
+ *  greatest priority that has waited for `caller`'s work so far (NULL refused: one fork pending per caller); the
+ *  block launches its router and routed experts on it, its shared expert's ys on `caller`, then
+ *  pulsar_rows_moe_routed_join makes `caller` wait for the routed chain before the shared add.  The routed chain is
+ *  latency-bound small launches between bandwidth-bound ones; at equal priority the shared expert's CTAs, queued
+ *  first, held them back (a 6 us select waited 46 us).  0 on success. */
+typedef cudaStream_t pulsar_rows_stream;   /**< a launch stream, opaque to the engine (NULL: the per-thread default) */
+pulsar_rows_stream pulsar_rows_moe_routed_fork(cudaStream_t caller);
+int pulsar_rows_moe_routed_join(cudaStream_t caller);
 typedef struct pulsar_rows_moe {
     const void *const *gate_up_table;   /**< exl3_expert_table pairs, the fused form, or NULL */
     const void *const *gate_table, *const *up_table;   /**< the pair form, or NULL */

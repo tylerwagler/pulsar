@@ -1847,7 +1847,9 @@ int pulsar_gpu_seg_exit(uint64_t key, int body_ok) {
         return 0;
     }
     cudaGraphExec_t ex = NULL;
-    if (cudaGraphInstantiate(&ex, gr, NULL, NULL, 0) != cudaSuccess) {
+    /* L296 dec2: the kernel nodes keep the priority of the stream they were captured on (a block's routed chain on
+     * its priority stream, pulsar_rows_moe_routed_fork) */
+    if (cudaGraphInstantiateWithFlags(&ex, gr, cudaGraphInstantiateFlagUseNodePriority) != cudaSuccess) {
         (void)cudaGraphDestroy(gr);
         (void)cudaGetLastError();
         return 0;

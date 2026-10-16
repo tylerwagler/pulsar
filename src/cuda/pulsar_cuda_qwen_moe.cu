@@ -21,6 +21,7 @@
 #include "mmq/ds4_exl3_dense.cuh"
 #include "mmq/exl3_moe.cuh"
 #include "pulsar_cuda_bf16_rows.cuh"
+#include "pulsar_cuda_rowops.h"
 #ifdef PULSAR_HAVE_MMQ
 #include "mmq/pulsar_tessera.h"
 #endif
@@ -229,8 +230,10 @@ extern "C" size_t pulsar_rows_linear_multi_workspace_bytes(const pulsar_rows_lin
     return ne ? ds4_exl3_dense_multi_workspace_bytes(p, ne, rows, ls[0]->in) : 0;
 }
 
-extern "C" int pulsar_rows_linear_multi_launch(const pulsar_rows_linear *const *ls, int n, const uint16_t *x_bf16,
-                                               int rows, float *const *y, void *ws, size_t ws_bytes, cudaStream_t stream) {
+/* The multi launch, f32 outputs y (yb NULL) or bf16 rows yb with y[j] the f32 staging of the arms that have no bf16
+ * epilogue (L296 dec2): the EXL3 decode GEMV emits yb itself; every other arm writes y[j] and the front door emits. */
+static int rows_multi(const pulsar_rows_linear *const *ls, int n, const uint16_t *x_bf16, int rows, float *const *y,
+                      uint16_t *const *yb, void *ws, size_t ws_bytes, cudaStream_t stream) {
     if (!ls || n < 1 || n > DS4_EXL3_DENSE_MAX_PROJ || !y || !x_bf16 || rows <= 0) {
         fprintf(stderr, "pulsar: qwen linears: %d Linears (1..%d), no input or no rows -- refusing\n", n,
                 DS4_EXL3_DENSE_MAX_PROJ);
@@ -240,18 +243,40 @@ extern "C" int pulsar_rows_linear_multi_launch(const pulsar_rows_linear *const *
     int ne = 0;
     for (int j = 0; j < n; ++j) {
         const pulsar_rows_linear *l = ls[j];
-        if (!l || !l->w || !y[j] || l->in != ls[0]->in || l->prompt != ls[0]->prompt) {
+        if (!l || !l->w || !y[j] || (yb && !yb[j]) || l->in != ls[0]->in || l->prompt != ls[0]->prompt) {
             fprintf(stderr, "pulsar: qwen linears: Linear %d has no weight / output, or not the first one's input width "
                             "and row kind -- refusing\n", j);
             return -1;
         }
-        if (l->k2) p[ne++] = ds4_exl3_dense_proj{l->w, l->k2, l->out, y[j]};
+        const bool own_bf16 = yb && !l->prompt;   /* the EXL3 decode epilogue emits the bf16 rows */
+        if (l->k2) p[ne++] = ds4_exl3_dense_proj{l->w, l->k2, l->out, own_bf16 ? nullptr : y[j], own_bf16 ? yb[j] : nullptr};
     }
     if (ne && ds4_exl3_dense_multi_launch(p, ne, x_bf16, rows, ls[0]->in, ws, ws_bytes, stream, ls[0]->prompt) != 0)
         return -1;
-    for (int j = 0; j < n; ++j)   /* the mxfp8_lt tier, one by one (its own arm) */
-        if (!ls[j]->k2 && pulsar_rows_linear_launch(ls[j], x_bf16, rows, y[j], ws, ws_bytes, stream) != 0) return -1;
+    for (int j = 0; j < n; ++j) {   /* the mxfp8_lt / BF16 tiers, one by one (their own arms) */
+        const pulsar_rows_linear *l = ls[j];
+        if (!l->k2 && pulsar_rows_linear_launch(l, x_bf16, rows, y[j], ws, ws_bytes, stream) != 0) return -1;
+        if (yb && (!l->k2 || l->prompt) &&
+            pulsar_rows_emit_bf16_launch(y[j], (uint64_t)l->out, (uint32_t)rows, (uint32_t)l->out, NULL,
+                                         PULSAR_ROWS_SCALE_NONE, yb[j], (uint64_t)l->out, stream) != 0)
+            return -1;
+    }
     return 0;
+}
+
+extern "C" int pulsar_rows_linear_multi_launch(const pulsar_rows_linear *const *ls, int n, const uint16_t *x_bf16,
+                                               int rows, float *const *y, void *ws, size_t ws_bytes, cudaStream_t stream) {
+    return rows_multi(ls, n, x_bf16, rows, y, nullptr, ws, ws_bytes, stream);
+}
+
+extern "C" int pulsar_rows_linear_multi_bf16_launch(const pulsar_rows_linear *const *ls, int n, const uint16_t *x_bf16,
+                                                    int rows, float *const *stage, uint16_t *const *yb, void *ws,
+                                                    size_t ws_bytes, cudaStream_t stream) {
+    if (!yb) {
+        fprintf(stderr, "pulsar: rows linears (bf16 outputs): no outputs -- refusing\n");
+        return -1;
+    }
+    return rows_multi(ls, n, x_bf16, rows, stage, yb, ws, ws_bytes, stream);
 }
 
 /* The MX slab geometry, for the engine TUs that cannot include pulsar_cuda_mx.cuh
@@ -466,27 +491,119 @@ extern "C" int pulsar_rows_moe_routed_launch(const pulsar_rows_moe *w, int32_t *
 #endif
 }
 
-extern "C" int pulsar_rows_moe_shared_launch(const pulsar_rows_moe_shared *q, const uint16_t *x_bf16, int T,
-                                             float *out, cudaStream_t stream) {
+/* A non-riding shared expert's descriptor, checked (the launch, the fork and the join take the same one). */
+static bool shared_ok(const pulsar_rows_moe_shared *q, const char *what) {
     const bool gated = q && q->act == PULSAR_FFN_ACT_SWIGLU;
     const int smid = q ? q->up.out : 0, H = q ? q->up.in : 0;
-    if (!q || !x_bf16 || !out || T <= 0 || (q->act != PULSAR_FFN_ACT_SWIGLU && q->act != PULSAR_FFN_ACT_RELU2) ||
+    if (!q || (q->act != PULSAR_FFN_ACT_SWIGLU && q->act != PULSAR_FFN_ACT_RELU2) ||
         (gated && (!q->yg || q->gate.in != H || q->gate.out != smid)) || !q->yu || !q->ys || !q->h ||
         q->down.in != smid || q->down.out != H) {
-        fprintf(stderr, "pulsar: MoE shared expert: activation %d, %s%d->%d / %d->%d (in -> mid -> in), its buffers, rows "
-                        "and an output -- refusing\n", q ? (int)q->act : -1, gated ? "a gate of the up's shape, " : "",
-                H, smid, q ? q->down.in : -1, q ? q->down.out : -1);
-        return -1;
+        fprintf(stderr, "pulsar: MoE shared expert %s: activation %d, %s%d->%d / %d->%d (in -> mid -> in), its buffers -- "
+                        "refusing\n", what, q ? (int)q->act : -1, gated ? "a gate of the up's shape, " : "", H, smid,
+                q ? q->down.in : -1, q ? q->down.out : -1);
+        return false;
     }
-    /* [gate +] up on the same row, the activation's producer, down, then out += scale * shared */
-    int rc = gated ? pulsar_rows_linear_launch(&q->gate, x_bf16, T, q->yg, q->ws, q->ws_bytes, stream) : 0;
+    return true;
+}
+
+/* [gate +] up on the same row, the activation's producer, down: ys = down(act(gate x, up x)) */
+static int shared_ys(const pulsar_rows_moe_shared *q, const uint16_t *x_bf16, int T, cudaStream_t stream) {
+    int rc = q->act == PULSAR_FFN_ACT_SWIGLU ? pulsar_rows_linear_launch(&q->gate, x_bf16, T, q->yg, q->ws, q->ws_bytes,
+                                                                         stream) : 0;
     if (!rc) rc = pulsar_rows_linear_launch(&q->up, x_bf16, T, q->yu, q->ws, q->ws_bytes, stream);
     if (rc) return rc;
-    rows_act_emit_kernel<<<T, 256, 0, stream>>>(q->yg, q->yu, smid, (int)q->act, (__nv_bfloat16 *)q->h);
+    rows_act_emit_kernel<<<T, 256, 0, stream>>>(q->yg, q->yu, q->up.out, (int)q->act, (__nv_bfloat16 *)q->h);
     if (!launch_ok("shared activation")) return -3;
-    rc = pulsar_rows_linear_launch(&q->down, q->h, T, q->ys, q->ws, q->ws_bytes, stream);
-    if (rc) return rc;
+    return pulsar_rows_linear_launch(&q->down, q->h, T, q->ys, q->ws, q->ws_bytes, stream);
+}
+
+/* out += scale * ys */
+static int shared_add(const pulsar_rows_moe_shared *q, int T, float *out, cudaStream_t stream) {
+    const int H = q->down.out;
     const size_t n = (size_t)T * H;
     rows_shared_add_kernel<<<(unsigned)((n + 255) / 256), 256, 0, stream>>>(out, q->ys, q->scale, T, H);
     return launch_ok("shared add") ? 0 : -3;
+}
+
+extern "C" int pulsar_rows_moe_shared_launch(const pulsar_rows_moe_shared *q, const uint16_t *x_bf16, int T,
+                                             float *out, cudaStream_t stream) {
+    if (!shared_ok(q, "launch") || !x_bf16 || !out || T <= 0) return -1;
+    const int rc = shared_ys(q, x_bf16, T, stream);
+    return rc ? rc : shared_add(q, T, out, stream);
+}
+
+extern "C" int pulsar_rows_moe_shared_ys_launch(const pulsar_rows_moe_shared *q, const uint16_t *x_bf16, int T,
+                                                cudaStream_t stream) {
+    if (!shared_ok(q, "ys") || !x_bf16 || T <= 0) return -1;
+    return shared_ys(q, x_bf16, T, stream);
+}
+
+extern "C" int pulsar_rows_moe_shared_add_launch(const pulsar_rows_moe_shared *q, int T, float *out, cudaStream_t stream) {
+    if (!shared_ok(q, "add") || !out || T <= 0) return -1;
+    return shared_add(q, T, out, stream);
+}
+
+namespace {
+
+/* L296 dec2: the routed chain's stream per (thread, device, caller stream) -- the device's GREATEST priority, so its
+ * latency-bound launches take the SMs ahead of the bandwidth-bound shared expert left on the caller (in a captured
+ * step the nodes keep it: kernel nodes copy their stream's priority, and the segment cache instantiates with
+ * cudaGraphInstantiateFlagUseNodePriority) -- with the fork and join events.  One fork pending at a time. */
+struct routed_lane {
+    int dev;
+    cudaStream_t caller, s;
+    cudaEvent_t fork, done;
+    bool pending;
+};
+
+routed_lane *routed_lane_for(cudaStream_t caller) {
+    thread_local routed_lane t_lanes[8];
+    thread_local int t_n = 0;
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess) return nullptr;
+    for (int i = 0; i < t_n; ++i)
+        if (t_lanes[i].dev == dev && t_lanes[i].caller == caller) return &t_lanes[i];
+    if (t_n == 8) return nullptr;
+    routed_lane l{};
+    l.dev = dev;
+    l.caller = caller;
+    int least = 0, greatest = 0;
+    if (cudaDeviceGetStreamPriorityRange(&least, &greatest) != cudaSuccess ||
+        cudaStreamCreateWithPriority(&l.s, cudaStreamNonBlocking, greatest) != cudaSuccess ||
+        cudaEventCreateWithFlags(&l.fork, cudaEventDisableTiming) != cudaSuccess ||
+        cudaEventCreateWithFlags(&l.done, cudaEventDisableTiming) != cudaSuccess)
+        return nullptr;
+    t_lanes[t_n] = l;
+    static bool announced = false;
+    if (!__atomic_exchange_n(&announced, true, __ATOMIC_RELAXED))
+        fprintf(stderr, "pulsar: MoE decode = the router + routed experts on a priority-%d stream, the shared expert "
+                        "alongside on the caller's (priority %d), joined before the shared add\n", greatest, least);
+    return &t_lanes[t_n++];
+}
+
+} // namespace
+
+extern "C" pulsar_rows_stream pulsar_rows_moe_routed_fork(cudaStream_t caller) {
+    routed_lane *lane = routed_lane_for(caller);
+    if (!lane || lane->pending) {
+        fprintf(stderr, "pulsar: MoE routed fork: no priority stream, or a fork already pending on it -- refusing\n");
+        return nullptr;
+    }
+    if (cudaEventRecord(lane->fork, caller) != cudaSuccess || cudaStreamWaitEvent(lane->s, lane->fork, 0) != cudaSuccess) {
+        fprintf(stderr, "pulsar: MoE routed fork: the fork event failed -- refusing\n");
+        return nullptr;
+    }
+    lane->pending = true;
+    return lane->s;
+}
+
+extern "C" int pulsar_rows_moe_routed_join(cudaStream_t caller) {
+    routed_lane *lane = routed_lane_for(caller);
+    if (!lane || !lane->pending) {
+        fprintf(stderr, "pulsar: MoE routed join: no fork pending on this stream -- refusing\n");
+        return -1;
+    }
+    lane->pending = false;
+    return cudaEventRecord(lane->done, lane->s) == cudaSuccess && cudaStreamWaitEvent(caller, lane->done, 0) == cudaSuccess
+               ? 0 : -3;
 }

@@ -3280,6 +3280,7 @@ typedef struct {
     uint32_t *nf_flag;
     uint32_t nf_code;
     bool prompt;
+    void *stream;   ///< L296 dec2: the stream every launch goes on, a pulsar_rows_stream (NULL: the per-thread default)
 } pulsar_moe_rows_call;
 bool pulsar_moe_routed_rows(const pulsar_moe_rows_call *c);
 /** Whether stored format `type` has a kernel for `role` at activation `act` -- the one table (weight_format.cpp). */

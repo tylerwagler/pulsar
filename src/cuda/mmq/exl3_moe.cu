@@ -97,7 +97,7 @@ exl3_shared_swiglu_kernel(const float *__restrict__ g, const float *__restrict__
 } // namespace
 
 size_t exl3_moe_shared_ws_bytes(int T, int in_dim, int mid, int out_dim) {
-    const ds4_exl3_dense_proj p[2] = {{nullptr, 0, mid, nullptr}, {nullptr, 0, mid, nullptr}};
+    const ds4_exl3_dense_proj p[2] = {{nullptr, 0, mid, nullptr, nullptr}, {nullptr, 0, mid, nullptr, nullptr}};
     const size_t gu = ds4_exl3_dense_multi_workspace_bytes(p, 2, T, in_dim), d = ds4_exl3_dense_workspace_bytes(T, mid, out_dim);
     return gu > d ? gu : d;
 }
@@ -118,7 +118,8 @@ int exl3_moe_shared_fork(const exl3_moe_shared &sh, const exl3_moe_act &x, int T
     }
     if (cudaEventRecord(lane->fork, stream) != cudaSuccess || cudaStreamWaitEvent(lane->s, lane->fork, 0) != cudaSuccess)
         return -3;
-    const ds4_exl3_dense_proj gu[2] = {{sh.gate, sh.k2_gate, sh.mid, sh.yg}, {sh.up, sh.k2_up, sh.mid, sh.yu}};
+    const ds4_exl3_dense_proj gu[2] = {{sh.gate, sh.k2_gate, sh.mid, sh.yg, nullptr},
+                                       {sh.up, sh.k2_up, sh.mid, sh.yu, nullptr}};
     int rc = ds4_exl3_dense_multi_launch(gu, 2, x.x, T, in_dim, sh.ws, sh.ws_bytes, lane->s, prompt);
     if (rc == 0) {
         const int64_t n = (int64_t)T * sh.mid;

@@ -96,12 +96,15 @@ int qwen_exl3_dense_prefill_launch(const void *w, int k2, const void *x_bf16, fl
 #define DS4_EXL3_DENSE_MAX_PROJ 4
 
 /** One projection of a multi launch: its [trellis | suh | svh] slice (16-byte aligned), rate, output width and
- *  output y [M][N] f32 (16-byte aligned). */
+ *  output: y [M][N] f32 (16-byte aligned), or (L296 dec2, decode rows only) NULL y and yb [M][N] bf16 (8-byte
+ *  aligned) -- the epilogue emits the bf16 rows the f32 output rounds to (round to nearest even), for a consumer
+ *  that reads bf16; a prompt chunk refuses yb. */
 struct ds4_exl3_dense_proj {
     const void *w;
     int         k2;
     int         N;
     float      *y;
+    uint16_t   *yb;
 };
 
 /** Workspace bytes ds4_exl3_dense_multi_launch needs for these projections at (M, K): the sum of each one's
