@@ -1044,7 +1044,7 @@ mtp-spec-gate: tests/mtp_spec_gate
 # (tools/nemotron/capture_mtp_ref.py) with transformers' own bf16 beside it (the floor); PASS within 2x the floor's KL.
 NEMOTRON_MTP_REF ?= /mnt/models/nemotron35-mini-ref/mtp_ref_fp32.pt
 NEMOTRON_MTP_REF_BF16 ?= /mnt/models/nemotron35-mini-ref/mtp_ref_bf16.pt
-NEMOTRON_MTP_GRADE_DIR ?= $(TMPDIR)/nemotron-mtp-grade
+NEMOTRON_MTP_GRADE_DIR ?= $(or $(TMPDIR),/var/tmp)/nemotron-mtp-grade-$(USER)
 .PHONY: nemotron-mtp-grade
 nemotron-mtp-grade: tests/mtp_spec_gate
 	rm -rf $(NEMOTRON_MTP_GRADE_DIR) && mkdir -p $(NEMOTRON_MTP_GRADE_DIR)
@@ -1060,7 +1060,7 @@ NEMOTRON_MINI_HF ?= /mnt/models/nemotron35-mini
 NEMOTRON_MINI_REF ?= /mnt/models/nemotron35-mini-ref/ref_fp32.pt
 NEMOTRON_MINI_REF_BF16 ?= /mnt/models/nemotron35-mini-ref/ref_bf16.pt
 NEMOTRON_GRADE_PY ?= $(HOME)/inkling/.venv/bin/python
-NEMOTRON_GRADE_DIR ?= $(TMPDIR)/nemotron-mini-grade
+NEMOTRON_GRADE_DIR ?= $(or $(TMPDIR),/var/tmp)/nemotron-mini-grade-$(USER)
 .PHONY: nemotron-mini-grade
 nemotron-mini-grade: tests/nemotron_fwd_gate
 	rm -rf $(NEMOTRON_GRADE_DIR) && mkdir -p $(NEMOTRON_GRADE_DIR)
