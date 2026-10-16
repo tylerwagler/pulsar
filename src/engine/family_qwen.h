@@ -393,16 +393,14 @@ typedef enum {
     PULSAR_QWEN_OP_COUNT,
 } pulsar_qwen_op_id;
 
-/** L251 MTP: the deepest chain one bank drafts (its verify run is at most this + 1 rows).  L288 (2026-10-13): 15 --
- *  a copy chain runs this deep; the MTP chain's own cap is the drafter's depth (spec_qwen.cpp).  L288 C1: kept at 15
- *  when the verify width went to 32 -- several banks fill the wider step; one bank's run is what a lone stream
- *  verifies, unchanged. */
-#define PULSAR_QWEN_SPEC_DRAFT_MAX 15u
 /** L272 P1 S4: the rows one verify step carries, every bank's run together -- the head's row cap, at every width
  *  of which the kernels keep their decode arms (each row's logits the bytes a one-token decode gives; L288 C1: in
  *  16-row blocks past 16).  The family's verify width (fused_heads_max, L284): the server's allocator fits N banks'
  *  drafts within it, one base row each. */
 #define PULSAR_QWEN_SPEC_ROWS PULSAR_QWEN_HEAD_ROWS_MAX
+
+/** L296 N9: the MTP drafter -- the chained-MTP drafter (spec_mtp.h) at this family's numbers (family_qwen.cpp). */
+extern const struct pulsar_drafter_ops PULSAR_QWEN_MTP_DRAFTER;
 
 struct pulsar_qwen_step;
 /** A Qwen session's own device state (L295 F3 / F4): the driver's buffers (the base: the logits slab, the step's
@@ -416,20 +414,19 @@ struct pulsar_qwen_state : pulsar_driver_state {
     /** The trunk's step object (the driver fills its core part each step). */
     struct pulsar_qwen_step *trunk;
     /* L251 MTP (mtp.present): the MTP layer's KV / index state is the declared state's slot n_layer; these are its
-     * activation slots.  Each bank's LAST trunk row waits in the MTP_PEND state until its next token exists (the MTP
-     * row at position p pairs the trunk stack at p with x_{p+1}). */
+     * activation slots.  The chained-MTP lane (spec_mtp.h, L296 N9) parks each bank's LAST trunk row in the MTP_PEND
+     * state until its next token exists (the MTP row at position p pairs the trunk stack at p with x_{p+1}) and stages
+     * a step's conditioning rows; the module step is this family's (family_qwen.cpp). */
     bool mtp;
     pulsar_gpu_tensor *mtp_streams; ///< [max_rows][n_hc][n_embd] bf16, the MTP layer's streams
-    pulsar_gpu_tensor *mtp_h;       ///< [max_rows + 1][n_hc][n_embd] bf16, the trunk stacks the MTP rows read
     pulsar_gpu_tensor *mtp_tok;     ///< [max_rows] i32, x_{p+1} per MTP row
     pulsar_gpu_tensor *mtp_ws;      ///< pulsar_qwen_mtp_combine_workspace_bytes
     pulsar_gpu_tensor *mtp_top;     ///< L289: pulsar_qwen_draft_top_ws_bytes, a draft row's pick + confidence
-    uint32_t *mtp_pend_pos;         ///< [n_banks] the pending row's position; UINT32_MAX = none
-    uint64_t mtp_probe_n, mtp_probe_hit;   ///< PULSAR_QWEN_MTP_PROBE counters (the eval's absorb)
     /** L272 P1: [n_banks] the MTP layer's index stage after each bank's last TRUE row, saved before a draft
-     *  chain writes draft rows into it, and whether the chain has (L272 P1 S4: per bank). */
+     *  chain writes draft rows into it (the lane's stage_save / stage_restore; L272 P1 S4: per bank). */
     pulsar_gpu_tensor *mtp_stage;
-    bool *mtp_stage_dirty;
+    /** L289: [n_banks][2] the n-gram context a draft chain's PLE prefetch advances (the bank's, at the chain's start) */
+    int32_t *mtp_pctx;
 };
 
 /** L266 step 7: tensor parallelism.  _load (at the family's load, the model bound): this rank's head counts

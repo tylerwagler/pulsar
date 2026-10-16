@@ -8,12 +8,14 @@
  * core stages and admission charges; every slot the plan declares is bound (and none it does not); the drafter's;
  * the engine facts; the tokenizer and chat front (N8: the container's tokenizer.json, the renderer turn by turn); and
  * the session side as declared (N3 / N7) -- the core driver's table covers the plan, the declared state is SSM FIXED
- * DELTA + conv FIXED SNAPSHOT on each Mamba-2 layer and a KV POOL on each attention layer (and the drafter's slot), the
+ * DELTA + conv FIXED SNAPSHOT on each Mamba-2 layer and a KV POOL on each attention layer, the drafter's slot (its KV
+ * POOL and the parked row, the chained-MTP lane's hooks) when the container holds the MTP module, the drafter, the
  * caps (the forward itself is tests/nemotron_fwd_gate's, on the GPU).  The refusals (a missing tensor, a wrong
  * shape, an unknown switch, ...) are graded by tests/nemotron_family_gate.py, which runs this probe on the clean
  * container and tests/loader_open on each mutant.  Exit 0 = every check passed. */
 #include "families/nemotron_h/nemotron_h.h"
 #include "engine/exl3_trellis.h"
+#include "engine/spec_mtp.h"
 
 #include <stdarg.h>
 
@@ -177,7 +179,9 @@ int main(int argc, char **argv) {
         pulsar_tokens_free(&t);
         check(pulsar_token_think_close(e) == 13, "the think close is </think> (13, a non-special added token)");
     }
-    check(pulsar_engine_drafter(e) == PULSAR_DRAFTER_NONE, "no drafter runs (N9)");
+    check(pulsar_engine_drafter(e) == (s->mtp_written ? PULSAR_DRAFTER_MTP : PULSAR_DRAFTER_NONE) &&
+              e->drafter_ops == (s->mtp_written ? &PULSAR_NEMOTRON_H_DRAFTER : NULL) && w->drafting == s->mtp_written,
+          "the drafter: %s (N9)", s->mtp_written ? "the MTP module, on the chained-MTP lane" : "none (no MTP module)");
     int k2 = 0;
     for (uint32_t il = 0; il < s->n_layer; il++)
         if (w->layer[il].exp_up) {
@@ -208,19 +212,26 @@ int main(int argc, char **argv) {
                     kv.kind == PULSAR_STATE_POOL && kv.tokens == 1u &&
                     kv.bytes == 2ull * s->n_head_kv * s->head_dim * 2u &&
                     sp->n_trunk == s->n_layer && sp->n_slots == s->n_layer + (s->mtp_written ? 1u : 0u);
+    const pulsar_state_decl &pend = sp->decl[PULSAR_NEMOTRON_H_STATE_MTP_PEND];
+    state_ok = state_ok && pend.kind == PULSAR_STATE_FIXED && pend.capture == PULSAR_STATE_CAPTURE_NONE && !pend.host &&
+               pend.bytes == (uint64_t)s->n_embd * 2u;
     for (uint32_t il = 0; state_ok && il < s->n_layer; il++)
         state_ok = sp->slot[il] == (p->desc[il].mixer == PULSAR_MIXER_MAMBA2
                                         ? (1u << PULSAR_NEMOTRON_H_STATE_SSM | 1u << PULSAR_NEMOTRON_H_STATE_CONV)
                                         : 1u << PULSAR_NEMOTRON_H_STATE_KV);
-    if (state_ok && s->mtp_written) state_ok = sp->slot[s->n_layer] == 1u << PULSAR_NEMOTRON_H_STATE_KV;
+    if (state_ok && s->mtp_written)
+        state_ok = sp->slot[s->n_layer] == (1u << PULSAR_NEMOTRON_H_STATE_KV | 1u << PULSAR_NEMOTRON_H_STATE_MTP_PEND) &&
+                   sp->drafter_at == pulsar_mtp_drafter_at && sp->drafter_frontier == pulsar_mtp_drafter_frontier;
     check(state_ok, "the declared state: ssm FIXED DELTA %llu B (+ %llu B a verify row), ssm_conv FIXED SNAPSHOT %llu B "
           "a Mamba-2 layer; kv POOL %llu B a token an attention layer%s", (unsigned long long)ssm.bytes,
           (unsigned long long)ssm.capture_bytes, (unsigned long long)conv.bytes, (unsigned long long)kv.bytes,
-          s->mtp_written ? " and the drafter's slot" : "");
+          s->mtp_written ? "; the drafter's slot: kv POOL + mtp_pend FIXED (the parked row), the lane's hooks" : "");
     const uint32_t want = PULSAR_FAMILY_CAP_CHAT | PULSAR_FAMILY_CAP_BANKS | PULSAR_FAMILY_CAP_SEGMENTS |
-                          PULSAR_FAMILY_CAP_PAYLOAD;
-    check(e->family->caps == want && e->family->spec == NULL, "caps 0x%x (chat, banks, segments, payload; no spec / TP "
-          "/ images yet)", e->family->caps);
+                          PULSAR_FAMILY_CAP_PAYLOAD | PULSAR_FAMILY_CAP_SPEC;
+    check(e->family->caps == want && e->family->spec == &PULSAR_DRIVER_SPEC_TARGET &&
+              e->family->driver->mtp && e->family->driver->absorb == pulsar_mtp_absorb,
+          "caps 0x%x (chat, banks, segments, payload, spec: the driver's verify target; no TP / images yet); the "
+          "driver declares its MTP module to the chained-MTP lane", e->family->caps);
     pulsar_engine_close(e);
     fprintf(stderr, "NEMOTRON-FAMILY PROBE %s\n", n_fail ? "FAIL" : "PASS");
     return n_fail ? 1 : 0;

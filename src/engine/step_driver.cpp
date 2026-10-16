@@ -6,7 +6,7 @@
  * target.  The family's facts it reads are pulsar_driver_ops (its blocks), the engine's layer plan, and the
  * session's declared state (state_kinds.h). */
 #include "pulsar_engine_internal.h"
-#include "spec_internal.h"
+#include "spec_mtp.h"
 #include "tp/pulsar_tp.h"
 
 static const pulsar_driver_ops *DOPS(const pulsar_engine *e) { return e->family->driver; }
@@ -62,6 +62,8 @@ static void driver_bufs_free(pulsar_driver_state *d) {
     free(d->host_logits);
     pulsar_gpu_tensor_free(d->tp_ticket);
     pulsar_gpu_tensor_free(d->tp_vocab_own);
+    pulsar_mtp_lane_free(d->mtp);
+    d->mtp = NULL;
 }
 
 /* The family's state, the driver's buffers and the declared state, built into a session the core allocated (L272
@@ -93,6 +95,10 @@ int pulsar_driver_session_create(pulsar_session *s, uint32_t n_banks) {
         d->host_logits = (float *)xmalloc((size_t)PULSAR_DRIVER_HEADS_MAX * W * sizeof(float));
         ok = d->run_first_dev != NULL;
     }
+    /* L296 N9: the chained-MTP drafter's lane when the family declares modules -- before the declared state, whose
+     * fresh banks set the lane's counters (pulsar_mtp_drafter_at) */
+    if (ok && ops->mtp && ops->mtp->modules(e) > 0) ok = (d->mtp = pulsar_mtp_lane_create(s, ops->mtp, n_banks,
+                                                                                           d->max_rows)) != NULL;
     /* the declared state (its verify capture when the session verifies), every bank fresh */
     if (ok) ok = (s->states = pulsar_state_create(e, &e->state_plan, d, n_banks, (uint32_t)s->ctx_size,
                                                   verifies ? PULSAR_STATE_VERIFY_ROWS : 0u)) != NULL;
@@ -269,6 +275,8 @@ static bool driver_forward(pulsar_session *s, pulsar_step_mode mode, const int32
     const uint32_t n_vruns = st.verify ? pulsar_step_verify_runs(&st) : 0u;
     /* the verify's runs, and each run's host state before the step: a commit finds its bank's run */
     if (st.verify) pulsar_state_verify_begin(ss, n_vruns, run_first, bank, pos);
+    /* L296 N9: the verify rows' tokens, which the MTP lane's absorb pairs a bank's still-parked row with */
+    if (st.verify && d->mtp) pulsar_mtp_note_verify(d->mtp, tokens, n_verify);
     /* L289: enqueued, not waited for -- the step's uploads never drain the stream */
     bool ok = pulsar_gpu_tensor_write_async(d->row_pos, 0, pos, (uint64_t)n_rows * sizeof(int32_t)) != 0 &&
               pulsar_gpu_tensor_write_async(d->row_bank, 0, bank, (uint64_t)n_rows * sizeof(int32_t)) != 0;

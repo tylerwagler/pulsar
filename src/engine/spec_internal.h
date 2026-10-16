@@ -128,6 +128,5 @@ static inline void spec_bank_save(pulsar_session *s, uint32_t bank) { s->engine-
 /* ---- the implementations ---- */
 extern const pulsar_spec_target_ops k_ds4_spec_target;   ///< DeepSeek V4's verify hooks (spec_dspark.cpp)
 extern const pulsar_drafter_ops k_dspark_drafter;        ///< the DSpark drafter (spec_dspark.cpp)
-extern const pulsar_drafter_ops k_mtp_drafter;           ///< Qwen's MTP drafter (spec_qwen.cpp)
 
 #endif /* PULSAR_SPEC_INTERNAL_H */

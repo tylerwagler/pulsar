@@ -3,7 +3,8 @@
  * One round's update of the draft-depth cap from what the round converted.  The rule is DSpark's
  * (spec_dspark.cpp's k_dspark_depth, the 2026-08-25 sweep and its v2..v5 refinements), moved here in
  * L251 so it has one home and a gate (tests/spec_depth_gate.cpp pins DSpark's schedule).  The Qwen MTP
- * drafter uses it since L288 (4..7, no veto or cooldown; spec_qwen.cpp k_mtp_depth has the replay); a drafter
+ * drafter uses it since L288 (4..7, no veto or cooldown; family_qwen.cpp k_mtp_depth has the replay), Nemotron-H's
+ * MTP drafter since L296 N9 (3..5, the card's range; nemotron_h_forward.cpp k_mtp_depth); a drafter
  * opts in through pulsar_drafter_ops::adapt.  Pure host
  * logic: no engine state, no CUDA.
  *
