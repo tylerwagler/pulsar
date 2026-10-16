@@ -270,7 +270,7 @@ uint64_t scratch_bytes(uint32_t arena, uint32_t max_rows, uint32_t ctx) {
 
 struct nh_step;
 /* The family's session state (the driver's buffers are its base): the residual stream and the normed rows the
- * blocks read, the trunk's step object, and the step's host tables (rebuilt by every embed). */
+ * blocks read, the trunk's step object, and the step's host tables (rebuilt by every stage). */
 struct nh_state : pulsar_driver_state {
     pulsar_gpu_tensor *h;     /* [max_rows][n_embd] bf16: the residual stream */
     pulsar_gpu_tensor *xn;    /* [max_rows][n_embd] bf16: the RMSNorm of h a block reads */
@@ -285,7 +285,15 @@ struct nh_state : pulsar_driver_state {
     uint32_t *row_pos;        /* host [max_rows]: F1's */
     int32_t *tab_a, *tab_b;   /* host [2 (max_rows + 1)]: the Mamba-2 calls' seq_first then seq_slot, as uploaded */
     uint32_t max_run_a, max_run_b;
-    pulsar_gqa_seq *seqs;     /* host [max_rows]: F1's sequences for the layer being run */
+    pulsar_gqa_seq *seqs;     /* host [max_rows]: F1's sequences for the layer being planned */
+    /* L296 perf: every attention layer's F1 call, planned by the step's host half (stage) and launched by the block
+     * from the uploaded descriptors -- the step's launches read no host value but the step's shape */
+    uint32_t n_attn;              /* attention layers in the plan */
+    uint32_t *attn_slot;          /* host [n_layer]: the layer's attention ordinal (UINT32_MAX = none) */
+    pulsar_gqa_call *attn_call;   /* host [n_attn]: this step's plans */
+    uint8_t *attn_desc_host;      /* host [n_attn][attn_stride]: this step's descriptors, staged */
+    pulsar_gpu_tensor *attn_desc; /* device [n_attn][a256(pulsar_gqa_desc_bytes(max_rows))] */
+    uint64_t attn_stride;         /* this step's descriptor stride: a256(pulsar_gqa_desc_bytes(n_rows)) */
 };
 
 struct nh_step : pulsar_driver_step {
@@ -308,6 +316,10 @@ void state_free(nh_state *st) {
     free(st->tab_a);
     free(st->tab_b);
     free(st->seqs);
+    free(st->attn_slot);
+    free(st->attn_call);
+    free(st->attn_desc_host);
+    pulsar_gpu_tensor_free(st->attn_desc);
     free(st->trunk);
     free(st);
 }
@@ -329,7 +341,14 @@ pulsar_driver_state *create(pulsar_session *s, uint32_t n_banks) {
     st->trunk = (nh_step *)xcalloc(1, sizeof(nh_step));
     st->trunk->w = W(e);
     st->trunk->st = st;
-    if (!st->h || !st->xn) {
+    st->attn_slot = (uint32_t *)xmalloc((size_t)e->plan.n_layer * sizeof(uint32_t));
+    for (uint32_t il = 0; il < e->plan.n_layer; il++)
+        st->attn_slot[il] = e->plan.desc[il].mixer == PULSAR_MIXER_ATTN_FULL ? st->n_attn++ : UINT32_MAX;
+    const uint64_t desc = a256(pulsar_gqa_desc_bytes((uint32_t)R));
+    st->attn_call = (pulsar_gqa_call *)xcalloc(st->n_attn ? st->n_attn : 1u, sizeof(pulsar_gqa_call));
+    st->attn_desc_host = (uint8_t *)xmalloc(st->n_attn ? st->n_attn * desc : 1u);
+    st->attn_desc = st->n_attn ? pulsar_gpu_tensor_alloc(st->n_attn * desc) : NULL;
+    if (!st->h || !st->xn || (st->n_attn && !st->attn_desc)) {
         fprintf(stderr, "pulsar: %s: session state allocation failed (%u banks x %d tokens)\n", ARCH, n_banks,
                 s->ctx_size);
         state_free(st);
@@ -383,7 +402,7 @@ bool emit(const float *y, uint16_t *yb, uint32_t n, uint32_t width) {
     return pulsar_rows_emit_bf16_launch(y, width, n, width, NULL, PULSAR_ROWS_SCALE_NONE, yb, width, 0) == 0;
 }
 
-/* ---- the step's tables (embed) ---------------------------------------------------------------------------------- */
+/* ---- the step's tables (stage) ---------------------------------------------------------------------------------- */
 
 /* The step's sequences: a DECODE row is one; a PREFILL run is one (a verify's runs first, rows [0, n_dec)).  The
  * Mamba-2 block runs two calls when the step verifies -- the verify rows with their per-row captures, then the prompt
@@ -456,12 +475,62 @@ pulsar_head_decl head_decl(const pulsar_nemotron_h_shape &s) {
     return hd;
 }
 
+/* L296 perf: every attention layer's F1 call planned (the step's sequences on the layer's pools), the descriptors
+ * staged at this step's stride and uploaded in one write.  Bounded at the power of two (>= one 256-key chunk) above
+ * the step's last position, capped at the pools' context: the launches then depend on the bound, not the positions
+ * (pulsar_gqa_plan), and a decode graph is recaptured once per doubling of the context. */
+bool plan_attention(const nh_step *st, uint32_t *bound_out) {
+    nh_state *q = st->st;
+    *bound_out = 0;
+    if (!q->n_attn) return true;
+    const pulsar_gqa_layer G1 = gqa_decl(st->w->shape);
+    const uint64_t tb = pulsar_gqa_kv_token_bytes(&G1);
+    uint32_t last = 0;
+    for (uint32_t r = 0; r < st->n_rows; r++) last = q->row_pos[r] > last ? q->row_pos[r] : last;
+    uint32_t bound = 256u;
+    while (bound <= last && bound < st->states->ctx) bound *= 2u;
+    if (bound > st->states->ctx) bound = st->states->ctx;
+    q->attn_stride = a256(pulsar_gqa_desc_bytes(st->n_rows));
+    for (uint32_t il = 0; il < st->plan->n_layer; il++) {
+        const uint32_t k = q->attn_slot[il];
+        if (k == UINT32_MAX) continue;
+        for (uint32_t j = 0; j < q->n_seq; j++) {
+            pulsar_gpu_tensor *pool = pulsar_state_pool(st->states, il, PULSAR_NEMOTRON_H_STATE_KV, (uint32_t)q->seq_bank[j]);
+            if (!pool) return failf("an attention layer's pool is evicted", il);
+            pulsar_gqa_seq &sq = q->seqs[j];
+            sq.kv = dptr(pool);
+            sq.bytes = pulsar_gpu_tensor_bytes(pool);
+            sq.cap = (uint32_t)(sq.bytes / tb);
+        }
+        if (pulsar_gqa_plan(&G1, q->seqs, q->n_seq, q->row_seq, q->row_pos, st->n_rows, bound,
+                            q->attn_desc_host + (size_t)k * q->attn_stride, q->attn_stride, &q->attn_call[k]) != 0)
+            return failf("the attention's plan refused", il);
+    }
+    *bound_out = bound;
+    return pulsar_gpu_tensor_write_async(q->attn_desc, 0, q->attn_desc_host, (uint64_t)q->n_attn * q->attn_stride) != 0 ||
+           fail("could not upload the attention descriptors");
+}
+
+/* L296 perf, the step's host half (pulsar_driver_ops::stage): the token ids checked, the step's tables and every
+ * attention call's descriptors uploaded.  What the launches then depend on beyond the driver's key: the attention
+ * bound (the row count and the head list are the driver's; a decode row is one sequence of one row, so the tables'
+ * shapes follow from the row count). */
+bool stage(const pulsar_driver_step *st0, uint64_t *graph_key) {
+    const nh_step *st = S(st0);
+    const pulsar_nemotron_h_shape &s = st->w->shape;
+    *graph_key = 0;
+    for (uint32_t r = 0; r < st->n_rows; r++)
+        if (st->tokens[r] < 0 || (uint32_t)st->tokens[r] >= s.n_vocab) return fail("a token id outside the vocabulary");
+    uint32_t bound = 0;
+    if (!build_tables(st) || !plan_attention(st, &bound)) return false;
+    *graph_key = 0x4E480000ull | ((uint64_t)bound << 20) | 1u;
+    return true;
+}
+
+/* tokens -> h: the gather from the ids stage uploaded (launch-only) */
 bool embed(const pulsar_driver_step *st0) {
     const nh_step *st = S(st0);
     const pulsar_nemotron_h_shape &s = st->w->shape;
-    for (uint32_t r = 0; r < st->n_rows; r++)
-        if (st->tokens[r] < 0 || (uint32_t)st->tokens[r] >= s.n_vocab) return fail("a token id outside the vocabulary");
-    if (!build_tables(st)) return false;
     const pulsar_head_decl hd = head_decl(s);
     const uint16_t *table = (const uint16_t *)wp(st, st->w->embed, "nemotron_h embed");
     const rows_scratch L = rows_layout(st->st->max_rows);
@@ -581,15 +650,8 @@ bool attention(const nh_step *st, uint32_t il, uint8_t *base, const mix_scratch 
             return failf("the q / k / v bf16 emit refused", il);
     }
     const pulsar_gqa_layer G1 = gqa_decl(s);
-    const uint64_t tb = pulsar_gqa_kv_token_bytes(&G1);
-    for (uint32_t k = 0; k < q->n_seq; k++) {
-        pulsar_gpu_tensor *pool = pulsar_state_pool(st->states, il, PULSAR_NEMOTRON_H_STATE_KV, (uint32_t)q->seq_bank[k]);
-        if (!pool) return failf("an attention layer's pool is evicted", il);
-        pulsar_gqa_seq &sq = q->seqs[k];
-        sq.kv = dptr(pool);
-        sq.bytes = pulsar_gpu_tensor_bytes(pool);
-        sq.cap = (uint32_t)(sq.bytes / tb);
-    }
+    const uint32_t slot = q->attn_slot[il];
+    if (slot == UINT32_MAX || q->attn_call[slot].n_rows != n) return failf("an attention layer the step did not plan", il);
     pulsar_gqa_io io{};
     io.q = {qb, Q, s.head_dim};
     io.k = {kb, KV, s.head_dim};
@@ -598,7 +660,8 @@ bool attention(const nh_step *st, uint32_t il, uint8_t *base, const mix_scratch 
     io.ld_out = Q;
     io.workspace = base + M.gqa;
     io.workspace_bytes = M.gqa_bytes;
-    if (pulsar_gqa_forward(&G1, q->seqs, q->n_seq, q->row_seq, q->row_pos, n, &io, 0) != 0)
+    if (pulsar_gqa_launch(&G1, &q->attn_call[slot], (const uint8_t *)dptr(q->attn_desc) + (size_t)slot * q->attn_stride,
+                          &io, 0) != 0)
         return failf("the attention refused", il);
     const pulsar_tensor *t[1] = {L.attn_o};
     const int outs[1] = {(int)E};
@@ -827,5 +890,6 @@ const pulsar_driver_ops PULSAR_NEMOTRON_H_DRIVER = {
     /* .image_rows    = */ NULL,   /* images: N11 */
     /* .dump          = */ dump,
     /* .artifact      = */ artifact,
+    /* .stage         = */ stage,   /* L296 perf: the host half; the ops are launch-only (a decode step graphs) */
 };
 static_assert(PULSAR_LAYER_BLOCKS == 4 && PULSAR_LAYER_KIND_COUNT == 5, "the block table's slot is the kind's value");

@@ -32,8 +32,16 @@
  *       four decode steps == Q cold, byte for byte
  *   X5  the payload round trip: a session at P + two decoded tokens saved to a payload, loaded into a FRESH session,
  *       both decode four more tokens -- byte for byte; and the snapshot round trip the same way
- *   X6  the bank carry: bank 0 prefills A, bank 1 prefills B, bank 0 restored decodes == a one-bank A + that token */
+ *   X6  the bank carry: bank 0 prefills A, bank 1 prefills B, bank 0 restored decodes == a one-bank A + that token
+ *   X7  (L296 perf) the decode step run as a captured CUDA graph == the same steps eager, byte for byte, at 1 and 4
+ *       banks across a recapture (the attention bound's doubling); the replay counter moved (rule 5)
+ *
+ * bench (info, ./tests/nemotron_fwd_gate bench <container> synthetic): ms a batched decode step, graphed and eager, at
+ *   PULSAR_BENCH_ROWS banks (default 1,4,16) over PULSAR_BENCH_STEPS steps (default 80, the first 16 untimed).
+ *
+ * Public API only, but for two instruments of pulsar_gpu.h: the segment counters and the eager switch (X7, bench). */
 #include "pulsar.h"
+#include "pulsar_gpu.h"   /* the instruments: pulsar_gpu_seg_counts / _set_enabled (X7, bench) */
 #include "gate_entry.h"
 #include "gate_util.h"
 
@@ -389,11 +397,98 @@ static void exact(pulsar_engine *e, const std::vector<int32_t> &ids, int W) {
     }
 }
 
+/* `banks` banks, bank b prefilled with ids[b * 37 .. + prompt), then `steps` batched decode steps of every bank (the
+ * argmax as the next token); each step's logits appended to *out.  The step graphs on or off (the eager reference). */
+static bool decode_run(pulsar_engine *e, const std::vector<int32_t> &ids, int banks, int prompt, int steps, int W,
+                       bool graphs, std::vector<std::vector<float>> *out, double *ms_step, int warm) {
+    const int was = pulsar_gpu_seg_set_enabled(graphs ? 1 : 0);
+    pulsar_engine_set_bank_pool((uint32_t)banks);
+    pulsar_session *s = NULL;
+    char err[256] = "";
+    bool ok = pulsar_session_create(&s, e, prompt + steps + 64) == 0 && s;
+    std::vector<int> pos((size_t)banks), next((size_t)banks);
+    for (int b = 0; ok && b < banks; b++) {
+        pulsar_tokens P = toks(ids, (size_t)b * 37u, (size_t)b * 37u + (size_t)prompt);
+        ok = (banks == 1 || pulsar_session_bank_state_restore(s, (uint32_t)b)) && pulsar_session_sync(s, &P, err, sizeof(err)) == 0;
+        if (ok && banks > 1) pulsar_session_bank_state_save(s, (uint32_t)b);
+        pos[(size_t)b] = P.len;
+        next[(size_t)b] = ok ? argmax(logits_of(s, W)) : 0;
+        pulsar_tokens_free(&P);
+    }
+    std::vector<float> lg((size_t)banks * W);
+    double t0 = 0;
+    for (int step = 0; ok && step < steps; step++) {
+        if (step == warm) { (void)pulsar_gpu_synchronize(); t0 = gate_now_s(); }
+        std::vector<pulsar_multiseq_req> rows((size_t)banks);
+        for (int b = 0; b < banks; b++) rows[(size_t)b] = {(uint32_t)b, pos[(size_t)b] + step, next[(size_t)b]};
+        ok = pulsar_session_decode_multiseq(s, rows.data(), (uint32_t)banks, lg.data(), banks * W, err, sizeof(err)) == 0;
+        for (int b = 0; ok && b < banks; b++) {
+            std::vector<float> r(lg.begin() + (size_t)b * W, lg.begin() + (size_t)(b + 1) * W);
+            next[(size_t)b] = argmax(r);
+            if (out) out->push_back(std::move(r));
+        }
+    }
+    if (ms_step) *ms_step = ok && steps > warm ? 1e3 * (gate_now_s() - t0) / (steps - warm) : 0.0;
+    if (!ok) fprintf(stderr, "decode_run(%d banks, graphs %d): %s\n", banks, graphs ? 1 : 0, err);
+    if (s) pulsar_session_free(s);
+    (void)pulsar_gpu_seg_set_enabled(was);
+    return ok;
+}
+
+/* X7 (L296 perf): the decode step as a captured graph == the same steps eager, byte for byte -- 1 and 4 banks, 48
+ * steps (a key is captured at its 12th use and replayed after), across the attention bound's doubling at 256 (the
+ * prompts end at 230: a recapture mid-run); the replay counter proves the graphed run replayed (rule 5) */
+static void exact_graphs(pulsar_engine *e, const std::vector<int32_t> &ids, int W) {
+    for (const int banks : {1, 4}) {
+        std::vector<std::vector<float>> eager, graphed;
+        uint64_t r0 = 0, c0 = 0, r1 = 0, c1 = 0;
+        const bool a = decode_run(e, ids, banks, 230, 48, W, false, &eager, NULL, 0);
+        pulsar_gpu_seg_counts(&r0, &c0);
+        const bool b = decode_run(e, ids, banks, 230, 48, W, true, &graphed, NULL, 0);
+        pulsar_gpu_seg_counts(&r1, &c1);
+        bool same_all = a && b && eager.size() == graphed.size() && !eager.empty();
+        double d = 0;
+        for (size_t i = 0; same_all && i < eager.size(); i++) {
+            double di = 0;
+            same_all = same(eager[i], graphed[i], &di);
+            d = fmax(d, di);
+        }
+        CHECK(same_all && r1 - r0 >= 20 && c1 - c0 >= 2,
+              "X7 %d bank(s), 48 decode steps from 230 (the attention bound doubles at 256): graphed == eager, byte for "
+              "byte (max |diff| %.3g); %llu replays, %llu captures", banks, d, (unsigned long long)(r1 - r0),
+              (unsigned long long)(c1 - c0));
+    }
+}
+
+/* bench (info): ms a batched decode step at each bank count (PULSAR_BENCH_ROWS, default 1,4,16), graphed and eager */
+static void bench(pulsar_engine *e, const std::vector<int32_t> &ids, int W) {
+    const char *rows_env = getenv("PULSAR_BENCH_ROWS");
+    std::string rl = rows_env ? rows_env : "1,4,16";
+    const int steps = getenv("PULSAR_BENCH_STEPS") ? atoi(getenv("PULSAR_BENCH_STEPS")) : 80;
+    for (size_t at = 0; at < rl.size();) {
+        const int banks = atoi(rl.c_str() + at);
+        const size_t comma = rl.find(',', at);
+        at = comma == std::string::npos ? rl.size() : comma + 1;
+        if (banks < 1) continue;
+        double ms_e = 0, ms_g = 0;
+        uint64_t r0 = 0, c0 = 0, r1 = 0, c1 = 0;
+        const bool a = decode_run(e, ids, banks, 512, steps, W, false, NULL, &ms_e, 16);
+        pulsar_gpu_seg_counts(&r0, &c0);
+        const bool b = decode_run(e, ids, banks, 512, steps, W, true, NULL, &ms_g, 16);
+        pulsar_gpu_seg_counts(&r1, &c1);
+        printf("bench: %2d row(s): eager %.3f ms/step, graphed %.3f ms/step (%.1f%%), %llu replays %llu captures%s\n",
+               banks, ms_e, ms_g, ms_e > 0 ? 100.0 * (ms_e - ms_g) / ms_e : 0.0, (unsigned long long)(r1 - r0),
+               (unsigned long long)(c1 - c0), a && b ? "" : " -- a run FAILED");
+        if (!a || !b) n_fail++;
+    }
+}
+
 int GATE_ENTRY(int argc, char **argv) {
     n_fail = 0;
-    if (argc < 4 || (strcmp(argv[1], "capture") && strcmp(argv[1], "exact")) ||
+    if (argc < 4 || (strcmp(argv[1], "capture") && strcmp(argv[1], "exact") && strcmp(argv[1], "bench")) ||
         (!strcmp(argv[1], "capture") && argc < 5)) {
-        fprintf(stderr, "usage: %s capture <container> <ids.bin> <out_dir> | exact <container> <ids.bin>\n", argv[0]);
+        fprintf(stderr, "usage: %s capture <container> <ids.bin> <out_dir> | exact <container> <ids.bin> | "
+                        "bench <container> <ids.bin>\n", argv[0]);
         return 2;
     }
     std::vector<int32_t> ids;
@@ -417,7 +512,11 @@ int GATE_ENTRY(int argc, char **argv) {
     const int W = pulsar_engine_logits_width(e);
     printf("nemotron-fwd: %s, %zu prompt ids, logits width %d\n", argv[2], ids.size(), W);
     if (!strcmp(argv[1], "capture")) capture(e, ids, argv[4], W);
-    else exact(e, ids, W);
+    else if (!strcmp(argv[1], "bench")) bench(e, ids, W);
+    else {
+        exact(e, ids, W);
+        exact_graphs(e, ids, W);
+    }
     gate_engine_close(e);
     printf(n_fail ? "NEMOTRON-FWD GATE FAIL (%d)\n" : "NEMOTRON-FWD GATE PASS\n", n_fail);
     return n_fail != 0;

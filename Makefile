@@ -1024,7 +1024,8 @@ nemotron-family-gate: tests/nemotron_family_gate tests/loader_open
 	python3 tests/loader_contract.py --open ./tests/loader_open --work $(LOADER_CONTRACT_WORK) $(NEMOTRON_GATE_MODEL)
 # L296 N7: the Nemotron-H forward's byte invariants on the core driver (tests/nemotron_fwd_gate.cpp exact): a prompt
 # cut anywhere == the cold prefill, a batched decode == each bank's own, prefix reuse from a grid checkpoint, payload
-# and snapshot round trips, the bank carry -- bytes; decode vs prefill graded.  Needs the GPU and the container.
+# and snapshot round trips, the bank carry, the decode step graphed == eager (L296 perf X7) -- bytes; decode vs
+# prefill graded.  Needs the GPU and the container.  `./tests/nemotron_fwd_gate bench` times the decode step (info).
 .PHONY: nemotron-fwd-gate
 nemotron-fwd-gate: tests/nemotron_fwd_gate
 	./tests/nemotron_fwd_gate exact $(NEMOTRON_GATE_MODEL) synthetic
@@ -2879,7 +2880,7 @@ tests/nemotron_family_gate.o: tests/nemotron_family_gate.cpp src/families/nemotr
 tests/nemotron_family_gate: tests/nemotron_family_gate.o $(CORE_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 # L296 N7: the Nemotron-H forward on the core driver, on a container (tests/nemotron_fwd_gate.cpp; public API only)
-tests/nemotron_fwd_gate.o: tests/nemotron_fwd_gate.cpp tests/gate_entry.h tests/gate_util.h src/pulsar.h
+tests/nemotron_fwd_gate.o: tests/nemotron_fwd_gate.cpp tests/gate_entry.h tests/gate_util.h src/pulsar.h src/pulsar_gpu.h
 	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -c -o $@ $<
 tests/nemotron_fwd_gate: tests/nemotron_fwd_gate.o $(CORE_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
