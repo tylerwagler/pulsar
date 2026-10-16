@@ -41,9 +41,14 @@
  *
  * STATE (state_kinds.h; nemotron_h.h PULSAR_NEMOTRON_H_STATE_*): a Mamba-2 layer's SSM state (FIXED, a verify's DELTA
  * per row, committed by pulsar_mamba2_commit) and its conv tail (FIXED, SNAPSHOT per row); an attention layer's K|V
- * pool (POOL); the drafter slot's K|V pool (POOL: the MTP module's attention, written by N9's drafter lane).  The core
- * allocates, prices, pages, walks and commits it; nothing here copies state. */
+ * pool (POOL); the drafter slot's K|V pool (POOL: the MTP module's attention) and each bank's parked conditioning row
+ * (FIXED), written by the chained-MTP lane (N9, spec_mtp.h).  The core allocates, prices, pages, walks and commits it;
+ * nothing here copies state.
+ *
+ * THE MTP MODULE (N9): one module step is this file's composition on its own residual stream (mtp_forward, below); the
+ * core's chained-MTP lane decides which rows a step carries and runs the module recursively for a chain. */
 #include "nemotron_h.h"
+#include "engine/spec_mtp.h"
 #include "cuda/pulsar_cuda_attn_gqa.h"
 #include "cuda/pulsar_cuda_head.h"
 #include "cuda/pulsar_cuda_mamba2.h"
@@ -199,7 +204,7 @@ rows_scratch rows_layout(uint32_t R) {
 
 /* MIX: the mixer's buffers -- a layer runs ONE mixer, so the Mamba-2 and the attention views share the region:
  *   pf  f32 [R][in]      the in_proj's output (Mamba) / q | k | v at their offsets (attention)
- *   pb  bf16 [R][in]     its bf16 rows
+ *   pb  bf16 [R][in]     its bf16 rows (N9: the MTP module's [enorm(embed) | hnorm(cond)] rows before its layer)
  *   yb  bf16 [R][d_inner | n_q head_dim]   the block's output (the out / o projection's input)
  *   of  f32 [R][n_embd]  the out / o projection's output;  db bf16 [R][n_embd] its bf16 rows (the delta)
  *   m2  the Mamba-2 block's scratch;  lin the dense arm's workspace;  gqa F1's workspace */
@@ -221,7 +226,7 @@ mix_scratch mix_layout(uint32_t R, uint32_t ctx) {
     const int qkv[3] = {(int)Q, (int)KV, (int)KV};
     t.lin = o;
     t.lin_bytes = umax(umax(lin_ws((int)E, (int)md.in, R), lin_ws((int)md.di, (int)E, R)),
-                       umax(multi_ws((int)E, 3, qkv, R), lin_ws((int)Q, (int)E, R)));
+                       umax(umax(multi_ws((int)E, 3, qkv, R), lin_ws((int)Q, (int)E, R)), lin_ws(2 * (int)E, (int)E, R)));
     o += t.lin_bytes;
     const pulsar_gqa_layer gd = gqa_decl(s);
     t.gqa = o; t.gqa_bytes = a256(pulsar_gqa_workspace_bytes(&gd, R, ctx ? ctx : 1u)); o += t.gqa_bytes;
@@ -275,6 +280,13 @@ struct nh_state : pulsar_driver_state {
     pulsar_gpu_tensor *h;     /* [max_rows][n_embd] bf16: the residual stream */
     pulsar_gpu_tensor *xn;    /* [max_rows][n_embd] bf16: the RMSNorm of h a block reads */
     nh_step *trunk;
+    /* N9, the MTP module's step (when the session drafts): its own residual stream (the trunk's must outlive the
+     * verify, whose rows the absorb reads), its output rows (final_layernorm: the head's input and the next chain
+     * step's conditioning), the draft pick's workspace */
+    nh_step *mtp;
+    pulsar_gpu_tensor *mh;    /* [max_rows][n_embd] bf16 */
+    pulsar_gpu_tensor *mo;    /* [max_rows][n_embd] bf16 */
+    pulsar_gpu_tensor *mtop;  /* pulsar_qwen_draft_top_ws_bytes */
     /* the step's sequences: one a decode row, one a prefill run (a verify's runs, then the prompt runs) */
     uint32_t n_seq;
     uint32_t n_seq_cap;       /* [0, n_seq_cap) are the verify's runs (their Mamba-2 state captured), rows [0, rows_cap) */
@@ -291,16 +303,24 @@ struct nh_state : pulsar_driver_state {
 struct nh_step : pulsar_driver_step {
     const pulsar_nemotron_h_model *w;
     nh_state *st;
+    pulsar_gpu_tensor *res;                  /* the residual stream the step runs on: the trunk's h, the MTP's mh */
+    const pulsar_nemotron_h_block *module;   /* N9: the MTP module's layer (every il of the step is its slot), or NULL */
 };
 
 const nh_step *S(const pulsar_driver_step *st) { return static_cast<const nh_step *>(st); }
 nh_state *ST(pulsar_session *s) { return static_cast<nh_state *>(s->driver); }
 const pulsar_nemotron_h_model *W(const pulsar_engine *e) { return (const pulsar_nemotron_h_model *)e->family_state; }
+/* layer il's weights: the trunk's, or the MTP module's on its step */
+const pulsar_nemotron_h_block &LW(const nh_step *st, uint32_t il) { return st->module ? *st->module : st->w->layer[il]; }
 
 void state_free(nh_state *st) {
     if (!st) return;
     pulsar_gpu_tensor_free(st->h);
     pulsar_gpu_tensor_free(st->xn);
+    pulsar_gpu_tensor_free(st->mh);
+    pulsar_gpu_tensor_free(st->mo);
+    pulsar_gpu_tensor_free(st->mtop);
+    free(st->mtp);
     free(st->seq_first);
     free(st->seq_bank);
     free(st->row_seq);
@@ -329,7 +349,20 @@ pulsar_driver_state *create(pulsar_session *s, uint32_t n_banks) {
     st->trunk = (nh_step *)xcalloc(1, sizeof(nh_step));
     st->trunk->w = W(e);
     st->trunk->st = st;
-    if (!st->h || !st->xn) {
+    st->trunk->res = st->h;
+    bool ok = st->h && st->xn;
+    if (ok && W(e)->drafting) {
+        st->mh = pulsar_gpu_tensor_alloc(R * sh.n_embd * 2u);
+        st->mo = pulsar_gpu_tensor_alloc(R * sh.n_embd * 2u);
+        st->mtop = pulsar_gpu_tensor_alloc(pulsar_qwen_draft_top_ws_bytes());
+        st->mtp = (nh_step *)xcalloc(1, sizeof(nh_step));
+        st->mtp->w = W(e);
+        st->mtp->st = st;
+        st->mtp->res = st->mh;
+        st->mtp->module = &W(e)->mtp.block;
+        ok = st->mh && st->mo && st->mtop;
+    }
+    if (!ok) {
         fprintf(stderr, "pulsar: %s: session state allocation failed (%u banks x %d tokens)\n", ARCH, n_banks,
                 s->ctx_size);
         state_free(st);
@@ -340,8 +373,8 @@ pulsar_driver_state *create(pulsar_session *s, uint32_t n_banks) {
 
 void destroy(pulsar_session *s) { state_free(ST(s)); }
 
-/* the declared state's verify capture exists with a drafter lane -- N9's MTP (F6); none yet */
-bool verifies(const pulsar_session *) { return false; }
+/* the declared state's verify capture exists with the drafter (N9: the MTP module, when the session drafts) */
+bool verifies(const pulsar_session *s) { return W(s->engine)->drafting; }
 
 pulsar_driver_step *trunk(pulsar_session *s) { return ST(s)->trunk; }
 
@@ -468,7 +501,7 @@ bool embed(const pulsar_driver_step *st0) {
     if (!table) return false;
     return pulsar_head_embed_launch(&hd, table, s.n_vocab,
                                     (const int32_t *)((uint8_t *)dptr(st->st->scratch[ARENA_ROWS]) + L.ids), st->n_rows,
-                                    (uint16_t *)dptr(st->st->h), s.n_embd, 0) == 0 ||
+                                    (uint16_t *)dptr(st->res), s.n_embd, 0) == 0 ||
            fail("the embedding refused");
 }
 
@@ -491,7 +524,7 @@ void dump_rows(const nh_step *st, const char *name, pulsar_gpu_tensor *arena, ui
 bool mamba(const nh_step *st, uint32_t il, uint8_t *base, const mix_scratch &M) {
     nh_state *q = st->st;
     const pulsar_nemotron_h_shape &s = st->w->shape;
-    const pulsar_nemotron_h_block &L = st->w->layer[il];
+    const pulsar_nemotron_h_block &L = LW(st, il);
     const mamba_dims md = mamba_of(s);
     const uint32_t n = st->n_rows, E = s.n_embd;
     float *pf = (float *)(base + M.pf), *of = (float *)(base + M.of);
@@ -563,7 +596,7 @@ bool mamba(const nh_step *st, uint32_t il, uint8_t *base, const mix_scratch &M) 
 bool attention(const nh_step *st, uint32_t il, uint8_t *base, const mix_scratch &M) {
     nh_state *q = st->st;
     const pulsar_nemotron_h_shape &s = st->w->shape;
-    const pulsar_nemotron_h_block &L = st->w->layer[il];
+    const pulsar_nemotron_h_block &L = LW(st, il);
     const uint32_t n = st->n_rows, E = s.n_embd, Q = s.n_head * s.head_dim, KV = s.n_head_kv * s.head_dim;
     float *qf = (float *)(base + M.pf), *kf = qf + (size_t)q->max_rows * Q, *vf = kf + (size_t)q->max_rows * KV;
     uint16_t *qb = (uint16_t *)(base + M.pb), *kb = qb + (size_t)q->max_rows * Q, *vb = kb + (size_t)q->max_rows * KV;
@@ -615,7 +648,7 @@ bool attention(const nh_step *st, uint32_t il, uint8_t *base, const mix_scratch 
  * latent through the front door's latent wrapper, then the ungated relu^2 shared expert on the hidden added */
 bool moe(const nh_step *st, uint32_t il, float *fo, uint8_t *base, const ffn_scratch &F) {
     const pulsar_nemotron_h_shape &s = st->w->shape;
-    const pulsar_nemotron_h_block &L = st->w->layer[il];
+    const pulsar_nemotron_h_block &L = LW(st, il);
     const uint32_t n = st->n_rows;
     const int E = (int)s.n_embd, Lt = (int)s.latent, SM = (int)s.n_ff_shared, K = (int)s.n_expert_used;
     const uint16_t *xn = (const uint16_t *)dptr(st->st->xn);
@@ -681,19 +714,14 @@ bool moe(const nh_step *st, uint32_t il, float *fo, uint8_t *base, const ffn_scr
 
 /* ---- the layer --------------------------------------------------------------------------------------------------- */
 
-/* block[PULSAR_LAYER_BLOCKS]: one layer as its description says -- the mixer's HF block, then the MoE's when it has
- * one, each `h += sublayer(rmsnorm(h))` */
-bool block(const pulsar_driver_step *st0, uint32_t il) {
-    const nh_step *st = S(st0);
+/* One layer on the step's residual stream: the mixer's HF block, then the MoE's when it has one, each
+ * `h += sublayer(rmsnorm(h))` -- a trunk layer as its description says, or the MTP module's {attention, MoE} (N9) */
+bool compose(const nh_step *st, uint32_t il, bool is_mamba, bool is_moe) {
     nh_state *q = st->st;
-    const pulsar_layer_desc &d = st->plan->desc[il];
     const pulsar_nemotron_h_shape &s = st->w->shape;
-    const pulsar_nemotron_h_block &L = st->w->layer[il];
-    const bool is_mamba = d.mixer == PULSAR_MIXER_MAMBA2, is_moe = d.ffn == PULSAR_FFN_MOE;
-    if ((!is_mamba && d.mixer != PULSAR_MIXER_ATTN_FULL) || (!is_moe && d.ffn != PULSAR_FFN_NONE))
-        return failf("a layer description that is not {Mamba-2 | full attention} x {MoE | none}", il);
+    const pulsar_nemotron_h_block &L = LW(st, il);
     const uint32_t n = st->n_rows, E = s.n_embd;
-    uint16_t *h = (uint16_t *)dptr(q->h), *xn = (uint16_t *)dptr(q->xn);
+    uint16_t *h = (uint16_t *)dptr(st->res), *xn = (uint16_t *)dptr(q->xn);
     /* the mixer's HF block */
     const uint16_t *mn = (const uint16_t *)wp(st, is_mamba ? L.ssm_pre_norm : L.attn_norm, "nemotron_h mixer norm");
     if (!mn || pulsar_rows_rmsnorm_launch(h, E, n, E, mn, s.rms_eps, xn, E, 0) != 0)
@@ -709,7 +737,7 @@ bool block(const pulsar_driver_step *st0, uint32_t il) {
                                0) != 0)
         return failf("the mixer's residual add refused", il);
     if (!is_moe) return true;
-    dump_rows(st, "nemotron_mid", q->h, 0, E, il);
+    dump_rows(st, "nemotron_mid", st->res, 0, E, il);
     /* the MoE's HF block */
     const ffn_scratch F = ffn_layout(q->max_rows);
     uint8_t *fbase = (uint8_t *)dptr(q->scratch[ARENA_FFN]);
@@ -722,19 +750,23 @@ bool block(const pulsar_driver_step *st0, uint32_t il) {
            failf("the MoE's residual add refused", il);
 }
 
-/* step rows [row0, row0 + n) -> logits rows [out0, out0 + n): the final norm, the head linear (the decode arm at every
- * call: a row's logits never depend on the rows beside it), E5's finish (no scale, no padding: nothing launches) */
-bool head(const pulsar_driver_step *st0, uint32_t row0, uint32_t n, uint32_t out0) {
-    const nh_step *st = S(st0);
+/* block[PULSAR_LAYER_BLOCKS]: one layer as its description says */
+bool block(const pulsar_driver_step *st0, uint32_t il) {
+    const pulsar_layer_desc &d = st0->plan->desc[il];
+    const bool is_mamba = d.mixer == PULSAR_MIXER_MAMBA2, is_moe = d.ffn == PULSAR_FFN_MOE;
+    if ((!is_mamba && d.mixer != PULSAR_MIXER_ATTN_FULL) || (!is_moe && d.ffn != PULSAR_FFN_NONE))
+        return failf("a layer description that is not {Mamba-2 | full attention} x {MoE | none}", il);
+    return compose(S(st0), il, is_mamba, is_moe);
+}
+
+/* n normed bf16 rows xb -> logits rows [out0, out0 + n) of the driver's slab: the head linear (the decode arm at every
+ * call: a row's logits never depend on the rows beside it), E5's finish (no scale, no padding: nothing launches).
+ * The trunk's head, and the MTP module's -- the target's own (the checkpoint has no MTP head; vLLM shares it). */
+bool head_rows(const nh_step *st, const uint16_t *xb, uint32_t n, uint32_t out0) {
     const pulsar_nemotron_h_shape &s = st->w->shape;
-    if (n == 0 || out0 + n > PULSAR_DRIVER_HEADS_MAX || row0 + n > st->n_rows) return fail("head rows out of range");
+    if (n == 0 || out0 + n > PULSAR_DRIVER_HEADS_MAX) return fail("head rows out of range");
     const head_scratch H = head_layout();
     uint8_t *base = (uint8_t *)dptr(st->st->scratch[ARENA_HEAD]);
-    uint16_t *xb = (uint16_t *)(base + H.xb);
-    const uint16_t *on = (const uint16_t *)wp(st, st->w->output_norm, "nemotron_h norm_f");
-    if (!on || pulsar_rows_rmsnorm_launch((const uint16_t *)dptr(st->st->h) + (size_t)row0 * s.n_embd, s.n_embd, n,
-                                          s.n_embd, on, s.rms_eps, xb, s.n_embd, 0) != 0)
-        return fail("the final norm refused");
     pulsar_rows_linear l{};
     float *logits = (float *)dptr(st->buf->logits) + (size_t)out0 * s.n_vocab;
     if (!pulsar_linear_rows_ref(st->model, st->w->head, (int)s.n_embd, (int)s.n_vocab, false, "nemotron_h lm_head", &l) ||
@@ -742,6 +774,19 @@ bool head(const pulsar_driver_step *st0, uint32_t row0, uint32_t n, uint32_t out
         return fail("the head linear refused");
     const pulsar_head_decl hd = head_decl(s);
     return pulsar_head_logits_finish_launch(&hd, logits, n, s.n_vocab, 0) == 0 || fail("the logits finish refused");
+}
+
+/* step rows [row0, row0 + n) -> logits rows [out0, out0 + n): the final norm, then the head */
+bool head(const pulsar_driver_step *st0, uint32_t row0, uint32_t n, uint32_t out0) {
+    const nh_step *st = S(st0);
+    const pulsar_nemotron_h_shape &s = st->w->shape;
+    if (n == 0 || row0 + n > st->n_rows) return fail("head rows out of range");
+    uint16_t *xb = (uint16_t *)((uint8_t *)dptr(st->st->scratch[ARENA_HEAD]) + head_layout().xb);
+    const uint16_t *on = (const uint16_t *)wp(st, st->w->output_norm, "nemotron_h norm_f");
+    if (!on || pulsar_rows_rmsnorm_launch((const uint16_t *)dptr(st->res) + (size_t)row0 * s.n_embd, s.n_embd, n,
+                                          s.n_embd, on, s.rms_eps, xb, s.n_embd, 0) != 0)
+        return fail("the final norm refused");
+    return head_rows(st, xb, n, out0);
 }
 
 /* the step's own checks (rule 9): the routed experts' non-finite flag */
@@ -763,7 +808,7 @@ bool step_end(const pulsar_driver_step *st0, bool ok) {
  * "nemotron_h" -- what the block grade reads against the reference's hidden_states (the layer's last HF block) */
 void dump(const pulsar_driver_step *st0, uint32_t il) {
     const nh_step *st = S(st0);
-    gpu_graph_debug_dump_hc_tensor("nemotron_h", st->st->h, (uint64_t)st->n_rows * st->w->shape.n_embd, il,
+    gpu_graph_debug_dump_hc_tensor("nemotron_h", st->res, (uint64_t)st->n_rows * st->w->shape.n_embd, il,
                                    (uint32_t)st->pos[st->n_rows - 1]);
 }
 
@@ -774,6 +819,159 @@ bool ssm_commit(void *state, uint32_t bank, const void *rows, uint32_t keep) {
     const pulsar_mamba2_geom g = mamba_geom(G());
     return pulsar_mamba2_commit(&g, (float *)state, bank, (const float *)rows, keep, 0) == 0;
 }
+
+/* ---- N9: the MTP module, declared to the chained-MTP lane (spec_mtp.h) ---------------------------------------------
+ * vLLM's NemotronHMultiTokenPredictor (models/nemotron_h_mtp.py), one module ({attention, MoE}) applied recursively:
+ *     x = eh_proj([enorm(embed(t_{p+1})) | hnorm(c_p)])         (embed FIRST: nemotron_h_mtp.py:106-113)
+ *     x += attn(rmsnorm(x));  x += moe(rmsnorm(x))              the trunk's composition, the module's own weights,
+ *                                                                its K|V on the drafter's slot
+ *     o = final_layernorm(x);  logits = lm_head(o)              the target's head (shared)
+ * The conditioning row c_p is the target's hidden vLLM hands the proposer -- norm_f of the trunk's residual at p, the
+ * head's input (nemotron_h.py:658) -- and deeper in a chain the module's own output o (the proposer feeds the draft
+ * model's returned hidden back).  Every rounding is the trunk's at the same op: each norm, the eh_proj's one bf16
+ * rounding, the residual adds. */
+
+uint32_t mtp_modules(const pulsar_engine *e) { return W(e)->drafting ? 1u : 0u; }
+uint64_t mtp_cond_bytes(const pulsar_engine *e) { return (uint64_t)W(e)->shape.n_embd * 2u; }
+uint32_t mtp_head_width(const pulsar_engine *e) { return W(e)->shape.n_vocab; }
+
+/* the last trunk step's rows [row0, row0 + n): norm_f of the residual (the target hidden) into dst at off */
+bool mtp_trunk_rows(pulsar_session *s, uint32_t row0, uint32_t n, pulsar_gpu_tensor *dst, uint64_t off) {
+    const nh_state *q = ST(s);
+    const pulsar_nemotron_h_model *w = W(s->engine);
+    const uint32_t E = w->shape.n_embd;
+    const uint16_t *on = (const uint16_t *)pulsar_weight_device_ptr(&s->engine->model, w->output_norm, "nemotron_h norm_f");
+    if (!on || row0 + n > q->max_rows || off + (uint64_t)n * E * 2u > pulsar_gpu_tensor_bytes(dst))
+        return fail("the MTP conditioning rows are out of range");
+    return pulsar_rows_rmsnorm_launch((const uint16_t *)dptr(q->h) + (size_t)row0 * E, E, n, E, on, w->shape.rms_eps,
+                                      (uint16_t *)((uint8_t *)dptr(dst) + off), E, 0) == 0 ||
+           fail("the MTP conditioning norm refused");
+}
+
+pulsar_gpu_tensor *mtp_out_rows(pulsar_session *s) { return ST(s)->mo; }
+
+/* One module step (pulsar_mtp_ops::forward): the rows' runs (as the driver builds a step's), the module's input side,
+ * its {attention, MoE} on the drafter slot, the out norm, the headed rows through the head and the device pick. */
+bool mtp_forward(pulsar_session *s, const pulsar_mtp_step *m) {
+    pulsar_engine *e = s->engine;
+    nh_state *q = ST(s);
+    const pulsar_nemotron_h_model *w = W(e);
+    const pulsar_nemotron_h_shape &sh = w->shape;
+    const uint32_t n = m->n, E = sh.n_embd, V = sh.n_vocab;
+    if (!q->mtp || m->module != 0 || n == 0 || n > q->max_rows || m->head_n > n ||
+        m->head_n > PULSAR_DRIVER_HEADS_MAX || (m->pick && m->head_n == 0) ||
+        (m->decode_rows && (m->mode != PULSAR_STEP_PREFILL || n > PULSAR_DRIVER_HEADS_MAX)))
+        return fail("an MTP step outside the module's rows (one module; its heads within the driver's)");
+    /* the runs: a prompt step is one bank's consecutive rows; decode rows of a PREFILL step one run a bank */
+    uint32_t run_first[PULSAR_DRIVER_HEADS_MAX + 1] = {0};
+    uint32_t n_runs = 0;
+    if (m->mode == PULSAR_STEP_PREFILL) {
+        bool runs_ok = true;
+        for (uint32_t r = 0; runs_ok && r < n; r++) {
+            if (r > 0 && m->bank[r] == m->bank[r - 1]) {
+                runs_ok = m->pos[r] == m->pos[r - 1] + 1;
+                continue;
+            }
+            for (uint32_t k = 0; k < n_runs; k++) runs_ok &= m->bank[run_first[k]] != m->bank[r];
+            runs_ok = runs_ok && (m->decode_rows ? n_runs < PULSAR_DRIVER_HEADS_MAX : n_runs == 0);
+            if (runs_ok) run_first[n_runs++] = r;
+        }
+        if (!runs_ok) return fail("an MTP step's rows are not one run a bank");
+        run_first[n_runs] = n;
+    }
+    nh_step &st = *q->mtp;
+    st.model = &e->model;
+    st.plan = &e->plan;
+    st.states = s->states;
+    st.buf = q;
+    st.mode = m->mode;
+    st.n_rows = n;
+    st.tokens = m->tokens;
+    st.pos = m->pos;
+    st.bank = m->bank;
+    st.rope = NULL;
+    st.verify = false;
+    st.n_runs = n_runs;
+    st.run_first = n_runs ? run_first : NULL;
+    st.n_dec = m->decode_rows ? n : pulsar_step_n_dec(m->mode, 0u, n);
+    st.tap = NULL;
+    const uint32_t il = e->state_plan.n_trunk + m->module;   /* the module's drafter slot */
+    const pulsar_nemotron_h_draft &D = w->mtp;
+    const mix_scratch M = mix_layout(q->max_rows, s->states->ctx);
+    uint8_t *mbase = (uint8_t *)dptr(q->scratch[ARENA_MIX]);
+    uint16_t *mh = (uint16_t *)dptr(q->mh), *mo = (uint16_t *)dptr(q->mo), *cat = (uint16_t *)(mbase + M.pb);
+    float *of = (float *)(mbase + M.of);
+    const uint16_t *en = (const uint16_t *)wp(&st, D.embed_norm, "nemotron_h mtp enorm");
+    const uint16_t *hn = (const uint16_t *)wp(&st, D.hidden_norm, "nemotron_h mtp hnorm");
+    const uint16_t *fn = (const uint16_t *)wp(&st, D.out_norm, "nemotron_h mtp final_layernorm");
+    bool ok = en && hn && fn && pulsar_gpu_begin_commands() != 0;
+    /* the step's tables and the token gather into mh, then [enorm(embed) | hnorm(cond)] -> eh_proj -> the residual */
+    if (ok) ok = embed(&st);
+    if (ok)
+        ok = (pulsar_rows_rmsnorm_launch(mh, E, n, E, en, sh.rms_eps, cat, 2u * E, 0) == 0 &&
+              pulsar_rows_rmsnorm_launch((const uint16_t *)pulsar_gpu_tensor_device_ptr(m->cond), E, n, E, hn, sh.rms_eps, cat + E, 2u * E,
+                                         0) == 0) ||
+             fail("the MTP input norms refused");
+    if (ok) {
+        const pulsar_tensor *t[1] = {D.in_proj};
+        const int outs[1] = {(int)E};
+        const char *what[1] = {"nemotron_h mtp eh_proj"};
+        float *y[1] = {of};
+        ok = (step_linears(&st, 1, t, 2 * (int)E, outs, what, cat, y, mbase + M.lin, M.lin_bytes) && emit(of, mh, n, E)) ||
+             fail("the MTP eh_proj refused");
+    }
+    if (ok) ok = compose(&st, il, false, true);
+    if (ok) ok = pulsar_rows_rmsnorm_launch(mh, E, n, E, fn, sh.rms_eps, mo, E, 0) == 0 || fail("the MTP out norm refused");
+    if (ok && gpu_graph_debug_dump_enabled()) dump_rows(&st, "nemotron_mtp", q->mo, 0, E, il);
+    if (ok && m->head_n) ok = head_rows(&st, mo, m->head_n, 0);
+    /* L289: the picks reduced on the device, behind the head (every headed row in one launch) */
+    if (ok && m->pick)
+        ok = pulsar_qwen_draft_top_launch((const float *)dptr(q->logits), (int)V, (int)m->head_n, dptr(q->mtop), 0) == 0 ||
+             fail("the MTP draft pick refused");
+    if (ok) ok = pulsar_gpu_end_commands() != 0;
+    else (void)pulsar_gpu_synchronize();
+    ok = step_end(&st, ok);
+    if (ok && m->pick) {
+        pulsar_qwen_draft_top rec[PULSAR_DRIVER_HEADS_MAX];
+        ok = pulsar_gpu_tensor_read(q->mtop, 0, rec, m->head_n * sizeof rec[0]) != 0 || fail("could not read the pick");
+        for (uint32_t r = 0; ok && r < m->head_n; r++) {
+            if (rec[r].nan || rec[r].index < 0 || (uint32_t)rec[r].index >= V) return fail("the MTP head's row holds a NaN");
+            m->pick[r] = {rec[r].index, rec[r].conf};
+        }
+    }
+    if (ok && m->head_n && m->logits)
+        ok = pulsar_gpu_tensor_read(q->logits, 0, m->logits, (uint64_t)m->head_n * V * sizeof(float)) != 0 ||
+             fail("could not read the MTP logits");
+    return ok;
+}
+
+/* the sampled proposal q of a headed row: the full vocabulary under the request's params (the head is the target's) */
+bool mtp_dist(pulsar_session *s, const float *row, float temperature, int top_k, float top_p, float min_p,
+              pulsar_sample_dist *qd) {
+    return row && pulsar_sample_dist_build(row, W(s->engine)->shape.n_vocab, temperature, top_k, top_p, min_p,
+                                           &s->sample_scratch, qd);
+}
+
+const pulsar_mtp_ops k_mtp_ops = {
+    /* .pend_decl     = */ PULSAR_NEMOTRON_H_STATE_MTP_PEND,
+    /* .modules       = */ mtp_modules,
+    /* .cond_bytes    = */ mtp_cond_bytes,
+    /* .head_width    = */ mtp_head_width,
+    /* .trunk_rows    = */ mtp_trunk_rows,
+    /* .out_rows      = */ mtp_out_rows,
+    /* .forward       = */ mtp_forward,
+    /* .dist          = */ mtp_dist,
+    /* .stage_save    = */ NULL,   /* the module's state is its K|V pool: position-addressed, nothing to undo */
+    /* .stage_restore = */ NULL,
+    /* .prefetch      = */ NULL,
+};
+
+/* The card's draft depth: "3-5" (vLLM's recipe drafts 3 on 4 x H100, 5 on GB200).  A session starts at 3 and the
+ * shared adaptive controller (spec_depth.h) moves it between 3 and 5 -- up a level after a round that converted all its
+ * depth but one draft, down after one that converted less than half (Qwen's MTP policy, L288); the stop threshold is
+ * the shared MTP one (0.7, Qwen's L270 sweep).  Neither is tuned on this model: the 3-layer mini is no acceptance
+ * fixture; the full model's numbers move them. */
+const pulsar_spec_depth_policy k_mtp_depth = {3, 5, 0.0f, 0, 0.0f, 0u, 0u, 1u};
 
 }  // namespace
 
@@ -798,6 +996,8 @@ void pulsar_nemotron_h_state_plan(pulsar_engine *e) {
                                        pulsar_mamba2_conv_state_elems(&g) * sizeof(uint16_t), 0, 0, NULL, NULL, NULL};
     d[PULSAR_NEMOTRON_H_STATE_KV] = {"kv", PULSAR_STATE_POOL, PULSAR_STATE_CAPTURE_NONE, false, false, 1u,
                                      pulsar_gqa_kv_token_bytes(&gd), 0, 0, NULL, NULL, NULL};
+    d[PULSAR_NEMOTRON_H_STATE_MTP_PEND] = {"mtp_pend", PULSAR_STATE_FIXED, PULSAR_STATE_CAPTURE_NONE, false, false, 0,
+                                           mtp_cond_bytes(e), 0, 0, NULL, NULL, NULL};
     for (uint32_t id = 0; id < PULSAR_NEMOTRON_H_STATE_COUNT; id++) (void)pulsar_state_plan_add(p, d[id]);
     for (uint32_t il = 0; il < lp->n_layer; il++)
         p->slot[il] = lp->desc[il].mixer == PULSAR_MIXER_MAMBA2
@@ -805,11 +1005,18 @@ void pulsar_nemotron_h_state_plan(pulsar_engine *e) {
                           : 1u << PULSAR_NEMOTRON_H_STATE_KV;
     p->n_trunk = lp->n_layer;
     p->n_slots = lp->n_layer;
-    /* the drafter's slot: the MTP module's attention K|V, one geometry with the trunk's (its writer is N9's drafter
-     * lane, F6; until then the pool is declared, priced and carried, and nothing writes it) */
-    if (s->mtp_written) p->slot[p->n_slots++] = 1u << PULSAR_NEMOTRON_H_STATE_KV;
+    /* N9, the drafter's slot when the session drafts: the MTP module's attention K|V (one geometry with the trunk's)
+     * and each bank's parked conditioning row; the chained-MTP lane's hooks keep its counters with the walk */
+    if (W(e)->drafting) {
+        p->slot[p->n_slots++] = 1u << PULSAR_NEMOTRON_H_STATE_KV | 1u << PULSAR_NEMOTRON_H_STATE_MTP_PEND;
+        p->drafter_at = pulsar_mtp_drafter_at;
+        p->drafter_frontier = pulsar_mtp_drafter_frontier;
+    }
     p->session = 0;
 }
+
+const pulsar_drafter_ops PULSAR_NEMOTRON_H_DRAFTER =
+    PULSAR_MTP_DRAFTER_OPS("MTP", 3u, PULSAR_MTP_DRAFT_MAX, 0.7f, &k_mtp_depth);
 
 const pulsar_driver_ops PULSAR_NEMOTRON_H_DRIVER = {
     /* .create        = */ create,
@@ -822,7 +1029,8 @@ const pulsar_driver_ops PULSAR_NEMOTRON_H_DRIVER = {
     /* .block         = */ {NULL, NULL, NULL, NULL, block},   /* by pulsar_layer_kind: BLOCKS */
     /* .head          = */ head,
     /* .step_end      = */ step_end,
-    /* .absorb        = */ NULL,   /* no drafter lane until N9 (F6's chained MTP) */
+    /* .absorb        = */ pulsar_mtp_absorb,   /* N9: the chained-MTP lane's lockstep (nothing without a lane) */
+    /* .mtp           = */ &k_mtp_ops,          /* N9: the MTP module (spec_mtp.h) */
     /* .rope          = */ NULL,   /* no positional encoding anywhere (NoPE) */
     /* .image_rows    = */ NULL,   /* images: N11 */
     /* .dump          = */ dump,

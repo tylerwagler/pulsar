@@ -946,7 +946,7 @@ QWEN_REF_ANCHORS = --ref-dir $(QWEN_REF_ANCHOR_DIR) --ref-tol $(QWEN_REF_TOL) \
 .PHONY: session-contract-gate-qwen session-contract-gate-ds session-contract-gate-nemotron
 session-contract-gate-qwen: tests/session_contract_gate
 	PULSAR_MSEQ_BANKS=4 ./tests/session_contract_gate $(QWEN_GATE_MODEL)
-# L296 N7: Nemotron-H's BF16 mini (no drafter: the speculation parts skip by name)
+# L296 N7: Nemotron-H's BF16 mini (N9: with its MTP drafter, B6 / F / S run)
 session-contract-gate-nemotron: tests/session_contract_gate
 	PULSAR_MSEQ_BANKS=4 ./tests/session_contract_gate $(NEMOTRON_GATE_MODEL)
 session-contract-gate-ds: tests/session_contract_gate
@@ -1028,6 +1028,29 @@ nemotron-family-gate: tests/nemotron_family_gate tests/loader_open
 .PHONY: nemotron-fwd-gate
 nemotron-fwd-gate: tests/nemotron_fwd_gate
 	./tests/nemotron_fwd_gate exact $(NEMOTRON_GATE_MODEL) synthetic
+# L296 N9: the chained-MTP drafter (src/engine/spec_mtp.h) on the container: greedy and seeded-sampled spec == plain at
+# depths 1..5 and the drafter's own numbers, the forced-reject stress (every Mamba-2 / attention / drafter byte back to
+# the plain twin's after planned rollbacks), the batched lane's shared verify == each bank's plain stream
+# (tests/mtp_spec_gate.cpp exact).  Any family whose drafter is the MTP lane: MTP_GATE_MODEL.
+MTP_GATE_MODEL ?= $(NEMOTRON_GATE_MODEL)
+MTP_GATE_TOKENS ?= 256
+.PHONY: mtp-spec-gate
+mtp-spec-gate: tests/mtp_spec_gate
+	./tests/mtp_spec_gate exact $(MTP_GATE_MODEL) $(MTP_GATE_TOKENS)
+# ... and its draft grade: the MTP module's first-step logits at every position of capture_ref.py's prompt, the engine's
+# DECODE and PROMPT paths (mtp_spec_gate probe), against transformers' modules on the fp32 trunk
+# (tools/nemotron/capture_mtp_ref.py) with transformers' own bf16 beside it (the floor); PASS within 2x the floor's KL.
+NEMOTRON_MTP_REF ?= /mnt/models/nemotron35-mini-ref/mtp_ref_fp32.pt
+NEMOTRON_MTP_REF_BF16 ?= /mnt/models/nemotron35-mini-ref/mtp_ref_bf16.pt
+NEMOTRON_MTP_GRADE_DIR ?= $(TMPDIR)/nemotron-mtp-grade
+.PHONY: nemotron-mtp-grade
+nemotron-mtp-grade: tests/mtp_spec_gate
+	rm -rf $(NEMOTRON_MTP_GRADE_DIR) && mkdir -p $(NEMOTRON_MTP_GRADE_DIR)
+	$(NEMOTRON_GRADE_PY) tests/nemotron_mtp_grade.py prep $(NEMOTRON_MINI_REF) $(NEMOTRON_MTP_GRADE_DIR)
+	./tests/mtp_spec_gate probe $(NEMOTRON_GATE_MODEL) $(NEMOTRON_MTP_GRADE_DIR)/ids.bin $(NEMOTRON_MTP_GRADE_DIR) \
+	    2> $(NEMOTRON_MTP_GRADE_DIR)/probe.log
+	$(NEMOTRON_GRADE_PY) tests/nemotron_mtp_grade.py grade $(NEMOTRON_MTP_REF) $(NEMOTRON_MTP_GRADE_DIR) \
+	    --bf16 $(NEMOTRON_MTP_REF_BF16) --trunk $(NEMOTRON_MINI_REF)
 # ... and its block grade against the transformers fp32 capture (tools/nemotron/capture_ref.py; dt unclamped) with
 # transformers' own bf16 run beside it (capture_ref.py --dtype bf16): per HF block, the final norm, the logits
 # (tests/nemotron_mini_grade.py; torch + safetensors: NEMOTRON_GRADE_PY).
@@ -2886,6 +2909,11 @@ tests/nemotron_fwd_gate: tests/nemotron_fwd_gate.o $(CORE_OBJS)
 tests/tp_plan_test.o: tests/tp_plan_test.cpp
 	$(CXX) $(CXXFLAGS) -Isrc -Isrc/engine -c -o $@ $<
 tests/tp_plan_test: tests/tp_plan_test.o src/lib/pulsar_help.o $(CORE_OBJS)
+	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
+# L296 N9: the chained-MTP drafter on a container (tests/mtp_spec_gate.cpp; reads the drafter's numbers and the state)
+tests/mtp_spec_gate.o: tests/mtp_spec_gate.cpp tests/gate_entry.h tests/gate_util.h src/pulsar.h src/engine/spec_mtp.h
+	$(CXX) $(CXXFLAGS) -Isrc -Isrc/engine -c -o $@ $<
+tests/mtp_spec_gate: tests/mtp_spec_gate.o $(CORE_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 tests/session_contract_gate.o: tests/session_contract_gate.cpp
 	$(CXX) $(CXXFLAGS) -Isrc -Isrc/engine -c -o $@ $<

@@ -1184,6 +1184,7 @@ static const pulsar_driver_ops k_qwen_driver = {
     /* .head          = */ qwen_head,
     /* .step_end      = */ qwen_step_end,
     /* .absorb        = */ qwen_absorb,
+    /* .mtp           = */ NULL,   /* its MTP lane is its own (spec_qwen.cpp) */
     /* .rope          = */ qwen_rope_table,
     /* .image_rows    = */ qwen_image_rows,
     /* .dump          = */ qwen_dump,
