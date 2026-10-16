@@ -2452,7 +2452,8 @@ int pulsar_session_spec_round_begin_local(pulsar_session *s, pulsar_spec_round *
                                           int top_k, float top_p, float min_p, char *err, size_t errlen);
 int pulsar_session_spec_round_end_local(pulsar_session *s, pulsar_spec_round *r, int first_token,
                                         float temperature, int top_k, float top_p,
-                                        float min_p, uint64_t *rng, const float *rows, uint32_t row0,
+                                        float min_p, uint32_t greedy_rows, uint64_t *rng,
+                                        const float *rows, uint32_t row0,
                                         int *accepted, int accepted_cap, char *err, size_t errlen);
 void pulsar_session_spec_round_abort_local(pulsar_session *s, pulsar_spec_round *r);
 void pulsar_session_spec_arm_capture_local(pulsar_session *s, uint32_t n_rows);

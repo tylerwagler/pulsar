@@ -601,6 +601,9 @@ static const server_output_parser_ops k_parser_qwen = {
     /* .turn_complete = */ parser_kit_turn_complete,
     /* .tool_progress = */ parser_kit_tool_progress,
     /* .finish        = */ parser_kit_finish,
+    /* .probe_new     = */ parser_kit_probe_new,
+    /* .probe_feed    = */ parser_kit_probe_feed,
+    /* .probe_free    = */ parser_kit_probe_free,
 };
 
 /* L272 B6: the longest rendered prefix two UNRELATED prompts share by template construction -- the

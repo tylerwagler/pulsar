@@ -47,6 +47,26 @@ bool parser_kit_in_tool_call(const void *st, const gen_state *) {
     return p.in_tool_call() && !p.in_payload();
 }
 
+/* L296 toolsample: the probe is a kit_gen around a copy of the parser's reading, at the same fed offset; it is fed
+ * what parser_kit_feed would feed it and read only by parser_kit_in_tool_call (no sink, no calls, events dropped). */
+void *parser_kit_probe_new(const void *st) {
+    const kit_gen *q = (const kit_gen *)st;
+    kit_gen *p = new kit_gen();
+    p->parser = q->parser->clone();
+    p->fed = q->fed;
+    return p;
+}
+
+void parser_kit_probe_feed(void *probe, const gen_state *, const char *text, size_t, size_t upto) {
+    kit_gen *p = (kit_gen *)probe;
+    if (upto <= p->fed) return;
+    p->ev.clear();
+    p->parser->feed(text + p->fed, upto - p->fed, &p->ev);
+    p->fed = upto;
+}
+
+void parser_kit_probe_free(void *probe) { delete (kit_gen *)probe; }
+
 bool parser_kit_turn_complete(const void *, const gen_state *) { return false; }
 
 void parser_kit_tool_progress(const void *st, bool *opened, bool *closed) {

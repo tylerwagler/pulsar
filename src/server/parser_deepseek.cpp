@@ -50,6 +50,22 @@ static bool ds_parser_in_tool_call(const void *st, const gen_state *) {
     return dsml_decode_state_is_tool(d) && !dsml_decode_state_uses_payload_sampling(d);
 }
 
+/* L296 toolsample: the probe is a parser state holding only a copy of the decode tracker -- all ds_parser_in_tool_call
+ * reads -- advanced as ds_parser_feed advances it (over the whole text, not the released bytes). */
+static void *ds_parser_probe_new(const void *st) {
+    deepseek_parser *p = (deepseek_parser *)server_xmalloc(sizeof *p);
+    memset(p, 0, sizeof *p);
+    p->tracker = ((const deepseek_parser *)st)->tracker;
+    return p;
+}
+
+static void ds_parser_probe_feed(void *probe, const gen_state *g, const char *text, size_t len, size_t) {
+    if (g->j->req.kind == REQ_CHAT && g->j->req.has_tools)
+        dsml_decode_tracker_update(&((deepseek_parser *)probe)->tracker, text, len);
+}
+
+static void ds_parser_probe_free(void *probe) { free(probe); }
+
 /* A closed DSML block ends the turn (finish "tool_calls"). */
 static bool ds_parser_turn_complete(const void *st, const gen_state *) {
     return ((const deepseek_parser *)st)->saw_tool_end;
@@ -182,4 +198,7 @@ const server_output_parser_ops k_parser_deepseek = {
     /* .turn_complete = */ ds_parser_turn_complete,
     /* .tool_progress = */ ds_parser_tool_progress,
     /* .finish        = */ ds_parser_finish,
+    /* .probe_new     = */ ds_parser_probe_new,
+    /* .probe_feed    = */ ds_parser_probe_feed,
+    /* .probe_free    = */ ds_parser_probe_free,
 };

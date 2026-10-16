@@ -1835,6 +1835,130 @@ static void test_decode_sampling_tool_payload_forcing(void) {
 
 
 
+/* L296 toolsample: the spec lane's per-position override (gen_spec_greedy_rows_text) equals the plain lane's
+ * token-by-token one.  The reference is the plain lane's order -- emit a token (gen_release, the parser fed what was
+ * released), THEN resolve -- run over the whole text; the probe is asked at every split point (the stream's state
+ * after e tokens) for the next 8 tokens' rows, with the base streamed before the forward and not.  Byte-split pieces
+ * (3 bytes: mid-marker, mid-UTF-8) and a client stop sequence that never matches (its holdback lags the parser)
+ * with a raw stream (plain_stream_pos moves) make the release rule matter.  Mutation checks: reading every row off
+ * the state as it stands (the old once-per-round rule) fails at every crossing; an off-by-one row fails too. */
+struct greedy_rows_case {
+    const server_output_parser_ops *ops;
+    void *(*fresh)(void);
+    void (*drop)(void *);
+    const char *text;
+};
+static void *greedy_rows_nemotron_fresh(void) {
+    const char *tools = "[{\"type\":\"function\",\"function\":{\"name\":\"get_weather\",\"parameters\":{\"type\":\"object\","
+                        "\"properties\":{\"city\":{\"type\":\"string\"},\"days\":{\"type\":\"integer\"}}}}}]";
+    nemotron_output_parser *p = new nemotron_output_parser();
+    char err[200];
+    TEST_ASSERT(p->init(false, tools, err, sizeof err));
+    return parser_kit_start(p);
+}
+static void *greedy_rows_deepseek_fresh(void) {
+    deepseek_parser *ps = (deepseek_parser *)server_xmalloc(sizeof *ps);
+    memset(ps, 0, sizeof *ps);
+    dsml_decode_tracker_init(&ps->tracker);
+    return ps;
+}
+static void greedy_rows_run(const greedy_rows_case &c, bool with_stop) {
+    job j;
+    memset(&j, 0, sizeof j);
+    request_init(&j.req, REQ_CHAT, 128);
+    j.req.think_mode = PULSAR_THINK_NONE;
+    j.req.temperature = 0.7f;
+    j.req.has_temperature = true;
+    j.req.has_tools = true;
+    j.req.stream = with_stop;
+    if (with_stop) stop_list_push(&j.req.stops, xstrdup("QQQQ"));
+    std::vector<std::string> pieces;
+    for (size_t i = 0, n = strlen(c.text); i < n; i += 3) pieces.push_back(std::string(c.text + i, std::min<size_t>(3, n - i)));
+    const int np = (int)pieces.size();
+    /* plain order over the whole text: mode[m] = the override after m tokens were emitted */
+    std::vector<bool> mode((size_t)np + 1);
+    auto emit = [&](gen_state *g, int k) {
+        buf_append(&g->text, pieces[(size_t)k].data(), pieces[(size_t)k].size());
+        bool hit = false;
+        size_t sp = 0, sl = 0;
+        const size_t upto = gen_release(&j.req.stops, g->text.ptr, g->text.len, pieces[(size_t)k].data(),
+                                        pieces[(size_t)k].size(), g->plain_stream_pos, &g->thinking,
+                                        &g->stop_scan_from, &hit, &sp, &sl);
+        TEST_ASSERT(!hit);
+        if (gen_streams_plain(g) && upto > g->plain_stream_pos) g->plain_stream_pos = upto;
+        c.ops->probe_feed(g->parser_st, g, g->text.ptr, g->text.len, upto);   /* the parser's own reading */
+    };
+    auto start = [&](gen_state *g) {
+        memset(g, 0, sizeof *g);
+        g->j = &j;
+        g->parser = c.ops;
+        g->parser_st = c.fresh();
+    };
+    auto stop = [&](gen_state *g) {
+        c.drop(g->parser_st);
+        buf_free(&g->text);
+    };
+    {
+        gen_state g;
+        start(&g);
+        mode[0] = c.ops->in_tool_call(g.parser_st, &g);
+        for (int k = 0; k < np; k++) {
+            emit(&g, k);
+            mode[(size_t)k + 1] = c.ops->in_tool_call(g.parser_st, &g);
+        }
+        stop(&g);
+    }
+    int crossings = 0;
+    for (int m = 0; m < np; m++) crossings += mode[(size_t)m] != mode[(size_t)m + 1];
+    TEST_ASSERT(crossings >= 4);   /* the text crosses structure / payload both ways, more than once */
+    for (int e = 0; e < np; e++) {
+        for (int be = 0; be < 2; be++) {
+            const bool base_emitted = be == 1;
+            if (base_emitted && e == 0) continue;
+            gen_state g;
+            start(&g);
+            for (int k = 0; k < e; k++) emit(&g, k);
+            const int n = std::min(8, np - e);
+            const char *pp[8];
+            size_t pl[8];
+            for (int i = 0; i < n; i++) { pp[i] = pieces[(size_t)(e + i)].data(); pl[i] = pieces[(size_t)(e + i)].size(); }
+            const uint32_t bits = gen_spec_greedy_rows_text(&g, pp, pl, n, base_emitted);
+            /* row r follows the base and r drafts: e tokens + r when the base was streamed, e + 1 + r when not */
+            const int rows = base_emitted ? n + 1 : n;
+            for (int r = 0; r < rows; r++) {
+                const int m = base_emitted ? e + r : e + 1 + r;
+                TEST_ASSERT(((bits >> r) & 1u) == (mode[(size_t)m] ? 1u : 0u));
+            }
+            stop(&g);
+        }
+    }
+    request_free(&j.req);
+}
+static void test_spec_greedy_rows_per_position(void) {
+    const greedy_rows_case nemotron = {
+        server_family_for_format(PULSAR_CHAT_NEMOTRON_H)->output, greedy_rows_nemotron_fresh, parser_kit_destroy,
+        "Let me check.\n<tool_call>\n<function=get_weather>\n<parameter=city>\nBoston\n</parameter>\n"
+        "<parameter=days>\n3\n</parameter>\n</function>\n</tool_call>\n<tool_call>\n<function=get_weather>\n"
+        "<parameter=city>\nS\xc3\xa3o Paulo\n</parameter>\n</function>\n</tool_call>"};
+    const greedy_rows_case deepseek = {
+        &k_parser_deepseek, greedy_rows_deepseek_fresh, free,
+        "Checking.\n\n" PULSAR_TOOL_CALLS_START "\n"
+        PULSAR_INVOKE_START " name=\"get_weather\">\n"
+        PULSAR_PARAM_START " name=\"city\" string=\"true\">Boston" PULSAR_PARAM_END "\n"
+        PULSAR_PARAM_START " name=\"days\" string=\"false\">3" PULSAR_PARAM_END "\n"
+        PULSAR_INVOKE_END "\n"
+        PULSAR_INVOKE_START " name=\"get_weather\">\n"
+        PULSAR_PARAM_START " name=\"city\" string=\"true\">Paris" PULSAR_PARAM_END "\n"
+        PULSAR_INVOKE_END "\n"
+        PULSAR_TOOL_CALLS_END};
+    for (int with_stop = 0; with_stop < 2; with_stop++) {
+        greedy_rows_run(nemotron, with_stop == 1);
+        greedy_rows_run(deepseek, with_stop == 1);
+    }
+}
+
+
+
 /* An Anthropic SERVER tool entry ({"type":"web_search_20250305",...}) is not
  * executed here -- the router upstream owns web search -- so parse drops it
  * and only the ordinary tool reaches the schemas and the order table. */
@@ -9233,6 +9357,7 @@ static void pulsar_server_unit_tests_run(void) {
     test_request_defaults_use_min_p_filtering();
     test_think_sampling_respects_explicit_params();
     test_decode_sampling_tool_payload_forcing();
+    test_spec_greedy_rows_per_position();
     test_anthropic_server_tool_entry_dropped();
     test_reasoning_effort_mapping();
     test_effort_names_one_table();

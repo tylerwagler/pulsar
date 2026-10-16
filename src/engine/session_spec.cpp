@@ -511,40 +511,52 @@ static bool spec_compact_dist(const int32_t *compact, uint32_t row, uint32_t n_v
                                                 scratch, out) != 0;
 }
 
+/* L296 toolsample: a round's sampling is decided PER POSITION, as the plain lane decides it token by token.  Row i
+ * (the token after the base and drafts 0..i-1; row K is a full accept's carry) draws greedy when the request is
+ * greedy or its bit in `greedy_rows` is set: the server's tool-call override (a call's structure greedy, its payload
+ * sampled) evaluated at that position (gen_spec_greedy_rows), so a round that crosses between the two draws each
+ * token as plain decoding draws it.  0 = the request's params at every row. */
+static bool spec_row_greedy(float temperature, uint32_t greedy_rows, uint32_t row) {
+    return temperature <= 0.0f || (row < 32u && ((greedy_rows >> row) & 1u) != 0u);
+}
+
 static int spec_accept_walk(pulsar_session *s,
                             pulsar_spec_row_read_fn read_row, void *read_ud,
                             const int32_t *compact, uint32_t row0,
                             const int *row_tops,
                             const int32_t *pend, uint32_t K,
                             float temperature, int top_k, float top_p, float min_p,
+                            uint32_t greedy_rows,
                             uint64_t rng, int *out_carry_tok) {
     int commit = 0;
     int carry_tok = -1;
-    if (temperature <= 0.0f || K == 0) {
-        while (commit < (int)K && row_tops[commit] == (int)pend[commit]) commit++;
-    } else {
+    while (commit < (int)K) {
+        if (spec_row_greedy(temperature, greedy_rows, (uint32_t)commit)) {
+            /* the row's argmax; on a miss the carry is the refreshed row's argmax (round_end) */
+            if (row_tops[commit] != (int)pend[commit]) break;
+            commit++;
+            continue;
+        }
         if (!s->spec_row_scratch)
             s->spec_row_scratch = (float *)xmalloc((size_t)spec_vocab(s) * sizeof(float));
         float *row_logits = s->spec_row_scratch;
-        while (commit < (int)K) {
-            pulsar_sample_dist dist;
-            if (!spec_compact_dist(compact, row0 + (uint32_t)commit, spec_vocab(s), temperature, top_k,
-                                   top_p, min_p, &s->sample_scratch, &dist)) {
-                if (!read_row(read_ud, (uint32_t)commit, row_logits) ||
-                    !pulsar_sample_dist_build(row_logits, spec_vocab(s), temperature, top_k,
-                                              top_p, min_p, &s->sample_scratch, &dist)) {
-                    *out_carry_tok = -1;
-                    return -1;
-                }
+        pulsar_sample_dist dist;
+        if (!spec_compact_dist(compact, row0 + (uint32_t)commit, spec_vocab(s), temperature, top_k,
+                               top_p, min_p, &s->sample_scratch, &dist)) {
+            if (!read_row(read_ud, (uint32_t)commit, row_logits) ||
+                !pulsar_sample_dist_build(row_logits, spec_vocab(s), temperature, top_k,
+                                          top_p, min_p, &s->sample_scratch, &dist)) {
+                *out_carry_tok = -1;
+                return -1;
             }
-            const int tok = pulsar_sample_dist_draw(&dist, pulsar_sample_key(rng, (uint32_t)commit + 1u));
-            pulsar_sample_dist_free(&dist);
-            if (tok != (int)pend[commit]) {
-                carry_tok = tok;
-                break;
-            }
-            commit++;
         }
+        const int tok = pulsar_sample_dist_draw(&dist, pulsar_sample_key(rng, (uint32_t)commit + 1u));
+        pulsar_sample_dist_free(&dist);
+        if (tok != (int)pend[commit]) {
+            carry_tok = tok;
+            break;
+        }
+        commit++;
     }
     *out_carry_tok = carry_tok;
     return commit;
@@ -665,6 +677,7 @@ static int spec_round_begin(pulsar_session *s, int first_token,
 static int spec_round_end(pulsar_session *s, pulsar_spec_round *r,
                           int first_token,
                           float temperature, int top_k, float top_p, float min_p,
+                          uint32_t greedy_rows,
                           uint64_t *rng,
                           const pulsar_spec_rows *src, uint32_t row0,
                           bool defer_redraft,
@@ -709,7 +722,7 @@ static int spec_round_end(pulsar_session *s, pulsar_spec_round *r,
         PULSAR_NVTX("spec: walk");
         commit_rc = spec_accept_walk(s, src->read, src->ud, src->compact, row0,
                                      row_tops, pend, K,
-                                     temperature, top_k, top_p, min_p,
+                                     temperature, top_k, top_p, min_p, greedy_rows,
                                      rng ? *rng : 0u, &carry_tok);
     }
     if (commit_rc < 0) {
@@ -830,9 +843,12 @@ static int spec_round_end(pulsar_session *s, pulsar_spec_round *r,
      * s->logits (= row[commit]) when the walk did not already draw it:
      * greedy -> argmax (the old next_base); sampled full-accept -> the draw
      * from the last accepted row's distribution at the carry's own key
-     * (commit + 1 past the base, as the walk's would have been). */
+     * (commit + 1 past the base, as the walk's would have been).  Greedy or sampled is the carry ROW's (L296:
+     * spec_row_greedy), and so are the params the carry and the next chain record: they are the next round's
+     * base position's, which the next round's own resolution reads. */
+    const float carry_temp = spec_row_greedy(temperature, greedy_rows, (uint32_t)commit) ? 0.0f : temperature;
     if (carry_tok < 0) {
-        if (temperature <= 0.0f) {
+        if (carry_temp <= 0.0f) {
             carry_tok = sample_argmax(s->logits, spec_vocab(s));
         } else {
             pulsar_sample_dist bonus;
@@ -932,7 +948,7 @@ static int spec_round_end(pulsar_session *s, pulsar_spec_round *r,
     s->spec.spec_carry_token = (int32_t)carry_tok;
     s->spec.spec_carry_valid = !hit_eos && !trimmed;
     s->spec.spec_carry_pos = (int32_t)s->checkpoint.len;
-    s->spec.spec_carry_temp = temperature;
+    s->spec.spec_carry_temp = carry_temp;
     s->spec.spec_carry_top_k = top_k;
     s->spec.spec_carry_top_p = top_p;
     s->spec.spec_carry_min_p = min_p;
@@ -954,7 +970,7 @@ static int spec_round_end(pulsar_session *s, pulsar_spec_round *r,
          * cannot serve simply takes a plain n=1 step next round. */
         pulsar_spec_drop_pendings(&s->spec);
         spec_redraft_req *q = &r->redraft;
-        pulsar_spec_draft_req_init(s, q, next_base, temperature, top_k, top_p, min_p);
+        pulsar_spec_draft_req_init(s, q, next_base, carry_temp, top_k, top_p, min_p);
         q->valid = features_ready;
         q->n_batch = n_batch;
         q->commit = commit;
@@ -963,7 +979,7 @@ static int spec_round_end(pulsar_session *s, pulsar_spec_round *r,
     uint32_t keep;
     {
         PULSAR_NVTX("spec: draft");
-        keep = spec_drafter(s)->draft(s, next_base, features_ready, temperature, top_k, top_p, min_p, rng);
+        keep = spec_drafter(s)->draft(s, next_base, features_ready, carry_temp, top_k, top_p, min_p, rng);
     }
     /* t0 == 0 marks a lane whose forward ran outside this round (the batched
      * lane) -- step_ms would print the epoch, so skip the line there. */
@@ -1010,7 +1026,7 @@ static int spec_single_round(pulsar_session *s, int first_token,
     const uint32_t n_rows = pulsar_spec_round_n_rows(&r);
     s->spec.spec_round_banks = 1;
     const int na = spec_round_end(s, &r, first_token,
-                                  temperature, top_k, top_p, min_p, rng,
+                                  temperature, top_k, top_p, min_p, 0u /* the caller's params at every row */, rng,
                                   &src, 0u, false, t0, NULL, accepted, accepted_cap, err, errlen);
     free(r.snap);
     /* L263: this lane's own cost observation -- the whole step, redraft
@@ -1203,7 +1219,7 @@ bool pulsar_spec_row_read_block(void *ud, uint32_t row, float *out) {
 static int spec_round_end_block(pulsar_session *s, pulsar_spec_round *r,
                                 int first_token,
                                 float temperature, int top_k, float top_p,
-                                float min_p, uint64_t *rng,
+                                float min_p, uint32_t greedy_rows, uint64_t *rng,
                                 const float *rows, uint32_t row0,
                                 const int32_t *forced_truth,
                                 int *accepted, int accepted_cap,
@@ -1224,7 +1240,7 @@ static int spec_round_end_block(pulsar_session *s, pulsar_spec_round *r,
         src.block.vocab = spec_vocab(s);
     }
     return spec_round_end(s, r, first_token,
-                          temperature, top_k, top_p, min_p, rng,
+                          temperature, top_k, top_p, min_p, greedy_rows, rng,
                           &src, row0,
                           true /* L150: redraft deferred to the batch */,
                           0.0 /* t0: step_ms diagnostic reads 0 in this lane */,
@@ -1236,12 +1252,12 @@ static int spec_round_end_block(pulsar_session *s, pulsar_spec_round *r,
 int pulsar_session_spec_round_end_local(pulsar_session *s, pulsar_spec_round *r,
                                int first_token,
                                float temperature, int top_k, float top_p,
-                               float min_p, uint64_t *rng,
+                               float min_p, uint32_t greedy_rows, uint64_t *rng,
                                const float *rows, uint32_t row0,
                                int *accepted, int accepted_cap,
                                char *err, size_t errlen) {
     return spec_round_end_block(s, r, first_token, temperature, top_k, top_p,
-                                min_p, rng, rows, row0, NULL, accepted, accepted_cap,
+                                min_p, greedy_rows, rng, rows, row0, NULL, accepted, accepted_cap,
                                 err, errlen);
 }
 
@@ -1258,7 +1274,7 @@ int pulsar_session_spec_round_end_forced(pulsar_session *s, pulsar_spec_round *r
         return -1;
     }
     return spec_round_end_block(s, r, first_token, temperature, top_k, top_p,
-                                min_p, rng, rows, row0, truth, accepted, accepted_cap,
+                                min_p, 0u, rng, rows, row0, truth, accepted, accepted_cap,
                                 err, errlen);
 }
 
@@ -1409,7 +1425,7 @@ void pulsar_session_spec_round_end_batch_local(pulsar_session *s, pulsar_spec_st
         }
         const int na = pulsar_session_spec_round_end_local(s, st->round, st->first_token,
                                                            st->temperature, st->top_k, st->top_p,
-                                                           st->min_p, st->rng, rows, st->row0,
+                                                           st->min_p, st->greedy_rows, st->rng, rows, st->row0,
                                                            st->accepted, st->accepted_cap,
                                                            st->err, sizeof st->err);
         if (na < 0) st->status = PULSAR_SPEC_STEP_FAILED;
