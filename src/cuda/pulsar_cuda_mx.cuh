@@ -144,4 +144,12 @@ __device__ __forceinline__ static float pulsar_swiglu_elem(float g, float u, flo
     return s * u * wv;
 }
 
+/* ONE squared-ReLU element for every non-gated (up-only) path (L296 N4: Nemotron-H's experts and shared expert,
+ * `relu2`): r = max(u, 0) -- written so a NaN u stays NaN (rule 9; fmaxf would return the 0) -- then r * r * w in
+ * that order. */
+__device__ __forceinline__ static float pulsar_relu2_elem(float u, float wv) {
+    const float r = u <= 0.0f ? 0.0f : u;
+    return r * r * wv;
+}
+
 #endif /* PULSAR_CUDA_MX_CUH */

@@ -176,8 +176,8 @@ __global__ void bf16_moe_plan_kernel(const int32_t *__restrict__ bounds, int E, 
 }
 
 /* The fold: each scheduled pair's activation with its route weight folded in, rounded to the bf16 row the down
- * reads -- SWIGLU pulsar_swiglu_elem (the EXL3 fold's and the shared expert's expression), RELU2 relu(u)^2 * w in f32
- * (g unread).  A pair with no expert (sel < 0) is not in the schedule: its row is not written and nothing reads it. */
+ * reads -- SWIGLU pulsar_swiglu_elem (the EXL3 fold's and the shared expert's expression), RELU2 pulsar_relu2_elem
+ * (relu(u)^2 * w in f32, a NaN kept; the non-gated shared expert's expression too; g unread).  A pair with no expert (sel < 0) is not in the schedule: its row is not written and nothing reads it. */
 template <int ACT>
 __global__ void __launch_bounds__(256)
 bf16_moe_fold_kernel(const float *__restrict__ g, const float *__restrict__ u, const int32_t *__restrict__ sel,
@@ -187,8 +187,9 @@ bf16_moe_fold_kernel(const float *__restrict__ g, const float *__restrict__ u, c
     const int64_t p = i / mid;
     if (sel[p] < 0) return;
     if constexpr (ACT == PULSAR_FFN_ACT_RELU2) {
-        const float x = u[i], r = x <= 0.0f ? 0.0f : x;   /* not fmaxf: a NaN up projection stays NaN (rule 9) */
-        h[i] = __float2bfloat16(r * r * wts[p]);
+        /* pulsar_relu2_elem: F7 18f2278f's NaN-keeping relu^2 (x <= 0 ? 0 : x, then r * r * w), the one expression the
+         * non-gated shared expert's producer reads too */
+        h[i] = __float2bfloat16(pulsar_relu2_elem(u[i], wts[p]));
     } else {
         h[i] = __float2bfloat16(pulsar_swiglu_elem(g[i], u[i], wts[p], clamp));
     }

@@ -1,7 +1,7 @@
 /* L295 F2: the shared MoE router (src/cuda/pulsar_cuda_router.cu) against a double host reference, for every router
  * the engine declares -- Qwen3.8-Flash-Next's (pulsar_qwen_router_cfg), DeepSeek V4's through its tensor binding
  * (pulsar_gpu_router_select_batch_tensor: the correction bias, the vision image-slot bias, the hash-routed token
- * table) and Inkling-Small's -- plus, when a fixture is given, Inkling's router on REAL router weights against
+ * table), Inkling-Small's and Nemotron 3.5 Super's -- plus, when a fixture is given, Inkling's router on REAL router weights against
  * transformers' own InklingTopkRouter (tests/inkling_router_fixture.py).
  *
  *   A  logits: bf16 rows x bf16 weight rows (+ a tail) -> f32, vs double; a row's logits the same bytes at any T
@@ -10,6 +10,7 @@
  *      gammas / scores vs double; batch-width neutrality (each row alone == its row in the batch, byte for byte)
  *   C  rule 9: a non-finite score row routes to experts 0..k-1 with NaN weights and NaN gammas
  *   D  refusals: a config the router does not have, a shape without an instance, a table without token ids
+ *   (Nemotron 3.5 Super's 512 / top-22 sum-renormalised router rides A-C as a declared case, L296 N4)
  *   E  (fixture) Inkling-Small mini, layers 1 and 2: our logits vs transformers' fp32 logits, our picks / weights /
  *      sink gammas vs InklingTopkRouter's
  *
@@ -191,6 +192,18 @@ static pulsar_router_cfg inkling_cfg(void) {
     return c;
 }
 
+/* Nemotron 3.5 Super's router (L296 N4; config.json llm_config + vLLM's NemotronHMoE): 512 routed experts, top-22,
+ * sigmoid scores, the e_score_correction_bias for selection only, the picks renormalised by their sum x
+ * routed_scaling_factor 5.0, f32 logits (vLLM's gate runs fp32), one UNGATED shared expert (no gate row).  Stated here
+ * as the contract the family's declaration must meet (src/families/nemotron_h/nemotron_h_forward.cpp router_cfg). */
+static pulsar_router_cfg nemotron_contract(void) {
+    pulsar_router_cfg c{};
+    c.n_expert = 512; c.top_k = 22; c.n_shared = 1; c.shared_gate = PULSAR_ROUTER_SHARED_NONE;
+    c.score = PULSAR_ROUTER_SCORE_SIGMOID; c.renorm = PULSAR_ROUTER_RENORM_SUM;
+    c.logits_bf16 = false; c.weights_bf16 = false; c.sum_floor = 0.0f; c.route_scale = 5.0f;
+    return c;
+}
+
 /* DeepSeek's binding resolves its tensors from a model map; every case gets its own slot in it (the device-copy
  * cache is keyed by (map, offset)). */
 static std::vector<uint8_t> g_map(16u << 20);
@@ -262,7 +275,8 @@ static void section_logits(void) {
     printf("A. router logits (bf16 x bf16 -> f32, fixed order)\n");
     struct shp { const char *name; int H, n_w, n_tail; };
     for (const shp &s : {shp{"Qwen 2560 x (512 + the shared gate row)", 2560, 512, 1},
-                         shp{"Inkling 4096 x 258 (256 routed + 2 sink rows, one tensor)", 4096, 258, 0}}) {
+                         shp{"Inkling 4096 x 258 (256 routed + 2 sink rows, one tensor)", 4096, 258, 0},
+                         shp{"Nemotron 4096 x 512 (no gate rows: an ungated shared expert)", 4096, 512, 0}}) {
         const int T = 37, R = s.n_w + s.n_tail;
         std::vector<uint16_t> x((size_t)T * s.H), w((size_t)R * s.H);
         for (auto &v : x) v = f2bf((float)(0.7 * rndn()));
@@ -366,6 +380,13 @@ static void section_select(void) {
         i.hl.global_scale = 0.0204065;
         i.hl.has_global = true;
         cases.push_back(i);
+    }
+    {
+        router_case n{"Nemotron 512 / top-22, sigmoid + bias, SUM x 5.0, one ungated shared", nemotron_contract(), {},
+                      false, 2.0};
+        n.hl.bias.resize(512);
+        for (auto &b : n.hl.bias) b = (float)(0.05 * rndn());
+        cases.push_back(n);
     }
     const int T = 37;
     for (const router_case &rc : cases) {

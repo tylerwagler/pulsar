@@ -10,7 +10,9 @@
  *              fold's mid emitted bf16; expert parallelism localises the picks first
  *   shared     each shared expert either RIDES the EXL3 routed launches (pulsar_rows_moe_shared_fork, joined at
  *              the routed sum) or runs after it (pulsar_rows_moe_shared_launch): gate, up, the SwiGLU emitted
- *              bf16 by its producer, the down
+ *              bf16 by its producer, the down -- or (L296 N4, pulsar_ffn_act RELU2) up, relu^2, the down
+ *   latent     (L296 N4) a latent block's routed experts run on the latent width: the block's workspace carries the
+ *              latent rows and the projections' workspace (moe.cpp composes fc1 -> routed -> fc2)
  *   out        routed + gamma_0 * shared_0 + gamma_1 * shared_1 + ... -- in that order
  *
  * L251 / ac69748f: there is no E4M3 activation slot on this lane. */
@@ -34,15 +36,17 @@ namespace {
 /* The shared expert's SwiGLU, emitted in the format its consumer reads (rule 3).  L251 / ac69748f:
  * the shared down projection reads a bf16 row, so the producer emits bf16 -- and bf16 carries its own
  * exponent, so there is no per-32 block and no scale slab any more. */
+/* L296 N4: the same producer for the non-gated activation (pulsar_ffn_act RELU2): relu(u)^2, g unread. */
 __global__ void __launch_bounds__(256)
-rows_swiglu_emit_kernel(const float *__restrict__ g, const float *__restrict__ u, int D,
-                        __nv_bfloat16 *__restrict__ xb) {
+rows_act_emit_kernel(const float *__restrict__ g, const float *__restrict__ u, int D, int act,
+                     __nv_bfloat16 *__restrict__ xb) {
     const int t = blockIdx.x;
     for (int c0 = 0; c0 < D; c0 += 256) {
         const int c = c0 + (int)threadIdx.x;
         if (c < D) {
-            xb[(size_t)t * D + c] = __float2bfloat16(pulsar_swiglu_elem(
-                g[(size_t)t * D + c], u[(size_t)t * D + c], 1.0f, 0.0f));
+            const size_t i = (size_t)t * D + c;
+            xb[i] = __float2bfloat16(act == PULSAR_FFN_ACT_RELU2 ? pulsar_relu2_elem(u[i], 1.0f)
+                                                                 : pulsar_swiglu_elem(g[i], u[i], 1.0f, 0.0f));
         }
     }
 }
@@ -125,7 +129,9 @@ static size_t moe_ws_layout(const pulsar_moe_block_shape *s, int T, void *base, 
     m.sel    = (int32_t *)b.take(pairs * 4);
     m.wts    = (float *)b.take(pairs * 4);
     m.gammas = (float *)b.take(S * T * 4);
-    m.routed_bytes = routed_ws_layout(T, s->top_k, s->expert_mid, s->hidden, nullptr, 0, nullptr);
+    /* the routed experts' width: the latent's on a latent block (L296 N4), else the hidden's */
+    const int rw = s->latent > 0 ? s->latent : s->hidden;
+    m.routed_bytes = routed_ws_layout(T, s->top_k, s->expert_mid, rw, nullptr, 0, nullptr);
     m.routed = b.take(m.routed_bytes);
     if (S) {
         m.yg = (float *)b.take(S * T * smid * 4);
@@ -137,6 +143,17 @@ static size_t moe_ws_layout(const pulsar_moe_block_shape *s, int T, void *base, 
         m.lin_bytes = exl3_moe_shared_ws_bytes(T, s->hidden, s->shared_mid, s->hidden);
         m.lin = b.take(m.lin_bytes);
     }
+    if (s->latent > 0) {
+        const size_t L = (size_t)s->latent;
+        m.lat_f = (float *)b.take((size_t)T * L * 4);
+        m.lat_x = (uint16_t *)b.take((size_t)T * L * 2);
+        m.lat_y = (uint16_t *)b.take((size_t)T * L * 2);
+        /* the two projections' dense-arm workspace (hidden -> latent, latent -> hidden), one, shared */
+        const size_t w1 = ds4_exl3_dense_workspace_bytes(T, s->hidden, s->latent);
+        const size_t w2 = ds4_exl3_dense_workspace_bytes(T, s->latent, s->hidden);
+        m.lat_lin_bytes = w1 > w2 ? w1 : w2;
+        m.lat_lin = b.take(m.lat_lin_bytes);
+    }
     if (o) *o = m;
     return b.failed ? 0 : b.used;
 }
@@ -144,7 +161,7 @@ static size_t moe_ws_layout(const pulsar_moe_block_shape *s, int T, void *base, 
 static bool block_shape_ok(const pulsar_moe_block_shape *s) {
     return s && s->n_expert > 0 && s->top_k > 0 && s->n_logit_rows >= s->n_expert && s->hidden > 0 &&
            s->expert_mid > 0 && s->n_shared >= 0 && s->n_shared <= PULSAR_ROUTER_SHARED_MAX &&
-           (s->n_shared == 0 || s->shared_mid > 0);
+           (s->n_shared == 0 || s->shared_mid > 0) && s->latent >= 0;
 }
 
 static bool launch_ok(const char *what) {
@@ -267,6 +284,11 @@ extern "C" size_t pulsar_rows_moe_routed_workspace_bytes(int T, int top_k, int m
 /* A riding shared expert's descriptor in the front door's terms: three EXL3 slices hidden -> mid -> hidden. */
 static bool rows_moe_shared(const pulsar_rows_moe_shared *q, int H, exl3_moe_shared *sh) {
     const int smid = q->gate.out;
+    if (q->act != PULSAR_FFN_ACT_SWIGLU) {
+        fprintf(stderr, "pulsar: routed MoE (bf16 rows): a riding shared expert is SwiGLU (the EXL3 front door's fold); "
+                        "activation %d runs pulsar_rows_moe_shared_launch -- refusing\n", (int)q->act);
+        return false;
+    }
     if (!q->gate.w || !q->up.w || !q->down.w || !q->gate.k2 || !q->up.k2 || !q->down.k2 || q->gate.in != H ||
         q->up.in != H || q->up.out != smid || q->down.in != smid || q->down.out != H) {
         fprintf(stderr, "pulsar: routed MoE (bf16 rows): a riding shared expert is three EXL3 slices %d -> %d -> %d "
@@ -439,20 +461,22 @@ extern "C" int pulsar_rows_moe_routed_launch(const pulsar_rows_moe *w, int32_t *
 
 extern "C" int pulsar_rows_moe_shared_launch(const pulsar_rows_moe_shared *q, const uint16_t *x_bf16, int T,
                                              float *out, cudaStream_t stream) {
-    const int smid = q ? q->gate.out : 0, H = q ? q->gate.in : 0;
-    if (!q || !x_bf16 || !out || T <= 0 || !q->yg || !q->yu || !q->ys || !q->h || q->up.in != H ||
-        q->up.out != smid || q->down.in != smid || q->down.out != H) {
-        fprintf(stderr, "pulsar: MoE shared expert: %d->%d / %d->%d / %d->%d (in -> mid -> in), its buffers, rows and an "
-                        "output -- refusing\n", H, smid, q ? q->up.in : -1, q ? q->up.out : -1, q ? q->down.in : -1,
-                q ? q->down.out : -1);
+    const bool gated = q && q->act == PULSAR_FFN_ACT_SWIGLU;
+    const int smid = q ? q->up.out : 0, H = q ? q->up.in : 0;
+    if (!q || !x_bf16 || !out || T <= 0 || (q->act != PULSAR_FFN_ACT_SWIGLU && q->act != PULSAR_FFN_ACT_RELU2) ||
+        (gated && (!q->yg || q->gate.in != H || q->gate.out != smid)) || !q->yu || !q->ys || !q->h ||
+        q->down.in != smid || q->down.out != H) {
+        fprintf(stderr, "pulsar: MoE shared expert: activation %d, %s%d->%d / %d->%d (in -> mid -> in), its buffers, rows "
+                        "and an output -- refusing\n", q ? (int)q->act : -1, gated ? "a gate of the up's shape, " : "",
+                H, smid, q ? q->down.in : -1, q ? q->down.out : -1);
         return -1;
     }
-    /* gate + up on the same row, the SwiGLU producer, down, then out += scale * shared */
-    int rc = pulsar_rows_linear_launch(&q->gate, x_bf16, T, q->yg, q->ws, q->ws_bytes, stream);
+    /* [gate +] up on the same row, the activation's producer, down, then out += scale * shared */
+    int rc = gated ? pulsar_rows_linear_launch(&q->gate, x_bf16, T, q->yg, q->ws, q->ws_bytes, stream) : 0;
     if (!rc) rc = pulsar_rows_linear_launch(&q->up, x_bf16, T, q->yu, q->ws, q->ws_bytes, stream);
     if (rc) return rc;
-    rows_swiglu_emit_kernel<<<T, 256, 0, stream>>>(q->yg, q->yu, smid, (__nv_bfloat16 *)q->h);
-    if (!launch_ok("shared swiglu")) return -3;
+    rows_act_emit_kernel<<<T, 256, 0, stream>>>(q->yg, q->yu, smid, (int)q->act, (__nv_bfloat16 *)q->h);
+    if (!launch_ok("shared activation")) return -3;
     rc = pulsar_rows_linear_launch(&q->down, q->h, T, q->ys, q->ws, q->ws_bytes, stream);
     if (rc) return rc;
     const size_t n = (size_t)T * H;

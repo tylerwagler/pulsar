@@ -7,10 +7,10 @@
  * registry serves a dense linear at bf16 rows (BF16, an EXL3 dense-arm rate, mxfp8_lt), the shared expert what it
  * serves a shared expert, the head what it serves a dense linear or BF16 as stored (E5's head op reads it).  The routed
  * stacks are admitted per stack by the registry's routed roles at bf16 rows (up as the gate/up side, down as down:
- * BF16 today).  Their COMBINATION -- an up-only (ungated) relu^2 expert -- has no arm in any format yet (N4 builds the
- * BF16 one; a quant format's comes with the L296 format verdict), so no pair check runs here: the forward, not the
- * load, owns that refusal until N4.  Norms, the conv, dt_bias / A_log / D and the router are read as stored: bf16, the
- * router's selection bias f32. */
+ * BF16 today), and their COMBINATION -- an up-only (ungated) relu^2 expert -- by the core's up-only arm
+ * (moe.cpp pulsar_moe_arm_up_only: BF16 up + down, N4; a quant format's comes with the L296 format verdict), so a
+ * container whose experts no arm runs is refused here, once, not at its first step.  Norms, the conv, dt_bias / A_log
+ * / D and the router are read as stored: bf16, the router's selection bias f32. */
 #include "nemotron_h.h"
 
 namespace {
@@ -62,6 +62,13 @@ void bind_block(pulsar_role_binder *b, const pulsar_nemotron_h_shape *s, const c
     L->latent_out = pulsar_role_bind(b, k("latent_out"), A_LINEAR, 2, Lt, E);
     L->exp_up = pulsar_role_bind(b, k("expert_up"), A_EXP_UP, 3, Lt, F, X);
     L->exp_down = pulsar_role_bind(b, k("expert_down"), A_EXP_DOWN, 3, F, Lt, X);
+    if (L->exp_up && L->exp_down &&
+        pulsar_moe_arm_up_only(L->exp_up, L->exp_down, PULSAR_ACT_ROWS_BF16) == PULSAR_MOE_ARM_NONE) {
+        fprintf(stderr, "pulsar: %s: %s %d: up-only relu^2 experts in %s / %s have no arm (BF16 up + down only; the "
+                        "quant up-only arm is the format verdict's, L296) -- refusing\n", OWNER, block, il,
+                tensor_type_name(L->exp_up->type), tensor_type_name(L->exp_down->type));
+        pulsar_load_refuse();
+    }
     L->sh_up = pulsar_role_bind(b, k("shared_up", 0), A_SHARED, 2, E, s->n_ff_shared);
     L->sh_down = pulsar_role_bind(b, k("shared_down", 0), A_SHARED, 2, s->n_ff_shared, E);
 }

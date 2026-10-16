@@ -2,9 +2,11 @@
 """capture_ref.py -- the fp32 reference forward of the Nemotron mini (L296 N1): transformers (trust_remote_code: the
 checkpoint's own NemotronH_Omni_Reasoning_V3 wrapper around transformers' NemotronHForCausalLM), fp32, eager
 attention, CPU, on the first T tokens of a text.  The format-neutral correctness fixture the pulsar forward (N2-N7)
-grades against, as /mnt/models/inkling-small-mini-ref is Inkling's.
+grades against, as /mnt/models/inkling-small-mini-ref is Inkling's.  `--dtype bf16` (L296 N7) runs the same capture
+in transformers' own bf16 -- the comparator that puts a bf16 engine's distance to the fp32 reference in context (the
+bf16 rounding floor); its tensors are stored as computed (bf16), the logits as f32.
 
-    python capture_ref.py <mini_dir> <out.pt> <text_file> [--tokens 1300]
+    python capture_ref.py <mini_dir> <out.pt> <text_file> [--tokens 1300] [--dtype fp32|bf16]
 
 out.pt (torch.save) holds:
   input_ids      [1, T] int64 (HF tokenizers on the text, no special tokens added -- the template renders no BOS)
@@ -34,6 +36,7 @@ def main():
     ap.add_argument("text")
     ap.add_argument("--tokens", type=int, default=1300)
     ap.add_argument("--threads", type=int, default=16)
+    ap.add_argument("--dtype", choices=["fp32", "bf16"], default="fp32")
     a = ap.parse_args()
     torch.set_num_threads(a.threads)
     import transformers
@@ -45,7 +48,8 @@ def main():
         raise SystemExit(f"{a.text}: {len(ids)} tokens < {a.tokens}")
     input_ids = torch.tensor([ids], dtype=torch.long)
     t0 = time.time()
-    model, info = AutoModel.from_pretrained(a.mini, trust_remote_code=True, dtype=torch.float32,
+    dtype = torch.float32 if a.dtype == "fp32" else torch.bfloat16
+    model, info = AutoModel.from_pretrained(a.mini, trust_remote_code=True, dtype=dtype,
                                             attn_implementation="eager", output_loading_info=True)
     missing, unexpected = sorted(info["missing_keys"]), sorted(info["unexpected_keys"])
     print(f"loaded in {time.time() - t0:.0f} s; missing {missing[:8]} ({len(missing)}); unexpected {len(unexpected)} "
@@ -96,7 +100,7 @@ def main():
     ref0 = run()
     out = {"input_ids": input_ids, **ref, "blocks": blocks, "dt_clamp": tuple(clamp),
            **{f"{k}_dt0": v for k, v in ref0.items()},
-           "meta": {"transformers": transformers.__version__, "torch": torch.__version__, "text": a.text,
+           "meta": {"transformers": transformers.__version__, "torch": torch.__version__, "text": a.text, "dtype": a.dtype,
                     "tokens": a.tokens, "dt_min_seen": min(dt_seen)}}
     same = torch.equal(ref["logits"], ref0["logits"])
     d = (ref["logits"] - ref0["logits"]).abs().max().item()

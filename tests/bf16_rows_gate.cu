@@ -21,6 +21,9 @@
  *      stacks) == the arm; refusals (BF16 with Tessera, BF16 with a riding shared expert);
  *   4'. the same routed checks for relu^2 up-only experts (no gate stack: Nemotron-H's activation, pulsar_ffn_act
  *      RELU2), and the activation / stack refusals both ways;
+ *   4''. (L296 N4) the non-gated shared expert through pulsar_rows_moe_shared_launch (BF16 4096 -> 5376 -> 4096,
+ *      RELU2): up graded, the bf16 relu^2 rows within one ulp, the down graded on them, out == the routed sum + the
+ *      expert's f32 output bit for bit, rows alone == batched;
  *   5. timing (information): the 4096 -> 201024 BF16 head at 1 / 4 / 16 rows.
  *
  * usage: ./tests/bf16_rows_gate
@@ -377,6 +380,68 @@ static void section_routed(pulsar_ffn_act act) {
     cudaFree(f.dG); cudaFree(f.dU); cudaFree(f.dD);
 }
 
+/* L296 N4: the non-gated shared expert (RELU2) through the shared launcher, on BF16 linears at Nemotron-H's width */
+static void section_shared_relu2(void) {
+    const int H = 4096, M = 5376, T = 16;
+    const std::vector<uint16_t> U = rnd_bf16((size_t)M * H, 0.02, H), D = rnd_bf16((size_t)H * M, 0.02, M);
+    const std::vector<uint16_t> X = rnd_bf16((size_t)T * H, 1.0, H);
+    std::vector<float> pre((size_t)T * H);
+    for (auto &v : pre) v = (float)(rndu() - 0.5);
+    uint16_t *dU = upload(U), *dD = upload(D);
+    struct out { std::vector<float> o, yu, ys; std::vector<uint16_t> h; int rc; };
+    auto run = [&](int rows, int r0) {
+        uint16_t *dX = upload(std::vector<uint16_t>(X.begin() + (size_t)r0 * H, X.begin() + (size_t)(r0 + rows) * H));
+        float *dO = upload(std::vector<float>(pre.begin() + (size_t)r0 * H, pre.begin() + (size_t)(r0 + rows) * H));
+        float *dyu = nullptr, *dys = nullptr;
+        uint16_t *dh = nullptr;
+        CUDA_OK(cudaMalloc((void **)&dyu, (size_t)rows * M * 4));
+        CUDA_OK(cudaMalloc((void **)&dys, (size_t)rows * H * 4));
+        CUDA_OK(cudaMalloc((void **)&dh, (size_t)rows * M * 2));
+        pulsar_rows_moe_shared q{};
+        q.act = PULSAR_FFN_ACT_RELU2;
+        q.up = pulsar_rows_linear{dU, nullptr, 0, H, M, false, true};
+        q.down = pulsar_rows_linear{dD, nullptr, 0, M, H, false, true};
+        q.yu = dyu; q.ys = dys; q.h = dh;   /* no gate, no yg */
+        out r;
+        r.rc = pulsar_rows_moe_shared_launch(&q, dX, rows, dO, 0);
+        r.o = download(dO, (size_t)rows * H);
+        r.yu = download(dyu, (size_t)rows * M);
+        r.ys = download(dys, (size_t)rows * H);
+        r.h = download(dh, (size_t)rows * M);
+        cudaFree(dX); cudaFree(dO); cudaFree(dyu); cudaFree(dys); cudaFree(dh);
+        return r;
+    };
+    const out r = run(T, 0);
+    CHECK(r.rc == 0, "shared relu^2: the launcher refused (rc=%d)", r.rc);
+    std::vector<double> y, env;
+    double uworst = 0, dworst = 0;
+    size_t uover = 0, hbad = 0, dover = 0, obad = 0;
+    ref_linear(U.data(), X.data(), 0, T, H, M, y, env);
+    uover = over_env(r.yu.data(), y, env, (size_t)T * M, &uworst);
+    for (size_t i = 0; i < (size_t)T * M; i++) {
+        const double u = r.yu[i], rl = u > 0 ? u : 0.0, h = rl * rl, got = bf16_val(r.h[i]);
+        const double ulp = ldexp(1.0, (int)floor(log2(fmax(fabs(h), 1e-30))) - 7);
+        hbad += !(fabs(got - h) <= ulp);
+    }
+    ref_linear(D.data(), r.h.data(), 0, T, M, H, y, env);
+    dover = over_env(r.ys.data(), y, env, (size_t)T * H, &dworst);
+    for (size_t i = 0; i < (size_t)T * H; i++) {
+        const float want = pre[i] + r.ys[i];
+        obad += memcmp(&want, &r.o[i], 4) != 0;
+    }
+    size_t inv = 0;
+    for (int t = 0; t < T; t += 5) {
+        const out r1 = run(1, t);
+        inv += memcmp(r1.o.data(), r.o.data() + (size_t)t * H, (size_t)H * 4) != 0;
+    }
+    CHECK(uover == 0 && hbad == 0 && dover == 0 && obad == 0 && inv == 0,
+          "shared relu^2: up %zu / rows %zu / down %zu outside, out != routed + shared at %zu, %zu rows differ alone",
+          uover, hbad, dover, obad, inv);
+    printf("  shared relu^2 (BF16 %d -> %d -> %d, %d rows): up worst %.2e, relu^2 rows within 1 bf16 ulp, down worst "
+           "%.2e, out == the routed sum + the expert bit for bit, rows alone == batched\n", H, M, H, T, uworst, dworst);
+    cudaFree(dU); cudaFree(dD);
+}
+
 static void section_time(void) {
     const int in = 4096, out = 201024;
     uint16_t *dW = nullptr, *dX = nullptr;
@@ -412,6 +477,7 @@ int main(void) {
     section_dense();
     section_routed(PULSAR_FFN_ACT_SWIGLU);
     section_routed(PULSAR_FFN_ACT_RELU2);
+    section_shared_relu2();
     section_time();
     printf(g_fail ? "BF16-ROWS GATE FAIL\n" : "BF16-ROWS GATE PASS\n");
     return g_fail;

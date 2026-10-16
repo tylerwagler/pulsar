@@ -217,7 +217,9 @@ static void part_chunks(pulsar_engine *e, int W, bool explicit_chunk) {
     }
     /* C3: the resume */
     for (int decoded : {0, 3}) {
-        const int k = N - 37;                                   /* Q shares P[0:k], then its own tail */
+        /* Q shares P[0:k], then its own tail: k past P's last grid point (the checkpoint the resume takes) and short
+         * of N, whatever N's length on the family's tokenizer (Inkling's P ends 32 past the grid) */
+        const int k = N / (int)grid * (int)grid + (N % (int)grid) / 2;
         pulsar_tokens Q = {0};
         for (int i = 0; i < k; i++) pulsar_tokens_push(&Q, P.v[i]);
         for (int i = 0; i < 60; i++) pulsar_tokens_push(&Q, P.v[(i * 7) % 200]);
@@ -908,8 +910,10 @@ static bool spec_generate(pulsar_session *s, int n, char *err, size_t errlen) {
 }
 
 static void part_spec_lookahead(pulsar_engine *e) {
-    CHECK(pulsar_engine_has_spec_rounds(e), "S1 the family speculates (a drafter behind the round API)");
-    if (!pulsar_engine_has_spec_rounds(e)) return;
+    if (!pulsar_engine_has_spec_rounds(e)) {   /* as B6 / S2: a model without a drafter has no round to re-arm */
+        printf("  skip  S1 (no drafter on this model: nothing speculates)\n");
+        return;
+    }
     pulsar_tokens A = text_tokens(e, "The lighthouse keeper counted the ships every evening, writing each name in a small");
     pulsar_tokens B = text_tokens(e, "def fibonacci(n):\n    \"\"\"Return the n-th Fibonacci number.\"\"\"\n    if n < 2:\n        return");
     pulsar_tokens more = text_tokens(e, " book. One night a ship came in without a name, and he wrote");

@@ -330,9 +330,11 @@ extern "C" int pulsar_router_select_launch(const pulsar_router_cfg *c, const pul
                                                                               weights, gammas, probs);               \
         return launch_ok("select") ? 0 : -3;                                                                          \
     }
-    /* the routers the engine serves: Qwen3.8-Flash-Next 512 / top-10; DeepSeek V4.1's 384 / top-6 target, 0731's
-     * 256 / top-6 target (and Inkling-Small's 256 / top-6) and V4.1's 128 / top-3 DSpark drafter */
+    /* the routers the engine serves: Qwen3.8-Flash-Next 512 / top-10; Nemotron 3.5 Super's 512 / top-22 (L296 N4);
+     * DeepSeek V4.1's 384 / top-6 target, 0731's 256 / top-6 target (and Inkling-Small's 256 / top-6) and V4.1's
+     * 128 / top-3 DSpark drafter */
     PULSAR_ROUTER_ARM(512, 10)
+    PULSAR_ROUTER_ARM(512, 22)
     PULSAR_ROUTER_ARM(384, 6)
     PULSAR_ROUTER_ARM(256, 6)
     PULSAR_ROUTER_ARM(128, 3)
