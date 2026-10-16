@@ -21,6 +21,7 @@
 #include "mmq/ds4_exl3_dense.cuh"
 #include "mmq/exl3_moe.cuh"
 #include "pulsar_cuda_bf16_rows.cuh"
+#include "pulsar_cuda_nvfp4.h"
 #include "pulsar_cuda_rowops.h"
 #ifdef PULSAR_HAVE_MMQ
 #include "mmq/pulsar_tessera.h"
@@ -189,12 +190,13 @@ extern "C" int pulsar_rows_linear_launch(const pulsar_rows_linear *l, const uint
         fprintf(stderr, "pulsar: qwen linear: no weight or no bf16 activation of width %d -- refusing\n", l ? l->in : -1);
         return -1;
     }
-    if (l->bf16) {                          /* L295 F7: a BF16 weight (pulsar_cuda_bf16_rows.cuh); needs no workspace */
-        if (l->k2 || l->sf) {
-            fprintf(stderr, "pulsar: rows linear: a %d->%d BF16 weight with an EXL3 rate or an E8M0 plane -- refusing\n",
-                    l->in, l->out);
+    if (l->bf16 || l->nvfp4) {              /* L295 F7 / L298: a BF16 / nvfp4 weight; needs no workspace */
+        if (l->k2 || l->sf || (l->bf16 && l->nvfp4)) {
+            fprintf(stderr, "pulsar: rows linear: a %d->%d BF16 / nvfp4 weight with an EXL3 rate, an E8M0 plane or both "
+                            "flags -- refusing\n", l->in, l->out);
             return -1;
         }
+        if (l->nvfp4) return pulsar_nvfp4_rows_linear_launch(l->w, x_bf16, rows, l->in, l->out, y, nullptr, stream);
         return pulsar_bf16_rows_linear_launch(l->w, x_bf16, rows, l->in, l->out, y, l->prompt, stream);
     }
     if (l->k2 == 0) {                       /* the recipe's mxfp8_lt dense tier */
@@ -255,6 +257,10 @@ static int rows_multi(const pulsar_rows_linear *const *ls, int n, const uint16_t
         return -1;
     for (int j = 0; j < n; ++j) {   /* the mxfp8_lt / BF16 tiers, one by one (their own arms) */
         const pulsar_rows_linear *l = ls[j];
+        if (l->nvfp4 && yb) {   /* L298: the nvfp4 kernel emits the bf16 rows in its epilogue (every row kind) */
+            if (pulsar_nvfp4_rows_linear_launch(l->w, x_bf16, rows, l->in, l->out, nullptr, yb[j], stream) != 0) return -1;
+            continue;
+        }
         if (!l->k2 && pulsar_rows_linear_launch(l, x_bf16, rows, y[j], ws, ws_bytes, stream) != 0) return -1;
         if (yb && (!l->k2 || l->prompt) &&
             pulsar_rows_emit_bf16_launch(y[j], (uint64_t)l->out, (uint32_t)rows, (uint32_t)l->out, NULL,
