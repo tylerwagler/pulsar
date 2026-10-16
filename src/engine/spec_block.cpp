@@ -123,6 +123,8 @@ bool pulsar_block_drafter_read(const pulsar_model *m, pulsar_block_drafter *d) {
                       : d->mask_id < 0 || (uint32_t)d->mask_id >= d->vocab ? "a mask token inside the vocabulary"
                                                                            : NULL;
     if (why) return refuse("the declaration (lilicorr.*) is outside what the blocks implement: %s%s", why);
+    d->ops = PULSAR_BLOCK_DRAFTER_OPS;
+    d->ops.depth = d->ops.depth_max = d->block - 1u;   /* a chain is the block's mask slots */
     return true;
 }
 
@@ -168,7 +170,9 @@ pulsar_gqa_layer gqa_decl(const pulsar_block_drafter *d, const uint16_t *qn, con
     L.n_q = d->n_head;
     L.n_kv = d->n_kv;
     L.head_dim = d->head_dim;
-    L.kv_fmt = PULSAR_GQA_KV_BF16;
+    /* E4M3 K / V at unit scale: the drafter was served (and its acceptance measured) with vLLM's fp8_e4m3 KV cache,
+     * whose rounding cuts the attention's distance to it 4x against bf16 rows (L298 head grade); half the ring too */
+    L.kv_fmt = PULSAR_GQA_KV_E4M3;
     L.span = PULSAR_GQA_WINDOW;
     L.window = d->window;
     L.scale = (float)(1.0 / sqrt((double)d->head_dim));
@@ -365,6 +369,45 @@ namespace {
 
 pulsar_block_lane *LANE(const pulsar_session *s) { return s->driver ? s->driver->block : NULL; }
 
+/* ---- the reference grade's dump (diagnostic: PULSAR_BLOCK_DUMP=<dir>, read once) ------------------------------------
+ * What tools/blockdraft/ref.py replays against the PyTorch reference of the drafter: every absorbed context row (its
+ * bank, position and taps) to <dir>/ctx.bin, and the first PULSAR_BLOCK_DUMP_PASSES (default 8) draft passes (their
+ * banks, carries, positions, each row's final hidden and top-k) to <dir>/draft.bin.  Little-endian records:
+ *   ctx    u32 n, i32 pos[n], i32 bank[n], u32 width, bf16 taps[n][width]
+ *   draft  u32 nb, u32 block, u32 hidden, u32 topk, i32 bank[nb], i32 carry[nb], i32 P[nb],
+ *          bf16 o[nb block][hidden], i32 ids[nb block][topk], f32 lp[nb block][topk] */
+const char *dump_dir() {
+    static const char *dir = NULL;
+    static bool read = false;
+    if (!read) {
+        read = true;
+        const char *v = getenv("PULSAR_BLOCK_DUMP");
+        dir = v && v[0] ? v : NULL;
+        if (dir) fprintf(stderr, "pulsar: block drafter: dumping context rows and draft passes to %s\n", dir);
+    }
+    return dir;
+}
+FILE *dump_open(const char *name) {
+    char p[1024];
+    snprintf(p, sizeof p, "%s/%s", dump_dir(), name);
+    return fopen(p, "ab");
+}
+
+void dump_ctx(pulsar_block_lane *l, uint32_t row0, const int32_t *pos, const int32_t *bank, uint32_t n) {
+    if (!dump_dir() || n == 0) return;
+    std::vector<uint16_t> taps((size_t)n * l->tap_width);
+    if (!pulsar_gpu_tensor_read(l->taps, (uint64_t)row0 * l->tap_width * 2u, taps.data(), taps.size() * 2u)) return;
+    FILE *f = dump_open("ctx.bin");
+    if (!f) return;
+    const uint32_t w = (uint32_t)l->tap_width;
+    fwrite(&n, 4, 1, f);
+    fwrite(pos, 4, n, f);
+    fwrite(bank, 4, n, f);
+    fwrite(&w, 4, 1, f);
+    fwrite(taps.data(), 2, taps.size(), f);
+    fclose(f);
+}
+
 const void *wp(const pulsar_session *s, const pulsar_tensor *t, const char *what) {
     return pulsar_weight_device_ptr(&s->engine->model, t, what);
 }
@@ -418,6 +461,7 @@ bool absorb_rows(pulsar_session *s, uint32_t row0, const int32_t *pos, const int
     const uint16_t *hn = (const uint16_t *)wp(s, d->hidden_norm, "drafter hidden_norm");
     pulsar_gpu_tensor *anchor = pulsar_state_tensor(ss, ss->plan->n_trunk, d->decl_anchor);
     if (!hn || !anchor) return fail("the drafter's context norm or anchor state is missing");
+    dump_ctx(l, row0, pos, bank, n);
     for (uint32_t p0 = 0; p0 < n; p0 += kAbsorbRows) {
         const uint32_t m = std::min(kAbsorbRows, n - p0);
         const uint16_t *x = (const uint16_t *)dptr(l->taps) + (uint64_t)(row0 + p0) * l->tap_width;
@@ -603,9 +647,36 @@ bool draft_pass(pulsar_session *s, const uint32_t *banks, const int32_t *carry, 
     if (pulsar_rows_topk_logprob_launch(logits, V, R, V, d->topk, (int32_t *)(base + D.top_id),
                                         (float *)(base + D.top_lp), 0) != 0)
         return fail("the candidates' top-k refused");
-    return (pulsar_gpu_tensor_read(l->arena, D.top_id, l->top_id.data(), (uint64_t)R * d->topk * 4u) &&
-            pulsar_gpu_tensor_read(l->arena, D.top_lp, l->top_lp.data(), (uint64_t)R * d->topk * 4u)) ||
-           fail("could not read the candidates");
+    if (!pulsar_gpu_tensor_read(l->arena, D.top_id, l->top_id.data(), (uint64_t)R * d->topk * 4u) ||
+        !pulsar_gpu_tensor_read(l->arena, D.top_lp, l->top_lp.data(), (uint64_t)R * d->topk * 4u))
+        return fail("could not read the candidates");
+    if (dump_dir()) {
+        static int passes = -1;
+        if (passes < 0) {
+            const char *v = getenv("PULSAR_BLOCK_DUMP_PASSES");
+            passes = v && v[0] ? atoi(v) : 8;
+        }
+        FILE *f = passes > 0 ? dump_open("draft.bin") : NULL;
+        std::vector<uint16_t> o((size_t)R * E);
+        if (f && pulsar_gpu_tensor_read(l->arena, D.x, o.data(), o.size() * 2u)) {
+            passes--;
+            int32_t bk[kDraftRows], P[kDraftRows];
+            for (uint32_t i = 0; i < nb; i++) {
+                bk[i] = (int32_t)banks[i];
+                P[i] = (int32_t)ss->bank_pos[banks[i]];
+            }
+            const uint32_t hdr[4] = {nb, B, E, d->topk};
+            fwrite(hdr, 4, 4, f);
+            fwrite(bk, 4, nb, f);
+            fwrite(carry, 4, nb, f);
+            fwrite(P, 4, nb, f);
+            fwrite(o.data(), 2, o.size(), f);
+            fwrite(l->top_id.data(), 4, (size_t)R * d->topk, f);
+            fwrite(l->top_lp.data(), 4, (size_t)R * d->topk, f);
+        }
+        if (f) fclose(f);
+    }
+    return true;
 }
 
 /* The chains of n banks, kDraftRows / block banks a pass: record i's carry at its bank's next position, its drafts
@@ -763,12 +834,13 @@ int block_draft_batch(pulsar_session *s, pulsar_spec_round **rounds, const uint3
 
 }  // namespace
 
-/* The drafter's numbers: a chain is the block's slots (block - 1: LiLiCorr's 7), every slot kept (no stop rule: the
- * block drafts every slot in its one pass, so a slot costs only its verify row), no adaptive depth. */
+/* The drafter's numbers: a chain is the block's slots (block - 1: LiLiCorr's 7; set per declaration in its copy,
+ * pulsar_block_drafter::ops), every slot kept (no stop rule: the block drafts every slot in its one pass, so a slot
+ * costs only its verify row), no adaptive depth. */
 const pulsar_drafter_ops PULSAR_BLOCK_DRAFTER_OPS = {
     /* .name          = */ "block",
-    /* .depth         = */ PULSAR_BLOCK_SIZE_MAX - 1u,
-    /* .depth_max     = */ PULSAR_BLOCK_SIZE_MAX - 1u,
+    /* .depth         = */ 0u,
+    /* .depth_max     = */ 0u,
     /* .tau           = */ 0.0f,
     /* .adapt         = */ NULL,
     /* .prime         = */ NULL,   /* the context is absorbed with the trunk's every step */

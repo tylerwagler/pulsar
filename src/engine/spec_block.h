@@ -83,6 +83,9 @@ typedef struct pulsar_block_drafter {
     const pulsar_tensor *embed;  ///< the TARGET's input embedding, bf16 [vocab rows of hidden] (the family's)
     /* the state plan's ids (pulsar_block_drafter_plan) */
     uint32_t decl_kv, decl_anchor;
+    /** The round API's drafter for this declaration (pulsar_block_drafter_read: PULSAR_BLOCK_DRAFTER_OPS at a chain of
+     *  the block's block - 1 slots) -- the engine's drafter_ops points here. */
+    pulsar_drafter_ops ops;
 } pulsar_block_drafter;
 
 /** Read the declaration from the container's lilicorr.* keys and check every number the blocks implement.  false =
@@ -98,7 +101,8 @@ void pulsar_block_drafter_plan(pulsar_engine *e, pulsar_state_plan *p);
 /** The announce line's words for the loaded drafter. */
 void pulsar_block_drafter_describe(const pulsar_block_drafter *d, char *out, size_t cap);
 
-/** The round API's drafter (spec_ops.h). */
+/** The round API's drafter (spec_ops.h): the functions; a loaded drafter's numbers are its own copy's
+ *  (pulsar_block_drafter::ops). */
 extern const pulsar_drafter_ops PULSAR_BLOCK_DRAFTER_OPS;
 
 /* ---- the lane: the per-session buffers (pulsar_driver_state::block) -------------------------------------------- */

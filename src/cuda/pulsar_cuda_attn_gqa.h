@@ -52,9 +52,14 @@
  * KV rows (one per token per layer, the caller owns the pools; F3 will):
  *   BF16  K head 0 .. K head n_kv-1, then V head 0 .. V head n_kv-1, each
  *         head_dim bf16 -- n_kv * 2 * head_dim * 2 B per token.
- *   (the FP8 seam: an E4M3 row with one E8M0 per 32 elements, data then
- *   scales as the window rows of pulsar_gpu.h, is a pulsar_gqa_kv_fmt value,
- *   a row-bytes line and a tile loader -- the kernels read rows through it.)
+ *   E4M3  (L298) the same order, each element ONE E4M3 byte at scale 1.0 (the
+ *         stored bf16 value converted with satfinite rounding; vLLM's
+ *         kv_cache_dtype fp8_e4m3 with unit k / v scales) -- n_kv * 2 *
+ *         head_dim B per token.  The tile loader widens it to bf16 (exact);
+ *         a call's own rows are read in the same format, so every key and
+ *         value the attention sees is the stored one.
+ *   (a block-scaled E4M3 row, one E8M0 per 32 elements, would be one more
+ *   value, a row-bytes line and a tile loader.)
  * A FULL sequence's token at position p is slot p (cap = token capacity); a
  * WINDOW sequence's is slot p % cap.  A call's own rows read the keys it
  * produced from its workspace and write the cache AFTER the attention (only
@@ -81,6 +86,7 @@ extern "C" {
 /** The KV row format (the format table's attention-row entry). */
 typedef enum {
     PULSAR_GQA_KV_BF16 = 0,   /**< K then V heads, head_dim bf16 each */
+    PULSAR_GQA_KV_E4M3 = 1,   /**< K then V heads, head_dim E4M3 bytes each, unit scale */
 } pulsar_gqa_kv_fmt;
 
 /** Which keys a row attends. */

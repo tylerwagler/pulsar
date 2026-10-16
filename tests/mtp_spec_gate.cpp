@@ -1,5 +1,7 @@
 /* L296 N9: the chained-MTP drafter (src/engine/spec_mtp.h) on a real container -- any family whose drafter is the MTP
- * lane (Nemotron-H's mini first).  Speculation never changes the output: every check here is the plain decode's bytes.
+ * lane (Nemotron-H's mini first) -- and (L298) the block drafter (src/engine/spec_block.h: LiLiCorr), whose M0 checks
+ * its lane and whose M3 asserts its context rings and anchor equal the plain twin's.  Speculation never changes the
+ * output: every check here is the plain decode's bytes.
  *
  *   ./tests/mtp_spec_gate <model> [tokens] [sections]
  *   ./tests/mtp_spec_gate <model> --probe <ids.bin> <out_dir> [positions]
@@ -39,6 +41,7 @@
 #include "gate_util.h"
 #include "pulsar_engine_internal.h"   /* the drafter's numbers, the pendings, the declared state, the lane's probe */
 #include "spec_mtp.h"
+#include "spec_block.h"
 
 #include <math.h>
 #include <stdio.h>
@@ -409,11 +412,14 @@ static int exact(pulsar_engine *e, int n, const char *only) {
     g_depth0 = e->spec_depth;
     g_cost0 = e->lane_cost[PULSAR_LANE_SPEC];
     /* M0 */
-    CHECK(pulsar_engine_drafter(e) == PULSAR_DRAFTER_MTP && pulsar_engine_has_spec_rounds(e) && g_base &&
-          g_base->absorb_banked == pulsar_mtp_absorb_banked && g_base->draft == pulsar_mtp_draft,
-          "M0 the engine's drafter is the chained-MTP drafter (%s: depth %u, %u max, tau %.2f, adaptive %s)",
-          g_base ? g_base->name : "none", g_base ? g_base->depth : 0u, g_base ? g_base->depth_max : 0u,
-          g_base ? (double)g_base->tau : 0.0, g_base && g_base->adapt ? "on" : "off");
+    const bool block = pulsar_engine_drafter(e) == PULSAR_DRAFTER_BLOCK;
+    CHECK(pulsar_engine_has_spec_rounds(e) && g_base &&
+          (block ? e->block_drafter && g_base == &e->block_drafter->ops && g_base->draft == PULSAR_BLOCK_DRAFTER_OPS.draft
+                 : pulsar_engine_drafter(e) == PULSAR_DRAFTER_MTP && g_base->absorb_banked == pulsar_mtp_absorb_banked &&
+                       g_base->draft == pulsar_mtp_draft),
+          "M0 the engine's drafter is a lane drafter: the %s (%s: depth %u, %u max, tau %.2f, adaptive %s)",
+          block ? "block drafter" : "chained-MTP drafter", g_base ? g_base->name : "none", g_base ? g_base->depth : 0u,
+          g_base ? g_base->depth_max : 0u, g_base ? (double)g_base->tau : 0.0, g_base && g_base->adapt ? "on" : "off");
     if (!g_base) return 1;
     std::vector<pulsar_tokens> P = prompts(e);
     CHECK(P.size() == 4, "M0 four prompts (%zu)", P.size());
@@ -424,10 +430,15 @@ static int exact(pulsar_engine *e, int n, const char *only) {
         char err[256] = "";
         const bool made = pulsar_session_create(&s, e, 4096) == 0 && s;
         const bool synced = made && pulsar_session_sync(s, &P[0], err, sizeof(err)) == 0;
-        const pulsar_mtp_lane *l = made && s->driver ? s->driver->mtp : NULL;
-        CHECK(synced && l && l->modules >= 1 && l->pend_pos[0] == (uint32_t)P[0].len - 1u,
-              "M0 a session builds the lane (%u module(s)) and the prefill parks bank 0's row at %d (%d): %s",
-              l ? l->modules : 0u, P[0].len - 1, l ? (int)l->pend_pos[0] : -2, err);
+        if (block) {
+            CHECK(synced && s->driver->block && !s->driver->mtp,
+                  "M0 a session builds the block drafter's lane (no MTP lane) and the prefill absorbs its context: %s", err);
+        } else {
+            const pulsar_mtp_lane *l = made && s->driver ? s->driver->mtp : NULL;
+            CHECK(synced && l && l->modules >= 1 && l->pend_pos[0] == (uint32_t)P[0].len - 1u,
+                  "M0 a session builds the lane (%u module(s)) and the prefill parks bank 0's row at %d (%d): %s",
+                  l ? l->modules : 0u, P[0].len - 1, l ? (int)l->pend_pos[0] : -2, err);
+        }
         if (s) pulsar_session_free(s);
     }
     /* M1, M2: plain references */
@@ -513,7 +524,11 @@ static int exact(pulsar_engine *e, int n, const char *only) {
                   tdiff.empty() ? "" : "; differs: ", tdiff.c_str());
             const std::string ddiff = state_diff(bank_state(sp_s, 0, p->n_trunk, p->n_slots, len - 1u),
                                                  bank_state(tw, 0, p->n_trunk, p->n_slots, len - 1u), &nd);
-            if (sp_s->driver->mtp->ops->row_exact)
+            if (block)   /* L298: the context rings and the anchor -- a rejected row never enters them, every context
+                          * row is the decode arms' (M-independent) bytes: the plain twin's exactly */
+                CHECK(ddiff.empty(), "M3 prompt %zu: the block drafter's context (its K|V rings and anchor) == the plain "
+                      "twin's, byte for byte (%zu bytes%s%s)", i, nd, ddiff.empty() ? "" : "; differs: ", ddiff.c_str());
+            else if (sp_s->driver->mtp->ops->row_exact)
                 CHECK(ddiff.empty(), "M3 prompt %zu: the drafter's slot (its pool rows and the parked row) == the plain "
                       "twin's, byte for byte (%zu bytes%s%s)", i, nd, ddiff.empty() ? "" : "; differs: ", ddiff.c_str());
             else   /* the family declares its module rows row-count dependent (pulsar_mtp_ops::row_exact): graded */

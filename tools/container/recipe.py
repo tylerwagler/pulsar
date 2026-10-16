@@ -17,7 +17,7 @@ read from.  A JSON object:
                        pattern: the escape hatch for what no role says.
 
 Rules (Qwen's, kept and now everyone's): every emitted tensor matches EXACTLY ONE row; a row that matches nothing
-refuses.  FORMAT is an engine layout name (bf16, mxfp8_lt, cutlass_mxfp4, exl3m_k2 .. k8, fp8_e4m3_soa_k, i32 ...),
+refuses.  FORMAT is an engine layout name (bf16, mxfp8_lt, cutlass_mxfp4, nvfp4, exl3m_k2 .. k8, fp8_e4m3_soa_k, i32 ...),
 `native` (the source's own dtype: bf16 / f32 / i32), `tessera` (Tessera planes; the producer lands with L255), or a
 consumed format that writes no container tensor (ple_rows, kv, omit).  SOURCE names a source the build was given:
 hf (default), exl3 (default for the EXL3 formats), exl3_experts, tessera (default for tessera).  Which formats a
@@ -34,7 +34,7 @@ import exl3_rates
 
 SCHEMA = "pulsar.recipe.v1"
 CONSUMED = ("ple_rows", "kv", "omit")
-FORMATS = {"native", "bf16", "f32", "i32", "mxfp8_lt", "fp8_e4m3_soa_k", "cutlass_mxfp4", "tessera",
+FORMATS = {"native", "bf16", "f32", "i32", "mxfp8_lt", "fp8_e4m3_soa_k", "cutlass_mxfp4", "nvfp4", "tessera",
            *exl3_rates.K2, *CONSUMED}
 SOURCES = ("hf", "exl3", "exl3_experts", "tessera")
 BLOCKS = ("layers", "mtp")
