@@ -6,5 +6,6 @@ GGUF-era tensor names.  Since L279 the builder reads neither: `--format-map` (an
 `names.py`) is gone -- formats are recipe rows (`pulsar.recipe.v1`, `recipe.py`).  Whether the 91 IQ2 rows get a
 producer or the map retires is L279 step 7.  `qwen38fn-*.json` are the Qwen recipes (pulsar.recipe.v1, name rows).
 `inkling-*.json` are the Inkling recipes (role rows): `inkling-bf16` the BF16 reference container of any Inkling
-checkpoint, `inkling-mini-k3` the 3-layer mini on its K3 EXL3 pack (L294).
+checkpoint, `inkling-mini-k3` the 3-layer mini on its K3 EXL3 pack (L294).  `nemotron_h-bf16` is the BF16 reference
+container of any Nemotron-H Omni checkpoint (role rows; the vision tower consumed by name -- L296 N1).
 The scripts that produced them were archived 2026-09-24 (tag `archive/gguf-tooling-2026-09-24`).

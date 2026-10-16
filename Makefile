@@ -164,7 +164,7 @@ LIB_HDRS = src/lib/pulsar_help.h src/lib/pulsar_kvtext.h src/lib/pulsar_segstore
 # kit, the Qwen and Inkling renderers and parser configurations: each family loads its tokenizer at open and the engine's
 # tokenizer entries dispatch to it, so every target linking $(CORE_OBJS) references it.
 FRONTEND_OBJS = src/lib/bpe_tokenizer.o src/lib/pyjson.o src/lib/qwen_chat.o src/lib/qwen_output.o src/lib/out_parse_kit.o \
-                src/lib/inkling_chat.o
+                src/lib/inkling_chat.o src/lib/nemotron_chat.o
 CORE_OBJS = $(ENGINE_OBJS) $(CUDA_OBJS) $(CUTLASS_CUDA_OBJS) $(MMQ_OBJS) src/lib/pulsar_json.o $(FRONTEND_OBJS) $(TP_OBJS)
 
 # ---------------------------------------------------------------------------
@@ -996,6 +996,18 @@ inkling-family-gate: tests/inkling_family_gate tests/loader_open
 	python3 tests/inkling_family_gate.py --probe ./tests/inkling_family_gate --open ./tests/loader_open \
 	    --work $(LOADER_CONTRACT_WORK)/inkling $(INKLING_GATE_MODEL)
 	python3 tests/loader_contract.py --open ./tests/loader_open --work $(LOADER_CONTRACT_WORK) $(INKLING_GATE_MODEL)
+# L296 N1: the Nemotron-H family's load on a built container (tests/nemotron_family_gate.{cpp,py}), as Inkling's above:
+# every tensor bound by its bind record, every byte priced, the grouped plan ({Mamba-2 | attention} x {MoE | none}), the
+# drafter, the facts, the tokenizer + chat front, the session refusals -- on the container and its header clone; then
+# each Nemotron-H mutant refused by name, and the loader contract's neutral faults.  Host-only.  The container: the
+# 5-block BF16 mini (tools/nemotron/make_mini.py), built by tools/container/build.py emit --hf
+# /mnt/models/nemotron35-mini --recipe format-maps/nemotron_h-bf16.json --all.
+NEMOTRON_GATE_MODEL ?= /mnt/models/nemotron35-mini-pulsar
+.PHONY: nemotron-family-gate
+nemotron-family-gate: tests/nemotron_family_gate tests/loader_open
+	python3 tests/nemotron_family_gate.py --probe ./tests/nemotron_family_gate --open ./tests/loader_open \
+	    --work $(LOADER_CONTRACT_WORK)/nemotron $(NEMOTRON_GATE_MODEL)
+	python3 tests/loader_contract.py --open ./tests/loader_open --work $(LOADER_CONTRACT_WORK) $(NEMOTRON_GATE_MODEL)
 tp-plan-golden: tests/tp_plan_test
 	@mkdir -p tests/tp-plan-golden; for m in $(TP_PLAN_MODELS); do for r in 0 1; do \
 	  g=tests/tp-plan-golden/$$(basename $$m)-r$$r.txt; \
@@ -1065,6 +1077,23 @@ tests/inkling_chat_gate: tests/inkling_chat_gate.cpp tests/bpe_gate_util.h $(INK
 .PHONY: inkling-chat-gate
 inkling-chat-gate: tests/inkling_chat_gate
 	./tests/inkling_chat_gate --tok $(INKLING_TOK_DIR) --vectors tests/test-vectors/inkling \
+	    --cases $(QWEN_RENDER_CASES) --calib $(QWEN_CALIB)
+
+# L296 N8: the Nemotron-H frontend -- the shared BPE engine in its HF "tekken" configuration (no normaliser,
+# ignore_merges) graded against HF tokenizers, the ChatML + <think> renderer against the checkpoint's
+# chat_template.jinja through transformers, the output-parser kit's Nemotron configuration against vLLM's nemotron_v3
+# parser engine (goldens from tests/nemotron/gen_nemotron_goldens.py).  Model-free; the inputs are the checkpoint's
+# tokenizer files and the L216 corpus.
+NEMOTRON_TOK_DIR ?= /mnt/models/nemotron35-super-vl-bf16
+NEMOTRON_CHAT_SRCS = src/lib/bpe_tokenizer.cpp src/lib/pyjson.cpp src/lib/nemotron_chat.cpp src/lib/qwen_output.cpp \
+                     src/lib/out_parse_kit.cpp
+tests/nemotron_chat_gate: tests/nemotron_chat_gate.cpp tests/bpe_gate_util.h $(NEMOTRON_CHAT_SRCS) src/lib/bpe_tokenizer.h \
+                          src/lib/bpe_unicode_tables.inc src/lib/pyjson.h src/lib/nemotron_chat.h src/lib/qwen_chat.h \
+                          src/lib/out_parse_kit.h src/lib/pulsar_utf8.h src/lib/sha1.hpp Makefile
+	$(CXX) $(CXXFLAGS) -Isrc -Isrc/lib -o $@ tests/nemotron_chat_gate.cpp $(NEMOTRON_CHAT_SRCS)
+.PHONY: nemotron-chat-gate
+nemotron-chat-gate: tests/nemotron_chat_gate
+	./tests/nemotron_chat_gate --tok $(NEMOTRON_TOK_DIR) --vectors tests/test-vectors/nemotron_h \
 	    --cases $(QWEN_RENDER_CASES) --calib $(QWEN_CALIB)
 
 # The attention layout table gate (two profiles, one engine) -- HOST ONLY.  The
@@ -1471,7 +1500,7 @@ cuda-reap-router-audit:
 CONTAINER_PY ?= python3
 .PHONY: container-tests
 container-tests:
-	cd tools/container && for t in test_exl3_rates.py test_names.py test_kv.py test_producers.py test_deepseek.py test_qwen.py test_inkling.py; do \
+	cd tools/container && for t in test_exl3_rates.py test_names.py test_kv.py test_producers.py test_deepseek.py test_qwen.py test_inkling.py test_nemotron_h.py; do \
 	  $(CONTAINER_PY) $$t || exit 1; done
 
 # plan-34 phase-2 inc 4: TRUE mixed step — decode banks + one K-row prefill run
@@ -2161,7 +2190,7 @@ GATE_TARGETS = unit-test-gate agent-test-gate \
 # DeepSeek is a 12 GB process over 167 GB of NFS page cache beside a 90 GB engine on unified memory.)
 HOST_GATE_TARGETS = cuda-reap-router-audit vision-layout-gate vision-pixel-gate \
 	vision-codec-gate vision-span-gate vision-visible-gate vision-placeholder-gate vision-qwen-pixel-gate seam-check \
-	exl3-dequant-gate host-checks qwen-chat-gate inkling-chat-gate api-golden-gate sse-golden-gate \
+	exl3-dequant-gate host-checks qwen-chat-gate inkling-chat-gate nemotron-chat-gate api-golden-gate sse-golden-gate \
 	spec-depth-gate \
 	loader-contract-gate render-gate
 # Every gate target is phony, declared HERE where the list is defined (the
@@ -2235,7 +2264,8 @@ gates-preflight:
 
 # The binaries of the serial GPU targets are prerequisites too (2026-10-14): they build here, in one parallel make,
 # instead of one target at a time inside the timed loop (pulsar_test alone was ~40 s of unit-test-gate).
-gates: tests/gates_runner pulsar-eval tests/qwen_chat_gate tests/inkling_chat_gate tests/api_golden tests/sse_golden tests/spec_depth_gate \
+gates: tests/gates_runner pulsar-eval tests/qwen_chat_gate tests/inkling_chat_gate tests/nemotron_chat_gate tests/api_golden \
+       tests/sse_golden tests/spec_depth_gate \
        tests/loader_open pulsar_test pulsar_agent_test pulsar $(CUDA_REGRESSION_BINS)
 	@$(MAKE) --no-print-directory gates-preflight || exit 1
 	@rc=0; passed=""; failed=""; times=""; suite0=$$(date +%s); \
@@ -2351,7 +2381,7 @@ gates-dev:
 	    for p in $$paths; do \
 	      case "$$p" in \
 	        *vision*) cls=vision; vision=1 ;; \
-	        src/engine/family*|src/families/*|src/engine/role_bind*|tests/inkling_*|src/engine/*qwen*|tests/qwen_*|tests/session_contract*|src/engine/state_kinds*|src/engine/step_driver*|tests/state_kinds*|src/engine/session*|src/engine/safetensors*|src/engine/model.cpp|src/engine/weights*|src/engine/tensor_bind*|tests/loader_*|src/engine/sync_driver*|src/engine/prefill_loop*|src/engine/checkpoint*|src/engine/kv_state*) cls=engine; family=1 ;; \
+	        src/engine/family*|src/families/*|src/engine/role_bind*|tests/inkling_*|tests/nemotron_*|src/engine/*qwen*|tests/qwen_*|tests/session_contract*|src/engine/state_kinds*|src/engine/step_driver*|tests/state_kinds*|src/engine/session*|src/engine/safetensors*|src/engine/model.cpp|src/engine/weights*|src/engine/tensor_bind*|tests/loader_*|src/engine/sync_driver*|src/engine/prefill_loop*|src/engine/checkpoint*|src/engine/kv_state*) cls=engine; family=1 ;; \
 	        *exl3*) cls=exl3; exl3=1 ;; \
 	        *gdn*) cls=gdn; gdn=1 ;; \
 	        *sconv*|*mamba2*|src/cuda/pulsar_cuda_head*|tests/head_*) cls=blocks; blocks=1 ;; \
@@ -2436,6 +2466,7 @@ gates-dev:
 	  $(MAKE) --no-print-directory state-kinds-gate CUDA_ARCH=sm_120f || rc=1; \
 	  $(MAKE) --no-print-directory loader-contract-gate CUDA_ARCH=sm_120f || rc=1; \
 	  $(MAKE) --no-print-directory inkling-family-gate CUDA_ARCH=sm_120f || rc=1; \
+	  $(MAKE) --no-print-directory nemotron-family-gate CUDA_ARCH=sm_120f || rc=1; \
 	fi; \
 	if [ -n "$$sel" ]; then \
 	  hosted=''; if [ $$family -eq 1 ]; then hosted='$(RUNNER_HOSTED_ARGS)'; fi; \
@@ -2805,6 +2836,11 @@ tests/inkling_family_gate.o: tests/inkling_family_gate.cpp src/families/inkling/
 	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -c -o $@ $<
 tests/inkling_family_gate: tests/inkling_family_gate.o $(CORE_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
+tests/nemotron_family_gate.o: tests/nemotron_family_gate.cpp src/families/nemotron_h/nemotron_h.h src/engine/role_bind.h \
+                              src/engine/pulsar_engine_internal.h src/pulsar.h
+	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -c -o $@ $<
+tests/nemotron_family_gate: tests/nemotron_family_gate.o $(CORE_OBJS)
+	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 tests/tp_plan_test.o: tests/tp_plan_test.cpp
 	$(CXX) $(CXXFLAGS) -Isrc -Isrc/engine -c -o $@ $<
 tests/tp_plan_test: tests/tp_plan_test.o src/lib/pulsar_help.o $(CORE_OBJS)
@@ -3092,7 +3128,7 @@ test: pulsar_test seam-check
 clean:
 	rm -rf .build
 	rm -rf tests/runner
-	rm -f tests/gates_runner pulsar pulsar-server pulsar-bench pulsar-eval pulsar-agent pulsar_test pulsar_agent_test src/engine/*.o src/families/*/*.o src/families/*/*.d src/tp/*.o src/agent/*.o src/server/*.o src/cuda/*.o src/cuda/mmq/*.o src/cuda/mmq/test/*.o src/cli/*.o src/lib/*.o src/vendor/*.o tests/*.o src/engine/*.d src/agent/*.d src/server/*.d src/cuda/*.d src/cuda/mmq/*.d src/cuda/mmq/test/*.d src/cli/*.d src/lib/*.d src/vendor/*.d tests/*.d tests/vision_visible_gate tests/vision_hc_gate tests/vision_image_gate tests/vision_placeholder_gate tests/vision_image_sync_gate tests/vision_chunk_gate tests/cuda_long_context_smoke tests/moe_route_bounds_gate tests/expert_table_gate tests/multiseq_frontier_gate tests/multiseq_decode_gate tests/prefill_bitexact_gate tests/bank_spec_gate tests/spec_sampling_gate tests/spec_sampling_gate_wide tests/accounting_gate tests/bank_evict_restore_gate tests/session_payload_gate tests/algo_stability_gate tests/mixed_prefill_gate tests/mixed_zero_prefill_gate tests/fused_step_gate tests/head_graph_replay_gate tests/decode_reference_gate tests/verify_width_probe tests/mixed_neutrality_gate tests/comp_state_gate tests/spec_teacher_forced_probe tests/attn_f16_kernel_test tests/attn_f16_banked_test tests/kv_rows_pack_gate tests/kv_rows_pack_gate_fastmath tests/minp_prefilter_gate tests/dspark_batch_gate tests/nt_crossover_sweep tests/vision_router_gate tests/router_gate tests/bf16_rows_gate tests/qwen_family_gate tests/inkling_family_gate tests/state_kinds_gate tests/payload_frontier_gate tests/prompt_end_gate tests/bank_residency_gate
+	rm -f tests/gates_runner pulsar pulsar-server pulsar-bench pulsar-eval pulsar-agent pulsar_test pulsar_agent_test src/engine/*.o src/families/*/*.o src/families/*/*.d src/tp/*.o src/agent/*.o src/server/*.o src/cuda/*.o src/cuda/mmq/*.o src/cuda/mmq/test/*.o src/cli/*.o src/lib/*.o src/vendor/*.o tests/*.o src/engine/*.d src/agent/*.d src/server/*.d src/cuda/*.d src/cuda/mmq/*.d src/cuda/mmq/test/*.d src/cli/*.d src/lib/*.d src/vendor/*.d tests/*.d tests/vision_visible_gate tests/vision_hc_gate tests/vision_image_gate tests/vision_placeholder_gate tests/vision_image_sync_gate tests/vision_chunk_gate tests/cuda_long_context_smoke tests/moe_route_bounds_gate tests/expert_table_gate tests/multiseq_frontier_gate tests/multiseq_decode_gate tests/prefill_bitexact_gate tests/bank_spec_gate tests/spec_sampling_gate tests/spec_sampling_gate_wide tests/accounting_gate tests/bank_evict_restore_gate tests/session_payload_gate tests/algo_stability_gate tests/mixed_prefill_gate tests/mixed_zero_prefill_gate tests/fused_step_gate tests/head_graph_replay_gate tests/decode_reference_gate tests/verify_width_probe tests/mixed_neutrality_gate tests/comp_state_gate tests/spec_teacher_forced_probe tests/attn_f16_kernel_test tests/attn_f16_banked_test tests/kv_rows_pack_gate tests/kv_rows_pack_gate_fastmath tests/minp_prefilter_gate tests/dspark_batch_gate tests/nt_crossover_sweep tests/vision_router_gate tests/router_gate tests/bf16_rows_gate tests/qwen_family_gate tests/inkling_family_gate tests/nemotron_family_gate tests/state_kinds_gate tests/payload_frontier_gate tests/prompt_end_gate tests/bank_residency_gate
 
 # Pull in the generated header dependencies.  `-include` (not `include`) so a
 # tree with no .d files yet -- a fresh clone, or right after `make clean` -- is

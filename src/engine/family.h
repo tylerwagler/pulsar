@@ -61,15 +61,17 @@ typedef enum : uint8_t {
 /** Printable name of a layer kind ("ds4_block", "qwen_gdn", "qwen_qsa", "blocks"). */
 const char *pulsar_layer_kind_name(pulsar_layer_kind k);
 
-/** L295 E1: the token mixer of a PULSAR_LAYER_BLOCKS layer -- which shared attention span it runs (F1's GQA block:
- *  every key, or a window of the most recent ones).  The family's geometry (heads, widths, score mods) is its own
- *  declaration; this is the plan's fact of WHICH block runs. */
+/** L295 E1: the token mixer of a PULSAR_LAYER_BLOCKS layer -- which shared block it runs (F1's GQA block over every
+ *  key or a window of the most recent ones; L296 the Mamba-2 selective state-space block).  The family's geometry
+ *  (heads, widths, score mods, state size) is its own declaration; this is the plan's fact of WHICH block runs. */
 typedef enum : uint8_t {
     PULSAR_MIXER_NONE        = 0,
     PULSAR_MIXER_ATTN_FULL   = 1,  ///< attention over every earlier key
     PULSAR_MIXER_ATTN_WINDOW = 2,  ///< attention over the last pulsar_layer_desc::window keys (self included)
+    PULSAR_MIXER_MAMBA2      = 3,  ///< L296: a Mamba-2 (SSD) mixer: causal conv + selective scan over a fixed state
 } pulsar_mixer_kind;
-/** L295 E1: the channel mixer of a PULSAR_LAYER_BLOCKS layer. */
+/** L295 E1: the channel mixer of a PULSAR_LAYER_BLOCKS layer.  NONE (L296): the layer is its mixer alone (a Mamba-2
+ *  block with no MoE after it). */
 typedef enum : uint8_t {
     PULSAR_FFN_NONE  = 0,
     PULSAR_FFN_DENSE = 1,  ///< one dense gated MLP
@@ -160,7 +162,7 @@ typedef struct {
 uint32_t pulsar_layer_plan_count(const pulsar_layer_plan *p, pulsar_layer_kind k);
 /** The plan's invariants (L295: one layer-description authority): every layer il < n_layer has a kind
  *  (not NONE, below PULSAR_LAYER_KIND_COUNT); desc[il] is non-zero exactly on a PULSAR_LAYER_BLOCKS layer, whose
- *  mixer and FFN are set and whose window is non-zero exactly on PULSAR_MIXER_ATTN_WINDOW.  NULL when it holds, else
+ *  mixer is set (its FFN may be NONE) and whose window is non-zero exactly on PULSAR_MIXER_ATTN_WINDOW.  NULL when it holds, else
  *  what broke, with the layer in *at_layer.  The engine refuses a load whose plan fails it. */
 const char *pulsar_layer_plan_check(const pulsar_layer_plan *p, uint32_t *at_layer);
 

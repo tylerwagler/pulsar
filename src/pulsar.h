@@ -106,6 +106,7 @@ typedef enum {
     PULSAR_FAMILY_ID_DEEPSEEK4 = 0,  ///< DeepSeek V4 Flash (0731), Vision-Exp, V4.1 Flash
     PULSAR_FAMILY_ID_QWEN4_EXP = 1,  ///< Qwen3.8-Flash-Next (HF model_type qwen4_exp)
     PULSAR_FAMILY_ID_INKLING   = 2,  ///< Thinking Machines' Inkling (HF model_type inkling_mm_model; src/families/inkling)
+    PULSAR_FAMILY_ID_NEMOTRON_H = 3, ///< NVIDIA Nemotron-H (Nemotron 3.5 Super VL; HF nemotron_h_omni; src/families/nemotron_h)
 } pulsar_family_id;
 
 /** The conversation format a front end must render for the loaded model: the
@@ -117,6 +118,7 @@ typedef enum {
     PULSAR_CHAT_DS4_V41 = 1,  ///< DeepSeek V4.1 / Vision-Exp template
     PULSAR_CHAT_QWEN    = 2,  ///< Qwen chat template (L251 S5)
     PULSAR_CHAT_INKLING = 3,  ///< Inkling-Small native renderer (L294 E6: src/lib/inkling_chat)
+    PULSAR_CHAT_NEMOTRON_H = 4,  ///< Nemotron-H ChatML + think-tag renderer (L296 N8: src/lib/nemotron_chat)
 } pulsar_chat_format;
 
 /** The speculative drafter a family's artifacts carry. */

@@ -105,6 +105,15 @@ int qwen_xml_call_body::read_param(const std::string &b, size_t *i, const std::s
         std::string canon;
         pyjson_dump(*v, &canon);
         as_json = v->kind != pyjson_value::STR && canon == text;   /* strings are written raw, never tojson */
+        /* a template that spells scalars with str() wrote no "true" / "false" / "null" */
+        if (python_scalars && (v->kind == pyjson_value::BOOL || v->kind == pyjson_value::NUL)) as_json = false;
+    }
+    if (!as_json && python_scalars && !(type && !strcmp(type, "string")) &&
+        (text == "True" || text == "False" || text == "None")) {
+        *v = pyjson_value();
+        v->kind = text == "None" ? pyjson_value::NUL : pyjson_value::BOOL;
+        v->b = text == "True";
+        return 1;
     }
     if (!as_json) {
         *v = pyjson_value();

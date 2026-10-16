@@ -12,6 +12,7 @@
 #include "lib/pulsar_writeback.h"
 #include "lib/pulsar_segstore.h"
 #include "lib/bpe_tokenizer.h"
+#include "lib/nemotron_chat.h"
 
 #ifdef PULSAR_SERVER_TEST
 
@@ -3723,6 +3724,233 @@ static void test_inkling_tool_error_suffix_reminds_the_system_turn(void) {
                        "\n\nRules here.<|end_message|><|message_model|>";
     TEST_ASSERT(suffix && !strcmp(suffix, want));
     TEST_ASSERT(n_spans == 1);   /* the error text is the tool body: client data */
+    free(suffix);
+    free(spans);
+    free(text);
+    request_free(&r);
+}
+
+
+/* ---- L296 N8: Nemotron-H's server table (family_nemotron_h.cpp over src/lib/nemotron_chat) ---------------------- */
+
+/* Render `msgs` with the Nemotron-H family and no engine; `tools` = an OpenAI tools array (NULL = none).  The
+ * messages are TAKEN.  `r` (optional) receives the request for the hooks. */
+static char *nemotron_test_full_render(chat_msgs *msgs, const char *tools, request *keep = NULL) {
+    chat_conversation c = {};
+    c.msgs = *msgs;
+    memset(msgs, 0, sizeof(*msgs));
+    c.tool_choice = CHAT_TOOL_CHOICE_AUTO;
+    if (tools) c.tools_raw = xstrdup(tools);
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    r.api = API_OPENAI;
+    char err[200] = {0};
+    const bool ok = render_chat_conversation(NULL, PULSAR_CHAT_NEMOTRON_H, NULL, &c, &r, err, sizeof err);
+    if (!ok) fprintf(stderr, "nemotron render refused: %s\n", err);
+    TEST_ASSERT(ok);
+    char *text = xstrdup(r.prompt_text ? r.prompt_text : "");
+    if (keep) *keep = r;
+    else request_free(&r);
+    chat_conversation_free(&c);
+    return text;
+}
+
+/* The one effort table: the template's three levels -- none is thinking off (the closed think block), minimal / low
+ * / medium the medium_effort suffix on the last user message, high / xhigh / max and nothing sent the default. */
+static void test_nemotron_effort_map(void) {
+    struct row { const char *effort; int level; const char *tail; };
+    static const row rows[] = {
+        {"\"none\"", NEMOTRON_EFFORT_NONE, "x<|im_end|>\n<|im_start|>assistant\n<think></think>"},
+        {"\"minimal\"", NEMOTRON_EFFORT_MEDIUM, "x\n\n{reasoning effort: efficient}<|im_end|>\n<|im_start|>assistant\n<think>\n"},
+        {"\"low\"", NEMOTRON_EFFORT_MEDIUM, "x\n\n{reasoning effort: efficient}<|im_end|>\n<|im_start|>assistant\n<think>\n"},
+        {"\"medium\"", NEMOTRON_EFFORT_MEDIUM, "x\n\n{reasoning effort: efficient}<|im_end|>\n<|im_start|>assistant\n<think>\n"},
+        {"\"high\"", NEMOTRON_EFFORT_HIGH, "x<|im_end|>\n<|im_start|>assistant\n<think>\n"},
+        {"\"max\"", NEMOTRON_EFFORT_HIGH, "x<|im_end|>\n<|im_start|>assistant\n<think>\n"},
+        {"40", NEMOTRON_EFFORT_MEDIUM, "x\n\n{reasoning effort: efficient}<|im_end|>\n<|im_start|>assistant\n<think>\n"},
+        {"90", NEMOTRON_EFFORT_HIGH, "x<|im_end|>\n<|im_start|>assistant\n<think>\n"},
+        {"null", NEMOTRON_EFFORT_HIGH, "x<|im_end|>\n<|im_start|>assistant\n<think>\n"},
+    };
+    char body[256], err[256];
+    request r;
+    for (const row &w : rows) {
+        snprintf(body, sizeof body, EFFORT_BODY(",\"reasoning_effort\":%s"), w.effort);
+        TEST_ASSERT(effort_case(PULSAR_CHAT_NEMOTRON_H, body, &r, err, sizeof err));
+        TEST_ASSERT(r.family_effort == w.level);
+        TEST_ASSERT(r.think_mode == (w.level == NEMOTRON_EFFORT_NONE ? PULSAR_THINK_NONE : PULSAR_THINK_DEFAULT));
+        const size_t n = strlen(w.tail), have = r.prompt_text ? strlen(r.prompt_text) : 0;
+        TEST_ASSERT(have >= n && !strcmp(r.prompt_text + have - n, w.tail));
+        request_free(&r);
+    }
+    TEST_ASSERT(effort_case(PULSAR_CHAT_NEMOTRON_H, EFFORT_BODY(",\"chat_template_kwargs\":{\"enable_thinking\":false}"),
+                            &r, err, sizeof err));
+    TEST_ASSERT(r.family_effort == NEMOTRON_EFFORT_NONE && r.think_mode == PULSAR_THINK_NONE);
+    request_free(&r);
+    TEST_ASSERT(!effort_case(PULSAR_CHAT_NEMOTRON_H, EFFORT_BODY(",\"chat_template_kwargs\":{\"medium_effort\":true}"),
+                             &r, err, sizeof err));
+    TEST_ASSERT(strstr(err, "medium_effort") != NULL);   /* the medium level is reasoning_effort's */
+    request_free(&r);
+    TEST_ASSERT(effort_case(PULSAR_CHAT_NEMOTRON_H, EFFORT_BODY(""), &r, err, sizeof err));
+    TEST_ASSERT(!strcmp(r.prompt_text, "<|im_start|>system\n<|im_end|>\n<|im_start|>user\nx<|im_end|>\n"
+                                       "<|im_start|>assistant\n<think>\n"));
+    TEST_ASSERT(r.prompt_n_spans == 1 && r.prompt_spans[0].hi - r.prompt_spans[0].lo == 1);
+    request_free(&r);
+}
+
+/* full(history) + assistant_turn_sampled + tool_result_tail == full(history + turn + results): the hooks are the
+ * renderer's own pieces, in a tool loop (after the last user message: nothing truncates). */
+static void test_nemotron_hooks_compose_to_the_full_render(void) {
+    const char *reasoning = "Let me check both.\n";
+    chat_msgs prefix = {0}, full = {0};
+    for (chat_msgs *m : {&prefix, &full}) {
+        chat_msgs_push(m, qwen_test_msg("system", "Be terse."));
+        chat_msgs_push(m, qwen_test_msg("user", "Weather in Paris and Rome?"));
+    }
+    chat_msg a = qwen_test_msg("assistant", "Checking.\n");
+    a.reasoning = xstrdup(reasoning);
+    qwen_test_call(&a, "call_1", "get_weather", "{\"n\":2,\"city\":\"Paris\"}");
+    qwen_test_call(&a, "call_2", "get_weather", "{\"city\":\"Rome\"}");
+    chat_msgs_push(&full, a);
+    chat_msgs_push(&full, qwen_test_msg("tool", "18C"));
+    full.v[3].tool_call_id = xstrdup("call_1");
+    chat_msgs_push(&full, qwen_test_msg("tool", "  22C\n"));
+    full.v[4].tool_call_id = xstrdup("call_2");
+    chat_msgs_push(&full, qwen_test_msg("system", "Hurry."));   /* a mid-loop system message: a system turn in place */
+
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    r.api = API_OPENAI;
+    r.family = server_family_for_format(PULSAR_CHAT_NEMOTRON_H);
+    r.family_effort = NEMOTRON_EFFORT_HIGH;
+    r.think_mode = PULSAR_THINK_DEFAULT;
+    chat_text_span *turn_spans = NULL, *tail_spans = NULL;
+    uint32_t turn_n = 0, tail_n = 0;
+    char *turn = r.family->assistant_turn_sampled(&r, true, reasoning, "Checking.\n", &full.v[2].calls, &turn_spans,
+                                                  &turn_n);
+    char *tail = r.family->tool_result_tail(&r, &full, 3, &tail_spans, &tail_n);
+    TEST_ASSERT(turn && tail);
+    TEST_ASSERT(turn && !strcmp(turn, "Let me check both.\n</think>Checking.\n<tool_call>\n<function=get_weather>\n"
+                                      "<parameter=n>\n2\n</parameter>\n<parameter=city>\nParis\n</parameter>\n</function>\n"
+                                      "</tool_call>\n<tool_call>\n<function=get_weather>\n<parameter=city>\nRome\n"
+                                      "</parameter>\n</function>\n</tool_call>\n"));
+    const char *want_tail = "<|im_end|>\n<|im_start|>user\n<tool_response>\n18C\n</tool_response>\n<tool_response>\n"
+                            "  22C\n\n</tool_response>\n<|im_end|>\n<|im_start|>system\nHurry.<|im_end|>\n"
+                            "<|im_start|>assistant\n<think>\n";
+    TEST_ASSERT(tail && !strcmp(tail, want_tail));
+    TEST_ASSERT(tail_n == 3);   /* the two results, the system text */
+    char *full_text = nemotron_test_full_render(&full, NULL);
+    char *prefix_text = nemotron_test_full_render(&prefix, NULL);
+    buf composed = {0};
+    buf_puts(&composed, prefix_text);
+    buf_puts(&composed, turn ? turn : "");
+    buf_puts(&composed, tail ? tail : "");
+    TEST_ASSERT(!strcmp(composed.ptr, full_text));
+    /* a stop turn closes itself (its content trimmed at the end, as the template trims the turn) */
+    tool_calls none = {0};
+    char *stop = r.family->assistant_turn_sampled(&r, true, "r", " Done. ", &none, NULL, NULL);
+    TEST_ASSERT(stop && !strcmp(stop, "r</think> Done.<|im_end|>\n"));
+    char *off = r.family->assistant_turn_sampled(&r, false, NULL, "Done.", &none, NULL, NULL);
+    TEST_ASSERT(off && !strcmp(off, "Done.<|im_end|>\n"));
+    /* a thinking-on turn with no reasoning replays as <think></think>, not as the prompt's continuation */
+    TEST_ASSERT(r.family->assistant_turn_sampled(&r, true, NULL, "Done.", &none, NULL, NULL) == NULL);
+    free(stop);
+    free(off);
+    buf_free(&composed);
+    free(full_text);
+    free(prefix_text);
+    free(turn);
+    free(tail);
+    free(turn_spans);
+    free(tail_spans);
+    chat_msgs_free(&full);
+    request_free(&r);
+}
+
+/* Tool memory: the parser records the calls as sampled, the renderer replays them verbatim, the block finder keys
+ * exactly those bytes. */
+static void test_nemotron_raw_calls_replay_and_key(void) {
+    const char *calls = "<tool_call>\n<function=bash>\n<parameter=cmd>\nls   -la\n</parameter>\n</function>\n</tool_call>\n"
+                        "<tool_call>\n<function=bash>\n<parameter=n>\n007\n</parameter>\n</function>\n</tool_call>";
+    const std::string sampled = std::string("Plan it.\n</think>On it.\n") + calls;
+    nemotron_output_parser p;
+    char err[200];
+    TEST_ASSERT(p.init(true, NULL, err, sizeof err));
+    std::vector<out_event> ev;
+    for (size_t i = 0; i < sampled.size(); i++) p.feed(sampled.data() + i, 1, &ev);   /* one byte at a time */
+    p.finish(&ev);
+    TEST_ASSERT(p.calls().size() == 2 && p.errors() == 0);
+    TEST_ASSERT(p.reasoning() == "Plan it." && p.content() == "On it.");   /* trimmed beside the calls */
+    size_t lo = 0, hi = 0;
+    TEST_ASSERT(p.raw_span(&lo, &hi) && sampled.compare(lo, hi - lo, calls) == 0);
+    const server_family_ops *nem = server_family_for_format(PULSAR_CHAT_NEMOTRON_H);
+    const char *end = NULL;
+    TEST_ASSERT(nem->find_call_block(sampled.c_str(), &end) == sampled.c_str() + lo && end == sampled.c_str() + hi);
+    /* the replay: the raw bytes where the calls go, after the content */
+    chat_msgs msgs = {0};
+    chat_msgs_push(&msgs, qwen_test_msg("user", "List."));
+    chat_msg a = qwen_test_msg("assistant", "On it.");
+    a.reasoning = xstrdup("Plan it.");
+    qwen_test_call(&a, "call_1", "bash", "{\"cmd\":\"ls   -la\"}");
+    qwen_test_call(&a, "call_2", "bash", "{\"n\":\"007\"}");
+    a.calls.raw_calls = xstrdup(calls);
+    chat_msgs_push(&msgs, a);
+    chat_msgs_push(&msgs, qwen_test_msg("tool", "ok"));
+    char *text = nemotron_test_full_render(&msgs, NULL);
+    const std::string expect = std::string("<|im_start|>assistant\n<think>\nPlan it.</think>On it.\n") + calls +
+                               "\n<|im_end|>\n<|im_start|>user\n<tool_response>\nok\n</tool_response>\n<|im_end|>\n";
+    TEST_ASSERT(strstr(text, expect.c_str()) != NULL);
+    const char *k = nem->find_call_block(text, &end);
+    TEST_ASSERT(k && std::string(k, (size_t)(end - k)) == calls);
+    TEST_ASSERT(nem->find_call_block(end, &end) == NULL);
+    free(text);
+}
+
+/* What the family does not build refuses by name: a forced tool_choice, an image (N11). */
+static void test_nemotron_refusals(void) {
+    char err[256];
+    request r;
+    const char *forced = "{\"messages\":[{\"role\":\"user\",\"content\":\"x\"}],\"tools\":[{\"type\":\"function\",\"function\":"
+                         "{\"name\":\"f\",\"parameters\":{}}}],\"tool_choice\":\"required\"}";
+    TEST_ASSERT(!effort_case(PULSAR_CHAT_NEMOTRON_H, forced, &r, err, sizeof err));
+    TEST_ASSERT(strstr(err, "forced tool call is not built") != NULL);
+    request_free(&r);
+    const server_family_ops *nem = server_family_for_format(PULSAR_CHAT_NEMOTRON_H);
+    TEST_ASSERT(!nem->forced_call_seed && !nem->forced_call_prefill && !nem->forced_name_open && !nem->forced_name_close);
+    /* auto: the tools block in the system turn */
+    TEST_ASSERT(effort_case(PULSAR_CHAT_NEMOTRON_H, "{\"messages\":[{\"role\":\"user\",\"content\":\"x\"}],\"tools\":"
+                            "[{\"type\":\"function\",\"function\":{\"name\":\"f\",\"parameters\":{}}}]}", &r, err, sizeof err));
+    const char *declared = "<|im_start|>system\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n"
+                           "<function>\n<name>f</name>\n<parameters>\n</parameters>\n</function>\n</tools>";
+    TEST_ASSERT(r.has_tools && !strncmp(r.prompt_text, declared, strlen(declared)));
+    request_free(&r);
+    chat_msgs msgs = {0};
+    chat_msgs_push(&msgs, qwen_test_image_msg("user", "Look: ", ""));
+    chat_conversation c = {};
+    c.msgs = msgs;
+    request_init(&r, REQ_CHAT, 16);
+    TEST_ASSERT(!render_chat_conversation(NULL, PULSAR_CHAT_NEMOTRON_H, NULL, &c, &r, err, sizeof err));
+    TEST_ASSERT(strstr(err, "vision front (N11)") != NULL);
+    request_free(&r);
+    chat_conversation_free(&c);
+}
+
+/* The model-visible retry: the turn's close, ONE tool result (the error, the system turn reminded), the generation
+ * prompt. */
+static void test_nemotron_tool_error_suffix_reminds_the_system_turn(void) {
+    chat_msgs msgs = {0};
+    chat_msgs_push(&msgs, qwen_test_msg("system", "Rules here."));
+    chat_msgs_push(&msgs, qwen_test_msg("user", "Hi"));
+    request r;
+    char *text = nemotron_test_full_render(&msgs, NULL, &r);
+    thinking_state st = {};
+    chat_text_span *spans = NULL;
+    uint32_t n_spans = 0;
+    char *suffix = r.family->tool_error_suffix(&r, &st, "unterminated tool call 0", &spans, &n_spans);
+    const char *want = "<|im_end|>\n<|im_start|>user\n<tool_response>\nTool error: malformed tool call: unterminated "
+                       "tool call 0\nThe previous assistant output was not executed because its <tool_call> block was "
+                       "malformed. Emit a new valid <tool_call>, or answer normally if no tool is needed.\n\nSystem "
+                       "prompt reminder:\nRules here.\n</tool_response>\n<|im_end|>\n<|im_start|>assistant\n<think>\n";
+    TEST_ASSERT(suffix && !strcmp(suffix, want));
+    TEST_ASSERT(n_spans == 1);
     free(suffix);
     free(spans);
     free(text);
@@ -9080,6 +9308,11 @@ static void pulsar_server_unit_tests_run(void) {
     test_inkling_raw_calls_replay_and_key();
     test_inkling_refusals();
     test_inkling_tool_error_suffix_reminds_the_system_turn();
+    test_nemotron_effort_map();
+    test_nemotron_hooks_compose_to_the_full_render();
+    test_nemotron_raw_calls_replay_and_key();
+    test_nemotron_refusals();
+    test_nemotron_tool_error_suffix_reminds_the_system_turn();
     test_anthropic_turn_render_is_stable_across_the_next_user_turn();
     test_live_tail_joins_before_a_committed_stop();
     test_anthropic_tool_result_id_validation();
