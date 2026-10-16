@@ -17,7 +17,7 @@
  *   x       = output_norm(x);  a = anchor_norm(a)
  *   g       = silu(factor_input_proj [x | a | x * a])       (vLLM splits the [1024][3072] weight into three GEMMs
  *             and rounds each partial to bf16; here ONE GEMM over the concatenated row, f32 throughout -- closer to
- *             the exact sum, inside the head's bf16 noise floor)
+ *             the exact sum, inside the head's bf16 noise floor; approved for L298)
  *   out, in = normalize(out_head g), normalize(in_head g)      (L2, eps 1e-4)
  *   start[j] = normalize(anchor_out_head a) . in[0,j];   pair[s][i][j] = out[s,i] . in[s+1,j]
  *   scores  = 8 * [ start broadcast over the 8 rows of slot 0 ; pair ]               [7][8][8] f32
@@ -25,21 +25,22 @@
  *           prev = j                                                  (triton tl.max(return_indices): ties to the left)
  *
  * NUMERICS: bf16 activations rounded where vLLM's torch ops round them (each Linear's output once -- f32 accumulate,
- * bias and the NVFP4 global scale in f32, one bf16 rounding; each residual add; each norm), f32 accumulation
- * everywhere.  The scores are graded against vLLM's within rounding, the chain exactly.
+ * the bias added in f32, one bf16 rounding; each residual add; each norm), f32 accumulation everywhere.  The scores
+ * agree with vLLM's to the head's bf16 noise floor (vLLM's own scores sit ~0.5 logits from an all-f32 head); the chain
+ * is graded exactly wherever vLLM's decision margin is above that floor (the L298 grading rule).
  *
- * LIBRARIES: every Linear is the BF16 rows arm's cuBLASLt GEMM (pulsar_bf16_rows_linear_launch, prompt = the
- * fixed-order kernel per shape); the lattice attention's Q K^T and P V are strided-batched cuBLASLt GEMMs
- * (pulsar_gpu_bf16_batched_gemm, no workspace).  The glue no library covers is this TU's: the candidate gather and
- * features, the epilogues (bias, global scale, residual, norm, activation, head-major split), the biased softmax, the
- * normalize-and-dot scores and the walk.  No host sync, no allocation: graphable.
+ * LIBRARIES: every Linear goes through the rows front door (pulsar_rows_linear_launch): an `nvfp4` weight takes the
+ * NVFP4 W4A16 rows arm (pulsar_cuda_nvfp4.h, the global scale applied inside), a BF16 one the BF16 rows arm (the
+ * tensor-core rows kernel, or with `prompt` set the fixed-order cuBLASLt GEMM).  The lattice attention's Q K^T and P V
+ * are strided-batched cuBLASLt GEMMs (pulsar_gpu_bf16_batched_gemm, no workspace).  The glue no library covers is this
+ * module's (pulsar_cuda_lilicorr.cu): the candidate gather and features (incl. the K = 5 feature_mlp up), the
+ * epilogues (bias, residual, norm, activation, the head-major q/k/v split), the biased softmax, the normalize-and-dot
+ * scores and the walk.  No host sync; no allocation after a shape's first call: graphable.
  *
- * WEIGHTS: bf16 device pointers, 16-byte aligned, row-major [out][in] as the checkpoint stores them.  An NVFP4 Linear
- * (token_proj, pass_hidden_proj, context_proj, the layers' out_proj / mlp up / mlp down) is dequantized to bf16 at load
- * as e2m1 x e4m3 (exact in bf16; pulsar_nvfp4_dequant_bf16_launch) and its f32 weight_scale_2 rides in `s2` (applied
- * in the epilogue).  A BF16 Linear has s2 = 1.  Every field binds one container role of the head block `lilicorr`
- * (the HF suffix names; layer -1 the head-level tensors, lattice layer i lilicorr.layers.i) as stored -- nothing is
- * re-laid at load. */
+ * WEIGHTS: every field binds one container role of the head block `lilicorr` (the HF suffix names; layer -1 the
+ * head-level tensors, lattice layer i lilicorr.layers.i) as stored -- nothing is re-laid at load.  A Linear is the
+ * front door's reference (`l`: in / out set, `nvfp4` or `bf16`, an nvfp4 slice as pulsar_nvfp4_layout lays it) plus its
+ * bias; vectors are bf16; every pointer 16-byte aligned. */
 #ifndef PULSAR_CUDA_LILICORR_H
 #define PULSAR_CUDA_LILICORR_H
 
@@ -50,6 +51,8 @@ typedef struct CUstream_st *cudaStream_t;
 #endif
 
 #include <stdint.h>
+
+#include "pulsar_cuda_qwen.h"   /* pulsar_rows_linear: the rows front door's Linear reference */
 
 #ifdef __cplusplus
 extern "C" {
@@ -63,11 +66,10 @@ extern "C" {
 #define PULSAR_LILICORR_LAYERS 2u
 #define PULSAR_LILICORR_BANKS_MAX 16u  /**< banks one launch takes */
 
-/** One Linear: bf16 weight [out][in], optional bf16 bias [out], f32 global scale (1 for a BF16 weight). */
+/** One Linear: the front door's reference and its bf16 bias [out] (every head Linear has one). */
 typedef struct {
-    const uint16_t *w;
+    pulsar_rows_linear l;
     const uint16_t *b;
-    float s2;
 } pulsar_lilicorr_linear;
 
 typedef struct {
@@ -120,19 +122,13 @@ uint64_t pulsar_lilicorr_head_ws_bytes(uint32_t n_banks);
  *    chain_ids     [n_banks][7] i32      the walk's tokens
  *    chain_rows    [n_banks][7] i32      the candidate index chosen per slot (scores[s][chain_rows[s-1]] is slot s's
  *                                        realized row, row 0 for s = 0)
- *  ws: pulsar_lilicorr_head_ws_bytes(n_banks) device bytes, 256-byte aligned.
- *  @return 0, -1 refused (named on stderr, nothing launched), -3 a launch failed. */
+ *  ws: pulsar_lilicorr_head_ws_bytes(n_banks) device bytes, 256-byte aligned (the head's Linears need none of their
+ *  own).  @return 0, -1 refused (named on stderr, nothing launched), -3 a launch failed. */
 int pulsar_lilicorr_head_launch(const pulsar_lilicorr_head *w, uint32_t n_banks, const int32_t *cand_ids,
                                 const float *cand_logprob, const uint16_t *embed_table, const uint16_t *pass_hidden,
                                 const uint16_t *anchor_hidden, const uint8_t *anchor_valid, float *scores,
                                 int32_t *chain_ids, int32_t *chain_rows, void *ws, uint64_t ws_bytes,
                                 cudaStream_t stream);
-
-/** ModelOpt NVFP4 -> bf16 at load: packed [rows][cols / 2] u8 (element 2i in the low nibble), scale [rows][cols / 16]
- *  E4M3 -> out [rows][cols] bf16 = e2m1 x e4m3 (exact; the f32 weight_scale_2 is NOT applied -- it is the Linear's
- *  s2).  cols % 16 == 0.  @return 0, -1 refused, -3 launch failure. */
-int pulsar_nvfp4_dequant_bf16_launch(const uint8_t *packed, const uint8_t *scale_e4m3, uint32_t rows, uint32_t cols,
-                                     uint16_t *out, cudaStream_t stream);
 
 #ifdef __cplusplus
 }

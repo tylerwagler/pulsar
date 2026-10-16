@@ -45,6 +45,7 @@ __pycache__/
 /tests/router_gate
 /tests/bf16_rows_gate
 /tests/nvfp4_rows_gate
+/tests/lilicorr_head_gate
 /tests/qwen_family_gate
 /tests/state_kinds_gate
 /tests/fixed_tile_gemm_probe
