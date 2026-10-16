@@ -40,6 +40,17 @@ int pulsar_bf16_rows_linear_launch(const void *w, const uint16_t *x_bf16, int ro
 int pulsar_gpu_bf16_rows_gemm(float *y, const uint16_t *w, const uint16_t *x_bf16, uint64_t in_dim, uint64_t out_dim,
                               uint64_t rows, cudaStream_t stream);
 
+/** The batch count pulsar_gpu_bf16_batched_gemm picks its algorithm at (16 banks x 8 heads, the LiLiCorr head's
+ *  widest call); every batch count runs that kernel, so an item's bytes do not depend on the batch count. */
+#define PULSAR_GPU_BATCHED_GEMM_CANON 128
+/** L298: strided-batched bf16 GEMM, f32 out (pulsar_cuda_matmul.cu): C_i [m x n] (ldc) = A_i [m x k] (lda) . op(B_i),
+ *  B_i row-major [n x k] when b_trans else [k x n] (ldb), operand i at base + i * stride elements.  No workspace, no
+ *  split-K, one algorithm per shape chosen at PULSAR_GPU_BATCHED_GEMM_CANON items (batch-count independent bytes),
+ *  the descriptors cached per shape: graphable after the first call of a shape.  1 on success. */
+int pulsar_gpu_bf16_batched_gemm(float *c, int ldc, int64_t stride_c, const uint16_t *a, int lda, int64_t stride_a,
+                                 const uint16_t *b, int ldb, int64_t stride_b, int b_trans, int m, int n, int k,
+                                 int batch, cudaStream_t stream);
+
 /** One layer's routed BF16 stacks over the experts this rank holds: gate / up [n_experts][mid][in], down
  *  [n_experts][out][in = mid], bf16, 16-byte aligned.  `act` the activation (pulsar_cuda_qwen.h pulsar_ffn_act):
  *  SWIGLU reads gate and up, RELU2 up alone (gate NULL -- an up-only, non-gated expert). */

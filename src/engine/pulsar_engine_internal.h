@@ -744,6 +744,9 @@ typedef struct {
      *  the rank's plan replaces (a slice built at open, a routed stack's half, the other rank's experts).  Set
      *  by pulsar_tp_plan_build; NULL = nothing unstaged. */
     uint8_t *tp_unstaged;
+    /** L298: unloaded[i] marks tensor i as not part of what this engine serves -- a drafter the open did not select
+     *  (pulsar_role_binder_unload): never bound, never staged, never priced.  NULL = every tensor is served. */
+    uint8_t *unloaded;
     /** L272 P4b: the engine's TP plan (owned by the engine; tp_slice.cpp), for the forward's lookup of a built
      *  slice (pulsar_tp_built_ptr).  NULL on one GPU. */
     struct pulsar_tp_plan *tp_plan;
@@ -1985,6 +1988,9 @@ struct pulsar_engine {
     bool gpu_ready;             ///< CUDA backend initialised and weights resident
     bool dspark_ready;          ///< a usable drafter is loaded; false disables speculation
     const struct pulsar_drafter_ops *drafter_ops;   ///< L272 P1: the loaded drafter behind the round API (spec_ops.h), or NULL = none
+    /** L298: the loaded block drafter (spec_block.h: its declaration, tap points, weights, state ids), or NULL -- set
+     *  by the family's load when the container holds one and the open selects it; the family's unload frees it. */
+    struct pulsar_block_drafter *block_drafter;
     bool dspark_external;       ///< drafter came from its OWN GGUF (separate map/fd), not the target's
     pulsar_vision_weights vision_weights;  ///< resolved ViT tower/aligner tensors (Vision-Exp artifacts)
     bool vision_ready;          ///< the artifact carries a bound, layout-validated vision tower
@@ -3200,6 +3206,7 @@ typedef enum {
     PULSAR_DENSE_ARM_MXFP8_ROWS,   ///< mxfp8_lt, raw bf16 rows (W8A16 split-K GEMV / MMA)
     PULSAR_DENSE_ARM_EXL3_ROWS,    ///< EXL3 at a dense-arm rate, raw bf16 rows
     PULSAR_DENSE_ARM_BF16_ROWS,    ///< bf16 weight, raw bf16 rows (L295 F7: the tensor-core rows kernel / cuBLASLt)
+    PULSAR_DENSE_ARM_NVFP4_ROWS,   ///< nvfp4 weight, raw bf16 rows (L298: the W4A16 rows kernel, every row kind)
 } pulsar_dense_arm;
 pulsar_dense_arm pulsar_dense_arm_for(uint32_t type, pulsar_act_format act);
 /** L272 P4c: the dense linear's front door (linear.cpp).  A weight's device pointer: the rank's TP slice, else the

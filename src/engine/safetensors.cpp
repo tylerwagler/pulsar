@@ -24,6 +24,7 @@
  */
 #include "pulsar_engine_internal.h"
 #include "exl3_trellis.h"   /* the EXL3 byte model for exl3m entries */
+#include "cuda/pulsar_cuda_nvfp4.h"   /* the nvfp4 byte model (L298) */
 
 #include "pulsar_json.h"
 
@@ -499,6 +500,14 @@ static uint64_t st_bytes_for(uint32_t type, const uint64_t *dim, uint32_t nd) {
         }
         return rows * cols + rows * (cols / 32);
     }
+    case PULSAR_TENSOR_NVFP4: {
+        /* L298: one [in, out] Linear (ne order), pulsar_nvfp4_layout the byte model */
+        uint64_t values = 0, scales = 0, stride = 0;
+        if (nd != 2 || !pulsar_nvfp4_layout(dim[0], dim[1], &values, &scales, &stride))
+            st_die("safetensors: nvfp4 tensor has a bad shape (%u dims, in %llu, out %llu; a 2-D Linear, in %% 64)", nd,
+                   (unsigned long long)(nd > 0 ? dim[0] : 0), (unsigned long long)(nd > 1 ? dim[1] : 0));
+        return stride;
+    }
     default: {
         /* EXL3 on a pulsar.tensors entry (L251): one [trellis | suh | svh] slice per
          * [in, out] (ne order), and a 3-D [in, out, n] entry is n of them back to
@@ -914,6 +923,16 @@ static void st_open(pulsar_model *m, const char *path, bool gpu_mapping) {
         if (st_meta_get(&shards[i], "pulsar.kv")) { primary = &shards[i]; break; }
     }
     if (!primary) st_die("safetensors: no shard in %s carries pulsar.kv", path);
+    /* L298: every shard carries the build's architecture keys (pulsar.kv_arch); a shard whose copy differs from the
+     * primary's came from another build -- a container assembled by hand from two artifacts -- and is refused */
+    if (const char *arch = st_meta_get(primary, "pulsar.kv_arch")) {
+        for (uint64_t i = 0; i < n; i++) {
+            const char *k = st_meta_get(&shards[i], "pulsar.kv_arch");
+            if (k && strcmp(k, arch) != 0)
+                st_die("safetensors: %s's pulsar.kv_arch differs from the primary shard's (%s): a shard of another "
+                       "build -- refusing the container", shards[i].name, primary->name);
+        }
+    }
     st_build_kv(m, primary);
 
     st_dir d = {0};

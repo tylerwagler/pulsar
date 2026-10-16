@@ -45,6 +45,10 @@ USE_MDFILE_AS_MAINPAGE = docs/DESIGN.md
 # without these the output documents almost nothing useful.
 EXTRACT_ALL            = YES
 EXTRACT_STATIC         = YES
+# L298: anonymous-namespace members are extracted like statics.  Left at NO, doxygen numbers anonymous namespaces
+# across the whole input and, as files are added, mis-pairs a file's members with another's (`@31::...` "was not
+# declared or defined" on ds4_mmq.cu, a file L298 never touched).
+EXTRACT_ANON_NSPACES   = YES
 EXTRACT_PRIVATE        = YES
 EXTRACT_LOCAL_CLASSES  = YES
 INTERNAL_DOCS          = YES

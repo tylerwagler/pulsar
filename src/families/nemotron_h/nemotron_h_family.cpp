@@ -9,7 +9,11 @@ namespace {
 const char *const ARCH = PULSAR_NEMOTRON_H_ARCH;
 
 void unload(pulsar_engine *e) {
-    if (e->family_state) bpe_tokenizer_free(((pulsar_nemotron_h_model *)e->family_state)->tok);
+    if (e->family_state) {
+        bpe_tokenizer_free(((pulsar_nemotron_h_model *)e->family_state)->tok);
+        free(((pulsar_nemotron_h_model *)e->family_state)->block);
+    }
+    e->block_drafter = NULL;
     free(e->family_state);
     e->family_state = NULL;
 }
@@ -34,6 +38,53 @@ bool load(pulsar_engine *e, const pulsar_engine_options *opt) {
         return false;
     }
     pulsar_nemotron_h_plan(&w->shape, &e->plan);
+    /* L298: the drafter the open selects among those the container holds -- and so the one that is LOADED: the other
+     * is declared unloaded by the bind (never staged; its memory stays the KV pool's) */
+    {
+        const pulsar_nemotron_h_shape &s = w->shape;
+        const char *want = opt->drafter;
+        bool use_mtp = false, use_block = false;
+        const char *why = NULL;
+        if (opt->dspark_disable) {
+        } else if (!want || !want[0]) {
+            if (s.mtp_written && s.block_written) why = "the container holds both the MTP module and LiLiCorr: pass --drafter mtp|lilicorr";
+            use_mtp = s.mtp_written;
+            use_block = s.block_written;
+        } else if (!strcmp(want, "lilicorr")) {
+            if (!s.block_written) why = "--drafter lilicorr: the container holds no LiLiCorr drafter (pulsar.drafter)";
+            use_block = true;
+        } else if (!strcmp(want, "mtp")) {
+            if (!s.mtp_written) why = "--drafter mtp: the container holds no MTP module (pulsar.mtp_present)";
+            use_mtp = true;
+        } else {
+            why = "--drafter names no drafter this family runs (mtp, lilicorr)";
+        }
+        if (why) {
+            fprintf(stderr, "pulsar: %s: %s -- refusing\n", ARCH, why);
+            return false;
+        }
+        w->drafting = use_mtp;
+        if (use_block) {
+            w->block = (pulsar_block_drafter *)xcalloc(1, sizeof(*w->block));
+            pulsar_block_drafter *d = w->block;
+            if (!pulsar_block_drafter_read(&e->model, d)) return false;
+            /* the taps: the residual after target block tap_block[j], at its place in the plan */
+            for (uint32_t j = 0; j < d->n_taps; j++) {
+                if (d->tap_block[j] >= s.n_blocks) {
+                    fprintf(stderr, "pulsar: %s: the drafter taps block %u of a %u-block target -- refusing\n", ARCH,
+                            d->tap_block[j], s.n_blocks);
+                    return false;
+                }
+                d->tap_layer[j] = s.block_layer[d->tap_block[j]];
+                d->tap_sub[j] = s.block_sub[d->tap_block[j]];
+            }
+            if (d->hidden != s.n_embd || d->vocab != s.n_vocab) {
+                fprintf(stderr, "pulsar: %s: the drafter's hidden %u / vocabulary %u are not the target's %u / %u -- "
+                                "refusing\n", ARCH, d->hidden, d->vocab, s.n_embd, s.n_vocab);
+                return false;
+            }
+        }
+    }
     /* stage 2: the whole-artifact scans every family's load runs */
     weights_reject_unsupported_types(&e->model);
     weights_reject_bad_e8m0(&e->model);
@@ -50,9 +101,10 @@ bool load(pulsar_engine *e, const pulsar_engine_options *opt) {
     }
     /* stage 4: the tokenizer beside the shards */
     if (!pulsar_nemotron_h_load_tokenizer(w, opt->model_path)) return false;
-    /* N9: the MTP module drafts unless the open turned drafting off (the option every family's drafter honours) */
-    w->drafting = w->shape.mtp_written && !opt->dspark_disable;
-    e->drafter_ops = w->drafting ? &PULSAR_NEMOTRON_H_DRAFTER : NULL;
+    /* N9 / L298: the selected drafter behind the round API (none when the open turned drafting off) */
+    if (w->block) w->block->embed = w->embed;
+    e->block_drafter = w->block;
+    e->drafter_ops = w->drafting ? &PULSAR_NEMOTRON_H_DRAFTER : w->block ? &w->block->ops : NULL;
     /* the session's declared state (N3, F3) and the digest its disk segments are keyed by: the directory's names,
      * types and sizes */
     pulsar_nemotron_h_state_plan(e);
@@ -80,7 +132,14 @@ bool load(pulsar_engine *e, const pulsar_engine_options *opt) {
             ARCH, s->name, s->n_blocks, s->n_layer, n_mamba, s->n_layer - n_mamba, n_moe, s->n_expert_used, s->n_expert,
             s->latent, s->n_layer - n_moe,
             w->drafting ? "the MTP module (the chained-MTP drafter)"
-                        : s->mtp_written ? "bound, drafting off" : "not in the container");
+            : w->block  ? "LiLiCorr (the block drafter; the MTP module unloaded)"
+            : s->mtp_written || s->block_written ? "in the container, unloaded (drafting off)"
+                                                 : "not in the container");
+    if (w->block) {
+        char d[256];
+        pulsar_block_drafter_describe(w->block, d, sizeof d);
+        fprintf(stderr, "pulsar: %s: %s\n", ARCH, d);
+    }
     return true;
 }
 
@@ -94,7 +153,10 @@ bool after_gpu(pulsar_engine *e) {
                     "512 / 22 + the rows MoE's latent relu^2 experts, E5 head); state: ssm FIXED DELTA + ssm_conv FIXED "
                     "SNAPSHOT + kv POOL%s%s%s\n", ARCH,
             pulsar_layer_plan_count(&e->plan, PULSAR_LAYER_BLOCKS),
-            sp->n_slots > sp->n_trunk ? " (+ the drafter slot's kv POOL)" : "", miss ? "; MISSING " : "",
+            e->block_drafter     ? " (+ the block drafter's slots: draft_kv RING, draft_anchor FIXED)"
+            : sp->n_slots > sp->n_trunk ? " (+ the drafter slot's kv POOL)"
+                                        : "",
+            miss ? "; MISSING " : "",
             miss ? miss : "");
     return true;
 }
@@ -112,7 +174,9 @@ int model_id(const pulsar_engine *) { return 4; }
 /* no positional encoding: the attention layers are trained to max_position_embeddings; the Mamba state is O(1) */
 uint64_t trained_context(const pulsar_engine *e) { return model_of(e)->shape.max_context; }
 /* N9: the MTP module drafts (the chained-MTP drafter, spec_mtp.h) when the container holds it */
-pulsar_drafter_kind drafter(pulsar_engine *e) { return model_of(e)->drafting ? PULSAR_DRAFTER_MTP : PULSAR_DRAFTER_NONE; }
+pulsar_drafter_kind drafter(pulsar_engine *e) {
+    return model_of(e)->drafting ? PULSAR_DRAFTER_MTP : model_of(e)->block ? PULSAR_DRAFTER_BLOCK : PULSAR_DRAFTER_NONE;
+}
 /* the routed experts' tier in EXL3's value space (family.h quant_bits): 20 + the highest rate in half bits, 0 when
  * they are not EXL3 (BF16 today) */
 int quant_bits(pulsar_engine *e) {

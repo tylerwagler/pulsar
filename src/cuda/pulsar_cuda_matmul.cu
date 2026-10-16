@@ -1,6 +1,7 @@
 #include <atomic>
 #include "pulsar_cuda_internal.h"
 #include "pulsar_cuda_mx.cuh"   /* the single source for pulsar_mx_sfoff */
+#include "pulsar_cuda_bf16_rows.cuh"   /* PULSAR_GPU_BATCHED_GEMM_CANON */
 
 
 
@@ -3130,6 +3131,120 @@ int pulsar_cuda_vision_gemm(float *c, int ldc, const uint16_t *a, int lda, const
     if (la) cublasLtMatrixLayoutDestroy(la);
     if (op) cublasLtMatmulDescDestroy(op);
     return ok;
+}
+
+/* L298: a strided-batched bf16 GEMM with f32 output (the LiLiCorr head's lattice attention: Q K^T and P V per
+ * (bank, head)).  C_i (f32 row-major [m x n], ldc) = A_i (bf16 row-major [m x k], lda) . op(B_i), B_i bf16 row-major
+ * [n x k] (op = transpose, b_trans) or [k x n]; operand i at base + i * stride (elements).  f32 accumulate.  Row-major C
+ * is column-major C^T = op(B)^T . A^T, as pulsar_cuda_vision_gemm says.  NO workspace (the heuristic is asked for a
+ * workspace-free kernel) and the descriptors and algorithm are cached per call shape, so a launch after the first
+ * allocates nothing and captures into a graph.  The algorithm is the heuristic's first pick for the shape: a shape's
+ * bytes are fixed. */
+int pulsar_gpu_bf16_batched_gemm(float *c, int ldc, int64_t stride_c, const uint16_t *a, int lda, int64_t stride_a,
+                                 const uint16_t *b, int ldb, int64_t stride_b, int b_trans, int m, int n, int k,
+                                 int batch, cudaStream_t stream) {
+    if (!c || !a || !b || m <= 0 || n <= 0 || k <= 0 || batch <= 0) {
+        fprintf(stderr, "pulsar: batched bf16 GEMM: empty operand or shape (m %d n %d k %d batch %d) -- refusing\n", m, n,
+                k, batch);
+        return 0;
+    }
+    if (!cublaslt_ensure()) {
+        fprintf(stderr, "pulsar: batched bf16 GEMM: cuBLASLt handle not ready -- refusing\n");
+        return 0;
+    }
+    struct shape_t {
+        int ldc, lda, ldb, b_trans, m, n, k, batch;
+        int64_t sc, sa, sb;
+        bool valid;
+        cublasLtMatmulDesc_t op;
+        cublasLtMatrixLayout_t la, lb, lc;
+        cublasLtMatmulAlgo_t algo;
+    };
+    static thread_local shape_t cache[8];
+    static thread_local int next;
+    shape_t *e = nullptr;
+    for (int i = 0; i < 8 && !e; i++) {
+        shape_t &q = cache[i];
+        if (q.valid && q.ldc == ldc && q.lda == lda && q.ldb == ldb && q.b_trans == b_trans && q.m == m && q.n == n &&
+            q.k == k && q.batch == batch && q.sc == stride_c && q.sa == stride_a && q.sb == stride_b)
+            e = &q;
+    }
+    if (!e) {
+        shape_t q = {ldc, lda, ldb, b_trans, m, n, k, batch, stride_c, stride_a, stride_b, false, NULL, NULL, NULL, NULL, {}};
+        const cublasOperation_t ta = b_trans ? CUBLAS_OP_T : CUBLAS_OP_N, tb = CUBLAS_OP_N;
+        const uint64_t zero = 0;
+        cublasLtMatmulPreference_t pf = NULL;
+        bool ok = cublasLtMatmulDescCreate(&q.op, CUBLAS_COMPUTE_32F, CUDA_R_32F) == CUBLAS_STATUS_SUCCESS;
+        if (ok) {
+            cublasLtMatmulDescSetAttribute(q.op, CUBLASLT_MATMUL_DESC_TRANSA, &ta, sizeof(ta));
+            cublasLtMatmulDescSetAttribute(q.op, CUBLASLT_MATMUL_DESC_TRANSB, &tb, sizeof(tb));
+            if (b_trans) cublasLtMatrixLayoutCreate(&q.la, CUDA_R_16BF, (uint64_t)k, (uint64_t)n, ldb);
+            else cublasLtMatrixLayoutCreate(&q.la, CUDA_R_16BF, (uint64_t)n, (uint64_t)k, ldb);
+            cublasLtMatrixLayoutCreate(&q.lb, CUDA_R_16BF, (uint64_t)k, (uint64_t)m, lda);
+            cublasLtMatrixLayoutCreate(&q.lc, CUDA_R_32F, (uint64_t)n, (uint64_t)m, ldc);
+            ok = q.la && q.lb && q.lc;
+        }
+        if (ok) {
+            const cublasLtMatrixLayout_t ls[3] = {q.la, q.lb, q.lc};
+            const int64_t st[3] = {stride_b, stride_a, stride_c};
+            for (int i = 0; i < 3; i++) {
+                cublasLtMatrixLayoutSetAttribute(ls[i], CUBLASLT_MATRIX_LAYOUT_BATCH_COUNT, &batch, sizeof(batch));
+                cublasLtMatrixLayoutSetAttribute(ls[i], CUBLASLT_MATRIX_LAYOUT_STRIDED_BATCH_OFFSET, &st[i],
+                                                 sizeof(st[i]));
+            }
+            cublasLtMatmulPreferenceCreate(&pf);
+            cublasLtMatmulPreferenceSetAttribute(pf, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &zero, sizeof(zero));
+            const uint32_t red = CUBLASLT_REDUCTION_SCHEME_NONE;
+            cublasLtMatmulPreferenceSetAttribute(pf, CUBLASLT_MATMUL_PREF_REDUCTION_SCHEME_MASK, &red, sizeof(red));
+            /* The algorithm is chosen at the CANONICAL batch count and checked at this one, so every batch item gets
+             * the same kernel (and bytes) whatever the batch count: a bank's scores never depend on how many banks
+             * ride with it.  Batch items are independent CTAs of one kernel; without split-K their sums do not mix. */
+            const int canon = PULSAR_GPU_BATCHED_GEMM_CANON;
+            for (int i = 0; i < 3; i++)
+                cublasLtMatrixLayoutSetAttribute(ls[i], CUBLASLT_MATRIX_LAYOUT_BATCH_COUNT, &canon, sizeof(canon));
+            cublasLtMatmulHeuristicResult_t hr;
+            int got = 0;
+            ok = pf && cublasLtMatmulAlgoGetHeuristic(g_cublaslt, q.op, q.la, q.lb, q.lc, q.lc, pf, 1, &hr, &got) ==
+                           CUBLAS_STATUS_SUCCESS && got;
+            for (int i = 0; i < 3; i++)
+                cublasLtMatrixLayoutSetAttribute(ls[i], CUBLASLT_MATRIX_LAYOUT_BATCH_COUNT, &batch, sizeof(batch));
+            if (ok) {
+                cublasLtMatmulHeuristicResult_t chk;
+                ok = cublasLtMatmulAlgoCheck(g_cublaslt, q.op, q.la, q.lb, q.lc, q.lc, &hr.algo, &chk) ==
+                         CUBLAS_STATUS_SUCCESS && chk.state == CUBLAS_STATUS_SUCCESS && chk.workspaceSize == 0;
+            }
+            if (ok) q.algo = hr.algo;
+        }
+        if (pf) cublasLtMatmulPreferenceDestroy(pf);
+        if (!ok) {
+            if (q.lc) cublasLtMatrixLayoutDestroy(q.lc);
+            if (q.lb) cublasLtMatrixLayoutDestroy(q.lb);
+            if (q.la) cublasLtMatrixLayoutDestroy(q.la);
+            if (q.op) cublasLtMatmulDescDestroy(q.op);
+            fprintf(stderr, "pulsar: batched bf16 GEMM (m %d n %d k %d, b_trans %d, batch %d): no workspace-free "
+                            "cuBLASLt kernel -- refusing\n", m, n, k, b_trans, batch);
+            return 0;
+        }
+        q.valid = true;
+        e = &cache[next];
+        next = (next + 1) & 7;
+        if (e->valid) {
+            cublasLtMatrixLayoutDestroy(e->lc);
+            cublasLtMatrixLayoutDestroy(e->lb);
+            cublasLtMatrixLayoutDestroy(e->la);
+            cublasLtMatmulDescDestroy(e->op);
+        }
+        *e = q;
+    }
+    const float al = 1.0f, be = 0.0f;
+    const cublasStatus_t st = cublasLtMatmul(g_cublaslt, e->op, &al, b, e->la, a, e->lb, &be, c, e->lc, c, e->lc,
+                                             &e->algo, NULL, 0, stream);
+    if (st != CUBLAS_STATUS_SUCCESS) {
+        fprintf(stderr, "pulsar: batched bf16 GEMM (m %d n %d k %d batch %d) failed: status %d\n", m, n, k, batch,
+                (int)st);
+        return 0;
+    }
+    return 1;
 }
 
 

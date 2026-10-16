@@ -4,6 +4,7 @@
     recipe  --hf DIR [--exl3 DIR] [--recipe JSON]    # print the pulsar.recipe.v1 the build runs (DeepSeek's default
                                                      #  is generated from policy.py + the EXL3 source)
     plan    --hf DIR [--exl3 DIR] [--exl3-experts DIR] [--tessera DIR] [--recipe JSON] [--dump FILE]
+            Nemotron-H: [--drafter lilicorr DIR] the LiLiCorr block drafter, written into the container
     emit    ... --out DIR (--shard S | --all) [--mxfp8-scale rederive|verbatim]
             DeepSeek: [--layers L,L,...] a layer-subset test fixture (names.py drop rule 4);
                       [--engram-layout JSON] V4.1's Engram hash layout (tools/engram/engram_layout.py)
@@ -388,7 +389,8 @@ def cmd_plan(args):
         write_dump(args.dump, shape, order, files, shards, consumed)
         print(f'plan dump: {args.dump}')
     print('sources: ' + ', '.join(f'{k} {getattr(args, k)}' for k in ('exl3', 'exl3_experts', 'tessera')
-                                  if getattr(args, k)))
+                                  if getattr(args, k))
+          + (f', drafter {args.drafter[0]} {args.drafter[1]}' if args.drafter else ''))
     return 0
 
 
@@ -534,10 +536,17 @@ _HF = {}
 def hf_of(args):
     """The HF source as its family reads it (fam.source: the checkpoint itself, or a view that names the tensors a
     fused HF tensor holds -- inkling.Source)."""
-    if args.hf not in _HF:
+    key = (args.hf, tuple(args.drafter or ()))
+    if key not in _HF:
         hf = HFCheckpoint(args.hf)
-        _HF[args.hf] = family_of(hf).source(hf)
-    return _HF[args.hf]
+        fam = family_of(hf)
+        src = fam.source(hf)
+        if args.drafter:
+            if not hasattr(fam, 'with_drafter'):
+                raise SystemExit(f'--drafter: the {fam.__name__} family reads no drafter input (nemotron_h does)')
+            src = fam.with_drafter(src, *args.drafter)
+        _HF[key] = src
+    return _HF[key]
 
 
 def mxfp8_roundtrip(hf, src_name, payload):
@@ -609,6 +618,9 @@ def main():
             p.add_argument('--exl3-experts', metavar='DIR', help='a second exllamav3 checkpoint: source `exl3_experts` '
                            '(the default source of a routed expert\'s EXL3 rows when given)')
             p.add_argument('--tessera', metavar='DIR', help='a Tessera bundle: source `tessera` (the producer lands with L255)')
+            p.add_argument('--drafter', nargs=2, metavar=('KIND', 'DIR'),
+                           help='Nemotron-H: a separate drafter checkpoint written into the container (KIND lilicorr: '
+                           'NVIDIA\'s LiLiCorr block drafter, shard `drafter`; nemotron_h.py)')
             p.add_argument('--recipe', metavar='JSON', help='a pulsar.recipe.v1 (recipe.py; format-maps/*.json).  '
                            'DeepSeek default: generated from policy.py + the EXL3 source (`recipe` prints it)')
             p.add_argument('--mxfp8-scale', choices=('rederive', 'verbatim'), default='rederive',
