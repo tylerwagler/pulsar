@@ -2,8 +2,8 @@
 """exl3_logit_ref.py -- pulsar's EXL3 Nemotron-H container graded against exllamav3's own forward of the SAME pack
 (L296: the format's reference implementation, as Inkling's mini was graded at 97% top-1).
 
-For each case: the chat prompt rendered by the checkpoint's template (HF tokenizer, enable_thinking=False -- what
-`pulsar --nothink` renders; the prompt length is checked against pulsar's), followed by pulsar's greedy continuation
+For each case: the chat prompt rendered by the checkpoint's template (HF tokenizer, enable_thinking=False and the CLI's
+default system prompt, --system -- what `pulsar --nothink` renders; the prompt length is checked against pulsar's), followed by pulsar's greedy continuation
 (its --dump-logprobs file: per step the selected id and the top-K logprobs).  exllamav3 runs ONE cache-less forward
 over prompt + continuation (teacher-forced on pulsar's tokens) and at every generated step reports:
 
@@ -48,6 +48,8 @@ def main():
     ap.add_argument("--pack", required=True)
     ap.add_argument("--case", nargs=3, action="append", metavar=("NAME", "PROMPT_FILE", "DUMP_JSON"), required=True)
     ap.add_argument("--json")
+    ap.add_argument("--system", default="You are a helpful assistant",
+                    help="the system turn's content: the pulsar CLI's default (-s); '' for none")
     a = ap.parse_args()
 
     from transformers import AutoTokenizer
@@ -62,7 +64,8 @@ def main():
     report, all_steps = [], []
     for name, prompt_file, dump in a.case:
         text = open(prompt_file).read()
-        ids = tok.apply_chat_template([{"role": "user", "content": text}], add_generation_prompt=True,
+        msgs = ([{"role": "system", "content": a.system}] if a.system else []) + [{"role": "user", "content": text}]
+        ids = tok.apply_chat_template(msgs, add_generation_prompt=True,
                                       enable_thinking=False, tokenize=True)
         if isinstance(ids, dict) or hasattr(ids, "input_ids"):
             ids = ids["input_ids"]
