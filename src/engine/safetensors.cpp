@@ -24,6 +24,7 @@
  */
 #include "pulsar_engine_internal.h"
 #include "exl3_trellis.h"   /* the EXL3 byte model for exl3m entries */
+#include "cuda/pulsar_cuda_nvfp4.h"   /* the nvfp4 byte model (L298) */
 
 #include "pulsar_json.h"
 
