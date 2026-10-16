@@ -279,7 +279,9 @@ typedef struct pulsar_rows_moe {
      *  of every table above (pulsar_cuda_bf16_rows.cuh); no riding shared expert (a BF16 one runs
      *  pulsar_rows_moe_shared_launch).  bf16_gate NULL = up-only experts (a non-gated activation, `act`). */
     const void *bf16_gate, *bf16_up, *bf16_down;
-    pulsar_ffn_act act;                  /**< the experts' activation; every arm but BF16 runs SWIGLU only */
+    /** the experts' activation: SWIGLU on the gated forms; RELU2 on up-only stacks -- BF16 without a gate, or (L296)
+     *  an EXL3 up_table alone (no gate_table, no gate_up_table) */
+    pulsar_ffn_act act;
     int k2_gate_up, k2_down;             /**< rates (half-bit units); k2_gate_up is the pair's in the split form */
     int n_expert, top_k;                 /**< the model's experts (the router's picks index them) and picks per row */
     int in_dim, mid_dim, out_dim;        /**< the expert shape (the model's): in == out, the block's hidden */

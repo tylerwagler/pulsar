@@ -38,14 +38,17 @@
 
 #include "exl3_moe_prefill.cuh"   /* exl3_moe_act */
 
-/** One layer's routed EXL3 stacks: exl3_expert_table() pointer pairs over the experts this rank holds. */
+/** One layer's routed EXL3 stacks: exl3_expert_table() pointer pairs over the experts this rank holds.  Three forms:
+ *  FUSED (gate_up), PAIR (gate + up) -- both SwiGLU -- and (L296) UP-ONLY (up alone, gate and gate_up NULL): an
+ *  ungated expert, act = PULSAR_FFN_ACT_RELU2 (pulsar_cuda_qwen.h), h = relu(up x)^2. */
 struct exl3_moe_stacks {
     const void *gate_up;            ///< the FUSED [in -> 2 mid] slices (gate rows, then up rows), or NULL
-    const void *gate, *up;          ///< the PAIR form, or NULL
+    const void *gate, *up;          ///< the PAIR form (or up alone: the UP-ONLY form), or NULL
     const void *down;
-    int k2_gate_up, k2_down;        ///< rates in half-bit units (the pair's gate and up share one)
+    int k2_gate_up, k2_down;        ///< rates in half-bit units (the pair's gate and up share one; up-only: the up's)
     int n_experts;                  ///< experts the tables hold (picks are local indices < n_experts)
     int in_dim, mid_dim, out_dim;
+    int act;                        ///< pulsar_ffn_act: 0 SWIGLU (fused / pair), 1 RELU2 (up-only); 0 when unnamed
 };
 
 /** The caller's buffers.  gate_z [pairs][mid] (fused: [pairs][2 mid]), up_z [pairs][mid] (pair form only),
@@ -80,7 +83,7 @@ int exl3_moe_shared_fork(const exl3_moe_shared &sh, const exl3_moe_act &x, int T
                          cudaStream_t stream);
 
 /** out [T][out_dim] f32 = sum over each row's top_k picks (sel [T][top_k], wts [T][top_k]) of
- *  w * down(swiglu(gate x, up x)), x the activation as its producer emitted it, plus each riding shared expert's
+ *  w * down(swiglu(gate x, up x)) (up-only: w * down(relu(up x)^2), b.up_z unused), x the activation as its producer emitted it, plus each riding shared expert's
  *  scale * ys, shared[0] first, when `shared` [n_shared] is given -- each forked first by exl3_moe_shared_fork, in
  *  that order (refused otherwise).  `prompt`: a prompt chunk
  *  (the prefill GEMM at every width, writing gate_z / up_z / down_z); otherwise decode rows (the decode GEMM

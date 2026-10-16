@@ -3221,12 +3221,14 @@ typedef enum {
     PULSAR_MOE_ARM_ROWS_FUSED,   ///< EXL3 fused gate_up + down over raw bf16 rows
     PULSAR_MOE_ARM_ROWS_PAIR,    ///< EXL3 gate + up pair + down over raw bf16 rows
     PULSAR_MOE_ARM_ROWS_BF16,    ///< BF16 gate + up + down stacks over raw bf16 rows (L295 F7)
+    PULSAR_MOE_ARM_ROWS_UP,      ///< EXL3 up (no gate) + down over raw bf16 rows: ungated relu^2 experts (L296)
 } pulsar_moe_arm;
 pulsar_moe_arm pulsar_moe_arm_for(const pulsar_tensor *gate, const pulsar_tensor *up, const pulsar_tensor *down,
                                   pulsar_act_format act);
 /** L296 N4: the arm of UP-ONLY experts (pulsar_ffn_act RELU2: an up and a down stack, no gate) at activation `act`:
- *  BF16 up + down at raw bf16 rows (the BF16 routed arm's relu^2, L295 F7), else NONE -- no quant format has an
- *  up-only arm yet.  The one authority the forward's front door and a family's load both ask. */
+ *  BF16 up + down at raw bf16 rows (the BF16 routed arm's relu^2, L295 F7) -> ROWS_BF16; EXL3 up + down at raw bf16
+ *  rows (the EXL3 routed front door's up-only form, L296) -> ROWS_UP; else NONE.  The one authority the forward's
+ *  front door and a family's load both ask. */
 pulsar_moe_arm pulsar_moe_arm_up_only(const pulsar_tensor *up, const pulsar_tensor *down, pulsar_act_format act);
 /** The routed part over the MX slot: out = the selected experts' weighted SwiGLU FFN of the activation armed for
  *  `x`; the up / mid / experts buffers are the backend's scratch.  A stack the rank's plan halved reads its halves. */
