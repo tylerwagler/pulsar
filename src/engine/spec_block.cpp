@@ -123,6 +123,8 @@ bool pulsar_block_drafter_read(const pulsar_model *m, pulsar_block_drafter *d) {
                       : d->mask_id < 0 || (uint32_t)d->mask_id >= d->vocab ? "a mask token inside the vocabulary"
                                                                            : NULL;
     if (why) return refuse("the declaration (lilicorr.*) is outside what the blocks implement: %s%s", why);
+    d->ops = PULSAR_BLOCK_DRAFTER_OPS;
+    d->ops.depth = d->ops.depth_max = d->block - 1u;   /* a chain is the block's mask slots */
     return true;
 }
 
@@ -832,12 +834,13 @@ int block_draft_batch(pulsar_session *s, pulsar_spec_round **rounds, const uint3
 
 }  // namespace
 
-/* The drafter's numbers: a chain is the block's slots (block - 1: LiLiCorr's 7), every slot kept (no stop rule: the
- * block drafts every slot in its one pass, so a slot costs only its verify row), no adaptive depth. */
+/* The drafter's numbers: a chain is the block's slots (block - 1: LiLiCorr's 7; set per declaration in its copy,
+ * pulsar_block_drafter::ops), every slot kept (no stop rule: the block drafts every slot in its one pass, so a slot
+ * costs only its verify row), no adaptive depth. */
 const pulsar_drafter_ops PULSAR_BLOCK_DRAFTER_OPS = {
     /* .name          = */ "block",
-    /* .depth         = */ PULSAR_BLOCK_SIZE_MAX - 1u,
-    /* .depth_max     = */ PULSAR_BLOCK_SIZE_MAX - 1u,
+    /* .depth         = */ 0u,
+    /* .depth_max     = */ 0u,
     /* .tau           = */ 0.0f,
     /* .adapt         = */ NULL,
     /* .prime         = */ NULL,   /* the context is absorbed with the trunk's every step */

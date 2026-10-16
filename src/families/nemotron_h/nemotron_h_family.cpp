@@ -104,7 +104,7 @@ bool load(pulsar_engine *e, const pulsar_engine_options *opt) {
     /* N9 / L298: the selected drafter behind the round API (none when the open turned drafting off) */
     if (w->block) w->block->embed = w->embed;
     e->block_drafter = w->block;
-    e->drafter_ops = w->drafting ? &PULSAR_NEMOTRON_H_DRAFTER : w->block ? &PULSAR_BLOCK_DRAFTER_OPS : NULL;
+    e->drafter_ops = w->drafting ? &PULSAR_NEMOTRON_H_DRAFTER : w->block ? &w->block->ops : NULL;
     /* the session's declared state (N3, F3) and the digest its disk segments are keyed by: the directory's names,
      * types and sizes */
     pulsar_nemotron_h_state_plan(e);

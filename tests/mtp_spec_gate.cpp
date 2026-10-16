@@ -414,7 +414,7 @@ static int exact(pulsar_engine *e, int n, const char *only) {
     /* M0 */
     const bool block = pulsar_engine_drafter(e) == PULSAR_DRAFTER_BLOCK;
     CHECK(pulsar_engine_has_spec_rounds(e) && g_base &&
-          (block ? g_base == &PULSAR_BLOCK_DRAFTER_OPS && e->block_drafter
+          (block ? e->block_drafter && g_base == &e->block_drafter->ops && g_base->draft == PULSAR_BLOCK_DRAFTER_OPS.draft
                  : pulsar_engine_drafter(e) == PULSAR_DRAFTER_MTP && g_base->absorb_banked == pulsar_mtp_absorb_banked &&
                        g_base->draft == pulsar_mtp_draft),
           "M0 the engine's drafter is a lane drafter: the %s (%s: depth %u, %u max, tau %.2f, adaptive %s)",
