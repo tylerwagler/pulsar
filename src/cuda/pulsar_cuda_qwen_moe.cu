@@ -255,12 +255,28 @@ static int rows_multi(const pulsar_rows_linear *const *ls, int n, const uint16_t
     }
     if (ne && ds4_exl3_dense_multi_launch(p, ne, x_bf16, rows, ls[0]->in, ws, ws_bytes, stream, ls[0]->prompt) != 0)
         return -1;
+    /* L298: the nvfp4 Linears, those of one output width in one launch (a gate and an up), each bit for bit its
+     * launch alone; with bf16 outputs the kernel's epilogue emits them (every row kind) */
+    bool done[DS4_EXL3_DENSE_MAX_PROJ] = {};
+    for (int j = 0; j < n; ++j) {
+        if (!ls[j]->nvfp4 || done[j]) continue;
+        const void *w[PULSAR_NVFP4_MULTI_MAX];
+        float *yf[PULSAR_NVFP4_MULTI_MAX];
+        uint16_t *yh[PULSAR_NVFP4_MULTI_MAX];
+        int m = 0;
+        for (int i = j; i < n && m < PULSAR_NVFP4_MULTI_MAX; ++i)
+            if (ls[i]->nvfp4 && !done[i] && ls[i]->out == ls[j]->out) {
+                w[m] = ls[i]->w;
+                yf[m] = yb ? nullptr : y[i];
+                yh[m] = yb ? yb[i] : nullptr;
+                done[i] = true;
+                ++m;
+            }
+        if (pulsar_nvfp4_rows_multi_launch(w, m, x_bf16, rows, ls[j]->in, ls[j]->out, yf, yh, stream) != 0) return -1;
+    }
     for (int j = 0; j < n; ++j) {   /* the mxfp8_lt / BF16 tiers, one by one (their own arms) */
         const pulsar_rows_linear *l = ls[j];
-        if (l->nvfp4 && yb) {   /* L298: the nvfp4 kernel emits the bf16 rows in its epilogue (every row kind) */
-            if (pulsar_nvfp4_rows_linear_launch(l->w, x_bf16, rows, l->in, l->out, nullptr, yb[j], stream) != 0) return -1;
-            continue;
-        }
+        if (l->nvfp4) continue;
         if (!l->k2 && pulsar_rows_linear_launch(l, x_bf16, rows, y[j], ws, ws_bytes, stream) != 0) return -1;
         if (yb && (!l->k2 || l->prompt) &&
             pulsar_rows_emit_bf16_launch(y[j], (uint64_t)l->out, (uint32_t)rows, (uint32_t)l->out, NULL,

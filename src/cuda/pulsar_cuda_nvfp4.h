@@ -15,13 +15,13 @@
 // kernel's).
 //
 // The arithmetic (pulsar_cuda_nvfp4.cu): e2m1 x e4m3 is exact in bf16 (at most 2 x 4 significant bits), so the kernel
-// dequantizes each value to that bf16 IN REGISTERS and runs the BF16 rows kernel's order on it -- the same 64-input
-// steps, k permutation, m16n8k16 fragments and fresh-fragment-added-in-k-order accumulation
-// (pulsar_cuda_bf16_rows.cu) -- then multiplies the f32 sum by the global scale.  With K split S ways (a function of
-// the shape alone, pulsar_nvfp4_ksplit) each slice is that sum over its inputs and the slices add in slice order.
-// So y is BIT-IDENTICAL to the BF16 rows kernel run on the dequantized (bf16) weight -- per K slice, slices summed in
-// order -- times the global scale: the BF16 bring-up path's bytes when S = 1.  A row's bytes do not depend on the
-// other rows of the call (M-independent at every width).
+// dequantizes each value to that bf16 IN REGISTERS and feeds bf16 m16n8k16 tensor-core MMAs (products exact in f32),
+// each into a fresh fragment added into the row's f32 accumulator in a fixed order (super-steps of 256 inputs, then
+// 16-input sub-steps; with K split S ways -- a function of the shape alone, pulsar_nvfp4_ksplit -- the slices add in
+// slice order), then multiplies by the global scale.  Deterministic (no atomics), and a row's bytes do not depend on
+// the other rows of the call (M-independent at every width).  The order is not the BF16 rows kernel's, so it is
+// graded, not byte-gated, against that arm: tests/nvfp4_rows_gate holds every output to the f32-accumulation envelope
+// of the double result, and the bf16 output to the bf16 rounding floor.
 #pragma once
 
 #include <cuda_runtime.h>
@@ -40,8 +40,9 @@ static inline bool pulsar_nvfp4_layout(uint64_t in, uint64_t out, uint64_t *valu
     return true;
 }
 
-/** The K split of an [out][in] nvfp4 Linear: the smallest S in 1, 2, 4, 8 giving >= 96 CTAs of 128 / S rows each (a
- *  GB10 has 48 SMs) with in % (64 S) == 0.  A function of the shape alone: it fixes the summation order. */
+/** The K split of an [out][in] nvfp4 Linear: the smallest S in 1, 2, 4, 8 giving >= the target CTA count (8 / S
+ *  16-row groups each, 192: four a GB10 SM) with in % (64 S) == 0.  A function of the shape alone: it fixes the
+ *  summation order. */
 int pulsar_nvfp4_ksplit(int in, int out);
 
 /** y [rows][out] f32 = W x (and, when y_bf16 is non-NULL, the same values rounded to nearest-even bf16 in
@@ -50,3 +51,11 @@ int pulsar_nvfp4_ksplit(int in, int out);
  *  Refuses (-1) on a contract violation. */
 int pulsar_nvfp4_rows_linear_launch(const void *w, const uint16_t *x_bf16, int rows, int in, int out, float *y,
                                     uint16_t *y_bf16, cudaStream_t stream);
+
+/** The most Linears one multi launch takes. */
+#define PULSAR_NVFP4_MULTI_MAX 4
+/** n (1..PULSAR_NVFP4_MULTI_MAX) nvfp4 Linears of one shape against the SAME bf16 rows, one launch (a gate and an up):
+ *  Linear j's outputs y[j] / y_bf16[j] (either array or entry NULL = not written, at least one each), each bit for bit
+ *  what pulsar_nvfp4_rows_linear_launch writes for it alone.  Refuses (-1) on a contract violation. */
+int pulsar_nvfp4_rows_multi_launch(const void *const *w, int n, const uint16_t *x_bf16, int rows, int in, int out,
+                                   float *const *y, uint16_t *const *y_bf16, cudaStream_t stream);

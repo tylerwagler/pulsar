@@ -4,16 +4,22 @@
  * Model-free.  Random e2m1 codes (every code, both signs), random E4M3 scales over the format's range (subnormals,
  * zeros and the 448 top included; the scale plane 128x4-tiled), a random global scale; random bf16 rows.
  *
- *   1. BIT-EXACT: y == the BF16 rows kernel (pulsar_bf16_rows_linear_launch) run on the weight dequantized on the host
- *      (e2m1 x e4m3, exact in bf16) -- per K slice (pulsar_nvfp4_ksplit), slices added in order -- times the global
- *      scale, f32 bit for bit; the bf16 output == that f32 rounded to nearest even, bit for bit.  Shapes: every K
- *      split (1, 2, 4, 8), an output width off 128 and off 16, the LiLiCorr drafter's head shapes.
- *   2. graded: the same y against double arithmetic on the dequantized weight (an f32-accumulation envelope).
- *   3. M-independence: M = 1, 3, 8, 9, 16 and 20 (16-row blocks) -- each row the bytes of the same row at M = 16.
+ *   1. graded: y against double arithmetic on the weight dequantized on the host (e2m1 x e4m3 x global): every output
+ *      within 2^-18 of its own sum |w x| (the f32 accumulation's envelope -- products are exact, so that is the only
+ *      error), and the bf16 output's relative error against the double result beside the bf16 rounding floor of that
+ *      result.  Shapes: every K split (1, 2, 4, 8), a span ending inside a super-step, output widths off 128 and off
+ *      16, the LiLiCorr drafter's shapes (the MLP and head ones; the wide head at a reduced row count).
+ *   2. bytes: the bf16 output == the f32 output rounded to nearest even; a repeated call is bit-identical
+ *      (deterministic: no atomics, a fixed summation order).
+ *   3. M-independence: M = 1, 3, 8, 9 and 20 (16-row blocks) -- each row the bytes of the same row at M = 16.
  *   4. the front door (pulsar_rows_linear_launch with an nvfp4 reference) == the arm; refusals (in % 64, no output,
  *      misaligned weight, an nvfp4 reference carrying an EXL3 rate).
- *   5. timing (information; `--bench` only): the drafter's shapes at M = 1, 4, 8 with the L2 flushed before every call
- *      (weights read cold), GB/s of the nvfp4 bytes, against the BF16 rows kernel on the dequantized weight.
+ *   5. the multi launch (a gate and an up of one input, one launch; pulsar_nvfp4_rows_multi_launch) and the front
+ *      door's multi (pulsar_rows_linear_multi_bf16_launch / _multi_launch grouping them) == each Linear alone, bit for
+ *      bit.
+ *   6. timing (information; `--bench` only): the drafter's shapes at M = 1, 4, 8 with the L2 flushed before every call
+ *      (weights read cold), GB/s of the nvfp4 bytes, against the BF16 rows kernel on a bf16 weight of the shape; and
+ *      the drafter's gate + up as one multi launch.
  *
  * usage: ./tests/nvfp4_rows_gate [--bench]
  */
@@ -123,33 +129,14 @@ static std::vector<uint16_t> rnd_rows(int M, int in) {
     return v;
 }
 
-/* The reference: the BF16 rows kernel over each K slice of the dequantized weight, slices added in order, x gs. */
-static std::vector<float> ref_rows_kernel(const fix &f, const std::vector<uint16_t> &X, int M) {
-    const int S = pulsar_nvfp4_ksplit(f.in, f.out), ks = f.in / S;
-    std::vector<float> acc((size_t)M * f.out, 0.0f);
-    std::vector<uint16_t> ws((size_t)f.out * ks), xs((size_t)M * ks);
-    for (int q = 0; q < S; q++) {
-        for (int r = 0; r < f.out; r++) memcpy(&ws[(size_t)r * ks], &f.deq[(size_t)r * f.in + q * ks], ks * 2);
-        for (int t = 0; t < M; t++) memcpy(&xs[(size_t)t * ks], &X[(size_t)t * f.in + q * ks], ks * 2);
-        uint16_t *dW = upload(ws), *dX = upload(xs);
-        float *dY = nullptr;
-        CUDA_OK(cudaMalloc((void **)&dY, (size_t)M * f.out * 4));
-        CHECK(pulsar_bf16_rows_linear_launch(dW, dX, M, ks, f.out, dY, false, 0) == 0, "reference rows kernel refused");
-        const std::vector<float> p = download(dY, (size_t)M * f.out);
-        for (size_t i = 0; i < acc.size(); i++) acc[i] = q == 0 ? p[i] : acc[i] + p[i];
-        cudaFree(dW); cudaFree(dX); cudaFree(dY);
-    }
-    for (auto &v : acc) v *= f.gs;
-    return acc;
-}
-
 static void section_exact(void) {
     struct shape { int in, out; const char *what; };
     const shape shapes[] = {
         {4096, 12288, "4096 -> 12288 (gate / up)"}, {12288, 4096, "12288 -> 4096 (down)"},
         {2048, 1024, "2048 -> 1024 (head proj)"},   {1024, 2048, "1024 -> 2048 (head up)"},
         {1024, 1024, "1024 -> 1024 (head down)"},   {512, 1000, "out off 16"},
-        {640, 200, "out off 128, in off 128"},      {4096, 40960, "wide, K unsplit"}};
+        {640, 200, "out off 128, in off 128"},      {4096, 40960, "wide, K unsplit"},
+        {20480, 4096, "20480 -> 4096 (fc)"}};
     const int MR = 20;
     for (const shape &sh : shapes) {
         const fix f = make_fix(sh.in, sh.out, true);
@@ -169,18 +156,15 @@ static void section_exact(void) {
         };
         std::vector<uint16_t> yb16;
         const std::vector<float> y16 = run(16, 0, &yb16);
-        /* 1. bit-exact against the BF16 rows kernel on the dequantized weight */
-        const std::vector<float> ref = ref_rows_kernel(f, X, 16);
-        size_t bad = 0, badb = 0;
-        for (size_t i = 0; i < y16.size(); i++) {
-            bad += memcmp(&y16[i], &ref[i], 4) != 0;
-            badb += yb16[i] != bf16_bits(y16[i]);
-        }
-        CHECK(bad == 0, "%s: %zu of %zu outputs differ from the BF16 rows kernel on the dequantized weight", sh.what, bad,
-              y16.size());
+        /* 2. bytes: bf16 = the f32 rounded; a repeat is the same bytes */
+        size_t badb = 0;
+        for (size_t i = 0; i < y16.size(); i++) badb += yb16[i] != bf16_bits(y16[i]);
+        const std::vector<float> again = run(16, 0, nullptr);
+        const bool repeat = memcmp(again.data(), y16.data(), y16.size() * 4) == 0;
         CHECK(badb == 0, "%s: %zu bf16 outputs are not the f32 output rounded", sh.what, badb);
-        /* 2. graded against double */
-        double worst = 0;
+        CHECK(repeat, "%s: a repeated call differs (not deterministic)", sh.what);
+        /* 1. graded against double */
+        double worst = 0, e2 = 0, f2 = 0, r2 = 0;
         size_t over = 0;
         for (int t = 0; t < 16; t++)
             for (int o = 0; o < f.out; o++) {
@@ -195,6 +179,10 @@ static void section_exact(void) {
                 const double e = fabs((double)y16[(size_t)t * f.out + o] - s);
                 over += !(e <= ldexp(a, -18) + 1e-30);
                 worst = fmax(worst, e / fmax(a, 1e-30));
+                const double b = bf16_val(yb16[(size_t)t * f.out + o]), bfloor = bf16_val(bf16_bits((float)s));
+                e2 += (b - s) * (b - s);
+                f2 += (bfloor - s) * (bfloor - s);
+                r2 += s * s;
             }
         CHECK(over == 0, "%s: %zu outputs past the f32 envelope (worst err / sum|wx| %.2e)", sh.what, over, worst);
         /* 3. M-independence */
@@ -211,9 +199,10 @@ static void section_exact(void) {
         }
         CHECK(diff == 0, "%s: %zu calls (M = 1, 3, 8, 9, 20 and rows 16, 19 alone) differ from the same rows of M = 16",
               sh.what, diff);
-        printf("  %-28s K split %d: %s the BF16 rows kernel on the dequantized weight (f32 and bf16 out); "
-               "worst err/sum|wx| %.2e; M = 1..20 %s\n", sh.what, pulsar_nvfp4_ksplit(f.in, f.out),
-               bad || badb ? "DIFFERS from" : "bit-identical to", worst, diff ? "DIFFER" : "bit-identical");
+        printf("  %-28s K split %d: worst err/sum|wx| %.2e; bf16 out rel err %.3e (bf16 floor %.3e); bf16 == f32 "
+               "rounded %s; repeat %s; M = 1..20 %s\n", sh.what, pulsar_nvfp4_ksplit(f.in, f.out), worst,
+               sqrt(e2 / r2), sqrt(f2 / r2), badb ? "NO" : "yes", repeat ? "bit-identical" : "DIFFERS",
+               diff ? "DIFFER" : "bit-identical");
         /* 4. the front door */
         if (sh.out == 2048) {
             pulsar_rows_linear l{};
@@ -239,6 +228,56 @@ static void section_exact(void) {
           "a misaligned weight accepted");
     cudaFree(y);
     printf("  refusals: in %% 64, no output, a misaligned weight -- refused\n");
+}
+
+static void section_multi(void) {
+    const int in = 1024, out = 2048, M = 8;
+    const fix a = make_fix(in, out, false), b = make_fix(in, out, false);
+    const std::vector<uint16_t> X = rnd_rows(M, in);
+    uint8_t *dA = upload(a.blob), *dB = upload(b.blob);
+    uint16_t *dX = upload(X), *h[2] = {nullptr, nullptr};
+    float *f[2] = {nullptr, nullptr};
+    for (int j = 0; j < 2; j++) {
+        CUDA_OK(cudaMalloc((void **)&f[j], (size_t)M * out * 4));
+        CUDA_OK(cudaMalloc((void **)&h[j], (size_t)M * out * 2));
+    }
+    auto alone = [&](const uint8_t *w) {
+        CHECK(pulsar_nvfp4_rows_linear_launch(w, dX, M, in, out, f[0], h[0], 0) == 0, "multi: a Linear alone refused");
+        return std::make_pair(download(f[0], (size_t)M * out), download(h[0], (size_t)M * out));
+    };
+    const auto ra = alone(dA), rb = alone(dB);
+    auto same = [&](int j, const std::pair<std::vector<float>, std::vector<uint16_t>> &r, bool f32, bool b16) {
+        bool ok = true;
+        if (f32) ok &= memcmp(download(f[j], (size_t)M * out).data(), r.first.data(), (size_t)M * out * 4) == 0;
+        if (b16) ok &= memcmp(download(h[j], (size_t)M * out).data(), r.second.data(), (size_t)M * out * 2) == 0;
+        return ok;
+    };
+    const void *w[2] = {dA, dB};
+    for (int j = 0; j < 2; j++) {
+        CUDA_OK(cudaMemset(f[j], 0xff, (size_t)M * out * 4));
+        CUDA_OK(cudaMemset(h[j], 0xff, (size_t)M * out * 2));
+    }
+    CHECK(pulsar_nvfp4_rows_multi_launch(w, 2, dX, M, in, out, f, h, 0) == 0, "multi launch refused");
+    CHECK(same(0, ra, true, true) && same(1, rb, true, true), "the multi launch != each Linear alone");
+    /* the front door's multi: f32 outputs, then bf16 outputs (the kernel's epilogue) */
+    pulsar_rows_linear la{}, lb{};
+    la.w = dA; lb.w = dB;
+    la.in = lb.in = in; la.out = lb.out = out; la.nvfp4 = lb.nvfp4 = true;
+    const pulsar_rows_linear *ls[2] = {&la, &lb};
+    CUDA_OK(cudaMemset(f[0], 0xff, (size_t)M * out * 4));
+    CUDA_OK(cudaMemset(f[1], 0xff, (size_t)M * out * 4));
+    CHECK(pulsar_rows_linear_multi_launch(ls, 2, dX, M, f, nullptr, 0, 0) == 0, "front door multi (f32) refused");
+    CHECK(same(0, ra, true, false) && same(1, rb, true, false), "front door multi (f32) != each Linear alone");
+    CUDA_OK(cudaMemset(h[0], 0xff, (size_t)M * out * 2));
+    CUDA_OK(cudaMemset(h[1], 0xff, (size_t)M * out * 2));
+    CHECK(pulsar_rows_linear_multi_bf16_launch(ls, 2, dX, M, f, h, nullptr, 0, 0) == 0, "front door multi (bf16) refused");
+    CHECK(same(0, ra, false, true) && same(1, rb, false, true), "front door multi (bf16) != each Linear alone");
+    CHECK(pulsar_nvfp4_rows_multi_launch(w, PULSAR_NVFP4_MULTI_MAX + 1, dX, M, in, out, f, h, 0) == -1,
+          "a multi launch past PULSAR_NVFP4_MULTI_MAX accepted");
+    printf("  multi: gate + up in one launch, and the front door's multi (f32 and bf16), == each Linear alone; "
+           "%d + 1 Linears refused\n", PULSAR_NVFP4_MULTI_MAX);
+    for (int j = 0; j < 2; j++) { cudaFree(f[j]); cudaFree(h[j]); }
+    cudaFree(dA); cudaFree(dB); cudaFree(dX);
 }
 
 static void section_bench(void) {
@@ -285,6 +324,15 @@ static void section_bench(void) {
             const double tb = med([&] { pulsar_bf16_rows_linear_launch(dB, dX, M, f.in, f.out, dY, false, 0); });
             printf("  %-16s %6d %7d  %3d  %10.1f %8.1f   %10.1f %8.1f   %5.2fx\n", sh.what, f.in, f.out, M, tn,
                    (double)f.blob.size() / tn / 1e3, tb, (double)f.out * f.in * 2 / tb / 1e3, tb / tn);
+            if (f.out == 12288) {   /* the drafter's gate + up: one multi launch (the same weight twice: cold anyway) */
+                uint8_t *dW2 = upload(f.blob);
+                const void *w2[2] = {dW, dW2};
+                float *ys[2] = {dY, dY};
+                const double tm = med([&] { pulsar_nvfp4_rows_multi_launch(w2, 2, dX, M, f.in, f.out, ys, nullptr, 0); });
+                printf("  %-16s %6d %7d  %3d  %10.1f %8.1f   (gate + up, one launch; two launches: %.1f us)\n",
+                       "mlp gate+up", f.in, f.out, M, tm, 2.0 * f.blob.size() / tm / 1e3, 2 * tn);
+                cudaFree(dW2);
+            }
         }
         cudaFree(dW); cudaFree(dB); cudaFree(dX); cudaFree(dY);
     }
@@ -296,7 +344,10 @@ static void section_bench(void) {
 int main(int argc, char **argv) {
     const bool bench = argc > 1 && !strcmp(argv[1], "--bench");
     printf("NVFP4 rows gate (L298): NVFP4 W4A16 x raw bf16 rows\n");
-    if (!bench) section_exact();
+    if (!bench) {
+        section_exact();
+        section_multi();
+    }
     else section_bench();
     if (g_fail) {
         printf("NVFP4 rows gate: FAIL\n");
