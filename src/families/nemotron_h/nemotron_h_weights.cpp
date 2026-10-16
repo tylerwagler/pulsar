@@ -84,14 +84,30 @@ bool pulsar_nemotron_h_bind(const pulsar_model *m, pulsar_nemotron_h_model *w) {
     w->head = pulsar_role_bind(b, pulsar_role_top("head"), A_HEAD, 2, E, V);
     for (uint32_t il = 0; il < s->n_layer; il++)
         bind_block(b, s, LAYERS, (int32_t)il, s->mamba_layers >> il & 1u, s->moe_layers >> il & 1u, &w->layer[il]);
-    /* the drafter: one {attention, MoE} layer plus its input side and its out norm, when the container holds it */
-    if (s->mtp_written) {
+    /* the drafter: one {attention, MoE} layer plus its input side and its out norm, when the open selected it (L298:
+     * otherwise declared unloaded -- never staged, never priced) */
+    if (s->mtp_written && !w->drafting) {
+        const uint64_t n = pulsar_role_binder_unload(b, MTP);
+        fprintf(stderr, "pulsar: %s: the MTP module (%llu tensors) is not the selected drafter: unloaded\n", OWNER,
+                (unsigned long long)n);
+    } else if (s->mtp_written) {
         pulsar_nemotron_h_draft *D = &w->mtp;
         bind_block(b, s, MTP, 0, false, true, &D->block);
         D->embed_norm = pulsar_role_bind(b, pulsar_role_in("draft_embed_norm", MTP, 0), A_BF16, 1, E);
         D->hidden_norm = pulsar_role_bind(b, pulsar_role_in("draft_hidden_norm", MTP, 0), A_BF16, 1, E);
         D->in_proj = pulsar_role_bind(b, pulsar_role_in("draft_in_proj", MTP, 0), A_LINEAR, 2, 2 * E, E);
         D->out_norm = pulsar_role_bind(b, pulsar_role_in("draft_out_norm", MTP, 0), A_BF16, 1, E);
+    }
+    /* L298: the LiLiCorr block drafter (block `drafter`) and its candidate head (block `lilicorr`) when the open
+     * selected it, else unloaded */
+    if (s->block_written) {
+        if (w->block) {
+            (void)pulsar_block_drafter_bind(b, w->block);
+        } else {
+            const uint64_t n = pulsar_role_binder_unload(b, "drafter") + pulsar_role_binder_unload(b, "lilicorr");
+            fprintf(stderr, "pulsar: %s: the LiLiCorr drafter (%llu tensors) is not the selected drafter: unloaded\n",
+                    OWNER, (unsigned long long)n);
+        }
     }
     /* the census: every directory entry declared, every byte priced (the extras refused by name) */
     return pulsar_role_binder_close(b, &w->census);

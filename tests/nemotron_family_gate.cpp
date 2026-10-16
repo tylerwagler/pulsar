@@ -15,6 +15,7 @@
  * container and tests/loader_open on each mutant.  Exit 0 = every check passed. */
 #include "families/nemotron_h/nemotron_h.h"
 #include "engine/exl3_trellis.h"
+#include "engine/spec_block.h"
 #include "engine/spec_mtp.h"
 
 #include <stdarg.h>
@@ -229,9 +230,9 @@ int main(int argc, char **argv) {
     const uint32_t want = PULSAR_FAMILY_CAP_CHAT | PULSAR_FAMILY_CAP_BANKS | PULSAR_FAMILY_CAP_SEGMENTS |
                           PULSAR_FAMILY_CAP_PAYLOAD | PULSAR_FAMILY_CAP_SPEC;
     check(e->family->caps == want && e->family->spec == &PULSAR_DRIVER_SPEC_TARGET &&
-              e->family->driver->mtp && e->family->driver->absorb == pulsar_mtp_absorb,
+              e->family->driver->mtp && e->family->driver->absorb == pulsar_drafter_lane_absorb,
           "caps 0x%x (chat, banks, segments, payload, spec: the driver's verify target; no TP / images yet); the "
-          "driver declares its MTP module to the chained-MTP lane", e->family->caps);
+          "driver declares its MTP module, its lockstep the drafter lane's (MTP or block, L298)", e->family->caps);
     pulsar_engine_close(e);
     fprintf(stderr, "NEMOTRON-FAMILY PROBE %s\n", n_fail ? "FAIL" : "PASS");
     return n_fail ? 1 : 0;

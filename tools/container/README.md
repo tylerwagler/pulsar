@@ -54,6 +54,11 @@ deepseek.py / qwen.py / inkling.py      # the family modules (build.FAMILIES, by
                                         #  inkling.Source names the projections Inkling's fused w13 / expert stacks hold
                                         #  (the EXL3 pack's names) and checks names, dtypes, shapes against the declared
                                         #  Shape both ways; Mapped.bind carries the role table into pulsar.tensors
+nemotron_h.py                           # Nemotron-H (the Omni checkpoint); with_drafter(hf, kind, dir) is build.py's
+                                        #  --drafter lilicorr DIR (L298): NVIDIA's LiLiCorr block drafter written into
+                                        #  the container (shard `drafter`, names `drafter.<HF name>`, bind blocks
+                                        #  drafter / lilicorr, kv pulsar.drafter + lilicorr.*); the recipe omits the MTP.
+                                        #  Every drafter config key written or ignored-with-a-reason, the rest refused
 
 producers.py                            # every producer: bytes in, bytes out, no I/O; each gated byte-identical
   PRODUCER_FOR[(source kind, format)]   # THE producer table; producer_for(kind, fmt, what) refuses a missing pair by name
@@ -61,6 +66,8 @@ producers.py                            # every producer: bytes in, bytes out, n
   def mxfp8_lt(w_fp8, scale_e8m0, out, inp, block, mode) -> bytes   # 'rederive' (archived codec) | 'verbatim'
   def mxfp8_lt_from_bf16(w_bf16, out, inp) -> bytes
   def cutlass_mxfp4(w_i8, scale_e8m0, out, inp) -> bytes            # per-expert [data | SF]
+  def nvfp4(w_u8, scale_e4m3, scale2_f32, out, inp) -> bytes        # ModelOpt NVFP4 Linear: [nibbles | 128x4-tiled
+                                                                     #  E4M3 SF | f32 scale_2 + 28 zero B]; in % 64
   def fp8_e4m3_soa_k_from_bf16(w_bf16, rows, cols) -> bytes          # markov_w2, k-major
   def i64_to_i32(raw) -> bytes                                       # tid2eid; refuses a value outside int32
   def tessera_planes(...)                                            # the (tessera, tessera) slot: refuses until L255

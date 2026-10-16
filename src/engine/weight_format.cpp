@@ -7,7 +7,8 @@
  * this table's answer -- one per kernel the engine has (research/family-plugin-audit-2026-10-06/09):
  *
  *   dense            slot bf16 plane: F32, BF16 (cuBLAS)            slot E4M3: MXFP8_LT (cuBLASLt)
- *                    bf16 rows: MXFP8_LT (split-K GEMV / MMA), EXL3 at a dense-arm rate, BF16 (L295 F7)
+ *                    bf16 rows: MXFP8_LT (split-K GEMV / MMA), EXL3 at a dense-arm rate, BF16 (L295 F7),
+ *                               NVFP4 (L298: W4A16, any family)
  *   expert gate/up   slot E4M3: CUTLASS MXFP4, IQ2 MMQ, EXL3 at a pair-arm rate   rows: EXL3 pair-arm, BF16
  *   expert down      slot E4M3: CUTLASS MXFP4, IQ2 MMQ, EXL3 at a down-arm rate   rows: EXL3 down-arm, BF16
  *   fused gate_up    bf16 rows: EXL3 at a fused-arm rate
@@ -15,7 +16,7 @@
  *
  * A combination with no kernel refuses by name at load -- never a converted activation (rule 3: producers emit,
  * consumers never convert).  Filling one (an E4M3-activation EXL3 dense arm for a DeepSeek EXL3 artifact, a bf16
- * CUTLASS MXFP4 MoE for a Qwen MXFP4 artifact, NVFP4 weights) is a kernel plus a line here. */
+ * CUTLASS MXFP4 MoE for a Qwen MXFP4 artifact, NVFP4 experts) is a kernel plus a line here. */
 #include "pulsar_engine_internal.h"
 #include "exl3_trellis.h"
 
@@ -38,6 +39,7 @@ pulsar_dense_arm pulsar_dense_arm_for(uint32_t type, pulsar_act_format act) {
     case PULSAR_ACT_ROWS_BF16:
         return type == PULSAR_TENSOR_MXFP8_LT ? PULSAR_DENSE_ARM_MXFP8_ROWS
              : type == PULSAR_TENSOR_BF16 ? PULSAR_DENSE_ARM_BF16_ROWS
+             : type == PULSAR_TENSOR_NVFP4 ? PULSAR_DENSE_ARM_NVFP4_ROWS
              : exl3_arm(type, EXL3_ARM_DENSE) ? PULSAR_DENSE_ARM_EXL3_ROWS : PULSAR_DENSE_ARM_NONE;
     case PULSAR_ACT_COUNT: break;
     }

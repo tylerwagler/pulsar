@@ -24,6 +24,11 @@ void unload(pulsar_engine *e) {
 
 bool load(pulsar_engine *e, const pulsar_engine_options *opt) {
     /* the options that name another family's feature refuse here, by name, rather than being ignored */
+    if (opt->drafter && opt->drafter[0]) {
+        fprintf(stderr, "pulsar: %s: --drafter %s: this family's container holds no drafter to choose; refusing\n", ARCH,
+                opt->drafter);
+        return false;
+    }
     if (opt->expert_overlay && opt->expert_overlay[0]) {
         fprintf(stderr, "pulsar: %s: --expert-overlay is a DeepSeek routed-expert tool; refusing\n", ARCH);
         return false;
