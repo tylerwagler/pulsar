@@ -13,6 +13,8 @@
  * r0 = bf16(bf16(x0 c) - bf16(x1 s)), r1 = bf16(bf16(x1 c) + bf16(x0 s)).
  * The keys a row attends are lo .. hi: hi = pos (causal), or a block's run's last
  * position (bidirectional inside the run, no bias).
+ * E4M3 KV rows (L298): the stored k and v are their bf16 values rounded to E4M3
+ * at unit scale, satfinite (gref_e4m3, transcribed from the format); q is not.
  *
  * tau is the module's own f32 formula (gqa_tau): the reference vLLM / transformers
  * compute it in torch f32, which the GPU does not see -- both read this value. */
@@ -40,6 +42,33 @@ static inline float gref_bf2f(uint16_t b) {
 }
 static inline float gref_round(float f) { return gref_bf2f(gref_f2bf(f)); }
 
+/* E4M3 (OCP fn: bias 7, no inf, max 448, subnormals m * 2^-9) at unit scale, transcribed from the format: round to
+ * nearest even on the value's own quantum, saturating finite (|x| > 448 -> 448).  The byte, then its value. */
+static inline uint8_t gref_e4m3_bits(float x) {
+    if (x != x) return 0x7f;
+    const uint8_t sign = signbit(x) ? 0x80 : 0x00;
+    const double a = fabs((double)x);
+    if (a >= 448.0) return sign | 0x7e;                               /* S.1111.110 = 448 */
+    if (a < 0x1p-6) {                                                 /* subnormal: quantum 2^-9 */
+        const double m = nearbyint(a * 512.0);                        /* 8 -> the smallest normal */
+        return sign | (uint8_t)m;                                     /* m = 8 encodes 0.0001.000, the same value */
+    }
+    int e2;
+    frexp(a, &e2);                                                    /* a = f 2^e2, f in [0.5, 1) */
+    const int e = e2 - 1;                                             /* a in [2^e, 2^(e+1)) */
+    double r = nearbyint(ldexp(a, 3 - e));                            /* mantissa with the hidden bit, 8 .. 16 */
+    int ee = e;
+    if (r >= 16.0) { r = 8.0; ee++; }
+    if (ldexp(r, ee - 3) > 448.0) return sign | 0x7e;
+    return sign | (uint8_t)(((ee + 7) << 3) | ((int)r - 8));
+}
+static inline float gref_e4m3_val(uint8_t b) {
+    const int ex = (b >> 3) & 15, m = b & 7;
+    const double v = ex == 0 ? ldexp((double)m, -9) : ldexp((double)(8 + m), ex - 10);
+    return (float)((b & 0x80) ? -v : v);
+}
+static inline float gref_e4m3(float x) { return gref_e4m3_val(gref_e4m3_bits(x)); }
+
 struct gref_layer {
     uint32_t n_q, n_kv, hd;
     uint32_t window;            /* 0 = full */
@@ -52,6 +81,7 @@ struct gref_layer {
     float floor_, alpha;        /* floor_ 0 = no temperature */
     bool gate;
     float rope_theta = 0.f;     /* > 0: NeoX rope of q and k */
+    bool e4m3 = false;          /* E4M3 KV rows: the stored k and v are gref_e4m3 of their bf16 values */
 };
 
 /* how the rope is applied: as declared (NeoX), not at all, or with the interleaved
@@ -102,7 +132,12 @@ static inline void gref_norm(const gref_layer &L, const float *x, const std::vec
  * doubles.  Mutations for the gate's discrimination checks: drop_bias, drop_tau,
  * window_delta, and the q rope's mode (the matching k comes from a History built
  * with the same mode). */
-struct gref_mut { bool drop_bias = false, drop_tau = false; int window_delta = 0; int rope = GREF_ROPE_NEOX; };
+struct gref_mut {
+    bool drop_bias = false, drop_tau = false;
+    int window_delta = 0;
+    int rope = GREF_ROPE_NEOX;
+    bool drop_e4m3 = false;   /* the history keeps E4M3 rows' k / v at bf16 */
+};
 
 static inline void gref_row(const gref_layer &L, uint32_t pos, uint32_t hi, uint32_t base, const float *kh,
                             const float *vh, const float *qin, const float *r, const float *gate, double *out,

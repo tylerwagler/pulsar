@@ -39,8 +39,12 @@
  * each row seeing its run's later rows (a causal reference must fail), the
  * pools byte-unchanged, alone == half-batched (split) == all-batched (folded) ==
  * bounded, bit-exact -- on a 300-key window and on the real 8192 (contexts
- * where a block row's keys span one chunk more than its window's).
- * Then refusals (incl. block + bias, store of a block, a bad rope base).
+ * where a block row's keys span one chunk more than its window's).  All of it
+ * again with E4M3 KV rows (unit scale, satfinite; the host rounds stored k and v
+ * with its own transcription of the format; a 'bf16 k / v' reference must fail;
+ * v's outliers saturate at 448).
+ * Then refusals (incl. block + bias, a block run past 256 rows, store of a block,
+ * a bad rope base, E4M3 + bias, an unknown KV format).
  *
  * The fixture is live: an additive bias of ~N(0, 4) over logits of ~N(0, 0.1)
  * (RMS-normed q, k at scale 1/head_dim) gives peaked rows; the log prints the
@@ -324,10 +328,11 @@ struct History {
     std::vector<float> rows;         /* raw fused rows [pos - rbase][ld] */
     const float *row(const Case &C, uint32_t p) const { return &rows[(uint64_t)(p - rbase) * C.ld]; }
 };
-/* positions [from, n) of sequence sid (raw rows kept from rows_from on); `rope`: the k rotation (a mutation's
- * history is built with the mutated one) */
+/* positions [from, n) of sequence sid (raw rows kept from rows_from on); a mutation's history is built with its
+ * mutated k rope (mu.rope) and E4M3 rows (mu.drop_e4m3) */
 static void history_build(const Case &C, uint64_t sid, uint32_t n, History &H, uint32_t from = 0, uint32_t rows_from = 0,
-                          int rope = GREF_ROPE_NEOX) {
+                          const gref_mut &mu = gref_mut()) {
+    const bool e4 = C.R.e4m3 && !mu.drop_e4m3;
     const uint32_t nkv = C.R.n_kv, hd = C.R.hd;
     H.base = from; H.rbase = std::max(from, rows_from);
     H.kh.assign((uint64_t)(n - from) * nkv * hd, 0.f); H.vh = H.kh;
@@ -340,8 +345,10 @@ static void history_build(const Case &C, uint64_t sid, uint32_t n, History &H, u
         for (uint32_t g = 0; g < nkv; g++) {
             float *k = &H.kh[((uint64_t)i * nkv + g) * hd];
             gref_norm(C.R, row + C.off_k + (uint64_t)g * hd, C.R.kw, k);
-            gref_rope(C.R, p, k, rope);
-            memcpy(&H.vh[((uint64_t)i * nkv + g) * hd], row + C.off_v + (uint64_t)g * hd, hd * 4);
+            gref_rope(C.R, p, k, mu.rope);
+            float *v = &H.vh[((uint64_t)i * nkv + g) * hd];
+            memcpy(v, row + C.off_v + (uint64_t)g * hd, hd * 4);
+            if (e4) for (uint32_t j = 0; j < hd; j++) { k[j] = gref_e4m3(k[j]); v[j] = gref_e4m3(v[j]); }
         }
     });
 }
@@ -408,11 +415,15 @@ static double mean_peak(const Case &C, const History &H, const std::vector<uint3
     return acc / cnt;
 }
 
+static void kv_mutations(const Case &C, uint64_t sid, uint32_t n, uint32_t from, uint32_t rows_from,
+                         const std::vector<uint32_t> &pl, const std::vector<const Out *> &gp, const char *where);
+
 static void run_case(Case &C) {
     printf("\n=== %s: %uq/%ukv/%u, %s %u (pool %u), rel bias extent %u, temperature floor %.0f, qk norm %s, gate %s, "
-           "rope base %.0f, %u tokens\n", C.name, C.R.n_q, C.R.n_kv, C.R.hd, C.R.window ? "window" : "full, window",
-           C.R.window, C.cap, C.R.extent, C.R.floor_, C.R.qk_norm ? "on" : "off", C.R.gate ? "on" : "off",
-           C.R.rope_theta, C.N);
+           "rope base %.0f, KV %s (%llu B/token), %u tokens\n", C.name, C.R.n_q, C.R.n_kv, C.R.hd,
+           C.R.window ? "window" : "full, window", C.R.window, C.cap, C.R.extent, C.R.floor_, C.R.qk_norm ? "on" : "off",
+           C.R.gate ? "on" : "off", C.R.rope_theta, C.R.e4m3 ? "E4M3" : "BF16",
+           (unsigned long long)pulsar_gqa_kv_token_bytes(&C.L), C.N);
     const uint32_t N = C.N;
     History H;
     history_build(C, 1, N, H);
@@ -547,17 +558,7 @@ static void run_case(Case &C) {
             check(M.fro >= 20 * BAR_FRO || M.max >= 20 * BAR_MAX,
                   "mutation '%s' fails the grade: fro %.2e, max %.2e", m.what, M.fro, M.max);
         }
-        /* L298: the rope dropped from q and k, or applied with the interleaved pair layout (x[2p], x[2p+1]) */
-        if (C.R.rope_theta > 0.f) {
-            for (const int mode : {(int)GREF_ROPE_NONE, (int)GREF_ROPE_INTERLEAVED}) {
-                History Hm;
-                history_build(C, 1, N, Hm, 0, 0, mode);
-                gref_mut mu; mu.rope = mode;
-                const Grade M = grade(C, Hm, all, gp, mu);
-                check(M.fro >= 20 * BAR_FRO || M.max >= 20 * BAR_MAX, "mutation '%s' fails the grade: fro %.2e, max %.2e",
-                      mode == GREF_ROPE_NONE ? "no rope" : "interleaved rope pairs", M.fro, M.max);
-            }
-        }
+        kv_mutations(C, 1, N, 0, 0, all, gp, "");
     }
     /* 8. store (L298): pulsar_gqa_store of the prompt's rows, in one call and in calls of 1, 37, 64, 63, 200, ..., leaves
      * the pool the forward's prefill left, byte for byte (a window's ring wraps inside the calls) */
@@ -573,25 +574,54 @@ static void run_case(Case &C) {
     seq_free(A);
 }
 
-/* the pool's stored K heads at positions [p0, p1) against the history's normed + roped k (bf16 values): the share of
- * elements equal and the worst |difference| */
-static void kpool_vs_history(const Case &C, const Seq &s, const History &H, uint32_t p0, uint32_t p1, double *eq, double *worst) {
+/* the pool's stored K and V heads at positions [p0, p1) against the history's (normed + roped k, v; E4M3-rounded for
+ * E4M3 rows), element for element in the row's format: the share of elements whose bytes are equal and the worst
+ * |difference| of their values */
+static void kvpool_vs_history(const Case &C, const Seq &s, const History &H, uint32_t p0, uint32_t p1, double *eq,
+                              double *worst) {
     const std::vector<uint8_t> pool = pool_bytes(s);
-    const uint32_t nkv = C.R.n_kv, hd = C.R.hd;
+    const uint32_t nkv = C.R.n_kv, hd = C.R.hd, ne = nkv * hd;
     const uint64_t tb = pulsar_gqa_kv_token_bytes(&C.L);
     uint64_t n = 0, same_n = 0;
     double w = 0;
     for (uint32_t p = p0; p < p1; p++) {
-        const uint16_t *rec = (const uint16_t *)(pool.data() + (uint64_t)(C.R.window ? p % s.cap : p) * tb);
-        for (uint32_t i = 0; i < nkv * hd; i++) {
-            const float host = H.kh[(uint64_t)(p - H.base) * nkv * hd + i], dev = gref_bf2f(rec[i]);
-            same_n += gref_f2bf(host) == rec[i];
+        const uint8_t *rec = pool.data() + (uint64_t)(C.R.window ? p % s.cap : p) * tb;
+        for (uint32_t i = 0; i < 2u * ne; i++) {
+            const float host = i < ne ? H.kh[(uint64_t)(p - H.base) * ne + i] : H.vh[(uint64_t)(p - H.base) * ne + i - ne];
+            float dev;
+            if (C.R.e4m3) {
+                dev = gref_e4m3_val(rec[i]);
+                same_n += gref_e4m3_bits(host) == rec[i];
+            } else {
+                uint16_t b;
+                memcpy(&b, rec + 2u * i, 2);
+                dev = gref_bf2f(b);
+                same_n += gref_f2bf(host) == b;
+            }
             w = std::max(w, fabs((double)dev - host));
             n++;
         }
     }
     *eq = (double)same_n / (double)n;
     *worst = w;
+}
+
+/* L298 mutations of the stored rows: the rope dropped from q and k or applied with the interleaved pair layout
+ * (x[2p], x[2p+1]); E4M3 rows' k / v kept at bf16.  Each must FAIL the grade of the rows pl / gp. */
+static void kv_mutations(const Case &C, uint64_t sid, uint32_t n, uint32_t from, uint32_t rows_from,
+                         const std::vector<uint32_t> &pl, const std::vector<const Out *> &gp, const char *where) {
+    struct { const char *what; gref_mut mu; bool applies; } ms[3];
+    ms[0] = {"no rope", gref_mut(), C.R.rope_theta > 0.f}; ms[0].mu.rope = GREF_ROPE_NONE;
+    ms[1] = {"interleaved rope pairs", gref_mut(), C.R.rope_theta > 0.f}; ms[1].mu.rope = GREF_ROPE_INTERLEAVED;
+    ms[2] = {"bf16 k / v (no E4M3 rounding)", gref_mut(), C.R.e4m3}; ms[2].mu.drop_e4m3 = true;
+    for (auto &m : ms) {
+        if (!m.applies) continue;
+        History Hm;
+        history_build(C, sid, n, Hm, from, rows_from, m.mu);
+        const Grade M = grade(C, Hm, pl, gp, m.mu);
+        check(M.fro >= 20 * BAR_FRO || M.max >= 20 * BAR_MAX, "mutation '%s'%s fails the grade: fro %.2e, max %.2e",
+              m.what, where, M.fro, M.max);
+    }
 }
 
 /* L298 rope at LARGE positions (the angle pos * inv_freq up to ~1e5 rad): a window layer whose context [P0 - cap - 25,
@@ -607,8 +637,8 @@ static void run_rope_long(Case &C, uint32_t P0) {
         history_build(C, 1, C.cap, Hs);
         Seq Z = seq_new(C, 1);
         double eq = 0, worst = 0;
-        if (store_schedule(C, Z, 0, C.cap, {C.cap})) kpool_vs_history(C, Z, Hs, 0, C.cap, &eq, &worst);
-        check(eq == 1.0, "rope (small positions 0..%u): stored K == the host's bf16 NeoX rope: %.6f of elements equal, "
+        if (store_schedule(C, Z, 0, C.cap, {C.cap})) kvpool_vs_history(C, Z, Hs, 0, C.cap, &eq, &worst);
+        check(eq == 1.0, "rope (small positions 0..%u): stored K, V == the host's (rope, row format): %.6f of elements equal, "
               "worst |diff| %.3e", C.cap - 1u, eq, worst);
         seq_free(Z);
     }
@@ -622,8 +652,8 @@ static void run_rope_long(Case &C, uint32_t P0) {
           "forward's pool, byte-identical", P0 - S0);
     {
         double eq = 0, worst = 0;
-        kpool_vs_history(C, A, H, P0 - C.cap, P0, &eq, &worst);
-        check(eq == 1.0, "rope (positions %u..%u): stored K == the host's bf16 NeoX rope: %.6f of elements equal, worst "
+        kvpool_vs_history(C, A, H, P0 - C.cap, P0, &eq, &worst);
+        check(eq == 1.0, "rope (positions %u..%u): stored K, V == the host's (rope, row format): %.6f of elements equal, worst "
               "|diff| %.3e", P0 - C.cap, P0 - 1u, eq, worst);
     }
     std::vector<Out> big = run_schedule(C, A, P0, P0 + n_new, {n_new});
@@ -641,15 +671,7 @@ static void run_rope_long(Case &C, uint32_t P0) {
         check(G.fro <= BAR_FRO && G.max <= BAR_MAX && G.eq >= BAR_EQ,
               "rope at large positions fidelity (%u rows, graded): fro %.2e, max %.2e, bf16 out == bf16(ref) %.4f", n_new,
               G.fro, G.max, G.eq);
-        for (const int mode : {(int)GREF_ROPE_NONE, (int)GREF_ROPE_INTERLEAVED}) {
-            History Hm;
-            history_build(C, 1, P0 + n_new, Hm, S0, P0, mode);
-            gref_mut mu; mu.rope = mode;
-            const Grade M = grade(C, Hm, pl, gp, mu);
-            check(M.fro >= 20 * BAR_FRO || M.max >= 20 * BAR_MAX,
-                  "mutation '%s' at large positions fails the grade: fro %.2e, max %.2e",
-                  mode == GREF_ROPE_NONE ? "no rope" : "interleaved rope pairs", M.fro, M.max);
-        }
+        kv_mutations(C, 1, P0 + n_new, S0, P0, pl, gp, " at large positions");
     }
     seq_free(A); seq_free(B); seq_free(F);
 }
@@ -817,6 +839,8 @@ static void run_refusals(Case &C, Case &Rp) {
     L = C.L; L.rope_theta = -10000.f; expect("a negative rope base", L, {{0, 0}});
     L = C.L; L.rope_theta = INFINITY; expect("an infinite rope base", L, {{0, 0}});
     L = C.L; L.rope_theta = -10000.f; expect("a store with a negative rope base", L, {{0, 0}}, true);
+    L = C.L; L.kv_fmt = PULSAR_GQA_KV_E4M3; expect("E4M3 KV rows with a relative bias", L, {{0, 0}});
+    L = C.L; L.kv_fmt = (pulsar_gqa_kv_fmt)2; expect("a KV row format with no loader (2)", L, {{0, 0}});
     {
         Seq B = seq_new(Rp, 1);
         std::vector<Seq *> w{&B};
@@ -825,6 +849,10 @@ static void run_refusals(Case &C, Case &Rp) {
         const std::vector<uint8_t> before = pool_bytes(B);
         const int rc = run_call(Bk, w, {{0, 0}, {0, 1}}, nullptr, false, true);
         check(rc == -1 && pool_bytes(B) == before, "refused: a store with block = 1, the pool untouched (rc %d)", rc);
+        std::vector<std::pair<uint32_t, uint32_t>> run;
+        for (uint32_t i = 0; i < 257; i++) run.push_back({0u, i});
+        const int rc2 = run_call(Bk, w, run, nullptr);
+        check(rc2 == -1, "refused: a block run of 257 rows (a block row reads at most 255 keys past it) (rc %d)", rc2);
         seq_free(B);
     }
     L = C.L;
@@ -988,6 +1016,25 @@ int main(int argc, char **argv) {
     run_rope_long(gr, 100000);
     run_block(gr, {1, 37, 299, 300, 301, 515, 777, 1000});
     run_block(gb, {8441, 8444, 8200, 8700, 300, 8443, 9000, 8442});
+
+    /* L298: the same with E4M3 KV rows (unit scale, satfinite) -- the drafter's lane.  Raw inputs at sd 25 (v's outlier
+     * channels at 150) so some v elements pass 448 and saturate; q and k are normed, so their scale is moot. */
+    Case er, eb;
+    case_init(er, "drafter-window-rope-e4m3", 32, 8, 128, 300, 300 + 15, true, 0, 0.f, 0.f, false, 1.0f / sqrtf(128.f), N, 88);
+    case_init(eb, "drafter-window8192-rope-e4m3", 32, 8, 128, 8192, 8192 + 15, true, 0, 0.f, 0.f, false, 1.0f / sqrtf(128.f), 0, 99);
+    for (Case *c : {&er, &eb}) {
+        c->R.eps = 1e-5f; c->L.norm_eps = 1e-5f;
+        c->R.rope_theta = 1e6f; c->L.rope_theta = 1e6f;
+        c->R.e4m3 = true; c->L.kv_fmt = PULSAR_GQA_KV_E4M3;
+        c->in_sd = 25.0;
+    }
+    check(pulsar_gqa_kv_token_bytes(&er.L) == 8u * 2u * 128u * 1u && pulsar_gqa_kv_token_bytes(&gr.L) == 8u * 2u * 128u * 2u,
+          "E4M3 KV rows: %llu B per token (n_kv * 2 * head_dim * 1); BF16 %llu B",
+          (unsigned long long)pulsar_gqa_kv_token_bytes(&er.L), (unsigned long long)pulsar_gqa_kv_token_bytes(&gr.L));
+    run_case(er);
+    run_rope_long(er, 100000);
+    run_block(er, {1, 37, 299, 300, 301, 515, 777, 1000});
+    run_block(eb, {8441, 8444, 8200, 8700, 300, 8443, 9000, 8442});
 
     run_refusals(g1, gr);
 
