@@ -18,7 +18,9 @@
  *              (spec_ops.h) and the priced depth (L288) run token by token; every bank's chain runs in LOCKSTEP --
  *              one module step a position for all of them, the head once a step;
  *   absorb     after a round's commit, the kept verify rows' module rows (their trunk rows, the tokens after them) of
- *              every bank in ONE step of decode rows, and each bank's last kept row parked;
+ *              every bank in ONE step of decode rows, and each bank's last kept row parked -- and, for a row-exact
+ *              module (L296 draft-cost), each bank's next chain's step 1 (the last kept row with the round's carry) in
+ *              the same step, headed: the chain starts at step 2 (pulsar_mtp_prime);
  *   harvest    nothing deferred (the chain's picks are read as it runs).
  *
  * The lane's per-bank counters are kept in step with the declared state by the plan's drafter hooks
@@ -61,7 +63,10 @@ typedef struct {
     const int32_t *bank;        ///< [n]
     uint32_t n;
     const pulsar_gpu_tensor *cond;   ///< the conditioning rows: row i at i * cond_bytes (the lane's)
-    uint32_t head_n;            ///< rows [0, head_n) are headed (0 = none)
+    uint32_t head_n;            ///< rows [0, head_n) are headed (0 = none) -- or the rows head_rows lists
+    /** NULL, or [head_n] the headed rows, ascending (the absorb's: each bank's last row, L296 draft-cost); pick and
+     *  logits are in this order */
+    const uint32_t *head_rows;
     pulsar_mtp_pick *pick;      ///< [head_n] their picks, reduced on the device (NULL = none)
     float *logits;              ///< host [head_n][head_width]: their logits rows (NULL = not read back)
 } pulsar_mtp_step;
@@ -116,6 +121,17 @@ typedef struct {
     uint32_t cap, n;
 } pulsar_mtp_probe;
 
+/** L296 draft-cost: a bank's next chain's step 1, run ahead by the round's absorb -- the parked row at `pos` with the
+ *  round's carry `tok` (both known when the absorb runs: the carry is its last row's next token) as one more row of the
+ *  absorb's module step, headed.  The chain whose step 1 is that row takes it from here instead of a module step of its
+ *  own: the same row of the same module over the same inputs (a row-exact module: the same bytes), so the same draft. */
+typedef struct {
+    bool valid;
+    uint32_t pos;               ///< the module row's position (the parked row's)
+    int32_t tok;                ///< its input token (the carry)
+    pulsar_mtp_pick pick;       ///< its head's pick
+} pulsar_mtp_prime;
+
 /** The lane's per-session state (pulsar_driver_state::mtp; the driver builds it when the family's ops declare
  *  modules). */
 struct pulsar_mtp_lane {
@@ -127,6 +143,12 @@ struct pulsar_mtp_lane {
     pulsar_gpu_tensor *cond;    ///< [max_rows] the conditioning rows a module step reads
     uint32_t *pend_pos;         ///< [n_banks] the parked row's position; UINT32_MAX = none
     bool *stage_dirty;          ///< [n_banks] a chain wrote draft rows into the saved stage (stage_save)
+    /** L296 draft-cost: each bank's step 1 run ahead by the absorb (a row-exact module only), its output row
+     *  (prime_out, [n_banks] conditioning rows) and its logits row (prime_logits, host [n_banks][head_width]: a sampled
+     *  chain's q; prime_stage, host [PULSAR_DRIVER_HEADS_MAX][head_width]: the absorb step's headed rows as read) */
+    pulsar_mtp_prime *prime;
+    pulsar_gpu_tensor *prime_out;
+    float *prime_logits, *prime_stage;
     int32_t vtok[PULSAR_DRIVER_HEADS_MAX];   ///< the last verify step's tokens, by step row (pulsar_mtp_note_verify)
     uint32_t n_vtok;
     pulsar_mtp_probe *probe;    ///< NULL = off

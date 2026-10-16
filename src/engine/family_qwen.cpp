@@ -1088,6 +1088,12 @@ static bool qwen_mtp_step(pulsar_session *s, const pulsar_mtp_step *m) {
         fprintf(stderr, "pulsar: %s: MTP module %u of one -- refusing\n", PULSAR_QWEN_ARCH, m->module);
         return false;
     }
+    /* the lane lists headed rows only for a row-exact module's absorb (its primes, L296 draft-cost); this one is not */
+    if (m->head_rows) {
+        fprintf(stderr, "pulsar: %s: an MTP step heading listed rows (a row-exact module's absorb) -- refusing\n",
+                PULSAR_QWEN_ARCH);
+        return false;
+    }
     qwen_mtp_pick pk[PULSAR_QWEN_HEAD_ROWS_MAX];
     if (m->pick && m->head_n > PULSAR_QWEN_HEAD_ROWS_MAX) return false;
     const bool ok = qwen_mtp_forward(s, m->mode, m->cond, m->tokens, m->pos, m->bank, m->n, 0, m->head_n, m->logits,

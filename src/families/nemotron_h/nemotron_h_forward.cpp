@@ -1110,7 +1110,17 @@ bool mtp_forward(pulsar_session *s, const pulsar_mtp_step *m) {
     /* the module's {attention, MoE}; its last add writes final_layernorm(x) into mo */
     if (ok) ok = compose(&st, il, false, true, an, fn, mo);
     if (ok && gpu_graph_debug_dump_enabled()) dump_rows(&st, "nemotron_mtp", q->mo, 0, E, il);
-    if (ok && m->head_n) ok = draft_head_rows(&st, mo, m->head_n);
+    /* the headed rows: [0, head_n), or (L296 draft-cost: the absorb's primes) the listed rows gathered into mh -- the
+     * module's residual stream, dead once its last add wrote mo -- so the head reads them contiguous */
+    const uint16_t *hx = mo;
+    for (uint32_t h = 0; ok && m->head_rows && h < m->head_n; h++) {
+        ok = (m->head_rows[h] < n && (h == 0 || m->head_rows[h] > m->head_rows[h - 1]) &&
+              pulsar_gpu_tensor_copy_async(q->mh, (uint64_t)h * E * 2u, q->mo, (uint64_t)m->head_rows[h] * E * 2u,
+                                           (uint64_t)E * 2u) != 0) ||
+             fail("an MTP step's headed rows are not ascending rows of the step");
+        hx = mh;
+    }
+    if (ok && m->head_n) ok = draft_head_rows(&st, hx, m->head_n);
     /* L289: the picks reduced on the device, behind the head (every headed row in one launch) */
     if (ok && m->pick)
         ok = pulsar_qwen_draft_top_launch((const float *)dptr(q->logits), (int)ND, (int)m->head_n, dptr(q->mtop), 0) == 0 ||
