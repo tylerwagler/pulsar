@@ -309,7 +309,7 @@ void pulsar_gpu_mem_info(uint64_t *free_out, uint64_t *total_out);
  *
  * A payload's storage is declared BY NAME in the container ("native" plus its
  * dtype, "mxfp8_lt", "iq2_xxs_mmq_k", "cutlass_mxfp4", "fp8_e4m3_soa_k",
- * "exl3m_k2" / "exl3m_k2h" / "exl3m_k3" / "exl3m_k4" / "exl3m_k5") and
+ * "exl3m_k2" / "exl3m_k2h" / "exl3m_k3" / "exl3m_k4" / "exl3m_k5", "nvfp4") and
  * resolved to one of these ids exactly once, at load (st_layout_type).  The
  * numbers used to be ggml's, which meant the engine's storage vocabulary came
  * from a project it no longer speaks to -- and types it can only REFUSE (q8_0,
@@ -365,6 +365,10 @@ enum {
      * shared.  Same byte model. */
     PULSAR_TENSOR_EXL3M_K6 = 12,         /* K = 6   */
     PULSAR_TENSOR_EXL3M_K8 = 13,         /* K = 8   */
+    /* L298: NVFP4 W4A16 (ModelOpt W4A16_NVFP4) -- one [in, out] Linear as e2m1 codes, the 128x4-tiled E4M3
+     * scale plane (one per 16 inputs) and the f32 global scale; pulsar_nvfp4_layout() in
+     * src/cuda/pulsar_cuda_nvfp4.h is the one byte model. */
+    PULSAR_TENSOR_NVFP4 = 14,
     PULSAR_TENSOR_TYPE_COUNT
 };
 

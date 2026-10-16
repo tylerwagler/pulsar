@@ -3203,6 +3203,7 @@ typedef enum {
     PULSAR_DENSE_ARM_MXFP8_ROWS,   ///< mxfp8_lt, raw bf16 rows (W8A16 split-K GEMV / MMA)
     PULSAR_DENSE_ARM_EXL3_ROWS,    ///< EXL3 at a dense-arm rate, raw bf16 rows
     PULSAR_DENSE_ARM_BF16_ROWS,    ///< bf16 weight, raw bf16 rows (L295 F7: the tensor-core rows kernel / cuBLASLt)
+    PULSAR_DENSE_ARM_NVFP4_ROWS,   ///< nvfp4 weight, raw bf16 rows (L298: the W4A16 rows kernel, every row kind)
 } pulsar_dense_arm;
 pulsar_dense_arm pulsar_dense_arm_for(uint32_t type, pulsar_act_format act);
 /** L272 P4c: the dense linear's front door (linear.cpp).  A weight's device pointer: the rank's TP slice, else the

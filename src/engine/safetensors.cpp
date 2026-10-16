@@ -499,6 +499,14 @@ static uint64_t st_bytes_for(uint32_t type, const uint64_t *dim, uint32_t nd) {
         }
         return rows * cols + rows * (cols / 32);
     }
+    case PULSAR_TENSOR_NVFP4: {
+        /* L298: one [in, out] Linear (ne order), pulsar_nvfp4_layout the byte model */
+        uint64_t values = 0, scales = 0, stride = 0;
+        if (nd != 2 || !pulsar_nvfp4_layout(dim[0], dim[1], &values, &scales, &stride))
+            st_die("safetensors: nvfp4 tensor has a bad shape (%u dims, in %llu, out %llu; a 2-D Linear, in %% 64)", nd,
+                   (unsigned long long)(nd > 0 ? dim[0] : 0), (unsigned long long)(nd > 1 ? dim[1] : 0));
+        return stride;
+    }
     default: {
         /* EXL3 on a pulsar.tensors entry (L251): one [trellis | suh | svh] slice per
          * [in, out] (ne order), and a 3-D [in, out, n] entry is n of them back to
