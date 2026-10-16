@@ -3,7 +3,7 @@
 
   gpuq submit --class {quiet,short,long} [--shared] [--timeout DUR] [--mem SIZE] [--min-hold DUR]
               [--yield-grace DUR] [--gpus RES[,RES]] [--label TEXT] [--cwd DIR] [--wait] -- CMD [ARG...]
-  gpuq status [--json]      gpuq cancel ID      gpuq log [-f] ID      gpuq daemon
+  gpuq status [--json]      gpuq cancel ID      gpuq bump ID      gpuq log [-f] ID      gpuq daemon
 
 Classes, in priority order: quiet (exclusive; the daemon owns ~/BATTERY_RUNNING while it runs) > short (FIFO,
 timeout <= 20m) > long (preemptible: after --min-hold, while a quiet/short job waits, its process group gets
@@ -19,7 +19,9 @@ started under GPUQ_RAMP s ago, default 60, which may not have allocated yet).
 
 Exit codes of `submit --wait`: the job's own code; 124 timeout; 125 cancelled; 120 lost (its shim vanished);
 127/126 cmd not found / not executable; 2 usage.  Docs: docs/QA_BEFORE_RELEASES.md "The GPU queue".
-Spool format (version 1): GPUQ_HOME (default ~/.gpuq)/{jobs/ID.json,ID.run,ID.out,ID.cancel; logs/ID.log;
+Within a class, `gpuq bump ID` moves a queued job ahead of every unbumped one (bumped jobs keep bump order):
+a measurement someone is waiting on goes first.
+Spool format (version 1): GPUQ_HOME (default ~/.gpuq)/{jobs/ID.json,ID.run,ID.out,ID.cancel,ID.bump; logs/ID.log;
 state.json; gpuq.log}.  Test mode (GPUQ_TEST=1) needs GPUQ_HOME, GPUQ_LOCK and GPUQ_MARKER set elsewhere and
 honours GPUQ_MEMINFO, GPUQ_TICK, GPUQ_KILL_AFTER, GPUQ_RAMP.
 """
@@ -140,8 +142,18 @@ def all_jobs():
     return sorted(out, key=lambda j: j["id"])
 
 
-def order(queued):
-    return sorted(queued, key=lambda j: (PRIO[j["cls"]], j["id"]))
+def bumped_at(j):   # the time `gpuq bump` marked a queued job, or None
+    try:
+        return os.stat(jp(j["id"], "bump")).st_mtime
+    except FileNotFoundError:
+        return None
+
+
+def order(queued):   # class priority, then bumped jobs (in bump order), then FIFO
+    def key(j):
+        b = bumped_at(j)
+        return (PRIO[j["cls"]], b is None, b or 0.0, j["id"])
+    return sorted(queued, key=key)
 
 
 def alive(pid, must=None):   # live (not zombie) and, when given, its cmdline contains every word of `must`
@@ -378,7 +390,7 @@ class Daemon:
         self.save(j)
         if j["cls"] == "quiet" and j.get("started"):
             self.clear_marker(j)
-        for ext in ("run", "out", "cancel"):
+        for ext in ("run", "out", "cancel", "bump"):
             try:
                 os.unlink(jp(j["id"], ext))
             except FileNotFoundError:
@@ -821,6 +833,17 @@ def cmd_cancel(a):
     return 0
 
 
+def cmd_bump(a):
+    j = read_json(jp(a.id))
+    if j is None:
+        die(f"no job {a.id}", 1)
+    if j["state"] != "queued":
+        die(f"job {a.id} is {j['state']}, not queued", 1)
+    open(jp(a.id, "bump"), "a").close()
+    print(f"gpuq: job {a.id} moved to the front of the {j['cls']} queue")
+    return 0
+
+
 def cmd_log(a):
     if read_json(jp(a.id)) is None:
         die(f"no job {a.id}", 1)
@@ -850,6 +873,7 @@ def main():
     s.add_argument("cmd", nargs=argparse.REMAINDER)
     sub.add_parser("status").add_argument("--json", action="store_true")
     sub.add_parser("cancel").add_argument("id", type=int)
+    sub.add_parser("bump").add_argument("id", type=int)
     lg = sub.add_parser("log")
     lg.add_argument("-f", "--follow", action="store_true")
     lg.add_argument("id", type=int)
@@ -857,7 +881,8 @@ def main():
     a = ap.parse_args()
     if a.op == "daemon":
         return Daemon().run()
-    return {"submit": cmd_submit, "status": cmd_status, "cancel": cmd_cancel, "log": cmd_log}[a.op](a)
+    return {"submit": cmd_submit, "status": cmd_status, "cancel": cmd_cancel, "bump": cmd_bump,
+            "log": cmd_log}[a.op](a)
 
 
 if __name__ == "__main__":
