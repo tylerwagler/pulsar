@@ -12,8 +12,8 @@
  *      all-f32 head on these rounds); the round is then reported, never silently passed.  Same check against the
  *      PyTorch reference's chain.
  *   2. SCORES (information): max |kernel - vLLM| and |kernel - reference| over every round, in logits.
- *   3. BANKS: the rounds run 16 banks a launch and each alone; the chains must agree (the scores' max difference is
- *      reported: the lattice GEMMs' batch count is part of their shape).
+ *   3. BANKS: the rounds run 16 banks a launch and each alone; scores and chains must be bit-identical (every Linear is
+ *      M-independent, the lattice GEMMs run one algorithm whatever their batch count).
  *   4. refusals: 0 banks, 17 banks, a short workspace, a Linear of the wrong shape.
  *   5. timing (information): one launch at 1 bank and at 16.
  *
@@ -338,7 +338,7 @@ int main(int argc, char **argv) {
     printf("CHAIN vs reference: %d exact, %d within the floor, %d misses\n", eq_r, ex_r, miss_r);
     printf("SCORES: max |kernel - vLLM| %.4f, max |kernel - reference| %.4f (logits)\n", max_dv, max_dr);
     printf("BANKS: 16-bank launches vs one bank: chains differ in %d rounds, scores max diff %.3g\n", bank_bad, max_bank);
-    CHECK(bank_bad == 0, "a round's chain depends on the banks beside it");
+    CHECK(bank_bad == 0 && max_bank == 0.0f, "a round's scores depend on the banks beside it");
 
     /* refusals */
     {
