@@ -963,8 +963,21 @@ extern "C" int pulsar_qwen_mxfp8_linear_launch(const pulsar_qwen_lowrank *l, con
             fprintf(stderr, "pulsar: L288 qwen mxfp8 linear at decode widths = the tensor-core rows kernel for >= %d "
                             "outputs (first: %d -> %d), the GEMV below\n", kRowsLinearOutMin, l->in, l->out);
         }
-        const int rc = rows > 8 ? rows_launch<2>((const uint8_t *)l->w, l->sf, x_bf16, l->out, l->in, rows, 1, y, true, stream)
-                                : rows_launch<1>((const uint8_t *)l->w, l->sf, x_bf16, l->out, l->in, rows, 1, y, true, stream);
+        /* 9..16 rows in one 16-row tile when its staging fits an SM's shared memory; else (L296 draft-cost: a
+         * 4096-wide input, 16 x 8 KiB) in 8-row launches -- a row's bytes are the same either way (each token's
+         * accumulation runs alone, in one order, whatever tile it rides) */
+        static int smem_optin = 0;
+        if (!smem_optin) {
+            int dev = 0;
+            if (cudaGetDevice(&dev) != cudaSuccess ||
+                cudaDeviceGetAttribute(&smem_optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev) != cudaSuccess)
+                return -1;
+        }
+        const bool tile16 = rows > 8 && (size_t)16 * ((size_t)l->in * 2 + 16) <= (size_t)smem_optin;
+        int rc = tile16 ? rows_launch<2>((const uint8_t *)l->w, l->sf, x_bf16, l->out, l->in, rows, 1, y, true, stream) : 0;
+        for (int r0 = 0; !tile16 && rc == 0 && r0 < rows; r0 += 8)
+            rc = rows_launch<1>((const uint8_t *)l->w, l->sf, x_bf16 + (size_t)r0 * l->in, l->out, l->in,
+                                rows - r0 < 8 ? rows - r0 : 8, 1, y + (size_t)r0 * l->out, true, stream);
         if (rc) {
             fprintf(stderr, "pulsar: qwen mxfp8 linear: %d -> %d at %d rows could not be launched -- refusing\n", l->in,
                     l->out, rows);
