@@ -539,7 +539,9 @@ uint64_t gqa_up(uint64_t x) { return (x + 255u) & ~255ull; }
 uint32_t gqa_max_chunks(const pulsar_gqa_layer *L, uint32_t max_ctx) {
     const uint32_t full = (max_ctx + GQA_CHUNK - 1u) / GQA_CHUNK;
     if (L->span != PULSAR_GQA_WINDOW) return full;
-    return std::min(full, (L->window - 1u + GQA_CHUNK - 1u) / GQA_CHUNK + 1u);
+    /* a block row also reads its run's later rows: at most GQA_CHUNK - 1 keys past it (gqa_plan bounds the run) */
+    const uint32_t ahead = L->block ? GQA_CHUNK - 1u : 0u;
+    return std::min(full, (L->window - 1u + ahead + GQA_CHUNK - 1u) / GQA_CHUNK + 1u);
 }
 
 gqa_ws gqa_ws_layout(uint8_t *base, const pulsar_gqa_layer *L, uint32_t n_rows, uint32_t max_ctx) {
@@ -691,6 +693,9 @@ int pulsar_gqa_plan(const pulsar_gqa_layer *L, const pulsar_gqa_seq *seqs, uint3
         max_ctx = std::max(max_ctx, row_pos[r] + 1u);
     }
     if (ctx_bound && max_ctx > ctx_bound) return gqa_refuse("a row's position is at or past the call's ctx_bound");
+    for (uint32_t sq = 0; L->block && sq < n_seqs; sq++)
+        if (run_first[sq] != UINT32_MAX && run_last[sq] - run_first[sq] >= GQA_CHUNK)
+            return gqa_refuse("a block run longer than 256 rows (a block row reads at most 255 keys past it)");
 
     gqa_row *h_rows = (gqa_row *)desc;
     gqa_tile *h_tiles = (gqa_tile *)((uint8_t *)desc + gqa_up((uint64_t)n_rows * sizeof(gqa_row)));
