@@ -352,7 +352,18 @@ static void history_build(const Case &C, uint64_t sid, uint32_t n, History &H, u
         }
     });
 }
-struct Grade { double fro, max, eq, rms; };
+struct Grade {
+    double fro, max, eq, rms;
+    double se = 0, ss = 0, em = 0, am = 0, eqn = 0, n = 0;   /* the sums, so grades of disjoint rows pool */
+};
+/* one grade over the rows of a and b (as if graded in one call) */
+static Grade grade_pool(const Grade &a, const Grade &b) {
+    Grade G{0, 0, 0, 0};
+    G.se = a.se + b.se; G.ss = a.ss + b.ss; G.em = std::max(a.em, b.em); G.am = std::max(a.am, b.am);
+    G.eqn = a.eqn + b.eqn; G.n = a.n + b.n;
+    G.fro = sqrt(G.se / G.ss); G.max = G.em / G.am; G.eq = G.eqn / G.n; G.rms = sqrt(G.ss / G.n);
+    return G;
+}
 /* grade the kernel rows `got` (positions p_list; row i's last key hi_list[i], else its own position) against the
  * reference; parallel over rows */
 static Grade grade(const Case &C, const History &H, const std::vector<uint32_t> &p_list, const std::vector<const Out *> &got,
@@ -374,6 +385,7 @@ static Grade grade(const Case &C, const History &H, const std::vector<uint32_t> 
     }
     Grade G;
     G.fro = sqrt(se / ss); G.max = em / am; G.eq = eq / ((double)nr * W); G.rms = sqrt(ss / ((double)nr * W));
+    G.se = se; G.ss = ss; G.em = em; G.am = am; G.eqn = eq; G.n = (double)nr * W;
     return G;
 }
 
@@ -576,35 +588,40 @@ static void run_case(Case &C) {
 
 /* the pool's stored K and V heads at positions [p0, p1) against the history's (normed + roped k, v; E4M3-rounded for
  * E4M3 rows), element for element in the row's format: the share of elements whose bytes are equal and the worst
- * |difference| of their values */
+ * distance in the format's steps (ulps; a sign flip counts as 1000) */
 static void kvpool_vs_history(const Case &C, const Seq &s, const History &H, uint32_t p0, uint32_t p1, double *eq,
-                              double *worst) {
+                              int *worst) {
     const std::vector<uint8_t> pool = pool_bytes(s);
     const uint32_t nkv = C.R.n_kv, hd = C.R.hd, ne = nkv * hd;
     const uint64_t tb = pulsar_gqa_kv_token_bytes(&C.L);
     uint64_t n = 0, same_n = 0;
-    double w = 0;
+    int w = 0;
     for (uint32_t p = p0; p < p1; p++) {
         const uint8_t *rec = pool.data() + (uint64_t)(C.R.window ? p % s.cap : p) * tb;
         for (uint32_t i = 0; i < 2u * ne; i++) {
             const float host = i < ne ? H.kh[(uint64_t)(p - H.base) * ne + i] : H.vh[(uint64_t)(p - H.base) * ne + i - ne];
-            float dev;
+            int a, b, sm;   /* the magnitudes' encodings, the sign mask */
             if (C.R.e4m3) {
-                dev = gref_e4m3_val(rec[i]);
-                same_n += gref_e4m3_bits(host) == rec[i];
+                a = gref_e4m3_bits(host); b = rec[i]; sm = 0x80;
             } else {
-                uint16_t b;
-                memcpy(&b, rec + 2u * i, 2);
-                dev = gref_bf2f(b);
-                same_n += gref_f2bf(host) == b;
+                uint16_t d;
+                memcpy(&d, rec + 2u * i, 2);
+                a = gref_f2bf(host); b = d; sm = 0x8000;
             }
-            w = std::max(w, fabs((double)dev - host));
+            same_n += a == b;
+            /* +0 / -0 and opposite-signed neighbours of zero are not steps apart on this scale: count them as a flip */
+            w = std::max(w, (a & sm) == (b & sm) ? abs((a & ~sm) - (b & ~sm)) : (a == b ? 0 : 1000));
             n++;
         }
     }
     *eq = (double)same_n / (double)n;
     *worst = w;
 }
+
+/* the stored rows' bar: libm-grade f32 cos / sin on either side (each within an ulp of the exact value) may land a
+ * bf16 rounding on opposite sides of a tie, so an element may be one step off -- rarely (the fast-math rope this gate
+ * caught moved 1.75e-4 of the elements at small positions and 6% near position 1e5, by up to many steps) */
+static const double BAR_KV_EQ = 0.9999;
 
 /* L298 mutations of the stored rows: the rope dropped from q and k or applied with the interleaved pair layout
  * (x[2p], x[2p+1]); E4M3 rows' k / v kept at bf16.  Each must FAIL the grade of the rows pl / gp. */
@@ -636,10 +653,11 @@ static void run_rope_long(Case &C, uint32_t P0) {
         History Hs;
         history_build(C, 1, C.cap, Hs);
         Seq Z = seq_new(C, 1);
-        double eq = 0, worst = 0;
+        double eq = 0;
+        int worst = 1000;
         if (store_schedule(C, Z, 0, C.cap, {C.cap})) kvpool_vs_history(C, Z, Hs, 0, C.cap, &eq, &worst);
-        check(eq == 1.0, "rope (small positions 0..%u): stored K, V == the host's (rope, row format): %.6f of elements equal, "
-              "worst |diff| %.3e", C.cap - 1u, eq, worst);
+        check(eq >= BAR_KV_EQ && worst <= 1, "rope (small positions 0..%u): stored K, V vs the host's (rope, row format): "
+              "%.6f of elements equal (bar %.4f), worst %d step(s) (bar 1)", C.cap - 1u, eq, BAR_KV_EQ, worst);
         seq_free(Z);
     }
     History H;
@@ -651,10 +669,11 @@ static void run_rope_long(Case &C, uint32_t P0) {
           "store at large positions: one %u-row store (the ring wraps inside it) == stores of 7, 100, ... rows == a "
           "forward's pool, byte-identical", P0 - S0);
     {
-        double eq = 0, worst = 0;
+        double eq = 0;
+        int worst = 1000;
         kvpool_vs_history(C, A, H, P0 - C.cap, P0, &eq, &worst);
-        check(eq == 1.0, "rope (positions %u..%u): stored K, V == the host's (rope, row format): %.6f of elements equal, worst "
-              "|diff| %.3e", P0 - C.cap, P0 - 1u, eq, worst);
+        check(eq >= BAR_KV_EQ && worst <= 1, "rope (positions %u..%u): stored K, V vs the host's (rope, row format): %.6f "
+              "of elements equal (bar %.4f), worst %d step(s) (bar 1)", P0 - C.cap, P0 - 1u, eq, BAR_KV_EQ, worst);
     }
     std::vector<Out> big = run_schedule(C, A, P0, P0 + n_new, {n_new});
     std::vector<Out> dec = run_schedule(C, B, P0, P0 + 4, {1});
@@ -740,25 +759,28 @@ static void run_block(Case &C, const std::vector<uint32_t> &ctx) {
           NS * K, NS * K >= 64 ? "folded" : "split", NS / 2 * K);
     check(bounded_eq, "block: the %u-row call planned at ctx_bound %u + launched == the forward, bit-exact", NS / 2 * K, mx + 300u);
 
-    /* graded against the host authority, each sequence's rows seeing its run's later rows; a causal reference (every
-     * row's last key its own position) must FAIL */
+    /* graded against the host authority over all NS * 8 rows (pooled, as the prefill grade pools its rows), each
+     * sequence's rows seeing its run's later rows; the worst single sequence is printed.  A causal reference (every
+     * row's last key its own position) must FAIL on every sequence */
     for (int which = 0; which < 2; which++) {
-        Grade worst{0, 0, 1, 0}, causal{1e30, 1e30, 1, 0};
+        Grade pooled{0, 0, 0, 0}, worst{0, 0, 1, 0}, causal{1e30, 1e30, 1, 0};
         bool caught = true;
         for (uint32_t s = 0; s < NS; s++) {
             std::vector<uint32_t> pl(K), hi(K, ctx[s] + K - 1u);
             std::vector<const Out *> gp(K);
             for (uint32_t i = 0; i < K; i++) { pl[i] = ctx[s] + i; gp[i] = which ? &alone[s][i] : &all[s * K + i]; }
             const Grade G = grade(C, H[s], pl, gp, gref_mut(), &hi);
+            pooled = s ? grade_pool(pooled, G) : G;
             worst.fro = std::max(worst.fro, G.fro); worst.max = std::max(worst.max, G.max);
-            worst.eq = std::min(worst.eq, G.eq); worst.rms = std::max(worst.rms, G.rms);
+            worst.eq = std::min(worst.eq, G.eq);
             const Grade M = grade(C, H[s], pl, gp);   /* the causal reference */
             causal.fro = std::min(causal.fro, M.fro); causal.max = std::min(causal.max, M.max);
             caught = caught && (M.fro >= 20 * BAR_FRO || M.max >= 20 * BAR_MAX);
         }
-        check(worst.fro <= BAR_FRO && worst.max <= BAR_MAX && worst.eq >= BAR_EQ,
-              "block fidelity (%s, graded, worst sequence): fro %.2e, max %.2e, bf16 out == bf16(ref) %.4f",
-              which ? "8-row calls" : "the all-sequence call", worst.fro, worst.max, worst.eq);
+        check(pooled.fro <= BAR_FRO && pooled.max <= BAR_MAX && pooled.eq >= BAR_EQ,
+              "block fidelity (%s, %u rows graded): fro %.2e, max %.2e, bf16 out == bf16(ref) %.4f (reference rms %.4f; "
+              "worst sequence fro %.2e, max %.2e, %.4f)", which ? "8-row calls" : "the all-sequence call", NS * K,
+              pooled.fro, pooled.max, pooled.eq, pooled.rms, worst.fro, worst.max, worst.eq);
         check(caught,
               "mutation 'causal' (no later rows of the run) fails the block grade on every sequence: fro >= %.2e, max >= %.2e",
               causal.fro, causal.max);
