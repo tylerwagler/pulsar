@@ -27,8 +27,8 @@ def dense(hf, name: str, layout: str, dshape: list, mxfp8_mode: str = "rederive"
     prod = PR.producer_for(kind, layout, name)
     hshape = hf.shape(name)
     if prod == PR.COPY:
-        path, off, n = hf.span(name)
-        return {"dtype": hf.dtype(name), "shape": list(dshape), "nbytes": n, "src": ("ranges", [(path, off, n)])}
+        src, n = hf.copy_src(name)          # the source's own bytes: a range, or a family view's derivation
+        return {"dtype": hf.dtype(name), "shape": list(dshape), "nbytes": n, "src": src}
     if prod == "i64_to_i32":
         n_el = 1
         for d in hshape:

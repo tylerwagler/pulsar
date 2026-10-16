@@ -65,16 +65,16 @@ format anywhere in the builder.
 
 | file | role | proven by |
 |---|---|---|
-| `hf_source.py` | header-only readers: `HFCheckpoint` (`names/shape/dtype/span/raw`, `config` with `text_config` merged), `Exl3Checkpoint` (`names`, `linear(key, k, n, rates)` with every refusal the format allows; the family names the key -- `names.exl3_expert_key` / `exl3_layers` for DeepSeek) | used by every test below |
+| `hf_source.py` | header-only readers: `HFCheckpoint` (`names/shape/dtype/span/raw/copy_src`, `X#i` = slice i of a stacked tensor, `config` with `text_config` merged), `Exl3Checkpoint` (`names`, `linear(key, k, n, rates)` with every refusal the format allows; the family names the key -- `names.exl3_expert_key` / `exl3_layers` for DeepSeek) | used by every test below |
 | `names.py` | DeepSeek's naming table: HF name -> container entry (`Mapped`: container name, `gguf_name`, role, family, shard, expert/part, `emit`); `ModelShape.from_config`; the shard plan; the EXL3 expert keys | `test_names.py` |
 | `policy.py` | DeepSeek's default formats (`layout_for`) and declared shapes (`declared_shape`) | `test_names.py` |
-| `deepseek.py` / `qwen.py` | the family modules (registered by `model_type`, `build.FAMILIES`): naming, shard order, what the loader admits, the default recipe, expert grouping, the arch KV | `test_deepseek.py` / `test_qwen.py` |
-| `recipe.py` | `pulsar.recipe.v1`: rows by role / block / layers or name pattern; exactly one row per tensor, no dead rows | `test_deepseek.py`, `test_qwen.py` |
+| `deepseek.py` / `qwen.py` / `inkling.py` | the family modules (registered by `model_type`, `build.FAMILIES`): the source view (`source`; Inkling's names each projection its fused w13 / expert stacks hold), naming, shard order, what the loader admits, the default recipe, expert grouping, the arch KV.  Inkling also declares its shape (refusing a config or tensor that disagrees) and writes each tensor's bind role into its record | `test_deepseek.py` / `test_qwen.py` / `test_inkling.py` |
+| `recipe.py` | `pulsar.recipe.v1`: rows by role / block / layers or name pattern; exactly one row per tensor, no dead rows | `test_deepseek.py`, `test_qwen.py`, `test_inkling.py` |
 | `kv.py` | the `pulsar.kv` block from `config.json` + tokenizer files, in the engine's spelling | `test_kv.py` |
-| `producers.py` | the codecs, bytes in / bytes out (`mxfp8_lt`, `mxfp8_lt_from_bf16`, `cutlass_mxfp4`, `fp8_e4m3_soa_k_from_bf16`, `i64_to_i32`), the ONE producer table `PRODUCER_FOR` ((source kind, format) -> producer), `bytes_for` (== `st_bytes_for` / `routed_expert_side_layout`) | `test_producers.py` |
+| `producers.py` | the codecs, bytes in / bytes out (`mxfp8_lt`, `mxfp8_lt_from_bf16`, `cutlass_mxfp4`, `fp8_e4m3_soa_k_from_bf16`, `i64_to_i32`; `rows_strided`, a source view's verbatim rows), the ONE producer table `PRODUCER_FOR` ((source kind, format) -> producer), `bytes_for` (== `st_bytes_for` / `routed_expert_side_layout`) | `test_producers.py` |
 | `entries.py` | one entry's payload through the producer table (dense, a routed expert, an EXL3 Linear's ranges) | the synthetic goldens |
 | `exl3_rates.py` | the EXL3 rate table and the engine's arms (`exl3_arm_has_rate`) by role | `test_exl3_rates.py` (in host-checks) |
-| `build.py` | the one plan; recipe / plan / emit / verify / audit | the shard comparison below; `test_deepseek.py` / `test_qwen.py` GOLDEN SHA-256s |
+| `build.py` | the one plan; recipe / plan / emit / verify / audit | the shard comparison below; `test_deepseek.py` / `test_qwen.py` / `test_inkling.py` GOLDEN SHA-256s |
 
 ## The instrument
 

@@ -94,39 +94,6 @@ char *path_join(const char *dir, const char *name) {
 
 
 
-const char *find_next_dsml_tool_block(const char *p, const char **end_out) {
-    struct block_form {
-        const char *start;
-        const char *end;
-    } forms[] = {
-        /* Every spelling either family renders, so the scanner finds the last
-         * tool block whatever produced the transcript (the shipped 0731
-         * artifacts sample V4's unspaced tags, V4.1 the spaced ones). */
-        {"\n\n" PULSAR_TOOL_CALLS_START, PULSAR_TOOL_CALLS_END},
-        {PULSAR_TOOL_CALLS_START, PULSAR_TOOL_CALLS_END},
-        {"\n\n" PULSAR_TOOL_CALLS_START_SHORT, PULSAR_TOOL_CALLS_END_SHORT},
-        {PULSAR_TOOL_CALLS_START_SHORT, PULSAR_TOOL_CALLS_END_SHORT},
-        {"\n\n" PULSAR_TOOL_CALLS_START_V4, PULSAR_TOOL_CALLS_END_V4},
-        {PULSAR_TOOL_CALLS_START_V4, PULSAR_TOOL_CALLS_END_V4},
-        {"\n\n" PULSAR_TOOL_CALLS_START_SHORT_V4, PULSAR_TOOL_CALLS_END_SHORT_V4},
-        {PULSAR_TOOL_CALLS_START_SHORT_V4, PULSAR_TOOL_CALLS_END_SHORT_V4},
-        {"\n\n<tool_calls>", "</tool_calls>"},
-        {"<tool_calls>", "</tool_calls>"},
-    };
-
-    const char *best = NULL;
-    const char *best_end = NULL;
-    for (size_t i = 0; i < sizeof(forms) / sizeof(forms[0]); i++) {
-        const char *s = strstr(p, forms[i].start);
-        if (!s || (best && s >= best)) continue;
-        const char *e = strstr(s, forms[i].end);
-        if (!e) continue;
-        best = s;
-        best_end = e + strlen(forms[i].end);
-    }
-    if (end_out) *end_out = best_end;
-    return best;
-}
 
 
 
@@ -149,15 +116,15 @@ bool server::kv_tool_map_measure_locked(const char *text,
             b->seen = scan;
             for (tool_memory_entry *e = b->entries; e; e = e->block_next) {
                 size_t id_len = strlen(e->id);
-                size_t dsml_len = b->len;
-                if (id_len > UINT32_MAX || dsml_len > UINT32_MAX) continue;
+                size_t raw_len = b->len;
+                if (id_len > UINT32_MAX || raw_len > UINT32_MAX) continue;
                 if (count == UINT32_MAX) return false;
                 if (UINT64_MAX - bytes < 8u ||
                     UINT64_MAX - bytes - 8u < (uint64_t)id_len ||
-                    UINT64_MAX - bytes - 8u - (uint64_t)id_len < (uint64_t)dsml_len)
+                    UINT64_MAX - bytes - 8u - (uint64_t)id_len < (uint64_t)raw_len)
                     return false;
                 count++;
-                bytes += 8u + (uint64_t)id_len + (uint64_t)dsml_len;
+                bytes += 8u + (uint64_t)id_len + (uint64_t)raw_len;
             }
         }
         p = end;
@@ -217,14 +184,14 @@ bool server::kv_tool_map_write(FILE *fp, const char *text,
             b->seen = scan;
             for (tool_memory_entry *e = b->entries; ok && e; e = e->block_next) {
                 size_t id_len = strlen(e->id);
-                size_t dsml_len = b->len;
-                if (id_len > UINT32_MAX || dsml_len > UINT32_MAX) continue;
+                size_t raw_len = b->len;
+                if (id_len > UINT32_MAX || raw_len > UINT32_MAX) continue;
                 uint8_t lens[8];
                 le_put32(lens, (uint32_t)id_len);
-                le_put32(lens + 4, (uint32_t)dsml_len);
+                le_put32(lens + 4, (uint32_t)raw_len);
                 ok = fwrite(lens, 1, sizeof(lens), fp) == sizeof(lens) &&
                      fwrite(e->id, 1, id_len, fp) == id_len &&
-                     fwrite(b->dsml, 1, dsml_len, fp) == dsml_len;
+                     fwrite(b->raw, 1, raw_len, fp) == raw_len;
             }
         }
         p = end;
@@ -253,21 +220,21 @@ int server::kv_tool_map_load_from_pos(FILE *fp, const stop_list *wanted) {
         uint8_t lens[8];
         if (fread(lens, 1, sizeof(lens), fp) != sizeof(lens)) return loaded;
         uint32_t id_len = le_get32(lens);
-        uint32_t dsml_len = le_get32(lens + 4);
-        if (id_len == 0 || id_len > 256 || dsml_len == 0 ||
-            dsml_len > PULSAR_TOOL_MEMORY_MAX_BYTES) return loaded;
+        uint32_t raw_len = le_get32(lens + 4);
+        if (id_len == 0 || id_len > 256 || raw_len == 0 ||
+            raw_len > PULSAR_TOOL_MEMORY_MAX_BYTES) return loaded;
         char *id = (char *)server_xmalloc((size_t)id_len + 1);
-        char *dsml = (char *)server_xmalloc((size_t)dsml_len + 1);
+        char *raw = (char *)server_xmalloc((size_t)raw_len + 1);
         bool ok = fread(id, 1, id_len, fp) == id_len &&
-                  fread(dsml, 1, dsml_len, fp) == dsml_len;
+                  fread(raw, 1, raw_len, fp) == raw_len;
         id[id_len] = '\0';
-        dsml[dsml_len] = '\0';
+        raw[raw_len] = '\0';
         if (ok && (!wanted || id_list_contains(wanted, id))) {
-            s->tool_memory_put_source(id, dsml, TOOL_MEMORY_DISK);
+            s->tool_memory_put_source(id, raw, TOOL_MEMORY_DISK);
             loaded++;
         }
         free(id);
-        free(dsml);
+        free(raw);
         if (!ok) return loaded;
     }
     return loaded;

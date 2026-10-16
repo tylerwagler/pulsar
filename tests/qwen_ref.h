@@ -261,6 +261,19 @@ struct expert { const linear *gate_up, *down, *gate = nullptr, *up = nullptr; };
 
 /** the block for one token given the routing (sel, w, sgate -- the device's);
  *  x = the decoded E4M3 block input */
+/* One shared expert added to out: out += gamma * down(bf16(silu(gate x) up x)). */
+inline void shared_token(const double *x, double gamma, const linear &sg, const linear &su, const linear &sd,
+                         double *out) {
+    std::vector<double> hg(sg.out), hu(su.out), h(sg.out), hd(sg.out), ys(H);
+    sg.run(x, hg.data());
+    su.run(x, hu.data());
+    for (int n = 0; n < sg.out; n++) h[n] = silu(hg[n]) * hu[n];
+    /* L251 / ac69748f: the shared expert's SwiGLU emits bf16. */
+    for (int k = 0; k < sg.out; k++) hd[k] = bf_round(h[k]);
+    sd.run(hd.data(), ys.data());
+    for (int o = 0; o < H; o++) out[o] += gamma * ys[o];
+}
+
 inline void moe_token(const double *x, const int32_t *sel, const double *w, double sgate,
                       const std::vector<expert> &experts, const linear &sg, const linear &su, const linear &sd,
                       double *out) {
@@ -293,14 +306,7 @@ inline void moe_token(const double *x, const int32_t *sel, const double *w, doub
         const uint16_t *svh = suh + MID;
         for (int o = 0; o < H; o++) out[o] += z[o] * exl3_f16_to_f32(svh[o]);
     }
-    std::vector<double> hg(sg.out), hu(su.out), h(sg.out), hd(sg.out), ys(H);
-    sg.run(x, hg.data());
-    su.run(x, hu.data());
-    for (int n = 0; n < sg.out; n++) h[n] = silu(hg[n]) * hu[n];
-    /* L251 / ac69748f: the shared expert's SwiGLU emits bf16. */
-    for (int k = 0; k < sg.out; k++) hd[k] = bf_round(h[k]);
-    sd.run(hd.data(), ys.data());
-    for (int o = 0; o < H; o++) out[o] += sgate * ys[o];
+    shared_token(x, sgate, sg, su, sd, out);
 }
 
 } // namespace qref

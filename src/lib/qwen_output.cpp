@@ -1,106 +1,53 @@
-/* qwen_output.cpp -- the Qwen3.8-Flash-Next output parser.  See qwen_chat.h. */
+/* qwen_output.cpp -- the Qwen3.8-Flash-Next output parser: the output-parser kit's Qwen configuration (its
+ * grammar) and Qwen's XML tool-call body.  See qwen_chat.h. */
 #include "qwen_chat.h"
 
 #include <stdio.h>
 #include <string.h>
 
-#include "pulsar_utf8.h"
-
-namespace {
-
-const char kThinkEnd[] = "</think>";
-const char kCallOpen[] = "<tool_call>";
-const char kCallClose[] = "</tool_call>";
-
-/* Length of the longest suffix of s that is a proper prefix of `marker`: the
- * bytes that must wait for the next chunk before they can be called text. */
-size_t marker_tail(const std::string &s, const char *marker) {
-    const size_t m = strlen(marker);
-    for (size_t k = std::min(s.size(), m - 1); k > 0; k--)
-        if (!s.compare(s.size() - k, k, marker, k)) return k;
-    return 0;
+const out_grammar &qwen_output_grammar(void) {
+    enum { THINK_END, CALL_OPEN, CALL_CLOSE };
+    static const out_grammar g = {
+        /* .name        = */ "qwen",
+        /* .markers     = */ {"</think>", "<tool_call>", "</tool_call>"},
+        /* .transitions = */ {
+            {OUT_REASONING, THINK_END, OUT_CONTENT, 0},
+            {OUT_CONTENT, CALL_OPEN, OUT_CALL, 0},
+            {OUT_CALL, CALL_CLOSE, OUT_CONTENT, 0},
+        },
+        /* .reasoning   = */ OUT_TEXT_STRIP,
+        /* .content     = */ OUT_TEXT_STRIP,
+        /* .call_open   = */ "<tool_call>",
+        /* .dropped     = */ {},
+    };
+    return g;
 }
-
-uint32_t cp_at(const unsigned char *p, int n) {
-    switch (n) {
-    case 1: return p[0];
-    case 2: return ((uint32_t)(p[0] & 0x1f) << 6) | (p[1] & 0x3f);
-    case 3: return ((uint32_t)(p[0] & 0x0f) << 12) | ((uint32_t)(p[1] & 0x3f) << 6) | (p[2] & 0x3f);
-    default: return ((uint32_t)(p[0] & 0x07) << 18) | ((uint32_t)(p[1] & 0x3f) << 12) |
-                    ((uint32_t)(p[2] & 0x3f) << 6) | (p[3] & 0x3f);
-    }
-}
-
-}  // namespace
 
 bool qwen_output_parser::init(bool thinking, const char *tools_json, char *err, size_t errlen) {
-    *this = qwen_output_parser();
-    mode_ = thinking ? M_REASONING : M_CONTENT;
+    body_.tools = pyjson_value();
     if (tools_json) {
         char jerr[160] = "not a JSON array";
-        if (!pyjson_parse(tools_json, strlen(tools_json), &tools_, jerr, sizeof jerr) ||
-            tools_.kind != pyjson_value::ARR) {
+        if (!pyjson_parse(tools_json, strlen(tools_json), &body_.tools, jerr, sizeof jerr) ||
+            body_.tools.kind != pyjson_value::ARR) {
             if (err && errlen) snprintf(err, errlen, "tools_not_array: %s", jerr);
             return false;
         }
     }
+    out_parser::init(&qwen_output_grammar(), &body_, thinking ? OUT_REASONING : OUT_CONTENT);
     return true;
 }
 
-/* Stripped streaming: leading whitespace of a section is dropped, interior
- * whitespace waits for the next non-space, trailing whitespace is dropped by
- * end_section.  Works on whole codepoints; a split sequence waits. */
-void qwen_output_parser::emit_text(bool reasoning, const char *p, size_t n, std::vector<qwen_out_event> *ev) {
-    section &s = sec_[reasoning ? 1 : 0];
-    std::string buf = s.partial + std::string(p, n);
-    s.partial.clear();
-    std::string out;
-    const unsigned char *u = (const unsigned char *)buf.data();
-    for (size_t i = 0; i < buf.size();) {
-        int k = utf8_seq_ok(u + i, buf.size() - i);
-        bool space = k && qwen_py_isspace(cp_at(u + i, k));
-        if (!k) {
-            /* an incomplete sequence at the end waits; an invalid byte is text */
-            const int want = utf8_seq_len(u[i]);
-            if (want > 1 && i + (size_t)want > buf.size()) {
-                bool prefix_ok = true;
-                for (size_t j = i + 1; j < buf.size(); j++) prefix_ok &= (u[j] & 0xc0) == 0x80;
-                if (prefix_ok) { s.partial.assign(buf, i, std::string::npos); break; }
-            }
-            k = 1;
-            space = false;
-        }
-        if (space) {
-            if (s.started) s.ws.append(buf, i, (size_t)k);
-        } else {
-            out += s.ws;
-            s.ws.clear();
-            out.append(buf, i, (size_t)k);
-            s.started = true;
-        }
-        i += (size_t)k;
-    }
-    if (out.empty()) return;
-    (reasoning ? reasoning_ : content_) += out;
-    qwen_out_event e;
-    e.kind = reasoning ? qwen_out_event::REASONING : qwen_out_event::CONTENT;
-    e.text = std::move(out);
-    ev->push_back(std::move(e));
-}
-
-void qwen_output_parser::end_section(bool reasoning) {
-    section &s = sec_[reasoning ? 1 : 0];
-    s.ws.clear();
-    s.started = false;
-    /* a dangling partial sequence at a section end is not text either side can own */
-    s.partial.clear();
+void qwen_xml_call_body::open() {
+    began_ = false;
+    fn_.clear();
+    pay_ = payload_scan();
 }
 
 /* The type the schema declares for `key` of function `fn`: "string" when the
  * declared type is or includes string, "other" for any other declaration,
  * NULL when the tool or the property is not declared. */
-const char *qwen_output_parser::param_type(const std::string &fn, const std::string &key) const {
-    for (const pyjson_value &tool : tools_.a) {
+const char *qwen_xml_call_body::param_type(const std::string &fn, const std::string &key) const {
+    for (const pyjson_value &tool : tools.a) {
         const pyjson_value *f = tool.get("function");
         if (!f) f = &tool;
         const pyjson_value *name = f->get("name");
@@ -122,8 +69,8 @@ const char *qwen_output_parser::param_type(const std::string &fn, const std::str
 
 /* One "<parameter=KEY>\nVALUE\n</parameter>" of function `fn` at b[*i]: 1 = read (*key, the typed *v,
  * *i past it), 0 = not complete yet, -1 = not a parameter; *why names what is missing or wrong.  The one
- * reading close_call and the stream share. */
-int qwen_output_parser::read_param(const std::string &b, size_t *i, const std::string &fn, std::string *key,
+ * reading close and the stream share. */
+int qwen_xml_call_body::read_param(const std::string &b, size_t *i, const std::string &fn, std::string *key,
                                    pyjson_value *v, const char **why) const {
     static const char kParam[] = "<parameter=";
     const size_t n = strlen(kParam), rem = b.size() - *i;
@@ -168,21 +115,21 @@ int qwen_output_parser::read_param(const std::string &b, size_t *i, const std::s
 }
 
 /* The open call's parameters that closed since the last call, as TOOL_ARGS fragments. */
-void qwen_output_parser::stream_params(std::vector<qwen_out_event> *ev) {
+void qwen_xml_call_body::stream_params(const std::string &b, int index, std::vector<out_event> *ev) {
     static const char kFnEnd[] = "</function>";
     while (!arg_stop_) {
         size_t i = arg_pos_;
-        while (i < block_.size() && (block_[i] == ' ' || block_[i] == '\n' || block_[i] == '\t' || block_[i] == '\r')) i++;
-        const size_t rem = block_.size() - i;
-        if (!rem || !block_.compare(i, std::min(rem, strlen(kFnEnd)), kFnEnd, std::min(rem, strlen(kFnEnd))))
-            return;   /* the call's close is close_call's */
+        while (i < b.size() && (b[i] == ' ' || b[i] == '\n' || b[i] == '\t' || b[i] == '\r')) i++;
+        const size_t rem = b.size() - i;
+        if (!rem || !b.compare(i, std::min(rem, strlen(kFnEnd)), kFnEnd, std::min(rem, strlen(kFnEnd))))
+            return;   /* the call's close is close()'s */
         std::string key;
         pyjson_value v;
         const char *why = NULL;
-        const int r = read_param(block_, &i, fn_, &key, &v, &why);
+        const int r = read_param(b, &i, fn_, &key, &v, &why);
         if (r == 0) return;
         if (r < 0) {
-            arg_stop_ = true;   /* close_call names the fault */
+            arg_stop_ = true;   /* close() names the fault */
             return;
         }
         pyjson_value one;
@@ -190,9 +137,9 @@ void qwen_output_parser::stream_params(std::vector<qwen_out_event> *ev) {
         one.o.emplace_back(key, std::move(v));
         std::string d;
         pyjson_dump(one, &d);   /* {"key": value} */
-        qwen_out_event e;
-        e.kind = qwen_out_event::TOOL_ARGS;
-        e.index = index_;
+        out_event e;
+        e.kind = out_event::TOOL_ARGS;
+        e.index = index;
         e.text = arg_n_ ? ", " + d.substr(1, d.size() - 2) : d.substr(0, d.size() - 1);
         ev->push_back(std::move(e));
         arg_n_++;
@@ -200,77 +147,12 @@ void qwen_output_parser::stream_params(std::vector<qwen_out_event> *ev) {
     }
 }
 
-/* Parse the body of one <tool_call> ... </tool_call>. */
-void qwen_output_parser::close_call(std::vector<qwen_out_event> *ev) {
-    const std::string &b = block_;
-    size_t i = 0;
-    auto skip_ws = [&]() {
-        while (i < b.size() && (b[i] == ' ' || b[i] == '\n' || b[i] == '\t' || b[i] == '\r')) i++;
-    };
-    auto fail = [&](const char *why) {
-        qwen_out_event e;
-        e.kind = qwen_out_event::ERROR;
-        char msg[200];
-        snprintf(msg, sizeof msg, "malformed tool call %d: %s at byte %zu of the block", index_, why, i);
-        e.text = msg;
-        e.index = index_;
-        ev->push_back(std::move(e));
-        errors_++;
-        index_++;
-    };
-    skip_ws();
-    if (b.compare(i, 10, "<function=")) return fail("expected <function=");
-    i += 10;
-    const size_t name_end = b.find('>', i);
-    if (name_end == std::string::npos || b.find('\n', i) < name_end) return fail("unterminated <function=NAME>");
-    const std::string name = b.substr(i, name_end - i);
-    i = name_end + 1;
-    pyjson_value args;
-    args.kind = pyjson_value::OBJ;
-    for (;;) {
-        skip_ws();
-        if (!b.compare(i, 11, "</function>")) {
-            i += 11;
-            break;
-        }
-        std::string key;
-        pyjson_value v;
-        const char *why = NULL;
-        if (read_param(b, &i, name, &key, &v, &why) != 1) return fail(why);
-        bool replaced = false;   /* a repeated key: first position, last value */
-        for (auto &kv : args.o)
-            if (kv.first == key) { kv.second = v; replaced = true; }
-        if (!replaced) args.o.emplace_back(key, std::move(v));
-    }
-    skip_ws();
-    if (i != b.size()) return fail("text after </function>");
-    qwen_out_call call;
-    call.name = name;
-    pyjson_dump(args, &call.arguments);
-    if (!began_) {
-        qwen_out_event e;
-        e.kind = qwen_out_event::TOOL_BEGIN;
-        e.index = index_;
-        e.name = name;
-        ev->push_back(std::move(e));
-    }
-    qwen_out_event e;
-    e.kind = qwen_out_event::TOOL_END;
-    e.index = index_;
-    e.name = name;
-    e.arguments = call.arguments;
-    ev->push_back(std::move(e));
-    calls_.push_back(std::move(call));
-    index_++;
-}
-
-/* Advance pay_ over block_'s new bytes (the open call's body so far; hold_ keeps a partial
- * "</tool_call>" out of it).  A parameter value starts past "<parameter=KEY>" and ends at the first
- * "</parameter>" -- close_call's reading. */
-void qwen_output_parser::scan_payload() {
+/* Advance pay_ over the body's new bytes (the kit holds a partial "</tool_call>" out of it: `held`).  A
+ * parameter value starts past "<parameter=KEY>" and ends at the first "</parameter>" -- close()'s
+ * reading. */
+void qwen_xml_call_body::scan_payload(const std::string &b, size_t held) {
     static const char kParam[] = "<parameter=", kParamEnd[] = "</parameter>";
     payload_scan &ps = pay_;
-    const std::string &b = block_;
     for (;;) {
         if (!ps.value) {
             const size_t at = b.find(kParam, ps.pos);
@@ -316,116 +198,83 @@ void qwen_output_parser::scan_payload() {
     /* the payload: inside a string value or a JSON string, past the template's leading newline, not on
      * "</" of a closer (this block's or the held "</tool_call>") */
     const size_t pending = b.size() - std::min(ps.pos, b.size());
-    ps.payload = ps.value && (ps.is_string || ps.json_str) && b.size() > ps.vstart && pending < 2 && hold_.size() < 2;
+    ps.payload = ps.value && (ps.is_string || ps.json_str) && b.size() > ps.vstart && pending < 2 && held < 2;
 }
 
-bool qwen_output_parser::raw_span(size_t *lo, size_t *hi) const {
-    if (calls_.empty()) return false;
-    *lo = raw_lo_;
-    *hi = raw_hi_;
-    return true;
+void qwen_xml_call_body::grow(const std::string &b, size_t held, bool closing, int index,
+                              std::vector<out_event> *ev) {
+    if (!began_) {
+        /* announce the call as soon as its name is complete */
+        size_t i = 0;
+        while (i < b.size() && (b[i] == ' ' || b[i] == '\n' || b[i] == '\t' || b[i] == '\r')) i++;
+        if (!b.compare(i, 10, "<function=")) {
+            const size_t e = b.find('>', i + 10);
+            const size_t nl = b.find('\n', i + 10);
+            if (e != std::string::npos && nl > e) {
+                out_event ev_begin;
+                ev_begin.kind = out_event::TOOL_BEGIN;
+                ev_begin.index = index;
+                ev_begin.name = b.substr(i + 10, e - i - 10);
+                fn_ = ev_begin.name;
+                ev->push_back(std::move(ev_begin));
+                began_ = true;
+                arg_pos_ = e + 1;
+                arg_n_ = 0;
+                arg_stop_ = false;
+            }
+        }
+    }
+    if (!began_) return;
+    if (!closing) scan_payload(b, held);
+    stream_params(b, index, ev);   /* closing: a last parameter closed in this piece goes out before the end */
 }
 
-void qwen_output_parser::feed(const char *p, size_t n, std::vector<qwen_out_event> *ev) {
-    hold_.append(p, n);
-    fed_ += n;
+/* The body of one <tool_call> ... </tool_call>. */
+bool qwen_xml_call_body::close(const std::string &b, int index, std::vector<out_event> *ev, out_call *call,
+                               const char **why, size_t *at) {
+    size_t i = 0;
+    auto skip_ws = [&]() {
+        while (i < b.size() && (b[i] == ' ' || b[i] == '\n' || b[i] == '\t' || b[i] == '\r')) i++;
+    };
+    auto fail = [&](const char *w) {
+        *why = w;
+        *at = i;
+        return false;
+    };
+    skip_ws();
+    if (b.compare(i, 10, "<function=")) return fail("expected <function=");
+    i += 10;
+    const size_t name_end = b.find('>', i);
+    if (name_end == std::string::npos || b.find('\n', i) < name_end) return fail("unterminated <function=NAME>");
+    const std::string name = b.substr(i, name_end - i);
+    i = name_end + 1;
+    pyjson_value args;
+    args.kind = pyjson_value::OBJ;
     for (;;) {
-        if (mode_ == M_REASONING) {
-            const size_t at = hold_.find(kThinkEnd);
-            if (at == std::string::npos) {
-                const size_t keep = marker_tail(hold_, kThinkEnd);
-                emit_text(true, hold_.data(), hold_.size() - keep, ev);
-                hold_.erase(0, hold_.size() - keep);
-                return;
-            }
-            emit_text(true, hold_.data(), at, ev);
-            end_section(true);
-            hold_.erase(0, at + strlen(kThinkEnd));
-            mode_ = M_CONTENT;
-            continue;
+        skip_ws();
+        if (!b.compare(i, 11, "</function>")) {
+            i += 11;
+            break;
         }
-        if (mode_ == M_CONTENT || mode_ == M_AFTER_TOOL) {
-            const size_t at = hold_.find(kCallOpen);
-            if (at == std::string::npos) {
-                const size_t keep = marker_tail(hold_, kCallOpen);
-                emit_text(false, hold_.data(), hold_.size() - keep, ev);
-                hold_.erase(0, hold_.size() - keep);
-                return;
-            }
-            emit_text(false, hold_.data(), at, ev);
-            end_section(false);
-            if (!block_seen_) {   /* hold_[0] sits at stream offset fed_ - hold_.size() */
-                raw_lo_ = fed_ - hold_.size() + at;
-                block_seen_ = true;
-            }
-            hold_.erase(0, at + strlen(kCallOpen));
-            block_.clear();
-            began_ = false;
-            fn_.clear();
-            pay_ = payload_scan();
-            mode_ = M_TOOL;
-            continue;
-        }
-        /* M_TOOL */
-        const size_t at = hold_.find(kCallClose);
-        const size_t keep = at == std::string::npos ? marker_tail(hold_, kCallClose) : 0;
-        const size_t take = at == std::string::npos ? hold_.size() - keep : at;
-        block_.append(hold_, 0, take);
-        if (!began_) {
-            /* announce the call as soon as its name is complete */
-            size_t i = 0;
-            while (i < block_.size() && (block_[i] == ' ' || block_[i] == '\n' || block_[i] == '\t' || block_[i] == '\r')) i++;
-            if (!block_.compare(i, 10, "<function=")) {
-                const size_t e = block_.find('>', i + 10);
-                const size_t nl = block_.find('\n', i + 10);
-                if (e != std::string::npos && nl > e) {
-                    qwen_out_event ev_begin;
-                    ev_begin.kind = qwen_out_event::TOOL_BEGIN;
-                    ev_begin.index = index_;
-                    ev_begin.name = block_.substr(i + 10, e - i - 10);
-                    fn_ = ev_begin.name;
-                    ev->push_back(std::move(ev_begin));
-                    began_ = true;
-                    arg_pos_ = e + 1;
-                    arg_n_ = 0;
-                    arg_stop_ = false;
-                }
-            }
-        }
-        if (at == std::string::npos) {
-            hold_.erase(0, take);
-            if (began_) {
-                scan_payload();
-                stream_params(ev);
-            }
-            return;
-        }
-        raw_hi_ = fed_ - hold_.size() + at + strlen(kCallClose);
-        hold_.erase(0, at + strlen(kCallClose));
-        if (began_) stream_params(ev);   /* a last parameter closed in this piece goes out before the end */
-        close_call(ev);
-        mode_ = M_AFTER_TOOL;
+        std::string key;
+        pyjson_value v;
+        const char *w = NULL;
+        if (read_param(b, &i, name, &key, &v, &w) != 1) return fail(w);
+        bool replaced = false;   /* a repeated key: first position, last value */
+        for (auto &kv : args.o)
+            if (kv.first == key) { kv.second = v; replaced = true; }
+        if (!replaced) args.o.emplace_back(key, std::move(v));
     }
-}
-
-void qwen_output_parser::finish(std::vector<qwen_out_event> *ev) {
-    if (mode_ == M_TOOL) {
-        block_ += hold_;
-        hold_.clear();
-        qwen_out_event e;
-        e.kind = qwen_out_event::ERROR;
-        char msg[120];
-        snprintf(msg, sizeof msg, "unterminated tool call %d (the turn ended inside <tool_call>)", index_);
-        e.text = msg;
-        e.index = index_;
+    skip_ws();
+    if (i != b.size()) return fail("text after </function>");
+    call->name = name;
+    pyjson_dump(args, &call->arguments);
+    if (!began_) {
+        out_event e;
+        e.kind = out_event::TOOL_BEGIN;
+        e.index = index;
+        e.name = name;
         ev->push_back(std::move(e));
-        errors_++;
-        index_++;
-        return;
     }
-    /* a held marker prefix at the end was text after all */
-    const bool reasoning = mode_ == M_REASONING;
-    emit_text(reasoning, hold_.data(), hold_.size(), ev);
-    hold_.clear();
-    end_section(reasoning);
+    return true;
 }

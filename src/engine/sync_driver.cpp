@@ -159,7 +159,7 @@ int pulsar_session_sync_default(pulsar_session *s, const pulsar_tokens *prompt, 
     }
     /* L284: only a view the bank PREFILLED whole is continued (pulsar_session_bank_continues, the rule DeepSeek's
      * sync reads too).  Decode rows are the decode arms' (a step's
-     * rows are not a prefill chunk's bytes, kv_state_qwen.cpp), so a view with any is resumed instead, from
+     * rows are not a prefill chunk's bytes: the prefill frontier, state_kinds.cpp), so a view with any is resumed instead, from
      * the deepest checkpoint at or below the prefill frontier -- the tokens generated since are prefilled
      * again and the prompt is the cold prefill's bytes, as DeepSeek's sync does it (L195) */
     const bool extends = continuable && common == s->checkpoint.len && common < prompt->len &&

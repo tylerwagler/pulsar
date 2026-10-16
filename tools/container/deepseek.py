@@ -39,6 +39,17 @@ map_hf = N.map_hf
 declared_shape = P.declared_shape
 
 
+def source(hf):
+    """The HF checkpoint as the plan reads it: as stored (every DeepSeek tensor is one container entry, or one
+    expert-projection of a family)."""
+    return hf
+
+
+def gate_up_key(rec):
+    """The layer a routed family belongs to, for the gate / up layout check: `blk.N.ffn_*_exps.weight` -> N."""
+    return rec["gguf_name"].split(".")[1]
+
+
 def default_format(hf, m, name):
     """policy.layout_for as a recipe format: `native` where the layout is the source dtype's own."""
     layout = P.layout_for(m, hf.dtype(name), hf.shape(name))

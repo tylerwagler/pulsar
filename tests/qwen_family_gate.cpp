@@ -33,12 +33,6 @@ static void check(bool ok, const char *fmt, ...) {
     if (!ok) n_fail++;
 }
 
-/* Present-but-never-called ops for the order probe: the walk only asks
- * whether an entry is set. */
-static bool never_embed(const pulsar_qwen_step *) { abort(); }
-static bool never_layer(const pulsar_qwen_step *, uint32_t) { abort(); }
-static bool never_gr(const pulsar_qwen_step *, uint32_t, pulsar_qwen_gr_side) { abort(); }
-
 static pulsar_engine *open_inspect(const char *path) {
     pulsar_engine_options opt;
     memset(&opt, 0, sizeof(opt));
@@ -90,31 +84,30 @@ static void host_part(const char *dir) {
           "PLE tables: odd multipliers, table 0 of %llu rows (> %llu), offsets contiguous",
           w ? (unsigned long long)w->ple_head_vocab[0] : 0ull, (unsigned long long)s->ngram_vocab_base);
 
-    /* The op table is COMPLETE: S2's gdn and S3's qsa landed 2026-09-27, so the
-     * driver has no op left to name.  (A step still refuses -- the synthetic
-     * fixture's tensors are not the recipe's formats -- but no longer for a
-     * missing op; the probes below keep the walk's order honest.) */
+    /* L295 F4: the family runs on the core step driver, and its block table is COMPLETE for the plan -- embed, a
+     * block for each of its layer kinds, the head -- so a session is not refused for a missing op.  (A step still
+     * refuses -- the synthetic fixture's tensors are not the recipe's formats -- but not for a missing block; the
+     * probes below keep the driver's walk honest: it names the first thing the plan's forward would miss.) */
+    const pulsar_driver_ops *dops = e->family->driver;
+    check(dops != NULL, "the family supplies the core driver's ops");
     uint32_t at = 0;
-    const pulsar_qwen_op_id miss = pulsar_qwen_first_missing_op(&g_qwen_ops, p, s, &at);
-    check(miss == PULSAR_QWEN_OP_COUNT, "the op table is complete: no missing op (got %s)", pulsar_qwen_op_name(miss));
-    /* The walk's order is the forward's: with only embed present the next is
-     * gr_read at layer 0; with every op but qsa present it is qsa at layer 3. */
-    pulsar_qwen_ops probe;
-    memset(&probe, 0, sizeof(probe));
-    probe.embed = never_embed;
-    check(pulsar_qwen_first_missing_op(&probe, p, s, &at) == PULSAR_QWEN_OP_GR_READ && at == 0,
-          "embed present -> gr_read at layer 0");
-    probe.gr_read = never_gr;
-    probe.gdn = never_layer;
-    probe.gr_write = never_gr;
-    probe.moe = never_layer;
-    check(pulsar_qwen_first_missing_op(&probe, p, s, &at) == PULSAR_QWEN_OP_PLE && at == 1,
-          "the PLE op is reached at layer 1, before its gr_read");
-    probe.ple = never_layer;
-    check(pulsar_qwen_first_missing_op(&probe, p, s, &at) == PULSAR_QWEN_OP_QSA && at == 3,
-          "then qsa at layer 3");
-    probe.qsa = never_layer;
-    check(pulsar_qwen_first_missing_op(&probe, p, s, &at) == PULSAR_QWEN_OP_HEAD, "then head");
+    const char *miss = dops ? pulsar_driver_first_missing(dops, p, &at) : "everything";
+    check(!miss, "the block table is complete for the plan (missing: %s)", miss ? miss : "none");
+    if (dops) {
+        pulsar_driver_ops probe = *dops;
+        probe.embed = NULL;
+        miss = pulsar_driver_first_missing(&probe, p, &at);
+        check(miss && !strcmp(miss, "embed") && at == UINT32_MAX, "no embed -> the walk names embed first");
+        probe = *dops;
+        probe.block[PULSAR_LAYER_QWEN_QSA] = NULL;
+        miss = pulsar_driver_first_missing(&probe, p, &at);
+        check(miss && !strcmp(miss, "block") && at == 3 && p->kind[at] == PULSAR_LAYER_QWEN_QSA,
+              "no QSA block -> the walk names the block of layer 3, the plan's first full_attention layer (got %u)", at);
+        probe = *dops;
+        probe.head = NULL;
+        miss = pulsar_driver_first_missing(&probe, p, &at);
+        check(miss && !strcmp(miss, "head"), "no head -> the walk names the head last");
+    }
     pulsar_engine_close(e);
 
     static const char *const mutants[] = { "arch", "shape", "tensor", "layer-type", "s4-format", "ple-rows" };
@@ -163,7 +156,8 @@ static void gpu_part(const char *dir) {
     const uint64_t price = pulsar_engine_session_cost_bytes_banked(e, ctx, (int)gpu_graph_bank_pool_n());
     pulsar_session *sess = NULL;
     const int rc = pulsar_session_create(&sess, e, ctx);
-    check(rc == 0 && sess && sess->qwen, "session created (%d tokens, %u bank(s))", ctx, gpu_graph_bank_pool_n());
+    check(rc == 0 && sess && sess->driver && sess->states, "session created on the core driver with declared state (%d "
+          "tokens, %u bank(s))", ctx, gpu_graph_bank_pool_n());
     if (rc != 0 || !sess) {
         pulsar_engine_close(e);
         return;

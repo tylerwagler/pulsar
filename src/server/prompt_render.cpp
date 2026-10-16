@@ -425,8 +425,8 @@ void append_json_object_or_empty(buf *b, const char *json) {
 void append_dsml_tool_calls_text(buf *b, const tool_calls *calls, bool v41) {
     const pulsar_dsml_syntax *d = pulsar_dsml_canonical(v41);
     if (!calls || calls->len == 0) return;
-    if (calls->raw_dsml && calls->raw_dsml[0]) {
-        buf_puts(b, calls->raw_dsml);
+    if (calls->raw_calls && calls->raw_calls[0]) {
+        buf_puts(b, calls->raw_calls);
         return;
     }
     /* The renderer writes the LOADED FAMILY's spelling (pulsar_dsml_canonical). */

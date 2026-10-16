@@ -186,26 +186,90 @@ not hygiene):
 `cuda-spec-sampling-gate [Qwen4-exp]`, the last at the battery's 1,250 trajectories).  Drop them; keep the
 vision, image-smoke and live / abandon server legs, which the runner does not cover.
 
-### The GPU lock
+### The GPU queue (gpuq)
 
-Sparky's GPU is shared through one lock file, `~/gpu.lock`, and one marker, `~/BATTERY_RUNNING`
-(nothing else runs while it exists: the accounting gate measures system-wide free memory).  Two ways to
-take the lock have bitten (#43):
-- `flock ~/gpu.lock cmd` (no `-o`) gives cmd the lock's fd, and every process cmd starts inherits it: a
-  pulsar-server started in the background keeps the GPU LOCKED after cmd and flock are gone, and
-  `/proc/locks` names a dead pid as the holder.
-- `flock -o ~/gpu.lock -c '...'` inherits nothing, but a server the job leaves running -- or a job orphaned
-  by a killed flock or a dropped ssh session -- keeps the GPU BUSY with the lock free, and the next job
-  loads beside it.
+Sparky's GPU is shared through `gpuq` (`tools/gpuq/`, installed as `~/bin/gpuq`, daemon `gpuq.service`, a
+systemd user unit; spool `~/.gpuq/`).  It replaces `tools/gpu-run.sh` and `tools/gpu-lock-status.sh` (#43)
+and a bare `flock -o ~/gpu.lock`, which is not FIFO (seven waiters ran in random order on 2026-10-14), knows
+no job classes and no memory, and shows little.
 
-Use the wrapper, which holds the lock itself (the job never gets the fd), runs the job in its own session
-tagged by an environment token, and on any exit (the job's end, `-t`, Ctrl-C, SIGTERM, SIGHUP) kills every
-process of the job that is left before the lock is released:
+    gpuq submit --class short --timeout 20m --wait -- make gates-dev PATHS=src/engine/session.cpp
+    gpuq submit --class quiet --timeout 75m --wait -- ~/qland3-battery.sh <sha>     # a battery
+    gpuq submit --class long --timeout 20h --mem 40G --min-hold 1h --yield-grace 90m \
+         --label inkling-k3 -- bash ~/inkling/runs/k3_slice.sh                      # prints the job id
+    gpuq status [--json]    gpuq log [-f] ID    gpuq cancel ID
 
-    tools/gpu-run.sh -t 1200 -- make gates-dev PATHS=src/engine/session.cpp
-    tools/gpu-run.sh --battery -t 4000 -- make gates CUDA_ARCH=sm_120f   # owns ~/BATTERY_RUNNING
-    tools/gpu-lock-status.sh   # holder + queue; exit 1 on an orphaned lock, an inherited fd,
-                               # or a GPU process outside the holder's tree
+- **Classes, in priority order.**  `quiet` > `short` > `long`; FIFO within a class; one job at a time,
+  except `--shared` short jobs (below).
+  `short`: timeout at most 20m (refused otherwise; default 20m).  `quiet`: the exclusive box for batteries
+  (default timeout 2h) -- it starts when nothing runs, nothing is admitted while it runs, and the daemon
+  creates `~/BATTERY_RUNNING` before it and removes it after.  `long` (default timeout 24h): preemptible.
+  Once `--min-hold` (default 5m) has passed and a quiet or short job waits, the daemon sends SIGUSR1 to the
+  job's process group, once.  The job exits **75 (EX_TEMPFAIL)** at its next checkpoint: re-queued with the
+  same cmd, `GPUQ_ATTEMPT` + 1, and it resumes when no quiet or short job waits.  Any other exit is final.
+  Not exited within `--yield-grace` (default 20m): logged once, and the daemon keeps waiting -- it never
+  kills for a yield.  SIGUSR1's default action terminates a process, so submit as `long` only a job that
+  handles it.  `gpuq status` shows "yield requested at" from the SIGUSR1 to the job's exit.
+- **The job** runs in its cwd (`--cwd`, default the submitter's), with the submitter's environment plus
+  `GPUQ_JOB_ID`, `GPUQ_CLASS`, `GPUQ_ATTEMPT`, `GPUQ_RESOURCES`; stdout+stderr to `~/.gpuq/logs/ID.log`
+  (`--wait` streams it).  It gets no lock fd.  Timeout is wall time per attempt: SIGTERM to the process
+  group, SIGKILL 30 s later.  On any exit every process still carrying the attempt's environment token (a
+  daemonized child included) is killed before the lock is released.
+- **Admission.**  Head of the queue, no foreign `~/BATTERY_RUNNING` (a legacy battery), `~/gpu.lock` taken,
+  then `sync` + drop_caches (once per admission; the page cache masks GB10 unified-memory pressure;
+  `GPUQ_DROP_CACHES=0` in the unit turns it off), then MemAvailable >= `--mem` (default 8G short, 16G
+  otherwise) + a 6G margin.  A head job short of memory waits holding the lock.
+- **Shared jobs** (`submit --class short --shared`): "timing-insensitive and safe to co-run".  Refused on
+  `quiet` and `long`.  Rules, in the daemon's order:
+  - A shared job starts only from the **head** of the queue (FIFO stays the rule: an exclusive job is never
+    overtaken).  An exclusive head -- a non-shared short, a quiet, a long -- waits until the running shared
+    group drains, and no new shared job starts past it, so it cannot be starved.
+  - It never starts beside a non-shared job, nor while a quiet job waits (a waiting quiet job is the head) or
+    runs, nor while a foreign `~/BATTERY_RUNNING` exists.
+  - At most `GPUQ_MAX_SHARED` (default 3; `Environment=` in the unit) run at once.
+  - Memory, measured fresh at each admission: MemAvailable >= `--mem` + 6G, plus the `--mem` of every group
+    member started under 60 s ago (it may not have allocated yet).  drop_caches runs only on an admission
+    onto an idle resource; a job joining a running group skips it (it would disturb the running jobs) and
+    the daemon logs "drop_caches skipped".
+  - The lock: the first job of a group starts a **lock holder** process (`gpuq.py _hold`, pid in
+    `~/.gpuq/holders.json`) that keeps `~/gpu.lock` until the daemon sees the group drained, so legacy
+    `flock` callers serialize with the whole group; shared shims get no lock fd.  The holder survives a
+    daemon restart like the shims, and the next daemon re-adopts it.
+  - A waiting shared job is a waiter for a running long job's yield, exactly like any short job.
+  - `gpuq status` lists every running job (`shared` tagged) and the group's lock holder.  `status --json`:
+    `resources.<res>.running` is a **list** (was one object or null); `running_first` is the old
+    single-object shape (or null) for existing readers; `queue` is unchanged, entries gain `shared`.
+
+  **Migration for callers:** model-free kernel gates and host-side tests add `--shared --mem 8G`.  Anything
+  loading a 60+ GB model, any perf / timing measurement, and batteries stay exclusive (no `--shared`).
+- **Exit codes of `--wait`:** the job's own; 124 timeout; 125 cancelled (also when the waiter itself gets
+  INT/TERM/HUP -- the job is tied to its waiter, like a `flock` child); 120 lost (its shim vanished while
+  the daemon was down); 127/126 cmd not found / not executable; 2 usage.  `gpuq status` exits 1 on an
+  anomaly: an orphaned lock (a dead holder, the lock kept by an inherited fd) or a GPU process that is
+  neither the running job's nor under a legacy holder.
+- **Legacy callers.**  While a job runs its shim (a shared group: its holder) holds `~/gpu.lock` (flock),
+  so `flock -o ~/gpu.lock` callers still serialize with gpuq; a legacy holder makes gpuq wait (it joins the kernel's queue like any
+  flock waiter, so it is not ahead of legacy waiters), and `gpuq status` shows it as LEGACY HOLDER with the
+  legacy waiters.  Migrate: a battery script's `flock -o ~/gpu.lock -c 'timeout 5400 ~/x-battery.sh'`
+  becomes `gpuq submit --class quiet --timeout 90m --wait -- ~/x-battery.sh` (gpuq owns
+  `~/BATTERY_RUNNING` now; a script's own `touch` + `trap 'rm -f'` is harmless and can go.  A marker gpuq did
+  not create -- a legacy battery's -- blocks every admission until it is removed); an agent's
+  `flock -o ~/gpu.lock -c 'timeout 1200 cmd'` becomes `gpuq submit --class short --timeout 20m --wait -- cmd`.
+- **Robustness.**  The daemon restarts without touching jobs (`KillMode=process`): each attempt runs under
+  a shim that holds the lock and writes the outcome, and the next daemon re-adopts live shims, finalizes
+  those that finished while it was down, and marks the rest lost (killing what is left of them).  Every
+  state file is written atomically; every scheduling decision is in `~/.gpuq/gpuq.log` and the journal.
+  The user unit needs `loginctl enable-linger claude` to outlive the last login session.
+- **Tests.**  `python3 tools/gpuq/test_gpuq.py -v` on Sparky (scratch in `~/gpuq-test/`): a real daemon per
+  test in test mode (`GPUQ_TEST=1` with its own `GPUQ_HOME`, `GPUQ_LOCK`, `GPUQ_MARKER`, a fake
+  `GPUQ_MEMINFO` and drop_caches command), dummy jobs, no GPU, ~75 s.  Install: `tools/gpuq/install.sh`.
+- **Spool format, version 1, and the v2 plan.**  Every job record, outcome and the daemon state carry
+  `"version": 1`, and every job names its resources (`"resources": ["sparky:gpu0"]`, from the hostname;
+  `--gpus gpu0` or `--gpus sparky:gpu0`).  The lock and the memory pool are per resource; v1 owns one
+  resource per host and refuses any other by name.  v2 (not built): a coordinator reads several hosts'
+  spools over ssh (`~/.gpuq/jobs/*.json`, `state.json`) and adds gang jobs that need every listed resource
+  at once (the two-Spark pair: `--gpus sparky:gpu0,spark2:gpu0`), taking each host's lock before starting.
+
 
 ## 3. Flash Inference Path
 

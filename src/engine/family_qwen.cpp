@@ -1,15 +1,15 @@
 /* family_qwen.cpp -- the Qwen4-exp family (Qwen3.8-Flash-Next), L251 S1.
  *
  * What is here: config validation against the known shape, the layer plan from
- * the artifact's layer_types, the weight binding by HF name, the session state
- * (DeltaNet recurrent + conv state, FP8 KV and pooled index keys, PLE conv
- * state; sized for the 1.5-2M-token target), and the step driver that walks
- * the plan through the op table (family_qwen.h).  What is NOT here: any op.
- * Until S2-S4 fill g_qwen_ops, a step refuses by naming the first op it would
- * call and the stream that owns it; nothing computes a number (rules 1, 9). */
+ * the artifact's layer_types, the weight binding by HF name, the DECLARATION of
+ * the session state (L295 F3: DeltaNet recurrent + conv state, FP8 KV and pooled
+ * index keys, PLE conv state -- the core's state_kinds.cpp builds and runs it),
+ * the family's own session state, and its blocks on the core step driver (L295
+ * F4: one block per layer kind, the MTP lane -- step_driver.cpp runs every
+ * step).  What is NOT here: any op (family_qwen_s4.cpp). */
 #include "pulsar_engine_internal.h"
 #include "exl3_trellis.h"
-#include "lib/qwen_tokenizer.h"
+#include "lib/bpe_tokenizer.h"
 #include "tp/pulsar_tp.h"
 #include "spec_internal.h"
 #include "qwen_forward.h"
@@ -58,97 +58,6 @@ const pulsar_qwen_shape PULSAR_QWEN_SHAPE_FLASH_NEXT = {
 };
 
 pulsar_qwen_shape g_qwen_shape = PULSAR_QWEN_SHAPE_FLASH_NEXT;
-
-/* ---- ops ---------------------------------------------------------------- */
-
-/* THE op table.  Every entry is NULL until its stream lands it; a stream fills
- * its own entries here and nothing else. */
-const pulsar_qwen_ops g_qwen_ops = {
-    /* .embed         = */ pulsar_qwen_s4_embed,      /* S4 work/l251-moe */
-    /* .ple           = */ pulsar_qwen_s4_ple,        /* S4 work/l251-moe */
-    /* .gr_read       = */ pulsar_qwen_s4_gr_read,    /* S4 work/l251-moe */
-    /* .gdn           = */ pulsar_qwen_s2_gdn,
-    /* .qsa           = */ pulsar_qwen_s3_qsa,
-    /* .gr_write      = */ pulsar_qwen_s4_gr_write,   /* S4 work/l251-moe */
-    /* .moe           = */ pulsar_qwen_s4_moe,        /* S4 work/l251-moe */
-    /* .head          = */ pulsar_qwen_s4_head,       /* S4 work/l251-moe */
-    /* .scratch_bytes = */ pulsar_qwen_s4_scratch_bytes,   /* S4's ops; S2 / S3 chain theirs in */
-};
-
-const char *pulsar_qwen_op_name(pulsar_qwen_op_id op) {
-    switch (op) {
-    case PULSAR_QWEN_OP_EMBED:    return "embed";
-    case PULSAR_QWEN_OP_PLE:      return "ple";
-    case PULSAR_QWEN_OP_GR_READ:  return "gr_read";
-    case PULSAR_QWEN_OP_GDN:      return "gdn";
-    case PULSAR_QWEN_OP_QSA:      return "qsa";
-    case PULSAR_QWEN_OP_GR_WRITE: return "gr_write";
-    case PULSAR_QWEN_OP_MOE:      return "moe";
-    case PULSAR_QWEN_OP_HEAD:     return "head";
-    case PULSAR_QWEN_OP_COUNT:    break;
-    }
-    return "unknown";
-}
-
-const char *pulsar_qwen_op_owner(pulsar_qwen_op_id op) {
-    switch (op) {
-    case PULSAR_QWEN_OP_GDN: return "S2 (work/l251-gdn)";
-    case PULSAR_QWEN_OP_QSA: return "S3 (work/l251-attn)";
-    case PULSAR_QWEN_OP_EMBED:
-    case PULSAR_QWEN_OP_PLE:
-    case PULSAR_QWEN_OP_GR_READ:
-    case PULSAR_QWEN_OP_GR_WRITE:
-    case PULSAR_QWEN_OP_MOE:
-    case PULSAR_QWEN_OP_HEAD:     return "S4 (work/l251-moe)";
-    case PULSAR_QWEN_OP_COUNT:    break;
-    }
-    return "unknown";
-}
-
-static bool qwen_op_present(const pulsar_qwen_ops *ops, pulsar_qwen_op_id op) {
-    switch (op) {
-    case PULSAR_QWEN_OP_EMBED:    return ops->embed != NULL;
-    case PULSAR_QWEN_OP_PLE:      return ops->ple != NULL;
-    case PULSAR_QWEN_OP_GR_READ:  return ops->gr_read != NULL;
-    case PULSAR_QWEN_OP_GDN:      return ops->gdn != NULL;
-    case PULSAR_QWEN_OP_QSA:      return ops->qsa != NULL;
-    case PULSAR_QWEN_OP_GR_WRITE: return ops->gr_write != NULL;
-    case PULSAR_QWEN_OP_MOE:      return ops->moe != NULL;
-    case PULSAR_QWEN_OP_HEAD:     return ops->head != NULL;
-    case PULSAR_QWEN_OP_COUNT:    break;
-    }
-    return false;
-}
-
-/* The ops a forward over `plan` calls, in the order it calls them, and the
- * first of them that is missing (PULSAR_QWEN_OP_COUNT: none).  The walk is the
- * driver's own order (qwen_forward), so the refusal names exactly the op the
- * step would have reached first. */
-pulsar_qwen_op_id pulsar_qwen_first_missing_op(const pulsar_qwen_ops *ops, const pulsar_layer_plan *plan,
-                                               const pulsar_qwen_shape *shape, uint32_t *at_layer) {
-    *at_layer = UINT32_MAX;
-    if (!qwen_op_present(ops, PULSAR_QWEN_OP_EMBED)) return PULSAR_QWEN_OP_EMBED;
-    for (uint32_t il = 0; il < plan->n_layer; il++) {
-        const pulsar_qwen_op_id seq[] = {
-            il == shape->ple_layer ? PULSAR_QWEN_OP_PLE : PULSAR_QWEN_OP_COUNT,
-            PULSAR_QWEN_OP_GR_READ,
-            plan->kind[il] == PULSAR_LAYER_QWEN_GDN ? PULSAR_QWEN_OP_GDN : PULSAR_QWEN_OP_QSA,
-            PULSAR_QWEN_OP_GR_WRITE,
-            PULSAR_QWEN_OP_GR_READ,
-            PULSAR_QWEN_OP_MOE,
-            PULSAR_QWEN_OP_GR_WRITE,
-        };
-        for (size_t k = 0; k < sizeof(seq) / sizeof(seq[0]); k++) {
-            if (seq[k] == PULSAR_QWEN_OP_COUNT) continue;
-            if (!qwen_op_present(ops, seq[k])) {
-                *at_layer = il;
-                return seq[k];
-            }
-        }
-    }
-    if (!qwen_op_present(ops, PULSAR_QWEN_OP_HEAD)) return PULSAR_QWEN_OP_HEAD;
-    return PULSAR_QWEN_OP_COUNT;
-}
 
 /* ---- load: config ---------------------------------------------------------- */
 
@@ -580,14 +489,14 @@ static bool qwen_load_tokenizer(pulsar_engine *e, const char *model_path) {
         return false;
     }
     char err[256] = "";
-    e->qwen_tok = qwen_tokenizer_load(tj.data(), tj.size(), gc.data(), gc.size(), err, sizeof(err));
+    e->qwen_tok = bpe_tokenizer_load_hf(tj.data(), tj.size(), gc.data(), gc.size(), err, sizeof(err));
     if (!e->qwen_tok) {
         fprintf(stderr, "pulsar: %s: tokenizer refused: %s\n", PULSAR_QWEN_ARCH, err);
         return false;
     }
-    const std::vector<int> &stop = qwen_tokenizer_stop_ids(e->qwen_tok);
+    const std::vector<int> &stop = bpe_tokenizer_stop_ids(e->qwen_tok);
     fprintf(stderr, "pulsar: %s: tokenizer %d ids from %s; stop ids", PULSAR_QWEN_ARCH,
-            qwen_tokenizer_n_tokens(e->qwen_tok), tp.c_str());
+            bpe_tokenizer_n_tokens(e->qwen_tok), tp.c_str());
     for (int id : stop) fprintf(stderr, " %d", id);
     fprintf(stderr, "\n");
     return true;
@@ -611,7 +520,7 @@ static bool qwen_draft_vocab(pulsar_engine *e) {
         const int32_t id = k_qwen_draft_extra[i];
         size_t len = 0;
         const char *b = id >= (int32_t)QWEN_DRAFT_PREFIX && (uint32_t)id < s->eos_id
-                            ? qwen_tokenizer_token_bytes(e->qwen_tok, id, &len) : NULL;
+                            ? bpe_tokenizer_token_bytes(e->qwen_tok, id, &len) : NULL;
         ok = b != NULL;
         for (size_t j = 0; ok && j <= len; j++) {
             h ^= j < len ? (uint8_t)b[j] : 0xffu;
@@ -728,7 +637,7 @@ static bool qwen_family_load(pulsar_engine *e, const pulsar_engine_options *opt)
     if (!qwen_vision_bind(&e->model, &e->qwen_weights->vision, &e->qwen_weights->vision_present)) return false;
     e->qwen_weights->vision_pad_id = -1;
     if (e->qwen_weights->vision_present) {
-        e->qwen_weights->vision_pad_id = qwen_tokenizer_added_id(e->qwen_tok, "<|image_pad|>");
+        e->qwen_weights->vision_pad_id = bpe_tokenizer_added_id(e->qwen_tok, "<|image_pad|>");
         if (e->qwen_weights->vision_pad_id < 0 || g_qwen_shape.n_embd != PULSAR_QWEN_VISION_OUT) {
             fprintf(stderr, "pulsar: %s: the vision tower needs <|image_pad|> in the tokenizer and a %u-wide model "
                             "(pad %d, n_embd %u) -- refusing\n", PULSAR_QWEN_ARCH, (unsigned)PULSAR_QWEN_VISION_OUT,
@@ -741,6 +650,7 @@ static bool qwen_family_load(pulsar_engine *e, const pulsar_engine_options *opt)
      * (--no-dspark) turns drafting off for this family as it does for DeepSeek's */
     if (e->qwen_weights->mtp.present && !opt->dspark_disable) e->drafter_ops = &k_mtp_drafter;
     if (e->qwen_weights->mtp.present && !qwen_draft_vocab(e)) return false;
+    qwen_state_plan(e);   /* L295 F3: the shape is the rank's, the MTP layer known */
     fprintf(stderr, "pulsar: %s: %s, %u GDN + %u QSA layers, PLE at layer %u\n",
             PULSAR_QWEN_ARCH, g_qwen_shape.name,
             pulsar_layer_plan_count(&e->plan, PULSAR_LAYER_QWEN_GDN),
@@ -780,20 +690,14 @@ bool pulsar_qwen_tp_load(pulsar_engine *e) {
     return true;
 }
 
-/* The ops that exist, announced once at open (rule 5): which of the forward's
- * ops this build carries, so a log says what a Qwen engine CAN run. */
+/* The lane, announced once at open (rule 5): the core driver over Qwen's blocks, and what its table lacks for the
+ * plan (a session refuses with exactly that). */
 static bool qwen_family_after_gpu(pulsar_engine *e) {
-    char have[256] = "", missing[256] = "";
-    for (int op = 0; op < PULSAR_QWEN_OP_COUNT; op++) {
-        char *dst = qwen_op_present(&g_qwen_ops, (pulsar_qwen_op_id)op) ? have : missing;
-        const size_t n = strlen(dst);
-        snprintf(dst + n, 256 - n, "%s%s", n ? " " : "", pulsar_qwen_op_name((pulsar_qwen_op_id)op));
-    }
     uint32_t at = 0;
-    const pulsar_qwen_op_id first = pulsar_qwen_first_missing_op(&g_qwen_ops, &e->plan, &g_qwen_shape, &at);
-    fprintf(stderr, "pulsar: %s ops present: [%s]; missing: [%s]%s%s\n", PULSAR_QWEN_ARCH,
-            have, missing, first == PULSAR_QWEN_OP_COUNT ? "" : "; a step refuses at ",
-            first == PULSAR_QWEN_OP_COUNT ? "" : pulsar_qwen_op_name(first));
+    const char *miss = pulsar_driver_first_missing(e->family->driver, &e->plan, &at);
+    fprintf(stderr, "pulsar: %s: the core step driver over %u qwen_gdn + %u qwen_qsa blocks%s%s%s\n", PULSAR_QWEN_ARCH,
+            pulsar_layer_plan_count(&e->plan, PULSAR_LAYER_QWEN_GDN), pulsar_layer_plan_count(&e->plan, PULSAR_LAYER_QWEN_QSA),
+            e->qwen_weights->mtp.present ? ", the MTP lane" : "", miss ? "; MISSING " : "", miss ? miss : "");
     return true;
 }
 
@@ -828,342 +732,242 @@ static uint64_t qwen_trained_context(const pulsar_engine *) { return g_qwen_shap
 
 /* ---- session state ------------------------------------------------------------ */
 
-static uint64_t qwen_ceil_div(uint64_t a, uint64_t b) { return (a + b - 1u) / b; }
+/* L295 F3: Qwen's state, DECLARED (state_kinds.h; the ids are family_qwen.h's PULSAR_QWEN_STATE_*).  The core
+ * builds, prices, pages, walks and commits it; what follows is only what the model IS.
+ *
+ *   per GDN layer (36)  the DeltaNet recurrent state (FIXED, 3.1 MB fp32; a verify row keeps its update, L288, and
+ *                       the commit applies the kept ones) and the causal-conv tail (FIXED, the state after each
+ *                       verify row);
+ *   per QSA layer (12)  KV rows (POOL, 1 token a row, 1056 B, E4M3 + E8M0) and pooled indexer keys (POOL, idx_block
+ *                       tokens a row, 256 B) -- demand-paged per bank -- and the open index block (STAGED; a verify
+ *                       row's record is its index_qk projection, the key after the query heads);
+ *   the PLE layer       its dilated-conv history (FIXED, snapshot per verify row);
+ *   the MTP layer       a drafter slot (n_layer): a QSA layer's state, whose KV lags the trunk by one row (row p is
+ *                       written once x_{p+1} exists, so at G it holds rows [0, G - 1)) and so is no segment's pool
+ *                       (a payload carries it as a trailing pool), plus the pending trunk stack at G - 1;
+ *   session-wide        the n-gram context, host state (the last two ids, reset at EOS): replayed over a verify's
+ *                       kept tokens, and carried in the checkpoint slot's tail so a restore needs no token replay.
+ *
+ * THE RESUME GRID: Qwen's recurrent GDN and per-row QSA are split-invariant by construction, and every prompt chunk
+ * takes the prefill arms at every row count with a pinned GEMM (L266: session_contract_gate C1) -- so a prompt cut
+ * ANYWHERE is the cold prefill's bytes.  The grid is therefore free; 128 keeps the slots on the server's and
+ * DeepSeek's cadence and closes an indexer block (the core checks every pool's rows divide it).
+ *
+ * THE PREFILL FRONTIER: a checkpoint is the cold prefill of its tokens only if every row below it was prefilled
+ * (decode rows are the decode arms'); the core's prefill_pos[bank] ends the bank's prefill-only history, decode
+ * never advances it, and a capture requires bank_pos == G == prefill_pos. */
+#define QWEN_RESUME_GRID 128u
+/* ~118 MB a slot (the GDN recurrent state), so 4 -- not DeepSeek's 16 x ~3.8 MB, which here would be ~1.9 GB a bank
+ * (Tyler 2026-10-08: "4"); an edit up to 2 turns back resumes from a slot, not from 0 (the ladder is checkpoint.cpp's). */
+#define QWEN_CKPT_SLOTS 4u
 
-/* L284 #3: one bank's demand-paged tensors on QSA layer il, each made where it is missing.  The sizes are the
- * op's per-bank views' (st->ctx is the block-rounded capacity; pulsar_qwen_qsa_cap). */
-static bool qwen_layer_bank_alloc(pulsar_qwen_state *st, uint32_t il, uint32_t bank) {
-    const pulsar_qwen_shape *s = &g_qwen_shape;
-    pulsar_qwen_layer_state *L = &st->layer[il];
-    if (!L->kv[bank]) L->kv[bank] = pulsar_gpu_tensor_alloc_managed((uint64_t)st->ctx * pulsar_qwen_kv_row_bytes(s));
-    if (!L->idx_keys[bank])
-        L->idx_keys[bank] = pulsar_gpu_tensor_alloc_managed(qwen_ceil_div(st->ctx, s->idx_block) *
-                                                            pulsar_qwen_index_row_bytes(s));
-    return L->kv[bank] && L->idx_keys[bank];
+/* DELTA (L288): apply the kept rows' recurrent updates -- the verify left the state as it found it. */
+static bool qwen_gdn_commit(void *state, uint32_t bank, const void *rows, uint32_t keep) {
+    return pulsar_gdn_commit((float *)state, (int)bank, (const float *)rows, (int)keep,
+                             (int)pulsar_qwen_tp(&g_qwen_shape), 0) == 0;
 }
 
-static void qwen_layer_bank_free(pulsar_qwen_state *st, uint32_t il, uint32_t bank) {
-    pulsar_qwen_layer_state *L = &st->layer[il];
-    pulsar_gpu_tensor_free(L->kv[bank]);
-    pulsar_gpu_tensor_free(L->idx_keys[bank]);
-    L->kv[bank] = NULL;
-    L->idx_keys[bank] = NULL;
+/* The n-gram context: a fresh bank's is the reset token (HF resets it at EOS, and a sequence start is a reset); a
+ * verify's commit replays the kept tokens over the bank's context before the step. */
+static void qwen_ngram_init(const void *, void *state) {
+    int32_t *ctx = (int32_t *)state;
+    for (uint32_t i = 0; i + 1u < g_qwen_shape.ngram_size; i++) ctx[i] = (int32_t)g_qwen_shape.eos_id;
 }
 
-void qwen_bank_kv_free(pulsar_qwen_state *st, uint32_t bank) {
-    for (uint32_t il = 0; il < st->n_trunk_layers; il++)
-        if (st->layer[il].kv) qwen_layer_bank_free(st, il, bank);
-    st->kv_hw[bank] = 0;   /* its pages are gone; the restore's loads raise it again */
+static bool qwen_ngram_replay(const void *e, void *state, const int32_t *tokens, uint32_t keep) {
+    return pulsar_qwen_s4_ngram_replay(((const pulsar_engine *)e)->qwen_weights, (int32_t *)state, tokens, keep);
 }
 
-bool qwen_bank_kv_alloc(pulsar_qwen_state *st, uint32_t bank) {
-    for (uint32_t il = 0; il < st->n_trunk_layers; il++) {
-        if (st->layer[il].kv && !qwen_layer_bank_alloc(st, il, bank)) {
-            qwen_bank_kv_free(st, bank);   /* never half-backed */
-            return false;
-        }
+/* The MTP lane's counters the walk keeps in step: at T the pending row is the trunk stack at T - 1 (none at 0) and
+ * the stage holds no draft rows (L289: the walk writes the true tail). */
+static void qwen_drafter_at(void *ud, uint32_t bank, uint32_t T) {
+    pulsar_qwen_state *q = (pulsar_qwen_state *)ud;
+    q->mtp_pend_pos[bank] = q->mtp ? T - 1u : UINT32_MAX;
+    if (q->mtp) q->mtp_stage_dirty[bank] = false;
+}
+
+/* A payload's frontier T: the MTP layer's pending row is the trunk stack at T - 1 and its stage holds no draft rows
+ * (a draft chain consumes the pending row and writes into the stage until the round's absorb puts both back). */
+static bool qwen_drafter_frontier(void *ud, uint32_t bank, uint32_t T, char *why, size_t whylen) {
+    const pulsar_qwen_state *q = (const pulsar_qwen_state *)ud;
+    if (q->mtp && (T == 0u || q->mtp_pend_pos[bank] != T - 1u || q->mtp_stage_dirty[bank])) {
+        snprintf(why, whylen, "bank %u's MTP layer is mid-draft (pending row %d, stage %s); step it first", bank,
+                 q->mtp_pend_pos[bank] == UINT32_MAX ? -1 : (int)q->mtp_pend_pos[bank],
+                 q->mtp_stage_dirty[bank] ? "holds draft rows" : "clean");
+        return false;
     }
     return true;
 }
 
-bool qwen_bank_kv_evicted(const pulsar_qwen_state *st, uint32_t bank) {
-    for (uint32_t il = 0; il < st->n_trunk_layers; il++) {
-        const pulsar_qwen_layer_state *L = &st->layer[il];
-        if (L->kv && (!L->kv[bank] || !L->idx_keys[bank])) return true;
-    }
-    return false;
+void qwen_state_plan(pulsar_engine *e) {
+    const pulsar_qwen_shape *s = &g_qwen_shape;
+    const pulsar_layer_plan *lp = &e->plan;
+    pulsar_state_plan *p = &e->state_plan;
+    *p = pulsar_state_plan{};
+    p->name = "qwen4-exp";   /* the kv-state's name since L266: mixed into every segment's digest */
+    p->resume_grid = QWEN_RESUME_GRID;
+    p->split_invariant = true;   /* THE RESUME GRID above */
+    p->ckpt_slots = QWEN_CKPT_SLOTS;
+    pulsar_state_decl d[PULSAR_QWEN_STATE_COUNT] = {};
+    d[PULSAR_QWEN_STATE_GDN_REC] = {"gdn_state", PULSAR_STATE_FIXED, PULSAR_STATE_CAPTURE_DELTA, false, false, 0,
+                                    pulsar_qwen_gdn_state_bytes(s),
+                                    pulsar_gdn_upd_floats((int)pulsar_qwen_tp(s)) * sizeof(float), 0, qwen_gdn_commit,
+                                    NULL, NULL};
+    d[PULSAR_QWEN_STATE_GDN_CONV] = {"gdn_conv", PULSAR_STATE_FIXED, PULSAR_STATE_CAPTURE_SNAPSHOT, false, false, 0,
+                                     pulsar_qwen_gdn_conv_bytes(s), 0, 0, NULL, NULL, NULL};
+    d[PULSAR_QWEN_STATE_KV] = {"kv", PULSAR_STATE_POOL, PULSAR_STATE_CAPTURE_NONE, false, false, 1u,
+                               pulsar_qwen_kv_row_bytes(s), 0, 0, NULL, NULL, NULL};
+    d[PULSAR_QWEN_STATE_IDX_KEYS] = {"idx_keys", PULSAR_STATE_POOL, PULSAR_STATE_CAPTURE_NONE, false, false,
+                                     s->idx_block, pulsar_qwen_index_row_bytes(s), 0, 0, NULL, NULL, NULL};
+    d[PULSAR_QWEN_STATE_IDX_TAIL] = {"idx_tail", PULSAR_STATE_STAGED, PULSAR_STATE_CAPTURE_STAGE, false, false,
+                                     s->idx_block, pulsar_qwen_index_tail_bytes(s) / s->idx_block,
+                                     (uint64_t)PULSAR_QSA_IDX_IN * sizeof(float),
+                                     (uint64_t)PULSAR_QSA_IDX_HEADS * PULSAR_QSA_IDX_DIM * sizeof(float), NULL, NULL,
+                                     NULL};
+    d[PULSAR_QWEN_STATE_PLE_CONV] = {"ple_conv", PULSAR_STATE_FIXED, PULSAR_STATE_CAPTURE_SNAPSHOT, false, false, 0,
+                                     pulsar_qwen_ple_conv_bytes(s), 0, 0, NULL, NULL, NULL};
+    d[PULSAR_QWEN_STATE_MTP_PEND] = {"mtp_pend", PULSAR_STATE_FIXED, PULSAR_STATE_CAPTURE_NONE, false, false, 0,
+                                     pulsar_qwen_hc_dim(s) * PULSAR_QWEN_STREAM_ELT_SIZE, 0, 0, NULL, NULL, NULL};
+    d[PULSAR_QWEN_STATE_NGRAM] = {"ngram_ctx", PULSAR_STATE_FIXED, PULSAR_STATE_CAPTURE_REPLAY, true, false, 0,
+                                  (uint64_t)(s->ngram_size - 1u) * sizeof(int32_t), 0, 0, NULL, qwen_ngram_replay,
+                                  qwen_ngram_init};
+    for (uint32_t id = 0; id < PULSAR_QWEN_STATE_COUNT; id++) (void)pulsar_state_plan_add(p, d[id]);
+    const uint32_t gdn = 1u << PULSAR_QWEN_STATE_GDN_REC | 1u << PULSAR_QWEN_STATE_GDN_CONV;
+    const uint32_t qsa = 1u << PULSAR_QWEN_STATE_KV | 1u << PULSAR_QWEN_STATE_IDX_KEYS | 1u << PULSAR_QWEN_STATE_IDX_TAIL;
+    for (uint32_t il = 0; il < lp->n_layer; il++)
+        p->slot[il] = (lp->kind[il] == PULSAR_LAYER_QWEN_GDN ? gdn : qsa) |
+                      (il == s->ple_layer ? 1u << PULSAR_QWEN_STATE_PLE_CONV : 0u);
+    p->n_trunk = lp->n_layer;
+    p->n_slots = lp->n_layer;
+    if (e->qwen_weights->mtp.present) p->slot[p->n_slots++] = qsa | 1u << PULSAR_QWEN_STATE_MTP_PEND;
+    p->session = 1u << PULSAR_QWEN_STATE_NGRAM;
+    p->drafter_at = qwen_drafter_at;
+    p->drafter_frontier = qwen_drafter_frontier;
 }
 
 static void qwen_state_free(pulsar_qwen_state *st) {
     if (!st) return;
-    for (uint32_t il = 0; il < PULSAR_FAMILY_MAX_LAYER; il++) {
-        pulsar_qwen_layer_state *L = &st->layer[il];
-        pulsar_gpu_tensor_free(L->gdn_state);
-        pulsar_gpu_tensor_free(L->gdn_conv);
-        if (L->kv)
-            for (uint32_t b = 0; b < st->n_banks; b++) qwen_layer_bank_free(st, il, b);
-        free(L->kv);
-        free(L->idx_keys);
-        pulsar_gpu_tensor_free(L->idx_tail);
-        pulsar_gpu_tensor_free(L->ple_conv);
-    }
     pulsar_gpu_tensor_free(st->streams);
     pulsar_gpu_tensor_free(st->x);
     pulsar_gpu_tensor_free(st->y);
-    pulsar_gpu_tensor_free(st->logits);
-    pulsar_gpu_tensor_free(st->row_pos);
-    pulsar_gpu_tensor_free(st->row_bank);
     pulsar_gpu_tensor_free(st->mtp_streams);
     pulsar_gpu_tensor_free(st->mtp_h);
     pulsar_gpu_tensor_free(st->mtp_tok);
     pulsar_gpu_tensor_free(st->mtp_ws);
     pulsar_gpu_tensor_free(st->mtp_top);
-    pulsar_gpu_tensor_free(st->mtp_pend);
-    free(st->mtp_pend_pos);
-    free(st->spec_logits);
-    pulsar_gpu_tensor_free(st->spec.gdn_upd);
-    pulsar_gpu_tensor_free(st->spec.gdn_conv);
-    pulsar_gpu_tensor_free(st->spec.ple);
-    pulsar_gpu_tensor_free(st->spec.qsa_stage);
-    pulsar_gpu_tensor_free(st->spec.qsa_keys);
     pulsar_gpu_tensor_free(st->mtp_stage);
+    free(st->mtp_pend_pos);
     free(st->mtp_stage_dirty);
-    pulsar_gpu_tensor_free(st->run_first_dev);
-    for (int op = 0; op < PULSAR_QWEN_OP_COUNT; op++) pulsar_gpu_tensor_free(st->scratch[op]);
-    free(st->ngram_ctx);
-    free(st->bank_pos);
-    free(st->kv_hw);
-    pulsar_gpu_tensor_free(st->tp_ticket);
-    pulsar_gpu_tensor_free(st->tp_vocab_own);
-    if (st->ckpt) pulsar_ckpt_release(st->ckpt);
-    free(st->ckpt);
-    free(st->prefill_pos);
-    free(st->frontier_stale);
+    free(st->trunk);
     free(st);
 }
 
-/* The layer kind of state slot il: the plan's for the trunk, QSA for the MTP layer at n_layer. */
-static pulsar_layer_kind qwen_state_kind(const pulsar_layer_plan *plan, uint32_t il) {
-    return il < plan->n_layer ? plan->kind[il] : PULSAR_LAYER_QWEN_QSA;
-}
-
-/* Allocate a session's state.  The same code prices it: the core runs the create under
- * pulsar_gpu_tensor_dry_begin and the allocators total the bytes instead (session_cost_bytes_banked). */
-static pulsar_qwen_state *qwen_state_alloc(const pulsar_qwen_shape *s, const pulsar_layer_plan *plan,
-                                           uint32_t n_banks, uint32_t ctx, uint32_t max_rows, bool mtp) {
+/* The family's own session state (the driver's create, step_driver.h; the driver then builds its buffers and the
+ * declared state): the step's activation slots, the trunk's step object, and the MTP lane.  Allocates only through
+ * the tensor allocators -- the create is also the session's price (session_cost_bytes_banked). */
+static pulsar_driver_state *qwen_create(pulsar_session *s, uint32_t n_banks) {
+    pulsar_engine *e = s->engine;
+    const pulsar_qwen_shape *sh = &g_qwen_shape;
+    const bool mtp = e->qwen_weights->mtp.present;
     pulsar_qwen_state *st = (pulsar_qwen_state *)xcalloc(1, sizeof(*st));
-    st->n_banks = n_banks;
-    st->ctx = pulsar_qwen_qsa_cap(s, ctx);   /* a whole number of indexer blocks; see the helper */
-    st->max_rows = max_rows;
     st->mtp = mtp;
-    bool ok = true;
-    const uint64_t nb = n_banks;
-    const uint32_t n_state = plan->n_layer + (mtp ? 1u : 0u);   /* the MTP layer's KV at slot n_layer */
-    for (uint32_t il = 0; ok && il < n_state; il++) {
-        pulsar_qwen_layer_state *L = &st->layer[il];
-        if (qwen_state_kind(plan, il) == PULSAR_LAYER_QWEN_GDN) {
-            L->gdn_state = pulsar_gpu_tensor_alloc(nb * pulsar_qwen_gdn_state_bytes(s));
-            L->gdn_conv  = pulsar_gpu_tensor_alloc(nb * pulsar_qwen_gdn_conv_bytes(s));
-            ok = L->gdn_state && L->gdn_conv;
-        } else {
-            /* Demand-paged: a bank pays for the KV it touches.  Sized from st->ctx, NOT the raw
-             * parameter: st->ctx is the block-rounded QSA capacity (see pulsar_qwen_qsa_cap), and
-             * the op views exactly st->ctx tokens per bank -- allocating the raw ctx made the KV
-             * view overshoot its tensor and the op refused with "a QSA bank cache view failed".  One
-             * tensor per bank (L284 #3), so a bank's pages can be returned (qwen_bank_kv_free). */
-            L->kv       = (pulsar_gpu_tensor **)xcalloc(n_banks, sizeof(*L->kv));
-            L->idx_keys = (pulsar_gpu_tensor **)xcalloc(n_banks, sizeof(*L->idx_keys));
-            for (uint32_t b = 0; ok && b < n_banks; b++) ok = qwen_layer_bank_alloc(st, il, b);
-            L->idx_tail = ok ? pulsar_gpu_tensor_alloc(nb * pulsar_qwen_index_tail_bytes(s)) : NULL;
-            ok = ok && L->idx_tail;
-        }
-        if (ok && il == s->ple_layer) {
-            L->ple_conv = pulsar_gpu_tensor_alloc(nb * pulsar_qwen_ple_conv_bytes(s));
-            ok = L->ple_conv != NULL;
-        }
-    }
-    const uint64_t rows = max_rows;
-    if (ok) {
-        st->streams  = pulsar_gpu_tensor_alloc(rows * pulsar_qwen_hc_dim(s) * PULSAR_QWEN_STREAM_ELT_SIZE);
-        st->x        = pulsar_gpu_tensor_alloc(rows * s->n_embd * PULSAR_QWEN_X_ELT_SIZE);
-        st->y        = pulsar_gpu_tensor_alloc(rows * s->n_embd * PULSAR_QWEN_Y_ELT_SIZE);
-        st->logits   = pulsar_gpu_tensor_alloc((uint64_t)PULSAR_QWEN_HEAD_ROWS_MAX * s->n_vocab * sizeof(float));
-        st->row_pos  = pulsar_gpu_tensor_alloc(rows * sizeof(int32_t));
-        st->row_bank = pulsar_gpu_tensor_alloc(rows * sizeof(int32_t));
-        ok = st->streams && st->x && st->y && st->logits && st->row_pos && st->row_bank;
-    }
+    const uint64_t rows = s->prefill_cap, nb = n_banks;
+    st->streams = pulsar_gpu_tensor_alloc(rows * pulsar_qwen_hc_dim(sh) * PULSAR_QWEN_STREAM_ELT_SIZE);
+    st->x       = pulsar_gpu_tensor_alloc(rows * sh->n_embd * PULSAR_QWEN_X_ELT_SIZE);
+    st->y       = pulsar_gpu_tensor_alloc(rows * sh->n_embd * PULSAR_QWEN_Y_ELT_SIZE);
+    bool ok = st->streams && st->x && st->y;
     if (ok && mtp) {
-        const uint64_t hc = pulsar_qwen_hc_dim(s) * PULSAR_QWEN_STREAM_ELT_SIZE;
+        const uint64_t hc = pulsar_qwen_hc_dim(sh) * PULSAR_QWEN_STREAM_ELT_SIZE;
         st->mtp_streams = pulsar_gpu_tensor_alloc(rows * hc);
         st->mtp_h       = pulsar_gpu_tensor_alloc((rows + 1u) * hc);
         st->mtp_tok     = pulsar_gpu_tensor_alloc(rows * sizeof(int32_t));
         st->mtp_ws      = pulsar_gpu_tensor_alloc(pulsar_qwen_s4_mtp_combine_ws_bytes());
         st->mtp_top     = pulsar_gpu_tensor_alloc(pulsar_qwen_s4_draft_top_ws_bytes());
-        st->mtp_pend    = pulsar_gpu_tensor_alloc(nb * hc);
-        ok = st->mtp_streams && st->mtp_h && st->mtp_tok && st->mtp_ws && st->mtp_top && st->mtp_pend;
+        st->mtp_stage   = pulsar_gpu_tensor_alloc(nb * pulsar_qwen_index_tail_bytes(sh));   /* per bank */
+        ok = st->mtp_streams && st->mtp_h && st->mtp_tok && st->mtp_ws && st->mtp_top && st->mtp_stage;
     }
     st->mtp_pend_pos = (uint32_t *)xmalloc(n_banks * sizeof(uint32_t));
     for (uint32_t b = 0; b < n_banks; b++) st->mtp_pend_pos[b] = UINT32_MAX;
-    if (mtp) st->spec_logits = (float *)xmalloc((size_t)PULSAR_QWEN_SPEC_ROWS * s->n_vocab * sizeof(float));
-    if (ok && mtp) {
-        /* the verify capture (L272 P1 S4: every bank's run of one step): per-row conv states and (L288) recurrent
-         * updates at the row's step index, each QSA layer's stage per run + the rows' raw keys; the MTP layer's
-         * stage per bank */
-        pulsar_qwen_spec_capture &sp = st->spec;
-        for (uint32_t il = 0; il < plan->n_layer; il++)
-            sp.ord[il] = (uint8_t)(plan->kind[il] == PULSAR_LAYER_QWEN_GDN ? sp.n_gdn++ : sp.n_qsa++);
-        sp.ord[plan->n_layer] = (uint8_t)sp.n_qsa;           /* the MTP layer's stage slot */
-        const uint64_t D = PULSAR_QWEN_SPEC_ROWS;
-        sp.gdn_upd   = pulsar_gpu_tensor_alloc((uint64_t)sp.n_gdn * D * pulsar_gdn_upd_floats((int)pulsar_qwen_tp(s)) *
-                                               sizeof(float));
-        sp.gdn_conv  = pulsar_gpu_tensor_alloc((uint64_t)sp.n_gdn * D * pulsar_qwen_gdn_conv_bytes(s));
-        sp.ple       = pulsar_gpu_tensor_alloc(D * pulsar_qwen_ple_conv_bytes(s));
-        sp.qsa_stage = pulsar_gpu_tensor_alloc((uint64_t)sp.n_qsa * D * pulsar_qwen_index_tail_bytes(s));
-        sp.qsa_keys  = pulsar_gpu_tensor_alloc((uint64_t)sp.n_qsa * D * PULSAR_QSA_IDX_IN * sizeof(float));
-        st->mtp_stage = pulsar_gpu_tensor_alloc((uint64_t)n_banks * pulsar_qwen_index_tail_bytes(s));
-        st->run_first_dev = pulsar_gpu_tensor_alloc((uint64_t)(D + 1u) * sizeof(int32_t));
-        ok = sp.gdn_upd && sp.gdn_conv && sp.ple && sp.qsa_stage && sp.qsa_keys && st->mtp_stage && st->run_first_dev;
-    }
     if (mtp) st->mtp_stage_dirty = (bool *)xcalloc(n_banks, sizeof(bool));
-    if (ok && mtp) {
-    }
-    for (int op = 0; ok && op < PULSAR_QWEN_OP_COUNT; op++) {
-        const uint64_t b = g_qwen_ops.scratch_bytes
-                               ? g_qwen_ops.scratch_bytes((pulsar_qwen_op_id)op, s, max_rows, ctx) : 0;
-        if (b) ok = (st->scratch[op] = pulsar_gpu_tensor_alloc(b)) != NULL;
-    }
-    /* L266 step 7: under TP, the row all-reduce's stage ticket (one u32) -- allocated here so the dry run
-     * prices it with the rest of the state */
-    if (ok && pulsar_qwen_tp(s) > 1) {
-        /* and the vocab gather's own slice (its row lane's; sized whatever the transport, so the price holds) */
-        const uint64_t vb = pulsar_tp_vocab_own_bytes_for(pulsar_qwen_tp(s), (uint64_t)s->n_embd * sizeof(float),
-                                                          s->n_vocab, PULSAR_QWEN_HEAD_ROWS_MAX);
-        ok = (st->tp_ticket = pulsar_gpu_tensor_alloc(sizeof(uint32_t))) != NULL &&
-             (st->tp_vocab_own = pulsar_gpu_tensor_alloc(vb)) != NULL;
-    }
-    st->ngram_ctx = (int32_t *)xcalloc((size_t)n_banks * (s->ngram_size - 1u), sizeof(int32_t));
-    st->bank_pos = (uint32_t *)xcalloc(n_banks, sizeof(uint32_t));
-    st->kv_hw = (uint32_t *)xcalloc(n_banks, sizeof(uint32_t));
-    st->prefill_pos = (uint32_t *)xcalloc(n_banks, sizeof(uint32_t));
-    st->frontier_stale = (bool *)xcalloc(n_banks, sizeof(bool));
-    st->n_trunk_layers = plan->n_layer;
-    /* L266 step 5: the grid checkpoints (kv_state_qwen.cpp), ckpt_slots x ~118 MB per bank -- priced with
-     * the rest under the dry run */
-    st->ckpt = (pulsar_ckpt_store *)xcalloc(1, sizeof(pulsar_ckpt_store));
-    if (ok && n_banks > PULSAR_MSEQ_MAX) {
-        fprintf(stderr, "pulsar: %s: %u banks, the checkpoint store holds at most %u -- refusing\n", PULSAR_QWEN_ARCH,
-                n_banks, (unsigned)PULSAR_MSEQ_MAX);
-        ok = false;
-    }
-    if (ok) ok = pulsar_ckpt_alloc(st->ckpt, &PULSAR_KV_STATE_QWEN, st, n_banks);
+    /* the trunk's lane: the step's own part, fixed for the session */
+    st->trunk = (pulsar_qwen_step *)xcalloc(1, sizeof(pulsar_qwen_step));
+    st->trunk->shape = sh;
+    st->trunk->w = e->qwen_weights;
+    st->trunk->st = st;
+    st->trunk->streams = st->streams;
+    st->trunk->mixer = &e->qwen_weights->mixer;
+    st->trunk->draft_head = false;
     if (!ok) {
-        fprintf(stderr, "pulsar: %s: session state allocation failed (%u banks x %u tokens)\n",
-                PULSAR_QWEN_ARCH, n_banks, ctx);
+        fprintf(stderr, "pulsar: %s: session state allocation failed (%u banks x %d tokens)\n", PULSAR_QWEN_ARCH,
+                n_banks, s->ctx_size);
         qwen_state_free(st);
         return NULL;
     }
     return st;
 }
 
-/* A bank starts fresh: its recurrent, conv and index-tail state is zero, and
- * its n-gram context is the reset token (HF resets the n-gram context at EOS,
- * and a sequence start is a reset). */
-static bool qwen_state_reset_bank(pulsar_qwen_state *st, const pulsar_qwen_shape *s,
-                                  const pulsar_layer_plan *plan, uint32_t bank) {
-    bool ok = true;
-    const uint32_t n_state = plan->n_layer + (st->mtp ? 1u : 0u);
-    for (uint32_t il = 0; ok && il < n_state; il++) {
-        pulsar_qwen_layer_state *L = &st->layer[il];
-        struct { pulsar_gpu_tensor *t; uint64_t bytes; } z[] = {
-            { L->gdn_state, pulsar_qwen_gdn_state_bytes(s) },
-            { L->gdn_conv,  pulsar_qwen_gdn_conv_bytes(s) },
-            { L->idx_tail,  pulsar_qwen_index_tail_bytes(s) },
-            { L->ple_conv,  pulsar_qwen_ple_conv_bytes(s) },
-        };
-        for (size_t k = 0; ok && k < sizeof(z) / sizeof(z[0]); k++) {
-            if (!z[k].t) continue;
-            pulsar_gpu_tensor *v = pulsar_gpu_tensor_view(z[k].t, (uint64_t)bank * z[k].bytes, z[k].bytes);
-            ok = v && pulsar_gpu_tensor_fill_f32(v, 0.0f, z[k].bytes / sizeof(float)) != 0;
-            pulsar_gpu_tensor_free(v);
-        }
-    }
-    for (uint32_t i = 0; i + 1u < s->ngram_size; i++)
-        st->ngram_ctx[(size_t)bank * (s->ngram_size - 1u) + i] = (int32_t)s->eos_id;
-    qwen_bank_set_pos(st, bank, 0);
-    st->prefill_pos[bank] = 0;
-    st->frontier_stale[bank] = false;
-    st->mtp_pend_pos[bank] = UINT32_MAX;
-    /* L289: the MTP layer's index tail was zeroed above, so the stage holds no draft rows over it (a stale mark
-     * from the previous conversation's last round refused every later frontier: payloads, prompt ends) */
-    if (st->mtp) st->mtp_stage_dirty[bank] = false;
-    if (st->ckpt && st->ckpt->ops) pulsar_ckpt_drop_bank(st->ckpt, bank);   /* its history is gone */
-    return ok;
-}
-
-
-/* The family's state, built into a session the core allocated (L272 P2: the core sets ctx_size, the prefill
- * cap and the logits row, and measures the bytes this allocates). */
-static int qwen_session_create(pulsar_session *s, uint32_t n_banks) {
-    pulsar_engine *e = s->engine;
-    s->qwen = qwen_state_alloc(&g_qwen_shape, &e->plan, n_banks, (uint32_t)s->ctx_size, s->prefill_cap,
-                               e->qwen_weights->mtp.present);
-    if (!s->qwen) return 1;
-    for (uint32_t b = 0; b < n_banks; b++) {
-        if (!qwen_state_reset_bank(s->qwen, &g_qwen_shape, &e->plan, b)) {
-            fprintf(stderr, "pulsar: %s: could not clear bank %u's state\n", PULSAR_QWEN_ARCH, b);
-            qwen_state_free(s->qwen);
-            s->qwen = NULL;
-            return 1;
-        }
-    }
-    s->qwen->ckpt->artifact = e->qwen_weights->artifact_digest;
-    if (e->tp) {   /* L266 step 7: the engine's lanes; the ticket is the state's (priced with it), zeroed here */
-        const uint32_t zero = 0;
-        s->qwen->tp = e->tp;
-        s->qwen->tp_slab_dev = e->tp_slab_dev;
-        s->qwen->tp_bulk_dev = e->tp_bulk_dev;
-        if (!s->qwen->tp_ticket || !pulsar_gpu_tensor_write(s->qwen->tp_ticket, 0, &zero, sizeof(zero))) {
-            fprintf(stderr, "pulsar: %s: the TP stage ticket is missing\n", PULSAR_QWEN_ARCH);
-            qwen_state_free(s->qwen);
-            s->qwen = NULL;
-            return 1;
-        }
-    }
-    if (!pulsar_gpu_tensor_dry_active())   /* a pricing run allocates nothing */
-        fprintf(stderr, "pulsar: %s session: %u bank(s) x %d tokens, %u-row steps "
-                        "(%.1f MiB fixed per bank + %.1f KiB per token)\n",
-                PULSAR_QWEN_ARCH, n_banks, s->ctx_size, s->prefill_cap,
-                (double)(pulsar_layer_plan_count(&e->plan, PULSAR_LAYER_QWEN_GDN) *
-                         (pulsar_qwen_gdn_state_bytes(&g_qwen_shape) + pulsar_qwen_gdn_conv_bytes(&g_qwen_shape)) +
-                         pulsar_qwen_ple_conv_bytes(&g_qwen_shape)) / 1048576.0,
-                (double)(pulsar_layer_plan_count(&e->plan, PULSAR_LAYER_QWEN_QSA) *
-                         (pulsar_qwen_kv_row_bytes(&g_qwen_shape) +
-                          pulsar_qwen_index_row_bytes(&g_qwen_shape) / g_qwen_shape.idx_block)) / 1024.0);
-    return 0;
-}
-
-static void qwen_session_destroy(pulsar_session *s) {
-    if (s->qwen && s->qwen->mtp_probe_n)
+static void qwen_destroy(pulsar_session *s) {
+    pulsar_qwen_state *q = qwen_st(s);
+    if (q && q->mtp_probe_n)
         fprintf(stderr, "pulsar: %s: MTP probe: draft position 1 agreed with the trunk's argmax %llu of %llu (%.1f%%)\n",
-                PULSAR_QWEN_ARCH, (unsigned long long)s->qwen->mtp_probe_hit, (unsigned long long)s->qwen->mtp_probe_n,
-                100.0 * (double)s->qwen->mtp_probe_hit / (double)s->qwen->mtp_probe_n);
-    qwen_state_free(s->qwen);
-    s->qwen = NULL;
+                PULSAR_QWEN_ARCH, (unsigned long long)q->mtp_probe_hit, (unsigned long long)q->mtp_probe_n,
+                100.0 * (double)q->mtp_probe_hit / (double)q->mtp_probe_n);
+    qwen_state_free(q);
 }
 
-uint64_t qwen_kv_bytes_at(const pulsar_qwen_state *st, uint64_t rows) {
-    const pulsar_qwen_shape *s = &g_qwen_shape;
-    uint64_t bytes = 0;
-    for (uint32_t il = 0; il < PULSAR_FAMILY_MAX_LAYER; il++) {
-        if (!st->layer[il].kv) continue;
-        bytes += rows * pulsar_qwen_kv_row_bytes(s) + qwen_ceil_div(rows, s->idx_block) * pulsar_qwen_index_row_bytes(s);
-    }
-    return bytes;
-}
+/* the declared state's verify capture exists with the MTP layer (the drafter speculation needs) */
+static bool qwen_verifies(const pulsar_session *s) { return s->engine->qwen_weights->mtp.present; }
 
-/* L270: one bank's demand-paged share at ctx_size -- the managed bytes of the session's own dry create
- * (the KV and index pools are cudaMallocManaged: VA reserved, physical on touch). */
-uint64_t qwen_demand_paged_bytes(pulsar_engine *e, int ctx_size) {
-    uint64_t managed = 0;
-    e->session_cost_bytes_banked(ctx_size, 1, &managed);
-    return managed;
-}
+static pulsar_driver_step *qwen_trunk(pulsar_session *s) { return qwen_st(s)->trunk; }
 
-/* ---- the step driver ------------------------------------------------------------ */
+/* ---- the blocks on the core driver (step_driver.h, L295 F4) ------------------------------------------------------
+ *
+ * The core driver runs every step (embed, the plan block by block, the head, the drafter's absorb, the banks'
+ * positions); Qwen supplies its ops, one block for each of its layer kinds, and its MTP lane. */
 
-/* One step: the plan, in the forward's order (family_qwen.h).  Refuses by
- * name before touching any state when an op the step needs is missing. */
-/* L266 step 7: under TP a rank's mixer (its heads) and MoE (its experts, rank 0's shared expert) leave a
- * PARTIAL block output in y; the group's sum is the block's.  One exchange each, f32 [rows][n_embd]; the
- * MTP layer's take the slot after the trunk's.  One GPU: nothing to do. */
-static bool qwen_tp_allreduce_y(pulsar_session *s, uint32_t il, uint32_t n_rows, const char *what) {
-    pulsar_qwen_state *q = s->qwen;
-    if (!q->tp) return true;
-    const pulsar_tp_rows x = {q->tp, q->tp_slab_dev, q->tp_bulk_dev, q->tp_ticket, &q->tp_seq, g_qwen_shape.n_embd};
-    pulsar_gpu_tensor *y = pulsar_gpu_tensor_view(q->y, 0, (uint64_t)n_rows * g_qwen_shape.n_embd * PULSAR_QWEN_Y_ELT_SIZE);
-    const bool ok = y && pulsar_tp_allreduce_rows(&x, il, n_rows, y, NULL, what);
-    pulsar_gpu_tensor_free(y);
+static const pulsar_qwen_step *QS(const pulsar_driver_step *st) { return static_cast<const pulsar_qwen_step *>(st); }
+
+/* One layer of THE FORWARD (family_qwen.h): the PLE injection on its layer, the attention side's gated-residual
+ * read, the mixer (the plan's kind), its TP exchange, the write; the MLP side's read, the MoE, its exchange, the
+ * write.  L266 step 7: under TP a rank's mixer (its heads) and MoE (its experts, rank 0's shared expert) leave a
+ * PARTIAL block output in y; the group's sum is the block's -- one exchange each in the layer's slot (the MTP
+ * layer's after the trunk's). */
+static bool qwen_layer(const pulsar_qwen_step *st, uint32_t il, pulsar_qwen_layer_fn mixer) {
+    const bool mtp = st->draft_head;   /* the MTP layer's lane */
+    bool ok = true;
+    if (il == g_qwen_shape.ple_layer) ok = pulsar_qwen_s4_ple(st, il);
+    if (ok) ok = pulsar_qwen_s4_gr_read(st, il, PULSAR_QWEN_GR_ATTN);
+    if (ok) ok = mixer(st, il);
+    if (ok) ok = pulsar_driver_tp_allreduce(st, il, st->st->y, g_qwen_shape.n_embd, mtp ? "MTP mixer" : "mixer");
+    if (ok) ok = pulsar_qwen_s4_gr_write(st, il, PULSAR_QWEN_GR_ATTN);
+    if (ok) ok = pulsar_qwen_s4_gr_read(st, il, PULSAR_QWEN_GR_MLP);
+    if (ok) ok = pulsar_qwen_s4_moe(st, il);
+    if (ok) ok = pulsar_driver_tp_allreduce(st, il, st->st->y, g_qwen_shape.n_embd, mtp ? "MTP moe" : "moe");
+    if (ok) ok = pulsar_qwen_s4_gr_write(st, il, PULSAR_QWEN_GR_MLP);
     return ok;
+}
+
+static bool qwen_block_gdn(const pulsar_driver_step *st, uint32_t il) { return qwen_layer(QS(st), il, pulsar_qwen_s2_gdn); }
+static bool qwen_block_qsa(const pulsar_driver_step *st, uint32_t il) { return qwen_layer(QS(st), il, pulsar_qwen_s3_qsa); }
+static bool qwen_embed(const pulsar_driver_step *st) { return pulsar_qwen_s4_embed(QS(st)); }
+static bool qwen_head(const pulsar_driver_step *st, uint32_t row0, uint32_t n, uint32_t out0) {
+    return pulsar_qwen_s4_head(QS(st), row0, n, out0);
+}
+static bool qwen_step_end(const pulsar_driver_step *st, bool ok) { return pulsar_qwen_s4_step_end(QS(st), ok); }
+static uint64_t qwen_scratch_bytes(uint32_t arena, uint32_t max_rows, uint32_t ctx) {
+    return pulsar_qwen_s4_scratch_bytes((pulsar_qwen_op_id)arena, &g_qwen_shape, max_rows, ctx);
+}
+static uint64_t qwen_artifact(const pulsar_engine *e) { return e->qwen_weights->artifact_digest; }
+
+/* Diagnostic tap: the HC streams after layer il -- `n_hc` x n_embd f32 per row, the same quantity the streamed
+ * reference keeps in `hs` ([seq, hc_count, n_embd]).  It is how a reference-gate miss gets attributed to a layer
+ * instead of to "the model".  The WHOLE step's streams ([n_rows][n_hc][n_embd], bf16 -> widened f32): the
+ * layer-correctness test feeds the engine's stream at layer L into the REFERENCE's layer L+1 and compares with the
+ * engine's L+1, which isolates a layer's own arithmetic from the error it inherited.  Volume is the caller's problem
+ * -- filter with PULSAR_CUDA_GRAPH_DUMP_LAYER/_POS, since the dump helper synchronizes mid-graph. */
+static void qwen_dump(const pulsar_driver_step *st, uint32_t il) {
+    gpu_graph_debug_dump_hc_tensor("qwen_h", QS(st)->streams, (uint64_t)st->n_rows * pulsar_qwen_hc_dim(&g_qwen_shape),
+                                   il, (uint32_t)st->pos[st->n_rows - 1]);
 }
 
 /* L268: the step's multi-axis rope positions (pulsar_image_rope3 over each row's bank's image records) -- NULL when
@@ -1173,13 +977,13 @@ static const uint32_t *qwen_rope_table(const pulsar_session *s, const int32_t *p
                                        std::vector<uint32_t> *out) {
     bool any = false;
     for (uint32_t r = 0; r < n && !any; r++) {
-        const pulsar_image_identity *id = pulsar_session_bank_images(s, (uint32_t)bank[r], s->qwen->live_bank);
+        const pulsar_image_identity *id = pulsar_session_bank_images(s, (uint32_t)bank[r], s->states->live_bank);
         for (uint32_t i = 0; id && i < id->n && !any; i++) any = id->b[i].grid_h && id->b[i].grid_w;
     }
     if (!any) return NULL;
     out->resize((size_t)n * 6u);
     for (uint32_t r = 0; r < n; r++) {
-        const pulsar_image_identity *id = pulsar_session_bank_images(s, (uint32_t)bank[r], s->qwen->live_bank);
+        const pulsar_image_identity *id = pulsar_session_bank_images(s, (uint32_t)bank[r], s->states->live_bank);
         const uint32_t p = (uint32_t)pos[r], back = PULSAR_QSA_BLOCK - 1u;
         pulsar_image_rope3(id, p, &(*out)[(size_t)r * 6u]);
         pulsar_image_rope3(id, p >= back ? p - back : 0u, &(*out)[(size_t)r * 6u + 3u]);
@@ -1188,190 +992,17 @@ static const uint32_t *qwen_rope_table(const pulsar_session *s, const int32_t *p
 }
 
 /* L268: image rows into the step's streams -- each row in all of them (the expansion follows the substitution) */
-static bool qwen_write_image_rows(void *ud, const uint16_t *rows, uint32_t n_rows, uint32_t row0, uint32_t n_tokens) {
-    return pulsar_image_write_stream_rows((pulsar_gpu_tensor *)ud, rows, n_rows, row0, n_tokens, g_qwen_shape.n_embd,
+static bool qwen_image_rows(const pulsar_driver_step *st, const uint16_t *rows, uint32_t n_rows, uint32_t row0,
+                            uint32_t n_tokens) {
+    return pulsar_image_write_stream_rows(QS(st)->streams, rows, n_rows, row0, n_tokens, g_qwen_shape.n_embd,
                                           g_qwen_shape.n_hc);
-}
-
-qwen_heads qwen_heads_span(uint32_t row0, uint32_t n) {
-    qwen_heads h;
-    h.n = n;
-    for (uint32_t i = 0; i < n && i < PULSAR_QWEN_HEAD_ROWS_MAX; i++) h.row[i] = row0 + i;
-    return h;
-}
-
-bool qwen_forward(pulsar_session *s, pulsar_qwen_step_mode mode, const int32_t *tokens,
-                  const int32_t *pos, const int32_t *bank, uint32_t n_rows,
-                  const qwen_heads &heads, float *logits_out, uint32_t n_verify) {
-    pulsar_engine *e = s->engine;
-    const pulsar_qwen_ops *ops = &g_qwen_ops;
-    uint32_t at = 0;
-    const pulsar_qwen_op_id miss = pulsar_qwen_first_missing_op(ops, &e->plan, &g_qwen_shape, &at);
-    if (miss != PULSAR_QWEN_OP_COUNT) {
-        char where[48] = "";
-        if (at != UINT32_MAX) snprintf(where, sizeof(where), " at layer %u (%s)", at,
-                                       pulsar_layer_kind_name(e->plan.kind[at]));
-        fprintf(stderr, "pulsar: %s: op '%s'%s is not implemented yet (owner: %s) -- refusing the "
-                        "%s step\n", PULSAR_QWEN_ARCH, pulsar_qwen_op_name(miss), where,
-                pulsar_qwen_op_owner(miss), mode == PULSAR_QWEN_STEP_PREFILL ? "prefill" : "decode");
-        return false;
-    }
-    if (n_rows == 0 || n_rows > s->qwen->max_rows || heads.n > PULSAR_QWEN_HEAD_ROWS_MAX) {
-        fprintf(stderr, "pulsar: %s: a step of %u rows heading %u (at most %u rows, %u heads) -- refusing\n",
-                PULSAR_QWEN_ARCH, n_rows, heads.n, s->qwen->max_rows, PULSAR_QWEN_HEAD_ROWS_MAX);
-        return false;
-    }
-    pulsar_qwen_step st{};
-    st.model = &e->model;
-    st.shape = &g_qwen_shape;
-    st.w = e->qwen_weights;
-    st.plan = &e->plan;
-    st.st = s->qwen;
-    st.mode = mode;
-    st.n_rows = n_rows;
-    st.tokens = tokens;
-    st.pos = pos;
-    st.bank = bank;
-    st.streams = s->qwen->streams;
-    st.mixer = &e->qwen_weights->mixer;
-    st.verify = n_verify > 0;
-    st.n_dec = pulsar_qwen_step_n_dec(mode, n_verify, n_rows);
-    st.tap = e->imatrix_tap;
-    std::vector<uint32_t> rope;
-    st.rope = qwen_rope_table(s, pos, bank, n_rows, &rope);
-    if (st.verify && (mode != PULSAR_QWEN_STEP_PREFILL || n_verify > n_rows || n_verify > PULSAR_QWEN_SPEC_ROWS ||
-                      !s->qwen->mtp)) {
-        fprintf(stderr, "pulsar: %s: a verify step of %u rows is outside the capture -- refusing\n", PULSAR_QWEN_ARCH,
-                n_verify);
-        return false;
-    }
-    if (st.verify && n_verify > PULSAR_GPU_MNEUTRAL_ROWS_MAX) {
-        static bool announced = false;   /* rule 5: the wide verify says once that it ran */
-        if (!announced) {
-            announced = true;
-            fprintf(stderr, "pulsar: %s: L288 C1 wide verify ran: %u rows, the decode arms in blocks of %u (every row "
-                            "a one-token decode's bytes)\n", PULSAR_QWEN_ARCH, n_verify, PULSAR_GPU_MNEUTRAL_ROWS_MAX);
-        }
-    }
-    /* L272 P1 S4 / L284 #2: a PREFILL step's rows as runs -- one bank each, consecutive positions, a bank in one
-     * run.  The verify rows [0, n_verify) are one run a bank (every row headed); a run never crosses n_verify; the
-     * rows after it are the fused step's prompt runs, at most PULSAR_FUSED_PF_MAX of them. */
-    uint32_t run_first[PULSAR_QWEN_SPEC_ROWS + PULSAR_FUSED_PF_MAX + 1] = {0};
-    uint32_t n_runs = 0;
-    if (mode == PULSAR_QWEN_STEP_PREFILL) {
-        n_runs = 1;
-        uint32_t n_prompt = n_verify == 0 ? 1u : 0u;   /* the runs from n_verify on */
-        for (uint32_t r = 1; r < n_rows; r++) {
-            if (bank[r] == bank[r - 1] && r != n_verify) {
-                if (pos[r] == pos[r - 1] + 1) continue;
-                fprintf(stderr, "pulsar: %s: prefill row %u (bank %d pos %d) does not follow its run -- refusing\n",
-                        PULSAR_QWEN_ARCH, r, bank[r], pos[r]);
-                return false;
-            }
-            bool seen = false;
-            for (uint32_t k = 0; k < n_runs; k++) seen |= bank[run_first[k]] == bank[r];
-            if (r >= n_verify) n_prompt++;
-            if (seen || n_prompt > PULSAR_FUSED_PF_MAX) {
-                fprintf(stderr, "pulsar: %s: prefill row %u (bank %d) starts a run %s -- refusing\n", PULSAR_QWEN_ARCH,
-                        r, bank[r], seen ? "of a bank the step already carries" : "past the step's run bound");
-                return false;
-            }
-            run_first[n_runs++] = r;
-        }
-        run_first[n_runs] = n_rows;
-    }
-    st.n_runs = n_runs;
-    st.run_first = n_runs ? run_first : NULL;
-    const uint32_t n_vruns = st.verify ? pulsar_qwen_step_verify_runs(&st) : 0u;
-    if (st.verify) {
-        /* the verify's runs, and each bank's n-gram context before the step: a rollback finds its bank's run */
-        pulsar_qwen_spec_capture &sp = s->qwen->spec;
-        const uint32_t nc = g_qwen_shape.ngram_size - 1u;
-        sp.n_runs = n_vruns;
-        for (uint32_t k = 0; k <= n_vruns; k++) sp.run_first[k] = run_first[k];
-        for (uint32_t k = 0; k < n_vruns; k++) {
-            sp.run_bank[k] = bank[run_first[k]];
-            sp.run_pos0[k] = pos[run_first[k]];
-            for (uint32_t i = 0; i < nc; i++)
-                sp.ngram_before[k][i] = s->qwen->ngram_ctx[(size_t)sp.run_bank[k] * nc + i];
-        }
-    }
-    /* L289: enqueued, not waited for -- the step's uploads never drain the stream */
-    bool ok = pulsar_gpu_tensor_write_async(s->qwen->row_pos, 0, pos, (uint64_t)n_rows * sizeof(int32_t)) != 0 &&
-              pulsar_gpu_tensor_write_async(s->qwen->row_bank, 0, bank, (uint64_t)n_rows * sizeof(int32_t)) != 0;
-    int32_t rf[PULSAR_QWEN_SPEC_ROWS + 1];
-    if (ok && n_vruns > 1) {   /* the GDN's ragged verify runs */
-        for (uint32_t k = 0; k <= n_vruns; k++) rf[k] = (int32_t)run_first[k];
-        ok = pulsar_gpu_tensor_write_async(s->qwen->run_first_dev, 0, rf, (uint64_t)(n_vruns + 1u) * sizeof(int32_t)) != 0;
-    }
-    if (ok) ok = pulsar_gpu_begin_commands() != 0;
-    if (ok) ok = ops->embed(&st);
-    /* L268: a sync's prefill chunk takes the image rows of the blocks it owns over their pads' embeddings (HF
-     * masked_scatter), each into all 4 streams (the hyper-connection expansion follows the substitution) */
-    if (ok && mode == PULSAR_QWEN_STEP_PREFILL && s->sync_images && n_runs == 1 && bank[0] == (int32_t)s->qwen->live_bank)
-        ok = pulsar_image_merge_chunk(e, s->sync_prompt->v, s->sync_prompt->len, s->sync_images, s->sync_n_images,
-                                      (uint32_t)pos[0], n_rows, qwen_write_image_rows, s->qwen->streams);
-    for (uint32_t il = 0; ok && il < e->plan.n_layer; il++) {
-        if (il == g_qwen_shape.ple_layer) ok = ops->ple(&st, il);
-        if (ok) ok = ops->gr_read(&st, il, PULSAR_QWEN_GR_ATTN);
-        if (ok) ok = e->plan.kind[il] == PULSAR_LAYER_QWEN_GDN ? ops->gdn(&st, il) : ops->qsa(&st, il);
-        if (ok) ok = qwen_tp_allreduce_y(s, il, n_rows, "mixer");
-        if (ok) ok = ops->gr_write(&st, il, PULSAR_QWEN_GR_ATTN);
-        if (ok) ok = ops->gr_read(&st, il, PULSAR_QWEN_GR_MLP);
-        if (ok) ok = ops->moe(&st, il);
-        if (ok) ok = qwen_tp_allreduce_y(s, il, n_rows, "moe");
-        if (ok) ok = ops->gr_write(&st, il, PULSAR_QWEN_GR_MLP);
-        /* Diagnostic tap: the HC streams after layer il -- `n_hc` x n_embd f32 per row,
-         * the same quantity the streamed reference keeps in `hs` ([seq, hc_count,
-         * n_embd]).  It is how a reference-gate miss gets attributed to a layer instead
-         * of to "the model".  The dump helpers re-check the arming themselves
-         * (PULSAR_CUDA_GRAPH_DUMP_PREFIX, plus _LAYER/_NAME/_POS), so an unarmed run
-         * does no work and allocates nothing. */
-        if (ok && gpu_graph_debug_dump_enabled()) {
-            /* The WHOLE step's streams ([n_rows][n_hc][n_embd], bf16 -> widened f32).  The
-             * last row alone is enough to compare stream error, but the layer-correctness
-             * test needs every position: it feeds the engine's stream at layer L into the
-             * REFERENCE's layer L+1 and compares with the engine's L+1, which isolates a
-             * layer's own arithmetic from the error it inherited.  Volume is the caller's
-             * problem -- filter with PULSAR_CUDA_GRAPH_DUMP_LAYER/_POS, since the dump
-             * helper synchronizes mid-graph. */
-            gpu_graph_debug_dump_hc_tensor("qwen_h", s->qwen->streams,
-                                          (uint64_t)n_rows * pulsar_qwen_hc_dim(&g_qwen_shape),
-                                          il, (uint32_t)pos[n_rows - 1]);
-        }
-    }
-    /* the head list into its logits rows (L284 #2): a span of consecutive decode rows is one call (a verify heads
-     * every row), a prompt row is its own call -- the one-row head its classic chunk makes */
-    for (uint32_t i = 0, j; ok && i < heads.n; i = j) {
-        for (j = i + 1; j < heads.n && heads.row[i] < st.n_dec && heads.row[j] == heads.row[j - 1] + 1u &&
-                        heads.row[j] < st.n_dec; j++) {}
-        ok = ops->head(&st, heads.row[i], j - i, i);
-    }
-    if (ok) ok = pulsar_gpu_end_commands() != 0;
-    else (void)pulsar_gpu_synchronize();
-    /* S4's step end: settles a PLE gather a failed step left in flight and, on a
-     * completed step, reads the MoE non-finite flag (rule 9: a NaN names its layer) */
-    ok = pulsar_qwen_s4_step_end(&st, ok);
-    if (!ok) {
-        /* the step may have advanced any of its banks' state (n-gram context, conv,
-         * recurrent) before it failed: those banks start over, and bank 0's
-         * checkpoint no longer describes its state */
-        for (uint32_t r = 0; r < n_rows; r++)
-            if (!qwen_state_reset_bank(s->qwen, &g_qwen_shape, &e->plan, (uint32_t)bank[r]))
-                fprintf(stderr, "pulsar: %s: could not clear bank %d after a failed step\n", PULSAR_QWEN_ARCH, bank[r]);
-        s->checkpoint_valid = false;
-    }
-    if (ok && heads.n)
-        ok = pulsar_gpu_tensor_read(s->qwen->logits, 0, logits_out,
-                                    (uint64_t)heads.n * g_qwen_shape.n_vocab * sizeof(float)) != 0;
-    return ok;
 }
 
 /* ---- L251 MTP: the drafter's forward and its lockstep with the trunk ----------------------------
  * (l251/docs/MTP-SPEC-2026-09-29.md.)  An MTP row at position p reads the trunk's pre-mixer stack at
  * p and the token x_{p+1}; it writes the MTP layer's KV at p and predicts x_{p+2}.  Every trunk row
  * gets its MTP row once its next token exists: in a prompt chunk that is the next prompt token, and
- * the chunk's LAST row waits in mtp_pend (per bank) for the token the next step feeds. */
+ * the chunk's LAST row waits in the MTP_PEND state (per bank) for the token the next step feeds. */
 
 /* The MTP layer over rows [0, n_rows) of mtp_h (trunk stacks), tokens = x_{p+1} per row; heads rows
  * [head_row0, head_row0 + head_n) into logits_out.  Its failure leaves the trunk untouched; the MTP
@@ -1379,16 +1010,16 @@ bool qwen_forward(pulsar_session *s, pulsar_qwen_step_mode mode, const int32_t *
  * `decode_rows` (PREFILL only, L288): the rows are runs of any number of banks (one run a bank, consecutive
  * positions) taken as decode rows -- the decode arms, the verify's row kind -- the speculation's absorb of every
  * bank's kept rows in one step; without it a PREFILL step is one bank's prompt rows (a sync chunk's). */
-bool qwen_mtp_forward(pulsar_session *s, pulsar_qwen_step_mode mode, const int32_t *tokens,
+bool qwen_mtp_forward(pulsar_session *s, pulsar_step_mode mode, const int32_t *tokens,
                       const int32_t *pos, const int32_t *bank, uint32_t n_rows,
                       uint32_t head_row0, uint32_t head_n, float *logits_out, qwen_mtp_pick *pick, bool decode_rows) {
     pulsar_engine *e = s->engine;
-    const pulsar_qwen_ops *ops = &g_qwen_ops;
+    pulsar_qwen_state *q = qwen_st(s);
     const uint32_t il = e->plan.n_layer;                /* the MTP layer's slot */
     uint32_t run_first[PULSAR_QWEN_SPEC_ROWS + 1] = {0};
     uint32_t n_runs = 0;
     if (decode_rows) {
-        bool runs_ok = mode == PULSAR_QWEN_STEP_PREFILL && n_rows > 0 && n_rows <= PULSAR_QWEN_SPEC_ROWS;
+        bool runs_ok = mode == PULSAR_STEP_PREFILL && n_rows > 0 && n_rows <= PULSAR_QWEN_SPEC_ROWS;
         for (uint32_t r = 0; runs_ok && r < n_rows; r++) {
             if (r > 0 && bank[r] == bank[r - 1]) {
                 runs_ok = pos[r] == pos[r - 1] + 1;
@@ -1406,10 +1037,9 @@ bool qwen_mtp_forward(pulsar_session *s, pulsar_qwen_step_mode mode, const int32
     }
     pulsar_qwen_step st{};
     st.model = &e->model;
-    st.shape = &g_qwen_shape;
-    st.w = e->qwen_weights;
     st.plan = &e->plan;
-    st.st = s->qwen;
+    st.states = s->states;
+    st.buf = q;
     st.mode = mode;
     st.n_rows = n_rows;
     st.tokens = tokens;
@@ -1417,30 +1047,26 @@ bool qwen_mtp_forward(pulsar_session *s, pulsar_qwen_step_mode mode, const int32
     st.bank = bank;
     std::vector<uint32_t> rope;   /* L268: the MTP layer ropes as the trunk does at the same positions */
     st.rope = qwen_rope_table(s, pos, bank, n_rows, &rope);
-    st.streams = s->qwen->mtp_streams;
-    st.mixer = &e->qwen_weights->mtp.mixer;
-    st.draft_head = true;                               /* the drafter's head: n_draft logits a row */
-    st.n_dec = decode_rows ? n_rows : pulsar_qwen_step_n_dec(mode, 0u, n_rows);
+    st.n_dec = decode_rows ? n_rows : pulsar_step_n_dec(mode, 0u, n_rows);
     st.n_runs = n_runs;
     st.run_first = n_runs ? run_first : NULL;
+    st.shape = &g_qwen_shape;
+    st.w = e->qwen_weights;
+    st.st = q;
+    st.streams = q->mtp_streams;
+    st.mixer = &e->qwen_weights->mtp.mixer;
+    st.draft_head = true;                               /* the drafter's head: n_draft logits a row */
     /* L289: enqueued, not waited for -- the step's uploads never drain the stream */
-    bool ok = pulsar_gpu_tensor_write_async(s->qwen->row_pos, 0, pos, (uint64_t)n_rows * sizeof(int32_t)) != 0 &&
-              pulsar_gpu_tensor_write_async(s->qwen->row_bank, 0, bank, (uint64_t)n_rows * sizeof(int32_t)) != 0;
+    bool ok = pulsar_gpu_tensor_write_async(q->row_pos, 0, pos, (uint64_t)n_rows * sizeof(int32_t)) != 0 &&
+              pulsar_gpu_tensor_write_async(q->row_bank, 0, bank, (uint64_t)n_rows * sizeof(int32_t)) != 0;
     if (ok) ok = pulsar_gpu_begin_commands() != 0;
-    if (ok) ok = pulsar_qwen_s4_mtp_combine(&st, pulsar_gpu_tensor_device_ptr(s->qwen->mtp_h));
-    if (ok) ok = ops->gr_read(&st, il, PULSAR_QWEN_GR_ATTN);
-    if (ok) ok = ops->qsa(&st, il);
-    if (ok) ok = qwen_tp_allreduce_y(s, il, n_rows, "MTP mixer");
-    if (ok) ok = ops->gr_write(&st, il, PULSAR_QWEN_GR_ATTN);
-    if (ok) ok = ops->gr_read(&st, il, PULSAR_QWEN_GR_MLP);
-    if (ok) ok = ops->moe(&st, il);
-    if (ok) ok = qwen_tp_allreduce_y(s, il, n_rows, "MTP moe");
-    if (ok) ok = ops->gr_write(&st, il, PULSAR_QWEN_GR_MLP);
+    if (ok) ok = pulsar_qwen_s4_mtp_combine(&st, pulsar_gpu_tensor_device_ptr(q->mtp_h));
+    if (ok) ok = qwen_layer(&st, il, pulsar_qwen_s3_qsa);
     if (pick && head_n == 0) {
         fprintf(stderr, "pulsar: %s: a draft pick from an MTP step heading no row -- refusing\n", PULSAR_QWEN_ARCH);
         ok = false;
     }
-    if (ok && head_n) ok = ops->head(&st, head_row0, head_n, 0);
+    if (ok && head_n) ok = pulsar_qwen_s4_head(&st, head_row0, head_n, 0);
     /* L289: the picks reduced on the device, behind the head (L288: every headed row in one launch) */
     if (ok && pick) ok = pulsar_qwen_s4_draft_top(&st, head_n);
     if (ok) ok = pulsar_gpu_end_commands() != 0;
@@ -1449,64 +1075,65 @@ bool qwen_mtp_forward(pulsar_session *s, pulsar_qwen_step_mode mode, const int32
     if (ok && pick) {
         int32_t id[PULSAR_QWEN_HEAD_ROWS_MAX];
         float conf[PULSAR_QWEN_HEAD_ROWS_MAX];
-        ok = pulsar_qwen_s4_draft_top_read(s->qwen, e->qwen_weights, head_n, id, conf);
+        ok = pulsar_qwen_s4_draft_top_read(q, e->qwen_weights, head_n, id, conf);
         for (uint32_t r = 0; ok && r < head_n; r++) pick[r] = {id[r], conf[r]};
     }
     if (!ok) {
         fprintf(stderr, "pulsar: %s: the MTP step failed; its banks' drafter state is dropped\n", PULSAR_QWEN_ARCH);
-        for (uint32_t r = 0; r < n_rows; r++) s->qwen->mtp_pend_pos[bank[r]] = UINT32_MAX;
+        for (uint32_t r = 0; r < n_rows; r++) q->mtp_pend_pos[bank[r]] = UINT32_MAX;
         return false;
     }
     if (head_n && logits_out)
-        ok = pulsar_gpu_tensor_read(s->qwen->logits, 0, logits_out,
+        ok = pulsar_gpu_tensor_read(q->logits, 0, logits_out,
                                     (uint64_t)head_n * e->qwen_weights->n_draft * sizeof(float)) != 0;
     return ok;
 }
 
 /* After a trunk step over rows (tokens, pos, bank) -- step rows [row0, row0 + n), the trunk's streams there (L284
  * #2: a fused step's prompt run sits behind its verify rows) -- give every row whose next token is now known its
- * MTP row, and park each bank's last row in mtp_pend.  PREFILL: one bank, consecutive positions --
+ * MTP row, and park each bank's last row in the MTP_PEND state.  PREFILL: one bank, consecutive positions --
  * the bank's pending row (position P - 1, if any) pairs with tokens[0], row i with tokens[i + 1], and
  * the last row is parked.  DECODE: one row per bank -- each bank's pending row pairs with the token
  * this step fed, and this step's row is parked.  With head_n = 1 and a DECODE step of one row, the
  * MTP row is headed and its draft pick read into *pick: the draft for the token after the one the trunk just predicted
  * is NOT this -- it is the prediction of the SAME next token (x_{p+1}), made from the stack at p - 1. */
-static bool qwen_mtp_absorb(pulsar_session *s, pulsar_qwen_step_mode mode, const int32_t *tokens,
+static bool qwen_mtp_absorb(pulsar_session *s, pulsar_step_mode mode, const int32_t *tokens,
                             const int32_t *pos, const int32_t *bank, uint32_t n, uint32_t row0, uint32_t head_n,
                             qwen_mtp_pick *pick) {
-    pulsar_qwen_state *q = s->qwen;
+    pulsar_qwen_state *q = qwen_st(s);
+    pulsar_gpu_tensor *pend = pulsar_state_tensor(s->states, s->engine->plan.n_layer, PULSAR_QWEN_STATE_MTP_PEND);
     const uint64_t hc = pulsar_qwen_hc_dim(&g_qwen_shape) * PULSAR_QWEN_STREAM_ELT_SIZE;
     int32_t *mt = (int32_t *)xmalloc((size_t)(n + 1) * sizeof(int32_t));
     int32_t *mp = (int32_t *)xmalloc((size_t)(n + 1) * sizeof(int32_t));
     int32_t *mb = (int32_t *)xmalloc((size_t)(n + 1) * sizeof(int32_t));
     uint32_t k = 0;
     bool ok = true;
-    if (mode == PULSAR_QWEN_STEP_PREFILL) {
+    if (mode == PULSAR_STEP_PREFILL) {
         const uint32_t b = (uint32_t)bank[0];
         if (q->mtp_pend_pos[b] != UINT32_MAX && q->mtp_pend_pos[b] + 1u == (uint32_t)pos[0]) {
-            ok = pulsar_gpu_tensor_copy_async(q->mtp_h, 0, q->mtp_pend, (uint64_t)b * hc, hc) != 0;
+            ok = pulsar_gpu_tensor_copy_async(q->mtp_h, 0, pend, (uint64_t)b * hc, hc) != 0;
             mt[k] = tokens[0]; mp[k] = pos[0] - 1; mb[k] = (int32_t)b; k++;
         }
         if (ok && n > 1) ok = pulsar_gpu_tensor_copy_async(q->mtp_h, (uint64_t)k * hc, q->streams, (uint64_t)row0 * hc,
                                                           (uint64_t)(n - 1u) * hc) != 0;
         for (uint32_t i = 0; i + 1u < n; i++) { mt[k] = tokens[i + 1]; mp[k] = pos[i]; mb[k] = (int32_t)b; k++; }
-        if (ok) ok = pulsar_gpu_tensor_copy_async(q->mtp_pend, (uint64_t)b * hc, q->streams,
+        if (ok) ok = pulsar_gpu_tensor_copy_async(pend, (uint64_t)b * hc, q->streams,
                                                   (uint64_t)(row0 + n - 1u) * hc, hc) != 0;
         if (ok) q->mtp_pend_pos[b] = (uint32_t)pos[n - 1];
     } else {
         for (uint32_t j = 0; ok && j < n; j++) {
             const uint32_t b = (uint32_t)bank[j];
             if (q->mtp_pend_pos[b] != UINT32_MAX && q->mtp_pend_pos[b] + 1u == (uint32_t)pos[j]) {
-                ok = pulsar_gpu_tensor_copy_async(q->mtp_h, (uint64_t)k * hc, q->mtp_pend, (uint64_t)b * hc, hc) != 0;
+                ok = pulsar_gpu_tensor_copy_async(q->mtp_h, (uint64_t)k * hc, pend, (uint64_t)b * hc, hc) != 0;
                 mt[k] = tokens[j]; mp[k] = pos[j] - 1; mb[k] = (int32_t)b; k++;
             }
-            if (ok) ok = pulsar_gpu_tensor_copy_async(q->mtp_pend, (uint64_t)b * hc, q->streams,
+            if (ok) ok = pulsar_gpu_tensor_copy_async(pend, (uint64_t)b * hc, q->streams,
                                                       (uint64_t)(row0 + j) * hc, hc) != 0;
             if (ok) q->mtp_pend_pos[b] = (uint32_t)pos[j];
         }
     }
     if (ok && k > 0) {
-        const uint32_t hn = head_n && k == n && mode == PULSAR_QWEN_STEP_DECODE ? head_n : 0;
+        const uint32_t hn = head_n && k == n && mode == PULSAR_STEP_DECODE ? head_n : 0;
         ok = qwen_mtp_forward(s, mode, mt, mp, mb, k, 0, hn, NULL, hn ? pick : NULL);
     }
     free(mt);
@@ -1515,336 +1142,25 @@ static bool qwen_mtp_absorb(pulsar_session *s, pulsar_qwen_step_mode mode, const
     return ok;
 }
 
-/* One prefill chunk of the live bank (pulsar_prefill_chunk_fn): rows [pos0, pos0 + rows) of the
- * prompt through the forward (the MTP layer absorbs them too), the bank's position advanced, and --
- * while the prefill CONTINUES the bank's prefill-only history (L266 step 5) -- that history extended. */
-struct qwen_prefill_ctx {
-    int32_t *pos, *bank;
-    uint32_t live;
-    bool canonical;
-};
-
-static bool qwen_prefill_chunk(pulsar_session *s, const pulsar_tokens *prompt, uint32_t pos0, uint32_t rows,
-                               bool last, void *ud) {
-    qwen_prefill_ctx *c = (qwen_prefill_ctx *)ud;
-    for (uint32_t r = 0; r < rows; r++) c->pos[r] = (int32_t)(pos0 + r);
-    bool ok = qwen_forward(s, PULSAR_QWEN_STEP_PREFILL, prompt->v + pos0, c->pos, c->bank, rows,
-                           qwen_heads_span(rows - 1u, last ? 1u : 0u), s->logits);
-    if (ok && s->qwen->mtp)
-        ok = qwen_mtp_absorb(s, PULSAR_QWEN_STEP_PREFILL, prompt->v + pos0, c->pos, c->bank, rows, 0, 0, NULL);
-    if (ok) qwen_bank_set_pos(s->qwen, c->live, pos0 + rows);
-    if (ok && c->canonical) s->qwen->prefill_pos[c->live] = pos0 + rows;
+/* The driver's absorb (pulsar_driver_ops::absorb): the MTP layer's lockstep, when the artifact carries it.  On the
+ * session's single-row eval, a DIAGNOSTIC (PULSAR_QWEN_MTP_PROBE set): head the MTP row this step absorbs -- (stack
+ * at p - 1, x_p), a prediction of x_{p+1} -- and count how often its argmax is the trunk's own argmax for x_{p+1}:
+ * draft-position-1 acceptance under greedy decoding.  Printed at session destroy. */
+static bool qwen_absorb(pulsar_session *s, pulsar_step_mode mode, const int32_t *tokens, const int32_t *pos,
+                        const int32_t *bank, uint32_t n, uint32_t row0, bool eval) {
+    pulsar_qwen_state *q = qwen_st(s);
+    if (!q->mtp) return true;
+    if (!eval) return qwen_mtp_absorb(s, mode, tokens, pos, bank, n, row0, 0, NULL);
+    static const bool probe = getenv("PULSAR_QWEN_MTP_PROBE") && getenv("PULSAR_QWEN_MTP_PROBE")[0];
+    qwen_mtp_pick pick{};
+    const uint32_t b = (uint32_t)bank[0];
+    const bool had = q->mtp_pend_pos[b] != UINT32_MAX && q->mtp_pend_pos[b] + 1u == (uint32_t)pos[0];
+    const bool ok = qwen_mtp_absorb(s, mode, tokens, pos, bank, 1, 0, probe ? 1u : 0u, &pick);
+    if (ok && probe && had) {
+        q->mtp_probe_n++;
+        q->mtp_probe_hit += (uint32_t)pick.id == pulsar_driver_argmax(s->logits, g_qwen_shape.n_vocab);
+    }
     return ok;
-}
-
-/* Prefill the live bank from `start` through the core loop (prefill_loop.cpp, L272 P2): prefill_cap
- * chunks, progress, the cancel hook at every chunk boundary, and the shared checkpoint ladder (P13: a
- * capture at every grid chunk end while the prefill continues the bank's prefill-only history, the last
- * chunk cut at the prompt's last grid point).  A cut changes no byte: every prompt chunk takes the prefill
- * arms (session_contract_gate C1), which is also why an interrupted sync resumes exactly.  Returns the
- * loop's 0 / PULSAR_SESSION_SYNC_INTERRUPTED / 1. */
-static int qwen_prefill(pulsar_session *s, const pulsar_tokens *prompt, uint32_t start) {
-    qwen_prefill_ctx c;
-    c.live = s->qwen->live_bank;
-    c.canonical = s->qwen->prefill_pos[c.live] == start && !s->qwen->frontier_stale[c.live];
-    c.pos = (int32_t *)xmalloc((size_t)s->prefill_cap * sizeof(int32_t));
-    c.bank = (int32_t *)xmalloc((size_t)s->prefill_cap * sizeof(int32_t));
-    for (uint32_t r = 0; r < s->prefill_cap; r++) c.bank[r] = (int32_t)c.live;
-    const int rc = pulsar_prefill_loop(s, prompt, start, qwen_prefill_chunk, &c);
-    free(c.pos);
-    free(c.bank);
-    return rc;
-}
-
-/* The family's sync is the core's (sync_driver.cpp, L272 P2) over its ops: the bank's position is the state's
- * authority, a reset clears the bank's recurrent and attention state, the prefill is qwen_prefill (the core loop,
- * with Qwen's capture on its prefill-only history), and the shape is the session's cap with no alignment (a cut
- * anywhere is the cold bytes: split_invariant). */
-static bool qwen_sync_state_agrees(pulsar_session *s) {
-    return s->qwen->bank_pos[s->qwen->live_bank] == (uint32_t)s->checkpoint.len;
-}
-
-static bool qwen_sync_reset_bank(pulsar_session *s) {
-    return qwen_state_reset_bank(s->qwen, &g_qwen_shape, &s->engine->plan, s->qwen->live_bank);
-}
-
-static void qwen_sync_prefill_shape(pulsar_session *s, pulsar_prefill_shape *out) {
-    out->cap = s->prefill_cap;
-    out->resumed_cap = s->prefill_cap;
-    out->align = 1u;
-}
-
-static const pulsar_sync_ops k_qwen_sync = {
-    /* .name          = */ PULSAR_QWEN_ARCH,
-    /* .state_agrees  = */ qwen_sync_state_agrees,
-    /* .reset_bank    = */ qwen_sync_reset_bank,
-    /* .prefill       = */ qwen_prefill,
-    /* .prefill_shape = */ qwen_sync_prefill_shape,
-};
-
-/* The row (the core's eval checked the context, the id, and the bank standing at the view's end): the trunk's
- * decode step, the MTP layer's absorb, and the bank's position advanced. */
-static int qwen_session_eval_row(pulsar_session *s, int token, char *err, size_t errlen) {
-    const uint32_t live = s->qwen->live_bank;
-    const int32_t tok = token, pos = s->checkpoint.len, bank = (int32_t)live;
-    if (!qwen_forward(s, PULSAR_QWEN_STEP_DECODE, &tok, &pos, &bank, 1, qwen_heads_span(0, 1), s->logits)) {
-        if (err) snprintf(err, errlen, "%s: decode refused (see the log for the op)", PULSAR_QWEN_ARCH);
-        return 1;
-    }
-    if (s->qwen->mtp) {
-        /* DIAGNOSTIC (PULSAR_QWEN_MTP_PROBE set): head the MTP row this step absorbs -- (stack at p - 1,
-         * x_p), a prediction of x_{p+1} -- and count how often its argmax is the trunk's own argmax for
-         * x_{p+1}: draft-position-1 acceptance under greedy decoding.  Printed at session destroy. */
-        static const bool probe = getenv("PULSAR_QWEN_MTP_PROBE") && getenv("PULSAR_QWEN_MTP_PROBE")[0];
-        qwen_mtp_pick pick{};
-        const bool had = s->qwen->mtp_pend_pos[live] != UINT32_MAX && s->qwen->mtp_pend_pos[live] + 1u == (uint32_t)pos;
-        const bool ok = qwen_mtp_absorb(s, PULSAR_QWEN_STEP_DECODE, &tok, &pos, &bank, 1, 0, probe ? 1u : 0u, &pick);
-        if (ok && probe && had) {
-            s->qwen->mtp_probe_n++;
-            s->qwen->mtp_probe_hit += (uint32_t)pick.id == qwen_argmax(s->logits, g_qwen_shape.n_vocab);
-        }
-        if (!ok) {
-            if (err) snprintf(err, errlen, "%s: the MTP step refused (see the log)", PULSAR_QWEN_ARCH);
-            return 1;
-        }
-    }
-    qwen_bank_set_pos(s->qwen, live, (uint32_t)pos + 1u);
-    return 0;
-}
-
-static int qwen_session_decode_multiseq(pulsar_session *s, const pulsar_multiseq_req *reqs, uint32_t n,
-                                        float *logits, int logits_cap, char *err, size_t errlen) {
-    const uint32_t nv = g_qwen_shape.n_vocab;
-    if (!reqs || n == 0 || n > PULSAR_QWEN_HEAD_ROWS_MAX || n > s->qwen->max_rows || !logits ||
-        logits_cap < 0 || (uint64_t)logits_cap < (uint64_t)n * nv) {
-        if (err) snprintf(err, errlen, "%s: batched decode of %u rows refused (bad args)", PULSAR_QWEN_ARCH, n);
-        return 1;
-    }
-    int32_t tok[PULSAR_QWEN_HEAD_ROWS_MAX], pos[PULSAR_QWEN_HEAD_ROWS_MAX], bank[PULSAR_QWEN_HEAD_ROWS_MAX];
-    for (uint32_t i = 0; i < n; i++) {
-        /* One row per bank, at that bank's next position: a recurrent state
-         * advances exactly one token per row. */
-        if (reqs[i].bank >= s->qwen->n_banks || (uint32_t)reqs[i].pos != s->qwen->bank_pos[reqs[i].bank]) {
-            if (err) snprintf(err, errlen, "%s: row %u (bank %u pos %d) is not its bank's next position",
-                              PULSAR_QWEN_ARCH, i, reqs[i].bank, reqs[i].pos);
-            return 1;
-        }
-        for (uint32_t j = 0; j < i; j++) {
-            if (reqs[j].bank == reqs[i].bank) {
-                if (err) snprintf(err, errlen, "%s: bank %u has two rows in one decode step", PULSAR_QWEN_ARCH,
-                                  reqs[i].bank);
-                return 1;
-            }
-        }
-        tok[i] = reqs[i].token;
-        pos[i] = reqs[i].pos;
-        bank[i] = (int32_t)reqs[i].bank;
-    }
-    if (!qwen_forward(s, PULSAR_QWEN_STEP_DECODE, tok, pos, bank, n, qwen_heads_span(0, n), logits) ||
-        (s->qwen->mtp && !qwen_mtp_absorb(s, PULSAR_QWEN_STEP_DECODE, tok, pos, bank, n, 0, 0, NULL))) {
-        /* the failed step reset the banks it touched (qwen_forward): fatal for these rows */
-        if (err) snprintf(err, errlen, "%s: decode refused (see the log for the op)", PULSAR_QWEN_ARCH);
-        return -1;
-    }
-    for (uint32_t i = 0; i < n; i++) {
-        qwen_bank_set_pos(s->qwen, reqs[i].bank, s->qwen->bank_pos[reqs[i].bank] + 1u);
-        if (reqs[i].bank == s->qwen->live_bank) {   /* the live bank moved past the host view */
-            s->checkpoint_valid = false;
-            s->logits_stale = true;
-        }
-    }
-    return 0;
-}
-
-/* A verify's rows reqs[0, n): one run a bank, each run starting at its bank's next position and each further row
- * following the one before -- the speculation lane's verify, alone (decode_mixed) or in front of a fused step's
- * prompt run.  Fills tok / pos / bk; false (nothing moved) names the first row that is not. */
-bool qwen_verify_rows(pulsar_session *s, const pulsar_multiseq_req *reqs, uint32_t n, int32_t *tok, int32_t *pos,
-                      int32_t *bk, char *err, size_t errlen) {
-    for (uint32_t i = 0; i < n; i++) {
-        const uint32_t b = reqs[i].bank;
-        const bool run_start = i == 0 || reqs[i - 1].bank != b;
-        const uint32_t want = run_start ? (b < s->qwen->n_banks ? s->qwen->bank_pos[b] : 0u) : (uint32_t)reqs[i - 1].pos + 1u;
-        if (b >= s->qwen->n_banks || (uint32_t)reqs[i].pos != want) {
-            if (err) snprintf(err, errlen, "%s: verify row %u (bank %u pos %d) is not its run's next position",
-                              PULSAR_QWEN_ARCH, i, b, reqs[i].pos);
-            return false;
-        }
-        tok[i] = reqs[i].token;
-        pos[i] = reqs[i].pos;
-        bk[i] = (int32_t)b;
-    }
-    return true;
-}
-
-/* The server's batched lane: its plain decode is this entry with one row per bank and no prefill
- * runs (max_head_runs 0), which is exactly the batched decode.  A step that carries a PREFILL run (a
- * bank with more than one row) is refused before anything moves: the family declares no
- * PULSAR_FAMILY_CAP_MIXED_PREFILL, so the server's mixed lane never sends one -- its prompts ride the
- * fused step (qwen_session_decode_fused) or the sync. */
-static int qwen_session_decode_mixed(pulsar_session *s, const pulsar_multiseq_req *reqs, uint32_t n_rows,
-                                     float *logits, int logits_cap, uint32_t *out_n_rows,
-                                     uint32_t max_head_runs, char *err, size_t errlen) {
-    if (out_n_rows) *out_n_rows = 0;
-    if (max_head_runs == PULSAR_MSEQ_HEAD_ALL_ROWS) {
-        /* L272 P1 S3/S4: the speculation lane's verify -- one run per bank, each [p, p + k] at its bank's next
-         * position, every row headed into the caller's block, the per-row state capture armed (the target's
-         * commit rolls each bank's rejected rows back, pulsar_qwen_s4_spec_rollback).  At most SPEC_ROWS rows,
-         * every kernel at its decode arm (L288 C1: in 16-row blocks past 16), so each row's logits are the bytes a
-         * one-token decode gives. */
-        const uint32_t nv = g_qwen_shape.n_vocab;
-        if (!reqs || n_rows == 0 || n_rows > PULSAR_QWEN_SPEC_ROWS || !logits || logits_cap < 0 ||
-            (uint64_t)logits_cap < (uint64_t)n_rows * nv || !s->qwen->mtp) {
-            if (err) snprintf(err, errlen, "%s: a verify step of %u rows refused (bad args, over %u rows, or no MTP layer)",
-                              PULSAR_QWEN_ARCH, n_rows, PULSAR_QWEN_SPEC_ROWS);
-            return 1;
-        }
-        int32_t tok[PULSAR_QWEN_SPEC_ROWS], pos[PULSAR_QWEN_SPEC_ROWS], bk[PULSAR_QWEN_SPEC_ROWS];
-        if (!qwen_verify_rows(s, reqs, n_rows, tok, pos, bk, err, errlen)) return 1;
-        if (!qwen_forward(s, PULSAR_QWEN_STEP_PREFILL, tok, pos, bk, n_rows, qwen_heads_span(0, n_rows), logits,
-                          n_rows)) {
-            if (err) snprintf(err, errlen, "%s: the verify step refused (see the log for the op)", PULSAR_QWEN_ARCH);
-            return -1;
-        }
-        if (out_n_rows) *out_n_rows = n_rows;
-        return 0;
-    }
-    for (uint32_t i = 0; reqs && i < n_rows; i++)
-        for (uint32_t j = 0; j < i; j++)
-            if (reqs[j].bank == reqs[i].bank) {
-                if (err) snprintf(err, errlen, "%s: a fused prefill run (bank %u, %u+ rows) is not implemented; "
-                                  "prefill goes through sync", PULSAR_QWEN_ARCH, reqs[i].bank, 2u);
-                return 1;
-            }
-    const int rc = qwen_session_decode_multiseq(s, reqs, n_rows, logits, logits_cap, err, errlen);
-    if (rc == 0 && out_n_rows) *out_n_rows = n_rows;
-    return rc;
-}
-
-/* L284 #2: the fused step (contract in pulsar.h) -- a verify's rows [0, n_dec) and the shape's n_pf prompt runs
- * [n_dec, n_rows) in one forward.  The verify rows are exactly the speculation lane's verify (decode_mixed with
- * every row headed): headed in place, their per-row state captured for the commit's rollback, their bank positions
- * left for the commit to move.  Each prompt run is exactly a sync's prefill chunk of the same rows on its bank, at
- * any width: a run from position 0 resets its bank first (as a cold sync does), the MTP layer absorbs it, the
- * bank's position moves past it, and so does its prefill-only history when the run continues it.  A run with
- * head_last set has its last row headed into the next logits row after the verify's, in run order.  The record
- * of each chunk in its bank's history is the core's pulsar_session_note_prefilled.  1 = refused before anything
- * moved, -1 = the step failed with state moved (its banks' state is fatal). */
-static int qwen_session_decode_fused(pulsar_session *s, const pulsar_multiseq_req *reqs, uint32_t n_rows,
-                                     const pulsar_fused_shape *shape, float *logits, int logits_cap,
-                                     uint32_t *out_n_rows, char *err, size_t errlen) {
-    if (out_n_rows) *out_n_rows = 0;
-    pulsar_engine *e = s->engine;
-    pulsar_qwen_state *q = s->qwen;
-    const uint32_t nv = g_qwen_shape.n_vocab;
-    if (!reqs || !shape || !logits || n_rows == 0 || n_rows > q->max_rows) {
-        if (err) snprintf(err, errlen, "%s: fused step: bad args (%u rows, at most %u)", PULSAR_QWEN_ARCH, n_rows,
-                          q->max_rows);
-        return 1;
-    }
-    const uint32_t n_dec = shape->n_dec, heads = pulsar_fused_shape_heads(shape);
-    if (n_dec >= n_rows || shape->n_pf == 0 || shape->n_pf > PULSAR_FUSED_PF_MAX) {
-        if (err) snprintf(err, errlen, "%s: a fused step is a verify and 1..%u prompt runs (n_dec %u of %u rows, %u "
-                          "prompt runs)", PULSAR_QWEN_ARCH, PULSAR_FUSED_PF_MAX, n_dec, n_rows, shape->n_pf);
-        return 1;
-    }
-    if (n_dec > PULSAR_QWEN_SPEC_ROWS || (n_dec > 0 && !q->mtp) ||
-        n_dec + heads > e->family->session->fused_heads_max || logits_cap < 0 || (uint64_t)logits_cap < (uint64_t)(n_dec + heads) * nv) {
-        if (err) snprintf(err, errlen, "%s: fused step: %u verify rows (at most %u, with the MTP layer) + %u headed "
-                          "(at most %u rows headed), logits capacity %d", PULSAR_QWEN_ARCH, n_dec, PULSAR_QWEN_SPEC_ROWS,
-                          heads, e->family->session->fused_heads_max, logits_cap);
-        return 1;
-    }
-    std::vector<int32_t> tok(n_rows), pos(n_rows), bk(n_rows);
-    if (!qwen_verify_rows(s, reqs, n_dec, tok.data(), pos.data(), bk.data(), err, errlen)) return 1;
-    /* the prompt runs: each on a bank no other row of the step is on, consecutive positions, text rows */
-    uint32_t first[PULSAR_FUSED_PF_MAX + 1];
-    uint32_t n_pf = 0;
-    const pulsar_family_vision *vis = e->family->vision;
-    for (uint32_t i = n_dec; i < n_rows; i++) {
-        const uint32_t b = reqs[i].bank;
-        const bool starts = i == n_dec || b != reqs[i - 1].bank;
-        bool taken = false;
-        for (uint32_t j = 0; starts && j < i; j++) taken |= reqs[j].bank == b;
-        if (starts && n_pf < PULSAR_FUSED_PF_MAX) first[n_pf] = i;
-        n_pf += starts ? 1u : 0u;
-        const char *why = n_pf > shape->n_pf                                       ? "starts a run past the shape's"
-                          : taken                                                 ? "is on a bank the step already carries"
-                          : !starts && reqs[i].pos != reqs[i - 1].pos + 1         ? "does not follow its run"
-                          : !pulsar_session_token_is_id(s, reqs[i].token, NULL, 0) ? "is not a token id"
-                          : vis && vis->is_sentinel(e, reqs[i].token)               ? "is an image block's (a sync's)"
-                                                                                  : NULL;
-        if (why) {
-            if (err) snprintf(err, errlen, "%s: fused prompt row %u (bank %u pos %d) %s", PULSAR_QWEN_ARCH, i, b,
-                              reqs[i].pos, why);
-            return 1;
-        }
-        tok[i] = reqs[i].token;
-        pos[i] = reqs[i].pos;
-        bk[i] = (int32_t)b;
-    }
-    if (n_pf != shape->n_pf) {
-        if (err) snprintf(err, errlen, "%s: fused step: %u prompt runs, the shape says %u", PULSAR_QWEN_ARCH, n_pf,
-                          shape->n_pf);
-        return 1;
-    }
-    first[n_pf] = n_rows;
-    /* each run at its bank's next position or from 0 (a run from 0 must not inherit a dead conversation's image
-     * records: its rope would read them) */
-    for (uint32_t r = 0; r < n_pf; r++) {
-        const uint32_t b = reqs[first[r]].bank, m = first[r + 1] - first[r];
-        const int32_t p0 = reqs[first[r]].pos;
-        const pulsar_image_identity *img = b < q->n_banks ? pulsar_session_bank_images(s, b, q->live_bank) : NULL;
-        const char *why = b >= q->n_banks                            ? "is outside the pool"
-                          : p0 != 0 && (uint32_t)p0 != q->bank_pos[b] ? "holds a different position"
-                          : (uint64_t)p0 + m > q->ctx                 ? "has no room"
-                          : p0 == 0 && img && img->n                  ? "still holds image blocks (invalidate it first)"
-                                                                      : NULL;
-        if (why) {
-            if (err) snprintf(err, errlen, "%s: fused prompt run %u on bank %u at %d + %u rows: the bank %s",
-                              PULSAR_QWEN_ARCH, r, b, p0, m, why);
-            return 1;
-        }
-    }
-    /* a run from 0 starts its bank over, as a cold sync does; whether each run continues its bank's prefill-only
-     * history is read before the step moves it */
-    bool canonical[PULSAR_FUSED_PF_MAX];
-    for (uint32_t r = 0; r < n_pf; r++) {
-        const uint32_t b = reqs[first[r]].bank;
-        if (reqs[first[r]].pos == 0 && !qwen_state_reset_bank(q, &g_qwen_shape, &e->plan, b)) {
-            if (err) snprintf(err, errlen, "%s: fused step: bank %u could not be reset", PULSAR_QWEN_ARCH, b);
-            return -1;
-        }
-        canonical[r] = q->prefill_pos[b] == (uint32_t)reqs[first[r]].pos && !q->frontier_stale[b];
-    }
-    qwen_heads hl = qwen_heads_span(0, n_dec);
-    for (uint32_t r = 0; r < n_pf; r++)
-        if (shape->head_last[r]) hl.row[hl.n++] = first[r + 1] - 1u;
-    bool ok = qwen_forward(s, PULSAR_QWEN_STEP_PREFILL, tok.data(), pos.data(), bk.data(), n_rows, hl, logits, n_dec);
-    for (uint32_t r = 0; ok && q->mtp && r < n_pf; r++)   /* each run's MTP rows, as its sync chunk's absorb */
-        ok = qwen_mtp_absorb(s, PULSAR_QWEN_STEP_PREFILL, tok.data() + first[r], pos.data() + first[r],
-                             bk.data() + first[r], first[r + 1] - first[r], first[r], 0, NULL);
-    if (!ok) {
-        if (err) snprintf(err, errlen, "%s: the fused step refused (see the log for the op)", PULSAR_QWEN_ARCH);
-        return -1;
-    }
-    for (uint32_t r = 0; r < n_pf; r++) {
-        const uint32_t b = reqs[first[r]].bank, end = (uint32_t)reqs[first[r]].pos + (first[r + 1] - first[r]);
-        qwen_bank_set_pos(q, b, end);
-        if (canonical[r]) q->prefill_pos[b] = end;
-        if (b == q->live_bank) {   /* the live bank moved past the host view */
-            s->checkpoint_valid = false;
-            s->logits_stale = true;
-        }
-    }
-    if (out_n_rows) *out_n_rows = hl.n;
-    return 0;
-}
-
-uint32_t qwen_argmax(const float *v, uint32_t n) {
-    uint32_t a = 0;
-    for (uint32_t i = 1; i < n; i++) if (v[i] > v[a]) a = i;
-    return a;
 }
 
 /* L270: the MTP's sampled distribution q over its draft vocabulary, ids mapped to the vocabulary. */
@@ -1856,20 +1172,27 @@ bool qwen_mtp_dist(pulsar_session *s, const float *row, float temperature, int t
     return true;
 }
 
-static const pulsar_family_session_ops k_qwen_session_ops = {
-    /* .create          = */ qwen_session_create,
-    /* .destroy         = */ qwen_session_destroy,
-    /* .sync            = */ &k_qwen_sync,
-    /* .eval_row        = */ qwen_session_eval_row,
-    /* .decode_multiseq = */ qwen_session_decode_multiseq,
-    /* .decode_mixed    = */ qwen_session_decode_mixed,
-    /* the core's invalidate forgets the HOST view; the device state is left alone: the next sync of that bank finds
-     * the view invalid and resets the bank before it prefills, so a stale state is never decoded -- and the server's
-     * invalidate (a bank provision, an eviction, a stop string mid-batch) cannot wipe OTHER banks' conversations */
-    /* .invalidate      = */ NULL,
-    /* .decode_fused    = */ qwen_session_decode_fused,
-    /* .fused_heads_max = */ PULSAR_QWEN_HEAD_ROWS_MAX,   /* the logits slab's rows */
+static const pulsar_driver_ops k_qwen_driver = {
+    /* .create        = */ qwen_create,
+    /* .destroy       = */ qwen_destroy,
+    /* .verifies      = */ qwen_verifies,
+    /* .trunk         = */ qwen_trunk,
+    /* .scratch_bytes = */ qwen_scratch_bytes,
+    /* .n_scratch     = */ PULSAR_QWEN_OP_COUNT,
+    /* .embed         = */ qwen_embed,
+    /* .block         = */ {NULL, NULL, qwen_block_gdn, qwen_block_qsa},   /* by pulsar_layer_kind: GDN, QSA */
+    /* .head          = */ qwen_head,
+    /* .step_end      = */ qwen_step_end,
+    /* .absorb        = */ qwen_absorb,
+    /* .rope          = */ qwen_rope_table,
+    /* .image_rows    = */ qwen_image_rows,
+    /* .dump          = */ qwen_dump,
+    /* .artifact      = */ qwen_artifact,
 };
+static_assert(PULSAR_LAYER_QWEN_GDN == 2 && PULSAR_LAYER_QWEN_QSA == 3, "the block table's slots are the kinds' values");
+
+static const pulsar_sync_ops k_qwen_sync = PULSAR_DRIVER_SYNC_OPS(PULSAR_QWEN_ARCH);
+static const pulsar_family_session_ops k_qwen_session_ops = PULSAR_DRIVER_SESSION_OPS(&k_qwen_sync);
 
 /* The trunk's layers and the MTP layer each take an exchange slot (L266 step 7). */
 static void qwen_tp_shape(const pulsar_engine *e, uint32_t *n_layer, uint32_t *n_embd, uint32_t *n_vocab) {
@@ -1896,12 +1219,13 @@ const pulsar_family PULSAR_FAMILY_QWEN4_EXP = {
     /* .tp_shape     = */ qwen_tp_shape,
     /* .drafter      = */ qwen_drafter,
     /* .quant_bits   = */ qwen_quant_bits,
-    /* .spec         = */ &k_qwen_spec_target,
-    /* .session      = */ &k_qwen_session_ops,
+    /* .spec         = */ &PULSAR_DRIVER_SPEC_TARGET,   /* L295 F4: the driver's verify target */
+    /* .session      = */ &k_qwen_session_ops,          /* L295 F4: the core driver's (step_driver.cpp) */
     /* .tokenizer    = */ &k_qwen_tokenizer,
     /* .tp_slices    = */ pulsar_qwen_tp_slices,
     /* .act_kind     = */ PULSAR_ACT_KIND_ROWS,
     /* .vision       = */ &PULSAR_QWEN_IMAGE_FRONT,   /* L268: vision_qwen.cpp */
-    /* .banks        = */ &k_qwen_bank_ops,
+    /* .banks        = */ &PULSAR_BANK_OPS_DECLARED,   /* L295 F3: state_kinds.cpp */
     /* .imatrix      = */ &k_qwen_imatrix,   /* L284 P15: imatrix_qwen.cpp */
+    /* .driver       = */ &k_qwen_driver,    /* L295 F4 */
 };

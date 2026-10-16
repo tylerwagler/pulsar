@@ -1,6 +1,7 @@
 /* pyjson.cpp -- see pyjson.h. */
 #include "pyjson.h"
 
+#include <algorithm>
 #include <charconv>
 #include <cmath>
 #include <stdarg.h>
@@ -350,4 +351,61 @@ void pyjson_dump(const pyjson_value &v, std::string *out) {
         out->push_back('}');
         return;
     }
+}
+
+bool pyjson_dump_canonical(const pyjson_value &v, std::string *out) {
+    switch (v.kind) {
+    case pyjson_value::FLOAT:
+        if (!std::isfinite(v.f)) return false;   /* allow_nan=False */
+        float_repr(v.f, out);
+        return true;
+    case pyjson_value::ARR:
+        out->push_back('[');
+        for (size_t i = 0; i < v.a.size(); i++) {
+            if (i) out->push_back(',');
+            if (!pyjson_dump_canonical(v.a[i], out)) return false;
+        }
+        out->push_back(']');
+        return true;
+    case pyjson_value::OBJ: {
+        /* sorted(dict): by code point, which is UTF-8 byte order (std::string compares bytes unsigned) */
+        std::vector<const std::pair<std::string, pyjson_value> *> m;
+        for (const auto &kv : v.o) m.push_back(&kv);
+        std::sort(m.begin(), m.end(), [](const auto *x, const auto *y) { return x->first < y->first; });
+        out->push_back('{');
+        for (size_t i = 0; i < m.size(); i++) {
+            if (i) out->push_back(',');
+            pyjson_dump_string(m[i]->first.data(), m[i]->first.size(), out);
+            out->push_back(':');
+            if (!pyjson_dump_canonical(m[i]->second, out)) return false;
+        }
+        out->push_back('}');
+        return true;
+    }
+    default:
+        pyjson_dump(v, out);
+        return true;
+    }
+}
+
+bool pyjson_truthy(const pyjson_value &v) {
+    switch (v.kind) {
+    case pyjson_value::NUL: return false;
+    case pyjson_value::BOOL: return v.b;
+    case pyjson_value::INT: return v.num != "0";
+    case pyjson_value::FLOAT: return v.f != 0.0;
+    case pyjson_value::STR: return !v.s.empty();
+    case pyjson_value::ARR: return !v.a.empty();
+    case pyjson_value::OBJ: return !v.o.empty();
+    }
+    return false;
+}
+
+bool py_isspace(uint32_t cp) {
+    /* str.isspace: bidi class WS, B or S, or category Zs */
+    if (cp >= 0x09 && cp <= 0x0d) return true;
+    if (cp >= 0x1c && cp <= 0x20) return true;
+    if (cp == 0x85 || cp == 0xa0 || cp == 0x1680) return true;
+    if (cp >= 0x2000 && cp <= 0x200a) return true;
+    return cp == 0x2028 || cp == 0x2029 || cp == 0x202f || cp == 0x205f || cp == 0x3000;
 }
