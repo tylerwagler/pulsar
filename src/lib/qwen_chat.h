@@ -230,6 +230,7 @@ public:
      * the request's tools (NULL for none) -- the schema that types arguments.  false + reason if tools_json
      * is not a JSON array. */
     bool init(bool thinking, const char *tools_json, char *err, size_t errlen);
+    out_parser *clone() const override;
 
 private:
     qwen_xml_call_body body_;

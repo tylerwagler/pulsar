@@ -581,7 +581,7 @@ int pulsar_tp_worker_dispatch(pulsar_engine *e, const pulsar_tp_command *c, char
                 int *acc = worker_accepted(slot, c->spec.i2);
                 const int na = pulsar_session_spec_round_end_local(slot->s, r, c->spec.i0,
                                                                    c->spec.temperature, c->spec.top_k, c->spec.top_p,
-                                                                   c->spec.min_p, &rng, slot->logits, (uint32_t)c->spec.i3,
+                                                                   c->spec.min_p, 0u, &rng, slot->logits, (uint32_t)c->spec.i3,
                                                                    acc, c->spec.i2, ferr, sizeof(ferr));
                 status = na + 1;
                 if (status < 0) status = 0;
@@ -664,6 +664,7 @@ int pulsar_tp_worker_dispatch(pulsar_engine *e, const pulsar_tp_command *c, char
                 st->accepted_cap = r->i2;
                 st->accepted = acc + off;
                 st->row0 = (uint32_t)r->i3;
+                st->greedy_rows = r->greedy_rows;
                 off += r->i2 > 0 ? r->i2 : 0;
                 if (!st->round) ok = 0;
                 if (c->type == PULSAR_TP_FRAME_SPEC_ROUND_END_BATCH &&

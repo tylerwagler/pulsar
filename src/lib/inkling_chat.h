@@ -151,6 +151,7 @@ public:
     /** `initial`: where the prompt left the turn -- OUT_HEADER after the generation prompt's
      *  `<|message_model|>`. */
     void init(out_state initial);
+    out_parser *clone() const override;
 
 private:
     out_json_call_body body_;

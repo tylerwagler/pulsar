@@ -1356,7 +1356,7 @@ int pulsar_session_spec_round_end(pulsar_session *s, pulsar_spec_round *r, int f
     pulsar_tp *tp = NULL;
     const int route = tp_spec_route(s, "spec_round_end", &tp, err, errlen);
     if (route == 0) return -1;
-    if (route == 1) return pulsar_session_spec_round_end_local(s, r, first_token, temperature, top_k, top_p, min_p, rng, rows, row0, accepted, accepted_cap, err, errlen);
+    if (route == 1) return pulsar_session_spec_round_end_local(s, r, first_token, temperature, top_k, top_p, min_p, 0u, rng, rows, row0, accepted, accepted_cap, err, errlen);
     /* The logits block is NOT shipped: every rank holds the same block from
      * its own mirrored forward (the vocab all-gather made them identical), so
      * only row0 crosses. */
@@ -1366,7 +1366,7 @@ int pulsar_session_spec_round_end(pulsar_session *s, pulsar_spec_round *r, int f
     c.rng = rng ? *rng : 0;
     if (!tp_mirror_sent(tp, "spec_round_end", pulsar_tp_send_spec(tp, PULSAR_TP_FRAME_SPEC_ROUND_END, &c, NULL, NULL),
                         err, errlen)) return -1;
-    const int own = pulsar_session_spec_round_end_local(s, r, first_token, temperature, top_k, top_p, min_p, rng, rows, row0, accepted, accepted_cap, err, errlen);
+    const int own = pulsar_session_spec_round_end_local(s, r, first_token, temperature, top_k, top_p, min_p, 0u, rng, rows, row0, accepted, accepted_cap, err, errlen);
     const int agreed = tp_mirror_bank_verdict(s, tp, "spec_round_end", own + 1, -1);
     return agreed < 0 ? -1 : own;
 }
@@ -1463,6 +1463,7 @@ static int tp_spec_steps_mirror(pulsar_session *s, pulsar_tp *tp, uint32_t frame
         r->i1 = st->k_alloc;
         r->i2 = st->accepted_cap;
         r->i3 = (int32_t)st->row0;
+        r->greedy_rows = st->greedy_rows;
     }
     return tp_mirror_sent(tp, operation, pulsar_tp_send_spec_steps(tp, frame_type, &c, recs), NULL, 0);
 }

@@ -23,6 +23,10 @@
  *       row-exact, pulsar_mtp_ops::row_exact; reported otherwise) -- and four decode steps after == the twin's
  *   M4  the batched lane (the server's round API): four banks' streams in shared verify steps (assemble, one
  *       decode_mixed with every row headed, round_end, ONE redraft pass, commit) == each bank's plain stream, greedy
+ *   M5  the batched lane at seeded T 0.7 with each position's mode its own (L296 toolsample: the server's tool-call
+ *       override, a call's structure greedy and its payload sampled, flips inside a round): every other run of 3
+ *       positions greedy, the plain stream drawing each token at its position's mode and the rounds through
+ *       pulsar_spec_step::greedy_rows -- == each bank's plain stream, rounds that cross between the modes counted
  *
  * --probe (the draft grade's capture, tests/nemotron_mtp_grade.py): the first draft step's logits at every position of
  * a reference prompt, teacher-forced by the trunk (the lane's probe: each lockstep module row headed) -- the DECODE
@@ -125,11 +129,16 @@ struct stream {
     bool ok = false;
 };
 
+/* M5's per-position sampling: the stream's token `pos` (0 = the first generated) draws greedy in every other run of
+ * `greedy_run` positions (0 = never) -- a stand-in for the server's tool-call override (structure greedy, payload
+ * sampled), which flips inside a speculative round. */
+static bool pos_greedy(int greedy_run, size_t pos) { return greedy_run > 0 && (pos / (size_t)greedy_run) % 2u == 1u; }
+
 /* One stream on a fresh one-bank session: sync(prompt), then `n` tokens -- plain (quenched: the plain step the round
  * API takes), or speculative; `force` (a reference stream) replaces every round's pendings (M3); `keep` leaves the
- * session open in *keep_s. */
+ * session open in *keep_s; `greedy_run` (plain only) draws each token at its position's mode (pos_greedy). */
 static stream run(pulsar_engine *e, const pulsar_tokens &prompt, int n, bool spec, float temp, uint64_t seed,
-                  const std::vector<int32_t> *force = NULL, pulsar_session **keep_s = NULL) {
+                  const std::vector<int32_t> *force = NULL, pulsar_session **keep_s = NULL, int greedy_run = 0) {
     stream r;
     pulsar_engine_set_bank_pool(1);
     pulsar_session *s = NULL;
@@ -157,7 +166,8 @@ static stream run(pulsar_engine *e, const pulsar_tokens &prompt, int n, bool spe
             force_pendings(s, *force, r.out.size(), K, bad);
         }
         int buf[17];
-        const int k = pulsar_session_generate_speculative(s, temp, 0, 1.0f, 0.0f, &rng, n - (int)r.out.size(), buf, 17,
+        const float t = !spec && pos_greedy(greedy_run, r.out.size()) ? 0.0f : temp;   /* a plain step: one token */
+        const int k = pulsar_session_generate_speculative(s, t, 0, 1.0f, 0.0f, &rng, n - (int)r.out.size(), buf, 17,
                                                           err, sizeof(err));
         if (k <= 0) {
             ok = k == 0;
@@ -268,6 +278,127 @@ static std::vector<pulsar_tokens> prompts(pulsar_engine *e) {
                             "    out = []\n    i = j = 0\n    while i < len(a) and j < len(b):\n", &code);
     P.push_back(code);
     return P;
+}
+
+/* M4 / M5: the batched lane (the server's round API) -- four banks' streams in shared verify steps (assemble, one
+ * decode_mixed with every row headed, round_end, ONE redraft pass, commit), each == its plain stream `ref`.  At
+ * `temp` > 0 with `greedy_run` set, every position draws at its own mode as the server's per-position override does
+ * (L296 toolsample): the assemble's base at the base's, the round's rows at theirs through greedy_rows. */
+static void batched_lane(pulsar_engine *e, const std::vector<pulsar_tokens> &P, int n, int W,
+                         const std::vector<stream> &ref, const char *tag, float temp, uint64_t seed0, int greedy_run) {
+    const int NB = 4;
+    pulsar_engine_set_bank_pool(NB);
+    pulsar_session *s = NULL;
+    char err[256] = "";
+    bool ok = pulsar_session_create(&s, e, 4096) == 0 && s;
+    for (int b = 0; ok && b < NB; b++) {
+        ok = pulsar_session_bank_state_restore(s, (uint32_t)b) && pulsar_session_sync(s, &P[b], err, sizeof(err)) == 0;
+        if (ok) pulsar_session_bank_state_save(s, (uint32_t)b);
+    }
+    CHECK(ok, "%s four banks prefilled: %s", tag, err);
+    std::vector<std::vector<int32_t>> got(NB);
+    pulsar_spec_round *rd[NB];
+    uint64_t rngs[NB];
+    bool done[NB] = {};
+    for (int b = 0; b < NB; b++) { rd[b] = pulsar_spec_round_new(); rngs[b] = temp > 0.0f ? seed0 + (uint64_t)b : 0u; }
+    const uint64_t d0 = drafted(e, NULL, NULL);
+    const uint32_t width = pulsar_engine_fused_heads_max(e);
+    std::vector<pulsar_multiseq_req> reqs(width);
+    static int acc[NB][PULSAR_SPEC_LOGITS_ROWS + 1];
+    int ticks = 0, crossing = 0;
+    while (ok && ticks++ < 4 * n) {
+        pulsar_spec_step st[NB];
+        uint32_t bank_of[NB];
+        int m = 0;
+        for (int b = 0; b < NB; b++) {
+            if (done[b]) continue;
+            /* the yield quench disarmed, as in run() */
+            ok = pulsar_session_bank_state_restore(s, (uint32_t)b);
+            s->spec.spec_quenched = false;
+            s->spec.spec_quench_steps = 0;
+            s->spec.spec_quench_debt = 0.0f;
+            s->spec.spec_quench_ewma = 0.0f;
+            pulsar_session_bank_state_save(s, (uint32_t)b);
+            if (!ok) break;
+            memset(&st[m], 0, sizeof st[m]);
+            st[m].bank = (uint32_t)b;
+            st[m].round = rd[b];
+            st[m].temperature = pos_greedy(greedy_run, got[b].size()) ? 0.0f : temp;   /* the base's position */
+            st[m].top_p = 1.0f;
+            st[m].rng = &rngs[b];
+            st[m].max_tokens = n - (int)got[b].size();
+            st[m].k_alloc = -1;
+            st[m].accepted_cap = (int)(PULSAR_SPEC_LOGITS_ROWS + 1);
+            bank_of[m++] = (uint32_t)b;
+        }
+        if (m == 0) break;
+        uint32_t rows = 0;
+        (void)pulsar_session_spec_assemble_batch(s, st, m, width, reqs.data(), &rows);
+        /* as the server's lane: a bank whose base is a stop token emits it and ends (never evaluated); a bank
+         * over the row budget sits the tick out untouched; the rest verify (a deep chain -- the drafter's cap 7,
+         * a copy chain -- can fill the width) */
+        int live = 0;
+        for (int i = 0; ok && i < m; i++) {
+            if (st[i].status == PULSAR_SPEC_STEP_EOS) {
+                got[bank_of[i]].push_back(st[i].first_token);
+                done[bank_of[i]] = true;
+            } else if (st[i].status == PULSAR_SPEC_STEP_OK) {
+                st[live] = st[i];
+                bank_of[live++] = bank_of[i];
+            } else if (st[i].status != PULSAR_SPEC_STEP_SKIPPED) {
+                ok = false;
+                snprintf(err, sizeof err, "assemble bank %u: status %d %s", st[i].bank, (int)st[i].status, st[i].err);
+            }
+        }
+        if (!ok) break;
+        m = live;
+        if (m == 0 || rows == 0) continue;
+        std::vector<float> logits((size_t)rows * W);
+        uint32_t gotr = 0;
+        pulsar_session_spec_arm_capture(s, rows);
+        ok = pulsar_session_decode_mixed(s, reqs.data(), rows, logits.data(), (int)rows * W, &gotr,
+                                         PULSAR_MSEQ_HEAD_ALL_ROWS, err, sizeof(err)) == 0 && gotr == rows;
+        pulsar_session_spec_arm_capture(s, 0u);
+        if (!ok) break;
+        for (int i = 0; i < m; i++) {
+            st[i].accepted = acc[i];
+            st[i].accepted_cap = (int)(PULSAR_SPEC_LOGITS_ROWS + 1);
+            /* row j: the token after the base (position got.size()) and j drafts */
+            st[i].temperature = temp;
+            st[i].greedy_rows = 0u;
+            const size_t base_pos = got[bank_of[i]].size();
+            for (uint32_t j = 0; j < st[i].n_rows; j++)
+                if (pos_greedy(greedy_run, base_pos + 1u + j)) st[i].greedy_rows |= 1u << j;
+            const uint32_t all = st[i].n_rows >= 32u ? ~0u : (1u << st[i].n_rows) - 1u;
+            crossing += st[i].n_rows > 1u && st[i].greedy_rows != 0u && st[i].greedy_rows != all;
+        }
+        ok = pulsar_session_spec_round_end_batch(s, st, m, logits.data()) == 0;
+        for (int i = 0; ok && i < m; i++) {
+            ok = st[i].status == PULSAR_SPEC_STEP_OK;
+            if (!ok) { snprintf(err, sizeof err, "round_end bank %u: %s", st[i].bank, st[i].err); break; }
+            const uint32_t b = bank_of[i];
+            for (int k = 0; k < st[i].n_accepted; k++) got[b].push_back(acc[i][k]);
+            if ((int)got[b].size() >= n || (st[i].n_accepted && pulsar_token_is_stop(e, acc[i][st[i].n_accepted - 1])))
+                done[b] = true;
+        }
+        if (!ok) break;
+        pulsar_spec_round *rr[NB];
+        uint64_t *rp[NB];
+        for (int i = 0; i < m; i++) { rr[i] = rd[bank_of[i]]; rp[i] = &rngs[bank_of[i]]; }
+        ok = pulsar_session_spec_redraft_batch(s, rr, bank_of, rp, m, err, sizeof(err)) == 0 &&
+             pulsar_session_spec_redraft_commit_batch(s, st, m) == 0;
+    }
+    const uint64_t dd = drafted(e, NULL, NULL) - d0;
+    CHECK(ok && dd > 0, "%s the batched lane ran %d ticks, %llu drafts: %s", tag, ticks, (unsigned long long)dd, err);
+    if (greedy_run > 0)
+        CHECK(crossing > 0, "%s %d verified rounds crossed between greedy and sampled positions", tag, crossing);
+    for (int b = 0; b < NB; b++) {
+        const int d = first_diff(got[b], ref[b].out);
+        CHECK(ok && d == -1, "%s bank %d: %zu tokens in shared verify steps == its plain stream (first difference "
+              "at %d)", tag, b, got[b].size(), d);
+    }
+    for (int b = 0; b < NB; b++) pulsar_spec_round_free(rd[b]);
+    if (s) pulsar_session_free(s);
 }
 
 static int exact(pulsar_engine *e, int n, const char *only) {
@@ -396,109 +527,17 @@ static int exact(pulsar_engine *e, int n, const char *only) {
     }
     /* M4 the batched lane: four banks, one shared verify a tick */
     drafter_at_depth(e, 0);
-    if (on('4')) {
-        const int NB = 4;
-        pulsar_engine_set_bank_pool(NB);
-        pulsar_session *s = NULL;
-        char err[256] = "";
-        bool ok = pulsar_session_create(&s, e, 4096) == 0 && s;
-        for (int b = 0; ok && b < NB; b++) {
-            ok = pulsar_session_bank_state_restore(s, (uint32_t)b) && pulsar_session_sync(s, &P[b], err, sizeof(err)) == 0;
-            if (ok) pulsar_session_bank_state_save(s, (uint32_t)b);
+    if (on('4')) batched_lane(e, P, n, W, plain, "M4", 0.0f, 0u, 0);
+    /* M5 the batched lane at seeded T0.7, each position's mode flipping inside the rounds (L296 toolsample) */
+    if (on('5')) {
+        const int RUN = 3;
+        std::vector<stream> plain_m(P.size());
+        for (size_t i = 0; i < P.size(); i++) {
+            plain_m[i] = run(e, P[i], n, false, 0.7f, 0x70015ULL + i, NULL, NULL, RUN);
+            CHECK(plain_m[i].ok && !plain_m[i].out.empty(), "M5 prompt %zu: plain T0.7 with every other run of %d "
+                  "positions greedy, %zu tokens", i, RUN, plain_m[i].out.size());
         }
-        CHECK(ok, "M4 four banks prefilled: %s", err);
-        std::vector<std::vector<int32_t>> got(NB);
-        pulsar_spec_round *rd[NB];
-        uint64_t rngs[NB];
-        bool done[NB] = {};
-        for (int b = 0; b < NB; b++) { rd[b] = pulsar_spec_round_new(); rngs[b] = 0; }
-        const uint64_t d0 = drafted(e, NULL, NULL);
-        const uint32_t width = pulsar_engine_fused_heads_max(e);
-        std::vector<pulsar_multiseq_req> reqs(width);
-        static int acc[NB][PULSAR_SPEC_LOGITS_ROWS + 1];
-        int ticks = 0;
-        while (ok && ticks++ < 4 * n) {
-            pulsar_spec_step st[NB];
-            uint32_t bank_of[NB];
-            int m = 0;
-            for (int b = 0; b < NB; b++) {
-                if (done[b]) continue;
-                /* the yield quench disarmed, as in run() */
-                ok = pulsar_session_bank_state_restore(s, (uint32_t)b);
-                s->spec.spec_quenched = false;
-                s->spec.spec_quench_steps = 0;
-                s->spec.spec_quench_debt = 0.0f;
-                s->spec.spec_quench_ewma = 0.0f;
-                pulsar_session_bank_state_save(s, (uint32_t)b);
-                if (!ok) break;
-                memset(&st[m], 0, sizeof st[m]);
-                st[m].bank = (uint32_t)b;
-                st[m].round = rd[b];
-                st[m].top_p = 1.0f;
-                st[m].rng = &rngs[b];
-                st[m].max_tokens = n - (int)got[b].size();
-                st[m].k_alloc = -1;
-                st[m].accepted_cap = (int)(PULSAR_SPEC_LOGITS_ROWS + 1);
-                bank_of[m++] = (uint32_t)b;
-            }
-            if (m == 0) break;
-            uint32_t rows = 0;
-            (void)pulsar_session_spec_assemble_batch(s, st, m, width, reqs.data(), &rows);
-            /* as the server's lane: a bank whose base is a stop token emits it and ends (never evaluated); a bank
-             * over the row budget sits the tick out untouched; the rest verify (a deep chain -- the drafter's cap 7,
-             * a copy chain -- can fill the width) */
-            int live = 0;
-            for (int i = 0; ok && i < m; i++) {
-                if (st[i].status == PULSAR_SPEC_STEP_EOS) {
-                    got[bank_of[i]].push_back(st[i].first_token);
-                    done[bank_of[i]] = true;
-                } else if (st[i].status == PULSAR_SPEC_STEP_OK) {
-                    st[live] = st[i];
-                    bank_of[live++] = bank_of[i];
-                } else if (st[i].status != PULSAR_SPEC_STEP_SKIPPED) {
-                    ok = false;
-                    snprintf(err, sizeof err, "assemble bank %u: status %d %s", st[i].bank, (int)st[i].status, st[i].err);
-                }
-            }
-            if (!ok) break;
-            m = live;
-            if (m == 0 || rows == 0) continue;
-            std::vector<float> logits((size_t)rows * W);
-            uint32_t gotr = 0;
-            pulsar_session_spec_arm_capture(s, rows);
-            ok = pulsar_session_decode_mixed(s, reqs.data(), rows, logits.data(), (int)rows * W, &gotr,
-                                             PULSAR_MSEQ_HEAD_ALL_ROWS, err, sizeof(err)) == 0 && gotr == rows;
-            pulsar_session_spec_arm_capture(s, 0u);
-            if (!ok) break;
-            for (int i = 0; i < m; i++) {
-                st[i].accepted = acc[i];
-                st[i].accepted_cap = (int)(PULSAR_SPEC_LOGITS_ROWS + 1);
-            }
-            ok = pulsar_session_spec_round_end_batch(s, st, m, logits.data()) == 0;
-            for (int i = 0; ok && i < m; i++) {
-                ok = st[i].status == PULSAR_SPEC_STEP_OK;
-                if (!ok) { snprintf(err, sizeof err, "round_end bank %u: %s", st[i].bank, st[i].err); break; }
-                const uint32_t b = bank_of[i];
-                for (int k = 0; k < st[i].n_accepted; k++) got[b].push_back(acc[i][k]);
-                if ((int)got[b].size() >= n || (st[i].n_accepted && pulsar_token_is_stop(e, acc[i][st[i].n_accepted - 1])))
-                    done[b] = true;
-            }
-            if (!ok) break;
-            pulsar_spec_round *rr[NB];
-            uint64_t *rp[NB];
-            for (int i = 0; i < m; i++) { rr[i] = rd[bank_of[i]]; rp[i] = &rngs[bank_of[i]]; }
-            ok = pulsar_session_spec_redraft_batch(s, rr, bank_of, rp, m, err, sizeof(err)) == 0 &&
-                 pulsar_session_spec_redraft_commit_batch(s, st, m) == 0;
-        }
-        const uint64_t dd = drafted(e, NULL, NULL) - d0;
-        CHECK(ok && dd > 0, "M4 the batched lane ran %d ticks, %llu drafts: %s", ticks, (unsigned long long)dd, err);
-        for (int b = 0; b < NB; b++) {
-            const int d = first_diff(got[b], plain[b].out);
-            CHECK(ok && d == -1, "M4 bank %d: %zu tokens in shared verify steps == its plain stream (first difference "
-                  "at %d)", b, got[b].size(), d);
-        }
-        for (int b = 0; b < NB; b++) pulsar_spec_round_free(rd[b]);
-        if (s) pulsar_session_free(s);
+        batched_lane(e, P, n, W, plain_m, "M5", 0.7f, 0x70015ULL, RUN);
     }
     drafter_at_depth(e, 0);
     e->lane_cost[PULSAR_LANE_SPEC] = g_cost0;

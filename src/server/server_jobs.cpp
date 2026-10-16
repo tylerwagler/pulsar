@@ -1283,10 +1283,12 @@ void gen_resolve_sampling(const request *req, float *temperature,
  * samples normally: the DSML tracker's payload spans for DeepSeek, the Qwen
  * parser's in_payload for Qwen -- L284 P6, one rule). L116: ONE authority for
  * every decode lane — classic, plain-batched, spec-batched, mixed — so a tool
- * request samples the same wherever the scheduler routes it. Granularity is
- * one resolution per spec block / batched round in every lane (the classic
- * lane always worked this way: the override can lag a mid-block tool-marker
- * crossing by up to one block). */
+ * request samples the same wherever the scheduler routes it.  Granularity is
+ * one resolution per TOKEN in every lane: the plain lanes resolve before each
+ * draw, and a speculative round takes the override at each of its positions
+ * (gen_spec_greedy_rows; L296 toolsample -- it was once per round, so a round
+ * that crossed from a call's structure into its payload drew the payload's
+ * first tokens greedy, and spec != plain at T > 0). */
 void gen_resolve_sampling_decode(const gen_state *g, float *temperature,
                                  int *top_k, float *top_p, float *min_p) {
     const request *req = &g->j->req;
@@ -1295,6 +1297,118 @@ void gen_resolve_sampling_decode(const gen_state *g, float *temperature,
     if (g->parser_st && g->parser->in_tool_call(g->parser_st, g)) *temperature = 0.0f;
 }
 
+
+
+/* The emit path's byte release -- gen_emit_token's, and (L296) the spec lane's per-position probe's on copies of the
+ * same state: `text` (len bytes) just grew by `piece`, its last piece_len bytes.  The reasoning tracker and the stop
+ * scan's resume point advance, and the return is how many bytes of `text` the stop-string scan releases (what the
+ * client stream and the output parser are given).  A client stop sequence that matched sets *hit_stop, *stop_pos and
+ * *stop_len. */
+size_t gen_release(const stop_list *stops, const char *text, size_t len, const char *piece, size_t piece_len,
+                   size_t plain_stream_pos, thinking_state *thinking, size_t *stop_scan_from,
+                   bool *hit_stop, size_t *stop_pos, size_t *stop_len) {
+    const bool was_thinking = thinking->inside;
+    thinking->feed(piece, piece_len);
+    /* L077 (stop-in-reasoning): client stop sequences describe the VISIBLE
+     * answer, not the reasoning stream -- matching them inside <think>
+     * truncates mid-block and, with no </think> ever emitted, the finish
+     * parse routes everything to reasoning_content and the client gets an
+     * empty answer. Suppress matching while inside, and on the close jump
+     * the scan to the start of the closing piece (the tracker reports no
+     * byte offset, so at most the think-tail bytes of that one piece stay
+     * scannable -- the conservative side of the boundary). */
+    if (was_thinking && !thinking->inside) {
+        const size_t close_base = len - piece_len;
+        if (*stop_scan_from < close_base) *stop_scan_from = close_base;
+    }
+    *hit_stop = !thinking->inside && stop_list_find_from(stops, text, *stop_scan_from, stop_pos, stop_len);
+    size_t stream_len = *hit_stop ? *stop_pos : stop_list_stream_safe_len(stops, len);
+    if (stream_len > len) stream_len = len;
+    stream_len = utf8_stream_safe_len(text, plain_stream_pos, stream_len, *hit_stop);
+    if (!*hit_stop && stops->max_len > 1) {
+        const size_t hold = stops->max_len - 1;
+        *stop_scan_from = len > hold ? len - hold : 0;
+    }
+    return stream_len;
+}
+
+/* The request streams g->text as it is released (plain_stream_pos follows the release). */
+bool gen_streams_plain(const gen_state *g) {
+    return g->j->req.stream && !g->structured_stream;
+}
+
+/* L296 toolsample: gen_resolve_sampling_decode's tool-call override at EVERY position of a speculative round, as the
+ * plain lane evaluates it token by token (emit a token, resolve, draw the next).  pieces[0..n) are the texts of the
+ * round's tokens the stream has not taken yet, in order -- the base unless it was streamed before the forward
+ * (`base_emitted`), then the drafts; NULL = a stop token.  Bit i of the result = the token after the base and drafts
+ * 0..i-1 (verify row i; row K is a full accept's carry) sits in a call's STRUCTURE, which the plain lane draws greedy.
+ *
+ * The positions are read off a SCRATCH copy of the decode-time state -- the output parser's tracking (its probe),
+ * the reasoning tracker, the stop scan's resume point, the streamed prefix and the text -- advanced by the emit
+ * path's own release rule (gen_release) and the parser's own reading, so each bit is what in_tool_call says once the
+ * tokens before it are emitted.  Past a token that ends the stream (a stop token, a stop sequence) nothing is
+ * emitted: those bits repeat the last, and the server never streams the rows they govern.  0 for a request the
+ * override never touches (not a chat with tools) or that is greedy throughout. */
+static bool gen_tool_override_varies(const gen_state *g) {
+    const request *req = &g->j->req;
+    float temperature, top_p, min_p;
+    int top_k;
+    gen_resolve_sampling(req, &temperature, &top_k, &top_p, &min_p);
+    return req->kind == REQ_CHAT && req->has_tools && g->parser_st && temperature > 0.0f;
+}
+
+uint32_t gen_spec_greedy_rows_text(const gen_state *g, const char *const *pieces, const size_t *piece_lens, int n,
+                                   bool base_emitted) {
+    if (!gen_tool_override_varies(g)) return 0u;
+    const request *req = &g->j->req;
+    void *probe = g->parser->probe_new(g->parser_st);
+    buf text;
+    memset(&text, 0, sizeof text);
+    if (g->text.len) buf_append(&text, g->text.ptr, g->text.len);
+    thinking_state thinking = g->thinking;
+    size_t stop_scan_from = g->stop_scan_from;
+    size_t plain_stream_pos = g->plain_stream_pos;
+    bool greedy = g->parser->in_tool_call(probe, g);
+    uint32_t bits = base_emitted && greedy ? 1u : 0u;   /* row 0 follows a streamed base: the state as it stands */
+    int row = base_emitted ? 1 : 0;
+    bool live = true;
+    for (int i = 0; i < n && row < 32; i++, row++) {
+        if (live && !pieces[i]) live = false;
+        if (live) {
+            buf_append(&text, pieces[i], piece_lens[i]);
+            size_t stop_pos = 0, stop_len = 0;
+            bool hit_stop = false;
+            const size_t upto = gen_release(&req->stops, text.ptr, text.len, pieces[i], piece_lens[i],
+                                            plain_stream_pos, &thinking, &stop_scan_from, &hit_stop, &stop_pos,
+                                            &stop_len);
+            if (hit_stop) {
+                live = false;
+            } else {
+                if (gen_streams_plain(g) && upto > plain_stream_pos) plain_stream_pos = upto;
+                g->parser->probe_feed(probe, g, text.ptr, text.len, upto);
+                greedy = g->parser->in_tool_call(probe, g);
+            }
+        }
+        if (greedy) bits |= 1u << row;
+    }
+    buf_free(&text);
+    g->parser->probe_free(probe);
+    return bits;
+}
+
+/* gen_spec_greedy_rows_text over the round's token ids (the engine's texts and stop set). */
+uint32_t gen_spec_greedy_rows(server *s, const gen_state *g, const int *toks, int n, bool base_emitted) {
+    if (!gen_tool_override_varies(g)) return 0u;
+    char *pieces[PULSAR_SPEC_LOGITS_ROWS + 1] = {};
+    size_t lens[PULSAR_SPEC_LOGITS_ROWS + 1] = {};
+    if (n > (int)PULSAR_SPEC_LOGITS_ROWS + 1) pulsar_die("gen_spec_greedy_rows: more tokens than a round's rows");
+    for (int i = 0; i < n; i++) {
+        pieces[i] = pulsar_token_is_stop(s->engine, toks[i]) ? NULL : pulsar_token_text(s->engine, toks[i], &lens[i]);
+    }
+    const uint32_t bits = gen_spec_greedy_rows_text(g, pieces, lens, n, base_emitted);
+    for (int i = 0; i < n; i++) free(pieces[i]);
+    return bits;
+}
 
 
 /* Emit one already-decoded token into the response stream: append it to the
@@ -1339,37 +1453,13 @@ bool server::gen_emit_token(session_slot *sl, int token) {
                    "distribution after %d tokens; logprobs dropped for this request",
                    g->ctx_span, g->completion);
     }
-    const bool was_thinking = g->thinking.inside;
-    g->thinking.feed(piece, piece_len);
-    /* L077 (stop-in-reasoning): client stop sequences describe the VISIBLE
-     * answer, not the reasoning stream -- matching them inside <think>
-     * truncates mid-block and, with no </think> ever emitted, the finish
-     * parse routes everything to reasoning_content and the client gets an
-     * empty answer. Suppress matching while inside, and on the close jump
-     * the scan to the start of the closing piece (the tracker reports no
-     * byte offset, so at most the think-tail bytes of that one piece stay
-     * scannable -- the conservative side of the boundary). */
-    if (was_thinking && !g->thinking.inside) {
-        const size_t close_base = g->text.len - piece_len;
-        if (g->stop_scan_from < close_base) g->stop_scan_from = close_base;
-    }
-
     size_t stop_pos = 0, stop_len = 0;
-    bool hit_stop = !g->thinking.inside &&
-                    stop_list_find_from(&j->req.stops, g->text.ptr,
-                                        g->stop_scan_from,
-                                        &stop_pos, &stop_len);
-    size_t stream_len = hit_stop ?
-        stop_pos : stop_list_stream_safe_len(&j->req.stops, g->text.len);
-    if (stream_len > g->text.len) stream_len = g->text.len;
-    stream_len = utf8_stream_safe_len(g->text.ptr, g->plain_stream_pos,
-                                      stream_len, hit_stop);
-    if (!hit_stop && j->req.stops.max_len > 1) {
-        const size_t hold = j->req.stops.max_len - 1;
-        g->stop_scan_from = g->text.len > hold ? g->text.len - hold : 0;
-    }
+    bool hit_stop = false;
+    const size_t stream_len = gen_release(&j->req.stops, g->text.ptr, g->text.len, piece, piece_len,
+                                          g->plain_stream_pos, &g->thinking, &g->stop_scan_from,
+                                          &hit_stop, &stop_pos, &stop_len);
 
-    if (j->req.stream && !g->structured_stream && stream_len > g->plain_stream_pos) {
+    if (gen_streams_plain(g) && stream_len > g->plain_stream_pos) {
         char *delta = xstrndup(g->text.ptr + g->plain_stream_pos, stream_len - g->plain_stream_pos);
         bool ok = sse_chunk(j->fd, &j->req, g->id, delta, NULL);
         free(delta);

@@ -636,6 +636,14 @@ typedef struct server_output_parser_ops {
     /** The turn's final reading (repair, parse, ids, the family's own retry and memory).  false = a
      *  client write failed while finishing the stream. */
     bool (*finish)(void *st, server *s, struct session_slot *sl, struct gen_state *g, server_turn *out);
+    /** L296 toolsample: a SCRATCH copy of the decode-time tracking `in_tool_call` reads, so the spec lane can read
+     *  the greedy region at every position of a round before any of it is emitted (gen_spec_greedy_rows).
+     *  `in_tool_call` reads a probe as it reads the state; nothing else does. */
+    void *(*probe_new)(const void *st);
+    /** Advance a probe as `feed` advances the state (no sink, no events kept): `text` (len bytes) is the
+     *  generated text with the round's tokens so far appended, `upto` the bytes the stop-string scan released. */
+    void (*probe_feed)(void *probe, const struct gen_state *g, const char *text, size_t len, size_t upto);
+    void (*probe_free)(void *probe);
 } server_output_parser_ops;
 extern const server_output_parser_ops k_parser_deepseek;
 /** The table for a chat format (every format has one), and for the loaded engine's. */
@@ -2395,6 +2403,9 @@ bool parser_kit_in_tool_call(const void *st, const struct gen_state *g);
 bool parser_kit_turn_complete(const void *st, const struct gen_state *g);
 void parser_kit_tool_progress(const void *st, bool *opened, bool *closed);
 bool parser_kit_finish(void *st, server *s, struct session_slot *sl, struct gen_state *g, server_turn *out);
+void *parser_kit_probe_new(const void *st);
+void parser_kit_probe_feed(void *probe, const struct gen_state *g, const char *text, size_t len, size_t upto);
+void parser_kit_probe_free(void *probe);
 
 /** Everything one in-flight generation needs, for the whole life of the
  * request.
@@ -3132,6 +3143,20 @@ void gen_resolve_sampling_decode(const gen_state *g, float *temperature,
                                  int *top_k, float *top_p, float *min_p);
 void gen_resolve_sampling(const request *req, float *temperature,
                           int *top_k, float *top_p, float *min_p);
+/** L296: gen_resolve_sampling_decode's tool-call override at every position of a speculative round (bit i = verify
+ *  row i draws greedy; pulsar_spec_step::greedy_rows), read off a scratch copy of the decode-time state.  `toks` (n)
+ *  = the round's tokens not yet streamed: the base unless `base_emitted`, then the drafts. */
+uint32_t gen_spec_greedy_rows(server *s, const gen_state *g, const int *toks, int n, bool base_emitted);
+/** The same over the tokens' texts (NULL = a stop token): the probe itself, engine-free (server tests). */
+uint32_t gen_spec_greedy_rows_text(const gen_state *g, const char *const *pieces, const size_t *piece_lens, int n,
+                                   bool base_emitted);
+/** The emit path's byte release (gen_emit_token's; the probe's on copies): returns the bytes of `text` the
+ *  stop-string scan releases after `text` grew by `piece`. */
+size_t gen_release(const stop_list *stops, const char *text, size_t len, const char *piece, size_t piece_len,
+                   size_t plain_stream_pos, thinking_state *thinking, size_t *stop_scan_from,
+                   bool *hit_stop, size_t *stop_pos, size_t *stop_len);
+/** The request streams g->text raw as it is released. */
+bool gen_streams_plain(const gen_state *g);
 /* OpenAI logprobs ledger (generate.cpp).  capture_* records the distribution a
  * token was DRAWN from; logprob_commit binds it to that token as it is emitted
  * and returns false if a capture was missing (the ledger then reports nothing
