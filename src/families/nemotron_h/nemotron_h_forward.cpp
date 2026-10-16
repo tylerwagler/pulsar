@@ -588,7 +588,25 @@ bool stage(const pulsar_driver_step *st0, uint64_t *graph_key) {
         if (st->tokens[r] < 0 || (uint32_t)st->tokens[r] >= s.n_vocab) return fail("a token id outside the vocabulary");
     uint32_t bound = 0;
     if (!build_tables(st) || !plan_attention(st, &bound)) return false;
-    *graph_key = 0x4E480000ull | ((uint64_t)bound << 20) | 1u;
+    uint64_t key = 0x4E480000ull | ((uint64_t)bound << 20) | 1u;
+    /* L296 fullspec: a verify step's launches also read its run structure -- the row-kind cut, the Mamba-2 calls'
+     * sequence counts, row splits and longest runs, and every attention call's shape -- so they are its key too (a
+     * decode step's follow from its row count: one sequence a row) */
+    if (st->verify) {
+        const nh_state *q = st->st;
+        auto mix = [](uint64_t h, uint64_t v) {
+            h ^= v + 0x9e3779b97f4a7c15ull + (h << 6) + (h >> 2);
+            h = (h ^ (h >> 30)) * 0xbf58476d1ce4e5b9ull;
+            return h ^ (h >> 27);
+        };
+        key = mix(mix(mix(key, st->n_dec), mix(q->n_seq, q->n_seq_cap)), mix(q->rows_cap, mix(q->max_run_a, q->max_run_b)));
+        for (uint32_t k = 0; k < q->n_attn; k++) {
+            const pulsar_gqa_call &c = q->attn_call[k];
+            key = mix(key, mix(mix(c.n_rows, c.n_tiles), mix(mix(c.grid_chunks, c.ctx_bound), (uint64_t)c.fold)));
+        }
+        key |= 1u;
+    }
+    *graph_key = key;
     return true;
 }
 

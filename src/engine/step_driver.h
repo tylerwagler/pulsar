@@ -183,10 +183,12 @@ typedef struct pulsar_driver_ops {
      *  attention descriptors), run by the driver before the step's launches on every step.  A family that supplies
      *  it makes embed, every block and the head LAUNCH-ONLY: their launches read the device and the step's shape,
      *  nothing a step's host values decide.  *graph_key = what those launches depend on beyond the driver's own key
-     *  (the session's buffers, the row count), nonzero; 0 = this step's launches must run eager.  A DECODE step
-     *  with a key runs its launches as ONE captured CUDA graph per key (pulsar_gpu_seg_*), replayed after; the
-     *  launches are the same either way, so the bytes are (nemotron-fwd-gate X7: graphed == eager).  NULL = the
-     *  ops upload as they go and every step runs eager. */
+     *  (the session's buffers, the step's kind, the row count, the head list), nonzero; 0 = this step's launches
+     *  must run eager.  A DECODE step, or a pure verify step (every row a verify row; the key must then carry the
+     *  step's run structure too), with a key runs its launches as ONE captured CUDA graph per key
+     *  (pulsar_gpu_seg_*), replayed after; the launches are the same either way, so the bytes are (nemotron-fwd-gate
+     *  X7: graphed == eager; mtp-spec-gate on the verify lane).  NULL = the ops upload as they go and every step
+     *  runs eager. */
     bool (*stage)(const pulsar_driver_step *st, uint64_t *graph_key);
 } pulsar_driver_ops;
 
