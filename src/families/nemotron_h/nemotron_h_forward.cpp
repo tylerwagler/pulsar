@@ -964,6 +964,7 @@ const pulsar_mtp_ops k_mtp_ops = {
     /* .stage_save    = */ NULL,   /* the module's state is its K|V pool: position-addressed, nothing to undo */
     /* .stage_restore = */ NULL,
     /* .prefetch      = */ NULL,
+    /* .row_exact     = */ true,   /* the trunk's blocks at their decode arms (M3: the drafter slot byte-exact) */
 };
 
 /* The card's draft depth: "3-5" (vLLM's recipe drafts 3 on 4 x H100, 5 on GB200).  A session starts at 3 and the

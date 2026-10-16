@@ -1141,6 +1141,10 @@ static const pulsar_mtp_ops k_qwen_mtp = {
     /* .stage_save    = */ qwen_mtp_stage_save,
     /* .stage_restore = */ qwen_mtp_stage_restore,
     /* .prefetch      = */ qwen_mtp_prefetch,
+    /* .row_exact     = */ false,   /* L296 N9 (mtp_spec_gate M3): the combine's fc_hidden runs the MXFP8 linear over
+                                     * the step's n x 4 stream rows -- the rows kernel up to 16 rows, the tensor-core
+                                     * GEMM past them (a step of 5+ module rows) -- so a module row's K|V differs in a
+                                     * few E4M3 values with the rows beside it: drafts move, the output never does */
 };
 static_assert(PULSAR_QWEN_HEAD_ROWS_MAX == PULSAR_DRIVER_HEADS_MAX, "the lane's lockstep rows are the draft head's");
 

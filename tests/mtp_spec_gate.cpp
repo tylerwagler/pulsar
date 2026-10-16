@@ -19,7 +19,8 @@
  *       kept), up to 15 deep, so each round's commit rolls the verify back to a planned row: the Mamba SSM state
  *       (DELTA), its conv tail (SNAPSHOT), the attention K|V (POOL, position-addressed) and the drafter's slot (its
  *       K|V and the parked row) must be the plain twin's byte for byte at the end -- every trunk slot's resident
- *       state and every pool row the stream wrote, then the drafter's -- and four decode steps after == the twin's
+ *       state and every pool row the stream wrote, then the drafter's (asserted when the family declares its module
+ *       row-exact, pulsar_mtp_ops::row_exact; reported otherwise) -- and four decode steps after == the twin's
  *   M4  the batched lane (the server's round API): four banks' streams in shared verify steps (assemble, one
  *       decode_mixed with every row headed, round_end, ONE redraft pass, commit) == each bank's plain stream, greedy
  *
@@ -226,8 +227,17 @@ static std::string state_diff(const std::vector<state_piece> &a, const std::vect
     *bytes = 0;
     for (const state_piece &p : a) *bytes += p.bytes.size();
     if (a.empty() || a.size() != b.size()) return "the state did not read";
-    for (size_t i = 0; i < a.size(); i++)
-        if (a[i].name != b[i].name || a[i].bytes != b[i].bytes) return a[i].name;
+    for (size_t i = 0; i < a.size(); i++) {
+        if (a[i].name != b[i].name || a[i].bytes.size() != b[i].bytes.size()) return a[i].name;
+        size_t at = 0, last = 0, n = 0;
+        for (size_t x = 0; x < a[i].bytes.size(); x++)
+            if (a[i].bytes[x] != b[i].bytes[x]) {
+                if (n++ == 0) at = x;
+                last = x;
+            }
+        if (n) return a[i].name + " (" + std::to_string(n) + " bytes from offset " + std::to_string(at) + " to " +
+                      std::to_string(last) + " of " + std::to_string(a[i].bytes.size()) + ")";
+    }
     return "";
 }
 
@@ -351,8 +361,12 @@ static int exact(pulsar_engine *e, int n, const char *only) {
                   tdiff.empty() ? "" : "; differs: ", tdiff.c_str());
             const std::string ddiff = state_diff(bank_state(sp_s, 0, p->n_trunk, p->n_slots, len - 1u),
                                                  bank_state(tw, 0, p->n_trunk, p->n_slots, len - 1u), &nd);
-            CHECK(ddiff.empty(), "M3 prompt %zu: the drafter's slot (its pool rows and the parked row) == the plain twin's, "
-                  "byte for byte (%zu bytes%s%s)", i, nd, ddiff.empty() ? "" : "; differs: ", ddiff.c_str());
+            if (sp_s->driver->mtp->ops->row_exact)
+                CHECK(ddiff.empty(), "M3 prompt %zu: the drafter's slot (its pool rows and the parked row) == the plain "
+                      "twin's, byte for byte (%zu bytes%s%s)", i, nd, ddiff.empty() ? "" : "; differs: ", ddiff.c_str());
+            else   /* the family declares its module rows row-count dependent (pulsar_mtp_ops::row_exact): graded */
+                printf("  info  M3 prompt %zu: the drafter's slot vs the plain twin's (%zu bytes): %s (the module is not "
+                       "row-exact by declaration)\n", i, nd, ddiff.empty() ? "byte-identical" : ddiff.c_str());
             const std::vector<std::vector<float>> ga = decode4(sp_s, W), gb = decode4(tw, W);
             CHECK(ga.size() == 4 && ga == gb, "M3 prompt %zu: four decode steps after == the twin's, byte for byte", i);
         }

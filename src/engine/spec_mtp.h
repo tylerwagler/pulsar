@@ -96,6 +96,11 @@ typedef struct pulsar_mtp_ops {
      *  call of a chain (`chain_start`) the carry (and a copy chain's drafts), then each draft (Qwen: the PLE rows'
      *  page-cache prefetch, its n-gram context advanced along the chain). */
     void (*prefetch)(pulsar_session *s, uint32_t bank, const int32_t *ids, uint32_t n, bool chain_start);
+    /** A module row's bytes are the same whatever rows share its step (every op of the module step at an
+     *  M-independent arm), so the drafter slot a speculative stream leaves is the plain stream's byte for byte
+     *  (tests/mtp_spec_gate M3 holds the family to it; false = graded there, not asserted -- it moves drafts only,
+     *  never an emitted token). */
+    bool row_exact;
 } pulsar_mtp_ops;
 
 /** L296 N9: a diagnostic -- while armed, every lockstep module step (pulsar_mtp_absorb) heads its rows (at most
