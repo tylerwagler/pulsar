@@ -132,10 +132,13 @@ static int uponly_section(void) {
             CUDA_OK(cudaDeviceSynchronize());
             std::vector<uint16_t> mb2(mb.size());
             CUDA_OK(cudaMemcpy(mb2.data(), d_mb2, mb2.size() * 2, cudaMemcpyDeviceToHost));
-            CHECK(rc == 0 && keep.splits > 1 && mb == mb2,
-                  "up-only fold K=%g: the split partials (%d) and the summed z emit different mids (rc=%d)", k2 / 2.0,
-                  keep.splits, rc);
-            printf("  up-only fold K=%g: fed %d split partials == fed the summed z, bit for bit\n", k2 / 2.0, keep.splits);
+            /* the decode arm's split count is a function of K alone: at the latent's K = 1024 it is one split, so
+             * this proves the fold reads the arm's own plane exactly (the multi-split sum is the V4.1 section's) */
+            CHECK(rc == 0 && keep.splits >= 1 && mb == mb2,
+                  "up-only fold K=%g: the decode arm's partials (%d) and the summed z emit different mids (rc=%d)",
+                  k2 / 2.0, keep.splits, rc);
+            printf("  up-only fold K=%g: fed the decode arm's partials (%d split at in %d) == fed the summed z, bit for "
+                   "bit\n", k2 / 2.0, keep.splits, K);
             cudaFree(d_mb2);
         }
 
