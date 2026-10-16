@@ -1712,6 +1712,8 @@ static pulsar_seg_ent g_seg[PULSAR_SEG_SLOTS];
 static int g_seg_capturing = 0;
 
 static uint64_t g_seg_n_replay, g_seg_n_capture, g_seg_n_eager;
+/* L296 perf: an instrument's eager reference (pulsar_gpu_seg_set_enabled) -- never set by the engine */
+static int g_seg_off = 0;
 
 static pulsar_seg_ent *seg_find(uint64_t key) {
     uint32_t h = (uint32_t)((key * 1099511628211ull) >> 33) % PULSAR_SEG_SLOTS;
@@ -1731,7 +1733,7 @@ int pulsar_gpu_seg_enter(uint64_t key) {
     /* L119: always on (the PULSAR_CUDA_GRAPH_SEG dev gate and its bisect
      * values died with the FFN segments — the losing variant is deleted,
      * the head segment ships default-on). */
-    if (g_seg_capturing || key == 0) return 0;
+    if (g_seg_capturing || key == 0 || g_seg_off) return 0;
     pulsar_seg_ent *e = seg_find(key);
     if (!e || e->dead) return 0;
     if (e->exec) {
@@ -1787,6 +1789,15 @@ void pulsar_gpu_seg_reset(void) {
         g_seg[i].dead = 0;
     }
     g_seg_reset_pending = 0;
+}
+
+/* L296 perf: an instrument runs the same steps with the segment cache off (every segment eager, nothing captured or
+ * replayed) to compare the graphed lane against; returns the previous setting.  Turning it off drops the cache. */
+int pulsar_gpu_seg_set_enabled(int on) {
+    const int was = !g_seg_off;
+    g_seg_off = on ? 0 : 1;
+    if (g_seg_off) pulsar_gpu_seg_reset();
+    return was;
 }
 
 /* L292: the counters an instrument reads to prove which lane it ran (replays served, captures begun since start). */
