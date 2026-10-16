@@ -1052,6 +1052,13 @@ MTP_GATE_TOKENS ?= 256
 .PHONY: mtp-spec-gate
 mtp-spec-gate: tests/mtp_spec_gate
 	./tests/mtp_spec_gate $(MTP_GATE_MODEL) $(MTP_GATE_TOKENS)
+# L298: the same gate on a container whose drafter is the LiLiCorr block drafter (spec_block.h): spec == plain greedy
+# and seeded-sampled, the forced-reject stress (the drafter's context rings == the plain twin's), the batched lane and
+# toolsample's per-position modes.
+LILICORR_GATE_MODEL ?= /srv/models/nemotron35-k4-lilicorr-pulsar
+.PHONY: lilicorr-spec-gate
+lilicorr-spec-gate: tests/mtp_spec_gate
+	./tests/mtp_spec_gate $(LILICORR_GATE_MODEL) $(MTP_GATE_TOKENS)
 # ... and its draft grade: the MTP module's first-step logits at every position of capture_ref.py's prompt, the engine's
 # DECODE and PROMPT paths (mtp_spec_gate probe), against transformers' modules on the fp32 trunk
 # (tools/nemotron/capture_mtp_ref.py) with transformers' own bf16 beside it (the floor); PASS within 2x the floor's KL.
