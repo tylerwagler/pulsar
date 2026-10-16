@@ -22,6 +22,12 @@
  *                                 the streamed events consistent with the reading
  *   P2 output parser corpus       every assistant turn of the corpus as sampled: vLLM's reading, sha1 per
  *                                 file, three chunkings   (--cases)
+ *   S1 live pieces (E6)           the server's suffix hooks and the engine's chat front are the renderer's
+ *                                 own writer: prompt + sampled turn + tail == the full render at every
+ *                                 assistant turn of the corpus; the parser's raw span of a turn's calls is
+ *                                 the call-block finder's key where the turn sits; a raw replay of a
+ *                                 canonical turn is that turn; hand cases for the finder and the refusals
+ *                                 (corpus with --cases)
  *
  * usage: inkling_chat_gate --tok DIR --vectors DIR [--cases DIR] [--calib FILE]
  *        DIR = the checkpoint's tiktoken/tokenizer.model, tokenizer.json, tokenizer_config.json,
@@ -506,6 +512,197 @@ static void p2_corpus(const std::string &dir, const std::string &cases_dir) {
            "chunking; %d mismatched\n", files, turns, with_calls, bad);
 }
 
+/* ---- S1: the pieces a live conversation appends (L294 E6: the server's suffix hooks, the engine's chat front) -- */
+
+static std::string render_n(const conv &c, int n, int effort, bool gen, bool *ok) {
+    inkling_render_in in;
+    in.msgs = c.msgs.data();
+    in.n_msgs = n;
+    in.tools_json = c.has_tools ? c.tools.c_str() : NULL;
+    in.effort = effort;
+    in.add_generation_prompt = gen;
+    inkling_render_out out;
+    char err[400];
+    *ok = inkling_chat_render(in, &out, err, sizeof err);
+    return out.text;
+}
+
+/* One conversation: at every assistant message j, the prompt before it + the turn as sampled + the piece up to
+ * the next assistant message == the full render through that piece; the parser's raw span of the sampled turn is
+ * the call-block finder's key, found where the turn sits in the transcript; and the turn replayed from those
+ * bytes renders exactly as the canonical turn.  Returns the compositions checked; `why` = the first failure. */
+static int g_s1_keyed = 0;   /* tool-call turns whose raw span was keyed and replayed */
+
+static int s1_conversation(const conv &c, int effort, std::string *why) {
+    const int n = (int)c.msgs.size();
+    int checked = 0;
+    for (int j = 0; j < n && why->empty(); j++) {
+        const inkling_msg_in &a = c.msgs[(size_t)j];
+        if (!a.role || strcmp(a.role, "assistant")) continue;
+        int k = j + 1;
+        while (k < n && strcmp(c.msgs[(size_t)k].role ? c.msgs[(size_t)k].role : "", "assistant")) k++;
+        bool ok_full = false, ok_prefix = false;
+        const std::string full = render_n(c, k, effort, true, &ok_full);
+        const std::string prefix = render_n(c, j, effort, true, &ok_prefix);
+        if (!ok_full) continue;   /* a refusal: R1 / R2 grade those */
+        inkling_render_out turn, tail;
+        char err[400];
+        if (!inkling_chat_render_assistant_turn(a, &turn, err, sizeof err)) {
+            if (!strncmp(err, "empty_turn", 10)) continue;
+            *why = std::string("assistant turn refused: ") + err;
+            break;
+        }
+        const bool calls = a.n_calls > 0;
+        if (!inkling_chat_render_turn(c.msgs.data(), k, j + 1, calls, true, &tail, err, sizeof err)) {
+            *why = std::string("tail refused: ") + err;
+            break;
+        }
+        if (!ok_prefix || prefix + turn.text + tail.text != full) {
+            *why = "prefix + turn + tail != the full render at message " + std::to_string(j);
+            break;
+        }
+        /* the spans shift with the cut: every client byte of the full render is client in the pieces */
+        for (const pulsar_text_span &s : turn.spans)
+            if (s.hi > turn.text.size() || s.lo >= s.hi) *why = "a turn span outside the turn";
+        checked++;
+        if (!calls) continue;
+        /* the turn as the model sampled it: before its stop token (a call turn has none in its render) */
+        inkling_output_parser p;
+        p.init(OUT_HEADER);
+        std::vector<out_event> ev;
+        p.feed(turn.text.data(), turn.text.size(), &ev);
+        p.finish(&ev);
+        size_t lo = 0, hi = 0;
+        if (!p.raw_span(&lo, &hi) || (int)p.calls().size() != a.n_calls) {
+            if (p.errors() == 0) *why = "the parser read no calls back from the turn at message " + std::to_string(j);
+            continue;   /* a call the shared JSON body refuses (vLLM's too): no key */
+        }
+        const std::string raw = turn.text.substr(lo, hi - lo);
+        const char *end = NULL;
+        const char *key = inkling_find_call_block(raw.c_str(), &end);
+        if (key != raw.c_str() || end != raw.c_str() + raw.size()) {
+            *why = "the raw span is not one call-block run at message " + std::to_string(j);
+            break;
+        }
+        const std::string live = prefix + turn.text;
+        const char *at = inkling_find_call_block(live.c_str() + prefix.size() - strlen("<|message_model|>"), &end);
+        if (!at || std::string(at, (size_t)(end - at)) != raw || (size_t)(at - live.c_str()) != prefix.size() + lo) {
+            *why = "the finder does not key the turn's calls in the transcript at message " + std::to_string(j);
+            break;
+        }
+        inkling_msg_in replay = a;
+        replay.raw_calls = raw.c_str();
+        inkling_render_out again;
+        if (!inkling_chat_render_assistant_turn(replay, &again, err, sizeof err) || again.text != turn.text) {
+            *why = "the raw replay of a canonical turn differs from it at message " + std::to_string(j);
+            break;
+        }
+        g_s1_keyed++;
+    }
+    return checked;
+}
+
+static void s1_hand(void) {
+    /* the sampled bytes replay verbatim (a spelling the canonical render would normalise), in the full render
+     * and the sampled turn alike; text sampled between two calls is no run, so that turn renders canonically */
+    const inkling_tool_call_in calls[2] = {{"c1", "get_weather", "{\"city\": \"Paris\"}"},
+                                           {"c2", "get_weather", "{\"city\":\"Rome\"}"}};
+    const std::string raw = "get_weather<|content_invoke_tool_json|>{\"name\": \"get_weather\", \"args\": {\"city\": "
+                            "\"Paris\"}}<|end_message|><|message_model|>get_weather<|content_invoke_tool_json|>"
+                            "{\"name\":\"get_weather\",\"args\":{\"city\":\"Rome\"}}<|end_message|>";
+    inkling_msg_in a = {};
+    a.role = "assistant";
+    a.reasoning = "Both.";
+    a.calls = calls;
+    a.n_calls = 2;
+    a.raw_calls = raw.c_str();
+    inkling_render_out turn;
+    char err[300];
+    CHECK(inkling_chat_render_assistant_turn(a, &turn, err, sizeof err) &&
+              turn.text == "<|content_thinking|>Both.<|end_message|><|message_model|>" + raw,
+          "S1: the sampled turn with raw calls is %s", turn.text.c_str());
+    const char *end = NULL;
+    const char *k = inkling_find_call_block(turn.text.c_str(), &end);
+    CHECK(k && std::string(k, (size_t)(end - k)) == raw, "S1: the finder keys the raw run in the turn");
+    CHECK(inkling_find_call_block(end, &end) == NULL, "S1: nothing after the run");
+    const std::string between = "get_weather<|content_invoke_tool_json|>{\"name\":\"get_weather\",\"args\":{}}"
+                                "<|end_message|><|message_model|><|content_text|>and<|end_message|><|message_model|>"
+                                "get_weather<|content_invoke_tool_json|>{\"name\":\"get_weather\",\"args\":{}}"
+                                "<|end_message|>";
+    k = inkling_find_call_block(between.c_str(), &end);
+    CHECK(k == between.c_str() && end < between.c_str() + between.size(), "S1: text between calls ends the run");
+    a.raw_calls = between.c_str();
+    CHECK(inkling_chat_render_assistant_turn(a, &turn, err, sizeof err) && turn.text.find("and") == std::string::npos &&
+              turn.text.find("{\"name\":\"get_weather\",\"args\":{\"city\":\"Paris\"}}") != std::string::npos,
+          "S1: a raw span that is not one run renders canonically");
+    CHECK(inkling_find_call_block("x<|message_model|>a<|content_invoke_tool_json|>{", &end) == NULL,
+          "S1: an unclosed block is no key");
+    CHECK(inkling_find_call_block("<|message_user|>a<|content_invoke_tool_json|>{}<|end_message|>", &end) == NULL,
+          "S1: a call kind after another role's marker is no key");
+    /* refusals */
+    inkling_msg_in empty = {};
+    empty.role = "assistant";
+    CHECK(!inkling_chat_render_assistant_turn(empty, &turn, err, sizeof err) && !strncmp(err, "empty_turn", 10),
+          "S1: an empty turn has no sampled render");
+    inkling_msg_in noc = {};
+    noc.role = "assistant";
+    noc.content = "x";
+    noc.raw_calls = raw.c_str();
+    CHECK(!inkling_chat_render_assistant_turn(noc, &turn, err, sizeof err) && !strncmp(err, "raw_calls_without_calls", 23),
+          "S1: raw calls without calls refuse");
+    CHECK(!inkling_chat_render_turn(NULL, 0, 0, false, false, &turn, err, sizeof err), "S1: an empty piece refuses");
+    CHECK(inkling_chat_render_turn(NULL, 0, 0, true, false, &turn, err, sizeof err) &&
+              turn.text == "<|content_model_end_sampling|>", "S1: the close alone");
+    /* a tail's tool result is authored by the call it answers, named in a message before the tail */
+    inkling_msg_in two[2] = {};
+    two[0].role = "assistant";
+    two[0].calls = calls;
+    two[0].n_calls = 2;
+    two[1].role = "tool";
+    two[1].content = "22C";
+    two[1].tool_call_id = "c2";
+    CHECK(inkling_chat_render_turn(two, 2, 1, true, true, &turn, err, sizeof err) &&
+              turn.text == "<|content_model_end_sampling|><|message_tool|>get_weather<|content_text|>22C<|end_message|>"
+                           "<|message_model|>",
+          "S1: the tail is %s", turn.text.c_str());
+}
+
+static void s1_corpus(const std::string &dir, const std::string &cases_dir) {
+    std::string tsv;
+    if (!read_file(dir + "/render_corpus.tsv", &tsv)) { fail("S1: no render_corpus.tsv"); return; }
+    int files = 0, convs = 0, checked = 0, bad = 0;
+    std::string last;
+    for (size_t pos = 0; pos < tsv.size();) {
+        const size_t nl = tsv.find('\n', pos);
+        const std::string line = tsv.substr(pos, nl - pos);
+        pos = nl + 1;
+        char file[256], cfg[4];
+        if (line.empty() || line[0] == '#' || sscanf(line.c_str(), "%255s\t%3s", file, cfg) != 2) continue;
+        if (last == file) continue;   /* one pass a file (the two configurations render the same messages) */
+        last = file;
+        const pyjson_value cases = load_json(cases_dir + "/" + file);
+        for (size_t idx = 0; idx < cases.a.size(); idx++) {
+            const pyjson_value &c = cases.a[idx];
+            conv cv;
+            const pyjson_value *tools = c.get("tools");
+            build_conv(*c.get("messages"), tools && tools->kind == pyjson_value::ARR && !tools->a.empty() ? tools : NULL,
+                       &cv);
+            std::string why;
+            checked += s1_conversation(cv, (int)(idx % 3) * 45, &why);   /* efforts 0, 45, 90 */
+            convs++;
+            g_checks++;
+            if (!why.empty()) {
+                bad++;
+                fail("S1 %s case %zu: %s", file, idx, why.c_str());
+            }
+        }
+        files++;
+    }
+    printf("S1 live pieces: %d files, %d conversations, %d turns composed (prompt + sampled turn + tail == full "
+           "render), %d tool-call turns keyed (raw span == the finder's key; raw replay == canonical), %d failed\n", files,
+           convs, checked, g_s1_keyed, bad);
+}
+
 int main(int argc, char **argv) {
     std::string tok_dir, vec_dir, cases_dir, calib;
     for (int i = 1; i < argc; i++) {
@@ -546,11 +743,13 @@ int main(int argc, char **argv) {
     else printf("T4 corpus: SKIPPED (no --calib)\n");
     r1_hand(t, vec_dir);
     p1_units(vec_dir);
+    s1_hand();
     if (!cases_dir.empty()) {
         r2_corpus(t, vec_dir, cases_dir);
         p2_corpus(vec_dir, cases_dir);
+        s1_corpus(vec_dir, cases_dir);
     } else {
-        printf("R2 render corpus / P2 parser corpus: SKIPPED (no --cases)\n");
+        printf("R2 render corpus / P2 parser corpus / S1 live pieces: SKIPPED (no --cases)\n");
     }
     bpe_tokenizer_free(t);
     printf("\ninkling_chat_gate: %d checks, %d failed -- %s\n", g_checks, g_fail, g_fail ? "FAIL" : "PASS");

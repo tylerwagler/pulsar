@@ -18,7 +18,9 @@
  *     between a role marker and a content-kind marker) buffers its text, which a transition either drops or
  *     sends as content (OUT_ACT_HEADER_TEXT), and the turn's end sends as content;
  *   - entering CALL opens a call and leaving it closes one; the call's bytes from the marker that opened it
- *     (or from the header that preceded it) to the marker that closed it are the tool memory's key. */
+ *     (or from the text of the header that preceded it -- past the header's own role marker, so a call's key
+ *     reads the same whether it is the turn's first block, after the generation prompt's marker, or a later
+ *     one) to the marker that closed it are the tool memory's key. */
 #pragma once
 
 #include <stddef.h>
@@ -201,7 +203,7 @@ private:
     std::string hold_;         ///< bytes not yet classified
     size_t fed_ = 0;           ///< bytes fed so far; hold_ is the stream's unclassified tail
     std::string header_;       ///< HEADER's buffered text
-    size_t header_at_ = 0;     ///< stream offset where the current header started
+    size_t header_at_ = 0;     ///< stream offset of the current header's text (past the marker that opened it)
     bool block_seen_ = false;  ///< a call opened: raw_lo_ is set
     size_t raw_lo_ = 0;        ///< stream offset of the first call's bytes
     size_t raw_hi_ = 0;        ///< stream offset past the last call's closer

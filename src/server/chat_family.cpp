@@ -7,8 +7,9 @@
  * the resolved mode), then the prompt.  DeepSeek renders its own template (prompt_render.cpp) with its
  * tool memory, live-continuation suffixes and forced-call prefill; Qwen renders HF's template
  * (src/lib/qwen_chat) with the same memory, continuations and prefill behind its own hooks (L272 P3
- * step 4), and refuses by name what that template cannot express.  A new family adds one arm here; a
- * new protocol adds one parser and no arm. */
+ * step 4), and refuses by name what that template cannot express.  A new family adds one table -- in its own
+ * file (Inkling: family_inkling.cpp, over F5's src/lib/inkling_chat) -- and one case in
+ * server_family_for_format; a new protocol adds one parser and no arm. */
 #include "pulsar_server_internal.h"
 #include "deepseek_dsml.h"
 #include "../lib/qwen_chat.h"
@@ -41,8 +42,8 @@ void chat_conversation_control(chat_conversation *c, const char *key, char *raw)
  * lets the engine replace each rendered PULSAR_IMAGE_PLACEHOLDER with that
  * image's sentinel block, filling each start_pos.  A text-only request is left
  * untouched -- its sync path is pulsar_session_sync(). */
-static bool request_prepare_images(pulsar_engine *e, const chat_msgs *msgs,
-                                   request *r, char *err, size_t errlen) {
+bool request_prepare_images(pulsar_engine *e, const chat_msgs *msgs,
+                            request *r, char *err, size_t errlen) {
     int n = 0;
     for (int i = 0; i < msgs->len; i++) n += msgs->v[i].images_len;
     /* A request with no images and no placeholder text is the plain text path:
@@ -91,7 +92,7 @@ static bool request_prepare_images(pulsar_engine *e, const chat_msgs *msgs,
  * memory (the sampled call bytes onto the replayed calls, from RAM or a KV file's trailer; the family's
  * find_call_block and raw replay carry them) and the protocols' live continuations (their tails are the
  * family's tool_result_tail).  Parse-without-server (the renderer gate, the golden) has no memory. */
-static void render_prelude(server *s, chat_conversation *c, request *r) {
+void render_prelude(server *s, chat_conversation *c, request *r) {
     if (s) {
         s->kv_cache_restore_tool_memory_for_messages(&c->msgs);
         s->tool_memory_attach_to_messages(&c->msgs, &r->tool_replay);
@@ -108,7 +109,8 @@ static void render_prelude(server *s, chat_conversation *c, request *r) {
  * output_config.effort, chat_template_kwargs.reasoning_effort.  What each means is the loaded family's
  * effort map (server_effort_map, one row per family, declared with its other hooks below); "none" is
  * thinking off on every family. */
-static const char *const k_effort_names[] = {"none", "minimal", "low", "medium", "high", "xhigh", "max"};
+extern const char *const k_effort_names[CHAT_EFFORT_NAMES] = {"none", "minimal", "low", "medium", "high", "xhigh",
+                                                                "max"};
 static_assert(sizeof k_effort_names / sizeof k_effort_names[0] == CHAT_EFFORT_NAMES,
               "server_effort_map::named has one column per effort name");
 /* the rows the integer axis and the thinking rule name */
@@ -406,6 +408,24 @@ static char *qwen_take_render(qwen_render_out *out, chat_text_span **spans_out, 
     return xstrndup(out->text.data(), out->text.size());
 }
 
+/* The tools of a family whose template takes OpenAI's tools array (Qwen, Inkling): none with tool_choice none; an
+ * OpenAI request's array as sent (HF's / vLLM's input); else the conversation's schema lines -- every protocol's
+ * kinds and tool_search's loads, as for DeepSeek (L284) -- in OpenAI's shape.  r->tools_json stays NULL when there
+ * are none; false + err when the lines do not convert. */
+bool chat_openai_tools_json(const chat_conversation *c, request *r, char *err, size_t errlen) {
+    if (c->tool_choice == CHAT_TOOL_CHOICE_NONE) return true;
+    if (r->api == API_OPENAI && c->tools_raw) {
+        r->tools_json = xstrdup(c->tools_raw);
+        return true;
+    }
+    buf lines = {0};
+    conversation_tool_schema_lines(c, &lines);
+    if (lines.len) r->tools_json = tool_schema_lines_openai_tools(lines.ptr, lines.len, err, errlen);
+    const bool failed = lines.len && !r->tools_json;
+    buf_free(&lines);
+    return !failed;
+}
+
 /* HF's apply_chat_template byte for byte (qwen_chat_render, with the L223 client-span map), tokenised
  * with the family's markers; the tools in the template's shape, typed for the output parser.  A forced
  * tool_choice prefills the turn into an open <tool_call> (qwen_forced_call_prefill); a tool-result-only
@@ -415,18 +435,7 @@ static char *qwen_take_render(qwen_render_out *out, chat_text_span **spans_out, 
  * array goes to the template as sent (HF's input). */
 static bool qwen_render(pulsar_engine *e, server *s, chat_conversation *c, request *r, char *err, size_t errlen) {
     const qwen_effort qe = (qwen_effort)r->family_effort;
-    if (c->tool_choice != CHAT_TOOL_CHOICE_NONE) {
-        if (r->api == API_OPENAI && c->tools_raw) {
-            r->tools_json = xstrdup(c->tools_raw);
-        } else {
-            buf lines = {0};
-            conversation_tool_schema_lines(c, &lines);
-            if (lines.len) r->tools_json = tool_schema_lines_openai_tools(lines.ptr, lines.len, err, errlen);
-            const bool failed = lines.len && !r->tools_json;
-            buf_free(&lines);
-            if (failed) return false;
-        }
-    }
+    if (!chat_openai_tools_json(c, r, err, errlen)) return false;
     r->has_tools = r->tools_json != NULL;
     render_prelude(s, c, r);
     std::vector<qwen_msg_in> qm;
@@ -741,6 +750,7 @@ const server_family_ops *server_family_for_format(pulsar_chat_format fmt) {
     case PULSAR_CHAT_DS4_V4:  return &k_family_deepseek_v4;
     case PULSAR_CHAT_DS4_V41: return &k_family_deepseek_v41;
     case PULSAR_CHAT_QWEN:    return &k_family_qwen;
+    case PULSAR_CHAT_INKLING: return &k_family_inkling;
     }
     pulsar_die("server_family_for_format: a chat format without a server family table");
     return NULL;   /* unreachable: pulsar_die exits */

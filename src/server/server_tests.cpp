@@ -3485,6 +3485,252 @@ static void test_qwen_tool_error_suffix_reminds_the_system_turn(void) {
 
 
 
+/* ---- L294 E6: Inkling's server table (family_inkling.cpp over src/lib/inkling_chat) ------------------------- */
+
+/* Render `msgs` with the Inkling family and no engine; `tools` = an OpenAI tools array (NULL = none).  The messages
+ * are TAKEN.  `r` (optional) receives the request for the hooks. */
+static char *inkling_test_full_render(chat_msgs *msgs, const char *tools, request *keep = NULL) {
+    chat_conversation c = {};
+    c.msgs = *msgs;
+    memset(msgs, 0, sizeof(*msgs));
+    c.tool_choice = CHAT_TOOL_CHOICE_AUTO;
+    if (tools) c.tools_raw = xstrdup(tools);
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    r.api = API_OPENAI;
+    char err[200] = {0};
+    const bool ok = render_chat_conversation(NULL, PULSAR_CHAT_INKLING, NULL, &c, &r, err, sizeof err);
+    if (!ok) fprintf(stderr, "inkling render refused: %s\n", err);
+    TEST_ASSERT(ok);
+    char *text = xstrdup(r.prompt_text ? r.prompt_text : "");
+    if (keep) *keep = r;
+    else request_free(&r);
+    chat_conversation_free(&c);
+    return text;
+}
+
+/* The one effort table: each name is the renderer's hundredths (vLLM's _NAMED_REASONING_EFFORT), an integer that
+ * many hundredths capped at 0.99, nothing sent 0.9; thinking off is effort 0 ("0.0"), on every protocol key. */
+static void test_inkling_effort_map(void) {
+    struct row { const char *effort; int centi; const char *text; };
+    static const row rows[] = {
+        {"\"none\"", 0, "0.0"},   {"\"minimal\"", 10, "0.1"}, {"\"low\"", 20, "0.2"}, {"\"medium\"", 70, "0.7"},
+        {"\"high\"", 90, "0.9"},  {"\"xhigh\"", 99, "0.99"},  {"\"max\"", 99, "0.99"}, {"37", 37, "0.37"},
+        {"5", 5, "0.05"},         {"100", 99, "0.99"},        {"null", 90, "0.9"},
+    };
+    char body[256], err[256], want[128];
+    request r;
+    for (const row &w : rows) {
+        snprintf(body, sizeof body, EFFORT_BODY(",\"reasoning_effort\":%s"), w.effort);
+        TEST_ASSERT(effort_case(PULSAR_CHAT_INKLING, body, &r, err, sizeof err));
+        TEST_ASSERT(r.family_effort == w.centi);
+        TEST_ASSERT(r.think_mode == (w.centi == 0 ? PULSAR_THINK_NONE : PULSAR_THINK_DEFAULT));
+        snprintf(want, sizeof want, "<|message_system|><|content_text|>Thinking effort level: %s<|end_message|>", w.text);
+        TEST_ASSERT(r.prompt_text && strstr(r.prompt_text, want) == r.prompt_text);
+        request_free(&r);
+    }
+    TEST_ASSERT(effort_case(PULSAR_CHAT_INKLING, EFFORT_BODY(",\"chat_template_kwargs\":{\"enable_thinking\":false}"), &r,
+                            err, sizeof err));
+    TEST_ASSERT(r.family_effort == 0 && r.think_mode == PULSAR_THINK_NONE);
+    request_free(&r);
+    TEST_ASSERT(!effort_case(PULSAR_CHAT_INKLING, EFFORT_BODY(",\"think\":true,\"reasoning_effort\":\"none\""), &r, err,
+                             sizeof err));
+    request_free(&r);
+    TEST_ASSERT(effort_case(PULSAR_CHAT_INKLING, EFFORT_BODY(""), &r, err, sizeof err));
+    TEST_ASSERT(!strcmp(r.prompt_text, "<|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|>"
+                                       "<|message_user|><|content_text|>x<|end_message|><|message_model|>"));
+    TEST_ASSERT(r.prompt_n_spans == 1 && r.prompt_spans[0].hi - r.prompt_spans[0].lo == 1);
+    request_free(&r);
+}
+
+/* full(history) + assistant_turn_sampled + tool_result_tail == full(history + turn + results): the hooks are the
+ * renderer's own pieces (inkling-chat-gate S1 grades the same identity over the corpus). */
+static void test_inkling_hooks_compose_to_the_full_render(void) {
+    const char *reasoning = "Let me check both.";
+    chat_msgs prefix = {0}, full = {0};
+    for (chat_msgs *m : {&prefix, &full}) {
+        chat_msgs_push(m, qwen_test_msg("system", "Be terse."));
+        chat_msgs_push(m, qwen_test_msg("user", "Weather in Paris and Rome?"));
+    }
+    chat_msg a = qwen_test_msg("assistant", "Checking.\n");
+    a.reasoning = xstrdup(reasoning);
+    qwen_test_call(&a, "call_1", "get_weather", "{\"n\":2,\"city\":\"Paris\"}");
+    qwen_test_call(&a, "call_2", "get_weather", "{\"city\":\"Rome\"}");
+    chat_msgs_push(&full, a);
+    chat_msgs_push(&full, qwen_test_msg("tool", "18C"));
+    full.v[3].tool_call_id = xstrdup("call_1");
+    chat_msgs_push(&full, qwen_test_msg("tool", "  22C\n"));
+    full.v[4].tool_call_id = xstrdup("call_2");
+    chat_msgs_push(&full, qwen_test_msg("system", "Hurry."));   /* a mid-loop system message: a system block */
+
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    r.api = API_OPENAI;
+    r.family = server_family_for_format(PULSAR_CHAT_INKLING);
+    r.family_effort = 90;
+    r.think_mode = PULSAR_THINK_DEFAULT;
+    chat_text_span *turn_spans = NULL, *tail_spans = NULL;
+    uint32_t turn_n = 0, tail_n = 0;
+    char *turn = r.family->assistant_turn_sampled(&r, true, reasoning, "Checking.\n", &full.v[2].calls, &turn_spans,
+                                                  &turn_n);
+    char *tail = r.family->tool_result_tail(&r, &full, 3, &tail_spans, &tail_n);
+    TEST_ASSERT(turn && tail);
+    /* the turn starts after the generation prompt's <|message_model|> and stops at its last call, before the stop
+     * token; the tail supplies it */
+    TEST_ASSERT(turn && !strncmp(turn, "<|content_thinking|>Let me check both.<|end_message|>", 52));
+    TEST_ASSERT(turn && strlen(turn) > 15 && !strcmp(turn + strlen(turn) - 15, "<|end_message|>"));
+    TEST_ASSERT(turn && strstr(turn, "{\"name\":\"get_weather\",\"args\":{\"city\":\"Paris\",\"n\":2}}"));   /* canonical */
+    const char *want_tail = "<|content_model_end_sampling|><|message_tool|>get_weather<|content_text|>18C<|end_message|>"
+                            "<|message_tool|>get_weather<|content_text|>  22C\n<|end_message|>"
+                            "<|message_system|><|content_text|>Hurry.<|end_message|><|message_model|>";
+    TEST_ASSERT(tail && !strcmp(tail, want_tail));
+    TEST_ASSERT(tail_n == 5);   /* the two authors, the two results, the system text */
+    char *full_text = inkling_test_full_render(&full, NULL);
+    char *prefix_text = inkling_test_full_render(&prefix, NULL);
+    buf composed = {0};
+    buf_puts(&composed, prefix_text);
+    buf_puts(&composed, turn ? turn : "");
+    buf_puts(&composed, tail ? tail : "");
+    TEST_ASSERT(!strcmp(composed.ptr, full_text));
+    /* a stop turn closes itself; an empty turn has no sampled render */
+    tool_calls none = {0};
+    char *stop = r.family->assistant_turn_sampled(&r, true, NULL, " Done. ", &none, NULL, NULL);
+    TEST_ASSERT(stop && !strcmp(stop, "<|content_text|> Done. <|end_message|><|content_model_end_sampling|>"));
+    TEST_ASSERT(r.family->assistant_turn_sampled(&r, true, NULL, "", &none, NULL, NULL) == NULL);
+    free(stop);
+    buf_free(&composed);
+    free(full_text);
+    free(prefix_text);
+    free(turn);
+    free(tail);
+    free(turn_spans);
+    free(tail_spans);
+    chat_msgs_free(&full);
+    request_free(&r);
+}
+
+/* Tool memory: the parser records the calls as sampled (a spelling the canonical render normalises), the renderer
+ * replays them verbatim, and the block finder keys exactly those bytes -- in the turn and in a transcript. */
+static void test_inkling_raw_calls_replay_and_key(void) {
+    const char *sampled =   /* after the generation prompt's <|message_model|>, before the stop token */
+        "bash<|content_invoke_tool_json|>{\"name\": \"bash\", \"args\": {\"cmd\": \"ls   -la\"}}<|end_message|>"
+        "<|message_model|>bash<|content_invoke_tool_json|>{\"name\":\"bash\",\"args\":{\"n\":\"007\"}}<|end_message|>";
+    inkling_output_parser p;
+    p.init(OUT_HEADER);
+    std::vector<out_event> ev;
+    for (size_t i = 0; sampled[i]; i++) p.feed(sampled + i, 1, &ev);   /* one byte at a time */
+    p.finish(&ev);
+    TEST_ASSERT(p.calls().size() == 2 && p.errors() == 0);
+    TEST_ASSERT(p.calls()[0].arguments == "{\"cmd\": \"ls   -la\"}");   /* as sampled */
+    size_t lo = 1, hi = 0;
+    TEST_ASSERT(p.raw_span(&lo, &hi) && lo == 0 && hi == strlen(sampled));
+    const server_family_ops *ink = server_family_for_format(PULSAR_CHAT_INKLING);
+    const char *end = NULL;
+    TEST_ASSERT(ink->find_call_block(sampled, &end) == sampled && end == sampled + hi);
+    /* a call that is not the turn's first block: its key starts at its author, past the role marker */
+    const std::string later = std::string("<|content_text|>On it.<|end_message|><|message_model|>") + sampled;
+    p.init(OUT_HEADER);
+    ev.clear();
+    p.feed(later.data(), later.size(), &ev);
+    p.finish(&ev);
+    TEST_ASSERT(p.raw_span(&lo, &hi) && later.compare(lo, hi - lo, sampled) == 0);
+
+    /* the replay: the raw bytes where the calls go, after the content */
+    chat_msgs msgs = {0};
+    chat_msgs_push(&msgs, qwen_test_msg("user", "List."));
+    chat_msg a = qwen_test_msg("assistant", "On it.");
+    qwen_test_call(&a, "call_1", "bash", "{\"cmd\":\"ls   -la\"}");
+    qwen_test_call(&a, "call_2", "bash", "{\"n\":\"007\"}");
+    a.calls.raw_calls = xstrdup(sampled);
+    chat_msgs_push(&msgs, a);
+    chat_msgs_push(&msgs, qwen_test_msg("tool", "ok"));
+    msgs.v[2].tool_call_id = xstrdup("call_2");
+    char *text = inkling_test_full_render(&msgs, NULL);
+    const std::string expect = std::string("<|message_model|><|content_text|>On it.<|end_message|><|message_model|>") +
+                               sampled + "<|content_model_end_sampling|><|message_tool|>bash<|content_text|>ok";
+    TEST_ASSERT(strstr(text, expect.c_str()) != NULL);
+    const char *k = ink->find_call_block(text, &end);
+    TEST_ASSERT(k && std::string(k, (size_t)(end - k)) == sampled);
+    TEST_ASSERT(ink->find_call_block(end, &end) == NULL);
+    /* and the sampled turn with those bytes is the KV that produced them */
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    r.family = ink;
+    r.family_effort = 90;
+    chat_msg t = qwen_test_msg("assistant", NULL);
+    qwen_test_call(&t, "call_1", "bash", "{\"cmd\":\"ls   -la\"}");
+    qwen_test_call(&t, "call_2", "bash", "{\"n\":\"007\"}");
+    t.calls.raw_calls = xstrdup(sampled);
+    char *turn = r.family->assistant_turn_sampled(&r, true, NULL, "", &t.calls, NULL, NULL);
+    TEST_ASSERT(turn && !strcmp(turn, sampled));
+    free(turn);
+    chat_msg_free(&t);
+    request_free(&r);
+    free(text);
+}
+
+/* What vLLM's Inkling renderer cannot express refuses by name: a forced tool_choice, an image (E9). */
+static void test_inkling_refusals(void) {
+    char err[256];
+    request r;
+    const char *forced[] = {
+        "{\"messages\":[{\"role\":\"user\",\"content\":\"x\"}],\"tools\":[{\"type\":\"function\",\"function\":"
+        "{\"name\":\"f\",\"parameters\":{}}}],\"tool_choice\":\"required\"}",
+        "{\"messages\":[{\"role\":\"user\",\"content\":\"x\"}],\"tools\":[{\"type\":\"function\",\"function\":"
+        "{\"name\":\"f\",\"parameters\":{}}}],\"tool_choice\":{\"type\":\"function\",\"function\":{\"name\":\"f\"}}}",
+    };
+    for (const char *b : forced) {
+        TEST_ASSERT(!effort_case(PULSAR_CHAT_INKLING, b, &r, err, sizeof err));
+        TEST_ASSERT(strstr(err, "no forced tool call") != NULL);
+        request_free(&r);
+    }
+    const server_family_ops *ink = server_family_for_format(PULSAR_CHAT_INKLING);
+    TEST_ASSERT(!ink->forced_call_seed && !ink->forced_call_prefill && !ink->forced_name_open && !ink->forced_name_close);
+    /* auto: the tools are declared in the leading system block, canonical */
+    TEST_ASSERT(effort_case(PULSAR_CHAT_INKLING, "{\"messages\":[{\"role\":\"user\",\"content\":\"x\"}],\"tools\":"
+                            "[{\"type\":\"function\",\"function\":{\"name\":\"f\",\"parameters\":{}}}]}", &r, err, sizeof err));
+    const char *declared = "<|message_system|>tool_declare<|content_xml|>[{\"description\":\"\",\"name\":\"f\","
+                           "\"parameters\":{},\"type\":\"function\"}]<|end_message|>";
+    TEST_ASSERT(r.has_tools && !strncmp(r.prompt_text, declared, strlen(declared)));
+    request_free(&r);
+    chat_msgs msgs = {0};
+    chat_msgs_push(&msgs, qwen_test_image_msg("user", "Look: ", ""));
+    chat_conversation c = {};
+    c.msgs = msgs;
+    request_init(&r, REQ_CHAT, 16);
+    TEST_ASSERT(!render_chat_conversation(NULL, PULSAR_CHAT_INKLING, NULL, &c, &r, err, sizeof err));
+    TEST_ASSERT(strstr(err, "image front (E9)") != NULL);
+    request_free(&r);
+    chat_conversation_free(&c);
+}
+
+/* The model-visible retry: the stop token, ONE tool result (the error, the system turn reminded), the generation
+ * prompt -- the template's own spelling. */
+static void test_inkling_tool_error_suffix_reminds_the_system_turn(void) {
+    chat_msgs msgs = {0};
+    chat_msgs_push(&msgs, qwen_test_msg("system", "Rules here."));
+    chat_msgs_push(&msgs, qwen_test_msg("user", "Hi"));
+    request r;
+    char *text = inkling_test_full_render(&msgs, "[{\"type\":\"function\",\"function\":{\"name\":\"f\"}}]", &r);
+    thinking_state st = {};
+    chat_text_span *spans = NULL;
+    uint32_t n_spans = 0;
+    char *suffix = r.family->tool_error_suffix(&r, &st, "unterminated tool call 0", &spans, &n_spans);
+    const char *want = "<|content_model_end_sampling|><|message_tool|><|content_text|>Tool error: malformed tool call: "
+                       "unterminated tool call 0\nThe previous assistant output was not executed because its tool call "
+                       "was malformed. Emit a new valid tool call, or answer normally if no tool is needed.\n\nSystem "
+                       "prompt reminder:\n[{\"description\":\"\",\"name\":\"f\",\"parameters\":{},\"type\":\"function\"}]"
+                       "\n\nRules here.<|end_message|><|message_model|>";
+    TEST_ASSERT(suffix && !strcmp(suffix, want));
+    TEST_ASSERT(n_spans == 1);   /* the error text is the tool body: client data */
+    free(suffix);
+    free(spans);
+    free(text);
+    request_free(&r);
+}
+
+
+
 /* ---- L290: a turn's tokens never change after the next user message arrives ------------------------------ */
 
 /* The checkpoint's tokenizer, host-side (src/lib/bpe_tokenizer, its HF configuration): PULSAR_TEST_QWEN_TOKENIZER
@@ -8829,6 +9075,11 @@ static void pulsar_server_unit_tests_run(void) {
     test_tool_name_token_allowed();
     test_qwen_payload_is_sampled_structure_greedy();
     test_qwen_tool_error_suffix_reminds_the_system_turn();
+    test_inkling_effort_map();
+    test_inkling_hooks_compose_to_the_full_render();
+    test_inkling_raw_calls_replay_and_key();
+    test_inkling_refusals();
+    test_inkling_tool_error_suffix_reminds_the_system_turn();
     test_anthropic_turn_render_is_stable_across_the_next_user_turn();
     test_live_tail_joins_before_a_committed_stop();
     test_anthropic_tool_result_id_validation();

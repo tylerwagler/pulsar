@@ -191,5 +191,9 @@ add("an/mid-system-lead", "anthropic", {"max_tokens": 50, "messages": [{"role": 
 for c in [c for c in cases if c["endpoint"] in ("anthropic", "responses")]:
     cases.append(dict(c, family="qwen"))
 
+# ---- L294 E6: the Inkling family, every DeepSeek-family body (appended: the lines above are unchanged) -----------
+for c in [c for c in cases if c["family"] == "deepseek"]:
+    cases.append(dict(c, family="inkling"))
+
 for c in cases:
     print(json.dumps(c, ensure_ascii=False))

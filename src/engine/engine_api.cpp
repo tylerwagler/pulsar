@@ -276,9 +276,17 @@ const char *pulsar_engine_family_name(const pulsar_engine *e) {
 
 
 
+/* The think-mode axis (none, 1..100) is DeepSeek's encoder's own; every other family's template renders thinking on
+ * at its default effort (PULSAR_THINK_DEFAULT, the enabled marker) or off, its own effort levels being the server's
+ * effort map's (L295 E6: Inkling; Qwen since L251). */
+static bool think_axis_is_deepseek(const pulsar_engine *e) {
+    if (!e) return true;   /* no engine: the compile-time default profile */
+    const pulsar_chat_format f = e->family->chat_format(e);
+    return f == PULSAR_CHAT_DS4_V4 || f == PULSAR_CHAT_DS4_V41;
+}
 pulsar_think_mode pulsar_engine_think_default(const pulsar_engine *e) {
-    /* Qwen: thinking on at the template's default effort (pulsar_encode_chat_prompt; the server's marker too) */
-    if (e && e->family->chat_format(e) == PULSAR_CHAT_QWEN) return PULSAR_THINK_DEFAULT;
+    /* on at the template's default effort (pulsar_encode_chat_prompt; the server's marker too) */
+    if (!think_axis_is_deepseek(e)) return PULSAR_THINK_DEFAULT;
     return pulsar_engine_chat_v41(e) ? PULSAR_THINK_DEFAULT : PULSAR_THINK_LOW;
 }
 bool pulsar_engine_think_mode_supported(const pulsar_engine *e, pulsar_think_mode mode, char *why, size_t n) {
@@ -286,9 +294,10 @@ bool pulsar_engine_think_mode_supported(const pulsar_engine *e, pulsar_think_mod
         if (why) snprintf(why, n, "%d is not a thinking effort (none, or 1..100)", (int)mode);
         return false;
     }
-    if (e && e->family->chat_format(e) == PULSAR_CHAT_QWEN) {
+    if (!think_axis_is_deepseek(e)) {
         if (mode == PULSAR_THINK_NONE || mode == PULSAR_THINK_DEFAULT) return true;
-        if (why) snprintf(why, n, "the Qwen template renders thinking on (at its default effort) or off -- no effort level");
+        if (why) snprintf(why, n, "the %s template renders thinking on (at its default effort) or off -- no effort level",
+                          e->family->name);
         return false;
     }
     if (pulsar_engine_chat_v41(e) || pulsar_think_effort_v4_valid(mode)) return true;

@@ -50,8 +50,11 @@ The container:
     head), `mtp.0..N-1` when the recipe writes the drafter (all of it or none).
   * pulsar.kv: general.architecture = "inkling"; text_config verbatim under `inkling.`, vision_config under
     `inkling.vision.`, mtp_config under `inkling.mtp.` (kv.config_kvs); eos_token_id; the builder's own facts under
-    `pulsar.*`.  No tokenizer.* entries yet: Inkling's tokenizer is tiktoken / a BPE whose specials are not named
-    in tokenizer_config.json, and the frontend kit (L295 F5, plan 120 E6) defines what the engine reads.
+    `pulsar.*`.  No tokenizer.* entries: the engine reads the checkpoint's own tokenizer files (L294 E6).
+  * side files (side_files, written by `emit --all`, checked byte-equal by `verify --all`): the tokenizer the engine
+    loads beside the shards (src/families/inkling/inkling_tokenizer.cpp) -- tiktoken/tokenizer.model as
+    `tokenizer.model`, tokenizer_config.json (the added tokens) and config.json (eos_token_id: the stop ids), as
+    shipped; the tokenizer files from --tokenizer DIR (default: the HF dir), config.json the checkpoint's own.
 """
 from __future__ import annotations
 
@@ -585,9 +588,6 @@ def build_kv(hf, ctx):
         raise SystemExit("--reap-map: REAP survivor maps are a DeepSeek table (validate_reap_metadata)")
     if ctx.ple_rows:
         raise SystemExit("--ple-rows: the PLE row file is a qwen4_exp table")
-    if os.path.normpath(ctx.tokenizer_dir) != os.path.normpath(hf.dir):
-        raise SystemExit("--tokenizer: the Inkling container carries no tokenizer.* entries yet (the frontend kit, "
-                         "L295 F5 / plan 120 E6, defines them)")
     top = hf.config["top_level"]
     sh = ctx.shape
     kvs = [("general.architecture", "string", FAMILY), ("general.type", "string", "model"),
@@ -612,3 +612,21 @@ def build_kv(hf, ctx):
     if len(set(keys)) != len(keys):
         raise SystemExit("duplicate kv key: " + ", ".join(sorted(k for k in set(keys) if keys.count(k) > 1)))
     return out
+
+
+# ---------------------------------------------------------------------------
+# side files
+# ---------------------------------------------------------------------------
+def side_files(hf, ctx):
+    """[(container name, source path)]: the tokenizer the engine loads beside the shards (the module docstring), as
+    shipped.  A checkpoint without them (the mini has no tiktoken/) names --tokenizer: a directory holding the same
+    checkpoint family's tiktoken/tokenizer.model and tokenizer_config.json."""
+    tdir = ctx.tokenizer_dir
+    files = [("tokenizer.model", os.path.join(tdir, "tiktoken", "tokenizer.model")),
+             ("tokenizer_config.json", os.path.join(tdir, "tokenizer_config.json")),
+             ("config.json", os.path.join(hf.dir, "config.json"))]
+    missing = [src for _, src in files if not os.path.isfile(src)]
+    if missing:
+        raise SystemExit(f"the Inkling container carries the checkpoint's tokenizer: {', '.join(missing)} missing "
+                         f"(--tokenizer DIR names a directory with tiktoken/tokenizer.model and tokenizer_config.json)")
+    return files
