@@ -27,6 +27,9 @@
  *   9. a gate + up pair in one launch == the two projections launched alone, bit for bit; the refusals.
  *  10. (L295 F7) the pair at K5 at Inkling's routed shape (4096 -> 2048 -> 4096, 256 experts, top-6, bf16 rows):
  *      prompt rows 1..4096 and decode rows 1..40 of both projections, and the pair launch, as above.
+ *  11. (L297) the decode arm at a verify's widths on Nemotron's up-only shape (1024 -> 2688 -> 1024, 512 experts,
+ *      top-22, K4): rows 1..40, every row == the same row through the 1-row path (each row its own call), and the
+ *      mixed cuts; Qwen's shape every row alone at 8 and 16 rows.
  * Error per assignment row: rel Frobenius ||z - ref|| / ||ref|| and max |z - ref| / max |ref|; reported as the
  * max and mean over the sampled rows.  The operand is ONE fp16 plane per (row, 128-block) prescale: an
  * input the arm rotates rounds once to 11 significant bits (row error ~2^-12 / sqrt 3), an E4M3 value
@@ -269,6 +272,9 @@ static dev_act upload_act(const act_rows &a) {
 
 /* The arm under test: false = the prompt-chunk GEMM, true = the decode GEMM (task #46). */
 static bool g_decode = false;
+/* L297: the invariance check cuts the rows into calls of ONE token each (every row through the 1-row path) instead of
+ * the mixed 1 / 3 / 17 / ... cuts. */
+static bool g_cut_one = false;
 
 /* One launch of the arm under test; for the decode arm `out` is unused and the split partials are summed in
  * split order (the fold's / sum's order) into *dec_out [n_assign][N] f32 on the host. */
@@ -428,7 +434,7 @@ static void section_case(const shape &sh, bool gate, int k2, int n_tok, int fmt,
         std::vector<float> got((size_t)n_pairs * N);
         int t0 = 0, ci = 0, nchunks = 0;
         while (t0 < n_tok) {
-            const int len = cuts[ci++ % 8];
+            const int len = g_cut_one ? 1 : cuts[ci++ % 8];
             const int t1 = t0 + len < n_tok ? t0 + len : n_tok;
             std::vector<float> part;
             /* the chunk's own activation rows: a chunk is its own call, its rows start at 0 */
@@ -460,8 +466,8 @@ static void section_case(const shape &sh, bool gate, int k2, int n_tok, int fmt,
         CHECK(diff == 0, "%s %s %s K=%g T=%d: %zu of %zu outputs differ between %d calls and one call",
               g_decode ? "decode" : "prefill", sh.what,
               gate ? "gate" : "down", k2 / 2.0, n_tok, diff, got.size(), nchunks);
-        printf("    %s invariance: %d calls (1..200 tokens) vs one call: %s (%zu outputs)\n",
-               g_decode ? "batch" : "chunk", nchunks, diff ? "DIFFER" : "bit-identical", got.size());
+        printf("    %s invariance: %d calls (%s) vs one call: %s (%zu outputs)\n", g_decode ? "batch" : "chunk",
+               nchunks, g_cut_one ? "1 token each" : "1..200 tokens", diff ? "DIFFER" : "bit-identical", got.size());
     }
     da.release();
     pl.release();
@@ -632,6 +638,27 @@ int main(void) {
             section_case(ink, gate, 10, t, ink.fmt, 160, t > 1, 4, t == 5 || t == 40);
     section_decode_pair("Inkling", 10, EXL3_MOE_ACT_BF16_ROWS, false);
     CHECK(exl3_arm_has_rate(EXL3_ARM_PAIR, 10), "the pair arm's rate table has no K5");
+    /* 11. L297: the decode arm at a verify's widths for Nemotron's up-only routed shape (latent 1024 -> 2688 -> 1024, 512
+     * experts, top-22, K4, bf16 rows; the up rotates its input as a gate does) -- graded against the f32-weight
+     * reference, and every width's rows == the same rows through the 1-row path (each row its own call) and == the
+     * mixed cuts, byte for byte: an R-row step reads an expert's tile once for all of its rows (the plan's 16-row
+     * tiles; hot experts carry several) and gives each row the 1-row decode's bits.  Qwen's shape the same at 8 and
+     * 16 rows.  Last, so the sections above keep their draws. */
+    printf("11. the decode arm at verify widths (L297): Nemotron's up-only shape (1024 -> 2688 -> 1024, 512 experts, "
+           "top-22, K4) rows 1..40, every row == its 1-row call; Qwen's at 8 / 16 rows\n");
+    const shape nem = {"Nemotron-K4", 1024, 2688, 512, 22, false, 8, 8, EXL3_MOE_ACT_BF16_ROWS};
+    for (int t : {1, 2, 3, 4, 6, 8, 16, 22, 40})
+        for (int gate = 1; gate >= 0; gate--) {
+            g_cut_one = true;
+            section_case(nem, gate, 8, t, nem.fmt, 160, t > 1, 4, t == 6 || t == 40);
+            g_cut_one = false;
+            if (t >= 6) section_case(nem, gate, 8, t, nem.fmt, 32, true, 4, false);
+        }
+    g_cut_one = true;
+    for (int t : {8, 16})
+        for (int gate = 1; gate >= 0; gate--)
+            section_case(qw, gate, gate ? qw.k2_gate : qw.k2_down, t, qw.fmt, 64, true, 4, false);
+    g_cut_one = false;
     printf(g_fail ? "EXL3-MOE-PREFILL GATE FAIL\n" : "EXL3-MOE-PREFILL GATE PASS\n");
     return g_fail;
 }

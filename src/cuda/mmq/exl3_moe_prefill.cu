@@ -40,11 +40,13 @@
 // The DECODE GEMM (task #46) shares the PREP and the per-k-tile arithmetic (a fresh fragment per k-tile,
 // scaled by the row's inverse prescale) but splits K: decode rows meet an expert a handful of times, so
 // the grouped GEMM's serial-K CTAs (one chain over all of K per output) left most of GB10 idle at 1-8
-// rows (Qwen's 640-wide gate: 5 output tiles per expert).  A CTA there is (128 outputs, a 16-row m16
+// rows (Qwen's 640-wide gate: 5 output tiles per expert).  A CTA there is (64 outputs, a 16-row m16
 // tile of one expert, one of SK K-splits), four warps over the split's k-range, summed in warp order;
-// the splits are added in split order by the fold / sum.  SK is a function of K alone.  Each tile's words
-// load coalesced (lane l word l) and a lane takes its 64-bit window from its neighbours by shuffle --
-// at K <= 4 one window holds all eight of a lane's B-fragment states (run8, TensorFold's load).
+// the splits are added in split order by the fold / sum.  SK is a function of K alone.  The tiles are
+// the PREP's plan (L297): every expert's assignments cut into 16-row tiles, so an R-row step streams each
+// routed expert's weights ONCE for all of its rows -- the bytes are the union of the rows' experts.  Each
+// tile's words load coalesced (lane l word l) and a lane takes its 64-bit window from its neighbours by
+// shuffle -- at K <= 4 one window holds all eight of a lane's B-fragment states (run8, TensorFold's load).
 
 #include "exl3_moe_prefill.cuh"
 #include "ds4_exl3_dev.cuh"
@@ -134,14 +136,50 @@ struct prep_out {
     float *pinv;
 };
 
+constexpr int kDecRows = 16;   ///< the decode GEMM's tile: up to 16 consecutive assignments of ONE expert
+
+/* The decode GEMM's tile list (L297): tile t = (expert, its first assignment), every expert's assignments cut into
+ * kDecRows-row tiles, in expert order -- the tiles the decode grid used to find by a binary search per CTA, its
+ * idle CTAs included.  NULL tiles: no plan (the prefill arm plans its own work list). */
+struct dec_plan {
+    int2 *tiles;    ///< [<= n_assign]: a tile holds >= 1 assignment
+    int  *n_tiles;
+};
+
+/* The plan, by one 256-thread CTA: thread t counts the tiles of experts [t per, (t + 1) per), an inclusive scan
+ * over the counts, then each thread writes its experts' tiles from its offset. */
+__device__ void plan_decode_tiles(const int32_t *__restrict__ bounds, int E, const dec_plan &p) {
+    __shared__ int s[256];
+    const int t = threadIdx.x, per = (E + 255) / 256, e0 = min(E, t * per), e1 = min(E, e0 + per);
+    int n = 0;
+    for (int e = e0; e < e1; ++e) n += (bounds[e + 1] - bounds[e] + kDecRows - 1) / kDecRows;
+    s[t] = n;
+    __syncthreads();
+    for (int off = 1; off < 256; off <<= 1) {
+        const int v = t >= off ? s[t - off] : 0;
+        __syncthreads();
+        s[t] += v;
+        __syncthreads();
+    }
+    int at = s[t] - n;
+    for (int e = e0; e < e1; ++e)
+        for (int a = bounds[e]; a < bounds[e + 1]; a += kDecRows) p.tiles[at++] = make_int2(e, a);
+    if (t == 255) *p.n_tiles = s[255];
+}
+
 /* PREP: one warp per (assignment, 128-block); lane l owns k = 4l..4l+3 of the block.  FMT is the
  * producer's activation format (exl3_moe_act_format): the row is read as given, never re-encoded.
- * blockIdx.y picks the projection (a decode gate + up pair preps both in one launch). */
+ * blockIdx.y picks the projection (a decode gate + up pair preps both in one launch).  With a plan (a decode
+ * launch), the grid's last CTA of projection 0 writes the decode GEMM's tile list instead. */
 template <int FMT, bool ROT>
 __global__ void __launch_bounds__(256)
 exl3_moe_prep_kernel(const prep_out o0, const prep_out o1, const void *__restrict__ xv, const uint8_t *__restrict__ xsf,
                      int kbp, const int32_t *__restrict__ ids_src, const int32_t *__restrict__ bounds, int E,
-                     int n_assign, int K) {
+                     int n_assign, int K, const dec_plan plan) {
+    if (plan.tiles && blockIdx.x == gridDim.x - 1) {
+        if (blockIdx.y == 0) plan_decode_tiles(bounds, E, plan);
+        return;
+    }
     const prep_out &o = blockIdx.y ? o1 : o0;
     const void *__restrict__ table = o.table;
     __half *__restrict__ phi = o.phi;
@@ -334,16 +372,18 @@ exl3_moe_gemm_kernel(const void *__restrict__ table, const __half *__restrict__ 
 /* ---------------------------------------------------------------------- */
 /* the DECODE GEMM (task #46)                                              */
 
-constexpr int kDecRows  = 16;                 ///< one m16 tile: up to 16 consecutive assignments of ONE expert
 constexpr int kDecWarps = 4;                  ///< the CTA's k-range split four ways, summed in warp order
-constexpr int kDecNT    = 8;                  ///< n16 tiles per warp: every warp covers the CTA's 128 outputs
+constexpr int kDecNT    = 4;                  ///< n16 tiles per warp: every warp covers the CTA's 64 outputs
 constexpr int kDecBN    = kDecNT * 16;
 constexpr int kDecMinWarpTiles = 16;          ///< k-tiles a warp runs at least: the split count's floor
-constexpr int kDecMinCtas = 3;                ///< CTAs per SM the register budget is held to (168 registers)
-/* Measured (task #46, V4 / Qwen shapes, 1..40 rows): 4 n16 tiles per warp, or two k-tiles in flight
- * instead of one, were 2-6% slower; a floor of 8 k-tiles 3-5% slower than 16 or 32; holding the
- * registers to 3 CTAs per SM (with the reduction's shared memory halved) 1-4% faster than 2, while 4
- * (128 registers) and 5 (96) spill and lose 1-30%. */
+constexpr int kDecMinCtas = 4;                ///< CTAs per SM the register budget is held to (128, no spill)
+/* Measured (task #46, V4 / Qwen shapes, 1..40 rows): a floor of 8 k-tiles 3-5% slower than 16 or 32.
+ * L297 (tests/exl3_moe_decode_bench, DRAM-cold, Nemotron / Qwen / V4 / V4.1 shapes at 1..16 rows; every
+ * variant's outputs byte-identical): with the planned tiles, 4 n16 tiles per warp at 4 CTAs per SM (128
+ * registers, no spill) beat 8 at 3 (168 registers, 24-64 bytes spilled at every rate) by 0-3% on Nemotron,
+ * 2-5% on Qwen and 1-6% on DeepSeek; 2 n16 tiles at 5-6 CTAs, or two k-tiles in flight, won up to 4% on
+ * Nemotron / Qwen and lost 5-20% on DeepSeek.  The routed reads run at 220-230 GB/s from 4 rows (GB10's
+ * streaming read: ~236). */
 
 /* The K splits of a K-wide projection: as many as keep every warp at >= kDecMinWarpTiles k-tiles, dividing
  * the k-tiles evenly.  A function of K ALONE -- never of the row count -- so a row's bits do not depend on
@@ -380,30 +420,26 @@ template <int K2> struct DecGeo {
 /* word idx of a tile whose lane l holds word l (a run8 rate's tile is at most 32 words: DecGeo static_assert) */
 __device__ __forceinline__ uint32_t tile_word(uint32_t w, int idx) { return __shfl_sync(0xffffffffu, w, idx); }
 
-/* CTA = (128 outputs, the m16 tile of an expert's assignments that STARTS at assignment blockIdx.y, one K
- * split of one projection).  A CTA whose assignment does not start a tile -- or lies outside the schedule --
- * has nothing to do: the grid spans every assignment, so no plan pass is needed.  Warp w runs k-tiles
- * [kt0, kt0 + per_warp) of the split, every k-tile: the A fragment straight from the PREP's plane (rows
- * past the tile's end are zero), each of its 8 n16 trellis tiles decoded into mma B registers (mul1_pair:
- * the prefill arm's decode bit for bit), one MMA per n8 half into a fresh fragment scaled by the row's
- * inverse prescale into the accumulator -- the prefill arm's per-k-tile arithmetic.  The next k-tile's
- * words, A and prescales load while this one computes.  The four warps' partials are summed in warp order
- * and written to the split's plane; the consumer (fold / sum) adds the splits in split order. */
+/* CTA = (64 outputs, tile blockIdx.y of the plan -- an m16 tile of one expert's assignments --, one K split of
+ * one projection).  The grid spans an upper bound (every assignment); the CTAs past the plan's tiles have nothing
+ * to do and leave at once.  Warp w runs k-tiles [kt0, kt0 + per_warp) of the split, every k-tile: the A
+ * fragment straight from the PREP's plane (rows past the tile's end are zero), each of its kDecNT n16 trellis
+ * tiles decoded into mma B registers (mul1_pair: the prefill arm's decode bit for bit), one MMA per n8 half
+ * into a fresh fragment scaled by the row's inverse prescale into the accumulator -- the prefill arm's
+ * per-k-tile arithmetic.  The next k-tile's words, A and prescales load while this one computes.  The four
+ * warps' partials are summed in warp order and written to the split's plane; the consumer (fold / sum) adds
+ * the splits in split order. */
 template <int K2>
 __global__ void __launch_bounds__(kDecWarps * 32, kDecMinCtas)
 exl3_moe_decode_kernel(const dec_mat m0, const dec_mat m1, const int32_t *__restrict__ ids_dst,
-                       const int32_t *__restrict__ bounds, int E, int M, int K, int SK, int64_t z_split) {
+                       const int32_t *__restrict__ bounds, const int2 *__restrict__ tiles,
+                       const int *__restrict__ n_tiles, int M, int K, int SK, int64_t z_split) {
     using G = DecGeo<K2>;
     constexpr int NT = kDecNT, BN = kDecBN;
     __shared__ float red[kDecWarps][kDecRows / 2][BN];
-    const int a0 = (int)blockIdx.y;
-    if (a0 < bounds[0] || a0 >= bounds[E]) return;   /* outside the schedule (a pick < 0 sorts below expert 0) */
-    int lo = 0, hi = E - 1;                           /* the assignment's expert: bounds is E+1 ascending */
-    while (lo < hi) {
-        const int mid = (lo + hi + 1) >> 1;
-        if (bounds[mid] <= a0) lo = mid; else hi = mid - 1;
-    }
-    if ((a0 - bounds[lo]) % kDecRows) return;         /* not the first assignment of a tile */
+    if ((int)blockIdx.y >= *n_tiles) return;
+    const int2 tile = tiles[blockIdx.y];
+    const int lo = tile.x, a0 = tile.y;               /* the tile's expert and its first assignment */
     const int mr = min(kDecRows, bounds[lo + 1] - a0);
     const int split = (int)blockIdx.z % SK, mat = (int)blockIdx.z / SK;
     const dec_mat &p = mat ? m1 : m0;
@@ -530,8 +566,9 @@ exl3_moe_decode_kernel(const dec_mat m0, const dec_mat m1, const int32_t *__rest
 
 template <int K2>
 bool launch_decode(const dim3 &grid, cudaStream_t stream, const dec_mat &m0, const dec_mat &m1, const int32_t *ids_dst,
-                   const int32_t *bounds, int E, int M, int K, int SK, int64_t z_split) {
-    exl3_moe_decode_kernel<K2><<<grid, kDecWarps * 32, 0, stream>>>(m0, m1, ids_dst, bounds, E, M, K, SK, z_split);
+                   const int32_t *bounds, const dec_plan &plan, int M, int K, int SK, int64_t z_split) {
+    exl3_moe_decode_kernel<K2><<<grid, kDecWarps * 32, 0, stream>>>(m0, m1, ids_dst, bounds, plan.tiles, plan.n_tiles,
+                                                                    M, K, SK, z_split);
     return true;
 }
 
@@ -550,25 +587,27 @@ bool launch_gemm(const dim3 &grid, cudaStream_t stream, const void *table, const
     return true;
 }
 
-/* The PREP of n_proj (1 or 2) projections over n_assign assignments, in the activation's own format. */
+/* The PREP of n_proj (1 or 2) projections over n_assign assignments, in the activation's own format; with a plan
+ * (plan.tiles: a decode launch) one more CTA writes the decode GEMM's tile list. */
 void launch_prep(bool rotate, cudaStream_t stream, const prep_out &o0, const prep_out &o1, int n_proj,
-                 const exl3_moe_act &act, const int32_t *ids_src, const int32_t *bounds, int E, int n_assign, int K) {
+                 const exl3_moe_act &act, const int32_t *ids_src, const int32_t *bounds, int E, int n_assign, int K,
+                 const dec_plan &plan) {
     const uint8_t *sf = static_cast<const uint8_t *>(act.sf);
     const int64_t tasks = (int64_t)n_assign * (K >> 7);
-    const dim3 grid((unsigned)((tasks + 7) / 8), (unsigned)n_proj);
+    const dim3 grid((unsigned)((tasks + 7) / 8 + (plan.tiles ? 1 : 0)), (unsigned)n_proj);
     const bool e4m3 = act.format == EXL3_MOE_ACT_E4M3_SLOT;
     if (e4m3 && rotate)
         exl3_moe_prep_kernel<EXL3_MOE_ACT_E4M3_SLOT, true><<<grid, 256, 0, stream>>>(o0, o1, act.x, sf, act.kbp, ids_src,
-                                                                                    bounds, E, n_assign, K);
+                                                                                    bounds, E, n_assign, K, plan);
     else if (e4m3)
         exl3_moe_prep_kernel<EXL3_MOE_ACT_E4M3_SLOT, false><<<grid, 256, 0, stream>>>(o0, o1, act.x, sf, act.kbp,
-                                                                                     ids_src, bounds, E, n_assign, K);
+                                                                                     ids_src, bounds, E, n_assign, K, plan);
     else if (rotate)
         exl3_moe_prep_kernel<EXL3_MOE_ACT_BF16_ROWS, true><<<grid, 256, 0, stream>>>(o0, o1, act.x, sf, act.kbp, ids_src,
-                                                                                    bounds, E, n_assign, K);
+                                                                                    bounds, E, n_assign, K, plan);
     else
         exl3_moe_prep_kernel<EXL3_MOE_ACT_BF16_ROWS, false><<<grid, 256, 0, stream>>>(o0, o1, act.x, sf, act.kbp,
-                                                                                     ids_src, bounds, E, n_assign, K);
+                                                                                     ids_src, bounds, E, n_assign, K, plan);
 }
 
 size_t up256(size_t b) { return (b + 255u) & ~(size_t)255u; }
@@ -640,7 +679,7 @@ int exl3_moe_prefill_launch(const void *table, int k2, bool rotate_input, const 
     while (threads < n_experts) threads <<= 1;
     exl3_moe_plan_kernel<<<1, threads, 0, stream>>>(expert_bounds, n_experts, work, n_work, (int)l.cap);
     const prep_out po{table, phi, pinv};
-    launch_prep(rotate_input, stream, po, po, 1, act, ids_src, expert_bounds, n_experts, (int)n_assign, K);
+    launch_prep(rotate_input, stream, po, po, 1, act, ids_src, expert_bounds, n_experts, (int)n_assign, K, dec_plan{});
     const dim3 grid((unsigned)(M / kBN), (unsigned)l.cap, 1);
     /* the rates exl3_arm_has_rate(EXL3_ARM_MOE_PREFILL) names: every rate a routed projection kind
      * admits -- k2 = 4 / 5 / 6 DeepSeek's (K2, 2.5, 3) and Qwen's
@@ -680,9 +719,12 @@ dec_layout dec_layout_for(int64_t n_assign, int K, int M) {
 
 } // namespace
 
+/* The decode tile list (dec_plan) after the projections' slices: n_assign tiles at most, then the count. */
+size_t dec_plan_bytes(int64_t n_assign) { return up256((size_t)n_assign * sizeof(int2) + sizeof(int)); }
+
 size_t exl3_moe_decode_ws_bytes(int n_proj, int64_t n_assign, int K, int M) {
     if (n_proj < 1 || n_proj > 2 || n_assign <= 0 || K <= 0 || M <= 0 || K % EXL3_HAD_BLOCK) return 0;
-    return (size_t)n_proj * dec_layout_for(n_assign, K, M).one;
+    return (size_t)n_proj * dec_layout_for(n_assign, K, M).one + dec_plan_bytes(n_assign);
 }
 
 int exl3_moe_decode_launch(const void *table0, const void *table1, int k2, bool rotate_input, const exl3_moe_act &act,
@@ -707,9 +749,9 @@ int exl3_moe_decode_launch(const void *table0, const void *table1, int k2, bool 
         return -1;
     }
     const dec_layout l = dec_layout_for(n_assign, K, M);
-    if (ws_bytes < (size_t)n_proj * l.one || ((uintptr_t)ws & 255u)) {
-        fprintf(stderr, "%s: workspace %zu B at %p < %zu B (256-aligned) -- refusing\n", tag, ws_bytes, ws,
-                (size_t)n_proj * l.one);
+    const size_t need = (size_t)n_proj * l.one + dec_plan_bytes(n_assign);
+    if (ws_bytes < need || ((uintptr_t)ws & 255u)) {
+        fprintf(stderr, "%s: workspace %zu B at %p < %zu B (256-aligned) -- refusing\n", tag, ws_bytes, ws, need);
         return -1;
     }
     const int SK = decode_splits(K);
@@ -728,17 +770,20 @@ int exl3_moe_decode_launch(const void *table0, const void *table1, int k2, bool 
         po[j] = prep_out{j && table1 ? table1 : table0, reinterpret_cast<__half *>(b), reinterpret_cast<float *>(b + l.plane)};
         dm[j] = dec_mat{po[j].table, po[j].phi, po[j].pinv, reinterpret_cast<float *>(b + l.plane + l.inv)};
     }
-    launch_prep(rotate_input, stream, po[0], po[1], n_proj, act, ids_src, expert_bounds, n_experts, (int)n_assign, K);
+    int2 *tiles = reinterpret_cast<int2 *>(base + (size_t)n_proj * l.one);
+    const dec_plan plan{tiles, reinterpret_cast<int *>(tiles + n_assign)};
+    launch_prep(rotate_input, stream, po[0], po[1], n_proj, act, ids_src, expert_bounds, n_experts, (int)n_assign, K,
+                plan);
     const int64_t z_split = n_assign * (int64_t)M;
     const dim3 grid((unsigned)(M / kDecBN), (unsigned)n_assign, (unsigned)(SK * n_proj));
     bool ok = false;
     switch (k2) {
-    case 4:  ok = launch_decode<4>(grid, stream, dm[0], dm[1], ids_dst, expert_bounds, n_experts, M, K, SK, z_split); break;
-    case 5:  ok = launch_decode<5>(grid, stream, dm[0], dm[1], ids_dst, expert_bounds, n_experts, M, K, SK, z_split); break;
-    case 6:  ok = launch_decode<6>(grid, stream, dm[0], dm[1], ids_dst, expert_bounds, n_experts, M, K, SK, z_split); break;
-    case 8:  ok = launch_decode<8>(grid, stream, dm[0], dm[1], ids_dst, expert_bounds, n_experts, M, K, SK, z_split); break;
-    case 10: ok = launch_decode<10>(grid, stream, dm[0], dm[1], ids_dst, expert_bounds, n_experts, M, K, SK, z_split); break;
-    case 12: ok = launch_decode<12>(grid, stream, dm[0], dm[1], ids_dst, expert_bounds, n_experts, M, K, SK, z_split); break;
+    case 4:  ok = launch_decode<4>(grid, stream, dm[0], dm[1], ids_dst, expert_bounds, plan, M, K, SK, z_split); break;
+    case 5:  ok = launch_decode<5>(grid, stream, dm[0], dm[1], ids_dst, expert_bounds, plan, M, K, SK, z_split); break;
+    case 6:  ok = launch_decode<6>(grid, stream, dm[0], dm[1], ids_dst, expert_bounds, plan, M, K, SK, z_split); break;
+    case 8:  ok = launch_decode<8>(grid, stream, dm[0], dm[1], ids_dst, expert_bounds, plan, M, K, SK, z_split); break;
+    case 10: ok = launch_decode<10>(grid, stream, dm[0], dm[1], ids_dst, expert_bounds, plan, M, K, SK, z_split); break;
+    case 12: ok = launch_decode<12>(grid, stream, dm[0], dm[1], ids_dst, expert_bounds, plan, M, K, SK, z_split); break;
     default: break;
     }
     const cudaError_t err = cudaGetLastError();

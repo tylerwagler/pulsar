@@ -66,8 +66,9 @@ struct exl3_moe_partials {
 size_t exl3_moe_decode_ws_bytes(int n_proj, int64_t n_assign, int K, int M);
 
 /** The routed arm for DECODE rows (task #46): the PREP above (the prefill arm's operand, bit for bit), then an
- *  fp16 tensor-core GEMM split over K -- a CTA per (128 outputs, a 16-assignment tile of one expert, a split)
- *  -- whose split count is a function of K alone, so a row's bits never depend on how many rows ride with it.
+ *  fp16 tensor-core GEMM split over K -- a CTA per (64 outputs, a 16-assignment tile of one expert, a split; the
+ *  PREP plans the tiles, so an expert's weights stream once for all of its rows) -- whose split count is a
+ *  function of K alone, so a row's bits never depend on how many rows ride with it.
  *  table1 non-NULL: a gate + up pair, both projections in the two launches.  The partials are its z:
  *  *out says where they are.  Agrees with the prefill arm to rounding, not to the bit. */
 int exl3_moe_decode_launch(

@@ -13,8 +13,9 @@
  * per width and the union of experts the rows touch.  Not a gate.
  *
  *   qwenp the same with turboderp's split gate / up stacks (td305: K3 experts)
+ *   nemo  Nemotron 3.5 Super's latent MoE: 512 experts, top-22, up-only relu^2 1024 -> 2688 -> 1024, bf16 rows
  *
- * usage: [EXL3_BENCH_PROMPT=1] [EXL3_BENCH_SHARED=k2] ./tests/exl3_moe_decode_bench qwen|qwenp|v4|v41 k2_gate_up k2_down
+ * usage: [EXL3_BENCH_PROMPT=1] [EXL3_BENCH_SHARED=k2] [EXL3_BENCH_DUMP=file] ./tests/exl3_moe_decode_bench qwen|qwenp|nemo|v4|v41 k2_gate_up k2_down
  *        keep S:R [S:R ...]
  * (EXL3_BENCH_PROMPT=1 runs the rows as a prompt chunk: the grouped GEMM, for the A/B against the decode arm;
  *  EXL3_BENCH_SHARED=k2 (Qwen shapes) adds the riding shared expert -- three EXL3 dense slices 2560 -> 640 -> 2560 at
@@ -24,6 +25,7 @@
 #include "cuda/pulsar_cuda_mx.cuh"
 #include "cuda/mmq/ds4_mmq.h"
 #include "cuda/mmq/exl3_moe.cuh"
+#include "cuda/pulsar_cuda_qwen.h"
 #include "engine/exl3_trellis.h"
 
 #include <cuda_bf16.h>
@@ -94,14 +96,16 @@ static stack make_stack(int K, int N, int k2, int E, uint32_t seed) {
 int main(int argc, char **argv) {
     setvbuf(stdout, NULL, _IONBF, 0);
     if (argc < 6) {
-        fprintf(stderr, "usage: %s qwen|v4|v41 k2_gate_up k2_down keep S:R [S:R ...]\n", argv[0]);
+        fprintf(stderr, "usage: %s qwen|qwenp|nemo|v4|v41 k2_gate_up k2_down keep S:R [S:R ...]\n", argv[0]);
         return 2;
     }
     /* qwen: our fused gate_up quant (U-e4-d5); qwenp: turboderp's split gate / up packs (td305) */
-    const bool qwenp = !strcmp(argv[1], "qwenp"), qwen = qwenp || !strcmp(argv[1], "qwen"), v41 = !strcmp(argv[1], "v41");
-    const bool fused = qwen && !qwenp;
-    const int H = qwen ? 2560 : v41 ? 5120 : 4096, MID = qwen ? 640 : v41 ? 2304 : 2048;
-    const int E = qwen ? 512 : v41 ? 384 : 256, TOPK = qwen ? 10 : 6;
+    const bool nemo = !strcmp(argv[1], "nemo");   /* bf16 rows like Qwen; up-only relu^2 experts */
+    const bool qwenp = !strcmp(argv[1], "qwenp"), qwen = nemo || qwenp || !strcmp(argv[1], "qwen"),
+               v41 = !strcmp(argv[1], "v41");
+    const bool fused = qwen && !qwenp && !nemo;
+    const int H = nemo ? 1024 : qwen ? 2560 : v41 ? 5120 : 4096, MID = nemo ? 2688 : qwen ? 640 : v41 ? 2304 : 2048;
+    const int E = qwen ? 512 : v41 ? 384 : 256, TOPK = nemo ? 22 : qwen ? 10 : 6;
     const int k2gu = atoi(argv[2]), k2d = atoi(argv[3]);
     const double keep = atof(argv[4]);
     std::vector<std::pair<int, int>> widths;
@@ -118,11 +122,23 @@ int main(int argc, char **argv) {
     if (ds4_mmq_init(dev) != 0) { fprintf(stderr, "bench: MMQ init\n"); return 2; }
     constexpr int NL = 3, NROUTE = 16;
     printf("exl3-moe-decode-bench: %s, %d -> %d (%s) -> %d, %d experts top-%d, K gate_up %g down %g, keep %.2f, "
-           "%d layer copies x %d routings (DRAM-cold)%s\n", argv[1], H, MID, fused ? "fused gate_up" : "gate + up pair", H,
+           "%d layer copies x %d routings (DRAM-cold)%s\n", argv[1], H, MID,
+           fused ? "fused gate_up" : nemo ? "up-only relu^2" : "gate + up pair", H,
            E, TOPK, k2gu / 2.0, k2d / 2.0, keep, NL, NROUTE, getenv("EXL3_BENCH_SHARED") ? ", + the shared expert" : "");
+    /* an expert's bytes (every projection's [trellis | scales] slice): the union's weight traffic per layer */
+    uint64_t ex_bytes = 0;
+    {
+        uint64_t tr = 0, sc = 0, sd = 0;
+        const int n_gu = fused ? 1 : nemo ? 1 : 2;
+        if (!exl3_expert_layout(H, fused ? 2 * MID : MID, k2gu, &tr, &sc, &sd)) { fprintf(stderr, "layout\n"); return 1; }
+        ex_bytes += (uint64_t)n_gu * sd;
+        if (!exl3_expert_layout(MID, H, k2d, &tr, &sc, &sd)) { fprintf(stderr, "layout\n"); return 1; }
+        ex_bytes += sd;
+    }
     stack GU[NL], G[NL], U[NL], D[NL];
     for (int l = 0; l < NL; l++) {
         if (fused) GU[l] = make_stack(H, 2 * MID, k2gu, E, 11 + 100 * l);
+        else if (nemo) U[l] = make_stack(H, MID, k2gu, E, 22 + 100 * l);
         else { G[l] = make_stack(H, MID, k2gu, E, 11 + 100 * l); U[l] = make_stack(H, MID, k2gu, E, 22 + 100 * l); }
         D[l] = make_stack(MID, H, k2d, E, 33 + 100 * l);
     }
@@ -221,13 +237,15 @@ int main(int argc, char **argv) {
         CUDA_OK(cudaMemcpy(sel, s.data(), s.size() * 4, cudaMemcpyHostToDevice));
         auto layer = [&](int i) -> int {
             const int l = i % NL, q = i % NROUTE;
-            const exl3_moe_stacks w = fused ? exl3_moe_stacks{GU[l].table, nullptr, nullptr, D[l].table, k2gu, k2d, E, H, MID, H}
-                                           : exl3_moe_stacks{nullptr, G[l].table, U[l].table, D[l].table, k2gu, k2d, E, H, MID, H};
+            const exl3_moe_stacks w =
+                fused  ? exl3_moe_stacks{GU[l].table, nullptr, nullptr, D[l].table, k2gu, k2d, E, H, MID, H, PULSAR_FFN_ACT_SWIGLU}
+                : nemo ? exl3_moe_stacks{nullptr, nullptr, U[l].table, D[l].table, k2gu, k2d, E, H, MID, H, PULSAR_FFN_ACT_RELU2}
+                       : exl3_moe_stacks{nullptr, G[l].table, U[l].table, D[l].table, k2gu, k2d, E, H, MID, H, PULSAR_FFN_ACT_SWIGLU};
             const exl3_moe_bufs b{gz, uz, dz, ma};
             const exl3_moe_shared sh{SG[l].arena, SU[l].arena, SD[l].arena, k2s, k2s, k2s, MID, ssc, syg, syu, sys,
                                      static_cast<__nv_bfloat16 *>(sh_h), sws, sws_bytes};
             if (k2s && exl3_moe_shared_fork(sh, xa, T, H, H, as_prompt, st) != 0) return -1;   /* the family's order */
-            return exl3_moe_routed_launch(w, sel + (size_t)q * maxP, wts + (size_t)q * maxP, T, TOPK, 10.0f, xa, b, out,
+            return exl3_moe_routed_launch(w, sel + (size_t)q * maxP, wts + (size_t)q * maxP, T, TOPK, nemo ? 0.0f : 10.0f, xa, b, out,
                                           nf, 1u, as_prompt, st, k2s ? &sh : nullptr, k2s ? 1 : 0);
         };
         for (int i = 0; i < NROUTE * NL; i++)
@@ -242,9 +260,24 @@ int main(int argc, char **argv) {
         CUDA_OK(cudaEventSynchronize(b));
         float ms = 0;
         cudaEventElapsedTime(&ms, a, b);
-        printf("  S=%d R=%-2d T=%-3d  %8.1f us/layer  %7.1f us/row  (union %.1f experts)\n", S, R, T,
-               1000.0 * ms / reps, 1000.0 * ms / reps / T, uni / NROUTE);
+        printf("  S=%d R=%-2d T=%-3d  %8.1f us/layer  %7.1f us/row  (union %.1f experts, %.1f MB: %.0f GB/s)\n", S, R, T,
+               1000.0 * ms / reps, 1000.0 * ms / reps / T, uni / NROUTE, uni / NROUTE * (double)ex_bytes / 1e6,
+               uni / NROUTE * (double)ex_bytes / (1e6 * ms / reps));
         cudaEventDestroy(a); cudaEventDestroy(b);
+        /* EXL3_BENCH_DUMP=<file>: every (layer copy, routing)'s output rows appended -- two trees' kernels compared
+         * byte for byte (the inputs are the seeds', the same in every build) */
+        if (const char *dump = getenv("EXL3_BENCH_DUMP")) {
+            FILE *f = fopen(dump, "ab");
+            if (!f) { fprintf(stderr, "bench: cannot open %s\n", dump); return 1; }
+            std::vector<float> h((size_t)T * H);
+            for (int i = 0; i < NROUTE * NL; i++) {
+                if (layer(i) != 0) { fprintf(stderr, "bench: layer T=%d refused\n", T); return 1; }
+                CUDA_OK(cudaMemcpyAsync(h.data(), out, h.size() * 4, cudaMemcpyDeviceToHost, st));
+                CUDA_OK(cudaStreamSynchronize(st));
+                fwrite(h.data(), 4, h.size(), f);
+            }
+            fclose(f);
+        }
     }
     return 0;
 }
