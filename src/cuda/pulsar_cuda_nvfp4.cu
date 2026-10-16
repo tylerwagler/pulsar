@@ -21,10 +21,12 @@
 namespace {
 
 constexpr int kWarps = 8;
-/* Measured on GB10 at the LiLiCorr drafter's shapes (2026-10-16, tests/nvfp4_rows_gate --bench): 4 super-steps in
- * flight and a K split aiming at 192 CTAs beat 1 / 2 super-steps and 96 / 384 CTAs (a few % to ~10%). */
+/* Measured on GB10 at the LiLiCorr drafter's shapes (2026-10-16, tests/nvfp4_rows_gate --bench): at decode widths 4
+ * super-steps in flight and a K split aiming at 192 CTAs beat 1 / 2 super-steps and 96 / 384 CTAs (a few % to ~10%).
+ * Neither the loads in flight (U) nor the n8 tiles a launch (NT) touch the summation order, so a row's bytes are the
+ * same at every launch geometry. */
 constexpr int kTargetCtas = 192;   ///< the K split's goal (pulsar_nvfp4_ksplit): four CTAs a GB10 SM
-constexpr int kUnroll = 4;         ///< 256-input super-steps whose loads are in flight together
+constexpr int kBlockRows = 64;     ///< the widest launch: 8 n8 tiles (prompt chunks; the weight read once a 64 rows)
 
 __device__ __forceinline__ void mma_bf16_16816(float (&d)[4], const uint32_t (&a)[4], uint32_t b0, uint32_t b1) {
     asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
@@ -74,7 +76,7 @@ __device__ __forceinline__ uint32_t dq(uint32_t q, uint32_t sc) {
 __device__ __forceinline__ int group_row(int G, int i) { return (G >> 3) * 128 + (i >> 2) * 32 + 4 * (G & 7) + (i & 3); }
 
 /* One CTA: R = 8 / S row groups (blockIdx.x R + rg) of W for nr <= 8 NT activation rows, K split S ways across its
- * warps.  A super-step is 256 inputs: lane c holds inputs [64 c, 64 c + 64) of each of its two rows -- 32 contiguous
+ * warps, U super-steps' loads in flight.  A super-step is 256 inputs: lane c holds inputs [64 c, 64 c + 64) of each of its two rows -- 32 contiguous
  * code bytes (a row's 128 bytes across the 4 lanes) and one scale word (the 4 blocks) -- and the same 64 inputs of
  * its activation row.  Sub-step s (16 of them) is one m16n8k16 MMA over inputs 64 c + 4 s + {0, 1 | 2, 3} of every
  * lane c, into a fresh fragment added into the row's f32 accumulator: super-steps in order, sub-steps in order. */
@@ -86,9 +88,9 @@ struct nvfp4_set {
     __nv_bfloat16 *yb[PULSAR_NVFP4_MULTI_MAX];
 };
 
-template <int NT, int S>
+template <int NT, int S, int U>
 __global__ void __launch_bounds__(32 * kWarps)
-nvfp4_rows_kernel(const nvfp4_set set, size_t scales_at, size_t global_at, int out, int in,
+nvfp4_rows_kernel(const __grid_constant__ nvfp4_set set, size_t scales_at, size_t global_at, int out, int in,
                   const __nv_bfloat16 *__restrict__ X, int nr) {
     constexpr int R = kWarps / S;
     const uint8_t *__restrict__ Wq = set.w[blockIdx.y];
@@ -127,11 +129,11 @@ nvfp4_rows_kernel(const nvfp4_set set, size_t scales_at, size_t global_at, int o
         for (int e = 0; e < 4; ++e) acc[j][e] = 0.0f;
     const uint4 z4 = make_uint4(0u, 0u, 0u, 0u);
 
-    for (int k0 = kbeg; k0 < kend; k0 += 256 * kUnroll) {
-        uint4 a0[kUnroll][2], a1[kUnroll][2];
-        uint32_t w0[kUnroll], w1[kUnroll];
+    for (int k0 = kbeg; k0 < kend; k0 += 256 * U) {
+        uint4 a0[U][2], a1[U][2];
+        uint32_t w0[U], w1[U];
 #pragma unroll
-        for (int u = 0; u < kUnroll; ++u) {
+        for (int u = 0; u < U; ++u) {
             const int k = k0 + 256 * u;
             const bool lv = k + 64 * c < kend;   /* a span of 64-multiples: a last super-step's high lanes are empty */
             const uint4 *p0 = reinterpret_cast<const uint4 *>(q0 + k / 2), *p1 = reinterpret_cast<const uint4 *>(q1 + k / 2);
@@ -143,7 +145,7 @@ nvfp4_rows_kernel(const nvfp4_set set, size_t scales_at, size_t global_at, int o
             w1[u] = v1 && lv ? __ldcs(reinterpret_cast<const uint32_t *>(s1 + (size_t)(k / 64) * 512)) : 0u;
         }
 #pragma unroll
-        for (int u = 0; u < kUnroll; ++u) {
+        for (int u = 0; u < U; ++u) {
             const int k = k0 + 256 * u;
             if (k >= kend) break;
             const bool lv = k + 64 * c < kend;
@@ -212,14 +214,14 @@ nvfp4_rows_kernel(const nvfp4_set set, size_t scales_at, size_t global_at, int o
         }
 }
 
-template <int NT>
+template <int NT, int U>
 void launch(int S, dim3 grid, const nvfp4_set &set, size_t vb, size_t gat, int out, int in, const __nv_bfloat16 *X,
             int nr, cudaStream_t st) {
     switch (S) {
-    case 1: nvfp4_rows_kernel<NT, 1><<<grid, 32 * kWarps, 0, st>>>(set, vb, gat, out, in, X, nr); break;
-    case 2: nvfp4_rows_kernel<NT, 2><<<grid, 32 * kWarps, 0, st>>>(set, vb, gat, out, in, X, nr); break;
-    case 4: nvfp4_rows_kernel<NT, 4><<<grid, 32 * kWarps, 0, st>>>(set, vb, gat, out, in, X, nr); break;
-    default: nvfp4_rows_kernel<NT, 8><<<grid, 32 * kWarps, 0, st>>>(set, vb, gat, out, in, X, nr); break;
+    case 1: nvfp4_rows_kernel<NT, 1, U><<<grid, 32 * kWarps, 0, st>>>(set, vb, gat, out, in, X, nr); break;
+    case 2: nvfp4_rows_kernel<NT, 2, U><<<grid, 32 * kWarps, 0, st>>>(set, vb, gat, out, in, X, nr); break;
+    case 4: nvfp4_rows_kernel<NT, 4, U><<<grid, 32 * kWarps, 0, st>>>(set, vb, gat, out, in, X, nr); break;
+    default: nvfp4_rows_kernel<NT, 8, U><<<grid, 32 * kWarps, 0, st>>>(set, vb, gat, out, in, X, nr); break;
     }
 }
 
@@ -229,7 +231,7 @@ bool aligned16(const void *p) { return ((uintptr_t)p & 15u) == 0; }
 
 int pulsar_nvfp4_ksplit(int in, int out) {
     int S = 1;
-    while (S < kWarps && (long)(out + 127) / 128 * S < kTargetCtas && in % (64 * 2 * S) == 0)
+    while (S < kWarps && (long)(out + 127) / 128 * S < kTargetCtas && in % (256 * 2 * S) == 0)
         S *= 2;
     return S;
 }
@@ -251,22 +253,26 @@ int pulsar_nvfp4_rows_multi_launch(const void *const *w, int n, const uint16_t *
     static bool announced = false;
     if (!__atomic_exchange_n(&announced, true, __ATOMIC_RELAXED))
         fprintf(stderr, "pulsar: NVFP4 linear (bf16 rows) = the W4A16 tensor-core kernel (e2m1 x e4m3 decoded to bf16 in "
-                        "registers, f32 accumulation in a fixed order, K split by shape), 16-row blocks, deterministic and "
+                        "registers, f32 accumulation in a fixed order, K split by shape), up to 64 rows a launch, deterministic and "
                         "M-independent at every width (first: %d x %d -> %d at %d rows, K split %d)\n", n, in, out, rows,
                 S);
     /* every 16-row group of every 128-row tile, for each Linear */
     const dim3 grid((unsigned)((out + 127) / 128 * 8 / R), (unsigned)n);
     const __nv_bfloat16 *X = reinterpret_cast<const __nv_bfloat16 *>(x_bf16);
-    for (int r0 = 0; r0 < rows; r0 += 16) {
-        const int m = rows - r0 < 16 ? rows - r0 : 16;
+    for (int r0 = 0; r0 < rows; r0 += kBlockRows) {
+        const int m = rows - r0 < kBlockRows ? rows - r0 : kBlockRows;
         nvfp4_set set{};
         for (int j = 0; j < n; ++j) {
             set.w[j] = static_cast<const uint8_t *>(w[j]);
             set.y[j] = y && y[j] ? y[j] + (size_t)r0 * out : nullptr;
             set.yb[j] = y_bf16 && y_bf16[j] ? reinterpret_cast<__nv_bfloat16 *>(y_bf16[j]) + (size_t)r0 * out : nullptr;
         }
-        if (m > 8) launch<2>(S, grid, set, vb, vb + sb, out, in, X + (size_t)r0 * in, m, stream);
-        else launch<1>(S, grid, set, vb, vb + sb, out, in, X + (size_t)r0 * in, m, stream);
+        /* decode widths: 4 super-steps in flight; prompt widths (the weight re-read a 64 rows): 2, for registers */
+        const __nv_bfloat16 *Xr = X + (size_t)r0 * in;
+        if (m > 32) launch<8, 2>(S, grid, set, vb, vb + sb, out, in, Xr, m, stream);
+        else if (m > 16) launch<4, 2>(S, grid, set, vb, vb + sb, out, in, Xr, m, stream);
+        else if (m > 8) launch<2, 4>(S, grid, set, vb, vb + sb, out, in, Xr, m, stream);
+        else launch<1, 4>(S, grid, set, vb, vb + sb, out, in, Xr, m, stream);
     }
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) {
