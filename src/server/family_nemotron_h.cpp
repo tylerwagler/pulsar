@@ -8,8 +8,6 @@
  * longer conversation wherever the template composes (nemotron-chat-gate S1).
  *
  * What is refused by name, never rendered in another spelling:
- *   - a forced tool_choice (required / a named function): the seed and prefill that open a call past the template's
- *     "<think></think>" are not built for this family yet (forced_call_* and forced_name_* NULL);
  *   - images: the template's <image> placeholders need the family's vision front (N11), not wired;
  *   - the template variables beyond the shared ones (medium_effort, truncate_history_thinking, force_nonempty_content):
  *     the server reads enable_thinking and reasoning_effort only; "medium" is the medium_effort level.
@@ -89,12 +87,37 @@ char *nemotron_take_render(const nemotron_render_out &out, chat_text_span **span
     return xstrndup(out.text.data(), out.text.size());
 }
 
-bool nemotron_render(pulsar_engine *e, server *s, chat_conversation *c, request *r, char *err, size_t errlen) {
-    if (c->tool_choice == CHAT_TOOL_CHOICE_ANY || c->tool_choice == CHAT_TOOL_CHOICE_NAMED) {
-        snprintf(err, errlen, "tool_choice %s: Nemotron-H's forced tool call is not built yet -- send auto or none",
-                 c->tool_choice == CHAT_TOOL_CHOICE_ANY ? "required" : "naming a function");
-        return false;
+/* ---- a forced tool_choice: "thinking skipped, a call opened" in the template's spelling ------------------------
+ * The template renders a call turn with no reasoning and no content as
+ *   <|im_start|>assistant\n<think></think>\n<tool_call>\n<function=NAME>\n...
+ * The generation prompt ends "<think>\n" with thinking on (the newline is not in the call turn's render, so the
+ * prefill drops it) and "<think></think>" with thinking off.  The seed is what the output parser reads before the
+ * model's first token; an UNNAMED seed stops before the name's opener "=" (token healing, as Qwen: the name is
+ * sampled under the declared-name mask, forced_name_open / forced_name_close). */
+void nemotron_forced_call_open(const request *r, buf *out) {
+    buf_puts(out, "<tool_call>\n<function");
+    if (r->forced_tool_name && r->forced_tool_name[0]) {
+        buf_puts(out, "=");
+        buf_puts(out, r->forced_tool_name);
+        buf_puts(out, ">\n");
     }
+}
+
+void nemotron_forced_call_seed(const request *r, buf *out) {
+    /* thinking on: the turn is in reasoning, the seed closes the empty block; off: the prompt already closed it */
+    buf_puts(out, (nemotron_effort)r->family_effort != NEMOTRON_EFFORT_NONE ? "</think>\n" : "\n");
+    nemotron_forced_call_open(r, out);
+}
+
+void nemotron_forced_call_prefill(const request *r, const char *prompt, size_t *keep, buf *append) {
+    if ((nemotron_effort)r->family_effort != NEMOTRON_EFFORT_NONE) {
+        /* the generation prompt's "<think>\n": keep "<think>", the call turn's render continues "</think>\n" */
+        if (*keep >= 8 && !memcmp(prompt + *keep - 8, "<think>\n", 8)) *keep -= 1;
+    }
+    nemotron_forced_call_seed(r, append);
+}
+
+bool nemotron_render(pulsar_engine *e, server *s, chat_conversation *c, request *r, char *err, size_t errlen) {
     if (!chat_openai_tools_json(c, r, err, errlen)) return false;
     r->has_tools = r->tools_json != NULL;
     render_prelude(s, c, r);
@@ -226,9 +249,9 @@ const server_family_ops k_family_nemotron_h = {
     /* .assistant_turn_sampled = */ nemotron_assistant_turn_sampled,
     /* .tool_result_tail      = */ nemotron_tool_result_tail,
     /* .tool_error_suffix     = */ nemotron_tool_error_suffix,
-    /* .forced_call_seed      = */ NULL,   /* the render refuses a forced tool_choice (not built for this family) */
-    /* .forced_call_prefill   = */ NULL,
-    /* .forced_name_open      = */ NULL,
-    /* .forced_name_close     = */ NULL,
+    /* .forced_call_seed      = */ nemotron_forced_call_seed,
+    /* .forced_call_prefill   = */ nemotron_forced_call_prefill,
+    /* .forced_name_open      = */ "=",   /* an unnamed seed ends at <function */
+    /* .forced_name_close     = */ ">",
     /* .find_call_block       = */ nemotron_find_call_block,
 };

@@ -4030,16 +4030,69 @@ static void test_nemotron_raw_calls_replay_and_key(void) {
 }
 
 /* What the family does not build refuses by name: a forced tool_choice, an image (N11). */
+/* A forced tool_choice on Nemotron: the prompt ends in the template's spelling of a call turn with no reasoning and no
+ * content ("<think></think>\n<tool_call>\n<function=NAME>\n"), thinking on or off; the seed is what the parser reads
+ * before the model's first token; an unnamed seed stops before the name's "=". */
+static void test_nemotron_forced_call_prefill_and_seed(void) {
+    for (int off = 0; off < 2; off++) {
+        const bool thinking_off = off == 1;
+        chat_conversation c = {};
+        chat_msgs_push(&c.msgs, qwen_test_msg("user", "Search for pulsars."));
+        c.tools_raw = xstrdup("[{\"type\":\"function\",\"function\":{\"name\":\"search\",\"parameters\":{\"type\":\"object\","
+                              "\"properties\":{\"q\":{\"type\":\"string\"}}}}}]");
+        c.tool_choice = CHAT_TOOL_CHOICE_NAMED;
+        if (thinking_off) chat_conversation_control(&c, "enable_thinking", xstrdup("false"));
+        request r;
+        request_init(&r, REQ_CHAT, 128);
+        r.api = API_OPENAI;
+        r.forced_tool_name = xstrdup("search");
+        tool_schema_orders_add_json(&r.tool_orders, "{\"name\":\"search\",\"parameters\":{\"type\":\"object\","
+                                                    "\"properties\":{\"q\":{\"type\":\"string\"}}}}");
+        char err[200] = {0};
+        TEST_ASSERT(render_chat_conversation(NULL, PULSAR_CHAT_NEMOTRON_H, NULL, &c, &r, err, sizeof err));
+        TEST_ASSERT(r.force_tool_call && r.has_tools);
+        const char *want = "<|im_start|>assistant\n<think></think>\n<tool_call>\n<function=search>\n";
+        const size_t plen = strlen(r.prompt_text);
+        TEST_ASSERT(plen > strlen(want) && !strcmp(r.prompt_text + plen - strlen(want), want));
+        buf seed = {0};
+        r.family->forced_call_seed(&r, &seed);
+        TEST_ASSERT(!strcmp(seed.ptr, thinking_off ? "\n<tool_call>\n<function=search>\n"
+                                                   : "</think>\n<tool_call>\n<function=search>\n"));
+        nemotron_output_parser p;
+        TEST_ASSERT(p.init(!thinking_off, r.tools_json, err, sizeof err));
+        std::vector<out_event> ev;
+        p.feed(seed.ptr, seed.len, &ev);
+        const char *body = "<parameter=q>\npulsars\n</parameter>\n</function>\n</tool_call>";
+        p.feed(body, strlen(body), &ev);
+        p.finish(&ev);
+        TEST_ASSERT(p.calls().size() == 1 && p.calls()[0].name == "search" && p.calls()[0].arguments == "{\"q\": \"pulsars\"}");
+        TEST_ASSERT(p.reasoning().empty() && p.content().empty() && p.errors() == 0);
+        buf_free(&seed);
+        /* unnamed: the seed stops before "=", the model's "=search>" completes the tag */
+        char *named = r.forced_tool_name;
+        r.forced_tool_name = NULL;
+        buf useed = {0};
+        r.family->forced_call_seed(&r, &useed);
+        TEST_ASSERT(!strcmp(useed.ptr, thinking_off ? "\n<tool_call>\n<function" : "</think>\n<tool_call>\n<function"));
+        TEST_ASSERT(!strcmp(r.family->forced_name_open, "=") && !strcmp(r.family->forced_name_close, ">"));
+        nemotron_output_parser u;
+        TEST_ASSERT(u.init(!thinking_off, r.tools_json, err, sizeof err));
+        std::vector<out_event> uev;
+        u.feed(useed.ptr, useed.len, &uev);
+        const std::string rest = std::string("=search>\n") + body;
+        u.feed(rest.data(), rest.size(), &uev);
+        u.finish(&uev);
+        TEST_ASSERT(u.calls().size() == 1 && u.calls()[0].name == "search" && u.errors() == 0);
+        r.forced_tool_name = named;
+        buf_free(&useed);
+        request_free(&r);
+        chat_conversation_free(&c);
+    }
+}
+
 static void test_nemotron_refusals(void) {
     char err[256];
     request r;
-    const char *forced = "{\"messages\":[{\"role\":\"user\",\"content\":\"x\"}],\"tools\":[{\"type\":\"function\",\"function\":"
-                         "{\"name\":\"f\",\"parameters\":{}}}],\"tool_choice\":\"required\"}";
-    TEST_ASSERT(!effort_case(PULSAR_CHAT_NEMOTRON_H, forced, &r, err, sizeof err));
-    TEST_ASSERT(strstr(err, "forced tool call is not built") != NULL);
-    request_free(&r);
-    const server_family_ops *nem = server_family_for_format(PULSAR_CHAT_NEMOTRON_H);
-    TEST_ASSERT(!nem->forced_call_seed && !nem->forced_call_prefill && !nem->forced_name_open && !nem->forced_name_close);
     /* auto: the tools block in the system turn */
     TEST_ASSERT(effort_case(PULSAR_CHAT_NEMOTRON_H, "{\"messages\":[{\"role\":\"user\",\"content\":\"x\"}],\"tools\":"
                             "[{\"type\":\"function\",\"function\":{\"name\":\"f\",\"parameters\":{}}}]}", &r, err, sizeof err));
@@ -9462,6 +9515,7 @@ static void pulsar_server_unit_tests_run(void) {
     test_inkling_refusals();
     test_inkling_tool_error_suffix_reminds_the_system_turn();
     test_nemotron_effort_map();
+    test_nemotron_forced_call_prefill_and_seed();
     test_nemotron_hooks_compose_to_the_full_render();
     test_nemotron_raw_calls_replay_and_key();
     test_nemotron_refusals();
