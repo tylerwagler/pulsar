@@ -108,21 +108,24 @@ dense_prep_kernel(const __nv_bfloat16 *__restrict__ x, const __half *__restrict_
     if (threadIdx.x == 0) inv[m] = pow2f(-p);
 }
 
-/* 4. one warp per (row, 128-block of outputs), in place on y. */
+/* 4. one warp per (row, 128-block of outputs), in place on y (row width N, the logical outputs).  The blocks past
+ * n_main -- one, the stored width's last when N is not a 128 multiple (exl3_out_stored, L295 F7) -- come from `tail`
+ * [M][128] instead, and only their columns below N are written. */
 __global__ void __launch_bounds__(256)
-dense_epilogue_kernel(float *__restrict__ y, const float *__restrict__ inv, const __half *__restrict__ svh,
-                      int M, int N) {
+dense_epilogue_kernel(float *__restrict__ y, const float *__restrict__ tail, const float *__restrict__ inv,
+                      const __half *__restrict__ svh, int M, int N, int n_main) {
     const int64_t task = (int64_t)blockIdx.x * 8 + (threadIdx.x >> 5);
-    const int n_blk = N >> 7;
+    const int n_blk = (int)(exl3_out_stored((uint64_t)N) >> 7);
     if (task >= (int64_t)M * n_blk) return;
     const int m = (int)(task / n_blk), blk = (int)(task % n_blk), lane = threadIdx.x & 31, n0 = blk * 128 + lane * 4;
     float4 *p = reinterpret_cast<float4 *>(y + (size_t)m * N + n0);
-    const float4 q = *p;
+    const float4 q = n0 < n_main ? *p : *reinterpret_cast<const float4 *>(tail + (size_t)m * 128 + (n0 - n_main));
     const float s = inv[m];
     float z[4] = {q.x * s, q.y * s, q.z * s, q.w * s};
     exl3dev::had128(z);
     const __half2 v01 = *reinterpret_cast<const __half2 *>(svh + n0), v23 = *reinterpret_cast<const __half2 *>(svh + n0 + 2);
-    *p = make_float4(z[0] * __low2float(v01), z[1] * __high2float(v01), z[2] * __low2float(v23), z[3] * __high2float(v23));
+    if (n0 < N)
+        *p = make_float4(z[0] * __low2float(v01), z[1] * __high2float(v01), z[2] * __low2float(v23), z[3] * __high2float(v23));
 }
 
 uint8_t *g_scratch = nullptr;
@@ -139,11 +142,15 @@ struct lt_shape {
     cublasLtMatrixLayout_t la;
     cublasLtMatmulAlgo_t algo;
 };
-/* per (shape, M): the row-count layouts and the check that the shape's algorithm supports M */
+/* per (shape, M, output columns n, output ld): the call's layouts -- A the shape's W_q columns [0, n) (ld the
+ * stored N), B the M rows, D [M][n] at ld -- and the check that the shape's algorithm supports them.  n = N, ld = N
+ * is the whole GEMM; a logical width short of the stored one (L295 F7) runs the 128-multiple head of the columns into
+ * y (ld the logical width) and the last stored block into the tail scratch (ld 128), each with the shape's one
+ * algorithm, so every column is the arithmetic the whole GEMM gives it. */
 struct lt_call {
-    int K, N, M;
+    int K, N, M, n, ldd;
     bool valid;
-    cublasLtMatrixLayout_t lb, ld;
+    cublasLtMatrixLayout_t la, lb, ld;
 };
 lt_shape g_shapes[16];
 int g_shapes_next;
@@ -187,26 +194,32 @@ const lt_shape *lt_shape_for(int K, int N, const char *tag) {
     return &slot;
 }
 
-const lt_call *lt_call_for(const lt_shape &sh, int M, const char *tag) {
+const lt_call *lt_call_for(const lt_shape &sh, int M, int n, int ldd, const char *tag) {
     for (lt_call &c : g_calls)
-        if (c.valid && c.K == sh.K && c.N == sh.N && c.M == M) return &c;
+        if (c.valid && c.K == sh.K && c.N == sh.N && c.M == M && c.n == n && c.ldd == ldd) return &c;
     lt_call nc = {};
-    nc.K = sh.K; nc.N = sh.N; nc.M = M;
+    nc.K = sh.K; nc.N = sh.N; nc.M = M; nc.n = n; nc.ldd = ldd;
+    cublasLtMatrixLayoutCreate(&nc.la, CUDA_R_16F, n, sh.K, sh.N);
     cublasLtMatrixLayoutCreate(&nc.lb, CUDA_R_16F, sh.K, M, sh.K);
-    cublasLtMatrixLayoutCreate(&nc.ld, CUDA_R_32F, sh.N, M, sh.N);
+    cublasLtMatrixLayoutCreate(&nc.ld, CUDA_R_32F, n, M, ldd);
     cublasLtMatmulHeuristicResult_t chk;
-    const cublasStatus_t cs = cublasLtMatmulAlgoCheck(g_lt, sh.op, sh.la, nc.lb, nc.ld, nc.ld, &sh.algo, &chk);
+    const cublasStatus_t cs = cublasLtMatmulAlgoCheck(g_lt, sh.op, nc.la, nc.lb, nc.ld, nc.ld, &sh.algo, &chk);
     if (cs != CUBLAS_STATUS_SUCCESS || chk.state != CUBLAS_STATUS_SUCCESS || chk.workspaceSize > kLtWorkspace) {
+        cublasLtMatrixLayoutDestroy(nc.la);
         cublasLtMatrixLayoutDestroy(nc.lb);
         cublasLtMatrixLayoutDestroy(nc.ld);
-        fprintf(stderr, "%s: the fixed kernel for K=%d N=%d (chosen at %d rows) does not support %d rows -- refusing\n",
-                tag, sh.K, sh.N, kCanonRows, M);
+        fprintf(stderr, "%s: the fixed kernel for K=%d N=%d (chosen at %d rows) does not support %d rows x %d columns "
+                        "(ld %d) -- refusing\n", tag, sh.K, sh.N, kCanonRows, M, n, ldd);
         return nullptr;
     }
     nc.valid = true;
     lt_call &slot = g_calls[g_calls_next];
     g_calls_next = (g_calls_next + 1) & 63;
-    if (slot.valid) { cublasLtMatrixLayoutDestroy(slot.lb); cublasLtMatrixLayoutDestroy(slot.ld); }
+    if (slot.valid) {
+        cublasLtMatrixLayoutDestroy(slot.la);
+        cublasLtMatrixLayoutDestroy(slot.lb);
+        cublasLtMatrixLayoutDestroy(slot.ld);
+    }
     slot = nc;
     return &slot;
 }
@@ -215,15 +228,18 @@ size_t up256(size_t b) { return (b + 255u) & ~(size_t)255u; }
 
 } // namespace
 
-int qwen_exl3_dense_prefill_launch(const void *w, int k2, const void *x_bf16, float *y, int M, int K, int N,
+int qwen_exl3_dense_prefill_launch(const void *w, int k2, const void *x_bf16, float *y, int M, int K, int Ny,
                                    uint64_t trellis_bytes, cudaStream_t stream) {
     const char *tag = "qwen_exl3_dense_prefill_launch";
-    if (!w || !x_bf16 || !y || M <= 0 || N % 128 || K % EXL3_HAD_BLOCK) {
-        fprintf(stderr, "%s: bad arguments (M=%d K=%d N=%d) -- refusing\n", tag, M, K, N);
+    if (!w || !x_bf16 || !y || M <= 0 || Ny <= 0 || Ny % 4 || K % EXL3_HAD_BLOCK) {
+        fprintf(stderr, "%s: bad arguments (M=%d K=%d N=%d) -- refusing\n", tag, M, K, Ny);
         return -1;
     }
+    /* N: the stored width the trellis and svh carry; Ny: the logical one, y's row (L295 F7) */
+    const int N = (int)exl3_out_stored((uint64_t)Ny), n_main = Ny / 128 * 128;
     const size_t wq_b = up256((size_t)K * N * sizeof(__half)), pl_b = up256((size_t)M * K * sizeof(__half));
-    const size_t need = wq_b + pl_b + up256((size_t)M * sizeof(float)) + kLtWorkspace;
+    const size_t tail_b = Ny == N ? 0 : up256((size_t)M * 128 * sizeof(float));
+    const size_t need = wq_b + pl_b + up256((size_t)M * sizeof(float)) + tail_b + kLtWorkspace;
     if (need > g_scratch_bytes) {
         if (g_scratch) cudaFree(g_scratch);
         g_scratch = nullptr;
@@ -240,12 +256,17 @@ int qwen_exl3_dense_prefill_launch(const void *w, int k2, const void *x_bf16, fl
         return -1;
     }
     const lt_shape *sh = lt_shape_for(K, N, tag);
-    const lt_call *call = sh ? lt_call_for(*sh, M, tag) : nullptr;
-    if (!call) return -1;
+    if (!sh) return -1;
+    /* the whole GEMM, or (a logical width short of the stored one) its 128-multiple head into y and its last stored
+     * block into the tail */
+    const lt_call *call = n_main ? lt_call_for(*sh, M, n_main, Ny, tag) : nullptr;
+    const lt_call *tcall = Ny != N ? lt_call_for(*sh, M, 128, 128, tag) : nullptr;
+    if ((n_main && !call) || (Ny != N && !tcall)) return -1;
     __half *wq = reinterpret_cast<__half *>(g_scratch);
     __half *xhi = reinterpret_cast<__half *>(g_scratch + wq_b);
     float *inv = reinterpret_cast<float *>(g_scratch + wq_b + pl_b);
-    void *lt_ws = g_scratch + wq_b + pl_b + up256((size_t)M * sizeof(float));
+    float *tail = Ny != N ? reinterpret_cast<float *>(g_scratch + wq_b + pl_b + up256((size_t)M * sizeof(float))) : nullptr;
+    void *lt_ws = g_scratch + wq_b + pl_b + up256((size_t)M * sizeof(float)) + tail_b;
     const uint32_t *tr = static_cast<const uint32_t *>(w);
     const __half *suh = reinterpret_cast<const __half *>(static_cast<const uint8_t *>(w) + trellis_bytes);
     const __half *svh = suh + K;
@@ -266,14 +287,18 @@ int qwen_exl3_dense_prefill_launch(const void *w, int k2, const void *x_bf16, fl
     dense_prep_kernel<<<M, 256, (size_t)K * sizeof(float), stream>>>(static_cast<const __nv_bfloat16 *>(x_bf16), suh,
                                                                        xhi, inv, K);
     const float one = 1.0f, zero = 0.0f;
-    const cublasStatus_t st = cublasLtMatmul(g_lt, sh->op, &one, wq, sh->la, xhi, call->lb, &zero, y, call->ld, y,
-                                             call->ld, &sh->algo, lt_ws, kLtWorkspace, stream);
-    if (st != CUBLAS_STATUS_SUCCESS) {
-        fprintf(stderr, "%s: cuBLAS GEMM failed (%d) -- refusing\n", tag, (int)st);
-        return -3;
+    for (const lt_call *c : {call, tcall}) {
+        if (!c) continue;
+        float *d = c == tcall ? tail : y;
+        const cublasStatus_t st = cublasLtMatmul(g_lt, sh->op, &one, c == tcall ? wq + n_main : wq, c->la, xhi, c->lb,
+                                                 &zero, d, c->ld, d, c->ld, &sh->algo, lt_ws, kLtWorkspace, stream);
+        if (st != CUBLAS_STATUS_SUCCESS) {
+            fprintf(stderr, "%s: cuBLAS GEMM failed (%d) -- refusing\n", tag, (int)st);
+            return -3;
+        }
     }
     const int64_t etasks = (int64_t)M * (N >> 7);
-    dense_epilogue_kernel<<<(unsigned)((etasks + 7) / 8), 256, 0, stream>>>(y, inv, svh, M, N);
+    dense_epilogue_kernel<<<(unsigned)((etasks + 7) / 8), 256, 0, stream>>>(y, tail, inv, svh, M, Ny, n_main);
     const cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
         fprintf(stderr, "%s: launch failed: %s\n", tag, cudaGetErrorString(err));

@@ -171,15 +171,15 @@ def mutate(shards, family, row, what):
             meta = s['header'].get('__metadata__', {})
             recs = json.loads(meta.get('pulsar.experts', '[]'))
             if any(r.get('gguf_name') == stack for r in recs):
-                edit_meta_json(s, 'pulsar.experts', lambda rs: [dict(r, layout='bf16') if r.get('gguf_name') == stack
+                edit_meta_json(s, 'pulsar.experts', lambda rs: [dict(r, layout='f32') if r.get('gguf_name') == stack
                                                                 else r for r in rs])
-                return f'{stack} layout bf16 (expert record)', [stack]
+                return f'{stack} layout f32 (expert record; no routed arm reads f32 -- bf16 is one since L295 F7)', [stack]
         i, cname = find_tensor(shards, stack)
         if i is None:
             sys.exit(f'loader_contract: {family} has no expert stack {stack}')
-        edit_meta_json(shards[i], 'pulsar.tensors', lambda t: {k: (dict(v, layout='bf16') if k == cname else v)
+        edit_meta_json(shards[i], 'pulsar.tensors', lambda t: {k: (dict(v, layout='f32') if k == cname else v)
                                                               for k, v in t.items()})
-        return f'{stack} layout bf16', [stack, cname]
+        return f'{stack} layout f32', [stack, cname]
     sys.exit(f'loader_contract: unknown mutation {what}')
 
 

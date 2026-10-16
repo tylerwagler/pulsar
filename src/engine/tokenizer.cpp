@@ -1701,8 +1701,8 @@ int pulsar_sample_dist_build(const float *logits, uint32_t n_vocab,
          * renormalised over it, so the only role `sum` plays is the
          * `filtered_sum / sum >= 1.0` break.  While a survivor remains that
          * ratio is at least prefilter/sum away from one, and with
-         * min_p >= PULSAR_SAMPLE_SPARSE_MINP_MIN over this vocabulary that is
-         * far more than an ulp, so the break can only coincide with the min-p
+         * pulsar_sample_sparse_minp(min_p, n_vocab) that is far more than an
+         * ulp, so the break can only coincide with the min-p
          * boundary.  Hand the emit +inf instead (the trick
          * pulsar_sample_dist_build_prefiltered documents) and members need no
          * normaliser at all.  An entry below the device prefilter's logit floor
@@ -1715,9 +1715,7 @@ int pulsar_sample_dist_build(const float *logits, uint32_t n_vocab,
         if (finite > 0) {
             uint64_t *keys = scratch->keys;
             const float prefilter = min_p * SAMPLE_MINP_PREFILTER_SLACK;
-            const bool full_nucleus = (top_p == 1.0f &&
-                                       min_p >= PULSAR_SAMPLE_SPARSE_MINP_MIN &&
-                                       n_vocab <= PULSAR_SAMPLE_SPARSE_VOCAB_MAX);
+            const bool full_nucleus = top_p == 1.0f && pulsar_sample_sparse_minp(min_p, n_vocab);
             const float floor_logit = full_nucleus
                 ? max_logit + temperature * (logf(min_p) - 1e-3f)
                 : -INFINITY;
@@ -1809,15 +1807,16 @@ int pulsar_sample_dist_build(const float *logits, uint32_t n_vocab,
  * over the full row.
  *
  * Byte-identical to pulsar_sample_dist_build(row, n_vocab, T, 0, 1.0f, min_p)
- * for min_p >= PULSAR_SAMPLE_SPARSE_MINP_MIN:
+ * for pulsar_sample_sparse_minp(min_p, n_vocab), n_vocab the width of the row
+ * the candidates came from:
  *   - same expf inputs (v - max)/T, same descending (logit, ascending id)
  *     order via the same radix keys (the ordinal is monotone in id in both),
  *     same min-p comparison (division-free, so no normaliser needed);
  *   - top_p == 1.0f is redundant given the min-p floor: the full path's
  *     `filtered_sum / sum >= 1.0f` can only fire once no further survivor
  *     exists (sum >= filtered_sum + min_p while one does, and
- *     min_p / filtered_sum > 2 ulp(1) for min_p >= the MIN and
- *     filtered_sum <= PULSAR_N_VOCAB), and when it fires the next candidate
+ *     min_p / filtered_sum > 2 * 2^-24 for filtered_sum <= n_vocab under
+ *     the predicate's floor -- the proof at pulsar_sample_sparse_minp), and when it fires the next candidate
  *     fails min-p anyway -- same `filtered`, same probs.  This path holds
  *     no full-row mass, so it hands the shared cutoff sum = +inf: the same
  *     loop, the test provably inert.
@@ -1827,10 +1826,10 @@ int pulsar_sample_dist_build(const float *logits, uint32_t n_vocab,
  * session_spec.cpp (pulsar_test --sampler pins the identity and its
  * sensitivity). */
 int pulsar_sample_dist_build_prefiltered(const int32_t *ids, const float *vals, uint32_t n_cand,
-                                         float max_logit, float temperature, float min_p,
+                                         uint32_t n_vocab, float max_logit, float temperature, float min_p,
                                          pulsar_sample_scratch *scratch, pulsar_sample_dist *out) {
-    if (!ids || !vals || !scratch || !out || n_cand == 0 || !(temperature > 0.0f) ||
-        !isfinite(max_logit) || !(min_p >= PULSAR_SAMPLE_SPARSE_MINP_MIN) || !(min_p <= 1.0f))
+    if (!ids || !vals || !scratch || !out || n_cand == 0 || n_cand > n_vocab || !(temperature > 0.0f) ||
+        !isfinite(max_logit) || !pulsar_sample_sparse_minp(min_p, n_vocab) || !(min_p <= 1.0f))
         return 0;
     sample_scratch_reserve(scratch, n_cand);
     sample_candidate *cand = scratch->cand;

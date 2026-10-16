@@ -274,7 +274,8 @@ pulsar-agent: $(AGENT_OBJS) src/lib/pulsar_help.o src/lib/pulsar_kvtext.o src/li
 # S4 (router / MoE / GR / PLE) beside DeepSeek's and the shared EXL3 arms.
 CUDA_REGRESSION_BINS = tests/cuda_long_context_smoke tests/moe_route_bounds_gate tests/expert_table_gate \
                        tests/exl3_moe_epilogue_gate tests/exl3_dense_gate tests/exl3_moe_prefill_gate tests/exl3_half_gate \
-                       tests/gdn_gate tests/qsa_attn_gate tests/qwen_s4_gate tests/router_gate tests/gqa_attn_gate tests/sconv_gate tests/head_gate
+                       tests/gdn_gate tests/qsa_attn_gate tests/qwen_s4_gate tests/router_gate tests/gqa_attn_gate tests/sconv_gate tests/head_gate \
+                       tests/bf16_rows_gate
 # 2026-10-14: they run CONCURRENTLY, each one's output kept together (-O).  They are model-free and mostly
 # host-bound (their references run on the CPU: measured alone, 258 s in series, the longest 114 s of which 113 s
 # user time), so in series they were 258 s of the battery's serial front.  No gate here grades a time.
@@ -289,6 +290,16 @@ cuda-regression: $(CUDA_REGRESSION_BINS)
 $(filter-out cuda-regression-run/router_gate,$(CUDA_REGRESSION_RUNS)): cuda-regression-run/%: tests/%
 	./tests/$* $(if $(filter exl3_half_gate,$*),$(EXL3_HALF_SCRATCH))
 cuda-regression-run/router_gate: router-gate
+
+# L295 F7: BF16 weights x raw bf16 rows -- the dense arm (rows kernel at decode widths, the fixed-order cuBLASLt GEMM
+# for prompt chunks) and the routed arm, vs double, plus their M / chunk invariance.  Needs a GPU, no model.
+tests/bf16_rows_gate: tests/bf16_rows_gate.cu src/cuda/pulsar_cuda_bf16_rows.cuh src/cuda/pulsar_cuda_qwen.h $(CUDA_OBJS) \
+                      $(CUTLASS_CUDA_OBJS) $(MMQ_OBJS) Makefile
+	$(NVCC) $(NVCCFLAGS) -std=c++17 -Isrc -Isrc/cuda -o $@ tests/bf16_rows_gate.cu \
+		$(CUDA_OBJS) $(CUTLASS_CUDA_OBJS) $(MMQ_OBJS) $(CUDA_LDLIBS)
+.PHONY: bf16-rows-gate
+bf16-rows-gate: tests/bf16_rows_gate
+	./tests/bf16_rows_gate
 
 # L218: the two KV row packers (window E4M3/E8M0, main E2M1/E4M3) byte-exact
 # against the host replica in tests/kv_row_fixture.h, plus the ring slot rule.
@@ -2297,7 +2308,7 @@ gates-dev:
 	fi; \
 	$(MAKE) -j$(GATE_JOBS) --no-print-directory tests/gates_runner pulsar_test CUDA_ARCH=sm_120f || exit 1; \
 	$(MAKE) --no-print-directory gates-preflight || exit 1; \
-	paths='$(PATHS)'; why=''; attn=0; server=0; vision=0; exl3=0; family=0; gdn=0; router=0; blocks=0; \
+	paths='$(PATHS)'; why=''; attn=0; server=0; vision=0; exl3=0; family=0; gdn=0; router=0; blocks=0; bf16=0; minp=0; \
 	if [ -z "$$paths" ]; then \
 	  paths=$$( { git diff --name-only HEAD; git ls-files --others --exclude-standard; } 2>/dev/null \
 	            | grep -E '\.(c|cc|cpp|cu|cuh|h|hpp)$$' | sort -u ); \
@@ -2325,6 +2336,8 @@ gates-dev:
 	      esac; \
 	      why="$$why $$p($$cls)"; \
 	      case "$$p" in *router*|*moe*) router=1 ;; esac; \
+	      case "$$p" in *bf16_rows*|*weight_format*|src/engine/linear.cpp|src/engine/moe.cpp) bf16=1 ;; esac; \
+	      case "$$p" in *minp*|src/engine/tokenizer.cpp|src/engine/spec_dspark.cpp|src/engine/session_spec.cpp) minp=1 ;; esac; \
 	      case $$cls in \
 	        attn) for g in $(GATES_DEV_ATTN); do add $$g; done ;; \
 	        cuda) for g in $(GATES_DEV_CUDA); do add $$g; done ;; \
@@ -2350,6 +2363,8 @@ gates-dev:
 	if [ $$attn -eq 1 ]; then printf '  cuda-attn-gates: selected (attention kernels)\n'; fi; \
 	if [ $$router -eq 1 ]; then printf '  router-gate + qwen-s4-gate: selected (the shared router, the rows MoE block)\n'; fi; \
 	if [ $$blocks -eq 1 ]; then printf '  block gates: sconv-gate, head-gate (the L295 short convolution and head options)\n'; fi; \
+	if [ $$bf16 -eq 1 ]; then printf '  bf16-rows-gate: selected (the BF16 rows arms and their admission)\n'; fi; \
+	if [ $$minp -eq 1 ]; then printf '  cuda-minp-prefilter-gate: selected (the sparse min-p contract)\n'; fi; \
 	if [ $$server -eq 1 ]; then printf '  server: chat smoke + the --server/--api unit switches\n'; fi; \
 	$(MAKE) --no-print-directory seam-check CUDA_ARCH=sm_120f || rc=1; \
 	$(MAKE) --no-print-directory cuda-reap-router-audit CUDA_ARCH=sm_120f \
@@ -2377,6 +2392,12 @@ gates-dev:
 	fi; \
 	if [ $$blocks -eq 1 ]; then \
 	  $(MAKE) --no-print-directory sconv-gate head-gate CUDA_ARCH=sm_120f || rc=1; \
+	fi; \
+	if [ $$bf16 -eq 1 ]; then \
+	  $(MAKE) --no-print-directory bf16-rows-gate CUDA_ARCH=sm_120f || rc=1; \
+	fi; \
+	if [ $$minp -eq 1 ]; then \
+	  $(MAKE) --no-print-directory cuda-minp-prefilter-gate CUDA_ARCH=sm_120f || rc=1; \
 	fi; \
 	if [ $$exl3 -eq 1 ]; then \
 	  $(MAKE) --no-print-directory exl3-dequant-gate CUDA_ARCH=sm_120f || rc=1; \
@@ -3043,7 +3064,7 @@ test: pulsar_test seam-check
 clean:
 	rm -rf .build
 	rm -rf tests/runner
-	rm -f tests/gates_runner pulsar pulsar-server pulsar-bench pulsar-eval pulsar-agent pulsar_test pulsar_agent_test src/engine/*.o src/families/*/*.o src/families/*/*.d src/tp/*.o src/agent/*.o src/server/*.o src/cuda/*.o src/cuda/mmq/*.o src/cuda/mmq/test/*.o src/cli/*.o src/lib/*.o src/vendor/*.o tests/*.o src/engine/*.d src/agent/*.d src/server/*.d src/cuda/*.d src/cuda/mmq/*.d src/cuda/mmq/test/*.d src/cli/*.d src/lib/*.d src/vendor/*.d tests/*.d tests/vision_visible_gate tests/vision_hc_gate tests/vision_image_gate tests/vision_placeholder_gate tests/vision_image_sync_gate tests/vision_chunk_gate tests/cuda_long_context_smoke tests/moe_route_bounds_gate tests/expert_table_gate tests/multiseq_frontier_gate tests/multiseq_decode_gate tests/prefill_bitexact_gate tests/bank_spec_gate tests/spec_sampling_gate tests/spec_sampling_gate_wide tests/accounting_gate tests/bank_evict_restore_gate tests/session_payload_gate tests/algo_stability_gate tests/mixed_prefill_gate tests/mixed_zero_prefill_gate tests/fused_step_gate tests/head_graph_replay_gate tests/decode_reference_gate tests/verify_width_probe tests/mixed_neutrality_gate tests/comp_state_gate tests/spec_teacher_forced_probe tests/attn_f16_kernel_test tests/attn_f16_banked_test tests/kv_rows_pack_gate tests/kv_rows_pack_gate_fastmath tests/minp_prefilter_gate tests/dspark_batch_gate tests/nt_crossover_sweep tests/vision_router_gate tests/router_gate tests/qwen_family_gate tests/inkling_family_gate tests/state_kinds_gate tests/payload_frontier_gate tests/prompt_end_gate tests/bank_residency_gate
+	rm -f tests/gates_runner pulsar pulsar-server pulsar-bench pulsar-eval pulsar-agent pulsar_test pulsar_agent_test src/engine/*.o src/families/*/*.o src/families/*/*.d src/tp/*.o src/agent/*.o src/server/*.o src/cuda/*.o src/cuda/mmq/*.o src/cuda/mmq/test/*.o src/cli/*.o src/lib/*.o src/vendor/*.o tests/*.o src/engine/*.d src/agent/*.d src/server/*.d src/cuda/*.d src/cuda/mmq/*.d src/cuda/mmq/test/*.d src/cli/*.d src/lib/*.d src/vendor/*.d tests/*.d tests/vision_visible_gate tests/vision_hc_gate tests/vision_image_gate tests/vision_placeholder_gate tests/vision_image_sync_gate tests/vision_chunk_gate tests/cuda_long_context_smoke tests/moe_route_bounds_gate tests/expert_table_gate tests/multiseq_frontier_gate tests/multiseq_decode_gate tests/prefill_bitexact_gate tests/bank_spec_gate tests/spec_sampling_gate tests/spec_sampling_gate_wide tests/accounting_gate tests/bank_evict_restore_gate tests/session_payload_gate tests/algo_stability_gate tests/mixed_prefill_gate tests/mixed_zero_prefill_gate tests/fused_step_gate tests/head_graph_replay_gate tests/decode_reference_gate tests/verify_width_probe tests/mixed_neutrality_gate tests/comp_state_gate tests/spec_teacher_forced_probe tests/attn_f16_kernel_test tests/attn_f16_banked_test tests/kv_rows_pack_gate tests/kv_rows_pack_gate_fastmath tests/minp_prefilter_gate tests/dspark_batch_gate tests/nt_crossover_sweep tests/vision_router_gate tests/router_gate tests/bf16_rows_gate tests/qwen_family_gate tests/inkling_family_gate tests/state_kinds_gate tests/payload_frontier_gate tests/prompt_end_gate tests/bank_residency_gate
 
 # Pull in the generated header dependencies.  `-include` (not `include`) so a
 # tree with no .d files yet -- a fresh clone, or right after `make clean` -- is

@@ -424,8 +424,7 @@ static int dspark_draft_group(pulsar_session *s, spec_redraft_req *const *qs, co
         for (int j = n_g; j < n_sel && ok; j++) {
             const spec_redraft_req *q = qs[j];
             const bool sparse = q->top_k <= 0 && q->top_p == 1.0f &&
-                                q->min_p >= PULSAR_SAMPLE_SPARSE_MINP_MIN && q->min_p <= 1.0f &&
-                                vocab_size <= PULSAR_SAMPLE_SPARSE_VOCAB_MAX;
+                                pulsar_sample_sparse_minp(q->min_p, vocab_size) && q->min_p <= 1.0f;
             if (!sparse) { all_sparse = false; continue; }
             /* floor in logit units, a hair below T*ln(min_p): the host build decides membership, this
              * only bounds the read */
@@ -469,7 +468,7 @@ static int dspark_draft_group(pulsar_session *s, spec_redraft_req *const *qs, co
                         if (n_c == 0 ||
                             !pulsar_sample_dist_build_prefiltered(
                                 h + 3, (const float *)(h + 3 + PULSAR_DSPARK_PREFILTER_CAP), n_c,
-                                max_logit, q->temperature, q->min_p, &s->sample_scratch, &qd)) {
+                                vocab_size, max_logit, q->temperature, q->min_p, &s->sample_scratch, &qd)) {
                             fprintf(stderr, "pulsar: dspark min-p prefilter handed %u "
                                             "candidates at draft position %u and the build refused "
                                             "them -- refusing the pass (L190)\n", n_c, pos);
@@ -631,8 +630,7 @@ static void dspark_harvest(pulsar_session *s) {
 static void ds4_round_note(pulsar_session *s, float temperature, int top_k, float top_p, float min_p) {
     pulsar_gpu_graph *g = s->graph;
     const bool in_contract = temperature > 0.0f && top_k <= 0 && top_p == 1.0f &&
-                             min_p >= PULSAR_SAMPLE_SPARSE_MINP_MIN && min_p <= 1.0f &&
-                             spec_vocab(s) <= PULSAR_SAMPLE_SPARSE_VOCAB_MAX;
+                             pulsar_sample_sparse_minp(min_p, spec_vocab(s)) && min_p <= 1.0f;
     const float d = in_contract
         ? (float)((double)temperature * (log((double)min_p) - 1e-3)) : 0.0f;
     if (g->spec_compact_acc_n == 0) {

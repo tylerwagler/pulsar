@@ -13,7 +13,8 @@
  * and -inf holes exercise the finite filter (an +inf would otherwise be the
  * max); an all-non-finite row must report count 0 and max id -1; a flat row
  * against a deep floor must overflow the cap and leave the arrays untouched;
- * strided multi-row batches check the row addressing the verify path will use.
+ * strided multi-row batches check the row addressing the verify path will use.  Every case runs at each
+ * vocabulary in k_vocabs.
  *
  * Also prints the per-launch time for a 9-row batch: the number the L149
  * price (~630 us of host time per draft position) is being traded for. */
@@ -27,7 +28,10 @@
 #include <cstring>
 #include <vector>
 
-enum { N_VOCAB = 129280, CAP = 2048, ROW_I32 = 3 + 2 * CAP };
+enum { CAP = 2048, ROW_I32 = 3 + 2 * CAP };
+/* L295 F7: every vocabulary a family serves (DeepSeek 129280, Inkling 201024, Qwen 248320) and 262144 -- the
+ * kernel gives each of its 1024 threads (n_vocab + 1023) / 1024 ids; nothing in it is a vocabulary constant */
+static const uint32_t k_vocabs[] = {129280u, 201024u, 248320u, 262144u};
 
 static uint64_t g_rng = 0x9E3779B97F4A7C15ull;
 static uint32_t rnd(void) {
@@ -100,12 +104,10 @@ static void fill(float *x, uint32_t n, int shape, float delta) {
     }
 }
 
-int main(void) {
-    if (pulsar_gpu_init() == 0) {
-        fprintf(stderr, "minp_prefilter_gate: no GPU\n");
-        return 2;
-    }
+/* Every case at one vocabulary. */
+static void run_vocab(const uint32_t N_VOCAB, int &failures, int &checked_rows) {
     struct Case { const char *name; uint32_t rows; uint32_t stride; float delta; int shape; };
+    printf("-- vocab %u\n", N_VOCAB);
     const float d05 = (float)(1.0 * (log(0.05) - 1e-3));   /* T=1, min_p 0.05: the production floor */
     const Case cases[] = {
         {"peaked, 1 row",                 1, N_VOCAB,       d05,    0},
@@ -118,7 +120,6 @@ int main(void) {
         {"single finite",                 2, N_VOCAB,       d05,    5},
         {"signed zeros, delta 0",         2, N_VOCAB,       0.0f,   6},
     };
-    int failures = 0, checked_rows = 0;
     std::vector<int32_t> eids; std::vector<float> evals;
     for (const Case &c : cases) {
         std::vector<float> host((size_t)c.rows * c.stride, -INFINITY);
@@ -178,6 +179,15 @@ int main(void) {
         pulsar_gpu_tensor_free(dx);
         pulsar_gpu_tensor_free(dout);
     }
+}
+
+int main(void) {
+    if (pulsar_gpu_init() == 0) {
+        fprintf(stderr, "minp_prefilter_gate: no GPU\n");
+        return 2;
+    }
+    int failures = 0, checked_rows = 0;
+    for (const uint32_t n_vocab : k_vocabs) run_vocab(n_vocab, failures, checked_rows);
     printf("MINP PREFILTER GATE: %s (%d rows checked, %d failures)\n", failures ? "FAIL" : "PASS",
            checked_rows, failures);
     return failures ? 1 : 0;
