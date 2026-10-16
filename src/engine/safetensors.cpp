@@ -923,6 +923,16 @@ static void st_open(pulsar_model *m, const char *path, bool gpu_mapping) {
         if (st_meta_get(&shards[i], "pulsar.kv")) { primary = &shards[i]; break; }
     }
     if (!primary) st_die("safetensors: no shard in %s carries pulsar.kv", path);
+    /* L298: every shard carries the build's architecture keys (pulsar.kv_arch); a shard whose copy differs from the
+     * primary's came from another build -- a container assembled by hand from two artifacts -- and is refused */
+    if (const char *arch = st_meta_get(primary, "pulsar.kv_arch")) {
+        for (uint64_t i = 0; i < n; i++) {
+            const char *k = st_meta_get(&shards[i], "pulsar.kv_arch");
+            if (k && strcmp(k, arch) != 0)
+                st_die("safetensors: %s's pulsar.kv_arch differs from the primary shard's (%s): a shard of another "
+                       "build -- refusing the container", shards[i].name, primary->name);
+        }
+    }
     st_build_kv(m, primary);
 
     st_dir d = {0};
