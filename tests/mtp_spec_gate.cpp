@@ -443,9 +443,26 @@ static int exact(pulsar_engine *e, int n, const char *only) {
             }
             if (m == 0) break;
             uint32_t rows = 0;
-            ok = pulsar_session_spec_assemble_batch(s, st, m, width, reqs.data(), &rows) == 0 && rows > 0;
-            for (int i = 0; ok && i < m; i++) ok = st[i].status == PULSAR_SPEC_STEP_OK;
-            if (!ok) { snprintf(err, sizeof err, "assemble: %s", m ? st[0].err : ""); break; }
+            (void)pulsar_session_spec_assemble_batch(s, st, m, width, reqs.data(), &rows);
+            /* as the server's lane: a bank whose base is a stop token emits it and ends (never evaluated); a bank
+             * over the row budget sits the tick out untouched; the rest verify (a deep chain -- the drafter's cap 7,
+             * a copy chain -- can fill the width) */
+            int live = 0;
+            for (int i = 0; ok && i < m; i++) {
+                if (st[i].status == PULSAR_SPEC_STEP_EOS) {
+                    got[bank_of[i]].push_back(st[i].first_token);
+                    done[bank_of[i]] = true;
+                } else if (st[i].status == PULSAR_SPEC_STEP_OK) {
+                    st[live] = st[i];
+                    bank_of[live++] = bank_of[i];
+                } else if (st[i].status != PULSAR_SPEC_STEP_SKIPPED) {
+                    ok = false;
+                    snprintf(err, sizeof err, "assemble bank %u: status %d %s", st[i].bank, (int)st[i].status, st[i].err);
+                }
+            }
+            if (!ok) break;
+            m = live;
+            if (m == 0 || rows == 0) continue;
             std::vector<float> logits((size_t)rows * W);
             uint32_t gotr = 0;
             pulsar_session_spec_arm_capture(s, rows);
