@@ -757,8 +757,8 @@ static void encode_chat_lead_in(const pulsar_vocab *vocab, bool has_system,
 
 /* The tokenizer entries serve a family with a tokenizer table (pulsar_family::tokenizer); the chat front's entries
  * (chat_open / chat_turn / chat_end_assistant) a family that also declares its chat front (family.h
- * PULSAR_FAMILY_CAP_CHAT) -- L295: a family's tokenizer can be wired before its chat renderer is (Inkling: token ids
- * and text in and out, its turn-by-turn chat front still E6's).  These entries return no error, so a family without
+ * PULSAR_FAMILY_CAP_CHAT) -- L295: a family's tokenizer can be wired before its chat renderer is (token ids and
+ * text in and out without the turn-by-turn chat front).  These entries return no error, so a family without
  * what they need ends the process here, by name, instead of tokenizing with an empty vocabulary; the front ends
  * refuse such an engine at startup (pulsar_engine_has_tokenizer, which asks for both) before they can reach this. */
 static const pulsar_family_tokenizer *tokenizer_require(const pulsar_engine *e, const char *op) {
