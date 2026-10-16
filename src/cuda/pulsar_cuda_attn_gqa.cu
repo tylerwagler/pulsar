@@ -578,16 +578,14 @@ uint64_t pulsar_gqa_workspace_bytes(const pulsar_gqa_layer *layer, uint32_t n_ro
     return std::max(at_max, split);
 }
 
-int pulsar_gqa_forward(const pulsar_gqa_layer *L, const pulsar_gqa_seq *seqs, uint32_t n_seqs,
-                       const uint32_t *row_seq, const uint32_t *row_pos, uint32_t n_rows,
-                       const pulsar_gqa_io *io, cudaStream_t st) {
-    if (!L || !seqs || !row_seq || !row_pos || !io || n_rows == 0 || n_seqs == 0) {
-        return gqa_refuse("a NULL argument or zero rows");
-    }
-    if (n_rows > 65535u) return gqa_refuse("more than 65535 rows in one call (the grid's tile dimension)");
+uint64_t pulsar_gqa_desc_bytes(uint32_t n_rows) {
+    return gqa_up((uint64_t)n_rows * sizeof(gqa_row)) + gqa_up((uint64_t)n_rows * sizeof(gqa_tile));
+}
+
+/* The layer's declaration, checked by a plan and a launch alike. */
+static int gqa_layer_refusal(const pulsar_gqa_layer *L) {
     if (L->n_q == 0 || L->n_kv == 0 || L->n_q % L->n_kv) return gqa_refuse("n_q is not a positive multiple of n_kv");
-    const uint32_t G = L->n_q / L->n_kv;
-    if (G > GQA_MAX_GROUP) return gqa_refuse("the query group n_q / n_kv is wider than 64 (one CTA's MMA rows)");
+    if (L->n_q / L->n_kv > GQA_MAX_GROUP) return gqa_refuse("the query group n_q / n_kv is wider than 64 (one CTA's MMA rows)");
     if (L->head_dim != 64u && L->head_dim != 128u) return gqa_refuse("head_dim has no built tile (64, 128)");
     if (L->kv_fmt != PULSAR_GQA_KV_BF16) return gqa_refuse("the KV row format has no tile loader (BF16 only)");
     if (L->span == PULSAR_GQA_FULL ? L->window != 0u : (L->span != PULSAR_GQA_WINDOW || L->window == 0u)) {
@@ -603,19 +601,21 @@ int pulsar_gqa_forward(const pulsar_gqa_layer *L, const pulsar_gqa_seq *seqs, ui
     if (L->temp_floor < 0.f || (L->temp_floor > 0.f && !isfinite(L->temp_alpha))) {
         return gqa_refuse("the temperature floor is negative or its alpha is not finite");
     }
-    const uint32_t HD = L->head_dim;
-    if (!gqa_in_ok(io->q, L->n_q, HD) || !gqa_in_ok(io->k, L->n_kv, HD) || !gqa_in_ok(io->v, L->n_kv, HD)) {
-        return gqa_refuse("a q / k / v input is missing or its strides overlap its heads");
+    return 0;
+}
+
+int pulsar_gqa_plan(const pulsar_gqa_layer *L, const pulsar_gqa_seq *seqs, uint32_t n_seqs,
+                    const uint32_t *row_seq, const uint32_t *row_pos, uint32_t n_rows, uint32_t ctx_bound,
+                    void *desc, uint64_t desc_cap, pulsar_gqa_call *out) {
+    if (!L || !seqs || !row_seq || !row_pos || !out || n_rows == 0 || n_seqs == 0) {
+        return gqa_refuse("a NULL argument or zero rows");
     }
-    if (L->rel_extent && (!gqa_in_ok(io->r, L->n_q, L->rel_dim) || ((uintptr_t)io->r.ptr & 3u) || (io->r.ld & 1u) ||
-                          (io->r.head_stride & 1u))) {
-        return gqa_refuse("the relative bias's r input is missing, overlapping, or not bf16-pair aligned");
+    if (n_rows > 65535u) return gqa_refuse("more than 65535 rows in one call (the grid's tile dimension)");
+    if (const int rc = gqa_layer_refusal(L)) return rc;
+    if (!desc || desc_cap < pulsar_gqa_desc_bytes(n_rows)) {
+        return gqa_refuse("the descriptor buffer is short of pulsar_gqa_desc_bytes");
     }
-    if (L->out_gate && !gqa_in_ok(io->gate, L->n_q, HD)) return gqa_refuse("out_gate is declared but its gate input is missing");
-    if (!io->out_bf16 || ((uintptr_t)io->out_bf16 & 3u) || (io->ld_out & 1u) || io->ld_out < (uint64_t)L->n_q * HD) {
-        return gqa_refuse("out_bf16 is missing, not bf16-pair aligned, or narrower than n_q * head_dim");
-    }
-    if (((uintptr_t)io->workspace & 255u) != 0) return gqa_refuse("the workspace is not 256-byte aligned");
+    const uint32_t G = L->n_q / L->n_kv;
     const uint64_t tb = pulsar_gqa_kv_token_bytes(L);
 
     /* rows -> descriptors; every sequence is ONE run of consecutive positions */
@@ -639,15 +639,10 @@ int pulsar_gqa_forward(const pulsar_gqa_layer *L, const pulsar_gqa_seq *seqs, ui
         run_last[sq] = r;
         max_ctx = std::max(max_ctx, row_pos[r] + 1u);
     }
-    const gqa_ws need = gqa_ws_layout(nullptr, L, n_rows, max_ctx);
-    if (!io->workspace || io->workspace_bytes < need.bytes) {
-        fprintf(stderr, "pulsar: gqa attention refused: workspace %llu B < %llu B for %u rows at ctx %u\n",
-                (unsigned long long)io->workspace_bytes, (unsigned long long)need.bytes, n_rows, max_ctx);
-        return -1;
-    }
-    const gqa_ws ws = gqa_ws_layout((uint8_t *)io->workspace, L, n_rows, max_ctx);
+    if (ctx_bound && max_ctx > ctx_bound) return gqa_refuse("a row's position is at or past the call's ctx_bound");
 
-    std::vector<gqa_row> h_rows(n_rows);
+    gqa_row *h_rows = (gqa_row *)desc;
+    gqa_tile *h_tiles = (gqa_tile *)((uint8_t *)desc + gqa_up((uint64_t)n_rows * sizeof(gqa_row)));
     for (uint32_t r = 0; r < n_rows; r++) {
         const uint32_t sq = row_seq[r], p = row_pos[r];
         gqa_row &d = h_rows[r];
@@ -665,18 +660,58 @@ int pulsar_gqa_forward(const pulsar_gqa_layer *L, const pulsar_gqa_seq *seqs, ui
     }
     /* tiles: runs of up to 64 / G consecutive rows of one sequence */
     const uint32_t qt = GQA_MROWS / G;
-    std::vector<gqa_tile> h_tiles;
-    h_tiles.reserve(n_rows);
-    uint32_t grid_chunks = 1;
+    uint32_t n_tiles = 0, grid_chunks = 1;
     for (uint32_t r = 0; r < n_rows;) {
         uint32_t n = 1;
         while (n < qt && r + n < n_rows && row_seq[r + n] == row_seq[r]) n++;
-        h_tiles.push_back({r, n});
+        h_tiles[n_tiles++] = {r, n};
         grid_chunks = std::max(grid_chunks, h_rows[r + n - 1u].pos / GQA_CHUNK - h_rows[r].chunk0 + 1u);
         r += n;
     }
-    const uint32_t n_tiles = (uint32_t)h_tiles.size();
-    const bool fold = n_rows >= GQA_FOLD_ROWS;
+    /* A bounded call's split grid is the bound's (a CTA whose chunk is past its tile's last row exits before it reads
+     * anything, and the combine folds each row's own chunks): its launches then depend on (n_rows, n_tiles, the
+     * bound) and never on the positions -- what a captured step replays.  The bytes are the unbounded call's. */
+    if (ctx_bound) grid_chunks = gqa_max_chunks(L, ctx_bound);
+    out->n_rows = n_rows;
+    out->n_tiles = n_tiles;
+    out->grid_chunks = grid_chunks;
+    out->ctx_bound = ctx_bound ? ctx_bound : max_ctx;
+    out->fold = n_rows >= GQA_FOLD_ROWS ? 1 : 0;
+    return 0;
+}
+
+int pulsar_gqa_launch(const pulsar_gqa_layer *L, const pulsar_gqa_call *call, const void *desc_dev,
+                      const pulsar_gqa_io *io, cudaStream_t st) {
+    if (!L || !call || !desc_dev || !io || call->n_rows == 0 || call->n_tiles == 0) {
+        return gqa_refuse("a NULL argument or an empty plan");
+    }
+    if (const int rc = gqa_layer_refusal(L)) return rc;
+    const uint32_t G = L->n_q / L->n_kv, HD = L->head_dim, n_rows = call->n_rows;
+    if (!gqa_in_ok(io->q, L->n_q, HD) || !gqa_in_ok(io->k, L->n_kv, HD) || !gqa_in_ok(io->v, L->n_kv, HD)) {
+        return gqa_refuse("a q / k / v input is missing or its strides overlap its heads");
+    }
+    if (L->rel_extent && (!gqa_in_ok(io->r, L->n_q, L->rel_dim) || ((uintptr_t)io->r.ptr & 3u) || (io->r.ld & 1u) ||
+                          (io->r.head_stride & 1u))) {
+        return gqa_refuse("the relative bias's r input is missing, overlapping, or not bf16-pair aligned");
+    }
+    if (L->out_gate && !gqa_in_ok(io->gate, L->n_q, HD)) return gqa_refuse("out_gate is declared but its gate input is missing");
+    if (!io->out_bf16 || ((uintptr_t)io->out_bf16 & 3u) || (io->ld_out & 1u) || io->ld_out < (uint64_t)L->n_q * HD) {
+        return gqa_refuse("out_bf16 is missing, not bf16-pair aligned, or narrower than n_q * head_dim");
+    }
+    if (((uintptr_t)io->workspace & 255u) != 0 || ((uintptr_t)desc_dev & 255u) != 0) {
+        return gqa_refuse("the workspace or the descriptors are not 256-byte aligned");
+    }
+    const uint64_t tb = pulsar_gqa_kv_token_bytes(L);
+    const gqa_ws need = gqa_ws_layout(nullptr, L, n_rows, call->ctx_bound);
+    if (!io->workspace || io->workspace_bytes < need.bytes) {
+        fprintf(stderr, "pulsar: gqa attention refused: workspace %llu B < %llu B for %u rows at ctx %u\n",
+                (unsigned long long)io->workspace_bytes, (unsigned long long)need.bytes, n_rows, call->ctx_bound);
+        return -1;
+    }
+    gqa_ws ws = gqa_ws_layout((uint8_t *)io->workspace, L, n_rows, call->ctx_bound);
+    ws.rows = (gqa_row *)desc_dev;
+    ws.tiles = (gqa_tile *)((const uint8_t *)desc_dev + gqa_up((uint64_t)n_rows * sizeof(gqa_row)));
+    const bool fold = call->fold != 0;
 
     const uint64_t key = pulsar_shape_key(((uint64_t)n_rows << 1) | (fold ? 1u : 0u),
                                           ((uint64_t)L->n_q << 24) ^ ((uint64_t)L->n_kv << 16) ^ ((uint64_t)HD << 4) ^
@@ -686,19 +721,8 @@ int pulsar_gqa_forward(const pulsar_gqa_layer *L, const pulsar_gqa_seq *seqs, ui
                         "qk norm %s, gate %s: %u rows in %u tiles, %s\n",
                 L->n_q, L->n_kv, HD, L->span == PULSAR_GQA_WINDOW ? "window" : "full", L->window,
                 L->rel_extent ? "on" : "off", L->rel_extent, L->temp_floor > 0.f ? "on" : "off",
-                L->qk_norm ? "on" : "off", L->out_gate ? "on" : "off", n_rows, n_tiles,
+                L->qk_norm ? "on" : "off", L->out_gate ? "on" : "off", n_rows, call->n_tiles,
                 fold ? "chunks folded in the CTA" : "chunks in parallel + combine");
-    }
-
-    {   /* rows and tiles are adjacent in the workspace: one upload, staged in their workspace layout */
-        const uint64_t toff = (uint64_t)((uint8_t *)ws.tiles - (uint8_t *)ws.rows);
-        std::vector<uint8_t> stage(toff + (uint64_t)n_tiles * sizeof(gqa_tile));
-        memcpy(stage.data(), h_rows.data(), (uint64_t)n_rows * sizeof(gqa_row));
-        memcpy(stage.data() + toff, h_tiles.data(), (uint64_t)n_tiles * sizeof(gqa_tile));
-        if (cudaMemcpyAsync(ws.rows, stage.data(), stage.size(), cudaMemcpyHostToDevice, st) != cudaSuccess) {
-            fprintf(stderr, "pulsar: gqa attention: descriptor upload failed\n");
-            return -3;
-        }
     }
 
     gqa_prep_args pa{};
@@ -725,6 +749,31 @@ int pulsar_gqa_forward(const pulsar_gqa_layer *L, const pulsar_gqa_seq *seqs, ui
     aa.out = (__nv_bfloat16 *)io->out_bf16; aa.ld_out = io->ld_out;
     aa.tap = io->tap_out_f32;
 
-    return HD == 128u ? gqa_launch<128>(L, pa, aa, n_rows, n_tiles, grid_chunks, fold, st, ws)
-                      : gqa_launch<64>(L, pa, aa, n_rows, n_tiles, grid_chunks, fold, st, ws);
+    return HD == 128u ? gqa_launch<128>(L, pa, aa, n_rows, call->n_tiles, call->grid_chunks, fold, st, ws)
+                      : gqa_launch<64>(L, pa, aa, n_rows, call->n_tiles, call->grid_chunks, fold, st, ws);
+}
+
+int pulsar_gqa_forward(const pulsar_gqa_layer *L, const pulsar_gqa_seq *seqs, uint32_t n_seqs,
+                       const uint32_t *row_seq, const uint32_t *row_pos, uint32_t n_rows,
+                       const pulsar_gqa_io *io, cudaStream_t st) {
+    if (!io || n_rows == 0 || n_rows > 65535u) return gqa_refuse("a NULL argument or a row count outside 1 .. 65535");
+    /* the plan staged on the host in the workspace's own layout (its first two regions are the rows and the tiles),
+     * one upload, then the launch from it */
+    std::vector<uint8_t> stage(pulsar_gqa_desc_bytes(n_rows));
+    pulsar_gqa_call call{};
+    if (const int rc = pulsar_gqa_plan(L, seqs, n_seqs, row_seq, row_pos, n_rows, 0u, stage.data(), stage.size(), &call)) {
+        return rc;
+    }
+    const uint64_t need = gqa_ws_layout(nullptr, L, n_rows, call.ctx_bound).bytes;
+    if (!io->workspace || ((uintptr_t)io->workspace & 255u) != 0 || io->workspace_bytes < need) {
+        fprintf(stderr, "pulsar: gqa attention refused: workspace %llu B (want %llu B, 256-byte aligned) for %u rows "
+                        "at ctx %u\n", (unsigned long long)io->workspace_bytes, (unsigned long long)need, n_rows,
+                call.ctx_bound);
+        return -1;
+    }
+    if (cudaMemcpyAsync(io->workspace, stage.data(), stage.size(), cudaMemcpyHostToDevice, st) != cudaSuccess) {
+        fprintf(stderr, "pulsar: gqa attention: descriptor upload failed\n");
+        return -3;
+    }
+    return pulsar_gqa_launch(L, &call, io->workspace, io, st);
 }

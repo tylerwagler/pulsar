@@ -144,6 +144,9 @@ struct Out { std::vector<uint16_t> y; std::vector<float> tap; };   /* one row: n
 
 static void *g_ws = nullptr;
 static uint64_t g_ws_bytes = 0;
+/* L296 perf: 0 = pulsar_gqa_forward; else the two halves -- pulsar_gqa_plan bounded at g_bound, the descriptors
+ * uploaded here, pulsar_gqa_launch (what a captured step does) */
+static uint32_t g_bound = 0;
 /* one call; `rows` = (index into seqs, pos); `junk` marks rows whose inputs come from a junk stream */
 static int run_call(const Case &C, std::vector<Seq *> &seqs, const std::vector<std::pair<uint32_t, uint32_t>> &rows,
                     std::vector<Out> *out, bool junk = false) {
@@ -158,7 +161,7 @@ static int run_call(const Case &C, std::vector<Seq *> &seqs, const std::vector<s
         for (uint64_t j = 0; j < C.ld; j++) in[(uint64_t)i * C.ld + j] = gref_f2bf(rowf[j]);
         max_ctx = std::max(max_ctx, rp[i] + 1u);
     }
-    const uint64_t need = pulsar_gqa_workspace_bytes(&C.L, n, max_ctx);
+    const uint64_t need = pulsar_gqa_workspace_bytes(&C.L, n, g_bound ? g_bound : max_ctx);
     if (need > g_ws_bytes) {
         if (g_ws) CK(cudaFree(g_ws));
         CK(cudaMalloc(&g_ws, need)); g_ws_bytes = need;
@@ -179,7 +182,23 @@ static int run_call(const Case &C, std::vector<Seq *> &seqs, const std::vector<s
     io.gate = {d_in + C.off_g, C.ld, C.R.hd};
     io.out_bf16 = d_out; io.ld_out = ld_out; io.tap_out_f32 = d_tap;
     io.workspace = g_ws; io.workspace_bytes = g_ws_bytes;
-    const int rc = pulsar_gqa_forward(&C.L, ss.data(), (uint32_t)ss.size(), rs.data(), rp.data(), n, &io, 0);
+    int rc;
+    if (!g_bound) {
+        rc = pulsar_gqa_forward(&C.L, ss.data(), (uint32_t)ss.size(), rs.data(), rp.data(), n, &io, 0);
+    } else {
+        std::vector<uint8_t> desc(pulsar_gqa_desc_bytes(n));
+        pulsar_gqa_call call{};
+        void *d_desc = nullptr;
+        rc = pulsar_gqa_plan(&C.L, ss.data(), (uint32_t)ss.size(), rs.data(), rp.data(), n, g_bound, desc.data(),
+                             desc.size(), &call);
+        if (rc == 0) {
+            CK(cudaMalloc(&d_desc, desc.size()));
+            CK(cudaMemcpy(d_desc, desc.data(), desc.size(), cudaMemcpyHostToDevice));
+            rc = pulsar_gqa_launch(&C.L, &call, d_desc, &io, 0);
+        }
+        CK(cudaDeviceSynchronize());
+        if (d_desc) CK(cudaFree(d_desc));
+    }
     CK(cudaDeviceSynchronize());
     if (rc == 0 && out) {
         std::vector<uint16_t> yo((uint64_t)n * ld_out);
@@ -342,6 +361,21 @@ static void run_case(Case &C) {
               "decode: %u one-row calls == the prefill (out, tap, pool), bit-exact%s", N,
               d == UINT32_MAX ? "" : " -- first difference at a row");
         seq_free(B);
+    }
+    /* 2b. L296 perf: the bounded halves (plan at a bound past every position, launch from uploaded descriptors) --
+     * the split grid is the bound's, not the positions' -- give the forward's bytes: decode and chunked */
+    {
+        g_bound = N + 300u;
+        Seq B = seq_new(C, 1), D = seq_new(C, 1);
+        std::vector<Out> dec = run_schedule(C, B, 0, N, {1});
+        std::vector<Out> ch = run_schedule(C, D, 0, N, {1, 37, 64, 63, 200});
+        g_bound = 0;
+        check(dec.size() == N && first_diff(pre, dec) == UINT32_MAX && pools_equal(C, A, B, N) && ch.size() == N &&
+              first_diff(pre, ch) == UINT32_MAX && pools_equal(C, A, D, N),
+              "bounded (ctx_bound %u): one-row calls and calls of 1, 37, 64, 63, 200 rows planned + launched == the "
+              "forward's prefill, bit-exact", N + 300u);
+        seq_free(B);
+        seq_free(D);
     }
     /* 3. chunking */
     {

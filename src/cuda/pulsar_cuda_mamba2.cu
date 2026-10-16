@@ -1,10 +1,15 @@
 /* Mamba-2 (SSD) mixer block (L296 N2) -- the contract, the math and the state
  * layout are in pulsar_cuda_mamba2.h.
  *
- * Four launches a call:
+ * The launches of a call:
  *   1. the x | B | C convolution: E3's block (pulsar_sconv_forward) with the
  *      layer's bias and SiLU, into the call's scratch (bf16 [rows][CC]);
- *   2. dt / dA per (row, head), in double, into the scratch (f32);
+ *   2. dt / dA per (row, head) in double (mamba2_dt), into the scratch --
+ *      only when a sequence runs more than one tile of rows (L296 perf: a
+ *      decode-width call computes them in the scan's staging instead, one
+ *      launch fewer; a long run keeps the parallel launch, since the double
+ *      transcendentals would sit on every tile's serial path).  One device
+ *      function either way: the same bytes;
  *   3. the scan: one CTA per (sequence, head, half of the head's P rows),
  *      128 threads; thread (q, p) holds S[p][32q .. 32q+31] in registers for
  *      the whole sequence.  Per row it applies the update to its 32 columns
@@ -33,12 +38,22 @@ constexpr int TT = 16;           /* rows a tile */
 static_assert(PC == 32, "a warp is one column quarter of the CTA's p rows");
 static_assert(NPT % 8 == 0, "the y share is four chains of NPT / 4");
 
-constexpr int DT_THREADS = 256;
-
 __device__ __forceinline__ float bf2f(uint16_t b) { return pulsar_sconv_bf2f(b); }
 __device__ __forceinline__ uint16_t f2bf(float f) { return pulsar_sconv_f2bf(f); }
 
-/* ---- 2. dt and dA per (row, head), double ------------------------------------------------------------ */
+/* ---- dt and dA of (row, head), double: softplus(dt_raw + dt_bias) and exp(dt * A), A = -exp(A_log) ------ */
+__device__ __forceinline__ void mamba2_dt(uint16_t dt_raw, uint16_t dt_bias, uint16_t A_log, float *dt_out,
+                                          float *dA_out) {
+    const float s = __fadd_rn(bf2f(dt_raw), bf2f(dt_bias));
+    const float dt = s > 20.0f ? s : (float)log1p(exp((double)s));            /* softplus, torch's threshold 20 */
+    const double A = -exp((double)bf2f(A_log));
+    *dt_out = dt;
+    *dA_out = (float)exp((double)dt * A);
+}
+
+constexpr int DT_THREADS = 256;
+
+/* ---- 2. dt and dA per (row, head) into the scratch (a call with a run longer than a tile) --------------- */
 __global__ void __launch_bounds__(DT_THREADS)
 mamba2_dt_kernel(const uint16_t *__restrict__ dt_raw, uint64_t ld_dt, const uint16_t *__restrict__ dt_bias,
                  const uint16_t *__restrict__ A_log, uint32_t H, uint32_t rows, float *__restrict__ dt_out,
@@ -46,17 +61,16 @@ mamba2_dt_kernel(const uint16_t *__restrict__ dt_raw, uint64_t ld_dt, const uint
     const uint64_t i = (uint64_t)blockIdx.x * DT_THREADS + threadIdx.x;
     if (i >= (uint64_t)rows * H) return;
     const uint32_t row = (uint32_t)(i / H), h = (uint32_t)(i % H);
-    const float s = __fadd_rn(bf2f(dt_raw[(uint64_t)row * ld_dt + h]), bf2f(dt_bias[h]));
-    const float dt = s > 20.0f ? s : (float)log1p(exp((double)s));            /* softplus, torch's threshold 20 */
-    const double A = -exp((double)bf2f(A_log[h]));
-    dt_out[i] = dt;
-    dA_out[i] = (float)exp((double)dt * A);
+    mamba2_dt(dt_raw[(uint64_t)row * ld_dt + h], dt_bias[h], A_log[h], &dt_out[i], &dA_out[i]);
 }
 
 /* ---- 3. the scan ------------------------------------------------------------------------------------- */
 struct scan_args {
     const uint16_t *conv_out;      /* [rows][CC] */
-    const float *dt, *dA;          /* [rows][H] */
+    const float *dt, *dA;          /* [rows][H] from launch 2, or NULL: the scan stages them itself */
+    const uint16_t *dt_raw;        /* row r's head h at dt_raw[r * ld_dt + h] */
+    uint64_t ld_dt;
+    const uint16_t *dt_bias, *A_log;
     const uint16_t *D;
     const int32_t *seq_first, *seq_slot;
     float *ssm;                    /* pool */
@@ -119,8 +133,12 @@ __global__ void __launch_bounds__(NT) mamba2_scan_kernel(const scan_args a) {
         }
         if (tid < tn) {
             const uint64_t row = (uint64_t)(r0 + t0 + tid);
-            sdt[tid] = a.dt[row * a.H + h];
-            sda[tid] = a.dA[row * a.H + h];
+            if (a.dt) {
+                sdt[tid] = a.dt[row * a.H + h];
+                sda[tid] = a.dA[row * a.H + h];
+            } else {
+                mamba2_dt(a.dt_raw[row * a.ld_dt + h], a.dt_bias[h], a.A_log[h], &sdt[tid], &sda[tid]);
+            }
         }
         __syncthreads();
         for (int i = tid; i < tn * N; i += NT) {
@@ -359,14 +377,20 @@ extern "C" int pulsar_mamba2_forward(const pulsar_mamba2_layer *L, const pulsar_
     const int rc = pulsar_sconv_forward(&cs, 1, &sr, stream);
     if (rc) return rc;
 
-    /* 2. dt, dA */
-    const uint64_t n_dt = (uint64_t)rows * H;
-    mamba2_dt_kernel<<<(unsigned)((n_dt + DT_THREADS - 1) / DT_THREADS), DT_THREADS, 0, stream>>>(
-        c->dt, c->ld_dt, L->dt_bias, L->A_log, H, rows, dt, dA);
+    /* 2. dt, dA -- a run longer than one tile only; a decode-width call stages them in the scan */
+    const bool dt_launch = c->max_seq_rows > (uint32_t)TT;
+    if (dt_launch) {
+        const uint64_t n_dt = (uint64_t)rows * H;
+        mamba2_dt_kernel<<<(unsigned)((n_dt + DT_THREADS - 1) / DT_THREADS), DT_THREADS, 0, stream>>>(
+            c->dt, c->ld_dt, L->dt_bias, L->A_log, H, rows, dt, dA);
+    }
 
     /* 3. the scan */
     scan_args a{};
-    a.conv_out = conv_out; a.dt = dt; a.dA = dA; a.D = L->D;
+    a.dt = dt_launch ? dt : nullptr;
+    a.dA = dt_launch ? dA : nullptr;
+    a.conv_out = conv_out; a.dt_raw = c->dt; a.ld_dt = c->ld_dt; a.dt_bias = L->dt_bias; a.A_log = L->A_log;
+    a.D = L->D;
     a.seq_first = c->seq_first; a.seq_slot = c->seq_slot;
     a.ssm = c->ssm_state; a.cap = c->ssm_capture; a.y = y;
     a.H = H; a.G = g->n_groups; a.CC = CC; a.upd = (uint32_t)pulsar_mamba2_upd_floats(g);

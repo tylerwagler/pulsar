@@ -171,6 +171,15 @@ typedef struct pulsar_driver_ops {
     void (*dump)(const pulsar_driver_step *st, uint32_t il);
     /** The artifact digest the session's segments are keyed by (pulsar_ckpt_store::artifact). */
     uint64_t (*artifact)(const pulsar_engine *e);
+    /** Optional (L296 perf): the step's HOST HALF -- every upload its launches read (token ids, sequence tables,
+     *  attention descriptors), run by the driver before the step's launches on every step.  A family that supplies
+     *  it makes embed, every block and the head LAUNCH-ONLY: their launches read the device and the step's shape,
+     *  nothing a step's host values decide.  *graph_key = what those launches depend on beyond the driver's own key
+     *  (the session's buffers, the row count), nonzero; 0 = this step's launches must run eager.  A DECODE step
+     *  with a key runs its launches as ONE captured CUDA graph per key (pulsar_gpu_seg_*), replayed after; the
+     *  launches are the same either way, so the bytes are (nemotron-fwd-gate X7: graphed == eager).  NULL = the
+     *  ops upload as they go and every step runs eager. */
+    bool (*stage)(const pulsar_driver_step *st, uint64_t *graph_key);
 } pulsar_driver_ops;
 
 /** The first thing a forward over `plan` would need that `ops` lacks -- "embed", the block of a layer kind (its
