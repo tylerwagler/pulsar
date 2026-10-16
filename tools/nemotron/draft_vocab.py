@@ -9,19 +9,25 @@ scripts: a prefix of 16,384 ids covers 80 % of the corpus below, a ranked 16,384
 a range.
 
 The ranking counts the tokens of the corpus tools/qwen/draft_vocab.py ranks Qwen's with (the CPython standard
-library's *.py, the upstream clones' Markdown and sources, 28 Project Gutenberg books): technical English, lists, code
-in many languages, general prose -- what a chat assistant writes.  Every non-added id seen at least --min-count times is
-ranked, most frequent first (ties by id).  The list is written FIXED ids first, then the ranked ids; the engine keeps a
-PREFIX of it (NEMOTRON_DRAFT_ROWS_DEFAULT rows, the sweep's knob PULSAR_NEMOTRON_MTP_DRAFT_ROWS) and sorts it ascending.
+library's *.py, the upstream clones' Markdown and sources, 28 Project Gutenberg books) AND the assistant side of four
+dataset shards (a *.parquet pattern: ultrachat_200k's assistant turns, hermes_reasoning_tool_use's reasoning + tool
+calls, OpenCodeInstruct's answers, wikitext-103).  The first alone missed modern expository English: this tokenizer
+spells many whole words in one id (" technology", " maritime"), and on the model's own served replies a 20,480-id head
+from it left 25 % of a prose reply's tokens undraftable (tokens / round 2.90 -> 2.29); with the datasets a 40,960-id head
+leaves < 1 % of held-out ultrachat replies undraftable.  Every non-added id seen at least --min-count times is ranked,
+most frequent first (ties by id).  The list is written FIXED ids first, then the ranked ids; the engine keeps a PREFIX
+of it (NEMOTRON_DRAFT_ROWS_DEFAULT rows, the sweep's knob PULSAR_NEMOTRON_MTP_DRAFT_ROWS) and sorts it ascending.
 
 The header carries the FNV-1a 64 digest of every listed id's raw token bytes (each id's bytes, then a 0xff separator)
 under the tokenizer: the engine recomputes it from the checkpoint's tokenizer at load and refuses a mismatch (a list
 made for another tokenizer would rank the wrong tokens).
 
-  U=~/Projects/AI/upstream
+  U=~/Projects/AI/upstream; R=/mnt/models/reap-corpus/raw   (tokenizers + pyarrow)
   python3 tools/nemotron/draft_vocab.py TOKENIZER_JSON src/families/nemotron_h/nemotron_h_draft_vocab.inc \
-      --default 20480 --max 49152 '/usr/lib/python3.13/**/*.py' "$U/**/*.md" "$U/**/*.py" "$U/**/*.cpp" "$U/**/*.h" \
-      "$U/**/*.rs" "$U/**/*.ts" "$U/**/*.js" "$U/**/*.sh" "$U/**/*.c" "$U/**/*.cu" 'GUTENBERG_DIR/*.txt'
+      --default 40960 --max 65536 '/usr/lib/python3.13/**/*.py' "$U/**/*.md" "$U/**/*.py" "$U/**/*.cpp" "$U/**/*.h" \
+      "$U/**/*.rs" "$U/**/*.ts" "$U/**/*.js" "$U/**/*.sh" "$U/**/*.c" "$U/**/*.cu" 'GUTENBERG_DIR/*.txt' \
+      $R/ultrachat_200k/data/train_sft-00000-of-00003-*.parquet $R/hermes_reasoning_tool_use/data/train-00000-of-00001.parquet \
+      $R/OpenCodeInstruct/data/train-00000-of-00050.parquet $R/wikitext/wikitext-103-raw-v1/train-00000-of-00002.parquet
   (the Gutenberg ids of tools/qwen/draft_vocab.py)
 """
 
@@ -52,6 +58,27 @@ def byte_decoder() -> dict[str, int]:
     return {chr(c): b for b, c in zip(bs, cs)}
 
 
+def parquet_texts(path: str):
+    """A dataset shard's ASSISTANT-side text, by its schema: chat `messages` (role assistant: ultrachat_200k),
+    `conversations` (from gpt: hermes_reasoning_tool_use), an `output` column (OpenCodeInstruct), a `text` column
+    (wikitext)."""
+    import pyarrow.parquet as pq
+    t = pq.read_table(path)
+    cols = t.column_names
+    if "messages" in cols:
+        for conv in t.column("messages").to_pylist():
+            yield from (m["content"] for m in conv if m["role"] == "assistant" and m["content"])
+    elif "conversations" in cols:
+        for conv in t.column("conversations").to_pylist():
+            yield from (m["value"] for m in conv if m["from"] == "gpt" and m["value"])
+    elif "output" in cols:
+        yield from (x for x in t.column("output").to_pylist() if x)
+    elif "text" in cols:
+        yield from (x for x in t.column("text").to_pylist() if x)
+    else:
+        raise SystemExit(f"{path}: no messages / conversations / output / text column")
+
+
 def main() -> None:
     p = argparse.ArgumentParser()
     p.add_argument("tokenizer")
@@ -78,6 +105,13 @@ def main() -> None:
         batch.clear()
 
     for path in files:
+        if path.endswith(".parquet"):
+            for text in parquet_texts(path):
+                batch.append(text)
+                if len(batch) >= 4096:
+                    flush()
+            used += 1
+            continue
         try:
             if os.path.getsize(path) > a.max_bytes:
                 continue
