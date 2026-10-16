@@ -24,11 +24,11 @@ constexpr int kRows = 16;               /* rows per CTA; >= KMAX - 1, so only ti
 static_assert(kRows >= PULSAR_SCONV_KMAX - 1, "a later row tile must find its whole window in the call's rows");
 
 struct stream_args {
-    const uint16_t *w, *x;
+    const uint16_t *w, *b, *x;
     uint16_t *y, *state, *cap;
     uint64_t ld_x, ld_y, state_ld, state_stride, cap_ld, cap_stride;
     uint32_t C;
-    int residual;
+    int residual, silu;
 };
 
 struct call_args {
@@ -75,6 +75,8 @@ __global__ void __launch_bounds__(kThreads) sconv_kernel(const call_args a) {
 #pragma unroll
             for (int i = 0; i < K; ++i) w[j][i] = pulsar_sconv_bf2f(wp[j * K + i]);
     }
+    float bias[kVec] = {};
+    if (S.b) unpack8(*(const uint4 *)(S.b + c0), bias);
     const uint16_t *xs = S.x + (uint64_t)f0 * S.ld_x + c0;   /* the sequence's row 0, this thread's channels */
     uint16_t *slot = S.state + (uint64_t)a.seq_slot[seq] * S.state_stride + c0;
 
@@ -101,8 +103,9 @@ __global__ void __launch_bounds__(kThreads) sconv_kernel(const call_args a) {
             float h0[K - 1], h1[K - 1];
 #pragma unroll
             for (int i = 0; i < K - 1; ++i) { h0[i] = hist[i][j]; h1[i] = hist[i][j + 1]; }
-            const uint16_t lo = pulsar_sconv_out(pulsar_sconv_taps<K>(w[j], h0, xr[j]), xr[j], S.residual);
-            const uint16_t hi = pulsar_sconv_out(pulsar_sconv_taps<K>(w[j + 1], h1, xr[j + 1]), xr[j + 1], S.residual);
+            const uint16_t lo = pulsar_sconv_out(pulsar_sconv_taps<K>(w[j], h0, xr[j], bias[j]), xr[j], S.residual, S.silu);
+            const uint16_t hi = pulsar_sconv_out(pulsar_sconv_taps<K>(w[j + 1], h1, xr[j + 1], bias[j + 1]), xr[j + 1],
+                                                 S.residual, S.silu);
             o[j / 2] = (uint32_t)lo | ((uint32_t)hi << 16);
         }
         *(uint4 *)(S.y + (uint64_t)(f0 + t) * S.ld_y + c0) = make_uint4(o[0], o[1], o[2], o[3]);
@@ -163,6 +166,10 @@ bool stream_ok(const pulsar_sconv_stream &s, uint32_t i, uint32_t n_rows, uint32
     if (d->kernel != K0) return refuse("every stream of one call has the first stream's kernel", i);
     if (d->residual != 0 && d->residual != 1) return refuse("residual must be 0 or 1", i);
     if (!d->weight || !aligned16(d->weight)) return refuse("no weight, or a weight not 16-byte aligned", i);
+    if (d->bias && !aligned16(d->bias)) return refuse("a bias not 16-byte aligned", i);
+    if (d->act != PULSAR_SCONV_ACT_NONE && d->act != PULSAR_SCONV_ACT_SILU) return refuse("act is not a PULSAR_SCONV_ACT_*", i);
+    if (d->act == PULSAR_SCONV_ACT_SILU && d->residual)
+        return refuse("SiLU with the residual (no family declares both; their order is not built)", i);
     if (!s.x || !s.y || !s.state || !aligned16(s.x) || !aligned16(s.y) || !aligned16(s.state))
         return refuse("x, y and state must be set and 16-byte aligned", i);
     if (s.ld_x < d->channels || s.ld_y < d->channels || s.ld_x % kVec || s.ld_y % kVec)
@@ -214,9 +221,10 @@ extern "C" int pulsar_sconv_forward(const pulsar_sconv_stream *streams, uint32_t
     for (uint32_t i = 0; i < n_streams; ++i) {
         const pulsar_sconv_stream &s = streams[i];
         if (!stream_ok(s, i, rows->n_rows, K)) return -1;
-        a.s[i] = stream_args{s.decl->weight, s.x,          s.y,          s.state,        s.capture,
-                             s.ld_x,          s.ld_y,       s.state_ld,   s.state_stride, s.capture_ld,
-                             s.capture_stride, s.decl->channels, s.decl->residual};
+        a.s[i] = stream_args{s.decl->weight, s.decl->bias, s.x,          s.y,          s.state,
+                             s.capture,       s.ld_x,       s.ld_y,       s.state_ld,   s.state_stride,
+                             s.capture_ld,    s.capture_stride, s.decl->channels, s.decl->residual,
+                             s.decl->act == PULSAR_SCONV_ACT_SILU};
         if (s.decl->channels > cmax) cmax = s.decl->channels;
     }
     a.seq_first = rows->seq_first;
