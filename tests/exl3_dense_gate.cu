@@ -27,7 +27,8 @@
  *   4. mutations: one flipped trellis bit must move outputs, and a sign-flipped
  *      suh block must push the error far past the tolerance;
  *   5. refusals: K % 128, an uninstantiated rate, a short workspace, M = 0.
- *   6. the multi launch (L288 exl3-dense): each output bit for bit its single launch.
+ *   6. the multi launch (L288 exl3-dense): each output bit for bit its single launch; L296 dec2: the decode
+ *      epilogue's bf16 outputs are the f32 outputs rounded to nearest even, byte for byte (a prompt chunk refuses them).
  *   7. the heads (L288 qwen-exl3-head): lm_head 2560 -> 248320 and the draft head 2560 -> 82304 at K = 3..5 --
  *      M-independent rows, and windows cut from the head equal its columns bit for bit and grade vs double.
  *   8. a logical width short of the stored 128 multiple (L295 F7: Inkling's head 4096 -> 201024, stored 201088):
@@ -348,7 +349,13 @@ int main(void) {
             size_t ytot = 0;
             for (int j = 0; j < c.n; j++) { yb[j] = ytot; ytot += (size_t)16 * c.N[j]; }
             CUDA_OK(cudaMalloc((void **)&ym, ytot * sizeof(float)));
-            for (int j = 0; j < c.n; j++) p[j] = ds4_exl3_dense_proj{d[j].w, c.k2[j], c.N[j], ym + yb[j]};
+            for (int j = 0; j < c.n; j++) p[j] = ds4_exl3_dense_proj{d[j].w, c.k2[j], c.N[j], ym + yb[j], nullptr};
+            /* L296 dec2: the same projections emitting bf16 rows (decode rows) */
+            uint16_t *ybm = nullptr;
+            CUDA_OK(cudaMalloc((void **)&ybm, ytot * sizeof(uint16_t)));
+            ds4_exl3_dense_proj pb[4] = {};
+            for (int j = 0; j < c.n; j++) pb[j] = ds4_exl3_dense_proj{d[j].w, c.k2[j], c.N[j], nullptr, ybm + yb[j]};
+            size_t bdiff = 0, bchecked = 0;
             const size_t mws = ds4_exl3_dense_multi_workspace_bytes(p, c.n, 16, K);
             size_t sum = 0;
             for (int j = 0; j < c.n; j++) sum += ds4_exl3_dense_workspace_bytes(16, K, c.N[j]);
@@ -370,13 +377,41 @@ int main(void) {
                         diff += std::memcmp(one.data(), many.data(), many.size() * sizeof(float)) != 0;
                         checked++;
                     }
+                    if (prompt) {
+                        CHECK(ds4_exl3_dense_multi_launch(pb, c.n, d[0].q, M, K, mw, mws, 0, true) == -1,
+                              "%s: bf16 outputs on a prompt chunk accepted", c.what);
+                        continue;
+                    }
+                    /* the bf16 rows are the f32 outputs rounded to nearest even, byte for byte */
+                    CUDA_OK(cudaMemset(ybm, 0xff, ytot * sizeof(uint16_t)));
+                    CHECK(ds4_exl3_dense_multi_launch(pb, c.n, d[0].q, M, K, mw, mws, 0, false) == 0,
+                          "%s: bf16 multi launch refused at M=%d", c.what, M);
+                    CUDA_OK(cudaDeviceSynchronize());
+                    for (int j = 0; j < c.n; j++) {
+                        std::vector<float> f((size_t)M * c.N[j]);
+                        std::vector<uint16_t> b(f.size());
+                        CUDA_OK(cudaMemcpy(f.data(), ym + yb[j], f.size() * sizeof(float), cudaMemcpyDeviceToHost));
+                        CUDA_OK(cudaMemcpy(b.data(), ybm + yb[j], b.size() * sizeof(uint16_t), cudaMemcpyDeviceToHost));
+                        for (size_t i = 0; i < f.size(); i++) {
+                            uint32_t u;
+                            std::memcpy(&u, &f[i], 4);
+                            u += 0x7fffu + ((u >> 16) & 1u);   /* round to nearest even (finite outputs) */
+                            bdiff += (uint16_t)(u >> 16) != b[i];
+                        }
+                        bchecked += f.size();
+                    }
                 }
             }
             CHECK(diff == 0, "%s: %zu of %zu (width, projection) outputs differ from the single launch", c.what, diff, checked);
+            CHECK(bdiff == 0 && bchecked > 0, "%s: %zu of %zu bf16 outputs are not the f32 outputs rounded", c.what, bdiff,
+                  bchecked);
+            pb[0].y = ym;   /* both outputs */
+            CHECK(ds4_exl3_dense_multi_launch(pb, c.n, d[0].q, 1, K, mw, mws, 0) == -1, "%s: y and yb both accepted", c.what);
+            cudaFree(ybm);
             CHECK(ds4_exl3_dense_multi_launch(p, c.n, d[0].q, 16, K, mw, mws - 16, 0) == -1, "%s: short workspace accepted",
                   c.what);
-            printf("  multi %-44s %zu (width, projection) outputs bit-identical to their single launches\n", c.what,
-                   checked);
+            printf("  multi %-44s %zu (width, projection) outputs bit-identical to their single launches; %zu bf16 "
+                   "outputs == the f32 rounded\n", c.what, checked, bchecked);
             cudaFree(mw);
             cudaFree(ym);
             for (dev &x : d) release(x);

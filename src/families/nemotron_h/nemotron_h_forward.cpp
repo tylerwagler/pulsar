@@ -380,25 +380,28 @@ bool arm_segments(const nh_step *st, uint32_t lo, uint32_t hi, Launch &&launch) 
     return (cut == lo || launch(false, lo, cut - lo)) && (cut == hi || launch(true, cut, hi - cut));
 }
 
-/* n linears (1..3) of the same bf16 input x [n_rows][in] -> y[j] f32 [n_rows][out[j]] (row stride out[j]), each
- * row-kind segment through its arm (one multi launch) */
+/* n linears (1..3) of the same bf16 input x [n_rows][in] -> their bf16 rows yb[j] [n_rows][out[j]] (row stride
+ * out[j]), each row-kind segment through its arm (one multi launch): the producer emits the one bf16 rounding a bf16
+ * GEMM's output has (the EXL3 decode epilogue itself, any other arm through y[j], its f32 staging) */
 bool step_linears(const nh_step *st, int n, const pulsar_tensor *const *t, int in, const int *out,
-                  const char *const *what, const uint16_t *x, float *const *y, void *ws, uint64_t ws_bytes) {
+                  const char *const *what, const uint16_t *x, float *const *y, uint16_t *const *yb, void *ws,
+                  uint64_t ws_bytes) {
     return arm_segments(st, 0, st->n_rows, [&](bool prompt, uint32_t r0, uint32_t m) {
         pulsar_rows_linear l[3];
         const pulsar_rows_linear *lp[3];
         float *yr[3];
+        uint16_t *br[3];
         for (int j = 0; j < n; j++) {
             if (!pulsar_linear_rows_ref(st->model, t[j], in, out[j], prompt, what[j], &l[j])) return false;
             lp[j] = &l[j];
             yr[j] = y[j] + (size_t)r0 * (size_t)out[j];
+            br[j] = yb[j] + (size_t)r0 * (size_t)out[j];
         }
-        return pulsar_rows_linear_multi_launch(lp, n, x + (size_t)r0 * in, (int)m, yr, ws, ws_bytes, 0) == 0;
+        return pulsar_rows_linear_multi_bf16_launch(lp, n, x + (size_t)r0 * in, (int)m, yr, br, ws, ws_bytes, 0) == 0;
     });
 }
 
-/* one linear's f32 output -> its bf16 rows (the producer-stage encode: the one bf16 rounding a bf16 GEMM's output
- * has) */
+/* one f32 sum -> its bf16 rows (the producer-stage encode) */
 bool emit(const float *y, uint16_t *yb, uint32_t n, uint32_t width) {
     return pulsar_rows_emit_bf16_launch(y, width, n, width, NULL, PULSAR_ROWS_SCALE_NONE, yb, width, 0) == 0;
 }
@@ -572,7 +575,8 @@ bool mamba(const nh_step *st, uint32_t il, uint8_t *base, const mix_scratch &M) 
         const int outs[1] = {(int)md.in};
         const char *what[1] = {"nemotron_h ssm_in"};
         float *y[1] = {pf};
-        if (!step_linears(st, 1, t, (int)E, outs, what, xn, y, base + M.lin, M.lin_bytes) || !emit(pf, pb, n, md.in))
+        uint16_t *yb16[1] = {pb};
+        if (!step_linears(st, 1, t, (int)E, outs, what, xn, y, yb16, base + M.lin, M.lin_bytes))
             return failf("the Mamba-2 in_proj refused", il);
     }
     pulsar_mamba2_layer ml{};
@@ -624,7 +628,8 @@ bool mamba(const nh_step *st, uint32_t il, uint8_t *base, const mix_scratch &M) 
     const int outs[1] = {(int)E};
     const char *what[1] = {"nemotron_h ssm_out"};
     float *y[1] = {of};
-    if (!step_linears(st, 1, t, (int)md.di, outs, what, yb, y, base + M.lin, M.lin_bytes) || !emit(of, db, n, E))
+    uint16_t *yb16[1] = {db};
+    if (!step_linears(st, 1, t, (int)md.di, outs, what, yb, y, yb16, base + M.lin, M.lin_bytes))
         return failf("the Mamba-2 out_proj refused", il);
     return true;
 }
@@ -645,10 +650,9 @@ bool attention(const nh_step *st, uint32_t il, uint8_t *base, const mix_scratch 
         const int outs[3] = {(int)Q, (int)KV, (int)KV};
         const char *what[3] = {"nemotron_h q_proj", "nemotron_h k_proj", "nemotron_h v_proj"};
         float *y[3] = {qf, kf, vf};
-        if (!step_linears(st, 3, t, (int)E, outs, what, xn, y, base + M.lin, M.lin_bytes))
+        uint16_t *yb16[3] = {qb, kb, vb};
+        if (!step_linears(st, 3, t, (int)E, outs, what, xn, y, yb16, base + M.lin, M.lin_bytes))
             return failf("the q / k / v projections refused", il);
-        if (!emit(qf, qb, n, Q) || !emit(kf, kb, n, KV) || !emit(vf, vb, n, KV))
-            return failf("the q / k / v bf16 emit refused", il);
     }
     const pulsar_gqa_layer G1 = gqa_decl(s);
     const uint32_t slot = q->attn_slot[il];
@@ -668,7 +672,8 @@ bool attention(const nh_step *st, uint32_t il, uint8_t *base, const mix_scratch 
     const int outs[1] = {(int)E};
     const char *what[1] = {"nemotron_h o_proj"};
     float *y[1] = {of};
-    if (!step_linears(st, 1, t, (int)Q, outs, what, ab, y, base + M.lin, M.lin_bytes) || !emit(of, db, n, E))
+    uint16_t *yb16[1] = {db};
+    if (!step_linears(st, 1, t, (int)Q, outs, what, ab, y, yb16, base + M.lin, M.lin_bytes))
         return failf("the o_proj refused", il);
     return true;
 }
@@ -686,6 +691,26 @@ bool moe(const nh_step *st, uint32_t il, float *fo, uint8_t *base, const ffn_scr
     const pulsar_moe_block_shape bs = moe_shape(s);
     pulsar_moe_block_parts parts;
     if (pulsar_moe_block_carve(&bs, (int)n, base + F.u, F.moe_bytes, &parts) != 0) return failf("the MoE workspace", il);
+    /* the shared expert, ungated: down(relu(up xn)^2) -- its decode rows forked onto their own stream here, ahead of
+     * the router and the routed experts they overlap (L296 dec2), joined and added after the routed sum below */
+    const auto shared_q = [&](bool prompt, pulsar_rows_moe_shared &q) {
+        q = pulsar_rows_moe_shared{};
+        q.act = PULSAR_FFN_ACT_RELU2;
+        q.scale = NULL;
+        q.yu = parts.yu;
+        q.ys = parts.ys;
+        q.h = parts.h;
+        q.ws = parts.lin;
+        q.ws_bytes = parts.lin_bytes;
+        return pulsar_linear_rows_ref(st->model, L.sh_up, E, SM, prompt, "nemotron_h shared up", &q.up) &&
+               pulsar_linear_rows_ref(st->model, L.sh_down, SM, E, prompt, "nemotron_h shared down", &q.down);
+    };
+    if (!arm_segments(st, 0, n, [&](bool prompt, uint32_t r0, uint32_t rows) {
+            pulsar_rows_moe_shared q;
+            return prompt ||
+                   (shared_q(false, q) && pulsar_rows_moe_shared_side_fork(&q, xn + (size_t)r0 * E, (int)rows, 0) == 0);
+        }))
+        return failf("the shared expert's fork refused", il);
     /* the router: f32 logits over the routed rows (no gate rows), then the select */
     const pulsar_router_cfg rc = router_cfg(s);
     pulsar_router_layer rl{};
@@ -726,19 +751,13 @@ bool moe(const nh_step *st, uint32_t il, float *fo, uint8_t *base, const ffn_scr
             return pulsar_moe_routed_rows(&c);
         }))
         return failf("the routed experts refused", il);
-    /* the shared expert: out += down(relu(up xn)^2), ungated */
+    /* the shared expert added: the decode rows' fork joined, a prompt chunk's run here (rows past the decode rows,
+     * after their join: the buffers are one) */
     const bool ok = arm_segments(st, 0, n, [&](bool prompt, uint32_t r0, uint32_t rows) {
-        pulsar_rows_moe_shared q{};
-        q.act = PULSAR_FFN_ACT_RELU2;
-        q.scale = NULL;
-        q.yu = parts.yu;
-        q.ys = parts.ys;
-        q.h = parts.h;
-        q.ws = parts.lin;
-        q.ws_bytes = parts.lin_bytes;
-        return pulsar_linear_rows_ref(st->model, L.sh_up, E, SM, prompt, "nemotron_h shared up", &q.up) &&
-               pulsar_linear_rows_ref(st->model, L.sh_down, SM, E, prompt, "nemotron_h shared down", &q.down) &&
-               pulsar_rows_moe_shared_launch(&q, xn + (size_t)r0 * E, (int)rows, fo + (size_t)r0 * E, 0) == 0;
+        pulsar_rows_moe_shared q;
+        if (!shared_q(prompt, q)) return false;
+        return prompt ? pulsar_rows_moe_shared_launch(&q, xn + (size_t)r0 * E, (int)rows, fo + (size_t)r0 * E, 0) == 0
+                      : pulsar_rows_moe_shared_side_join(&q, (int)rows, fo + (size_t)r0 * E, 0) == 0;
     });
     return ok || failf("the shared expert refused", il);
 }

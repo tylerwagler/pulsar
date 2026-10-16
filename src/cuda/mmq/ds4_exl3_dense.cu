@@ -109,6 +109,7 @@ struct dense_proj {
     const uint32_t *trellis;
     const __half *suh, *svh;
     float *part, *y;
+    __nv_bfloat16 *yb;               ///< the bf16 output instead of y (decode rows), or NULL
     __half *hi, *lo;                 ///< the prep planes
     float *inv;
     unsigned *ctr;
@@ -369,9 +370,17 @@ exl3_dense_kernel(const dense_set P, const __nv_bfloat16 *__restrict__ xb, int M
         exl3dev::had128(z);   /* the whole warp: a stored block mixes its pad columns in */
         const __half2 v01 = *reinterpret_cast<const __half2 *>(p.svh + n0);
         const __half2 v23 = *reinterpret_cast<const __half2 *>(p.svh + n0 + 2);
-        if (n0 < p.Ny)        /* L295 F7: a stored pad column (exl3_out_stored) is never written */
-            *reinterpret_cast<float4 *>(p.y + (size_t)m * (size_t)p.Ny + n0) =
-                make_float4(z[0] * __low2float(v01), z[1] * __high2float(v01), z[2] * __low2float(v23), z[3] * __high2float(v23));
+        if (n0 < p.Ny) {      /* L295 F7: a stored pad column (exl3_out_stored) is never written */
+            const float4 o = make_float4(z[0] * __low2float(v01), z[1] * __high2float(v01), z[2] * __low2float(v23),
+                                         z[3] * __high2float(v23));
+            if (p.yb) {       /* L296 dec2: the bf16 rows the consumer reads, emitted here */
+                const __nv_bfloat162 b01 = __floats2bfloat162_rn(o.x, o.y), b23 = __floats2bfloat162_rn(o.z, o.w);
+                *reinterpret_cast<uint2 *>(p.yb + (size_t)m * (size_t)p.Ny + n0) =
+                    make_uint2(*reinterpret_cast<const uint32_t *>(&b01), *reinterpret_cast<const uint32_t *>(&b23));
+            } else {
+                *reinterpret_cast<float4 *>(p.y + (size_t)m * (size_t)p.Ny + n0) = o;
+            }
+        }
     }
 }
 
@@ -433,7 +442,7 @@ size_t ds4_exl3_dense_multi_workspace_bytes(const ds4_exl3_dense_proj *p, int n,
 }
 
 size_t ds4_exl3_dense_workspace_bytes(int M, int K, int N) {
-    const ds4_exl3_dense_proj p{nullptr, 0, N, nullptr};
+    const ds4_exl3_dense_proj p{nullptr, 0, N, nullptr, nullptr};
     return ds4_exl3_dense_multi_workspace_bytes(&p, 1, M, K);
 }
 
@@ -450,8 +459,9 @@ int ds4_exl3_dense_multi_launch(const ds4_exl3_dense_proj *p, int n, const void 
     for (int j = 0; j < n; ++j) {
         uint64_t scale_bytes = 0, stride = 0;
         const int N = p[j].N;
-        if (!p[j].w || !p[j].y) {
-            fprintf(stderr, "%s: projection %d has no weight or no output -- refusing\n", tag, j);
+        if (!p[j].w || !p[j].y == !p[j].yb || (p[j].yb && prompt)) {
+            fprintf(stderr, "%s: projection %d has no weight, or not exactly one output (f32 y, or bf16 yb on decode "
+                            "rows) -- refusing\n", tag, j);
             return -1;
         }
         if (N <= 0 || N % 4 ||
@@ -466,8 +476,8 @@ int ds4_exl3_dense_multi_launch(const ds4_exl3_dense_proj *p, int n, const void 
             fprintf(stderr, "%s: rate k2=%d has no instance (K = 2, 3, 4, 5, 6, 8) -- refusing\n", tag, p[j].k2);
             return -1;
         }
-        if ((uintptr_t)p[j].w % 16 || (uintptr_t)p[j].y % 16) {
-            fprintf(stderr, "%s: w / y must be 16-byte aligned -- refusing\n", tag);
+        if ((uintptr_t)p[j].w % 16 || (uintptr_t)p[j].y % 16 || (uintptr_t)p[j].yb % 8) {
+            fprintf(stderr, "%s: w / y must be 16-byte aligned, yb 8-byte -- refusing\n", tag);
             return -1;
         }
         n_ctr += (int)(exl3_out_stored((uint64_t)N) / 128);
@@ -500,7 +510,8 @@ int ds4_exl3_dense_multi_launch(const ds4_exl3_dense_proj *p, int n, const void 
             ds4_exl3_dense_proj q[kMaxProj];
             for (int j = 0; j < n; ++j) {
                 q[j] = p[j];
-                q[j].y = p[j].y + (size_t)r0 * p[j].N;
+                if (p[j].y) q[j].y = p[j].y + (size_t)r0 * p[j].N;
+                if (p[j].yb) q[j].yb = p[j].yb + (size_t)r0 * p[j].N;
             }
             const int m = M - r0 < kRows ? M - r0 : kRows;
             const int rc = ds4_exl3_dense_multi_launch(q, n, static_cast<const __nv_bfloat16 *>(xb) + (size_t)r0 * K, m, K,
@@ -536,7 +547,8 @@ int ds4_exl3_dense_multi_launch(const ds4_exl3_dense_proj *p, int n, const void 
             const Workspace L(S, M, K, N);
             const __half *suh = reinterpret_cast<const __half *>(static_cast<const uint8_t *>(p[j].w) + trellis_bytes[j]);
             all.p[j] = dense_proj{static_cast<const uint32_t *>(p[j].w), suh, suh + K, reinterpret_cast<float *>(ws + L.part),
-                                  p[j].y, reinterpret_cast<__half *>(ws + L.hi), reinterpret_cast<__half *>(ws + L.lo),
+                                  p[j].y, reinterpret_cast<__nv_bfloat16 *>(p[j].yb),
+                                  reinterpret_cast<__half *>(ws + L.hi), reinterpret_cast<__half *>(ws + L.lo),
                                   reinterpret_cast<float *>(ws + L.inv), c, N, S, p[j].N};
             ws += proj_ws_bytes(M, K, N);
             c += N / 128;
@@ -578,6 +590,6 @@ int ds4_exl3_dense_multi_launch(const ds4_exl3_dense_proj *p, int n, const void 
 
 int ds4_exl3_dense_launch(const void *w, int k2, const void *xb, float *y,
                           int M, int K, int N, void *workspace, size_t workspace_bytes, cudaStream_t stream, bool prompt) {
-    const ds4_exl3_dense_proj p{w, k2, N, y};
+    const ds4_exl3_dense_proj p{w, k2, N, y, nullptr};
     return ds4_exl3_dense_multi_launch(&p, 1, xb, M, K, workspace, workspace_bytes, stream, prompt);
 }
