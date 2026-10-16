@@ -59,6 +59,7 @@ struct pulsar_imatrix_tap;
 struct pulsar_tp;
 struct pulsar_mtp_ops;
 struct pulsar_mtp_lane;
+struct pulsar_block_lane;
 
 /** The core's per-session driver buffers.  A family's session state EXTENDS it (C++ derivation; the family's
  *  create allocates the derived object, the driver fills this part). */
@@ -81,6 +82,8 @@ struct pulsar_driver_state {
     uint64_t tp_vocab_seq;
     /** L296 N9: the chained-MTP drafter's lane (spec_mtp.h) when the family's ops declare modules, else NULL */
     struct pulsar_mtp_lane *mtp;
+    /** L298: the block drafter's lane (spec_block.h) when the engine loaded one, else NULL */
+    struct pulsar_block_lane *block;
 };
 
 /** Everything an op needs for one step: the core's part.  A family's step EXTENDS it with what its ops read of

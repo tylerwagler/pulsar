@@ -278,6 +278,11 @@ static bool ds4_load_stage_ok(const char *stage) {
 }
 
 bool pulsar_ds4_family_load(pulsar_engine *e, const pulsar_engine_options *opt) {
+    if (opt->drafter && opt->drafter[0]) {
+        fprintf(stderr, "pulsar: --drafter %s: DeepSeek drafts with the checkpoint's DSpark only (--no-dspark turns it "
+                        "off); refusing\n", opt->drafter);
+        return false;
+    }
     pulsar_load_refusals_reset();
     if (!opt->inspect_only) e->vocab.vocab_load(&e->model);
     if (!ds4_load_stage_ok("the tokenizer")) return false;

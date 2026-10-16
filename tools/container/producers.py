@@ -19,6 +19,8 @@ builder's copy of the engine's byte model.  The authorities these agree with:
   * fp8_e4m3_soa_k: `ds4q_fp8_e4m3_soa_k_repack` quants_fp.c:285-297 after the
     k-major transpose in `dsq_generate.c` :269-283; byte model `st_bytes_for`.
   * exl3m_*: `exl3_expert_layout` src/engine/exl3_trellis.h.
+  * nvfp4 (ModelOpt W4A16_NVFP4 Linears, PULSAR_TENSOR_NVFP4): the nibbles verbatim, the E4M3 scales through the
+    same 128x4 tile swizzle as the E8M0 planes, the global scale; byte model `st_bytes_for`.
 
 Every producer is graded byte-identical against the served source-precision
 repack by tools/container/test_producers.py.  numpy only; no torch.
@@ -289,6 +291,32 @@ def cutlass_mxfp4(w_i8: bytes, scale_e8m0: bytes, out: int, inp: int) -> bytes:
     return bytes(w_i8) + swizzle_sf(scale, out, kb_n).tobytes()
 
 
+# The nvfp4 entry's tail: the f32 global scale, then zeros to NVFP4_TAIL bytes -- a multiple of 32, so an nvfp4 entry
+# (out*in/2 and rup(out,128)*in/16 are multiples of 32 when in % 64 == 0) keeps the container's 32-byte order-based
+# alignment (build.py ALIGN) when several sit back to back.
+NVFP4_TAIL = 32
+
+
+def nvfp4(w_u8: bytes, scale_e4m3: bytes, scale2_f32: bytes, out: int, inp: int) -> bytes:
+    """A ModelOpt NVFP4 Linear (W4A16_NVFP4: U8 [out, in/2] E2M1 nibbles, low nibble = even input; F8_E4M3
+    [out, in/16] block scales, row-major; F32 [] global scale; w = e2m1 * e4m3 * scale_2) -> the engine's `nvfp4`
+    entry: the nibbles VERBATIM (out*in/2), the E4M3 scale plane in the 128x4-tiled MMA layout (`swizzle_sf`, i.e.
+    pulsar_mx_sfoff with kbp = in/16; rows zero-padded to rup(out,128)), then the f32 global scale and zeros to
+    NVFP4_TAIL bytes.  Requires in % 64 == 0 (whole 4-block scale tiles, no K padding)."""
+    if inp % 64:
+        raise ValueError(f"nvfp4: in={inp} is not divisible by 64")
+    if len(w_u8) != out * inp // 2:
+        raise ValueError(f"nvfp4: weight holds {len(w_u8)} bytes, [out={out}, in={inp}] needs {out * inp // 2}")
+    if len(scale_e4m3) != out * (inp // 16):
+        raise ValueError(f"nvfp4: weight_scale holds {len(scale_e4m3)} bytes, expected {out * (inp // 16)}")
+    if len(scale2_f32) != 4:
+        raise ValueError(f"nvfp4: weight_scale_2 holds {len(scale2_f32)} bytes, expected one f32")
+    if not np.isfinite(np.frombuffer(scale2_f32, dtype="<f4")).all():
+        raise ValueError("nvfp4: weight_scale_2 is not finite")
+    scale = np.frombuffer(scale_e4m3, dtype=np.uint8).reshape(out, inp // 16)
+    return bytes(w_u8) + swizzle_sf(scale, out, inp // 16).tobytes() + bytes(scale2_f32) + bytes(NVFP4_TAIL - 4)
+
+
 def _quantize_fp8_e4m3_planes(x: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     """`ds4q_quantize_fp8_e4m3` (quants_fp.c:55-77) on an f32 [nrows, ncols]
     array, returned as (E8M0 [nrows, ncols/32], E4M3 [nrows, ncols]) planes."""
@@ -384,13 +412,14 @@ def rows_strided(buf: bytes, n_rows: int, row_bytes: int, start: int, step: int)
     return np.frombuffer(buf, dtype=np.uint8).reshape(n_rows, row_bytes)[start::step].tobytes()
 
 
-PRODUCERS = {f.__name__: f for f in (mxfp8_lt, mxfp8_lt_from_bf16, cutlass_mxfp4, fp8_e4m3_soa_k_from_bf16,
+PRODUCERS = {f.__name__: f for f in (mxfp8_lt, mxfp8_lt_from_bf16, cutlass_mxfp4, nvfp4, fp8_e4m3_soa_k_from_bf16,
                                       i64_to_i32, tessera_planes, rows_strided)}
 # the engine's native layouts, by the stored dtype (`st_layout_type`): the recipe's `native` format
 NATIVE_LAYOUT = {"BF16": "bf16", "F32": "f32", "I32": "i32"}
 
 # The ONE producer table (L279 step 1): (source kind, target format) -> the producer that writes it, COPY for the
-# source's own bytes verbatim.  A source kind is the stored dtype, `+scale` with a block-scale companion, `exl3`
+# source's own bytes verbatim.  A source kind is the stored dtype, `+scale` with a block-scale companion, `+nvfp4`
+# with ModelOpt NVFP4's two (`X.weight_scale` E4M3 + `X.weight_scale_2` F32 beside `X.weight` U8), `exl3`
 # (an exllamav3 Linear's trellis | suh | svh) or `tessera` (a Tessera bundle's unit blobs).  Both families' plans ask here; a pair that is not a row refuses by
 # name (producer_for) -- there is no nearest format.
 COPY = "copy"
@@ -403,13 +432,15 @@ PRODUCER_FOR = {
     ("BF16", "mxfp8_lt"): "mxfp8_lt_from_bf16",
     ("BF16", "fp8_e4m3_soa_k"): "fp8_e4m3_soa_k_from_bf16",
     ("I8+scale", "cutlass_mxfp4"): "cutlass_mxfp4",
+    ("U8+nvfp4", "nvfp4"): "nvfp4",
     **{("exl3", layout): COPY for layout in exl3_rates.K2},
     ("tessera", "tessera"): "tessera_planes",
 }
 
 
-def source_kind(dtype: str, has_scale: bool) -> str:
-    return dtype + "+scale" if has_scale else dtype
+def source_kind(dtype: str, companion: str | None) -> str:
+    """`companion`: None, "scale" (an FP8 / FP4 block scale `X.scale`) or "nvfp4" (ModelOpt's two NVFP4 scales)."""
+    return f"{dtype}+{companion}" if companion else dtype
 
 
 def producer_for(kind: str, fmt: str, what: str) -> str:
@@ -422,9 +453,9 @@ def producer_for(kind: str, fmt: str, what: str) -> str:
 
 
 def matrix_dims(kind: str, shape: list) -> tuple:
-    """(out, in) of a source matrix: the FP4 source stores two E2M1 nibbles per I8 byte."""
+    """(out, in) of a source matrix: the FP4 sources store two E2M1 nibbles per byte (I8 MXFP4, U8 NVFP4)."""
     out, cols = shape
-    return out, cols * 2 if kind == "I8+scale" else cols
+    return out, cols * 2 if kind in ("I8+scale", "U8+nvfp4") else cols
 
 
 def spec(producer: str, inputs: list, **args) -> dict:
@@ -498,6 +529,13 @@ def bytes_for(layout: str, dims_ne: list, dtype: str | None = None) -> int:
             raise ValueError(f"bytes_for: cutlass_mxfp4 k={k} is not divisible by 32")
         per_expert = n * k // 2 + (_rup(n, 128) // 32) * _rup(k, 128)
         return per_expert * _prod(dims_ne[2:])
+    if layout == "nvfp4":
+        if len(dims_ne) != 2:
+            raise ValueError(f"bytes_for: nvfp4 is a 2-D [in, out] Linear, got {dims_ne}")
+        k, n = int(dims_ne[0]), int(dims_ne[1])
+        if k % 64:
+            raise ValueError(f"bytes_for: nvfp4 in={k} is not divisible by 64")
+        return n * k // 2 + _rup(n, 128) * (k // 16) + NVFP4_TAIL
     if layout in _EXL3_K2:
         if len(dims_ne) < 2:
             raise ValueError(f"bytes_for: {layout} tensor must be at least 2D")

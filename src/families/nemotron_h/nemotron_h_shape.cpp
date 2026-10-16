@@ -177,7 +177,8 @@ bool read_kinds(const pulsar_model *m, const char *key, char kinds[][12], uint32
 /* HF blocks -> pulsar layers: a mixer opens a layer, a moe closes the open one.  The same grouping as the builder's
  * (tools/container/nemotron_h.py group_layers); the bind records carry its result, and the binder proves the two
  * agree tensor by tensor. */
-bool group(const char kinds[][12], uint32_t n, const char *key, uint32_t *n_layer, uint64_t *mamba, uint64_t *moe) {
+bool group(const char kinds[][12], uint32_t n, const char *key, uint32_t *n_layer, uint64_t *mamba, uint64_t *moe,
+           uint8_t *block_layer = NULL, uint8_t *block_sub = NULL) {
     *n_layer = 0;
     *mamba = *moe = 0;
     bool open = false;
@@ -189,8 +190,16 @@ bool group(const char kinds[][12], uint32_t n, const char *key, uint32_t *n_laye
                 return refuse("%s%s (a layer is a mixer and the MoE after it)", key, why);
             }
             *moe |= 1ull << (*n_layer - 1);
+            if (block_layer) {
+                block_layer[b] = (uint8_t)(*n_layer - 1);
+                block_sub[b] = PULSAR_BLOCK_TAP_FFN;
+            }
             open = false;
             continue;
+        }
+        if (block_layer) {
+            block_layer[b] = (uint8_t)*n_layer;
+            block_sub[b] = PULSAR_BLOCK_TAP_MIXER;
         }
         if (*n_layer == PULSAR_FAMILY_MAX_LAYER) {
             char why[64];
@@ -215,6 +224,17 @@ bool pulsar_nemotron_h_read_shape(const pulsar_model *m, pulsar_nemotron_h_shape
                     "tower%s", "pulsar.mtp_present");
     if (vision) ok = refuse("%s is true: the vision tower is not part of this declaration (v1: text; N11)%s",
                             "pulsar.vision_present");
+    /* L298: a block drafter the container holds (absent: none -- containers built before it) */
+    pulsar_str dk = {NULL, 0};
+    s->block_written = false;
+    if (nh_kv(m, "pulsar.drafter")) {
+        if (!model_get_string(m, "pulsar.drafter", &dk))
+            ok = refuse("%s is not a string%s", "pulsar.drafter");
+        else if (pulsar_streq(dk, "lilicorr"))
+            s->block_written = true;
+        else if (dk.len)
+            ok = refuse("%s names a drafter the declaration does not know (lilicorr, or empty)%s", "pulsar.drafter");
+    }
     /* every nemotron_h.* key is one of the table's */
     for (uint64_t i = 0; i < m->n_kv; i++) {
         const pulsar_str k = m->kv[i].key;
@@ -306,7 +326,8 @@ bool pulsar_nemotron_h_read_shape(const pulsar_model *m, pulsar_nemotron_h_shape
     char kinds[PULSAR_NEMOTRON_H_MAX_BLOCKS][12];
     uint32_t n = 0;
     if (read_kinds(m, "nemotron_h.layers_block_type", kinds, PULSAR_NEMOTRON_H_MAX_BLOCKS, &n) &&
-        group(kinds, n, "nemotron_h.layers_block_type", &s->n_layer, &s->mamba_layers, &s->moe_layers)) {
+        group(kinds, n, "nemotron_h.layers_block_type", &s->n_layer, &s->mamba_layers, &s->moe_layers, s->block_layer,
+              s->block_sub)) {
         s->n_blocks = n;
     } else {
         ok = false;

@@ -7,6 +7,7 @@
  * session's declared state (state_kinds.h). */
 #include "pulsar_engine_internal.h"
 #include "spec_mtp.h"
+#include "spec_block.h"
 #include "tp/pulsar_tp.h"
 
 static const pulsar_driver_ops *DOPS(const pulsar_engine *e) { return e->family->driver; }
@@ -64,6 +65,8 @@ static void driver_bufs_free(pulsar_driver_state *d) {
     pulsar_gpu_tensor_free(d->tp_vocab_own);
     pulsar_mtp_lane_free(d->mtp);
     d->mtp = NULL;
+    pulsar_block_lane_free(d->block);
+    d->block = NULL;
 }
 
 /* The family's state, the driver's buffers and the declared state, built into a session the core allocated (L272
@@ -99,6 +102,8 @@ int pulsar_driver_session_create(pulsar_session *s, uint32_t n_banks) {
      * fresh banks set the lane's counters (pulsar_mtp_drafter_at) */
     if (ok && ops->mtp && ops->mtp->modules(e) > 0) ok = (d->mtp = pulsar_mtp_lane_create(s, ops->mtp, n_banks,
                                                                                            d->max_rows)) != NULL;
+    /* L298: the block drafter's lane (its tap rows and its op arena) when the engine loaded one */
+    if (ok && e->block_drafter) ok = (d->block = pulsar_block_lane_create(s, n_banks, d->max_rows)) != NULL;
     /* the declared state (its verify capture when the session verifies), every bank fresh */
     if (ok) ok = (s->states = pulsar_state_create(e, &e->state_plan, d, n_banks, (uint32_t)s->ctx_size,
                                                   verifies ? PULSAR_STATE_VERIFY_ROWS : 0u)) != NULL;

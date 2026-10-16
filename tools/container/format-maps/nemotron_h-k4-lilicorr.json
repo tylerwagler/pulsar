@@ -1,0 +1,21 @@
+{
+ "schema": "pulsar.recipe.v1",
+ "recipe": "nemotron_h-k4-lilicorr",
+ "model_type": "nemotron_h_omni",
+ "about": "Nemotron 3.5 Super VL on the uniform K4 EXL3 pack (as nemotron_h-exl3-k4: every trunk Linear exl3m_k4, the head exl3m_k6, the rest from the BF16 checkpoint as stored) with NVIDIA's LiLiCorr block drafter in place of the MTP module (L298): build with --drafter lilicorr DIR. The target's MTP module is omitted (pulsar.mtp_present false); the drafter's ModelOpt NVFP4 Linears are written nvfp4, its other tensors as stored (shard `drafter`). The trunk rows are scoped to block `layers` so they do not reach the MTP tensors; the top-level norm_f is named.",
+ "rows": [
+  {"role": "dense", "block": "layers", "format": "exl3m_k4"},
+  {"role": "shared_expert", "block": "layers", "format": "exl3m_k4"},
+  {"role": "expert_up", "block": "layers", "format": "exl3m_k4"},
+  {"role": "expert_down", "block": "layers", "format": "exl3m_k4"},
+  {"role": "router", "block": "layers", "format": "native"},
+  {"role": "norm", "block": "layers", "format": "native"},
+  {"role": "other", "block": "layers", "format": "native"},
+  ["language_model.backbone.norm_f.weight", "native"],
+  {"role": "embed", "format": "native"},
+  {"role": "head", "format": "exl3m_k6"},
+  ["language_model.mtp.*", "omit"],
+  {"role": "drafter_quantized", "format": "nvfp4"},
+  {"role": "drafter_native", "format": "native"}
+ ]
+}

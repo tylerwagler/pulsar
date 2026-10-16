@@ -585,6 +585,11 @@ static bool qwen_family_load(pulsar_engine *e, const pulsar_engine_options *opt)
                 PULSAR_QWEN_ARCH);
         return false;
     }
+    if (opt->drafter && opt->drafter[0] && strcmp(opt->drafter, "mtp") != 0) {
+        fprintf(stderr, "pulsar: %s: --drafter %s: this family drafts with its MTP module only (mtp); refusing\n",
+                PULSAR_QWEN_ARCH, opt->drafter);
+        return false;
+    }
     if (opt->directional_steering_file && opt->directional_steering_file[0]) {
         fprintf(stderr, "pulsar: %s: directional steering is not implemented for this family; refusing\n",
                 PULSAR_QWEN_ARCH);
