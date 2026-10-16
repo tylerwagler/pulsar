@@ -133,6 +133,13 @@ bool nemotron_render(pulsar_engine *e, server *s, chat_conversation *c, request 
     if (!nemotron_chat_render(in, &out, err, errlen)) return false;
     free(r->prompt_spans);
     r->prompt_text = nemotron_take_render(out, &r->prompt_spans, &r->prompt_n_spans);
+    /* A required call (OpenAI "required" or a named function, Anthropic "any" or "tool"): the turn is prefilled past
+     * thinking into an open <tool_call> (nemotron_forced_call_prefill), and the output seeded with the same bytes. */
+    const bool forced = c->tool_choice == CHAT_TOOL_CHOICE_ANY || c->tool_choice == CHAT_TOOL_CHOICE_NAMED;
+    if (forced && r->has_tools) {
+        r->force_tool_call = true;
+        if (!request_apply_forced_tool_prefill(r, err, errlen)) return false;
+    }
     if (e) {
         pulsar_tokenize_rendered_chat_spans(e, r->prompt_text, r->prompt_spans, r->prompt_n_spans, &r->prompt);
         if (!request_prepare_images(e, &c->msgs, r, err, errlen)) return false;
