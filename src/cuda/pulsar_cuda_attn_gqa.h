@@ -146,6 +146,40 @@ int pulsar_gqa_forward(const pulsar_gqa_layer *layer,
                        const uint32_t *row_seq, const uint32_t *row_pos, uint32_t n_rows,
                        const pulsar_gqa_io *io, cudaStream_t stream);
 
+/* ---- the same call in two halves (L296 perf): the host plan, then the launches -------------------------------
+ * pulsar_gqa_forward is pulsar_gqa_plan into a host stage + one upload + pulsar_gqa_launch.  A caller that runs its
+ * step's launches as a captured CUDA graph plans every attention call of the step first (its host half), uploads
+ * the descriptors itself, and launches from them: a launch reads nothing from the host but the plan's shape. */
+
+/** A planned call: what its launches depend on. */
+typedef struct {
+    uint32_t n_rows;
+    uint32_t n_tiles;
+    uint32_t grid_chunks;   /**< the split schedule's chunk CTAs per (KV head, tile) */
+    uint32_t ctx_bound;     /**< the workspace's context: the call's bound, else its own last position + 1 */
+    int      fold;          /**< 1: the folded schedule (n_rows >= 64) */
+} pulsar_gqa_call;
+
+/** Bytes of a call's descriptors at n_rows rows (pulsar_gqa_plan's `desc`). */
+uint64_t pulsar_gqa_desc_bytes(uint32_t n_rows);
+
+/** The host half: the rows' descriptors into `desc` (host, >= pulsar_gqa_desc_bytes(n_rows)) and the call's shape
+ *  into *out.  The contract and the refusals are pulsar_gqa_forward's.  ctx_bound > 0 BOUNDS the call: every row's
+ *  position is below it (else refused) and the launches are sized by it, not by the positions -- the bytes are the
+ *  unbounded call's (a chunk CTA past its tile's last row exits; the combine folds each row's own chunks), so a
+ *  graph captured at one bound replays at every position under it.  0 = the call's own positions (the forward's).
+ *  @return 0, or -1 on a refused contract (named on stderr). */
+int pulsar_gqa_plan(const pulsar_gqa_layer *layer, const pulsar_gqa_seq *seqs, uint32_t n_seqs,
+                    const uint32_t *row_seq, const uint32_t *row_pos, uint32_t n_rows, uint32_t ctx_bound,
+                    void *desc, uint64_t desc_cap, pulsar_gqa_call *out);
+
+/** The launches of a planned call from its descriptors on the device (`desc_dev`, 256-byte aligned: the plan's
+ *  bytes, uploaded by the caller before this runs).  io->workspace is sized by pulsar_gqa_workspace_bytes at the
+ *  call's rows and ctx_bound; its descriptor region is unused (the descriptors are desc_dev's).
+ *  @return 0, -1 on a refused contract, -3 on a launch failure. */
+int pulsar_gqa_launch(const pulsar_gqa_layer *layer, const pulsar_gqa_call *call, const void *desc_dev,
+                      const pulsar_gqa_io *io, cudaStream_t stream);
+
 #ifdef __cplusplus
 }
 #endif

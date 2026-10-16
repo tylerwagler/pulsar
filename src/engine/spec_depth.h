@@ -3,8 +3,9 @@
  * One round's update of the draft-depth cap from what the round converted.  The rule is DSpark's
  * (spec_dspark.cpp's k_dspark_depth, the 2026-08-25 sweep and its v2..v5 refinements), moved here in
  * L251 so it has one home and a gate (tests/spec_depth_gate.cpp pins DSpark's schedule).  The Qwen MTP
- * drafter uses it since L288 (4..7, no veto or cooldown; spec_qwen.cpp k_mtp_depth has the replay); a drafter
- * opts in through pulsar_drafter_ops::adapt.  Pure host
+ * drafter uses it since L288 (4..7, no veto or cooldown; family_qwen.cpp k_mtp_depth has the replay); Nemotron-H's
+ * MTP drafter does not (L296 fullspec: a fixed cap of 7, its stop rule and the priced depth measured faster than the
+ * controller at every range tried); a drafter opts in through pulsar_drafter_ops::adapt.  Pure host
  * logic: no engine state, no CUDA.
  *
  *   UP:    commit >= depth - up_slack (up_slack 0: the whole chain was kept and accepted), no cooldown running,

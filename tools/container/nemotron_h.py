@@ -7,10 +7,13 @@ Sources (no GGUF anywhere, L247):
            under `language_model.` (`backbone.layers.B.`, `backbone.embeddings`, `backbone.norm_f`, `lm_head`, `mtp.`);
            the vision tower (`vision_model.`, `vision_projector.`, `mlp1.`) is consumed by name and written nowhere in
            v1 (plan 121 decision 3: text first).
-  --exl3   an exllamav3 pack (Linear keys = the HF names minus `.weight`): the dense Linears (Mamba in / out, attention,
-           the latent projections, the shared expert, the drafter's eh_proj) and the head, at a dense-arm rate.  The
-           ROUTED experts are up-only (no gate): no EXL3 arm reads an up-only routed stack yet, so an EXL3 routed row is
-           refused by name until the format verdict (L296: EXL3 vs NVFP4) builds one.
+  --exl3   an exllamav3 pack of the same checkpoint (exllamav3 1.6's NemotronH adapter: Linear keys = the HF names
+           minus `language_model.` and `.weight`, e.g. `backbone.layers.1.mixer.experts.7.up_proj`): every Linear --
+           the Mamba in / out projections, attention, the latent fc1 / fc2, the shared expert, the routed experts
+           (UP-ONLY: one up and one down slice per expert, no gate; the engine's EXL3 routed front door runs them,
+           moe.cpp PULSAR_MOE_ARM_ROWS_UP), the drafter's eh_proj -- and the head, byte copies of the pack (PackView).
+           Norms, the conv, A_log / D / dt_bias, the router (the pack's is an F16 copy) and its selection bias are
+           read from --hf as stored.
   --recipe a pulsar.recipe.v1 (format-maps/nemotron_h-*.json): required.
 
 The model (plan 121 section 1).  `llm_config.layers_block_type` lists the HF blocks, each ONE pre-norm residual
@@ -38,8 +41,8 @@ The container:
   * names ARE the HF names; routed experts fold to one entry per expert-projection (the HF per-expert tensors as
     they are), contiguous in expert order, part in {up_proj, down_proj}; each family in pulsar.experts carries
     entry_name, layer, role and block.  gguf_name of a family: `<prefix>.mixer.experts.<part>`.
-  * layouts: bf16 / f32 native; exl3m_k* for a dense Linear or the head from an EXL3 pack; mxfp8_lt for a dense
-    Linear or the head from BF16.  The conv1d weight is declared [channels, kernel] (the HF [channels, 1, kernel]
+  * layouts: bf16 / f32 native; exl3m_k* for a dense Linear, a routed expert-projection or the head from an EXL3
+    pack (the rate per engine arm, exl3_rates.admit); mxfp8_lt for a dense Linear or the head from BF16.  The conv1d weight is declared [channels, kernel] (the HF [channels, 1, kernel]
     minus its unit dim; the same bytes).
   * shards: `vision` (primary: pulsar.kv only -- no tower in v1), `layers.0..L-1` (pulsar layers), `top` (embed,
     norm_f, head), `mtp.0..N-1` when the recipe writes the drafter (all of it or none).
@@ -57,6 +60,7 @@ import os
 import re
 from dataclasses import dataclass, field, replace
 
+import entries as EN
 import exl3_rates
 import kv as KV
 import producers as PR
@@ -373,7 +377,36 @@ def _mtp_written(hf, recipe):
     return bool(fm) and not omitted
 
 
+class PackView:
+    """The --exl3 pack under the checkpoint's names: exllamav3 keys a NemotronH Linear without the Omni wrapper's
+    `language_model.` prefix.  Answers the Exl3Checkpoint calls build.py / entries.py make for an HF Linear key."""
+
+    def __init__(self, pack):
+        self.pack = pack
+        self.dir = pack.dir
+
+    @staticmethod
+    def key(k):
+        if not k.startswith(LM):
+            raise SystemExit(f"{k}: an EXL3 Linear outside {LM!r} -- the pack holds the language model only")
+        return k[len(LM):]
+
+    def names(self):
+        return self.pack.names()
+
+    def has_linear(self, key):
+        return self.pack.has_linear(self.key(key))
+
+    def linear(self, key, k, n, rates):
+        return self.pack.linear(self.key(key), k, n, rates)
+
+
 def shape(hf, ctx):
+    src = ctx.sources.get("exl3")
+    if src is not None and not isinstance(src, PackView):
+        ctx.sources["exl3"] = PackView(src)
+    if ctx.sources.get("exl3_experts") is not None:
+        raise SystemExit("--exl3-experts: the Nemotron-H build reads one pack (--exl3)")
     if ctx.recipe is None:
         default_recipe(hf, None, ctx)
     return replace(hf.decl, recipe=ctx.recipe.name, mtp=_mtp_written(hf, ctx.recipe), table=hf.mapped)
@@ -396,18 +429,17 @@ def declared_shape(m, hshape):
 
 
 # what the loader binds, by recipe role: the dense Linears and the head EXL3 (dense arm) / mxfp8_lt / BF16; the
-# routed experts BF16 only (no up-only routed arm in any format yet: the format verdict's); everything else in its
-# source dtype.  `omit` only for the drafter (_mtp_written keeps it whole).
+# routed experts BF16 or EXL3 (the up-only routed arm, L296; the rate by the engine's arm, exl3_rates.admit);
+# everything else in its source dtype.  `omit` only for the drafter (_mtp_written keeps it whole).
 def admit(hf, m, fmt, name):
     native = PR.NATIVE_LAYOUT.get(hf.dtype(name))
     allowed = {"native", native}
     if m.role in ("dense", "shared_expert", "head"):
         allowed |= EXL3 | {"mxfp8_lt"}
+    if m.role in ("expert_up", "expert_down"):
+        allowed |= EXL3
     if m.shard.startswith("mtp."):
         allowed.add("omit")
-    if m.role in ("expert_up", "expert_down") and fmt in EXL3:
-        raise SystemExit(f"{name}: an up-only routed expert at {fmt} -- no EXL3 arm reads an up-only (ungated) routed "
-                         f"stack yet (L296: the format verdict builds it) -- refusing")
     if fmt not in allowed:
         raise SystemExit(f"{name}: the Nemotron-H loader binds this {m.role} tensor as "
                          f"{sorted(a for a in allowed if a)}, not {fmt}")
@@ -426,7 +458,8 @@ def gate_up_key(rec):
 
 
 def group_families(hf, key, slots, fmt, ctx):
-    """One routed family from the per-expert HF tensors {e: (name, mapped)}: their BF16 bytes as stored."""
+    """One routed family from the per-expert HF tensors {e: (name, mapped)}: EXL3 ranges from the pack, or their
+    BF16 bytes as stored."""
     shard, layer, part = key
     n_exp = max(slots) + 1
     if sorted(slots) != list(range(n_exp)) or n_exp != hf.decl.n_expert:
@@ -437,17 +470,21 @@ def group_families(hf, key, slots, fmt, ctx):
     if odd:
         raise SystemExit(f"{shard} {part}: experts of one family share a format and source; {odd[0]} is "
                          f"{fmt[odd[0]]}, expert 0 {fmt0}")
-    layout = fmt0[0]
+    layout, src = fmt0
     if layout == "native":
         layout = PR.NATIVE_LAYOUT[hf.dtype(name0)]
-    if layout != "bf16":
-        raise SystemExit(f"{name0}: a routed expert is written bf16, not {layout}")
     out, inp = hf.shape(name0)
     names = [slots[e][0] for e in range(n_exp)]
+    if layout in EXL3:
+        srcs = [("ranges", EN.exl3_ranges(ctx.sources[src], x[:-len(".weight")], layout, inp, out)[0]) for x in names]
+    elif layout == "bf16":
+        srcs = [hf.copy_src(x)[0] for x in names]
+    else:
+        raise SystemExit(f"{name0}: a routed expert is written EXL3 or bf16, not {layout}")
     pre = name0[:name0.index(".experts.") + len(".experts.")]
     rec = dict(m0.bind)
     return [dict(gguf_name=pre + part, part=part, role=m0.role, layout=layout, inp=inp, n=out, entry_names=names,
-                 srcs=[hf.copy_src(x)[0] for x in names],
+                 srcs=srcs,
                  extras={"entry_name": f"{pre}{{e}}.{part}.weight", "layer": layer, "role": rec["role"],
                          "block": rec["block"]})]
 

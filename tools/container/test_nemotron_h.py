@@ -10,11 +10,13 @@ module, vision tensors):
   * pulsar.kv: llm_config verbatim, time_step_limit as its two pinned facts, mtp / vision presence; no vision
     tensor in the container
   * an EXL3 build of every dense Linear and the shared expert (dense arm), the routed experts BF16: bytes == the
-    pack's [trellis | suh | svh]
+    pack's [trellis | suh | svh], the pack keyed as exllamav3 writes it (no `language_model.` prefix)
+  * a full EXL3 build (L296): the up-only routed experts too, from the pack (expert width 128, an EXL3 multiple):
+    every expert-projection's bytes == the pack's, its family exl3m_k4; a pack keyed under the HF names refused
   * the drafter omitted whole -> no mtp shard, pulsar.mtp_present false
   * refusals by name: an unknown tensor, a missing tensor, a wrong shape, a switch (relu2 -> silu), a dt clamp
-    (time_step_limit [0.001, inf]), a moe with no mixer before it, an `mlp` block, an EXL3 routed expert row, half
-    a drafter omitted, an omitted main-model tensor
+    (time_step_limit [0.001, inf]), a moe with no mixer before it, an `mlp` block, half a drafter omitted, an
+    omitted main-model tensor
 """
 from __future__ import annotations
 
@@ -79,6 +81,7 @@ def config():
 def make_hf(root, rng, cfg=None, edit=None):
     os.makedirs(root, exist_ok=True)
     json.dump(cfg or config(), open(os.path.join(root, "config.json"), "w"))
+    ff = (cfg or config())["llm_config"]["moe_intermediate_size"]
     for f in SIDE[:-1]:
         open(os.path.join(root, f), "w").write(f"{{\"synthetic\": \"{f}\"}}\n")
     t = {}
@@ -102,7 +105,7 @@ def make_hf(root, rng, cfg=None, edit=None):
             mat(m + "fc1_latent_proj.weight", LAT, H); mat(m + "fc2_latent_proj.weight", H, LAT)
             mat(m + "shared_experts.up_proj.weight", SFF, H); mat(m + "shared_experts.down_proj.weight", H, SFF)
             for e in range(X):
-                mat(m + f"experts.{e}.up_proj.weight", FF, LAT); mat(m + f"experts.{e}.down_proj.weight", LAT, FF)
+                mat(m + f"experts.{e}.up_proj.weight", ff, LAT); mat(m + f"experts.{e}.down_proj.weight", LAT, ff)
     mat(BB + "embeddings.weight", V, H); mat(BB + "norm_f.weight", H); mat(LM + "lm_head.weight", V, H)
     for b, kind in enumerate(BLOCKS):
         block(f"{BB}layers.{b}.", kind)
@@ -127,14 +130,18 @@ DENSE = ("in_proj", "out_proj", "q_proj", "k_proj", "v_proj", "o_proj", "fc1_lat
          "shared_experts.up_proj", "shared_experts.down_proj")
 
 
-def make_exl3(root, hf_t, rng, K=4):
-    """The EXL3 pack of the trunk's dense Linears and shared experts (the HF names minus .weight)."""
+def make_exl3(root, hf_t, rng, K=4, experts=False, prefixed=False):
+    """The EXL3 pack of the trunk's dense Linears and shared experts -- and its routed experts when `experts` -- keyed
+    as exllamav3's NemotronH Omni adapter writes them: the HF names minus `language_model.` and `.weight` (`prefixed`:
+    under the HF names, which the builder must refuse)."""
     t = {}
     for name, (_dt, shape, _b) in hf_t.items():
-        if name.startswith(BB + "layers.") and any(name.endswith(f"mixer.{d}.weight") for d in DENSE):
+        routed = experts and ".mixer.experts." in name
+        if name.startswith(BB + "layers.") and (routed or any(name.endswith(f"mixer.{d}.weight") for d in DENSE)):
             out, inp = shape
+            key = name[:-len(".weight")] if prefixed else name[len(LM):-len(".weight")]
             for s, v in exl3_parts(rng, inp, (out + 127) // 128 * 128, K).items():
-                t[f"{name[:-len('.weight')]}.{s}"] = v
+                t[f"{key}.{s}"] = v
     os.makedirs(root, exist_ok=True)
     write_st(os.path.join(root, "model-00001-of-00001.safetensors"), t)
     return t
@@ -286,8 +293,37 @@ def main():
                 and key + ".weight" in header(os.path.join(o4, f))[0]]
         d1 = json.loads(header(os.path.join(o4, f_l1[0]))[0]["__metadata__"]["pulsar.tensors"]) if f_l1 else {}
         check(bool(f_l1) and d1[key + ".weight"]["layout"] == "exl3m_k4" and d1[key + ".weight"]["dims_ne"] == [H, DI + CD + NH]
-              and entry_bytes(o4, f_l1[0], key + ".weight") == b"".join(ext[f"{key}.{s}"][2] for s in ("trellis", "suh", "svh")),
+              and entry_bytes(o4, f_l1[0], key + ".weight") == b"".join(ext[f"{key[len(LM):]}.{s}"][2]
+                                                                        for s in ("trellis", "suh", "svh")),
               "ssm_in exl3m_k4 at its logical width, bytes == the pack's [trellis | suh | svh]")
+
+        print("full EXL3 build (L296: the up-only routed experts from the pack too; expert width 128):")
+        c128 = config()
+        c128["llm_config"]["moe_intermediate_size"] = c128["llm_config"]["intermediate_size"] = 128
+        hf128 = os.path.join(tmp, "hf128")
+        t128 = make_hf(hf128, np.random.default_rng(11), cfg=c128)
+        ex128 = os.path.join(tmp, "exl3-128")
+        ext128 = make_exl3(ex128, t128, np.random.default_rng(12), experts=True)
+        rfull = recipe(tmp, "full", [
+            *[{"role": r, "block": "layers", "format": "exl3m_k4"} for r in ("dense", "shared_expert", "expert_up",
+                                                                              "expert_down")],
+            *[{"role": r, "block": "mtp", "format": "native"} for r in ("dense", "shared_expert", "expert_up",
+                                                                         "expert_down")],
+            *[{"role": r, "format": "native"} for r in ("router", "norm", "embed", "head", "other")]])
+        of = build_grade(tmp, "full", ["--hf", hf128, "--exl3", ex128, "--recipe", rfull], n_files)
+        ek = BB + "layers.4.mixer.experts.3.up_proj"
+        ff = [f for f in sorted(os.listdir(of)) if f.endswith(".safetensors") and ek + ".weight" in header(os.path.join(of, f))[0]]
+        fam = [x for x in json.loads(header(os.path.join(of, ff[0]))[0]["__metadata__"]["pulsar.experts"])
+               if x["part"] == "up_proj"] if ff else []
+        check(bool(ff) and fam and fam[0]["layout"] == "exl3m_k4" and fam[0]["n_experts"] == X
+              and entry_bytes(of, ff[0], ek + ".weight") == b"".join(ext128[f"{ek[len(LM):]}.{s}"][2]
+                                                                      for s in ("trellis", "suh", "svh")),
+              "routed up expert 3 exl3m_k4, bytes == the pack's [trellis | suh | svh]; its family exl3m_k4 x 4 experts")
+        exp = os.path.join(tmp, "exl3-prefixed")
+        make_exl3(exp, t128, np.random.default_rng(12), experts=True, prefixed=True)
+        ok, _ = run("plan", "--hf", hf128, "--exl3", exp, "--recipe", rfull, expect_fail=True,
+                    contains="missing from the EXL3 checkpoint")
+        check(ok, "a pack keyed under the HF names (language_model.) -> refused (not the exllamav3 layout)")
 
         print("drafter omitted:")
         rom = recipe(tmp, "omit", [
@@ -332,10 +368,6 @@ def main():
             make_hf(d, np.random.default_rng(1), cfg=copy.deepcopy(cfg) if cfg else None, edit=edit)
             ok, _ = run("plan", "--hf", d, "--recipe", rbf, expect_fail=True, contains=msg)
             check(ok, f"{label} -> refused")
-        re3 = recipe(tmp, "exl3-routed", [x if x["role"] != "expert_up" else {**x, "format": "exl3m_k4"}
-                                          for x in json.load(open(rk4))["rows"]])
-        ok, _ = run("plan", "--hf", hf, "--exl3", ex, "--recipe", re3, expect_fail=True, contains="up-only")
-        check(ok, "an EXL3 routed (up-only) expert row -> refused by name (no arm yet)")
         r = json.load(open(rbf))
         hp = recipe(tmp, "half-mtp", [x for x in r["rows"] if x["role"] != "router"] + [
             {"role": "router", "block": "layers", "format": "native"}, {"role": "router", "block": "mtp", "format": "omit"}])

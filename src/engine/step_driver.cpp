@@ -6,7 +6,7 @@
  * target.  The family's facts it reads are pulsar_driver_ops (its blocks), the engine's layer plan, and the
  * session's declared state (state_kinds.h). */
 #include "pulsar_engine_internal.h"
-#include "spec_internal.h"
+#include "spec_mtp.h"
 #include "tp/pulsar_tp.h"
 
 static const pulsar_driver_ops *DOPS(const pulsar_engine *e) { return e->family->driver; }
@@ -62,6 +62,8 @@ static void driver_bufs_free(pulsar_driver_state *d) {
     free(d->host_logits);
     pulsar_gpu_tensor_free(d->tp_ticket);
     pulsar_gpu_tensor_free(d->tp_vocab_own);
+    pulsar_mtp_lane_free(d->mtp);
+    d->mtp = NULL;
 }
 
 /* The family's state, the driver's buffers and the declared state, built into a session the core allocated (L272
@@ -93,6 +95,10 @@ int pulsar_driver_session_create(pulsar_session *s, uint32_t n_banks) {
         d->host_logits = (float *)xmalloc((size_t)PULSAR_DRIVER_HEADS_MAX * W * sizeof(float));
         ok = d->run_first_dev != NULL;
     }
+    /* L296 N9: the chained-MTP drafter's lane when the family declares modules -- before the declared state, whose
+     * fresh banks set the lane's counters (pulsar_mtp_drafter_at) */
+    if (ok && ops->mtp && ops->mtp->modules(e) > 0) ok = (d->mtp = pulsar_mtp_lane_create(s, ops->mtp, n_banks,
+                                                                                           d->max_rows)) != NULL;
     /* the declared state (its verify capture when the session verifies), every bank fresh */
     if (ok) ok = (s->states = pulsar_state_create(e, &e->state_plan, d, n_banks, (uint32_t)s->ctx_size,
                                                   verifies ? PULSAR_STATE_VERIFY_ROWS : 0u)) != NULL;
@@ -142,6 +148,9 @@ int pulsar_driver_session_create(pulsar_session *s, uint32_t n_banks) {
 }
 
 void pulsar_driver_session_destroy(pulsar_session *s) {
+    /* L296 perf: a captured decode step bakes this session's buffers (its key names them): drop every graph before
+     * they are freed and another allocation can take their addresses */
+    pulsar_gpu_seg_reset();
     pulsar_state_destroy(s->states);
     s->states = NULL;
     if (s->driver) driver_bufs_free(s->driver);
@@ -159,6 +168,39 @@ struct driver_image_ud {
 static bool driver_image_rows(void *ud, const uint16_t *rows, uint32_t n_rows, uint32_t row0, uint32_t n_tokens) {
     const driver_image_ud *u = (const driver_image_ud *)ud;
     return u->ops->image_rows(u->st, rows, n_rows, row0, n_tokens);
+}
+
+/* L296 perf: a captured step's key -- everything host-side its launches depend on: the session's buffers (the
+ * driver state; a destroyed session drops every graph, pulsar_driver_session_destroy), the step's kind (a decode step
+ * or a pure verify), the row count, the head list, and the family's own key (pulsar_driver_ops::stage).  Tagged in the
+ * top bits so it never meets the output head segment's structured keys (gpu_graph_output_head_seg_key) in the one
+ * segment table. */
+static uint64_t driver_graph_key(const pulsar_driver_state *d, bool verify, uint32_t n_rows,
+                                 const pulsar_driver_heads &heads, uint64_t family_key) {
+    auto mix = [](uint64_t h, uint64_t v) {
+        uint64_t z = h ^ (v + 0x9e3779b97f4a7c15ull + (h << 6) + (h >> 2));
+        z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ull;
+        z = (z ^ (z >> 27)) * 0x94d049bb133111ebull;
+        return z ^ (z >> 31);
+    };
+    uint64_t h = mix(0x44525647ull /* "DRVG" */, (uint64_t)(uintptr_t)d);
+    h = mix(h, verify ? 2u : 1u);
+    h = mix(h, n_rows);
+    h = mix(h, heads.n);
+    for (uint32_t i = 0; i < heads.n; i++) h = mix(h, heads.row[i]);
+    h = mix(h, family_key);
+    return (h >> 4) | (0xDull << 60);
+}
+
+/* rule 5: each graphed lane (the decode step, the verify step) says once that it ran (the counters are
+ * pulsar_gpu_seg_counts) */
+static void driver_graph_announce(const char *arch, bool verify, const char *what) {
+    static bool seen_[2][2] = {};
+    bool &seen = seen_[verify ? 1 : 0][what[0] == 'c' ? 0 : 1];
+    if (seen) return;
+    seen = true;
+    fprintf(stderr, "pulsar: %s: L296 %s step graph %s (one captured graph per %s shape)\n", arch,
+            verify ? "verify" : "decode", what, verify ? "verify" : "decode");
 }
 
 /* One step of the trunk: the plan, in its order.  DECODE: one row per bank; PREFILL: runs of one bank each -- a
@@ -237,6 +279,8 @@ static bool driver_forward(pulsar_session *s, pulsar_step_mode mode, const int32
     const uint32_t n_vruns = st.verify ? pulsar_step_verify_runs(&st) : 0u;
     /* the verify's runs, and each run's host state before the step: a commit finds its bank's run */
     if (st.verify) pulsar_state_verify_begin(ss, n_vruns, run_first, bank, pos);
+    /* L296 N9: the verify rows' tokens, which the MTP lane's absorb pairs a bank's still-parked row with */
+    if (st.verify && d->mtp) pulsar_mtp_note_verify(d->mtp, tokens, n_verify);
     /* L289: enqueued, not waited for -- the step's uploads never drain the stream */
     bool ok = pulsar_gpu_tensor_write_async(d->row_pos, 0, pos, (uint64_t)n_rows * sizeof(int32_t)) != 0 &&
               pulsar_gpu_tensor_write_async(d->row_bank, 0, bank, (uint64_t)n_rows * sizeof(int32_t)) != 0;
@@ -245,35 +289,67 @@ static bool driver_forward(pulsar_session *s, pulsar_step_mode mode, const int32
         for (uint32_t k = 0; k <= n_vruns; k++) rf[k] = (int32_t)run_first[k];
         ok = pulsar_gpu_tensor_write_async(d->run_first_dev, 0, rf, (uint64_t)(n_vruns + 1u) * sizeof(int32_t)) != 0;
     }
+    /* L296 perf: the family's host half (every upload the launches read), and what its launches depend on */
+    uint64_t family_key = 0;
+    if (ok && ops->stage) ok = ops->stage(&st, &family_key);
     if (ok) ok = pulsar_gpu_begin_commands() != 0;
     /* each verify run's open blocks, before any op of the step writes them (state_kinds.h STAGE) */
     if (ok && st.verify) ok = pulsar_state_verify_capture(ss);
-    if (ok) ok = ops->embed(&st);
-    /* L268: a sync's prefill chunk takes the image rows of the blocks it owns over their pads' embeddings (HF
-     * masked_scatter), through the family's writer */
-    if (ok && mode == PULSAR_STEP_PREFILL && s->sync_images && n_runs == 1 && bank[0] == (int32_t)ss->live_bank) {
-        if (!ops->image_rows) {
-            fprintf(stderr, "pulsar: %s: a prompt chunk with image blocks, and the family takes no image rows\n",
-                    ARCH(e));
-            ok = false;
-        } else {
-            driver_image_ud u = {ops, &st};
-            ok = pulsar_image_merge_chunk(e, s->sync_prompt->v, s->sync_prompt->len, s->sync_images, s->sync_n_images,
-                                          (uint32_t)pos[0], n_rows, driver_image_rows, &u);
+    /* the step's launches: embed, the image rows of a prompt chunk, the plan's blocks, the head list */
+    auto launches = [&]() -> bool {
+        bool lok = ops->embed(&st);
+        /* L268: a sync's prefill chunk takes the image rows of the blocks it owns over their pads' embeddings (HF
+         * masked_scatter), through the family's writer */
+        if (lok && mode == PULSAR_STEP_PREFILL && s->sync_images && n_runs == 1 && bank[0] == (int32_t)ss->live_bank) {
+            if (!ops->image_rows) {
+                fprintf(stderr, "pulsar: %s: a prompt chunk with image blocks, and the family takes no image rows\n",
+                        ARCH(e));
+                lok = false;
+            } else {
+                driver_image_ud u = {ops, &st};
+                lok = pulsar_image_merge_chunk(e, s->sync_prompt->v, s->sync_prompt->len, s->sync_images,
+                                               s->sync_n_images, (uint32_t)pos[0], n_rows, driver_image_rows, &u);
+            }
         }
-    }
-    for (uint32_t il = 0; ok && il < e->plan.n_layer; il++) {
-        ok = ops->block[e->plan.kind[il]](&st, il);
-        /* the diagnostic tap after layer il (PULSAR_CUDA_GRAPH_DUMP_PREFIX armed; the family's dump re-checks its
-         * own arming, so an unarmed run does no work) */
-        if (ok && ops->dump && gpu_graph_debug_dump_enabled()) ops->dump(&st, il);
-    }
-    /* the head list into its logits rows (L284 #2): a span of consecutive decode rows is one call (a verify heads
-     * every row), a prompt row is its own call -- the one-row head its classic chunk makes */
-    for (uint32_t i = 0, j; ok && i < heads.n; i = j) {
-        for (j = i + 1; j < heads.n && heads.row[i] < st.n_dec && heads.row[j] == heads.row[j - 1] + 1u &&
-                        heads.row[j] < st.n_dec; j++) {}
-        ok = ops->head(&st, heads.row[i], j - i, i);
+        for (uint32_t il = 0; lok && il < e->plan.n_layer; il++) {
+            lok = ops->block[e->plan.kind[il]](&st, il);
+            /* the diagnostic tap after layer il (PULSAR_CUDA_GRAPH_DUMP_PREFIX armed; the family's dump re-checks
+             * its own arming, so an unarmed run does no work) */
+            if (lok && ops->dump && gpu_graph_debug_dump_enabled()) ops->dump(&st, il);
+        }
+        /* the head list into its logits rows (L284 #2): a span of consecutive decode rows is one call (a verify
+         * heads every row), a prompt row is its own call -- the one-row head its classic chunk makes */
+        for (uint32_t i = 0, j; lok && i < heads.n; i = j) {
+            for (j = i + 1; j < heads.n && heads.row[i] < st.n_dec && heads.row[j] == heads.row[j - 1] + 1u &&
+                            heads.row[j] < st.n_dec; j++) {}
+            lok = ops->head(&st, heads.row[i], j - i, i);
+        }
+        return lok;
+    };
+    /* L296 perf: a DECODE step of a staged family runs its launches as one captured graph per key (the session's
+     * buffers, the step's kind, the rows, the head list, the family's key): the L119 segment cache captures a key's
+     * 12th use and replays it after.  L296 fullspec: so does a PURE verify step (every row a verify row -- a
+     * speculative round's; its capture of the recurrent state is the driver's, before the launches), keyed by the
+     * family on its run structure too.  Eager while a diagnostic tap or an importance-matrix observer reads the step
+     * from the host, and under TP (the row exchange waits on the host). */
+    const bool graphable = mode == PULSAR_STEP_DECODE ? !st.verify : st.verify && n_verify == n_rows;
+    const uint64_t gkey = ok && graphable && family_key && !st.tap && !d->tp && !gpu_graph_debug_dump_enabled()
+                              ? driver_graph_key(d, st.verify, n_rows, heads, family_key)
+                              : 0;
+    if (ok && gkey) {
+        const int seg = pulsar_gpu_seg_enter(gkey);
+        if (seg == 2) {
+            driver_graph_announce(ARCH(e), st.verify, "replayed");
+        } else if (seg == 1) {
+            const bool body = launches();
+            /* a failed capture never ran its work: the launches again, eager (a real refusal refuses again) */
+            if (pulsar_gpu_seg_exit(gkey, body ? 1 : 0)) driver_graph_announce(ARCH(e), st.verify, "captured");
+            else ok = launches();
+        } else {
+            ok = launches();
+        }
+    } else if (ok) {
+        ok = launches();
     }
     if (ok) ok = pulsar_gpu_end_commands() != 0;
     else (void)pulsar_gpu_synchronize();

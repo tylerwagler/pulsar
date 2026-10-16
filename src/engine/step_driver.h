@@ -57,6 +57,8 @@ pulsar_driver_heads pulsar_driver_heads_span(uint32_t row0, uint32_t n);
 struct pulsar_state_set;
 struct pulsar_imatrix_tap;
 struct pulsar_tp;
+struct pulsar_mtp_ops;
+struct pulsar_mtp_lane;
 
 /** The core's per-session driver buffers.  A family's session state EXTENDS it (C++ derivation; the family's
  *  create allocates the derived object, the driver fills this part). */
@@ -77,6 +79,8 @@ struct pulsar_driver_state {
     uint64_t tp_seq;
     pulsar_gpu_tensor *tp_vocab_own;
     uint64_t tp_vocab_seq;
+    /** L296 N9: the chained-MTP drafter's lane (spec_mtp.h) when the family's ops declare modules, else NULL */
+    struct pulsar_mtp_lane *mtp;
 };
 
 /** Everything an op needs for one step: the core's part.  A family's step EXTENDS it with what its ops read of
@@ -157,9 +161,13 @@ typedef struct pulsar_driver_ops {
     bool (*step_end)(const pulsar_driver_step *st, bool ok);
     /** After a trunk step over rows (tokens, pos, bank) -- step rows [row0, row0 + n) -- the drafter lane's lockstep:
      *  every row whose next token is now known gets its drafter row (PREFILL: one bank's run; DECODE: one row a bank).
-     *  `eval`: the session's single-row eval (a family's diagnostics may head it).  NULL = no drafter lane. */
+     *  `eval`: the session's single-row eval (a family's diagnostics may head it).  NULL = no drafter lane; a family
+     *  that drafts with its MTP modules sets the chained-MTP lane's (spec_mtp.h pulsar_mtp_absorb). */
     bool (*absorb)(pulsar_session *s, pulsar_step_mode mode, const int32_t *tokens, const int32_t *pos,
                    const int32_t *bank, uint32_t n, uint32_t row0, bool eval);
+    /** L296 N9: the family's MTP module declaration (spec_mtp.h), or NULL = none.  When it declares modules the
+     *  driver builds the chained-MTP drafter's lane (pulsar_driver_state::mtp) before the declared state. */
+    const struct pulsar_mtp_ops *mtp;
     /** Optional (L268): the step's multi-axis rope positions into *out, or NULL = text positions. */
     const uint32_t *(*rope)(const pulsar_session *s, const int32_t *pos, const int32_t *bank, uint32_t n,
                             std::vector<uint32_t> *out);
@@ -171,6 +179,17 @@ typedef struct pulsar_driver_ops {
     void (*dump)(const pulsar_driver_step *st, uint32_t il);
     /** The artifact digest the session's segments are keyed by (pulsar_ckpt_store::artifact). */
     uint64_t (*artifact)(const pulsar_engine *e);
+    /** Optional (L296 perf): the step's HOST HALF -- every upload its launches read (token ids, sequence tables,
+     *  attention descriptors), run by the driver before the step's launches on every step.  A family that supplies
+     *  it makes embed, every block and the head LAUNCH-ONLY: their launches read the device and the step's shape,
+     *  nothing a step's host values decide.  *graph_key = what those launches depend on beyond the driver's own key
+     *  (the session's buffers, the step's kind, the row count, the head list), nonzero; 0 = this step's launches
+     *  must run eager.  A DECODE step, or a pure verify step (every row a verify row; the key must then carry the
+     *  step's run structure too), with a key runs its launches as ONE captured CUDA graph per key
+     *  (pulsar_gpu_seg_*), replayed after; the launches are the same either way, so the bytes are (nemotron-fwd-gate
+     *  X7: graphed == eager; mtp-spec-gate on the verify lane).  NULL = the ops upload as they go and every step
+     *  runs eager. */
+    bool (*stage)(const pulsar_driver_step *st, uint64_t *graph_key);
 } pulsar_driver_ops;
 
 /** The first thing a forward over `plan` would need that `ops` lacks -- "embed", the block of a layer kind (its

@@ -23,7 +23,8 @@
  *   4b. the split partials: the fold and the sum fed the decode arm's partials
  *      (adding the splits themselves) == fed the pre-summed z, bit for bit.
  *   5. a mutation: one flipped trellis bit must move the projection's output.
- * Then Qwen3.8-Flash-Next's fused gate_up / down (exl3_moe_epilogue_gate_qwen.inc).
+ * Then Qwen3.8-Flash-Next's fused gate_up / down (exl3_moe_epilogue_gate_qwen.inc) and the up-only relu^2 experts
+ * at Nemotron-H's latent shape (exl3_moe_epilogue_gate_uponly.inc, L296).
  * The decode arm's own grade (every rate, shape, format, 1..40 rows, batch
  * invariance) is tests/exl3_moe_prefill_gate.cu.
  *
@@ -281,6 +282,7 @@ static float swiglu_host(float g, float u, float wv, float clamp) {
 }
 
 #include "exl3_moe_epilogue_gate_qwen.inc"
+#include "exl3_moe_epilogue_gate_uponly.inc"
 
 int main(void) {
     const int K = 5120, M = 2304;      /* the V4.1 expert: in 5120, mid 2304 */
@@ -516,6 +518,7 @@ int main(void) {
         cudaFree(sg.arena); cudaFree((void *)sg.table); cudaFree(su.arena); cudaFree((void *)su.table);
     }
     if (qwen_section()) g_fail = 1;
+    if (uponly_section()) g_fail = 1;
     printf(g_fail ? "EXL3-MOE-EPILOGUE GATE FAIL\n" : "EXL3-MOE-EPILOGUE GATE PASS\n");
     return g_fail;
 }
