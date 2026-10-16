@@ -142,6 +142,9 @@ bool pulsar_block_drafter_read(const pulsar_model *m, pulsar_block_drafter *d) {
                       "layers x 8 heads, factor 1024, mlp x2, 8 candidates at 7 slots over a 4096 drafter)%s");
     d->ops = PULSAR_BLOCK_DRAFTER_OPS;
     d->ops.depth = d->ops.depth_max = d->block - 1u;   /* a chain is the block's mask slots */
+    /* the stop rule's tau on the head's slot confidences, measured (L298, the l297 bench single stream T0, the priced
+     * width on): tau off 62.0 tok/s, 0.3 62.0, 0.5 62.6 (code 61.1 -> 64.2), 0.7 61.4 */
+    d->ops.tau = 0.5f;
     return true;
 }
 
@@ -1113,9 +1116,9 @@ int block_draft_batch(pulsar_session *s, pulsar_spec_round **rounds, const uint3
 
 }  // namespace
 
-/* The drafter's numbers: a chain is the block's slots (block - 1: LiLiCorr's 7; set per declaration in its copy,
- * pulsar_block_drafter::ops), every slot kept (no stop rule: the block drafts every slot in its one pass, so a slot
- * costs only its verify row), no adaptive depth. */
+/* The drafter's functions; its numbers are set per declaration in its copy (pulsar_block_drafter_read: the chain is the
+ * block's block - 1 slots, the stop rule's tau measured), no adaptive depth (the stop rule and the priced width end a
+ * chain where it no longer pays). */
 const pulsar_drafter_ops PULSAR_BLOCK_DRAFTER_OPS = {
     /* .name          = */ "block",
     /* .depth         = */ 0u,
