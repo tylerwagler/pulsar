@@ -405,7 +405,7 @@ def rounds_of(g):
 
 
 def check(a):
-    dev = "cuda"
+    dev = a.device
     W = Weights(dev=dev)
     head = Head(W)
     head32 = Head(W.as_f32())
@@ -492,7 +492,7 @@ def check(a):
 def fixture(a):
     """Per prompt <out>/<prompt>.safetensors: the head kernel's inputs for every round (vLLM's), a compact embedding
     table (the rounds' unique candidate rows; cand_local indexes it), vLLM's scores / chain, and this reference's."""
-    dev = "cuda"
+    dev = a.device
     W = Weights(dev=dev)
     head = Head(W)
     embed = load_embed(dev)
@@ -525,6 +525,7 @@ def main():
     p.add_argument("--prompts", default="")
     p.add_argument("--kv", choices=["fp8", "bf16"], default="fp8")
     p.add_argument("--verbose", action="store_true")
+    p.add_argument("--device", default="cuda", help="cpu: a fixture without the GPU (the reference chain then carries CPU torch numerics)")
     a = p.parse_args()
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.backends.cudnn.allow_tf32 = False

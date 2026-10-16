@@ -1,6 +1,7 @@
 #include <atomic>
 #include "pulsar_cuda_internal.h"
 #include "pulsar_cuda_mx.cuh"   /* the single source for pulsar_mx_sfoff */
+#include "pulsar_cuda_bf16_rows.cuh"   /* PULSAR_GPU_BATCHED_GEMM_CANON */
 
 
 
@@ -3193,10 +3194,25 @@ int pulsar_gpu_bf16_batched_gemm(float *c, int ldc, int64_t stride_c, const uint
             }
             cublasLtMatmulPreferenceCreate(&pf);
             cublasLtMatmulPreferenceSetAttribute(pf, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &zero, sizeof(zero));
+            const uint32_t red = CUBLASLT_REDUCTION_SCHEME_NONE;
+            cublasLtMatmulPreferenceSetAttribute(pf, CUBLASLT_MATMUL_PREF_REDUCTION_SCHEME_MASK, &red, sizeof(red));
+            /* The algorithm is chosen at the CANONICAL batch count and checked at this one, so every batch item gets
+             * the same kernel (and bytes) whatever the batch count: a bank's scores never depend on how many banks
+             * ride with it.  Batch items are independent CTAs of one kernel; without split-K their sums do not mix. */
+            const int canon = PULSAR_GPU_BATCHED_GEMM_CANON;
+            for (int i = 0; i < 3; i++)
+                cublasLtMatrixLayoutSetAttribute(ls[i], CUBLASLT_MATRIX_LAYOUT_BATCH_COUNT, &canon, sizeof(canon));
             cublasLtMatmulHeuristicResult_t hr;
             int got = 0;
             ok = pf && cublasLtMatmulAlgoGetHeuristic(g_cublaslt, q.op, q.la, q.lb, q.lc, q.lc, pf, 1, &hr, &got) ==
                            CUBLAS_STATUS_SUCCESS && got;
+            for (int i = 0; i < 3; i++)
+                cublasLtMatrixLayoutSetAttribute(ls[i], CUBLASLT_MATRIX_LAYOUT_BATCH_COUNT, &batch, sizeof(batch));
+            if (ok) {
+                cublasLtMatmulHeuristicResult_t chk;
+                ok = cublasLtMatmulAlgoCheck(g_cublaslt, q.op, q.la, q.lb, q.lc, q.lc, &hr.algo, &chk) ==
+                         CUBLAS_STATUS_SUCCESS && chk.state == CUBLAS_STATUS_SUCCESS && chk.workspaceSize == 0;
+            }
             if (ok) q.algo = hr.algo;
         }
         if (pf) cublasLtMatmulPreferenceDestroy(pf);
