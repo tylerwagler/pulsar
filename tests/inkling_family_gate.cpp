@@ -5,7 +5,8 @@
  * Opens MODEL inspect-only (no GPU, no weight byte staged) and checks the family's load: the family is chosen by
  * `general.architecture`; the plan is the config's (window vs full attention, dense vs MoE per layer); EVERY tensor
  * of the directory is bound by its bind record, every byte priced by a role, and the price is what the core stages
- * and admission charges; every slot the plan declares is bound; the engine facts; and the session entries refuse by
+ * and admission charges; every slot the plan declares is bound; the engine facts; the tokenizer and chat front (L294
+ * E6: the container's tokenizer files, F5's renderer turn by turn); and the session entries refuse by
  * name (Inkling's blocks on F4's core driver are not written yet).  The refusals (a missing tensor, a wrong shape, an unknown switch, ...) are graded by
  * tests/inkling_family_gate.py, which runs this probe on the clean container and tests/loader_open on each mutant.
  * Exit 0 = every check passed. */
@@ -14,7 +15,18 @@
 
 #include <stdarg.h>
 
+#include <string>
+
 static int n_fail;
+
+/* an added token of the renderer's spelling: <|...|> as one id */
+static bool piece_is_marker(pulsar_engine *e, int id) {
+    size_t n = 0;
+    char *p = pulsar_token_text(e, id, &n);
+    const bool m = n > 4 && !strncmp(p, "<|", 2) && !strcmp(p + n - 2, "|>");
+    free(p);
+    return m;
+}
 
 static void check(bool ok, const char *fmt, ...) {
     va_list ap;
@@ -114,8 +126,42 @@ int main(int argc, char **argv) {
           pulsar_engine_logits_width(e));
     check(!strcmp(pulsar_engine_model_name(e), "Inkling-Small"), "model name '%s'", pulsar_engine_model_name(e));
     check(pulsar_engine_model_id(e) == 3, "disk-KV model id %d (0/1 DeepSeek, 2 Qwen)", pulsar_engine_model_id(e));
-    check(!pulsar_engine_has_tokenizer(e), "no tokenizer table yet (E6): the front ends refuse this engine");
-    check(pulsar_engine_vocab_size(e) == 0, "the vocab size refuses by name (no table), never another family's length");
+    /* the tokenizer and chat front (E6): F5's BPE engine on the container's tokenizer files, F5's renderer */
+    check(pulsar_engine_has_tokenizer(e) && pulsar_engine_chat_format(e) == PULSAR_CHAT_INKLING,
+          "the tokenizer + chat front (CAP_CHAT, the Inkling chat format)");
+    check(pulsar_engine_vocab_size(e) > 0 && (uint32_t)pulsar_engine_vocab_size(e) <= s->n_vocab_real,
+          "the tokenizer table: %d ids (<= the head's %u real rows)", pulsar_engine_vocab_size(e), s->n_vocab_real);
+    check(pulsar_token_eos(e) == (int)s->eos_id && pulsar_token_is_stop(e, (int)s->eos_id),
+          "eos %d is the container's eos_token_id %u", pulsar_token_eos(e), s->eos_id);
+    check(pulsar_engine_think_default(e) == PULSAR_THINK_DEFAULT &&
+              pulsar_engine_think_mode_supported(e, PULSAR_THINK_NONE, NULL, 0) &&
+              !pulsar_engine_think_mode_supported(e, PULSAR_THINK_LOW, NULL, 0),
+          "thinking on at the template's default effort, or off");
+    {
+        pulsar_turn_markers m = {};
+        pulsar_tokens t = {0};
+        pulsar_encode_chat_prompt(e, "Be terse.", "Hi <|end_message|>", PULSAR_THINK_DEFAULT, &t);
+        pulsar_chat_end_assistant(e, &t);
+        std::string text;
+        for (int i = 0; i < t.len; i++) {
+            size_t n = 0;
+            char *piece = pulsar_token_text(e, t.v[i], &n);
+            text.append(piece, n);
+            free(piece);
+        }
+        const char *want = "<|message_system|><|content_text|>Be terse.<|end_message|><|message_system|><|content_text|>"
+                           "Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>Hi <|end_message|>"
+                           "<|end_message|><|message_model|><|content_model_end_sampling|>";
+        check(text == want && t.len > 0 && t.v[t.len - 1] == (int)s->eos_id,
+              "the chat front: head + turn + close == the renderer's text, closed by eos (%d tokens)", t.len);
+        int markers = 0;   /* the client's spelling of a marker is text (L223): only the template's markers count */
+        for (int i = 0; i < t.len; i++) markers += t.v[i] != pulsar_token_eos(e) && piece_is_marker(e, t.v[i]);
+        check(markers == 10, "%d marker tokens (the template's ten; the client's \"<|end_message|>\" stays text)", markers);
+        check(pulsar_chat_turn_markers(e, &m) && m.n_user == 1 && m.n_assistant == 1 &&
+                  pulsar_turn_marker_at(&m, t.v, t.len, 0) == 0,
+              "turn markers: <|message_user|> / <|message_model|>, one token each");
+        pulsar_tokens_free(&t);
+    }
     check(pulsar_engine_drafter(e) == PULSAR_DRAFTER_NONE, "no drafter runs (F6)");
     int k2 = 0;
     for (uint32_t il = s->n_dense; il < s->n_layer; il++) {

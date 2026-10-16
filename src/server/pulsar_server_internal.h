@@ -581,7 +581,8 @@ typedef struct server_family_ops {
      *  (token healing): Qwen's tokenizer merges "=" with a name's first piece ("=get"), so a prompt ending
      *  in a lone "=" is a state the model saw only before names it does not merge ("=", "convert"), and
      *  "required" chose convert_currency for every question.  The closer is the whole tag end for the same
-     *  reason (DeepSeek's `">` is one token).  Every family has both. */
+     *  reason (DeepSeek's `">` is one token).  Every family with forced_call_seed has both; one whose render
+     *  refuses a forced call (Inkling: vLLM has none) has neither, and nothing reads them. */
     const char *forced_name_open;
     const char *forced_name_close;
     /** Tool memory: the earliest complete tool-call block at or after `p` in a transcript's text
@@ -640,6 +641,18 @@ extern const server_output_parser_ops k_parser_deepseek;
 /** The table for a chat format (every format has one), and for the loaded engine's. */
 const server_family_ops *server_family_for_format(pulsar_chat_format fmt);
 const server_family_ops *server_family_for_engine(const pulsar_engine *e);
+/** A family table in its own file (chat_family.cpp's switch names it): Inkling's (family_inkling.cpp). */
+extern const server_family_ops k_family_inkling;
+/** The effort names, in the order of server_effort_map::named's columns (chat_family.cpp). */
+extern const char *const k_effort_names[CHAT_EFFORT_NAMES];
+/* What every family's render shares (chat_family.cpp), for a table in its own file: */
+/** The tool memory and the protocols' live continuations, between the family's folding and its template. */
+void render_prelude(struct server *s, struct chat_conversation *c, struct request *r);
+/** The tools as OpenAI's array into r->tools_json, for a template that takes one (NULL = none, or tool_choice
+ *  none); false + err when the conversation's schema lines do not convert. */
+bool chat_openai_tools_json(const struct chat_conversation *c, struct request *r, char *err, size_t errlen);
+/** After tokenising: each image's sentinel block where its placeholder sits (a text-only request untouched). */
+bool request_prepare_images(pulsar_engine *e, const chat_msgs *msgs, struct request *r, char *err, size_t errlen);
 
 /** One parsed request, normalised across the three supported APIs.
  *

@@ -14,7 +14,11 @@
  * (its tools JSON types the arguments).
  *
  * L284: the DeepSeek leg runs that same sequence (it used to emulate the finish with its own final parse), so both
- * families' finishes -- the broken-call rule, the Responses tail -- are what the goldens pin. */
+ * families' finishes -- the broken-call rule, the Responses tail -- are what the goldens pin.
+ *
+ * L294 E6: an INKLING leg after the Qwen one, the same sequence on a request Inkling's renderer prepared (the kit in
+ * Inkling's configuration: typed content blocks, the shared JSON call body).  Appended: the earlier legs' bytes are
+ * unchanged. */
 #define PULSAR_SERVER_TEST
 #define PULSAR_SERVER_TEST_NO_MAIN
 #include "../src/server/util.cpp"
@@ -22,6 +26,7 @@
 #include "../src/server/prompt_render.cpp"
 #include "../src/server/api_parse.cpp"
 #include "../src/server/chat_family.cpp"
+#include "../src/server/family_inkling.cpp"
 #include "../src/server/genmsg.cpp"
 #include "../src/server/deepseek_dsml.cpp"
 #include "../src/server/deepseek_stream.cpp"
@@ -131,6 +136,42 @@ static const gcase QCASES[] = {
     {"q-tool-undeclared", true, true, "hm\n</think>\n\n" QCALL("rm_rf", QPARAM("path", "/")), "stop"},
 };
 
+/* ---- L294 E6: the Inkling leg -------------------------------------------------------------------------- */
+
+/* An Inkling generation is the text after the rendered prompt's generation prompt <|message_model|>, up to (not
+ * including) the stop token <|content_model_end_sampling|>: the turn opens in its first block's header. */
+#define IBLOCK(kind, body) "<|message_model|><|content_" kind "|>" body "<|end_message|>"
+#define ICALL(name, args) "<|message_model|>" name "<|content_invoke_tool_json|>{\"name\":\"" name "\",\"args\":" args \
+                          "}<|end_message|>"
+static const gcase ICASES[] = {
+    {"i-think-answer", true, false,
+     "<|content_thinking|>Let me compute 17*23.<|end_message|>" IBLOCK("text", "The answer is 391."), "stop"},
+    {"i-think-unclosed", true, false, "<|content_thinking|>thinking on and on, never closing", "length"},
+    {"i-no-think", false, false, "<|content_text|>Plain answer with <angle> and </think> text.<|end_message|>", "stop"},
+    {"i-utf8", true, false, "<|content_thinking|>naïve 日本語  <|end_message|>" IBLOCK("text", "🌞 ok — done"), "stop"},
+    {"i-partial-marker", true, true,
+     "<|content_text|>x < y and <b>bold</b> and <|content_invoke not a call<|end_message|>", "stop"},
+    {"i-tool-after-think", true, true,
+     "<|content_thinking|>plan the call<|end_message|>" ICALL("bash", "{\"command\":\"ls -l /var/log\"}"), "stop"},
+    {"i-text-then-tool", true, true,
+     "<|content_thinking|>plan<|end_message|>" IBLOCK("text", "Let me look.") ICALL("bash", "{\"command\":\"pwd\"}"),
+     "stop"},
+    {"i-two-calls", true, true,
+     "<|content_thinking|>x<|end_message|>" ICALL("bash", "{\"command\":\"a\"}")
+     ICALL("bash", "{\"command\":\"b & c\",\"description\":\"two\"}"), "stop"},
+    {"i-tool-first", false, true,
+     "bash<|content_invoke_tool_json|>{\"name\":\"bash\",\"args\":{\"command\":\"uname -a\"}}<|end_message|>",
+     "stop"},
+    {"i-tool-unclosed", true, true,
+     "<|content_thinking|>go<|end_message|><|message_model|>bash<|content_invoke_tool_json|>{\"name\":\"bash\","
+     "\"args\":{\"command\":\"sleep", "length"},
+    {"i-tool-undeclared", true, true,
+     "<|content_thinking|>hm<|end_message|>" ICALL("rm_rf", "{\"path\":\"/\"}"), "stop"},
+    {"i-tool-malformed", true, true,
+     "<|content_thinking|>j<|end_message|><|message_model|>bash<|content_invoke_tool_json|>{\"name\":\"bash\","
+     "\"args\":[1, 2]}<|end_message|>", "stop"},
+};
+
 /* the one tool, in each protocol's declaration shape (the renderer reads the request's) */
 #define QSCHEMA "{\"type\":\"object\",\"properties\":{\"command\":{\"type\":\"string\"},\"description\":{\"type\":\"string\"}}}"
 static const char *qtools_for(proto p) {
@@ -156,7 +197,8 @@ static std::string run_family(const gcase &c, proto p, size_t piece, pulsar_chat
     r->model = xstrdup("m");
     r->api = p == P_OPENAI ? API_OPENAI : p == P_ANTHROPIC ? API_ANTHROPIC : API_RESPONSES;
     r->reasoning_summary_emit = p == P_RESPONSES_SUMMARY;
-    if (fmt != PULSAR_CHAT_QWEN) {
+    const bool deepseek = fmt == PULSAR_CHAT_DS4_V4 || fmt == PULSAR_CHAT_DS4_V41;
+    if (deepseek) {
         /* DeepSeek: the request as its renderer leaves it -- the family, the think mode, the declared tools */
         r->family = server_family_for_format(fmt);
         r->think_mode = c.think ? PULSAR_THINK_HIGH : PULSAR_THINK_NONE;
@@ -166,14 +208,15 @@ static std::string run_family(const gcase &c, proto p, size_t piece, pulsar_chat
                 "{\"name\":\"bash\",\"input_schema\":{\"type\":\"object\",\"properties\":{"
                 "\"command\":{\"type\":\"string\"},\"description\":{\"type\":\"string\"}}}}");
     }
-    /* Qwen: the request as the server has it after rendering: the Qwen renderer sets the family, the think mode,
-     * the tools JSON the parser types arguments with, and the declared tools a call is checked against */
+    /* Qwen, Inkling: the request as the server has it after rendering: the family's renderer sets the family, the
+     * think mode, the tools JSON (Qwen's parser types arguments with it), and the declared tools a call is checked
+     * against */
     chat_conversation conv = {};
     chat_msg u = {0};
     u.role = xstrdup("user");
     u.content = xstrdup("Go.");
     chat_msgs_push(&conv.msgs, u);
-    if (fmt == PULSAR_CHAT_QWEN && c.tools) {
+    if (!deepseek && c.tools) {
         conv.tools_raw = xstrdup(qtools_for(p));
         tool_schema_orders_add_json(&r->tool_orders,
             "{\"name\":\"bash\",\"parameters\":{\"type\":\"object\",\"properties\":{"
@@ -181,7 +224,7 @@ static std::string run_family(const gcase &c, proto p, size_t piece, pulsar_chat
     }
     if (!c.think) chat_conversation_control(&conv, "enable_thinking", xstrdup("false"));
     char err[256] = "";
-    if (fmt == PULSAR_CHAT_QWEN && !render_chat_conversation(NULL, PULSAR_CHAT_QWEN, NULL, &conv, r, err, sizeof err)) {
+    if (!deepseek && !render_chat_conversation(NULL, fmt, NULL, &conv, r, err, sizeof err)) {
         chat_conversation_free(&conv);
         request_free(r);
         close(sv[0]);
@@ -277,6 +320,15 @@ int main(void) {
             for (size_t piece : {(size_t)1, (size_t)3, (size_t)7, (size_t)0}) {
                 printf("== %s [%s] piece %zu\n", c.name, PROTO_NAME[p], piece);
                 fputs(run_family(c, (proto)p, piece, PULSAR_CHAT_QWEN).c_str(), stdout);
+                n++;
+            }
+        }
+    }
+    for (const gcase &c : ICASES) {
+        for (int p = P_OPENAI; p <= P_RESPONSES_SUMMARY; p++) {
+            for (size_t piece : {(size_t)1, (size_t)3, (size_t)7, (size_t)0}) {
+                printf("== %s [%s] piece %zu\n", c.name, PROTO_NAME[p], piece);
+                fputs(run_family(c, (proto)p, piece, PULSAR_CHAT_INKLING).c_str(), stdout);
                 n++;
             }
         }
