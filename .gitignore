@@ -173,6 +173,7 @@ tests/dspark_batch_gate
 /tests/qsa_layer_replay
 /tests/qsa_attn_bench
 /tests/gqa_attn_gate
+/tests/blockdraft_gate
 /tests/gqa_attn_bench
 /tests/sconv_gate
 /tests/sconv_bench

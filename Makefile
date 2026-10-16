@@ -679,6 +679,13 @@ gdn-gate: tests/gdn_gate
 # prefill == chunked == verify == batched bit-exact; ring rollback; mutations;
 # a long position past the temperature floor; refusals.  Links the PRODUCTION
 # object; pass the served arch (CUDA_ARCH=sm_120f).  Model-free.
+# L298: the block drafter's small ops (src/cuda/pulsar_cuda_blockdraft.h: the grouped dynamic conv, SwiGLU, the tap
+# row copy, top-k + log-softmax) against the host authority (tests/blockdraft_gate.cu).  Model-free.
+tests/blockdraft_gate: tests/blockdraft_gate.cu src/cuda/pulsar_cuda_blockdraft.o src/cuda/pulsar_cuda_blockdraft.h Makefile
+	$(NVCC) $(NVCCFLAGS) -std=c++17 -Isrc -Isrc/cuda -o $@ tests/blockdraft_gate.cu src/cuda/pulsar_cuda_blockdraft.o
+.PHONY: blockdraft-gate
+blockdraft-gate: tests/blockdraft_gate
+	./tests/blockdraft_gate
 src/cuda/pulsar_cuda_attn_gqa.o: src/cuda/pulsar_cuda_attn_gqa.h
 tests/gqa_attn_gate: tests/gqa_attn_gate.cu tests/gqa_ref.h src/cuda/pulsar_cuda_attn_gqa.o src/cuda/pulsar_cuda_attn_gqa.h Makefile
 	$(NVCC) $(NVCCFLAGS) -std=c++17 -Isrc -Isrc/cuda -o $@ tests/gqa_attn_gate.cu src/cuda/pulsar_cuda_attn_gqa.o
