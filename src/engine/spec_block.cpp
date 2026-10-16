@@ -603,8 +603,8 @@ bool draft_pass(pulsar_session *s, const uint32_t *banks, const int32_t *carry, 
     if (pulsar_rows_topk_logprob_launch(logits, V, R, V, d->topk, (int32_t *)(base + D.top_id),
                                         (float *)(base + D.top_lp), 0) != 0)
         return fail("the candidates' top-k refused");
-    return pulsar_gpu_tensor_read(l->arena, D.top_id, l->top_id.data(), (uint64_t)R * d->topk * 4u) &&
-           pulsar_gpu_tensor_read(l->arena, D.top_lp, l->top_lp.data(), (uint64_t)R * d->topk * 4u) ||
+    return (pulsar_gpu_tensor_read(l->arena, D.top_id, l->top_id.data(), (uint64_t)R * d->topk * 4u) &&
+            pulsar_gpu_tensor_read(l->arena, D.top_lp, l->top_lp.data(), (uint64_t)R * d->topk * 4u)) ||
            fail("could not read the candidates");
 }
 
