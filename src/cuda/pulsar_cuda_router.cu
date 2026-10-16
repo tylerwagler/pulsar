@@ -14,7 +14,7 @@ namespace {
 
 constexpr int kLogitsTB = 8;     ///< tokens per logits CTA row
 constexpr int kLogitsWarps = 4;  ///< logit rows (warps) per logits CTA
-constexpr int kLogitsUnroll = 4; ///< weight chunks a lane loads ahead of their fmas
+constexpr int kLogitsUnroll = 2; ///< weight chunks a lane loads ahead of their fmas
 constexpr int kSelectWarps = 4;  ///< rows (warps) per select CTA
 
 __device__ __forceinline__ float bf16_round(float v) { return __bfloat162float(__float2bfloat16(v)); }
@@ -32,8 +32,9 @@ __device__ __forceinline__ void bf16x8(const uint4 &u, float f[8]) {
 /* One warp per logit row (rows n_w.. come from w_tail), kLogitsTB tokens per CTA row, kLogitsWarps rows per CTA.
  * Lane l owns the uint4 chunks l, l + 32, ... of the row and accumulates each token's partial in chunk order; the
  * xor tree then sums the lanes.  A token's logit is the same arithmetic at any T.  The chunks' weight loads are
- * issued kLogitsUnroll at a time ahead of their fmas (L296 dec2: one load in flight per warp held a 4 MB router to
- * ~170 GB/s), the fmas still in chunk order. */
+ * issued kLogitsUnroll at a time ahead of their fmas, the fmas still in chunk order (L296 dec2, measured over 48
+ * cold 512 x 4096 routers in turn: 1 row 19.6 -> 19.9 us, at bandwidth either way; 4 rows 21.6 -> 19.9; 16 rows
+ * 33.0 -> 24.4 -- the x loads of more rows had serialised behind one weight load per lane). */
 __device__ __forceinline__ void logits_chunk(const uint4 &wv, const __nv_bfloat16 *__restrict__ x, int H, int t0,
                                              int nt, int i, float (&acc)[kLogitsTB]) {
     float wf[8];
