@@ -423,10 +423,14 @@ static bool decode_run(pulsar_engine *e, const std::vector<int32_t> &ids, int ba
         std::vector<pulsar_multiseq_req> rows((size_t)banks);
         for (int b = 0; b < banks; b++) rows[(size_t)b] = {(uint32_t)b, pos[(size_t)b] + step, next[(size_t)b]};
         ok = pulsar_session_decode_multiseq(s, rows.data(), (uint32_t)banks, lg.data(), banks * W, err, sizeof(err)) == 0;
+        /* the next token in place (a per-row copy is a fresh 512 KiB allocation a step: page faults the timing
+         * would charge to the engine); the rows kept only when the caller compares them */
         for (int b = 0; ok && b < banks; b++) {
-            std::vector<float> r(lg.begin() + (size_t)b * W, lg.begin() + (size_t)(b + 1) * W);
-            next[(size_t)b] = argmax(r);
-            if (out) out->push_back(std::move(r));
+            const float *row = lg.data() + (size_t)b * W;
+            int a = 0;
+            for (int i = 1; i < W; i++) if (row[i] > row[a]) a = i;
+            next[(size_t)b] = a;
+            if (out) out->emplace_back(row, row + W);
         }
     }
     if (ms_step) *ms_step = ok && steps > warm ? 1e3 * (gate_now_s() - t0) / (steps - warm) : 0.0;

@@ -1,18 +1,22 @@
 /* Mamba-2 (SSD) mixer block (L296 N2) -- the contract, the math and the state
  * layout are in pulsar_cuda_mamba2.h.
  *
- * Three launches a call (L296 perf: dt / dA moved into the scan's staging,
- * the same double arithmetic -- byte-identical to the former separate launch):
+ * The launches of a call:
  *   1. the x | B | C convolution: E3's block (pulsar_sconv_forward) with the
  *      layer's bias and SiLU, into the call's scratch (bf16 [rows][CC]);
- *   2. the scan: one CTA per (sequence, head, half of the head's P rows),
+ *   2. dt / dA per (row, head) in double (mamba2_dt), into the scratch --
+ *      only when a sequence runs more than one tile of rows (L296 perf: a
+ *      decode-width call computes them in the scan's staging instead, one
+ *      launch fewer; a long run keeps the parallel launch, since the double
+ *      transcendentals would sit on every tile's serial path).  One device
+ *      function either way: the same bytes;
+ *   3. the scan: one CTA per (sequence, head, half of the head's P rows),
  *      128 threads; thread (q, p) holds S[p][32q .. 32q+31] in registers for
- *      the whole sequence.  It stages each tile's dt / dA per row of its head
- *      (in double, mamba2_dt).  Per row it applies the update to its 32 columns
+ *      the whole sequence.  Per row it applies the update to its 32 columns
  *      and sums its share of y[p] = S[p] . C; the four shares of y[p] are added
  *      in a fixed tree after the tile.  The update never reads y, so a tile of
  *      rows runs with no barrier between rows;
- *   3. the gated grouped RMSNorm: one CTA per (row, norm group).
+ *   4. the gated grouped RMSNorm: one CTA per (row, norm group).
  * The thread that computes an element is fixed by its (head, p, n), never by
  * the call's shape, so every schedule gives the same bytes. */
 #include "pulsar_cuda_mamba2.h"
@@ -47,9 +51,23 @@ __device__ __forceinline__ void mamba2_dt(uint16_t dt_raw, uint16_t dt_bias, uin
     *dA_out = (float)exp((double)dt * A);
 }
 
-/* ---- 2. the scan ------------------------------------------------------------------------------------- */
+constexpr int DT_THREADS = 256;
+
+/* ---- 2. dt and dA per (row, head) into the scratch (a call with a run longer than a tile) --------------- */
+__global__ void __launch_bounds__(DT_THREADS)
+mamba2_dt_kernel(const uint16_t *__restrict__ dt_raw, uint64_t ld_dt, const uint16_t *__restrict__ dt_bias,
+                 const uint16_t *__restrict__ A_log, uint32_t H, uint32_t rows, float *__restrict__ dt_out,
+                 float *__restrict__ dA_out) {
+    const uint64_t i = (uint64_t)blockIdx.x * DT_THREADS + threadIdx.x;
+    if (i >= (uint64_t)rows * H) return;
+    const uint32_t row = (uint32_t)(i / H), h = (uint32_t)(i % H);
+    mamba2_dt(dt_raw[(uint64_t)row * ld_dt + h], dt_bias[h], A_log[h], &dt_out[i], &dA_out[i]);
+}
+
+/* ---- 3. the scan ------------------------------------------------------------------------------------- */
 struct scan_args {
     const uint16_t *conv_out;      /* [rows][CC] */
+    const float *dt, *dA;          /* [rows][H] from launch 2, or NULL: the scan stages them itself */
     const uint16_t *dt_raw;        /* row r's head h at dt_raw[r * ld_dt + h] */
     uint64_t ld_dt;
     const uint16_t *dt_bias, *A_log;
@@ -115,7 +133,12 @@ __global__ void __launch_bounds__(NT) mamba2_scan_kernel(const scan_args a) {
         }
         if (tid < tn) {
             const uint64_t row = (uint64_t)(r0 + t0 + tid);
-            mamba2_dt(a.dt_raw[row * a.ld_dt + h], a.dt_bias[h], a.A_log[h], &sdt[tid], &sda[tid]);
+            if (a.dt) {
+                sdt[tid] = a.dt[row * a.H + h];
+                sda[tid] = a.dA[row * a.H + h];
+            } else {
+                mamba2_dt(a.dt_raw[row * a.ld_dt + h], a.dt_bias[h], a.A_log[h], &sdt[tid], &sda[tid]);
+            }
         }
         __syncthreads();
         for (int i = tid; i < tn * N; i += NT) {
@@ -205,7 +228,7 @@ mamba2_commit_kernel(float *__restrict__ ssm, const float *__restrict__ upd, uin
         reinterpret_cast<float4 *>(S)[i] = make_float4(s[4 * i], s[4 * i + 1], s[4 * i + 2], s[4 * i + 3]);
 }
 
-/* ---- 3. the gated grouped RMSNorm: one CTA per (row, group), 8 channels a thread ---------------------- */
+/* ---- 4. the gated grouped RMSNorm: one CTA per (row, group), 8 channels a thread ---------------------- */
 __global__ void __launch_bounds__(1024)
 mamba2_norm_kernel(const uint16_t *__restrict__ y, uint32_t HP, const uint16_t *__restrict__ z, uint64_t ld_z,
                    const uint16_t *__restrict__ w, uint32_t ng, float eps, uint16_t *__restrict__ out, uint64_t ld_out) {
@@ -294,7 +317,8 @@ extern "C" uint64_t pulsar_mamba2_upd_floats(const pulsar_mamba2_geom *g) {
 }
 extern "C" size_t pulsar_mamba2_scratch_bytes(const pulsar_mamba2_geom *g, uint32_t rows) {
     if (!g) return 0;
-    return round16((size_t)rows * pulsar_mamba2_conv_channels(g) * 2u) + round16((size_t)rows * g->n_heads * g->head_dim * 2u);
+    return round16((size_t)rows * pulsar_mamba2_conv_channels(g) * 2u) +
+           round16((size_t)rows * g->n_heads * g->head_dim * 2u) + 2u * round16((size_t)rows * g->n_heads * 4u);
 }
 
 extern "C" int pulsar_mamba2_forward(const pulsar_mamba2_layer *L, const pulsar_mamba2_call *c, cudaStream_t stream) {
@@ -335,6 +359,10 @@ extern "C" int pulsar_mamba2_forward(const pulsar_mamba2_layer *L, const pulsar_
     uint16_t *conv_out = reinterpret_cast<uint16_t *>(sp);
     sp += round16((size_t)rows * CC * 2u);
     uint16_t *y = reinterpret_cast<uint16_t *>(sp);
+    sp += round16((size_t)rows * HP * 2u);
+    float *dt = reinterpret_cast<float *>(sp);
+    sp += round16((size_t)rows * H * 4u);
+    float *dA = reinterpret_cast<float *>(sp);
 
     /* 1. the convolution (E3) -- it refuses before launching anything, so a refusal here launches nothing */
     const pulsar_sconv_decl cd{CC, g->conv_kernel, 0, L->conv_w, L->conv_b, PULSAR_SCONV_ACT_SILU};
@@ -349,8 +377,18 @@ extern "C" int pulsar_mamba2_forward(const pulsar_mamba2_layer *L, const pulsar_
     const int rc = pulsar_sconv_forward(&cs, 1, &sr, stream);
     if (rc) return rc;
 
-    /* 2. the scan (dt / dA staged in it) */
+    /* 2. dt, dA -- a run longer than one tile only; a decode-width call stages them in the scan */
+    const bool dt_launch = c->max_seq_rows > (uint32_t)TT;
+    if (dt_launch) {
+        const uint64_t n_dt = (uint64_t)rows * H;
+        mamba2_dt_kernel<<<(unsigned)((n_dt + DT_THREADS - 1) / DT_THREADS), DT_THREADS, 0, stream>>>(
+            c->dt, c->ld_dt, L->dt_bias, L->A_log, H, rows, dt, dA);
+    }
+
+    /* 3. the scan */
     scan_args a{};
+    a.dt = dt_launch ? dt : nullptr;
+    a.dA = dt_launch ? dA : nullptr;
     a.conv_out = conv_out; a.dt_raw = c->dt; a.ld_dt = c->ld_dt; a.dt_bias = L->dt_bias; a.A_log = L->A_log;
     a.D = L->D;
     a.seq_first = c->seq_first; a.seq_slot = c->seq_slot;
@@ -358,7 +396,7 @@ extern "C" int pulsar_mamba2_forward(const pulsar_mamba2_layer *L, const pulsar_
     a.H = H; a.G = g->n_groups; a.CC = CC; a.upd = (uint32_t)pulsar_mamba2_upd_floats(g);
     mamba2_scan_kernel<<<dim3(c->n_seqs, H, PS), NT, 0, stream>>>(a);
 
-    /* 3. the gated norm */
+    /* 4. the gated norm */
     mamba2_norm_kernel<<<dim3(rows, HP / g->norm_group), g->norm_group / 8, 0, stream>>>(
         y, HP, c->z, c->ld_z, L->norm_w, g->norm_group, g->norm_eps, c->out, c->ld_out);
 
