@@ -130,6 +130,16 @@ void out_parser::emit_text(out_state st, const char *p, size_t n, std::vector<ou
                 }
             }
             break;
+        case OUT_TEXT_TRIM_AT_CALLS:
+            if (space) {
+                if (s.started || !block_seen_) s.ws.append(buf, i, (size_t)k);   /* after a call: leading dropped */
+            } else {
+                out += s.ws;
+                s.ws.clear();
+                out.append(buf, i, (size_t)k);
+                s.started = true;
+            }
+            break;
         }
         i += (size_t)k;
     }
@@ -156,6 +166,7 @@ void out_parser::finish_section(out_state st, std::vector<out_event> *ev) {
     s.partial.clear();
     const out_text_policy policy = reasoning ? g_->reasoning : g_->content;
     if (policy == OUT_TEXT_KEEP_UNLESS_BLANK && !s.started && calls_.empty()) send(reasoning, std::move(s.ws), ev);
+    if (policy == OUT_TEXT_TRIM_AT_CALLS && !block_seen_) send(reasoning, std::move(s.ws), ev);
     s.ws.clear();
 }
 
@@ -251,6 +262,10 @@ void out_parser::feed(const char *p, size_t n, std::vector<out_event> *ev) {
         if (tr->to == OUT_CALL) {
             section &c = sec_[0];
             if (g_->content == OUT_TEXT_KEEP_UNLESS_BLANK && !c.started) c.ws.clear();   /* blank before a call */
+            if (g_->content == OUT_TEXT_TRIM_AT_CALLS) {   /* trailing whitespace before a call; strip afresh after */
+                c.ws.clear();
+                c.started = false;
+            }
             if (!block_seen_) {
                 raw_lo_ = state_ == OUT_HEADER ? header_at_ : marker_at;
                 block_seen_ = true;

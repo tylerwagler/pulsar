@@ -33,8 +33,9 @@ const char *pulsar_layer_plan_check(const pulsar_layer_plan *p, uint32_t *at_lay
             if (memcmp(&d, &zero, sizeof d) != 0) return "a block description on a layer that is not a blocks layer";
             continue;
         }
-        if (d.mixer != PULSAR_MIXER_ATTN_FULL && d.mixer != PULSAR_MIXER_ATTN_WINDOW) return "a blocks layer with no mixer";
-        if (d.ffn != PULSAR_FFN_DENSE && d.ffn != PULSAR_FFN_MOE) return "a blocks layer with no FFN";
+        if (d.mixer != PULSAR_MIXER_ATTN_FULL && d.mixer != PULSAR_MIXER_ATTN_WINDOW && d.mixer != PULSAR_MIXER_MAMBA2)
+            return "a blocks layer with no mixer";
+        if (d.ffn != PULSAR_FFN_NONE && d.ffn != PULSAR_FFN_DENSE && d.ffn != PULSAR_FFN_MOE) return "a blocks layer with an unknown FFN";
         if ((d.window != 0) != (d.mixer == PULSAR_MIXER_ATTN_WINDOW)) return "a window on a full-attention layer, or none on a window layer";
     }
     *at_layer = UINT32_MAX;
@@ -43,6 +44,7 @@ const char *pulsar_layer_plan_check(const pulsar_layer_plan *p, uint32_t *at_lay
 
 /* A family module under src/families/<name>/ (L295) declares its descriptor here, beside its registry row. */
 extern const pulsar_family PULSAR_FAMILY_INKLING;
+extern const pulsar_family PULSAR_FAMILY_NEMOTRON_H;
 
 /* Every family the engine serves.  The ONE place an architecture string is
  * mapped to code. */
@@ -50,6 +52,7 @@ static const pulsar_family *const k_families[] = {
     &PULSAR_FAMILY_DEEPSEEK4,
     &PULSAR_FAMILY_QWEN4_EXP,
     &PULSAR_FAMILY_INKLING,
+    &PULSAR_FAMILY_NEMOTRON_H,
 };
 
 const pulsar_family *pulsar_family_for_model(const pulsar_model *m) {

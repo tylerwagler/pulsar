@@ -1,0 +1,192 @@
+[
+{
+"thinking": true,
+"text": "let me think\n</think>\n\nThe answer.",
+"expect": {
+"reasoning": "let me think",
+"content": "\n\nThe answer.",
+"calls": []
+}
+},
+{
+"thinking": true,
+"text": "let me think\n</think>The answer.\n",
+"expect": {
+"reasoning": "let me think",
+"content": "The answer.\n",
+"calls": []
+}
+},
+{
+"thinking": false,
+"text": "Just content.  ",
+"expect": {
+"reasoning": "",
+"content": "Just content.  ",
+"calls": []
+}
+},
+{
+"thinking": true,
+"text": "cut off mid thought   ",
+"expect": {
+"reasoning": "cut off mid thought",
+"content": "",
+"calls": []
+}
+},
+{
+"thinking": true,
+"text": "a \n b\n</think>\n\nx  \n y\n",
+"expect": {
+"reasoning": "a \n b",
+"content": "\n\nx  \n y\n",
+"calls": []
+}
+},
+{
+"thinking": true,
+"text": "<think>\nrepeated open\n</think>answer",
+"expect": {
+"reasoning": "\nrepeated open",
+"content": "answer",
+"calls": []
+}
+},
+{
+"thinking": true,
+"text": "r</think>a</think>b",
+"expect": {
+"reasoning": "r",
+"content": "ab",
+"calls": []
+}
+},
+{
+"thinking": true,
+"text": "r\n</think>\n\nOk.\n<tool_call>\n<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n<parameter=days>\n3\n</parameter>\n<parameter=metric>\ntrue\n</parameter>\n</function>\n</tool_call>\n",
+"expect": {
+"reasoning": "r",
+"content": "Ok.",
+"calls": [
+{
+"name": "get_weather",
+"arguments": {
+"city": "Paris",
+"days": 3,
+"metric": true
+}
+}
+]
+}
+},
+{
+"thinking": true,
+"text": "planning\n<tool_call>\n<function=run>\n<parameter=cmd>\nls\n</parameter>\n</function>\n</tool_call>",
+"expect": {
+"reasoning": "planning",
+"content": "",
+"calls": [
+{
+"name": "run",
+"arguments": {
+"cmd": "ls"
+}
+}
+]
+}
+},
+{
+"thinking": true,
+"text": "</think>\n\n<tool_call>\n<function=run>\n</function>\n</tool_call>\n<tool_call>\n<function=run>\n<parameter=cmd>\n\n\nv\n\n\n</parameter>\n</function>\n</tool_call>",
+"expect": {
+"reasoning": "",
+"content": "",
+"calls": [
+{
+"name": "run",
+"arguments": {}
+},
+{
+"name": "run",
+"arguments": {
+"cmd": "\n\nv\n\n"
+}
+}
+]
+}
+},
+{
+"thinking": true,
+"text": "</think>  \n <tool_call>\n<function=run>\n<parameter=cmd>\nx\n</parameter>\n</function>\n</tool_call>\ntrailing words",
+"expect": {
+"reasoning": "",
+"content": "",
+"calls": [
+{
+"name": "run",
+"arguments": {
+"cmd": "x"
+}
+}
+]
+}
+},
+{
+"thinking": false,
+"text": "answer first\n<tool_call>\n<function=run>\n<parameter=timeout>\n2.5\n</parameter>\n</function>\n</tool_call>",
+"expect": {
+"reasoning": "",
+"content": "answer first",
+"calls": [
+{
+"name": "run",
+"arguments": {
+"timeout": 2.5
+}
+}
+]
+}
+},
+{
+"thinking": true,
+"text": "I could <tool_call here\n</think>no",
+"expect": {
+"reasoning": "I could <tool_call here",
+"content": "no",
+"calls": []
+}
+},
+{
+"thinking": true,
+"text": "r</think>tail </thi",
+"expect": {
+"reasoning": "r",
+"content": "tail </thi",
+"calls": []
+}
+},
+{
+"thinking": true,
+"text": "</think><tool_call>\n<function=get_weather>\n<parameter=tags>\n[\"a\", \"b\"]\n</parameter>\n<parameter=opts>\n{\"k\": 1}\n</parameter>\n<parameter=note>\nnull\n</parameter>\n</function>\n</tool_call>",
+"expect": {
+"reasoning": "",
+"content": "",
+"calls": [
+{
+"name": "get_weather",
+"arguments": {
+"tags": [
+"a",
+"b"
+],
+"opts": {
+"k": 1
+},
+"note": null
+}
+}
+]
+}
+}
+]
