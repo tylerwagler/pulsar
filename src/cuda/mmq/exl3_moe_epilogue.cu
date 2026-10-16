@@ -11,6 +11,7 @@
 #include "cuda/pulsar_cuda_mx.cuh"
 #include "engine/exl3_trellis.h"
 
+#include <cstdint>
 #include <cstdio>
 
 namespace {
@@ -113,59 +114,72 @@ exl3_moe_fold_kernel(const float *__restrict__ gate_z,
     }
 }
 
-/* Slots whose loads the sum issues together (L284 #7): a decode step's sum is a
- * few warps, latency-bound on its chain of selected -> table -> partial loads
- * when they wait one slot at a time. */
-constexpr int kSumBatch = 8;
+/* The sum's CTA: up to kSumWarpsMax warps (one per slot, at most), the slots staged up to kSumChunk at a time in
+ * dynamic shared memory sized by sum_chunk(n_expert) (a 6-slot router's CTA keeps 6 KiB, not 32). */
+constexpr int kSumWarpsMax = 16;
+constexpr int kSumChunk = 32;
+__host__ __device__ constexpr int sum_chunk(int n_expert) { return n_expert < kSumChunk ? n_expert : kSumChunk; }
+constexpr size_t sum_smem_bytes(int chunk) { return (size_t)chunk * 32 * 2 * sizeof(float4) + (size_t)chunk * sizeof(int); }
 
-/* One warp per (token, 128-block of out); slots summed in order, their loads
- * issued kSumBatch slots at a time. */
-__global__ void __launch_bounds__(256)
+/* One CTA per (token, 128-block of out).  Each slot's chain -- selected -> table -> svh, its split partials added in
+ * split order, the Hadamard -- runs on its own warp (warp w takes slots w, w + warps, ...), which leaves the rotated
+ * z and svh in shared memory; warp 0 then sums the slots in slot order, the same fma per element in the same order
+ * as one warp walking the slots (L296 dec2: that walk, a few warps each loading slot after slot, was 20 us per
+ * decode-step layer). */
+__global__ void __launch_bounds__(kSumWarpsMax * 32)
 exl3_moe_sum_kernel(float *__restrict__ out,
                     const float *__restrict__ down_z,
                     const int32_t *__restrict__ selected,
                     const void *__restrict__ down_table,
-                    int mid_dim, int out_dim, int n_expert, int n_tokens,
+                    int mid_dim, int out_dim, int n_expert,
                     uint32_t *__restrict__ nf_flag, uint32_t nf_code,
                     const exl3_moe_shared_add shared, int z_splits, int64_t z_split_stride) {
-    const int64_t task = ((int64_t)blockIdx.x * (blockDim.x >> 5)) + (threadIdx.x >> 5);
+    extern __shared__ float4 s_sum[];
+    const int chunk = sum_chunk(n_expert);
+    float4 *s_z = s_sum, *s_sv = s_sum + chunk * 32;   /* [chunk][32] each, then s_live [chunk] */
+    int *s_live = reinterpret_cast<int *>(s_sum + 2 * chunk * 32);
     const int n_blk = out_dim >> 7;
-    if (task >= (int64_t)n_tokens * n_blk) return;
-    const int tok = (int)(task / n_blk);
-    const int blk = (int)(task - (int64_t)tok * n_blk);
-    const int lane = threadIdx.x & 31;
+    const int tok = (int)(blockIdx.x / (unsigned)n_blk);
+    const int blk = (int)(blockIdx.x - (unsigned)tok * (unsigned)n_blk);
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, warps = blockDim.x >> 5;
     const int col0 = blk * 128 + lane * 4;
     const void *const *pd = reinterpret_cast<const void *const *>(down_table);
     float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-    for (int s0 = 0; s0 < n_expert; s0 += kSumBatch) {
-        int ex[kSumBatch];
-#pragma unroll
-        for (int b = 0; b < kSumBatch; ++b)
-            ex[b] = s0 + b < n_expert ? selected[(int64_t)tok * n_expert + s0 + b] : -1;
-        float4 z4[kSumBatch];
-        __half sv[kSumBatch][4];
-#pragma unroll
-        for (int b = 0; b < kSumBatch; ++b) {
-            if (ex[b] < 0) continue;                  /* past the slots, or another rank's expert (L266 EP): its partial is that rank's */
-            const __half *svh_d = reinterpret_cast<const __half *>(pd[2 * (size_t)ex[b] + 1]) + mid_dim;
-            z4[b] = *reinterpret_cast<const float4 *>(down_z + ((int64_t)tok * n_expert + s0 + b) * out_dim + col0);
-#pragma unroll
-            for (int j = 0; j < 4; ++j) sv[b][j] = svh_d[col0 + j];
-        }
-#pragma unroll
-        for (int b = 0; b < kSumBatch; ++b) {
-            if (ex[b] < 0) continue;
-            float z[4] = {z4[b].x, z4[b].y, z4[b].z, z4[b].w};
+    for (int c0 = 0; c0 < n_expert; c0 += chunk) {
+        const int nc = min(chunk, n_expert - c0);
+        for (int b = warp; b < nc; b += warps) {
+            const int64_t pair = (int64_t)tok * n_expert + c0 + b;
+            const int ex = selected[pair];
+            if (ex < 0) {                             /* another rank's expert (L266 EP): its partial is that rank's */
+                if (lane == 0) s_live[b] = 0;
+                continue;
+            }
+            const __half *svh_d = reinterpret_cast<const __half *>(pd[2 * (size_t)ex + 1]) + mid_dim;
+            const float4 z4 = *reinterpret_cast<const float4 *>(down_z + pair * out_dim + col0);
+            float z[4] = {z4.x, z4.y, z4.z, z4.w};
             for (int s = 1; s < z_splits; ++s) {     /* a decode launch's K splits, in split order */
-                const float4 zs = *reinterpret_cast<const float4 *>(
-                    down_z + s * z_split_stride + ((int64_t)tok * n_expert + s0 + b) * out_dim + col0);
+                const float4 zs = *reinterpret_cast<const float4 *>(down_z + s * z_split_stride + pair * out_dim + col0);
                 z[0] += zs.x; z[1] += zs.y; z[2] += zs.z; z[3] += zs.w;
             }
             exl3dev::had128(z);
-#pragma unroll
-            for (int j = 0; j < 4; ++j) acc[j] += z[j] * __half2float(sv[b][j]);
+            s_z[b * 32 + lane] = make_float4(z[0], z[1], z[2], z[3]);
+            s_sv[b * 32 + lane] = make_float4(__half2float(svh_d[col0]), __half2float(svh_d[col0 + 1]),
+                                        __half2float(svh_d[col0 + 2]), __half2float(svh_d[col0 + 3]));
+            if (lane == 0) s_live[b] = 1;
         }
+        __syncthreads();
+        if (warp == 0)
+            for (int b = 0; b < nc; ++b) {
+                if (!s_live[b]) continue;
+                const float4 z4 = s_z[b * 32 + lane], v4 = s_sv[b * 32 + lane];
+                acc[0] += z4.x * v4.x;
+                acc[1] += z4.y * v4.y;
+                acc[2] += z4.z * v4.z;
+                acc[3] += z4.w * v4.w;
+            }
+        __syncthreads();
     }
+    if (warp != 0) return;
     bool bad = false;
 #pragma unroll
     for (int j = 0; j < 4; ++j) bad |= !isfinite(acc[j]);
@@ -277,10 +291,15 @@ int ds4_exl3_moe_sum_launch(float *out, const float *down_z, const int32_t *sele
             fprintf(stderr, "ds4_exl3_moe_sum_launch: shared expert %d has no output -- refusing\n", e);
             return -1;
         }
-    const int64_t tasks = (int64_t)n_tokens * (out_dim >> 7);
-    const unsigned blocks = (unsigned)((tasks + 7) / 8);
-    exl3_moe_sum_kernel<<<blocks, 256, 0, stream>>>(
-        out, down_z, selected, down_table, mid_dim, out_dim, n_expert, n_tokens, nf_flag, nf_code, sh, z_splits,
+    const int64_t blocks = (int64_t)n_tokens * (out_dim >> 7);
+    if (blocks > INT32_MAX) {
+        fprintf(stderr, "ds4_exl3_moe_sum_launch: %d tokens x %d outputs is past one launch's grid -- refusing\n",
+                n_tokens, out_dim);
+        return -1;
+    }
+    const int warps = n_expert < kSumWarpsMax ? n_expert : kSumWarpsMax;
+    exl3_moe_sum_kernel<<<(unsigned)blocks, warps * 32, sum_smem_bytes(sum_chunk(n_expert)), stream>>>(
+        out, down_z, selected, down_table, mid_dim, out_dim, n_expert, nf_flag, nf_code, sh, z_splits,
         z_split_stride);
     const cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
