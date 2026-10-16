@@ -9,7 +9,8 @@
 //   scales  the 128x4-tiled E4M3 plane (the NVFP4 MMA layout cuBLASLt, CUTLASS, FlashInfer and b12x read): row r's
 //           scale of inputs [16 kb, 16 kb + 16) at byte  ((r / 128) * (in / 64) + kb / 4) * 512 + (r % 32) * 16
 //           + ((r % 128) / 32) * 4 + kb % 4, out padded to 128 rows (zero scales)
-//   global  one f32 (weight_scale_2), then 12 zero bytes
+//   global  one f32 (weight_scale_2), then 28 zero bytes (a 32-byte tail: the container starts every packed entry
+//           32-byte aligned, and values and scales are multiples of 32)
 // The weight is w[r][k] = e2m1 * e4m3 * global.  pulsar_nvfp4_layout is the one byte model (the loader's and the
 // kernel's).
 //
@@ -35,7 +36,7 @@ static inline bool pulsar_nvfp4_layout(uint64_t in, uint64_t out, uint64_t *valu
     if (in == 0 || out == 0 || in % 64 != 0) return false;
     *values = out * in / 2;
     *scales = (out + 127) / 128 * 128 * (in / 16);
-    *stride = *values + *scales + 16;
+    *stride = *values + *scales + 32;
     return true;
 }
 
