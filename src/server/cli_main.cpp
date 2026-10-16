@@ -451,6 +451,8 @@ static server_config parse_options(int argc, char **argv) {
             defaulted_model_path = false;
         } else if (!strcmp(arg, "--no-dspark")) {
             c.engine.dspark_disable = true;
+        } else if (!strcmp(arg, "--drafter")) {
+            c.engine.drafter = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--spec-depth")) {
             c.engine.spec_depth = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--spec-tau")) {
@@ -595,8 +597,10 @@ int main(int argc, char **argv) {
                    pulsar_engine_spec_depth(engine));
     } else if (pulsar_engine_has_spec_rounds(engine)) {
         server_log(PULSAR_LOG_DEFAULT,
-                   "pulsar-server: %s speculative decoding active (MTP drafter, greedy or sampled; %u verify rows a round)",
-                   pulsar_engine_family_name(engine), pulsar_engine_fused_heads_max(engine));
+                   "pulsar-server: %s speculative decoding active (%s drafter, greedy or sampled; %u verify rows a round)",
+                   pulsar_engine_family_name(engine),
+                   pulsar_engine_drafter(engine) == PULSAR_DRAFTER_BLOCK ? "LiLiCorr block" : "MTP",
+                   pulsar_engine_fused_heads_max(engine));
     } else if (cfg.engine.dspark_disable) {
         server_log(PULSAR_LOG_DEFAULT,
                    "pulsar-server: speculative decoding disabled by --no-dspark");

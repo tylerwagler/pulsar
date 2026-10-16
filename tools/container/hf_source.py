@@ -31,9 +31,13 @@ class HFCheckpoint:
         if os.path.exists(idx_path):
             self.weight_map = json.load(open(idx_path))['weight_map']
         else:
-            # a partial download: index every shard present by header
+            # a partial download: index every shard present by header; a one-file checkpoint (model.safetensors,
+            # no index -- the LiLiCorr drafter) is its own single shard
             self.weight_map = {}
-            for p in sorted(glob.glob(os.path.join(hf_dir, 'model-*.safetensors'))):
+            files = sorted(glob.glob(os.path.join(hf_dir, 'model-*.safetensors')))
+            if not files and os.path.exists(os.path.join(hf_dir, 'model.safetensors')):
+                files = [os.path.join(hf_dir, 'model.safetensors')]
+            for p in files:
                 for name in self._shard_header_of(p):
                     self.weight_map[name] = os.path.basename(p)
         self._hdr = {}

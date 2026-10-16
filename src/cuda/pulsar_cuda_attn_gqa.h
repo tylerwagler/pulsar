@@ -20,10 +20,20 @@
  *                 ln(max(1, (pos + 1) / floor)), applied (as a bf16 product)
  *                 to the normed q and to the bias -- i.e. to the whole logit
  *   output gate   optional y *= sigmoid(gate) per (row, head, dim)
+ *   rope          optional rotary position encoding of the normed q and k
+ *                 at the row's position: the NeoX half-split rotation of
+ *                 the whole head, base `rope_theta`, in the HF / vLLM bf16
+ *                 arithmetic (cos and sin rounded to bf16, each product and
+ *                 the sum one bf16 rounding)
+ *   block         optional (L298, a block drafter's query block): every row
+ *                 of a sequence's run also attends the LATER rows of its run
+ *                 (bidirectional inside the run, the span's window to the
+ *                 left), and the run's rows are drafts -- they are never
+ *                 stored into the pool
  *
  * The arithmetic, per (row, query head):
- *   q = bf16(bf16(rmsnorm(q_in) * w_q) * tau)       (norm / tau when declared)
- *   k = bf16(rmsnorm(k_in) * w_k),  v = v_in        (the KV row stores these)
+ *   q = bf16(rope(bf16(rmsnorm(q_in) * w_q)) * tau) (norm / rope / tau when declared)
+ *   k = rope(bf16(rmsnorm(k_in) * w_k)),  v = v_in  (the KV row stores these)
  *   s(x) = (q . k_x) * scale + bias(pos - x)        for the keys x it attends
  *   y = sum_x softmax(s)_x v_x  [* sigmoid(gate)]   -> bf16 (o_proj's input)
  *
@@ -42,9 +52,14 @@
  * KV rows (one per token per layer, the caller owns the pools; F3 will):
  *   BF16  K head 0 .. K head n_kv-1, then V head 0 .. V head n_kv-1, each
  *         head_dim bf16 -- n_kv * 2 * head_dim * 2 B per token.
- *   (the FP8 seam: an E4M3 row with one E8M0 per 32 elements, data then
- *   scales as the window rows of pulsar_gpu.h, is a pulsar_gqa_kv_fmt value,
- *   a row-bytes line and a tile loader -- the kernels read rows through it.)
+ *   E4M3  (L298) the same order, each element ONE E4M3 byte at scale 1.0 (the
+ *         stored bf16 value converted with satfinite rounding; vLLM's
+ *         kv_cache_dtype fp8_e4m3 with unit k / v scales) -- n_kv * 2 *
+ *         head_dim B per token.  The tile loader widens it to bf16 (exact);
+ *         a call's own rows are read in the same format, so every key and
+ *         value the attention sees is the stored one.
+ *   (a block-scaled E4M3 row, one E8M0 per 32 elements, would be one more
+ *   value, a row-bytes line and a tile loader.)
  * A FULL sequence's token at position p is slot p (cap = token capacity); a
  * WINDOW sequence's is slot p % cap.  A call's own rows read the keys it
  * produced from its workspace and write the cache AFTER the attention (only
@@ -71,6 +86,7 @@ extern "C" {
 /** The KV row format (the format table's attention-row entry). */
 typedef enum {
     PULSAR_GQA_KV_BF16 = 0,   /**< K then V heads, head_dim bf16 each */
+    PULSAR_GQA_KV_E4M3 = 1,   /**< K then V heads, head_dim E4M3 bytes each, unit scale */
 } pulsar_gqa_kv_fmt;
 
 /** Which keys a row attends. */
@@ -99,6 +115,8 @@ typedef struct {
     float             temp_floor;   /**< log-length temperature floor; 0 = no temperature */
     float             temp_alpha;
     int               out_gate;     /**< 1: y *= sigmoid(gate) */
+    float             rope_theta;   /**< > 0: NeoX rope of q and k at base rope_theta; 0 = none */
+    int               block;        /**< 1: a run's rows attend its later rows too and are never stored (no bias) */
 } pulsar_gqa_layer;
 
 /** One sequence's KV pool for ONE layer. */
@@ -179,6 +197,23 @@ int pulsar_gqa_plan(const pulsar_gqa_layer *layer, const pulsar_gqa_seq *seqs, u
  *  @return 0, -1 on a refused contract, -3 on a launch failure. */
 int pulsar_gqa_launch(const pulsar_gqa_layer *layer, const pulsar_gqa_call *call, const void *desc_dev,
                       const pulsar_gqa_io *io, cudaStream_t stream);
+
+/* ---- the KV rows alone (L298) ----------------------------------------------------------------------------------
+ * A block drafter's context rows have no queries: their K and V come from the target's hidden states and land in
+ * the pool, which the drafter's query blocks read.  The store is the attention call's own first and last stage --
+ * the K head norm and rope of gqa_prep, the pool write of gqa_commit -- so a row stored here is byte for byte the
+ * row a forward over the same k / v would have stored.  The contract on rows, sequences and the ring is the
+ * forward's (each sequence's rows one run of consecutive positions; a ring keeps the run's last cap). */
+
+/** Workspace for a store of at most n_rows rows. */
+uint64_t pulsar_gqa_store_workspace_bytes(const pulsar_gqa_layer *layer, uint32_t n_rows);
+
+/** Store n_rows rows' K (normed, roped as declared) and V into the sequences' pools on `stream`.  io->k and io->v
+ *  are read; q, r, gate and out are not.  `block` must be 0 (a block's rows are never stored).
+ *  @return 0, -1 on a refused contract (named on stderr, nothing launched), -3 on a launch failure. */
+int pulsar_gqa_store(const pulsar_gqa_layer *layer, const pulsar_gqa_seq *seqs, uint32_t n_seqs,
+                     const uint32_t *row_seq, const uint32_t *row_pos, uint32_t n_rows, const pulsar_gqa_io *io,
+                     cudaStream_t stream);
 
 #ifdef __cplusplus
 }

@@ -18,7 +18,9 @@
  * even a reassociated multiply here is a red gate. */
 #pragma once
 
+#include <cuda_bf16.h>
 #include <math.h>
+#include <stdint.h>
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -62,4 +64,26 @@ __device__ static inline void rope_pair_rotate_core_dev(
     if (inverse) s = -s;
     *r0 = x0 * c - x1 * s;
     *r1 = x0 * s + x1 * c;
+}
+
+/* The NeoX (half-split) rotation in the HF / vLLM bf16 arithmetic (L298: the block drafter's q and k; a Qwen3-style
+ * layer).  Pair p of a head of d dims is (x[p], x[p + d/2]); its frequency is the f32 inv_freq vLLM caches,
+ * 1 / base^(2p / d), its angle pos * inv_freq in f32; cos and sin are rounded to bf16 (the cache vLLM casts to the
+ * model dtype, HF's .to(x.dtype)), and each product and the difference / sum is one bf16 rounding (c10::BFloat16
+ * arithmetic, HF's bf16 tensor ops).  x0 / x1 are bf16 values held in f32; r0 / r1 come back the same.
+ *
+ * The engine builds with --use_fast_math, which turns powf / cosf / sinf into the __powf / __cosf / __sinf
+ * approximations and 1.0f / x into an approximate reciprocal: at an angle near 1e5 rad that moved ~6% of the stored
+ * K elements by a bf16 ulp or more (tests/gqa_attn_gate, L298).  So pow, cos and sin are evaluated in double (which
+ * fast-math leaves alone) and rounded once to f32 -- the f32 value torch's / libm's f32 functions return -- and the
+ * division and the product are the IEEE intrinsics. */
+__device__ static inline float rope_neox_bf16_round_dev(float x) { return __bfloat162float(__float2bfloat16_rn(x)); }
+__device__ static inline void rope_neox_bf16_pair_dev(float x0, float x1, uint32_t p, uint32_t d, uint32_t pos,
+                                                      float base, float *r0, float *r1) {
+    const float e = __fdiv_rn((float)(2u * p), (float)d);
+    const float inv = __fdiv_rn(1.0f, (float)pow((double)base, (double)e));
+    const double ang = (double)__fmul_rn((float)pos, inv);
+    const float c = rope_neox_bf16_round_dev((float)cos(ang)), s = rope_neox_bf16_round_dev((float)sin(ang));
+    *r0 = rope_neox_bf16_round_dev(__fsub_rn(rope_neox_bf16_round_dev(__fmul_rn(x0, c)), rope_neox_bf16_round_dev(__fmul_rn(x1, s))));
+    *r1 = rope_neox_bf16_round_dev(__fadd_rn(rope_neox_bf16_round_dev(__fmul_rn(x1, c)), rope_neox_bf16_round_dev(__fmul_rn(x0, s))));
 }

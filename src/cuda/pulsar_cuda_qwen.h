@@ -118,6 +118,8 @@ typedef struct pulsar_rows_linear {
     bool prompt;
     /** L295 F7: a BF16 weight [out][in] (k2 0, sf NULL): the BF16 rows arm (pulsar_cuda_bf16_rows.cuh). */
     bool bf16;
+    /** L298: an nvfp4 slice (k2 0, sf NULL; pulsar_cuda_nvfp4.h): the NVFP4 W4A16 rows arm. */
+    bool nvfp4;
 } pulsar_rows_linear;
 
 /** L251 MTP: the head-side weights of the input combine (the sidecar's tensors). */
@@ -210,8 +212,8 @@ int pulsar_rows_linear_multi_launch(const pulsar_rows_linear *const *ls, int n, 
                                     float *const *y, void *ws, size_t ws_bytes, cudaStream_t stream);
 /** L296 dec2: the multi launch with bf16 outputs yb[j] [rows][ls[j]->out] -- the f32 outputs rounded to nearest even,
  *  byte for byte, for a consumer that reads bf16 (rule 3: the producer emits).  The EXL3 decode GEMV emits them in its
- *  epilogue (no f32 round trip, no emit launch); every other arm (a prompt chunk, mxfp8_lt, BF16) writes its f32 rows
- *  into stage[j] [rows][out] and the front door emits them. */
+ *  epilogue (no f32 round trip, no emit launch), and so does the nvfp4 kernel (L298, every row kind); every other arm
+ *  (a prompt chunk, mxfp8_lt, BF16) writes its f32 rows into stage[j] [rows][out] and the front door emits them. */
 int pulsar_rows_linear_multi_bf16_launch(const pulsar_rows_linear *const *ls, int n, const uint16_t *x_bf16, int rows,
                                          float *const *stage, uint16_t *const *yb, void *ws, size_t ws_bytes,
                                          cudaStream_t stream);

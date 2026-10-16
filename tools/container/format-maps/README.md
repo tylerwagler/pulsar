@@ -7,5 +7,8 @@ GGUF-era tensor names.  Since L279 the builder reads neither: `--format-map` (an
 producer or the map retires is L279 step 7.  `qwen38fn-*.json` are the Qwen recipes (pulsar.recipe.v1, name rows).
 `inkling-*.json` are the Inkling recipes (role rows): `inkling-bf16` the BF16 reference container of any Inkling
 checkpoint, `inkling-mini-k3` the 3-layer mini on its K3 EXL3 pack (L294).  `nemotron_h-bf16` is the BF16 reference
-container of any Nemotron-H Omni checkpoint (role rows; the vision tower consumed by name -- L296 N1).
+container of any Nemotron-H Omni checkpoint (role rows; the vision tower consumed by name -- L296 N1);
+`nemotron_h-exl3-k4` Nemotron 3.5 Super VL on its K4 EXL3 pack; `nemotron_h-k4-lilicorr` the same with the MTP
+module omitted and NVIDIA's LiLiCorr block drafter written in its place (needs `--drafter lilicorr DIR`; its NVFP4
+Linears `nvfp4`, the rest native -- L298).
 The scripts that produced them were archived 2026-09-24 (tag `archive/gguf-tooling-2026-09-24`).

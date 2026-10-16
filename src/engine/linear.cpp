@@ -12,6 +12,7 @@
  *       mxfp8_lt   -> the W8A16 split-K GEMV / MMA
  *       EXL3       -> the EXL3 dense arm at its rate
  *       bf16       -> the BF16 rows arm (L295 F7: tensor-core rows kernel at decode widths, cuBLASLt beyond)
+ *       nvfp4      -> the NVFP4 W4A16 rows arm (L298: decoded in registers, the BF16 rows kernel's order)
  *
  * Every arm is today's launcher, unchanged -- this is where a family stops choosing kernels.  A pairing the table
  * has not refuses by name (rule 1); filling one (an EXL3 weight against the slot's bf16 plane, a bf16 weight
@@ -75,7 +76,8 @@ bool pulsar_linear_slot(pulsar_gpu_tensor *out, const pulsar_model *m, const pul
 bool pulsar_linear_rows_ref(const pulsar_model *m, const pulsar_tensor *t, int in, int out, bool prompt,
                             const char *what, pulsar_rows_linear *l) {
     const pulsar_dense_arm arm = pulsar_dense_arm_for(t->type, PULSAR_ACT_ROWS_BF16);
-    if (arm != PULSAR_DENSE_ARM_MXFP8_ROWS && arm != PULSAR_DENSE_ARM_EXL3_ROWS && arm != PULSAR_DENSE_ARM_BF16_ROWS) {
+    if (arm != PULSAR_DENSE_ARM_MXFP8_ROWS && arm != PULSAR_DENSE_ARM_EXL3_ROWS && arm != PULSAR_DENSE_ARM_BF16_ROWS &&
+        arm != PULSAR_DENSE_ARM_NVFP4_ROWS) {
         say_no_arm(t, "raw bf16 rows");
         return false;
     }
@@ -88,5 +90,6 @@ bool pulsar_linear_rows_ref(const pulsar_model *m, const pulsar_tensor *t, int i
     l->sf = arm == PULSAR_DENSE_ARM_MXFP8_ROWS && l->w ? (const uint8_t *)l->w + (uint64_t)out * in : NULL;
     l->prompt = prompt;
     l->bf16 = arm == PULSAR_DENSE_ARM_BF16_ROWS;
+    l->nvfp4 = arm == PULSAR_DENSE_ARM_NVFP4_ROWS;
     return l->w != NULL;
 }
