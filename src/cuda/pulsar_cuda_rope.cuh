@@ -18,7 +18,9 @@
  * even a reassociated multiply here is a red gate. */
 #pragma once
 
+#include <cuda_bf16.h>
 #include <math.h>
+#include <stdint.h>
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -62,4 +64,19 @@ __device__ static inline void rope_pair_rotate_core_dev(
     if (inverse) s = -s;
     *r0 = x0 * c - x1 * s;
     *r1 = x0 * s + x1 * c;
+}
+
+/* The NeoX (half-split) rotation in the HF / vLLM bf16 arithmetic (L298: the block drafter's q and k; a Qwen3-style
+ * layer).  Pair p of a head of d dims is (x[p], x[p + d/2]); its frequency is the f32 inv_freq vLLM caches,
+ * 1 / base^(2p / d), its angle pos * inv_freq in f32; cos and sin are rounded to bf16 (the cache vLLM casts to the
+ * model dtype, HF's .to(x.dtype)), and each product and the difference / sum is one bf16 rounding (c10::BFloat16
+ * arithmetic, HF's bf16 tensor ops).  x0 / x1 are bf16 values held in f32; r0 / r1 come back the same. */
+__device__ static inline float rope_neox_bf16_round_dev(float x) { return __bfloat162float(__float2bfloat16_rn(x)); }
+__device__ static inline void rope_neox_bf16_pair_dev(float x0, float x1, uint32_t p, uint32_t d, uint32_t pos,
+                                                      float base, float *r0, float *r1) {
+    const float inv = 1.0f / powf(base, (float)(2u * p) / (float)d);
+    const float ang = (float)pos * inv;
+    const float c = rope_neox_bf16_round_dev(cosf(ang)), s = rope_neox_bf16_round_dev(sinf(ang));
+    *r0 = rope_neox_bf16_round_dev(rope_neox_bf16_round_dev(x0 * c) - rope_neox_bf16_round_dev(x1 * s));
+    *r1 = rope_neox_bf16_round_dev(rope_neox_bf16_round_dev(x1 * c) + rope_neox_bf16_round_dev(x0 * s));
 }

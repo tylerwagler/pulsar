@@ -21,6 +21,7 @@
  * the attention never reads a slot the same call overwrites. */
 #include "pulsar_cuda_attn_gqa.h"
 #include "pulsar_cuda_internal.h"
+#include "pulsar_cuda_rope.cuh"   /* the NeoX bf16 rotation: ONE authority (rope_neox_bf16_pair_dev) */
 
 #include <cuda_bf16.h>
 
@@ -57,7 +58,7 @@ struct gqa_row {
     uint32_t ring;      /* 1: slot = position % cap */
     uint32_t chunk0;    /* lo / GQA_CHUNK */
     float    tau;       /* the log-length temperature (1 when the layer declares none) */
-    uint32_t pad;
+    uint32_t hi;        /* the last key it attends: its own position, or (a block) its run's last */
 };
 static_assert(sizeof(gqa_row) == 48, "row descriptor");
 
@@ -149,6 +150,7 @@ struct gqa_prep_args {
     const uint16_t       *qw, *kw;    /* NULL: no norm */
     float                 eps;
     uint32_t              n_q, n_kv, token_bytes;
+    float                 rope_theta; /* > 0: the NeoX rotation of q and k at the row's position */
     __nv_bfloat16        *q;          /* workspace */
     uint8_t              *fresh;      /* workspace */
 };
@@ -191,6 +193,17 @@ __global__ void __launch_bounds__(256) gqa_prep_kernel(const gqa_prep_args a) {
         #pragma unroll
         for (int j = 0; j < NJ; j++) x[j] = gqa_round(__fmul_rn(__fmul_rn(x[j], rstd), gqa_bf(w[lane + 32 * j])));
     }
+    /* L298: the rope of q and k (never v) after the norm -- element lane + 32 j pairs with lane + 32 (j + NJ / 2) */
+    if (a.rope_theta > 0.f && job < a.n_q + a.n_kv) {
+        const uint32_t pos = a.rows[row].pos;
+        #pragma unroll
+        for (int j = 0; j < NJ / 2; j++) {
+            float r0, r1;
+            rope_neox_bf16_pair_dev(x[j], x[j + NJ / 2], lane + 32u * (uint32_t)j, HD, pos, a.rope_theta, &r0, &r1);
+            x[j] = r0;
+            x[j + NJ / 2] = r1;
+        }
+    }
     /* the temperature multiplies the stored bf16 q (tau = 1 is an exact identity) */
     #pragma unroll
     for (int j = 0; j < NJ; j++) dst[lane + 32 * j] = __float2bfloat16_rn(__fmul_rn(x[j], tau));
@@ -211,7 +224,7 @@ __global__ void __launch_bounds__(128) gqa_attn_kernel(const gqa_args a) {
     const uint32_t g = blockIdx.y;
     const gqa_row R0 = a.rows[T.row0];
     const gqa_row RL = a.rows[T.row0 + T.n - 1u];
-    const uint32_t c_last = RL.pos / GQA_CHUNK;
+    const uint32_t c_last = RL.hi / GQA_CHUNK;
     const uint32_t c_first = FOLD ? R0.chunk0 : R0.chunk0 + blockIdx.x;
     if (c_first > c_last) return;
     const uint32_t c_end = FOLD ? c_last : c_first;
@@ -220,7 +233,7 @@ __global__ void __launch_bounds__(128) gqa_attn_kernel(const gqa_args a) {
 
     /* this lane's two MMA rows: gr and gr + 8 of the warp's 16 */
     bool mval[2];
-    uint32_t mpos[2], mlo[2], mrow[2], mhead[2], mch0[2];
+    uint32_t mpos[2], mhi[2], mlo[2], mrow[2], mhead[2], mch0[2];
     float mtau[2];
     #pragma unroll
     for (int hh = 0; hh < 2; hh++) {
@@ -228,7 +241,7 @@ __global__ void __launch_bounds__(128) gqa_attn_kernel(const gqa_args a) {
         mval[hh] = m < mrows;
         const uint32_t ri = mval[hh] ? m / G : 0u;
         const gqa_row &Rm = a.rows[T.row0 + ri];
-        mpos[hh] = Rm.pos; mlo[hh] = Rm.lo; mtau[hh] = Rm.tau; mch0[hh] = Rm.chunk0;
+        mpos[hh] = Rm.pos; mhi[hh] = Rm.hi; mlo[hh] = Rm.lo; mtau[hh] = Rm.tau; mch0[hh] = Rm.chunk0;
         mrow[hh] = T.row0 + ri;
         mhead[hh] = g * G + (mval[hh] ? m % G : 0u);
     }
@@ -260,7 +273,7 @@ __global__ void __launch_bounds__(128) gqa_attn_kernel(const gqa_args a) {
 
         for (uint32_t s = 0; s < GQA_CHUNK_SPLITS; s++) {
             const uint32_t x0 = ch * GQA_CHUNK + s * GQA_SPLIT;
-            if (x0 > RL.pos) break;
+            if (x0 > RL.hi) break;
             if (x0 + GQA_SPLIT <= R0.lo) continue;
             __syncthreads();                       /* the previous split is done with ks / vs / bs */
             /* the K tile, then the V tile: each thread's LPT 16-byte loads all issued before its stores */
@@ -274,7 +287,7 @@ __global__ void __launch_bounds__(128) gqa_attn_kernel(const gqa_args a) {
                 for (uint32_t it = 0; it < LPT; it++) {
                     const uint32_t i = tid + 128u * it, t = i / V8, part = i % V8, x = x0 + t;
                     ld[it] = make_uint4(0u, 0u, 0u, 0u);
-                    if (x >= R0.lo && x <= RL.pos) {
+                    if (x >= R0.lo && x <= RL.hi) {
                         const uint8_t *rec = x >= R0.p0
                                 ? a.fresh + (uint64_t)(R0.fresh0 + (x - R0.p0)) * a.token_bytes
                                 : R0.cache + (uint64_t)(R0.ring ? x % R0.cap : x) * a.token_bytes;
@@ -344,7 +357,7 @@ __global__ void __launch_bounds__(128) gqa_attn_kernel(const gqa_args a) {
                 for (int e = 0; e < 4; e++) {
                     const int hh = e >> 1;
                     const uint32_t kx = 8u * nt + 2u * c + (e & 1), x = x0 + kx;
-                    const bool valid = mval[hh] && x >= mlo[hh] && x <= mpos[hh];
+                    const bool valid = mval[hh] && x >= mlo[hh] && x <= mhi[hh];
                     float t = __fmul_rn(sc[nt][e], a.scale);
                     if (BIAS && bias_live && valid) {
                         t = __fadd_rn(t, __bfloat162float(bs[(w * 16u + gr + 8u * hh) * GQA_BIAS_W + (mpos[hh] - wpos0) + (GQA_SPLIT - 1u) - kx]));
@@ -456,7 +469,7 @@ template <int HD>
 __global__ void __launch_bounds__(HD) gqa_combine_kernel(const gqa_args a) {
     const uint32_t row = blockIdx.x, h = blockIdx.y, d = threadIdx.x;
     const gqa_row R = a.rows[row];
-    const uint32_t nch = R.pos / GQA_CHUNK - R.chunk0 + 1u;
+    const uint32_t nch = R.hi / GQA_CHUNK - R.chunk0 + 1u;
     const uint64_t base = ((uint64_t)row * a.n_q + h) * a.max_chunks;
     float M = -INFINITY, L = 0.f, A = 0.f;
     for (uint32_t i = 0; i < nch; i++) {
@@ -550,7 +563,7 @@ int gqa_launch(const pulsar_gqa_layer *L, const gqa_prep_args &pa, const gqa_arg
         else      gqa_attn_kernel<HD, false, false><<<grid, 128, 0, st>>>(aa);
         gqa_combine_kernel<HD><<<dim3(n_rows, L->n_q), HD, 0, st>>>(aa);
     }
-    gqa_commit_kernel<<<n_rows, 128, 0, st>>>(ws.rows, ws.fresh, aa.token_bytes);
+    if (!L->block) gqa_commit_kernel<<<n_rows, 128, 0, st>>>(ws.rows, ws.fresh, aa.token_bytes);   /* a block's rows are drafts */
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) {
         fprintf(stderr, "pulsar: gqa attention launch failed: %s\n", cudaGetErrorString(e));
@@ -601,6 +614,8 @@ static int gqa_layer_refusal(const pulsar_gqa_layer *L) {
     if (L->temp_floor < 0.f || (L->temp_floor > 0.f && !isfinite(L->temp_alpha))) {
         return gqa_refuse("the temperature floor is negative or its alpha is not finite");
     }
+    if (L->rope_theta < 0.f || !isfinite(L->rope_theta)) return gqa_refuse("the rope base is negative or not finite");
+    if (L->block && L->rel_extent) return gqa_refuse("a block (bidirectional run) with a relative bias has no built tile");
     return 0;
 }
 
@@ -656,7 +671,7 @@ int pulsar_gqa_plan(const pulsar_gqa_layer *L, const pulsar_gqa_seq *seqs, uint3
         d.ring   = L->span == PULSAR_GQA_WINDOW ? 1u : 0u;
         d.chunk0 = d.lo / GQA_CHUNK;
         d.tau    = gqa_tau(L, p);
-        d.pad    = 0;
+        d.hi     = L->block ? row_pos[run_last[sq]] : p;
     }
     /* tiles: runs of up to 64 / G consecutive rows of one sequence */
     const uint32_t qt = GQA_MROWS / G;
@@ -665,7 +680,7 @@ int pulsar_gqa_plan(const pulsar_gqa_layer *L, const pulsar_gqa_seq *seqs, uint3
         uint32_t n = 1;
         while (n < qt && r + n < n_rows && row_seq[r + n] == row_seq[r]) n++;
         h_tiles[n_tiles++] = {r, n};
-        grid_chunks = std::max(grid_chunks, h_rows[r + n - 1u].pos / GQA_CHUNK - h_rows[r].chunk0 + 1u);
+        grid_chunks = std::max(grid_chunks, h_rows[r + n - 1u].hi / GQA_CHUNK - h_rows[r].chunk0 + 1u);
         r += n;
     }
     /* A bounded call's split grid is the bound's (a CTA whose chunk is past its tile's last row exits before it reads
@@ -715,13 +730,15 @@ int pulsar_gqa_launch(const pulsar_gqa_layer *L, const pulsar_gqa_call *call, co
 
     const uint64_t key = pulsar_shape_key(((uint64_t)n_rows << 1) | (fold ? 1u : 0u),
                                           ((uint64_t)L->n_q << 24) ^ ((uint64_t)L->n_kv << 16) ^ ((uint64_t)HD << 4) ^
-                                          ((uint64_t)L->span << 2) ^ (L->rel_extent ? 2u : 0u) ^ (L->temp_floor > 0.f ? 1u : 0u));
+                                          ((uint64_t)L->span << 2) ^ (L->rel_extent ? 2u : 0u) ^ (L->temp_floor > 0.f ? 1u : 0u) ^
+                                          (L->rope_theta > 0.f ? 0x100u : 0u) ^ (L->block ? 0x200u : 0u));
     if (pulsar_shape_once_first(&g_gqa_announce, key, "gqa attention")) {
         fprintf(stderr, "pulsar: gqa attention: %uq/%ukv/%u, KV BF16, %s %u, rel bias %s (extent %u), temperature %s, "
-                        "qk norm %s, gate %s: %u rows in %u tiles, %s\n",
+                        "qk norm %s, gate %s, rope %s, %s: %u rows in %u tiles, %s\n",
                 L->n_q, L->n_kv, HD, L->span == PULSAR_GQA_WINDOW ? "window" : "full", L->window,
                 L->rel_extent ? "on" : "off", L->rel_extent, L->temp_floor > 0.f ? "on" : "off",
-                L->qk_norm ? "on" : "off", L->out_gate ? "on" : "off", n_rows, call->n_tiles,
+                L->qk_norm ? "on" : "off", L->out_gate ? "on" : "off", L->rope_theta > 0.f ? "neox" : "off",
+                L->block ? "bidirectional runs, not stored" : "causal", n_rows, call->n_tiles,
                 fold ? "chunks folded in the CTA" : "chunks in parallel + combine");
     }
 
@@ -734,6 +751,7 @@ int pulsar_gqa_launch(const pulsar_gqa_layer *L, const pulsar_gqa_call *call, co
     pa.kw = L->qk_norm ? L->k_norm_w : nullptr;
     pa.eps = L->norm_eps;
     pa.n_q = L->n_q; pa.n_kv = L->n_kv; pa.token_bytes = (uint32_t)tb;
+    pa.rope_theta = L->rope_theta;
     pa.q = ws.q; pa.fresh = ws.fresh;
 
     gqa_args aa{};
@@ -776,4 +794,56 @@ int pulsar_gqa_forward(const pulsar_gqa_layer *L, const pulsar_gqa_seq *seqs, ui
         return -3;
     }
     return pulsar_gqa_launch(L, &call, io->workspace, io, st);
+}
+
+/* ---- the KV rows alone (L298): gqa_prep's K / V jobs and gqa_commit, nothing between --------------------------- */
+
+uint64_t pulsar_gqa_store_workspace_bytes(const pulsar_gqa_layer *layer, uint32_t n_rows) {
+    return pulsar_gqa_desc_bytes(n_rows) + gqa_up((uint64_t)n_rows * pulsar_gqa_kv_token_bytes(layer));
+}
+
+int pulsar_gqa_store(const pulsar_gqa_layer *L, const pulsar_gqa_seq *seqs, uint32_t n_seqs, const uint32_t *row_seq,
+                     const uint32_t *row_pos, uint32_t n_rows, const pulsar_gqa_io *io, cudaStream_t st) {
+    if (!L || !io || n_rows == 0 || n_rows > 65535u) return gqa_refuse("a NULL argument or a row count outside 1 .. 65535");
+    if (L->block) return gqa_refuse("a store of a block's rows (a block's rows are drafts, never stored)");
+    if (!gqa_in_ok(io->k, L->n_kv, L->head_dim) || !gqa_in_ok(io->v, L->n_kv, L->head_dim)) {
+        return gqa_refuse("a store's k / v input is missing or its strides overlap its heads");
+    }
+    const uint64_t desc = pulsar_gqa_desc_bytes(n_rows), tb = pulsar_gqa_kv_token_bytes(L);
+    if (!io->workspace || ((uintptr_t)io->workspace & 255u) != 0 ||
+        io->workspace_bytes < pulsar_gqa_store_workspace_bytes(L, n_rows)) {
+        return gqa_refuse("the store's workspace is missing, short or not 256-byte aligned");
+    }
+    /* the forward's plan (its contract and refusals) into the workspace's descriptor region */
+    std::vector<uint8_t> stage(desc);
+    pulsar_gqa_call call{};
+    if (const int rc = pulsar_gqa_plan(L, seqs, n_seqs, row_seq, row_pos, n_rows, 0u, stage.data(), stage.size(), &call)) {
+        return rc;
+    }
+    if (cudaMemcpyAsync(io->workspace, stage.data(), stage.size(), cudaMemcpyHostToDevice, st) != cudaSuccess) {
+        fprintf(stderr, "pulsar: gqa store: descriptor upload failed\n");
+        return -3;
+    }
+    const gqa_row *rows = (const gqa_row *)io->workspace;
+    uint8_t *fresh = (uint8_t *)io->workspace + desc;
+    gqa_prep_args pa{};
+    pa.rows = rows;
+    pa.kin = (const __nv_bfloat16 *)io->k.ptr; pa.ld_k = io->k.ld; pa.hs_k = io->k.head_stride;
+    pa.vin = (const __nv_bfloat16 *)io->v.ptr; pa.ld_v = io->v.ld; pa.hs_v = io->v.head_stride;
+    pa.kw = L->qk_norm ? L->k_norm_w : nullptr;
+    pa.eps = L->norm_eps;
+    pa.n_q = 0;   /* no query jobs: job g < n_kv is K head g, then the V heads */
+    pa.n_kv = L->n_kv; pa.token_bytes = (uint32_t)tb;
+    pa.rope_theta = L->rope_theta;
+    pa.fresh = fresh;
+    const dim3 grid(n_rows, (2u * L->n_kv + 7u) / 8u);
+    if (L->head_dim == 128u) gqa_prep_kernel<128><<<grid, 256, 0, st>>>(pa);
+    else                     gqa_prep_kernel<64><<<grid, 256, 0, st>>>(pa);
+    gqa_commit_kernel<<<n_rows, 128, 0, st>>>(rows, fresh, (uint32_t)tb);
+    const cudaError_t e = cudaGetLastError();
+    if (e != cudaSuccess) {
+        fprintf(stderr, "pulsar: gqa store launch failed: %s\n", cudaGetErrorString(e));
+        return -3;
+    }
+    return 0;
 }

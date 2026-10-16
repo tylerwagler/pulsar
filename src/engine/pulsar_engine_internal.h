@@ -744,6 +744,9 @@ typedef struct {
      *  the rank's plan replaces (a slice built at open, a routed stack's half, the other rank's experts).  Set
      *  by pulsar_tp_plan_build; NULL = nothing unstaged. */
     uint8_t *tp_unstaged;
+    /** L298: unloaded[i] marks tensor i as not part of what this engine serves -- a drafter the open did not select
+     *  (pulsar_role_binder_unload): never bound, never staged, never priced.  NULL = every tensor is served. */
+    uint8_t *unloaded;
     /** L272 P4b: the engine's TP plan (owned by the engine; tp_slice.cpp), for the forward's lookup of a built
      *  slice (pulsar_tp_built_ptr).  NULL on one GPU. */
     struct pulsar_tp_plan *tp_plan;

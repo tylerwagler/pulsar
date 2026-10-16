@@ -47,6 +47,8 @@ typedef struct {
     uint64_t bytes;              ///< their stored bytes (== directory_bytes after a clean close)
     uint64_t directory_bytes;    ///< every directory entry's stored bytes
     uint32_t roles;              ///< distinct roles bound
+    uint64_t unloaded;           ///< L298: entries declared unloaded (pulsar_role_binder_unload)
+    uint64_t unloaded_bytes;     ///< their stored bytes: never staged, never priced
 } pulsar_role_census;
 
 typedef struct pulsar_role_binder pulsar_role_binder;
@@ -59,6 +61,11 @@ pulsar_role_binder *pulsar_role_binder_open(const pulsar_model *m, const char *o
  *  `a`.  It is charged to its role.  NULL = refused (said, counted); a key bound twice is refused too. */
 pulsar_tensor *pulsar_role_bind(pulsar_role_binder *b, pulsar_role_key k, const pulsar_role_admit &a, uint32_t nd,
                                 uint64_t d0, uint64_t d1 = 0, uint64_t d2 = 0);
+
+/** L298: every entry of block `block` is DECLARED and NOT LOADED -- the open did not select what it serves (a drafter
+ *  the engine does not run): none is bound, staged (pulsar_model::unloaded) or priced, and the close accounts for its
+ *  bytes as unloaded, not as undeclared extras.  Returns the entries so marked. */
+uint64_t pulsar_role_binder_unload(pulsar_role_binder *b, const char *block);
 
 /** Close the binding: every entry not bound is refused (said, counted) -- the container holds a tensor the family
  *  did not declare.  Prints the price by role, fills `out`, frees `b`.  false = something was refused. */

@@ -113,13 +113,33 @@ pulsar_tensor *pulsar_role_bind(pulsar_role_binder *b, pulsar_role_key k, const 
     return t;
 }
 
+uint64_t pulsar_role_binder_unload(pulsar_role_binder *b, const char *block) {
+    pulsar_model *m = const_cast<pulsar_model *>(b->m);   /* the residency mark is the model's (staging reads it) */
+    const size_t bl = strlen(block);
+    uint64_t n = 0;
+    for (uint64_t i = 0; i < m->n_tensors; i++) {
+        const pulsar_tensor &t = m->tensors[i];
+        if (t.bind_block.len != bl || memcmp(t.bind_block.ptr, block, bl) != 0 || b->bound[i]) continue;
+        if (!m->unloaded) m->unloaded = (uint8_t *)xcalloc((size_t)m->n_tensors, 1);
+        m->unloaded[i] = 1;
+        b->bound[i] = 2;   /* declared, unloaded */
+        n++;
+    }
+    return n;
+}
+
 bool pulsar_role_binder_close(pulsar_role_binder *b, pulsar_role_census *out) {
     const pulsar_model *m = b->m;
-    pulsar_role_census c = {0, 0, 0, 0};
+    pulsar_role_census c = {0, 0, 0, 0, 0, 0};
     uint32_t extra = 0;
     for (uint64_t i = 0; i < m->n_tensors; i++) {
         const pulsar_tensor &t = m->tensors[i];
         c.directory_bytes += t.bytes;
+        if (b->bound[i] == 2) {
+            c.unloaded++;
+            c.unloaded_bytes += t.bytes;
+            continue;
+        }
         if (b->bound[i] || t.bind_role.len == 0) continue;   /* a roleless entry was refused at the open */
         fprintf(stderr, "pulsar: %s: tensor %.*s (%s) is in the container but the family declares no such tensor -- "
                         "refusing\n", b->owner, (int)t.name.len, t.name.ptr, describe(t).c_str());
@@ -135,11 +155,13 @@ bool pulsar_role_binder_close(pulsar_role_binder *b, pulsar_role_census *out) {
                 (double)kv.second.second / 1048576.0);
     }
     fprintf(stderr, "\n");
-    const bool whole = extra == 0 && c.tensors == m->n_tensors && c.bytes == c.directory_bytes;
-    fprintf(stderr, "pulsar: %s: %llu of %llu tensors bound in %u roles, %.3f GiB priced of the directory's %.3f GiB%s\n",
+    const bool whole = extra == 0 && c.tensors + c.unloaded == m->n_tensors &&
+                       c.bytes + c.unloaded_bytes == c.directory_bytes;
+    fprintf(stderr, "pulsar: %s: %llu of %llu tensors bound in %u roles, %.3f GiB priced of the directory's %.3f GiB "
+                    "(%llu tensors, %.3f GiB declared unloaded)%s\n",
             b->owner, (unsigned long long)c.tensors, (unsigned long long)m->n_tensors, c.roles,
-            (double)c.bytes / 1073741824.0, (double)c.directory_bytes / 1073741824.0,
-            whole ? " (every staged byte is a declared role's)" : " -- refusing");
+            (double)c.bytes / 1073741824.0, (double)c.directory_bytes / 1073741824.0, (unsigned long long)c.unloaded,
+            (double)c.unloaded_bytes / 1073741824.0, whole ? " (every staged byte is a declared role's)" : " -- refusing");
     if (out) *out = c;
     delete b;
     return whole;

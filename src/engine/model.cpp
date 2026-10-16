@@ -245,6 +245,7 @@ void model_close(pulsar_model *m) {
     free(m->kv);
     free(m->tensors);
     free(m->tp_unstaged);
+    free(m->unloaded);
     if (m->map && m->n_shards == 0) munmap((void *)m->map, (size_t)m->size);   /* with shards it aliases shard 0 */
     if (m->fd >= 0) close(m->fd);
     memset(m, 0, sizeof(*m));
@@ -462,6 +463,10 @@ static bool accelerator_span_filter_contains(uint64_t off,
 static bool model_tensor_unstaged(const pulsar_model *m, const pulsar_tensor *t) {
     return m->tp_n_ranks > 1 && m->tp_unstaged && m->tp_unstaged[t - m->tensors] != 0;
 }
+/* L298: a tensor the open did not select (a drafter the engine does not run) is never staged. */
+static bool model_tensor_unloaded(const pulsar_model *m, const pulsar_tensor *t) {
+    return m->unloaded && m->unloaded[t - m->tensors] != 0;
+}
 
 uint64_t pulsar_model_unstaged_expert_bytes(const pulsar_model *m) {
     if (!m || m->tp_n_ranks <= 1) return 0;
@@ -519,7 +524,7 @@ static bool accelerator_prepare_model_tensor_spans(const pulsar_model *m,
         }
         /* Under TP the stored routed-expert stacks are not staged (the
          * per-rank halves are built at open). */
-        if (model_tensor_unstaged(m, t)) continue;
+        if (model_tensor_unstaged(m, t) || model_tensor_unloaded(m, t)) continue;
         spans[nspan++] = (accelerator_tensor_span){
             .base = base,
             .map_size = map_size,
