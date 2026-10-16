@@ -399,8 +399,8 @@ pulsar_driver_state *create(pulsar_session *s, uint32_t n_banks) {
 
 void destroy(pulsar_session *s) { state_free(ST(s)); }
 
-/* the declared state's verify capture exists with the drafter (N9: the MTP module, when the session drafts) */
-bool verifies(const pulsar_session *s) { return W(s->engine)->drafting; }
+/* the declared state's verify capture exists with the drafter (N9: the MTP module; L298: the block drafter) */
+bool verifies(const pulsar_session *s) { return W(s->engine)->drafting || W(s->engine)->block; }
 
 pulsar_driver_step *trunk(pulsar_session *s) { return ST(s)->trunk; }
 
@@ -899,6 +899,8 @@ bool compose(const nh_step *st, uint32_t il, bool is_mamba, bool is_moe, const u
     if (!fn || pulsar_rows_add_launch(h, E, (const uint16_t *)(mbase + M.db), E, n, E, fn, s.rms_eps, is_moe ? xn : nout, E,
                                     0) != 0)
         return failf("the mixer's residual add refused", il);
+    /* L298: a block drafter's taps after this HF block (the trunk's steps only) */
+    if (!st->module && !pulsar_block_tap(q, il, PULSAR_BLOCK_TAP_MIXER, h, E, n)) return failf("the drafter tap refused", il);
     if (!is_moe) return true;
     dump_rows(st, "nemotron_mid", st->res, 0, E, il);
     /* the MoE's HF block */
@@ -909,8 +911,9 @@ bool compose(const nh_step *st, uint32_t il, bool is_mamba, bool is_moe, const u
     if (!moe(st, il, fo, fbase, F)) return false;
     if (!emit(fo, db, n, E)) return failf("the MoE bf16 emit refused", il);
     dump_rows(st, "nemotron_ffn", q->scratch[ARENA_FFN], F.db, E, il);
-    return pulsar_rows_add_launch(h, E, db, E, n, E, nn, s.rms_eps, nout, E, 0) == 0 ||
-           failf("the MoE's residual add refused", il);
+    if (pulsar_rows_add_launch(h, E, db, E, n, E, nn, s.rms_eps, nout, E, 0) != 0)
+        return failf("the MoE's residual add refused", il);
+    return st->module || pulsar_block_tap(q, il, PULSAR_BLOCK_TAP_FFN, h, E, n) || failf("the drafter tap refused", il);
 }
 
 /* block[PULSAR_LAYER_BLOCKS]: one layer as its description says; its pre-norm is the previous layer's last add's
@@ -1169,6 +1172,8 @@ void pulsar_nemotron_h_state_plan(pulsar_engine *e) {
         p->slot[p->n_slots++] = 1u << PULSAR_NEMOTRON_H_STATE_KV | 1u << PULSAR_NEMOTRON_H_STATE_MTP_PEND;
         p->drafter_at = pulsar_mtp_drafter_at;
         p->drafter_frontier = pulsar_mtp_drafter_frontier;
+    } else if (W(e)->block) {
+        pulsar_block_drafter_plan(e, p);   /* L298: the block drafter's context rings and anchor rows */
     }
     p->session = 0;
 }
@@ -1194,7 +1199,7 @@ const pulsar_driver_ops PULSAR_NEMOTRON_H_DRIVER = {
     /* .block         = */ {NULL, NULL, NULL, NULL, block},   /* by pulsar_layer_kind: BLOCKS */
     /* .head          = */ head,
     /* .step_end      = */ step_end,
-    /* .absorb        = */ pulsar_mtp_absorb,   /* N9: the chained-MTP lane's lockstep (nothing without a lane) */
+    /* .absorb        = */ pulsar_drafter_lane_absorb,   /* N9 / L298: the MTP or block lane's lockstep (none: nothing) */
     /* .mtp           = */ &k_mtp_ops,          /* N9: the MTP module (spec_mtp.h) */
     /* .rope          = */ NULL,   /* no positional encoding anywhere (NoPE) */
     /* .image_rows    = */ NULL,   /* images: N11 */

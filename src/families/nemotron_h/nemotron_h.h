@@ -44,6 +44,7 @@
 
 #include "engine/pulsar_engine_internal.h"
 #include "engine/role_bind.h"
+#include "engine/spec_block.h"
 
 #define PULSAR_NEMOTRON_H_ARCH "nemotron_h"
 /** The most HF blocks a container's layers_block_type may list (the full model has 88). */
@@ -87,6 +88,11 @@ typedef struct {
     uint64_t moe_layers;       ///< bit il: layer il has the MoE (else its mixer alone)
     uint32_t n_mtp;            ///< num_nextn_predict_layers (0 or 1: one {attention, MoE} module)
     bool mtp_written;          ///< pulsar.mtp_present: the container holds the drafter
+    bool block_written;        ///< L298 pulsar.drafter = "lilicorr": the container holds the LiLiCorr block drafter
+    /** L298: HF block b's place in the plan -- pulsar layer block_layer[b], its mixer (PULSAR_BLOCK_TAP_MIXER) or its
+     *  MoE (PULSAR_BLOCK_TAP_FFN): where a block drafter's tap after block b reads the residual */
+    uint8_t block_layer[PULSAR_NEMOTRON_H_MAX_BLOCKS];
+    uint8_t block_sub[PULSAR_NEMOTRON_H_MAX_BLOCKS];
 } pulsar_nemotron_h_shape;
 
 extern const pulsar_nemotron_h_shape PULSAR_NEMOTRON_H_SHAPE_SUPER;
@@ -150,9 +156,13 @@ typedef struct {
     pulsar_nemotron_h_draft mtp;
     /** What the binding priced (role_bind.h): every byte the core stages, by role. */
     pulsar_role_census census;
-    /** N9: the MTP module drafts (the container holds it and the open did not turn drafting off): the engine's
-     *  drafter is PULSAR_NEMOTRON_H_DRAFTER, the plan declares the drafter's slot, sessions verify. */
+    /** N9: the MTP module drafts (the container holds it and the open selected it): the engine's drafter is
+     *  PULSAR_NEMOTRON_H_DRAFTER, the plan declares the drafter's slot, sessions verify. */
     bool drafting;
+    /** L298: the LiLiCorr block drafter drafts instead (the container holds it and the open selected it): the
+     *  engine's drafter is the core's block drafter (spec_block.h) over this declaration and these weights; the
+     *  MTP module, if the container holds one, is declared unloaded. */
+    struct pulsar_block_drafter *block;
     /** The digest a session's disk segments are keyed by: the directory's names, types and sizes (FNV-1a). */
     uint64_t artifact_digest;
     /** The tokenizer (nemotron_h_tokenizer.cpp): F5's shared BPE engine in its HF configuration (the "tekken"

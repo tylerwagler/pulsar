@@ -451,6 +451,8 @@ static server_config parse_options(int argc, char **argv) {
             defaulted_model_path = false;
         } else if (!strcmp(arg, "--no-dspark")) {
             c.engine.dspark_disable = true;
+        } else if (!strcmp(arg, "--drafter")) {
+            c.engine.drafter = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--spec-depth")) {
             c.engine.spec_depth = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--spec-tau")) {

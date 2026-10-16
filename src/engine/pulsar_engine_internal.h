@@ -1988,6 +1988,9 @@ struct pulsar_engine {
     bool gpu_ready;             ///< CUDA backend initialised and weights resident
     bool dspark_ready;          ///< a usable drafter is loaded; false disables speculation
     const struct pulsar_drafter_ops *drafter_ops;   ///< L272 P1: the loaded drafter behind the round API (spec_ops.h), or NULL = none
+    /** L298: the loaded block drafter (spec_block.h: its declaration, tap points, weights, state ids), or NULL -- set
+     *  by the family's load when the container holds one and the open selects it; the family's unload frees it. */
+    struct pulsar_block_drafter *block_drafter;
     bool dspark_external;       ///< drafter came from its OWN GGUF (separate map/fd), not the target's
     pulsar_vision_weights vision_weights;  ///< resolved ViT tower/aligner tensors (Vision-Exp artifacts)
     bool vision_ready;          ///< the artifact carries a bound, layout-validated vision tower
