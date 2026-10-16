@@ -164,8 +164,10 @@ class out_parser {
 public:
     out_parser() = default;
     virtual ~out_parser() = default;
-    out_parser(const out_parser &) = delete;              ///< it points at its configuration's body
-    out_parser &operator=(const out_parser &) = delete;
+    out_parser &operator=(const out_parser &) = delete;   ///< it points at its configuration's body
+    /** L296: a copy of the reading so far -- its own body in the same state, the same grammar -- for a scratch
+     *  probe that reads ahead without touching this one (the server's per-position tool-call override). */
+    virtual out_parser *clone() const = 0;
     /** `g` and `body` outlive the parser; `initial` is the state the prompt left the turn in.  Resets every
      *  reading: one init per turn. */
     void init(const out_grammar *g, out_call_body *body, out_state initial);
@@ -186,6 +188,11 @@ public:
      * the end of the last call that closed (a malformed one among them included -- these are the bytes the
      * live KV holds).  false until a call was read. */
     bool raw_span(size_t *lo, size_t *hi) const;
+
+protected:
+    /** A configuration's clone: the base's reading copied, then pointed at the copy's own body. */
+    out_parser(const out_parser &) = default;
+    void rebind_body(out_call_body *body) { body_ = body; }
 
 private:
     struct section {           /* one reported text stream */

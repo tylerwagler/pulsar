@@ -2785,7 +2785,17 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n, int quantum_
             memset(st, 0, sizeof(*st));
             st->bank = (uint32_t)sl->bank;
             st->round = rounds[live_idx[q]];
-            gen_resolve_sampling_decode(g, &st->temperature, &st->top_k, &st->top_p, &st->min_p);
+            /* L296 toolsample: the request's params, and the tool-call override at each of the round's positions
+             * (row i: the token after the base and drafts 0..i-1) as the plain lane resolves it token by token --
+             * one resolution for the round drew a crossing's first payload tokens greedy.  The round's tokens are
+             * its rows' (reqs, laid by the assemble); a base streamed before the forward is in g->text already. */
+            gen_resolve_sampling(&g->j->req, &st->temperature, &st->top_k, &st->top_p, &st->min_p);
+            {
+                int toks[PULSAR_SPEC_LOGITS_ROWS];
+                int nt = 0;
+                for (int i = base_sent[q] ? 1 : 0; i < row_nb[q]; i++) toks[nt++] = reqs[row0s[q] + (uint32_t)i].token;
+                st->greedy_rows = gen_spec_greedy_rows(s, g, toks, nt, base_sent[q]);
+            }
             st->rng = &g->rng;
             st->first_token = first_tok[q];
             st->row0 = row0s[q];

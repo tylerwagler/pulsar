@@ -445,3 +445,9 @@ const out_grammar &inkling_output_grammar(void) {
 }
 
 void inkling_output_parser::init(out_state initial) { out_parser::init(&inkling_output_grammar(), &body_, initial); }
+
+out_parser *inkling_output_parser::clone() const {
+    inkling_output_parser *p = new inkling_output_parser(*this);
+    p->rebind_body(&p->body_);
+    return p;
+}

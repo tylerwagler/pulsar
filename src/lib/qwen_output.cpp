@@ -37,6 +37,12 @@ bool qwen_output_parser::init(bool thinking, const char *tools_json, char *err, 
     return true;
 }
 
+out_parser *qwen_output_parser::clone() const {
+    qwen_output_parser *p = new qwen_output_parser(*this);
+    p->rebind_body(&p->body_);
+    return p;
+}
+
 void qwen_xml_call_body::open() {
     began_ = false;
     fn_.clear();

@@ -963,6 +963,12 @@ typedef struct {
     int k_alloc;             /* assemble: drafts allocated under overflow; -1 = no allocation */
     int accepted_cap;        /* assemble: round_begin's cap; round_end: accepted[] capacity */
     int *accepted;           /* round_end: this bank's accepted tokens */
+    /* round_end (L296): bit i set = verify row i -- the token after the base and drafts 0..i-1; row K is a full
+     * accept's carry -- draws greedy whatever `temperature` says.  The caller's sampling authority evaluated at
+     * each position of the round (the server's tool-call override: a call's structure greedy, its payload sampled),
+     * so a round that crosses between the two draws every token as one-token-a-step decoding would.  The carry and
+     * the next chain record the carry row's params.  0 = `temperature` at every row. */
+    uint32_t greedy_rows;
     /* assemble out, round_end in */
     int first_token;
     uint32_t row0;           /* the bank's first row in the shared forward */

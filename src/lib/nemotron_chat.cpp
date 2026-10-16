@@ -639,3 +639,9 @@ bool nemotron_output_parser::init(bool thinking, const char *tools_json, char *e
     out_parser::init(&nemotron_output_grammar(), &body_, thinking ? OUT_REASONING : OUT_CONTENT);
     return true;
 }
+
+out_parser *nemotron_output_parser::clone() const {
+    nemotron_output_parser *p = new nemotron_output_parser(*this);
+    p->rebind_body(&p->body_);
+    return p;
+}
