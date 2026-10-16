@@ -195,6 +195,7 @@ tests/sse-golden/out.txt
 /tests/inkling_family_gate
 /tests/nemotron_family_gate
 /tests/nemotron_fwd_gate
+/tests/mtp_spec_gate
 /tests/prefill_chunk_census_probe
 /tests/vision_merge_gate
 /tests/vision_tower_gate

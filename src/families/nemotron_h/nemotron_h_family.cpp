@@ -50,6 +50,9 @@ bool load(pulsar_engine *e, const pulsar_engine_options *opt) {
     }
     /* stage 4: the tokenizer beside the shards */
     if (!pulsar_nemotron_h_load_tokenizer(w, opt->model_path)) return false;
+    /* N9: the MTP module drafts unless the open turned drafting off (the option every family's drafter honours) */
+    w->drafting = w->shape.mtp_written && !opt->dspark_disable;
+    e->drafter_ops = w->drafting ? &PULSAR_NEMOTRON_H_DRAFTER : NULL;
     /* the session's declared state (N3, F3) and the digest its disk segments are keyed by: the directory's names,
      * types and sizes */
     pulsar_nemotron_h_state_plan(e);
@@ -75,7 +78,9 @@ bool load(pulsar_engine *e, const pulsar_engine_options *opt) {
     fprintf(stderr, "pulsar: %s: %s, %u blocks -> %u layers: %u Mamba-2 + %u attention mixers, %u MoE (%u of %u experts "
                     "on a %u latent + 1 shared) + %u mixer-only; drafter %s; vision not in the container (v1)\n",
             ARCH, s->name, s->n_blocks, s->n_layer, n_mamba, s->n_layer - n_mamba, n_moe, s->n_expert_used, s->n_expert,
-            s->latent, s->n_layer - n_moe, s->mtp_written ? "bound (MTP; drafting is N9's)" : "not in the container");
+            s->latent, s->n_layer - n_moe,
+            w->drafting ? "the MTP module (the chained-MTP drafter)"
+                        : s->mtp_written ? "bound, drafting off" : "not in the container");
     return true;
 }
 
@@ -106,8 +111,8 @@ pulsar_chat_format chat_format(const pulsar_engine *) { return PULSAR_CHAT_NEMOT
 int model_id(const pulsar_engine *) { return 4; }
 /* no positional encoding: the attention layers are trained to max_position_embeddings; the Mamba state is O(1) */
 uint64_t trained_context(const pulsar_engine *e) { return model_of(e)->shape.max_context; }
-/* the MTP module is bound when written, but no drafter runs on it until N9 (F6's chained MTP) */
-pulsar_drafter_kind drafter(pulsar_engine *) { return PULSAR_DRAFTER_NONE; }
+/* N9: the MTP module drafts (the chained-MTP drafter, spec_mtp.h) when the container holds it */
+pulsar_drafter_kind drafter(pulsar_engine *e) { return model_of(e)->drafting ? PULSAR_DRAFTER_MTP : PULSAR_DRAFTER_NONE; }
 /* the routed experts' tier in EXL3's value space (family.h quant_bits): 20 + the highest rate in half bits, 0 when
  * they are not EXL3 (BF16 today) */
 int quant_bits(pulsar_engine *e) {
@@ -133,9 +138,10 @@ const pulsar_family PULSAR_FAMILY_NEMOTRON_H = {
     /* .arch         = */ PULSAR_NEMOTRON_H_ARCH,
     /* .name         = */ "Nemotron-H",
     /* .caps         = */ PULSAR_FAMILY_CAP_CHAT | PULSAR_FAMILY_CAP_BANKS | PULSAR_FAMILY_CAP_SEGMENTS |
-                          PULSAR_FAMILY_CAP_PAYLOAD,
+                          PULSAR_FAMILY_CAP_PAYLOAD | PULSAR_FAMILY_CAP_SPEC,
                           /* the tokenizer + chat front (N8); the driver's session ops over the declared state (N3,
-                           * N7); then SPEC (N9), TP (N12), VISION (N11) */
+                           * N7); SPEC: the driver's verify target under the MTP drafter (N9); then TP (N12), VISION
+                           * (N11) */
     /* .load         = */ load,
     /* .after_gpu    = */ after_gpu,
     /* .logits_width = */ logits_width,
@@ -147,7 +153,7 @@ const pulsar_family PULSAR_FAMILY_NEMOTRON_H = {
     /* .tp_shape     = */ NULL,   /* no CAP_TP: the open refuses tensor parallelism before it would ask */
     /* .drafter      = */ drafter,
     /* .quant_bits   = */ quant_bits,
-    /* .spec         = */ NULL,
+    /* .spec         = */ &PULSAR_DRIVER_SPEC_TARGET,   /* N9: the core driver's verify target (step_driver.cpp) */
     /* .session      = */ &k_session_ops,
     /* .tokenizer    = */ &PULSAR_NEMOTRON_H_TOKENIZER,   /* nemotron_h_tokenizer.cpp (F5's BPE engine + renderer) */
     /* .tp_slices    = */ NULL,

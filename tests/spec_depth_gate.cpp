@@ -52,7 +52,7 @@ int main() {
         pulsar_spec_depth_state s2{false, 10, 0};
         CHECK(pulsar_spec_depth_next(&ds, &s2, 2, 2, 0, lo) == 2, "clamped at min 2");
     }
-    {   /* L288: the MTP policy (spec_qwen.cpp k_mtp_depth, 4..7, up_slack 1): a chain that converts all its depth but one
+    {   /* L288: the MTP policy (family_qwen.cpp k_mtp_depth, 4..7, up_slack 1): a chain that converts all its depth but one
          * draft climbs, one that converts every draft too, less than half backs off; DSpark (up_slack 0) needs the whole */
         const pulsar_spec_depth_policy mtp = {4, 7, 0.0f, 0, 0.0f, 0u, 0u, 1u};
         pulsar_spec_depth_state st{false, 10, 0};

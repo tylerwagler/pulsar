@@ -125,7 +125,7 @@ typedef enum {
 typedef enum {
     PULSAR_DRAFTER_NONE   = 0,
     PULSAR_DRAFTER_DSPARK = 1,  ///< DeepSeek's DSpark (merged `dspark.*` tensors)
-    PULSAR_DRAFTER_MTP    = 2,  ///< Qwen's multi-token-prediction block (`mtp.*`)
+    PULSAR_DRAFTER_MTP    = 2,  ///< the artifact's multi-token-prediction module(s) (Qwen's `mtp.*`, Nemotron-H's MTP module)
 } pulsar_drafter_kind;
 
 typedef void (*pulsar_session_progress_fn)(void *ud, const char *event, int current, int total);

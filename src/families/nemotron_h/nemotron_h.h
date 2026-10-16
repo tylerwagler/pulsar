@@ -20,7 +20,10 @@
  * nemotron_h_forward.cpp): the family's ops on the core row-step driver -- block[PULSAR_LAYER_BLOCKS] composes each
  * layer from its pulsar_layer_desc over shared blocks (the Mamba-2 block N2, F1 attention, F2's router with the
  * 512 / 22 instance, the rows MoE front door's latent wrapper and relu^2 option N4, E5's head), and the declared
- * state (N3: SSM FIXED / DELTA, conv FIXED / SNAPSHOT, attention KV POOL; the drafter slot's KV POOL).
+ * state (N3: SSM FIXED / DELTA, conv FIXED / SNAPSHOT, attention KV POOL; the drafter slot's KV POOL and parked row).
+ * THE DRAFTER (N9): the MTP module declared to the core's chained-MTP drafter (src/engine/spec_mtp.h) -- the family
+ * says what one module step is (eh_proj over [enorm(embed) | hnorm(norm_f(h))], its {attention, MoE} on the drafter
+ * slot, final_layernorm, the target's head); the lane drafts it recursively, the driver's verify target verifies.
  *
  * FORMAT-NEUTRAL: every linear (Mamba in / out, attention, the latent projections, the shared expert, the drafter's
  * eh_proj, the head) is admitted through the format registry at bf16 rows -- BF16 today, an EXL3 dense-arm rate or
@@ -147,6 +150,9 @@ typedef struct {
     pulsar_nemotron_h_draft mtp;
     /** What the binding priced (role_bind.h): every byte the core stages, by role. */
     pulsar_role_census census;
+    /** N9: the MTP module drafts (the container holds it and the open did not turn drafting off): the engine's
+     *  drafter is PULSAR_NEMOTRON_H_DRAFTER, the plan declares the drafter's slot, sessions verify. */
+    bool drafting;
     /** The digest a session's disk segments are keyed by: the directory's names, types and sizes (FNV-1a). */
     uint64_t artifact_digest;
     /** The tokenizer (nemotron_h_tokenizer.cpp): F5's shared BPE engine in its HF configuration (the "tekken"
@@ -180,6 +186,9 @@ enum pulsar_nemotron_h_state_id {
     PULSAR_NEMOTRON_H_STATE_SSM = 0,   ///< FIXED, DELTA: the selective-scan state f32 [heads][head_dim][d_state]
     PULSAR_NEMOTRON_H_STATE_CONV,      ///< FIXED, SNAPSHOT: the x | B | C convolution's tail bf16 [conv_k - 1][channels]
     PULSAR_NEMOTRON_H_STATE_KV,        ///< POOL, one token a row: an attention layer's K | V rows (F1's BF16 rows)
+    /** FIXED, no capture, on the drafter's slot (N9): a bank's parked conditioning row -- norm_f of the trunk's last
+     *  row, bf16 [n_embd] -- until the token after it arrives (spec_mtp.h, the chained-MTP lane) */
+    PULSAR_NEMOTRON_H_STATE_MTP_PEND,
     PULSAR_NEMOTRON_H_STATE_COUNT
 };
 
@@ -187,7 +196,9 @@ enum pulsar_nemotron_h_state_id {
 void pulsar_nemotron_h_state_plan(pulsar_engine *e);
 
 /** The family's ops on the core row-step driver (step_driver.h): block[PULSAR_LAYER_BLOCKS] composes each layer
- *  from its pulsar_layer_desc. */
+ *  from its pulsar_layer_desc; its MTP module is declared to the chained-MTP lane (spec_mtp.h). */
 extern const pulsar_driver_ops PULSAR_NEMOTRON_H_DRIVER;
+/** N9: the drafter -- the chained-MTP drafter (spec_mtp.h) at the card's numbers. */
+extern const struct pulsar_drafter_ops PULSAR_NEMOTRON_H_DRAFTER;
 
 #endif /* PULSAR_FAMILY_NEMOTRON_H_H */

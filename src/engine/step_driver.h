@@ -57,6 +57,8 @@ pulsar_driver_heads pulsar_driver_heads_span(uint32_t row0, uint32_t n);
 struct pulsar_state_set;
 struct pulsar_imatrix_tap;
 struct pulsar_tp;
+struct pulsar_mtp_ops;
+struct pulsar_mtp_lane;
 
 /** The core's per-session driver buffers.  A family's session state EXTENDS it (C++ derivation; the family's
  *  create allocates the derived object, the driver fills this part). */
@@ -77,6 +79,8 @@ struct pulsar_driver_state {
     uint64_t tp_seq;
     pulsar_gpu_tensor *tp_vocab_own;
     uint64_t tp_vocab_seq;
+    /** L296 N9: the chained-MTP drafter's lane (spec_mtp.h) when the family's ops declare modules, else NULL */
+    struct pulsar_mtp_lane *mtp;
 };
 
 /** Everything an op needs for one step: the core's part.  A family's step EXTENDS it with what its ops read of
@@ -157,9 +161,13 @@ typedef struct pulsar_driver_ops {
     bool (*step_end)(const pulsar_driver_step *st, bool ok);
     /** After a trunk step over rows (tokens, pos, bank) -- step rows [row0, row0 + n) -- the drafter lane's lockstep:
      *  every row whose next token is now known gets its drafter row (PREFILL: one bank's run; DECODE: one row a bank).
-     *  `eval`: the session's single-row eval (a family's diagnostics may head it).  NULL = no drafter lane. */
+     *  `eval`: the session's single-row eval (a family's diagnostics may head it).  NULL = no drafter lane; a family
+     *  that drafts with its MTP modules sets the chained-MTP lane's (spec_mtp.h pulsar_mtp_absorb). */
     bool (*absorb)(pulsar_session *s, pulsar_step_mode mode, const int32_t *tokens, const int32_t *pos,
                    const int32_t *bank, uint32_t n, uint32_t row0, bool eval);
+    /** L296 N9: the family's MTP module declaration (spec_mtp.h), or NULL = none.  When it declares modules the
+     *  driver builds the chained-MTP drafter's lane (pulsar_driver_state::mtp) before the declared state. */
+    const struct pulsar_mtp_ops *mtp;
     /** Optional (L268): the step's multi-axis rope positions into *out, or NULL = text positions. */
     const uint32_t *(*rope)(const pulsar_session *s, const int32_t *pos, const int32_t *bank, uint32_t n,
                             std::vector<uint32_t> *out);
