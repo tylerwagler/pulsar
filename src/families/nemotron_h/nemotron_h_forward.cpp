@@ -707,7 +707,7 @@ bool moe(const nh_step *st, uint32_t il, float *fo, uint8_t *base, const ffn_scr
     /* L296 dec2: a decode step runs the router and the routed experts on the priority stream (rs) while its shared
      * expert's ys runs here; the join comes before the shared add.  A step with prompt rows runs them in turn. */
     const bool split = st->n_dec == n;
-    cudaStream_t rs = NULL;
+    pulsar_rows_stream rs = NULL;
     if (split) {
         pulsar_rows_moe_shared q;
         if (!shared_q(false, q) || !(rs = pulsar_rows_moe_routed_fork(NULL)) ||

@@ -583,7 +583,7 @@ routed_lane *routed_lane_for(cudaStream_t caller) {
 
 } // namespace
 
-extern "C" cudaStream_t pulsar_rows_moe_routed_fork(cudaStream_t caller) {
+extern "C" pulsar_rows_stream pulsar_rows_moe_routed_fork(cudaStream_t caller) {
     routed_lane *lane = routed_lane_for(caller);
     if (!lane || lane->pending) {
         fprintf(stderr, "pulsar: MoE routed fork: no priority stream, or a fork already pending on it -- refusing\n");

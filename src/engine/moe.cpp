@@ -110,6 +110,9 @@ bool pulsar_moe_routed_slot(const pulsar_moe_slot_call *c) {
                                               c->layer, c->n_tokens, split) != 0;
 }
 
+/* the call's launch stream (L296 dec2) */
+static pulsar_rows_stream rows_stream(const pulsar_moe_rows_call *c) { return (pulsar_rows_stream)c->stream; }
+
 /* L296 N4: the latent wrapper -- x_lat = bf16(latent_in x); the routed experts on x_lat into lat_f (f32, the block's
  * routed sum on the latent); out = latent_out(bf16(lat_f)).  The two bf16 roundings are the producers' (rule 3): the
  * routed experts read bf16 rows (the latent projection emits them, L296 dec2: the front door's bf16 outputs, lat_f
@@ -131,7 +134,7 @@ static bool latent_rows(const pulsar_moe_rows_call *c) {
     float *stage[1] = {c->lat_f};
     uint16_t *lat_x[1] = {c->lat_x};
     if (pulsar_rows_linear_multi_bf16_launch(fc1p, 1, c->x_bf16, n, stage, lat_x, c->lat_ws, c->lat_ws_bytes,
-                                             c->stream) != 0) {
+                                             rows_stream(c)) != 0) {
         fprintf(stderr, "pulsar: routed MoE: the latent projection %d -> %d refused\n", H, L);
         return false;
     }
@@ -141,8 +144,8 @@ static bool latent_rows(const pulsar_moe_rows_call *c) {
     r.out = c->lat_f;   /* the routed sum on the latent (the fc1 output is consumed: lat_x holds its bf16 rows) */
     if (!pulsar_moe_routed_rows(&r)) return false;
     if (pulsar_rows_emit_bf16_launch(c->lat_f, (uint64_t)L, (uint32_t)n, (uint32_t)L, NULL, PULSAR_ROWS_SCALE_NONE,
-                                     c->lat_y, (uint64_t)L, c->stream) != 0 ||
-        pulsar_rows_linear_launch(&fc2, c->lat_y, n, c->out, c->lat_ws, c->lat_ws_bytes, c->stream) != 0) {
+                                     c->lat_y, (uint64_t)L, rows_stream(c)) != 0 ||
+        pulsar_rows_linear_launch(&fc2, c->lat_y, n, c->out, c->lat_ws, c->lat_ws_bytes, rows_stream(c)) != 0) {
         fprintf(stderr, "pulsar: routed MoE: the latent back projection %d -> %d refused\n", L, H);
         return false;
     }
@@ -170,7 +173,7 @@ bool pulsar_moe_routed_rows(const pulsar_moe_rows_call *c) {
         w.shared = c->shared;   /* the launcher refuses them: only the EXL3 front door carries shared experts */
         w.n_shared = c->n_shared;
         return pulsar_rows_moe_routed_launch(&w, c->selected, c->weights, c->x_bf16, c->n_rows, c->out, c->ws,
-                                             c->ws_bytes, c->nf_flag, c->nf_code, c->stream) == 0;
+                                             c->ws_bytes, c->nf_flag, c->nf_code, rows_stream(c)) == 0;
     }
     const pulsar_tensor *G = c->gate, *U = c->up, *D = c->down;
     /* L295 F7 / L296: a non-gated activation (RELU2) reads up-only experts (no gate stack): the BF16 arm or EXL3's
@@ -237,7 +240,7 @@ bool pulsar_moe_routed_rows(const pulsar_moe_rows_call *c) {
         w.bf16_down = stack(D, "routed experts down", &s, &r);
         if ((G && !w.bf16_gate) || !w.bf16_up || !w.bf16_down) return false;
         return pulsar_rows_moe_routed_launch(&w, c->selected, c->weights, c->x_bf16, c->n_rows, c->out, c->ws,
-                                             c->ws_bytes, c->nf_flag, c->nf_code, c->stream) == 0;
+                                             c->ws_bytes, c->nf_flag, c->nf_code, rows_stream(c)) == 0;
     }
     /* one stack's table over the rank's experts: [trellis, scales] pointer pairs (exl3_expert_layout) */
     auto table = [&](const pulsar_tensor *t, const char *what) -> const void *const * {
@@ -259,5 +262,5 @@ bool pulsar_moe_routed_rows(const pulsar_moe_rows_call *c) {
     w.down_table = table(D, "routed experts down");
     if (!w.down_table) return false;
     return pulsar_rows_moe_routed_launch(&w, c->selected, c->weights, c->x_bf16, c->n_rows, c->out, c->ws, c->ws_bytes,
-                                         c->nf_flag, c->nf_code, c->stream) == 0;
+                                         c->nf_flag, c->nf_code, rows_stream(c)) == 0;
 }

@@ -286,7 +286,8 @@ int pulsar_rows_moe_shared_add_launch(const pulsar_rows_moe_shared *q, int T, fl
  *  pulsar_rows_moe_routed_join makes `caller` wait for the routed chain before the shared add.  The routed chain is
  *  latency-bound small launches between bandwidth-bound ones; at equal priority the shared expert's CTAs, queued
  *  first, held them back (a 6 us select waited 46 us).  0 on success. */
-cudaStream_t pulsar_rows_moe_routed_fork(cudaStream_t caller);
+typedef cudaStream_t pulsar_rows_stream;   /**< a launch stream, opaque to the engine (NULL: the per-thread default) */
+pulsar_rows_stream pulsar_rows_moe_routed_fork(cudaStream_t caller);
 int pulsar_rows_moe_routed_join(cudaStream_t caller);
 typedef struct pulsar_rows_moe {
     const void *const *gate_up_table;   /**< exl3_expert_table pairs, the fused form, or NULL */
