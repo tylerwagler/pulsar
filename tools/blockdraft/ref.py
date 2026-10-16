@@ -247,9 +247,12 @@ def read_dump(d):
             rec["bank"] = np.frombuffer(f.read(4 * nb), dtype=np.int32)
             rec["carry"] = np.frombuffer(f.read(4 * nb), dtype=np.int32)
             rec["P"] = np.frombuffer(f.read(4 * nb), dtype=np.int32)
+            S = B - 1
             rec["o"] = np.frombuffer(f.read(2 * nb * B * E), dtype=np.uint16).reshape(nb * B, E)
-            rec["ids"] = np.frombuffer(f.read(4 * nb * B * k), dtype=np.int32).reshape(nb * B, k)
-            rec["lp"] = np.frombuffer(f.read(4 * nb * B * k), dtype=np.float32).reshape(nb * B, k)
+            rec["ids"] = np.frombuffer(f.read(4 * nb * S * k), dtype=np.int32).reshape(nb, S, k)
+            rec["lp"] = np.frombuffer(f.read(4 * nb * S * k), dtype=np.float32).reshape(nb, S, k)
+            rec["scores"] = np.frombuffer(f.read(4 * nb * S * k * k), dtype=np.float32).reshape(nb, S, k, k)
+            rec["chain"] = np.frombuffer(f.read(4 * nb * S), dtype=np.int32).reshape(nb, S)
             passes.append(rec)
     return ctx, passes
 
@@ -278,12 +281,13 @@ def dump(D, d, rounds):
             _inter, o, lp = D.forward(cn, torch.arange(lo, P, device=D.dev), P, carry)
             eo = u16(ps["o"][bi * B:(bi + 1) * B], D.dev)
             cos = torch.nn.functional.cosine_similarity(o.float(), eo.float(), dim=-1)
-            ids = torch.from_numpy(ps["ids"][bi * B + 1:(bi + 1) * B].copy()).to(D.dev)
-            elp = torch.from_numpy(ps["lp"][bi * B + 1:(bi + 1) * B].copy()).to(D.dev)
+            ids = torch.from_numpy(ps["ids"][bi].copy()).to(D.dev)
+            elp = torch.from_numpy(ps["lp"][bi].copy()).to(D.dev)
             ti, top1, ovl, dlp = topk_report(lp[1:], ids, elp, ps["k"])
             print(f"pass {pi} bank {b} P {P} carry {carry}: final hidden rel {rel(eo, o):.4f} cos min "
                   f"{cos.min().item():.5f}; slots top-1 agree {top1:.2f}, top-{ps['k']} overlap {ovl:.2f}, top-1 lp "
-                  f"max|d| {dlp:.4f}; ref {ti[:, 0].tolist()} engine {ids[:, 0].tolist()}", flush=True)
+                  f"max|d| {dlp:.4f}; ref top-1 {ti[:, 0].tolist()} engine top-1 {ids[:, 0].tolist()} engine chain "
+                  f"{ps['chain'][bi].tolist()}", flush=True)
 
 
 def main():

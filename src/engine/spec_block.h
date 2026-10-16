@@ -23,9 +23,10 @@
  *             the sublayer's input (kernel_projection: hidden -> 2 sides x taps x groups).  Then o = rmsnorm(h) *
  *             norm, the drafter's own lm_head over rows 1 .. block - 1, and per slot the top-k ids with their
  *             log-softmax values.
- *   chain     slot j's draft is its top-1 (greedy) or a draw from its row's distribution under the request's
- *             params at the draft's key (sampled); the LiLiCorr head (its candidate lattice and path selector) is
- *             the next stage and replaces this pick.
+ *   chain     the LiLiCorr candidate head (pulsar_cuda_lilicorr.h): the slots' top-8 candidates re-scored jointly
+ *             with the anchor (cn of the last committed position), then a walk over the transition scores -- the
+ *             head's own greedy walk (greedy), or slot by slot a draw from the realized row's candidates under the
+ *             request's params at the draft's key (sampled: vLLM's candidate sampler's proposal).
  *
  * THE ARMS (rule 8, Tyler 2026-10-16 "cutlass / cublaslt / b12x before our own kernels"): every Linear through the
  * rows front door (pulsar_linear_rows_ref: BF16 rows kernel / cuBLASLt for prompt rows, NVFP4 W4A16 rows kernel for
@@ -57,6 +58,21 @@ typedef struct {
     pulsar_tensor *gate, *up, *down;                 ///< hidden -> ff, ff -> hidden
 } pulsar_block_layer;
 
+/** The LiLiCorr candidate head's tensors (bind block `lilicorr`; lattice layer i = layer i), one per field of
+ *  pulsar_lilicorr_head (src/cuda/pulsar_cuda_lilicorr.h).  `_b` = the Linear's bias. */
+typedef struct {
+    pulsar_tensor *token_proj, *token_proj_b, *pass_proj, *pass_proj_b, *context_proj, *context_proj_b;
+    pulsar_tensor *feature_norm_w, *feature_norm_b, *feature_up_w, *feature_up_b, *feature_down, *feature_down_b;
+    pulsar_tensor *slot_embedding, *rank_embedding, *relative_slot_bias, *same_slot_bias;
+    pulsar_tensor *output_norm, *anchor_norm, *factor_in, *factor_in_b;
+    pulsar_tensor *out_head, *out_head_b, *in_head, *in_head_b, *anchor_out_head, *anchor_out_head_b;
+    struct {
+        pulsar_tensor *attn_norm, *attn_in, *attn_in_b, *attn_out, *attn_out_b;
+        pulsar_tensor *mlp_norm, *mlp_up, *mlp_up_b, *mlp_down, *mlp_down_b;
+    } layer[2];
+    float vector_eps, logit_scale;
+} pulsar_block_head;
+
 /** The loaded block drafter (pulsar_engine::block_drafter): its declaration, the family's tap points, its weights,
  *  its state ids. */
 typedef struct pulsar_block_drafter {
@@ -80,6 +96,7 @@ typedef struct pulsar_block_drafter {
     pulsar_tensor *out_norm;     ///< the final norm
     pulsar_tensor *head;         ///< hidden -> vocab (the drafter's own lm_head)
     pulsar_block_layer layer[PULSAR_BLOCK_MAX_LAYERS];
+    pulsar_block_head head_lc;   ///< the LiLiCorr candidate head (bind block `lilicorr`)
     const pulsar_tensor *embed;  ///< the TARGET's input embedding, bf16 [vocab rows of hidden] (the family's)
     /* the state plan's ids (pulsar_block_drafter_plan) */
     uint32_t decl_kv, decl_anchor;
@@ -91,8 +108,8 @@ typedef struct pulsar_block_drafter {
 /** Read the declaration from the container's lilicorr.* keys and check every number the blocks implement.  false =
  *  refused (said, counted: pulsar_load_refuse). */
 bool pulsar_block_drafter_read(const pulsar_model *m, pulsar_block_drafter *d);
-/** Bind block `drafter`'s tensors through the role binder (its linears admitted by the format registry at bf16
- *  rows).  The candidate head (block `lilicorr`) is not run yet: the caller unloads it.  false = refused. */
+/** Bind block `drafter`'s tensors and the candidate head's (block `lilicorr`) through the role binder (the linears
+ *  admitted by the format registry at bf16 rows).  false = refused. */
 bool pulsar_block_drafter_bind(pulsar_role_binder *b, pulsar_block_drafter *d);
 /** Declare the drafter's state in the family's plan (after the trunk's slots): a RING of K | V rows per drafter layer
  *  (the context; window `window`) and, on the first drafter slot, each bank's anchor row (FIXED: cn of the last

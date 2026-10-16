@@ -7,6 +7,7 @@
 #include "cuda/pulsar_cuda_attn_gqa.h"
 #include "cuda/pulsar_cuda_blockdraft.h"
 #include "cuda/pulsar_cuda_head.h"
+#include "cuda/pulsar_cuda_lilicorr.h"
 #include "cuda/pulsar_cuda_qwen.h"     /* the rows front door (pulsar_rows_linear_*) */
 #include "cuda/pulsar_cuda_rowops.h"
 
@@ -123,6 +124,22 @@ bool pulsar_block_drafter_read(const pulsar_model *m, pulsar_block_drafter *d) {
                       : d->mask_id < 0 || (uint32_t)d->mask_id >= d->vocab ? "a mask token inside the vocabulary"
                                                                            : NULL;
     if (why) return refuse("the declaration (lilicorr.*) is outside what the blocks implement: %s%s", why);
+    /* the candidate head: the kernel's one geometry (pulsar_cuda_lilicorr.h) */
+    uint32_t lh = 0, ll = 0, lnh = 0, lf = 0;
+    float ratio = 0.f;
+    ok = get_u32(m, "lilicorr.dflash.lilicorr_hidden_size", &lh);
+    ok = get_u32(m, "lilicorr.dflash.lilicorr_num_layers", &ll) && ok;
+    ok = get_u32(m, "lilicorr.dflash.lilicorr_num_heads", &lnh) && ok;
+    ok = get_u32(m, "lilicorr.dflash.lilicorr_factor_dim", &lf) && ok;
+    ok = get_f32(m, "lilicorr.dflash.lilicorr_mlp_ratio", &ratio) && ok;
+    ok = get_f32(m, "lilicorr.dflash.lilicorr_vector_eps", &d->head_lc.vector_eps) && ok;
+    ok = get_f32(m, "lilicorr.dflash.lilicorr_logit_scale", &d->head_lc.logit_scale) && ok;
+    if (!ok) return false;
+    if (lh != PULSAR_LILICORR_HIDDEN || ll != PULSAR_LILICORR_LAYERS || lnh != PULSAR_LILICORR_HEADS ||
+        lf != PULSAR_LILICORR_HIDDEN || ratio != 2.0f || d->topk != PULSAR_LILICORR_TOPK ||
+        d->block != PULSAR_LILICORR_SLOTS + 1u || d->hidden != PULSAR_LILICORR_MODEL)
+        return refuse("the candidate head's geometry (lilicorr.dflash.lilicorr_*) is not the head kernel's (1024 wide, 2 "
+                      "layers x 8 heads, factor 1024, mlp x2, 8 candidates at 7 slots over a 4096 drafter)%s");
     d->ops = PULSAR_BLOCK_DRAFTER_OPS;
     d->ops.depth = d->ops.depth_max = d->block - 1u;   /* a chain is the block's mask slots */
     return true;
@@ -156,6 +173,55 @@ bool pulsar_block_drafter_bind(pulsar_role_binder *b, pulsar_block_drafter *d) {
         L.gate = pulsar_role_bind(b, k("mlp_gate"), A_LINEAR, 2, E, d->ff);
         L.up = pulsar_role_bind(b, k("mlp_up"), A_LINEAR, 2, E, d->ff);
         L.down = pulsar_role_bind(b, k("mlp_down"), A_LINEAR, 2, d->ff, E);
+    }
+    /* the candidate head, block `lilicorr`: every tensor as stored (the builder's ne order: [in, out] Linears) */
+    pulsar_block_head &H = d->head_lc;
+    const uint64_t LH = PULSAR_LILICORR_HIDDEN, S = PULSAR_LILICORR_SLOTS, K = PULSAR_LILICORR_TOPK,
+                   NH = PULSAR_LILICORR_HEADS;
+    auto hk = [&](const char *role, int32_t l = -1) { return pulsar_role_in(role, "lilicorr", l); };
+    auto vec = [&](const char *role, uint64_t n, int32_t l = -1) { return pulsar_role_bind(b, hk(role, l), A_BF16, 1, n, 0, 0); };
+    auto lin = [&](const char *role, uint64_t in, uint64_t out, int32_t l = -1) {
+        return pulsar_role_bind(b, hk(role, l), A_LINEAR, 2, in, out);
+    };
+    H.token_proj = lin("token_proj", E, LH);
+    H.token_proj_b = vec("token_proj_bias", LH);
+    H.pass_proj = lin("pass_hidden_proj", E, LH);
+    H.pass_proj_b = vec("pass_hidden_proj_bias", LH);
+    H.context_proj = lin("context_proj", E, LH);
+    H.context_proj_b = vec("context_proj_bias", LH);
+    H.feature_norm_w = vec("feature_norm", 5);
+    H.feature_norm_b = vec("feature_norm_bias", 5);
+    H.feature_up_w = pulsar_role_bind(b, hk("feature_up"), A_BF16, 2, 5, LH);
+    H.feature_up_b = vec("feature_up_bias", LH);
+    H.feature_down = lin("feature_down", LH, LH);
+    H.feature_down_b = vec("feature_down_bias", LH);
+    const uint64_t slot_dims[5] = {LH, 1, S, 1, 1}, rank_dims[5] = {LH, K, 1, 1, 1};
+    H.slot_embedding = pulsar_role_bind_n(b, hk("slot_embedding"), A_BF16, 5, slot_dims);
+    H.rank_embedding = pulsar_role_bind_n(b, hk("rank_embedding"), A_BF16, 5, rank_dims);
+    H.relative_slot_bias = pulsar_role_bind(b, hk("relative_slot_bias"), A_BF16, 2, 2 * S + 1, NH);
+    H.same_slot_bias = vec("same_slot_bias", NH);
+    H.output_norm = vec("output_norm", LH);
+    H.anchor_norm = vec("anchor_norm", LH);
+    H.factor_in = lin("factor_in", 3 * LH, LH);
+    H.factor_in_b = vec("factor_in_bias", LH);
+    H.out_head = lin("out_head", LH, LH);
+    H.out_head_b = vec("out_head_bias", LH);
+    H.in_head = lin("in_head", LH, LH);
+    H.in_head_b = vec("in_head_bias", LH);
+    H.anchor_out_head = lin("anchor_out_head", LH, LH);
+    H.anchor_out_head_b = vec("anchor_out_head_bias", LH);
+    for (int32_t l = 0; l < (int32_t)PULSAR_LILICORR_LAYERS; l++) {
+        auto &Y = H.layer[l];
+        Y.attn_norm = vec("attn_norm", LH, l);
+        Y.attn_in = lin("attn_in", LH, 3 * LH, l);
+        Y.attn_in_b = vec("attn_in_bias", 3 * LH, l);
+        Y.attn_out = lin("attn_out", LH, LH, l);
+        Y.attn_out_b = vec("attn_out_bias", LH, l);
+        Y.mlp_norm = vec("mlp_norm", LH, l);
+        Y.mlp_up = lin("mlp_up", LH, 2 * LH, l);
+        Y.mlp_up_b = vec("mlp_up_bias", 2 * LH, l);
+        Y.mlp_down = lin("mlp_down", 2 * LH, LH, l);
+        Y.mlp_down_b = vec("mlp_down_bias", LH, l);
     }
     return d->fc && d->hidden_norm && d->out_norm && d->head;
 }
@@ -228,8 +294,9 @@ constexpr uint32_t kDraftRows = PULSAR_DRIVER_HEADS_MAX;
 struct absorb_layout { uint64_t c, cn, stage, kb, vb, ws, ws_bytes, gqa, gqa_bytes, total; };
 /* the draft's region */
 struct draft_layout {
-    uint64_t ids, h, x, cx, t, ob, coef, q, k, v, a, g, u, m, stage, ws, ws_bytes, gqa, gqa_bytes, logits, top_id,
-        top_lp, total;
+    uint64_t ids, h, x, cx, t, ob, coef, q, k, v, a, g, u, m, stage, ws, ws_bytes, gqa, gqa_bytes, logits;
+    /* the candidate head's inputs and outputs, [bank][slot]... (pulsar_cuda_lilicorr.h) */
+    uint64_t cand_id, cand_lp, pass, anchor, valid, scores, chain_ids, chain_rows, head_ws, head_ws_bytes, total;
 };
 
 uint64_t multi_ws(int in, const int *outs, int n, uint32_t rows) {
@@ -293,10 +360,70 @@ draft_layout draft_of(const pulsar_block_drafter *d) {
     L.gqa = o; L.gqa_bytes = a256(pulsar_gqa_workspace_bytes(&g, (uint32_t)R, d->window + PULSAR_BLOCK_SIZE_MAX));
     o += L.gqa_bytes;
     L.logits = o; o += a256(R * d->vocab * 2u);   /* bf16: the head's rows as its producer emits them */
-    L.top_id = o; o += a256(R * d->topk * 4u);
-    L.top_lp = o; o += a256(R * d->topk * 4u);
+    const uint64_t NB = R / d->block, SL = d->block - 1u;   /* the banks a pass carries, their slots */
+    L.cand_id = o; o += a256(NB * SL * d->topk * 4u);
+    L.cand_lp = o; o += a256(NB * SL * d->topk * 4u);
+    L.pass = o; o += a256(NB * SL * E * 2u);
+    L.anchor = o; o += a256(NB * E * 2u);
+    L.valid = o; o += a256(NB);
+    L.scores = o; o += a256(NB * SL * d->topk * d->topk * 4u);
+    L.chain_ids = o; o += a256(NB * SL * 4u);
+    L.chain_rows = o; o += a256(NB * SL * 4u);
+    L.head_ws = o; L.head_ws_bytes = a256(pulsar_lilicorr_head_ws_bytes((uint32_t)NB)); o += L.head_ws_bytes;
     L.total = o;
     return L;
+}
+
+/* The candidate head's device weights: each Linear the rows front door's reference (decode rows: a bank's bytes never
+ * depend on the banks beside it) and its bias, each vector its device pointer. */
+bool head_weights(const pulsar_session *s, const pulsar_block_drafter *d, pulsar_lilicorr_head *w) {
+    const pulsar_model *m = &s->engine->model;
+    const pulsar_block_head &H = d->head_lc;
+    bool ok = true;
+    auto vec = [&](const pulsar_tensor *t, const char *what) {
+        const uint16_t *p = (const uint16_t *)pulsar_weight_device_ptr(m, t, what);
+        ok = ok && p;
+        return p;
+    };
+    auto lin = [&](pulsar_lilicorr_linear *o, const pulsar_tensor *t, const pulsar_tensor *bias, int in, int out,
+                   const char *what) {
+        ok = ok && pulsar_linear_rows_ref(m, t, in, out, false, what, &o->l);
+        o->b = vec(bias, what);
+    };
+    const int E = (int)d->hidden, LH = (int)PULSAR_LILICORR_HIDDEN;
+    *w = pulsar_lilicorr_head{};
+    lin(&w->token_proj, H.token_proj, H.token_proj_b, E, LH, "lilicorr token_proj");
+    lin(&w->pass_hidden_proj, H.pass_proj, H.pass_proj_b, E, LH, "lilicorr pass_hidden_proj");
+    lin(&w->context_proj, H.context_proj, H.context_proj_b, E, LH, "lilicorr context_proj");
+    w->feature_norm_w = vec(H.feature_norm_w, "lilicorr feature_norm");
+    w->feature_norm_b = vec(H.feature_norm_b, "lilicorr feature_norm bias");
+    w->feature_mlp_up_w = vec(H.feature_up_w, "lilicorr feature_mlp up");
+    w->feature_mlp_up_b = vec(H.feature_up_b, "lilicorr feature_mlp up bias");
+    lin(&w->feature_mlp_down, H.feature_down, H.feature_down_b, LH, LH, "lilicorr feature_mlp down");
+    w->slot_embedding = vec(H.slot_embedding, "lilicorr slot_embedding");
+    w->rank_embedding = vec(H.rank_embedding, "lilicorr rank_embedding");
+    w->relative_slot_bias = vec(H.relative_slot_bias, "lilicorr relative_slot_bias");
+    w->same_slot_bias = vec(H.same_slot_bias, "lilicorr same_slot_bias");
+    for (uint32_t l = 0; l < PULSAR_LILICORR_LAYERS; l++) {
+        pulsar_lilicorr_layer &Y = w->layers[l];
+        const auto &X = H.layer[l];
+        Y.lat_attn_norm = vec(X.attn_norm, "lilicorr attn_norm");
+        lin(&Y.lat_attn_in, X.attn_in, X.attn_in_b, LH, 3 * LH, "lilicorr attn in_proj");
+        lin(&Y.lat_attn_out, X.attn_out, X.attn_out_b, LH, LH, "lilicorr attn out_proj");
+        Y.lat_mlp_norm = vec(X.mlp_norm, "lilicorr mlp_norm");
+        lin(&Y.lat_mlp_up, X.mlp_up, X.mlp_up_b, LH, 2 * LH, "lilicorr mlp up");
+        lin(&Y.lat_mlp_down, X.mlp_down, X.mlp_down_b, 2 * LH, LH, "lilicorr mlp down");
+    }
+    w->output_norm = vec(H.output_norm, "lilicorr output_norm");
+    w->anchor_norm = vec(H.anchor_norm, "lilicorr anchor_norm");
+    lin(&w->factor_input_proj, H.factor_in, H.factor_in_b, 3 * LH, LH, "lilicorr factor_input_proj");
+    lin(&w->out_head, H.out_head, H.out_head_b, LH, LH, "lilicorr out_head");
+    lin(&w->in_head, H.in_head, H.in_head_b, LH, LH, "lilicorr in_head");
+    lin(&w->anchor_out_head, H.anchor_out_head, H.anchor_out_head_b, LH, LH, "lilicorr anchor_out_head");
+    w->vector_eps = H.vector_eps;
+    w->logit_scale = H.logit_scale;
+    if (!ok) fprintf(stderr, "pulsar: block drafter: the candidate head's weights did not resolve -- refusing the session\n");
+    return ok;
 }
 
 }  // namespace
@@ -312,8 +439,10 @@ struct pulsar_block_lane {
     /* host staging */
     std::vector<uint32_t> row_seq, row_pos, seq_bank;
     std::vector<pulsar_gqa_seq> seqs;
-    std::vector<int32_t> top_id;
-    std::vector<float> top_lp;
+    /* the last draft pass's head outputs, read back: [bank][slot][...] */
+    std::vector<int32_t> cand_id, chain_ids;
+    std::vector<float> cand_lp, scores;
+    pulsar_lilicorr_head head;   /* the candidate head's device weights (fixed for the lane's life) */
 };
 
 pulsar_block_lane *pulsar_block_lane_create(pulsar_session *s, uint32_t n_banks, uint32_t max_rows) {
@@ -332,8 +461,15 @@ pulsar_block_lane *pulsar_block_lane_create(pulsar_session *s, uint32_t n_banks,
     l->row_pos.resize(l->row_seq.size());
     l->seqs.resize(l->row_seq.size());
     l->seq_bank.resize(l->row_seq.size());
-    l->top_id.resize((size_t)kDraftRows * d->topk);
-    l->top_lp.resize((size_t)kDraftRows * d->topk);
+    const size_t nbs = (size_t)(kDraftRows / d->block) * (d->block - 1u);   /* bank slots a pass carries */
+    l->cand_id.resize(nbs * d->topk);
+    l->cand_lp.resize(nbs * d->topk);
+    l->chain_ids.resize(nbs);
+    l->scores.resize(nbs * d->topk * d->topk);
+    if (!head_weights(s, d, &l->head)) {
+        pulsar_block_lane_free(l);
+        return NULL;
+    }
     if (!l->taps || !l->arena) {
         fprintf(stderr, "pulsar: block drafter: lane allocation failed (%u rows of %llu taps)\n", max_rows,
                 (unsigned long long)l->tap_width);
@@ -375,7 +511,8 @@ pulsar_block_lane *LANE(const pulsar_session *s) { return s->driver ? s->driver-
  * banks, carries, positions, each row's final hidden and top-k) to <dir>/draft.bin.  Little-endian records:
  *   ctx    u32 n, i32 pos[n], i32 bank[n], u32 width, bf16 taps[n][width]
  *   draft  u32 nb, u32 block, u32 hidden, u32 topk, i32 bank[nb], i32 carry[nb], i32 P[nb],
- *          bf16 o[nb block][hidden], i32 ids[nb block][topk], f32 lp[nb block][topk] */
+ *          bf16 o[nb block][hidden], i32 cand[nb][block - 1][topk], f32 lp[nb][block - 1][topk],
+ *          f32 scores[nb][block - 1][topk][topk], i32 chain[nb][block - 1] */
 const char *dump_dir() {
     static const char *dir = NULL;
     static bool read = false;
@@ -644,12 +781,35 @@ bool draft_pass(pulsar_session *s, const uint32_t *banks, const int32_t *carry, 
         uint16_t *yb[1] = {logits};
         if (!linears(s, 1, w, (int)E, out, "drafter lm_head", x, R, false, stage, yb, ws, D.ws_bytes)) return false;
     }
-    if (pulsar_rows_topk_logprob_launch(logits, V, R, V, d->topk, (int32_t *)(base + D.top_id),
-                                        (float *)(base + D.top_lp), 0) != 0)
-        return fail("the candidates' top-k refused");
-    if (!pulsar_gpu_tensor_read(l->arena, D.top_id, l->top_id.data(), (uint64_t)R * d->topk * 4u) ||
-        !pulsar_gpu_tensor_read(l->arena, D.top_lp, l->top_lp.data(), (uint64_t)R * d->topk * 4u))
-        return fail("could not read the candidates");
+    /* the candidate head (pulsar_cuda_lilicorr.h): each bank's 7 slot rows' top-8 and log-probs, the slot rows' final
+     * hidden, its anchor (cn of its last committed position: the state's anchor row) -> the scores and the greedy walk */
+    const uint32_t SL = B - 1u, K = d->topk;
+    pulsar_gpu_tensor *anchor = pulsar_state_tensor(ss, ss->plan->n_trunk, d->decl_anchor);
+    uint8_t valid[kDraftRows];
+    bool ok2 = anchor != NULL;
+    for (uint32_t i = 0; ok2 && i < nb; i++) {
+        ok2 = pulsar_rows_topk_logprob_launch(logits + (uint64_t)(i * B + 1u) * V, V, SL, V, K,
+                                              (int32_t *)(base + D.cand_id) + (uint64_t)i * SL * K,
+                                              (float *)(base + D.cand_lp) + (uint64_t)i * SL * K, 0) == 0 &&
+              pulsar_gpu_tensor_copy_async(l->arena, D.pass + (uint64_t)i * SL * E * 2u, l->arena,
+                                           D.x + (uint64_t)(i * B + 1u) * E * 2u, (uint64_t)SL * E * 2u) != 0 &&
+              pulsar_gpu_tensor_copy_async(l->arena, D.anchor + (uint64_t)i * E * 2u, anchor,
+                                           (uint64_t)banks[i] * E * 2u, (uint64_t)E * 2u) != 0;
+        valid[i] = 1;   /* a drafted bank holds a committed row (P > 0): its anchor is real */
+    }
+    ok2 = ok2 && pulsar_gpu_tensor_write_async(l->arena, D.valid, valid, nb) != 0;
+    if (!ok2 ||
+        pulsar_lilicorr_head_launch(&l->head, nb, (const int32_t *)(base + D.cand_id), (const float *)(base + D.cand_lp),
+                                    table, (const uint16_t *)(base + D.pass), (const uint16_t *)(base + D.anchor),
+                                    (const uint8_t *)(base + D.valid), (float *)(base + D.scores),
+                                    (int32_t *)(base + D.chain_ids), (int32_t *)(base + D.chain_rows),
+                                    base + D.head_ws, D.head_ws_bytes, 0) != 0)
+        return fail("the candidate head refused");
+    if (!pulsar_gpu_tensor_read(l->arena, D.cand_id, l->cand_id.data(), (uint64_t)nb * SL * K * 4u) ||
+        !pulsar_gpu_tensor_read(l->arena, D.cand_lp, l->cand_lp.data(), (uint64_t)nb * SL * K * 4u) ||
+        !pulsar_gpu_tensor_read(l->arena, D.scores, l->scores.data(), (uint64_t)nb * SL * K * K * 4u) ||
+        !pulsar_gpu_tensor_read(l->arena, D.chain_ids, l->chain_ids.data(), (uint64_t)nb * SL * 4u))
+        return fail("could not read the head's chain");
     if (dump_dir()) {
         static int passes = -1;
         if (passes < 0) {
@@ -665,14 +825,16 @@ bool draft_pass(pulsar_session *s, const uint32_t *banks, const int32_t *carry, 
                 bk[i] = (int32_t)banks[i];
                 P[i] = (int32_t)ss->bank_pos[banks[i]];
             }
-            const uint32_t hdr[4] = {nb, B, E, d->topk};
+            const uint32_t hdr[4] = {nb, B, E, K};
             fwrite(hdr, 4, 4, f);
             fwrite(bk, 4, nb, f);
             fwrite(carry, 4, nb, f);
             fwrite(P, 4, nb, f);
             fwrite(o.data(), 2, o.size(), f);
-            fwrite(l->top_id.data(), 4, (size_t)R * d->topk, f);
-            fwrite(l->top_lp.data(), 4, (size_t)R * d->topk, f);
+            fwrite(l->cand_id.data(), 4, (size_t)nb * SL * K, f);
+            fwrite(l->cand_lp.data(), 4, (size_t)nb * SL * K, f);
+            fwrite(l->scores.data(), 4, (size_t)nb * SL * K * K, f);
+            fwrite(l->chain_ids.data(), 4, (size_t)nb * SL, f);
         }
         if (f) fclose(f);
     }
@@ -696,7 +858,6 @@ bool draft_chains(pulsar_session *s, const uint32_t *banks, uint64_t *const *rng
     uint32_t pb[kDraftRows], pi[kDraftRows];
     int32_t pc[kDraftRows];
     std::vector<float> row;
-    std::vector<uint16_t> row16;
     for (uint32_t i0 = 0; i0 < n;) {
         uint32_t nb = 0, i = i0;
         for (; i < n && nb < per; i++) {
@@ -726,38 +887,46 @@ bool draft_chains(pulsar_session *s, const uint32_t *banks, uint64_t *const *rng
             const uint32_t P = ss->bank_pos[pb[b]];
             uint32_t K = std::min(q->n_draft, B - 1u);
             if ((uint64_t)P + 1u + K > ss->ctx) K = (uint32_t)(ss->ctx - P - 1u);
+            /* the walk over the head's scores: slot s's row is scores[s][prev] (slot 0: the start row) -- greedy the
+             * device's walk (its first argmax), sampled a draw from the row's candidates under the request's params at
+             * the draft's key (s + 1 places past the carry), as vLLM's candidate sampler draws from them */
+            const uint32_t SL = B - 1u, TK = d->topk;
+            const int32_t *cand = &l->cand_id[(size_t)b * SL * TK];
+            const float *sc = &l->scores[(size_t)b * SL * TK * TK];
+            uint32_t prev = 0;
             for (uint32_t j = 1; j <= K; j++) {
-                const uint32_t r = b * B + j;
-                const int32_t top = l->top_id[(size_t)r * d->topk];
-                q->conf[j - 1] = expf(l->top_lp[(size_t)r * d->topk]);
+                const float *rw = sc + ((size_t)(j - 1) * TK + prev) * TK;
+                float mx = rw[0], sum = 0.f;
+                for (uint32_t c = 1; c < TK; c++) mx = std::max(mx, rw[c]);
+                for (uint32_t c = 0; c < TK; c++) sum += expf(rw[c] - mx);
+                uint32_t pick = 0;
                 if (q->temperature <= 0.0f) {
-                    q->refined[j] = top;
-                    continue;
+                    q->refined[j] = l->chain_ids[(size_t)b * SL + j - 1];
+                    while (pick < TK && cand[(j - 1) * TK + pick] != q->refined[j]) pick++;
+                } else {
+                    row.assign(V, -INFINITY);
+                    for (uint32_t c = 0; c < TK; c++) row[(uint32_t)cand[(j - 1) * TK + c]] = rw[c];
+                    pulsar_sample_dist qd{};
+                    if (!pulsar_sample_dist_build(row.data(), V, q->temperature, q->top_k, q->top_p, q->min_p,
+                                                  &s->sample_scratch, &qd)) {
+                        snprintf(err, errlen, "a draft slot's candidates have no distribution");
+                        return false;
+                    }
+                    const int dt = pulsar_sample_dist_draw(&qd, pulsar_sample_key(*rngs[pi[b]], j));
+                    pulsar_sample_dist_free(&qd);
+                    if (dt < 0) {
+                        snprintf(err, errlen, "a draft draw failed");
+                        return false;
+                    }
+                    q->refined[j] = dt;
+                    while (pick < TK && cand[(j - 1) * TK + pick] != dt) pick++;
                 }
-                /* sampled: the row under the request's params, drawn at the draft's key (j places past the carry) */
-                row16.resize(V);
-                row.resize(V);
-                if (!pulsar_gpu_tensor_read(l->arena, l->dl.logits + (uint64_t)r * V * 2u, row16.data(), (uint64_t)V * 2u)) {
-                    snprintf(err, errlen, "could not read a draft row");
+                if (pick == TK) {
+                    snprintf(err, errlen, "a draft is not among its slot's candidates");
                     return false;
                 }
-                for (uint32_t c = 0; c < V; c++) {   /* bf16 -> f32 is exact */
-                    const uint32_t bits = (uint32_t)row16[c] << 16;
-                    memcpy(&row[c], &bits, 4);
-                }
-                pulsar_sample_dist qd{};
-                if (!pulsar_sample_dist_build(row.data(), V, q->temperature, q->top_k, q->top_p, q->min_p,
-                                              &s->sample_scratch, &qd)) {
-                    snprintf(err, errlen, "a draft row has no distribution");
-                    return false;
-                }
-                const int dt = pulsar_sample_dist_draw(&qd, pulsar_sample_key(*rngs[pi[b]], j));
-                pulsar_sample_dist_free(&qd);
-                if (dt < 0) {
-                    snprintf(err, errlen, "a draft draw failed");
-                    return false;
-                }
-                q->refined[j] = dt;
+                q->conf[j - 1] = expf(rw[pick] - mx) / sum;   /* its probability among the slot's candidates */
+                prev = pick;
             }
             q->keep = K;
         }

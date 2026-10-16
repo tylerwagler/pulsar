@@ -86,6 +86,12 @@ static bool role_admit(const pulsar_role_binder *b, const pulsar_tensor *t, cons
 
 pulsar_tensor *pulsar_role_bind(pulsar_role_binder *b, pulsar_role_key k, const pulsar_role_admit &a, uint32_t nd,
                                 uint64_t d0, uint64_t d1, uint64_t d2) {
+    const uint64_t dims[3] = {d0, d1, d2};
+    return pulsar_role_bind_n(b, k, a, nd, dims);
+}
+
+pulsar_tensor *pulsar_role_bind_n(pulsar_role_binder *b, pulsar_role_key k, const pulsar_role_admit &a, uint32_t nd,
+                                  const uint64_t *dims) {
     const auto it = b->by_key.find(key_of(k));
     if (it == b->by_key.end()) {
         fprintf(stderr, "pulsar: %s: the container has no tensor for %s -- refusing\n", b->owner,
@@ -101,7 +107,16 @@ pulsar_tensor *pulsar_role_bind(pulsar_role_binder *b, pulsar_role_key k, const 
         return NULL;
     }
     b->bound[it->second] = 1;   /* declared: whatever its verdict, it is not an undeclared extra at the close */
-    bool ok = pulsar_tensor_dims(t, b->owner, nd, d0, d1, d2);
+    bool ok = nd <= PULSAR_MAX_DIMS && t->ndim == nd;
+    for (uint32_t i = 0; ok && i < nd; i++) ok = t->dim[i] == dims[i];
+    if (!ok) {
+        fprintf(stderr, "pulsar: %s: tensor %.*s has ne [", b->owner, (int)t->name.len, t->name.ptr);
+        for (uint32_t i = 0; i < t->ndim; i++) fprintf(stderr, "%s%llu", i ? ", " : "", (unsigned long long)t->dim[i]);
+        fprintf(stderr, "], want [");
+        for (uint32_t i = 0; i < nd && i < PULSAR_MAX_DIMS; i++)
+            fprintf(stderr, "%s%llu", i ? ", " : "", (unsigned long long)dims[i]);
+        fprintf(stderr, "]\n");
+    }
     ok = role_admit(b, t, a) && ok;
     if (!ok) {
         pulsar_load_refuse();

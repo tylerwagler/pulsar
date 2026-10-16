@@ -1043,6 +1043,7 @@ static bool weights_tensor_type_supported(uint32_t type) {
     case PULSAR_TENSOR_EXL3M_K5:
     case PULSAR_TENSOR_EXL3M_K6:
     case PULSAR_TENSOR_EXL3M_K8:
+    case PULSAR_TENSOR_NVFP4:   /* L298: the NVFP4 W4A16 rows arm (pulsar_cuda_nvfp4.h) */
         return true;
     default:
         return false;

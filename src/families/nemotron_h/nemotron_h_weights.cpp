@@ -98,17 +98,16 @@ bool pulsar_nemotron_h_bind(const pulsar_model *m, pulsar_nemotron_h_model *w) {
         D->in_proj = pulsar_role_bind(b, pulsar_role_in("draft_in_proj", MTP, 0), A_LINEAR, 2, 2 * E, E);
         D->out_norm = pulsar_role_bind(b, pulsar_role_in("draft_out_norm", MTP, 0), A_BF16, 1, E);
     }
-    /* L298: the LiLiCorr block drafter (block `drafter`) when the open selected it, else unloaded; its candidate head
-     * (block `lilicorr`) is not run yet (the drafts are each slot's top-1): unloaded either way */
+    /* L298: the LiLiCorr block drafter (block `drafter`) and its candidate head (block `lilicorr`) when the open
+     * selected it, else unloaded */
     if (s->block_written) {
         if (w->block) {
             (void)pulsar_block_drafter_bind(b, w->block);
         } else {
-            const uint64_t n = pulsar_role_binder_unload(b, "drafter");
+            const uint64_t n = pulsar_role_binder_unload(b, "drafter") + pulsar_role_binder_unload(b, "lilicorr");
             fprintf(stderr, "pulsar: %s: the LiLiCorr drafter (%llu tensors) is not the selected drafter: unloaded\n",
                     OWNER, (unsigned long long)n);
         }
-        (void)pulsar_role_binder_unload(b, "lilicorr");
     }
     /* the census: every directory entry declared, every byte priced (the extras refused by name) */
     return pulsar_role_binder_close(b, &w->census);

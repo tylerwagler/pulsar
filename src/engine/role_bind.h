@@ -61,6 +61,9 @@ pulsar_role_binder *pulsar_role_binder_open(const pulsar_model *m, const char *o
  *  `a`.  It is charged to its role.  NULL = refused (said, counted); a key bound twice is refused too. */
 pulsar_tensor *pulsar_role_bind(pulsar_role_binder *b, pulsar_role_key k, const pulsar_role_admit &a, uint32_t nd,
                                 uint64_t d0, uint64_t d1 = 0, uint64_t d2 = 0);
+/** The same for a tensor of nd <= PULSAR_MAX_DIMS dims (ne order) -- e.g. a checkpoint's [1, 1, n, 1, w] table. */
+pulsar_tensor *pulsar_role_bind_n(pulsar_role_binder *b, pulsar_role_key k, const pulsar_role_admit &a, uint32_t nd,
+                                  const uint64_t *dims);
 
 /** L298: every entry of block `block` is DECLARED and NOT LOADED -- the open did not select what it serves (a drafter
  *  the engine does not run): none is bound, staged (pulsar_model::unloaded) or priced, and the close accounts for its
