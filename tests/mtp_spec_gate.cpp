@@ -307,7 +307,17 @@ static int exact(pulsar_engine *e, int n, const char *only) {
         CHECK(plain[i].ok && plain_t[i].ok && !plain[i].out.empty(), "M1 prompt %zu (%d tokens): plain greedy %zu tokens, "
               "plain T0.7 %zu tokens", i, P[i].len, plain[i].out.size(), plain_t[i].out.size());
     }
+    /* rule 5: a spec stream's trunk steps are its verifies (the module steps are not the driver's), so the segment
+     * cache's movement across M1's spec streams is the graphed verify lane's (L296 fullspec) */
+    uint64_t rep0 = 0, cap0 = 0;
+    pulsar_gpu_seg_counts(&rep0, &cap0);
     for (uint32_t depth = 0; on('1') && depth <= 5; depth++) {
+        if (depth == 1) {
+            uint64_t rep1 = 0, cap1 = 0;
+            pulsar_gpu_seg_counts(&rep1, &cap1);
+            printf("  info  M1 the verify steps' graphs: %llu replayed, %llu captured (the drafter's numbers)\n",
+                   (unsigned long long)(rep1 - rep0), (unsigned long long)(cap1 - cap0));
+        }
         drafter_at_depth(e, depth);
         uint64_t rounds = 0, drafts = 0, acc = 0, emitted = 0;
         for (size_t i = 0; i < P.size(); i++) {
@@ -351,7 +361,18 @@ static int exact(pulsar_engine *e, int n, const char *only) {
               (unsigned long long)sp.drafts, (unsigned long long)sp.accepted, d);
         if (tw && sp_s && sp.ok && twin.ok && d == -1) {
             const pulsar_state_plan *p = sp_s->states->plan;
-            const uint32_t len = (uint32_t)P[i].len + (uint32_t)sp.out.size();
+            uint32_t len = (uint32_t)P[i].len + (uint32_t)sp.out.size();
+            /* a stream that ends on a stop token: the plain step emits it without feeding it, a round that verified
+             * it as a kept draft has its row -- the twin feeds it too, so both stand at the same frontier (a full
+             * model's stream can stop inside `tokens`; the mini's never did) */
+            const bool stopped = !sp.out.empty() && pulsar_token_is_stop(e, sp.out.back());
+            if (stopped && tw->states->bank_pos[0] == len - 1u && sp_s->states->bank_pos[0] == len) {
+                char err[256] = "";
+                CHECK(pulsar_session_eval(tw, sp.out.back(), err, sizeof(err)) == 0,
+                      "M3 prompt %zu: the twin feeds the stop token the spec round verified: %s", i, err);
+            }
+            if (stopped && tw->states->bank_pos[0] == len - 1u && sp_s->states->bank_pos[0] == len - 1u)
+                len--;   /* neither fed it (the round's own token, not a kept draft) */
             CHECK(sp_s->states->bank_pos[0] == len && tw->states->bank_pos[0] == len,
                   "M3 prompt %zu: both at %u tokens (%u, %u)", i, len, sp_s->states->bank_pos[0], tw->states->bank_pos[0]);
             size_t nb = 0, nd = 0;
@@ -422,9 +443,26 @@ static int exact(pulsar_engine *e, int n, const char *only) {
             }
             if (m == 0) break;
             uint32_t rows = 0;
-            ok = pulsar_session_spec_assemble_batch(s, st, m, width, reqs.data(), &rows) == 0 && rows > 0;
-            for (int i = 0; ok && i < m; i++) ok = st[i].status == PULSAR_SPEC_STEP_OK;
-            if (!ok) { snprintf(err, sizeof err, "assemble: %s", m ? st[0].err : ""); break; }
+            (void)pulsar_session_spec_assemble_batch(s, st, m, width, reqs.data(), &rows);
+            /* as the server's lane: a bank whose base is a stop token emits it and ends (never evaluated); a bank
+             * over the row budget sits the tick out untouched; the rest verify (a deep chain -- the drafter's cap 7,
+             * a copy chain -- can fill the width) */
+            int live = 0;
+            for (int i = 0; ok && i < m; i++) {
+                if (st[i].status == PULSAR_SPEC_STEP_EOS) {
+                    got[bank_of[i]].push_back(st[i].first_token);
+                    done[bank_of[i]] = true;
+                } else if (st[i].status == PULSAR_SPEC_STEP_OK) {
+                    st[live] = st[i];
+                    bank_of[live++] = bank_of[i];
+                } else if (st[i].status != PULSAR_SPEC_STEP_SKIPPED) {
+                    ok = false;
+                    snprintf(err, sizeof err, "assemble bank %u: status %d %s", st[i].bank, (int)st[i].status, st[i].err);
+                }
+            }
+            if (!ok) break;
+            m = live;
+            if (m == 0 || rows == 0) continue;
             std::vector<float> logits((size_t)rows * W);
             uint32_t gotr = 0;
             pulsar_session_spec_arm_capture(s, rows);

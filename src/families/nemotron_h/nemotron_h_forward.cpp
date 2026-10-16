@@ -588,7 +588,25 @@ bool stage(const pulsar_driver_step *st0, uint64_t *graph_key) {
         if (st->tokens[r] < 0 || (uint32_t)st->tokens[r] >= s.n_vocab) return fail("a token id outside the vocabulary");
     uint32_t bound = 0;
     if (!build_tables(st) || !plan_attention(st, &bound)) return false;
-    *graph_key = 0x4E480000ull | ((uint64_t)bound << 20) | 1u;
+    uint64_t key = 0x4E480000ull | ((uint64_t)bound << 20) | 1u;
+    /* L296 fullspec: a verify step's launches also read its run structure -- the row-kind cut, the Mamba-2 calls'
+     * sequence counts, row splits and longest runs, and every attention call's shape -- so they are its key too (a
+     * decode step's follow from its row count: one sequence a row) */
+    if (st->verify) {
+        const nh_state *q = st->st;
+        auto mix = [](uint64_t h, uint64_t v) {
+            h ^= v + 0x9e3779b97f4a7c15ull + (h << 6) + (h >> 2);
+            h = (h ^ (h >> 30)) * 0xbf58476d1ce4e5b9ull;
+            return h ^ (h >> 27);
+        };
+        key = mix(mix(mix(key, st->n_dec), mix(q->n_seq, q->n_seq_cap)), mix(q->rows_cap, mix(q->max_run_a, q->max_run_b)));
+        for (uint32_t k = 0; k < q->n_attn; k++) {
+            const pulsar_gqa_call &c = q->attn_call[k];
+            key = mix(key, mix(mix(c.n_rows, c.n_tiles), mix(mix(c.grid_chunks, c.ctx_bound), (uint64_t)c.fold)));
+        }
+        key |= 1u;
+    }
+    *graph_key = key;
     return true;
 }
 
@@ -1079,13 +1097,6 @@ const pulsar_mtp_ops k_mtp_ops = {
     /* .row_exact     = */ true,   /* the trunk's blocks at their decode arms (M3: the drafter slot byte-exact) */
 };
 
-/* The card's draft depth: "3-5" (vLLM's recipe drafts 3 on 4 x H100, 5 on GB200).  A session starts at 3 and the
- * shared adaptive controller (spec_depth.h) moves it between 3 and 5 -- up a level after a round that converted all its
- * depth but one draft, down after one that converted less than half (Qwen's MTP policy, L288); the stop threshold is
- * the shared MTP one (0.7, Qwen's L270 sweep).  Neither is tuned on this model: the 3-layer mini is no acceptance
- * fixture; the full model's numbers move them. */
-const pulsar_spec_depth_policy k_mtp_depth = {3, 5, 0.0f, 0, 0.0f, 0u, 0u, 1u};
-
 }  // namespace
 
 /* ---- N3: the state declaration ------------------------------------------------------------------------------------ */
@@ -1128,8 +1139,15 @@ void pulsar_nemotron_h_state_plan(pulsar_engine *e) {
     p->session = 0;
 }
 
+/* The drafter's numbers, measured on the full K4 container (L296 fullspec, served single stream T0 over code / prose /
+ * chat / tool-call / edit, tok/s over all five): a chain may run 7 deep and no adaptive controller moves that cap --
+ * the stop rule (tau 0.7) and the priced depth (session_spec.cpp, the measured lane costs) end every chain sooner when
+ * a further draft would not pay.  59.1 tok/s vs the card's 3..5 under the shared controller 57.3 (tool calls 72.1 ->
+ * 80.1, edit 77.8 -> 83.4, code 52.2 -> 53.3, prose / chat flat); a cap of 3 55.1, 5 57.6, 8 / 10 / 12 58.6 / 58.6 /
+ * 59.3; the controller at 3..7 / 2..6 / 4..8 58.3-58.9; tau 0.5 / 0.6 / 0.8 / 0.85 / off all lower.  Plain decode
+ * 28.1. */
 const pulsar_drafter_ops PULSAR_NEMOTRON_H_DRAFTER =
-    PULSAR_MTP_DRAFTER_OPS("MTP", 3u, PULSAR_MTP_DRAFT_MAX, 0.7f, &k_mtp_depth);
+    PULSAR_MTP_DRAFTER_OPS("MTP", 7u, PULSAR_MTP_DRAFT_MAX, 0.7f, NULL);
 
 const pulsar_driver_ops PULSAR_NEMOTRON_H_DRIVER = {
     /* .create        = */ create,

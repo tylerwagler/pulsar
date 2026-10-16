@@ -170,12 +170,13 @@ static bool driver_image_rows(void *ud, const uint16_t *rows, uint32_t n_rows, u
     return u->ops->image_rows(u->st, rows, n_rows, row0, n_tokens);
 }
 
-/* L296 perf: a captured decode step's key -- everything host-side its launches depend on: the session's buffers
- * (the driver state; a destroyed session drops every graph, pulsar_driver_session_destroy), the row count, the head
- * list, and the family's own key (pulsar_driver_ops::stage).  Tagged in the top bits so it never meets the output
- * head segment's structured keys (gpu_graph_output_head_seg_key) in the one segment table. */
-static uint64_t driver_graph_key(const pulsar_driver_state *d, uint32_t n_rows, const pulsar_driver_heads &heads,
-                                 uint64_t family_key) {
+/* L296 perf: a captured step's key -- everything host-side its launches depend on: the session's buffers (the
+ * driver state; a destroyed session drops every graph, pulsar_driver_session_destroy), the step's kind (a decode step
+ * or a pure verify), the row count, the head list, and the family's own key (pulsar_driver_ops::stage).  Tagged in the
+ * top bits so it never meets the output head segment's structured keys (gpu_graph_output_head_seg_key) in the one
+ * segment table. */
+static uint64_t driver_graph_key(const pulsar_driver_state *d, bool verify, uint32_t n_rows,
+                                 const pulsar_driver_heads &heads, uint64_t family_key) {
     auto mix = [](uint64_t h, uint64_t v) {
         uint64_t z = h ^ (v + 0x9e3779b97f4a7c15ull + (h << 6) + (h >> 2));
         z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ull;
@@ -183,6 +184,7 @@ static uint64_t driver_graph_key(const pulsar_driver_state *d, uint32_t n_rows, 
         return z ^ (z >> 31);
     };
     uint64_t h = mix(0x44525647ull /* "DRVG" */, (uint64_t)(uintptr_t)d);
+    h = mix(h, verify ? 2u : 1u);
     h = mix(h, n_rows);
     h = mix(h, heads.n);
     for (uint32_t i = 0; i < heads.n; i++) h = mix(h, heads.row[i]);
@@ -190,13 +192,15 @@ static uint64_t driver_graph_key(const pulsar_driver_state *d, uint32_t n_rows, 
     return (h >> 4) | (0xDull << 60);
 }
 
-/* rule 5: the graphed decode lane says once that it ran (the counters are pulsar_gpu_seg_counts) */
-static void driver_graph_announce(const char *arch, const char *what) {
-    static bool captured = false, replayed = false;
-    bool &seen = what[0] == 'c' ? captured : replayed;
+/* rule 5: each graphed lane (the decode step, the verify step) says once that it ran (the counters are
+ * pulsar_gpu_seg_counts) */
+static void driver_graph_announce(const char *arch, bool verify, const char *what) {
+    static bool seen_[2][2] = {};
+    bool &seen = seen_[verify ? 1 : 0][what[0] == 'c' ? 0 : 1];
     if (seen) return;
     seen = true;
-    fprintf(stderr, "pulsar: %s: L296 decode step graph %s (one captured graph per decode shape)\n", arch, what);
+    fprintf(stderr, "pulsar: %s: L296 %s step graph %s (one captured graph per %s shape)\n", arch,
+            verify ? "verify" : "decode", what, verify ? "verify" : "decode");
 }
 
 /* One step of the trunk: the plan, in its order.  DECODE: one row per bank; PREFILL: runs of one bank each -- a
@@ -323,21 +327,23 @@ static bool driver_forward(pulsar_session *s, pulsar_step_mode mode, const int32
         return lok;
     };
     /* L296 perf: a DECODE step of a staged family runs its launches as one captured graph per key (the session's
-     * buffers, the rows, the head list, the family's key): the L119 segment cache captures a key's 12th use and
-     * replays it after.  Eager while a diagnostic tap or an importance-matrix observer reads the step from the host,
-     * and under TP (the row exchange waits on the host). */
-    const uint64_t gkey = ok && mode == PULSAR_STEP_DECODE && !st.verify && family_key && !st.tap && !d->tp &&
-                                  !gpu_graph_debug_dump_enabled()
-                              ? driver_graph_key(d, n_rows, heads, family_key)
+     * buffers, the step's kind, the rows, the head list, the family's key): the L119 segment cache captures a key's
+     * 12th use and replays it after.  L296 fullspec: so does a PURE verify step (every row a verify row -- a
+     * speculative round's; its capture of the recurrent state is the driver's, before the launches), keyed by the
+     * family on its run structure too.  Eager while a diagnostic tap or an importance-matrix observer reads the step
+     * from the host, and under TP (the row exchange waits on the host). */
+    const bool graphable = mode == PULSAR_STEP_DECODE ? !st.verify : st.verify && n_verify == n_rows;
+    const uint64_t gkey = ok && graphable && family_key && !st.tap && !d->tp && !gpu_graph_debug_dump_enabled()
+                              ? driver_graph_key(d, st.verify, n_rows, heads, family_key)
                               : 0;
     if (ok && gkey) {
         const int seg = pulsar_gpu_seg_enter(gkey);
         if (seg == 2) {
-            driver_graph_announce(ARCH(e), "replayed");
+            driver_graph_announce(ARCH(e), st.verify, "replayed");
         } else if (seg == 1) {
             const bool body = launches();
             /* a failed capture never ran its work: the launches again, eager (a real refusal refuses again) */
-            if (pulsar_gpu_seg_exit(gkey, body ? 1 : 0)) driver_graph_announce(ARCH(e), "captured");
+            if (pulsar_gpu_seg_exit(gkey, body ? 1 : 0)) driver_graph_announce(ARCH(e), st.verify, "captured");
             else ok = launches();
         } else {
             ok = launches();
