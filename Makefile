@@ -1036,7 +1036,7 @@ MTP_GATE_MODEL ?= $(NEMOTRON_GATE_MODEL)
 MTP_GATE_TOKENS ?= 256
 .PHONY: mtp-spec-gate
 mtp-spec-gate: tests/mtp_spec_gate
-	./tests/mtp_spec_gate exact $(MTP_GATE_MODEL) $(MTP_GATE_TOKENS)
+	./tests/mtp_spec_gate $(MTP_GATE_MODEL) $(MTP_GATE_TOKENS)
 # ... and its draft grade: the MTP module's first-step logits at every position of capture_ref.py's prompt, the engine's
 # DECODE and PROMPT paths (mtp_spec_gate probe), against transformers' modules on the fp32 trunk
 # (tools/nemotron/capture_mtp_ref.py) with transformers' own bf16 beside it (the floor); PASS within 2x the floor's KL.
@@ -1047,7 +1047,7 @@ NEMOTRON_MTP_GRADE_DIR ?= $(TMPDIR)/nemotron-mtp-grade
 nemotron-mtp-grade: tests/mtp_spec_gate
 	rm -rf $(NEMOTRON_MTP_GRADE_DIR) && mkdir -p $(NEMOTRON_MTP_GRADE_DIR)
 	$(NEMOTRON_GRADE_PY) tests/nemotron_mtp_grade.py prep $(NEMOTRON_MINI_REF) $(NEMOTRON_MTP_GRADE_DIR)
-	./tests/mtp_spec_gate probe $(NEMOTRON_GATE_MODEL) $(NEMOTRON_MTP_GRADE_DIR)/ids.bin $(NEMOTRON_MTP_GRADE_DIR) \
+	./tests/mtp_spec_gate $(NEMOTRON_GATE_MODEL) --probe $(NEMOTRON_MTP_GRADE_DIR)/ids.bin $(NEMOTRON_MTP_GRADE_DIR) \
 	    2> $(NEMOTRON_MTP_GRADE_DIR)/probe.log
 	$(NEMOTRON_GRADE_PY) tests/nemotron_mtp_grade.py grade $(NEMOTRON_MTP_REF) $(NEMOTRON_MTP_GRADE_DIR) \
 	    --bf16 $(NEMOTRON_MTP_REF_BF16) --trunk $(NEMOTRON_MINI_REF)
@@ -2145,7 +2145,7 @@ RUNNER_GATES = multiseq_frontier_gate rewind_frontier_gate mseq_rewind_probe tok
                bank_evict_restore_gate algo_stability_gate mixed_prefill_gate \
                mixed_neutrality_gate spec_sampling_gate mseq_short_ctx_probe prefill_bitexact_gate \
                comp_state_gate chunk_neutrality_gate vision_chunk_gate session_payload_gate tp_head_split_gate \
-               decode_reference_gate session_contract_gate chat_decode_smoke head_graph_replay_gate
+               decode_reference_gate session_contract_gate chat_decode_smoke head_graph_replay_gate mtp_spec_gate
 RUNNER_OBJS = $(RUNNER_GATES:%=tests/runner/%.o)
 tests/runner/%.o: tests/%.cpp tests/gate_entry.h tests/gate_fixture.h tests/gate_util.h src/pulsar.h src/pulsar_gpu.h src/engine/pulsar_engine_internal.h src/lib/pulsar_segstore.h
 	@mkdir -p tests/runner
@@ -2407,7 +2407,8 @@ GATES_DEV_ATTN   = cuda-mixed-prefill-gate cuda-row-neutrality-gate-deep cuda-vi
 # kernel dispatch: row-kind/batch-composition neutrality and the width sweep.
 GATES_DEV_CUDA   = cuda-mixed-neutrality-gate cuda-algo-stability-gate cuda-mixed-prefill-gate cuda-row-neutrality-gate-deep
 # engine lanes: the batched driver, the spec lane, the bank pool.
-GATES_DEV_ENGINE = cuda-multiseq-gate cuda-bank-spec-gate cuda-dspark-batch-gate cuda-evict-restore-gate cuda-session-payload-gate
+GATES_DEV_ENGINE = cuda-multiseq-gate cuda-bank-spec-gate cuda-dspark-batch-gate cuda-evict-restore-gate cuda-session-payload-gate \
+                   mtp-spec-gate
 GATES_DEV_SERVER = cuda-seam-gate cuda-session-payload-gate
 # vision: the host gates below do the real work (they need no model); the runner
 # sub-gates pin the prefill lane an image span rides and (L283) its chunk-start invariance.

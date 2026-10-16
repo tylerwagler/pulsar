@@ -92,9 +92,10 @@ typedef struct pulsar_mtp_ops {
      *  undo: keep it (Qwen: the index stage); stage_restore puts it back before the bank's next true rows. */
     bool (*stage_save)(pulsar_session *s, uint32_t bank);
     bool (*stage_restore)(pulsar_session *s, uint32_t bank);
-    /** Optional, a hint: ids the next verify of `bank` will embed, known as the chain drafts them (Qwen: the PLE rows'
-     *  page-cache prefetch). */
-    void (*prefetch)(pulsar_session *s, uint32_t bank, const int32_t *ids, uint32_t n);
+    /** Optional, a hint: ids the next verify of `bank` will embed, in order, as the chain drafts them -- the first
+     *  call of a chain (`chain_start`) the carry (and a copy chain's drafts), then each draft (Qwen: the PLE rows'
+     *  page-cache prefetch, its n-gram context advanced along the chain). */
+    void (*prefetch)(pulsar_session *s, uint32_t bank, const int32_t *ids, uint32_t n, bool chain_start);
 } pulsar_mtp_ops;
 
 /** L296 N9: a diagnostic -- while armed, every lockstep module step (pulsar_mtp_absorb) heads its rows (at most

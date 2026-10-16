@@ -5,7 +5,7 @@
  *
  * The lane's arithmetic is the family's (its module steps); what is here is only which rows a step carries, in which
  * order, and what each bank's parked row is.  The rules (L251 MTP-SPEC, L272 P1, L288, L289) were Qwen's drafter's
- * (spec_qwen.cpp), lifted with no change of order. */
+ * (spec_qwen.cpp until L296 N9), lifted with no change of order; Qwen and Nemotron-H both draft here. */
 #include "pulsar_engine_internal.h"
 #include "spec_mtp.h"
 
@@ -315,7 +315,7 @@ static bool mtp_draft_chains(pulsar_session *s, const uint32_t *banks, uint64_t 
         if (ch.K == 0) continue;
         ch.live = true;
         /* L289: the verify will embed [x, d_1 ..]: a family may start reading what they need as each is known */
-        if (ops->prefetch) ops->prefetch(s, ch.b, &q->refined[0], ch.copy ? 1u + q->keep : 1u);
+        if (ops->prefetch) ops->prefetch(s, ch.b, &q->refined[0], ch.copy ? 1u + q->keep : 1u, true);
     }
     /* L288 pass 2: the price a further step must clear (session_spec.cpp, the priced depth), and every survival the
      * round has drafted so far -- what outranks a chain for the shared verify width */
@@ -355,7 +355,7 @@ static bool mtp_draft_chains(pulsar_session *s, const uint32_t *banks, uint64_t 
         if (pulsar_spec_conf_stops(pk.conf, tau) || j == c[i].K) c[i].live = false;   /* the chain's last */
         if (!c[i].sampled) {
             q->refined[j] = pk.id;
-            if (ops->prefetch) ops->prefetch(s, c[i].b, &q->refined[j], 1);
+            if (ops->prefetch) ops->prefetch(s, c[i].b, &q->refined[j], 1, false);
             return true;
         }
         pulsar_sample_dist qd{};
@@ -365,7 +365,7 @@ static bool mtp_draft_chains(pulsar_session *s, const uint32_t *banks, uint64_t 
         pulsar_sample_dist_free(&qd);
         if (d < 0) return false;
         q->refined[j] = (int32_t)d;
-        if (ops->prefetch) ops->prefetch(s, c[i].b, &q->refined[j], 1);
+        if (ops->prefetch) ops->prefetch(s, c[i].b, &q->refined[j], 1, false);
         return true;
     };
     int32_t tok[PULSAR_DRIVER_HEADS_MAX], pos[PULSAR_DRIVER_HEADS_MAX], bank[PULSAR_DRIVER_HEADS_MAX];

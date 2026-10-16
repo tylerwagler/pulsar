@@ -1,10 +1,12 @@
 /* L296 N9: the chained-MTP drafter (src/engine/spec_mtp.h) on a real container -- any family whose drafter is the MTP
  * lane (Nemotron-H's mini first).  Speculation never changes the output: every check here is the plain decode's bytes.
  *
- *   ./tests/mtp_spec_gate exact <model> [tokens]
- *   ./tests/mtp_spec_gate probe <model> <ids.bin> <out_dir> [positions]
+ *   ./tests/mtp_spec_gate <model> [tokens] [sections]
+ *   ./tests/mtp_spec_gate <model> --probe <ids.bin> <out_dir> [positions]
  *
- * exact (`tokens` per stream, default 256):
+ * Also a runner gate (tests/gates_runner.cpp `mtp-spec-gate`, on every hosted model whose drafter is the MTP lane).
+ *
+ * exact (`tokens` per stream, default 256; `sections` the digits of the M sections to run, default all):
  *   M0  the lane runs: the engine's drafter is the MTP drafter, a session builds its lane, a prefill parks every bank's
  *       row at its last position
  *   M1  greedy spec == plain: four prompts, prefill + `tokens` tokens, at each fixed depth 1..5 with no stop rule and
@@ -21,7 +23,7 @@
  *   M4  the batched lane (the server's round API): four banks' streams in shared verify steps (assemble, one
  *       decode_mixed with every row headed, round_end, ONE redraft pass, commit) == each bank's plain stream, greedy
  *
- * probe (the draft grade's capture, tests/nemotron_mtp_grade.py): the first draft step's logits at every position of
+ * --probe (the draft grade's capture, tests/nemotron_mtp_grade.py): the first draft step's logits at every position of
  * a reference prompt, teacher-forced by the trunk (the lane's probe: each lockstep module row headed) -- the DECODE
  * path (a sync of the first token, then one eval a token: one row a step, the decode arms) to
  * <out_dir>/mtp_decode.f32, and the PROMPT path (syncs growing by 31 tokens: each lockstep step 31 rows, the prompt
@@ -46,6 +48,10 @@ static int n_fail = 0;
 static const pulsar_drafter_ops *g_base;   /* the engine's own drafter */
 static pulsar_drafter_ops g_fixed;         /* a copy at a fixed depth */
 static bool g_unpriced;                    /* a fixed depth: no priced depth either (every chain the whole depth) */
+/* the engine's own settings, put back when the gate ends (a runner gate borrows the engine) */
+static float g_tau0;
+static int g_depth0;
+static pulsar_lane_cost_fit g_cost0;
 
 /* the drafter's numbers for a run: depth 0 = its own (the controller, the stop rule, the priced depth); else that
  * depth fixed, no stop rule, no price -- every chain drafts the whole depth, so the module runs recursively that deep */
@@ -53,8 +59,8 @@ static void drafter_at_depth(pulsar_engine *e, uint32_t depth) {
     g_unpriced = depth != 0;
     if (depth == 0) {
         e->drafter_ops = g_base;
-        e->spec_tau = 0.0f;
-        e->spec_depth = 0;
+        e->spec_tau = g_tau0;
+        e->spec_depth = g_depth0;
         return;
     }
     g_fixed = *g_base;
@@ -175,10 +181,16 @@ static int first_diff(const std::vector<int32_t> &a, const std::vector<int32_t> 
     return a.size() == b.size() ? -1 : (int)n;
 }
 
-/* A bank's declared state, read off the device: slots [k0, k1), every resident decl's bank bytes and the first `rows`
- * rows of each one-token pool (a drafter slot trails the trunk by one row). */
-static std::vector<uint8_t> bank_state(pulsar_session *s, uint32_t b, uint32_t k0, uint32_t k1, uint32_t rows) {
-    std::vector<uint8_t> out;
+/* A bank's declared state, read off the device as the frontier `rows` describes it: slots [k0, k1), each resident
+ * decl's bank bytes (FIXED, RING whole; STAGED: the open block's rows below the frontier -- a rejected verify row past
+ * it is no state) and the whole rows below the frontier of each pool (a drafter slot trails the trunk by one row: its
+ * caller passes one row fewer).  One piece per (slot, decl), named, so a difference says where it is. */
+struct state_piece {
+    std::string name;
+    std::vector<uint8_t> bytes;
+};
+static std::vector<state_piece> bank_state(pulsar_session *s, uint32_t b, uint32_t k0, uint32_t k1, uint32_t rows) {
+    std::vector<state_piece> out;
     const pulsar_state_set *ss = s->states;
     const pulsar_state_plan *p = ss->plan;
     bool ok = true;
@@ -188,22 +200,35 @@ static std::vector<uint8_t> bank_state(pulsar_session *s, uint32_t b, uint32_t k
             if (!(p->slot[k] >> id & 1u)) continue;
             const pulsar_gpu_tensor *t;
             uint64_t off, n;
-            if (d->kind != PULSAR_STATE_POOL) {
-                n = pulsar_state_decl_bank_bytes(d);
-                t = pulsar_state_tensor(ss, k, id);
-                off = (uint64_t)b * n;
-            } else {
+            if (d->kind == PULSAR_STATE_POOL) {
                 n = (uint64_t)rows / d->tokens * d->bytes;
                 t = pulsar_state_pool(ss, k, id, b);
                 off = 0;
+            } else {
+                n = d->kind == PULSAR_STATE_STAGED ? (uint64_t)(rows % d->tokens) * d->bytes
+                                                    : pulsar_state_decl_bank_bytes(d);
+                t = pulsar_state_tensor(ss, k, id);
+                off = (uint64_t)b * pulsar_state_decl_bank_bytes(d);
             }
-            const size_t at = out.size();
-            out.resize(at + n);
-            ok = t && pulsar_gpu_tensor_read(t, off, out.data() + at, n) != 0;
+            state_piece pc;
+            pc.name = std::string(d->name) + "@" + std::to_string(k);
+            pc.bytes.resize(n);
+            ok = t && (n == 0 || pulsar_gpu_tensor_read(t, off, pc.bytes.data(), n) != 0);
+            out.push_back(std::move(pc));
         }
     }
     if (!ok) out.clear();
     return out;
+}
+
+/* the pieces' bytes and the first piece that differs ("" = none) */
+static std::string state_diff(const std::vector<state_piece> &a, const std::vector<state_piece> &b, size_t *bytes) {
+    *bytes = 0;
+    for (const state_piece &p : a) *bytes += p.bytes.size();
+    if (a.empty() || a.size() != b.size()) return "the state did not read";
+    for (size_t i = 0; i < a.size(); i++)
+        if (a[i].name != b[i].name || a[i].bytes != b[i].bytes) return a[i].name;
+    return "";
 }
 
 /* four plain decode steps after the stream: the session's logits each step */
@@ -235,9 +260,13 @@ static std::vector<pulsar_tokens> prompts(pulsar_engine *e) {
     return P;
 }
 
-static int exact(pulsar_engine *e, int n) {
+static int exact(pulsar_engine *e, int n, const char *only) {
+    auto on = [only](char c) { return !only || strchr(only, c) != NULL; };   /* the sections to run (M0 always) */
     const int W = pulsar_engine_logits_width(e);
     g_base = e->drafter_ops;
+    g_tau0 = e->spec_tau;
+    g_depth0 = e->spec_depth;
+    g_cost0 = e->lane_cost[PULSAR_LANE_SPEC];
     /* M0 */
     CHECK(pulsar_engine_drafter(e) == PULSAR_DRAFTER_MTP && pulsar_engine_has_spec_rounds(e) && g_base &&
           g_base->absorb_banked == pulsar_mtp_absorb_banked && g_base->draft == pulsar_mtp_draft,
@@ -262,13 +291,13 @@ static int exact(pulsar_engine *e, int n) {
     }
     /* M1, M2: plain references */
     std::vector<stream> plain(P.size()), plain_t(P.size());
-    for (size_t i = 0; i < P.size(); i++) {
+    for (size_t i = 0; (on('1') || on('2') || on('4')) && i < P.size(); i++) {
         plain[i] = run(e, P[i], n, false, 0.0f, 0);
-        plain_t[i] = run(e, P[i], n, false, 0.7f, 0x5eed + i);
+        plain_t[i] = on('2') ? run(e, P[i], n, false, 0.7f, 0x5eed + i) : plain[i];
         CHECK(plain[i].ok && plain_t[i].ok && !plain[i].out.empty(), "M1 prompt %zu (%d tokens): plain greedy %zu tokens, "
               "plain T0.7 %zu tokens", i, P[i].len, plain[i].out.size(), plain_t[i].out.size());
     }
-    for (uint32_t depth = 0; depth <= 5; depth++) {
+    for (uint32_t depth = 0; on('1') && depth <= 5; depth++) {
         drafter_at_depth(e, depth);
         uint64_t rounds = 0, drafts = 0, acc = 0, emitted = 0;
         for (size_t i = 0; i < P.size(); i++) {
@@ -292,7 +321,7 @@ static int exact(pulsar_engine *e, int n) {
     }
     for (uint32_t depth : {3u, 0u}) {
         drafter_at_depth(e, depth);
-        for (size_t i = 0; i < P.size(); i++) {
+        for (size_t i = 0; on('2') && i < P.size(); i++) {
             const stream sp = run(e, P[i], n, true, 0.7f, 0x5eed + i);
             const int d = first_diff(sp.out, plain_t[i].out);
             CHECK(sp.ok && d == -1, "M2 depth %s prompt %zu: seeded T0.7 spec == plain, %zu tokens (first difference at "
@@ -302,7 +331,7 @@ static int exact(pulsar_engine *e, int n) {
     }
     /* M3 the forced-reject stress */
     drafter_at_depth(e, 0);
-    for (size_t i = 0; i < 2; i++) {
+    for (size_t i = 0; on('3') && i < 2; i++) {
         pulsar_session *tw = NULL, *sp_s = NULL;
         const stream twin = run(e, P[i], n, false, 0.0f, 0, NULL, &tw);
         const stream sp = run(e, P[i], n, true, 0.0f, 0, &twin.out, &sp_s);
@@ -315,13 +344,15 @@ static int exact(pulsar_engine *e, int n) {
             const uint32_t len = (uint32_t)P[i].len + (uint32_t)sp.out.size();
             CHECK(sp_s->states->bank_pos[0] == len && tw->states->bank_pos[0] == len,
                   "M3 prompt %zu: both at %u tokens (%u, %u)", i, len, sp_s->states->bank_pos[0], tw->states->bank_pos[0]);
-            const std::vector<uint8_t> a = bank_state(sp_s, 0, 0, p->n_trunk, len), b = bank_state(tw, 0, 0, p->n_trunk, len);
-            CHECK(!a.empty() && a == b, "M3 prompt %zu: the trunk's state after the rollbacks == the plain twin's, byte for "
-                  "byte (%zu bytes: SSM, conv, K|V rows)", i, a.size());
-            const std::vector<uint8_t> da = bank_state(sp_s, 0, p->n_trunk, p->n_slots, len - 1u),
-                                       db = bank_state(tw, 0, p->n_trunk, p->n_slots, len - 1u);
-            CHECK(!da.empty() && da == db, "M3 prompt %zu: the drafter's slot (its K|V rows and the parked row) == the "
-                  "plain twin's, byte for byte (%zu bytes)", i, da.size());
+            size_t nb = 0, nd = 0;
+            const std::string tdiff = state_diff(bank_state(sp_s, 0, 0, p->n_trunk, len), bank_state(tw, 0, 0, p->n_trunk, len), &nb);
+            CHECK(tdiff.empty(), "M3 prompt %zu: the trunk's state after the rollbacks == the plain twin's, byte for byte "
+                  "(%zu bytes: every slot's recurrent / conv state and pool rows%s%s)", i, nb,
+                  tdiff.empty() ? "" : "; differs: ", tdiff.c_str());
+            const std::string ddiff = state_diff(bank_state(sp_s, 0, p->n_trunk, p->n_slots, len - 1u),
+                                                 bank_state(tw, 0, p->n_trunk, p->n_slots, len - 1u), &nd);
+            CHECK(ddiff.empty(), "M3 prompt %zu: the drafter's slot (its pool rows and the parked row) == the plain twin's, "
+                  "byte for byte (%zu bytes%s%s)", i, nd, ddiff.empty() ? "" : "; differs: ", ddiff.c_str());
             const std::vector<std::vector<float>> ga = decode4(sp_s, W), gb = decode4(tw, W);
             CHECK(ga.size() == 4 && ga == gb, "M3 prompt %zu: four decode steps after == the twin's, byte for byte", i);
         }
@@ -330,7 +361,7 @@ static int exact(pulsar_engine *e, int n) {
     }
     /* M4 the batched lane: four banks, one shared verify a tick */
     drafter_at_depth(e, 0);
-    {
+    if (on('4')) {
         const int NB = 4;
         pulsar_engine_set_bank_pool(NB);
         pulsar_session *s = NULL;
@@ -418,6 +449,7 @@ static int exact(pulsar_engine *e, int n) {
         if (s) pulsar_session_free(s);
     }
     drafter_at_depth(e, 0);
+    e->lane_cost[PULSAR_LANE_SPEC] = g_cost0;
     for (auto &t : P) pulsar_tokens_free(&t);
     return 0;
 }
@@ -491,19 +523,20 @@ static int probe(pulsar_engine *e, const char *ids_path, const char *out_dir, in
 
 int GATE_ENTRY(int argc, char **argv) {
     n_fail = 0;
-    if (argc < 3 || (strcmp(argv[1], "exact") != 0 && strcmp(argv[1], "probe") != 0) ||
-        (!strcmp(argv[1], "probe") && argc < 5)) {
-        fprintf(stderr, "usage: %s exact <model> [tokens] | probe <model> <ids.bin> <out_dir> [positions]\n", argv[0]);
+    const bool is_probe = argc > 2 && !strcmp(argv[2], "--probe");
+    if (argc < 2 || (is_probe && argc < 5)) {
+        fprintf(stderr, "usage: %s <model> [tokens] [sections, e.g. 134] | <model> --probe <ids.bin> <out_dir> "
+                        "[positions]\n", argv[0]);
         return 2;
     }
     pulsar_engine_options opt;
     memset(&opt, 0, sizeof(opt));
-    opt.model_path = argv[2];
+    opt.model_path = argv[1];
     opt.backend = PULSAR_BACKEND_CUDA;
     pulsar_engine *e = NULL;
-    if (gate_engine_open(&e, &opt) != 0) { fprintf(stderr, "mtp-spec: %s did not open\n", argv[2]); return 2; }
-    if (!strcmp(argv[1], "exact")) (void)exact(e, argc > 3 ? atoi(argv[3]) : 256);
-    else (void)probe(e, argv[3], argv[4], argc > 5 ? atoi(argv[5]) : 0);
+    if (gate_engine_open(&e, &opt) != 0) { fprintf(stderr, "mtp-spec: %s did not open\n", argv[1]); return 2; }
+    if (is_probe) (void)probe(e, argv[3], argv[4], argc > 5 ? atoi(argv[5]) : 0);
+    else (void)exact(e, argc > 2 ? atoi(argv[2]) : 256, argc > 3 ? argv[3] : NULL);
     gate_engine_close(e);
     printf(n_fail ? "MTP-SPEC GATE FAIL (%d)\n" : "MTP-SPEC GATE PASS\n", n_fail);
     return n_fail != 0;
