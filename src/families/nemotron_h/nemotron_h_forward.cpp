@@ -1080,7 +1080,8 @@ bool mtp_forward(pulsar_session *s, const pulsar_mtp_step *m) {
         const int outs[1] = {(int)E};
         const char *what[1] = {"nemotron_h mtp eh_proj"};
         float *y[1] = {of};
-        ok = (step_linears(&st, 1, t, 2 * (int)E, outs, what, cat, y, mbase + M.lin, M.lin_bytes) && emit(of, mh, n, E)) ||
+        uint16_t *yb16[1] = {mh};
+        ok = step_linears(&st, 1, t, 2 * (int)E, outs, what, cat, y, yb16, mbase + M.lin, M.lin_bytes) ||
              fail("the MTP eh_proj refused");
     }
     /* the module's {attention, MoE}; its last add writes final_layernorm(x) into mo */
