@@ -13,6 +13,8 @@
 namespace {
 
 constexpr int kLogitsTB = 8;     ///< tokens per logits CTA row
+constexpr int kLogitsWarps = 4;  ///< logit rows (warps) per logits CTA
+constexpr int kLogitsUnroll = 4; ///< weight chunks a lane loads ahead of their fmas
 constexpr int kSelectWarps = 4;  ///< rows (warps) per select CTA
 
 __device__ __forceinline__ float bf16_round(float v) { return __bfloat162float(__float2bfloat16(v)); }
@@ -27,14 +29,31 @@ __device__ __forceinline__ void bf16x8(const uint4 &u, float f[8]) {
     }
 }
 
-/* One warp per logit row (rows n_w.. come from w_tail), kLogitsTB tokens per CTA row.  Lane l owns the uint4
- * chunks l, l + 32, ... of the row and accumulates each token's partial in chunk order; the xor tree then sums the
- * lanes.  A token's logit is the same arithmetic at any T. */
-__global__ void __launch_bounds__(256)
+/* One warp per logit row (rows n_w.. come from w_tail), kLogitsTB tokens per CTA row, kLogitsWarps rows per CTA.
+ * Lane l owns the uint4 chunks l, l + 32, ... of the row and accumulates each token's partial in chunk order; the
+ * xor tree then sums the lanes.  A token's logit is the same arithmetic at any T.  The chunks' weight loads are
+ * issued kLogitsUnroll at a time ahead of their fmas (L296 dec2: one load in flight per warp held a 4 MB router to
+ * ~170 GB/s), the fmas still in chunk order. */
+__device__ __forceinline__ void logits_chunk(const uint4 &wv, const __nv_bfloat16 *__restrict__ x, int H, int t0,
+                                             int nt, int i, float (&acc)[kLogitsTB]) {
+    float wf[8];
+    bf16x8(wv, wf);
+#pragma unroll
+    for (int tt = 0; tt < kLogitsTB; ++tt) {
+        if (tt < nt) {
+            float xf[8];
+            bf16x8(reinterpret_cast<const uint4 *>(x + (size_t)(t0 + tt) * H)[i], xf);
+#pragma unroll
+            for (int j = 0; j < 8; ++j) acc[tt] = fmaf(wf[j], xf[j], acc[tt]);
+        }
+    }
+}
+
+__global__ void __launch_bounds__(kLogitsWarps * 32)
 router_logits_kernel(const __nv_bfloat16 *__restrict__ x, int H, const __nv_bfloat16 *__restrict__ w, int n_w,
                      const __nv_bfloat16 *__restrict__ w_tail, int n_rows, int T, float *__restrict__ logits) {
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
-    const int e = blockIdx.x * 8 + warp;
+    const int e = blockIdx.x * kLogitsWarps + warp;
     if (e >= n_rows) return;                      /* whole warps */
     const int t0 = blockIdx.y * kLogitsTB;
     const int nt = min(kLogitsTB, T - t0);
@@ -42,19 +61,16 @@ router_logits_kernel(const __nv_bfloat16 *__restrict__ x, int H, const __nv_bflo
     float acc[kLogitsTB];
 #pragma unroll
     for (int tt = 0; tt < kLogitsTB; ++tt) acc[tt] = 0.0f;
-    for (int i = lane; i < H / 8; i += 32) {
-        float wf[8];
-        bf16x8(w4[i], wf);
+    const int nch = H / 8;
+    int i = lane;
+    for (; i + 32 * (kLogitsUnroll - 1) < nch; i += 32 * kLogitsUnroll) {
+        uint4 wv[kLogitsUnroll];
 #pragma unroll
-        for (int tt = 0; tt < kLogitsTB; ++tt) {
-            if (tt < nt) {
-                float xf[8];
-                bf16x8(reinterpret_cast<const uint4 *>(x + (size_t)(t0 + tt) * H)[i], xf);
+        for (int u = 0; u < kLogitsUnroll; ++u) wv[u] = w4[i + 32 * u];
 #pragma unroll
-                for (int j = 0; j < 8; ++j) acc[tt] = fmaf(wf[j], xf[j], acc[tt]);
-            }
-        }
+        for (int u = 0; u < kLogitsUnroll; ++u) logits_chunk(wv[u], x, H, t0, nt, i + 32 * u, acc);
     }
+    for (; i < nch; i += 32) logits_chunk(w4[i], x, H, t0, nt, i, acc);
 #pragma unroll
     for (int tt = 0; tt < kLogitsTB; ++tt) {
         float v = acc[tt];
@@ -383,9 +399,10 @@ extern "C" int pulsar_router_logits_launch(const uint16_t *x_bf16, int T, int hi
         return -1;
     }
     const int n_rows = n_w + n_tail;
-    const dim3 grid((unsigned)((n_rows + 7) / 8), (unsigned)((T + kLogitsTB - 1) / kLogitsTB));
-    router_logits_kernel<<<grid, 256, 0, stream>>>((const __nv_bfloat16 *)x_bf16, hidden, (const __nv_bfloat16 *)w, n_w,
-                                                   (const __nv_bfloat16 *)w_tail, n_rows, T, logits);
+    const dim3 grid((unsigned)((n_rows + kLogitsWarps - 1) / kLogitsWarps), (unsigned)((T + kLogitsTB - 1) / kLogitsTB));
+    router_logits_kernel<<<grid, kLogitsWarps * 32, 0, stream>>>((const __nv_bfloat16 *)x_bf16, hidden,
+                                                                 (const __nv_bfloat16 *)w, n_w,
+                                                                 (const __nv_bfloat16 *)w_tail, n_rows, T, logits);
     return launch_ok("logits") ? 0 : -3;
 }
 
