@@ -5,7 +5,7 @@
  *
  *   embed      E5   pulsar_head_embed_launch: the gather (no embedding norm) -> the residual h (bf16)
  *   per layer  (pulsar_layer_desc: a Mamba-2 or an attention mixer, the MoE or no FFN -- one HF block each)
- *       xn = rmsnorm(h) * mixer_norm                                              row ops (pulsar_cuda_rowops.h)
+ *       xn = rmsnorm(h) * mixer_norm  (layer 0; then the previous layer's last add) row ops (pulsar_cuda_rowops.h)
  *     Mamba-2:  p = bf16(xn W_in) = [z | x B C | dt]                              rows front door (linear.cpp)
  *               y = Mamba2(p) (conv + bias + SiLU, selective scan, D skip,         N2 (pulsar_cuda_mamba2.h; the
  *                   gated grouped RMSNorm)                                         SSM and conv state: F3's)
@@ -20,7 +20,9 @@
  *               f = latent_out(bf16(sum_k w_k relu2_expert_k(bf16(latent_in xn))))  the rows MoE front door: the
  *                   + shared(xn), the shared expert relu^2 on the full width          latent wrapper + relu^2 (N4)
  *               h += bf16(f)                                                      row ops
- *   head       rmsnorm(h) * output_norm -> the head linear (untied, every id real) -> E5 finish (nothing to scale)
+ *       the layer's last add also writes xn = rmsnorm(h) * the next reader's norm (the next layer's mixer norm, or
+ *       output_norm after the last layer) -- one launch (L296 perf)
+ *   head       xn -> the head linear (untied, every id real) -> E5 finish (nothing to scale)
  *
  * vLLM's NemotronHForCausalLM (models/nemotron_h.py) is the order: each HF block is `x += mixer(RMSNorm(x))`, the
  * residual bf16, each add and each norm one rounding (vLLM's fused add_rmsnorm).  pulsar groups a mixer with the MoE
@@ -244,13 +246,12 @@ ffn_scratch ffn_layout(uint32_t R) {
     return f;
 }
 
-/* HEAD: the head rows' final-norm bf16 rows and the head linear's workspace (at most PULSAR_DRIVER_HEADS_MAX rows) */
-struct head_scratch { uint64_t xb, lin, lin_bytes, total; };
+/* HEAD: the head linear's workspace (at most PULSAR_DRIVER_HEADS_MAX rows; its input is xn, the final norm) */
+struct head_scratch { uint64_t lin, lin_bytes, total; };
 head_scratch head_layout() {
     const pulsar_nemotron_h_shape &s = G();
     head_scratch h{};
-    h.xb = 0;
-    h.lin = a256((uint64_t)PULSAR_DRIVER_HEADS_MAX * s.n_embd * 2u);
+    h.lin = 0;
     h.lin_bytes = lin_ws((int)s.n_embd, (int)s.n_vocab, PULSAR_DRIVER_HEADS_MAX);
     h.total = h.lin + h.lin_bytes;
     return h;
@@ -270,7 +271,7 @@ uint64_t scratch_bytes(uint32_t arena, uint32_t max_rows, uint32_t ctx) {
 
 struct nh_step;
 /* The family's session state (the driver's buffers are its base): the residual stream and the normed rows the
- * blocks read, the trunk's step object, and the step's host tables (rebuilt by every embed). */
+ * blocks read, the trunk's step object, and the step's host tables (rebuilt by every stage). */
 struct nh_state : pulsar_driver_state {
     pulsar_gpu_tensor *h;     /* [max_rows][n_embd] bf16: the residual stream */
     pulsar_gpu_tensor *xn;    /* [max_rows][n_embd] bf16: the RMSNorm of h a block reads */
@@ -285,7 +286,15 @@ struct nh_state : pulsar_driver_state {
     uint32_t *row_pos;        /* host [max_rows]: F1's */
     int32_t *tab_a, *tab_b;   /* host [2 (max_rows + 1)]: the Mamba-2 calls' seq_first then seq_slot, as uploaded */
     uint32_t max_run_a, max_run_b;
-    pulsar_gqa_seq *seqs;     /* host [max_rows]: F1's sequences for the layer being run */
+    pulsar_gqa_seq *seqs;     /* host [max_rows]: F1's sequences for the layer being planned */
+    /* L296 perf: every attention layer's F1 call, planned by the step's host half (stage) and launched by the block
+     * from the uploaded descriptors -- the step's launches read no host value but the step's shape */
+    uint32_t n_attn;              /* attention layers in the plan */
+    uint32_t *attn_slot;          /* host [n_layer]: the layer's attention ordinal (UINT32_MAX = none) */
+    pulsar_gqa_call *attn_call;   /* host [n_attn]: this step's plans */
+    uint8_t *attn_desc_host;      /* host [n_attn][attn_stride]: this step's descriptors, staged */
+    pulsar_gpu_tensor *attn_desc; /* device [n_attn][a256(pulsar_gqa_desc_bytes(max_rows))] */
+    uint64_t attn_stride;         /* this step's descriptor stride: a256(pulsar_gqa_desc_bytes(n_rows)) */
 };
 
 struct nh_step : pulsar_driver_step {
@@ -308,6 +317,10 @@ void state_free(nh_state *st) {
     free(st->tab_a);
     free(st->tab_b);
     free(st->seqs);
+    free(st->attn_slot);
+    free(st->attn_call);
+    free(st->attn_desc_host);
+    pulsar_gpu_tensor_free(st->attn_desc);
     free(st->trunk);
     free(st);
 }
@@ -329,7 +342,14 @@ pulsar_driver_state *create(pulsar_session *s, uint32_t n_banks) {
     st->trunk = (nh_step *)xcalloc(1, sizeof(nh_step));
     st->trunk->w = W(e);
     st->trunk->st = st;
-    if (!st->h || !st->xn) {
+    st->attn_slot = (uint32_t *)xmalloc((size_t)e->plan.n_layer * sizeof(uint32_t));
+    for (uint32_t il = 0; il < e->plan.n_layer; il++)
+        st->attn_slot[il] = e->plan.desc[il].mixer == PULSAR_MIXER_ATTN_FULL ? st->n_attn++ : UINT32_MAX;
+    const uint64_t desc = a256(pulsar_gqa_desc_bytes((uint32_t)R));
+    st->attn_call = (pulsar_gqa_call *)xcalloc(st->n_attn ? st->n_attn : 1u, sizeof(pulsar_gqa_call));
+    st->attn_desc_host = (uint8_t *)xmalloc(st->n_attn ? st->n_attn * desc : 1u);
+    st->attn_desc = st->n_attn ? pulsar_gpu_tensor_alloc(st->n_attn * desc) : NULL;
+    if (!st->h || !st->xn || (st->n_attn && !st->attn_desc)) {
         fprintf(stderr, "pulsar: %s: session state allocation failed (%u banks x %d tokens)\n", ARCH, n_banks,
                 s->ctx_size);
         state_free(st);
@@ -383,7 +403,7 @@ bool emit(const float *y, uint16_t *yb, uint32_t n, uint32_t width) {
     return pulsar_rows_emit_bf16_launch(y, width, n, width, NULL, PULSAR_ROWS_SCALE_NONE, yb, width, 0) == 0;
 }
 
-/* ---- the step's tables (embed) ---------------------------------------------------------------------------------- */
+/* ---- the step's tables (stage) ---------------------------------------------------------------------------------- */
 
 /* The step's sequences: a DECODE row is one; a PREFILL run is one (a verify's runs first, rows [0, n_dec)).  The
  * Mamba-2 block runs two calls when the step verifies -- the verify rows with their per-row captures, then the prompt
@@ -456,12 +476,62 @@ pulsar_head_decl head_decl(const pulsar_nemotron_h_shape &s) {
     return hd;
 }
 
+/* L296 perf: every attention layer's F1 call planned (the step's sequences on the layer's pools), the descriptors
+ * staged at this step's stride and uploaded in one write.  Bounded at the power of two (>= one 256-key chunk) above
+ * the step's last position, capped at the pools' context: the launches then depend on the bound, not the positions
+ * (pulsar_gqa_plan), and a decode graph is recaptured once per doubling of the context. */
+bool plan_attention(const nh_step *st, uint32_t *bound_out) {
+    nh_state *q = st->st;
+    *bound_out = 0;
+    if (!q->n_attn) return true;
+    const pulsar_gqa_layer G1 = gqa_decl(st->w->shape);
+    const uint64_t tb = pulsar_gqa_kv_token_bytes(&G1);
+    uint32_t last = 0;
+    for (uint32_t r = 0; r < st->n_rows; r++) last = q->row_pos[r] > last ? q->row_pos[r] : last;
+    uint32_t bound = 256u;
+    while (bound <= last && bound < st->states->ctx) bound *= 2u;
+    if (bound > st->states->ctx) bound = st->states->ctx;
+    q->attn_stride = a256(pulsar_gqa_desc_bytes(st->n_rows));
+    for (uint32_t il = 0; il < st->plan->n_layer; il++) {
+        const uint32_t k = q->attn_slot[il];
+        if (k == UINT32_MAX) continue;
+        for (uint32_t j = 0; j < q->n_seq; j++) {
+            pulsar_gpu_tensor *pool = pulsar_state_pool(st->states, il, PULSAR_NEMOTRON_H_STATE_KV, (uint32_t)q->seq_bank[j]);
+            if (!pool) return failf("an attention layer's pool is evicted", il);
+            pulsar_gqa_seq &sq = q->seqs[j];
+            sq.kv = dptr(pool);
+            sq.bytes = pulsar_gpu_tensor_bytes(pool);
+            sq.cap = (uint32_t)(sq.bytes / tb);
+        }
+        if (pulsar_gqa_plan(&G1, q->seqs, q->n_seq, q->row_seq, q->row_pos, st->n_rows, bound,
+                            q->attn_desc_host + (size_t)k * q->attn_stride, q->attn_stride, &q->attn_call[k]) != 0)
+            return failf("the attention's plan refused", il);
+    }
+    *bound_out = bound;
+    return pulsar_gpu_tensor_write_async(q->attn_desc, 0, q->attn_desc_host, (uint64_t)q->n_attn * q->attn_stride) != 0 ||
+           fail("could not upload the attention descriptors");
+}
+
+/* L296 perf, the step's host half (pulsar_driver_ops::stage): the token ids checked, the step's tables and every
+ * attention call's descriptors uploaded.  What the launches then depend on beyond the driver's key: the attention
+ * bound (the row count and the head list are the driver's; a decode row is one sequence of one row, so the tables'
+ * shapes follow from the row count). */
+bool stage(const pulsar_driver_step *st0, uint64_t *graph_key) {
+    const nh_step *st = S(st0);
+    const pulsar_nemotron_h_shape &s = st->w->shape;
+    *graph_key = 0;
+    for (uint32_t r = 0; r < st->n_rows; r++)
+        if (st->tokens[r] < 0 || (uint32_t)st->tokens[r] >= s.n_vocab) return fail("a token id outside the vocabulary");
+    uint32_t bound = 0;
+    if (!build_tables(st) || !plan_attention(st, &bound)) return false;
+    *graph_key = 0x4E480000ull | ((uint64_t)bound << 20) | 1u;
+    return true;
+}
+
+/* tokens -> h: the gather from the ids stage uploaded (launch-only) */
 bool embed(const pulsar_driver_step *st0) {
     const nh_step *st = S(st0);
     const pulsar_nemotron_h_shape &s = st->w->shape;
-    for (uint32_t r = 0; r < st->n_rows; r++)
-        if (st->tokens[r] < 0 || (uint32_t)st->tokens[r] >= s.n_vocab) return fail("a token id outside the vocabulary");
-    if (!build_tables(st)) return false;
     const pulsar_head_decl hd = head_decl(s);
     const uint16_t *table = (const uint16_t *)wp(st, st->w->embed, "nemotron_h embed");
     const rows_scratch L = rows_layout(st->st->max_rows);
@@ -581,15 +651,8 @@ bool attention(const nh_step *st, uint32_t il, uint8_t *base, const mix_scratch 
             return failf("the q / k / v bf16 emit refused", il);
     }
     const pulsar_gqa_layer G1 = gqa_decl(s);
-    const uint64_t tb = pulsar_gqa_kv_token_bytes(&G1);
-    for (uint32_t k = 0; k < q->n_seq; k++) {
-        pulsar_gpu_tensor *pool = pulsar_state_pool(st->states, il, PULSAR_NEMOTRON_H_STATE_KV, (uint32_t)q->seq_bank[k]);
-        if (!pool) return failf("an attention layer's pool is evicted", il);
-        pulsar_gqa_seq &sq = q->seqs[k];
-        sq.kv = dptr(pool);
-        sq.bytes = pulsar_gpu_tensor_bytes(pool);
-        sq.cap = (uint32_t)(sq.bytes / tb);
-    }
+    const uint32_t slot = q->attn_slot[il];
+    if (slot == UINT32_MAX || q->attn_call[slot].n_rows != n) return failf("an attention layer the step did not plan", il);
     pulsar_gqa_io io{};
     io.q = {qb, Q, s.head_dim};
     io.k = {kb, KV, s.head_dim};
@@ -598,7 +661,8 @@ bool attention(const nh_step *st, uint32_t il, uint8_t *base, const mix_scratch 
     io.ld_out = Q;
     io.workspace = base + M.gqa;
     io.workspace_bytes = M.gqa_bytes;
-    if (pulsar_gqa_forward(&G1, q->seqs, q->n_seq, q->row_seq, q->row_pos, n, &io, 0) != 0)
+    if (pulsar_gqa_launch(&G1, &q->attn_call[slot], (const uint8_t *)dptr(q->attn_desc) + (size_t)slot * q->attn_stride,
+                          &io, 0) != 0)
         return failf("the attention refused", il);
     const pulsar_tensor *t[1] = {L.attn_o};
     const int outs[1] = {(int)E};
@@ -681,6 +745,19 @@ bool moe(const nh_step *st, uint32_t il, float *fo, uint8_t *base, const ffn_scr
 
 /* ---- the layer --------------------------------------------------------------------------------------------------- */
 
+/* layer il's mixer pre-norm weight */
+const uint16_t *mixer_norm(const nh_step *st, uint32_t il) {
+    const pulsar_nemotron_h_block &L = st->w->layer[il];
+    return (const uint16_t *)wp(st, st->plan->desc[il].mixer == PULSAR_MIXER_MAMBA2 ? L.ssm_pre_norm : L.attn_norm,
+                                "nemotron_h mixer norm");
+}
+/* L296 perf: the norm whatever reads h after layer il applies -- layer il + 1's mixer pre-norm, or the final norm the
+ * head reads after the last layer.  Layer il's last add writes it into xn in the same launch. */
+const uint16_t *next_norm(const nh_step *st, uint32_t il) {
+    if (il + 1u < st->plan->n_layer) return mixer_norm(st, il + 1u);
+    return (const uint16_t *)wp(st, st->w->output_norm, "nemotron_h norm_f");
+}
+
 /* block[PULSAR_LAYER_BLOCKS]: one layer as its description says -- the mixer's HF block, then the MoE's when it has
  * one, each `h += sublayer(rmsnorm(h))` */
 bool block(const pulsar_driver_step *st0, uint32_t il) {
@@ -694,19 +771,24 @@ bool block(const pulsar_driver_step *st0, uint32_t il) {
         return failf("a layer description that is not {Mamba-2 | full attention} x {MoE | none}", il);
     const uint32_t n = st->n_rows, E = s.n_embd;
     uint16_t *h = (uint16_t *)dptr(q->h), *xn = (uint16_t *)dptr(q->xn);
-    /* the mixer's HF block */
-    const uint16_t *mn = (const uint16_t *)wp(st, is_mamba ? L.ssm_pre_norm : L.attn_norm, "nemotron_h mixer norm");
-    if (!mn || pulsar_rows_rmsnorm_launch(h, E, n, E, mn, s.rms_eps, xn, E, 0) != 0)
-        return failf("the mixer norm refused", il);
+    /* the mixer's HF block: its pre-norm is the previous layer's last add's (L296 perf: next_norm); layer 0 norms the
+     * embedding here */
+    if (il == 0) {
+        const uint16_t *mn = mixer_norm(st, 0);
+        if (!mn || pulsar_rows_rmsnorm_launch(h, E, n, E, mn, s.rms_eps, xn, E, 0) != 0)
+            return failf("the mixer norm refused", il);
+    }
+    /* the layer's last add also norms the new h for what reads it next (vLLM's fused add_rmsnorm; the norm of the
+     * rounded sum, rowops: the bytes of the add then the norm) */
+    const uint16_t *nn = next_norm(st, il);
+    if (!nn) return failf("the next pre-norm's weight is missing", il);
     const mix_scratch M = mix_layout(q->max_rows, st->states->ctx);
     uint8_t *mbase = (uint8_t *)dptr(q->scratch[ARENA_MIX]);
     if (!(is_mamba ? mamba(st, il, mbase, M) : attention(st, il, mbase, M))) return false;
     dump_rows(st, "nemotron_mix", q->scratch[ARENA_MIX], M.db, E, il);
-    /* h += delta, and the MoE's pre-norm of the new h in the same launch (vLLM's fused add_rmsnorm) */
-    const uint16_t *fn = is_moe ? (const uint16_t *)wp(st, L.ffn_norm, "nemotron_h ffn norm") : NULL;
-    if ((is_moe && !fn) ||
-        pulsar_rows_add_launch(h, E, (const uint16_t *)(mbase + M.db), E, n, E, fn, s.rms_eps, is_moe ? xn : NULL, E,
-                               0) != 0)
+    /* h += delta, and the pre-norm of the new h in the same launch: the MoE's, else the next reader's */
+    const uint16_t *fn = is_moe ? (const uint16_t *)wp(st, L.ffn_norm, "nemotron_h ffn norm") : nn;
+    if (!fn || pulsar_rows_add_launch(h, E, (const uint16_t *)(mbase + M.db), E, n, E, fn, s.rms_eps, xn, E, 0) != 0)
         return failf("the mixer's residual add refused", il);
     if (!is_moe) return true;
     dump_rows(st, "nemotron_mid", q->h, 0, E, il);
@@ -718,23 +800,20 @@ bool block(const pulsar_driver_step *st0, uint32_t il) {
     if (!moe(st, il, fo, fbase, F)) return false;
     if (!emit(fo, db, n, E)) return failf("the MoE bf16 emit refused", il);
     dump_rows(st, "nemotron_ffn", q->scratch[ARENA_FFN], F.db, E, il);
-    return pulsar_rows_add_launch(h, E, db, E, n, E, NULL, 0.0f, NULL, 0, 0) == 0 ||
+    return pulsar_rows_add_launch(h, E, db, E, n, E, nn, s.rms_eps, xn, E, 0) == 0 ||
            failf("the MoE's residual add refused", il);
 }
 
-/* step rows [row0, row0 + n) -> logits rows [out0, out0 + n): the final norm, the head linear (the decode arm at every
- * call: a row's logits never depend on the rows beside it), E5's finish (no scale, no padding: nothing launches) */
+/* step rows [row0, row0 + n) -> logits rows [out0, out0 + n): the head linear over the final norm of h (the last
+ * layer's last add wrote it into xn, next_norm; the decode arm at every call: a row's logits never depend on the rows
+ * beside it), E5's finish (no scale, no padding: nothing launches) */
 bool head(const pulsar_driver_step *st0, uint32_t row0, uint32_t n, uint32_t out0) {
     const nh_step *st = S(st0);
     const pulsar_nemotron_h_shape &s = st->w->shape;
     if (n == 0 || out0 + n > PULSAR_DRIVER_HEADS_MAX || row0 + n > st->n_rows) return fail("head rows out of range");
     const head_scratch H = head_layout();
     uint8_t *base = (uint8_t *)dptr(st->st->scratch[ARENA_HEAD]);
-    uint16_t *xb = (uint16_t *)(base + H.xb);
-    const uint16_t *on = (const uint16_t *)wp(st, st->w->output_norm, "nemotron_h norm_f");
-    if (!on || pulsar_rows_rmsnorm_launch((const uint16_t *)dptr(st->st->h) + (size_t)row0 * s.n_embd, s.n_embd, n,
-                                          s.n_embd, on, s.rms_eps, xb, s.n_embd, 0) != 0)
-        return fail("the final norm refused");
+    const uint16_t *xb = (const uint16_t *)dptr(st->st->xn) + (size_t)row0 * s.n_embd;
     pulsar_rows_linear l{};
     float *logits = (float *)dptr(st->buf->logits) + (size_t)out0 * s.n_vocab;
     if (!pulsar_linear_rows_ref(st->model, st->w->head, (int)s.n_embd, (int)s.n_vocab, false, "nemotron_h lm_head", &l) ||
@@ -827,5 +906,6 @@ const pulsar_driver_ops PULSAR_NEMOTRON_H_DRIVER = {
     /* .image_rows    = */ NULL,   /* images: N11 */
     /* .dump          = */ dump,
     /* .artifact      = */ artifact,
+    /* .stage         = */ stage,   /* L296 perf: the host half; the ops are launch-only (a decode step graphs) */
 };
 static_assert(PULSAR_LAYER_BLOCKS == 4 && PULSAR_LAYER_KIND_COUNT == 5, "the block table's slot is the kind's value");

@@ -280,6 +280,10 @@ void pulsar_gpu_seg_note_device_free(void); /* REQUIRED at every grow-realloc
 /** Process-lifetime segment counters: graphs replayed and captures begun (L292: a gate proves it ran the replay
  *  lane, or the eager one, by their movement across its steps). */
 void pulsar_gpu_seg_counts(uint64_t *replays, uint64_t *captures);
+/** L296 perf, instruments only: 0 runs every segment eager (the cache dropped, nothing captured or replayed) -- the
+ *  eager reference a gate compares the graphed lane against (nemotron-fwd-gate X7); 1 restores.  Returns the previous
+ *  setting.  The engine never calls it. */
+int pulsar_gpu_seg_set_enabled(int on);
 
 int pulsar_gpu_set_model_map(const void *model_map, uint64_t model_size);
 int pulsar_gpu_set_model_fd(int fd);

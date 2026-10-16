@@ -124,8 +124,8 @@ uint64_t pulsar_mamba2_upd_floats(const pulsar_mamba2_geom *g);
 /** Scratch bytes a call of `rows` rows needs (the conv output, y, dt and dA). */
 size_t pulsar_mamba2_scratch_bytes(const pulsar_mamba2_geom *g, uint32_t rows);
 
-/** Run the block for one layer on `stream` (four launches: conv, dt, scan,
- *  norm).  Advances every sequence's conv slot and (without ssm_capture) its
+/** Run the block for one layer on `stream` (conv, [dt / dA: a run longer than
+ *  16 rows only -- else the scan stages them], scan, norm).  Advances every sequence's conv slot and (without ssm_capture) its
  *  SSM slot; writes the captures when set.
  *  @return 0, -1 on a refused contract (named on stderr, nothing launched),
  *  -3 on a launch failure. */
