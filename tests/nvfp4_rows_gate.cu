@@ -11,7 +11,8 @@
  *      16, the LiLiCorr drafter's shapes (the MLP and head ones; the wide head at a reduced row count).
  *   2. bytes: the bf16 output == the f32 output rounded to nearest even; a repeated call is bit-identical
  *      (deterministic: no atomics, a fixed summation order).
- *   3. M-independence: M = 1, 3, 8, 9 and 20 (16-row blocks) -- each row the bytes of the same row at M = 16.
+ *   3. M-independence: M = 1, 3, 8, 9, 20 and (prompt widths, 64-row launches) 40 and 100 -- each row the bytes of
+ *      the same row at M = 16 or alone: a prompt row is a decode row's bytes.
  *   4. the front door (pulsar_rows_linear_launch with an nvfp4 reference) == the arm; refusals (in % 64, no output,
  *      misaligned weight, an nvfp4 reference carrying an EXL3 rate).
  *   5. the multi launch (a gate and an up of one input, one launch; pulsar_nvfp4_rows_multi_launch) and the front
@@ -137,7 +138,7 @@ static void section_exact(void) {
         {1024, 1024, "1024 -> 1024 (head down)"},   {512, 1000, "out off 16"},
         {640, 200, "out off 128, in off 128"},      {4096, 40960, "wide, K unsplit"},
         {20480, 4096, "20480 -> 4096 (fc)"}};
-    const int MR = 20;
+    const int MR = 100;
     for (const shape &sh : shapes) {
         const fix f = make_fix(sh.in, sh.out, true);
         const std::vector<uint16_t> X = rnd_rows(MR, f.in);
@@ -191,16 +192,18 @@ static void section_exact(void) {
             const std::vector<float> y = run(M, 0, nullptr);
             diff += memcmp(y.data(), y16.data(), y.size() * 4) != 0;
         }
-        const std::vector<float> y20 = run(MR, 0, nullptr);
-        diff += memcmp(y20.data(), y16.data(), y16.size() * 4) != 0;
-        for (int r : {16, 19}) {
-            const std::vector<float> y1 = run(1, r, nullptr);
-            diff += memcmp(y1.data(), y20.data() + (size_t)r * f.out, (size_t)f.out * 4) != 0;
+        for (int M : {20, 40, MR}) {
+            const std::vector<float> yw = run(M, 0, nullptr);
+            diff += memcmp(yw.data(), y16.data(), y16.size() * 4) != 0;
+            for (int r : {16, M - 1}) {
+                const std::vector<float> y1 = run(1, r, nullptr);
+                diff += memcmp(y1.data(), yw.data() + (size_t)r * f.out, (size_t)f.out * 4) != 0;
+            }
         }
-        CHECK(diff == 0, "%s: %zu calls (M = 1, 3, 8, 9, 20 and rows 16, 19 alone) differ from the same rows of M = 16",
+        CHECK(diff == 0, "%s: %zu calls (M = 1, 3, 8, 9; 20, 40, 100 and their rows alone) differ from the same rows",
               sh.what, diff);
         printf("  %-28s K split %d: worst err/sum|wx| %.2e; bf16 out rel err %.3e (bf16 floor %.3e); bf16 == f32 "
-               "rounded %s; repeat %s; M = 1..20 %s\n", sh.what, pulsar_nvfp4_ksplit(f.in, f.out), worst,
+               "rounded %s; repeat %s; M = 1..100 %s\n", sh.what, pulsar_nvfp4_ksplit(f.in, f.out), worst,
                sqrt(e2 / r2), sqrt(f2 / r2), badb ? "NO" : "yes", repeat ? "bit-identical" : "DIFFERS",
                diff ? "DIFFER" : "bit-identical");
         /* 4. the front door */
@@ -333,6 +336,30 @@ static void section_bench(void) {
                        "mlp gate+up", f.in, f.out, M, tm, 2.0 * f.blob.size() / tm / 1e3, 2 * tn);
                 cudaFree(dW2);
             }
+        }
+        if (f.out == 4096 && f.in == 20480) {   /* fc at prefill: prompt widths, 64-row launches */
+            const int MP = 512;
+            const std::vector<uint16_t> XP = rnd_rows(MP, f.in);
+            uint16_t *dXP = upload(XP);
+            float *dYP = nullptr;
+            CUDA_OK(cudaMalloc((void **)&dYP, (size_t)MP * f.out * 4));
+            for (int M : {64, MP}) {
+                std::vector<float> t;
+                for (int it = 0; it < 13; it++) {
+                    CUDA_OK(cudaMemsetAsync(flush, it, flush_b, 0));
+                    CUDA_OK(cudaEventRecord(e0));
+                    pulsar_nvfp4_rows_linear_launch(dW, dXP, M, f.in, f.out, dYP, nullptr, 0);
+                    CUDA_OK(cudaEventRecord(e1));
+                    CUDA_OK(cudaEventSynchronize(e1));
+                    float ms = 0;
+                    CUDA_OK(cudaEventElapsedTime(&ms, e0, e1));
+                    if (it >= 3) t.push_back(ms * 1000.0f);
+                }
+                std::sort(t.begin(), t.end());
+                printf("  %-16s %6d %7d  %3d  %10.1f us  (prompt rows: %.2f us a row)\n", "fc (prompt)", f.in, f.out, M,
+                       (double)t[t.size() / 2], (double)t[t.size() / 2] / M);
+            }
+            cudaFree(dXP); cudaFree(dYP);
         }
         cudaFree(dW); cudaFree(dB); cudaFree(dX); cudaFree(dY);
     }

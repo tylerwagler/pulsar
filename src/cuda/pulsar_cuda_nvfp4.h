@@ -41,13 +41,14 @@ static inline bool pulsar_nvfp4_layout(uint64_t in, uint64_t out, uint64_t *valu
 }
 
 /** The K split of an [out][in] nvfp4 Linear: the smallest S in 1, 2, 4, 8 giving >= the target CTA count (8 / S
- *  16-row groups each, 192: four a GB10 SM) with in % (64 S) == 0.  A function of the shape alone: it fixes the
+ *  16-row groups each, 192: four a GB10 SM) with in % (256 S) == 0 (whole 256-input super-steps a slice).  A function of the shape alone: it fixes the
  *  summation order. */
 int pulsar_nvfp4_ksplit(int in, int out);
 
 /** y [rows][out] f32 = W x (and, when y_bf16 is non-NULL, the same values rounded to nearest-even bf16 in
  *  y_bf16 [rows][out]) for an nvfp4 slice `w` (pulsar_nvfp4_layout) and bf16 rows x [rows][in].  w, x 16-byte
- *  aligned.  Every row kind takes the one kernel (16-row blocks): a prompt row is the bytes a decode row is.
+ *  aligned.  Every row kind takes the one kernel (up to 64 rows a launch: a prompt chunk reads the weight once a 64
+ *  rows) and a row's bytes do not depend on the launch: a prompt row is the bytes a decode row is.
  *  Refuses (-1) on a contract violation. */
 int pulsar_nvfp4_rows_linear_launch(const void *w, const uint16_t *x_bf16, int rows, int in, int out, float *y,
                                     uint16_t *y_bf16, cudaStream_t stream);
