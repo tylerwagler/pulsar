@@ -837,12 +837,7 @@ bool draft_pass(pulsar_session *s, const uint32_t *banks, const int32_t *carry, 
                 pulsar_blockdraft_rows_copy_launch(x + (uint64_t)(i * B + 1u) * E, E, SL, E,
                                                    (uint16_t *)(base + D.pass) + (uint64_t)i * SL * E, E, 0) != 0)
                 return fail("the candidates' top-k refused");
-        return pulsar_lilicorr_head_launch(&l->head, nb, (const int32_t *)(base + D.cand_id),
-                                           (const float *)(base + D.cand_lp), table, (const uint16_t *)(base + D.pass),
-                                           (const uint16_t *)(base + D.anchor), (const uint8_t *)(base + D.valid),
-                                           (float *)(base + D.scores), (int32_t *)(base + D.chain_ids),
-                                           (int32_t *)(base + D.chain_rows), base + D.head_ws, D.head_ws_bytes, 0) == 0 ||
-               fail("the candidate head refused");
+        return true;
     };
     /* one graph per (lane, banks, bound); eager while the dump reads the pass */
     uint64_t key = 0;
@@ -862,10 +857,20 @@ bool draft_pass(pulsar_session *s, const uint32_t *banks, const int32_t *carry, 
     } else if (seg == 0) {
         ok = launches();
     }
+    /* the candidate head after the graph, its own launches: its lattice attention's cuBLASLt batched GEMM refuses
+     * inside a stream capture (status 14), so it runs eager behind the replay */
+    ok = ok && (pulsar_lilicorr_head_launch(&l->head, nb, (const int32_t *)(base + D.cand_id),
+                                            (const float *)(base + D.cand_lp), table, (const uint16_t *)(base + D.pass),
+                                            (const uint16_t *)(base + D.anchor), (const uint8_t *)(base + D.valid),
+                                            (float *)(base + D.scores), (int32_t *)(base + D.chain_ids),
+                                            (int32_t *)(base + D.chain_rows), base + D.head_ws, D.head_ws_bytes,
+                                            0) == 0 ||
+                fail("the candidate head refused"));
     if (ok && !l->announced) {
         l->announced = true;
-        fprintf(stderr, "pulsar: block drafter: the draft pass (%u bank(s) of %u rows) runs %s; its chain is the "
-                        "LiLiCorr head's walk\n", nb, B, key ? "as one captured graph a (banks, bound)" : "eager (dump)");
+        fprintf(stderr, "pulsar: block drafter: the draft pass (%u bank(s) of %u rows) runs %s, the candidate head "
+                        "behind it eager; its chain is the head's walk\n", nb, B,
+                key ? "as one captured graph a (banks, bound)" : "eager (dump)");
     }
     if (!ok) return false;
     if (!pulsar_gpu_tensor_read(l->arena, D.cand_id, l->cand_id.data(), (uint64_t)nb * SL * K * 4u) ||

@@ -29,6 +29,8 @@
  *       override, a call's structure greedy and its payload sampled, flips inside a round): every other run of 3
  *       positions greedy, the plain stream drawing each token at its position's mode and the rounds through
  *       pulsar_spec_step::greedy_rows -- == each bank's plain stream, rounds that cross between the modes counted
+ *   M6  (L298) the prefix-cache must-pass: the next turn synced on the session that served a speculative stream (the
+ *       reuse) == the same text synced cold, every trunk and drafter slot byte for byte, the same logits
  *
  * --probe (the draft grade's capture, tests/nemotron_mtp_grade.py): the first draft step's logits at every position of
  * a reference prompt, teacher-forced by the trunk (the lane's probe: each lockstep module row headed) -- the DECODE
@@ -553,6 +555,42 @@ static int exact(pulsar_engine *e, int n, const char *only) {
                   "positions greedy, %zu tokens", i, RUN, plain_m[i].out.size());
         }
         batched_lane(e, P, n, W, plain_m, "M5", 0.7f, 0x70015ULL, RUN);
+    }
+    /* M6 (L298, the prefix-cache must-pass): a conversation's next turn on the session that served the last one -- its
+     * sync reuses the prefill-only history from a grid checkpoint and prefills the rest -- holds the cold sync's
+     * state byte for byte, every trunk slot and every drafter slot (the drafter's context: its drafts from here are
+     * the cold session's), and the same logits */
+    drafter_at_depth(e, 0);
+    for (size_t i = 0; on('6') && i < 2; i++) {
+        pulsar_session *wa = NULL, *co = NULL;
+        const stream sp = run(e, P[i], n, true, 0.0f, 0, NULL, &wa);
+        pulsar_tokens full;
+        memset(&full, 0, sizeof(full));
+        for (int k = 0; k < P[i].len; k++) pulsar_tokens_push(&full, P[i].v[k]);
+        for (int32_t t : sp.out)
+            if (!pulsar_token_is_stop(e, t)) pulsar_tokens_push(&full, t);
+        for (int k = 0; k < P[3].len; k++) pulsar_tokens_push(&full, P[3].v[k]);   /* the next turn's text */
+        char err[256] = "";
+        bool ok = wa && sp.ok && pulsar_session_sync(wa, &full, err, sizeof(err)) == 0;
+        pulsar_engine_set_bank_pool(1);
+        ok = ok && pulsar_session_create(&co, e, 4096) == 0 && co && pulsar_session_sync(co, &full, err, sizeof(err)) == 0;
+        const uint32_t len = (uint32_t)full.len;
+        CHECK(ok && wa->states->bank_pos[0] == len && co->states->bank_pos[0] == len,
+              "M6 prompt %zu: the next turn (%u tokens) synced on the served session and cold: %s", i, len, err);
+        if (ok) {
+            const pulsar_state_plan *p = wa->states->plan;
+            size_t nt = 0, nd = 0;
+            const std::string tdiff = state_diff(bank_state(wa, 0, 0, p->n_trunk, len), bank_state(co, 0, 0, p->n_trunk, len), &nt);
+            const std::string ddiff = state_diff(bank_state(wa, 0, p->n_trunk, p->n_slots, len - 1u),
+                                                 bank_state(co, 0, p->n_trunk, p->n_slots, len - 1u), &nd);
+            CHECK(tdiff.empty() && ddiff.empty(), "M6 prompt %zu: the reused session's state == the cold sync's, byte for "
+                  "byte (trunk %zu bytes%s%s; drafter %zu bytes%s%s)", i, nt, tdiff.empty() ? "" : ", differs: ",
+                  tdiff.c_str(), nd, ddiff.empty() ? "" : ", differs: ", ddiff.c_str());
+            CHECK(logits_of(wa, W) == logits_of(co, W), "M6 prompt %zu: the same logits after the sync", i);
+        }
+        pulsar_tokens_free(&full);
+        if (wa) pulsar_session_free(wa);
+        if (co) pulsar_session_free(co);
     }
     drafter_at_depth(e, 0);
     e->lane_cost[PULSAR_LANE_SPEC] = g_cost0;
