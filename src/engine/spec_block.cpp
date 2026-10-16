@@ -831,8 +831,8 @@ bool draft_pass(pulsar_session *s, const uint32_t *banks, const int32_t *carry, 
             if (pulsar_rows_topk_logprob_launch(logits + (uint64_t)(i * B + 1u) * V, V, SL, V, K,
                                                 (int32_t *)(base + D.cand_id) + (uint64_t)i * SL * K,
                                                 (float *)(base + D.cand_lp) + (uint64_t)i * SL * K, 0) != 0 ||
-                !pulsar_gpu_tensor_copy_async(l->arena, D.pass + (uint64_t)i * SL * E * 2u, l->arena,
-                                              D.x + (uint64_t)(i * B + 1u) * E * 2u, (uint64_t)SL * E * 2u))
+                pulsar_blockdraft_rows_copy_launch(x + (uint64_t)(i * B + 1u) * E, E, SL, E,
+                                                   (uint16_t *)(base + D.pass) + (uint64_t)i * SL * E, E, 0) != 0)
                 return fail("the candidates' top-k refused");
         return pulsar_lilicorr_head_launch(&l->head, nb, (const int32_t *)(base + D.cand_id),
                                            (const float *)(base + D.cand_lp), table, (const uint16_t *)(base + D.pass),
