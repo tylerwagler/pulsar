@@ -1236,7 +1236,7 @@ int main(int argc, char **argv) {
             server_log(PULSAR_LOG_KVCACHE,
                        "pulsar-server: persisting slot %d KV cache before shutdown tokens=%d",
                        i, tokens->len);
-            s.kv_cache_persist(sl, "shutdown");
+            s.kv_cache_persist(sl, "shutdown", true);
         }
     }
     s.close_resources();

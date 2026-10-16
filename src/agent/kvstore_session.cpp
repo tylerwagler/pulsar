@@ -185,7 +185,7 @@ int agent_kv_load(agent_worker *w, const pulsar_tokens *tokens) {
 void agent_kv_persist(agent_worker *w, const char *what) {
     if (!w->kv) return;
     pulsar_kvchain_persist_result r;
-    pulsar_kvchain_persist(w->kv, w->engine, w->session, 0, NULL, &r);
+    pulsar_kvchain_persist(w->kv, w->engine, w->session, 0, true, NULL, &r);
     if (r.err[0]) {
         agent_buf b = {0};
         agent_buf_puts(&b, "pulsar-agent: ");

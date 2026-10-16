@@ -923,7 +923,7 @@ bool server::worker_evict_one(bool protect[PULSAR_SESSION_POOL_CAP]) {
     if (switched && s->kv.enabled && live_tokens >= s->kv.opt.min_tokens) {
         /* L264 S4: persisting is idempotent -- a chain the store already holds
          * writes nothing -- so "stored" is "the store holds this history". */
-        s->kv_cache_persist(sl, "evict");
+        s->kv_cache_persist(sl, "evict", true);
         stored = true;
     }
     if (!stored && live_tokens > 0) {
@@ -1808,7 +1808,7 @@ bool server::spill_bank(session_slot *victim) {
         return false;
     }
     const double t0 = server_now_sec();
-    s->kv_cache_persist(victim, "spill");
+    s->kv_cache_persist(victim, "spill", true);
     pulsar_session_bank_state_save(pool, vb);         /* preserve host carry for restore */
     if (!pulsar_session_bank_state_restore(pool, 0)) return false;
     s->live_bank = 0;

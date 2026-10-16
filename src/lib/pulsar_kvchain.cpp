@@ -31,7 +31,16 @@ pulsar_tokens view(const pulsar_tokens *t, int from, int to) {
 }
 }  // namespace
 
-int pulsar_kvchain_persist(pulsar_segstore *st, pulsar_engine *e, pulsar_session *s, int min_tokens,
+int pulsar_kvchain_segment_ends(const int *Gs, int n, int prev, int span, bool close, int *ends) {
+    int m = 0;
+    for (int k = 0; k < n; k++) {
+        if (Gs[k] <= prev) continue;
+        if (Gs[k] - prev >= span || (close && k == n - 1)) ends[m++] = prev = Gs[k];
+    }
+    return m;
+}
+
+int pulsar_kvchain_persist(pulsar_segstore *st, pulsar_engine *e, pulsar_session *s, int min_tokens, bool close,
                            const pulsar_kvchain_trailer *trailer, pulsar_kvchain_persist_result *out) {
     pulsar_kvchain_persist_result r;
     memset(&r, 0, sizeof(r));
@@ -74,9 +83,11 @@ int pulsar_kvchain_persist(pulsar_segstore *st, pulsar_engine *e, pulsar_session
             }
         }
     }
-    for (int k = n - 1; k >= 0; k--) {
-        const int G = Gs[k];
-        if (G <= prev) continue;
+    int up[PULSAR_KVCHAIN_MAX], ends[PULSAR_KVCHAIN_MAX];
+    for (int k = 0; k < n; k++) up[k] = Gs[n - 1 - k];
+    const int m = pulsar_kvchain_segment_ends(up, n, prev, pulsar_session_prefill_cap(s), close, ends);
+    for (int k = 0; k < m; k++) {
+        const int G = ends[k];
         const pulsar_tokens span = view(toks, prev, G);
         size_t text_len = 0;
         char *text = pulsar_kvtext_render_tokens_text(e, &span, &text_len);

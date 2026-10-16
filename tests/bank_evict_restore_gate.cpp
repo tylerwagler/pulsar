@@ -10,7 +10,8 @@
  *   1. prefill bank 0 to L tokens; capture its frontier; CHECKSUM its comp/index
  *      rows (raw D2H fold).
  *   2. save bank 0 as a chain of SEGMENTS, one per grid checkpoint it holds
- *      (server: kv_cache_persist "spill").
+ *      (server: kv_cache_persist "spill" ends segments at a chunk-spaced subset
+ *      of them, pulsar_kvchain_segment_ends; every one here is the stricter test).
  *   3. repoint to bank 1       -- bank 0 is now idle (free_physical refuses cur).
  *   4. free_physical(bank 0)   -- DIRECT cudaFree of bank 0's split comp/index;
  *      assert is_evicted==true.  The cudaMemGetInfo delta is PRINTED, not
@@ -133,7 +134,7 @@ static void frontier_coverage(const pulsar_gpu_graph *g, uint32_t bank, int L) {
 }
 
 /* Bank `cur`'s grid checkpoints as a segment chain, root first, each in its own
- * tmpfile rewound for reading -- what kv_cache_persist writes for a spill.
+ * tmpfile rewound for reading -- the segments a spill writes, at every checkpoint.
  * Returns the chain length; 0 on failure (err says why). */
 #define GATE_CHAIN_MAX 64
 static int save_chain(pulsar_session *s, int limit, FILE **fp, uint64_t *bytes, int *Gs, char *err, size_t errlen) {

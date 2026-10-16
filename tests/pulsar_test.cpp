@@ -1183,7 +1183,7 @@ static void test_image_chain_round_trip(void) {
     TEST_ASSERT(ok);
     pulsar_kvchain_persist_result pr;
     memset(&pr, 0, sizeof pr);
-    if (ok) pulsar_kvchain_persist(st, engine, sa, 0, NULL, &pr);
+    if (ok) pulsar_kvchain_persist(st, engine, sa, 0, true, NULL, &pr);
     fprintf(stderr, "image-chain gate: %d-token prompt, block at %d; persisted %d segment(s) to %d%s%s\n", prompt.len,
             img.start_pos, pr.written, pr.end, pr.err[0] ? " -- " : "", pr.err);
     TEST_ASSERT(pr.written > 0 && pr.end > img.start_pos);   /* the chain goes past the image */

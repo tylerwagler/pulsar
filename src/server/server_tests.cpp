@@ -11,6 +11,7 @@
 #include "deepseek_dsml.h"
 #include "lib/pulsar_writeback.h"
 #include "lib/pulsar_segstore.h"
+#include "lib/pulsar_kvchain.h"
 #include "lib/bpe_tokenizer.h"
 #include "lib/nemotron_chat.h"
 
@@ -6060,6 +6061,33 @@ static void test_l264_segstore_chain_lookup(void) {
     TEST_ASSERT(system(cmd) == 0);
 }
 
+/* L264: where a persist ends segments.  A prompt riding decode steps lands a grid checkpoint every 128-token
+ * slice; the store writes one segment per prefill chunk (4096) of it, and the chain's end only when the persist
+ * closes (prompt end, evict, spill) -- never one segment per slice (2026-10-16: 133 segments, 35 GB in 10 min). */
+static void test_l264_kvchain_segment_ends(void) {
+    int ends[16];
+    /* riding slices: the four retained checkpoints just after 4096 landed, chain stored to 0 */
+    const int riding[] = { 3712, 3840, 3968, 4096 };
+    TEST_ASSERT(pulsar_kvchain_segment_ends(riding, 4, 0, 4096, false, ends) == 1 && ends[0] == 4096);
+    /* the next slice: nothing until a whole chunk past the stored end */
+    const int next[] = { 3968, 4096, 4224 };
+    TEST_ASSERT(pulsar_kvchain_segment_ends(next, 3, 4096, 4096, false, ends) == 0);
+    /* the prompt's end closes the chain at its deepest checkpoint */
+    const int fin[] = { 8192, 8832, 8960, 9088 };
+    TEST_ASSERT(pulsar_kvchain_segment_ends(fin, 4, 8192, 4096, true, ends) == 1 && ends[0] == 9088);
+    TEST_ASSERT(pulsar_kvchain_segment_ends(fin, 4, 8192, 4096, false, ends) == 0);
+    /* a chunked prefill (checkpoints a chunk apart, the last at the final cut) stores every one, as before */
+    const int chunked[] = { 4096, 8192, 11648 };
+    TEST_ASSERT(pulsar_kvchain_segment_ends(chunked, 3, 0, 4096, false, ends) == 2 && ends[0] == 4096 &&
+                ends[1] == 8192);
+    TEST_ASSERT(pulsar_kvchain_segment_ends(chunked, 3, 0, 4096, true, ends) == 3 && ends[2] == 11648);
+    /* a resumed history: spans count from the stored end, not from 0 */
+    const int resumed[] = { 5120, 9216, 9344 };
+    TEST_ASSERT(pulsar_kvchain_segment_ends(resumed, 3, 5120, 4096, false, ends) == 1 && ends[0] == 9216);
+    /* a stored chain at or past the deepest checkpoint: nothing new, closing or not */
+    TEST_ASSERT(pulsar_kvchain_segment_ends(fin, 4, 9088, 4096, true, ends) == 0);
+}
+
 /* L264: releasing one chain's KV (the agent's /strip and /del) takes only the
  * stretch no other chain shares, never past the stop (the system prompt), and
  * nothing at all from a tip a longer chain extends. */
@@ -9485,6 +9513,7 @@ static void pulsar_server_unit_tests_run(void) {
     test_writeback_preserves_bytes();
     test_sha1_bytes_hex_matches_known_vector();
     test_l264_segstore_chain_lookup();
+    test_l264_kvchain_segment_ends();
     test_l264_segstore_eviction_and_hygiene();
     test_l264_segstore_release();
     test_l179_tool_admission_is_bound_decode_only();

@@ -6,8 +6,14 @@
  * sessions run.
  *
  * persist: extend the chain the store already holds for the installed bank's
- *   history by one segment per grid checkpoint past it, so a write costs only
- *   the new tokens.  The stored chain is this history only if the bank's own
+ *   history by segments ending at the bank's grid checkpoints past it, so a
+ *   write costs only the new tokens.  A segment spans at least one prefill
+ *   chunk (pulsar_session_prefill_cap): a segment carries the whole checkpoint
+ *   (a recurrent family's state, a drafter's ring), so a prompt riding decode
+ *   steps in grid-sized slices stores what a chunked prefill of it stores, not
+ *   one segment per slice.  A closing persist (prompt end, evict, spill) also
+ *   ends the chain at the deepest checkpoint; a persist on progress stops at
+ *   the last full span.  The stored chain is this history only if the bank's own
  *   tokens up to its end render to exactly its text (same bytes at the same
  *   position, the L115 rule); otherwise a fresh chain starts at the root.
  * restore: load the deepest chain whose text is a byte prefix of `text`; the
@@ -48,11 +54,16 @@ typedef struct {
     char err[256];      ///< why the write stopped early ("" when it did not)
 } pulsar_kvchain_persist_result;
 
+/** Which of a bank's grid checkpoints `Gs` (ascending, `n` of them) end new segments of a chain stored to `prev`:
+ *  each the first checkpoint at least `span` past the segment before it, and with `close` the deepest one as well
+ *  (the chain's end).  Writes them ascending to `ends` (room for `n`); returns how many. */
+int pulsar_kvchain_segment_ends(const int *Gs, int n, int prev, int span, bool close, int *ends);
+
 /** Persist the installed bank's history (see above), never past
- *  pulsar_session_persist_end (L281: the first block whose image the session does not record).  Nothing is written
- *  when its deepest grid
+ *  pulsar_session_persist_end (L281: the first block whose image the session does not record).  `close`: end the
+ *  chain at the deepest grid checkpoint (pulsar_kvchain_segment_ends).  Nothing is written when its deepest grid
  *  checkpoint is below `min_tokens`.  Returns `written`. */
-int pulsar_kvchain_persist(pulsar_segstore *st, pulsar_engine *e, pulsar_session *s, int min_tokens,
+int pulsar_kvchain_persist(pulsar_segstore *st, pulsar_engine *e, pulsar_session *s, int min_tokens, bool close,
                            const pulsar_kvchain_trailer *trailer, pulsar_kvchain_persist_result *out);
 
 /** Restore the deepest stored chain for `text` into the installed bank (see

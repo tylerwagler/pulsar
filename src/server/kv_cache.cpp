@@ -243,8 +243,9 @@ int server::kv_tool_map_load_from_pos(FILE *fp, const stop_list *wanted) {
 
 
 /* ===== L264 S4: the disk KV cache is the segment store ====================
- * A conversation persists as a chain of segments, one per grid checkpoint its
- * bank holds (pulsar_segstore.h): each new prefill adds only the segments past
+ * A conversation persists as a chain of segments, each ending at a grid
+ * checkpoint its bank holds, at least a prefill chunk apart (pulsar_kvchain.h,
+ * pulsar_segstore.h): each new prefill adds only the segments past
  * the chain's last stored one, so a write costs the new tokens, and the chain's
  * earlier segments stay -- a client that rewrites history further back finds
  * the stretch it still shares.  A restore loads the deepest chain the request's
@@ -363,7 +364,7 @@ int seg_trailer_write(FILE *fp, void *ud, const char *text, char *err, size_t er
 }
 }  // namespace
 
-int server::kv_cache_persist(session_slot *sl, const char *reason) {
+int server::kv_cache_persist(session_slot *sl, const char *reason, bool close) {
     auto *s = this;
     (void)sl;   /* the caller installed the slot's bank */
     if (!s->kv.enabled) return 0;
@@ -375,7 +376,7 @@ int server::kv_cache_persist(session_slot *sl, const char *reason) {
     const double t0 = server_now_sec();
     const pulsar_kvchain_trailer tool_maps = { s, seg_trailer_size, seg_trailer_write };
     pulsar_kvchain_persist_result r;
-    pulsar_kvchain_persist(s->kv.st, s->engine, s->sess, s->kv.opt.min_tokens, &tool_maps, &r);
+    pulsar_kvchain_persist(s->kv.st, s->engine, s->sess, s->kv.opt.min_tokens, close, &tool_maps, &r);
     if (r.err[0])
         server_log(PULSAR_LOG_WARNING, "pulsar-server: kv cache chain not fully stored (reason=%s): %s", reason, r.err);
     if (r.written)

@@ -152,7 +152,7 @@ static void server_progress_cb(void *ud, const char *event, int current, int tot
     double elapsed = now - p->t0;
     if (p->seen && current == p->last_current) {
         if (p->srv && p->slot && current > p->cached_tokens) {
-            p->srv->kv_cache_persist(p->slot, "continued");
+            p->srv->kv_cache_persist(p->slot, "continued", false);
         }
         return;
     }
@@ -208,7 +208,7 @@ static void server_progress_cb(void *ud, const char *event, int current, int tot
                avg_tps,
                elapsed);
     if (p->srv && p->slot && current > p->cached_tokens) {
-        p->srv->kv_cache_persist(p->slot, "continued");
+        p->srv->kv_cache_persist(p->slot, "continued", false);
     }
 }
 
@@ -753,7 +753,7 @@ void server::gen_begin(session_slot *sl) {
         /* Loading a chain replaces the live bank.  Persist its history first
          * (only the segments the store lacks), so the newer conversation state
          * outlives the restore. */
-        s->kv_cache_persist(sl, "evict");
+        s->kv_cache_persist(sl, "evict", true);
     }
     if (cached == 0) {
         disk_cached = s->kv_cache_try_load(sl, &j->req, &effective_prompt,
@@ -1001,7 +1001,7 @@ void server::gen_step_prefill(session_slot *sl) {
     if (cold) {
         /* The cold prefill ended on the sys-prefix cut, a grid point, so the
          * shared preamble is a checkpoint now: persist it as its own chain. */
-        s->kv_cache_persist(sl, "sys-prefix");
+        s->kv_cache_persist(sl, "sys-prefix", true);
         pulsar_tokens_free(&g->cold_prefix);
         g->phase = GEN_PREFILL_MAIN;
         return; /* the cold store is a quantum boundary of its own */
@@ -1026,7 +1026,7 @@ void server::gen_stream_begin(session_slot *sl) {
     if (!g->anthropic_live_continuation) s->anthropic_live_clear(sl);
     pulsar_session_set_progress(s->sess, NULL, NULL);
     pulsar_session_set_display_progress(s->sess, NULL, NULL);
-    s->kv_cache_persist(sl, "prompt");
+    s->kv_cache_persist(sl, "prompt", true);
     server_log(PULSAR_LOG_PREFILL,
                "pulsar-server: %s ctx=%s%s%s prompt done %.3fs",
                j->req.kind == REQ_CHAT ? "chat" : "completion",

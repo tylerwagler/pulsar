@@ -160,7 +160,7 @@
  *
  * kv_cache_persist extends a bank's stored chain by the segments past its last
  * one (a write costs the new tokens, never the history), at prompt end, on
- * progress, at the system-prefix cut, on evict and on a Tier-2 spill -- always
+ * progress (one prefill chunk at a time), at the system-prefix cut, on evict and on a Tier-2 spill -- always
  * from checkpoints the live bank already holds; the session is never rolled
  * back to build an entry.  The store is keyed by pulsar_segstore_identity
  * (model + routed-expert format), evicts least-recently-used LEAVES first, and
@@ -1765,9 +1765,13 @@ struct server {
      * a replayed conversation can be matched against the live prefix. */
     void kv_cache_restore_tool_memory_for_messages(const chat_msgs *msgs);
     /** L264 S4: persist the INSTALLED bank's history as segments -- the chain the
-     * store already holds for this text, extended to the bank's deepest grid
-     * checkpoint.  @return segments written (0: nothing new, or disabled). */
-    int kv_cache_persist(session_slot *sl, const char *reason);
+     * store already holds for this text, extended by segments of at least one
+     * prefill chunk (pulsar_kvchain_persist) and, when `close`, to the bank's
+     * deepest grid checkpoint.  Only a store on prefill progress ("continued")
+     * leaves the chain open: a prompt riding decode steps lands a checkpoint
+     * every grid slice, and a segment per slice wrote the whole recurrent state
+     * each time.  @return segments written (0: nothing new, or disabled). */
+    int kv_cache_persist(session_slot *sl, const char *reason, bool close);
     /** Load the deepest stored chain whose text is a byte prefix of
      * `prompt_text` into the installed bank (live at the chain's end), and build
      * the prompt to sync: the exact stored tokens + the rest of the text.
