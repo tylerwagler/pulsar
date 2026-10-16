@@ -68,6 +68,13 @@ int pulsar_head_embed_launch(const pulsar_head_decl *h, const uint16_t *table, u
  *  @return 0, -1 refused, -3 launch failure. */
 int pulsar_head_logits_finish_launch(const pulsar_head_decl *h, float *logits, uint32_t n, uint64_t ld, cudaStream_t stream);
 
+/** L296 draft-cost: the gather a drafter's subset head is built with (pulsar_draft_head_build) -- y holds the head
+ *  linear of n_in one-hot rows (row i: the head's input column i; f32, ld_y apart; every id < ld_y); out[r][i] (bf16,
+ *  rows ld_out apart) = bf16_rn(y[i][ids[r]]): the head's row ids[r] over those n_in input columns.
+ *  @return 0, -1 refused (named on stderr, nothing launched), -3 launch failure. */
+int pulsar_head_draft_gather_launch(const float *y, uint64_t ld_y, uint32_t n_in, const int32_t *ids, uint32_t n,
+                                    uint16_t *out, uint64_t ld_out, cudaStream_t stream);
+
 #ifdef __cplusplus
 }
 #endif

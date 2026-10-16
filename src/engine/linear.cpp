@@ -18,7 +18,10 @@
  * against raw rows) is an arm here and a line in the table, for every family at once. */
 #include "pulsar_engine_internal.h"
 #include "exl3_trellis.h"
+#include "cuda/pulsar_cuda_head.h"
 #include "cuda/pulsar_cuda_qwen.h"
+
+#include <vector>
 
 static void say_no_arm(const pulsar_tensor *w, const char *against) {
     fprintf(stderr, "pulsar: linear: %.*s is %s, which has no dense arm against %s -- refusing\n", (int)w->name.len,
@@ -89,4 +92,59 @@ bool pulsar_linear_rows_ref(const pulsar_model *m, const pulsar_tensor *t, int i
     l->prompt = prompt;
     l->bf16 = arm == PULSAR_DENSE_ARM_BF16_ROWS;
     return l->w != NULL;
+}
+
+pulsar_gpu_tensor *pulsar_draft_head_build(const pulsar_model *m, const pulsar_tensor *head, int in, int vocab,
+                                           const int32_t *ids, uint32_t n, const char *what) {
+    constexpr int kChunk = 256;   /* one-hot rows a launch: y is kChunk x vocab f32 */
+    const uint64_t bytes = pulsar_qwen_mxfp8_bytes((int)n, in);
+    bool ok = n > 0 && (int64_t)n < vocab && in > 0 && in % kChunk == 0 && bytes != 0;
+    for (uint32_t r = 0; ok && r < n; r++) ok = ids[r] >= 0 && ids[r] < vocab && (r == 0 || ids[r] > ids[r - 1]);
+    if (!ok) {
+        fprintf(stderr, "pulsar: %s: a draft head of %u ascending ids under %d over %d inputs (a multiple of %d) -- "
+                        "refusing\n", what, n, vocab, in, kChunk);
+        return NULL;
+    }
+    pulsar_rows_linear l{};
+    if (!pulsar_linear_rows_ref(m, head, in, vocab, false, what, &l)) return NULL;
+    const uint64_t ws_bytes = pulsar_rows_linear_workspace_bytes(&l, kChunk);
+    pulsar_gpu_tensor *x = pulsar_gpu_tensor_alloc((uint64_t)kChunk * in * 2u);
+    pulsar_gpu_tensor *y = pulsar_gpu_tensor_alloc((uint64_t)kChunk * vocab * 4u);
+    pulsar_gpu_tensor *ws = pulsar_gpu_tensor_alloc(ws_bytes ? ws_bytes : 256u);
+    pulsar_gpu_tensor *dids = pulsar_gpu_tensor_alloc((uint64_t)n * 4u);
+    pulsar_gpu_tensor *wb = pulsar_gpu_tensor_alloc((uint64_t)n * in * 2u);
+    pulsar_gpu_tensor *out = pulsar_gpu_tensor_alloc(bytes);
+    ok = x && y && ws && dids && wb && out && pulsar_gpu_tensor_write(dids, 0, ids, (uint64_t)n * 4u);
+    /* the head's rows through its own arm: the linear of the one-hot rows e_j0 .. e_{j0 + kChunk - 1} is the head's
+     * input columns j0.. (y[i][v] = W[v][j0 + i]), gathered at the ids into the bf16 [n][in] staging */
+    std::vector<uint16_t> onehot((size_t)kChunk * in, 0);
+    for (int j0 = 0; ok && j0 < in; j0 += kChunk) {
+        for (int i = 0; i < kChunk; i++) {
+            if (j0 > 0) onehot[(size_t)i * in + (j0 - kChunk) + i] = 0;
+            onehot[(size_t)i * in + j0 + i] = 0x3f80u;   /* bf16 1.0 */
+        }
+        ok = pulsar_gpu_tensor_write(x, 0, onehot.data(), onehot.size() * 2u) &&
+             pulsar_rows_linear_launch(&l, (const uint16_t *)pulsar_gpu_tensor_device_ptr(x), kChunk,
+                                       (float *)pulsar_gpu_tensor_device_ptr(y), pulsar_gpu_tensor_device_ptr(ws),
+                                       ws_bytes, 0) == 0 &&
+             pulsar_head_draft_gather_launch((const float *)pulsar_gpu_tensor_device_ptr(y), (uint64_t)vocab, kChunk,
+                                             (const int32_t *)pulsar_gpu_tensor_device_ptr(dids), n,
+                                             (uint16_t *)pulsar_gpu_tensor_device_ptr(wb) + j0, (uint64_t)in, 0) == 0 &&
+             pulsar_gpu_synchronize() != 0;
+    }
+    /* stored mxfp8_lt by the producers' encoder: the mxfp8_lt rows arm's weight */
+    ok = ok && pulsar_qwen_bf16_to_mxfp8((const uint16_t *)pulsar_gpu_tensor_device_ptr(wb), NULL, (int)n, in,
+                                         pulsar_gpu_tensor_device_ptr(out), 0) == 0 &&
+         pulsar_gpu_synchronize() != 0;
+    for (pulsar_gpu_tensor *t : {x, y, ws, dids, wb}) pulsar_gpu_tensor_free(t);
+    if (!ok) {
+        fprintf(stderr, "pulsar: %s: the draft head (%u rows of %.*s) could not be built -- refusing\n", what, n,
+                (int)head->name.len, head->name.ptr);
+        pulsar_gpu_tensor_free(out);
+        return NULL;
+    }
+    fprintf(stderr, "pulsar: %s: draft head: %u of %d rows of %.*s (%s), read through its rows arm, stored MXFP8 "
+                    "(%.1f MB)\n", what, n, vocab, (int)head->name.len, head->name.ptr, tensor_type_name(head->type),
+            (double)bytes / 1e6);
+    return out;
 }

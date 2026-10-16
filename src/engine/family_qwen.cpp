@@ -1073,6 +1073,7 @@ static uint64_t qwen_mtp_cond_bytes(const pulsar_engine *) {
     return pulsar_qwen_hc_dim(&g_qwen_shape) * PULSAR_QWEN_STREAM_ELT_SIZE;
 }
 static uint32_t qwen_mtp_head_width(const pulsar_engine *e) { return e->qwen_weights->n_draft; }
+static const int32_t *qwen_mtp_head_ids(const pulsar_engine *e) { return e->qwen_weights->draft_ids; }
 
 /* the last trunk step's stacks [row0, row0 + n) into dst at off */
 static bool qwen_mtp_trunk_rows(pulsar_session *s, uint32_t row0, uint32_t n, pulsar_gpu_tensor *dst, uint64_t off) {
@@ -1134,6 +1135,7 @@ static const pulsar_mtp_ops k_qwen_mtp = {
     /* .modules       = */ qwen_mtp_modules,
     /* .cond_bytes    = */ qwen_mtp_cond_bytes,
     /* .head_width    = */ qwen_mtp_head_width,
+    /* .head_ids      = */ qwen_mtp_head_ids,
     /* .trunk_rows    = */ qwen_mtp_trunk_rows,
     /* .out_rows      = */ qwen_mtp_out_rows,
     /* .forward       = */ qwen_mtp_step,

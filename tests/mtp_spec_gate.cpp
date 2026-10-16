@@ -33,7 +33,8 @@
  * path (a sync of the first token, then one eval a token: one row a step, the decode arms) to
  * <out_dir>/mtp_decode.f32, and the PROMPT path (syncs growing by 31 tokens: each lockstep step 31 rows, the prompt
  * arms) to <out_dir>/mtp_prefill.f32; row p is the module's prediction of token p + 2 from (the trunk at p, token
- * p + 1), `positions` rows (default all but the last). */
+ * p + 1), `positions` rows (default all but the last), each the drafter's head's width -- and, when that head scores a
+ * subset of the vocabulary (a draft head, pulsar_mtp_ops::head_ids), its ids to <out_dir>/mtp_ids.i32. */
 #include "pulsar.h"
 #include "gate_entry.h"
 #include "gate_util.h"
@@ -575,7 +576,17 @@ static int probe(pulsar_engine *e, const char *ids_path, const char *out_dir, in
     if (positions <= 0 || positions > T - 1) positions = T - 1;
     CHECK(T > 32, "probe: %d reference ids from %s", T, ids_path);
     if (T <= 32) return 1;
-    const uint32_t V = (uint32_t)pulsar_engine_logits_width(e);
+    const pulsar_mtp_ops *mops = e->family->driver ? e->family->driver->mtp : NULL;
+    CHECK(mops && mops->modules(e) > 0, "probe: the engine drafts with MTP modules");
+    if (!mops || mops->modules(e) == 0) return 1;
+    const uint32_t V = mops->head_width(e);   /* the drafter's head: the vocabulary, or a draft head's rows */
+    if (const int32_t *hid = mops->head_ids ? mops->head_ids(e) : NULL) {
+        const std::string name = std::string(out_dir) + "/mtp_ids.i32";
+        FILE *fp = fopen(name.c_str(), "wb");
+        const bool ok = fp && fwrite(hid, sizeof(int32_t), V, fp) == V;
+        if (fp) fclose(fp);
+        CHECK(ok, "probe: the draft head's %u ids -> %s", V, name.c_str());
+    }
     pulsar_mtp_probe pr{};
     pr.cap = (uint32_t)T;
     pr.logits = (float *)malloc((size_t)pr.cap * V * sizeof(float));

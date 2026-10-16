@@ -77,6 +77,10 @@ typedef struct pulsar_mtp_ops {
     uint64_t (*cond_bytes)(const pulsar_engine *e);
     /** Floats a headed row's logits hold: the head's width (the vocabulary, or a draft head's rows). */
     uint32_t (*head_width)(const pulsar_engine *e);
+    /** The vocabulary id of each of a headed row's logits ([head_width], ascending), or NULL: the vocabulary itself
+     *  (logit i is id i).  A draft head scores a subset (Qwen's L288 draft vocabulary, Nemotron-H's L296 draft-cost);
+     *  the picks and q are already ids -- this is for the instruments that read the rows (the probe's grade). */
+    const int32_t *(*head_ids)(const pulsar_engine *e);
     /** The conditioning rows of the LAST TRUNK STEP's rows [row0, row0 + n) into `dst` at byte `off` (one row each,
      *  cond_bytes apart), on the session stream: what the trunk hands a module (Nemotron: norm_f of the residual,
      *  vLLM's target hidden; Qwen: the HC streams).  Valid until the next trunk step. */

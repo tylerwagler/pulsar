@@ -3214,6 +3214,13 @@ bool pulsar_linear_slot(pulsar_gpu_tensor *out, const pulsar_model *m, const pul
 struct pulsar_rows_linear;
 bool pulsar_linear_rows_ref(const pulsar_model *m, const pulsar_tensor *t, int in, int out, bool prompt,
                             const char *what, struct pulsar_rows_linear *l);
+/** L296 draft-cost: a drafter's head over a SUBSET of the vocabulary -- the rows `ids` (n, ascending, < vocab) of the
+ *  head `head` [in -> vocab], read through the head's own rows arm (whatever its format: the linear of one-hot rows
+ *  is the head's input columns), rounded to bf16 and stored mxfp8_lt [n][in] by the producers' encoder
+ *  (pulsar_qwen_bf16_to_mxfp8), the mxfp8_lt rows arm's weight: pulsar_rows_linear{w, w + n * in, 0, in, n, false}.
+ *  Built once at open; the caller frees it.  NULL = refused (said). */
+pulsar_gpu_tensor *pulsar_draft_head_build(const pulsar_model *m, const pulsar_tensor *head, int in, int vocab,
+                                           const int32_t *ids, uint32_t n, const char *what);
 /** L272 P4c: the routed MoE's front door (moe.cpp): the arm for (gate / up format, down format, activation) -- `up`
  *  NULL = a fused gate_up stack in `gate` -- from the format registry. */
 typedef enum {

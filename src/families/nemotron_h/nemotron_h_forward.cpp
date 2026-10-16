@@ -928,7 +928,7 @@ bool block(const pulsar_driver_step *st0, uint32_t il) {
 
 /* n normed bf16 rows xb -> logits rows [out0, out0 + n) of the driver's slab: the head linear (the decode arm at every
  * call: a row's logits never depend on the rows beside it), E5's finish (no scale, no padding: nothing launches).
- * The trunk's head, and the MTP module's -- the target's own (the checkpoint has no MTP head; vLLM shares it). */
+ * The trunk's head (the MTP module heads its rows with the draft head, draft_head_rows). */
 bool head_rows(const nh_step *st, const uint16_t *xb, uint32_t n, uint32_t out0) {
     const pulsar_nemotron_h_shape &s = st->w->shape;
     if (n == 0 || out0 + n > PULSAR_DRIVER_HEADS_MAX) return fail("head rows out of range");
@@ -941,6 +941,26 @@ bool head_rows(const nh_step *st, const uint16_t *xb, uint32_t n, uint32_t out0)
         return fail("the head linear refused");
     const pulsar_head_decl hd = head_decl(s);
     return pulsar_head_logits_finish_launch(&hd, logits, n, s.n_vocab, 0) == 0 || fail("the logits finish refused");
+}
+
+/* L296 draft-cost: n normed bf16 rows xb -> the DRAFT head's logits, rows [0, n) of the driver's slab n_draft apart
+ * (row r's logit i is draft_ids[i]'s): the drafter's own head (pulsar_nemotron_h_model::draft_head, MXFP8 rows of the
+ * head) through the mxfp8_lt rows arm, the decode arm at every call; the head's finish over the draft vocabulary (its
+ * ids are real ids: the scale only). */
+bool draft_head_rows(const nh_step *st, const uint16_t *xb, uint32_t n) {
+    const pulsar_nemotron_h_model *w = st->w;
+    const int H = (int)w->shape.n_embd, nd = (int)w->n_draft;
+    if (n == 0 || n > PULSAR_DRIVER_HEADS_MAX || !w->draft_head) return fail("draft head rows out of range (or no draft head)");
+    const head_scratch Hs = head_layout();
+    uint8_t *base = (uint8_t *)dptr(st->st->scratch[ARENA_HEAD]);
+    const uint8_t *hq = (const uint8_t *)pulsar_gpu_tensor_device_ptr(w->draft_head);
+    const pulsar_rows_linear l{hq, hq + (uint64_t)nd * H, 0, H, nd, false, false};
+    float *logits = (float *)dptr(st->buf->logits);
+    if (pulsar_rows_linear_launch(&l, xb, (int)n, logits, base + Hs.lin, Hs.lin_bytes, 0) != 0)
+        return fail("the draft head linear refused");
+    pulsar_head_decl hd = head_decl(w->shape);
+    hd.n_logits = hd.n_real = (uint32_t)nd;
+    return pulsar_head_logits_finish_launch(&hd, logits, n, (uint64_t)nd, 0) == 0 || fail("the draft logits finish refused");
 }
 
 /* step rows [row0, row0 + n) -> logits rows [out0, out0 + n): the head over the final norm of h (the last layer's
@@ -987,15 +1007,18 @@ bool ssm_commit(void *state, uint32_t bank, const void *rows, uint32_t keep) {
  *     x = eh_proj([enorm(embed(t_{p+1})) | hnorm(c_p)])         (embed FIRST: nemotron_h_mtp.py:106-113)
  *     x += attn(rmsnorm(x));  x += moe(rmsnorm(x))              the trunk's composition, the module's own weights,
  *                                                                its K|V on the drafter's slot
- *     o = final_layernorm(x);  logits = lm_head(o)              the target's head (shared)
+ *     o = final_layernorm(x);  logits = draft_head(o)           the target's head over the draft vocabulary
  * The conditioning row c_p is the target's hidden vLLM hands the proposer -- norm_f of the trunk's residual at p, the
  * head's input (nemotron_h.py:658) -- and deeper in a chain the module's own output o (the proposer feeds the draft
  * model's returned hidden back).  Every rounding is the trunk's at the same op: each norm, the eh_proj's one bf16
- * rounding, the residual adds. */
+ * rounding, the residual adds.  The head (L296 draft-cost): vLLM shares the target's lm_head (the checkpoint has no MTP
+ * head); ours is its rows of the draft vocabulary (draft_head_rows, MXFP8) -- 1 / 6 of the lm_head's bytes, so a draft
+ * is a draft-vocabulary token (proposals only: the verify keeps the full head and decides every token). */
 
 uint32_t mtp_modules(const pulsar_engine *e) { return W(e)->drafting ? 1u : 0u; }
 uint64_t mtp_cond_bytes(const pulsar_engine *e) { return (uint64_t)W(e)->shape.n_embd * 2u; }
-uint32_t mtp_head_width(const pulsar_engine *e) { return W(e)->shape.n_vocab; }
+uint32_t mtp_head_width(const pulsar_engine *e) { return W(e)->n_draft; }
+const int32_t *mtp_head_ids(const pulsar_engine *e) { return W(e)->draft_ids; }
 
 /* the last trunk step's rows [row0, row0 + n): norm_f of the residual (the target hidden) into dst at off */
 bool mtp_trunk_rows(pulsar_session *s, uint32_t row0, uint32_t n, pulsar_gpu_tensor *dst, uint64_t off) {
@@ -1019,7 +1042,7 @@ bool mtp_forward(pulsar_session *s, const pulsar_mtp_step *m) {
     nh_state *q = ST(s);
     const pulsar_nemotron_h_model *w = W(e);
     const pulsar_nemotron_h_shape &sh = w->shape;
-    const uint32_t n = m->n, E = sh.n_embd, V = sh.n_vocab;
+    const uint32_t n = m->n, E = sh.n_embd, ND = w->n_draft;
     if (!q->mtp || m->module != 0 || n == 0 || n > q->max_rows || m->head_n > n ||
         m->head_n > PULSAR_DRIVER_HEADS_MAX || (m->pick && m->head_n == 0) ||
         (m->decode_rows && (m->mode != PULSAR_STEP_PREFILL || n > PULSAR_DRIVER_HEADS_MAX)))
@@ -1087,10 +1110,10 @@ bool mtp_forward(pulsar_session *s, const pulsar_mtp_step *m) {
     /* the module's {attention, MoE}; its last add writes final_layernorm(x) into mo */
     if (ok) ok = compose(&st, il, false, true, an, fn, mo);
     if (ok && gpu_graph_debug_dump_enabled()) dump_rows(&st, "nemotron_mtp", q->mo, 0, E, il);
-    if (ok && m->head_n) ok = head_rows(&st, mo, m->head_n, 0);
+    if (ok && m->head_n) ok = draft_head_rows(&st, mo, m->head_n);
     /* L289: the picks reduced on the device, behind the head (every headed row in one launch) */
     if (ok && m->pick)
-        ok = pulsar_qwen_draft_top_launch((const float *)dptr(q->logits), (int)V, (int)m->head_n, dptr(q->mtop), 0) == 0 ||
+        ok = pulsar_qwen_draft_top_launch((const float *)dptr(q->logits), (int)ND, (int)m->head_n, dptr(q->mtop), 0) == 0 ||
              fail("the MTP draft pick refused");
     if (ok) ok = pulsar_gpu_end_commands() != 0;
     else (void)pulsar_gpu_synchronize();
@@ -1099,21 +1122,25 @@ bool mtp_forward(pulsar_session *s, const pulsar_mtp_step *m) {
         pulsar_qwen_draft_top rec[PULSAR_DRIVER_HEADS_MAX];
         ok = pulsar_gpu_tensor_read(q->mtop, 0, rec, m->head_n * sizeof rec[0]) != 0 || fail("could not read the pick");
         for (uint32_t r = 0; ok && r < m->head_n; r++) {
-            if (rec[r].nan || rec[r].index < 0 || (uint32_t)rec[r].index >= V) return fail("the MTP head's row holds a NaN");
-            m->pick[r] = {rec[r].index, rec[r].conf};
+            if (rec[r].nan || rec[r].index < 0 || (uint32_t)rec[r].index >= ND) return fail("the MTP head's row holds a NaN");
+            m->pick[r] = {w->draft_ids[rec[r].index], rec[r].conf};
         }
     }
     if (ok && m->head_n && m->logits)
-        ok = pulsar_gpu_tensor_read(q->logits, 0, m->logits, (uint64_t)m->head_n * V * sizeof(float)) != 0 ||
+        ok = pulsar_gpu_tensor_read(q->logits, 0, m->logits, (uint64_t)m->head_n * ND * sizeof(float)) != 0 ||
              fail("could not read the MTP logits");
     return ok;
 }
 
-/* the sampled proposal q of a headed row: the full vocabulary under the request's params (the head is the target's) */
+/* the sampled proposal q of a headed row: the draft vocabulary under the request's params, ids mapped to the
+ * vocabulary (L296 draft-cost; the walk accepts a draft iff it IS the target's own draw, so q is any proposal) */
 bool mtp_dist(pulsar_session *s, const float *row, float temperature, int top_k, float top_p, float min_p,
               pulsar_sample_dist *qd) {
-    return row && pulsar_sample_dist_build(row, W(s->engine)->shape.n_vocab, temperature, top_k, top_p, min_p,
-                                           &s->sample_scratch, qd);
+    const pulsar_nemotron_h_model *w = W(s->engine);
+    if (!row || !pulsar_sample_dist_build(row, w->n_draft, temperature, top_k, top_p, min_p, &s->sample_scratch, qd))
+        return false;
+    for (uint32_t i = 0; i < qd->n; i++) qd->ids[i] = (int)w->draft_ids[qd->ids[i]];
+    return true;
 }
 
 const pulsar_mtp_ops k_mtp_ops = {
@@ -1121,6 +1148,7 @@ const pulsar_mtp_ops k_mtp_ops = {
     /* .modules       = */ mtp_modules,
     /* .cond_bytes    = */ mtp_cond_bytes,
     /* .head_width    = */ mtp_head_width,
+    /* .head_ids      = */ mtp_head_ids,
     /* .trunk_rows    = */ mtp_trunk_rows,
     /* .out_rows      = */ mtp_out_rows,
     /* .forward       = */ mtp_forward,

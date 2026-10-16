@@ -23,7 +23,8 @@
  * state (N3: SSM FIXED / DELTA, conv FIXED / SNAPSHOT, attention KV POOL; the drafter slot's KV POOL and parked row).
  * THE DRAFTER (N9): the MTP module declared to the core's chained-MTP drafter (src/engine/spec_mtp.h) -- the family
  * says what one module step is (eh_proj over [enorm(embed) | hnorm(norm_f(h))], its {attention, MoE} on the drafter
- * slot, final_layernorm, the target's head); the lane drafts it recursively, the driver's verify target verifies.
+ * slot, final_layernorm, the target's head over the draft vocabulary -- L296 draft-cost); the lane drafts it
+ * recursively, the driver's verify target verifies.
  *
  * FORMAT-NEUTRAL: every linear (Mamba in / out, attention, the latent projections, the shared expert, the drafter's
  * eh_proj, the head) is admitted through the format registry at bf16 rows -- BF16 today, an EXL3 dense-arm rate or
@@ -153,6 +154,14 @@ typedef struct {
     /** N9: the MTP module drafts (the container holds it and the open did not turn drafting off): the engine's
      *  drafter is PULSAR_NEMOTRON_H_DRAFTER, the plan declares the drafter's slot, sessions verify. */
     bool drafting;
+    /** L296 draft-cost: the drafter's OWN head -- the head's rows of draft_ids (ascending: a prefix of
+     *  nemotron_h_draft_vocab.inc's list -- the named added tokens and the most frequent ids -- chosen at load), read
+     *  through the head's rows arm and stored MXFP8 at after_gpu (pulsar_draft_head_build).  A module step heads its
+     *  rows with it: n_draft logits a row, row i the logit of draft_ids[i].  Verify keeps the full head.  NULL / 0
+     *  when not drafting. */
+    struct pulsar_gpu_tensor *draft_head;
+    int32_t *draft_ids;
+    uint32_t n_draft;
     /** The digest a session's disk segments are keyed by: the directory's names, types and sizes (FNV-1a). */
     uint64_t artifact_digest;
     /** The tokenizer (nemotron_h_tokenizer.cpp): F5's shared BPE engine in its HF configuration (the "tekken"

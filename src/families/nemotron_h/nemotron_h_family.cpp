@@ -4,14 +4,61 @@
 #include "engine/exl3_trellis.h"
 #include "lib/bpe_tokenizer.h"
 
+#include <algorithm>
+
 namespace {
 
 const char *const ARCH = PULSAR_NEMOTRON_H_ARCH;
 
 void unload(pulsar_engine *e) {
-    if (e->family_state) bpe_tokenizer_free(((pulsar_nemotron_h_model *)e->family_state)->tok);
+    if (pulsar_nemotron_h_model *w = (pulsar_nemotron_h_model *)e->family_state) {
+        bpe_tokenizer_free(w->tok);
+        pulsar_gpu_tensor_free(w->draft_head);
+        free(w->draft_ids);
+    }
     free(e->family_state);
     e->family_state = NULL;
+}
+
+#include "nemotron_h_draft_vocab.inc"
+
+/* L296 draft-cost: the drafter's head's ids (pulsar_nemotron_h_model::draft_ids, ascending) -- the first `rows` ids of
+ * nemotron_h_draft_vocab.inc's list (the named added tokens, then the ids most frequent first; tools/nemotron/
+ * draft_vocab.py).  The list was ranked under this checkpoint's tokenizer: the digest of its ids' token bytes is
+ * recomputed here and a mismatch refuses (it would rank another tokenizer's tokens). */
+bool draft_vocab(pulsar_nemotron_h_model *w) {
+    const uint32_t n_list = (uint32_t)(sizeof k_nemotron_draft_ids / sizeof k_nemotron_draft_ids[0]);
+    uint64_t h = 1469598103934665603ull;
+    bool ok = true;
+    for (uint32_t i = 0; ok && i < n_list; i++) {
+        size_t len = 0;
+        const int32_t id = k_nemotron_draft_ids[i];
+        const char *b = (uint32_t)id < w->shape.n_vocab ? bpe_tokenizer_token_bytes(w->tok, id, &len) : NULL;
+        ok = b != NULL;
+        for (size_t j = 0; ok && j <= len; j++) {
+            h ^= j < len ? (uint8_t)b[j] : 0xffu;
+            h *= 1099511628211ull;
+        }
+    }
+    if (!ok || h != NEMOTRON_DRAFT_VOCAB_DIGEST) {
+        fprintf(stderr, "pulsar: %s: the MTP draft vocabulary (nemotron_h_draft_vocab.inc) was ranked under another "
+                        "tokenizer (digest %016llx, want %016llx) -- regenerate it with tools/nemotron/draft_vocab.py; "
+                        "refusing\n", ARCH, (unsigned long long)h, (unsigned long long)NEMOTRON_DRAFT_VOCAB_DIGEST);
+        return false;
+    }
+    /* PULSAR_NEMOTRON_MTP_DRAFT_ROWS: how many of the list's ids the head carries (the sweep's knob; proposals only) */
+    uint32_t rows = NEMOTRON_DRAFT_ROWS_DEFAULT;
+    if (const char *ev = getenv("PULSAR_NEMOTRON_MTP_DRAFT_ROWS"); ev && ev[0]) rows = (uint32_t)strtoul(ev, NULL, 10);
+    if (rows < NEMOTRON_DRAFT_FIXED || rows > n_list) {
+        fprintf(stderr, "pulsar: %s: a draft head of %u rows (PULSAR_NEMOTRON_MTP_DRAFT_ROWS) is outside the list's "
+                        "[%u, %u]; refusing\n", ARCH, rows, NEMOTRON_DRAFT_FIXED, n_list);
+        return false;
+    }
+    w->draft_ids = (int32_t *)xmalloc((size_t)rows * sizeof(int32_t));
+    memcpy(w->draft_ids, k_nemotron_draft_ids, (size_t)rows * sizeof(int32_t));
+    std::sort(w->draft_ids, w->draft_ids + rows);
+    w->n_draft = rows;
+    return true;
 }
 
 bool load(pulsar_engine *e, const pulsar_engine_options *opt) {
@@ -53,6 +100,7 @@ bool load(pulsar_engine *e, const pulsar_engine_options *opt) {
     /* N9: the MTP module drafts unless the open turned drafting off (the option every family's drafter honours) */
     w->drafting = w->shape.mtp_written && !opt->dspark_disable;
     e->drafter_ops = w->drafting ? &PULSAR_NEMOTRON_H_DRAFTER : NULL;
+    if (w->drafting && !draft_vocab(w)) return false;
     /* the session's declared state (N3, F3) and the digest its disk segments are keyed by: the directory's names,
      * types and sizes */
     pulsar_nemotron_h_state_plan(e);
@@ -87,6 +135,13 @@ bool load(pulsar_engine *e, const pulsar_engine_options *opt) {
 /* The lane, announced once at open (rule 5): the core driver over the family's blocks, and what its table lacks for
  * the plan (a session refuses with exactly that). */
 bool after_gpu(pulsar_engine *e) {
+    /* L296 draft-cost: the drafter's head, built once from the head's rows of the draft vocabulary */
+    pulsar_nemotron_h_model *w = (pulsar_nemotron_h_model *)e->family_state;
+    if (w->drafting) {
+        w->draft_head = pulsar_draft_head_build(&e->model, w->head, (int)w->shape.n_embd, (int)w->shape.n_vocab,
+                                                w->draft_ids, w->n_draft, "nemotron_h MTP");
+        if (!w->draft_head) return false;
+    }
     uint32_t at = 0;
     const char *miss = pulsar_driver_first_missing(e->family->driver, &e->plan, &at);
     const pulsar_state_plan *sp = &e->state_plan;

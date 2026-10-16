@@ -78,6 +78,15 @@ head_finish_kernel(float *__restrict__ logits, uint64_t ld, uint32_t n_logits, u
         row[c] = c < n_real ? __fmul_rn(row[c], scale) : -INFINITY;
 }
 
+/* thread (i, r): out[r][i] = bf16_rn(y[i][ids[r]]) -- i along the input axis (the warp's), r the draft row */
+__global__ void __launch_bounds__(256)
+head_draft_gather_kernel(const float *__restrict__ y, uint64_t ld_y, uint32_t n_in, const int32_t *__restrict__ ids,
+                         uint32_t n, uint16_t *__restrict__ out, uint64_t ld_out) {
+    const uint32_t i = blockIdx.x * 32u + (threadIdx.x & 31u), r = blockIdx.y * 8u + (threadIdx.x >> 5);
+    if (i >= n_in || r >= n) return;
+    out[(uint64_t)r * ld_out + i] = f2bf(y[(uint64_t)i * ld_y + (uint32_t)ids[r]]);
+}
+
 bool decl_ok(const pulsar_head_decl *h, const char *who) {
     if (!h || h->n_embd == 0 || h->n_embd % 8 || h->n_logits == 0 || h->n_real == 0 || h->n_real > h->n_logits ||
         !isfinite(h->logit_scale) || h->logit_scale == 0.0f || (h->embed_norm_w && !(h->embed_norm_eps >= 0.0f)) ||
@@ -127,4 +136,16 @@ extern "C" int pulsar_head_logits_finish_launch(const pulsar_head_decl *h, float
     const uint32_t blocks = (h->n_logits + kFinishThreads * 8 - 1) / (kFinishThreads * 8);
     head_finish_kernel<<<dim3(blocks, n), kFinishThreads, 0, stream>>>(logits, ld, h->n_logits, h->n_real, h->logit_scale);
     return launched("logits");
+}
+
+extern "C" int pulsar_head_draft_gather_launch(const float *y, uint64_t ld_y, uint32_t n_in, const int32_t *ids,
+                                               uint32_t n, uint16_t *out, uint64_t ld_out, cudaStream_t stream) {
+    if (!y || !ids || !out || n_in == 0 || n == 0 || n_in > 65535u * 32u || n > 65535u * 8u || ld_out < n_in) {
+        fprintf(stderr, "pulsar: head draft gather: no rows / ids / output, %u inputs x %u ids, or ld_out %llu below the "
+                        "inputs -- refusing\n", n_in, n, (unsigned long long)ld_out);
+        return -1;
+    }
+    head_draft_gather_kernel<<<dim3((n_in + 31u) / 32u, (n + 7u) / 8u), 256, 0, stream>>>(y, ld_y, n_in, ids, n, out,
+                                                                                         ld_out);
+    return launched("draft gather");
 }
