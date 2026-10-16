@@ -18,6 +18,7 @@
 #include "pulsar_cuda_mx.cuh"
 #include "mmq/ds4_exl3_dense.cuh"
 #include "mmq/exl3_moe.cuh"
+#include "pulsar_cuda_bf16_rows.cuh"
 #ifdef PULSAR_HAVE_MMQ
 #include "mmq/pulsar_tessera.h"
 #endif
@@ -170,6 +171,14 @@ extern "C" int pulsar_rows_linear_launch(const pulsar_rows_linear *l, const uint
         fprintf(stderr, "pulsar: qwen linear: no weight or no bf16 activation of width %d -- refusing\n", l ? l->in : -1);
         return -1;
     }
+    if (l->bf16) {                          /* L295 F7: a BF16 weight (pulsar_cuda_bf16_rows.cuh); needs no workspace */
+        if (l->k2 || l->sf) {
+            fprintf(stderr, "pulsar: rows linear: a %d->%d BF16 weight with an EXL3 rate or an E8M0 plane -- refusing\n",
+                    l->in, l->out);
+            return -1;
+        }
+        return pulsar_bf16_rows_linear_launch(l->w, x_bf16, rows, l->in, l->out, y, l->prompt, stream);
+    }
     if (l->k2 == 0) {                       /* the recipe's mxfp8_lt dense tier */
         if (!l->sf) {
             fprintf(stderr, "pulsar: qwen linear: a %d->%d tensor is neither EXL3 nor mxfp8_lt -- refusing\n",
@@ -197,7 +206,8 @@ extern "C" size_t pulsar_rows_linear_multi_workspace_bytes(const pulsar_rows_lin
     int ne = 0;
     for (int j = 0; j < n; ++j) {
         if (!ls[j] || ls[j]->in != ls[0]->in) return 0;
-        if (ls[j]->out % 128 == 0) p[ne++].N = ls[j]->out;   /* an EXL3 shape (mxfp8_lt-only widths need none) */
+        /* an EXL3 Linear (any logical width, L295 F7), or a width an EXL3 one could have (mxfp8_lt needs none) */
+        if (ls[j]->k2 || ls[j]->out % 128 == 0) p[ne++].N = ls[j]->out;
     }
     return ne ? ds4_exl3_dense_multi_workspace_bytes(p, ne, rows, ls[0]->in) : 0;
 }
@@ -290,14 +300,29 @@ extern "C" int pulsar_rows_moe_routed_launch(const pulsar_rows_moe *w, int32_t *
         fprintf(stderr, "pulsar: routed MoE (bf16 rows): a null input -- refusing\n");
         return -1;
     }
-    /* the routed experts are ONE of: EXL3 fused gate_up + down, EXL3 gate + up pair + down, Tessera (L255) */
+    /* the routed experts are ONE of: EXL3 fused gate_up + down, EXL3 gate + up pair + down, Tessera (L255), BF16
+     * gate / up / down stacks (L295 F7) */
     const bool tessera = w->tessera_gate != nullptr;
+    const bool bf16 = w->bf16_gate != nullptr || w->bf16_up != nullptr;
     const bool split = w->gate_table != nullptr;
     const bool exl3 = split || w->gate_up_table != nullptr || w->down_table != nullptr;
-    if (tessera ? (!w->tessera_up || !w->tessera_down || exl3)
-                : (!w->down_table || split != (w->up_table != nullptr) || split == (w->gate_up_table != nullptr))) {
+    if (tessera && bf16) {
+        fprintf(stderr, "pulsar: routed MoE (bf16 rows): both Tessera and BF16 stacks -- refusing\n");
+        return -1;
+    }
+    /* L295 F7: a non-gated activation runs only where an arm reads it -- the BF16 arm, up-only (no gate stack) */
+    if (w->act != PULSAR_FFN_ACT_SWIGLU &&
+        (!bf16 || w->act != PULSAR_FFN_ACT_RELU2 || w->bf16_gate != nullptr)) {
+        fprintf(stderr, "pulsar: routed MoE (bf16 rows): activation %d runs on the BF16 arm's up-only stacks alone (the "
+                        "EXL3 and Tessera arms are SwiGLU) -- refusing\n", (int)w->act);
+        return -1;
+    }
+    if (tessera || bf16 ? (tessera ? (!w->tessera_up || !w->tessera_down)
+                                   : (!w->bf16_up || !w->bf16_down ||
+                                      (w->act == PULSAR_FFN_ACT_SWIGLU) != (w->bf16_gate != nullptr))) || exl3
+                        : (!w->down_table || split != (w->up_table != nullptr) || split == (w->gate_up_table != nullptr))) {
         fprintf(stderr, "pulsar: routed MoE (bf16 rows): the experts must be ONE of an EXL3 fused gate_up table, an "
-                        "EXL3 gate + up pair, or a Tessera gate / up / down triple -- refusing\n");
+                        "EXL3 gate + up pair, a Tessera gate / up / down triple or a BF16 one -- refusing\n");
         return -1;
     }
     const int H = w->out_dim, mid = w->mid_dim, top_k = w->top_k, E = w->n_expert;
@@ -316,16 +341,28 @@ extern "C" int pulsar_rows_moe_routed_launch(const pulsar_rows_moe *w, int32_t *
     const int64_t pairs = (int64_t)T * top_k;
     const int nE = w->n_local;   /* the experts this rank's tables hold */
 #ifndef PULSAR_HAVE_MMQ
-    (void)nf_code; (void)stream; (void)pairs; (void)nE; (void)tessera;
+    (void)nf_code; (void)stream; (void)pairs; (void)nE; (void)tessera; (void)bf16;
     fprintf(stderr, "pulsar: routed MoE (bf16 rows): built without the MMQ drivers the routed arms ride -- refusing\n");
     return -1;
 #else
     if (w->n_shared < 0 || w->n_shared > PULSAR_ROUTER_SHARED_MAX || (w->n_shared > 0) != (w->shared != nullptr) ||
-        (tessera && w->n_shared)) {
+        ((tessera || bf16) && w->n_shared)) {
         fprintf(stderr, "pulsar: routed MoE (bf16 rows): %d riding shared experts (0..%d, with their descriptors; they "
-                        "ride the EXL3 front door only, not the Tessera arm) -- refusing\n", w->n_shared,
+                        "ride the EXL3 front door only, not the Tessera or BF16 arms) -- refusing\n", w->n_shared,
                 PULSAR_ROUTER_SHARED_MAX);
         return -1;
+    }
+    if (bf16) {
+        /* L295 F7: the BF16 routed arm over the router's selection, its buffers the EXL3 arm's (exactly one routed
+         * arm runs): gate z = gu_z, up z = its second half, the fold's bf16 rows = mid_x, the down's = down_z */
+        if (nE != E) {
+            qwen_ep_localize_kernel<<<(unsigned)((pairs + 255) / 256), 256, 0, stream>>>(sel, (int)pairs, w->ex_lo, nE);
+            if (!launch_ok("expert localize")) return -3;
+        }
+        const pulsar_bf16_moe bw{w->bf16_gate, w->bf16_up, w->bf16_down, nE, H, mid, H, w->act};
+        return pulsar_bf16_moe_routed_launch(bw, sel, wts, T, top_k, 0.0f, x_bf16, m.gu_z, m.gu_z + (size_t)pairs * mid,
+                                             reinterpret_cast<uint16_t *>(m.mid_x), m.down_z, out, nf_flag, nf_code,
+                                             stream) == 0 ? 0 : -1;
     }
     if (tessera) {
         /* L255: Tessera's fused window kernel on the router's own selection -- routing prep, gate/up + SwiGLU,

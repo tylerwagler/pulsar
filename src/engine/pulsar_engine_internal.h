@@ -3198,6 +3198,7 @@ typedef enum {
     PULSAR_DENSE_ARM_MXFP8_SLOT,   ///< mxfp8_lt, the slot's E4M3 (cuBLASLt)
     PULSAR_DENSE_ARM_MXFP8_ROWS,   ///< mxfp8_lt, raw bf16 rows (W8A16 split-K GEMV / MMA)
     PULSAR_DENSE_ARM_EXL3_ROWS,    ///< EXL3 at a dense-arm rate, raw bf16 rows
+    PULSAR_DENSE_ARM_BF16_ROWS,    ///< bf16 weight, raw bf16 rows (L295 F7: the tensor-core rows kernel / cuBLASLt)
 } pulsar_dense_arm;
 pulsar_dense_arm pulsar_dense_arm_for(uint32_t type, pulsar_act_format act);
 /** L272 P4c: the dense linear's front door (linear.cpp).  A weight's device pointer: the rank's TP slice, else the
@@ -3219,6 +3220,7 @@ typedef enum {
     PULSAR_MOE_ARM_SLOT,         ///< the backend's routed dispatcher over the E4M3 slot (CUTLASS MXFP4 / IQ2 / EXL3 / mixed)
     PULSAR_MOE_ARM_ROWS_FUSED,   ///< EXL3 fused gate_up + down over raw bf16 rows
     PULSAR_MOE_ARM_ROWS_PAIR,    ///< EXL3 gate + up pair + down over raw bf16 rows
+    PULSAR_MOE_ARM_ROWS_BF16,    ///< BF16 gate + up + down stacks over raw bf16 rows (L295 F7)
 } pulsar_moe_arm;
 pulsar_moe_arm pulsar_moe_arm_for(const pulsar_tensor *gate, const pulsar_tensor *up, const pulsar_tensor *down,
                                   pulsar_act_format act);
@@ -3241,7 +3243,10 @@ struct pulsar_tessera_proj;   /* src/cuda/mmq/pulsar_tessera.h (L255) */
 struct pulsar_rows_moe_shared; /* src/cuda/pulsar_cuda_qwen.h (task #44) */
 typedef struct {
     const pulsar_model *m;
-    const pulsar_tensor *gate, *up, *down;   ///< up NULL = gate is the fused gate_up stack
+    const pulsar_tensor *gate, *up, *down;   ///< up NULL = gate is the fused gate_up stack; gate NULL = up-only (RELU2)
+    /** L295 F7: the experts' activation, a pulsar_ffn_act (src/cuda/pulsar_cuda_qwen.h): 0 SWIGLU (gate + up);
+     *  RELU2 runs the BF16 arm's up-only stacks (gate NULL) */
+    int act;
     /** L255: the layer's routed experts as Tessera planes instead -- the three kernel-ready stacks the family
      *  built from them (family_qwen.h PULSAR_QWEN_TESS_*), or NULL; then gate / up / down are unread. */
     const struct pulsar_tessera_proj *tessera_gate, *tessera_up, *tessera_down;
@@ -4276,21 +4281,30 @@ typedef struct {
 int pulsar_sample_dist_build(const float *logits, uint32_t n_vocab,
                           float temperature, int top_k, float top_p, float min_p,
                           pulsar_sample_scratch *scratch, pulsar_sample_dist *out);
-/** L149: smallest min_p the device-prefiltered build accepts. Below it the
- * full path's top_p == 1.0f check is no longer provably redundant (it needs
- * min_p / filtered_sum > 2 ulp(1.0f) with filtered_sum <= PULSAR_N_VOCAB);
- * the production default is 0.05. */
+/** L149: the sparse min-p contract's floor, at every vocabulary (production default min_p 0.05). */
 #define PULSAR_SAMPLE_SPARSE_MINP_MIN 0.02f
-/** ... and the widest vocab that bound was derived for (the caller refuses the
- * sparse path above it; the shape's vocab is a runtime value). */
-#define PULSAR_SAMPLE_SPARSE_VOCAB_MAX 131072u
-static_assert(PULSAR_SAMPLE_SPARSE_MINP_MIN > 2.0f * 5.9604645e-8f * (float)PULSAR_SAMPLE_SPARSE_VOCAB_MAX,
-              "sparse min-p floor must dominate the top_p==1 rounding band over the vocab");
-/** Byte-identical to pulsar_sample_dist_build(row, PULSAR_N_VOCAB, temperature, 0,
- * 1.0f, min_p) when fed the device prefilter's candidates (contract at the
- * definition). Returns 0, `out` untouched, for anything outside it. */
+/** L295 F7 (Tyler 2026-10-14): THE sparse min-p predicate -- the full-nucleus arm of pulsar_sample_dist_build and
+ * the device-prefiltered build (pulsar_sample_dist_build_prefiltered) are taken iff
+ *     min_p >= max(PULSAR_SAMPLE_SPARSE_MINP_MIN, 2.5 * 2^-24 * n_vocab).
+ * The proof it rests on: with top_p == 1.0f the full path's `filtered_sum / sum >= 1.0f` break is redundant with
+ * the min-p cut.  While a further survivor exists, sum >= filtered_sum + min_p (every survivor's prob is >= min_p
+ * times the max's, and the max's is expf(0) == 1), so the ratio is at most 1 - min_p / (filtered_sum + min_p);
+ * L149's bound asks that gap to clear the rounding band under 1.0f, min_p / filtered_sum > 2 * 2^-24, and
+ * filtered_sum <= n_vocab (each prob <= 1), so min_p > 2 * 2^-24 * n_vocab makes the break unreachable before
+ * the cut, and when it fires the next candidate fails min-p anyway; the 2.5 is that bound with a 25% margin.  At n_vocab <= 131072 the
+ * vocabulary term is under 0.0196, so DeepSeek (129280) is exactly the old `min_p >= 0.02` at every min_p; Qwen
+ * (248320) needs 0.037, Inkling (201024) 0.030, a 262144 vocabulary 0.039.  (It replaced a compile-time
+ * PULSAR_SAMPLE_SPARSE_VOCAB_MAX of 131072 that sent every wider vocabulary down the full path.)  Pinned by
+ * pulsar_test --sampler at 129280 / 201024 / 248320 / 262144. */
+static inline bool pulsar_sample_sparse_minp(float min_p, uint32_t n_vocab) {
+    const float band = 2.5f * 5.9604645e-8f * (float)n_vocab;
+    return min_p >= (band > PULSAR_SAMPLE_SPARSE_MINP_MIN ? band : PULSAR_SAMPLE_SPARSE_MINP_MIN);
+}
+/** Byte-identical to pulsar_sample_dist_build(row, n_vocab, temperature, 0, 1.0f, min_p) when fed the device
+ * prefilter's candidates of that row (contract at the definition), for pulsar_sample_sparse_minp(min_p, n_vocab).
+ * Returns 0, `out` untouched, for anything outside it. */
 int pulsar_sample_dist_build_prefiltered(const int32_t *ids, const float *vals, uint32_t n_cand,
-                                         float max_logit, float temperature, float min_p,
+                                         uint32_t n_vocab, float max_logit, float temperature, float min_p,
                                          pulsar_sample_scratch *scratch, pulsar_sample_dist *out);
 void pulsar_sample_dist_free(pulsar_sample_dist *d);
 float pulsar_sample_dist_prob(const pulsar_sample_dist *d, int token);

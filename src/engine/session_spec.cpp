@@ -493,12 +493,12 @@ void spec_lookahead_reset(pulsar_session *s) {
 /* L149 phase 2: build row `row`'s target distribution from the compact
  * prefilter block when the request is in the sparse min-p contract and the
  * row's candidate set fit the cap. false = caller reads the full row. */
-static bool spec_compact_dist(const int32_t *compact, uint32_t row,
+static bool spec_compact_dist(const int32_t *compact, uint32_t row, uint32_t n_vocab,
                               float temperature, int top_k, float top_p, float min_p,
                               pulsar_sample_scratch *scratch, pulsar_sample_dist *out) {
     if (!compact || row >= PULSAR_SPEC_LOGITS_ROWS ||
         !(temperature > 0.0f && top_k <= 0 && top_p == 1.0f &&
-          min_p >= PULSAR_SAMPLE_SPARSE_MINP_MIN && min_p <= 1.0f))
+          pulsar_sample_sparse_minp(min_p, n_vocab) && min_p <= 1.0f))
         return false;
     const int32_t *h = compact + (size_t)row * PULSAR_DSPARK_PREFILTER_ROW_I32;
     const uint32_t n = (uint32_t)h[0];
@@ -507,7 +507,7 @@ static bool spec_compact_dist(const int32_t *compact, uint32_t row,
     memcpy(&max_logit, &h[2], sizeof(max_logit));
     return pulsar_sample_dist_build_prefiltered(h + 3,
                                                 (const float *)(h + 3 + PULSAR_DSPARK_PREFILTER_CAP),
-                                                n, max_logit, temperature, min_p,
+                                                n, n_vocab, max_logit, temperature, min_p,
                                                 scratch, out) != 0;
 }
 
@@ -528,7 +528,7 @@ static int spec_accept_walk(pulsar_session *s,
         float *row_logits = s->spec_row_scratch;
         while (commit < (int)K) {
             pulsar_sample_dist dist;
-            if (!spec_compact_dist(compact, row0 + (uint32_t)commit, temperature, top_k,
+            if (!spec_compact_dist(compact, row0 + (uint32_t)commit, spec_vocab(s), temperature, top_k,
                                    top_p, min_p, &s->sample_scratch, &dist)) {
                 if (!read_row(read_ud, (uint32_t)commit, row_logits) ||
                     !pulsar_sample_dist_build(row_logits, spec_vocab(s), temperature, top_k,

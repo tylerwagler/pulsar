@@ -30,6 +30,8 @@
  *   6. the multi launch (L288 exl3-dense): each output bit for bit its single launch.
  *   7. the heads (L288 qwen-exl3-head): lm_head 2560 -> 248320 and the draft head 2560 -> 82304 at K = 3..5 --
  *      M-independent rows, and windows cut from the head equal its columns bit for bit and grade vs double.
+ *   8. a logical width short of the stored 128 multiple (L295 F7: Inkling's head 4096 -> 201024, stored 201088):
+ *      bit for bit the stored call's columns, nothing written past N, graded vs double.
  *
  * usage: ./tests/exl3_dense_gate
  */
@@ -472,6 +474,176 @@ int main(void) {
             printf("\n");
             cudaEventDestroy(e0);
             cudaEventDestroy(e1);
+            release(d);
+        }
+    }
+    /* 8. L295 F7: a logical width short of the stored one.  exllamav3 pads every Linear to a 128 multiple
+     * (exl3_out_stored: Inkling's head 4096 -> 201024 ships 201088 wide, svh 0 on the 64 pad columns); the arm
+     * computes the stored width and writes the logical columns.  Per shape: (a) the logical call is BIT FOR BIT the
+     * stored call's first N columns -- decode widths (the GEMV, M = 1, 5, 16) and prompt chunks (the GEMM, M = 1, 40,
+     * each GEMM column through the shape's one algorithm); (b) nothing is written past y's N columns (a canary over
+     * the stored width's remainder); (c) the stored call's pad outputs are exactly 0 (svh 0); (d) graded against the
+     * double reference -- the whole output for the small shapes, the head's last 2560 stored columns (cut out with
+     * exl3_expert_cut, the tail block among them) for the head; (e) a logical width off 4 is refused. */
+    {
+        struct pad { int K, N, k2; const char *what; };
+        const pad pads[] = {{4096, 201024, 12, "Inkling head"}, {4096, 201024, 10, "Inkling head"},
+                            {512, 1088, 8, "one tail block"}, {512, 200, 12, "n % 16 != 0"},
+                            {512, 64, 6, "all tail"}};
+        for (const pad &pc : pads) {
+            const int K = pc.K, N = pc.N, k2 = pc.k2, Ns = (int)exl3_out_stored((uint64_t)N), MR = 40;
+            weight w = make_weight(K, Ns, k2);
+            uint16_t *svp = (uint16_t *)(w.bytes.data() + w.trellis) + K;
+            for (int n = N; n < Ns; n++) svp[n] = 0;   /* exllamav3's pad */
+            uint64_t lt = 0, lsc = 0, lst = 0;
+            CHECK(exl3_linear_layout(K, N, k2, &lt, &lsc, &lst) && lst == w.stride && lt == w.trellis,
+                  "%s: exl3_linear_layout(%d, %d) is not the stored %d-wide slice", pc.what, K, N, Ns);
+            CHECK(ds4_exl3_dense_workspace_bytes(16, K, N) == ds4_exl3_dense_workspace_bytes(16, K, Ns) &&
+                  ds4_exl3_dense_splits(K, N) == ds4_exl3_dense_splits(K, Ns),
+                  "%s: the logical width's workspace / splits are not the stored width's", pc.what);
+            const slot s = make_slot(MR, K);
+            dev d;
+            upload(w, s, MR, d);   /* y and the workspace at the stored width: room for the canary */
+            /* one call at width n (Ns or N): the whole y region of M x Ns NaN-filled first, y [M][n] returned, and
+             * whether anything past M x n was written */
+            auto call = [&](int n, int M, bool prompt, std::vector<float> &y, bool *past) {
+                CUDA_OK(cudaMemset(d.y, 0xff, (size_t)M * Ns * sizeof(float)));
+                const int rc = ds4_exl3_dense_launch(d.w, k2, d.q, d.y, M, K, n, d.ws, d.ws_bytes, 0, prompt);
+                if (rc) return rc;
+                CUDA_OK(cudaDeviceSynchronize());
+                std::vector<float> all((size_t)M * Ns);
+                CUDA_OK(cudaMemcpy(all.data(), d.y, all.size() * sizeof(float), cudaMemcpyDeviceToHost));
+                *past = false;
+                for (size_t i = (size_t)M * n; i < all.size(); i++) {
+                    uint32_t u;
+                    std::memcpy(&u, &all[i], 4);
+                    *past |= u != 0xffffffffu;
+                }
+                y.assign(all.begin(), all.begin() + (size_t)M * n);
+                return 0;
+            };
+            /* the logical rows [M][N] vs the stored rows [M][Ns]' first N columns */
+            auto same_cols = [&](const std::vector<float> &yl, const std::vector<float> &ys, int M) {
+                size_t bad = 0;
+                for (int r = 0; r < M; r++)
+                    bad += memcmp(yl.data() + (size_t)r * N, ys.data() + (size_t)r * Ns, (size_t)N * sizeof(float)) != 0;
+                return bad;
+            };
+            std::vector<float> ys16, yl, ysp, ylp;
+            bool past = false, any_past = false;
+            int rc = call(Ns, 16, false, ys16, &past);
+            CHECK(rc == 0, "%s K=%d: the stored-width call refused (rc=%d)", pc.what, k2 / 2, rc);
+            if (rc) { release(d); continue; }
+            size_t pad_nonzero = 0;
+            for (int r = 0; r < 16; r++)
+                for (int n = N; n < Ns; n++) pad_nonzero += ys16[(size_t)r * Ns + n] != 0.0f;
+            size_t bad = 0, rows = 0;
+            for (int M : {16, 5, 1}) {
+                rc = call(N, M, false, yl, &past);
+                CHECK(rc == 0, "%s K=%d M=%d: the logical call refused (rc=%d)", pc.what, k2 / 2, M, rc);
+                if (rc) continue;
+                bad += same_cols(yl, ys16, M);
+                rows += M;
+                any_past |= past;
+            }
+            /* the GEMM: prompt chunks at 40 and 1 rows, logical vs stored, and 1 vs 40 (chunk invariance) */
+            size_t bad_p = 0, rows_p = 0;
+            rc = call(Ns, MR, true, ysp, &past);
+            CHECK(rc == 0, "%s K=%d: the stored-width prompt call refused (rc=%d)", pc.what, k2 / 2, rc);
+            for (int M : {MR, 1}) {
+                if (rc) break;
+                const int r2 = call(N, M, true, ylp, &past);
+                CHECK(r2 == 0, "%s K=%d prompt M=%d: the logical call refused (rc=%d)", pc.what, k2 / 2, M, r2);
+                if (r2) continue;
+                bad_p += same_cols(ylp, ysp, M);
+                rows_p += M;
+                any_past |= past;
+            }
+            CHECK(bad == 0, "%s K=%d: %zu of %zu decode rows differ from the stored call's first %d columns", pc.what,
+                  k2 / 2, bad, rows, N);
+            CHECK(bad_p == 0, "%s K=%d: %zu of %zu prompt rows differ from the stored call's first %d columns", pc.what,
+                  k2 / 2, bad_p, rows_p, N);
+            CHECK(!any_past, "%s K=%d: a logical call wrote past y's %d columns", pc.what, k2 / 2, N);
+            CHECK(pad_nonzero == 0, "%s K=%d: %zu pad outputs of the stored call are not 0 (svh 0)", pc.what, k2 / 2,
+                  pad_nonzero);
+            /* (d) the grade: the whole output (small shapes) or the head's last 2560 stored columns, cut out */
+            const int W = K == 4096 ? 2560 : Ns, lo = Ns - W;
+            weight sub;
+            sub.K = K; sub.N = W; sub.k2 = k2;
+            exl3_cut cut;
+            const bool cut_ok = exl3_expert_cut(K, Ns, k2, false, lo, Ns, 0, W, &cut) &&
+                                exl3_expert_layout(K, W, k2, &sub.trellis, &sub.scales, &sub.stride);
+            CHECK(cut_ok, "%s: the window [%d, %d) does not cut", pc.what, lo, Ns);
+            double mx = 0, med = 0, pmx = 0, pmed = 0;
+            if (cut_ok) {
+                sub.bytes.resize(sub.stride);
+                exl3_expert_cut_apply(&cut, w.bytes.data(), sub.bytes.data());
+                std::vector<double> what, yref;
+                exl3t_dequant(sub.bytes.data(), K, W, k2, what);
+                exl3t_reference(sub.bytes.data(), what, K, W, k2, s.x.data(), MR, yref);
+                /* the logical call's last W - (Ns - N) columns are the window's first ones; grade those of the
+                 * decode rows (M = 16, rerun) and of the prompt chunk (M = 40) */
+                const int Wl = W - (Ns - N);
+                std::vector<float> yd;
+                if (call(N, 16, false, yd, &past) == 0) {
+                    std::vector<float> got((size_t)16 * Wl);
+                    std::vector<double> want((size_t)16 * Wl);
+                    for (int r = 0; r < 16; r++)
+                        for (int c = 0; c < Wl; c++) {
+                            got[(size_t)r * Wl + c] = yd[(size_t)r * N + lo + c];
+                            want[(size_t)r * Wl + c] = yref[(size_t)r * W + c];
+                        }
+                    grade(got, want, 16, Wl, 0, &mx, &med);
+                }
+                {
+                    std::vector<float> got((size_t)MR * Wl);
+                    std::vector<double> want((size_t)MR * Wl);
+                    std::vector<double> bnd;
+                    exl3t_fp16_operand_bound(sub.bytes.data(), what, K, W, k2, s.x.data(), MR, bnd);
+                    size_t over = 0;
+                    for (int r = 0; r < MR; r++) {
+                        double sc = 0;
+                        for (int c = 0; c < Wl; c++) sc = fmax(sc, fabs(yref[(size_t)r * W + c]));
+                        for (int c = 0; c < Wl; c++) {
+                            /* the stored prompt call's columns: the logical one's, bit for bit (checked above) */
+                            const double g = ysp.empty() ? 0.0 : (double)ysp[(size_t)r * Ns + lo + c];
+                            got[(size_t)r * Wl + c] = (float)g;
+                            want[(size_t)r * Wl + c] = yref[(size_t)r * W + c];
+                            over += fabs(g - yref[(size_t)r * W + c]) > bnd[(size_t)r * W + c] + tol * sc;
+                        }
+                    }
+                    grade(got, want, MR, Wl, 0, &pmx, &pmed);
+                    CHECK(over == 0, "%s K=%d: %zu prompt outputs past the fp16-operand envelope", pc.what, k2 / 2, over);
+                }
+            }
+            CHECK(mx < tol, "%s %d -> %d K=%d: decode max rel %.3e (limit %.0e)", pc.what, K, N, k2 / 2, mx, tol);
+            CHECK(med > 1e-10, "%s K=%d: median rel %.3e -- a degenerate fixture, not a pass", pc.what, k2 / 2, med);
+            /* (e) a logical width off 4 */
+            CHECK(ds4_exl3_dense_launch(d.w, k2, d.q, d.y, 16, K, N - 2, d.ws, d.ws_bytes, 0) == -1 &&
+                  ds4_exl3_dense_workspace_bytes(16, K, N - 2) == 0, "%s: a logical width %% 4 != 0 accepted", pc.what);
+            printf("  pad %-22s %4d -> %-6d (stored %d) K=%d: decode M=16,5,1 and prompt M=40,1 == the stored call's "
+                   "columns %s; nothing past N %s; pad outputs %s; vs double max rel %.2e (median %.2e), prompt %.2e\n",
+                   pc.what, K, N, Ns, k2 / 2, bad || bad_p ? "DIFFER" : "bit for bit", any_past ? "WRITTEN" : "written",
+                   pad_nonzero ? "NONZERO" : "0", mx, med, pmx);
+            if (K == 4096) {   /* timed (information): the head at 1 / 4 / 16 rows */
+                cudaEvent_t e0, e1;
+                CUDA_OK(cudaEventCreate(&e0));
+                CUDA_OK(cudaEventCreate(&e1));
+                printf("    time:");
+                for (const int M : {1, 4, 16}) {
+                    for (int i = 0; i < 3; i++) (void)ds4_exl3_dense_launch(d.w, k2, d.q, d.y, M, K, N, d.ws, d.ws_bytes, 0);
+                    CUDA_OK(cudaEventRecord(e0));
+                    for (int i = 0; i < 20; i++) (void)ds4_exl3_dense_launch(d.w, k2, d.q, d.y, M, K, N, d.ws, d.ws_bytes, 0);
+                    CUDA_OK(cudaEventRecord(e1));
+                    CUDA_OK(cudaEventSynchronize(e1));
+                    float ms = 0;
+                    CUDA_OK(cudaEventElapsedTime(&ms, e0, e1));
+                    printf("  %2d rows %.3f ms (%.0f GB/s)", M, ms / 20, (double)w.stride / (ms / 20 * 1e-3) / 1e9);
+                }
+                printf("\n");
+                cudaEventDestroy(e0);
+                cudaEventDestroy(e1);
+            }
             release(d);
         }
     }

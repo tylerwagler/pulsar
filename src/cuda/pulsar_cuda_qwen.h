@@ -100,21 +100,24 @@ typedef struct {
 } pulsar_qwen_lowrank;
 
 /** L272 P4c: the bf16-ROWS dense linear's reference (family-neutral; built by the core's front door,
- *  pulsar_linear_rows_ref in linear.cpp, from the format table): an mxfp8_lt weight (the W8A16 arm) or an
- *  EXL3 one -- one [trellis | suh | svh] slice in exl3_expert_layout's byte model, so an exllamav3
- *  checkpoint's tensors copy in verbatim (mmq/ds4_exl3_dense.cuh). */
+ *  pulsar_linear_rows_ref in linear.cpp, from the format table): an mxfp8_lt weight (the W8A16 arm), an
+ *  EXL3 one -- one [trellis | suh | svh] slice in exl3_linear_layout's byte model, so an exllamav3
+ *  checkpoint's tensors copy in verbatim (mmq/ds4_exl3_dense.cuh) -- or (L295 F7) a BF16 one
+ *  (pulsar_cuda_bf16_rows.cuh). */
 typedef struct pulsar_rows_linear {
     const void *w;
-    const uint8_t *sf;   /**< the mxfp8_lt E8M0 plane (NULL for EXL3): the
+    const uint8_t *sf;   /**< the mxfp8_lt E8M0 plane (NULL for EXL3 and BF16): the
                           *  recipe's dense tier is MIXED, so the arm follows
-                          *  k2 -- 0 means mxfp8_lt, 4..10 an EXL3 rate. */
-    int k2;          /**< rate in half-bit units, 4..10; 0 = mxfp8_lt */
+                          *  k2 -- 0 means mxfp8_lt (or BF16, below), 4..16 an EXL3 rate. */
+    int k2;          /**< rate in half-bit units, 4..16; 0 = mxfp8_lt or BF16 */
     int in, out;
     /** L266: a PROMPT chunk (a prefill step, not a verify): the prefill GEMM at every row count, so a
      *  prompt cut anywhere is byte-identical to one prefilled whole (session_contract_gate C1).
      *  false: decode rows -- the decode arms at every width, in blocks of PULSAR_QWEN_DECODE_ROWS_MAX past it
      *  (L288 C1), so a row's bytes never depend on how many ride with it. */
     bool prompt;
+    /** L295 F7: a BF16 weight [out][in] (k2 0, sf NULL): the BF16 rows arm (pulsar_cuda_bf16_rows.cuh). */
+    bool bf16;
 } pulsar_rows_linear;
 
 /** L251 MTP: the head-side weights of the input combine (the sidecar's tensors). */
@@ -230,10 +233,15 @@ static inline pulsar_router_cfg pulsar_qwen_router_cfg(int n_expert, int top_k) 
 
 /** L272 P4c: the routed MoE over bf16 ROWS -- the core front door's arm (moe.cpp builds it from the expert
  *  stacks' formats; family-neutral).  EXL3 experts: a FUSED gate_up stack (output rows 0..mid-1 gate, mid..2mid-1
- *  up) or a gate + up PAIR (two stacks, each with its own suh), and a down stack.  The tables hold experts
+ *  up) or a gate + up PAIR (two stacks, each with its own suh), and a down stack; Tessera; or BF16 stacks
+ *  (L295 F7).  The tables hold experts
  *  [ex_lo, ex_lo + n_local) -- all of them on one GPU; under expert parallelism a token's picks of another
  *  rank's experts are dropped here and summed there. */
 struct pulsar_tessera_proj;   /* src/cuda/mmq/pulsar_tessera.h (L255) */
+/** L295 F7: an FFN's activation, family-neutral -- the expert arms key on it, never on a family.  SWIGLU: h =
+ *  silu(gate x) * up x (gate + up stacks); RELU2: h = relu(up x)^2 (up-only stacks, no gate: Nemotron-H's experts).
+ *  Zero is SWIGLU, so a descriptor that never names one keeps every arm's behaviour. */
+typedef enum { PULSAR_FFN_ACT_SWIGLU = 0, PULSAR_FFN_ACT_RELU2 = 1 } pulsar_ffn_act;
 /** One shared expert: out += scale[t] * down(silu(gate x) * up x), added after the routed sum (a block's N shared
  *  experts in order).  Task #44: one whose three Linears are EXL3 dense slices rides the routed launches (the EXL3
  *  routed front door, mmq/exl3_moe.cuh) -- keyed on that format; any other format runs
@@ -266,6 +274,11 @@ typedef struct pulsar_rows_moe {
      *  stacks of n_expert, kernel-ready.  Set INSTEAD of every EXL3 table above; the launcher refuses a descriptor
      *  with both or neither, and (no expert range in that arm yet) one whose tables are not every expert. */
     const struct pulsar_tessera_proj *tessera_gate, *tessera_up, *tessera_down;
+    /** L295 F7: the routed experts in BF16 -- gate / up [n_local][mid][in], down [n_local][out][mid] -- set INSTEAD
+     *  of every table above (pulsar_cuda_bf16_rows.cuh); no riding shared expert (a BF16 one runs
+     *  pulsar_rows_moe_shared_launch).  bf16_gate NULL = up-only experts (a non-gated activation, `act`). */
+    const void *bf16_gate, *bf16_up, *bf16_down;
+    pulsar_ffn_act act;                  /**< the experts' activation; every arm but BF16 runs SWIGLU only */
     int k2_gate_up, k2_down;             /**< rates (half-bit units); k2_gate_up is the pair's in the split form */
     int n_expert, top_k;                 /**< the model's experts (the router's picks index them) and picks per row */
     int in_dim, mid_dim, out_dim;        /**< the expert shape (the model's): in == out, the block's hidden */

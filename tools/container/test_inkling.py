@@ -15,7 +15,9 @@ pins:
   * the drafter and the tower omitted whole -> no mtp shards, pulsar.mtp_present false
   * refusals by name: an unknown tensor, a missing tensor, a tensor whose shape disagrees with the declaration, an
     architecture switch the role table does not describe, a moe_intermediate_size that is not intermediate_size,
-    half a drafter omitted, an omitted main-model tensor, routed experts at a rate the pair arm lacks (K5)
+    half a drafter omitted, an omitted main-model tensor, routed experts at a rate no routed arm reads (K8; K5 plans
+    since L295 F7)
+  * L295 F7: the pack's K6 head -- stored at the 128 multiple, declared at its logical width, bytes the pack's
   * GOLDEN: the SHA-256 of every emitted file of the BF16 and the K3 build (the byte-identity instrument, rule 7)
 """
 from __future__ import annotations
@@ -35,6 +37,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 from test_deepseek import digest  # noqa: E402
 from test_qwen import bf16, write_st, exl3_parts  # noqa: E402
+import exl3_rates  # noqa: E402
 
 FAILS: list[str] = []
 # sha256 over (file name, sha256(file)) of every emitted file (test_deepseek.digest); fixed when the family landed (L295 E1)
@@ -128,13 +131,16 @@ def make_hf(root, rng, cfg=None, edit=None):
     return t
 
 
-def make_exl3(root, rng, K=3, expert_K=None):
-    """The EXL3 pack of the main layers, under the L294 key names (attention as stored; the w13 split)."""
+def make_exl3(root, rng, K=3, expert_K=None, head_K=None):
+    """The EXL3 pack of the main layers, under the L294 key names (attention as stored; the w13 split); with head_K,
+    the head too, its V outputs stored at the 128 multiple as exllamav3 pads them (L295 F7)."""
     t = {}
 
     def lin(key, k, n, kk):
         for s, v in exl3_parts(rng, k, n, kk).items():
             t[f"{key}.{s}"] = v
+    if head_K:
+        lin(LLM + "unembed", H, exl3_rates.out_stored(V), head_K)
     for i in range(L):
         p = f"{LLM}layers.{i}."
         for nm, out, inp in (("wq_du", NQ * HD, H), ("wk_dv", NKV * HD, H), ("wv_dv", NKV * HD, H),
@@ -360,8 +366,29 @@ def main():
                                 *[{"role": r, "format": "exl3m_k5"} for r in ("expert_gate", "expert_up", "expert_down")],
                                 *[{"role": r, "format": "native"} for r in ("router", "norm", "embed", "head", "other",
                                                                              "vision")]])
-        ok, _ = run("plan", "--hf", hf, "--exl3", ex5, "--recipe", r5, expect_fail=True, contains="pair arm")
-        check(ok, "routed gate / up at K5 (split, the pair arm reads no K5) -> refused")
+        ok, _ = run("plan", "--hf", hf, "--exl3", ex5, "--recipe", r5)
+        check(ok, "routed gate / up at K5 (split: the pair arm's K5, L295 F7) -> planned")
+        ex8 = os.path.join(tmp, "exl3-k8")
+        make_exl3(ex8, np.random.default_rng(8), expert_K=8)
+        r8 = recipe(tmp, "k8", [x if not x["role"].startswith("expert_") else {**x, "format": "exl3m_k8"}
+                                for x in json.load(open(r5))["rows"]])
+        ok, _ = run("plan", "--hf", hf, "--exl3", ex8, "--recipe", r8, expect_fail=True, contains="exl3_arm_has_rate")
+        check(ok, "routed experts at K8 (no routed arm reads K8) -> refused by the rate table")
+        print("the pack's K6 head (L295 F7: stored at the 128 multiple, the logical width declared):")
+        exh = os.path.join(tmp, "exl3-head")
+        exth = make_exl3(exh, np.random.default_rng(11), head_K=6)
+        rh = recipe(tmp, "k6head", [x if x["role"] != "head" else {**x, "format": "exl3m_k6"}
+                                    for x in json.load(open(rk3))["rows"]])
+        oh = build_grade(tmp, "k6head", ["--hf", hf, "--exl3", exh, "--recipe", rh], n_files)
+        fh = [f for f in sorted(os.listdir(oh)) if f.endswith(".safetensors")
+              and LLM + "unembed.weight" in header(os.path.join(oh, f))[0]]
+        hd = json.loads(header(os.path.join(oh, fh[0]))[0]["__metadata__"]["pulsar.tensors"])[LLM + "unembed.weight"] \
+            if fh else {}
+        check(bool(fh) and hd.get("layout") == "exl3m_k6" and hd.get("dims_ne") == [H, V]
+              and entry_bytes(oh, fh[0], LLM + "unembed.weight") == b"".join(exth[f"{LLM}unembed.{s}"][2]
+                                                                          for s in ("trellis", "suh", "svh")),
+              f"head exl3m_k6, declared [{H}, {V}] (logical), its bytes the pack's [trellis | suh | svh] at the stored "
+              f"{exl3_rates.out_stored(V)} outputs")
         ok, _ = run("plan", "--hf", hf, "--recipe", rbf, "--tokenizer", tmp, expect_fail=True, contains="tokenizer")
         check(ok, "--tokenizer on an Inkling build (no tokenizer.* entries yet) -> refused")
     finally:

@@ -12,7 +12,7 @@
  * routed entry (pulsar_gpu_routed_moe_batch_tensor with expert_split, the call moe.cpp's front door makes).
  *
  * WHAT IT PROVES (the V4.1 routed shape: 5120 -> 2304 -> 5120, halves of 1152 = 9 x 128; 16 experts, top-6)
- *   1. BYTES, every rate the routed arms read (gate / up K2 K2.5 K3 K4 K6; down K2 K2.5 K3 K4 K5 K6): both
+ *   1. BYTES, every rate the routed arms read (gate / up K2 K2.5 K3 K4 K5 K6; down K2 K2.5 K3 K4 K5 K6): both
  *      ranks' halves, as the production builder made them, equal an INDEPENDENT statement of the cut -- every
  *      16x16 tile of the half is the whole's tile at the shifted index, suh / svh the whole's ranges -- so the
  *      two halves partition every expert, and each half is exl3_expert_layout of the half shape.  The host cut
@@ -149,8 +149,8 @@ int main(int argc, char **argv) {
            H, MID, H, E, TOPK, NR, (unsigned long long)HALF);
     static const char key = 0;   /* the registry key the halves resolve under (the engine, in the engine) */
     uint64_t key_next = 1;
-    /* (gate / up rate, down rate): every rate each kind reads (exl3_arm_has_rate PAIR / DOWN); the pair has no K5 */
-    const int rates[][2] = {{4, 4}, {5, 5}, {6, 6}, {8, 8}, {8, 10}, {12, 12}};
+    /* (gate / up rate, down rate): every rate each kind reads (exl3_arm_has_rate PAIR / DOWN; the pair's K5 is L295 F7's) */
+    const int rates[][2] = {{4, 4}, {5, 5}, {6, 6}, {8, 8}, {8, 10}, {10, 10}, {12, 12}};
     double worst_rel = 0, worst_max = 0;
     for (const auto &rk : rates) {
         const int gk2 = rk[0], dk2 = rk[1];
