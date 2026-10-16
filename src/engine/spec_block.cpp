@@ -168,7 +168,9 @@ pulsar_gqa_layer gqa_decl(const pulsar_block_drafter *d, const uint16_t *qn, con
     L.n_q = d->n_head;
     L.n_kv = d->n_kv;
     L.head_dim = d->head_dim;
-    L.kv_fmt = PULSAR_GQA_KV_BF16;
+    /* E4M3 K / V at unit scale: the drafter was served (and its acceptance measured) with vLLM's fp8_e4m3 KV cache,
+     * whose rounding cuts the attention's distance to it 4x against bf16 rows (L298 head grade); half the ring too */
+    L.kv_fmt = PULSAR_GQA_KV_E4M3;
     L.span = PULSAR_GQA_WINDOW;
     L.window = d->window;
     L.scale = (float)(1.0 / sqrt((double)d->head_dim));
