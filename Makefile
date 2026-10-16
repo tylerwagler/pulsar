@@ -2275,6 +2275,7 @@ GATE_TARGETS = unit-test-gate agent-test-gate \
 	cuda-regression cuda-kv-rows-pack-gate cuda-minp-prefilter-gate cuda-chat-smoke-gate \
 	cuda-attn-gates cuda-attn-pack-gate indexer-hadamard-kernel-check \
 	cuda-prefill-gate-cutlass-mxfp4 qwen-family-gate-device state-kinds-gate vision-qwen-tower-gate tessera-kernel-gate \
+	blockdraft-gate nvfp4-rows-gate lilicorr-head-gate lilicorr-spec-gate \
 	\
 	cuda-runner-gate
 # L220: gates that need no GPU and no model.  They are launched in the
@@ -2468,7 +2469,7 @@ gates-dev:
 	fi; \
 	$(MAKE) -j$(GATE_JOBS) --no-print-directory tests/gates_runner pulsar_test CUDA_ARCH=sm_120f || exit 1; \
 	$(MAKE) --no-print-directory gates-preflight || exit 1; \
-	paths='$(PATHS)'; why=''; attn=0; server=0; vision=0; exl3=0; family=0; gdn=0; router=0; blocks=0; bf16=0; minp=0; \
+	paths='$(PATHS)'; why=''; attn=0; server=0; vision=0; exl3=0; family=0; gdn=0; router=0; blocks=0; bf16=0; minp=0; drafter=0; \
 	if [ -z "$$paths" ]; then \
 	  paths=$$( { git diff --name-only HEAD; git ls-files --others --exclude-standard; } 2>/dev/null \
 	            | grep -E '\.(c|cc|cpp|cu|cuh|h|hpp)$$' | sort -u ); \
@@ -2498,6 +2499,7 @@ gates-dev:
 	      case "$$p" in *router*|*moe*) router=1 ;; esac; \
 	      case "$$p" in *bf16_rows*|*nvfp4*|*weight_format*|src/engine/linear.cpp|src/engine/moe.cpp) bf16=1 ;; esac; \
 	      case "$$p" in *minp*|src/engine/tokenizer.cpp|src/engine/spec_dspark.cpp|src/engine/session_spec.cpp) minp=1 ;; esac; \
+	      case "$$p" in *spec_block*|*blockdraft*|*lilicorr*|*mtp_spec*|*attn_gqa*|*rope*|src/engine/session_spec.cpp|src/families/nemotron_h/*) drafter=1 ;; esac; \
 	      case $$cls in \
 	        attn) for g in $(GATES_DEV_ATTN); do add $$g; done ;; \
 	        cuda) for g in $(GATES_DEV_CUDA); do add $$g; done ;; \
@@ -2525,6 +2527,7 @@ gates-dev:
 	if [ $$blocks -eq 1 ]; then printf '  block gates: sconv-gate, head-gate, rowops-gate, mamba2-gate (the L295 short convolution, head options, row operations; the L296 Mamba-2 block)\n'; fi; \
 	if [ $$bf16 -eq 1 ]; then printf '  bf16-rows-gate + nvfp4-rows-gate: selected (the BF16 / NVFP4 rows arms and their admission)\n'; fi; \
 	if [ $$minp -eq 1 ]; then printf '  cuda-minp-prefilter-gate: selected (the sparse min-p contract)\n'; fi; \
+	if [ $$drafter -eq 1 ]; then printf '  block drafter gates: blockdraft-gate, lilicorr-head-gate, lilicorr-spec-gate (L298: the LiLiCorr lane on the Nemotron artifact)\n'; fi; \
 	if [ $$server -eq 1 ]; then printf '  server: chat smoke + the --server/--api unit switches\n'; fi; \
 	$(MAKE) --no-print-directory seam-check CUDA_ARCH=sm_120f || rc=1; \
 	$(MAKE) --no-print-directory cuda-reap-router-audit CUDA_ARCH=sm_120f \
@@ -2558,6 +2561,9 @@ gates-dev:
 	fi; \
 	if [ $$minp -eq 1 ]; then \
 	  $(MAKE) --no-print-directory cuda-minp-prefilter-gate CUDA_ARCH=sm_120f || rc=1; \
+	fi; \
+	if [ $$drafter -eq 1 ]; then \
+	  $(MAKE) --no-print-directory blockdraft-gate lilicorr-head-gate lilicorr-spec-gate CUDA_ARCH=sm_120f || rc=1; \
 	fi; \
 	if [ $$exl3 -eq 1 ]; then \
 	  $(MAKE) --no-print-directory exl3-dequant-gate CUDA_ARCH=sm_120f || rc=1; \
