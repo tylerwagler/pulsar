@@ -11,8 +11,9 @@
  *              score     s_e = f(l_e) over the routed logits l_0..l_{E-1} (bf16-rounded first when the family's
  *                        decision is made on bf16 logits): softmax | sqrt(softplus) | sigmoid;
  *              pick      the top-k of s_e + bias_e (the selection bias, or the image-slot bias on a row whose token
- *                        id says it is an image slot) by a k-round warp argmax, ties to the LOWER expert id
- *                        (torch.topk's order); or, on a token-id table layer, the table's row for the token;
+ *                        id says it is an image slot) in the total order (descending, ties to the LOWER expert id,
+ *                        torch.topk's order; a row whose s_e + bias_e is not all finite has no routing); or, on a
+ *                        token-id table layer, the table's row for the token;
  *              weights   SUM: w_k = s_k / max(sum_k s_k, floor) * route_scale, the picks' UNBIASED scores;
  *                        LOGSIGMOID_SINKS: over the k picks' RAW logits and the S sink logits (rows E..E+S-1),
  *                        w_i = softmax_i(logsigmoid(a_i)) * route_scale * global_scale -- the last S of them gate
