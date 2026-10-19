@@ -31,6 +31,7 @@
  */
 #include "pulsar_cuda_internal.h"
 #include "pulsar_cuda_mx.cuh"
+#include "lib/pulsar_yarn.h"
 
 #include <algorithm>
 
@@ -105,7 +106,7 @@ struct qsa_row {
     uint32_t brope[3];  /* ... and its indexer block's first token's (pos - 3 for text) */
 };
 
-struct qsa_rope_tab { float inv[PULSAR_QSA_ROT_DIM / 2]; };
+struct qsa_rope_tab { float inv[PULSAR_QSA_ROT_DIM / 2]; float mscale; };
 
 __device__ __forceinline__ float qsa_warp_sum(float v) {
     #pragma unroll
@@ -122,15 +123,17 @@ __device__ __forceinline__ float qsa_warp_max(float v) {
  * axis of pair i -- H when i % 3 == 1, W when i % 3 == 2, else T (HF apply_interleaved_mrope, mrope_section
  * [11, 11, 10] over 32 pairs); a text row's three axes are equal, so its angle is the 1D rope's.  The angle is the
  * f32 product transformers forms (inv_freq f32 times the position as f32); its cos/sin are taken in double so a
- * large angle is not the fast-math __sinf's. */
+ * large angle is not the fast-math __sinf's, rounded to f32, then times the rope's mscale in f32 (transformers'
+ * `freqs.cos() * attention_scaling`; L280 YaRN -- natively 1, and x * 1.0f is x, so the native rope's bytes are
+ * the ones it had before the factor existed). */
 __device__ __forceinline__ void qsa_rope_cs(const qsa_rope_tab &tab, const uint32_t (&p)[3], uint32_t i,
                                             float *c, float *s) {
     const uint32_t pos = p[i % 3u == 1u ? 1 : i % 3u == 2u ? 2 : 0];
     const float ang = __fmul_rn((float)pos, tab.inv[i]);
     double sd, cd;
     sincos((double)ang, &sd, &cd);
-    *c = (float)cd;
-    *s = (float)sd;
+    *c = __fmul_rn((float)cd, tab.mscale);
+    *s = __fmul_rn((float)sd, tab.mscale);
 }
 
 /* One warp, one head of NJ*32 elements: lane l holds x[l + 32 j].  RMSNorm with
@@ -751,10 +754,32 @@ uint32_t pulsar_qsa_kv_token_bytes(int tp_ranks) {
     return tp_ranks == 2 ? qsa_shape<2>::KV_TOKEN_BYTES : qsa_shape<1>::KV_TOKEN_BYTES;
 }
 
-void pulsar_qsa_inv_freq(float inv_freq[PULSAR_QSA_ROT_DIM / 2]) {
-    for (uint32_t i = 0; i < PULSAR_QSA_ROT_DIM / 2; i++) {
-        inv_freq[i] = (float)(1.0 / pow(PULSAR_QSA_ROPE_THETA, (double)(2u * i) / (double)PULSAR_QSA_ROT_DIM));
+/* transformers' rope init (the default rope, or _compute_yarn_parameters) in double, each result rounded ONCE to f32:
+ * pos_freqs = theta^(2i/64); extrapolation = 1 / pos_freqs; interpolation = 1 / (factor * pos_freqs); blended by
+ * each pair's extrapolation weight; attention factor 1 + 0.1 ln(factor).  Host code of a .cu TU: IEEE (nvcc's
+ * --use_fast_math is the device's), so pow and log are libm's double functions. */
+int pulsar_qsa_rope_init(pulsar_qsa_rope *out, const pulsar_qsa_yarn *yarn) {
+    if (!out) return qsa_refuse("pulsar_qsa_rope_init: no output");
+    constexpr uint32_t D = PULSAR_QSA_ROT_DIM;
+    double low = 0.0, high = 0.0;
+    if (yarn) {
+        if (!(yarn->factor > 1.0) || !isfinite(yarn->factor) || yarn->orig_ctx == 0 || !(yarn->beta_slow > 0.0) ||
+            !(yarn->beta_fast > yarn->beta_slow) || !isfinite(yarn->beta_fast)) {
+            return qsa_refuse("YaRN needs factor > 1, an original context, and beta_fast > beta_slow > 0");
+        }
+        pulsar_yarn_corr_range<double>(D, yarn->orig_ctx, PULSAR_QSA_ROPE_THETA, yarn->beta_fast, yarn->beta_slow,
+                                       &low, &high);
+        if (!(high > low)) return qsa_refuse("the YaRN ramp's pair range is empty at this original context");
     }
+    for (uint32_t i = 0; i < D / 2; i++) {
+        const double pos_freq = pow(PULSAR_QSA_ROPE_THETA, (double)(2u * i) / (double)D);
+        const double extrap = 1.0 / pos_freq;
+        out->inv_freq[i] = (float)(yarn ? pulsar_yarn_blend<double>(1.0 / (yarn->factor * pos_freq), extrap,
+                                                                     pulsar_yarn_extrap_weight<double>(low, high, (double)i))
+                                        : extrap);
+    }
+    out->mscale = yarn ? (float)pulsar_yarn_mscale<double>(yarn->factor) : 1.0f;
+    return 1;
 }
 
 uint64_t pulsar_gpu_qsa_workspace_bytes(uint32_t n_rows, uint32_t max_ctx) {
@@ -790,6 +815,7 @@ int pulsar_gpu_qsa_forward(const pulsar_qsa_layer *layer,
         return qsa_refuse("a projection input is missing or shorter than n_rows rows");
     }
     if (!io->out_bf16 && !io->out_e4m3) return qsa_refuse("no o_proj output (out_bf16 and out_e4m3 both NULL)");
+    if (!io->rope) return qsa_refuse("no rope (pulsar_qsa_io::rope; pulsar_qsa_rope_init makes it)");
     if (io->out_e4m3 && (!io->out_scale || io->out_sf_pitch != pulsar_mx_kbp((uint32_t)OUT_DIM))) {
         return qsa_refuse("an o_proj E4M3 slot needs its scale plane and the rank's o_proj-wide KBp");
     }
@@ -858,8 +884,9 @@ int pulsar_gpu_qsa_forward(const pulsar_qsa_layer *layer,
 
     if (pulsar_shape_once_first(&g_qsa_announce, pulsar_shape_key(n_rows, n_select ? 1u : 0u), "qsa attention")) {
         fprintf(stderr, "pulsar: qsa attention: %u rows (%u selecting top-%u blocks), KV E4M3 MX32, "
-                        "splits of %u listed tokens %s\n", n_rows, n_select, PULSAR_QSA_TOP_BLOCKS, QSA_SPLIT,
-                n_rows >= QSA_FOLD_ROWS ? "folded in the CTA" : "in parallel + combine");
+                        "splits of %u listed tokens %s, rope mscale %.9g\n", n_rows, n_select,
+                PULSAR_QSA_TOP_BLOCKS, QSA_SPLIT, n_rows >= QSA_FOLD_ROWS ? "folded in the CTA" : "in parallel + combine",
+                (double)io->rope->mscale);
     }
 
     if (!cuda_ok(cudaMemcpyAsync(ws.rows, h_rows.data(), R * sizeof(qsa_row), cudaMemcpyHostToDevice),
@@ -867,7 +894,8 @@ int pulsar_gpu_qsa_forward(const pulsar_qsa_layer *layer,
     if (n_select && !cuda_ok(cudaMemcpyAsync(ws.list, h_list.data(), (uint64_t)n_select * 4u,
                                              cudaMemcpyHostToDevice), "qsa list upload")) return 0;
     qsa_rope_tab tab;
-    pulsar_qsa_inv_freq(tab.inv);
+    memcpy(tab.inv, io->rope->inv_freq, sizeof(tab.inv));
+    tab.mscale = io->rope->mscale;
 
     qsa_block_keys_kernel<<<(n_rows + 7u) / 8u, 256>>>(ws.rows, n_rows, (const float *)io->idx->ptr,
                                                        layer->idx_k_norm, tab);

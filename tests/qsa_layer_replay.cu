@@ -79,6 +79,9 @@ struct Replay {
         io.out_sf_pitch = pulsar_mx_kbp(PULSAR_QSA_OUT_DIM);
         io.tap_out_f32 = tap;
         io.tap_sel = sel;
+        pulsar_qsa_rope rope;   /* the native rope: the replay's captures are the native model's */
+        if (!pulsar_qsa_rope_init(&rope, NULL)) { fprintf(stderr, "rope init refused\n"); exit(1); }
+        io.rope = &rope;
         pulsar_gpu_tensor_fill_f32(sc, 0.f, pulsar_gpu_tensor_bytes(sc) / 4);
         if (!pulsar_gpu_qsa_forward(&L, &seq, 1, rs.data(), rp.data(), n, &io, ws)) { fprintf(stderr, "forward refused\n"); exit(1); }
         pulsar_gpu_tensor_read(tap, 0, out, (size_t)n * PULSAR_QSA_OUT_DIM * 4);
