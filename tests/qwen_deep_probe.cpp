@@ -164,8 +164,11 @@ int main(int argc, char **argv) {
         const double t1 = now_s();
         Gk = ok ? pulsar_session_checkpoint_best(s, k) : 0;
         GD = ok ? pulsar_session_checkpoint_best(s, D) : 0;
-        CHECK(ok && Gk == k / (int)grid * (int)grid && GD == D / (int)grid * (int)grid,
-              "C1 sync(P[0:%d]) then sync(P[0:%d]): %.1f s; checkpoints at %d and %d %s", k, D, t1 - t0, Gk, GD, err);
+        /* which checkpoints survive is the ladder's call (checkpoint.cpp: Qwen keeps 2 slots), so the chain is cut
+         * at whichever grid checkpoint below k the session kept -- the last one must be D's grid point */
+        CHECK(ok && Gk > 0 && Gk % (int)grid == 0 && GD == D / (int)grid * (int)grid,
+              "C1 sync(P[0:%d]) then sync(P[0:%d]): %.1f s; checkpoints kept at %d and %d %s", k, D, t1 - t0, Gk, GD,
+              err);
         FILE *a = ok ? fopen(f1.c_str(), "wb") : NULL, *b = ok ? fopen(f2.c_str(), "wb") : NULL;
         b1 = ok ? pulsar_session_segment_bytes(s, 0, Gk) : 0;
         b2 = ok ? pulsar_session_segment_bytes(s, Gk, GD) : 0;
@@ -228,7 +231,9 @@ int main(int argc, char **argv) {
               "%.2f tokens / round, %llu drafted %s", n_spec, D, first_diff, rounds, (double)n_spec / (rounds ? rounds : 1),
               (unsigned long long)(m1.draft_tokens - m0.draft_tokens), err);
 
-        /* PAYLOAD: the frontier (off the grid, past the prefill, the drafter's state moved) */
+        /* PAYLOAD: the frontier (off the grid, past the prefill, the drafter's state moved) -- after one plain step,
+         * which leaves the MTP lane at a savable frontier (payload_frontier_gate's order) */
+        ok = ok && pulsar_session_eval(s, pulsar_session_argmax(s), err, sizeof err) == 0;
         FILE *pf = ok ? fopen(fp_.c_str(), "wb") : NULL;
         const uint64_t pb = ok ? pulsar_session_payload_bytes(s) : 0;
         const double t1 = now_s();
