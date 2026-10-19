@@ -35,6 +35,8 @@ __pycache__/
 /tests/mseq_short_ctx_probe
 /tests/qwen_ref_gate
 /tests/qwen_generate
+/tests/qwen_kv_walk
+/tests/qwen_deep_probe
 /tests/qwen_chat_smoke
 /tests/api_golden
 /tests/grammar_bench
