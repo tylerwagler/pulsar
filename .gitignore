@@ -170,6 +170,7 @@ tests/dspark_batch_gate
 /tests/vision_visible_gate
 /tests/bank_carry_identity
 /tests/qsa_attn_gate
+/tests/qsa_yarn_test
 /tests/qsa_layer_replay
 /tests/qsa_attn_bench
 /tests/gqa_attn_gate

@@ -1,5 +1,6 @@
 #include "pulsar_engine_internal.h"
 #include "tp/pulsar_tp.h"
+#include "lib/pulsar_yarn.h"
 
 
 
@@ -144,7 +145,7 @@ static bool gpu_graph_csa2_emit_rows(
     const float freq_scale = layer_rope_freq_scale(il);
     const float ext_factor = PULSAR_ROPE_SCALE_FACTOR > 1.0f ? 1.0f : 0.0f;
     float attn_factor = 1.0f;
-    if (ext_factor != 0.0f && freq_scale > 0.0f) attn_factor /= 1.0f + 0.1f * logf(1.0f / freq_scale);
+    if (ext_factor != 0.0f && freq_scale > 0.0f) attn_factor /= pulsar_yarn_mscale(1.0f / freq_scale);
 
     pulsar_gpu_tensor *latent = pulsar_gpu_tensor_view(g->attn_comp_stage, 0,
                                                        (uint64_t)n_rows * PULSAR_N_HEAD_DIM * sizeof(float));
@@ -444,7 +445,7 @@ static bool gpu_graph_csa2_produce(
     const float freq_scale = layer_rope_freq_scale(il);
     const float ext_factor = PULSAR_ROPE_SCALE_FACTOR > 1.0f ? 1.0f : 0.0f;
     float attn_factor = 1.0f;
-    if (ext_factor != 0.0f && freq_scale > 0.0f) attn_factor /= 1.0f + 0.1f * logf(1.0f / freq_scale);
+    if (ext_factor != 0.0f && freq_scale > 0.0f) attn_factor /= pulsar_yarn_mscale(1.0f / freq_scale);
     /* A banked graph has the indexer's lane too (the slab carries iskv/issc,
      * and gpu_graph_bank_index_state_*_view hands back the active bank's), so
      * the two index helpers below take the bank and select it themselves.  The
@@ -1372,7 +1373,7 @@ bool gpu_graph_encode_layer_attention_batch(
     const float ext_factor = compressed && PULSAR_ROPE_SCALE_FACTOR > 1.0f ? 1.0f : 0.0f;
     float attn_factor = 1.0f;
     if (ext_factor != 0.0f && freq_scale > 0.0f) {
-        attn_factor /= 1.0f + 0.1f * logf(1.0f / freq_scale);
+        attn_factor /= pulsar_yarn_mscale(1.0f / freq_scale);
     }
     uint32_t *comp_counts = compressed ? (uint32_t *)xcalloc(n_tokens, sizeof(comp_counts[0])) : NULL;
     pulsar_gpu_tensor *hc_mix_view = pulsar_gpu_tensor_view(
@@ -3221,7 +3222,7 @@ bool gpu_graph_dspark_compressor_rollforward(
                 const float idx_ext_factor = PULSAR_ROPE_SCALE_FACTOR > 1.0f ? 1.0f : 0.0f;
                 float idx_attn_factor = 1.0f;
                 if (idx_ext_factor != 0.0f && idx_freq_scale > 0.0f)
-                    idx_attn_factor /= 1.0f + 0.1f * logf(1.0f / idx_freq_scale);
+                    idx_attn_factor /= pulsar_yarn_mscale(1.0f / idx_freq_scale);
                 pulsar_gpu_tensor *idx_latent = pulsar_gpu_tensor_view(g->idx_comp_stage, 0,
                                                     (uint64_t)PULSAR_N_INDEXER_HEAD_DIM * sizeof(float));
                 if (!idx_latent) return rollforward_fail(il, pos0, "no indexer latent scratch for the rollforward");

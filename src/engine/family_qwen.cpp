@@ -194,6 +194,93 @@ static bool qwen_read_shape(const pulsar_model *m, pulsar_qwen_shape *s) {
     return ok;
 }
 
+/* Any value at all under `key` (number, bool, string): a key this engine does not implement is refused by name,
+ * whatever its type. */
+static bool qcfg_present(const pulsar_model *m, const char *key) {
+    float f;
+    uint64_t u;
+    bool b;
+    pulsar_str z;
+    return model_get_f32_compat(m, key, &f) || model_get_u64_compat(m, key, &u) || model_get_bool(m, key, &b) ||
+           model_get_string(m, key, &z);
+}
+
+/* L280: the QSA rope's scaling, from rope_parameters and the --rope-yarn option.
+ *   rope_type "default"  the native rope; with the option, YaRN at its factor over max_position_embeddings and
+ *                        transformers' default ramp (beta_fast 32, beta_slow 1) -- the model card's recipe
+ *   rope_type "yarn"     the container's factor, original_max_position_embeddings and optional beta_fast /
+ *                        beta_slow; the option, when given, must be that factor
+ * Anything else refuses: another rope type, and the YaRN keys this engine does not implement (attention_factor,
+ * mscale, mscale_all_dim, truncate false) -- a rope the container describes is the rope that runs, or nothing does.
+ * Fills s->yarn and the table every QSA call passes (s->qsa_rope). */
+static bool qwen_read_rope(const pulsar_model *m, const pulsar_engine_options *opt, pulsar_qwen_shape *s) {
+    const char *tkey = QWEN_KEY("rope_parameters.rope_type");
+    pulsar_str type = {NULL, 0};
+    if (!model_get_string(m, tkey, &type)) {
+        fprintf(stderr, "pulsar: %s: required config key %s is missing or not a string\n", PULSAR_QWEN_ARCH, tkey);
+        return false;
+    }
+    const double want = opt->rope_yarn_factor;
+    if (want != 0.0 && !(want > 1.0)) {
+        fprintf(stderr, "pulsar: %s: --rope-yarn %g: a YaRN factor is > 1 -- refusing\n", PULSAR_QWEN_ARCH, want);
+        return false;
+    }
+    memset(&s->yarn, 0, sizeof(s->yarn));
+    const char *src = NULL;
+    if (pulsar_streq(type, "default")) {
+        if (want != 0.0) {
+            s->yarn.factor = want;
+            s->yarn.orig_ctx = s->max_position;
+            s->yarn.beta_fast = 32.0;
+            s->yarn.beta_slow = 1.0;
+            src = "the --rope-yarn option over the container's native rope";
+        }
+    } else if (pulsar_streq(type, "yarn")) {
+        float factor = 0.0f, bf = 32.0f, bs = 1.0f;
+        bool ok = qcfg_f32(m, QWEN_KEY("rope_parameters.factor"), &factor);
+        ok &= qcfg_u32(m, QWEN_KEY("rope_parameters.original_max_position_embeddings"), &s->yarn.orig_ctx);
+        (void)model_get_f32_compat(m, QWEN_KEY("rope_parameters.beta_fast"), &bf);
+        (void)model_get_f32_compat(m, QWEN_KEY("rope_parameters.beta_slow"), &bs);
+        bool trunc = true;
+        for (const char *k : {QWEN_KEY("rope_parameters.attention_factor"), QWEN_KEY("rope_parameters.mscale"),
+                              QWEN_KEY("rope_parameters.mscale_all_dim")}) {
+            if (qcfg_present(m, k)) {
+                fprintf(stderr, "pulsar: %s: %s is not implemented (the attention factor is 1 + 0.1 ln(factor)) -- "
+                                "refusing\n", PULSAR_QWEN_ARCH, k);
+                ok = false;
+            }
+        }
+        if (model_get_bool(m, QWEN_KEY("rope_parameters.truncate"), &trunc) && !trunc) {
+            fprintf(stderr, "pulsar: %s: rope_parameters.truncate false is not implemented -- refusing\n", PULSAR_QWEN_ARCH);
+            ok = false;
+        }
+        if (!ok) return false;
+        s->yarn.factor = (double)factor;
+        s->yarn.beta_fast = (double)bf;
+        s->yarn.beta_slow = (double)bs;
+        if (want != 0.0 && want != s->yarn.factor) {
+            fprintf(stderr, "pulsar: %s: --rope-yarn %g contradicts the container's YaRN factor %g -- refusing\n",
+                    PULSAR_QWEN_ARCH, want, s->yarn.factor);
+            return false;
+        }
+        src = "the container's rope_parameters";
+    } else {
+        fprintf(stderr, "pulsar: %s: %s = '%.*s' is neither default nor yarn -- refusing\n", PULSAR_QWEN_ARCH, tkey,
+                (int)type.len, type.ptr);
+        return false;
+    }
+    if (!pulsar_qsa_rope_init(&s->qsa_rope, src ? &s->yarn : NULL)) return false;
+    if (src) {
+        fprintf(stderr, "pulsar: %s: rope YaRN x%g over %u trained positions (%s): %llu positions, ramp beta %g / %g, "
+                        "attention factor %.9g\n", PULSAR_QWEN_ARCH, s->yarn.factor, s->yarn.orig_ctx, src,
+                (unsigned long long)((double)s->yarn.orig_ctx * s->yarn.factor), s->yarn.beta_fast, s->yarn.beta_slow,
+                (double)s->qsa_rope.mscale);
+    } else {
+        fprintf(stderr, "pulsar: %s: rope native (rope_type default): %u positions\n", PULSAR_QWEN_ARCH, s->max_position);
+    }
+    return true;
+}
+
 /* The plan from `layer_types`, HF's own strings: "linear_attention" is a GDN
  * layer, "full_attention" a QSA layer, anything else is refused. */
 static bool qwen_read_plan(const pulsar_model *m, uint32_t n_layer, pulsar_layer_plan *plan) {
@@ -602,6 +689,7 @@ static bool qwen_family_load(pulsar_engine *e, const pulsar_engine_options *opt)
                 PULSAR_QWEN_SHAPE_FLASH_NEXT.name);
         return false;
     }
+    if (!qwen_read_rope(&e->model, opt, &s)) return false;
     g_qwen_shape = s;
     if (!qwen_read_plan(&e->model, s.n_layer, &e->plan)) return false;
     if (e->plan.kind[s.ple_layer] == PULSAR_LAYER_NONE) return false;
@@ -616,6 +704,14 @@ static bool qwen_family_load(pulsar_engine *e, const pulsar_engine_options *opt)
             mix(t->name.ptr, t->name.len);
             mix(&t->type, sizeof(t->type));
             mix(&t->bytes, sizeof(t->bytes));
+        }
+        /* L280: a YaRN rope writes other K bytes, so its segments and payloads never load into a native bank (or
+         * one of another factor); the native rope leaves the digest -- and every existing segment -- as it was */
+        if (s.yarn.factor != 0.0) {
+            mix(&s.yarn.factor, sizeof(s.yarn.factor));
+            mix(&s.yarn.orig_ctx, sizeof(s.yarn.orig_ctx));
+            mix(&s.yarn.beta_fast, sizeof(s.yarn.beta_fast));
+            mix(&s.yarn.beta_slow, sizeof(s.yarn.beta_slow));
         }
         e->qwen_weights->artifact_digest = h;
     }
@@ -732,8 +828,11 @@ static const char *qwen_served_model_id(const pulsar_engine *) { return "qwen3.8
 static pulsar_chat_format qwen_chat_format(const pulsar_engine *) { return PULSAR_CHAT_QWEN; }
 /* Disk-KV compatibility id: 0 and 1 are DeepSeek's two profiles. */
 static int qwen_model_id(const pulsar_engine *) { return 2; }
-/* no position scaling yet (L280): the trained positions are the limit */
-static uint64_t qwen_trained_context(const pulsar_engine *) { return g_qwen_shape.max_position; }
+/* The trained positions, or YaRN's original context x factor (L280) */
+static uint64_t qwen_trained_context(const pulsar_engine *) {
+    const pulsar_qsa_yarn &y = g_qwen_shape.yarn;
+    return y.factor != 0.0 ? (uint64_t)((double)y.orig_ctx * y.factor) : g_qwen_shape.max_position;
+}
 
 /* ---- session state ------------------------------------------------------------ */
 

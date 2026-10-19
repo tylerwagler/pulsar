@@ -288,6 +288,12 @@ bool pulsar_ds4_family_load(pulsar_engine *e, const pulsar_engine_options *opt) 
     if (!ds4_load_stage_ok("the tokenizer")) return false;
     config_validate_model(&e->model);
     if (!ds4_load_stage_ok("the configuration")) return false;
+    /* L280: DeepSeek's container declares its YaRN (validated above); the option may only restate it */
+    if (opt->rope_yarn_factor != 0.0 && opt->rope_yarn_factor != (double)PULSAR_ROPE_SCALE_FACTOR) {
+        fprintf(stderr, "pulsar: --rope-yarn %g contradicts the container's YaRN factor %g -- refusing\n",
+                opt->rope_yarn_factor, (double)PULSAR_ROPE_SCALE_FACTOR);
+        return false;
+    }
     if (opt->expert_overlay && opt->expert_overlay[0]) {
         const char *sep = strrchr(opt->expert_overlay, ':');
         if (!sep || sep == opt->expert_overlay || !sep[1]) {

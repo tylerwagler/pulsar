@@ -1320,6 +1320,7 @@ bool pulsar_qwen_s3_qsa(const pulsar_qwen_step *st, uint32_t il) {
         io.tap_out_f32 = NULL; io.tap_sel = NULL;              /* the lane, not a gate */
         io.tp_ranks = (int)pulsar_qwen_tp(s);
         io.row_rope = st->rope ? st->rope + (size_t)r0 * 6u : NULL;   /* L268: multi-axis rope, NULL for text */
+        io.rope = &s->qsa_rope;                                       /* L280: the load's table (native or YaRN) */
         /* row_seq / row_pos are HOST arrays -- pulsar_gpu_qsa_forward walks them on
          * the host to build its row list.  The step already carries them as `bank` /
          * `pos`.  (The GDN call's row_slot is the opposite: a DEVICE pointer.  Passing

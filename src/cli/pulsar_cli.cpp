@@ -1491,6 +1491,8 @@ static cli_config parse_options(int argc, char **argv) {
             c.engine.dspark_disable = true;
         } else if (!strcmp(arg, "--drafter")) {
             c.engine.drafter = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--rope-yarn")) {
+            c.engine.rope_yarn_factor = parse_float_range(need_arg(&i, argc, argv, arg), arg, 1.0f, 64.0f);
         } else if (!strcmp(arg, "--spec-depth")) {
             c.engine.spec_depth = parse_int(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--spec-tau")) {
