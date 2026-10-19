@@ -128,6 +128,7 @@ static bool spec_depth_shareable(int v) { return v >= 0 && v <= 16; }
 static bool same_config(const pulsar_engine_options *a, const pulsar_engine_options *b) {
     return same_str(a->model_path, b->model_path) &&
            a->dspark_disable == b->dspark_disable &&
+           a->rope_yarn_factor == b->rope_yarn_factor &&   /* L280: another rope is another model */
            same_str(a->expert_overlay, b->expert_overlay) &&
            a->backend == b->backend &&
            prefill_chunk_resolved(a->prefill_chunk) == prefill_chunk_resolved(b->prefill_chunk) &&
