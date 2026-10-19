@@ -2944,6 +2944,20 @@ tests/qwen_generate.o: tests/qwen_generate.cpp
 	$(CXX) $(CXXFLAGS) -Isrc -Isrc/engine -c -o $@ $<
 tests/qwen_generate: tests/qwen_generate.o src/lib/pulsar_help.o $(CORE_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
+# L291 / L280: the teacher-forced depth walk -- windows ending at a depth, one engine load (tools/qwen/kv_grade.py
+# grades its outputs).  The K/V format and the rope are the engine's (--rope-yarn F passes the option).  Needs a
+# real container.
+tests/qwen_kv_walk.o: tests/qwen_kv_walk.cpp
+	$(CXX) $(CXXFLAGS) -Isrc -Isrc/engine -c -o $@ $<
+tests/qwen_kv_walk: tests/qwen_kv_walk.o src/lib/pulsar_help.o $(CORE_OBJS)
+	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
+# L280: the session mechanisms past the native 262,144 positions (resume, the disk chain, spec == plain, the
+# payload) at one depth, each against one cold prefill.  Not in the battery (two prefills at the depth: ~10 min at
+# 300K); needs a real container and a long token file.
+tests/qwen_deep_probe.o: tests/qwen_deep_probe.cpp
+	$(CXX) $(CXXFLAGS) -Isrc -Isrc/engine -c -o $@ $<
+tests/qwen_deep_probe: tests/qwen_deep_probe.o src/lib/pulsar_help.o $(CORE_OBJS)
+	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 tests/qwen_chat_smoke.o: tests/qwen_chat_smoke.cpp
 	$(CXX) $(CXXFLAGS) -Isrc -Isrc/engine -c -o $@ $<
 tests/qwen_chat_smoke: tests/qwen_chat_smoke.o src/lib/pulsar_help.o $(CORE_OBJS)
