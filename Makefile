@@ -287,7 +287,7 @@ pulsar-agent: $(AGENT_OBJS) src/lib/pulsar_help.o src/lib/pulsar_kvtext.o src/li
 # S4 (router / MoE / GR / PLE) beside DeepSeek's and the shared EXL3 arms.
 CUDA_REGRESSION_BINS = tests/cuda_long_context_smoke tests/moe_route_bounds_gate tests/expert_table_gate \
                        tests/exl3_moe_epilogue_gate tests/exl3_dense_gate tests/exl3_moe_prefill_gate tests/exl3_half_gate \
-                       tests/gdn_gate tests/qsa_attn_gate tests/qwen_s4_gate tests/router_gate tests/gqa_attn_gate tests/sconv_gate tests/head_gate \
+                       tests/gdn_gate tests/qsa_attn_gate tests/qsa_yarn_test tests/qwen_s4_gate tests/router_gate tests/gqa_attn_gate tests/sconv_gate tests/head_gate \
                        tests/bf16_rows_gate tests/nvfp4_rows_gate tests/mamba2_gate tests/rowops_gate
 # 2026-10-14: they run CONCURRENTLY, each one's output kept together (-O).  They are model-free and mostly
 # host-bound (their references run on the CPU: measured alone, 258 s in series, the longest 114 s of which 113 s
@@ -833,6 +833,18 @@ tests/qsa_attn_gate: tests/qsa_attn_gate.cu Makefile src/pulsar_gpu.h src/cuda/p
 .PHONY: qsa-attn-gate
 qsa-attn-gate: tests/qsa_attn_gate
 	./tests/qsa_attn_gate
+
+# L280: the QSA rope table (native and YaRN) against transformers' own rope init, element-wise
+# (tests/qsa_yarn_golden.h, made by tools/qwen/yarn_golden.py).  Host only; links the production objects
+# for pulsar_qsa_rope_init.
+tests/qsa_yarn_test: tests/qsa_yarn_test.cu tests/qsa_yarn_golden.h Makefile src/pulsar_gpu.h src/lib/pulsar_yarn.h \
+                     $(CUDA_OBJS) $(CUTLASS_CUDA_OBJS) $(MMQ_OBJS)
+	$(NVCC) $(NVCCFLAGS) -std=c++17 -Isrc -Isrc/cuda -Itests -o $@ tests/qsa_yarn_test.cu \
+	        $(CUDA_OBJS) $(CUTLASS_CUDA_OBJS) $(MMQ_OBJS) $(CUDA_LDLIBS)
+
+.PHONY: qsa-yarn-test
+qsa-yarn-test: tests/qsa_yarn_test
+	./tests/qsa_yarn_test
 
 # L251 S3: replay one real attention layer's captured projections through the
 # same entry point, for the offline grade against transformers (see the tool's

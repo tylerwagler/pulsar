@@ -147,6 +147,11 @@ typedef struct {
      *  container holds; of two, the block drafter on Qwen (L299: dflash2 by default), a choice required on Nemotron-H;
      *  a name the container does not hold refuses the open by name. */
     const char *drafter;
+    /** L280 (--rope-yarn F): YaRN rope scaling at factor F over the container's trained context, for a container
+     *  whose rope is native (Qwen's ship `rope_type: default`; the model card's recipe is F 4 = 1M).  0 = the
+     *  container's own rope.  A container that already declares YaRN takes only its own factor, and a family whose
+     *  rope has no YaRN refuses the option by name -- it never reaches a model silently. */
+    double rope_yarn_factor;
     /** "FILE:PREFIX" — swap routed-expert tensors whose name starts with
      * PREFIX for the same-named tensors in FILE (a donor GGUF). Measurement
      * aid for per-layer quant-format KL probes (the prisma allocator, archived at tag archive/gguf-tooling-2026-09-24). */

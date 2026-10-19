@@ -2878,7 +2878,8 @@ int pulsar_gpu_tp_bulk_combine_sum(pulsar_gpu_tensor *dst, uint64_t dst_off, con
  * only (the three mRoPE rows equal, so interleaved mRoPE is plain RoPE):
  *   q_proj row = 24 heads x [256 query | 256 sigmoid output gate] (per head)
  *   q/k RMSNorm per head (weight applied as 1 + w), partial RoPE on dims 0..63
- *   (rotate_half pairs (i, i+32), angle = f32(pos) * f32 inv_freq[i]), GQA 12:1
+ *   (rotate_half pairs (i, i+32), angle = f32(pos) * f32 inv_freq[i], cos and sin
+ *   times the rope's mscale -- 1 natively, YaRN's attention factor under L280), GQA 12:1
  *   indexer: 4 q heads x 128 + 1 raw key x 128; keys mean-pooled over aligned
  *   blocks of 4 BEFORE the norm, then RMSNorm, then RoPE at the block start;
  *   score(block) = sum_h relu(q_h . k_block); a query at position p sees
@@ -2915,9 +2916,28 @@ enum {
 #define PULSAR_QSA_ROPE_THETA 10000000.0
 #define PULSAR_QSA_RMS_EPS    1e-6f
 
-/** The RoPE inverse frequencies, f32, as transformers computes them
- * (1 / theta^(2i/64)); the ONE table the kernels and the gates use. */
-void pulsar_qsa_inv_freq(float inv_freq[PULSAR_QSA_ROT_DIM / 2]);
+/** L280: YaRN over the native rope (transformers `rope_type: yarn`): `factor` > 1 times the context the rope was
+ *  trained at, `orig_ctx` (original_max_position_embeddings), with the ramp bounded by beta_fast / beta_slow
+ *  rotations (transformers' defaults 32 / 1).  The math is lib/pulsar_yarn.h's, shared with DeepSeek's rope. */
+typedef struct {
+    double   factor;               /**< double, as transformers reads the config's number */
+    uint32_t orig_ctx;
+    double   beta_fast, beta_slow;
+} pulsar_qsa_yarn;
+
+/** The QSA rope of a loaded model: the f32 inverse frequency of each rotary pair and the factor on cos and sin
+ *  (YaRN's attention factor; exactly 1 for the native rope).  pulsar_qsa_rope_init is its one producer, run once
+ *  per load; every pulsar_gpu_qsa_forward call names it (pulsar_qsa_io::rope). */
+typedef struct {
+    float inv_freq[PULSAR_QSA_ROT_DIM / 2];
+    float mscale;
+} pulsar_qsa_rope;
+
+/** Fill `out` for the native rope (`yarn` NULL: inv_freq[i] = 1 / theta^(2i/64), mscale 1) or for YaRN, as
+ *  transformers' _compute_yarn_parameters defines it -- every step evaluated in double and each result rounded
+ *  once to f32 (tests/qsa_yarn_test grades the table element-wise against transformers).  Refuses (returns 0, says
+ *  why) a factor <= 1, an orig_ctx of 0, or a ramp whose range is empty. */
+int pulsar_qsa_rope_init(pulsar_qsa_rope *out, const pulsar_qsa_yarn *yarn);
 
 /** One sequence's cache for ONE attention layer (layout above). */
 typedef struct {
@@ -2964,6 +2984,8 @@ typedef struct {
      *  earlier call's).  Rotary pair j takes H when j % 3 == 1, W when j % 3 == 2, else T (HF's
      *  apply_interleaved_mrope over mrope_section [11, 11, 10]).  The KV row is still `row_pos`. */
     const uint32_t *row_rope;
+    /** L280: the model's rope (pulsar_qsa_rope_init); required -- a call without one refuses. */
+    const pulsar_qsa_rope *rope;
 } pulsar_qsa_io;
 
 /** Bytes of one token's KV record for one rank at the tensor-parallel degree tp_ranks (0 / 1: 1056). */

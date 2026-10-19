@@ -33,6 +33,10 @@ bool load(pulsar_engine *e, const pulsar_engine_options *opt) {
         fprintf(stderr, "pulsar: %s: --expert-overlay is a DeepSeek routed-expert tool; refusing\n", ARCH);
         return false;
     }
+    if (opt->rope_yarn_factor != 0.0) {
+        fprintf(stderr, "pulsar: %s: --rope-yarn: this family has no rope to scale; refusing\n", ARCH);
+        return false;
+    }
     if (opt->directional_steering_file && opt->directional_steering_file[0]) {
         fprintf(stderr, "pulsar: %s: directional steering is not implemented for this family; refusing\n", ARCH);
         return false;
