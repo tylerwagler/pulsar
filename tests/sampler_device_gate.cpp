@@ -451,6 +451,59 @@ void bench(uint32_t n_vocab, pulsar_gpu_tensor *dl, pulsar_gpu_tensor *scratch, 
 
 }  // namespace
 
+/* The TP mirror's cross-rank identity digest (L243; on the device since L302): deterministic, sensitive to one bit
+ * anywhere, to the row count and to the width. */
+static void test_rows_digest(gate &g) {
+    const uint32_t width = 129280u, rows = 24u;   /* a served verify batch: 3 clients x 8 rows */
+    const size_t n = (size_t)rows * width;
+    std::vector<float> a(n);
+    uint32_t x = 0x1234567u;
+    for (size_t i = 0; i < n; i++) {
+        x = x * 1664525u + 1013904223u;
+        a[i] = (float)(x >> 8) * (1.0f / 16777216.0f) * 20.0f - 10.0f;
+    }
+    pulsar_gpu_tensor *d = pulsar_gpu_tensor_alloc(n * 4u), *out = pulsar_gpu_tensor_alloc(8u);
+    uint32_t checks = 0, bad = 0;
+    auto digest = [&](uint64_t off_floats, uint32_t nr, uint32_t w) {
+        uint64_t h = 0;
+        if (!pulsar_gpu_rows_digest(d, off_floats * 4u, nr, w, out, 0) || !pulsar_gpu_tensor_read(out, 0, &h, 8u))
+            bad++;
+        return h;
+    };
+    auto check = [&](bool ok, const char *what) {
+        checks++;
+        if (!ok) { bad++; fprintf(stderr, "  FAIL rows digest: %s\n", what); }
+    };
+    if (!d || !out || !pulsar_gpu_tensor_write(d, 0, a.data(), n * 4u)) {
+        g.fails++;
+        fprintf(stderr, "  FAIL rows digest: setup\n");
+        return;
+    }
+    const uint64_t d0 = digest(0, rows, width);
+    check(d0 == digest(0, rows, width), "deterministic");
+    check(d0 != digest(0, rows - 1, width), "one fewer row changes it");
+    check(digest(0, 1, width) != digest(width, 1, width), "two different rows differ");
+    check(digest(0, 0, width) == digest(0, 0, width) && digest(0, 0, width) != digest(0, 0, width + 2),
+          "a zero-row digest is deterministic and still names its width");
+    const size_t at[4] = {0, n / 2 + 3, n - 9, n - 1};
+    for (int k = 0; k < 4; k++) {
+        std::vector<float> b = a;
+        uint32_t bits;
+        memcpy(&bits, &b[at[k]], 4);
+        bits ^= 1u << (k * 7);
+        memcpy(&b[at[k]], &bits, 4);
+        pulsar_gpu_tensor_write(d, 0, b.data(), n * 4u);
+        check(digest(0, rows, width) != d0, "one flipped bit changes it");
+    }
+    pulsar_gpu_tensor_write(d, 0, a.data(), n * 4u);
+    check(digest(0, rows, width) == d0, "the restored rows digest as before");
+    printf("  rows digest: %u checks, %u failures\n", checks, bad);
+    g.cases += checks;
+    g.fails += bad;
+    pulsar_gpu_tensor_free(d);
+    pulsar_gpu_tensor_free(out);
+}
+
 int main(int argc, char **argv) {
     bool quick = false, do_bench = false, bench_only = false;
     for (int i = 1; i < argc; i++) {
@@ -517,6 +570,7 @@ int main(int argc, char **argv) {
         pulsar_gpu_tensor_free(dwalk);
         pulsar_gpu_tensor_free(dmap);
     }
+    if (!bench_only) test_rows_digest(g);
     const double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
     printf("sampler-device-gate: %u cases (%u rows past the shared store), %u failures, %.1f s -- %s\n", g.cases,
            g.overflow_rows, g.fails, s, g.fails ? "FAIL" : "PASS");

@@ -70,6 +70,9 @@ static float pat(int rank, uint32_t slot, uint32_t i) {
     return (float)((int)(rank == 0 ? 100000 : 70000) + (int)slot * 1000 + (int)i);
 }
 
+/* A logits digest both ranks agree on (the protocol carries it; the ranks compute theirs on the device, L302). */
+static uint64_t agreed_digest(uint32_t slot) { return 0x9E3779B97F4A7C15ull * (slot + 1u); }
+
 static float *slot_at(uint8_t *base, const pulsar_tp_slab *s, uint32_t layer,
                       uint32_t gate, uint64_t vec, int in) {
     const uint64_t off = in ? pulsar_tp_slab_in_offset(s, layer, gate, vec)
@@ -177,9 +180,7 @@ static void acks_ahead_phase(pulsar_tp *tp, uint8_t *base, int rank, const pulsa
                              uint64_t vec) {
     char err[256];
     const uint64_t sid = 7171u;
-    float logits[64];
-    for (uint32_t i = 0; i < 64; i++) logits[i] = pat(1, 71, i);
-    const uint64_t digest = pulsar_tp_logits_digest(logits, 1u, 64u);
+    const uint64_t digest = agreed_digest(71u);
     if (rank == 0) {
         CHECK(pulsar_tp_send_eval(tp, sid, 1, 21) == 1, "acks ahead: send_eval");
         CHECK(pulsar_tp_defer_command_ack_digest(tp, sid, "eval at position 1", digest) == 1,
@@ -419,13 +420,7 @@ static void frames_phase(pulsar_tp *tp, int rank) {
 static void deferred_phase(pulsar_tp *tp, int rank) {
     char err[512];
     const uint64_t sid = 6262u;
-    const uint32_t width = 4096u, rows = 1u;
-    float *logits = (float *)std::malloc((size_t)rows * width * sizeof(float));
-    CHECK(logits != NULL, "deferred logits alloc");
-    if (!logits) return;
-    for (uint32_t i = 0; i < rows * width; i++) logits[i] = pat(3, 78, i);
-    const uint64_t digest = pulsar_tp_logits_digest(logits, rows, width);
-    std::free(logits);
+    const uint64_t digest = agreed_digest(78u);
     if (rank == 0) {
         uint64_t f0 = 0, m0 = 0, frames = 0, matched = 0;
         pulsar_tp_identity_stats(tp, &f0, &m0);
@@ -517,8 +512,8 @@ static void deferred_phase(pulsar_tp *tp, int rank) {
     }
 }
 
-/* The cross-rank logits identity ack (L243, protocol v11).  Both ranks build
- * the same synthetic logits; the worker answers an eval with the digest ack;
+/* The cross-rank logits identity ack (L243, protocol v11).  Both ranks hold
+ * the same agreed digest; the worker answers an eval with the digest ack;
  * the leader's digest collect must accept an equal digest and count it, refuse
  * a different one by name (marking the group failed), and refuse a shape
  * confusion in both directions: a digest on a plain collect and a plain ack on
@@ -526,13 +521,7 @@ static void deferred_phase(pulsar_tp *tp, int rank) {
 static void identity_phase(pulsar_tp *tp, int rank) {
     char err[512];
     const uint64_t sid = 6161u;
-    const uint32_t width = 4096u, rows = 3u;
-    float *logits = (float *)std::malloc((size_t)rows * width * sizeof(float));
-    CHECK(logits != NULL, "identity logits alloc");
-    if (!logits) return;
-    for (uint32_t i = 0; i < rows * width; i++) logits[i] = pat(3, 77, i);
-    const uint64_t digest = pulsar_tp_logits_digest(logits, rows, width);
-    std::free(logits);
+    const uint64_t digest = agreed_digest(77u);
 
     if (rank == 0) {
         uint64_t frames = 0, matched = 0, f0 = 0, m0 = 0;

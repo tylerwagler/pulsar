@@ -271,63 +271,6 @@ static void test_owned_range(void) {
           "negative rank accepted");
 }
 
-static void test_logits_digest(void) {
-    /* The cross-rank identity digest (L243): deterministic, sensitive to one
-     * bit anywhere and to the row count, and cheap enough to run on every
-     * served step (the throughput is printed, not asserted -- it is a report
-     * for the pair's step budget, which is measured on the pair). */
-    const uint32_t width = 129280u, rows = 24u;   /* a served verify batch: 3 clients x 8 rows */
-    const size_t n = (size_t)rows * width;
-    float *a = (float *)std::malloc(n * sizeof(float));
-    CHECK(a != NULL, "digest buffer alloc");
-    if (!a) return;
-    uint32_t x = 0x1234567u;
-    for (size_t i = 0; i < n; i++) {
-        x = x * 1664525u + 1013904223u;
-        a[i] = (float)(x >> 8) * (1.0f / 16777216.0f) * 20.0f - 10.0f;
-    }
-    const uint64_t d0 = pulsar_tp_logits_digest(a, rows, width);
-    CHECK(d0 == pulsar_tp_logits_digest(a, rows, width), "digest must be deterministic");
-    CHECK(d0 != pulsar_tp_logits_digest(a, rows - 1, width),
-          "one fewer row must change the digest");
-    CHECK(pulsar_tp_logits_digest(a, 1, width) != pulsar_tp_logits_digest(a + width, 1, width),
-          "two different rows must digest differently");
-    CHECK(pulsar_tp_logits_digest(a, 0, width) == pulsar_tp_logits_digest(a, 0, width) &&
-          pulsar_tp_logits_digest(a, 0, width) != pulsar_tp_logits_digest(a, 0, width + 1),
-          "a zero-row digest is deterministic and still names its width");
-    /* One bit, at the start, in the middle of a lane stride, in the tail word,
-     * and the last element. */
-    const size_t at[4] = { 0, n / 2 + 3, n - 9, n - 1 };
-    for (int k = 0; k < 4; k++) {
-        uint32_t bits;
-        std::memcpy(&bits, &a[at[k]], 4);
-        bits ^= 1u << (k * 7);
-        std::memcpy(&a[at[k]], &bits, 4);
-        CHECK(pulsar_tp_logits_digest(a, rows, width) != d0,
-              "flipping bit %d of element %zu must change the digest", k * 7, at[k]);
-        std::memcpy(&bits, &a[at[k]], 4);
-        bits ^= 1u << (k * 7);
-        std::memcpy(&a[at[k]], &bits, 4);
-    }
-    CHECK(pulsar_tp_logits_digest(a, rows, width) == d0, "restored buffer must digest as before");
-    /* A width that is not a multiple of 8 bytes exercises the tail path. */
-    CHECK(pulsar_tp_logits_digest(a, 3, 5) != pulsar_tp_logits_digest(a, 3, 7) &&
-          pulsar_tp_logits_digest(a, 3, 5) == pulsar_tp_logits_digest(a, 3, 5),
-          "odd widths digest deterministically through the tail path");
-    {
-        struct timespec t0, t1;
-        clock_gettime(CLOCK_MONOTONIC, &t0);
-        uint64_t acc = 0;
-        for (int r = 0; r < 8; r++) acc = acc * 31u + pulsar_tp_logits_digest(a, rows, width);
-        clock_gettime(CLOCK_MONOTONIC, &t1);
-        const double sec = (double)(t1.tv_sec - t0.tv_sec) + (double)(t1.tv_nsec - t0.tv_nsec) * 1e-9;
-        const double mb = (double)(n * sizeof(float)) / 1048576.0;
-        std::printf("tp_core_test: logits digest %.1f MiB (%u rows x %u) in %.2f ms per pass = %.1f GiB/s (acc %016llx)\n",
-                    mb, rows, width, sec / 8.0 * 1e3, mb / 1024.0 / (sec / 8.0), (unsigned long long)acc);
-    }
-    std::free(a);
-}
-
 /* L258: the bulk lane credits each imm arrival to its own exchange.  The peer
  * finishes exchange k once our k arrives and may post k+1 while this rank is
  * still reaping its own send completion for k, so one CQ poll can hand back
@@ -391,7 +334,6 @@ int main(void) {
     test_identity_defaults();
     test_gate_schedule();
     test_owned_range();
-    test_logits_digest();
     test_bulk_arrivals();
     test_bulk_rail_split();
     if (g_failures) {
