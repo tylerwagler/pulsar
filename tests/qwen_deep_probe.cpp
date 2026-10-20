@@ -80,10 +80,12 @@ static bool same_rows(const std::vector<std::vector<float>> &a, const std::vecto
 int main(int argc, char **argv) {
     double yarn = 0.0;
     int n_spec = 64;
+    bool payload_only = false;   /* only PAYLOAD, on one cold prefill (no C1 / C4 / SPEC comparison) */
     std::vector<char *> pos;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--rope-yarn") && i + 1 < argc) yarn = atof(argv[++i]);
         else if (!strcmp(argv[i], "--spec") && i + 1 < argc) n_spec = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--payload-only")) payload_only = true;
         else pos.push_back(argv[i]);
     }
     if (pos.size() != 4) {
@@ -120,6 +122,63 @@ int main(int argc, char **argv) {
     const int32_t *next = &ids[(size_t)D];
     char err[512] = "";
     printf("qwen-deep-probe: D %d, ctx %d, rope-yarn %g, spec %d tokens\n", D, ctx, yarn, n_spec);
+
+    if (payload_only) {
+        /* the frontier PAYLOAD grades, from one cold prefill: 4 decode steps, n_spec speculated tokens, one plain
+         * step -- then the same save / load / 8-step comparison as below */
+        pulsar_engine_set_bank_pool(1);
+        pulsar_session *s = NULL, *x = NULL;
+        pulsar_tokens P = {(int *)ids.data(), D, D};
+        const double t0 = now_s();
+        bool ok = pulsar_session_create(&s, e, ctx) == 0 && pulsar_session_sync(s, &P, err, sizeof err) == 0;
+        CHECK(ok, "COLD sync(P[0:%d]): %.1f s %s", D, now_s() - t0, err);
+        std::vector<std::vector<float>> c;
+        ok = ok && after_sync(s, next, W, &c, err, sizeof err);
+        uint64_t rng = 7;
+        int got = 0, rounds = 0;
+        while (ok && got < n_spec) {
+            int buf[17];
+            const int n = pulsar_session_generate_speculative(s, 0.0f, 0, 1.0f, 0.0f, &rng, n_spec - got, buf, 17, err,
+                                                              sizeof err);
+            if (n <= 0) { ok = false; break; }
+            got += n;
+            rounds++;
+        }
+        ok = ok && pulsar_session_eval(s, pulsar_session_argmax(s), err, sizeof err) == 0;
+        CHECK(ok, "4 decode steps, %d tokens speculated in %d rounds, one plain step: frontier %d %s", got, rounds,
+              pulsar_session_pos(s), err);
+        const std::string fp_ = dir + "/l280-payload.bin";
+        FILE *pf = ok ? fopen(fp_.c_str(), "wb") : NULL;
+        const uint64_t pb = ok ? pulsar_session_payload_bytes(s) : 0;
+        const double t1 = now_s();
+        ok = ok && pf && pulsar_session_save_payload(s, pf, err, sizeof err) == 0;
+        const long wrote = pf ? ftell(pf) : 0;
+        if (pf) fclose(pf);
+        CHECK(ok && (uint64_t)wrote == pb, "PAYLOAD saved at %d: %.2f GiB (payload_bytes %.2f GiB) in %.1f s %s",
+              pulsar_session_pos(s), wrote / 1073741824.0, pb / 1073741824.0, now_s() - t1, err);
+        pf = ok ? fopen(fp_.c_str(), "rb") : NULL;
+        const double t2 = now_s();
+        ok = ok && pf && pulsar_session_create(&x, e, ctx) == 0 &&
+             pulsar_session_load_payload(x, pf, pb, err, sizeof err) == 0 && pulsar_session_pos(x) == pulsar_session_pos(s);
+        if (pf) fclose(pf);
+        CHECK(ok, "PAYLOAD loaded into a fresh session at %d in %.1f s %s", x ? pulsar_session_pos(x) : -1,
+              now_s() - t2, err);
+        int diff_rows = 0;
+        for (int i = 0; ok && i < 8; i++) {
+            const std::vector<float> ls = logits_of(s, W), lx = logits_of(x, W);
+            diff_rows += ls.size() != lx.size() || memcmp(ls.data(), lx.data(), ls.size() * sizeof(float)) != 0;
+            const int t = pulsar_session_argmax(s);
+            ok = pulsar_session_eval(s, t, err, sizeof err) == 0 && pulsar_session_eval(x, t, err, sizeof err) == 0;
+        }
+        CHECK(ok && diff_rows == 0, "PAYLOAD the loaded frontier's logits and next 8 decode steps == the live session's "
+              "(%d of 8 rows differ) %s", diff_rows, err);
+        if (x) pulsar_session_free(x);
+        if (s) pulsar_session_free(s);
+        remove(fp_.c_str());
+        pulsar_engine_close(e);
+        printf("\nqwen-deep-probe (payload only): %s (%d failed)\n", g_fail ? "FAIL" : "PASS", g_fail);
+        return g_fail ? 1 : 0;
+    }
 
     /* COLD, then the plain greedy continuation SPEC compares against */
     std::vector<std::vector<float>> cold;
