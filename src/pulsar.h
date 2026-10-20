@@ -664,6 +664,12 @@ int pulsar_session_argmax_excluding(pulsar_session *s, int excluded_id);
  * (no finite logit) or no stream. */
 int pulsar_sample_logits(const float *logits, int n_vocab, float temperature,
                       int top_k, float top_p, float min_p, uint64_t *rng);
+/** L303: one token-mask row applied to a logits row: token t keeps its logit when bit (t & 31) of mask[t >> 5]
+ * is set and becomes -inf otherwise, so every sampling transform after it (temperature, top-k/p, min-p, the
+ * draw, the argmax) sees only the allowed tokens.  A row is (n_vocab + 31) / 32 words -- the layout of
+ * pulsar_grammar.h's masks and of the device sampler's (L302).  The ONE place a mask meets logits: the plain
+ * lanes (server) and the speculative walk (engine) both call it. */
+void pulsar_token_mask_apply(float *logits, uint32_t n_vocab, const uint32_t *mask);
 /** pulsar_sample_logits over the session's live logits. @return the token, or -1. */
 int pulsar_session_sample(pulsar_session *s, float temperature, int top_k, float top_p, float min_p, uint64_t *rng);
 int pulsar_session_top_logprobs(pulsar_session *s, pulsar_token_score *out, int k);
@@ -975,6 +981,15 @@ typedef struct {
      * so a round that crosses between the two draws every token as one-token-a-step decoding would.  The carry and
      * the next chain record the carry row's params.  0 = `temperature` at every row. */
     uint32_t greedy_rows;
+    /* L303: token masks, pulsar_token_mask_apply's rows (pulsar_engine_logits_width wide); NULL = unconstrained,
+     * today's bytes.  assemble: row 0 masks a FRESH base draw (a carry was drawn under the previous round's row
+     * mask).  round_end: row i masks verify row i (the token after the base and drafts 0..i-1; row K is a full
+     * accept's carry), so each needs the request's grammar advanced through the base and drafts 0..i-1;
+     * `mask_rows` > the row the walk stops at (a row past a draft the mask refuses is never read).  A masked row
+     * is read whole and drawn through the mask exactly as a plain lane draws it -- spec == plain.  Not on a pair:
+     * the masks do not cross it (the step fails by name). */
+    const uint32_t *masks;
+    uint32_t mask_rows;
     /* assemble out, round_end in */
     int first_token;
     uint32_t row0;           /* the bank's first row in the shared forward */

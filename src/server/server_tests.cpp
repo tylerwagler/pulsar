@@ -14,6 +14,7 @@
 #include "lib/pulsar_kvchain.h"
 #include "lib/bpe_tokenizer.h"
 #include "lib/nemotron_chat.h"
+#include "lib/pulsar_grammar.h"
 
 #ifdef PULSAR_SERVER_TEST
 
@@ -3426,7 +3427,7 @@ static void test_qwen_forced_call_prefill_and_seed(void) {
         buf useed = {0};
         r.family->forced_call_seed(&r, &useed);
         TEST_ASSERT(!strcmp(useed.ptr, thinking_off ? "<tool_call>\n<function" : "\n</think>\n\n<tool_call>\n<function"));
-        TEST_ASSERT(!strcmp(r.family->forced_name_open, "=") && !strcmp(r.family->forced_name_close, ">"));
+        TEST_ASSERT(r.family->grammar == &k_grammar_qwen_xml);   /* L303: the call grammar takes it from "=" */
         qwen_output_parser u;
         TEST_ASSERT(u.init(!thinking_off, r.tools_json, err, sizeof err));
         std::vector<out_event> uev;
@@ -3530,60 +3531,382 @@ static void test_qwen_payload_is_sampled_structure_greedy(void) {
     TEST_ASSERT(p.calls()[0].arguments == "{\"s\": \"hello </b\", \"n\": 42, \"o\": {\"k\": \"v \\\" still\"}}");
 }
 
-/* L272: the declared-name mask's token rule -- a token is allowed while the joined bytes stay a prefix of
- * a declared name + the closer, or pass the closer with only whitespace after. */
-static void test_tool_name_token_allowed(void) {
-    request r;
-    request_init(&r, REQ_CHAT, 16);
-    tool_schema_orders_add_json(&r.tool_orders, "{\"name\":\"get_weather\",\"parameters\":{}}");
-    tool_schema_orders_add_json(&r.tool_orders, "{\"name\":\"search\",\"parameters\":{}}");
-    const tool_schema_orders *d = &r.tool_orders;
-    TEST_ASSERT(tool_name_token_allowed("", 0, "get", 3, "", d, ">"));
-    TEST_ASSERT(tool_name_token_allowed("", 0, "se", 2, "", d, ">"));
-    TEST_ASSERT(!tool_name_token_allowed("", 0, "ask", 3, "", d, ">"));          /* Qwen's undeclared ask_user */
-    TEST_ASSERT(tool_name_token_allowed("get_", 4, "weather", 7, "", d, ">"));
-    TEST_ASSERT(tool_name_token_allowed("get_weather", 11, ">", 1, "", d, ">"));
-    TEST_ASSERT(tool_name_token_allowed("get_weather", 11, ">\n", 2, "", d, ">"));   /* closer + newline in one token */
-    TEST_ASSERT(!tool_name_token_allowed("get_weather", 11, ">x", 2, "", d, ">"));
-    TEST_ASSERT(!tool_name_token_allowed("get", 3, ">", 1, "", d, ">"));           /* a strict prefix cannot close */
-    TEST_ASSERT(!tool_name_token_allowed("search", 6, "_web", 4, "", d, ">"));
-    TEST_ASSERT(!tool_name_token_allowed("", 0, "", 0, "", d, ">"));               /* an empty token: never */
-    /* L272: the opener rides the name's first token (Qwen "=get"); a bare opener is a prefix too */
-    TEST_ASSERT(tool_name_token_allowed("", 0, "=get", 4, "=", d, ">"));
-    TEST_ASSERT(tool_name_token_allowed("", 0, "=", 1, "=", d, ">"));
-    TEST_ASSERT(tool_name_token_allowed("=", 1, "search", 6, "=", d, ">"));
-    TEST_ASSERT(!tool_name_token_allowed("", 0, "get", 3, "=", d, ">"));        /* the opener is not optional */
-    TEST_ASSERT(!tool_name_token_allowed("", 0, "=ask", 4, "=", d, ">"));
-    /* L284 P7: DeepSeek's opener ` name="` and closer `">` (one token) under the same rule */
-    const server_family_ops *ds = server_family_for_format(PULSAR_CHAT_DS4_V41);
-    TEST_ASSERT(tool_name_token_allowed("", 0, " name", 5, ds->forced_name_open, d, ds->forced_name_close));
-    TEST_ASSERT(tool_name_token_allowed(" name=\"", 7, "get", 3, ds->forced_name_open, d, ds->forced_name_close));
-    TEST_ASSERT(!tool_name_token_allowed(" name=\"", 7, "reply", 5, ds->forced_name_open, d, ds->forced_name_close));
-    TEST_ASSERT(tool_name_token_allowed(" name=\"search", 13, "\">\n", 3, ds->forced_name_open, d,
-                                        ds->forced_name_close));
-    TEST_ASSERT(!tool_name_token_allowed(" name=\"se", 9, "\">", 2, ds->forced_name_open, d, ds->forced_name_close));
-    request_free(&r);
-    /* the mask stays on until the closer appears PAST the opener (the opener holds the closer's quote) */
+/* ==== L303: structured outputs -- the grammars, the gate, the protocols ================================== */
+
+/* A toy vocabulary for the grammar tests: every byte is a token (id = byte), then a few multi-byte tokens the
+ * families' markup samples whole, then the stop. */
+struct l303_vocab {
+    std::vector<std::string> tok;
+    int32_t stop;
+    l303_vocab() {
+        for (int b = 0; b < 256; b++) tok.push_back(std::string(1, (char)b));
+        for (const char *m : {"<tool_call>", "</think>", "\n\n", "<|content_text|>", "<|end_message|>"})
+            tok.push_back(m);
+        tok.push_back("<EOS>");
+        stop = (int32_t)tok.size() - 1;
+    }
+    int id(const char *m) const {
+        for (size_t i = 256; i < tok.size(); i++)
+            if (tok[i] == m) return (int)i;
+        return -1;
+    }
+};
+
+static void l303_server(server *srv, const l303_vocab &v) {
+    memset(srv, 0, sizeof *srv);
+    pthread_mutex_init(&srv->tool_mu, NULL);
+    std::vector<const char *> p;
+    std::vector<size_t> l;
+    for (const std::string &t : v.tok) {
+        p.push_back(t.data());
+        l.push_back(t.size());
+    }
+    char err[200] = "";
+    srv->grammar = pulsar_grammar_compiler_new(p.data(), l.data(), (int)v.tok.size(), (int)v.tok.size(), &v.stop, 1,
+                                               64LL << 20, err, sizeof err);
+    TEST_ASSERT(srv->grammar != NULL);
+    srv->token_bytes = new std::vector<std::string>(v.tok);
+}
+
+static void l303_server_free(server *srv) {
+    pulsar_grammar_compiler_free(srv->grammar);
+    delete srv->token_bytes;
+    pthread_mutex_destroy(&srv->tool_mu);
+}
+
+/* A request through a protocol parser and the family's render, with the toy compiler: the plan is built. */
+static bool l303_request(server *srv, pulsar_chat_format fmt, api_style api, const char *body, request *r, char *err,
+                         size_t errlen) {
+    request_init(r, REQ_CHAT, 64);
+    r->api = api;
+    chat_conversation c;
+    memset(&c, 0, sizeof c);
+    err[0] = '\0';
+    bool ok = api == API_RESPONSES   ? parse_chat_conversation_responses(body, &c, r, err, errlen)
+              : api == API_ANTHROPIC ? parse_chat_conversation_anthropic(body, &c, r, err, errlen)
+                                     : parse_chat_conversation_openai(body, &c, r, err, errlen);
+    ok = ok && render_chat_conversation(NULL, fmt, srv, &c, r, err, errlen);
+    chat_conversation_free(&c);
+    return ok;
+}
+
+/* The turn's gate as gen_decode_init starts it: the thinking state from the prompt, a forced call's seed. */
+static bool l303_begin(server *srv, job *j, gen_state *g) {
+    memset(g, 0, sizeof *g);
+    g->j = j;
+    g->thinking = thinking_state_from_prompt(&j->req);
+    if (j->req.force_tool_call && j->req.family->forced_call_seed) j->req.family->forced_call_seed(&j->req, &g->text);
+    return gen_constrain_begin(srv, g);
+}
+
+static bool l303_allows(server *srv, gen_state *g, int tok) {
+    if (!gen_constrain_live(g)) return true;
+    std::vector<uint32_t> row(gen_constrain_words(srv));
+    TEST_ASSERT(gen_constrain_mask(srv, g, row.data()));
+    return (row[(uint32_t)tok >> 5] >> ((uint32_t)tok & 31u)) & 1u;
+}
+
+/* Feed `text` a byte-token at a time, each one first checked against the live mask.  Returns the bytes fed: n when
+ * all were allowed, else the index of the first refused byte (not fed). */
+static size_t l303_feed(server *srv, gen_state *g, const std::string &text) {
+    for (size_t i = 0; i < text.size(); i++) {
+        const int tok = (uint8_t)text[i];
+        if (!l303_allows(srv, g, tok)) return i;
+        TEST_ASSERT(gen_constrain_accept(srv, g, tok));
+    }
+    return text.size();
+}
+
+static void l303_end(job *j, gen_state *g) {
+    gen_constrain_end(g);
+    buf_free(&g->text);
+    request_free(&j->req);
+}
+
+#define L303_TOOLS                                                                                                  \
+    "\"tools\":[{\"type\":\"function\",\"function\":{\"name\":\"search\",\"strict\":true,\"parameters\":{\"type\":"   \
+    "\"object\",\"properties\":{\"q\":{\"type\":\"string\"}},\"required\":[\"q\"],\"additionalProperties\":false}}}," \
+    "{\"type\":\"function\",\"function\":{\"name\":\"now\",\"strict\":true,\"parameters\":{\"type\":\"object\","      \
+    "\"properties\":{},\"additionalProperties\":false}}}]"
+#define L303_BODY(extra) "{\"messages\":[{\"role\":\"user\",\"content\":\"x\"}]," L303_TOOLS extra "}"
+
+/* L303: every family's grammar shape accepts the calls its own template renders -- byte for byte, under the mask
+ * at every byte -- and a strict call off its schema or naming an undeclared tool is refused at the byte that leaves
+ * it.  The reasoning before the calls is free (no matcher runs there). */
+static void test_l303_shapes_accept_rendered_calls(void) {
+    l303_vocab v;
+    server srv;
+    l303_server(&srv, v);
+    struct fcase {
+        pulsar_chat_format fmt;
+        const char *before;   /* the turn up to its calls */
+        const char *call;     /* a call to search(q="pulsars") as the template renders it */
+        const char *now;      /* a call to now() */
+        const char *bad;      /* a call that leaves the grammar: refused `bad_tail` bytes before its end */
+        size_t bad_tail;
+    };
+    static const fcase cases[] = {
+        {PULSAR_CHAT_QWEN, "plan</think>\n\n",
+         "<tool_call>\n<function=search>\n<parameter=q>\npulsars\n</parameter>\n</function>\n</tool_call>",
+         "<tool_call>\n<function=now>\n</function>\n</tool_call>", "<tool_call>\n<function=rm", 2},
+        {PULSAR_CHAT_NEMOTRON_H, "plan</think>\n",
+         "<tool_call>\n<function=search>\n<parameter=q>\npulsars\n</parameter>\n</function>\n</tool_call>",
+         "<tool_call>\n<function=now>\n</function>\n</tool_call>",
+         "<tool_call>\n<function=search>\n<parameter=x>", 2},
+        {PULSAR_CHAT_DS4_V41, "plan</think>",
+         "\n\n" PULSAR_TOOL_CALLS_START "\n" PULSAR_INVOKE_START " name=\"search\">\n" PULSAR_PARAM_START
+         " name=\"q\" string=\"true\">pulsars" PULSAR_PARAM_END "\n" PULSAR_INVOKE_END "\n" PULSAR_TOOL_CALLS_END,
+         "\n\n" PULSAR_TOOL_CALLS_START "\n" PULSAR_INVOKE_START " name=\"now\">\n\n" PULSAR_INVOKE_END "\n"
+         PULSAR_TOOL_CALLS_END,
+         "\n\n" PULSAR_TOOL_CALLS_START "\n" PULSAR_INVOKE_START " name=\"rm", 2},
+        {PULSAR_CHAT_DS4_V4, "plan</think>",
+         "\n\n" PULSAR_TOOL_CALLS_START_V4 "\n" PULSAR_INVOKE_START_V4 " name=\"search\">\n" PULSAR_PARAM_START_V4
+         " name=\"q\" string=\"true\">pulsars" PULSAR_PARAM_END_V4 "\n" PULSAR_INVOKE_END_V4 "\n" PULSAR_TOOL_CALLS_END_V4,
+         "\n\n" PULSAR_TOOL_CALLS_START_V4 "\n" PULSAR_INVOKE_START_V4 " name=\"now\">\n" PULSAR_INVOKE_END_V4 "\n"
+         PULSAR_TOOL_CALLS_END_V4,
+         "\n\n" PULSAR_TOOL_CALLS_START_V4 "\n" PULSAR_INVOKE_START_V4 " name=\"rm", 2},
+        {PULSAR_CHAT_INKLING, "",
+         "<|content_invoke_tool_json|>{\"name\":\"search\",\"args\":{\"q\":\"pulsars\"}}<|end_message|>",
+         "<|content_invoke_tool_json|>{\"name\":\"now\",\"args\":{}}<|end_message|>",
+         "<|content_invoke_tool_json|>{\"name\":\"search\",\"args\":{\"q\":1", 1},
+    };
+    for (const fcase &fc : cases) {
+        for (int which = 0; which < 3; which++) {
+            job j;
+            memset(&j, 0, sizeof j);
+            char err[300];
+            TEST_ASSERT(l303_request(&srv, fc.fmt, API_OPENAI, L303_BODY(""), &j.req, err, sizeof err));
+            TEST_ASSERT(j.req.constrain != NULL);
+            gen_state g;
+            TEST_ASSERT(l303_begin(&srv, &j, &g));
+            TEST_ASSERT(!gen_constrain_live(&g));   /* reasoning / free text: no matcher */
+            TEST_ASSERT(l303_feed(&srv, &g, fc.before) == strlen(fc.before));
+            const std::string call = which == 0 ? fc.call : which == 1 ? fc.now : fc.bad;
+            const size_t fed = l303_feed(&srv, &g, call);
+            if (which < 2) {
+                if (fed != call.size())
+                    fprintf(stderr, "l303 shape %d case %d: refused at %zu: \"%.*s\"\n", (int)fc.fmt, which, fed,
+                            (int)fed + 1, call.c_str());
+                TEST_ASSERT(fed == call.size());
+                TEST_ASSERT(!gen_constrain_live(&g));   /* the region ended with the call */
+            } else {
+                if (fed != call.size() - fc.bad_tail)
+                    fprintf(stderr, "l303 shape %d bad: refused at %zu of %zu\n", (int)fc.fmt, fed, call.size());
+                TEST_ASSERT(fed == call.size() - fc.bad_tail);
+            }
+            l303_end(&j, &g);
+        }
+    }
+    l303_server_free(&srv);
+}
+
+/* L303 (L272's case): a forced call is the call grammar from the family's seed on -- an unnamed one may only name
+ * a declared tool, and its arguments follow the tool's schema; a named one starts at its arguments. */
+static void test_l303_forced_call_grammar(void) {
+    l303_vocab v;
+    server srv;
+    l303_server(&srv, v);
+    struct fcase {
+        pulsar_chat_format fmt;
+        const char *rest_unnamed, *bad_unnamed, *rest_named;
+    };
+    static const fcase cases[] = {
+        {PULSAR_CHAT_QWEN, "=search>\n<parameter=q>\npulsars\n</parameter>\n</function>\n</tool_call>", "=ask",
+         "<parameter=q>\npulsars\n</parameter>\n</function>\n</tool_call>"},
+        {PULSAR_CHAT_NEMOTRON_H, "=search>\n<parameter=q>\npulsars\n</parameter>\n</function>\n</tool_call>", "=ask",
+         "<parameter=q>\npulsars\n</parameter>\n</function>\n</tool_call>"},
+        {PULSAR_CHAT_DS4_V41,
+         " name=\"search\">\n" PULSAR_PARAM_START " name=\"q\" string=\"true\">pulsars" PULSAR_PARAM_END "\n"
+         PULSAR_INVOKE_END "\n" PULSAR_TOOL_CALLS_END, " name=\"ask",
+         PULSAR_PARAM_START " name=\"q\" string=\"true\">pulsars" PULSAR_PARAM_END "\n" PULSAR_INVOKE_END "\n"
+         PULSAR_TOOL_CALLS_END},
+    };
+    for (const fcase &fc : cases) {
+        for (int named = 0; named < 2; named++) {
+            for (int bad = 0; bad < 2 - named; bad++) {
+                job j;
+                memset(&j, 0, sizeof j);
+                char err[300];
+                const char *body = named ? L303_BODY(",\"tool_choice\":{\"type\":\"function\",\"function\":{\"name\":"
+                                                     "\"search\"}}")
+                                         : L303_BODY(",\"tool_choice\":\"required\"");
+                TEST_ASSERT(l303_request(&srv, fc.fmt, API_OPENAI, body, &j.req, err, sizeof err));
+                TEST_ASSERT(j.req.force_tool_call && j.req.constrain);
+                gen_state g;
+                TEST_ASSERT(l303_begin(&srv, &j, &g));
+                TEST_ASSERT(gen_constrain_live(&g));   /* the seed opened the call region */
+                const std::string rest = named ? fc.rest_named : bad ? fc.bad_unnamed : fc.rest_unnamed;
+                const size_t fed = l303_feed(&srv, &g, rest);
+                if (bad) {
+                    TEST_ASSERT(fed == rest.size() - 3);   /* the undeclared name's first byte */
+                } else {
+                    if (fed != rest.size()) fprintf(stderr, "l303 forced %d named %d: refused at %zu\n", (int)fc.fmt, named, fed);
+                    TEST_ASSERT(fed == rest.size());
+                    TEST_ASSERT(!gen_constrain_live(&g));
+                }
+                l303_end(&j, &g);
+            }
+        }
+    }
+    l303_server_free(&srv);
+}
+
+/* L303: a response format constrains the answer -- after the reasoning closes (or at once when the turn starts
+ * outside it), through the family's answer close -- and the turn may end only when the format is complete. */
+static void test_l303_response_format_answer(void) {
+    l303_vocab v;
+    server srv;
+    l303_server(&srv, v);
+#define L303_RF ",\"response_format\":{\"type\":\"json_schema\",\"json_schema\":{\"name\":\"n\",\"schema\":{\"type\":" \
+                "\"object\",\"properties\":{\"n\":{\"type\":\"integer\"}},\"required\":[\"n\"],\"additionalProperties\":false}}}"
+    struct fcase {
+        pulsar_chat_format fmt;
+        const char *body;
+        const char *before;   /* free bytes before the answer */
+        const char *answer;
+    };
+    static const fcase cases[] = {
+        {PULSAR_CHAT_DS4_V41, "{\"messages\":[{\"role\":\"user\",\"content\":\"x\"}]" L303_RF "}", "hmm</think>",
+         "{\"n\": 42}"},
+        {PULSAR_CHAT_DS4_V41, "{\"messages\":[{\"role\":\"user\",\"content\":\"x\"}],\"reasoning_effort\":\"none\"" L303_RF "}",
+         "", "{\"n\":42}"},
+        {PULSAR_CHAT_QWEN, "{\"messages\":[{\"role\":\"user\",\"content\":\"x\"}]" L303_RF "}", "hmm</think>",
+         "\n\n{\n  \"n\": 42\n}"},
+        {PULSAR_CHAT_NEMOTRON_H, "{\"messages\":[{\"role\":\"user\",\"content\":\"x\"}]" L303_RF "}", "hmm</think>",
+         "{\"n\": 42}"},
+        {PULSAR_CHAT_INKLING, "{\"messages\":[{\"role\":\"user\",\"content\":\"x\"}]" L303_RF "}",
+         "<|content_thinking|>hmm<|end_message|><|message_model|><|content_text|>", "{\"n\": 42}<|end_message|>"},
+    };
+    for (const fcase &fc : cases) {
+        job j;
+        memset(&j, 0, sizeof j);
+        char err[300];
+        TEST_ASSERT(l303_request(&srv, fc.fmt, API_OPENAI, fc.body, &j.req, err, sizeof err));
+        TEST_ASSERT(j.req.constrain != NULL);
+        gen_state g;
+        TEST_ASSERT(l303_begin(&srv, &j, &g));
+        TEST_ASSERT(gen_constrain_live(&g) == !fc.before[0]);
+        TEST_ASSERT(l303_feed(&srv, &g, fc.before) == strlen(fc.before));
+        TEST_ASSERT(gen_constrain_live(&g));
+        TEST_ASSERT(!l303_allows(&srv, &g, 'x'));        /* not JSON */
+        TEST_ASSERT(!l303_allows(&srv, &g, v.stop));     /* not complete */
+        const std::string ans = fc.answer;
+        const size_t fed = l303_feed(&srv, &g, ans);
+        if (fed != ans.size()) fprintf(stderr, "l303 answer %d: refused at %zu\n", (int)fc.fmt, fed);
+        TEST_ASSERT(fed == ans.size());
+        TEST_ASSERT(gen_constrain_live(&g) && l303_allows(&srv, &g, v.stop) && !l303_allows(&srv, &g, ','));
+        l303_end(&j, &g);
+    }
+    /* a format that does not compile refuses the request by name */
     job j;
     memset(&j, 0, sizeof j);
-    request_init(&j.req, REQ_CHAT, 16);
-    j.req.family = ds;
-    gen_state g;
-    memset(&g, 0, sizeof g);
-    g.j = &j;
-    g.tool_name_constrained = true;
-    buf_puts(&g.text, "seed");
-    g.tool_name_from = g.text.len;
-    TEST_ASSERT(gen_tool_name_open(&g));
-    buf_puts(&g.text, " name=\"");
-    TEST_ASSERT(gen_tool_name_open(&g));
-    buf_puts(&g.text, "search");
-    TEST_ASSERT(gen_tool_name_open(&g));
-    buf_puts(&g.text, "\">\n");
-    TEST_ASSERT(!gen_tool_name_open(&g));
-    buf_free(&g.text);
-    request_free(&j.req);
+    char err[300];
+    TEST_ASSERT(!l303_request(&srv, PULSAR_CHAT_QWEN, API_OPENAI,
+                              "{\"messages\":[{\"role\":\"user\",\"content\":\"x\"}],\"response_format\":{\"type\":"
+                              "\"regex\",\"pattern\":\"(\"}}", &j.req, err, sizeof err));
+    TEST_ASSERT(strstr(err, "response_format") != NULL);
+    l303_server_free(&srv);
+#undef L303_RF
 }
+
+/* L303: a speculative round's masks are the plain lane's -- row i is the mask after the base and drafts 0..i-1,
+ * filled through the same gate -- and the round leaves the gate where it found it.  A draft its row refuses ends
+ * the rows the walk can read. */
+static void test_l303_round_masks_match_plain(void) {
+    l303_vocab v;
+    server srv;
+    l303_server(&srv, v);
+    const uint32_t W = gen_constrain_words(&srv);
+    for (int refuse = 0; refuse < 2; refuse++) {
+        job j;
+        memset(&j, 0, sizeof j);
+        char err[300];
+        TEST_ASSERT(l303_request(&srv, PULSAR_CHAT_QWEN, API_OPENAI, L303_BODY(""), &j.req, err, sizeof err));
+        gen_state g;
+        TEST_ASSERT(l303_begin(&srv, &j, &g));
+        const std::string head = "ok</think>\n\n<tool_call>\n<func";
+        TEST_ASSERT(l303_feed(&srv, &g, head) == head.size());
+        const std::string round = refuse ? "tion=sx>\n" : "tion=search>\n<param";   /* base + drafts */
+        std::vector<int> toks;
+        for (char c : round) toks.push_back((uint8_t)c);
+        const uint32_t *masks = NULL;
+        const int rows = gen_constrain_round(&srv, &g, toks.data(), (int)toks.size(), false, &masks);
+        TEST_ASSERT(rows == (int)toks.size() && masks);
+        /* the gate is back where it was: the next draw's mask is the round's base mask */
+        std::vector<uint32_t> row(W);
+        TEST_ASSERT(l303_allows(&srv, &g, 't') && !l303_allows(&srv, &g, 'x'));
+        /* step by step, as the plain lane decodes the same tokens */
+        size_t i = 0;
+        TEST_ASSERT(gen_constrain_accept(&srv, &g, toks[0]));
+        for (; i < (size_t)rows; i++) {
+            TEST_ASSERT(gen_constrain_mask(&srv, &g, row.data()));
+            TEST_ASSERT(!memcmp(row.data(), masks + i * W, W * sizeof(uint32_t)));
+            if (i + 1 == (size_t)rows) break;
+            const int t = toks[i + 1];
+            if (!((row[(uint32_t)t >> 5] >> ((uint32_t)t & 31u)) & 1u)) break;   /* the walk stops here */
+            TEST_ASSERT(gen_constrain_accept(&srv, &g, t));
+        }
+        TEST_ASSERT(refuse ? i == 5 : i + 1 == (size_t)rows);   /* "sx": 'x' refused after "tion=s" */
+        l303_end(&j, &g);
+    }
+    l303_server_free(&srv);
+}
+
+/* L303: the protocols' format fields and the Responses forced tool_choice. */
+static void test_l303_protocol_fields(void) {
+    response_format_spec f = {};
+    char err[200];
+    TEST_ASSERT(response_format_parse("{\"type\":\"text\"}", &f, err, sizeof err) && f.kind == RESPONSE_FORMAT_NONE);
+    TEST_ASSERT(response_format_parse("{\"type\":\"json_object\"}", &f, err, sizeof err) &&
+                f.kind == RESPONSE_FORMAT_JSON_OBJECT);
+    TEST_ASSERT(response_format_parse("{\"type\":\"json_schema\",\"json_schema\":{\"name\":\"a\",\"schema\":{\"type\":"
+                                      "\"string\"}}}", &f, err, sizeof err) &&
+                f.kind == RESPONSE_FORMAT_JSON_SCHEMA && !strcmp(f.src, "{\"type\":\"string\"}"));
+    TEST_ASSERT(response_format_parse("{\"type\":\"json_schema\",\"name\":\"a\",\"schema\":{}}", &f, err, sizeof err) &&
+                !strcmp(f.src, "{}"));
+    TEST_ASSERT(response_format_parse("{\"type\":\"regex\",\"pattern\":\"[a-z]+\"}", &f, err, sizeof err) &&
+                f.kind == RESPONSE_FORMAT_REGEX && !strcmp(f.src, "[a-z]+"));
+    TEST_ASSERT(!response_format_parse("{\"type\":\"json_schema\"}", &f, err, sizeof err) && strstr(err, "no schema"));
+    TEST_ASSERT(!response_format_parse("{\"type\":\"yaml\"}", &f, err, sizeof err) && strstr(err, "yaml"));
+    response_format_free(&f);
+    l303_vocab v;
+    server srv;
+    l303_server(&srv, v);
+    request r;
+    /* Responses: text.format, and a forced function by name */
+    TEST_ASSERT(l303_request(&srv, PULSAR_CHAT_QWEN, API_RESPONSES,
+                             "{\"input\":\"x\",\"text\":{\"format\":{\"type\":\"json_schema\",\"name\":\"a\",\"schema\":"
+                             "{\"type\":\"object\"}}}}", &r, err, sizeof err));
+    TEST_ASSERT(r.constrain != NULL);
+    request_free(&r);
+    TEST_ASSERT(l303_request(&srv, PULSAR_CHAT_QWEN, API_RESPONSES,
+                             "{\"input\":\"x\",\"tools\":[{\"type\":\"function\",\"name\":\"search\",\"parameters\":"
+                             "{\"type\":\"object\",\"properties\":{\"q\":{\"type\":\"string\"}}}}],\"tool_choice\":"
+                             "{\"type\":\"function\",\"name\":\"search\"}}", &r, err, sizeof err));
+    TEST_ASSERT(r.force_tool_call && r.forced_tool_name && !strcmp(r.forced_tool_name, "search") && r.constrain);
+    request_free(&r);
+    TEST_ASSERT(l303_request(&srv, PULSAR_CHAT_QWEN, API_RESPONSES,
+                             "{\"input\":\"x\",\"tools\":[{\"type\":\"function\",\"name\":\"search\",\"parameters\":"
+                             "{}}],\"tool_choice\":\"required\"}", &r, err, sizeof err));
+    TEST_ASSERT(r.force_tool_call && r.constrain);
+    request_free(&r);
+    /* Anthropic: output_config.format beside the effort */
+    TEST_ASSERT(l303_request(&srv, PULSAR_CHAT_QWEN, API_ANTHROPIC,
+                             "{\"max_tokens\":16,\"messages\":[{\"role\":\"user\",\"content\":\"x\"}],\"output_config\":"
+                             "{\"effort\":\"low\",\"format\":{\"type\":\"json_schema\",\"schema\":{\"type\":\"object\"}}}}",
+                             &r, err, sizeof err));
+    TEST_ASSERT(r.constrain != NULL);
+    request_free(&r);
+    /* no format, no strict tool, no forced call: nothing compiled, today's path */
+    TEST_ASSERT(l303_request(&srv, PULSAR_CHAT_QWEN, API_OPENAI,
+                             "{\"messages\":[{\"role\":\"user\",\"content\":\"x\"}],\"tools\":[{\"type\":\"function\","
+                             "\"function\":{\"name\":\"f\",\"parameters\":{}}}]}", &r, err, sizeof err));
+    TEST_ASSERT(r.constrain == NULL);
+    request_free(&r);
+    l303_server_free(&srv);
+}
+#undef L303_BODY
+#undef L303_TOOLS
 
 static void test_qwen_tool_error_suffix_reminds_the_system_turn(void) {
     request r;
@@ -3811,7 +4134,7 @@ static void test_inkling_refusals(void) {
         request_free(&r);
     }
     const server_family_ops *ink = server_family_for_format(PULSAR_CHAT_INKLING);
-    TEST_ASSERT(!ink->forced_call_seed && !ink->forced_call_prefill && !ink->forced_name_open && !ink->forced_name_close);
+    TEST_ASSERT(!ink->forced_call_seed && !ink->forced_call_prefill);
     /* auto: the tools are declared in the leading system block, canonical */
     TEST_ASSERT(effort_case(PULSAR_CHAT_INKLING, "{\"messages\":[{\"role\":\"user\",\"content\":\"x\"}],\"tools\":"
                             "[{\"type\":\"function\",\"function\":{\"name\":\"f\",\"parameters\":{}}}]}", &r, err, sizeof err));
@@ -4074,7 +4397,7 @@ static void test_nemotron_forced_call_prefill_and_seed(void) {
         buf useed = {0};
         r.family->forced_call_seed(&r, &useed);
         TEST_ASSERT(!strcmp(useed.ptr, thinking_off ? "\n<tool_call>\n<function" : "</think>\n<tool_call>\n<function"));
-        TEST_ASSERT(!strcmp(r.family->forced_name_open, "=") && !strcmp(r.family->forced_name_close, ">"));
+        TEST_ASSERT(r.family->grammar == &k_grammar_qwen_xml);   /* L303: Qwen's markup, from "=" */
         nemotron_output_parser u;
         TEST_ASSERT(u.init(!thinking_off, r.tools_json, err, sizeof err));
         std::vector<out_event> uev;
@@ -9536,7 +9859,11 @@ static void pulsar_server_unit_tests_run(void) {
     test_qwen_raw_calls_replay_verbatim();
     test_qwen_forced_call_prefill_and_seed();
     test_forced_call_names_a_declared_tool();
-    test_tool_name_token_allowed();
+    test_l303_shapes_accept_rendered_calls();
+    test_l303_forced_call_grammar();
+    test_l303_response_format_answer();
+    test_l303_round_masks_match_plain();
+    test_l303_protocol_fields();
     test_qwen_payload_is_sampled_structure_greedy();
     test_qwen_tool_error_suffix_reminds_the_system_turn();
     test_inkling_effort_map();

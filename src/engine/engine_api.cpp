@@ -1322,14 +1322,14 @@ int pulsar_session_spec_next_base(pulsar_session *s, float temperature, int top_
     pulsar_tp *tp = NULL;
     const int route = tp_spec_route(s, "spec_next_base", &tp, err, sizeof(err));
     if (route == 0) { fprintf(stderr, "pulsar: %s\n", err); return -1; }
-    if (route == 1) return pulsar_session_spec_next_base_local(s, temperature, top_k, top_p, min_p, rng);
+    if (route == 1) return pulsar_session_spec_next_base_local(s, temperature, top_k, top_p, min_p, NULL, rng);
     pulsar_tp_spec_command c = tp_spec_cmd(s, tp_spec_live_bank(s));
     c.temperature = temperature; c.top_k = top_k; c.top_p = top_p; c.min_p = min_p;
     c.rng = rng ? *rng : 0;
     if (!tp_mirror_sent(tp, "spec_next_base",
                         pulsar_tp_send_spec(tp, PULSAR_TP_FRAME_SPEC_NEXT_BASE, &c, NULL, NULL),
                         NULL, 0)) return -1;
-    const int own = pulsar_session_spec_next_base_local(s, temperature, top_k, top_p, min_p, rng);
+    const int own = pulsar_session_spec_next_base_local(s, temperature, top_k, top_p, min_p, NULL, rng);
     const int agreed = tp_mirror_bank_verdict(s, tp, "spec_next_base", own + 1, -1);
     return agreed < 0 ? -1 : own;
 }
@@ -1356,7 +1356,7 @@ int pulsar_session_spec_round_end(pulsar_session *s, pulsar_spec_round *r, int f
     pulsar_tp *tp = NULL;
     const int route = tp_spec_route(s, "spec_round_end", &tp, err, errlen);
     if (route == 0) return -1;
-    if (route == 1) return pulsar_session_spec_round_end_local(s, r, first_token, temperature, top_k, top_p, min_p, 0u, rng, rows, row0, accepted, accepted_cap, err, errlen);
+    if (route == 1) return pulsar_session_spec_round_end_local(s, r, first_token, temperature, top_k, top_p, min_p, 0u, NULL, 0u, rng, rows, row0, accepted, accepted_cap, err, errlen);
     /* The logits block is NOT shipped: every rank holds the same block from
      * its own mirrored forward (the vocab all-gather made them identical), so
      * only row0 crosses. */
@@ -1366,7 +1366,7 @@ int pulsar_session_spec_round_end(pulsar_session *s, pulsar_spec_round *r, int f
     c.rng = rng ? *rng : 0;
     if (!tp_mirror_sent(tp, "spec_round_end", pulsar_tp_send_spec(tp, PULSAR_TP_FRAME_SPEC_ROUND_END, &c, NULL, NULL),
                         err, errlen)) return -1;
-    const int own = pulsar_session_spec_round_end_local(s, r, first_token, temperature, top_k, top_p, min_p, 0u, rng, rows, row0, accepted, accepted_cap, err, errlen);
+    const int own = pulsar_session_spec_round_end_local(s, r, first_token, temperature, top_k, top_p, min_p, 0u, NULL, 0u, rng, rows, row0, accepted, accepted_cap, err, errlen);
     const int agreed = tp_mirror_bank_verdict(s, tp, "spec_round_end", own + 1, -1);
     return agreed < 0 ? -1 : own;
 }
@@ -1474,6 +1474,20 @@ static int tp_spec_steps_fail(pulsar_spec_step *steps, int n, const char *operat
     }
     return -1;
 }
+/* L303: token masks do not cross the pair (the frames carry no mask rows), so a constrained step on a pair fails by
+ * name rather than letting the ranks draw from different rows. */
+static bool tp_spec_steps_masked(const pulsar_spec_step *steps, int n) {
+    for (int i = 0; i < n; i++)
+        if (steps[i].masks) return true;
+    return false;
+}
+static int tp_spec_steps_refuse_masks(pulsar_spec_step *steps, int n) {
+    for (int i = 0; i < n; i++) {
+        steps[i].status = PULSAR_SPEC_STEP_FAILED;
+        snprintf(steps[i].err, sizeof steps[i].err, "tp: constrained decoding does not cross the pair (L303)");
+    }
+    return -1;
+}
 int pulsar_session_spec_assemble_batch(pulsar_session *s, pulsar_spec_step *steps, int n,
                                        uint32_t row_budget, pulsar_multiseq_req *reqs, uint32_t *n_rows_out) {
     PULSAR_NVTX_FN();
@@ -1488,6 +1502,7 @@ int pulsar_session_spec_assemble_batch(pulsar_session *s, pulsar_spec_step *step
         pulsar_session_spec_assemble_batch_local(s, steps, n, row_budget, reqs, n_rows_out);
         return 0;
     }
+    if (tp_spec_steps_masked(steps, n)) return tp_spec_steps_refuse_masks(steps, n);
     if (!tp_spec_steps_mirror(s, tp, PULSAR_TP_FRAME_SPEC_ASSEMBLE_BATCH, operation, steps, n,
                               (int32_t)row_budget, 0, 0)) return tp_spec_steps_fail(steps, n, operation);
     pulsar_session_spec_assemble_batch_local(s, steps, n, row_budget, reqs, n_rows_out);
@@ -1516,6 +1531,7 @@ int pulsar_session_spec_round_end_batch(pulsar_session *s, pulsar_spec_step *ste
      * leader's measured spec cost rides the header (v24): the guard every
      * rank's round_end prices the quench with is computed from these same
      * integers, so a quench latches on every rank or on none. */
+    if (tp_spec_steps_masked(steps, n)) return tp_spec_steps_refuse_masks(steps, n);
     const pulsar_lane_cost_fit *cost = &s->engine->lane_cost[PULSAR_LANE_SPEC];
     if (!tp_spec_steps_mirror(s, tp, PULSAR_TP_FRAME_SPEC_ROUND_END_BATCH, operation, steps, n,
                               cost->flat_us, cost->row_us, cost->valid ? 1 : 0))

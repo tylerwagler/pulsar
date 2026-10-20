@@ -92,8 +92,8 @@ char *nemotron_take_render(const nemotron_render_out &out, chat_text_span **span
  *   <|im_start|>assistant\n<think></think>\n<tool_call>\n<function=NAME>\n...
  * The generation prompt ends "<think>\n" with thinking on (the newline is not in the call turn's render, so the
  * prefill drops it) and "<think></think>" with thinking off.  The seed is what the output parser reads before the
- * model's first token; an UNNAMED seed stops before the name's opener "=" (token healing, as Qwen: the name is
- * sampled under the declared-name mask, forced_name_open / forced_name_close). */
+ * model's first token; an UNNAMED seed stops before the name's opener "=" (token healing, as Qwen: the opener,
+ * a declared name and the arguments are the call grammar's, L303). */
 void nemotron_forced_call_open(const request *r, buf *out) {
     buf_puts(out, "<tool_call>\n<function");
     if (r->forced_tool_name && r->forced_tool_name[0]) {
@@ -258,7 +258,6 @@ const server_family_ops k_family_nemotron_h = {
     /* .tool_error_suffix     = */ nemotron_tool_error_suffix,
     /* .forced_call_seed      = */ nemotron_forced_call_seed,
     /* .forced_call_prefill   = */ nemotron_forced_call_prefill,
-    /* .forced_name_open      = */ "=",   /* an unnamed seed ends at <function */
-    /* .forced_name_close     = */ ">",
+    /* .grammar               = */ &k_grammar_qwen_xml,   /* Qwen's markup (nemotron_chat.cpp) */
     /* .find_call_block       = */ nemotron_find_call_block,
 };
