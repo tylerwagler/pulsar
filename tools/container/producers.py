@@ -21,8 +21,9 @@ builder's copy of the engine's byte model.  The authorities these agree with:
   * exl3m_*: `exl3_expert_layout` src/engine/exl3_trellis.h.
   * nvfp4 (ModelOpt W4A16_NVFP4 Linears, PULSAR_TENSOR_NVFP4): the nibbles verbatim, the E4M3 scales through the
     same 128x4 tile swizzle as the E8M0 planes, the global scale; byte model `st_bytes_for`.  (L299) from a BF16
-    source: `nvfp4_from_bf16`, ModelOpt's max-based recipe (global amax / (6 x 448), per-16 E4M3 RNE of the block
-    amax / 6, E2M1 RNE of the scaled values), then the same packer.
+    source: `nvfp4_from_bf16` -- ModelOpt's global scale (amax / (6 x 448)), each block's E4M3 scale the
+    least-squared-error one among the max-based code and the NVFP4_SCALE_SEARCH codes below it, E2M1 RNE of the
+    scaled values -- then the same packer.
 
 Every producer is graded byte-identical against the served source-precision
 repack by tools/container/test_producers.py.  numpy only; no torch.
@@ -335,11 +336,19 @@ def f32_to_e2m1(x: np.ndarray) -> np.ndarray:
     return (np.where(x < 0, 8, 0) | idx).astype(np.uint8)
 
 
+# Block scales tried below the max-based one (L299, measured on the DFlash2 drafter's served acceptance replay, every
+# Linear nvfp4: tokens / round code 5.80 -> 5.86, prose 3.24 -> 3.32, edit 7.60 -> 7.71 against max-based; BF16 5.93 /
+# 3.44 / 7.84): a smaller scale clips the block's largest value to 6 and resolves the rest finer.
+NVFP4_SCALE_SEARCH = 4
+
+
 def nvfp4_from_bf16(w_bf16: bytes, out: int, inp: int) -> bytes:
     """A BF16 [out, in] Linear -> the `nvfp4` entry (L299: our own quantisation, the DFlash2 drafter's Linears):
-    s2 = amax(|w|) / (6 * 448) (f32; 1 for an all-zero weight), each 16-wide block's scale the E4M3 RNE of
-    amax_block / (6 * s2), each value the E2M1 RNE of w / (scale * s2) (0 for a zero-scale block), packed by
-    `nvfp4` (low nibble = even input).  The engine reads w = e2m1 * e4m3 * s2."""
+    s2 = amax(|w|) / (6 * 448) (f32; 1 for an all-zero weight); each 16-wide block's scale code c0 = the E4M3 RNE of
+    amax_block / (6 * s2), then of the codes c0, c0 - 1, .. c0 - NVFP4_SCALE_SEARCH (>= 0) the one whose block
+    reconstruction has the least squared error (f64; a tie keeps the larger scale); each value the E2M1 RNE of
+    w / (scale * s2) clipped to +-6 (0 for a zero-scale block); packed by `nvfp4` (low nibble = even input).  The
+    engine reads w = e2m1 * e4m3 * s2."""
     if inp % 64:
         raise ValueError(f"nvfp4_from_bf16: in={inp} is not divisible by 64")
     if len(w_bf16) != out * inp * 2:
@@ -351,11 +360,24 @@ def nvfp4_from_bf16(w_bf16: bytes, out: int, inp: int) -> bytes:
     s2 = np.float32(amax / np.float32(6.0 * 448.0)) if amax > 0 else np.float32(1.0)
     blk = w.reshape(out, inp // 16, 16)
     bmax = np.abs(blk).max(axis=2)
-    sc_code = f32_to_e4m3((bmax / (np.float32(6.0) * s2)).astype(np.float32))
-    den = (E4M3_VALUE[sc_code] * s2).astype(np.float32)
-    with np.errstate(divide="ignore", invalid="ignore"):
-        x = np.where(den[:, :, None] > 0, blk / den[:, :, None], np.float32(0.0)).astype(np.float32)
-    code = f32_to_e2m1(np.clip(x, -6.0, 6.0)).reshape(out, inp)
+    c0 = f32_to_e4m3((bmax / (np.float32(6.0) * s2)).astype(np.float32)).astype(np.int32)
+    sc_code = code = best = None
+    for step in range(NVFP4_SCALE_SEARCH + 1):
+        c = np.maximum(c0 - step, 0).astype(np.uint8)
+        den = (E4M3_VALUE[c] * s2).astype(np.float32)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            x = np.where(den[:, :, None] > 0, blk / den[:, :, None], np.float32(0.0)).astype(np.float32)
+        cd = f32_to_e2m1(np.clip(x, -6.0, 6.0))
+        q = (np.where(cd & 8, -1.0, 1.0) * E2M1_VALUE[cd & 7]) * den[:, :, None].astype(np.float64)
+        err = ((q - blk.astype(np.float64)) ** 2).sum(axis=2)
+        if best is None:
+            sc_code, code, best = c, cd, err
+        else:
+            take = err < best
+            sc_code = np.where(take, c, sc_code)
+            code = np.where(take[:, :, None], cd, code)
+            best = np.where(take, err, best)
+    code = code.reshape(out, inp)
     packed = (code[:, 0::2] | (code[:, 1::2] << 4)).astype(np.uint8)
     return nvfp4(packed.tobytes(), sc_code.tobytes(), np.float32(s2).astype("<f4").tobytes(), out, inp)
 

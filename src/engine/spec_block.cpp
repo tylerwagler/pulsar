@@ -89,11 +89,10 @@ bool get_ids(const pulsar_model *m, const char *key, uint32_t *out, uint32_t cap
 namespace {
 
 /* THE KIND TABLE (spec_block.h THE DECLARATION): per kind, where its config keeps each number (keys under
- * "<kind>."), the chain head it ends in, its context ring's row format and its stop rule's tau. */
+ * "<kind>."), the chain head it ends in and its stop rule's tau. */
 struct kind_decl {
     const char *kind;
     pulsar_block_head_kind head;
-    pulsar_gqa_kv_fmt kv_fmt;
     float tau;
     const char *hidden, *n_layer, *n_head, *n_kv, *head_dim, *ff, *vocab, *block, *eps, *rope_theta;
     const char *mask, *conv_taps, *conv_group, *window, *topk, *taps;
@@ -101,19 +100,16 @@ struct kind_decl {
     const char *swa;          /* a bool key that must be true: every layer windowed over the context */
 };
 
-/* LiLiCorr (L298): vLLM's lilicorr config.  E4M3 K / V at unit scale: the drafter was served (and its acceptance
- * measured) with vLLM's fp8_e4m3 KV cache, whose rounding cuts the attention's distance to it 4x against bf16 rows
- * (L298 head grade); half the ring too.  tau measured (L298, the l297 bench single stream T0, the priced width on): tau
- * off 62.0 tok/s, 0.3 62.0, 0.5 62.6 (code 61.1 -> 64.2), 0.7 61.4.
- * DFlash2 (L299): z-lab's DFlash2DraftModel config (incoai/Qwen3.8-Flash-Next-DFlash2): the reference (and its
- * training) keeps bf16 K / V; the kind's tau and ring format are L299's measurements (spec_block.cpp, the row). */
+/* LiLiCorr (L298): vLLM's lilicorr config; tau measured (L298, the l297 bench single stream T0, the priced width on):
+ * tau off 62.0 tok/s, 0.3 62.0, 0.5 62.6 (code 61.1 -> 64.2), 0.7 61.4.
+ * DFlash2 (L299): z-lab's DFlash2DraftModel config (incoai/Qwen3.8-Flash-Next-DFlash2). */
 const kind_decl k_kinds[] = {
-    {"lilicorr", PULSAR_BLOCK_HEAD_LILICORR, PULSAR_GQA_KV_E4M3, 0.5f, "hidden_size", "num_hidden_layers",
+    {"lilicorr", PULSAR_BLOCK_HEAD_LILICORR, 0.5f, "hidden_size", "num_hidden_layers",
      "num_attention_heads", "num_key_value_heads", "head_dim", "intermediate_size", "vocab_size", "block_size",
      "rms_norm_eps", "rope_theta", "dflash.mask_token_id", "dflash.conv_kernel_size", "dflash.conv_group_size",
      "dflash.swa_window_size", "dflash.lilicorr_candidate_topk", "dflash.target_layer_ids", "dflash.causal",
      "dflash.use_swa"},
-    {"dflash2", PULSAR_BLOCK_HEAD_SELECTOR, PULSAR_GQA_KV_BF16, 0.5f, "hidden_size", "num_hidden_layers",
+    {"dflash2", PULSAR_BLOCK_HEAD_SELECTOR, 0.5f, "hidden_size", "num_hidden_layers",
      "num_attention_heads", "num_key_value_heads", "head_dim", "intermediate_size", "vocab_size",
      "dflash_config.block_size", "rms_norm_eps", "rope_parameters.rope_theta", "dflash_config.mask_token_id",
      "dflash_config.conv_kernel_size", "dflash_config.conv_group_size", "sliding_window",
@@ -169,7 +165,6 @@ bool pulsar_block_drafter_read(const pulsar_model *m, pulsar_block_drafter *d) {
     if (!K) return refuse("the container declares no block drafter (pulsar.drafter)%s%s");
     d->kind = K->kind;
     d->head_kind = K->head;
-    d->kv_fmt = K->kv_fmt;
     const char *kd = K->kind;
     bool ok = get_u32(m, kkey(kd, K->hidden), &d->hidden);
     ok = get_u32(m, kkey(kd, K->n_layer), &d->n_layer) && ok;
@@ -353,7 +348,12 @@ pulsar_gqa_layer gqa_decl(const pulsar_block_drafter *d, const uint16_t *qn, con
     L.n_q = d->n_head;
     L.n_kv = d->n_kv;
     L.head_dim = d->head_dim;
-    L.kv_fmt = (pulsar_gqa_kv_fmt)d->kv_fmt;   /* the kind's (k_kinds) */
+    /* E4M3 K / V at unit scale, every kind: LiLiCorr was served (and its acceptance measured) with vLLM's fp8_e4m3 KV
+     * cache, whose rounding cuts the attention's distance to it 4x against bf16 rows (L298 head grade); DFlash2's
+     * reference keeps bf16, and E4M3 rows measured no different on its served-acceptance replay (L299, every Linear
+     * nvfp4: tokens / round code 5.80 -> 5.86, prose 3.24 -> 3.26, story 3.12 -> 3.12, edit 7.60 -> 7.60).  Half the
+     * ring, and the ring rides every grid checkpoint. */
+    L.kv_fmt = PULSAR_GQA_KV_E4M3;
     L.span = PULSAR_GQA_WINDOW;
     L.window = d->window;
     L.scale = (float)(1.0 / sqrt((double)d->head_dim));
@@ -394,10 +394,10 @@ void pulsar_block_drafter_describe(const pulsar_block_drafter *d, char *out, siz
     if (d->head_kind == PULSAR_BLOCK_HEAD_SELECTOR) snprintf(headw, sizeof headw, "CandidateSelector top-%u rank %u",
                                                              d->topk, d->sel.rank);
     else snprintf(headw, sizeof headw, "LiLiCorr top-%u", d->topk);
-    int n = snprintf(out, cap, "%s block drafter: %u layers %u/%u/%u, ff %u, block %u, window %u (%s ring), conv %ux/%u, "
+    int n = snprintf(out, cap, "%s block drafter: %u layers %u/%u/%u, ff %u, block %u, window %u, conv %ux/%u, "
                                "head %u rows%s, %s chain head, taps",
-                     d->kind, d->n_layer, d->n_head, d->n_kv, d->head_dim, d->ff, d->block, d->window,
-                     d->kv_fmt == PULSAR_GQA_KV_E4M3 ? "E4M3" : "bf16", d->conv_taps, d->conv_group, d->head_rows,
+                     d->kind, d->n_layer, d->n_head, d->n_kv, d->head_dim, d->ff, d->block, d->window, d->conv_taps,
+                     d->conv_group, d->head_rows,
                      d->head_ids ? " (a draft vocabulary)" : "", headw);
     for (uint32_t j = 0; j < d->n_taps && n > 0 && (size_t)n < cap; j++)
         n += snprintf(out + n, cap - (size_t)n, " %u@L%u%s", d->tap_block[j], d->tap_layer[j],

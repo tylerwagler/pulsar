@@ -517,8 +517,9 @@ def check_refusals() -> None:
 
 
 def check_nvfp4_from_bf16() -> None:
-    """L299: the BF16 -> nvfp4 producer against a scalar transcription of its recipe, on a [200, 128] weight with
-    planted E2M1 midpoints (each rounds to the even code), an all-zero block and an outlier."""
+    """L299: the BF16 -> nvfp4 producer against a scalar transcription of its recipe (the least-squared-error scale of
+    the max-based code and the NVFP4_SCALE_SEARCH below it), on a [200, 128] weight with an all-zero block and an
+    outlier; the E2M1 encoder's midpoints (each to the even code)."""
     out, inp = 200, 128
     rng = np.random.default_rng(7)
     w = (rng.standard_normal((out, inp)) * 0.02).astype(np.float32)
@@ -538,26 +539,34 @@ def check_nvfp4_from_bf16() -> None:
         fail(f"nvfp4_from_bf16 [{out}, {inp}]: {len(blob)} bytes, the byte model says {P.bytes_for('nvfp4', [inp, out])}")
         return
     got = P.nvfp4_decode(blob, out, inp)
-    bad = 0
+    bad = searched = 0
     for r in range(out):
         for b in range(inp // 16):
             blk = w[r, b * 16:(b + 1) * 16]
-            code = P.f32_to_e4m3(np.array([np.abs(blk).max() / (np.float32(6.0) * s2)], dtype=np.float32))[0]
-            d = np.float32(P.E4M3_VALUE[code] * s2)
-            for i in range(16):
-                x = 0.0 if d == 0 else float(np.float32(blk[i] / d))
-                a = abs(x)
-                best = min(range(8), key=lambda k: (abs(P.E2M1_VALUE[k] - a), k % 2))   # nearest, ties to even
-                want = np.float32((-1.0 if x < 0 else 1.0) * P.E2M1_VALUE[best]) * d
-                bad += got[r, b * 16 + i] != want
+            c0 = int(P.f32_to_e4m3(np.array([np.abs(blk).max() / (np.float32(6.0) * s2)], dtype=np.float32))[0])
+            pick = None
+            for c in range(c0, max(c0 - P.NVFP4_SCALE_SEARCH, 0) - 1, -1):
+                d = np.float32(P.E4M3_VALUE[c] * s2)
+                q = []
+                for i in range(16):
+                    x = 0.0 if d == 0 else float(min(max(np.float32(blk[i] / d), -6.0), 6.0))
+                    k = min(range(8), key=lambda k: (abs(P.E2M1_VALUE[k] - abs(x)), k % 2))   # nearest, ties to even
+                    q.append((-1.0 if x < 0 else 1.0) * float(P.E2M1_VALUE[k]) * float(d))
+                err = sum((q[i] - float(blk[i])) ** 2 for i in range(16))
+                if pick is None or err < pick[0]:
+                    pick = (err, q, c)
+            searched += pick[2] != c0
+            bad += sum(got[r, b * 16 + i] != np.float32(pick[1][i]) for i in range(16))
     tail = np.frombuffer(blob, dtype="<f4", count=1, offset=out * inp // 2 + 256 * (inp // 16))[0]
-    ties = got[7, 1:8] / den
-    if bad or tail != s2 or not exact or not np.array_equal(ties, np.array([0.0, 1.0, 1.0, 2.0, 2.0, 4.0, 4.0])):
-        fail(f"nvfp4_from_bf16: {bad} values differ from the scalar recipe, global scale {tail} vs {s2}, planted "
-             f"midpoints decode to {ties.tolist()} (want 0, 1, 1, 2, 2, 4, 4: ties to the even code)")
+    mids = P.f32_to_e2m1(np.array([0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0, -0.75, -1.75], dtype=np.float32))
+    want_mid = [0, 2, 2, 4, 4, 6, 6, 8 | 2, 8 | 4]   # 0, 1, 1, 2, 2, 4, 4, -1, -2: the even code
+    if bad or tail != s2 or not exact or mids.tolist() != want_mid or not searched:
+        fail(f"nvfp4_from_bf16: {bad} values differ from the scalar recipe ({searched} blocks took a searched scale), "
+             f"global scale {tail} vs {s2}, E2M1 midpoints encode {mids.tolist()} (want {want_mid})")
     else:
-        ok(f"nvfp4_from_bf16 [{out}, {inp}]: every value the scalar recipe's (E4M3 block scales, E2M1 RNE, ties to "
-           f"even), global scale in the tail, the zero block zero")
+        ok(f"nvfp4_from_bf16 [{out}, {inp}]: every value the scalar recipe's ({searched} of {out * inp // 16} blocks "
+           f"took a scale below the max-based one), global scale in the tail, the zero block zero; E2M1 midpoints to "
+           f"the even code")
     rows = P.rows_gather(np.arange(40, dtype=np.uint8).tobytes(), 4, [9, 0, 3])
     vals = P.i32_values([0, 7, 248319])
     if rows != bytes([36, 37, 38, 39, 0, 1, 2, 3, 12, 13, 14, 15]) or np.frombuffer(vals, "<i4").tolist() != [0, 7, 248319]:

@@ -38,8 +38,8 @@
  *
  * THE DECLARATION (the container's): `pulsar.drafter` names the KIND ("lilicorr", "dflash2"), and the kind's config
  * sits verbatim under `<kind>.` (the builder writes the drafter's HF config there, tools/container); one table here
- * maps each kind's key names to the geometry, the taps, the chain head, its KV row format and its stop rule's tau
- * (spec_block.cpp k_kinds) -- the one reader for every kind.
+ * maps each kind's key names to the geometry, the taps, the chain head and its stop rule's tau (spec_block.cpp
+ * k_kinds) -- the one reader for every kind.
  *
  * THE ARMS (rule 8, Tyler 2026-10-16 "cutlass / cublaslt / b12x before our own kernels"): every Linear through the
  * rows front door (pulsar_linear_rows_ref: BF16 rows kernel / cuBLASLt for prompt rows, NVFP4 W4A16 rows kernel for
@@ -102,7 +102,6 @@ typedef struct {
 typedef struct pulsar_block_drafter {
     const char *kind;            ///< the container's pulsar.drafter ("lilicorr", "dflash2")
     pulsar_block_head_kind head_kind;
-    uint32_t kv_fmt;             ///< the context ring's row format (pulsar_gqa_kv_fmt), the kind's
     /* the declaration (the container's <kind>.* keys) */
     uint32_t hidden, n_layer, n_head, n_kv, head_dim, ff, vocab;
     uint32_t block;              ///< rows a draft pass carries: the carry + block - 1 mask rows

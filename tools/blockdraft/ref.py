@@ -17,7 +17,7 @@ f32, the f32 global scale on the GEMM's output) and the target's input embedding
 Arithmetic follows vLLM's: bf16 activations between ops, f32 inside each op.
 
 (L299) DFlash2 (z-lab's DFlash2DraftModel, config architectures [DFlash2DraftModel]; tools/dflash2's replay is the
-f32 transcription it was graded against): the same backbone with bf16 K / V (no fp8 cache), rope_parameters' theta,
+f32 transcription it was graded against): the same backbone (the engine's E4M3 ring too), rope_parameters' theta,
 the head the target's lm_head and the CandidateSelector's walk.  --container DIR reads every drafter tensor and the
 target's input embedding from the PULSAR CONTAINER the engine served (nvfp4 entries decoded exactly,
 tools/container/producers.nvfp4_decode; the head's draft-vocabulary rows and ids as stored), so the --dump grade
@@ -109,9 +109,9 @@ class Drafter:
                                                       cfg["head_dim"])
         self.taps, self.group = dc["conv_kernel_size"], dc["conv_group_size"]
         self.mask = dc["mask_token_id"]
-        if self.dflash2:   # L299: its keys, bf16 K / V, the container's tensors
+        if self.dflash2:   # L299: its keys, the container's tensors
             self.eps, self.theta, self.W = cfg["rms_norm_eps"], cfg["rope_parameters"]["rope_theta"], cfg["sliding_window"]
-            self.block, self.k, self.kv8 = dc["block_size"], dc["selector_top_k"], False
+            self.block, self.k, self.kv8 = dc["block_size"], dc["selector_top_k"], True
             if container is None:
                 raise SystemExit("--container: the DFlash2 reference reads the drafter as the container stores it")
             self.c = Container(container)
@@ -225,7 +225,7 @@ class Drafter:
             co = self.lin(x, Lw["acp"]).reshape(B, 2, self.taps, G)
             cx = self.conv(x, co[:, 0], Lw["acb"][0])
             q = self.rope(self.rms(self.lin(cx, Lw["q"]).reshape(B, NQ, HD), Lw["qn"]), qpos)
-            kvf = e4m3 if self.kv8 else (lambda x: x)   # the ring's row format: LiLiCorr E4M3, DFlash2 bf16
+            kvf = e4m3 if self.kv8 else (lambda x: x)   # the ring's row format (the engine's E4M3)
             kq = kvf(self.rope(self.rms(self.lin(cx, Lw["k"]).reshape(B, NKV, HD), Lw["kn"]), qpos))
             vq = kvf(self.lin(cx, Lw["v"]).reshape(B, NKV, HD))
             kc = kvf(self.rope(self.rms(self.lin(cn, Lw["k"]).reshape(-1, NKV, HD), Lw["kn"]), cpos))

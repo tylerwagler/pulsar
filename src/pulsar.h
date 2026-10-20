@@ -126,7 +126,7 @@ typedef enum {
     PULSAR_DRAFTER_NONE   = 0,
     PULSAR_DRAFTER_DSPARK = 1,  ///< DeepSeek's DSpark (merged `dspark.*` tensors)
     PULSAR_DRAFTER_MTP    = 2,  ///< the artifact's multi-token-prediction module(s) (Qwen's `mtp.*`, Nemotron-H's MTP module)
-    PULSAR_DRAFTER_BLOCK  = 3,  ///< a block drafter the container holds (L298: LiLiCorr, a DFlash-family drafter)
+    PULSAR_DRAFTER_BLOCK  = 3,  ///< a block drafter the container holds (L298 LiLiCorr, L299 DFlash2: the DFlash family)
 } pulsar_drafter_kind;
 
 typedef void (*pulsar_session_progress_fn)(void *ud, const char *event, int current, int total);
@@ -141,7 +141,8 @@ typedef struct {
     /** Drafter is auto-enabled when the main GGUF contains dspark.* tensors;
      * this opts out (memory saving for sampled-only workloads). */
     bool dspark_disable;
-    /** L298 (--drafter NAME): which of the drafters the container holds runs -- "mtp" or "lilicorr" -- and so which
+    /** L298 (--drafter NAME): which of the drafters the container holds runs -- "mtp" or its block drafter's kind
+     *  ("lilicorr" on Nemotron-H, L299 "dflash2" on Qwen3.8-Flash-Next) -- and so which
      *  is loaded at all (the other is declared unloaded: never staged, its memory the KV pool's).  NULL = the one the
      *  container holds (a container with both refuses without a choice); a name the container does not hold refuses
      *  the open by name. */
