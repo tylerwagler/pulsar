@@ -2442,7 +2442,6 @@ typedef struct pulsar_gpu_sample_out {
 
 /** Bytes of the scratch tensor a session gives every sampler launch over rows of n_vocab. */
 uint64_t pulsar_gpu_sample_scratch_bytes(uint32_t n_vocab);
-uint64_t pulsar_gpu_sample_slot_bytes(uint32_t n_vocab);
 
 /** n_rows draws: reqs[k] reads the row at logits + logits_offset_bytes + reqs[k].row * row_stride floats, n_vocab
  *  wide, and out receives, from out_offset_bytes, n_rows pulsar_gpu_sample_out in reqs order.  `logits_rows` bounds

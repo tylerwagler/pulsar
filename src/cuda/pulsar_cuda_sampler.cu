@@ -24,12 +24,16 @@
  * survive as they did on the host.  sampler-device-gate holds the device to a frozen host reference
  * (tests/sampler_host_ref.cpp, the host sampler as it was, built with the production flags) over every mode.
  *
- * Shape: one block per row (rows run on separate SMs).  A row whose candidate set exceeds the block's shared-memory
- * capacity (min_p == 0 without top-k, a near-flat row) is finished by the slot kernel on a global scratch slot --
- * the same row function, a stable radix sort in global memory instead of the shared bitonic: the same order (the
- * key is total), so the same bytes. */
+ * Shape: one block per row (rows run on separate SMs) after the prep stage's scans spread over the GPU.  A row whose
+ * candidate set exceeds the block's shared-memory capacity (a near-flat min-p row) is finished by the slot kernel on
+ * a global scratch slot -- the same row function, a stable radix sort in global memory instead of the shared
+ * bitonic: the same order (the key is total), so the same bytes.  The full arm (min_p <= 1e-30 without top-k: every
+ * finite value a candidate) is known from the knobs, so the launch routes those rows to their own pipeline: the
+ * device radix sort, the probabilities and the race over the GPU, only the serial sum and the cut on one thread. */
 #include "pulsar_cuda_internal.h"
 #include "pulsar_cuda_libm.cuh"
+
+#include <cub/device/device_radix_sort.cuh>
 
 namespace {
 
@@ -44,7 +48,16 @@ constexpr float SPARSE_MINP_MIN = 0.02f;
 
 enum : uint32_t { PATH_TOPK = 0, PATH_MINP = 1, PATH_FULL = 2 };
 
-__device__ __forceinline__ bool finite_bits(float v) { return (__float_as_uint(v) & 0x7f800000u) != 0x7f800000u; }
+__host__ __device__ __forceinline__ uint32_t f32_bits(float v) {
+#ifdef __CUDA_ARCH__
+    return __float_as_uint(v);
+#else
+    uint32_t u;
+    memcpy(&u, &v, sizeof u);
+    return u;
+#endif
+}
+__host__ __device__ __forceinline__ bool finite_bits(float v) { return (f32_bits(v) & 0x7f800000u) != 0x7f800000u; }
 
 /* descending value, -0 as +0: unsigned ascending order of the key is the candidates' order (ids break ties) */
 __device__ __forceinline__ uint32_t desc_key(float f) {
@@ -261,7 +274,9 @@ struct launch_args {
     pulsar_gpu_sample_req req[PULSAR_GPU_SAMPLE_ROWS_MAX];
     row_out_t *out;            /* [n_rows] */
     uint32_t *pending;         /* [n_rows]: 1 = the row kernel left it to a slot */
-    /* slot scratch: per slot keys [2][n_vocab] u32, ids [2][n_vocab] u32, probs [n_vocab] f32 */
+    uint64_t full_rows;        /* bit r: row r is on the full arm (its own pipeline, not the row kernel's) */
+    /* slot scratch: per slot keys [2][n_vocab] u32, ids [2][n_vocab] u32, probs [n_vocab] f32, then (aligned) the
+     * slot kernel's radix counts or the full arm's state and sort scratch */
     uint8_t *slots;
     uint64_t slot_bytes;
     /* the gate's dist dump: per row [n, ids[dist_cap], probs[dist_cap]] (u32 words), or NULL */
@@ -388,8 +403,9 @@ struct row_plan {
     bool full;
 };
 
-__device__ __forceinline__ row_plan plan_row(const pulsar_gpu_sample_req &q, uint32_t n_vocab) {
-    row_plan p;
+/* the knobs clamped and the path -- comparisons only, so the launch (host) routes the full arm by the same rule */
+__host__ __device__ __forceinline__ void plan_knobs(const pulsar_gpu_sample_req &q, row_plan *pl) {
+    row_plan &p = *pl;
     p.greedy = (q.flags & PULSAR_GPU_SAMPLE_GREEDY) != 0;
     p.T = q.temperature;
     p.top_p = q.top_p;
@@ -400,8 +416,20 @@ __device__ __forceinline__ row_plan plan_row(const pulsar_gpu_sample_req &q, uin
     if (p.top_p <= 0.0f || p.top_p > 1.0f) p.top_p = 1.0f;
     if (p.min_p < 0.0f) p.min_p = 0.0f;
     if (p.top_k <= 0 || p.top_k > 1024) p.top_k = p.top_k <= 0 ? 0 : 1024;
-    p.rcpT = p.refuse || p.greedy ? 0.0f : __fdiv_rn(1.0f, p.T);
     p.path = p.top_k > 0 ? PATH_TOPK : p.min_p > MINP_PREFILTER_MIN ? PATH_MINP : PATH_FULL;
+}
+
+/* a row the full arm's pipeline draws */
+__host__ __device__ __forceinline__ bool row_on_full_arm(const pulsar_gpu_sample_req &q) {
+    row_plan p;
+    plan_knobs(q, &p);
+    return !p.refuse && !p.greedy && p.path == PATH_FULL;
+}
+
+__device__ __forceinline__ row_plan plan_row(const pulsar_gpu_sample_req &q, uint32_t n_vocab) {
+    row_plan p;
+    plan_knobs(q, &p);
+    p.rcpT = p.refuse || p.greedy ? 0.0f : __fdiv_rn(1.0f, p.T);
     p.prefilter = 0.0f;
     p.full = false;
     if (p.path == PATH_MINP) {
@@ -418,13 +446,12 @@ __device__ __forceinline__ row_plan plan_row(const pulsar_gpu_sample_req &q, uin
     return p;
 }
 
-/* THE candidate predicate of the min-p and full arms (a top-k row's is its key against K*) -- the row kernel's and
- * the prep's.  floor: the full-nucleus arm's bound (an entry under it has p < prefilter however it rounds), else
- * -inf; *pp receives p where it was computed. */
+/* THE candidate predicate of the min-p arm (a top-k row's is its key against K*; the full arm takes every finite
+ * value) -- the row kernel's and the prep's.  floor: the full-nucleus arm's bound (an entry under it has
+ * p < prefilter however it rounds), else -inf; *pp receives p where it was computed. */
 __device__ __forceinline__ bool row_is_cand(const row_plan &p, uint32_t i, float v, float floor_logit, float maxlogit,
                                             uint32_t max_id, float *pp) {
     if (!finite_bits(v)) return false;
-    if (p.path == PATH_FULL) return true;
     if (v < floor_logit && i != max_id) return false;
     const float pr = plm_expf(__fmul_rn(__fsub_rn(v, maxlogit), p.rcpT));
     *pp = pr;
@@ -594,11 +621,7 @@ __global__ void __launch_bounds__(PREP_THREADS) prep_collect_kernel(const __grid
         pr->maxi = maxi;
         pr->n_fin = n_fin;
     }
-    if (p.refuse || p.greedy || maxi < 0) return;
-    if (p.path == PATH_FULL && n_fin > SMP_CAP) {   /* every finite value is a candidate: past the store */
-        if (c == 0 && tid == 0) pr->n_cand = n_fin;
-        return;
-    }
+    if (p.refuse || p.greedy || maxi < 0 || ((a.full_rows >> row) & 1u)) return;
     const row_view rv = prep_view(a, q);
     uint32_t lo, hi;
     prep_chunk(rv.n, c, &lo, &hi);
@@ -744,11 +767,12 @@ __device__ void sample_row(const launch_args &a, uint32_t row, row_smem<THREADS>
         __syncthreads();
         sum = sm.fsum;
     } else {
-        /* PATH_MINP / PATH_FULL: the candidate predicate, and (MINP, not full-nucleus) the id-order sum */
+        /* PATH_MINP (the full arm has its own pipeline): the candidate predicate, and (not full-nucleus) the
+         * id-order sum */
         const uint32_t max_id = (uint32_t)maxi;
         const float floor_logit = row_floor(p, maxv);
-        if (p.path == PATH_MINP) maxlogit = maxv;
-        const bool idsum = p.path == PATH_MINP && !p.full;
+        maxlogit = maxv;
+        const bool idsum = !p.full;
         if (tid == 0) { sm.cnt = 0; sm.fsum = 0.0f; }
         __syncthreads();
         uint32_t n;
@@ -772,7 +796,7 @@ __device__ void sample_row(const launch_args &a, uint32_t row, row_smem<THREADS>
             n = pp->n_cand;
         }
         if (idsum) sum = sm.fsum;
-        if (p.path == PATH_MINP && p.full) { sum = __uint_as_float(0x7f800000u); sum_inert = true; }
+        if (p.full) { sum = __uint_as_float(0x7f800000u); sum_inert = true; }
         cl.n = n;
         if (n <= SMP_CAP) {
             if (pp) {
@@ -789,7 +813,6 @@ __device__ void sample_row(const launch_args &a, uint32_t row, row_smem<THREADS>
             __syncthreads();
             bitonic_sort<THREADS>(sm.keys, n);
             cl.skeys = sm.keys;
-            if (p.path == PATH_FULL) maxlogit = rv((uint32_t)sm.keys[0]);
             for (uint32_t i = tid; i < n; i += THREADS)
                 sm.probs[i] = plm_expf(__fmul_rn(__fsub_rn(rv((uint32_t)sm.keys[i]), maxlogit), rcpT));
             __syncthreads();
@@ -819,16 +842,10 @@ __device__ void sample_row(const launch_args &a, uint32_t row, row_smem<THREADS>
             __syncthreads();
             global_radix_sort<THREADS>(gk0, gv0, gk1, gv1, n, gcnt);
             cl.gids = gv0;
-            if (p.path == PATH_FULL) maxlogit = rv(gv0[0]);
             for (uint32_t i = tid; i < n; i += THREADS)
                 gp[i] = plm_expf(__fmul_rn(__fsub_rn(rv(gv0[i]), maxlogit), rcpT));
             __syncthreads();
             cl.probs = gp;
-        }
-        if (p.path == PATH_FULL) {
-            if (tid == 0) sm.fsum = serial_sum(cl.probs, n);
-            __syncthreads();
-            sum = sm.fsum;
         }
     }
     if (!sum_inert && (sum <= 0.0f || !finite_bits(sum))) {
@@ -879,6 +896,7 @@ __global__ void __launch_bounds__(SMP_THREADS) sample_rows_kernel(const __grid_c
                                                                    const row_prep *prep) {
     __shared__ row_smem<SMP_THREADS> sm;
     if (threadIdx.x == 0) a.pending[blockIdx.x] = 0u;
+    if ((a.full_rows >> blockIdx.x) & 1u) return;   /* the full arm's pipeline draws it */
     __syncthreads();
     sample_row<SMP_THREADS>(a, blockIdx.x, sm, prep + blockIdx.x, nullptr);
 }
@@ -893,6 +911,209 @@ __global__ void __launch_bounds__(SLOT_THREADS) sample_slots_kernel(const __grid
         sample_row<SLOT_THREADS>(a, r, sm, nullptr, a.slots + (size_t)blockIdx.x * a.slot_bytes);
         __syncthreads();
     }
+}
+
+/* ---- the full arm (min_p <= 1e-30, no top-k): every finite value is a candidate --------------------------------
+ *
+ * The host routes these rows here (their path follows from the knobs alone): the row's (desc key, id) pairs sorted
+ * by the device radix sort (stable, so ascending id on ties -- the host's order; a non-finite value keys ~0 and sorts
+ * last), the probabilities over the GPU, the serial sum and the cut on one thread over staged tiles, the race over
+ * the GPU (each chunk's first minimum, then the first minimum of those).  Rows go FULL_GROUP at a time, one scratch
+ * slot each. */
+
+constexpr uint32_t FULL_GROUP = SMP_SLOTS;
+constexpr uint32_t FULL_TILE = 4096;
+
+/* a full-arm row's state: the cut, and each race chunk's first minimum */
+struct full_state {
+    uint32_t f, status;
+    float rf;
+    double pbest[PREP_CHUNKS];
+    uint32_t pidx[PREP_CHUNKS];
+};
+
+__host__ __device__ __forceinline__ uint64_t full_state_off(uint32_t n_vocab) {
+    return ((uint64_t)n_vocab * 5u * sizeof(uint32_t) + 255u) & ~255ull;
+}
+
+/* the rows of one pass, slot j for row[j]; the sort leaves its output in the alternate buffers or not */
+struct full_group {
+    uint32_t row[FULL_GROUP];
+    uint32_t n;
+    uint32_t sorted_in_alt;
+};
+
+/* a slot's arrays: keys and ids in (keygen), the sorted ids, the probabilities in sorted order, the row's state */
+struct full_slot {
+    uint32_t *k_in, *v_in;
+    const uint32_t *ids;
+    float *p;
+    full_state *st;
+};
+
+__device__ __forceinline__ full_slot full_slot_of(const launch_args &a, const full_group &g, uint32_t j) {
+    uint8_t *base = a.slots + (size_t)j * a.slot_bytes;
+    uint32_t *k0 = (uint32_t *)base, *v0 = k0 + a.n_vocab, *k1 = v0 + a.n_vocab, *v1 = k1 + a.n_vocab;
+    full_slot s;
+    s.k_in = k0;
+    s.v_in = v0;
+    s.ids = g.sorted_in_alt ? v1 : v0;
+    s.p = (float *)(v1 + a.n_vocab);
+    s.st = (full_state *)(base + full_state_off(a.n_vocab));
+    return s;
+}
+
+__global__ void __launch_bounds__(PREP_THREADS) full_keygen_kernel(const __grid_constant__ launch_args a,
+                                                                   const full_group g) {
+    const uint32_t j = blockIdx.y, c = blockIdx.x, tid = threadIdx.x;
+    const pulsar_gpu_sample_req q = a.req[g.row[j]];
+    const row_view rv = prep_view(a, q);
+    const full_slot s = full_slot_of(a, g, j);
+    uint32_t lo, hi;
+    prep_chunk(rv.n, c, &lo, &hi);
+    for (uint32_t i = lo + tid; i < hi; i += PREP_THREADS) {
+        const float v = rv(i);
+        s.k_in[i] = finite_bits(v) ? desc_key(v) : 0xffffffffu;
+        s.v_in[i] = i;
+    }
+}
+
+__global__ void __launch_bounds__(PREP_THREADS) full_probs_kernel(const __grid_constant__ launch_args a,
+                                                                  const full_group g, const row_prep *prep) {
+    const uint32_t j = blockIdx.y, c = blockIdx.x, tid = threadIdx.x;
+    const uint32_t row = g.row[j];
+    const pulsar_gpu_sample_req q = a.req[row];
+    const row_plan p = plan_row(q, a.n_vocab);
+    const row_view rv = prep_view(a, q);
+    const full_slot s = full_slot_of(a, g, j);
+    const uint32_t n = prep[row].n_fin;
+    if (n == 0) return;
+    const float maxlogit = rv(s.ids[0]);   /* the sorted head */
+    uint32_t lo, hi;
+    prep_chunk(n, c, &lo, &hi);
+    for (uint32_t i = lo + tid; i < hi; i += PREP_THREADS)
+        s.p[i] = plm_expf(__fmul_rn(__fsub_rn(rv(s.ids[i]), maxlogit), p.rcpT));
+}
+
+/* the serial sum over every candidate in sorted order, then the cut -- one thread, the tiles staged by the block */
+__global__ void __launch_bounds__(SMP_THREADS) full_cut_kernel(const __grid_constant__ launch_args a, const full_group g,
+                                                               const row_prep *prep) {
+    __shared__ __align__(16) float tile[FULL_TILE];
+    __shared__ float acc;
+    __shared__ uint32_t stop;
+    const uint32_t j = blockIdx.x, tid = threadIdx.x;
+    const uint32_t row = g.row[j];
+    const row_plan p = plan_row(a.req[row], a.n_vocab);
+    const full_slot s = full_slot_of(a, g, j);
+    const uint32_t n = prep[row].n_fin;
+    if (tid == 0) {
+        a.out[row].probe_p = 0.0f;
+        s.st->status = n == 0 ? PULSAR_GPU_SAMPLE_REFUSED_EMPTY : PULSAR_GPU_SAMPLE_OK;
+        acc = 0.0f;
+    }
+    if (n == 0) return;
+    __syncthreads();
+    for (uint32_t b = 0; b < n; b += FULL_TILE) {
+        const uint32_t m = min(FULL_TILE, n - b);
+        for (uint32_t i = tid; i < m; i += SMP_THREADS) tile[i] = s.p[b + i];
+        __syncthreads();
+        if (tid == 0) acc = serial_sum_from(acc, tile, m);
+        __syncthreads();
+    }
+    const float sum = acc;
+    if (!(sum > 0.0f) || !finite_bits(sum)) {
+        if (tid == 0) s.st->status = PULSAR_GPU_SAMPLE_REFUSED_MASS;
+        return;
+    }
+    /* the cut, the host's loop: the floor p0 * min_p (min_p <= 1e-30 here: only a subnormal tail falls under it),
+     * the top-p test against the full sum */
+    const float min_e = __fmul_rn(s.p[0], p.min_p), rs = __fdiv_rn(1.0f, sum);
+    __syncthreads();   /* every thread has read the sum */
+    if (tid == 0) { acc = 0.0f; stop = 0; }
+    uint32_t f = 0;
+    __syncthreads();
+    for (uint32_t b = 0; b < n && !stop; b += FULL_TILE) {
+        const uint32_t m = min(FULL_TILE, n - b);
+        for (uint32_t i = tid; i < m; i += SMP_THREADS) tile[i] = s.p[b + i];
+        __syncthreads();
+        if (tid == 0) {
+            float fs = acc;
+            for (uint32_t i = 0; i < m; i++) {
+                const float pr = tile[i];
+                if (b + i > 0 && pr < min_e) { stop = 1; break; }
+                fs = __fadd_rn(fs, pr);
+                f++;
+                if (__fmul_rn(fs, rs) >= p.top_p) { stop = 1; break; }
+            }
+            acc = fs;
+        }
+        __syncthreads();
+    }
+    if (tid == 0) {
+        s.st->f = f;
+        s.st->rf = __fdiv_rn(1.0f, acc);
+    }
+}
+
+/* the race over the emitted candidates, each chunk's first strict minimum */
+__global__ void __launch_bounds__(PREP_THREADS) full_race_kernel(const __grid_constant__ launch_args a,
+                                                                 const full_group g) {
+    __shared__ double wd[32];
+    __shared__ uint32_t wi[32];
+    const uint32_t j = blockIdx.y, c = blockIdx.x, tid = threadIdx.x;
+    const uint32_t row = g.row[j];
+    const pulsar_gpu_sample_req q = a.req[row];
+    const full_slot s = full_slot_of(a, g, j);
+    row_out_t *o = a.out + row;
+    uint32_t *dist = a.dist ? a.dist + (size_t)row * (1u + 2u * a.dist_cap) : nullptr;
+    double best = __longlong_as_double(0x7ff0000000000000ll);
+    uint32_t besti = UINT32_MAX;
+    if (s.st->status == PULSAR_GPU_SAMPLE_OK) {
+        const uint32_t f = s.st->f;
+        const float rf = s.st->rf;
+        uint32_t lo, hi;
+        prep_chunk(f, c, &lo, &hi);
+        for (uint32_t i = lo + tid; i < hi; i += PREP_THREADS) {
+            const float pe = __fmul_rn(s.p[i], rf);
+            const int32_t id = a.id_map ? a.id_map[s.ids[i]] : (int32_t)s.ids[i];
+            if (dist && i < a.dist_cap) {
+                dist[1 + i] = (uint32_t)id;
+                dist[1 + a.dist_cap + i] = __float_as_uint(pe);
+            }
+            if (id == q.probe) o->probe_p = pe;
+            if (!(pe > 0.0f)) continue;
+            const double sc = race_score(q.key, id, pe);
+            if (sc < best) { best = sc; besti = i; }
+        }
+    }
+    block_argmin<PREP_THREADS>(&best, &besti, wd, wi);
+    if (tid == 0) {
+        s.st->pbest[c] = best;
+        s.st->pidx[c] = besti;
+    }
+}
+
+__global__ void full_final_kernel(const __grid_constant__ launch_args a, const full_group g) {
+    const uint32_t j = blockIdx.x;
+    if (threadIdx.x != 0 || j >= g.n) return;
+    const uint32_t row = g.row[j];
+    const full_slot s = full_slot_of(a, g, j);
+    row_out_t *o = a.out + row;
+    uint32_t *dist = a.dist ? a.dist + (size_t)row * (1u + 2u * a.dist_cap) : nullptr;
+    if (s.st->status != PULSAR_GPU_SAMPLE_OK) {
+        o->token = -1;
+        o->status = s.st->status;
+        if (dist) dist[0] = 0;
+        return;
+    }
+    double best = __longlong_as_double(0x7ff0000000000000ll);
+    uint32_t bi = UINT32_MAX;
+    for (uint32_t c = 0; c < PREP_CHUNKS; c++)   /* chunks in index order: the first strict minimum */
+        if (s.st->pbest[c] < best) { best = s.st->pbest[c]; bi = s.st->pidx[c]; }
+    const uint32_t w = bi == UINT32_MAX ? 0u : bi;
+    o->token = a.id_map ? a.id_map[s.ids[w]] : (int32_t)s.ids[w];
+    o->status = PULSAR_GPU_SAMPLE_OK;
+    if (dist) dist[0] = s.st->f;
 }
 
 /* ---- logprobs (the host scorers' bytes: tests/sampler_host_ref.cpp pulsar_logits_top_logprobs / _token_logprob) --- */
@@ -1042,13 +1263,29 @@ __global__ void spec_walk_kernel(const __grid_constant__ walk_args a) {
 
 }  // namespace
 
-uint64_t pulsar_gpu_sample_slot_bytes(uint32_t n_vocab) {
-    return (uint64_t)n_vocab * 5u * sizeof(uint32_t) + 17ull * SLOT_THREADS * sizeof(uint32_t);
+/* the full arm's sort scratch for a row of n_vocab (the double-buffer form: the slot's own arrays alternate) */
+static uint64_t full_sort_bytes(uint32_t n_vocab) {
+    size_t bytes = 0;
+    cub::DoubleBuffer<uint32_t> k(nullptr, nullptr), v(nullptr, nullptr);
+    if (cub::DeviceRadixSort::SortPairs(nullptr, bytes, k, v, (int)n_vocab, 0, 32, cudaStreamPerThread) != cudaSuccess)
+        return UINT64_MAX / 8u;   /* refused below: no scratch is that large */
+    return (bytes + 255u) & ~255ull;
+}
+
+static uint64_t full_sort_off(uint32_t n_vocab) {
+    return full_state_off(n_vocab) + ((sizeof(full_state) + 255u) & ~(uint64_t)255u);
+}
+
+/* a slot: the five row arrays, then the slot kernel's radix counts or the full arm's state and sort scratch */
+static uint64_t sample_slot_bytes(uint32_t n_vocab) {
+    const uint64_t counts = (uint64_t)n_vocab * 5u * sizeof(uint32_t) + 17ull * SLOT_THREADS * sizeof(uint32_t);
+    const uint64_t full = full_sort_off(n_vocab) + full_sort_bytes(n_vocab);
+    return ((counts > full ? counts : full) + 255u) & ~255ull;
 }
 
 /* scratch: the slots, the pending flags, the rows' prep records */
 static uint64_t sample_prep_off(uint32_t n_vocab) {
-    return ((uint64_t)SMP_SLOTS * ((pulsar_gpu_sample_slot_bytes(n_vocab) + 255u) & ~255ull) +
+    return ((uint64_t)SMP_SLOTS * sample_slot_bytes(n_vocab) +
             (uint64_t)PULSAR_GPU_SAMPLE_ROWS_MAX * sizeof(uint32_t) + 255u) & ~255ull;
 }
 
@@ -1098,7 +1335,7 @@ int pulsar_gpu_sample_rows(const pulsar_gpu_tensor *logits, uint64_t logits_offs
     a.id_map = id_map ? (const int32_t *)id_map->ptr : nullptr;
     memcpy(a.req, reqs, (size_t)n_rows * sizeof(*reqs));
     a.out = (row_out_t *)((char *)out->ptr + out_offset_bytes);
-    a.slot_bytes = (pulsar_gpu_sample_slot_bytes(n_vocab) + 255u) & ~255ull;
+    a.slot_bytes = sample_slot_bytes(n_vocab);
     a.slots = (uint8_t *)scratch->ptr;
     a.pending = (uint32_t *)((uint8_t *)scratch->ptr + (uint64_t)SMP_SLOTS * a.slot_bytes);
     a.dist = dist ? (uint32_t *)dist->ptr : nullptr;
@@ -1106,7 +1343,10 @@ int pulsar_gpu_sample_rows(const pulsar_gpu_tensor *logits, uint64_t logits_offs
     /* the prep: the rows' scans over PREP_CHUNKS blocks a row, the top-k rows' radix levels when a row is one */
     row_prep *prep = (row_prep *)((uint8_t *)scratch->ptr + sample_prep_off(n_vocab));
     bool any_topk = false;
-    for (uint32_t r = 0; r < n_rows; r++) any_topk |= reqs[r].top_k > 0;
+    for (uint32_t r = 0; r < n_rows; r++) {
+        any_topk |= reqs[r].top_k > 0;
+        if (row_on_full_arm(reqs[r])) a.full_rows |= 1ull << r;
+    }
     const dim3 pg(PREP_CHUNKS, n_rows);
     if (!cuda_ok(cudaMemset2DAsync(prep, sizeof(row_prep), 0, offsetof(row_prep, zero_end), n_rows,
                                    cudaStreamPerThread), "device sampler prep zero"))
@@ -1123,7 +1363,35 @@ int pulsar_gpu_sample_rows(const pulsar_gpu_tensor *logits, uint64_t logits_offs
     sample_rows_kernel<<<n_rows, SMP_THREADS>>>(a, prep);
     if (!cuda_ok(cudaGetLastError(), "device sampler rows")) return 0;
     sample_slots_kernel<<<SMP_SLOTS, SLOT_THREADS>>>(a);
-    return cuda_ok(cudaGetLastError(), "device sampler slots");
+    if (!cuda_ok(cudaGetLastError(), "device sampler slots")) return 0;
+    /* the full arm's rows, a slot each, FULL_GROUP at a time (the slot kernel above is done with the slots) */
+    const uint64_t sort_bytes = full_sort_bytes(n_vocab);
+    for (uint32_t r0 = 0; r0 < n_rows;) {
+        full_group g;
+        memset(&g, 0, sizeof g);
+        for (; r0 < n_rows && g.n < FULL_GROUP; r0++)
+            if ((a.full_rows >> r0) & 1u) g.row[g.n++] = r0;
+        if (g.n == 0) break;
+        full_keygen_kernel<<<dim3(PREP_CHUNKS, g.n), PREP_THREADS>>>(a, g);
+        for (uint32_t j = 0; j < g.n; j++) {
+            uint8_t *base = a.slots + (uint64_t)j * a.slot_bytes;
+            uint32_t *k0 = (uint32_t *)base, *v0 = k0 + n_vocab, *k1 = v0 + n_vocab, *v1 = k1 + n_vocab;
+            cub::DoubleBuffer<uint32_t> kb(k0, k1), vb(v0, v1);
+            size_t tb = sort_bytes;
+            if (!cuda_ok(cub::DeviceRadixSort::SortPairs(base + full_sort_off(n_vocab), tb, kb, vb, (int)n_vocab, 0,
+                                                          32, cudaStreamPerThread),
+                         "device sampler full-arm sort"))
+                return 0;
+            /* the pass count is fixed by the key width, so where the sorted ids land is the same for every slot */
+            g.sorted_in_alt = vb.selector;
+        }
+        full_probs_kernel<<<dim3(PREP_CHUNKS, g.n), PREP_THREADS>>>(a, g, prep);
+        full_cut_kernel<<<g.n, SMP_THREADS>>>(a, g, prep);
+        full_race_kernel<<<dim3(PREP_CHUNKS, g.n), PREP_THREADS>>>(a, g);
+        full_final_kernel<<<g.n, 32>>>(a, g);
+        if (!cuda_ok(cudaGetLastError(), "device sampler full arm")) return 0;
+    }
+    return 1;
 }
 
 int pulsar_gpu_logprobs_rows(const pulsar_gpu_tensor *logits, uint64_t logits_offset_bytes, uint32_t row_stride,
