@@ -96,6 +96,32 @@ static void server_warmup_generation(pulsar_engine *engine, pulsar_session *sess
             }
         }
     }
+    /* L301: the spec lane's verify curve, on this bank at the warmup's frontier (the prompt's depth, the drafter
+     * warm): loaded from the cache under $XDG_CACHE_HOME (else ~/.cache) /pulsar/verify-curve, or profiled -- every
+     * verify width, ~6 forwards each -- and cached there.  A server with no batched spec lane (TP, no drafter, no
+     * bank pool) has none: its row budget alone admits drafts. */
+    if (ok && !pulsar_engine_is_tp(engine) && pulsar_engine_has_spec_rounds(engine) &&
+        pulsar_engine_has_fused_step(engine) && pulsar_session_bank_count(session) > 1) {
+        char dir[4096] = "";
+        const char *xdg = getenv("XDG_CACHE_HOME"), *home = getenv("HOME");
+        if (xdg && xdg[0]) snprintf(dir, sizeof dir, "%s/pulsar/verify-curve", xdg);
+        else if (home && home[0]) snprintf(dir, sizeof dir, "%s/.cache/pulsar/verify-curve", home);
+        for (char *p = dir + 1; dir[0] && *p; p++) {   /* mkdir -p */
+            if (*p != '/') continue;
+            *p = '\0';
+            (void)mkdir(dir, 0755);
+            *p = '/';
+        }
+        if (dir[0] && mkdir(dir, 0755) != 0 && errno != EEXIST) {
+            server_log(PULSAR_LOG_WARNING, "pulsar-server: verify curve cache %s unusable (%s): profiled, not cached",
+                       dir, strerror(errno));
+            dir[0] = '\0';
+        }
+        char cerr[256] = "";
+        if (pulsar_session_verify_curve_open(session, dir, PULSAR_VERSION_STR, cerr, sizeof cerr) != 0)
+            server_log(PULSAR_LOG_WARNING, "pulsar-server: no verify curve (%s): the spec lane's row budget alone "
+                       "admits drafts", cerr);
+    }
     /* Shrink the live state to one token: below every routing/storage
      * threshold, and the next real prompt rebuilds from zero anyway. */
     if (prompt.len > 0) {

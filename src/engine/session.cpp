@@ -961,6 +961,8 @@ int pulsar_engine::model_id() {
 void pulsar_engine::destroy() {
     auto *e = this;
     if (!e) return;
+    pulsar_verify_curve_free(e->verify_curve);   /* L301 */
+    e->verify_curve = NULL;
     /* Tear down the TP pair before releasing the GPU/model (stop the peer, drop
      * the transport and its registered MR, then free the host-pinned slab). */
     if (e->tp) {

@@ -926,7 +926,7 @@ bool draft_chains(pulsar_session *s, const uint32_t *banks, uint64_t *const *rng
     uint32_t pb[kDraftRows], pi[kDraftRows];
     int32_t pc[kDraftRows];
     std::vector<float> row;
-    std::vector<spec_redraft_req *> chains;   /* the records this call drafted (the stop rule and the price below) */
+    std::vector<spec_redraft_req *> chains;   /* the records this call drafted (the stop rule and the pick below) */
     for (uint32_t i0 = 0; i0 < n;) {
         uint32_t nb = 0, i = i0;
         for (; i < n && nb < per; i++) {
@@ -1022,33 +1022,15 @@ bool draft_chains(pulsar_session *s, const uint32_t *banks, uint64_t *const *rng
         }
     }
     /* the shared draft schedule (spec_ops.h): each chain ends at its first draft under tau (that draft still verified),
-     * then the priced width (session_spec.cpp, L288): a draft is verified while its survival (the product of the
-     * confidences up to it) pays its verify row, run * token_ms >= row_ms, and fewer than the shared verify budget's
-     * drafts of the round outrank it.  The block's pass is paid whatever the depth, so the per-row term alone prices a
-     * slot (no step term: the step is the draft pass, already run). */
+     * then the verify pick (L301, verify_curve.cpp): the round's drafts by survival (the product of the confidences up
+     * to each, a copy chain's beside the drafter's), as many as raise its tokens per ms on the measured curve, the
+     * n banks' base rows beside them.  The block's pass is paid whatever the depth, so no drafter step enters: the
+     * pick alone cuts a chain. */
     const float tau = pulsar_spec_tau(s->engine);
     for (spec_redraft_req *q : chains) q->keep = pulsar_spec_conf_keep(q->conf, q->keep, tau);
     static int unpriced = -1;   /* diagnostic (PULSAR_BLOCK_UNPRICED set, read once): the sweep's rule-off arm */
     if (unpriced < 0) unpriced = getenv("PULSAR_BLOCK_UNPRICED") ? 1 : 0;
-    if (!unpriced && !chains.empty()) {
-        const pulsar_spec_chain_price price = pulsar_spec_chain_price_for(s, (uint32_t)chains.size());
-        std::vector<float> runs;
-        for (spec_redraft_req *q : chains) {
-            float run = 1.0f;
-            for (uint32_t k = 0; k < q->keep; k++) runs.push_back(run *= q->conf[k]);
-        }
-        for (spec_redraft_req *q : chains) {
-            float run = 1.0f;
-            uint32_t k = 0;
-            for (; k < q->keep; k++) {
-                run *= q->conf[k];
-                uint32_t ahead = 0;
-                for (float r : runs) ahead += r > run ? 1u : 0u;
-                if (ahead >= price.budget || (price.token_ms > 0.0f && run * price.token_ms < price.row_ms)) break;
-            }
-            q->keep = k;
-        }
-    }
+    if (!unpriced && !chains.empty()) pulsar_spec_keep_picked(s, n, reqs, n);
     return true;
 }
 

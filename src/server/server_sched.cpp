@@ -8,6 +8,8 @@
 #include "pulsar_nvtx.h"
 #include "pulsar_lock.hpp"
 
+#include <algorithm>
+
 
 
 /* Tier-2 shared-pool bank switch (defined lower, near provision_slot). Installs
@@ -1318,7 +1320,10 @@ void server::publish_metrics_snapshot() {
     s->m_gen_tokens = s->w_gen_tokens;
     s->m_prefill_chunk_tokens = s->w_prefill_chunk_tokens;
     s->m_spec_overflow_rounds = s->w_spec_overflow_rounds;
-    s->m_spec_thr_cut_rows = s->w_spec_thr_cut_rows;
+    s->m_spec_pick_cut_rows = s->w_spec_pick_cut_rows;
+    pulsar_engine_verify_curve_view(s->engine, &s->m_verify_curve);
+    pulsar_engine_spec_calibration(s->engine, &s->m_spec_calib);
+    s->m_drafter_name = pulsar_engine_drafter_name(s->engine);
     memcpy(s->m_spec_phase_ms, s->w_spec_phase_ms, sizeof s->m_spec_phase_ms);
     s->m_spec_phase_rounds = s->w_spec_phase_rounds;
     s->m_decode_lane = s->w_decode_lane;
@@ -1688,68 +1693,6 @@ static int lane_price_pick(lane_price *lp, const pulsar_lane_cost *plain, const 
     }
     lp->why = "priced";
     return inc;
-}
-
-/* L288 C1: the verify width for `n` decoding banks -- the decode block `blk` or the whole width `full`, measured (see
- * width_price).  One decoder, or as many as the block holds base rows for, have no choice (the whole width).  At a
- * count: the width in force is measured first (LANE_PRICE_PROBE_STEPS rounds), then the other is probed as long, and
- * the faster by LANE_PRICE_MARGIN holds; every LANE_PRICE_REPROBE_STEPS rounds the other is probed again. */
-static uint32_t width_price_pick(width_price *wp, int n, uint32_t blk, uint32_t full) {
-    if (!wp->init) {
-        for (int i = 0; i < WIDTH_PRICE_N; i++) { wp->probe[i] = -1; wp->force[i] = 1; }
-        wp->init = true;
-    }
-    if (n <= 1 || n >= WIDTH_PRICE_N || full <= blk || (uint32_t)n >= blk) {
-        wp->why = "no choice";
-        return full;
-    }
-    auto price = [&](int w) {
-        return wp->steps[n][w] >= LANE_PRICE_PROBE_STEPS && wp->ms[n][w] > 0.0 ? 1000.0 * wp->tok[n][w] / wp->ms[n][w]
-                                                                               : 0.0;
-    };
-    const int inc = wp->force[n], other = 1 - inc;
-    const uint32_t at = wp->rounds[n];
-    auto event = [&]() {   /* a probe begins or ends: the caller announces it, with the prices it weighed */
-        wp->ann_n = n;
-        wp->ann_blk = price(0);
-        wp->ann_whole = price(1);
-    };
-    if (wp->probe[n] >= 0) {
-        if (at - wp->mark[n] < LANE_PRICE_PROBE_STEPS) {
-            wp->why = "measuring";
-            return wp->probe[n] ? full : blk;
-        }
-        wp->probe[n] = -1;
-        wp->mark[n] = at;
-        if (price(other) > price(inc) * (1.0 + LANE_PRICE_MARGIN)) {
-            wp->force[n] = (uint8_t)other;
-            wp->why = "measured faster";
-        } else {
-            wp->why = "measured: the width in force holds";
-        }
-        event();
-        return wp->force[n] ? full : blk;
-    }
-    if (price(inc) > 0.0 && (price(other) <= 0.0 || at - wp->mark[n] >= LANE_PRICE_REPROBE_STEPS)) {
-        wp->probe[n] = (int8_t)other;
-        wp->mark[n] = at;
-        wp->why = price(other) <= 0.0 ? "no price here: measuring" : "re-measuring";
-        event();
-        return other ? full : blk;
-    }
-    wp->why = price(inc) > 0.0 ? "priced" : "measuring the width in force";
-    return inc ? full : blk;
-}
-
-/* One decode-only spec round at `n` decoders and `width` (the whole width or not): `tokens` committed in `ms`. */
-static void width_price_observe(width_price *wp, int n, bool whole, int tokens, double ms) {
-    if (n <= 0 || n >= WIDTH_PRICE_N || tokens < 0 || !(ms > 0.0)) return;
-    const int w = whole ? 1 : 0;
-    const double a = wp->steps[n][w] ? (double)LANE_PRICE_ALPHA : 1.0;
-    wp->tok[n][w] += a * ((double)tokens - wp->tok[n][w]);
-    wp->ms[n][w] += a * (ms - wp->ms[n][w]);
-    wp->steps[n][w]++;
-    wp->rounds[n]++;
 }
 
 static int server_pick_decode_lane(int pool_banks, bool spec_rounds, uint32_t verify_rows,
@@ -2339,68 +2282,34 @@ void server::worker_batched_decode_quantum(session_slot **dec, int n, int quantu
 }
 
 
-/* L049 increment 1 / L117: confidence-ranked cross-bank K allocation for the
- * spec lane's shared forward (L179 branch 1). surv[i][j] is bank i's survival
- * (cumprod of drafter confidences) at pending position j, npend[i] its pending
- * count (0 for a bank not in GEN_DECODE), n_live the number of decoding banks
- * (one base row each), row_budget the verify rows the round may carry (L284:
- * the family's pulsar_engine_fused_heads_max less the round's finishing
- * chunks -- one rule for both families). Returns 2 on OVERFLOW (base rows +
- * every pending > row_budget), 1 when only the cost cut binds (a pending row
- * priced below thr), else 0.
- *
- * When everything fits and no row is priced out, every bank is admitted whole
- * (k_alloc[i] == npend[i]) and the caller applies the old unconditional cap.
- * L284 (Tyler 2026-10-08: batch invariance is not a requirement): the cost
- * cut binds whether or not the budget does -- a draft row whose survival is
- * worth less than the row costs is not verified at any width.  Before, the
- * cut engaged only on overflow (the L179 isolation invariant, which kept a
- * bank's round shape independent of its partners' carries); measured on one
- * Spark at temperature 0.7 the always-on cut is +11% for a lone DeepSeek
- * stream and within noise at 4 / 8 / 12 (rows/L284.md).
- *
- * Admission: the global best (bank, position) until the row budget
- * (row_budget - n_live) is spent; survival is monotone within a
- * bank so each bank's admitted set is a prefix. The cost table (L117/L136)
- * stops admission once the best remaining candidate's survival is below thr
- * (= marginal row ms / the lane yield, pulsar_engine_spec_token_ms): every remaining candidate is
- * then <= it, and *thr_cut_rows counts the rows that cut left unadmitted (0
- * when the cut did not fire). */
-static int spec_alloc_rows(const float surv[][16], const uint32_t *npend, int n, int n_live,
-                           int row_budget, float thr, int *k_alloc, int *thr_cut_rows) {
-    uint32_t demand = (uint32_t)n_live;
-    for (int i = 0; i < n; i++) demand += npend[i];
-    *thr_cut_rows = 0;
-    const bool overflow = demand > (uint32_t)row_budget;
-    bool priced_out = false;
-    for (int i = 0; i < n && !priced_out; i++)
-        for (uint32_t j = 0; j < npend[i] && !priced_out; j++) priced_out = surv[i][j] < thr;
-    if (!overflow && !priced_out) {
-        for (int i = 0; i < n; i++) k_alloc[i] = (int)npend[i];
-        return 0;
+/* L301: the round's verify pick (verify_curve.cpp, one rule for every drafter; L049 / L117 / L284 ranked the same
+ * candidates against a marginal threshold).  surv[i][j] is bank i's survival (the product of its drafter's
+ * confidences up to pending position j; a confidence under 0 counts as 1), npend[i] its pending count (0 for a bank
+ * not in GEN_DECODE), n_live the decoding banks (one base row each, never cut), row_budget the rows the round may
+ * carry (the family's verify width less the round's finishing chunks).  Every (bank, position) is ranked by survival
+ * -- then bank, then position, so each bank's admitted set is a prefix of its chain -- and the engine's pick takes
+ * the T best that maximise the round's tokens per ms on the measured curve (no curve: as many as the budget holds).
+ * k_alloc[i] = bank i's share.  Returns the pending drafts left unverified; *overflow = the demand passed the
+ * budget. */
+static int spec_pick_rows(const pulsar_engine *e, const float surv[][16], const uint32_t *npend, int n, int n_live,
+                          int row_budget, int *k_alloc, bool *overflow) {
+    struct cand { float surv; int i; uint32_t j; };
+    cand c[PULSAR_SESSION_POOL_CAP * 16];
+    uint32_t m = 0;
+    for (int i = 0; i < n; i++) {
+        k_alloc[i] = 0;
+        for (uint32_t j = 0; j < npend[i] && j < 16u; j++) c[m++] = {surv[i][j], i, j};
     }
-    for (int i = 0; i < n; i++) k_alloc[i] = 0;
-    int budget = row_budget - n_live;
-    while (budget > 0) {
-        int bi = -1;
-        float bv = -1.0f;
-        for (int i = 0; i < n; i++) {
-            if ((uint32_t)k_alloc[i] < npend[i] && surv[i][k_alloc[i]] > bv) {
-                bv = surv[i][k_alloc[i]];
-                bi = i;
-            }
-        }
-        if (bi < 0) break;
-        if (bv < thr) {
-            /* L136: everything left is priced out by the cost table while
-             * budget remains -- the only rows whose fate marginal_ms decides. */
-            for (int i = 0; i < n; i++) *thr_cut_rows += (int)npend[i] - k_alloc[i];
-            break;
-        }
-        k_alloc[bi]++;
-        budget--;
-    }
-    return overflow ? 2 : 1;
+    *overflow = (uint32_t)n_live + m > (uint32_t)(row_budget > 0 ? row_budget : 0);
+    std::sort(c, c + m, [](const cand &a, const cand &b) {
+        return a.surv != b.surv ? a.surv > b.surv : a.i != b.i ? a.i < b.i : a.j < b.j;
+    });
+    float sv[PULSAR_SESSION_POOL_CAP * 16];
+    for (uint32_t t = 0; t < m; t++) sv[t] = c[t].surv;
+    const uint32_t T = pulsar_engine_verify_pick(e, (uint32_t)n_live, sv, m,
+                                                 row_budget > 0 ? (uint32_t)row_budget : 0u);
+    for (uint32_t t = 0; t < T; t++) k_alloc[c[t].i]++;
+    return (int)(m - T);
 }
 
 
@@ -2523,7 +2432,6 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n, int quantum_
     float *logits = s->spec_lane_logits;
 
     int emitted_total = 0;
-    const double quantum_t0 = server_now_sec();   /* L117 EMA numerator */
     const bool fuse_on = s->fusion_enabled();
     /* L260 fusion: the prompt rows one round carries, at most -- a classic
      * chunk's worth (prefill_cap) less the verify rows' budget, so a fused step
@@ -2622,27 +2530,15 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n, int quantum_
             pf_rows += (uint32_t)kk;
             n_fr++;
         }
-        /* ---- L049 increment 1: confidence-ranked cross-bank K allocation.
-         * At <=16 total rows the shared forward's marginal row cost is
-         * near-flat, so the win is ALLOCATION under the cap, not budget
-         * sizing (vLLM #47808's cost-table argmax is increment 2 if that
-         * ever stops being true). Score every (bank, position) slot by the
-         * drafter's survival probability -- cumprod of per-position
-         * confidences, read switch-free from the saved carries, which are
-         * fresh at sweep start because every bank saved at the previous
-         * round's end -- and admit the global best until the row budget is
-         * spent. Survival is monotone, so each bank's admitted set is a
-         * prefix. Banks with no/invalid pendings get K=0 and still run
-         * their base row. When everything fits, every slot is admitted and
-         * the lane behaves exactly as before this allocator existed.  L284:
-         * the budget is the family's verify width (heads_max) less this
-         * round's finishing chunks, so it runs after the riders are chosen --
-         * a finishing chunk used to leave the allocation at the full width and
-         * sit a whole bank out of the round (assemble's SKIPPED). */
+        /* ---- L301: the verify pick (spec_pick_rows): every (bank, position) by its drafter's survival -- the
+         * product of per-position confidences, read switch-free from the saved carries, which are fresh at sweep
+         * start because every bank saved at the previous round's end -- and the count that maximises the round's
+         * tokens per ms on the engine's measured verify curve, within the row budget: the family's verify width
+         * (heads_max) less this round's finishing chunks, so it runs after the riders are chosen (L284: a
+         * finishing chunk used to leave the allocation at the full width and sit a whole bank out of the round,
+         * assemble's SKIPPED).  Banks with no or invalid pendings get K=0 and still run their base row. */
         int k_alloc[PULSAR_SESSION_POOL_CAP];
-        bool k_overflow = false;
-        uint32_t width = heads_max;   /* L288 C1: the verify width this round carries (below) */
-        int n_live_w = 0;
+        uint32_t n_live_w = 0;
         {
             float surv[PULSAR_SESSION_POOL_CAP][16];
             uint32_t npend[PULSAR_SESSION_POOL_CAP];
@@ -2657,49 +2553,17 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n, int quantum_
                     pulsar_session_bank_pending_confs(pool, (uint32_t)dec[i]->bank, conf);
                 float p = 1.0f;
                 for (uint32_t j2 = 0; j2 < np; j2++) {
-                    p *= conf[j2];
+                    p *= conf[j2] < 0.0f ? 1.0f : conf[j2];
                     surv[i][j2] = p;
                 }
                 npend[i] = np;
             }
-            /* L117 (L049 inc 2): under overflow the ranked admission also
-             * consults the cost -- stop admitting once the next candidate's
-             * survival is worth less than a marginal row costs (value
-             * denominator = live EMA of ms per emitted token).  Binds ONLY
-             * under overflow -- when everything fits the old unconditional
-             * cap is byte-identical (isolation invariant, see
-             * spec_alloc_rows). vLLM #47808 is the same design upstream.
-             * L111/L121 established the cost is DEPTH-FLAT; the row price
-             * is ONE fact shared with the engine's yield quench, and since
-             * L263 it is MEASURED (pulsar_engine_lane_cost: the rounds this
-             * loop reports) -- L136's 6.0 and L214's 7.17 were refits that
-             * went stale with the kernels (L219/B4: every price in [3, 9] ms
-             * sits on one plateau; a 30 ms positive control costs 12-19%).
-             * No fit yet, or no EMA yet: no cut, the cap alone admits. */
-            const pulsar_lane_cost cost = pulsar_engine_lane_cost(s->engine, PULSAR_LANE_SPEC);
-            const float tok_ms = pulsar_engine_spec_token_ms(s->engine);   /* L288: the engine's, the drafter's too */
-            const float thr = cost.valid && tok_ms > 1.0f ? (float)cost.row_us / (1000.0f * tok_ms) : 0.0f;
-            /* L288 C1: the width -- the decode block or the whole verify width, measured per decoder count
-             * (width_price_pick); a round a prompt finishes in keeps the whole width (its head rows ride in it), and
-             * a tensor-parallel group the whole width always (its ranks draft against the same width).  The drafter
-             * budgets the next round's chains against it (pulsar_engine_set_spec_width). */
-            n_live_w = n_live;
-            if (n_fin == 0 && !pulsar_engine_is_tp(s->engine))
-                width = width_price_pick(&s->w_width_price, n_live, PULSAR_GPU_MNEUTRAL_ROWS_MAX, heads_max);
-            (void)pulsar_engine_set_spec_width(s->engine, width);
-            width_price &wp = s->w_width_price;
-            if (wp.ann_n > 0) {   /* rule 5: a probe's start and its verdict, with the prices weighed */
-                server_log(PULSAR_LOG_DEFAULT, "pulsar-server: spec verify width at %d decoders: %u rows (%s; the %u-row "
-                           "block %.1f vs the whole %u rows %.1f tok/s)", wp.ann_n, width, wp.why ? wp.why : "",
-                           (unsigned)PULSAR_GPU_MNEUTRAL_ROWS_MAX, wp.ann_blk, heads_max, wp.ann_whole);
-                wp.ann_n = 0;
-            }
-            int thr_cut_rows = 0;
-            const int bound = spec_alloc_rows(surv, npend, n, n_live, (int)width - n_fin, thr,
-                                              k_alloc, &thr_cut_rows);
-            k_overflow = bound != 0;
-            if (bound == 2) s->w_spec_overflow_rounds++;
-            s->w_spec_thr_cut_rows += (uint64_t)thr_cut_rows;
+            n_live_w = (uint32_t)n_live;
+            bool overflow = false;
+            const int cut = spec_pick_rows(s->engine, surv, npend, n, n_live, (int)heads_max - n_fin, k_alloc,
+                                           &overflow);
+            if (overflow) s->w_spec_overflow_rounds++;
+            s->w_spec_pick_cut_rows += (uint64_t)cut;
         }
         /* ---- assemble: ONE call restores each bank, draws its base, begins
          * its round and lays its rows, saving it after (L260: one mirrored
@@ -2736,8 +2600,8 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n, int quantum_
              * trim (K <= accepted_cap-1) enforces the allocation, and its
              * validity checks may trim further -- the allocation is an
              * upper bound, never a promise. */
-            st->k_alloc = k_overflow ? k_alloc[i] : -1;
-            st->accepted_cap = k_overflow ? k_alloc[i] + 1 : (int)(PULSAR_SPEC_LOGITS_ROWS + 1);
+            st->k_alloc = k_alloc[i];
+            st->accepted_cap = k_alloc[i] + 1;
             step_slot[ns++] = i;
         }
         /* The batch's first restore overwrites whatever is installed: park the
@@ -2750,7 +2614,7 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n, int quantum_
         uint32_t rows = 0;
         if (ns > 0)
             (void)pulsar_session_spec_assemble_batch(pool, steps, ns,
-                                                     width - (uint32_t)n_fin, reqs, &rows);
+                                                     heads_max - (uint32_t)n_fin, reqs, &rows);
         int m = 0;
         for (int j = 0; j < ns; j++) {
             const pulsar_spec_step *st = &steps[j];
@@ -3111,14 +2975,24 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n, int quantum_
                                                               round_t1};
             for (int p = 0; p < SERVER_ROUND_PHASE_COUNT; p++) s->w_spec_phase_ms[p] += (cut[p + 1] - cut[p]) * 1e3;
             s->w_spec_phase_rounds++;
-            pulsar_engine_lane_cost_observe(s->engine, PULSAR_LANE_SPEC, rows, (server_now_sec() - round_t0) * 1e3);
+            const double round_ms = (round_t1 - round_t0) * 1e3, fwd_ms = (fwd_t1 - fwd_t0) * 1e3,
+                         draft_ms = (draft_t1 - draft_t0) * 1e3;
+            pulsar_engine_lane_cost_observe(s->engine, PULSAR_LANE_SPEC, rows, round_ms);
             /* L284 lane cost: the same round's yield, per bank -- what the lane choice prices the spec lane's
              * rows by (lane_price_pick) */
-            lane_price_observe_spec(&s->w_lane_price, emitted_total - round_emitted0, (int)rows, m,
-                                    (server_now_sec() - round_t0) * 1e3);
-            /* L288 C1: and the width's price at this decoder count */
-            width_price_observe(&s->w_width_price, n_live_w, width == heads_max, emitted_total - round_emitted0,
-                                (server_now_sec() - round_t0) * 1e3);
+            lane_price_observe_spec(&s->w_lane_price, emitted_total - round_emitted0, (int)rows, m, round_ms);
+            /* L301: and the verify curve's online correction -- the forward against its profile, the rest of the
+             * round outside the forward and the drafting, the drafting */
+            pulsar_engine_verify_curve_observe(s->engine, (uint32_t)m, rows, fwd_ms, round_ms - fwd_ms - draft_ms,
+                                               draft_ms);
+            if (!s->w_spec_pick_announced) {   /* rule 5: the pick ran, with the curve it priced on */
+                s->w_spec_pick_announced = true;
+                pulsar_verify_curve_view v;
+                pulsar_engine_verify_curve_view(s->engine, &v);
+                server_log(PULSAR_LOG_DEFAULT, "pulsar-server: verify pick ran: %u decoders, %u rows (%s)",
+                           n_live_w, rows, v.valid ? "priced on the measured verify curve"
+                                                   : "no verify curve: the row budget alone");
+            }
         }
         s->publish_metrics_snapshot();
         /* L260 fusion: a prompt finished this round -- end the quantum so its
@@ -3135,8 +3009,6 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n, int quantum_
                    c->bank, pulsar_session_bank_pos(pool, (uint32_t)c->bank), len, rv[k].rows, rv[k].rounds,
                    round_ix, rv[k].why ? "; last miss: " : "", rv[k].why ? rv[k].why : "");
     }
-    if (emitted_total > 0)
-        pulsar_engine_spec_yield_observe(s->engine, emitted_total, (server_now_sec() - quantum_t0) * 1e3);
     for (int i = 0; i < n; i++) {
         if (rounds[i]) pulsar_spec_round_free(rounds[i]);
         dec[i]->last_serviced_us = (uint64_t)(server_now_sec() * 1e6);
