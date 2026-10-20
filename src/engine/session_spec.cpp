@@ -432,13 +432,19 @@ static int spec_accept_walk(pulsar_session *s,
                             const int32_t *pend, uint32_t K,
                             float temperature, int top_k, float top_p, float min_p,
                             uint32_t greedy_rows,
-                            uint64_t rng, int *out_carry_tok) {
+                            uint64_t rng, int *out_carry_tok,
+                            float *label, uint8_t *hit, uint32_t *n_label) {
     int commit = 0;
     int carry_tok = -1;
+    *n_label = 0;
     while (commit < (int)K) {
         if (spec_row_greedy(temperature, greedy_rows, (uint32_t)commit)) {
             /* the row's argmax; on a miss the carry is the refreshed row's argmax (round_end) */
-            if (row_tops[commit] != (int)pend[commit]) break;
+            const bool ok = row_tops[commit] == (int)pend[commit];
+            label[commit] = ok ? 1.0f : 0.0f;   /* L301: greedy, the acceptance itself */
+            hit[commit] = ok ? 1u : 0u;
+            *n_label = (uint32_t)commit + 1u;
+            if (!ok) break;
             commit++;
             continue;
         }
@@ -456,7 +462,14 @@ static int spec_accept_walk(pulsar_session *s,
             }
         }
         const int tok = pulsar_sample_dist_draw(&dist, pulsar_sample_key(rng, (uint32_t)commit + 1u));
+        /* L301: sampled, the target's probability of the draft (its candidates are the filtered nucleus) */
+        float p = 0.0f;
+        for (uint32_t c = 0; c < dist.n; c++)
+            if (dist.ids[c] == (int)pend[commit]) { p = dist.probs[c]; break; }
         pulsar_sample_dist_free(&dist);
+        label[commit] = p;
+        hit[commit] = tok == (int)pend[commit] ? 1u : 0u;
+        *n_label = (uint32_t)commit + 1u;
         if (tok != (int)pend[commit]) {
             carry_tok = tok;
             break;
@@ -625,10 +638,15 @@ static int spec_round_end(pulsar_session *s, pulsar_spec_round *r,
         carry_tok = (int)forced_truth[commit_rc];
     } else {
         PULSAR_NVTX("spec: walk");
+        float label[16];
+        uint8_t hit[16];
+        uint32_t n_label = 0;
         commit_rc = spec_accept_walk(s, src->read, src->ud, src->compact, row0,
                                      row_tops, pend, K,
                                      temperature, top_k, top_p, min_p, greedy_rows,
-                                     rng ? *rng : 0u, &carry_tok);
+                                     rng ? *rng : 0u, &carry_tok, label, hit, &n_label);
+        /* L301: the drafts the walk reached, against their confidences (a teacher-forced end has no target draw) */
+        if (commit_rc >= 0) pulsar_spec_calibration_note(e, r->copy, pend_conf, label, hit, n_label);
     }
     if (commit_rc < 0) {
         s->checkpoint.len = saved_len;
