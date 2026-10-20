@@ -102,7 +102,11 @@ struct kind_decl {
 
 /* LiLiCorr (L298): vLLM's lilicorr config; tau measured (L298, the l297 bench single stream T0, the priced width on):
  * tau off 62.0 tok/s, 0.3 62.0, 0.5 62.6 (code 61.1 -> 64.2), 0.7 61.4.
- * DFlash2 (L299): z-lab's DFlash2DraftModel config (incoai/Qwen3.8-Flash-Next-DFlash2). */
+ * DFlash2 (L299): z-lab's DFlash2DraftModel config (incoai/Qwen3.8-Flash-Next-DFlash2); tau measured (L299, the
+ * scoreboard untraced, Qwen3.8 U-e4-d5, the priced width on; code / prose / code T0.7 / edit / 4 streams tok/s): 0.3
+ * 122.2 / 81.2 / 108.5 / 128.6 / 171.9, 0.5 121.6 / 83.1 / 107.2 / 129.3 / 175.7, 0.7 117.1 / 81.8 / 106.1 / 127.9
+ * / 174.3.  Its slot confidence is calibrated (the served-round replay, quintiles conf -> accept: prose 0.44 -> 0.30,
+ * 0.73 -> 0.54, 0.93 -> 0.79, 0.99 -> 0.97; code 0.68 -> 0.60, 0.97 -> 0.93, 1.00 -> 0.99): no rescale. */
 const kind_decl k_kinds[] = {
     {"lilicorr", PULSAR_BLOCK_HEAD_LILICORR, 0.5f, "hidden_size", "num_hidden_layers",
      "num_attention_heads", "num_key_value_heads", "head_dim", "intermediate_size", "vocab_size", "block_size",

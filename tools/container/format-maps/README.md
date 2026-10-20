@@ -10,5 +10,6 @@ checkpoint, `inkling-mini-k3` the 3-layer mini on its K3 EXL3 pack (L294).  `nem
 container of any Nemotron-H Omni checkpoint (role rows; the vision tower consumed by name -- L296 N1);
 `nemotron_h-exl3-k4` Nemotron 3.5 Super VL on its K4 EXL3 pack; `nemotron_h-k4-lilicorr` the same with the MTP
 module omitted and NVIDIA's LiLiCorr block drafter written in its place (needs `--drafter lilicorr DIR`; its NVFP4
-Linears `nvfp4`, the rest native -- L298).
+Linears `nvfp4`, the rest native -- L298).  `qwen38fn-u-e4-d5-dflash2` is U-e4-d5 with z-lab's DFlash2 block drafter
+(needs `--drafter dflash2 DIR`; its Linears and draft-vocabulary head `nvfp4` from BF16, the rest BF16 -- L299).
 The scripts that produced them were archived 2026-09-24 (tag `archive/gguf-tooling-2026-09-24`).
