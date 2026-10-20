@@ -84,24 +84,39 @@ __device__ __forceinline__ bool before(float va, int32_t ia, float vb, int32_t i
 
 /* one CTA per row: each thread a sorted local top-k of its strided columns and an online (max, sum exp); the CTA's
  * logsumexp, then k rounds of a CTA argmax over the threads' list heads */
+template <int KM>
 __global__ void __launch_bounds__(TOPK_THREADS) topk_kernel(const uint16_t *__restrict__ logits, uint64_t ld,
-                                                           uint32_t n, uint32_t k, const int32_t *__restrict__ id_map,
+                                                           uint32_t n, const int32_t *__restrict__ id_map,
                                                            int32_t *ids, float *lp) {
+    constexpr uint32_t k = (uint32_t)KM;
     const uint32_t row = blockIdx.x, tid = threadIdx.x;
     const uint16_t *x = logits + (uint64_t)row * ld;
-    float lv[PULSAR_BLOCKDRAFT_TOPK_MAX];
-    int32_t li[PULSAR_BLOCKDRAFT_TOPK_MAX];
-    for (uint32_t j = 0; j < k; j++) { lv[j] = -INFINITY; li[j] = INT32_MAX; }
+    /* the thread's sorted list in REGISTERS: k is the template's and every index below a compile-time constant
+     * (fully unrolled), so the list never lives in local memory (L299) */
+    float lv[KM];
+    int32_t li[KM];
+#pragma unroll
+    for (int j = 0; j < KM; j++) { lv[j] = -INFINITY; li[j] = INT32_MAX; }
+    const int kk = (int)k;
     float m = -INFINITY, s = 0.f;
     for (uint32_t c = tid; c < n; c += TOPK_THREADS) {
         const float v = bf(x[c]);
         if (v > m) { s = s * expf(m - v) + 1.f; m = v; }
         else s += expf(v - m);
-        if (!before(v, (int32_t)c, lv[k - 1], li[k - 1])) continue;
-        uint32_t j = k - 1;
-        while (j > 0 && before(v, (int32_t)c, lv[j - 1], li[j - 1])) { lv[j] = lv[j - 1]; li[j] = li[j - 1]; j--; }
-        lv[j] = v;
-        li[j] = (int32_t)c;
+        float lk = -INFINITY;
+        int32_t lik = INT32_MAX;
+#pragma unroll
+        for (int j = 0; j < KM; j++)
+            if (j == kk - 1) { lk = lv[j]; lik = li[j]; }
+        if (!before(v, (int32_t)c, lk, lik)) continue;
+        /* the insertion: from the list's end, shift each entry v outranks down one; v takes the first it does not */
+        bool placed = false;
+#pragma unroll
+        for (int j = KM - 1; j >= 0; j--) {
+            if (placed || j > kk - 1) continue;
+            if (j > 0 && before(v, (int32_t)c, lv[j - 1], li[j - 1])) { lv[j] = lv[j - 1]; li[j] = li[j - 1]; }
+            else { lv[j] = v; li[j] = (int32_t)c; placed = true; }
+        }
     }
     __shared__ float sm[TOPK_THREADS], ss[TOPK_THREADS];
     __shared__ int32_t si[TOPK_THREADS];
@@ -120,10 +135,15 @@ __global__ void __launch_bounds__(TOPK_THREADS) topk_kernel(const uint16_t *__re
     }
     const float lse = sm[0] + logf(ss[0]);
     __syncthreads();
-    uint32_t head = 0;
+    int head = 0;
     for (uint32_t j = 0; j < k; j++) {
-        sm[tid] = head < k ? lv[head] : -INFINITY;
-        si[tid] = head < k ? li[head] : INT32_MAX;
+        float hv = -INFINITY;
+        int32_t hi = INT32_MAX;
+#pragma unroll
+        for (int q = 0; q < KM; q++)
+            if (q == head && q < kk) { hv = lv[q]; hi = li[q]; }
+        sm[tid] = hv;
+        si[tid] = hi;
         ss[tid] = (float)tid;
         __syncthreads();
         for (uint32_t w = TOPK_THREADS / 2; w > 0; w >>= 1) {
@@ -190,6 +210,14 @@ int pulsar_rows_topk_logprob_launch(const uint16_t *logits, uint64_t ld, uint32_
                                     const int32_t *id_map, int32_t *ids, float *lp, cudaStream_t stream) {
     if (!logits || !ids || !lp || n_rows == 0 || n == 0 || ld < n || k == 0 || k > PULSAR_BLOCKDRAFT_TOPK_MAX || k > n)
         return refuse("top-k: a NULL buffer, no rows, or k outside 1 .. 16");
-    topk_kernel<<<n_rows, TOPK_THREADS, 0, stream>>>(logits, ld, n, k, id_map, ids, lp);
+    static_assert(PULSAR_BLOCKDRAFT_TOPK_MAX == 16, "one instantiation a k, 1 .. 16");
+    switch (k) {   /* one instantiation a k: the list's length is a compile-time constant */
+#define PULSAR_TOPK_CASE(K) case K: topk_kernel<K><<<n_rows, TOPK_THREADS, 0, stream>>>(logits, ld, n, id_map, ids, lp); break;
+        PULSAR_TOPK_CASE(1) PULSAR_TOPK_CASE(2) PULSAR_TOPK_CASE(3) PULSAR_TOPK_CASE(4) PULSAR_TOPK_CASE(5)
+        PULSAR_TOPK_CASE(6) PULSAR_TOPK_CASE(7) PULSAR_TOPK_CASE(8) PULSAR_TOPK_CASE(9) PULSAR_TOPK_CASE(10)
+        PULSAR_TOPK_CASE(11) PULSAR_TOPK_CASE(12) PULSAR_TOPK_CASE(13) PULSAR_TOPK_CASE(14) PULSAR_TOPK_CASE(15)
+        PULSAR_TOPK_CASE(16)
+#undef PULSAR_TOPK_CASE
+    }
     return launched("top-k");
 }
