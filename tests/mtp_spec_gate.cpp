@@ -411,7 +411,6 @@ static int exact(pulsar_engine *e, int n, const char *only) {
     g_base = e->drafter_ops;
     g_tau0 = e->spec_tau;
     g_depth0 = e->spec_depth;
-    g_curve0 = e->verify_curve;
     /* M0 */
     const bool block = pulsar_engine_drafter(e) == PULSAR_DRAFTER_BLOCK;
     CHECK(pulsar_engine_has_spec_rounds(e) && g_base &&
@@ -425,6 +424,19 @@ static int exact(pulsar_engine *e, int n, const char *only) {
     std::vector<pulsar_tokens> P = prompts(e);
     CHECK(P.size() == 4, "M0 four prompts (%zu)", P.size());
     if (P.size() != 4) return 1;
+    /* L301: the drafter's own numbers run priced -- on the engine's verify curve, or (a gate has no server to profile
+     * one) a synthetic staircase: 16-row blocks, 20 ms a step and 0.25 ms a row, the second block 14 ms more.  The
+     * pick moves only which drafts are verified, so every comparison below must hold priced as unpriced. */
+    struct pulsar_verify_curve *own_curve = NULL;
+    if (!e->verify_curve && pulsar_engine_fused_heads_max(e) > 0u) {
+        double base[PULSAR_SPEC_LOGITS_ROWS + 1] = {0};
+        for (uint32_t r = 1; r <= PULSAR_SPEC_LOGITS_ROWS; r++) base[r] = (r <= 16u ? 20.0 : 34.0) + 0.25 * (double)r;
+        own_curve = pulsar_verify_curve_new(pulsar_engine_fused_heads_max(e), base);
+        e->verify_curve = own_curve;
+        printf("M0: the drafter's own numbers priced on a synthetic staircase verify curve (%u rows)\n",
+               pulsar_engine_fused_heads_max(e));
+    }
+    g_curve0 = e->verify_curve;
     {
         pulsar_engine_set_bank_pool(1);
         pulsar_session *s = NULL;
@@ -592,6 +604,10 @@ static int exact(pulsar_engine *e, int n, const char *only) {
         if (co) pulsar_session_free(co);
     }
     drafter_at_depth(e, 0);
+    if (own_curve) {
+        e->verify_curve = NULL;
+        pulsar_verify_curve_free(own_curve);
+    }
     for (auto &t : P) pulsar_tokens_free(&t);
     return 0;
 }
