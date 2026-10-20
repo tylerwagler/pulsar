@@ -29,7 +29,12 @@
  * a global scratch slot -- the same row function, a stable radix sort in global memory instead of the shared
  * bitonic: the same order (the key is total), so the same bytes.  The full arm (min_p <= 1e-30 without top-k: every
  * finite value a candidate) is known from the knobs, so the launch routes those rows to their own pipeline: the
- * device radix sort, the probabilities and the race over the GPU, only the serial sum and the cut on one thread. */
+ * device radix sort, the probabilities and the race over the GPU, only the serial sum and the cut walked in order.
+ *
+ * A serial sum stays serial -- its bits are the host's order of adds -- but it skips the adds that cannot move it:
+ * s + p == s exactly when p is under half of s's ulp, so each tile of values is tested against the sum before it
+ * (it only grows) and one warp adds the rest in order (warp_walk_adds).  On a real row that is a few hundred adds of
+ * a quarter million. */
 #include "pulsar_cuda_internal.h"
 #include "pulsar_cuda_libm.cuh"
 
@@ -977,6 +982,7 @@ constexpr uint32_t FULL_GROUP = SMP_SLOTS;
 struct full_state {
     uint32_t n, f, status;
     float fs;
+    uint32_t ub_bits;   /* the race estimates' least upper bound (float bits) */
     double pbest[PREP_CHUNKS];
     uint32_t pidx[PREP_CHUNKS];
 };
@@ -1025,6 +1031,7 @@ __global__ void __launch_bounds__(PREP_THREADS) full_keygen_kernel(const __grid_
         a.out[row].probe_p = 0.0f;
         s.st->n = n;
         s.st->f = n;
+        s.st->ub_bits = 0x7f800000u;
         s.st->status = n == 0 ? PULSAR_GPU_SAMPLE_REFUSED_EMPTY : PULSAR_GPU_SAMPLE_OK;
     }
     uint32_t lo, hi;
@@ -1169,7 +1176,55 @@ __global__ void __launch_bounds__(SMP_THREADS) full_chain_kernel(const __grid_co
     }
 }
 
-/* the race over the emitted candidates, each chunk's first strict minimum */
+/* A float estimate of race_score within a relative 1e-5 (the error is a few ulps): u = (m + 0.5) * 2^-53 is exact in
+ * double; -log(u) from u itself under 1/2, from log1p(-(1 - u)) above (so a u near 1 keeps its digits). */
+constexpr float RACE_EST_TOL = 1e-5f;
+__device__ __forceinline__ float race_score_est(uint64_t key, int32_t id, float p) {
+    const uint64_t h = mix64(key ^ ((uint64_t)(uint32_t)id * 0xd1b54a32d192ed03ull));
+    const double u = __dmul_rn(__dadd_rn((double)(h >> 11), 0.5), 1.0 / 9007199254740992.0);
+    const float e = u < 0.5 ? -logf((float)u) : -log1pf(-(float)__dsub_rn(1.0, u));
+    return __fdiv_rn(e, p);
+}
+
+/* the race over the emitted candidates in two passes: the estimates' least upper bound over the row, then the exact
+ * score (double, the host's) only where the estimate's lower bound reaches it -- every other candidate's score is
+ * provably above the minimum, so the first strict minimum is the same.  Pass 1 also writes the probe and the dump. */
+__global__ void __launch_bounds__(PREP_THREADS) full_race_bound_kernel(const __grid_constant__ launch_args a,
+                                                                       const full_group g) {
+    __shared__ float red[PREP_THREADS];
+    const uint32_t j = blockIdx.y, c = blockIdx.x, tid = threadIdx.x;
+    const uint32_t row = g.row[j];
+    const pulsar_gpu_sample_req q = a.req[row];
+    const full_slot s = full_slot_of(a, g, j);
+    if (s.st->status != PULSAR_GPU_SAMPLE_OK) return;
+    row_out_t *o = a.out + row;
+    uint32_t *dist = a.dist ? a.dist + (size_t)row * (1u + 2u * a.dist_cap) : nullptr;
+    const uint32_t f = s.st->f;   /* >= 1: the first candidate is always taken */
+    const float rf = __fdiv_rn(1.0f, s.st->fs);
+    float ub = __uint_as_float(0x7f800000u);
+    uint32_t lo, hi;
+    prep_chunk(f, c, &lo, &hi);
+    for (uint32_t i = lo + tid; i < hi; i += PREP_THREADS) {
+        const float pe = __fmul_rn(s.p[i], rf);
+        const int32_t id = a.id_map ? a.id_map[s.ids[i]] : (int32_t)s.ids[i];
+        if (dist && i < a.dist_cap) {
+            dist[1 + i] = (uint32_t)id;
+            dist[1 + a.dist_cap + i] = __float_as_uint(pe);
+        }
+        if (id == q.probe) o->probe_p = pe;
+        if (!(pe > 0.0f)) continue;
+        ub = fminf(ub, __fmul_rn(race_score_est(q.key, id, pe), 1.0f + RACE_EST_TOL));
+    }
+    red[tid] = ub;
+    __syncthreads();
+    for (uint32_t off = PREP_THREADS / 2u; off > 0; off >>= 1) {
+        if (tid < off) red[tid] = fminf(red[tid], red[tid + off]);
+        __syncthreads();
+    }
+    if (tid == 0) atomicMin(&s.st->ub_bits, __float_as_uint(red[0]));   /* non-negative: bits order as values */
+}
+
+/* pass 2: each chunk's first strict minimum of the exact scores among the candidates that can reach the bound */
 __global__ void __launch_bounds__(PREP_THREADS) full_race_kernel(const __grid_constant__ launch_args a,
                                                                  const full_group g) {
     __shared__ double wd[32];
@@ -1178,24 +1233,18 @@ __global__ void __launch_bounds__(PREP_THREADS) full_race_kernel(const __grid_co
     const uint32_t row = g.row[j];
     const pulsar_gpu_sample_req q = a.req[row];
     const full_slot s = full_slot_of(a, g, j);
-    row_out_t *o = a.out + row;
-    uint32_t *dist = a.dist ? a.dist + (size_t)row * (1u + 2u * a.dist_cap) : nullptr;
     double best = __longlong_as_double(0x7ff0000000000000ll);
     uint32_t besti = UINT32_MAX;
     if (s.st->status == PULSAR_GPU_SAMPLE_OK) {
-        const uint32_t f = s.st->f;   /* >= 1: the first candidate is always taken */
-        const float rf = __fdiv_rn(1.0f, s.st->fs);
+        const uint32_t f = s.st->f;
+        const float rf = __fdiv_rn(1.0f, s.st->fs), bound = __uint_as_float(s.st->ub_bits);
         uint32_t lo, hi;
         prep_chunk(f, c, &lo, &hi);
         for (uint32_t i = lo + tid; i < hi; i += PREP_THREADS) {
             const float pe = __fmul_rn(s.p[i], rf);
-            const int32_t id = a.id_map ? a.id_map[s.ids[i]] : (int32_t)s.ids[i];
-            if (dist && i < a.dist_cap) {
-                dist[1 + i] = (uint32_t)id;
-                dist[1 + a.dist_cap + i] = __float_as_uint(pe);
-            }
-            if (id == q.probe) o->probe_p = pe;
             if (!(pe > 0.0f)) continue;
+            const int32_t id = a.id_map ? a.id_map[s.ids[i]] : (int32_t)s.ids[i];
+            if (__fmul_rn(race_score_est(q.key, id, pe), 1.0f - RACE_EST_TOL) > bound) continue;
             const double sc = race_score(q.key, id, pe);
             if (sc < best) { best = sc; besti = i; }
         }
@@ -1519,6 +1568,7 @@ int pulsar_gpu_sample_rows(const pulsar_gpu_tensor *logits, uint64_t logits_offs
         full_probs_kernel<<<dim3(PREP_CHUNKS, g.n), PREP_THREADS>>>(a, g, prep);
         full_floor_kernel<<<dim3(PREP_CHUNKS, g.n), PREP_THREADS>>>(a, g);
         full_chain_kernel<<<g.n, SMP_THREADS>>>(a, g);
+        full_race_bound_kernel<<<dim3(PREP_CHUNKS, g.n), PREP_THREADS>>>(a, g);
         full_race_kernel<<<dim3(PREP_CHUNKS, g.n), PREP_THREADS>>>(a, g);
         full_final_kernel<<<g.n, 32>>>(a, g);
         if (!cuda_ok(cudaGetLastError(), "device sampler full arm")) return 0;
