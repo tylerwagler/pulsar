@@ -14,10 +14,13 @@ default), on the head's own input -- the trunk mixer's bf16 rows.
   quant    --source DIR --hessian H.pt --k K [--draft] --seed S --out Q.pt
       lm_head (or its draft-vocabulary rows, --draft) [in 2560, out N] -> exllamav3 quantize_exl3 on the GPU; saves the
       packed trellis / suh / svh, the reconstruction (bf16, for grading), the proxy error and the ids (--draft).
-  emit     --base DIR --out DIR [--head Q.pt] [--draft Q.pt]
+  emit     --base DIR --out DIR [--head Q.pt] [--draft Q.pt] | [--qhead FILE]
       a container that IS `base` (every file a symlink) except: --head drops the bf16 lm_head from the shard that held
       it (that shard rewritten, its other tensors verbatim) and adds lm_head.weight in EXL3; --draft adds
       mtp.draft_head.weight + .ids.  The new tensors go in model-qhead.safetensors.  `base` is never written.
+      (L299) --qhead FILE: the heads of ANOTHER container's model-qhead.safetensors, verbatim -- the served heads
+      carried onto a rebuilt base (the same checkpoint and recipe: a container with a block drafter added); the base's
+      bf16 lm_head dropped as --head does when FILE holds lm_head.weight.
 
 The draft head's rows are the engine's draft vocabulary in the engine's order (qwen_draft_vocab, family_qwen.cpp): ids
 [0, QWEN_DRAFT_PREFIX), the first `extra` of src/engine/qwen_draft_vocab.inc's ranked list sorted ascending, then
@@ -169,15 +172,31 @@ def exl3_blob(q):
 
 # ---- emit ---------------------------------------------------------------------------------------------------------
 def cmd_emit(a):
-    import torch
     base, out = os.path.abspath(a.base), os.path.abspath(a.out)
     if out == base or os.path.exists(out):
         raise SystemExit(f'{out} exists or is the base -- a container copy is made fresh, never over another')
-    if not a.head and not a.draft:
-        raise SystemExit('nothing to change: give --head and / or --draft')
+    if not a.head and not a.draft and not a.qhead:
+        raise SystemExit('nothing to change: give --head and / or --draft, or --qhead')
+    if a.qhead and (a.head or a.draft):
+        raise SystemExit('--qhead carries another container\'s heads whole: not with --head / --draft')
     os.makedirs(out)
     top = None
     tensors, entries = {}, []
+    if a.qhead:
+        qh, qoff = st_header(a.qhead)
+        qt = json.loads(qh['__metadata__']['pulsar.tensors'])
+        raw = np.memmap(a.qhead, dtype=np.uint8, mode='r')
+        for k, v in qh.items():
+            if k == '__metadata__':
+                continue
+            if k not in qt:
+                raise SystemExit(f'{a.qhead}: {k} has no pulsar.tensors declaration')
+            entries.append((k, v['dtype'], v['shape'], raw[qoff + v['data_offsets'][0]: qoff + v['data_offsets'][1]]))
+            tensors[k] = qt[k]
+        if 'lm_head.weight' in tensors:
+            top, h, off = find_tensor(base, 'lm_head.weight')
+    if a.head or a.draft:
+        import torch
     if a.head:
         q = torch.load(a.head, weights_only=False)
         if q['draft'] or q['n'] != N_VOCAB:
@@ -220,7 +239,8 @@ def cmd_emit(a):
     write_shard(os.path.join(out, 'model-qhead.safetensors'), entries,
                 {'format': 'pt', 'pulsar.format': 'pulsar-safetensors-v1', 'pulsar.shard_key': 'qhead',
                  'pulsar.tensors': json.dumps(tensors, separators=(',', ':'), sort_keys=True),
-                 'pulsar.qhead': json.dumps({'base': base, 'head': a.head, 'draft': a.draft})})
+                 'pulsar.qhead': json.dumps({'base': base, 'head': a.head, 'draft': a.draft,
+                                             **({'from': os.path.abspath(a.qhead)} if a.qhead else {})})})
     print(f'{out}: {", ".join(f"{k} {v["layout"]}" for k, v in tensors.items())}')
 
 
@@ -242,6 +262,7 @@ def main():
     p.add_argument('--out', required=True)
     p.add_argument('--head')
     p.add_argument('--draft')
+    p.add_argument('--qhead', help='another container\'s model-qhead.safetensors, its heads carried verbatim')
     a = ap.parse_args()
     {'hessian': cmd_hessian, 'quant': cmd_quant, 'emit': cmd_emit}[a.cmd](a)
 

@@ -315,7 +315,9 @@ def build_kv(hf, ctx):
 # the drafter input (--drafter dflash2 DIR, L299): the shared block-drafter input (drafters.py) against this target
 # ---------------------------------------------------------------------------
 DRAFTERS = ("dflash2",)
-_VOCAB_INC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "src", "engine", "qwen_draft_vocab.inc")
+# the engine's draft-vocabulary table (PULSAR_QWEN_DRAFT_VOCAB_INC: test_qwen.py's toy table for its toy vocabulary)
+_VOCAB_INC = os.environ.get("PULSAR_QWEN_DRAFT_VOCAB_INC") or os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "..", "..", "src", "engine", "qwen_draft_vocab.inc")
 
 
 def qwen_draft_vocabulary(eos_id: int, n_vocab: int) -> list:

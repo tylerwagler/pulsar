@@ -15,6 +15,11 @@ an exllamav3-layout EXL3 checkpoint of random trellis / suh / svh, a toy BPE tok
   * split gate/up (turboderp's form) -> gate_proj / up_proj families when the recipe says split
   * GOLDEN: the SHA-256 of every emitted file of the fused and the split build, fixed on the builder before L279's
     refactor (the byte-identity instrument, rule 7; test_deepseek.py holds the DeepSeek pair)
+  * (L299) the DFlash2 block drafter (--drafter dflash2 DIR, drafters.py) on a synthetic BF16 drafter: emit twice
+    byte-identical, verify / audit PASS, a `drafter` shard last, pulsar.drafter "dflash2" and the drafter's config as
+    dflash2.*; every drafter tensor's bind record and layout as the recipe says; the head the target lm_head's
+    draft-vocabulary rows (nvfp4_from_bf16 of exactly those rows) and its ids; refusals: a lilicorr drafter on Qwen,
+    a config key the declaration does not know, a tensor it does not declare
 """
 from __future__ import annotations
 
@@ -234,6 +239,133 @@ def scalar_mxfp8(w):
     return codes, (s + 127).astype(np.uint8)
 
 
+# --------------------------------------------------------------------------- L299: the DFlash2 drafter
+D_TL = [1, 2]       # target_layer_ids
+D_RANK, D_TOPK, D_BLOCK, D_FF = 16, 4, 4, 128
+
+
+def make_dflash2(root, rng):
+    """A toy DFlash2DraftModel checkpoint against make_hf's target (hidden 256, vocab 64, 4 layers): 1 layer, 2 / 1
+    heads x 128, ff 128, the selector at rank 16."""
+    os.makedirs(root, exist_ok=True)
+    cfg = {"architectures": ["DFlash2DraftModel"], "attention_bias": False, "attention_dropout": 0.0,
+           "bos_token_id": 5, "dflash_config": {"block_size": D_BLOCK, "conv_group_size": 16, "conv_kernel_size": 2,
+                                                "mask_token_id": 7, "selector_rank": D_RANK, "selector_top_k": D_TOPK,
+                                                "target_layer_ids": D_TL},
+           "dtype": "bfloat16", "eos_token_id": 5, "head_dim": 128, "hidden_act": "silu", "hidden_size": H,
+           "initializer_range": 0.02, "intermediate_size": D_FF, "is_causal": False,
+           "layer_types": ["sliding_attention"], "max_position_embeddings": 4096, "max_window_layers": 1,
+           "model_type": "qwen3", "num_attention_heads": 2, "num_hidden_layers": 1, "num_key_value_heads": 1,
+           "num_target_layers": L, "pad_token_id": None, "rms_norm_eps": 1e-6,
+           "rope_parameters": {"rope_theta": 10000, "rope_type": "default"}, "sliding_window": 32,
+           "tie_word_embeddings": False, "transformers_version": "5.12.1", "use_cache": False,
+           "use_sliding_window": True, "vocab_size": 64}
+    json.dump(cfg, open(os.path.join(root, "config.json"), "w"))
+    t = {}
+
+    def mat(name, *shape, scale=0.05):
+        t[name] = ("BF16", shape, bf16(rng.standard_normal(shape).astype(np.float32) * scale).tobytes())
+    kp = 2 * 2 * H // 16
+    mat("fc.weight", H, len(D_TL) * H); mat("hidden_norm.weight", H); mat("norm.weight", H)
+    mat("candidate_selector.hidden_projection.weight", D_RANK, H)
+    mat("candidate_selector.predecessor_codebook", 64, D_RANK); mat("candidate_selector.successor_codebook", 64, D_RANK)
+    p = "layers.0."
+    mat(p + "input_layernorm.weight", H); mat(p + "post_attention_layernorm.weight", H)
+    mat(p + "self_attn.q_proj.weight", 256, H); mat(p + "self_attn.k_proj.weight", 128, H)
+    mat(p + "self_attn.v_proj.weight", 128, H); mat(p + "self_attn.o_proj.weight", H, 256)
+    mat(p + "self_attn.q_norm.weight", 128); mat(p + "self_attn.k_norm.weight", 128)
+    for c in ("attention_conv", "mlp_conv"):
+        mat(p + c + ".base_kernel", 2, 2, H); mat(p + c + ".kernel_projection.weight", kp, H)
+    mat(p + "mlp.gate_proj.weight", D_FF, H); mat(p + "mlp.up_proj.weight", D_FF, H)
+    mat(p + "mlp.down_proj.weight", H, D_FF)
+    write_st(os.path.join(root, "model.safetensors"), t)
+    return t, cfg
+
+
+def dflash2_tests(tmp, hf_dir, hf_t, ex, man):
+    print("the DFlash2 block drafter (--drafter dflash2, L299):")
+    dd = os.path.join(tmp, "dflash2")
+    dt, dcfg = make_dflash2(dd, np.random.default_rng(299))
+    inc = os.path.join(tmp, "toy_draft_vocab.inc")       # the toy vocabulary's draft table: ids 0..2, 4, then 5..63
+    open(inc, "w").write("#define QWEN_DRAFT_PREFIX 3u\n#define QWEN_DRAFT_EXTRA_DEFAULT 1u\n"
+                         "static const int32_t k_qwen_draft_extra[] = {\n    4, 3,\n};\n")
+    os.environ["PULSAR_QWEN_DRAFT_VOCAB_INC"] = inc
+    ids = [0, 1, 2, 4] + list(range(5, 64))
+    recipe = os.path.join(HERE, "format-maps", "qwen38fn-u-e4-d5-dflash2.json")
+    common = ["--hf", hf_dir, "--exl3", ex, "--recipe", recipe, "--ple-rows", man, "--drafter", "dflash2", dd]
+    o1, o2 = os.path.join(tmp, "out-df2-1"), os.path.join(tmp, "out-df2-2")
+    ok1, out1 = run("build.py", "emit", *common, "--out", o1, "--all")
+    ok2, _ = run("build.py", "emit", *common, "--out", o2, "--all")
+    files = sorted(os.listdir(o1)) if ok1 else []
+    same = ok1 and ok2 and files == sorted(os.listdir(o2)) and all(
+        open(os.path.join(o1, f), "rb").read() == open(os.path.join(o2, f), "rb").read() for f in files)
+    check(same and len(files) == L + 4, f"emit --all twice, byte-identical ({len(files)} files: + the drafter shard)"
+          + ("" if ok1 else ": " + out1[-400:]))
+    if not ok1:
+        return
+    ok, out = run("build.py", "verify", *common, "--out", o1, "--all")
+    check(ok and "failing: 0" in out, "verify --all PASS (the nvfp4 entries re-produced from the BF16 source)")
+    ok, out = run("build.py", "audit", "--out", o1)
+    check(ok and "AUDIT PASS" in out, "audit PASS")
+    shards = sorted(f for f in files if f.endswith(".safetensors"))
+
+    def header(f):
+        with open(os.path.join(o1, f), "rb") as g:
+            (n,) = struct.unpack("<Q", g.read(8))
+            return json.loads(g.read(n)), 8 + n
+    h0, _ = header(shards[0])
+    kv = {e["key"]: e["value"] for e in json.loads(h0["__metadata__"]["pulsar.kv"])}
+    hd, off = header(shards[-1])
+    decl = json.loads(hd["__metadata__"]["pulsar.tensors"])
+    check(hd["__metadata__"]["pulsar.shard_key"] == "drafter" and kv.get("pulsar.drafter") == "dflash2"
+          and kv.get("pulsar.source.drafter") == "dflash2" and kv.get("dflash2.dflash_config.selector_rank") == D_RANK
+          and kv.get("dflash2.rope_parameters.rope_theta") == 10000
+          and kv.get("dflash2.dflash_config.target_layer_ids") == {"__array__": "u32", "n": 2, "v": D_TL}
+          and "dflash2.dtype" not in kv and "dflash2.architectures" not in kv,
+          "a `drafter` shard last; pulsar.drafter dflash2, its config under dflash2.* (dflash_config / rope flattened)")
+    want = {"drafter.fc.weight": ("nvfp4", "fc", "drafter", None),
+            "drafter.lm_head.weight": ("nvfp4", "head", "drafter", None),
+            "drafter.lm_head.ids": ("i32", "head_ids", "drafter", None),
+            "drafter.norm.weight": ("bf16", "out_norm", "drafter", None),
+            "drafter.layers.0.self_attn.k_proj.weight": ("nvfp4", "attn_k", "drafter", 0),
+            "drafter.layers.0.mlp_conv.kernel_projection.weight": ("nvfp4", "mlp_conv_proj", "drafter", 0),
+            "drafter.layers.0.attention_conv.base_kernel": ("bf16", "attn_conv_base", "drafter", 0),
+            "drafter.candidate_selector.hidden_projection.weight": ("bf16", "hidden_proj", "selector", None),
+            "drafter.candidate_selector.successor_codebook": ("bf16", "succ_codebook", "selector", None)}
+    bad = [n for n, (lay, role, block, layer) in want.items()
+           if n not in decl or decl[n]["layout"] != lay or decl[n].get("role") != role or decl[n].get("block") != block
+           or decl[n].get("layer") != layer]
+    check(not bad and len(decl) == 6 + 15 + 2, f"the drafter's {len(decl)} tensors: bind records and layouts as "
+          f"declared (wrong: {bad})")
+
+    def raw(name):
+        a, b = hd[name]["data_offsets"]
+        with open(os.path.join(o1, shards[-1]), "rb") as g:
+            g.seek(off + a)
+            return g.read(b - a)
+    head_rows = np.frombuffer(hf_t["lm_head.weight"][2], dtype="<u2").reshape(64, H)[ids]
+    check(raw("drafter.lm_head.weight") == P.nvfp4_from_bf16(head_rows.tobytes(), len(ids), H)
+          and np.frombuffer(raw("drafter.lm_head.ids"), "<i4").tolist() == ids,
+          f"the head: nvfp4_from_bf16 of the target lm_head's {len(ids)} draft-vocabulary rows, byte for byte; the ids")
+    ok, out = run("build.py", "plan", "--hf", hf_dir, "--exl3", ex, "--recipe", recipe, "--ple-rows", man, "--drafter",
+                  "lilicorr", dd, expect_fail=True, contains="the qwen4_exp build reads ['dflash2']")
+    check(ok, "--drafter lilicorr on a Qwen build -> refused by name")
+    bad_d = os.path.join(tmp, "dflash2-bad")
+    shutil.copytree(dd, bad_d)
+    json.dump(dict(dcfg, rope_scaling={"factor": 4.0}), open(os.path.join(bad_d, "config.json"), "w"))
+    ok, out = run("build.py", "plan", "--hf", hf_dir, "--exl3", ex, "--recipe", recipe, "--ple-rows", man, "--drafter",
+                  "dflash2", bad_d, expect_fail=True, contains="'rope_scaling' is neither written nor ignored")
+    check(ok, "a drafter config key the declaration does not know -> refused by name")
+    json.dump(dcfg, open(os.path.join(bad_d, "config.json"), "w"))
+    t2 = dict(dt)
+    t2["layers.0.extra.weight"] = ("BF16", [4], bf16(np.zeros(4, np.float32)).tobytes())
+    write_st(os.path.join(bad_d, "model.safetensors"), t2)
+    ok, out = run("build.py", "plan", "--hf", hf_dir, "--exl3", ex, "--recipe", recipe, "--ple-rows", man, "--drafter",
+                  "dflash2", bad_d, expect_fail=True, contains="not declared ['layers.0.extra.weight']")
+    check(ok, "a drafter tensor the declaration does not declare -> refused by name")
+    del os.environ["PULSAR_QWEN_DRAFT_VOCAB_INC"]
+
+
 def main():
     rng = np.random.default_rng(251)
     print("mxfp8_lt_from_bf16:")
@@ -444,6 +576,7 @@ def main():
         ok, out = run("build.py", "plan", "--hf", hf_dir, "--exl3", ex, "--recipe", rp, "--ple-rows", man,
                       expect_fail=True, contains="missing from the EXL3 checkpoint")
         check(ok, "recipe says split, the source is fused -> refused")
+        dflash2_tests(tmp, hf_dir, hf_t, ex, man)
     finally:
         shutil.rmtree(tmp)
     print(f"test_qwen: {'PASS' if not FAILS else 'FAIL'} ({len(FAILS)} failing)")
