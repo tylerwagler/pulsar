@@ -736,7 +736,12 @@ int pulsar_session::save_payload(FILE *fp, char *err, size_t errlen) {
     uint32_t spec_rec[KVP_SPEC_U32];
     kvp_spec_pack(&s->spec, spec_rec);
     for (uint32_t i = 0; rc == 0 && i < KVP_SPEC_U32; i++) rc = payload_write_u32(&io, spec_rec[i], err, errlen);
-    if (rc == 0) rc = payload_write_bytes(&io, s->logits, (uint64_t)p.width * sizeof(float), err, errlen);
+    const float *live = rc == 0 ? s->live_host() : NULL;   /* L302: the payload carries the live row */
+    if (rc == 0 && !live) {
+        snprintf(err, errlen, "payload: the live row could not be read from the device");
+        rc = 1;
+    }
+    if (rc == 0) rc = payload_write_bytes(&io, live, (uint64_t)p.width * sizeof(float), err, errlen);
     uint8_t *buf = (uint8_t *)xmalloc(PULSAR_SESSION_IO_CHUNK);
     if (rc == 0 && p.G)
         rc = payload_write_tensor_span(&io, slab, slot_off, st->slot_bytes, buf, PULSAR_SESSION_IO_CHUNK, err, errlen);
@@ -883,8 +888,9 @@ int pulsar_session::load_payload(FILE *fp, uint64_t payload_bytes, char *err, si
     token_vec_free(&s->checkpoint);
     s->checkpoint = toks;
     s->live_images = imgs;
-    memcpy(s->logits, logits, (size_t)width * sizeof(float));
+    const bool live_ok = s->live_from_host(logits);
     free(logits);
+    if (!live_ok) return fail();
     s->prefill_frontier = (int)PF;   /* the session's mirror (DeepSeek's own: L195), as a fused prompt chunk sets it */
     s->checkpoint_valid = true;
     s->logits_stale = false;

@@ -23,10 +23,8 @@
  *             computes (vLLM folds 1/mup into addmm's alpha, beta 0) -- so moving
  *             the scale into a head arm's epilogue later is byte-identical.
  *             -inf is the padding mask every consumer already honours: the
- *             sampler, the argmax, the device min-p prefilter and the logprobs
- *             all skip a non-finite logit (tokenizer.cpp sample_argmax /
- *             pulsar_sample_dist_build, pulsar_cuda_dspark.cu
- *             minp_prefilter_rows_kernel, session.cpp), so a pad id can never be
+ *             sampler, its argmax and its logprobs all skip a non-finite
+ *             logit (pulsar_cuda_sampler.cu), so a pad id can never be
  *             sampled, ranked or scored. */
 #ifndef PULSAR_CUDA_HEAD_H
 #define PULSAR_CUDA_HEAD_H

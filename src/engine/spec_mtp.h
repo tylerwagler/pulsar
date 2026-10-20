@@ -85,9 +85,10 @@ typedef struct pulsar_mtp_ops {
     pulsar_gpu_tensor *(*out_rows)(pulsar_session *s);
     /** One module step.  false (said) = refused or failed; the lane drops the rows' banks' parked rows. */
     bool (*forward)(pulsar_session *s, const pulsar_mtp_step *m);
-    /** The sampled proposal q of a headed row under the request's params, ids in the vocabulary. */
-    bool (*dist)(pulsar_session *s, const float *row, float temperature, int top_k, float top_p, float min_p,
-                 pulsar_sample_dist *q);
+    /** L302: the last module step's headed rows on the device -- row r at r * head_width floats -- that a sampled
+     *  chain draws its drafts from (THE sampler, the request's params), and *id_map the token id of each row index
+     *  (int32 [head_width]; NULL = the index is the id). */
+    const pulsar_gpu_tensor *(*q_rows)(pulsar_session *s, const pulsar_gpu_tensor **id_map);
     /** Optional.  A chain is about to write draft rows on `bank`'s drafter slot into state position addressing cannot
      *  undo: keep it (Qwen: the index stage); stage_restore puts it back before the bank's next true rows. */
     bool (*stage_save)(pulsar_session *s, uint32_t bank);

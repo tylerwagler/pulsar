@@ -335,11 +335,18 @@ static bool mtp_draft_chains(pulsar_session *s, const uint32_t *banks, uint64_t 
     }
     bool any_sampled = false;
     for (uint32_t i = 0; i < n; i++) any_sampled |= c[i].live && !c[i].copy && c[i].sampled;
-    /* L289: the picks are the device's; the rows come back only when a chain samples (its q) */
-    float *L = any_sampled ? s->driver->host_logits : NULL;   /* the driver's verify rows, idle while the chain drafts */
+    /* L289: the picks are the device's; L302: so are the sampled chains' draws (THE sampler over the headed rows, at
+     * each draft's key), one launch a step -- the rows never come back */
+    const pulsar_gpu_tensor *q_map = NULL;
+    const pulsar_gpu_tensor *q_rows = any_sampled ? ops->q_rows(s, &q_map) : NULL;
+    if (any_sampled && !q_rows) {
+        snprintf(err, errlen, "%s: the MTP head's rows are not on the device", ARCH(s));
+        return false;
+    }
+    int32_t drawn[PULSAR_DRIVER_HEADS_MAX];
     pulsar_mtp_pick pick[PULSAR_DRIVER_HEADS_MAX];
     /* position j of chain i from its row's pick: its confidence (whether it is the chain's last), then its draft:
-     * the pick (greedy) or a draw from q over the row in L (sampled) */
+     * the pick (greedy) or its draw from q over its row (sampled, drawn[i] by the step's launch) */
     auto draft = [&](uint32_t i, uint32_t j) -> bool {
         if (c[i].copy) {   /* its drafts are the copy; step 1 wrote its module row */
             c[i].live = false;
@@ -347,7 +354,6 @@ static bool mtp_draft_chains(pulsar_session *s, const uint32_t *banks, uint64_t 
         }
         spec_redraft_req *q = reqs[i];
         const pulsar_mtp_pick &pk = pick[c[i].row];
-        const float *row = L ? L + (size_t)c[i].row * l->head_width : NULL;
         q->conf[j - 1] = pk.conf;
         q->keep = j;
         c[i].run *= pk.conf;
@@ -358,13 +364,8 @@ static bool mtp_draft_chains(pulsar_session *s, const uint32_t *banks, uint64_t 
             if (ops->prefetch) ops->prefetch(s, c[i].b, &q->refined[j], 1, false);
             return true;
         }
-        pulsar_sample_dist qd{};
-        if (!ops->dist(s, row, q->temperature, q->top_k, q->top_p, q->min_p, &qd)) return false;
-        /* draft j sits j places past the carry: the key the target's draw for that token reads */
-        const int d = pulsar_sample_dist_draw(&qd, pulsar_sample_key(*rngs[i], j));
-        pulsar_sample_dist_free(&qd);
-        if (d < 0) return false;
-        q->refined[j] = (int32_t)d;
+        if (drawn[i] < 0) return false;
+        q->refined[j] = drawn[i];
         if (ops->prefetch) ops->prefetch(s, c[i].b, &q->refined[j], 1, false);
         return true;
     };
@@ -393,9 +394,32 @@ static bool mtp_draft_chains(pulsar_session *s, const uint32_t *banks, uint64_t 
         if (headed) {
             ms.head_n = m;
             ms.pick = pick;
-            ms.logits = L;
         }
         ok = step(s, ms);
+        /* the sampled live chains' drafts at this step, one launch: chain i's row, the key of the token it proposes
+         * (draft j sits j places past the carry: the key the target's draw for that token reads) */
+        if (ok && headed && any_sampled) {
+            pulsar_gpu_sample_req dq[PULSAR_DRIVER_HEADS_MAX];
+            pulsar_gpu_sample_out dout[PULSAR_DRIVER_HEADS_MAX];
+            uint32_t drow[PULSAR_DRIVER_HEADS_MAX], who[PULSAR_DRIVER_HEADS_MAX], nd = 0;
+            for (uint32_t i = 0; i < n; i++) {
+                drawn[i] = -1;
+                if (!c[i].live || c[i].copy || !c[i].sampled) continue;
+                const spec_redraft_req *q = reqs[i];
+                pulsar_gpu_sample_req &r = dq[nd];
+                memset(&r, 0, sizeof(r));
+                r.temperature = q->temperature;
+                r.top_k = q->top_k;
+                r.top_p = q->top_p;
+                r.min_p = q->min_p;
+                r.key = pulsar_sample_key(*rngs[i], j);
+                r.probe = -1;
+                drow[nd] = c[i].row;
+                who[nd++] = i;
+            }
+            if (nd > 0) ok = s->draw_rows_width(q_rows, l->head_width, q_map, drow, nd, dq, dout);
+            for (uint32_t k = 0; ok && k < nd; k++) drawn[who[k]] = dout[k].token;
+        }
         if (j == 1) {
             for (uint32_t i = 0; i < n; i++) {
                 if (!c[i].live) continue;

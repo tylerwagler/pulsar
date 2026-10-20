@@ -1054,7 +1054,14 @@ static pulsar_session *session_build(pulsar_engine *e, int ctx_size, uint32_t n_
     s->ctx_size = ctx_size;
     s->prefill_cap = pulsar_prefill_cap_for_prompt(ctx_size, e->prefill_chunk);
     s->logits = (float *)xmalloc((size_t)e->logits_width() * sizeof(s->logits[0]));
+    /* L302: the live row, each bank's, and the device sampler's buffers -- the session's draws happen there */
+    if (!pulsar_session_dev_alloc(s, n_banks)) {
+        free(s->logits);
+        free(s);
+        return NULL;
+    }
     if (e->family->session->create(s, n_banks) != 0) {
+        pulsar_session_dev_free(s);
         free(s->logits);
         free(s);
         return NULL;
@@ -1181,9 +1188,8 @@ void pulsar_session::destroy() {
     if (!s) return;
     s->engine->family->session->destroy(s);
     token_vec_free(&s->checkpoint);
-    pulsar_sample_scratch_free(&s->sample_scratch);
     s->bank_carry_free();
-    free(s->spec_row_scratch);
+    pulsar_session_dev_free(s);
     free(s->logits);
     free(s);
 }
@@ -1332,167 +1338,6 @@ void pulsar_session::prefix_match(const pulsar_tokens *prompt,
     pulsar_tokens_prefix_match(s->engine,
                                s->checkpoint.v, s->checkpoint.len,
                                prompt->v, prompt->len, out);
-}
-
-
-int pulsar_session::argmax() {
-    auto *s = this;
-    return sample_argmax(s->logits, (uint32_t)s->engine->logits_width());
-}
-
-
-int pulsar_session::argmax_excluding(int excluded_id) {
-    auto *s = this;
-    if (!s || !s->logits) return -1;
-    /* THE row-max rule (sample_argmax): first finite value seeds, lowest id
-     * wins a tie, -1 when nothing is finite. */
-    int best = -1;
-    float best_logit = 0.0f;
-    for (uint32_t i = 0, nv = (uint32_t)s->engine->logits_width(); i < nv; i++) {
-        if ((int)i == excluded_id) continue;
-        const float v = s->logits[i];
-        if (!isfinite(v)) continue;
-        if (best < 0 || v > best_logit) {
-            best = (int)i;
-            best_logit = v;
-        }
-    }
-    return best;
-}
-
-
-int pulsar_sample_logits(const float *logits, int n_vocab, float temperature,
-                      int top_k, float top_p, float min_p, uint64_t *rng) {
-    if (!logits || n_vocab <= 0) return PULSAR_SAMPLE_REFUSED;   /* was token 0 (L188) */
-    /* No session here, so no scratch to borrow: this public entry keeps the
-     * malloc path. Session callers below pass their own. */
-    if (!rng) return PULSAR_SAMPLE_REFUSED;
-    const int tok = sample_top_p_min_p(logits, (uint32_t)n_vocab, temperature, top_k, top_p,
-                                       min_p, pulsar_sample_key(*rng, 0u), NULL);
-    if (tok >= 0) pulsar_sample_advance(rng, 1u);   /* the drawn token is the stream's next (L288 sdet) */
-    return tok;
-}
-
-
-int pulsar_session::sample(float temperature, int top_k, float top_p, float min_p, uint64_t *rng) {
-    auto *s = this;
-    if (!rng) return PULSAR_SAMPLE_REFUSED;
-    const int tok = sample_top_p_min_p(s->logits, (uint32_t)s->engine->logits_width(), temperature, top_k, top_p,
-                                       min_p, pulsar_sample_key(*rng, 0u), &s->sample_scratch);
-    if (tok >= 0) pulsar_sample_advance(rng, 1u);
-    return tok;
-}
-
-
-/* Row-based twins of the two session logprob readers below, in the same
- * relation pulsar_sample_logits has to pulsar_session::sample: score a
- * caller-supplied logits row instead of the session's own.  The batched decode
- * entries (pulsar_session_decode_multiseq / _mixed) hand each bank's row back to
- * the caller and deliberately leave s->logits alone, so for those steps the
- * returned row is the ONLY place that position's distribution exists.  Same
- * arithmetic as before, moved verbatim — the session methods now delegate. */
-int pulsar_logits_top_logprobs(const float *logits, int n_vocab,
-                            pulsar_token_score *out, int k) {
-    if (!logits || !out || k <= 0 || n_vocab <= 0) return 0;
-    if (k > n_vocab) k = n_vocab;
-    for (int i = 0; i < k; i++) {
-        out[i].id = -1;
-        out[i].logit = PULSAR_NEG_INF;
-        out[i].logprob = PULSAR_NEG_INF;
-    }
-
-    /* Row max by THE rule (sample_argmax): the first finite value seeds.  A
-     * -1e30 seed is finite, so an all-non-finite row used to pass the
-     * isfinite(max_logit) check below and score against log(0). */
-    float max_logit = 0.0f;
-    bool have_max = false;
-    for (int i = 0; i < n_vocab; i++) {
-        const float v = logits[i];
-        if (!isfinite(v)) continue;
-        if (!have_max || v > max_logit) {
-            max_logit = v;
-            have_max = true;
-        }
-        for (int j = 0; j < k; j++) {
-            if (out[j].id < 0 || v > out[j].logit) {
-                for (int l = k - 1; l > j; l--) out[l] = out[l - 1];
-                out[j].id = i;
-                out[j].logit = v;
-                break;
-            }
-        }
-    }
-    if (!have_max) return 0;
-
-    double sum = 0.0;
-    for (int i = 0; i < n_vocab; i++) {
-        const float v = logits[i];
-        if (isfinite(v)) sum += exp((double)v - (double)max_logit);
-    }
-    const double logsum = (double)max_logit + log(sum);
-    for (int i = 0; i < k && out[i].id >= 0; i++) {
-        out[i].logprob = isfinite(out[i].logit) ? (float)((double)out[i].logit - logsum) : PULSAR_NEG_INF;
-    }
-    return k;
-}
-
-
-int pulsar_logits_token_logprob(const float *logits, int n_vocab, int token,
-                             pulsar_token_score *out) {
-    if (!logits || !out || n_vocab <= 0 || token < 0 || token >= n_vocab) return 0;
-
-    float max_logit = 0.0f;
-    bool have_max = false;
-    for (int i = 0; i < n_vocab; i++) {
-        const float v = logits[i];
-        if (!isfinite(v)) continue;
-        if (!have_max || v > max_logit) {
-            max_logit = v;
-            have_max = true;
-        }
-    }
-    if (!have_max) return 0;
-
-    double sum = 0.0;
-    for (int i = 0; i < n_vocab; i++) {
-        const float v = logits[i];
-        if (isfinite(v)) sum += exp((double)v - (double)max_logit);
-    }
-    const double logsum = (double)max_logit + log(sum);
-    out->id = token;
-    out->logit = logits[token];
-    out->logprob = isfinite(out->logit) ? (float)((double)out->logit - logsum) : PULSAR_NEG_INF;
-    return 1;
-}
-
-
-int pulsar_session::top_logprobs(pulsar_token_score *out, int k) {
-    auto *s = this;
-    if (!s) return 0;
-    return pulsar_logits_top_logprobs(s->logits, s->engine->logits_width(), out, k);
-}
-
-
-int pulsar_session::token_logprob(int token, pulsar_token_score *out) {
-    auto *s = this;
-    if (!s) return 0;
-    return pulsar_logits_token_logprob(s->logits, s->engine->logits_width(), token, out);
-}
-
-
-int pulsar_session::copy_logits(float *out, int cap) {
-    auto *s = this;
-    if (!s || !out || cap < s->engine->logits_width()) return 0;
-    memcpy(out, s->logits, (size_t)s->engine->logits_width() * sizeof(out[0]));
-    return s->engine->logits_width();
-}
-
-
-int pulsar_session::set_logits(const float *logits, int n) {
-    auto *s = this;
-    if (!s || !logits || n != s->engine->logits_width()) return 1;
-    memcpy(s->logits, logits, (size_t)s->engine->logits_width() * sizeof(s->logits[0]));
-    return 0;
 }
 
 
