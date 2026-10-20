@@ -454,13 +454,12 @@ void bench(uint32_t n_vocab, pulsar_gpu_tensor *dl, pulsar_gpu_tensor *scratch, 
     }
     pulsar_gpu_tensor *lp = pulsar_gpu_tensor_alloc(ROWS * sizeof(pulsar_gpu_logprob_row));
     for (uint32_t nr : {1u, 5u, 33u}) {
-        std::vector<uint32_t> mrows(nr, PULSAR_GPU_SAMPLE_NO_MASK);
         const int it = 20;
-        pulsar_gpu_logprobs_rows(dl, 0, n_vocab, n_vocab, nr, nullptr, 0, mrows.data(), nullptr, 0, 0, 20, lp);
+        pulsar_gpu_logprobs_rows(dl, 0, n_vocab, n_vocab, nr, nullptr, 0, nullptr, nullptr, 0, 0, 20, lp);
         pulsar_gpu_synchronize();
         const auto t0 = std::chrono::steady_clock::now();
         for (int i = 0; i < it; i++)
-            pulsar_gpu_logprobs_rows(dl, 0, n_vocab, n_vocab, nr, nullptr, 0, mrows.data(), nullptr, 0, 0, 20, lp);
+            pulsar_gpu_logprobs_rows(dl, 0, n_vocab, n_vocab, nr, nullptr, 0, nullptr, nullptr, 0, 0, 20, lp);
         pulsar_gpu_synchronize();
         const double us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count() / it;
         printf("  bench V=%u %-28s %2u rows: %8.1f us a launch\n", n_vocab, "logprobs top 20", nr, us);

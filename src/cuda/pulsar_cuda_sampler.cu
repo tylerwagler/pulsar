@@ -29,12 +29,11 @@
  * a global scratch slot -- the same row function, a stable radix sort in global memory instead of the shared
  * bitonic: the same order (the key is total), so the same bytes.  The full arm (min_p <= 1e-30 without top-k: every
  * finite value a candidate) is known from the knobs, so the launch routes those rows to their own pipeline: the
- * device radix sort, the probabilities and the race over the GPU, only the serial sum and the cut walked in order.
+ * device radix sort, the probabilities, the sum, the cut and the race over the GPU.
  *
- * A serial sum stays serial -- its bits are the host's order of adds -- but it skips the adds that cannot move it:
- * s + p == s exactly when p is under half of s's ulp, so each tile of values is tested against the sum before it
- * (it only grows) and one warp adds the rest in order (warp_walk_adds).  On a real row that is a few hundred adds of
- * a quarter million. */
+ * The host's long serial sums (the id-order sum over a whole row, the full arm's sorted one, the logprob scorer's
+ * double one) keep their bits but not their seriality: block_serial_sum runs them as integer scans on the running
+ * sum's ulp grid, and only the adds that leave a binade or round a tie run one at a time. */
 #include "pulsar_cuda_internal.h"
 #include "pulsar_cuda_libm.cuh"
 
@@ -289,16 +288,24 @@ struct launch_args {
     uint32_t dist_cap;
 };
 
+/* block_serial_sum's shared state */
+template <typename T>
+struct serial_sum_smem {
+    unsigned long long wsum[32];
+    uint32_t wmin[32];
+    T s;
+    uint32_t i0, stop;
+};
+
 /* The shared memory of a row: the THREADS-wide scratch and (row kernel) the candidate store. */
 template <uint32_t THREADS>
 struct row_smem {
     float redv[THREADS];
     int32_t redi[THREADS];
     uint32_t redu[THREADS];
-    float tile[2][THREADS];   /* the id-order sum's tiles: one tested and walked while the next is computed */
-    uint32_t words[32];       /* a tile's significant adds, a bit each */
     uint64_t keys[SMP_CAP];
     float probs[SMP_CAP];
+    serial_sum_smem<float> ssum;
     double redd[32];
     uint32_t redw[32];
     uint32_t hist[256];
@@ -665,40 +672,141 @@ __device__ __forceinline__ float serial_sum_from(float s, const float *v, uint32
 }
 __device__ __forceinline__ float serial_sum(const float *p, uint32_t n) { return serial_sum_from(0.0f, p, n); }
 
-/* Half an ulp of a non-negative running sum s, rounded down to a float (0 where s is subnormal, zero or not finite):
- * s + p == s for every p < this, so such an add can be skipped without changing a bit. */
-__device__ __forceinline__ float sum_half_ulp(float s) {
-    const uint32_t e = (__float_as_uint(s) >> 23) & 0xffu;
-    return e < 255u && e > 24u ? __uint_as_float((e - 24u) << 23) : 0.0f;
-}
+/* ---- THE serial sum, in parallel and to the bit ----------------------------------------------------------------
+ *
+ * The host summed non-negative values one at a time in round-to-nearest (float in the sampler, double in the logprob
+ * scorer).  While the running sum s stays inside one binade its representable values are the multiples of one ulp u,
+ * s = m * u (m below `top`, 2^24 or 2^53; the subnormals share the lowest normal binade's u), so s + p rounds to
+ * (m + rint(p / u)) * u -- integer arithmetic, which a block scan does in any order.  Two cases are not that: a value
+ * exactly halfway between grid points (the rounding's tie goes to an even m + k, which depends on m) and the add
+ * that takes the sum out of its binade (the next grid is coarser).  Both are taken serially, by the hardware add,
+ * and the scan restarts after them on the sum's new grid.  A sum crosses a binade a few dozen times at most, and an
+ * exact tie is rare, so a row costs about one scan pass. */
 
-/* The same for a double sum: 0 where s is subnormal, zero or not finite. */
-__device__ __forceinline__ double sum_half_ulp(double s) {
-    const uint64_t e = ((uint64_t)__double_as_longlong(s) >> 52) & 0x7ffu;
-    return e < 2047u && e > 53u ? __longlong_as_double((long long)((e - 53u) << 52)) : 0.0;
-}
+template <typename T> struct sum_grid_traits;
+template <> struct sum_grid_traits<float> {
+    static constexpr uint32_t MANT = 23u, BIAS = 127u, EMAX = 255u;
+    static __device__ __forceinline__ uint64_t bits(float v) { return __float_as_uint(v); }
+    static __device__ __forceinline__ float add(float a, float b) { return __fadd_rn(a, b); }
+};
+template <> struct sum_grid_traits<double> {
+    static constexpr uint32_t MANT = 52u, BIAS = 1023u, EMAX = 2047u;
+    static __device__ __forceinline__ uint64_t bits(double v) { return (uint64_t)__double_as_longlong(v); }
+    static __device__ __forceinline__ double add(double a, double b) { return __dadd_rn(a, b); }
+};
 
-__device__ __forceinline__ float add_rn(float a, float b) { return __fadd_rn(a, b); }
-__device__ __forceinline__ double add_rn(double a, double b) { return __dadd_rn(a, b); }
-
-/* Warp 0: the adds a tile's words mark, in index order (word w bit b is value w * 32 + b), onto s; every lane
- * returns the sum. */
+/* s's grid: s = m * 2^-k exactly, m < 2^(MANT + 1); finite false for a NaN or infinite s */
 template <typename T>
-__device__ __forceinline__ T warp_walk_adds(T s, const T *vals, const uint32_t *words, uint32_t n_words) {
-    const uint32_t lane = threadIdx.x & 31u;
-    const uint32_t mine = lane < n_words ? words[lane] : 0u;
-    uint32_t nz = __ballot_sync(0xffffffffu, mine != 0u);
-    while (nz) {
-        const uint32_t w = __ffs(nz) - 1u;
-        nz &= nz - 1u;
-        uint32_t bits = __shfl_sync(0xffffffffu, mine, w);
-        while (bits) {
-            const uint32_t b = __ffs(bits) - 1u;
-            bits &= bits - 1u;
-            s = add_rn(s, vals[w * 32u + b]);
-        }
+struct sum_grid {
+    bool finite;
+    int k;
+    uint64_t m;
+    __device__ __forceinline__ sum_grid(T s) {
+        typedef sum_grid_traits<T> tr;
+        const uint64_t b = tr::bits(s);
+        const uint32_t e = (uint32_t)(b >> tr::MANT) & tr::EMAX;
+        const uint64_t mant = b & ((1ull << tr::MANT) - 1u);
+        finite = e != tr::EMAX;
+        m = e ? mant | (1ull << tr::MANT) : mant;
+        k = (int)(tr::BIAS + tr::MANT) - (int)(e ? e : 1u);
     }
-    return s;
+    __device__ __forceinline__ T value(uint64_t mm) const { return (T)ldexp((double)mm, -k); }
+};
+
+/* Block-wide inclusive scan of q (THREADS threads). */
+template <uint32_t THREADS>
+__device__ __forceinline__ uint64_t block_scan_u64(uint64_t q, unsigned long long *wsum) {
+    const uint32_t lane = threadIdx.x & 31u, warp = threadIdx.x >> 5;
+    uint64_t v = q;
+    for (uint32_t off = 1; off < 32u; off <<= 1) {
+        const uint64_t o = __shfl_up_sync(0xffffffffu, v, off);
+        if (lane >= off) v += o;
+    }
+    if (lane == 31u) wsum[warp] = v;
+    __syncthreads();
+    if (warp == 0) {
+        uint64_t w = lane < THREADS / 32u ? wsum[lane] : 0u;
+        for (uint32_t off = 1; off < 32u; off <<= 1) {
+            const uint64_t o = __shfl_up_sync(0xffffffffu, w, off);
+            if (lane >= off) w += o;
+        }
+        if (lane < THREADS / 32u) wsum[lane] = w;
+    }
+    __syncthreads();
+    const uint64_t r = v + (warp ? wsum[warp - 1u] : 0u);
+    __syncthreads();
+    return r;
+}
+
+/* The block's least `c` (THREADS where no thread has one). */
+template <uint32_t THREADS>
+__device__ __forceinline__ uint32_t block_min_u32(uint32_t c, uint32_t *wmin) {
+    const uint32_t lane = threadIdx.x & 31u, warp = threadIdx.x >> 5;
+    c = __reduce_min_sync(0xffffffffu, c);
+    if (lane == 0) wmin[warp] = c;
+    __syncthreads();
+    uint32_t r = THREADS;
+    for (uint32_t w = 0; w < THREADS / 32u; w++) r = min(r, wmin[w]);
+    __syncthreads();
+    return r;
+}
+
+/* The serial round-to-nearest sum of value(0), value(1), ... value(n - 1), stopped after the first i whose prefix
+ * satisfies pred (*stop_at = i, else UINT32_MAX).  value(i, k) may return 0 for a value it proves under half the
+ * current grid's ulp 2^-k (it rounds away; the grid only coarsens) without computing it.  Every thread returns the
+ * sum. */
+template <typename T, uint32_t THREADS, typename V, typename P>
+__device__ T block_serial_sum(uint32_t n, V value, P pred, uint32_t *stop_at, serial_sum_smem<T> &sm) {
+    typedef sum_grid_traits<T> tr;
+    constexpr uint64_t TOP = 1ull << (tr::MANT + 1u);
+    constexpr double QMAX = (double)TOP;   /* any value this large leaves the binade: the scan only needs to see it */
+    const uint32_t tid = threadIdx.x;
+    if (tid == 0) { sm.s = T(0); sm.i0 = 0; sm.stop = UINT32_MAX; }
+    __syncthreads();
+    for (;;) {
+        const uint32_t i0 = sm.i0;
+        const T s = sm.s;
+        if (i0 >= n || sm.stop != UINT32_MAX) break;
+        const sum_grid<T> g(s);
+        if (!g.finite) break;   /* a NaN sum stays NaN (an infinite one cannot arise: every value is <= 1) */
+        const uint32_t i = i0 + tid;
+        const T p = i < n ? value(i, g.k) : T(0);
+        bool serial = false;
+        uint64_t q = 0;
+        const double r = ldexp((double)p, g.k);
+        if (r != r) {
+            serial = true;   /* a NaN value: the hardware add makes the sum NaN */
+        } else if (r >= QMAX) {
+            q = TOP;
+        } else {
+            const double fl = floor(r);
+            if (r - fl == 0.5) serial = true;   /* an exact tie */
+            else q = (uint64_t)rint(r);
+        }
+        const uint64_t incl = block_scan_u64<THREADS>(q, sm.wsum);
+        const bool cross = g.m + incl >= TOP;
+        const T pre = g.value(g.m + incl);
+        const bool hit = i < n && (serial || cross || pred(pre));
+        const uint32_t first = block_min_u32<THREADS>(hit ? tid : THREADS, sm.wmin);
+        if (first == THREADS) {
+            if (i + 1u == min(n, i0 + THREADS)) { sm.s = pre; sm.i0 = i0 + THREADS; }
+        } else if (tid == first) {
+            if (!serial && !cross) {   /* pred at an exact prefix */
+                sm.s = pre;
+                sm.stop = i;
+            } else {
+                const T ns = tr::add(g.value(g.m + incl - q), p);
+                sm.s = ns;
+                sm.i0 = i + 1u;
+                if (pred(ns)) sm.stop = i;
+            }
+        }
+        __syncthreads();
+    }
+    if (stop_at) *stop_at = sm.stop;
+    const T out = sm.s;
+    __syncthreads();
+    return out;
 }
 
 /* THE row: argmax, the path, the candidates, the cut, the race.  `pp` (the row kernel) is the row's prep -- its maximum
@@ -818,37 +926,26 @@ __device__ void sample_row(const launch_args &a, uint32_t row, row_smem<THREADS>
         if (tid == 0) { sm.cnt = 0; sm.fsum = 0.0f; }
         __syncthreads();
         uint32_t n;
-        if (!pp || idsum) {
-            /* count (no prep), and the id-order serial sum where the arm keeps one: the tiles of THREADS values,
-             * each tested against the sum so far (an add under its half ulp is a no-op, exactly -- skipped), then
-             * walked by warp 0 in id order over the adds that remain, while the other warps compute the next */
+        if (!pp) {   /* the count (the row kernel has the prep's) */
             uint32_t mine = 0;
-            auto value = [&](uint32_t base) {
-                const uint32_t i = base + tid;
-                float pr = 0.0f;   /* a non-finite value adds +0 to the sum: the host skipped it, same bits */
-                const bool c = i < rv.n && row_is_cand(p, i, rv(i), floor_logit, maxlogit, max_id, &pr);
-                mine += c ? 1u : 0u;
-                return pr;
-            };
-            float pr = value(0);
-            if (idsum) sm.tile[0][tid] = pr;
-            __syncthreads();
-            for (uint32_t base = 0, t = 0; base < rv.n; base += THREADS, t ^= 1u) {
-                if (idsum) {
-                    const uint32_t bal = __ballot_sync(0xffffffffu, !(pr < sum_half_ulp(sm.fsum)));
-                    if ((tid & 31u) == 0) sm.words[tid >> 5] = bal;
-                    __syncthreads();
-                    if (tid < 32u) sm.fsum = warp_walk_adds(sm.fsum, sm.tile[t], sm.words, THREADS / 32u);
-                }
-                if (base + THREADS < rv.n) {
-                    pr = value(base + THREADS);
-                    if (idsum) sm.tile[t ^ 1u][tid] = pr;
-                }
-                __syncthreads();
+            for (uint32_t i = tid; i < rv.n; i += THREADS) {
+                float pr;
+                mine += row_is_cand(p, i, rv(i), floor_logit, maxlogit, max_id, &pr) ? 1u : 0u;
             }
-            n = pp ? pp->n_cand : block_sum_u32<THREADS>(mine, sm.redu);
+            n = block_sum_u32<THREADS>(mine, sm.redu);
         } else {
             n = pp->n_cand;
+        }
+        if (idsum) {   /* the id-order serial sum over every finite value (block_serial_sum: the host's bits) */
+            auto value = [&](uint32_t i, int) {
+                float pr = 0.0f;   /* a non-finite value adds +0 to the sum: the host skipped it, same bits */
+                (void)row_is_cand(p, i, rv(i), floor_logit, maxlogit, max_id, &pr);
+                return pr;
+            };
+            const float fs = block_serial_sum<float, THREADS>(rv.n, value, [](float) { return false; }, nullptr,
+                                                              sm.ssum);
+            if (tid == 0) sm.fsum = fs;
+            __syncthreads();
         }
         if (idsum) sum = sm.fsum;
         if (p.full) { sum = __uint_as_float(0x7f800000u); sum_inert = true; }
@@ -1085,94 +1182,31 @@ __global__ void __launch_bounds__(PREP_THREADS) full_floor_kernel(const __grid_c
     if (tid == 0 && red[0] != UINT32_MAX) atomicMin(&s.st->f, red[0]);
 }
 
-/* An add the running sum cannot see, for good: p under a quarter of the sum's ulp rounds away (under half would do),
- * and so does every later one -- the candidates descend, and expf's error (under an ulp) cannot lift a later p past
- * twice this one; the sum only grows.  So a walk in sorted order stops there exactly. */
-__device__ __forceinline__ bool sum_saturated(float fs, float p) {
-    const uint32_t e = (__float_as_uint(fs) >> 23) & 0xffu;
-    return e < 255u && e > 25u && p < __uint_as_float((e - 25u) << 23);
-}
-
-/* THE serial sum in sorted order (the host's float accumulation), then the cut -- two walks over the candidates in
- * tiles the block stages: each tile's values tested against the sum before it (an add under half its ulp is a no-op,
- * exactly, so it is skipped), warp 0 adding the rest in order.  The first walk stops where the sum saturates; the
- * second stops at the floor (f from the floor search: the prefix before it) or after the first add whose prefix
- * * (1 / sum) reaches top_p -- the prefix only moves at an add, so the test needs only those. */
+/* THE serial sum in sorted order (the host's float accumulation), then the cut: the sum over every candidate, then
+ * the walk again up to the floor (f from the floor search), stopped after the first candidate whose prefix
+ * * (1 / sum) reaches top_p -- both block_serial_sum, the host's bits. */
 __global__ void __launch_bounds__(SMP_THREADS) full_chain_kernel(const __grid_constant__ launch_args a,
                                                                  const full_group g) {
-    __shared__ float tile[SMP_THREADS];
-    __shared__ uint32_t words[SMP_THREADS / 32u];
-    __shared__ float acc;
-    __shared__ uint32_t end, done;
-    const uint32_t j = blockIdx.x, tid = threadIdx.x, lane = tid & 31u;
+    __shared__ serial_sum_smem<float> sm;
+    const uint32_t j = blockIdx.x, tid = threadIdx.x;
     const uint32_t row = g.row[j];
     const row_plan p = plan_row(a.req[row], a.n_vocab);
     const full_slot s = full_slot_of(a, g, j);
     if (s.st->status != PULSAR_GPU_SAMPLE_OK) return;
-    const uint32_t n = s.st->n;
-    if (tid == 0) { acc = 0.0f; end = n; }
-    __syncthreads();
-    /* stage tile b, mark its adds against the sum so far */
-    auto stage = [&](uint32_t b, uint32_t lim) {
-        const uint32_t i = b + tid;
-        const float pr = i < lim ? s.p[i] : 0.0f;
-        tile[tid] = pr;
-        const uint32_t bal = __ballot_sync(0xffffffffu, i < lim && !(pr < sum_half_ulp(acc)));
-        if (lane == 0) words[tid >> 5] = bal;
-        __syncthreads();
-    };
-    for (uint32_t b = 0; b < end; b += SMP_THREADS) {
-        stage(b, n);
-        if (tid < 32u) {
-            const float fs = warp_walk_adds(acc, tile, words, SMP_THREADS / 32u);
-            const uint32_t m = min(SMP_THREADS, n - b);
-            if (lane == 0) {
-                acc = fs;
-                if (sum_saturated(fs, tile[m - 1u])) end = b + m;
-            }
-        }
-        __syncthreads();
-    }
-    const float sum = acc;
+    const uint32_t n = s.st->n, floor_at = s.st->f;
+    auto value = [&](uint32_t i, int) { return s.p[i]; };
+    const float sum = block_serial_sum<float, SMP_THREADS>(n, value, [](float) { return false; }, nullptr, sm);
     if (!(sum > 0.0f) || !finite_bits(sum)) {
         if (tid == 0) s.st->status = PULSAR_GPU_SAMPLE_REFUSED_MASS;
         return;
     }
     const float rs = __fdiv_rn(1.0f, sum);
-    const uint32_t floor_at = s.st->f, sat = end;
-    __syncthreads();   /* every thread has read the sum */
-    if (tid == 0) { acc = 0.0f; done = 0u; }
-    __syncthreads();
-    /* past the saturation point no add moves the prefix: a cut not reached by then is the floor's, at the sum */
-    const uint32_t lim = min(floor_at, sat);
-    for (uint32_t b = 0; b < lim && !done; b += SMP_THREADS) {
-        stage(b, lim);
-        if (tid < 32u) {
-            float fs = acc;
-            uint32_t f = 0;
-            const uint32_t mine = words[lane];
-            uint32_t nz = __ballot_sync(0xffffffffu, mine != 0u);
-            while (nz && !f) {
-                const uint32_t w = __ffs(nz) - 1u;
-                nz &= nz - 1u;
-                uint32_t bits = __shfl_sync(0xffffffffu, mine, w);
-                while (bits) {
-                    const uint32_t k = __ffs(bits) - 1u;
-                    bits &= bits - 1u;
-                    fs = __fadd_rn(fs, tile[w * 32u + k]);
-                    if (__fmul_rn(fs, rs) >= p.top_p) { f = b + w * 32u + k + 1u; break; }
-                }
-            }
-            if (lane == 0) {
-                acc = fs;
-                if (f) { done = 1u; s.st->f = f; }
-            }
-        }
-        __syncthreads();
-    }
+    uint32_t stop;
+    const float fs = block_serial_sum<float, SMP_THREADS>(
+        floor_at, value, [&](float pre) { return __fmul_rn(pre, rs) >= p.top_p; }, &stop, sm);
     if (tid == 0) {
-        if (!done) s.st->f = floor_at;   /* the floor, or every candidate */
-        s.st->fs = done || floor_at <= sat ? acc : sum;
+        s.st->f = stop != UINT32_MAX ? stop + 1u : floor_at;   /* the top-p stop, else the floor (or every one) */
+        s.st->fs = fs;
     }
 }
 
@@ -1298,8 +1332,7 @@ struct lp_smem {
     float redv[SMP_THREADS];
     int32_t redi[SMP_THREADS];
     uint32_t redu[SMP_THREADS];
-    double tile[2][SMP_THREADS];
-    uint32_t words[32];
+    serial_sum_smem<double> ssum;
     uint64_t keys[1024];
     uint32_t hist[256];
     uint32_t cnt;
@@ -1327,41 +1360,22 @@ __global__ void __launch_bounds__(SMP_THREADS) logprobs_rows_kernel(const __grid
         return;
     }
     const double dmax = (double)maxv;
-    if (tid == 0) sm.sum = 0.0;
-    /* The serial sum in tiles: an add under half the sum's ulp is a no-op, exactly, so it is skipped -- tested
-     * against the sum before the tile (it only grows), and below exp(d) < that bound / e not even evaluated (plm_exp
-     * is within an ulp); warp 0 walks the adds that remain in id order while the other warps compute the next tile. */
-    auto value = [&](uint32_t base, double s) {
-        const uint32_t i = base + tid;
+    /* the serial double sum (block_serial_sum: the host's bits); a value provably under half the grid's ulp rounds
+     * away, so its exp is not evaluated: exp(d) < 2^-k / 2 / e where d < -(k + 1) ln 2 - 1 (plm_exp is within an
+     * ulp) */
+    auto value = [&](uint32_t i, int k) {
         double e = 0.0;   /* the host skipped a non-finite value; +0.0 leaves the sum's bits alone */
-        if (i < rv.n) {
-            const float v = rv(i);
-            if (finite_bits(v)) {
-                const double d = __dsub_rn((double)v, dmax);
-                const double h = sum_half_ulp(s);
-                if (h == 0.0 || !(d < __dsub_rn(log(h), 1.0))) e = plm_exp(d);
-            }
+        const float v = rv(i);
+        if (finite_bits(v)) {
+            const double d = __dsub_rn((double)v, dmax);
+            if (!(d < -(double)(k + 1) * 0.6931471805599453 - 1.0)) e = plm_exp(d);
         }
         return e;
     };
-    double e = value(0, 0.0);
-    sm.tile[0][tid] = e;
+    const double dsum = block_serial_sum<double, SMP_THREADS>(rv.n, value, [](double) { return false; }, nullptr,
+                                                              sm.ssum);
+    if (tid == 0) sm.sum = dsum;
     __syncthreads();
-    for (uint32_t base = 0, t = 0; base < rv.n; base += SMP_THREADS, t ^= 1u) {
-        const double s = sm.sum;
-        const uint32_t bal = __ballot_sync(0xffffffffu, !(e < sum_half_ulp(s)));
-        if ((tid & 31u) == 0) sm.words[tid >> 5] = bal;
-        __syncthreads();
-        if (tid < 32u) {
-            const double ns = warp_walk_adds(s, sm.tile[t], sm.words, SMP_THREADS / 32u);
-            if (tid == 0) sm.sum = ns;
-        }
-        if (base + SMP_THREADS < rv.n) {
-            e = value(base + SMP_THREADS, s);
-            sm.tile[t ^ 1u][tid] = e;
-        }
-        __syncthreads();
-    }
     const double lsum = plm_log(sm.sum);
     if (tid == 0) {
         const int32_t t = a.token ? a.token[(size_t)row * a.token_stride] : -1;
