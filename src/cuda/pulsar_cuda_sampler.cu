@@ -247,10 +247,7 @@ __device__ void select_topk(const row_view &rv, uint32_t k, uint64_t *keys, uint
 }
 
 /* What the row function writes per row (the host reads the token; the gate also the dist). */
-struct row_out_t {
-    int32_t token;
-    uint32_t status;
-};
+typedef pulsar_gpu_sample_out row_out_t;
 
 /* Per-launch arguments (by value). */
 struct launch_args {
@@ -382,6 +379,7 @@ __device__ void sample_row(const launch_args &a, uint32_t row, row_smem<THREADS>
         }
     };
 
+    if (tid == 0) o->probe_p = 0.0f;   /* before the first barrier: a race-loop thread may set it below */
     float maxv;
     int32_t maxi;
     const bool greedy_flag = (q.flags & PULSAR_GPU_SAMPLE_GREEDY) != 0;
@@ -393,6 +391,7 @@ __device__ void sample_row(const launch_args &a, uint32_t row, row_smem<THREADS>
     }
     block_argmax<THREADS>(rv, sm.redv, sm.redi, &maxv, &maxi);
     if (greedy_flag || T <= 0.0f) {
+        if (tid == 0 && maxi >= 0 && maxi == q.probe) o->probe_p = 1.0f;
         finish(maxi, maxi < 0 ? PULSAR_GPU_SAMPLE_REFUSED_EMPTY : PULSAR_GPU_SAMPLE_OK);
         dump_point(maxi);
         return;
@@ -572,6 +571,7 @@ __device__ void sample_row(const launch_args &a, uint32_t row, row_smem<THREADS>
             dist[1 + i] = (uint32_t)cl.id(i);
             dist[1 + a.dist_cap + i] = __float_as_uint(pe);
         }
+        if (cl.id(i) == q.probe) o->probe_p = pe;
         if (!(pe > 0.0f)) continue;
         const double s = race_score(q.key, cl.id(i), pe);
         if (s < best) { best = s; besti = i; }   /* i rises per thread: the first minimum of this thread's share */
@@ -725,16 +725,23 @@ __global__ void spec_walk_kernel(const __grid_constant__ walk_args a) {
     const pulsar_gpu_spec_run &run = a.run[r];
     uint32_t c = 0;
     int32_t carry = -1;
-    uint32_t status = PULSAR_GPU_SAMPLE_OK;
+    uint32_t status = PULSAR_GPU_SAMPLE_OK, n_label = 0;
+    pulsar_gpu_spec_walk_out &o = a.out[r];
     for (;;) {
         const row_out_t t = a.rows[run.row0 + c];
         if (t.status != PULSAR_GPU_SAMPLE_OK || t.token < 0) {
             status = t.status != PULSAR_GPU_SAMPLE_OK ? t.status : PULSAR_GPU_SAMPLE_REFUSED_EMPTY;
             break;
         }
-        if (c == run.k || t.token != run.pend[c]) { carry = t.token; break; }
+        if (c == run.k) { carry = t.token; break; }
+        const bool ok = t.token == run.pend[c];
+        o.label[c] = (run.greedy_rows >> c) & 1u ? (ok ? 1.0f : 0.0f) : t.probe_p;
+        o.hit[c] = ok ? 1u : 0u;
+        n_label = c + 1u;
+        if (!ok) { carry = t.token; break; }
         c++;
     }
+    o.n_label = n_label;
     a.out[r].commit = c;
     a.out[r].carry = carry;
     a.out[r].status = status;
@@ -761,7 +768,7 @@ int pulsar_gpu_sample_rows(const pulsar_gpu_tensor *logits, uint64_t logits_offs
         (uint64_t)(n_rows - 1u) * row_stride * sizeof(float) + (uint64_t)n_vocab * sizeof(float) >
             logits->bytes - logits_offset_bytes ||
         scratch->bytes < pulsar_gpu_sample_scratch_bytes(n_vocab) ||
-        out_offset_bytes > out->bytes || out->bytes - out_offset_bytes < (uint64_t)n_rows * 2u * sizeof(uint32_t) ||
+        out_offset_bytes > out->bytes || out->bytes - out_offset_bytes < (uint64_t)n_rows * sizeof(row_out_t) ||
         (mask && mask_words < (n_vocab + 31u) / 32u) ||
         (dist && dist->bytes < (uint64_t)n_rows * (1u + 2u * dist_cap) * sizeof(uint32_t))) {
         fprintf(stderr, "pulsar: device sampler: bad launch (%u rows of %u, stride %u) -- refusing\n", n_rows, n_vocab,
@@ -831,7 +838,7 @@ int pulsar_gpu_spec_walk(const pulsar_gpu_tensor *rows, uint64_t rows_offset_byt
                          const pulsar_gpu_spec_run *runs, uint32_t n_runs, pulsar_gpu_tensor *out,
                          uint64_t out_offset_bytes) {
     bool ok = rows && runs && out && n_runs > 0 && n_runs <= PULSAR_GPU_SAMPLE_ROWS_MAX &&
-              rows_offset_bytes + (uint64_t)n_rows * 2u * sizeof(uint32_t) <= rows->bytes &&
+              rows_offset_bytes + (uint64_t)n_rows * sizeof(row_out_t) <= rows->bytes &&
               out_offset_bytes + (uint64_t)n_runs * sizeof(pulsar_gpu_spec_walk_out) <= out->bytes;
     for (uint32_t r = 0; ok && r < n_runs; r++) ok = runs[r].k <= 16u && runs[r].row0 + runs[r].k < n_rows;
     if (!ok) {

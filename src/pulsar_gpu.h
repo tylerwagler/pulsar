@@ -2418,14 +2418,24 @@ typedef struct pulsar_gpu_sample_req {
     uint64_t key;
     uint32_t flags;
     uint32_t mask_row;   ///< row of the launch's mask (bit i of word i/32 set = token i allowed), or PULSAR_GPU_SAMPLE_NO_MASK
+    int32_t probe;       ///< a token whose emitted probability the row reports (a verify row's draft; L301), or -1
+    uint32_t pad_;
 } pulsar_gpu_sample_req;
+
+/** What the sampler writes per row. */
+typedef struct pulsar_gpu_sample_out {
+    int32_t token;     ///< -1 = refused
+    uint32_t status;   ///< PULSAR_GPU_SAMPLE_*
+    float probe_p;     ///< the probe's probability in the emitted distribution (0 when not emitted; greedy: 1 for the argmax)
+    uint32_t pad_;
+} pulsar_gpu_sample_out;
 
 /** Bytes of the scratch tensor a session gives every sampler launch over rows of n_vocab. */
 uint64_t pulsar_gpu_sample_scratch_bytes(uint32_t n_vocab);
 uint64_t pulsar_gpu_sample_slot_bytes(uint32_t n_vocab);
 
 /** Draw n_rows rows (row r at logits + logits_offset_bytes + r * row_stride floats, n_vocab wide) by reqs[r]: out
- *  receives, from out_offset_bytes, n_rows x {int32 token (-1 = refused), uint32 status}.  `mask` (NULL = none) is
+ *  receives, from out_offset_bytes, n_rows pulsar_gpu_sample_out.  `mask` (NULL = none) is
  *  uint32 [rows][mask_words]: a cleared bit makes that token's logit -inf before every transform -- L303's
  *  structured-output hook, L272's tool-name mask; no mask = the unmasked bytes exactly.  `dist` (NULL in production)
  *  receives the emitted distribution per row as uint32 [n, ids[dist_cap], prob bits[dist_cap]] for the equality
@@ -2441,13 +2451,19 @@ int pulsar_gpu_sample_rows(const pulsar_gpu_tensor *logits, uint64_t logits_offs
 typedef struct pulsar_gpu_spec_run {
     uint32_t row0;
     uint32_t k;
+    uint32_t greedy_rows;   ///< bit j: row j drew greedy (its calibration label is the acceptance itself)
     int32_t pend[16];
 } pulsar_gpu_spec_run;
-/** The walk's verdict for a run: drafts kept, the carry token (-1 when a row refused), the refusing row's status. */
+/** The walk's verdict for a run: drafts kept, the carry token (-1 when a row refused), the refusing row's status,
+ *  and L301's calibration labels for the drafts it reached: label[j] = 1/0 (greedy row: argmax == draft) or the
+ *  target's emitted probability of draft j (sampled row), hit[j] = the row drew draft j. */
 typedef struct pulsar_gpu_spec_walk_out {
     uint32_t commit;
     int32_t carry;
     uint32_t status;
+    uint32_t n_label;
+    float label[16];
+    uint8_t hit[16];
 } pulsar_gpu_spec_walk_out;
 /** The speculative walk over a sampler launch's rows (pulsar_gpu_sample_rows' out at rows_offset_bytes): a draft is
  *  kept iff its row drew it.  out receives n_runs pulsar_gpu_spec_walk_out at out_offset_bytes. */
