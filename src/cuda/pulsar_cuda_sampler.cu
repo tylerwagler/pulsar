@@ -279,6 +279,7 @@ struct launch_args {
     row_out_t *out;            /* [n_rows] */
     uint32_t *pending;         /* [n_rows]: 1 = the row kernel left it to a slot */
     uint64_t full_rows;        /* bit r: row r is on the full arm (its own pipeline, not the row kernel's) */
+    uint32_t plan_vocab;       /* the vocabulary the knobs' plan reads (the row's width; a chain slot's sparse row's) */
     /* slot scratch: per slot keys [2][n_vocab] u32, ids [2][n_vocab] u32, probs [n_vocab] f32, then (aligned) the
      * slot kernel's radix counts or the full arm's state and sort scratch */
     uint8_t *slots;
@@ -459,12 +460,13 @@ __device__ __forceinline__ row_plan plan_row(const pulsar_gpu_sample_req &q, uin
     return p;
 }
 
-/* THE candidate predicate of the min-p arm (a top-k row's is its key against K*; the full arm takes every finite
- * value) -- the row kernel's and the prep's.  floor: the full-nucleus arm's bound (an entry under it has
+/* THE candidate predicate of the min-p and full arms (a top-k row's is its key against K*) -- the row kernel's and
+ * the prep's (the full arm's rows of a launch take their own pipeline; a chain's slot runs the arm in the block).  floor: the full-nucleus arm's bound (an entry under it has
  * p < prefilter however it rounds), else -inf; *pp receives p where it was computed. */
 __device__ __forceinline__ bool row_is_cand(const row_plan &p, uint32_t i, float v, float floor_logit, float maxlogit,
                                             uint32_t max_id, float *pp) {
     if (!finite_bits(v)) return false;
+    if (p.path == PATH_FULL) return true;
     if (v < floor_logit && i != max_id) return false;
     const float pr = plm_expf(__fmul_rn(__fsub_rn(v, maxlogit), p.rcpT));
     *pp = pr;
@@ -836,7 +838,7 @@ __device__ void sample_row(const launch_args &a, uint32_t row, row_smem<THREADS>
     };
 
     if (tid == 0) o->probe_p = 0.0f;   /* before the first barrier: a race-loop thread may set it below */
-    const row_plan p = plan_row(q, rv.n);
+    const row_plan p = plan_row(q, a.plan_vocab);
     if (p.refuse) {
         finish(-1, PULSAR_GPU_SAMPLE_REFUSED_KNOB);
         return;
@@ -917,12 +919,13 @@ __device__ void sample_row(const launch_args &a, uint32_t row, row_smem<THREADS>
         __syncthreads();
         sum = sm.fsum;
     } else {
-        /* PATH_MINP (the full arm has its own pipeline): the candidate predicate, and (not full-nucleus) the
-         * id-order sum */
+        /* PATH_MINP, and PATH_FULL in a block (a chain's slot: a launch's full-arm rows take their own pipeline):
+         * the candidate predicate, and (min-p, not full-nucleus) the id-order sum */
         const uint32_t max_id = (uint32_t)maxi;
         const float floor_logit = row_floor(p, maxv);
+        const bool full_arm = p.path == PATH_FULL;
         maxlogit = maxv;
-        const bool idsum = !p.full;
+        const bool idsum = !full_arm && !p.full;
         if (tid == 0) { sm.cnt = 0; sm.fsum = 0.0f; }
         __syncthreads();
         uint32_t n;
@@ -950,6 +953,10 @@ __device__ void sample_row(const launch_args &a, uint32_t row, row_smem<THREADS>
         if (idsum) sum = sm.fsum;
         if (p.full) { sum = __uint_as_float(0x7f800000u); sum_inert = true; }
         cl.n = n;
+        if (full_arm && n > SMP_CAP) {   /* a launch routes these to the full arm's pipeline: none reaches here */
+            finish(-1, PULSAR_GPU_SAMPLE_REFUSED_KNOB);
+            return;
+        }
         if (n <= SMP_CAP) {
             if (pp) {
                 for (uint32_t i = tid; i < n; i += THREADS) sm.keys[i] = pp->cand[i];
@@ -965,10 +972,16 @@ __device__ void sample_row(const launch_args &a, uint32_t row, row_smem<THREADS>
             __syncthreads();
             bitonic_sort<THREADS>(sm.keys, n);
             cl.skeys = sm.keys;
+            if (full_arm) maxlogit = rv((uint32_t)sm.keys[0]);   /* the sorted head */
             for (uint32_t i = tid; i < n; i += THREADS)
                 sm.probs[i] = plm_expf(__fmul_rn(__fsub_rn(rv((uint32_t)sm.keys[i]), maxlogit), rcpT));
             __syncthreads();
             cl.probs = sm.probs;
+            if (full_arm) {   /* the serial sum in sorted order */
+                if (tid == 0) sm.fsum = serial_sum(sm.probs, n);
+                __syncthreads();
+                sum = sm.fsum;
+            }
         } else {
             if (!slot) {   /* past the shared store: the slot kernel finishes this row */
                 if (tid == 0) a.pending[row] = 1u;
@@ -1455,6 +1468,96 @@ __global__ void spec_walk_kernel(const __grid_constant__ walk_args a) {
     a.out[r].status = status;
 }
 
+/* ---- a block drafter's sampled chains (L298 rows): one block a chain, every slot's draw in it -------------------
+ *
+ * A slot's row is a sparse row of the vocabulary: the head's few candidates, every other id -inf.  THE sampler on it
+ * reads only its finite entries, so the block hands it those, in ascending id (the order its sums and tie-breaks
+ * read) with the ids as the row's id map, and plans the knobs against the vocabulary's width (the sparse min-p
+ * predicate reads it).  The same function as every other draw (sample_row), so the same bytes as the full-width row;
+ * the next slot's row follows from the pick, so the walk stays in the block -- one launch, one readback. */
+
+constexpr uint32_t CHAIN_THREADS = 256;
+
+struct chain_args {
+    const int32_t *cand;
+    const float *scores;
+    uint32_t slots, topk, vocab;
+    pulsar_gpu_chain_req req[PULSAR_GPU_CHAINS_MAX];
+    int32_t *out;
+};
+
+__global__ void __launch_bounds__(CHAIN_THREADS) sample_chains_kernel(const __grid_constant__ chain_args c) {
+    __shared__ row_smem<CHAIN_THREADS> sm;
+    __shared__ launch_args la;
+    __shared__ float row[PULSAR_GPU_CHAIN_TOPK_MAX];
+    __shared__ int32_t ids[PULSAR_GPU_CHAIN_TOPK_MAX];
+    __shared__ row_out_t o;
+    __shared__ uint32_t pend, prev, stop;
+    const uint32_t b = blockIdx.x, tid = threadIdx.x, TK = c.topk;
+    const pulsar_gpu_chain_req &q = c.req[b];
+    const int32_t *cand = c.cand + (size_t)q.chain * c.slots * TK;
+    const float *sc = c.scores + (size_t)q.chain * c.slots * TK * TK;
+    int32_t *out = c.out + (size_t)b * c.slots;
+    if (tid == 0) {
+        memset(&la, 0, sizeof(la));
+        la.logits = row;
+        la.n_rows = 1;
+        la.plan_vocab = c.vocab;
+        la.id_map = ids;
+        la.out = &o;
+        la.pending = &pend;
+        la.req[0].temperature = q.temperature;
+        la.req[0].top_p = q.top_p;
+        la.req[0].min_p = q.min_p;
+        la.req[0].top_k = q.top_k;
+        la.req[0].mask_row = PULSAR_GPU_SAMPLE_NO_MASK;
+        la.req[0].probe = -1;
+        prev = 0;
+        stop = 0;
+    }
+    for (uint32_t j = 0; j < c.slots; j++) {
+        __syncthreads();
+        if (stop || j >= q.n) {
+            if (tid == 0) out[j] = -1;
+            continue;
+        }
+        if (tid == 0) {   /* the slot's finite entries in ascending id, a repeated id at its last score */
+            const int32_t *ci = cand + (size_t)j * TK;
+            const float *rw = sc + ((size_t)j * TK + prev) * TK;
+            uint32_t m = 0;
+            for (uint32_t k = 0; k < TK; k++) {
+                const int32_t id = ci[k];
+                if (id < 0 || (uint32_t)id >= c.vocab) continue;
+                uint32_t at = 0;
+                while (at < m && ids[at] < id) at++;
+                if (at < m && ids[at] == id) {
+                    row[at] = rw[k];
+                    continue;
+                }
+                for (uint32_t t = m; t > at; t--) { ids[t] = ids[t - 1]; row[t] = row[t - 1]; }
+                ids[at] = id;
+                row[at] = rw[k];
+                m++;
+            }
+            la.n_vocab = m;
+            la.row_stride = m;
+            la.req[0].key = q.key[j];
+        }
+        __syncthreads();
+        sample_row<CHAIN_THREADS>(la, 0u, sm, nullptr, nullptr);
+        __syncthreads();
+        if (tid == 0) {
+            const int32_t tok = o.status == PULSAR_GPU_SAMPLE_OK ? o.token : -1;
+            out[j] = tok;
+            uint32_t pick = 0;
+            const int32_t *ci = cand + (size_t)j * TK;
+            while (pick < TK && ci[pick] != tok) pick++;
+            if (tok < 0 || pick == TK) stop = 1;
+            else prev = pick;
+        }
+    }
+}
+
 }  // namespace
 
 /* the full arm's sort scratch for a row of n_vocab (the double-buffer form: the slot's own arrays alternate) */
@@ -1523,6 +1626,7 @@ int pulsar_gpu_sample_rows(const pulsar_gpu_tensor *logits, uint64_t logits_offs
     a.logits = (const float *)((const char *)logits->ptr + logits_offset_bytes);
     a.row_stride = row_stride;
     a.n_vocab = n_vocab;
+    a.plan_vocab = n_vocab;
     a.n_rows = n_rows;
     a.mask = mask ? (const uint32_t *)mask->ptr : nullptr;
     a.mask_words = mask_words;
@@ -1675,29 +1779,33 @@ int pulsar_gpu_rows_digest(const pulsar_gpu_tensor *rows, uint64_t offset_bytes,
     return cuda_ok(cudaGetLastError(), "rows digest");
 }
 
-/* ---- a row from a candidate list (a drafter whose head scores a few candidates a slot, L298) -------------------- */
-
-__global__ static void sparse_fill_kernel(float *row, uint32_t width) {
-    for (uint32_t i = blockIdx.x * blockDim.x + threadIdx.x; i < width; i += gridDim.x * blockDim.x)
-        row[i] = __uint_as_float(0xff800000u);
-}
-
-/* the candidates in list order, one thread: a repeated id keeps its last value, as a host row built by assignment */
-__global__ static void sparse_scatter_kernel(float *row, uint32_t width, const int32_t *ids, const float *vals,
-                                             uint32_t n) {
-    for (uint32_t c = 0; c < n; c++)
-        if (ids[c] >= 0 && (uint32_t)ids[c] < width) row[ids[c]] = vals[c];
-}
-
-int pulsar_gpu_sparse_row(pulsar_gpu_tensor *row, uint32_t width, const pulsar_gpu_tensor *cand, uint32_t n) {
-    if (!row || !cand || width == 0 || row->bytes < (uint64_t)width * 4u || cand->bytes < (uint64_t)n * 8u) {
-        fprintf(stderr, "pulsar: sparse row: bad launch (%u candidates into %u) -- refusing\n", n, width);
+int pulsar_gpu_sample_chains(const pulsar_gpu_tensor *cand, uint64_t cand_offset_bytes, const pulsar_gpu_tensor *scores,
+                             uint64_t scores_offset_bytes, uint32_t slots, uint32_t topk, uint32_t vocab,
+                             const pulsar_gpu_chain_req *reqs, uint32_t n_chains, pulsar_gpu_tensor *out,
+                             uint64_t out_offset_bytes) {
+    bool ok = cand && scores && reqs && out && n_chains > 0 && n_chains <= PULSAR_GPU_CHAINS_MAX && slots > 0 &&
+              slots <= PULSAR_GPU_CHAIN_SLOTS_MAX && topk > 0 && topk <= PULSAR_GPU_CHAIN_TOPK_MAX && vocab > 0 &&
+              out_offset_bytes <= out->bytes && out->bytes - out_offset_bytes >= (uint64_t)n_chains * slots * 4u &&
+              cand_offset_bytes <= cand->bytes && scores_offset_bytes <= scores->bytes;
+    for (uint32_t i = 0; ok && i < n_chains; i++) {
+        const uint64_t ch = reqs[i].chain;
+        ok = reqs[i].n <= slots && (ch + 1u) * slots * topk * 4u <= cand->bytes - cand_offset_bytes &&
+             (ch + 1u) * slots * topk * topk * 4u <= scores->bytes - scores_offset_bytes;
+    }
+    if (!ok) {
+        fprintf(stderr, "pulsar: device sampler: bad chain launch (%u chains of %u slots, top %u) -- refusing\n",
+                n_chains, slots, topk);
         return 0;
     }
-    const int32_t *ids = (const int32_t *)cand->ptr;
-    const float *vals = (const float *)(ids + n);
-    sparse_fill_kernel<<<(width + 255u) / 256u, 256>>>((float *)row->ptr, width);
-    if (!cuda_ok(cudaGetLastError(), "sparse row fill")) return 0;
-    sparse_scatter_kernel<<<1, 1>>>((float *)row->ptr, width, ids, vals, n);
-    return cuda_ok(cudaGetLastError(), "sparse row scatter");
+    chain_args c;
+    memset(&c, 0, sizeof(c));
+    c.cand = (const int32_t *)((const char *)cand->ptr + cand_offset_bytes);
+    c.scores = (const float *)((const char *)scores->ptr + scores_offset_bytes);
+    c.slots = slots;
+    c.topk = topk;
+    c.vocab = vocab;
+    memcpy(c.req, reqs, (size_t)n_chains * sizeof(*reqs));
+    c.out = (int32_t *)((char *)out->ptr + out_offset_bytes);
+    sample_chains_kernel<<<n_chains, CHAIN_THREADS>>>(c);
+    return cuda_ok(cudaGetLastError(), "device sampler chains");
 }

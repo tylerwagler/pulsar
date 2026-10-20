@@ -2343,15 +2343,12 @@ typedef struct pulsar_session_dev_rows {
     pulsar_gpu_tensor *out;         ///< PULSAR_GPU_SAMPLE_ROWS_MAX sample outs, then as many walk outs
     pulsar_gpu_tensor *mask;        ///< [PULSAR_GPU_SAMPLE_ROWS_MAX][ceil(W/32)] u32 token masks
     pulsar_gpu_tensor *lp;          ///< [PULSAR_GPU_SAMPLE_ROWS_MAX] logprob rows
-    pulsar_gpu_tensor *sparse_row;  ///< [W] f32: a row made from a candidate list (draw_sparse)
-    pulsar_gpu_tensor *sparse_in;   ///< [PULSAR_SESSION_SPARSE_MAX] ids, then as many values
+    pulsar_gpu_tensor *chain_out;   ///< [PULSAR_GPU_CHAINS_MAX][PULSAR_GPU_CHAIN_SLOTS_MAX] i32: draw_chains' tokens
     /** the rows the last batched step (decode_multiseq / _mixed / _fused, a verify) headed: logits row k at
      *  step_rows + k * W floats, k < step_n -- valid until the session's next step */
     const pulsar_gpu_tensor *step_rows;
     uint32_t step_n;
 } pulsar_session_dev_rows;
-/** Candidates a draw_sparse takes. */
-#define PULSAR_SESSION_SPARSE_MAX 1024u
 bool pulsar_session_dev_alloc(pulsar_session *s, uint32_t n_banks);
 void pulsar_session_dev_free(pulsar_session *s);
 
@@ -2597,7 +2594,9 @@ struct pulsar_session {
                          const uint32_t *row_index, uint32_t n, pulsar_gpu_sample_req *reqs, pulsar_gpu_sample_out *out);
     /** One draw over a row of `width` made from n candidates (ids, values; every other entry -inf): a drafter whose
      *  head scores a few candidates a slot.  The token, or PULSAR_SAMPLE_REFUSED. */
-    int draw_sparse(uint32_t width, const int32_t *ids, const float *vals, uint32_t n, pulsar_gpu_sample_req *req);
+    bool draw_chains(const pulsar_gpu_tensor *cand, uint64_t cand_off, const pulsar_gpu_tensor *scores,
+                     uint64_t scores_off, uint32_t slots, uint32_t topk, uint32_t vocab,
+                     const pulsar_gpu_chain_req *reqs, uint32_t n, int32_t *tokens);
     /** The launch alone, no mask, the outs left in dev.out (a walk reads them there). */
     bool draw_rows_dev(const pulsar_gpu_tensor *rows, const uint32_t *row_index, uint32_t n,
                        pulsar_gpu_sample_req *reqs);

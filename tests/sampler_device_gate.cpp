@@ -469,6 +469,95 @@ void bench(uint32_t n_vocab, pulsar_gpu_tensor *dl, pulsar_gpu_tensor *scratch, 
 
 }  // namespace
 
+/* A block drafter's sampled chains (pulsar_gpu_sample_chains) against the host walk over full-width sparse rows: slot
+ * j's row is -inf but the candidates (a repeated id at its last score, an id outside the vocabulary dropped), drawn by
+ * the frozen host sampler at the chain's key j, the pick the first candidate equal to the draw. */
+static void test_chains(gate &g, uint32_t V, uint32_t rounds) {
+    const uint32_t SL = 7, TK = 16, NC = PULSAR_GPU_CHAINS_MAX;
+    pulsar_gpu_tensor *dc = pulsar_gpu_tensor_alloc((uint64_t)NC * SL * TK * 4u);
+    pulsar_gpu_tensor *ds = pulsar_gpu_tensor_alloc((uint64_t)NC * SL * TK * TK * 4u);
+    pulsar_gpu_tensor *dout = pulsar_gpu_tensor_alloc((uint64_t)NC * SL * 4u);
+    uint32_t cases = 0, bad = 0;
+    std::vector<float> row(V);
+    for (uint32_t it = 0; it < rounds; it++) {
+        std::vector<int32_t> cand((size_t)NC * SL * TK);
+        std::vector<float> sc((size_t)NC * SL * TK * TK);
+        for (auto &c : cand) {
+            const uint32_t w = urand(40);
+            c = w == 0 ? -1 : w == 1 ? (int32_t)(V + urand(9)) : w < 6 ? (int32_t)urand(64) : (int32_t)urand(V);
+        }
+        for (auto &x : sc) {
+            const uint32_t w = urand(60);
+            x = w == 0 ? -INFINITY : w == 1 ? NAN : w == 2 ? 1.5f : 3.0f * gauss();
+        }
+        const uint32_t nc = 1 + urand(NC);
+        std::vector<pulsar_gpu_chain_req> rq(nc);
+        std::vector<pulsar_gpu_sample_req> hq(nc);
+        for (uint32_t c = 0; c < nc; c++) {
+            pulsar_gpu_sample_req q;
+            gen_req(q);
+            q.flags = 0;
+            hq[c] = q;
+            memset(&rq[c], 0, sizeof(rq[c]));
+            rq[c].temperature = q.temperature;
+            rq[c].top_k = q.top_k;
+            rq[c].top_p = q.top_p;
+            rq[c].min_p = q.min_p;
+            rq[c].chain = urand(NC);
+            rq[c].n = urand(SL + 1);
+            for (uint32_t j = 0; j < SL; j++) rq[c].key[j] = g_rng();
+        }
+        std::vector<int32_t> out((size_t)nc * SL);
+        if (!pulsar_gpu_tensor_write(dc, 0, cand.data(), cand.size() * 4) ||
+            !pulsar_gpu_tensor_write(ds, 0, sc.data(), sc.size() * 4) ||
+            !pulsar_gpu_sample_chains(dc, 0, ds, 0, SL, TK, V, rq.data(), nc, dout, 0) ||
+            !pulsar_gpu_tensor_read(dout, 0, out.data(), out.size() * 4)) {
+            g.fails++;
+            fprintf(stderr, "  FAIL chains: a launch failed\n");
+            break;
+        }
+        for (uint32_t c = 0; c < nc; c++) {
+            const int32_t *ci = &cand[(size_t)rq[c].chain * SL * TK];
+            const float *s = &sc[(size_t)rq[c].chain * SL * TK * TK];
+            uint32_t prev = 0;
+            bool stopped = false;
+            for (uint32_t j = 0; j < SL; j++) {
+                int32_t want = -1;
+                if (!stopped && j < rq[c].n) {
+                    std::fill(row.begin(), row.end(), -INFINITY);
+                    const float *rw = s + ((size_t)j * TK + prev) * TK;
+                    for (uint32_t k = 0; k < TK; k++)
+                        if (ci[j * TK + k] >= 0 && (uint32_t)ci[j * TK + k] < V) row[ci[j * TK + k]] = rw[k];
+                    pulsar_gpu_sample_req q = hq[c];
+                    q.key = rq[c].key[j];
+                    sref::pulsar_sample_scratch scr;
+                    memset(&scr, 0, sizeof(scr));
+                    want = host_sample(row.data(), V, q, &scr).tok;
+                    sref::pulsar_sample_scratch_free(&scr);
+                    uint32_t pick = 0;
+                    while (pick < TK && ci[j * TK + pick] != want) pick++;
+                    if (want < 0 || pick == TK) stopped = true;
+                    else prev = pick;
+                }
+                cases++;
+                if (out[(size_t)c * SL + j] != want) {
+                    if (bad++ < 10)
+                        fprintf(stderr, "  FAIL chain %u slot %u (V=%u T=%g k=%d p=%g minp=%g): device %d host %d\n", c,
+                                j, V, hq[c].temperature, hq[c].top_k, hq[c].top_p, hq[c].min_p,
+                                out[(size_t)c * SL + j], want);
+                    break;
+                }
+            }
+        }
+    }
+    printf("  chains V=%-6u %u slots, %u failures\n", V, cases, bad);
+    g.cases += cases;
+    g.fails += bad;
+    pulsar_gpu_tensor_free(dc);
+    pulsar_gpu_tensor_free(ds);
+    pulsar_gpu_tensor_free(dout);
+}
+
 /* The TP mirror's cross-rank identity digest (L243; on the device since L302): deterministic, sensitive to one bit
  * anywhere, to the row count and to the width. */
 static void test_rows_digest(gate &g) {
@@ -582,6 +671,7 @@ int main(int argc, char **argv) {
             }
         }
         printf("  V=%-6u %5u cases, %u failures\n", v, g.cases - c0, g.fails - f0);
+        if (!bench_only) test_chains(g, v, quick ? 4u : 24u);
         if (do_bench) bench(v, dl, scratch, dout);
         pulsar_gpu_tensor_free(dl); pulsar_gpu_tensor_free(dm); pulsar_gpu_tensor_free(scratch);
         pulsar_gpu_tensor_free(dout); pulsar_gpu_tensor_free(ddist); pulsar_gpu_tensor_free(dlp);

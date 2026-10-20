@@ -30,12 +30,11 @@ bool pulsar_session_dev_alloc(pulsar_session *s, uint32_t n_banks) {
     d.out = pulsar_gpu_tensor_alloc(dev_digest_off() + sizeof(uint64_t));
     d.mask = pulsar_gpu_tensor_alloc((uint64_t)PULSAR_GPU_SAMPLE_ROWS_MAX * mask_words(s) * sizeof(uint32_t));
     d.lp = pulsar_gpu_tensor_alloc(PULSAR_GPU_SAMPLE_ROWS_MAX * sizeof(pulsar_gpu_logprob_row));
-    d.sparse_row = pulsar_gpu_tensor_alloc((uint64_t)W * sizeof(float));
-    d.sparse_in = pulsar_gpu_tensor_alloc(2ull * PULSAR_SESSION_SPARSE_MAX * sizeof(int32_t));
+    d.chain_out = pulsar_gpu_tensor_alloc((uint64_t)PULSAR_GPU_CHAINS_MAX * PULSAR_GPU_CHAIN_SLOTS_MAX * sizeof(int32_t));
     d.host_stale = false;
     d.step_rows = NULL;
     d.step_n = 0;
-    if (d.live && d.bank_rows && d.scratch && d.out && d.mask && d.lp && d.sparse_row && d.sparse_in) return true;
+    if (d.live && d.bank_rows && d.scratch && d.out && d.mask && d.lp && d.chain_out) return true;
     fprintf(stderr, "pulsar: session: the device sampler's buffers could not be allocated\n");
     pulsar_session_dev_free(s);
     return false;
@@ -49,8 +48,7 @@ void pulsar_session_dev_free(pulsar_session *s) {
     pulsar_gpu_tensor_free(d.out);
     pulsar_gpu_tensor_free(d.mask);
     pulsar_gpu_tensor_free(d.lp);
-    pulsar_gpu_tensor_free(d.sparse_row);
-    pulsar_gpu_tensor_free(d.sparse_in);
+    pulsar_gpu_tensor_free(d.chain_out);
     memset(&d, 0, sizeof(d));
 }
 
@@ -173,22 +171,14 @@ bool pulsar_session::draw_rows(const pulsar_gpu_tensor *rows, const uint32_t *ro
     return true;
 }
 
-int pulsar_session::draw_sparse(uint32_t width, const int32_t *ids, const float *vals, uint32_t n,
-                                pulsar_gpu_sample_req *req) {
-    if (n == 0 || n > PULSAR_SESSION_SPARSE_MAX) {
-        fprintf(stderr, "pulsar: session: a draw over %u candidates (1..%u) -- refusing\n", n, PULSAR_SESSION_SPARSE_MAX);
-        return PULSAR_SAMPLE_REFUSED;
-    }
-    std::vector<int32_t> in(2u * n);
-    memcpy(in.data(), ids, (size_t)n * sizeof(int32_t));
-    memcpy(in.data() + n, vals, (size_t)n * sizeof(float));
-    const uint32_t zero = 0;
-    pulsar_gpu_sample_out o;
-    if (!pulsar_gpu_tensor_write(dev.sparse_in, 0, in.data(), in.size() * sizeof(int32_t)) ||
-        !pulsar_gpu_sparse_row(dev.sparse_row, width, dev.sparse_in, n) ||
-        !draw_rows_width(dev.sparse_row, width, NULL, &zero, 1, req, &o))
-        return PULSAR_SAMPLE_REFUSED;
-    return o.token;
+/* a block drafter's sampled chains, every slot's draw on the device (pulsar_gpu_sample_chains): one launch, one
+ * readback of n * slots tokens */
+bool pulsar_session::draw_chains(const pulsar_gpu_tensor *cand, uint64_t cand_off, const pulsar_gpu_tensor *scores,
+                                 uint64_t scores_off, uint32_t slots, uint32_t topk, uint32_t vocab,
+                                 const pulsar_gpu_chain_req *reqs, uint32_t n, int32_t *tokens) {
+    return pulsar_gpu_sample_chains(cand, cand_off, scores, scores_off, slots, topk, vocab, reqs, n, dev.chain_out,
+                                    0) &&
+           pulsar_gpu_tensor_read(dev.chain_out, 0, tokens, (uint64_t)n * slots * sizeof(int32_t));
 }
 
 static void draw_req(const pulsar_row_draw *d, pulsar_gpu_sample_req *q) {

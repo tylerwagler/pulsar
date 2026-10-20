@@ -2505,9 +2505,25 @@ int pulsar_gpu_logprobs_rows(const pulsar_gpu_tensor *logits, uint64_t logits_of
                              const uint32_t *mask_rows, const pulsar_gpu_tensor *tokens, uint64_t tokens_offset_bytes,
                              uint32_t token_stride, uint32_t top_k, pulsar_gpu_tensor *out);
 
-/** A row of `width` from a candidate list: cand holds n int32 ids then n f32 values; every other entry -inf (a
- *  repeated id keeps its last value).  The row a drafter's few scored candidates make for THE sampler (L298, L302). */
-int pulsar_gpu_sparse_row(pulsar_gpu_tensor *row, uint32_t width, const pulsar_gpu_tensor *cand, uint32_t n);
+/** A block drafter's sampled chains (L298 rows, L302 on the device): chain c walks slots 0..n-1, slot j's row the
+ *  candidates cand[c][j][0..topk) scored by scores[c][j][prev][0..topk) (prev: the slot before's pick, 0 at slot 0)
+ *  -- a sparse row of `vocab` (every other id -inf, a repeated id keeps its last score, an id outside the vocabulary
+ *  none) drawn by THE sampler under the chain's knobs at key[j]; the pick is the first candidate equal to the draw.
+ *  out receives tokens [n_chains][slots] (int32; -1 from a refused slot on, the walk stops there). */
+#define PULSAR_GPU_CHAIN_SLOTS_MAX 16u
+#define PULSAR_GPU_CHAIN_TOPK_MAX 64u
+#define PULSAR_GPU_CHAINS_MAX 16u
+typedef struct pulsar_gpu_chain_req {
+    float temperature, top_p, min_p;
+    int32_t top_k;
+    uint32_t chain;   /* the chain's index in cand / scores */
+    uint32_t n;       /* slots to walk (<= slots) */
+    uint64_t key[PULSAR_GPU_CHAIN_SLOTS_MAX];
+} pulsar_gpu_chain_req;
+int pulsar_gpu_sample_chains(const pulsar_gpu_tensor *cand, uint64_t cand_offset_bytes, const pulsar_gpu_tensor *scores,
+                             uint64_t scores_offset_bytes, uint32_t slots, uint32_t topk, uint32_t vocab,
+                             const pulsar_gpu_chain_req *reqs, uint32_t n_chains, pulsar_gpu_tensor *out,
+                             uint64_t out_offset_bytes);
 
 /** A deterministic 64-bit digest of n_rows f32 rows of `width` (8-byte aligned) into out at out_offset_bytes: the
  *  TP mirror's cross-rank identity check over rows that stay on the device (L243, L302). */

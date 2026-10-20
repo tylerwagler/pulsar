@@ -1141,6 +1141,43 @@ bool draft_chains(pulsar_session *s, const uint32_t *banks, uint64_t *const *rng
                 cnt = 0;
             }
         }
+        /* the sampled chains' draws, every bank's every slot in one launch of THE sampler (L302): slot j's row is
+         * its candidates scored from the slot before's pick, so the walk runs on the device and one readback brings
+         * the drafts */
+        const uint32_t SL = B - 1u, TK = d->topk;
+        int32_t drawn[PULSAR_GPU_CHAINS_MAX][PULSAR_GPU_CHAIN_SLOTS_MAX];
+        uint32_t chain_of[kDraftRows];
+        {
+            pulsar_gpu_chain_req cr[PULSAR_GPU_CHAINS_MAX];
+            uint32_t nc = 0;
+            for (uint32_t b = 0; b < nb; b++) {
+                spec_redraft_req *q = reqs[pi[b]];
+                chain_of[b] = UINT32_MAX;
+                if (q->temperature <= 0.0f) continue;
+                const uint32_t P = ss->bank_pos[pb[b]];
+                uint32_t K = std::min(q->n_draft, B - 1u);
+                if ((uint64_t)P + 1u + K > ss->ctx) K = (uint32_t)(ss->ctx - P - 1u);
+                if (nc == PULSAR_GPU_CHAINS_MAX || SL > PULSAR_GPU_CHAIN_SLOTS_MAX) {
+                    snprintf(err, errlen, "more sampled chains than a launch draws");
+                    return false;
+                }
+                pulsar_gpu_chain_req &c = cr[nc];
+                memset(&c, 0, sizeof(c));
+                c.temperature = q->temperature;
+                c.top_k = q->top_k;
+                c.top_p = q->top_p;
+                c.min_p = q->min_p;
+                c.chain = b;
+                c.n = K;
+                for (uint32_t j = 1; j <= K; j++) c.key[j - 1] = pulsar_sample_key(*rngs[pi[b]], j);
+                chain_of[b] = nc++;
+            }
+            if (nc > 0 && !s->draw_chains(l->arena, l->dl.cand_id, l->arena, l->dl.scores, SL, TK, V, cr, nc,
+                                          &drawn[0][0])) {
+                snprintf(err, errlen, "the sampled chains' draws failed");
+                return false;
+            }
+        }
         for (uint32_t b = 0; b < nb; b++) {
             spec_redraft_req *q = reqs[pi[b]];
             const uint32_t P = ss->bank_pos[pb[b]];
@@ -1149,7 +1186,6 @@ bool draft_chains(pulsar_session *s, const uint32_t *banks, uint64_t *const *rng
             /* the walk over the head's scores: slot s's row is scores[s][prev] (slot 0: the start row) -- greedy the
              * device's walk (its first argmax), sampled a draw from the row's candidates under the request's params at
              * the draft's key (s + 1 places past the carry), as vLLM's candidate sampler draws from them */
-            const uint32_t SL = B - 1u, TK = d->topk;
             const int32_t *cand = &l->cand_id[(size_t)b * SL * TK];
             const float *sc = &l->scores[(size_t)b * SL * TK * TK];
             uint32_t prev = 0;
@@ -1163,16 +1199,7 @@ bool draft_chains(pulsar_session *s, const uint32_t *banks, uint64_t *const *rng
                     q->refined[j] = l->chain_ids[(size_t)b * SL + j - 1];
                     while (pick < TK && cand[(j - 1) * TK + pick] != q->refined[j]) pick++;
                 } else {
-                    /* THE sampler over the slot's row: its candidates, every other id -inf (L302: on the device) */
-                    pulsar_gpu_sample_req rq;
-                    memset(&rq, 0, sizeof(rq));
-                    rq.temperature = q->temperature;
-                    rq.top_k = q->top_k;
-                    rq.top_p = q->top_p;
-                    rq.min_p = q->min_p;
-                    rq.key = pulsar_sample_key(*rngs[pi[b]], j);
-                    rq.probe = -1;
-                    const int dt = s->draw_sparse(V, &cand[(j - 1) * TK], rw, TK, &rq);
+                    const int dt = drawn[chain_of[b]][j - 1];   /* THE sampler's draw over the slot's candidates */
                     if (dt < 0) {
                         snprintf(err, errlen, "a draft slot's candidates have no distribution");
                         return false;
