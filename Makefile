@@ -680,9 +680,12 @@ gdn-gate: tests/gdn_gate
 # a long position past the temperature floor; refusals.  Links the PRODUCTION
 # object; pass the served arch (CUDA_ARCH=sm_120f).  Model-free.
 # L298: the block drafter's small ops (src/cuda/pulsar_cuda_blockdraft.h: the grouped dynamic conv, SwiGLU, the tap
-# row copy, top-k + log-softmax) against the host authority (tests/blockdraft_gate.cu).  Model-free.
-tests/blockdraft_gate: tests/blockdraft_gate.cu src/cuda/pulsar_cuda_blockdraft.o src/cuda/pulsar_cuda_blockdraft.h Makefile
-	$(NVCC) $(NVCCFLAGS) -std=c++17 -Isrc -Isrc/cuda -o $@ tests/blockdraft_gate.cu src/cuda/pulsar_cuda_blockdraft.o
+# row copy, top-k + log-softmax; L299 the stream-mean tap, the top-k id map) and (L299) the CandidateSelector chain
+# head (src/cuda/pulsar_cuda_candsel.h) against the host authority (tests/blockdraft_gate.cu).  Model-free.
+tests/blockdraft_gate: tests/blockdraft_gate.cu src/cuda/pulsar_cuda_blockdraft.o src/cuda/pulsar_cuda_blockdraft.h \
+                       src/cuda/pulsar_cuda_candsel.o src/cuda/pulsar_cuda_candsel.h Makefile
+	$(NVCC) $(NVCCFLAGS) -std=c++17 -Isrc -Isrc/cuda -o $@ tests/blockdraft_gate.cu src/cuda/pulsar_cuda_blockdraft.o \
+		src/cuda/pulsar_cuda_candsel.o
 .PHONY: blockdraft-gate
 blockdraft-gate: tests/blockdraft_gate
 	./tests/blockdraft_gate

@@ -11,7 +11,7 @@ struct pulsar_role_binder {
     const pulsar_model *m;
     const char *owner;
     std::unordered_map<std::string, uint64_t> by_key;   ///< key -> directory index
-    std::vector<uint8_t> bound;                          ///< per directory entry
+    std::vector<uint8_t> bound;                          ///< per directory entry: 1 bound, 2 unloaded, 3 not in scope
     std::map<std::string, std::pair<uint64_t, uint64_t>> price;   ///< role -> (tensors, bytes), printed in role order
 };
 
@@ -51,13 +51,18 @@ static std::string describe(const pulsar_tensor &t) {
                     t.has_bind_index ? t.bind_index : -1);
 }
 
-pulsar_role_binder *pulsar_role_binder_open(const pulsar_model *m, const char *owner) {
+/* the binder over the entries `in_scope` admits (the whole directory, or a set of blocks) */
+template <class Scope> static pulsar_role_binder *binder_open(const pulsar_model *m, const char *owner, Scope in_scope) {
     pulsar_role_binder *b = new pulsar_role_binder();
     b->m = m;
     b->owner = owner;
     b->bound.assign(m->n_tensors, 0);
     for (uint64_t i = 0; i < m->n_tensors; i++) {
         const pulsar_tensor &t = m->tensors[i];
+        if (!in_scope(t)) {
+            b->bound[i] = 3;
+            continue;
+        }
         if (t.bind_role.len == 0) {
             fprintf(stderr, "pulsar: %s: tensor %.*s carries no bind role -- a role-bound container records one for "
                             "every tensor (tools/container); refusing\n", owner, (int)t.name.len, t.name.ptr);
@@ -73,6 +78,23 @@ pulsar_role_binder *pulsar_role_binder_open(const pulsar_model *m, const char *o
         }
     }
     return b;
+}
+
+pulsar_role_binder *pulsar_role_binder_open(const pulsar_model *m, const char *owner) {
+    return binder_open(m, owner, [](const pulsar_tensor &) { return true; });
+}
+
+pulsar_role_binder *pulsar_role_binder_open_blocks(const pulsar_model *m, const char *owner, const char *const *blocks) {
+    return binder_open(m, owner, [blocks](const pulsar_tensor &t) {
+        for (const char *const *bl = blocks; *bl; bl++)
+            if (t.bind_block.len == strlen(*bl) && memcmp(t.bind_block.ptr, *bl, t.bind_block.len) == 0) return true;
+        return false;
+    });
+}
+
+const pulsar_tensor *pulsar_role_binder_find(const pulsar_role_binder *b, pulsar_role_key k) {
+    const auto it = b->by_key.find(key_of(k));
+    return it == b->by_key.end() ? NULL : &b->m->tensors[it->second];
 }
 
 static bool role_admit(const pulsar_role_binder *b, const pulsar_tensor *t, const pulsar_role_admit &a) {
@@ -147,8 +169,11 @@ bool pulsar_role_binder_close(pulsar_role_binder *b, pulsar_role_census *out) {
     const pulsar_model *m = b->m;
     pulsar_role_census c = {0, 0, 0, 0, 0, 0};
     uint32_t extra = 0;
+    uint64_t in_scope = 0;
     for (uint64_t i = 0; i < m->n_tensors; i++) {
         const pulsar_tensor &t = m->tensors[i];
+        if (b->bound[i] == 3) continue;   /* not this binder's (pulsar_role_binder_open_blocks) */
+        in_scope++;
         c.directory_bytes += t.bytes;
         if (b->bound[i] == 2) {
             c.unloaded++;
@@ -170,11 +195,11 @@ bool pulsar_role_binder_close(pulsar_role_binder *b, pulsar_role_census *out) {
                 (double)kv.second.second / 1048576.0);
     }
     fprintf(stderr, "\n");
-    const bool whole = extra == 0 && c.tensors + c.unloaded == m->n_tensors &&
+    const bool whole = extra == 0 && c.tensors + c.unloaded == in_scope &&
                        c.bytes + c.unloaded_bytes == c.directory_bytes;
     fprintf(stderr, "pulsar: %s: %llu of %llu tensors bound in %u roles, %.3f GiB priced of the directory's %.3f GiB "
                     "(%llu tensors, %.3f GiB declared unloaded)%s\n",
-            b->owner, (unsigned long long)c.tensors, (unsigned long long)m->n_tensors, c.roles,
+            b->owner, (unsigned long long)c.tensors, (unsigned long long)in_scope, c.roles,
             (double)c.bytes / 1073741824.0, (double)c.directory_bytes / 1073741824.0, (unsigned long long)c.unloaded,
             (double)c.unloaded_bytes / 1073741824.0, whole ? " (every staged byte is a declared role's)" : " -- refusing");
     if (out) *out = c;

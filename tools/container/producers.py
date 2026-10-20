@@ -20,7 +20,9 @@ builder's copy of the engine's byte model.  The authorities these agree with:
     k-major transpose in `dsq_generate.c` :269-283; byte model `st_bytes_for`.
   * exl3m_*: `exl3_expert_layout` src/engine/exl3_trellis.h.
   * nvfp4 (ModelOpt W4A16_NVFP4 Linears, PULSAR_TENSOR_NVFP4): the nibbles verbatim, the E4M3 scales through the
-    same 128x4 tile swizzle as the E8M0 planes, the global scale; byte model `st_bytes_for`.
+    same 128x4 tile swizzle as the E8M0 planes, the global scale; byte model `st_bytes_for`.  (L299) from a BF16
+    source: `nvfp4_from_bf16`, ModelOpt's max-based recipe (global amax / (6 x 448), per-16 E4M3 RNE of the block
+    amax / 6, E2M1 RNE of the scaled values), then the same packer.
 
 Every producer is graded byte-identical against the served source-precision
 repack by tools/container/test_producers.py.  numpy only; no torch.
@@ -317,6 +319,82 @@ def nvfp4(w_u8: bytes, scale_e4m3: bytes, scale2_f32: bytes, out: int, inp: int)
     return bytes(w_u8) + swizzle_sf(scale, out, inp // 16).tobytes() + bytes(scale2_f32) + bytes(NVFP4_TAIL - 4)
 
 
+E2M1_VALUE = np.array([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0], dtype=np.float32)
+_E2M1_MID = (E2M1_VALUE[1:] + E2M1_VALUE[:-1]) / 2
+
+
+def f32_to_e2m1(x: np.ndarray) -> np.ndarray:
+    """|x| <= 6 (the caller's scaling) -> E2M1 codes (bit 3 the sign, bits 0-2 the magnitude's index in E2M1_VALUE),
+    round to nearest, a midpoint to the even code."""
+    a = np.abs(x).astype(np.float32)
+    if (a > 6.0).any() or np.isnan(a).any():
+        raise ValueError("f32_to_e2m1: a value past 6 or NaN -- the block scale did not bound it")
+    idx = np.searchsorted(_E2M1_MID, a, side="left")          # a <= mid[idx]: the lower neighbour idx
+    tie = (idx < 7) & (a == _E2M1_MID[np.minimum(idx, 6)])
+    idx = np.where(tie & (idx % 2 == 1), idx + 1, idx)
+    return (np.where(x < 0, 8, 0) | idx).astype(np.uint8)
+
+
+def nvfp4_from_bf16(w_bf16: bytes, out: int, inp: int) -> bytes:
+    """A BF16 [out, in] Linear -> the `nvfp4` entry (L299: our own quantisation, the DFlash2 drafter's Linears):
+    s2 = amax(|w|) / (6 * 448) (f32; 1 for an all-zero weight), each 16-wide block's scale the E4M3 RNE of
+    amax_block / (6 * s2), each value the E2M1 RNE of w / (scale * s2) (0 for a zero-scale block), packed by
+    `nvfp4` (low nibble = even input).  The engine reads w = e2m1 * e4m3 * s2."""
+    if inp % 64:
+        raise ValueError(f"nvfp4_from_bf16: in={inp} is not divisible by 64")
+    if len(w_bf16) != out * inp * 2:
+        raise ValueError(f"nvfp4_from_bf16: weight holds {len(w_bf16)} bytes, [{out}, {inp}] bf16 needs {out * inp * 2}")
+    w = (np.frombuffer(w_bf16, dtype="<u2").astype(np.uint32) << 16).view(np.float32).reshape(out, inp)
+    if not np.isfinite(w).all():
+        raise ValueError("nvfp4_from_bf16: a non-finite weight; the source tensor is corrupt")
+    amax = np.float32(np.abs(w).max())
+    s2 = np.float32(amax / np.float32(6.0 * 448.0)) if amax > 0 else np.float32(1.0)
+    blk = w.reshape(out, inp // 16, 16)
+    bmax = np.abs(blk).max(axis=2)
+    sc_code = f32_to_e4m3((bmax / (np.float32(6.0) * s2)).astype(np.float32))
+    den = (E4M3_VALUE[sc_code] * s2).astype(np.float32)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        x = np.where(den[:, :, None] > 0, blk / den[:, :, None], np.float32(0.0)).astype(np.float32)
+    code = f32_to_e2m1(np.clip(x, -6.0, 6.0)).reshape(out, inp)
+    packed = (code[:, 0::2] | (code[:, 1::2] << 4)).astype(np.uint8)
+    return nvfp4(packed.tobytes(), sc_code.tobytes(), np.float32(s2).astype("<f4").tobytes(), out, inp)
+
+
+def nvfp4_decode(buf: bytes, out: int, inp: int) -> np.ndarray:
+    """An `nvfp4` entry -> its f32 [out, in] values (e2m1 * e4m3 * scale_2): the grading inverse."""
+    vals = np.frombuffer(buf, dtype=np.uint8, count=out * inp // 2).reshape(out, inp // 2)
+    kb_n = inp // 16
+    sf_n = _rup(out, 128) * kb_n
+    sf = unswizzle_sf(np.frombuffer(buf, dtype=np.uint8, count=sf_n, offset=out * inp // 2), out, kb_n)
+    s2 = np.frombuffer(buf, dtype="<f4", count=1, offset=out * inp // 2 + sf_n)[0]
+    code = np.empty((out, inp), dtype=np.uint8)
+    code[:, 0::2] = vals & 15
+    code[:, 1::2] = vals >> 4
+    e2 = np.where(code & 8, -1.0, 1.0).astype(np.float32) * E2M1_VALUE[code & 7]
+    return e2 * (E4M3_VALUE[sf].astype(np.float32) * np.float32(s2)).repeat(16, axis=1)
+
+
+def rows_gather(buf: bytes, row_bytes: int, rows: list) -> bytes:
+    """Rows `rows` (in that order) of a row-major [n][row_bytes] buffer, verbatim -- a head over a subset of the
+    vocabulary read out of the full head (L299, the drafter's draft-vocabulary head).  Not a format conversion: the
+    family's source view names the subset as a tensor of its own."""
+    if row_bytes <= 0 or len(buf) % row_bytes:
+        raise ValueError(f"rows_gather: {len(buf)} bytes are not whole {row_bytes}-byte rows")
+    a = np.frombuffer(buf, dtype=np.uint8).reshape(-1, row_bytes)
+    ix = np.asarray(rows, dtype=np.int64)
+    if ix.size == 0 or ix.min() < 0 or ix.max() >= a.shape[0]:
+        raise ValueError(f"rows_gather: rows outside [0, {a.shape[0]})")
+    return a[ix].tobytes()
+
+
+def i32_values(values: list) -> bytes:
+    """A small I32 table the family's view states itself (L299: the drafter head's vocabulary ids), little-endian."""
+    v = np.asarray(values, dtype=np.int64)
+    if v.size == 0 or v.min() < -(1 << 31) or v.max() >= (1 << 31):
+        raise ValueError("i32_values: empty, or a value outside int32")
+    return v.astype("<i4").tobytes()
+
+
 def _quantize_fp8_e4m3_planes(x: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     """`ds4q_quantize_fp8_e4m3` (quants_fp.c:55-77) on an f32 [nrows, ncols]
     array, returned as (E8M0 [nrows, ncols/32], E4M3 [nrows, ncols]) planes."""
@@ -412,8 +490,9 @@ def rows_strided(buf: bytes, n_rows: int, row_bytes: int, start: int, step: int)
     return np.frombuffer(buf, dtype=np.uint8).reshape(n_rows, row_bytes)[start::step].tobytes()
 
 
-PRODUCERS = {f.__name__: f for f in (mxfp8_lt, mxfp8_lt_from_bf16, cutlass_mxfp4, nvfp4, fp8_e4m3_soa_k_from_bf16,
-                                      i64_to_i32, tessera_planes, rows_strided)}
+PRODUCERS = {f.__name__: f for f in (mxfp8_lt, mxfp8_lt_from_bf16, cutlass_mxfp4, nvfp4, nvfp4_from_bf16,
+                                      fp8_e4m3_soa_k_from_bf16, i64_to_i32, tessera_planes, rows_strided, rows_gather,
+                                      i32_values)}
 # the engine's native layouts, by the stored dtype (`st_layout_type`): the recipe's `native` format
 NATIVE_LAYOUT = {"BF16": "bf16", "F32": "f32", "I32": "i32"}
 
@@ -433,6 +512,7 @@ PRODUCER_FOR = {
     ("BF16", "fp8_e4m3_soa_k"): "fp8_e4m3_soa_k_from_bf16",
     ("I8+scale", "cutlass_mxfp4"): "cutlass_mxfp4",
     ("U8+nvfp4", "nvfp4"): "nvfp4",
+    ("BF16", "nvfp4"): "nvfp4_from_bf16",
     **{("exl3", layout): COPY for layout in exl3_rates.K2},
     ("tessera", "tessera"): "tessera_planes",
 }

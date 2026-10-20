@@ -6,6 +6,7 @@
 #include "spec_mtp.h"
 #include "cuda/pulsar_cuda_attn_gqa.h"
 #include "cuda/pulsar_cuda_blockdraft.h"
+#include "cuda/pulsar_cuda_candsel.h"
 #include "cuda/pulsar_cuda_head.h"
 #include "cuda/pulsar_cuda_lilicorr.h"
 #include "cuda/pulsar_cuda_qwen.h"     /* the rows front door (pulsar_rows_linear_*) */
@@ -85,29 +86,111 @@ bool get_ids(const pulsar_model *m, const char *key, uint32_t *out, uint32_t cap
 
 }  // namespace
 
+namespace {
+
+/* THE KIND TABLE (spec_block.h THE DECLARATION): per kind, where its config keeps each number (keys under
+ * "<kind>."), the chain head it ends in, its context ring's row format and its stop rule's tau. */
+struct kind_decl {
+    const char *kind;
+    pulsar_block_head_kind head;
+    pulsar_gqa_kv_fmt kv_fmt;
+    float tau;
+    const char *hidden, *n_layer, *n_head, *n_kv, *head_dim, *ff, *vocab, *block, *eps, *rope_theta;
+    const char *mask, *conv_taps, *conv_group, *window, *topk, *taps;
+    const char *non_causal;   /* a bool key that must be false: bidirectional inside the block */
+    const char *swa;          /* a bool key that must be true: every layer windowed over the context */
+};
+
+/* LiLiCorr (L298): vLLM's lilicorr config.  E4M3 K / V at unit scale: the drafter was served (and its acceptance
+ * measured) with vLLM's fp8_e4m3 KV cache, whose rounding cuts the attention's distance to it 4x against bf16 rows
+ * (L298 head grade); half the ring too.  tau measured (L298, the l297 bench single stream T0, the priced width on): tau
+ * off 62.0 tok/s, 0.3 62.0, 0.5 62.6 (code 61.1 -> 64.2), 0.7 61.4.
+ * DFlash2 (L299): z-lab's DFlash2DraftModel config (incoai/Qwen3.8-Flash-Next-DFlash2): the reference (and its
+ * training) keeps bf16 K / V; the kind's tau and ring format are L299's measurements (spec_block.cpp, the row). */
+const kind_decl k_kinds[] = {
+    {"lilicorr", PULSAR_BLOCK_HEAD_LILICORR, PULSAR_GQA_KV_E4M3, 0.5f, "hidden_size", "num_hidden_layers",
+     "num_attention_heads", "num_key_value_heads", "head_dim", "intermediate_size", "vocab_size", "block_size",
+     "rms_norm_eps", "rope_theta", "dflash.mask_token_id", "dflash.conv_kernel_size", "dflash.conv_group_size",
+     "dflash.swa_window_size", "dflash.lilicorr_candidate_topk", "dflash.target_layer_ids", "dflash.causal",
+     "dflash.use_swa"},
+    {"dflash2", PULSAR_BLOCK_HEAD_SELECTOR, PULSAR_GQA_KV_BF16, 0.5f, "hidden_size", "num_hidden_layers",
+     "num_attention_heads", "num_key_value_heads", "head_dim", "intermediate_size", "vocab_size",
+     "dflash_config.block_size", "rms_norm_eps", "rope_parameters.rope_theta", "dflash_config.mask_token_id",
+     "dflash_config.conv_kernel_size", "dflash_config.conv_group_size", "sliding_window",
+     "dflash_config.selector_top_k", "dflash_config.target_layer_ids", "is_causal", "use_sliding_window"},
+};
+const kind_decl *kind_find(const char *kind) {
+    for (const kind_decl &k : k_kinds)
+        if (!strcmp(k.kind, kind)) return &k;
+    return NULL;
+}
+
+/* "<kind>.<key>" */
+struct kkey {
+    char buf[160];
+    kkey(const char *kind, const char *key) { snprintf(buf, sizeof buf, "%s.%s", kind, key); }
+    operator const char *() const { return buf; }
+};
+
+}  // namespace
+
+const char *pulsar_block_drafter_kind_of(const pulsar_model *m) {
+    bool present = false;
+    for (uint64_t i = 0; i < m->n_kv && !present; i++) present = pulsar_streq(m->kv[i].key, "pulsar.drafter");
+    if (!present) return "";
+    pulsar_str v = {NULL, 0};
+    if (!model_get_string(m, "pulsar.drafter", &v)) {
+        refuse("pulsar.drafter is not a string%s%s");
+        return NULL;
+    }
+    if (v.len == 0) return "";
+    for (const kind_decl &k : k_kinds)
+        if (pulsar_streq(v, k.kind)) return k.kind;
+    fprintf(stderr, "pulsar: block drafter: pulsar.drafter names %.*s, a drafter the lane does not implement (",
+            (int)v.len, v.ptr);
+    for (const kind_decl &k : k_kinds) fprintf(stderr, "%s%s", &k == k_kinds ? "" : ", ", k.kind);
+    fprintf(stderr, ") -- refusing\n");
+    pulsar_load_refuse();
+    return NULL;
+}
+
+const char *const *pulsar_block_drafter_blocks(const char *kind) {
+    static const char *const lilicorr[] = {BLOCK, "lilicorr", NULL};
+    static const char *const selector[] = {BLOCK, "selector", NULL};
+    const kind_decl *k = kind_find(kind);
+    return k && k->head == PULSAR_BLOCK_HEAD_LILICORR ? lilicorr : selector;
+}
+
 bool pulsar_block_drafter_read(const pulsar_model *m, pulsar_block_drafter *d) {
     *d = pulsar_block_drafter{};
-    d->kind = "lilicorr";
-    bool ok = get_u32(m, "lilicorr.hidden_size", &d->hidden);
-    ok = get_u32(m, "lilicorr.num_hidden_layers", &d->n_layer) && ok;
-    ok = get_u32(m, "lilicorr.num_attention_heads", &d->n_head) && ok;
-    ok = get_u32(m, "lilicorr.num_key_value_heads", &d->n_kv) && ok;
-    ok = get_u32(m, "lilicorr.head_dim", &d->head_dim) && ok;
-    ok = get_u32(m, "lilicorr.intermediate_size", &d->ff) && ok;
-    ok = get_u32(m, "lilicorr.vocab_size", &d->vocab) && ok;
-    ok = get_u32(m, "lilicorr.block_size", &d->block) && ok;
-    ok = get_f32(m, "lilicorr.rms_norm_eps", &d->eps) && ok;
-    ok = get_f32(m, "lilicorr.rope_theta", &d->rope_theta) && ok;
+    const char *kind = pulsar_block_drafter_kind_of(m);
+    if (!kind) return false;
+    const kind_decl *K = kind[0] ? kind_find(kind) : NULL;
+    if (!K) return refuse("the container declares no block drafter (pulsar.drafter)%s%s");
+    d->kind = K->kind;
+    d->head_kind = K->head;
+    d->kv_fmt = K->kv_fmt;
+    const char *kd = K->kind;
+    bool ok = get_u32(m, kkey(kd, K->hidden), &d->hidden);
+    ok = get_u32(m, kkey(kd, K->n_layer), &d->n_layer) && ok;
+    ok = get_u32(m, kkey(kd, K->n_head), &d->n_head) && ok;
+    ok = get_u32(m, kkey(kd, K->n_kv), &d->n_kv) && ok;
+    ok = get_u32(m, kkey(kd, K->head_dim), &d->head_dim) && ok;
+    ok = get_u32(m, kkey(kd, K->ff), &d->ff) && ok;
+    ok = get_u32(m, kkey(kd, K->vocab), &d->vocab) && ok;
+    ok = get_u32(m, kkey(kd, K->block), &d->block) && ok;
+    ok = get_f32(m, kkey(kd, K->eps), &d->eps) && ok;
+    ok = get_f32(m, kkey(kd, K->rope_theta), &d->rope_theta) && ok;
     uint32_t mask = 0;
-    ok = get_u32(m, "lilicorr.dflash.mask_token_id", &mask) && ok;
+    ok = get_u32(m, kkey(kd, K->mask), &mask) && ok;
     d->mask_id = (int32_t)mask;
-    ok = get_u32(m, "lilicorr.dflash.conv_kernel_size", &d->conv_taps) && ok;
-    ok = get_u32(m, "lilicorr.dflash.conv_group_size", &d->conv_group) && ok;
-    ok = get_u32(m, "lilicorr.dflash.swa_window_size", &d->window) && ok;
-    ok = get_u32(m, "lilicorr.dflash.lilicorr_candidate_topk", &d->topk) && ok;
-    ok = want_bool(m, "lilicorr.dflash.causal", false) && ok;   /* bidirectional inside the block */
-    ok = want_bool(m, "lilicorr.dflash.use_swa", true) && ok;   /* every layer windowed over the context */
-    ok = get_ids(m, "lilicorr.dflash.target_layer_ids", d->tap_block, PULSAR_BLOCK_MAX_TAPS, &d->n_taps) && ok;
+    ok = get_u32(m, kkey(kd, K->conv_taps), &d->conv_taps) && ok;
+    ok = get_u32(m, kkey(kd, K->conv_group), &d->conv_group) && ok;
+    ok = get_u32(m, kkey(kd, K->window), &d->window) && ok;
+    ok = get_u32(m, kkey(kd, K->topk), &d->topk) && ok;
+    ok = want_bool(m, kkey(kd, K->non_causal), false) && ok;   /* bidirectional inside the block */
+    ok = want_bool(m, kkey(kd, K->swa), true) && ok;           /* every layer windowed over the context */
+    ok = get_ids(m, kkey(kd, K->taps), d->tap_block, PULSAR_BLOCK_MAX_TAPS, &d->n_taps) && ok;
     if (!ok) return false;
     /* the numbers the blocks implement (the shared GQA block's tiles, the round record, the top-k kernel) */
     const char *why = d->n_layer == 0 || d->n_layer > PULSAR_BLOCK_MAX_LAYERS ? "1 .. 8 layers"
@@ -123,33 +206,41 @@ bool pulsar_block_drafter_read(const pulsar_model *m, pulsar_block_drafter *d) {
                       : !(d->eps > 0.f) || !(d->rope_theta > 0.f)          ? "a positive eps and rope base"
                       : d->mask_id < 0 || (uint32_t)d->mask_id >= d->vocab ? "a mask token inside the vocabulary"
                                                                            : NULL;
-    if (why) return refuse("the declaration (lilicorr.*) is outside what the blocks implement: %s%s", why);
-    /* the candidate head: the kernel's one geometry (pulsar_cuda_lilicorr.h) */
-    uint32_t lh = 0, ll = 0, lnh = 0, lf = 0;
-    float ratio = 0.f;
-    ok = get_u32(m, "lilicorr.dflash.lilicorr_hidden_size", &lh);
-    ok = get_u32(m, "lilicorr.dflash.lilicorr_num_layers", &ll) && ok;
-    ok = get_u32(m, "lilicorr.dflash.lilicorr_num_heads", &lnh) && ok;
-    ok = get_u32(m, "lilicorr.dflash.lilicorr_factor_dim", &lf) && ok;
-    ok = get_f32(m, "lilicorr.dflash.lilicorr_mlp_ratio", &ratio) && ok;
-    ok = get_f32(m, "lilicorr.dflash.lilicorr_vector_eps", &d->head_lc.vector_eps) && ok;
-    ok = get_f32(m, "lilicorr.dflash.lilicorr_logit_scale", &d->head_lc.logit_scale) && ok;
-    if (!ok) return false;
-    if (lh != PULSAR_LILICORR_HIDDEN || ll != PULSAR_LILICORR_LAYERS || lnh != PULSAR_LILICORR_HEADS ||
-        lf != PULSAR_LILICORR_HIDDEN || ratio != 2.0f || d->topk != PULSAR_LILICORR_TOPK ||
-        d->block != PULSAR_LILICORR_SLOTS + 1u || d->hidden != PULSAR_LILICORR_MODEL)
-        return refuse("the candidate head's geometry (lilicorr.dflash.lilicorr_*) is not the head kernel's (1024 wide, 2 "
-                      "layers x 8 heads, factor 1024, mlp x2, 8 candidates at 7 slots over a 4096 drafter)%s");
+    if (why) return refuse("the declaration (%s.*) is outside what the blocks implement: %s", kd, why);
+    if (d->head_kind == PULSAR_BLOCK_HEAD_LILICORR) {
+        /* the candidate head: the kernel's one geometry (pulsar_cuda_lilicorr.h) */
+        uint32_t lh = 0, ll = 0, lnh = 0, lf = 0;
+        float ratio = 0.f;
+        ok = get_u32(m, kkey(kd, "dflash.lilicorr_hidden_size"), &lh);
+        ok = get_u32(m, kkey(kd, "dflash.lilicorr_num_layers"), &ll) && ok;
+        ok = get_u32(m, kkey(kd, "dflash.lilicorr_num_heads"), &lnh) && ok;
+        ok = get_u32(m, kkey(kd, "dflash.lilicorr_factor_dim"), &lf) && ok;
+        ok = get_f32(m, kkey(kd, "dflash.lilicorr_mlp_ratio"), &ratio) && ok;
+        ok = get_f32(m, kkey(kd, "dflash.lilicorr_vector_eps"), &d->head_lc.vector_eps) && ok;
+        ok = get_f32(m, kkey(kd, "dflash.lilicorr_logit_scale"), &d->head_lc.logit_scale) && ok;
+        if (!ok) return false;
+        if (lh != PULSAR_LILICORR_HIDDEN || ll != PULSAR_LILICORR_LAYERS || lnh != PULSAR_LILICORR_HEADS ||
+            lf != PULSAR_LILICORR_HIDDEN || ratio != 2.0f || d->topk != PULSAR_LILICORR_TOPK ||
+            d->block != PULSAR_LILICORR_SLOTS + 1u || d->hidden != PULSAR_LILICORR_MODEL)
+            return refuse("the candidate head's geometry (%s.dflash.lilicorr_*) is not the head kernel's (1024 wide, 2 "
+                          "layers x 8 heads, factor 1024, mlp x2, 8 candidates at 7 slots over a 4096 drafter)%s", kd);
+    } else {
+        /* the selector: the kernel's caps (pulsar_cuda_candsel.h) */
+        if (!get_u32(m, kkey(kd, "dflash_config.selector_rank"), &d->sel.rank)) return false;
+        if (d->sel.rank == 0 || d->sel.rank > PULSAR_CANDSEL_RANK_MAX || d->topk > PULSAR_CANDSEL_TOPK_MAX ||
+            d->block - 1u > PULSAR_CANDSEL_SLOTS_MAX)
+            return refuse("the selector (%s.dflash_config.selector_*) is outside the kernel's: rank 1 .. 256, 16 "
+                          "candidates, 15 slots%s", kd);
+    }
     d->ops = PULSAR_BLOCK_DRAFTER_OPS;
     d->ops.depth = d->ops.depth_max = d->block - 1u;   /* a chain is the block's mask slots */
-    /* the stop rule's tau on the head's slot confidences, measured (L298, the l297 bench single stream T0, the priced
-     * width on): tau off 62.0 tok/s, 0.3 62.0, 0.5 62.6 (code 61.1 -> 64.2), 0.7 61.4 */
-    d->ops.tau = 0.5f;
+    d->ops.tau = K->tau;
     return true;
 }
 
 bool pulsar_block_drafter_bind(pulsar_role_binder *b, pulsar_block_drafter *d) {
     const pulsar_role_admit A_BF16 = {PULSAR_ROLE_PLAIN(PULSAR_TENSOR_BF16), false, PULSAR_ROLE_DENSE, 0};
+    const pulsar_role_admit A_I32 = {PULSAR_ROLE_PLAIN(PULSAR_TENSOR_I32), false, PULSAR_ROLE_DENSE, 0};
     const pulsar_role_admit A_LINEAR = {0, true, PULSAR_ROLE_DENSE, PULSAR_ACTS(PULSAR_ACT_ROWS_BF16)};
     const uint64_t E = d->hidden, Q = (uint64_t)d->n_head * d->head_dim, KV = (uint64_t)d->n_kv * d->head_dim;
     const uint64_t CP = 2ull * d->conv_taps * (E / d->conv_group);
@@ -157,7 +248,21 @@ bool pulsar_block_drafter_bind(pulsar_role_binder *b, pulsar_block_drafter *d) {
     d->fc = pulsar_role_bind(b, top("fc"), A_LINEAR, 2, (uint64_t)d->n_taps * E, E);
     d->hidden_norm = pulsar_role_bind(b, top("hidden_norm"), A_BF16, 1, E);
     d->out_norm = pulsar_role_bind(b, top("out_norm"), A_BF16, 1, E);
-    d->head = pulsar_role_bind(b, top("head"), A_LINEAR, 2, E, d->vocab);
+    /* the head: the whole vocabulary, or (L299) a subset of it whose rows' ids are the container's head_ids */
+    d->head_rows = d->vocab;
+    if (const pulsar_tensor *ids = pulsar_role_binder_find(b, top("head_ids")))
+        d->head_ids = pulsar_role_bind(b, top("head_ids"), A_I32, 1, ids->ndim == 1 ? ids->dim[0] : 0);
+    if (d->head_ids) {
+        d->head_rows = (uint32_t)d->head_ids->dim[0];
+        if (d->head_kind != PULSAR_BLOCK_HEAD_SELECTOR || d->head_rows == 0 || d->head_rows > d->vocab ||
+            d->head_rows < d->topk) {
+            refuse("drafter head_ids: %s%s", d->head_kind != PULSAR_BLOCK_HEAD_SELECTOR
+                                                 ? "the LiLiCorr head gathers the whole vocabulary's candidates"
+                                                 : "a subset of the vocabulary at least topk rows long");
+            d->head_ids = NULL;
+        }
+    }
+    d->head = pulsar_role_bind(b, top("head"), A_LINEAR, 2, E, d->head_rows);
     for (uint32_t l = 0; l < d->n_layer; l++) {
         pulsar_block_layer &L = d->layer[l];
         auto k = [&](const char *role) { return pulsar_role_in(role, BLOCK, (int32_t)l); };
@@ -176,6 +281,15 @@ bool pulsar_block_drafter_bind(pulsar_role_binder *b, pulsar_block_drafter *d) {
         L.gate = pulsar_role_bind(b, k("mlp_gate"), A_LINEAR, 2, E, d->ff);
         L.up = pulsar_role_bind(b, k("mlp_up"), A_LINEAR, 2, E, d->ff);
         L.down = pulsar_role_bind(b, k("mlp_down"), A_LINEAR, 2, d->ff, E);
+    }
+    if (d->head_kind == PULSAR_BLOCK_HEAD_SELECTOR) {
+        /* the selector, block `selector`: its projection a Linear, the codebooks bf16 rows (gathered, never streamed) */
+        pulsar_block_selector &S = d->sel;
+        auto sk = [&](const char *role) { return pulsar_role_in(role, "selector", -1); };
+        S.proj = pulsar_role_bind(b, sk("hidden_proj"), A_LINEAR, 2, E, S.rank);
+        S.pred = pulsar_role_bind(b, sk("pred_codebook"), A_BF16, 2, S.rank, d->vocab);
+        S.succ = pulsar_role_bind(b, sk("succ_codebook"), A_BF16, 2, S.rank, d->vocab);
+        return d->fc && d->hidden_norm && d->out_norm && d->head && S.proj && S.pred && S.succ;
     }
     /* the candidate head, block `lilicorr`: every tensor as stored (the builder's ne order: [in, out] Linears) */
     pulsar_block_head &H = d->head_lc;
@@ -239,9 +353,7 @@ pulsar_gqa_layer gqa_decl(const pulsar_block_drafter *d, const uint16_t *qn, con
     L.n_q = d->n_head;
     L.n_kv = d->n_kv;
     L.head_dim = d->head_dim;
-    /* E4M3 K / V at unit scale: the drafter was served (and its acceptance measured) with vLLM's fp8_e4m3 KV cache,
-     * whose rounding cuts the attention's distance to it 4x against bf16 rows (L298 head grade); half the ring too */
-    L.kv_fmt = PULSAR_GQA_KV_E4M3;
+    L.kv_fmt = (pulsar_gqa_kv_fmt)d->kv_fmt;   /* the kind's (k_kinds) */
     L.span = PULSAR_GQA_WINDOW;
     L.window = d->window;
     L.scale = (float)(1.0 / sqrt((double)d->head_dim));
@@ -261,12 +373,15 @@ void pulsar_block_drafter_plan(pulsar_engine *e, pulsar_state_plan *p) {
     const pulsar_gqa_layer g = gqa_decl(d, NULL, NULL, false);
     pulsar_state_decl kv{"draft_kv", PULSAR_STATE_RING, PULSAR_STATE_CAPTURE_NONE, false, false, d->window,
                          pulsar_gqa_kv_token_bytes(&g), 0, 0, NULL, NULL, NULL};
-    pulsar_state_decl anchor{"draft_anchor", PULSAR_STATE_FIXED, PULSAR_STATE_CAPTURE_NONE, false, false, 0,
-                             (uint64_t)d->hidden * 2u, 0, 0, NULL, NULL, NULL};
     d->decl_kv = pulsar_state_plan_add(p, kv);
-    d->decl_anchor = pulsar_state_plan_add(p, anchor);
     for (uint32_t l = 0; l < d->n_layer; l++) p->slot[p->n_slots + l] = 1u << d->decl_kv;
-    p->slot[p->n_slots] |= 1u << d->decl_anchor;
+    d->decl_anchor = UINT32_MAX;
+    if (d->head_kind == PULSAR_BLOCK_HEAD_LILICORR) {   /* the candidate head reads cn of the last committed row */
+        pulsar_state_decl anchor{"draft_anchor", PULSAR_STATE_FIXED, PULSAR_STATE_CAPTURE_NONE, false, false, 0,
+                                 (uint64_t)d->hidden * 2u, 0, 0, NULL, NULL, NULL};
+        d->decl_anchor = pulsar_state_plan_add(p, anchor);
+        p->slot[p->n_slots] |= 1u << d->decl_anchor;
+    }
     p->n_slots += d->n_layer;
     /* no lane counters to keep with the walk: the ring and the anchor ARE the drafter's state at the bank's frontier
      * (a draft writes neither) */
@@ -275,9 +390,15 @@ void pulsar_block_drafter_plan(pulsar_engine *e, pulsar_state_plan *p) {
 }
 
 void pulsar_block_drafter_describe(const pulsar_block_drafter *d, char *out, size_t cap) {
-    int n = snprintf(out, cap, "%s block drafter: %u layers %u/%u/%u, ff %u, block %u, window %u, conv %ux/%u, taps",
-                     d->kind, d->n_layer, d->n_head, d->n_kv, d->head_dim, d->ff, d->block, d->window, d->conv_taps,
-                     d->conv_group);
+    char headw[64];
+    if (d->head_kind == PULSAR_BLOCK_HEAD_SELECTOR) snprintf(headw, sizeof headw, "CandidateSelector top-%u rank %u",
+                                                             d->topk, d->sel.rank);
+    else snprintf(headw, sizeof headw, "LiLiCorr top-%u", d->topk);
+    int n = snprintf(out, cap, "%s block drafter: %u layers %u/%u/%u, ff %u, block %u, window %u (%s ring), conv %ux/%u, "
+                               "head %u rows%s, %s chain head, taps",
+                     d->kind, d->n_layer, d->n_head, d->n_kv, d->head_dim, d->ff, d->block, d->window,
+                     d->kv_fmt == PULSAR_GQA_KV_E4M3 ? "E4M3" : "bf16", d->conv_taps, d->conv_group, d->head_rows,
+                     d->head_ids ? " (a draft vocabulary)" : "", headw);
     for (uint32_t j = 0; j < d->n_taps && n > 0 && (size_t)n < cap; j++)
         n += snprintf(out + n, cap - (size_t)n, " %u@L%u%s", d->tap_block[j], d->tap_layer[j],
                       d->tap_sub[j] == PULSAR_BLOCK_TAP_MIXER ? "m" : "f");
@@ -299,8 +420,11 @@ struct absorb_layout { uint64_t c, cn, stage, kb, vb, ws, ws_bytes, gqa, gqa_byt
 struct draft_layout {
     uint64_t ids, h, x, cx, t, ob, coef, q, k, v, a, g, u, m, stage, ws, ws_bytes, gqa, gqa_bytes, logits;
     uint64_t desc, desc_stride;   /* every layer's attention descriptors (pulsar_gqa_plan), desc_stride apart */
-    /* the candidate head's inputs and outputs, [bank][slot]... (pulsar_cuda_lilicorr.h) */
-    uint64_t cand_id, cand_lp, pass, anchor, valid, scores, chain_ids, chain_rows, head_ws, head_ws_bytes, total;
+    /* the chain head's inputs and outputs, [bank][slot]...: the candidates and their log-probs, the scores, the walk
+     * (both kinds); LILICORR's pass rows, anchor rows and validity and its workspace (pulsar_cuda_lilicorr.h);
+     * SELECTOR's projected rows and anchor ids (pulsar_cuda_candsel.h) */
+    uint64_t cand_id, cand_lp, pass, anchor, valid, scores, chain_ids, chain_rows, head_ws, head_ws_bytes;
+    uint64_t hp, anchor_ids, total;
 };
 
 uint64_t multi_ws(int in, const int *outs, int n, uint32_t rows) {
@@ -353,12 +477,16 @@ draft_layout draft_of(const pulsar_block_drafter *d) {
     L.m = o; o += a256(R * F * 2u);
     /* the f32 staging of the arms that do not emit bf16 themselves: the widest call (the head's vocabulary) */
     L.stage = o;
-    o += a256(R * std::max<uint64_t>(std::max<uint64_t>(2u * F, Q + 2u * KV), std::max<uint64_t>(d->vocab, CP)) * 4u);
+    o += a256(R * std::max<uint64_t>(std::max<uint64_t>(2u * F, Q + 2u * KV), std::max<uint64_t>(d->head_rows, CP)) * 4u);
     const int qkv[3] = {(int)Q, (int)KV, (int)KV}, gu[2] = {(int)F, (int)F}, eo[1] = {(int)E}, cp[1] = {(int)CP};
     L.ws = o;
     L.ws_bytes = std::max(std::max(multi_ws((int)E, qkv, 3, R), multi_ws((int)E, gu, 2, R)),
                           std::max(std::max(multi_ws((int)F, eo, 1, R), multi_ws((int)Q, eo, 1, R)),
                                    multi_ws((int)E, cp, 1, R)));
+    if (d->head_kind == PULSAR_BLOCK_HEAD_SELECTOR) {   /* its head over a draft vocabulary, its projection */
+        const int hr[1] = {(int)d->head_rows}, sr[1] = {(int)d->sel.rank};
+        L.ws_bytes = std::max(L.ws_bytes, std::max(multi_ws((int)E, hr, 1, R), multi_ws((int)E, sr, 1, R)));
+    }
     o += L.ws_bytes;
     const pulsar_gqa_layer g = gqa_decl(d, NULL, NULL, true);
     /* sized for any bound: the window's chunks cap a row's partials whatever the context */
@@ -366,17 +494,22 @@ draft_layout draft_of(const pulsar_block_drafter *d) {
     o += L.gqa_bytes;
     L.desc_stride = a256(pulsar_gqa_desc_bytes((uint32_t)R));
     L.desc = o; o += (uint64_t)d->n_layer * L.desc_stride;
-    L.logits = o; o += a256(R * d->vocab * 2u);   /* bf16: the head's rows as its producer emits them */
+    L.logits = o; o += a256(R * d->head_rows * 2u);   /* bf16: the head's rows as its producer emits them */
     const uint64_t NB = R / d->block, SL = d->block - 1u;   /* the banks a pass carries, their slots */
     L.cand_id = o; o += a256(NB * SL * d->topk * 4u);
     L.cand_lp = o; o += a256(NB * SL * d->topk * 4u);
-    L.pass = o; o += a256(NB * SL * E * 2u);
-    L.anchor = o; o += a256(NB * E * 2u);
-    L.valid = o; o += a256(NB);
     L.scores = o; o += a256(NB * SL * d->topk * d->topk * 4u);
     L.chain_ids = o; o += a256(NB * SL * 4u);
     L.chain_rows = o; o += a256(NB * SL * 4u);
-    L.head_ws = o; L.head_ws_bytes = a256(pulsar_lilicorr_head_ws_bytes((uint32_t)NB)); o += L.head_ws_bytes;
+    if (d->head_kind == PULSAR_BLOCK_HEAD_LILICORR) {
+        L.pass = o; o += a256(NB * SL * E * 2u);
+        L.anchor = o; o += a256(NB * E * 2u);
+        L.valid = o; o += a256(NB);
+        L.head_ws = o; L.head_ws_bytes = a256(pulsar_lilicorr_head_ws_bytes((uint32_t)NB)); o += L.head_ws_bytes;
+    } else {
+        L.hp = o; o += a256(R * d->sel.rank * 2u);
+        L.anchor_ids = o; o += a256(NB * 4u);
+    }
     L.total = o;
     return L;
 }
@@ -449,9 +582,10 @@ struct pulsar_block_lane {
     /* the last draft pass's head outputs, read back: [bank][slot][...] */
     std::vector<int32_t> cand_id, chain_ids;
     std::vector<float> cand_lp, scores;
-    pulsar_lilicorr_head head;   /* the candidate head's device weights (fixed for the lane's life) */
+    pulsar_lilicorr_head head;   /* LILICORR: the candidate head's device weights (fixed for the lane's life) */
     /* the draft pass's host half (pinned: its uploads read them after the call returns) */
     int32_t *h_tok;
+    int32_t *h_anchor;           /* SELECTOR: each bank's carry, slot 0's predecessor */
     uint8_t *h_valid;
     uint8_t *h_desc;
     pulsar_gqa_call call[PULSAR_BLOCK_MAX_LAYERS];
@@ -480,9 +614,11 @@ pulsar_block_lane *pulsar_block_lane_create(pulsar_session *s, uint32_t n_banks,
     l->chain_ids.resize(nbs);
     l->scores.resize(nbs * d->topk * d->topk);
     l->h_tok = (int32_t *)pulsar_gpu_host_alloc((uint64_t)kDraftRows * 4u);
+    l->h_anchor = (int32_t *)pulsar_gpu_host_alloc((uint64_t)kDraftRows * 4u);
     l->h_valid = (uint8_t *)pulsar_gpu_host_alloc(kDraftRows);
     l->h_desc = (uint8_t *)pulsar_gpu_host_alloc((uint64_t)d->n_layer * l->dl.desc_stride);
-    if (!l->h_tok || !l->h_valid || !l->h_desc || !head_weights(s, d, &l->head)) {
+    if (!l->h_tok || !l->h_anchor || !l->h_valid || !l->h_desc ||
+        (d->head_kind == PULSAR_BLOCK_HEAD_LILICORR && !head_weights(s, d, &l->head))) {
         pulsar_block_lane_free(l);
         return NULL;
     }
@@ -500,24 +636,34 @@ void pulsar_block_lane_free(pulsar_block_lane *l) {
     pulsar_gpu_tensor_free(l->taps);
     pulsar_gpu_tensor_free(l->arena);
     pulsar_gpu_host_free(l->h_tok);
+    pulsar_gpu_host_free(l->h_anchor);
     pulsar_gpu_host_free(l->h_valid);
     pulsar_gpu_host_free(l->h_desc);
     delete l;
 }
 
-bool pulsar_block_tap(pulsar_driver_state *ds, uint32_t il, uint32_t sub, const uint16_t *h, uint64_t ld, uint32_t n) {
+uint16_t *pulsar_block_tap_dst(pulsar_driver_state *ds, uint32_t il, uint32_t sub, uint32_t n, uint32_t *j,
+                               uint64_t *ld_dst, bool *refused) {
     pulsar_block_lane *l = ds ? ds->block : NULL;
-    if (!l) return true;
+    if (!l) return NULL;
     const pulsar_block_drafter *d = l->d;
-    bool ok = true;
-    for (uint32_t j = 0; ok && j < d->n_taps; j++) {
-        if (d->tap_layer[j] != il || d->tap_sub[j] != sub) continue;
-        if (n > l->max_rows) return fail("a trunk step wider than the tap rows");
-        ok = pulsar_blockdraft_rows_copy_launch(h, ld, n, d->hidden, (uint16_t *)dptr(l->taps) + (uint64_t)j * d->hidden,
-                                                l->tap_width, 0) == 0 ||
-             fail("the tap copy refused");
+    for (; *j < d->n_taps; (*j)++) {
+        if (d->tap_layer[*j] != il || d->tap_sub[*j] != sub) continue;
+        if (n > l->max_rows) {
+            *refused = !fail("a trunk step wider than the tap rows");
+            return NULL;
+        }
+        *ld_dst = l->tap_width;
+        return (uint16_t *)dptr(l->taps) + (uint64_t)(*j)++ * d->hidden;
     }
-    return ok;
+    return NULL;
+}
+
+bool pulsar_block_tap(pulsar_driver_state *ds, uint32_t il, uint32_t sub, const uint16_t *h, uint64_t ld, uint32_t n) {
+    const uint32_t E = ds && ds->block ? ds->block->d->hidden : 0u;
+    return pulsar_block_tap_rows(ds, il, sub, n, [&](uint16_t *dst, uint64_t ld_dst) {
+        return pulsar_blockdraft_rows_copy_launch(h, ld, n, E, dst, ld_dst, 0) == 0 || fail("the tap copy refused");
+    });
 }
 
 namespace {
@@ -615,8 +761,9 @@ bool absorb_rows(pulsar_session *s, uint32_t row0, const int32_t *pos, const int
              *vb = (uint16_t *)(base + A.vb);
     float *stage = (float *)(base + A.stage);
     const uint16_t *hn = (const uint16_t *)wp(s, d->hidden_norm, "drafter hidden_norm");
-    pulsar_gpu_tensor *anchor = pulsar_state_tensor(ss, ss->plan->n_trunk, d->decl_anchor);
-    if (!hn || !anchor) return fail("the drafter's context norm or anchor state is missing");
+    pulsar_gpu_tensor *anchor =
+        d->decl_anchor != UINT32_MAX ? pulsar_state_tensor(ss, ss->plan->n_trunk, d->decl_anchor) : NULL;
+    if (!hn || (d->decl_anchor != UINT32_MAX && !anchor)) return fail("the drafter's context norm or anchor state is missing");
     dump_ctx(l, row0, pos, bank, n);
     for (uint32_t p0 = 0; p0 < n; p0 += kAbsorbRows) {
         const uint32_t m = std::min(kAbsorbRows, n - p0);
@@ -659,8 +806,8 @@ bool absorb_rows(pulsar_session *s, uint32_t row0, const int32_t *pos, const int
                 pulsar_gqa_store(&G, l->seqs.data(), ns, l->row_seq.data(), l->row_pos.data(), m, &io, 0) != 0)
                 return fail("the context store refused");
         }
-        /* each bank's last row of this pass is its anchor (a later pass's overwrites it) */
-        for (uint32_t i = 0; i < m; i++) {
+        /* LILICORR: each bank's last row of this pass is its anchor (a later pass's overwrites it) */
+        for (uint32_t i = 0; anchor && i < m; i++) {
             const uint32_t r = p0 + i;
             if (i + 1u < m && bank[r + 1] == bank[r]) continue;
             if (!pulsar_gpu_tensor_copy_async(anchor, (uint64_t)bank[r] * E * 2u, l->arena, A.cn + (uint64_t)i * E * 2u,
@@ -686,8 +833,9 @@ bool draft_pass(pulsar_session *s, const uint32_t *banks, const int32_t *carry, 
     const pulsar_block_drafter *d = l->d;
     const pulsar_state_set *ss = s->states;
     const uint32_t B = d->block, R = nb * B, E = d->hidden, Q = d->n_head * d->head_dim, KV = d->n_kv * d->head_dim,
-                   F = d->ff, CP = 2u * d->conv_taps * (E / d->conv_group), V = d->vocab,
+                   F = d->ff, CP = 2u * d->conv_taps * (E / d->conv_group), V = d->vocab, HR = d->head_rows,
                    half = d->conv_taps * (E / d->conv_group), SL = B - 1u, K = d->topk;
+    const bool lili = d->head_kind == PULSAR_BLOCK_HEAD_LILICORR;
     if (R > kDraftRows || nb == 0) return fail("a draft pass outside the lane's rows");
     uint8_t *base = (uint8_t *)dptr(l->arena);
     const draft_layout &D = l->dl;
@@ -697,6 +845,7 @@ bool draft_pass(pulsar_session *s, const uint32_t *banks, const int32_t *carry, 
         const uint32_t P = ss->bank_pos[banks[i]];
         if (carry[i] < 0 || (uint32_t)carry[i] >= V) return fail("a carry outside the vocabulary");
         l->h_tok[i * B] = carry[i];
+        l->h_anchor[i] = carry[i];
         for (uint32_t j = 1; j < B; j++) l->h_tok[i * B + j] = d->mask_id;
         for (uint32_t j = 0; j < B; j++) {
             l->row_seq[i * B + j] = i;
@@ -707,12 +856,16 @@ bool draft_pass(pulsar_session *s, const uint32_t *banks, const int32_t *carry, 
     }
     uint32_t bound = 256u;   /* the attention's bound: a graph is recaptured once per doubling of the context */
     while (bound <= last) bound *= 2u;
-    pulsar_gpu_tensor *anchor = pulsar_state_tensor(ss, ss->plan->n_trunk, d->decl_anchor);
-    bool ok = anchor && pulsar_gpu_tensor_write_async(l->arena, D.ids, l->h_tok, (uint64_t)R * 4u) != 0 &&
-              pulsar_gpu_tensor_write_async(l->arena, D.valid, l->h_valid, nb) != 0;
-    for (uint32_t i = 0; ok && i < nb; i++)
-        ok = pulsar_gpu_tensor_copy_async(l->arena, D.anchor + (uint64_t)i * E * 2u, anchor, (uint64_t)banks[i] * E * 2u,
-                                          (uint64_t)E * 2u) != 0;
+    bool ok = pulsar_gpu_tensor_write_async(l->arena, D.ids, l->h_tok, (uint64_t)R * 4u) != 0;
+    if (lili) {   /* the candidate head's anchor rows (cn of each bank's last committed row) and their validity */
+        pulsar_gpu_tensor *anchor = pulsar_state_tensor(ss, ss->plan->n_trunk, d->decl_anchor);
+        ok = ok && anchor && pulsar_gpu_tensor_write_async(l->arena, D.valid, l->h_valid, nb) != 0;
+        for (uint32_t i = 0; ok && i < nb; i++)
+            ok = pulsar_gpu_tensor_copy_async(l->arena, D.anchor + (uint64_t)i * E * 2u, anchor,
+                                              (uint64_t)banks[i] * E * 2u, (uint64_t)E * 2u) != 0;
+    } else {      /* the selector's anchors: the carries */
+        ok = ok && pulsar_gpu_tensor_write_async(l->arena, D.anchor_ids, l->h_anchor, (uint64_t)nb * 4u) != 0;
+    }
     std::vector<pulsar_gqa_layer> G(d->n_layer);
     for (uint32_t li = 0; ok && li < d->n_layer; li++) {
         const pulsar_block_layer &L = d->layer[li];
@@ -735,7 +888,11 @@ bool draft_pass(pulsar_session *s, const uint32_t *banks, const int32_t *carry, 
     void *ws = base + D.ws;
     const uint16_t *table = (const uint16_t *)wp(s, d->embed, "drafter embed (the target's)");
     const uint16_t *on = (const uint16_t *)wp(s, d->out_norm, "drafter norm");
-    if (!table || !on) return fail("the drafter's embedding or final norm is missing");
+    const int32_t *id_map = d->head_ids ? (const int32_t *)wp(s, d->head_ids, "drafter head ids") : NULL;
+    const uint16_t *pred = lili ? NULL : (const uint16_t *)wp(s, d->sel.pred, "selector predecessor codebook");
+    const uint16_t *succ = lili ? NULL : (const uint16_t *)wp(s, d->sel.succ, "selector successor codebook");
+    if (!table || !on || (d->head_ids && !id_map) || (!lili && (!pred || !succ)))
+        return fail("the drafter's embedding, final norm, head ids or selector codebooks are missing");
     auto launches = [&]() -> bool {
         pulsar_head_decl hd{};
         hd.n_embd = E;
@@ -824,20 +981,35 @@ bool draft_pass(pulsar_session *s, const uint32_t *banks, const int32_t *carry, 
         if (pulsar_rows_add_launch(h, E, t, E, R, E, on, d->eps, x, E, 0) != 0) return fail("the final norm refused");
         {
             const pulsar_tensor *w[1] = {d->head};
-            const int out[1] = {(int)V};
+            const int out[1] = {(int)HR};
             uint16_t *yb[1] = {logits};
             if (!linears(s, 1, w, (int)E, out, "drafter lm_head", x, R, false, stage, yb, ws, D.ws_bytes)) return false;
         }
-        /* the candidate head (pulsar_cuda_lilicorr.h): each bank's 7 slot rows' top-8 and log-probs, those rows'
-         * final hidden, its anchor -> the scores and the greedy walk */
+        /* each bank's slot rows' top-k candidates (vocabulary ids through the head's id map) and log-probs */
         for (uint32_t i = 0; i < nb; i++)
-            if (pulsar_rows_topk_logprob_launch(logits + (uint64_t)(i * B + 1u) * V, V, SL, V, K,
+            if (pulsar_rows_topk_logprob_launch(logits + (uint64_t)(i * B + 1u) * HR, HR, SL, HR, K, id_map,
                                                 (int32_t *)(base + D.cand_id) + (uint64_t)i * SL * K,
                                                 (float *)(base + D.cand_lp) + (uint64_t)i * SL * K, 0) != 0 ||
-                pulsar_blockdraft_rows_copy_launch(x + (uint64_t)(i * B + 1u) * E, E, SL, E,
-                                                   (uint16_t *)(base + D.pass) + (uint64_t)i * SL * E, E, 0) != 0)
+                (lili && pulsar_blockdraft_rows_copy_launch(x + (uint64_t)(i * B + 1u) * E, E, SL, E,
+                                                            (uint16_t *)(base + D.pass) + (uint64_t)i * SL * E, E,
+                                                            0) != 0))
                 return fail("the candidates' top-k refused");
-        return true;
+        if (lili) return true;
+        /* the selector (pulsar_cuda_candsel.h), in the graph: hidden_projection over every row, then the scores and
+         * the walk from each bank's carry over its slot rows 1 .. block - 1 */
+        {
+            const pulsar_tensor *w[1] = {d->sel.proj};
+            const int out[1] = {(int)d->sel.rank};
+            uint16_t *yb[1] = {(uint16_t *)(base + D.hp)};
+            if (!linears(s, 1, w, (int)E, out, "selector hidden_projection", x, R, false, stage, yb, ws, D.ws_bytes))
+                return false;
+        }
+        return pulsar_candsel_launch(nb, SL, K, d->sel.rank, V, (const int32_t *)(base + D.cand_id),
+                                     (const float *)(base + D.cand_lp),
+                                     (const uint16_t *)(base + D.hp) + d->sel.rank, B, d->sel.rank,
+                                     (const int32_t *)(base + D.anchor_ids), pred, succ, (float *)(base + D.scores),
+                                     (int32_t *)(base + D.chain_ids), (int32_t *)(base + D.chain_rows), 0) == 0 ||
+               fail("the candidate selector refused");
     };
     /* one graph per (lane, banks, bound); eager while the dump reads the pass */
     uint64_t key = 0;
@@ -857,9 +1029,9 @@ bool draft_pass(pulsar_session *s, const uint32_t *banks, const int32_t *carry, 
     } else if (seg == 0) {
         ok = launches();
     }
-    /* the candidate head after the graph, its own launches: its lattice attention's cuBLASLt batched GEMM refuses
-     * inside a stream capture (status 14), so it runs eager behind the replay */
-    ok = ok && (pulsar_lilicorr_head_launch(&l->head, nb, (const int32_t *)(base + D.cand_id),
+    /* LILICORR: the candidate head after the graph, its own launches: its lattice attention's cuBLASLt batched GEMM
+     * refuses inside a stream capture (status 14), so it runs eager behind the replay */
+    ok = ok && (!lili || pulsar_lilicorr_head_launch(&l->head, nb, (const int32_t *)(base + D.cand_id),
                                             (const float *)(base + D.cand_lp), table, (const uint16_t *)(base + D.pass),
                                             (const uint16_t *)(base + D.anchor), (const uint8_t *)(base + D.valid),
                                             (float *)(base + D.scores), (int32_t *)(base + D.chain_ids),
@@ -868,9 +1040,9 @@ bool draft_pass(pulsar_session *s, const uint32_t *banks, const int32_t *carry, 
                 fail("the candidate head refused"));
     if (ok && !l->announced) {
         l->announced = true;
-        fprintf(stderr, "pulsar: block drafter: the draft pass (%u bank(s) of %u rows) runs %s, the candidate head "
-                        "behind it eager; its chain is the head's walk\n", nb, B,
-                key ? "as one captured graph a (banks, bound)" : "eager (dump)");
+        fprintf(stderr, "pulsar: block drafter: the draft pass (%u bank(s) of %u rows) runs %s, %s; its chain is the "
+                        "head's walk\n", nb, B, key ? "as one captured graph a (banks, bound)" : "eager (dump)",
+                lili ? "the LiLiCorr candidate head behind it eager" : "the CandidateSelector inside it");
     }
     if (!ok) return false;
     if (!pulsar_gpu_tensor_read(l->arena, D.cand_id, l->cand_id.data(), (uint64_t)nb * SL * K * 4u) ||

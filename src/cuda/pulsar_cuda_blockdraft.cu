@@ -55,6 +55,26 @@ __global__ void rows_copy_kernel(const uint16_t *__restrict__ src, uint64_t ld_s
     reinterpret_cast<uint4 *>(dst + (uint64_t)r * ld_dst)[i] = reinterpret_cast<const uint4 *>(src + (uint64_t)r * ld_src)[i];
 }
 
+/* one thread per 8 columns of a row: the streams summed in order, then the mean */
+__global__ void stream_mean_kernel(const uint16_t *__restrict__ src, uint64_t ld_src, uint32_t n_streams,
+                                   uint32_t width8, uint32_t width, uint16_t *__restrict__ dst, uint64_t ld_dst) {
+    const uint32_t r = blockIdx.y, i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= width8) return;
+    float acc[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+    for (uint32_t st = 0; st < n_streams; st++) {
+        const uint4 v = reinterpret_cast<const uint4 *>(src + (uint64_t)r * ld_src + (uint64_t)st * width)[i];
+        const uint32_t w[4] = {v.x, v.y, v.z, v.w};
+        for (int j = 0; j < 4; j++) {
+            acc[2 * j] += bf((uint16_t)(w[j] & 0xffffu));
+            acc[2 * j + 1] += bf((uint16_t)(w[j] >> 16));
+        }
+    }
+    const float inv = __frcp_rn((float)n_streams);   /* IEEE reciprocal (the build is fast-math): exact for 2, 4, 8 */
+    uint32_t o[4];
+    for (int j = 0; j < 4; j++) o[j] = (uint32_t)to_bf(acc[2 * j] * inv) | (uint32_t)to_bf(acc[2 * j + 1] * inv) << 16;
+    reinterpret_cast<uint4 *>(dst + (uint64_t)r * ld_dst)[i] = make_uint4(o[0], o[1], o[2], o[3]);
+}
+
 constexpr int TOPK_THREADS = 256;
 
 /* a > b in the selection order: the larger value, ties to the lower id */
@@ -65,7 +85,8 @@ __device__ __forceinline__ bool before(float va, int32_t ia, float vb, int32_t i
 /* one CTA per row: each thread a sorted local top-k of its strided columns and an online (max, sum exp); the CTA's
  * logsumexp, then k rounds of a CTA argmax over the threads' list heads */
 __global__ void __launch_bounds__(TOPK_THREADS) topk_kernel(const uint16_t *__restrict__ logits, uint64_t ld,
-                                                           uint32_t n, uint32_t k, int32_t *ids, float *lp) {
+                                                           uint32_t n, uint32_t k, const int32_t *__restrict__ id_map,
+                                                           int32_t *ids, float *lp) {
     const uint32_t row = blockIdx.x, tid = threadIdx.x;
     const uint16_t *x = logits + (uint64_t)row * ld;
     float lv[PULSAR_BLOCKDRAFT_TOPK_MAX];
@@ -114,7 +135,7 @@ __global__ void __launch_bounds__(TOPK_THREADS) topk_kernel(const uint16_t *__re
             __syncthreads();
         }
         if (tid == 0) {
-            ids[(uint64_t)row * k + j] = si[0];
+            ids[(uint64_t)row * k + j] = id_map ? id_map[si[0]] : si[0];
             lp[(uint64_t)row * k + j] = sm[0] - lse;
         }
         if ((float)tid == ss[0]) head++;
@@ -154,10 +175,21 @@ int pulsar_blockdraft_rows_copy_launch(const uint16_t *src, uint64_t ld_src, uin
     return launched("row copy");
 }
 
+int pulsar_blockdraft_stream_mean_launch(const uint16_t *src, uint64_t ld_src, uint32_t n_streams, uint32_t n_rows,
+                                         uint32_t width, uint16_t *dst, uint64_t ld_dst, cudaStream_t stream) {
+    if (!src || !dst || n_streams == 0 || n_rows == 0 || n_rows > 65535u || width % 8u || ld_src % 8u || ld_dst % 8u ||
+        ld_src < (uint64_t)n_streams * width || ((uintptr_t)src & 15u) || ((uintptr_t)dst & 15u))
+        return refuse("stream mean: no streams or rows, or rows not whole 16-byte units");
+    const uint32_t w8 = width / 8u;
+    stream_mean_kernel<<<dim3((w8 + 127u) / 128u, n_rows), 128, 0, stream>>>(src, ld_src, n_streams, w8, width, dst,
+                                                                             ld_dst);
+    return launched("stream mean");
+}
+
 int pulsar_rows_topk_logprob_launch(const uint16_t *logits, uint64_t ld, uint32_t n_rows, uint32_t n, uint32_t k,
-                                    int32_t *ids, float *lp, cudaStream_t stream) {
+                                    const int32_t *id_map, int32_t *ids, float *lp, cudaStream_t stream) {
     if (!logits || !ids || !lp || n_rows == 0 || n == 0 || ld < n || k == 0 || k > PULSAR_BLOCKDRAFT_TOPK_MAX || k > n)
         return refuse("top-k: a NULL buffer, no rows, or k outside 1 .. 16");
-    topk_kernel<<<n_rows, TOPK_THREADS, 0, stream>>>(logits, ld, n, k, ids, lp);
+    topk_kernel<<<n_rows, TOPK_THREADS, 0, stream>>>(logits, ld, n, k, id_map, ids, lp);
     return launched("top-k");
 }

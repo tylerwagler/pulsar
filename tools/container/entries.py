@@ -49,6 +49,9 @@ def dense(hf, name: str, layout: str, dshape: list, mxfp8_mode: str = "rederive"
     elif prod == "mxfp8_lt_from_bf16":
         out, inp = hshape
         desc = PR.spec(prod, [name], out=out, inp=inp)
+    elif prod == "nvfp4_from_bf16":
+        out, inp = hshape
+        desc = PR.spec(prod, [name], out=out, inp=inp)
     elif prod == "nvfp4":
         out, inp = dshape                   # the LOGICAL [out, in] (the source holds [out, in/2] bytes)
         if PR.matrix_dims(kind, hshape) != (out, inp):

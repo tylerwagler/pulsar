@@ -12,6 +12,8 @@
 #include "lib/bpe_tokenizer.h"
 #include "tp/pulsar_tp.h"
 #include "spec_mtp.h"
+#include "spec_block.h"
+#include "cuda/pulsar_cuda_blockdraft.h"
 #include "cuda/pulsar_cuda_gdn.h"
 
 #include <algorithm>
@@ -386,8 +388,8 @@ static void qwen_bind_layer(const pulsar_model *m, bool *ok, const pulsar_qwen_s
  * mtp.fc_hidden.weight -- then ALL of them or the load refuses (a partial MTP is a broken artifact,
  * not a reason to run without one).  The layer goes to slot n_layer (family_qwen.h). */
 static bool qwen_bind_mtp(const pulsar_model *m, const pulsar_qwen_shape *s, const pulsar_layer_plan *plan,
-                          pulsar_qwen_weights *w) {
-    w->mtp.present = model_find_tensor(m, "mtp.fc_hidden.weight") != NULL;
+                          pulsar_qwen_weights *w, bool selected) {
+    w->mtp.present = selected && model_find_tensor(m, "mtp.fc_hidden.weight") != NULL;
     if (!w->mtp.present) return true;
     if (plan->n_layer + 1u > PULSAR_FAMILY_MAX_LAYER) {
         fprintf(stderr, "pulsar: %s: no layer slot for the MTP layer past %u -- refusing\n", PULSAR_QWEN_ARCH,
@@ -428,7 +430,7 @@ static bool qwen_bind_mtp(const pulsar_model *m, const pulsar_qwen_shape *s, con
 }
 
 static bool qwen_bind_weights(const pulsar_model *m, const pulsar_qwen_shape *s,
-                              const pulsar_layer_plan *plan, pulsar_qwen_weights *w) {
+                              const pulsar_layer_plan *plan, pulsar_qwen_weights *w, bool mtp_selected) {
     bool ok = true;
     /* the trunk's routed experts as the builder wrote them (L266): "fused" (one gate_up slice per
      * expert, our quant) or "split" (gate and up apart, turboderp's packs -- their suh differ, so
@@ -454,8 +456,89 @@ static bool qwen_bind_weights(const pulsar_model *m, const pulsar_qwen_shape *s,
         qwen_bind_layer(m, &ok, s, plan->kind[il], lp, il == s->ple_layer, split, &w->layer[il]);
     }
     ok &= qwen_read_ple_tables(m, s, w);
-    ok &= qwen_bind_mtp(m, s, plan, w);
+    ok &= qwen_bind_mtp(m, s, plan, w, mtp_selected);
     return ok;
+}
+
+/* L299: the drafter the open selects among those the container holds -- the MTP module (mtp.*, bound by name) or a
+ * block drafter (pulsar.drafter, DFlash2: role-recorded blocks) -- and so the one LOADED: the other is declared
+ * unloaded (never staged; its memory stays the KV pool's).  --no-dspark loads neither.  A container with both refuses
+ * without --drafter (as Nemotron-H's). */
+static bool qwen_select_drafter(pulsar_engine *e, const pulsar_engine_options *opt, bool *use_mtp, bool *use_block) {
+    pulsar_model *m = &e->model;
+    const char *bk = pulsar_block_drafter_kind_of(m);
+    if (!bk) return false;
+    const bool mtp_in = model_find_tensor(m, "mtp.fc_hidden.weight") != NULL, block_in = bk[0] != 0;
+    const char *want = opt->drafter, *why = NULL;
+    *use_mtp = *use_block = false;
+    if (opt->dspark_disable) {
+    } else if (!want || !want[0]) {
+        if (mtp_in && block_in) why = "the container holds both the MTP module and a block drafter: pass --drafter";
+        *use_mtp = mtp_in;
+        *use_block = block_in;
+    } else if (!strcmp(want, "mtp")) {
+        if (!mtp_in) why = "--drafter mtp: the container holds no MTP module (mtp.*)";
+        *use_mtp = true;
+    } else if (block_in && !strcmp(want, bk)) {
+        *use_block = true;
+    } else {
+        why = "--drafter names no drafter the container holds";
+    }
+    if (why) {
+        fprintf(stderr, "pulsar: %s: %s (it holds:%s%s%s) -- refusing\n", PULSAR_QWEN_ARCH, why, mtp_in ? " mtp" : "",
+                block_in ? " " : "", block_in ? bk : "");
+        return false;
+    }
+    if (*use_block && m->tp_n_ranks > 1) {
+        fprintf(stderr, "pulsar: %s: the block drafter runs on one GPU (no tensor-parallel lane yet) -- refusing\n",
+                PULSAR_QWEN_ARCH);
+        return false;
+    }
+    if (mtp_in && !*use_mtp)
+        fprintf(stderr, "pulsar: %s: the MTP module (%llu tensors) is not the selected drafter: unloaded\n",
+                PULSAR_QWEN_ARCH, (unsigned long long)model_unload_prefix(m, "mtp."));
+    return true;
+}
+
+/* L299: the block drafter's declaration and taps (the HC-mean of the streams after each tapped layer's MLP write,
+ * qwen_layer), when selected */
+static bool qwen_block_read(pulsar_engine *e, const pulsar_qwen_shape *s, pulsar_qwen_weights *w) {
+    w->block = (pulsar_block_drafter *)xcalloc(1, sizeof(*w->block));
+    pulsar_block_drafter *d = w->block;
+    if (!pulsar_block_drafter_read(&e->model, d)) return false;
+    for (uint32_t j = 0; j < d->n_taps; j++) {
+        if (d->tap_block[j] >= s->n_layer) {
+            fprintf(stderr, "pulsar: %s: the drafter taps layer %u of a %u-layer target -- refusing\n", PULSAR_QWEN_ARCH,
+                    d->tap_block[j], s->n_layer);
+            return false;
+        }
+        d->tap_layer[j] = d->tap_block[j];        /* HF layer i is the trunk's layer i */
+        d->tap_sub[j] = PULSAR_BLOCK_TAP_FFN;     /* its completed output: after the MLP side's gated-residual write */
+    }
+    if (d->hidden != s->n_embd || d->vocab != s->n_vocab) {
+        fprintf(stderr, "pulsar: %s: the drafter's hidden %u / vocabulary %u are not the target's %u / %u -- refusing\n",
+                PULSAR_QWEN_ARCH, d->hidden, d->vocab, s->n_embd, s->n_vocab);
+        return false;
+    }
+    return true;
+}
+
+/* L299: the block drafter's tensors (role-recorded blocks; the rest of the container binds by name) bound when
+ * selected, else declared unloaded */
+static bool qwen_block_bind(pulsar_engine *e, pulsar_qwen_weights *w) {
+    const char *kind = pulsar_block_drafter_kind_of(&e->model);
+    if (!kind || !kind[0]) return kind != NULL;
+    pulsar_role_binder *b = pulsar_role_binder_open_blocks(&e->model, PULSAR_QWEN_ARCH, pulsar_block_drafter_blocks(kind));
+    if (w->block) {
+        (void)pulsar_block_drafter_bind(b, w->block);
+    } else {
+        uint64_t n = 0;
+        for (const char *const *bl = pulsar_block_drafter_blocks(kind); *bl; bl++) n += pulsar_role_binder_unload(b, *bl);
+        fprintf(stderr, "pulsar: %s: the %s block drafter (%llu tensors) is not the selected drafter: unloaded\n",
+                PULSAR_QWEN_ARCH, kind, (unsigned long long)n);
+    }
+    pulsar_role_census c;
+    return pulsar_role_binder_close(b, &c) && !pulsar_load_refusals();
 }
 
 /* The checkpoint's tokenizer.json / generation_config.json, read verbatim from the container
@@ -585,11 +668,6 @@ static bool qwen_family_load(pulsar_engine *e, const pulsar_engine_options *opt)
                 PULSAR_QWEN_ARCH);
         return false;
     }
-    if (opt->drafter && opt->drafter[0] && strcmp(opt->drafter, "mtp") != 0) {
-        fprintf(stderr, "pulsar: %s: --drafter %s: this family drafts with its MTP module only (mtp); refusing\n",
-                PULSAR_QWEN_ARCH, opt->drafter);
-        return false;
-    }
     if (opt->directional_steering_file && opt->directional_steering_file[0]) {
         fprintf(stderr, "pulsar: %s: directional steering is not implemented for this family; refusing\n",
                 PULSAR_QWEN_ARCH);
@@ -622,6 +700,9 @@ static bool qwen_family_load(pulsar_engine *e, const pulsar_engine_options *opt)
     /* L272 B7: the whole-artifact scans DeepSeek's bind runs -- a tensor type no reader takes, a NaN
      * E8M0 scale, a non-finite EXL3 scale -- run for this family's artifact too. */
     pulsar_load_refusals_reset();   /* L272: the loader's one failure policy (family.cpp) */
+    bool use_mtp = false, use_block = false;
+    if (!qwen_select_drafter(e, opt, &use_mtp, &use_block)) return false;
+    if (use_block && !qwen_block_read(e, &s, e->qwen_weights)) return false;
     weights_reject_unsupported_types(&e->model);
     weights_reject_bad_e8m0(&e->model);
     if (pulsar_load_refusals()) {
@@ -629,7 +710,8 @@ static bool qwen_family_load(pulsar_engine *e, const pulsar_engine_options *opt)
                 pulsar_load_refusals());
         return false;
     }
-    if (!qwen_bind_weights(&e->model, &g_qwen_shape, &e->plan, e->qwen_weights)) {
+    if (!qwen_bind_weights(&e->model, &g_qwen_shape, &e->plan, e->qwen_weights, use_mtp) ||
+        !qwen_block_bind(e, e->qwen_weights)) {
         fprintf(stderr, "pulsar: %s: the artifact does not bind -- refusing\n", PULSAR_QWEN_ARCH);
         return false;
     }
@@ -653,8 +735,17 @@ static bool qwen_family_load(pulsar_engine *e, const pulsar_engine_options *opt)
     /* L272 P1: the MTP layer is the drafter behind the round API -- L296 N9: the chained-MTP drafter (spec_mtp.h) at
      * this family's numbers; the drafter option (--no-dspark) turns drafting off for this family as it does for
      * DeepSeek's */
-    if (e->qwen_weights->mtp.present && !opt->dspark_disable) e->drafter_ops = &PULSAR_QWEN_MTP_DRAFTER;
+    if (e->qwen_weights->mtp.present) e->drafter_ops = &PULSAR_QWEN_MTP_DRAFTER;
     if (e->qwen_weights->mtp.present && !qwen_draft_vocab(e)) return false;
+    /* L299: the block drafter (DFlash2) behind the round API, the target's input embedding its block's */
+    if (pulsar_block_drafter *d = e->qwen_weights->block) {
+        d->embed = e->qwen_weights->token_embd;
+        e->block_drafter = d;
+        e->drafter_ops = &d->ops;
+        char desc[320];
+        pulsar_block_drafter_describe(d, desc, sizeof desc);
+        fprintf(stderr, "pulsar: %s: %s\n", PULSAR_QWEN_ARCH, desc);
+    }
     qwen_state_plan(e);   /* L295 F3: the shape is the rank's, the MTP layer known */
     fprintf(stderr, "pulsar: %s: %s, %u GDN + %u QSA layers, PLE at layer %u\n",
             PULSAR_QWEN_ARCH, g_qwen_shape.name,
@@ -702,16 +793,21 @@ static bool qwen_family_after_gpu(pulsar_engine *e) {
     const char *miss = pulsar_driver_first_missing(e->family->driver, &e->plan, &at);
     fprintf(stderr, "pulsar: %s: the core step driver over %u qwen_gdn + %u qwen_qsa blocks%s%s%s\n", PULSAR_QWEN_ARCH,
             pulsar_layer_plan_count(&e->plan, PULSAR_LAYER_QWEN_GDN), pulsar_layer_plan_count(&e->plan, PULSAR_LAYER_QWEN_QSA),
-            e->qwen_weights->mtp.present ? ", the MTP lane" : "", miss ? "; MISSING " : "", miss ? miss : "");
+            e->qwen_weights->mtp.present ? ", the MTP lane"
+            : e->block_drafter           ? ", the block drafter's lane (draft_kv RING)"
+                                         : "",
+            miss ? "; MISSING " : "", miss ? miss : "");
     return true;
 }
 
 /* ---- engine facts ------------------------------------------------------------- */
 
 static uint32_t qwen_logits_width(const pulsar_engine *) { return g_qwen_shape.n_vocab; }
-/* L272 B15: the drafter the opened artifact carries -- the MTP layer, when its sidecar shard loaded. */
+/* L272 B15: the drafter the open selected -- the MTP layer, or (L299) the block drafter. */
 static pulsar_drafter_kind qwen_drafter(pulsar_engine *e) {
-    return e->qwen_weights && e->qwen_weights->mtp.present ? PULSAR_DRAFTER_MTP : PULSAR_DRAFTER_NONE;
+    return e->qwen_weights && e->qwen_weights->mtp.present ? PULSAR_DRAFTER_MTP
+           : e->block_drafter                              ? PULSAR_DRAFTER_BLOCK
+                                                           : PULSAR_DRAFTER_NONE;
 }
 /* The routed experts' precision tier in EXL3's value space (family.h quant_bits): 20 + the highest
  * rate present in half bits.  Qwen admits EXL3 experts only, so the tier is never 2 or 4. */
@@ -829,6 +925,8 @@ void qwen_state_plan(pulsar_engine *e) {
         p->drafter_at = pulsar_mtp_drafter_at;
         p->drafter_frontier = pulsar_mtp_drafter_frontier;
     }
+    /* L299: the block drafter's slots (its context rings; spec_block.h) */
+    if (e->block_drafter) pulsar_block_drafter_plan(e, p);
     p->session = 1u << PULSAR_QWEN_STATE_NGRAM;
 }
 
@@ -893,8 +991,10 @@ static pulsar_driver_state *qwen_create(pulsar_session *s, uint32_t n_banks) {
 
 static void qwen_destroy(pulsar_session *s) { qwen_state_free(qwen_st(s)); }
 
-/* the declared state's verify capture exists with the MTP layer (the drafter speculation needs) */
-static bool qwen_verifies(const pulsar_session *s) { return s->engine->qwen_weights->mtp.present; }
+/* the declared state's verify capture exists with a drafter (the MTP layer, or L299 the block drafter) */
+static bool qwen_verifies(const pulsar_session *s) {
+    return s->engine->qwen_weights->mtp.present || s->engine->block_drafter;
+}
 
 static pulsar_driver_step *qwen_trunk(pulsar_session *s) { return qwen_st(s)->trunk; }
 
@@ -922,6 +1022,16 @@ static bool qwen_layer(const pulsar_qwen_step *st, uint32_t il, pulsar_qwen_laye
     if (ok) ok = pulsar_qwen_s4_moe(st, il);
     if (ok) ok = pulsar_driver_tp_allreduce(st, il, st->st->y, g_qwen_shape.n_embd, mtp ? "MTP moe" : "moe");
     if (ok) ok = pulsar_qwen_s4_gr_write(st, il, PULSAR_QWEN_GR_MLP);
+    /* L299: the block drafter's taps after a tapped layer's completed output -- the mean of its n_hc streams (the
+     * trunk's rows only; never the MTP layer's) */
+    if (ok && !mtp) {
+        const uint64_t HC = pulsar_qwen_hc_dim(&g_qwen_shape);
+        const uint16_t *h = (const uint16_t *)pulsar_gpu_tensor_device_ptr(st->streams);
+        ok = pulsar_block_tap_rows(st->st, il, PULSAR_BLOCK_TAP_FFN, st->n_rows, [&](uint16_t *dst, uint64_t ld) {
+            return pulsar_blockdraft_stream_mean_launch(h, HC, g_qwen_shape.n_hc, st->n_rows, g_qwen_shape.n_embd, dst,
+                                                        ld, 0) == 0;
+        });
+    }
     return ok;
 }
 
@@ -1195,7 +1305,7 @@ static const pulsar_driver_ops k_qwen_driver = {
     /* .block         = */ {NULL, NULL, qwen_block_gdn, qwen_block_qsa},   /* by pulsar_layer_kind: GDN, QSA */
     /* .head          = */ qwen_head,
     /* .step_end      = */ qwen_step_end,
-    /* .absorb        = */ pulsar_mtp_absorb,   /* L296 N9: the chained-MTP lane's lockstep (nothing without the layer) */
+    /* .absorb        = */ pulsar_drafter_lane_absorb,   /* L296 N9 / L299: the MTP or block lane's lockstep (none: nothing) */
     /* .mtp           = */ &k_qwen_mtp,         /* L296 N9: the MTP layer (spec_mtp.h) */
     /* .rope          = */ qwen_rope_table,
     /* .image_rows    = */ qwen_image_rows,
@@ -1205,6 +1315,15 @@ static const pulsar_driver_ops k_qwen_driver = {
 static_assert(PULSAR_LAYER_QWEN_GDN == 2 && PULSAR_LAYER_QWEN_QSA == 3, "the block table's slots are the kinds' values");
 
 static const pulsar_sync_ops k_qwen_sync = PULSAR_DRIVER_SYNC_OPS(PULSAR_QWEN_ARCH);
+
+/* L299: the family's own state beside qwen_weights (which the engine's close frees): the block drafter */
+static void qwen_unload(pulsar_engine *e) {
+    if (e->qwen_weights) {
+        free(e->qwen_weights->block);
+        e->qwen_weights->block = NULL;
+    }
+    e->block_drafter = NULL;
+}
 static const pulsar_family_session_ops k_qwen_session_ops = PULSAR_DRIVER_SESSION_OPS(&k_qwen_sync);
 
 /* The trunk's layers and the MTP layer each take an exchange slot (L266 step 7). */
@@ -1241,4 +1360,5 @@ const pulsar_family PULSAR_FAMILY_QWEN4_EXP = {
     /* .banks        = */ &PULSAR_BANK_OPS_DECLARED,   /* L295 F3: state_kinds.cpp */
     /* .imatrix      = */ &k_qwen_imatrix,   /* L284 P15: imatrix_qwen.cpp */
     /* .driver       = */ &k_qwen_driver,    /* L295 F4 */
+    /* .unload       = */ qwen_unload,       /* L299: the block drafter */
 };

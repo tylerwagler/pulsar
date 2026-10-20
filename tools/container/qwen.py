@@ -32,7 +32,11 @@ What the container holds (the loader's contract, published in pulsar-notes resea
     k5 / k6 / k8 (U8 [trellis | suh | svh], dims_ne [in, out]; K6 / K8 are turboderp's packs, L266).  Declared shapes are the SOURCE shapes (no reshapes).
   * shards: `vision` (primary: pulsar.kv + the vision tower, BF16 native), `layers.0..47`, `top` (embed, head,
     top-level mixer), and `mtp` (the drafter's mtp.* tensors, its expert families marked "block": "mtp") when the
-    recipe writes them (L279; the L251 sidecar's rows) -- pulsar.mtp_present says which.
+    recipe writes them (L279; the L251 sidecar's rows) -- pulsar.mtp_present says which -- and (L299) `drafter` with
+    --drafter dflash2 DIR: the DFlash2 block drafter (drafters.py; incoai/Qwen3.8-Flash-Next-DFlash2), its head the
+    target lm_head's draft-vocabulary rows (qwen_draft_vocabulary: the engine's src/engine/qwen_draft_vocab.inc), its
+    config under `dflash2.` and pulsar.drafter "dflash2" -- the engine selects it with --drafter dflash2 (the MTP
+    module, when the recipe writes it too, with --drafter mtp; the other is unloaded).
 """
 from __future__ import annotations
 
@@ -41,6 +45,7 @@ import os
 import re
 import struct
 
+import drafters as DR
 import entries as EN
 import exl3_rates
 import kv as KV
@@ -109,7 +114,10 @@ _NGRAM = re.compile(r"^ple\.ple_embedding\.ngram_embedding\.shard_\d+\.weight$")
 
 
 def map_hf(name: str, shape=None) -> Mapped | None:
-    """The naming table's row for an HF name, or None (the caller refuses)."""
+    """The naming table's row for an HF name, or None (the caller refuses); a drafter's (L299) from the plan's
+    shape (the drafter view's table)."""
+    if name.startswith(DR.DRAFTER):
+        return (shape or {}).get("drafter_mapped", {}).get(name)
     m = _BLOCK.match(name)
     if m:
         mtp, layer, rest = m.group(1) == "mtp.layers", int(m.group(2)), m.group(3)
@@ -135,18 +143,24 @@ def expert_names(m: Mapped, part: str) -> tuple[str, str]:
 
 
 def shape(hf, ctx):
-    """n_layer, the recipe, and whether the recipe writes the MTP drafter (an `mtp` shard after `top`)."""
+    """n_layer, the recipe, whether the recipe writes the MTP drafter (an `mtp` shard after `top`) and (L299) the
+    block drafter --drafter wrote (a `drafter` shard last)."""
     if ctx.recipe is None:
         default_recipe(hf, None, ctx)
     out = {"family": FAMILY, "n_layer": int(hf.config["num_hidden_layers"]), "recipe": ctx.recipe.name}
-    res = ctx.recipe.resolve({n: map_hf(n) for n in hf.names()})
-    if any(f not in R.CONSUMED for n, (f, _s) in res.items() if map_hf(n).shard == "mtp"):
+    if isinstance(hf, DR.WithDrafter):
+        out["drafter"] = hf.drafter.kind
+        out["drafter_mapped"] = hf.drafter.mapped
+    mapped = {n: map_hf(n, out) for n in hf.names()}
+    res = ctx.recipe.resolve(mapped)
+    if any(f not in R.CONSUMED for n, (f, _s) in res.items() if mapped[n].shard == "mtp"):
         out["mtp"] = True
     return out
 
 
 def shard_order(shape):
-    return ["vision"] + [f"layers.{i}" for i in range(shape["n_layer"])] + ["top"] + (["mtp"] if shape.get("mtp") else [])
+    return (["vision"] + [f"layers.{i}" for i in range(shape["n_layer"])] + ["top"] + (["mtp"] if shape.get("mtp") else [])
+            + (["drafter"] if shape.get("drafter") else []))
 
 
 def declared_shape(m, hshape):
@@ -164,6 +178,12 @@ def gate_up_key(rec):
 
 
 def admit(hf, m, fmt, name):
+    if m.shard == "drafter":                    # the --drafter input (L299): what the block-drafter lane binds
+        allowed = {"drafter_linear": {"nvfp4", "bf16", "native"}, "drafter_native": {"native", "bf16"},
+                   "drafter_ids": {"native", "i32"}}[m.role]
+        if fmt not in allowed:
+            raise SystemExit(f"{name}: the drafter's {m.role} tensor is written {sorted(allowed)}, not {fmt}")
+        return
     if fmt not in ADMITS:
         raise SystemExit(f"{name}: the qwen4_exp loader binds {sorted(ADMITS)}, not {fmt}")
 
@@ -260,6 +280,9 @@ def build_kv(hf, ctx):
             raise SystemExit(f"{ple_manifest}: {mk} {man.get(mk)} is not the checkpoint's {bufs[hk]} -- a different table")
     if man.get("layer") != ple_layer:
         raise SystemExit(f"{ple_manifest}: layer {man.get('layer')}; the checkpoint's PLE layer is {ple_layer} -- a different table")
+    if ctx.shape.get("drafter"):                # L299: the block drafter's declaration (drafters.py)
+        kvs += [("pulsar.drafter", "string", ctx.shape["drafter"])] + hf.drafter.kvs
+        kvs.append(("pulsar.source.drafter", "string", os.path.basename(os.path.normpath(hf.drafter.dir))))
     kvs += [
         ("pulsar.recipe", "string", recipe.name),
         ("pulsar.recipe.sha256", "string", recipe.sha256),
@@ -286,3 +309,38 @@ def build_kv(hf, ctx):
     if len(set(keys)) != len(keys):
         raise SystemExit("duplicate kv key: " + ", ".join(sorted(k for k in set(keys) if keys.count(k) > 1)))
     return out
+
+
+# ---------------------------------------------------------------------------
+# the drafter input (--drafter dflash2 DIR, L299): the shared block-drafter input (drafters.py) against this target
+# ---------------------------------------------------------------------------
+DRAFTERS = ("dflash2",)
+_VOCAB_INC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "src", "engine", "qwen_draft_vocab.inc")
+
+
+def qwen_draft_vocabulary(eos_id: int, n_vocab: int) -> list:
+    """The engine's draft vocabulary (family_qwen.cpp qwen_draft_vocab; src/engine/qwen_draft_vocab.inc): ids
+    [0, QWEN_DRAFT_PREFIX), the first QWEN_DRAFT_EXTRA_DEFAULT ranked ids sorted ascending, then [eos_id, n_vocab) --
+    the rows the MTP drafter's head carries, and (L299) the DFlash2 drafter's head."""
+    src = open(_VOCAB_INC).read()
+    prefix = int(re.search(r"#define QWEN_DRAFT_PREFIX (\d+)u", src).group(1))
+    extra = int(re.search(r"#define QWEN_DRAFT_EXTRA_DEFAULT (\d+)u", src).group(1))
+    ranked = [int(x) for x in re.findall(r"-?\d+", src.split("k_qwen_draft_extra[] = {", 1)[1].split("};", 1)[0])]
+    if extra > len(ranked) or prefix > eos_id:
+        raise SystemExit(f"{_VOCAB_INC}: {extra} ranked ids of {len(ranked)}, prefix {prefix} past eos {eos_id}")
+    mid = ranked[:extra]
+    if len(set(mid)) != extra or any(not prefix <= i < eos_id for i in mid):
+        raise SystemExit(f"{_VOCAB_INC}: the ranked ids are not distinct ids in [{prefix}, {eos_id})")
+    return list(range(prefix)) + sorted(mid) + list(range(eos_id, n_vocab))
+
+
+def with_drafter(hf, kind, path):
+    """build.py --drafter KIND DIR: the checkpoint view carrying the DFlash2 drafter (drafters.py), its head the
+    target lm_head's draft-vocabulary rows."""
+    if kind not in DRAFTERS:
+        raise SystemExit(f"--drafter {kind}: the qwen4_exp build reads {list(DRAFTERS)}")
+    c = hf.config
+    V, eos = int(c["vocab_size"]), int(c["eos_token_id"])
+    target = DR.Target(int(c["hidden_size"]), V, int(c["num_hidden_layers"]), hf, "lm_head.weight",
+                       tuple(qwen_draft_vocabulary(eos, V)))
+    return DR.with_drafter(hf, kind, path, target)

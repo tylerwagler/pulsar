@@ -11,7 +11,10 @@ GPU; reads only the byte ranges it needs from both trees.
   * native / i64_to_i32-> byte-identical
   * bytes_for            -> == every served tensor's span, all 48 shards
   * self-checks: the vectorised E4M3 encoder against a scalar port of the C,
-    swizzle_sf against mx_sfoff on every shape touched
+    swizzle_sf against mx_sfoff on every shape touched; (L299) nvfp4_from_bf16
+    against a scalar transcription of its recipe (codes, scales, global scale,
+    the planted E2M1 ties), its decode the nearest grid point of every value,
+    rows_gather / i32_values
 
 Exit status is non-zero on any byte difference in an exact producer.
 """
@@ -513,9 +516,60 @@ def check_refusals() -> None:
        "bytes_for nvfp4")
 
 
+def check_nvfp4_from_bf16() -> None:
+    """L299: the BF16 -> nvfp4 producer against a scalar transcription of its recipe, on a [200, 128] weight with
+    planted E2M1 midpoints (each rounds to the even code), an all-zero block and an outlier."""
+    out, inp = 200, 128
+    rng = np.random.default_rng(7)
+    w = (rng.standard_normal((out, inp)) * 0.02).astype(np.float32)
+    w[3, 16:32] = 0.0                                    # a zero block: scale 0, codes 0
+    w[5, 0] = 0.65625                                    # the global amax: s2 = 2^-12 exactly
+    w = ((w.view(np.uint32) + 0x8000) & 0xFFFF0000).view(np.float32)   # bf16 values
+    amax = np.float32(np.abs(w).max())
+    s2 = np.float32(amax / np.float32(6.0 * 448.0))
+    # plant exact midpoints in row 7, block 0: block amax 6 * scale, values at 0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5
+    sc = P.E4M3_VALUE[P.f32_to_e4m3(np.array([np.float32(0.004) / (np.float32(6.0) * s2)], dtype=np.float32))][0]
+    den = np.float32(sc * s2)
+    mids = [6.0, 0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0, -0.25, -0.75, -1.25, -1.75, -2.5, -3.5, -5.0, 0.0]
+    w[7, :16] = np.array(mids, dtype=np.float32) * den
+    exact = np.array_equal(((w[7, :16].view(np.uint32) + 0x8000) & 0xFFFF0000).view(np.float32), w[7, :16])
+    blob = P.nvfp4_from_bf16((w.view(np.uint32) >> 16).astype("<u2").tobytes(), out, inp)
+    if len(blob) != P.bytes_for("nvfp4", [inp, out]):
+        fail(f"nvfp4_from_bf16 [{out}, {inp}]: {len(blob)} bytes, the byte model says {P.bytes_for('nvfp4', [inp, out])}")
+        return
+    got = P.nvfp4_decode(blob, out, inp)
+    bad = 0
+    for r in range(out):
+        for b in range(inp // 16):
+            blk = w[r, b * 16:(b + 1) * 16]
+            code = P.f32_to_e4m3(np.array([np.abs(blk).max() / (np.float32(6.0) * s2)], dtype=np.float32))[0]
+            d = np.float32(P.E4M3_VALUE[code] * s2)
+            for i in range(16):
+                x = 0.0 if d == 0 else float(np.float32(blk[i] / d))
+                a = abs(x)
+                best = min(range(8), key=lambda k: (abs(P.E2M1_VALUE[k] - a), k % 2))   # nearest, ties to even
+                want = np.float32((-1.0 if x < 0 else 1.0) * P.E2M1_VALUE[best]) * d
+                bad += got[r, b * 16 + i] != want
+    tail = np.frombuffer(blob, dtype="<f4", count=1, offset=out * inp // 2 + 256 * (inp // 16))[0]
+    ties = got[7, 1:8] / den
+    if bad or tail != s2 or not exact or not np.array_equal(ties, np.array([0.0, 1.0, 1.0, 2.0, 2.0, 4.0, 4.0])):
+        fail(f"nvfp4_from_bf16: {bad} values differ from the scalar recipe, global scale {tail} vs {s2}, planted "
+             f"midpoints decode to {ties.tolist()} (want 0, 1, 1, 2, 2, 4, 4: ties to the even code)")
+    else:
+        ok(f"nvfp4_from_bf16 [{out}, {inp}]: every value the scalar recipe's (E4M3 block scales, E2M1 RNE, ties to "
+           f"even), global scale in the tail, the zero block zero")
+    rows = P.rows_gather(np.arange(40, dtype=np.uint8).tobytes(), 4, [9, 0, 3])
+    vals = P.i32_values([0, 7, 248319])
+    if rows != bytes([36, 37, 38, 39, 0, 1, 2, 3, 12, 13, 14, 15]) or np.frombuffer(vals, "<i4").tolist() != [0, 7, 248319]:
+        fail("rows_gather / i32_values")
+    else:
+        ok("rows_gather (rows in the given order, verbatim) and i32_values")
+
+
 def main() -> int:
     print(f"served {SERVED}\nsource {HF}")
     check_e4m3_encoder()
+    check_nvfp4_from_bf16()
     check_refusals()
     for rows, kb in [(128, 4), (256, 8), (512, 128), (2048, 64), (200, 5), (130, 3)]:
         check_swizzle(rows, kb)

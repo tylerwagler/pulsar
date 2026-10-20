@@ -57,6 +57,16 @@ typedef struct pulsar_role_binder pulsar_role_binder;
  *  entries with one key.  `owner` names the family in every message.  Never NULL. */
 pulsar_role_binder *pulsar_role_binder_open(const pulsar_model *m, const char *owner);
 
+/** L299: a binder over the entries whose bind block is one of `blocks` (NULL-terminated) only -- a family that
+ *  binds the rest of its container by name (Qwen) binds a role-recorded part of it, its block drafter, here.  An entry
+ *  outside the blocks is not this binder's: never refused (with or without a role), never priced; the close's census
+ *  is the blocks'.  Never NULL. */
+pulsar_role_binder *pulsar_role_binder_open_blocks(const pulsar_model *m, const char *owner, const char *const *blocks);
+
+/** L299: the tensor at `k` when the container holds one (nothing bound, nothing said): a declaration's optional
+ *  tensor, whose dims the caller then binds it at. */
+const pulsar_tensor *pulsar_role_binder_find(const pulsar_role_binder *b, pulsar_role_key k);
+
 /** Bind the tensor at `k`: present, its dims [d0, d1, d2][:nd] (ne order: innermost first), its format admitted by
  *  `a`.  It is charged to its role.  NULL = refused (said, counted); a key bound twice is refused too. */
 pulsar_tensor *pulsar_role_bind(pulsar_role_binder *b, pulsar_role_key k, const pulsar_role_admit &a, uint32_t nd,

@@ -3024,6 +3024,10 @@ bool model_open(pulsar_model *m, const char *path, bool gpu_mapping);
 bool safetensors_open(pulsar_model *m, const char *path, bool gpu_mapping);
 void model_summary(const pulsar_model *m);
 pulsar_tensor *model_find_tensor(const pulsar_model *m, const char *name);
+/** L299: every tensor whose name starts with `prefix` is declared NOT LOADED (pulsar_model::unloaded: never bound,
+ *  staged or priced) -- the drafter an open did not select, in a container that binds it by name (Qwen's mtp.*;
+ *  role-recorded blocks use pulsar_role_binder_unload).  Returns the tensors so marked. */
+uint64_t model_unload_prefix(pulsar_model *m, const char *prefix);
 bool accelerator_cache_model_tensors(pulsar_backend backend,
                                             const pulsar_model *m,
                                             const uint64_t *span_offsets,

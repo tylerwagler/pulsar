@@ -260,6 +260,9 @@ typedef struct {
     /** [0, n_layer) the trunk; [n_layer] the MTP layer when mtp.present (a QSA layer, split experts) */
     pulsar_qwen_layer_weights layer[PULSAR_FAMILY_MAX_LAYER];
     pulsar_qwen_mtp_weights mtp;
+    /** L299: the block drafter (spec_block.h: DFlash2) when the open selected it -- then the MTP tensors are
+     *  unloaded and mtp.present is false; NULL otherwise (its tensors, if the container holds them, unloaded). */
+    struct pulsar_block_drafter *block;
     /* The PLE hash's config (section 2): read at load, used by the host-side
      * n-gram id hashing (S4). */
     uint64_t ple_multipliers[PULSAR_QWEN_MAX_NGRAM];       ///< [ngram_size]
