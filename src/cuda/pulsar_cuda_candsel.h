@@ -22,7 +22,7 @@
  *
  * NUMERICS: every operand widened to f32; pred[p][r] * hp[s][r] rounded once to f32, the R products with succ summed
  * in r order with fused multiply-adds, the unary added last.  Deterministic, and a bank's bytes never depend on the
- * banks beside it (one CTA a bank).
+ * banks beside it.
  *
  * LIBRARIES: the hidden_projection is the caller's (the rows front door); the codebook gathers, the dots and the walk
  * are this one kernel -- nothing a library covers at K = 16, R = 256.  No host sync, no allocation, no cuBLASLt:
