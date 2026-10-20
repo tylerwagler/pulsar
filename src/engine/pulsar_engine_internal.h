@@ -778,6 +778,10 @@ typedef struct {
     uint64_t *shard_size;           ///< one mapping length per shard
     const uint8_t *kv_base;         ///< metadata value buffer (NULL => map)
     uint64_t kv_size;               ///< length of that buffer
+    /** L301: the container's identity -- FNV-1a over each shard's name and safetensors header (the declared
+     *  layout: every tensor's name, dtype, shape and offsets, and the metadata), in shard order.  What a cache of
+     *  measurements taken on this container (the verify cost curve, verify_curve.cpp) is keyed by. */
+    uint64_t container_digest;
 } pulsar_model;
 
 /* The model-family interface (L251 S1): the family descriptor, the layer plan,
@@ -1935,16 +1939,15 @@ struct pulsar_engine {
      * SPEC_ROUND_END_BATCH; the spec lane's is read by the quench guard and the allocator, both by
      * the server's lane choice. */
     pulsar_lane_cost_fit lane_cost[PULSAR_LANE_COUNT];
-    /** L288 C1: the verify width in force (pulsar_engine_set_spec_width; 0 = fused_heads_max) -- what the drafter
-     *  budgets a round's chains against. */
-    uint32_t spec_width;
     /** L288 (tf-gap pass 2): a drafter's lockstep step, measured the same way -- its wall on the chains it
      * carried (one row a chain), fed by a drafter that drafts token by token (the MTP chain) off TP.  What one
-     * more draft costs beside its verify row (pulsar_spec_chain_price). */
+     * more step costs the round (pulsar_spec_chain_step). */
     pulsar_lane_cost_fit draft_step_cost;
-    /** L288: the spec lane's yield, ms of wall an emitted token costs (an EMA; 0 = none observed) -- the value of
-     * a token every draft and verify row is priced against (pulsar_engine_spec_token_ms). */
-    float spec_token_ms;
+    /** L301: the spec lane's verify cost curve (verify_curve.cpp; pulsar_session_verify_curve_open installs it,
+     *  owned), the one authority every verify pick reads.  NULL = none: the row budget alone admits drafts. */
+    struct pulsar_verify_curve *verify_curve;
+    /** L301: the drafters' confidence calibration per draft position (pulsar_spec_calibration_note). */
+    pulsar_spec_calibration spec_calibration;
     char *directional_steering_file;   ///< steering-vector file path, or NULL
     float *directional_steering_dirs;  ///< loaded steering directions, or NULL
     float directional_steering_attn_scale;  ///< steering strength on the attention stream
@@ -2971,6 +2974,18 @@ void *xrealloc(void *ptr, size_t size);
 double now_sec(void);
 
 void lane_cost_fit_observe(pulsar_lane_cost_fit *f, uint32_t rows, double ms);
+/** L301: the verify curve (verify_curve.cpp): a curve over the profiled forward base_ms[1..rows_max] (NULL past
+ *  the landing buffers), its release; the pick over survivals sorted descending -- the drafts a round of n base
+ *  rows verifies within cap_rows, `extra_ms` added to every candidate round, *ratio its tokens per ms (c NULL: as
+ *  many as the rows hold, ratio 0); and the lockstep chains' continuation on it (pulsar_spec_chain_step's rule with
+ *  the drafter's step cost and the row cap given).  The engine-free forms the scheduler tests drive. */
+struct pulsar_verify_curve *pulsar_verify_curve_new(uint32_t rows_max, const double *base_ms);
+void pulsar_verify_curve_free(struct pulsar_verify_curve *c);
+uint32_t pulsar_verify_curve_pick(const struct pulsar_verify_curve *c, uint32_t n, const float *surv, uint32_t m,
+                                  uint32_t cap_rows, double extra_ms, double *ratio);
+uint32_t pulsar_verify_chain_pick(const struct pulsar_verify_curve *c, const pulsar_lane_cost *step, uint32_t cap,
+                                  uint32_t n_chains, const float *drafted, uint32_t n_drafted, const float *run,
+                                  uint32_t n_live, double spent_ms, bool *go);
 /** The read-only view of one fit (its terms, count and weighted centre). */
 pulsar_lane_cost lane_cost_fit_view(const pulsar_lane_cost_fit *f);
 /** A TP worker takes the leader's terms as they rode the wire. */

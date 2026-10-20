@@ -4469,6 +4469,220 @@ static void test_attn_layout_table(void) {
  * the indexer_scores scratch.  The unit process has no model, so the loader
  * installs no layout and the comp/idx term would be 0 (a gate that measures
  * nothing); the test installs the profile's V4.1 layout first. */
+/* Geometric survival for one bank: np pendings at per-position confidence c,
+ * surv[j] = c^(j+1) -- the cumprod spec_pick_rows' caller derives from the
+ * drafter carry. */
+static void l179_fill_surv(float surv[][16], uint32_t *npend, int i, uint32_t np, float c) {
+    float p = 1.0f;
+    npend[i] = np;
+    for (uint32_t j = 0; j < np; j++) {
+        p *= c;
+        surv[i][j] = p;
+    }
+}
+
+/* L301: an engine with the verify curve base[1..rows] (calloc'd: only the pick's fields are read), and its release */
+static pulsar_engine *l301_engine(const double *base, uint32_t rows) {
+    pulsar_engine *e = (pulsar_engine *)calloc(1, sizeof(pulsar_engine));
+    e->verify_curve = base ? pulsar_verify_curve_new(rows, base) : NULL;
+    return e;
+}
+static void l301_engine_free(pulsar_engine *e) {
+    pulsar_verify_curve_free(e->verify_curve);
+    free(e);
+}
+/* The staircase a 16-row decode block gives (L288 C1): flat inside a block, a block's weight reads again at 17 */
+static void l301_staircase(double *base, uint32_t rows) {
+    for (uint32_t r = 1; r <= rows; r++) base[r] = (r <= 16u ? 20.0 : 34.0) + 0.25 * (double)r;
+}
+/* The pick by brute force: every T, survivals ranked, ratio (n + sum) / (round(n + T)), the first best. */
+static uint32_t l301_brute(const float surv[][16], const uint32_t *npend, int n, int n_live, int budget,
+                           const double *round_ms) {
+    std::vector<float> all;
+    for (int i = 0; i < n; i++)
+        for (uint32_t j = 0; j < npend[i]; j++) all.push_back(surv[i][j]);
+    std::sort(all.begin(), all.end(), [](float a, float b) { return a > b; });
+    double best = -1.0, cur = n_live;
+    uint32_t best_t = 0;
+    for (uint32_t t = 0; t <= all.size() && n_live + (int)t <= budget; t++) {
+        if (t > 0) cur += all[t - 1];
+        const double r = cur / round_ms[n_live + t];
+        if (r > best) { best = r; best_t = t; }
+    }
+    return best_t;
+}
+
+/* L179 branch 1 / L301 -- the round's verify pick (spec_pick_rows).  Invariants, at any row budget B:
+ * (a) with no curve (a TP group, a classic server) every pending draft the budget holds is admitted -- whole banks
+ * while the demand fits, the global best by survival past it, each bank a prefix, the budget spent exactly;
+ * (b) with a curve the count is the brute-force argmax of (base rows + top-T survivals) / round_ms, still a global
+ * best and a prefix per bank, and hopeless drafts are cut although the budget holds them;
+ * (c) the cut count is the pending drafts left. */
+static void l179_spec_pick_rows_at(const int B) {
+    TEST_ASSERT(B > 3 + 12 && B < 3 + 48);
+    float surv[PULSAR_SESSION_POOL_CAP][16];
+    uint32_t npend[PULSAR_SESSION_POOL_CAP];
+    int k_alloc[PULSAR_SESSION_POOL_CAP];
+    bool overflow = false;
+    memset(surv, 0, sizeof surv);
+    memset(npend, 0, sizeof npend);
+    pulsar_engine *bare = l301_engine(NULL, 0);
+
+    /* (a) demand 3 + (B - 4) and exactly B fit, a fourth bank not decoding: every bank whole, nothing cut */
+    for (int d = B - 4; d <= B - 3; d++) {
+        const uint32_t third = (uint32_t)d / 3u;
+        l179_fill_surv(surv, npend, 0, third, 0.95f);
+        l179_fill_surv(surv, npend, 1, third, 0.01f);   /* hopeless, but no curve prices it */
+        l179_fill_surv(surv, npend, 2, (uint32_t)d - 2u * third, 0.99f);
+        npend[3] = 0;
+        TEST_ASSERT(spec_pick_rows(bare, surv, npend, 4, 3, B, k_alloc, &overflow) == 0 && !overflow);
+        for (int i = 0; i < 4; i++) TEST_ASSERT(k_alloc[i] == (int)npend[i]);
+    }
+    /* (a) overflow: demand 3 + 48 > B, the B - 3 highest survivals (no ties across the three banks' powers) */
+    l179_fill_surv(surv, npend, 0, 16, 0.99f);
+    l179_fill_surv(surv, npend, 1, 16, 0.97f);
+    l179_fill_surv(surv, npend, 2, 16, 0.95f);
+    float all[48];
+    for (int i = 0; i < 3; i++)
+        for (int j = 0; j < 16; j++) all[i * 16 + j] = surv[i][j];
+    std::sort(all, all + 48, [](float a, float b) { return a > b; });
+    const float kth = all[B - 3 - 1];
+    TEST_ASSERT(all[B - 3] < kth);
+    TEST_ASSERT(spec_pick_rows(bare, surv, npend, 4, 3, B, k_alloc, &overflow) == 48 - (B - 3) && overflow);
+    int admitted = 0;
+    for (int i = 0; i < 4; i++) {
+        int want = 0;
+        for (uint32_t j = 0; j < npend[i]; j++) want += surv[i][j] >= kth;
+        TEST_ASSERT(k_alloc[i] == want);
+        admitted += k_alloc[i];
+    }
+    TEST_ASSERT(3 + admitted == B);
+    l301_engine_free(bare);
+
+    /* (b) the staircase curve: the brute-force argmax, a global best, a prefix per bank */
+    double base[PULSAR_SPEC_LOGITS_ROWS + 1];
+    l301_staircase(base, PULSAR_SPEC_LOGITS_ROWS);
+    pulsar_engine *e = l301_engine(base, PULSAR_SPEC_LOGITS_ROWS);
+    const float confs[5][3] = {{0.99f, 0.97f, 0.95f}, {0.9f, 0.8f, 0.7f}, {0.6f, 0.5f, 0.4f}, {0.01f, 0.02f, 0.03f},
+                               {1.0f, 1.0f, 1.0f}};
+    for (int c = 0; c < 5; c++) {
+        for (int i = 0; i < 3; i++) l179_fill_surv(surv, npend, i, 16, confs[c][i]);
+        npend[3] = 0;
+        const int cut = spec_pick_rows(e, surv, npend, 4, 3, B, k_alloc, &overflow);
+        const uint32_t T = l301_brute(surv, npend, 4, 3, B, base);
+        int got = 0;
+        for (int i = 0; i < 4; i++) {
+            TEST_ASSERT(k_alloc[i] >= 0 && k_alloc[i] <= (int)npend[i]);
+            got += k_alloc[i];
+        }
+        TEST_ASSERT(got == (int)T && cut == 48 - (int)T && 3 + got <= B);
+        float min_admitted = 2.0f, max_unadmitted = -1.0f;
+        for (int i = 0; i < 4; i++) {
+            for (int j = 0; j < k_alloc[i]; j++) min_admitted = std::min(min_admitted, surv[i][j]);
+            if ((uint32_t)k_alloc[i] < npend[i]) max_unadmitted = std::max(max_unadmitted, surv[i][k_alloc[i]]);
+        }
+        TEST_ASSERT(got == 0 || min_admitted >= max_unadmitted);
+        if (c == 3) TEST_ASSERT(got == 0);                   /* hopeless: the base rows alone */
+        if (c == 4) TEST_ASSERT(3 + got == B);               /* certain: as wide as the budget */
+        /* the staircase: a pick past one block fills the second as far as it pays -- it never stops at 17 */
+        TEST_ASSERT(3 + got != 17);
+    }
+    l301_engine_free(e);
+}
+
+/* L284: one pick for both families, at each one's verify width (pulsar_engine_fused_heads_max -- since L288 C1
+ * both families' PULSAR_SPEC_ROW_BUDGET; the 16-row case keeps a narrower width covered). */
+static void test_l179_spec_pick_rows(void) {
+    l179_spec_pick_rows_at(16);
+    l179_spec_pick_rows_at((int)PULSAR_SPEC_LOGITS_ROWS);
+}
+
+/* L301 -- the verify curve's online correction (DeepInfer's ForwardRuntimeEstimator): the forward's residual per
+ * row against the profile, the median per row count over the median of those, robust to a stray round; the
+ * round's wall outside the forward and its drafting by the median of the last rounds at that bank count.  The pick
+ * prices with the corrected round. */
+static void test_l301_verify_curve_correction(void) {
+    double base[PULSAR_SPEC_LOGITS_ROWS + 1];
+    l301_staircase(base, PULSAR_SPEC_LOGITS_ROWS);
+    pulsar_engine *e = l301_engine(base, PULSAR_SPEC_LOGITS_ROWS);
+    pulsar_verify_curve_view v;
+    pulsar_engine_verify_curve_view(e, &v);
+    TEST_ASSERT(v.valid && !v.slope_valid && v.rows_max == PULSAR_SPEC_LOGITS_ROWS && v.base_ms[17] > v.base_ms[16]);
+    /* rounds at 4 decoders over 4..12 rows: the forward 0.5 ms a row past the profile, one in 7 a 200 ms stall */
+    for (uint32_t i = 0; i < 400; i++) {
+        const uint32_t rows = 4u + i % 9u;
+        const double fwd = base[rows] + 0.5 * rows + (i % 7u == 3u ? 200.0 : 0.0);
+        pulsar_engine_verify_curve_observe(e, 4u, rows, fwd, 6.0 + (i % 2u), 3.0);
+    }
+    pulsar_engine_verify_curve_view(e, &v);
+    TEST_ASSERT(v.slope_valid && fabsf(v.slope_ms - 0.5f) < 1e-3f);
+    TEST_ASSERT(v.observed == 400u && v.draft_ms == 3.0f && v.host_ms >= 6.0f && v.host_ms <= 7.0f);
+    /* the pick on the corrected round: the brute force over base + 0.5 r + host + draft at 4 banks */
+    float surv[PULSAR_SESSION_POOL_CAP][16];
+    uint32_t npend[PULSAR_SESSION_POOL_CAP];
+    int k_alloc[PULSAR_SESSION_POOL_CAP];
+    bool overflow;
+    memset(npend, 0, sizeof npend);
+    for (int i = 0; i < 4; i++) l179_fill_surv(surv, npend, i, 8, 0.9f - 0.1f * (float)i);
+    double round_ms[PULSAR_SPEC_LOGITS_ROWS + 1];
+    for (uint32_t r = 1; r <= PULSAR_SPEC_LOGITS_ROWS; r++) round_ms[r] = base[r] + 0.5 * r + v.host_ms + 3.0;
+    (void)spec_pick_rows(e, surv, npend, 4, 4, (int)PULSAR_SPEC_LOGITS_ROWS, k_alloc, &overflow);
+    int got = 0;
+    for (int i = 0; i < 4; i++) got += k_alloc[i];
+    TEST_ASSERT(got == (int)l301_brute(surv, npend, 4, 4, (int)PULSAR_SPEC_LOGITS_ROWS, round_ms));
+    /* a TP group reads no curve: the budget alone */
+    e->tp = (struct pulsar_tp *)e;   /* never dereferenced by the pick */
+    (void)spec_pick_rows(e, surv, npend, 4, 4, (int)PULSAR_SPEC_LOGITS_ROWS, k_alloc, &overflow);
+    /* 28 of the 32 drafts fit: the four weakest go (0.6^8, 0.6^7, 0.6^6, 0.7^8) */
+    TEST_ASSERT(k_alloc[0] == 8 && k_alloc[1] == 8 && k_alloc[2] == 7 && k_alloc[3] == 5);
+    e->tp = NULL;
+    l301_engine_free(e);
+}
+
+/* L301 -- the lockstep chains' continuation (pulsar_spec_chain_step's rule): the k best chains whose next drafts
+ * raise the round's tokens per ms once the step that drafts them is paid.  A sure chain inside the block goes on; a
+ * hopeless one stops; a step that costs more than any draft returns stops every chain; with no curve, a chain goes
+ * on while fewer drafts than the row budget outrank it. */
+static void test_l301_chain_pick(void) {
+    double base[PULSAR_SPEC_LOGITS_ROWS + 1];
+    l301_staircase(base, PULSAR_SPEC_LOGITS_ROWS);
+    pulsar_verify_curve *c = pulsar_verify_curve_new(PULSAR_SPEC_LOGITS_ROWS, base);
+    pulsar_lane_cost step;
+    memset(&step, 0, sizeof step);
+    step.valid = true;
+    step.flat_us = 1000;   /* a 1.0 + 0.1 ms/chain drafter step */
+    step.row_us = 100;
+    const float drafted[3] = {0.9f, 0.81f, 0.729f};
+    bool go[4];
+    /* one chain, survival 0.729 after three drafts: the next draft (<= 0.729) beats a 1.1 ms step on a ~22 ms round */
+    float run1[1] = {0.729f};
+    TEST_ASSERT(pulsar_verify_chain_pick(c, &step, 32u, 1u, drafted, 3u, run1, 1u, 3.0, go) == 1u && go[0]);
+    /* the same chain at survival 0.01: not worth the step */
+    float run2[1] = {0.01f};
+    TEST_ASSERT(pulsar_verify_chain_pick(c, &step, 32u, 1u, drafted, 3u, run2, 1u, 3.0, go) == 0u && !go[0]);
+    /* a 100 ms step: nothing is worth it */
+    pulsar_lane_cost slow = step;
+    slow.flat_us = 100000;
+    TEST_ASSERT(pulsar_verify_chain_pick(c, &slow, 32u, 1u, drafted, 3u, run1, 1u, 3.0, go) == 0u);
+    /* two chains, a strong and a hopeless one: the strong goes on alone (the best k is a prefix by survival) */
+    float run3[2] = {0.02f, 0.85f};
+    TEST_ASSERT(pulsar_verify_chain_pick(c, &step, 32u, 2u, drafted, 3u, run3, 2u, 3.0, go) == 1u && go[1] && !go[0]);
+    /* no curve: the row budget (32 - 2 base rows = 30) against what already outranks each chain */
+    float many[30];
+    for (int i = 0; i < 30; i++) many[i] = 0.95f;
+    TEST_ASSERT(pulsar_verify_chain_pick(NULL, &step, 32u, 2u, many, 30u, run3, 2u, 3.0, go) == 0u);
+    TEST_ASSERT(pulsar_verify_chain_pick(NULL, &step, 32u, 2u, drafted, 3u, run3, 2u, 3.0, go) == 2u && go[0] && go[1]);
+    pulsar_verify_curve_free(c);
+}
+
+/* L301: the verify pick, its online correction and the lockstep chains' continuation (verify_curve.cpp; the
+ * server's spec_pick_rows) -- host arithmetic on synthetic curves, no model. */
+static void test_verify_pick(void) {
+    test_l179_spec_pick_rows();
+    test_l301_verify_curve_correction();
+    test_l301_chain_pick();
+}
+
 /* L263 / L284: the lane cost fit (both decode lanes').  A linear step cost with
  * spread row counts fits to its terms; too few steps, one row count, or a
  * non-positive term is not a price (valid stays false) -- though one row count
@@ -4711,6 +4925,7 @@ static const pulsar_test_entry test_entries[] = {
     {"--lib-think", "lib-think", "shared <think> scanner: split tags, hold-back, spacing, seeded state", test_lib_think_scan},
     {"--attn-layout", "attn-layout", "CSA2 attention layout table: modes + sources derived from the V4.1 source sets (L218)", test_attn_layout_table},
     {"--lane-cost", "lane-cost", "lane cost fit: a step's measured cost to its terms, its centre, or no price at all (L263, L284)", test_lane_cost_fit},
+    {"--verify-pick", "verify-pick", "the verify pick: the brute-force argmax on a staircase curve, the robust online correction, the lockstep continuation (L301)", test_verify_pick},
     {"--lib-image-rope", "lib-image-rope", "multi-axis rope positions from the image records vs HF get_rope_index (L268)", test_lib_image_rope},
     {"--lib-image-identity", "lib-image-identity", "the core image identity: records per block, rewind keeps survivors, a chain persists past a block only with its record (L281)", test_lib_image_identity},
     {"--head-graph-key", "head-graph-key", "the output head's graph key carries its row kinds: a fused step's head never replays a decode step's graph (L292)", test_head_graph_key},

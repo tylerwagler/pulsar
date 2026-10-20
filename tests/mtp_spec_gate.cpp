@@ -60,16 +60,15 @@ static int n_fail = 0;
 
 static const pulsar_drafter_ops *g_base;   /* the engine's own drafter */
 static pulsar_drafter_ops g_fixed;         /* a copy at a fixed depth */
-static bool g_unpriced;                    /* a fixed depth: no priced depth either (every chain the whole depth) */
 /* the engine's own settings, put back when the gate ends (a runner gate borrows the engine) */
 static float g_tau0;
 static int g_depth0;
-static pulsar_lane_cost_fit g_cost0;
+static struct pulsar_verify_curve *g_curve0;   /* L301: the engine's verify curve (NULL off a server) */
 
 /* the drafter's numbers for a run: depth 0 = its own (the controller, the stop rule, the priced depth); else that
  * depth fixed, no stop rule, no price -- every chain drafts the whole depth, so the module runs recursively that deep */
 static void drafter_at_depth(pulsar_engine *e, uint32_t depth) {
-    g_unpriced = depth != 0;
+    e->verify_curve = depth == 0 ? g_curve0 : NULL;   /* unpriced: no verify pick cuts a chain */
     if (depth == 0) {
         e->drafter_ops = g_base;
         e->spec_tau = g_tau0;
@@ -164,9 +163,6 @@ static stream run(pulsar_engine *e, const pulsar_tokens &prompt, int n, bool spe
         s->spec.spec_quench_steps = 0;
         s->spec.spec_quench_debt = 0.0f;
         s->spec.spec_quench_ewma = 0.0f;
-        /* unpriced: the spec lane's measured cost forgotten before every round, so no chain is priced out (L288: the
-         * price needs the fit) */
-        if (g_unpriced) memset(&e->lane_cost[PULSAR_LANE_SPEC], 0, sizeof(e->lane_cost[PULSAR_LANE_SPEC]));
         if (force && spec) {
             lcg = lcg * 1664525u + 1013904223u;
             const uint32_t K = 1u + (lcg >> 8) % PULSAR_MTP_DRAFT_MAX;
@@ -415,7 +411,7 @@ static int exact(pulsar_engine *e, int n, const char *only) {
     g_base = e->drafter_ops;
     g_tau0 = e->spec_tau;
     g_depth0 = e->spec_depth;
-    g_cost0 = e->lane_cost[PULSAR_LANE_SPEC];
+    g_curve0 = e->verify_curve;
     /* M0 */
     const bool block = pulsar_engine_drafter(e) == PULSAR_DRAFTER_BLOCK;
     CHECK(pulsar_engine_has_spec_rounds(e) && g_base &&
@@ -596,7 +592,6 @@ static int exact(pulsar_engine *e, int n, const char *only) {
         if (co) pulsar_session_free(co);
     }
     drafter_at_depth(e, 0);
-    e->lane_cost[PULSAR_LANE_SPEC] = g_cost0;
     for (auto &t : P) pulsar_tokens_free(&t);
     return 0;
 }
