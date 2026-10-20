@@ -15,7 +15,7 @@
  * the token mask (dense random, a tool-name-like handful, everything masked); row strides wider than the sampled
  * width (a draft vocabulary inside a wider row).  Every case at each vocabulary a family serves.
  *
- *   ./tests/sampler_device_gate [--quick] [--seed N] [--bench] */
+ *   ./tests/sampler_device_gate [--quick] [--seed N] [--bench | --bench-only] */
 #include "pulsar_gpu.h"
 #include "sampler_host_ref.h"
 
@@ -452,17 +452,18 @@ void bench(uint32_t n_vocab, pulsar_gpu_tensor *dl, pulsar_gpu_tensor *scratch, 
 }  // namespace
 
 int main(int argc, char **argv) {
-    bool quick = false, do_bench = false;
+    bool quick = false, do_bench = false, bench_only = false;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--quick")) quick = true;
         else if (!strcmp(argv[i], "--bench")) do_bench = true;
+        else if (!strcmp(argv[i], "--bench-only")) do_bench = bench_only = true;
         else if (!strcmp(argv[i], "--seed") && i + 1 < argc) g_rng.seed(strtoull(argv[++i], nullptr, 0));
-        else { fprintf(stderr, "usage: %s [--quick] [--seed N] [--bench]\n", argv[0]); return 2; }
+        else { fprintf(stderr, "usage: %s [--quick] [--seed N] [--bench | --bench-only]\n", argv[0]); return 2; }
     }
     if (!pulsar_gpu_init()) { fprintf(stderr, "sampler-device-gate: no GPU\n"); return 1; }
     /* every vocabulary a family serves, Qwen's draft vocabulary, and a small one */
     static const uint32_t vocabs[] = {248320u, 129280u, 201024u, 82196u, 4099u};
-    const uint32_t batches = quick ? 6u : 40u;
+    const uint32_t batches = bench_only ? 0u : quick ? 6u : 40u;
     gate g;
     const auto t0 = std::chrono::steady_clock::now();
     for (uint32_t v : vocabs) {

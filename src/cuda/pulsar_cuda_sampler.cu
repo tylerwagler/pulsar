@@ -348,23 +348,303 @@ __device__ void global_radix_sort(uint32_t *k0, uint32_t *v0, uint32_t *k1, uint
     /* 8 passes: the result is back in the first buffers */
 }
 
-/* Serially sum probs[0, n) in order (one thread) -- the host's float accumulation, bit for bit. */
-__device__ __forceinline__ float serial_sum(const float *p, uint32_t n) {
-    float s = 0.0f;
-    for (uint32_t i = 0; i < n; i++) s = __fadd_rn(s, p[i]);
-    return s;
+/* ---- the prep stage: the row's scans spread over the GPU ---------------------------------------------------------
+ *
+ * One block a row reads a 1 MB row at one SM's bandwidth, once for the argmax and once or twice more for the
+ * candidates (four more for a top-k's radix select).  The prep kernels do those passes with PREP_CHUNKS blocks a row:
+ * a scan (each chunk's first maximum and finite count; a top-k row's first radix histogram), the top-k row's two
+ * further radix levels (each after a decide kernel that fixes the level's digit), and the collection (the row's
+ * maximum reduced from the chunks', then every candidate appended to the row's list -- the order is free: the row
+ * kernel sorts by (desc key, id), a total order).  The row kernel then starts from the maximum and the list; a list
+ * past its shared store, and the arm that needs a serial sum over the whole row in id order, keep their own passes.
+ * The arithmetic is the row kernel's own (the same is_cand, the same expf): the candidates are the same set. */
+
+constexpr uint32_t PREP_CHUNKS = 32;
+constexpr uint32_t PREP_THREADS = 256;
+constexpr uint32_t HIST1 = 2048, HIST2 = 2048, HIST3 = 1024;   /* desc key bits 31..21, 20..10, 9..0 */
+
+/* A row's prep record (scratch, zeroed through `zero_end` before every launch). */
+struct row_prep {
+    uint32_t n_cand;            /* candidates appended (past SMP_CAP: the list overflowed) */
+    uint32_t d1, d2, d3;        /* the top-k row's radix digits, fixed by the decide kernels */
+    uint32_t want1, want2, want3;
+    uint32_t hist[HIST1 + HIST2 + HIST3];
+    uint32_t zero_end;          /* everything above is zeroed per launch */
+    float maxv;
+    int32_t maxi;
+    uint32_t n_fin;
+    float pmax[PREP_CHUNKS];
+    int32_t pidx[PREP_CHUNKS];
+    uint32_t pfin[PREP_CHUNKS];
+    uint64_t cand[SMP_CAP];
+};
+
+/* A row's knobs as the sampler reads them, and its path. */
+struct row_plan {
+    bool refuse, greedy;
+    uint32_t path;
+    float T, top_p, min_p, rcpT, prefilter;
+    int top_k;
+    bool full;
+};
+
+__device__ __forceinline__ row_plan plan_row(const pulsar_gpu_sample_req &q, uint32_t n_vocab) {
+    row_plan p;
+    p.greedy = (q.flags & PULSAR_GPU_SAMPLE_GREEDY) != 0;
+    p.T = q.temperature;
+    p.top_p = q.top_p;
+    p.min_p = q.min_p;
+    p.top_k = q.top_k;
+    p.refuse = !p.greedy && (!finite_bits(p.T) || !finite_bits(p.top_p) || !finite_bits(p.min_p));
+    p.greedy = p.greedy || (!p.refuse && p.T <= 0.0f);
+    if (p.top_p <= 0.0f || p.top_p > 1.0f) p.top_p = 1.0f;
+    if (p.min_p < 0.0f) p.min_p = 0.0f;
+    if (p.top_k <= 0 || p.top_k > 1024) p.top_k = p.top_k <= 0 ? 0 : 1024;
+    p.rcpT = p.refuse || p.greedy ? 0.0f : __fdiv_rn(1.0f, p.T);
+    p.path = p.top_k > 0 ? PATH_TOPK : p.min_p > MINP_PREFILTER_MIN ? PATH_MINP : PATH_FULL;
+    p.prefilter = 0.0f;
+    p.full = false;
+    if (p.path == PATH_MINP) {
+        p.prefilter = __fmul_rn(p.min_p, MINP_PREFILTER_SLACK);
+        /* L295 F7: THE sparse min-p predicate, min_p >= max(0.02, 2.5 * 2^-24 * n_vocab).  With top_p == 1 the cut's
+         * `filtered * (1 / sum) >= 1` test is redundant with the min-p cut: while a further survivor exists, sum >=
+         * filtered + min_p (every survivor's p >= min_p times the max's, which is expf(0) == 1), so the ratio stays at
+         * least min_p / (filtered + min_p) under 1, which clears the rounding band (2 * 2^-24) for filtered <= n_vocab
+         * when min_p > 2 * 2^-24 * n_vocab; the 2.5 is a 25% margin.  So the arm drops the sum (+inf) and the expf
+         * below the floor. */
+        const float band = __fmul_rn(1.4901161193847656e-7f, (float)n_vocab);
+        p.full = p.top_p == 1.0f && p.min_p >= (band > SPARSE_MINP_MIN ? band : SPARSE_MINP_MIN);
+    }
+    return p;
 }
 
-/* THE row: argmax, the path, the candidates, the cut, the race.  `slot` NULL = the row kernel (shared candidates
- * only; a row past SMP_CAP is left pending), else the slot kernel's global scratch. */
-template <uint32_t THREADS>
-__device__ void sample_row(const launch_args &a, uint32_t row, row_smem<THREADS> &sm, uint8_t *slot) {
-    const uint32_t tid = threadIdx.x;
-    const pulsar_gpu_sample_req q = a.req[row];
+/* THE candidate predicate of the min-p and full arms (a top-k row's is its key against K*) -- the row kernel's and
+ * the prep's.  floor: the full-nucleus arm's bound (an entry under it has p < prefilter however it rounds), else
+ * -inf; *pp receives p where it was computed. */
+__device__ __forceinline__ bool row_is_cand(const row_plan &p, uint32_t i, float v, float floor_logit, float maxlogit,
+                                            uint32_t max_id, float *pp) {
+    if (!finite_bits(v)) return false;
+    if (p.path == PATH_FULL) return true;
+    if (v < floor_logit && i != max_id) return false;
+    const float pr = plm_expf(__fmul_rn(__fsub_rn(v, maxlogit), p.rcpT));
+    *pp = pr;
+    return pr >= p.prefilter || i == max_id;
+}
+
+__device__ __forceinline__ float row_floor(const row_plan &p, float maxv) {
+    return p.path == PATH_MINP && p.full ? __fmaf_rn(__fsub_rn(logf(p.min_p), 1e-3f), p.T, maxv)
+                                         : __uint_as_float(0xff800000u);
+}
+
+__device__ __forceinline__ row_view prep_view(const launch_args &a, const pulsar_gpu_sample_req &q) {
     row_view rv;
     rv.x = a.logits + (size_t)q.row * a.row_stride;
     rv.n = a.n_vocab;
     rv.mask = a.mask && q.mask_row != PULSAR_GPU_SAMPLE_NO_MASK ? a.mask + (size_t)q.mask_row * a.mask_words : nullptr;
+    return rv;
+}
+
+/* chunk c of a row: [lo, hi) */
+__device__ __forceinline__ void prep_chunk(uint32_t n, uint32_t c, uint32_t *lo, uint32_t *hi) {
+    const uint32_t per = (n + PREP_CHUNKS - 1u) / PREP_CHUNKS;
+    *lo = min(c * per, n);
+    *hi = min(*lo + per, n);
+}
+
+/* scan: the chunk's first maximum and finite count; a top-k row's first histogram */
+__global__ void __launch_bounds__(PREP_THREADS) prep_scan_kernel(const __grid_constant__ launch_args a, row_prep *prep) {
+    __shared__ float rv_[PREP_THREADS];
+    __shared__ int32_t ri_[PREP_THREADS];
+    __shared__ uint32_t ru_[PREP_THREADS];
+    const uint32_t row = blockIdx.y, c = blockIdx.x, tid = threadIdx.x;
+    const pulsar_gpu_sample_req q = a.req[row];
+    const row_plan p = plan_row(q, a.n_vocab);
+    row_prep *pr = prep + row;
+    const row_view rv = prep_view(a, q);
+    uint32_t lo, hi;
+    prep_chunk(rv.n, c, &lo, &hi);
+    const bool hist = !p.refuse && !p.greedy && p.path == PATH_TOPK;
+    float bv = 0.0f;
+    int32_t bi = -1;
+    uint32_t fin = 0;
+    for (uint32_t i = lo + tid; i < hi; i += PREP_THREADS) {
+        const float v = rv(i);
+        if (!finite_bits(v)) continue;
+        fin++;
+        if (bi < 0 || v > bv) { bv = v; bi = (int32_t)i; }
+        if (hist) atomicAdd(&pr->hist[desc_key(v) >> 21], 1u);
+    }
+    rv_[tid] = bv;
+    ri_[tid] = bi;
+    ru_[tid] = fin;
+    __syncthreads();
+    for (uint32_t s = PREP_THREADS / 2u; s > 0u; s >>= 1) {
+        if (tid < s) {
+            const float vr = rv_[tid + s], vl = rv_[tid];
+            const int32_t ir = ri_[tid + s], il = ri_[tid];
+            if (ir >= 0 && (il < 0 || vr > vl || (vr == vl && ir < il))) { rv_[tid] = vr; ri_[tid] = ir; }
+            ru_[tid] += ru_[tid + s];
+        }
+        __syncthreads();
+    }
+    if (tid == 0) {
+        pr->pmax[c] = rv_[0];
+        pr->pidx[c] = ri_[0];
+        pr->pfin[c] = ru_[0];
+    }
+}
+
+/* the row's first maximum and finite count from its chunks' (the block argmax's rule: a larger value, or an equal one
+ * at a lower id) */
+__device__ __forceinline__ void prep_reduce_max(const row_prep *pr, float *maxv, int32_t *maxi, uint32_t *n_fin) {
+    float bv = 0.0f;
+    int32_t bi = -1;
+    uint32_t fin = 0;
+    for (uint32_t c = 0; c < PREP_CHUNKS; c++) {
+        const float v = pr->pmax[c];
+        const int32_t i = pr->pidx[c];
+        fin += pr->pfin[c];
+        if (i >= 0 && (bi < 0 || v > bv || (v == bv && i < bi))) { bv = v; bi = i; }
+    }
+    *maxv = bv;
+    *maxi = bi;
+    *n_fin = fin;
+}
+
+/* decide level L of a top-k row's radix select: the digit whose cumulative count reaches the keys still wanted
+ * (the k-th smallest key's), and how many of the level's class sit below it */
+template <uint32_t L>
+__global__ void __launch_bounds__(PREP_THREADS) prep_decide_kernel(const __grid_constant__ launch_args a, row_prep *prep) {
+    __shared__ uint32_t sc[PREP_THREADS];
+    const uint32_t row = blockIdx.x, tid = threadIdx.x;
+    const row_plan p = plan_row(a.req[row], a.n_vocab);
+    if (p.refuse || p.greedy || p.path != PATH_TOPK) return;
+    row_prep *pr = prep + row;
+    const uint32_t nb = L == 1 ? HIST1 : L == 2 ? HIST2 : HIST3;
+    const uint32_t *h = pr->hist + (L == 1 ? 0u : L == 2 ? HIST1 : HIST1 + HIST2);
+    uint32_t want;
+    if (L == 1) {
+        float mv;
+        int32_t mi;
+        uint32_t nf;
+        prep_reduce_max(pr, &mv, &mi, &nf);
+        want = min((uint32_t)p.top_k, nf);
+    } else {
+        want = L == 2 ? pr->want1 : pr->want2;
+    }
+    /* each thread a contiguous run of bins; a scan of the runs' sums finds the digit */
+    const uint32_t per = nb / PREP_THREADS;
+    uint32_t s = 0;
+    for (uint32_t b = 0; b < per; b++) s += h[tid * per + b];
+    sc[tid] = s;
+    __syncthreads();
+    for (uint32_t off = 1; off < PREP_THREADS; off <<= 1) {
+        const uint32_t t = tid >= off ? sc[tid - off] : 0u;
+        __syncthreads();
+        sc[tid] += t;
+        __syncthreads();
+    }
+    const uint32_t before = sc[tid] - s;   /* bins below this thread's run */
+    if (want == 0) return;                 /* no finite value: the row kernel refuses it */
+    if (before < want && sc[tid] >= want) {
+        uint32_t c = before, d = tid * per;
+        while (c + h[d] < want) c += h[d++];
+        if (L == 1) { pr->d1 = d; pr->want1 = want - c; }
+        else if (L == 2) { pr->d2 = d; pr->want2 = want - c; }
+        else { pr->d3 = d; pr->want3 = want - c; }
+    }
+}
+
+/* level 2 / 3 histograms over the keys of the decided prefix */
+template <uint32_t L>
+__global__ void __launch_bounds__(PREP_THREADS) prep_hist_kernel(const __grid_constant__ launch_args a, row_prep *prep) {
+    const uint32_t row = blockIdx.y, c = blockIdx.x, tid = threadIdx.x;
+    const pulsar_gpu_sample_req q = a.req[row];
+    const row_plan p = plan_row(q, a.n_vocab);
+    if (p.refuse || p.greedy || p.path != PATH_TOPK) return;
+    row_prep *pr = prep + row;
+    const row_view rv = prep_view(a, q);
+    uint32_t lo, hi;
+    prep_chunk(rv.n, c, &lo, &hi);
+    const uint32_t prefix = L == 2 ? pr->d1 : (pr->d1 << 11) | pr->d2;
+    const uint32_t shift = L == 2 ? 21u : 10u;
+    uint32_t *h = pr->hist + (L == 2 ? HIST1 : HIST1 + HIST2);
+    for (uint32_t i = lo + tid; i < hi; i += PREP_THREADS) {
+        const float v = rv(i);
+        if (!finite_bits(v)) continue;
+        const uint32_t dk = desc_key(v);
+        if ((dk >> shift) != prefix) continue;
+        atomicAdd(&h[L == 2 ? (dk >> 10) & 2047u : dk & 1023u], 1u);
+    }
+}
+
+/* the row's maximum (block 0 records it) and its candidates appended to its list */
+__global__ void __launch_bounds__(PREP_THREADS) prep_collect_kernel(const __grid_constant__ launch_args a,
+                                                                    row_prep *prep) {
+    const uint32_t row = blockIdx.y, c = blockIdx.x, tid = threadIdx.x;
+    const pulsar_gpu_sample_req q = a.req[row];
+    const row_plan p = plan_row(q, a.n_vocab);
+    row_prep *pr = prep + row;
+    float maxv;
+    int32_t maxi;
+    uint32_t n_fin;
+    prep_reduce_max(pr, &maxv, &maxi, &n_fin);
+    if (c == 0 && tid == 0) {
+        pr->maxv = maxv;
+        pr->maxi = maxi;
+        pr->n_fin = n_fin;
+    }
+    if (p.refuse || p.greedy || maxi < 0) return;
+    if (p.path == PATH_FULL && n_fin > SMP_CAP) {   /* every finite value is a candidate: past the store */
+        if (c == 0 && tid == 0) pr->n_cand = n_fin;
+        return;
+    }
+    const row_view rv = prep_view(a, q);
+    uint32_t lo, hi;
+    prep_chunk(rv.n, c, &lo, &hi);
+    const uint32_t kstar = (pr->d1 << 21) | (pr->d2 << 10) | pr->d3;
+    const float floor_logit = row_floor(p, maxv);
+    for (uint32_t i = lo + tid; i < hi; i += PREP_THREADS) {
+        const float v = rv(i);
+        bool take;
+        if (p.path == PATH_TOPK) {
+            take = finite_bits(v) && desc_key(v) <= kstar;   /* below K*, and K*'s whole tie class */
+        } else {
+            float pp;
+            take = row_is_cand(p, i, v, floor_logit, maxv, (uint32_t)maxi, &pp);
+        }
+        if (!take) continue;
+        const uint32_t at = atomicAdd(&pr->n_cand, 1u);
+        if (at < SMP_CAP) pr->cand[at] = ((uint64_t)desc_key(v) << 32) | i;
+    }
+}
+
+/* Serially sum v[0, n) in order (one thread) -- the host's float accumulation, bit for bit; four at a time from
+ * shared memory so the loads overlap the dependent adds. */
+__device__ __forceinline__ float serial_sum_from(float s, const float *v, uint32_t n) {
+    uint32_t i = 0;
+    if ((((uintptr_t)v) & 15u) == 0)
+        for (; i + 4u <= n; i += 4u) {
+            const float4 x = *reinterpret_cast<const float4 *>(v + i);
+            s = __fadd_rn(s, x.x);
+            s = __fadd_rn(s, x.y);
+            s = __fadd_rn(s, x.z);
+            s = __fadd_rn(s, x.w);
+        }
+    for (; i < n; i++) s = __fadd_rn(s, v[i]);
+    return s;
+}
+__device__ __forceinline__ float serial_sum(const float *p, uint32_t n) { return serial_sum_from(0.0f, p, n); }
+
+/* THE row: argmax, the path, the candidates, the cut, the race.  `pp` (the row kernel) is the row's prep -- its maximum
+ * and candidate list (a list past the shared store leaves the row pending for a slot); `slot` (the slot kernel, pp
+ * NULL) is a global scratch slot: the row's own passes, a stable radix sort in global memory. */
+template <uint32_t THREADS>
+__device__ void sample_row(const launch_args &a, uint32_t row, row_smem<THREADS> &sm, const row_prep *pp,
+                           uint8_t *slot) {
+    const uint32_t tid = threadIdx.x;
+    const pulsar_gpu_sample_req q = a.req[row];
+    const row_view rv = prep_view(a, q);
     row_out_t *o = a.out + row;
     uint32_t *dist = a.dist ? a.dist + (size_t)row * (1u + 2u * a.dist_cap) : nullptr;
     auto finish = [&](int32_t tok, uint32_t status) {
@@ -383,17 +663,20 @@ __device__ void sample_row(const launch_args &a, uint32_t row, row_smem<THREADS>
     };
 
     if (tid == 0) o->probe_p = 0.0f;   /* before the first barrier: a race-loop thread may set it below */
-    float maxv;
-    int32_t maxi;
-    const bool greedy_flag = (q.flags & PULSAR_GPU_SAMPLE_GREEDY) != 0;
-    float T = q.temperature, top_p = q.top_p, min_p = q.min_p;
-    int top_k = q.top_k;
-    if (!greedy_flag && (!finite_bits(T) || !finite_bits(top_p) || !finite_bits(min_p))) {
+    const row_plan p = plan_row(q, rv.n);
+    if (p.refuse) {
         finish(-1, PULSAR_GPU_SAMPLE_REFUSED_KNOB);
         return;
     }
-    block_argmax<THREADS>(rv, sm.redv, sm.redi, &maxv, &maxi);
-    if (greedy_flag || T <= 0.0f) {
+    float maxv;
+    int32_t maxi;
+    if (pp) {
+        maxv = pp->maxv;
+        maxi = pp->maxi;
+    } else {
+        block_argmax<THREADS>(rv, sm.redv, sm.redi, &maxv, &maxi);
+    }
+    if (p.greedy) {
         if (maxi >= 0 && a.id_map) maxi = a.id_map[maxi];
         if (tid == 0 && maxi >= 0 && maxi == q.probe) o->probe_p = 1.0f;
         finish(maxi, maxi < 0 ? PULSAR_GPU_SAMPLE_REFUSED_EMPTY : PULSAR_GPU_SAMPLE_OK);
@@ -404,11 +687,12 @@ __device__ void sample_row(const launch_args &a, uint32_t row, row_smem<THREADS>
         finish(-1, PULSAR_GPU_SAMPLE_REFUSED_EMPTY);
         return;
     }
-    if (top_p <= 0.0f || top_p > 1.0f) top_p = 1.0f;
-    if (min_p < 0.0f) min_p = 0.0f;
-    if (top_k <= 0 || top_k > 1024) top_k = top_k <= 0 ? 0 : 1024;
-    const float rcpT = __fdiv_rn(1.0f, T);
-    const uint32_t path = top_k > 0 ? PATH_TOPK : min_p > MINP_PREFILTER_MIN ? PATH_MINP : PATH_FULL;
+    const float top_p = p.top_p, min_p = p.min_p, rcpT = p.rcpT;
+    /* a prep list past the shared store: the slot kernel finishes this row from scratch */
+    if (pp && pp->n_cand > SMP_CAP) {
+        if (tid == 0) a.pending[row] = 1u;
+        return;
+    }
 
     cand_list cl;
     cl.map = a.id_map;
@@ -433,12 +717,22 @@ __device__ void sample_row(const launch_args &a, uint32_t row, row_smem<THREADS>
         gcnt = (uint32_t *)(gp + a.n_vocab);   /* 17 x THREADS words */
     }
 
-    if (path == PATH_TOPK) {
-        uint32_t nfin = 0;
-        for (uint32_t i = tid; i < rv.n; i += THREADS) nfin += finite_bits(rv(i)) ? 1u : 0u;
-        nfin = block_sum_u32<THREADS>(nfin, sm.redu);
-        const uint32_t k = min((uint32_t)top_k, nfin);
-        select_topk<THREADS>(rv, k, sm.keys, sm.hist, &sm.cnt, sm.redu);
+    if (p.path == PATH_TOPK) {
+        uint32_t k;
+        if (pp) {
+            /* the prep's list: every key below K* and K*'s tie class; sorted, its first k are the host's k */
+            k = min((uint32_t)p.top_k, pp->n_fin);
+            const uint32_t m = pp->n_cand;
+            for (uint32_t i = tid; i < m; i += THREADS) sm.keys[i] = pp->cand[i];
+            __syncthreads();
+            bitonic_sort<THREADS>(sm.keys, m);
+        } else {
+            uint32_t nfin = 0;
+            for (uint32_t i = tid; i < rv.n; i += THREADS) nfin += finite_bits(rv(i)) ? 1u : 0u;
+            nfin = block_sum_u32<THREADS>(nfin, sm.redu);
+            k = min((uint32_t)p.top_k, nfin);
+            select_topk<THREADS>(rv, k, sm.keys, sm.hist, &sm.cnt, sm.redu);
+        }
         cl.n = k;
         cl.skeys = sm.keys;
         maxlogit = rv((uint32_t)sm.keys[0]);
@@ -451,68 +745,51 @@ __device__ void sample_row(const launch_args &a, uint32_t row, row_smem<THREADS>
         sum = sm.fsum;
     } else {
         /* PATH_MINP / PATH_FULL: the candidate predicate, and (MINP, not full-nucleus) the id-order sum */
-        bool full = false;
-        float floor_logit = __uint_as_float(0xff800000u), prefilter = 0.0f;
         const uint32_t max_id = (uint32_t)maxi;
-        if (path == PATH_MINP) {
-            prefilter = __fmul_rn(min_p, MINP_PREFILTER_SLACK);
-            /* L295 F7: THE sparse min-p predicate, min_p >= max(0.02, 2.5 * 2^-24 * n_vocab).  With top_p == 1 the
-             * cut's `filtered * (1 / sum) >= 1` test is redundant with the min-p cut: while a further survivor
-             * exists, sum >= filtered + min_p (every survivor's p >= min_p times the max's, which is expf(0) == 1),
-             * so the ratio stays at least min_p / (filtered + min_p) under 1, which clears the rounding band
-             * (2 * 2^-24) for filtered <= n_vocab when min_p > 2 * 2^-24 * n_vocab; the 2.5 is a 25% margin.  So
-             * the arm drops the sum (+inf) and the expf below the floor. */
-            const float band = __fmul_rn(1.4901161193847656e-7f, (float)rv.n);
-            full = top_p == 1.0f && min_p >= (band > SPARSE_MINP_MIN ? band : SPARSE_MINP_MIN);
-            /* a bound, not a decision: an entry under it has p < prefilter however it rounds */
-            if (full) floor_logit = __fmaf_rn(__fsub_rn(logf(min_p), 1e-3f), T, maxv);
-            maxlogit = maxv;
-        }
-        auto is_cand = [&](uint32_t i, float v, float *pp) -> bool {
-            if (!finite_bits(v)) return false;
-            if (path == PATH_FULL) return true;
-            if (v < floor_logit && i != max_id) return false;
-            const float p = plm_expf(__fmul_rn(__fsub_rn(v, maxlogit), rcpT));
-            *pp = p;
-            return p >= prefilter || i == max_id;
-        };
-        /* count, and the id-order serial sum where the arm keeps one */
-        const bool idsum = path == PATH_MINP && !full;
+        const float floor_logit = row_floor(p, maxv);
+        if (p.path == PATH_MINP) maxlogit = maxv;
+        const bool idsum = p.path == PATH_MINP && !p.full;
         if (tid == 0) { sm.cnt = 0; sm.fsum = 0.0f; }
         __syncthreads();
-        uint32_t mine = 0;
-        for (uint32_t base = 0; base < rv.n; base += THREADS) {
-            const uint32_t i = base + tid;
-            float p = 0.0f;   /* a non-finite value adds +0 to the sum: the host skipped it, same bits */
-            const bool c = i < rv.n && is_cand(i, rv(i), &p);
-            mine += c ? 1u : 0u;
-            if (idsum) {
-                sm.tile[tid] = i < rv.n ? p : 0.0f;
-                __syncthreads();
-                if (tid == 0) {
-                    float s = sm.fsum;
-                    const uint32_t m = min(THREADS, rv.n - base);
-                    for (uint32_t j = 0; j < m; j++) s = __fadd_rn(s, sm.tile[j]);
-                    sm.fsum = s;
+        uint32_t n;
+        if (!pp || idsum) {
+            /* count (no prep), and the id-order serial sum where the arm keeps one */
+            uint32_t mine = 0;
+            for (uint32_t base = 0; base < rv.n; base += THREADS) {
+                const uint32_t i = base + tid;
+                float pr = 0.0f;   /* a non-finite value adds +0 to the sum: the host skipped it, same bits */
+                const bool c = i < rv.n && row_is_cand(p, i, rv(i), floor_logit, maxlogit, max_id, &pr);
+                mine += c ? 1u : 0u;
+                if (idsum) {
+                    sm.tile[tid] = i < rv.n ? pr : 0.0f;
+                    __syncthreads();
+                    if (tid == 0) sm.fsum = serial_sum_from(sm.fsum, sm.tile, min(THREADS, rv.n - base));
+                    __syncthreads();
                 }
-                __syncthreads();
             }
+            n = pp ? pp->n_cand : block_sum_u32<THREADS>(mine, sm.redu);
+        } else {
+            n = pp->n_cand;
         }
-        const uint32_t n = block_sum_u32<THREADS>(mine, sm.redu);
         if (idsum) sum = sm.fsum;
-        if (path == PATH_MINP && full) { sum = __uint_as_float(0x7f800000u); sum_inert = true; }
+        if (p.path == PATH_MINP && p.full) { sum = __uint_as_float(0x7f800000u); sum_inert = true; }
         cl.n = n;
         if (n <= SMP_CAP) {
-            if (tid == 0) sm.cnt = 0;
-            __syncthreads();
-            for (uint32_t i = tid; i < rv.n; i += THREADS) {
-                float p;
-                if (is_cand(i, rv(i), &p)) sm.keys[atomicAdd(&sm.cnt, 1u)] = ((uint64_t)desc_key(rv(i)) << 32) | i;
+            if (pp) {
+                for (uint32_t i = tid; i < n; i += THREADS) sm.keys[i] = pp->cand[i];
+            } else {
+                if (tid == 0) sm.cnt = 0;
+                __syncthreads();
+                for (uint32_t i = tid; i < rv.n; i += THREADS) {
+                    float pr;
+                    if (row_is_cand(p, i, rv(i), floor_logit, maxlogit, max_id, &pr))
+                        sm.keys[atomicAdd(&sm.cnt, 1u)] = ((uint64_t)desc_key(rv(i)) << 32) | i;
+                }
             }
             __syncthreads();
             bitonic_sort<THREADS>(sm.keys, n);
             cl.skeys = sm.keys;
-            if (path == PATH_FULL) maxlogit = rv((uint32_t)sm.keys[0]);
+            if (p.path == PATH_FULL) maxlogit = rv((uint32_t)sm.keys[0]);
             for (uint32_t i = tid; i < n; i += THREADS)
                 sm.probs[i] = plm_expf(__fmul_rn(__fsub_rn(rv((uint32_t)sm.keys[i]), maxlogit), rcpT));
             __syncthreads();
@@ -527,24 +804,28 @@ __device__ void sample_row(const launch_args &a, uint32_t row, row_smem<THREADS>
             const uint32_t lo = min(tid * chunk, rv.n), hi = min(lo + chunk, rv.n);
             uint32_t c = 0;
             for (uint32_t i = lo; i < hi; i++) {
-                float p;
-                c += is_cand(i, rv(i), &p) ? 1u : 0u;
+                float pr;
+                c += row_is_cand(p, i, rv(i), floor_logit, maxlogit, max_id, &pr) ? 1u : 0u;
             }
             uint32_t pos = block_scan_incl<THREADS>(c, sm.redu) - c;
             for (uint32_t i = lo; i < hi; i++) {
-                float p;
-                if (is_cand(i, rv(i), &p)) { gk0[pos] = desc_key(rv(i)); gv0[pos] = i; pos++; }
+                float pr;
+                if (row_is_cand(p, i, rv(i), floor_logit, maxlogit, max_id, &pr)) {
+                    gk0[pos] = desc_key(rv(i));
+                    gv0[pos] = i;
+                    pos++;
+                }
             }
             __syncthreads();
             global_radix_sort<THREADS>(gk0, gv0, gk1, gv1, n, gcnt);
             cl.gids = gv0;
-            if (path == PATH_FULL) maxlogit = rv(gv0[0]);
+            if (p.path == PATH_FULL) maxlogit = rv(gv0[0]);
             for (uint32_t i = tid; i < n; i += THREADS)
                 gp[i] = plm_expf(__fmul_rn(__fsub_rn(rv(gv0[i]), maxlogit), rcpT));
             __syncthreads();
             cl.probs = gp;
         }
-        if (path == PATH_FULL) {
+        if (p.path == PATH_FULL) {
             if (tid == 0) sm.fsum = serial_sum(cl.probs, n);
             __syncthreads();
             sum = sm.fsum;
@@ -594,11 +875,12 @@ __device__ void sample_row(const launch_args &a, uint32_t row, row_smem<THREADS>
     finish(tok, PULSAR_GPU_SAMPLE_OK);
 }
 
-__global__ void __launch_bounds__(SMP_THREADS) sample_rows_kernel(const __grid_constant__ launch_args a) {
+__global__ void __launch_bounds__(SMP_THREADS) sample_rows_kernel(const __grid_constant__ launch_args a,
+                                                                   const row_prep *prep) {
     __shared__ row_smem<SMP_THREADS> sm;
     if (threadIdx.x == 0) a.pending[blockIdx.x] = 0u;
     __syncthreads();
-    sample_row<SMP_THREADS>(a, blockIdx.x, sm, nullptr);
+    sample_row<SMP_THREADS>(a, blockIdx.x, sm, prep + blockIdx.x, nullptr);
 }
 
 /* The rows the row kernel left pending, round-robin over the slots in row order. */
@@ -608,7 +890,7 @@ __global__ void __launch_bounds__(SLOT_THREADS) sample_slots_kernel(const __grid
     for (uint32_t r = 0; r < a.n_rows; r++) {
         if (!a.pending[r]) continue;
         if (rank++ % SMP_SLOTS != blockIdx.x) continue;
-        sample_row<SLOT_THREADS>(a, r, sm, a.slots + (size_t)blockIdx.x * a.slot_bytes);
+        sample_row<SLOT_THREADS>(a, r, sm, nullptr, a.slots + (size_t)blockIdx.x * a.slot_bytes);
         __syncthreads();
     }
 }
@@ -764,9 +1046,14 @@ uint64_t pulsar_gpu_sample_slot_bytes(uint32_t n_vocab) {
     return (uint64_t)n_vocab * 5u * sizeof(uint32_t) + 17ull * SLOT_THREADS * sizeof(uint32_t);
 }
 
+/* scratch: the slots, the pending flags, the rows' prep records */
+static uint64_t sample_prep_off(uint32_t n_vocab) {
+    return ((uint64_t)SMP_SLOTS * ((pulsar_gpu_sample_slot_bytes(n_vocab) + 255u) & ~255ull) +
+            (uint64_t)PULSAR_GPU_SAMPLE_ROWS_MAX * sizeof(uint32_t) + 255u) & ~255ull;
+}
+
 uint64_t pulsar_gpu_sample_scratch_bytes(uint32_t n_vocab) {
-    return (uint64_t)SMP_SLOTS * ((pulsar_gpu_sample_slot_bytes(n_vocab) + 255u) & ~255ull) +
-           (uint64_t)PULSAR_GPU_SAMPLE_ROWS_MAX * sizeof(uint32_t);
+    return sample_prep_off(n_vocab) + (uint64_t)PULSAR_GPU_SAMPLE_ROWS_MAX * sizeof(row_prep);
 }
 
 int pulsar_gpu_sample_rows(const pulsar_gpu_tensor *logits, uint64_t logits_offset_bytes, uint32_t row_stride,
@@ -816,7 +1103,24 @@ int pulsar_gpu_sample_rows(const pulsar_gpu_tensor *logits, uint64_t logits_offs
     a.pending = (uint32_t *)((uint8_t *)scratch->ptr + (uint64_t)SMP_SLOTS * a.slot_bytes);
     a.dist = dist ? (uint32_t *)dist->ptr : nullptr;
     a.dist_cap = dist_cap;
-    sample_rows_kernel<<<n_rows, SMP_THREADS>>>(a);
+    /* the prep: the rows' scans over PREP_CHUNKS blocks a row, the top-k rows' radix levels when a row is one */
+    row_prep *prep = (row_prep *)((uint8_t *)scratch->ptr + sample_prep_off(n_vocab));
+    bool any_topk = false;
+    for (uint32_t r = 0; r < n_rows; r++) any_topk |= reqs[r].top_k > 0;
+    const dim3 pg(PREP_CHUNKS, n_rows);
+    if (!cuda_ok(cudaMemset2DAsync(prep, sizeof(row_prep), 0, offsetof(row_prep, zero_end), n_rows,
+                                   cudaStreamPerThread), "device sampler prep zero"))
+        return 0;
+    prep_scan_kernel<<<pg, PREP_THREADS>>>(a, prep);
+    if (any_topk) {
+        prep_decide_kernel<1><<<n_rows, PREP_THREADS>>>(a, prep);
+        prep_hist_kernel<2><<<pg, PREP_THREADS>>>(a, prep);
+        prep_decide_kernel<2><<<n_rows, PREP_THREADS>>>(a, prep);
+        prep_hist_kernel<3><<<pg, PREP_THREADS>>>(a, prep);
+        prep_decide_kernel<3><<<n_rows, PREP_THREADS>>>(a, prep);
+    }
+    prep_collect_kernel<<<pg, PREP_THREADS>>>(a, prep);
+    sample_rows_kernel<<<n_rows, SMP_THREADS>>>(a, prep);
     if (!cuda_ok(cudaGetLastError(), "device sampler rows")) return 0;
     sample_slots_kernel<<<SMP_SLOTS, SLOT_THREADS>>>(a);
     return cuda_ok(cudaGetLastError(), "device sampler slots");
