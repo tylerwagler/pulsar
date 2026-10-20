@@ -137,6 +137,7 @@ tests/dspark_batch_gate
 /tests/csa2_compressor_kernel_test
 /tests/indexer_score_test
 /tests/sampler_device_gate
+/tests/sync_budget_gate
 # gate binaries the battery builds in-tree (2026-09-23: a clean run left these untracked)
 /tests/expert_table_gate
 /tests/exl3_moe_epilogue_gate
