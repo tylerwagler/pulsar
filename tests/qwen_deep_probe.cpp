@@ -144,8 +144,8 @@ int main(int argc, char **argv) {
             got += n;
             rounds++;
         }
-        ok = ok && pulsar_session_eval(s, pulsar_session_argmax(s), err, sizeof err) == 0;
-        CHECK(ok, "4 decode steps, %d tokens speculated in %d rounds, one plain step: frontier %d %s", got, rounds,
+        for (int i = 0; ok && i < 6; i++) ok = pulsar_session_eval(s, pulsar_session_argmax(s), err, sizeof err) == 0;
+        CHECK(ok, "4 decode steps, %d tokens speculated in %d rounds, 6 plain steps: frontier %d %s", got, rounds,
               pulsar_session_pos(s), err);
         const std::string fp_ = dir + "/l280-payload.bin";
         FILE *pf = ok ? fopen(fp_.c_str(), "wb") : NULL;
@@ -290,9 +290,10 @@ int main(int argc, char **argv) {
               "%.2f tokens / round, %llu drafted %s", n_spec, D, first_diff, rounds, (double)n_spec / (rounds ? rounds : 1),
               (unsigned long long)(m1.draft_tokens - m0.draft_tokens), err);
 
-        /* PAYLOAD: the frontier (off the grid, past the prefill, the drafter's state moved) -- after one plain step,
-         * which leaves the MTP lane at a savable frontier (payload_frontier_gate's order) */
-        ok = ok && pulsar_session_eval(s, pulsar_session_argmax(s), err, sizeof err) == 0;
+        /* PAYLOAD: the frontier (off the grid, past the prefill, the drafter's state moved) -- after 6 plain steps,
+         * which leave the MTP lane at a savable frontier (its index stage is a 4-token block, rewritten only by
+         * whole blocks; payload_frontier_gate's order) */
+        for (int i = 0; ok && i < 6; i++) ok = pulsar_session_eval(s, pulsar_session_argmax(s), err, sizeof err) == 0;
         FILE *pf = ok ? fopen(fp_.c_str(), "wb") : NULL;
         const uint64_t pb = ok ? pulsar_session_payload_bytes(s) : 0;
         const double t1 = now_s();
