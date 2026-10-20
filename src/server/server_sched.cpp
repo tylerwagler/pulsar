@@ -1321,6 +1321,7 @@ void server::publish_metrics_snapshot() {
     s->m_spec_thr_cut_rows = s->w_spec_thr_cut_rows;
     memcpy(s->m_spec_phase_ms, s->w_spec_phase_ms, sizeof s->m_spec_phase_ms);
     s->m_spec_phase_rounds = s->w_spec_phase_rounds;
+    memcpy(s->m_spec_syncs, s->w_spec_syncs, sizeof s->m_spec_syncs);
     s->m_decode_lane = s->w_decode_lane;
     /* Bump and wake the /metrics/stream subscribers. A generation counter
      * rather than a payload comparison on purpose: "did anything move" over a
@@ -2564,6 +2565,8 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n, int quantum_
     while (emitted_total < quantum_tokens) {
         const bool first_round = round_ix++ == 0;
         const double round_t0 = server_now_sec();   /* L263: this round's cost observation */
+        pulsar_gpu_sync_stats sync0;                  /* L302: and its synchronisations */
+        pulsar_gpu_sync_stats_get(&sync0);
         const int round_emitted0 = emitted_total;   /* L284: and its yield */
         /* ---- L260 fusion: the queued prompts that ride this round's forward,
          * one chunk each, up to fuse_rows prompt rows in all.  A chunk that
@@ -3114,6 +3117,12 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n, int quantum_
                                                               round_t1};
             for (int p = 0; p < SERVER_ROUND_PHASE_COUNT; p++) s->w_spec_phase_ms[p] += (cut[p + 1] - cut[p]) * 1e3;
             s->w_spec_phase_rounds++;
+            pulsar_gpu_sync_stats sync1;
+            pulsar_gpu_sync_stats_get(&sync1);
+            s->w_spec_syncs[0] += sync1.stream_syncs - sync0.stream_syncs;
+            s->w_spec_syncs[1] += sync1.d2h - sync0.d2h;
+            s->w_spec_syncs[2] += sync1.d2h_bytes - sync0.d2h_bytes;
+            s->w_spec_syncs[3] += sync1.h2d - sync0.h2d;
             pulsar_engine_lane_cost_observe(s->engine, PULSAR_LANE_SPEC, rows, (server_now_sec() - round_t0) * 1e3);
             /* L284 lane cost: the same round's yield, per bank -- what the lane choice prices the spec lane's
              * rows by (lane_price_pick) */

@@ -1621,6 +1621,10 @@ struct server {
     uint64_t w_spec_phase_rounds;
     double   m_spec_phase_ms[SERVER_ROUND_PHASE_COUNT];
     uint64_t m_spec_phase_rounds;
+    /** L302: the same rounds' host<->device synchronisations (pulsar_gpu_sync_stats deltas): stream drains, blocking
+     *  device -> host copies (and their bytes), blocking host -> device copies -- pulsar:spec_round_syncs_total. */
+    uint64_t w_spec_syncs[4];
+    uint64_t m_spec_syncs[4];
     /** Which decode lane the scheduler is on: 0 idle, 1 spec (retired), 2
      * batched, 3 spec-batched, 4 family-spec (server_pick_decode_lane). The
      * spec-decode counters cannot advance on the batched lane (it never enters

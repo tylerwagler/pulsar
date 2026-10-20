@@ -491,6 +491,8 @@ bool server::send_metrics(int fd) {
     double phase_ms[SERVER_ROUND_PHASE_COUNT];
     memcpy(phase_ms, s->m_spec_phase_ms, sizeof phase_ms);
     const unsigned long long phase_rounds = (unsigned long long)s->m_spec_phase_rounds;
+    uint64_t round_syncs[4];
+    memcpy(round_syncs, s->m_spec_syncs, sizeof round_syncs);
     pthread_mutex_unlock(&s->mu);
     if (running < 0) running = 0;
     if (waiting < 0) waiting = 0;
@@ -580,6 +582,13 @@ bool server::send_metrics(int fd) {
     buf_puts(&b, "# HELP pulsar:spec_round_phase_rounds_total Decode-only spec rounds timed by phase.\n");
     buf_puts(&b, "# TYPE pulsar:spec_round_phase_rounds_total counter\n");
     buf_printf(&b, "pulsar:spec_round_phase_rounds_total %llu\n", phase_rounds);
+    /* L302: the same rounds' host<->device synchronisations, by kind (delta over a window / rounds = per round) */
+    buf_puts(&b, "# HELP pulsar:spec_round_syncs_total Decode-only spec rounds' host<->device synchronisations.\n");
+    buf_puts(&b, "# TYPE pulsar:spec_round_syncs_total counter\n");
+    buf_printf(&b, "pulsar:spec_round_syncs_total{kind=\"stream_drain\"} %llu\n", (unsigned long long)round_syncs[0]);
+    buf_printf(&b, "pulsar:spec_round_syncs_total{kind=\"d2h_copy\"} %llu\n", (unsigned long long)round_syncs[1]);
+    buf_printf(&b, "pulsar:spec_round_syncs_total{kind=\"d2h_bytes\"} %llu\n", (unsigned long long)round_syncs[2]);
+    buf_printf(&b, "pulsar:spec_round_syncs_total{kind=\"h2d_copy\"} %llu\n", (unsigned long long)round_syncs[3]);
     /* Prefix-cache hit rate (scraper computes hits/queries). */
     buf_puts(&b, "# HELP vllm:prefix_cache_queries_total Cumulative prompt tokens looked up in the prefix cache.\n");
     buf_puts(&b, "# TYPE vllm:prefix_cache_queries_total counter\n");

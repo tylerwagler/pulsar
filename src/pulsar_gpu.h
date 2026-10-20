@@ -254,6 +254,16 @@ void pulsar_gpu_batched_copy_free(void *handle);
 int pulsar_gpu_begin_commands(void);
 int pulsar_gpu_end_commands(void);
 int pulsar_gpu_synchronize(void);
+/** L302: the host<->device synchronisations the process has paid, by kind (monotonic; every blocking copy and every
+ *  drain counts once) -- what the sync-budget gate (tests/sync_budget_gate.cpp) holds a round of each lane to. */
+typedef struct pulsar_gpu_sync_stats {
+    uint64_t stream_syncs;   ///< pulsar_gpu_end_commands: the stream drained
+    uint64_t device_syncs;   ///< pulsar_gpu_synchronize
+    uint64_t d2h;            ///< blocking device -> host copies (tensor reads, the step-end flag reads)
+    uint64_t d2h_bytes;
+    uint64_t h2d;            ///< blocking host -> device copies (tensor writes, flag clears)
+} pulsar_gpu_sync_stats;
+void pulsar_gpu_sync_stats_get(pulsar_gpu_sync_stats *out);
 /** Record a completion marker on the per-thread stream (L142).  Returns a
  *  handle, or -1 if the runtime could not record one; pulsar_gpu_marker_done
  *  reports a -1 handle as complete, so a poller never stalls on it. */
