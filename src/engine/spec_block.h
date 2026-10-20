@@ -140,7 +140,7 @@ typedef struct pulsar_block_drafter {
  *  ("lilicorr", "dflash2"), "" when it holds none (no key, or an empty one), NULL refused (said, counted: another
  *  name, or not a string). */
 const char *pulsar_block_drafter_kind_of(const pulsar_model *m);
-/** Read the declaration of the kind the container holds (its <kind>.* keys, the kind table) and check every number
+/** Read the declaration of the kind the container holds (its `KIND.*` keys, the kind table) and check every number
  *  the blocks implement.  false = refused (said, counted: pulsar_load_refuse). */
 bool pulsar_block_drafter_read(const pulsar_model *m, pulsar_block_drafter *d);
 /** Bind block `drafter`'s tensors and the chain head's (block `lilicorr` or `selector`) through the role binder (the
