@@ -469,6 +469,19 @@ static bool model_tensor_unloaded(const pulsar_model *m, const pulsar_tensor *t)
     return m->unloaded && m->unloaded[t - m->tensors] != 0;
 }
 
+uint64_t model_unload_prefix(pulsar_model *m, const char *prefix) {
+    const size_t pl = strlen(prefix);
+    uint64_t n = 0;
+    for (uint64_t i = 0; i < m->n_tensors; i++) {
+        const pulsar_tensor &t = m->tensors[i];
+        if (t.name.len < pl || memcmp(t.name.ptr, prefix, pl) != 0) continue;
+        if (!m->unloaded) m->unloaded = (uint8_t *)xcalloc((size_t)m->n_tensors, 1);
+        m->unloaded[i] = 1;
+        n++;
+    }
+    return n;
+}
+
 uint64_t pulsar_model_unstaged_expert_bytes(const pulsar_model *m) {
     if (!m || m->tp_n_ranks <= 1) return 0;
     uint64_t unstaged = 0;

@@ -599,7 +599,7 @@ int main(int argc, char **argv) {
         server_log(PULSAR_LOG_DEFAULT,
                    "pulsar-server: %s speculative decoding active (%s drafter, greedy or sampled; %u verify rows a round)",
                    pulsar_engine_family_name(engine),
-                   pulsar_engine_drafter(engine) == PULSAR_DRAFTER_BLOCK ? "LiLiCorr block" : "MTP",
+                   pulsar_engine_drafter(engine) == PULSAR_DRAFTER_BLOCK ? "block" : "MTP",
                    pulsar_engine_fused_heads_max(engine));
     } else if (cfg.engine.dspark_disable) {
         server_log(PULSAR_LOG_DEFAULT,

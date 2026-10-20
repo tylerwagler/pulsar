@@ -91,6 +91,8 @@ void gate_engine_close(pulsar_engine *e);
 static inline int gate_engine_open(pulsar_engine **e, const pulsar_engine_options *opt) {
     pulsar_engine_options o = *opt;
     if (gate_tp_options_from_env(&o)) return 1;
+    /* L299: PULSAR_GATE_DRAFTER is the open's --drafter (a container holding two drafters: mtp | dflash2) */
+    if (!o.drafter) o.drafter = getenv("PULSAR_GATE_DRAFTER");
     const int rc = pulsar_engine_open(e, &o);
     if (rc == 0) gate_tp_worker_or_continue(*e);
     return rc;

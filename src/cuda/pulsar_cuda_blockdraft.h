@@ -13,8 +13,13 @@
  *   swiglu         h = bf16(silu(g) * u) over bf16 g, u (vLLM silu_and_mul: f32 silu(x) = x / (1 + exp(-x)))
  *   row copy       bf16 rows -> a column window of wider rows (the target's tapped hidden states into the
  *                  drafter's concatenated context row)
- *   top-k          per row of bf16 logits (the head's rows as its producer emits them): the k largest ids (ties to
- *                  the lower id), and their log-softmax values over the whole row (f32) */
+ *   stream mean    (L299) rows of n_streams bf16 streams [row][stream][width] -> their mean, bf16, into a column
+ *                  window of wider rows: a hyper-connection trunk's tap (the streams summed in stream order in f32,
+ *                  times 1 / n_streams, one bf16 rounding -- the reference's bf16(streams.mean(-2)), exact up to that
+ *                  rounding while the streams' exponents span under 2^16)
+ *   top-k          per row of bf16 logits (the head's rows as its producer emits them): the k largest rows (ties to
+ *                  the lower row), and their log-softmax values over the whole row (f32); a head over a subset of the
+ *                  vocabulary maps each row to its id (L299: `id_map`, the head's rows' ids) */
 #ifndef PULSAR_CUDA_BLOCKDRAFT_H
 #define PULSAR_CUDA_BLOCKDRAFT_H
 
@@ -51,11 +56,17 @@ int pulsar_blockdraft_swiglu_launch(const uint16_t *g, uint64_t ld_g, const uint
 int pulsar_blockdraft_rows_copy_launch(const uint16_t *src, uint64_t ld_src, uint32_t n_rows, uint32_t width,
                                        uint16_t *dst, uint64_t ld_dst, cudaStream_t stream);
 
+/** dst row r [0, width) (dst + r * ld_dst) = bf16 of the mean of src row r's n_streams streams, stream i at
+ *  src + r * ld_src + i * width (bf16).  width % 8 == 0, 16-byte aligned rows.  @return 0, -1, -3. */
+int pulsar_blockdraft_stream_mean_launch(const uint16_t *src, uint64_t ld_src, uint32_t n_streams, uint32_t n_rows,
+                                         uint32_t width, uint16_t *dst, uint64_t ld_dst, cudaStream_t stream);
+
 /** For each of n_rows rows of `logits` [row][ld] bf16 (the first n columns are the row): ids [row][k] = the k largest
- *  values in descending order (ties: the lower id first), lp [row][k] = v - max - log(sum exp(v - max)) over the row
- *  (f32).  1 <= k <= PULSAR_BLOCKDRAFT_TOPK_MAX.  @return 0, -1, -3. */
+ *  values in descending order (ties: the lower column first) as ids -- the column itself, or id_map[column] when the
+ *  head's rows are a subset of the vocabulary (id_map: device [n] i32; NULL = the columns ARE the ids) --, lp [row][k]
+ *  = v - max - log(sum exp(v - max)) over the row (f32).  1 <= k <= PULSAR_BLOCKDRAFT_TOPK_MAX.  @return 0, -1, -3. */
 int pulsar_rows_topk_logprob_launch(const uint16_t *logits, uint64_t ld, uint32_t n_rows, uint32_t n, uint32_t k,
-                                    int32_t *ids, float *lp, cudaStream_t stream);
+                                    const int32_t *id_map, int32_t *ids, float *lp, cudaStream_t stream);
 
 #ifdef __cplusplus
 }

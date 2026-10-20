@@ -4,7 +4,8 @@
     recipe  --hf DIR [--exl3 DIR] [--recipe JSON]    # print the pulsar.recipe.v1 the build runs (DeepSeek's default
                                                      #  is generated from policy.py + the EXL3 source)
     plan    --hf DIR [--exl3 DIR] [--exl3-experts DIR] [--tessera DIR] [--recipe JSON] [--dump FILE]
-            Nemotron-H: [--drafter lilicorr DIR] the LiLiCorr block drafter, written into the container
+            [--drafter KIND DIR] a block drafter written into the container (drafters.py): Nemotron-H lilicorr
+            (NVIDIA's LiLiCorr), qwen4_exp dflash2 (z-lab's DFlash2, L299)
     emit    ... --out DIR (--shard S | --all) [--mxfp8-scale rederive|verbatim]
             DeepSeek: [--layers L,L,...] a layer-subset test fixture (names.py drop rule 4);
                       [--engram-layout JSON] V4.1's Engram hash layout (tools/engram/engram_layout.py)
@@ -543,7 +544,7 @@ def hf_of(args):
         src = fam.source(hf)
         if args.drafter:
             if not hasattr(fam, 'with_drafter'):
-                raise SystemExit(f'--drafter: the {fam.__name__} family reads no drafter input (nemotron_h does)')
+                raise SystemExit(f'--drafter: the {fam.__name__} family reads no drafter input (nemotron_h, qwen do)')
             src = fam.with_drafter(src, *args.drafter)
         _HF[key] = src
     return _HF[key]
@@ -619,8 +620,9 @@ def main():
                            '(the default source of a routed expert\'s EXL3 rows when given)')
             p.add_argument('--tessera', metavar='DIR', help='a Tessera bundle: source `tessera` (the producer lands with L255)')
             p.add_argument('--drafter', nargs=2, metavar=('KIND', 'DIR'),
-                           help='Nemotron-H: a separate drafter checkpoint written into the container (KIND lilicorr: '
-                           'NVIDIA\'s LiLiCorr block drafter, shard `drafter`; nemotron_h.py)')
+                           help='a separate block-drafter checkpoint written into the container, shard `drafter` '
+                           '(drafters.py): KIND lilicorr on Nemotron-H (NVIDIA\'s LiLiCorr), dflash2 on qwen4_exp '
+                           '(z-lab\'s DFlash2, its head the target lm_head\'s draft-vocabulary rows)')
             p.add_argument('--recipe', metavar='JSON', help='a pulsar.recipe.v1 (recipe.py; format-maps/*.json).  '
                            'DeepSeek default: generated from policy.py + the EXL3 source (`recipe` prints it)')
             p.add_argument('--mxfp8-scale', choices=('rederive', 'verbatim'), default='rederive',

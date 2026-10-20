@@ -16,8 +16,17 @@ The reference reads the drafter's own ModelOpt checkpoint (W4A16 NVFP4 linears d
 f32, the f32 global scale on the GEMM's output) and the target's input embedding from the target's HF checkpoint.
 Arithmetic follows vLLM's: bf16 activations between ops, f32 inside each op.
 
+(L299) DFlash2 (z-lab's DFlash2DraftModel, config architectures [DFlash2DraftModel]; tools/dflash2's replay is the
+f32 transcription it was graded against): the same backbone (the engine's E4M3 ring too), rope_parameters' theta,
+the head the target's lm_head and the CandidateSelector's walk.  --container DIR reads every drafter tensor and the
+target's input embedding from the PULSAR CONTAINER the engine served (nvfp4 entries decoded exactly,
+tools/container/producers.nvfp4_decode; the head's draft-vocabulary rows and ids as stored), so the --dump grade
+isolates the engine's arithmetic from the container's quantisation; the selector's chain is graded too.
+
     ~/venvs/tf/bin/python tools/blockdraft/ref.py --drafter /mnt/models/nemotron35-super-lilicorr \
         --target-hf /mnt/models/nemotron35-super-vl-bf16 (--golden F | --dump DIR) [--rounds N] [--device cpu|cuda]
+    ~/venvs/tf/bin/python tools/blockdraft/ref.py --drafter /mnt/models/qwen38fn-dflash2 --container CONTAINER \
+        --dump DIR [--rounds N]
 """
 from __future__ import annotations
 
@@ -30,6 +39,10 @@ import struct
 import numpy as np
 import torch
 from safetensors import safe_open
+
+import sys
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "container"))
+import producers as PR  # noqa: E402
 
 BF16 = torch.bfloat16
 E2M1 = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0])
@@ -44,24 +57,75 @@ def e4m3(x):
     return x.float().clamp(-448.0, 448.0).to(torch.float8_e4m3fn).to(BF16)
 
 
+class Container:
+    """A pulsar container's tensors by name (every shard's header; an nvfp4 entry decoded through its pulsar.tensors
+    declaration)."""
+
+    def __init__(self, d):
+        self.at = {}
+        for fn in sorted(os.listdir(d)):
+            if not fn.endswith(".safetensors"):
+                continue
+            p = os.path.join(d, fn)
+            with open(p, "rb") as f:
+                n = struct.unpack("<Q", f.read(8))[0]
+                h = json.loads(f.read(n))
+            decl = json.loads(h.pop("__metadata__", {}).get("pulsar.tensors", "{}"))
+            for k, v in h.items():
+                self.at[k] = (p, 8 + n + v["data_offsets"][0], v["data_offsets"][1] - v["data_offsets"][0], v,
+                              decl.get(k, {}))
+
+    def raw(self, name):
+        p, off, n, _v, _d = self.at[name]
+        with open(p, "rb") as f:
+            f.seek(off)
+            return f.read(n)
+
+    def has(self, name):
+        return name in self.at
+
+    def tensor(self, name):
+        """bf16 / i32 as stored ([shape]); an nvfp4 Linear as (W f32 [out][in], None) -- the global scale folded"""
+        _p, _o, _n, v, d = self.at[name]
+        b = self.raw(name)
+        if d.get("layout") == "nvfp4":
+            inp, out = d["dims_ne"]
+            return torch.from_numpy(PR.nvfp4_decode(b, out, inp).copy())
+        if v["dtype"] == "BF16":
+            return torch.from_numpy(np.frombuffer(b, dtype=np.int16).copy()).view(BF16).reshape(v["shape"])
+        if v["dtype"] == "I32":
+            return torch.from_numpy(np.frombuffer(b, dtype=np.int32).copy()).reshape(v["shape"])
+        raise SystemExit(f"{name}: {v['dtype']} {d.get('layout')} is not a layout the reference reads")
+
+
 class Drafter:
-    def __init__(self, path, target_hf, device):
+    def __init__(self, path, target_hf, device, container=None):
         self.dev = device
-        self.f = safe_open(os.path.join(path, "model.safetensors"), framework="pt", device="cpu")
-        self.keys = set(self.f.keys())
         cfg = json.load(open(os.path.join(path, "config.json")))
         dc = cfg["dflash_config"]
+        self.dflash2 = cfg.get("architectures") == ["DFlash2DraftModel"]
         self.E, self.L, self.NQ, self.NKV, self.HD = (cfg["hidden_size"], cfg["num_hidden_layers"],
                                                       cfg["num_attention_heads"], cfg["num_key_value_heads"],
                                                       cfg["head_dim"])
-        self.eps, self.theta, self.W = cfg["rms_norm_eps"], cfg["rope_theta"], dc["swa_window_size"]
         self.taps, self.group = dc["conv_kernel_size"], dc["conv_group_size"]
-        self.block, self.mask, self.k = cfg["block_size"], dc["mask_token_id"], dc["lilicorr_candidate_topk"]
+        self.mask = dc["mask_token_id"]
+        if self.dflash2:   # L299: its keys, the container's tensors
+            self.eps, self.theta, self.W = cfg["rms_norm_eps"], cfg["rope_parameters"]["rope_theta"], cfg["sliding_window"]
+            self.block, self.k, self.kv8 = dc["block_size"], dc["selector_top_k"], True
+            if container is None:
+                raise SystemExit("--container: the DFlash2 reference reads the drafter as the container stores it")
+            self.c = Container(container)
+            self.emb = self.c.tensor("model.language_model.embed_tokens.weight").to(device)
+        else:
+            self.f = safe_open(os.path.join(path, "model.safetensors"), framework="pt", device="cpu")
+            self.keys = set(self.f.keys())
+            self.eps, self.theta, self.W = cfg["rms_norm_eps"], cfg["rope_theta"], dc["swa_window_size"]
+            self.block, self.k, self.kv8 = cfg["block_size"], dc["lilicorr_candidate_topk"], True
+            idx = json.load(open(os.path.join(target_hf, "model.safetensors.index.json")))["weight_map"]
+            en = "language_model.backbone.embeddings.weight"
+            with safe_open(os.path.join(target_hf, idx[en]), framework="pt", device="cpu") as g:
+                self.emb = g.get_tensor(en).to(device)
         self.G = self.E // self.group
-        idx = json.load(open(os.path.join(target_hf, "model.safetensors.index.json")))["weight_map"]
-        en = "language_model.backbone.embeddings.weight"
-        with safe_open(os.path.join(target_hf, idx[en]), framework="pt", device="cpu") as g:
-            self.emb = g.get_tensor(en).to(device)
         self.fc = self.linear("fc")
         self.hn = self.get("hidden_norm.weight")
         self.lay = []
@@ -78,12 +142,24 @@ class Drafter:
                 d=self.linear(p + "mlp.down_proj")))
         self.norm = self.get("norm.weight")
         self.head = self.linear("lm_head")
+        self.head_ids = None
+        if self.dflash2:
+            if self.c.has("drafter.lm_head.ids"):
+                self.head_ids = self.c.tensor("drafter.lm_head.ids").long().to(self.dev)
+            self.sel_proj = self.linear("candidate_selector.hidden_projection")
+            self.sel_pred = self.get("candidate_selector.predecessor_codebook").float()
+            self.sel_succ = self.get("candidate_selector.successor_codebook").float()
 
     def get(self, name):
+        if self.dflash2:
+            return self.c.tensor("drafter." + name).to(self.dev)
         return self.f.get_tensor(name).to(self.dev)
 
     def linear(self, name):
         """(W f32 [out][in], global scale or None)"""
+        if self.dflash2:
+            t = self.c.tensor("drafter." + name + ".weight")
+            return t.float().to(self.dev), None
         if name + ".weight_scale" in self.keys:
             w = self.f.get_tensor(name + ".weight")                      # u8 [out][in/2]
             sc = self.f.get_tensor(name + ".weight_scale").float()       # e4m3 [out][in/16]
@@ -149,10 +225,11 @@ class Drafter:
             co = self.lin(x, Lw["acp"]).reshape(B, 2, self.taps, G)
             cx = self.conv(x, co[:, 0], Lw["acb"][0])
             q = self.rope(self.rms(self.lin(cx, Lw["q"]).reshape(B, NQ, HD), Lw["qn"]), qpos)
-            kq = e4m3(self.rope(self.rms(self.lin(cx, Lw["k"]).reshape(B, NKV, HD), Lw["kn"]), qpos))
-            vq = e4m3(self.lin(cx, Lw["v"]).reshape(B, NKV, HD))
-            kc = e4m3(self.rope(self.rms(self.lin(cn, Lw["k"]).reshape(-1, NKV, HD), Lw["kn"]), cpos))
-            vc = e4m3(self.lin(cn, Lw["v"]).reshape(-1, NKV, HD))
+            kvf = e4m3 if self.kv8 else (lambda x: x)   # the ring's row format (the engine's E4M3)
+            kq = kvf(self.rope(self.rms(self.lin(cx, Lw["k"]).reshape(B, NKV, HD), Lw["kn"]), qpos))
+            vq = kvf(self.lin(cx, Lw["v"]).reshape(B, NKV, HD))
+            kc = kvf(self.rope(self.rms(self.lin(cn, Lw["k"]).reshape(-1, NKV, HD), Lw["kn"]), cpos))
+            vc = kvf(self.lin(cn, Lw["v"]).reshape(-1, NKV, HD))
             K, V = torch.cat([kc, kq]).float(), torch.cat([vc, vq]).float()
             kp = torch.cat([cpos, qpos])
             rep = NQ // NKV
@@ -173,6 +250,20 @@ class Drafter:
         o = self.rms(bf(h.float() + t.float()), self.norm)
         lp = torch.log_softmax(self.lin(o, self.head).float(), dim=-1)
         return inter, o, lp
+
+    def select(self, o, lp, carry):
+        """(L299) the CandidateSelector's walk over rows 1 .. block - 1: top-k of each slot's head row (ids through the
+        head's id map), score = log-prob + succ[c] . (pred[prev] * hidden_projection(o)) -> the chain"""
+        tv, ti = torch.topk(lp[1:], self.k, dim=-1)
+        ids = self.head_ids[ti] if self.head_ids is not None else ti
+        hp = self.lin(o[1:], self.sel_proj).float()
+        prev, chain = carry, []
+        for s in range(ids.shape[0]):
+            sc = tv[s] + self.sel_succ[ids[s]] @ (self.sel_pred[prev] * hp[s])
+            j = int(torch.argmax(sc))
+            prev = int(ids[s, j])
+            chain.append(prev)
+        return chain
 
 
 def rel(a, b):
@@ -283,17 +374,28 @@ def dump(D, d, rounds):
             cos = torch.nn.functional.cosine_similarity(o.float(), eo.float(), dim=-1)
             ids = torch.from_numpy(ps["ids"][bi].copy()).to(D.dev)
             elp = torch.from_numpy(ps["lp"][bi].copy()).to(D.dev)
-            ti, top1, ovl, dlp = topk_report(lp[1:], ids, elp, ps["k"])
+            if D.head_ids is not None:   # the engine's ids are vocabulary ids; the reference's top-k head rows
+                lpv = torch.full((lp.shape[0], int(D.head_ids.max()) + 1), float("-inf"), device=D.dev)
+                lpv[:, D.head_ids] = lp
+            else:
+                lpv = lp
+            ti, top1, ovl, dlp = topk_report(lpv[1:], ids, elp, ps["k"])
+            extra = ""
+            if D.dflash2:
+                ref_chain = D.select(o, lp, carry)
+                same = sum(int(a == b) for a, b in zip(ref_chain, ps["chain"][bi].tolist()))
+                extra = f"; selector chain ref {ref_chain} agree {same}/{len(ref_chain)}"
             print(f"pass {pi} bank {b} P {P} carry {carry}: final hidden rel {rel(eo, o):.4f} cos min "
                   f"{cos.min().item():.5f}; slots top-1 agree {top1:.2f}, top-{ps['k']} overlap {ovl:.2f}, top-1 lp "
                   f"max|d| {dlp:.4f}; ref top-1 {ti[:, 0].tolist()} engine top-1 {ids[:, 0].tolist()} engine chain "
-                  f"{ps['chain'][bi].tolist()}", flush=True)
+                  f"{ps['chain'][bi].tolist()}{extra}", flush=True)
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--drafter", required=True)
-    ap.add_argument("--target-hf", required=True)
+    ap.add_argument("--target-hf", help="the target's HF checkpoint (LiLiCorr: its input embedding)")
+    ap.add_argument("--container", help="(DFlash2) the pulsar container the engine served")
     g = ap.add_mutually_exclusive_group(required=True)
     g.add_argument("--golden")
     g.add_argument("--dump")
@@ -301,7 +403,7 @@ def main():
     ap.add_argument("--device", default="cpu")
     a = ap.parse_args()
     torch.set_grad_enabled(False)
-    D = Drafter(a.drafter, a.target_hf, torch.device(a.device))
+    D = Drafter(a.drafter, a.target_hf, torch.device(a.device), a.container)
     if a.golden:
         golden(D, a.golden, a.rounds)
     else:

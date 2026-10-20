@@ -72,6 +72,7 @@ int main(int argc, char **argv) {
     opt.model_path = argv[1];
     opt.backend = PULSAR_BACKEND_CUDA;
     if (getenv("QWEN_SPEC_K")) setenv("PULSAR_SPEC_DEPTH", getenv("QWEN_SPEC_K"), 1);   /* the MTP draft depth */
+    opt.drafter = getenv("QWEN_DRAFTER");   /* L299: --drafter (mtp | dflash2) of a container holding both */
     /* L266 step 7: QWEN_TP_PEERS ("host:port,host:port") runs this as rank 0 of a tensor-parallel pair; rank 1
      * is any pulsar binary in its worker loop (pulsar --tp-rank 1 ...) */
     opt.tp_rank = -1;

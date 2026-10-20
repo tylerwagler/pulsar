@@ -8,9 +8,16 @@
  *   C4  top-k + log-softmax over a 131072-wide bf16 row (ties planted): the ids exactly (descending, ties to the lower
  *       id), the log-probs within 1e-5 of the host's double logsumexp
  *   C5  refusals: rows not whole blocks, k past 16
+ *   C6  (L299) the stream mean (a hyper-connection trunk's tap: 4 bf16 streams -> their mean) into a column window:
+ *       bit-exact against the host's bf16(((s0 + s1 + s2 + s3) * 0.25)), the rest of the destination untouched
+ *   C7  (L299) top-k over a head whose rows are a vocabulary subset: the ids are the id map's of the C4 rows
+ *   C8  (L299) the CandidateSelector chain head (src/cuda/pulsar_cuda_candsel.h) over 3 banks of 7 slots x 16
+ *       candidates, rank 256, ties planted: every score within 1e-5 relative of the host's double transcription of
+ *       z-lab's score, the walk (first argmax, slot 0 from the anchor) exactly; a bank's bytes alone == beside others
  *
  *   ./tests/blockdraft_gate */
 #include "pulsar_cuda_blockdraft.h"
+#include "pulsar_cuda_candsel.h"
 
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
@@ -148,7 +155,7 @@ static void topk_case() {
     float *dl = nullptr;
     cudaMalloc(&di, R * K * 4);
     cudaMalloc(&dl, R * K * 4);
-    const int rc = pulsar_rows_topk_logprob_launch(dx, V, R, V, K, di, dl, 0);
+    const int rc = pulsar_rows_topk_logprob_launch(dx, V, R, V, K, nullptr, di, dl, 0);
     const std::vector<int32_t> ids = host(di, R * K);
     const std::vector<float> lp = host(dl, R * K);
     size_t bad_id = 0;
@@ -172,7 +179,115 @@ static void topk_case() {
     CHECK(rc == 0 && bad_id == 0 && ids[0] == 50 && ids[1] == 90000, "C4 top-%u of %u rows x %u: %zu ids differ from "
           "the host's order (ties to the lower id: row 0 starts %d, %d)", K, R, V, bad_id, ids[0], ids[1]);
     CHECK(worst < 1e-5, "C4 the log-probs within 1e-5 of the host's double logsumexp (worst %.3g)", worst);
+    /* C7: the same rows as a head over a vocabulary subset -- column c is id map[c] */
+    std::vector<int32_t> map(V);
+    for (uint32_t c = 0; c < V; c++) map[c] = (int32_t)(3u * c + 7u);
+    int32_t *dm = dev(map);
+    const int rc7 = pulsar_rows_topk_logprob_launch(dx, V, R, V, K, dm, di, dl, 0);
+    const std::vector<int32_t> mids = host(di, R * K);
+    const std::vector<float> mlp = host(dl, R * K);
+    size_t bad7 = 0;
+    for (size_t i = 0; i < mids.size(); i++) bad7 += mids[i] != map[(uint32_t)ids[i]] || mlp[i] != lp[i];
+    CHECK(rc7 == 0 && bad7 == 0, "C7 top-k through an id map: %zu of %u (id, log-prob) pairs differ from C4's mapped",
+          bad7, R * K);
+    cudaFree(dm);
     cudaFree(dx); cudaFree(di); cudaFree(dl);
+}
+
+static void stream_mean_case() {
+    const uint32_t R = 21, NS = 4, W = 2560, LD = 5 * W, COL = 3 * W;
+    std::vector<uint16_t> src(R * NS * W), dst(R * LD);
+    for (size_t i = 0; i < src.size(); i++) src[i] = f2bf(rnd() * (i % 7 == 0 ? 40.0f : 1.5f));
+    for (auto &v : dst) v = 0x4321;
+    uint16_t *ds = dev(src), *dd = dev(dst);
+    const int rc = pulsar_blockdraft_stream_mean_launch(ds, NS * W, NS, R, W, dd + COL, LD, 0);
+    const std::vector<uint16_t> got = host(dd, R * LD);
+    size_t bad = 0;
+    for (uint32_t r = 0; r < R; r++)
+        for (uint32_t c = 0; c < LD; c++) {
+            uint16_t want = 0x4321;
+            if (c >= COL && c < COL + W) {
+                float a = 0.f;
+                for (uint32_t st = 0; st < NS; st++) a += bf2f(src[(r * NS + st) * W + c - COL]);
+                want = f2bf(a * (1.0f / NS));
+            }
+            bad += got[r * LD + c] != want;
+        }
+    CHECK(rc == 0 && bad == 0, "C6 stream mean of %u rows x %u streams x %u into columns [%u, %u): %zu elements wrong",
+          R, NS, W, COL, COL + W, bad);
+    cudaFree(ds); cudaFree(dd);
+}
+
+/* the host transcription of z-lab's CandidateSelector score and walk (double) */
+static void candsel_case() {
+    const uint32_t NB = 3, SL = 7, K = 16, RK = 256, V = 5000, HB = 8;   /* hp: 8 rows a bank (the block), slot s at 1 + s */
+    std::vector<int32_t> cand(NB * SL * K), anchor(NB);
+    std::vector<float> unary(NB * SL * K);
+    std::vector<uint16_t> hp(NB * HB * RK), pred((size_t)V * RK), succ((size_t)V * RK);
+    for (auto &v : pred) v = f2bf(rnd());
+    for (auto &v : succ) v = f2bf(rnd());
+    for (auto &v : hp) v = f2bf(rnd() * 0.5f);
+    for (uint32_t i = 0; i < NB * SL * K; i++) {
+        g_lcg = g_lcg * 1664525u + 1013904223u;
+        cand[i] = (int32_t)((g_lcg >> 8) % V);
+        unary[i] = rnd() * 3.0f - (float)(i % K) * 0.2f;
+    }
+    for (uint32_t b = 0; b < NB; b++) anchor[b] = (int32_t)(17u + 101u * b);
+    /* a planted tie: bank 1 slot 0's candidates 3 and 5 are the same token at the same unary -> equal scores; the
+     * walk takes the lower index if they lead */
+    cand[(1 * SL + 0) * K + 5] = cand[(1 * SL + 0) * K + 3];
+    unary[(1 * SL + 0) * K + 5] = unary[(1 * SL + 0) * K + 3] = 50.0f;
+    int32_t *dc = dev(cand), *da = dev(anchor), *dids = nullptr, *drows = nullptr;
+    float *du = dev(unary), *dsc = nullptr;
+    uint16_t *dh = dev(hp), *dp = dev(pred), *ds = dev(succ);
+    cudaMalloc(&dsc, NB * SL * K * K * 4);
+    cudaMalloc(&dids, NB * SL * 4);
+    cudaMalloc(&drows, NB * SL * 4);
+    const int rc = pulsar_candsel_launch(NB, SL, K, RK, V, dc, du, dh + RK, HB, RK, da, dp, ds, dsc, dids, drows, 0);
+    const std::vector<float> sc = host(dsc, NB * SL * K * K);
+    const std::vector<int32_t> ids = host(dids, NB * SL), rows = host(drows, NB * SL);
+    double worst = 0;
+    size_t bad_walk = 0;
+    for (uint32_t b = 0; b < NB; b++) {
+        uint32_t prev = 0;
+        for (uint32_t s = 0; s < SL; s++) {
+            const uint16_t *h = &hp[(b * HB + 1 + s) * RK];
+            std::vector<double> rowv(K * K);
+            for (uint32_t i = 0; i < K; i++)
+                for (uint32_t c = 0; c < K; c++) {
+                    const int32_t p = s == 0 ? anchor[b] : cand[(b * SL + s - 1) * K + i];
+                    const int32_t t = cand[(b * SL + s) * K + c];
+                    double acc = 0;
+                    for (uint32_t r = 0; r < RK; r++)
+                        acc += (double)bf2f(succ[(size_t)t * RK + r]) * bf2f(pred[(size_t)p * RK + r]) * bf2f(h[r]);
+                    const double want = unary[(b * SL + s) * K + c] + acc;
+                    rowv[i * K + c] = want;
+                    const double g = sc[((b * SL + s) * K + i) * K + c];
+                    worst = std::max(worst, fabs(g - want) / std::max(1.0, fabs(want)));
+                }
+            /* the walk on the DEVICE's scores (first maximum), against the device's choice */
+            const float *dr = &sc[((b * SL + s) * K + prev) * K];
+            uint32_t j = 0;
+            for (uint32_t c = 1; c < K; c++)
+                if (dr[c] > dr[j]) j = c;
+            bad_walk += (uint32_t)rows[b * SL + s] != j || ids[b * SL + s] != cand[(b * SL + s) * K + j];
+            prev = j;
+        }
+    }
+    CHECK(rc == 0 && worst < 1e-5, "C8 selector scores, %u banks x %u slots x %u x %u, rank %u: worst relative "
+          "distance %.3g from the host's double", NB, SL, K, K, RK, worst);
+    CHECK(bad_walk == 0 && rows[1 * SL + 0] == 3, "C8 the walk: %zu slot choices differ from the first argmax of the "
+          "row the previous slot chose (bank 1's planted tie takes candidate %d, want 3)", bad_walk, rows[1 * SL + 0]);
+    /* bank 2 alone == bank 2 beside the others */
+    const int rc1 = pulsar_candsel_launch(1, SL, K, RK, V, dc + 2 * SL * K, du + 2 * SL * K, dh + 2 * HB * RK + RK, HB,
+                                          RK, da + 2, dp, ds, dsc, dids, drows, 0);
+    const std::vector<float> one = host(dsc, SL * K * K);
+    CHECK(rc1 == 0 && memcmp(one.data(), &sc[2 * SL * K * K], one.size() * 4) == 0,
+          "C8 a bank's scores alone == the same bank beside two others, byte for byte");
+    CHECK(pulsar_candsel_launch(1, SL, 17, RK, V, dc, du, dh, HB, RK, da, dp, ds, dsc, dids, drows, 0) == -1,
+          "C8 refused: k 17");
+    cudaFree(dc); cudaFree(da); cudaFree(dids); cudaFree(drows); cudaFree(du); cudaFree(dsc); cudaFree(dh);
+    cudaFree(dp); cudaFree(ds);
 }
 
 int main() {
@@ -181,11 +296,14 @@ int main() {
     swiglu_case();
     copy_case();
     topk_case();
+    stream_mean_case();
+    candsel_case();
     uint16_t *d = nullptr;
     cudaMalloc(&d, 1 << 20);
     CHECK(pulsar_blockdraft_conv_launch(d, 64, d, 8, d, 2, 16, 8, 12, 64, d + 4096, 64, 0) == -1,
           "C5 refused: rows not whole blocks");
-    CHECK(pulsar_rows_topk_logprob_launch(d, 64, 1, 64, 17, (int32_t *)d, (float *)d, 0) == -1, "C5 refused: k 17");
+    CHECK(pulsar_rows_topk_logprob_launch(d, 64, 1, 64, 17, nullptr, (int32_t *)d, (float *)d, 0) == -1,
+          "C5 refused: k 17");
     cudaFree(d);
     printf(n_fail ? "blockdraft_gate: FAIL (%d)\n" : "blockdraft_gate: PASS\n", n_fail);
     return n_fail != 0;

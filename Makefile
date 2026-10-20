@@ -680,9 +680,12 @@ gdn-gate: tests/gdn_gate
 # a long position past the temperature floor; refusals.  Links the PRODUCTION
 # object; pass the served arch (CUDA_ARCH=sm_120f).  Model-free.
 # L298: the block drafter's small ops (src/cuda/pulsar_cuda_blockdraft.h: the grouped dynamic conv, SwiGLU, the tap
-# row copy, top-k + log-softmax) against the host authority (tests/blockdraft_gate.cu).  Model-free.
-tests/blockdraft_gate: tests/blockdraft_gate.cu src/cuda/pulsar_cuda_blockdraft.o src/cuda/pulsar_cuda_blockdraft.h Makefile
-	$(NVCC) $(NVCCFLAGS) -std=c++17 -Isrc -Isrc/cuda -o $@ tests/blockdraft_gate.cu src/cuda/pulsar_cuda_blockdraft.o
+# row copy, top-k + log-softmax; L299 the stream-mean tap, the top-k id map) and (L299) the CandidateSelector chain
+# head (src/cuda/pulsar_cuda_candsel.h) against the host authority (tests/blockdraft_gate.cu).  Model-free.
+tests/blockdraft_gate: tests/blockdraft_gate.cu src/cuda/pulsar_cuda_blockdraft.o src/cuda/pulsar_cuda_blockdraft.h \
+                       src/cuda/pulsar_cuda_candsel.o src/cuda/pulsar_cuda_candsel.h Makefile
+	$(NVCC) $(NVCCFLAGS) -std=c++17 -Isrc -Isrc/cuda -o $@ tests/blockdraft_gate.cu src/cuda/pulsar_cuda_blockdraft.o \
+		src/cuda/pulsar_cuda_candsel.o
 .PHONY: blockdraft-gate
 blockdraft-gate: tests/blockdraft_gate
 	./tests/blockdraft_gate
@@ -1079,6 +1082,21 @@ LILICORR_GATE_MODEL ?= /srv/models/nemotron35-k4-lilicorr-pulsar
 .PHONY: lilicorr-spec-gate
 lilicorr-spec-gate: tests/mtp_spec_gate
 	./tests/mtp_spec_gate $(LILICORR_GATE_MODEL) $(MTP_GATE_TOKENS)
+# L299: the same gate on the DFlash2 block drafter (Qwen3.8-Flash-Next, the CandidateSelector chain head, the HC-mean
+# taps); its container holds the MTP module too (DFlash2 is the default of the two; the gate names it anyway).
+DFLASH2_GATE_MODEL ?= /srv/models/qwen38fn-u-e4-d5-dflash2
+.PHONY: dflash2-spec-gate
+dflash2-spec-gate: tests/mtp_spec_gate
+	PULSAR_GATE_DRAFTER=dflash2 ./tests/mtp_spec_gate $(DFLASH2_GATE_MODEL) $(MTP_GATE_TOKENS)
+# L299: Qwen's drafter selection at open, host-only (pulsar --inspect): of two, DFlash2 by default (announced); --drafter
+# mtp picks the MTP module; a one-drafter container runs its own; unknown names and a missing drafter shard refused.
+# The base is the same model built without a block drafter (the MTP-only container is it + the MTP sidecar).
+QWEN_SELECT_BASE ?= /mnt/models/qwen38fn-u-e4-d5
+QWEN_SELECT_WORK ?= $(or $(TMPDIR),/var/tmp)/qwen-drafter-select-$(USER)
+.PHONY: qwen-drafter-select-gate
+qwen-drafter-select-gate: pulsar
+	python3 tests/qwen_drafter_select_gate.py --open ./pulsar --work $(QWEN_SELECT_WORK) --base $(QWEN_SELECT_BASE) \
+	    $(DFLASH2_GATE_MODEL)
 # ... and its draft grade: the MTP module's first-step logits at every position of capture_ref.py's prompt, the engine's
 # DECODE and PROMPT paths (mtp_spec_gate probe), against transformers' modules on the fp32 trunk
 # (tools/nemotron/capture_mtp_ref.py) with transformers' own bf16 beside it (the floor); PASS within 2x the floor's KL.
@@ -2283,7 +2301,7 @@ GATE_TARGETS = unit-test-gate agent-test-gate \
 	cuda-regression cuda-kv-rows-pack-gate cuda-minp-prefilter-gate cuda-chat-smoke-gate \
 	cuda-attn-gates cuda-attn-pack-gate indexer-hadamard-kernel-check \
 	cuda-prefill-gate-cutlass-mxfp4 qwen-family-gate-device state-kinds-gate vision-qwen-tower-gate tessera-kernel-gate \
-	blockdraft-gate nvfp4-rows-gate lilicorr-head-gate lilicorr-spec-gate \
+	blockdraft-gate nvfp4-rows-gate lilicorr-head-gate lilicorr-spec-gate dflash2-spec-gate \
 	\
 	cuda-runner-gate
 # L220: gates that need no GPU and no model.  They are launched in the
@@ -2507,7 +2525,7 @@ gates-dev:
 	      case "$$p" in *router*|*moe*) router=1 ;; esac; \
 	      case "$$p" in *bf16_rows*|*nvfp4*|*weight_format*|src/engine/linear.cpp|src/engine/moe.cpp) bf16=1 ;; esac; \
 	      case "$$p" in *minp*|src/engine/tokenizer.cpp|src/engine/spec_dspark.cpp|src/engine/session_spec.cpp) minp=1 ;; esac; \
-	      case "$$p" in *spec_block*|*blockdraft*|*lilicorr*|*mtp_spec*|*attn_gqa*|*rope*|src/engine/session_spec.cpp|src/families/nemotron_h/*) drafter=1 ;; esac; \
+	      case "$$p" in *spec_block*|*blockdraft*|*candsel*|*lilicorr*|*mtp_spec*|*attn_gqa*|*rope*|src/engine/session_spec.cpp|src/families/nemotron_h/*|src/engine/family_qwen.cpp) drafter=1 ;; esac; \
 	      case $$cls in \
 	        attn) for g in $(GATES_DEV_ATTN); do add $$g; done ;; \
 	        cuda) for g in $(GATES_DEV_CUDA); do add $$g; done ;; \
@@ -2535,7 +2553,7 @@ gates-dev:
 	if [ $$blocks -eq 1 ]; then printf '  block gates: sconv-gate, head-gate, rowops-gate, mamba2-gate (the L295 short convolution, head options, row operations; the L296 Mamba-2 block)\n'; fi; \
 	if [ $$bf16 -eq 1 ]; then printf '  bf16-rows-gate + nvfp4-rows-gate: selected (the BF16 / NVFP4 rows arms and their admission)\n'; fi; \
 	if [ $$minp -eq 1 ]; then printf '  cuda-minp-prefilter-gate: selected (the sparse min-p contract)\n'; fi; \
-	if [ $$drafter -eq 1 ]; then printf '  block drafter gates: blockdraft-gate, lilicorr-head-gate, lilicorr-spec-gate (L298: the LiLiCorr lane on the Nemotron artifact)\n'; fi; \
+	if [ $$drafter -eq 1 ]; then printf '  block drafter gates: blockdraft-gate, lilicorr-head-gate, lilicorr-spec-gate, dflash2-spec-gate (L298 / L299: the LiLiCorr lane on the Nemotron artifact, the DFlash2 lane on the Qwen artifact)\n'; fi; \
 	if [ $$server -eq 1 ]; then printf '  server: chat smoke + the --server/--api unit switches\n'; fi; \
 	$(MAKE) --no-print-directory seam-check CUDA_ARCH=sm_120f || rc=1; \
 	$(MAKE) --no-print-directory cuda-reap-router-audit CUDA_ARCH=sm_120f \
@@ -2571,7 +2589,7 @@ gates-dev:
 	  $(MAKE) --no-print-directory cuda-minp-prefilter-gate CUDA_ARCH=sm_120f || rc=1; \
 	fi; \
 	if [ $$drafter -eq 1 ]; then \
-	  $(MAKE) --no-print-directory blockdraft-gate lilicorr-head-gate lilicorr-spec-gate CUDA_ARCH=sm_120f || rc=1; \
+	  $(MAKE) --no-print-directory blockdraft-gate lilicorr-head-gate lilicorr-spec-gate dflash2-spec-gate CUDA_ARCH=sm_120f || rc=1; \
 	fi; \
 	if [ $$exl3 -eq 1 ]; then \
 	  $(MAKE) --no-print-directory exl3-dequant-gate CUDA_ARCH=sm_120f || rc=1; \

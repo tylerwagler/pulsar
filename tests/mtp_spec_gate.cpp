@@ -1,10 +1,13 @@
 /* L296 N9: the chained-MTP drafter (src/engine/spec_mtp.h) on a real container -- any family whose drafter is the MTP
- * lane (Nemotron-H's mini first) -- and (L298) the block drafter (src/engine/spec_block.h: LiLiCorr), whose M0 checks
- * its lane and whose M3 asserts its context rings and anchor equal the plain twin's.  Speculation never changes the
- * output: every check here is the plain decode's bytes.
+ * lane (Nemotron-H's mini first) -- and (L298) the block drafter (src/engine/spec_block.h: LiLiCorr; L299 DFlash2 on
+ * Qwen3.8-Flash-Next), whose M0 checks its lane and whose M3 asserts its context rings (and LiLiCorr's anchor) equal
+ * the plain twin's.  Speculation never changes the output: every check here is the plain decode's bytes.
  *
- *   ./tests/mtp_spec_gate <model> [tokens] [sections]
+ *   [PULSAR_GATE_DRAFTER=mtp|dflash2] ./tests/mtp_spec_gate <model> [tokens] [sections]
  *   ./tests/mtp_spec_gate <model> --probe <ids.bin> <out_dir> [positions]
+ *
+ * PULSAR_GATE_DRAFTER (L299, tests/gate_entry.h) is the open's --drafter: which drafter of a container holding two
+ * the gate grades.
  *
  * Also a runner gate (tests/gates_runner.cpp `mtp-spec-gate`, on every hosted model whose drafter is the MTP lane).
  *

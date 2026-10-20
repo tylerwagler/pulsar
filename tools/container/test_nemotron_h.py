@@ -23,7 +23,7 @@ module, vision tensors):
     dims_ne; an nvfp4 payload == nibbles + the E4M3 scales tiled by a direct loop of the 128x4 formula + scale_2 +
     zeros; refusals: an unknown config key (top level and dflash_config), a pinned switch, an unknown / missing tensor,
     a wrong dtype, the exclude list disagreeing both ways, the target disagreeing, --drafter with the MTP written, the
-    drafter recipe without --drafter, --drafter on another family
+    drafter recipe without --drafter, --drafter lilicorr on another family (Qwen reads dflash2)
 """
 from __future__ import annotations
 
@@ -268,6 +268,7 @@ DRAFTER_KV = (["block_size", "hidden_size", "num_hidden_layers", "num_attention_
 
 
 def drafter_tests(tmp, hf, t):
+    import drafters as DR
     import nemotron_h as NH
     dd = os.path.join(tmp, "lilicorr")
     dt = make_drafter(dd, np.random.default_rng(298))
@@ -311,14 +312,14 @@ def drafter_tests(tmp, hf, t):
             rest = n[len("lilicorr."):]
             if rest.startswith("layers."):
                 _l, i, sfx = rest.split(".", 2)
-                role, block, layer = NH.LILI_HEAD_LAYER[sfx][0], "lilicorr", int(i)
+                role, block, layer = DR.LILI_HEAD_LAYER[sfx][0], "lilicorr", int(i)
             else:
-                role, block, layer = NH.LILI_HEAD[rest][0], "lilicorr", None
+                role, block, layer = DR.LILI_HEAD[rest][0], "lilicorr", None
         elif n.startswith("layers."):
             _l, i, sfx = n.split(".", 2)
-            role, block, layer = NH.LILI_LAYER[sfx][0], "drafter", int(i)
+            role, block, layer = DR.LILI_LAYER[sfx][0], "drafter", int(i)
         else:
-            role, block, layer = NH.LILI_TOP[n][0], "drafter", None
+            role, block, layer = DR.LILI_TOP[n][0], "drafter", None
         exp = {"role": role, "block": block, "layout": "nvfp4" if q else "bf16", "dims_ne": list(reversed(shape)),
                "gguf_name": "drafter." + n, **({"layer": layer} if layer is not None else {})}
         if d != exp:
@@ -416,8 +417,8 @@ def drafter_tests(tmp, hf, t):
     os.makedirs(qd)
     test_qwen.make_hf(qd, np.random.default_rng(3))
     ok, _ = run("plan", "--hf", qd, "--drafter", "lilicorr", dd, expect_fail=True,
-                contains="the qwen family reads no drafter input")
-    check(ok, "--drafter on another family (qwen4_exp) -> refused by name")
+                contains="the qwen4_exp build reads ['dflash2']")
+    check(ok, "--drafter lilicorr on another family (qwen4_exp, whose drafter is dflash2: L299) -> refused by name")
     r = json.load(open(rl))
     check(r["recipe"] == "nemotron_h-k4-lilicorr" and ["language_model.mtp.*", "omit"] in r["rows"]
           and {"role": "drafter_quantized", "format": "nvfp4"} in r["rows"],
