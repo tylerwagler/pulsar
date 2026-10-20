@@ -2213,7 +2213,8 @@ RUNNER_GATES = multiseq_frontier_gate rewind_frontier_gate mseq_rewind_probe tok
                bank_evict_restore_gate algo_stability_gate mixed_prefill_gate \
                mixed_neutrality_gate spec_sampling_gate mseq_short_ctx_probe prefill_bitexact_gate \
                comp_state_gate chunk_neutrality_gate vision_chunk_gate session_payload_gate tp_head_split_gate \
-               decode_reference_gate session_contract_gate chat_decode_smoke head_graph_replay_gate mtp_spec_gate
+               decode_reference_gate session_contract_gate chat_decode_smoke head_graph_replay_gate mtp_spec_gate \
+               sync_budget_gate
 RUNNER_OBJS = $(RUNNER_GATES:%=tests/runner/%.o)
 tests/runner/%.o: tests/%.cpp tests/gate_entry.h tests/gate_fixture.h tests/gate_util.h src/pulsar.h src/pulsar_gpu.h src/engine/pulsar_engine_internal.h src/lib/pulsar_segstore.h
 	@mkdir -p tests/runner

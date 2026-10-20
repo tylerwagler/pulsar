@@ -37,7 +37,6 @@ static uint64_t syncs_of(const pulsar_gpu_sync_stats &a, const pulsar_gpu_sync_s
 }
 
 static void run(pulsar_engine *e, int NB, float temp, int rounds_max, bool report) {
-    pulsar_engine_set_bank_pool((uint32_t)(NB > 1 ? NB : 2));
     pulsar_session *s = NULL;
     char err[256] = "";
     bool ok = pulsar_session_create(&s, e, 4096) == 0 && s;
@@ -153,6 +152,8 @@ int GATE_ENTRY(int argc, char **argv) {
     opt.model_path = argv[1];
     opt.backend = PULSAR_BACKEND_CUDA;
     pulsar_engine *e = NULL;
+    n_fail = 0;
+    pulsar_engine_set_bank_pool(4u);   /* the widest run's banks, before the first session */
     if (gate_engine_open(&e, &opt) != 0) { fprintf(stderr, "engine open failed\n"); return 1; }
     if (!pulsar_engine_has_spec_rounds(e)) { fprintf(stderr, "no drafter in this artifact\n"); gate_engine_close(e); return 1; }
     printf("sync-budget-gate: syncs a round by phase (stream drains + blocking copies)%s\n",
