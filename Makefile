@@ -1083,11 +1083,20 @@ LILICORR_GATE_MODEL ?= /srv/models/nemotron35-k4-lilicorr-pulsar
 lilicorr-spec-gate: tests/mtp_spec_gate
 	./tests/mtp_spec_gate $(LILICORR_GATE_MODEL) $(MTP_GATE_TOKENS)
 # L299: the same gate on the DFlash2 block drafter (Qwen3.8-Flash-Next, the CandidateSelector chain head, the HC-mean
-# taps); its container holds the MTP module too, so the open selects the drafter (--drafter dflash2).
+# taps); its container holds the MTP module too (DFlash2 is the default of the two; the gate names it anyway).
 DFLASH2_GATE_MODEL ?= /srv/models/qwen38fn-u-e4-d5-dflash2
 .PHONY: dflash2-spec-gate
 dflash2-spec-gate: tests/mtp_spec_gate
 	PULSAR_GATE_DRAFTER=dflash2 ./tests/mtp_spec_gate $(DFLASH2_GATE_MODEL) $(MTP_GATE_TOKENS)
+# L299: Qwen's drafter selection at open, host-only (pulsar --inspect): of two, DFlash2 by default (announced); --drafter
+# mtp picks the MTP module; a one-drafter container runs its own; unknown names and a missing drafter shard refused.
+# The base is the same model built without a block drafter (the MTP-only container is it + the MTP sidecar).
+QWEN_SELECT_BASE ?= /mnt/models/qwen38fn-u-e4-d5
+QWEN_SELECT_WORK ?= $(or $(TMPDIR),/var/tmp)/qwen-drafter-select-$(USER)
+.PHONY: qwen-drafter-select-gate
+qwen-drafter-select-gate: pulsar
+	python3 tests/qwen_drafter_select_gate.py --open ./pulsar --work $(QWEN_SELECT_WORK) --base $(QWEN_SELECT_BASE) \
+	    $(DFLASH2_GATE_MODEL)
 # ... and its draft grade: the MTP module's first-step logits at every position of capture_ref.py's prompt, the engine's
 # DECODE and PROMPT paths (mtp_spec_gate probe), against transformers' modules on the fp32 trunk
 # (tools/nemotron/capture_mtp_ref.py) with transformers' own bf16 beside it (the floor); PASS within 2x the floor's KL.

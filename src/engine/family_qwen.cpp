@@ -462,8 +462,9 @@ static bool qwen_bind_weights(const pulsar_model *m, const pulsar_qwen_shape *s,
 
 /* L299: the drafter the open selects among those the container holds -- the MTP module (mtp.*, bound by name) or a
  * block drafter (pulsar.drafter, DFlash2: role-recorded blocks) -- and so the one LOADED: the other is declared
- * unloaded (never staged; its memory stays the KV pool's).  --no-dspark loads neither.  A container with both refuses
- * without --drafter (as Nemotron-H's). */
+ * unloaded (never staged; its memory stays the KV pool's).  --no-dspark loads neither.  Without --drafter a container
+ * holding both runs the block drafter (Tyler 2026-10-20, "dflash2 should be default": it won every width of the L299
+ * scoreboard), one holding one runs that one; --drafter mtp | <kind> picks. */
 static bool qwen_select_drafter(pulsar_engine *e, const pulsar_engine_options *opt, bool *use_mtp, bool *use_block) {
     pulsar_model *m = &e->model;
     const char *bk = pulsar_block_drafter_kind_of(m);
@@ -473,9 +474,11 @@ static bool qwen_select_drafter(pulsar_engine *e, const pulsar_engine_options *o
     *use_mtp = *use_block = false;
     if (opt->dspark_disable) {
     } else if (!want || !want[0]) {
-        if (mtp_in && block_in) why = "the container holds both the MTP module and a block drafter: pass --drafter";
-        *use_mtp = mtp_in;
         *use_block = block_in;
+        *use_mtp = mtp_in && !block_in;
+        if (mtp_in && block_in)
+            fprintf(stderr, "pulsar: %s: the container holds the MTP module and the %s block drafter: %s by default "
+                            "(--drafter mtp selects the MTP module)\n", PULSAR_QWEN_ARCH, bk, bk);
     } else if (!strcmp(want, "mtp")) {
         if (!mtp_in) why = "--drafter mtp: the container holds no MTP module (mtp.*)";
         *use_mtp = true;

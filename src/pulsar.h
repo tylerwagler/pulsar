@@ -144,8 +144,8 @@ typedef struct {
     /** L298 (--drafter NAME): which of the drafters the container holds runs -- "mtp" or its block drafter's kind
      *  ("lilicorr" on Nemotron-H, L299 "dflash2" on Qwen3.8-Flash-Next) -- and so which
      *  is loaded at all (the other is declared unloaded: never staged, its memory the KV pool's).  NULL = the one the
-     *  container holds (a container with both refuses without a choice); a name the container does not hold refuses
-     *  the open by name. */
+     *  container holds; of two, the block drafter on Qwen (L299: dflash2 by default), a choice required on Nemotron-H;
+     *  a name the container does not hold refuses the open by name. */
     const char *drafter;
     /** "FILE:PREFIX" — swap routed-expert tensors whose name starts with
      * PREFIX for the same-named tensors in FILE (a donor GGUF). Measurement
