@@ -583,26 +583,33 @@ int pulsar_session::load_segment(FILE *fp, uint64_t bytes, bool last, uint32_t *
 /* The session's draft-depth controller (spec_depth.h) -- the speculation state a frontier carries, every family's
  * (a drafter without an adaptive policy holds it at zero).  It persists across a session's requests on purpose
  * (pulsar_spec_carry_state::spec_adaptive_depth), so a restored session drafts at the saved one's depth and runs
- * its controller from the saved counters -- not from whatever its bank served last.  The rest of the speculation
+ * its controller from the saved counters -- not from whatever its bank served last.  So does the copy drafter's
+ * measured acceptance (pulsar_spec_carry_state::copy_accept, L288): it prices the copy rounds, and the request it was
+ * measured in goes on past the frontier (a new request resets it, as it would have).  The rest of the speculation
  * state is a request's lookahead (the carry, the pendings, the quench): a load resets it as every request
  * boundary does (spec_lookahead_reset), and a live session voids it on its next plain step, so neither side
- * holds it at the frontier's next round.  Format v3. */
-#define KVP_SPEC_U32 4u
+ * holds it at the frontier's next round.  Format v3; the copy acceptance v5. */
+#define KVP_SPEC_U32 5u
 static void kvp_spec_pack(const pulsar_spec_carry_state *sp, uint32_t (&rec)[KVP_SPEC_U32]) {
     rec[0] = (uint32_t)sp->spec_adaptive_depth;
     rec[1] = sp->spec_depth_down_forgiven ? 1u : 0u;
     rec[2] = sp->spec_depth_rounds_since_up;
     rec[3] = sp->spec_depth_climb_cooldown;
+    memcpy(&rec[4], &sp->copy_accept, sizeof(float));
 }
-/* false = the record holds no controller a session could (0 = not yet moved; a depth is 1..16) */
+/* false = the record holds no state a session could (0 = not yet moved; a depth is 1..16; an acceptance is a rate
+ * in [0, 1], 0 = not measured) */
 static bool kvp_spec_valid(const uint32_t (&rec)[KVP_SPEC_U32]) {
-    return rec[0] <= 16u && rec[1] <= 1u && rec[2] <= 255u && rec[3] <= 255u;
+    float c;
+    memcpy(&c, &rec[4], sizeof c);
+    return rec[0] <= 16u && rec[1] <= 1u && rec[2] <= 255u && rec[3] <= 255u && c >= 0.0f && c <= 1.0f;
 }
 static void kvp_spec_unpack(const uint32_t (&rec)[KVP_SPEC_U32], pulsar_spec_carry_state *sp) {
     sp->spec_adaptive_depth = (int)rec[0];
     sp->spec_depth_down_forgiven = rec[1] != 0u;
     sp->spec_depth_rounds_since_up = (uint8_t)rec[2];
     sp->spec_depth_climb_cooldown = (uint8_t)rec[3];
+    memcpy(&sp->copy_accept, &rec[4], sizeof(float));
 }
 
 /* the frontier slot's size: the state model's frontier walk, aligned as a grid slot is (checkpoint.cpp) */
@@ -836,7 +843,7 @@ int pulsar_session::load_payload(FILE *fp, uint64_t payload_bytes, char *err, si
     for (uint32_t k = 0; k < KVP_SPEC_U32; k++)
         if (payload_read_u32(&io, &spec_rec[k], &remaining, err, errlen) != 0) return drop();
     if (!kvp_spec_valid(spec_rec)) {
-        payload_set_err(err, errlen, "session payload: its draft-depth record holds no controller state");
+        payload_set_err(err, errlen, "session payload: its speculation record holds no state a session could");
         return drop();
     }
     if (payload_read_bytes(&io, logits, (uint64_t)width * sizeof(float), &remaining, err, errlen) != 0) return drop();

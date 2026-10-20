@@ -1214,9 +1214,11 @@ const pulsar_tokens *pulsar_session_tokens(pulsar_session *s);
  * version.
  * v4 (L292): the 0731 NVFP4 KV rows are quantized with IEEE divides (attnpack): same layout,
  * rows written before differ in a few codes, so a resumed v3 payload would not equal a
- * fresh prefill -- v3 refuses on the version and the bank re-prefills. */
+ * fresh prefill -- v3 refuses on the version and the bank re-prefills.
+ * v5 (L302): the copy drafter's measured acceptance joins the speculation record (5 u32), so a
+ * restored session prices its copy rounds as the saved one does; v4 refuses on the version. */
 #define PULSAR_SESSION_KV_PAYLOAD_MAGIC UINT32_C(0x3150564b) /* "KVP1" */
-#define PULSAR_SESSION_KV_PAYLOAD_VERSION UINT32_C(4)
+#define PULSAR_SESSION_KV_PAYLOAD_VERSION UINT32_C(5)
 
 uint64_t pulsar_session_payload_bytes(pulsar_session *s);
 int pulsar_session_save_payload(pulsar_session *s, FILE *fp, char *err, size_t errlen);
