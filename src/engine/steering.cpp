@@ -149,7 +149,8 @@ struct gpu_graph_dump_cfg {
     int         enabled;      ///< PULSAR_CUDA_GRAPH_DUMP_PREFIX set
     const char *prefix;       ///< file prefix
     const char *name;         ///< PULSAR_CUDA_GRAPH_DUMP_NAME substring filter, or NULL
-    long        layer;        ///< PULSAR_CUDA_GRAPH_DUMP_LAYER, -1 = all
+    long        layer;        ///< PULSAR_CUDA_GRAPH_DUMP_LAYER, -1 = all (a comma list arms layer_mask instead)
+    uint64_t    layer_mask;   ///< work/dflash2-gate (measurement only): PULSAR_CUDA_GRAPH_DUMP_LAYER=a,b,c, layers < 64
     long        pos;          ///< PULSAR_CUDA_GRAPH_DUMP_POS, -1 = all
 };
 static const gpu_graph_dump_cfg *gpu_graph_dump_cfg_get(void) {
@@ -164,6 +165,16 @@ static const gpu_graph_dump_cfg *gpu_graph_dump_cfg_get(void) {
         cfg.name = (n && n[0]) ? n : NULL;
         const char *l = getenv("PULSAR_CUDA_GRAPH_DUMP_LAYER");
         cfg.layer = (l && l[0] && strcmp(l, "all") != 0) ? (long)strtoul(l, NULL, 10) : -1;
+        if (l && strchr(l, ',')) {
+            cfg.layer = -1;
+            for (const char *c = l; *c; ) {
+                char *end = NULL;
+                const unsigned long v = strtoul(c, &end, 10);
+                if (end == c || v >= 64) { fprintf(stderr, "pulsar: PULSAR_CUDA_GRAPH_DUMP_LAYER list '%s' refused\n", l); exit(2); }
+                cfg.layer_mask |= 1ull << v;
+                c = *end == ',' ? end + 1 : end;
+            }
+        }
         const char *q = getenv("PULSAR_CUDA_GRAPH_DUMP_POS");
         cfg.pos = (q && q[0]) ? (long)strtoul(q, NULL, 10) : -1;
     }
@@ -180,6 +191,7 @@ bool gpu_graph_debug_wants(const char *name, uint32_t il, uint32_t pos) {
     if (!c->enabled) return false;
     if (c->name && strstr(c->name, name) == NULL) return false;
     if (c->layer >= 0 && (uint32_t)c->layer != il) return false;
+    if (c->layer_mask && (il >= 64 || !(c->layer_mask >> il & 1u))) return false;
     if (c->pos >= 0 && (uint32_t)c->pos != pos) return false;
     return true;
 }
