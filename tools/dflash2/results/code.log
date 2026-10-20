@@ -1,0 +1,9 @@
+code B8 sel    : 86 rounds, 5.930 tok/round, P(kept>=d) 0.930 0.849 0.779 0.721 0.616 0.547 0.488
+code B8 argmax : 91 rounds, 5.604 tok/round, P(kept>=d) 0.912 0.835 0.758 0.615 0.538 0.505 0.440
+code B8 sel-dv : 86 rounds, 5.930 tok/round, P(kept>=d) 0.930 0.849 0.779 0.721 0.616 0.547 0.488
+code B6 sel    : 106 rounds, 4.821 tok/round, P(kept>=d) 0.906 0.811 0.774 0.708 0.623
+code B6 argmax : 108 rounds, 4.731 tok/round, P(kept>=d) 0.917 0.843 0.778 0.639 0.556
+code B6 sel-dv : 106 rounds, 4.821 tok/round, P(kept>=d) 0.906 0.811 0.774 0.708 0.623
+code B4 sel    : 139 rounds, 3.669 tok/round, P(kept>=d) 0.942 0.899 0.827
+code B4 argmax : 142 rounds, 3.592 tok/round, P(kept>=d) 0.951 0.866 0.775
+code B4 sel-dv : 139 rounds, 3.669 tok/round, P(kept>=d) 0.942 0.899 0.827

@@ -1,0 +1,9 @@
+edit B8 sel    : 130 rounds, 7.838 tok/round, P(kept>=d) 1.000 1.000 1.000 0.985 0.969 0.954 0.931
+edit B8 argmax : 131 rounds, 7.779 tok/round, P(kept>=d) 1.000 1.000 1.000 0.985 0.962 0.924 0.908
+edit B8 sel-dv : 131 rounds, 7.763 tok/round, P(kept>=d) 1.000 1.000 0.992 0.977 0.962 0.931 0.901
+edit B6 sel    : 172 rounds, 5.948 tok/round, P(kept>=d) 1.000 1.000 1.000 0.983 0.965
+edit B6 argmax : 173 rounds, 5.913 tok/round, P(kept>=d) 1.000 1.000 1.000 0.977 0.936
+edit B6 sel-dv : 175 rounds, 5.846 tok/round, P(kept>=d) 1.000 0.983 0.977 0.954 0.931
+edit B4 sel    : 257 rounds, 3.981 tok/round, P(kept>=d) 1.000 0.996 0.984
+edit B4 argmax : 256 rounds, 3.996 tok/round, P(kept>=d) 1.000 1.000 0.996
+edit B4 sel-dv : 259 rounds, 3.950 tok/round, P(kept>=d) 0.996 0.985 0.969

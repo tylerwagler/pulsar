@@ -1,0 +1,9 @@
+prose B8 sel    : 147 rounds, 3.435 tok/round, P(kept>=d) 0.789 0.544 0.408 0.272 0.177 0.143 0.102
+prose B8 argmax : 155 rounds, 3.258 tok/round, P(kept>=d) 0.774 0.529 0.361 0.245 0.155 0.116 0.077
+prose B8 sel-dv : 147 rounds, 3.435 tok/round, P(kept>=d) 0.789 0.544 0.408 0.272 0.177 0.143 0.102
+prose B6 sel    : 154 rounds, 3.305 tok/round, P(kept>=d) 0.792 0.597 0.435 0.299 0.182
+prose B6 argmax : 161 rounds, 3.161 tok/round, P(kept>=d) 0.795 0.559 0.391 0.267 0.149
+prose B6 sel-dv : 154 rounds, 3.305 tok/round, P(kept>=d) 0.792 0.597 0.435 0.299 0.182
+prose B4 sel    : 175 rounds, 2.909 tok/round, P(kept>=d) 0.851 0.611 0.446
+prose B4 argmax : 180 rounds, 2.828 tok/round, P(kept>=d) 0.828 0.594 0.406
+prose B4 sel-dv : 175 rounds, 2.909 tok/round, P(kept>=d) 0.851 0.611 0.446

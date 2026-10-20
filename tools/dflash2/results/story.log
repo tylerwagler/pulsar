@@ -1,0 +1,9 @@
+story B8 sel    : 158 rounds, 3.196 tok/round, P(kept>=d) 0.671 0.424 0.316 0.253 0.203 0.177 0.152
+story B8 argmax : 157 rounds, 3.217 tok/round, P(kept>=d) 0.701 0.446 0.306 0.255 0.204 0.172 0.134
+story B8 sel-dv : 160 rounds, 3.156 tok/round, P(kept>=d) 0.662 0.425 0.312 0.250 0.206 0.163 0.138
+story B6 sel    : 167 rounds, 3.036 tok/round, P(kept>=d) 0.683 0.461 0.371 0.281 0.240
+story B6 argmax : 173 rounds, 2.931 tok/round, P(kept>=d) 0.682 0.434 0.335 0.266 0.214
+story B6 sel-dv : 167 rounds, 3.036 tok/round, P(kept>=d) 0.683 0.455 0.377 0.281 0.240
+story B4 sel    : 193 rounds, 2.648 tok/round, P(kept>=d) 0.710 0.518 0.420
+story B4 argmax : 198 rounds, 2.581 tok/round, P(kept>=d) 0.712 0.490 0.379
+story B4 sel-dv : 194 rounds, 2.634 tok/round, P(kept>=d) 0.706 0.510 0.418
