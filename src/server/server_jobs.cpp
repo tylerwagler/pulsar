@@ -1253,11 +1253,10 @@ bool gen_tool_name_mask(server *s, gen_state *g, int width, std::vector<uint32_t
  * client sent explicitly is respected as-is. That includes an explicit
  * temperature==0, which selects greedy decode -- and nothing more: it does NOT
  * decide whether DSpark runs. Speculative decode is gated on one condition,
- * `spec_enabled = !req.logprobs` above, and `spec_accept_walk`
- * (session_spec.cpp) carries BOTH acceptance rules -- greedy argmax match at
- * temperature 0, sampled p/q otherwise, with the L149 compact prefilter
- * (`spec_compact_dist`) serving the sparse min-p contract that the engine
- * defaults put a thinking request in. Tool-call payload forcing (temperature=0 while
+ * `spec_enabled = !req.logprobs` above, and the accept walk (session_spec.cpp,
+ * on the device since L302) draws every verify row the plain sampler's way --
+ * greedy argmax at temperature 0, THE sampler's keyed draw otherwise -- so one
+ * rule serves both. Tool-call payload forcing (temperature=0 while
  * decoding structured tool output, in gen_resolve_sampling_decode) is a separate,
  * deliberate override applied on top of this. */
 void gen_resolve_sampling(const request *req, float *temperature,

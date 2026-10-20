@@ -613,7 +613,7 @@ __global__ void __launch_bounds__(SLOT_THREADS) sample_slots_kernel(const __grid
     }
 }
 
-/* ---- logprobs (the host's pulsar_logits_top_logprobs / _token_logprob, byte for byte) -------------------------- */
+/* ---- logprobs (the host scorers' bytes: tests/sampler_host_ref.cpp pulsar_logits_top_logprobs / _token_logprob) --- */
 
 struct lp_args {
     const float *logits;

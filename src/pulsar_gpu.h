@@ -2489,8 +2489,8 @@ typedef struct pulsar_gpu_logprob_row {
     pulsar_gpu_token_score top[PULSAR_GPU_LOGPROB_TOPK_MAX];
 } pulsar_gpu_logprob_row;
 /** Logprobs of n_rows rows: the scored token of row r (tokens at tokens_offset_bytes + r * token_stride int32s;
- *  NULL = none) and the top_k (<= PULSAR_GPU_LOGPROB_TOPK_MAX) best, as pulsar_logits_token_logprob /
- *  pulsar_logits_top_logprobs score them.  mask_rows (NULL = unmasked) names each row's mask row. */
+ *  NULL = none) and the top_k (<= PULSAR_GPU_LOGPROB_TOPK_MAX) best, as the host scorers did (frozen in
+ *  tests/sampler_host_ref.cpp).  mask_rows (NULL = unmasked) names each row's mask row. */
 int pulsar_gpu_logprobs_rows(const pulsar_gpu_tensor *logits, uint64_t logits_offset_bytes, uint32_t row_stride,
                              uint32_t n_vocab, uint32_t n_rows, const pulsar_gpu_tensor *mask, uint32_t mask_words,
                              const uint32_t *mask_rows, const pulsar_gpu_tensor *tokens, uint64_t tokens_offset_bytes,

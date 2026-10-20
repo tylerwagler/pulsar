@@ -1586,6 +1586,14 @@ static void test_tool_call_quality(void) {
  */
 #define SPEC_V 64u
 
+/* the trials' own generator (xorshift64*) */
+static uint64_t samp_rs;
+static void samp_seed(uint64_t s) { samp_rs = s ? s : 1; }
+static double samp_u01(void) {
+    samp_rs ^= samp_rs >> 12; samp_rs ^= samp_rs << 25; samp_rs ^= samp_rs >> 27;
+    return (double)((samp_rs * 0x2545f4914f6cdd1dULL) >> 11) / 9007199254740992.0;
+}
+
 static double spec_tv(const sref::pulsar_sample_dist *p, const sref::pulsar_sample_dist *q) {
     double tv = 0.0;
     for (uint32_t i = 0; i < p->n; i++) {
