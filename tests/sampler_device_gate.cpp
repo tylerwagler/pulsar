@@ -425,9 +425,14 @@ void bench(uint32_t n_vocab, pulsar_gpu_tensor *dl, pulsar_gpu_tensor *scratch, 
     }
     pulsar_gpu_tensor_write(dl, 0, host.data(), host.size() * 4);
     struct mode { const char *name; float t; int k; float p, m; } modes[] = {
-        {"greedy", 0.0f, 0, 1.0f, 0.05f}, {"T0.7 min_p 0.05", 0.7f, 0, 1.0f, 0.05f},
-        {"T0.7 top-k 20 top-p 0.95", 0.7f, 20, 0.95f, 0.0f}, {"T0.7 top-p 0.9 min_p 0.05", 0.7f, 0, 0.9f, 0.05f},
-        {"T1.0 min_p 0 (full sort)", 1.0f, 0, 1.0f, 0.0f}};
+        {"greedy", 0.0f, 0, 1.0f, 0.05f},
+        {"T0.7 min_p 0.05", 0.7f, 0, 1.0f, 0.05f},
+        {"T0.7 top-k 20 top-p 0.95", 0.7f, 20, 0.95f, 0.0f},
+        {"T0.7 top-p 0.9 (min_p 0)", 0.7f, 0, 0.9f, 0.0f},
+        {"T0.7 top-p 0.9 min_p 0.05", 0.7f, 0, 0.9f, 0.05f},
+        {"T1.0 min_p 0 (full arm)", 1.0f, 0, 1.0f, 0.0f},
+        {"T1.5 min_p 0.05", 1.5f, 0, 1.0f, 0.05f},
+        {"T1.5 top-p 0.95 min_p 0.05", 1.5f, 0, 0.95f, 0.05f}};
     for (const mode &m : modes) {
         for (uint32_t nr : {1u, 5u, 33u}) {
             std::vector<pulsar_gpu_sample_req> reqs(nr);
@@ -447,6 +452,20 @@ void bench(uint32_t n_vocab, pulsar_gpu_tensor *dl, pulsar_gpu_tensor *scratch, 
             printf("  bench V=%u %-28s %2u rows: %8.1f us a launch\n", n_vocab, m.name, nr, us);
         }
     }
+    pulsar_gpu_tensor *lp = pulsar_gpu_tensor_alloc(ROWS * sizeof(pulsar_gpu_logprob_row));
+    for (uint32_t nr : {1u, 5u, 33u}) {
+        std::vector<uint32_t> mrows(nr, PULSAR_GPU_SAMPLE_NO_MASK);
+        const int it = 20;
+        pulsar_gpu_logprobs_rows(dl, 0, n_vocab, n_vocab, nr, nullptr, 0, mrows.data(), nullptr, 0, 0, 20, lp);
+        pulsar_gpu_synchronize();
+        const auto t0 = std::chrono::steady_clock::now();
+        for (int i = 0; i < it; i++)
+            pulsar_gpu_logprobs_rows(dl, 0, n_vocab, n_vocab, nr, nullptr, 0, mrows.data(), nullptr, 0, 0, 20, lp);
+        pulsar_gpu_synchronize();
+        const double us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count() / it;
+        printf("  bench V=%u %-28s %2u rows: %8.1f us a launch\n", n_vocab, "logprobs top 20", nr, us);
+    }
+    pulsar_gpu_tensor_free(lp);
 }
 
 }  // namespace
