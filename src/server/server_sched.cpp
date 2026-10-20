@@ -611,14 +611,20 @@ session_slot *server::choose_slot_for_job(job *j, int *reject_ctx,
         : -1;
     const bool in_place = best && server_route_in_place(best_common, best_score, frontier, prefilled,
                                                         s->slot_trivial_common_tokens, anchor);
-    /* One line per bind, always: which bank, how deep the match, where it
-     * resumes, what it costs the bank, and where the bank's last turn starts. */
-    if (best)
+    /* One line per bind decision: which bank, how deep the match, where it resumes, what it costs the bank, and
+     * where the bank's last turn starts (a head that waits re-routes every quantum; its line repeats only when the
+     * decision changes). */
+    const uint64_t route_key = best ? 1u + (((uint64_t)best->bank << 1 | (in_place ? 1u : 0u)) ^
+                                            ((uint64_t)(uint32_t)best_common << 17) ^ ((uint64_t)(uint32_t)best_score << 40))
+                                    : 0u;
+    if (best && route_key != j->route_logged) {
+        j->route_logged = route_key;
         server_log(PULSAR_LOG_KVCACHE,
                    "pulsar-server: route: best bank %u common %d resume %d frontier %d prefilled %d "
                    "anchor %d prompt %d -> %s",
                    best->bank, best_common, best_score, frontier, prefilled, anchor, j->req.prompt.len,
                    in_place ? "in place" : "fresh preferred");
+    }
     if (in_place) return best;
     /* L280: a fresh bank is preferred to keep the best bank's conversation -- but the prompt's KV lands in it, and
      * when that cannot fit the resident-KV budget even by spilling idle banks (prompt_kv_check on an empty bank),
