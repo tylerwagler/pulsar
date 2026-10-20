@@ -2339,7 +2339,7 @@ typedef struct pulsar_session_dev_rows {
     bool host_stale;                ///< pulsar_session::logits is behind `live`
     pulsar_gpu_tensor *bank_rows;   ///< [n_banks][W] f32: each bank's live row while another bank is installed
     uint32_t n_banks;
-    pulsar_gpu_tensor *scratch;     ///< pulsar_gpu_sample_scratch_bytes(W)
+    pulsar_gpu_tensor *scratch;     ///< the sampler's and the logprob passes' (the larger of their scratch bytes)
     pulsar_gpu_tensor *out;         ///< PULSAR_GPU_SAMPLE_ROWS_MAX sample outs, then as many walk outs
     pulsar_gpu_tensor *mask;        ///< [PULSAR_GPU_SAMPLE_ROWS_MAX][ceil(W/32)] u32 token masks
     pulsar_gpu_tensor *lp;          ///< [PULSAR_GPU_SAMPLE_ROWS_MAX] logprob rows

@@ -2503,7 +2503,10 @@ typedef struct pulsar_gpu_logprob_row {
 int pulsar_gpu_logprobs_rows(const pulsar_gpu_tensor *logits, uint64_t logits_offset_bytes, uint32_t row_stride,
                              uint32_t n_vocab, uint32_t n_rows, const pulsar_gpu_tensor *mask, uint32_t mask_words,
                              const uint32_t *mask_rows, const pulsar_gpu_tensor *tokens, uint64_t tokens_offset_bytes,
-                             uint32_t token_stride, uint32_t top_k, pulsar_gpu_tensor *out);
+                             uint32_t token_stride, uint32_t top_k, pulsar_gpu_tensor *scratch,
+                             pulsar_gpu_tensor *out);
+/** Bytes of the scratch a logprob launch over rows of n_vocab takes (any row count). */
+uint64_t pulsar_gpu_logprobs_scratch_bytes(uint32_t n_vocab);
 
 /** A block drafter's sampled chains (L298 rows, L302 on the device): chain c walks slots 0..n-1, slot j's row the
  *  candidates cand[c][j][0..topk) scored by scores[c][j][prev][0..topk) (prev: the slot before's pick, 0 at slot 0)

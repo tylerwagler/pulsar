@@ -26,7 +26,8 @@ bool pulsar_session_dev_alloc(pulsar_session *s, uint32_t n_banks) {
     d.n_banks = n_banks ? n_banks : 1u;
     d.live = pulsar_gpu_tensor_alloc((uint64_t)W * sizeof(float));
     d.bank_rows = pulsar_gpu_tensor_alloc((uint64_t)d.n_banks * W * sizeof(float));
-    d.scratch = pulsar_gpu_tensor_alloc(pulsar_gpu_sample_scratch_bytes(W));
+    /* the sampler's scratch, the logprob passes' too (one stream: never both at once) */
+    d.scratch = pulsar_gpu_tensor_alloc(std::max(pulsar_gpu_sample_scratch_bytes(W), pulsar_gpu_logprobs_scratch_bytes(W)));
     d.out = pulsar_gpu_tensor_alloc(dev_digest_off() + sizeof(uint64_t));
     d.mask = pulsar_gpu_tensor_alloc((uint64_t)PULSAR_GPU_SAMPLE_ROWS_MAX * mask_words(s) * sizeof(uint32_t));
     d.lp = pulsar_gpu_tensor_alloc(PULSAR_GPU_SAMPLE_ROWS_MAX * sizeof(pulsar_gpu_logprob_row));
@@ -259,7 +260,7 @@ static bool session_logprobs(pulsar_session *s, const pulsar_gpu_tensor *rows, u
     if (!pulsar_gpu_tensor_write(s->dev.out, 0, &t, sizeof(t)) ||
         !pulsar_gpu_logprobs_rows(rows, (uint64_t)row * W * sizeof(float), W, W, 1, NULL, 0, NULL,
                                   token >= 0 ? s->dev.out : NULL, 0, sizeof(t) / sizeof(int32_t), (uint32_t)k,
-                                  s->dev.lp) ||
+                                  s->dev.scratch, s->dev.lp) ||
         !pulsar_gpu_tensor_read(s->dev.lp, 0, L, sizeof(*L))) {
         fprintf(stderr, "pulsar: session: the device logprobs failed\n");
         return false;

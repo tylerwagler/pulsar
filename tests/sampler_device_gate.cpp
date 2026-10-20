@@ -242,7 +242,7 @@ bool run_batch(gate &g, uint32_t n_vocab, std::vector<case_row> &rows, pulsar_gp
     std::vector<uint32_t> mrows(nr);
     for (uint32_t r = 0; r < nr; r++) mrows[r] = reqs[r].mask_row;
     if (check_lp && (!pulsar_gpu_logprobs_rows(dl, 0, stride, n_vocab, nr, dm, words, mrows.data(), dout, 0, sizeof(pulsar_gpu_sample_out) / 4,
-                                               PULSAR_GPU_LOGPROB_TOPK_MAX, dlp) ||
+                                               PULSAR_GPU_LOGPROB_TOPK_MAX, scratch, dlp) ||
                      !pulsar_gpu_synchronize() || !pulsar_gpu_tensor_read(dlp, 0, lp.data(), lp.size() * sizeof(lp[0]))))
         return false;
     std::vector<host_out> ho(nr);
@@ -455,11 +455,11 @@ void bench(uint32_t n_vocab, pulsar_gpu_tensor *dl, pulsar_gpu_tensor *scratch, 
     pulsar_gpu_tensor *lp = pulsar_gpu_tensor_alloc(ROWS * sizeof(pulsar_gpu_logprob_row));
     for (uint32_t nr : {1u, 5u, 33u}) {
         const int it = 20;
-        pulsar_gpu_logprobs_rows(dl, 0, n_vocab, n_vocab, nr, nullptr, 0, nullptr, nullptr, 0, 0, 20, lp);
+        pulsar_gpu_logprobs_rows(dl, 0, n_vocab, n_vocab, nr, nullptr, 0, nullptr, nullptr, 0, 0, 20, scratch, lp);
         pulsar_gpu_synchronize();
         const auto t0 = std::chrono::steady_clock::now();
         for (int i = 0; i < it; i++)
-            pulsar_gpu_logprobs_rows(dl, 0, n_vocab, n_vocab, nr, nullptr, 0, nullptr, nullptr, 0, 0, 20, lp);
+            pulsar_gpu_logprobs_rows(dl, 0, n_vocab, n_vocab, nr, nullptr, 0, nullptr, nullptr, 0, 0, 20, scratch, lp);
         pulsar_gpu_synchronize();
         const double us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count() / it;
         printf("  bench V=%u %-28s %2u rows: %8.1f us a launch\n", n_vocab, "logprobs top 20", nr, us);
@@ -630,7 +630,8 @@ int main(int argc, char **argv) {
         const uint32_t max_stride = v + 77u;
         pulsar_gpu_tensor *dl = pulsar_gpu_tensor_alloc((uint64_t)ROWS * max_stride * 4);
         pulsar_gpu_tensor *dm = pulsar_gpu_tensor_alloc((uint64_t)ROWS * ((v + 31u) / 32u) * 4);
-        pulsar_gpu_tensor *scratch = pulsar_gpu_tensor_alloc(pulsar_gpu_sample_scratch_bytes(v));
+        pulsar_gpu_tensor *scratch = pulsar_gpu_tensor_alloc(
+            std::max(pulsar_gpu_sample_scratch_bytes(v), pulsar_gpu_logprobs_scratch_bytes(v)));
         pulsar_gpu_tensor *dout = pulsar_gpu_tensor_alloc(ROWS * sizeof(pulsar_gpu_sample_out));
         pulsar_gpu_tensor *ddist = pulsar_gpu_tensor_alloc((uint64_t)ROWS * (1 + 2 * DIST_CAP) * 4);
         pulsar_gpu_tensor *dlp = pulsar_gpu_tensor_alloc(ROWS * sizeof(pulsar_gpu_logprob_row));

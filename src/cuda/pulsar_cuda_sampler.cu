@@ -295,7 +295,7 @@ struct serial_sum_smem {
     unsigned long long wsum[32];
     uint32_t wmin[32];
     T s;
-    uint32_t i0, stop;
+    uint32_t start, stop, nan;
 };
 
 /* The shared memory of a row: the THREADS-wide scratch and (row kernel) the candidate store. */
@@ -682,19 +682,23 @@ __device__ __forceinline__ float serial_sum(const float *p, uint32_t n) { return
  * (m + rint(p / u)) * u -- integer arithmetic, which a block scan does in any order.  Two cases are not that: a value
  * exactly halfway between grid points (the rounding's tie goes to an even m + k, which depends on m) and the add
  * that takes the sum out of its binade (the next grid is coarser).  Both are taken serially, by the hardware add,
- * and the scan restarts after them on the sum's new grid.  A sum crosses a binade a few dozen times at most, and an
- * exact tie is rare, so a row costs about one scan pass. */
+ * and the scan restarts after them on the sum's new grid -- inside the tile, from the values each thread holds in
+ * registers.  A sum crosses a binade a few dozen times, and an exact tie is rare, so a row costs about one pass. */
+
+constexpr uint32_t SUM_E = 8;   /* values a thread holds a tile */
 
 template <typename T> struct sum_grid_traits;
 template <> struct sum_grid_traits<float> {
-    static constexpr uint32_t MANT = 23u, BIAS = 127u, EMAX = 255u;
+    static constexpr uint32_t MANT = 23u, LSB = 150u, EMAX = 255u;   /* value = M * 2^(max(e, 1) - LSB) */
     static __device__ __forceinline__ uint64_t bits(float v) { return __float_as_uint(v); }
     static __device__ __forceinline__ float add(float a, float b) { return __fadd_rn(a, b); }
+    static __device__ __forceinline__ float scaled(uint64_t m, int k) { return ldexpf((float)(uint32_t)m, -k); }
 };
 template <> struct sum_grid_traits<double> {
-    static constexpr uint32_t MANT = 52u, BIAS = 1023u, EMAX = 2047u;
+    static constexpr uint32_t MANT = 52u, LSB = 1075u, EMAX = 2047u;
     static __device__ __forceinline__ uint64_t bits(double v) { return (uint64_t)__double_as_longlong(v); }
     static __device__ __forceinline__ double add(double a, double b) { return __dadd_rn(a, b); }
+    static __device__ __forceinline__ double scaled(uint64_t m, int k) { return ldexp((double)m, -k); }
 };
 
 /* s's grid: s = m * 2^-k exactly, m < 2^(MANT + 1); finite false for a NaN or infinite s */
@@ -703,105 +707,165 @@ struct sum_grid {
     bool finite;
     int k;
     uint64_t m;
-    __device__ __forceinline__ sum_grid(T s) {
+    __device__ __forceinline__ explicit sum_grid(T s) {
         typedef sum_grid_traits<T> tr;
         const uint64_t b = tr::bits(s);
         const uint32_t e = (uint32_t)(b >> tr::MANT) & tr::EMAX;
         const uint64_t mant = b & ((1ull << tr::MANT) - 1u);
         finite = e != tr::EMAX;
         m = e ? mant | (1ull << tr::MANT) : mant;
-        k = (int)(tr::BIAS + tr::MANT) - (int)(e ? e : 1u);
+        k = (int)tr::LSB - (int)(e ? e : 1u);
     }
-    __device__ __forceinline__ T value(uint64_t mm) const { return (T)ldexp((double)mm, -k); }
+    __device__ __forceinline__ T value(uint64_t mm) const { return sum_grid_traits<T>::scaled(mm, k); }
 };
 
-/* Block-wide inclusive scan of q (THREADS threads). */
+/* rint(p * 2^k) from p's bits (integer ops: no FP64), clamped at `top` (any such value leaves the binade); *serial
+ * set for an exact tie or a NaN p */
+template <typename T>
+__device__ __forceinline__ uint64_t grid_q(T p, int k, bool *serial) {
+    typedef sum_grid_traits<T> tr;
+    constexpr uint64_t TOP = 1ull << (tr::MANT + 1u);
+    const uint64_t b = tr::bits(p);
+    const uint32_t e = (uint32_t)(b >> tr::MANT) & tr::EMAX;
+    if (e == tr::EMAX) { *serial = true; return 0; }
+    const uint64_t M = e ? (b & ((1ull << tr::MANT) - 1u)) | (1ull << tr::MANT) : b & ((1ull << tr::MANT) - 1u);
+    if (M == 0) return 0;   /* +0 (a -0 cannot arise) */
+    const int sh = (int)(e ? e : 1u) - (int)tr::LSB + k;
+    if (sh >= 0) return sh > (int)tr::MANT || M >= (TOP >> sh) ? TOP : M << sh;
+    const int r = -sh;
+    if (r > (int)tr::MANT + 2) return 0;   /* M < 2^(MANT + 1) <= half the step: under half */
+    const uint64_t rem = M & ((1ull << r) - 1u), half = 1ull << (r - 1);
+    uint64_t q = M >> r;
+    if (rem > half) q++;
+    else if (rem == half) *serial = true;
+    return q;
+}
+
+/* Saturating at 2^62: a prefix that large has left any binade, and the saturating sum is still associative. */
+__device__ __forceinline__ uint64_t sat_add(uint64_t a, uint64_t b) {
+    constexpr uint64_t CAP = 1ull << 62;
+    const uint64_t s = a + b;
+    return s > CAP || s < a ? CAP : s;
+}
+
+/* Block-wide exclusive (saturating) scan of v (THREADS threads); *total receives the sum. */
 template <uint32_t THREADS>
-__device__ __forceinline__ uint64_t block_scan_u64(uint64_t q, unsigned long long *wsum) {
+__device__ __forceinline__ uint64_t block_scan_excl_u64(uint64_t v, unsigned long long *wsum, uint64_t *total) {
     const uint32_t lane = threadIdx.x & 31u, warp = threadIdx.x >> 5;
-    uint64_t v = q;
+    uint64_t x = v, ex = 0;
     for (uint32_t off = 1; off < 32u; off <<= 1) {
-        const uint64_t o = __shfl_up_sync(0xffffffffu, v, off);
-        if (lane >= off) v += o;
+        const uint64_t o = __shfl_up_sync(0xffffffffu, x, off);
+        if (lane >= off) x = sat_add(x, o);
     }
-    if (lane == 31u) wsum[warp] = v;
+    {   /* the warp-exclusive prefix: the inclusive one of the lane below */
+        const uint64_t o = __shfl_up_sync(0xffffffffu, x, 1);
+        ex = lane ? o : 0u;
+    }
+    if (lane == 31u) wsum[warp] = x;
     __syncthreads();
     if (warp == 0) {
         uint64_t w = lane < THREADS / 32u ? wsum[lane] : 0u;
         for (uint32_t off = 1; off < 32u; off <<= 1) {
             const uint64_t o = __shfl_up_sync(0xffffffffu, w, off);
-            if (lane >= off) w += o;
+            if (lane >= off) w = sat_add(w, o);
         }
         if (lane < THREADS / 32u) wsum[lane] = w;
     }
     __syncthreads();
-    const uint64_t r = v + (warp ? wsum[warp - 1u] : 0u);
+    const uint64_t r = sat_add(ex, warp ? wsum[warp - 1u] : 0u);
+    *total = wsum[THREADS / 32u - 1u];
     __syncthreads();
     return r;
 }
 
-/* The block's least `c` (THREADS where no thread has one). */
+/* The block's least c. */
 template <uint32_t THREADS>
 __device__ __forceinline__ uint32_t block_min_u32(uint32_t c, uint32_t *wmin) {
     const uint32_t lane = threadIdx.x & 31u, warp = threadIdx.x >> 5;
     c = __reduce_min_sync(0xffffffffu, c);
     if (lane == 0) wmin[warp] = c;
     __syncthreads();
-    uint32_t r = THREADS;
+    uint32_t r = UINT32_MAX;
     for (uint32_t w = 0; w < THREADS / 32u; w++) r = min(r, wmin[w]);
     __syncthreads();
     return r;
 }
 
-/* The serial round-to-nearest sum of value(0), value(1), ... value(n - 1), stopped after the first i whose prefix
- * satisfies pred (*stop_at = i, else UINT32_MAX).  value(i, k) may return 0 for a value it proves under half the
- * current grid's ulp 2^-k (it rounds away; the grid only coarsens) without computing it.  Every thread returns the
- * sum. */
-template <typename T, uint32_t THREADS, typename V, typename P>
+/* The serial round-to-nearest sum of value(0) .. value(n - 1), stopped after the first i whose prefix satisfies pred
+ * (HAS_PRED; *stop_at = i, else UINT32_MAX).  Each thread holds E consecutive values of a tile of THREADS * E.  Every
+ * thread returns the sum. */
+template <typename T, uint32_t THREADS, uint32_t E, bool HAS_PRED, typename V, typename P>
 __device__ T block_serial_sum(uint32_t n, V value, P pred, uint32_t *stop_at, serial_sum_smem<T> &sm) {
     typedef sum_grid_traits<T> tr;
     constexpr uint64_t TOP = 1ull << (tr::MANT + 1u);
-    constexpr double QMAX = (double)TOP;   /* any value this large leaves the binade: the scan only needs to see it */
     const uint32_t tid = threadIdx.x;
-    if (tid == 0) { sm.s = T(0); sm.i0 = 0; sm.stop = UINT32_MAX; }
+    if (tid == 0) { sm.s = T(0); sm.stop = UINT32_MAX; sm.nan = 0; }
     __syncthreads();
-    for (;;) {
-        const uint32_t i0 = sm.i0;
-        const T s = sm.s;
-        if (i0 >= n || sm.stop != UINT32_MAX) break;
-        const sum_grid<T> g(s);
-        if (!g.finite) break;   /* a NaN sum stays NaN (an infinite one cannot arise: every value is <= 1) */
-        const uint32_t i = i0 + tid;
-        const T p = i < n ? value(i, g.k) : T(0);
-        bool serial = false;
-        uint64_t q = 0;
-        const double r = ldexp((double)p, g.k);
-        if (r != r) {
-            serial = true;   /* a NaN value: the hardware add makes the sum NaN */
-        } else if (r >= QMAX) {
-            q = TOP;
-        } else {
-            const double fl = floor(r);
-            if (r - fl == 0.5) serial = true;   /* an exact tie */
-            else q = (uint64_t)rint(r);
-        }
-        const uint64_t incl = block_scan_u64<THREADS>(q, sm.wsum);
-        const bool cross = g.m + incl >= TOP;
-        const T pre = g.value(g.m + incl);
-        const bool hit = i < n && (serial || cross || pred(pre));
-        const uint32_t first = block_min_u32<THREADS>(hit ? tid : THREADS, sm.wmin);
-        if (first == THREADS) {
-            if (i + 1u == min(n, i0 + THREADS)) { sm.s = pre; sm.i0 = i0 + THREADS; }
-        } else if (tid == first) {
-            if (!serial && !cross) {   /* pred at an exact prefix */
-                sm.s = pre;
-                sm.stop = i;
-            } else {
-                const T ns = tr::add(g.value(g.m + incl - q), p);
-                sm.s = ns;
-                sm.i0 = i + 1u;
-                if (pred(ns)) sm.stop = i;
+    for (uint32_t t0 = 0; t0 < n; t0 += THREADS * E) {
+        if (sm.stop != UINT32_MAX || sm.nan) break;
+        const uint32_t ib = t0 + tid * E, t_end = min(n, t0 + THREADS * E);
+        T v[E];
+#pragma unroll
+        for (uint32_t e = 0; e < E; e++) v[e] = ib + e < n ? value(ib + e) : T(0);
+        uint32_t start = t0;
+        for (;;) {
+            const sum_grid<T> g(sm.s);
+            if (!g.finite) {   /* a NaN sum stays NaN (an infinite one cannot arise: every value is <= 1) */
+                if (tid == 0) sm.nan = 1;
+                break;
             }
+            uint64_t q[E], loc = 0;
+            uint32_t ser = 0;
+#pragma unroll
+            for (uint32_t e = 0; e < E; e++) {
+                bool f = false;
+                q[e] = ib + e >= start && ib + e < t_end ? grid_q<T>(v[e], g.k, &f) : 0u;
+                if (f) ser |= 1u << e;
+                loc = sat_add(loc, q[e]);
+            }
+            uint64_t total;
+            const uint64_t excl = block_scan_excl_u64<THREADS>(loc, sm.wsum, &total);
+            uint32_t hit = UINT32_MAX;
+            uint64_t S = excl;
+#pragma unroll
+            for (uint32_t e = 0; e < E; e++) {
+                S = sat_add(S, q[e]);
+                const uint32_t i = ib + e;
+                if (hit != UINT32_MAX || i < start || i >= t_end) continue;
+                bool h = ((ser >> e) & 1u) || g.m + S >= TOP;
+                if (!h && HAS_PRED) h = pred(g.value(g.m + S));
+                if (h) hit = i;
+            }
+            const uint32_t first = HAS_PRED || (g.m + total >= TOP) || __syncthreads_or(ser != 0u)
+                                       ? block_min_u32<THREADS>(hit, sm.wmin)
+                                       : UINT32_MAX;
+            if (first == UINT32_MAX) {
+                if (tid == 0) sm.s = g.value(g.m + total);
+                __syncthreads();
+                break;
+            }
+            if (first >= ib && first < ib + E) {
+                const uint32_t e0 = first - ib;
+                uint64_t Sb = excl, qf = 0;   /* the prefix before `first`, and its q */
+                T pv = T(0);
+#pragma unroll
+                for (uint32_t e = 0; e < E; e++) {
+                    if (e < e0) Sb = sat_add(Sb, q[e]);
+                    if (e == e0) { qf = q[e]; pv = v[e]; }
+                }
+                if (!((ser >> e0) & 1u) && g.m + Sb + qf < TOP) {   /* pred at an exact prefix */
+                    sm.s = g.value(g.m + Sb + qf);
+                    sm.stop = first;
+                } else {   /* a tie, a NaN or the binade's edge: the hardware add */
+                    const T ns = tr::add(g.value(g.m + Sb), pv);
+                    sm.s = ns;
+                    if (HAS_PRED && pred(ns)) sm.stop = first;
+                }
+                sm.start = first + 1u;
+            }
+            __syncthreads();
+            start = sm.start;
+            if (sm.stop != UINT32_MAX || start >= t_end) break;
         }
         __syncthreads();
     }
@@ -940,13 +1004,13 @@ __device__ void sample_row(const launch_args &a, uint32_t row, row_smem<THREADS>
             n = pp->n_cand;
         }
         if (idsum) {   /* the id-order serial sum over every finite value (block_serial_sum: the host's bits) */
-            auto value = [&](uint32_t i, int) {
+            auto value = [&](uint32_t i) {
                 float pr = 0.0f;   /* a non-finite value adds +0 to the sum: the host skipped it, same bits */
                 (void)row_is_cand(p, i, rv(i), floor_logit, maxlogit, max_id, &pr);
                 return pr;
             };
-            const float fs = block_serial_sum<float, THREADS>(rv.n, value, [](float) { return false; }, nullptr,
-                                                              sm.ssum);
+            const float fs = block_serial_sum<float, THREADS, SUM_E, false>(rv.n, value, [](float) { return false; },
+                                                                            nullptr, sm.ssum);
             if (tid == 0) sm.fsum = fs;
             __syncthreads();
         }
@@ -1207,15 +1271,16 @@ __global__ void __launch_bounds__(SMP_THREADS) full_chain_kernel(const __grid_co
     const full_slot s = full_slot_of(a, g, j);
     if (s.st->status != PULSAR_GPU_SAMPLE_OK) return;
     const uint32_t n = s.st->n, floor_at = s.st->f;
-    auto value = [&](uint32_t i, int) { return s.p[i]; };
-    const float sum = block_serial_sum<float, SMP_THREADS>(n, value, [](float) { return false; }, nullptr, sm);
+    auto value = [&](uint32_t i) { return s.p[i]; };
+    const float sum = block_serial_sum<float, SMP_THREADS, SUM_E, false>(n, value, [](float) { return false; },
+                                                                         nullptr, sm);
     if (!(sum > 0.0f) || !finite_bits(sum)) {
         if (tid == 0) s.st->status = PULSAR_GPU_SAMPLE_REFUSED_MASS;
         return;
     }
     const float rs = __fdiv_rn(1.0f, sum);
     uint32_t stop;
-    const float fs = block_serial_sum<float, SMP_THREADS>(
+    const float fs = block_serial_sum<float, SMP_THREADS, SUM_E, true>(
         floor_at, value, [&](float pre) { return __fmul_rn(pre, rs) >= p.top_p; }, &stop, sm);
     if (tid == 0) {
         s.st->f = stop != UINT32_MAX ? stop + 1u : floor_at;   /* the top-p stop, else the floor (or every one) */
@@ -1328,6 +1393,12 @@ __global__ void full_final_kernel(const __grid_constant__ launch_args a, const f
 
 /* ---- logprobs (the host scorers' bytes: tests/sampler_host_ref.cpp pulsar_logits_top_logprobs / _token_logprob) --- */
 
+constexpr uint32_t LP_GROUP = 8;   /* rows a logprob pass takes (its scratch: LP_GROUP rows of doubles) */
+struct lp_head {
+    float maxv;
+    int32_t maxi;
+};
+
 struct lp_args {
     const float *logits;
     uint64_t row_stride;
@@ -1339,11 +1410,12 @@ struct lp_args {
     uint32_t token_stride;
     uint32_t top_k;
     pulsar_gpu_logprob_row *out;
+    uint32_t row0;             /* this launch's first row (a launch takes LP_GROUP rows) */
+    lp_head *head;             /* [LP_GROUP] each row's first maximum */
+    double *ex;                /* [LP_GROUP][n_vocab] exp(v - max) of the finite values, 0 elsewhere */
 };
 
 struct lp_smem {
-    float redv[SMP_THREADS];
-    int32_t redi[SMP_THREADS];
     uint32_t redu[SMP_THREADS];
     serial_sum_smem<double> ssum;
     uint64_t keys[1024];
@@ -1352,41 +1424,58 @@ struct lp_smem {
     double sum;
 };
 
-/* One block a row: the max (the first finite maximum's value), the double sum of exp(v - max) over the finite
- * values in id order (serial: the host's accumulation), log(sum) once; the scored token as _token_logprob's
- * compiled arithmetic has it ((logit - max) - log(sum)), the top-k as _top_logprobs' does (logit - (log(sum) +
- * max)) -- the host's -ffast-math build reassociated one and not the other. */
-__global__ void __launch_bounds__(SMP_THREADS) logprobs_rows_kernel(const __grid_constant__ lp_args a) {
-    __shared__ lp_smem sm;
-    const uint32_t tid = threadIdx.x, row = blockIdx.x;
+__device__ __forceinline__ row_view lp_view(const lp_args &a, uint32_t row) {
     row_view rv;
     rv.x = a.logits + (size_t)row * a.row_stride;
     rv.n = a.n_vocab;
     rv.mask = a.mask && a.mask_row[row] != PULSAR_GPU_SAMPLE_NO_MASK
                   ? a.mask + (size_t)a.mask_row[row] * a.mask_words : nullptr;
-    pulsar_gpu_logprob_row *o = a.out + row;
+    return rv;
+}
+
+/* pass 1, one block a row: the first finite maximum */
+__global__ void __launch_bounds__(SMP_THREADS) logprobs_max_kernel(const __grid_constant__ lp_args a) {
+    __shared__ float redv[SMP_THREADS];
+    __shared__ int32_t redi[SMP_THREADS];
+    const uint32_t j = blockIdx.x;
     float maxv;
     int32_t maxi;
-    block_argmax<SMP_THREADS>(rv, sm.redv, sm.redi, &maxv, &maxi);
-    if (maxi < 0) {
+    block_argmax<SMP_THREADS>(lp_view(a, a.row0 + j), redv, redi, &maxv, &maxi);
+    if (threadIdx.x == 0) a.head[j] = lp_head{maxv, maxi};
+}
+
+/* pass 2, PREP_CHUNKS blocks a row: exp(v - max) in double, the host scorer's (plm_exp), for every finite value */
+__global__ void __launch_bounds__(PREP_THREADS) logprobs_exp_kernel(const __grid_constant__ lp_args a) {
+    const uint32_t j = blockIdx.y, c = blockIdx.x;
+    if (a.head[j].maxi < 0) return;
+    const row_view rv = lp_view(a, a.row0 + j);
+    const double dmax = (double)a.head[j].maxv;
+    double *ex = a.ex + (size_t)j * a.n_vocab;
+    uint32_t lo, hi;
+    prep_chunk(rv.n, c, &lo, &hi);
+    for (uint32_t i = lo + threadIdx.x; i < hi; i += PREP_THREADS) {
+        const float v = rv(i);
+        ex[i] = finite_bits(v) ? plm_exp(__dsub_rn((double)v, dmax)) : 0.0;   /* +0.0: the host skipped it */
+    }
+}
+
+/* pass 3, one block a row: the double sum of exp(v - max) over the finite values in id order (block_serial_sum: the
+ * host's accumulation), log(sum) once; the scored token as _token_logprob's compiled arithmetic has it
+ * ((logit - max) - log(sum)), the top-k as _top_logprobs' does (logit - (log(sum) + max)) -- the host's -ffast-math
+ * build reassociated one and not the other. */
+__global__ void __launch_bounds__(SMP_THREADS) logprobs_rows_kernel(const __grid_constant__ lp_args a) {
+    __shared__ lp_smem sm;
+    const uint32_t tid = threadIdx.x, j = blockIdx.x, row = a.row0 + j;
+    const row_view rv = lp_view(a, row);
+    pulsar_gpu_logprob_row *o = a.out + row;
+    if (a.head[j].maxi < 0) {
         if (tid == 0) { o->n_top = 0; o->have_token = 0; }
         return;
     }
-    const double dmax = (double)maxv;
-    /* the serial double sum (block_serial_sum: the host's bits); a value provably under half the grid's ulp rounds
-     * away, so its exp is not evaluated: exp(d) < 2^-k / 2 / e where d < -(k + 1) ln 2 - 1 (plm_exp is within an
-     * ulp) */
-    auto value = [&](uint32_t i, int k) {
-        double e = 0.0;   /* the host skipped a non-finite value; +0.0 leaves the sum's bits alone */
-        const float v = rv(i);
-        if (finite_bits(v)) {
-            const double d = __dsub_rn((double)v, dmax);
-            if (!(d < -(double)(k + 1) * 0.6931471805599453 - 1.0)) e = plm_exp(d);
-        }
-        return e;
-    };
-    const double dsum = block_serial_sum<double, SMP_THREADS>(rv.n, value, [](double) { return false; }, nullptr,
-                                                              sm.ssum);
+    const double dmax = (double)a.head[j].maxv;
+    const double *ex = a.ex + (size_t)j * a.n_vocab;
+    const double dsum = block_serial_sum<double, SMP_THREADS, SUM_E, false>(
+        rv.n, [&](uint32_t i) { return ex[i]; }, [](double) { return false; }, nullptr, sm.ssum);
     if (tid == 0) sm.sum = dsum;
     __syncthreads();
     const double lsum = plm_log(sm.sum);
@@ -1694,11 +1783,17 @@ int pulsar_gpu_sample_rows(const pulsar_gpu_tensor *logits, uint64_t logits_offs
     return 1;
 }
 
+uint64_t pulsar_gpu_logprobs_scratch_bytes(uint32_t n_vocab) {
+    static_assert(LP_GROUP * sizeof(lp_head) <= 256u, "the logprob scratch's head");
+    return 256u + (uint64_t)LP_GROUP * n_vocab * sizeof(double);
+}
+
 int pulsar_gpu_logprobs_rows(const pulsar_gpu_tensor *logits, uint64_t logits_offset_bytes, uint32_t row_stride,
                              uint32_t n_vocab, uint32_t n_rows, const pulsar_gpu_tensor *mask, uint32_t mask_words,
                              const uint32_t *mask_rows, const pulsar_gpu_tensor *tokens, uint64_t tokens_offset_bytes,
-                             uint32_t token_stride, uint32_t top_k, pulsar_gpu_tensor *out) {
-    if (!logits || !out || n_rows == 0 || n_rows > PULSAR_GPU_SAMPLE_ROWS_MAX || n_vocab == 0 || row_stride < n_vocab ||
+                             uint32_t token_stride, uint32_t top_k, pulsar_gpu_tensor *scratch,
+                             pulsar_gpu_tensor *out) {
+    if (!logits || !out || !scratch || scratch->bytes < pulsar_gpu_logprobs_scratch_bytes(n_vocab) || n_rows == 0 || n_rows > PULSAR_GPU_SAMPLE_ROWS_MAX || n_vocab == 0 || row_stride < n_vocab ||
         top_k > PULSAR_GPU_LOGPROB_TOPK_MAX || logits_offset_bytes > logits->bytes ||
         (uint64_t)(n_rows - 1u) * row_stride * sizeof(float) + (uint64_t)n_vocab * sizeof(float) >
             logits->bytes - logits_offset_bytes ||
@@ -1720,8 +1815,17 @@ int pulsar_gpu_logprobs_rows(const pulsar_gpu_tensor *logits, uint64_t logits_of
     a.token_stride = token_stride;
     a.top_k = top_k;
     a.out = (pulsar_gpu_logprob_row *)out->ptr;
-    logprobs_rows_kernel<<<n_rows, SMP_THREADS>>>(a);
-    return cuda_ok(cudaGetLastError(), "device logprobs");
+    a.head = (lp_head *)scratch->ptr;
+    a.ex = (double *)((uint8_t *)scratch->ptr + 256u);
+    for (uint32_t r0 = 0; r0 < n_rows; r0 += LP_GROUP) {
+        const uint32_t g = min(LP_GROUP, n_rows - r0);
+        a.row0 = r0;
+        logprobs_max_kernel<<<g, SMP_THREADS>>>(a);
+        logprobs_exp_kernel<<<dim3(PREP_CHUNKS, g), PREP_THREADS>>>(a);
+        logprobs_rows_kernel<<<g, SMP_THREADS>>>(a);
+        if (!cuda_ok(cudaGetLastError(), "device logprobs")) return 0;
+    }
+    return 1;
 }
 
 int pulsar_gpu_spec_walk(const pulsar_gpu_tensor *rows, uint64_t rows_offset_bytes, uint32_t n_rows,
