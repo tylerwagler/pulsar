@@ -1371,9 +1371,24 @@ typedef enum {
                                       reused); see server_refusal_evictable */
     PROVISION_REFUSED_CREATE_FAIL, /* allocation failed — eviction unsafe to
                                       chain on (same physical pressure) */
+    PROVISION_REFUSED_KV_TOUCHED,  /* L280: the prompt's KV would take the
+                                      resident KV past the guard's budget and
+                                      no idle bank can be spilled to make room
+                                      -- the head waits for a busy bank (an
+                                      eviction frees no pages) */
     PROVISION_REFUSAL_COUNT,       /* sentinel: array bound for the /metrics
                                       per-reason counters, not a reason */
 } provision_refusal;
+
+/** L280: the prompt's KV admission verdict (server::prompt_kv_check; the arithmetic is
+ * server_prompt_kv_verdict in server_sched.cpp). */
+typedef enum {
+    PROMPT_KV_FITS = 0,   /* resident KV + the prompt's growth stays within the budget */
+    PROMPT_KV_SPILL,      /* it fits after spilling the planned idle banks */
+    PROMPT_KV_WAIT,       /* it does not fit yet; a busy bank will become a victim when its job ends */
+    PROMPT_KV_REFUSE,     /* it cannot fit: no idle bank to spill, none busy to wait for, or the prompt
+                             alone is past the budget */
+} prompt_kv_verdict;
 
 /** Rate limiter for a warning about a PER-REQUEST condition that the worker
  * re-evaluates every quantum (L190 C1): one line per period, carrying the
@@ -2045,6 +2060,14 @@ struct server {
      * under guard_touched_budget. @param dec the decode set that must be kept
      * resident. @param n its length. */
     void guard_maybe_evict(session_slot **dec, int n);
+    /** The prompt's KV admission (L280): what binding `j` to `sl` does to the resident KV -- the prompt's rows
+     * land in the bank while its prefill (or disk-chain load) runs, before any decode quantum the guard above
+     * watches.  Fills `order` with the idle victims to spill first (*n_spill of them) when that is what fitting
+     * takes; *need is the bank's growth.  Worker thread only. */
+    prompt_kv_verdict prompt_kv_check(const session_slot *sl, const job *j, int *order, int *n_spill, uint64_t *need);
+    /** Apply prompt_kv_check at bind: spill what it says, or keep the head queued (a busy bank will turn into a
+     * victim), or answer the client 503 (nothing ever will).  True = the job may bind to `sl` now. */
+    bool prompt_kv_admit(session_slot *sl, job *j, bool *refused);
     /** Publish the /metrics snapshots — per-slot KV position/context and the
      * engine spec-decode counters — into plain server fields under mu. Client
      * threads must never call into the engine (CUDA-state audit,

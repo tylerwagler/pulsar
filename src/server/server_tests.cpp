@@ -8756,6 +8756,36 @@ static void test_l179_guard_spill_plan_is_minimum(void) {
     TEST_ASSERT(guard_spill_plan(0, 2 * GiB, GiB, drops, 3) == 3);
 }
 
+/* L280 -- the prompt's KV admission (server_prompt_kv_verdict).  The case that took the box down: a third 1M chain
+ * loaded into a fresh bank with 29 GiB resident against a 23 GiB budget and no idle bank to spill (bank 0 pinned,
+ * the other bound) -- the load ran, MemAvailable fell to 43 MiB and earlyoom killed the server mid-request.
+ * Invariants: it FITS when resident + growth is within the budget; it SPILLs the minimum idle banks when that makes
+ * it fit; it never plans a spill that cannot make it fit; with no spill possible it WAITs while a busy bank can
+ * become a victim and REFUSEs otherwise; a prompt whose growth alone exceeds the budget is REFUSEd at once. */
+static void test_l280_prompt_kv_admission(void) {
+    const uint64_t GiB = 1024ull * 1024ull * 1024ull;
+    int k = -1;
+    const uint64_t drops[3] = {3 * GiB, 2 * GiB, 5 * GiB};
+    /* fits, exactly at the bound */
+    TEST_ASSERT(server_prompt_kv_verdict(10 * GiB, 13 * GiB, 23 * GiB, drops, 3, false, &k) == PROMPT_KV_FITS && k == 0);
+    /* the window-C case: 29 GiB resident (two 1M banks: pinned bank 0 + a bound one), +14.6 GiB, budget 23.18 GiB */
+    const uint64_t t = 29 * GiB, d = 14 * GiB + 600 * 1024 * 1024, b = 23 * GiB + 180 * 1024 * 1024;
+    TEST_ASSERT(server_prompt_kv_verdict(t, d, b, NULL, 0, true, &k) == PROMPT_KV_WAIT && k == 0);
+    TEST_ASSERT(server_prompt_kv_verdict(t, d, b, NULL, 0, false, &k) == PROMPT_KV_REFUSE && k == 0);
+    /* idle victims that make room: the minimum number, in their order */
+    TEST_ASSERT(server_prompt_kv_verdict(12 * GiB, 13 * GiB, 23 * GiB, drops, 3, false, &k) == PROMPT_KV_SPILL && k == 1);
+    TEST_ASSERT(server_prompt_kv_verdict(14 * GiB, 13 * GiB, 23 * GiB, drops, 3, false, &k) == PROMPT_KV_SPILL && k == 2);
+    /* victims that cannot make room are never spilled: wait for a busy bank, or refuse */
+    const uint64_t small[2] = {GiB, GiB};
+    TEST_ASSERT(server_prompt_kv_verdict(20 * GiB, 10 * GiB, 23 * GiB, small, 2, true, &k) == PROMPT_KV_WAIT && k == 0);
+    TEST_ASSERT(server_prompt_kv_verdict(20 * GiB, 10 * GiB, 23 * GiB, small, 2, false, &k) == PROMPT_KV_REFUSE && k == 0);
+    /* a prompt past the budget by itself: refused even with everything spillable and a busy bank to wait for */
+    const uint64_t all[1] = {20 * GiB};
+    TEST_ASSERT(server_prompt_kv_verdict(20 * GiB, 24 * GiB, 23 * GiB, all, 1, true, &k) == PROMPT_KV_REFUSE && k == 0);
+    /* nothing to add (a continuation on its own resident bank) always fits, even over a breached pool */
+    TEST_ASSERT(server_prompt_kv_verdict(30 * GiB, 0, 23 * GiB, NULL, 0, false, &k) == PROMPT_KV_FITS && k == 0);
+}
+
 /* L179 branch 11 -- worker_evict_one's slot reset (evict_reset_slot_fields).
  * Invariant: the evicted slot is a reusable hole -- unprovisioned,
  * SLOT_EVICTED, no gen, no job, ctx 0, ledger cost 0, no scheduler
@@ -9596,6 +9626,7 @@ static void pulsar_server_unit_tests_run(void) {
     test_l179_superseded_pick_prefers_redundant_history();
     test_l179_guard_victim_skips_pinned_live_spilled();
     test_l179_guard_spill_plan_is_minimum();
+    test_l280_prompt_kv_admission();
     test_l281_prefill_chunk_publishes_the_slot_gauges();
     test_l179_evict_reset_leaves_a_reusable_hole();
     test_l179_mixed_head_cap_drops_only_intermediate_prefill_head();

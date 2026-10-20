@@ -419,7 +419,7 @@ static void emit_histogram(buf *b, const char *name, const char *help,
  * first two are relieved by eviction; mem_floor means the box itself is tight,
  * which is a different operator action entirely. */
 static const char *const refusal_names[PROVISION_REFUSAL_COUNT] = {
-    "none", "pool_full", "ledger_full", "mem_floor", "create_fail",
+    "none", "pool_full", "ledger_full", "mem_floor", "create_fail", "kv_touched",
 };
 
 /* Prometheus /metrics — DSpark speculative-decode counters in vLLM naming, so
