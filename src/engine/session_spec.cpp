@@ -1381,7 +1381,7 @@ void pulsar_session_spec_round_end_batch_local(pulsar_session *s, pulsar_spec_st
     for (int i = 0; i < n && i < (int)PULSAR_MSEQ_MAX; i++) {
         pulsar_spec_step *st = &steps[i];
         widx[i] = -1;
-        if (!st->round || st->n_rows == 0 || nw == PULSAR_GPU_SAMPLE_ROWS_MAX) continue;
+        if (!st->round || st->round->n_batch == 0 || nw == PULSAR_GPU_SAMPLE_ROWS_MAX) continue;
         if (st->temperature > 0.0f && !st->rng) continue;   /* its round_end refuses below */
         w[nw] = {st->round, st->row0, st->temperature, st->top_k, st->top_p, st->min_p, st->greedy_rows,
                  st->rng ? *st->rng : 0u};
