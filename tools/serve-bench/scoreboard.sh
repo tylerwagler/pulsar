@@ -26,7 +26,9 @@ TF_DIR=${TF_DIR:-$HOME/tf-run}
 TF_BENCH=${TF_BENCH:-$TF_DIR/src/tools/bench_openai.py}
 TF_PARALLEL=${TF_PARALLEL-8}   # TensorFold's CUDA server runs concurrent requests one at a time without --parallel
 mkdir -p "$OUT"; OUT=$(cd "$OUT" && pwd)
-[ -e ~/BATTERY_RUNNING ] && { echo "battery running -- refusing"; exit 9; }
+# a battery's marker refuses -- unless it is gpuq's marker for the quiet-class job this runs in (GPUQ_JOB_ID)
+[ -e ~/BATTERY_RUNNING ] && ! grep -q "^gpuq job ${GPUQ_JOB_ID:-none} " ~/BATTERY_RUNNING && {
+  echo "battery running -- refusing"; exit 9; }
 listener() { ss -ltnpH "sport = :$PORT" | grep -o "pid=[0-9]*" | cut -d= -f2 | sort -u; }
 SP=
 cleanup() {
