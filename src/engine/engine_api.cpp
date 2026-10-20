@@ -1,5 +1,6 @@
 #include "pulsar_engine_internal.h"
 #include "spec_internal.h"
+#include "spec_block.h"
 #include "pulsar_nvtx.h"
 #include "../tp/pulsar_tp.h"
 #include <unistd.h>
@@ -1582,7 +1583,11 @@ void pulsar_engine_spec_calibration(const pulsar_engine *e, pulsar_spec_calibrat
     else memset(out, 0, sizeof *out);
 }
 const char *pulsar_engine_drafter_name(const pulsar_engine *e) {
-    return e && e->drafter_ops && e->drafter_ops->name ? e->drafter_ops->name : "";
+    if (!e || !e->drafter_ops) return "";
+    /* a block drafter is named by its container's kind (the lane's ops are shared: "block") */
+    if (e->block_drafter && e->drafter_ops == &e->block_drafter->ops && e->block_drafter->kind)
+        return e->block_drafter->kind;
+    return e->drafter_ops->name ? e->drafter_ops->name : "";
 }
 void pulsar_engine_spec_cost_set(pulsar_engine *e, int32_t flat_us, int32_t row_us, bool valid) {
     if (!e) return;
