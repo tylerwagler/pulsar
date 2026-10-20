@@ -145,6 +145,7 @@ void gen_req(pulsar_gpu_sample_req &q) {
     q.key = g_rng();
     q.flags = urand(12) == 0 ? PULSAR_GPU_SAMPLE_GREEDY : 0u;
     q.mask_row = PULSAR_GPU_SAMPLE_NO_MASK;
+    q.probe = -1;
 }
 
 /* the host's verdict on one row: what sample_top_p_min_p (or the walk's argmax for a GREEDY row) gives, and the
@@ -208,20 +209,26 @@ bool run_batch(gate &g, uint32_t n_vocab, std::vector<case_row> &rows, pulsar_gp
     if (!pulsar_gpu_tensor_write(dl, 0, host.data(), host.size() * 4) ||
         !pulsar_gpu_tensor_write(dm, 0, mask.data(), mask.size() * 4))
         return false;
-    std::vector<uint32_t> out1(2 * nr), out2(2 * nr), dist((size_t)nr * (1 + 2 * DIST_CAP));
+    /* each row probes a token whose emitted probability it reports: its argmax, a random id, or none */
+    for (uint32_t r = 0; r < nr; r++) {
+        const uint32_t w = urand(3);
+        reqs[r].probe = w == 0 ? -1 : w == 1 ? (int32_t)urand(n_vocab) : sref::sample_argmax(rows[r].x.data(), n_vocab);
+    }
+    std::vector<pulsar_gpu_sample_out> out1(nr), out2(nr);
+    std::vector<uint32_t> dist((size_t)nr * (1 + 2 * DIST_CAP));
     if (!pulsar_gpu_sample_rows(dl, 0, stride, n_vocab, nr, reqs.data(), dm, words, scratch, dout, 0, ddist,
                                 DIST_CAP) ||
-        !pulsar_gpu_synchronize() || !pulsar_gpu_tensor_read(dout, 0, out1.data(), out1.size() * 4) ||
+        !pulsar_gpu_synchronize() || !pulsar_gpu_tensor_read(dout, 0, out1.data(), out1.size() * sizeof(out1[0])) ||
         !pulsar_gpu_tensor_read(ddist, 0, dist.data(), dist.size() * 4))
         return false;
     if (!pulsar_gpu_sample_rows(dl, 0, stride, n_vocab, nr, reqs.data(), dm, words, scratch, dout, 0, nullptr, 0) ||
-        !pulsar_gpu_synchronize() || !pulsar_gpu_tensor_read(dout, 0, out2.data(), out2.size() * 4))
+        !pulsar_gpu_synchronize() || !pulsar_gpu_tensor_read(dout, 0, out2.data(), out2.size() * sizeof(out2[0])))
         return false;
     /* logprobs of each row's host token (the masked view when the row is masked) */
     std::vector<pulsar_gpu_logprob_row> lp(nr);
     std::vector<uint32_t> mrows(nr);
     for (uint32_t r = 0; r < nr; r++) mrows[r] = reqs[r].mask_row;
-    if (check_lp && (!pulsar_gpu_logprobs_rows(dl, 0, stride, n_vocab, nr, dm, words, mrows.data(), dout, 0, 2,
+    if (check_lp && (!pulsar_gpu_logprobs_rows(dl, 0, stride, n_vocab, nr, dm, words, mrows.data(), dout, 0, sizeof(pulsar_gpu_sample_out) / 4,
                                                PULSAR_GPU_LOGPROB_TOPK_MAX, dlp) ||
                      !pulsar_gpu_synchronize() || !pulsar_gpu_tensor_read(dlp, 0, lp.data(), lp.size() * sizeof(lp[0]))))
         return false;
@@ -241,10 +248,10 @@ bool run_batch(gate &g, uint32_t n_vocab, std::vector<case_row> &rows, pulsar_gp
     char det[256];
     for (uint32_t r = 0; r < nr; r++) {
         g.cases++;
-        const int32_t t1 = (int32_t)out1[2 * r], t2 = (int32_t)out2[2 * r];
-        const uint32_t st = out1[2 * r + 1];
+        const int32_t t1 = out1[r].token, t2 = out2[r].token;
+        const uint32_t st = out1[r].status;
         const host_out &h = ho[r];
-        if (t1 != t2 || st != out1[2 * r + 1] || out2[2 * r + 1] != st) {
+        if (t1 != t2 || out2[r].status != st || fbits(out1[r].probe_p) != fbits(out2[r].probe_p)) {
             snprintf(det, sizeof(det), "two launches disagree (%d vs %d)", t1, t2);
             g.fail("determinism", n_vocab, rows[r], r, det);
         }
@@ -270,6 +277,16 @@ bool run_batch(gate &g, uint32_t n_vocab, std::vector<case_row> &rows, pulsar_gp
             }
         }
         if (h.ids.size() > 2048) g.overflow_rows++;
+        {   /* L301's label: the probe's emitted probability (pulsar_sample_dist_prob: the first match, 0 if absent) */
+            float hp = 0.0f;
+            for (size_t i = 0; i < h.ids.size(); i++)
+                if (h.ids[i] == reqs[r].probe) { hp = h.probs[i]; break; }
+            if (fbits(hp) != fbits(out1[r].probe_p)) {
+                snprintf(det, sizeof(det), "probe %d p: device %08x host %08x", reqs[r].probe,
+                         fbits(out1[r].probe_p), fbits(hp));
+                g.fail("probe", n_vocab, rows[r], r, det);
+            }
+        }
         if (!check_lp) continue;
         sref::pulsar_token_score top[PULSAR_GPU_LOGPROB_TOPK_MAX], tk;
         const int nt = sref::pulsar_logits_top_logprobs(view[r].data(), (int)n_vocab, top,
@@ -317,13 +334,13 @@ bool run_walk(gate &g, uint32_t n_vocab, pulsar_gpu_tensor *dl, pulsar_gpu_tenso
         if (!std::isfinite(reqs[r].top_p) || !std::isfinite(reqs[r].min_p)) reqs[r].top_p = reqs[r].min_p = 0.05f;
     }
     if (!pulsar_gpu_tensor_write(dl, 0, host.data(), host.size() * 4)) return false;
-    if (!pulsar_gpu_sample_rows(dl, 0, n_vocab, n_vocab, ROWS, reqs.data(), nullptr, 0, scratch, dout, 0, nullptr, 0))
-        return false;
-    std::vector<int> tok(ROWS);
+    /* the host draws first: the drafts are built from its tokens, and each row probes its draft as a verify does */
+    std::vector<host_out> ho(ROWS);
     for (uint32_t r = 0; r < ROWS; r++) {
         sref::pulsar_sample_scratch sc;
         memset(&sc, 0, sizeof(sc));
-        tok[r] = host_sample(&host[(size_t)r * n_vocab], n_vocab, reqs[r], &sc).tok;
+        if (urand(5) == 0) reqs[r].flags |= PULSAR_GPU_SAMPLE_GREEDY;
+        ho[r] = host_sample(&host[(size_t)r * n_vocab], n_vocab, reqs[r], &sc);
         sref::pulsar_sample_scratch_free(&sc);
     }
     std::vector<pulsar_gpu_spec_run> runs;
@@ -333,23 +350,53 @@ bool run_walk(gate &g, uint32_t n_vocab, pulsar_gpu_tensor *dl, pulsar_gpu_tenso
         run.row0 = r0;
         run.k = k;
         const uint32_t agree = urand(k + 1);
-        for (uint32_t j = 0; j < k; j++) run.pend[j] = j < agree ? tok[r0 + j] : (tok[r0 + j] + 1) % (int)n_vocab;
+        for (uint32_t j = 0; j < k; j++) {
+            /* a miss drafts the row's runner-up when it has one, else any other id */
+            const host_out &h = ho[r0 + j];
+            run.pend[j] = j < agree ? h.tok : h.ids.size() > 1 && h.ids[1] != h.tok ? h.ids[1]
+                                                                                      : (h.tok + 1) % (int)n_vocab;
+            reqs[r0 + j].probe = run.pend[j];
+            const bool greedy = (reqs[r0 + j].flags & PULSAR_GPU_SAMPLE_GREEDY) || reqs[r0 + j].temperature <= 0.0f;
+            run.greedy_rows |= greedy ? 1u << j : 0u;
+        }
         runs.push_back(run);
         r0 += k + 1;
     }
+    if (!pulsar_gpu_sample_rows(dl, 0, n_vocab, n_vocab, ROWS, reqs.data(), nullptr, 0, scratch, dout, 0, nullptr, 0))
+        return false;
+    std::vector<int> tok(ROWS);
+    for (uint32_t r = 0; r < ROWS; r++) tok[r] = ho[r].tok;
     std::vector<pulsar_gpu_spec_walk_out> wo(runs.size());
     if (!pulsar_gpu_spec_walk(dout, 0, ROWS, runs.data(), (uint32_t)runs.size(), dwalk, 0) ||
         !pulsar_gpu_synchronize() || !pulsar_gpu_tensor_read(dwalk, 0, wo.data(), wo.size() * sizeof(wo[0])))
         return false;
     for (size_t i = 0; i < runs.size(); i++) {
-        uint32_t c = 0;
-        while (c < runs[i].k && tok[runs[i].row0 + c] == runs[i].pend[c]) c++;
+        /* the host walk with L301's labels (7e6392a2: greedy row -> acceptance, sampled row -> p_target(draft)) */
+        uint32_t c = 0, nl = 0;
+        float label[16];
+        uint8_t hit[16];
+        while (c < runs[i].k) {
+            const host_out &h = ho[runs[i].row0 + c];
+            const bool ok = h.tok == runs[i].pend[c];
+            float p = 0.0f;
+            for (size_t j = 0; j < h.ids.size(); j++)
+                if (h.ids[j] == runs[i].pend[c]) { p = h.probs[j]; break; }
+            label[c] = (runs[i].greedy_rows >> c) & 1u ? (ok ? 1.0f : 0.0f) : p;
+            hit[c] = ok;
+            nl = c + 1;
+            if (!ok) break;
+            c++;
+        }
         const int carry = tok[runs[i].row0 + c];
+        bool labels_ok = wo[i].n_label == nl;
+        for (uint32_t j = 0; labels_ok && j < nl; j++)
+            labels_ok = fbits(wo[i].label[j]) == fbits(label[j]) && wo[i].hit[j] == hit[j];
         g.cases++;
-        if (wo[i].commit != c || wo[i].carry != carry || wo[i].status != PULSAR_GPU_SAMPLE_OK) {
+        if (wo[i].commit != c || wo[i].carry != carry || wo[i].status != PULSAR_GPU_SAMPLE_OK || !labels_ok) {
             g.fails++;
-            fprintf(stderr, "  FAIL walk V=%u run %zu (k %u): device commit %u carry %d status %u, host %u %d\n",
-                    n_vocab, i, runs[i].k, wo[i].commit, wo[i].carry, wo[i].status, c, carry);
+            fprintf(stderr, "  FAIL walk V=%u run %zu (k %u): device commit %u carry %d status %u labels %u%s, host %u %d %u\n",
+                    n_vocab, i, runs[i].k, wo[i].commit, wo[i].carry, wo[i].status, wo[i].n_label,
+                    labels_ok ? "" : " (differ)", c, carry, nl);
         }
     }
     return true;
@@ -371,7 +418,7 @@ void bench(uint32_t n_vocab, pulsar_gpu_tensor *dl, pulsar_gpu_tensor *scratch, 
         for (uint32_t nr : {1u, 5u, 33u}) {
             std::vector<pulsar_gpu_sample_req> reqs(nr);
             for (uint32_t r = 0; r < nr; r++) {
-                reqs[r] = pulsar_gpu_sample_req{m.t, m.p, m.m, m.k, 0x1234ull + r, 0u, PULSAR_GPU_SAMPLE_NO_MASK};
+                reqs[r] = pulsar_gpu_sample_req{m.t, m.p, m.m, m.k, 0x1234ull + r, 0u, PULSAR_GPU_SAMPLE_NO_MASK, -1, 0u};
             }
             const int it = 20;
             pulsar_gpu_sample_rows(dl, 0, n_vocab, n_vocab, nr, reqs.data(), nullptr, 0, scratch, dout, 0, nullptr, 0);
@@ -409,7 +456,7 @@ int main(int argc, char **argv) {
         pulsar_gpu_tensor *dl = pulsar_gpu_tensor_alloc((uint64_t)ROWS * max_stride * 4);
         pulsar_gpu_tensor *dm = pulsar_gpu_tensor_alloc((uint64_t)ROWS * ((v + 31u) / 32u) * 4);
         pulsar_gpu_tensor *scratch = pulsar_gpu_tensor_alloc(pulsar_gpu_sample_scratch_bytes(v));
-        pulsar_gpu_tensor *dout = pulsar_gpu_tensor_alloc(ROWS * 8u);
+        pulsar_gpu_tensor *dout = pulsar_gpu_tensor_alloc(ROWS * sizeof(pulsar_gpu_sample_out));
         pulsar_gpu_tensor *ddist = pulsar_gpu_tensor_alloc((uint64_t)ROWS * (1 + 2 * DIST_CAP) * 4);
         pulsar_gpu_tensor *dlp = pulsar_gpu_tensor_alloc(ROWS * sizeof(pulsar_gpu_logprob_row));
         pulsar_gpu_tensor *dwalk = pulsar_gpu_tensor_alloc(ROWS * sizeof(pulsar_gpu_spec_walk_out));
