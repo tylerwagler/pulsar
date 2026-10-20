@@ -1209,11 +1209,11 @@ bool gen_tool_name_open(const gen_state *g) {
     return !strstr(g->text.ptr + g->tool_name_from + no, g->j->req.family->forced_name_close);
 }
 
-/* L272: mask `row` (the logits a constrained slot draws its next token from) to the tokens that keep the
- * function name a prefix of the family's opener + a declared tool's name + its closer.  The token bytes are built once
- * per server.  false = no token is allowed (cannot happen while a declared name is a strict extension of
- * the text; said once if it does), and the row is left as it was. */
-bool gen_mask_tool_name(server *s, gen_state *g, float *row, int width) {
+/* L272: the token mask of a constrained slot's next draw (bit t set = token t allowed, THE sampler's mask, L302):
+ * the tokens that keep the function name a prefix of the family's opener + a declared tool's name + its closer.  The
+ * token bytes are built once per server.  false = no token is allowed (cannot happen while a declared name is a
+ * strict extension of the text; said once if it does): the draw runs unmasked. */
+bool gen_tool_name_mask(server *s, gen_state *g, int width, std::vector<uint32_t> *mask) {
     if (!s->token_bytes) {
         s->token_bytes = new std::vector<std::string>((size_t)width);
         for (int t = 0; t < width; t++) {
@@ -1227,23 +1227,22 @@ bool gen_mask_tool_name(server *s, gen_state *g, float *row, int width) {
     const request *r = &g->j->req;
     const char *so_far = g->text.ptr ? g->text.ptr + g->tool_name_from : "";
     const size_t n_so_far = g->text.len - g->tool_name_from;
-    std::vector<int> keep;
+    mask->assign(((size_t)width + 31u) / 32u, 0u);
+    bool any = false;
     for (int t = 0; t < width && (size_t)t < bytes.size(); t++) {
         const std::string &b = bytes[(size_t)t];
         if (tool_name_token_allowed(so_far, n_so_far, b.data(), b.size(), r->family->forced_name_open,
-                                    &r->tool_orders, r->family->forced_name_close))
-            keep.push_back(t);
+                                    &r->tool_orders, r->family->forced_name_close)) {
+            (*mask)[(size_t)t >> 5] |= 1u << (t & 31);
+            any = true;
+        }
     }
-    if (keep.empty()) {
+    if (!any) {
         server_log(PULSAR_LOG_WARNING, "pulsar-server: chat ctx=%s%s%s forced tool name: no token continues "
                    "\"%.*s\" toward a declared tool -- sampling unmasked", g->ctx_span, g->req_flags[0] ? " " : "",
                    g->req_flags, (int)n_so_far, so_far);
         return false;
     }
-    std::vector<float> kept(keep.size());
-    for (size_t k = 0; k < keep.size(); k++) kept[k] = row[keep[k]];
-    for (int t = 0; t < width; t++) row[t] = -INFINITY;
-    for (size_t k = 0; k < keep.size(); k++) row[keep[k]] = kept[k];
     return true;
 }
 

@@ -335,12 +335,6 @@ cuda-kv-rows-pack-gate: tests/kv_rows_pack_gate tests/kv_rows_pack_gate_fastmath
 	./tests/kv_rows_pack_gate
 	./tests/kv_rows_pack_gate_fastmath
 
-# L149: the device min-p prefilter must equal its host emulation bit-for-bit
-# (row max with the host's tie rule, candidate set and order, overflow report).
-# Needs a GPU, no model.
-cuda-minp-prefilter-gate: tests/minp_prefilter_gate
-	./tests/minp_prefilter_gate
-
 # L302: THE sampler is on the device; it must give the host sampler's bytes (frozen in tests/sampler_host_ref.cpp,
 # built with the engine's own flags) -- token, distribution, logprobs, walk -- over every mode and edge row.
 # Needs a GPU, no model.
@@ -1262,7 +1256,7 @@ tests/hc_carry_kernel_test: tests/hc_carry_kernel_test.cu Makefile src/cuda/puls
 # attn_f16_banked_test took a "p" argument selecting packed comp banks over
 # f32 ones; the comp format parameter is gone from the kernels (2026-08-18), so
 # there is one mode and one invocation.
-cuda-attn-gates: tests/gqa_attn_gate tests/attn_f16_kernel_test tests/attn_f16_banked_test tests/kv_rows_pack_gate tests/hc_carry_kernel_test tests/minp_prefilter_gate tests/dspark_batch_gate tests/nt_crossover_sweep tests/exl3_dense_gate tests/exl3_dense_bench tests/exl3_dense_xcheck tests/vision_router_gate tests/vision_hc_gate tests/rope_tail_format_gate
+cuda-attn-gates: tests/gqa_attn_gate tests/attn_f16_kernel_test tests/attn_f16_banked_test tests/kv_rows_pack_gate tests/hc_carry_kernel_test tests/sampler_device_gate tests/dspark_batch_gate tests/nt_crossover_sweep tests/exl3_dense_gate tests/exl3_dense_bench tests/exl3_dense_xcheck tests/vision_router_gate tests/vision_hc_gate tests/rope_tail_format_gate
 	./tests/attn_f16_kernel_test
 	./tests/attn_f16_kernel_test 40 24 32 x 8 4          # compressed tail
 	./tests/attn_f16_kernel_test 40 24 32 x 8 4 3        # indexed top-k selection
@@ -2286,7 +2280,7 @@ render-gate: pulsar_test
 # v10 digest corruption case included), so the battery no longer pays a
 # separate engine load for it.
 GATE_TARGETS = unit-test-gate agent-test-gate \
-	cuda-regression cuda-kv-rows-pack-gate cuda-minp-prefilter-gate cuda-chat-smoke-gate \
+	cuda-regression cuda-kv-rows-pack-gate cuda-sampler-device-gate cuda-chat-smoke-gate \
 	cuda-attn-gates cuda-attn-pack-gate indexer-hadamard-kernel-check \
 	cuda-prefill-gate-cutlass-mxfp4 qwen-family-gate-device state-kinds-gate vision-qwen-tower-gate tessera-kernel-gate \
 	blockdraft-gate nvfp4-rows-gate lilicorr-head-gate lilicorr-spec-gate \
@@ -2512,7 +2506,7 @@ gates-dev:
 	      why="$$why $$p($$cls)"; \
 	      case "$$p" in *router*|*moe*) router=1 ;; esac; \
 	      case "$$p" in *bf16_rows*|*nvfp4*|*weight_format*|src/engine/linear.cpp|src/engine/moe.cpp) bf16=1 ;; esac; \
-	      case "$$p" in *minp*|src/engine/tokenizer.cpp|src/engine/spec_dspark.cpp|src/engine/session_spec.cpp) minp=1 ;; esac; \
+	      case "$$p" in *sampler*|*libm*|src/engine/spec_dspark.cpp|src/engine/session_spec.cpp|src/engine/spec_mtp.cpp|src/engine/spec_block.cpp) minp=1 ;; esac; \
 	      case "$$p" in *spec_block*|*blockdraft*|*lilicorr*|*mtp_spec*|*attn_gqa*|*rope*|src/engine/session_spec.cpp|src/families/nemotron_h/*) drafter=1 ;; esac; \
 	      case $$cls in \
 	        attn) for g in $(GATES_DEV_ATTN); do add $$g; done ;; \
@@ -2540,7 +2534,7 @@ gates-dev:
 	if [ $$router -eq 1 ]; then printf '  router-gate + qwen-s4-gate: selected (the shared router, the rows MoE block)\n'; fi; \
 	if [ $$blocks -eq 1 ]; then printf '  block gates: sconv-gate, head-gate, rowops-gate, mamba2-gate (the L295 short convolution, head options, row operations; the L296 Mamba-2 block)\n'; fi; \
 	if [ $$bf16 -eq 1 ]; then printf '  bf16-rows-gate + nvfp4-rows-gate: selected (the BF16 / NVFP4 rows arms and their admission)\n'; fi; \
-	if [ $$minp -eq 1 ]; then printf '  cuda-minp-prefilter-gate: selected (the sparse min-p contract)\n'; fi; \
+	if [ $$minp -eq 1 ]; then printf '  cuda-sampler-device-gate: selected (THE sampler, on the device: L302)\n'; fi; \
 	if [ $$drafter -eq 1 ]; then printf '  block drafter gates: blockdraft-gate, lilicorr-head-gate, lilicorr-spec-gate (L298: the LiLiCorr lane on the Nemotron artifact)\n'; fi; \
 	if [ $$server -eq 1 ]; then printf '  server: chat smoke + the --server/--api unit switches\n'; fi; \
 	$(MAKE) --no-print-directory seam-check CUDA_ARCH=sm_120f || rc=1; \
@@ -2574,7 +2568,7 @@ gates-dev:
 	  $(MAKE) --no-print-directory bf16-rows-gate nvfp4-rows-gate CUDA_ARCH=sm_120f || rc=1; \
 	fi; \
 	if [ $$minp -eq 1 ]; then \
-	  $(MAKE) --no-print-directory cuda-minp-prefilter-gate CUDA_ARCH=sm_120f || rc=1; \
+	  $(MAKE) --no-print-directory cuda-sampler-device-gate CUDA_ARCH=sm_120f || rc=1; \
 	fi; \
 	if [ $$drafter -eq 1 ]; then \
 	  $(MAKE) --no-print-directory blockdraft-gate lilicorr-head-gate lilicorr-spec-gate CUDA_ARCH=sm_120f || rc=1; \
@@ -2642,8 +2636,8 @@ src/lib/%.o: src/lib/%.cpp src/pulsar.h $(LIB_HDRS) src/lib/sha1.hpp
 src/vendor/%.o: src/vendor/%.cpp src/vendor/linenoise.h
 	$(CXX) $(CXXFLAGS) -Wno-write-strings -c -o $@ $<
 
-tests/pulsar_test.o: tests/pulsar_test.cpp $(SERVER_SRCS) $(SERVER_HDRS) src/pulsar.h $(LIB_HDRS)
-	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -Wno-unused-function -c -o $@ tests/pulsar_test.cpp
+tests/pulsar_test.o: tests/pulsar_test.cpp $(SERVER_SRCS) $(SERVER_HDRS) src/pulsar.h $(LIB_HDRS) tests/sampler_host_ref.h
+	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -Itests -Wno-unused-function -c -o $@ tests/pulsar_test.cpp
 
 tests/pulsar_agent_test.o: tests/pulsar_agent_test.cpp $(AGENT_SRCS) src/agent/pulsar_agent_internal.h src/pulsar.h $(LIB_HDRS) src/vendor/linenoise.h
 	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -Wno-unused-function -c -o $@ tests/pulsar_agent_test.cpp
@@ -2651,8 +2645,6 @@ tests/pulsar_agent_test.o: tests/pulsar_agent_test.cpp $(AGENT_SRCS) src/agent/p
 tests/cuda_long_context_smoke.o: tests/cuda_long_context_smoke.cpp src/pulsar_gpu.h
 	$(CXX) $(CXXFLAGS) -Isrc -c -o $@ tests/cuda_long_context_smoke.cpp
 
-tests/minp_prefilter_gate.o: tests/minp_prefilter_gate.cpp src/pulsar_gpu.h
-	$(CXX) $(CXXFLAGS) -fno-fast-math -Isrc -c -o $@ tests/minp_prefilter_gate.cpp
 
 tests/vision_router_gate.o: tests/vision_router_gate.cpp src/pulsar_gpu.h
 	$(CXX) $(CXXFLAGS) -fno-fast-math -Isrc -c -o $@ tests/vision_router_gate.cpp
@@ -2824,9 +2816,6 @@ src/cuda/pulsar_mxfp4_cutlass.o: src/cuda/pulsar_mxfp4_cutlass.cu src/pulsar_gpu
 	$(NVCC) $(NVCCFLAGS) -std=c++17 --expt-relaxed-constexpr --expt-extended-lambda -diag-suppress 20012 -diag-suppress 177 -Isrc $(CUTLASS_INC) -c -o $@ src/cuda/pulsar_mxfp4_cutlass.cu
 
 tests/cuda_long_context_smoke: tests/cuda_long_context_smoke.o $(CUDA_OBJS) $(CUTLASS_CUDA_OBJS) $(MMQ_OBJS)
-	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
-
-tests/minp_prefilter_gate: tests/minp_prefilter_gate.o $(CUDA_OBJS) $(CUTLASS_CUDA_OBJS) $(MMQ_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
 # the frozen host sampler: the ENGINE's flags exactly (its bytes came from that compilation)
@@ -3090,8 +3079,8 @@ tests/prefill_chunk_census_probe.o: tests/prefill_chunk_census_probe.cpp src/eng
 tests/prefill_chunk_census_probe: tests/prefill_chunk_census_probe.o src/lib/pulsar_help.o $(CORE_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
-pulsar_test: tests/pulsar_test.o src/lib/pulsar_help.o src/lib/pulsar_kvtext.o src/lib/pulsar_segstore.o src/lib/pulsar_kvchain.o src/lib/pulsar_dsml.o $(CORE_OBJS)
-	$(NVCC) $(NVCCFLAGS) -o $@ tests/pulsar_test.o src/lib/pulsar_help.o src/lib/pulsar_kvtext.o src/lib/pulsar_segstore.o src/lib/pulsar_kvchain.o src/lib/pulsar_dsml.o $(CORE_OBJS) $(CUDA_LDLIBS)
+pulsar_test: tests/pulsar_test.o tests/sampler_host_ref.o src/lib/pulsar_help.o src/lib/pulsar_kvtext.o src/lib/pulsar_segstore.o src/lib/pulsar_kvchain.o src/lib/pulsar_dsml.o $(CORE_OBJS)
+	$(NVCC) $(NVCCFLAGS) -o $@ tests/pulsar_test.o tests/sampler_host_ref.o src/lib/pulsar_help.o src/lib/pulsar_kvtext.o src/lib/pulsar_segstore.o src/lib/pulsar_kvchain.o src/lib/pulsar_dsml.o $(CORE_OBJS) $(CUDA_LDLIBS)
 
 # L267: the API parsers' requests dumped field by field (host-only; see tests/api_golden.cpp).
 # api-golden-gate compares them with the golden recorded before L267 moved the parse/render layers.
@@ -3279,7 +3268,7 @@ test: pulsar_test seam-check
 clean:
 	rm -rf .build
 	rm -rf tests/runner
-	rm -f tests/gates_runner pulsar pulsar-server pulsar-bench pulsar-eval pulsar-agent pulsar_test pulsar_agent_test src/engine/*.o src/families/*/*.o src/families/*/*.d src/tp/*.o src/agent/*.o src/server/*.o src/cuda/*.o src/cuda/mmq/*.o src/cuda/mmq/test/*.o src/cli/*.o src/lib/*.o src/vendor/*.o tests/*.o src/engine/*.d src/agent/*.d src/server/*.d src/cuda/*.d src/cuda/mmq/*.d src/cuda/mmq/test/*.d src/cli/*.d src/lib/*.d src/vendor/*.d tests/*.d tests/vision_visible_gate tests/vision_hc_gate tests/vision_image_gate tests/vision_placeholder_gate tests/vision_image_sync_gate tests/vision_chunk_gate tests/cuda_long_context_smoke tests/moe_route_bounds_gate tests/expert_table_gate tests/multiseq_frontier_gate tests/multiseq_decode_gate tests/prefill_bitexact_gate tests/bank_spec_gate tests/spec_sampling_gate tests/spec_sampling_gate_wide tests/accounting_gate tests/bank_evict_restore_gate tests/session_payload_gate tests/algo_stability_gate tests/mixed_prefill_gate tests/mixed_zero_prefill_gate tests/fused_step_gate tests/head_graph_replay_gate tests/decode_reference_gate tests/verify_width_probe tests/mixed_neutrality_gate tests/comp_state_gate tests/spec_teacher_forced_probe tests/attn_f16_kernel_test tests/attn_f16_banked_test tests/kv_rows_pack_gate tests/kv_rows_pack_gate_fastmath tests/minp_prefilter_gate tests/sampler_device_gate tests/dspark_batch_gate tests/nt_crossover_sweep tests/vision_router_gate tests/router_gate tests/bf16_rows_gate tests/nvfp4_rows_gate tests/lilicorr_head_gate tests/qwen_family_gate tests/inkling_family_gate tests/nemotron_family_gate tests/nemotron_fwd_gate tests/rowops_gate tests/state_kinds_gate tests/payload_frontier_gate tests/prompt_end_gate tests/bank_residency_gate
+	rm -f tests/gates_runner pulsar pulsar-server pulsar-bench pulsar-eval pulsar-agent pulsar_test pulsar_agent_test src/engine/*.o src/families/*/*.o src/families/*/*.d src/tp/*.o src/agent/*.o src/server/*.o src/cuda/*.o src/cuda/mmq/*.o src/cuda/mmq/test/*.o src/cli/*.o src/lib/*.o src/vendor/*.o tests/*.o src/engine/*.d src/agent/*.d src/server/*.d src/cuda/*.d src/cuda/mmq/*.d src/cuda/mmq/test/*.d src/cli/*.d src/lib/*.d src/vendor/*.d tests/*.d tests/vision_visible_gate tests/vision_hc_gate tests/vision_image_gate tests/vision_placeholder_gate tests/vision_image_sync_gate tests/vision_chunk_gate tests/cuda_long_context_smoke tests/moe_route_bounds_gate tests/expert_table_gate tests/multiseq_frontier_gate tests/multiseq_decode_gate tests/prefill_bitexact_gate tests/bank_spec_gate tests/spec_sampling_gate tests/spec_sampling_gate_wide tests/accounting_gate tests/bank_evict_restore_gate tests/session_payload_gate tests/algo_stability_gate tests/mixed_prefill_gate tests/mixed_zero_prefill_gate tests/fused_step_gate tests/head_graph_replay_gate tests/decode_reference_gate tests/verify_width_probe tests/mixed_neutrality_gate tests/comp_state_gate tests/spec_teacher_forced_probe tests/attn_f16_kernel_test tests/attn_f16_banked_test tests/kv_rows_pack_gate tests/kv_rows_pack_gate_fastmath tests/sampler_device_gate tests/dspark_batch_gate tests/nt_crossover_sweep tests/vision_router_gate tests/router_gate tests/bf16_rows_gate tests/nvfp4_rows_gate tests/lilicorr_head_gate tests/qwen_family_gate tests/inkling_family_gate tests/nemotron_family_gate tests/nemotron_fwd_gate tests/rowops_gate tests/state_kinds_gate tests/payload_frontier_gate tests/prompt_end_gate tests/bank_residency_gate
 
 # Pull in the generated header dependencies.  `-include` (not `include`) so a
 # tree with no .d files yet -- a fresh clone, or right after `make clean` -- is

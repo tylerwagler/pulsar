@@ -126,8 +126,8 @@
  * above (server_sched.cpp fits draft depths to it, session_multiseq.cpp's ALL_ROWS
  * head refuses above it); a plain PULSAR_MSEQ_MAX-row step must fit
  * (static_assert PULSAR_MSEQ_MAX <= PULSAR_SPEC_LOGITS_ROWS, imatrix.cpp).
- * spec_logits, dspark_prefilter_sel, dspark_row_meta and spec_compact_host
- * are all sized by this one constant (gpu_diag.cpp) -- guards on row indices
+ * spec_logits and dspark_row_meta
+ * are sized by this one constant (gpu_diag.cpp) -- guards on row indices
  * must check against THIS, or the number lives only in a comment. */
 #define PULSAR_SPEC_LOGITS_ROWS 32u   /* L117 2026-08-27: 16 -> 32. The 16-row
  * ceiling squeezed per-bank draft depth at c3+ (c4: K~3 vs solo K~8, the
@@ -2419,7 +2419,7 @@ typedef struct pulsar_gpu_sample_req {
     uint32_t flags;
     uint32_t mask_row;   ///< row of the launch's mask (bit i of word i/32 set = token i allowed), or PULSAR_GPU_SAMPLE_NO_MASK
     int32_t probe;       ///< a token whose emitted probability the row reports (a verify row's draft; L301), or -1
-    uint32_t pad_;
+    uint32_t row;        ///< the logits row this draw reads (row `row` of the launch's rows)
 } pulsar_gpu_sample_req;
 
 /** What the sampler writes per row. */
@@ -2434,17 +2434,20 @@ typedef struct pulsar_gpu_sample_out {
 uint64_t pulsar_gpu_sample_scratch_bytes(uint32_t n_vocab);
 uint64_t pulsar_gpu_sample_slot_bytes(uint32_t n_vocab);
 
-/** Draw n_rows rows (row r at logits + logits_offset_bytes + r * row_stride floats, n_vocab wide) by reqs[r]: out
- *  receives, from out_offset_bytes, n_rows pulsar_gpu_sample_out.  `mask` (NULL = none) is
+/** n_rows draws: reqs[k] reads the row at logits + logits_offset_bytes + reqs[k].row * row_stride floats, n_vocab
+ *  wide, and out receives, from out_offset_bytes, n_rows pulsar_gpu_sample_out in reqs order.  `logits_rows` bounds
+ *  every reqs[k].row.  `mask` (NULL = none) is
  *  uint32 [rows][mask_words]: a cleared bit makes that token's logit -inf before every transform -- L303's
  *  structured-output hook, L272's tool-name mask; no mask = the unmasked bytes exactly.  `dist` (NULL in production)
  *  receives the emitted distribution per row as uint32 [n, ids[dist_cap], prob bits[dist_cap]] for the equality
- *  gate.  Enqueued on the caller's stream; 0 (said) on a bad launch. */
+ *  gate.  `id_map` (NULL = identity) is int32 [n_vocab]: row index i is token id_map[i] -- a drafter's draft
+ *  vocabulary (the candidates still order by row index on ties; the race hashes, the probe and the token are the
+ *  mapped ids).  Enqueued on the caller's stream; 0 (said) on a bad launch. */
 int pulsar_gpu_sample_rows(const pulsar_gpu_tensor *logits, uint64_t logits_offset_bytes, uint32_t row_stride,
-                           uint32_t n_vocab, uint32_t n_rows, const pulsar_gpu_sample_req *reqs,
-                           const pulsar_gpu_tensor *mask, uint32_t mask_words, pulsar_gpu_tensor *scratch,
-                           pulsar_gpu_tensor *out, uint64_t out_offset_bytes, pulsar_gpu_tensor *dist,
-                           uint32_t dist_cap);
+                           uint32_t n_vocab, uint32_t logits_rows, uint32_t n_rows, const pulsar_gpu_sample_req *reqs,
+                           const pulsar_gpu_tensor *mask, uint32_t mask_words, const pulsar_gpu_tensor *id_map,
+                           pulsar_gpu_tensor *scratch, pulsar_gpu_tensor *out, uint64_t out_offset_bytes,
+                           pulsar_gpu_tensor *dist, uint32_t dist_cap);
 
 /** A verify run for the device walk: the sampler rows [row0, row0 + k] of one bank (the draw after the base and
  *  after each of its k drafts) and the drafts. */
@@ -2493,28 +2496,15 @@ int pulsar_gpu_logprobs_rows(const pulsar_gpu_tensor *logits, uint64_t logits_of
                              const uint32_t *mask_rows, const pulsar_gpu_tensor *tokens, uint64_t tokens_offset_bytes,
                              uint32_t token_stride, uint32_t top_k, pulsar_gpu_tensor *out);
 
-/** L149: min-p candidate prefilter over F32 logits rows. For each of n_rows
- * rows (row r at logits + logits_offset_bytes + r*row_stride_elems floats,
- * n_vocab wide) writes to out row r (int32, stride 3 + 2*cap):
- *   [0] count of finite logits v with v >= max + delta (ALL of them counted,
- *       even past cap), [1] id of the row max (first finite maximum, lowest id
- *       on ties -- matches the host scan), [2] the max logit's float bits,
- *   [3 .. 3+cap) the candidate ids in ascending id order,
- *   [3+cap .. 3+2cap) their logits as float bits, same order.
- * When count > cap the candidate arrays are not written. A row with no finite
- * logit reports count 0. `delta` is the caller's floor below the max in logit
- * units (T * ln(min_p) minus a margin); the compare is a single float add
- * and compare, reproducible on the host. Non-blocking; runs on the engine
- * stream. Returns 0 on bad arguments or launch failure. */
-int pulsar_gpu_minp_prefilter_rows(
-        pulsar_gpu_tensor       *out,
-        const pulsar_gpu_tensor *logits,
-        uint64_t                logits_offset_bytes,
-        uint32_t                n_rows,
-        uint32_t                row_stride_elems,
-        uint32_t                n_vocab,
-        float                   delta,
-        uint32_t                cap);
+/** A row of `width` from a candidate list: cand holds n int32 ids then n f32 values; every other entry -inf (a
+ *  repeated id keeps its last value).  The row a drafter's few scored candidates make for THE sampler (L298, L302). */
+int pulsar_gpu_sparse_row(pulsar_gpu_tensor *row, uint32_t width, const pulsar_gpu_tensor *cand, uint32_t n);
+
+/** A deterministic 64-bit digest of n_rows f32 rows of `width` (8-byte aligned) into out at out_offset_bytes: the
+ *  TP mirror's cross-rank identity check over rows that stay on the device (L243, L302). */
+int pulsar_gpu_rows_digest(const pulsar_gpu_tensor *rows, uint64_t offset_bytes, uint32_t n_rows, uint32_t width,
+                           pulsar_gpu_tensor *out, uint64_t out_offset_bytes);
+
 
 /** L150: bank-batched markov refine. One launch per draft position serves
  * n_banks banks (one markov_w2 stream shared across them); byte-exact per

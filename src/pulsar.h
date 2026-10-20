@@ -647,24 +647,38 @@ void pulsar_session_bank_prefix_match(pulsar_session *s, uint32_t bank,
 int pulsar_session_argmax(pulsar_session *s);
 /** pulsar_session_argmax with `excluded_id` removed from the row. @return the id, or -1. */
 int pulsar_session_argmax_excluding(pulsar_session *s, int excluded_id);
-/** Returned by pulsar_sample_logits / pulsar_session_sample when the row is
- * DEGENERATE (no finite logit, or a probability mass that is not a positive
- * finite number) or the arguments are unusable: no token is drawn, one line
- * is printed, and the caller must fail its request (L188).  Never a valid id. */
+/** Returned by the draws (pulsar_session_draw, _draw_rows, _sample) when the row is DEGENERATE (no finite logit,
+ * a probability mass that is not a positive finite number, a non-finite knob): no token is drawn and the caller
+ * must fail its request (L188).  Never a valid id. */
 #define PULSAR_SAMPLE_REFUSED (-1)
-/** Sample one token from a logits row under (temperature, top-k, top-p,
- * min-p); the row twin of pulsar_session_sample.  `rng` is the request's
- * sampler stream (seed it with the request's seed): the draw reads the key
- * of the stream's next token and steps the stream past it -- greedy too (it
- * reads nothing), so the stream's index stays the count of tokens drawn.  The
- * key is a function of (seed, index) only, and the speculative lanes draw
- * each token at the same key, so a seeded request is the same text whichever
- * lane decodes which of its tokens (L288 sdet).
- * @return the token id, or -1 for a row no distribution can be drawn from
- * (no finite logit) or no stream. */
-int pulsar_sample_logits(const float *logits, int n_vocab, float temperature,
-                      int top_k, float top_p, float min_p, uint64_t *rng);
-/** pulsar_sample_logits over the session's live logits. @return the token, or -1. */
+/** L302: one draw (THE sampler, on the device: src/cuda/pulsar_cuda_sampler.cu).  `rng` is the request's sampler
+ * stream (seed it with the request's seed): the draw reads the key of the stream's next token and steps the stream
+ * past it -- greedy too, so the stream's index stays the count of tokens drawn.  The key is a function of (seed,
+ * index) only and the speculative lanes draw each token at the same key, so a seeded request is the same text
+ * whichever lane decodes which of its tokens (L288 sdet).  `greedy` draws the argmax whatever the temperature (a
+ * tool call's structure, L296); `mask` (NULL = none; ceil(logits width / 32) words, bit i set = token i allowed)
+ * makes every other token -inf before every transform (L303's structured outputs, L272's tool names). */
+typedef struct pulsar_row_draw {
+    float temperature;
+    int top_k;
+    float top_p;
+    float min_p;
+    uint64_t *rng;
+    bool greedy;
+    const uint32_t *mask;
+} pulsar_row_draw;
+/** A draw from the session's live logits. @return the token, or PULSAR_SAMPLE_REFUSED. */
+int pulsar_session_draw(pulsar_session *s, const pulsar_row_draw *d);
+/** Draws from rows rows[0 .. n) of the last batched step's headed rows -- decode_multiseq /
+ * decode_mixed / decode_fused's logits row k, which stay on the device -- one per row: tokens[k], or
+ * PULSAR_SAMPLE_REFUSED for a degenerate row (that request fails; the others stand).  @return 0, or 1 when nothing
+ * was drawn (bad arguments, a device failure). */
+int pulsar_session_draw_rows(pulsar_session *s, const uint32_t *rows, const pulsar_row_draw *d, uint32_t n,
+                             int *tokens);
+/** The last batched step's headed row `row` becomes `bank`'s next-token row (a mixed step's finished prompt run: the
+ * bank's restore installs it).  On the device.  @return 0, or 1. */
+int pulsar_session_step_row_to_bank(pulsar_session *s, uint32_t row, uint32_t bank);
+/** pulsar_session_draw with no mask and no greedy override. @return the token, or -1. */
 int pulsar_session_sample(pulsar_session *s, float temperature, int top_k, float top_p, float min_p, uint64_t *rng);
 int pulsar_session_top_logprobs(pulsar_session *s, pulsar_token_score *out, int k);
 /** Tensor-parallel leader: read and check the pair's pending logits-identity
@@ -675,15 +689,11 @@ int pulsar_session_top_logprobs(pulsar_session *s, pulsar_token_score *out, int 
  * 1 with `err` filled on a mismatch or a dead pair. */
 int pulsar_session_settle(pulsar_session *s, char *err, size_t errlen);
 int pulsar_session_token_logprob(pulsar_session *s, int token, pulsar_token_score *out);
-/** Row-based twins of the two readers above (pulsar_sample_logits' relation to
- * pulsar_session_sample): score a caller-supplied logits row.  The batched
- * decode entries return one row per bank and leave s->logits untouched by
- * contract, so a caller that samples from those rows must read its logprobs
- * from them too.  Identical arithmetic; the session readers delegate here. */
-int pulsar_logits_top_logprobs(const float *logits, int n_vocab,
-                            pulsar_token_score *out, int k);
-int pulsar_logits_token_logprob(const float *logits, int n_vocab, int token,
-                             pulsar_token_score *out);
+/** The logprobs of row `row` of the last batched step's headed rows (pulsar_session_draw_rows' rows): the scored
+ * token's (*have_chosen 1, or 0 when the row has no finite logit or token is not an id) and the top k (k <= 20;
+ * *n_top as pulsar_session_top_logprobs returns).  @return 0, or 1 on bad arguments / a device failure. */
+int pulsar_session_step_row_logprobs(pulsar_session *s, uint32_t row, int token, pulsar_token_score *chosen,
+                                     int *have_chosen, pulsar_token_score *top, int k, int *n_top);
 int pulsar_session_copy_logits(pulsar_session *s, float *out, int cap);
 int pulsar_session_set_logits(pulsar_session *s, const float *logits, int n);
 int pulsar_session_eval(pulsar_session *s, int token, char *err, size_t errlen);
@@ -890,18 +900,15 @@ uint32_t pulsar_spec_round_n_rows(const pulsar_spec_round *r);
  * every verify's rows, the single lane's included.  Returns the row count
  * written. */
 uint32_t pulsar_spec_round_fill_reqs(const pulsar_spec_round *r, uint32_t bank, pulsar_multiseq_req *out);
-/** Finish the round against the shared forward's logits block: `rows` points
- * at the block, and this round's rows start at block row `row0` (row stride =
- * pulsar_engine_logits_width floats). Emits into accepted[] and returns the
- * count, or -1 (session poisoned). Row argmaxes for the greedy walk are
- * computed host-side from the block.  The walk draws each row's token at its
- * own key in `rng` (the stream at the round's base) and steps the stream past
- * every token it emits (L288 sdet). */
+/** Finish the round against the last shared forward's rows: this round's rows start at the step's headed row
+ * `row0` (they stay on the device, L302).  Emits into accepted[] and returns the count, or -1 (session poisoned).
+ * The walk -- on the device -- draws each row's token at its own key in `rng` (the stream at the round's base) and
+ * steps the stream past every token it emits (L288 sdet). */
 int pulsar_session_spec_round_end(pulsar_session *s, pulsar_spec_round *r,
                                int first_token,
                                float temperature, int top_k, float top_p,
                                float min_p, uint64_t *rng,
-                               const float *rows, uint32_t row0,
+                               uint32_t row0,
                                int *accepted, int accepted_cap,
                                char *err, size_t errlen);
 /** Gate-facing (L182): pulsar_session_spec_round_end with the acceptance walk
@@ -917,7 +924,7 @@ int pulsar_session_spec_round_end_forced(pulsar_session *s, pulsar_spec_round *r
                                       int first_token,
                                       float temperature, int top_k, float top_p,
                                       float min_p, uint64_t *rng,
-                                      const float *rows, uint32_t row0,
+                                      uint32_t row0,
                                       const int32_t *truth,
                                       int *accepted, int accepted_cap,
                                       char *err, size_t errlen);
@@ -995,10 +1002,9 @@ typedef struct {
 int pulsar_session_spec_assemble_batch(pulsar_session *s, pulsar_spec_step *steps, int n,
                                        uint32_t row_budget,
                                        pulsar_multiseq_req *reqs, uint32_t *n_rows_out);
-/** Per step: restore, round_end against the shared forward's block `rows`
+/** Every step's walk over the last shared forward's rows in one device launch, then per step: restore, round_end
  * (the step's row0 / first_token from assemble), save.  0 or -1 as above. */
-int pulsar_session_spec_round_end_batch(pulsar_session *s, pulsar_spec_step *steps, int n,
-                                        const float *rows);
+int pulsar_session_spec_round_end_batch(pulsar_session *s, pulsar_spec_step *steps, int n);
 /** Per step: restore, pulsar_session_spec_redraft_commit, save.  0 or -1. */
 int pulsar_session_spec_redraft_commit_batch(pulsar_session *s, pulsar_spec_step *steps, int n);
 /** Gate-facing: read a batched redraft's result out of the round before it is

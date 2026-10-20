@@ -925,7 +925,6 @@ bool draft_chains(pulsar_session *s, const uint32_t *banks, uint64_t *const *rng
     const uint32_t B = d->block, per = kDraftRows / B, V = d->vocab;
     uint32_t pb[kDraftRows], pi[kDraftRows];
     int32_t pc[kDraftRows];
-    std::vector<float> row;
     std::vector<spec_redraft_req *> chains;   /* the records this call drafted (the stop rule and the price below) */
     for (uint32_t i0 = 0; i0 < n;) {
         uint32_t nb = 0, i = i0;
@@ -988,18 +987,18 @@ bool draft_chains(pulsar_session *s, const uint32_t *banks, uint64_t *const *rng
                     q->refined[j] = l->chain_ids[(size_t)b * SL + j - 1];
                     while (pick < TK && cand[(j - 1) * TK + pick] != q->refined[j]) pick++;
                 } else {
-                    row.assign(V, -INFINITY);
-                    for (uint32_t c = 0; c < TK; c++) row[(uint32_t)cand[(j - 1) * TK + c]] = rw[c];
-                    pulsar_sample_dist qd{};
-                    if (!pulsar_sample_dist_build(row.data(), V, q->temperature, q->top_k, q->top_p, q->min_p,
-                                                  &s->sample_scratch, &qd)) {
-                        snprintf(err, errlen, "a draft slot's candidates have no distribution");
-                        return false;
-                    }
-                    const int dt = pulsar_sample_dist_draw(&qd, pulsar_sample_key(*rngs[pi[b]], j));
-                    pulsar_sample_dist_free(&qd);
+                    /* THE sampler over the slot's row: its candidates, every other id -inf (L302: on the device) */
+                    pulsar_gpu_sample_req rq;
+                    memset(&rq, 0, sizeof(rq));
+                    rq.temperature = q->temperature;
+                    rq.top_k = q->top_k;
+                    rq.top_p = q->top_p;
+                    rq.min_p = q->min_p;
+                    rq.key = pulsar_sample_key(*rngs[pi[b]], j);
+                    rq.probe = -1;
+                    const int dt = s->draw_sparse(V, &cand[(j - 1) * TK], rw, TK, &rq);
                     if (dt < 0) {
-                        snprintf(err, errlen, "a draft draw failed");
+                        snprintf(err, errlen, "a draft slot's candidates have no distribution");
                         return false;
                     }
                     q->refined[j] = dt;

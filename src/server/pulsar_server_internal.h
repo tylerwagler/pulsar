@@ -1621,19 +1621,6 @@ struct server {
     uint64_t w_spec_phase_rounds;
     double   m_spec_phase_ms[SERVER_ROUND_PHASE_COUNT];
     uint64_t m_spec_phase_rounds;
-    /** L123: the batched lane's shared ALL_ROWS logits landing buffer
-     * (PULSAR_SPEC_LOGITS_ROWS x vocab floats, ~16.5 MB), allocated once on
-     * first quantum. It was a per-quantum malloc/free — 16.5 MB of
-     * demand-zero pages faulted back in on every touch cycle, a measured
-     * ~1-2 ms/round of host tax. Worker-owned like the EMA above. */
-    float   *spec_lane_logits;
-    /** L219: the plain and mixed batched lanes' logits landing buffer
-     * ((PULSAR_SESSION_POOL_CAP + 1) x vocab floats).  Same rationale as
-     * spec_lane_logits, one lane over: the per-quantum malloc/free re-faulted
-     * ~4 MB of demand-zero pages on every quantum of a
-     * --no-dspark/plain-serving workload.  Worker-owned; the two lanes run
-     * sequentially in one worker. */
-    float   *lane_logits;
     /** Which decode lane the scheduler is on: 0 idle, 1 spec (retired), 2
      * batched, 3 spec-batched, 4 family-spec (server_pick_decode_lane). The
      * spec-decode counters cannot advance on the batched lane (it never enters
@@ -2935,9 +2922,9 @@ bool tool_name_token_allowed(const char *so_far, size_t n_so_far, const char *to
                              const tool_schema_orders *declared, const char *close);
 /** The slot is sampling an unnamed forced call's function name (the closer has not appeared yet). */
 bool gen_tool_name_open(const struct gen_state *g);
-/** Mask a constrained slot's logits row to the declared names (server_jobs.cpp); false = nothing allowed
- *  (said), the row untouched. */
-bool gen_mask_tool_name(struct server *s, struct gen_state *g, float *row, int width);
+/** The token mask of a constrained slot's next draw: the declared names (server_jobs.cpp; bit t set = allowed);
+ *  false = nothing allowed (said): draw unmasked. */
+bool gen_tool_name_mask(struct server *s, struct gen_state *g, int width, std::vector<uint32_t> *mask);
 bool request_exceeds_context(const request *r, int ctx_size);
 bool gen_client_disconnected(int fd);
 bool http_error_context_length_exceeded(int fd,
@@ -3195,7 +3182,7 @@ bool gen_streams_plain(const gen_state *g);
 void logprob_ledger_reset(logprob_ledger *lg);
 void logprob_ledger_free(logprob_ledger *lg);
 void logprob_capture_session(logprob_ledger *lg, pulsar_session *sess, int token);
-void logprob_capture_row(logprob_ledger *lg, const float *logits, int n_vocab, int token);
+void logprob_capture_row(logprob_ledger *lg, pulsar_session *sess, uint32_t row, int token);
 bool logprob_commit(logprob_ledger *lg, pulsar_engine *engine, int token,
                     const char *piece, size_t piece_len, size_t end_off);
 int  logprob_stream_ready(const logprob_ledger *lg, size_t upto);

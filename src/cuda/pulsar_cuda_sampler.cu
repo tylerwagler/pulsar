@@ -257,6 +257,7 @@ struct launch_args {
     uint32_t n_rows;
     const uint32_t *mask;      /* [mask rows][mask_words] or NULL */
     uint32_t mask_words;
+    const int32_t *id_map;     /* [n_vocab]: row index -> token id (a drafter's draft vocabulary), or NULL */
     pulsar_gpu_sample_req req[PULSAR_GPU_SAMPLE_ROWS_MAX];
     row_out_t *out;            /* [n_rows] */
     uint32_t *pending;         /* [n_rows]: 1 = the row kernel left it to a slot */
@@ -292,8 +293,10 @@ struct cand_list {
     uint64_t *skeys;     /* shared: (desc_key << 32 | id) sorted */
     uint32_t *gids;      /* global: ids in sorted order (slot path) */
     float *probs;        /* shared or global, sorted order */
+    const int32_t *map;  /* the row's ids -> the draw's ids (a drafter's draft vocabulary), or NULL */
     __device__ __forceinline__ int32_t id(uint32_t i) const {
-        return skeys ? (int32_t)(uint32_t)skeys[i] : (int32_t)gids[i];
+        const int32_t r = skeys ? (int32_t)(uint32_t)skeys[i] : (int32_t)gids[i];
+        return map ? map[r] : r;
     }
 };
 
@@ -359,7 +362,7 @@ __device__ void sample_row(const launch_args &a, uint32_t row, row_smem<THREADS>
     const uint32_t tid = threadIdx.x;
     const pulsar_gpu_sample_req q = a.req[row];
     row_view rv;
-    rv.x = a.logits + (size_t)row * a.row_stride;
+    rv.x = a.logits + (size_t)q.row * a.row_stride;
     rv.n = a.n_vocab;
     rv.mask = a.mask && q.mask_row != PULSAR_GPU_SAMPLE_NO_MASK ? a.mask + (size_t)q.mask_row * a.mask_words : nullptr;
     row_out_t *o = a.out + row;
@@ -391,6 +394,7 @@ __device__ void sample_row(const launch_args &a, uint32_t row, row_smem<THREADS>
     }
     block_argmax<THREADS>(rv, sm.redv, sm.redi, &maxv, &maxi);
     if (greedy_flag || T <= 0.0f) {
+        if (maxi >= 0 && a.id_map) maxi = a.id_map[maxi];
         if (tid == 0 && maxi >= 0 && maxi == q.probe) o->probe_p = 1.0f;
         finish(maxi, maxi < 0 ? PULSAR_GPU_SAMPLE_REFUSED_EMPTY : PULSAR_GPU_SAMPLE_OK);
         dump_point(maxi);
@@ -407,6 +411,7 @@ __device__ void sample_row(const launch_args &a, uint32_t row, row_smem<THREADS>
     const uint32_t path = top_k > 0 ? PATH_TOPK : min_p > MINP_PREFILTER_MIN ? PATH_MINP : PATH_FULL;
 
     cand_list cl;
+    cl.map = a.id_map;
     cl.n = 0;
     cl.skeys = nullptr;
     cl.gids = nullptr;
@@ -451,6 +456,12 @@ __device__ void sample_row(const launch_args &a, uint32_t row, row_smem<THREADS>
         const uint32_t max_id = (uint32_t)maxi;
         if (path == PATH_MINP) {
             prefilter = __fmul_rn(min_p, MINP_PREFILTER_SLACK);
+            /* L295 F7: THE sparse min-p predicate, min_p >= max(0.02, 2.5 * 2^-24 * n_vocab).  With top_p == 1 the
+             * cut's `filtered * (1 / sum) >= 1` test is redundant with the min-p cut: while a further survivor
+             * exists, sum >= filtered + min_p (every survivor's p >= min_p times the max's, which is expf(0) == 1),
+             * so the ratio stays at least min_p / (filtered + min_p) under 1, which clears the rounding band
+             * (2 * 2^-24) for filtered <= n_vocab when min_p > 2 * 2^-24 * n_vocab; the 2.5 is a 25% margin.  So
+             * the arm drops the sum (+inf) and the expf below the floor. */
             const float band = __fmul_rn(1.4901161193847656e-7f, (float)rv.n);
             full = top_p == 1.0f && min_p >= (band > SPARSE_MINP_MIN ? band : SPARSE_MINP_MIN);
             /* a bound, not a decision: an entry under it has p < prefilter however it rounds */
@@ -759,23 +770,29 @@ uint64_t pulsar_gpu_sample_scratch_bytes(uint32_t n_vocab) {
 }
 
 int pulsar_gpu_sample_rows(const pulsar_gpu_tensor *logits, uint64_t logits_offset_bytes, uint32_t row_stride,
-                           uint32_t n_vocab, uint32_t n_rows, const pulsar_gpu_sample_req *reqs,
-                           const pulsar_gpu_tensor *mask, uint32_t mask_words, pulsar_gpu_tensor *scratch,
-                           pulsar_gpu_tensor *out, uint64_t out_offset_bytes, pulsar_gpu_tensor *dist,
-                           uint32_t dist_cap) {
+                           uint32_t n_vocab, uint32_t logits_rows, uint32_t n_rows, const pulsar_gpu_sample_req *reqs,
+                           const pulsar_gpu_tensor *mask, uint32_t mask_words, const pulsar_gpu_tensor *id_map,
+                           pulsar_gpu_tensor *scratch, pulsar_gpu_tensor *out, uint64_t out_offset_bytes,
+                           pulsar_gpu_tensor *dist, uint32_t dist_cap) {
     if (!logits || !reqs || !scratch || !out || n_rows == 0 || n_rows > PULSAR_GPU_SAMPLE_ROWS_MAX || n_vocab == 0 ||
         row_stride < n_vocab || logits_offset_bytes > logits->bytes ||
-        (uint64_t)(n_rows - 1u) * row_stride * sizeof(float) + (uint64_t)n_vocab * sizeof(float) >
+        logits_rows == 0 ||
+        (uint64_t)(logits_rows - 1u) * row_stride * sizeof(float) + (uint64_t)n_vocab * sizeof(float) >
             logits->bytes - logits_offset_bytes ||
         scratch->bytes < pulsar_gpu_sample_scratch_bytes(n_vocab) ||
         out_offset_bytes > out->bytes || out->bytes - out_offset_bytes < (uint64_t)n_rows * sizeof(row_out_t) ||
-        (mask && mask_words < (n_vocab + 31u) / 32u) ||
+        (mask && mask_words < (n_vocab + 31u) / 32u) || (id_map && id_map->bytes < (uint64_t)n_vocab * 4u) ||
         (dist && dist->bytes < (uint64_t)n_rows * (1u + 2u * dist_cap) * sizeof(uint32_t))) {
         fprintf(stderr, "pulsar: device sampler: bad launch (%u rows of %u, stride %u) -- refusing\n", n_rows, n_vocab,
                 row_stride);
         return 0;
     }
     for (uint32_t r = 0; r < n_rows; r++) {
+        if (reqs[r].row >= logits_rows) {
+            fprintf(stderr, "pulsar: device sampler: draw %u reads row %u of %u -- refusing\n", r, reqs[r].row,
+                    logits_rows);
+            return 0;
+        }
         if (reqs[r].mask_row != PULSAR_GPU_SAMPLE_NO_MASK &&
             (!mask || (uint64_t)(reqs[r].mask_row + 1u) * mask_words * sizeof(uint32_t) > mask->bytes)) {
             fprintf(stderr, "pulsar: device sampler: row %u names mask row %u outside the mask -- refusing\n", r,
@@ -791,6 +808,7 @@ int pulsar_gpu_sample_rows(const pulsar_gpu_tensor *logits, uint64_t logits_offs
     a.n_rows = n_rows;
     a.mask = mask ? (const uint32_t *)mask->ptr : nullptr;
     a.mask_words = mask_words;
+    a.id_map = id_map ? (const int32_t *)id_map->ptr : nullptr;
     memcpy(a.req, reqs, (size_t)n_rows * sizeof(*reqs));
     a.out = (row_out_t *)((char *)out->ptr + out_offset_bytes);
     a.slot_bytes = (pulsar_gpu_sample_slot_bytes(n_vocab) + 255u) & ~255ull;
@@ -853,4 +871,65 @@ int pulsar_gpu_spec_walk(const pulsar_gpu_tensor *rows, uint64_t rows_offset_byt
     a.out = (pulsar_gpu_spec_walk_out *)((char *)out->ptr + out_offset_bytes);
     spec_walk_kernel<<<1, 32>>>(a);
     return cuda_ok(cudaGetLastError(), "device spec walk");
+}
+
+/* ---- the rows' identity digest (the TP mirror's cross-rank check, L243; L302: the rows stay on the device) ------ */
+
+/* One block: each thread folds a contiguous run of 64-bit words with a multiply-xor chain seeded by its position,
+ * and the chains fold in thread order -- a deterministic function of the bytes, the row count and the width. */
+__global__ static void __launch_bounds__(256) rows_digest_kernel(const uint64_t *w, uint64_t n_words, uint32_t n_rows,
+                                                          uint32_t width, uint64_t *out) {
+    __shared__ uint64_t part[256];
+    const uint64_t K = 0x9E3779B97F4A7C15ull;
+    const uint64_t chunk = (n_words + 255u) / 256u;
+    const uint64_t lo = min((uint64_t)threadIdx.x * chunk, n_words), hi = min(lo + chunk, n_words);
+    uint64_t h = (K ^ ((uint64_t)n_rows << 32 | width)) + threadIdx.x * K;
+    for (uint64_t i = lo; i < hi; i++) h = (h ^ w[i]) * K;
+    part[threadIdx.x] = h ^ (h >> 29);
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        uint64_t f = K;
+        for (uint32_t t = 0; t < 256; t++) f = (f ^ part[t]) * 0x100000001b3ull;
+        *out = f;
+    }
+}
+
+int pulsar_gpu_rows_digest(const pulsar_gpu_tensor *rows, uint64_t offset_bytes, uint32_t n_rows, uint32_t width,
+                           pulsar_gpu_tensor *out, uint64_t out_offset_bytes) {
+    const uint64_t bytes = (uint64_t)n_rows * width * sizeof(float);
+    if (!rows || !out || (offset_bytes & 7u) || (bytes & 7u) || offset_bytes + bytes > rows->bytes ||
+        out_offset_bytes + 8u > out->bytes || (out_offset_bytes & 7u)) {
+        fprintf(stderr, "pulsar: rows digest: bad launch (%u rows x %u) -- refusing\n", n_rows, width);
+        return 0;
+    }
+    rows_digest_kernel<<<1, 256>>>((const uint64_t *)((const char *)rows->ptr + offset_bytes), bytes / 8u, n_rows,
+                                   width, (uint64_t *)((char *)out->ptr + out_offset_bytes));
+    return cuda_ok(cudaGetLastError(), "rows digest");
+}
+
+/* ---- a row from a candidate list (a drafter whose head scores a few candidates a slot, L298) -------------------- */
+
+__global__ static void sparse_fill_kernel(float *row, uint32_t width) {
+    for (uint32_t i = blockIdx.x * blockDim.x + threadIdx.x; i < width; i += gridDim.x * blockDim.x)
+        row[i] = __uint_as_float(0xff800000u);
+}
+
+/* the candidates in list order, one thread: a repeated id keeps its last value, as a host row built by assignment */
+__global__ static void sparse_scatter_kernel(float *row, uint32_t width, const int32_t *ids, const float *vals,
+                                             uint32_t n) {
+    for (uint32_t c = 0; c < n; c++)
+        if (ids[c] >= 0 && (uint32_t)ids[c] < width) row[ids[c]] = vals[c];
+}
+
+int pulsar_gpu_sparse_row(pulsar_gpu_tensor *row, uint32_t width, const pulsar_gpu_tensor *cand, uint32_t n) {
+    if (!row || !cand || width == 0 || row->bytes < (uint64_t)width * 4u || cand->bytes < (uint64_t)n * 8u) {
+        fprintf(stderr, "pulsar: sparse row: bad launch (%u candidates into %u) -- refusing\n", n, width);
+        return 0;
+    }
+    const int32_t *ids = (const int32_t *)cand->ptr;
+    const float *vals = (const float *)(ids + n);
+    sparse_fill_kernel<<<(width + 255u) / 256u, 256>>>((float *)row->ptr, width);
+    if (!cuda_ok(cudaGetLastError(), "sparse row fill")) return 0;
+    sparse_scatter_kernel<<<1, 1>>>((float *)row->ptr, width, ids, vals, n);
+    return cuda_ok(cudaGetLastError(), "sparse row scatter");
 }

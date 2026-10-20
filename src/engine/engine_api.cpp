@@ -452,33 +452,25 @@ static int tp_mirror_leader_ack(pulsar_session *s, pulsar_tp *tp, const char *op
     return 0;
 }
 
-/** The cross-rank identity digest of a BATCHED step (decode_multiseq /
- * decode_mixed): of what the step actually produced.  Under a greedy
- * speculative step the readback is the per-row argmaxes (L219,
- * spec_argmax_host) and under the sparse min-p contract the compact candidate
- * block (L149, spec_compact_host) -- the caller's `logits` rows are NOT
- * written then, and digesting them compared two processes' stale buffers: the
- * server's first speculative step on the pair refused a correct step as a
- * divergence.  gpu_graph_decode_multiseq_batch records the form on every step
- * (exactly one of the two row counts nonzero, or both zero for full rows), so
- * the leader's collect and the worker's ack read it the same way.  The width
- * seeds the digest, so the three forms cannot collide. */
-uint64_t pulsar_session_batch_digest(pulsar_session *s, const float *logits, uint32_t n_rows) {
-    /* the cheaper readback the target chose (spec_ops.h readback; a family without one digests full rows) */
-    const pulsar_spec_target_ops *t = s->engine->family->spec;
-    const void *rows = NULL;
-    uint32_t n = 0, width = 0;
-    if (t && t->readback && t->readback(s, &rows, &n, &width))
-        return pulsar_tp_logits_digest((const float *)rows, n, width);
-    return pulsar_tp_logits_digest(logits, n_rows, (uint32_t)s->engine->logits_width());
+/** The cross-rank identity digest of a BATCHED step (decode_multiseq / decode_mixed): of the rows it headed, on
+ * the device where they stay (L302; pulsar_gpu_rows_digest) -- every rank holds the same rows after the vocab
+ * all-gather.  0 when the device digest failed (the ranks then disagree, loudly). */
+uint64_t pulsar_session_batch_digest(pulsar_session *s, uint32_t n_rows) {
+    uint64_t d = 0;
+    return n_rows == 0 ? 0x9E3779B97F4A7C15ull : s->rows_digest(s->dev.step_rows, 0, n_rows, &d) ? d : 0u;
 }
 
-uint64_t pulsar_session_fused_digest(pulsar_session *s, const float *logits, uint32_t n_dec,
-                                     uint32_t n_heads) {
-    const uint32_t width = (uint32_t)s->engine->logits_width();
-    const uint64_t dec = pulsar_session_batch_digest(s, logits, n_dec);
-    const uint64_t heads = pulsar_tp_logits_digest(logits + (size_t)n_dec * width, n_heads, width);
+uint64_t pulsar_session_fused_digest(pulsar_session *s, uint32_t n_dec, uint32_t n_heads) {
+    uint64_t dec = 0, heads = 0x9E3779B97F4A7C15ull;
+    if (n_dec && !s->rows_digest(s->dev.step_rows, 0, n_dec, &dec)) return 0;
+    if (n_heads && !s->rows_digest(s->dev.step_rows, n_dec, n_heads, &heads)) return 0;
     return dec * 0x100000001b3ull ^ heads;
+}
+
+/* The live row's digest (an eval's, a speculative run's last row). */
+static uint64_t live_digest(pulsar_session *s) {
+    uint64_t d = 0;
+    return s->rows_digest(s->dev.live, 0, 1, &d) ? d : 0u;
 }
 
 /** Settle a pipelined eval's identity check (pulsar_session_eval defers it,
@@ -509,19 +501,12 @@ int pulsar_session_settle(pulsar_session *s, char *err, size_t errlen) {
  * body failed there is nothing to compare; the acks are drained in either shape
  * so the next frame is not shifted, and the local failure is the result. */
 static int tp_mirror_leader_ack_logits(pulsar_session *s, pulsar_tp *tp, const char *operation,
-                                       int body_rc, const float *logits, uint32_t n_rows,
-                                       char *err, size_t errlen) {
+                                       int body_rc, uint32_t n_rows, char *err, size_t errlen) {
     if (body_rc != 0) {
         pulsar_tp_drain_command_acks(tp);
         return body_rc;
     }
-    if (!logits && n_rows > 0) {
-        pulsar_tp_drain_command_acks(tp);
-        if (err) snprintf(err, errlen, "tp: the mirrored %s produced %u rows but no logits buffer to "
-                          "check them by", operation, n_rows);
-        return 1;
-    }
-    const uint64_t own = pulsar_session_batch_digest(s, logits, n_rows);
+    const uint64_t own = pulsar_session_batch_digest(s, n_rows);
     char peer_err[256];
     peer_err[0] = '\0';
     if (!pulsar_tp_wait_command_ack_digest(tp, s->tp_session_id, operation, own,
@@ -855,6 +840,17 @@ void pulsar_session_prefix_match(pulsar_session *s, const pulsar_tokens *prompt,
 int pulsar_session_argmax(pulsar_session *s) { return s->argmax(); }
 int pulsar_session_argmax_excluding(pulsar_session *s, int excluded_id) { return s ? s->argmax_excluding(excluded_id) : -1; }
 int pulsar_session_sample(pulsar_session *s, float temperature, int top_k, float top_p, float min_p, uint64_t *rng) { return s->sample(temperature, top_k, top_p, min_p, rng); }
+int pulsar_session_draw(pulsar_session *s, const pulsar_row_draw *d) { return s && d ? s->draw(d) : PULSAR_SAMPLE_REFUSED; }
+int pulsar_session_draw_rows(pulsar_session *s, const uint32_t *rows, const pulsar_row_draw *d, uint32_t n, int *tokens) {
+    return s && rows && d && tokens && n ? s->draw_step_rows(rows, d, n, tokens) : 1;
+}
+int pulsar_session_step_row_to_bank(pulsar_session *s, uint32_t row, uint32_t bank) {
+    return s && s->step_row_to_bank(row, bank) ? 0 : 1;
+}
+int pulsar_session_step_row_logprobs(pulsar_session *s, uint32_t row, int token, pulsar_token_score *chosen,
+                                     int *have_chosen, pulsar_token_score *top, int k, int *n_top) {
+    return s && chosen && have_chosen && n_top && (top || k == 0) ? s->step_row_logprobs(row, token, chosen, have_chosen, top, k, n_top) : 1;
+}
 int pulsar_session_top_logprobs(pulsar_session *s, pulsar_token_score *out, int k) { return s && tp_mirror_settle(s, NULL, 0) ? s->top_logprobs(out, k) : 0; }
 int pulsar_session_token_logprob(pulsar_session *s, int token, pulsar_token_score *out) { return s && tp_mirror_settle(s, NULL, 0) ? s->token_logprob(token, out) : 0; }
 int pulsar_session_copy_logits(pulsar_session *s, float *out, int cap) { return s && tp_mirror_settle(s, NULL, 0) ? s->copy_logits(out, cap) : 0; }
@@ -913,16 +909,9 @@ int pulsar_session_eval(pulsar_session *s, int token, char *err, size_t errlen) 
                           (unsigned long long)pos);
         return 1;
     }
-    if (!s->logits) {
-        pulsar_tp_drain_command_acks(tp);
-        if (err) snprintf(err, errlen, "tp: the mirrored eval produced no logits to check");
-        return 1;
-    }
     char what[96];
     snprintf(what, sizeof(what), "eval at position %llu", (unsigned long long)pos);
-    if (!pulsar_tp_defer_command_ack_digest(tp, s->tp_session_id, what,
-                                            pulsar_tp_logits_digest(s->logits, 1u,
-                                                                    (uint32_t)s->engine->logits_width()))) {
+    if (!pulsar_tp_defer_command_ack_digest(tp, s->tp_session_id, what, live_digest(s))) {
         pulsar_tp_drain_command_acks(tp);
         if (err) snprintf(err, errlen, "tp: could not defer the eval's identity check");
         return 1;
@@ -946,7 +935,7 @@ int pulsar_session_decode_multiseq(pulsar_session *s, const pulsar_multiseq_req 
     if (!tp_mirror_sent(tp, "batch decode", sent, err, errlen)) return 1;
     return tp_mirror_leader_ack_logits(s, tp, "batch decode",
                                        s->engine->family->session->decode_multiseq(s, reqs, n, logits, logits_cap, err, errlen),
-                                       logits, n, err, errlen);
+                                       n, err, errlen);
 }
 int pulsar_session_decode_mixed(pulsar_session *s, const pulsar_multiseq_req *reqs, uint32_t n_rows, float *logits, int logits_cap, uint32_t *out_n_rows, uint32_t max_head_runs, char *err, size_t errlen) {
     PULSAR_NVTX_FN();
@@ -974,7 +963,7 @@ int pulsar_session_decode_mixed(pulsar_session *s, const pulsar_multiseq_req *re
     uint32_t *rows_out = out_n_rows ? out_n_rows : &headed;
     const int body_rc = s->engine->family->session->decode_mixed(s, reqs, n_rows, logits, logits_cap,
                                         rows_out, max_head_runs, err, errlen);
-    return tp_mirror_leader_ack_logits(s, tp, "mixed batch", body_rc, logits, *rows_out, err, errlen);
+    return tp_mirror_leader_ack_logits(s, tp, "mixed batch", body_rc, *rows_out, err, errlen);
 }
 int pulsar_session_decode_fused(pulsar_session *s, const pulsar_multiseq_req *reqs, uint32_t n_rows,
                                 const pulsar_fused_shape *shape, float *logits, int logits_cap,
@@ -1012,8 +1001,7 @@ int pulsar_session_decode_fused(pulsar_session *s, const pulsar_multiseq_req *re
     char peer_err[256];
     peer_err[0] = '\0';
     if (!pulsar_tp_wait_command_ack_digest(tp, s->tp_session_id, "fused batch",
-                                           pulsar_session_fused_digest(s, logits, shape->n_dec,
-                                                                       got - shape->n_dec),
+                                           pulsar_session_fused_digest(s, shape->n_dec, got - shape->n_dec),
                                            peer_err, sizeof(peer_err))) {
         if (err) snprintf(err, errlen, "tp: a worker failed the mirrored fused batch: %s", peer_err);
         return 1;
@@ -1049,19 +1037,18 @@ static int tp_mirror_bank_verdict(pulsar_session *s, pulsar_tp *tp, const char *
 
 /** The verdict collect for a verdict operation that also ends on logits
  * (generate_speculative): a POSITIVE own verdict carries this rank's digest of
- * `n_rows` rows of `logits` and every peer's positive verdict must match it
+ * its live row and every peer's positive verdict must match it
  * (the cross-rank identity check, L243).  An own verdict of 0 (the run failed
  * here) collects plainly; a peer that ran anyway answers with a digest, which
  * the plain collect refuses as a shape mismatch -- a split either way. */
 static int tp_mirror_bank_verdict_logits(pulsar_session *s, pulsar_tp *tp, const char *operation,
-                                         int own, int divergence_rc, const float *logits,
-                                         uint32_t n_rows) {
+                                         int own, int divergence_rc) {
     PULSAR_NVTX("tp: wait worker verdict");
     if (own <= 0) return tp_mirror_bank_verdict(s, tp, operation, own, divergence_rc);
     char err[256];
     err[0] = '\0';
     int peers = 0;
-    const uint64_t digest = pulsar_tp_logits_digest(logits, n_rows, (uint32_t)s->engine->logits_width());
+    const uint64_t digest = live_digest(s);
     if (!pulsar_tp_wait_command_status_digest(tp, s->tp_session_id, operation, &peers, digest,
                                               err, sizeof(err))) {
         pulsar_tp_mirror_fail_void(tp, operation, err);
@@ -1310,8 +1297,7 @@ int pulsar_session_generate_speculative(pulsar_session *s, float temperature, in
                         err, errlen)) return -1;
     const int own = local();
     if (own < 0) pulsar_tp_own_step_failed(tp, "generate_speculative");
-    const int agreed = tp_mirror_bank_verdict_logits(s, tp, "generate_speculative", own + 1, -1,
-                                                     s->logits, 1u);
+    const int agreed = tp_mirror_bank_verdict_logits(s, tp, "generate_speculative", own + 1, -1);
     return agreed < 0 ? -1 : own;
 }
 int pulsar_session_spec_next_base(pulsar_session *s, float temperature, int top_k, float top_p, float min_p, uint64_t *rng) {
@@ -1349,24 +1335,23 @@ int pulsar_session_spec_round_begin(pulsar_session *s, pulsar_spec_round *r, int
     const int own = pulsar_session_spec_round_begin_local(s, r, first_token, max_tokens, accepted_cap, temperature, top_k, top_p, min_p, err, errlen);
     return tp_mirror_bank_verdict(s, tp, "spec_round_begin", own == 0 ? 0 : 1, -1) < 0 ? -1 : own;
 }
-int pulsar_session_spec_round_end(pulsar_session *s, pulsar_spec_round *r, int first_token, float temperature, int top_k, float top_p, float min_p, uint64_t *rng, const float *rows, uint32_t row0, int *accepted, int accepted_cap, char *err, size_t errlen) {
+int pulsar_session_spec_round_end(pulsar_session *s, pulsar_spec_round *r, int first_token, float temperature, int top_k, float top_p, float min_p, uint64_t *rng, uint32_t row0, int *accepted, int accepted_cap, char *err, size_t errlen) {
     PULSAR_NVTX_FN();
     PULSAR_FAMILY_REQUIRES_S(s, PULSAR_FAMILY_CAP_SPEC, "speculative decoding", -1);
     if (!s) return -1;
     pulsar_tp *tp = NULL;
     const int route = tp_spec_route(s, "spec_round_end", &tp, err, errlen);
     if (route == 0) return -1;
-    if (route == 1) return pulsar_session_spec_round_end_local(s, r, first_token, temperature, top_k, top_p, min_p, 0u, rng, rows, row0, accepted, accepted_cap, err, errlen);
-    /* The logits block is NOT shipped: every rank holds the same block from
-     * its own mirrored forward (the vocab all-gather made them identical), so
-     * only row0 crosses. */
+    if (route == 1) return pulsar_session_spec_round_end_local(s, r, first_token, temperature, top_k, top_p, min_p, 0u, rng, row0, accepted, accepted_cap, err, errlen);
+    /* The rows are NOT shipped: every rank holds the same rows on its device from its own mirrored forward (the vocab
+     * all-gather made them identical), so only row0 crosses. */
     pulsar_tp_spec_command c = tp_spec_cmd(s, tp_spec_live_bank(s));
     c.i0 = first_token; c.i2 = accepted_cap; c.i3 = (int32_t)row0;   /* i1: unused since L284 */
     c.temperature = temperature; c.top_k = top_k; c.top_p = top_p; c.min_p = min_p;
     c.rng = rng ? *rng : 0;
     if (!tp_mirror_sent(tp, "spec_round_end", pulsar_tp_send_spec(tp, PULSAR_TP_FRAME_SPEC_ROUND_END, &c, NULL, NULL),
                         err, errlen)) return -1;
-    const int own = pulsar_session_spec_round_end_local(s, r, first_token, temperature, top_k, top_p, min_p, 0u, rng, rows, row0, accepted, accepted_cap, err, errlen);
+    const int own = pulsar_session_spec_round_end_local(s, r, first_token, temperature, top_k, top_p, min_p, 0u, rng, row0, accepted, accepted_cap, err, errlen);
     const int agreed = tp_mirror_bank_verdict(s, tp, "spec_round_end", own + 1, -1);
     return agreed < 0 ? -1 : own;
 }
@@ -1498,20 +1483,19 @@ int pulsar_session_spec_assemble_batch(pulsar_session *s, pulsar_spec_step *step
     }
     return 0;
 }
-int pulsar_session_spec_round_end_batch(pulsar_session *s, pulsar_spec_step *steps, int n,
-                                        const float *rows) {
+int pulsar_session_spec_round_end_batch(pulsar_session *s, pulsar_spec_step *steps, int n) {
     PULSAR_NVTX_FN();
     const char *operation = "spec_round_end_batch";
-    if (!s || n < 0 || (n > 0 && (!steps || !rows))) return -1;
+    if (!s || n < 0 || (n > 0 && !steps)) return -1;
     char err[256];
     pulsar_tp *tp = NULL;
     const int route = tp_spec_route(s, operation, &tp, err, sizeof(err));
     if (route == 0) { fprintf(stderr, "pulsar: %s\n", err); return tp_spec_steps_fail(steps, n, operation); }
     if (route == 1) {
-        pulsar_session_spec_round_end_batch_local(s, steps, n, rows);
+        pulsar_session_spec_round_end_batch_local(s, steps, n);
         return 0;
     }
-    /* The logits block is NOT shipped: every rank holds the same block from
+    /* The rows are NOT shipped: every rank holds the same rows on its device from
      * its own mirrored forward, so only each step's row0 crosses.  The
      * leader's measured spec cost rides the header (v24): the guard every
      * rank's round_end prices the quench with is computed from these same
@@ -1520,7 +1504,7 @@ int pulsar_session_spec_round_end_batch(pulsar_session *s, pulsar_spec_step *ste
     if (!tp_spec_steps_mirror(s, tp, PULSAR_TP_FRAME_SPEC_ROUND_END_BATCH, operation, steps, n,
                               cost->flat_us, cost->row_us, cost->valid ? 1 : 0))
         return tp_spec_steps_fail(steps, n, operation);
-    pulsar_session_spec_round_end_batch_local(s, steps, n, rows);
+    pulsar_session_spec_round_end_batch_local(s, steps, n);
     const int own = pulsar_spec_steps_verdict(PULSAR_SPEC_PHASE_ROUND_END, steps, n, 0u);
     return tp_mirror_bank_verdict(s, tp, operation, own, -1) < 0 ? tp_spec_steps_fail(steps, n, operation) : 0;
 }

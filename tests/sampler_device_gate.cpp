@@ -156,15 +156,21 @@ struct host_out {
     std::vector<float> probs;
 };
 
-host_out host_sample(const float *row, uint32_t n, const pulsar_gpu_sample_req &q, sref::pulsar_sample_scratch *sc) {
+/* `map` (NULL = identity): a drafter's draft vocabulary -- the dist is built over the row, then its ids mapped, then
+ * drawn (family_qwen.cpp's qwen_mtp_dist, as it stood) */
+host_out host_sample(const float *row, uint32_t n, const pulsar_gpu_sample_req &q, sref::pulsar_sample_scratch *sc,
+                     const int32_t *map = nullptr) {
     host_out h;
     if (q.flags & PULSAR_GPU_SAMPLE_GREEDY) {
         h.tok = sref::sample_argmax(row, n);
+        if (h.tok >= 0 && map) h.tok = map[h.tok];
         if (h.tok >= 0) { h.ids = {h.tok}; h.probs = {1.0f}; }
         return h;
     }
     sref::pulsar_sample_dist d;
     if (!sref::pulsar_sample_dist_build(row, n, q.temperature, q.top_k, q.top_p, q.min_p, sc, &d)) return h;
+    if (map)
+        for (uint32_t i = 0; i < d.n; i++) d.ids[i] = map[d.ids[i]];
     h.tok = q.temperature <= 0.0f ? d.ids[0] : sref::pulsar_sample_dist_draw(&d, q.key);
     h.ids.assign(d.ids, d.ids + d.n);
     h.probs.assign(d.probs, d.probs + d.n);
@@ -192,7 +198,11 @@ struct gate {
 /* One batch of up to ROWS rows on the device: sample (twice), dist, logprobs, against the host. */
 bool run_batch(gate &g, uint32_t n_vocab, std::vector<case_row> &rows, pulsar_gpu_tensor *dl, pulsar_gpu_tensor *dm,
                pulsar_gpu_tensor *scratch, pulsar_gpu_tensor *dout, pulsar_gpu_tensor *ddist, pulsar_gpu_tensor *dlp,
-               bool check_lp) {
+               bool check_lp, const std::vector<int32_t> *map, pulsar_gpu_tensor *dmap) {
+    const int32_t *hm = map ? map->data() : nullptr;
+    if (map && !pulsar_gpu_tensor_write(dmap, 0, map->data(), map->size() * 4)) return false;
+    pulsar_gpu_tensor *idm = map ? dmap : nullptr;
+    if (map) check_lp = false;   /* logprobs score the row's own ids */
     const uint32_t nr = (uint32_t)rows.size();
     const uint32_t stride = rows[0].stride, words = (n_vocab + 31u) / 32u;
     std::vector<float> host((size_t)nr * stride);
@@ -201,6 +211,7 @@ bool run_batch(gate &g, uint32_t n_vocab, std::vector<case_row> &rows, pulsar_gp
     for (uint32_t r = 0; r < nr; r++) {
         memcpy(&host[(size_t)r * stride], rows[r].x.data(), (size_t)stride * 4);
         reqs[r] = rows[r].req;
+        reqs[r].row = r;
         if (!rows[r].mask.empty()) {
             memcpy(&mask[(size_t)r * words], rows[r].mask.data(), (size_t)words * 4);
             reqs[r].mask_row = r;
@@ -212,16 +223,18 @@ bool run_batch(gate &g, uint32_t n_vocab, std::vector<case_row> &rows, pulsar_gp
     /* each row probes a token whose emitted probability it reports: its argmax, a random id, or none */
     for (uint32_t r = 0; r < nr; r++) {
         const uint32_t w = urand(3);
-        reqs[r].probe = w == 0 ? -1 : w == 1 ? (int32_t)urand(n_vocab) : sref::sample_argmax(rows[r].x.data(), n_vocab);
+        int32_t p = w == 0 ? -1 : w == 1 ? (int32_t)urand(n_vocab) : sref::sample_argmax(rows[r].x.data(), n_vocab);
+        if (p >= 0 && hm) p = hm[p];
+        reqs[r].probe = p;
     }
     std::vector<pulsar_gpu_sample_out> out1(nr), out2(nr);
     std::vector<uint32_t> dist((size_t)nr * (1 + 2 * DIST_CAP));
-    if (!pulsar_gpu_sample_rows(dl, 0, stride, n_vocab, nr, reqs.data(), dm, words, scratch, dout, 0, ddist,
+    if (!pulsar_gpu_sample_rows(dl, 0, stride, n_vocab, nr, nr, reqs.data(), dm, words, idm, scratch, dout, 0, ddist,
                                 DIST_CAP) ||
         !pulsar_gpu_synchronize() || !pulsar_gpu_tensor_read(dout, 0, out1.data(), out1.size() * sizeof(out1[0])) ||
         !pulsar_gpu_tensor_read(ddist, 0, dist.data(), dist.size() * 4))
         return false;
-    if (!pulsar_gpu_sample_rows(dl, 0, stride, n_vocab, nr, reqs.data(), dm, words, scratch, dout, 0, nullptr, 0) ||
+    if (!pulsar_gpu_sample_rows(dl, 0, stride, n_vocab, nr, nr, reqs.data(), dm, words, idm, scratch, dout, 0, nullptr, 0) ||
         !pulsar_gpu_synchronize() || !pulsar_gpu_tensor_read(dout, 0, out2.data(), out2.size() * sizeof(out2[0])))
         return false;
     /* logprobs of each row's host token (the masked view when the row is masked) */
@@ -242,7 +255,7 @@ bool run_batch(gate &g, uint32_t n_vocab, std::vector<case_row> &rows, pulsar_gp
         if (!rows[r].mask.empty())
             for (uint32_t i = 0; i < n_vocab; i++)
                 if (!((rows[r].mask[i >> 5] >> (i & 31u)) & 1u)) view[r][i] = -INFINITY;
-        ho[r] = host_sample(view[r].data(), n_vocab, rows[r].req, &sc);
+        ho[r] = host_sample(view[r].data(), n_vocab, reqs[r], &sc, hm);
         sref::pulsar_sample_scratch_free(&sc);
     }
     char det[256];
@@ -330,6 +343,7 @@ bool run_walk(gate &g, uint32_t n_vocab, pulsar_gpu_tensor *dl, pulsar_gpu_tenso
         gen_row(urand(2) ? 0u : 1u, n_vocab, x);
         memcpy(&host[(size_t)r * n_vocab], x.data(), (size_t)n_vocab * 4);
         gen_req(reqs[r]);
+        reqs[r].row = r;
         reqs[r].temperature = urand(3) ? 0.7f : 0.0f;
         if (!std::isfinite(reqs[r].top_p) || !std::isfinite(reqs[r].min_p)) reqs[r].top_p = reqs[r].min_p = 0.05f;
     }
@@ -362,7 +376,7 @@ bool run_walk(gate &g, uint32_t n_vocab, pulsar_gpu_tensor *dl, pulsar_gpu_tenso
         runs.push_back(run);
         r0 += k + 1;
     }
-    if (!pulsar_gpu_sample_rows(dl, 0, n_vocab, n_vocab, ROWS, reqs.data(), nullptr, 0, scratch, dout, 0, nullptr, 0))
+    if (!pulsar_gpu_sample_rows(dl, 0, n_vocab, n_vocab, ROWS, ROWS, reqs.data(), nullptr, 0, nullptr, scratch, dout, 0, nullptr, 0))
         return false;
     std::vector<int> tok(ROWS);
     for (uint32_t r = 0; r < ROWS; r++) tok[r] = ho[r].tok;
@@ -418,14 +432,14 @@ void bench(uint32_t n_vocab, pulsar_gpu_tensor *dl, pulsar_gpu_tensor *scratch, 
         for (uint32_t nr : {1u, 5u, 33u}) {
             std::vector<pulsar_gpu_sample_req> reqs(nr);
             for (uint32_t r = 0; r < nr; r++) {
-                reqs[r] = pulsar_gpu_sample_req{m.t, m.p, m.m, m.k, 0x1234ull + r, 0u, PULSAR_GPU_SAMPLE_NO_MASK, -1, 0u};
+                reqs[r] = pulsar_gpu_sample_req{m.t, m.p, m.m, m.k, 0x1234ull + r, 0u, PULSAR_GPU_SAMPLE_NO_MASK, -1, r};
             }
             const int it = 20;
-            pulsar_gpu_sample_rows(dl, 0, n_vocab, n_vocab, nr, reqs.data(), nullptr, 0, scratch, dout, 0, nullptr, 0);
+            pulsar_gpu_sample_rows(dl, 0, n_vocab, n_vocab, nr, nr, reqs.data(), nullptr, 0, nullptr, scratch, dout, 0, nullptr, 0);
             pulsar_gpu_synchronize();
             const auto t0 = std::chrono::steady_clock::now();
             for (int i = 0; i < it; i++)
-                pulsar_gpu_sample_rows(dl, 0, n_vocab, n_vocab, nr, reqs.data(), nullptr, 0, scratch, dout, 0, nullptr,
+                pulsar_gpu_sample_rows(dl, 0, n_vocab, n_vocab, nr, nr, reqs.data(), nullptr, 0, nullptr, scratch, dout, 0, nullptr,
                                        0);
             pulsar_gpu_synchronize();
             const double us =
@@ -460,7 +474,8 @@ int main(int argc, char **argv) {
         pulsar_gpu_tensor *ddist = pulsar_gpu_tensor_alloc((uint64_t)ROWS * (1 + 2 * DIST_CAP) * 4);
         pulsar_gpu_tensor *dlp = pulsar_gpu_tensor_alloc(ROWS * sizeof(pulsar_gpu_logprob_row));
         pulsar_gpu_tensor *dwalk = pulsar_gpu_tensor_alloc(ROWS * sizeof(pulsar_gpu_spec_walk_out));
-        if (!dl || !dm || !scratch || !dout || !ddist || !dlp || !dwalk) { fprintf(stderr, "alloc failed\n"); return 1; }
+        pulsar_gpu_tensor *dmap = pulsar_gpu_tensor_alloc((uint64_t)v * 4u);
+        if (!dl || !dm || !scratch || !dout || !ddist || !dlp || !dwalk || !dmap) { fprintf(stderr, "alloc failed\n"); return 1; }
         const uint32_t f0 = g.fails, c0 = g.cases;
         for (uint32_t b = 0; b < batches; b++) {
             const uint32_t stride = b % 5 == 4 ? v + 77u : v;
@@ -477,7 +492,15 @@ int main(int argc, char **argv) {
                 gen_req(c.req);
                 if (urand(5) == 0) gen_mask(urand(10) == 0 ? 3u : urand(3), v, x, c.mask);
             }
-            if (!run_batch(g, v, rows, dl, dm, scratch, dout, ddist, dlp, b % 2 == 0)) {
+            /* every seventh batch draws through a draft vocabulary: an ascending subset of a vocabulary twice as wide */
+            std::vector<int32_t> map;
+            if (b % 7 == 6) {
+                map.resize(v);
+                int32_t at = 0;
+                for (uint32_t i = 0; i < v; i++) map[i] = (at += 1 + (int32_t)urand(2));
+            }
+            if (!run_batch(g, v, rows, dl, dm, scratch, dout, ddist, dlp, b % 2 == 0, map.empty() ? nullptr : &map,
+                           dmap)) {
                 fprintf(stderr, "sampler-device-gate: a launch failed\n");
                 return 1;
             }
@@ -491,6 +514,7 @@ int main(int argc, char **argv) {
         pulsar_gpu_tensor_free(dl); pulsar_gpu_tensor_free(dm); pulsar_gpu_tensor_free(scratch);
         pulsar_gpu_tensor_free(dout); pulsar_gpu_tensor_free(ddist); pulsar_gpu_tensor_free(dlp);
         pulsar_gpu_tensor_free(dwalk);
+        pulsar_gpu_tensor_free(dmap);
     }
     const double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
     printf("sampler-device-gate: %u cases (%u rows past the shared store), %u failures, %.1f s -- %s\n", g.cases,

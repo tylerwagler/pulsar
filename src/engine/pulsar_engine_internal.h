@@ -1261,7 +1261,7 @@ typedef struct {
     int spec_frontier_copy_init;            ///< 0 unbuilt (a failed prepare leaves it 0 and the next snapshot retries), 1 built; see spec_frontier_copy_tables_init
     /** Shared multi-row logits slab (16 rows x n_vocab f32), written by every
      * batched multi-row output head: the DSpark draft/verify passes,
-     * gpu_graph_verify_suffix_tops, and the Tier-2 batched multi-session
+     * gpu_graph_verify_suffix, and the Tier-2 batched multi-session
      * decode driver.  Despite the "spec_" name it is NOT speculation-owned —
      * gpu_graph_alloc_raw_cap allocates it unconditionally so the batched
      * paths work with speculation disabled. */
@@ -1306,7 +1306,6 @@ typedef struct {
     pulsar_gpu_tensor *ffn_norm;         ///< RMSNorm output feeding the FFN
     pulsar_gpu_tensor *output_embd;      ///< collapsed embedding-width vector
     pulsar_gpu_tensor *output_norm;      ///< final RMSNorm before the vocab projection
-    pulsar_gpu_tensor *logits;           ///< vocab logits row (width = pulsar_shape::n_vocab)
 
     /** DSpark target hidden capture buffers */
     pulsar_gpu_tensor *dspark_target_h[3];  ///< target hiddens captured at the three anchor layers
@@ -1373,38 +1372,8 @@ typedef struct {
     pulsar_gpu_tensor *dspark_conf_tokens;  ///< [16] i32 refined draft ids
     pulsar_gpu_tensor *dspark_embed_tokens;  ///< [16] i32 draft ids for the embed upload (L104 fix B: was a cudaMalloc/free PER DRAFTER FORWARD in gpu_decode)
     pulsar_gpu_tensor *dspark_refined_ids;  ///< [17] i32: L108 P1 device-chained greedy walk -- [0] seeded with the base token, reduce pos p writes the winner to [p+1]
-    pulsar_gpu_tensor *dspark_prefilter_sel;  ///< L149: [16 x PULSAR_DSPARK_PREFILTER_ROW_I32] i32 min-p prefilter output rows
     pulsar_gpu_tensor *dspark_bank_meta;      ///< L150: [2 x PULSAR_DSPARK_BANKS_MAX] i32: per-bank base row, per-bank sampled prev token
     pulsar_gpu_tensor *dspark_row_meta;       ///< L150: [7 x PULSAR_SPEC_LOGITS_ROWS] i32 per-row rope/visibility positions per layer + bank id for the banked drafter forward
-    /** L149 phase 2: compact verify rows. spec_round_begin accumulates, over
-     * the rounds begun since the last step, whether EVERY one is in the sparse
-     * min-p contract and the most permissive floor among them;
-     * pulsar_session_spec_arm_capture arms the step from that. An armed
-     * ALL_ROWS head then runs the min-p prefilter over its rows and reads the
-     * compact block into spec_compact_host INSTEAD of the full logits, and the
-     * accept walk builds each target distribution from the row's candidates
-     * (a device read of that one row is the per-row fallback). A more negative
-     * floor only widens the candidate superset, so the min over rounds is safe
-     * for every round. */
-    bool     spec_compact_acc_ok;
-    uint32_t spec_compact_acc_n;
-    float    spec_compact_acc_delta;
-    bool     spec_compact_armed;
-    float    spec_compact_delta;
-    int32_t *spec_compact_host;   ///< PULSAR_SPEC_LOGITS_ROWS x PULSAR_DSPARK_PREFILTER_ROW_I32, owned
-    uint32_t spec_compact_rows;   ///< rows [0, spec_compact_rows) hold this step's compact output (0 = none)
-    /** L219 greedy verify rows: spec_round_begin accumulates, over the rounds
-     * begun since the last step, whether EVERY one is greedy (temperature <= 0).
-     * An armed ALL_ROWS head then runs the per-row argmax on device and reads
-     * int32s into spec_argmax_host instead of the full 517 KB rows -- the walk
-     * on a greedy round consults only row argmaxes, and the single row the
-     * s->logits refresh needs is read from the device on demand.  Greedy and
-     * compact are mutually exclusive by temperature. */
-    bool     spec_argmax_acc_ok;
-    uint32_t spec_argmax_acc_n;
-    bool     spec_argmax_armed;
-    int32_t *spec_argmax_host;    ///< PULSAR_SPEC_LOGITS_ROWS int32, owned
-    uint32_t spec_argmax_rows;    ///< rows [0, spec_argmax_rows) hold this step's argmaxes (0 = none)
     pulsar_gpu_tensor *dspark_seed_kv;  ///< [HEAD_DIM] seed kv scratch
     pulsar_gpu_tensor *dspark_seed_norm;  ///< [HEAD_DIM]
     pulsar_gpu_tensor *dspark_seed_rot;  ///< [HEAD_DIM]
@@ -2070,37 +2039,6 @@ typedef struct owned_str {
     uint64_t len;  ///< length in bytes
 } owned_str;
 
-/** One token under consideration by the sampler. Carries both the raw logit
- * and the normalised probability because the filters need different ones --
- * top-k sorts on the logit, min-p compares probabilities. */
-typedef struct {
-    int id;       ///< token id
-    float logit;  ///< raw logit
-    float prob;   ///< probability after softmax over the candidate set
-} sample_candidate;
-
-/** Reusable working set for pulsar_sample_dist_build's full-vocab (top_k <= 0)
- * path, which sorts all n_vocab candidates. Zero-initialize before first use;
- * grows on demand and is reused across calls, so the sampled speculative walk
- * does not malloc/free ~1.5 MB per accepted position. Free with
- * pulsar_sample_scratch_free.
- *
- * Caller-owned and NOT shared: each concurrent session runs its own sampled
- * acceptance walk, so this lives on pulsar_session, never on pulsar_engine. */
-typedef struct {
-    sample_candidate *cand;  ///< sorted candidates
-    uint64_t *keys;  ///< packed (sort key << 32 | id)
-    uint64_t *tmp;  ///< radix ping-pong buffer
-    /** Gather target for the min-p prefilter path: survivors are collected
-     * into `cand` in ascending-id order (probs computed once, alongside the
-     * full-vocab sum), then gathered here in descending sort order. A second
-     * buffer because the gather cannot run in place and the degenerate
-     * all-equal-logits case keeps every candidate (m == cap). */
-    sample_candidate *cand2;
-    uint32_t cap;  ///< elements reserved in each
-} pulsar_sample_scratch;
-
-void pulsar_sample_scratch_free(pulsar_sample_scratch *s);
 
 
 /** The per-conversation SPECULATIVE / DSpark host shadow, factored into one
@@ -2116,13 +2054,6 @@ void pulsar_sample_scratch_free(pulsar_sample_scratch *s);
  * Deliberately EXCLUDED: heap-backed state (checkpoint, logits) -- those
  * need deep copies with per-side ownership, so they stay as explicit members
  * of each struct. */
-/** L149: device min-p prefilter (pulsar_gpu_minp_prefilter_rows) output row:
- * i32 [0] candidate count, [1] max id, [2] max logit bits, then
- * PULSAR_DSPARK_PREFILTER_CAP ids and PULSAR_DSPARK_PREFILTER_CAP f32 logits
- * (ascending id). A count above the cap means "too many survivors": the host
- * reads the full row instead. Rows are stored back-to-back. */
-#define PULSAR_DSPARK_PREFILTER_CAP 2048u
-#define PULSAR_DSPARK_PREFILTER_ROW_I32 (3u + 2u * PULSAR_DSPARK_PREFILTER_CAP)
 typedef struct pulsar_spec_carry_state {
     /** Fused DSpark loop (P2): drafts produced LAST step from the last-accepted
      * position's hidden, pending verification in THIS step's single batched
@@ -2400,11 +2331,34 @@ bool qwen_vision_encode(const pulsar_qwen_vision_weights_dev *w, const uint8_t *
  * The three heap members are owned deep copies; every other field is a scalar
  * mirror of the identically-named pulsar_session field; the speculative/DSpark
  * scalars are carried wholesale as one embedded pulsar_spec_carry_state. */
+/** L302: a session's device sampling state (session_sampler.cpp): the live row -- the authority; the host mirror
+ *  pulsar_session::logits is read back only on demand -- each bank's saved live row, the sampler's scratch, and the
+ *  rows the last batched step headed into the family's slab. */
+typedef struct pulsar_session_dev_rows {
+    pulsar_gpu_tensor *live;        ///< [W] f32: the live row
+    bool host_stale;                ///< pulsar_session::logits is behind `live`
+    pulsar_gpu_tensor *bank_rows;   ///< [n_banks][W] f32: each bank's live row while another bank is installed
+    uint32_t n_banks;
+    pulsar_gpu_tensor *scratch;     ///< pulsar_gpu_sample_scratch_bytes(W)
+    pulsar_gpu_tensor *out;         ///< PULSAR_GPU_SAMPLE_ROWS_MAX sample outs, then as many walk outs
+    pulsar_gpu_tensor *mask;        ///< [PULSAR_GPU_SAMPLE_ROWS_MAX][ceil(W/32)] u32 token masks
+    pulsar_gpu_tensor *lp;          ///< [PULSAR_GPU_SAMPLE_ROWS_MAX] logprob rows
+    pulsar_gpu_tensor *sparse_row;  ///< [W] f32: a row made from a candidate list (draw_sparse)
+    pulsar_gpu_tensor *sparse_in;   ///< [PULSAR_SESSION_SPARSE_MAX] ids, then as many values
+    /** the rows the last batched step (decode_multiseq / _mixed / _fused, a verify) headed: logits row k at
+     *  step_rows + k * W floats, k < step_n -- valid until the session's next step */
+    const pulsar_gpu_tensor *step_rows;
+    uint32_t step_n;
+} pulsar_session_dev_rows;
+/** Candidates a draw_sparse takes. */
+#define PULSAR_SESSION_SPARSE_MAX 1024u
+bool pulsar_session_dev_alloc(pulsar_session *s, uint32_t n_banks);
+void pulsar_session_dev_free(pulsar_session *s);
+
 typedef struct pulsar_bank_carry {
     bool      valid;  ///< has this bank's state ever been saved
     /** heap-backed (owned): */
     token_vec checkpoint;  ///< deep copy of s->checkpoint
-    float    *logits;  ///< PULSAR_N_VOCAB floats, owned
     /** scalar mirrors: */
     bool      checkpoint_valid;
     bool      logits_stale;     ///< mirror of pulsar_session::logits_stale
@@ -2458,8 +2412,7 @@ int pulsar_session_spec_round_begin_local(pulsar_session *s, pulsar_spec_round *
                                           int top_k, float top_p, float min_p, char *err, size_t errlen);
 int pulsar_session_spec_round_end_local(pulsar_session *s, pulsar_spec_round *r, int first_token,
                                         float temperature, int top_k, float top_p,
-                                        float min_p, uint32_t greedy_rows, uint64_t *rng,
-                                        const float *rows, uint32_t row0,
+                                        float min_p, uint32_t greedy_rows, uint64_t *rng, uint32_t row0,
                                         int *accepted, int accepted_cap, char *err, size_t errlen);
 void pulsar_session_spec_round_abort_local(pulsar_session *s, pulsar_spec_round *r);
 void pulsar_session_spec_arm_capture_local(pulsar_session *s, uint32_t n_rows);
@@ -2473,8 +2426,7 @@ void pulsar_session_spec_redraft_commit_local(pulsar_session *s, pulsar_spec_rou
 void pulsar_session_spec_assemble_batch_local(pulsar_session *s, pulsar_spec_step *steps, int n,
                                               uint32_t row_budget,
                                               pulsar_multiseq_req *reqs, uint32_t *n_rows_out);
-void pulsar_session_spec_round_end_batch_local(pulsar_session *s, pulsar_spec_step *steps, int n,
-                                               const float *rows);
+void pulsar_session_spec_round_end_batch_local(pulsar_session *s, pulsar_spec_step *steps, int n);
 void pulsar_session_spec_redraft_commit_batch_local(pulsar_session *s, pulsar_spec_step *steps, int n);
 /** L260: a batch phase's verdict -- a positive fingerprint of what the phase
  * decided for every step (statuses, base tokens and rows; frontiers and
@@ -2526,20 +2478,11 @@ struct pulsar_session {
      *  checkpoints, built from the engine's state_plan by the family's create; NULL on a DeepSeek session. */
     pulsar_state_set *states;
     token_vec checkpoint;     ///< tokens whose KV the graph currently holds, current bank
-    float *logits;            ///< last decoded row, pulsar_engine_logits_width() floats
-    /** Reused working set for the sampled speculative acceptance walk's
-     * full-vocab distribution builds (one per accepted position). Per-session,
-     * never shared: concurrent sessions each run their own walk. */
-    pulsar_sample_scratch sample_scratch;
-    /** Reusable PULSAR_N_VOCAB-float staging row for the speculative paths'
-     * spec_logits readbacks.  ~517 KB, i.e. above glibc's mmap threshold, so a
-     * per-step malloc/free would mmap/munmap and re-fault it every accepted
-     * position — allocate once per session instead.  Deliberately NOT drawn
-     * from sample_scratch: sample_scratch_reserve frees the whole struct when
-     * it grows, which would dangle a row held across a pulsar_sample_dist_build.
-     * Only ever live inside one speculative eval call (the fused and block
-     * paths never overlap: block tail-calls fused). */
-    float *spec_row_scratch;
+    /** L302: the live row -- the distribution of the token after `checkpoint` -- lives ON THE DEVICE (dev.live) and
+     *  every draw, argmax and logprob reads it there (session_sampler.cpp).  `logits` is its host mirror, read back
+     *  only when a host reader asks for it (live_host(): the payload, a bank carry on the host, a copy out). */
+    float *logits;            ///< the live row's host mirror, pulsar_engine_logits_width() floats (live_host())
+    pulsar_session_dev_rows dev;
     pulsar_session_progress_fn progress;   ///< durable progress callback: fires at real checkpoint boundaries
     void *progress_ud;                     ///< user data for progress
     pulsar_session_progress_fn display_progress;  ///< UI-only progress; may fire MID-chunk, so not a checkpoint boundary
@@ -2577,7 +2520,7 @@ struct pulsar_session {
      *  buffer), its decode-row count and its headed rows -- what
      *  pulsar_session_note_prefilled's `head` indexes.  NULL when the last fused
      *  step failed or none ran. */
-    const float *fused_logits = nullptr;
+    bool fused_valid = false;
     uint32_t fused_n_dec = 0;
     uint32_t fused_heads = 0;
     int prefill_frontier;                  ///< L195: the last position a PREFILL wrote for this checkpoint (decode advances the checkpoint, not this); the resume grid point is derived from min(checkpoint, this); clamped by rewind, carried per bank and in the payload
@@ -2634,6 +2577,39 @@ struct pulsar_session {
     int common_prefix(const pulsar_tokens *prompt);
     /** L115: the prefix-reuse authority (see pulsar.h). */
     void prefix_match(const pulsar_tokens *prompt, pulsar_prefix_match *out);
+    /** L302 (session_sampler.cpp): the live row from row `row` of a step's device rows / from a host row; the host
+     *  mirror, read back if the device moved past it (NULL on a device failure); each bank's row kept on the device
+     *  across a bank switch. */
+    bool live_from_rows(const pulsar_gpu_tensor *rows, uint32_t row);
+    bool live_from_host(const float *row);
+    const float *live_host();
+    bool live_save_bank(uint32_t bank);
+    bool live_restore_bank(uint32_t bank);
+    /** Row `row` of the last batched step becomes `bank`'s saved live row (pulsar_session_step_row_to_bank). */
+    bool step_row_to_bank(uint32_t row, uint32_t bank);
+    /** THE launch: rows row_index[0 .. n) of `rows` by reqs (mask_row is set here from `masks`, NULL
+     *  = none), out[k] from the device.  false (said) on a bad launch or a device failure. */
+    bool draw_rows(const pulsar_gpu_tensor *rows, const uint32_t *row_index, uint32_t n, pulsar_gpu_sample_req *reqs,
+                   const uint32_t *const *masks, pulsar_gpu_sample_out *out);
+    /** draw_rows over rows `width` wide (<= the logits width) whose index i is token id_map[i] (NULL = i): a
+     *  drafter's head rows, no mask. */
+    bool draw_rows_width(const pulsar_gpu_tensor *rows, uint32_t width, const pulsar_gpu_tensor *id_map,
+                         const uint32_t *row_index, uint32_t n, pulsar_gpu_sample_req *reqs, pulsar_gpu_sample_out *out);
+    /** One draw over a row of `width` made from n candidates (ids, values; every other entry -inf): a drafter whose
+     *  head scores a few candidates a slot.  The token, or PULSAR_SAMPLE_REFUSED. */
+    int draw_sparse(uint32_t width, const int32_t *ids, const float *vals, uint32_t n, pulsar_gpu_sample_req *req);
+    /** The launch alone, no mask, the outs left in dev.out (a walk reads them there). */
+    bool draw_rows_dev(const pulsar_gpu_tensor *rows, const uint32_t *row_index, uint32_t n,
+                       pulsar_gpu_sample_req *reqs);
+    /** The rows' identity digest, on the device (pulsar_gpu_rows_digest): rows [row0, row0 + n) of `rows`. */
+    bool rows_digest(const pulsar_gpu_tensor *rows, uint32_t row0, uint32_t n, uint64_t *out);
+    /** One draw from the live row (pulsar_session_draw). */
+    int draw(const pulsar_row_draw *d);
+    /** Draws from rows of the last batched step (pulsar_session_draw_rows). */
+    int draw_step_rows(const uint32_t *rows, const pulsar_row_draw *d, uint32_t n, int *tokens);
+    /** Logprobs of a row of the last batched step (pulsar_session_step_row_logprobs). */
+    int step_row_logprobs(uint32_t row, int token, pulsar_token_score *chosen, int *have_chosen,
+                          pulsar_token_score *top, int k, int *n_top);
     /** Highest-scoring token in the session's current logits row. */
     int argmax();
     /** argmax() ignoring one id -- used to keep a forced continuation off EOS. */
@@ -3938,7 +3914,7 @@ uint32_t gpu_graph_prefill_slice(void);
  * `row` collapsed with batch_hc_pre row `row` (the last FFN's pre), normed,
  * projected into `out`.  Slice 4d: the projection covers the vocab RANGE
  * [vocab_lo, vocab_lo + vocab_dim); the single-box caller passes
- * (0, N_VOCAB, g->logits), which is the whole head. */
+ * (0, N_VOCAB, its row), which is the whole head. */
 bool gpu_graph_encode_output_head(
         pulsar_gpu_graph *g,
         const pulsar_model       *model,
@@ -4210,7 +4186,7 @@ bool gpu_graph_prefill_layer_major(
         const token_vec       *prompt,
         uint32_t               start,
         uint32_t               n_tokens,
-        float                 *logits,
+        pulsar_gpu_tensor     *head_out,
         bool                   show_progress,
         pulsar_imatrix_collector *imatrix,
         pulsar_session_progress_fn display_progress,
@@ -4222,32 +4198,18 @@ pulsar_prefill_shape gpu_graph_prefill_shape(const pulsar_gpu_graph *g);
  *  and the gates' classic suffix -- by the one cut rule over gpu_graph_prefill_shape (text only), capturing grid
  *  checkpoints by the shared rule.  `logits` (NULL = none) receives the last row. */
 bool gpu_graph_prefill_chunked_range(pulsar_gpu_graph *g, const pulsar_model *model, const pulsar_weights *weights,
-                                     const token_vec *prompt, uint32_t start, uint32_t n_tokens, float *logits,
-                                     pulsar_imatrix_collector *imatrix);
-bool gpu_graph_verify_suffix_tops(
+                                     const token_vec *prompt, uint32_t start, uint32_t n_tokens,
+                                     pulsar_gpu_tensor *head_out, pulsar_imatrix_collector *imatrix);
+bool gpu_graph_verify_suffix(
         pulsar_gpu_graph *g,
         const pulsar_model       *model,
         const pulsar_weights     *weights,
         const token_vec       *prompt,
         uint32_t               start,
-        uint32_t               n_tokens,
-        int                   *row_tops,
-        float                 *row_logits);
-bool gpu_graph_read_spec_logits_row(pulsar_gpu_graph *g, uint32_t row, float *logits);
-
-
+        uint32_t               n_tokens);
 /** Reset a bank's compressor state lanes to the canonical empty group (kv 0,
  *  score -INF): their state at any even position. */
 bool gpu_graph_compressor_state_reset(pulsar_gpu_graph *g, uint32_t bank);
-/** L149 phase 2: run the min-p prefilter (floor g->spec_compact_delta) over
- * spec_logits rows [row0, row0+n_rows) and read the compact block into
- * g->spec_compact_host at those row offsets; sets g->spec_compact_rows to
- * row0+n_rows on success, 0 on failure. Blocking read (one small copy). */
-bool gpu_graph_spec_compact_read(pulsar_gpu_graph *g, uint32_t row0, uint32_t n_rows);
-/** L219: the greedy twin of the compact read -- per-row argmax over
- * spec_logits rows [row0, row0+n_rows) into g->spec_argmax_host; sets
- * g->spec_argmax_rows to row0+n_rows on success, 0 on failure. */
-bool gpu_graph_spec_argmax_read(pulsar_gpu_graph *g, uint32_t row0, uint32_t n_rows);
 /** Pick a raw SWA cache size for GPU.  During batched prefill it must cover
  * the previous window plus the current ubatch.
  */
@@ -4262,17 +4224,10 @@ void dump_tokens_fp(FILE *fp, const pulsar_vocab *vocab, const token_vec *tokens
  * pulsar_token_text and dump_tokens_fp both call it.  Malloc'd,
  * NUL-terminated; *len (optional) receives the byte count. */
 char *vocab_token_text(const pulsar_vocab *vocab, int token, size_t *len);
-/** THE row-max rule: the first finite value seeds, lowest id wins a tie.
- * @return the argmax id, or -1 when the row has no finite value. */
-int sample_argmax(const float *logits, uint32_t n_vocab);
-/* The identity digest of a batched step's output (engine_api.cpp): argmax
- * rows, compact rows or logits rows, whichever the step read back. */
-uint64_t pulsar_session_batch_digest(pulsar_session *s, const float *logits, uint32_t n_rows);
-/** L260 fusion: a fused step's digest -- its decode rows as
- *  pulsar_session_batch_digest reads them, then its `n_heads` headed rows (full
- *  logits rows after the decode rows' block). */
-uint64_t pulsar_session_fused_digest(pulsar_session *s, const float *logits, uint32_t n_dec,
-                                     uint32_t n_heads);
+/* The identity digest of a batched step's headed rows, on the device (engine_api.cpp; the TP mirror's check). */
+uint64_t pulsar_session_batch_digest(pulsar_session *s, uint32_t n_rows);
+/** L260 fusion: a fused step's digest -- its decode rows', then its `n_heads` headed rows'. */
+uint64_t pulsar_session_fused_digest(pulsar_session *s, uint32_t n_dec, uint32_t n_heads);
 /** L284 #2: the prompt runs a fused step heads (head_last[r] set, r < n_pf) -- THE count every reader of a
  *  shape uses. */
 static inline uint32_t pulsar_fused_shape_heads(const pulsar_fused_shape *sh) {
@@ -4287,55 +4242,6 @@ static inline uint32_t pulsar_fused_shape_heads(const pulsar_fused_shape *sh) {
 int pulsar_session_fused_local(pulsar_session *s, const pulsar_multiseq_req *reqs, uint32_t n_rows,
                                const pulsar_fused_shape *shape, float *logits, int logits_cap, uint32_t *out_n_rows,
                                char *err, size_t errlen);
-/** The candidate distribution a sampler draws from, after filtering. */
-typedef struct {
-    int *ids;      ///< candidate token ids
-    float *probs;  ///< renormalized over the filtered nucleus
-    uint32_t n;    ///< candidates present in both arrays
-} pulsar_sample_dist;
-
-/** THE authority for the sampled candidate set (temperature, top-k, top-p,
- * min-p) and its order: every lane -- the plain samplers below and the
- * speculative accept walk -- draws from this object, so one rng state yields
- * one token whichever lane runs (L186).  `scratch` is required (non-NULL) and
- * must outlive nothing: it is pure working memory, reusable across calls and
- * independent of `out`.
- * @return 1 with `out` filled; 0 with `out` zeroed for a row no distribution
- * can be drawn from (no finite logit, or a non-positive / non-finite
- * candidate mass) -- said once on stderr. */
-int pulsar_sample_dist_build(const float *logits, uint32_t n_vocab,
-                          float temperature, int top_k, float top_p, float min_p,
-                          pulsar_sample_scratch *scratch, pulsar_sample_dist *out);
-/** L149: the sparse min-p contract's floor, at every vocabulary (production default min_p 0.05). */
-#define PULSAR_SAMPLE_SPARSE_MINP_MIN 0.02f
-/** L295 F7 (Tyler 2026-10-14): THE sparse min-p predicate -- the full-nucleus arm of pulsar_sample_dist_build and
- * the device-prefiltered build (pulsar_sample_dist_build_prefiltered) are taken iff
- *     min_p >= max(PULSAR_SAMPLE_SPARSE_MINP_MIN, 2.5 * 2^-24 * n_vocab).
- * The proof it rests on: with top_p == 1.0f the full path's `filtered_sum / sum >= 1.0f` break is redundant with
- * the min-p cut.  While a further survivor exists, sum >= filtered_sum + min_p (every survivor's prob is >= min_p
- * times the max's, and the max's is expf(0) == 1), so the ratio is at most 1 - min_p / (filtered_sum + min_p);
- * L149's bound asks that gap to clear the rounding band under 1.0f, min_p / filtered_sum > 2 * 2^-24, and
- * filtered_sum <= n_vocab (each prob <= 1), so min_p > 2 * 2^-24 * n_vocab makes the break unreachable before
- * the cut, and when it fires the next candidate fails min-p anyway; the 2.5 is that bound with a 25% margin.  At n_vocab <= 131072 the
- * vocabulary term is under 0.0196, so DeepSeek (129280) is exactly the old `min_p >= 0.02` at every min_p; Qwen
- * (248320) needs 0.037, Inkling (201024) 0.030, a 262144 vocabulary 0.039.  (It replaced a compile-time
- * PULSAR_SAMPLE_SPARSE_VOCAB_MAX of 131072 that sent every wider vocabulary down the full path.)  Pinned by
- * pulsar_test --sampler at 129280 / 201024 / 248320 / 262144. */
-static inline bool pulsar_sample_sparse_minp(float min_p, uint32_t n_vocab) {
-    const float band = 2.5f * 5.9604645e-8f * (float)n_vocab;
-    return min_p >= (band > PULSAR_SAMPLE_SPARSE_MINP_MIN ? band : PULSAR_SAMPLE_SPARSE_MINP_MIN);
-}
-/** Byte-identical to pulsar_sample_dist_build(row, n_vocab, temperature, 0, 1.0f, min_p) when fed the device
- * prefilter's candidates of that row (contract at the definition), for pulsar_sample_sparse_minp(min_p, n_vocab).
- * Returns 0, `out` untouched, for anything outside it. */
-int pulsar_sample_dist_build_prefiltered(const int32_t *ids, const float *vals, uint32_t n_cand,
-                                         uint32_t n_vocab, float max_logit, float temperature, float min_p,
-                                         pulsar_sample_scratch *scratch, pulsar_sample_dist *out);
-void pulsar_sample_dist_free(pulsar_sample_dist *d);
-float pulsar_sample_dist_prob(const pulsar_sample_dist *d, int token);
-/** The token drawn at `key`: an exponential race over the candidates, each with its own uniform hashed from
- *  (key, id) -- exactly a draw from the dist, and the same token for two dists that agree (tokenizer.cpp). */
-int pulsar_sample_dist_draw(const pulsar_sample_dist *d, uint64_t key);
 /** L288 sdet: the key of the token `ahead` places past the stream's next undrawn one -- a function of the request's
  *  seed and the token's index only, read without consuming anything.  Every lane draws a token from its own row at
  *  this key, the plain samplers and the speculative walk alike, so a seeded stream's tokens do not depend on the
@@ -4344,21 +4250,6 @@ uint64_t pulsar_sample_key(uint64_t rng, uint32_t ahead);
 /** Step the stream past `n` committed tokens. */
 void pulsar_sample_advance(uint64_t *rng, uint32_t n);
 
-/** The plain per-token sampler: pulsar_sample_dist_build -> pulsar_sample_dist_draw at `key`,
- * nothing else (greedy takes the point mass and does not read the key).  `scratch`
- * is optional reusable working memory; pass the calling session's
- * sample_scratch, or NULL for a call-local one (pulsar_sample_logits, which
- * has no session) -- the same path, ~5 MB of malloc/free per call.
- * @return the token, or -1 when the build refused the row. */
-int sample_top_p_min_p(
-        const float *logits,
-        uint32_t     n_vocab,
-        float        temperature,
-        int          top_k,
-        float        top_p,
-        float        min_p,
-        uint64_t     key,
-        pulsar_sample_scratch *scratch);
 void pulsar_linux_graph_backend_set_oom_score(pulsar_backend backend);
 void pulsar_release_instance_lock(void);
 /** Refuse to start a second pulsar/ds4 process.  The model can map tens of GiB,

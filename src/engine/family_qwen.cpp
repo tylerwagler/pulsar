@@ -1100,13 +1100,11 @@ static bool qwen_mtp_step(pulsar_session *s, const pulsar_mtp_step *m) {
     return ok;
 }
 
-/* L270: the MTP's sampled distribution q over its draft vocabulary, ids mapped to the vocabulary. */
-static bool qwen_mtp_dist(pulsar_session *s, const float *row, float temperature, int top_k, float top_p, float min_p,
-                          pulsar_sample_dist *q) {
-    const pulsar_qwen_weights *w = s->engine->qwen_weights;
-    if (!pulsar_sample_dist_build(row, w->n_draft, temperature, top_k, top_p, min_p, &s->sample_scratch, q)) return false;
-    for (uint32_t i = 0; i < q->n; i++) q->ids[i] = (int)w->draft_ids[q->ids[i]];
-    return true;
+/* L270: the MTP's sampled q: its headed rows over the draft vocabulary, each row index mapped to its token id (L302:
+ * the device sampler draws from them there). */
+static const pulsar_gpu_tensor *qwen_mtp_q_rows(pulsar_session *s, const pulsar_gpu_tensor **id_map) {
+    *id_map = s->engine->qwen_weights->draft_ids_dev;
+    return qwen_st(s)->logits;
 }
 
 /* L272 P1: the MTP layer's index stage after the bank's last TRUE row, kept while a chain writes draft rows into it */
@@ -1142,7 +1140,7 @@ static const pulsar_mtp_ops k_qwen_mtp = {
     /* .trunk_rows    = */ qwen_mtp_trunk_rows,
     /* .out_rows      = */ qwen_mtp_out_rows,
     /* .forward       = */ qwen_mtp_step,
-    /* .dist          = */ qwen_mtp_dist,
+    /* .q_rows        = */ qwen_mtp_q_rows,
     /* .stage_save    = */ qwen_mtp_stage_save,
     /* .stage_restore = */ qwen_mtp_stage_restore,
     /* .prefetch      = */ qwen_mtp_prefetch,
