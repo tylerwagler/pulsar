@@ -280,6 +280,7 @@ struct launch_args {
     uint32_t *pending;         /* [n_rows]: 1 = the row kernel left it to a slot */
     uint64_t full_rows;        /* bit r: row r is on the full arm (its own pipeline, not the row kernel's) */
     uint32_t plan_vocab;       /* the vocabulary the knobs' plan reads (the row's width; a chain slot's sparse row's) */
+    float *pvals;              /* [n_rows][n_vocab]: the id-order sum's values, computed over the GPU, or NULL */
     /* slot scratch: per slot keys [2][n_vocab] u32, ids [2][n_vocab] u32, probs [n_vocab] f32, then (aligned) the
      * slot kernel's radix counts or the full arm's state and sort scratch */
     uint8_t *slots;
@@ -617,6 +618,26 @@ __global__ void __launch_bounds__(PREP_THREADS) prep_hist_kernel(const __grid_co
         const uint32_t dk = desc_key(v);
         if ((dk >> shift) != prefix) continue;
         atomicAdd(&h[L == 2 ? (dk >> 10) & 2047u : dk & 1023u], 1u);
+    }
+}
+
+/* the id-order sum's values of a min-p row (not full-nucleus), over the GPU: expf's double arithmetic is the cost a
+ * row's single block cannot carry -- the sum then reads them (sample_row) */
+__global__ void __launch_bounds__(PREP_THREADS) prep_pvals_kernel(const __grid_constant__ launch_args a,
+                                                                  const row_prep *prep) {
+    const uint32_t row = blockIdx.y, c = blockIdx.x;
+    const pulsar_gpu_sample_req q = a.req[row];
+    const row_plan p = plan_row(q, a.plan_vocab);
+    const row_prep *pr = prep + row;
+    if (p.refuse || p.greedy || p.path != PATH_MINP || p.full || pr->maxi < 0) return;
+    const row_view rv = prep_view(a, q);
+    float *pv = a.pvals + (size_t)row * a.n_vocab;
+    uint32_t lo, hi;
+    prep_chunk(rv.n, c, &lo, &hi);
+    for (uint32_t i = lo + threadIdx.x; i < hi; i += PREP_THREADS) {
+        float x = 0.0f;
+        (void)row_is_cand(p, i, rv(i), __uint_as_float(0xff800000u), pr->maxv, (uint32_t)pr->maxi, &x);
+        pv[i] = x;
     }
 }
 
@@ -1004,7 +1025,9 @@ __device__ void sample_row(const launch_args &a, uint32_t row, row_smem<THREADS>
             n = pp->n_cand;
         }
         if (idsum) {   /* the id-order serial sum over every finite value (block_serial_sum: the host's bits) */
+            const float *pv = a.pvals ? a.pvals + (size_t)row * a.n_vocab : nullptr;   /* prep_pvals_kernel's */
             auto value = [&](uint32_t i) {
+                if (pv) return pv[i];
                 float pr = 0.0f;   /* a non-finite value adds +0 to the sum: the host skipped it, same bits */
                 (void)row_is_cand(p, i, rv(i), floor_logit, maxlogit, max_id, &pr);
                 return pr;
@@ -1675,8 +1698,12 @@ static uint64_t sample_prep_off(uint32_t n_vocab) {
             (uint64_t)PULSAR_GPU_SAMPLE_ROWS_MAX * sizeof(uint32_t) + 255u) & ~255ull;
 }
 
+static uint64_t sample_pvals_off(uint32_t n_vocab) {
+    return (sample_prep_off(n_vocab) + (uint64_t)PULSAR_GPU_SAMPLE_ROWS_MAX * sizeof(row_prep) + 255u) & ~255ull;
+}
+
 uint64_t pulsar_gpu_sample_scratch_bytes(uint32_t n_vocab) {
-    return sample_prep_off(n_vocab) + (uint64_t)PULSAR_GPU_SAMPLE_ROWS_MAX * sizeof(row_prep);
+    return sample_pvals_off(n_vocab) + (uint64_t)PULSAR_GPU_SAMPLE_ROWS_MAX * n_vocab * sizeof(float);
 }
 
 int pulsar_gpu_sample_rows(const pulsar_gpu_tensor *logits, uint64_t logits_offset_bytes, uint32_t row_stride,
@@ -1729,6 +1756,7 @@ int pulsar_gpu_sample_rows(const pulsar_gpu_tensor *logits, uint64_t logits_offs
     a.dist_cap = dist_cap;
     /* the prep: the rows' scans over PREP_CHUNKS blocks a row, the top-k rows' radix levels when a row is one */
     row_prep *prep = (row_prep *)((uint8_t *)scratch->ptr + sample_prep_off(n_vocab));
+    a.pvals = (float *)((uint8_t *)scratch->ptr + sample_pvals_off(n_vocab));
     bool any_topk = false;
     for (uint32_t r = 0; r < n_rows; r++) {
         any_topk |= reqs[r].top_k > 0;
@@ -1747,6 +1775,7 @@ int pulsar_gpu_sample_rows(const pulsar_gpu_tensor *logits, uint64_t logits_offs
         prep_decide_kernel<3><<<n_rows, PREP_THREADS>>>(a, prep);
     }
     prep_collect_kernel<<<pg, PREP_THREADS>>>(a, prep);
+    prep_pvals_kernel<<<pg, PREP_THREADS>>>(a, prep);
     sample_rows_kernel<<<n_rows, SMP_THREADS>>>(a, prep);
     if (!cuda_ok(cudaGetLastError(), "device sampler rows")) return 0;
     sample_slots_kernel<<<SMP_SLOTS, SLOT_THREADS>>>(a);
