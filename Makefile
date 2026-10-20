@@ -166,6 +166,18 @@ LIB_HDRS = src/lib/pulsar_help.h src/lib/pulsar_kvtext.h src/lib/pulsar_segstore
 FRONTEND_OBJS = src/lib/bpe_tokenizer.o src/lib/pyjson.o src/lib/qwen_chat.o src/lib/qwen_output.o src/lib/out_parse_kit.o \
                 src/lib/inkling_chat.o src/lib/nemotron_chat.o
 CORE_OBJS = $(ENGINE_OBJS) $(CUDA_OBJS) $(CUTLASS_CUDA_OBJS) $(MMQ_OBJS) src/lib/pulsar_json.o $(FRONTEND_OBJS) $(TP_OBJS)
+# L303: grammar-constrained decoding.  xgrammar's C++ core is vendored VERBATIM under src/vendor/xgrammar (the pin
+# and the copy recipe: src/vendor/xgrammar/UPSTREAM), so a refresh is a copy.  Its flags are confined to it and to
+# the one boundary TU, src/lib/pulsar_grammar.cpp: -fexceptions (xgrammar reports every error by throwing; the
+# boundary catches everything -- pulsar_grammar.h), no -ffast-math (it parses schema numbers), and upstream's own
+# -Wno-unused-parameter for the vendored files only (35 sites; our boundary keeps the warning).  The server and the
+# server-linked tests take GRAMMAR_OBJS; nothing else links it.
+XGRAMMAR_SRCS = $(wildcard src/vendor/xgrammar/cpp/*.cc src/vendor/xgrammar/cpp/support/*.cc src/vendor/xgrammar/cpp/converter_ext/*.cc)
+XGRAMMAR_OBJS = $(XGRAMMAR_SRCS:.cc=.o)
+XGRAMMAR_INC = -Isrc/vendor/xgrammar/include -isystem src/vendor/xgrammar/3rdparty
+GRAMMAR_CXXFLAGS = $(filter-out -ffast-math -fno-exceptions,$(CXXFLAGS)) -fexceptions \
+                   -DXGRAMMAR_ENABLE_CPPTRACE=0 -DXGRAMMAR_ENABLE_INTERNAL_CHECK=0
+GRAMMAR_OBJS = src/lib/pulsar_grammar.o $(XGRAMMAR_OBJS)
 
 # ---------------------------------------------------------------------------
 # AUTOMATIC HEADER DEPENDENCIES  (-MMD -MP)
@@ -196,7 +208,7 @@ CORE_OBJS = $(ENGINE_OBJS) $(CUDA_OBJS) $(CUTLASS_CUDA_OBJS) $(MMQ_OBJS) src/lib
 ALL_OBJS = $(CORE_OBJS) $(AGENT_OBJS) $(SERVER_OBJS) \
            $(patsubst %.cpp,%.o,$(wildcard src/cli/*.cpp)) \
            $(patsubst %.cpp,%.o,$(wildcard src/lib/*.cpp)) \
-           $(patsubst %.cpp,%.o,$(wildcard src/vendor/*.cpp)) \
+           $(patsubst %.cpp,%.o,$(wildcard src/vendor/*.cpp)) $(XGRAMMAR_OBJS) \
            $(patsubst %.cpp,%.o,$(wildcard tests/*.cpp))
 PULSAR_DEPS = $(ALL_OBJS:.o=.d)
 PULSAR_LINK ?= $(NVCC) $(NVCCFLAGS)
@@ -254,7 +266,7 @@ help:
 cuda-spark:
 	$(MAKE) -B pulsar-server CUDA_ARCH=sm_120f
 
-pulsar-server: $(SERVER_OBJS) src/lib/pulsar_help.o src/lib/pulsar_kvtext.o src/lib/pulsar_segstore.o src/lib/pulsar_kvchain.o src/lib/pulsar_dsml.o $(CORE_OBJS)
+pulsar-server: $(SERVER_OBJS) src/lib/pulsar_help.o src/lib/pulsar_kvtext.o src/lib/pulsar_segstore.o src/lib/pulsar_kvchain.o src/lib/pulsar_dsml.o $(CORE_OBJS) $(GRAMMAR_OBJS)
 	$(PULSAR_LINK) -o $@ $^ $(PULSAR_LINK_LIBS)
 
 # Development tools, not part of the shipped release. The release is just
@@ -1954,6 +1966,19 @@ cuda-chat-smoke-gate: pulsar
 # (tests/server_live.py: plain answer, forced / streamed / required tool calls, the tool_result continuation, the
 # undeclared-tool refusal).  Not in GATE_TARGETS: one server load per family.  SERVER_LIVE_MODELS to choose.
 SERVER_LIVE_MODELS ?= $(FRONTIER_MODEL) $(QWEN_GATE_MODEL)
+# L303: structured outputs live (tests/constrained_live.py): every constrained output valid over seeds at T 0 and
+# T 0.8, thinking off and on; spec == plain byte-exact for each (logprobs requests decode without speculation);
+# the protocols' format fields; the cost against the same prompt unconstrained; a matcher failure (injected,
+# PULSAR_GRAMMAR_FAIL_AFTER) fails only its request.  Not in `make gates` (two server loads per family), like
+# server-live-gate: it runs on CONSTRAINED_LIVE_MODELS.
+CONSTRAINED_LIVE_MODELS ?= $(SERVER_LIVE_MODELS)
+.PHONY: constrained-live-gate
+constrained-live-gate: pulsar-server
+	@rc=0; for m in $(CONSTRAINED_LIVE_MODELS); do \
+	  sync; sudo -n sh -c "echo 3 > /proc/sys/vm/drop_caches" 2>/dev/null; \
+	  python3 tests/constrained_live.py $$m --binary ./pulsar-server || rc=1; \
+	done; exit $$rc
+
 .PHONY: server-live-gate
 server-live-gate: pulsar-server
 	@rc=0; for m in $(SERVER_LIVE_MODELS); do \
@@ -2468,7 +2493,7 @@ gates: tests/gates_runner pulsar-eval tests/qwen_chat_gate tests/inkling_chat_ga
 # stamp (`.build/cuda-flags.stamp`), so an invocation that leaves it empty
 # rewrites the stamp for the empty arch and the next `make gates` rebuilds
 # every .cu.  Every sub-make below carries it for the same reason.
-GATES_DEV_UNIT ?= --ctxmem --sampler --sampler-prefilter --spec-math --lib-utf8 --lib-think
+GATES_DEV_UNIT ?= --ctxmem --sampler --sampler-prefilter --token-mask --spec-math --lib-utf8 --lib-think
 GATES_DEV_UNIT_SERVER ?= --server --api-sampling-flags --api-min-p-range --api-logprobs-parse --api-count-tokens
 # attention kernels: their own oracle (cuda-attn-gates) + the fused mixed step,
 # which is where an attention/compressor row change shows up as a logits delta.
@@ -2653,6 +2678,12 @@ src/lib/%.o: src/lib/%.cpp src/pulsar.h $(LIB_HDRS) src/lib/sha1.hpp
 
 src/vendor/%.o: src/vendor/%.cpp src/vendor/linenoise.h
 	$(CXX) $(CXXFLAGS) -Wno-write-strings -c -o $@ $<
+
+src/vendor/xgrammar/%.o: src/vendor/xgrammar/%.cc
+	$(CXX) $(GRAMMAR_CXXFLAGS) -Wno-unused-parameter $(XGRAMMAR_INC) -c -o $@ $<
+
+src/lib/pulsar_grammar.o: src/lib/pulsar_grammar.cpp src/lib/pulsar_grammar.h
+	$(CXX) $(GRAMMAR_CXXFLAGS) $(XGRAMMAR_INC) -c -o $@ $<
 
 tests/pulsar_test.o: tests/pulsar_test.cpp $(SERVER_SRCS) $(SERVER_HDRS) src/pulsar.h $(LIB_HDRS)
 	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -Wno-unused-function -c -o $@ tests/pulsar_test.cpp
@@ -3084,15 +3115,24 @@ tests/prefill_chunk_census_probe.o: tests/prefill_chunk_census_probe.cpp src/eng
 tests/prefill_chunk_census_probe: tests/prefill_chunk_census_probe.o src/lib/pulsar_help.o $(CORE_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
-pulsar_test: tests/pulsar_test.o src/lib/pulsar_help.o src/lib/pulsar_kvtext.o src/lib/pulsar_segstore.o src/lib/pulsar_kvchain.o src/lib/pulsar_dsml.o $(CORE_OBJS)
-	$(NVCC) $(NVCCFLAGS) -o $@ tests/pulsar_test.o src/lib/pulsar_help.o src/lib/pulsar_kvtext.o src/lib/pulsar_segstore.o src/lib/pulsar_kvchain.o src/lib/pulsar_dsml.o $(CORE_OBJS) $(CUDA_LDLIBS)
+pulsar_test: tests/pulsar_test.o src/lib/pulsar_help.o src/lib/pulsar_kvtext.o src/lib/pulsar_segstore.o src/lib/pulsar_kvchain.o src/lib/pulsar_dsml.o $(CORE_OBJS) $(GRAMMAR_OBJS)
+	$(NVCC) $(NVCCFLAGS) -o $@ tests/pulsar_test.o src/lib/pulsar_help.o src/lib/pulsar_kvtext.o src/lib/pulsar_segstore.o src/lib/pulsar_kvchain.o src/lib/pulsar_dsml.o $(CORE_OBJS) $(GRAMMAR_OBJS) $(CUDA_LDLIBS)
 
 # L267: the API parsers' requests dumped field by field (host-only; see tests/api_golden.cpp).
 # api-golden-gate compares them with the golden recorded before L267 moved the parse/render layers.
 tests/api_golden.o: tests/api_golden.cpp $(SERVER_SRCS) $(SERVER_HDRS) src/pulsar.h $(LIB_HDRS)
 	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -Wno-unused-function -c -o $@ tests/api_golden.cpp
 
-tests/api_golden: tests/api_golden.o src/lib/pulsar_help.o src/lib/pulsar_kvtext.o src/lib/pulsar_segstore.o src/lib/pulsar_kvchain.o src/lib/pulsar_dsml.o $(CORE_OBJS)
+tests/api_golden: tests/api_golden.o src/lib/pulsar_help.o src/lib/pulsar_kvtext.o src/lib/pulsar_segstore.o src/lib/pulsar_kvchain.o src/lib/pulsar_dsml.o $(CORE_OBJS) $(GRAMMAR_OBJS)
+	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
+
+# L303: constrained decoding's host cost at a family's real vocabulary (mask fill, accept, a round's masks) and
+# whether the template's own bytes, tokenized, stay inside the grammar.  No engine, no GPU: the checkpoint's
+# tokenizer.json.  A measurement tool, not a gate.
+tests/grammar_bench.o: tests/grammar_bench.cpp $(SERVER_SRCS) $(SERVER_HDRS) src/pulsar.h $(LIB_HDRS) src/lib/pulsar_grammar.h
+	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -Wno-unused-function -c -o $@ tests/grammar_bench.cpp
+
+tests/grammar_bench: tests/grammar_bench.o src/lib/pulsar_help.o src/lib/pulsar_kvtext.o src/lib/pulsar_segstore.o src/lib/pulsar_kvchain.o src/lib/pulsar_dsml.o $(CORE_OBJS) $(GRAMMAR_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
 .PHONY: api-golden-gate
@@ -3104,7 +3144,7 @@ api-golden-gate: tests/api_golden
 tests/sse_golden.o: tests/sse_golden.cpp $(SERVER_SRCS) $(SERVER_HDRS) src/pulsar.h $(LIB_HDRS)
 	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -Wno-unused-function -c -o $@ tests/sse_golden.cpp
 
-tests/sse_golden: tests/sse_golden.o src/lib/pulsar_help.o src/lib/pulsar_kvtext.o src/lib/pulsar_segstore.o src/lib/pulsar_kvchain.o src/lib/pulsar_dsml.o $(CORE_OBJS)
+tests/sse_golden: tests/sse_golden.o src/lib/pulsar_help.o src/lib/pulsar_kvtext.o src/lib/pulsar_segstore.o src/lib/pulsar_kvchain.o src/lib/pulsar_dsml.o $(CORE_OBJS) $(GRAMMAR_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
 .PHONY: sse-golden-gate
@@ -3273,7 +3313,7 @@ test: pulsar_test seam-check
 clean:
 	rm -rf .build
 	rm -rf tests/runner
-	rm -f tests/gates_runner pulsar pulsar-server pulsar-bench pulsar-eval pulsar-agent pulsar_test pulsar_agent_test src/engine/*.o src/families/*/*.o src/families/*/*.d src/tp/*.o src/agent/*.o src/server/*.o src/cuda/*.o src/cuda/mmq/*.o src/cuda/mmq/test/*.o src/cli/*.o src/lib/*.o src/vendor/*.o tests/*.o src/engine/*.d src/agent/*.d src/server/*.d src/cuda/*.d src/cuda/mmq/*.d src/cuda/mmq/test/*.d src/cli/*.d src/lib/*.d src/vendor/*.d tests/*.d tests/vision_visible_gate tests/vision_hc_gate tests/vision_image_gate tests/vision_placeholder_gate tests/vision_image_sync_gate tests/vision_chunk_gate tests/cuda_long_context_smoke tests/moe_route_bounds_gate tests/expert_table_gate tests/multiseq_frontier_gate tests/multiseq_decode_gate tests/prefill_bitexact_gate tests/bank_spec_gate tests/spec_sampling_gate tests/spec_sampling_gate_wide tests/accounting_gate tests/bank_evict_restore_gate tests/session_payload_gate tests/algo_stability_gate tests/mixed_prefill_gate tests/mixed_zero_prefill_gate tests/fused_step_gate tests/head_graph_replay_gate tests/decode_reference_gate tests/verify_width_probe tests/mixed_neutrality_gate tests/comp_state_gate tests/spec_teacher_forced_probe tests/attn_f16_kernel_test tests/attn_f16_banked_test tests/kv_rows_pack_gate tests/kv_rows_pack_gate_fastmath tests/minp_prefilter_gate tests/dspark_batch_gate tests/nt_crossover_sweep tests/vision_router_gate tests/router_gate tests/bf16_rows_gate tests/nvfp4_rows_gate tests/lilicorr_head_gate tests/qwen_family_gate tests/inkling_family_gate tests/nemotron_family_gate tests/nemotron_fwd_gate tests/rowops_gate tests/state_kinds_gate tests/payload_frontier_gate tests/prompt_end_gate tests/bank_residency_gate
+	rm -f tests/gates_runner pulsar pulsar-server pulsar-bench pulsar-eval pulsar-agent pulsar_test pulsar_agent_test src/engine/*.o src/families/*/*.o src/families/*/*.d src/tp/*.o src/agent/*.o src/server/*.o src/cuda/*.o src/cuda/mmq/*.o src/cuda/mmq/test/*.o src/cli/*.o src/lib/*.o src/vendor/*.o $(XGRAMMAR_OBJS) $(XGRAMMAR_OBJS:.o=.d) tests/*.o src/engine/*.d src/agent/*.d src/server/*.d src/cuda/*.d src/cuda/mmq/*.d src/cuda/mmq/test/*.d src/cli/*.d src/lib/*.d src/vendor/*.d tests/*.d tests/vision_visible_gate tests/vision_hc_gate tests/vision_image_gate tests/vision_placeholder_gate tests/vision_image_sync_gate tests/vision_chunk_gate tests/cuda_long_context_smoke tests/moe_route_bounds_gate tests/expert_table_gate tests/multiseq_frontier_gate tests/multiseq_decode_gate tests/prefill_bitexact_gate tests/bank_spec_gate tests/spec_sampling_gate tests/spec_sampling_gate_wide tests/accounting_gate tests/bank_evict_restore_gate tests/session_payload_gate tests/algo_stability_gate tests/mixed_prefill_gate tests/mixed_zero_prefill_gate tests/fused_step_gate tests/head_graph_replay_gate tests/decode_reference_gate tests/verify_width_probe tests/mixed_neutrality_gate tests/comp_state_gate tests/spec_teacher_forced_probe tests/attn_f16_kernel_test tests/attn_f16_banked_test tests/kv_rows_pack_gate tests/kv_rows_pack_gate_fastmath tests/minp_prefilter_gate tests/dspark_batch_gate tests/nt_crossover_sweep tests/vision_router_gate tests/router_gate tests/bf16_rows_gate tests/nvfp4_rows_gate tests/lilicorr_head_gate tests/qwen_family_gate tests/inkling_family_gate tests/nemotron_family_gate tests/nemotron_fwd_gate tests/rowops_gate tests/state_kinds_gate tests/payload_frontier_gate tests/prompt_end_gate tests/bank_residency_gate
 
 # Pull in the generated header dependencies.  `-include` (not `include`) so a
 # tree with no .d files yet -- a fresh clone, or right after `make clean` -- is

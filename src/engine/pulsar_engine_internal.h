@@ -2452,13 +2452,14 @@ uint64_t pulsar_session_checkpoint_digest(const pulsar_session *s);
  * worker loop calls these directly.  Every rng a call consumes rides its
  * frame, so the two ranks draw from the same state by construction. */
 int pulsar_session_spec_next_base_local(pulsar_session *s, float temperature, int top_k,
-                                        float top_p, float min_p, uint64_t *rng);
+                                        float top_p, float min_p, const uint32_t *mask, uint64_t *rng);
 int pulsar_session_spec_round_begin_local(pulsar_session *s, pulsar_spec_round *r, int first_token,
                                           int max_tokens, int accepted_cap, float temperature,
                                           int top_k, float top_p, float min_p, char *err, size_t errlen);
 int pulsar_session_spec_round_end_local(pulsar_session *s, pulsar_spec_round *r, int first_token,
                                         float temperature, int top_k, float top_p,
-                                        float min_p, uint32_t greedy_rows, uint64_t *rng,
+                                        float min_p, uint32_t greedy_rows,
+                                        const uint32_t *masks, uint32_t mask_rows, uint64_t *rng,
                                         const float *rows, uint32_t row0,
                                         int *accepted, int accepted_cap, char *err, size_t errlen);
 void pulsar_session_spec_round_abort_local(pulsar_session *s, pulsar_spec_round *r);

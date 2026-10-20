@@ -60,7 +60,10 @@ Public headers: `src/pulsar.h` (engine API) and `src/pulsar_gpu.h` (GPU graph AP
   terminal UI, sessions, compaction).
 - `src/cli/` — `pulsar_cli.cpp`, `pulsar_bench.cpp`, `pulsar_eval.cpp` entry points.
 - `src/lib/` — shared pieces: help text, kvstore.
-- `src/vendor/` — linenoise, rax.
+- `src/vendor/` — linenoise; `xgrammar/` (L303: xgrammar's C++ core, verbatim, pinned in its `UPSTREAM`).
+  The tree builds `-fno-exceptions`; xgrammar throws, so its TUs and the ONE boundary TU that calls it
+  (`src/lib/pulsar_grammar.cpp`, which catches everything into return values) are the only ones built
+  `-fexceptions` (Makefile `GRAMMAR_CXXFLAGS`).
 - `tests/` — test runners; `pulsar_test.cpp` and `pulsar_agent_test.cpp` are unity builds
   that `#include` the server/agent source lists.
 - `cutlass/` — EXTERNAL header-only dependency, **required** for the MXFP4
