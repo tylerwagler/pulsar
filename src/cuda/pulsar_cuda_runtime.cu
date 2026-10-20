@@ -1943,6 +1943,8 @@ int pulsar_gpu_end_commands(void) {
      * next step's bytes. */
     uint32_t nf_layer = 0u;
     const char *nf_arm = NULL;
+    pulsar_cuda_sync_note(2, sizeof(uint32_t));   /* the routed-expert flags: two blocking 4-byte reads */
+    pulsar_cuda_sync_note(2, sizeof(uint32_t));
     const int nf = pulsar_gpu_routed_moe_nonfinite_take(&nf_layer, &nf_arm);
     if (nf < 0) return 0;
     uint32_t oob_layer = 0u;
@@ -1976,6 +1978,8 @@ int pulsar_gpu_synchronize(void) {
      * hazard and is drained the same way. */
     uint32_t nf_layer = 0u;
     const char *nf_arm = NULL;
+    pulsar_cuda_sync_note(2, sizeof(uint32_t));   /* the routed-expert flags: two blocking 4-byte reads */
+    pulsar_cuda_sync_note(2, sizeof(uint32_t));
     const int nf = pulsar_gpu_routed_moe_nonfinite_take(&nf_layer, &nf_arm);
     if (nf > 0)
         fprintf(stderr, "pulsar: non-finite routed-expert output at layer %u (%s) in a step that did not "

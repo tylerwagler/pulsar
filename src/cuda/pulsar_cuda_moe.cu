@@ -116,7 +116,6 @@ __device__ static __forceinline__ void moe_flag_nonfinite(float acc, uint32_t nf
 
 int pulsar_gpu_routed_moe_nonfinite_take(uint32_t *layer_index, const char **arm) {
     uint32_t code = 0u;
-    pulsar_cuda_sync_note(2, sizeof code);
     if (!cuda_ok(cudaMemcpyFromSymbol(&code, g_moe_nonfinite, sizeof code, 0, cudaMemcpyDeviceToHost),
                  "routed MoE non-finite flag read")) return -1;
     if (code == 0u) return 0;
