@@ -2321,9 +2321,25 @@ static int spec_pick_rows(const pulsar_engine *e, const float surv[][16], const 
  * chunking, and its numerics with it, would depend on the load beside it. */
 #define PULSAR_SERVER_FUSED_CHUNK_ALIGN 128
 
-/* L260 fusion: the round width up to which a chunk that does NOT finish its
- * prompt may still add rows (see fuse_rows in the spec quantum). */
-#define PULSAR_SERVER_FUSED_CONT_ROWS 2048u
+/* L304: the wall a fused round may take when it carries a chunk that does NOT finish its prompt -- the decode
+ * streams' longest wait between tokens while a long prompt prefills beside them (Tyler 2026-10-15: decode over
+ * prefill).  The chunk is the widest whose cost on the engine's measured fit (pulsar_engine_fused_chunk) keeps the
+ * round inside it.  PULSAR_SERVER_FUSED_ROUND_MS (read once) moves it for a measurement sweep. */
+#define PULSAR_SERVER_FUSED_ROUND_MS 500.0
+/* ... and until the fit has its evidence (a handful of fused rounds), a continuation chunk is this many rows --
+ * small enough to protect the streams beside it, and each such round is one more observation. */
+#define PULSAR_SERVER_FUSED_PROBE_ROWS (4 * PULSAR_SERVER_FUSED_CHUNK_ALIGN)
+
+static double server_fused_round_ms() {
+    static double v = -1.0;
+    if (v < 0.0) {
+        const char *e = getenv("PULSAR_SERVER_FUSED_ROUND_MS");
+        v = e && atof(e) > 0.0 ? atof(e) : PULSAR_SERVER_FUSED_ROUND_MS;
+        if (e) server_log(PULSAR_LOG_DEFAULT, "pulsar-server: fused round budget %.0f ms (PULSAR_SERVER_FUSED_ROUND_MS)",
+                          v);
+    }
+    return v;
+}
 
 static bool slot_prefilling(const session_slot *c) {
     return c->active_job && c->gen &&
@@ -2442,9 +2458,11 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n, int quantum_
      * that against the classic schedule.  Only chunks that FINISH their prompt
      * take that room: they bring a first token forward and pack (one Spark,
      * 10 x 1.8k prompts: +15% prefill t/s, TTFT max -13%).  A chunk that does
-     * not finish only makes the decode streams wait, so the rows it may add stay
-     * at PULSAR_SERVER_FUSED_CONT_ROWS (a short request beside a 61k prompt
-     * finished in 13.7 s with 4064-row continuation rounds, 9.3 s with 2048). */
+     * not finish only makes the decode streams wait, so its rows are cut to the
+     * round's time budget (L304, PULSAR_SERVER_FUSED_ROUND_MS: it was a fixed
+     * 2048 rows -- a short request beside a 61k prompt finished in 13.7 s with
+     * 4064-row continuation rounds, 9.3 s with 2048 -- whose wall grew with the
+     * context the chunk attends). */
     /* L284 #2: the rows one step heads -- the verify's and the finishing chunks' -- are the family's cap
      * (DeepSeek: the spec-logits block; Qwen: its logits slab, the widest step its kernels keep decode-width
      * arms), the one authority the verify budget below is cut from, fused or not (L284: the lane pick admits up
@@ -2454,7 +2472,7 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n, int quantum_
     const uint32_t heads_max = pulsar_engine_fused_heads_max(s->engine);
     const uint32_t prefill_cap = (uint32_t)pulsar_session_prefill_cap(pool);
     const uint32_t fuse_rows = prefill_cap > heads_max ? prefill_cap - heads_max : 0u;
-    const uint32_t cont_rows = fuse_rows < PULSAR_SERVER_FUSED_CONT_ROWS ? fuse_rows : PULSAR_SERVER_FUSED_CONT_ROWS;
+    const double round_budget_ms = server_fused_round_ms();
     pulsar_multiseq_req *fused_reqs = NULL;
     /* rule 5 (L284): each prefilling prompt's verdict over this quantum -- the rows it rode in how many
      * rounds, and why it last did not ride -- printed once at the quantum's end */
@@ -2482,6 +2500,7 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n, int quantum_
         fused_run fr[PULSAR_SESSION_POOL_CAP];
         int n_fr = 0, n_fin = 0;
         uint32_t pf_rows = 0;
+        double pf_cost_ms = 0.0;   /* L304: the riders' prompt cost on the engine's fit, so far */
         for (int k = 0; k < s->n_slots; k++) {
             session_slot *c = &s->slots[k];
             if (!slot_prefilling(c)) continue;
@@ -2507,10 +2526,15 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n, int quantum_
             int kk = left < (int)(fuse_rows - pf_rows) ? left : (int)(fuse_rows - pf_rows);
             if (kk < left) {
                 if (!long_ok) { rv[k].why = "continuation waits for a full quantum's first round"; continue; }
-                if (pf_rows >= cont_rows) { rv[k].why = "continuation rows full"; continue; }
-                if (kk > (int)(cont_rows - pf_rows)) kk = (int)(cont_rows - pf_rows);
+                /* L304: the widest chunk the round's time budget holds, on the measured cost; one alignment step at
+                 * least when it rides alone (a prompt whose next 128 rows cost more than the budget still moves) */
+                uint32_t fit = 0;
+                if (!pulsar_engine_fused_chunk(s->engine, (uint32_t)p0, pf_cost_ms, round_budget_ms, &fit))
+                    fit = PULSAR_SERVER_FUSED_PROBE_ROWS;
+                if (fit < PULSAR_SERVER_FUSED_CHUNK_ALIGN && n_fr == 0) fit = PULSAR_SERVER_FUSED_CHUNK_ALIGN;
+                if (kk > (int)fit) kk = (int)fit;
                 kk = (p0 + kk) / PULSAR_SERVER_FUSED_CHUNK_ALIGN * PULSAR_SERVER_FUSED_CHUNK_ALIGN - p0;
-                if (kk <= 0) { rv[k].why = "continuation below the chunk alignment"; continue; }
+                if (kk <= 0) { rv[k].why = "continuation: the round's time budget is spent"; continue; }
             } else {
                 /* L264: the final chunk stops at the last grid point inside it,
                  * which the bank keeps as a checkpoint (note_prefilled); the
@@ -2528,6 +2552,7 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n, int quantum_
             c->state = SLOT_PREFILLING;
             n_fin += fr[n_fr].fin ? 1 : 0;
             pf_rows += (uint32_t)kk;
+            pf_cost_ms += pulsar_engine_fused_cost_ms(s->engine, (uint32_t)kk, (uint32_t)p0);
             n_fr++;
         }
         /* ---- L301: the verify pick (spec_pick_rows): every (bank, position) by its drafter's survival -- the
@@ -2751,6 +2776,16 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n, int quantum_
                 g->phase = GEN_FINISH;
             }
             break;
+        }
+
+        /* L304: the fused forward's wall against its prompt runs -- the fit the next continuation chunk is cut by */
+        if (n_fr > 0) {
+            uint32_t fq[PULSAR_SESSION_POOL_CAP], fc[PULSAR_SESSION_POOL_CAP];
+            for (int r = 0; r < n_fr; r++) {
+                fq[r] = (uint32_t)fr[r].k;
+                fc[r] = (uint32_t)fr[r].p0;
+            }
+            pulsar_engine_fused_cost_observe(s->engine, (uint32_t)n_fr, fq, fc, (fwd_t1 - fwd_t0) * 1e3);
         }
 
         /* ---- L260 fusion: each riding chunk joins its bank (checkpoint +

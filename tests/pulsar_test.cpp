@@ -4683,6 +4683,38 @@ static void test_verify_pick(void) {
     test_l301_chain_pick();
 }
 
+/* L304: the fused step's cost fit and the chunk solved from it (verify_curve.cpp).  Rounds whose forward is
+ * 30 + 0.4 ms a prompt row + 2e-6 ms an attention pair, over chunks of 128..2048 rows at contexts 0..60k, refit to
+ * those terms; the chunk is the largest the budget holds (the quadratic's root), the riders' spent cost and the fixed
+ * term come off the budget; with no fit there is no number. */
+static void test_fused_chunk(void) {
+    pulsar_engine *e = (pulsar_engine *)calloc(1, sizeof(pulsar_engine));
+    uint32_t rows = 0;
+    TEST_ASSERT(!pulsar_engine_fused_chunk(e, 1000u, 0.0, 500.0, &rows) && rows == 0u);
+    TEST_ASSERT(pulsar_engine_fused_cost_ms(e, 512u, 0u) == 0.0);
+    for (uint32_t i = 0; i < 64; i++) {
+        const uint32_t q[2] = {128u * (1u + i % 16u), 256u};
+        const uint32_t c[2] = {4096u * (i % 15u), 1024u};
+        const uint32_t n = i % 3u == 0u ? 2u : 1u;
+        double y = 30.0;
+        for (uint32_t r = 0; r < n; r++) y += 0.4 * q[r] + 2e-6 * q[r] * (c[r] + 0.5 * q[r]);
+        pulsar_engine_fused_cost_observe(e, n, q, c, y);
+    }
+    const pulsar_fused_cost_fit &f = e->fused_cost;
+    TEST_ASSERT(f.valid && fabs(f.a_ms - 30.0) < 0.05 && fabs(f.alpha_ms - 0.4) < 1e-4 && fabs(f.beta_ms - 2e-6) < 1e-9);
+    /* at 60k of context, 500 ms: 30 + 0.4 q + 2e-6 q (60000 + q / 2) <= 500 */
+    TEST_ASSERT(pulsar_engine_fused_chunk(e, 60000u, 0.0, 500.0, &rows));
+    const double at = 30.0 + 0.4 * rows + 2e-6 * rows * (60000.0 + 0.5 * rows);
+    const double next = 30.0 + 0.4 * (rows + 1) + 2e-6 * (rows + 1) * (60000.0 + 0.5 * (rows + 1));
+    TEST_ASSERT(at <= 500.0 + 1e-6 && next > 500.0 - 0.05);
+    /* a rider already took 200 ms: less room; the budget spent: nothing */
+    uint32_t less = 0;
+    TEST_ASSERT(pulsar_engine_fused_chunk(e, 60000u, 200.0, 500.0, &less) && less < rows && less > 0u);
+    TEST_ASSERT(pulsar_engine_fused_chunk(e, 60000u, 480.0, 500.0, &less) && less == 0u);
+    TEST_ASSERT(fabs(pulsar_engine_fused_cost_ms(e, 512u, 1000u) - (0.4 * 512 + 2e-6 * 512 * (1000 + 256))) < 1e-3);
+    free(e);
+}
+
 /* L263 / L284: the lane cost fit (both decode lanes').  A linear step cost with
  * spread row counts fits to its terms; too few steps, one row count, or a
  * non-positive term is not a price (valid stays false) -- though one row count
@@ -4925,6 +4957,7 @@ static const pulsar_test_entry test_entries[] = {
     {"--lib-think", "lib-think", "shared <think> scanner: split tags, hold-back, spacing, seeded state", test_lib_think_scan},
     {"--attn-layout", "attn-layout", "CSA2 attention layout table: modes + sources derived from the V4.1 source sets (L218)", test_attn_layout_table},
     {"--lane-cost", "lane-cost", "lane cost fit: a step's measured cost to its terms, its centre, or no price at all (L263, L284)", test_lane_cost_fit},
+    {"--fused-chunk", "fused-chunk", "the fused step's cost fit and the continuation chunk solved from a time budget (L304)", test_fused_chunk},
     {"--verify-pick", "verify-pick", "the verify pick: the brute-force argmax on a staircase curve, the robust online correction, the lockstep continuation (L301)", test_verify_pick},
     {"--lib-image-rope", "lib-image-rope", "multi-axis rope positions from the image records vs HF get_rope_index (L268)", test_lib_image_rope},
     {"--lib-image-identity", "lib-image-identity", "the core image identity: records per block, rewind keeps survivors, a chain persists past a block only with its record (L281)", test_lib_image_identity},
