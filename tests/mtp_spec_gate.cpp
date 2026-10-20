@@ -377,7 +377,7 @@ static void batched_lane(pulsar_engine *e, const std::vector<pulsar_tokens> &P, 
             const uint32_t all = st[i].n_rows >= 32u ? ~0u : (1u << st[i].n_rows) - 1u;
             crossing += st[i].n_rows > 1u && st[i].greedy_rows != 0u && st[i].greedy_rows != all;
         }
-        ok = pulsar_session_spec_round_end_batch(s, st, m, logits.data()) == 0;
+        ok = pulsar_session_spec_round_end_batch(s, st, m) == 0;
         for (int i = 0; ok && i < m; i++) {
             ok = st[i].status == PULSAR_SPEC_STEP_OK;
             if (!ok) { snprintf(err, sizeof err, "round_end bank %u: %s", st[i].bank, st[i].err); break; }
