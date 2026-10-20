@@ -1945,6 +1945,14 @@ server-live-gate: pulsar-server
 	  python3 tests/server_abandon_live.py $$m --binary ./pulsar-server || rc=1; \
 	done; exit $$rc
 
+# L280: a prompt's KV is admitted against the 2b guard's budget before it lands (spill first / wait for a busy bank /
+# 503), never past it into memory pressure.  A real server on a SMALL model (the guard's budget lowered through its
+# test hook to 2.2 conversations), so it fits beside a running production server; ~2 min.  Family-neutral.
+KV_ADMISSION_MODEL ?= /mnt/models/nemotron35-mini-pulsar
+.PHONY: server-kv-admission-live
+server-kv-admission-live: pulsar-server
+	python3 tests/server_kv_admission_live.py $(KV_ADMISSION_MODEL) --binary ./pulsar-server
+
 cuda-spec-width-gate: pulsar
 	python3 tests/spec_verify_width_gate.py $(FRONTIER_MODEL) --binary ./pulsar
 

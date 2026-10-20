@@ -2318,6 +2318,9 @@ struct job {
      * jobs are memset to zero at creation, so that is the natural initial
      * value. */
     provision_refusal refusal_counted;
+    /** The routing line last logged for this job (L280): a head the worker re-routes every quantum while it waits
+     * (the KV admission's WAIT) logs its route once per distinct decision, not once per attempt.  0 = none yet. */
+    uint64_t route_logged;
 };
 
 
