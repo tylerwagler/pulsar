@@ -620,6 +620,26 @@ session_slot *server::choose_slot_for_job(job *j, int *reject_ctx,
                    best->bank, best_common, best_score, frontier, prefilled, anchor, j->req.prompt.len,
                    in_place ? "in place" : "fresh preferred");
     if (in_place) return best;
+    /* L280: a fresh bank is preferred to keep the best bank's conversation -- but the prompt's KV lands in it, and
+     * when that cannot fit the resident-KV budget even by spilling idle banks (prompt_kv_check on an empty bank),
+     * continuing on the best bank reuses its resident pages instead (the same clobber the pool-exhausted fallback
+     * below takes; gen_begin persists the displaced history first).  Only when THAT fits. */
+    if (best) {
+        int order[PULSAR_SESSION_POOL_CAP], n_spill = 0;
+        uint64_t need_fresh = 0, need_best = 0;
+        const prompt_kv_verdict vf = s->prompt_kv_check(NULL, j, order, &n_spill, &need_fresh);
+        if (vf == PROMPT_KV_WAIT || vf == PROMPT_KV_REFUSE) {
+            const prompt_kv_verdict vb = s->prompt_kv_check(best, j, order, &n_spill, &need_best);
+            if (vb == PROMPT_KV_FITS || vb == PROMPT_KV_SPILL) {
+                server_log(PULSAR_LOG_KVCACHE,
+                           "pulsar-server: route: a fresh bank would add %.2f GiB of KV past the budget; continuing "
+                           "on bank %u instead (it adds %.2f GiB)", (double)need_fresh / (1024.0 * 1024.0 * 1024.0),
+                           best->bank, (double)need_best / (1024.0 * 1024.0 * 1024.0));
+                *clobbers = true;
+                return best;
+            }
+        }
+    }
     session_slot *fresh = s->provision_slot(s->provision_ctx_for_job(j), refusal);
     /* Pool full of idle stale banks: without eviction HERE, every new
      * conversation falls through to the same bank and clobbers it serially
@@ -1220,6 +1240,26 @@ bool server::worker_try_bind() {
          * owner slot (refusal stays PROVISION_OK there). */
         s->note_provision_refusal(j, refusal);
         return false;
+    }
+    /* L280: the prompt's KV must fit the resident-KV budget before its prefill or chain load starts (the guard
+     * only watches decode quanta): spill idle banks, or keep the head queued for a busy one, or answer 503 --
+     * never bind it into memory pressure. */
+    {
+        bool kv_refused = false;
+        if (!s->prompt_kv_admit(sl, j, &kv_refused)) {
+            if (!kv_refused) return false;
+            pthread_mutex_lock(&s->mu);
+            s->head = j->next;
+            if (!s->head) s->tail = NULL;
+            if (s->n_queued > 0) s->n_queued--;
+            pthread_mutex_unlock(&s->mu);
+            j->next = NULL;
+            pthread_mutex_lock(&j->mu);
+            j->done = true;
+            pthread_cond_signal(&j->cv);
+            pthread_mutex_unlock(&j->mu);
+            return true;
+        }
     }
 
     pthread_mutex_lock(&s->mu);
@@ -1896,6 +1936,109 @@ static int guard_victim_order(server *s, session_slot **dec, int n, int *order) 
         m++;
     }
     return m;
+}
+
+/* L280: the prompt's KV admission, as arithmetic.  touched = the pool's resident KV now, delta = what binding the
+ * job adds (its bank's growth to the prompt's length), bound = the guard's budget, drop[] = the idle victims'
+ * resident bytes in spill order.  FITS when touched + delta <= bound; SPILL (*n_spill victims, the minimum,
+ * guard_spill_plan's law) when spilling makes it fit; else WAIT when a busy bank will become a victim once its job
+ * ends (busy_may_free), else REFUSE.  A prompt whose growth alone is past the bound is REFUSE at once: no spill or
+ * wait ever makes it fit.  Spilling is never planned when it cannot make the prompt fit (a spill that does not
+ * clear the breach only churns the disk). */
+static prompt_kv_verdict server_prompt_kv_verdict(uint64_t touched, uint64_t delta, uint64_t bound,
+                                                  const uint64_t *drop, int n_victims, bool busy_may_free,
+                                                  int *n_spill) {
+    *n_spill = 0;
+    /* a job that adds nothing (a continuation on its own resident bank) never waits on a breach it did not cause */
+    if (delta == 0 || touched + delta <= bound) return PROMPT_KV_FITS;
+    if (delta > bound) return PROMPT_KV_REFUSE;
+    const int k = guard_spill_plan(touched, delta, bound, drop, n_victims);
+    uint64_t t = touched;
+    for (int i = 0; i < k; i++) t = drop[i] >= t ? 0 : t - drop[i];
+    if (k > 0 && t + delta <= bound) {
+        *n_spill = k;
+        return PROMPT_KV_SPILL;
+    }
+    return busy_may_free ? PROMPT_KV_WAIT : PROMPT_KV_REFUSE;
+}
+
+prompt_kv_verdict server::prompt_kv_check(const session_slot *sl, const job *j, int *order, int *n_spill,
+                                          uint64_t *need) {
+    auto *s = this;
+    *n_spill = 0;
+    *need = 0;
+    if (!s->guard_enabled || s->pool_banks <= 0) return PROMPT_KV_FITS;
+    pulsar_session *pool = s->sess;
+    const int len = j->req.prompt.len > 0 ? j->req.prompt.len : 0;
+    const uint64_t want = pulsar_session_quantum_growth_bytes_per_bank(pool, (uint32_t)len);
+    const uint64_t have = sl ? pulsar_session_bank_touched_kv_bytes(pool, sl->bank) : 0;   /* NULL: an empty bank */
+    *need = want > have ? want - have : 0;
+    /* the victims: every idle bank but the job's own (guard_pick_victim's filter: never bank 0, never a bound or
+     * spilled bank) */
+    session_slot *self[1] = {(session_slot *)sl};
+    const int n_victims = guard_victim_order(s, self, sl ? 1 : 0, order);
+    uint64_t drop[PULSAR_SESSION_POOL_CAP];
+    for (int k = 0; k < n_victims; k++) drop[k] = pulsar_session_bank_touched_kv_bytes(pool, s->slots[order[k]].bank);
+    /* a bank bound to a job now is a victim once that job ends (bank 0 never is) */
+    bool busy = false;
+    for (int i = 1; i < s->n_slots && !busy; i++)
+        busy = &s->slots[i] != sl && s->slots[i].provisioned && !s->slots[i].spilled && s->slots[i].active_job;
+    return server_prompt_kv_verdict(pulsar_session_touched_kv_bytes(pool), *need, s->guard_touched_budget, drop,
+                                    n_victims, busy, n_spill);
+}
+
+bool server::prompt_kv_admit(session_slot *sl, job *j, bool *refused) {
+    auto *s = this;
+    *refused = false;
+    int order[PULSAR_SESSION_POOL_CAP];
+    int n_spill = 0;
+    uint64_t need = 0;
+    const prompt_kv_verdict v = s->prompt_kv_check(sl, j, order, &n_spill, &need);
+    if (v == PROMPT_KV_FITS) return true;
+    pulsar_session *pool = s->sess;
+    const double gib = 1024.0 * 1024.0 * 1024.0;
+    const uint64_t touched = pulsar_session_touched_kv_bytes(pool);
+    if (v == PROMPT_KV_SPILL) {
+        server_log(PULSAR_LOG_DEFAULT,
+                   "pulsar-server: kv admission: a %d-token prompt adds %.2f GiB of KV to bank %u (resident %.2f + "
+                   "%.2f > budget %.2f GiB): spilling %d idle bank(s) first",
+                   j->req.prompt.len, (double)need / gib, sl->bank, (double)touched / gib, (double)need / gib,
+                   (double)s->guard_touched_budget / gib, n_spill);
+        for (int k = 0; k < n_spill; k++) {
+            if (!s->spill_bank(&s->slots[order[k]])) break;
+            s->count_metric(&s->m_spills);
+        }
+        /* a spill that failed leaves the breach: decide again on what is resident now */
+        uint64_t again = 0;
+        int n2 = 0;
+        const prompt_kv_verdict v2 = s->prompt_kv_check(sl, j, order, &n2, &again);
+        if (v2 == PROMPT_KV_FITS) return true;
+        if (v2 != PROMPT_KV_REFUSE) {
+            s->note_provision_refusal(j, PROVISION_REFUSED_KV_TOUCHED);
+            return false;
+        }
+    } else if (v == PROMPT_KV_WAIT) {
+        if (j->refusal_counted != PROVISION_REFUSED_KV_TOUCHED)   /* once per job (rule 9): the worker retries it */
+            server_log(PULSAR_LOG_WARNING,
+                       "pulsar-server: kv admission: a %d-token prompt adds %.2f GiB of KV to bank %u (resident %.2f + "
+                       "%.2f > budget %.2f GiB) and no idle bank can be spilled: queued until a busy bank's job ends",
+                       j->req.prompt.len, (double)need / gib, sl->bank, (double)touched / gib, (double)need / gib,
+                       (double)s->guard_touched_budget / gib);
+        s->note_provision_refusal(j, PROVISION_REFUSED_KV_TOUCHED);
+        return false;
+    }
+    char msg[512];
+    snprintf(msg, sizeof msg,
+             "not enough KV memory for this prompt now: its %d tokens need %.2f GiB of KV beside %.2f GiB the server "
+             "keeps resident (budget %.2f GiB), and no idle conversation can be moved to disk to make room; retry "
+             "later or shorten the prompt",
+             j->req.prompt.len, (double)need / gib, (double)touched / gib, (double)s->guard_touched_budget / gib);
+    server_log(PULSAR_LOG_WARNING, "pulsar-server: kv admission REFUSED (503): %s", msg);
+    s->note_provision_refusal(j, PROVISION_REFUSED_KV_TOUCHED);
+    *refused = true;
+    if (j->req.api == API_ANTHROPIC) http_error_anthropic(j->fd, 503, msg);
+    else http_error_retry(j->fd, 503, msg, HTTP_RETRY_GOING_AWAY_S);
+    return false;
 }
 
 void server::guard_maybe_evict(session_slot **dec, int n) {
