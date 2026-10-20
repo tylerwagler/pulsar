@@ -2524,6 +2524,15 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n, int quantum_
             const int left = pg->prompt_for_sync->len - p0;
             if (left <= 0) { rv[k].why = "nothing left"; continue; }
             int kk = left < (int)(fuse_rows - pf_rows) ? left : (int)(fuse_rows - pf_rows);
+            /* L304: a prompt's tail rides whole -- it brings the first token forward -- as long as it alone fits the
+             * round's time budget; a longer tail (the last ~4k rows of a long prompt: a multi-second round) is a
+             * continuation like the rest of the prompt */
+            if (kk == left) {
+                uint32_t alone = 0;
+                if (pulsar_engine_fused_chunk(s->engine, (uint32_t)p0, 0.0, round_budget_ms, &alone) &&
+                    (uint32_t)kk > std::max(alone, (uint32_t)PULSAR_SERVER_FUSED_CHUNK_ALIGN))
+                    kk = (int)std::max(alone, (uint32_t)PULSAR_SERVER_FUSED_CHUNK_ALIGN);
+            }
             if (kk < left) {
                 if (!long_ok) { rv[k].why = "continuation waits for a full quantum's first round"; continue; }
                 /* L304: the widest chunk the round's time budget holds, on the measured cost; one alignment step at
