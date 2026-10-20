@@ -917,17 +917,18 @@ __global__ void __launch_bounds__(SLOT_THREADS) sample_slots_kernel(const __grid
  *
  * The host routes these rows here (their path follows from the knobs alone): the row's (desc key, id) pairs sorted
  * by the device radix sort (stable, so ascending id on ties -- the host's order; a non-finite value keys ~0 and sorts
- * last), the probabilities over the GPU, the serial sum and the cut on one thread over staged tiles, the race over
- * the GPU (each chunk's first minimum, then the first minimum of those).  Rows go FULL_GROUP at a time, one scratch
+ * last), the probabilities over the GPU, the serial sum on one thread over staged tiles (stopped where the sum
+ * saturates), the cut as a search over its prefixes and the race over the GPU (each chunk's first minimum, then the
+ * first minimum of those).  Rows go FULL_GROUP at a time, one scratch
  * slot each. */
 
 constexpr uint32_t FULL_GROUP = SMP_SLOTS;
 constexpr uint32_t FULL_TILE = 4096;
 
-/* a full-arm row's state: the cut, and each race chunk's first minimum */
+/* a full-arm row's state: the sum and where it saturated, the cut, each race chunk's first minimum */
 struct full_state {
-    uint32_t f, status;
-    float rf;
+    uint32_t n, f, status, n_sat;
+    float sum;
     double pbest[PREP_CHUNKS];
     uint32_t pidx[PREP_CHUNKS];
 };
@@ -943,11 +944,12 @@ struct full_group {
     uint32_t sorted_in_alt;
 };
 
-/* a slot's arrays: keys and ids in (keygen), the sorted ids, the probabilities in sorted order, the row's state */
+/* a slot's arrays: keys and ids in (keygen), the sorted ids, the probabilities in sorted order, their prefix sums
+ * (in the first key buffer: the keys are dead once sorted), the row's state */
 struct full_slot {
     uint32_t *k_in, *v_in;
     const uint32_t *ids;
-    float *p;
+    float *p, *prefix;
     full_state *st;
 };
 
@@ -959,6 +961,7 @@ __device__ __forceinline__ full_slot full_slot_of(const launch_args &a, const fu
     s.v_in = v0;
     s.ids = g.sorted_in_alt ? v1 : v0;
     s.p = (float *)(v1 + a.n_vocab);
+    s.prefix = (float *)k0;
     s.st = (full_state *)(base + full_state_off(a.n_vocab));
     return s;
 }
@@ -995,64 +998,101 @@ __global__ void __launch_bounds__(PREP_THREADS) full_probs_kernel(const __grid_c
         s.p[i] = plm_expf(__fmul_rn(__fsub_rn(rv(s.ids[i]), maxlogit), p.rcpT));
 }
 
-/* the serial sum over every candidate in sorted order, then the cut -- one thread, the tiles staged by the block */
-__global__ void __launch_bounds__(SMP_THREADS) full_cut_kernel(const __grid_constant__ launch_args a, const full_group g,
-                                                               const row_prep *prep) {
+/* An add the running sum cannot see: p under a quarter of the sum's ulp rounds away (under half would do), and so does
+ * every later one -- the candidates descend, and expf's error (under an ulp) cannot lift a later p past twice this
+ * one; the sum only grows.  So the chain stops there exactly: every later prefix is the sum's final value. */
+__device__ __forceinline__ bool sum_saturated(float fs, float p) {
+    const uint32_t e = (__float_as_uint(fs) >> 23) & 0xffu;
+    return e < 255u && e > 25u && p < __uint_as_float((e - 25u) << 23);
+}
+
+/* THE serial sum, in sorted order (the host's float accumulation): one thread over tiles the block stages, every
+ * prefix kept (the cut reads them), stopped where the sum saturates */
+__global__ void __launch_bounds__(SMP_THREADS) full_chain_kernel(const __grid_constant__ launch_args a,
+                                                                 const full_group g, const row_prep *prep) {
     __shared__ __align__(16) float tile[FULL_TILE];
     __shared__ float acc;
-    __shared__ uint32_t stop;
+    __shared__ uint32_t n_sat;
     const uint32_t j = blockIdx.x, tid = threadIdx.x;
     const uint32_t row = g.row[j];
-    const row_plan p = plan_row(a.req[row], a.n_vocab);
     const full_slot s = full_slot_of(a, g, j);
     const uint32_t n = prep[row].n_fin;
     if (tid == 0) {
         a.out[row].probe_p = 0.0f;
         s.st->status = n == 0 ? PULSAR_GPU_SAMPLE_REFUSED_EMPTY : PULSAR_GPU_SAMPLE_OK;
+        s.st->n = n;
+        s.st->f = n;   /* the cut's default: every candidate; the search lowers it */
         acc = 0.0f;
+        n_sat = n;
     }
     if (n == 0) return;
     __syncthreads();
-    for (uint32_t b = 0; b < n; b += FULL_TILE) {
-        const uint32_t m = min(FULL_TILE, n - b);
-        for (uint32_t i = tid; i < m; i += SMP_THREADS) tile[i] = s.p[b + i];
-        __syncthreads();
-        if (tid == 0) acc = serial_sum_from(acc, tile, m);
-        __syncthreads();
-    }
-    const float sum = acc;
-    if (!(sum > 0.0f) || !finite_bits(sum)) {
-        if (tid == 0) s.st->status = PULSAR_GPU_SAMPLE_REFUSED_MASS;
-        return;
-    }
-    /* the cut, the host's loop: the floor p0 * min_p (min_p <= 1e-30 here: only a subnormal tail falls under it),
-     * the top-p test against the full sum */
-    const float min_e = __fmul_rn(s.p[0], p.min_p), rs = __fdiv_rn(1.0f, sum);
-    __syncthreads();   /* every thread has read the sum */
-    if (tid == 0) { acc = 0.0f; stop = 0; }
-    uint32_t f = 0;
-    __syncthreads();
-    for (uint32_t b = 0; b < n && !stop; b += FULL_TILE) {
+    for (uint32_t b = 0; b < n_sat; b += FULL_TILE) {
         const uint32_t m = min(FULL_TILE, n - b);
         for (uint32_t i = tid; i < m; i += SMP_THREADS) tile[i] = s.p[b + i];
         __syncthreads();
         if (tid == 0) {
             float fs = acc;
-            for (uint32_t i = 0; i < m; i++) {
-                const float pr = tile[i];
-                if (b + i > 0 && pr < min_e) { stop = 1; break; }
-                fs = __fadd_rn(fs, pr);
-                f++;
-                if (__fmul_rn(fs, rs) >= p.top_p) { stop = 1; break; }
+            uint32_t i = 0;
+            for (; i + 4u <= m; i += 4u) {   /* the tile and the prefixes are 16-byte aligned (b, i multiples of 4) */
+                const float4 x = *reinterpret_cast<const float4 *>(tile + i);
+                float4 y;
+                y.x = __fadd_rn(fs, x.x);
+                y.y = __fadd_rn(y.x, x.y);
+                y.z = __fadd_rn(y.y, x.z);
+                y.w = __fadd_rn(y.z, x.w);
+                *reinterpret_cast<float4 *>(s.prefix + b + i) = y;
+                fs = y.w;
+                if (sum_saturated(fs, x.w)) { n_sat = b + i + 4u; break; }
             }
+            if (n_sat == n)
+                for (; i < m; i++) {
+                    fs = __fadd_rn(fs, tile[i]);
+                    s.prefix[b + i] = fs;
+                }
             acc = fs;
         }
         __syncthreads();
     }
     if (tid == 0) {
-        s.st->f = f;
-        s.st->rf = __fdiv_rn(1.0f, acc);
+        s.st->sum = acc;
+        s.st->n_sat = n_sat;
+        if (!(acc > 0.0f) || !finite_bits(acc)) s.st->status = PULSAR_GPU_SAMPLE_REFUSED_MASS;
     }
+}
+
+/* the prefix after candidate i (past the saturation point: the sum) */
+__device__ __forceinline__ float full_prefix(const full_slot &s, uint32_t i) {
+    return i < s.st->n_sat ? s.prefix[i] : s.st->sum;
+}
+
+/* the cut, the host's loop as a search: it stops before the first i > 0 under the floor p0 * min_p (min_p <= 1e-30
+ * here: only a subnormal tail is under it), or after the first i whose prefix * (1 / sum) reaches top_p -- the
+ * smallest such stop over the row */
+__global__ void __launch_bounds__(PREP_THREADS) full_cut_kernel(const __grid_constant__ launch_args a,
+                                                                const full_group g) {
+    __shared__ uint32_t red[PREP_THREADS];
+    const uint32_t j = blockIdx.y, c = blockIdx.x, tid = threadIdx.x;
+    const uint32_t row = g.row[j];
+    const row_plan p = plan_row(a.req[row], a.n_vocab);
+    const full_slot s = full_slot_of(a, g, j);
+    if (s.st->status != PULSAR_GPU_SAMPLE_OK) return;
+    const uint32_t n = s.st->n;   /* not f: the other blocks lower it meanwhile */
+    const float min_e = __fmul_rn(s.p[0], p.min_p), rs = __fdiv_rn(1.0f, s.st->sum);
+    uint32_t lo, hi;
+    prep_chunk(n, c, &lo, &hi);
+    uint32_t stop = UINT32_MAX;
+    for (uint32_t i = lo + tid; i < hi; i += PREP_THREADS) {   /* i rises: this thread's first stop is its least */
+        if (i > 0 && s.p[i] < min_e) { stop = i; break; }
+        if (__fmul_rn(full_prefix(s, i), rs) >= p.top_p) { stop = i + 1u; break; }
+    }
+    red[tid] = stop;
+    __syncthreads();
+    for (uint32_t off = PREP_THREADS / 2u; off > 0; off >>= 1) {
+        if (tid < off) red[tid] = min(red[tid], red[tid + off]);
+        __syncthreads();
+    }
+    if (tid == 0 && red[0] != UINT32_MAX) atomicMin(&s.st->f, red[0]);
 }
 
 /* the race over the emitted candidates, each chunk's first strict minimum */
@@ -1069,8 +1109,8 @@ __global__ void __launch_bounds__(PREP_THREADS) full_race_kernel(const __grid_co
     double best = __longlong_as_double(0x7ff0000000000000ll);
     uint32_t besti = UINT32_MAX;
     if (s.st->status == PULSAR_GPU_SAMPLE_OK) {
-        const uint32_t f = s.st->f;
-        const float rf = s.st->rf;
+        const uint32_t f = s.st->f;   /* >= 1: the first candidate is always taken */
+        const float rf = __fdiv_rn(1.0f, full_prefix(s, f - 1u));
         uint32_t lo, hi;
         prep_chunk(f, c, &lo, &hi);
         for (uint32_t i = lo + tid; i < hi; i += PREP_THREADS) {
@@ -1386,7 +1426,8 @@ int pulsar_gpu_sample_rows(const pulsar_gpu_tensor *logits, uint64_t logits_offs
             g.sorted_in_alt = vb.selector;
         }
         full_probs_kernel<<<dim3(PREP_CHUNKS, g.n), PREP_THREADS>>>(a, g, prep);
-        full_cut_kernel<<<g.n, SMP_THREADS>>>(a, g, prep);
+        full_chain_kernel<<<g.n, SMP_THREADS>>>(a, g, prep);
+        full_cut_kernel<<<dim3(PREP_CHUNKS, g.n), PREP_THREADS>>>(a, g);
         full_race_kernel<<<dim3(PREP_CHUNKS, g.n), PREP_THREADS>>>(a, g);
         full_final_kernel<<<g.n, 32>>>(a, g);
         if (!cuda_ok(cudaGetLastError(), "device sampler full arm")) return 0;
