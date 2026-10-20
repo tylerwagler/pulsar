@@ -752,8 +752,12 @@ bool gpu_graph_verify_suffix(
     /* The verify block's rows are DECODE rows (the continuation token and the
      * drafts under test): every GEMM and MoE tier below takes the
      * M-independent arms whatever n_tokens is (L167; until then row count
-     * chose, so a 5..16-row block took cuBLASLt).  Restored on return. */
-    pulsar_decode_rows_scope rows(n_tokens);
+     * chose, so a 5..16-row block took cuBLASLt).  Restored on return.  The
+     * cap is the verify slab's, as the batched verify's (gpu_diag.cpp): since
+     * L288 C1 a round carries up to 32 rows -- a copy round's 16 drafts and
+     * its base are 17 -- and past 16 the decode arms block them (step_driver.h
+     * PULSAR_DRIVER_HEADS_MAX).  The 16-row default refused that round. */
+    pulsar_decode_rows_scope rows(n_tokens, PULSAR_SPEC_LOGITS_ROWS);
     if (!rows.ok()) return false;
 
     bool ok = gpu_graph_upload_prompt_tokens(g->prefill_tokens, prompt, start, n_tokens);
