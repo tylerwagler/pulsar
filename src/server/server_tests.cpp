@@ -3863,6 +3863,60 @@ static void test_l303_round_masks_match_plain(void) {
     l303_server_free(&srv);
 }
 
+/* L309: a pending chain is cut at its first draft the grammar refuses -- exactly where the round's masked walk would
+ * stop (gen_constrain_round's masks: the row before it leaves it out) -- a stop draft is its chain's last, the gate
+ * is back where it was, and a request with no gate keeps its chain whole. */
+static void test_l309_draft_prefix(void) {
+    l303_vocab v;
+    server srv;
+    l303_server(&srv, v);
+    const uint32_t W = gen_constrain_words(&srv);
+    struct pcase { const char *round; int stop_at; int want; };
+    const pcase cases[] = {
+        {"tion=search>\n<param", -1, 18},   /* legal throughout */
+        {"tion=sx>\n", -1, 5},              /* 'x' refused after "tion=s" */
+        {"tion=search>\n<param", 3, 4},     /* a stop as draft 3 (ever legal or not): the chain's last */
+        {"tx", -1, 0},                      /* the first draft refused */
+    };
+    for (const pcase &pc : cases) {
+        job j;
+        memset(&j, 0, sizeof j);
+        char err[300];
+        TEST_ASSERT(l303_request(&srv, PULSAR_CHAT_QWEN, API_OPENAI, L303_BODY(""), &j.req, err, sizeof err));
+        gen_state g;
+        TEST_ASSERT(l303_begin(&srv, &j, &g));
+        const std::string head = "ok</think>\n\n<tool_call>\n<func";
+        TEST_ASSERT(l303_feed(&srv, &g, head) == head.size());
+        std::vector<int32_t> toks;
+        for (char c : std::string(pc.round)) toks.push_back((uint8_t)c);
+        if (pc.stop_at >= 0) toks[(size_t)pc.stop_at + 1u] = v.stop;
+        const int n = (int)toks.size() - 1;
+        const int got = gen_constrain_draft_prefix(&srv, &g, toks[0], toks.data() + 1, n);
+        if (got != pc.want) fprintf(stderr, "l309 \"%s\": prefix %d, want %d\n", pc.round, got, pc.want);
+        TEST_ASSERT(got == pc.want);
+        /* the gate is back: the next draw's mask still takes the base, and the round's masks agree with the cut */
+        TEST_ASSERT(l303_allows(&srv, &g, 't') && !l303_allows(&srv, &g, 'x'));
+        if (pc.stop_at < 0) {
+            std::vector<int> rt(toks.begin(), toks.end());
+            const uint32_t *masks = NULL;
+            const int rows = gen_constrain_round(&srv, &g, rt.data(), (int)rt.size(), false, &masks);
+            TEST_ASSERT(rows == (int)rt.size() && masks);
+            int walk = 0;   /* the drafts the masked walk can accept: row i takes draft i */
+            while (walk < n && ((masks[(size_t)walk * W + ((uint32_t)rt[(size_t)walk + 1u] >> 5)] >>
+                                 ((uint32_t)rt[(size_t)walk + 1u] & 31u)) & 1u))
+                walk++;
+            TEST_ASSERT(walk == got);
+        }
+        l303_end(&j, &g);
+    }
+    /* no gate: the chain whole */
+    gen_state g;
+    memset(&g, 0, sizeof g);
+    const int32_t d[3] = {'a', 'b', 'c'};
+    TEST_ASSERT(gen_constrain_draft_prefix(&srv, &g, 'z', d, 3) == 3);
+    l303_server_free(&srv);
+}
+
 /* L303: the protocols' format fields and the Responses forced tool_choice. */
 static void test_l303_protocol_fields(void) {
     response_format_spec f = {};
@@ -9700,6 +9754,7 @@ static void pulsar_server_unit_tests_run(void) {
     test_l303_forced_call_grammar();
     test_l303_response_format_answer();
     test_l303_round_masks_match_plain();
+    test_l309_draft_prefix();
     test_l303_protocol_fields();
     test_qwen_payload_is_sampled_structure_greedy();
     test_qwen_tool_error_suffix_reminds_the_system_turn();

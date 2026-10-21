@@ -870,18 +870,21 @@ uint32_t pulsar_session_spec_next_rows_max(const pulsar_session *s);
  * pulsar_session_spec_round_end the bank's frontier must equal this plus the
  * accepted count it returned (L155); the server checks exactly that. */
 int pulsar_spec_round_saved_len(const pulsar_spec_round *r);
-/* L049 adaptive per-bank K: bank `bank`'s pending-draft confidences from the
- * SAVED carry -- no bank switch, valid at sweep start where every bank was
- * saved at the previous round's end. Writes up to 16 per-position acceptance
- * confidences to out[] and returns the pending count (0 = no saved state or
- * no pendings; the bank still gets its base row). The allocation these feed
- * is an UPPER bound on K -- round_begin's own validity trims still apply. */
 /** L112: the adaptive draft controller's current depth for a bank (live state
  * for the live bank, saved carry otherwise; bank 0 in bankless sessions).
  * 0 = no drafter / nothing valid. Pure host read for metrics/monitoring. */
 int pulsar_session_bank_spec_depth(pulsar_session *s, uint32_t bank);
-uint32_t pulsar_session_bank_pending_confs(const pulsar_session *s, uint32_t bank,
-                                        float out[16]);
+/** L049 adaptive per-bank K: bank `bank`'s pending drafts from the SAVED carry
+ * -- no bank switch, valid at sweep start where every bank was saved at the
+ * previous round's end.  Writes the base token they continue (*base: the
+ * round uses them only when its base is this one), up to 16 draft tokens to
+ * tok[] and their per-position acceptance confidences to conf[], and returns
+ * the pending count (0 = no saved state or no pendings; the bank still gets
+ * its base row).  The allocation these feed is an UPPER bound on K --
+ * round_begin's own validity trims still apply.  L309: the tokens are what the
+ * server's grammar gate prunes a chain by before the pick. */
+uint32_t pulsar_session_bank_pendings(const pulsar_session *s, uint32_t bank, int32_t *base, int32_t tok[16],
+                                      float conf[16]);
 /** The carry-or-sample base draw (the head of generate_speculative). Never
  * returns EOS handling -- the caller checks and short-circuits like
  * generate_speculative does.  A fresh draw reads the stream's next key and

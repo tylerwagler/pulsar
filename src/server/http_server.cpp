@@ -578,6 +578,11 @@ bool server::send_metrics(int fd) {
     buf_puts(&b, "# TYPE pulsar:spec_pick_cut_rows_total counter\n");
     buf_printf(&b, "pulsar:spec_pick_cut_rows_total %llu\n",
                (unsigned long long)s->m_spec_pick_cut_rows);
+    buf_puts(&b, "# HELP pulsar:spec_grammar_cut_rows_total Pending drafts cut at the grammar's first refusal before "
+                 "the pick (L309).\n");
+    buf_puts(&b, "# TYPE pulsar:spec_grammar_cut_rows_total counter\n");
+    buf_printf(&b, "pulsar:spec_grammar_cut_rows_total %llu\n",
+               (unsigned long long)s->m_spec_grammar_cut_rows);
     /* L301: the verify curve the pick prices with (verify_curve.cpp): the profiled forward per row count, the
      * online correction per row, and the round's measured wall outside the forward. */
     if (vc.valid) {

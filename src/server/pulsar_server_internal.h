@@ -1644,6 +1644,9 @@ struct server {
     uint64_t w_spec_pick_cut_rows;
     uint64_t m_spec_pick_cut_rows;
     bool w_spec_pick_announced;   ///< rule 5: the first priced round said the pick ran, and on what
+    /** L309: pending drafts the grammar gate cut before the pick (gen_constrain_draft_prefix). */
+    uint64_t w_spec_grammar_cut_rows;
+    uint64_t m_spec_grammar_cut_rows;
     /** L301: the engine's verify curve and the drafters' confidence calibration, as /metrics publishes them
      *  (published copies, like m_spec). */
     pulsar_verify_curve_view m_verify_curve;
@@ -2979,6 +2982,11 @@ bool gen_constrain_accept(struct server *s, struct gen_state *g, int token);
  *  written -- 0 when no row of the round is in a live region (no masks: today's bytes) -- or -1 (g->err). */
 int gen_constrain_round(struct server *s, struct gen_state *g, const int *toks, int n, bool base_emitted,
                         const uint32_t **masks);
+/** L309: how many of a pending chain's `n` drafts (after the not yet emitted `base`) can be accepted under the
+ *  grammar: the gate goes through the base and the drafts, as gen_constrain_round's walk does, and back; the first
+ *  draft it refuses -- which no masked draw can emit -- ends the chain before it is verified, and a stop draft is
+ *  its chain's last.  `n` when the request has no gate.  -1 = the gate failed (g->err). */
+int gen_constrain_draft_prefix(struct server *s, struct gen_state *g, int base, const int32_t *drafts, int n);
 /** The base draw's mask for a speculative round's assemble (live only; the gate's buffer, valid until the next
  *  call).  NULL + g->err on failure. */
 const uint32_t *gen_constrain_base_mask(struct server *s, struct gen_state *g);

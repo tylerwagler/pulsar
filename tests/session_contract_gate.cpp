@@ -1166,7 +1166,8 @@ static void part_spec_zero_draft(pulsar_engine *e, int W) {
         cs.round = r[1];
         ran = ran && pulsar_session_spec_redraft_commit_batch(s, &cs, 1) == 0 && cs.status == PULSAR_SPEC_STEP_OK;
         float conf[16];
-        const uint32_t pend = ran ? pulsar_session_bank_pending_confs(s, 1, conf) : 0u;
+        int32_t pbase, ptok[16];
+        const uint32_t pend = ran ? pulsar_session_bank_pendings(s, 1, &pbase, ptok, conf) : 0u;
         CHECK(ran && pend > 0, "S2 (beside) bank 1 holds %u drafts for the shared round: %s", pend, err);
         const uint32_t banks[2] = {0, 1};
         const int k[2] = {0, -1};
