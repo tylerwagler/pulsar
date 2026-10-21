@@ -875,6 +875,10 @@ static int spec_round_end(pulsar_session *s, pulsar_spec_round *r,
         PULSAR_NVTX("spec: draft");
         keep = spec_drafter(s)->draft(s, next_base, features_ready, carry_temp, top_k, top_p, min_p, rng);
     }
+    if (keep == PULSAR_DRAFT_REFUSED) {   /* L306: the drafter refused the next chain (its line says why) */
+        snprintf(err, errlen, "spec round: the drafter refused the next chain");
+        return -1;
+    }
     /* t0 == 0 marks a lane whose forward ran outside this round (the batched
      * lane) -- step_ms would print the epoch, so skip the line there. */
     if (dspark_stats && t0 > 0.0)
