@@ -218,11 +218,16 @@ __device__ void select_topk(const row_view &rv, uint32_t k, uint64_t *keys, uint
         const uint32_t hmask = pass == 3 ? 0u : (0xffffffffu << (sh + 8u));
         for (uint32_t d = tid; d < 256; d += THREADS) hist[d] = 0;
         __syncthreads();
-        for (uint32_t i = tid; i < rv.n; i += THREADS) {
-            const float v = rv(i);
-            if (!finite_bits(v)) continue;
-            const uint32_t dk = desc_key(v);
-            if ((dk & hmask) == (prefix & hmask)) atomicAdd(&hist[(dk >> sh) & 255u], 1u);
+        for (uint32_t base = 0; base < rv.n; base += THREADS) {   /* warp-uniform: lanes of a digit add once */
+            const uint32_t i = base + tid;
+            uint32_t dg = 256u;
+            if (i < rv.n) {
+                const float v = rv(i);
+                const uint32_t dk = desc_key(v);
+                if (finite_bits(v) && (dk & hmask) == (prefix & hmask)) dg = (dk >> sh) & 255u;
+            }
+            const uint32_t peers = __match_any_sync(0xffffffffu, dg);
+            if (dg < 256u && (tid & 31u) == (uint32_t)(__ffs(peers) - 1)) atomicAdd(&hist[dg], (uint32_t)__popc(peers));
         }
         __syncthreads();
         {   /* the digit whose cumulative count reaches `want`, and how many of the class sit below it (< 2^24): a
