@@ -1928,7 +1928,8 @@ struct pulsar_engine {
     struct pulsar_verify_curve *verify_curve;
     /** L301: the drafters' confidence calibration per draft position (pulsar_spec_calibration_note). */
     pulsar_spec_calibration spec_calibration;
-    /** L304: the fused step's prompt cost, what a continuation chunk is solved from (pulsar_engine_fused_chunk). */
+    /** L304: the fused step's measured cost, what the server's round selection prices a chunk by (L312,
+     *  pulsar_engine_fused_step_ms). */
     pulsar_fused_cost_fit fused_cost;
     char *directional_steering_file;   ///< steering-vector file path, or NULL
     float *directional_steering_dirs;  ///< loaded steering directions, or NULL

@@ -21,6 +21,7 @@
 #include "../src/server/trace.cpp"
 #include "../src/server/generate.cpp"
 #include "../src/server/server_jobs.cpp"
+#include "../src/server/sched_value.cpp"
 #include "../src/server/server_sched.cpp"
 #include "../src/server/http_server.cpp"
 #include "../src/server/cli_main.cpp"
@@ -3790,15 +3791,17 @@ static void test_verify_pick(void) {
     test_l315_tp_pick();
 }
 
-/* L304: the fused step's cost fit and the chunk solved from it (verify_curve.cpp).  Rounds whose forward is
- * 30 + 0.4 ms a prompt row + 2e-6 ms an attention pair, over chunks of 128..2048 rows at contexts 0..60k, refit to
- * those terms; the chunk is the largest the budget holds (the quadratic's root), the riders' spent cost and the fixed
- * term come off the budget; with no fit there is no number. */
-static void test_fused_chunk(void) {
+/* L304 / L312: the fused step's cost fit (verify_curve.cpp).  Rounds whose forward is 30 + 0.4 ms a prompt row +
+ * 2e-6 ms an attention pair, over chunks of 128..2048 rows at contexts 0..60k, refit to those terms; a step's
+ * predicted forward is the fixed term plus each run's; with no fit there is no number.  And the round cost the
+ * selection reads beside it on the verify curve: the profile + the correction + host + draft (its part outside the
+ * forward); rows past the profile clamp to its widest; none with no curve; a pair's leader reads its own (L315). */
+static void test_fused_cost(void) {
     pulsar_engine *e = (pulsar_engine *)calloc(1, sizeof(pulsar_engine));
-    uint32_t rows = 0;
-    TEST_ASSERT(!pulsar_engine_fused_chunk(e, 1000u, 0.0, 500.0, &rows) && rows == 0u);
-    TEST_ASSERT(pulsar_engine_fused_cost_ms(e, 512u, 0u) == 0.0);
+    double ms = 1.0, out = 1.0;
+    const uint32_t q1 = 512u, c1 = 0u;
+    TEST_ASSERT(!pulsar_engine_fused_step_ms(e, 1u, &q1, &c1, &ms) && ms == 0.0);
+    TEST_ASSERT(pulsar_engine_verify_round_ms(e, 4u, 8u, &out) == 0.0 && out == 0.0);
     for (uint32_t i = 0; i < 64; i++) {
         const uint32_t q[2] = {128u * (1u + i % 16u), 256u};
         const uint32_t c[2] = {4096u * (i % 15u), 1024u};
@@ -3809,17 +3812,243 @@ static void test_fused_chunk(void) {
     }
     const pulsar_fused_cost_fit &f = e->fused_cost;
     TEST_ASSERT(f.valid && fabs(f.a_ms - 30.0) < 0.05 && fabs(f.alpha_ms - 0.4) < 1e-4 && fabs(f.beta_ms - 2e-6) < 1e-9);
-    /* at 60k of context, 500 ms: 30 + 0.4 q + 2e-6 q (60000 + q / 2) <= 500 */
-    TEST_ASSERT(pulsar_engine_fused_chunk(e, 60000u, 0.0, 500.0, &rows));
-    const double at = 30.0 + 0.4 * rows + 2e-6 * rows * (60000.0 + 0.5 * rows);
-    const double next = 30.0 + 0.4 * (rows + 1) + 2e-6 * (rows + 1) * (60000.0 + 0.5 * (rows + 1));
-    TEST_ASSERT(at <= 500.0 + 1e-6 && next > 500.0 - 0.05);
-    /* a rider already took 200 ms: less room; the budget spent: nothing */
-    uint32_t less = 0;
-    TEST_ASSERT(pulsar_engine_fused_chunk(e, 60000u, 200.0, 500.0, &less) && less < rows && less > 0u);
-    TEST_ASSERT(pulsar_engine_fused_chunk(e, 60000u, 480.0, 500.0, &less) && less == 0u);
-    TEST_ASSERT(fabs(pulsar_engine_fused_cost_ms(e, 512u, 1000u) - (0.4 * 512 + 2e-6 * 512 * (1000 + 256))) < 1e-3);
+    const uint32_t q[2] = {512u, 128u}, c[2] = {1000u, 60000u};
+    TEST_ASSERT(pulsar_engine_fused_step_ms(e, 2u, q, c, &ms));
+    TEST_ASSERT(fabs(ms - (30.0 + 0.4 * 640.0 + 2e-6 * (512.0 * 1256.0 + 128.0 * 60064.0))) < 0.06);
     free(e);
+    double base[PULSAR_SPEC_LOGITS_ROWS + 1];
+    l301_staircase(base, PULSAR_SPEC_LOGITS_ROWS);
+    pulsar_engine *v = l301_engine(base, PULSAR_SPEC_LOGITS_ROWS);
+    for (uint32_t i = 0; i < 20; i++) pulsar_engine_verify_curve_observe(v, 4u, 8u, base[8], 6.0, 3.0);
+    TEST_ASSERT(fabs(pulsar_engine_verify_round_ms(v, 4u, 8u, &out) - (base[8] + 9.0)) < 1e-9 && out == 9.0);
+    TEST_ASSERT(fabs(pulsar_engine_verify_round_ms(v, 4u, 99u, &out) - (base[PULSAR_SPEC_LOGITS_ROWS] + 9.0)) < 1e-9);
+    v->tp = (struct pulsar_tp *)v;   /* never dereferenced: a pair's leader prices its round selection (L315) */
+    TEST_ASSERT(fabs(pulsar_engine_verify_round_ms(v, 4u, 8u, &out) - (base[8] + 9.0)) < 1e-9 && out == 9.0);
+    v->tp = NULL;
+    l301_engine_free(v);
+}
+
+/* L312 -- the round selection, simulated (after Flare's scripts/scheduling_sim): the real sched_choose and service
+ * prices over the engine's real cost authorities (the fused-step fit, the verify curve and its pick), the device
+ * replaced by a cost model from the fused-step fit the server measured in L312's sweep (gpuq #411, Qwen DFlash2, one
+ * Spark: 225-242 ms + 0.57-0.60 ms a prompt row + 1.4e-5..2.4e-5 ms an attention pair; here 230 + 0.58 q + 2.0e-5;
+ * 28 ms outside the forward;
+ * a decode-only round 88 ms at 4 streams, alone p50 87 ms; 5% noise; drafts survive at 0.65 a position, 7 a stream)
+ * and the server's glue around them (the quantum, worker_decode_budget, prices started at a 1/n share).  Scenarios:
+ *   (a) L304's: 4 streams decode while a 53k-token prompt prefills -- it finishes, no gap reaches 1.5 s (L304: max
+ *       1.98 s), the streams keep over a third of their rate.
+ *   (b) L277's: one stream, a 53k prompt, a 9.6k one 6 s later -- the second rides within 5 s (L277: 233 s), and
+ *       the stream keeps over a fifth of its rate.
+ *   (c) L304's stall: a 3.4k-row rest beside 4 running streams finishes (L304's budget held a rest that did not fit it
+ *       alone until every stream had finished: the rest is within one chunk, so worker_decode_budget's quantum is one
+ *       round, never a full quantum's first round).
+ *   (d) no prompt: every round decode-only, the verify pick's rows.
+ *   (e) unpriced (no fit yet): the rest rides whole, probes alternate 2 / 6 alignment steps, and the fit arms.
+ * Each scenario prints its numbers (the row's simulator table). */
+namespace l312 {
+struct lcg {
+    uint64_t s;
+    double u() {
+        s = s * 6364136223846793005ull + 1442695040888963407ull;
+        return (double)(s >> 11) * (1.0 / 9007199254740992.0);
+    }
+    double noise() { return exp(0.05 * (u() + u() + u() + u() - 2.0) * 1.7320508); }
+};
+struct prompt {
+    uint32_t len, p0;
+    double arrive_ms, first_ms, done_ms, inv;
+    uint64_t last;
+};
+struct stats {
+    double gap_max, gap_p99, dec_tps, alone_tps;
+    int fused, decode_only, unpriced;
+};
+static const double FWD_A = 230.0, FWD_ROW = 0.58, FWD_PAIR = 2.0e-5, OUTSIDE = 28.0, SURV = 0.65;
+static double dec_fwd(uint32_t r) { return 35.0 + 1.6 * r + (r > 16u ? 18.0 : 0.0); }
+static double tokens_of(uint32_t k) {
+    double t = 1.0, s = 1.0;
+    for (uint32_t j = 0; j < k; j++) t += (s *= SURV);
+    return t;
+}
+/* `ndec` streams decode throughout; prompts arrive; until the first prompt's first token (or horizon_ms) */
+static stats run(int ndec, prompt *P, int np, double horizon_ms, bool warm, const sched_prefs *pf, lcg *g) {
+    double base[PULSAR_SPEC_LOGITS_ROWS + 1];
+    for (uint32_t r = 1; r <= PULSAR_SPEC_LOGITS_ROWS; r++) base[r] = dec_fwd(r);
+    pulsar_engine *e = l301_engine(base, PULSAR_SPEC_LOGITS_ROWS);
+    for (int i = 0; i < 20; i++) pulsar_engine_verify_curve_observe(e, 4u, 16u, base[16], 12.0, 16.0);
+    /* the short prompts a server has seen before: the fit's evidence at shallow context */
+    for (uint32_t i = 0; warm && i < 12u; i++) {
+        const uint32_t q = 32u + 37u * i, c = 0u;
+        pulsar_engine_fused_cost_observe(e, 1u, &q, &c, (FWD_A + FWD_ROW * q + FWD_PAIR * q * q / 2.0) * g->noise());
+    }
+    const uint32_t heads_max = 32u, prefill_cap = 4096u, fuse_rows = prefill_cap - heads_max;
+    std::vector<double> gaps, inv(ndec, 0.0), last_out(ndec, 0.0);
+    stats st = {};
+    double t = 0.0, dec_tok = 0.0;
+    uint64_t probes = 0, rounds = 0;
+    uint32_t alone_per = 0, alone_rows = 1;   /* the decode-only pick (the same in every round: streams alike) */
+    const double win0 = P[0].arrive_ms;
+    while (t < horizon_ms && P[0].done_ms < 0.0) {
+        int qt = PULSAR_SERVER_DECODE_QUANTUM_TOKENS;   /* worker_decode_budget */
+        for (int k = 0; k < np; k++)
+            if (P[k].done_ms < 0.0 && P[k].arrive_ms <= t && P[k].len - P[k].p0 <= prefill_cap) qt = 1;
+        for (int ri = 0, emitted = 0; emitted < qt; ri++) {
+            float sv[PULSAR_SESSION_POOL_CAP * 7];
+            uint32_t m = 0;
+            for (int i = 0; i < ndec; i++)
+                for (uint32_t j = 0; j < 7u; j++) sv[m++] = (float)pow(SURV, j + 1.0);
+            std::sort(sv, sv + m, [](float a, float b) { return a > b; });
+            const uint32_t T = pulsar_engine_verify_pick(e, (uint32_t)ndec, sv, m, heads_max);
+            const uint32_t per = T / (uint32_t)ndec, rows = (uint32_t)ndec + T;
+            alone_per = per;
+            alone_rows = rows;
+            sched_round sr;
+            memset(&sr, 0, sizeof sr);
+            sr.n_live = sr.n_dec = (uint32_t)ndec;
+            sr.heads_max = heads_max;
+            sr.rows = rows;
+            int ix[4], n_ps = 0;
+            sched_prompt sp[4];
+            for (int k = 0; k < np; k++)
+                if (P[k].done_ms < 0.0 && P[k].arrive_ms <= t) {
+                    ix[n_ps] = k;
+                    sp[n_ps++] = {P[k].p0, P[k].len, 128u, P[k].inv, P[k].last};
+                }
+            const double n_req = ndec + n_ps, d_rate = sched_decode_rate_max(e, tokens_of(per), 1u + per);
+            for (int i = 0; i < ndec; i++) {
+                if (!(inv[i] > 0.0) && d_rate > 0.0) inv[i] = n_req / d_rate;
+                sr.tokens[i] = tokens_of(per);
+                sr.inv_ms[i] = inv[i];
+                sr.age_ms += t - last_out[i];
+            }
+            double rate[4] = {};
+            for (int k = 0; k < n_ps; k++) {
+                rate[k] = sched_prompt_rate_max(e, &sr, &sp[k], fuse_rows);
+                if (!(sp[k].inv_ms > 0.0) && rate[k] > 0.0) sp[k].inv_ms = P[ix[k]].inv = n_req / rate[k];
+            }
+            sched_choice ch;
+            sched_choose(e, pf, &sr, sp, n_ps, fuse_rows, ri == 0 && qt >= PULSAR_SERVER_DECODE_QUANTUM_TOKENS,
+                         (probes & 1u) ? 6u * SCHED_CHUNK_ALIGN : 2u * SCHED_CHUNK_ALIGN, &ch);
+            uint32_t nr = 0, q[4], c[4], pf_rows = 0;
+            double fwd = FWD_A;
+            bool fin = false;
+            for (int k = 0; k < n_ps; k++) {
+                if (!ch.q[k]) continue;
+                q[nr] = ch.q[k];
+                c[nr++] = sp[k].p0;
+                pf_rows += ch.q[k];
+                fwd += FWD_ROW * ch.q[k] + FWD_PAIR * ch.q[k] * (sp[k].p0 + ch.q[k] / 2.0);
+                if (!ch.priced) { st.unpriced++; probes++; }
+            }
+            TEST_ASSERT(pf_rows <= fuse_rows);
+            if (nr) {
+                fwd *= g->noise();
+                pulsar_engine_fused_cost_observe(e, nr, q, c, fwd);
+                st.fused++;
+            } else {
+                fwd = dec_fwd(rows) * g->noise();
+                pulsar_engine_verify_curve_observe(e, (uint32_t)ndec, rows, fwd, 12.0, 16.0);
+                st.decode_only++;
+            }
+            const double wall = fwd + OUTSIDE;
+            for (int k = 0; k < n_ps; k++) {
+                prompt &p = P[ix[k]];
+                sched_service_observe(&p.inv, wall, ch.q[k], rate[k], pf->adapt_ms);
+                if (!ch.q[k]) continue;
+                if (p.first_ms < 0.0) p.first_ms = t;
+                p.p0 += ch.q[k];
+                p.last = ++rounds;
+                if (ch.fin[k]) { p.done_ms = t + wall; fin = true; }
+            }
+            t += wall;
+            for (int i = 0; i < ndec; i++) {
+                int got = 1;
+                while (got <= (int)per && g->u() < SURV) got++;
+                emitted += got;
+                sched_service_observe(&inv[i], wall, got, d_rate, pf->adapt_ms);
+                last_out[i] = t;
+                if (t > win0 && P[0].done_ms < 0.0) {
+                    gaps.push_back(wall);
+                    dec_tok += got;
+                }
+            }
+            if (fin) break;
+        }
+    }
+    std::sort(gaps.begin(), gaps.end());
+    st.gap_max = gaps.empty() ? 0.0 : gaps.back();
+    st.gap_p99 = gaps.empty() ? 0.0 : gaps[std::min(gaps.size() - 1, (size_t)(0.99 * gaps.size()))];
+    st.dec_tps = dec_tok / std::max(1e-9, (std::min(t, P[0].done_ms > 0.0 ? P[0].done_ms : t) - win0) * 1e-3);
+    st.alone_tps = ndec * tokens_of(alone_per) / ((dec_fwd(alone_rows) + OUTSIDE) * 1e-3);
+    l301_engine_free(e);
+    return st;
+}
+}  // namespace l312
+
+static void test_fused_sched(void) {
+    sched_prefs pf = *server_sched_prefs();
+    l312::lcg g = {7u};
+    /* (d) no prompt: the decode-only round, the pick's rows, whatever the prices */
+    {
+        double base[PULSAR_SPEC_LOGITS_ROWS + 1];
+        l301_staircase(base, PULSAR_SPEC_LOGITS_ROWS);
+        pulsar_engine *e = l301_engine(base, PULSAR_SPEC_LOGITS_ROWS);
+        for (int i = 0; i < 20; i++) pulsar_engine_verify_curve_observe(e, 2u, 6u, base[6], 5.0, 4.0);
+        for (uint32_t i = 0; i < 12u; i++) {
+            const uint32_t q = 64u + 100u * i, c = 0u;
+            pulsar_engine_fused_cost_observe(e, 1u, &q, &c, 150.0 + 0.5 * q);
+        }
+        sched_round sr;
+        memset(&sr, 0, sizeof sr);
+        sr.n_live = sr.n_dec = 2u;
+        sr.heads_max = 32u;
+        sr.rows = 6u;
+        sr.tokens[0] = sr.tokens[1] = 2.5;
+        sr.inv_ms[0] = sr.inv_ms[1] = 40.0;
+        sched_choice ch;
+        sched_choose(e, &pf, &sr, NULL, 0, 4064u, true, 256u, &ch);
+        TEST_ASSERT(ch.priced && ch.t_ms == ch.t_dec_ms && ch.score == ch.score_dec &&
+                    fabs(ch.t_dec_ms - (base[6] + 9.0)) < 1e-9);
+        /* the candidates: a fresh prompt's ends are the aligned points and, with no grid point inside, its end */
+        sched_prompt one = {1000u, 1100u, 128u, 1.0, 0u};   /* 1024 lies inside: no finishing chunk this round */
+        sched_choose(e, &pf, &sr, &one, 1, 4064u, true, 256u, &ch);
+        TEST_ASSERT(ch.q[0] == 0u || (ch.q[0] == 24u && !ch.fin[0]));
+        one = {1024u, 1100u, 128u, 1e6, 0u};   /* priced far above the streams: its last 76 rows ride, finishing */
+        sched_choose(e, &pf, &sr, &one, 1, 4064u, true, 256u, &ch);
+        TEST_ASSERT(ch.q[0] == 76u && ch.fin[0]);
+        sr.n_dec = sr.heads_max;   /* every head row a decoder's: a finishing chunk cannot ride */
+        sched_choose(e, &pf, &sr, &one, 1, 4064u, true, 256u, &ch);
+        TEST_ASSERT(ch.q[0] == 0u);
+        l301_engine_free(e);
+    }
+    /* (a) L304's case */
+    l312::prompt a[1] = {{53359u, 0u, 4000.0, -1.0, -1.0, 0.0, 0u}};
+    l312::stats sa = l312::run(4, a, 1, 600e3, true, &pf, &g);
+    printf("  L312 sim (a) 4 streams + 53k: TTFT %.1f s, decode %.1f tok/s of %.1f alone, gap p99 %.0f max %.0f ms "
+           "(%d fused, %d decode-only rounds)\n", (a[0].done_ms - a[0].arrive_ms) * 1e-3, sa.dec_tps, sa.alone_tps,
+           sa.gap_p99, sa.gap_max, sa.fused, sa.decode_only);
+    TEST_ASSERT(a[0].done_ms > 0.0 && sa.gap_max < 1500.0 && sa.dec_tps > sa.alone_tps / 3.0);
+    /* (b) L277's case */
+    l312::prompt b[2] = {{53359u, 0u, 4000.0, -1.0, -1.0, 0.0, 0u}, {9599u, 0u, 10000.0, -1.0, -1.0, 0.0, 0u}};
+    l312::stats sb = l312::run(1, b, 2, 600e3, true, &pf, &g);
+    printf("  L312 sim (b) 1 stream + 53k + 9.6k: TTFT %.1f / %.1f s, the second's first rows after %.1f s, decode "
+           "%.1f tok/s of %.1f alone, gap p99 %.0f max %.0f ms\n", (b[0].done_ms - b[0].arrive_ms) * 1e-3,
+           (b[1].done_ms - b[1].arrive_ms) * 1e-3, (b[1].first_ms - b[1].arrive_ms) * 1e-3, sb.dec_tps, sb.alone_tps,
+           sb.gap_p99, sb.gap_max);
+    TEST_ASSERT(b[0].done_ms > 0.0 && b[1].done_ms > 0.0 && b[1].first_ms - b[1].arrive_ms < 5000.0);
+    TEST_ASSERT(sb.dec_tps > sb.alone_tps / 5.0);
+    /* (c) L304's stall: a 3.4k rest */
+    l312::prompt c[1] = {{53359u, 49920u, 4000.0, -1.0, -1.0, 0.0, 0u}};
+    l312::stats sc = l312::run(4, c, 1, 120e3, true, &pf, &g);
+    printf("  L312 sim (c) 4 streams + a 3.4k-row rest: TTFT %.1f s, gap max %.0f ms\n",
+           (c[0].done_ms - c[0].arrive_ms) * 1e-3, sc.gap_max);
+    TEST_ASSERT(c[0].done_ms > 0.0 && c[0].done_ms - c[0].arrive_ms < 30e3);
+    /* (e) unpriced: no fit yet */
+    l312::prompt u[1] = {{53359u, 0u, 4000.0, -1.0, -1.0, 0.0, 0u}};
+    l312::stats su = l312::run(4, u, 1, 600e3, false, &pf, &g);
+    printf("  L312 sim (e) cold fit: %d unpriced rounds, then TTFT %.1f s, gap max %.0f ms\n", su.unpriced,
+           (u[0].done_ms - u[0].arrive_ms) * 1e-3, su.gap_max);
+    TEST_ASSERT(su.unpriced >= 8 && su.unpriced <= 16 && u[0].done_ms > 0.0);
 }
 
 /* L263 / L284: the lane cost fit (both decode lanes').  A linear step cost with
@@ -4062,7 +4291,8 @@ static const pulsar_test_entry test_entries[] = {
     {"--lib-think", "lib-think", "shared <think> scanner: split tags, hold-back, spacing, seeded state", test_lib_think_scan},
     {"--attn-layout", "attn-layout", "CSA2 attention layout table: modes + sources derived from the V4.1 source sets (L218)", test_attn_layout_table},
     {"--lane-cost", "lane-cost", "lane cost fit: a step's measured cost to its terms, its centre, or no price at all (L263, L284)", test_lane_cost_fit},
-    {"--fused-chunk", "fused-chunk", "the fused step's cost fit and the continuation chunk solved from a time budget (L304)", test_fused_chunk},
+    {"--fused-cost", "fused-cost", "the fused step's cost fit and the verify curve's round cost, what the round selection prices by (L304, L312)", test_fused_cost},
+    {"--fused-sched", "fused-sched", "the round selection simulated on L304's logged costs: L304's and L277's cases, the stall, no prompt, the cold fit (L312)", test_fused_sched},
     {"--verify-pick", "verify-pick", "the verify pick: the brute-force argmax on a staircase curve, the robust online correction, the lockstep continuation (L301); the copy estimate's re-probe (L308)", test_verify_pick},
     {"--lib-image-rope", "lib-image-rope", "multi-axis rope positions from the image records vs HF get_rope_index (L268)", test_lib_image_rope},
     {"--lib-image-identity", "lib-image-identity", "the core image identity: records per block, rewind keeps survivors, a chain persists past a block only with its record (L281)", test_lib_image_identity},
