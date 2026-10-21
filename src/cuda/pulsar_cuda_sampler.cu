@@ -225,12 +225,26 @@ __device__ void select_topk(const row_view &rv, uint32_t k, uint64_t *keys, uint
             if ((dk & hmask) == (prefix & hmask)) atomicAdd(&hist[(dk >> sh) & 255u], 1u);
         }
         __syncthreads();
-        if (tid == 0) {
-            uint32_t c = 0, d = 0;
-            while (c + hist[d] < want) c += hist[d++];
-            *cnt = d | (c << 8);   /* the digit, and how many of the class sit below it (< 2^24) */
+        {   /* the digit whose cumulative count reaches `want`, and how many of the class sit below it (< 2^24): a
+             * scan of the 256 bins, a thread a bin */
+            static_assert(THREADS >= 256u, "a thread a bin");
+            const uint32_t lane = tid & 31u, warp = tid >> 5;
+            const uint32_t h = tid < 256u ? hist[tid] : 0u;
+            uint32_t x = h;
+            for (uint32_t off = 1; off < 32u; off <<= 1) {
+                const uint32_t o = __shfl_up_sync(0xffffffffu, x, off);
+                if (lane >= off) x += o;
+            }
+            if (tid < 256u && lane == 31u) redu[warp] = x;
+            __syncthreads();
+            if (tid < 256u) {
+                uint32_t base = 0;
+                for (uint32_t w = 0; w < warp; w++) base += redu[w];
+                const uint32_t incl = x + base, excl = incl - h;
+                if (excl < want && incl >= want) *cnt = tid | (excl << 8);
+            }
+            __syncthreads();
         }
-        __syncthreads();
         const uint32_t d = *cnt & 255u, below = *cnt >> 8;
         prefix |= d << sh;
         want -= below;
@@ -1798,24 +1812,27 @@ __global__ void __launch_bounds__(SMP_THREADS) logprobs_rows_kernel(const __grid
         if (tid == 0) o->n_top = 0;
         return;
     }
-    /* the chunks' best, merged: one sort of their union, its first min(k, finite) -- warp 0 places each chunk's run */
+    /* the chunks' best, merged: each chunk's run is sorted, so warp 0 takes the least head min(k, finite) times */
     static_assert(LP_TK_CHUNKS == 32u, "a lane a chunk");
     if (tid < 32u) {
         const uint32_t *cn = a.tk_n + ((size_t)j * LP_TK_CHUNKS + tid) * 2u;
-        const uint32_t kc = min(cn[0], k), fin = cn[1];   /* a chunk kept its best even at k == 0 */
-        uint32_t at = kc, nfin = fin;
-        for (uint32_t off = 1; off < 32u; off <<= 1) {
-            const uint32_t x = __shfl_up_sync(0xffffffffu, at, off), y = __shfl_xor_sync(0xffffffffu, nfin, off);
-            if (tid >= off) at += x;
-            nfin += y;
-        }
+        const uint32_t kc = min(cn[0], k);   /* a chunk kept its best even at k == 0 */
+        uint32_t nfin = cn[1];
+        for (uint32_t off = 16; off > 0; off >>= 1) nfin += __shfl_xor_sync(0xffffffffu, nfin, off);
+        const uint32_t kf = min(k, nfin);
         const uint64_t *ck = a.tk + ((size_t)j * LP_TK_CHUNKS + tid) * PULSAR_GPU_LOGPROB_TOPK_MAX;
-        for (uint32_t i = 0; i < kc; i++) sm.keys[at - kc + i] = ck[i];
-        if (tid == 31u) sm.cnt = at | (min(k, nfin) << 16);
+        uint32_t at = 0;
+        for (uint32_t i = 0; i < kf; i++) {
+            const uint64_t head = at < kc ? ck[at] : UINT64_MAX;
+            uint64_t best = head;
+            for (uint32_t off = 16; off > 0; off >>= 1) best = min(best, __shfl_xor_sync(0xffffffffu, best, off));
+            if (head == best) at++;   /* keys are distinct (the id is in them): one lane holds it */
+            if (tid == 0) sm.keys[i] = best;
+        }
+        if (tid == 0) sm.cnt = kf;
     }
     __syncthreads();
-    const uint32_t m = sm.cnt & 0xffffu, kf = sm.cnt >> 16;
-    bitonic_sort<SMP_THREADS>(sm.keys, m);
+    const uint32_t kf = sm.cnt;
     const double logsum = __dadd_rn(lsum, dmax);
     for (uint32_t i = tid; i < k; i += SMP_THREADS) {
         pulsar_gpu_token_score ts;
@@ -2119,7 +2136,8 @@ int pulsar_gpu_sample_rows(const pulsar_gpu_tensor *logits, uint64_t logits_offs
         prep_hist_kernel<3><<<pg, PREP_THREADS>>>(a, prep);
         prep_decide_kernel<3><<<n_rows, PREP_THREADS>>>(a, prep);
     }
-    prep_collect_kernel<<<dim3(WIDE_CHUNKS, n_rows), PREP_THREADS>>>(a, prep);
+    /* wide for a few rows (each row's expf over more of the GPU); many rows fill it at the prep's width */
+    prep_collect_kernel<<<dim3(n_rows <= 4u ? WIDE_CHUNKS : PREP_CHUNKS, n_rows), PREP_THREADS>>>(a, prep);
     if (a.idsum_rows) {   /* the id-order sums (of the values prep_collect_kernel wrote) before the row kernel */
         sr_args sa;
         memset(&sa, 0, sizeof(sa));
