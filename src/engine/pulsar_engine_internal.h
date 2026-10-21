@@ -1993,6 +1993,7 @@ struct pulsar_engine {
     uint64_t spec_verified_per_pos[16];  ///< rounds that VERIFIED position i (the trim kept
                                          ///< it); the honest denominator for per-position
                                          ///< acceptance under the L107 adaptive depth
+    uint64_t spec_copy_probes;    ///< L308: copy chains drafted as a stale estimate's probe while it stood under tau
 
     /** ---- methods (C++ port): 1:1 mirror of the pulsar_engine_* verb family.
      * The public API in pulsar.h stays the free-function facade (defined in
@@ -2132,12 +2133,16 @@ typedef struct pulsar_spec_carry_state {
      * controller reads the verified chain's tail confidence in round_end. */
     float   pend_conf[16];
     /** L288: the pendings are a copy chain (pulsar_spec_copy_chain), not the drafter's: their verdict feeds the
-     * copy acceptance (pulsar_engine::spec_copy_accept). */
+     * copy acceptance (copy_accept). */
     bool    pend_copy;
     /** L288: this request's copy drafts' measured chance to be accepted once the one before was (an EMA over its
      * verified copy chains, weight 0.1 a round; 0 = none yet) -- the confidence its copy drafts carry.  A request
-     * boundary clears it (spec_lookahead_reset). */
+     * boundary clears it (spec_lookahead_reset).  The one copy estimate: pulsar_spec_copy_price reads it,
+     * pulsar_spec_copy_observe moves it (session_spec.cpp). */
     float   copy_accept;
+    /** L308: tokens the request has committed since copy_accept's last verdict (saturating).  An estimate this old
+     * (PULSAR_SPEC_COPY_REPROBE) is stale: the next copy chain is a probe, and its verdict re-seeds the estimate. */
+    uint32_t copy_unseen;
     /** L107 adaptive draft depth: the session's CURRENT draft depth, moved
      * +/-1 per round by the controller in spec_round_end from the realized
      * accept count and the verified tail confidence. 0 = uninitialized (first

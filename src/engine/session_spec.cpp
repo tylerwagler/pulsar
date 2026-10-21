@@ -73,19 +73,51 @@ uint32_t pulsar_spec_copy_chain(pulsar_session *s, uint32_t bank, int32_t next_b
     return best;
 }
 
-float pulsar_spec_copy_conf(const pulsar_session *s) {
-    return s->spec.copy_accept > 0.0f ? s->spec.copy_accept : 1.0f;
+/* L308: the copy estimate, after Flare's retained-proposal acceptance (NVIDIA/flare-local-inference,
+ * docs/scheduling-runtime-design.md "Retained proposals": an unobserved suffix is priced at its upper bound after 32
+ * tokens, so it can become worth probing).  L288 kept one number per request, and a request whose copies fell under
+ * tau never copied again -- nothing verified a copy after that, so nothing could move it back, and a long reply that
+ * later quoted a file drafted the quote with its drafter.  Now the estimate ages by the tokens committed without a
+ * copy verdict, and once it is PULSAR_SPEC_COPY_REPROBE old it is stale: it describes text the request has left.  A
+ * stale estimate prices the next copy chain as a probe -- its first draft at the upper bound 1 (what an unobserved
+ * draft can be worth), the rest at the old estimate -- cut by the stop rule (a quenched estimate keeps the first
+ * draft and the one that stops it) and then by the verify pick, so a probe is drafted only when the curve says even
+ * that is worth its rows.  The probe's verdict re-seeds the estimate, as a request's first copy verdict seeds it: a
+ * quote that has started is copied from the next round on, and a probe that failed quenches the lane for another
+ * PULSAR_SPEC_COPY_REPROBE tokens.  Counts and verdicts only, so every rank of a TP group holds the same estimate. */
+uint32_t pulsar_spec_copy_price(const pulsar_spec_carry_state *sp, float tau, uint32_t n, float *conf, bool *reprobe) {
+    *reprobe = false;
+    if (n == 0u) return 0u;
+    const float c = sp->copy_accept;
+    if (!(c > 0.0f)) {   /* none measured: every copy draft at its upper bound (L288) */
+        for (uint32_t k = 0; k < n; k++) conf[k] = 1.0f;
+        return n;
+    }
+    if (sp->copy_unseen < PULSAR_SPEC_COPY_REPROBE) {   /* fresh: the request's own number */
+        for (uint32_t k = 0; k < n; k++) conf[k] = c;
+        return pulsar_spec_conf_stops(c, tau) ? 0u : n;
+    }
+    conf[0] = 1.0f;   /* stale: a probe */
+    for (uint32_t k = 1; k < n; k++) conf[k] = c;
+    *reprobe = pulsar_spec_conf_stops(c, tau);
+    return pulsar_spec_conf_keep(conf, n, tau);
 }
 
 /* A verified copy chain's verdict: `commit` of its `K` drafts accepted -- commit successes in commit + (commit < K)
- * trials of "accepted, given the one before was" -- into the request's copy acceptance (weight 0.1 a round).  Counts
- * only, so every rank of a TP group holds the same number. */
-static void spec_copy_observe(pulsar_session *s, int commit, uint32_t K) {
+ * trials of "accepted, given the one before was" -- into the request's copy acceptance (weight 0.1 a round; an
+ * unmeasured or stale estimate is replaced by it). */
+void pulsar_spec_copy_observe(pulsar_spec_carry_state *sp, int commit, uint32_t K) {
     const uint32_t trials = (uint32_t)commit + ((uint32_t)commit < K ? 1u : 0u);
     if (trials == 0u) return;
     const float rate = (float)commit / (float)trials;
-    float &a = s->spec.copy_accept;
-    a = a > 0.0f ? 0.9f * a + 0.1f * rate : (rate > 0.0f ? rate : 0.01f);
+    float &a = sp->copy_accept;
+    const bool seed = !(a > 0.0f) || sp->copy_unseen >= PULSAR_SPEC_COPY_REPROBE;
+    a = !seed ? 0.9f * a + 0.1f * rate : (rate > 0.0f ? rate : 0.01f);
+    sp->copy_unseen = 0u;
+}
+
+void pulsar_spec_copy_age(pulsar_spec_carry_state *sp, uint32_t tokens) {
+    sp->copy_unseen = sp->copy_unseen > UINT32_MAX - tokens ? UINT32_MAX : sp->copy_unseen + tokens;
 }
 
 void pulsar_spec_draft_req_init(pulsar_session *s, spec_redraft_req *q, int next_base, float temperature, int top_k,
@@ -102,28 +134,25 @@ void pulsar_spec_draft_req_init(pulsar_session *s, spec_redraft_req *q, int next
     q->copied = false;
     q->keep = 0;
     /* L288: a bank that repeats its history drafts the repeat (pulsar_spec_copy_chain), whichever drafter it has: up
-     * to the drafter's deepest chain and the verify width beside the base row, within the context, cut by the verify
-     * pick as a chain alone (L301; the server's pick rations the shared width); the drafter then leaves this
-     * record's drafts as they are.
-     * A request whose copies have been accepted less often than the stop rule asks of a draft (tau) drafts with
-     * its drafter for the rest of it, as a quenched one decodes plain. */
+     * to the drafter's deepest chain and the verify width beside the base row, within the context, priced by the
+     * request's copy estimate (pulsar_spec_copy_price, L308) and cut by the verify pick as a chain alone (L301; the
+     * server's pick rations the shared width); the drafter then leaves this record's drafts as they are.  A request
+     * whose fresh estimate is under the stop rule's tau drafts with its drafter until the estimate goes stale. */
     const pulsar_drafter_ops *d = spec_drafter(s);
-    const float c = pulsar_spec_copy_conf(s);
-    if (pulsar_spec_conf_stops(c, pulsar_spec_tau(s->engine))) return;
     const uint32_t width = pulsar_engine_fused_heads_max(s->engine);
     const int room = s->ctx() - (int)s->checkpoint.len - 1;
     uint32_t cap = d && width > 1u ? (d->depth_max < width - 1u ? d->depth_max : width - 1u) : 0u;
     if (cap > 16u) cap = 16u;
     if (room < (int)cap) cap = room > 0 ? (uint32_t)room : 0u;
+    bool reprobe = false;
+    const uint32_t admit = pulsar_spec_copy_price(&s->spec, pulsar_spec_tau(s->engine), cap, q->conf, &reprobe);
+    if (admit == 0u) return;   /* before the history scan: a quenched request pays nothing for it */
     int32_t cp[16];
-    const uint32_t n_cp = cap ? pulsar_spec_copy_chain(s, pulsar_session_live_bank(s), next_base, cap, cp) : 0u;
+    const uint32_t n_cp = pulsar_spec_copy_chain(s, pulsar_session_live_bank(s), next_base, cap, cp);
     if (n_cp == 0) return;
-    q->keep = n_cp;
+    q->keep = n_cp < admit ? n_cp : admit;
     q->refined[0] = q->next_base;
-    for (uint32_t k = 0; k < n_cp; k++) {
-        q->refined[k + 1] = cp[k];
-        q->conf[k] = c;
-    }
+    for (uint32_t k = 0; k < q->keep; k++) q->refined[k + 1] = cp[k];
     pulsar_spec_keep_picked(s, 1u, &q, 1u);
     if (q->keep == 0) return;   /* no copy draft is worth its row: the drafter drafts */
     q->have_conf = true;
@@ -132,7 +161,17 @@ void pulsar_spec_draft_req_init(pulsar_session *s, spec_redraft_req *q, int next
     if (!announced) {
         announced = true;
         fprintf(stderr, "pulsar: copy drafts ran: %u of a %u-token repeat drafted (conf %.2f) after a %u-token match\n",
-                q->keep, n_cp, (double)c, PULSAR_SPEC_COPY_MATCH);
+                q->keep, n_cp, (double)q->conf[q->keep - 1u], PULSAR_SPEC_COPY_MATCH);
+    }
+    if (reprobe) {
+        s->engine->spec_copy_probes++;
+        static bool probe_announced = false;   /* rule 5: and that a quenched copy lane probed again */
+        if (!probe_announced) {
+            probe_announced = true;
+            fprintf(stderr, "pulsar: copy re-probe ran: %u drafts after %u tokens without a copy verdict (estimate %.3f, "
+                            "tau %.2f)\n", q->keep, s->spec.copy_unseen, (double)s->spec.copy_accept,
+                    (double)pulsar_spec_tau(s->engine));
+        }
     }
 }
 
@@ -341,6 +380,7 @@ void spec_quench_reset(pulsar_session *s) {
 void spec_lookahead_reset(pulsar_session *s) {
     s->spec.spec_carry_valid = false;
     s->spec.copy_accept = 0.0f;   /* L288: copies are measured per request */
+    s->spec.copy_unseen = 0u;
     pulsar_spec_drop_pendings(&s->spec);
     spec_quench_reset(s);
 }
@@ -641,7 +681,9 @@ static int spec_round_end(pulsar_session *s, pulsar_spec_round *r,
         return -1;
     }
     int commit = commit_rc;
-    if (r->copy) spec_copy_observe(s, commit_rc, K);   /* L288: before the stop clamp -- the walk's verdict */
+    /* L288: the walk's verdict, before the stop clamp, into the copy estimate; L308: any other round ages it */
+    if (r->copy) pulsar_spec_copy_observe(&s->spec, commit_rc, K);
+    else pulsar_spec_copy_age(&s->spec, 1u + (uint32_t)commit_rc);
 
     /* Ghost-token guard: never commit drafts PAST an accepted EOS. The
      * emission loop below stops at EOS, but the checkpoint trim uses commit —
