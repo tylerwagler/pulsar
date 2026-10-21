@@ -80,7 +80,7 @@ class AbandonLeg(Leg):
         else:
             self.g.check(False, "two decodes never ran together: %s" % self.phases())
             return
-        # ~16k tokens in THIS model's tokenizer (half a 32k context: long enough to be caught mid-prefill, and it fits)
+        # ~16k tokens in THIS model's tokenizer (long enough to be caught mid-prefill; it fits a 32k context alone)
         n_words = 2000
         n_words = int(n_words * 16000 / max(1, self.count_tokens(" ".join("filler%d" % i for i in range(n_words)))))
         big = " ".join("filler%d" % i for i in range(n_words))
