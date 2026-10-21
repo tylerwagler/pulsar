@@ -122,10 +122,10 @@ int pulsar_kvchain_persist(pulsar_segstore *st, pulsar_engine *e, pulsar_session
     return r.written;
 }
 
-int pulsar_kvchain_restore(pulsar_segstore *st, pulsar_engine *e, pulsar_session *s, const char *text,
-                           size_t text_len, const uint64_t *image_hashes, int n_images, int min_tokens,
-                           pulsar_segstore_seg *chain, int cap, int *n_out, char *err, size_t errlen) {
-    if (n_out) *n_out = 0;
+int pulsar_kvchain_find(pulsar_segstore *st, const char *text, size_t text_len, const uint64_t *image_hashes,
+                        int n_images, int min_tokens, pulsar_segstore_seg *chain, int cap, uint64_t *bytes, char *err,
+                        size_t errlen) {
+    if (bytes) *bytes = 0;
     if (err && errlen) err[0] = '\0';
     if (!st || !text) return 0;
     int n = pulsar_segstore_lookup(st, text, text_len, chain, cap);
@@ -156,6 +156,15 @@ int pulsar_kvchain_restore(pulsar_segstore *st, pulsar_engine *e, pulsar_session
         }
     }
     if (n == 0 || (int)chain[n - 1].G < min_tokens) return 0;
+    if (bytes)
+        for (int i = 0; i < n; i++) *bytes += chain[i].payload_bytes + chain[i].trailer_bytes;
+    return n;
+}
+
+int pulsar_kvchain_load(pulsar_segstore *st, pulsar_engine *e, pulsar_session *s, const char *text,
+                        const pulsar_segstore_seg *chain, int n, char *err, size_t errlen) {
+    if (err && errlen) err[0] = '\0';
+    if (!st || !text || n <= 0) return 0;
     for (int i = 0; i < n; i++) {
         uint64_t pb = 0;
         FILE *fp = pulsar_segstore_open_payload(st, chain[i].key, &pb);
@@ -184,6 +193,21 @@ int pulsar_kvchain_restore(pulsar_segstore *st, pulsar_engine *e, pulsar_session
         return 0;
     }
     pulsar_segstore_touch(st, chain, n);
-    if (n_out) *n_out = n;
     return (int)chain[n - 1].G;
 }
+
+int pulsar_kvchain_restore(pulsar_segstore *st, pulsar_engine *e, pulsar_session *s, const char *text,
+                           size_t text_len, const uint64_t *image_hashes, int n_images, int min_tokens,
+                           pulsar_segstore_seg *chain, int cap, int *n_out, char *err, size_t errlen) {
+    if (n_out) *n_out = 0;
+    const int n = pulsar_kvchain_find(st, text, text_len, image_hashes, n_images, min_tokens, chain, cap, NULL, err,
+                                      errlen);
+    if (n == 0) return 0;
+    /* a chain cut at an image still loads (find said why in `err`); a load failure says its own why instead */
+    char lerr[384] = "";
+    const int G = pulsar_kvchain_load(st, e, s, text, chain, n, lerr, sizeof(lerr));
+    if (lerr[0] && err && errlen) snprintf(err, errlen, "%s", lerr);
+    if (G > 0 && n_out) *n_out = n;
+    return G;
+}
+

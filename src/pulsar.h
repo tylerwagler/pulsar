@@ -1246,6 +1246,10 @@ void pulsar_engine_fused_cost_observe(pulsar_engine *e, uint32_t n_runs, const u
                                       double forward_ms);
 bool pulsar_engine_fused_chunk(const pulsar_engine *e, uint32_t c, double spent_ms, double budget_ms, uint32_t *rows);
 double pulsar_engine_fused_cost_ms(const pulsar_engine *e, uint32_t q, uint32_t c);
+/** L310: the same fit priced as a prefill of q tokens over the c already computed, cut into chunks of at most `chunk`
+ *  rows: each chunk pays the step's fixed term a, the rows alpha * q + beta * q (c + q / 2).  false (and *ms 0) with
+ *  no fit yet -- the one prefill cost model, never a second (the disk tier's restore-vs-recompute reads it). */
+bool pulsar_engine_prefill_ms(const pulsar_engine *e, uint32_t q, uint32_t c, uint32_t chunk, double *ms);
 /** The loaded drafter's name ("" with none). */
 const char *pulsar_engine_drafter_name(const pulsar_engine *e);
 const pulsar_tokens *pulsar_session_tokens(pulsar_session *s);

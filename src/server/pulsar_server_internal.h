@@ -1023,12 +1023,49 @@ typedef struct {
 } kv_cache_options;
 
 typedef struct pulsar_segstore pulsar_segstore;
+
+/** L310: what a disk hit's restore-vs-recompute decided (after Flare's prefix-cache offload policy, 2.10): a chain
+ *  loads only when reading it takes under half the prefill of the tokens it adds over the bank's own resume, both
+ *  priced from measurements -- the read rate of this store's loads, the prefill from the engine's one cost fit
+ *  (pulsar_engine_prefill_ms, L304).  Either way the bank ends with the same bytes (a segment is the prefill's own
+ *  rows, L264), so the verdict moves time, never a number.  Before either rate exists the chain loads: the first
+ *  load is what measures the read rate, and with no fit there is no prefill price to beat. */
+typedef enum {
+    KV_RESTORE_LOAD = 0,       ///< priced: the read beats half the prefill
+    KV_RESTORE_RECOMPUTE,      ///< priced: prefilling the gain is cheaper than reading it -- the chain stays on disk
+    KV_RESTORE_UNMEASURED,     ///< loaded: no load has measured the read rate yet
+    KV_RESTORE_UNPRICED,       ///< loaded: the engine has no prefill cost fit yet
+    KV_RESTORE_VERDICTS
+} kv_restore_verdict;
+/** The verdict's names, the /metrics label and the log word (one authority). */
+extern const char *const kv_restore_verdict_names[KV_RESTORE_VERDICTS];
+/** The decision, pure: `bytes` read for `gained` tokens past what the bank serves; `read_bytes_per_ms` 0 = unmeasured;
+ *  `priced` false = no prefill fit, else `prefill_ms` prices the gain.  *transfer_ms the read's estimate (0 when
+ *  unmeasured).  A chain that adds nothing (gained 0) is never read. */
+kv_restore_verdict kv_restore_decide(uint64_t bytes, uint32_t gained, double read_bytes_per_ms, bool priced,
+                                     double prefill_ms, double *transfer_ms);
+/** The measured read rate's update: an exponentially weighted mean (weight 1/8) of each load's bytes per ms of wall
+ *  time, the first sample taken whole.  Returns the new rate. */
+double kv_restore_rate_update(double rate, uint32_t n, uint64_t bytes, double ms);
+
+/** L310: the restore-vs-recompute telemetry, on /metrics.  Worker-written under server::mu. */
+typedef struct {
+    double read_bytes_per_ms;          ///< measured; 0 until the first load
+    uint32_t reads;                    ///< loads that measured it
+    uint64_t verdicts[KV_RESTORE_VERDICTS];
+    uint64_t restored_tokens;          ///< tokens the loaded chains added over the banks' own resumes
+    uint64_t recomputed_tokens;        ///< tokens a RECOMPUTE verdict left to the prefill
+    double last_transfer_ms;           ///< the last decision's read estimate
+    double last_prefill_ms;            ///< ... and its prefill price
+} kv_restore_meter;
+
 /** L264 S4: the disk KV cache -- the segment store (lib/pulsar_segstore.h). */
 typedef struct {
     pulsar_segstore *st;     ///< NULL while disabled
     char *dir;
     bool enabled;
     kv_cache_options opt;
+    kv_restore_meter meter;  ///< L310
 } kv_disk_cache;
 
 /** Where a remembered tool entry came from. */
@@ -1815,14 +1852,18 @@ struct server {
     int kv_cache_persist(session_slot *sl, const char *reason, bool close);
     /** Load the deepest stored chain whose text is a byte prefix of
      * `prompt_text` into the installed bank (live at the chain's end), and build
-     * the prompt to sync: the exact stored tokens + the rest of the text.
-     * @return tokens restored, 0 for a miss. */
+     * the prompt to sync: the exact stored tokens + the rest of the text --
+     * when L310's restore-vs-recompute says the read beats prefilling the
+     * tokens it adds past `base` (where the bank's own state resumes the prompt
+     * without it; 0 = from nothing).
+     * @return tokens restored, 0 for a miss or a RECOMPUTE verdict. */
     int kv_cache_try_load_text(session_slot *sl, const char *prompt_text,
                                const pulsar_text_span *prompt_spans, uint32_t prompt_n_spans,
-                               const uint64_t *image_hashes, int n_images,
+                               const uint64_t *image_hashes, int n_images, int base,
                                pulsar_tokens *effective_prompt, char **loaded_key_out, bool responses_protocol);
     /** kv_cache_try_load_text() for a request's prompt. */
-    int kv_cache_try_load(session_slot *sl, const request *req, pulsar_tokens *effective_prompt, char **loaded_key_out);
+    int kv_cache_try_load(session_slot *sl, const request *req, int base, pulsar_tokens *effective_prompt,
+                          char **loaded_key_out);
     /** A chain whose restore the prefill then failed on: drop its last segment. */
     void kv_cache_discard_failed_chain(const char *key);
     /** Tool-output-only Responses continuation.

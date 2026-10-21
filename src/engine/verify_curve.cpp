@@ -648,6 +648,15 @@ double pulsar_engine_fused_cost_ms(const pulsar_engine *e, uint32_t q, uint32_t 
     return f->alpha_ms * (double)q + f->beta_ms * (double)q * ((double)c + 0.5 * (double)q);
 }
 
+bool pulsar_engine_prefill_ms(const pulsar_engine *e, uint32_t q, uint32_t c, uint32_t chunk, double *ms) {
+    const pulsar_fused_cost_fit *f = e ? &e->fused_cost : NULL;
+    *ms = 0.0;
+    if (!f || !f->valid || chunk == 0u) return false;
+    const uint32_t chunks = q / chunk + (q % chunk != 0u ? 1u : 0u);
+    *ms = f->a_ms * (double)chunks + pulsar_engine_fused_cost_ms(e, q, c);
+    return true;
+}
+
 bool pulsar_engine_fused_chunk(const pulsar_engine *e, uint32_t c, double spent_ms, double budget_ms, uint32_t *rows) {
     const pulsar_fused_cost_fit *f = e ? &e->fused_cost : NULL;
     *rows = 0u;
