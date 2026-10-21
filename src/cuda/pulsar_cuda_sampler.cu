@@ -1626,6 +1626,7 @@ __global__ void full_final_kernel(const __grid_constant__ launch_args a, const f
 /* ---- logprobs (the host scorers' bytes: tests/sampler_host_ref.cpp pulsar_logits_top_logprobs / _token_logprob) --- */
 
 constexpr uint32_t LP_GROUP = 8;   /* rows a logprob pass takes (its scratch: LP_GROUP rows of doubles) */
+constexpr uint32_t LP_TK_CHUNKS = 32, LP_TK_THREADS = 256, LP_EXP_CHUNKS = 4u * 32u;
 struct lp_head {
     float maxv;
     int32_t maxi;
@@ -1646,16 +1647,16 @@ struct lp_args {
     lp_head *head;             /* [LP_GROUP] each row's first maximum */
     double *ex;                /* [LP_GROUP][n_vocab] exp(v - max) of the finite values, 0 elsewhere */
     const double *sums;        /* [LP_GROUP] their serial sums (sr_sum_kernel) */
+    uint64_t *tk;              /* [LP_GROUP][LP_TK_CHUNKS][PULSAR_GPU_LOGPROB_TOPK_MAX] each chunk's best keys */
+    uint32_t *tk_n;            /* [LP_GROUP][LP_TK_CHUNKS][2]: each chunk's kept count and finite count */
 };
 
 struct lp_smem {
-    uint32_t redu[SMP_THREADS];
-    serial_sum_smem<double> ssum;
-    uint64_t keys[1024];
-    uint32_t hist[256];
+    uint64_t keys[1024];   /* the chunks' best keys, merged (LP_TK_CHUNKS * PULSAR_GPU_LOGPROB_TOPK_MAX <= 1024) */
     uint32_t cnt;
-    double sum;
 };
+static_assert(LP_TK_CHUNKS * PULSAR_GPU_LOGPROB_TOPK_MAX <= 1024u, "the merge's store");
+
 
 __device__ __forceinline__ row_view lp_view(const lp_args &a, uint32_t row) {
     row_view rv;
@@ -1664,6 +1665,39 @@ __device__ __forceinline__ row_view lp_view(const lp_args &a, uint32_t row) {
     rv.mask = a.mask && a.mask_row[row] != PULSAR_GPU_SAMPLE_NO_MASK
                   ? a.mask + (size_t)a.mask_row[row] * a.mask_words : nullptr;
     return rv;
+}
+
+/* a chunk of a row (32-aligned, so a mask view stays word-aligned) */
+__device__ __forceinline__ void lp_chunk(uint32_t n, uint32_t c, uint32_t *lo, uint32_t *hi) {
+    const uint32_t per = ((n + LP_TK_CHUNKS - 1u) / LP_TK_CHUNKS + 31u) & ~31u;
+    *lo = min(c * per, n);
+    *hi = min(*lo + per, n);
+}
+
+/* pass 2b, LP_TK_CHUNKS blocks a row: each chunk's best min(k, its finite count) keys (select_topk's), ids made the
+ * row's -- the row's best k are among the chunks' best k, in the same total order */
+__global__ void __launch_bounds__(LP_TK_THREADS) logprobs_topk_kernel(const __grid_constant__ lp_args a) {
+    __shared__ uint64_t keys[1024];
+    __shared__ uint32_t hist[256], redu[LP_TK_THREADS], cnt;
+    const uint32_t c = blockIdx.x, j = blockIdx.y, tid = threadIdx.x;
+    const row_view rv = lp_view(a, a.row0 + j);
+    uint32_t lo, hi;
+    lp_chunk(rv.n, c, &lo, &hi);
+    row_view cv = rv;
+    cv.x = rv.x + lo;
+    cv.n = hi - lo;
+    cv.mask = rv.mask ? rv.mask + lo / 32u : nullptr;
+    uint32_t nfin = 0;
+    for (uint32_t i = tid; i < cv.n; i += LP_TK_THREADS) nfin += finite_bits(cv(i)) ? 1u : 0u;
+    nfin = block_sum_u32<LP_TK_THREADS>(nfin, redu);
+    const uint32_t kc = min(min(a.top_k, rv.n), nfin);
+    if (kc > 0) select_topk<LP_TK_THREADS>(cv, kc, keys, hist, &cnt, redu);
+    uint64_t *out = a.tk + ((size_t)j * LP_TK_CHUNKS + c) * PULSAR_GPU_LOGPROB_TOPK_MAX;
+    for (uint32_t i = tid; i < kc; i += LP_TK_THREADS) out[i] = keys[i] + lo;   /* the id is the low word */
+    if (tid == 0) {
+        a.tk_n[((size_t)j * LP_TK_CHUNKS + c) * 2u] = kc;
+        a.tk_n[((size_t)j * LP_TK_CHUNKS + c) * 2u + 1u] = nfin;
+    }
 }
 
 /* pass 1, one block a row: the first finite maximum */
@@ -1677,15 +1711,15 @@ __global__ void __launch_bounds__(SMP_THREADS) logprobs_max_kernel(const __grid_
     if (threadIdx.x == 0) a.head[j] = lp_head{maxv, maxi};
 }
 
-/* pass 2, PREP_CHUNKS blocks a row: exp(v - max) in double, the host scorer's (plm_exp), for every finite value */
+/* pass 2, LP_EXP_CHUNKS blocks a row: exp(v - max) in double, the host scorer's (plm_exp), for every finite value */
 __global__ void __launch_bounds__(PREP_THREADS) logprobs_exp_kernel(const __grid_constant__ lp_args a) {
     const uint32_t j = blockIdx.y, c = blockIdx.x;
     if (a.head[j].maxi < 0) return;
     const row_view rv = lp_view(a, a.row0 + j);
     const double dmax = (double)a.head[j].maxv;
     double *ex = a.ex + (size_t)j * a.n_vocab;
-    uint32_t lo, hi;
-    prep_chunk(rv.n, c, &lo, &hi);
+    const uint32_t per = (rv.n + LP_EXP_CHUNKS - 1u) / LP_EXP_CHUNKS;
+    const uint32_t lo = min(c * per, rv.n), hi = min(lo + per, rv.n);
     for (uint32_t i = lo + threadIdx.x; i < hi; i += PREP_THREADS) {
         const float v = rv(i);
         ex[i] = finite_bits(v) ? plm_exp(__dsub_rn((double)v, dmax)) : 0.0;   /* +0.0: the host skipped it */
@@ -1706,9 +1740,7 @@ __global__ void __launch_bounds__(SMP_THREADS) logprobs_rows_kernel(const __grid
         return;
     }
     const double dmax = (double)a.head[j].maxv;
-    if (tid == 0) sm.sum = a.sums[j];
-    __syncthreads();
-    const double lsum = plm_log(sm.sum);
+    const double lsum = plm_log(a.sums[j]);
     if (tid == 0) {
         const int32_t t = a.token ? a.token[(size_t)row * a.token_stride] : -1;
         o->have_token = t >= 0 && (uint32_t)t < rv.n ? 1u : 0u;
@@ -1725,11 +1757,20 @@ __global__ void __launch_bounds__(SMP_THREADS) logprobs_rows_kernel(const __grid
         if (tid == 0) o->n_top = 0;
         return;
     }
-    uint32_t nfin = 0;
-    for (uint32_t i = tid; i < rv.n; i += SMP_THREADS) nfin += finite_bits(rv(i)) ? 1u : 0u;
-    nfin = block_sum_u32<SMP_THREADS>(nfin, sm.redu);
-    const uint32_t kf = min(k, nfin);
-    select_topk<SMP_THREADS>(rv, kf, sm.keys, sm.hist, &sm.cnt, sm.redu);
+    /* the chunks' best, merged: one sort of their union, its first min(k, finite) */
+    if (tid == 0) {
+        uint32_t m = 0, nfin = 0;
+        for (uint32_t c = 0; c < LP_TK_CHUNKS; c++) {
+            const uint32_t *cn = a.tk_n + ((size_t)j * LP_TK_CHUNKS + c) * 2u;
+            const uint64_t *ck = a.tk + ((size_t)j * LP_TK_CHUNKS + c) * PULSAR_GPU_LOGPROB_TOPK_MAX;
+            for (uint32_t i = 0; i < cn[0]; i++) sm.keys[m++] = ck[i];
+            nfin += cn[1];
+        }
+        sm.cnt = m | (min(k, nfin) << 16);
+    }
+    __syncthreads();
+    const uint32_t m = sm.cnt & 0xffffu, kf = sm.cnt >> 16;
+    bitonic_sort<SMP_THREADS>(sm.keys, m);
     const double logsum = __dadd_rn(lsum, dmax);
     for (uint32_t i = tid; i < k; i += SMP_THREADS) {
         pulsar_gpu_token_score ts;
@@ -2105,9 +2146,13 @@ int pulsar_gpu_sample_rows(const pulsar_gpu_tensor *logits, uint64_t logits_offs
 
 static uint64_t lp_sr_off(uint32_t n_vocab) { return (256u + (uint64_t)LP_GROUP * n_vocab * sizeof(double) + 255u) & ~255ull; }
 
+static uint64_t lp_tk_off(uint32_t n_vocab) { return (lp_sr_off(n_vocab) + sr_scratch_bytes(n_vocab) + 255u) & ~255ull; }
+static constexpr uint64_t LP_TK_BYTES =
+    (uint64_t)LP_GROUP * LP_TK_CHUNKS * (PULSAR_GPU_LOGPROB_TOPK_MAX * sizeof(uint64_t) + 2u * sizeof(uint32_t));
+
 uint64_t pulsar_gpu_logprobs_scratch_bytes(uint32_t n_vocab) {
     static_assert(LP_GROUP * sizeof(lp_head) <= 256u, "the logprob scratch's head");
-    return lp_sr_off(n_vocab) + sr_scratch_bytes(n_vocab);
+    return lp_tk_off(n_vocab) + LP_TK_BYTES;
 }
 
 int pulsar_gpu_logprobs_rows(const pulsar_gpu_tensor *logits, uint64_t logits_offset_bytes, uint32_t row_stride,
@@ -2140,11 +2185,14 @@ int pulsar_gpu_logprobs_rows(const pulsar_gpu_tensor *logits, uint64_t logits_of
     a.head = (lp_head *)scratch->ptr;
     a.ex = (double *)((uint8_t *)scratch->ptr + 256u);
     const sr_scratch src = sr_carve((uint8_t *)scratch->ptr + lp_sr_off(n_vocab), n_vocab);
+    a.tk = (uint64_t *)((uint8_t *)scratch->ptr + lp_tk_off(n_vocab));
+    a.tk_n = (uint32_t *)(a.tk + (size_t)LP_GROUP * LP_TK_CHUNKS * PULSAR_GPU_LOGPROB_TOPK_MAX);
     for (uint32_t r0 = 0; r0 < n_rows; r0 += LP_GROUP) {
         const uint32_t g = min(LP_GROUP, n_rows - r0);
         a.row0 = r0;
         logprobs_max_kernel<<<g, SMP_THREADS>>>(a);
-        logprobs_exp_kernel<<<dim3(PREP_CHUNKS, g), PREP_THREADS>>>(a);
+        logprobs_exp_kernel<<<dim3(LP_EXP_CHUNKS, g), PREP_THREADS>>>(a);
+        logprobs_topk_kernel<<<dim3(LP_TK_CHUNKS, g), LP_TK_THREADS>>>(a);
         sr_args sa;
         memset(&sa, 0, sizeof(sa));
         sa.n_rows = g;
