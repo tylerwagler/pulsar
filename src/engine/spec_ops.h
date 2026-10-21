@@ -115,6 +115,11 @@ typedef struct pulsar_drafter_ops {
      *  `draft` for each bank.  0, or -1 with `err` on a device failure. */
     int (*draft_batch)(struct pulsar_session *s, struct pulsar_spec_round **rounds, const uint32_t *banks,
                        uint64_t **rngs, int n, char *err, size_t errlen);
+    /** Optional (L306).  The drafter's own graph catalog at the startup warmup: run every shape its captured draft
+     *  pass takes live (bank counts x attention bounds) twice on the installed bank, writing no state, inside the
+     *  warmup's segment window (pulsar_gpu_seg_catalog_open) -- so no live round pays the capture.  0, or -1 with
+     *  `err`.  NULL = the drafter graphs nothing (or its shapes ride the verify walk). */
+    int (*warm)(struct pulsar_session *s, char *err, size_t errlen);
 } pulsar_drafter_ops;
 
 #endif /* PULSAR_SPEC_OPS_H */
