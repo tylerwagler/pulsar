@@ -1154,15 +1154,27 @@ uint32_t pulsar_session_resume_point(pulsar_session *s, uint32_t bank, int commo
     const pulsar_ckpt_store *st = pulsar_session_kv_store(s);
     if (!st || !st->ops) return 0u;
     const uint32_t G = limit ? pulsar_ckpt_best(st, bank, limit) : 0u;
-    /* L289: the bank's prompt end T, when the prompt IS that prompt: it resumes AT T with the logits its prefill
-     * left -- no row evaluated, every family.  (A longer prompt resumes from the grid as before: a payload carries
-     * the grid checkpoint, so a restored session resumes as the saved one would.) */
-    const uint32_t T = pulsar_ckpt_end(st, bank);
-    if (T > G && T == (uint32_t)prompt_len && T <= (uint32_t)common && T <= frontier) {
-        const pulsar_tokens *h = pulsar_bank_history(s, bank);
-        if (h && pulsar_ckpt_end_matches(st, bank, h->v, (uint32_t)h->len)) return T;
-    }
+    /* L289 / L311: the bank's records (its prompt end, its message endpoint) -- the prefill's own state at an exact
+     * T the prompt carries (T within the match and the prefilled history).  A record AT the prompt's end resumes
+     * there with the logits its prefill left, no row evaluated, every family.  One below it resumes from T and
+     * prefills the rest only on a split-invariant family, where that IS the cold prefill's bytes; elsewhere a longer
+     * prompt resumes from the grid (only a grid cut is the cold prefill's, L183). */
+    uint32_t rlimit = (uint32_t)common;
+    if (rlimit > frontier) rlimit = frontier;
+    if (rlimit > (uint32_t)prompt_len) rlimit = (uint32_t)prompt_len;
+    const pulsar_tokens *h = pulsar_bank_history(s, bank);
+    const pulsar_ckpt_record *r =
+        h ? pulsar_ckpt_record_best(st, bank, h->v, (uint32_t)h->len, rlimit, (uint32_t)prompt_len) : NULL;
+    if (r && r->T > G && (r->T == (uint32_t)prompt_len || st->ops->split_invariant)) return r->T;
     return G;
+}
+
+const pulsar_ckpt_record *pulsar_session_resume_record(pulsar_session *s, uint32_t bank, uint32_t T, int prompt_len) {
+    const pulsar_ckpt_store *st = pulsar_session_kv_store(s);
+    const pulsar_tokens *h = pulsar_bank_history(s, bank);
+    if (!st || !st->ops || !h || T == 0u || pulsar_ckpt_best(st, bank, T) == T) return NULL;
+    const pulsar_ckpt_record *r = pulsar_ckpt_record_best(st, bank, h->v, (uint32_t)h->len, T, (uint32_t)prompt_len);
+    return r && r->T == T ? r : NULL;
 }
 bool pulsar_session_bank_continues(pulsar_session *s, uint32_t bank, int len) {
     const pulsar_ckpt_store *st = pulsar_session_kv_store(s);
