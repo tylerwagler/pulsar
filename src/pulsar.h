@@ -1111,6 +1111,18 @@ int pulsar_session_bank_checkpoint_best(pulsar_session *s, uint32_t bank, int li
  *  and the stitched prompt's length - 1, else nothing (0). */
 int pulsar_session_bank_resume_at(pulsar_session *s, uint32_t bank, const pulsar_tokens *prompt);
 int pulsar_session_restore_checkpoint(pulsar_session *s, int G, char *err, size_t errlen);
+/** L313: bank-independent checkpoints -- the INSTALLED bank adopts ANOTHER bank's published state for `prompt`: the
+ *  deepest of `src`'s grid checkpoints and records the prompt carries (the resume rule's terms, over src's prefill-only
+ *  history), copied in -- src's pool rows below T, then its checkpoint -- so the installed bank stands at T with src's
+ *  tokens to T as its view (and, at a prompt end that IS the prompt, its logits); the sync that follows prefills the
+ *  rest, the cold prefill's bytes.  src may be busy (its rows below T never change while its history reaches T).
+ *  A text history only.  @return T, 0 when src serves nothing (or holds an image block below it), -1 with `err` on a
+ *  refusal (a tensor-parallel engine, not another bank, a copy that failed: the installed bank then describes no
+ *  position and must be synced from nothing). */
+int pulsar_session_bank_adopt(pulsar_session *s, uint32_t src, const pulsar_tokens *prompt, char *err, size_t errlen);
+/** L313: the T pulsar_session_bank_adopt would adopt from `src` for `prompt` (a host scan, no device work; 0 for the
+ *  installed bank, none, or a tensor-parallel engine). */
+int pulsar_session_bank_adopt_score(pulsar_session *s, uint32_t src, const pulsar_tokens *prompt);
 int pulsar_session_pos(pulsar_session *s);
 int pulsar_session_ctx(pulsar_session *s);
 int pulsar_session_prefill_cap(pulsar_session *s);

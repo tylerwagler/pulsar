@@ -759,6 +759,33 @@ void server::gen_begin(session_slot *sl) {
          * outlives the restore. */
         s->kv_cache_persist(sl, "evict", true);
     }
+    if (cached == 0 && s->pool_banks > 1 && !image_request) {
+        /* L313: another bank's published checkpoint -- a busy main conversation's prompt end or message endpoint,
+         * an idle bank's grid checkpoint -- copied in beats the disk and a prefill: the deepest one any other
+         * resident bank holds for this prompt, past what this bank's own state serves */
+        int src = -1, best = memory_resume;
+        for (int i = 0; i < s->n_slots; i++) {
+            const session_slot *o = &s->slots[i];
+            if (o == sl || !o->provisioned || o->spilled) continue;
+            const int T = pulsar_session_bank_adopt_score(s->sess, o->bank, &j->req.prompt);
+            if (T > best) { best = T; src = (int)o->bank; }
+        }
+        if (src >= 0) {
+            char aerr[192] = "";
+            const double t_a = server_now_sec();
+            const int T = pulsar_session_bank_adopt(s->sess, (uint32_t)src, &j->req.prompt, aerr, sizeof(aerr));
+            if (T > 0) {
+                cached = T;
+                cache_source = "bank-adopt";
+                server_log(PULSAR_LOG_KVCACHE, "pulsar-server: bank %u adopted bank %d's state at %d of %d (%.1f ms)",
+                           sl->bank, src, T, j->req.prompt.len, (server_now_sec() - t_a) * 1e3);
+            } else if (T < 0) {
+                server_log(PULSAR_LOG_WARNING, "pulsar-server: bank %u could not adopt bank %d's state: %s", sl->bank,
+                           src, aerr);
+                pulsar_session_invalidate(s->sess);   /* the bank describes no position: the sync rebuilds it */
+            }
+        }
+    }
     if (cached == 0) {
         /* L310: the chain loads only when reading it beats prefilling what it adds over the bank's own resume */
         disk_cached = s->kv_cache_try_load(sl, &j->req, memory_resume, &effective_prompt, &g->disk_cache_path);
