@@ -28,13 +28,18 @@ import argparse, importlib, os, sys, time, traceback
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from live_server import Grader, Server, StartError  # noqa: E402
 
-# Each model's instance configuration: the union its legs need (L317).  deepseek: the context server-live and the
-# abandon leg ran at, banks auto-fit as before.  qwen: the preempt / prefix legs' 64k context, 8 banks (the stall
-# check's 4 streams + its long prompt need 5 at once; preempt's W, A and B three).  nemotron: opencode's.
+# Each model's instances run production's shape, the legs inside it (L317, 2026-10-21: "use production flags").  From
+# the ledger's record of Sparky's ~/pulsar-serve/*.env -- this file cannot read them, so a change there moves this
+# table in the same row:
+#   qwen      qwen.env: --ctx 262144 --kv-disk-space-mb 65536, PULSAR_MSEQ_BANKS=16 (L298, L305)
+#   nemotron  nemotron.env: --drafter lilicorr --ctx 1048576 --kv-disk-space-mb 65536, PULSAR_MSEQ_BANKS=16 (L298)
+#   deepseek  NOT CONFIRMED against deepseek.env (no recent ledger record): the server's defaults (1M context, banks
+#             auto-fit) and the same 64 GB disk tier
+# Each instance's disk tier is under the run's work dir and removed when it stops: the work dir needs 64 GB free.
 MODELS = {
-    "deepseek": dict(ctx=32768, banks=None),
-    "qwen": dict(ctx=65536, banks=8),
-    "nemotron": dict(ctx=65536, banks=4),
+    "deepseek": dict(ctx=1048576, banks=None, extra=("--kv-disk-space-mb", "65536")),
+    "qwen": dict(ctx=262144, banks=16, extra=("--kv-disk-space-mb", "65536")),
+    "nemotron": dict(ctx=1048576, banks=16, extra=("--drafter", "lilicorr", "--kv-disk-space-mb", "65536")),
 }
 # (leg, module, class, options, models) in run order on a shared server.  The stall check first (it times a long
 # prompt beside four streams: the banks must be free), the abandon leg next (it fills the decode lane).
@@ -77,7 +82,8 @@ def run_model(key, model, legs, binary, work, port, cfg):
         if not todo:
             return
         try:
-            srv = Server(binary, model, work, "%s-%s" % (key, inst), port, cfg["ctx"], cfg["banks"], env)
+            srv = Server(binary, model, work, "%s-%s" % (key, inst), port, cfg["ctx"], cfg["banks"], env,
+                         extra=cfg.get("extra", ()))
         except StartError as e:
             print(str(e), flush=True)
             for n, l in todo:

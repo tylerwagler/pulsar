@@ -170,7 +170,7 @@ on an engine it now shares.
 | leg | before | now |
 |---|---|---|
 | constrained-live, server-live, server-abandon (DeepSeek, Qwen) | own servers after `make gates`, 4 loads a model | `live-legs`, the last section of `make gates`: the model's shared server; constrained's isolation on its hooks instance |
-| L312 stall check | `~/flare-work` script + `~/l312w/tbt2.py`, own server (262k ctx, 16 banks, no disk) | `tests/stall_live.py`, Qwen's shared server, first (64k ctx, 8 banks) |
+| L312 stall check | `~/flare-work` script + `~/l312w/tbt2.py`, own server (262k ctx, 16 banks, no disk) | `tests/stall_live.py`, Qwen's shared server, first (production's shape: 262k ctx, 16 banks, 64 GB disk tier) |
 | prefix-turns reply / side (Qwen) | 2 servers each (warm, cold) | shared server; the reference on Qwen's one fresh instance (0 cached tokens asserted); L316's instrument (thinking echoed, one prompt asserted) |
 | preempt-exact (Qwen) | 4 servers (probe, count, preempt, alone) | probe + counts on the shared server, the preemption on the hooks instance (budget override), A alone on the fresh instance |
 | opencode-turns (Nemotron) | 2 servers | shared + fresh (Nemotron has one leg) |
@@ -185,7 +185,9 @@ on an engine it now shares.
   after a `--model` restricts a hosted model to its own legs; a runner entry marked DEV runs only when
   `--only` names it (gates-dev), and every run lists them by name.  A hosted model none of whose entries the
   selection takes is not opened.
-- *The live legs* (`tests/live_legs.py`, `make live-legs`, `LIVE_LEGS=a,b` for a subset): per model the
+- *The live legs* run at each model's production shape (`tests/live_legs.py` MODELS: Qwen 262k / 16 banks, Nemotron
+  1M / 16 banks / LiLiCorr, each with a 64 GB disk tier; DeepSeek's from the server defaults until deepseek.env is
+  confirmed).  `tests/live_legs.py`, `make live-legs`, `LIVE_LEGS=a,b` for a subset: per model the
   shared server, then one instance with every server-wide test hook its legs need (only if one does), then
   one fresh instance for every reuse == cold reference (only if one does) -- never two engines at once.
   Each leg keeps its checks and its PASS/FAIL; each phase names the instance it ran on; each leg's
