@@ -75,11 +75,13 @@ static void run(pulsar_engine *e, int NB, float temp, int rounds_max, bool repor
     static int acc[32][PULSAR_SPEC_LOGITS_ROWS + 1];
     uint64_t sum[PH_COUNT] = {}, worst[PH_COUNT] = {}, d2h_bytes = 0;
     int rounds = 0, rows_total = 0;
+    std::vector<bool> done(NB, false);   /* a bank whose stream ended (its base token is EOS, or the context) */
     for (int tick = 0; ok && rounds < rounds_max && tick < 4 * rounds_max; tick++) {
         pulsar_spec_step st[32];
         uint32_t bank_of[32];
         int m = 0;
         for (int b = 0; b < NB; b++) {
+            if (done[b]) continue;
             memset(&st[m], 0, sizeof st[m]);
             st[m].bank = (uint32_t)b;
             st[m].round = rd[b];
@@ -101,9 +103,11 @@ static void run(pulsar_engine *e, int NB, float temp, int rounds_max, bool repor
         char why[200] = "";
         for (int i = 0; i < m; i++) {
             if (st[i].status == PULSAR_SPEC_STEP_OK) { st[live] = st[i]; bank_of[live++] = bank_of[i]; }
+            else if (st[i].status == PULSAR_SPEC_STEP_EOS || st[i].status == PULSAR_SPEC_STEP_LENGTH) done[bank_of[i]] = true;
             else if (!why[0]) snprintf(why, sizeof why, "bank %u status %d: %.150s", st[i].bank, (int)st[i].status, st[i].err);
         }
         m = live;
+        if (m == 0 && !why[0]) break;   /* every bank's stream ended: the rounds measured so far stand */
         if (m == 0 || rows == 0) {
             ok = false;
             snprintf(err, sizeof err, "no bank verified at tick %d (%.200s)", tick, why);

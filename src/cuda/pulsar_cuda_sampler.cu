@@ -514,6 +514,14 @@ __device__ __forceinline__ void prep_chunk(uint32_t n, uint32_t c, uint32_t *lo,
     *hi = min(*lo + per, n);
 }
 
+/* chunk c of gridDim.x (the passes that keep no per-chunk record run wider) */
+__device__ __forceinline__ void grid_chunk(uint32_t n, uint32_t c, uint32_t *lo, uint32_t *hi) {
+    const uint32_t per = (n + gridDim.x - 1u) / gridDim.x;
+    *lo = min(c * per, n);
+    *hi = min(*lo + per, n);
+}
+constexpr uint32_t WIDE_CHUNKS = 128;   /* the wide passes' blocks a row */
+
 /* scan: the chunk's first maximum and finite count; a top-k row's first histogram */
 __global__ void __launch_bounds__(PREP_THREADS) prep_scan_kernel(const __grid_constant__ launch_args a, row_prep *prep) {
     __shared__ float rv_[PREP_THREADS];
@@ -653,7 +661,7 @@ __global__ void __launch_bounds__(PREP_THREADS) prep_pvals_kernel(const __grid_c
     const row_view rv = prep_view(a, q);
     float *pv = a.pvals + (size_t)row * a.n_vocab;
     uint32_t lo, hi;
-    prep_chunk(rv.n, c, &lo, &hi);
+    grid_chunk(rv.n, c, &lo, &hi);
     for (uint32_t i = lo + threadIdx.x; i < hi; i += PREP_THREADS) {
         float x = 0.0f;
         (void)row_is_cand(p, i, rv(i), __uint_as_float(0xff800000u), pr->maxv, (uint32_t)pr->maxi, &x);
@@ -938,7 +946,7 @@ __device__ T block_serial_sum(uint32_t n, V value, P pred, uint32_t *stop_at, se
  * nothing ties or crosses), which the tile publishes.  The few tiles where the sum leaves a binade chain; the rest
  * resolve from the look-back. */
 
-constexpr uint32_t SR_THREADS = 256, SR_E = 16, SR_TILE = SR_THREADS * SR_E;
+constexpr uint32_t SR_THREADS = 1024, SR_E = 4, SR_TILE = SR_THREADS * SR_E;
 constexpr uint32_t SR_ROWS = PULSAR_GPU_SAMPLE_ROWS_MAX;
 
 struct sr_status {
@@ -1445,7 +1453,7 @@ __global__ void __launch_bounds__(PREP_THREADS) full_keygen_kernel(const __grid_
         s.st->status = n == 0 ? PULSAR_GPU_SAMPLE_REFUSED_EMPTY : PULSAR_GPU_SAMPLE_OK;
     }
     uint32_t lo, hi;
-    prep_chunk(rv.n, c, &lo, &hi);
+    grid_chunk(rv.n, c, &lo, &hi);
     for (uint32_t i = lo + tid; i < hi; i += PREP_THREADS) {
         const float v = rv(i);
         s.k_in[i] = finite_bits(v) ? desc_key(v) : 0xffffffffu;
@@ -1465,7 +1473,7 @@ __global__ void __launch_bounds__(PREP_THREADS) full_probs_kernel(const __grid_c
     if (n == 0) return;
     const float maxlogit = rv(s.ids[0]);   /* the sorted head */
     uint32_t lo, hi;
-    prep_chunk(n, c, &lo, &hi);
+    grid_chunk(n, c, &lo, &hi);
     for (uint32_t i = lo + tid; i < hi; i += PREP_THREADS)
         s.p[i] = plm_expf(__fmul_rn(__fsub_rn(rv(s.ids[i]), maxlogit), p.rcpT));
 }
@@ -1482,7 +1490,7 @@ __global__ void __launch_bounds__(PREP_THREADS) full_floor_kernel(const __grid_c
     if (n == 0) return;
     const float min_e = __fmul_rn(s.p[0], p.min_p);
     uint32_t lo, hi;
-    prep_chunk(n, c, &lo, &hi);
+    grid_chunk(n, c, &lo, &hi);
     uint32_t stop = UINT32_MAX;
     for (uint32_t i = max(lo, 1u) + tid; i < hi; i += PREP_THREADS)   /* i rises: this thread's first is its least */
         if (s.p[i] < min_e) { stop = i; break; }
@@ -2076,7 +2084,7 @@ int pulsar_gpu_sample_rows(const pulsar_gpu_tensor *logits, uint64_t logits_offs
     }
     prep_collect_kernel<<<pg, PREP_THREADS>>>(a, prep);
     if (a.idsum_rows) {   /* the id-order sums, over the GPU, before the row kernel reads them */
-        prep_pvals_kernel<<<pg, PREP_THREADS>>>(a, prep);
+        prep_pvals_kernel<<<dim3(WIDE_CHUNKS, n_rows), PREP_THREADS>>>(a, prep);
         sr_args sa;
         memset(&sa, 0, sizeof(sa));
         sa.n_rows = n_rows;
@@ -2098,7 +2106,7 @@ int pulsar_gpu_sample_rows(const pulsar_gpu_tensor *logits, uint64_t logits_offs
         for (; r0 < n_rows && g.n < FULL_GROUP; r0++)
             if ((a.full_rows >> r0) & 1u) g.row[g.n++] = r0;
         if (g.n == 0) break;
-        full_keygen_kernel<<<dim3(PREP_CHUNKS, g.n), PREP_THREADS>>>(a, g, prep);
+        full_keygen_kernel<<<dim3(WIDE_CHUNKS, g.n), PREP_THREADS>>>(a, g, prep);
         for (uint32_t j = 0; j < g.n; j++) {
             uint8_t *base = a.slots + (uint64_t)j * a.slot_bytes;
             uint32_t *k0 = (uint32_t *)base, *v0 = k0 + n_vocab, *k1 = v0 + n_vocab, *v1 = k1 + n_vocab;
@@ -2111,8 +2119,8 @@ int pulsar_gpu_sample_rows(const pulsar_gpu_tensor *logits, uint64_t logits_offs
             /* the pass count is fixed by the key width, so where the sorted ids land is the same for every slot */
             g.sorted_in_alt = vb.selector;
         }
-        full_probs_kernel<<<dim3(PREP_CHUNKS, g.n), PREP_THREADS>>>(a, g, prep);
-        full_floor_kernel<<<dim3(PREP_CHUNKS, g.n), PREP_THREADS>>>(a, g);
+        full_probs_kernel<<<dim3(WIDE_CHUNKS, g.n), PREP_THREADS>>>(a, g, prep);
+        full_floor_kernel<<<dim3(WIDE_CHUNKS, g.n), PREP_THREADS>>>(a, g);
         {   /* the sum in sorted order, the mass test, then the cut's walk (both over the GPU) */
             sr_args sa;
             memset(&sa, 0, sizeof(sa));
