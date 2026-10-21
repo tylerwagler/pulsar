@@ -1078,17 +1078,13 @@ bool gpu_graph_encode_output_head_batch(
         const uint64_t key = gpu_graph_output_head_seg_key(hc_parity, n_tokens,
                                                            pulsar_gpu_matmul_decode_prefix(n_tokens));
         const int st = pulsar_gpu_seg_enter(key);
+        if (st < 0) return false;   /* L306: this shape's graph failed (the runtime's line names it) */
         if (st == 2) return true;
         if (st == 1) {
             const bool ok = gpu_graph_encode_output_head_batch_impl(
                     g, model, weights, 0u, n_tokens, vocab_lo, vocab_dim, out);
-            if (pulsar_gpu_seg_exit(key, ok ? 1 : 0)) return true;
-            /* Capture failed (key now poisoned): the recorded work never ran,
-             * and a mid-capture violation can fail an otherwise-good body —
-             * run the body for real regardless of ok; a REAL body failure
-             * simply fails again here and propagates. */
-            return gpu_graph_encode_output_head_batch_impl(
-                    g, model, weights, 0u, n_tokens, vocab_lo, vocab_dim, out);
+            /* L306: a failed capture ran nothing and refuses -- no eager re-run */
+            return pulsar_gpu_seg_exit(key, ok ? 1 : 0) != 0;
         }
     }
     return gpu_graph_encode_output_head_batch_impl(g, model, weights, row0, n_tokens,

@@ -1,6 +1,8 @@
 #include "pulsar_cuda_internal.h"
 #include "engine/exl3_trellis.h" /* L269 W1: exl3_expert_cut, the EXL3 expert half */
 
+#include <list>
+
 
 static const void *g_model_host_base;
 
@@ -1703,212 +1705,332 @@ int pulsar_gpu_batched_copy_run(void *handle, uint32_t n_descs, uint64_t max_byt
 int pulsar_gpu_begin_commands(void) { return 1; }
 
 
-/* ==== L119 segment capture-or-replay ========================================
+/* ==== L119 / L306 segment graphs ===========================================
  *
- * Small CUDA-graph cache for ROUND-INVARIANT stretches of the batched decode
- * sweep (plan 119; the 2026-08-27 audit's verdict table says which stretches
- * qualify). Keyed by (layer, phase, n_tokens); a key's first two uses run
- * eager (scratch slots warm up — cudaMalloc during capture is illegal), the
- * third is captured + instantiated + launched, later uses replay with one
- * cudaGraphLaunch. Worker-thread only (like every sweep entry); ThreadLocal
- * capture mode so other threads' CUDA ops are unaffected.
+ * The CUDA-graph cache of the round-invariant stretches a step declares: the DeepSeek output head
+ * (gpu_graph_encode_output_head_batch), a staged family's whole decode / pure-verify step (step_driver.cpp) and the
+ * block drafter's pass (spec_block.cpp).  The caller computes the KEY -- everything host-side the stretch's launches
+ * depend on -- and brackets the launches with seg_enter / seg_exit:
  *
- * This is NOT the old whole-sweep "graph tape" (removed at a +0.6% ceiling
- * when classic decode was 98.9% GPU-busy — see pulsar_gpu.h): the unified
- * spec-batched lane measures 92% busy unprofiled (L119), and these segments
- * target exactly its inter-launch fragmentation.
+ *   seg_enter  2  a captured graph replayed: the body must not run;
+ *              1  capture armed: run the body (recorded, not executed), then seg_exit;
+ *              0  run the body eagerly: a warm use (below), the cache off (an instrument), key 0 (the caller's own
+ *                 eager lane: a diagnostic tap, TP), or a stretch nested in a capture (recorded into the outer one);
+ *             -1  REFUSED: this key's capture or replay failed (L306: the step fails; there is no eager fallback).
+ *   seg_exit   1  instantiated, launched and cached -- the body's work ran;
+ *              0  nothing ran: the body refused under capture (its own line says why), or the capture,
+ *                 instantiation or launch failed -- the step refuses (L306, rules 1 and 9).
  *
- * Always on (L119 verdict): the OUTPUT HEAD is the one segment whose shape
- * pays on GB10 — one dense graph per round (+1-2% solo, bitwise-proven).
- * Per-layer FFN segments measured -13% (cudaGraphLaunch is expensive on
- * integrated Blackwell; 43 small graphs/round lose) and are deleted. */
-/** One cached CUDA graph, keyed by the launch shape it was captured for. */
-typedef struct {
-    uint64_t key;           ///< hash of the launch shape this graph was captured for
-    cudaGraphExec_t exec;   ///< the instantiated graph
-    uint32_t uses;          ///< replays served, for the capture/replay counters
-    /** POISONED KEY: capture failed for this shape once, so never attempt it
-     * again -- fall back to eager launches for good. Cleared only by a full
-     * segment-cache reset. A retry loop here would re-pay a failing capture
-     * every round. */
-    int dead;
-} pulsar_seg_ent;
-#define PULSAR_SEG_SLOTS 1024u
-static pulsar_seg_ent g_seg[PULSAR_SEG_SLOTS];
-static int g_seg_capturing = 0;
+ * Eager and replayed launches are the same launches, so their bytes are the same (head-graph-replay-gate,
+ * nemotron-fwd-gate X7, mtp-spec-gate): a warm use is not a second path.  A failure is: before L306 a failed capture
+ * poisoned its key and ran the shape eagerly forever, a failed replay re-captured after a dozen eager uses, and a
+ * full table ran eager -- each a fallback nobody measured.  Now a failure is one loud line naming the key and the
+ * CUDA error, and every later use of that key refuses (counted in pulsar_gpu_seg_stats::refusals).
+ *
+ * Two kinds of key:
+ *   CATALOG  declared by the startup warmup (pulsar_gpu_seg_catalog_open .. _close: the warmup generation, the L301
+ *            verify-curve walk over every verify width, the block drafter's sweep over its bank counts and attention
+ *            bounds).  One eager use warms the stretch's scratch (an allocation is illegal under capture), the second
+ *            captures, so the walk leaves every shape it declares captured before the listener opens.  Pinned.
+ *   LIVE     first seen after the warmup.  Captured at its 12th use -- transient shapes (an adaptive depth's
+ *            wobble) stay eager rather than pay an instantiate each (L119 measured that storm at -13%).  At most
+ *            SEG_LIVE_MAX of them are held; past it the least recently used is dropped (counted, announced once):
+ *            the table never runs a shape eager because it is full.
+ *
+ * Invalidation (L119): pulsar_gpu_seg_reset drops everything (a graph teardown: the execs bake its buffers);
+ * pulsar_gpu_seg_note_device_free drops every exec but keeps the catalog (a scratch regrow: the baked pointers die;
+ * the catalog recaptures on its next uses, counted as live captures).  Worker thread only; ThreadLocal capture mode,
+ * so other threads' CUDA calls are unaffected. */
+namespace {
 
-static uint64_t g_seg_n_replay, g_seg_n_capture, g_seg_n_eager;
-/* L296 perf: an instrument's eager reference (pulsar_gpu_seg_set_enabled) -- never set by the engine */
-static int g_seg_off = 0;
+/** One key's cache state. */
+struct seg_ent {
+    cudaGraphExec_t exec = nullptr;      ///< the instantiated graph (nullptr: not captured yet)
+    uint64_t bytes = 0;                  ///< the device memory its instantiation took (cudaMemGetInfo delta)
+    uint32_t uses = 0;                   ///< eager uses so far, toward the capture
+    bool catalog = false;                ///< declared by the warmup: pinned, captured on its second use
+    bool dead = false;                   ///< a capture or replay failed: every later use refuses
+    std::list<uint64_t>::iterator lru;   ///< a live key's place in g_seg_lru (catalog and dead keys are not in it)
+};
 
-static pulsar_seg_ent *seg_find(uint64_t key) {
-    uint32_t h = (uint32_t)((key * 1099511628211ull) >> 33) % PULSAR_SEG_SLOTS;
-    /* Bounded probe: a full/degenerate table must cost O(64), not O(slots),
-     * per segment call — misses fall back to eager. */
-    for (uint32_t i = 0; i < 64u; i++) {
-        pulsar_seg_ent *e = &g_seg[(h + i) % PULSAR_SEG_SLOTS];
-        if (e->key == key) return e;
-        if (e->key == 0) { e->key = key; return e; }
-    }
-    return NULL;
+constexpr uint32_t SEG_LIVE_WARM = 11u;      ///< a live key's eager uses before its capture (the 12th captures)
+constexpr uint32_t SEG_CATALOG_WARM = 1u;    ///< a catalog key's: one warms its scratch, the second captures
+constexpr size_t SEG_LIVE_MAX = 1024u;       ///< live keys held; past it the least recently used is dropped
+
+std::unordered_map<uint64_t, seg_ent> g_seg;
+std::list<uint64_t> g_seg_lru;               ///< the live keys, most recently used first
+bool g_seg_capturing = false;
+bool g_seg_reset_pending = false;            ///< a scratch regrow during a capture: drop every exec after it
+bool g_seg_catalog_on = false;               ///< the warmup's declaration window is open
+bool g_seg_catalog_done = false;             ///< a warmup declared a catalog and closed (a regrow after it is news)
+bool g_seg_off = false;                      ///< L296 perf: an instrument's eager reference (never the engine)
+double g_seg_catalog_t0 = 0.0;
+pulsar_gpu_seg_stats g_seg_st;
+
+double seg_now(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec + 1e-9 * (double)ts.tv_nsec;
 }
 
-/* 0 = run the body eagerly; 1 = capture armed (run the body, then seg_exit);
- * 2 = replayed a cached graph (skip the body entirely). */
-int pulsar_gpu_seg_enter(uint64_t key) {
-    /* L119: always on (the PULSAR_CUDA_GRAPH_SEG dev gate and its bisect
-     * values died with the FFN segments — the losing variant is deleted,
-     * the head segment ships default-on). */
-    if (g_seg_capturing || key == 0 || g_seg_off) return 0;
-    pulsar_seg_ent *e = seg_find(key);
-    if (!e || e->dead) return 0;
-    if (e->exec) {
-        if (cudaGraphLaunch(e->exec, cudaStreamPerThread) == cudaSuccess) {
-            if ((++g_seg_n_replay % 4096u) == 0u)
-                fprintf(stderr, "pulsar: L119 seg stats: %llu replays, %llu captures, %llu eager\n",
-                        (unsigned long long)g_seg_n_replay,
-                        (unsigned long long)g_seg_n_capture,
-                        (unsigned long long)g_seg_n_eager);
-            return 2;
+uint64_t seg_free_bytes(void) {
+    size_t fr = 0, tot = 0;
+    if (cudaMemGetInfo(&fr, &tot) != cudaSuccess) {
+        (void)cudaGetLastError();
+        return 0;
+    }
+    return (uint64_t)fr;
+}
+
+void seg_drop_exec(seg_ent &e) {
+    if (!e.exec) return;
+    (void)cudaGraphExecDestroy(e.exec);
+    e.exec = nullptr;
+    g_seg_st.graphs--;
+    g_seg_st.graph_bytes -= e.bytes;
+    e.bytes = 0;
+}
+
+/* A key's capture or replay failed: it refuses from now on.  One line per key (rule 9: loudly, once). */
+void seg_kill(uint64_t key, seg_ent &e, const char *what, cudaError_t rc) {
+    (void)cudaGetLastError();
+    seg_drop_exec(e);
+    if (!e.catalog && !e.dead) g_seg_lru.erase(e.lru);
+    e.dead = true;
+    g_seg_st.dead++;
+    fprintf(stderr, "pulsar: L306 segment graph %s FAILED for key %016llx (%s): this shape REFUSES from now on -- no "
+                    "eager fallback (ENGINEERING-RULES 1, 9)\n",
+            what, (unsigned long long)key, cudaGetErrorString(rc));
+}
+
+/* The key's entry, made on first sight -- a catalog key while the warmup's window is open, else a live one (the least
+ * recently used live key dropped when the table holds SEG_LIVE_MAX). */
+seg_ent &seg_lookup(uint64_t key) {
+    auto it = g_seg.find(key);
+    if (it == g_seg.end()) {
+        if (!g_seg_catalog_on && g_seg_lru.size() >= SEG_LIVE_MAX) {
+            const uint64_t old = g_seg_lru.back();
+            g_seg_lru.pop_back();
+            auto ot = g_seg.find(old);
+            seg_drop_exec(ot->second);
+            g_seg.erase(ot);
+            if (g_seg_st.evictions++ == 0)
+                fprintf(stderr, "pulsar: L306 segment graphs: %zu live shapes held -- the least recently used is "
+                                "dropped for each new one (counted: pulsar_gpu_seg_stats::evictions)\n",
+                        SEG_LIVE_MAX);
         }
-        /* A failed replay poisons the entry: fall back to eager forever. */
-        (void)cudaGraphExecDestroy(e->exec);
-        e->exec = NULL;
-        e->uses = 0;
-        (void)cudaGetLastError();
+        it = g_seg.emplace(key, seg_ent()).first;
+        seg_ent &e = it->second;
+        if (g_seg_catalog_on) {
+            e.catalog = true;
+            g_seg_st.catalog_keys++;
+        } else {
+            g_seg_lru.push_front(key);
+            e.lru = g_seg_lru.begin();
+        }
+        return e;
+    }
+    seg_ent &e = it->second;
+    if (e.dead || e.catalog) return e;
+    if (g_seg_catalog_on) {   /* a live key the warmup declares too: pinned from now on */
+        g_seg_lru.erase(e.lru);
+        e.catalog = true;
+        if (e.uses > SEG_CATALOG_WARM) e.uses = SEG_CATALOG_WARM;
+        g_seg_st.catalog_keys++;
+    } else if (e.lru != g_seg_lru.begin()) {
+        g_seg_lru.splice(g_seg_lru.begin(), g_seg_lru, e.lru);
+    }
+    return e;
+}
+
+/* A scratch regrow (or the instrument's switch): every exec dropped, every key's warm-up started over; the catalog
+ * keys stay declared, the live ones are forgotten, a dead key stays dead. */
+void seg_drop_graphs(void) {
+    for (auto it = g_seg.begin(); it != g_seg.end();) {
+        seg_ent &e = it->second;
+        seg_drop_exec(e);
+        e.uses = 0;
+        if (e.catalog || e.dead) {
+            ++it;
+        } else {
+            it = g_seg.erase(it);
+        }
+    }
+    g_seg_lru.clear();
+    g_seg_reset_pending = false;
+}
+
+}  // namespace
+
+int pulsar_gpu_seg_enter(uint64_t key) {
+    if (g_seg_capturing || key == 0 || g_seg_off) return 0;
+    seg_ent &e = seg_lookup(key);
+    if (e.dead) {
+        g_seg_st.refusals++;
+        return -1;
+    }
+    if (e.exec) {
+        const cudaError_t rc = cudaGraphLaunch(e.exec, cudaStreamPerThread);
+        if (rc != cudaSuccess) {
+            seg_kill(key, e, "replay", rc);
+            g_seg_st.refusals++;
+            return -1;
+        }
+        if ((++g_seg_st.replays % 4096u) == 0u)
+            fprintf(stderr, "pulsar: L306 graph stats: %llu replays, %llu captures (%llu live), %llu graphs held "
+                            "(%.1f MiB), %llu evicted, %llu refused\n",
+                    (unsigned long long)g_seg_st.replays, (unsigned long long)g_seg_st.captures,
+                    (unsigned long long)g_seg_st.live_captures, (unsigned long long)g_seg_st.graphs,
+                    (double)g_seg_st.graph_bytes / 1048576.0, (unsigned long long)g_seg_st.evictions,
+                    (unsigned long long)g_seg_st.refusals);
+        return 2;
+    }
+    g_seg_st.misses++;
+    if (e.uses < (e.catalog ? SEG_CATALOG_WARM : SEG_LIVE_WARM)) {
+        e.uses++;
         return 0;
     }
-    /* Capture only genuinely HOT shapes: adaptive-K makes rows wobble, and
-     * capturing every transient (layer, rows, parity) combo is an
-     * instantiate storm that measured SLOWER than eager (16.2 vs 18.6 t/s
-     * solo). Transient shapes stay eager; the hot steady-state set (a few
-     * rows values) crosses the threshold quickly. */
-    e->uses++;
-    if (e->uses < 12u) { g_seg_n_eager++; return 0; }
-    if (cudaStreamBeginCapture(cudaStreamPerThread,
-                               cudaStreamCaptureModeThreadLocal) != cudaSuccess) {
-        (void)cudaGetLastError();
-        return 0;
+    const cudaError_t rc = cudaStreamBeginCapture(cudaStreamPerThread, cudaStreamCaptureModeThreadLocal);
+    if (rc != cudaSuccess) {
+        seg_kill(key, e, "capture begin", rc);
+        g_seg_st.refusals++;
+        return -1;
     }
-    g_seg_capturing = 1;
-    g_seg_n_capture++;
+    g_seg_capturing = true;
+    g_seg_st.captures++;
+    if (!g_seg_catalog_on && g_seg_st.live_captures++ == 0 && g_seg_catalog_done)
+        fprintf(stderr, "pulsar: L306 a live step captured a graph after the warmup (key %016llx, %s): counted in "
+                        "pulsar_gpu_seg_stats::live_captures\n",
+                (unsigned long long)key, e.catalog ? "a catalog shape after a scratch regrow" : "not in the catalog");
     return 1;
 }
 
-/* L119: drop every cached exec graph. MUST be called when a gpu graph is
- * torn down: the cached graphs bake that graph's device allocations, and a
- * later session reusing (or re-receiving) those addresses would replay
- * against freed state — the multiseq/bank gates create sessions repeatedly
- * and caught exactly this (4 gate FAILs, 2026-08-27). Worker thread only. */
-static int g_seg_reset_pending = 0;
+int pulsar_gpu_seg_exit(uint64_t key, int body_ok) {
+    cudaGraph_t gr = NULL;
+    g_seg_capturing = false;
+    const cudaError_t rc = cudaStreamEndCapture(cudaStreamPerThread, &gr);
+    seg_ent &e = g_seg.find(key)->second;   /* enter made it; nothing drops an entry while a capture is open */
+    if (!body_ok) {
+        /* the body refused under capture: its own line says why, nothing ran, the key is as it was */
+        if (gr) (void)cudaGraphDestroy(gr);
+        (void)cudaGetLastError();
+        if (g_seg_reset_pending) seg_drop_graphs();
+        return 0;
+    }
+    if (rc != cudaSuccess || !gr) {
+        if (gr) (void)cudaGraphDestroy(gr);
+        seg_kill(key, e, "capture", rc != cudaSuccess ? rc : cudaErrorStreamCaptureInvalidated);
+        g_seg_st.refusals++;
+        if (g_seg_reset_pending) seg_drop_graphs();
+        return 0;
+    }
+    cudaGraphExec_t ex = NULL;
+    const uint64_t f0 = seg_free_bytes();
+    /* L296 dec2: the kernel nodes keep the priority of the stream they were captured on (a block's routed chain on
+     * its priority stream, pulsar_rows_moe_routed_fork) */
+    const cudaError_t ri = cudaGraphInstantiateWithFlags(&ex, gr, cudaGraphInstantiateFlagUseNodePriority);
+    const uint64_t f1 = seg_free_bytes();
+    (void)cudaGraphDestroy(gr);
+    if (ri != cudaSuccess) {
+        seg_kill(key, e, "instantiate", ri);
+        g_seg_st.refusals++;
+        if (g_seg_reset_pending) seg_drop_graphs();
+        return 0;
+    }
+    const cudaError_t rl = cudaGraphLaunch(ex, cudaStreamPerThread);
+    if (rl != cudaSuccess) {
+        (void)cudaGraphExecDestroy(ex);
+        seg_kill(key, e, "first launch", rl);
+        g_seg_st.refusals++;
+        if (g_seg_reset_pending) seg_drop_graphs();
+        return 0;
+    }
+    if (g_seg_reset_pending) {
+        /* a scratch regrow DURING this capture: the graph ran (the work is done) but its baked pointers may be stale
+         * for later replays -- drop every exec */
+        (void)cudaGraphExecDestroy(ex);
+        seg_drop_graphs();
+        return 1;
+    }
+    e.exec = ex;
+    e.bytes = f0 > f1 ? f0 - f1 : 0u;
+    g_seg_st.graphs++;
+    g_seg_st.graph_bytes += e.bytes;
+    return 1;
+}
 
 void pulsar_gpu_seg_reset(void) {
-    if (g_seg_capturing) {           /* mid-capture: defer to seg_exit */
-        g_seg_reset_pending = 1;
+    if (g_seg_capturing) {   /* mid-capture: deferred to seg_exit */
+        g_seg_reset_pending = true;
         return;
     }
-    for (uint32_t i = 0; i < PULSAR_SEG_SLOTS; i++) {
-        if (g_seg[i].exec) (void)cudaGraphExecDestroy(g_seg[i].exec);
-        g_seg[i].key = 0;
-        g_seg[i].exec = NULL;
-        g_seg[i].uses = 0;
-        g_seg[i].dead = 0;
-    }
-    g_seg_reset_pending = 0;
+    for (auto &kv : g_seg) seg_drop_exec(kv.second);
+    g_seg.clear();
+    g_seg_lru.clear();
+    g_seg_reset_pending = false;
 }
 
 /* L296 perf: an instrument runs the same steps with the segment cache off (every segment eager, nothing captured or
  * replayed) to compare the graphed lane against; returns the previous setting.  Turning it off drops the cache. */
 int pulsar_gpu_seg_set_enabled(int on) {
     const int was = !g_seg_off;
-    g_seg_off = on ? 0 : 1;
+    g_seg_off = !on;
     if (g_seg_off) pulsar_gpu_seg_reset();
     return was;
 }
 
 /* L292: the counters an instrument reads to prove which lane it ran (replays served, captures begun since start). */
 void pulsar_gpu_seg_counts(uint64_t *replays, uint64_t *captures) {
-    if (replays) *replays = g_seg_n_replay;
-    if (captures) *captures = g_seg_n_capture;
+    if (replays) *replays = g_seg_st.replays;
+    if (captures) *captures = g_seg_st.captures;
 }
 
+void pulsar_gpu_seg_stats_get(pulsar_gpu_seg_stats *out) { *out = g_seg_st; }
 
-/* L119/L117 root-cause hook: captured segment graphs bake pointers into
- * grow-realloc device scratch (tmp slots, arenas, act buffers). ANY
- * free-then-realloc growth makes every cached exec stale — the sanitizer
- * caught a replayed head writing 970 MB past a freed tmp slot after a
- * later request's prefill regrew it (f32_to_bf16_kernel, 2026-08-27,
- * rows/L119.md). Growth sites call this; captures rebuild in a few rounds.
- * A sync at the free site prevents the race but NOT the staleness — only
- * invalidation does. */
+void pulsar_gpu_seg_catalog_open(void) {
+    g_seg_catalog_on = true;
+    g_seg_catalog_t0 = seg_now();
+}
+
+uint64_t pulsar_gpu_seg_catalog_close(void) {
+    if (!g_seg_catalog_on) return 0;
+    g_seg_catalog_on = false;
+    g_seg_catalog_done = true;
+    uint64_t declared = 0, captured = 0, dead = 0, bytes = 0;
+    for (const auto &kv : g_seg) {
+        if (!kv.second.catalog) continue;
+        declared++;
+        captured += kv.second.exec != nullptr;
+        dead += kv.second.dead;
+        bytes += kv.second.bytes;
+    }
+    /* rule 5: what the warmup captured, what it cost, and what it left to a live step */
+    fprintf(stderr, "pulsar: L306 graph catalog: %llu shape(s) declared at warmup, %llu captured (%.1f MiB device), "
+                    "%llu used once (captured on their next use), %llu FAILED; window %.2f s\n",
+            (unsigned long long)declared, (unsigned long long)captured, (double)bytes / 1048576.0,
+            (unsigned long long)(declared - captured - dead), (unsigned long long)dead, seg_now() - g_seg_catalog_t0);
+    return dead;
+}
+
+/* L119/L117 root-cause hook: captured segment graphs bake pointers into grow-realloc device scratch (tmp slots,
+ * arenas, act buffers).  ANY free-then-realloc growth makes every cached exec stale -- the sanitizer caught a
+ * replayed head writing 970 MB past a freed tmp slot after a later request's prefill regrew it (f32_to_bf16_kernel,
+ * 2026-08-27, rows/L119.md).  Growth sites call this; a sync at the free site prevents the race but NOT the staleness
+ * -- only invalidation does.  L306: the catalog stays declared and recaptures on its next uses; a regrow after the
+ * warmup is announced once and counted. */
 void pulsar_gpu_seg_note_device_free(void) {
-    pulsar_gpu_seg_reset();
+    if (g_seg_capturing) {
+        g_seg_reset_pending = true;
+        return;
+    }
+    if (g_seg.empty()) return;
+    if (g_seg_catalog_done && !g_seg_catalog_on && g_seg_st.regrows == 0)
+        fprintf(stderr, "pulsar: L306 a scratch regrow after the warmup dropped every captured graph (%llu); the catalog "
+                        "recaptures on use (counted: pulsar_gpu_seg_stats::regrows, ::live_captures)\n",
+                (unsigned long long)g_seg_st.graphs);
+    if (!g_seg_catalog_on) g_seg_st.regrows++;
+    seg_drop_graphs();
 }
-
-
-/* End a capture opened by seg_enter()==1. Returns 1 when the captured graph
- * was instantiated, stored, and LAUNCHED (the body's work has now run).
- * Returns 0 when capture failed — the recorded work NEVER EXECUTED and the
- * caller must re-run the body eagerly. body_ok=0 aborts the capture. */
-int pulsar_gpu_seg_exit(uint64_t key, int body_ok) {
-    cudaGraph_t gr = NULL;
-    g_seg_capturing = 0;
-    const cudaError_t rc = cudaStreamEndCapture(cudaStreamPerThread, &gr);
-    if (!body_ok || rc != cudaSuccess || !gr) {
-        /* A capture that failed (or a body that failed UNDER capture — a
-         * mid-capture violation can fail an otherwise-good body) poisons the
-         * key: this segment stays eager forever. One-shot diagnosis line so
-         * the violating call names itself instead of cascading silently. */
-        static int announced_fail = 0;
-        if (!announced_fail) {
-            announced_fail = 1;
-            fprintf(stderr, "pulsar: L119 segment capture FAILED for key %llx "
-                            "(body_ok=%d, end=%s) -> key poisoned, eager\n",
-                    (unsigned long long)key, body_ok, cudaGetErrorString(rc));
-        }
-        pulsar_seg_ent *pe = seg_find(key);
-        if (pe) pe->dead = 1;
-        if (gr) (void)cudaGraphDestroy(gr);
-        (void)cudaGetLastError();
-        return 0;
-    }
-    cudaGraphExec_t ex = NULL;
-    /* L296 dec2: the kernel nodes keep the priority of the stream they were captured on (a block's routed chain on
-     * its priority stream, pulsar_rows_moe_routed_fork) */
-    if (cudaGraphInstantiateWithFlags(&ex, gr, cudaGraphInstantiateFlagUseNodePriority) != cudaSuccess) {
-        (void)cudaGraphDestroy(gr);
-        (void)cudaGetLastError();
-        return 0;
-    }
-    (void)cudaGraphDestroy(gr);
-    if (cudaGraphLaunch(ex, cudaStreamPerThread) != cudaSuccess) {
-        (void)cudaGraphExecDestroy(ex);
-        (void)cudaGetLastError();
-        return 0;
-    }
-    if (g_seg_reset_pending) {
-        /* A scratch regrow happened DURING this capture: the freshly
-         * instantiated graph already ran (work is done) but its baked
-         * pointers may be stale for future replays — drop everything. */
-        (void)cudaGraphExecDestroy(ex);
-        pulsar_gpu_seg_reset();
-        return 1;
-    }
-    pulsar_seg_ent *e = seg_find(key);
-    if (e && !e->exec) {
-        e->exec = ex;
-    } else {
-        /* Table anomaly: keep correctness, drop the cache entry. */
-        (void)cudaGraphExecDestroy(ex);
-    }
-    static int announced = 0;
-    if (!announced) {
-        announced = 1;
-        fprintf(stderr, "pulsar: L119 head-segment graph capture ACTIVE\n");
-    }
-    return 1;
-}
-
 
 
 /* The TP row lane's error word (pulsar_gpu_tp_err_word_set): 1 = the proxy
