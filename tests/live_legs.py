@@ -28,16 +28,15 @@ import argparse, importlib, os, sys, time, traceback
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from live_server import Grader, Server, StartError  # noqa: E402
 
-# Each model's instances run production's shape, the legs inside it (L317, 2026-10-21: "use production flags").  From
-# the ledger's record of Sparky's ~/pulsar-serve/*.env -- this file cannot read them, so a change there moves this
-# table in the same row:
-#   qwen      qwen.env: --ctx 262144 --kv-disk-space-mb 65536, PULSAR_MSEQ_BANKS=16 (L298, L305)
-#   nemotron  nemotron.env: --drafter lilicorr --ctx 1048576 --kv-disk-space-mb 65536, PULSAR_MSEQ_BANKS=16 (L298)
-#   deepseek  NOT CONFIRMED against deepseek.env (no recent ledger record): the server's defaults (1M context, banks
-#             auto-fit) and the same 64 GB disk tier
-# Each instance's disk tier is under the run's work dir and removed when it stops: the work dir needs 64 GB free.
+# Each model's instances run production's flags exactly, the legs inside them (L317, 2026-10-21), as read from Sparky's
+# ~/pulsar-serve/{deepseek,qwen,nemotron}.env that day -- a change there moves this table in the same row.  All three
+# set PULSAR_MSEQ_BANKS=16 in the environment (Server's `banks`):
+#   deepseek  --ctx 1048576 (the disk tier at the server's default size)
+#   qwen      --ctx 262144 --kv-disk-space-mb 65536
+#   nemotron  --drafter lilicorr --ctx 1048576 --kv-disk-space-mb 65536
+# Each instance's disk tier is under the run's work dir and removed when it stops: the work dir needs the room.
 MODELS = {
-    "deepseek": dict(ctx=1048576, banks=None, extra=("--kv-disk-space-mb", "65536")),
+    "deepseek": dict(ctx=1048576, banks=16, extra=()),
     "qwen": dict(ctx=262144, banks=16, extra=("--kv-disk-space-mb", "65536")),
     "nemotron": dict(ctx=1048576, banks=16, extra=("--drafter", "lilicorr", "--kv-disk-space-mb", "65536")),
 }
