@@ -60,16 +60,15 @@ static int n_fail = 0;
 
 static const pulsar_drafter_ops *g_base;   /* the engine's own drafter */
 static pulsar_drafter_ops g_fixed;         /* a copy at a fixed depth */
-static bool g_unpriced;                    /* a fixed depth: no priced depth either (every chain the whole depth) */
 /* the engine's own settings, put back when the gate ends (a runner gate borrows the engine) */
 static float g_tau0;
 static int g_depth0;
-static pulsar_lane_cost_fit g_cost0;
+static struct pulsar_verify_curve *g_curve0;   /* L301: the engine's verify curve (NULL off a server) */
 
 /* the drafter's numbers for a run: depth 0 = its own (the controller, the stop rule, the priced depth); else that
  * depth fixed, no stop rule, no price -- every chain drafts the whole depth, so the module runs recursively that deep */
 static void drafter_at_depth(pulsar_engine *e, uint32_t depth) {
-    g_unpriced = depth != 0;
+    e->verify_curve = depth == 0 ? g_curve0 : NULL;   /* unpriced: no verify pick cuts a chain */
     if (depth == 0) {
         e->drafter_ops = g_base;
         e->spec_tau = g_tau0;
@@ -164,9 +163,6 @@ static stream run(pulsar_engine *e, const pulsar_tokens &prompt, int n, bool spe
         s->spec.spec_quench_steps = 0;
         s->spec.spec_quench_debt = 0.0f;
         s->spec.spec_quench_ewma = 0.0f;
-        /* unpriced: the spec lane's measured cost forgotten before every round, so no chain is priced out (L288: the
-         * price needs the fit) */
-        if (g_unpriced) memset(&e->lane_cost[PULSAR_LANE_SPEC], 0, sizeof(e->lane_cost[PULSAR_LANE_SPEC]));
         if (force && spec) {
             lcg = lcg * 1664525u + 1013904223u;
             const uint32_t K = 1u + (lcg >> 8) % PULSAR_MTP_DRAFT_MAX;
@@ -415,7 +411,6 @@ static int exact(pulsar_engine *e, int n, const char *only) {
     g_base = e->drafter_ops;
     g_tau0 = e->spec_tau;
     g_depth0 = e->spec_depth;
-    g_cost0 = e->lane_cost[PULSAR_LANE_SPEC];
     /* M0 */
     const bool block = pulsar_engine_drafter(e) == PULSAR_DRAFTER_BLOCK;
     CHECK(pulsar_engine_has_spec_rounds(e) && g_base &&
@@ -429,6 +424,19 @@ static int exact(pulsar_engine *e, int n, const char *only) {
     std::vector<pulsar_tokens> P = prompts(e);
     CHECK(P.size() == 4, "M0 four prompts (%zu)", P.size());
     if (P.size() != 4) return 1;
+    /* L301: the drafter's own numbers run priced -- on the engine's verify curve, or (a gate has no server to profile
+     * one) a synthetic staircase: 16-row blocks, 20 ms a step and 0.25 ms a row, the second block 14 ms more.  The
+     * pick moves only which drafts are verified, so every comparison below must hold priced as unpriced. */
+    struct pulsar_verify_curve *own_curve = NULL;
+    if (!e->verify_curve && pulsar_engine_fused_heads_max(e) > 0u) {
+        double base[PULSAR_SPEC_LOGITS_ROWS + 1] = {0};
+        for (uint32_t r = 1; r <= PULSAR_SPEC_LOGITS_ROWS; r++) base[r] = (r <= 16u ? 20.0 : 34.0) + 0.25 * (double)r;
+        own_curve = pulsar_verify_curve_new(pulsar_engine_fused_heads_max(e), base);
+        e->verify_curve = own_curve;
+        printf("M0: the drafter's own numbers priced on a synthetic staircase verify curve (%u rows)\n",
+               pulsar_engine_fused_heads_max(e));
+    }
+    g_curve0 = e->verify_curve;
     {
         pulsar_engine_set_bank_pool(1);
         pulsar_session *s = NULL;
@@ -596,7 +604,10 @@ static int exact(pulsar_engine *e, int n, const char *only) {
         if (co) pulsar_session_free(co);
     }
     drafter_at_depth(e, 0);
-    e->lane_cost[PULSAR_LANE_SPEC] = g_cost0;
+    if (own_curve) {
+        e->verify_curve = NULL;
+        pulsar_verify_curve_free(own_curve);
+    }
     for (auto &t : P) pulsar_tokens_free(&t);
     return 0;
 }

@@ -1,5 +1,6 @@
 #include "pulsar_engine_internal.h"
 #include "spec_internal.h"
+#include "spec_block.h"
 #include "pulsar_nvtx.h"
 #include "../tp/pulsar_tp.h"
 #include <unistd.h>
@@ -326,16 +327,6 @@ bool pulsar_engine_can_rewind(const pulsar_engine *e) { return e && (e->family->
 bool pulsar_engine_has_fused_step(const pulsar_engine *e) { return e && e->family->session->decode_fused; }
 uint32_t pulsar_engine_fused_heads_max(const pulsar_engine *e) {
     return pulsar_engine_has_fused_step(e) ? e->family->session->fused_heads_max : 0u;
-}
-bool pulsar_engine_set_spec_width(pulsar_engine *e, uint32_t width) {
-    if (!e || e->tp) return false;
-    const uint32_t max = pulsar_engine_fused_heads_max(e);
-    e->spec_width = width == 0 || width > max ? 0u : width;
-    return true;
-}
-uint32_t pulsar_engine_spec_width(const pulsar_engine *e) {
-    const uint32_t max = pulsar_engine_fused_heads_max(e);
-    return e && e->spec_width > 0 && e->spec_width < max ? e->spec_width : max;
 }
 bool pulsar_engine_has_mixed_prefill(const pulsar_engine *e) {
     return e && (e->family->caps & PULSAR_FAMILY_CAP_MIXED_PREFILL) != 0;
@@ -1587,12 +1578,17 @@ pulsar_lane_cost pulsar_engine_lane_cost(const pulsar_engine *e, pulsar_decode_l
     }
     return lane_cost_fit_view(&e->lane_cost[lane]);
 }
-void pulsar_engine_spec_yield_observe(pulsar_engine *e, int tokens, double ms) {
-    if (!e || tokens <= 0 || !(ms > 0.0)) return;
-    const float v = (float)(ms / (double)tokens);
-    e->spec_token_ms = e->spec_token_ms <= 0.0f ? v : 0.9f * e->spec_token_ms + 0.1f * v;
+void pulsar_engine_spec_calibration(const pulsar_engine *e, pulsar_spec_calibration *out) {
+    if (e) *out = e->spec_calibration;
+    else memset(out, 0, sizeof *out);
 }
-float pulsar_engine_spec_token_ms(const pulsar_engine *e) { return e ? e->spec_token_ms : 0.0f; }
+const char *pulsar_engine_drafter_name(const pulsar_engine *e) {
+    if (!e || !e->drafter_ops) return "";
+    /* a block drafter is named by its container's kind (the lane's ops are shared: "block") */
+    if (e->block_drafter && e->drafter_ops == &e->block_drafter->ops && e->block_drafter->kind)
+        return e->block_drafter->kind;
+    return e->drafter_ops->name ? e->drafter_ops->name : "";
+}
 void pulsar_engine_spec_cost_set(pulsar_engine *e, int32_t flat_us, int32_t row_us, bool valid) {
     if (!e) return;
     pulsar_lane_cost_fit *f = &e->lane_cost[PULSAR_LANE_SPEC];

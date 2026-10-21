@@ -1122,13 +1122,6 @@ bool pulsar_engine_has_fused_step(const pulsar_engine *e);
  *  spec lane takes up to this many decoders (each keeps its base row; past it they ride the plain batched lane)
  *  and its allocator rations the drafts within this less the round's finishing chunks. */
 uint32_t pulsar_engine_fused_heads_max(const pulsar_engine *e);
-/** L288 C1: the verify width IN FORCE -- the rows the server's next spec rounds carry at most, which its drafter
- *  budgets against (a chain stops once the round's drafts that outrank it fill the width beside the base rows; a copy
- *  chain stays under it).  The server prices it (server_sched.cpp width_price_pick) between the decode block and
- *  pulsar_engine_fused_heads_max.  Clamped to [1, fused_heads_max]; 0 restores the full width.  A tensor-parallel
- *  engine keeps the full width (its ranks draft alike from the same numbers) and returns false. */
-bool pulsar_engine_set_spec_width(pulsar_engine *e, uint32_t width);
-uint32_t pulsar_engine_spec_width(const pulsar_engine *e);
 /** Does pulsar_session_decode_mixed carry prefill runs beside its decode rows (the plain batched lane's mixed
  *  quantum)?  A family without it refuses such a step by name; its prompts ride only the fused step. */
 bool pulsar_engine_has_mixed_prefill(const pulsar_engine *e);
@@ -1178,13 +1171,58 @@ pulsar_lane_cost pulsar_engine_lane_cost(const pulsar_engine *e, pulsar_decode_l
  *  when `rows` sits at the fit's centre (within half a row, 16+ steps: the slope does not enter); else 0 -- no
  *  number. */
 double pulsar_lane_cost_ms(const pulsar_lane_cost *c, double rows);
-/** L288 (tf-gap pass 2): the spec lane's yield -- the wall one emitted token costs, ms, an exponentially weighted
- *  mean (weight 0.1) over what the lanes report: the server's decode quanta, the single lane's rounds (`tokens`
- *  emitted in `ms`).  It is the VALUE OF A TOKEN both draft prices read: the server's K-allocator admits a verify
- *  row while its chain survival pays the spec lane's row_us against it, and a drafter takes one more step while
- *  the survival pays that step and its row (session_spec.cpp pulsar_spec_chain_price).  0 until observed. */
-void pulsar_engine_spec_yield_observe(pulsar_engine *e, int tokens, double ms);
-float pulsar_engine_spec_token_ms(const pulsar_engine *e);
+/** L301: the spec lane's verify cost curve (src/engine/verify_curve.cpp has the rule and its rationale).  A round
+ *  verifies n_seqs base rows and the T drafts that maximise (n_seqs + the top-T survivals) / round_ms(n_seqs + T),
+ *  round_ms(n, r) = base[r] + slope * r + host(n) + draft(n): base the per-row-count verify forward PROFILED at
+ *  startup and cached on disk, slope the online robust correction of the forward against it, host and draft the
+ *  round's measured wall outside the forward.
+ *
+ *  pulsar_session_verify_curve_open installs the curve: loaded from `cache_dir` (a file named by the key: the
+ *  container's digest, the drafter, the widest step, the session's bank pool and context, `build_id`) or profiled
+ *  on the session's INSTALLED bank at its frontier -- every r-row verify step from the widest down, each one put
+ *  back as a round's abort does -- and written there.  The installed bank must hold a prefix and room for the widest
+ *  step.  0, or -1 with `err` (no batched speculative lane: tensor-parallel, no drafter, no bank pool; or the
+ *  profile failed) -- the engine then has no curve and the row budget alone admits drafts. */
+int pulsar_session_verify_curve_open(pulsar_session *s, const char *cache_dir, const char *build_id, char *err,
+                                     size_t errlen);
+/** One decode round of the batched spec lane (the server reports every round that carried no prompt rows):
+ *  `n_seqs` banks, `rows` verify rows, the forward's wall, the rest of the round outside the forward and the
+ *  drafting (`host_ms`), and the drafting (`draft_ms`). */
+void pulsar_engine_verify_curve_observe(pulsar_engine *e, uint32_t n_seqs, uint32_t rows, double forward_ms,
+                                        double host_ms, double draft_ms);
+/** The verify pick: of m drafts with survivals `surv` sorted DESCENDING, how many a round of n_seqs base rows
+ *  verifies within cap_rows rows (the best ratio on the curve; no curve: as many as the rows hold). */
+uint32_t pulsar_engine_verify_pick(const pulsar_engine *e, uint32_t n_seqs, const float *surv, uint32_t m,
+                                   uint32_t cap_rows);
+/** The curve as /metrics shows it (valid false: none). */
+typedef struct {
+    bool valid;
+    bool cached;                                  ///< loaded from the disk cache (else profiled by this process)
+    uint32_t rows_max;                            ///< the widest verify step
+    float base_ms[33];                            ///< [r]: the profiled r-row verify forward, ms (1..rows_max)
+    bool slope_valid;                             ///< the online correction has a number
+    float slope_ms;                               ///< its residual per row (applied as max(0, slope))
+    float host_ms;                                ///< the round's recent wall outside the forward and drafting
+    float draft_ms;                               ///< the round's recent drafting wall
+    uint64_t observed;                            ///< rounds observed
+    uint64_t key;                                 ///< the cache key
+} pulsar_verify_curve_view;
+void pulsar_engine_verify_curve_view(const pulsar_engine *e, pulsar_verify_curve_view *out);
+/** L301: the drafters' confidence calibration, per draft position (0..15): index 0 the engine's drafter (its name:
+ *  pulsar_engine_drafter_name), 1 copy drafts.  Per draft the walk reached (accepted, or the one that ended the
+ *  round): its confidence, its exact acceptance label under the coupled draws (greedy: the row's argmax is the
+ *  draft; sampled: the target's probability of the draft), whether it was accepted.  The sums give mean confidence
+ *  vs mean label (bias), the Brier score (sq_err / n) and the mean absolute calibration error; the ten confidence
+ *  bins give the ECE (sum_b |bin_conf - bin_label| / sum_b bin_n). */
+typedef struct {
+    uint64_t n[2][16];
+    double conf[2][16], label[2][16], hit[2][16], abs_err[2][16], sq_err[2][16];
+    uint64_t bin_n[2][10];
+    double bin_conf[2][10], bin_label[2][10];
+} pulsar_spec_calibration;
+void pulsar_engine_spec_calibration(const pulsar_engine *e, pulsar_spec_calibration *out);
+/** The loaded drafter's name ("" with none). */
+const char *pulsar_engine_drafter_name(const pulsar_engine *e);
 const pulsar_tokens *pulsar_session_tokens(pulsar_session *s);
 
 /** Session payload helpers.  HTTP/agent code owns the outer file header and

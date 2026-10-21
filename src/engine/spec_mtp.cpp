@@ -317,11 +317,9 @@ static bool mtp_draft_chains(pulsar_session *s, const uint32_t *banks, uint64_t 
         /* L289: the verify will embed [x, d_1 ..]: a family may start reading what they need as each is known */
         if (ops->prefetch) ops->prefetch(s, ch.b, &q->refined[0], ch.copy ? 1u + q->keep : 1u, true);
     }
-    /* L288 pass 2: the price a further step must clear (session_spec.cpp, the priced depth), and every survival the
-     * round has drafted so far -- what outranks a chain for the shared verify width */
-    uint32_t n_live = 0;
-    for (uint32_t i = 0; i < n; i++) n_live += c[i].live ? 1u : 0u;
-    const pulsar_spec_chain_price price = pulsar_spec_chain_price_for(s, n_live);
+    /* L301: every survival the round has drafted so far -- what a further step's drafts are weighed beside by the
+     * verify pick (pulsar_spec_chain_step) -- and the drafting wall spent so far, which the round pays too */
+    const double draft_t0 = now_sec();
     float drafted[PULSAR_DRIVER_HEADS_MAX * PULSAR_MTP_DRAFT_MAX];
     uint32_t n_drafted = 0;
     /* L288 copy drafts: a record that holds a copy chain (pulsar_spec_draft_req_init) keeps it; its drafts outrank the
@@ -410,22 +408,20 @@ static bool mtp_draft_chains(pulsar_session *s, const uint32_t *banks, uint64_t 
         for (uint32_t i = 0; ok && i < n; i++)
             if (c[i].live) ok = draft(i, j);
         /* the step's wall, picks and draws included (the picks' readback waited for the device): the drafter's step
-         * price.  Off TP only, as the lane fits are (a group's ranks must price alike). */
+         * price.  Off TP only (a group's ranks must draft alike). */
         if (ok && headed && !e->tp) lane_cost_fit_observe(&e->draft_step_cost, m, (now_sec() - step_t0) * 1e3);
-        /* the priced depth: the live chains that pay the next lockstep step between them, each its row, and that
-         * fewer drafts than the shared verify carries already outrank (pulsar_spec_chain_step) */
+        /* L301: the live chains whose next drafts raise the round's tokens per ms on the verify curve once the step
+         * that drafts them is paid (pulsar_spec_chain_step, the verify pick's rule) take it */
         if (ok) {
             float run[PULSAR_DRIVER_HEADS_MAX];
-            uint32_t ahead[PULSAR_DRIVER_HEADS_MAX], at[PULSAR_DRIVER_HEADS_MAX], nl = 0;
+            uint32_t at[PULSAR_DRIVER_HEADS_MAX], nl = 0;
             bool go[PULSAR_DRIVER_HEADS_MAX];
             for (uint32_t i = 0; i < n; i++) {
                 if (!c[i].live) continue;
                 run[nl] = c[i].run;
-                ahead[nl] = 0;
-                for (uint32_t k = 0; k < n_drafted; k++) ahead[nl] += drafted[k] >= c[i].run ? 1u : 0u;
                 at[nl++] = i;
             }
-            (void)pulsar_spec_chain_step(&price, run, ahead, nl, go);
+            (void)pulsar_spec_chain_step(s, n, drafted, n_drafted, run, nl, (now_sec() - draft_t0) * 1e3, go);
             for (uint32_t x = 0; x < nl; x++) c[at[x]].live = go[x];
         }
     }

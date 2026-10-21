@@ -555,6 +555,8 @@ static int dspark_draft_group(pulsar_session *s, spec_redraft_req *const *qs, co
             for (uint32_t k = 0; k < q->n_draft; k++) q->conf[k] = confs[base_row[j] + k];
             q->keep = pulsar_spec_conf_keep(q->conf, q->n_draft, tau);
         }
+        /* L301: then the verify pick over the group's drafts (verify_curve.cpp) -- DSpark priced as every drafter */
+        if (!defer) pulsar_spec_keep_picked(s, (uint32_t)n_sel, qs, (uint32_t)n_sel);
     }
     return 0;
 }
@@ -613,7 +615,14 @@ static void dspark_harvest(pulsar_session *s) {
         s->spec.n_pend = 0;
         return;
     }
-    const uint32_t keep = have_conf ? pulsar_spec_conf_keep(conf, n_draft, pulsar_spec_tau(s->engine)) : n_draft;
+    /* the stop rule, then the verify pick (L301) over the chain alone -- what dspark_draft_group does undeferred */
+    spec_redraft_req q;
+    memset(&q, 0, sizeof q);
+    for (uint32_t i = 0; i < n_draft; i++) q.conf[i] = have_conf ? conf[i] : -1.0f;
+    q.keep = have_conf ? pulsar_spec_conf_keep(conf, n_draft, pulsar_spec_tau(s->engine)) : n_draft;
+    spec_redraft_req *qp = &q;
+    pulsar_spec_keep_picked(s, 1u, &qp, 1u);
+    const uint32_t keep = q.keep;
     s->spec.n_pend = keep;
     for (uint32_t i = 0; i < keep; i++) {
         s->spec.pend[i] = ids[i + 1];

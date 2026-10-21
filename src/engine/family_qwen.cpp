@@ -1282,8 +1282,8 @@ static_assert(PULSAR_QWEN_HEAD_ROWS_MAX == PULSAR_DRIVER_HEADS_MAX, "the lane's 
  * (teacher-forced, tools/qwen/accept); the deeper chains TF runs pay there because a draft costs 3.43 ms against
  * 4.45 here (verify row 2.49 + MTP step 1.74, 0.98 of it this draft head's MXFP8 read).  Depth 6 vs 4: single
  * stream -1..+4 %, 4 / 8 streams -3 % on both models.  L288 (2026-10-13, tf-gap pass 2): the chain runs to the
- * session's depth while its survival pays one more MTP step and its verify row at the lane's yield and the shared
- * verify width still has room for it (pulsar_spec_chain_price), the stop rule beside it; the depth is the shared
+ * session's depth while its next draft pays one more MTP step and its verify row (L301: on the measured verify curve,
+ * pulsar_spec_chain_step; L288 priced both at the lane's yield), the stop rule beside it; the depth is the shared
  * adaptive controller's (spec_depth.h) between 4 and 7 -- up a level after a round that converted all its depth but
  * one draft (up_slack 1: replayed, code 99.7 against 99.0 when only a whole chain climbs, the chat start 76.1 vs
  * 76.5), down after one that converted less than half.  Replayed on the unstopped depth-8 traces (td305; the 2026-10-13

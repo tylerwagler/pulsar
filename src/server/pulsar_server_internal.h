@@ -1416,29 +1416,6 @@ enum server_round_phase {
 /** /metrics' label for each server_round_phase. */
 extern const char *const server_round_phase_name[SERVER_ROUND_PHASE_COUNT];
 
-/** L288 C1: the spec lane's verify width, MEASURED per decoder count like the lanes (server_sched.cpp
- *  width_price_pick): the decode block (the rows the decode arms take in one pass) or the family's whole verify width
- *  (pulsar_engine_fused_heads_max).  A step past the block pays the block's weight reads again, and whether the
- *  drafts it adds return that depends on the decoders and the text, so both widths are measured at each count and
- *  the faster holds; the other is re-measured every LANE_PRICE_REPROBE_STEPS rounds at that count.  [n][w]: n the
- *  decoders, w 0 the block, 1 the whole width.  All-zero is the start state (the whole width first). */
-#define WIDTH_PRICE_N 33
-typedef struct {
-    double tok[WIDTH_PRICE_N][2];      ///< EW tokens a round committed at n decoders and width w
-    double ms[WIDTH_PRICE_N][2];       ///< EW wall of those rounds, ms
-    uint32_t steps[WIDTH_PRICE_N][2];  ///< rounds measured there
-    uint8_t force[WIDTH_PRICE_N];      ///< the width in force at n (0 the block, 1 the whole width; start: whole)
-    int8_t probe[WIDTH_PRICE_N];       ///< the width being measured against it (-1 none; all-zero state: see init)
-    uint32_t mark[WIDTH_PRICE_N];      ///< rounds at n when the probe began, or when the width in force was weighed
-    uint32_t rounds[WIDTH_PRICE_N];    ///< rounds run at n
-    bool init;                         ///< probe[] set to -1
-    const char *why;                   ///< the last pick's reason
-    /** a probe began or ended at `ann_n` decoders (the caller announces it once and clears ann_n; 0 none), with the
-     *  two prices it was weighed on, tokens/s (0: no number) */
-    int ann_n;
-    double ann_blk, ann_whole;
-} width_price;
-
 /** L284 lane cost: the scheduler's priced choice between the plain and spec decode lanes, one rule for every
  *  family (server_sched.cpp lane_price_pick).  The spec lane's acceptance is measured here, per bank per decode
  *  round; both lanes' step costs are the engine's fits (pulsar_engine_lane_cost).  All-zero is the start state. */
@@ -1604,15 +1581,19 @@ struct server {
      * attribution instrument). */
     uint64_t w_prefill_chunk_tokens;  ///< worker-owned running count
     uint64_t m_prefill_chunk_tokens;  ///< published copy, read by send_metrics
-    /** L136: how often the overflow argmax actually binds.  overflow_rounds
-     * counts sweeps whose demand exceeded the shared row budget; thr_cut_rows
-     * counts candidate rows the COST THRESHOLD priced out (budget still
-     * unspent) — the only rows whose fate the marginal_ms constant decides.
-     * Worker-owned/mirrored like the counters above. */
+    /** L136 / L301: what the verify pick decides.  overflow_rounds counts rounds whose demand (base rows and
+     * every pending draft) exceeded the row budget; pick_cut_rows counts the pending drafts the pick left
+     * unverified (server_sched.cpp spec_pick_rows).  Worker-owned/mirrored like the counters above. */
     uint64_t w_spec_overflow_rounds;
     uint64_t m_spec_overflow_rounds;
-    uint64_t w_spec_thr_cut_rows;
-    uint64_t m_spec_thr_cut_rows;
+    uint64_t w_spec_pick_cut_rows;
+    uint64_t m_spec_pick_cut_rows;
+    bool w_spec_pick_announced;   ///< rule 5: the first priced round said the pick ran, and on what
+    /** L301: the engine's verify curve and the drafters' confidence calibration, as /metrics publishes them
+     *  (published copies, like m_spec). */
+    pulsar_verify_curve_view m_verify_curve;
+    pulsar_spec_calibration m_spec_calib;
+    const char *m_drafter_name;   ///< the engine's drafter (static storage), the calibration's label
     /** L288: a decode-only spec round's wall split by phase (server_sched.cpp's spec quantum, the host clock,
      *  no device sync added) -- what /metrics publishes as pulsar:spec_round_phase_ms_total, so a client
      *  decomposes ms/round untraced.  Device work a phase enqueues without waiting for it is paid where the next
@@ -1644,7 +1625,6 @@ struct server {
     /** L284 lane cost: the priced choice between the plain (2) and spec (3) lanes while the spec lane could carry
      *  every decoder (server_sched.cpp lane_price_pick).  Worker-owned. */
     lane_price w_lane_price;
-    width_price w_width_price;     ///< L288 C1: the spec lane's verify width, measured per decoder count
     uint64_t m_prompt_tokens;  ///< cumulative prompt tokens prefilled
     uint64_t m_prefix_queries;  ///< cumulative prompt tokens seen (hit-rate denom)
     uint64_t m_prefix_hits;  ///< cumulative prompt tokens served from prefix cache
