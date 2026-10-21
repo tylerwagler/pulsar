@@ -264,7 +264,6 @@ typedef struct {
     uint64_t low_dim;         ///< width of the attention output's low-rank 'a' projection
     uint64_t shared_dim;      ///< shared-expert intermediate width
     uint64_t routed_mid_dim;  ///< routed-expert intermediate width
-    uint64_t vocab_dim;       ///< output head width
     uint64_t comp_width_max;  ///< widest compressed row across layers; sizes the shared staging
     uint64_t index_comp_width_max; ///< widest INDEXER-compressor row across layers; same rule at the indexer's head dim
     uint64_t indexer_q_dim;   ///< indexer query width
@@ -272,7 +271,6 @@ typedef struct {
 
 static void gpu_graph_compute_dims(
         gpu_graph_dims *d,
-        const pulsar_weights       *weights,
         const pulsar_layer_weights *layer,
         uint32_t                 raw_cap,
         uint32_t                 ctx_size,
@@ -315,7 +313,6 @@ static void gpu_graph_compute_dims(
     d->low_dim = (uint64_t)PULSAR_N_OUT_GROUP * PULSAR_N_LORA_O;
     d->shared_dim = layer->ffn_gate_shexp->dim[1];
     d->routed_mid_dim = layer->ffn_gate_exps->dim[1];
-    d->vocab_dim = weights->output ? weights->output->dim[1] : PULSAR_N_VOCAB;
     /* The widest compressor row any layer needs.  Derived from the layout table
      * rather than written as head_dim: V4's ratio-4 layers project to
      * 2*head_dim (they overlap), so a head_dim literal would under-size the
@@ -1341,7 +1338,7 @@ bool gpu_graph_alloc_raw_cap(
     g->tp_group_hi = PULSAR_N_OUT_GROUP;
     if (n_banks < 1u) n_banks = 1u;
     gpu_graph_dims dz;
-    gpu_graph_compute_dims(&dz, weights, layer, raw_cap, ctx_size, prefill_cap);
+    gpu_graph_compute_dims(&dz, layer, raw_cap, ctx_size, prefill_cap);
     raw_cap = dz.raw_cap;
     ctx_size = dz.ctx_size;
     prefill_cap = dz.prefill_cap;
@@ -1373,7 +1370,6 @@ bool gpu_graph_alloc_raw_cap(
     const uint64_t low_dim = dz.low_dim;
     const uint64_t shared_dim = dz.shared_dim;
     const uint64_t routed_mid_dim = dz.routed_mid_dim;
-    const uint64_t vocab_dim = dz.vocab_dim;
     const uint64_t comp_width_max = dz.comp_width_max;
     const uint64_t indexer_q_dim = dz.indexer_q_dim;
     const uint64_t pc = prefill_cap;
@@ -1610,7 +1606,6 @@ bool gpu_graph_alloc_raw_cap(
     g->ffn_norm = pulsar_gpu_tensor_alloc((uint64_t)PULSAR_N_EMBD * sizeof(float));
     g->output_embd = pulsar_gpu_tensor_alloc((uint64_t)PULSAR_N_EMBD * sizeof(float));
     g->output_norm = pulsar_gpu_tensor_alloc((uint64_t)PULSAR_N_EMBD * sizeof(float));
-    g->logits = pulsar_gpu_tensor_alloc(vocab_dim * sizeof(float));
     g->prefill_tokens = pulsar_gpu_tensor_alloc(pc * sizeof(int32_t));
     /* L216 image-span visibility: one left half and one right half of
      * prefill_cap int32 each, written per chunk only when the chunk carries
@@ -1620,7 +1615,7 @@ bool gpu_graph_alloc_raw_cap(
     g->vision_visible_tokens = 0;
     /* Shared multi-row logits slab (PULSAR_SPEC_LOGITS_ROWS rows).  Unconditional, NOT gated on
      * speculation: every batched multi-row output head writes its rows here —
-     * the DSpark draft/verify passes, gpu_graph_verify_suffix_tops, and the
+     * the DSpark draft/verify passes, gpu_graph_verify_suffix, and the
      * Tier-2 batched multi-session decode driver.  It used to be allocated
      * only by gpu_graph_init_dspark_target (session create, dspark_ready
      * only), which left the multiseq driver rejecting every step whenever
@@ -1744,7 +1739,7 @@ bool gpu_graph_alloc_raw_cap(
                     g->comp_selected && g->cand_mask && g->cand_bscore &&
                     g->ffn_norm &&
                     g->output_embd &&
-                    g->output_norm && g->logits &&
+                    g->output_norm &&
                     g->prefill_tokens && g->spec_logits &&
                     g->vision_visible &&
                     g->batch_cur_hc && g->batch_next_hc && g->batch_flat_hc &&
@@ -1921,32 +1916,12 @@ bool gpu_graph_init_dspark_target(pulsar_gpu_graph *g, const uint32_t target_lay
         ok = ok && g->dspark_bank_meta;
         g->dspark_embed_tokens = pulsar_gpu_tensor_alloc((uint64_t)PULSAR_DSPARK_DRAFT_ROWS_MAX * sizeof(int32_t));
         g->dspark_refined_ids = pulsar_gpu_tensor_alloc(17ull * PULSAR_DSPARK_BANKS_MAX * sizeof(int32_t));
-        /* One compact block per admitted speculative row: the lane admits up
-         * to PULSAR_SPEC_LOGITS_ROWS rows per forward and the host mirror below
-         * is sized by the same constant.  This slab stayed at 16 rows after
-         * L117 raised the budget to 32 (L177): at 3 drafting clients x depth 5
-         * = 18 rows the prefilter refused, and once L174 removed the silent
-         * full-readback fallback that refusal failed the whole co-scheduled
-         * forward. */
-        g->dspark_prefilter_sel = pulsar_gpu_tensor_alloc(
-            (uint64_t)PULSAR_SPEC_LOGITS_ROWS * PULSAR_DSPARK_PREFILTER_ROW_I32 * sizeof(int32_t));
         g->dspark_row_meta = pulsar_gpu_tensor_alloc(7ull * PULSAR_DSPARK_DRAFT_ROWS_MAX * sizeof(int32_t));
         ok = ok && g->dspark_row_meta;
-        g->spec_compact_host = (int32_t *)xmalloc(
-            (size_t)PULSAR_SPEC_LOGITS_ROWS * PULSAR_DSPARK_PREFILTER_ROW_I32 * sizeof(int32_t));
-        g->spec_compact_rows = 0;
-        g->spec_compact_armed = false;
-        g->spec_compact_acc_n = 0;
-        g->spec_argmax_host = (int32_t *)xmalloc(
-            (size_t)PULSAR_SPEC_LOGITS_ROWS * sizeof(int32_t));
-        g->spec_argmax_rows = 0;
-        g->spec_argmax_armed = false;
-        g->spec_argmax_acc_n = 0;
-        g->spec_argmax_acc_ok = false;
         ok = ok && g->dspark_concat && g->dspark_proj_out && g->dspark_seed_kv &&
              g->dspark_seed_norm && g->dspark_seed_rot && g->dspark_markov_logits &&
              g->dspark_conf_scores && g->dspark_conf_tokens && g->dspark_embed_tokens &&
-             g->dspark_refined_ids && g->dspark_prefilter_sel;
+             g->dspark_refined_ids;
     }
     /* spec_logits is NOT allocated here: it is the shared multi-row logits
      * slab, allocated unconditionally by gpu_graph_alloc_raw_cap (the batched

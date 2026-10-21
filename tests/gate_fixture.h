@@ -36,10 +36,11 @@ static inline bool gate_prefill_suffix_classic(pulsar_session *s, const pulsar_t
         return false;
     }
     if (!gpu_graph_prefill_chunked_range(s->graph, &s->engine->model, &s->engine->weights, toks,
-                                         (uint32_t)start, (uint32_t)(end - start), s->logits, NULL)) {
+                                         (uint32_t)start, (uint32_t)(end - start), s->dev.live, NULL)) {
         snprintf(err, errlen, "classic suffix prefill [%d, %d) failed", start, end);
         return false;
     }
+    s->dev.host_stale = true;   /* the head wrote the live row on the device (L302) */
     pulsar_tokens p = *toks; p.len = end;
     pulsar_tokens_copy(&s->checkpoint, &p);
     s->checkpoint_valid = true;

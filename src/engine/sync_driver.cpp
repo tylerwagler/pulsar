@@ -185,7 +185,8 @@ int pulsar_session_sync_default(pulsar_session *s, const pulsar_tokens *prompt, 
             /* L289: the resume rule picks the whole prompt only at the bank's prompt end: the record's state is the
              * prefill's own at G, copied whole (its tokens are the prompt's: the rule matched them), with the
              * logits that prefill headed -- nothing is evaluated */
-            if (!pulsar_ckpt_end_restore(st, live, s->logits, (uint32_t)pulsar_engine_logits_width(e))) {
+            if (!pulsar_ckpt_end_restore(st, live, s->logits, (uint32_t)pulsar_engine_logits_width(e)) ||
+                !s->live_from_host(s->logits)) {
                 if (err) snprintf(err, errlen, "%s: restoring bank %u's prompt end at %u failed", ops->name, live, G);
                 return 1;
             }

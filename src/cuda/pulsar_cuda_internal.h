@@ -724,6 +724,9 @@ const char *cuda_model_range_ptr(const void *model_map, uint64_t offset, uint64_
  *  @return 1 when @p err is cudaSuccess, else 0
  *  \hidecallergraph */
 int cuda_ok(cudaError_t err, const char *what);
+/** L302: count one host<->device synchronisation (pulsar_gpu_sync_stats): kind 0 stream drain, 1 device drain, 2 a
+ *  blocking device -> host copy of `bytes`, 3 a blocking host -> device copy. */
+void pulsar_cuda_sync_note(int kind, uint64_t bytes);
 
 /* ---- shared __device__ inline helpers (per-TU copies; no -rdc) ---- */
 

@@ -1492,9 +1492,33 @@ int pulsar_gpu_tensor_fill_f32(pulsar_gpu_tensor *tensor, float value, uint64_t 
 
 
 
+/* L302: the process's host<->device synchronisations (pulsar_gpu_sync_stats) */
+static pulsar_gpu_sync_stats g_sync_stats;
+
+void pulsar_cuda_sync_note(int kind, uint64_t bytes) {
+    switch (kind) {
+    case 0: __atomic_fetch_add(&g_sync_stats.stream_syncs, 1u, __ATOMIC_RELAXED); break;
+    case 1: __atomic_fetch_add(&g_sync_stats.device_syncs, 1u, __ATOMIC_RELAXED); break;
+    case 2:
+        __atomic_fetch_add(&g_sync_stats.d2h, 1u, __ATOMIC_RELAXED);
+        __atomic_fetch_add(&g_sync_stats.d2h_bytes, bytes, __ATOMIC_RELAXED);
+        break;
+    default: __atomic_fetch_add(&g_sync_stats.h2d, 1u, __ATOMIC_RELAXED); break;
+    }
+}
+
+void pulsar_gpu_sync_stats_get(pulsar_gpu_sync_stats *out) {
+    out->stream_syncs = __atomic_load_n(&g_sync_stats.stream_syncs, __ATOMIC_RELAXED);
+    out->device_syncs = __atomic_load_n(&g_sync_stats.device_syncs, __ATOMIC_RELAXED);
+    out->d2h = __atomic_load_n(&g_sync_stats.d2h, __ATOMIC_RELAXED);
+    out->d2h_bytes = __atomic_load_n(&g_sync_stats.d2h_bytes, __ATOMIC_RELAXED);
+    out->h2d = __atomic_load_n(&g_sync_stats.h2d, __ATOMIC_RELAXED);
+}
+
 int pulsar_gpu_tensor_write(pulsar_gpu_tensor *tensor, uint64_t offset, const void *data, uint64_t bytes) {
     if (!tensor || !data || offset > tensor->bytes || bytes > tensor->bytes - offset) return 0;
     if (tensor->dry) return 1;
+    pulsar_cuda_sync_note(3, bytes);
     return cuda_ok(cudaMemcpy((char *)tensor->ptr + offset, data, (size_t)bytes, cudaMemcpyHostToDevice), "tensor write");
 }
 
@@ -1541,6 +1565,7 @@ int pulsar_gpu_tensor_write_q_f32(pulsar_gpu_tensor *tensor, uint64_t off_elems,
 int pulsar_gpu_tensor_read(const pulsar_gpu_tensor *tensor, uint64_t offset, void *data, uint64_t bytes) {
     if (!tensor || !data || offset > tensor->bytes || bytes > tensor->bytes - offset) return 0;
     if (tensor->dry) return 1;
+    pulsar_cuda_sync_note(2, bytes);
     return cuda_ok(cudaMemcpy(data, (const char *)tensor->ptr + offset, (size_t)bytes, cudaMemcpyDeviceToHost), "tensor read");
 }
 
@@ -1549,6 +1574,7 @@ int pulsar_gpu_tensor_read(const pulsar_gpu_tensor *tensor, uint64_t offset, voi
 
 int pulsar_gpu_device_read(const void *device, void *host, uint64_t bytes) {
     if (!device || !host) return 0;
+    pulsar_cuda_sync_note(2, bytes);
     return cuda_ok(cudaMemcpy(host, device, (size_t)bytes, cudaMemcpyDeviceToHost), "device read");
 }
 
@@ -1903,6 +1929,7 @@ static int tp_err_word_ok(void) {
 
 int pulsar_gpu_end_commands(void) {
     cuda_model_load_progress_finish();
+    pulsar_cuda_sync_note(0, 0);
     if (!cuda_ok(cudaStreamSynchronize(cudaStreamPerThread), "end commands")) return 0;
     if (!tp_err_word_ok()) return 0;
     /* L188: the stream is drained -- this is where every step reads its logits
@@ -1916,6 +1943,8 @@ int pulsar_gpu_end_commands(void) {
      * next step's bytes. */
     uint32_t nf_layer = 0u;
     const char *nf_arm = NULL;
+    pulsar_cuda_sync_note(2, sizeof(uint32_t));   /* the routed-expert flags: two blocking 4-byte reads */
+    pulsar_cuda_sync_note(2, sizeof(uint32_t));
     const int nf = pulsar_gpu_routed_moe_nonfinite_take(&nf_layer, &nf_arm);
     if (nf < 0) return 0;
     uint32_t oob_layer = 0u;
@@ -1939,6 +1968,7 @@ int pulsar_gpu_end_commands(void) {
 
 int pulsar_gpu_synchronize(void) {
     cuda_model_load_progress_finish();
+    pulsar_cuda_sync_note(1, 0);
     if (!cuda_ok(cudaDeviceSynchronize(), "synchronize")) return 0;
     /* L188: the failure and cancel paths drain here rather than through
      * pulsar_gpu_end_commands; a routed-expert non-finite flag set by a step
@@ -1948,6 +1978,8 @@ int pulsar_gpu_synchronize(void) {
      * hazard and is drained the same way. */
     uint32_t nf_layer = 0u;
     const char *nf_arm = NULL;
+    pulsar_cuda_sync_note(2, sizeof(uint32_t));   /* the routed-expert flags: two blocking 4-byte reads */
+    pulsar_cuda_sync_note(2, sizeof(uint32_t));
     const int nf = pulsar_gpu_routed_moe_nonfinite_take(&nf_layer, &nf_arm);
     if (nf > 0)
         fprintf(stderr, "pulsar: non-finite routed-expert output at layer %u (%s) in a step that did not "

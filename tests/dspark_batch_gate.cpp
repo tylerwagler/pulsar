@@ -18,9 +18,8 @@
  * Runs three shapes: all banks greedy; bank 0 greedy with banks 1-2 sampled
  * at temperature 1.0 / min_p 0.05 (the production shape; the mixed set
  * exercises the greedy-first / sampled-second grouping); and all-sampled
- * alternating with all-greedy per tick, which switches the verify readback
- * arm (compact -> argmax) and audits that the round-end walk consumes the
- * fresh one.  argv[3] = draft depth (0 = engine default) so the Makefile can
+ * alternating with all-greedy per tick (the walk draws every verify row on
+ * the device either way, L302).  argv[3] = draft depth (0 = engine default) so the Makefile can
  * also pin depth 1, whose attention takes a distinct single-row fast path.
  *
  * WHY THIS AND NOT THE MULTISEQ FINGERPRINTS: with exact verification the
@@ -123,7 +122,7 @@ static void peek_all(pulsar_spec_round **r, int n, draft_result *out) {
  * the previous step's candidates (review of 4fa5e0b6). */
 static int tick_to_round_end(pulsar_session *s, pulsar_spec_round **r, const float *temps,
                              uint64_t *rngs, int *first_tok, uint32_t *row0, float *logits,
-                             int vocab, int audit) {
+                             int vocab) {
     char err[256];
     pulsar_multiseq_req reqs[ROWS];
     uint32_t rows = 0;
@@ -142,14 +141,6 @@ static int tick_to_round_end(pulsar_session *s, pulsar_spec_round **r, const flo
         pulsar_session_bank_state_save(s, (uint32_t)b);
     }
     pulsar_session_spec_arm_capture(s, rows);
-    /* The engine's OWN arm decision for this step, read before arm_capture(0)
-     * retires it.  The audit below checks the counters the round-end walk
-     * consumes against the arm the ENGINE says it armed: re-deriving the arm
-     * from the temperatures would be a second copy of the min-p contract
-     * (top_k/top_p/min_p are part of it, not just temperature) and would go
-     * stale the moment a shape used different knobs. */
-    const bool expect_compact = s->graph->spec_compact_armed;
-    const bool expect_argmax  = s->graph->spec_argmax_armed;
     uint32_t got = 0;
     const int rc = pulsar_session_decode_mixed(s, reqs, rows, logits, (int)(rows * (uint32_t)vocab),
                                                &got, PULSAR_MSEQ_HEAD_ALL_ROWS, err, sizeof(err));
@@ -158,32 +149,12 @@ static int tick_to_round_end(pulsar_session *s, pulsar_spec_round **r, const flo
         fprintf(stderr, "decode_mixed failed (rc=%d got=%u rows=%u): %s\n", rc, got, rows, err);
         return -1;
     }
-    if (audit) {
-        pulsar_gpu_graph *g = s->graph;
-        if (expect_argmax) {
-            CHECK(g->spec_argmax_rows >= rows && g->spec_compact_rows == 0,
-                  "STALE COMPACT ROWS: the engine armed the argmax readback for %u rows, but "
-                  "spec_compact_rows=%u is still live (argmax_rows=%u) -- spec_round_end_block "
-                  "reads the previous step's candidates first", rows, g->spec_compact_rows,
-                  g->spec_argmax_rows);
-        } else if (expect_compact) {
-            CHECK(g->spec_compact_rows >= rows && g->spec_argmax_rows == 0,
-                  "STALE ARGMAX ROWS: the engine armed the compact readback for %u rows, but "
-                  "spec_argmax_rows=%u is still live (compact_rows=%u)", rows,
-                  g->spec_argmax_rows, g->spec_compact_rows);
-        } else {
-            CHECK(g->spec_compact_rows == 0 && g->spec_argmax_rows == 0,
-                  "MIXED STEP TOOK AN ARM: the engine armed neither readback for %u rows, but "
-                  "compact_rows=%u argmax_rows=%u", rows, g->spec_compact_rows,
-                  g->spec_argmax_rows);
-        }
-    }
     int live = 0;
     for (int b = 0; b < g_nb; b++) {
         if (!pulsar_session_bank_state_restore(s, (uint32_t)b)) return -1;
         int accepted[17];
         const int na = pulsar_session_spec_round_end(s, r[b], first_tok[b], temps[b], 0, 1.0f,
-                                                     0.05f, &rngs[b], logits, row0[b], accepted, 17,
+                                                     0.05f, &rngs[b], row0[b], accepted, 17,
                                                      err, sizeof(err));
         if (na < 0) { fprintf(stderr, "round_end bank %d: %s\n", b, err); return -1; }
         live++;
@@ -218,7 +189,7 @@ static int run_shape(const char *name, const float *temps, const float *temps_al
          * all-sampled tick with an all-greedy one is the readback-arm switch
          * the audit exists for. */
         const float *tp = (temps_alt && (t & 1)) ? temps_alt : temps;
-        if (tick_to_round_end(s, r, tp, rngs, first_tok, row0, logits, vocab, 1) < 0) {
+        if (tick_to_round_end(s, r, tp, rngs, first_tok, row0, logits, vocab) < 0) {
             CHECK(0, "%s: tick %d failed", name, t);
             break;
         }

@@ -20,12 +20,6 @@ pulsar_driver_heads pulsar_driver_heads_span(uint32_t row0, uint32_t n) {
     return h;
 }
 
-uint32_t pulsar_driver_argmax(const float *v, uint32_t n) {
-    uint32_t a = 0;
-    for (uint32_t i = 1; i < n; i++) if (v[i] > v[a]) a = i;
-    return a;
-}
-
 const char *pulsar_driver_first_missing(const pulsar_driver_ops *ops, const pulsar_layer_plan *plan,
                                         uint32_t *at_layer) {
     *at_layer = UINT32_MAX;
@@ -60,7 +54,6 @@ static void driver_bufs_free(pulsar_driver_state *d) {
     pulsar_gpu_tensor_free(d->row_bank);
     pulsar_gpu_tensor_free(d->run_first_dev);
     for (uint32_t a = 0; a < PULSAR_DRIVER_SCRATCH_MAX; a++) pulsar_gpu_tensor_free(d->scratch[a]);
-    free(d->host_logits);
     pulsar_gpu_tensor_free(d->tp_ticket);
     pulsar_gpu_tensor_free(d->tp_vocab_own);
     pulsar_mtp_lane_free(d->mtp);
@@ -95,7 +88,6 @@ int pulsar_driver_session_create(pulsar_session *s, uint32_t n_banks) {
     bool ok = d->logits && d->row_pos && d->row_bank;
     if (ok && verifies) {
         d->run_first_dev = pulsar_gpu_tensor_alloc((uint64_t)(PULSAR_DRIVER_HEADS_MAX + 1u) * sizeof(int32_t));
-        d->host_logits = (float *)xmalloc((size_t)PULSAR_DRIVER_HEADS_MAX * W * sizeof(float));
         ok = d->run_first_dev != NULL;
     }
     /* L296 N9: the chained-MTP drafter's lane when the family declares modules -- before the declared state, whose
@@ -209,8 +201,10 @@ static void driver_graph_announce(const char *arch, bool verify, const char *wha
 }
 
 /* One step of the trunk: the plan, in its order.  DECODE: one row per bank; PREFILL: runs of one bank each -- a
- * verify's [0, n_verify), then the fused step's prompt runs.  The `heads` rows are headed into `logits_out` (host,
- * the logits width a row); n_verify > 0 arms the declared state's verify capture over the verify rows. */
+ * verify's [0, n_verify), then the fused step's prompt runs.  The `heads` rows are headed into the driver's slab
+ * (d->logits, the logits width a row), which becomes the session's step rows (L302: draws read them there); a
+ * caller that wants them on the host too passes `logits_out`.  n_verify > 0 arms the declared state's verify capture
+ * over the verify rows. */
 static bool driver_forward(pulsar_session *s, pulsar_step_mode mode, const int32_t *tokens, const int32_t *pos,
                            const int32_t *bank, uint32_t n_rows, const pulsar_driver_heads &heads, float *logits_out,
                            uint32_t n_verify = 0) {
@@ -369,7 +363,9 @@ static bool driver_forward(pulsar_session *s, pulsar_step_mode mode, const int32
                 fprintf(stderr, "pulsar: %s: could not clear bank %d after a failed step\n", ARCH(e), bank[r]);
         s->checkpoint_valid = false;
     }
-    if (ok && heads.n)
+    s->dev.step_rows = ok ? d->logits : NULL;
+    s->dev.step_n = ok ? heads.n : 0u;
+    if (ok && heads.n && logits_out)
         ok = pulsar_gpu_tensor_read(d->logits, 0, logits_out, (uint64_t)heads.n * e->logits_width() * sizeof(float)) != 0;
     return ok;
 }
@@ -391,7 +387,8 @@ static bool driver_prefill_chunk(pulsar_session *s, const pulsar_tokens *prompt,
     const pulsar_driver_ops *ops = DOPS(s->engine);
     for (uint32_t r = 0; r < rows; r++) c->pos[r] = (int32_t)(pos0 + r);
     bool ok = driver_forward(s, PULSAR_STEP_PREFILL, prompt->v + pos0, c->pos, c->bank, rows,
-                                    pulsar_driver_heads_span(rows - 1u, last ? 1u : 0u), s->logits);
+                                    pulsar_driver_heads_span(rows - 1u, last ? 1u : 0u), NULL);
+    if (ok && last) ok = s->live_from_rows(s->driver->logits, 0);
     if (ok && ops->absorb)
         ok = ops->absorb(s, PULSAR_STEP_PREFILL, prompt->v + pos0, c->pos, c->bank, rows, 0, false);
     if (ok) pulsar_state_set_pos(s->states, c->live, pos0 + rows);
@@ -444,8 +441,8 @@ int pulsar_driver_eval_row(pulsar_session *s, int token, char *err, size_t errle
     const pulsar_driver_ops *ops = DOPS(s->engine);
     const uint32_t live = s->states->live_bank;
     const int32_t tok = token, pos = s->checkpoint.len, bank = (int32_t)live;
-    if (!driver_forward(s, PULSAR_STEP_DECODE, &tok, &pos, &bank, 1, pulsar_driver_heads_span(0, 1),
-                               s->logits)) {
+    if (!driver_forward(s, PULSAR_STEP_DECODE, &tok, &pos, &bank, 1, pulsar_driver_heads_span(0, 1), NULL) ||
+        !s->live_from_rows(s->driver->logits, 0)) {
         if (err) snprintf(err, errlen, "%s: decode refused (see the log for the op)", ARCH(s->engine));
         return 1;
     }
@@ -462,8 +459,8 @@ int pulsar_driver_decode_multiseq(pulsar_session *s, const pulsar_multiseq_req *
     pulsar_engine *e = s->engine;
     pulsar_state_set *ss = s->states;
     const uint32_t nv = e->logits_width();
-    if (!reqs || n == 0 || n > PULSAR_DRIVER_HEADS_MAX || n > s->driver->max_rows || !logits || logits_cap < 0 ||
-        (uint64_t)logits_cap < (uint64_t)n * nv) {
+    if (!reqs || n == 0 || n > PULSAR_DRIVER_HEADS_MAX || n > s->driver->max_rows ||
+        (logits && (logits_cap < 0 || (uint64_t)logits_cap < (uint64_t)n * nv))) {
         if (err) snprintf(err, errlen, "%s: batched decode of %u rows refused (bad args)", ARCH(e), n);
         return 1;
     }
@@ -540,8 +537,8 @@ int pulsar_driver_decode_mixed(pulsar_session *s, const pulsar_multiseq_req *req
          * every kernel at its decode arm (L288 C1: in 16-row blocks past 16), so each row's logits are the bytes a
          * one-token decode gives. */
         const uint32_t nv = e->logits_width();
-        if (!reqs || n_rows == 0 || n_rows > PULSAR_DRIVER_HEADS_MAX || !logits || logits_cap < 0 ||
-            (uint64_t)logits_cap < (uint64_t)n_rows * nv || !s->states->verify_rows) {
+        if (!reqs || n_rows == 0 || n_rows > PULSAR_DRIVER_HEADS_MAX || !s->states->verify_rows ||
+            (logits && (logits_cap < 0 || (uint64_t)logits_cap < (uint64_t)n_rows * nv))) {
             if (err) snprintf(err, errlen, "%s: a verify step of %u rows refused (bad args, over %u rows, or no "
                               "verify capture)", ARCH(e), n_rows, PULSAR_DRIVER_HEADS_MAX);
             return 1;
@@ -585,7 +582,7 @@ int pulsar_driver_decode_fused(pulsar_session *s, const pulsar_multiseq_req *req
     const pulsar_driver_ops *ops = DOPS(e);
     pulsar_state_set *ss = s->states;
     const uint32_t nv = e->logits_width();
-    if (!reqs || !shape || !logits || n_rows == 0 || n_rows > s->driver->max_rows) {
+    if (!reqs || !shape || n_rows == 0 || n_rows > s->driver->max_rows) {
         if (err) snprintf(err, errlen, "%s: fused step: bad args (%u rows, at most %u)", ARCH(e), n_rows,
                           s->driver->max_rows);
         return 1;
@@ -597,8 +594,8 @@ int pulsar_driver_decode_fused(pulsar_session *s, const pulsar_multiseq_req *req
         return 1;
     }
     if (n_dec > PULSAR_DRIVER_HEADS_MAX || (n_dec > 0 && !ss->verify_rows) ||
-        n_dec + heads > e->family->session->fused_heads_max || logits_cap < 0 ||
-        (uint64_t)logits_cap < (uint64_t)(n_dec + heads) * nv) {
+        n_dec + heads > e->family->session->fused_heads_max ||
+        (logits && (logits_cap < 0 || (uint64_t)logits_cap < (uint64_t)(n_dec + heads) * nv))) {
         if (err) snprintf(err, errlen, "%s: fused step: %u verify rows (at most %u, with a verify capture) + %u "
                           "headed (at most %u rows headed), logits capacity %d", ARCH(e), n_dec,
                           PULSAR_DRIVER_HEADS_MAX, heads, e->family->session->fused_heads_max, logits_cap);
@@ -700,31 +697,19 @@ int pulsar_driver_decode_fused(pulsar_session *s, const pulsar_multiseq_req *req
  *   cut      the L155 trim: a recurrent state has no rewind, so the bank's view is invalidated and its next sync
  *            prefills it (a grid checkpoint at or below the cut would do). */
 
-/* The single lane's verify: the trunk over the round's rows, every row headed into the host rows the core reads; the
- * row argmaxes for the walk. */
-static bool driver_verify_single(pulsar_session *s, pulsar_spec_round *r, pulsar_spec_rows *out, char *err,
-                                 size_t errlen) {
-    pulsar_driver_state *d = s->driver;
-    const uint32_t V = s->engine->logits_width(), R = r->n_batch;
-    if (R > PULSAR_DRIVER_HEADS_MAX || !d->host_logits) {
+/* The single lane's verify: the trunk over the round's rows, every row headed into the driver's slab (the session's
+ * step rows: the walk reads them on the device, L302). */
+static bool driver_verify_single(pulsar_session *s, pulsar_spec_round *r, char *err, size_t errlen) {
+    const uint32_t R = r->n_batch;
+    if (R > PULSAR_DRIVER_HEADS_MAX) {
         snprintf(err, errlen, "%s: a verify step of %u rows is outside the capture", ARCH(s->engine), R);
         return false;
     }
     /* the batched lane's verify (decode_mixed, every row headed) over this round's rows alone */
     pulsar_multiseq_req reqs[PULSAR_DRIVER_HEADS_MAX];
     pulsar_spec_round_fill_reqs(r, s->states->live_bank, reqs);
-    if (s->engine->family->session->decode_mixed(s, reqs, R, d->host_logits, (int)(R * V), NULL,
-                                                 PULSAR_MSEQ_HEAD_ALL_ROWS, err, errlen) != 0)
-        return false;
-    for (uint32_t i = 0; i < r->K && i < 16u; i++)
-        r->row_tops[i] = (int)pulsar_driver_argmax(d->host_logits + (size_t)i * V, V);
-    out->read = pulsar_spec_row_read_block;
-    out->ud = out;
-    out->compact = NULL;
-    out->block.rows = d->host_logits;
-    out->block.row0 = 0;
-    out->block.vocab = V;
-    return true;
+    return s->engine->family->session->decode_mixed(s, reqs, R, NULL, 0, NULL, PULSAR_MSEQ_HEAD_ALL_ROWS, err,
+                                                    errlen) == 0;
 }
 
 /* The walk kept `commit` drafts: the installed bank's run of the last verify back to its last kept row (rows
@@ -754,11 +739,8 @@ const pulsar_spec_target_ops PULSAR_DRIVER_SPEC_TARGET = {
     /* .snapshot      = */ NULL,   /* the verify step captures its own undo state (the declared state's capture) */
     /* .restore       = */ NULL,
     /* .release       = */ NULL,
-    /* .round_note    = */ NULL,   /* one logits readback: the block */
     /* .arm_verify    = */ NULL,   /* a heads-on-every-row decode_mixed IS the verify */
     /* .verify_single = */ driver_verify_single,
-    /* .verify_rows   = */ NULL,   /* the block holds every row */
     /* .commit        = */ driver_spec_commit,
     /* .cut           = */ driver_spec_cut,
-    /* .readback      = */ NULL,   /* its batched steps read back full rows */
 };

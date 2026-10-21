@@ -29,7 +29,6 @@
 struct pulsar_session;
 struct pulsar_engine;
 struct pulsar_spec_round;
-struct pulsar_spec_rows;
 
 /** The TARGET family's verify hooks.  A hook marked optional may be NULL: the core then does nothing
  *  there (a family whose verify captures its own undo state inside the forward has no snapshot). */
@@ -43,25 +42,15 @@ typedef struct pulsar_spec_target_ops {
     bool (*restore)(struct pulsar_session *s, struct pulsar_spec_round *r);
     /** Optional.  The snapshot is no longer needed (the round ended or aborted). */
     void (*release)(struct pulsar_session *s, struct pulsar_spec_round *r);
-    /** A round begun with these sampling params will ride the next shared forward: the target may
-     *  choose a cheaper logits readback for the step (DeepSeek: per-row argmaxes when every round is
-     *  greedy, compact min-p candidates when every round is in the sparse contract).  Optional. */
-    void (*round_note)(struct pulsar_session *s, float temperature, int top_k, float top_p, float min_p);
     /** Optional.  Before the shared verify forward over n_rows rows (0 = disarm after it): keep each
-     *  row's drafter features and state inputs, and select the logits readback the rounds noted.  A
-     *  family whose decode_mixed treats a heads-on-every-row step as the verify needs none. */
+     *  row's drafter features and state inputs.  A family whose decode_mixed treats a heads-on-every-row
+     *  step as the verify needs none. */
     void (*arm_verify)(struct pulsar_session *s, uint32_t n_rows);
     /** The single lane's verify: ONE forward over the round's rows [base, pend...] at saved_len on the
-     *  installed bank, features and state inputs kept, r->row_tops filled for the K drafts, and `out`
-     *  set to read the rows.  false with `err` = the round is undone by the core. */
-    bool (*verify_single)(struct pulsar_session *s, struct pulsar_spec_round *r, struct pulsar_spec_rows *out,
-                          char *err, size_t errlen);
-    /** Optional.  The batched lane: this round's rows [row0, row0 + n_batch) of the last shared
-     *  forward, whose caller-visible logits block is `block` (rows the target read back another way are
-     *  not in it): fill r->row_tops for the K drafts and set `out` to read the rows.  NULL = the block
-     *  holds every row: the core takes the argmaxes from it and reads it. */
-    bool (*verify_rows)(struct pulsar_session *s, struct pulsar_spec_round *r, const float *block, uint32_t row0,
-                        struct pulsar_spec_rows *out, char *err, size_t errlen);
+     *  installed bank, features and state inputs kept, every row headed into the session's step rows
+     *  (pulsar_session_dev_rows: the walk reads them on the device, L302).  false with `err` = the round is
+     *  undone by the core. */
+    bool (*verify_single)(struct pulsar_session *s, struct pulsar_spec_round *r, char *err, size_t errlen);
     /** The walk accepted `commit` of the K drafts: the verify advanced the installed bank's state by all
      *  n_batch rows; leave it at saved_len + 1 + commit -- nothing to do on a full accept (DeepSeek), a
      *  snapshot restore plus a roll-forward of the recurrent state from the inputs saved during the
@@ -72,10 +61,6 @@ typedef struct pulsar_spec_target_ops {
     void (*cut)(struct pulsar_session *s, int pos);
     /* The rows one shared verify forward carries -- and so the decoders it carries, one base row each -- are the
      * family's session fact pulsar_family_session_ops::fused_heads_max (L284), not a field here. */
-    /** Optional.  The readback the last batched forward took INSTEAD of its full logits rows (what round_note
-     *  chose): its host rows, row count and row width in 4-byte words; false = the full rows (the caller's
-     *  block).  The cross-rank digest of a batched step reads it (pulsar_session_batch_digest). */
-    bool (*readback)(struct pulsar_session *s, const void **rows, uint32_t *n_rows, uint32_t *width);
 } pulsar_spec_target_ops;
 
 /** A DRAFTER: its own weights and per-bank context, behind the round API.

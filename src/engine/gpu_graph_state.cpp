@@ -67,7 +67,6 @@ void gpu_graph_release(pulsar_gpu_graph *g) {
     pulsar_gpu_tensor_free(g->batch_cur_hc);
     pulsar_gpu_tensor_free(g->prefill_tokens);
     pulsar_gpu_tensor_free(g->vision_visible);
-    pulsar_gpu_tensor_free(g->logits);
     pulsar_gpu_tensor_free(g->spec_logits);
     pulsar_gpu_tensor_free(g->tp_vocab_own);
     g->tp_vocab_own = NULL;
@@ -106,11 +105,8 @@ void gpu_graph_release(pulsar_gpu_graph *g) {
     pulsar_gpu_tensor_free(g->dspark_conf_tokens);
     pulsar_gpu_tensor_free(g->dspark_embed_tokens);
     pulsar_gpu_tensor_free(g->dspark_refined_ids);
-    pulsar_gpu_tensor_free(g->dspark_prefilter_sel);
     pulsar_gpu_tensor_free(g->dspark_row_meta);
     pulsar_gpu_tensor_free(g->dspark_bank_meta);
-    free(g->spec_compact_host);
-    free(g->spec_argmax_host);
     pulsar_gpu_tensor_free(g->output_norm);
     pulsar_gpu_tensor_free(g->output_embd);
     pulsar_gpu_tensor_free(g->ffn_norm);

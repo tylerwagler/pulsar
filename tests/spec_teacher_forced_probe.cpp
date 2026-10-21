@@ -81,8 +81,7 @@ int GATE_ENTRY(int argc, char **argv) {
     pulsar_session *s = NULL;
     pulsar_spec_round *r = NULL;
     pulsar_tokens toks; memset(&toks, 0, sizeof toks);
-    float *logits = NULL, *prow = NULL;
-    pulsar_sample_scratch scratch; memset(&scratch, 0, sizeof scratch);
+    float *logits = NULL;
     {
         size_t text_len = 0;
         /* NOT the long-context story blob: that file is a needle-in-haystack
@@ -110,9 +109,8 @@ int GATE_ENTRY(int argc, char **argv) {
         if (pulsar_session_bank_count(s) < 2) { fprintf(stderr, "no bank pool\n"); goto done; }
         const int width = pulsar_engine_logits_width(e);
         logits = (float *)malloc((size_t)17 * (size_t)width * sizeof(float));
-        prow = (float *)malloc((size_t)width * sizeof(float));
         r = pulsar_spec_round_new();
-        if (!logits || !prow || !r) goto done;
+        if (!logits || !r) goto done;
 
         char err[256];
         {
@@ -171,25 +169,23 @@ int GATE_ENTRY(int argc, char **argv) {
                 fprintf(stderr, "decode_mixed at %d: rc=%d rows=%u/%u %s\n", pos, drc, out_rows, rows, err);
                 goto done;
             }
-            /* p: the target after `first` = the round's row 0, read from the
-             * device: with the compact block armed the host block is not the
-             * row (L149 phase 2 -- round_end reads the compact headers and
-             * fetches a full row only when it needs one), and a uniform p is
-             * exactly what an unwritten block measured as (E[accept] 1.6e-5). */
+            /* p: the target after `first` = the round's row 0 (the step's headed row 0, on the device, L302): its
+             * draw where the walk draws it -- the draft sits one place past the base, so a copy of the stream stepped
+             * once reads that key -- and its argmax */
             if (have_q) {
-                if (!gpu_graph_read_spec_logits_row(s->graph, 0u, prow)) {
-                    fprintf(stderr, "spec logits row 0 read failed at %d\n", pos);
+                uint64_t at = rng;
+                pulsar_sample_advance(&at, 1u);
+                const uint32_t row0 = 0;
+                const pulsar_row_draw dp = {temperature, top_k, top_p, min_p, &at, false, NULL};
+                const pulsar_row_draw dm = {temperature, top_k, top_p, min_p, NULL, true, NULL};
+                int tp = -1, tm = -1;
+                if (pulsar_session_draw_rows(s, &row0, &dp, 1, &tp) != 0 || pulsar_session_draw_rows(s, &row0, &dm, 1, &tm) != 0 ||
+                    tp < 0 || tm < 0) {
+                    fprintf(stderr, "the target row's draws failed at %d\n", pos);
                     goto done;
                 }
-                pulsar_sample_dist pd; memset(&pd, 0, sizeof pd);
-                if (!pulsar_sample_dist_build(prow, (uint32_t)width, temperature, top_k, top_p, min_p, &scratch, &pd)) {
-                    fprintf(stderr, "p build failed at %d\n", pos);
-                    goto done;
-                }
-                /* the draft sits one place past the base: the key the walk's target draw reads */
-                accept += pulsar_sample_dist_draw(&pd, pulsar_sample_key(rng, 1u)) == draft0;
-                mode_hit += pd.ids[0] == draft0;
-                pulsar_sample_dist_free(&pd);
+                accept += tp == draft0;
+                mode_hit += tm == draft0;
                 truth_hit += (draft0 == toks.v[pos + 1]);
                 n_meas++;
                 if (n_meas % 250 == 0)
@@ -200,7 +196,7 @@ int GATE_ENTRY(int argc, char **argv) {
             if (!pulsar_session_bank_state_restore(s, bank0)) { fprintf(stderr, "bank restore failed\n"); goto done; }
             int accepted[17];
             const int na = pulsar_session_spec_round_end_forced(s, r, first, temperature, top_k, top_p, min_p,
-                                                                rngp, logits, 0u, toks.v + pos + 1, accepted, 17,
+                                                                rngp, 0u, toks.v + pos + 1, accepted, 17,
                                                                 err, sizeof err);
             if (na < 0) { fprintf(stderr, "round_end_forced at %d: %s\n", pos, err); goto done; }
             for (int i = 0; i < na; i++) {
@@ -236,9 +232,7 @@ int GATE_ENTRY(int argc, char **argv) {
         rc = 0;
     }
 done:
-    pulsar_sample_scratch_free(&scratch);
     free(logits);
-    free(prow);
     if (r) pulsar_spec_round_free(r);
     pulsar_tokens_free(&toks);
     if (s) pulsar_session_free(s);

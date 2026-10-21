@@ -1112,11 +1112,10 @@ bool mtp_forward(pulsar_session *s, const pulsar_mtp_step *m) {
     return ok;
 }
 
-/* the sampled proposal q of a headed row: the full vocabulary under the request's params (the head is the target's) */
-bool mtp_dist(pulsar_session *s, const float *row, float temperature, int top_k, float top_p, float min_p,
-              pulsar_sample_dist *qd) {
-    return row && pulsar_sample_dist_build(row, W(s->engine)->shape.n_vocab, temperature, top_k, top_p, min_p,
-                                           &s->sample_scratch, qd);
+/* the sampled proposal q of the headed rows: the full vocabulary (the head is the target's), in the driver's slab */
+const pulsar_gpu_tensor *mtp_q_rows(pulsar_session *s, const pulsar_gpu_tensor **id_map) {
+    *id_map = NULL;
+    return s->driver->logits;
 }
 
 const pulsar_mtp_ops k_mtp_ops = {
@@ -1127,7 +1126,7 @@ const pulsar_mtp_ops k_mtp_ops = {
     /* .trunk_rows    = */ mtp_trunk_rows,
     /* .out_rows      = */ mtp_out_rows,
     /* .forward       = */ mtp_forward,
-    /* .dist          = */ mtp_dist,
+    /* .q_rows        = */ mtp_q_rows,
     /* .stage_save    = */ NULL,   /* the module's state is its K|V pool: position-addressed, nothing to undo */
     /* .stage_restore = */ NULL,
     /* .prefetch      = */ NULL,

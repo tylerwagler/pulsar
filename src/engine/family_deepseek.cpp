@@ -114,12 +114,13 @@ static bool ds4_sync_reset_bank(pulsar_session *s) {
 static bool ds4_prefill_chunk(pulsar_session *s, const pulsar_tokens *prompt, uint32_t pos0, uint32_t rows, bool last,
                               void *) {
     pulsar_engine *e = s->engine;
-    if (!gpu_graph_prefill_layer_major(s->graph, &e->model, &e->weights, prompt, pos0, rows, last ? s->logits : NULL,
+    if (!gpu_graph_prefill_layer_major(s->graph, &e->model, &e->weights, prompt, pos0, rows, last ? s->dev.live : NULL,
                                        false, NULL, s->display_progress, s->display_progress_ud)) {
         if (pulsar_gpu_synchronize() == 0)
             fprintf(stderr, "pulsar: GPU synchronize after chunked prefill failure also failed\n");
         return false;
     }
+    if (last) s->dev.host_stale = true;   /* L302: the head wrote the live row on the device */
     s->prefill_frontier = (int)(pos0 + rows);
     return true;
 }
@@ -162,8 +163,9 @@ static int ds4_eval_row(pulsar_session *s, int token, char *err, size_t errlen) 
     int32_t ms_pos[1] = { (int32_t)s->checkpoint.len };
     int32_t ms_bank[1] = { (int32_t)(s->graph->banks.n_banks ? s->graph->banks.cur_bank : 0u) };
     /* rc: 0 = recoverable pre-arm reject, 1 = success, else fatal mid-sweep */
-    if (gpu_graph_decode_multiseq_batch(s->graph, &e->model, &e->weights, ms_tok, ms_pos, ms_bank, 1u, s->logits,
-                                        NULL, 0u, /*capture_cur=*/true, NULL) == 1)
+    if (gpu_graph_decode_multiseq_batch(s->graph, &e->model, &e->weights, ms_tok, ms_pos, ms_bank, 1u, NULL,
+                                        NULL, 0u, /*capture_cur=*/true, NULL) == 1 &&
+        s->live_from_rows(s->graph->spec_logits, 0))
         return 0;
     if (err) snprintf(err, errlen, "%s decode failed", pulsar_backend_name(e->backend));
     return 1;

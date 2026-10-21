@@ -70,7 +70,6 @@ struct pulsar_driver_state {
     pulsar_gpu_tensor *row_bank;        ///< [max_rows] i32: the step's banks
     pulsar_gpu_tensor *run_first_dev;   ///< [PULSAR_DRIVER_HEADS_MAX + 1] i32: a ragged verify's run offsets (with a verify capture)
     pulsar_gpu_tensor *scratch[PULSAR_DRIVER_SCRATCH_MAX];   ///< each op arena, sized by the family's scratch_bytes (NULL = none)
-    float *host_logits;                 ///< host [PULSAR_DRIVER_HEADS_MAX][logits width]: a round's verify (or draft) rows (with a verify capture)
     /* L266 step 7: the session's share of the engine's tensor-parallel transport (NULL tp = one GPU): the row
      * all-reduce's stage ticket and the exchange seq, advanced identically on every rank; the vocab gather's own
      * slice. */
@@ -203,8 +202,6 @@ const char *pulsar_driver_first_missing(const pulsar_driver_ops *ops, const puls
  *  [n_rows][width]) in exchange slot `slot` (the layer's; a drafter layer's after the trunk's).  One GPU: nothing. */
 bool pulsar_driver_tp_allreduce(const pulsar_driver_step *st, uint32_t slot, pulsar_gpu_tensor *y, uint32_t width,
                                 const char *what);
-/** The index of the first maximum of a row of n floats. */
-uint32_t pulsar_driver_argmax(const float *v, uint32_t n);
 /** The speculation round's verify target for a driver family (spec_ops.h): the verify is a heads-on-every-row
  *  decode_mixed, the commit the declared state's (pulsar_state_commit), the cut an invalidate. */
 extern const pulsar_spec_target_ops PULSAR_DRIVER_SPEC_TARGET;

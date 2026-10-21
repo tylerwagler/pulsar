@@ -92,6 +92,7 @@ int gate_session_contract_gate_main(int, char **);
 int gate_chat_decode_smoke_main(int, char **);
 int gate_head_graph_replay_gate_main(int, char **);
 int gate_mtp_spec_gate_main(int, char **);
+int gate_sync_budget_gate_main(int, char **);
 
 /* ---- the engine broker ------------------------------------------------- */
 
@@ -564,6 +565,10 @@ int main(int argc, char **argv) {
          * verify over 4 banks; 64 tokens a stream (the full 256 is make mtp-spec-gate) */
         {"mtp-spec-gate",             gate_mtp_spec_gate_main,          4, NULL, NULL, {"64", NULL},
          NEED_MTP | NEED_TOKENIZER},
+        /* L302: the host<->device syncs a speculative round pays, by phase, against the budget (DeepInfer's
+         * forbid_cuda_sync) -- every drafter's lane, 1 and 4 banks, greedy and seeded T0.7 */
+        {"sync-budget-gate",          gate_sync_budget_gate_main,       4, NULL, NULL, {"24", NULL},
+         NEED_SPEC | NEED_TOKENIZER},
     };
     /* Configuration A at a pinned draft depth (the gate sets spec_depth; the broker runs it on the default group's
      * engine, spec_depth_shareable -- 2026-10-14, three model loads per battery before). */

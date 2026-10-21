@@ -22,7 +22,7 @@ int parse_sampling_key(const char *key, const char **p, request *r) {
     } else if (!strcmp(key, "top_p")) {
         double v = 0.0;
         if (!json_number(p, &v) || !isfinite(v)) return -1;
-        /* The engine maps anything outside (0,1] to 1.0 (pulsar_sample_dist_build).
+        /* The engine maps anything outside (0,1] to 1.0 (THE sampler, pulsar_cuda_sampler.cu).
          * Clamp here too so the stored request matches what will run, and say so
          * once: top_p=0 is a common near-greedy idiom that clients expect to
          * narrow the nucleus, not widen it to the full vocab. */
@@ -41,7 +41,7 @@ int parse_sampling_key(const char *key, const char **p, request *r) {
         double v = 0.0;
         if (!json_number(p, &v) || !isfinite(v)) return -1;
         /* out-of-range disables the filter, matching the engine sampler
-         * (sample_top_p_min_p); an unvalidated min_p>1 collapses to greedy. */
+         * (pulsar_cuda_sampler.cu); an unvalidated min_p>1 collapses to greedy. */
         if (v < 0.0 || v > 1.0) {
             static bool warned = false;
             if (!warned) {

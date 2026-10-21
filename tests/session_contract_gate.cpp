@@ -1042,7 +1042,7 @@ static bool spec_lane_round(pulsar_session *s, const uint32_t *banks, const int 
         st[i].accepted = acc[i];
         st[i].accepted_cap = (int)(PULSAR_SPEC_LOGITS_ROWS + 1);
     }
-    if (pulsar_session_spec_round_end_batch(s, st, n, logits.data()) != 0) {
+    if (pulsar_session_spec_round_end_batch(s, st, n) != 0) {
         snprintf(err, errlen, "round_end refused");
         return false;
     }

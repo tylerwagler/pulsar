@@ -55,9 +55,15 @@ static int ds4_batch_step(pulsar_session *s, const pulsar_multiseq_req *reqs, ui
         bank[k]   = (int32_t)reqs[k].bank;
         tokens[k] = reqs[k].token;
     }
+    uint32_t headed = 0;
     const int rc = gpu_graph_decode_multiseq_batch(s->graph, &e->model, &e->weights, tokens, pos, bank,
-                                                   n_rows, logits, out_n_rows, max_head_runs,
+                                                   n_rows, logits, &headed, max_head_runs,
                                                    /*capture_cur=*/false, shape);
+    if (out_n_rows) *out_n_rows = headed;
+    /* L302: the headed rows are the session's step rows, in spec_logits (a fused step's prompt heads after its
+     * decode rows) */
+    s->dev.step_rows = rc == 1 ? s->graph->spec_logits : NULL;
+    s->dev.step_n = rc == 1 ? (shape ? shape->n_dec + pulsar_fused_shape_heads(shape) : headed) : 0u;
     /* The batch call consumed the descriptor synchronously (tokens copied to a stack row, pos/seq uploaded
      * to device in step_begin); the host scratch is dead now regardless of rc. */
     free(pos); free(bank); free(tokens);
@@ -86,7 +92,7 @@ int pulsar_session::decode_multiseq(const pulsar_multiseq_req *reqs,
                                 uint32_t n, float *logits, int logits_cap,
                                 char *err, size_t errlen) {
     auto *s = this;
-    if (!s || !reqs || !logits || n == 0 || n > PULSAR_MSEQ_MAX) {
+    if (!s || !reqs || n == 0 || n > PULSAR_MSEQ_MAX) {
         PULSAR_MULTISEQ_ERR("multiseq decode: bad args (n=%u)", n);
         return 1;
     }
@@ -94,7 +100,7 @@ int pulsar_session::decode_multiseq(const pulsar_multiseq_req *reqs,
      * readback would overflow a caller buffer sized from a different vocab
      * notion (pulsar_engine_vocab_size is the tokenizer table length, which the
      * loader never checks against the shape profile's n_vocab). */
-    if (logits_cap < 0 || (uint64_t)logits_cap < (uint64_t)n * PULSAR_N_VOCAB) {
+    if (logits && (logits_cap < 0 || (uint64_t)logits_cap < (uint64_t)n * PULSAR_N_VOCAB)) {
         PULSAR_MULTISEQ_ERR("multiseq decode: logits capacity %d < %u rows x %u",
                          logits_cap, n, (unsigned)PULSAR_N_VOCAB);
         return 1;
@@ -116,7 +122,7 @@ int pulsar_session::decode_mixed(const pulsar_multiseq_req *reqs,
                              char *err, size_t errlen) {
     auto *s = this;
     if (out_n_rows) *out_n_rows = 0;
-    if (!s || !reqs || !logits || n_rows == 0 ||
+    if (!s || !reqs || n_rows == 0 ||
         n_rows > s->graph->prefill_cap) {
         PULSAR_MULTISEQ_ERR("mixed decode: bad args (n_rows=%u prefill_cap=%u)",
                       n_rows, s ? s->graph->prefill_cap : 0u);
@@ -143,7 +149,7 @@ int pulsar_session::decode_mixed(const pulsar_multiseq_req *reqs,
                       (unsigned)PULSAR_SPEC_ROW_BUDGET, n_rows);
         return 1;
     }
-    if (logits_cap < 0 || (uint64_t)logits_cap < (uint64_t)head_rows * PULSAR_N_VOCAB) {
+    if (logits && (logits_cap < 0 || (uint64_t)logits_cap < (uint64_t)head_rows * PULSAR_N_VOCAB)) {
         PULSAR_MULTISEQ_ERR("mixed decode: logits capacity %d < %u rows x %u",
                       logits_cap, head_rows, (unsigned)PULSAR_N_VOCAB);
         return 1;
@@ -157,12 +163,12 @@ int pulsar_session::decode_fused(const pulsar_multiseq_req *reqs, uint32_t n_row
                                  uint32_t *out_n_rows, char *err, size_t errlen) {
     auto *s = this;
     if (out_n_rows) *out_n_rows = 0;
-    if (!reqs || !shape || !logits || n_rows == 0 || n_rows > s->graph->prefill_cap) {
+    if (!reqs || !shape || n_rows == 0 || n_rows > s->graph->prefill_cap) {
         PULSAR_MULTISEQ_ERR("fused step: bad args (n_rows=%u prefill_cap=%u)", n_rows, s->graph->prefill_cap);
         return 1;
     }
     const uint32_t heads = pulsar_fused_shape_heads(shape);
-    if (logits_cap < 0 || (uint64_t)logits_cap < (uint64_t)(shape->n_dec + heads) * PULSAR_N_VOCAB) {
+    if (logits && (logits_cap < 0 || (uint64_t)logits_cap < (uint64_t)(shape->n_dec + heads) * PULSAR_N_VOCAB)) {
         PULSAR_MULTISEQ_ERR("fused step: logits capacity %d < %u rows x %u", logits_cap, shape->n_dec + heads,
                          (unsigned)PULSAR_N_VOCAB);
         return 1;
@@ -174,12 +180,12 @@ int pulsar_session::decode_fused(const pulsar_multiseq_req *reqs, uint32_t n_row
 int pulsar_session_fused_local(pulsar_session *s, const pulsar_multiseq_req *reqs, uint32_t n_rows,
                                const pulsar_fused_shape *shape, float *logits, int logits_cap, uint32_t *out_n_rows,
                                char *err, size_t errlen) {
-    s->fused_logits = nullptr;
+    s->fused_valid = false;
     s->fused_n_dec = s->fused_heads = 0;
     const int rc = s->engine->family->session->decode_fused(s, reqs, n_rows, shape, logits, logits_cap, out_n_rows,
                                                             err, errlen);
     if (rc == 0) {
-        s->fused_logits = logits;
+        s->fused_valid = true;
         s->fused_n_dec = shape->n_dec;
         s->fused_heads = pulsar_fused_shape_heads(shape);
     }

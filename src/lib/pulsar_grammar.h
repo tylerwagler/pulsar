@@ -10,9 +10,9 @@
  * pulsar_grammar_matcher over it: accept a token, roll back k tokens, fill the next token's mask.
  *
  * THE MASK.  One row is pulsar_grammar_mask_words(n_vocab) uint32 words; bit (t & 31) of word (t >> 5) set = token t
- * may be drawn.  The same [rows][words] layout is the engine's per-row mask (pulsar_token_mask_apply) and the device
- * sampler's (L302): a masked token's logit becomes -inf before every sampling transform, identically in plain and
- * verify rows.  Bits past the tokenizer's vocabulary (a padded logits width) are clear.
+ * may be drawn.  The same [rows][words] layout is the device sampler's mask (L302: pulsar_row_draw.mask, the
+ * speculative walk's per-row masks): a masked token's logit becomes -inf before every sampling transform,
+ * identically in plain and verify rows.  Bits past the tokenizer's vocabulary (a padded logits width) are clear.
  *
  * EXCEPTIONS.  xgrammar reports every error by throwing.  pulsar_grammar.cpp is the only translation unit in pulsar
  * that is built with -fexceptions besides the vendored ones, and it is the boundary: every entry below catches

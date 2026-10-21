@@ -512,12 +512,11 @@ int pulsar_tp_send_command_ack(pulsar_tp *tp, uint64_t session_id, int status);
  * leader prints the tally at close (`cross-rank logits identity: N/N worker
  * frames matched`) and the pair grading tool reads that line as LEG A.
  *
- * The digest is word-wise (uint64 lanes, four independent chains so the
- * multiply latency does not serialise it), seeded with the row count so a
- * missing or extra row differs even when the bytes present agree.  It is a
- * structural identity check, not a cryptographic one. */
+ * The digest is computed where the rows live, on the device
+ * (pulsar_gpu_rows_digest, L302): word-wise, seeded with the row count and
+ * width so a missing or extra row differs even when the bytes present agree.
+ * It is a structural identity check, not a cryptographic one. */
 #define PULSAR_TP_ACK_HAS_DIGEST 1u
-uint64_t pulsar_tp_logits_digest(const float *logits, uint32_t n_rows, uint32_t width);
 /* The ack a logits-producing operation answers with on SUCCESS: `status` is 0
  * for the acked operations (eval, batch decode, mixed batch) and the POSITIVE
  * verdict for a verdict operation that ran (generate_speculative: tokens + 1).

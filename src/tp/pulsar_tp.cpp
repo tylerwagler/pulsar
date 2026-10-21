@@ -4065,36 +4065,6 @@ int pulsar_tp_send_command_ack_digest(pulsar_tp *tp, uint64_t session_id, int st
                          &ack, sizeof(ack));
 }
 
-uint64_t pulsar_tp_logits_digest(const float *logits, uint32_t n_rows, uint32_t width) {
-    /* Four independent multiply-xor chains over uint64 words, folded at the
-     * end; the row count and width seed the chains so a short or long vector
-     * cannot collide with a full one by matching bytes.  Word-wise because a
-     * byte-wise hash costs a served batch (tens of MB per step) milliseconds;
-     * this one runs near memory speed. */
-    const uint64_t K = 0x9E3779B97F4A7C15ull;
-    uint64_t h0 = K ^ ((uint64_t)n_rows << 32 | width), h1 = h0 * 3, h2 = h0 * 5, h3 = h0 * 7;
-    const size_t n_bytes = (size_t)n_rows * width * sizeof(float);
-    const unsigned char *b = (const unsigned char *)logits;
-    size_t i = 0;
-    for (; i + 32 <= n_bytes; i += 32) {
-        uint64_t w0, w1, w2, w3;
-        memcpy(&w0, b + i, 8); memcpy(&w1, b + i + 8, 8);
-        memcpy(&w2, b + i + 16, 8); memcpy(&w3, b + i + 24, 8);
-        h0 = (h0 ^ w0) * K; h1 = (h1 ^ w1) * K; h2 = (h2 ^ w2) * K; h3 = (h3 ^ w3) * K;
-    }
-    for (; i + 8 <= n_bytes; i += 8) {
-        uint64_t w; memcpy(&w, b + i, 8);
-        h0 = (h0 ^ w) * K;
-    }
-    if (i < n_bytes) {
-        uint64_t w = 0; memcpy(&w, b + i, n_bytes - i);
-        h0 = (h0 ^ w) * K;
-    }
-    uint64_t h = (h0 ^ (h1 >> 29)) * K ^ (h2 * 3 + (h3 >> 17));
-    h ^= h >> 32; h *= K; h ^= h >> 29;
-    return h;
-}
-
 void pulsar_tp_identity_stats(const pulsar_tp *tp, uint64_t *frames, uint64_t *matched) {
     if (frames) *frames = tp ? tp->identity_frames : 0;
     if (matched) *matched = tp ? tp->identity_matched : 0;
