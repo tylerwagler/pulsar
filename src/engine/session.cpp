@@ -910,6 +910,7 @@ void pulsar_engine::spec_metrics(pulsar_spec_metrics *out) {
     out->draft_tokens = e->spec_draft_tokens;
     out->num_drafts = e->spec_num_drafts;
     out->gen_tokens = e->spec_gen_tokens;
+    out->copy_probes = e->spec_copy_probes;
     for (int i = 0; i < 16; i++) out->accepted_per_pos[i] = e->spec_accepted_per_pos[i];
     for (int i = 0; i < 16; i++) out->verified_per_pos[i] = e->spec_verified_per_pos[i];
     /* L107: the waterfall covers every position the adaptive controller can reach */

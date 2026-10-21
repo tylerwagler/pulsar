@@ -287,6 +287,7 @@ typedef struct {
     uint64_t draft_tokens;          ///< proposed/verified draft tokens
     uint64_t num_drafts;            ///< draft rounds (verify steps carrying drafts)
     uint64_t gen_tokens;            ///< tokens emitted by the spec loop
+    uint64_t copy_probes;           ///< L308: copy chains drafted as a stale copy estimate's probe while it stood under tau
     uint64_t accepted_per_pos[16];  ///< accepted count per draft position
     uint64_t verified_per_pos[16];  ///< count of rounds verifying position i; rate[i] = accepted_per_pos[i]/verified_per_pos[i]
     int      max_draft;             ///< the deepest draft position a round can verify (the start depth, or the adaptive controller's ceiling)
@@ -1273,9 +1274,11 @@ const pulsar_tokens *pulsar_session_tokens(pulsar_session *s);
  * rows written before differ in a few codes, so a resumed v3 payload would not equal a
  * fresh prefill -- v3 refuses on the version and the bank re-prefills.
  * v5 (L302): the copy drafter's measured acceptance joins the speculation record (5 u32), so a
- * restored session prices its copy rounds as the saved one does; v4 refuses on the version. */
+ * restored session prices its copy rounds as the saved one does; v4 refuses on the version.
+ * v6 (L308): the copy acceptance's age (tokens since its last verdict) joins it (6 u32), so a restored session
+ * re-probes a stale copy estimate when the saved one would; v5 refuses on the version. */
 #define PULSAR_SESSION_KV_PAYLOAD_MAGIC UINT32_C(0x3150564b) /* "KVP1" */
-#define PULSAR_SESSION_KV_PAYLOAD_VERSION UINT32_C(5)
+#define PULSAR_SESSION_KV_PAYLOAD_VERSION UINT32_C(6)
 
 uint64_t pulsar_session_payload_bytes(pulsar_session *s);
 int pulsar_session_save_payload(pulsar_session *s, FILE *fp, char *err, size_t errlen);
