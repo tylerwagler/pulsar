@@ -971,8 +971,8 @@ state-kinds-gate: tests/state_kinds_gate
 # L272 P5: the session contract every family meets, on REAL weights (tests/session_contract_gate.cpp: chunk
 # neutrality C1-C5 incl. the interruptible sync, the bank surface B1-B5), one target per family's model.  The
 # zero-weight family gate above proves wiring only.  A new family adds one line here.
-# the served quant, MTP sidecar included (B6 needs a drafter)
-QWEN_GATE_MODEL ?= /mnt/models/qwen38fn-u-e4-d5-mtp
+# the served pack (L305): U-e4-d5 with the DFlash2 block drafter (B6 needs a drafter) and the EXL3 K5 head, no MTP
+QWEN_GATE_MODEL ?= /srv/models/qwen38fn-dflash2
 # L278 contract 4: Qwen's reference anchors, graded by the runner's cuda-reference-gate-* on the hosted Qwen model.
 # The capture is the CONTAINER's (HF qwen4_exp modules on these quantized weights, layer-streamed; L251
 # 2026-09-28) -- matched precision, as DeepSeek's B300 capture is, so a KL here is OUR arithmetic's divergence,
@@ -1041,7 +1041,10 @@ TP_PAIR_DS_MODEL ?= /mnt/models/DeepSeek-v4-Flash
 # L269 W1: the V4.1 layer-subset fixture (layer 4 = source layer 20, OUR EXL3 K3; the rest CUTLASS MXFP4) -- the
 # plan's EXL3 expert halves beside the MXFP4 ones.
 TP_V41_FIXTURE ?= /mnt/models/v41-tp1-fixture
-TP_PLAN_MODELS = $(TP_PAIR_DS_MODEL) $(QWEN_GATE_MODEL) $(TP_V41_FIXTURE)
+# Qwen's plan stays on the MTP pack (its golden's name): the served pack has no TP plan -- the plan refuses a block
+# drafter under TP and an EXL3 head (L305) -- and Qwen is not a pair model (no DeepSeek/Qwen on the work pair).
+TP_QWEN_PLAN_MODEL ?= /mnt/models/qwen38fn-u-e4-d5-mtp
+TP_PLAN_MODELS = $(TP_PAIR_DS_MODEL) $(TP_QWEN_PLAN_MODEL) $(TP_V41_FIXTURE)
 .PHONY: tp-plan-gate tp-plan-golden
 tp-plan-gate: tests/tp_plan_test
 	@for m in $(TP_PLAN_MODELS); do for r in 0 1; do \
@@ -1091,7 +1094,9 @@ nemotron-fwd-gate: tests/nemotron_fwd_gate
 # L296 N9: the chained-MTP drafter (src/engine/spec_mtp.h) on the container: greedy and seeded-sampled spec == plain at
 # depths 1..5 and the drafter's own numbers, the forced-reject stress (every Mamba-2 / attention / drafter byte back to
 # the plain twin's after planned rollbacks), the batched lane's shared verify == each bank's plain stream
-# (tests/mtp_spec_gate.cpp exact).  Any family whose drafter is the MTP lane: MTP_GATE_MODEL.
+# (tests/mtp_spec_gate.cpp exact).  Any family whose drafter is the MTP lane: MTP_GATE_MODEL.  L305: MTP is a dormant
+# lane -- no production family drafts with it -- so this is not in `make gates`; gates-dev runs it when an MTP path
+# changes (docs/QA_BEFORE_RELEASES.md).
 MTP_GATE_MODEL ?= $(NEMOTRON_GATE_MODEL)
 MTP_GATE_TOKENS ?= 256
 .PHONY: mtp-spec-gate
@@ -1105,8 +1110,8 @@ LILICORR_GATE_MODEL ?= /srv/models/nemotron35-k4-lilicorr-pulsar
 lilicorr-spec-gate: tests/mtp_spec_gate
 	./tests/mtp_spec_gate $(LILICORR_GATE_MODEL) $(MTP_GATE_TOKENS)
 # L299: the same gate on the DFlash2 block drafter (Qwen3.8-Flash-Next, the CandidateSelector chain head, the HC-mean
-# taps); its container holds the MTP module too (DFlash2 is the default of the two; the gate names it anyway).
-DFLASH2_GATE_MODEL ?= /srv/models/qwen38fn-u-e4-d5-dflash2
+# taps); the served pack, which holds no MTP module since L305 (the gate names the drafter anyway).
+DFLASH2_GATE_MODEL ?= $(QWEN_GATE_MODEL)
 .PHONY: dflash2-spec-gate
 dflash2-spec-gate: tests/mtp_spec_gate
 	PULSAR_GATE_DRAFTER=dflash2 ./tests/mtp_spec_gate $(DFLASH2_GATE_MODEL) $(MTP_GATE_TOKENS)
@@ -2275,7 +2280,7 @@ RUNNER_GATES = multiseq_frontier_gate rewind_frontier_gate mseq_rewind_probe tok
                bank_evict_restore_gate algo_stability_gate mixed_prefill_gate \
                mixed_neutrality_gate spec_sampling_gate mseq_short_ctx_probe prefill_bitexact_gate \
                comp_state_gate chunk_neutrality_gate vision_chunk_gate session_payload_gate tp_head_split_gate \
-               decode_reference_gate session_contract_gate chat_decode_smoke head_graph_replay_gate mtp_spec_gate \
+               decode_reference_gate session_contract_gate chat_decode_smoke head_graph_replay_gate \
                sync_budget_gate scratch_poison_gate
 RUNNER_OBJS = $(RUNNER_GATES:%=tests/runner/%.o)
 tests/runner/%.o: tests/%.cpp tests/gate_entry.h tests/gate_fixture.h tests/gate_util.h src/pulsar.h src/pulsar_gpu.h src/engine/pulsar_engine_internal.h src/lib/pulsar_segstore.h
@@ -2539,8 +2544,7 @@ GATES_DEV_ATTN   = cuda-mixed-prefill-gate cuda-row-neutrality-gate-deep cuda-vi
 # kernel dispatch: row-kind/batch-composition neutrality and the width sweep.
 GATES_DEV_CUDA   = cuda-mixed-neutrality-gate cuda-algo-stability-gate cuda-mixed-prefill-gate cuda-row-neutrality-gate-deep
 # engine lanes: the batched driver, the spec lane, the bank pool.
-GATES_DEV_ENGINE = cuda-multiseq-gate cuda-bank-spec-gate cuda-dspark-batch-gate cuda-evict-restore-gate cuda-session-payload-gate \
-                   mtp-spec-gate
+GATES_DEV_ENGINE = cuda-multiseq-gate cuda-bank-spec-gate cuda-dspark-batch-gate cuda-evict-restore-gate cuda-session-payload-gate
 GATES_DEV_SERVER = cuda-seam-gate cuda-session-payload-gate
 # vision: the host gates below do the real work (they need no model); the runner
 # sub-gates pin the prefill lane an image span rides and (L283) its chunk-start invariance.
@@ -2558,7 +2562,7 @@ gates-dev:
 	fi; \
 	$(MAKE) -j$(GATE_JOBS) --no-print-directory tests/gates_runner pulsar_test CUDA_ARCH=sm_120f || exit 1; \
 	$(MAKE) --no-print-directory gates-preflight || exit 1; \
-	paths='$(PATHS)'; why=''; attn=0; server=0; vision=0; exl3=0; family=0; gdn=0; router=0; blocks=0; bf16=0; minp=0; drafter=0; poison=0; \
+	paths='$(PATHS)'; why=''; attn=0; server=0; vision=0; exl3=0; family=0; gdn=0; router=0; blocks=0; bf16=0; minp=0; drafter=0; poison=0; mtp=0; \
 	if [ -z "$$paths" ]; then \
 	  paths=$$( { git diff --name-only HEAD; git ls-files --others --exclude-standard; } 2>/dev/null \
 	            | grep -E '\.(c|cc|cpp|cu|cuh|h|hpp)$$' | sort -u ); \
@@ -2589,6 +2593,7 @@ gates-dev:
 	      case "$$p" in *bf16_rows*|*nvfp4*|*weight_format*|src/engine/linear.cpp|src/engine/moe.cpp) bf16=1 ;; esac; \
 	      case "$$p" in *sampler*|*libm*|src/engine/spec_dspark.cpp|src/engine/session_spec.cpp|src/engine/spec_mtp.cpp|src/engine/spec_block.cpp) minp=1 ;; esac; \
 	      case "$$p" in *spec_block*|*blockdraft*|*candsel*|*lilicorr*|*mtp_spec*|*attn_gqa*|*rope*|src/engine/session_spec.cpp|src/families/nemotron_h/*|src/engine/family_qwen.cpp) drafter=1 ;; esac; \
+	      case "$$p" in *mtp*|src/engine/family_qwen.cpp|src/engine/family_qwen.h|src/engine/step_driver*|src/families/nemotron_h/nemotron_h_family.cpp|src/families/nemotron_h/nemotron_h.h) mtp=1 ;; esac; \
 	      case "$$p" in src/cuda/pulsar_cuda_runtime.cu|src/cuda/*scratch*|src/engine/gpu_graph_*|src/engine/gpu_decode.cpp|src/engine/step_driver*|src/engine/spec_block*|src/engine/verify_curve.cpp|*scratch_poison*) poison=1 ;; esac; \
 	      case $$cls in \
 	        attn) for g in $(GATES_DEV_ATTN); do add $$g; done ;; \
@@ -2618,6 +2623,7 @@ gates-dev:
 	if [ $$bf16 -eq 1 ]; then printf '  bf16-rows-gate + nvfp4-rows-gate: selected (the BF16 / NVFP4 rows arms and their admission)\n'; fi; \
 	if [ $$minp -eq 1 ]; then printf '  cuda-sampler-device-gate: selected (THE sampler, on the device: L302)\n'; fi; \
 	if [ $$drafter -eq 1 ]; then printf '  block drafter gates: blockdraft-gate, lilicorr-head-gate, lilicorr-spec-gate, dflash2-spec-gate (L298 / L299: the LiLiCorr lane on the Nemotron artifact, the DFlash2 lane on the Qwen artifact)\n'; fi; \
+	if [ $$mtp -eq 1 ]; then printf '  mtp-spec-gate: selected (L305: the dormant MTP lane, on an MTP path change, on the Nemotron mini)\n'; fi; \
 	if [ $$poison -eq 1 ]; then printf '  scratch-poison-gate: selected (L307: the graphed lanes and their scratch, poisoned == unpoisoned on DeepSeek, DFlash2, LiLiCorr)\n'; fi; \
 	if [ $$server -eq 1 ]; then printf '  server: chat smoke + the --server/--api unit switches\n'; fi; \
 	$(MAKE) --no-print-directory seam-check CUDA_ARCH=sm_120f || rc=1; \
@@ -2655,6 +2661,9 @@ gates-dev:
 	fi; \
 	if [ $$drafter -eq 1 ]; then \
 	  $(MAKE) --no-print-directory blockdraft-gate lilicorr-head-gate lilicorr-spec-gate dflash2-spec-gate draft-refusal-gate CUDA_ARCH=sm_120f || rc=1; \
+	fi; \
+	if [ $$mtp -eq 1 ]; then \
+	  $(MAKE) --no-print-directory mtp-spec-gate CUDA_ARCH=sm_120f || rc=1; \
 	fi; \
 	if [ $$poison -eq 1 ]; then \
 	  $(MAKE) --no-print-directory scratch-poison-gate CUDA_ARCH=sm_120f FRONTIER_MODEL="$(FRONTIER_MODEL)" || rc=1; \

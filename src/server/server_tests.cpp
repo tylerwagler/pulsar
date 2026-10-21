@@ -4536,7 +4536,7 @@ static const bpe_tokenizer *qwen_test_tokenizer(void) {
     if (tried) return tok;
     tried = true;
     const char *env = getenv("PULSAR_TEST_QWEN_TOKENIZER");
-    const std::string dir = env && env[0] ? env : "/mnt/models/qwen38fn-u-e4-d5-mtp";
+    const std::string dir = env && env[0] ? env : "/srv/models/qwen38fn-dflash2";
     std::string tj, gj;
     const auto slurp = [](const std::string &path, std::string *out) {
         FILE *f = fopen(path.c_str(), "rb");

@@ -91,7 +91,6 @@ int gate_decode_reference_gate_main(int, char **);
 int gate_session_contract_gate_main(int, char **);
 int gate_chat_decode_smoke_main(int, char **);
 int gate_head_graph_replay_gate_main(int, char **);
-int gate_mtp_spec_gate_main(int, char **);
 int gate_scratch_poison_gate_main(int, char **);
 int gate_sync_budget_gate_main(int, char **);
 
@@ -206,7 +205,6 @@ enum {
     NEED_REWIND        = 1u << 4,   /* pulsar_session_rewind: pulsar_engine_can_rewind */
     NEED_FIXTURES      = 1u << 5,   /* the blobs on the command line, which are the PRIMARY model's */
     NEED_VISION        = 1u << 6,   /* images: pulsar_engine_has_vision */
-    NEED_MTP           = 1u << 7,   /* the chained-MTP drafter (L296 N9): pulsar_engine_drafter == MTP */
 };
 #define DS4 NEED_DS4_INTERNALS
 
@@ -219,7 +217,6 @@ static const char *need_name(uint32_t bit) {
     case NEED_REWIND:        return "session rewind";
     case NEED_FIXTURES:      return "the command line's fixture blobs (captured from the primary model)";
     case NEED_VISION:        return "a vision tower (images)";
-    case NEED_MTP:           return "the chained-MTP drafter";
     }
     return "?";
 }
@@ -364,11 +361,10 @@ static int host_model(hosted_model *hm, const char *path, bool primary) {
     if (pulsar_engine_drafter(e) == PULSAR_DRAFTER_DSPARK) hm->has |= NEED_DSPARK;
     if (pulsar_engine_can_rewind(e)) hm->has |= NEED_REWIND;
     if (pulsar_engine_has_vision(e)) hm->has |= NEED_VISION;
-    if (pulsar_engine_drafter(e) == PULSAR_DRAFTER_MTP) hm->has |= NEED_MTP;
     if (primary) hm->has |= NEED_FIXTURES;
-    printf("\ngates_runner: hosting %s (%s%s):%s%s%s%s%s%s%s\n", path, hm->family, primary ? ", primary" : "",
+    printf("\ngates_runner: hosting %s (%s%s):%s%s%s%s%s%s\n", path, hm->family, primary ? ", primary" : "",
            hm->has & NEED_TOKENIZER ? " tokenizer" : "", hm->has & NEED_SPEC ? " spec" : "",
-           hm->has & NEED_DSPARK ? " dspark" : "", hm->has & NEED_MTP ? " mtp" : "", hm->has & NEED_REWIND ? " rewind" : "",
+           hm->has & NEED_DSPARK ? " dspark" : "", hm->has & NEED_REWIND ? " rewind" : "",
            hm->has & NEED_VISION ? " vision" : "", hm->has & NEED_DS4_INTERNALS ? " ds4-internals" : "");
     fflush(stdout);
     return 0;
@@ -561,11 +557,8 @@ int main(int argc, char **argv) {
         {"session-contract-gate",     gate_session_contract_gate_main,  4, NULL, NULL, {NULL}, 0},
         /* L278 contract 6: one greedy chat answer, graded on content -- every hosted model's semantic smoke */
         {"chat-smoke-gate",           gate_chat_decode_smoke_main,      1, NULL, NULL, {NULL}, NEED_TOKENIZER},
-        /* L296 N9: the chained-MTP drafter -- spec == plain (greedy at depths 1..5 and the drafter's numbers, seeded
-         * T0.7), the forced-reject stress (every state byte back to the plain twin's), the batched lane's shared
-         * verify over 4 banks; 64 tokens a stream (the full 256 is make mtp-spec-gate) */
-        {"mtp-spec-gate",             gate_mtp_spec_gate_main,          4, NULL, NULL, {"64", NULL},
-         NEED_MTP | NEED_TOKENIZER},
+        /* (L305: the chained-MTP drafter's mtp-spec-gate left the battery -- no production family drafts with MTP;
+         * `make mtp-spec-gate` runs it by hand and gates-dev on an MTP path change) */
         /* L302: the host<->device syncs a speculative round pays, by phase, against the budget (DeepInfer's
          * forbid_cuda_sync) -- every drafter's lane, 1 and 4 banks, greedy and seeded T0.7 */
         {"sync-budget-gate",          gate_sync_budget_gate_main,       4, NULL, NULL, {"24", NULL},
