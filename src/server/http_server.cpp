@@ -483,6 +483,8 @@ bool server::send_metrics(int fd) {
     const unsigned long long restores = (unsigned long long)s->m_restores;
     const unsigned long long restore_failures = (unsigned long long)s->m_restore_failures;
     const kv_restore_meter disk_meter = s->kv.meter;   /* L310 */
+    const unsigned long long preemptions = (unsigned long long)s->m_preemptions;    /* L314 */
+    const unsigned long long readmissions = (unsigned long long)s->m_readmissions;
     uint64_t refusals[PROVISION_REFUSAL_COUNT];
     for (int i = 0; i < PROVISION_REFUSAL_COUNT; i++) refusals[i] = s->m_refusals[i];
     const int block_reason = s->m_queue_block_reason;
@@ -779,6 +781,14 @@ bool server::send_metrics(int fd) {
     buf_puts(&b, "# HELP pulsar:bank_restore_failures_total Spilled banks that could not be reloaded.\n");
     buf_puts(&b, "# TYPE pulsar:bank_restore_failures_total counter\n");
     buf_printf(&b, "pulsar:bank_restore_failures_total %llu\n", restore_failures);
+
+    /* L314: running decoders preempted through their terminal checkpoint for a prompt that did not fit, and back */
+    buf_puts(&b, "# HELP pulsar:decoder_preemptions_total Running decoders preempted (terminal checkpoint to disk) to admit a prompt.\n");
+    buf_puts(&b, "# TYPE pulsar:decoder_preemptions_total counter\n");
+    buf_printf(&b, "pulsar:decoder_preemptions_total %llu\n", preemptions);
+    buf_puts(&b, "# HELP pulsar:decoder_readmissions_total Preempted decoders reloaded and decoding again.\n");
+    buf_puts(&b, "# TYPE pulsar:decoder_readmissions_total counter\n");
+    buf_printf(&b, "pulsar:decoder_readmissions_total %llu\n", readmissions);
 
     /* L310: the disk tier's restore-vs-recompute -- what each hit decided, the measured read rate it priced the
      * read with, the last decision's two prices, and the tokens each side carried. */
