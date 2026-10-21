@@ -769,7 +769,7 @@ void server::gen_begin(session_slot *sl) {
         int src = -1, best = own + PULSAR_SERVER_ADOPT_MIN_GAIN;
         for (int i = 0; i < s->n_slots; i++) {
             const session_slot *o = &s->slots[i];
-            if (o == sl || !o->provisioned || o->spilled) continue;
+            if (o == sl || !o->provisioned || o->spilled || o->preempted) continue;
             const int T = pulsar_session_bank_adopt_score(s->sess, o->bank, &j->req.prompt);
             if (T > best) { best = T; src = (int)o->bank; }
         }
