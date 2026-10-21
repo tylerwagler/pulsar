@@ -168,8 +168,8 @@ void pulsar_spec_draft_req_init(pulsar_session *s, spec_redraft_req *q, int next
         static bool probe_announced = false;   /* rule 5: and that a quenched copy lane probed again */
         if (!probe_announced) {
             probe_announced = true;
-            fprintf(stderr, "pulsar: copy re-probe ran: %u drafts after %u tokens without a copy verdict (estimate %.3f, "
-                            "tau %.2f)\n", q->keep, s->spec.copy_unseen, (double)s->spec.copy_accept,
+            fprintf(stderr, "pulsar: copy re-probe ran: %u drafts after %u tokens without a copy verdict "
+                            "(estimate %.3f, tau %.2f)\n", q->keep, s->spec.copy_unseen, (double)s->spec.copy_accept,
                     (double)pulsar_spec_tau(s->engine));
         }
     }

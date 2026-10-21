@@ -1375,6 +1375,25 @@ void pulsar_session_spec_arm_capture(pulsar_session *s, uint32_t n_rows) {
                         pulsar_tp_send_spec(tp, PULSAR_TP_FRAME_SPEC_ARM_CAPTURE, &c, NULL, NULL), NULL, 0)) return;
     pulsar_session_spec_arm_capture_local(s, n_rows);
 }
+/* L315: the verify curve's profile on a pair -- every rank runs it in step from the frame, the leader keeps its
+ * timings (verify_curve.cpp).  Verdict: 0 ran, 1 failed. */
+int pulsar_session_verify_profile(pulsar_session *s, uint32_t rows_max, double *base, char *err, size_t errlen) {
+    PULSAR_NVTX_FN();
+    if (!s) return -1;
+    pulsar_tp *tp = NULL;
+    const int route = tp_spec_route(s, "verify_profile", &tp, err, errlen);
+    if (route == 0) return -1;
+    if (route == 1) return pulsar_session_verify_profile_local(s, rows_max, base, err, errlen) ? 0 : -1;
+    pulsar_tp_spec_command c = tp_spec_cmd(s, tp_spec_live_bank(s));
+    c.i0 = (int32_t)rows_max;
+    c.i1 = base ? 1 : 0;   /* L306: timed (no cached curve) or the warmup's walk alone -- every rank runs the same reps */
+    if (!tp_mirror_sent(tp, "verify_profile",
+                        pulsar_tp_send_spec(tp, PULSAR_TP_FRAME_VERIFY_PROFILE, &c, NULL, NULL), err, errlen))
+        return -1;
+    const bool own = pulsar_session_verify_profile_local(s, rows_max, base, err, errlen);
+    if (!own) pulsar_tp_own_step_failed(tp, "verify_profile");
+    return tp_mirror_bank_verdict(s, tp, "verify_profile", own ? 0 : 1, -1) == 0 ? 0 : -1;
+}
 int pulsar_session_spec_redraft_batch(pulsar_session *s, pulsar_spec_round **rounds, const uint32_t *banks, uint64_t **rngs, int n, char *err, size_t errlen) {
     PULSAR_NVTX_FN();
     PULSAR_FAMILY_REQUIRES_S(s, PULSAR_FAMILY_CAP_SPEC, "speculative decoding", -1);

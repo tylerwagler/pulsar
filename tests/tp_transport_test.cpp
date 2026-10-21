@@ -305,6 +305,21 @@ static void frames_phase(pulsar_tp *tp, int rank) {
                   "a segment frame with a malformed key must not ship");
         }
 
+        /* L315: the verify curve's profile, run by every rank in step on the leader's bank and width (v29); the
+         * verdict is acked */
+        {
+            pulsar_tp_spec_command pc;
+            std::memset(&pc, 0, sizeof pc);
+            pc.session_id = sid;
+            pc.bank = 2;
+            pc.i0 = 32;
+            CHECK(pulsar_tp_send_spec(tp, PULSAR_TP_FRAME_VERIFY_PROFILE, &pc, NULL, NULL) == 1,
+                  "leader send verify profile");
+            int peers = -1;
+            CHECK(pulsar_tp_wait_command_status(tp, sid, "verify profile", &peers, err, sizeof(err)) && peers == 0,
+                  "leader verify profile verdict (%d): %s", peers, err);
+        }
+
         const int drafts[3] = { 7, 8, 9 };
         CHECK(pulsar_tp_send_verify(tp, sid, drafts, 3) == 1,
               "leader send_verify");
@@ -395,6 +410,12 @@ static void frames_phase(pulsar_tp *tp, int rank) {
               !std::memcmp(cmd.keys + 40, "fedcba9876543210fedcba9876543210fedcba98", 40),
               "worker segment reconcile payload");
         pulsar_tp_command_free(&cmd);
+
+        CHECK(pulsar_tp_recv_command(tp, &cmd, err, sizeof(err)), "worker recv verify profile: %s", err);
+        CHECK(cmd.type == PULSAR_TP_FRAME_VERIFY_PROFILE && cmd.session_id == sid && cmd.spec.bank == 2 &&
+              cmd.spec.i0 == 32, "worker verify profile payload");
+        pulsar_tp_command_free(&cmd);
+        CHECK(pulsar_tp_send_command_ack(tp, sid, 0) == 1, "worker verify profile ack");
 
         CHECK(pulsar_tp_recv_command(tp, &cmd, err, sizeof(err)),
               "worker recv verify: %s", err);
