@@ -6369,6 +6369,39 @@ static void test_kv_cache_sys_prefix_cut_clears_preamble_jitter(void) {
     TEST_ASSERT(kv_cache_sys_prefix_cut(&kc, kc.opt.sys_prefix_margin) == 0);
 }
 
+/* L310: a disk hit loads only when its measured read beats half the priced prefill of what it adds (Flare 2.10);
+ * an unmeasured read rate or an unpriced prefill loads (the first load measures the rate); a chain that adds nothing
+ * is never read.  The rate is an exponentially weighted mean of each load's bytes per ms. */
+static void test_l310_restore_vs_recompute(void) {
+    double t = -1.0;
+    /* 260 MiB (L298's Mamba slice) at 2 GB/s = ~136 ms of read */
+    const uint64_t bytes = 260ull << 20;
+    const double rate = 2.0e6;   /* bytes per ms */
+    TEST_ASSERT(kv_restore_decide(bytes, 40000, rate, true, 8000.0, &t) == KV_RESTORE_LOAD);
+    TEST_ASSERT(t > 136.0 && t < 137.0);
+    /* the same read for 256 tokens of ~60 ms prefill: recompute */
+    TEST_ASSERT(kv_restore_decide(bytes, 256, rate, true, 60.0, &t) == KV_RESTORE_RECOMPUTE);
+    /* the boundary: the read must be strictly under half the prefill */
+    TEST_ASSERT(kv_restore_decide(1000, 100, 1.0, true, 2000.0, &t) == KV_RESTORE_RECOMPUTE);
+    TEST_ASSERT(kv_restore_decide(999, 100, 1.0, true, 2000.0, &t) == KV_RESTORE_LOAD);
+    /* nothing gained past the bank's own resume: never read, whatever the prices */
+    TEST_ASSERT(kv_restore_decide(bytes, 0, rate, true, 1e9, &t) == KV_RESTORE_RECOMPUTE);
+    TEST_ASSERT(kv_restore_decide(bytes, 0, 0.0, false, 0.0, &t) == KV_RESTORE_RECOMPUTE);
+    /* before the first load, and before the engine's fit: load */
+    TEST_ASSERT(kv_restore_decide(bytes, 40000, 0.0, true, 8000.0, &t) == KV_RESTORE_UNMEASURED && t == 0.0);
+    TEST_ASSERT(kv_restore_decide(bytes, 40000, rate, false, 0.0, &t) == KV_RESTORE_UNPRICED);
+    /* the names are the /metrics labels */
+    TEST_ASSERT(!strcmp(kv_restore_verdict_names[KV_RESTORE_LOAD], "load"));
+    TEST_ASSERT(!strcmp(kv_restore_verdict_names[KV_RESTORE_RECOMPUTE], "recompute"));
+    /* the rate: the first sample whole, then 1/8 of each step toward the next; a zero-time or empty load is ignored */
+    double r = kv_restore_rate_update(0.0, 0, 8000, 4.0);
+    TEST_ASSERT(r == 2000.0);
+    r = kv_restore_rate_update(r, 1, 8000, 2.0);   /* sample 4000 */
+    TEST_ASSERT(r == 2250.0);
+    TEST_ASSERT(kv_restore_rate_update(r, 2, 8000, 0.0) == r);
+    TEST_ASSERT(kv_restore_rate_update(r, 2, 0, 5.0) == r);
+}
+
 static void test_kv_cache_chat_anchor_ignores_multiturn_tail(void) {
     const int user = 9001;
     const int assistant = 9002;
@@ -9813,6 +9846,7 @@ static void pulsar_server_unit_tests_run(void) {
     test_kv_cache_chat_anchor_uses_last_user_before_assistant();
     test_kv_cache_chat_anchor_ignores_multiturn_tail();
     test_kv_cache_sys_prefix_cut_clears_preamble_jitter();
+    test_l310_restore_vs_recompute();
     test_writeback_preserves_bytes();
     test_sha1_bytes_hex_matches_known_vector();
     test_l264_segstore_chain_lookup();

@@ -745,3 +745,12 @@ bool pulsar_engine_fused_step_ms(const pulsar_engine *e, uint32_t n_runs, const 
     *ms = t;
     return true;
 }
+
+bool pulsar_engine_prefill_ms(const pulsar_engine *e, uint32_t q, uint32_t c, uint32_t chunk, double *ms) {
+    const pulsar_fused_cost_fit *f = e ? &e->fused_cost : NULL;
+    *ms = 0.0;
+    if (!f || !f->valid || chunk == 0u) return false;
+    const uint32_t chunks = q / chunk + (q % chunk != 0u ? 1u : 0u);
+    *ms = f->a_ms * (double)chunks + f->alpha_ms * (double)q + f->beta_ms * (double)q * ((double)c + 0.5 * (double)q);
+    return true;
+}

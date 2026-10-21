@@ -314,7 +314,7 @@ void server::canonicalize_tool_checkpoint(session_slot *sl,
         pulsar_tokens effective = {0};
         const int loaded = resume > 0 ? 0
             : s->kv_cache_try_load_text(sl, rendered.ptr ? rendered.ptr : "", rendered.spans, rendered.n_spans,
-                                        NULL, 0, &effective, &path, false);
+                                        NULL, 0, 0, &effective, &path, false);
         const pulsar_tokens *sync_prompt = loaded > 0 ? &effective : &canonical;
         const int cached = loaded > 0 ? loaded : resume;
         const char *source = loaded > 0 ? "disk" : cached > 0 ? "memory" : "full";
@@ -642,6 +642,7 @@ void server::gen_begin(session_slot *sl) {
     int cached = 0;
     const char *cache_source = "none";
     int disk_cached = 0;
+    int memory_resume = 0;   /* L310: where the bank's own state resumes this prompt, kept or declined as shallow */
     if (image_request) {
         server_log(PULSAR_LOG_PREFILL,
                    "pulsar-server: image request (%d image%s): live and disk resolvers apply, "
@@ -736,6 +737,7 @@ void server::gen_begin(session_slot *sl) {
          * starts -- the match itself when the sync continues the bank where it stands, else the grid
          * checkpoint it resumes from (every family: decode rows past the prefill are recomputed) */
         const int resume = pulsar_session_bank_resume_at(s->sess, sl->bank, &j->req.prompt);
+        memory_resume = resume;
         /* L289: a bank that serves the WHOLE prompt (its prompt end, or a history it continues) is never declined
          * as shallow -- nothing serves that prompt better (a short repeated prompt sat under the trivial line and
          * was counted cold, and with the disk on, persisted and searched for nothing) */
@@ -756,8 +758,8 @@ void server::gen_begin(session_slot *sl) {
         s->kv_cache_persist(sl, "evict", true);
     }
     if (cached == 0) {
-        disk_cached = s->kv_cache_try_load(sl, &j->req, &effective_prompt,
-                                        &g->disk_cache_path);
+        /* L310: the chain loads only when reading it beats prefilling what it adds over the bank's own resume */
+        disk_cached = s->kv_cache_try_load(sl, &j->req, memory_resume, &effective_prompt, &g->disk_cache_path);
         if (disk_cached > 0) {
             cached = disk_cached;
             cache_source = "disk-text";
