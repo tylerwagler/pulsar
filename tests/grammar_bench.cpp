@@ -34,6 +34,7 @@
 #include "../src/server/trace.cpp"
 #include "../src/server/generate.cpp"
 #include "../src/server/server_jobs.cpp"
+#include "../src/server/sched_value.cpp"
 #include "../src/server/server_sched.cpp"
 #include "../src/server/http_server.cpp"
 #include "../src/server/cli_main.cpp"

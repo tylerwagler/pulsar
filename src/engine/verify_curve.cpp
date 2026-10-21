@@ -243,6 +243,15 @@ uint32_t pulsar_engine_verify_pick(const pulsar_engine *e, uint32_t n_seqs, cons
     return pulsar_verify_curve_pick(vc_leader(e), n_seqs, surv, m, cap_rows, 0.0, &ratio);
 }
 
+double pulsar_engine_verify_round_ms(const pulsar_engine *e, uint32_t n_seqs, uint32_t rows, double *outside_ms) {
+    const pulsar_verify_curve *c = vc_leader(e);   /* the server's round selection: on a pair the leader's (L315) */
+    *outside_ms = 0.0;
+    if (!c || n_seqs == 0u || rows == 0u) return 0.0;
+    if (rows > c->rows_max) rows = c->rows_max;
+    *outside_ms = vc_recent(c->host, &c->host_any, n_seqs) + vc_recent(c->draft, &c->draft_any, n_seqs);
+    return vc_round_ms(c, n_seqs, rows);
+}
+
 /* A draft's survival from its chain's confidences: a confidence below 0 is none (a drafter without a head, the
  * stop rule off) and counts as 1 -- the draft is ranked as sure, as DeepInfer pads a chain with no rates. */
 static inline float vc_conf(float c) { return c < 0.0f ? 1.0f : c; }
@@ -636,11 +645,12 @@ void pulsar_spec_calibration_note(pulsar_engine *e, bool copy, const float *conf
 
 /* ---- L304: the fused step's prompt cost ------------------------------------------------------------------------
  *
- * After DeepInfer's prefill load balancer (doc/inference_deployment_qa.md, "within a single GPU"): a chunk of a
- * prompt that does not finish it is not a fixed width but the widest that fits a time budget, solved from a fitted
- * cost.  A fused step's forward carries the decode banks' verify rows and each riding prompt's chunk of q rows over
- * the c rows of it already computed; the chunk's rows each pay the dense and expert work (linear in q) and attend
- * over c + their own causal prefix (q * (c + q / 2) pairs).  So
+ * After DeepInfer's prefill load balancer (doc/inference_deployment_qa.md, "within a single GPU"): a fused step's
+ * cost is fitted, not assumed, so the server can price every chunk it might carry (L312: the value-per-time round
+ * selection, src/server/sched_value.cpp, reads it through pulsar_engine_fused_step_ms).  A fused step's forward
+ * carries the decode banks' verify rows and each riding prompt's chunk of q rows over the c rows of it already
+ * computed; the chunk's rows each pay the dense and expert work (linear in q) and attend over c + their own causal
+ * prefix (q * (c + q / 2) pairs).  So
  *
  *     forward_ms = a + alpha * sum q + beta * sum q (c + q / 2)
  *
@@ -724,21 +734,14 @@ void pulsar_engine_fused_cost_observe(pulsar_engine *e, uint32_t n_runs, const u
     }
 }
 
-double pulsar_engine_fused_cost_ms(const pulsar_engine *e, uint32_t q, uint32_t c) {
+bool pulsar_engine_fused_step_ms(const pulsar_engine *e, uint32_t n_runs, const uint32_t *q, const uint32_t *c,
+                                 double *ms) {
     const pulsar_fused_cost_fit *f = e ? &e->fused_cost : NULL;
-    if (!f || !f->valid) return 0.0;
-    return f->alpha_ms * (double)q + f->beta_ms * (double)q * ((double)c + 0.5 * (double)q);
-}
-
-bool pulsar_engine_fused_chunk(const pulsar_engine *e, uint32_t c, double spent_ms, double budget_ms, uint32_t *rows) {
-    const pulsar_fused_cost_fit *f = e ? &e->fused_cost : NULL;
-    *rows = 0u;
+    *ms = 0.0;
     if (!f || !f->valid) return false;
-    const double room = budget_ms - f->a_ms - spent_ms;
-    if (!(room > 0.0)) return true;
-    /* the largest q with alpha q + beta q (c + q / 2) <= room */
-    const double lin = f->alpha_ms + f->beta_ms * (double)c;
-    const double q = f->beta_ms > 0.0 ? (-lin + sqrt(lin * lin + 2.0 * f->beta_ms * room)) / f->beta_ms : room / lin;
-    *rows = q >= 4294967295.0 ? 4294967295u : (uint32_t)q;
+    double t = f->a_ms;
+    for (uint32_t i = 0; i < n_runs; i++)
+        t += f->alpha_ms * (double)q[i] + f->beta_ms * (double)q[i] * ((double)c[i] + 0.5 * (double)q[i]);
+    *ms = t;
     return true;
 }
