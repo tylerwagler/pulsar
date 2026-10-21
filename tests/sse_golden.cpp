@@ -28,6 +28,7 @@
 #include "../src/server/chat_family.cpp"
 #include "../src/server/family_inkling.cpp"
 #include "../src/server/family_nemotron_h.cpp"
+#include "../src/server/constrain.cpp"
 #include "../src/server/genmsg.cpp"
 #include "../src/server/deepseek_dsml.cpp"
 #include "../src/server/deepseek_stream.cpp"

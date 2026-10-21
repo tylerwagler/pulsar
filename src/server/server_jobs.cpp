@@ -1189,63 +1189,18 @@ void server::gen_decode_init(session_slot *sl) {
         j->req.family->forced_call_seed(&j->req, &g->text);
         if (g->parser->seed) g->parser->seed(g->parser_st, g);
         g->plain_stream_pos = g->text.len;
-        /* L272: an unnamed forced call (required with several declared tools) samples its name under
-         * the declared-name mask (gen_mask_tool_name); every family's seed ends at the name's opener */
-        g->tool_name_constrained = (!j->req.forced_tool_name || !j->req.forced_tool_name[0]) &&
-                                   j->req.tool_orders.len > 0;
-        g->tool_name_from = g->text.len;
+    }
+    /* L303: the turn's grammar gate, past the seed (an unnamed forced call's name and arguments are the
+     * grammar's from here: the seed ends before the name's opener) */
+    if (!gen_constrain_begin(s, g)) {
+        g->finish = "error";
+        g->phase = GEN_FINISH;
+        return;
     }
     g->phase = GEN_DECODE;
 }
 
 
-
-bool gen_tool_name_open(const gen_state *g) {
-    if (!g || !g->tool_name_constrained || g->tool_name_from > g->text.len) return false;
-    /* the closer is looked for past the opener: DeepSeek's opener ` name="` holds the quote its closer starts with */
-    const size_t no = strlen(g->j->req.family->forced_name_open);
-    const size_t n = g->text.len - g->tool_name_from;
-    if (n <= no) return true;
-    return !strstr(g->text.ptr + g->tool_name_from + no, g->j->req.family->forced_name_close);
-}
-
-/* L272: mask `row` (the logits a constrained slot draws its next token from) to the tokens that keep the
- * function name a prefix of the family's opener + a declared tool's name + its closer.  The token bytes are built once
- * per server.  false = no token is allowed (cannot happen while a declared name is a strict extension of
- * the text; said once if it does), and the row is left as it was. */
-bool gen_mask_tool_name(server *s, gen_state *g, float *row, int width) {
-    if (!s->token_bytes) {
-        s->token_bytes = new std::vector<std::string>((size_t)width);
-        for (int t = 0; t < width; t++) {
-            size_t n = 0;
-            char *b = pulsar_token_text(s->engine, t, &n);
-            (*s->token_bytes)[(size_t)t].assign(b, n);
-            free(b);
-        }
-    }
-    const std::vector<std::string> &bytes = *s->token_bytes;
-    const request *r = &g->j->req;
-    const char *so_far = g->text.ptr ? g->text.ptr + g->tool_name_from : "";
-    const size_t n_so_far = g->text.len - g->tool_name_from;
-    std::vector<int> keep;
-    for (int t = 0; t < width && (size_t)t < bytes.size(); t++) {
-        const std::string &b = bytes[(size_t)t];
-        if (tool_name_token_allowed(so_far, n_so_far, b.data(), b.size(), r->family->forced_name_open,
-                                    &r->tool_orders, r->family->forced_name_close))
-            keep.push_back(t);
-    }
-    if (keep.empty()) {
-        server_log(PULSAR_LOG_WARNING, "pulsar-server: chat ctx=%s%s%s forced tool name: no token continues "
-                   "\"%.*s\" toward a declared tool -- sampling unmasked", g->ctx_span, g->req_flags[0] ? " " : "",
-                   g->req_flags, (int)n_so_far, so_far);
-        return false;
-    }
-    std::vector<float> kept(keep.size());
-    for (size_t k = 0; k < keep.size(); k++) kept[k] = row[keep[k]];
-    for (int t = 0; t < width; t++) row[t] = -INFINITY;
-    for (size_t k = 0; k < keep.size(); k++) row[keep[k]] = kept[k];
-    return true;
-}
 
 /* Sampling contract: request_init() pre-fills the engine defaults, so the
  * request values are already correct for non-thinking requests. In thinking
@@ -1434,6 +1389,11 @@ bool server::gen_emit_token(session_slot *sl, int token) {
     job *j = g->j;
     if (pulsar_token_is_stop(s->engine, token)) {
         g->finish = "stop";
+        return true;
+    }
+    /* L303: the gate follows every emitted token (a stop never reaches it: the turn ends there) */
+    if (!gen_constrain_accept(s, g, token)) {
+        g->finish = "error";
         return true;
     }
 
@@ -1837,6 +1797,7 @@ void server::gen_state_free(session_slot *sl) {
     pulsar_session_set_progress(s->sess, NULL, NULL);
     pulsar_session_set_display_progress(s->sess, NULL, NULL);
     if (g->parser_st) g->parser->destroy(g->parser_st);
+    gen_constrain_end(g);
     responses_stream_free(&g->responses_live);
     buf_free(&g->text);
     logprob_ledger_free(&g->logprobs);

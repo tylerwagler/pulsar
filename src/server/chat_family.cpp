@@ -26,6 +26,7 @@ void chat_conversation_free(chat_conversation *c) {
     free(c->tool_choice_wire);
     for (int i = 0; i < c->n_controls; i++) free(c->controls[i].raw);
     free(c->controls);
+    response_format_free(&c->response_format);
     memset(c, 0, sizeof(*c));
 }
 
@@ -544,7 +545,7 @@ static char *qwen_tool_error_suffix(const request *r, const thinking_state *, co
  * call; with thinking off the prompt already closed it. */
 static void qwen_forced_call_seed(const request *r, buf *out) {
     if ((qwen_effort)r->family_effort != QWEN_EFFORT_NONE) buf_puts(out, "\n</think>\n\n");
-    /* unnamed: stop before the name's opener -- the model samples "=name>" under the declared-name mask, as
+    /* unnamed: stop before the name's opener -- the model samples "=name>" under the call grammar (L303), as
      * the tokenizer joins them ("=get"); named: the whole tag, tokenized with the prompt as the model saw it */
     buf_puts(out, "<tool_call>\n<function");
     if (r->forced_tool_name && r->forced_tool_name[0]) {
@@ -674,8 +675,8 @@ static void deepseek_forced_call_seed(const request *r, buf *out) {
     buf_puts(out, d->tool_calls_start);
     buf_puts(out, "\n");
     buf_puts(out, d->invoke_start);
-    /* unnamed: stop before the name's opener -- the model samples ` name="NAME">` under the declared-name
-     * mask (forced_name_open / _close, the same constraint as Qwen's); named: the whole tag */
+    /* unnamed: stop before the name's opener -- the model samples ` name="NAME">` under the call grammar
+     * (L303, the same constraint as Qwen's); named: the whole tag */
     if (r->forced_tool_name && r->forced_tool_name[0]) {
         buf_puts(out, " name=\"");
         buf_puts(out, r->forced_tool_name);
@@ -694,6 +695,53 @@ static void deepseek_forced_call_prefill(const request *r, const char *prompt, s
     buf_free(&seed);
 }
 
+/* ---- L303: the grammar shapes -- what a constrained turn's bytes look like in each template ----------- */
+
+/* DeepSeek: after reasoning the answer; the calls are ONE DSML block of invokes (append_dsml_tool_calls_text's
+ * bytes: the block tag and a newline, each invoke's tag line, its parameters, its close and a newline, the block
+ * close), the parameters in xgrammar's DSML style for the template's spelling. */
+static const server_grammar_shape k_grammar_deepseek_v41 = {
+    /* .answer_open           = */ "</think>",
+    /* .answer_at_think_close = */ true,
+    /* .answer_close          = */ "",
+    /* .call_trigger          = */ PULSAR_TOOL_CALLS_START,
+    /* .block_head            = */ "\n",
+    /* .name_open             = */ PULSAR_INVOKE_START " name=\"",
+    /* .name_close            = */ "\">\n",
+    /* .style                 = */ "deepseek_v4_1_xml",
+    /* .call_close            = */ PULSAR_INVOKE_END "\n",
+    /* .repeat                = */ true,
+    /* .block_tail            = */ PULSAR_TOOL_CALLS_END,
+};
+static const server_grammar_shape k_grammar_deepseek_v4 = {
+    /* .answer_open           = */ "</think>",
+    /* .answer_at_think_close = */ true,
+    /* .answer_close          = */ "",
+    /* .call_trigger          = */ PULSAR_TOOL_CALLS_START_V4,
+    /* .block_head            = */ "\n",
+    /* .name_open             = */ PULSAR_INVOKE_START_V4 " name=\"",
+    /* .name_close            = */ "\">\n",
+    /* .style                 = */ "deepseek_xml",
+    /* .call_close            = */ PULSAR_INVOKE_END_V4 "\n",
+    /* .repeat                = */ true,
+    /* .block_tail            = */ PULSAR_TOOL_CALLS_END_V4,
+};
+/* Qwen and Nemotron-H write the same markup (qwen_chat.cpp, nemotron_chat.cpp): one <tool_call> block a call,
+ * <function=NAME> and its <parameter=KEY> lines -- xgrammar's qwen_xml style. */
+const server_grammar_shape k_grammar_qwen_xml = {
+    /* .answer_open           = */ "</think>",
+    /* .answer_at_think_close = */ true,
+    /* .answer_close          = */ "",
+    /* .call_trigger          = */ "<tool_call>",
+    /* .block_head            = */ "",
+    /* .name_open             = */ "\n<function=",
+    /* .name_close            = */ ">\n",
+    /* .style                 = */ "qwen_xml",
+    /* .call_close            = */ "</function>\n</tool_call>",
+    /* .repeat                = */ false,
+    /* .block_tail            = */ "",
+};
+
 /* ---- the tables and the dispatch ------------------------------------------------------------------- */
 
 static const server_family_ops k_family_deepseek_v41 = {
@@ -709,8 +757,7 @@ static const server_family_ops k_family_deepseek_v41 = {
     /* .tool_error_suffix     = */ deepseek_tool_error_suffix,
     /* .forced_call_seed      = */ deepseek_forced_call_seed,
     /* .forced_call_prefill   = */ deepseek_forced_call_prefill,
-    /* .forced_name_open      = */ " name=\"",   /* an unnamed seed ends at the invoke tag */
-    /* .forced_name_close     = */ "\">",         /* the tag's end: `">` is one token */
+    /* .grammar               = */ &k_grammar_deepseek_v41,
     /* .find_call_block       = */ find_next_dsml_tool_block,
 };
 static const server_family_ops k_family_deepseek_v4 = {
@@ -726,8 +773,7 @@ static const server_family_ops k_family_deepseek_v4 = {
     /* .tool_error_suffix     = */ deepseek_tool_error_suffix,
     /* .forced_call_seed      = */ deepseek_forced_call_seed,
     /* .forced_call_prefill   = */ deepseek_forced_call_prefill,
-    /* .forced_name_open      = */ " name=\"",   /* an unnamed seed ends at the invoke tag */
-    /* .forced_name_close     = */ "\">",         /* the tag's end: `">` is one token */
+    /* .grammar               = */ &k_grammar_deepseek_v4,
     /* .find_call_block       = */ find_next_dsml_tool_block,
 };
 static const server_family_ops k_family_qwen = {
@@ -743,8 +789,7 @@ static const server_family_ops k_family_qwen = {
     /* .tool_error_suffix     = */ qwen_tool_error_suffix,
     /* .forced_call_seed      = */ qwen_forced_call_seed,
     /* .forced_call_prefill   = */ qwen_forced_call_prefill,
-    /* .forced_name_open      = */ "=",   /* an unnamed seed ends at <function: "=get" is one token */
-    /* .forced_name_close     = */ ">",
+    /* .grammar               = */ &k_grammar_qwen_xml,
     /* .find_call_block       = */ qwen_find_call_block,
 };
 
@@ -781,5 +826,5 @@ bool render_chat_conversation(pulsar_engine *e, pulsar_chat_format fmt, server *
         !s->responses_validate_tool_outputs(&c->msgs, r->think_mode, &r->responses_requires_live_tool_state,
                                             &r->responses_requires_live_reasoning, err, errlen))
         return false;
-    return r->family->render(e, s, c, r, err, errlen);
+    return r->family->render(e, s, c, r, err, errlen) && constrain_plan_build(e, s, c, r, err, errlen);
 }

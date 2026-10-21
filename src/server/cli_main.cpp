@@ -3,6 +3,7 @@
 #include "pulsar_lock.hpp"
 #include "pulsar_gpu.h"
 #include "pulsar_ctxmem.h"
+#include "pulsar_grammar.h"
 
 #include <malloc.h>
 
@@ -297,7 +298,9 @@ void server::close_resources() {
         s->slots[i].provisioned = false;
     }
     if (s->sess) pulsar_session_free(s->sess);
-    delete s->token_bytes;   /* L272: the constrained tool name's token table */
+    pulsar_grammar_compiler_free(s->grammar);   /* L303: the grammar compiler and its token table */
+    s->grammar = NULL;
+    delete s->token_bytes;
     s->token_bytes = NULL;
     s->sess = NULL;
     free(s->spec_lane_logits);

@@ -574,17 +574,14 @@ typedef struct server_family_ops {
      *  append, so prompt + output = the family's render of the turn (request_apply_forced_tool_prefill
      *  does the bookkeeping).  With forced_call_seed, both or neither. */
     void (*forced_call_prefill)(const request *r, const char *prompt, size_t *keep, buf *append);
-    /** L272: an UNNAMED forced call's seed ends where the function name's OPENER starts; the opener, the
-     *  name and the closer (Qwen: "=" and ">"; DeepSeek: ` name="` and `">`, L284) are then sampled under a
-     *  mask that keeps them a prefix of opener + a declared tool's name + closer, so "required" with several
-     *  tools cannot name an undeclared one (Qwen sampled "ask_user").  The seed stops BEFORE the opener
-     *  (token healing): Qwen's tokenizer merges "=" with a name's first piece ("=get"), so a prompt ending
-     *  in a lone "=" is a state the model saw only before names it does not merge ("=", "convert"), and
-     *  "required" chose convert_currency for every question.  The closer is the whole tag end for the same
-     *  reason (DeepSeek's `">` is one token).  Every family with forced_call_seed has both; one whose render
-     *  refuses a forced call (Inkling: vLLM has none) has neither, and nothing reads them. */
-    const char *forced_name_open;
-    const char *forced_name_close;
+    /** L303: the family's spelling of what a grammar constrains -- its answer's bounds and its tool calls'
+     *  markup (server_grammar_shape, constrain.cpp builds every grammar from it).  A forced call is
+     *  constrained by it from the seed on: the seed is fed to the gate as if sampled, so an unnamed seed that
+     *  stops before the name's opener (L272's token healing: Qwen merges "=" with a name's first piece, and a
+     *  prompt ending in a lone "=" made "required" pick convert_currency for every question) leaves the
+     *  opener, a declared name and the arguments to the grammar.  NULL = none: the family refuses a response
+     *  format and strict tools by name. */
+    const struct server_grammar_shape *grammar;
     /** Tool memory: the earliest complete tool-call block at or after `p` in a transcript's text
      *  (`*end` = one past it); NULL = none.  The block's bytes are the replay key. */
     const char *(*find_call_block)(const char *p, const char **end);
@@ -663,6 +660,60 @@ void render_prelude(struct server *s, struct chat_conversation *c, struct reques
 bool chat_openai_tools_json(const struct chat_conversation *c, struct request *r, char *err, size_t errlen);
 /** After tokenising: each image's sentinel block where its placeholder sits (a text-only request untouched). */
 bool request_prepare_images(pulsar_engine *e, const chat_msgs *msgs, struct request *r, char *err, size_t errlen);
+
+/* ---- L303: structured outputs (constrain.cpp) ----------------------------------------------------------
+ * A response format (OpenAI response_format, Responses text.format, Anthropic output_config.format) and strict
+ * tools are grammars over the turn, compiled once per request off the decode thread (pulsar_grammar.h) and
+ * enforced per draw by a GATE that follows the emitted tokens: unconstrained until a trigger's bytes go by,
+ * then a grammar region whose masks every lane applies before its draw (pulsar_token_mask_apply).  The
+ * family declares the bytes; the gate is family-blind. */
+
+/** A family's spelling of a constrained turn (server_family_ops::grammar).  Calls: a region opens on
+ *  `call_trigger` (the bytes that open the turn's calls) and is
+ *      call_trigger block_head ( name_open NAME name_close ARGS call_close )[+ when repeat] block_tail
+ *  with ARGS the tool's schema in `style` (xgrammar's: "qwen_xml", "deepseek_xml", "deepseek_v4_1_xml",
+ *  "json") -- a strict tool's declared schema, another tool's any arguments.  The answer (a response format)
+ *  opens on `answer_open`, or at once when it is the think close and the turn starts outside reasoning, and
+ *  is: whitespace, the format, `answer_close`, then a stop token. */
+typedef struct server_grammar_shape {
+    const char *answer_open;    ///< the bytes that open the answer ("</think>"; Inkling "<|content_text|>")
+    bool answer_at_think_close; ///< answer_open is the reasoning close: a turn outside reasoning starts there
+    const char *answer_close;   ///< after the answer, before the stop ("" or "<|end_message|>")
+    const char *call_trigger;   ///< opens the turn's calls ("<tool_call>", DSML's calls tag, ...)
+    const char *block_head;     ///< after the trigger, before the first call
+    const char *name_open;      ///< before a call's name
+    const char *name_close;     ///< after it, before the arguments
+    const char *style;          ///< the arguments' xgrammar style
+    const char *call_close;     ///< after the arguments
+    bool repeat;                ///< more calls may follow in the same block
+    const char *block_tail;     ///< closes the block
+} server_grammar_shape;
+
+/** Qwen's markup, which Nemotron-H writes too (chat_family.cpp). */
+extern const server_grammar_shape k_grammar_qwen_xml;
+
+/** The response format a protocol asked for (chat_conversation::response_format). */
+typedef enum {
+    RESPONSE_FORMAT_NONE = 0,       ///< text
+    RESPONSE_FORMAT_JSON_OBJECT,    ///< any JSON object
+    RESPONSE_FORMAT_JSON_SCHEMA,    ///< src: the schema
+    RESPONSE_FORMAT_REGEX,          ///< src: the pattern (pulsar extension)
+    RESPONSE_FORMAT_GRAMMAR,        ///< src: an EBNF grammar, start rule `root` (pulsar extension)
+    RESPONSE_FORMAT_STRUCTURAL_TAG, ///< src: an xgrammar format object (vLLM's extension)
+} response_format_kind;
+typedef struct {
+    response_format_kind kind;
+    char *src;   ///< owned; NULL for NONE / JSON_OBJECT
+} response_format_spec;
+void response_format_free(response_format_spec *f);
+/** OpenAI chat's response_format object (also Responses' text.format, which is the same object with the
+ *  json_schema's members flattened into it, and Anthropic's output_config.format: {type: json_schema,
+ *  schema}).  false + err: a malformed or unknown format. */
+bool response_format_parse(const char *raw, response_format_spec *out, char *err, size_t errlen);
+
+/** The grammars one request's turn runs under, built with its render (request::constrain). */
+typedef struct constrain_plan constrain_plan;
+void constrain_plan_free(constrain_plan *p);
 
 /** One parsed request, normalised across the three supported APIs.
  *
@@ -771,6 +822,9 @@ typedef struct request {
     /** L251: the request's tools array in OpenAI's shape (JSON text) for a family that renders it as JSON
      * and reads arguments by its schema (Qwen's template and output parser); owned, NULL = no tools. */
     char *tools_json;
+    /** L303: the turn's grammars (a response format, strict or forced tool calls); NULL = unconstrained,
+     *  today's path.  Owned. */
+    constrain_plan *constrain;
 } request;
 
 /** One key/value pair from a parsed JSON object. */
@@ -1455,9 +1509,10 @@ struct server {
      * it. Slots are pure bank descriptors; all engine work goes through this
      * pointer. */
     pulsar_session *sess;
-    /** L272: every token's bytes (pulsar_token_text over the logits width), built on the first constrained
-     *  tool name and kept: the mask reads them per draw.  A pointer, so the struct stays memset-clean;
-     *  freed with the session at shutdown.  Worker thread only. */
+    /** L303: the grammar compiler over the loaded vocabulary and every token's bytes (pulsar_token_text over
+     *  the logits width), built on the first constrained request (constrain.cpp, under its own lock) and
+     *  immutable after; freed at shutdown.  Pointers, so the struct stays memset-clean. */
+    struct pulsar_grammar_compiler *grammar;
     std::vector<std::string> *token_bytes;
     /** Session pool. slots[0..n_slots) are provisioned; the worker thread is
      * the only mutator of slot fields and n_slots (n_slots additionally
@@ -2512,11 +2567,8 @@ struct gen_state {
     int last_decode_log_completion;    ///< token count at that line, for interval rates
     thinking_state thinking;           ///< reasoning-block tracking (the stop-string scan waits outside it)
     bool spec_enabled;          ///< speculative decoding is active for this request
-    /** L272: an unnamed forced call's function name is being sampled from g->text[tool_name_from..):
-     *  until the family's closer appears the sampler masks every token that would leave the declared
-     *  names, and the slot holds speculation (lane 3 samples inside the engine, past any mask). */
-    bool tool_name_constrained;
-    size_t tool_name_from;
+    /** L303: the request's grammar gate for this decode attempt (constrain.cpp); NULL = unconstrained. */
+    struct constrain_gate *gate;
     /** L272 P3: the family's output parser and its state for this decode attempt (created at decode
      * init, destroyed with the next attempt or the request). */
     const server_output_parser_ops *parser;
@@ -2818,6 +2870,7 @@ typedef struct chat_conversation {
     char *tool_choice_wire;         ///< the choice as the client spelled it (for a refusal); NULL = named
     chat_control *controls;         ///< thinking / effort controls in arrival order, owned
     int n_controls;                 ///< entries in controls
+    response_format_spec response_format;  ///< L303: the answer's format (NONE = text)
 } chat_conversation;
 
 void chat_conversation_free(chat_conversation *c);
@@ -2908,16 +2961,41 @@ bool http_response_retry(int fd, int code, const char *type, const char *body,
 bool http_error_retry(int fd, int code, const char *msg, int retry_after_s);
 bool http_error_anthropic(int fd, int code, const char *msg);
 bool request_apply_forced_tool_prefill(request *r, char *err, size_t errlen);
-/** L272: whether a token whose bytes are `tok` may follow `so_far` in an unnamed forced call's function
- *  name: the joined bytes stay a prefix of some declared name followed by `close`, or pass it with only
- *  whitespace after (a token may carry the closer and the newline).  An empty token is never allowed. */
-bool tool_name_token_allowed(const char *so_far, size_t n_so_far, const char *tok, size_t n_tok, const char *open,
-                             const tool_schema_orders *declared, const char *close);
-/** The slot is sampling an unnamed forced call's function name (the closer has not appeared yet). */
-bool gen_tool_name_open(const struct gen_state *g);
-/** Mask a constrained slot's logits row to the declared names (server_jobs.cpp); false = nothing allowed
- *  (said), the row untouched. */
-bool gen_mask_tool_name(struct server *s, struct gen_state *g, float *row, int width);
+/* ---- L303: the request's grammars and its gate (constrain.cpp) ---- */
+/** After the family's render: the request's response format and its strict or forced tool calls as compiled
+ *  grammars in r->constrain (none = NULL, nothing compiled, today's path).  The compile runs here, on the
+ *  request's own thread, under a deadline.  false + err = refused: a malformed format or schema, a compile
+ *  past its deadline, a family that declares no grammar shape, a pair. */
+bool constrain_plan_build(pulsar_engine *e, struct server *s, const chat_conversation *c, request *r, char *err,
+                          size_t errlen);
+/** The gate for one decode attempt (gen_decode_init), after the parser's seed: the seed's bytes go through it as
+ *  if sampled.  false = g->err says why (the request fails). */
+bool gen_constrain_begin(struct server *s, struct gen_state *g);
+void gen_constrain_end(struct gen_state *g);
+/** A grammar region is live: the next draw is masked. */
+bool gen_constrain_live(const struct gen_state *g);
+/** Mask words per row (pulsar_token_mask_apply's layout over the logits width). */
+uint32_t gen_constrain_words(const struct server *s);
+/** The next draw's mask into `row` (live only).  false = the matcher failed; g->err says why. */
+bool gen_constrain_mask(struct server *s, struct gen_state *g, uint32_t *row);
+/** The plain lanes' draw from a logits row (pulsar_sample_logits on the request's stream): through the
+ *  grammar's mask when a region is live, on a copy -- the mask shapes the DRAW only; `logits` stays the
+ *  target's row, which is what logprobs report (vLLM's default raw logprobs, and L302's device sampler keeps
+ *  the same split).  -1 with g->err set: the sampler refused the row or the grammar failed. */
+int gen_constrain_draw(struct server *s, struct gen_state *g, const float *logits, int width, float temp, int top_k,
+                       float top_p, float min_p);
+/** Advance past an emitted token.  false = the grammar refused it or the matcher failed; g->err says why. */
+bool gen_constrain_accept(struct server *s, struct gen_state *g, int token);
+/** A speculative round's masks: `toks` are the round's tokens (the base unless `base_emitted`, then the
+ *  drafts), row i the token after the base and drafts 0..i-1, so the gate goes through them and back.  Rows
+ *  are written into the gate's own buffer (*masks; valid until the next call on this gate).  Returns the rows
+ *  written -- 0 when no row of the round is in a live region (no masks: today's bytes) -- or -1 (g->err). */
+int gen_constrain_round(struct server *s, struct gen_state *g, const int *toks, int n, bool base_emitted,
+                        const uint32_t **masks);
+/** The base draw's mask for a speculative round's assemble (live only; the gate's buffer, valid until the next
+ *  call).  NULL + g->err on failure. */
+const uint32_t *gen_constrain_base_mask(struct server *s, struct gen_state *g);
+
 bool request_exceeds_context(const request *r, int ctx_size);
 bool gen_client_disconnected(int fd);
 bool http_error_context_length_exceeded(int fd,

@@ -543,7 +543,7 @@ int pulsar_tp_worker_dispatch(pulsar_engine *e, const pulsar_tp_command *c, char
         if (!worker_refused(e, c, "spec_next_base", &slot, ferr, sizeof(ferr))) {
             uint64_t rng = c->spec.rng;
             const int first = pulsar_session_spec_next_base_local(slot->s, c->spec.temperature, c->spec.top_k,
-                                                                  c->spec.top_p, c->spec.min_p, &rng);
+                                                                  c->spec.top_p, c->spec.min_p, NULL, &rng);
             status = first + 1;
             if (status < 0) status = 0;
         } else fprintf(stderr, "pulsar: tp worker: spec_next_base refused: %s\n", ferr);
@@ -581,7 +581,8 @@ int pulsar_tp_worker_dispatch(pulsar_engine *e, const pulsar_tp_command *c, char
                 int *acc = worker_accepted(slot, c->spec.i2);
                 const int na = pulsar_session_spec_round_end_local(slot->s, r, c->spec.i0,
                                                                    c->spec.temperature, c->spec.top_k, c->spec.top_p,
-                                                                   c->spec.min_p, 0u, &rng, slot->logits, (uint32_t)c->spec.i3,
+                                                                   c->spec.min_p, 0u, NULL, 0u, &rng, slot->logits,
+                                                                   (uint32_t)c->spec.i3,
                                                                    acc, c->spec.i2, ferr, sizeof(ferr));
                 status = na + 1;
                 if (status < 0) status = 0;

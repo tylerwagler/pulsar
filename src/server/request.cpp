@@ -277,26 +277,6 @@ const tool_schema_order *tool_schema_orders_find(const tool_schema_orders *order
  * samples names freely (Qwen answered a tool_choice "required" turn with an undeclared "reply"), so each
  * family's parser treats an undeclared name as a malformed call: dropped, never streamed, and retried with
  * the model-visible tool error this writes (the name, then the declared ones, cut to fit). */
-bool tool_name_token_allowed(const char *so_far, size_t n_so_far, const char *tok, size_t n_tok, const char *open,
-                             const tool_schema_orders *declared, const char *close) {
-    if (!tok || n_tok == 0 || !declared || !close) return false;
-    std::string joined(so_far ? so_far : "", n_so_far);
-    joined.append(tok, n_tok);
-    for (int i = 0; i < declared->len; i++) {
-        if (!declared->v[i].name) continue;
-        const std::string want = std::string(open ? open : "") + declared->v[i].name + close;
-        if (joined.size() <= want.size()) {
-            if (!want.compare(0, joined.size(), joined)) return true;   /* still inside name + closer */
-        } else if (!joined.compare(0, want.size(), want)) {
-            bool ws = true;   /* past the closer: only whitespace may ride the same token */
-            for (size_t k = want.size(); ws && k < joined.size(); k++)
-                ws = joined[k] == '\n' || joined[k] == ' ' || joined[k] == '\t' || joined[k] == '\r';
-            if (ws) return true;
-        }
-    }
-    return false;
-}
-
 bool tool_call_declared(const request *r, const char *name, char *detail, size_t detail_len) {
     if (name && tool_schema_orders_find(&r->tool_orders, name)) return true;
     if (detail && detail_len) {
@@ -359,6 +339,7 @@ void request_free(request *r) {
     r->anthropic_live_suffix_n_spans = 0;
     tool_schema_orders_free(&r->tool_orders);
     free(r->tools_json);
+    constrain_plan_free(r->constrain);
     memset(r, 0, sizeof(*r));
 }
 
