@@ -1033,17 +1033,17 @@ __global__ void __launch_bounds__(SR_THREADS) sr_sum_kernel(const __grid_constan
     if (tid == 0) start_s = (T)est;
     __syncthreads();
     const sum_grid<T> gg(start_s);
-    uint64_t loc = 0;
+    uint64_t loc = 0, q[SR_E];
     uint32_t ser = 0;
 #pragma unroll
     for (uint32_t e = 0; e < SR_E; e++) {
         bool f = false;
-        const uint64_t q = ib + e < t_end ? grid_q<T>(v[e], gg.k, &f) : 0u;
-        ser |= f ? 1u : 0u;
-        loc = sat_add(loc, q);
+        q[e] = ib + e < t_end ? grid_q<T>(v[e], gg.k, &f) : 0u;
+        ser |= f ? 1u << e : 0u;
+        loc = sat_add(loc, q[e]);
     }
     uint64_t total;
-    (void)block_scan_excl_u64<SR_THREADS>(loc, sm.wsum, &total);
+    const uint64_t excl = block_scan_excl_u64<SR_THREADS>(loc, sm.wsum, &total);
     const bool tie = __syncthreads_or(ser != 0u) || !gg.finite;
     if (tid == 0) {
         vst[t].k = gg.k;
@@ -1089,7 +1089,27 @@ __global__ void __launch_bounds__(SR_THREADS) sr_sum_kernel(const __grid_constan
         sm.start = t0;
     }
     __syncthreads();
-    tile_walk<T, SR_THREADS, SR_E, HAS_PRED>(v, ib, t0, t_end, pred, sm);
+    /* the start sits on the guessed grid (the usual case): the aggregate's scan is the tile's walk, but for the first
+     * value that ties, crosses the binade or meets pred from the exact start -- found without a second scan */
+    const sum_grid<T> sg(sm.s);
+    bool walked = false;
+    if (sg.finite && sg.k == gg.k && !tie) {
+        uint32_t hit = UINT32_MAX;
+        uint64_t S = excl;
+#pragma unroll
+        for (uint32_t e = 0; e < SR_E; e++) {
+            S = sat_add(S, q[e]);
+            if (hit != UINT32_MAX || ib + e >= t_end) continue;
+            if (sg.m + S >= TOP || (HAS_PRED && pred(sg.value(sg.m + S)))) hit = ib + e;
+        }
+        const uint32_t first = HAS_PRED || sg.m + total >= TOP ? block_min_u32<SR_THREADS>(hit, sm.wmin) : UINT32_MAX;
+        if (first == UINT32_MAX) {
+            if (tid == 0) sm.s = sg.value(sg.m + total);
+            walked = true;
+        }
+    }
+    __syncthreads();
+    if (!walked) tile_walk<T, SR_THREADS, SR_E, HAS_PRED>(v, ib, t0, t_end, pred, sm);
     if (tid == 0) {
         vst[t].stop = sm.stop;
         vst[t].end = (double)sm.s;
