@@ -92,6 +92,7 @@ int gate_session_contract_gate_main(int, char **);
 int gate_chat_decode_smoke_main(int, char **);
 int gate_head_graph_replay_gate_main(int, char **);
 int gate_mtp_spec_gate_main(int, char **);
+int gate_scratch_poison_gate_main(int, char **);
 int gate_sync_budget_gate_main(int, char **);
 
 /* ---- the engine broker ------------------------------------------------- */
@@ -568,6 +569,11 @@ int main(int argc, char **argv) {
         /* L302: the host<->device syncs a speculative round pays, by phase, against the budget (DeepInfer's
          * forbid_cuda_sync) -- every drafter's lane, 1 and 4 banks, greedy and seeded T0.7 */
         {"sync-budget-gate",          gate_sync_budget_gate_main,       4, NULL, NULL, {"24", NULL},
+         NEED_SPEC | NEED_TOKENIZER},
+        /* L307: poisoned disposable scratch changes no output -- the batched speculative lane, its bank subsets and
+         * verify widths alternating every tick, poisoned == unpoisoned byte for byte; 32 tokens a stream (the three
+         * graphed lanes' fixtures: make scratch-poison-gate) */
+        {"scratch-poison-gate",       gate_scratch_poison_gate_main,    4, NULL, NULL, {"32", NULL},
          NEED_SPEC | NEED_TOKENIZER},
     };
     /* Configuration A at a pinned draft depth (the gate sets spec_depth; the broker runs it on the default group's

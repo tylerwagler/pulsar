@@ -851,6 +851,9 @@ int gpu_graph_decode_multiseq_batch(
                 (g && g->spec_logits) ? "ok" : "MISSING");
         return 0;
     }
+    /* L307, armed only: the CUDA scratch slots (the step's disposable arenas) filled before the step uploads anything;
+     * an honest step overwrites everything it reads.  Nothing has been mutated yet: a refusal is recoverable. */
+    if (!pulsar_gpu_scratch_poison_step(NULL, 0)) return 0;
 
     /* Every accepted step joins the battery's shape report once, here: one
      * call per classic decode token, per mixed-entry K-row run, per
