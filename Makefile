@@ -979,10 +979,12 @@ QWEN_GATE_MODEL ?= /srv/models/qwen38fn-dflash2
 # not the quantization's.  (~/ref-qwen38fn beside it is the BF16 source: a quant-quality reading, qwen-ref-gate.)
 # No quotes in these values: gates-dev passes them through a shell variable.
 QWEN_REF_ANCHOR_DIR ?= /mnt/models/sparky-parked/home-claude/ref-qwen38fn-q
-# Measured 2026-10-07 at e21a0868 (sparky, report-only; the budgets below are that run's `--dump-kl`):
-#   story  512 2.2e-4 | 2048 0.90 FLIP (ref 710, ours <|im_end|>; ref margin 2.14 -- L251's documented mismatch)
-#          4096 1.97 | 4102 1.34 | 6144 0.54 | 16388 1.1e-5 | 31183 1.4e-6        top-1 6/7
-#   code   512 0.076 | 2048 3.0e-4 | 3957 0.041                                      top-1 3/3
+# Re-recorded 2026-10-21 on the SERVED pack (L305: QWEN_GATE_MODEL, the EXL3 K5 head; the anchors' capture and the
+# 2026-10-07 budgets, e21a0868, were the MTP pack's BF16 head -- code 512 0.076 then), report-only `--dump-kl`, the same
+# numbers at dev ec5bd400 and on the Flare series (gpuq #420):
+#   story  512 2.4e-4 | 2048 0.88 FLIP (ref 710, ours <|im_end|>; ref margin 2.14 -- L251's documented mismatch)
+#          4096 1.96 | 4102 1.35 | 6144 0.55 | 16388 1.1e-5 | 31183 1.5e-6        top-1 6/7
+#   code   512 0.086 | 2048 6.0e-4 | 3957 0.039                                      top-1 3/3
 # The high rows are the positions L251 traced to the model's own sensitivity (a random 0.67%-norm nudge of the
 # REFERENCE's own state flips story 4096 three times in four) -- known-high: top-1 enforced, KL informational and
 # graded for DIRECTION by the budgets.  The tolerance holds the confident rows with 3-5x headroom.
