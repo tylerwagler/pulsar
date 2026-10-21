@@ -130,6 +130,8 @@ its section's budget here, in its own commit, and its ledger row says why.  Sect
 the runner per hosted model (`cuda-runner-gate [<family>]`, its engine opens included); the live legs per
 model (`live-legs [<model>]`, its server loads included); the host-only gates, which overlap the runner, as
 their longest; and the suite total (the recipe's wall, the prerequisite build outside it, ~100 s).
+*Provisional:* the section rows are estimates from #422; the first battery at the L317 sha re-sets them from its
+own table.  The total is the target (L317: about 50 min with the live legs), not the sum of the rows.
 
 <!-- battery-budget -->
 | section | budget s | holds |
