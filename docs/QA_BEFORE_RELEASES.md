@@ -185,9 +185,9 @@ on an engine it now shares.
   after a `--model` restricts a hosted model to its own legs; a runner entry marked DEV runs only when
   `--only` names it (gates-dev), and every run lists them by name.  A hosted model none of whose entries the
   selection takes is not opened.
-- *The live legs* run at each model's production shape (`tests/live_legs.py` MODELS: Qwen 262k / 16 banks, Nemotron
-  1M / 16 banks / LiLiCorr, each with a 64 GB disk tier; DeepSeek's from the server defaults until deepseek.env is
-  confirmed).  `tests/live_legs.py`, `make live-legs`, `LIVE_LEGS=a,b` for a subset: per model the
+- *The live legs* run at each model's production flags (`tests/live_legs.py` MODELS, from `~/pulsar-serve/*.env`:
+  all PULSAR_MSEQ_BANKS=16; DeepSeek 1M ctx; Qwen 262k ctx, 64 GB disk tier; Nemotron 1M ctx, LiLiCorr, 64 GB disk
+  tier).  `tests/live_legs.py`, `make live-legs`, `LIVE_LEGS=a,b` for a subset: per model the
   shared server, then one instance with every server-wide test hook its legs need (only if one does), then
   one fresh instance for every reuse == cold reference (only if one does) -- never two engines at once.
   Each leg keeps its checks and its PASS/FAIL; each phase names the instance it ran on; each leg's
