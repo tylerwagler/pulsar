@@ -219,6 +219,9 @@ static bool driver_forward(pulsar_session *s, pulsar_step_mode mode, const int32
                 ARCH(e), n_rows, heads.n, d->max_rows, PULSAR_DRIVER_HEADS_MAX);
         return false;
     }
+    /* L307, armed only: the step's disposable scratch -- the family's arenas and the CUDA scratch slots -- filled
+     * before anything of the step is uploaded; an honest step overwrites everything it reads */
+    if (!pulsar_gpu_scratch_poison_step(d->scratch, PULSAR_DRIVER_SCRATCH_MAX)) return false;
     pulsar_driver_step &st = *ops->trunk(s);
     st.model = &e->model;
     st.plan = &e->plan;

@@ -313,6 +313,16 @@ uint64_t pulsar_gpu_seg_catalog_close(void);
  *  setting.  The engine never calls it. */
 int pulsar_gpu_seg_set_enabled(int on);
 
+/** L307 scratch poisoning, a diagnostic (gates; PULSAR_SCRATCH_POISON=1 arms it at start): armed, every step's entry
+ *  fills the calling thread's CUDA scratch slots and the step's own disposable regions with a cycling byte pattern
+ *  (0xFF, 0x00, 0x7F) before it uploads anything, so a step that reads scratch it did not write this step is caught
+ *  by an output that differs from the unarmed run's (scratch-poison-gate).  _set returns the previous setting; _step
+ *  is the step-entry hook (1 = done or unarmed, 0 = refused: called inside a capture, or the fill failed); _counts =
+ *  steps poisoned and bytes filled. */
+int pulsar_gpu_scratch_poison_set(int on);
+int pulsar_gpu_scratch_poison_step(pulsar_gpu_tensor *const *regions, uint32_t n);
+void pulsar_gpu_scratch_poison_counts(uint64_t *steps, uint64_t *bytes);
+
 int pulsar_gpu_set_model_map(const void *model_map, uint64_t model_size);
 int pulsar_gpu_set_model_fd(int fd);
 int pulsar_gpu_set_model_fd_for_map(int fd, const void *model_map);
