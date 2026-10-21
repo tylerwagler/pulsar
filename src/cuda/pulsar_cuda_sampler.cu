@@ -916,6 +916,89 @@ __device__ void tile_walk(const T (&v)[E], uint32_t ib, uint32_t start, uint32_t
     }
 }
 
+/* One warp's serial sum of vals[start, end) onto s, the tile_walk rule with warp shuffles for the block's barriers: a
+ * restart (a tie, a binade's edge) costs a few shuffles, so the stretch where a sum leaves a binade at nearly every
+ * value -- the row's start -- takes it.  Stops after the first index whose prefix satisfies pred (HAS_PRED; *stop).
+ * Every lane returns the sum. */
+template <typename T, bool HAS_PRED, typename P>
+__device__ T warp_walk(const T *vals, uint32_t start, uint32_t end, T s, P pred, uint32_t *stop) {
+    typedef sum_grid_traits<T> tr;
+    constexpr uint32_t E = 8;
+    constexpr uint64_t TOP = 1ull << (tr::MANT + 1u);
+    const uint32_t lane = threadIdx.x & 31u;
+    *stop = UINT32_MAX;
+    for (uint32_t c0 = start; c0 < end; c0 += 32u * E) {
+        const uint32_t ib = c0 + lane * E, c_end = min(end, c0 + 32u * E);
+        T v[E];
+#pragma unroll
+        for (uint32_t e = 0; e < E; e++) v[e] = ib + e < c_end ? vals[ib + e] : T(0);
+        uint32_t from = c0;
+        for (;;) {
+            const sum_grid<T> g(s);
+            if (!g.finite) return s;   /* a NaN sum stays NaN */
+            uint64_t q[E], loc = 0;
+            uint32_t ser = 0;
+#pragma unroll
+            for (uint32_t e = 0; e < E; e++) {
+                bool f = false;
+                q[e] = ib + e >= from && ib + e < c_end ? grid_q<T>(v[e], g.k, &f) : 0u;
+                if (f) ser |= 1u << e;
+                loc = sat_add(loc, q[e]);
+            }
+            uint64_t incl = loc;
+            for (uint32_t off = 1; off < 32u; off <<= 1) {
+                const uint64_t o = __shfl_up_sync(0xffffffffu, incl, off);
+                if (lane >= off) incl = sat_add(incl, o);
+            }
+            const uint64_t total = __shfl_sync(0xffffffffu, incl, 31);
+            const uint64_t below = __shfl_up_sync(0xffffffffu, incl, 1);
+            const uint64_t excl = lane ? below : 0u;   /* the lanes before (saturating sums do not subtract) */
+            uint32_t hit = UINT32_MAX;
+            uint64_t S = excl;
+#pragma unroll
+            for (uint32_t e = 0; e < E; e++) {
+                S = sat_add(S, q[e]);
+                const uint32_t i = ib + e;
+                if (hit != UINT32_MAX || i < from || i >= c_end) continue;
+                bool h = ((ser >> e) & 1u) || g.m + S >= TOP;
+                if (!h && HAS_PRED) h = pred(g.value(g.m + S));
+                if (h) hit = i;
+            }
+            const uint32_t first = __reduce_min_sync(0xffffffffu, hit);
+            if (first == UINT32_MAX) {
+                s = g.value(g.m + total);
+                break;
+            }
+            T ns = s;
+            uint32_t st = UINT32_MAX;
+            if (first >= ib && first < ib + E) {
+                const uint32_t e0 = first - ib;
+                uint64_t Sb = excl, qf = 0;
+                T pv = T(0);
+#pragma unroll
+                for (uint32_t e = 0; e < E; e++) {
+                    if (e < e0) Sb = sat_add(Sb, q[e]);
+                    if (e == e0) { qf = q[e]; pv = v[e]; }
+                }
+                if (!((ser >> e0) & 1u) && g.m + Sb + qf < TOP) {   /* pred at an exact prefix */
+                    ns = g.value(g.m + Sb + qf);
+                    st = first;
+                } else {   /* a tie, a NaN or the binade's edge: the hardware add */
+                    ns = tr::add(g.value(g.m + Sb), pv);
+                    if (HAS_PRED && pred(ns)) st = first;
+                }
+            }
+            const uint32_t owner = (first - c0) / E;
+            s = __shfl_sync(0xffffffffu, ns, owner);
+            st = __shfl_sync(0xffffffffu, st, owner);
+            if (st != UINT32_MAX) { *stop = st; return s; }
+            from = first + 1u;
+            if (from >= c_end) break;
+        }
+    }
+    return s;
+}
+
 /* The serial round-to-nearest sum of value(0) .. value(n - 1) in one block, stopped after the first i whose prefix
  * satisfies pred (HAS_PRED; *stop_at = i, else UINT32_MAX) -- a row's few values (a chain's slot, a slot kernel's
  * row); a row's whole vocabulary takes the multi-block sum below.  Every thread returns the sum. */
@@ -951,7 +1034,6 @@ __device__ T block_serial_sum(uint32_t n, V value, P pred, uint32_t *stop_at, se
 
 constexpr uint32_t SR_THREADS = 512, SR_E = 8, SR_TILE = SR_THREADS * SR_E;
 constexpr uint32_t SR_ROWS = PULSAR_GPU_SAMPLE_ROWS_MAX;
-constexpr uint32_t SR_HEAD = 512;   /* a row's first values, added serially (sr_sum_kernel) */
 
 struct sr_status {
     uint32_t flag;            /* 0 nothing, 1 the aggregate, 2 the exact end too */
@@ -1120,25 +1202,17 @@ __global__ void __launch_bounds__(SR_THREADS) sr_sum_kernel(const __grid_constan
     }
     __syncthreads();
     if (!walked && t == 0) {
-        /* the row's first values: a sum growing from 0 leaves a binade at nearly every one of them, so one thread
-         * adds the head serially (the hardware add: the host's), and the scan walks the rest */
-        __shared__ T head[SR_HEAD];
-        for (uint32_t i = tid; i < min(SR_HEAD, t_end); i += SR_THREADS) head[i] = vals[i];
-        __syncthreads();
-        if (tid == 0) {
-            T x = T(0);
-            uint32_t i = 0, stop = UINT32_MAX;
-            for (; i < min(SR_HEAD, t_end); i++) {
-                x = tr::add(x, head[i]);
-                if (HAS_PRED && pred(x)) { stop = i; break; }
+        /* the row's first tile: a sum growing from 0 leaves a binade at nearly every one of its first values, so warp 0
+         * walks it (a restart there is a few shuffles, not the block's barriers) */
+        if (tid < 32u) {
+            uint32_t stop;
+            const T x = warp_walk<T, HAS_PRED>(vals, 0u, t_end, T(0), pred, &stop);
+            if (tid == 0) {
+                sm.s = x;
+                sm.stop = stop;
             }
-            sm.s = x;
-            sm.stop = stop;
-            sm.nan = x != x ? 1u : 0u;
         }
         __syncthreads();
-        if (sm.stop == UINT32_MAX && !sm.nan && t_end > SR_HEAD)
-            tile_walk<T, SR_THREADS, SR_E, HAS_PRED>(v, ib, SR_HEAD, t_end, pred, sm);
     } else if (!walked) {
         tile_walk<T, SR_THREADS, SR_E, HAS_PRED>(v, ib, t0, t_end, pred, sm);
     }
