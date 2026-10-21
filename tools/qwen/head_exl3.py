@@ -20,7 +20,9 @@ default), on the head's own input -- the trunk mixer's bf16 rows.
       mtp.draft_head.weight + .ids.  The new tensors go in model-qhead.safetensors.  `base` is never written.
       (L299) --qhead FILE: the heads of ANOTHER container's model-qhead.safetensors, verbatim -- the served heads
       carried onto a rebuilt base (the same checkpoint and recipe: a container with a block drafter added); the base's
-      bf16 lm_head dropped as --head does when FILE holds lm_head.weight.
+      bf16 lm_head dropped as --head does when FILE holds lm_head.weight.  (L305) Only lm_head.weight is carried: an
+      MTP draft head in FILE (mtp.draft_head.*) is dropped, announced -- Qwen's MTP drafter is retired, its containers
+      carry no mtp.* tensor -- and any other tensor refuses.
 
 The draft head's rows are the engine's draft vocabulary in the engine's order (qwen_draft_vocab, family_qwen.cpp): ids
 [0, QWEN_DRAFT_PREFIX), the first `extra` of src/engine/qwen_draft_vocab.inc's ranked list sorted ascending, then
@@ -191,6 +193,11 @@ def cmd_emit(a):
                 continue
             if k not in qt:
                 raise SystemExit(f'{a.qhead}: {k} has no pulsar.tensors declaration')
+            if k.startswith('mtp.'):
+                print(f'{a.qhead}: {k} dropped (L305: the MTP drafter is retired; no mtp.* tensor is carried)')
+                continue
+            if k != 'lm_head.weight':
+                raise SystemExit(f'{a.qhead}: {k} is not a head this tool carries (lm_head.weight)')
             entries.append((k, v['dtype'], v['shape'], raw[qoff + v['data_offsets'][0]: qoff + v['data_offsets'][1]]))
             tensors[k] = qt[k]
         if 'lm_head.weight' in tensors:
