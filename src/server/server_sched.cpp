@@ -151,6 +151,7 @@ bool server::bank_switch(int bank) {
     auto *s = this;
     if (s->pool_banks <= 0) return true;          /* classic mode */
     if (bank < 0 || bank >= s->pool_banks) return true;
+    if (s->slots[bank].preempted) return false;   /* L314: its physical is freed until its readmission reloads it */
     if (bank == s->live_bank && !s->slots[bank].spilled) return true; /* already installed */
     pulsar_session *pool = s->sess;
     /* Snapshot the outgoing bank so its carry stays readable while idle, and
@@ -1507,7 +1508,7 @@ static int gen_sample_pool(server *s, gen_state *g, pulsar_session *pool, float 
  * Prefill/init/finish slots are serviced per-slot as usual. */
 static bool slot_is_batchable_decode(const session_slot *sl) {
     const gen_state *g = sl->gen;
-    return sl->active_job && g && g->phase == GEN_DECODE;
+    return sl->active_job && !sl->preempted && g && g->phase == GEN_DECODE;   /* L314: a parked decoder is not */
 }
 
 /* Decode-lane selection, ONE rule for the whole sweep (L179): the spec-batched
@@ -1861,6 +1862,171 @@ bool server::spill_bank(session_slot *victim) {
     return true;
 }
 
+/* ==== L314: preempt a running decoder through its terminal checkpoint, readmit it =====================
+ *
+ * After Flare (core-design.md, "Capacities and memory"): when a prompt cannot be admitted and no idle bank can be
+ * spilled, the NEWEST running decoder publishes its terminal checkpoint and is readmitted later with its history and
+ * its remaining budget.  Here the terminal checkpoint is the bank's frontier PAYLOAD at its consumed count (the
+ * kv-state payload, every family's: every pool's rows, the frontier walk, the logits the next draw reads, the
+ * draft-depth controller -- what the payload-frontier gate proves decodes on as the saved session would), written to
+ * the disk KV dir, and the bank's physical is freed.  The job itself stays bound and parked: its gen_state keeps the
+ * stream, the budget, the stop / grammar (L303) / penalty state and the sampler stream (L302), whose key is (seed,
+ * tokens drawn) -- so a readmitted request draws exactly the tokens an uninterrupted one would (greedy and keyed
+ * sampling alike; beside other decoders the batched lanes are nondeterministic by design, L118).  Readmission is
+ * first-preempted first, as soon as the bank's resident KV fits the budget again.  An image request keeps its bank
+ * (as Flare's: its image features are not reconstructed). */
+static int guard_victim_order(server *s, session_slot **dec, int n, int *order);
+static prompt_kv_verdict server_prompt_kv_verdict(uint64_t touched, uint64_t delta, uint64_t bound,
+                                                  const uint64_t *drop, int n_victims, bool busy_may_free,
+                                                  int *n_spill);
+bool server::preempt_newest_decoder(const session_slot *keep, uint64_t need) {
+    auto *s = this;
+    if (s->pool_banks <= 1 || !s->kv.enabled || !s->kv.dir || pulsar_engine_is_tp(s->engine)) return false;
+    bool tried[PULSAR_SESSION_POOL_CAP] = {};
+    for (;;) {
+        /* the newest decoder not yet tried -- never bank 0, which every guard move keeps resident (spill_bank
+         * installs it), never an image request's */
+        session_slot *v = NULL;
+        for (int i = 1; i < s->n_slots; i++) {
+            session_slot *c = &s->slots[i];
+            if (c == keep || tried[i] || !slot_is_batchable_decode(c) || c->spilled || c->active_job->req.n_images > 0)
+                continue;
+            /* a preemption that does not make the prompt fit only churns (the prompt waits either way) */
+            const uint64_t freed = pulsar_session_bank_touched_kv_bytes(s->sess, c->bank);
+            const uint64_t touched = pulsar_session_touched_kv_bytes(s->sess);
+            if ((touched > freed ? touched - freed : 0) + need > s->guard_touched_budget) continue;
+            if (!v || c->gen->t0 > v->gen->t0) v = c;
+        }
+        if (!v) return false;
+        tried[v - s->slots] = true;
+        gen_state *g = v->gen;
+        if (g->batch_active && !s->batch_leave(v)) continue;   /* the plain batch's sampled token is committed first */
+        if (g->phase != GEN_DECODE || !s->bank_switch((int)v->bank)) continue;
+        pulsar_session *pool = s->sess;
+        const double t0 = server_now_sec();
+        const uint64_t bytes = pulsar_session_bank_touched_kv_bytes(pool, v->bank);
+        const uint64_t payload_bytes = pulsar_session_payload_bytes(pool);   /* the installed victim's */
+        char name[64];
+        snprintf(name, sizeof name, "preempt-bank-%u.kvp", v->bank);
+        char *path = path_join(s->kv.dir, name);
+        char err[256] = "";
+        /* the payload refuses a bank that is no exact frontier (a drafter mid-draft between rounds): that decoder keeps
+         * its bank and the next newest is tried */
+        FILE *fp = fopen(path, "wb");
+        bool ok = fp && pulsar_session_save_payload(pool, fp, err, sizeof err) == 0;
+        if (fp) ok = fclose(fp) == 0 && ok;
+        if (ok) {
+            pulsar_session_bank_state_save(pool, v->bank);
+            ok = pulsar_session_bank_state_restore(pool, 0);   /* free_physical refuses the installed bank */
+            if (ok) s->live_bank = 0;
+        }
+        ok = ok && pulsar_session_bank_free_physical(pool, v->bank);
+        if (!ok) {
+            server_log(PULSAR_LOG_WARNING, "pulsar-server: preemption of bank %u declined (%s); it keeps decoding",
+                       v->bank, err[0] ? err : "its payload could not be written or its physical freed");
+            unlink(path);
+            free(path);
+            continue;
+        }
+        v->preempted = true;
+        v->preempt_bytes = bytes;
+        v->preempt_t = t0;
+        v->preempt_path = path;
+        s->count_metric(&s->m_preemptions);
+        server_log(PULSAR_LOG_DEFAULT,
+                   "pulsar-server: PREEMPTED bank %u's decoder at %d tokens (%d generated): terminal checkpoint "
+                   "%.1f MiB in %.1f ms, physical freed (%.2f GiB)", v->bank, pulsar_session_bank_pos(pool, v->bank),
+                   g->completion_total + g->completion, (double)payload_bytes / 1048576.0,
+                   (server_now_sec() - t0) * 1e3, (double)bytes / (1024.0 * 1024.0 * 1024.0));
+        return true;
+    }
+}
+
+bool server::worker_readmit_preempted() {
+    auto *s = this;
+    session_slot *v = NULL;
+    for (int i = 0; i < s->n_slots; i++)
+        if (s->slots[i].preempted && (!v || s->slots[i].preempt_t < v->preempt_t)) v = &s->slots[i];
+    if (!v) return false;
+    pulsar_session *pool = s->sess;
+    if (s->guard_enabled) {
+        /* the admission arithmetic over the idle banks, as a prompt's (L280): fits, or fits once idle banks spill */
+        int order[PULSAR_SESSION_POOL_CAP], n_spill = 0;
+        uint64_t drop[PULSAR_SESSION_POOL_CAP];
+        const int n_victims = guard_victim_order(s, NULL, 0, order);
+        for (int k = 0; k < n_victims; k++) drop[k] = pulsar_session_bank_touched_kv_bytes(pool, s->slots[order[k]].bank);
+        bool busy = false;   /* another job whose end may make room */
+        for (int i = 0; i < s->n_slots && !busy; i++)
+            busy = &s->slots[i] != v && s->slots[i].active_job && !s->slots[i].preempted;
+        const prompt_kv_verdict pv = server_prompt_kv_verdict(pulsar_session_touched_kv_bytes(pool), v->preempt_bytes,
+                                                              s->guard_touched_budget, drop, n_victims, busy, &n_spill);
+        if (pv == PROMPT_KV_WAIT) return false;
+        if (pv == PROMPT_KV_REFUSE) {
+            /* nothing running will make room and no spill does: it can never come back -- ended by name (Flare: a
+             * request whose history exceeds the whole pool ends) */
+            snprintf(v->gen->err, sizeof v->gen->err,
+                     "a preempted decode no longer fits the KV budget (%.2f GiB beside %.2f GiB resident, budget %.2f "
+                     "GiB) and nothing running can make room", (double)v->preempt_bytes / (1024.0 * 1024.0 * 1024.0),
+                     (double)pulsar_session_touched_kv_bytes(pool) / (1024.0 * 1024.0 * 1024.0),
+                     (double)s->guard_touched_budget / (1024.0 * 1024.0 * 1024.0));
+            v->gen->finish = "error";
+            v->gen->phase = GEN_FINISH;
+            server_log(PULSAR_LOG_WARNING, "pulsar-server: bank %u: %s", v->bank, v->gen->err);
+            unlink(v->preempt_path);
+            free(v->preempt_path);
+            v->preempt_path = NULL;
+            v->preempted = false;
+            /* an empty bank again, its history gone with it (never a view over rows it no longer holds) */
+            if (pulsar_session_bank_alloc_physical(pool, v->bank) && pulsar_session_bank_state_restore(pool, v->bank)) {
+                s->live_bank = (int)v->bank;
+                pulsar_session_invalidate(pool);
+                pulsar_session_bank_state_save(pool, v->bank);
+            }
+            return true;
+        }
+        for (int k = 0; k < n_spill; k++) {
+            if (!s->spill_bank(&s->slots[order[k]])) return false;
+            s->count_metric(&s->m_spills);
+        }
+        if (pulsar_session_touched_kv_bytes(pool) + v->preempt_bytes > s->guard_touched_budget) return false;
+    }
+    const double t0 = server_now_sec();
+    char err[256] = "";
+    bool ok = pulsar_session_bank_alloc_physical(pool, v->bank) && pulsar_session_bank_state_restore(pool, v->bank);
+    const bool installed = ok;
+    if (ok) s->live_bank = (int)v->bank;
+    FILE *fp = ok ? fopen(v->preempt_path, "rb") : NULL;
+    if (fp) {
+        fseek(fp, 0, SEEK_END);
+        const long n = ftell(fp);
+        rewind(fp);
+        ok = n > 0 && pulsar_session_load_payload(pool, fp, (uint64_t)n, err, sizeof err) == 0;
+        fclose(fp);
+    } else {
+        ok = false;
+    }
+    gen_state *g = v->gen;
+    if (ok) {
+        pulsar_session_bank_state_save(pool, v->bank);
+        v->committed_pos = pulsar_session_pos(pool);
+        s->count_metric(&s->m_readmissions);
+        server_log(PULSAR_LOG_DEFAULT, "pulsar-server: READMITTED bank %u's decoder at %d tokens after %.1f s (%.1f ms "
+                   "reload)", v->bank, pulsar_session_pos(pool), t0 - v->preempt_t, (server_now_sec() - t0) * 1e3);
+    } else {
+        snprintf(g->err, sizeof g->err, "a preempted decode could not be reloaded: %s",
+                 err[0] ? err : "its bank could not be re-backed or its payload read");
+        g->finish = "error";
+        g->phase = GEN_FINISH;
+        server_log(PULSAR_LOG_WARNING, "pulsar-server: bank %u: %s", v->bank, g->err);
+        if (installed) pulsar_session_invalidate(pool);   /* only the bank's own state, never another's */
+    }
+    unlink(v->preempt_path);
+    free(v->preempt_path);
+    v->preempt_path = NULL;
+    v->preempted = false;
+    return true;
+}
+
 /* LRU-idle smallest-frontier victim: NOT bank 0 (pinned), NOT in the live decode
  * set, no active job, not already spilled. -1 if none. */
 int server::guard_pick_victim(session_slot **dec, int n) {
@@ -1975,7 +2141,12 @@ bool server::prompt_kv_admit(session_slot *sl, job *j, bool *refused) {
     int order[PULSAR_SESSION_POOL_CAP];
     int n_spill = 0;
     uint64_t need = 0;
-    const prompt_kv_verdict v = s->prompt_kv_check(sl, j, order, &n_spill, &need);
+    prompt_kv_verdict v = s->prompt_kv_check(sl, j, order, &n_spill, &need);
+    /* L314: no idle bank can make room: the newest running decoders are preempted through their terminal checkpoints,
+     * one at a time, while that can (a prompt whose growth alone is past the budget never fits) */
+    while ((v == PROMPT_KV_WAIT || v == PROMPT_KV_REFUSE) && need <= s->guard_touched_budget &&
+           s->preempt_newest_decoder(sl, need))
+        v = s->prompt_kv_check(sl, j, order, &n_spill, &need);
     if (v == PROMPT_KV_FITS) return true;
     pulsar_session *pool = s->sess;
     const double gib = 1024.0 * 1024.0 * 1024.0;
@@ -3531,10 +3702,10 @@ static session_slot *worker_pick_step(server *s, int *rr, const session_slot *sk
 }
 
 static bool slot_steppable_beside_decode(const session_slot *c) {
-    return c->active_job && !slot_is_batchable_decode(c) && !(c->gen && c->gen->batch_active);
+    return c->active_job && !c->preempted && !slot_is_batchable_decode(c) && !(c->gen && c->gen->batch_active);
 }
 
-static bool slot_active(const session_slot *c) { return c->active_job != NULL; }
+static bool slot_active(const session_slot *c) { return c->active_job != NULL && !c->preempted; }
 
 /* L260 fusion: beside a spec quantum a riding prompt advances inside the
  * quantum's forwards, so the iteration's classic step leaves it alone. */
@@ -3548,17 +3719,32 @@ void *worker_main(void *arg) {
     for (;;) {
         bool bound = false;
         while (s->worker_try_bind()) bound = true;
+        /* L314: a preempted decoder whose KV fits again is reloaded -- once no queued prompt waits on KV (the prompt
+         * it was preempted for binds first; readmitting ahead of it would only preempt it again) */
+        {
+            bool kv_wait;
+            {
+                pulsar::ScopedLock lk(&s->mu);
+                kv_wait = s->head && s->head->refusal_counted == PROVISION_REFUSED_KV_TOUCHED;
+            }
+            if (!kv_wait && s->worker_readmit_preempted()) bound = true;
+        }
         if (bound) s->publish_metrics_snapshot();
 
-        int n_active = 0;
+        int n_active = 0, n_parked = 0;
         for (int i = 0; i < s->n_slots; i++) {
-            if (s->slots[i].active_job) n_active++;
+            if (s->slots[i].active_job && !s->slots[i].preempted) n_active++;
+            if (s->slots[i].preempted) n_parked++;
             /* L006 heartbeat: swept over ALL bound slots, not just the one
              * about to get a quantum. The slot that most needs a keepalive is
              * precisely the one starved behind another job's long prefill —
              * which is never the slot being advanced. Non-blocking; a no-op
              * unless that slot has been silent >= PULSAR_SERVER_HEARTBEAT_MS. */
             if (s->slots[i].gen) (void)gen_stream_heartbeat(s->slots[i].gen);
+        }
+        if (n_active == 0 && n_parked > 0) {
+            usleep(10000);   /* L314: only parked decoders, waiting for room: poll their readmission */
+            continue;
         }
         if (n_active == 0) {
             /* With every slot free, choose_slot_for_job never returns NULL

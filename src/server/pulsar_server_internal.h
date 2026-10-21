@@ -1443,6 +1443,14 @@ typedef struct session_slot {
      *  history is prefilled again to its consumed end (server::terminal_checkpoint_step), so the next turn resumes
      *  there instead of re-prefilling the reply first.  Cleared by the next job's bind. */
     bool         terminal_pending;
+    /** L314: the slot's running decoder was PREEMPTED for a prompt the KV budget could not otherwise admit: its
+     *  bank's exact state (the frontier payload at its consumed count) is on disk at preempt_path, its physical
+     *  freed, its job parked with everything the decode loop keeps (stream, budget, stop / grammar / penalty state,
+     *  the keyed sampler stream).  The scheduler steps it again once server::worker_readmit_preempted reloads it. */
+    bool         preempted;
+    uint64_t     preempt_bytes;   ///< its resident KV when preempted -- what the readmission must fit
+    double       preempt_t;       ///< when (the readmission order: first preempted, first back)
+    char        *preempt_path;
     /** Protocol live bindings for THIS slot's sampled KV frontier (guarded by
      * server.tool_mu — client threads read them at parse time). They bind
      * tool-call ids / visible transcripts to the session they were sampled on,
@@ -1754,6 +1762,8 @@ struct server {
     uint64_t m_spills;  ///< banks spilled to disk by the guard
     uint64_t m_restores;  ///< spilled banks brought back
     uint64_t m_restore_failures;  ///< spilled bank could not be restored
+    uint64_t m_preemptions;  ///< L314: running decoders preempted through their terminal checkpoint
+    uint64_t m_readmissions;  ///< L314: preempted decoders reloaded and stepping again
     /** Why the queue is stuck. Counted once per job (job::refusal_counted) so a
      * head that cannot bind for many quanta registers once, not once a tick. */
     uint64_t m_refusals[PROVISION_REFUSAL_COUNT];
@@ -2134,6 +2144,14 @@ struct server {
      * repoint AWAY (free_physical refuses the cur bank), then cudaFree its physical.
      */
     bool spill_bank(session_slot *victim);
+    /** L314: preempt the newest running decoder other than `keep` that may be (a text-only decode in the batched
+     *  spec or plain lane, the disk KV cache on, not a tensor-parallel engine): its bank's frontier payload to the disk
+     *  KV dir, its physical freed, its job parked (session_slot::preempted) -- only one whose freed KV makes `need`
+     *  bytes fit the budget.  @return true when one was. */
+    bool preempt_newest_decoder(const session_slot *keep, uint64_t need);
+    /** L314: reload the first-preempted decoder whose KV fits the budget again (one a call); a reload that fails
+     *  fails that request by name.  @return true when one was readmitted (or failed). */
+    bool worker_readmit_preempted();
     /** LRU-idle smallest-frontier victim: NOT bank 0 (pinned), NOT in the live decode
      * set, no active job, not already spilled. -1 if none.
      */
