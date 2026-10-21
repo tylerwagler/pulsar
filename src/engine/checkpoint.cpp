@@ -223,6 +223,9 @@ bool pulsar_ckpt_record_capture(pulsar_ckpt_store *st, uint32_t bank, pulsar_ckp
             st->end_width = width;
         }
         if (!r->logits) r->logits = (float *)xmalloc((size_t)width * sizeof(float));
+    } else {
+        free(r->logits);   /* a recycled prompt end's row is no endpoint's */
+        r->logits = NULL;
     }
     if (r->tokens_cap < T) {
         free(r->tokens);
@@ -289,6 +292,91 @@ bool pulsar_ckpt_record_restore(pulsar_ckpt_store *st, uint32_t bank, const puls
     ckpt_records_drop_above(st, bank, T);
     w->used = ++st->rec_clock;
     if (logits) memcpy(logits, w->logits, (size_t)width * sizeof(float));
+    return true;
+}
+
+/* L313: the most pools any bank has (bank_pools' out) */
+#define CKPT_ADOPT_POOLS (2u * PULSAR_KV_POOLS_MAX)
+
+bool pulsar_ckpt_adopt(pulsar_ckpt_store *st, uint32_t dst, uint32_t src, uint32_t T, const pulsar_ckpt_record *r) {
+    const char *why = NULL;
+    pulsar_gpu_tensor *slab = NULL;
+    uint64_t off = 0;
+    if (dst >= PULSAR_MSEQ_MAX || src >= PULSAR_MSEQ_MAX || dst == src || T == 0u || !st->ops->bank_pools)
+        why = "not two banks of the pool";
+    else if (r) {
+        if (r < st->rec || r >= st->rec + st->n_rec || r->bank != src || r->T != T) why = "the record is not the source's at T";
+        else slab = r->slab;
+    } else if (!pulsar_ckpt_locate(st, src, T, &slab, &off)) {
+        why = "the source holds no grid checkpoint at T";
+    }
+    static pulsar_kv_pool sp[CKPT_ADOPT_POOLS], dp[CKPT_ADOPT_POOLS];   /* worker thread only, as every store op */
+    uint32_t n = 0;
+    if (!why) {
+        n = st->ops->bank_pools(st->state, src, sp, CKPT_ADOPT_POOLS);
+        const uint32_t m = st->ops->bank_pools(st->state, dst, dp, CKPT_ADOPT_POOLS);
+        if (n == 0 || n != m || n > CKPT_ADOPT_POOLS) why = "the banks' pools do not pair";
+        for (uint32_t i = 0; !why && i < n; i++) {
+            const uint64_t rows = (T + sp[i].tokens_per_row - 1u) / sp[i].tokens_per_row;
+            if (!sp[i].rows || !dp[i].rows) why = "a bank's physical is freed";
+            else if (sp[i].tokens_per_row != dp[i].tokens_per_row || sp[i].row_bytes != dp[i].row_bytes ||
+                     rows * dp[i].row_bytes > pulsar_gpu_tensor_bytes(dp[i].rows) ||
+                     rows * sp[i].row_bytes > pulsar_gpu_tensor_bytes(sp[i].rows))
+                why = "a pool's rows do not fit";
+        }
+    }
+    if (why) {
+        fprintf(stderr, "pulsar: adopting bank %u's %s at %u into bank %u refused: %s\n", src,
+                r ? "record" : "checkpoint", T, dst, why);
+        return false;
+    }
+    /* dst's history is replaced wholesale: its checkpoints and records go; then the counters at T, the source's rows
+     * below T, the source's state at T -- the same three moves as a restore on the source itself */
+    pulsar_ckpt_drop_bank(st, dst);
+    bool ok = r ? st->ops->install_frontier(st->state, T, T) : st->ops->prepare_restore(st->state, T);
+    for (uint32_t i = 0; ok && i < n; i++) {
+        const uint64_t rows = (T + sp[i].tokens_per_row - 1u) / sp[i].tokens_per_row;
+        ok = pulsar_gpu_tensor_copy_async(dp[i].rows, 0, sp[i].rows, 0, rows * sp[i].row_bytes) != 0;
+    }
+    ok = ok && st->ops->walk(st->state, 1, r != NULL, slab, off, T, NULL);
+    if (!ok) {
+        fprintf(stderr, "pulsar: adopting bank %u's state at %u into bank %u: copy failed\n", src, T, dst);
+        return false;
+    }
+    st->ops->restored(st->state);
+    /* and dst keeps the checkpoint it now stands at, so its own next resume finds it */
+    if (!r) {
+        pulsar_gpu_tensor *ds = NULL;
+        uint64_t doff = 0;
+        uint32_t slot = 0;
+        if (pulsar_ckpt_claim(st, dst, T, &ds, &doff, &slot) &&
+            pulsar_gpu_tensor_copy_async(ds, doff, slab, off, st->slot_bytes) != 0)
+            pulsar_ckpt_commit(st, dst, slot, T);
+    } else {
+        pulsar_ckpt_record *w = ckpt_record_pick(st);
+        if (w != r && w->cap >= r->cap) {
+            w->T = 0u;
+            if (r->logits) {
+                if (!w->logits) w->logits = (float *)xmalloc((size_t)st->end_width * sizeof(float));
+                memcpy(w->logits, r->logits, (size_t)st->end_width * sizeof(float));
+            } else {
+                free(w->logits);
+                w->logits = NULL;
+            }
+            if (w->tokens_cap < T) {
+                free(w->tokens);
+                w->tokens = (int32_t *)xmalloc((size_t)T * sizeof(int32_t));
+                w->tokens_cap = T;
+            }
+            memcpy(w->tokens, r->tokens, (size_t)T * sizeof(int32_t));
+            if (pulsar_gpu_tensor_copy_async(w->slab, 0, r->slab, 0, r->cap) != 0) {
+                w->bank = dst;
+                w->kind = r->kind;
+                w->used = ++st->rec_clock;
+                w->T = T;
+            }
+        }
+    }
     return true;
 }
 
