@@ -1855,6 +1855,10 @@ bool server::spill_bank(session_slot *victim) {
  * sampling alike; beside other decoders the batched lanes are nondeterministic by design, L118).  Readmission is
  * first-preempted first, as soon as the bank's resident KV fits the budget again.  An image request keeps its bank
  * (as Flare's: its image features are not reconstructed). */
+static int guard_victim_order(server *s, session_slot **dec, int n, int *order);
+static prompt_kv_verdict server_prompt_kv_verdict(uint64_t touched, uint64_t delta, uint64_t bound,
+                                                  const uint64_t *drop, int n_victims, bool busy_may_free,
+                                                  int *n_spill);
 bool server::preempt_newest_decoder(const session_slot *keep) {
     auto *s = this;
     if (s->pool_banks <= 1 || !s->kv.enabled || !s->kv.dir || pulsar_engine_is_tp(s->engine)) return false;
@@ -1913,8 +1917,21 @@ bool server::worker_readmit_preempted() {
         if (s->slots[i].preempted && (!v || s->slots[i].preempt_t < v->preempt_t)) v = &s->slots[i];
     if (!v) return false;
     pulsar_session *pool = s->sess;
-    if (s->guard_enabled &&
-        pulsar_session_touched_kv_bytes(pool) + v->preempt_bytes > s->guard_touched_budget) return false;
+    if (s->guard_enabled) {
+        /* the admission arithmetic over the idle banks, as a prompt's (L280): fits, or fits once idle banks spill */
+        int order[PULSAR_SESSION_POOL_CAP], n_spill = 0;
+        uint64_t drop[PULSAR_SESSION_POOL_CAP];
+        const int n_victims = guard_victim_order(s, NULL, 0, order);
+        for (int k = 0; k < n_victims; k++) drop[k] = pulsar_session_bank_touched_kv_bytes(pool, s->slots[order[k]].bank);
+        const prompt_kv_verdict pv = server_prompt_kv_verdict(pulsar_session_touched_kv_bytes(pool), v->preempt_bytes,
+                                                              s->guard_touched_budget, drop, n_victims, false, &n_spill);
+        if (pv != PROMPT_KV_FITS && pv != PROMPT_KV_SPILL) return false;
+        for (int k = 0; k < n_spill; k++) {
+            if (!s->spill_bank(&s->slots[order[k]])) return false;
+            s->count_metric(&s->m_spills);
+        }
+        if (pulsar_session_touched_kv_bytes(pool) + v->preempt_bytes > s->guard_touched_budget) return false;
+    }
     const double t0 = server_now_sec();
     char err[256] = "";
     bool ok = pulsar_session_bank_alloc_physical(pool, v->bank) && pulsar_session_bank_state_restore(pool, v->bank);
