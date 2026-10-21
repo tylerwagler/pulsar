@@ -29,6 +29,7 @@ ap.add_argument("--banks", type=int, default=4)
 ap.add_argument("--n", type=int, default=12)
 ap.add_argument("--prompt", type=int, default=48000, help="pressure: approximate prompt tokens a request")
 ap.add_argument("--gen", type=int, default=128)
+ap.add_argument("--fit", type=float, default=3.0, help="pressure: the KV budget overridden to this many requests (0: the real one)")
 ap.add_argument("--tag", default="run")
 a = ap.parse_args()
 B = "http://127.0.0.1:%d" % a.port
@@ -110,19 +111,23 @@ def check(c, msg):
     print(("PASS " if c else "FAIL ") + msg, flush=True)
 
 
-if a.mode == "exact":
-    A_TEXT, B_TEXT = STORY[:24000], STORY[30000:66000]
-    probe = Server(a.tag + "-probe")
+def probe():
+    """(the guard's eager floor, one bank's KV bytes a token) of this --ctx / --banks server"""
+    p = Server(a.tag + "-probe")
     try:
-        m = re.search(r"touched budget ([0-9.]+) GiB \(kv budget ([0-9.]+) . eager ([0-9.]+) GiB\)", probe.text())
+        m = re.search(r"touched budget ([0-9.]+) GiB \(kv budget ([0-9.]+) \S+ eager ([0-9.]+)\)", p.text())
         bank_bytes = metrics().get("pulsar:kv_bank_bytes", 0.0)
     finally:
-        probe.stop()
+        p.stop()
     if not m or bank_bytes <= 0:
         print("FAIL the probe server reported no guard budget / bank bytes")
         sys.exit(1)
-    eager = float(m.group(3)) * 2**30
-    per_tok = bank_bytes / a.ctx
+    return float(m.group(3)) * 2**30, bank_bytes / a.ctx
+
+
+if a.mode == "exact":
+    A_TEXT, B_TEXT = STORY[:24000], STORY[30000:66000]
+    eager, per_tok = probe()
     GEN_A = 1500
     LA, LB = 6000 + GEN_A, 9000   # A's prompt + generation, B's prompt (approximate tokens)
     budget = int(eager + per_tok * (LA + 0.7 * LB))
@@ -159,7 +164,14 @@ if a.mode == "exact":
     if res["A"] != alone:
         print("  preempted %r\n  alone     %r" % (res["A"][1][:300], alone[1][:300]))
 else:
-    srv = Server(a.tag + "-pressure")
+    env = {}
+    if a.fit > 0:   # the guard's test hook: room for `fit` requests' KV at once
+        eager, per_tok = probe()
+        budget = int(eager + per_tok * (a.prompt + a.gen) * a.fit)
+        env = {"PULSAR_SERVER_KV_BUDGET_OVERRIDE": str(budget)}
+        print("# eager %.2f GiB, %.0f B a token: budget override %.2f GiB (%.1f requests)" %
+              (eager / 2**30, per_tok, budget / 2**30, a.fit))
+    srv = Server(a.tag + "-pressure", env)
     codes = []
     t0 = time.time()
     try:

@@ -28,6 +28,7 @@ ap.add_argument("--ctx", type=int, default=65536)
 ap.add_argument("--turns", type=int, default=8)
 ap.add_argument("--pause", type=float, default=2.0)
 ap.add_argument("--side", action="store_true")
+ap.add_argument("--reply", type=int, default=0, help="a turn writes up to this many tokens before its call (0: a bare forced call)")
 ap.add_argument("--tag", default="run")
 ap.add_argument("--start-timeout", type=float, default=900.0)
 a = ap.parse_args()
@@ -121,7 +122,8 @@ def post(body):
 TOOLS = [{"name": "read_file", "description": "Read a numbered part of the project's notes file.",
           "input_schema": {"type": "object", "properties": {"part": {"type": "integer"}}, "required": ["part"]}}]
 SYSTEM = ("You are a careful assistant working through a long notes file one part at a time with the read_file tool. "
-          "Read the parts in order, starting at part 1.  " + STORY[:6000])
+          "Read the parts in order, starting at part 1.  Before each read_file call, write a detailed summary of "
+          "the part you just read.  " + STORY[:6000])
 
 
 def body(msgs, forced, max_tokens):
@@ -146,7 +148,8 @@ def measure(srv, kind, turn, b):
 
 
 def reply_text(d):
-    return json.dumps(d.get("content", []), sort_keys=True)
+    """The reply's content without the server's random tool_use ids (each server names its calls afresh)."""
+    return json.dumps([{k: v for k, v in c.items() if k != "id"} for c in d.get("content", [])], sort_keys=True)
 
 
 def loop(srv):
@@ -154,21 +157,24 @@ def loop(srv):
     last_main = last_side = None
     th = None
     for t in range(1, a.turns + 1):
-        b = body(msgs, True, 96)
+        # --reply N: the turn writes a reply of up to N tokens (the decode rows a next turn re-prefilled, L275's
+        # ~969), then calls the tool; else a bare forced call
+        b = body(msgs, a.reply == 0, a.reply if a.reply else 96)
         d = measure(srv, "main", t, b)
         if th:
             th.join()   # the side request rode beside this main turn
             th = None
         last_main = (b, d)
         calls = [c for c in d.get("content", []) if c.get("type") == "tool_use"]
-        if not calls:
-            print("FAIL turn %d made no tool call: %s" % (t, reply_text(d)[:300]))
-            return None, None
-        msgs = msgs + [{"role": "assistant", "content": d["content"]}]
+        msgs = msgs + [{"role": "assistant", "content": d["content"] or [{"type": "text", "text": "."}]}]
         time.sleep(a.pause)   # the tool runs
         part = STORY[6000 + t * 4800: 6000 + (t + 1) * 4800]
-        msgs = msgs + [{"role": "user", "content": [{"type": "tool_result", "tool_use_id": calls[0]["id"],
-                                                     "content": part}]}]
+        if calls:
+            msgs = msgs + [{"role": "user", "content": [{"type": "tool_result", "tool_use_id": calls[0]["id"],
+                                                         "content": part}]}]
+        else:
+            msgs = msgs + [{"role": "user", "content": "Part %d of the notes:\n%s\n\nSummarise it in detail, then "
+                                                       "read the next part." % (t + 1, part)}]
         if a.side and t < a.turns:
             sb = body(msgs + [{"role": "user", "content": "Describe your most recent action in 3-5 words using "
                                                           "present tense (-ing)."}], False, 24)

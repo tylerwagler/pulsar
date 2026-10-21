@@ -759,17 +759,23 @@ void server::gen_begin(session_slot *sl) {
          * outlives the restore. */
         s->kv_cache_persist(sl, "evict", true);
     }
-    if (cached == 0 && s->pool_banks > 1 && !image_request) {
+    if (prompt_for_sync == &j->req.prompt && s->pool_banks > 1 && !image_request) {
         /* L313: another bank's published checkpoint -- a busy main conversation's prompt end or message endpoint,
-         * an idle bank's grid checkpoint -- copied in beats the disk and a prefill: the deepest one any other
-         * resident bank holds for this prompt, past what this bank's own state serves */
-        int src = -1, best = memory_resume;
+         * the bank a side request just prefilled the same tool result on -- copied in beats the disk and a prefill:
+         * the deepest one any other resident bank holds for this prompt, when it is deeper than what this bank's own
+         * state serves by more than the copy costs (PULSAR_SERVER_ADOPT_MIN_GAIN tokens; the copy is the shared
+         * prefix's rows + one state, milliseconds) */
+        const int own = cached > memory_resume ? cached : memory_resume;
+        int src = -1, best = own + PULSAR_SERVER_ADOPT_MIN_GAIN;
         for (int i = 0; i < s->n_slots; i++) {
             const session_slot *o = &s->slots[i];
-            if (o == sl || !o->provisioned || o->spilled) continue;
+            if (o == sl || !o->provisioned || o->spilled || o->preempted) continue;
             const int T = pulsar_session_bank_adopt_score(s->sess, o->bank, &j->req.prompt);
             if (T > best) { best = T; src = (int)o->bank; }
         }
+        /* the adopt replaces this bank's history: a conversation it holds is persisted first (the miss above did) */
+        if (src >= 0 && cached > 0 && s->kv.enabled && old_pos >= s->kv.opt.min_tokens)
+            s->kv_cache_persist(sl, "evict", true);
         if (src >= 0) {
             char aerr[192] = "";
             const double t_a = server_now_sec();
@@ -1853,8 +1859,17 @@ bool server::terminal_checkpoint_step() {
     pulsar_session_set_display_progress(s->sess, NULL, NULL);
     const double t0 = server_now_sec();
     char err[192] = "";
-    const int rc = pulsar_session_sync(s->sess, &target, err, sizeof(err));
-    const int origin = pulsar_session_resume_origin(s->sess);
+    /* the view IS the target when no stop trails it, and a sync of the same prompt is a no-op: the history short of
+     * its last token first (that sync resumes below the decode rows), then the token */
+    int rc = 0, origin = -1;
+    if (C == old_len) {
+        target.len = C - 1;
+        rc = pulsar_session_sync(s->sess, &target, err, sizeof(err));
+        origin = pulsar_session_resume_origin(s->sess);
+        target.len = C;
+    }
+    if (rc == 0) rc = pulsar_session_sync(s->sess, &target, err, sizeof(err));
+    if (origin < 0) origin = pulsar_session_resume_origin(s->sess);
     pick->committed_pos = pulsar_session_pos(s->sess);
     if (rc == 0) {
         /* the bank's frontier moved from the decoded end to C: a live tool binding at the old end describes C now
