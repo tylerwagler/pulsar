@@ -1065,7 +1065,13 @@ __global__ void __launch_bounds__(SR_THREADS) sr_sum_kernel(const __grid_constan
                 while ((f = vst[j].flag) == 0u) __nanosleep(64);
                 __threadfence();
                 if (f == 2u) { base = (T)vst[j].end; exact = true; break; }
-                if (vst[j].k != gg.k || vst[j].tie) break;
+                if (vst[j].k != gg.k || vst[j].tie) {   /* its aggregate is not this grid's: its exact end */
+                    while (vst[j].flag != 2u) __nanosleep(64);
+                    __threadfence();
+                    base = (T)vst[j].end;
+                    exact = true;
+                    break;
+                }
                 acc = sat_add(acc, vst[j].Q);
                 j--;
             }
