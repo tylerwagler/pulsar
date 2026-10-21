@@ -1436,6 +1436,10 @@ typedef struct session_slot {
      * slot next decodes. Distinct from SLOT_EVICTED (which frees the bank for a
      * DIFFERENT conversation). */
     bool         spilled;
+    /** L311: the slot's last turn finished with decode rows past its prefill: when the worker is idle, its bank's
+     *  history is prefilled again to its consumed end (server::terminal_checkpoint_step), so the next turn resumes
+     *  there instead of re-prefilling the reply first.  Cleared by the next job's bind. */
+    bool         terminal_pending;
     /** Protocol live bindings for THIS slot's sampled KV frontier (guarded by
      * server.tool_mu — client threads read them at parse time). They bind
      * tool-call ids / visible transcripts to the session they were sampled on,
@@ -2007,6 +2011,13 @@ struct server {
      * back to GEN_DECODE_INIT (the old goto decode_again).
      */
     void gen_step_finish(session_slot *sl);
+    /** L311: the TERMINAL checkpoint, run when the worker has nothing else to do: the most recently served idle slot
+     *  with terminal_pending has its bank's history -- to its consumed end, a trailing stop row excluded (the next
+     *  render re-spells it) -- synced again, so the reply's decode rows become prefill rows and its grid checkpoints,
+     *  prompt end and message endpoint land where the next turn resumes (reuse == cold: the sync IS that turn's
+     *  resume, run early), and the chain is persisted ("terminal").  @return true when it ran one (or dropped one
+     *  that no longer applies), false when none is pending. */
+    bool terminal_checkpoint_step();
     /** Tear down the slot's generation state.
      *
      * Uninstalls every engine callback FIRST: a cancel/progress callback still
@@ -3182,6 +3193,9 @@ bool server_slot_match_is_trivial(int common, int slot_pos,
  * when a completed exchange precedes it; -1 otherwise (defined in
  * server_sched.cpp; unit-tested in server_tests.cpp). */
 int server_route_turn_anchor(const pulsar_tokens *bank, int prefilled, const pulsar_turn_markers *m);
+/** L311: the last token of the last assistant marker (the generation header) among the bank's prefilled tokens,
+ *  first turn included; a request that matches past it is the conversation's next turn.  -1 when none / unknown. */
+int server_route_header_anchor(const pulsar_tokens *bank, int prefilled, const pulsar_turn_markers *m);
 /* L264 S3 + L275: does the best-scoring free bank take the request in place, or
  * is a fresh bank preferred.  `anchor` is server_route_turn_anchor's answer for
  * that bank (defined in server_sched.cpp; unit-tested in server_tests.cpp). */

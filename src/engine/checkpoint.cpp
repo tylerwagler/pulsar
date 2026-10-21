@@ -6,16 +6,20 @@
  * Validity is the frontier: a checkpoint at G is good while its bank's history reaches G (the
  * pools' rows below G are append-only, so a slot references them instead of copying).  The model
  * calls pulsar_ckpt_frontier_lowered wherever its frontier falls, and an operation that replaces a
- * bank's history wholesale drops all of its checkpoints. */
+ * bank's history wholesale drops all of its checkpoints.
+ *
+ * L289 / L311: the RECORDS -- a pool of exact-position states (the frontier walk at any T) every bank draws from: a
+ * bank's prompt end and its last message endpoint.  The same validity rule; a record is replaced by the bank's next
+ * one of its kind, else evicted least recently used when the pool is full. */
 #include "pulsar_engine_internal.h"
 
 #include <stdio.h>
 #include <string.h>
 
-/* L289: the prompt-end record's bytes: the model's frontier walk, aligned as a slot is.  Nothing else: every pool's
- * rows below T are never rewritten while the history reaches T, and a row T leaves open (a part-filled indexer
- * block, the MTP layer's lagging row) is written whole by the token that closes it, from the lanes the walk holds,
- * before any step reads it (qsa_block_keys_kernel). */
+/* L289: a record's bytes: the model's frontier walk, aligned as a slot is.  Nothing else: every pool's rows below T
+ * are never rewritten while the history reaches T, and a row T leaves open (a part-filled indexer block, the MTP
+ * layer's lagging row) is written whole by the token that closes it, from the lanes the walk holds, before any step
+ * reads it (qsa_block_keys_kernel). */
 static uint64_t ckpt_end_bytes(const pulsar_ckpt_store *st) {
     uint64_t front = 0;
     (void)st->ops->walk(st->state, -1, true, NULL, 0, st->ops->min_checkpoint(st->state), &front);
@@ -41,17 +45,20 @@ bool pulsar_ckpt_alloc(pulsar_ckpt_store *st, const pulsar_kv_state_ops *ops, vo
             return false;
         }
     }
-    /* L289: each bank's prompt-end record, allocated with the ladder so a session's dry run prices it */
-    memset(st->end_pos, 0, sizeof(st->end_pos));
+    /* L289 / L311: the record pool, allocated with the ladder so a session's dry run prices it */
     const uint64_t end = ckpt_end_bytes(st);
-    for (uint32_t b = 0; b < n_banks; b++) {
-        st->end_slab[b] = pulsar_gpu_tensor_alloc(end);
-        if (!st->end_slab[b]) {
-            fprintf(stderr, "pulsar: prompt-end record for bank %u (%llu bytes, %s) allocation failed\n", b,
+    st->n_rec = pulsar_ckpt_records_for(n_banks);
+    st->rec_clock = 0;
+    for (uint32_t i = 0; i < st->n_rec; i++) {
+        pulsar_ckpt_record *r = &st->rec[i];
+        r->T = 0u;
+        r->slab = pulsar_gpu_tensor_alloc(end);
+        if (!r->slab) {
+            fprintf(stderr, "pulsar: record %u of %u (%llu bytes, %s) allocation failed\n", i, st->n_rec,
                     (unsigned long long)end, ops->name);
             return false;
         }
-        st->end_cap[b] = end;
+        r->cap = end;
     }
     return true;
 }
@@ -60,17 +67,16 @@ void pulsar_ckpt_release(pulsar_ckpt_store *st) {
     for (uint32_t b = 0; b < PULSAR_MSEQ_MAX; b++) {
         pulsar_gpu_tensor_free(st->slab[b]);
         st->slab[b] = NULL;
-        pulsar_gpu_tensor_free(st->end_slab[b]);
-        st->end_slab[b] = NULL;
-        st->end_cap[b] = 0;
-        free(st->end_logits[b]);
-        st->end_logits[b] = NULL;
-        free(st->end_tokens[b]);
-        st->end_tokens[b] = NULL;
-        st->end_tokens_cap[b] = 0;
     }
+    for (uint32_t i = 0; i < PULSAR_CKPT_RECORDS_MAX; i++) {
+        pulsar_ckpt_record *r = &st->rec[i];
+        pulsar_gpu_tensor_free(r->slab);
+        free(r->logits);
+        free(r->tokens);
+        memset(r, 0, sizeof(*r));
+    }
+    st->n_rec = 0;
     memset(st->pos, 0, sizeof(st->pos));
-    memset(st->end_pos, 0, sizeof(st->end_pos));
 }
 
 /* The slot a capture at G writes: the one already holding G, else an empty one, else the victim
@@ -145,6 +151,12 @@ bool pulsar_ckpt_landed(pulsar_ckpt_store *st, uint32_t bank, uint32_t T) {
     return ckpt_capture(st, bank, T);
 }
 
+/* The bank's records above `tokens` go (the frontier rule), and with `tokens` 0 every one of the bank's. */
+static void ckpt_records_drop_above(pulsar_ckpt_store *st, uint32_t bank, uint32_t tokens) {
+    for (uint32_t i = 0; i < st->n_rec; i++)
+        if (st->rec[i].T != 0u && st->rec[i].bank == bank && st->rec[i].T > tokens) st->rec[i].T = 0u;
+}
+
 bool pulsar_ckpt_restore(pulsar_ckpt_store *st, uint32_t bank, uint32_t G) {
     if (bank >= PULSAR_MSEQ_MAX || G == 0u) return false;
     uint32_t s = PULSAR_CKPT_SLOTS_MAX;
@@ -158,77 +170,125 @@ bool pulsar_ckpt_restore(pulsar_ckpt_store *st, uint32_t bank, uint32_t G) {
     st->ops->restored(st->state);
     for (uint32_t k = 0; k < st->ops->ckpt_slots; k++)
         if (st->pos[bank][k] > G) st->pos[bank][k] = 0u;
-    if (st->end_pos[bank] > G) st->end_pos[bank] = 0u;
+    ckpt_records_drop_above(st, bank, G);
     return true;
 }
 
-bool pulsar_ckpt_end_capture(pulsar_ckpt_store *st, uint32_t bank, uint32_t T, const int *tokens, const float *logits,
-                             uint32_t width) {
-    if (bank >= PULSAR_MSEQ_MAX || !st->end_slab[bank] || T == 0u || !tokens || !logits || width == 0u) return false;
-    st->end_pos[bank] = 0u;   /* not a record until the copy is issued whole */
+/* The record a capture writes (the bank's previous one of its kind already dropped): a free one, else the least
+ * recently used. */
+static pulsar_ckpt_record *ckpt_record_pick(pulsar_ckpt_store *st) {
+    pulsar_ckpt_record *lru = NULL;
+    for (uint32_t i = 0; i < st->n_rec; i++) {
+        pulsar_ckpt_record *r = &st->rec[i];
+        if (r->T == 0u) return r;
+        if (!lru || r->used < lru->used) lru = r;
+    }
+    return lru;
+}
+
+bool pulsar_ckpt_record_capture(pulsar_ckpt_store *st, uint32_t bank, pulsar_ckpt_record_kind kind, uint32_t T,
+                                const int *tokens, const float *logits, uint32_t width) {
+    if (bank >= PULSAR_MSEQ_MAX || T == 0u || !tokens || st->n_rec == 0u ||
+        (kind == PULSAR_CKPT_REC_END) != (logits != NULL && width != 0u))
+        return false;
+    /* the bank's previous record of this kind describes an older position: gone whatever happens below */
+    for (uint32_t i = 0; i < st->n_rec; i++)
+        if (st->rec[i].T != 0u && st->rec[i].bank == bank && st->rec[i].kind == kind) st->rec[i].T = 0u;
     char why[192];
     if (!st->ops->frontier_at(st->state, T, why, sizeof(why))) {
-        fprintf(stderr, "pulsar: prompt end at %u on bank %u not recorded: %s\n", T, bank, why);
+        fprintf(stderr, "pulsar: %s at %u on bank %u not recorded: %s\n",
+                kind == PULSAR_CKPT_REC_END ? "prompt end" : "message endpoint", T, bank, why);
         return false;
     }
+    pulsar_ckpt_record *r = ckpt_record_pick(st);
+    r->T = 0u;   /* not a record until the copy is issued whole (an evicted LRU record is gone from here) */
     const uint64_t need = ckpt_end_bytes(st);
-    if (st->end_cap[bank] < need) {   /* a drafter loaded after the store adds its rings to the frontier */
-        pulsar_gpu_tensor_free(st->end_slab[bank]);
-        st->end_slab[bank] = pulsar_gpu_tensor_alloc(need);
-        st->end_cap[bank] = st->end_slab[bank] ? need : 0u;
-        if (!st->end_slab[bank]) {
-            fprintf(stderr, "pulsar: prompt-end record for bank %u (%llu bytes) allocation failed\n", bank,
+    if (r->cap < need) {   /* a drafter loaded after the store adds its rings to the frontier */
+        pulsar_gpu_tensor_free(r->slab);
+        r->slab = pulsar_gpu_tensor_alloc(need);
+        r->cap = r->slab ? need : 0u;
+        if (!r->slab) {
+            fprintf(stderr, "pulsar: record for bank %u (%llu bytes) allocation failed\n", bank,
                     (unsigned long long)need);
             return false;
         }
     }
-    if (st->end_width != width) {   /* one logits width a store (the engine's) */
-        for (uint32_t b = 0; b < PULSAR_MSEQ_MAX; b++) {
-            free(st->end_logits[b]);
-            st->end_logits[b] = NULL;
-            st->end_pos[b] = 0u;
+    if (logits) {
+        if (st->end_width != width) {   /* one logits width a store (the engine's) */
+            for (uint32_t i = 0; i < st->n_rec; i++) {
+                free(st->rec[i].logits);
+                st->rec[i].logits = NULL;
+                if (st->rec[i].kind == PULSAR_CKPT_REC_END) st->rec[i].T = 0u;
+            }
+            st->end_width = width;
         }
-        st->end_width = width;
+        if (!r->logits) r->logits = (float *)xmalloc((size_t)width * sizeof(float));
     }
-    if (!st->end_logits[bank]) st->end_logits[bank] = (float *)xmalloc((size_t)width * sizeof(float));
-    if (st->end_tokens_cap[bank] < T) {
-        free(st->end_tokens[bank]);
-        st->end_tokens[bank] = (int32_t *)xmalloc((size_t)T * sizeof(int32_t));
-        st->end_tokens_cap[bank] = T;
+    if (r->tokens_cap < T) {
+        free(r->tokens);
+        r->tokens = (int32_t *)xmalloc((size_t)T * sizeof(int32_t));
+        r->tokens_cap = T;
     }
-    if (!st->ops->walk(st->state, 0, true, st->end_slab[bank], 0, T, NULL)) {
-        fprintf(stderr, "pulsar: prompt end at %u on bank %u: copy failed\n", T, bank);
+    if (!st->ops->walk(st->state, 0, true, r->slab, 0, T, NULL)) {
+        fprintf(stderr, "pulsar: record at %u on bank %u: copy failed\n", T, bank);
         return false;
     }
-    memcpy(st->end_logits[bank], logits, (size_t)width * sizeof(float));
-    for (uint32_t i = 0; i < T; i++) st->end_tokens[bank][i] = (int32_t)tokens[i];
-    st->end_pos[bank] = T;
+    if (logits) memcpy(r->logits, logits, (size_t)width * sizeof(float));
+    for (uint32_t i = 0; i < T; i++) r->tokens[i] = (int32_t)tokens[i];
+    r->bank = bank;
+    r->kind = kind;
+    r->used = ++st->rec_clock;
+    r->T = T;
     return true;
 }
 
-bool pulsar_ckpt_end_matches(const pulsar_ckpt_store *st, uint32_t bank, const int *tokens, uint32_t len) {
-    const uint32_t T = pulsar_ckpt_end(st, bank);
-    if (T == 0u || !tokens || len < T) return false;
-    for (uint32_t i = 0; i < T; i++)
-        if ((int32_t)tokens[i] != st->end_tokens[bank][i]) return false;
+const pulsar_ckpt_record *pulsar_ckpt_record_of(const pulsar_ckpt_store *st, uint32_t bank,
+                                                pulsar_ckpt_record_kind kind) {
+    for (uint32_t i = 0; st && i < st->n_rec; i++)
+        if (st->rec[i].T != 0u && st->rec[i].bank == bank && st->rec[i].kind == kind) return &st->rec[i];
+    return NULL;
+}
+
+/* Are the record's ids tokens[0, T)? */
+static bool ckpt_record_matches(const pulsar_ckpt_record *r, const int *tokens, uint32_t len) {
+    if (r->T == 0u || !tokens || len < r->T) return false;
+    for (uint32_t i = 0; i < r->T; i++)
+        if ((int32_t)tokens[i] != r->tokens[i]) return false;
     return true;
 }
 
-bool pulsar_ckpt_end_restore(pulsar_ckpt_store *st, uint32_t bank, float *logits, uint32_t width) {
-    const uint32_t T = pulsar_ckpt_end(st, bank);
-    if (T == 0u || (logits && width != st->end_width)) return false;
+const pulsar_ckpt_record *pulsar_ckpt_record_best(const pulsar_ckpt_store *st, uint32_t bank, const int *tokens,
+                                                  uint32_t len, uint32_t limit, uint32_t prompt_len) {
+    const pulsar_ckpt_record *best = NULL;
+    for (uint32_t i = 0; st && i < st->n_rec; i++) {
+        const pulsar_ckpt_record *r = &st->rec[i];
+        if (r->T == 0u || r->bank != bank || r->T > limit || (best && r->T <= best->T)) continue;
+        if (r->T == prompt_len && !r->logits) continue;   /* a resume AT T reads the row the prefill left there */
+        if (ckpt_record_matches(r, tokens, len)) best = r;
+    }
+    return best;
+}
+
+bool pulsar_ckpt_record_restore(pulsar_ckpt_store *st, uint32_t bank, const pulsar_ckpt_record *r, float *logits,
+                                uint32_t width) {
+    if (!r || r < st->rec || r >= st->rec + st->n_rec || r->T == 0u || r->bank != bank ||
+        (logits && (!r->logits || width != st->end_width)))
+        return false;
+    const uint32_t T = r->T;
+    pulsar_ckpt_record *w = &st->rec[r - st->rec];
     /* the counters at T, prefilled to T (Qwen: the MTP layer's pending row at T - 1, its stage clean); the walk
      * brings every lane back */
-    if (!st->ops->install_frontier(st->state, T, T) ||
-        !st->ops->walk(st->state, 1, true, st->end_slab[bank], 0, T, NULL)) {
-        fprintf(stderr, "pulsar: prompt-end restore to %u on bank %u: copy failed\n", T, bank);
-        st->end_pos[bank] = 0u;
+    if (!st->ops->install_frontier(st->state, T, T) || !st->ops->walk(st->state, 1, true, w->slab, 0, T, NULL)) {
+        fprintf(stderr, "pulsar: record restore to %u on bank %u: copy failed\n", T, bank);
+        w->T = 0u;
         return false;
     }
     st->ops->restored(st->state);
     for (uint32_t k = 0; k < st->ops->ckpt_slots; k++)
         if (st->pos[bank][k] > T) st->pos[bank][k] = 0u;
-    if (logits) memcpy(logits, st->end_logits[bank], (size_t)width * sizeof(float));
+    ckpt_records_drop_above(st, bank, T);
+    w->used = ++st->rec_clock;
+    if (logits) memcpy(logits, w->logits, (size_t)width * sizeof(float));
     return true;
 }
 
@@ -246,13 +306,13 @@ void pulsar_ckpt_frontier_lowered(pulsar_ckpt_store *st, uint32_t bank, uint32_t
     if (bank >= PULSAR_MSEQ_MAX) return;
     for (uint32_t k = 0; k < PULSAR_CKPT_SLOTS_MAX; k++)
         if (st->pos[bank][k] > tokens) st->pos[bank][k] = 0u;
-    if (st->end_pos[bank] > tokens) st->end_pos[bank] = 0u;
+    ckpt_records_drop_above(st, bank, tokens);
 }
 
 void pulsar_ckpt_drop_bank(pulsar_ckpt_store *st, uint32_t bank) {
     if (bank >= PULSAR_MSEQ_MAX) return;
     memset(st->pos[bank], 0, sizeof(st->pos[bank]));
-    st->end_pos[bank] = 0u;
+    ckpt_records_drop_above(st, bank, 0u);
 }
 
 bool pulsar_ckpt_locate(pulsar_ckpt_store *st, uint32_t bank, uint32_t G, pulsar_gpu_tensor **slab, uint64_t *off) {

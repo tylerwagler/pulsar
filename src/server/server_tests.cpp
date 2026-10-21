@@ -7324,6 +7324,40 @@ static void test_l275_route_turn_anchor(void) {
 
 /* L275: the in-place verdict through the last turn -- the pair's measured
  * shapes of 2026-10-06. */
+/* L311: the generation-header anchor -- the opencode / Nemotron report (2026-10-21): the bank prefilled turn 1's
+ * prompt (system, user, header "<|im_start|>assistant\n<think>\n") and decoded "REASONING</think>answer"; turn 2
+ * re-renders that turn "<think></think>answer" (truncate_history_thinking), so it matches the bank through the header
+ * and "<think>" only.  A first-turn bank: no last-turn anchor, and before this every such turn took a fresh bank. */
+static void test_l311_route_header_anchor(void) {
+    const int start = 151644, u = 872, a = 77091, nl = 198, think = 151667, think_end = 151668;
+    const pulsar_turn_markers q = {{start, u}, 2, {start, a}, 2};
+    pulsar_tokens b = {0};
+    pulsar_tokens_push(&b, start);  pulsar_tokens_push(&b, 8948);   /* 0 <|im_start|>system */
+    for (int i = 0; i < 300; i++) pulsar_tokens_push(&b, 1000 + i); /* 2 .. 301 the system prompt + tools */
+    pulsar_tokens_push(&b, start);  pulsar_tokens_push(&b, u);      /* 302 <|im_start|>user */
+    for (int i = 0; i < 40; i++) pulsar_tokens_push(&b, 2000 + i);  /* 304 .. 343 the task */
+    pulsar_tokens_push(&b, start);  pulsar_tokens_push(&b, a);      /* 344 <|im_start|>assistant: the header */
+    pulsar_tokens_push(&b, nl);     pulsar_tokens_push(&b, think);  pulsar_tokens_push(&b, nl);   /* 346 .. 348 */
+    const int prefilled = b.len;                                    /* 349: the prompt the bank prefilled */
+    for (int i = 0; i < 200; i++) pulsar_tokens_push(&b, 3000 + i); /* the reasoning, decoded */
+    pulsar_tokens_push(&b, think_end);
+    TEST_ASSERT(server_route_header_anchor(&b, prefilled, &q) == 345);
+    TEST_ASSERT(server_route_turn_anchor(&b, prefilled, &q) == -1);   /* a first-turn bank has no last-turn anchor */
+    /* turn 2 matches through "<think>" (348): in place, where the last-turn anchor alone took a fresh bank */
+    TEST_ASSERT(server_route_in_place(348, 256, b.len, prefilled, 157, 345));
+    TEST_ASSERT(!server_route_in_place(348, 256, b.len, prefilled, 157, -1));
+    /* a request matching only the header's first token (a side request's "<|im_start|>user" there) is not this
+     * conversation's next turn by the header rule (the last-turn anchor decides it) */
+    TEST_ASSERT(!server_route_in_place(345, 256, b.len, prefilled, 157, 345));
+    /* the clobber: another conversation behind the same system prompt diverges inside the first user message */
+    TEST_ASSERT(!server_route_in_place(320, 256, b.len, prefilled, 157, 345));
+    /* the header's second token past what the bank prefilled: the marker before it */
+    TEST_ASSERT(server_route_header_anchor(&b, 345, &q) == -1);
+    const pulsar_turn_markers none = {{0, 0}, 0, {0, 0}, 0};
+    TEST_ASSERT(server_route_header_anchor(&b, prefilled, &none) == -1 && server_route_header_anchor(NULL, 9, &q) == -1);
+    pulsar_tokens_free(&b);
+}
+
 static void test_l275_route_in_place_through_last_turn(void) {
     const int floor_ = 157;
     /* the session recap on the idle main bank: the bank prefilled 41670 (its
@@ -9709,6 +9743,7 @@ static void pulsar_server_unit_tests_run(void) {
     test_l275_route_turn_anchor();
     test_l273_image_cold_cut();
     test_l275_route_in_place_through_last_turn();
+    test_l311_route_header_anchor();
     test_slot_writer_defers_and_preserves_order();
     test_slot_writer_stall_times_out();
     test_unterminated_think_stays_off_content();

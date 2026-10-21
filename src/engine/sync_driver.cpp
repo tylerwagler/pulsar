@@ -179,18 +179,20 @@ int pulsar_session_sync_default(pulsar_session *s, const pulsar_tokens *prompt, 
                             "prefilling from 0\n", ops->name, live, G);
             G = 0;
         }
-        s->checkpoint_valid = false;   /* the state moves below; the prefill loop re-establishes the view */
         pulsar_ckpt_store *st = pulsar_session_kv_store(s);
-        if (G && G == (uint32_t)prompt->len) {
-            /* L289: the resume rule picks the whole prompt only at the bank's prompt end: the record's state is the
-             * prefill's own at G, copied whole (its tokens are the prompt's: the rule matched them), with the
+        /* L289 / L311: a resume at a record (the bank's prompt end or message endpoint) rather than a grid point */
+        const pulsar_ckpt_record *rec = G ? pulsar_session_resume_record(s, live, G, prompt->len) : NULL;
+        s->checkpoint_valid = false;   /* the state moves below; the prefill loop re-establishes the view */
+        if (rec && G == (uint32_t)prompt->len) {
+            /* L289: the resume rule picks the whole prompt only at a record that keeps its logits: the record's state
+             * is the prefill's own at G, copied whole (its tokens are the prompt's: the rule matched them), with the
              * logits that prefill headed -- nothing is evaluated */
-            if (!pulsar_ckpt_end_restore(st, live, s->logits, (uint32_t)pulsar_engine_logits_width(e)) ||
+            if (!pulsar_ckpt_record_restore(st, live, rec, s->logits, (uint32_t)pulsar_engine_logits_width(e)) ||
                 !s->live_from_host(s->logits)) {
                 if (err) snprintf(err, errlen, "%s: restoring bank %u's prompt end at %u failed", ops->name, live, G);
                 return 1;
             }
-            s->live_images.n = 0;   /* a prompt end is recorded for a text history only */
+            s->live_images.n = 0;   /* a record is kept for a text history only */
             s->checkpoint.len = (int)G;
             s->checkpoint_valid = true;
             s->prefill_frontier = (int)G;
@@ -200,7 +202,20 @@ int pulsar_session_sync_default(pulsar_session *s, const pulsar_tokens *prompt, 
                     ops->name, live, G);
             return 0;
         }
-        if (G) {
+        if (rec) {
+            /* L311: a record below the prompt's end (a split-invariant family's: from T the prefill is the cold
+             * prefill's bytes): the state at G, the view the record's tokens -- the prompt's to G -- and the rest
+             * prefilled from there */
+            if (!pulsar_ckpt_record_restore(st, live, rec, NULL, 0u)) {
+                if (err) snprintf(err, errlen, "%s: restoring bank %u's record at %u failed", ops->name, live, G);
+                return 1;
+            }
+            s->logits_stale = true;   /* a restore moves the state, not the logits */
+            start = G;
+            s->live_images.n = 0;
+            fprintf(stderr, "pulsar: %s: bank %u resumes from its %s at %u (prompt %d, shared %d)\n", ops->name, live,
+                    rec->kind == PULSAR_CKPT_REC_END ? "prompt end" : "message endpoint", G, prompt->len, common);
+        } else if (G) {
             if (!pulsar_ckpt_restore(pulsar_session_kv_store(s), live, G)) {
                 if (err) snprintf(err, errlen, "%s: restoring bank %u's checkpoint at %u failed", ops->name, live, G);
                 return 1;

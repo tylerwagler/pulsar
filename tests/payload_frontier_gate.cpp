@@ -17,7 +17,8 @@
  *                differ.  A failure names the first differing token and round.
  *   4. IDEMPOTENT a session loaded from the payload saves it again byte for byte (snapshot == file).
  *   5. RESUME    a sync that does not extend the frontier resumes from the carried grid checkpoint, from the
- *                same origin as the live session, and its logits equal a cold prefill's.
+ *                same origin as the live session (L311: or below it, on a split-invariant family, whose live
+ *                session resumes from a record the payload does not carry), and both logits equal a cold prefill's.
  *   6. DIGEST    one flipped data byte is refused as a digest mismatch.
  *
  * usage: ./tests/payload_frontier_gate MODEL [P] */
@@ -125,7 +126,7 @@ int GATE_ENTRY(int argc, char **argv) {
     free(text);
     if (base.len < T0 + N_CHECK + 4) { say(false, "prompt has %d tokens, need %d", base.len, T0 + N_CHECK + 4); goto done; }
     lg = (float *)malloc((size_t)W * (2 * N_CHECK + 4) * sizeof(float));
-    float *ref0 = lg, *refA = lg + W, *got = refA + (size_t)W * N_CHECK, *cold = got + W;
+    float *ref0 = lg, *refA = lg + W, *got = refA + (size_t)W * N_CHECK, *cold = got + W, *live = cold + W;
     for (int i = 0; i < 3; i++)
         if (pulsar_session_create(&g_s[i], e, ctx) != 0) { say(false, "session %d create", i); goto done; }
     pulsar_session *A = g_s[0], *B = g_s[1], *X = g_s[2];
@@ -207,13 +208,17 @@ int GATE_ENTRY(int argc, char **argv) {
     q.v[P + 2] = base.v[7] != base.v[P + 2] ? base.v[7] : base.v[8];
     const int sa = pulsar_session_sync(A, &q, err, sizeof err);
     const int oa = pulsar_session_resume_origin(A);
+    pulsar_session_copy_logits(A, live, W);
     const int sb = sa == 0 ? pulsar_session_sync(B, &q, err, sizeof err) : 1;
     const int ob = pulsar_session_resume_origin(B);
     pulsar_session_copy_logits(B, got, W);
     const int sx = sb == 0 ? pulsar_session_sync(X, &q, err, sizeof err) : 1;
     pulsar_session_copy_logits(X, cold, W);
-    say(sx == 0 && oa == ob && ob > 0 && !memcmp(got, cold, (size_t)W * sizeof(float)),
-        "5. RESUME: origins live %d, restored %d; restored logits == cold prefill's %s", oa, ob, err);
+    /* L311: the live session may resume deeper, from a record the payload does not carry (its prompt end, on a
+     * split-invariant family) -- the same bytes either way, which is what is graded */
+    say(sx == 0 && oa >= ob && ob > 0 && (oa == ob || pulsar_session_split_invariant(A)) &&
+            !memcmp(got, cold, (size_t)W * sizeof(float)) && !memcmp(live, cold, (size_t)W * sizeof(float)),
+        "5. RESUME: origins live %d, restored %d; restored and live logits == cold prefill's %s", oa, ob, err);
     pulsar_tokens_free(&q);
 
     /* one flipped data byte (the trailing 8 are the digest) */

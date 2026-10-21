@@ -358,9 +358,12 @@ int GATE_ENTRY(int argc, char **argv) {
             {"E: resume at 4500 (last grid point 4480), then 8600", 4500, 0, 4480, 4500, false, 0, 0, 0, 0, 0},
             /* decode saves nothing (its rows are the decode kernels'); the
              * resume redoes the generated tokens from the last PREFILL grid
-             * point -- the only way it equals the cold prefill */
-            {"F: sync 8100 (grid point 8064), decode 200 across 8192, resume from 8064", 8100, GATE_EVALS, 8064, 8064, false, 0, 0, 0, 0, 0},
-            {"G: sync 4000 (grid point 3968), decode 200 across 4096, resume from 3968", 4000, GATE_EVALS, 3968, 3968, false, 0, 0, 0, 0, 0},
+             * point -- the only way it equals the cold prefill.  L311: on a
+             * split-invariant family the sync's prompt-end record (the
+             * prefill-only history ends at 8100 / 4000) is the deeper resume,
+             * and the generated tokens are prefilled from there */
+            {"F: sync 8100 (grid point 8064), decode 200 across 8192, resume from 8064", 8100, GATE_EVALS, 8064, 8100, false, 0, 0, 0, 0, 0},
+            {"G: sync 4000 (grid point 3968), decode 200 across 4096, resume from 3968", 4000, GATE_EVALS, 3968, 4000, false, 0, 0, 0, 0, 0},
             /* the payload carries the prefill frontier and a raw window deep
              * enough for the warm-up: a disk-restored bank resumes too */
             {"H: sync 4500, save+load into a fresh session, resume from 4480", 4500, 0, 4480, 4500, true, 0, 0, 0, 0, NEED_SNAPSHOT},

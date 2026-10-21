@@ -24,6 +24,17 @@ void pulsar_prefill_plan_init(pulsar_prefill_plan *p, const pulsar_prefill_shape
     p->prompt = prompt;
     p->images = n_images > 0 ? images : NULL;
     p->n_images = n_images > 0 ? n_images : 0;
+    p->endpoint = 0u;
+}
+
+uint32_t pulsar_prompt_endpoint(pulsar_engine *e, const pulsar_ckpt_store *store, const pulsar_tokens *prompt) {
+    if (!e || !store || !store->ops || !store->ops->split_invariant || !prompt || prompt->len < 2) return 0u;
+    pulsar_turn_markers m;
+    if (!pulsar_chat_turn_markers(e, &m)) return 0u;
+    for (int i = prompt->len - 1; i > 0; i--)
+        if (pulsar_turn_marker_at(&m, prompt->v, prompt->len, i) != 0)
+            return (uint32_t)i >= store->ops->min_checkpoint(store->state) ? (uint32_t)i : 0u;
+    return 0u;
 }
 
 /* L268: the image block a cut at `cut` would split -- [bs, be) with bs < cut < be -- or false.  The FIRST such
@@ -75,6 +86,13 @@ uint32_t pulsar_prefill_plan_next_end(const pulsar_prefill_plan *p, uint32_t pos
         uint32_t bs = 0, be = 0;
         if (!prefill_plan_block_across(p, cut, &bs, &be)) chunk = cut - pos0;
     }
+    /* L311: and a chunk stops at the prompt's message endpoint inside it, so the walk lands there and records it (a
+     * split-invariant family's only: any cut is its cold prefill's bytes) -- after the grid cut, which the walk
+     * still makes (the disk segments and the grid resume end there) */
+    if (p->endpoint > pos0 && p->endpoint < pos0 + chunk) {
+        uint32_t bs = 0, be = 0;
+        if (!prefill_plan_block_across(p, p->endpoint, &bs, &be)) chunk = p->endpoint - pos0;
+    }
     return pos0 + chunk;
 }
 
@@ -114,6 +132,7 @@ struct prefill_loop_ctx {
     pulsar_ckpt_store *ckpt;
     pulsar_prefill_chunk_fn chunk;
     void *ud;
+    uint32_t endpoint;   ///< L311: the plan's message endpoint the walk records (0 = none)
     /** L281 (b): the walk stands where a resume is exact -- its start, or a chunk end the model's prefill
      *  reproduces (anywhere when split_invariant, else on the resume grid; a chunk never ends inside an image
      *  block).  A stop is honoured only there: an interrupt at an image block's off-grid end would resume from the
@@ -132,6 +151,9 @@ static bool prefill_loop_landed(void *ud, uint32_t chunk_end) {
     for (int i = s->checkpoint.len; i < (int)chunk_end; i++) token_vec_push(&s->checkpoint, c->prompt->v[i]);
     s->checkpoint_valid = true;
     if (!pulsar_ckpt_landed(c->ckpt, c->bank, chunk_end)) return false;
+    /* L311: the walk stands at the prompt's message endpoint -- record it (said when it cannot be) */
+    if (chunk_end == c->endpoint)
+        (void)pulsar_ckpt_record_capture(c->ckpt, c->bank, PULSAR_CKPT_REC_ENDPOINT, chunk_end, c->prompt->v, NULL, 0u);
     c->at_resume_point = c->ckpt->ops->split_invariant || chunk_end % c->ckpt->ops->resume_grid == 0u;
     prefill_loop_progress(s, (int)chunk_end, c->prompt->len);
     return true;
@@ -154,6 +176,12 @@ int pulsar_prefill_loop(pulsar_session *s, const pulsar_tokens *prompt, uint32_t
     }
     pulsar_prefill_plan plan;
     pulsar_prefill_plan_init(&plan, &shape, start, ckpt, s->engine, prompt, s->sync_images, s->sync_n_images);
+    /* L311: a text history's message endpoint past the walk's start is cut at and recorded (the records keep no
+     * image identity, as the prompt end below) */
+    if (s->sync_n_images == 0 && s->live_images.n == 0) {
+        const uint32_t E = pulsar_prompt_endpoint(s->engine, ckpt, prompt);
+        plan.endpoint = E > start ? E : 0u;
+    }
     if (plan.n_images > 0) {
         /* every block must fit one chunk of THIS walk (a resume's chunks may be narrower than the cold pass's) */
         char verr[384];
@@ -174,7 +202,7 @@ int pulsar_prefill_loop(pulsar_session *s, const pulsar_tokens *prompt, uint32_t
     for (uint32_t i = 0; i < start; i++) token_vec_push(&s->checkpoint, prompt->v[i]);
     s->checkpoint_valid = start > 0u;
     prefill_loop_progress(s, (int)start, prompt->len);
-    prefill_loop_ctx c = { s, prompt, pulsar_session_live_bank(s), ckpt, chunk, ud, true };
+    prefill_loop_ctx c = { s, prompt, pulsar_session_live_bank(s), ckpt, chunk, ud, plan.endpoint, true };
     const pulsar_prefill_walk w = { &plan, prefill_loop_chunk, prefill_loop_landed, prefill_loop_stop, &c };
     const int rc = pulsar_prefill_walk_run(&w, start, end);
     /* the logits are the prompt's next-token row only when the final chunk ran (a stop leaves the view
@@ -187,8 +215,8 @@ int pulsar_prefill_loop(pulsar_session *s, const pulsar_tokens *prompt, uint32_t
     if (rc == 0 && s->sync_n_images == 0 && s->live_images.n == 0) {
         const float *live = s->live_host();   /* L302: the record keeps the row on the host */
         if (live)
-            (void)pulsar_ckpt_end_capture(ckpt, c.bank, end, prompt->v, live,
-                                          (uint32_t)pulsar_engine_logits_width(s->engine));
+            (void)pulsar_ckpt_record_capture(ckpt, c.bank, PULSAR_CKPT_REC_END, end, prompt->v, live,
+                                             (uint32_t)pulsar_engine_logits_width(s->engine));
     }
     return rc;
 }
