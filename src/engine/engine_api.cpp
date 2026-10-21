@@ -1172,7 +1172,9 @@ uint32_t pulsar_session_resume_point(pulsar_session *s, uint32_t bank, int commo
 const pulsar_ckpt_record *pulsar_session_resume_record(pulsar_session *s, uint32_t bank, uint32_t T, int prompt_len) {
     const pulsar_ckpt_store *st = pulsar_session_kv_store(s);
     const pulsar_tokens *h = pulsar_bank_history(s, bank);
-    if (!st || !st->ops || !h || T == 0u || pulsar_ckpt_best(st, bank, T) == T) return NULL;
+    /* below the prompt's end a grid checkpoint at T is the restore; AT it only a record (its logits) serves */
+    if (!st || !st->ops || !h || T == 0u || (T < (uint32_t)prompt_len && pulsar_ckpt_best(st, bank, T) == T))
+        return NULL;
     const pulsar_ckpt_record *r = pulsar_ckpt_record_best(st, bank, h->v, (uint32_t)h->len, T, (uint32_t)prompt_len);
     return r && r->T == T ? r : NULL;
 }

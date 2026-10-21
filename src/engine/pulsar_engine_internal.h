@@ -3104,8 +3104,8 @@ uint32_t pulsar_session_live_bank(pulsar_session *s);
  * L289 / L311: or a deeper record of the bank's within the prefix and the prefill-only history -- at the
  * prompt's end with its logits (every family), or below it on a split-invariant family. */
 uint32_t pulsar_session_resume_point(pulsar_session *s, uint32_t bank, int common, int prompt_len);
-/** L311: the record a resume at T (pulsar_session_resume_point's answer) restores -- NULL when T is a grid
- *  checkpoint of the bank's (or 0, or no record of its is at T). */
+/** L311: the record a resume at T (pulsar_session_resume_point's answer) restores -- NULL when T, below the prompt's
+ *  end, is a grid checkpoint of the bank's (or 0, or no record of its is at T). */
 const pulsar_ckpt_record *pulsar_session_resume_record(pulsar_session *s, uint32_t bank, uint32_t T, int prompt_len);
 /** L284: whether a sync continues `bank`'s history where its first `len` tokens end, every family's one rule:
  * those tokens are all prefill rows (none a decode step's), the cut is one the model's prefill reproduces
