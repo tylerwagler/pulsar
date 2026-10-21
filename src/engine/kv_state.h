@@ -113,6 +113,31 @@ typedef struct pulsar_kv_state_ops {
     bool (*noted_at)(void *state, uint32_t T, bool *capture, char *why, size_t whylen);
 } pulsar_kv_state_ops;
 
+/** The kinds of record (pulsar_ckpt_store::rec). */
+typedef enum : uint8_t {
+    PULSAR_CKPT_REC_END = 1,        ///< L289: a classic sync's prompt end, with its logits
+    PULSAR_CKPT_REC_ENDPOINT = 2,   ///< L311: the prompt's last message endpoint (its last turn marker's start)
+} pulsar_ckpt_record_kind;
+
+/** The most records one store pools (two a bank at the pool's widest). */
+#define PULSAR_CKPT_RECORDS_MAX (2u * PULSAR_MSEQ_MAX)
+
+/** One record of the pool: bank `bank`'s state at T. */
+typedef struct pulsar_ckpt_record {
+    uint32_t bank;                     ///< the bank whose history it is a position of
+    uint32_t T;                        ///< 0 = a free record
+    pulsar_ckpt_record_kind kind;
+    uint64_t used;                     ///< the pool's clock at its capture or last restore (the eviction order)
+    struct pulsar_gpu_tensor *slab;    ///< the frontier walk's bytes
+    uint64_t cap;                      ///< slab's bytes (it grows when a drafter loads after the store)
+    float *logits;                     ///< host, end_width floats: a prompt end's next-token row (NULL otherwise)
+    /** host: the T token ids the record's state is the prefill of -- the match authority at a resume (a history
+     *  rewound inside T's last compressor group and re-prefilled with other ids keeps the record's rows, not its
+     *  tokens) */
+    int32_t *tokens;
+    uint32_t tokens_cap;
+} pulsar_ckpt_record;
+
 /** A model's grid checkpoints: per bank, ops->ckpt_slots slots of slot_bytes.  pos[bank][s] is
  *  the grid point slot s holds, 0 = empty.  A checkpoint at G is valid while its bank's history
  *  reaches G: pulsar_ckpt_frontier_lowered drops it when the history falls below. */
@@ -126,20 +151,18 @@ typedef struct pulsar_ckpt_store {
     struct pulsar_gpu_tensor *slab[PULSAR_MSEQ_MAX];
     uint64_t slot_bytes;
     uint32_t pos[PULSAR_MSEQ_MAX][PULSAR_CKPT_SLOTS_MAX];
-    /** L289: per bank, its PROMPT END -- the state a classic sync's prefill left at the prompt's last token T: the
-     *  model's FRONTIER walk at T and the logits row that prefill headed.  Valid by the frontier rule like a grid checkpoint (end_pos 0 once
-     *  the history falls below T).  A sync of the same prompt resumes AT T with no row prefilled (every family:
-     *  the state is the prefill's own, copied whole). */
-    struct pulsar_gpu_tensor *end_slab[PULSAR_MSEQ_MAX];
-    uint64_t end_cap[PULSAR_MSEQ_MAX];      ///< end_slab[b]'s bytes (it grows when a drafter loads after the store)
-    uint32_t end_pos[PULSAR_MSEQ_MAX];      ///< T, 0 = none
-    float *end_logits[PULSAR_MSEQ_MAX];     ///< host, end_width floats
-    uint32_t end_width;
-    /** host: the T token ids the record's state is the prefill of -- the match authority at a resume (a history
-     *  rewound inside T's last compressor group and re-prefilled with other ids keeps the record's rows, not its
-     *  tokens) */
-    int32_t *end_tokens[PULSAR_MSEQ_MAX];
-    uint32_t end_tokens_cap[PULSAR_MSEQ_MAX];
+    /** L289 / L311: the RECORDS, one pool every bank draws from -- each the state a prefill left at an EXACT
+     *  position T of a bank's history (not a grid point): the model's FRONTIER walk at T and the token ids it is the
+     *  prefill of.  Two kinds: a PROMPT END (the state a classic sync's prefill left at the prompt's last token, with
+     *  the logits row it headed) and a MESSAGE ENDPOINT (L311: where the prompt's last turn marker begins, the
+     *  history before the generation header -- the branch point of an agent's side request).  Valid by the frontier
+     *  rule like a grid checkpoint (T 0 once the bank's history falls below T, or the bank is dropped).  A record
+     *  resumes a prompt that carries its tokens: the same prompt AT T with its logits (every family: the state is the
+     *  prefill's own, copied whole), and on a split-invariant family any longer one from T. */
+    pulsar_ckpt_record rec[PULSAR_CKPT_RECORDS_MAX];
+    uint32_t n_rec;                         ///< records in the pool (pulsar_ckpt_records_for)
+    uint64_t rec_clock;                     ///< the pool's use clock (a capture or restore stamps rec[].used)
+    uint32_t end_width;                     ///< the logits width a prompt end keeps (the engine's)
 } pulsar_ckpt_store;
 
 bool pulsar_ckpt_alloc(pulsar_ckpt_store *st, const pulsar_kv_state_ops *ops, void *state, uint32_t n_banks);
@@ -169,21 +192,36 @@ void pulsar_ckpt_commit(pulsar_ckpt_store *st, uint32_t bank, uint32_t slot, uin
 static inline uint32_t pulsar_ckpt_grid_floor(const pulsar_ckpt_store *st, uint32_t pos) {
     return pos / st->ops->resume_grid * st->ops->resume_grid;
 }
-/** L289: capture the installed `bank`'s prompt end at T with the logits the prefill left there (`width` floats).
- *  The model confirms a live frontier at T (ops->frontier_at); false, said, when not or when a copy fails (the bank
- *  then holds no prompt end). */
-bool pulsar_ckpt_end_capture(pulsar_ckpt_store *st, uint32_t bank, uint32_t T, const int *tokens, const float *logits,
-                             uint32_t width);
-/** Is `bank`'s prompt end the prefill of tokens[0, T) -- T its position, len >= T and the ids equal? */
-bool pulsar_ckpt_end_matches(const pulsar_ckpt_store *st, uint32_t bank, const int *tokens, uint32_t len);
+/** L311: how many records a store of n_banks pools -- a prompt end and a message endpoint for most banks: n_banks
+ *  plus half as many again (at least two, so a one-bank session keeps both of its own). */
+static inline uint32_t pulsar_ckpt_records_for(uint32_t n_banks) {
+    const uint32_t n = n_banks + (n_banks / 2u > 1u ? n_banks / 2u : 1u);
+    return n < PULSAR_CKPT_RECORDS_MAX ? n : PULSAR_CKPT_RECORDS_MAX;
+}
+/** L289 / L311: capture the installed `bank`'s state at T as a record of `kind` -- a prompt end with the logits the
+ *  prefill left there (`width` floats), a message endpoint with none (logits NULL).  It replaces the bank's record of
+ *  that kind, in a free record or the least recently used one.  The model confirms a live frontier at T
+ *  (ops->frontier_at); false, said, when not or when a copy fails (the bank then holds no record of that kind). */
+bool pulsar_ckpt_record_capture(pulsar_ckpt_store *st, uint32_t bank, pulsar_ckpt_record_kind kind, uint32_t T,
+                                const int *tokens, const float *logits, uint32_t width);
+/** The deepest of `bank`'s records whose ids are tokens[0, T) (of `len`) with T <= limit and -- when T == prompt_len,
+ *  a resume AT T -- that holds the logits that resume reads.  NULL when none. */
+const pulsar_ckpt_record *pulsar_ckpt_record_best(const pulsar_ckpt_store *st, uint32_t bank, const int *tokens,
+                                                  uint32_t len, uint32_t limit, uint32_t prompt_len);
+/** `bank`'s record of `kind`, NULL when none. */
+const pulsar_ckpt_record *pulsar_ckpt_record_of(const pulsar_ckpt_store *st, uint32_t bank,
+                                                pulsar_ckpt_record_kind kind);
 /** `bank`'s prompt end T, 0 when none. */
 static inline uint32_t pulsar_ckpt_end(const pulsar_ckpt_store *st, uint32_t bank) {
-    return bank < PULSAR_MSEQ_MAX ? st->end_pos[bank] : 0u;
+    const pulsar_ckpt_record *r = pulsar_ckpt_record_of(st, bank, PULSAR_CKPT_REC_END);
+    return r ? r->T : 0u;
 }
-/** Put the installed `bank` back at its prompt end T: the counters at T (prefilled to T), every lane and open row
- *  from the record, the grid checkpoints above T dropped; *logits (width floats, when non-NULL) is the row the
- *  prefill left at T.  False when the bank holds none or a copy failed (its state then describes no position). */
-bool pulsar_ckpt_end_restore(pulsar_ckpt_store *st, uint32_t bank, float *logits, uint32_t width);
+/** Put the installed `bank` back at its record `r` (one of the bank's own): the counters at r->T (prefilled to T),
+ *  every lane and open row from the record, the grid checkpoints and records above T dropped; *logits (width floats,
+ *  when non-NULL; the record must keep them) is the row the prefill left at T.  False when the record is not the
+ *  bank's or a copy failed (its state then describes no position). */
+bool pulsar_ckpt_record_restore(pulsar_ckpt_store *st, uint32_t bank, const pulsar_ckpt_record *r, float *logits,
+                                uint32_t width);
 /** Where a walk's FINAL chunk [pos0, end) ends (P13, every walk's): at the prompt's last grid point when that lies
  *  strictly inside it -- so the prefill leaves the checkpoint the next turn resumes from -- else at `end`.  The
  *  caller keeps an image block whole around it. */

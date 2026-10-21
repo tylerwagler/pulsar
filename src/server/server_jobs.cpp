@@ -7,6 +7,7 @@
  * because the scheduler TU steps jobs by phase and drives the batched
  * lanes through the batch_* fields. */
 #include "pulsar_server_internal.h"
+#include "pulsar_lock.hpp"
 
 
 
@@ -608,6 +609,7 @@ void server::gen_begin(session_slot *sl) {
      * 2026-10-06 20:21, an image turn routed to a fresh bank prefilled 150k
      * tokens cold past the sys-prefix cut where a text turn loads the chain. */
     const bool image_request = j->req.n_images > 0;
+    sl->terminal_pending = false;   /* L311: this job's own sync resumes the bank's last turn */
     /* Tier-2: install this slot's bank before ANY s->sess touch below (all the
      * pos/common-prefix/tokens reads and the prefill sync run against the live
      * bank). No-op in classic mode / when already live. Finding 1: a failed spill
@@ -1781,7 +1783,76 @@ void server::gen_step_finish(session_slot *sl) {
     free(parsed_content);
     free(parsed_reasoning);
     tool_calls_free(&parsed_calls);
+    /* L311: a turn that decoded leaves its reply as decode rows; the idle worker prefills it as the next turn would */
+    sl->terminal_pending = strcmp(final_finish, "error") != 0 && g->completion_total + g->completion > 0;
     g->phase = GEN_DONE;
+}
+
+bool server::terminal_checkpoint_step() {
+    auto *s = this;
+    if (s->pool_banks <= 0) return false;
+    session_slot *pick = NULL;
+    for (int i = 0; i < s->n_slots; i++) {
+        session_slot *sl = &s->slots[i];
+        if (!sl->terminal_pending) continue;
+        /* a slot evicted, spilled (its rows are on disk) or bound since no longer has the turn to complete */
+        if (!sl->provisioned || sl->spilled || sl->active_job) {
+            sl->terminal_pending = false;
+            continue;
+        }
+        if (!pick || sl->last_serviced_us > pick->last_serviced_us) pick = sl;
+    }
+    if (!pick) return false;
+    pick->terminal_pending = false;
+    /* a Responses visible binding keys its replay on the live history's last token (L196): left as decoded */
+    {
+        pulsar::ScopedLock lk(&s->tool_mu);
+        if (pick->responses_live.valid) return true;
+    }
+    const pulsar_tokens *h = pulsar_session_bank_tokens(s->sess, pick->bank);
+    const int pf = pulsar_session_bank_prefill_frontier(s->sess, pick->bank);
+    if (!h || h->len <= 0) return true;
+    int C = h->len;
+    if (pulsar_token_is_stop(s->engine, h->v[C - 1])) C--;   /* the render re-spells the stop (L290's join) */
+    if (C <= pf) return true;                                /* nothing decoded past the prefill */
+    if (!s->bank_switch((int)pick->bank)) return true;
+    /* the records keep no image identity: a history holding an image block stays as decoded */
+    if (pulsar_session_image_hashes(s->sess, NULL, 0) > 0) return true;
+    pulsar_tokens target = {0};
+    tokens_copy_prefix(&target, pulsar_session_tokens(s->sess), C);
+    const int old_len = pulsar_session_pos(s->sess);
+    pulsar_session_set_cancel(s->sess, NULL, NULL);
+    pulsar_session_set_progress(s->sess, NULL, NULL);
+    pulsar_session_set_display_progress(s->sess, NULL, NULL);
+    const double t0 = server_now_sec();
+    char err[192] = "";
+    /* the view IS the target when no stop trails it, and a sync of the same prompt is a no-op: the history short of
+     * its last token first (that sync resumes below the decode rows), then the token */
+    int rc = 0, origin = -1;
+    if (C == old_len) {
+        target.len = C - 1;
+        rc = pulsar_session_sync(s->sess, &target, err, sizeof(err));
+        origin = pulsar_session_resume_origin(s->sess);
+        target.len = C;
+    }
+    if (rc == 0) rc = pulsar_session_sync(s->sess, &target, err, sizeof(err));
+    if (origin < 0) origin = pulsar_session_resume_origin(s->sess);
+    pick->committed_pos = pulsar_session_pos(s->sess);
+    if (rc == 0) {
+        /* the bank's frontier moved from the decoded end to C: a live tool binding at the old end describes C now
+         * (the continuation's tail re-spells a dropped stop) */
+        pulsar::ScopedLock lk(&s->tool_mu);
+        if (pick->anthropic_live.valid && pick->anthropic_live.live_tokens == old_len)
+            pick->anthropic_live.live_tokens = C;
+    }
+    server_log(PULSAR_LOG_KVCACHE,
+               "pulsar-server: terminal checkpoint: bank %u prefilled [%d, %d) of its turn (prefill frontier was %d) "
+               "in %.1f ms%s%s",
+               pick->bank, origin, C, pf, (server_now_sec() - t0) * 1e3, rc == 0 ? "" : " -- FAILED: ", err);
+    if (rc == 0) s->kv_cache_persist(pick, "terminal", true);
+    else pulsar_session_invalidate(s->sess);   /* the bank's state is no position's; its next turn rebuilds it */
+    pulsar_tokens_free(&target);
+    return true;
 }
 
 
