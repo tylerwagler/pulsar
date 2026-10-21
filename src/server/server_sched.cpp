@@ -1875,6 +1875,7 @@ bool server::preempt_newest_decoder(const session_slot *keep) {
     pulsar_session *pool = s->sess;
     const double t0 = server_now_sec();
     const uint64_t bytes = pulsar_session_bank_touched_kv_bytes(pool, v->bank);
+    const uint64_t payload_bytes = pulsar_session_payload_bytes(pool);   /* the installed victim's, before the switch */
     char name[64];
     snprintf(name, sizeof name, "preempt-bank-%u.kvp", v->bank);
     char *path = path_join(s->kv.dir, name);
@@ -1905,7 +1906,7 @@ bool server::preempt_newest_decoder(const session_slot *keep) {
     server_log(PULSAR_LOG_DEFAULT,
                "pulsar-server: PREEMPTED bank %u's decoder at %d tokens (%d generated): terminal checkpoint %.1f MiB "
                "in %.1f ms, physical freed (%.2f GiB)", v->bank, pulsar_session_bank_pos(pool, v->bank),
-               g->completion_total + g->completion, (double)pulsar_session_payload_bytes(pool) / 1048576.0,
+               g->completion_total + g->completion, (double)payload_bytes / 1048576.0,
                (server_now_sec() - t0) * 1e3, (double)bytes / (1024.0 * 1024.0 * 1024.0));
     return true;
 }
