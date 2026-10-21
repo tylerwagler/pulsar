@@ -1200,8 +1200,10 @@ double pulsar_lane_cost_ms(const pulsar_lane_cost *c, double rows);
  *  container's digest, the drafter, the widest step, the session's bank pool and context, `build_id`) or profiled
  *  on the session's INSTALLED bank at its frontier -- every r-row verify step from the widest down, each one put
  *  back as a round's abort does -- and written there.  The installed bank must hold a prefix and room for the widest
- *  step.  0, or -1 with `err` (no batched speculative lane: tensor-parallel, no drafter, no bank pool; or the
- *  profile failed) -- the engine then has no curve and the row budget alone admits drafts. */
+ *  step.  On a tensor-parallel group (L315) the leader opens it: a profile runs on every rank in step
+ *  (pulsar_session_verify_profile), the key names the group's width, and only the leader holds the curve.  0, or -1
+ *  with `err` (no batched speculative lane: no drafter, no bank pool; or the profile failed) -- the engine then has
+ *  no curve and the row budget alone admits drafts. */
 int pulsar_session_verify_curve_open(pulsar_session *s, const char *cache_dir, const char *build_id, char *err,
                                      size_t errlen);
 /** One decode round of the batched spec lane (the server reports every round that carried no prompt rows):
@@ -1210,7 +1212,9 @@ int pulsar_session_verify_curve_open(pulsar_session *s, const char *cache_dir, c
 void pulsar_engine_verify_curve_observe(pulsar_engine *e, uint32_t n_seqs, uint32_t rows, double forward_ms,
                                         double host_ms, double draft_ms);
 /** The verify pick: of m drafts with survivals `surv` sorted DESCENDING, how many a round of n_seqs base rows
- *  verifies within cap_rows rows (the best ratio on the curve; no curve: as many as the rows hold). */
+ *  verifies within cap_rows rows (the best ratio on the curve; no curve: as many as the rows hold).  The SERVER'S
+ *  pick: on a tensor-parallel group it runs on the leader, on the leader's curve (L315), and its choice reaches the
+ *  workers as each step's k_alloc. */
 uint32_t pulsar_engine_verify_pick(const pulsar_engine *e, uint32_t n_seqs, const float *surv, uint32_t m,
                                    uint32_t cap_rows);
 /** The curve as /metrics shows it (valid false: none). */
