@@ -1326,6 +1326,7 @@ void server::publish_metrics_snapshot() {
     s->m_drafter_name = pulsar_engine_drafter_name(s->engine);
     memcpy(s->m_spec_phase_ms, s->w_spec_phase_ms, sizeof s->m_spec_phase_ms);
     s->m_spec_phase_rounds = s->w_spec_phase_rounds;
+    memcpy(s->m_spec_syncs, s->w_spec_syncs, sizeof s->m_spec_syncs);
     s->m_decode_lane = s->w_decode_lane;
     /* Bump and wake the /metrics/stream subscribers. A generation counter
      * rather than a payload comparison on purpose: "did anything move" over a
@@ -1443,21 +1444,28 @@ void server::worker_service_slot(session_slot *sl) {
  * than the DSpark ≤17-token fused burst) and are deliberate single-thread
  * design: the CUDA-state audit (pulsar_server_internal.h) rules out a second
  * GPU thread, and both happen only at a scheduling boundary. */
-/* A slot's draw from the pool session's live logits row -- L303: through the grammar's mask while a region is
- * live (the row copied out: the session's own stays the target distribution the logprob capture reads).  -1 with
- * g->err set: the sampler refused the row, or the grammar failed. */
+/* A slot's draw request (THE sampler, L302) -- L303: through the grammar's mask while a region is live; the row
+ * itself stays the target distribution the logprob capture reads.  *mask is the caller's storage; the draw request
+ * reads it.  false with g->err set: the grammar failed (the request fails). */
+static bool gen_draw_req(server *s, gen_state *g, float temp, int top_k, float top_p, float min_p,
+                         std::vector<uint32_t> *mask, pulsar_row_draw *d) {
+    const bool live = gen_constrain_live(g);
+    if (live) {
+        mask->resize(gen_constrain_words(s));
+        if (!gen_constrain_mask(s, g, mask->data())) return false;
+    }
+    *d = pulsar_row_draw{temp, top_k, top_p, min_p, &g->rng, false, live ? mask->data() : NULL};
+    return true;
+}
+
+/* the slot's draw from the pool session's live row.  -1 with g->err set: the sampler refused the row, or the
+ * grammar failed. */
 static int gen_sample_pool(server *s, gen_state *g, pulsar_session *pool, float temp, int top_k, float top_p,
                            float min_p) {
-    if (gen_constrain_live(g)) {
-        const int width = pulsar_engine_logits_width(s->engine);
-        std::vector<float> row((size_t)width);
-        if (pulsar_session_copy_logits(pool, row.data(), width) != width) {
-            snprintf(g->err, sizeof g->err, "the live logits row could not be read");
-            return -1;
-        }
-        return gen_constrain_draw(s, g, row.data(), width, temp, top_k, top_p, min_p);
-    }
-    const int tok = pulsar_session_sample(pool, temp, top_k, top_p, min_p, &g->rng);
+    std::vector<uint32_t> mask;
+    pulsar_row_draw d;
+    if (!gen_draw_req(s, g, temp, top_k, top_p, min_p, &mask, &d)) return -1;
+    const int tok = pulsar_session_draw(pool, &d);
     if (tok < 0) snprintf(g->err, sizeof g->err, "sampler refused a degenerate logits row (L188)");
     return tok;
 }
@@ -2120,12 +2128,65 @@ static void lane_abandon(gen_state *g, bool drop_feed) {
     g->phase = GEN_FINISH;
 }
 
+/* The plain and mixed batched lanes' step epilogue: every decode row's committed token emitted, then the rows of
+ * the slots that go on drawn in ONE device launch (THE sampler over the step's headed rows: row q is dec[live_idx[q]]'s,
+ * each at its own stream's key, a live grammar region through its mask -- L302, L303), and each draw's logprobs captured
+ * from the same row.  A slot that stopped draws nothing (its stream is not stepped). */
+static void lane_emit_and_draw(server *s, session_slot **dec, const int *live_idx, int m, pulsar_session *pool) {
+    uint32_t rows[PULSAR_SESSION_POOL_CAP];
+    pulsar_row_draw d[PULSAR_SESSION_POOL_CAP];
+    std::vector<uint32_t> masks[PULSAR_SESSION_POOL_CAP];
+    gen_state *who[PULSAR_SESSION_POOL_CAP];
+    uint32_t nd = 0;
+    for (int q = 0; q < m; q++) {
+        session_slot *sl = dec[live_idx[q]];
+        gen_state *g = sl->gen;
+        const int committed = g->batch_feed_token; /* committed at batch_feed_pos */
+        g->batch_feed_pos++;
+        sl->committed_pos = g->batch_feed_pos;
+        sl->tokens_emitted++;   /* L118: classic-loop accounting parity */
+        pulsar_tokens_push(&g->batch_pending, committed);
+        if (g->first_token_t == 0.0) g->first_token_t = server_now_sec();
+        /* Route THIS slot's stream writes through its own deferral queue
+         * (the worker-thread-local writer is shared across slots). */
+        slot_writer_install(&g->writer);
+        if (s->gen_emit_token(sl, committed)) {
+            g->batch_feed_valid = false;
+            g->phase = GEN_FINISH;
+            continue;
+        }
+        float temp, top_p, min_p; int top_k;
+        gen_resolve_sampling_decode(g, &temp, &top_k, &top_p, &min_p);
+        if (!gen_draw_req(s, g, temp, top_k, top_p, min_p, &masks[nd], &d[nd])) {   /* L303: g->err says why */
+            g->finish = "error"; g->batch_feed_valid = false; g->phase = GEN_FINISH;
+            continue;
+        }
+        rows[nd] = (uint32_t)q;
+        who[nd++] = g;
+    }
+    if (nd == 0) return;
+    int tok[PULSAR_SESSION_POOL_CAP];
+    if (pulsar_session_draw_rows(pool, rows, d, nd, tok) != 0)
+        for (uint32_t k = 0; k < nd; k++) tok[k] = PULSAR_SAMPLE_REFUSED;
+    for (uint32_t k = 0; k < nd; k++) {
+        gen_state *g = who[k];
+        g->batch_feed_token = tok[k];
+        if (tok[k] < 0) {
+            snprintf(g->err, sizeof g->err, "sampler refused a degenerate logits row (L188)");
+            g->finish = "error"; g->batch_feed_valid = false; g->phase = GEN_FINISH;
+            continue;
+        }
+        /* This bank's row IS the target distribution at batch_feed_pos, and
+         * it is overwritten by the next step's sweep. */
+        logprob_capture_row(&g->logprobs, pool, rows[k], tok[k]);
+    }
+}
+
 void server::worker_batched_decode_quantum(session_slot **dec, int n, int quantum_tokens) {
     PULSAR_NVTX_FN();
     auto *s = this;
     if (n <= 0) return;
     pulsar_session *pool = s->sess;
-    const int vocab = pulsar_engine_logits_width(s->engine);
     park_live_bank(s, dec, n, NULL);
 
     /* Tier-2 2b: proactive-eviction guard — BEFORE the weight sweep grows the live
@@ -2188,12 +2249,6 @@ void server::worker_batched_decode_quantum(session_slot **dec, int n, int quantu
         g->batch_active = true;
     }
 
-    /* Persistent, like the spec lane's: a per-quantum malloc/free re-faults
-     * ~4 MB of demand-zero pages on every quantum (L219). */
-    if (!s->lane_logits)
-        s->lane_logits = (float *)server_xmalloc(
-                (size_t)(PULSAR_SESSION_POOL_CAP + 1) * (size_t)vocab * sizeof(float));
-    float *logits = s->lane_logits;
     pulsar_multiseq_req reqs[PULSAR_SESSION_POOL_CAP];
     int live_idx[PULSAR_SESSION_POOL_CAP];
 
@@ -2224,9 +2279,7 @@ void server::worker_batched_decode_quantum(session_slot **dec, int n, int quantu
          * (n_rows == n_dec, still exactly 1 row per bank — no prefill rows, no
          * mixing yet). Byte-identical to pulsar_session_decode_multiseq; the only
          * change is the heap descriptor scratch. */
-        const int rc = pulsar_session_decode_mixed(pool, reqs, (uint32_t)m,
-                                                 logits, (uint32_t)m * vocab,
-                                                 NULL, 0u, err, sizeof(err));
+        const int rc = pulsar_session_decode_mixed(pool, reqs, (uint32_t)m, NULL, 0, NULL, 0u, err, sizeof(err));
         s->live_bank = -1;   /* pool is multiseq-poisoned: no clean live bank */
         if (rc != 0) {
             for (int q = 0; q < m; q++) {
@@ -2239,35 +2292,7 @@ void server::worker_batched_decode_quantum(session_slot **dec, int n, int quantu
             break;
         }
 
-        for (int q = 0; q < m; q++) {
-            session_slot *sl = dec[live_idx[q]];
-            gen_state *g = sl->gen;
-            const int committed = g->batch_feed_token; /* committed at batch_feed_pos */
-            g->batch_feed_pos++;
-            sl->committed_pos = g->batch_feed_pos;
-            sl->tokens_emitted++;   /* L118: classic-loop accounting parity */
-            pulsar_tokens_push(&g->batch_pending, committed);
-            if (g->first_token_t == 0.0) g->first_token_t = server_now_sec();
-            /* Route THIS slot's stream writes through its own deferral queue
-             * (the worker-thread-local writer is shared across slots). */
-            slot_writer_install(&g->writer);
-            if (s->gen_emit_token(sl, committed)) {
-                g->batch_feed_valid = false;
-                g->phase = GEN_FINISH;
-                continue;
-            }
-            float *row = logits + (size_t)q * (size_t)vocab;
-            float temp, top_p, min_p; int top_k;
-            gen_resolve_sampling_decode(g, &temp, &top_k, &top_p, &min_p);
-            g->batch_feed_token = gen_constrain_draw(s, g, row, vocab, temp, top_k, top_p, min_p);   /* L303 */
-            if (g->batch_feed_token < 0) {
-                g->finish = "error"; g->batch_feed_valid = false; g->phase = GEN_FINISH;
-                continue;
-            }
-            /* This bank's row IS the target distribution at batch_feed_pos, and
-             * it is overwritten by the next step's sweep. */
-            logprob_capture_row(&g->logprobs, row, vocab, g->batch_feed_token);
-        }
+        lane_emit_and_draw(s, dec, live_idx, m, pool);
         /* L284: the plain lane's step cost, measured as the spec lane's round is -- the rows the forward
          * carried against the step's wall, sampling and emission included -- into the same fit structure
          * (pulsar_engine_lane_cost), so the lane choice weighs one clock against the other */
@@ -2418,7 +2443,6 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n, int quantum_
     auto *s = this;
     if (n <= 0) return;
     pulsar_session *pool = s->sess;
-    const int vocab = pulsar_engine_logits_width(s->engine);
     park_live_bank(s, dec, n, NULL);
 
     s->guard_maybe_evict(dec, n);
@@ -2443,14 +2467,6 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n, int quantum_
     pulsar_spec_step steps[PULSAR_SESSION_POOL_CAP];
     int step_slot[PULSAR_SESSION_POOL_CAP];
     int accepted[PULSAR_SESSION_POOL_CAP][PULSAR_SPEC_LOGITS_ROWS + 1];
-    /* The shared forward carries at most heads_max rows (the family's verify width, <= the slab).
-     * L123: the landing buffer lives on the server (allocated once) — the
-     * per-quantum malloc re-faulted 16.5 MB of demand-zero pages every
-     * quantum. */
-    if (!s->spec_lane_logits)
-        s->spec_lane_logits = (float *)server_xmalloc(
-                (size_t)PULSAR_SPEC_LOGITS_ROWS * (size_t)vocab * sizeof(float));
-    float *logits = s->spec_lane_logits;
 
     int emitted_total = 0;
     const bool fuse_on = s->fusion_enabled();
@@ -2488,6 +2504,8 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n, int quantum_
     while (emitted_total < quantum_tokens) {
         const bool first_round = round_ix++ == 0;
         const double round_t0 = server_now_sec();   /* L263: this round's cost observation */
+        pulsar_gpu_sync_stats sync0;                  /* L302: and its synchronisations */
+        pulsar_gpu_sync_stats_get(&sync0);
         const int round_emitted0 = emitted_total;   /* L284: and its yield */
         /* ---- L260 fusion: the queued prompts that ride this round's forward,
          * one chunk each, up to fuse_rows prompt rows in all.  A chunk that
@@ -2756,9 +2774,7 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n, int quantum_
                 }
                 shape.head_last[r] = fr[r].fin ? 1u : 0u;
             }
-            rc = pulsar_session_decode_fused(pool, fused_reqs, at, &shape, logits,
-                                             (int)((rows + (uint32_t)n_fin) * (uint32_t)vocab), &got,
-                                             err, sizeof err);
+            rc = pulsar_session_decode_fused(pool, fused_reqs, at, &shape, NULL, 0, &got, err, sizeof err);
             if (rc == 0 && got == rows + (uint32_t)n_fin) got = rows;   /* the verify rows' share */
             /* Rule 5: the lane announces that it RAN, once, with its shape --
              * otherwise only its refusals print and "it ran" rests on inference
@@ -2774,10 +2790,8 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n, int quantum_
             }
             else if (rc == 0) rc = -1;
         } else {
-            rc = pulsar_session_decode_mixed(pool, reqs, rows, logits,
-                                             (int)(rows * (uint32_t)vocab),
-                                             &got, PULSAR_MSEQ_HEAD_ALL_ROWS,
-                                             err, sizeof err);
+            rc = pulsar_session_decode_mixed(pool, reqs, rows, NULL, 0, &got, PULSAR_MSEQ_HEAD_ALL_ROWS, err,
+                                             sizeof err);
         }
         pulsar_session_spec_arm_capture(pool, 0u);
         const double fwd_t1 = server_now_sec();
@@ -2887,7 +2901,7 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n, int quantum_
             st->accepted = accepted[q];
             st->accepted_cap = (int)(PULSAR_SPEC_LOGITS_ROWS + 1);
         }
-        (void)pulsar_session_spec_round_end_batch(pool, steps, m, logits);
+        (void)pulsar_session_spec_round_end_batch(pool, steps, m);
         const double end_t1 = server_now_sec();
         for (int q = 0; q < m; q++) {
             session_slot *sl = dec[live_idx[q]];
@@ -3047,6 +3061,12 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n, int quantum_
                                                               round_t1};
             for (int p = 0; p < SERVER_ROUND_PHASE_COUNT; p++) s->w_spec_phase_ms[p] += (cut[p + 1] - cut[p]) * 1e3;
             s->w_spec_phase_rounds++;
+            pulsar_gpu_sync_stats sync1;
+            pulsar_gpu_sync_stats_get(&sync1);
+            s->w_spec_syncs[0] += sync1.stream_syncs - sync0.stream_syncs;
+            s->w_spec_syncs[1] += sync1.d2h - sync0.d2h;
+            s->w_spec_syncs[2] += sync1.d2h_bytes - sync0.d2h_bytes;
+            s->w_spec_syncs[3] += sync1.h2d - sync0.h2d;
             const double round_ms = (round_t1 - round_t0) * 1e3, fwd_ms = (fwd_t1 - fwd_t0) * 1e3,
                          draft_ms = (draft_t1 - draft_t0) * 1e3;
             pulsar_engine_lane_cost_observe(s->engine, PULSAR_LANE_SPEC, rows, round_ms);
@@ -3244,7 +3264,6 @@ void server::worker_mixed_batch_quantum(session_slot **dec, int n, session_slot 
     auto *s = this;
     if (n <= 0 || !pf || !pf->gen || !pf->gen->prompt_for_sync) return;
     pulsar_session *pool = s->sess;
-    const int vocab = pulsar_engine_logits_width(s->engine);
     park_live_bank(s, dec, n, pf);
     gen_state *pg = pf->gen;
     const pulsar_tokens *pp = pg->prompt_for_sync;
@@ -3313,15 +3332,6 @@ void server::worker_mixed_batch_quantum(session_slot **dec, int n, session_slot 
 
     const size_t reqcap = (size_t)PULSAR_SESSION_POOL_CAP + (size_t)kstep;
     pulsar_multiseq_req *reqs = (pulsar_multiseq_req *)server_xmalloc(reqcap * sizeof(*reqs));
-    /* Persistent, like the spec lane's: see the lane_logits note in the header. */
-    if (!s->lane_logits)
-        s->lane_logits = (float *)server_xmalloc(
-                (size_t)(PULSAR_SESSION_POOL_CAP + 1) * (size_t)vocab * sizeof(float));
-    float *logits = s->lane_logits;
-    /* last-position (len-1) logits captured from the final fused prefill run — the
-     * decode seed for the prefill->decode handoff (byte-identical to classic per
-     * the inc-4 gate: the fused run's last-of-run logits match classic-resume). */
-    float *pf_last_logits = (float *)server_xmalloc((size_t)vocab * sizeof(float));
     int live_idx[PULSAR_SESSION_POOL_CAP];
 
     for (int step = 0; step < PULSAR_SERVER_DECODE_QUANTUM_TOKENS; step++) {
@@ -3370,8 +3380,8 @@ void server::worker_mixed_batch_quantum(session_slot **dec, int n, session_slot 
         uint32_t n_runs = 0;
         /* LEVER 1: the head cap is mixed_head_cap's (see it). */
         const uint32_t head_cap = mixed_head_cap(kthis, m, pos_now, len);
-        int rc = pulsar_session_decode_mixed(pool, reqs, (uint32_t)nrows, logits,
-                (int)((size_t)(m + (kthis > 0 ? 1 : 0)) * (size_t)vocab), &n_runs, head_cap, err, sizeof err);
+        int rc = pulsar_session_decode_mixed(pool, reqs, (uint32_t)nrows, NULL, 0, &n_runs, head_cap, err,
+                                             sizeof err);
         const int verdict = mixed_prefill_giveup(rc, kthis, m);
         if (verdict != MIXED_PROCEED) {
             /* RECOVERABLE reject charged to the PREFILL run (see
@@ -3382,8 +3392,7 @@ void server::worker_mixed_batch_quantum(session_slot **dec, int n, session_slot 
                        "pulsar-server: fused prefill rejected (%s): this prefill runs classic "
                        "from now on; the %d decode bank(s) retry this step alone", err, m);
             if (verdict == MIXED_GIVEUP_RETRY_DECODE) {
-                rc = pulsar_session_decode_mixed(pool, reqs, (uint32_t)m, logits,
-                        (int)((size_t)m * (size_t)vocab), &n_runs, 0u, err, sizeof err);
+                rc = pulsar_session_decode_mixed(pool, reqs, (uint32_t)m, NULL, 0, &n_runs, 0u, err, sizeof err);
             } else { s->live_bank = -1; break; }   /* only prefill this step: just stop */
             kthis = 0;                              /* prefill did not advance */
         }
@@ -3409,34 +3418,17 @@ void server::worker_mixed_batch_quantum(session_slot **dec, int n, session_slot 
             pf->prefill_counted = pos_now + kthis;
         }
         if (kthis > 0 && pos_now + kthis == len) {
-            /* final prefill sub-chunk: capture the len-1 logits (prefill run row =
-             * index m, last-of-run) as the decode seed for the handoff. */
-            memcpy(pf_last_logits, logits + (size_t)m * (size_t)vocab, (size_t)vocab * sizeof(float));
+            /* final prefill sub-chunk: the len-1 row (the prefill run's, headed row m, last-of-run) becomes the
+             * prefill bank's next-token row -- the decode seed for the handoff, on the device (L302) */
+            if (pulsar_session_step_row_to_bank(pool, (uint32_t)m, (uint32_t)pf->bank) != 0) {
+                snprintf(pg->err, sizeof pg->err, "prefill bank %u: its last row could not be kept", (unsigned)pf->bank);
+                pg->finish = "error"; pg->phase = GEN_FINISH;
+                break;
+            }
             reached_end = true;
         }
 
-        for (int q = 0; q < m; q++) {
-            session_slot *sl = dec[live_idx[q]];
-            gen_state *g = sl->gen;
-            const int committed = g->batch_feed_token;
-            g->batch_feed_pos++; sl->committed_pos = g->batch_feed_pos;
-            sl->tokens_emitted++;   /* L118: classic-loop accounting parity */
-            pulsar_tokens_push(&g->batch_pending, committed);
-            if (g->first_token_t == 0.0) g->first_token_t = server_now_sec();
-            slot_writer_install(&g->writer);
-            if (s->gen_emit_token(sl, committed)) {
-                g->batch_feed_valid = false; g->phase = GEN_FINISH; continue;
-            }
-            float *row = logits + (size_t)q * (size_t)vocab;
-            float temp, top_p, min_p; int top_k;
-            gen_resolve_sampling_decode(g, &temp, &top_k, &top_p, &min_p);
-            g->batch_feed_token = gen_constrain_draw(s, g, row, vocab, temp, top_k, top_p, min_p);   /* L303 */
-            if (g->batch_feed_token < 0) {
-                g->finish = "error"; g->batch_feed_valid = false; g->phase = GEN_FINISH;
-                continue;
-            }
-            logprob_capture_row(&g->logprobs, row, vocab, g->batch_feed_token);
-        }
+        lane_emit_and_draw(s, dec, live_idx, m, pool);
     }
     free(reqs);
 
@@ -3453,12 +3445,10 @@ void server::worker_mixed_batch_quantum(session_slot **dec, int n, session_slot 
             pf->committed_pos = P0 + pf_done;
             s->live_bank = (int)pf->bank;
             if (reached_end) {
-                /* Prefill complete: seed the decode with the fused last-position
-                 * logits (byte-identical to classic) and run the SAME prefill->
-                 * decode handoff the classic path uses (kv-cache store, SSE start,
-                 * GEN_DECODE_INIT). No non-aligned classic tail resume => the
-                 * request's decode is byte-identical to a cold classic prefill. */
-                pulsar_session_set_logits(pool, pf_last_logits, vocab);
+                /* Prefill complete: the restore above installed the fused last-position row (kept for the
+                 * bank at the final sub-chunk; byte-identical to classic) -- run the SAME prefill->decode
+                 * handoff the classic path uses (kv-cache store, SSE start, GEN_DECODE_INIT). No non-aligned
+                 * classic tail resume => the request's decode is byte-identical to a cold classic prefill. */
                 slot_writer_install(&pg->writer);
                 s->gen_stream_begin(pf);
                 slot_writer_flush(&pg->writer);
@@ -3468,7 +3458,6 @@ void server::worker_mixed_batch_quantum(session_slot **dec, int n, session_slot 
             pg->finish = "error"; pg->phase = GEN_FINISH;
         }
     }
-    free(pf_last_logits);
 
     const uint64_t now_us = (uint64_t)(server_now_sec() * 1e6);
     for (int i = 0; i < n; i++) {

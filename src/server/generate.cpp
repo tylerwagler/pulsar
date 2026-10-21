@@ -72,20 +72,19 @@ void logprob_capture_session(logprob_ledger *lg, pulsar_session *sess, int token
 
 
 
-/* Capture from ONE row of a batched decode step.  Those entries return a row
- * per bank and leave the session's logits untouched by contract, so the row the
- * host sampler read is the only correct source here. */
-void logprob_capture_row(logprob_ledger *lg, const float *logits, int n_vocab, int token) {
+/* Capture from ONE row of a batched decode step: its headed row `row`, on the device (L302).  Those entries leave
+ * the session's live row untouched by contract, so the row the draw read is the only correct source here. */
+void logprob_capture_row(logprob_ledger *lg, pulsar_session *sess, uint32_t row, int token) {
     if (!lg || !lg->enabled) return;
     pulsar_token_score chosen;
-    lg->pending_logprob = pulsar_logits_token_logprob(logits, n_vocab, token, &chosen)
-                              ? chosen.logprob : -INFINITY;
-    lg->pending_n_top = lg->top_k > 0
-                            ? logprob_trim(lg->pending_top,
-                                           pulsar_logits_top_logprobs(logits, n_vocab,
-                                                                   lg->pending_top,
-                                                                   lg->top_k))
-                            : 0;
+    int have = 0, n_top = 0;
+    const int k = lg->top_k > 0 ? lg->top_k : 0;
+    if (pulsar_session_step_row_logprobs(sess, row, token, &chosen, &have, k ? lg->pending_top : NULL, k, &n_top) != 0) {
+        have = 0;
+        n_top = 0;
+    }
+    lg->pending_logprob = have ? chosen.logprob : -INFINITY;
+    lg->pending_n_top = k ? logprob_trim(lg->pending_top, n_top) : 0;
     lg->pending_valid = true;
 }
 

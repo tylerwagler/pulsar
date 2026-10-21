@@ -421,7 +421,6 @@ struct constrain_gate {
     std::vector<constrain_rec> hist;
     std::vector<uint32_t> rows;   /* a round's masks */
     std::vector<uint32_t> one;    /* a single draw's mask */
-    std::vector<float> scratch;   /* a plain draw's masked copy of its row */
     int live_accepts = 0;         /* emitted tokens a live region took (the failure injection's count) */
     char err[200];
     ~constrain_gate() {
@@ -614,22 +613,6 @@ bool gen_constrain_mask(server *, gen_state *g, uint32_t *row) {
         return false;
     }
     return true;
-}
-
-int gen_constrain_draw(server *s, gen_state *g, const float *logits, int width, float temp, int top_k, float top_p,
-                       float min_p) {
-    const float *row = logits;
-    if (gen_constrain_live(g)) {
-        constrain_gate *gt = g->gate;
-        gt->one.resize(gt->words);
-        if (!gen_constrain_mask(s, g, gt->one.data())) return -1;
-        gt->scratch.assign(logits, logits + width);
-        pulsar_token_mask_apply(gt->scratch.data(), (uint32_t)width, gt->one.data());
-        row = gt->scratch.data();
-    }
-    const int tok = pulsar_sample_logits(row, width, temp, top_k, top_p, min_p, &g->rng);
-    if (tok < 0) snprintf(g->err, sizeof g->err, "sampler refused a degenerate logits row (L188)");
-    return tok;
 }
 
 bool gen_constrain_accept(server *s, gen_state *g, int token) {

@@ -442,7 +442,7 @@ static bool gpu_graph_prefill_layer_major_inner(
         const token_vec       *prompt,
         uint32_t               start,
         uint32_t               n_tokens,
-        float                 *logits,
+        pulsar_gpu_tensor     *head_out,
         bool                   show_progress,
         pulsar_imatrix_collector *imatrix,
         pulsar_session_progress_fn display_progress,
@@ -455,7 +455,7 @@ bool gpu_graph_prefill_layer_major(
         const token_vec       *prompt,
         uint32_t               start,
         uint32_t               n_tokens,
-        float                 *logits,
+        pulsar_gpu_tensor     *head_out,
         bool                   show_progress,
         pulsar_imatrix_collector *imatrix,
         pulsar_session_progress_fn display_progress,
@@ -470,7 +470,7 @@ bool gpu_graph_prefill_layer_major(
      * norm stores them only while this is set. */
     g->imatrix_f32_rows = imatrix != NULL;
     const bool ok = gpu_graph_prefill_layer_major_inner(g, model, weights, prompt,
-                                                        start, n_tokens, logits,
+                                                        start, n_tokens, head_out,
                                                         show_progress, imatrix,
                                                         display_progress,
                                                         display_progress_ud);
@@ -486,7 +486,7 @@ static bool gpu_graph_prefill_layer_major_inner(
         const token_vec       *prompt,
         uint32_t               start,
         uint32_t               n_tokens,
-        float                 *logits,
+        pulsar_gpu_tensor     *head_out,
         bool                   show_progress,
         pulsar_imatrix_collector *imatrix,
         pulsar_session_progress_fn display_progress,
@@ -556,9 +556,9 @@ static bool gpu_graph_prefill_layer_major_inner(
 
         /* the head reads the last row of the sweep-final stream and the pre
          * its last FFN handed on, both by row */
-        if (ok && logits) {
+        if (ok && head_out) {   /* L302: the head writes the caller's device row; nothing comes back */
             ok = gpu_graph_encode_output_head_row_tp(g, model, weights,
-                                                     (uint32_t)n_tokens - 1u, g->logits);
+                                                     (uint32_t)n_tokens - 1u, head_out);
         }
 
         if (ok) ok = pulsar_gpu_end_commands() != 0;
@@ -569,9 +569,6 @@ static bool gpu_graph_prefill_layer_major_inner(
             return false;
         }
 
-        if (logits) {
-            ok = pulsar_gpu_tensor_read(g->logits, 0, logits, (uint64_t)PULSAR_N_VOCAB * sizeof(float)) != 0;
-        }
         return ok;
     }
 
@@ -669,15 +666,10 @@ static bool gpu_graph_prefill_layer_major_inner(
         if (!ok) return false;
     }
 
-    if (ok && logits) ok = pulsar_gpu_begin_commands() != 0;
-    if (ok && logits) ok = gpu_graph_encode_output_head_row_tp(g, model, weights,
-                                                               (uint32_t)n_tokens - 1u, g->logits);
-    if (ok && logits) ok = pulsar_gpu_end_commands() != 0;
-    if (!ok) return false;
-
-    if (logits) {
-        ok = pulsar_gpu_tensor_read(g->logits, 0, logits, (uint64_t)PULSAR_N_VOCAB * sizeof(float)) != 0;
-    }
+    if (ok && head_out) ok = pulsar_gpu_begin_commands() != 0;
+    if (ok && head_out) ok = gpu_graph_encode_output_head_row_tp(g, model, weights,
+                                                                 (uint32_t)n_tokens - 1u, head_out);
+    if (ok && head_out) ok = pulsar_gpu_end_commands() != 0;
     return ok;
 }
 
@@ -702,19 +694,19 @@ pulsar_prefill_shape gpu_graph_prefill_shape(const pulsar_gpu_graph *g) {
 }
 
 /* The range prefill as the walk's hooks: the chunk (gpu_graph_prefill_layer_major, the last one headed into
- * `logits`), the landing (the shared capture rule).  No view, no progress, no stop. */
+ * `head_out`), the landing (the shared capture rule).  No view, no progress, no stop. */
 struct ds4_range {
     pulsar_gpu_graph *g;
     const pulsar_model *model;
     const pulsar_weights *weights;
     const token_vec *prompt;
-    float *logits;
+    pulsar_gpu_tensor *head_out;
     pulsar_imatrix_collector *imatrix;
 };
 
 static bool ds4_range_chunk(void *ud, uint32_t pos0, uint32_t rows, bool last) {
     const ds4_range *r = (const ds4_range *)ud;
-    if (gpu_graph_prefill_layer_major(r->g, r->model, r->weights, r->prompt, pos0, rows, last ? r->logits : NULL,
+    if (gpu_graph_prefill_layer_major(r->g, r->model, r->weights, r->prompt, pos0, rows, last ? r->head_out : NULL,
                                       false, r->imatrix, NULL, NULL))
         return true;
     if (pulsar_gpu_synchronize() == 0) fprintf(stderr, "pulsar: GPU synchronize after chunked prefill failure also failed\n");
@@ -727,8 +719,8 @@ static bool ds4_range_landed(void *ud, uint32_t chunk_end) {
 }
 
 bool gpu_graph_prefill_chunked_range(pulsar_gpu_graph *g, const pulsar_model *model, const pulsar_weights *weights,
-                                     const token_vec *prompt, uint32_t start, uint32_t n_tokens, float *logits,
-                                     pulsar_imatrix_collector *imatrix) {
+                                     const token_vec *prompt, uint32_t start, uint32_t n_tokens,
+                                     pulsar_gpu_tensor *head_out, pulsar_imatrix_collector *imatrix) {
     if (n_tokens == 0 || g->prefill_cap == 0 || start > (uint32_t)prompt->len ||
         n_tokens > (uint32_t)prompt->len - start)
         return false;
@@ -736,45 +728,36 @@ bool gpu_graph_prefill_chunked_range(pulsar_gpu_graph *g, const pulsar_model *mo
     pulsar_prefill_plan plan;
     pulsar_prefill_plan_init(&plan, &shape, start, &g->ckpt, NULL, prompt, NULL, 0);
     if (plan.chunk_cap == 0) return false;
-    ds4_range r = { g, model, weights, prompt, logits, imatrix };
+    ds4_range r = { g, model, weights, prompt, head_out, imatrix };
     const pulsar_prefill_walk w = { &plan, ds4_range_chunk, ds4_range_landed, NULL, &r };
     return pulsar_prefill_walk_run(&w, start, start + n_tokens) == 0;
 }
 
 
 
-/* Layer-major speculative target verifier for tiny draft suffixes.
- *
- * This is the first production-shaped verifier attempt: unlike repeated decode
- * it runs the target model layer-by-layer for the whole speculative suffix, and
- * unlike the diagnostic path it does not read back full logits for every row.
- * The verifier returns the row top-1 ids needed for acceptance.  The caller
- * then reads exactly one logits row: the row that becomes the new continuation
- * state.  It still reuses the existing batch layer kernels, so it is not yet
- * the final hand-written N=2/N=4 decode microbatch, but it exercises the right
- * verifier contract and removes the obvious diagnostic overheads first. */
-bool gpu_graph_verify_suffix_tops(
+/* The single lane's speculative verify (DeepSeek): the target layer-major over the round's rows [start, start +
+ * n_tokens) of `prompt` -- the base token and the drafts under test -- every row headed into spec_logits, where the
+ * session's walk reads them on the device (L302).  Nothing is read back. */
+bool gpu_graph_verify_suffix(
         pulsar_gpu_graph *g,
         const pulsar_model       *model,
         const pulsar_weights     *weights,
         const token_vec       *prompt,
         uint32_t               start,
-        uint32_t               n_tokens,
-        int                   *row_tops,
-        float                 *row_logits) {
-    /* spec_logits holds PULSAR_SPEC_LOGITS_ROWS rows, not prefill_cap: the slab
-     * cap was previously asserted only in prose, and a deeper request failed at
-     * the read bounds with a generic error instead of here. */
+        uint32_t               n_tokens) {
+    /* spec_logits holds PULSAR_SPEC_LOGITS_ROWS rows, not prefill_cap */
     if (n_tokens == 0 || n_tokens > g->prefill_cap ||
         n_tokens > PULSAR_SPEC_LOGITS_ROWS || !g->spec_logits) return false;
     if (start > (uint32_t)prompt->len || n_tokens > (uint32_t)prompt->len - start) return false;
-    const uint32_t top_rows = n_tokens > 1 ? n_tokens - 1 : 0;
-    if (top_rows && !row_tops) return false;
     /* The verify block's rows are DECODE rows (the continuation token and the
      * drafts under test): every GEMM and MoE tier below takes the
      * M-independent arms whatever n_tokens is (L167; until then row count
-     * chose, so a 5..16-row block took cuBLASLt).  Restored on return. */
-    pulsar_decode_rows_scope rows(n_tokens);
+     * chose, so a 5..16-row block took cuBLASLt).  Restored on return.  The
+     * cap is the verify slab's, as the batched verify's (gpu_diag.cpp): since
+     * L288 C1 a round carries up to 32 rows -- a copy round's 16 drafts and
+     * its base are 17 -- and past 16 the decode arms block them (step_driver.h
+     * PULSAR_DRIVER_HEADS_MAX).  The 16-row default refused that round. */
+    pulsar_decode_rows_scope rows(n_tokens, PULSAR_SPEC_LOGITS_ROWS);
     if (!rows.ok()) return false;
 
     bool ok = gpu_graph_upload_prompt_tokens(g->prefill_tokens, prompt, start, n_tokens);
@@ -787,77 +770,12 @@ bool gpu_graph_verify_suffix_tops(
     }
     if (!ok) return false;
 
-
     ok = pulsar_gpu_begin_commands() != 0;
-    for (uint32_t il = 0; ok && il < PULSAR_N_LAYER; il++) {
-        ok = gpu_graph_encode_layer_batch(g,
-                                            model,
-                                            &weights->layer[il],
-                                            il,
-                                            start,
-                                            n_tokens);
-    }
-    if (ok) {
-        ok = pulsar_gpu_end_commands() != 0;
-    } else {
-        (void)pulsar_gpu_synchronize();
-    }
-    if (!ok) return false;
-
-    ok = pulsar_gpu_begin_commands() != 0;
-    if (ok) ok = gpu_graph_encode_output_head_batch_tp(g,
-                                                      model,
-                                                      weights,
-                                                      0u,
-                                                      n_tokens,
-                                                      g->spec_logits);
-    if (ok) {
-        if (top_rows == 1) {
-            /* Common K=2 verify case: top_k=1 over n_vocab → use the dedicated
-             * argmax kernel (single-block tree-reduce) instead of the legacy
-             * indexer_topk_kernel's single-thread O(n_vocab * top_k) fall-through. */
-            ok = pulsar_gpu_argmax_tensor(g->comp_selected,
-                                       g->spec_logits,
-                                       PULSAR_N_VOCAB) != 0;
-        } else if (top_rows) {
-            /* top-1 of each of the top_rows rows. The legacy
-             * indexer_topk_tensor fall-through for this shape launches ONE
-             * THREAD per row scanning the whole vocab (~14ms at 4 rows);
-             * per-row argmax launches (1024-thread tree-reduce each) do the
-             * same job in <1ms and write the same [top_rows] i32 layout. */
-            for (uint32_t r = 0; ok && r < top_rows; r++) {
-                pulsar_gpu_tensor *row = pulsar_gpu_tensor_view(
-                        g->spec_logits,
-                        (uint64_t)r * PULSAR_N_VOCAB * sizeof(float),
-                        (uint64_t)PULSAR_N_VOCAB * sizeof(float));
-                pulsar_gpu_tensor *dst = pulsar_gpu_tensor_view(
-                        g->comp_selected,
-                        (uint64_t)r * sizeof(int32_t),
-                        sizeof(int32_t));
-                ok = row && dst &&
-                     pulsar_gpu_argmax_tensor(dst, row, PULSAR_N_VOCAB) != 0;
-                pulsar_gpu_tensor_free(row);
-                pulsar_gpu_tensor_free(dst);
-            }
-        }
-    }
-    if (ok) {
-        ok = pulsar_gpu_end_commands() != 0;
-    } else {
-        (void)pulsar_gpu_synchronize();
-    }
-    if (ok && top_rows) {
-        ok = pulsar_gpu_tensor_read(g->comp_selected,
-                                   0,
-                                   row_tops,
-                                   (uint64_t)top_rows * sizeof(row_tops[0])) != 0;
-    }
-    if (ok && row_logits) {
-        ok = pulsar_gpu_tensor_read(g->spec_logits,
-                                   0,
-                                   row_logits,
-                                   (uint64_t)n_tokens * PULSAR_N_VOCAB * sizeof(row_logits[0])) != 0;
-    }
+    for (uint32_t il = 0; ok && il < PULSAR_N_LAYER; il++)
+        ok = gpu_graph_encode_layer_batch(g, model, &weights->layer[il], il, start, n_tokens);
+    if (ok) ok = gpu_graph_encode_output_head_batch_tp(g, model, weights, 0u, n_tokens, g->spec_logits);
+    if (ok) ok = pulsar_gpu_end_commands() != 0;
+    else (void)pulsar_gpu_synchronize();
     return ok;
 }
 
@@ -866,7 +784,7 @@ bool gpu_graph_verify_suffix_tops(
 /* Tier-2 batched multi-session decode step: one current token per live bank
  * through ONE weight sweep (this is where the N-fold aggregate decode win
  * comes from — decode is weight-bandwidth-bound, and the batch reads the
- * weights once for all rows).  Structure mirrors gpu_graph_verify_suffix_tops
+ * weights once for all rows).  Structure mirrors gpu_graph_verify_suffix
  * (upload -> layer sweep -> output head -> readback), but the rows are
  * independent sessions at unrelated positions rather than one session's
  * speculative suffix, so the sweep runs armed as a banked multiseq step
@@ -922,7 +840,7 @@ int gpu_graph_decode_multiseq_batch(
      * enforced per-row in step_begin (seq[t] >= PULSAR_MSEQ_MAX). The pool-count
      * clause below is the bank ceiling; do NOT reinstate an n_active>PULSAR_MSEQ_MAX
      * row ceiling. */
-    if (!g || !model || !weights || !tokens || !pos || !bank || !logits ||
+    if (!g || !model || !weights || !tokens || !pos || !bank ||
         n_active == 0 ||
         n_active > gpu_graph_bank_pool_count(g) * g->prefill_cap ||
         n_active > g->prefill_cap || !g->spec_logits) {
@@ -1128,42 +1046,11 @@ int gpu_graph_decode_multiseq_batch(
      * bank[k]. */
     if (out_n_rows) *out_n_rows = head_runs;
     if (fused) head_runs = fused_read_dec;
-    if (head_all_rows && g->spec_argmax_armed) {
-        /* L219: every round in this step is greedy, so the walk consults only
-         * each row's argmax.  Run the per-row argmax on device (the same
-         * readback the fused lane and the classic verify use) and read ints
-         * instead of head_runs x 517 KB.  Greedy and compact are mutually
-         * exclusive by temperature; a device failure refuses rather than
-         * falling back to the full read (L174).
-         * The compact rows from an EARLIER compact step must be retired here:
-         * spec_round_end_block tests spec_compact_rows first, so a stale value
-         * would make the greedy walk read the previous step's candidates
-         * (review of 4fa5e0b6).  Mirror of the compact branch retiring
-         * spec_argmax_rows. */
-        g->spec_compact_rows = 0;
-        ok = gpu_graph_spec_argmax_read(g, 0u, head_runs);
-        if (!ok)
-            fprintf(stderr, "pulsar: spec argmax readback failed for %u rows -- refusing "
-                            "(no full-row readback fallback; L174)\n", head_runs);
-    } else if (head_all_rows && g->spec_compact_armed) {
-        /* L149 phase 2: every round in this step is in the sparse min-p
-         * contract -- read the prefilter's compact block (16 KB/row) instead of
-         * the 517 KB rows; the caller's `logits` block is left untouched and
-         * the accept walk builds from candidates.  A failed compact read used to
-         * fall to the full readback silently -- a device error read as a slower
-         * path (L174). */
-        g->spec_argmax_rows = 0;
-        ok = gpu_graph_spec_compact_read(g, 0u, head_runs);
-        if (!ok)
-            fprintf(stderr, "pulsar: spec compact readback failed for %u rows -- refusing "
-                            "(no full-row readback fallback; L174)\n", head_runs);
-    } else {
-        g->spec_compact_rows = 0;
-        g->spec_argmax_rows = 0;
-        ok = pulsar_gpu_tensor_read(g->spec_logits, 0, logits,
-                                 (uint64_t)head_runs * PULSAR_N_VOCAB * sizeof(float)) != 0;
-    }
-    if (ok && fused && fused_heads > 0)
+    /* L302: the rows stay in spec_logits (the session's step rows); a caller that wants them on the host passes
+     * `logits` */
+    if (logits)
+        ok = pulsar_gpu_tensor_read(g->spec_logits, 0, logits, (uint64_t)head_runs * PULSAR_N_VOCAB * sizeof(float)) != 0;
+    if (ok && logits && fused && fused_heads > 0)
         ok = pulsar_gpu_tensor_read(g->spec_logits, (uint64_t)fused->n_dec * PULSAR_N_VOCAB * sizeof(float),
                                     logits + (size_t)fused->n_dec * PULSAR_N_VOCAB,
                                     (uint64_t)fused_heads * PULSAR_N_VOCAB * sizeof(float)) != 0;
@@ -1172,65 +1059,6 @@ int gpu_graph_decode_multiseq_batch(
      * which desynchronizes its sampling from the committed KV — treat as
      * fatal rather than guess. */
     return ok ? 1 : -1;
-}
-
-
-
-bool gpu_graph_spec_compact_read(pulsar_gpu_graph *g, uint32_t row0, uint32_t n_rows) {
-    g->spec_compact_rows = 0;
-    if (!g || !g->spec_logits || !g->spec_compact_host || !g->dspark_prefilter_sel ||
-        n_rows == 0 || row0 + n_rows > PULSAR_SPEC_LOGITS_ROWS)
-        return false;
-    const uint64_t row_i32 = PULSAR_DSPARK_PREFILTER_ROW_I32;
-    if (!pulsar_gpu_minp_prefilter_rows(g->dspark_prefilter_sel, g->spec_logits,
-                                        (uint64_t)row0 * PULSAR_N_VOCAB * sizeof(float),
-                                        n_rows, PULSAR_N_VOCAB, PULSAR_N_VOCAB,
-                                        g->spec_compact_delta, PULSAR_DSPARK_PREFILTER_CAP))
-        return false;
-    if (!pulsar_gpu_tensor_read(g->dspark_prefilter_sel, 0,
-                                g->spec_compact_host + (size_t)row0 * row_i32,
-                                (uint64_t)n_rows * row_i32 * sizeof(int32_t)))
-        return false;
-    g->spec_compact_rows = row0 + n_rows;
-    return true;
-}
-
-bool gpu_graph_spec_argmax_read(pulsar_gpu_graph *g, uint32_t row0, uint32_t n_rows) {
-    g->spec_argmax_rows = 0;
-    if (!g || !g->spec_logits || !g->spec_argmax_host || !g->comp_selected ||
-        n_rows == 0 || row0 + n_rows > PULSAR_SPEC_LOGITS_ROWS)
-        return false;
-    bool ok = pulsar_gpu_begin_commands() != 0;
-    for (uint32_t r = 0; ok && r < n_rows; r++) {
-        /* Per-row views, exactly the classic verify's readback shape. */
-        pulsar_gpu_tensor *row = pulsar_gpu_tensor_view(
-                g->spec_logits,
-                (uint64_t)(row0 + r) * PULSAR_N_VOCAB * sizeof(float),
-                (uint64_t)PULSAR_N_VOCAB * sizeof(float));
-        pulsar_gpu_tensor *dst = pulsar_gpu_tensor_view(
-                g->comp_selected,
-                (uint64_t)r * sizeof(int32_t), sizeof(int32_t));
-        ok = row && dst && pulsar_gpu_argmax_tensor(dst, row, PULSAR_N_VOCAB) != 0;
-        pulsar_gpu_tensor_free(row);
-        pulsar_gpu_tensor_free(dst);
-    }
-    if (ok) ok = pulsar_gpu_end_commands() != 0;
-    else (void)pulsar_gpu_synchronize();
-    if (ok)
-        ok = pulsar_gpu_tensor_read(g->comp_selected, 0, g->spec_argmax_host,
-                                    (uint64_t)n_rows * sizeof(int32_t)) != 0;
-    if (!ok) return false;
-    g->spec_argmax_rows = row0 + n_rows;
-    return true;
-}
-
-bool gpu_graph_read_spec_logits_row(pulsar_gpu_graph *g, uint32_t row, float *logits) {
-    if (!g || !g->spec_logits || !logits || row >= PULSAR_SPEC_LOGITS_ROWS) return false;
-    const uint64_t row_bytes = (uint64_t)PULSAR_N_VOCAB * sizeof(float);
-    return pulsar_gpu_tensor_read(g->spec_logits,
-                                 (uint64_t)row * row_bytes,
-                                 logits,
-                                 row_bytes) != 0;
 }
 
 

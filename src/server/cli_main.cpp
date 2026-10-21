@@ -303,10 +303,6 @@ void server::close_resources() {
     delete s->token_bytes;
     s->token_bytes = NULL;
     s->sess = NULL;
-    free(s->spec_lane_logits);
-    s->spec_lane_logits = NULL;
-    free(s->lane_logits);
-    s->lane_logits = NULL;
     pulsar_engine_close(s->engine);
     memset(s, 0, sizeof(*s));
 }

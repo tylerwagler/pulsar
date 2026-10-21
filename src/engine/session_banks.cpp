@@ -31,7 +31,6 @@ void pulsar_bank_carry::free_one() {
     auto *c = this;
     if (!c) return;
     token_vec_free(&c->checkpoint);
-    free(c->logits);
     memset(c, 0, sizeof(*c));
 }
 
@@ -87,9 +86,8 @@ void pulsar_bank_carry_save_view(pulsar_session *s, uint32_t bank) {
     pulsar_bank_carry *c = &s->bank_carry[bank];
     /* heap-backed deep copies */
     pulsar_tokens_copy(&c->checkpoint, &s->checkpoint);
-    const size_t nv = (size_t)s->engine->logits_width();
-    if (!c->logits) c->logits = (float *)xmalloc(nv * sizeof(float));
-    memcpy(c->logits, s->logits, nv * sizeof(float));
+    /* L302: the bank's live row stays on the device, in its row of dev.bank_rows */
+    if (!s->live_save_bank(bank)) fprintf(stderr, "pulsar: bank %u: its live row could not be saved\n", bank);
     /* scalar mirrors */
     c->checkpoint_valid       = s->checkpoint_valid;
     c->logits_stale           = s->logits_stale;
@@ -127,7 +125,7 @@ bool pulsar_bank_carry_restore_view(pulsar_session *s, uint32_t bank) {
     if (!s || !s->bank_carry || bank >= s->bank_carry_n || !s->bank_carry[bank].valid) return false;
     const pulsar_bank_carry *c = &s->bank_carry[bank];
     pulsar_tokens_copy(&s->checkpoint, &c->checkpoint);
-    memcpy(s->logits, c->logits, (size_t)s->engine->logits_width() * sizeof(float));
+    if (!s->live_restore_bank(bank)) return false;
     s->checkpoint_valid       = c->checkpoint_valid;
     s->logits_stale           = c->logits_stale;
     s->prefill_frontier       = c->prefill_frontier;   /* L195 */
@@ -174,9 +172,9 @@ const pulsar_tokens *pulsar_bank_history(pulsar_session *s, uint32_t bank) {
 int pulsar_session::note_prefilled(const int *toks, int n, int head) {
     auto *s = this;
     if (!toks || n <= 0) return 1;
-    if (head >= 0 && (!s->fused_logits || (uint32_t)head >= s->fused_heads)) {
+    if (head >= 0 && (!s->fused_valid || (uint32_t)head >= s->fused_heads)) {
         fprintf(stderr, "pulsar: note_prefilled: head row %d of a fused step that headed %u -- refusing\n",
-                head, s->fused_logits ? s->fused_heads : 0u);
+                head, s->fused_valid ? s->fused_heads : 0u);
         return 1;
     }
     pulsar_ckpt_store *ck = pulsar_session_kv_store(s);
@@ -197,8 +195,8 @@ int pulsar_session::note_prefilled(const int *toks, int n, int head) {
     s->checkpoint_valid = true;
     s->prefill_frontier = s->checkpoint.len;   /* L195: a prefill wrote up to here */
     if (head >= 0) {
-        const size_t w = (size_t)s->engine->logits_width();
-        memcpy(s->logits, s->fused_logits + (size_t)(s->fused_n_dec + (uint32_t)head) * w, w * sizeof(s->logits[0]));
+        /* the step's rows are still the session's (L302: nothing ran since the fused step) */
+        if (!s->live_from_rows(s->dev.step_rows, s->fused_n_dec + (uint32_t)head)) return 1;
         s->logits_stale = false;   /* the next-token row of the history, as a sync's last chunk leaves it */
     }
     return 0;

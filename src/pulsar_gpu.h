@@ -126,8 +126,8 @@
  * above (server_sched.cpp fits draft depths to it, session_multiseq.cpp's ALL_ROWS
  * head refuses above it); a plain PULSAR_MSEQ_MAX-row step must fit
  * (static_assert PULSAR_MSEQ_MAX <= PULSAR_SPEC_LOGITS_ROWS, imatrix.cpp).
- * spec_logits, dspark_prefilter_sel, dspark_row_meta and spec_compact_host
- * are all sized by this one constant (gpu_diag.cpp) -- guards on row indices
+ * spec_logits and dspark_row_meta
+ * are sized by this one constant (gpu_diag.cpp) -- guards on row indices
  * must check against THIS, or the number lives only in a comment. */
 #define PULSAR_SPEC_LOGITS_ROWS 32u   /* L117 2026-08-27: 16 -> 32. The 16-row
  * ceiling squeezed per-bank draft depth at c3+ (c4: K~3 vs solo K~8, the
@@ -254,6 +254,16 @@ void pulsar_gpu_batched_copy_free(void *handle);
 int pulsar_gpu_begin_commands(void);
 int pulsar_gpu_end_commands(void);
 int pulsar_gpu_synchronize(void);
+/** L302: the host<->device synchronisations the process has paid, by kind (monotonic; every blocking copy and every
+ *  drain counts once) -- what the sync-budget gate (tests/sync_budget_gate.cpp) holds a round of each lane to. */
+typedef struct pulsar_gpu_sync_stats {
+    uint64_t stream_syncs;   ///< pulsar_gpu_end_commands: the stream drained
+    uint64_t device_syncs;   ///< pulsar_gpu_synchronize
+    uint64_t d2h;            ///< blocking device -> host copies (tensor reads, the step-end flag reads)
+    uint64_t d2h_bytes;
+    uint64_t h2d;            ///< blocking host -> device copies (tensor writes, flag clears)
+} pulsar_gpu_sync_stats;
+void pulsar_gpu_sync_stats_get(pulsar_gpu_sync_stats *out);
 /** Record a completion marker on the per-thread stream (L142).  Returns a
  *  handle, or -1 if the runtime could not record one; pulsar_gpu_marker_done
  *  reports a -1 handle as complete, so a poller never stalls on it. */
@@ -2389,28 +2399,140 @@ int pulsar_gpu_hc_expand_add_split_tensor(
         uint32_t                n_embd,
         uint32_t                n_hc);
 
-/** L149: min-p candidate prefilter over F32 logits rows. For each of n_rows
- * rows (row r at logits + logits_offset_bytes + r*row_stride_elems floats,
- * n_vocab wide) writes to out row r (int32, stride 3 + 2*cap):
- *   [0] count of finite logits v with v >= max + delta (ALL of them counted,
- *       even past cap), [1] id of the row max (first finite maximum, lowest id
- *       on ties -- matches the host scan), [2] the max logit's float bits,
- *   [3 .. 3+cap) the candidate ids in ascending id order,
- *   [3+cap .. 3+2cap) their logits as float bits, same order.
- * When count > cap the candidate arrays are not written. A row with no finite
- * logit reports count 0. `delta` is the caller's floor below the max in logit
- * units (T * ln(min_p) minus a margin); the compare is a single float add
- * and compare, reproducible on the host. Non-blocking; runs on the engine
- * stream. Returns 0 on bad arguments or launch failure. */
-int pulsar_gpu_minp_prefilter_rows(
-        pulsar_gpu_tensor       *out,
-        const pulsar_gpu_tensor *logits,
-        uint64_t                logits_offset_bytes,
-        uint32_t                n_rows,
-        uint32_t                row_stride_elems,
-        uint32_t                n_vocab,
-        float                   delta,
-        uint32_t                cap);
+/* ---- L302: THE sampler, on the device (pulsar_cuda_sampler.cu has the rule) ------------------------------------ */
+
+/** Rows one sampler launch takes: a verify's PULSAR_SPEC_ROW_BUDGET rows plus a full accept's carry row. */
+#define PULSAR_GPU_SAMPLE_ROWS_MAX 33u
+/** Global scratch slots for rows whose candidate set outgrows the row kernel's shared store. */
+#define PULSAR_GPU_SAMPLE_SLOTS 4u
+/** A row with no mask (pulsar_gpu_sample_req::mask_row). */
+#define PULSAR_GPU_SAMPLE_NO_MASK 0xffffffffu
+/** pulsar_gpu_sample_req::flags: draw this row's argmax whatever its temperature (L296 toolsample positions). */
+#define PULSAR_GPU_SAMPLE_GREEDY 1u
+
+/** A row's status: OK, or why no token was drawn (the host sampler's three refusals). */
+enum {
+    PULSAR_GPU_SAMPLE_OK = 0,
+    PULSAR_GPU_SAMPLE_REFUSED_KNOB = 1,    ///< a sampling knob is not finite
+    PULSAR_GPU_SAMPLE_REFUSED_EMPTY = 2,   ///< no finite logit (after the mask)
+    PULSAR_GPU_SAMPLE_REFUSED_MASS = 3,    ///< the candidate mass is not a positive finite number
+};
+
+/** One row's draw: the request's knobs as it carries them (the sampler clamps them as the host's always did), the
+ *  key (pulsar_sample_key at the token's index), the flags, and the row of the token mask it reads. */
+typedef struct pulsar_gpu_sample_req {
+    float temperature;
+    float top_p;
+    float min_p;
+    int32_t top_k;
+    uint64_t key;
+    uint32_t flags;
+    uint32_t mask_row;   ///< row of the launch's mask (bit i of word i/32 set = token i allowed), or PULSAR_GPU_SAMPLE_NO_MASK
+    int32_t probe;       ///< a token whose emitted probability the row reports (a verify row's draft; L301), or -1
+    uint32_t row;        ///< the logits row this draw reads (row `row` of the launch's rows)
+} pulsar_gpu_sample_req;
+
+/** What the sampler writes per row. */
+typedef struct pulsar_gpu_sample_out {
+    int32_t token;     ///< -1 = refused
+    uint32_t status;   ///< PULSAR_GPU_SAMPLE_*
+    float probe_p;     ///< the probe's probability in the emitted distribution (0 when not emitted; greedy: 1 for the argmax)
+    uint32_t pad_;
+} pulsar_gpu_sample_out;
+
+/** Bytes of the scratch tensor a session gives every sampler launch over rows of n_vocab. */
+uint64_t pulsar_gpu_sample_scratch_bytes(uint32_t n_vocab);
+
+/** n_rows draws: reqs[k] reads the row at logits + logits_offset_bytes + reqs[k].row * row_stride floats, n_vocab
+ *  wide, and out receives, from out_offset_bytes, n_rows pulsar_gpu_sample_out in reqs order.  `logits_rows` bounds
+ *  every reqs[k].row.  `mask` (NULL = none) is
+ *  uint32 [rows][mask_words]: a cleared bit makes that token's logit -inf before every transform -- L303's
+ *  structured-output hook, L272's tool-name mask; no mask = the unmasked bytes exactly.  `dist` (NULL in production)
+ *  receives the emitted distribution per row as uint32 [n, ids[dist_cap], prob bits[dist_cap]] for the equality
+ *  gate.  `id_map` (NULL = identity) is int32 [n_vocab]: row index i is token id_map[i] -- a drafter's draft
+ *  vocabulary (the candidates still order by row index on ties; the race hashes, the probe and the token are the
+ *  mapped ids).  Enqueued on the caller's stream; 0 (said) on a bad launch. */
+int pulsar_gpu_sample_rows(const pulsar_gpu_tensor *logits, uint64_t logits_offset_bytes, uint32_t row_stride,
+                           uint32_t n_vocab, uint32_t logits_rows, uint32_t n_rows, const pulsar_gpu_sample_req *reqs,
+                           const pulsar_gpu_tensor *mask, uint32_t mask_words, const pulsar_gpu_tensor *id_map,
+                           pulsar_gpu_tensor *scratch, pulsar_gpu_tensor *out, uint64_t out_offset_bytes,
+                           pulsar_gpu_tensor *dist, uint32_t dist_cap);
+
+/** A verify run for the device walk: the sampler rows [row0, row0 + k] of one bank (the draw after the base and
+ *  after each of its k drafts) and the drafts. */
+typedef struct pulsar_gpu_spec_run {
+    uint32_t row0;
+    uint32_t k;
+    uint32_t greedy_rows;   ///< bit j: row j drew greedy (its calibration label is the acceptance itself)
+    int32_t pend[16];
+} pulsar_gpu_spec_run;
+/** The walk's verdict for a run: drafts kept, the carry token (-1 when a row refused), the refusing row's status,
+ *  and L301's calibration labels for the drafts it reached: label[j] = 1/0 (greedy row: argmax == draft) or the
+ *  target's emitted probability of draft j (sampled row), hit[j] = the row drew draft j. */
+typedef struct pulsar_gpu_spec_walk_out {
+    uint32_t commit;
+    int32_t carry;
+    uint32_t status;
+    uint32_t n_label;
+    float label[16];
+    uint8_t hit[16];
+} pulsar_gpu_spec_walk_out;
+/** The speculative walk over a sampler launch's rows (pulsar_gpu_sample_rows' out at rows_offset_bytes): a draft is
+ *  kept iff its row drew it.  out receives n_runs pulsar_gpu_spec_walk_out at out_offset_bytes. */
+int pulsar_gpu_spec_walk(const pulsar_gpu_tensor *rows, uint64_t rows_offset_bytes, uint32_t n_rows,
+                         const pulsar_gpu_spec_run *runs, uint32_t n_runs, pulsar_gpu_tensor *out,
+                         uint64_t out_offset_bytes);
+
+/** The logprob outputs of a row (the host's pulsar_token_score, field for field). */
+#define PULSAR_GPU_LOGPROB_TOPK_MAX 20u
+#define PULSAR_GPU_LOGPROB_NEG_INF (-1.0e30f)
+typedef struct pulsar_gpu_token_score {
+    int32_t id;
+    float logit;
+    float logprob;
+} pulsar_gpu_token_score;
+typedef struct pulsar_gpu_logprob_row {
+    uint32_t n_top;        ///< entries in top (0: the row has no finite logit)
+    uint32_t have_token;   ///< token holds the scored token's score
+    pulsar_gpu_token_score token;
+    pulsar_gpu_token_score top[PULSAR_GPU_LOGPROB_TOPK_MAX];
+} pulsar_gpu_logprob_row;
+/** Logprobs of n_rows rows: the scored token of row r (tokens at tokens_offset_bytes + r * token_stride int32s;
+ *  NULL = none) and the top_k (<= PULSAR_GPU_LOGPROB_TOPK_MAX) best, as the host scorers did (frozen in
+ *  tests/sampler_host_ref.cpp).  mask_rows (NULL = unmasked) names each row's mask row. */
+int pulsar_gpu_logprobs_rows(const pulsar_gpu_tensor *logits, uint64_t logits_offset_bytes, uint32_t row_stride,
+                             uint32_t n_vocab, uint32_t n_rows, const pulsar_gpu_tensor *mask, uint32_t mask_words,
+                             const uint32_t *mask_rows, const pulsar_gpu_tensor *tokens, uint64_t tokens_offset_bytes,
+                             uint32_t token_stride, uint32_t top_k, pulsar_gpu_tensor *scratch,
+                             pulsar_gpu_tensor *out);
+/** Bytes of the scratch a logprob launch over rows of n_vocab takes (any row count). */
+uint64_t pulsar_gpu_logprobs_scratch_bytes(uint32_t n_vocab);
+
+/** A block drafter's sampled chains (L298 rows, L302 on the device): chain c walks slots 0..n-1, slot j's row the
+ *  candidates cand[c][j][0..topk) scored by scores[c][j][prev][0..topk) (prev: the slot before's pick, 0 at slot 0)
+ *  -- a sparse row of `vocab` (every other id -inf, a repeated id keeps its last score, an id outside the vocabulary
+ *  none) drawn by THE sampler under the chain's knobs at key[j]; the pick is the first candidate equal to the draw.
+ *  out receives tokens [n_chains][slots] (int32; -1 from a refused slot on, the walk stops there). */
+#define PULSAR_GPU_CHAIN_SLOTS_MAX 16u
+#define PULSAR_GPU_CHAIN_TOPK_MAX 64u
+#define PULSAR_GPU_CHAINS_MAX 16u
+typedef struct pulsar_gpu_chain_req {
+    float temperature, top_p, min_p;
+    int32_t top_k;
+    uint32_t chain;   /* the chain's index in cand / scores */
+    uint32_t n;       /* slots to walk (<= slots) */
+    uint64_t key[PULSAR_GPU_CHAIN_SLOTS_MAX];
+} pulsar_gpu_chain_req;
+int pulsar_gpu_sample_chains(const pulsar_gpu_tensor *cand, uint64_t cand_offset_bytes, const pulsar_gpu_tensor *scores,
+                             uint64_t scores_offset_bytes, uint32_t slots, uint32_t topk, uint32_t vocab,
+                             const pulsar_gpu_chain_req *reqs, uint32_t n_chains, pulsar_gpu_tensor *out,
+                             uint64_t out_offset_bytes);
+
+/** A deterministic 64-bit digest of n_rows f32 rows of `width` (8-byte aligned) into out at out_offset_bytes: the
+ *  TP mirror's cross-rank identity check over rows that stay on the device (L243, L302). */
+int pulsar_gpu_rows_digest(const pulsar_gpu_tensor *rows, uint64_t offset_bytes, uint32_t n_rows, uint32_t width,
+                           pulsar_gpu_tensor *out, uint64_t out_offset_bytes);
+
 
 /** L150: bank-batched markov refine. One launch per draft position serves
  * n_banks banks (one markov_w2 stream shared across them); byte-exact per

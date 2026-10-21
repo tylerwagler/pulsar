@@ -665,7 +665,7 @@ bool request_prepare_images(pulsar_engine *e, const chat_msgs *msgs, struct requ
  * A response format (OpenAI response_format, Responses text.format, Anthropic output_config.format) and strict
  * tools are grammars over the turn, compiled once per request off the decode thread (pulsar_grammar.h) and
  * enforced per draw by a GATE that follows the emitted tokens: unconstrained until a trigger's bytes go by,
- * then a grammar region whose masks every lane applies before its draw (pulsar_token_mask_apply).  The
+ * then a grammar region whose masks every lane's draw takes (the device sampler's mask, L302).  The
  * family declares the bytes; the gate is family-blind. */
 
 /** A family's spelling of a constrained turn (server_family_ops::grammar).  Calls: a region opens on
@@ -1657,19 +1657,10 @@ struct server {
     uint64_t w_spec_phase_rounds;
     double   m_spec_phase_ms[SERVER_ROUND_PHASE_COUNT];
     uint64_t m_spec_phase_rounds;
-    /** L123: the batched lane's shared ALL_ROWS logits landing buffer
-     * (PULSAR_SPEC_LOGITS_ROWS x vocab floats, ~16.5 MB), allocated once on
-     * first quantum. It was a per-quantum malloc/free — 16.5 MB of
-     * demand-zero pages faulted back in on every touch cycle, a measured
-     * ~1-2 ms/round of host tax. Worker-owned like the EMA above. */
-    float   *spec_lane_logits;
-    /** L219: the plain and mixed batched lanes' logits landing buffer
-     * ((PULSAR_SESSION_POOL_CAP + 1) x vocab floats).  Same rationale as
-     * spec_lane_logits, one lane over: the per-quantum malloc/free re-faulted
-     * ~4 MB of demand-zero pages on every quantum of a
-     * --no-dspark/plain-serving workload.  Worker-owned; the two lanes run
-     * sequentially in one worker. */
-    float   *lane_logits;
+    /** L302: the same rounds' host<->device synchronisations (pulsar_gpu_sync_stats deltas): stream drains, blocking
+     *  device -> host copies (and their bytes), blocking host -> device copies -- pulsar:spec_round_syncs_total. */
+    uint64_t w_spec_syncs[4];
+    uint64_t m_spec_syncs[4];
     /** Which decode lane the scheduler is on: 0 idle, 1 spec (retired), 2
      * batched, 3 spec-batched, 4 family-spec (server_pick_decode_lane). The
      * spec-decode counters cannot advance on the batched lane (it never enters
@@ -2974,16 +2965,12 @@ bool gen_constrain_begin(struct server *s, struct gen_state *g);
 void gen_constrain_end(struct gen_state *g);
 /** A grammar region is live: the next draw is masked. */
 bool gen_constrain_live(const struct gen_state *g);
-/** Mask words per row (pulsar_token_mask_apply's layout over the logits width). */
+/** Mask words per row (the device sampler's mask layout over the logits width, pulsar_row_draw.mask). */
 uint32_t gen_constrain_words(const struct server *s);
-/** The next draw's mask into `row` (live only).  false = the matcher failed; g->err says why. */
+/** The next draw's mask into `row` (live only): the plain lanes' pulsar_row_draw.mask -- the mask shapes the
+ *  DRAW only; the row stays the target's, which is what logprobs report (vLLM's default raw logprobs).
+ *  false = the matcher failed; g->err says why. */
 bool gen_constrain_mask(struct server *s, struct gen_state *g, uint32_t *row);
-/** The plain lanes' draw from a logits row (pulsar_sample_logits on the request's stream): through the
- *  grammar's mask when a region is live, on a copy -- the mask shapes the DRAW only; `logits` stays the
- *  target's row, which is what logprobs report (vLLM's default raw logprobs, and L302's device sampler keeps
- *  the same split).  -1 with g->err set: the sampler refused the row or the grammar failed. */
-int gen_constrain_draw(struct server *s, struct gen_state *g, const float *logits, int width, float temp, int top_k,
-                       float top_p, float min_p);
 /** Advance past an emitted token.  false = the grammar refused it or the matcher failed; g->err says why. */
 bool gen_constrain_accept(struct server *s, struct gen_state *g, int token);
 /** A speculative round's masks: `toks` are the round's tokens (the base unless `base_emitted`, then the
@@ -3253,7 +3240,7 @@ bool gen_streams_plain(const gen_state *g);
 void logprob_ledger_reset(logprob_ledger *lg);
 void logprob_ledger_free(logprob_ledger *lg);
 void logprob_capture_session(logprob_ledger *lg, pulsar_session *sess, int token);
-void logprob_capture_row(logprob_ledger *lg, const float *logits, int n_vocab, int token);
+void logprob_capture_row(logprob_ledger *lg, pulsar_session *sess, uint32_t row, int token);
 bool logprob_commit(logprob_ledger *lg, pulsar_engine *engine, int token,
                     const char *piece, size_t piece_len, size_t end_off);
 int  logprob_stream_ready(const logprob_ledger *lg, size_t upto);

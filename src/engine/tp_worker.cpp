@@ -34,8 +34,6 @@
 struct pulsar_tp_worker_slot {
     uint64_t id;            /* the create ordinal the leader names */
     pulsar_session *s;
-    float *logits;          /* this rank's decode output; sized on first use */
-    uint32_t logits_rows;
     /* Increment 4: one speculative round per bank, created on first use.  The
      * leader keys its rounds by scheduler slot and names the BANK in every
      * round frame; the bank is the identity this rank keys by. */
@@ -69,23 +67,8 @@ static void worker_drop(pulsar_engine *e, pulsar_tp_worker_slot *slot) {
     free(slot->rounds);
     free(slot->accepted);
     slot->s->destroy();
-    free(slot->logits);
     *slot = e->tp_worker_slots[e->tp_worker_n - 1u];
     e->tp_worker_n--;
-}
-
-/* The decode output buffer this rank writes but nobody reads: the vocab
- * all-gather already left every rank holding the full logits, and sampling is
- * the leader's.  Sized in rows of the engine's logits width. */
-static float *worker_logits(pulsar_engine *e, pulsar_tp_worker_slot *slot, uint32_t rows,
-                            int *cap_floats) {
-    const uint32_t width = (uint32_t)e->logits_width();
-    if (rows > slot->logits_rows) {
-        slot->logits = (float *)xrealloc(slot->logits, (size_t)rows * width * sizeof(float));
-        slot->logits_rows = rows;
-    }
-    *cap_floats = (int)(slot->logits_rows * width);
-    return slot->logits;
 }
 
 /* The round for `bank` on this rank, created on first use. */
@@ -158,14 +141,13 @@ static int worker_ack(pulsar_engine *e, uint64_t sid, int rc, char *err, size_t 
     return -1;
 }
 
-/* The ack of a logits-producing operation (eval, batch decode, mixed batch):
- * on success it carries the digest of THIS rank's assembled logits, which the
- * leader compares against its own (the cross-rank identity check, L243).  A
- * failure acks its status the plain way -- there are no logits to digest. */
-static int worker_ack_logits(pulsar_engine *e, uint64_t sid, int rc, const float *logits,
-                             uint32_t n_rows, char *err, size_t errlen) {
+/* The ack of an eval: on success it carries the digest of THIS rank's live row (on the device, L302), which the
+ * leader compares against its own (the cross-rank identity check, L243).  A failure acks its status the plain way --
+ * there is no row to digest. */
+static int worker_ack_live(pulsar_engine *e, uint64_t sid, int rc, pulsar_session *s, char *err, size_t errlen) {
     if (rc != 0) return worker_ack(e, sid, rc, err, errlen);
-    const uint64_t digest = pulsar_tp_logits_digest(logits, n_rows, (uint32_t)e->logits_width());
+    uint64_t digest = 0;
+    if (!s->rows_digest(s->dev.live, 0, 1, &digest)) digest = 0;
     if (pulsar_tp_send_command_ack_digest(e->tp, sid, 0, digest) != 0) return 1;
     snprintf(err, errlen, "tp: could not ack the leader (control channel gone)");
     return -1;
@@ -397,8 +379,7 @@ int pulsar_tp_worker_dispatch(pulsar_engine *e, const pulsar_tp_command *c, char
             fprintf(stderr, "pulsar: tp worker: eval refused: %s\n", ferr);
             worker_abort_step(e, "eval", ferr);
         }
-        return worker_ack_logits(e, c->session_id, rc, rc == 0 ? slot->s->logits : NULL, 1u,
-                                 err, errlen);
+        return worker_ack_live(e, c->session_id, rc, rc == 0 ? slot->s : NULL, err, errlen);
     }
 
     case PULSAR_TP_FRAME_EVAL_BATCH:
@@ -406,18 +387,15 @@ int pulsar_tp_worker_dispatch(pulsar_engine *e, const pulsar_tp_command *c, char
         const bool mixed = c->type == PULSAR_TP_FRAME_MIXED_BATCH;
         const char *op = mixed ? "mixed batch" : "batch decode";
         int rc = 1;
-        float *logits = NULL;
         uint32_t out_rows = 0;   /* the rows the step headed: n_items, or the mixed step's count */
         if (!worker_refused(e, c, op, &slot, ferr, sizeof(ferr))) {
             pulsar_multiseq_req *rows = (pulsar_multiseq_req *)xmalloc((size_t)c->n_items * sizeof(*rows));
             worker_rows(c, rows);
-            int cap = 0;
-            logits = worker_logits(e, slot, c->n_items, &cap);
             if (mixed) {
-                rc = e->family->session->decode_mixed(slot->s, rows, c->n_items, logits, cap, &out_rows,
+                rc = e->family->session->decode_mixed(slot->s, rows, c->n_items, NULL, 0, &out_rows,
                                                       (uint32_t)c->value, ferr, sizeof(ferr));
             } else {
-                rc = e->family->session->decode_multiseq(slot->s, rows, c->n_items, logits, cap, ferr, sizeof(ferr));
+                rc = e->family->session->decode_multiseq(slot->s, rows, c->n_items, NULL, 0, ferr, sizeof(ferr));
                 out_rows = c->n_items;
             }
             free(rows);
@@ -427,10 +405,9 @@ int pulsar_tp_worker_dispatch(pulsar_engine *e, const pulsar_tp_command *c, char
             worker_abort_step(e, op, ferr);
             return worker_ack(e, c->session_id, rc, err, errlen);
         }
-        /* The digest of what the step PRODUCED (argmax / compact / logits rows),
-         * the same helper the leader's collect uses. */
+        /* The digest of the rows the step headed (on the device), the same helper the leader's collect uses. */
         if (pulsar_tp_send_command_ack_digest(e->tp, c->session_id, 0,
-                                              pulsar_session_batch_digest(slot->s, logits, out_rows)) != 0)
+                                              pulsar_session_batch_digest(slot->s, out_rows)) != 0)
             return 1;
         snprintf(err, errlen, "tp: could not ack the leader (control channel gone)");
         return -1;
@@ -438,18 +415,13 @@ int pulsar_tp_worker_dispatch(pulsar_engine *e, const pulsar_tp_command *c, char
 
     case PULSAR_TP_FRAME_FUSED_BATCH: {
         int rc = 1;
-        float *logits = NULL;
         uint32_t out_rows = 0;
         const pulsar_fused_shape *shape = &c->fused;
         if (!worker_refused(e, c, "fused batch", &slot, ferr, sizeof(ferr))) {
             pulsar_multiseq_req *rows = (pulsar_multiseq_req *)xmalloc((size_t)c->n_items * sizeof(*rows));
             worker_rows(c, rows);
-            /* The block holds the decode rows and the headed runs, not every
-             * row: a prompt chunk's rows are not headed. */
-            int cap = 0;
-            logits = worker_logits(e, slot, shape->n_dec + pulsar_fused_shape_heads(shape), &cap);
             rc = pulsar_engine_has_fused_step(slot->s->engine)
-                     ? pulsar_session_fused_local(slot->s, rows, c->n_items, shape, logits, cap, &out_rows, ferr,
+                     ? pulsar_session_fused_local(slot->s, rows, c->n_items, shape, NULL, 0, &out_rows, ferr,
                                                   sizeof(ferr))
                      : (snprintf(ferr, sizeof ferr, "%s: no fused step", slot->s->engine->family->name), 1);
             free(rows);
@@ -460,7 +432,7 @@ int pulsar_tp_worker_dispatch(pulsar_engine *e, const pulsar_tp_command *c, char
             return worker_ack(e, c->session_id, rc, err, errlen);
         }
         if (pulsar_tp_send_command_ack_digest(e->tp, c->session_id, 0,
-                                              pulsar_session_fused_digest(slot->s, logits, shape->n_dec,
+                                              pulsar_session_fused_digest(slot->s, shape->n_dec,
                                                                           out_rows - shape->n_dec)) != 0)
             return 1;
         snprintf(err, errlen, "tp: could not ack the leader (control channel gone)");
@@ -572,8 +544,7 @@ int pulsar_tp_worker_dispatch(pulsar_engine *e, const pulsar_tp_command *c, char
         int status = -1;
         if (!worker_refused(e, c, "spec_round_end", &slot, ferr, sizeof(ferr))) {
             pulsar_spec_round *r = worker_round(slot, c->spec.bank);
-            const uint32_t width = (uint32_t)e->logits_width();
-            if (!r || !slot->logits || (uint64_t)(c->spec.i3 + 1) * width > (uint64_t)slot->logits_rows * width) {
+            if (!r || c->spec.i3 < 0 || (uint32_t)c->spec.i3 + 1u > slot->s->dev.step_n) {
                 snprintf(ferr, sizeof(ferr), "tp: spec_round_end for bank %d has no round or no forward block on this rank", c->spec.bank);
                 fprintf(stderr, "pulsar: tp worker: %s\n", ferr);
             } else {
@@ -581,8 +552,7 @@ int pulsar_tp_worker_dispatch(pulsar_engine *e, const pulsar_tp_command *c, char
                 int *acc = worker_accepted(slot, c->spec.i2);
                 const int na = pulsar_session_spec_round_end_local(slot->s, r, c->spec.i0,
                                                                    c->spec.temperature, c->spec.top_k, c->spec.top_p,
-                                                                   c->spec.min_p, 0u, NULL, 0u, &rng, slot->logits,
-                                                                   (uint32_t)c->spec.i3,
+                                                                   c->spec.min_p, 0u, NULL, 0u, &rng, (uint32_t)c->spec.i3,
                                                                    acc, c->spec.i2, ferr, sizeof(ferr));
                 status = na + 1;
                 if (status < 0) status = 0;
@@ -669,8 +639,8 @@ int pulsar_tp_worker_dispatch(pulsar_engine *e, const pulsar_tp_command *c, char
                 off += r->i2 > 0 ? r->i2 : 0;
                 if (!st->round) ok = 0;
                 if (c->type == PULSAR_TP_FRAME_SPEC_ROUND_END_BATCH &&
-                    (!slot->logits || r->i3 < 0 ||
-                     (uint64_t)r->i3 + pulsar_spec_round_n_rows(st->round) > (uint64_t)slot->logits_rows))
+                    (r->i3 < 0 ||
+                     (uint64_t)r->i3 + pulsar_spec_round_n_rows(st->round) > (uint64_t)slot->s->dev.step_n))
                     ok = 0;
             }
             if (!ok) {
@@ -685,7 +655,7 @@ int pulsar_tp_worker_dispatch(pulsar_engine *e, const pulsar_tp_command *c, char
                 /* v24: the leader's measured spec cost, the one every rank
                  * prices this round's quench from (L263). */
                 pulsar_engine_spec_cost_set(e, c->spec.i1, c->spec.i2, c->spec.i3 != 0);
-                pulsar_session_spec_round_end_batch_local(slot->s, steps, n, slot->logits);
+                pulsar_session_spec_round_end_batch_local(slot->s, steps, n);
                 status = pulsar_spec_steps_verdict(PULSAR_SPEC_PHASE_ROUND_END, steps, n, 0u);
             } else {
                 pulsar_session_spec_redraft_commit_batch_local(slot->s, steps, n);
@@ -716,8 +686,8 @@ int pulsar_tp_worker_dispatch(pulsar_engine *e, const pulsar_tp_command *c, char
             } else {
                 /* The run's last row is this rank's assembled logits after the
                  * whole loop; the positive verdict carries its digest (L243). */
-                const uint64_t digest = pulsar_tp_logits_digest(slot->s->logits, 1u,
-                                                                (uint32_t)e->logits_width());
+                uint64_t digest = 0;
+                if (!slot->s->rows_digest(slot->s->dev.live, 0, 1, &digest)) digest = 0;
                 if (pulsar_tp_send_command_ack_digest(e->tp, c->session_id, status, digest) != 0)
                     return 1;
                 snprintf(err, errlen, "tp: could not ack the leader (control channel gone)");

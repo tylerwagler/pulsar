@@ -370,51 +370,19 @@ void spec_lookahead_reset(pulsar_session *s) {
  * Partial/zero accepts restore the frontier and replay the committed prefix
  * (Stage A; the Stage-B transactional state removes the replay). */
 
-/* plan-34 inc 6 (step 2a): the accept walk, extracted PURE from the fused
- * loop. Consumes logit rows through `read_row` (row index is round-local:
- * 0..K-1 are the draft rows), decides the accepted prefix and -- for the
- * sampled rule -- draws the rejecting position's residual carry. Touches NO
- * session state beyond the sampling scratch; this is the function the
- * batched lane calls once per bank over a SHARED forward's rows, with
- * read_row pointing into that batch's ALL_ROWS logits at the bank's offset.
+/* The accept walk (L288 sdet's rule, L302: on the device).  The target draws its own token at every verified row --
+ * greedy: the row's argmax; sampled: THE sampler's draw at that token's own key, pulsar_sample_key at its index in
+ * the stream -- and a draft is accepted iff it IS that token.  The first row whose token differs ends the round with
+ * that token as the carry; on a full accept the carry is row K's draw at the next index.  Every emitted token is
+ * therefore the plain sampler's token at its index: exact in distribution by construction (it IS the plain draw), and
+ * the same whichever lane, depth or drafter produced the round, so a seeded stream reproduces whatever the lane price
+ * picked when.  The drafter draws a sampled draft at the same key, so it is the target's token with probability at
+ * least (1 - TV) / (1 + TV) of the two distributions (the sampler's race).
  *
- * L288 sdet: ONE rule at every temperature -- the target draws its own token
- * at each verified row (greedy: the row's argmax; sampled: the plain sampler's
- * draw at that token's own key, pulsar_sample_key at its index in the
- * stream) and a draft is accepted iff it IS that token.  The first row whose
- * token differs ends the round with that token as the carry; on a full accept
- * the caller draws the carry from the row after the last draft at the next
- * index.  Every emitted token is therefore the plain sampler's token at its
- * index: exact in distribution by construction (it IS the plain draw), and the
- * same whichever lane, depth or drafter produced the round, so a seeded stream
- * reproduces whatever the lane price picked when (wall-clock probes moved a
- * lone stream between the lanes, and the old accept / residual draws consumed
- * the stream differently in each -- three runs, three texts).  The drafter draws
- * a sampled draft at the same key, so it is the target's token with
- * probability at least (1 - TV) / (1 + TV) of the two distributions
- * (pulsar_sample_dist_draw's race).  `rng` is the stream at the round's base
- * token: draft i sits i + 1 places past it. */
-
-/* L149 phase 2: build row `row`'s target distribution from the compact
- * prefilter block when the request is in the sparse min-p contract and the
- * row's candidate set fit the cap. false = caller reads the full row. */
-static bool spec_compact_dist(const int32_t *compact, uint32_t row, uint32_t n_vocab,
-                              float temperature, int top_k, float top_p, float min_p,
-                              pulsar_sample_scratch *scratch, pulsar_sample_dist *out) {
-    if (!compact || row >= PULSAR_SPEC_LOGITS_ROWS ||
-        !(temperature > 0.0f && top_k <= 0 && top_p == 1.0f &&
-          pulsar_sample_sparse_minp(min_p, n_vocab) && min_p <= 1.0f))
-        return false;
-    const int32_t *h = compact + (size_t)row * PULSAR_DSPARK_PREFILTER_ROW_I32;
-    const uint32_t n = (uint32_t)h[0];
-    if (n == 0 || n > PULSAR_DSPARK_PREFILTER_CAP) return false;
-    float max_logit;
-    memcpy(&max_logit, &h[2], sizeof(max_logit));
-    return pulsar_sample_dist_build_prefiltered(h + 3,
-                                                (const float *)(h + 3 + PULSAR_DSPARK_PREFILTER_CAP),
-                                                n, n_vocab, max_logit, temperature, min_p,
-                                                scratch, out) != 0;
-}
+ * Every row of every round in the step is drawn in ONE sampler launch over the step's device rows, the walk runs as
+ * a second kernel, and what comes back is each round's verdict (pulsar_gpu_spec_walk_out: commit, carry, status, and
+ * L301's calibration labels -- greedy row: the acceptance; sampled row: the target's emitted probability of the
+ * draft).  The logits never leave the device. */
 
 /* L296 toolsample: a round's sampling is decided PER POSITION, as the plain lane decides it token by token.  Row i
  * (the token after the base and drafts 0..i-1; row K is a full accept's carry) draws greedy when the request is
@@ -425,120 +393,74 @@ static bool spec_row_greedy(float temperature, uint32_t greedy_rows, uint32_t ro
     return temperature <= 0.0f || (row < 32u && ((greedy_rows >> row) & 1u) != 0u);
 }
 
-/* L303: the session's row scratch (one logits row). */
-static float *spec_scratch_row(pulsar_session *s) {
-    if (!s->spec_row_scratch) s->spec_row_scratch = (float *)xmalloc((size_t)spec_vocab(s) * sizeof(float));
-    return s->spec_row_scratch;
-}
+/* One round's part of a walk: its rows [row0, row0 + K] of the step, its params, its stream at the base and its
+ * masks (pulsar_spec_step.masks). */
+struct spec_walk_round {
+    const pulsar_spec_round *r;
+    uint32_t row0;
+    float temperature;
+    int top_k;
+    float top_p, min_p;
+    uint32_t greedy_rows;
+    uint64_t rng;
+    const uint32_t *masks;   /* L303: row j of the round draws through mask row j (j < mask_rows); NULL = none */
+    uint32_t mask_rows;
+};
 
-/* L303: `src` through mask row `mask` into the scratch row -- what the plain lane draws from at that position. */
-static const float *spec_masked_row(pulsar_session *s, const float *src, const uint32_t *mask) {
-    float *row = spec_scratch_row(s);
-    if (row != src) memcpy(row, src, (size_t)spec_vocab(s) * sizeof(float));
-    pulsar_token_mask_apply(row, spec_vocab(s), mask);
-    return row;
-}
-
-static int spec_accept_walk(pulsar_session *s,
-                            pulsar_spec_row_read_fn read_row, void *read_ud,
-                            const int32_t *compact, uint32_t row0,
-                            const int *row_tops,
-                            const int32_t *pend, uint32_t K,
-                            float temperature, int top_k, float top_p, float min_p,
-                            uint32_t greedy_rows,
-                            const uint32_t *masks, uint32_t mask_rows,
-                            uint64_t rng, int *out_carry_tok,
-                            float *label, uint8_t *hit, uint32_t *n_label) {
-    int commit = 0;
-    int carry_tok = -1;
-    *n_label = 0;
+/* The walks of n rounds over the session's step rows: one sampler launch, one walk launch, the verdicts back. */
+static bool spec_walk_rounds(pulsar_session *s, const spec_walk_round *w, uint32_t n, pulsar_gpu_spec_walk_out *out,
+                             char *err, size_t errlen) {
+    pulsar_gpu_sample_req reqs[PULSAR_GPU_SAMPLE_ROWS_MAX];
+    uint32_t rows[PULSAR_GPU_SAMPLE_ROWS_MAX];
+    pulsar_gpu_spec_run runs[PULSAR_GPU_SAMPLE_ROWS_MAX];
+    const uint32_t *masks[PULSAR_GPU_SAMPLE_ROWS_MAX];
     const uint32_t words = (spec_vocab(s) + 31u) / 32u;
-    while (commit < (int)K) {
-        if (masks) {
-            /* L303: a constrained row is read whole and drawn through its mask (the compact prefilter and the
-             * forward's row argmax describe the unmasked row) */
-            if ((uint32_t)commit >= mask_rows) {
-                *out_carry_tok = -1;
-                return -1;
-            }
-            float *row_logits = spec_scratch_row(s);
-            if (!read_row(read_ud, (uint32_t)commit, row_logits)) {
-                *out_carry_tok = -1;
-                return -1;
-            }
-            spec_masked_row(s, row_logits, masks + (size_t)commit * words);
-            int tok;
-            if (spec_row_greedy(temperature, greedy_rows, (uint32_t)commit)) {
-                tok = sample_argmax(row_logits, spec_vocab(s));
-                label[commit] = tok == (int)pend[commit] ? 1.0f : 0.0f;   /* L301: greedy, the acceptance */
-            } else {
-                pulsar_sample_dist dist;
-                if (!pulsar_sample_dist_build(row_logits, spec_vocab(s), temperature, top_k, top_p, min_p,
-                                              &s->sample_scratch, &dist)) {
-                    *out_carry_tok = -1;
-                    return -1;
-                }
-                tok = pulsar_sample_dist_draw(&dist, pulsar_sample_key(rng, (uint32_t)commit + 1u));
-                /* L301: sampled, the target's probability of the draft under the row's mask */
-                float p = 0.0f;
-                for (uint32_t c = 0; c < dist.n; c++)
-                    if (dist.ids[c] == (int)pend[commit]) { p = dist.probs[c]; break; }
-                label[commit] = p;
-                pulsar_sample_dist_free(&dist);
-            }
-            hit[commit] = tok == (int)pend[commit] ? 1u : 0u;
-            *n_label = (uint32_t)commit + 1u;
-            if (tok != (int)pend[commit]) {
-                carry_tok = tok;
-                break;
-            }
-            commit++;
-            continue;
-        }
-        if (spec_row_greedy(temperature, greedy_rows, (uint32_t)commit)) {
-            /* the row's argmax; on a miss the carry is the refreshed row's argmax (round_end) */
-            const bool ok = row_tops[commit] == (int)pend[commit];
-            label[commit] = ok ? 1.0f : 0.0f;   /* L301: greedy, the acceptance itself */
-            hit[commit] = ok ? 1u : 0u;
-            *n_label = (uint32_t)commit + 1u;
-            if (!ok) break;
-            commit++;
-            continue;
-        }
-        float *row_logits = spec_scratch_row(s);
-        pulsar_sample_dist dist;
-        if (!spec_compact_dist(compact, row0 + (uint32_t)commit, spec_vocab(s), temperature, top_k,
-                               top_p, min_p, &s->sample_scratch, &dist)) {
-            if (!read_row(read_ud, (uint32_t)commit, row_logits) ||
-                !pulsar_sample_dist_build(row_logits, spec_vocab(s), temperature, top_k,
-                                          top_p, min_p, &s->sample_scratch, &dist)) {
-                *out_carry_tok = -1;
-                return -1;
-            }
-        }
-        const int tok = pulsar_sample_dist_draw(&dist, pulsar_sample_key(rng, (uint32_t)commit + 1u));
-        /* L301: sampled, the target's probability of the draft (its candidates are the filtered nucleus) */
-        float p = 0.0f;
-        for (uint32_t c = 0; c < dist.n; c++)
-            if (dist.ids[c] == (int)pend[commit]) { p = dist.probs[c]; break; }
-        pulsar_sample_dist_free(&dist);
-        label[commit] = p;
-        hit[commit] = tok == (int)pend[commit] ? 1u : 0u;
-        *n_label = (uint32_t)commit + 1u;
-        if (tok != (int)pend[commit]) {
-            carry_tok = tok;
-            break;
-        }
-        commit++;
+    uint32_t m = 0;
+    if (!s->dev.step_rows || n == 0 || n > PULSAR_GPU_SAMPLE_ROWS_MAX) {
+        snprintf(err, errlen, "spec walk: %u rounds over a step that headed %u rows", n,
+                 s->dev.step_rows ? s->dev.step_n : 0u);
+        return false;
     }
-    *out_carry_tok = carry_tok;
-    return commit;
+    for (uint32_t i = 0; i < n; i++) {
+        const pulsar_spec_round *r = w[i].r;
+        if (m + r->K + 1u > PULSAR_GPU_SAMPLE_ROWS_MAX || w[i].row0 + r->K >= s->dev.step_n) {
+            snprintf(err, errlen, "spec walk: round %u's rows [%u, %u] are outside the step's %u", i, w[i].row0,
+                     w[i].row0 + r->K, s->dev.step_n);
+            return false;
+        }
+        pulsar_gpu_spec_run &run = runs[i];
+        memset(&run, 0, sizeof(run));
+        run.row0 = m;
+        run.k = r->K;
+        for (uint32_t j = 0; j <= r->K; j++) {
+            pulsar_gpu_sample_req &q = reqs[m];
+            const bool greedy = spec_row_greedy(w[i].temperature, w[i].greedy_rows, j);
+            memset(&q, 0, sizeof(q));
+            q.temperature = w[i].temperature;
+            q.top_k = w[i].top_k;
+            q.top_p = w[i].top_p;
+            q.min_p = w[i].min_p;
+            q.key = pulsar_sample_key(w[i].rng, j + 1u);   /* row j draws the token j + 1 places past the base */
+            q.flags = greedy ? PULSAR_GPU_SAMPLE_GREEDY : 0u;
+            q.probe = j < r->K ? r->pend[j] : -1;
+            rows[m] = w[i].row0 + j;
+            masks[m] = w[i].masks && j < w[i].mask_rows ? w[i].masks + (size_t)j * words : NULL;
+            if (j < r->K) {
+                run.pend[j] = r->pend[j];
+                run.greedy_rows |= greedy ? 1u << j : 0u;
+            }
+            m++;
+        }
+    }
+    const uint64_t walk_off = (uint64_t)PULSAR_GPU_SAMPLE_ROWS_MAX * sizeof(pulsar_gpu_sample_out);
+    if (!s->draw_rows_dev(s->dev.step_rows, rows, m, reqs, masks) ||
+        !pulsar_gpu_spec_walk(s->dev.out, 0, m, runs, n, s->dev.out, walk_off) ||
+        !pulsar_gpu_tensor_read(s->dev.out, walk_off, out, (uint64_t)n * sizeof(*out))) {
+        snprintf(err, errlen, "spec walk: the device sampler failed over %u rows", m);
+        return false;
+    }
+    return true;
 }
-
-
-
-
-
 
 /** inc-6: one speculative ROUND's state, threaded between round_begin (rows
  * assembled, frontier snapshotted, checkpoint pushed), the verify forward
@@ -576,8 +498,6 @@ static int spec_round_begin(pulsar_session *s, int first_token,
         r->snap = snap;
         r->base = (int32_t)first_token;
     }
-    /* the target may choose the step's logits readback from the rounds that ride it (L149 / L219) */
-    if (spec_target(s)->round_note) spec_target(s)->round_note(s, temperature, top_k, top_p, min_p);
     uint32_t &K = r->K;
     uint32_t &n_batch = r->n_batch;
     int &saved_len = r->saved_len;
@@ -653,7 +573,7 @@ static int spec_round_end(pulsar_session *s, pulsar_spec_round *r,
                           uint32_t greedy_rows,
                           const uint32_t *masks, uint32_t mask_rows,
                           uint64_t *rng,
-                          const pulsar_spec_rows *src, uint32_t row0,
+                          const pulsar_gpu_spec_walk_out *wv, uint32_t row0,
                           bool defer_redraft,
                           double t0,
                           const int32_t *forced_truth,
@@ -668,18 +588,14 @@ static int spec_round_end(pulsar_session *s, pulsar_spec_round *r,
     const int saved_len = r->saved_len;
     int32_t (&pend)[16] = r->pend;
     float (&pend_conf)[16] = r->pend_conf;
-    int (&row_tops)[16] = r->row_tops;
     (void)pend_conf; (void)t0; (void)dspark_stats;
     /* Accept the longest prefix the target agrees with: row i's own token --
      * its argmax (greedy) or its draw at that token's key under the
      * request's FILTERED target distribution (sampled) -- must equal pend[i];
-     * the first that differs is the carry (spec_accept_walk). */
-    if (temperature > 0.0f && !rng && !forced_truth) {
-        snprintf(err, errlen, "spec round: a sampled walk needs the request's stream");
-        return -1;
-    }
+     * the first that differs is the carry (the device walk, spec_walk_rounds). */
     int carry_tok = -1;
     int commit_rc;
+    bool carry_refused = false;
     if (forced_truth) {
         /* TEACHER-FORCED end (gate-facing, L182): the walk is replaced by
          * equality against the true continuation -- draft i is accepted iff it
@@ -693,22 +609,34 @@ static int spec_round_end(pulsar_session *s, pulsar_spec_round *r,
         while ((uint32_t)commit_rc < K && pend[commit_rc] == forced_truth[commit_rc]) commit_rc++;
         carry_tok = (int)forced_truth[commit_rc];
     } else {
-        PULSAR_NVTX("spec: walk");
-        float label[16];
-        uint8_t hit[16];
-        uint32_t n_label = 0;
-        commit_rc = spec_accept_walk(s, src->read, src->ud, src->compact, row0,
-                                     row_tops, pend, K,
-                                     temperature, top_k, top_p, min_p, greedy_rows, masks, mask_rows,
-                                     rng ? *rng : 0u, &carry_tok, label, hit, &n_label);
+        /* the device walk's verdict: a refused row ends the round -- unless it is a full accept's carry row and the
+         * stop clamp below cuts the round before it (that carry is never emitted; the host walk drew it from the
+         * clamped row, which the walk had already drawn) */
+        commit_rc = (int)wv->commit;
+        carry_tok = wv->carry;
+        carry_refused = wv->status != PULSAR_GPU_SAMPLE_OK;
+        if (carry_refused && wv->commit < K) commit_rc = -1;
+        /* L303: every row the walk judged a draft on must be under a mask (mask_rows > the stop row; a row past
+         * them was drawn unconstrained, and no masks at all is the round's grammar failure): the round is refused.
+         * A full accept's carry row past them is a refused carry, which only the stop clamp below can leave
+         * unused. */
+        if (masks) {
+            const uint32_t judged = wv->commit < K ? wv->commit : K - 1u;   /* the last draft row the walk read */
+            if (K > 0u && judged >= mask_rows) {
+                commit_rc = -1;
+            } else if (wv->commit >= mask_rows) {
+                carry_tok = -1;
+                carry_refused = true;
+            }
+        }
         /* L301: the drafts the walk reached, against their confidences (a teacher-forced end has no target draw) */
-        if (commit_rc >= 0) pulsar_spec_calibration_note(e, r->copy, pend_conf, label, hit, n_label);
+        if (commit_rc >= 0) pulsar_spec_calibration_note(e, r->copy, pend_conf, wv->label, wv->hit, wv->n_label);
     }
     if (commit_rc < 0) {
         s->checkpoint.len = saved_len;
         spec_round_undo(s, r);
         snprintf(err, errlen, masks ? "spec walk: a row past the round's masks, or a masked row with no drawable "
-                                      "token (L303)" : "DSpark sampled-accept logits readback failed");
+                                      "token (L303)" : "spec walk: the sampler refused a verify row");
         s->checkpoint_valid = false;
         return -1;
     }
@@ -810,49 +738,29 @@ static int spec_round_end(pulsar_session *s, pulsar_spec_round *r,
         }
     }
 
-    /* Refresh s->logits to the last committed position's distribution. */
-    if (!src->read(src->ud, (uint32_t)commit, s->logits)) {
+    /* The live row: the last committed position's distribution, on the device (L302). */
+    if (!s->live_from_rows(s->dev.step_rows, row0 + (uint32_t)commit)) {
         s->checkpoint.len = saved_len;
         spec_round_undo(s, r);
-        snprintf(err, errlen, "DSpark fused logits readback failed");
+        snprintf(err, errlen, "spec round: the live row could not be taken from the verify");
         s->checkpoint_valid = false;
         return -1;
     }
 
-    /* Finalize the carry token -- the next base, drawn from the refreshed
-     * s->logits (= row[commit]) when the walk did not already draw it:
-     * greedy -> argmax (the old next_base); sampled full-accept -> the draw
-     * from the last accepted row's distribution at the carry's own key
-     * (commit + 1 past the base, as the walk's would have been).  Greedy or sampled is the carry ROW's (L296:
-     * spec_row_greedy), and so are the params the carry and the next chain record: they are the next round's
-     * base position's, which the next round's own resolution reads. */
+    /* The carry -- the next base -- is the walk's draw: the first row that disagreed, or row K's on a full accept,
+     * at that token's own key, greedy or sampled by that row's rule (spec_row_greedy).  When the stop clamp cut the
+     * round below the walk's commit, an EOS ends it and the carry is never used.  The carry ROW's params are what the
+     * carry and the next chain record: the next round's base position's, which the next round's own resolution
+     * reads. */
     const float carry_temp = spec_row_greedy(temperature, greedy_rows, (uint32_t)commit) ? 0.0f : temperature;
-    if (carry_tok < 0) {
-        /* L303: a constrained carry draws through its row's mask; s->logits stays the target's row */
-        const float *carry_row = s->logits;
-        if (masks && (uint32_t)commit < mask_rows)
-            carry_row = spec_masked_row(s, s->logits, masks + (size_t)commit * ((spec_vocab(s) + 31u) / 32u));
-        if (masks && (uint32_t)commit >= mask_rows) {
-            carry_tok = -1;
-        } else if (carry_temp <= 0.0f) {
-            carry_tok = sample_argmax(carry_row, spec_vocab(s));
-        } else {
-            pulsar_sample_dist bonus;
-            if (pulsar_sample_dist_build(carry_row, spec_vocab(s), temperature, top_k,
-                                         top_p, min_p, &s->sample_scratch, &bonus)) {
-                carry_tok = pulsar_sample_dist_draw(&bonus, pulsar_sample_key(*rng, (uint32_t)commit + 1u));
-                pulsar_sample_dist_free(&bonus);
-            }
-        }
-        if (carry_tok < 0) {
-            /* the committed row has no drawable distribution (the sampler said
-             * why, once): no carry can be honest, so the round fails */
-            s->checkpoint.len = saved_len;
-            spec_round_undo(s, r);
-            snprintf(err, errlen, "DSpark fused: the sampler refused the carry row");
-            s->checkpoint_valid = false;
-            return -1;
-        }
+    if (carry_tok < 0 && !(carry_refused && commit < commit_rc)) {
+        /* the committed row has no drawable distribution (the sampler said why): no carry can be honest, so the
+         * round fails */
+        s->checkpoint.len = saved_len;
+        spec_round_undo(s, r);
+        snprintf(err, errlen, "spec round: the sampler refused the carry row");
+        s->checkpoint_valid = false;
+        return -1;
     }
 
     /* the drafter's conditioning features follow the last committed row through the absorbs below */
@@ -995,12 +903,22 @@ static int spec_single_round(pulsar_session *s, int first_token,
                                          err, errlen);
         if (brc != 0) { free(r.snap); return brc; }
     }
-    pulsar_spec_rows src;
-    memset(&src, 0, sizeof src);
     bool verified;
     {
         PULSAR_NVTX("spec: verify");
-        verified = spec_target(s)->verify_single(s, &r, &src, err, errlen);
+        verified = spec_target(s)->verify_single(s, &r, err, errlen);
+    }
+    /* the walk over the verify's rows (row 0 is the base's), on the device */
+    pulsar_gpu_spec_walk_out wv;
+    if (verified) {
+        PULSAR_NVTX("spec: walk");
+        const spec_walk_round w = {&r, 0u, temperature, top_k, top_p, min_p, 0u, rng ? *rng : 0u, NULL, 0u};
+        if (temperature > 0.0f && !rng) {
+            snprintf(err, errlen, "spec round: a sampled walk needs the request's stream");
+            verified = false;
+        } else {
+            verified = spec_walk_rounds(s, &w, 1, &wv, err, errlen);
+        }
     }
     if (!verified) {
         s->checkpoint.len = r.saved_len;
@@ -1013,7 +931,8 @@ static int spec_single_round(pulsar_session *s, int first_token,
     s->spec.spec_round_banks = 1;
     const int na = spec_round_end(s, &r, first_token,
                                   temperature, top_k, top_p, min_p, 0u /* the caller's params at every row */,
-                                  NULL, 0u, rng, &src, 0u, false, t0, NULL, accepted, accepted_cap, err, errlen);
+                                  NULL, 0u, rng,
+                                  &wv, 0u, false, t0, NULL, accepted, accepted_cap, err, errlen);
     free(r.snap);
     /* L263: this lane's own cost observation -- the whole step, redraft
      * included.  Off TP only: a group's ranks must hold the same fit, and this
@@ -1026,10 +945,22 @@ static int spec_single_round(pulsar_session *s, int first_token,
     return na;
 }
 
-/* The base draw's key: the stream's next undrawn token, read without consuming it -- the round that emits the
- * base advances past it (L288 sdet).  Greedy never reads it, and a greedy caller may pass no stream. */
-static uint64_t spec_stream_key(const uint64_t *rng) {
-    return rng ? pulsar_sample_key(*rng, 0u) : 0u;
+/* The base draw: the live row at the stream's next undrawn key, read without consuming it -- the round that emits
+ * the base advances past it (L288 sdet).  Greedy never reads the key, and a greedy caller may pass no stream. */
+static int spec_base_draw(pulsar_session *s, float temperature, int top_k, float top_p, float min_p,
+                          const uint32_t *mask, const uint64_t *rng) {
+    if (temperature > 0.0f && !rng) return PULSAR_SAMPLE_REFUSED;
+    pulsar_gpu_sample_req q;
+    memset(&q, 0, sizeof(q));
+    q.temperature = temperature;
+    q.top_k = top_k;
+    q.top_p = top_p;
+    q.min_p = min_p;
+    q.key = rng ? pulsar_sample_key(*rng, 0u) : 0u;
+    q.probe = -1;
+    const uint32_t row = 0;
+    pulsar_gpu_sample_out o;
+    return s->draw_rows(s->dev.live, &row, 1, &q, &mask, &o) ? o.token : PULSAR_SAMPLE_REFUSED;   /* L303: through its mask */
 }
 
 /* Speculative generation that OWNS sampling: draws the base token from the
@@ -1069,8 +1000,7 @@ int pulsar_session::generate_speculative(float temperature, int top_k,
         /* no carry, or params changed mid-stream (e.g. tool-call payloads
          * force greedy): redraw from the current distribution */
         s->spec.spec_carry_valid = false;
-        first = sample_top_p_min_p(s->logits, spec_vocab(s), temperature, top_k,
-                                   top_p, min_p, spec_stream_key(rng), &s->sample_scratch);
+        first = spec_base_draw(s, temperature, top_k, top_p, min_p, NULL, rng);
         if (first < 0) {
             snprintf(err, errlen, "the sampler refused the live logits row");
             return -1;
@@ -1160,10 +1090,7 @@ int pulsar_session_spec_next_base_local(pulsar_session *s, float temperature,
         s->spec.spec_carry_valid = false;
     } else {
         s->spec.spec_carry_valid = false;
-        /* L303: a constrained request draws through its mask; s->logits stays the target's row */
-        const float *row = mask ? spec_masked_row(s, s->logits, mask) : s->logits;
-        first = sample_top_p_min_p(row, spec_vocab(s), temperature, top_k,
-                                   top_p, min_p, spec_stream_key(rng), &s->sample_scratch);
+        first = spec_base_draw(s, temperature, top_k, top_p, min_p, mask, rng);
     }
     return first;
 }
@@ -1189,72 +1116,52 @@ uint32_t pulsar_spec_round_fill_reqs(const pulsar_spec_round *r, uint32_t bank, 
     return r->n_batch;
 }
 
-/** Row source over the server-held ALL_ROWS logits block.
- *
- * The batched lane runs one spec round per bank around ONE shared forward, so
- * a round reads its rows out of the shared block at an offset rather than
- * owning a logits buffer of its own. */
-bool pulsar_spec_row_read_block(void *ud, uint32_t row, float *out) {
-    const pulsar_spec_rows *b = (const pulsar_spec_rows *)ud;
-    memcpy(out, b->block.rows + ((size_t)b->block.row0 + row) * b->block.vocab,
-           (size_t)b->block.vocab * sizeof(float));
-    return true;
-}
-
-/* The batched lane's round end: the target reads this round's rows out of the last shared forward
- * (its own readback or the caller's block), then the one round_end runs. */
-static int spec_round_end_block(pulsar_session *s, pulsar_spec_round *r,
-                                int first_token,
-                                float temperature, int top_k, float top_p,
-                                float min_p, uint32_t greedy_rows,
-                                const uint32_t *masks, uint32_t mask_rows, uint64_t *rng,
-                                const float *rows, uint32_t row0,
-                                const int32_t *forced_truth,
-                                int *accepted, int accepted_cap,
-                                char *err, size_t errlen) {
-    pulsar_spec_rows src;
-    memset(&src, 0, sizeof src);
-    if (spec_target(s)->verify_rows) {
-        if (!spec_target(s)->verify_rows(s, r, rows, row0, &src, err, errlen)) return -1;
-    } else {
-        /* the block holds every row: draft i is judged against round-local row i (the row that
-         * PREDICTS it), its argmax computed here */
-        for (uint32_t i = 0; i < r->K && i < 16u; i++)
-            r->row_tops[i] = (int)sample_argmax(rows + ((size_t)row0 + i) * spec_vocab(s), spec_vocab(s));
-        src.read = pulsar_spec_row_read_block;
-        src.ud = &src;
-        src.block.rows = rows;
-        src.block.row0 = row0;
-        src.block.vocab = spec_vocab(s);
-    }
+/* The batched lane's round end: the round's verdict from the step's walk (spec_walk_rounds), then the one
+ * round_end. */
+static int spec_round_end_walked(pulsar_session *s, pulsar_spec_round *r,
+                                 int first_token,
+                                 float temperature, int top_k, float top_p,
+                                 float min_p, uint32_t greedy_rows,
+                                 const uint32_t *masks, uint32_t mask_rows, uint64_t *rng,
+                                 const pulsar_gpu_spec_walk_out *wv, uint32_t row0,
+                                 const int32_t *forced_truth,
+                                 int *accepted, int accepted_cap,
+                                 char *err, size_t errlen) {
     return spec_round_end(s, r, first_token,
                           temperature, top_k, top_p, min_p, greedy_rows, masks, mask_rows, rng,
-                          &src, row0,
+                          wv, row0,
                           true /* L150: redraft deferred to the batch */,
                           0.0 /* t0: step_ms diagnostic reads 0 in this lane */,
                           forced_truth, accepted, accepted_cap, err, errlen);
 }
 
-
-
+/* One round against the last shared forward's rows [row0, row0 + n_batch): its walk, then its end. */
 int pulsar_session_spec_round_end_local(pulsar_session *s, pulsar_spec_round *r,
                                int first_token,
                                float temperature, int top_k, float top_p,
                                float min_p, uint32_t greedy_rows,
                                const uint32_t *masks, uint32_t mask_rows, uint64_t *rng,
-                               const float *rows, uint32_t row0,
+                               uint32_t row0,
                                int *accepted, int accepted_cap,
                                char *err, size_t errlen) {
-    return spec_round_end_block(s, r, first_token, temperature, top_k, top_p,
-                                min_p, greedy_rows, masks, mask_rows, rng, rows, row0, NULL, accepted, accepted_cap,
-                                err, errlen);
+    if (temperature > 0.0f && !rng) {
+        snprintf(err, errlen, "spec round: a sampled walk needs the request's stream");
+        return -1;
+    }
+    const spec_walk_round w = {r, row0, temperature, top_k, top_p, min_p, greedy_rows, rng ? *rng : 0u,
+                                masks, mask_rows};
+    pulsar_gpu_spec_walk_out wv;
+    if (!spec_walk_rounds(s, &w, 1, &wv, err, errlen)) return -1;
+    return spec_round_end_walked(s, r, first_token, temperature, top_k, top_p, min_p, greedy_rows, masks, mask_rows,
+                                 rng, &wv, row0,
+                                 NULL, accepted, accepted_cap, err, errlen);
 }
 
 int pulsar_session_spec_round_end_forced(pulsar_session *s, pulsar_spec_round *r,
                                       int first_token,
                                       float temperature, int top_k, float top_p,
                                       float min_p, uint64_t *rng,
-                                      const float *rows, uint32_t row0,
+                                      uint32_t row0,
                                       const int32_t *truth,
                                       int *accepted, int accepted_cap,
                                       char *err, size_t errlen) {
@@ -1262,9 +1169,9 @@ int pulsar_session_spec_round_end_forced(pulsar_session *s, pulsar_spec_round *r
         snprintf(err, errlen, "spec round_end_forced: no truth");
         return -1;
     }
-    return spec_round_end_block(s, r, first_token, temperature, top_k, top_p,
-                                min_p, 0u, NULL, 0u, rng, rows, row0, truth, accepted, accepted_cap,
-                                err, errlen);
+    return spec_round_end_walked(s, r, first_token, temperature, top_k, top_p, min_p, 0u, NULL, 0u, rng, NULL, row0,
+                                 truth,
+                                 accepted, accepted_cap, err, errlen);
 }
 
 
@@ -1395,8 +1302,25 @@ void pulsar_session_spec_assemble_batch_local(pulsar_session *s, pulsar_spec_ste
     *n_rows_out = rows;
 }
 
-void pulsar_session_spec_round_end_batch_local(pulsar_session *s, pulsar_spec_step *steps, int n,
-                                               const float *rows) {
+void pulsar_session_spec_round_end_batch_local(pulsar_session *s, pulsar_spec_step *steps, int n) {
+    /* L302: every round's walk over the shared forward's rows in one launch, before any bank switch (the walk reads
+     * each round's drafts and its stream, both host-side in the step) */
+    spec_walk_round w[PULSAR_GPU_SAMPLE_ROWS_MAX];
+    int widx[PULSAR_MSEQ_MAX];
+    pulsar_gpu_spec_walk_out wv[PULSAR_GPU_SAMPLE_ROWS_MAX];
+    uint32_t nw = 0;
+    char werr[160] = "";
+    bool walked = true;
+    for (int i = 0; i < n && i < (int)PULSAR_MSEQ_MAX; i++) {
+        pulsar_spec_step *st = &steps[i];
+        widx[i] = -1;
+        if (!st->round || st->round->n_batch == 0 || nw == PULSAR_GPU_SAMPLE_ROWS_MAX) continue;
+        if (st->temperature > 0.0f && !st->rng) continue;   /* its round_end refuses below */
+        w[nw] = {st->round, st->row0, st->temperature, st->top_k, st->top_p, st->min_p, st->greedy_rows,
+                 st->rng ? *st->rng : 0u, st->masks, st->mask_rows};
+        widx[i] = (int)nw++;
+    }
+    if (nw > 0) walked = spec_walk_rounds(s, w, nw, wv, werr, sizeof werr);
     /* L260: each bank's walk records its committed capture rows; one banked seed
      * after the loop shares the drafter's main_proj / attn_kv reads across every
      * bank (they were re-read per committed row -- 16 to 32 times a step at c16). */
@@ -1412,12 +1336,15 @@ void pulsar_session_spec_round_end_batch_local(pulsar_session *s, pulsar_spec_st
             st->status = PULSAR_SPEC_STEP_RESTORE_FAILED;
             continue;
         }
-        const int na = pulsar_session_spec_round_end_local(s, st->round, st->first_token,
-                                                           st->temperature, st->top_k, st->top_p,
-                                                           st->min_p, st->greedy_rows, st->masks, st->mask_rows,
-                                                           st->rng, rows, st->row0,
-                                                           st->accepted, st->accepted_cap,
-                                                           st->err, sizeof st->err);
+        int na = -1;
+        if (i >= (int)PULSAR_MSEQ_MAX || widx[i] < 0 || !walked)
+            snprintf(st->err, sizeof st->err, "%s", walked ? "spec round: the step's walk did not carry this round"
+                                                           : werr);
+        else
+            na = spec_round_end_walked(s, st->round, st->first_token, st->temperature, st->top_k, st->top_p,
+                                       st->min_p, st->greedy_rows, st->masks, st->mask_rows, st->rng,
+                                       &wv[widx[i]], st->row0, NULL,
+                                       st->accepted, st->accepted_cap, st->err, sizeof st->err);
         if (na < 0) st->status = PULSAR_SPEC_STEP_FAILED;
         else st->n_accepted = na;
         st->pos_after = s->pos();

@@ -103,12 +103,9 @@ static int create_rank(int rank, int port, pulsar_tp **out, char *err,
     return pulsar_tp_create(out, &opt, &id, err, errlen);
 }
 
-/* Mode C's agreed step-1 logits digest (both ranks compute the same bytes). */
-static uint64_t mode3_digest(void) {
-    static float logits[64];
-    for (uint32_t i = 0; i < 64; i++) logits[i] = pat(0, 7, i);
-    return pulsar_tp_logits_digest(logits, 1u, 64u);
-}
+/* Mode C's agreed step-1 logits digest (both ranks hold the same value; the protocol carries it, it does not
+ * compute it). */
+static uint64_t mode3_digest(void) { return 0x5ca1ab1e0ddba11ull; }
 #define MODE3_SID 9393u
 #define MODE3_GATE_BYTES 65536u
 static pid_t g_child = -1;

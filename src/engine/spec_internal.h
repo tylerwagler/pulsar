@@ -36,27 +36,11 @@ typedef struct pulsar_spec_round {
     int32_t pend[16];       ///< the drafted token ids, in draft order
     float pend_conf[16];    ///< confidence head's score per draft position
     bool copy;              ///< L288: the drafts are a copy chain (their verdict feeds the copy acceptance)
-    int row_tops[16];       ///< the target's argmax per verify row; the greedy walk's comparison
     /** The target's state snapshot taken before the verify (pulsar_spec_target_ops snapshot / restore /
      * release own its contents; malloc'd, freed with the round), so a partial accept can roll back. */
     void *snap;
     spec_redraft_req redraft;   ///< L150: batched-lane deferred redraft (see the typedef)
 } pulsar_spec_round;
-
-/** Round-local row i (i = 0 the base row, i = j the row that judges draft j) -> its full target logits. */
-typedef bool (*pulsar_spec_row_read_fn)(void *ud, uint32_t row, float *out);
-
-/** How a round reads its verify rows: a reader plus what it reads from -- the caller's logits block at
- * the round's offset (the core's reader) or the target's own device rows (a target reader). */
-typedef struct pulsar_spec_rows {
-    pulsar_spec_row_read_fn read;
-    void *ud;               ///< what `read` takes: `&block` or `&target`
-    /** Compact candidate rows for the walk (PULSAR_DSPARK_PREFILTER_ROW_I32 ints a row, indexed by the
-     *  row's ABSOLUTE index in the forward), or NULL = the walk builds from full rows. */
-    const int32_t *compact;
-    struct { const float *rows; uint32_t row0; uint32_t vocab; } block;   ///< the core's reader
-    struct { void *g; uint32_t row0; } target;                            ///< a target reader's handle
-} pulsar_spec_rows;
 
 /* ---- the core's helpers the implementations use ---- */
 /** The width of every host logits row the round API reads or stores (the engine's logits width). */
@@ -105,8 +89,6 @@ float pulsar_spec_copy_conf(const pulsar_session *s);
  *  params -- what a drafter's draft / draft_batch fills (the rest of the record is the caller's). */
 void pulsar_spec_draft_req_init(pulsar_session *s, spec_redraft_req *q, int next_base, float temperature, int top_k,
                                 float top_p, float min_p);
-/** The core's reader over `rows->block`. */
-bool pulsar_spec_row_read_block(void *ud, uint32_t row, float *out);
 /** Stamp a drafter's result record into the installed bank's pendings (the one way pendings are written). */
 void pulsar_spec_redraft_stamp(pulsar_session *s, spec_redraft_req *q);
 /** `bank`'s speculative shadow for a read: the live state for the installed bank, the saved carry's for

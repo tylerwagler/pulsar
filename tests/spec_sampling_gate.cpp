@@ -82,8 +82,8 @@
  * min_p 0. top_p is not a knob to turn down casually — see the note at its
  * parse below; too low makes the nucleus a single token and the chi-square
  * passes vacuously. min_p > 0 is what makes this gate NON-VACUOUS for the
- * min-p prefilter in pulsar_sample_dist_build (dev-minp): at min_p == 0 the
- * prefilter path is not even entered. The server default is 0.05.
+ * sampler's min-p arm (pulsar_cuda_sampler.cu): at min_p == 0 that arm is not
+ * even entered. The server default is 0.05.
  */
 #include <math.h>
 #include <stdio.h>
@@ -195,10 +195,21 @@ static int sampled_plain_batch(pulsar_session *s, const start_state *snap,
             if (rc == 0) snprintf(err, errlen, "decode_mixed returned %u rows for %u banks", rows, m);
             return -1;
         }
+        /* every bank's row drawn in one device launch, each at its own stream's key (L302) */
+        uint32_t qrow[SAMPLED_BANKS_PLAIN];
+        pulsar_row_draw d[SAMPLED_BANKS_PLAIN];
+        int drawn[SAMPLED_BANKS_PLAIN];
+        for (uint32_t q = 0; q < m; q++) {
+            qrow[q] = q;
+            d[q] = pulsar_row_draw{temp, 0, top_p, min_p, &rng[who[q]], false, NULL};
+        }
+        if (pulsar_session_draw_rows(s, qrow, d, m, drawn) != 0) {
+            snprintf(err, errlen, "the batched draw failed");
+            return -1;
+        }
         for (uint32_t q = 0; q < m; q++) {
             const int b = who[q];
-            const float *row = logits + (size_t)q * (size_t)vocab;
-            const int tok = pulsar_sample_logits(row, vocab, temp, 0, top_p, min_p, &rng[b]);
+            const int tok = drawn[q];
             seq[t0 + b][got[b]++] = tok;
             reqs[b].pos++; reqs[b].token = tok;
             if (pulsar_token_is_stop(e, tok) || got[b] >= DEPTH) live[b] = 0;
@@ -285,7 +296,7 @@ static int sampled_spec_batch(pulsar_session *s, const start_state *snap,
             }
             int accepted[17];
             const int na = pulsar_session_spec_round_end(s, r[b], first[b], temp, 0, top_p, min_p,
-                                                         &rng[b], logits, row0[b], accepted, 17,
+                                                         &rng[b], row0[b], accepted, 17,
                                                          err, errlen);
             if (na < 0) return -1;
             for (int i = 0; i < na && got[b] < DEPTH; i++) seq[t0 + b][got[b]++] = accepted[i];
