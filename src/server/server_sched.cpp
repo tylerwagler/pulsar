@@ -461,6 +461,22 @@ int server_route_turn_anchor(const pulsar_tokens *bank, int prefilled, const pul
     return first_assistant >= 0 && last_user > first_assistant ? last_user : -1;
 }
 
+/* L311: the bank's GENERATION-HEADER anchor -- the last token of the last assistant marker among the tokens the bank
+ * PREFILLED (its last prompt's generation header: the history of complete messages before it is that prompt's message
+ * endpoint), first turn included.  A request that carries that whole marker is this conversation's next turn whatever
+ * the template did to the reply after it: a template that truncates history reasoning (Nemotron's
+ * truncate_history_thinking, always on: the bank holds "<think>\nREASONING</think>answer", the next prompt re-renders
+ * the turn "<think></think>answer") or a client that strips it diverges right after the header, past every complete
+ * message (the 2026-10-21 opencode report: every Nemotron turn took a fresh bank).  The 2026-10-04 clobber diverged
+ * inside the first user message, before any header.  -1 when the markers are unknown or there is none. */
+int server_route_header_anchor(const pulsar_tokens *bank, int prefilled, const pulsar_turn_markers *m) {
+    if (!bank || !bank->v || !m || m->n_assistant <= 0) return -1;
+    if (prefilled > bank->len) prefilled = bank->len;
+    for (int i = prefilled - 1; i >= 0; i--)
+        if (pulsar_turn_marker_at(m, bank->v, prefilled, i) == 2) return i + m->n_assistant - 1;
+    return -1;
+}
+
 /* L264: does the job continue on its best bank?  Yes when it carries everything
  * that bank PREFILLED (common >= prefilled: it IS that conversation's next turn,
  * whatever it did to the bank's generated tail -- an agent client drops the
@@ -608,10 +624,14 @@ session_slot *server::choose_slot_for_job(job *j, int *reject_ctx,
     }
     const int frontier = best ? s->slot_frontier_pos(best) : 0;
     const int prefilled = best && s->sess ? pulsar_session_bank_prefill_frontier(s->sess, best->bank) : 0;
-    /* L275: the bank's last-turn anchor, from the history it prefilled. */
-    const int anchor = best && s->sess
-        ? server_route_turn_anchor(pulsar_session_bank_tokens(s->sess, best->bank), prefilled, &s->turn_markers)
-        : -1;
+    /* L275: the bank's last-turn anchor, from the history it prefilled; L311: or its generation header's */
+    int anchor = -1;
+    if (best && s->sess) {
+        const pulsar_tokens *bt = pulsar_session_bank_tokens(s->sess, best->bank);
+        anchor = server_route_turn_anchor(bt, prefilled, &s->turn_markers);
+        const int header = server_route_header_anchor(bt, prefilled, &s->turn_markers);
+        if (header > anchor) anchor = header;
+    }
     const bool in_place = best && server_route_in_place(best_common, best_score, frontier, prefilled,
                                                         s->slot_trivial_common_tokens, anchor);
     /* One line per bind decision: which bank, how deep the match, where it resumes, what it costs the bank, and

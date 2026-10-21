@@ -3193,6 +3193,9 @@ bool server_slot_match_is_trivial(int common, int slot_pos,
  * when a completed exchange precedes it; -1 otherwise (defined in
  * server_sched.cpp; unit-tested in server_tests.cpp). */
 int server_route_turn_anchor(const pulsar_tokens *bank, int prefilled, const pulsar_turn_markers *m);
+/** L311: the last token of the last assistant marker (the generation header) among the bank's prefilled tokens,
+ *  first turn included; a request that matches past it is the conversation's next turn.  -1 when none / unknown. */
+int server_route_header_anchor(const pulsar_tokens *bank, int prefilled, const pulsar_turn_markers *m);
 /* L264 S3 + L275: does the best-scoring free bank take the request in place, or
  * is a fresh bank preferred.  `anchor` is server_route_turn_anchor's answer for
  * that bank (defined in server_sched.cpp; unit-tested in server_tests.cpp). */
