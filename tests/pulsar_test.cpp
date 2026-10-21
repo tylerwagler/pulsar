@@ -3720,6 +3720,104 @@ static void test_fused_chunk(void) {
     free(e);
 }
 
+/* L311: the record pool and the endpoint cut, host only -- a fake kv-state whose walk moves no byte (every slab NULL,
+ * every record's capacity above the walk's size, so nothing allocates), on a split-invariant grid of 128. */
+static bool fake_walk(void *, int, bool, pulsar_gpu_tensor *, uint64_t, uint32_t, uint64_t *bytes) {
+    if (bytes) *bytes = 1024;
+    return true;
+}
+static uint32_t fake_min_ckpt(void *) { return 1u; }
+static bool fake_true_why(void *, uint32_t, char *, size_t) { return true; }
+static bool fake_true_at(void *, uint32_t) { return true; }
+static void fake_restored(void *) {}
+static bool fake_install(void *, uint32_t, uint32_t) { return true; }
+
+static void test_ckpt_records(void) {
+    pulsar_kv_state_ops ops = {};
+    ops.name = "fake";
+    ops.resume_grid = 128u;
+    ops.split_invariant = true;
+    ops.ckpt_slots = 2u;
+    ops.walk = fake_walk;
+    ops.min_checkpoint = fake_min_ckpt;
+    ops.stands_at = fake_true_why;
+    ops.holds = fake_true_at;
+    ops.prepare_restore = fake_true_at;
+    ops.restored = fake_restored;
+    ops.frontier_at = fake_true_why;
+    ops.install_frontier = fake_install;
+    pulsar_ckpt_store *st = (pulsar_ckpt_store *)calloc(1, sizeof(pulsar_ckpt_store));
+    st->ops = &ops;
+    /* the pool's size: two for one bank, n + n / 2 above that */
+    TEST_ASSERT(pulsar_ckpt_records_for(1) == 2u && pulsar_ckpt_records_for(4) == 6u && pulsar_ckpt_records_for(16) == 24u);
+    st->n_rec = pulsar_ckpt_records_for(2);   /* 3 records for 2 banks */
+    for (uint32_t i = 0; i < st->n_rec; i++) st->rec[i].cap = 1u << 20;
+    int toks[600];
+    for (int i = 0; i < 600; i++) toks[i] = 1000 + i;
+    float lg[4] = {1, 2, 3, 4}, out[4] = {0};
+    /* a prompt end keeps logits, an endpoint none; a kind and its logits must agree */
+    TEST_ASSERT(!pulsar_ckpt_record_capture(st, 0, PULSAR_CKPT_REC_END, 300, toks, NULL, 0));
+    TEST_ASSERT(!pulsar_ckpt_record_capture(st, 0, PULSAR_CKPT_REC_ENDPOINT, 297, toks, lg, 4));
+    TEST_ASSERT(pulsar_ckpt_record_capture(st, 0, PULSAR_CKPT_REC_END, 300, toks, lg, 4));
+    TEST_ASSERT(pulsar_ckpt_record_capture(st, 0, PULSAR_CKPT_REC_ENDPOINT, 297, toks, NULL, 0));
+    TEST_ASSERT(pulsar_ckpt_end(st, 0) == 300u && pulsar_ckpt_end(st, 1) == 0u);
+    /* the deepest matching record within the limit; a resume AT a record without logits is not one */
+    const pulsar_ckpt_record *r = pulsar_ckpt_record_best(st, 0, toks, 600, 600, 600);
+    TEST_ASSERT(r && r->T == 300u && r->kind == PULSAR_CKPT_REC_END);
+    r = pulsar_ckpt_record_best(st, 0, toks, 600, 299, 600);
+    TEST_ASSERT(r && r->T == 297u && r->kind == PULSAR_CKPT_REC_ENDPOINT);
+    TEST_ASSERT(pulsar_ckpt_record_best(st, 0, toks, 600, 297, 297) == NULL);   /* AT 297: no logits there */
+    r = pulsar_ckpt_record_best(st, 0, toks, 600, 300, 300);
+    TEST_ASSERT(r && r->T == 300u);
+    /* other ids below T: no match; another bank: none */
+    toks[100] = 7;
+    TEST_ASSERT(pulsar_ckpt_record_best(st, 0, toks, 600, 600, 600) == NULL);
+    toks[100] = 1100;
+    TEST_ASSERT(pulsar_ckpt_record_best(st, 1, toks, 600, 600, 600) == NULL);
+    /* a second capture of a kind replaces the bank's first */
+    TEST_ASSERT(pulsar_ckpt_record_capture(st, 0, PULSAR_CKPT_REC_END, 310, toks, lg, 4));
+    TEST_ASSERT(pulsar_ckpt_end(st, 0) == 310u);
+    uint32_t n0 = 0;
+    for (uint32_t i = 0; i < st->n_rec; i++) n0 += st->rec[i].T != 0u && st->rec[i].bank == 0u;
+    TEST_ASSERT(n0 == 2u);
+    /* a full pool evicts the least recently used: bank 1 takes the third record, then its endpoint takes the oldest
+     * (bank 0's endpoint, captured before its newer prompt end) */
+    TEST_ASSERT(pulsar_ckpt_record_capture(st, 1, PULSAR_CKPT_REC_END, 200, toks, lg, 4));
+    TEST_ASSERT(pulsar_ckpt_record_capture(st, 1, PULSAR_CKPT_REC_ENDPOINT, 190, toks, NULL, 0));
+    TEST_ASSERT(pulsar_ckpt_record_of(st, 0, PULSAR_CKPT_REC_ENDPOINT) == NULL);
+    TEST_ASSERT(pulsar_ckpt_end(st, 0) == 310u && pulsar_ckpt_end(st, 1) == 200u);
+    /* a restore puts the bank at T, hands back the logits, drops its records above T, stamps the record used */
+    r = pulsar_ckpt_record_of(st, 1, PULSAR_CKPT_REC_ENDPOINT);
+    TEST_ASSERT(r && pulsar_ckpt_record_restore(st, 1, r, NULL, 0));
+    TEST_ASSERT(pulsar_ckpt_end(st, 1) == 0u && pulsar_ckpt_record_of(st, 1, PULSAR_CKPT_REC_ENDPOINT));
+    TEST_ASSERT(!pulsar_ckpt_record_restore(st, 0, r, NULL, 0));   /* not bank 0's */
+    r = pulsar_ckpt_record_of(st, 0, PULSAR_CKPT_REC_END);
+    TEST_ASSERT(r && pulsar_ckpt_record_restore(st, 0, r, out, 4) && out[3] == 4.0f);
+    /* the frontier rule: a history lowered below T drops the record; a dropped bank holds none */
+    pulsar_ckpt_frontier_lowered(st, 0, 309);
+    TEST_ASSERT(pulsar_ckpt_end(st, 0) == 0u);
+    pulsar_ckpt_drop_bank(st, 1);
+    TEST_ASSERT(pulsar_ckpt_record_of(st, 1, PULSAR_CKPT_REC_ENDPOINT) == NULL);
+    /* the cut rule stops a chunk at the plan's endpoint, then at the final grid point: [0, 297), [297, 384),
+     * [384, 400) for a 400-token prompt (cap 4096) */
+    pulsar_prefill_shape shape = {4096u, 4096u, 1u};
+    pulsar_tokens p = {toks, 400, 400};
+    pulsar_prefill_plan plan;
+    pulsar_prefill_plan_init(&plan, &shape, 0u, st, NULL, &p, NULL, 0);
+    TEST_ASSERT(plan.endpoint == 0u && pulsar_prefill_plan_next_end(&plan, 0u, 400u) == 384u);
+    plan.endpoint = 297u;
+    TEST_ASSERT(pulsar_prefill_plan_next_end(&plan, 0u, 400u) == 297u);
+    TEST_ASSERT(pulsar_prefill_plan_next_end(&plan, 297u, 400u) == 384u);
+    TEST_ASSERT(pulsar_prefill_plan_next_end(&plan, 384u, 400u) == 400u);
+    /* an endpoint past the grid point: [0, 384), [384, 390), [390, 400) */
+    plan.endpoint = 390u;
+    TEST_ASSERT(pulsar_prefill_plan_next_end(&plan, 0u, 400u) == 384u);
+    TEST_ASSERT(pulsar_prefill_plan_next_end(&plan, 384u, 400u) == 390u);
+    TEST_ASSERT(pulsar_prefill_plan_next_end(&plan, 390u, 400u) == 400u);
+    pulsar_ckpt_release(st);
+    free(st);
+}
+
 /* L263 / L284: the lane cost fit (both decode lanes').  A linear step cost with
  * spread row counts fits to its terms; too few steps, one row count, or a
  * non-positive term is not a price (valid stays false) -- though one row count
@@ -3961,6 +4059,7 @@ static const pulsar_test_entry test_entries[] = {
     {"--attn-layout", "attn-layout", "CSA2 attention layout table: modes + sources derived from the V4.1 source sets (L218)", test_attn_layout_table},
     {"--lane-cost", "lane-cost", "lane cost fit: a step's measured cost to its terms, its centre, or no price at all (L263, L284)", test_lane_cost_fit},
     {"--fused-chunk", "fused-chunk", "the fused step's cost fit and the continuation chunk solved from a time budget (L304)", test_fused_chunk},
+    {"--ckpt-records", "ckpt-records", "the record pool (prompt ends, message endpoints: capture, match, LRU, frontier rule) and the endpoint cut (L311)", test_ckpt_records},
     {"--verify-pick", "verify-pick", "the verify pick: the brute-force argmax on a staircase curve, the robust online correction, the lockstep continuation (L301)", test_verify_pick},
     {"--lib-image-rope", "lib-image-rope", "multi-axis rope positions from the image records vs HF get_rope_index (L268)", test_lib_image_rope},
     {"--lib-image-identity", "lib-image-identity", "the core image identity: records per block, rewind keeps survivors, a chain persists past a block only with its record (L281)", test_lib_image_identity},

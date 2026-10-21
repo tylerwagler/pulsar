@@ -3100,8 +3100,13 @@ struct pulsar_ckpt_store *pulsar_session_kv_store(pulsar_session *s);
 uint32_t pulsar_session_live_bank(pulsar_session *s);
 /** L266 step 5: where a sync of `prompt_len` tokens sharing `common` with `bank`'s history resumes --
  * the deepest grid checkpoint within the shared prefix, the bank's prefill-only history and one
- * token short of the prompt (the last row must be evaluated for the logits); 0 = prefill from 0. */
+ * token short of the prompt (the last row must be evaluated for the logits); 0 = prefill from 0.
+ * L289 / L311: or a deeper record of the bank's within the prefix and the prefill-only history -- at the
+ * prompt's end with its logits (every family), or below it on a split-invariant family. */
 uint32_t pulsar_session_resume_point(pulsar_session *s, uint32_t bank, int common, int prompt_len);
+/** L311: the record a resume at T (pulsar_session_resume_point's answer) restores -- NULL when T, below the prompt's
+ *  end, is a grid checkpoint of the bank's (or 0, or no record of its is at T). */
+const pulsar_ckpt_record *pulsar_session_resume_record(pulsar_session *s, uint32_t bank, uint32_t T, int prompt_len);
 /** L284: whether a sync continues `bank`'s history where its first `len` tokens end, every family's one rule:
  * those tokens are all prefill rows (none a decode step's), the cut is one the model's prefill reproduces
  * (anywhere when pulsar_kv_state_ops::split_invariant, else on the resume grid) and the bank's state is not
@@ -3399,8 +3404,9 @@ void pulsar_session_note_committed(pulsar_session *s, const int *toks, int n);
 /** THE cut rule (prefill_loop.cpp, L284): a walk's chunk ends, as a pure function of the chunk's start, the
  *  prompt's end and these fixed inputs.  In order: snap to the absolute grid of `grid_cap` (at most `chunk_cap`
  *  rows); round a non-final end down to `align`; move an end that would split an image block to the block's start
- *  (or past its end when the block starts the chunk); then cut the final chunk at the prompt's last resume-grid
- *  point (pulsar_ckpt_final_cut) unless that lands inside a block. */
+ *  (or past its end when the block starts the chunk); stop at the prompt's message endpoint inside the chunk (L311);
+ *  then cut the final chunk at the prompt's last resume-grid point (pulsar_ckpt_final_cut) unless that lands inside a
+ *  block. */
 typedef struct {
     uint32_t grid_cap, chunk_cap, align;
     const pulsar_ckpt_store *store;          ///< the resume grid the final cut lands on
@@ -3408,7 +3414,14 @@ typedef struct {
     const pulsar_tokens *prompt;
     const pulsar_image_ref *images;          ///< the request's blocks (NULL / 0 = text)
     int n_images;
+    uint32_t endpoint;                       ///< L311: the message endpoint a chunk stops at (0 = none; the walk's)
 } pulsar_prefill_plan;
+/** L311: the prompt's MESSAGE ENDPOINT -- where its last turn marker begins (pulsar_turn_marker_at): the history of
+ *  complete messages before the generation header, the point an agent's side request (the same history plus a
+ *  message of its own) and a re-rendered generation header branch from.  Only a split-invariant family's (any cut
+ *  is its cold prefill's bytes, so the cut the record needs moves no byte); 0 for another family, a prompt with no
+ *  marker past position 0, or one below the store's smallest checkpoint. */
+uint32_t pulsar_prompt_endpoint(pulsar_engine *e, const pulsar_ckpt_store *store, const pulsar_tokens *prompt);
 /** The plan of a walk from `start` (chunk_cap = the shape's resumed width when start != 0). */
 void pulsar_prefill_plan_init(pulsar_prefill_plan *p, const pulsar_prefill_shape *shape, uint32_t start,
                               const pulsar_ckpt_store *store, const pulsar_engine *e, const pulsar_tokens *prompt,
