@@ -198,6 +198,25 @@ static uint32_t ds4_pools(void *state, pulsar_kv_pool *out, uint32_t cap) {
     return n;
 }
 
+/* L313: bank `bank`'s own pools (the per-bank managed allocations ds4_pools' views repoint onto), ds4_pools' order;
+ * none on a graph without a bank pool. */
+static uint32_t ds4_bank_pools(void *state, uint32_t bank, pulsar_kv_pool *out, uint32_t cap) {
+    pulsar_gpu_graph *g = G_(state);
+    const pulsar_bank_slabs *b = &g->banks;
+    if (b->n_banks == 0 || bank >= b->n_banks) return 0;
+    uint32_t n = 0;
+    for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
+        if (!gpu_graph_layer_is_kv_source(il)) continue;
+        const uint32_t r = pulsar_layer_compress_ratio(il);
+        if (n < cap) out[n] = { b->comp[il][bank], r, pulsar_kv_row_bytes(PULSAR_KV_ROW_COMP), true };
+        n++;
+        if (!gpu_graph_layer_has_index_pool(il)) continue;
+        if (n < cap) out[n] = { b->index[il][bank], r, pulsar_kv_row_bytes(PULSAR_KV_ROW_INDEX), true };
+        n++;
+    }
+    return n;
+}
+
 /* L284: the payload's frontier (session_payload.cpp).  The lanes describe T when every pool stands at T (a
  * decode row emits as a prefill row does) and no off-grid rewind left the compressor group stale. */
 static bool ds4_frontier_at(void *state, uint32_t T, char *why, size_t whylen) {
@@ -245,4 +264,5 @@ const pulsar_kv_state_ops PULSAR_KV_STATE_DS4 = {
     /* .install_frontier   = */ ds4_install_frontier,
     /* .trailing_pools     = */ NULL,   /* no row trails its position */
     /* .noted_at           = */ ds4_noted_at,
+    /* .bank_pools         = */ ds4_bank_pools,
 };
