@@ -34,10 +34,19 @@
  * is only that the first real generation pays the materialization instead).
  * The session state is shrunk to a single token afterwards so the warmup
  * transcript can never win slot routing, hit the disk KV min-tokens floor,
- * or collide with a real conversation. */
-static void server_warmup_generation(pulsar_engine *engine, pulsar_session *session,
+ * or collide with a real conversation.
+ *
+ * L306: the warmup is also the CUDA-graph catalog's declaration window
+ * (pulsar_gpu_seg_catalog_open): every graphed shape it runs -- the verify
+ * curve's walk over every verify width, the drafter's sweep over its bank
+ * counts and attention bounds -- is captured before the listener opens.  A
+ * declared shape whose capture FAILED is not best-effort: it would refuse
+ * every live step of that shape, so the server refuses to start (returns
+ * false) and the log names the key. */
+static bool server_warmup_generation(pulsar_engine *engine, pulsar_session *session,
                                      int ctx_size) {
     const double t0 = server_now_sec();
+    pulsar_gpu_seg_catalog_open();
     const uint64_t avail_before = server_mem_available_bytes();
     /* One full prefill-cap chunk plus a tail: exercises the widened chunk
      * prefill shape AND the sub-chunk tail shape.  The session's resolved
@@ -133,6 +142,7 @@ static void server_warmup_generation(pulsar_engine *engine, pulsar_session *sess
     }
     pulsar_tokens_free(&prompt);
     pulsar_tokens_free(&body);
+    const uint64_t graph_failed = pulsar_gpu_seg_catalog_close();
     const uint64_t avail_after = server_mem_available_bytes();
     if (ok) {
         server_log(PULSAR_LOG_DEFAULT,
@@ -151,6 +161,14 @@ static void server_warmup_generation(pulsar_engine *engine, pulsar_session *sess
                    "generation will pay the deferred CUDA allocations instead",
                    err[0] ? err : "empty warmup prompt");
     }
+    if (graph_failed) {
+        server_log(PULSAR_LOG_DEFAULT,
+                   "pulsar-server: %llu graphed shape(s) of the warmup catalog FAILED or refused their capture "
+                   "(the L306 lines above name them) -- refusing to start",
+                   (unsigned long long)graph_failed);
+        return false;
+    }
+    return true;
 }
 
 
@@ -811,7 +829,11 @@ int main(int argc, char **argv) {
 
     /* Materialize the lazy first-generation CUDA working set BEFORE deriving
      * the admission budget or opening the listener (F1, task #32). */
-    server_warmup_generation(engine, session, cfg.ctx_size);
+    if (!server_warmup_generation(engine, session, cfg.ctx_size)) {
+        pulsar_session_free(session);
+        pulsar_engine_close(engine);
+        return 1;
+    }
 
     /* Re-derive the admission budget from MEASURED post-warmup MemAvailable
      * (the est==actual discipline applied to the budget itself): the static

@@ -161,6 +161,6 @@ int pulsar_mtp_draft_batch(pulsar_session *s, pulsar_spec_round **rounds, const 
 /** A family's MTP drafter: its numbers (spec_ops.h pulsar_drafter_ops), the lane's functions. */
 #define PULSAR_MTP_DRAFTER_OPS(NAME, DEPTH, DEPTH_MAX, TAU, ADAPT)                                                    \
     { (NAME), (DEPTH), (DEPTH_MAX), (TAU), (ADAPT), NULL, NULL, pulsar_mtp_absorb_banked, pulsar_mtp_draft, NULL,     \
-      pulsar_mtp_draft_batch }
+      pulsar_mtp_draft_batch, NULL }
 
 #endif /* PULSAR_SPEC_MTP_H */

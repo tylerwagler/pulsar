@@ -1796,6 +1796,22 @@ int pulsar_gpu_matmul_decode_exact_rows(void) { return PULSAR_LT_DECODE_MIN_ROWS
  * suffix reads the producer's full-width E4M3 slot (data by pointer offset,
  * scales re-based by mx_scale_rebase_kernel) instead of quantising an offset
  * f32 view -- the last way an f32 activation reached this GEMM. */
+/* L306: a cuBLASLt shape cache's key (the GEMM's dims, its row count, its output dtype): the caches below keep every
+ * shape for the process -- an evicted shape's heuristic re-run inside a graph capture finds no kernel. */
+struct lt_cache_key {
+    uint64_t in_dim, out_dim, ntok, variant;
+    bool operator==(const lt_cache_key &o) const {
+        return in_dim == o.in_dim && out_dim == o.out_dim && ntok == o.ntok && variant == o.variant;
+    }
+};
+struct lt_cache_key_hash {
+    size_t operator()(const lt_cache_key &k) const {
+        uint64_t h = 0xcbf29ce484222325ull;
+        for (uint64_t v : {k.in_dim, k.out_dim, k.ntok, k.variant}) h = (h ^ v) * 0x100000001b3ull;
+        return (size_t)h;
+    }
+};
+
 static int cuda_matmul_fp8_mx_window(pulsar_gpu_tensor *out, const void *model_map, uint64_t model_size,
         uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim, const pulsar_gpu_tensor *x,
         uint64_t row0, uint64_t n_tok, const char *label) {
@@ -1851,8 +1867,10 @@ static int cuda_matmul_fp8_mx_window(pulsar_gpu_tensor *out, const void *model_m
      * scale pointers change between calls of the same (in,out,ntok) shape.
      * The workhorse prefill runs a handful of shapes x 43 layers per chunk,
      * so cache the handles and the chosen algo, and update just the scale
-     * pointers per call. Round-robin eviction; entries live for the process
-     * (bounded by the slot count). */
+     * pointers per call.  L306: never evicted -- an entry lives for the process (a shape's descriptors and algo are
+     * small host objects, and the shapes are the model's dims x the row counts it runs).  The round-robin eviction
+     * it replaces re-ran a dropped shape's heuristic on its next call, which inside a CUDA-graph capture finds no
+     * kernel: a captured step refused for a shape it had run before (L306, the warmup's verify walk). */
     struct lt_shape_cache {
         uint64_t in_dim, out_dim; int ntok; int valid;
         cublasLtMatmulDesc_t op;
@@ -1860,21 +1878,12 @@ static int cuda_matmul_fp8_mx_window(pulsar_gpu_tensor *out, const void *model_m
         cublasLtMatmulHeuristicResult_t h;
         int out_f16;  ///< D layout dtype: 0 = CUDA_R_32F, 1 = CUDA_R_16F (L045)
 };
-    /** thread_local for the same reason as the dspark reduce buffers: round-robin
-     * eviction below DESTROYS the cuBLASLt descriptors in the slot it takes, so
-     * as a process global a second submitting thread could destroy handles this
-     * one is about to hand to cublasLtMatmul -- and `cache_next` is a plain
-     * non-atomic counter two threads would both advance onto the same slot.
-     * Per-thread costs one heuristic search per thread per shape; the entries
-     * are small metadata objects, not device memory. */
-    static thread_local lt_shape_cache cache[32];
-    static thread_local int cache_next;
-    lt_shape_cache *e = NULL;
-    for (int i = 0; i < 32; i++) {
-        if (cache[i].valid && cache[i].in_dim == in_dim &&
-            cache[i].out_dim == out_dim && cache[i].ntok == ntok &&
-            cache[i].out_f16 == out_f16) { e = &cache[i]; break; }
-    }
+    /** thread_local: a second submitting thread gets its own descriptors (one heuristic search per thread per shape;
+     * the entries are small metadata objects, not device memory). */
+    static thread_local std::unordered_map<lt_cache_key, lt_shape_cache, lt_cache_key_hash> cache;
+    const lt_cache_key ck = {in_dim, out_dim, (uint64_t)ntok, (uint64_t)out_f16};
+    auto hit = cache.find(ck);
+    lt_shape_cache *e = hit != cache.end() ? &hit->second : NULL;
     if (!e) {
         lt_shape_cache ne = {};
         ne.in_dim = in_dim; ne.out_dim = out_dim; ne.ntok = ntok; ne.out_f16 = out_f16;
@@ -1914,13 +1923,7 @@ static int cuda_matmul_fp8_mx_window(pulsar_gpu_tensor *out, const void *model_m
             return 0;
         }
         ne.valid = 1;
-        e = &cache[cache_next];
-        cache_next = (cache_next + 1) & 31;
-        if (e->valid) {
-            cublasLtMatrixLayoutDestroy(e->la); cublasLtMatrixLayoutDestroy(e->lb);
-            cublasLtMatrixLayoutDestroy(e->ld); cublasLtMatmulDescDestroy(e->op);
-        }
-        *e = ne;
+        e = &cache.emplace(ck, ne).first->second;
     }
     cublasLtMatmulDescSetAttribute(e->op, CUBLASLT_MATMUL_DESC_A_SCALE_POINTER, &w->scale, sizeof(w->scale));
     cublasLtMatmulDescSetAttribute(e->op, CUBLASLT_MATMUL_DESC_B_SCALE_POINTER, &sx, sizeof(sx));
@@ -3279,15 +3282,13 @@ static int bf16_lt_decode_matmul(void *out, const uint16_t *w, const uint16_t *x
         cublasLtMatrixLayout_t la, lb, ld;
         cublasLtMatmulAlgo_t algo;
     };
-    static thread_local bf16_lt_decode_ent cache[64];
-    static thread_local int cache_next;
+    /* L306: never evicted (lt_cache_key): a dropped shape's heuristic, re-run inside a graph capture, finds no
+     * kernel -- the warmup's verify walk refused an 11-row head that way */
+    static thread_local std::unordered_map<lt_cache_key, bf16_lt_decode_ent, lt_cache_key_hash> cache;
     const int ntok = (int)n_tok;
-    bf16_lt_decode_ent *e = NULL;
-    for (int i = 0; i < 64; i++)
-        if (cache[i].valid && cache[i].in_dim == in_dim && cache[i].out_dim == out_dim && cache[i].ntok == ntok) {
-            e = &cache[i];
-            break;
-        }
+    const lt_cache_key ck = {in_dim, out_dim, n_tok, 0u};
+    auto hit = cache.find(ck);
+    bf16_lt_decode_ent *e = hit != cache.end() ? &hit->second : NULL;
     if (!e) {
         bf16_lt_decode_ent ne = {};
         ne.in_dim = in_dim; ne.out_dim = out_dim; ne.ntok = ntok;
@@ -3339,13 +3340,7 @@ static int bf16_lt_decode_matmul(void *out, const uint16_t *w, const uint16_t *x
                             "(first: %d rows, in %llu out %llu); below = the nt / one-row kernels\n",
                     PULSAR_LT_DECODE_MIN_ROWS, ntok, (unsigned long long)in_dim, (unsigned long long)out_dim);
         }
-        e = &cache[cache_next];
-        cache_next = (cache_next + 1) & 63;
-        if (e->valid) {
-            cublasLtMatrixLayoutDestroy(e->la); cublasLtMatrixLayoutDestroy(e->lb); cublasLtMatrixLayoutDestroy(e->ld);
-            cublasLtMatmulDescDestroy(e->op);
-        }
-        *e = ne;
+        e = &cache.emplace(ck, ne).first->second;
     }
     cuda_arena ar;
     if (!cuda_arena_begin(&ar, wz, "bf16 lt decode scratch")) return 0;

@@ -146,8 +146,10 @@ int pulsar_driver_session_create(pulsar_session *s, uint32_t n_banks) {
 
 void pulsar_driver_session_destroy(pulsar_session *s) {
     /* L296 perf: a captured decode step bakes this session's buffers (its key names them): drop every graph before
-     * they are freed and another allocation can take their addresses */
-    pulsar_gpu_seg_reset();
+     * they are freed and another allocation can take their addresses.  L306: a priced (dry) session never ran and
+     * holds nothing a graph baked -- its teardown leaves the live session's graphs (the server prices a slot after the
+     * warmup: that teardown dropped the whole warmup catalog, as pulsar_ds4_session_destroy already knew) */
+    if (!pulsar_gpu_tensor_dry_active()) pulsar_gpu_seg_reset();
     pulsar_state_destroy(s->states);
     s->states = NULL;
     if (s->driver) driver_bufs_free(s->driver);
@@ -337,13 +339,15 @@ static bool driver_forward(pulsar_session *s, pulsar_step_mode mode, const int32
                               : 0;
     if (ok && gkey) {
         const int seg = pulsar_gpu_seg_enter(gkey);
-        if (seg == 2) {
+        if (seg < 0) {
+            ok = false;   /* L306: this shape's graph failed (the runtime's line names it): the step refuses */
+        } else if (seg == 2) {
             driver_graph_announce(ARCH(e), st.verify, "replayed");
         } else if (seg == 1) {
             const bool body = launches();
-            /* a failed capture never ran its work: the launches again, eager (a real refusal refuses again) */
-            if (pulsar_gpu_seg_exit(gkey, body ? 1 : 0)) driver_graph_announce(ARCH(e), st.verify, "captured");
-            else ok = launches();
+            /* L306: a failed capture ran nothing and refuses -- no eager re-run */
+            ok = pulsar_gpu_seg_exit(gkey, body ? 1 : 0) != 0;
+            if (ok) driver_graph_announce(ARCH(e), st.verify, "captured");
         } else {
             ok = launches();
         }
