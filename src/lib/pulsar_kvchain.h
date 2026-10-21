@@ -66,6 +66,19 @@ int pulsar_kvchain_segment_ends(const int *Gs, int n, int prev, int span, bool c
 int pulsar_kvchain_persist(pulsar_segstore *st, pulsar_engine *e, pulsar_session *s, int min_tokens, bool close,
                            const pulsar_kvchain_trailer *trailer, pulsar_kvchain_persist_result *out);
 
+/** L310: the chain a restore of `text` would load, without loading it -- the deepest whose text is a byte prefix of
+ *  `text`, cut at the request's images exactly as pulsar_kvchain_restore cuts it -- into `chain` (root first), and
+ *  *bytes its stored payload + trailer bytes (what a load reads).  Returns its length; 0 when there is none or it
+ *  ends below `min_tokens`.  `err` says why a stored chain was cut short. */
+int pulsar_kvchain_find(pulsar_segstore *st, const char *text, size_t text_len, const uint64_t *image_hashes,
+                        int n_images, int min_tokens, pulsar_segstore_seg *chain, int cap, uint64_t *bytes, char *err,
+                        size_t errlen);
+/** L310: load the `n` segments pulsar_kvchain_find returned for `text` into the installed bank.  Returns the position
+ *  the bank stands at; 0 when a segment would not load or the chain disagrees with its tokens at the boundary (that
+ *  chain is dropped, the bank invalidated, `err` says which).  The chain is touched on success. */
+int pulsar_kvchain_load(pulsar_segstore *st, pulsar_engine *e, pulsar_session *s, const char *text,
+                        const pulsar_segstore_seg *chain, int n, char *err, size_t errlen);
+
 /** Restore the deepest stored chain for `text` into the installed bank (see
  *  above), at most `cap` segments reported in `chain` (*n_out of them).  `image_hashes` are the content hashes
  *  (pulsar_image_hash) of the images the history must hold, in order -- a request's images, or a spilled bank's own

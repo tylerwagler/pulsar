@@ -1780,8 +1780,8 @@ bool server::bank_restore_spilled(int bank) {
         /* L281: the bank's own image records are what its chain must carry back */
         uint64_t hashes[64];
         const int n_img = pulsar_session_image_hashes(pool, hashes, 64);
-        restored = s->kv_cache_try_load_text(&s->slots[bank], text, NULL, 0, hashes, n_img < 64 ? n_img : 64, NULL,
-                                             NULL, false);
+        restored = s->kv_cache_try_load_text(&s->slots[bank], text, NULL, 0, hashes, n_img < 64 ? n_img : 64, 0,
+                                             NULL, NULL, false);
         free(text);
     }
     if (restored == 0) pulsar_session_invalidate(pool);   /* nothing stored: the conversation resumes cold */

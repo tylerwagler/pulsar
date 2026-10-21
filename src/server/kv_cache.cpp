@@ -386,10 +386,29 @@ int server::kv_cache_persist(session_slot *sl, const char *reason, bool close) {
     return r.written;
 }
 
+/* ===== L310: restore-vs-recompute ========================================== */
+
+const char *const kv_restore_verdict_names[KV_RESTORE_VERDICTS] = { "load", "recompute", "unmeasured", "unpriced" };
+
+kv_restore_verdict kv_restore_decide(uint64_t bytes, uint32_t gained, double read_bytes_per_ms, bool priced,
+                                     double prefill_ms, double *transfer_ms) {
+    *transfer_ms = read_bytes_per_ms > 0.0 ? (double)bytes / read_bytes_per_ms : 0.0;
+    if (gained == 0u) return KV_RESTORE_RECOMPUTE;
+    if (!(read_bytes_per_ms > 0.0)) return KV_RESTORE_UNMEASURED;
+    if (!priced) return KV_RESTORE_UNPRICED;
+    return *transfer_ms < 0.5 * prefill_ms ? KV_RESTORE_LOAD : KV_RESTORE_RECOMPUTE;
+}
+
+double kv_restore_rate_update(double rate, uint32_t n, uint64_t bytes, double ms) {
+    if (!(ms > 0.0) || bytes == 0) return rate;
+    const double sample = (double)bytes / ms;
+    return n == 0 || !(rate > 0.0) ? sample : rate + (sample - rate) / 8.0;
+}
+
 int server::kv_cache_try_load_text(session_slot *sl, const char *prompt_text,
                                   const pulsar_text_span *prompt_spans,
                                   uint32_t prompt_n_spans,
-                                  const uint64_t *image_hashes, int n_images,
+                                  const uint64_t *image_hashes, int n_images, int base,
                                   pulsar_tokens *effective_prompt,
                                   char **loaded_key_out,
                                   bool responses_protocol) {
@@ -400,13 +419,49 @@ int server::kv_cache_try_load_text(session_slot *sl, const char *prompt_text,
     const size_t prompt_bytes = strlen(prompt_text);
     const double t0 = server_now_sec();
     pulsar_segstore_seg chain[PULSAR_KVCHAIN_MAX];
-    int n = 0;
     char err[384];
-    const int G = pulsar_kvchain_restore(s->kv.st, s->engine, s->sess, prompt_text, prompt_bytes, image_hashes,
-                                         n_images, s->kv.opt.min_tokens, chain, PULSAR_KVCHAIN_MAX, &n, err,
-                                         sizeof(err));
-    if (err[0]) server_log(G ? PULSAR_LOG_KVCACHE : PULSAR_LOG_WARNING, "pulsar-server: kv cache %s", err);
+    uint64_t bytes = 0;
+    const int n = pulsar_kvchain_find(s->kv.st, prompt_text, prompt_bytes, image_hashes, n_images,
+                                      s->kv.opt.min_tokens, chain, PULSAR_KVCHAIN_MAX, &bytes, err, sizeof(err));
+    if (err[0]) server_log(n ? PULSAR_LOG_KVCACHE : PULSAR_LOG_WARNING, "pulsar-server: kv cache %s", err);
+    if (n == 0) return 0;
+    /* L310: price the read against the prefill of what the chain adds past the bank's own resume */
+    const uint32_t chain_G = chain[n - 1].G;
+    if (base < 0) base = 0;
+    const uint32_t gained = chain_G > (uint32_t)base ? chain_G - (uint32_t)base : 0u;
+    double prefill_ms = 0.0, transfer_ms = 0.0;
+    const int cap = s->sess ? pulsar_session_prefill_cap(s->sess) : 0;
+    const bool priced = pulsar_engine_prefill_ms(s->engine, gained, (uint32_t)base, cap > 0 ? (uint32_t)cap : 0u,
+                                                 &prefill_ms);
+    pthread_mutex_lock(&s->mu);
+    const double rate = s->kv.meter.read_bytes_per_ms;
+    pthread_mutex_unlock(&s->mu);
+    const kv_restore_verdict v = kv_restore_decide(bytes, gained, rate, priced, prefill_ms, &transfer_ms);
+    pthread_mutex_lock(&s->mu);
+    s->kv.meter.verdicts[v]++;
+    s->kv.meter.last_transfer_ms = transfer_ms;
+    s->kv.meter.last_prefill_ms = prefill_ms;
+    if (v == KV_RESTORE_RECOMPUTE) s->kv.meter.recomputed_tokens += gained;
+    pthread_mutex_unlock(&s->mu);
+    server_log(PULSAR_LOG_KVCACHE,
+               "pulsar-server: kv cache restore-vs-recompute: chain to %u (%d segments, %.1f MiB) adds %u tokens past "
+               "%d: read %.1f ms (%.0f MB/s%s) vs prefill %.1f ms%s -> %s",
+               chain_G, n, (double)bytes / (1024.0 * 1024.0), gained, base, transfer_ms, rate * 1e-3,
+               rate > 0.0 ? "" : ", unmeasured", prefill_ms, priced ? "" : " (no fit)", kv_restore_verdict_names[v]);
+    if (v == KV_RESTORE_RECOMPUTE) return 0;
+    const double t_load = server_now_sec();
+    const int G = pulsar_kvchain_load(s->kv.st, s->engine, s->sess, prompt_text, chain, n, err, sizeof(err));
+    if (err[0]) server_log(PULSAR_LOG_WARNING, "pulsar-server: kv cache %s", err);
     if (G == 0) return 0;
+    {
+        const double load_ms = (server_now_sec() - t_load) * 1000.0;
+        pthread_mutex_lock(&s->mu);
+        s->kv.meter.read_bytes_per_ms = kv_restore_rate_update(s->kv.meter.read_bytes_per_ms, s->kv.meter.reads,
+                                                               bytes, load_ms);
+        s->kv.meter.reads++;
+        s->kv.meter.restored_tokens += gained;
+        pthread_mutex_unlock(&s->mu);
+    }
     const pulsar_tokens *loaded = pulsar_session_tokens(s->sess);
     const uint64_t text_end = chain[n - 1].text_end;
     /* The chain's tool maps: the exact DSML of every tool call inside it. */
@@ -436,7 +491,7 @@ int server::kv_cache_try_load_text(session_slot *sl, const char *prompt_text,
     return (int)chain[n - 1].G;
 }
 
-int server::kv_cache_try_load(session_slot *sl, const request *req,
+int server::kv_cache_try_load(session_slot *sl, const request *req, int base,
                              pulsar_tokens *effective_prompt,
                              char **loaded_key_out) {
     auto *s = this;
@@ -448,7 +503,7 @@ int server::kv_cache_try_load(session_slot *sl, const request *req,
     return s->kv_cache_try_load_text(sl, req ? req->prompt_text : NULL,
                                   req ? req->prompt_spans : NULL,
                                   req ? req->prompt_n_spans : 0,
-                                  hashes, n_images,
+                                  hashes, n_images, base,
                                   effective_prompt, loaded_key_out,
                                   req && req->api == API_RESPONSES);
 }

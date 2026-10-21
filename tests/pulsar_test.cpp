@@ -3802,6 +3802,8 @@ static void test_fused_cost(void) {
     const uint32_t q1 = 512u, c1 = 0u;
     TEST_ASSERT(!pulsar_engine_fused_step_ms(e, 1u, &q1, &c1, &ms) && ms == 0.0);
     TEST_ASSERT(pulsar_engine_verify_round_ms(e, 4u, 8u, &out) == 0.0 && out == 0.0);
+    double pms = -1.0;
+    TEST_ASSERT(!pulsar_engine_prefill_ms(e, 4096u, 0u, 4096u, &pms) && pms == 0.0);
     for (uint32_t i = 0; i < 64; i++) {
         const uint32_t q[2] = {128u * (1u + i % 16u), 256u};
         const uint32_t c[2] = {4096u * (i % 15u), 1024u};
@@ -3815,6 +3817,10 @@ static void test_fused_cost(void) {
     const uint32_t q[2] = {512u, 128u}, c[2] = {1000u, 60000u};
     TEST_ASSERT(pulsar_engine_fused_step_ms(e, 2u, q, c, &ms));
     TEST_ASSERT(fabs(ms - (30.0 + 0.4 * 640.0 + 2e-6 * (512.0 * 1256.0 + 128.0 * 60064.0))) < 0.06);
+    /* L310: the same fit priced as a prefill -- the fixed term once a chunk (10000 rows at 4096 = 3 chunks) */
+    TEST_ASSERT(pulsar_engine_prefill_ms(e, 10000u, 2000u, 4096u, &pms));
+    TEST_ASSERT(fabs(pms - (3 * 30.0 + 0.4 * 10000 + 2e-6 * 10000 * (2000 + 5000))) < 0.5);
+    TEST_ASSERT(pulsar_engine_prefill_ms(e, 4096u, 0u, 4096u, &pms) && fabs(pms - (30.0 + 0.4 * 4096 + 2e-6 * 4096 * 2048)) < 0.5);
     free(e);
     double base[PULSAR_SPEC_LOGITS_ROWS + 1];
     l301_staircase(base, PULSAR_SPEC_LOGITS_ROWS);
