@@ -1321,6 +1321,7 @@ void server::publish_metrics_snapshot() {
     s->m_prefill_chunk_tokens = s->w_prefill_chunk_tokens;
     s->m_spec_overflow_rounds = s->w_spec_overflow_rounds;
     s->m_spec_pick_cut_rows = s->w_spec_pick_cut_rows;
+    s->m_spec_grammar_cut_rows = s->w_spec_grammar_cut_rows;
     pulsar_engine_verify_curve_view(s->engine, &s->m_verify_curve);
     pulsar_engine_spec_calibration(s->engine, &s->m_spec_calib);
     s->m_drafter_name = pulsar_engine_drafter_name(s->engine);
@@ -2604,10 +2605,24 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n, int quantum_
                 npend[i] = 0;
                 gen_state *ag = dec[i]->gen;
                 if (!ag || ag->phase != GEN_DECODE) continue;
-                n_live++;
                 float conf[16];
-                const uint32_t np =
-                    pulsar_session_bank_pending_confs(pool, (uint32_t)dec[i]->bank, conf);
+                int32_t pbase, ptok[16];
+                uint32_t np = pulsar_session_bank_pendings(pool, (uint32_t)dec[i]->bank, &pbase, ptok, conf);
+                /* L309: a chain under a grammar ends before its first draft the grammar refuses */
+                if (np > 0 && ag->gate) {
+                    const int legal = gen_constrain_draft_prefix(s, ag, pbase, ptok, (int)np);
+                    if (legal < 0) {
+                        ag->finish = "error";
+                        ag->phase = GEN_FINISH;
+                        continue;
+                    }
+                    if ((uint32_t)legal < np && s->w_spec_grammar_cut_rows == 0)   /* rule 5: the cut ran */
+                        server_log(PULSAR_LOG_DEFAULT, "pulsar-server: grammar cut a pending chain: %d of %u drafts "
+                                   "before the grammar's first refusal (L309)", legal, np);
+                    s->w_spec_grammar_cut_rows += np - (uint32_t)legal;
+                    np = (uint32_t)legal;
+                }
+                n_live++;
                 float p = 1.0f;
                 for (uint32_t j2 = 0; j2 < np; j2++) {
                     p *= conf[j2] < 0.0f ? 1.0f : conf[j2];
