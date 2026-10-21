@@ -616,12 +616,15 @@ static int spec_round_end(pulsar_session *s, pulsar_spec_round *r,
         carry_tok = wv->carry;
         carry_refused = wv->status != PULSAR_GPU_SAMPLE_OK;
         if (carry_refused && wv->commit < K) commit_rc = -1;
-        /* L303: the walk stops at a row its masks cover (mask_rows > the stop row); a row past them was drawn
-         * unconstrained, so a draft accepted there -- or a full accept's carry there -- is refused */
-        if (masks && wv->commit >= mask_rows) {
-            if (wv->commit < K) {
+        /* L303: every row the walk judged a draft on must be under a mask (mask_rows > the stop row; a row past
+         * them was drawn unconstrained, and no masks at all is the round's grammar failure): the round is refused.
+         * A full accept's carry row past them is a refused carry, which only the stop clamp below can leave
+         * unused. */
+        if (masks) {
+            const uint32_t judged = wv->commit < K ? wv->commit : K - 1u;   /* the last draft row the walk read */
+            if (K > 0u && judged >= mask_rows) {
                 commit_rc = -1;
-            } else {
+            } else if (wv->commit >= mask_rows) {
                 carry_tok = -1;
                 carry_refused = true;
             }
