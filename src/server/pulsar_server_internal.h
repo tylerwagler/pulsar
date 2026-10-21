@@ -19,6 +19,7 @@
 #include "pulsar_json.h"
 /* L251: the Qwen family's chat renderer, effort authority and output parser. */
 #include "qwen_chat.h"
+#include "sched_value.h"
 
 #include <new>
 #include <string>
@@ -1644,6 +1645,11 @@ struct server {
     uint64_t w_spec_pick_cut_rows;
     uint64_t m_spec_pick_cut_rows;
     bool w_spec_pick_announced;   ///< rule 5: the first priced round said the pick ran, and on what
+    /** L312: the fused lane's round selection -- rule 5's announcements (priced / unpriced, once each), the
+     *  unpriced rule's probe alternation, and the round counter riders are ordered by.  Worker-owned. */
+    bool w_sched_announced[2];
+    uint64_t w_sched_probes;
+    uint64_t w_sched_rounds;
     /** L301: the engine's verify curve and the drafters' confidence calibration, as /metrics publishes them
      *  (published copies, like m_spec). */
     pulsar_verify_curve_view m_verify_curve;
@@ -2590,6 +2596,13 @@ struct gen_state {
      * conversation).  A prompt that is not an extension of its bank's history is
      * marked no_fuse instead and prefills classically. */
     bool fuse_ready;
+    /** L312: the fused lane's round selection (sched_value.cpp) -- this request's token service price over f
+     *  (ms per token, Flare's ServicePrice; kept from prefill into decode; <= 0 until first priced), when it last
+     *  delivered output (the decode-age clock, server_now_sec; 0: never), and the round it last rode as a prompt
+     *  (the unpriced rule's order). */
+    double sched_inv_ms;
+    double sched_out_t;
+    uint64_t sched_last_ride;
 
     /** deferred, non-blocking client writes (installed for send_all) */
     slot_writer writer;  ///< queues bytes so a slow client cannot block the worker
