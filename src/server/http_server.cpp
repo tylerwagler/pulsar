@@ -482,6 +482,7 @@ bool server::send_metrics(int fd) {
     const unsigned long long spills = (unsigned long long)s->m_spills;
     const unsigned long long restores = (unsigned long long)s->m_restores;
     const unsigned long long restore_failures = (unsigned long long)s->m_restore_failures;
+    const kv_restore_meter disk_meter = s->kv.meter;   /* L310 */
     uint64_t refusals[PROVISION_REFUSAL_COUNT];
     for (int i = 0; i < PROVISION_REFUSAL_COUNT; i++) refusals[i] = s->m_refusals[i];
     const int block_reason = s->m_queue_block_reason;
@@ -769,6 +770,29 @@ bool server::send_metrics(int fd) {
     buf_puts(&b, "# HELP pulsar:bank_restore_failures_total Spilled banks that could not be reloaded.\n");
     buf_puts(&b, "# TYPE pulsar:bank_restore_failures_total counter\n");
     buf_printf(&b, "pulsar:bank_restore_failures_total %llu\n", restore_failures);
+
+    /* L310: the disk tier's restore-vs-recompute -- what each hit decided, the measured read rate it priced the
+     * read with, the last decision's two prices, and the tokens each side carried. */
+    buf_puts(&b, "# HELP pulsar:kv_disk_restore_decisions_total Disk chain hits by restore-vs-recompute verdict.\n");
+    buf_puts(&b, "# TYPE pulsar:kv_disk_restore_decisions_total counter\n");
+    for (int i = 0; i < KV_RESTORE_VERDICTS; i++)
+        buf_printf(&b, "pulsar:kv_disk_restore_decisions_total{verdict=\"%s\"} %llu\n", kv_restore_verdict_names[i],
+                   (unsigned long long)disk_meter.verdicts[i]);
+    buf_puts(&b, "# HELP pulsar:kv_disk_read_bytes_per_second Measured disk chain load rate (0 until the first load).\n");
+    buf_puts(&b, "# TYPE pulsar:kv_disk_read_bytes_per_second gauge\n");
+    buf_printf(&b, "pulsar:kv_disk_read_bytes_per_second %.0f\n", disk_meter.read_bytes_per_ms * 1000.0);
+    buf_puts(&b, "# HELP pulsar:kv_disk_last_transfer_ms The last disk hit's estimated chain read time.\n");
+    buf_puts(&b, "# TYPE pulsar:kv_disk_last_transfer_ms gauge\n");
+    buf_printf(&b, "pulsar:kv_disk_last_transfer_ms %.3f\n", disk_meter.last_transfer_ms);
+    buf_puts(&b, "# HELP pulsar:kv_disk_last_prefill_ms The last disk hit's priced prefill of the tokens it adds.\n");
+    buf_puts(&b, "# TYPE pulsar:kv_disk_last_prefill_ms gauge\n");
+    buf_printf(&b, "pulsar:kv_disk_last_prefill_ms %.3f\n", disk_meter.last_prefill_ms);
+    buf_puts(&b, "# HELP pulsar:kv_disk_restored_tokens_total Tokens loaded disk chains added past the banks' own resumes.\n");
+    buf_puts(&b, "# TYPE pulsar:kv_disk_restored_tokens_total counter\n");
+    buf_printf(&b, "pulsar:kv_disk_restored_tokens_total %llu\n", (unsigned long long)disk_meter.restored_tokens);
+    buf_puts(&b, "# HELP pulsar:kv_disk_recomputed_tokens_total Tokens a recompute verdict left to the prefill.\n");
+    buf_puts(&b, "# TYPE pulsar:kv_disk_recomputed_tokens_total counter\n");
+    buf_printf(&b, "pulsar:kv_disk_recomputed_tokens_total %llu\n", (unsigned long long)disk_meter.recomputed_tokens);
 
     /* Why requests queue. num_requests_waiting says that they do; this says
      * whether evicting something would help or the box is simply out of room. */
