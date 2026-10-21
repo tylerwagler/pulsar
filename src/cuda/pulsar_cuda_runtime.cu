@@ -2032,6 +2032,69 @@ void pulsar_gpu_seg_note_device_free(void) {
     seg_drop_graphs();
 }
 
+/* ==== L307 scratch poisoning (gates and debugging only) =====================
+ *
+ * Flare's defect class (NVIDIA flare-local-inference, docs/glm-batched-speculation-defect.md: 95.8% wrong selections
+ * from a graph reading stale scratch): a step that reads disposable scratch it did not write this step computes the
+ * right answer exactly while the previous step happened to leave the right bytes there -- in eager runs, or while one
+ * shape repeats.  Armed (pulsar_gpu_scratch_poison_set, or PULSAR_SCRATCH_POISON=1 at start), every step's entry
+ * fills the scratch it owns -- the calling thread's CUDA scratch slots and the regions the step names -- with a byte
+ * pattern that cycles 0xFF (NaN in f32 and bf16, -1 as an index), 0x00 and 0x7F (huge finite values, large indices),
+ * on the step's stream, before its host half uploads anything.  An honest step overwrites everything it reads, so
+ * its outputs are byte-identical to the unarmed run's (scratch-poison-gate); a stale read is not.  Never inside a
+ * capture: the fill would be recorded into the graph. */
+namespace {
+int g_poison = -1;   ///< -1: PULSAR_SCRATCH_POISON not read yet
+uint64_t g_poison_steps, g_poison_bytes;
+const unsigned char kPoison[3] = {0xFFu, 0x00u, 0x7Fu};
+
+bool poison_armed(void) {
+    if (g_poison < 0) {
+        const char *v = getenv("PULSAR_SCRATCH_POISON");
+        g_poison = v && v[0] && strcmp(v, "0") != 0 ? 1 : 0;
+        if (g_poison)
+            fprintf(stderr, "pulsar: L307 scratch poisoning ARMED (PULSAR_SCRATCH_POISON): every step's disposable "
+                            "scratch is filled before it runs -- a diagnostic, not a serving mode\n");
+    }
+    return g_poison == 1;
+}
+}  // namespace
+
+int pulsar_gpu_scratch_poison_set(int on) {
+    const int was = poison_armed() ? 1 : 0;
+    g_poison = on ? 1 : 0;
+    return was;
+}
+
+int pulsar_gpu_scratch_poison_step(pulsar_gpu_tensor *const *regions, uint32_t n) {
+    if (!poison_armed()) return 1;
+    if (g_seg_capturing) {
+        fprintf(stderr, "pulsar: L307 a step poisons its scratch inside a graph capture -- refusing (the fill would "
+                        "be recorded into the graph)\n");
+        return 0;
+    }
+    const int pat = kPoison[g_poison_steps % 3u];
+    cudaError_t rc = cudaSuccess;
+    for (int s = 0; rc == cudaSuccess && s < CUDA_SCRATCH_SLOTS; s++) {
+        if (!g_cuda_tmp[s] || g_cuda_tmp_bytes[s] == 0) continue;
+        rc = cudaMemsetAsync(g_cuda_tmp[s], pat, (size_t)g_cuda_tmp_bytes[s], cudaStreamPerThread);
+        g_poison_bytes += g_cuda_tmp_bytes[s];
+    }
+    for (uint32_t i = 0; rc == cudaSuccess && i < n; i++) {
+        const pulsar_gpu_tensor *t = regions[i];
+        if (!t || !t->ptr || t->dry || t->bytes == 0) continue;
+        rc = cudaMemsetAsync(t->ptr, pat, (size_t)t->bytes, cudaStreamPerThread);
+        g_poison_bytes += t->bytes;
+    }
+    g_poison_steps++;
+    return cuda_ok(rc, "L307 scratch poison");
+}
+
+void pulsar_gpu_scratch_poison_counts(uint64_t *steps, uint64_t *bytes) {
+    if (steps) *steps = g_poison_steps;
+    if (bytes) *bytes = g_poison_bytes;
+}
+
 
 /* The TP row lane's error word (pulsar_gpu_tp_err_word_set): 1 = the proxy
  * failed an exchange (transport timeout or error), 2 = the lane was aborted (pulsar_tp_row_lane_abort).  Latched:

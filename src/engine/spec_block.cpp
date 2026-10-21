@@ -759,6 +759,8 @@ bool absorb_rows(pulsar_session *s, uint32_t row0, const int32_t *pos, const int
     const pulsar_state_set *ss = s->states;
     const uint32_t E = d->hidden, KV = d->n_kv * d->head_dim;
     if (row0 + n > l->max_rows) return fail("absorbed rows past the tap rows");
+    /* L307, armed only: the lane's arena filled first (the absorb's region, never live across a call) */
+    if (!pulsar_gpu_scratch_poison_step(&l->arena, 1)) return false;
     uint8_t *base = (uint8_t *)dptr(l->arena);
     const absorb_layout &A = l->al;
     uint16_t *c = (uint16_t *)(base + A.c), *cn = (uint16_t *)(base + A.cn), *kb = (uint16_t *)(base + A.kb),
@@ -842,6 +844,8 @@ bool draft_pass(pulsar_session *s, const uint32_t *banks, const uint32_t *pos, c
                    half = d->conv_taps * (E / d->conv_group), SL = B - 1u, K = d->topk;
     const bool lili = d->head_kind == PULSAR_BLOCK_HEAD_LILICORR;
     if (R > kDraftRows || nb == 0) return fail("a draft pass outside the lane's rows");
+    /* L307, armed only: the lane's arena (the absorb's and the draft's, never live across a pass) filled first */
+    if (!pulsar_gpu_scratch_poison_step(&l->arena, 1)) return false;
     uint8_t *base = (uint8_t *)dptr(l->arena);
     const draft_layout &D = l->dl;
     /* ---- the host half */
