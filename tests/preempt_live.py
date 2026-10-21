@@ -10,7 +10,10 @@ exact     A probe server reads the guard's eager floor and one bank's KV bytes a
           guard's test hook) so request A (a long prompt decoding 1500 greedy tokens) fits alone, B (a longer prompt, 1
           token) fits alone, and both do not.  B arrives while A decodes: A must be PREEMPTED (the server's log),
           B answered, A READMITTED and finished -- and A's text must equal A's on a fresh server, uninterrupted, byte
-          for byte (a single stream on both sides: greedy decode is deterministic there).
+          for byte (a single stream on both sides: greedy decode is deterministic there).  Every request asks for
+          logprobs, which keeps it on the plain lane (one M-independent row a step): a reloaded bank's speculative
+          rounds start without the pendings it had, and past 16 verify rows a round's numerics are graded, not
+          byte-equal (ENGINEERING-RULES 7), so on the spec lanes the instrument is the resume point, not the text.
 pressure  N concurrent requests of L-token prompts decoding G tokens each on a --ctx / --banks server with its real
           budget; reports the 503s, the admission refusals by reason (/metrics), preemptions and readmissions, and
           the wall time -- run once per binary to compare.
@@ -79,7 +82,7 @@ class Server:
 
 
 def chat(text, max_tokens):
-    body = {"model": "m", "max_tokens": max_tokens, "temperature": 0,
+    body = {"model": "m", "max_tokens": max_tokens, "temperature": 0, "logprobs": a.mode == "exact",
             "messages": [{"role": "user", "content": text + "\n\nContinue this story in your own words."}]}
     req = urllib.request.Request(B + "/v1/chat/completions", json.dumps(body).encode(),
                                  {"content-type": "application/json"})
@@ -149,7 +152,7 @@ if a.mode == "exact":
     if not (0 < LA < LB):
         print("FAIL the counted prompts (A + generation %d, B %d) do not frame a preemption" % (LA, LB))
         sys.exit(1)
-    budget = int(eager + per_tok * (LW + 1.25 * LB))
+    budget = int(eager + per_tok * (LW + 1.5 * LB))
     print("# eager %.2f GiB, %.0f B a token: budget override %.2f GiB" % (eager / 2**30, per_tok, budget / 2**30))
     srv = Server(a.tag + "-preempt", {"PULSAR_SERVER_KV_BUDGET_OVERRIDE": str(budget)})
     res = {}

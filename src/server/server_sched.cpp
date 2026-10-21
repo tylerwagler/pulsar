@@ -1879,7 +1879,7 @@ static int guard_victim_order(server *s, session_slot **dec, int n, int *order);
 static prompt_kv_verdict server_prompt_kv_verdict(uint64_t touched, uint64_t delta, uint64_t bound,
                                                   const uint64_t *drop, int n_victims, bool busy_may_free,
                                                   int *n_spill);
-bool server::preempt_newest_decoder(const session_slot *keep) {
+bool server::preempt_newest_decoder(const session_slot *keep, uint64_t need) {
     auto *s = this;
     if (s->pool_banks <= 1 || !s->kv.enabled || !s->kv.dir || pulsar_engine_is_tp(s->engine)) return false;
     bool tried[PULSAR_SESSION_POOL_CAP] = {};
@@ -1891,6 +1891,10 @@ bool server::preempt_newest_decoder(const session_slot *keep) {
             session_slot *c = &s->slots[i];
             if (c == keep || tried[i] || !slot_is_batchable_decode(c) || c->spilled || c->active_job->req.n_images > 0)
                 continue;
+            /* a preemption that does not make the prompt fit only churns (the prompt waits either way) */
+            const uint64_t freed = pulsar_session_bank_touched_kv_bytes(s->sess, c->bank);
+            const uint64_t touched = pulsar_session_touched_kv_bytes(s->sess);
+            if ((touched > freed ? touched - freed : 0) + need > s->guard_touched_budget) continue;
             if (!v || c->gen->t0 > v->gen->t0) v = c;
         }
         if (!v) return false;
@@ -2141,7 +2145,7 @@ bool server::prompt_kv_admit(session_slot *sl, job *j, bool *refused) {
     /* L314: no idle bank can make room: the newest running decoders are preempted through their terminal checkpoints,
      * one at a time, while that can (a prompt whose growth alone is past the budget never fits) */
     while ((v == PROMPT_KV_WAIT || v == PROMPT_KV_REFUSE) && need <= s->guard_touched_budget &&
-           s->preempt_newest_decoder(sl))
+           s->preempt_newest_decoder(sl, need))
         v = s->prompt_kv_check(sl, j, order, &n_spill, &need);
     if (v == PROMPT_KV_FITS) return true;
     pulsar_session *pool = s->sess;
@@ -3714,9 +3718,17 @@ void *worker_main(void *arg) {
     int rr = 0; /* round-robin cursor: first slot index to consider next */
     for (;;) {
         bool bound = false;
-        /* L314: a preempted decoder whose KV fits again is reloaded before new work binds */
-        if (s->worker_readmit_preempted()) bound = true;
         while (s->worker_try_bind()) bound = true;
+        /* L314: a preempted decoder whose KV fits again is reloaded -- once no queued prompt waits on KV (the prompt
+         * it was preempted for binds first; readmitting ahead of it would only preempt it again) */
+        {
+            bool kv_wait;
+            {
+                pulsar::ScopedLock lk(&s->mu);
+                kv_wait = s->head && s->head->refusal_counted == PROVISION_REFUSED_KV_TOUCHED;
+            }
+            if (!kv_wait && s->worker_readmit_preempted()) bound = true;
+        }
         if (bound) s->publish_metrics_snapshot();
 
         int n_active = 0, n_parked = 0;

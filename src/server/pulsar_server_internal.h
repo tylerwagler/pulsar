@@ -2146,8 +2146,9 @@ struct server {
     bool spill_bank(session_slot *victim);
     /** L314: preempt the newest running decoder other than `keep` that may be (a text-only decode in the batched
      *  spec or plain lane, the disk KV cache on, not a tensor-parallel engine): its bank's frontier payload to the disk
-     *  KV dir, its physical freed, its job parked (session_slot::preempted).  @return true when one was. */
-    bool preempt_newest_decoder(const session_slot *keep);
+     *  KV dir, its physical freed, its job parked (session_slot::preempted) -- only one whose freed KV makes `need`
+     *  bytes fit the budget.  @return true when one was. */
+    bool preempt_newest_decoder(const session_slot *keep, uint64_t need);
     /** L314: reload the first-preempted decoder whose KV fits the budget again (one a call); a reload that fails
      *  fails that request by name.  @return true when one was readmitted (or failed). */
     bool worker_readmit_preempted();
