@@ -2324,8 +2324,12 @@ static int spec_pick_rows(const pulsar_engine *e, const float surv[][16], const 
 /* L304: the wall a fused round may take when it carries a chunk that does NOT finish its prompt -- the decode
  * streams' longest wait between tokens while a long prompt prefills beside them (Tyler 2026-10-15: decode over
  * prefill).  The chunk is the widest whose cost on the engine's measured fit (pulsar_engine_fused_chunk) keeps the
- * round inside it.  PULSAR_SERVER_FUSED_ROUND_MS (read once) moves it for a measurement sweep. */
-#define PULSAR_SERVER_FUSED_ROUND_MS 500.0
+ * round inside it.  PULSAR_SERVER_FUSED_ROUND_MS (read once) moves it for a measurement sweep.  A fused step pays
+ * ~200-350 ms whatever its prompt rows (Qwen, its fit), so a tighter budget only makes more of them: measured (one
+ * Spark, Qwen DFlash2, 4 streams decoding while a 53k-token prompt prefills; gap p99 / the streams' tok/s / the
+ * prompt's TTFT): fixed 2048 rows 1.80 s / 12.9 / 45 s; 1000 ms 1.07 s / 51.5 / 78 s; 750 ms 0.82 s / 48 / 83 s;
+ * 500 ms 0.58 s / 34-39 / 101 s; 250 ms 0.48-0.58 s / 36 / 112 s.  1000 ms decodes the most beside the prompt. */
+#define PULSAR_SERVER_FUSED_ROUND_MS 1000.0
 /* ... and until the fit has its evidence (a handful of fused rounds), a continuation chunk is this many rows --
  * small enough to protect the streams beside it, and each such round is one more observation. */
 #define PULSAR_SERVER_FUSED_PROBE_ROWS (4 * PULSAR_SERVER_FUSED_CHUNK_ALIGN)
