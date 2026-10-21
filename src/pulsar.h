@@ -1209,6 +1209,9 @@ void pulsar_engine_verify_curve_observe(pulsar_engine *e, uint32_t n_seqs, uint3
  *  verifies within cap_rows rows (the best ratio on the curve; no curve: as many as the rows hold). */
 uint32_t pulsar_engine_verify_pick(const pulsar_engine *e, uint32_t n_seqs, const float *surv, uint32_t m,
                                    uint32_t cap_rows);
+/** L312: a spec round's predicted wall on the verify curve, round_ms(n_seqs, rows) (rows clamped to the widest
+ *  profiled step), and into *outside_ms its part outside the forward (host + drafting); 0 for both with no curve. */
+double pulsar_engine_verify_round_ms(const pulsar_engine *e, uint32_t n_seqs, uint32_t rows, double *outside_ms);
 /** The curve as /metrics shows it (valid false: none). */
 typedef struct {
     bool valid;
@@ -1238,14 +1241,12 @@ typedef struct {
 void pulsar_engine_spec_calibration(const pulsar_engine *e, pulsar_spec_calibration *out);
 /** L304: the fused step's cost (src/engine/verify_curve.cpp has the model): forward_ms = a + alpha * sum q +
  *  beta * sum q (c + q / 2) over its prompt runs (q rows each over c already computed), fitted from the fused steps
- *  the server reports (`forward_ms` the step's whole forward, verify rows included).  pulsar_engine_fused_chunk: the
- *  most rows a run at context c may add with `spent_ms` of the step's prompt cost already taken, for the forward to
- *  stay within `budget_ms` into *rows (0 when it cannot), false with no fit yet; pulsar_engine_fused_cost_ms: a run's prompt cost
- *  (0 with no fit). */
+ *  the server reports (`forward_ms` the step's whole forward, verify rows included).  pulsar_engine_fused_step_ms:
+ *  the predicted forward of a step carrying `n_runs` runs into *ms, false (and 0) with no fit yet. */
 void pulsar_engine_fused_cost_observe(pulsar_engine *e, uint32_t n_runs, const uint32_t *q, const uint32_t *c,
                                       double forward_ms);
-bool pulsar_engine_fused_chunk(const pulsar_engine *e, uint32_t c, double spent_ms, double budget_ms, uint32_t *rows);
-double pulsar_engine_fused_cost_ms(const pulsar_engine *e, uint32_t q, uint32_t c);
+bool pulsar_engine_fused_step_ms(const pulsar_engine *e, uint32_t n_runs, const uint32_t *q, const uint32_t *c,
+                                 double *ms);
 /** The loaded drafter's name ("" with none). */
 const char *pulsar_engine_drafter_name(const pulsar_engine *e);
 const pulsar_tokens *pulsar_session_tokens(pulsar_session *s);
