@@ -35,94 +35,16 @@ uint32_t pulsar_spec_cur_depth(const pulsar_session *s) {
     return d < 1u ? 1u : d;
 }
 
-/* L288 (tf-gap pass 2): the priced depth.  A drafter that drafts token by token (the MTP chain) pays one drafter
- * step for every draft and the verify one row for it; the draft returns its chain's survival -- the product of the
- * confidences up to it, the chance it is accepted -- times what a token is worth (token_ms: the lane's measured
- * yield, pulsar_engine_spec_token_ms).  The chains of a round draft in LOCKSTEP: one step carries every chain that
- * goes on, and costs step(k) = flat + slope * k for k chains (pulsar_engine::draft_step_cost, measured), so the
- * step's flat part is paid by whichever chains keep it alive -- in the end the round's deepest chains alone.
- * Charging each chain step(n) / n of the round's n (the first form) undercharged exactly those: at 4 streams the
- * deepest chain kept a whole step alive for a quarter of its price.  So the step is charged to the chains that
- * extend it (pulsar_spec_chain_step): every candidate pays its own verify row and its marginal slope,
- *     run_i * token_ms >= row_ms + slope,
- * and the set that goes on -- the best by survival, dropping the weakest until it holds -- pays the step's flat part
- * out of what it earns past that:
- *     sum_i (run_i * token_ms - row_ms - slope) >= flat.
- * One chain alone pays the whole step (TensorFold's zig/src/core/draft_depth.zig `more`, power 1).  And the verify
- * width is shared: a draft is verified only if it ranks among the budget's best by survival (the allocator's global
- * admission, spec_alloc_rows), so a chain also stops once `budget` drafts of the round already outrank it -- vLLM's
- * adaptive verification (a global top-k of draft slots under a budget) drawn on the draft side.  Without a price (a
- * fresh engine, a TP group -- the clocks are the leader's, and a chain's depth must be the same on every rank) no
- * chain is priced out: its depth and the stop rule alone.  Which drafts are proposed is all it moves: every emitted
- * token is the target's, greedy or keyed. */
-pulsar_spec_chain_price pulsar_spec_chain_price_for(const pulsar_session *s, uint32_t chains) {
-    const pulsar_engine *e = s->engine;
-    pulsar_spec_chain_price p;
-    memset(&p, 0, sizeof p);
-    const uint32_t width = pulsar_engine_spec_width(e);   /* L288 C1: the width in force */
-    p.budget = width > chains ? width - chains : 0u;
-    if (e->tp || chains == 0u || !(e->spec_token_ms > 0.0f)) return p;
-    const pulsar_lane_cost row = lane_cost_fit_view(&e->lane_cost[PULSAR_LANE_SPEC]);
-    if (!row.valid) return p;
-    p.token_ms = e->spec_token_ms;
-    p.row_ms = (float)row.row_us / 1000.0f;
-    p.run_min_row = p.row_ms / p.token_ms;
-    const pulsar_lane_cost step = lane_cost_fit_view(&e->draft_step_cost);
-    if (step.valid) {   /* the steps' widths spread: flat + slope * k */
-        p.step_flat_ms = (float)step.flat_us / 1000.0f;
-        p.step_slope_ms = (float)step.row_us / 1000.0f;
-        p.step_priced = true;
-    } else {            /* one width only (a lone stream: k = 1 every step): its mean is the whole step */
-        const double one = pulsar_lane_cost_ms(&step, 1.0);
-        p.step_flat_ms = (float)one;
-        p.step_priced = one > 0.0;
-    }
-    return p;
-}
-
-uint32_t pulsar_spec_chain_step(const pulsar_spec_chain_price *p, const float *run, const uint32_t *ahead, uint32_t n,
-                                bool *go) {
-    uint32_t idx[64];   /* n is a round's chains: <= the verify width (32) */
-    uint32_t k = 0;
-    for (uint32_t i = 0; i < n; i++) {
-        go[i] = false;
-        if (ahead[i] >= p->budget) continue;
-        if (!p->step_priced) { go[i] = true; continue; }
-        if (run[i] * p->token_ms < p->row_ms + p->step_slope_ms) continue;
-        if (k < sizeof idx / sizeof idx[0]) idx[k++] = i;
-    }
-    if (!p->step_priced) {
-        uint32_t m = 0;
-        for (uint32_t i = 0; i < n; i++) m += go[i] ? 1u : 0u;
-        return m;
-    }
-    /* the best by survival first; drop the weakest until the set pays the step's flat part */
-    for (uint32_t x = 1; x < k; x++)
-        for (uint32_t y = x; y > 0 && run[idx[y]] > run[idx[y - 1]]; y--) {
-            const uint32_t t = idx[y];
-            idx[y] = idx[y - 1];
-            idx[y - 1] = t;
-        }
-    while (k > 0) {
-        float surplus = 0.0f;
-        for (uint32_t x = 0; x < k; x++) surplus += run[idx[x]] * p->token_ms - p->row_ms - p->step_slope_ms;
-        if (surplus >= p->step_flat_ms) break;
-        k--;
-    }
-    for (uint32_t x = 0; x < k; x++) go[idx[x]] = true;
-    return k;
-}
-
 /* L288 (tf-gap pass 2): copy drafts (TensorFold #468, after its Nemotron CopyIndex; vLLM's MRV2 n-gram speculator and
  * exllamav3's hybrid mode are the same idea).  A reply that re-states text it has seen -- an edit of a quoted file, a
  * rename, a quotation, a tool result read back -- repeats its own history token for token, and no drafter predicts
  * that as well as the history does.  When the bank's last PULSAR_SPEC_COPY_MATCH tokens (its committed history, then
  * the carry that opens the next round) occurred earlier, the round drafts what followed the LATEST earlier copy, up to
  * `max` tokens; a copy whose continuation is shorter than the match (a repeat that runs into its own tail) is none,
- * unless `max` is.  A copy draft costs no drafter step, only its verify row, so it is priced at the row alone
- * (pulsar_spec_copy_keep) at the copy acceptance the engine has measured.  The verify is unchanged, so every emitted
- * token is still the target's.  A backward scan of the history: O(history) a round, no index to keep in step with a
- * history that rewinds and resyncs. */
+ * unless `max` is.  A copy draft costs no drafter step, only its verify row, so its chain is cut by the verify pick
+ * alone (pulsar_spec_keep_picked, L301) at the copy acceptance the engine has measured.  The verify is unchanged, so
+ * every emitted token is still the target's.  A backward scan of the history: O(history) a round, no index to keep in
+ * step with a history that rewinds and resyncs. */
 uint32_t pulsar_spec_copy_chain(pulsar_session *s, uint32_t bank, int32_t next_base, uint32_t max, int32_t *out) {
     const uint32_t m = PULSAR_SPEC_COPY_MATCH;
     const pulsar_tokens *h = pulsar_bank_history(s, bank);
@@ -155,23 +77,6 @@ float pulsar_spec_copy_conf(const pulsar_session *s) {
     return s->spec.copy_accept > 0.0f ? s->spec.copy_accept : 1.0f;
 }
 
-uint32_t pulsar_spec_copy_keep(const pulsar_spec_chain_price *p, float c, uint32_t n, float *drafted,
-                               uint32_t *n_drafted) {
-    float run = 1.0f;
-    uint32_t k = 0;
-    while (k < n) {
-        if (k > 0) {
-            uint32_t ahead = 0;
-            for (uint32_t j = 0; j < *n_drafted; j++) ahead += drafted[j] >= run ? 1u : 0u;
-            if (run < p->run_min_row || ahead >= p->budget) break;
-        }
-        run *= c;
-        drafted[(*n_drafted)++] = run;
-        k++;
-    }
-    return k;
-}
-
 /* A verified copy chain's verdict: `commit` of its `K` drafts accepted -- commit successes in commit + (commit < K)
  * trials of "accepted, given the one before was" -- into the request's copy acceptance (weight 0.1 a round).  Counts
  * only, so every rank of a TP group holds the same number. */
@@ -197,14 +102,15 @@ void pulsar_spec_draft_req_init(pulsar_session *s, spec_redraft_req *q, int next
     q->copied = false;
     q->keep = 0;
     /* L288: a bank that repeats its history drafts the repeat (pulsar_spec_copy_chain), whichever drafter it has: up
-     * to the drafter's deepest chain and the verify width beside the base row, within the context, priced alone
-     * (the server's allocator rations the shared width); the drafter then leaves this record's drafts as they are.
+     * to the drafter's deepest chain and the verify width beside the base row, within the context, cut by the verify
+     * pick as a chain alone (L301; the server's pick rations the shared width); the drafter then leaves this
+     * record's drafts as they are.
      * A request whose copies have been accepted less often than the stop rule asks of a draft (tau) drafts with
      * its drafter for the rest of it, as a quenched one decodes plain. */
     const pulsar_drafter_ops *d = spec_drafter(s);
     const float c = pulsar_spec_copy_conf(s);
     if (pulsar_spec_conf_stops(c, pulsar_spec_tau(s->engine))) return;
-    const uint32_t width = pulsar_engine_spec_width(s->engine);
+    const uint32_t width = pulsar_engine_fused_heads_max(s->engine);
     const int room = s->ctx() - (int)s->checkpoint.len - 1;
     uint32_t cap = d && width > 1u ? (d->depth_max < width - 1u ? d->depth_max : width - 1u) : 0u;
     if (cap > 16u) cap = 16u;
@@ -212,15 +118,14 @@ void pulsar_spec_draft_req_init(pulsar_session *s, spec_redraft_req *q, int next
     int32_t cp[16];
     const uint32_t n_cp = cap ? pulsar_spec_copy_chain(s, pulsar_session_live_bank(s), next_base, cap, cp) : 0u;
     if (n_cp == 0) return;
-    const pulsar_spec_chain_price price = pulsar_spec_chain_price_for(s, 1u);
-    float drafted[16];
-    uint32_t n_drafted = 0;
-    q->keep = pulsar_spec_copy_keep(&price, c, n_cp, drafted, &n_drafted);
+    q->keep = n_cp;
     q->refined[0] = q->next_base;
-    for (uint32_t k = 0; k < q->keep; k++) {
+    for (uint32_t k = 0; k < n_cp; k++) {
         q->refined[k + 1] = cp[k];
         q->conf[k] = c;
     }
+    pulsar_spec_keep_picked(s, 1u, &q, 1u);
+    if (q->keep == 0) return;   /* no copy draft is worth its row: the drafter drafts */
     q->have_conf = true;
     q->copied = true;
     static bool announced = false;   /* rule 5: the copy lane says once that it ran */
@@ -527,13 +432,19 @@ static int spec_accept_walk(pulsar_session *s,
                             const int32_t *pend, uint32_t K,
                             float temperature, int top_k, float top_p, float min_p,
                             uint32_t greedy_rows,
-                            uint64_t rng, int *out_carry_tok) {
+                            uint64_t rng, int *out_carry_tok,
+                            float *label, uint8_t *hit, uint32_t *n_label) {
     int commit = 0;
     int carry_tok = -1;
+    *n_label = 0;
     while (commit < (int)K) {
         if (spec_row_greedy(temperature, greedy_rows, (uint32_t)commit)) {
             /* the row's argmax; on a miss the carry is the refreshed row's argmax (round_end) */
-            if (row_tops[commit] != (int)pend[commit]) break;
+            const bool ok = row_tops[commit] == (int)pend[commit];
+            label[commit] = ok ? 1.0f : 0.0f;   /* L301: greedy, the acceptance itself */
+            hit[commit] = ok ? 1u : 0u;
+            *n_label = (uint32_t)commit + 1u;
+            if (!ok) break;
             commit++;
             continue;
         }
@@ -551,7 +462,14 @@ static int spec_accept_walk(pulsar_session *s,
             }
         }
         const int tok = pulsar_sample_dist_draw(&dist, pulsar_sample_key(rng, (uint32_t)commit + 1u));
+        /* L301: sampled, the target's probability of the draft (its candidates are the filtered nucleus) */
+        float p = 0.0f;
+        for (uint32_t c = 0; c < dist.n; c++)
+            if (dist.ids[c] == (int)pend[commit]) { p = dist.probs[c]; break; }
         pulsar_sample_dist_free(&dist);
+        label[commit] = p;
+        hit[commit] = tok == (int)pend[commit] ? 1u : 0u;
+        *n_label = (uint32_t)commit + 1u;
         if (tok != (int)pend[commit]) {
             carry_tok = tok;
             break;
@@ -720,10 +638,15 @@ static int spec_round_end(pulsar_session *s, pulsar_spec_round *r,
         carry_tok = (int)forced_truth[commit_rc];
     } else {
         PULSAR_NVTX("spec: walk");
+        float label[16];
+        uint8_t hit[16];
+        uint32_t n_label = 0;
         commit_rc = spec_accept_walk(s, src->read, src->ud, src->compact, row0,
                                      row_tops, pend, K,
                                      temperature, top_k, top_p, min_p, greedy_rows,
-                                     rng ? *rng : 0u, &carry_tok);
+                                     rng ? *rng : 0u, &carry_tok, label, hit, &n_label);
+        /* L301: the drafts the walk reached, against their confidences (a teacher-forced end has no target draw) */
+        if (commit_rc >= 0) pulsar_spec_calibration_note(e, r->copy, pend_conf, label, hit, n_label);
     }
     if (commit_rc < 0) {
         s->checkpoint.len = saved_len;
@@ -1036,7 +959,6 @@ static int spec_single_round(pulsar_session *s, int first_token,
     if (na >= 0 && !e->tp) {
         const double ms = (now_sec() - t0) * 1e3;
         pulsar_engine_lane_cost_observe(e, PULSAR_LANE_SPEC, n_rows, ms);
-        pulsar_engine_spec_yield_observe(e, na, ms);   /* L288: and its yield, the value of a token */
     }
     return na;
 }

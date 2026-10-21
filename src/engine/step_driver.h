@@ -31,7 +31,7 @@
  *  PULSAR_GPU_MNEUTRAL_ROWS_MAX keep the decode arms in 16-row blocks (the kernels block them: the dense EXL3 GEMV,
  *  the W8A16 rows kernel, the GR read; the routed EXL3 decode GEMM is M-independent at any width), so every row of a
  *  wide verify is the bytes a one-token decode gives (verify-width-probe-qwen: identical rows).  The width a round
- *  actually carries is the server's pick (pulsar_engine_set_spec_width, server_sched.cpp width_price_pick). */
+ *  actually carries is the verify pick's (L301, verify_curve.cpp: the rows that maximise the round's tokens per ms). */
 #define PULSAR_DRIVER_HEADS_MAX ((uint32_t)PULSAR_SPEC_ROW_BUDGET)
 /** The scratch arenas a family's ops may own. */
 #define PULSAR_DRIVER_SCRATCH_MAX 16u

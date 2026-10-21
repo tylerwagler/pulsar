@@ -449,6 +449,9 @@ bool server::send_metrics(int fd) {
     int slot_pf_total[PULSAR_SESSION_POOL_CAP];
     pthread_mutex_lock(&s->mu);
     m = s->m_spec;
+    const pulsar_verify_curve_view vc = s->m_verify_curve;
+    const pulsar_spec_calibration cal = s->m_spec_calib;
+    const char *drafter = s->m_drafter_name ? s->m_drafter_name : "";
     n_slots = s->n_slots;
     for (int i = 0; i < n_slots; i++) {
         const int pos = s->m_slot_pos[i];
@@ -559,18 +562,67 @@ bool server::send_metrics(int fd) {
     buf_puts(&b, "# HELP pulsar:spec_decode_gen_tokens_total Tokens emitted by the fused spec loop only.\n");
     buf_puts(&b, "# TYPE pulsar:spec_decode_gen_tokens_total counter\n");
     buf_printf(&b, "pulsar:spec_decode_gen_tokens_total %llu\n", (unsigned long long)m.gen_tokens);
-    /* L136: overflow-argmax bind frequency.  overflow_rounds = sweeps whose
-     * row demand exceeded the shared budget; thr_cut_rows = candidate rows
-     * the cost threshold priced out with budget unspent — the only decisions
-     * the marginal_ms constant makes. */
+    /* L136 / L301: what the verify pick decides.  overflow_rounds = rounds whose row demand exceeded the
+     * budget; pick_cut_rows = pending drafts the pick left unverified. */
     buf_puts(&b, "# HELP pulsar:spec_overflow_rounds_total Spec sweeps whose row demand exceeded the shared budget.\n");
     buf_puts(&b, "# TYPE pulsar:spec_overflow_rounds_total counter\n");
     buf_printf(&b, "pulsar:spec_overflow_rounds_total %llu\n",
                (unsigned long long)s->m_spec_overflow_rounds);
-    buf_puts(&b, "# HELP pulsar:spec_thr_cut_rows_total Draft rows priced out by the overflow cost threshold with budget unspent.\n");
-    buf_puts(&b, "# TYPE pulsar:spec_thr_cut_rows_total counter\n");
-    buf_printf(&b, "pulsar:spec_thr_cut_rows_total %llu\n",
-               (unsigned long long)s->m_spec_thr_cut_rows);
+    buf_puts(&b, "# HELP pulsar:spec_pick_cut_rows_total Pending drafts the verify pick left unverified.\n");
+    buf_puts(&b, "# TYPE pulsar:spec_pick_cut_rows_total counter\n");
+    buf_printf(&b, "pulsar:spec_pick_cut_rows_total %llu\n",
+               (unsigned long long)s->m_spec_pick_cut_rows);
+    /* L301: the verify curve the pick prices with (verify_curve.cpp): the profiled forward per row count, the
+     * online correction per row, and the round's measured wall outside the forward. */
+    if (vc.valid) {
+        buf_puts(&b, "# HELP pulsar:spec_verify_curve_ms Profiled verify forward wall at this many rows, ms.\n");
+        buf_puts(&b, "# TYPE pulsar:spec_verify_curve_ms gauge\n");
+        for (uint32_t r = 1; r <= vc.rows_max && r < 33u; r++)
+            buf_printf(&b, "pulsar:spec_verify_curve_ms{rows=\"%u\",source=\"%s\"} %.4f\n", r,
+                       vc.cached ? "cache" : "profile", (double)vc.base_ms[r]);
+        buf_puts(&b, "# HELP pulsar:spec_verify_slope_ms The forward's online residual per row past the profile, ms.\n");
+        buf_puts(&b, "# TYPE pulsar:spec_verify_slope_ms gauge\n");
+        if (vc.slope_valid) buf_printf(&b, "pulsar:spec_verify_slope_ms %.4f\n", (double)vc.slope_ms);
+        buf_puts(&b, "# HELP pulsar:spec_verify_host_ms A round's recent wall outside the forward and drafting, ms.\n");
+        buf_puts(&b, "# TYPE pulsar:spec_verify_host_ms gauge\n");
+        buf_printf(&b, "pulsar:spec_verify_host_ms %.4f\n", (double)vc.host_ms);
+        buf_puts(&b, "# HELP pulsar:spec_verify_draft_ms A round's recent drafting wall, ms.\n");
+        buf_puts(&b, "# TYPE pulsar:spec_verify_draft_ms gauge\n");
+        buf_printf(&b, "pulsar:spec_verify_draft_ms %.4f\n", (double)vc.draft_ms);
+    }
+    /* L301: the drafters' confidence calibration per draft position: the confidence each verified-or-rejected
+     * draft carried against its exact acceptance label (greedy: the row's argmax is the draft; sampled: the
+     * target's probability of the draft).  Bias = conf_sum - label_sum, Brier = sq_err_sum / count, mean absolute
+     * error = abs_err_sum / count; the bins give the ECE.  drafter = the engine's drafter, or "copy". */
+    {
+        static const char *const metric[6] = {"conf", "label", "hit", "abs_err", "sq_err", "count"};
+        for (int k = 0; k < 6; k++) {
+            buf_printf(&b, "# HELP pulsar:spec_calib_%s_sum Draft confidence calibration per position (%s).\n",
+                       metric[k], metric[k]);
+            buf_printf(&b, "# TYPE pulsar:spec_calib_%s_sum counter\n", metric[k]);
+            for (int d = 0; d < 2; d++)
+                for (int i = 0; i < 16; i++) {
+                    if (cal.n[d][i] == 0) continue;
+                    const double v = k == 0 ? cal.conf[d][i] : k == 1 ? cal.label[d][i] : k == 2 ? cal.hit[d][i]
+                                   : k == 3 ? cal.abs_err[d][i] : k == 4 ? cal.sq_err[d][i] : (double)cal.n[d][i];
+                    buf_printf(&b, "pulsar:spec_calib_%s_sum{drafter=\"%s\",pos=\"%d\"} %.6f\n", metric[k],
+                               d ? "copy" : drafter, i, v);
+                }
+        }
+        static const char *const bmetric[3] = {"count", "conf", "label"};
+        for (int k = 0; k < 3; k++) {
+            buf_printf(&b, "# HELP pulsar:spec_calib_bin_%s_sum Draft confidence calibration per confidence decile "
+                           "(%s).\n", bmetric[k], bmetric[k]);
+            buf_printf(&b, "# TYPE pulsar:spec_calib_bin_%s_sum counter\n", bmetric[k]);
+            for (int d = 0; d < 2; d++)
+                for (int i = 0; i < 10; i++) {
+                    if (cal.bin_n[d][i] == 0) continue;
+                    const double v = k == 0 ? (double)cal.bin_n[d][i] : k == 1 ? cal.bin_conf[d][i] : cal.bin_label[d][i];
+                    buf_printf(&b, "pulsar:spec_calib_bin_%s_sum{drafter=\"%s\",bin=\"%d\"} %.6f\n", bmetric[k],
+                               d ? "copy" : drafter, i, v);
+                }
+        }
+    }
     /* L288: the spec lane's decode-only rounds by phase, host wall (server_round_phase) -- a client's delta over
      * a window over the rounds' delta is ms/round per phase, measured untraced. */
     buf_puts(&b, "# HELP pulsar:spec_round_phase_ms_total Decode-only spec rounds' host wall by phase, ms.\n");

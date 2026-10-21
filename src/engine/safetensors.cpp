@@ -916,6 +916,19 @@ static void st_open(pulsar_model *m, const char *path, bool gpu_mapping) {
         }
     }
 
+    /* L301: the container's identity (pulsar_model::container_digest): every shard's name and header bytes */
+    m->container_digest = 0xcbf29ce484222325ull;
+    for (uint64_t i = 0; i < n; i++) {
+        const auto mix = [&](const uint8_t *p, uint64_t len) {
+            for (uint64_t b = 0; b < len; b++) {
+                m->container_digest ^= (uint64_t)p[b];
+                m->container_digest *= 0x100000001b3ull;
+            }
+        };
+        mix((const uint8_t *)shards[i].name, strlen(shards[i].name) + 1u);
+        mix(shards[i].map, shards[i].buf_off);
+    }
+
     /* The primary shard is the one carrying the full KV block; it is also the
      * only one that needs the architecture keys. */
     const st_shard *primary = NULL;
