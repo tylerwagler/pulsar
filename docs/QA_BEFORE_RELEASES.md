@@ -107,6 +107,16 @@ model.  Record pass/fail against the release commit:
   decode+prefill batching neutrality.
 - `make cuda-spec-sampling-gate` — speculative-sampling chi-square exactness.
 
+**The battery runs the production drafters (L305, 2026-10-21).**  Qwen's hosted model and every Qwen gate default
+(`QWEN_GATE_MODEL`, `DFLASH2_GATE_MODEL`) are the served pack, `/srv/models/qwen38fn-dflash2` (DFlash2, the EXL3 K5
+head, no MTP module); Nemotron's drafter gate is LiLiCorr's, DeepSeek's is DSpark's.  **MTP is a dormant lane: not
+release-blocking, tested on MTP-path changes only.**  `mtp-spec-gate` is out of `make gates` (its runner entry is
+gone; the target builds and runs by hand on `MTP_GATE_MODEL`, the Nemotron mini), and `make gates-dev` runs it when a
+touched path is an MTP one (`*mtp*`, the family MTP bindings in `family_qwen`, `nemotron_h_family`, `step_driver`).
+`sync-budget-gate` runs each hosted model's own drafter, so its Qwen leg is DFlash2's.  The one Qwen leg left on the
+MTP pack is `tp-plan-gate`'s (manual; `TP_QWEN_PLAN_MODEL`): the served pack has no TP plan (a block drafter under
+TP and an EXL3 head refuse) and Qwen is not a pair model.
+
 ### Battery wall time
 
 The one home for what `make gates` costs and why (Phase 5 #39: back under ~35 min).  The battery prints
