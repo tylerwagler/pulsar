@@ -1062,7 +1062,7 @@ __global__ void __launch_bounds__(SR_THREADS) sr_sum_kernel(const __grid_constan
             T base = T(0);
             while (j >= 0) {
                 uint32_t f;
-                while ((f = vst[j].flag) == 0u) { }
+                while ((f = vst[j].flag) == 0u) __nanosleep(64);
                 __threadfence();
                 if (f == 2u) { base = (T)vst[j].end; exact = true; break; }
                 if (vst[j].k != gg.k || vst[j].tie) break;
@@ -1078,7 +1078,7 @@ __global__ void __launch_bounds__(SR_THREADS) sr_sum_kernel(const __grid_constan
                 else if (acc == 0u) { s0 = base; ok = true; }   /* the base is the predecessor's own end */
             }
             if (!ok) {   /* the span leaves the grid: the predecessor's exact end */
-                while (vst[t - 1].flag != 2u) { }
+                while (vst[t - 1].flag != 2u) __nanosleep(64);
                 __threadfence();
                 s0 = (T)vst[t - 1].end;
             }
