@@ -120,8 +120,78 @@ TP and an EXL3 head refuse) and Qwen is not a pair model.
 ### Battery wall time
 
 The one home for what `make gates` costs and why (Phase 5 #39: back under ~35 min).  The battery prints
-its own table at the end -- `seconds per gate` in the runner summary and in the GATE SUMMARY -- so every
-battery log is a fresh measurement; this section records the levers.
+its own table at the end -- `seconds per gate` in the runner summary, and each section against its budget
+below in the GATE SUMMARY -- so every battery log is a fresh measurement; this section records the levers.
+
+**The budget (L317, 2026-10-21).**  `make gates` ends with each section's seconds against this table
+(`tests/battery_budget.py` reads it from here -- the one place the budgets are written) and flags, never
+fails, a section over its budget or a section with no row.  A row that adds battery time says so: it moves
+its section's budget here, in its own commit, and its ledger row says why.  Sections: each serial target;
+the runner per hosted model (`cuda-runner-gate [<family>]`, its engine opens included); the live legs per
+model (`live-legs [<model>]`, its server loads included); the host-only gates, which overlap the runner, as
+their longest; and the suite total (the recipe's wall, the prerequisite build outside it, ~100 s).
+
+<!-- battery-budget -->
+| section | budget s | holds |
+|---|---:|---|
+| `unit-test-gate` | 175 | `pulsar_test --gating`: three model loads |
+| `agent-test-gate` | 10 | host |
+| `cuda-regression` | 70 | ten model-free kernel gates, concurrent |
+| `cuda-kv-rows-pack-gate` | 10 | |
+| `cuda-sampler-device-gate` | 30 | |
+| `cuda-chat-smoke-gate` | 35 | the CLI's own load |
+| `cuda-attn-gates` | 45 | |
+| `cuda-attn-pack-gate` | 5 | |
+| `indexer-hadamard-kernel-check` | 5 | |
+| `cuda-prefill-gate-cutlass-mxfp4` | 5 | skips loudly off-box |
+| `qwen-family-gate-device` | 60 | zero-weight containers |
+| `state-kinds-gate` | 5 | |
+| `vision-qwen-tower-gate` | 10 | |
+| `tessera-kernel-gate` | 10 | |
+| `blockdraft-gate` | 5 | |
+| `nvfp4-rows-gate` | 10 | |
+| `lilicorr-head-gate` | 10 | |
+| `cuda-runner-gate [DeepSeek V4]` | 1150 | the whole table, 2 engine opens |
+| `cuda-runner-gate [Qwen4-exp]` | 720 | the whole table where its needs allow, 2 opens; block-spec (DFlash2) |
+| `cuda-runner-gate [Nemotron-H]` | 300 | block-spec (LiLiCorr), scratch-poison, bank-adopt; 1 open |
+| `live-legs [deepseek]` | 600 | constrained, server-live, abandon: warm + hooks instances |
+| `live-legs [qwen]` | 1500 | the stall check, abandon, constrained, server-live, prefix-turns x2, preempt: warm + hooks + fresh |
+| `live-legs [nemotron]` | 240 | opencode-turns: warm + fresh |
+| `host-only gates (longest)` | 90 | overlap the runner |
+| `suite total` | 3000 | the target: <= ~50 min, the live legs included |
+<!-- /battery-budget -->
+
+**2026-10-21 (L317, the battery diet; #389 / #422 before it: suite 3,329 / 3,219 s + ~45 min of live
+legs, ~1 h 40 min).**  No leg lost its owner: each runs in the battery, or on a gates-dev path trigger, or
+on an engine it now shares.
+
+| leg | before | now |
+|---|---|---|
+| constrained-live, server-live, server-abandon (DeepSeek, Qwen) | own servers after `make gates`, 4 loads a model | `live-legs`, the last section of `make gates`: the model's shared server; constrained's isolation on its hooks instance |
+| L312 stall check | `~/flare-work` script + `~/l312w/tbt2.py`, own server (262k ctx, 16 banks, no disk) | `tests/stall_live.py`, Qwen's shared server, first (64k ctx, 8 banks) |
+| prefix-turns reply / side (Qwen) | 2 servers each (warm, cold) | shared server; the reference on Qwen's one fresh instance (0 cached tokens asserted); L316's instrument (thinking echoed, one prompt asserted) |
+| preempt-exact (Qwen) | 4 servers (probe, count, preempt, alone) | probe + counts on the shared server, the preemption on the hooks instance (budget override), A alone on the fresh instance |
+| opencode-turns (Nemotron) | 2 servers | shared + fresh (Nemotron has one leg) |
+| lilicorr-spec-gate, dflash2-spec-gate | own process + load each, 256 tokens (389 + 307 s) | runner `block-spec-gate` on the hosted Nemotron (LiLiCorr) and Qwen (DFlash2), 128 tokens; the make targets at 256 are gates-dev's drafter trigger |
+| scratch-poison LiLiCorr leg | by hand / gates-dev | runner `scratch-poison-gate` on the hosted Nemotron |
+| bank-adopt-gate-{ds,qwen,nemotron} | by hand | runner `bank-adopt-gate` on all three hosted models (Nemotron's: the LiLiCorr pack, was the mini) |
+| cuda-chunk-neutrality-gate (382 + 212 s) | 16 schedules + X, both families | battery: A + one schedule per class (grid, endpoint, finishing, disk), seeded by the sha; the past-ring class (K, M, P: the 4,600-step decode) and the rest: `cuda-chunk-neutrality-gate-full`, gates-dev on prefill / chunk / kv_state / checkpoint / session / segment-store paths |
+| row-neutrality -deep / -deeper, algo-stability -deep | battery, both families | gates-dev entries of the runner (attention and kernel-dispatch paths); the battery keeps the short probe and the short sweep |
+
+- *The runner hosts three models, one at a time* (each closed before the next opens): DeepSeek, Qwen
+  (`qwen38fn-dflash2`, the production pack), Nemotron (`nemotron35-k4-lilicorr-pulsar`).  `--gates=a,b`
+  after a `--model` restricts a hosted model to its own legs; a runner entry marked DEV runs only when
+  `--only` names it (gates-dev), and every run lists them by name.  A hosted model none of whose entries the
+  selection takes is not opened.
+- *The live legs* (`tests/live_legs.py`, `make live-legs`, `LIVE_LEGS=a,b` for a subset): per model the
+  shared server, then one instance with every server-wide test hook its legs need (only if one does), then
+  one fresh instance for every reuse == cold reference (only if one does) -- never two engines at once.
+  Each leg keeps its checks and its PASS/FAIL; each phase names the instance it ran on; each leg's
+  conversations open with text no other leg sends, and every fresh-instance reference must report 0 cached
+  prompt tokens.  Each script still runs alone by its old command line, on instances of its own.
+- *The mutation spot check* (`make battery-mutants`, a GPU job): tests/gates_runner linked against one
+  mutated TU per moved leg (`tests/runner_mutants.py`, plus L307's scratch-poison mutant), each run with the
+  selection that must catch it.
 
 **Before (2026-10-13, 1b33c1d4, sparky `~/qland2-battery-1013-2134`):** 3,324 s wall, of which 3,240 s
 suite: the runner 2,629 s (52 sub-gates, 9 engine opens), the serial GPU targets in front of it 611 s.
@@ -189,12 +259,13 @@ not hygiene):
 - cuda-head-graph-replay-gate's run C (26 s): it only proves eager determinism, the premise of B == A.
 - The spec-sampling oracles' 1,250 trajectories per mode (L163 already halved them).
 
-**Outside `make gates`:** the landing scripts' extra legs (`~/*-battery.sh` after `make gates`:
+**Outside `make gates` (2026-10-13; L317 moved the live legs into it):** the landing scripts' extra legs (`~/*-battery.sh` after `make gates`:
 `session-contract-gate-qwen`, `cuda-chunk-neutrality-gate` and `cuda-spec-sampling-gate` on
 `$(QWEN_GATE_MODEL)`, ~12 min on 2026-10-13) repeat what the runner already runs on the hosted Qwen
 (`session-contract-gate [Qwen4-exp]`, `cuda-chunk-neutrality-gate [Qwen4-exp]`,
 `cuda-spec-sampling-gate [Qwen4-exp]`, the last at the battery's 1,250 trajectories).  Drop them; keep the
-vision, image-smoke and live / abandon server legs, which the runner does not cover.
+vision, image-smoke and live / abandon server legs, which the runner does not cover (since L317 the live legs are
+`make gates`' last section, `live-legs`).
 
 ### The GPU queue (gpuq)
 
