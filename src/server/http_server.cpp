@@ -564,6 +564,10 @@ bool server::send_metrics(int fd) {
     buf_puts(&b, "# HELP pulsar:spec_decode_gen_tokens_total Tokens emitted by the fused spec loop only.\n");
     buf_puts(&b, "# TYPE pulsar:spec_decode_gen_tokens_total counter\n");
     buf_printf(&b, "pulsar:spec_decode_gen_tokens_total %llu\n", (unsigned long long)m.gen_tokens);
+    /* L308: a quenched copy lane's probes (its estimate went stale; session_spec.cpp pulsar_spec_copy_price) */
+    buf_puts(&b, "# HELP pulsar:spec_copy_probes_total Copy chains drafted to re-probe a stale copy estimate under tau.\n");
+    buf_puts(&b, "# TYPE pulsar:spec_copy_probes_total counter\n");
+    buf_printf(&b, "pulsar:spec_copy_probes_total %llu\n", (unsigned long long)m.copy_probes);
     /* L136 / L301: what the verify pick decides.  overflow_rounds = rounds whose row demand exceeded the
      * budget; pick_cut_rows = pending drafts the pick left unverified. */
     buf_puts(&b, "# HELP pulsar:spec_overflow_rounds_total Spec sweeps whose row demand exceeded the shared budget.\n");

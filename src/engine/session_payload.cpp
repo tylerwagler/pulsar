@@ -588,17 +588,19 @@ int pulsar_session::load_segment(FILE *fp, uint64_t bytes, bool last, uint32_t *
  * measured in goes on past the frontier (a new request resets it, as it would have).  The rest of the speculation
  * state is a request's lookahead (the carry, the pendings, the quench): a load resets it as every request
  * boundary does (spec_lookahead_reset), and a live session voids it on its next plain step, so neither side
- * holds it at the frontier's next round.  Format v3; the copy acceptance v5. */
-#define KVP_SPEC_U32 5u
+ * holds it at the frontier's next round.  Format v3; the copy acceptance v5; its age (copy_unseen, L308: a stale
+ * estimate's next copy chain is a probe) v6. */
+#define KVP_SPEC_U32 6u
 static void kvp_spec_pack(const pulsar_spec_carry_state *sp, uint32_t (&rec)[KVP_SPEC_U32]) {
     rec[0] = (uint32_t)sp->spec_adaptive_depth;
     rec[1] = sp->spec_depth_down_forgiven ? 1u : 0u;
     rec[2] = sp->spec_depth_rounds_since_up;
     rec[3] = sp->spec_depth_climb_cooldown;
     memcpy(&rec[4], &sp->copy_accept, sizeof(float));
+    rec[5] = sp->copy_unseen;
 }
 /* false = the record holds no state a session could (0 = not yet moved; a depth is 1..16; an acceptance is a rate
- * in [0, 1], 0 = not measured) */
+ * in [0, 1], 0 = not measured; its age is any count) */
 static bool kvp_spec_valid(const uint32_t (&rec)[KVP_SPEC_U32]) {
     float c;
     memcpy(&c, &rec[4], sizeof c);
@@ -610,6 +612,7 @@ static void kvp_spec_unpack(const uint32_t (&rec)[KVP_SPEC_U32], pulsar_spec_car
     sp->spec_depth_rounds_since_up = (uint8_t)rec[2];
     sp->spec_depth_climb_cooldown = (uint8_t)rec[3];
     memcpy(&sp->copy_accept, &rec[4], sizeof(float));
+    sp->copy_unseen = rec[5];
 }
 
 /* the frontier slot's size: the state model's frontier walk, aligned as a grid slot is (checkpoint.cpp) */

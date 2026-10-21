@@ -30,6 +30,7 @@
 #include <ctype.h>
 /* engine internals */
 #include "../src/engine/pulsar_engine_internal.h"
+#include "../src/engine/spec_internal.h"   /* L308: the copy estimate */
 /* the frozen host sampler (L302): spec-math's oracle */
 #include "sampler_host_ref.h"
 #ifndef PULSAR_NO_GPU
@@ -3674,12 +3675,56 @@ static void test_l301_chain_pick(void) {
     pulsar_verify_curve_free(c);
 }
 
+/* L308 -- the copy estimate (session_spec.cpp pulsar_spec_copy_price): unmeasured, every copy draft at 1; a failed
+ * chain quenches it under tau, and it stays quenched while fresh; PULSAR_SPEC_COPY_REPROBE tokens without a copy
+ * verdict make it stale, and the next chain is a probe -- the first draft at 1, the next at the old estimate, the
+ * stop rule cutting there -- whose verdict re-seeds the estimate; a fresh verdict blends.  The age saturates. */
+static void test_l308_copy_estimate(void) {
+    pulsar_spec_carry_state sp;
+    memset(&sp, 0, sizeof sp);
+    const float tau = 0.3f;
+    float conf[16];
+    bool rp = true;
+    TEST_ASSERT(pulsar_spec_copy_price(&sp, tau, 8u, conf, &rp) == 8u && !rp && conf[0] == 1.0f && conf[7] == 1.0f);
+    TEST_ASSERT(pulsar_spec_copy_price(&sp, tau, 0u, conf, &rp) == 0u && !rp);
+    pulsar_spec_copy_observe(&sp, 0, 8u);   /* the first chain refused at its first draft: seeded at the floor */
+    TEST_ASSERT(sp.copy_accept == 0.01f && sp.copy_unseen == 0u);
+    TEST_ASSERT(pulsar_spec_copy_price(&sp, tau, 8u, conf, &rp) == 0u && !rp);
+    pulsar_spec_copy_age(&sp, PULSAR_SPEC_COPY_REPROBE - 1u);
+    TEST_ASSERT(pulsar_spec_copy_price(&sp, tau, 8u, conf, &rp) == 0u && !rp);   /* still fresh: still quenched */
+    pulsar_spec_copy_age(&sp, 1u);
+    TEST_ASSERT(pulsar_spec_copy_price(&sp, tau, 8u, conf, &rp) == 2u && rp && conf[0] == 1.0f && conf[1] == 0.01f);
+    TEST_ASSERT(pulsar_spec_copy_price(&sp, tau, 1u, conf, &rp) == 1u && rp);
+    pulsar_spec_copy_observe(&sp, 2, 2u);   /* the probe accepted whole: re-seeded, not blended */
+    TEST_ASSERT(sp.copy_accept == 1.0f && sp.copy_unseen == 0u);
+    TEST_ASSERT(pulsar_spec_copy_price(&sp, tau, 8u, conf, &rp) == 8u && !rp && conf[1] == 1.0f && conf[7] == 1.0f);
+    pulsar_spec_copy_observe(&sp, 3, 8u);   /* fresh: 3 of 4 trials blended at 0.1 */
+    TEST_ASSERT(fabsf(sp.copy_accept - (0.9f + 0.1f * 0.75f)) < 1e-6f);
+    pulsar_spec_copy_observe(&sp, 0, 0u);   /* no trial: no verdict */
+    TEST_ASSERT(fabsf(sp.copy_accept - (0.9f + 0.1f * 0.75f)) < 1e-6f);
+    /* a stale estimate above tau: the probe's pricing, the whole chain admitted, no re-probe counted; re-seeded */
+    sp.copy_accept = 0.8f;
+    pulsar_spec_copy_age(&sp, 40u);
+    TEST_ASSERT(pulsar_spec_copy_price(&sp, tau, 8u, conf, &rp) == 8u && !rp && conf[0] == 1.0f && conf[1] == 0.8f);
+    pulsar_spec_copy_observe(&sp, 1, 8u);
+    TEST_ASSERT(sp.copy_accept == 0.5f && sp.copy_unseen == 0u);
+    /* tau off: nothing stops, nothing is a re-probe */
+    sp.copy_accept = 0.01f;
+    TEST_ASSERT(pulsar_spec_copy_price(&sp, 0.0f, 8u, conf, &rp) == 8u && !rp);
+    sp.copy_unseen = UINT32_MAX - 1u;
+    pulsar_spec_copy_age(&sp, 5u);
+    TEST_ASSERT(sp.copy_unseen == UINT32_MAX);
+    TEST_ASSERT(pulsar_spec_copy_price(&sp, 0.0f, 8u, conf, &rp) == 8u && !rp && conf[0] == 1.0f);
+}
+
 /* L301: the verify pick, its online correction and the lockstep chains' continuation (verify_curve.cpp; the
- * server's spec_pick_rows) -- host arithmetic on synthetic curves, no model. */
+ * server's spec_pick_rows) -- host arithmetic on synthetic curves, no model.  L308: the copy estimate it prices
+ * copy chains with. */
 static void test_verify_pick(void) {
     test_l179_spec_pick_rows();
     test_l301_verify_curve_correction();
     test_l301_chain_pick();
+    test_l308_copy_estimate();
 }
 
 /* L304: the fused step's cost fit and the chunk solved from it (verify_curve.cpp).  Rounds whose forward is
@@ -3955,7 +4000,7 @@ static const pulsar_test_entry test_entries[] = {
     {"--attn-layout", "attn-layout", "CSA2 attention layout table: modes + sources derived from the V4.1 source sets (L218)", test_attn_layout_table},
     {"--lane-cost", "lane-cost", "lane cost fit: a step's measured cost to its terms, its centre, or no price at all (L263, L284)", test_lane_cost_fit},
     {"--fused-chunk", "fused-chunk", "the fused step's cost fit and the continuation chunk solved from a time budget (L304)", test_fused_chunk},
-    {"--verify-pick", "verify-pick", "the verify pick: the brute-force argmax on a staircase curve, the robust online correction, the lockstep continuation (L301)", test_verify_pick},
+    {"--verify-pick", "verify-pick", "the verify pick: the brute-force argmax on a staircase curve, the robust online correction, the lockstep continuation (L301); the copy estimate's re-probe (L308)", test_verify_pick},
     {"--lib-image-rope", "lib-image-rope", "multi-axis rope positions from the image records vs HF get_rope_index (L268)", test_lib_image_rope},
     {"--lib-image-identity", "lib-image-identity", "the core image identity: records per block, rewind keeps survivors, a chain persists past a block only with its record (L281)", test_lib_image_identity},
     {"--head-graph-key", "head-graph-key", "the output head's graph key carries its row kinds: a fused step's head never replays a decode step's graph (L292)", test_head_graph_key},

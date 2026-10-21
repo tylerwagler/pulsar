@@ -82,9 +82,20 @@ void pulsar_spec_calibration_note(pulsar_engine *e, bool copy, const float *conf
  *  count, 0 for none (session_spec.cpp has the rule). */
 #define PULSAR_SPEC_COPY_MATCH 8u
 uint32_t pulsar_spec_copy_chain(pulsar_session *s, uint32_t bank, int32_t next_base, uint32_t max, int32_t *out);
-/** The confidence the installed bank's copy drafts carry: this request's measured copy acceptance
- *  (pulsar_spec_carry_state::copy_accept), 1 until one is measured. */
-float pulsar_spec_copy_conf(const pulsar_session *s);
+/** L308: an estimate unobserved for this many committed tokens is stale (Flare's 32-token horizon). */
+#define PULSAR_SPEC_COPY_REPROBE 32u
+/** L288 / L308: the confidences of a copy chain's first n drafts from the request's copy estimate `sp` (the one
+ *  estimate: copy_accept, copy_unseen), into conf[0..n), and how many of them the stop rule at tau admits (0 = the
+ *  request does not copy now).  None measured yet: 1 each.  A fresh estimate: copy_accept each, none admitted under
+ *  tau.  A stale one (copy_unseen >= PULSAR_SPEC_COPY_REPROBE): the first draft at its upper bound, 1, the rest at
+ *  the estimate -- a probe, cut by the stop rule (session_spec.cpp has the rationale).  *reprobe = the chain is a
+ *  probe the fresh estimate would have refused. */
+uint32_t pulsar_spec_copy_price(const pulsar_spec_carry_state *sp, float tau, uint32_t n, float *conf, bool *reprobe);
+/** L308: a verified copy chain's verdict, `commit` of its `K` drafts accepted, into the estimate (a stale or
+ *  unmeasured one is re-seeded by it); the estimate is fresh again. */
+void pulsar_spec_copy_observe(pulsar_spec_carry_state *sp, int commit, uint32_t K);
+/** L308: `tokens` committed by a round that verified no copy chain: the estimate ages. */
+void pulsar_spec_copy_age(pulsar_spec_carry_state *sp, uint32_t tokens);
 /** A draft record for the installed bank's next chain after `next_base` at the session's depth and these
  *  params -- what a drafter's draft / draft_batch fills (the rest of the record is the caller's). */
 void pulsar_spec_draft_req_init(pulsar_session *s, spec_redraft_req *q, int next_base, float temperature, int top_k,
