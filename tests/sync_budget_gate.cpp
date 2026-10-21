@@ -26,11 +26,24 @@ static int n_fail = 0;
 enum { PH_ASSEMBLE, PH_FORWARD, PH_ROUND_END, PH_REDRAFT, PH_COUNT };
 static const char *const k_phase[PH_COUNT] = {"assemble", "forward", "round_end", "redraft+commit"};
 
-/* The budget: per round, per phase, the most stream drains + blocking copies (both directions) the lane may pay.
- * Measured at L302 step 1 (device sampler + walk) -- lower them as the round loses syncs, never raise them without
- * a row saying why. */
+/* The budget: per round, per phase, the most stream drains + blocking copies (both directions) a lane may pay at 1 to
+ * 4 banks, greedy or sampled -- per drafter, as its lane pays them.  Measured 2026-10-20 (L302: the device sampler,
+ * walk and block chains), the worst round of 32 at each of the four configurations plus ~25% (a drafter's depth is
+ * priced by measured step costs, so its round shapes move a little run to run).  Lower them as the round loses syncs;
+ * never raise one without a row saying why.
+ *   DSpark (vexp)      worst 12 / 6 / 14 / 16   (assemble pays 3 a bank)
+ *   MTP (Qwen, mini)   worst  2 / 4 /  5 / 42   (each chained draft reads its token back)
+ *   block (DFlash2,    worst  2 / 4 /  1 /  5   (the sampled chains: one launch, one read)
+ *          LiLiCorr) */
 struct budget { int assemble, forward, round_end, redraft; };
-static const budget k_budget = {64, 64, 64, 256};
+static budget budget_of(pulsar_drafter_kind k) {
+    switch (k) {
+    case PULSAR_DRAFTER_DSPARK: return {12, 6, 18, 20};
+    case PULSAR_DRAFTER_MTP: return {3, 4, 6, 52};
+    case PULSAR_DRAFTER_BLOCK: return {3, 4, 1, 6};
+    default: return {0, 0, 0, 0};
+    }
+}
 
 static uint64_t syncs_of(const pulsar_gpu_sync_stats &a, const pulsar_gpu_sync_stats &b) {
     return (b.stream_syncs - a.stream_syncs) + (b.device_syncs - a.device_syncs) + (b.d2h - a.d2h) + (b.h2d - a.h2d);
@@ -85,10 +98,17 @@ static void run(pulsar_engine *e, int NB, float temp, int rounds_max, bool repor
         (void)pulsar_session_spec_assemble_batch(s, st, m, width, reqs.data(), &rows);
         pulsar_gpu_sync_stats_get(&c1);
         int live = 0;
-        for (int i = 0; i < m; i++)
+        char why[200] = "";
+        for (int i = 0; i < m; i++) {
             if (st[i].status == PULSAR_SPEC_STEP_OK) { st[live] = st[i]; bank_of[live++] = bank_of[i]; }
+            else if (!why[0]) snprintf(why, sizeof why, "bank %u status %d: %.150s", st[i].bank, (int)st[i].status, st[i].err);
+        }
         m = live;
-        if (m == 0 || rows == 0) { ok = false; snprintf(err, sizeof err, "no bank verified at tick %d", tick); break; }
+        if (m == 0 || rows == 0) {
+            ok = false;
+            snprintf(err, sizeof err, "no bank verified at tick %d (%.200s)", tick, why);
+            break;
+        }
         uint32_t gotr = 0;
         pulsar_session_spec_arm_capture(s, rows);
         ok = pulsar_session_decode_mixed(s, reqs.data(), rows, NULL, 0, &gotr, PULSAR_MSEQ_HEAD_ALL_ROWS, err,
@@ -131,8 +151,8 @@ static void run(pulsar_engine *e, int NB, float temp, int rounds_max, bool repor
             printf("  %s %.2f (max %llu)", k_phase[p], (double)sum[p] / rounds, (unsigned long long)worst[p]);
         printf("\n");
         if (!report) {
-            const int lim[PH_COUNT] = {k_budget.assemble * NB, k_budget.forward, k_budget.round_end * NB,
-                                       k_budget.redraft * NB};
+            const budget b = budget_of(pulsar_engine_drafter(e));
+            const int lim[PH_COUNT] = {b.assemble, b.forward, b.round_end, b.redraft};
             for (int p = 0; p < PH_COUNT; p++)
                 CHECK((int)worst[p] <= lim[p], "%d bank(s) T%.1f %s: at most %llu syncs a round, budget %d", NB,
                       (double)temp, k_phase[p], (unsigned long long)worst[p], lim[p]);
