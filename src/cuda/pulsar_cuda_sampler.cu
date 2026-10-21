@@ -946,7 +946,7 @@ __device__ T block_serial_sum(uint32_t n, V value, P pred, uint32_t *stop_at, se
  * nothing ties or crosses), which the tile publishes.  The few tiles where the sum leaves a binade chain; the rest
  * resolve from the look-back. */
 
-constexpr uint32_t SR_THREADS = 1024, SR_E = 4, SR_TILE = SR_THREADS * SR_E;
+constexpr uint32_t SR_THREADS = 512, SR_E = 8, SR_TILE = SR_THREADS * SR_E;
 constexpr uint32_t SR_ROWS = PULSAR_GPU_SAMPLE_ROWS_MAX;
 
 struct sr_status {
