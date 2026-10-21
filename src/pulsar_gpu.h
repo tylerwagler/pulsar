@@ -272,15 +272,12 @@ int pulsar_gpu_marker_record(void);
  *  -1 / invalid), 0 while the GPU is still working towards it.  Never blocks. */
 int pulsar_gpu_marker_done(int marker);
 
-/** L119 segment capture-or-replay for round-invariant decode-sweep stretches
- * (plan 119 in pulsar-notes; supersedes the removed whole-sweep tape the
- * comment above describes — the unified batch lane measures 92% GPU-busy
- * unprofiled, and these reclaim its inter-launch gaps). seg_enter: 0 = run
- * the body eagerly, 1 = capture armed (run body, then seg_exit), 2 = cached
- * graph replayed (skip the body). seg_exit returning 0 means the captured
- * work NEVER RAN — re-run the body eagerly. Always on (L119 verdict: the
- * head segment ships default-on; the per-layer FFN segments measured a net
- * loss on GB10 and are deleted). Worker thread only. */
+/** L119 / L306 segment graphs: the CUDA-graph cache of a step's round-invariant stretch, keyed by everything host-side
+ *  its launches depend on (the contract, the two kinds of key and the invalidation: pulsar_cuda_runtime.cu).
+ *  seg_enter: 2 = a captured graph replayed (skip the body), 1 = capture armed (run the body, then seg_exit), 0 = run
+ *  the body eagerly (a warm use, key 0, the cache off, or nested in a capture), -1 = REFUSED (this key's capture or
+ *  replay failed: the step fails -- L306, no eager fallback).  seg_exit: 1 = the captured work ran, 0 = nothing ran
+ *  (the body refused, or the capture failed): the step refuses.  Worker thread only. */
 int pulsar_gpu_seg_enter(uint64_t key);
 int pulsar_gpu_seg_exit(uint64_t key, int body_ok);
 void pulsar_gpu_seg_reset(void);   /* REQUIRED on gpu-graph teardown: cached
@@ -290,6 +287,27 @@ void pulsar_gpu_seg_note_device_free(void); /* REQUIRED at every grow-realloc
 /** Process-lifetime segment counters: graphs replayed and captures begun (L292: a gate proves it ran the replay
  *  lane, or the eager one, by their movement across its steps). */
 void pulsar_gpu_seg_counts(uint64_t *replays, uint64_t *captures);
+/** L306: every segment counter (process lifetime; graphs and graph_bytes are what is held now). */
+typedef struct pulsar_gpu_seg_stats {
+    uint64_t replays;         ///< graphs replayed
+    uint64_t captures;        ///< captures begun
+    uint64_t live_captures;   ///< of them, outside the warmup's window: a live step paid the capture
+    uint64_t misses;          ///< uses of a graphed key that did not replay (its warm uses and its capture)
+    uint64_t catalog_keys;    ///< shapes the warmup declared (pulsar_gpu_seg_catalog_open .. _close)
+    uint64_t graphs;          ///< instantiated graphs held
+    uint64_t graph_bytes;     ///< the device memory their instantiation took (cudaMemGetInfo deltas)
+    uint64_t evictions;       ///< live graphs dropped for room (the table never runs a shape eager when full)
+    uint64_t regrows;         ///< scratch regrows outside the warmup that dropped every graph
+    uint64_t dead;            ///< keys whose capture or replay failed (each refuses from then on)
+    uint64_t refusals;        ///< uses refused
+} pulsar_gpu_seg_stats;
+void pulsar_gpu_seg_stats_get(pulsar_gpu_seg_stats *out);
+/** L306: the startup warmup's declaration window.  Every key a step uses between open and close is a CATALOG key:
+ *  pinned, its first use eager (its scratch warms), its second captured -- so the shapes the warmup walks are
+ *  captured before the listener opens.  Close announces what was declared, captured and what it cost, and returns
+ *  how many declared shapes FAILED their capture or refused under it (the server refuses to start on any). */
+void pulsar_gpu_seg_catalog_open(void);
+uint64_t pulsar_gpu_seg_catalog_close(void);
 /** L296 perf, instruments only: 0 runs every segment eager (the cache dropped, nothing captured or replayed) -- the
  *  eager reference a gate compares the graphed lane against (nemotron-fwd-gate X7); 1 restores.  Returns the previous
  *  setting.  The engine never calls it. */

@@ -439,9 +439,20 @@ static void vc_cache_write(const char *path, uint64_t key, uint32_t rows_max, co
 /* The profile (DeepInfer's profile_decode_perf): on the installed bank at its frontier, an r-row verify step for
  * every r from the widest down -- the production verify (heads on every row, the target's verify capture armed),
  * the target's frontier snapshot taken before it and put back after, exactly a round's begin and abort, so the bank
- * is where it was after each -- one untimed, then VC_PROFILE_REPS timed; the mean of the timed ones less the fastest
- * and the slowest. */
+ * is where it was after each -- untimed until the width is WARM, then VC_PROFILE_REPS timed; the mean of the timed
+ * ones less the fastest and the slowest.
+ *
+ * L306: the same walk is the startup warmup's catalog of the verify widths, so it runs on every start and times only
+ * when `base` is non-NULL (no cached curve).  A width is warm at its first rep after the first that ran every graph
+ * segment it entered from a captured graph -- the segment cache's misses did not move (pulsar_gpu_seg_stats) -- and
+ * that rep is the first timed one.  Inside the warmup's catalog window a shape's first use warms its scratch and its
+ * second captures it (DeepSeek's output head alternates two carrier parities: four uses), so the timed reps are the
+ * replays production runs, not the eager first uses (before L306 every width ran six times under the live capture
+ * threshold of twelve: a graphed lane's curve priced its eager forward).  A lane with no segment is warm at its second
+ * rep -- one untimed, as before; with no timing wanted, a width whose first rep entered no segment is done (DeepSeek's
+ * head is graphed at 16 rows and below only). */
 #define VC_PROFILE_REPS 5u
+#define VC_WARM_MAX 8u
 static bool vc_profile(pulsar_session *s, uint32_t rows_max, double *base, char *err, size_t errlen) {
     const uint32_t bank = pulsar_session_live_bank(s);
     const int P = pulsar_session_pos(s);
@@ -459,7 +470,13 @@ static bool vc_profile(pulsar_session *s, uint32_t rows_max, double *base, char 
     for (uint32_t rows = rows_max; ok && rows >= 1u; rows--) {
         for (uint32_t k = 0; k < rows; k++) reqs[k] = {bank, (int32_t)(P + (int)k), s->checkpoint.v[k % (uint32_t)P]};
         double ms[VC_PROFILE_REPS];
-        for (uint32_t rep = 0; ok && rep <= VC_PROFILE_REPS; rep++) {
+        uint32_t timed = 0;
+        bool warm = false;
+        bool segments = true;   /* this width enters a graph segment (known after its first rep) */
+        for (uint32_t rep = 0;
+             ok && segments && rep < VC_WARM_MAX + VC_PROFILE_REPS && (base ? timed < VC_PROFILE_REPS : !warm); rep++) {
+            pulsar_gpu_seg_stats g0, g1;
+            pulsar_gpu_seg_stats_get(&g0);
             ok = pulsar_session_bank_state_restore(s, bank) &&
                  (!t->snapshot || t->snapshot(s, r, err, errlen));
             if (!ok) break;
@@ -472,12 +489,23 @@ static bool vc_profile(pulsar_session *s, uint32_t rows_max, double *base, char 
             const double t1 = now_sec();
             pulsar_session_spec_arm_capture(s, 0u);
             if (!ok) break;
-            if (rep > 0) ms[rep - 1u] = (t1 - t0) * 1e3;
+            pulsar_gpu_seg_stats_get(&g1);
+            if (!warm && rep >= 1u && g1.misses == g0.misses) warm = true;
+            if (warm && base) {
+                ms[timed++] = (t1 - t0) * 1e3;
+            } else if (!warm && rep + 1u == VC_WARM_MAX) {
+                /* rule 5: a width whose segments never all replay is timed as it runs, and says so */
+                warm = true;
+                fprintf(stderr, "pulsar: verify curve: the %u-row verify still missed the graph cache after %u reps "
+                                "(%llu captured, %llu live): timed as it runs\n",
+                        rows, VC_WARM_MAX, (unsigned long long)g1.captures, (unsigned long long)g1.live_captures);
+            }
+            if (!base && rep == 0u && g1.misses == g0.misses) segments = false;   /* nothing to capture here */
             ok = pulsar_session_bank_state_restore(s, bank) && (!t->restore || t->restore(s, r));
             pulsar_session_bank_state_save(s, bank);
             if (!ok) snprintf(err, errlen, "the bank could not be put back after a %u-row verify", rows);
         }
-        if (!ok) break;
+        if (!ok || !base) continue;
         std::sort(ms, ms + VC_PROFILE_REPS);
         double sum = 0.0;
         for (uint32_t i = 1; i + 1u < VC_PROFILE_REPS; i++) sum += ms[i];
@@ -510,10 +538,11 @@ int pulsar_session_verify_curve_open(pulsar_session *s, const char *cache_dir, c
         snprintf(path, sizeof path, "%s/%016llx.curve", cache_dir, (unsigned long long)key);
     const double t0 = now_sec();
     const bool cached = path[0] && vc_cache_read(path, key, rows_max, base);
-    if (!cached) {
-        if (!vc_profile(s, rows_max, base, err, errlen)) return -1;
-        if (path[0]) vc_cache_write(path, key, rows_max, base);
-    }
+    /* L306: the walk runs on every start -- it is the warmup's catalog of the verify widths -- and times them only
+     * without a cached curve; then the drafter's own captured shapes (its draft pass's bank counts and bounds) */
+    if (!vc_profile(s, rows_max, cached ? NULL : base, err, errlen)) return -1;
+    if (!cached && path[0]) vc_cache_write(path, key, rows_max, base);
+    if (e->drafter_ops && e->drafter_ops->warm && e->drafter_ops->warm(s, err, errlen) != 0) return -1;
     pulsar_verify_curve *c = pulsar_verify_curve_new(rows_max, base);
     c->key = key;
     c->cached = cached;

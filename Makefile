@@ -1100,6 +1100,11 @@ DFLASH2_GATE_MODEL ?= /srv/models/qwen38fn-u-e4-d5-dflash2
 .PHONY: dflash2-spec-gate
 dflash2-spec-gate: tests/mtp_spec_gate
 	PULSAR_GATE_DRAFTER=dflash2 ./tests/mtp_spec_gate $(DFLASH2_GATE_MODEL) $(MTP_GATE_TOKENS)
+# L306: a refused block-drafter pass fails the single-bank lane's request by name, never a plain round
+# (tests/draft_refusal_gate.cpp; the refusal forced by detaching the session's block lane for one call).
+.PHONY: draft-refusal-gate
+draft-refusal-gate: tests/draft_refusal_gate
+	PULSAR_GATE_DRAFTER=dflash2 ./tests/draft_refusal_gate $(DFLASH2_GATE_MODEL)
 # L299: Qwen's drafter selection at open, host-only (pulsar --inspect): of two, DFlash2 by default (announced); --drafter
 # mtp picks the MTP module; a one-drafter container runs its own; unknown names and a missing drafter shard refused.
 # The base is the same model built without a block drafter (the MTP-only container is it + the MTP sidecar).
@@ -2615,7 +2620,7 @@ gates-dev:
 	  $(MAKE) --no-print-directory cuda-sampler-device-gate CUDA_ARCH=sm_120f || rc=1; \
 	fi; \
 	if [ $$drafter -eq 1 ]; then \
-	  $(MAKE) --no-print-directory blockdraft-gate lilicorr-head-gate lilicorr-spec-gate dflash2-spec-gate CUDA_ARCH=sm_120f || rc=1; \
+	  $(MAKE) --no-print-directory blockdraft-gate lilicorr-head-gate lilicorr-spec-gate dflash2-spec-gate draft-refusal-gate CUDA_ARCH=sm_120f || rc=1; \
 	fi; \
 	if [ $$exl3 -eq 1 ]; then \
 	  $(MAKE) --no-print-directory exl3-dequant-gate CUDA_ARCH=sm_120f || rc=1; \
@@ -3035,6 +3040,10 @@ tests/mtp_spec_gate.o: tests/mtp_spec_gate.cpp tests/gate_entry.h tests/gate_uti
 	$(CXX) $(CXXFLAGS) -Isrc -Isrc/engine -c -o $@ $<
 tests/mtp_spec_gate: tests/mtp_spec_gate.o $(CORE_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
+tests/draft_refusal_gate.o: tests/draft_refusal_gate.cpp tests/gate_entry.h tests/gate_util.h src/pulsar.h src/engine/step_driver.h
+	$(CXX) $(CXXFLAGS) -Isrc -Isrc/engine -c -o $@ $<
+tests/draft_refusal_gate: tests/draft_refusal_gate.o $(CORE_OBJS)
+	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 tests/sync_budget_gate.o: tests/sync_budget_gate.cpp tests/gate_entry.h tests/gate_util.h src/pulsar.h src/pulsar_gpu.h
 	$(CXX) $(CXXFLAGS) -Isrc -Isrc/engine -c -o $@ $<
 tests/sync_budget_gate: tests/sync_budget_gate.o $(CORE_OBJS)
@@ -3331,7 +3340,7 @@ test: pulsar_test seam-check
 clean:
 	rm -rf .build
 	rm -rf tests/runner
-	rm -f tests/gates_runner pulsar pulsar-server pulsar-bench pulsar-eval pulsar-agent pulsar_test pulsar_agent_test src/engine/*.o src/families/*/*.o src/families/*/*.d src/tp/*.o src/agent/*.o src/server/*.o src/cuda/*.o src/cuda/mmq/*.o src/cuda/mmq/test/*.o src/cli/*.o src/lib/*.o src/vendor/*.o $(XGRAMMAR_OBJS) $(XGRAMMAR_OBJS:.o=.d) tests/*.o src/engine/*.d src/agent/*.d src/server/*.d src/cuda/*.d src/cuda/mmq/*.d src/cuda/mmq/test/*.d src/cli/*.d src/lib/*.d src/vendor/*.d tests/*.d tests/vision_visible_gate tests/vision_hc_gate tests/vision_image_gate tests/vision_placeholder_gate tests/vision_image_sync_gate tests/vision_chunk_gate tests/cuda_long_context_smoke tests/moe_route_bounds_gate tests/expert_table_gate tests/multiseq_frontier_gate tests/multiseq_decode_gate tests/prefill_bitexact_gate tests/bank_spec_gate tests/spec_sampling_gate tests/spec_sampling_gate_wide tests/accounting_gate tests/bank_evict_restore_gate tests/session_payload_gate tests/algo_stability_gate tests/mixed_prefill_gate tests/mixed_zero_prefill_gate tests/fused_step_gate tests/head_graph_replay_gate tests/decode_reference_gate tests/verify_width_probe tests/mixed_neutrality_gate tests/comp_state_gate tests/spec_teacher_forced_probe tests/attn_f16_kernel_test tests/attn_f16_banked_test tests/kv_rows_pack_gate tests/kv_rows_pack_gate_fastmath tests/sampler_device_gate tests/dspark_batch_gate tests/nt_crossover_sweep tests/vision_router_gate tests/router_gate tests/bf16_rows_gate tests/nvfp4_rows_gate tests/lilicorr_head_gate tests/qwen_family_gate tests/inkling_family_gate tests/nemotron_family_gate tests/nemotron_fwd_gate tests/rowops_gate tests/state_kinds_gate tests/payload_frontier_gate tests/prompt_end_gate tests/bank_residency_gate
+	rm -f tests/gates_runner pulsar pulsar-server pulsar-bench pulsar-eval pulsar-agent pulsar_test pulsar_agent_test src/engine/*.o src/families/*/*.o src/families/*/*.d src/tp/*.o src/agent/*.o src/server/*.o src/cuda/*.o src/cuda/mmq/*.o src/cuda/mmq/test/*.o src/cli/*.o src/lib/*.o src/vendor/*.o $(XGRAMMAR_OBJS) $(XGRAMMAR_OBJS:.o=.d) tests/*.o src/engine/*.d src/agent/*.d src/server/*.d src/cuda/*.d src/cuda/mmq/*.d src/cuda/mmq/test/*.d src/cli/*.d src/lib/*.d src/vendor/*.d tests/*.d tests/vision_visible_gate tests/vision_hc_gate tests/vision_image_gate tests/vision_placeholder_gate tests/vision_image_sync_gate tests/vision_chunk_gate tests/cuda_long_context_smoke tests/moe_route_bounds_gate tests/expert_table_gate tests/multiseq_frontier_gate tests/multiseq_decode_gate tests/prefill_bitexact_gate tests/bank_spec_gate tests/spec_sampling_gate tests/spec_sampling_gate_wide tests/accounting_gate tests/bank_evict_restore_gate tests/session_payload_gate tests/algo_stability_gate tests/mixed_prefill_gate tests/mixed_zero_prefill_gate tests/fused_step_gate tests/head_graph_replay_gate tests/draft_refusal_gate tests/decode_reference_gate tests/verify_width_probe tests/mixed_neutrality_gate tests/comp_state_gate tests/spec_teacher_forced_probe tests/attn_f16_kernel_test tests/attn_f16_banked_test tests/kv_rows_pack_gate tests/kv_rows_pack_gate_fastmath tests/sampler_device_gate tests/dspark_batch_gate tests/nt_crossover_sweep tests/vision_router_gate tests/router_gate tests/bf16_rows_gate tests/nvfp4_rows_gate tests/lilicorr_head_gate tests/qwen_family_gate tests/inkling_family_gate tests/nemotron_family_gate tests/nemotron_fwd_gate tests/rowops_gate tests/state_kinds_gate tests/payload_frontier_gate tests/prompt_end_gate tests/bank_residency_gate
 
 # Pull in the generated header dependencies.  `-include` (not `include`) so a
 # tree with no .d files yet -- a fresh clone, or right after `make clean` -- is

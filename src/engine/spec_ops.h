@@ -81,6 +81,9 @@ typedef struct pulsar_spec_target_ops {
  *  curve (pulsar_spec_chain_step).  L288: a bank that repeats its history
  *  takes a copy chain instead of the drafter's (pulsar_spec_copy_chain, up to depth_max): the record arrives from
  *  pulsar_spec_draft_req_init with `copied` set and its drafts in place, and the drafter leaves them. */
+/** pulsar_drafter_ops::draft's refusal (L306): no chain, and the round that asked for it refuses. */
+#define PULSAR_DRAFT_REFUSED UINT32_MAX
+
 typedef struct pulsar_drafter_ops {
     const char *name;
     uint32_t depth;       ///< the depth a fresh session drafts at (the adaptive controller moves it from here)
@@ -105,8 +108,9 @@ typedef struct pulsar_drafter_ops {
      *  request-filtered proposal q at the draft's own key -- draft j at pulsar_sample_key(*rng, j), the key the
      *  target's draw for that token reads; `rng` is read, never advanced (L288 sdet) -- stamped into the bank's
      *  pendings.
-     *  Returns the pending count kept.  `features_ready` = the drafter's conditioning features are those of the last
-     *  committed row. */
+     *  Returns the pending count kept, or PULSAR_DRAFT_REFUSED: the drafter refused the chain (its line says why), and
+     *  the round refuses with it (L306) -- it never continues as a plain round.  `features_ready` = the drafter's
+     *  conditioning features are those of the last committed row. */
     uint32_t (*draft)(struct pulsar_session *s, int next_base, bool features_ready, float temperature,
                       int top_k, float top_p, float min_p, uint64_t *rng);
     /** Optional.  Finish a deferred device draft into the installed bank's pendings. */
@@ -115,6 +119,11 @@ typedef struct pulsar_drafter_ops {
      *  `draft` for each bank.  0, or -1 with `err` on a device failure. */
     int (*draft_batch)(struct pulsar_session *s, struct pulsar_spec_round **rounds, const uint32_t *banks,
                        uint64_t **rngs, int n, char *err, size_t errlen);
+    /** Optional (L306).  The drafter's own graph catalog at the startup warmup: run every shape its captured draft
+     *  pass takes live (bank counts x attention bounds) twice on the installed bank, writing no state, inside the
+     *  warmup's segment window (pulsar_gpu_seg_catalog_open) -- so no live round pays the capture.  0, or -1 with
+     *  `err`.  NULL = the drafter graphs nothing (or its shapes ride the verify walk). */
+    int (*warm)(struct pulsar_session *s, char *err, size_t errlen);
 } pulsar_drafter_ops;
 
 #endif /* PULSAR_SPEC_OPS_H */
