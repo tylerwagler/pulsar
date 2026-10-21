@@ -133,22 +133,28 @@ if a.mode == "exact":
     GEN_A = 1500
     # B's prompt tokens, counted on a server of its own: the budget holds B alone (and A alone: A's prompt + its
     # generation is below B's prompt) with a quarter to spare, never both
+    # bank 0 is never preempted (the guard keeps it resident): an unrelated conversation W takes it first, so A lands
+    # on a bank of its own (W's match is trivial) and decodes alone
+    W_TEXT = STORY[70000:78000]
     counter = Server(a.tag + "-count")
     try:
         chat(B_TEXT, 1)
         LB = chat.prompt_tokens
         chat(A_TEXT, 1)
         LA = chat.prompt_tokens + GEN_A
+        chat(W_TEXT, 1)
+        LW = chat.prompt_tokens
     finally:
         counter.stop()
     if not (0 < LA < LB):
         print("FAIL the counted prompts (A + generation %d, B %d) do not frame a preemption" % (LA, LB))
         sys.exit(1)
-    budget = int(eager + per_tok * 1.25 * LB)
+    budget = int(eager + per_tok * (LW + 1.25 * LB))
     print("# eager %.2f GiB, %.0f B a token: budget override %.2f GiB" % (eager / 2**30, per_tok, budget / 2**30))
     srv = Server(a.tag + "-preempt", {"PULSAR_SERVER_KV_BUDGET_OVERRIDE": str(budget)})
     res = {}
     try:
+        chat(W_TEXT, 1)
         th = threading.Thread(target=lambda: res.__setitem__("A", chat(A_TEXT, GEN_A)))
         th.start()
         t0 = time.time()   # A decoding: a slot's phase reads decode on /metrics
