@@ -1345,6 +1345,16 @@ void pulsar_sample_advance(uint64_t *rng, uint32_t n) {
     *rng += (uint64_t)n * SAMPLE_STREAM_STEP;
 }
 
+void pulsar_token_mask_apply(float *logits, uint32_t n_vocab, const uint32_t *mask) {
+    for (uint32_t w = 0, nw = (n_vocab + 31u) / 32u; w < nw; w++) {
+        const uint32_t bits = mask[w];
+        if (bits == 0xffffffffu) continue;
+        const uint32_t t1 = w * 32u + 32u < n_vocab ? w * 32u + 32u : n_vocab;
+        for (uint32_t t = w * 32u; t < t1; t++)
+            if (!((bits >> (t & 31u)) & 1u)) logits[t] = -INFINITY;
+    }
+}
+
 
 
 /* IEEE-754 float32 -> uint32 whose UNSIGNED ASCENDING order is the float's

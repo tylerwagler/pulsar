@@ -9,7 +9,7 @@
  *
  * What vLLM's renderer cannot express is refused by name, never rendered in another family's spelling:
  *   - a forced tool_choice (required / a named function): vLLM's Inkling path has no forced call, so there is
- *     no seed, no prefill and no name mask (forced_call_* and forced_name_* are NULL);
+ *     no seed and no prefill (forced_call_* are NULL);
  *   - images: the template's <|content_image|> block needs the family's image front (E9), not wired.
  * Departures from vLLM, each the rule every family shares: client text spelling a marker stays text (L223); a
  * call the turn ends inside is broken (L272); a message's text parts arrive joined by the protocol parsers, so
@@ -248,6 +248,22 @@ char *inkling_tool_error_suffix(const request *r, const thinking_state *, const 
     return suffix;
 }
 
+/* L303: the answer is a text block's body (<|content_text|> ... <|end_message|>); a call is an invoke_tool_json
+ * block's body, {"name":NAME,"args":ARGS} in the renderer's compact JSON (tool_call_json), then its end. */
+const server_grammar_shape k_grammar_inkling = {
+    /* .answer_open           = */ "<|content_text|>",
+    /* .answer_at_think_close = */ false,
+    /* .answer_close          = */ "<|end_message|>",
+    /* .call_trigger          = */ "<|content_invoke_tool_json|>",
+    /* .block_head            = */ "",
+    /* .name_open             = */ "{\"name\":\"",
+    /* .name_close            = */ "\",\"args\":",
+    /* .style                 = */ "json",
+    /* .call_close            = */ "}<|end_message|>",
+    /* .repeat                = */ false,
+    /* .block_tail            = */ "",
+};
+
 }  // namespace
 
 const server_family_ops k_family_inkling = {
@@ -263,7 +279,6 @@ const server_family_ops k_family_inkling = {
     /* .tool_error_suffix     = */ inkling_tool_error_suffix,
     /* .forced_call_seed      = */ NULL,   /* the render refuses a forced tool_choice (vLLM has none for Inkling) */
     /* .forced_call_prefill   = */ NULL,
-    /* .forced_name_open      = */ NULL,
-    /* .forced_name_close     = */ NULL,
+    /* .grammar               = */ &k_grammar_inkling,
     /* .find_call_block       = */ inkling_find_call_block,
 };

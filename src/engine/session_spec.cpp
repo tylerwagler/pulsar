@@ -425,6 +425,20 @@ static bool spec_row_greedy(float temperature, uint32_t greedy_rows, uint32_t ro
     return temperature <= 0.0f || (row < 32u && ((greedy_rows >> row) & 1u) != 0u);
 }
 
+/* L303: the session's row scratch (one logits row). */
+static float *spec_scratch_row(pulsar_session *s) {
+    if (!s->spec_row_scratch) s->spec_row_scratch = (float *)xmalloc((size_t)spec_vocab(s) * sizeof(float));
+    return s->spec_row_scratch;
+}
+
+/* L303: `src` through mask row `mask` into the scratch row -- what the plain lane draws from at that position. */
+static const float *spec_masked_row(pulsar_session *s, const float *src, const uint32_t *mask) {
+    float *row = spec_scratch_row(s);
+    if (row != src) memcpy(row, src, (size_t)spec_vocab(s) * sizeof(float));
+    pulsar_token_mask_apply(row, spec_vocab(s), mask);
+    return row;
+}
+
 static int spec_accept_walk(pulsar_session *s,
                             pulsar_spec_row_read_fn read_row, void *read_ud,
                             const int32_t *compact, uint32_t row0,
@@ -432,12 +446,55 @@ static int spec_accept_walk(pulsar_session *s,
                             const int32_t *pend, uint32_t K,
                             float temperature, int top_k, float top_p, float min_p,
                             uint32_t greedy_rows,
+                            const uint32_t *masks, uint32_t mask_rows,
                             uint64_t rng, int *out_carry_tok,
                             float *label, uint8_t *hit, uint32_t *n_label) {
     int commit = 0;
     int carry_tok = -1;
     *n_label = 0;
+    const uint32_t words = (spec_vocab(s) + 31u) / 32u;
     while (commit < (int)K) {
+        if (masks) {
+            /* L303: a constrained row is read whole and drawn through its mask (the compact prefilter and the
+             * forward's row argmax describe the unmasked row) */
+            if ((uint32_t)commit >= mask_rows) {
+                *out_carry_tok = -1;
+                return -1;
+            }
+            float *row_logits = spec_scratch_row(s);
+            if (!read_row(read_ud, (uint32_t)commit, row_logits)) {
+                *out_carry_tok = -1;
+                return -1;
+            }
+            spec_masked_row(s, row_logits, masks + (size_t)commit * words);
+            int tok;
+            if (spec_row_greedy(temperature, greedy_rows, (uint32_t)commit)) {
+                tok = sample_argmax(row_logits, spec_vocab(s));
+                label[commit] = tok == (int)pend[commit] ? 1.0f : 0.0f;   /* L301: greedy, the acceptance */
+            } else {
+                pulsar_sample_dist dist;
+                if (!pulsar_sample_dist_build(row_logits, spec_vocab(s), temperature, top_k, top_p, min_p,
+                                              &s->sample_scratch, &dist)) {
+                    *out_carry_tok = -1;
+                    return -1;
+                }
+                tok = pulsar_sample_dist_draw(&dist, pulsar_sample_key(rng, (uint32_t)commit + 1u));
+                /* L301: sampled, the target's probability of the draft under the row's mask */
+                float p = 0.0f;
+                for (uint32_t c = 0; c < dist.n; c++)
+                    if (dist.ids[c] == (int)pend[commit]) { p = dist.probs[c]; break; }
+                label[commit] = p;
+                pulsar_sample_dist_free(&dist);
+            }
+            hit[commit] = tok == (int)pend[commit] ? 1u : 0u;
+            *n_label = (uint32_t)commit + 1u;
+            if (tok != (int)pend[commit]) {
+                carry_tok = tok;
+                break;
+            }
+            commit++;
+            continue;
+        }
         if (spec_row_greedy(temperature, greedy_rows, (uint32_t)commit)) {
             /* the row's argmax; on a miss the carry is the refreshed row's argmax (round_end) */
             const bool ok = row_tops[commit] == (int)pend[commit];
@@ -448,9 +505,7 @@ static int spec_accept_walk(pulsar_session *s,
             commit++;
             continue;
         }
-        if (!s->spec_row_scratch)
-            s->spec_row_scratch = (float *)xmalloc((size_t)spec_vocab(s) * sizeof(float));
-        float *row_logits = s->spec_row_scratch;
+        float *row_logits = spec_scratch_row(s);
         pulsar_sample_dist dist;
         if (!spec_compact_dist(compact, row0 + (uint32_t)commit, spec_vocab(s), temperature, top_k,
                                top_p, min_p, &s->sample_scratch, &dist)) {
@@ -596,6 +651,7 @@ static int spec_round_end(pulsar_session *s, pulsar_spec_round *r,
                           int first_token,
                           float temperature, int top_k, float top_p, float min_p,
                           uint32_t greedy_rows,
+                          const uint32_t *masks, uint32_t mask_rows,
                           uint64_t *rng,
                           const pulsar_spec_rows *src, uint32_t row0,
                           bool defer_redraft,
@@ -643,7 +699,7 @@ static int spec_round_end(pulsar_session *s, pulsar_spec_round *r,
         uint32_t n_label = 0;
         commit_rc = spec_accept_walk(s, src->read, src->ud, src->compact, row0,
                                      row_tops, pend, K,
-                                     temperature, top_k, top_p, min_p, greedy_rows,
+                                     temperature, top_k, top_p, min_p, greedy_rows, masks, mask_rows,
                                      rng ? *rng : 0u, &carry_tok, label, hit, &n_label);
         /* L301: the drafts the walk reached, against their confidences (a teacher-forced end has no target draw) */
         if (commit_rc >= 0) pulsar_spec_calibration_note(e, r->copy, pend_conf, label, hit, n_label);
@@ -651,7 +707,8 @@ static int spec_round_end(pulsar_session *s, pulsar_spec_round *r,
     if (commit_rc < 0) {
         s->checkpoint.len = saved_len;
         spec_round_undo(s, r);
-        snprintf(err, errlen, "DSpark sampled-accept logits readback failed");
+        snprintf(err, errlen, masks ? "spec walk: a row past the round's masks, or a masked row with no drawable "
+                                      "token (L303)" : "DSpark sampled-accept logits readback failed");
         s->checkpoint_valid = false;
         return -1;
     }
@@ -771,11 +828,17 @@ static int spec_round_end(pulsar_session *s, pulsar_spec_round *r,
      * base position's, which the next round's own resolution reads. */
     const float carry_temp = spec_row_greedy(temperature, greedy_rows, (uint32_t)commit) ? 0.0f : temperature;
     if (carry_tok < 0) {
-        if (carry_temp <= 0.0f) {
-            carry_tok = sample_argmax(s->logits, spec_vocab(s));
+        /* L303: a constrained carry draws through its row's mask; s->logits stays the target's row */
+        const float *carry_row = s->logits;
+        if (masks && (uint32_t)commit < mask_rows)
+            carry_row = spec_masked_row(s, s->logits, masks + (size_t)commit * ((spec_vocab(s) + 31u) / 32u));
+        if (masks && (uint32_t)commit >= mask_rows) {
+            carry_tok = -1;
+        } else if (carry_temp <= 0.0f) {
+            carry_tok = sample_argmax(carry_row, spec_vocab(s));
         } else {
             pulsar_sample_dist bonus;
-            if (pulsar_sample_dist_build(s->logits, spec_vocab(s), temperature, top_k,
+            if (pulsar_sample_dist_build(carry_row, spec_vocab(s), temperature, top_k,
                                          top_p, min_p, &s->sample_scratch, &bonus)) {
                 carry_tok = pulsar_sample_dist_draw(&bonus, pulsar_sample_key(*rng, (uint32_t)commit + 1u));
                 pulsar_sample_dist_free(&bonus);
@@ -949,8 +1012,8 @@ static int spec_single_round(pulsar_session *s, int first_token,
     const uint32_t n_rows = pulsar_spec_round_n_rows(&r);
     s->spec.spec_round_banks = 1;
     const int na = spec_round_end(s, &r, first_token,
-                                  temperature, top_k, top_p, min_p, 0u /* the caller's params at every row */, rng,
-                                  &src, 0u, false, t0, NULL, accepted, accepted_cap, err, errlen);
+                                  temperature, top_k, top_p, min_p, 0u /* the caller's params at every row */,
+                                  NULL, 0u, rng, &src, 0u, false, t0, NULL, accepted, accepted_cap, err, errlen);
     free(r.snap);
     /* L263: this lane's own cost observation -- the whole step, redraft
      * included.  Off TP only: a group's ranks must hold the same fit, and this
@@ -1086,7 +1149,7 @@ void pulsar_spec_round_free(pulsar_spec_round *r) {
  * from the live logits. The caller owns the EOS short-circuit. */
 int pulsar_session_spec_next_base_local(pulsar_session *s, float temperature,
                                int top_k, float top_p, float min_p,
-                               uint64_t *rng) {
+                               const uint32_t *mask, uint64_t *rng) {
     int first;
     const bool carry_params_match =
         s->spec.spec_carry_temp == temperature && s->spec.spec_carry_top_k == top_k &&
@@ -1097,7 +1160,9 @@ int pulsar_session_spec_next_base_local(pulsar_session *s, float temperature,
         s->spec.spec_carry_valid = false;
     } else {
         s->spec.spec_carry_valid = false;
-        first = sample_top_p_min_p(s->logits, spec_vocab(s), temperature, top_k,
+        /* L303: a constrained request draws through its mask; s->logits stays the target's row */
+        const float *row = mask ? spec_masked_row(s, s->logits, mask) : s->logits;
+        first = sample_top_p_min_p(row, spec_vocab(s), temperature, top_k,
                                    top_p, min_p, spec_stream_key(rng), &s->sample_scratch);
     }
     return first;
@@ -1141,7 +1206,8 @@ bool pulsar_spec_row_read_block(void *ud, uint32_t row, float *out) {
 static int spec_round_end_block(pulsar_session *s, pulsar_spec_round *r,
                                 int first_token,
                                 float temperature, int top_k, float top_p,
-                                float min_p, uint32_t greedy_rows, uint64_t *rng,
+                                float min_p, uint32_t greedy_rows,
+                                const uint32_t *masks, uint32_t mask_rows, uint64_t *rng,
                                 const float *rows, uint32_t row0,
                                 const int32_t *forced_truth,
                                 int *accepted, int accepted_cap,
@@ -1162,7 +1228,7 @@ static int spec_round_end_block(pulsar_session *s, pulsar_spec_round *r,
         src.block.vocab = spec_vocab(s);
     }
     return spec_round_end(s, r, first_token,
-                          temperature, top_k, top_p, min_p, greedy_rows, rng,
+                          temperature, top_k, top_p, min_p, greedy_rows, masks, mask_rows, rng,
                           &src, row0,
                           true /* L150: redraft deferred to the batch */,
                           0.0 /* t0: step_ms diagnostic reads 0 in this lane */,
@@ -1174,12 +1240,13 @@ static int spec_round_end_block(pulsar_session *s, pulsar_spec_round *r,
 int pulsar_session_spec_round_end_local(pulsar_session *s, pulsar_spec_round *r,
                                int first_token,
                                float temperature, int top_k, float top_p,
-                               float min_p, uint32_t greedy_rows, uint64_t *rng,
+                               float min_p, uint32_t greedy_rows,
+                               const uint32_t *masks, uint32_t mask_rows, uint64_t *rng,
                                const float *rows, uint32_t row0,
                                int *accepted, int accepted_cap,
                                char *err, size_t errlen) {
     return spec_round_end_block(s, r, first_token, temperature, top_k, top_p,
-                                min_p, greedy_rows, rng, rows, row0, NULL, accepted, accepted_cap,
+                                min_p, greedy_rows, masks, mask_rows, rng, rows, row0, NULL, accepted, accepted_cap,
                                 err, errlen);
 }
 
@@ -1196,7 +1263,7 @@ int pulsar_session_spec_round_end_forced(pulsar_session *s, pulsar_spec_round *r
         return -1;
     }
     return spec_round_end_block(s, r, first_token, temperature, top_k, top_p,
-                                min_p, 0u, rng, rows, row0, truth, accepted, accepted_cap,
+                                min_p, 0u, NULL, 0u, rng, rows, row0, truth, accepted, accepted_cap,
                                 err, errlen);
 }
 
@@ -1297,7 +1364,7 @@ void pulsar_session_spec_assemble_batch_local(pulsar_session *s, pulsar_spec_ste
             st->status = PULSAR_SPEC_STEP_SKIPPED;
         } else {
             const int first = pulsar_session_spec_next_base_local(s, st->temperature, st->top_k,
-                                                                  st->top_p, st->min_p, st->rng);
+                                                                  st->top_p, st->min_p, st->masks, st->rng);
             st->first_token = first;
             if (first < 0) {
                 st->status = PULSAR_SPEC_STEP_FAILED;
@@ -1347,7 +1414,8 @@ void pulsar_session_spec_round_end_batch_local(pulsar_session *s, pulsar_spec_st
         }
         const int na = pulsar_session_spec_round_end_local(s, st->round, st->first_token,
                                                            st->temperature, st->top_k, st->top_p,
-                                                           st->min_p, st->greedy_rows, st->rng, rows, st->row0,
+                                                           st->min_p, st->greedy_rows, st->masks, st->mask_rows,
+                                                           st->rng, rows, st->row0,
                                                            st->accepted, st->accepted_cap,
                                                            st->err, sizeof st->err);
         if (na < 0) st->status = PULSAR_SPEC_STEP_FAILED;

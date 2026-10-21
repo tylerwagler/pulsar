@@ -1443,17 +1443,23 @@ void server::worker_service_slot(session_slot *sl) {
  * than the DSpark ≤17-token fused burst) and are deliberate single-thread
  * design: the CUDA-state audit (pulsar_server_internal.h) rules out a second
  * GPU thread, and both happen only at a scheduling boundary. */
-/* L272: a slot's draw from the pool session's live logits row -- through the declared-name mask while it
- * samples a constrained tool name (the row copied out: the session's own stays the target distribution
- * the logprob capture reads). */
+/* A slot's draw from the pool session's live logits row -- L303: through the grammar's mask while a region is
+ * live (the row copied out: the session's own stays the target distribution the logprob capture reads).  -1 with
+ * g->err set: the sampler refused the row, or the grammar failed. */
 static int gen_sample_pool(server *s, gen_state *g, pulsar_session *pool, float temp, int top_k, float top_p,
                            float min_p) {
-    if (!gen_tool_name_open(g)) return pulsar_session_sample(pool, temp, top_k, top_p, min_p, &g->rng);
-    const int width = pulsar_engine_logits_width(s->engine);
-    std::vector<float> row((size_t)width);
-    if (pulsar_session_copy_logits(pool, row.data(), width) != width) return -1;
-    (void)gen_mask_tool_name(s, g, row.data(), width);
-    return pulsar_sample_logits(row.data(), width, temp, top_k, top_p, min_p, &g->rng);
+    if (gen_constrain_live(g)) {
+        const int width = pulsar_engine_logits_width(s->engine);
+        std::vector<float> row((size_t)width);
+        if (pulsar_session_copy_logits(pool, row.data(), width) != width) {
+            snprintf(g->err, sizeof g->err, "the live logits row could not be read");
+            return -1;
+        }
+        return gen_constrain_draw(s, g, row.data(), width, temp, top_k, top_p, min_p);
+    }
+    const int tok = pulsar_session_sample(pool, temp, top_k, top_p, min_p, &g->rng);
+    if (tok < 0) snprintf(g->err, sizeof g->err, "sampler refused a degenerate logits row (L188)");
+    return tok;
 }
 
 /* A slot is eligible for the batched decode lanes when it is in steady-state
@@ -1490,14 +1496,14 @@ static bool slot_is_batchable_decode(const session_slot *sl) {
  * when it is the faster, and decoders left in the plain batch rejoin it through
  * server::batch_leave before this pick (L271, L284). */
 /* L271 / L284: whether the spec lane could take every decoder: the drafter runs behind the round API, they are
- * no more than one verify forward carries, and each speculates with no constrained tool name open (the lane
- * pick's own conditions, batch membership aside: a decoder in the plain batch leaves it when the price picks
- * spec, so a leave is never undone by the next pick). */
+ * no more than one verify forward carries, and each speculates (the lane pick's own conditions, batch membership
+ * aside: a decoder in the plain batch leaves it when the price picks spec, so a leave is never undone by the next
+ * pick).  L303: a constrained decoder speculates too -- the round's rows carry its masks. */
 static bool server_spec_lane_carries(bool spec_rounds, uint32_t verify_rows, session_slot *const *dec, int n_dec) {
     if (!spec_rounds || n_dec <= 0 || (uint32_t)n_dec > verify_rows) return false;
     for (int i = 0; i < n_dec; i++) {
         const gen_state *dg = dec[i]->gen;
-        if (!dg || !dg->spec_enabled || gen_tool_name_open(dg)) return false;
+        if (!dg || !dg->spec_enabled) return false;
     }
     return true;
 }
@@ -1700,8 +1706,7 @@ static int server_pick_decode_lane(int pool_banks, bool spec_rounds, uint32_t ve
     bool all_spec = spec_rounds && n_dec >= 1 && (uint32_t)n_dec <= verify_rows && n_batched == 0;
     for (int i = 0; all_spec && i < n_dec; i++) {
         const gen_state *dg = dec[i]->gen;
-        /* L272: a slot sampling a constrained tool name holds speculation (lane 3 samples in the engine) */
-        if (!dg || !dg->spec_enabled || dg->batch_active || gen_tool_name_open(dg))
+        if (!dg || !dg->spec_enabled || dg->batch_active)
             all_spec = false;
     }
     const bool use_spec_batched = pool_banks > 0 && all_spec;
@@ -2170,7 +2175,6 @@ void server::worker_batched_decode_quantum(session_slot **dec, int n, int quantu
         gen_resolve_sampling_decode(g, &temp, &top_k, &top_p, &min_p);
         g->batch_feed_token = gen_sample_pool(s, g, pool, temp, top_k, top_p, min_p);
         if (g->batch_feed_token < 0) {
-            snprintf(g->err, sizeof g->err, "sampler refused a degenerate logits row (L188)");
             g->finish = "error"; g->batch_feed_valid = false; g->phase = GEN_FINISH;
             continue;
         }
@@ -2255,11 +2259,8 @@ void server::worker_batched_decode_quantum(session_slot **dec, int n, int quantu
             float *row = logits + (size_t)q * (size_t)vocab;
             float temp, top_p, min_p; int top_k;
             gen_resolve_sampling_decode(g, &temp, &top_k, &top_p, &min_p);
-            if (gen_tool_name_open(g)) (void)gen_mask_tool_name(s, g, row, vocab);   /* L272 */
-            g->batch_feed_token =
-                pulsar_sample_logits(row, vocab, temp, top_k, top_p, min_p, &g->rng);
+            g->batch_feed_token = gen_constrain_draw(s, g, row, vocab, temp, top_k, top_p, min_p);   /* L303 */
             if (g->batch_feed_token < 0) {
-                snprintf(g->err, sizeof g->err, "sampler refused a degenerate logits row (L188)");
                 g->finish = "error"; g->batch_feed_valid = false; g->phase = GEN_FINISH;
                 continue;
             }
@@ -2633,6 +2634,16 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n, int quantum_
             st->round = rounds[i];
             gen_resolve_sampling_decode(g, &st->temperature, &st->top_k, &st->top_p, &st->min_p);
             st->rng = &g->rng;
+            /* L303: a fresh base draw goes through the grammar's mask (a carry was drawn under one) */
+            if (gen_constrain_live(g)) {
+                st->masks = gen_constrain_base_mask(s, g);
+                st->mask_rows = 1u;
+                if (!st->masks) {
+                    g->finish = "error";
+                    g->phase = GEN_FINISH;
+                    continue;
+                }
+            }
             st->max_tokens = g->max_tokens - g->completion;
             /* accepted_cap = allocated K + the base token: round_begin's own
              * trim (K <= accepted_cap-1) enforces the allocation, and its
@@ -2706,6 +2717,7 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n, int quantum_
          * instead of a chunk later (c2: TTFT min 3.3 s against the 1.6 s its
          * own prefill took).  Round end then emits from the first draft on. */
         bool base_sent[PULSAR_SESSION_POOL_CAP], base_stop[PULSAR_SESSION_POOL_CAP];
+        bool constrain_failed[PULSAR_SESSION_POOL_CAP] = {};
         for (int q = 0; q < m; q++) {
             base_sent[q] = base_stop[q] = false;
             if (n_fr == 0) continue;
@@ -2856,6 +2868,18 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n, int quantum_
                 int nt = 0;
                 for (int i = base_sent[q] ? 1 : 0; i < row_nb[q]; i++) toks[nt++] = reqs[row0s[q] + (uint32_t)i].token;
                 st->greedy_rows = gen_spec_greedy_rows(s, g, toks, nt, base_sent[q]);
+                /* L303: each verify row's mask -- the gate walked through the round's tokens and back */
+                const int mr = gen_constrain_round(s, g, toks, nt, base_sent[q], &st->masks);
+                if (mr < 0) {
+                    /* the grammar failed (g->err says how): masks with no rows make the round refuse and undo
+                     * itself, so this request fails and the others' rounds go on */
+                    static const uint32_t no_rows = 0;
+                    st->masks = &no_rows;
+                    st->mask_rows = 0u;
+                    constrain_failed[q] = true;
+                } else {
+                    st->mask_rows = (uint32_t)mr;
+                }
             }
             st->rng = &g->rng;
             st->first_token = first_tok[q];
@@ -2878,7 +2902,7 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n, int quantum_
             }
             if (st->status != PULSAR_SPEC_STEP_OK) {
                 g->finish = "error";
-                snprintf(g->err, sizeof g->err, "spec round end failed: %s", st->err);
+                if (!constrain_failed[q]) snprintf(g->err, sizeof g->err, "spec round end failed: %s", st->err);
                 g->phase = GEN_FINISH;
                 continue;
             }
@@ -3250,7 +3274,6 @@ void server::worker_mixed_batch_quantum(session_slot **dec, int n, session_slot 
         gen_resolve_sampling_decode(g, &temp, &top_k, &top_p, &min_p);
         g->batch_feed_token = gen_sample_pool(s, g, pool, temp, top_k, top_p, min_p);
         if (g->batch_feed_token < 0) {
-            snprintf(g->err, sizeof g->err, "sampler refused a degenerate logits row (L188)");
             g->finish = "error"; g->batch_feed_valid = false; g->phase = GEN_FINISH;
             continue;
         }
@@ -3407,10 +3430,8 @@ void server::worker_mixed_batch_quantum(session_slot **dec, int n, session_slot 
             float *row = logits + (size_t)q * (size_t)vocab;
             float temp, top_p, min_p; int top_k;
             gen_resolve_sampling_decode(g, &temp, &top_k, &top_p, &min_p);
-            if (gen_tool_name_open(g)) (void)gen_mask_tool_name(s, g, row, vocab);   /* L272 */
-            g->batch_feed_token = pulsar_sample_logits(row, vocab, temp, top_k, top_p, min_p, &g->rng);
+            g->batch_feed_token = gen_constrain_draw(s, g, row, vocab, temp, top_k, top_p, min_p);   /* L303 */
             if (g->batch_feed_token < 0) {
-                snprintf(g->err, sizeof g->err, "sampler refused a degenerate logits row (L188)");
                 g->finish = "error"; g->batch_feed_valid = false; g->phase = GEN_FINISH;
                 continue;
             }

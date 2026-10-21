@@ -7,6 +7,7 @@
 #include "../src/server/chat_family.cpp"
 #include "../src/server/family_inkling.cpp"
 #include "../src/server/family_nemotron_h.cpp"
+#include "../src/server/constrain.cpp"
 #include "../src/server/genmsg.cpp"
 #include "../src/server/deepseek_dsml.cpp"
 #include "../src/server/deepseek_stream.cpp"
@@ -2162,6 +2163,45 @@ static void sampler_sparse_vocabs(void) {
     }
     pulsar_sample_scratch_free(&scratch);
     pulsar_sample_scratch_free(&sparse_scratch);
+}
+
+/* L303: a token mask meets logits in one place (pulsar_token_mask_apply): an all-ones row changes no byte, a masked
+ * token is never drawn nor the argmax, the draw from a masked row is the draw over the allowed set (the same key
+ * gives the same token whether the mask removed the others or they were never there), and a padded width past the
+ * last full word is honoured. */
+static void test_token_mask(void) {
+    enum { V = 1000 };
+    const uint32_t W = (V + 31) / 32;
+    std::vector<float> row(V), ref(V), sub(V);
+    std::vector<uint32_t> ones(W, 0xffffffffu), mask(W, 0u);
+    samp_seed(0x13037u);
+    for (int i = 0; i < V; i++) row[i] = (float)(samp_u01() * 10.0 - 5.0);
+    ref = row;
+    pulsar_token_mask_apply(ref.data(), V, ones.data());
+    TEST_ASSERT(!memcmp(ref.data(), row.data(), sizeof(float) * V));
+    /* allow every 7th token and the last one (in the partial last word) */
+    for (int t = 0; t < V; t++)
+        if (t % 7 == 3 || t == V - 1) mask[(uint32_t)t >> 5] |= 1u << ((uint32_t)t & 31u);
+    ref = row;
+    pulsar_token_mask_apply(ref.data(), V, mask.data());
+    for (int t = 0; t < V; t++) {
+        const bool allowed = t % 7 == 3 || t == V - 1;
+        TEST_ASSERT(allowed ? ref[t] == row[t] : std::isinf(ref[t]) && ref[t] < 0);
+        sub[t] = allowed ? row[t] : -INFINITY;
+    }
+    int disallowed = 0;
+    for (int k = 0; k < 4000; k++) {
+        const float T = k % 4 == 0 ? 0.0f : 0.9f;
+        uint64_t r1 = 0x5eedull + (uint64_t)k, r2 = r1;
+        const int a = pulsar_sample_logits(ref.data(), V, T, k % 3 == 1 ? 40 : 0, k % 5 == 2 ? 0.9f : 1.0f,
+                                           k % 6 == 5 ? 0.05f : 0.0f, &r1);
+        const int b = pulsar_sample_logits(sub.data(), V, T, k % 3 == 1 ? 40 : 0, k % 5 == 2 ? 0.9f : 1.0f,
+                                           k % 6 == 5 ? 0.05f : 0.0f, &r2);
+        TEST_ASSERT(a == b && r1 == r2);
+        disallowed += !(a % 7 == 3 || a == V - 1);
+    }
+    TEST_ASSERT(disallowed == 0);
+    printf("  token-mask: identity, -inf outside the mask, 4000 masked draws == draws over the allowed set\n");
 }
 
 static void test_sampler_dist_equivalence(void) {
@@ -4952,6 +4992,7 @@ static const pulsar_test_entry test_entries[] = {
 #endif
     {"--sampler", "sampler", "sampler: build is the one authority; plain == draw(build) under fixed seeds; byte-exact vs re-derived reference", test_sampler_dist_equivalence},
     {"--sampler-prefilter", "sampler-prefilter", "min-p prefilter: survivor set/order identity vs old-sum reference + boundary teeth", test_sampler_prefilter_equivalence},
+    {"--token-mask", "token-mask", "a token mask (L303): identity when all-ones, -inf outside, masked draws == draws over the allowed set", test_token_mask},
     {"--spec-math", "spec-math", "the speculative walk's race-coupled draw emits the target; the stream's index arithmetic", test_spec_pq_math},
     {"--lib-utf8", "lib-utf8", "shared UTF-8 rule: strict lead ranges + Table 3-7 second bytes", test_lib_utf8},
     {"--lib-think", "lib-think", "shared <think> scanner: split tags, hold-back, spacing, seeded state", test_lib_think_scan},

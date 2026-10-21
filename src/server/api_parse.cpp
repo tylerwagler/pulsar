@@ -95,6 +95,25 @@ static bool take_control(const char **p, chat_conversation *c, const char *key) 
     return true;
 }
 
+/* L303: the answer's format from the protocol's object -- OpenAI chat's response_format itself, Responses'
+ * text.format (`member` "format" of `text`), Anthropic's output_config.format. */
+static bool take_response_format(const char **p, chat_conversation *c, const char *member, char *err, size_t errlen) {
+    char *raw = NULL;
+    if (!json_raw_value(p, &raw)) return false;
+    char *fmt = member ? json_object_member_raw(raw, member) : NULL;
+    const bool ok = (member && !fmt) || response_format_parse(member ? fmt : raw, &c->response_format, err, errlen);
+    free(fmt);
+    free(raw);
+    return ok;
+}
+
+/* Anthropic's output_config: its effort is a thinking control (kept as sent), its format the answer's (L303). */
+static bool take_output_config(const char **p, chat_conversation *c, char *err, size_t errlen) {
+    const char *at = *p;
+    if (!take_response_format(&at, c, "format", err, errlen)) return false;
+    return take_control(p, c, "output_config");
+}
+
 /* The controls a chat protocol may carry, by request key; the static spelling is the control's key. */
 static const char *chat_control_key(const char *key) {
     static const char *const keys[] = {"thinking", "think", "enable_thinking", "reasoning_effort",
@@ -238,6 +257,8 @@ bool parse_chat_conversation_openai(const char *body, chat_conversation *c, requ
             ok = json_bool(&p, &r->stream);
         } else if (!strcmp(key, "stream_options")) {
             ok = parse_stream_options(&p, &r->stream_include_usage);
+        } else if (!strcmp(key, "response_format")) {
+            ok = take_response_format(&p, c, NULL, err, errlen);
         } else if (control && strcmp(control, "output_config")) {
             ok = take_control(&p, c, control);
         } else if (!strcmp(key, "stop")) {
@@ -393,7 +414,9 @@ bool parse_chat_conversation_anthropic(const char *body, chat_conversation *c, r
             ok = json_bool(&p, &r->stream);
         } else if (!strcmp(key, "stop_sequences")) {
             ok = parse_stop(&p, &r->stops);
-        } else if (!strcmp(key, "thinking") || !strcmp(key, "output_config") || !strcmp(key, "reasoning_effort")) {
+        } else if (!strcmp(key, "output_config")) {
+            ok = take_output_config(&p, c, err, errlen);
+        } else if (!strcmp(key, "thinking") || !strcmp(key, "reasoning_effort")) {
             ok = take_control(&p, c, chat_control_key(key));
         } else {
             ok = json_skip_value(&p);
@@ -1318,27 +1341,56 @@ bool parse_chat_conversation_responses(const char *body, chat_conversation *c, r
         } else if (!strcmp(key, "tools")) {
             ok = take_tools(&p, c, r, false, err, errlen);
         } else if (!strcmp(key, "tool_choice")) {
+            /* "none" | "auto" | "required", or {"type":"function","name":X} (the Responses shape: the name beside
+             * the type).  L303: a forced call is the family's seed under the call grammar, as on chat. */
             json_ws(&p);
             if (*p == '"') {
                 char *choice = NULL;
                 ok = json_string(&p, &choice);
-                /* "none" (disable tools) and "auto" (model decides).  "required"
-                 * and explicit function targets need constrained decoding we
-                 * don't implement -- refused so clients see the limitation
-                 * instead of silently downgrading to auto. */
                 if (ok && !strcmp(choice, "none")) {
                     c->tool_choice = CHAT_TOOL_CHOICE_NONE;
+                } else if (ok && !strcmp(choice, "required")) {
+                    c->tool_choice = CHAT_TOOL_CHOICE_ANY;
                 } else if (ok && strcmp(choice, "auto") != 0) {
-                    snprintf(err, errlen, "tool_choice=%s not supported", choice);
+                    snprintf(err, errlen, "tool_choice: \"%.40s\" is not one of \"none\", \"auto\" or \"required\"",
+                             choice);
                     ok = false;
+                }
+                if (ok) {
+                    free(c->tool_choice_wire);
+                    c->tool_choice_wire = choice;
+                    choice = NULL;
                 }
                 free(choice);
             } else if (*p == '{') {
-                snprintf(err, errlen, "forced tool_choice not supported");
-                ok = false;
+                char *raw = NULL;
+                ok = json_raw_value(&p, &raw);
+                char *type = ok ? json_object_member_raw(raw, "type") : NULL;
+                char *name_raw = ok ? json_object_member_raw(raw, "name") : NULL;
+                const char *np = name_raw;
+                char *name = NULL;
+                const bool function = type && !strcmp(type, "\"function\"");
+                if (ok && !(function && np && json_string(&np, &name) && name[0])) {
+                    snprintf(err, errlen, "tool_choice: an object must be {\"type\": \"function\", \"name\": ...}");
+                    ok = false;
+                }
+                if (ok) {
+                    free(r->forced_tool_name);
+                    r->forced_tool_name = name;
+                    name = NULL;
+                    free(c->tool_choice_wire);
+                    c->tool_choice_wire = NULL;
+                    c->tool_choice = CHAT_TOOL_CHOICE_NAMED;
+                }
+                free(name);
+                free(type);
+                free(name_raw);
+                free(raw);
             } else {
                 ok = json_skip_value(&p);
             }
+        } else if (!strcmp(key, "text")) {
+            ok = take_response_format(&p, c, "format", err, errlen);
         } else if (!strcmp(key, "model")) {
             free(r->model);
             ok = json_string(&p, &r->model);
