@@ -759,6 +759,8 @@ bool absorb_rows(pulsar_session *s, uint32_t row0, const int32_t *pos, const int
     const pulsar_state_set *ss = s->states;
     const uint32_t E = d->hidden, KV = d->n_kv * d->head_dim;
     if (row0 + n > l->max_rows) return fail("absorbed rows past the tap rows");
+    /* L307, armed only: the lane's arena filled first (the absorb's region, never live across a call) */
+    if (!pulsar_gpu_scratch_poison_step(&l->arena, 1)) return false;
     uint8_t *base = (uint8_t *)dptr(l->arena);
     const absorb_layout &A = l->al;
     uint16_t *c = (uint16_t *)(base + A.c), *cn = (uint16_t *)(base + A.cn), *kb = (uint16_t *)(base + A.kb),
@@ -831,8 +833,9 @@ bool absorb_rows(pulsar_session *s, uint32_t row0, const int32_t *pos, const int
  * rows' ids, every layer's attention descriptors (the banks' rings, bounded at a power of two above the rows'
  * positions), each bank's anchor row and validity -- and the LAUNCH half reads only the device and the pass's shape,
  * so it runs as ONE captured CUDA graph per (lane, banks, bound) (the L119 segment cache: captured on a key's warm use,
- * replayed after; eager while the reference dump reads the pass). */
-bool draft_pass(pulsar_session *s, const uint32_t *banks, const int32_t *carry, uint32_t nb) {
+ * replayed after; eager while the reference dump reads the pass).  pos[i] is bank i's position P_i: its frontier, or
+ * (L306) the warmup sweep's stand-in for a deeper one -- a pass writes nothing but the lane's arena. */
+bool draft_pass(pulsar_session *s, const uint32_t *banks, const uint32_t *pos, const int32_t *carry, uint32_t nb) {
     pulsar_block_lane *l = LANE(s);
     const pulsar_block_drafter *d = l->d;
     const pulsar_state_set *ss = s->states;
@@ -841,12 +844,14 @@ bool draft_pass(pulsar_session *s, const uint32_t *banks, const int32_t *carry, 
                    half = d->conv_taps * (E / d->conv_group), SL = B - 1u, K = d->topk;
     const bool lili = d->head_kind == PULSAR_BLOCK_HEAD_LILICORR;
     if (R > kDraftRows || nb == 0) return fail("a draft pass outside the lane's rows");
+    /* L307, armed only: the lane's arena (the absorb's and the draft's, never live across a pass) filled first */
+    if (!pulsar_gpu_scratch_poison_step(&l->arena, 1)) return false;
     uint8_t *base = (uint8_t *)dptr(l->arena);
     const draft_layout &D = l->dl;
     /* ---- the host half */
     uint32_t last = 0;
     for (uint32_t i = 0; i < nb; i++) {
-        const uint32_t P = ss->bank_pos[banks[i]];
+        const uint32_t P = pos[i];
         if (carry[i] < 0 || (uint32_t)carry[i] >= V) return fail("a carry outside the vocabulary");
         l->h_tok[i * B] = carry[i];
         l->h_anchor[i] = carry[i];
@@ -1026,10 +1031,12 @@ bool draft_pass(pulsar_session *s, const uint32_t *banks, const int32_t *carry, 
         key |= 1u;
     }
     const int seg = key ? pulsar_gpu_seg_enter(key) : 0;
-    if (seg == 1) {
+    if (seg < 0) {
+        ok = false;   /* L306: this shape's graph failed (the runtime's line names it): the pass refuses */
+    } else if (seg == 1) {
+        /* L306: a failed capture ran nothing and refuses -- no eager re-run */
         const bool body = launches();
-        if (!pulsar_gpu_seg_exit(key, body ? 1 : 0)) ok = launches();
-        else ok = body;
+        ok = pulsar_gpu_seg_exit(key, body ? 1 : 0) != 0;
     } else if (seg == 0) {
         ok = launches();
     }
@@ -1067,7 +1074,7 @@ bool draft_pass(pulsar_session *s, const uint32_t *banks, const int32_t *carry, 
             int32_t bk[kDraftRows], P[kDraftRows];
             for (uint32_t i = 0; i < nb; i++) {
                 bk[i] = (int32_t)banks[i];
-                P[i] = (int32_t)ss->bank_pos[banks[i]];
+                P[i] = (int32_t)pos[i];
             }
             const uint32_t hdr[4] = {nb, B, E, K};
             fwrite(hdr, 4, 4, f);
@@ -1099,7 +1106,7 @@ bool draft_chains(pulsar_session *s, const uint32_t *banks, uint64_t *const *rng
     const pulsar_block_drafter *d = l->d;
     const pulsar_state_set *ss = s->states;
     const uint32_t B = d->block, per = kDraftRows / B, V = d->vocab;
-    uint32_t pb[kDraftRows], pi[kDraftRows];
+    uint32_t pb[kDraftRows], pi[kDraftRows], pp[kDraftRows];
     int32_t pc[kDraftRows];
     std::vector<spec_redraft_req *> chains;   /* the records this call drafted (the stop rule and the pick below) */
     for (uint32_t i0 = 0; i0 < n;) {
@@ -1117,13 +1124,14 @@ bool draft_chains(pulsar_session *s, const uint32_t *banks, uint64_t *const *rng
                 return false;
             }
             pb[nb] = banks[i];
+            pp[nb] = P;
             pc[nb] = q->next_base;
             pi[nb++] = i;
         }
         i0 = i;
         if (nb == 0) continue;
         const double t0 = now_sec();
-        if (!draft_pass(s, pb, pc, nb)) {
+        if (!draft_pass(s, pb, pp, pc, nb)) {
             snprintf(err, errlen, "the block draft failed (see the log)");
             return false;
         }
@@ -1302,6 +1310,56 @@ int block_draft_batch(pulsar_session *s, pulsar_spec_round **rounds, const uint3
     return 0;
 }
 
+/* L306: the draft pass's graph catalog, at the startup warmup (pulsar_drafter_ops::warm).  A live pass's graph key is
+ * (lane, banks, bound): every bank count a pass carries (1 .. kDraftRows / block) at every attention bound a pass
+ * reaches (256, doubling, to the first above the deepest pass's last row, ctx - 2 + block - 1), each twice -- the
+ * first use warms the pass's scratch, the second is captured inside the warmup's segment window.  On the installed
+ * bank (repeated for the bank counts: a pass reads each bank's ring and anchor, never writes them) at a stand-in
+ * position per bound: a pass writes only the lane's arena, so a deeper position than the bank holds reads its ring
+ * (position-addressed, modulo its window) without touching any state. */
+int block_warm(pulsar_session *s, char *err, size_t errlen) {
+    pulsar_block_lane *l = LANE(s);
+    if (!l || dump_dir()) return 0;   /* no lane; or the dump's eager passes: nothing is captured */
+    const pulsar_block_drafter *d = l->d;
+    const pulsar_state_set *ss = s->states;
+    const uint32_t B = d->block, per = kDraftRows / B, bank = ss->live_bank;
+    if (ss->bank_pos[bank] == 0 || ss->ctx < 2u + B) {
+        snprintf(err, errlen, "the installed bank holds no context to warm the draft pass from");
+        return -1;
+    }
+    const uint64_t last_max = (uint64_t)ss->ctx - 2u + B - 1u;
+    uint32_t top = 256u;
+    while (top <= last_max) top *= 2u;
+    pulsar_gpu_seg_stats a, b;
+    pulsar_gpu_seg_stats_get(&a);
+    const double t0 = now_sec();
+    uint32_t banks[kDraftRows], pos[kDraftRows], shapes = 0, n_bounds = 0;
+    int32_t carry[kDraftRows];
+    for (uint32_t bound = 256u; bound <= top; bound *= 2u, n_bounds++) {
+        /* a pass's last row P + block - 1 lands in [bound / 2, bound) (in [0, 256) for the first) */
+        const uint32_t P = (uint32_t)std::min<uint64_t>((uint64_t)bound - B, (uint64_t)ss->ctx - 2u);
+        for (uint32_t nb = 1; nb <= per; nb++, shapes++) {
+            for (uint32_t i = 0; i < nb; i++) {
+                banks[i] = bank;
+                pos[i] = P;
+                carry[i] = 0;
+            }
+            for (int use = 0; use < 2; use++)
+                if (!draft_pass(s, banks, pos, carry, nb)) {
+                    snprintf(err, errlen, "the draft pass of %u bank(s) at bound %u refused at the warmup", nb, bound);
+                    return -1;
+                }
+        }
+    }
+    pulsar_gpu_seg_stats_get(&b);
+    /* rule 5: the shapes the warmup declared for this lane and what was captured of them */
+    fprintf(stderr, "pulsar: block drafter: L306 warmup: the draft pass at %u bank count(s) x %u attention bounds "
+                    "(256 .. %u) = %u shapes, %llu graphs captured (%.1f MiB) in %.2f s\n",
+            per, n_bounds, top, shapes, (unsigned long long)(b.captures - a.captures),
+            (double)(b.graph_bytes > a.graph_bytes ? b.graph_bytes - a.graph_bytes : 0u) / 1048576.0, now_sec() - t0);
+    return 0;
+}
+
 }  // namespace
 
 /* The drafter's functions; its numbers are set per declaration in its copy (pulsar_block_drafter_read: the chain is the
@@ -1319,6 +1377,7 @@ const pulsar_drafter_ops PULSAR_BLOCK_DRAFTER_OPS = {
     /* .draft         = */ block_draft,
     /* .harvest       = */ NULL,
     /* .draft_batch   = */ block_draft_batch,
+    /* .warm          = */ block_warm,   /* L306: its draft pass's bank counts x bounds, at the warmup */
 };
 
 bool pulsar_drafter_lane_absorb(pulsar_session *s, pulsar_step_mode mode, const int32_t *tokens, const int32_t *pos,

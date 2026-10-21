@@ -817,4 +817,5 @@ const pulsar_drafter_ops k_dspark_drafter = {
     /* .draft         = */ dspark_draft,
     /* .harvest       = */ dspark_harvest,
     /* .draft_batch   = */ dspark_draft_batch,
+    /* .warm          = */ NULL,   /* it captures no graph of its own (L306) */
 };

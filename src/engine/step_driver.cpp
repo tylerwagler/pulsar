@@ -217,6 +217,9 @@ static bool driver_forward(pulsar_session *s, pulsar_step_mode mode, const int32
                 ARCH(e), n_rows, heads.n, d->max_rows, PULSAR_DRIVER_HEADS_MAX);
         return false;
     }
+    /* L307, armed only: the step's disposable scratch -- the family's arenas and the CUDA scratch slots -- filled
+     * before anything of the step is uploaded; an honest step overwrites everything it reads */
+    if (!pulsar_gpu_scratch_poison_step(d->scratch, PULSAR_DRIVER_SCRATCH_MAX)) return false;
     pulsar_driver_step &st = *ops->trunk(s);
     st.model = &e->model;
     st.plan = &e->plan;
@@ -337,13 +340,15 @@ static bool driver_forward(pulsar_session *s, pulsar_step_mode mode, const int32
                               : 0;
     if (ok && gkey) {
         const int seg = pulsar_gpu_seg_enter(gkey);
-        if (seg == 2) {
+        if (seg < 0) {
+            ok = false;   /* L306: this shape's graph failed (the runtime's line names it): the step refuses */
+        } else if (seg == 2) {
             driver_graph_announce(ARCH(e), st.verify, "replayed");
         } else if (seg == 1) {
             const bool body = launches();
-            /* a failed capture never ran its work: the launches again, eager (a real refusal refuses again) */
-            if (pulsar_gpu_seg_exit(gkey, body ? 1 : 0)) driver_graph_announce(ARCH(e), st.verify, "captured");
-            else ok = launches();
+            /* L306: a failed capture ran nothing and refuses -- no eager re-run */
+            ok = pulsar_gpu_seg_exit(gkey, body ? 1 : 0) != 0;
+            if (ok) driver_graph_announce(ARCH(e), st.verify, "captured");
         } else {
             ok = launches();
         }
