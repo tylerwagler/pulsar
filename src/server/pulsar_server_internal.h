@@ -1004,6 +1004,10 @@ typedef struct {
  * silent for PULSAR_SERVER_HEARTBEAT_MS and, if so, emits a keepalive that is
  * a NO-OP at the protocol level for the surface in question. */
 #define PULSAR_SERVER_HEARTBEAT_MS 5000
+/** L313: a bank adopts another bank's published state only when it starts its sync this many tokens deeper than its
+ *  own state would: the copy (the shared prefix's pool rows + one checkpoint, ~10-15 ms at a few thousand tokens on
+ *  GB10, measured on the bank-adopt gate's banks) costs about what prefilling some 50-100 tokens does. */
+#define PULSAR_SERVER_ADOPT_MIN_GAIN 256
 
 void slot_writer_init(slot_writer *w, int fd);
 void slot_writer_install(slot_writer *w);  ///< thread-local; NULL uninstalls

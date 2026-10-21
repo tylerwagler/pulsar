@@ -111,6 +111,9 @@ typedef struct pulsar_kv_state_ops {
      *  the state at T is a prefill's, so a grid checkpoint there is the cold prefill's (DeepSeek: no stale
      *  compressor group; Qwen: T is the prefill-only history's end). */
     bool (*noted_at)(void *state, uint32_t T, bool *capture, char *why, size_t whylen);
+    /** L313: every append-only row pool of ANY bank -- pools() then trailing_pools(), the same order -- each
+     *  bank's own tensor (a NULL `rows` while the bank's physical is freed).  What a cross-bank restore copies. */
+    uint32_t (*bank_pools)(void *state, uint32_t bank, pulsar_kv_pool *out, uint32_t cap);
 } pulsar_kv_state_ops;
 
 /** The kinds of record (pulsar_ckpt_store::rec). */
@@ -222,6 +225,13 @@ static inline uint32_t pulsar_ckpt_end(const pulsar_ckpt_store *st, uint32_t ban
  *  bank's or a copy failed (its state then describes no position). */
 bool pulsar_ckpt_record_restore(pulsar_ckpt_store *st, uint32_t bank, const pulsar_ckpt_record *r, float *logits,
                                 uint32_t width);
+/** L313: put the INSTALLED bank `dst` at ANOTHER bank's state at T -- `src`'s grid checkpoint at T (r NULL) or its
+ *  record `r` at T: every pool's rows below T copied from src's own pools (ops->bank_pools), then src's checkpoint
+ *  walked into dst, exactly what a restore on src would leave there (a published checkpoint is any bank's to restore
+ *  while its own bank's history still reaches T, the frontier rule).  dst's own checkpoints and records go (its
+ *  history is replaced); it keeps a copy of the one it now stands at.  False, said, when the banks' pools do not pair,
+ *  one is freed, or a copy failed (dst's state then describes no position). */
+bool pulsar_ckpt_adopt(pulsar_ckpt_store *st, uint32_t dst, uint32_t src, uint32_t T, const pulsar_ckpt_record *r);
 /** Where a walk's FINAL chunk [pos0, end) ends (P13, every walk's): at the prompt's last grid point when that lies
  *  strictly inside it -- so the prefill leaves the checkpoint the next turn resumes from -- else at `end`.  The
  *  caller keeps an image block whole around it. */
