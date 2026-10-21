@@ -1471,18 +1471,23 @@ int pulsar_session_spec_redraft_peek(const pulsar_spec_round *r, int32_t ids[17]
     return 1;
 }
 
-uint32_t pulsar_session_bank_pending_confs(const pulsar_session *s, uint32_t bank,
-                                        float out[16]) {
+uint32_t pulsar_session_bank_pendings(const pulsar_session *s, uint32_t bank, int32_t *base, int32_t tok[16],
+                                      float conf[16]) {
     /* L108 P2: the live session's pending count may still be an
      * in-flight chain; complete it before peeking. Logically a lazy
      * read-completion, not observable-state mutation. */
     pulsar_session_spec_chain_harvest((pulsar_session *)s);
 
+    *base = -1;
     const pulsar_spec_carry_state *sp = s ? pulsar_spec_bank_shadow((pulsar_session *)s, bank) : NULL;
     if (!sp) return 0;
     uint32_t n = sp->n_pend;
     if (n > 16u) n = 16u;
-    for (uint32_t i = 0; i < n; i++) out[i] = sp->pend_conf[i];
+    *base = sp->pend_base;
+    for (uint32_t i = 0; i < n; i++) {
+        tok[i] = sp->pend[i];
+        conf[i] = sp->pend_conf[i];
+    }
     return n;
 }
 
