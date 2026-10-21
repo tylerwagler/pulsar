@@ -570,6 +570,22 @@ int pulsar_tp_worker_dispatch(pulsar_engine *e, const pulsar_tp_command *c, char
         if (r) pulsar_session_spec_round_abort_local(slot->s, r);
         return 1;
     }
+    case PULSAR_TP_FRAME_VERIFY_PROFILE: {
+        /* L315: the leader's verify curve profile -- the same forwards here, in step; these timings are dropped */
+        int status = 1;
+        if (!worker_refused(e, c, "verify_profile", &slot, ferr, sizeof(ferr))) {
+            double base[PULSAR_SPEC_LOGITS_ROWS + 1];
+            if (c->spec.bank < 0 || (uint32_t)c->spec.bank != pulsar_session_live_bank(slot->s))
+                snprintf(ferr, sizeof(ferr), "tp: verify_profile names bank %d, this rank has bank %u installed",
+                         c->spec.bank, pulsar_session_live_bank(slot->s));
+            else if (pulsar_session_verify_profile_local(slot->s, (uint32_t)c->spec.i0, c->spec.i1 ? base : NULL,
+                                                         ferr, sizeof(ferr)))
+                status = 0;
+            if (status != 0) fprintf(stderr, "pulsar: tp worker: verify_profile failed: %s\n", ferr);
+        } else fprintf(stderr, "pulsar: tp worker: verify_profile refused: %s\n", ferr);
+        if (status != 0) worker_abort_step(e, "verify_profile", ferr);
+        return worker_ack(e, c->session_id, status, err, errlen);
+    }
     case PULSAR_TP_FRAME_SPEC_REDRAFT_BATCH: {
         int status = -1;
         if (!worker_refused(e, c, "spec_redraft_batch", &slot, ferr, sizeof(ferr))) {

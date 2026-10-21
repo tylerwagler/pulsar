@@ -4353,6 +4353,7 @@ int pulsar_tp_recv_command(pulsar_tp *tp, pulsar_tp_command *command,
     case PULSAR_TP_FRAME_SPEC_ROUND_ABORT:
     case PULSAR_TP_FRAME_SPEC_REDRAFT_BATCH:
     case PULSAR_TP_FRAME_SPEC_REDRAFT_COMMIT:
+    case PULSAR_TP_FRAME_VERIFY_PROFILE:
     case PULSAR_TP_FRAME_GENERATE_SPECULATIVE: {
         if (bytes < sizeof(command->spec)) { ok = 0; break; }
         memcpy(&command->spec, payload, sizeof(command->spec));

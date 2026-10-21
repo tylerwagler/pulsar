@@ -108,9 +108,10 @@ static bool server_warmup_generation(pulsar_engine *engine, pulsar_session *sess
     }
     /* L301: the spec lane's verify curve, on this bank at the warmup's frontier (the prompt's depth, the drafter
      * warm): loaded from the cache under $XDG_CACHE_HOME (else ~/.cache) /pulsar/verify-curve, or profiled -- every
-     * verify width, ~6 forwards each -- and cached there.  A server with no batched spec lane (TP, no drafter, no
-     * bank pool) has none: its row budget alone admits drafts. */
-    if (ok && !pulsar_engine_is_tp(engine) && pulsar_engine_has_spec_rounds(engine) &&
+     * verify width, ~6 forwards each -- and cached there.  On a pair (L315) the leader opens it, every rank running
+     * the profile in step, and the leader's pick sends each round's choice to the workers.  A server with no batched
+     * spec lane (no drafter, no bank pool) has none: its row budget alone admits drafts. */
+    if (ok && pulsar_engine_has_spec_rounds(engine) &&
         pulsar_engine_has_fused_step(engine) && pulsar_session_bank_count(session) > 1) {
         char dir[4096] = "";
         const char *xdg = getenv("XDG_CACHE_HOME"), *home = getenv("HOME");

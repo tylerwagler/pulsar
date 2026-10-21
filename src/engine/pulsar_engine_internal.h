@@ -2435,6 +2435,14 @@ int pulsar_session_spec_round_end_local(pulsar_session *s, pulsar_spec_round *r,
                                         int *accepted, int accepted_cap, char *err, size_t errlen);
 void pulsar_session_spec_round_abort_local(pulsar_session *s, pulsar_spec_round *r);
 void pulsar_session_spec_arm_capture_local(pulsar_session *s, uint32_t n_rows);
+/** L301 / L315: the verify curve's profile on the installed bank, every 1..rows_max-row verify forward timed into
+ *  base[1..rows_max] (verify_curve.cpp has the procedure); `base` NULL runs the walk untimed (L306: the startup
+ *  warmup's catalog of the verify widths, a cached curve).  The _local form is this rank's own run -- a pair's
+ *  worker runs it from the VERIFY_PROFILE frame; pulsar_session_verify_profile is the leader's, every rank in step
+ *  (one rank: the local run).  false / -1 with `err`. */
+bool pulsar_session_verify_profile_local(pulsar_session *s, uint32_t rows_max, double *base, char *err,
+                                         size_t errlen);
+int pulsar_session_verify_profile(pulsar_session *s, uint32_t rows_max, double *base, char *err, size_t errlen);
 int pulsar_session_spec_redraft_batch_local(pulsar_session *s, pulsar_spec_round **rounds,
                                             const uint32_t *banks, uint64_t **rngs, int n,
                                             char *err, size_t errlen);
