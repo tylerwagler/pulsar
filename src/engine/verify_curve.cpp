@@ -33,10 +33,18 @@
  * (pulsar_spec_chain_step, which adds the next drafter step's measured cost to the round).  It replaces L288's
  * marginal threshold (row_us / token_ms), its 16 / 32 width probes and the drafters' token_ms price.
  *
- * No curve (a tensor-parallel group -- its ranks must draft alike and the clocks are the leader's -- a classic
- * one-bank server, or before the profile): every pending draft the row budget holds is verified, by survival -- the
- * row cap alone, "no number, no decision" as before.  Which drafts are verified is all the pick moves: every emitted
- * token is the target's (spec == plain), greedy or keyed.
+ * A tensor-parallel group (L315, after Flare's rank-0 decision: docs/scheduling-runtime-design.md, "rank zero supplies
+ * the confidence curve ... every rank receives the same root-selected operation"): the leader profiles the curve
+ * with every rank running the profile's forwards in step (pulsar_session_verify_profile), corrects it from its own
+ * rounds, and the SERVER'S pick -- the rows each bank verifies, pulsar_engine_verify_pick -- reads it there; the
+ * choice reaches the workers as each step's k_alloc on the assemble frame, so no rank decides from floats it
+ * replicated.  The picks a drafter makes while it drafts (pulsar_spec_keep_picked, pulsar_spec_chain_step) run on
+ * every rank inside the mirrored redraft, where no rank may read a curve only the leader holds: on a pair they take
+ * the row budget alone, an upper bound the leader's verify pick then cuts.
+ *
+ * No curve (a classic one-bank server, or before the profile): every pending draft the row budget holds is
+ * verified, by survival -- the row cap alone, "no number, no decision" as before.  Which drafts are verified is all
+ * the pick moves: every emitted token is the target's (spec == plain), greedy or keyed.
  *
  * The lag rule (DeepInfer's N-2 / N-1 comment): a planner that runs ahead of the round's results (overlapped
  * scheduling) must take T from the survivals one round older than those it allocates with, so that draft i's
@@ -44,6 +52,7 @@
  * both are the round's own. */
 #include "pulsar_engine_internal.h"
 #include "spec_internal.h"
+#include "tp/pulsar_tp.h"
 
 #include <errno.h>
 #include <math.h>
@@ -192,9 +201,15 @@ static double vc_round_ms(const pulsar_verify_curve *c, uint32_t n, uint32_t row
            vc_recent(c->draft, &c->draft_any, n);
 }
 
-/* The curve a pick may read: none on a tensor-parallel group (its ranks draft alike from the same numbers, and the
- * clocks are the leader's), else the engine's. */
-static const pulsar_verify_curve *vc_of(const pulsar_engine *e) {
+/* The curve the server's pick reads: the engine's -- on a tensor-parallel group only the leader holds one, and its
+ * choice crosses the wire (L315). */
+static const pulsar_verify_curve *vc_leader(const pulsar_engine *e) {
+    return e ? e->verify_curve : NULL;
+}
+
+/* The curve a pick every rank makes for itself may read (a drafter's keep, the lockstep continuation): none on a
+ * tensor-parallel group, whose ranks must draft alike and only one of which holds a curve. */
+static const pulsar_verify_curve *vc_ranked(const pulsar_engine *e) {
     return e && !e->tp ? e->verify_curve : NULL;
 }
 
@@ -225,7 +240,7 @@ uint32_t pulsar_verify_curve_pick(const pulsar_verify_curve *c, uint32_t n, cons
 uint32_t pulsar_engine_verify_pick(const pulsar_engine *e, uint32_t n_seqs, const float *surv, uint32_t m,
                                    uint32_t cap_rows) {
     double ratio;
-    return pulsar_verify_curve_pick(vc_of(e), n_seqs, surv, m, cap_rows, 0.0, &ratio);
+    return pulsar_verify_curve_pick(vc_leader(e), n_seqs, surv, m, cap_rows, 0.0, &ratio);
 }
 
 /* A draft's survival from its chain's confidences: a confidence below 0 is none (a drafter without a head, the
@@ -247,7 +262,7 @@ void pulsar_spec_keep_picked(const pulsar_session *s, uint32_t n_chains, spec_re
     std::vector<float> surv(c.size());
     for (size_t i = 0; i < c.size(); i++) surv[i] = c[i].surv;
     double ratio;
-    const uint32_t T = pulsar_verify_curve_pick(vc_of(e), n_chains, surv.data(), (uint32_t)surv.size(),
+    const uint32_t T = pulsar_verify_curve_pick(vc_ranked(e), n_chains, surv.data(), (uint32_t)surv.size(),
                                                 pulsar_engine_fused_heads_max(e), 0.0, &ratio);
     for (uint32_t i = 0; i < nq; i++) qs[i]->keep = 0;
     for (uint32_t t = 0; t < T; t++) qs[c[t].q]->keep++;
@@ -308,7 +323,7 @@ uint32_t pulsar_spec_chain_step(const pulsar_session *s, uint32_t n_chains, cons
                                 const float *run, uint32_t n_live, double spent_ms, bool *go) {
     const pulsar_engine *e = s->engine;
     const pulsar_lane_cost step = lane_cost_fit_view(&e->draft_step_cost);
-    return pulsar_verify_chain_pick(vc_of(e), &step, pulsar_engine_fused_heads_max(e), n_chains, drafted, n_drafted,
+    return pulsar_verify_chain_pick(vc_ranked(e), &step, pulsar_engine_fused_heads_max(e), n_chains, drafted, n_drafted,
                                     run, n_live, spent_ms, go);
 }
 
@@ -317,7 +332,8 @@ uint32_t pulsar_spec_chain_step(const pulsar_session *s, uint32_t n_chains, cons
 void pulsar_engine_verify_curve_observe(pulsar_engine *e, uint32_t n_seqs, uint32_t rows, double forward_ms,
                                         double host_ms, double draft_ms) {
     pulsar_verify_curve *c = e ? e->verify_curve : NULL;
-    if (!c || e->tp || n_seqs == 0u || rows == 0u || rows > c->rows_max || !(forward_ms > 0.0)) return;
+    /* L315: on a pair, the leader's (a worker has no curve) */
+    if (!c || n_seqs == 0u || rows == 0u || rows > c->rows_max || !(forward_ms > 0.0)) return;
     c->slope.add(rows, (forward_ms - c->base_ms[rows]) / (double)rows);
     if (host_ms >= 0.0) {
         if (n_seqs <= PULSAR_SPEC_LOGITS_ROWS) c->host[n_seqs].add(host_ms);
@@ -383,6 +399,11 @@ static uint64_t vc_key(const pulsar_session *s, const char *build_id) {
     const uint32_t v[3] = {pulsar_engine_fused_heads_max(e), (uint32_t)pulsar_session_bank_count((pulsar_session *)s),
                            (uint32_t)pulsar_session_ctx((pulsar_session *)s)};
     mix(v, sizeof v);
+    /* L315: a pair's forward is both ranks' (one Spark's curve is not a pair's) */
+    if (e->tp) {
+        const uint32_t ranks = pulsar_tp_n_ranks(e->tp);
+        mix(&ranks, sizeof ranks);
+    }
     const char *b = build_id ? build_id : "";
     mix(b, strlen(b) + 1u);
     /* the executable itself: a rebuild the build id does not name (a dirty tree, an object the id was not
@@ -440,41 +461,49 @@ static void vc_cache_write(const char *path, uint64_t key, uint32_t rows_max, co
  * every r from the widest down -- the production verify (heads on every row, the target's verify capture armed),
  * the target's frontier snapshot taken before it and put back after, exactly a round's begin and abort, so the bank
  * is where it was after each -- one untimed, then VC_PROFILE_REPS timed; the mean of the timed ones less the fastest
- * and the slowest. */
+ * and the slowest.  Every call is this rank's own (the family's ops, never the mirrored API): on a pair each rank runs
+ * this same sequence from the VERIFY_PROFILE frame (pulsar_session_verify_profile), the forwards' exchanges keep them
+ * in step, and only the leader's timings become a curve. */
 #define VC_PROFILE_REPS 5u
-static bool vc_profile(pulsar_session *s, uint32_t rows_max, double *base, char *err, size_t errlen) {
+bool pulsar_session_verify_profile_local(pulsar_session *s, uint32_t rows_max, double *base, char *err,
+                                         size_t errlen) {
     const uint32_t bank = pulsar_session_live_bank(s);
     const int P = pulsar_session_pos(s);
     const uint32_t V = spec_vocab(s);
+    if (rows_max == 0u || rows_max > PULSAR_SPEC_LOGITS_ROWS) {
+        snprintf(err, errlen, "a %u-row verify profile is outside the landing buffers (%u)", rows_max,
+                 PULSAR_SPEC_LOGITS_ROWS);
+        return false;
+    }
     if (P < 1 || (int64_t)P + rows_max > (int64_t)pulsar_session_ctx(s)) {
         snprintf(err, errlen, "the bank holds %d tokens: no room for a %u-row verify", P, rows_max);
         return false;
     }
     const pulsar_spec_target_ops *t = spec_target(s);
+    const pulsar_family_session_ops *fs = s->engine->family->session;
     std::vector<float> logits((size_t)rows_max * V);
     pulsar_multiseq_req reqs[PULSAR_SPEC_LOGITS_ROWS];
     pulsar_spec_round *r = pulsar_spec_round_new();
     bool ok = true;
-    pulsar_session_bank_state_save(s, bank);
+    spec_bank_save(s, bank);
     for (uint32_t rows = rows_max; ok && rows >= 1u; rows--) {
         for (uint32_t k = 0; k < rows; k++) reqs[k] = {bank, (int32_t)(P + (int)k), s->checkpoint.v[k % (uint32_t)P]};
         double ms[VC_PROFILE_REPS];
         for (uint32_t rep = 0; ok && rep <= VC_PROFILE_REPS; rep++) {
-            ok = pulsar_session_bank_state_restore(s, bank) &&
-                 (!t->snapshot || t->snapshot(s, r, err, errlen));
+            ok = spec_bank_restore(s, bank) && (!t->snapshot || t->snapshot(s, r, err, errlen));
             if (!ok) break;
-            pulsar_session_bank_state_save(s, bank);
-            pulsar_session_spec_arm_capture(s, rows);
+            spec_bank_save(s, bank);
+            pulsar_session_spec_arm_capture_local(s, rows);
             uint32_t got = 0;
             const double t0 = now_sec();
-            ok = pulsar_session_decode_mixed(s, reqs, rows, logits.data(), (int)((size_t)rows * V), &got,
-                                             PULSAR_MSEQ_HEAD_ALL_ROWS, err, errlen) == 0 && got == rows;
+            ok = fs->decode_mixed(s, reqs, rows, logits.data(), (int)((size_t)rows * V), &got,
+                                  PULSAR_MSEQ_HEAD_ALL_ROWS, err, errlen) == 0 && got == rows;
             const double t1 = now_sec();
-            pulsar_session_spec_arm_capture(s, 0u);
+            pulsar_session_spec_arm_capture_local(s, 0u);
             if (!ok) break;
             if (rep > 0) ms[rep - 1u] = (t1 - t0) * 1e3;
-            ok = pulsar_session_bank_state_restore(s, bank) && (!t->restore || t->restore(s, r));
-            pulsar_session_bank_state_save(s, bank);
+            ok = spec_bank_restore(s, bank) && (!t->restore || t->restore(s, r));
+            spec_bank_save(s, bank);
             if (!ok) snprintf(err, errlen, "the bank could not be put back after a %u-row verify", rows);
         }
         if (!ok) break;
@@ -485,16 +514,16 @@ static bool vc_profile(pulsar_session *s, uint32_t rows_max, double *base, char 
     }
     if (t->release) t->release(s, r);
     pulsar_spec_round_free(r);
-    (void)pulsar_session_bank_state_restore(s, bank);
+    (void)spec_bank_restore(s, bank);
     return ok;
 }
 
 int pulsar_session_verify_curve_open(pulsar_session *s, const char *cache_dir, const char *build_id, char *err,
                                      size_t errlen) {
     pulsar_engine *e = s ? s->engine : NULL;
-    if (!e || e->tp || !pulsar_engine_has_spec_rounds(e) || !pulsar_engine_has_fused_step(e) ||
+    if (!e || !pulsar_engine_has_spec_rounds(e) || !pulsar_engine_has_fused_step(e) ||
         pulsar_session_bank_count(s) < 2) {
-        snprintf(err, errlen, "no batched speculative lane to price (tensor-parallel, no drafter, or no bank pool)");
+        snprintf(err, errlen, "no batched speculative lane to price (no drafter, or no bank pool)");
         return -1;
     }
     const uint32_t rows_max = pulsar_engine_fused_heads_max(e);
@@ -511,7 +540,7 @@ int pulsar_session_verify_curve_open(pulsar_session *s, const char *cache_dir, c
     const double t0 = now_sec();
     const bool cached = path[0] && vc_cache_read(path, key, rows_max, base);
     if (!cached) {
-        if (!vc_profile(s, rows_max, base, err, errlen)) return -1;
+        if (pulsar_session_verify_profile(s, rows_max, base, err, errlen) != 0) return -1;   /* every rank, in step */
         if (path[0]) vc_cache_write(path, key, rows_max, base);
     }
     pulsar_verify_curve *c = pulsar_verify_curve_new(rows_max, base);

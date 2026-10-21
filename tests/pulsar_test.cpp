@@ -3630,12 +3630,74 @@ static void test_l301_verify_curve_correction(void) {
     int got = 0;
     for (int i = 0; i < 4; i++) got += k_alloc[i];
     TEST_ASSERT(got == (int)l301_brute(surv, npend, 4, 4, (int)PULSAR_SPEC_LOGITS_ROWS, round_ms));
-    /* a TP group reads no curve: the budget alone */
-    e->tp = (struct pulsar_tp *)e;   /* never dereferenced by the pick */
-    (void)spec_pick_rows(e, surv, npend, 4, 4, (int)PULSAR_SPEC_LOGITS_ROWS, k_alloc, &overflow);
-    /* 28 of the 32 drafts fit: the four weakest go (0.6^8, 0.6^7, 0.6^6, 0.7^8) */
-    TEST_ASSERT(k_alloc[0] == 8 && k_alloc[1] == 8 && k_alloc[2] == 7 && k_alloc[3] == 5);
+    l301_engine_free(e);
+}
+
+/* L315 -- the verify pick on a tensor-parallel group: the server's pick (the leader's, its choice the steps' k_alloc
+ * on the wire) prices on the leader's curve, and the leader's rounds correct it; the picks a drafter makes on every
+ * rank (a chain's keep, the lockstep continuation) read no curve there -- the row budget alone. */
+static int l315_fused_never(pulsar_session *, const pulsar_multiseq_req *, uint32_t, const pulsar_fused_shape *,
+                            float *, int, uint32_t *, char *, size_t) {
+    return -1;
+}
+static void test_l315_tp_pick(void) {
+    double base[PULSAR_SPEC_LOGITS_ROWS + 1];
+    l301_staircase(base, PULSAR_SPEC_LOGITS_ROWS);
+    pulsar_engine *e = l301_engine(base, PULSAR_SPEC_LOGITS_ROWS);
+    static pulsar_family_session_ops fs{};
+    fs.decode_fused = l315_fused_never;   /* the fused step's width is the pick's cap; never run */
+    fs.fused_heads_max = PULSAR_SPEC_LOGITS_ROWS;
+    static pulsar_family fam{};
+    fam.session = &fs;
+    e->family = &fam;
+    float surv[PULSAR_SESSION_POOL_CAP][16];
+    uint32_t npend[PULSAR_SESSION_POOL_CAP];
+    int k_one[PULSAR_SESSION_POOL_CAP], k_tp[PULSAR_SESSION_POOL_CAP];
+    bool overflow;
+    memset(npend, 0, sizeof npend);
+    for (int i = 0; i < 4; i++) l179_fill_surv(surv, npend, i, 8, 0.9f - 0.1f * (float)i);
+    (void)spec_pick_rows(e, surv, npend, 4, 4, (int)PULSAR_SPEC_LOGITS_ROWS, k_one, &overflow);
+    e->tp = (struct pulsar_tp *)e;   /* never dereferenced by the picks */
+    (void)spec_pick_rows(e, surv, npend, 4, 4, (int)PULSAR_SPEC_LOGITS_ROWS, k_tp, &overflow);
+    int got = 0;
+    for (int i = 0; i < 4; i++) {
+        TEST_ASSERT(k_tp[i] == k_one[i]);
+        got += k_tp[i];
+    }
+    TEST_ASSERT(got == (int)l301_brute(surv, npend, 4, 4, (int)PULSAR_SPEC_LOGITS_ROWS, base));
+    TEST_ASSERT(got < 28);   /* priced: the row budget alone would verify 28 (the four weakest of 32 go) */
+    /* the leader's rounds correct its curve */
+    for (uint32_t i = 0; i < 40; i++) pulsar_engine_verify_curve_observe(e, 4u, 4u + i % 4u, base[4u + i % 4u] + 2.0,
+                                                                          5.0, 2.0);
+    pulsar_verify_curve_view v;
+    pulsar_engine_verify_curve_view(e, &v);
+    TEST_ASSERT(v.observed == 40u && v.slope_valid);
+    /* a drafter's keep on every rank: the budget alone (a priced keep cuts these 0.3-confidence drafts) */
+    pulsar_session *s = (pulsar_session *)calloc(1, sizeof(pulsar_session));
+    s->engine = e;
+    spec_redraft_req q;
+    memset(&q, 0, sizeof q);
+    spec_redraft_req *qp = &q;
+    for (uint32_t k = 0; k < 8; k++) q.conf[k] = 0.3f;
+    q.keep = 8;
+    pulsar_spec_keep_picked(s, 1u, &qp, 1u);
+    TEST_ASSERT(q.keep == 8u);
     e->tp = NULL;
+    q.keep = 8;
+    pulsar_spec_keep_picked(s, 1u, &qp, 1u);
+    TEST_ASSERT(q.keep < 8u);
+    /* the lockstep continuation on a pair: the rule without a curve */
+    e->tp = (struct pulsar_tp *)e;
+    const float drafted[3] = {0.9f, 0.81f, 0.729f};
+    const float run[1] = {0.01f};
+    bool go_tp[1], go_ref[1];
+    pulsar_lane_cost step = lane_cost_fit_view(&e->draft_step_cost);
+    TEST_ASSERT(pulsar_spec_chain_step(s, 1u, drafted, 3u, run, 1u, 3.0, go_tp) ==
+                pulsar_verify_chain_pick(NULL, &step, PULSAR_SPEC_LOGITS_ROWS, 1u, drafted, 3u, run, 1u, 3.0, go_ref));
+    TEST_ASSERT(go_tp[0] == go_ref[0] && go_tp[0]);   /* unpriced, a hopeless chain still goes on */
+    e->tp = NULL;
+    free(s);
+    e->family = NULL;
     l301_engine_free(e);
 }
 
@@ -3725,6 +3787,7 @@ static void test_verify_pick(void) {
     test_l301_verify_curve_correction();
     test_l301_chain_pick();
     test_l308_copy_estimate();
+    test_l315_tp_pick();
 }
 
 /* L304: the fused step's cost fit and the chunk solved from it (verify_curve.cpp).  Rounds whose forward is
