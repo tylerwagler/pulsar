@@ -1686,7 +1686,9 @@ __global__ void full_final_kernel(const __grid_constant__ launch_args a, const f
 /* ---- logprobs (the host scorers' bytes: tests/sampler_host_ref.cpp pulsar_logits_top_logprobs / _token_logprob) --- */
 
 constexpr uint32_t LP_GROUP = 8;   /* rows a logprob pass takes (its scratch: LP_GROUP rows of doubles) */
-constexpr uint32_t LP_TK_CHUNKS = 32, LP_TK_THREADS = 256, LP_EXP_CHUNKS = 4u * 32u;
+constexpr uint32_t LP_TK_CHUNKS = 128, LP_TK_THREADS = 256, LP_EXP_CHUNKS = 4u * 32u;
+constexpr uint32_t LP_TK_PER_LANE = LP_TK_CHUNKS / 32u;   /* the merge's chunks a lane */
+static_assert(LP_TK_CHUNKS % 32u == 0u, "the merge's lanes");
 
 struct lp_args {
     const float *logits;
@@ -1707,11 +1709,10 @@ struct lp_args {
 };
 
 struct lp_smem {
-    uint64_t keys[1024];   /* the chunks' best keys, merged (LP_TK_CHUNKS * PULSAR_GPU_LOGPROB_TOPK_MAX <= 1024) */
+    uint64_t keys[PULSAR_GPU_LOGPROB_TOPK_MAX];   /* the row's best keys, merged from the chunks' */
     uint32_t cnt;
     int32_t maxi;
 };
-static_assert(LP_TK_CHUNKS * PULSAR_GPU_LOGPROB_TOPK_MAX <= 1024u, "the merge's store");
 
 
 __device__ __forceinline__ row_view lp_view(const lp_args &a, uint32_t row) {
@@ -1756,13 +1757,15 @@ __global__ void __launch_bounds__(LP_TK_THREADS) logprobs_topk_kernel(const __gr
     }
 }
 
-/* the row's first finite maximum: the least of the chunks' best keys (descending value, ascending id -- the argmax's
- * rule, +0 and -0 tied), its id; -1 with no finite value */
+/* warp 0: the row's first finite maximum -- the least of the chunks' best keys (descending value, ascending id: the
+ * argmax's rule, +0 and -0 tied), its id; -1 with no finite value.  Every lane returns it. */
 __device__ __forceinline__ int32_t lp_row_max(const lp_args &a, uint32_t j) {
+    const uint32_t lane = threadIdx.x & 31u;
     uint64_t best = UINT64_MAX;
-    for (uint32_t c = 0; c < LP_TK_CHUNKS; c++)
+    for (uint32_t c = lane; c < LP_TK_CHUNKS; c += 32u)
         if (a.tk_n[((size_t)j * LP_TK_CHUNKS + c) * 2u])
             best = min(best, a.tk[((size_t)j * LP_TK_CHUNKS + c) * PULSAR_GPU_LOGPROB_TOPK_MAX]);
+    for (uint32_t off = 16; off > 0; off >>= 1) best = min(best, __shfl_xor_sync(0xffffffffu, best, off));
     return best == UINT64_MAX ? -1 : (int32_t)(uint32_t)best;
 }
 
@@ -1770,7 +1773,10 @@ __device__ __forceinline__ int32_t lp_row_max(const lp_args &a, uint32_t j) {
 __global__ void __launch_bounds__(PREP_THREADS) logprobs_exp_kernel(const __grid_constant__ lp_args a) {
     const uint32_t j = blockIdx.y, c = blockIdx.x;
     __shared__ int32_t maxi;
-    if (threadIdx.x == 0) maxi = lp_row_max(a, j);
+    if (threadIdx.x < 32u) {
+        const int32_t m = lp_row_max(a, j);
+        if (threadIdx.x == 0) maxi = m;
+    }
     __syncthreads();
     if (maxi < 0) return;
     const row_view rv = lp_view(a, a.row0 + j);
@@ -1793,7 +1799,10 @@ __global__ void __launch_bounds__(SMP_THREADS) logprobs_rows_kernel(const __grid
     const uint32_t tid = threadIdx.x, j = blockIdx.x, row = a.row0 + j;
     const row_view rv = lp_view(a, row);
     pulsar_gpu_logprob_row *o = a.out + row;
-    if (tid == 0) sm.maxi = lp_row_max(a, j);
+    if (tid < 32u) {
+        const int32_t m = lp_row_max(a, j);
+        if (tid == 0) sm.maxi = m;
+    }
     __syncthreads();
     if (sm.maxi < 0) {
         if (tid == 0) { o->n_top = 0; o->have_token = 0; }
@@ -1817,21 +1826,37 @@ __global__ void __launch_bounds__(SMP_THREADS) logprobs_rows_kernel(const __grid
         if (tid == 0) o->n_top = 0;
         return;
     }
-    /* the chunks' best, merged: each chunk's run is sorted, so warp 0 takes the least head min(k, finite) times */
-    static_assert(LP_TK_CHUNKS == 32u, "a lane a chunk");
+    /* the chunks' best, merged: each chunk's run is sorted, so warp 0 takes the least head min(k, finite) times (a
+     * lane keeps LP_TK_PER_LANE chunks' cursors) */
     if (tid < 32u) {
-        const uint32_t *cn = a.tk_n + ((size_t)j * LP_TK_CHUNKS + tid) * 2u;
-        const uint32_t kc = min(cn[0], k);   /* a chunk kept its best even at k == 0 */
-        uint32_t nfin = cn[1];
+        uint32_t kc[LP_TK_PER_LANE], at[LP_TK_PER_LANE], nfin = 0;
+        const uint64_t *ck[LP_TK_PER_LANE];
+#pragma unroll
+        for (uint32_t x = 0; x < LP_TK_PER_LANE; x++) {
+            const uint32_t c = tid + 32u * x;
+            const uint32_t *cn = a.tk_n + ((size_t)j * LP_TK_CHUNKS + c) * 2u;
+            kc[x] = min(cn[0], k);   /* a chunk kept its best even at k == 0 */
+            nfin += cn[1];
+            at[x] = 0;
+            ck[x] = a.tk + ((size_t)j * LP_TK_CHUNKS + c) * PULSAR_GPU_LOGPROB_TOPK_MAX;
+        }
         for (uint32_t off = 16; off > 0; off >>= 1) nfin += __shfl_xor_sync(0xffffffffu, nfin, off);
         const uint32_t kf = min(k, nfin);
-        const uint64_t *ck = a.tk + ((size_t)j * LP_TK_CHUNKS + tid) * PULSAR_GPU_LOGPROB_TOPK_MAX;
-        uint32_t at = 0;
         for (uint32_t i = 0; i < kf; i++) {
-            const uint64_t head = at < kc ? ck[at] : UINT64_MAX;
-            uint64_t best = head;
+            uint64_t mine = UINT64_MAX;
+            uint32_t from = 0;
+#pragma unroll
+            for (uint32_t x = 0; x < LP_TK_PER_LANE; x++) {
+                const uint64_t h = at[x] < kc[x] ? ck[x][at[x]] : UINT64_MAX;
+                if (h < mine) { mine = h; from = x; }
+            }
+            uint64_t best = mine;
             for (uint32_t off = 16; off > 0; off >>= 1) best = min(best, __shfl_xor_sync(0xffffffffu, best, off));
-            if (head == best) at++;   /* keys are distinct (the id is in them): one lane holds it */
+            if (mine == best) {   /* keys are distinct (the id is in them): one lane, one chunk holds it */
+#pragma unroll
+                for (uint32_t x = 0; x < LP_TK_PER_LANE; x++)
+                    if (x == from) at[x]++;
+            }
             if (tid == 0) sm.keys[i] = best;
         }
         if (tid == 0) sm.cnt = kf;
