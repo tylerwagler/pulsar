@@ -85,7 +85,9 @@ def chat(text, max_tokens):
                                  {"content-type": "application/json"})
     try:
         d = json.loads(urllib.request.urlopen(req, timeout=3600).read().decode())
-        return 200, d["choices"][0]["message"].get("content") or ""
+        m = d["choices"][0]["message"]
+        chat.prompt_tokens = d.get("usage", {}).get("prompt_tokens", 0)
+        return 200, (m.get("reasoning_content") or "") + "\n--\n" + (m.get("content") or "")
     except urllib.error.HTTPError as e:
         return e.code, e.read().decode("utf-8", "replace")
 
@@ -129,8 +131,20 @@ if a.mode == "exact":
     A_TEXT, B_TEXT = STORY[:24000], STORY[30000:66000]
     eager, per_tok = probe()
     GEN_A = 1500
-    LA, LB = 6000 + GEN_A, 9000   # A's prompt + generation, B's prompt (approximate tokens)
-    budget = int(eager + per_tok * (LA + 0.7 * LB))
+    # B's prompt tokens, counted on a server of its own: the budget holds B alone (and A alone: A's prompt + its
+    # generation is below B's prompt) with a quarter to spare, never both
+    counter = Server(a.tag + "-count")
+    try:
+        chat(B_TEXT, 1)
+        LB = chat.prompt_tokens
+        chat(A_TEXT, 1)
+        LA = chat.prompt_tokens + GEN_A
+    finally:
+        counter.stop()
+    if not (0 < LA < LB):
+        print("FAIL the counted prompts (A + generation %d, B %d) do not frame a preemption" % (LA, LB))
+        sys.exit(1)
+    budget = int(eager + per_tok * 1.25 * LB)
     print("# eager %.2f GiB, %.0f B a token: budget override %.2f GiB" % (eager / 2**30, per_tok, budget / 2**30))
     srv = Server(a.tag + "-preempt", {"PULSAR_SERVER_KV_BUDGET_OVERRIDE": str(budget)})
     res = {}
