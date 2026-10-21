@@ -3548,6 +3548,19 @@ void *worker_main(void *arg) {
              * work or shutdown is safe.  If a refusal path is ever added
              * that can leave head set with nothing active, this predicate
              * becomes a hard spin — keep the first-bank guarantee. */
+            /* L311: an idle worker with no queued job first completes the finished turns' terminal checkpoints, one
+             * a pass (a request that arrives meanwhile binds before the next) */
+            {
+                bool queued;
+                {
+                    pulsar::ScopedLock lk(&s->mu);
+                    queued = s->head != NULL;
+                }
+                if (!queued && s->terminal_checkpoint_step()) {
+                    s->publish_metrics_snapshot();
+                    continue;
+                }
+            }
             bool quit, had_head;
             {
                 pulsar::ScopedLock lk(&s->mu);
