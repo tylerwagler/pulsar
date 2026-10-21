@@ -32,6 +32,7 @@ ap.add_argument("--banks", type=int, default=4)
 ap.add_argument("--n", type=int, default=12)
 ap.add_argument("--prompt", type=int, default=48000, help="pressure: approximate prompt tokens a request")
 ap.add_argument("--gen", type=int, default=128)
+ap.add_argument("--margin", type=float, default=1.5, help="exact: the budget holds B's prompt times this")
 ap.add_argument("--fit", type=float, default=3.0, help="pressure: the KV budget overridden to this many requests (0: the real one)")
 ap.add_argument("--tag", default="run")
 a = ap.parse_args()
@@ -152,7 +153,7 @@ if a.mode == "exact":
     if not (0 < LA < LB):
         print("FAIL the counted prompts (A + generation %d, B %d) do not frame a preemption" % (LA, LB))
         sys.exit(1)
-    budget = int(eager + per_tok * (LW + 1.5 * LB))
+    budget = int(eager + per_tok * (LW + a.margin * LB))
     print("# eager %.2f GiB, %.0f B a token: budget override %.2f GiB" % (eager / 2**30, per_tok, budget / 2**30))
     srv = Server(a.tag + "-preempt", {"PULSAR_SERVER_KV_BUDGET_OVERRIDE": str(budget)})
     res = {}

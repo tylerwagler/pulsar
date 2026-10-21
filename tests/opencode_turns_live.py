@@ -106,15 +106,15 @@ RESUME = re.compile(r"bank (\d+) (?:resumes from its (prompt end|message endpoin
 
 def turn_facts(log_part, prompt):
     """(bank, restored, prefilled) of one request from its log lines"""
-    bank, restored = None, 0
+    bank, restored, routed = None, 0, False
     for l in log_part.splitlines():
         m = ROUTE.search(l)
         if m and m.group(2) == "in place":
-            bank = int(m.group(1))
+            bank, routed = int(m.group(1)), True
         m = PROV.search(l)
         if m:
-            bank = int(m.group(1))
-        m = RESUME.search(l)
+            bank, routed = int(m.group(1)), True
+        m = RESUME.search(l) if routed else None   # a resume before the route is the previous turn's terminal step
         if m:
             bank = int(m.group(1)) if bank is None else bank
             restored = int(next(g for g in m.groups()[2:] if g))
