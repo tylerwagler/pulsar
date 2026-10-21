@@ -366,10 +366,10 @@ static bool decl_stale(void *state, uint32_t bank) {
     return bank < ss->n_banks && ss->frontier_stale[bank];
 }
 
-/* The installed bank's pools of slots [k0, k1), each slot's in id order. */
-static uint32_t slot_pools(pulsar_state_set *ss, uint32_t k0, uint32_t k1, pulsar_kv_pool *out, uint32_t cap) {
+/* Bank `bank`'s pools of slots [k0, k1), each slot's in id order. */
+static uint32_t slot_pools(pulsar_state_set *ss, uint32_t bank, uint32_t k0, uint32_t k1, pulsar_kv_pool *out,
+                           uint32_t cap) {
     const pulsar_state_plan *p = ss->plan;
-    const uint32_t bank = ss->live_bank;
     uint32_t n = 0;
     for (uint32_t k = k0; k < k1; k++) {
         for (uint32_t id = 0; id < p->n_decl; id++) {
@@ -384,7 +384,14 @@ static uint32_t slot_pools(pulsar_state_set *ss, uint32_t k0, uint32_t k1, pulsa
 
 /* Every trunk slot's pools; a drafter slot's trail a row, so no segment carries them (decl_trailing_pools). */
 static uint32_t decl_pools(void *state, pulsar_kv_pool *out, uint32_t cap) {
-    return slot_pools(SS(state), 0, SS(state)->plan->n_trunk, out, cap);
+    return slot_pools(SS(state), SS(state)->live_bank, 0, SS(state)->plan->n_trunk, out, cap);
+}
+
+/* L313: any bank's pools, trunk then drafter (decl_pools then decl_trailing_pools) */
+static uint32_t decl_bank_pools(void *state, uint32_t bank, pulsar_kv_pool *out, uint32_t cap) {
+    pulsar_state_set *ss = SS(state);
+    if (bank >= ss->n_banks) return 0;
+    return slot_pools(ss, bank, 0, ss->plan->n_slots, out, cap);
 }
 
 /* L284: the payload's frontier (session_payload.cpp).  At T the lanes describe T when the bank's counter is T, no
@@ -410,7 +417,7 @@ static bool decl_install_frontier(void *state, uint32_t T, uint32_t prefill) {
 }
 
 static uint32_t decl_trailing_pools(void *state, pulsar_kv_pool *out, uint32_t cap) {
-    return slot_pools(SS(state), SS(state)->plan->n_trunk, SS(state)->plan->n_slots, out, cap);
+    return slot_pools(SS(state), SS(state)->live_bank, SS(state)->plan->n_trunk, SS(state)->plan->n_slots, out, cap);
 }
 
 /* A prompt chunk to T -- the core loop's, or a fused step's (L284 #2): the bank's counter is the chunk's; a capture
@@ -498,6 +505,7 @@ pulsar_state_set *pulsar_state_create(const void *engine, const pulsar_state_pla
         /* .install_frontier   = */ decl_install_frontier,
         /* .trailing_pools     = */ decl_trailing_pools,
         /* .noted_at           = */ decl_noted_at,
+        /* .bank_pools         = */ decl_bank_pools,
     };
     /* the grid checkpoints, ckpt_slots x the walk's bytes a bank -- priced with the rest under the dry run */
     if (ok) ok = pulsar_ckpt_alloc(&ss->ckpt, &ss->ops, ss, n_banks);

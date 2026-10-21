@@ -3798,6 +3798,20 @@ static void test_ckpt_records(void) {
     TEST_ASSERT(pulsar_ckpt_end(st, 0) == 0u);
     pulsar_ckpt_drop_bank(st, 1);
     TEST_ASSERT(pulsar_ckpt_record_of(st, 1, PULSAR_CKPT_REC_ENDPOINT) == NULL);
+    /* a record recycled from a prompt end into an endpoint keeps no logits (a resume AT it would read them) */
+    TEST_ASSERT(pulsar_ckpt_record_capture(st, 0, PULSAR_CKPT_REC_END, 120, toks, lg, 4));
+    pulsar_ckpt_drop_bank(st, 0);
+    for (uint32_t i = 0; i < st->n_rec; i++)
+        TEST_ASSERT(pulsar_ckpt_record_capture(st, i % 2u, i < 2u ? PULSAR_CKPT_REC_ENDPOINT : PULSAR_CKPT_REC_END,
+                                               100u + i, toks, i < 2u ? NULL : lg, i < 2u ? 0u : 4u));
+    TEST_ASSERT(pulsar_ckpt_record_best(st, 0, toks, 600, 100, 100) == NULL);
+    for (uint32_t i = 0; i < st->n_rec; i++)
+        TEST_ASSERT((st->rec[i].kind == PULSAR_CKPT_REC_END) == (st->rec[i].logits != NULL));
+    /* L313: an adopt between banks refuses without paired pools (this store has none), and from the bank itself */
+    TEST_ASSERT(!pulsar_ckpt_adopt(st, 0, 1, 101, NULL));
+    TEST_ASSERT(!pulsar_ckpt_adopt(st, 0, 0, 100, NULL));
+    pulsar_ckpt_drop_bank(st, 0);
+    pulsar_ckpt_drop_bank(st, 1);
     /* the cut rule stops a chunk at the plan's endpoint, then at the final grid point: [0, 297), [297, 384),
      * [384, 400) for a 400-token prompt (cap 4096) */
     pulsar_prefill_shape shape = {4096u, 4096u, 1u};

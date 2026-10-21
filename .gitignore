@@ -86,6 +86,7 @@ __pycache__/
 /tests/session_payload_gate
 /tests/payload_frontier_gate
 /tests/prompt_end_gate
+/tests/bank_adopt_gate
 /tests/bank_residency_gate
 /tests/kv4_pack_gate
 /tests/rewind_frontier_gate

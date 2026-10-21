@@ -1635,6 +1635,80 @@ int pulsar_session_bank_resume_at(pulsar_session *s, uint32_t bank, const pulsar
     const uint32_t G = pulsar_session_resume_point(s, bank, m.live_cut, m.live_cut + (prompt->len - m.prompt_cut));
     return (int)G < m.live_cut ? (int)G : m.prompt_cut;
 }
+/* L313: where `src`'s published state serves `prompt` -- its deepest grid checkpoint within the shared ids and its
+ * prefill-only history (one short of the prompt), or a deeper record by the resume rule's own terms -- and the record
+ * (NULL for a grid point).  0 when none. */
+static uint32_t bank_adopt_point(pulsar_session *s, uint32_t src, const pulsar_tokens *prompt,
+                                 const pulsar_ckpt_record **rec) {
+    *rec = NULL;
+    const pulsar_ckpt_store *st = pulsar_session_kv_store(s);
+    const pulsar_tokens *h = pulsar_bank_history(s, src);
+    if (!st || !st->ops || !h || prompt->len <= 0) return 0u;
+    const uint32_t common = (uint32_t)pulsar_tokens_common_prefix(h, prompt);
+    const uint32_t pf = (uint32_t)pulsar_session_bank_prefill_frontier(s, src);
+    uint32_t limit = common < pf ? common : pf;
+    uint32_t rlimit = limit < (uint32_t)prompt->len ? limit : (uint32_t)prompt->len;
+    if (limit > (uint32_t)prompt->len - 1u) limit = (uint32_t)prompt->len - 1u;
+    const uint32_t G = limit ? pulsar_ckpt_best(st, src, limit) : 0u;
+    const pulsar_ckpt_record *r = pulsar_ckpt_record_best(st, src, h->v, (uint32_t)h->len, rlimit, (uint32_t)prompt->len);
+    if (r && r->T > G && (r->T == (uint32_t)prompt->len || st->ops->split_invariant)) {
+        *rec = r;
+        return r->T;
+    }
+    return G;
+}
+
+int pulsar_session_bank_adopt_score(pulsar_session *s, uint32_t src, const pulsar_tokens *prompt) {
+    if (!s || !prompt || src >= (uint32_t)pulsar_session_bank_count(s) || src == pulsar_session_live_bank(s)) return 0;
+    if (tp_mirror_target(s)) return 0;   /* a pair does not mirror the adopt (pulsar_session_bank_adopt refuses it) */
+    const pulsar_ckpt_record *r = NULL;
+    return (int)bank_adopt_point(s, src, prompt, &r);
+}
+
+int pulsar_session_bank_adopt(pulsar_session *s, uint32_t src, const pulsar_tokens *prompt, char *err,
+                              size_t errlen) {
+    PULSAR_NVTX_FN();
+    PULSAR_FAMILY_REQUIRES_S(s, PULSAR_FAMILY_CAP_BANKS, "bank adopt", -1);
+    if (!s || !prompt) return -1;
+    if (tp_mirror_target(s)) {
+        snprintf(err, errlen, "bank adopt: a tensor-parallel engine does not mirror it");
+        return -1;
+    }
+    const uint32_t dst = pulsar_session_live_bank(s);
+    if (src >= (uint32_t)pulsar_session_bank_count(s) || src == dst) {
+        snprintf(err, errlen, "bank adopt: bank %u is not another bank of the pool", src);
+        return -1;
+    }
+    const pulsar_ckpt_record *r = NULL;
+    const uint32_t T = bank_adopt_point(s, src, prompt, &r);
+    if (T == 0u) return 0;
+    const pulsar_tokens *h = pulsar_bank_history(s, src);
+    /* the records and checkpoints keep no image identity across banks: a history with an image block stays its own */
+    if (pulsar_image_block_starts(s->engine, h, (int)T, NULL, 0) != 0) return 0;
+    pulsar_tokens view = {0};
+    for (uint32_t i = 0; i < T; i++) pulsar_tokens_push(&view, h->v[i]);   /* h is src's carry: copy before moving */
+    pulsar_ckpt_store *st = pulsar_session_kv_store(s);
+    const bool at_end = r && r->logits && T == (uint32_t)prompt->len;
+    if (at_end) memcpy(s->logits, r->logits, (size_t)st->end_width * sizeof(float));
+    s->checkpoint_valid = false;   /* the state moves below */
+    if (!pulsar_ckpt_adopt(st, dst, src, T, r) || (at_end && !s->live_from_host(s->logits))) {
+        pulsar_tokens_free(&view);
+        snprintf(err, errlen, "bank adopt: bank %u's state at %u did not copy into bank %u", src, T, dst);
+        return -1;
+    }
+    s->checkpoint.len = 0;
+    for (uint32_t i = 0; i < T; i++) token_vec_push(&s->checkpoint, view.v[i]);
+    pulsar_tokens_free(&view);
+    s->checkpoint_valid = true;
+    s->prefill_frontier = (int)T;
+    s->logits_stale = !at_end;
+    s->live_images.n = 0;
+    spec_lookahead_reset(s);   /* the bank's pending drafts were its old history's */
+    fprintf(stderr, "pulsar: bank %u adopts bank %u's %s at %u (prompt %d)\n", dst, src,
+            !r ? "grid checkpoint" : r->kind == PULSAR_CKPT_REC_END ? "prompt end" : "message endpoint", T, prompt->len);
+    return (int)T;
+}
+
 int pulsar_session_restore_checkpoint(pulsar_session *s, int G, char *err, size_t errlen) {
     PULSAR_NVTX_FN();
     if (!s || G <= 0) { snprintf(err, errlen, "restore checkpoint: no session or position %d", G); return 1; }
