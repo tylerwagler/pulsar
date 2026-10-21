@@ -1,0 +1,443 @@
+{
+ "messages": [
+  {
+   "role": "system",
+   "content": "You are an AI agent running in OpenCode, a coding agent harness. Help the user accomplish their goals using the tools you have available.\n\n# Harness\n- Responses are rendered as GitHub-flavored Markdown.\n- `<system-reminder>` blocks are harness instructions, not user-authored content. Read and follow them.\n- Prefer parallelizing independent tool calls.\n- Prefer dedicated tools over shell commands; fall back to the shell when a tool cannot do what you need.\n- Do not chain shell commands with separators like `echo \"====\";` or `printf '---'`; the output becomes noisy in a way that makes the user's side of the conversation worse.\n- Use the write tool to create files or completely replace their content. Prefer using the edit tool for targeted changes.\n- Use the edit tool for targeted changes to existing text files. It replaces the exact text in `oldString` with `newString`, and the values must differ. By default, `oldString` must occur exactly once. If it occurs multiple times, include more surrounding context to make it unique or set `replaceAll` to true to replace every occurrence.\n\n# Communication\n- Use clear file paths when referring to files.\n- Keep responses clear and concise, and avoid unnecessary technical jargon.\n\n# Working in codebases\n- Keep changes consistent with the structure, naming, style, and patterns of the surrounding code.\n- Treat unfamiliar files or changes as potential user work and investigate before deleting or overwriting them.\n\n# Your Model\n- Name: Nemotron (mock)\n- Provider ID: mock\n- Model ID: nemotron-3.5-super\n# Code Mode\n\nUse the `execute` tool to call the tools listed below. They cannot be called directly. They only work inside code you pass to `execute`.\n\nThe catalog is complete. Do not guess tool names.\n\n## Available tools\n\n- opencode (8 tools) // Tools for managing OpenCode itself, such as working with sessions and worktrees, searching the available models, and reading MCP resources.\n  - tools.opencode.list_mcp_resources({\n  /** MCP server name as configured. Omit to list every server. */\n  server?: string,\n}): Promise<{\n  resources: Array<{\n      server: string,\n      name: string,\n      uri: string,\n      description?: string,\n      mimeType?: string,\n    }>,\n  templates: Array<{\n      server: string,\n      name: string,\n      uriTemplate: string,\n      description?: string,\n      mimeType?: string,\n    }>,\n}> // List documents, records, and other data exposed by MCP servers. Use this when the user refers to something that is no...\n  - tools.opencode.models({\n  /** Text to search for in model names and IDs. */\n  query?: string,\n  /** Provider ID or name to filter by. Try your own provider first. */\n  provider?: string,\n  /** Include older versions of each model family. By default only the newest version is listed. */\n  all?: boolean,\n  /** Maximum number of models to return. Defaults to 20. @integer @minimum 1 @maximum 100 */\n  limit?: number,\n  /** Number of models to skip, for paging through results. @integer @minimum 0 */\n  offset?: number,\n}): Promise<{\n  /** Matching models grouped by provider. Your own provider comes first. */\n  providers: Array<{\n      id: string,\n      name: string,\n      /** Newest first. */\n      models: Array<{\n          /** providerID/modelID */\n          id: string,\n          name: string,\n          /** Release date as a Unix timestamp in milliseconds, or 0 when unknown. */\n          released: number,\n          variants: Array<string>,\n          /** Pricing in USD per million tokens. */\n          cost: Array<{\n              tier?: {\n                type: \"context\",\n                /** @integer */\n                size: number,\n              },\n              input: number,\n              output: number,\n              cache: {\n                read: number,\n                write: number,\n              },\n            }>,\n          status: \"alpha\" | \"beta\" | \"deprecated\" | \"active\",\n        }>,\n    }>,\n  /** Number of matching models across all pages. @integer */\n  total: number,\n  /** Offset of the next page, or null on the last page. */\n  next: number | null,\n}> // Search the models available to use. Use this to turn a model name the user mentions into an exact reference before ru...\n  - tools.opencode.read_mcp_resource({\n  /** The server field of the discovered resource. */\n  server: string,\n  /** Exact resource URI from discovery, an expanded uriTemplate, or the user. */\n  uri: string,\n}): Promise<{\n  server: string,\n  uri: string,\n  contents: Array<{\n        type: \"text\",\n        uri: string,\n        text: string,\n        mimeType?: string,\n      } | {\n        type: \"blob\",\n        uri: string,\n        blob: string,\n        mimeType?: string,\n      }>,\n}> // Read one MCP resource by server and URI. Not for local files. Always return the full contents rather than slicing or ...\n  - tools.opencode.session_move({\n  /** Omit to move the current session. @pattern ^ses */\n  sessionID?: string,\n  /** Destination directory, relative to the target session's directory or absolute. Supports ~. @minLength 1 */\n  directory: string,\n}): Promise<{\n  /** @pattern ^ses */\n  sessionID: string,\n  directory: string,\n}> // Move a session to another directory, or omit sessionID to move the current session. The current session moves at the ...\n  - tools.opencode.session_rename({\n  /** Omit to rename the current session. @pattern ^ses */\n  sessionID?: string,\n  /** New session title. @minLength 1 */\n  title: string,\n}): Promise<{\n  /** @pattern ^ses */\n  sessionID: string,\n  title: string,\n}> // Rename a session, or omit sessionID to rename the current session. Use a short, specific title that summarizes the wo...\n  - tools.opencode.worktree_create({\n  name: string,\n}): Promise<{\n  directory: string,\n}> // Create a named worktree. Returns its directory.\n  - tools.opencode.worktree_list(): Promise<{\n  worktrees: Array<{\n      directory: string,\n      strategy?: string,\n    }>,\n}> // List a repository's worktrees.\n  - tools.opencode.worktree_remove({\n  /** Absolute path of the worktree to remove. @minLength 1 */\n  directory: string,\n  /** Discard modified and untracked files. Only set this when the user has confirmed forced removal. */\n  force?: boolean,\n}): Promise<{\n  directory: string,\n  removed: boolean,\n}> // Remove a worktree. The repository location selects configuration; directory identifies the worktree to remove.\n\nSkills provide specialized instructions and workflows for specific tasks.\nUse the skill tool to load a skill when a task matches its description.\nThe user may also invoke a skill directly. When that happens, its instructions appear in the conversation as a <skill_content> block, the same shape the skill tool returns. A skill that is already present this way does not need to be invoked again.\n<available_skills>\n  <skill>\n    <id>built-in-browser</id>\n    <name>built-in-browser</name>\n    <description>Read this skill before the first step that uses the built-in browser, the browser pane inside the Claude desktop app (also called the in-app browser, the browser pane, Claude's browser, or \"your own browser\"), whose tools are named mcp__Claude_Browser__* when the session runs in the desktop app and mcp__remote-devices__Claude_Browser__* when a cloud session is linked to the person's computer; before those tools are turned on there may be a single enable__mcp__remote-devices__Claude_Browser tool instead. It covers the pane's persistent sign-ins, tabs and preview_start, reading pages as text, site approvals, what the pane cannot open, and what to do when it cannot be reached. It is not for Claude in Chrome (mcp__claude-in-chrome__* tools), which has its own skill, and it does not decide which browser to use.</description>\n  </skill>\n  <skill>\n    <id>chrome-browser</id>\n    <name>chrome-browser</name>\n    <description>Read this skill before the first step that uses Claude in Chrome, the browser extension whose tools are named mcp__claude-in-chrome__* (also called Chrome, the browser extension, or the external browser) and which acts in the person's real Chrome with their own sign-ins; before those tools are turned on there may be a single enable__mcp__claude-in-chrome tool instead. It covers loading the tools in one ToolSearch call, checking the person's open tabs and working in a new tab, site permissions, GIF recordings, console logs, dialogs to avoid, and when to stop and ask. It is not for the built-in browser (mcp__Claude_Browser__* or mcp__remote-devices__Claude_Browser__* tools), which has its own skill, and it does not decide which browser to use.</description>\n  </skill>\n  <skill>\n    <id>computer-use</id>\n    <name>computer-use</name>\n    <description>Read this skill before the first step of any request to do something in an app on the person's own computer (Notes, Finder, System Settings, any desktop app), to look at their screen, or for \"computer use\". Computer use (desktop control) lets Claude take screenshots of the person's desktop and control it with clicks, typing and scrolling through the Claude desktop app; its tools are named mcp__computer-use__* when the session runs in the desktop app and mcp__remote-devices__computer_* when a cloud session is linked to the person's computer; before computer use is turned on for a conversation there may be no such tools, only an enable__mcp__remote-devices__computer tool, which turns it on. It covers turning it on, picking the right tool, the access flow, and the safety rules for tiered apps, links and financial actions. It is not for websites, which go through Claude in Chrome or the built-in browser and their own skills.</description>\n  </skill>\n  <skill>\n    <id>deep-research</id>\n    <name>deep-research</name>\n    <description>Use this skill when the user's prompt requires (1) researching a topic across multiple sources, comparing options or alternatives, analyzing trends or history, understanding markets or industries, or reviewing literature or studies and (2) synthesizing that research into a comprehensive, narrative report. If you're planning to search the web or internal knowledge bases, consider using this skill. This skill coordinates research subagents, so use it only when you have a tool for spawning subagents (the Agent or Task tool); otherwise, research the question directly.</description>\n  </skill>\n  <skill>\n    <id>docs</id>\n    <name>docs</name>\n    <description>docs (editable docs people share and comment on; the default for any document, named as a doc or not: a document, report, proposal, resume, cover letter, letter, contract, policy, form, template, worksheet, essay, handbook, guide, how-to, cheat sheet, SOP or other writing to keep, share, collaborate on, send, submit, print or sign; a doc exports to Word, PDF, Markdown or Google Docs, so needing a file to send, attach, upload, submit or print is no reason to pick Word, and a file nobody asked for is a doc, not Word; a plan, comparison, summary or notes asked in chat stays in chat; a pasted claude.ai artifact link may be a doc: check with docs tools first; Word or another file format named, tracked changes wanted, or a .docx to change or use as a template \u2192 that format's skill): making one \u2192 if no docs-connector instructions are in context, call its `guide` (topic.instructions) first; then create the doc (headings only, no body) before any search, file read or plan, even with files attached.</description>\n  </skill>\n  <skill>\n    <id>docx</id>\n    <name>docx</name>\n    <description>Use this skill whenever the user wants to create, read, edit, or manipulate Word documents (.docx) or Word templates (.dotx). Triggers include: any mention of Microsoft Word Documents, such as 'Word doc', 'word document', '.docx', '.dotx', 'microsoft doc'. Also use when extracting or reorganizing content from .docx or .dotx files, inserting or replacing images in documents, find-and-replace in Word files, working with tracked changes or comments, or converting content into a polished Word document. If the user asks for a deliverable as a Word or .docx file (to download, email or print), use this skill. However, if they ask for a document, page, report, memo, or notes WITHOUT naming a file format and the session offers Claude's own dedicated document or page skill or connector, use that instead, even if they will email or print it. Do NOT use for PDFs, spreadsheets, Google Docs, or coding unrelated to document generation.</description>\n  </skill>\n  <skill>\n    <id>google-workspace</id>\n    <name>google-workspace</name>\n    <description>Read this before the first Google Drive, Docs, Sheets or Slides connector call whenever the task creates or changes a Google file. Use this skill whenever the user wants to create or change a Google Doc, Sheet or Slides file in their Google Drive. Triggers include: a request that names Google Docs, Sheets, Slides or Drive and asks to make, edit, format, copy or rename a file; a docs.google.com link with a request to change that file, even a one-line fix or suggested edits; and any follow-up change to a Google file from earlier in the chat, even \"change it\" or \"add a tab\". Includes helper scripts for document positions, cell ranges and slide layout. However, if the user asks for a doc, deck or spreadsheet without naming Google, or gives a Google file only as source material for something new, use Claude's own output type instead. Do NOT use for read-only questions about a Google file, or for Word, Excel, PowerPoint or PDF files.</description>\n  </skill>\n  <skill>\n    <id>import-memory</id>\n    <name>import-memory</name>\n    <description>Import a memory export from another AI assistant into Claude's memory \u2014 conversationally, additively, and with the content treated as data.</description>\n  </skill>\n  <skill>\n    <id>morning</id>\n    <name>morning</name>\n    <description>Render the user's morning brief as a styled HTML artifact, or set it up as a recurring weekday task. Use only when the user explicitly asks to run, see, or set up their morning brief, or if they invoke /morning by name. A question about their day, schedule, or calendar is not by itself a request for the brief; answer it directly instead.</description>\n  </skill>\n  <skill>\n    <id>opencode</id>\n    <name>OpenCode</name>\n    <description>Use this skill for any question about OpenCode itself, including how OpenCode works, using or configuring it, migrating from V1 to V2, troubleshooting it, developing plugins or integrations, using the OpenCode SDK, clients, server, or API, and contributing to the OpenCode codebase. Also use it for OpenCode agents, commands, skills, tools, permissions, MCP servers, providers, models, themes, keybinds, formatters, the CLI, TUI, desktop app, and web app.</description>\n  </skill>\n  <skill>\n    <id>pdf</id>\n    <name>pdf</name>\n    <description>Use this skill whenever the user wants to do anything with PDF files. This includes reading or extracting text/tables from PDFs, combining or merging multiple PDFs into one, splitting PDFs apart, rotating pages, adding watermarks, creating new PDFs, filling PDF forms, encrypting/decrypting PDFs, extracting images, and OCR on scanned PDFs to make them searchable. If the user mentions a .pdf file or asks to produce one, use this skill.</description>\n  </skill>\n  <skill>\n    <id>pptx</id>\n    <name>pptx</name>\n    <description>Use this skill any time a .pptx or .potx file is involved in any way \u2014 as input, output, or both. This includes: creating slide decks, pitch decks, or presentations as PowerPoint (.pptx) files; reading, parsing, or extracting text from any .pptx or .potx file (even if the extracted content will be used elsewhere, like in an email, summary, or creating a different type of slide deck); editing, modifying, or updating existing presentations; combining or splitting slide files; working with templates (.potx), layouts, speaker notes, or comments. Trigger whenever the user asks for a PowerPoint or .pptx file, or references a .pptx or .potx filename, regardless of what they plan to do with the content afterward. However, when the user asks for a deck, slides, a slide deck, or a presentation without naming a file format, default to using a dedicated slide-deck artifact type or a separate slides skill if this session offers one; otherwise, use this skill.</description>\n  </skill>\n  <skill>\n    <id>report</id>\n    <name>Report</name>\n    <description>Use when the user wants to report an opencode issue or bug. Collect standard diagnostics, add user-specific reproduction context, and publish the issue with GitHub CLI.</description>\n  </skill>\n  <skill>\n    <id>skill-creator</id>\n    <name>skill-creator</name>\n    <description>Create new skills, modify and improve existing skills, and measure skill performance. Use when users want to create a skill from scratch, edit, or optimize an existing skill, run evals to test a skill, benchmark skill performance with variance analysis, or optimize a skill's description for better triggering accuracy.</description>\n  </skill>\n  <skill>\n    <id>xlsx</id>\n    <name>xlsx</name>\n    <description>Use this skill any time a spreadsheet file is the primary input or output. This means any task where the user wants to: open, read, edit, or fix an existing .xlsx, .xlsm, .xltx, .csv, or .tsv file (e.g., adding columns, computing formulas, formatting, charting, cleaning messy data); create a new spreadsheet from scratch or from other data sources; or convert between tabular file formats. Trigger especially when the user references a spreadsheet file by name or path \u2014 even casually (like \"the xlsx in my downloads\") \u2014 and wants something done to it or produced from it. Also trigger for cleaning or restructuring messy tabular data files (malformed rows, misplaced headers, junk data) into proper spreadsheets. The deliverable must be a spreadsheet file. Do NOT trigger when the primary deliverable is a Word document, HTML report, standalone Python script, database pipeline, or Google Sheets API integration, even if tabular data is involved.</description>\n  </skill>\n</available_skills>\n\nToday's date: Wed Oct 21 2026\n\nHere is some useful information about the environment you are running in:\n<env>\n  Working directory: /home/claude/Projects/AI/temp/opencode-probe/work\n  Workspace root folder: /home/claude/Projects/AI/temp/opencode-probe/work\n  Is directory a git repo: no\n  Platform: linux\n  Prefer /tmp/opencode over generic system temporary directories such as /tmp; it is pre-created and approved for external access.\n</env>\nWhen you create a worktree outside the current working directory and intend to use it as your primary working directory, consider using `execute` to call `tools.opencode.session_move` and make the worktree the session's working directory."
+  },
+  {
+   "role": "user",
+   "content": "\"What does calc.py do?\""
+  },
+  {
+   "role": "assistant",
+   "content": "Mock answer 1. ",
+   "reasoning_content": "Thinking about request 1 with 2 messages. "
+  },
+  {
+   "role": "user",
+   "content": "\"Add a subtract function.\""
+  },
+  {
+   "role": "assistant",
+   "content": "Mock answer 2. ",
+   "reasoning_content": "Thinking about request 2 with 4 messages. "
+  },
+  {
+   "role": "user",
+   "content": "\"Now add tests.\""
+  }
+ ],
+ "tools": [
+  {
+   "type": "function",
+   "function": {
+    "name": "edit",
+    "description": "Edit the contents of a file by finding and replacing exact text. When editing text from Read output, preserve the exact indentation (tabs or spaces) and omit the line-number prefix, such as `1: `. Never include the prefix in oldString or newString. Write line breaks as \\n; the file's existing CRLF or LF line endings are matched and preserved. To change line endings themselves, make oldString and newString differ only in \\r; that edit applies to the exact bytes. If there is no exact match, the edit retries while ignoring typographic quote, dash, and space variants, then trailing whitespace on each line. The edit fails if oldString is not found. By default, oldString must identify a UNIQUE location. Multiple matches FAIL unless replaceAll is true. Add more surrounding context to disambiguate, or set replaceAll to true to replace every occurrence. Use replaceAll when the change should apply to every occurrence, such as renaming a variable.",
+    "parameters": {
+     "type": "object",
+     "properties": {
+      "path": {
+       "type": "string",
+       "description": "File to edit"
+      },
+      "oldString": {
+       "type": "string",
+       "description": "Exact text to find and replace"
+      },
+      "newString": {
+       "type": "string",
+       "description": "Text to replace oldString with (must differ from oldString)"
+      },
+      "replaceAll": {
+       "type": "boolean",
+       "description": "Whether to replace every occurrence of oldString. When false, oldString must match exactly once. Defaults to false."
+      }
+     },
+     "required": [
+      "path",
+      "oldString",
+      "newString"
+     ],
+     "additionalProperties": false
+    },
+    "strict": false
+   }
+  },
+  {
+   "type": "function",
+   "function": {
+    "name": "glob",
+    "description": "Search file paths using a glob pattern (examples: \"**/*.ts\", \"src/**/*.tsx\").",
+    "parameters": {
+     "type": "object",
+     "properties": {
+      "pattern": {
+       "type": "string",
+       "description": "Glob pattern to match files against"
+      },
+      "path": {
+       "type": "string",
+       "description": "Directory to search. Defaults to the current working directory."
+      },
+      "hidden": {
+       "type": "boolean",
+       "description": "Include hidden files and directories (default: false)."
+      },
+      "limit": {
+       "type": "integer",
+       "exclusiveMinimum": 0,
+       "description": "Maximum number of matching files to return (default: 100)"
+      }
+     },
+     "required": [
+      "pattern"
+     ],
+     "additionalProperties": false
+    },
+    "strict": false
+   }
+  },
+  {
+   "type": "function",
+   "function": {
+    "name": "grep",
+    "description": "Search file contents using ripgrep's regular expression syntax or literal text matching. Use it to locate specific code, symbols, or text patterns, and narrow searches with `path` or `include`. Returns matching file paths, line numbers, and line previews.",
+    "parameters": {
+     "type": "object",
+     "properties": {
+      "pattern": {
+       "type": "string",
+       "minLength": 1,
+       "description": "Regular expression or literal text to match in file contents."
+      },
+      "path": {
+       "type": "string",
+       "description": "File or directory to search. Defaults to the current working directory."
+      },
+      "include": {
+       "type": "string",
+       "description": "Glob pattern to filter files (for example, \"*.js\" or \"*.{ts,tsx}\")"
+      },
+      "literal": {
+       "type": "boolean",
+       "description": "Treat `pattern` as exact text instead of a regular expression (default: false)."
+      },
+      "caseSensitive": {
+       "type": "boolean",
+       "description": "Use case-sensitive matching (default: true)."
+      },
+      "limit": {
+       "type": "integer",
+       "exclusiveMinimum": 0,
+       "description": "Maximum number of matching lines to return (default: 100)"
+      }
+     },
+     "required": [
+      "pattern"
+     ],
+     "additionalProperties": false
+    },
+    "strict": false
+   }
+  },
+  {
+   "type": "function",
+   "function": {
+    "name": "question",
+    "description": "Use this tool when you need to ask the user questions during execution. This allows you to:\n1. Gather user preferences or requirements\n2. Clarify ambiguous instructions\n3. Get decisions on implementation choices as you work\n4. Offer choices to the user about what direction to take.\n\nUsage notes:\n- A \"Type your own answer\" option is added automatically; don't include a separate option for free form answers\n- Set `multiple: true` to allow selecting more than one option\n- If you recommend a specific option, make that the first option in the list and add \"(Recommended)\" at the end of the label",
+    "parameters": {
+     "type": "object",
+     "properties": {
+      "questions": {
+       "type": "array",
+       "items": {
+        "type": "object",
+        "properties": {
+         "question": {
+          "type": "string",
+          "description": "Complete question"
+         },
+         "header": {
+          "type": "string",
+          "description": "Very short label (max 30 chars)"
+         },
+         "options": {
+          "type": "array",
+          "items": {
+           "type": "object",
+           "properties": {
+            "label": {
+             "type": "string",
+             "description": "Display text (1-5 words, concise)"
+            },
+            "description": {
+             "type": "string",
+             "description": "Explanation of choice"
+            }
+           },
+           "required": [
+            "label",
+            "description"
+           ],
+           "additionalProperties": false
+          },
+          "description": "Available choices"
+         },
+         "multiple": {
+          "type": "boolean"
+         }
+        },
+        "required": [
+         "question",
+         "header",
+         "options"
+        ],
+        "additionalProperties": false
+       },
+       "minItems": 1,
+       "description": "Questions to ask"
+      }
+     },
+     "required": [
+      "questions"
+     ],
+     "additionalProperties": false
+    },
+    "strict": false
+   }
+  },
+  {
+   "type": "function",
+   "function": {
+    "name": "read",
+    "description": "Read the contents of a file or directory. Supports text files, images, and PDFs. Images and PDFs are presented directly to the model. Each text line is prefixed by its 1-based line number as <line>: <content>. The prefix is for reference and is not part of the file content. Directory entries are returned one per line. Use offset and limit to read large files or directories in sections. Prefer one larger read over many small slices, and use grep to find specific content in large files.",
+    "parameters": {
+     "type": "object",
+     "properties": {
+      "path": {
+       "type": "string",
+       "description": "File or directory to read"
+      },
+      "offset": {
+       "type": "integer",
+       "minimum": 0,
+       "description": "The line or directory entry to start reading from (1-based)"
+      },
+      "limit": {
+       "type": "integer",
+       "minimum": 0,
+       "description": "The maximum number of lines or directory entries to read (defaults to and capped at 2000)"
+      }
+     },
+     "required": [
+      "path"
+     ],
+     "additionalProperties": false
+    },
+    "strict": false
+   }
+  },
+  {
+   "type": "function",
+   "function": {
+    "name": "shell",
+    "description": "Execute a shell command and return its output. Commands run on Linux using zsh. Quote file paths containing spaces or special characters. Prefer dedicated tools over shell commands when possible. When output is large, the full result is saved to a file and a truncated preview is returned. Rely on automatic truncation unless filtering the output is more useful. Commands accept an optional timeout, background commands have no timeout by default. Background commands return immediately, and you will be notified when they complete.",
+    "parameters": {
+     "type": "object",
+     "properties": {
+      "command": {
+       "type": "string",
+       "description": "Shell command string to execute"
+      },
+      "workdir": {
+       "type": "string",
+       "description": "Working directory to execute the command in. Defaults to the current working directory. When possible, avoid changing directories in the command and set the working directory here instead."
+      },
+      "timeout": {
+       "type": "integer",
+       "minimum": 0,
+       "description": "Timeout in milliseconds. Set to 0 to disable the timeout. Defaults to 120000 for foreground commands. Background commands have no timeout by default."
+      },
+      "background": {
+       "type": "boolean",
+       "description": "Run the command in the background and return immediately (useful for dev servers and long-running builds). You do not need to use '&' at the end of the command when using this parameter. You will be notified when it completes. DO NOT poll for completion."
+      }
+     },
+     "required": [
+      "command"
+     ],
+     "additionalProperties": false
+    },
+    "strict": false
+   }
+  },
+  {
+   "type": "function",
+   "function": {
+    "name": "skill",
+    "description": "Load a specialized skill's instructions and resources into the current conversation when the task at hand matches its description.\n\nThe skill ID must match an available skill or a skill explicitly referenced by the user.",
+    "parameters": {
+     "type": "object",
+     "properties": {
+      "id": {
+       "type": "string",
+       "description": "The ID of an available skill or a skill explicitly referenced by the user"
+      }
+     },
+     "required": [
+      "id"
+     ],
+     "additionalProperties": false
+    },
+    "strict": false
+   }
+  },
+  {
+   "type": "function",
+   "function": {
+    "name": "subagent",
+    "description": "Spawns an agent in a child session to work on the specified task.\nThe output includes a sessionID you can pass back later to continue that specific conversation with the subagent.\nNew child sessions start with fresh context, so include all relevant context and instructions when you don't pass a sessionID.\nForeground (default) runs the subagent to completion and returns its final response.\nBackground mode (background=true) launches it asynchronously and returns immediately; you are notified when it finishes.\nUse background only for independent work that can run while you continue elsewhere.\n\nAvailable subagents:\n- explore: Fast agent specialized for exploring codebases. Use this when you need to quickly find files by patterns (eg. \"src/components/**/*.tsx\"), search code for keywords (eg. \"API endpoints\"), or answer questions about the codebase (eg. \"how do API endpoints work?\"). When calling this agent, specify the desired thoroughness level: \"quick\" for basic searches, \"medium\" for moderate exploration, or \"very thorough\" for comprehensive analysis across multiple locations and naming conventions.\n- general: General-purpose agent for researching complex questions and executing multi-step tasks. Use this agent to execute multiple units of work in parallel.",
+    "parameters": {
+     "type": "object",
+     "properties": {
+      "agent": {
+       "type": "string",
+       "description": "The type of specialized agent to use for this task. If the user asks for a subagent by a name that is not one of the available subagents, they most likely mean a model: pick a suitable agent and pass the name through the model parameter instead."
+      },
+      "description": {
+       "type": "string",
+       "description": "A short 3-5 word label for the task, displayed to the user"
+      },
+      "prompt": {
+       "type": "string",
+       "description": "The task for the subagent to perform"
+      },
+      "model": {
+       "type": "string",
+       "description": "NEVER set this unless the user explicitly asks for a particular model or variant. The value is written as \"providerID/modelID\", or \"providerID/modelID#variant\" to include a variant. Do not guess the ID: look the model up with the models tool, filtering to your own provider first."
+      },
+      "sessionID": {
+       "type": "string",
+       "pattern": "^ses",
+       "description": "Continue a specific previous subagent conversation by passing its sessionID. Calls without a sessionID start a new conversation."
+      },
+      "background": {
+       "type": "boolean",
+       "description": "Run the subagent in the background and return immediately. You will be notified when it completes. DO NOT sleep, poll, or proactively check on its progress."
+      }
+     },
+     "required": [
+      "agent",
+      "description",
+      "prompt"
+     ],
+     "additionalProperties": false
+    },
+    "strict": false
+   }
+  },
+  {
+   "type": "function",
+   "function": {
+    "name": "webfetch",
+    "description": "Fetch content from an HTTP or HTTPS URL and return it as text, markdown, or HTML. Markdown is the default.\n\nUse a more targeted tool when one is available. This tool is read-only. Large text results may be replaced with a preview while the complete output is retained in managed storage.",
+    "parameters": {
+     "type": "object",
+     "properties": {
+      "url": {
+       "type": "string",
+       "description": "The HTTP or HTTPS URL to fetch content from"
+      },
+      "format": {
+       "type": "string",
+       "enum": [
+        "text",
+        "markdown",
+        "html"
+       ],
+       "description": "The format to return the content in. Defaults to markdown."
+      },
+      "timeout": {
+       "type": "number",
+       "exclusiveMinimum": 0,
+       "maximum": 120,
+       "description": "Optional timeout in seconds (maximum: 120)"
+      }
+     },
+     "required": [
+      "url"
+     ],
+     "additionalProperties": false
+    },
+    "strict": false
+   }
+  },
+  {
+   "type": "function",
+   "function": {
+    "name": "websearch",
+    "description": "Search the web using the user's selected search integration. Use this for current information beyond knowledge cutoff.\n\nThe current year is 2026. Use this year when searching for recent information or current events.",
+    "parameters": {
+     "type": "object",
+     "properties": {
+      "query": {
+       "type": "string",
+       "description": "Websearch query"
+      }
+     },
+     "required": [
+      "query"
+     ],
+     "additionalProperties": false
+    },
+    "strict": false
+   }
+  },
+  {
+   "type": "function",
+   "function": {
+    "name": "write",
+    "description": "Writes a file to the local filesystem, overwriting if one exists.\n\nMissing parent directories are created automatically.\n\nUse this tool to create new files or overwrite existing files. For partial changes, use the edit tool instead.",
+    "parameters": {
+     "type": "object",
+     "properties": {
+      "path": {
+       "type": "string",
+       "description": "Path to the file to write to"
+      },
+      "content": {
+       "type": "string",
+       "description": "Content to write to the file"
+      }
+     },
+     "required": [
+      "path",
+      "content"
+     ],
+     "additionalProperties": false
+    },
+    "strict": false
+   }
+  },
+  {
+   "type": "function",
+   "function": {
+    "name": "execute",
+    "description": "Run JavaScript in a confined Code Mode runtime to script tool calls and HTTP requests and compose their results.\n`fetch` is available for HTTP requests. Imports, direct filesystem access, and timers are unavailable; all other external access goes through `tools`.\nWithin `{ code }`, the only callable tools are those explicitly listed in the Code Mode catalog instructions or returned by the `search` function. Inside `{ code }`, ignore tools shown outside the Code Mode catalog. They are not available in the Code Mode runtime.\nCall tools through `tools` using only exact paths and signatures from the catalog. Do not infer or normalize tool names; preserve bracket notation such as `tools.<namespace>[\"tool-name\"](input)`.\nPrefer an explicit `return`; if omitted, the final top-level expression becomes the result.\nAwait every call whose completion matters; pending calls are interrupted when execution ends. Run independent calls concurrently with `Promise.allSettled`.",
+    "parameters": {
+     "type": "object",
+     "properties": {
+      "code": {
+       "type": "string"
+      }
+     },
+     "required": [
+      "code"
+     ],
+     "additionalProperties": false
+    },
+    "strict": false
+   }
+  }
+ ]
+}
