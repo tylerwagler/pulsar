@@ -1901,6 +1901,17 @@ typedef struct {
     uint32_t ann_n;                   ///< `n` at that announcement
 } pulsar_lane_cost_fit;
 
+/* L304: the fused step's measured cost (verify_curve.cpp pulsar_engine_fused_cost_observe): an EW least-squares fit
+ * of the forward's wall on [1, prompt rows, prompt attention pairs]. */
+typedef struct {
+    double w, s1, s2, s11, s12, s22, sy, s1y, s2y;   ///< EW sums (x2 in M pairs)
+    uint32_t n;                                      ///< steps observed
+    bool valid;                                      ///< the terms below may be used
+    double a_ms, alpha_ms, beta_ms;                  ///< fixed, per prompt row, per attention pair
+    uint32_t ann_n;                                  ///< `n` at the last announcement (0: never)
+    double ann_alpha, ann_beta;
+} pulsar_fused_cost_fit;
+
 struct pulsar_engine {
     /** The model family, chosen once at open from `general.architecture`
      * (pulsar_family_for_model) and never switched; generic code reaches the
@@ -1948,6 +1959,8 @@ struct pulsar_engine {
     struct pulsar_verify_curve *verify_curve;
     /** L301: the drafters' confidence calibration per draft position (pulsar_spec_calibration_note). */
     pulsar_spec_calibration spec_calibration;
+    /** L304: the fused step's prompt cost, what a continuation chunk is solved from (pulsar_engine_fused_chunk). */
+    pulsar_fused_cost_fit fused_cost;
     char *directional_steering_file;   ///< steering-vector file path, or NULL
     float *directional_steering_dirs;  ///< loaded steering directions, or NULL
     float directional_steering_attn_scale;  ///< steering strength on the attention stream

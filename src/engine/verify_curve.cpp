@@ -551,3 +551,112 @@ void pulsar_spec_calibration_note(pulsar_engine *e, bool copy, const float *conf
         a.bin_label[d][b] += y;
     }
 }
+
+/* ---- L304: the fused step's prompt cost ------------------------------------------------------------------------
+ *
+ * After DeepInfer's prefill load balancer (doc/inference_deployment_qa.md, "within a single GPU"): a chunk of a
+ * prompt that does not finish it is not a fixed width but the widest that fits a time budget, solved from a fitted
+ * cost.  A fused step's forward carries the decode banks' verify rows and each riding prompt's chunk of q rows over
+ * the c rows of it already computed; the chunk's rows each pay the dense and expert work (linear in q) and attend
+ * over c + their own causal prefix (q * (c + q / 2) pairs).  So
+ *
+ *     forward_ms = a + alpha * sum q + beta * sum q (c + q / 2)
+ *
+ * with a the verify rows and the step's fixed cost.  An exponentially weighted least-squares fit over the fused steps
+ * the server reports (weight 1 - 1/64 a step: a prompt's chunks move c through the window); beta clamps at 0 (a
+ * short context's attention is lost in the noise: the two-term fit then).  No number until 8 steps are in and the
+ * terms are positive. */
+#define FC_DECAY (1.0 - 1.0 / 64.0)
+#define FC_MIN_OBS 8u
+
+static bool fc_solve(const pulsar_fused_cost_fit *f, double *a, double *alpha, double *beta) {
+    /* the normal equations of [1, x1, x2] */
+    const double m[3][3] = {{f->w, f->s1, f->s2}, {f->s1, f->s11, f->s12}, {f->s2, f->s12, f->s22}};
+    const double v[3] = {f->sy, f->s1y, f->s2y};
+    const auto det3 = [](const double (&x)[3][3]) {
+        return x[0][0] * (x[1][1] * x[2][2] - x[1][2] * x[2][1]) - x[0][1] * (x[1][0] * x[2][2] - x[1][2] * x[2][0]) +
+               x[0][2] * (x[1][0] * x[2][1] - x[1][1] * x[2][0]);
+    };
+    const double d = det3(m);
+    if (fabs(d) > 1e-9 * (f->w * f->s11 * f->s22 + 1.0)) {
+        double r[3];
+        for (int k = 0; k < 3; k++) {
+            double mk[3][3];
+            memcpy(mk, m, sizeof mk);
+            for (int i = 0; i < 3; i++) mk[i][k] = v[i];
+            r[k] = det3(mk) / d;
+        }
+        if (r[1] > 0.0 && r[2] >= 0.0) {
+            *a = r[0];
+            *alpha = r[1];
+            *beta = r[2];
+            return true;
+        }
+    }
+    /* the two-term fit [1, x1] */
+    const double d2 = f->w * f->s11 - f->s1 * f->s1;
+    if (!(d2 > 1e-9 * (f->w * f->s11 + 1.0))) return false;
+    *alpha = (f->w * f->s1y - f->s1 * f->sy) / d2;
+    *a = (f->sy - *alpha * f->s1) / f->w;
+    *beta = 0.0;
+    return *alpha > 0.0;
+}
+
+void pulsar_engine_fused_cost_observe(pulsar_engine *e, uint32_t n_runs, const uint32_t *q, const uint32_t *c,
+                                      double forward_ms) {
+    if (!e || e->tp || n_runs == 0u || !(forward_ms > 0.0)) return;
+    double x1 = 0.0, x2 = 0.0;
+    for (uint32_t i = 0; i < n_runs; i++) {
+        x1 += (double)q[i];
+        x2 += (double)q[i] * ((double)c[i] + 0.5 * (double)q[i]);
+    }
+    x2 *= 1e-6;   /* in M pairs: the normal equations stay well scaled */
+    pulsar_fused_cost_fit *f = &e->fused_cost;
+    f->w = f->w * FC_DECAY + 1.0;
+    f->s1 = f->s1 * FC_DECAY + x1;
+    f->s2 = f->s2 * FC_DECAY + x2;
+    f->s11 = f->s11 * FC_DECAY + x1 * x1;
+    f->s12 = f->s12 * FC_DECAY + x1 * x2;
+    f->s22 = f->s22 * FC_DECAY + x2 * x2;
+    f->sy = f->sy * FC_DECAY + forward_ms;
+    f->s1y = f->s1y * FC_DECAY + x1 * forward_ms;
+    f->s2y = f->s2y * FC_DECAY + x2 * forward_ms;
+    f->n++;
+    double a = 0.0, al = 0.0, be = 0.0;
+    f->valid = f->n >= FC_MIN_OBS && fc_solve(f, &a, &al, &be);
+    if (!f->valid) return;
+    f->a_ms = a > 0.0 ? a : 0.0;
+    f->alpha_ms = al;
+    f->beta_ms = be * 1e-6;
+    /* rule 5: the fit announces itself when it arms and, at most once in 256 steps, when a term moved by half */
+    const bool first = f->ann_n == 0u;
+    const bool moved = !first && f->n - f->ann_n >= 256u &&
+                       (fabs(f->alpha_ms - f->ann_alpha) * 2.0 > f->ann_alpha ||
+                        fabs(f->beta_ms - f->ann_beta) * 2.0 > f->ann_beta + 1e-12);
+    if (first || moved) {
+        f->ann_n = f->n;
+        f->ann_alpha = f->alpha_ms;
+        f->ann_beta = f->beta_ms;
+        fprintf(stderr, "pulsar: fused step cost measured: %.1f + %.4f x rows + %.3f x M pairs ms (%u steps%s)\n",
+                f->a_ms, f->alpha_ms, f->beta_ms * 1e6, f->n, first ? "" : ", moved");
+    }
+}
+
+double pulsar_engine_fused_cost_ms(const pulsar_engine *e, uint32_t q, uint32_t c) {
+    const pulsar_fused_cost_fit *f = e ? &e->fused_cost : NULL;
+    if (!f || !f->valid) return 0.0;
+    return f->alpha_ms * (double)q + f->beta_ms * (double)q * ((double)c + 0.5 * (double)q);
+}
+
+bool pulsar_engine_fused_chunk(const pulsar_engine *e, uint32_t c, double spent_ms, double budget_ms, uint32_t *rows) {
+    const pulsar_fused_cost_fit *f = e ? &e->fused_cost : NULL;
+    *rows = 0u;
+    if (!f || !f->valid) return false;
+    const double room = budget_ms - f->a_ms - spent_ms;
+    if (!(room > 0.0)) return true;
+    /* the largest q with alpha q + beta q (c + q / 2) <= room */
+    const double lin = f->alpha_ms + f->beta_ms * (double)c;
+    const double q = f->beta_ms > 0.0 ? (-lin + sqrt(lin * lin + 2.0 * f->beta_ms * room)) / f->beta_ms : room / lin;
+    *rows = q >= 4294967295.0 ? 4294967295u : (uint32_t)q;
+    return true;
+}

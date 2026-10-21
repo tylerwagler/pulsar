@@ -1221,6 +1221,16 @@ typedef struct {
     double bin_conf[2][10], bin_label[2][10];
 } pulsar_spec_calibration;
 void pulsar_engine_spec_calibration(const pulsar_engine *e, pulsar_spec_calibration *out);
+/** L304: the fused step's cost (src/engine/verify_curve.cpp has the model): forward_ms = a + alpha * sum q +
+ *  beta * sum q (c + q / 2) over its prompt runs (q rows each over c already computed), fitted from the fused steps
+ *  the server reports (`forward_ms` the step's whole forward, verify rows included).  pulsar_engine_fused_chunk: the
+ *  most rows a run at context c may add with `spent_ms` of the step's prompt cost already taken, for the forward to
+ *  stay within `budget_ms` into *rows (0 when it cannot), false with no fit yet; pulsar_engine_fused_cost_ms: a run's prompt cost
+ *  (0 with no fit). */
+void pulsar_engine_fused_cost_observe(pulsar_engine *e, uint32_t n_runs, const uint32_t *q, const uint32_t *c,
+                                      double forward_ms);
+bool pulsar_engine_fused_chunk(const pulsar_engine *e, uint32_t c, double spent_ms, double budget_ms, uint32_t *rows);
+double pulsar_engine_fused_cost_ms(const pulsar_engine *e, uint32_t q, uint32_t c);
 /** The loaded drafter's name ("" with none). */
 const char *pulsar_engine_drafter_name(const pulsar_engine *e);
 const pulsar_tokens *pulsar_session_tokens(pulsar_session *s);
