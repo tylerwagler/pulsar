@@ -307,15 +307,14 @@ void server::canonicalize_tool_checkpoint(session_slot *sl,
      * from the grid checkpoint the resume rule picks, so the generated tail is evaluated again in its canonical
      * spelling.  Before, a rewrite behind the live end needed REWIND (Qwen refused it and logged
      * "canonicalization failed" every thinking-off tool turn) and DeepSeek rebuilt it from a disk checkpoint or
-     * from 0 even with a grid checkpoint below the cut.  A sync that would start from 0 tries a disk checkpoint
-     * first, as a request's does. */
+     * from 0 even with a grid checkpoint below the cut.  L318: a disk chain deeper than the bank's own resume loads
+     * when L310 prices the read under the prefill it saves, as a request's does. */
     {
         const int resume = pulsar_session_bank_resume_at(s->sess, (uint32_t)sl->bank, &canonical);
         char *path = NULL;
         pulsar_tokens effective = {0};
-        const int loaded = resume > 0 ? 0
-            : s->kv_cache_try_load_text(sl, rendered.ptr ? rendered.ptr : "", rendered.spans, rendered.n_spans,
-                                        NULL, 0, 0, &effective, &path, false);
+        const int loaded = s->kv_cache_try_load_text(sl, rendered.ptr ? rendered.ptr : "", rendered.spans,
+                                                     rendered.n_spans, NULL, 0, resume, &effective, &path, false);
         const pulsar_tokens *sync_prompt = loaded > 0 ? &effective : &canonical;
         const int cached = loaded > 0 ? loaded : resume;
         const char *source = loaded > 0 ? "disk" : cached > 0 ? "memory" : "full";
@@ -539,6 +538,30 @@ void server::gen_prefill_fail(session_slot *sl, bool discard_loaded_entry) {
     g->phase = GEN_DONE;
 }
 
+void server::gen_prefill_abandon(session_slot *sl) {
+    auto *s = this;
+    gen_state *g = sl->gen;
+    server_log(PULSAR_LOG_DEFAULT, "pulsar-server: client disconnected during prefill, abandoning");
+    snprintf(g->err, sizeof g->err, "client disconnected");
+    /* L318: the rows computed so far are the re-send's own prefix (a Stop and re-send, measured 2026-10-21: 24k of
+     * 28k tokens thrown away, then prefilled again).  The bank's grid checkpoints up to where the prefill stopped are
+     * the same ones a "continued" store writes on progress; this store closes the chain at the deepest of them. */
+    if (s->kv.enabled && s->bank_switch(sl->bank)) {
+        int end = 0;
+        s->kv_cache_persist(sl, "abandoned", true, &end);
+        const int kept = end - g->progress.cached_tokens;
+        server_log(PULSAR_LOG_KVCACHE,
+                   "pulsar-server: abandoned prefill of bank %u: chain stored to %d (resumed at %d, prompt %d)",
+                   sl->bank, end, g->progress.cached_tokens, g->prompt_tokens);
+        if (kept > 0) {
+            pthread_mutex_lock(&s->mu);
+            s->kv.meter.abandon_persisted_tokens += (uint64_t)kept;
+            pthread_mutex_unlock(&s->mu);
+        }
+    }
+    s->gen_prefill_fail(sl, false);
+}
+
 
 
 /* L261: place an image request's images on a live-continuation effective prompt
@@ -753,54 +776,92 @@ void server::gen_begin(session_slot *sl) {
                    old_pos, j->req.prompt.len, common,
                    trace_cache_miss_reason(&cache_diag));
     }
-    if (s->kv.enabled && cached == 0 && old_pos >= s->kv.opt.min_tokens) {
-        /* Loading a chain replaces the live bank.  Persist its history first
-         * (only the segments the store lacks), so the newer conversation state
-         * outlives the restore. */
-        s->kv_cache_persist(sl, "evict", true);
-    }
-    if (prompt_for_sync == &j->req.prompt && s->pool_banks > 1 && !image_request) {
-        /* L313: another bank's published checkpoint -- a busy main conversation's prompt end or message endpoint,
-         * the bank a side request just prefilled the same tool result on -- copied in beats the disk and a prefill:
-         * the deepest one any other resident bank holds for this prompt, when it is deeper than what this bank's own
-         * state serves by more than the copy costs (PULSAR_SERVER_ADOPT_MIN_GAIN tokens; the copy is the shared
-         * prefix's rows + one state, milliseconds) */
+    /* L318: ONE resume decision -- the deepest valid state among the bank's own (memory_resume: its grid checkpoint,
+     * record or the history it continues), another resident bank's published checkpoint (L313: a busy main
+     * conversation's prompt end or message endpoint, the bank a side request just prefilled the same tool result on;
+     * copied in when it starts the sync more than PULSAR_SERVER_ADOPT_MIN_GAIN tokens deeper, the copy being the
+     * shared prefix's rows + one state, milliseconds), and the disk chain (L310: loaded when reading it beats half the
+     * prefill of what it adds past the deeper of the other two).  Every candidate is measured before any is applied.
+     * Before, the adopt ran first and the disk was searched only when nothing at all served the prompt: an adopt at a
+     * thinned grid point (8192) hid a chain one segment below the divergence (31482) and 28k tokens were re-prefilled
+     * per Open WebUI turn.  A live tool/visible continuation (prompt_for_sync is its effective prompt) is the bank's
+     * exact frontier; nothing serves it deeper. */
+    kv_chain_hit *disk_hit = NULL;   /* heap: PULSAR_KVCHAIN_MAX segments */
+    resume_pick pick = RESUME_OWN;
+    int adopt_src = -1, adopt_at = 0, disk_at = 0, mem = 0;
+    if (prompt_for_sync == &j->req.prompt) {
         const int own = cached > memory_resume ? cached : memory_resume;
-        int src = -1, best = own + PULSAR_SERVER_ADOPT_MIN_GAIN;
-        for (int i = 0; i < s->n_slots; i++) {
-            const session_slot *o = &s->slots[i];
-            if (o == sl || !o->provisioned || o->spilled || o->preempted) continue;
-            const int T = pulsar_session_bank_adopt_score(s->sess, o->bank, &j->req.prompt);
-            if (T > best) { best = T; src = (int)o->bank; }
-        }
-        /* the adopt replaces this bank's history: a conversation it holds is persisted first (the miss above did) */
-        if (src >= 0 && cached > 0 && s->kv.enabled && old_pos >= s->kv.opt.min_tokens)
-            s->kv_cache_persist(sl, "evict", true);
-        if (src >= 0) {
-            char aerr[192] = "";
-            const double t_a = server_now_sec();
-            const int T = pulsar_session_bank_adopt(s->sess, (uint32_t)src, &j->req.prompt, aerr, sizeof(aerr));
-            if (T > 0) {
-                cached = T;
-                cache_source = "bank-adopt";
-                server_log(PULSAR_LOG_KVCACHE, "pulsar-server: bank %u adopted bank %d's state at %d of %d (%.1f ms)",
-                           sl->bank, src, T, j->req.prompt.len, (server_now_sec() - t_a) * 1e3);
-            } else if (T < 0) {
-                server_log(PULSAR_LOG_WARNING, "pulsar-server: bank %u could not adopt bank %d's state: %s", sl->bank,
-                           src, aerr);
-                pulsar_session_invalidate(s->sess);   /* the bank describes no position: the sync rebuilds it */
+        if (s->pool_banks > 1 && !image_request) {
+            for (int i = 0; i < s->n_slots; i++) {
+                const session_slot *o = &s->slots[i];
+                if (o == sl || !o->provisioned || o->spilled || o->preempted) continue;
+                const int T = pulsar_session_bank_adopt_score(s->sess, o->bank, &j->req.prompt);
+                if (T > adopt_at) { adopt_at = T; adopt_src = (int)o->bank; }
             }
         }
+        mem = server_resume_memory_depth(own, adopt_at);
+        kv_restore_verdict disk_v = KV_RESTORE_RECOMPUTE;
+        if (s->kv.enabled && mem < j->req.prompt.len) {
+            disk_hit = (kv_chain_hit *)server_xmalloc(sizeof(kv_chain_hit));
+            disk_at = s->kv_cache_find_req(&j->req, disk_hit);
+            if (disk_at > mem) disk_v = s->kv_cache_price(disk_hit, mem);
+        }
+        pick = server_resume_pick(own, adopt_at, disk_at, disk_v);
+        pthread_mutex_lock(&s->mu);
+        s->kv.meter.picks[pick]++;
+        pthread_mutex_unlock(&s->mu);
+        server_log(PULSAR_LOG_KVCACHE,
+                   "pulsar-server: resume: bank %u own %d adopt %d%s disk %d of %d (match %d) -> %s", sl->bank, own,
+                   adopt_at, adopt_src >= 0 ? "" : " (none)", disk_at, j->req.prompt.len, pm.prompt_cut,
+                   resume_pick_names[pick]);
     }
-    if (cached == 0) {
-        /* L310: the chain loads only when reading it beats prefilling what it adds over the bank's own resume */
-        disk_cached = s->kv_cache_try_load(sl, &j->req, memory_resume, &effective_prompt, &g->disk_cache_path);
+    if (s->kv.enabled && old_pos >= s->kv.opt.min_tokens && (cached == 0 || pick != RESUME_OWN)) {
+        /* The sync from a miss, an adopt and a chain load each replace the bank's history.  Persist it first (only
+         * the segments the store lacks), so the newer conversation state outlives them; the chain about to load is
+         * touched first, so making room for the persist evicts other leaves. */
+        if (pick == RESUME_DISK) pulsar_segstore_touch(s->kv.st, disk_hit->chain, disk_hit->n);
+        s->kv_cache_persist(sl, "evict", true);
+    }
+    if (pick == RESUME_ADOPT) {
+        char aerr[192] = "";
+        const double t_a = server_now_sec();
+        const int T = pulsar_session_bank_adopt(s->sess, (uint32_t)adopt_src, &j->req.prompt, aerr, sizeof(aerr));
+        if (T > 0) {
+            cached = T;
+            cache_source = "bank-adopt";
+            server_log(PULSAR_LOG_KVCACHE, "pulsar-server: bank %u adopted bank %d's state at %d of %d (%.1f ms)",
+                       sl->bank, adopt_src, T, j->req.prompt.len, (server_now_sec() - t_a) * 1e3);
+        } else if (T < 0) {
+            server_log(PULSAR_LOG_WARNING, "pulsar-server: bank %u could not adopt bank %d's state: %s", sl->bank,
+                       adopt_src, aerr);
+            pulsar_session_invalidate(s->sess);   /* the bank describes no position: the sync rebuilds it */
+            cached = 0;
+            cache_source = "none";
+        }
+    } else if (pick == RESUME_DISK) {
+        disk_cached = s->kv_cache_load(disk_hit, j->req.prompt_text, j->req.prompt_spans, j->req.prompt_n_spans, mem,
+                                       &effective_prompt, &g->disk_cache_path, j->req.api == API_RESPONSES);
         if (disk_cached > 0) {
             cached = disk_cached;
             cache_source = "disk-text";
-            prompt_for_sync = &effective_prompt;
+            /* The chain's tokens are usually the request's own up to its end: then the sync runs the request's
+             * tokens, exactly what a cold server prefills (reuse == cold), instead of the suffix re-tokenized from
+             * the chain's byte boundary -- which is mid-text wherever a grid point falls.  Only a byte-only match
+             * (another spelling of the same bytes) syncs the stitched prompt. */
+            const pulsar_tokens *loaded = pulsar_session_tokens(s->sess);
+            bool own_tokens = loaded && loaded->len == disk_cached && disk_cached <= j->req.prompt.len;
+            for (int i = 0; own_tokens && i < disk_cached; i++) own_tokens = loaded->v[i] == j->req.prompt.v[i];
+            if (own_tokens) {
+                pulsar_tokens_free(&effective_prompt);
+            } else {
+                prompt_for_sync = &effective_prompt;
+            }
+        } else {
+            cached = 0;   /* the load said why and left the bank invalid: the sync rebuilds it from 0 */
+            cache_source = "none";
         }
     }
+    free(disk_hit);
     /* An effective prompt is the live (or chain-restored) tokens plus freshly
      * tokenized request text: place the images on it -- the held ones where
      * that history already carries their blocks, the new ones expanded from
@@ -1018,10 +1079,7 @@ void server::gen_step_prefill(session_slot *sl) {
             /* Client cancelled mid-prefill: abandon rather than resume or fail, so
              * a long deep-context prefill stops promptly on disconnect instead of
              * running to completion (the decode loop already abandons this way). */
-            server_log(PULSAR_LOG_DEFAULT,
-                       "pulsar-server: client disconnected during prefill, abandoning");
-            snprintf(g->err, sizeof(g->err), "client disconnected");
-            s->gen_prefill_fail(sl, false);
+            s->gen_prefill_abandon(sl);
             return;
         }
         if (g->prefill_chunks_done > 0) return; /* voluntary yield; resume next quantum */

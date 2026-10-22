@@ -812,6 +812,17 @@ bool server::send_metrics(int fd) {
     buf_puts(&b, "# HELP pulsar:kv_disk_recomputed_tokens_total Tokens a recompute verdict left to the prefill.\n");
     buf_puts(&b, "# TYPE pulsar:kv_disk_recomputed_tokens_total counter\n");
     buf_printf(&b, "pulsar:kv_disk_recomputed_tokens_total %llu\n", (unsigned long long)disk_meter.recomputed_tokens);
+    /* L318: where each request's sync resumed -- the deepest of the bank's own state, an adopt, the disk chain */
+    buf_puts(&b, "# HELP pulsar:resume_decisions_total Resume decisions by the state picked (own bank, adopt, disk).\n");
+    buf_puts(&b, "# TYPE pulsar:resume_decisions_total counter\n");
+    for (int i = 0; i < RESUME_PICKS; i++)
+        buf_printf(&b, "pulsar:resume_decisions_total{source=\"%s\"} %llu\n", resume_pick_names[i],
+                   (unsigned long long)disk_meter.picks[i]);
+    /* L318: prefills a disconnect abandoned, and the computed prefix each persisted for the re-send */
+    buf_puts(&b, "# HELP pulsar:prefill_abandon_persisted_tokens_total Tokens an abandoned prefill left on disk as segments.\n");
+    buf_puts(&b, "# TYPE pulsar:prefill_abandon_persisted_tokens_total counter\n");
+    buf_printf(&b, "pulsar:prefill_abandon_persisted_tokens_total %llu\n",
+               (unsigned long long)disk_meter.abandon_persisted_tokens);
 
     /* Why requests queue. num_requests_waiting says that they do; this says
      * whether evicting something would help or the box is simply out of room. */

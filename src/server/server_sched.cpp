@@ -721,7 +721,7 @@ session_slot *server::choose_slot_for_job(job *j, int *reject_ctx,
  * while (the 2026-09-29 pair: c2 ran serially).
  *
  * Restore path: none of it is new. gen_begin's cache resolution already
- * prefers a disk-text snapshot over cold prefill (kv_cache_try_load), and the
+ * takes a disk chain when it is the deepest state (L318, server_resume_pick), and the
  * "evict" snapshot is keyed exactly like a shutdown checkpoint — by rendered
  * transcript bytes, or by the visible protocol transcript when a live
  * responses/thinking binding covers the frontier. A returning client binds to
@@ -2751,9 +2751,7 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n, int quantum_
             else if (pg->no_fuse) why = pg->no_fuse;
             if (why) { rv[k].why = why; continue; }
             if (gen_client_disconnected(pg->j->fd)) {
-                server_log(PULSAR_LOG_DEFAULT, "pulsar-server: client disconnected during prefill, abandoning");
-                snprintf(pg->err, sizeof pg->err, "client disconnected");
-                s->gen_prefill_fail(c, false);
+                s->gen_prefill_abandon(c);
                 s->worker_finish_slot(c);   /* L282: released where abandoned (nothing in this quantum steps it) */
                 continue;
             }
