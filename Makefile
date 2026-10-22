@@ -2052,6 +2052,16 @@ KV_ADMISSION_MODEL ?= /mnt/models/nemotron35-mini-pulsar
 server-kv-admission-live: pulsar-server
 	python3 tests/server_kv_admission_live.py $(KV_ADMISSION_MODEL) --binary ./pulsar-server
 
+# L318: an Open WebUI conversation (the history rewritten inside the previous turn, ~30k-token prompts) resumes within
+# one segment of its byte match from the deepest valid state -- own bank, adopt, disk chain -- a prefill its client
+# abandons keeps its computed prefix for the re-send, and both stay reuse == cold against a fresh server.  Production's
+# Qwen pack and flags (262k, 16 banks, 64 GB disk tier); two loads, ~8 min.  gates-dev runs it on a routing / kv path.
+RESUME_LIVE_MODEL ?= $(QWEN_GATE_MODEL)
+RESUME_LIVE_WORK ?= $(or $(TMPDIR),/var/tmp)/pulsar-l318-$(USER)
+.PHONY: resume-deepest-live
+resume-deepest-live: pulsar-server
+	python3 tests/resume_deepest_live.py $(RESUME_LIVE_MODEL) --binary ./pulsar-server --work $(RESUME_LIVE_WORK)
+
 cuda-spec-width-gate: pulsar
 	python3 tests/spec_verify_width_gate.py $(FRONTIER_MODEL) --binary ./pulsar
 
@@ -2576,7 +2586,7 @@ gates-dev:
 	fi; \
 	$(MAKE) -j$(GATE_JOBS) --no-print-directory tests/gates_runner pulsar_test CUDA_ARCH=sm_120f || exit 1; \
 	$(MAKE) --no-print-directory gates-preflight || exit 1; \
-	paths='$(PATHS)'; why=''; attn=0; server=0; vision=0; exl3=0; family=0; gdn=0; router=0; blocks=0; bf16=0; minp=0; drafter=0; poison=0; mtp=0; \
+	paths='$(PATHS)'; why=''; attn=0; server=0; vision=0; exl3=0; family=0; gdn=0; router=0; blocks=0; bf16=0; minp=0; drafter=0; poison=0; mtp=0; resume=0; \
 	if [ -z "$$paths" ]; then \
 	  paths=$$( { git diff --name-only HEAD; git ls-files --others --exclude-standard; } 2>/dev/null \
 	            | grep -E '\.(c|cc|cpp|cu|cuh|h|hpp)$$' | sort -u ); \
@@ -2608,6 +2618,7 @@ gates-dev:
 	      case "$$p" in *sampler*|*libm*|src/engine/spec_dspark.cpp|src/engine/session_spec.cpp|src/engine/spec_mtp.cpp|src/engine/spec_block.cpp) minp=1 ;; esac; \
 	      case "$$p" in *spec_block*|*blockdraft*|*candsel*|*lilicorr*|*mtp_spec*|*attn_gqa*|*rope*|src/engine/session_spec.cpp|src/families/nemotron_h/*|src/engine/family_qwen.cpp) drafter=1 ;; esac; \
 	      case "$$p" in *mtp*|src/engine/family_qwen.cpp|src/engine/family_qwen.h|src/engine/step_driver*|src/families/nemotron_h/nemotron_h_family.cpp|src/families/nemotron_h/nemotron_h.h) mtp=1 ;; esac; \
+	      case "$$p" in src/server/server_jobs.cpp|src/server/server_sched.cpp|src/server/kv_cache.cpp|src/lib/pulsar_kvchain*|src/lib/pulsar_segstore*) resume=1 ;; esac; \
 	      case "$$p" in src/cuda/pulsar_cuda_runtime.cu|src/cuda/*scratch*|src/engine/gpu_graph_*|src/engine/gpu_decode.cpp|src/engine/step_driver*|src/engine/spec_block*|src/engine/verify_curve.cpp|*scratch_poison*) poison=1 ;; esac; \
 	      case $$cls in \
 	        attn) for g in $(GATES_DEV_ATTN); do add $$g; done ;; \
@@ -2640,6 +2651,7 @@ gates-dev:
 	if [ $$mtp -eq 1 ]; then printf '  mtp-spec-gate: selected (L305: the dormant MTP lane, on an MTP path change, on the Nemotron mini)\n'; fi; \
 	if [ $$poison -eq 1 ]; then printf '  scratch-poison-gate: selected (L307: the graphed lanes and their scratch, poisoned == unpoisoned on DeepSeek, DFlash2, LiLiCorr)\n'; fi; \
 	if [ $$server -eq 1 ]; then printf '  server: chat smoke + the --server/--api unit switches\n'; fi; \
+	if [ $$resume -eq 1 ]; then printf '  resume-deepest-live: selected (L318: routing / resume / disk-chain paths, Open WebUI shape on the Qwen pack)\n'; fi; \
 	$(MAKE) --no-print-directory seam-check CUDA_ARCH=sm_120f || rc=1; \
 	$(MAKE) --no-print-directory cuda-reap-router-audit CUDA_ARCH=sm_120f \
 	      FRONTIER_MODEL="$(FRONTIER_MODEL)" || rc=1; \
@@ -2681,6 +2693,9 @@ gates-dev:
 	fi; \
 	if [ $$poison -eq 1 ]; then \
 	  $(MAKE) --no-print-directory scratch-poison-gate CUDA_ARCH=sm_120f FRONTIER_MODEL="$(FRONTIER_MODEL)" || rc=1; \
+	fi; \
+	if [ $$resume -eq 1 ]; then \
+	  $(MAKE) --no-print-directory resume-deepest-live CUDA_ARCH=sm_120f || rc=1; \
 	fi; \
 	if [ $$exl3 -eq 1 ]; then \
 	  $(MAKE) --no-print-directory exl3-dequant-gate CUDA_ARCH=sm_120f || rc=1; \

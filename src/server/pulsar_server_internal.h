@@ -12,6 +12,7 @@
 #include "pulsar_gpu.h"
 #include "pulsar_help.h"
 #include "pulsar_kvtext.h"
+#include "pulsar_kvchain.h"
 #include "pulsar_dsml.h"
 #include "pulsar_utf8.h"
 /* The JSON scanner is shared with the engine's safetensors reader, so it lives
@@ -1053,8 +1054,40 @@ kv_restore_verdict kv_restore_decide(uint64_t bytes, uint32_t gained, double rea
  *  time, the first sample taken whole.  Returns the new rate. */
 double kv_restore_rate_update(double rate, uint32_t n, uint64_t bytes, double ms);
 
+/** L318: where a request's sync resumes -- the DEEPEST valid state among the bank's own (its grid checkpoint, record
+ *  or the history it continues), another resident bank's published checkpoint copied in (L313's adopt), and the disk
+ *  chain (L310), decided once, by server_resume_pick, before any of them is applied.  Before, the adopt ran first and
+ *  the disk tier was consulted only when nothing at all served the prompt, so an adopt at a shallow grid point (Qwen's
+ *  4 checkpoint slots thin the old ones to ~8192) hid a chain one segment below the divergence: 138 segments written
+ *  and none loaded on 2026-10-21, ~29k tokens re-prefilled per Open WebUI turn. */
+typedef enum {
+    RESUME_OWN = 0,    ///< the bank's own state (or nothing: the sync starts where the bank resumes it, maybe 0)
+    RESUME_ADOPT,      ///< another bank's published checkpoint (pulsar_session_bank_adopt)
+    RESUME_DISK,       ///< the disk chain (pulsar_kvchain_load)
+    RESUME_PICKS
+} resume_pick;
+/** The picks' names: the log word and the /metrics label (one authority). */
+extern const char *const resume_pick_names[RESUME_PICKS];
+/** The depth the memory tiers serve: `adopt` (the deepest published checkpoint another bank holds for the prompt, 0
+ *  for none) when it starts the sync more than PULSAR_SERVER_ADOPT_MIN_GAIN tokens deeper than `own`, else `own`.
+ *  The disk chain is priced past this depth. */
+int server_resume_memory_depth(int own, int adopt);
+/** The decision, pure: the disk chain to `disk` (0: none) wins when it is deeper than server_resume_memory_depth and
+ *  its L310 verdict, priced on the tokens it adds past that depth, is not RECOMPUTE; else the adopt when it counts;
+ *  else the bank's own state. */
+resume_pick server_resume_pick(int own, int adopt, int disk, kv_restore_verdict disk_verdict);
+
+/** L310: the chain a disk restore would load (pulsar_kvchain_find), nothing loaded yet. */
+typedef struct {
+    pulsar_segstore_seg chain[PULSAR_KVCHAIN_MAX];
+    int n;               ///< segments, root first (0: none)
+    uint64_t bytes;      ///< what a load reads
+} kv_chain_hit;
+
 /** L310: the restore-vs-recompute telemetry, on /metrics.  Worker-written under server::mu. */
 typedef struct {
+    uint64_t picks[RESUME_PICKS];      ///< L318: every resume decision, by the source it picked
+    uint64_t abandon_persisted_tokens; ///< L318: tokens an abandoned prefill persisted past its chain's stored end
     double read_bytes_per_ms;          ///< measured; 0 until the first load
     uint32_t reads;                    ///< loads that measured it
     uint64_t verdicts[KV_RESTORE_VERDICTS];
@@ -1875,8 +1908,9 @@ struct server {
      * deepest grid checkpoint.  Only a store on prefill progress ("continued")
      * leaves the chain open: a prompt riding decode steps lands a checkpoint
      * every grid slice, and a segment per slice wrote the whole recurrent state
-     * each time.  @return segments written (0: nothing new, or disabled). */
-    int kv_cache_persist(session_slot *sl, const char *reason, bool close);
+     * each time.  *chain_end (when given): where the stored chain ends after the
+     * write (0: none).  @return segments written (0: nothing new, or disabled). */
+    int kv_cache_persist(session_slot *sl, const char *reason, bool close, int *chain_end = nullptr);
     /** Load the deepest stored chain whose text is a byte prefix of
      * `prompt_text` into the installed bank (live at the chain's end), and build
      * the prompt to sync: the exact stored tokens + the rest of the text --
@@ -1888,9 +1922,21 @@ struct server {
                                const pulsar_text_span *prompt_spans, uint32_t prompt_n_spans,
                                const uint64_t *image_hashes, int n_images, int base,
                                pulsar_tokens *effective_prompt, char **loaded_key_out, bool responses_protocol);
-    /** kv_cache_try_load_text() for a request's prompt. */
-    int kv_cache_try_load(session_slot *sl, const request *req, int base, pulsar_tokens *effective_prompt,
-                          char **loaded_key_out);
+    /** L318: the stored chain a restore of `prompt_text` would load (the deepest whose text is a byte prefix of it,
+     * cut at the first image `image_hashes` does not bring), nothing loaded.  @return the position it ends at, 0 for
+     * none. */
+    int kv_cache_find(const char *prompt_text, const uint64_t *image_hashes, int n_images, kv_chain_hit *hit);
+    /** kv_cache_find() for a request's prompt and images. */
+    int kv_cache_find_req(const request *req, kv_chain_hit *hit);
+    /** L310: the restore-vs-recompute verdict on `hit`, priced on the tokens it adds past `base` (which it must
+     * exceed); counted on /metrics and logged. */
+    kv_restore_verdict kv_cache_price(const kv_chain_hit *hit, int base);
+    /** Load `hit` into the installed bank (live at the chain's end) and build the prompt to sync: the exact stored
+     * tokens + the rest of `prompt_text`.  `base` is where the bank would have resumed without it (the restored-tokens
+     * counter).  @return the position restored, 0 when a segment would not load (the bank is then invalid). */
+    int kv_cache_load(const kv_chain_hit *hit, const char *prompt_text, const pulsar_text_span *prompt_spans,
+                      uint32_t prompt_n_spans, int base, pulsar_tokens *effective_prompt, char **loaded_key_out,
+                      bool responses_protocol);
     /** A chain whose restore the prefill then failed on: drop its last segment. */
     void kv_cache_discard_failed_chain(const char *key);
     /** Tool-output-only Responses continuation.
@@ -1974,6 +2020,10 @@ struct server {
      * restore, a fused forward shared with other slots -- keeps the file (L261).
      */
     void gen_prefill_fail(session_slot *sl, bool discard_loaded_entry);
+    /** L318: the prefill's client hung up (both lanes' one abandon).  The computed prefix is persisted first -- the
+     * chain closed at the bank's deepest grid checkpoint, the last grid point the prefill reached -- so the re-send
+     * (a Stop and re-send, a client timeout) resumes there instead of re-prefilling it; then gen_prefill_fail. */
+    void gen_prefill_abandon(session_slot *sl);
     /** Resolve the prompt against every cache layer and decide the prefill plan.
      * Clients resend full prompts as text.  The worker first tries the old exact
      * token-prefix hit, then a rendered-text prefix hit for the live checkpoint,

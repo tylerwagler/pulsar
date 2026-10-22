@@ -6402,6 +6402,32 @@ static void test_l310_restore_vs_recompute(void) {
     TEST_ASSERT(kv_restore_rate_update(r, 2, 0, 5.0) == r);
 }
 
+/* L318: the one resume decision takes the DEEPEST valid state.  The production case (2026-10-21, Open WebUI on Qwen):
+ * a fresh bank (own 0), bank 14's thinned grid checkpoint adoptable at 8192, a disk chain to 28672 below the
+ * divergence at 31482 -- the adopt used to win because the disk was only searched when nothing served the prompt. */
+static void test_l318_resume_picks_the_deepest(void) {
+    const int G = PULSAR_SERVER_ADOPT_MIN_GAIN;
+    TEST_ASSERT(server_resume_pick(0, 8192, 28672, KV_RESTORE_LOAD) == RESUME_DISK);
+    TEST_ASSERT(server_resume_pick(0, 8192, 28672, KV_RESTORE_UNMEASURED) == RESUME_DISK);
+    TEST_ASSERT(server_resume_pick(0, 8192, 28672, KV_RESTORE_UNPRICED) == RESUME_DISK);
+    /* the in-place shape: the bank's own thinned checkpoint, a deeper chain */
+    TEST_ASSERT(server_resume_pick(8192, 0, 36864, KV_RESTORE_LOAD) == RESUME_DISK);
+    /* a priced recompute keeps the deeper memory state */
+    TEST_ASSERT(server_resume_pick(0, 8192, 28672, KV_RESTORE_RECOMPUTE) == RESUME_ADOPT);
+    TEST_ASSERT(server_resume_pick(8192, 0, 28672, KV_RESTORE_RECOMPUTE) == RESUME_OWN);
+    /* a chain no deeper than memory never wins, whatever its verdict */
+    TEST_ASSERT(server_resume_pick(0, 30000, 28672, KV_RESTORE_LOAD) == RESUME_ADOPT);
+    TEST_ASSERT(server_resume_pick(30000, 0, 30000, KV_RESTORE_LOAD) == RESUME_OWN);
+    TEST_ASSERT(server_resume_pick(0, 0, 0, KV_RESTORE_LOAD) == RESUME_OWN);
+    /* the adopt counts only past its copy's price, and the disk is priced past what memory then serves */
+    TEST_ASSERT(server_resume_memory_depth(1000, 1000 + G) == 1000);
+    TEST_ASSERT(server_resume_memory_depth(1000, 1001 + G) == 1001 + G);
+    TEST_ASSERT(server_resume_pick(1000, 1000 + G, 0, KV_RESTORE_RECOMPUTE) == RESUME_OWN);
+    TEST_ASSERT(server_resume_pick(1000, 1000 + G, 1100 + G, KV_RESTORE_LOAD) == RESUME_DISK);
+    TEST_ASSERT(!strcmp(resume_pick_names[RESUME_OWN], "own") && !strcmp(resume_pick_names[RESUME_ADOPT], "adopt") &&
+                !strcmp(resume_pick_names[RESUME_DISK], "disk"));
+}
+
 static void test_kv_cache_chat_anchor_ignores_multiturn_tail(void) {
     const int user = 9001;
     const int assistant = 9002;
@@ -9882,6 +9908,7 @@ static void pulsar_server_unit_tests_run(void) {
     test_kv_cache_chat_anchor_ignores_multiturn_tail();
     test_kv_cache_sys_prefix_cut_clears_preamble_jitter();
     test_l310_restore_vs_recompute();
+    test_l318_resume_picks_the_deepest();
     test_writeback_preserves_bytes();
     test_sha1_bytes_hex_matches_known_vector();
     test_l264_segstore_chain_lookup();

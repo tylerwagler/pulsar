@@ -364,9 +364,10 @@ int seg_trailer_write(FILE *fp, void *ud, const char *text, char *err, size_t er
 }
 }  // namespace
 
-int server::kv_cache_persist(session_slot *sl, const char *reason, bool close) {
+int server::kv_cache_persist(session_slot *sl, const char *reason, bool close, int *chain_end) {
     auto *s = this;
     (void)sl;   /* the caller installed the slot's bank */
+    if (chain_end) *chain_end = 0;
     if (!s->kv.enabled) return 0;
     /* A "continued" store fires from the prefill's progress callback; on a TP
      * group that is inside the mirrored sync, where the workers read only
@@ -383,6 +384,7 @@ int server::kv_cache_persist(session_slot *sl, const char *reason, bool close) {
         server_log(PULSAR_LOG_KVCACHE,
                    "pulsar-server: kv cache persisted reason=%s chain to %d (%d new segments, %.1f MiB) %.1f ms",
                    reason, r.end, r.written, (double)r.bytes / (1024.0 * 1024.0), (server_now_sec() - t0) * 1000.0);
+    if (chain_end) *chain_end = r.end;
     return r.written;
 }
 
@@ -412,21 +414,57 @@ int server::kv_cache_try_load_text(session_slot *sl, const char *prompt_text,
                                   pulsar_tokens *effective_prompt,
                                   char **loaded_key_out,
                                   bool responses_protocol) {
-    auto *s = this;
     (void)sl;   /* the caller installed the slot's bank */
     if (loaded_key_out) *loaded_key_out = NULL;
+    kv_chain_hit hit;
+    const int G = kv_cache_find(prompt_text, image_hashes, n_images, &hit);
+    if (G <= base) return 0;   /* nothing past what the bank serves: no read is priced */
+    if (kv_cache_price(&hit, base) == KV_RESTORE_RECOMPUTE) return 0;
+    return kv_cache_load(&hit, prompt_text, prompt_spans, prompt_n_spans, base, effective_prompt, loaded_key_out,
+                         responses_protocol);
+}
+
+/* ===== L318: one resume decision, the deepest valid state ================== */
+
+const char *const resume_pick_names[RESUME_PICKS] = { "own", "adopt", "disk" };
+
+int server_resume_memory_depth(int own, int adopt) {
+    return adopt > own + PULSAR_SERVER_ADOPT_MIN_GAIN ? adopt : own;
+}
+
+resume_pick server_resume_pick(int own, int adopt, int disk, kv_restore_verdict disk_verdict) {
+    const int mem = server_resume_memory_depth(own, adopt);
+    if (disk > mem && disk_verdict != KV_RESTORE_RECOMPUTE) return RESUME_DISK;
+    return mem > own ? RESUME_ADOPT : RESUME_OWN;
+}
+
+int server::kv_cache_find(const char *prompt_text, const uint64_t *image_hashes, int n_images, kv_chain_hit *hit) {
+    auto *s = this;
+    hit->n = 0;
+    hit->bytes = 0;
     if (!s->kv.enabled || !prompt_text) return 0;
-    const size_t prompt_bytes = strlen(prompt_text);
-    const double t0 = server_now_sec();
-    pulsar_segstore_seg chain[PULSAR_KVCHAIN_MAX];
     char err[384];
-    uint64_t bytes = 0;
-    const int n = pulsar_kvchain_find(s->kv.st, prompt_text, prompt_bytes, image_hashes, n_images,
-                                      s->kv.opt.min_tokens, chain, PULSAR_KVCHAIN_MAX, &bytes, err, sizeof(err));
-    if (err[0]) server_log(n ? PULSAR_LOG_KVCACHE : PULSAR_LOG_WARNING, "pulsar-server: kv cache %s", err);
-    if (n == 0) return 0;
-    /* L310: price the read against the prefill of what the chain adds past the bank's own resume */
-    const uint32_t chain_G = chain[n - 1].G;
+    hit->n = pulsar_kvchain_find(s->kv.st, prompt_text, strlen(prompt_text), image_hashes, n_images,
+                                 s->kv.opt.min_tokens, hit->chain, PULSAR_KVCHAIN_MAX, &hit->bytes, err, sizeof(err));
+    if (err[0]) server_log(hit->n ? PULSAR_LOG_KVCACHE : PULSAR_LOG_WARNING, "pulsar-server: kv cache %s", err);
+    return hit->n > 0 ? (int)hit->chain[hit->n - 1].G : 0;
+}
+
+int server::kv_cache_find_req(const request *req, kv_chain_hit *hit) {
+    /* L281: the chain loads past an image block only when this request brings the same image there */
+    enum { HASHES_MAX = 64 };
+    uint64_t hashes[HASHES_MAX];
+    const int n_images = req->n_images < HASHES_MAX ? req->n_images : HASHES_MAX;
+    for (int i = 0; i < n_images; i++) hashes[i] = pulsar_image_hash(&req->images[i]);
+    return kv_cache_find(req->prompt_text, hashes, n_images, hit);
+}
+
+kv_restore_verdict server::kv_cache_price(const kv_chain_hit *hit, int base) {
+    auto *s = this;
+    /* L310: price the read against the prefill of what the chain adds past `base` */
+    const uint32_t chain_G = hit->chain[hit->n - 1].G;
+    const uint64_t bytes = hit->bytes;
+    const int n = hit->n;
     if (base < 0) base = 0;
     const uint32_t gained = chain_G > (uint32_t)base ? chain_G - (uint32_t)base : 0u;
     double prefill_ms = 0.0, transfer_ms = 0.0;
@@ -448,18 +486,30 @@ int server::kv_cache_try_load_text(session_slot *sl, const char *prompt_text,
                "%d: read %.1f ms (%.0f MB/s%s) vs prefill %.1f ms%s -> %s",
                chain_G, n, (double)bytes / (1024.0 * 1024.0), gained, base, transfer_ms, rate * 1e-3,
                rate > 0.0 ? "" : ", unmeasured", prefill_ms, priced ? "" : " (no fit)", kv_restore_verdict_names[v]);
-    if (v == KV_RESTORE_RECOMPUTE) return 0;
-    const double t_load = server_now_sec();
+    return v;
+}
+
+int server::kv_cache_load(const kv_chain_hit *hit, const char *prompt_text, const pulsar_text_span *prompt_spans,
+                          uint32_t prompt_n_spans, int base, pulsar_tokens *effective_prompt, char **loaded_key_out,
+                          bool responses_protocol) {
+    auto *s = this;
+    if (loaded_key_out) *loaded_key_out = NULL;
+    const pulsar_segstore_seg *chain = hit->chain;
+    const int n = hit->n;
+    const size_t prompt_bytes = strlen(prompt_text);
+    const double t0 = server_now_sec();
+    char err[384];
     const int G = pulsar_kvchain_load(s->kv.st, s->engine, s->sess, prompt_text, chain, n, err, sizeof(err));
     if (err[0]) server_log(PULSAR_LOG_WARNING, "pulsar-server: kv cache %s", err);
     if (G == 0) return 0;
     {
-        const double load_ms = (server_now_sec() - t_load) * 1000.0;
+        const double load_ms = (server_now_sec() - t0) * 1000.0;
+        if (base < 0) base = 0;
         pthread_mutex_lock(&s->mu);
         s->kv.meter.read_bytes_per_ms = kv_restore_rate_update(s->kv.meter.read_bytes_per_ms, s->kv.meter.reads,
-                                                               bytes, load_ms);
+                                                               hit->bytes, load_ms);
         s->kv.meter.reads++;
-        s->kv.meter.restored_tokens += gained;
+        s->kv.meter.restored_tokens += G > base ? (uint64_t)(G - base) : 0u;
         pthread_mutex_unlock(&s->mu);
     }
     const pulsar_tokens *loaded = pulsar_session_tokens(s->sess);
@@ -488,24 +538,7 @@ int server::kv_cache_try_load_text(session_slot *sl, const char *prompt_text,
                "pulsar-server: kv cache hit%s chain of %d to %u (text %llu of %zu bytes) load=%.1f ms",
                responses_protocol ? " [responses]" : "", n, chain[n - 1].G,
                (unsigned long long)text_end, prompt_bytes, (server_now_sec() - t0) * 1000.0);
-    return (int)chain[n - 1].G;
-}
-
-int server::kv_cache_try_load(session_slot *sl, const request *req, int base,
-                             pulsar_tokens *effective_prompt,
-                             char **loaded_key_out) {
-    auto *s = this;
-    /* L281: the chain loads past an image block only when this request brings the same image there */
-    enum { HASHES_MAX = 64 };
-    uint64_t hashes[HASHES_MAX];
-    const int n_images = req && req->n_images < HASHES_MAX ? req->n_images : HASHES_MAX;
-    for (int i = 0; req && i < n_images; i++) hashes[i] = pulsar_image_hash(&req->images[i]);
-    return s->kv_cache_try_load_text(sl, req ? req->prompt_text : NULL,
-                                  req ? req->prompt_spans : NULL,
-                                  req ? req->prompt_n_spans : 0,
-                                  hashes, n_images, base,
-                                  effective_prompt, loaded_key_out,
-                                  req && req->api == API_RESPONSES);
+    return G;
 }
 
 void server::kv_cache_discard_failed_chain(const char *key) {
