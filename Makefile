@@ -1106,7 +1106,9 @@ mtp-spec-gate: tests/mtp_spec_gate
 	./tests/mtp_spec_gate $(MTP_GATE_MODEL) $(MTP_GATE_TOKENS)
 # L298: the same gate on a container whose drafter is the LiLiCorr block drafter (spec_block.h): spec == plain greedy
 # and seeded-sampled, the forced-reject stress (the drafter's context rings == the plain twin's), the batched lane and
-# toolsample's per-position modes.
+# toolsample's per-position modes.  L317: the battery runs it in the runner on the hosted engines (block-spec-gate on
+# Qwen's DFlash2 and Nemotron's LiLiCorr, 128 tokens a stream); these two targets are the gates-dev depth (256) on a
+# drafter path change, and the hand run.
 LILICORR_GATE_MODEL ?= /srv/models/nemotron35-k4-lilicorr-pulsar
 .PHONY: lilicorr-spec-gate
 lilicorr-spec-gate: tests/mtp_spec_gate
@@ -2008,13 +2010,14 @@ cuda-chat-smoke-gate: pulsar
 
 # L278 contract 6: the live server tier -- a real pulsar-server per family on a scratch port, driven over HTTP
 # (tests/server_live.py: plain answer, forced / streamed / required tool calls, the tool_result continuation, the
-# undeclared-tool refusal).  Not in GATE_TARGETS: one server load per family.  SERVER_LIVE_MODELS to choose.
+# undeclared-tool refusal).  L317: the battery runs it as a leg of live-legs (one shared server per model); this target
+# runs it alone, on its own server.  SERVER_LIVE_MODELS to choose.
 SERVER_LIVE_MODELS ?= $(FRONTIER_MODEL) $(QWEN_GATE_MODEL)
 # L303: structured outputs live (tests/constrained_live.py): every constrained output valid over seeds at T 0 and
 # T 0.8, thinking off and on; spec == plain byte-exact for each (logprobs requests decode without speculation);
 # the protocols' format fields; the cost against the same prompt unconstrained; a matcher failure (injected,
-# PULSAR_GRAMMAR_FAIL_AFTER) fails only its request.  Not in `make gates` (two server loads per family), like
-# server-live-gate: it runs on CONSTRAINED_LIVE_MODELS.
+# PULSAR_GRAMMAR_FAIL_AFTER) fails only its request.  L317: the battery runs it as a leg of live-legs; this target runs
+# it alone (two server loads per family) on CONSTRAINED_LIVE_MODELS.
 CONSTRAINED_LIVE_MODELS ?= $(SERVER_LIVE_MODELS)
 .PHONY: constrained-live-gate
 constrained-live-gate: pulsar-server
@@ -2034,8 +2037,8 @@ server-live-gate: pulsar-server
 
 # L316: an agent loop's reuse == cold on the production Qwen pack (tests/prefix_turns_live.py --reply 600: eight
 # Anthropic tool turns with ~150-400-token replies, thinking echoed; the last turn in the loop and re-sent alone ==
-# a fresh server's, byte for byte, on one prompt).  Not in GATE_TARGETS (two server loads); a battery leg beside
-# server-live-gate.  ~4 min.
+# a fresh server's, byte for byte, on one prompt).  L317: the battery runs it as a leg of live-legs (Qwen's shared
+# server); this target runs it alone (two server loads).  ~4 min.
 PREFIX_TURNS_LIVE_MODEL ?= $(QWEN_GATE_MODEL)
 PREFIX_TURNS_LIVE_WORK ?= $(CURDIR)/.build/prefix-turns-live
 .PHONY: prefix-turns-live-gate
@@ -2043,6 +2046,20 @@ prefix-turns-live-gate: pulsar-server
 	sync; sudo -n sh -c "echo 3 > /proc/sys/vm/drop_caches" 2>/dev/null; \
 	python3 tests/prefix_turns_live.py $(PREFIX_TURNS_LIVE_MODEL) --binary ./pulsar-server \
 	  --work $(PREFIX_TURNS_LIVE_WORK) --tag gate --reply 600
+# L317: the battery's live legs on ONE server per model (tests/live_legs.py): constrained-live, server-live and the
+# abandon leg on DeepSeek and Qwen, the L312 stall check, prefix-turns (L316's gate and the side shape), preempt-exact and
+# (L318) resume-deepest on Qwen,
+# opencode-turns on Nemotron's LiLiCorr pack.  Per model: the shared server, then -- only if a leg needs it -- one
+# instance with the test hooks (the injected grammar failure, the KV-budget override), then one fresh instance for
+# every leg's reuse == cold reference.  Each leg keeps its own checks and PASS/FAIL; the targets above still run a
+# leg alone.  The last section of `make gates`.  LIVE_LEGS="a,b" runs only those.
+LIVE_LEGS ?=
+LIVE_LEGS_WORK ?= $(CURDIR)/.build/live-legs
+.PHONY: live-legs
+live-legs: pulsar-server
+	python3 tests/live_legs.py --binary ./pulsar-server --work $(LIVE_LEGS_WORK) \
+	  --model deepseek=$(FRONTIER_MODEL) --model qwen=$(QWEN_GATE_MODEL) --model nemotron=$(LILICORR_GATE_MODEL) \
+	  $(if $(LIVE_LEGS),--legs $(LIVE_LEGS),)
 
 # L280: a prompt's KV is admitted against the 2b guard's budget before it lands (spill first / wait for a busy bank /
 # 503), never past it into memory pressure.  A real server on a SMALL model (the guard's budget lowered through its
@@ -2271,6 +2288,8 @@ cuda-comp-state-gate: tests/comp_state_gate
 # chunk, two mid-size chunks, off-grid warm resume -- frontier + one decode step
 # byte-identical).  The plain-weight GEMM arm's fixed reduction order is what
 # makes it hold; a split-K pick fails it from layer 0.
+# L317: this target is the exhaustive sweep (every schedule); the battery's runner entry runs the seeded sample
+# (`sample`, PULSAR_GATE_CHUNK_SEED = the sha) and gates-dev's cuda-chunk-neutrality-gate-full the sweep.
 cuda-chunk-neutrality-gate: tests/chunk_neutrality_gate
 	./tests/chunk_neutrality_gate $(FRONTIER_MODEL)
 # L283: an image block's logits do not depend on where its prefill chunk starts (before, at, straddling the grid,
@@ -2305,7 +2324,7 @@ RUNNER_GATES = multiseq_frontier_gate rewind_frontier_gate mseq_rewind_probe tok
                mixed_neutrality_gate spec_sampling_gate mseq_short_ctx_probe prefill_bitexact_gate \
                comp_state_gate chunk_neutrality_gate vision_chunk_gate session_payload_gate tp_head_split_gate \
                decode_reference_gate session_contract_gate chat_decode_smoke head_graph_replay_gate \
-               sync_budget_gate scratch_poison_gate
+               sync_budget_gate scratch_poison_gate mtp_spec_gate bank_adopt_gate
 RUNNER_OBJS = $(RUNNER_GATES:%=tests/runner/%.o)
 tests/runner/%.o: tests/%.cpp tests/gate_entry.h tests/gate_fixture.h tests/gate_util.h src/pulsar.h src/pulsar_gpu.h src/engine/pulsar_engine_internal.h src/lib/pulsar_segstore.h
 	@mkdir -p tests/runner
@@ -2326,9 +2345,14 @@ GATE_RUNNER_FLAGS ?=
 # family adds its served model here.
 # Each entry is `--model PATH` and that model's reference anchors; it must follow the primary's anchors (an option
 # binds to the last --model before it).
-RUNNER_HOSTED_ARGS ?= --model $(QWEN_GATE_MODEL) $(QWEN_REF_ANCHORS)
+# L317: Nemotron's LiLiCorr pack is hosted for the legs that loaded it themselves (block-spec, scratch-poison,
+# bank-adopt): --gates restricts it to them.  Models are hosted one at a time (each closed before the next opens).
+RUNNER_HOSTED_ARGS ?= --model $(QWEN_GATE_MODEL) $(QWEN_REF_ANCHORS) \
+                      --model $(LILICORR_GATE_MODEL) --gates=block-spec-gate,scratch-poison-gate,bank-adopt-gate
+# L317: the seed of the chunk-neutrality sample is the sha the battery runs at (successive batteries rotate through
+# the schedules; one sha always runs the same ones).
 cuda-runner-gate: tests/gates_runner
-	./tests/gates_runner $(FRONTIER_MODEL) --prefill-baseline $(PREFILL_BASELINE) \
+	PULSAR_GATE_CHUNK_SEED=$(GATE_BUILD_REF) ./tests/gates_runner $(FRONTIER_MODEL) --prefill-baseline $(PREFILL_BASELINE) \
 		--prefill-ref $(PREFILL_BASELINE_REF_SHORT) \
 		--decode-baseline $(PREFILL_DECODE_BASELINE) --decode-ref $(PREFILL_DECODE_BASELINE_REF_SHORT) \
 		$(PULSAR_REF_ANCHORS) $(RUNNER_HOSTED_ARGS) $(GATE_RUNNER_FLAGS)
@@ -2388,14 +2412,16 @@ render-gate: pulsar_test
 # iterating on one gate; the battery is the runner.  L220 folded the last
 # exception in: cuda-session-payload-gate is now a runner function too (its
 # v10 digest corruption case included), so the battery no longer pays a
-# separate engine load for it.
-GATE_TARGETS = unit-test-gate agent-test-gate \
+# separate engine load for it.  L317: so did lilicorr-spec-gate and dflash2-spec-gate
+# (block-spec-gate on the hosted Nemotron and Qwen); the live legs, one shared server
+# per model, are the last section (live-legs).  Each section's wall time is printed
+# against its budget (docs/QA_BEFORE_RELEASES.md, "Battery wall time").
+GATE_TARGETS =unit-test-gate agent-test-gate \
 	cuda-regression cuda-kv-rows-pack-gate cuda-sampler-device-gate cuda-chat-smoke-gate \
 	cuda-attn-gates cuda-attn-pack-gate indexer-hadamard-kernel-check \
 	cuda-prefill-gate-cutlass-mxfp4 qwen-family-gate-device state-kinds-gate vision-qwen-tower-gate tessera-kernel-gate \
-	blockdraft-gate nvfp4-rows-gate lilicorr-head-gate lilicorr-spec-gate dflash2-spec-gate \
-	\
-	cuda-runner-gate
+	blockdraft-gate nvfp4-rows-gate lilicorr-head-gate \
+	cuda-runner-gate live-legs
 # L220: gates that need no GPU and no model.  They are launched in the
 # background immediately before cuda-runner-gate and collected after it, so
 # they overlap the long GPU tail instead of adding their seconds in front of
@@ -2484,12 +2510,13 @@ gates-preflight:
 
 # The binaries of the serial GPU targets are prerequisites too (2026-10-14): they build here, in one parallel make,
 # instead of one target at a time inside the timed loop (pulsar_test alone was ~40 s of unit-test-gate).
-gates: tests/gates_runner pulsar-eval tests/qwen_chat_gate tests/inkling_chat_gate tests/nemotron_chat_gate tests/api_golden \
+gates: tests/gates_runner pulsar-server pulsar-eval tests/qwen_chat_gate tests/inkling_chat_gate tests/nemotron_chat_gate tests/api_golden \
        tests/sse_golden tests/spec_depth_gate \
        tests/loader_open pulsar_test pulsar_agent_test pulsar $(CUDA_REGRESSION_BINS)
 	@$(MAKE) --no-print-directory gates-preflight || exit 1
-	@rc=0; passed=""; failed=""; times=""; suite0=$$(date +%s); \
-	hostdir=$$(mktemp -d /tmp/pulsar-gates-XXXXXX); host_pids=""; \
+	@rc=0; passed=""; failed=""; suite0=$$(date +%s); \
+	hostdir=$$(mktemp -d $${TMPDIR:-/var/tmp}/pulsar-gates-XXXXXX); host_pids=""; \
+	export PULSAR_GATES_SECTIONS=$$hostdir/sections.tsv; : > $$PULSAR_GATES_SECTIONS; \
 	for g in $(GATE_TARGETS); do \
 	  if [ "$$g" = "cuda-runner-gate" ]; then \
 	    for h in $(HOST_GATE_TARGETS); do \
@@ -2510,25 +2537,25 @@ gates: tests/gates_runner pulsar-eval tests/qwen_chat_gate tests/inkling_chat_ga
 	  else \
 	    failed="$$failed $$g"; rc=1; \
 	  fi; \
-	  times="$$times $$g:$$(( $$(date +%s) - t0 ))"; \
+	  case "$$g" in cuda-runner-gate|live-legs) ;; \
+	    *) printf '%s\t%s\n' "$$(( $$(date +%s) - t0 ))" "$$g" >> $$PULSAR_GATES_SECTIONS ;; esac; \
 	done; \
 	for p in $$host_pids; do wait $$p; done; \
 	for h in $(HOST_GATE_TARGETS); do \
 	  printf '\n\033[1m=== %s (host-only, ran alongside the GPU tail) ===\033[0m\n' "$$h"; \
 	  cat "$$hostdir/$$h.log"; \
 	  read hrc hsecs < "$$hostdir/$$h.result"; \
-	  times="$$times $$h:$$hsecs"; \
+	  printf '%s\t%s\n' "$$hsecs" "$$h" >> $$hostdir/host.tsv; \
 	  if [ "$$hrc" = "0" ]; then passed="$$passed $$h"; \
 	  else failed="$$failed $$h"; rc=1; fi; \
 	done; \
-	rm -rf "$$hostdir"; \
 	printf '\n===================== GATE SUMMARY =====================\n'; \
 	for g in $$passed; do printf '  PASS  %s\n' "$$g"; done; \
 	for g in $$failed; do printf '  FAIL  %s\n' "$$g"; done; \
-	printf '\n  seconds per gate (slowest first; host gates overlap the runner):\n'; \
-	for e in $$times; do printf '    %6s  %s\n' "$${e##*:}" "$${e%%:*}"; done \
-	  | sort -rn; \
-	printf '\n  suite total: %s s\n' "$$(( $$(date +%s) - suite0 ))"; \
+	printf '%s\n' "$$(( $$(date +%s) - suite0 ))" > $$hostdir/total; \
+	python3 tests/battery_budget.py --sections $$PULSAR_GATES_SECTIONS --host $$hostdir/host.tsv \
+	  --total "$$(cat $$hostdir/total)" --budget docs/QA_BEFORE_RELEASES.md || true; \
+	rm -rf "$$hostdir"; \
 	if [ $$rc -eq 0 ]; then printf '\nALL GATES PASS\n'; \
 	else printf '\nGATES FAILED:%s\n' "$$failed"; fi; \
 	exit $$rc
@@ -2549,9 +2576,13 @@ gates: tests/gates_runner pulsar-eval tests/qwen_chat_gate tests/inkling_chat_ga
 # classified by the lane it belongs to and mapped to a sub-gate list below; the
 # runner runs them in ONE process (--only=), so the tier pays a single engine
 # open.  The mapping is deliberately NARROW: the expensive general gates
-# (chunk-neutrality, prefill, spec-sampling, accounting, rewind) stay in
-# `make gates` only, and the always-on block -- seam-check, the reap-router
-# audit, and the host-only pulsar_test switches -- is cheap and lane-independent.
+# (prefill, spec-sampling, accounting, rewind) stay in `make gates` only, and the
+# always-on block -- seam-check, the reap-router audit, and the host-only
+# pulsar_test switches -- is cheap and lane-independent.  L317: the runner's DEV
+# entries are this tier's -- the exhaustive chunk-neutrality sweep on the prefill /
+# chunk / kv_state / checkpoint / session / segment-store paths, and the probes'
+# deeper depths on attention and kernel-dispatch paths (the battery runs one
+# depth of each and a seeded sample of the chunk schedules).
 # GATES_DEV_ONLY="a b" overrides the selection outright (the runner refuses an
 # unknown name and FAILS on an empty selection).
 #
@@ -2564,9 +2595,12 @@ GATES_DEV_UNIT ?= --ctxmem --spec-math --lib-utf8 --lib-think --verify-pick --fu
 GATES_DEV_UNIT_SERVER ?= --server --api-sampling-flags --api-min-p-range --api-logprobs-parse --api-count-tokens
 # attention kernels: their own oracle (cuda-attn-gates) + the fused mixed step,
 # which is where an attention/compressor row change shows up as a logits delta.
-GATES_DEV_ATTN   = cuda-mixed-prefill-gate cuda-row-neutrality-gate-deep cuda-vision-chunk-gate
+# L317: the row-neutrality probe's depths (-deep ~2.2k, -deeper ~10k tokens) and algo-stability's -deep are gates-dev
+# entries of the runner (the battery runs one depth of each): attention and kernel-dispatch paths run them.
+GATES_DEV_ATTN   = cuda-mixed-prefill-gate cuda-row-neutrality-gate-deep cuda-row-neutrality-gate-deeper cuda-vision-chunk-gate
 # kernel dispatch: row-kind/batch-composition neutrality and the width sweep.
-GATES_DEV_CUDA   = cuda-mixed-neutrality-gate cuda-algo-stability-gate cuda-mixed-prefill-gate cuda-row-neutrality-gate-deep
+GATES_DEV_CUDA   = cuda-mixed-neutrality-gate cuda-algo-stability-gate cuda-algo-stability-gate-deep cuda-mixed-prefill-gate \
+                   cuda-row-neutrality-gate-deep cuda-row-neutrality-gate-deeper
 # engine lanes: the batched driver, the spec lane, the bank pool.
 GATES_DEV_ENGINE = cuda-multiseq-gate cuda-bank-spec-gate cuda-dspark-batch-gate cuda-evict-restore-gate cuda-session-payload-gate
 GATES_DEV_SERVER = cuda-seam-gate cuda-session-payload-gate
@@ -2586,7 +2620,7 @@ gates-dev:
 	fi; \
 	$(MAKE) -j$(GATE_JOBS) --no-print-directory tests/gates_runner pulsar_test CUDA_ARCH=sm_120f || exit 1; \
 	$(MAKE) --no-print-directory gates-preflight || exit 1; \
-	paths='$(PATHS)'; why=''; attn=0; server=0; vision=0; exl3=0; family=0; gdn=0; router=0; blocks=0; bf16=0; minp=0; drafter=0; poison=0; mtp=0; resume=0; \
+	paths='$(PATHS)'; why=''; attn=0; server=0; vision=0; exl3=0; family=0; gdn=0; router=0; blocks=0; bf16=0; minp=0; drafter=0; poison=0; mtp=0; resume=0; chunk=0; \
 	if [ -z "$$paths" ]; then \
 	  paths=$$( { git diff --name-only HEAD; git ls-files --others --exclude-standard; } 2>/dev/null \
 	            | grep -E '\.(c|cc|cpp|cu|cuh|h|hpp)$$' | sort -u ); \
@@ -2620,6 +2654,7 @@ gates-dev:
 	      case "$$p" in *mtp*|src/engine/family_qwen.cpp|src/engine/family_qwen.h|src/engine/step_driver*|src/families/nemotron_h/nemotron_h_family.cpp|src/families/nemotron_h/nemotron_h.h) mtp=1 ;; esac; \
 	      case "$$p" in src/server/server_jobs.cpp|src/server/server_sched.cpp|src/server/kv_cache.cpp|src/lib/pulsar_kvchain*|src/lib/pulsar_segstore*) resume=1 ;; esac; \
 	      case "$$p" in src/cuda/pulsar_cuda_runtime.cu|src/cuda/*scratch*|src/engine/gpu_graph_*|src/engine/gpu_decode.cpp|src/engine/step_driver*|src/engine/spec_block*|src/engine/verify_curve.cpp|*scratch_poison*) poison=1 ;; esac; \
+	      case "$$p" in src/engine/gpu_prefill*|src/engine/prefill_loop*|src/engine/kv_state*|src/engine/checkpoint*|src/engine/sync_driver*|src/engine/session*|src/lib/pulsar_segstore*|*chunk*) chunk=1 ;; esac; \
 	      case $$cls in \
 	        attn) for g in $(GATES_DEV_ATTN); do add $$g; done ;; \
 	        cuda) for g in $(GATES_DEV_CUDA); do add $$g; done ;; \
@@ -2632,7 +2667,8 @@ gates-dev:
 	        *) for g in $(GATES_DEV_DEFAULT); do add $$g; done ;; \
 	      esac; \
 	    done; \
-	    if [ $$family -eq 1 ]; then add session-contract-gate; add cuda-row-neutrality-gate; fi; \
+	    if [ $$family -eq 1 ]; then add session-contract-gate; add cuda-row-neutrality-gate; add bank-adopt-gate; fi; \
+	    if [ $$chunk -eq 1 ]; then add cuda-chunk-neutrality-gate-full; fi; \
 	  fi; \
 	  sel=$$(echo $$sel); \
 	fi; \
@@ -2711,7 +2747,7 @@ gates-dev:
 	fi; \
 	if [ -n "$$sel" ]; then \
 	  hosted=''; if [ $$family -eq 1 ]; then hosted='$(RUNNER_HOSTED_ARGS)'; fi; \
-	  ./tests/gates_runner "$(FRONTIER_MODEL)" --prefill-baseline $(PREFILL_BASELINE) \
+	  PULSAR_GATE_CHUNK_SEED=$(GATE_BUILD_REF) ./tests/gates_runner "$(FRONTIER_MODEL)" --prefill-baseline $(PREFILL_BASELINE) \
 	      --prefill-ref $(PREFILL_BASELINE_REF_SHORT) \
 	      --decode-baseline $(PREFILL_DECODE_BASELINE) --decode-ref $(PREFILL_DECODE_BASELINE_REF_SHORT) \
 	      $$hosted --only=$$(echo $$sel | tr ' ' ',') || rc=1; \
@@ -3138,6 +3174,57 @@ tests/mutant/family_qwen_s4_l307.o: tests/mutant/family_qwen_s4_l307.cpp src/eng
 tests/scratch_poison_gate_mutant: tests/scratch_poison_gate.o tests/mutant/family_qwen_s4_l307.o \
                                   $(filter-out src/engine/family_qwen_s4.o,$(CORE_OBJS))
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
+# L317: the battery's moved legs, bitten.  tests/gates_runner linked against ONE mutated TU (tests/runner_mutants.py
+# writes the copy and refuses unless its site appears once) and run with the selection that must catch it -- PASS of
+# `make battery-mutants` = every mutant's target gate FAILED.  $(1) the mutant, $(2) the TU without its extension,
+# $(3) the extension.
+define RUNNER_MUTANT_RULES
+tests/mutant/runner_$(1).$(3): $(2).$(3) tests/runner_mutants.py
+	@mkdir -p tests/mutant
+	python3 tests/runner_mutants.py $(1) $$< $$@
+tests/mutant/runner_$(1).o: tests/mutant/runner_$(1).$(3) $$(CUDA_FLAG_STAMP)
+	$(if $(filter cu,$(3)),$$(NVCC) $$(NVCCFLAGS) $$(MMQ_CPPFLAGS) -Isrc -Isrc/cuda -c -o $$@ $$<,$$(CXX) $$(CXXFLAGS) $$(PULSAR_INC) -Isrc/engine -c -o $$@ $$<)
+tests/gates_runner_mutant_$(1): tests/gates_runner.o $$(RUNNER_OBJS) src/lib/pulsar_help.o src/lib/pulsar_segstore.o \
+                               tests/mutant/runner_$(1).o $$(filter-out $(2).o,$$(CORE_OBJS))
+	$$(NVCC) $$(NVCCFLAGS) -o $$@ $$^ $$(CUDA_LDLIBS)
+endef
+$(eval $(call RUNNER_MUTANT_RULES,chunk-resume,src/engine/sync_driver,cpp))
+$(eval $(call RUNNER_MUTANT_RULES,row-sort,src/cuda/pulsar_cuda_attention,cu))
+$(eval $(call RUNNER_MUTANT_RULES,row-sort-wide,src/cuda/pulsar_cuda_attention,cu))
+$(eval $(call RUNNER_MUTANT_RULES,adopt-rows,src/engine/checkpoint,cpp))
+$(eval $(call RUNNER_MUTANT_RULES,spec-emit,src/engine/session_spec,cpp))
+# ... and the L307 scratch-poison mutant in the runner: scratch-poison-gate on the hosted Qwen
+tests/gates_runner_mutant_scratch-poison: tests/gates_runner.o $(RUNNER_OBJS) src/lib/pulsar_help.o src/lib/pulsar_segstore.o \
+                                          tests/mutant/family_qwen_s4_l307.o $(filter-out src/engine/family_qwen_s4.o,$(CORE_OBJS))
+	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
+# mutant -> the sub-gate (the moved leg) whose FAIL is the catch; the runner selection is runner_mutants.py's
+BATTERY_MUTANTS = chunk-resume:cuda-chunk-neutrality-gate row-sort:cuda-row-neutrality-gate-deep \
+                  row-sort:cuda-row-neutrality-gate-deeper row-sort-wide:cuda-algo-stability-gate-deep \
+                  adopt-rows:bank-adopt-gate spec-emit:block-spec-gate scratch-poison:scratch-poison-gate
+BATTERY_MUTANT_NAMES = $(sort $(foreach m,$(BATTERY_MUTANTS),$(firstword $(subst :, ,$(m)))))
+BATTERY_MUTANTS_WORK ?= $(CURDIR)/.build/battery-mutants
+.PHONY: battery-mutants
+battery-mutants: $(BATTERY_MUTANT_NAMES:%=tests/gates_runner_mutant_%)
+	@mkdir -p $(BATTERY_MUTANTS_WORK); rc=0; \
+	for m in $(BATTERY_MUTANT_NAMES); do \
+	  if [ "$$m" = scratch-poison ]; then sel=--only=scratch-poison-gate; \
+	  else sel=$$(python3 tests/runner_mutants.py --list | awk -F'\t' -v m=$$m '$$1 == m {print $$3}'); fi; \
+	  log=$(BATTERY_MUTANTS_WORK)/$$m.log; \
+	  printf '\n\033[1m=== mutant %s: tests/gates_runner_mutant_%s %s ===\033[0m\n' "$$m" "$$m" "$$sel"; \
+	  sync; sudo -n sh -c "echo 3 > /proc/sys/vm/drop_caches" 2>/dev/null; \
+	  PULSAR_GATE_CHUNK_SEED=$(GATE_BUILD_REF) ./tests/gates_runner_mutant_$$m $(FRONTIER_MODEL) \
+	      --prefill-baseline $(PREFILL_BASELINE) --prefill-ref $(PREFILL_BASELINE_REF_SHORT) \
+	      --decode-baseline $(PREFILL_DECODE_BASELINE) --decode-ref $(PREFILL_DECODE_BASELINE_REF_SHORT) \
+	      $(RUNNER_HOSTED_ARGS) $$sel > $$log 2>&1; \
+	  echo "  runner rc=$$? (log $$log)"; \
+	  grep -E '^--- .*(PASS|FAIL)|^  SKIP ' $$log | sed 's/^/  /'; \
+	done; \
+	printf '\n===================== BATTERY MUTANTS =====================\n'; \
+	for mg in $(BATTERY_MUTANTS); do m=$${mg%%:*}; g=$${mg#*:}; log=$(BATTERY_MUTANTS_WORK)/$$m.log; \
+	  if grep -qE "^--- $$g( \[[^]]*\])?: FAIL" $$log; then \
+	    printf '  CAUGHT      %-15s by %s: %s\n' "$$m" "$$g" "$$(grep -E "^--- $$g( \[[^]]*\])?: FAIL" $$log | sed 's/^--- //; s/:.*//' | tr '\n' ' ')"; \
+	  else printf '  NOT CAUGHT  %-15s by %s -- the moved leg has no teeth for it (see %s)\n' "$$m" "$$g" "$$log"; rc=1; fi; \
+	done; exit $$rc
 tests/sync_budget_gate.o: tests/sync_budget_gate.cpp tests/gate_entry.h tests/gate_util.h src/pulsar.h src/pulsar_gpu.h
 	$(CXX) $(CXXFLAGS) -Isrc -Isrc/engine -c -o $@ $<
 tests/sync_budget_gate: tests/sync_budget_gate.o $(CORE_OBJS)
@@ -3434,7 +3521,7 @@ test: pulsar_test seam-check
 clean:
 	rm -rf .build
 	rm -rf tests/runner
-	rm -f tests/gates_runner pulsar pulsar-server pulsar-bench pulsar-eval pulsar-agent pulsar_test pulsar_agent_test src/engine/*.o src/families/*/*.o src/families/*/*.d src/tp/*.o src/agent/*.o src/server/*.o src/cuda/*.o src/cuda/mmq/*.o src/cuda/mmq/test/*.o src/cli/*.o src/lib/*.o src/vendor/*.o $(XGRAMMAR_OBJS) $(XGRAMMAR_OBJS:.o=.d) tests/*.o src/engine/*.d src/agent/*.d src/server/*.d src/cuda/*.d src/cuda/mmq/*.d src/cuda/mmq/test/*.d src/cli/*.d src/lib/*.d src/vendor/*.d tests/*.d tests/vision_visible_gate tests/vision_hc_gate tests/vision_image_gate tests/vision_placeholder_gate tests/vision_image_sync_gate tests/vision_chunk_gate tests/cuda_long_context_smoke tests/moe_route_bounds_gate tests/expert_table_gate tests/multiseq_frontier_gate tests/multiseq_decode_gate tests/prefill_bitexact_gate tests/bank_spec_gate tests/spec_sampling_gate tests/spec_sampling_gate_wide tests/accounting_gate tests/bank_evict_restore_gate tests/session_payload_gate tests/algo_stability_gate tests/mixed_prefill_gate tests/mixed_zero_prefill_gate tests/fused_step_gate tests/head_graph_replay_gate tests/draft_refusal_gate tests/scratch_poison_gate tests/scratch_poison_gate_mutant tests/mutant/family_qwen_s4_l307.cpp tests/mutant/family_qwen_s4_l307.o tests/mutant/family_qwen_s4_l307.d tests/decode_reference_gate tests/verify_width_probe tests/mixed_neutrality_gate tests/comp_state_gate tests/spec_teacher_forced_probe tests/attn_f16_kernel_test tests/attn_f16_banked_test tests/kv_rows_pack_gate tests/kv_rows_pack_gate_fastmath tests/sampler_device_gate tests/dspark_batch_gate tests/nt_crossover_sweep tests/vision_router_gate tests/router_gate tests/bf16_rows_gate tests/nvfp4_rows_gate tests/lilicorr_head_gate tests/qwen_family_gate tests/inkling_family_gate tests/nemotron_family_gate tests/nemotron_fwd_gate tests/rowops_gate tests/state_kinds_gate tests/payload_frontier_gate tests/prompt_end_gate tests/bank_adopt_gate tests/bank_residency_gate
+	rm -f tests/gates_runner pulsar pulsar-server pulsar-bench pulsar-eval pulsar-agent pulsar_test pulsar_agent_test src/engine/*.o src/families/*/*.o src/families/*/*.d src/tp/*.o src/agent/*.o src/server/*.o src/cuda/*.o src/cuda/mmq/*.o src/cuda/mmq/test/*.o src/cli/*.o src/lib/*.o src/vendor/*.o $(XGRAMMAR_OBJS) $(XGRAMMAR_OBJS:.o=.d) tests/*.o src/engine/*.d src/agent/*.d src/server/*.d src/cuda/*.d src/cuda/mmq/*.d src/cuda/mmq/test/*.d src/cli/*.d src/lib/*.d src/vendor/*.d tests/*.d tests/vision_visible_gate tests/vision_hc_gate tests/vision_image_gate tests/vision_placeholder_gate tests/vision_image_sync_gate tests/vision_chunk_gate tests/cuda_long_context_smoke tests/moe_route_bounds_gate tests/expert_table_gate tests/multiseq_frontier_gate tests/multiseq_decode_gate tests/prefill_bitexact_gate tests/bank_spec_gate tests/spec_sampling_gate tests/spec_sampling_gate_wide tests/accounting_gate tests/bank_evict_restore_gate tests/session_payload_gate tests/algo_stability_gate tests/mixed_prefill_gate tests/mixed_zero_prefill_gate tests/fused_step_gate tests/head_graph_replay_gate tests/draft_refusal_gate tests/scratch_poison_gate tests/scratch_poison_gate_mutant tests/gates_runner_mutant_* tests/mutant/family_qwen_s4_l307.cpp tests/mutant/family_qwen_s4_l307.o tests/mutant/family_qwen_s4_l307.d tests/decode_reference_gate tests/verify_width_probe tests/mixed_neutrality_gate tests/comp_state_gate tests/spec_teacher_forced_probe tests/attn_f16_kernel_test tests/attn_f16_banked_test tests/kv_rows_pack_gate tests/kv_rows_pack_gate_fastmath tests/sampler_device_gate tests/dspark_batch_gate tests/nt_crossover_sweep tests/vision_router_gate tests/router_gate tests/bf16_rows_gate tests/nvfp4_rows_gate tests/lilicorr_head_gate tests/qwen_family_gate tests/inkling_family_gate tests/nemotron_family_gate tests/nemotron_fwd_gate tests/rowops_gate tests/state_kinds_gate tests/payload_frontier_gate tests/prompt_end_gate tests/bank_adopt_gate tests/bank_residency_gate
 
 # Pull in the generated header dependencies.  `-include` (not `include`) so a
 # tree with no .d files yet -- a fresh clone, or right after `make clean` -- is

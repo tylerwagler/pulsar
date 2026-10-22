@@ -206,6 +206,7 @@ tests/sse-golden/out.txt
 /tests/scratch_poison_gate
 /tests/scratch_poison_gate_mutant
 /tests/mutant/
+/tests/gates_runner_mutant_*
 /tests/prefill_chunk_census_probe
 /tests/vision_merge_gate
 /tests/vision_tower_gate

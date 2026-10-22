@@ -1,0 +1,88 @@
+#!/usr/bin/env python3
+"""runner_mutants.py -- L317: the mutants that show the battery's moved legs still bite (make battery-mutants).
+
+    python3 tests/runner_mutants.py NAME SRC DST    write SRC with mutant NAME applied to DST
+    python3 tests/runner_mutants.py --list          NAME<TAB>source<TAB>the runner selection that must catch it
+
+Each mutant is one small defect in one engine TU, a class the leg it targets exists to catch; tests/gates_runner is
+linked against the mutated copy (tests/gates_runner_mutant_NAME) and run with the selection named here, which must
+FAIL.  The script refuses unless the mutation site appears exactly once, so a mutant that stopped matching the code it
+mutates says so instead of building the unmutated TU.  Never linked into a served binary.
+
+  chunk-resume  src/engine/sync_driver.cpp: a resume (a sync that starts past 0) prefills its first token as another
+                id -- every resumed schedule of cuda-chunk-neutrality-gate's SAMPLE differs from cold A
+  row-sort      src/cuda/pulsar_cuda_attention.cu: the indexed attention sorts the top-k ids only when n_tokens > 1
+                (L170's original 1-row-vs-N-row split) -- the gates-dev depths cuda-row-neutrality-gate-deep / -deeper,
+                where the selection is engaged
+  row-sort-wide the same file: the sort is skipped only for calls of 4 rows or more, so the fold order changes
+                between batched widths (M=2 sorted, M>=4 not) -- cuda-algo-stability-gate-deep, whose bank 0 sits past
+                the selection threshold (the short sweep never reaches the indexed lane, and M=1 vs M=2 is
+                informational there, which is why row-sort cannot bite it)
+  adopt-rows    src/engine/checkpoint.cpp: a bank adoption copies one pool row too few -- bank-adopt-gate on every
+                hosted model
+  spec-emit     src/engine/session_spec.cpp: a round that commits two or more drafts emits the first one twice (the
+                state committed is right; the stream is not) -- block-spec-gate on Qwen's DFlash2 and Nemotron's
+                LiLiCorr
+The L307 scratch-poison mutant (tests/scratch_poison_mutant.py, family_qwen_s4.cpp) is the sixth: linked into the
+runner it runs scratch-poison-gate on the hosted Qwen."""
+import sys
+
+MUTANTS = {
+    "chunk-resume": (
+        "src/engine/sync_driver.cpp",
+        "--only=cuda-chunk-neutrality-gate",
+        "    const int rc = ops->prefill(s, prompt, start);\n",
+        "    /* L317 MUTANT: a resume prefills its first token as another id */\n"
+        "    const int l317_t = start > 0u && (int)start < prompt->len ? prompt->v[start] : -1;\n"
+        "    if (l317_t >= 0) prompt->v[start] = l317_t == 1000 ? 1001 : 1000;\n"
+        "    const int rc = ops->prefill(s, prompt, start);\n"
+        "    if (l317_t >= 0) prompt->v[start] = l317_t;\n"),
+    "row-sort": (
+        "src/cuda/pulsar_cuda_attention.cu",
+        "--only=cuda-row-neutrality-gate,cuda-row-neutrality-gate-deep,cuda-row-neutrality-gate-deeper",
+        "    if (top_k == 512u) {\n        const uint64_t sort_bytes",
+        "    if (top_k == 512u && n_tokens > 1u) {   /* L317 MUTANT: L170's 1-row unsorted fold */\n"
+        "        const uint64_t sort_bytes"),
+    "row-sort-wide": (
+        "src/cuda/pulsar_cuda_attention.cu",
+        "--only=cuda-algo-stability-gate,cuda-algo-stability-gate-deep",
+        "    if (top_k == 512u) {\n        const uint64_t sort_bytes",
+        "    if (top_k == 512u && n_tokens < 4u) {   /* L317 MUTANT: unsorted fold from 4 rows up */\n"
+        "        const uint64_t sort_bytes"),
+    "adopt-rows": (
+        "src/engine/checkpoint.cpp",
+        "--only=bank-adopt-gate",
+        "        ok = pulsar_gpu_tensor_copy_async(dp[i].rows, 0, sp[i].rows, 0, rows * sp[i].row_bytes) != 0;\n",
+        "        ok = pulsar_gpu_tensor_copy_async(dp[i].rows, 0, sp[i].rows, 0,   /* L317 MUTANT: one row too few */\n"
+        "                                          (rows - 1u) * sp[i].row_bytes) != 0;\n"),
+    "spec-emit": (
+        "src/engine/session_spec.cpp",
+        "--only=block-spec-gate",
+        "        accepted[n_accept++] = (int)pend[i];\n",
+        "        accepted[n_accept++] = i == 1 ? (int)pend[0] : (int)pend[i];   /* L317 MUTANT: the first draft twice */\n"),
+}
+
+
+def main():
+    if len(sys.argv) == 2 and sys.argv[1] == "--list":
+        for name, (src, sel, _, _) in MUTANTS.items():
+            print("%s\t%s\t%s" % (name, src, sel))
+        return 0
+    if len(sys.argv) != 4 or sys.argv[1] not in MUTANTS:
+        sys.exit(__doc__)
+    name, src_path, dst = sys.argv[1:]
+    src_want, _, site, mutant = MUTANTS[name]
+    if not src_path.endswith(src_want):
+        sys.exit("runner_mutants: %s mutates %s, not %s" % (name, src_want, src_path))
+    src = open(src_path).read()
+    n = src.count(site)
+    if n != 1:
+        sys.exit("runner_mutants: %s: the mutation site appears %d times in %s (want 1) -- update the mutant with the "
+                 "code it mutates" % (name, n, src_path))
+    open(dst, "w").write("/* GENERATED by tests/runner_mutants.py -- the L317 mutant %s; never linked into a served "
+                         "binary */\n" % name + src.replace(site, mutant))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
