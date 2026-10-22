@@ -13,7 +13,11 @@ message and adds a "Describe your most recent action in 3-5 words" user message 
 answered (Claude Code's agent summary) -- its TTFT and recompute are reported apart.
 
 REUSE == COLD (must-pass): the last main request is sent again to a FRESH server (an empty disk tier, cold banks)
-and its greedy reply must equal the warm one byte for byte; with --side the last side request too.
+and its greedy reply must equal the warm one byte for byte; with --side the last side request too.  The client keeps
+the replies' thinking blocks in its history (an Anthropic client echoes them inside a tool loop): the warm bank's
+live continuation holds the reasoning it generated, so a history without it is another conversation to a fresh
+server (L316: 10587 vs 10093 tokens, the in-loop check failing on every pack).  Each graded pair must also be one
+prompt (the same prompt token count), so a check cannot pass or fail on two different conversations.
 
 The server runs with its own disk-KV dir under DIR (never /tmp), PULSAR_MSEQ_BANKS=4.  Prints one TSV line a request
 (tag, kind, turn, prompt, cached, recomputed, ttft_s, e2e_s) and a summary; exit 0 only when reuse == cold held."""
@@ -111,11 +115,19 @@ def post(body):
                 parts[-1] += dl["partial_json"]
             elif dl.get("type") == "thinking_delta":
                 blocks[-1]["thinking"] = blocks[-1].get("thinking", "") + dl["thinking"]
+            elif dl.get("type") == "signature_delta":
+                blocks[-1]["signature"] = blocks[-1].get("signature", "") + dl["signature"]
         elif ty == "content_block_stop":
             if blocks and blocks[-1].get("type") == "tool_use":
                 blocks[-1]["input"] = json.loads(parts[-1]) if parts[-1] else {}
-    msg["content"] = [b for b in blocks if b.get("type") != "thinking"]
+    # L316: the thinking blocks stay in the reply and so in the client's history, as an Anthropic client echoes them
+    # inside a tool loop.  Dropping them made the fresh server render a different conversation (an empty think block
+    # where the warm bank's live continuation holds the reasoning it generated): 10093 vs 10587 prompt tokens.
+    msg["content"] = blocks
     msg["ttft_s"] = ttft if ttft is not None else time.time() - t
+    u = msg.get("usage", {})
+    msg["prompt_tokens"] = (u.get("input_tokens", 0) + u.get("cache_read_input_tokens", 0) +
+                            u.get("cache_creation_input_tokens", 0))
     return msg, time.time() - t
 
 
@@ -138,9 +150,8 @@ rows = []
 
 def measure(srv, kind, turn, b):
     d, e2e = post(b)
-    u = d.get("usage", {})
-    prompt = u.get("input_tokens", 0) + u.get("cache_read_input_tokens", 0) + u.get("cache_creation_input_tokens", 0)
-    cached = u.get("cache_read_input_tokens", 0)
+    prompt = d["prompt_tokens"]
+    cached = d.get("usage", {}).get("cache_read_input_tokens", 0)
     row = (a.tag, kind, turn, prompt, cached, prompt - cached, d["ttft_s"], e2e)
     rows.append(row)
     print("%s\t%s\t%d\t%d\t%d\t%d\t%.3f\t%.3f" % row, flush=True)
@@ -148,8 +159,10 @@ def measure(srv, kind, turn, b):
 
 
 def reply_text(d):
-    """The reply's content without the server's random tool_use ids (each server names its calls afresh)."""
-    return json.dumps([{k: v for k, v in c.items() if k != "id"} for c in d.get("content", [])], sort_keys=True)
+    """The reply's content, thinking included, without the server's random tool_use ids and thinking signatures (each
+    server names its calls and stamps its thinking blocks with a response id afresh)."""
+    return json.dumps([{k: v for k, v in c.items() if k not in ("id", "signature")} for c in d.get("content", [])],
+                      sort_keys=True)
 
 
 def loop(srv):
@@ -223,6 +236,13 @@ try:
     for what, warm in (("in the loop", None if a.side else last_main[1]), ("re-sent alone", main_again)):
         if warm is None:
             continue
+        # L316: the instrument proves it compared ONE conversation -- the warm request's effective prompt (a live
+        # continuation keeps the bank's tokens) and the fresh server's render are the same length, or the replies
+        # say nothing about reuse
+        same_prompt = warm["prompt_tokens"] == dc["prompt_tokens"]
+        print(("PASS" if same_prompt else "FAIL") + " the last main turn (%s) and the fresh server's are one prompt: "
+              "%d vs %d tokens" % (what, warm["prompt_tokens"], dc["prompt_tokens"]))
+        ok &= same_prompt
         same = reply_text(dc) == reply_text(warm)
         print(("PASS" if same else "FAIL") + " reuse == cold: the last main turn (%s) == a fresh server's" % what)
         if not same:
