@@ -3163,6 +3163,7 @@ tests/gates_runner_mutant_$(1): tests/gates_runner.o $$(RUNNER_OBJS) src/lib/pul
 endef
 $(eval $(call RUNNER_MUTANT_RULES,chunk-resume,src/engine/sync_driver,cpp))
 $(eval $(call RUNNER_MUTANT_RULES,row-sort,src/cuda/pulsar_cuda_attention,cu))
+$(eval $(call RUNNER_MUTANT_RULES,row-sort-wide,src/cuda/pulsar_cuda_attention,cu))
 $(eval $(call RUNNER_MUTANT_RULES,adopt-rows,src/engine/checkpoint,cpp))
 $(eval $(call RUNNER_MUTANT_RULES,spec-emit,src/engine/session_spec,cpp))
 # ... and the L307 scratch-poison mutant in the runner: scratch-poison-gate on the hosted Qwen
@@ -3171,7 +3172,7 @@ tests/gates_runner_mutant_scratch-poison: tests/gates_runner.o $(RUNNER_OBJS) sr
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 # mutant -> the sub-gate (the moved leg) whose FAIL is the catch; the runner selection is runner_mutants.py's
 BATTERY_MUTANTS = chunk-resume:cuda-chunk-neutrality-gate row-sort:cuda-row-neutrality-gate-deep \
-                  row-sort:cuda-row-neutrality-gate-deeper row-sort:cuda-algo-stability-gate-deep \
+                  row-sort:cuda-row-neutrality-gate-deeper row-sort-wide:cuda-algo-stability-gate-deep \
                   adopt-rows:bank-adopt-gate spec-emit:block-spec-gate scratch-poison:scratch-poison-gate
 BATTERY_MUTANT_NAMES = $(sort $(foreach m,$(BATTERY_MUTANTS),$(firstword $(subst :, ,$(m)))))
 BATTERY_MUTANTS_WORK ?= $(CURDIR)/.build/battery-mutants

@@ -12,14 +12,18 @@ mutates says so instead of building the unmutated TU.  Never linked into a serve
   chunk-resume  src/engine/sync_driver.cpp: a resume (a sync that starts past 0) prefills its first token as another
                 id -- every resumed schedule of cuda-chunk-neutrality-gate's SAMPLE differs from cold A
   row-sort      src/cuda/pulsar_cuda_attention.cu: the indexed attention sorts the top-k ids only when n_tokens > 1
-                (L170's original 1-row-vs-N-row split) -- the gates-dev depths cuda-row-neutrality-gate-deep / -deeper
-                and cuda-algo-stability-gate-deep, where the selection is engaged
+                (L170's original 1-row-vs-N-row split) -- the gates-dev depths cuda-row-neutrality-gate-deep / -deeper,
+                where the selection is engaged
+  row-sort-wide the same file: the sort is skipped only for calls of 4 rows or more, so the fold order changes
+                between batched widths (M=2 sorted, M>=4 not) -- cuda-algo-stability-gate-deep, whose bank 0 sits past
+                the selection threshold (the short sweep never reaches the indexed lane, and M=1 vs M=2 is
+                informational there, which is why row-sort cannot bite it)
   adopt-rows    src/engine/checkpoint.cpp: a bank adoption copies one pool row too few -- bank-adopt-gate on every
                 hosted model
   spec-emit     src/engine/session_spec.cpp: a round that commits two or more drafts emits the first one twice (the
                 state committed is right; the stream is not) -- block-spec-gate on Qwen's DFlash2 and Nemotron's
                 LiLiCorr
-The L307 scratch-poison mutant (tests/scratch_poison_mutant.py, family_qwen_s4.cpp) is the fifth: linked into the
+The L307 scratch-poison mutant (tests/scratch_poison_mutant.py, family_qwen_s4.cpp) is the sixth: linked into the
 runner it runs scratch-poison-gate on the hosted Qwen."""
 import sys
 
@@ -35,10 +39,15 @@ MUTANTS = {
         "    if (l317_t >= 0) prompt->v[start] = l317_t;\n"),
     "row-sort": (
         "src/cuda/pulsar_cuda_attention.cu",
-        "--only=cuda-row-neutrality-gate,cuda-row-neutrality-gate-deep,cuda-row-neutrality-gate-deeper,"
-        "cuda-algo-stability-gate,cuda-algo-stability-gate-deep",
+        "--only=cuda-row-neutrality-gate,cuda-row-neutrality-gate-deep,cuda-row-neutrality-gate-deeper",
         "    if (top_k == 512u) {\n        const uint64_t sort_bytes",
         "    if (top_k == 512u && n_tokens > 1u) {   /* L317 MUTANT: L170's 1-row unsorted fold */\n"
+        "        const uint64_t sort_bytes"),
+    "row-sort-wide": (
+        "src/cuda/pulsar_cuda_attention.cu",
+        "--only=cuda-algo-stability-gate,cuda-algo-stability-gate-deep",
+        "    if (top_k == 512u) {\n        const uint64_t sort_bytes",
+        "    if (top_k == 512u && n_tokens < 4u) {   /* L317 MUTANT: unsorted fold from 4 rows up */\n"
         "        const uint64_t sort_bytes"),
     "adopt-rows": (
         "src/engine/checkpoint.cpp",
