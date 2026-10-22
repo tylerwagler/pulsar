@@ -1659,8 +1659,9 @@ struct server {
     /** Tier-2 task #55 increment 2b — proactive-eviction guard. `guard_enabled`
      * gates the whole mechanism (on iff overcommit sized N>1 banks and the disk
      * KV cache is open: a spill persists to it, L264). `guard_touched_budget` is the resident-KV ceiling the guard keeps
-     * touched_kv under = kv_budget − eager_reserved (banks may grow to 1M but total
-     * physical is bounded); `guard_eager_bytes` the eager floor already resident.
+     * touched_kv under = min(kv_budget − eager_reserved, the measured post-warmup headroom: L319,
+     * server_guard_touched_budget) (banks may grow to 1M but total physical is bounded); `guard_eager_bytes` the eager
+     * floor already resident.
      * `guard_evictions` counts spills for metrics. */
     bool         guard_enabled;          ///< the proactive-eviction guard is active
     uint64_t     guard_touched_budget;   ///< resident-KV ceiling the guard keeps touched_kv under
@@ -3284,6 +3285,10 @@ bool server_kv_admits(uint64_t kv_budget_bytes,
  * at provisioning time on top of the ledger (defined in cli_main.cpp;
  * unit-tested there). avail == 0 (unreadable /proc/meminfo) fails closed. */
 bool server_mem_floor_admits(uint64_t avail_bytes, uint64_t est_bytes);
+/* L319: the touched-KV ceiling -- min(kv budget − eager, touched + MemAvailable − floor at the post-warmup reading);
+ * 0 when MemAvailable is at or under the floor, or unreadable (defined in cli_main.cpp; unit-tested there). */
+uint64_t server_guard_touched_budget(uint64_t kv_budget_bytes, uint64_t eager_bytes, uint64_t touched_bytes,
+                                     uint64_t avail_bytes);
 
 /* MemAvailable from /proc/meminfo, in bytes (0 on parse failure — callers
  * fail closed).  Never called on a token/layer hot path (defined in

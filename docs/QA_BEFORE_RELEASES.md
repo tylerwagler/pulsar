@@ -159,6 +159,7 @@ own table.  The total is the target (L317: about 50 min with the live legs), not
 | `live-legs [deepseek]` | 600 | constrained, server-live, abandon: warm + hooks instances |
 | `live-legs [qwen]` | 1500 | the stall check, abandon, constrained, server-live, prefix-turns x2, preempt: warm + hooks + fresh |
 | `live-legs [nemotron]` | 240 | opencode-turns: warm + fresh |
+| `server-kv-headroom-live` | 240 | L319: the touched-KV ceiling is the measured headroom; a balloon, the Nemotron mini |
 | `host-only gates (longest)` | 90 | overlap the runner |
 | `suite total` | 3000 | the target: <= ~50 min, the live legs included |
 <!-- /battery-budget -->
