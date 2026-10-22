@@ -2032,6 +2032,18 @@ server-live-gate: pulsar-server
 	  python3 tests/server_abandon_live.py $$m --binary ./pulsar-server || rc=1; \
 	done; exit $$rc
 
+# L316: an agent loop's reuse == cold on the production Qwen pack (tests/prefix_turns_live.py --reply 600: eight
+# Anthropic tool turns with ~150-400-token replies, thinking echoed; the last turn in the loop and re-sent alone ==
+# a fresh server's, byte for byte, on one prompt).  Not in GATE_TARGETS (two server loads); a battery leg beside
+# server-live-gate.  ~4 min.
+PREFIX_TURNS_LIVE_MODEL ?= $(QWEN_GATE_MODEL)
+PREFIX_TURNS_LIVE_WORK ?= $(CURDIR)/.build/prefix-turns-live
+.PHONY: prefix-turns-live-gate
+prefix-turns-live-gate: pulsar-server
+	sync; sudo -n sh -c "echo 3 > /proc/sys/vm/drop_caches" 2>/dev/null; \
+	python3 tests/prefix_turns_live.py $(PREFIX_TURNS_LIVE_MODEL) --binary ./pulsar-server \
+	  --work $(PREFIX_TURNS_LIVE_WORK) --tag gate --reply 600
+
 # L280: a prompt's KV is admitted against the 2b guard's budget before it lands (spill first / wait for a busy bank /
 # 503), never past it into memory pressure.  A real server on a SMALL model (the guard's budget lowered through its
 # test hook to 2.2 conversations), so it fits beside a running production server; ~2 min.  Family-neutral.

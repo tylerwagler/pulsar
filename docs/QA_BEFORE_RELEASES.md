@@ -194,7 +194,10 @@ not hygiene):
 `$(QWEN_GATE_MODEL)`, ~12 min on 2026-10-13) repeat what the runner already runs on the hosted Qwen
 (`session-contract-gate [Qwen4-exp]`, `cuda-chunk-neutrality-gate [Qwen4-exp]`,
 `cuda-spec-sampling-gate [Qwen4-exp]`, the last at the battery's 1,250 trajectories).  Drop them; keep the
-vision, image-smoke and live / abandon server legs, which the runner does not cover.
+vision, image-smoke and live / abandon server legs, which the runner does not cover.  The live legs are
+`constrained-live-gate`, `server-live-gate` and (L316) `prefix-turns-live-gate`: an agent loop's in-loop and
+re-sent turns == a fresh server's on the production Qwen pack, release-blocking (prefix-cache checks are
+must-pass).
 
 ### The GPU queue (gpuq)
 
