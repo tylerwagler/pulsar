@@ -644,9 +644,14 @@ int main(int argc, char **argv) {
      * drafter off), so it runs beside it. */
     /* L317: the battery runs a seeded sample -- one schedule of each boundary class, seeded by the build's sha so
      * successive batteries rotate through every schedule (tests/chunk_neutrality_gate.cpp); the exhaustive sweep is
-     * the gates-dev entry beside it (prefill / chunk / kv_state / checkpoint paths). */
+     * the gates-dev entry beside it (prefill / chunk / kv_state / checkpoint paths).  The seed is read HERE, at the
+     * runner's start, and handed over in argv: the prefill gate scrubs PULSAR_* from the environment before the chunk
+     * gate runs (#440 refused for want of it). */
+    static char chunk_sample[96];
+    const char *chunk_seed = getenv("PULSAR_GATE_CHUNK_SEED");
+    snprintf(chunk_sample, sizeof chunk_sample, "sample=%s", chunk_seed ? chunk_seed : "");
     const gate_spec chunk_neutrality = {"cuda-chunk-neutrality-gate", gate_chunk_neutrality_gate_main, 1, NULL, NULL,
-                                        {"sample", NULL}, NEED_TOKENIZER};
+                                        {chunk_sample, NULL}, NEED_TOKENIZER};
     const gate_spec chunk_neutrality_full = {"cuda-chunk-neutrality-gate-full", gate_chunk_neutrality_gate_main, 1,
                                              NULL, NULL, {NULL}, NEED_TOKENIZER, DEV};
     /* L283: the same for an image block -- its logits do not depend on where its chunk starts.  The chunk-neutrality
@@ -706,7 +711,11 @@ int main(int argc, char **argv) {
     int n_results = 0, rc_all = 0;
     const double suite0 = gate_now_s();
     hosted_model hm;
-    const char *sections = getenv("PULSAR_GATES_SECTIONS");
+    /* copied now: the prefill gate scrubs PULSAR_* from the environment mid-run */
+    static char sections_path[4096];
+    const char *sections_env = getenv("PULSAR_GATES_SECTIONS");
+    if (sections_env) snprintf(sections_path, sizeof sections_path, "%s", sections_env);
+    const char *sections = sections_env ? sections_path : NULL;
     const model_args *ma = NULL;
     /* a table entry runs when the selection takes it and the hosted model's own --gates list (if any) names it */
 #define WANTED(name, dev) (gate_selected((name), (dev)) && (!ma->gates || name_in_list(ma->gates, (name))))

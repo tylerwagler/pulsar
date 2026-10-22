@@ -82,7 +82,7 @@
  * With no argument the gate runs every schedule (the exhaustive sweep: `make cuda-chunk-neutrality-gate`, the runner's
  * gates-dev entry cuda-chunk-neutrality-gate-full).  The sample is announced -- seed, class, schedule -- before it runs.
  *
- *   ./tests/chunk_neutrality_gate MODEL [sample]      (sample: the seed is PULSAR_GATE_CHUNK_SEED, required)
+ *   ./tests/chunk_neutrality_gate MODEL [sample=SEED]   (the runner passes sample=$PULSAR_GATE_CHUNK_SEED, read at its start)
  */
 #include "pulsar.h"
 #include "gate_entry.h"
@@ -334,15 +334,17 @@ static int compare_rows(const char *what, const char *label, const float *ref, c
 
 int GATE_ENTRY(int argc, char **argv) {
     setvbuf(stdout, NULL, _IOLBF, 0);
-    if (argc < 2 || (argc > 2 && strcmp(argv[2], "sample") != 0)) {
-        fprintf(stderr, "usage: %s MODEL [sample]\n", argv[0]);
+    if (argc < 2 || (argc > 2 && strncmp(argv[2], "sample=", 7) != 0)) {
+        fprintf(stderr, "usage: %s MODEL [sample=SEED]\n", argv[0]);
         return 2;
     }
     const bool sample = argc > 2;
-    const char *seed = getenv("PULSAR_GATE_CHUNK_SEED");
-    if (sample && (!seed || !seed[0])) {
-        fprintf(stderr, "CHUNK-NEUTRALITY GATE: `sample` needs PULSAR_GATE_CHUNK_SEED (make gates sets the sha it runs "
-                        "at) -- refusing to pick schedules from nothing\n");
+    /* the seed is an argument, never the environment: in the runner the prefill gate scrubs PULSAR_* before this
+     * gate runs (L317, #440) */
+    const char *seed = sample ? argv[2] + 7 : NULL;
+    if (sample && !seed[0]) {
+        fprintf(stderr, "CHUNK-NEUTRALITY GATE: `sample=` has no seed (make gates passes the sha it runs at as "
+                        "PULSAR_GATE_CHUNK_SEED to the runner) -- refusing to pick schedules from nothing\n");
         return 2;
     }
     pulsar_engine_options opt; memset(&opt, 0, sizeof opt);
@@ -443,7 +445,7 @@ int GATE_ENTRY(int argc, char **argv) {
         bool want[GATE_SCHEDULES], want_x = true;
         for (int k = 0; k < GATE_SCHEDULES; k++) want[k] = true;
         if (sample) {
-            printf("chunk-neutrality gate: SAMPLE, seed '%s' (PULSAR_GATE_CHUNK_SEED): A plus one schedule of each "
+            printf("chunk-neutrality gate: SAMPLE, seed '%s': A plus one schedule of each "
                    "boundary class this family runs\n", seed);
             for (int c = CLS_GRID; c < CLS_COUNT; c++) {
                 int pool[GATE_SCHEDULES + 1], n = 0;   /* GATE_SCHEDULES = X, the disk class's leg outside the table */
