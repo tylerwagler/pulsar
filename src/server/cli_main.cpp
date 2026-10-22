@@ -280,6 +280,23 @@ bool server_mem_floor_admits(uint64_t avail_bytes, uint64_t est_bytes) {
     return avail_bytes >= est_bytes + PULSAR_SERVER_MEM_FLOOR_BYTES;
 }
 
+/* L319: the resident-KV ceiling every touched-KV decision keys on (the decode guard's spills, L280's prompt
+ * verdict, L314's preempt / readmit): the demand-paged KV the box can hold, measured -- what was touched at the
+ * post-warmup reading plus that reading's MemAvailable above the floor -- and never more than the ledger's share
+ * (budget less the eager floor).  Before L319 it was the ledger's share alone, and the ledger's budget is not a
+ * physical number in pooled mode (its startup clamp lifts it to slot 0 + one session estimate): on Nemotron at
+ * --ctx 1M the ceiling was 9.05 GiB against 5.16 GiB of headroom, the guard never spilled, MemAvailable reached
+ * zero, and the GPU stalled on unbacked pages (work, 2026-10-22) or earlyoom killed the server (Sparky).  avail 0
+ * (/proc/meminfo unreadable) is 0: the caller refuses to start rather than run unguarded. */
+uint64_t server_guard_touched_budget(uint64_t kv_budget_bytes, uint64_t eager_bytes, uint64_t touched_bytes,
+                                     uint64_t avail_bytes) {
+    if (avail_bytes <= PULSAR_SERVER_MEM_FLOOR_BYTES) return 0;
+    const uint64_t ledger = kv_budget_bytes > eager_bytes ? kv_budget_bytes - eager_bytes : 0;
+    const uint64_t headroom = avail_bytes - PULSAR_SERVER_MEM_FLOOR_BYTES;
+    const uint64_t physical = touched_bytes > UINT64_MAX - headroom ? UINT64_MAX : touched_bytes + headroom;
+    return ledger < physical ? ledger : physical;
+}
+
 
 
 void server::close_resources() {
@@ -847,6 +864,7 @@ int main(int argc, char **argv) {
      * static budget: the live floor check in provision_slot fails closed on
      * its own read. */
     uint64_t kv_budget_final = kv_budget;
+    uint64_t warm_avail = 0, warm_touched = 0;   /* L319: the touched-KV ceiling's measurement (below) */
     {
         /* What of slot 0 is RESIDENT now, and so already out of MemAvailable:
          * its priced cost less the pool's demand-paged comp/index VA that no
@@ -864,6 +882,8 @@ int main(int argc, char **argv) {
         const uint64_t untouched_va = demand_va > touched_now ? demand_va - touched_now : 0;
         const uint64_t resident_now = session_actual > untouched_va ? session_actual - untouched_va : 0;
         const uint64_t avail_now = server_mem_available_bytes();
+        warm_avail = avail_now;
+        warm_touched = touched_now;
         if (avail_now > 0) {
             const uint64_t headroom =
                 avail_now > PULSAR_SERVER_MEM_FLOOR_BYTES
@@ -1049,16 +1069,30 @@ int main(int argc, char **argv) {
             }
         }
         s.guard_eager_bytes = overcommit_admission_est;   /* eager floor resident */
-        s.guard_touched_budget = budget > s.guard_eager_bytes
-                               ? budget - s.guard_eager_bytes : 0;
+        /* L319: the ceiling is the smaller of the ledger's share and the measured headroom (see
+         * server_guard_touched_budget); a pool with no measured headroom does not start -- unguarded, its banks
+         * would grow until the box runs dry */
+        s.guard_touched_budget = server_guard_touched_budget(budget, s.guard_eager_bytes, warm_touched, warm_avail);
         s.guard_enabled = (s.guard_touched_budget > 0);
+        const double gib = 1024.0 * 1024.0 * 1024.0;
+        if (!s.guard_enabled) {
+            server_log(PULSAR_LOG_ERROR,
+                       "pulsar-server: refusing to start: a %d-bank pool has no touched-KV headroom (MemAvailable "
+                       "%.2f GiB post-warmup, floor %.2f GiB; kv budget %.2f − eager %.2f GiB) -- lower --ctx or "
+                       "PULSAR_MSEQ_BANKS (L319)",
+                       s.pool_banks, (double)warm_avail / gib, (double)PULSAR_SERVER_MEM_FLOOR_BYTES / gib,
+                       (double)budget / gib, (double)s.guard_eager_bytes / gib);
+            pulsar_session_free(session);
+            pulsar_engine_close(engine);
+            return 1;
+        }
         server_log(PULSAR_LOG_DEFAULT,
-                   "pulsar-server: Tier-2 2b guard %s: touched budget %.2f GiB "
-                   "(kv budget %.2f − eager %.2f); spills persist to the disk KV cache",
-                   s.guard_enabled ? "ENABLED" : "DISABLED (no touched headroom)",
-                   (double)s.guard_touched_budget / (1024.0*1024.0*1024.0),
-                   (double)budget / (1024.0*1024.0*1024.0),
-                   (double)s.guard_eager_bytes / (1024.0*1024.0*1024.0));
+                   "pulsar-server: Tier-2 2b guard ENABLED: touched budget %.2f GiB = min(kv budget %.2f − eager "
+                   "%.2f, touched %.2f + MemAvailable %.2f − floor %.2f post-warmup); spills persist to the disk KV "
+                   "cache",
+                   (double)s.guard_touched_budget / gib, (double)budget / gib, (double)s.guard_eager_bytes / gib,
+                   (double)warm_touched / gib, (double)warm_avail / gib,
+                   (double)PULSAR_SERVER_MEM_FLOOR_BYTES / gib);
     }
     s.sess = session;                /* the one session; slot 0 describes it */
     /* ctx_size on slot 0 is the pool's shared per-bank ctx reference and is
