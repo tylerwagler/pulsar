@@ -7122,6 +7122,38 @@ static void test_kv_admission_budget_math(void) {
  * MemAvailable INSIDE that already-subtracted reserve. The old 6 GiB floor
  * double-counted that caution and vetoed sessions the ledger legally
  * admitted. */
+/* L319: the touched-KV ceiling is physical.  The incident's startup (Nemotron 3.5 Super K4 + LiLiCorr, --ctx 1M,
+ * 16 banks, e80e7a66): MemAvailable 9.18 GiB post-warmup, kv budget 40.29 GiB (the clamp's static bound), eager
+ * 31.24 GiB, nothing touched.  The ledger's share alone was 9.05 GiB of touched KV against 5.18 GiB above the floor:
+ * the guard never spilled and the box ran dry (rows/L319.md).  At the ceiling, MemAvailable must still read the
+ * floor: avail − (ceiling − touched) >= floor, whatever the inputs. */
+static void test_guard_touched_budget_is_physical(void) {
+    const uint64_t MiB = 1024ull * 1024ull;
+    const uint64_t GiB = 1024ull * MiB;
+    const uint64_t F = PULSAR_SERVER_MEM_FLOOR_BYTES;
+    const uint64_t avail = 9400ull * MiB, budget = 41257ull * MiB, eager = 31990ull * MiB;   /* 9.18 / 40.29 / 31.24 */
+    const uint64_t c = server_guard_touched_budget(budget, eager, 0, avail);
+    TEST_ASSERT(c == avail - F);                     /* the headroom binds, not the ledger's 9.05 GiB */
+    TEST_ASSERT(c < budget - eager);
+    /* pages the warmup touched are already out of MemAvailable: they count toward the ceiling */
+    TEST_ASSERT(server_guard_touched_budget(budget, eager, 1 * GiB, avail) == avail - F + 1 * GiB);
+    /* a roomy box: the ledger's share binds */
+    TEST_ASSERT(server_guard_touched_budget(budget, eager, 0, 64 * GiB) == budget - eager);
+    /* no headroom, or /proc/meminfo unreadable: 0 (startup refuses rather than run the pool unguarded) */
+    TEST_ASSERT(server_guard_touched_budget(budget, eager, 0, F) == 0);
+    TEST_ASSERT(server_guard_touched_budget(budget, eager, 0, F - 1) == 0);
+    TEST_ASSERT(server_guard_touched_budget(budget, eager, 0, 0) == 0);
+    TEST_ASSERT(server_guard_touched_budget(eager, eager, 0, avail) == 0);
+    TEST_ASSERT(server_guard_touched_budget(UINT64_MAX, 0, UINT64_MAX, avail) == UINT64_MAX);   /* no wrap */
+    /* the invariant over a sweep */
+    for (uint64_t a = F + 1; a < 40 * GiB; a += 777 * MiB)
+        for (uint64_t t = 0; t < 8 * GiB; t += 1531 * MiB)
+            for (uint64_t b = 0; b < 64 * GiB; b += 2999 * MiB) {
+                const uint64_t ceil = server_guard_touched_budget(b, eager / 4, t, a);
+                TEST_ASSERT(ceil <= t || a - (ceil - t) >= F);
+            }
+}
+
 static void test_mem_floor_admits_warmed_box_shape(void) {
     const uint64_t MiB = 1024ull * 1024ull;
     const uint64_t GiB = 1024ull * MiB;
@@ -9762,6 +9794,7 @@ static void pulsar_server_unit_tests_run(void) {
     test_kv_cache_open_unusable_dir_disables();
     test_kv_admission_budget_math();
     test_mem_floor_admits_warmed_box_shape();
+    test_guard_touched_budget_is_physical();
     test_session_eviction_ledger_math();
     test_session_eviction_victim_selection();
     test_slot_route_trivial_match_decision();

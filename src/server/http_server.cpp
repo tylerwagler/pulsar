@@ -856,7 +856,7 @@ bool server::send_metrics(int fd) {
      * carries every bank's eager floor, so budget / kv_bank_bytes overstates
      * the tokens the box holds before the 2b guard spills (6.0 of 13.1 GiB on
      * 16 banks at 1M).  0 when the guard is off (no overcommit). */
-    buf_puts(&b, "# HELP pulsar:kv_touched_budget_bytes Demand-paged KV the eviction guard allows resident before spilling idle banks (ledger budget minus the eager floor; 0 = guard off).\n");
+    buf_puts(&b, "# HELP pulsar:kv_touched_budget_bytes Demand-paged KV the eviction guard allows resident before spilling idle banks (the smaller of the ledger budget minus the eager floor and the measured post-warmup headroom, L319; 0 = guard off).\n");
     buf_puts(&b, "# TYPE pulsar:kv_touched_budget_bytes gauge\n");
     buf_printf(&b, "pulsar:kv_touched_budget_bytes %llu\n",
                s->guard_enabled ? (unsigned long long)s->guard_touched_budget : 0ULL);
