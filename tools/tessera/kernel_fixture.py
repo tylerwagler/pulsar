@@ -4,8 +4,8 @@
 Runs Tessera's OWN fused window kernels (its torch extension, built from Tessera's source by Tessera's loader)
 on Qwen3.8-Flash-Next layer-12 weights, and writes every kernel input plus the output bytes to one fixture
 file.  The gate then runs pulsar's launcher (src/cuda/mmq/pulsar_tessera.cu, the same device code vendored)
-on the same inputs and requires the same bytes.  Value family (BF16 grid, folded arithmetic) only -- the one
-pulsar vendors.
+on the same inputs and requires the same bytes.  Value family (BF16 grid, epilogue row-scale arithmetic) only --
+the one pulsar vendors.
 
     python3 kernel_fixture.py --blobs BLOBS_BF16.pt --act /mnt/models/qwen38fn-act-L12 --out tessera_kernel.fx
 

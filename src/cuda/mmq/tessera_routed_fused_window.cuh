@@ -1,5 +1,5 @@
 // VENDORED from Tessera (https://github.com/RobTand/tessera), src/tessera/serving/csrc/routed_fused_window.cu
-// at upstream 37742e0f (2026-10-08), file sha256 4e93959a2a265dcd560e827fe65bbfe703b25b0e7769aef221bd426b882c802a.
+// at upstream 4897b634 (2026-10-23), file sha256 8a1536dfbc3df70edbdc37001a0db6947e97d9263926bc85a4d4d3ca231eae4f.
 // Made with Tessera by Robert Tand - https://github.com/RobTand/tessera
 // License: MIT + Tessera Attribution Addendum 1.0 (LicenseRef-Tessera-Attribution-1.0); see src/cuda/mmq/VENDOR-TESSERA.md.
 //
@@ -9,9 +9,9 @@
 //   * the three piece-major TORCH_CHECKs in launch call TESSERA_HOST_CHECK(cond, msg), and its run-pair refusal
 //     calls TESSERA_HOST_REFUSE_PAIR(mode, r_lo, two, tile_words, K);
 //   * check_words / check_slot / i32_ptr / f32_ptr / TABLE_DTYPE / check_run_tables (torch::Tensor helpers of the
-//     host entries, upstream 2063-2080 and 2110-2131), the E2M1 family (2132-3048, built only at
-//     TESSERA_ROUTED_FUSED_FP4=1) and the torch host entries + PYBIND module (3051-end) are dropped; pulsar's
-//     launcher (pulsar_tessera.cu) replaces the entries.  dense_reduce_kernel (upstream 2081-2109) is kept verbatim.
+//     host entries, upstream 2061-2078 and 2111-2132), the E2M1 family (2133-3048, built only at
+//     TESSERA_ROUTED_FUSED_FP4=1) and the torch host entries + PYBIND module (3052-end) are dropped; pulsar's
+//     launcher (pulsar_tessera.cu) replaces the entries.  dense_reduce_kernel (upstream 2079-2110) is kept verbatim.
 // The includer defines TESSERA_ROUTED_FUSED_FP8 and the three hooks before including this file, and compiles the
 // translation unit WITHOUT --use_fast_math (upstream builds -O3 -lineinfo; the SwiGLU epilogue calls expf and
 // divides, which fast-math would approximate).
@@ -27,11 +27,11 @@
 // stream (``rate`` bits per row per column: 1..8 on the routed launches, up
 // to RATE_MAX on the dense one -- the run table's
 // one rate or two ADJACENT rates, the pair bracketing the stack's root) ending
-// after row ``n``, looked up in the expert's table.  The BF16 (value) family
-// is FOLDED -- ``bf16(table[state] * row_scale[n])`` before the dot, no
-// epilogue scale -- and the E4M3 family
-// runs the epilogue arithmetic ``(acc * a_scale[row]) * row_scale[n]``, both
-// in the exact fp32 operation order of the legacy kernel.  The E4M3 table
+// after row ``n``, looked up in the expert's table.  The row scale multiplies
+// the fp32 accumulator once per output, after the dot, on both families: the
+// BF16 (value) family ``acc * row_scale[n]``, the E4M3 family
+// ``(acc * a_scale[row]) * row_scale[n]``. The E4M3 operation order stays
+// unchanged. The E4M3 table
 // entry ``native[codes[state]]`` is composed on the host into an f16 table
 // (exact: e4m3 -> f16 is lossless) and the fp8 activation is converted to f16
 // on the way into shared memory (also exact), so the E4M3 stack runs on the
@@ -78,7 +78,7 @@
 // at least STAGES + 1 K chunks per item, which is what keeps an item's
 // descriptor and row-scale slot live until its fixup is done with it.
 // The dense identity is ``tessera::fused_window_dense`` (``serving.native_
-// window``), decoders ``native_fused_window_dense`` / ``..._folded``.
+// window``), decoders ``native_fused_window_dense`` / ``native_fused_window_dense_bf16``.
 //
 // The Python owner is ``tessera.routed_fused``; the contract publishes this
 // file as two ``native_extensions`` entries (one per family, see ``ext``).
@@ -681,8 +681,7 @@ __device__ __forceinline__ void copy_half(int32_t* dst, const int32_t* src, int 
 // A/B shows the array form costs nothing at rates 1..8.
 template <bool FP8, int R>
 __device__ __forceinline__ void decode_rows(const int32_t* Wc, uint32_t prev, int j,
-                                            const TabT* T, const float* ws,
-                                            uint32_t (&packed)[4]) {
+                                            const TabT* T, uint32_t (&packed)[4]) {
     constexpr bool ALIGNED = (8 * R) % 32 == 0;
     constexpr int NZ = 1 + (8 * R + 31) / 32;         // the window's words: 2 (R <= 4) .. 5 (R = 14)
     const int bits0 = 8 * j * R;
@@ -746,11 +745,6 @@ __device__ __forceinline__ void decode_rows(const int32_t* Wc, uint32_t prev, in
             }
         }
         uint32_t t0 = T[s[0]], t1 = T[s[1]];
-        if constexpr (!FP8) {
-            // FOLDED: one bf16 rounding of value * row_scale, before the dot
-            t0 = bf16_bits_rn(__fmul_rn(bf16_bits_to_f32(t0), ws[r]));
-            t1 = bf16_bits_rn(__fmul_rn(bf16_bits_to_f32(t1), ws[r + 1]));
-        }
         if constexpr (FAMILY_MMA8) {
             v8[r] = t0;
             v8[r + 1] = t1;
@@ -770,9 +764,9 @@ __device__ __forceinline__ void decode_rows(const int32_t* Wc, uint32_t prev, in
 template <bool FP8, int RA, int RB>
 __device__ __forceinline__ void decode_two(const int32_t* const (&Wc)[2], const int32_t (&prev)[2], int j,
                                            const TabT* T0, const TabT* T1,
-                                           const float* const (&ws)[2], uint32_t (&packed)[2][4]) {
-    decode_rows<FP8, RA>(Wc[0], (uint32_t)prev[0], j, T0, ws[0], packed[0]);
-    decode_rows<FP8, RB>(Wc[1], (uint32_t)prev[1], j, T1, ws[1], packed[1]);
+                                           uint32_t (&packed)[2][4]) {
+    decode_rows<FP8, RA>(Wc[0], (uint32_t)prev[0], j, T0, packed[0]);
+    decode_rows<FP8, RB>(Wc[1], (uint32_t)prev[1], j, T1, packed[1]);
 }
 
 // MULTI: a merged Linear's roles, one launch.  The roles share K, the run
@@ -1455,14 +1449,12 @@ __global__ void __launch_bounds__(THREADS, 1) routed_fused_kernel(const Params p
                     const int32_t* W = Ws + word_slot(kc) * W_STAGE;
                     uint8_t* B = Bs + stage * B_STAGE_BYTES;
                     const int32_t* Wc[2];
-                    const float* ws[2];
                     int chunk[2];
                     #pragma unroll
                     for (int h = 0; h < 2; ++h) {
                         const int odd_off = ((cm_cur[h].rate & 1) & (t64_h[h] & 1)) << 1;   // see copy_half
                         Wc[h] = W + (h * BK + m) * SW + odd_off;
                         chunk[h] = (MODE == 2) ? (8 * h + j) : (4 * (j >> 1) + 2 * h + (j & 1));
-                        ws[h] = wsc + slot * BN + chunk[h] * 8;
                     }
                     // The chunk's stream history: from its stage (STAGE_PREV;
                     // zero for the row groups ``load_prev`` skips, as the
@@ -1479,18 +1471,18 @@ __global__ void __launch_bounds__(THREADS, 1) routed_fused_kernel(const Params p
                     const TabT* T1 = tab + ((MODE == 2) ? 0 : TABLE_ENTRIES);
                     uint32_t packed[2][4];
                     if constexpr (!TWO) {
-                        decode_two<FP8, RL, RL>(Wc, pv, j, T0, T1, ws, packed);
+                        decode_two<FP8, RL, RL>(Wc, pv, j, T0, T1, packed);
                     } else if constexpr (MODE == 2) {
                         // one column in both halves: one rate
-                        if (cm_cur[0].lo) decode_two<FP8, RL, RL>(Wc, pv, j, T0, T1, ws, packed);
-                        else decode_two<FP8, RH, RH>(Wc, pv, j, T0, T1, ws, packed);
+                        if (cm_cur[0].lo) decode_two<FP8, RL, RL>(Wc, pv, j, T0, T1, packed);
+                        else decode_two<FP8, RH, RH>(Wc, pv, j, T0, T1, packed);
                     } else {
                         // gate and up share the pair, not the column order
                         const bool lo0 = cm_cur[0].lo, lo1 = cm_cur[1].lo;
-                        if (lo0 && lo1) decode_two<FP8, RL, RL>(Wc, pv, j, T0, T1, ws, packed);
-                        else if (!lo0 && !lo1) decode_two<FP8, RH, RH>(Wc, pv, j, T0, T1, ws, packed);
-                        else if (lo0) decode_two<FP8, RL, RH>(Wc, pv, j, T0, T1, ws, packed);
-                        else decode_two<FP8, RH, RL>(Wc, pv, j, T0, T1, ws, packed);
+                        if (lo0 && lo1) decode_two<FP8, RL, RL>(Wc, pv, j, T0, T1, packed);
+                        else if (!lo0 && !lo1) decode_two<FP8, RH, RH>(Wc, pv, j, T0, T1, packed);
+                        else if (lo0) decode_two<FP8, RL, RH>(Wc, pv, j, T0, T1, packed);
+                        else decode_two<FP8, RH, RL>(Wc, pv, j, T0, T1, packed);
                     }
                     #pragma unroll
                     for (int h = 0; h < 2; ++h) {
@@ -1786,6 +1778,10 @@ __global__ void __launch_bounds__(THREADS, 1) routed_fused_kernel(const Params p
                                 if constexpr (FP8) {
                                     g = __fmul_rn(__fmul_rn(g, a_s), wsc[slot * BN + cb + c]);
                                     u = __fmul_rn(__fmul_rn(u, a_s), wsc[slot * BN + cb + 16 + c]);
+                                } else {
+                                    // the row scale on the fp32 accumulator, after the dot
+                                    g = __fmul_rn(g, wsc[slot * BN + cb + c]);
+                                    u = __fmul_rn(u, wsc[slot * BN + cb + 16 + c]);
                                 }
                                 // the bf16 GEMM output, widened for the fp32 activation
                                 float gf = bf16_bits_to_f32(bf16_bits_rn(g));
@@ -1809,6 +1805,7 @@ __global__ void __launch_bounds__(THREADS, 1) routed_fused_kernel(const Params p
                             for (int c = 0; c < SEGW; ++c) {
                                 float y = accv(mi, sg, c, hr);
                                 if constexpr (FP8) y = __fmul_rn(__fmul_rn(y, a_s), wsc[slot * BN + cb + c]);
+                                else y = __fmul_rn(y, wsc[slot * BN + cb + c]);
                                 w[c >> 1] |= (uint32_t)bf16_bits_rn(y) << (16 * (c & 1));
                             }
                             const long col = (long)h * p.inter + n0 + nl;
@@ -1828,6 +1825,7 @@ __global__ void __launch_bounds__(THREADS, 1) routed_fused_kernel(const Params p
                             for (int c = 0; c < SEGW; ++c) {
                                 float y = accv(mi, sg, c, hr);
                                 if constexpr (FP8) y = __fmul_rn(__fmul_rn(y, a_s), wsc[slot * BN + cb + c]);
+                                else y = __fmul_rn(y, wsc[slot * BN + cb + c]);
                                 if (!DENSE && p.mul_weight) y = __fmul_rn(y, rw);
                                 w[c >> 1] |= (uint32_t)bf16_bits_rn(y) << (16 * (c & 1));
                             }
@@ -2068,8 +2066,8 @@ void launch(const Params& p, int grid, cudaStream_t stream) {
 
 // DENSE && SPLIT: out[m, n] = epilogue( sum_{s < S} partial[s, m, n] ), the sum
 // in fixed split order in fp32, then the same operation order as the unsplit
-// epilogue: ``(acc * a_scale[m]) * w_scale[n]`` for the E4M3 family, the bare
-// accumulator for the folded value family, one bf16 rounding.
+// epilogue: ``(acc * a_scale[m]) * w_scale[n]`` for the E4M3 family,
+// ``acc * w_scale[n]`` for the BF16 family, one bf16 rounding.
 template <bool FP8>
 __global__ void dense_reduce_kernel(const float* __restrict__ partial, const float* __restrict__ a_scale,
                                     const float* __restrict__ wscale, uint16_t* __restrict__ out,
@@ -2089,6 +2087,9 @@ __global__ void dense_reduce_kernel(const float* __restrict__ partial, const flo
         const float a_s = a_scale[m];
         #pragma unroll
         for (int i = 0; i < 4; ++i) y[i] = __fmul_rn(__fmul_rn(y[i], a_s), wscale[n + i]);
+    } else {
+        #pragma unroll
+        for (int i = 0; i < 4; ++i) y[i] = __fmul_rn(y[i], wscale[n + i]);
     }
     uint2 o;
     o.x = bf16_bits_rn(y[0]) | ((uint32_t)bf16_bits_rn(y[1]) << 16);

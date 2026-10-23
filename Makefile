@@ -940,7 +940,7 @@ spec-depth-gate: tests/spec_depth_gate
 # layer-12 weights.  The fixtures come from tools/tessera/kernel_fixture.py (needs Tessera + torch), at the
 # vendored revision (VENDOR-TESSERA.md): the 32-expert one (dense qkv/out_proj + routed, 12 cases) and the full
 # 512-expert stack with the capture's own routing (--moe-only --real-routing, 5 cases).  17 of 17 is the bar.
-TESSERA_FIXTURES ?= /mnt/models/tessera-l255/fx-37742e0f/tessera_kernel.fx /mnt/models/tessera-l255/fx-37742e0f/full512.fx
+TESSERA_FIXTURES ?= /mnt/models/tessera-l255/fx-4897b634/tessera_kernel.fx /mnt/models/tessera-l255/fx-4897b634/full512.fx
 .PHONY: tessera-kernel-gate
 tests/tessera_kernel_gate: tests/tessera_kernel_gate.cu src/cuda/mmq/pulsar_tessera.o src/cuda/mmq/pulsar_tessera.h Makefile
 	$(NVCC) $(NVCCFLAGS) -std=c++17 -Isrc -Isrc/cuda/mmq -o $@ tests/tessera_kernel_gate.cu \
