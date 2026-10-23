@@ -4,16 +4,25 @@
 
 `tessera_routed_fused_window.cuh` is Tessera's fused window kernel,
 `src/tessera/serving/csrc/routed_fused_window.cu`, copied from upstream
-**`37742e0f`** (2026-10-08, contract v64; file sha256 `4e93959a2a26…`).
+**`4897b634`** (2026-10-23, contract v66; file sha256 `8a1536dfbc3d…`).
 First vendored from `1381c3b7` (2026-09-29); re-vendored 2026-10-08 -- the upstream
 file grew from 1,520 to 3,778 lines (four families: value, E4M3, E4M3-MMA, E2M1;
 dense rates 9-14; the piece-major E4M3 layout; the paired-K32 schedule), the value
 family's `Params` gained `piece_major`, `fixup`, `tile_sem`, `roles` (all zero here:
 pulsar never requests piece-major and launches no multi-role dense), and `table0/1`
-became `const void*`.  Byte parity with Tessera's own build at this revision:
-**17/17 byte-identical** (sparky, 2026-10-08, fixtures regenerated at 37742e0f; the
-1381c3b7 gate was 17/17 too, and the new fixtures' outputs and planes equal the old
-ones byte for byte -- only the tables' dtype tag moved, int16 -> bf16). Tessera is
+became `const void*`.  Re-vendored again 2026-10-23 (`4897b634`, 3,779 lines): the
+v64->v66 drift lands inside the kept device code -- upstream retired the value
+family's FOLDED row scale (a bf16 rounding of `table[state] * row_scale` before the
+dot) for one fp32 multiply of the accumulator in the epilogue, and
+`dense_reduce_kernel` grew the matching BF16 leg; `Params`, the host entries' field
+assignments, `dense_k_split` and `_routing` did not move, so `pulsar_tessera.cu`
+mirrors nothing new.  Byte parity with Tessera's own build at this revision:
+**17/17 byte-identical** (sparky, 2026-10-23, fixtures regenerated at 4897b634 in
+`/mnt/models/tessera-l255/fx-4897b634/`; the fixture bytes differ from
+`fx-37742e0f` wherever a row scale lands -- the moved epilogue, visible on both
+sides of the gate).  History: 17/17 at 37742e0f on 2026-10-08 (whose outputs were
+byte-equal to the 1381c3b7 fixtures', only three tables' dtype tag having moved,
+int16 -> bf16) and 17/17 at 1381c3b7 on 2026-09-29. Tessera is
 licensed **MIT + Attribution Addendum 1.0** (`LicenseRef-Tessera-Attribution-1.0`);
 the full text is `LICENSE-TESSERA` in this directory, verbatim (addendum A3
 requires it to travel with every copy).
@@ -33,16 +42,16 @@ requires it to travel with every copy).
 Every device function is upstream byte for byte. The header's own banner
 lists the edits; in short:
 
-| upstream (37742e0f) | here |
+| upstream (4897b634) | here |
 | --- | --- |
 | lines 68-72, the torch / c10 / ATen `#include`s | dropped |
 | `C10_CUDA_CHECK` in `max_dynamic_smem_bytes`, `launch_variant`; `C10_CUDA_KERNEL_LAUNCH_CHECK` in `launch_variant` | `TESSERA_HOST_CUDA(expr)`, defined by the includer |
 | the three piece-major `TORCH_CHECK(cond, msg)` in `launch` | `TESSERA_HOST_CHECK(cond, msg)`, defined by the includer |
 | `TORCH_CHECK(false, …)` at the end of `launch` (the run-pair refusal) | `TESSERA_HOST_REFUSE_PAIR(…)`, defined by the includer |
-| lines 2063-2080 and 2110-2131: `check_words`, `check_slot`, `i32_ptr`, `f32_ptr`, `TABLE_DTYPE`, `check_run_tables` (torch::Tensor) | dropped |
-| lines 2081-2109, `dense_reduce_kernel` | kept verbatim |
-| lines 2132-3048, the E2M1 family (`#if TESSERA_ROUTED_FUSED_FP4`, which we build at 0) | dropped |
-| lines 3051-end: the torch host entries and the PYBIND module | dropped; `pulsar_tessera.cu` replaces them |
+| lines 2061-2078 and 2111-2132: `check_words`, `check_slot`, `i32_ptr`, `f32_ptr`, `TABLE_DTYPE`, `check_run_tables` (torch::Tensor) | dropped |
+| lines 2079-2110, `dense_reduce_kernel` | kept verbatim |
+| lines 2133-3048, the E2M1 family (`#if TESSERA_ROUTED_FUSED_FP4`, which we build at 0) | dropped |
+| lines 3052-end: the torch host entries and the PYBIND module | dropped; `pulsar_tessera.cu` replaces them |
 
 `pulsar_tessera.cu` fills `Params` exactly as upstream's `dense_forward` /
 `routed_fused_forward` do, replaces `token_sum`'s host entry, and replaces the
@@ -59,7 +68,8 @@ the SwiGLU epilogue calls `expf` and divides. The Makefile compiles
 `advance_micro` copies a never-loaded next `ColMap`, a dead copy (the next item
 reloads `cm_cur` first).  `pulsar_tessera.cu` wraps the one `#include` in
 `nv_diag_suppress 549` / `nv_diag_default 549` instead of patching the header,
-so the device code stays upstream's byte for byte.  Re-check at each re-sync.
+so the device code stays upstream's byte for byte.  Re-check at each re-sync
+(re-checked 2026-10-23 at `4897b634`: still fires, now upstream :1500).
 
 ## The gate
 
