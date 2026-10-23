@@ -1,4 +1,4 @@
-/* pulsar_tessera.cu -- the host side of Tessera's fused window kernel, value (BF16, folded) family (L255).
+/* pulsar_tessera.cu -- the host side of Tessera's fused window kernel, value (BF16, epilogue-scaled) family (L255).
  *
  * Made with Tessera by Robert Tand - https://github.com/RobTand/tessera
  *
@@ -216,7 +216,7 @@ __global__ void __launch_bounds__(kRouteThreads) route_place_kernel(const int32_
 }
 
 void announce(const char *what, int N, int K, int E, int extra_a, int extra_b) {
-    fprintf(stderr, "pulsar: L255 tessera %s = Tessera fused window kernel (value family, folded bf16), "
+    fprintf(stderr, "pulsar: L255 tessera %s = Tessera fused window kernel (value family, epilogue-scaled bf16), "
                     "N %d K %d E %d (%d, %d)\n", what, N, K, E, extra_a, extra_b);
 }
 
