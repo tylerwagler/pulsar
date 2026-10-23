@@ -83,8 +83,7 @@ def main():
     # ---- dense: one role per Linear, x = the layer's real inputs
     dense_cases = () if a.moe_only else (("qkv", "gdn_in.pt", (1, 8, 64, 4096)), ("oproj", "oproj_in.pt", (1, 8, 4096)))
     for role, act_file, ms in dense_cases:
-        bundle = wg.prepare_window_gemm(unit(blobs[role][0]), block_m=64, block_n=64, block_k=64,
-                                        arithmetic="folded")
+        bundle = wg.prepare_window_gemm(unit(blobs[role][0]), block_m=64, block_n=64, block_k=64)
         why = rf.fused_dense_window_supported(bundle)
         if why is not None:
             raise SystemExit(f"dense {role}: Tessera refuses the fused dense identity: {why}")
