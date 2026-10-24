@@ -3344,6 +3344,10 @@ void pulsar_bank_carry_save_view(pulsar_session *s, uint32_t bank);
 /** Bring `bank`'s saved view back into the host view.  false = nothing valid was saved (the family
  *  decides what a bank with no carry means). */
 bool pulsar_bank_carry_restore_view(pulsar_session *s, uint32_t bank);
+/** L322: the host view of a bank nothing was saved for -- empty and INVALID, so its first sync resets the bank and
+ *  prefills cold (never continues another bank's history: the host view the caller held describes the bank it was
+ *  synced on).  Every family's restore of such a bank installs it. */
+void pulsar_bank_carry_fresh_view(pulsar_session *s);
 /** A bank's committed history: the live view for the live bank, else its carry.  NULL = none. */
 const pulsar_tokens *pulsar_bank_history(pulsar_session *s, uint32_t bank);
 

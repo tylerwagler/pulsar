@@ -191,6 +191,8 @@ int GATE_ENTRY(int argc, char **argv) {
         pulsar_tokens_free(&a);
         pulsar_tokens_free(&b);
         int pre3[N_PRE];
+        /* no invalidate after the install, deliberately: a bank nothing was saved for must come up with the fresh view
+         * on every family (pulsar_bank_carry_fresh_view; on DeepSeek it kept bank 0's view of P until L322, gpuq #446) */
         const bool b3 = k >= 0 && install(s, &live, 3) && pulsar_session_sync(s, &H, err, sizeof err) == 0 &&
                         greedy(s, N_PRE, pre3, err, sizeof err);
         say(b3, "SEAM: bank 3 prefilled P re-spelled at %d (%d tokens for its %d) and decoded %d past it %s", k, H.len,

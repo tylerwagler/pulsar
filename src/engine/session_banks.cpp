@@ -106,6 +106,7 @@ void pulsar_bank_carry_save_view(pulsar_session *s, uint32_t bank) {
 
 static bool ds4_bank_restore(pulsar_session *s, uint32_t bank) {
     if (bank >= gpu_graph_bank_pool_count(s->graph)) return false;
+    const uint32_t held = gpu_graph_cur_bank(s->graph);   /* the bank the host view was synced on */
     /* Point device views (incl. Option F drafter ring) at this bank, and
      * re-arm its frontier counters — this is what makes clearing mseq_dirty
      * cheap and safe (per-bank truth is re-established without a re-prefill). */
@@ -113,12 +114,25 @@ static bool ds4_bank_restore(pulsar_session *s, uint32_t bank) {
         return false;
     gpu_graph_bank_counters_install(s->graph, bank);
     /* No saved host state for a fresh bank: the counters_install above set the
-     * (zeroed) frontier; the session's host shadow stays as the caller primed it
-     * (a fresh sync just ran).  Either way, per-bank frontier truth is now
-     * installed, so the multiseq superset poison no longer applies to this bank. */
-    (void)pulsar_bank_carry_restore_view(s, bank);
+     * (zeroed) frontier.  Re-installing the bank the host view was synced on keeps
+     * that view (a fresh sync just ran); any OTHER bank gets the fresh view, as on
+     * every family (L322: bank-adopt-gate-ds's SEAM installed an unused bank 3 after
+     * bank 0 and the host view still said P -- the sync took it for bank 3's history,
+     * stitched, ran nothing, and the decode refused "frontier not position-true ...
+     * n_comp 0 want 658").  Either way, per-bank frontier truth is now installed, so
+     * the multiseq superset poison no longer applies to this bank. */
+    if (!pulsar_bank_carry_restore_view(s, bank) && bank != held) pulsar_bank_carry_fresh_view(s);
     s->mseq_dirty = false;
     return true;
+}
+
+void pulsar_bank_carry_fresh_view(pulsar_session *s) {
+    s->checkpoint.len = 0;
+    s->checkpoint_valid = false;
+    s->logits_stale = true;
+    s->prefill_frontier = 0;
+    s->live_images.n = 0;
+    spec_lookahead_reset(s);   /* no shadow was saved: the fresh bank has no pendings, carry or quench */
 }
 
 bool pulsar_bank_carry_restore_view(pulsar_session *s, uint32_t bank) {
