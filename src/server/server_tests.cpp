@@ -9298,6 +9298,68 @@ static void test_l190_mem_floor_warn_is_rate_limited(void) {
     TEST_ASSERT(skipped == 1);
 }
 
+/* L324: the duplicate-prefix census (kv_dup_census_core) on a Claude Code shape at the production grid.  Invariants:
+ * a page is a whole grid cell [p*grid, (p+1)*grid) of a RESIDENT bank's history; two banks hold the same page iff
+ * their common token prefix reaches (p+1)*grid (exactly reaching it counts); distinct pages count each class once,
+ * pages_duplicate = resident - distinct, dup_bytes = pages_duplicate * page_bytes; a pair counts in a class only when
+ * it shares a whole page, deep iff it shares >= PULSAR_KV_DUP_DEEP_TOKENS; a spilled bank holds nothing. */
+static void test_l324_kv_dup_census(void) {
+    enum { N = 7, G = 4096 };
+    const uint64_t PB = 52ull << 20;
+    /* 0 main conversation; 1, 2 fan-out siblings (24.5k in common, 14k with the main one: the same-config
+     * preamble); 3 a third sibling, SPILLED; 4 a dominated copy of 0 at 150k; 5 another conversation; 6 empty */
+    int hist_len[N] = {180000, 30000, 28000, 26000, 150000, 10000, 0};
+    bool resident[N] = {true, true, true, false, true, true, true};
+    int rows[N][N];
+    const int *common[N];
+    for (int i = 0; i < N; i++) {
+        common[i] = rows[i];
+        for (int k = 0; k < N; k++) rows[i][k] = -1;
+    }
+    auto set = [&](int a, int b, int v) { rows[a][b] = v; rows[b][a] = v; };
+    set(0, 1, 14000); set(0, 2, 14000); set(0, 3, 14000); set(0, 4, 150000); set(0, 5, 200);
+    set(1, 2, 24500); set(1, 3, 24500); set(1, 4, 14000); set(1, 5, 200);
+    set(2, 3, 24500); set(2, 4, 14000); set(2, 5, 200);
+    set(3, 4, 14000); set(3, 5, 200); set(4, 5, 200);
+    kv_dup_census c;
+    uint32_t deep[N];
+    kv_dup_census_core(N, hist_len, resident, common, G, PB, &c, deep);
+    TEST_ASSERT(c.grid == G && c.page_bytes == PB);
+    TEST_ASSERT(c.banks == 5);                       /* the spilled and the empty bank hold no page */
+    TEST_ASSERT(c.pages_resident == 43 + 7 + 6 + 36 + 2);
+    /* p0-1: {0,1,2,4} {5}; p2: {0,1,2,4}; p3-4: {0,4} {1,2}; p5: {0,4} {1} {2} (24500 < 6*4096); p6: {0,4} {1};
+     * p7-35: {0,4}; p36-42: {0} */
+    TEST_ASSERT(c.pages_distinct == 2 + 2 + 1 + 2 + 2 + 3 + 2 + 29 + 7);
+    TEST_ASSERT(c.pages_shared == 1 + 1 + 1 + 2 + 2 + 1 + 1 + 29);
+    TEST_ASSERT(c.pages_duplicate == 44);
+    TEST_ASSERT(c.dup_bytes == 44 * PB);
+    TEST_ASSERT(c.pairs[0] == 5 && c.pairs[1] == 1);  /* (0,1) (0,2) (1,2) (1,4) (2,4); deep (0,4); 5 shares no page */
+    TEST_ASSERT(c.longest[0] == 24500 && c.longest[1] == 150000);
+    TEST_ASSERT(deep[0] == 1u << 4);
+    for (int a = 1; a < N; a++) TEST_ASSERT(deep[a] == 0);
+    /* the spilled sibling resident again: it shares p0-4 with 1 and 2 and p0-2 with 0 and 4 */
+    resident[3] = true;
+    kv_dup_census_core(N, hist_len, resident, common, G, PB, &c, NULL);
+    TEST_ASSERT(c.banks == 6 && c.pages_resident == 94 + 6);
+    TEST_ASSERT(c.pages_duplicate == 44 + 5 && c.pairs[0] == 5 + 4);
+    /* exactly reaching a page end shares it: two identical 8192-token copies hold 2 pages once each */
+    {
+        int hl[2] = {8192, 8192};
+        bool rs[2] = {true, true};
+        int r[2][2] = {{-1, 8192}, {8192, -1}};
+        const int *cm[2] = {r[0], r[1]};
+        kv_dup_census_core(2, hl, rs, cm, G, PB, &c, NULL);
+        TEST_ASSERT(c.pages_resident == 4 && c.pages_distinct == 2 && c.pages_shared == 2 && c.pages_duplicate == 2);
+        TEST_ASSERT(c.pairs[0] == 1 && c.longest[0] == 8192 && c.pairs[1] == 0);
+        r[0][1] = r[1][0] = 8191;   /* one token short of the second page end */
+        kv_dup_census_core(2, hl, rs, cm, G, PB, &c, NULL);
+        TEST_ASSERT(c.pages_distinct == 3 && c.pages_duplicate == 1);
+    }
+    /* no grid, no census */
+    kv_dup_census_core(N, hist_len, resident, common, 0, PB, &c, deep);
+    TEST_ASSERT(c.pages_resident == 0 && c.dup_bytes == 0 && deep[0] == 0);
+}
+
 /* L323 (4): the ONE bank-dominance predicate (bank_dominated_core; L179 branch 6's superseded scan before it).
  * Invariant: slot a is dominated only if it has a history and some OTHER slot k reaches at least as far
  * (hist_len[k] > hist_len[a], or an identical copy at a lower index) with a's whole history as its prefix
@@ -10336,6 +10398,7 @@ static void pulsar_server_unit_tests_run(void) {
     test_l185_every_renderer_produces_the_authority_bytes();
     test_l192_tool_history_validation_is_nearest_preceding();
     test_l323_bank_dominated();
+    test_l324_kv_dup_census();
     test_l179_guard_victim_skips_pinned_live_spilled();
     test_l179_guard_spill_plan_is_minimum();
     test_l280_prompt_kv_admission();

@@ -1075,29 +1075,124 @@ static bool bank_dominated_core(int a, int n_slots, const int *hist_len, const i
     return false;
 }
 
-void server::dominated_slots(bool dominated[PULSAR_SESSION_POOL_CAP]) {
-    auto *s = this;
+/* L323/L324: the common-prefix matrix of the slots' histories, the ONE fill both the dominance predicate and the
+ * duplicate census read: hist_len[i] (0 = no history; unprovisioned slots have none) and, where hist_len[i] > 0 and
+ * hist_len[k] >= hist_len[i] (k != i), common_rows[i][k] = their common token prefix; -1 elsewhere.  Host-carry
+ * prefix reads (the same reads routing does on idle banks; no CUDA), only where a reader looks: two conversations
+ * part within a few thousand tokens, so a compare runs long only between copies of one. */
+static void bank_common_matrix(server *s, int hist_len[PULSAR_SESSION_POOL_CAP],
+                               int common_rows[PULSAR_SESSION_POOL_CAP][PULSAR_SESSION_POOL_CAP]) {
     pulsar_session *pool = s->sess;
-    for (int i = 0; i < PULSAR_SESSION_POOL_CAP; i++) dominated[i] = false;
-    if (!pool || s->pool_banks <= 0) return;
-    int hist_len[PULSAR_SESSION_POOL_CAP];
     const pulsar_tokens *hist[PULSAR_SESSION_POOL_CAP];
-    int common_rows[PULSAR_SESSION_POOL_CAP][PULSAR_SESSION_POOL_CAP];
-    const int *common[PULSAR_SESSION_POOL_CAP];
     for (int i = 0; i < s->n_slots; i++) {
         const session_slot *a = &s->slots[i];
         hist[i] = a->provisioned ? pulsar_session_bank_tokens(pool, a->bank) : NULL;
         hist_len[i] = hist[i] ? hist[i]->len : 0;
-        common[i] = common_rows[i];
     }
-    /* Host-carry prefix reads (the same reads routing does on idle banks; no CUDA), only where the core will look:
-     * the rows of banks with a history, the columns at least as long.  Two conversations part within a few
-     * thousand tokens, so a compare runs long only between copies of one. */
     for (int i = 0; i < s->n_slots; i++)
         for (int k = 0; k < s->n_slots; k++)
             common_rows[i][k] = (hist_len[i] > 0 && k != i && hist_len[k] >= hist_len[i])
                 ? pulsar_session_bank_common_prefix(pool, s->slots[k].bank, hist[i]) : -1;
+}
+
+void server::dominated_slots(bool dominated[PULSAR_SESSION_POOL_CAP]) {
+    auto *s = this;
+    for (int i = 0; i < PULSAR_SESSION_POOL_CAP; i++) dominated[i] = false;
+    if (!s->sess || s->pool_banks <= 0) return;
+    int hist_len[PULSAR_SESSION_POOL_CAP];
+    int common_rows[PULSAR_SESSION_POOL_CAP][PULSAR_SESSION_POOL_CAP];
+    const int *common[PULSAR_SESSION_POOL_CAP];
+    bank_common_matrix(s, hist_len, common_rows);
+    for (int i = 0; i < s->n_slots; i++) common[i] = common_rows[i];
     for (int i = 0; i < s->n_slots; i++) dominated[i] = bank_dominated_core(i, s->n_slots, hist_len, common);
+}
+
+/* L324: the common prefix of slots a and b from the matrix (read in the direction bank_common_matrix fills). */
+static int dup_pair_common(int a, int b, const int *hist_len, const int *const *common) {
+    return hist_len[a] <= hist_len[b] ? common[a][b] : common[b][a];
+}
+
+void kv_dup_census_core(int n, const int *hist_len, const bool *resident, const int *const *common, int grid,
+                        uint64_t page_bytes, kv_dup_census *out, uint32_t *deep) {
+    memset(out, 0, sizeof *out);
+    out->grid = grid;
+    out->page_bytes = page_bytes;
+    if (deep)
+        for (int a = 0; a < n; a++) deep[a] = 0;
+    if (grid <= 0) return;
+    int pages[PULSAR_SESSION_POOL_CAP];
+    int max_pages = 0;
+    for (int a = 0; a < n; a++) {
+        pages[a] = resident[a] && hist_len[a] > 0 ? hist_len[a] / grid : 0;
+        if (pages[a] > 0) out->banks++;
+        out->pages_resident += (uint64_t)pages[a];
+        max_pages = std::max(max_pages, pages[a]);
+    }
+    /* Page p: the banks that hold it whole fall into classes by "same ids to (p+1)*grid" (an equivalence: prefix
+     * agreement is transitive).  A class's first member stands for it; the others are its extra copies. */
+    for (int p = 0; p < max_pages; p++) {
+        const int end = (p + 1) * grid;
+        for (int a = 0; a < n; a++) {
+            if (pages[a] <= p) continue;
+            bool first = true;
+            for (int b = 0; b < a && first; b++)
+                if (pages[b] > p && dup_pair_common(a, b, hist_len, common) >= end) first = false;
+            if (!first) continue;
+            out->pages_distinct++;
+            for (int b = a + 1; b < n; b++)
+                if (pages[b] > p && dup_pair_common(a, b, hist_len, common) >= end) { out->pages_shared++; break; }
+        }
+    }
+    out->pages_duplicate = out->pages_resident - out->pages_distinct;
+    out->dup_bytes = out->pages_duplicate * page_bytes;
+    for (int a = 0; a < n; a++)
+        for (int b = a + 1; b < n; b++) {
+            if (pages[a] <= 0 || pages[b] <= 0) continue;
+            const int c = dup_pair_common(a, b, hist_len, common);
+            if (c < grid) continue;
+            const int cls = c >= PULSAR_KV_DUP_DEEP_TOKENS ? 1 : 0;
+            out->pairs[cls]++;
+            out->longest[cls] = std::max(out->longest[cls], c);
+            if (cls && deep) deep[a] |= 1u << b;
+        }
+}
+
+void server::kv_dup_census_update() {
+    auto *s = this;
+    if (!s->sess || s->pool_banks <= 0) return;
+    int hist_len[PULSAR_SESSION_POOL_CAP];
+    int common_rows[PULSAR_SESSION_POOL_CAP][PULSAR_SESSION_POOL_CAP];
+    const int *common[PULSAR_SESSION_POOL_CAP];
+    bool resident[PULSAR_SESSION_POOL_CAP];
+    bank_common_matrix(s, hist_len, common_rows);
+    for (int i = 0; i < s->n_slots; i++) {
+        common[i] = common_rows[i];
+        resident[i] = s->slots[i].provisioned && !pulsar_session_bank_is_evicted(s->sess, s->slots[i].bank);
+    }
+    const int grid = pulsar_kvchain_grid(s->sess);
+    const uint64_t page_bytes = grid > 0 ? pulsar_session_quantum_growth_bytes_per_bank(s->sess, (uint32_t)grid) : 0;
+    kv_dup_census c;
+    uint32_t deep[PULSAR_SESSION_POOL_CAP];
+    kv_dup_census_core(s->n_slots, hist_len, resident, common, grid, page_bytes, &c, deep);
+    /* a pair that shares more than the preamble: once per pair until it stops (a bank that moves on clears it) */
+    for (int a = 0; a < s->n_slots; a++) {
+        const uint32_t fresh = deep[a] & ~s->w_dup_deep[a];
+        for (int b = a + 1; b < s->n_slots; b++) {
+            if (!(fresh >> b & 1u)) continue;
+            const int shared = dup_pair_common(a, b, hist_len, common);
+            server_log(PULSAR_LOG_KVCACHE,
+                       "pulsar-server: kv dup: banks %u and %u share %d tokens (%d whole pages of %d, %.2f GiB held "
+                       "twice) -- deeper than the preamble (%d)", s->slots[a].bank, s->slots[b].bank, shared,
+                       shared / grid, grid, (double)((uint64_t)(shared / grid) * page_bytes) / (1024.0 * 1024.0 * 1024.0),
+                       PULSAR_KV_DUP_DEEP_TOKENS);
+        }
+        s->w_dup_deep[a] = deep[a];
+    }
+    pthread_mutex_lock(&s->mu);
+    s->m_dup = c;
+    s->m_dup_censuses++;
+    s->m_dup_bytes_peak = std::max(s->m_dup_bytes_peak, c.dup_bytes);
+    pthread_mutex_unlock(&s->mu);
 }
 
 /* Evict exactly one NON-trunk victim so a warm fork gets a free bank. Trunk is

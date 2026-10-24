@@ -2101,6 +2101,15 @@ sidecall-turns-live: pulsar-server
 	sync; sudo -n sh -c "echo 3 > /proc/sys/vm/drop_caches" 2>/dev/null; \
 	python3 tests/sidecall_turns_live.py $(RESUME_LIVE_MODEL) --binary ./pulsar-server --work $(SIDECALL_LIVE_WORK)
 
+# L324: the duplicate-prefix census (/metrics pulsar:kv_dup_*): three fan-out siblings sharing a ~14k-token system
+# prompt, each on a fresh bank that adopts the prefix, show their shared pages as duplicates.  The Qwen pack, 4 banks,
+# 64k; one load, ~2 min.  The battery runs it as a leg of live-legs (Qwen, Nemotron); gates-dev on a routing / kv path.
+KV_DUP_LIVE_WORK ?= $(CURDIR)/.build/kv-dup-live
+.PHONY: kv-dup-live
+kv-dup-live: pulsar-server
+	sync; sudo -n sh -c "echo 3 > /proc/sys/vm/drop_caches" 2>/dev/null; \
+	python3 tests/kv_dup_live.py $(RESUME_LIVE_MODEL) --binary ./pulsar-server --work $(KV_DUP_LIVE_WORK)
+
 cuda-spec-width-gate: pulsar
 	python3 tests/spec_verify_width_gate.py $(FRONTIER_MODEL) --binary ./pulsar
 
@@ -2712,7 +2721,7 @@ gates-dev:
 	if [ $$poison -eq 1 ]; then printf '  scratch-poison-gate: selected (L307: the graphed lanes and their scratch, poisoned == unpoisoned on DeepSeek, DFlash2, LiLiCorr)\n'; fi; \
 	if [ $$server -eq 1 ]; then printf '  server: chat smoke + the --server/--api unit switches\n'; fi; \
 	if [ $$kvmem -eq 1 ]; then printf '  server-kv-headroom-live: selected (L319: the touched-KV ceiling is the measured headroom; admission / guard / bank paths)\n'; fi; \
-	if [ $$resume -eq 1 ]; then printf '  resume-deepest-live + sidecall-turns-live: selected (L318 / L322: routing / resume / disk-chain paths, the Open WebUI and the Claude Code side-call shapes on the Qwen pack)\n'; fi; \
+	if [ $$resume -eq 1 ]; then printf '  resume-deepest-live + sidecall-turns-live + kv-dup-live: selected (L318 / L322 / L324: routing / resume / disk-chain paths, the Open WebUI and the Claude Code side-call shapes and the fan-out duplicate census on the Qwen pack)\n'; fi; \
 	$(MAKE) --no-print-directory seam-check CUDA_ARCH=sm_120f || rc=1; \
 	$(MAKE) --no-print-directory cuda-reap-router-audit CUDA_ARCH=sm_120f \
 	      FRONTIER_MODEL="$(FRONTIER_MODEL)" || rc=1; \
@@ -2758,6 +2767,7 @@ gates-dev:
 	if [ $$resume -eq 1 ]; then \
 	  $(MAKE) --no-print-directory resume-deepest-live CUDA_ARCH=sm_120f || rc=1; \
 	  $(MAKE) --no-print-directory sidecall-turns-live CUDA_ARCH=sm_120f || rc=1; \
+	  $(MAKE) --no-print-directory kv-dup-live CUDA_ARCH=sm_120f || rc=1; \
 	fi; \
 	if [ $$kvmem -eq 1 ]; then \
 	  $(MAKE) --no-print-directory server-kv-headroom-live CUDA_ARCH=sm_120f || rc=1; \
