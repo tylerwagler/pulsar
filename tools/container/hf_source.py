@@ -144,8 +144,12 @@ class Exl3Checkpoint:
         self._fh = {}
         shards = sorted(f for f in os.listdir(hf_dir)
                         if f.startswith('model-') and f.endswith('.safetensors'))
+        # L321: an exllamav3 pack small enough for one file is written as model.safetensors (the Nemotron-3.5
+        # encoders at 4.0 bpw, 5.2 GB) -- its own single shard, as HFCheckpoint reads a one-file checkpoint
+        if not shards and os.path.exists(os.path.join(hf_dir, 'model.safetensors')):
+            shards = ['model.safetensors']
         if not shards:
-            raise SystemExit(f'{hf_dir}: no model-*.safetensors shards')
+            raise SystemExit(f'{hf_dir}: no model-*.safetensors shards and no model.safetensors')
         for f in shards:
             path = os.path.join(hf_dir, f)
             with open(path, 'rb') as fh:
