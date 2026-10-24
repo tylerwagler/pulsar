@@ -45,6 +45,7 @@ const char *pulsar_layer_plan_check(const pulsar_layer_plan *p, uint32_t *at_lay
 /* A family module under src/families/<name>/ (L295) declares its descriptor here, beside its registry row. */
 extern const pulsar_family PULSAR_FAMILY_INKLING;
 extern const pulsar_family PULSAR_FAMILY_NEMOTRON_H;
+extern const pulsar_family PULSAR_FAMILY_NEMOTRON_ENC;
 
 /* Every family the engine serves.  The ONE place an architecture string is
  * mapped to code. */
@@ -53,6 +54,7 @@ static const pulsar_family *const k_families[] = {
     &PULSAR_FAMILY_QWEN4_EXP,
     &PULSAR_FAMILY_INKLING,
     &PULSAR_FAMILY_NEMOTRON_H,
+    &PULSAR_FAMILY_NEMOTRON_ENC,
 };
 
 const pulsar_family *pulsar_family_for_model(const pulsar_model *m) {
@@ -69,6 +71,11 @@ const pulsar_family *pulsar_family_for_model(const pulsar_model *m) {
         if (!f->banks || ((f->caps & PULSAR_FAMILY_CAP_REWIND) != 0) != (f->banks->rewind != NULL)) {
             fprintf(stderr, "pulsar: the %s family's bank ops are %s -- refusing\n", f->name,
                     f->banks ? "out of step with its PULSAR_FAMILY_CAP_REWIND" : "missing");
+            return NULL;
+        }
+        if (((f->caps & PULSAR_FAMILY_CAP_ENCODE) != 0) != (f->encoder != NULL)) {
+            fprintf(stderr, "pulsar: the %s family's encoder entries are out of step with its PULSAR_FAMILY_CAP_ENCODE "
+                            "-- refusing\n", f->name);
             return NULL;
         }
         return f;

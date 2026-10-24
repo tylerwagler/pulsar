@@ -335,6 +335,41 @@ bool pulsar_engine_has_snapshots(const pulsar_engine *e) { return e && (e->famil
 bool pulsar_engine_has_vision(const pulsar_engine *e) { return e && e->family->vision && e->vision_ready; }
 pulsar_drafter_kind pulsar_engine_drafter(pulsar_engine *e) { return e ? e->family->drafter(e) : PULSAR_DRAFTER_NONE; }
 
+/* L321: the encoder entries -- the family's (pulsar_family_encoder), behind PULSAR_FAMILY_CAP_ENCODE */
+static const pulsar_family_encoder *encoder_of(const pulsar_engine *e) {
+    return e && (e->family->caps & PULSAR_FAMILY_CAP_ENCODE) ? e->family->encoder : NULL;
+}
+pulsar_encoder_kind pulsar_engine_encoder(const pulsar_engine *e) {
+    const pulsar_family_encoder *x = encoder_of(e);
+    return x ? x->kind(e) : PULSAR_ENCODER_NONE;
+}
+uint32_t pulsar_engine_encode_dim(const pulsar_engine *e) {
+    const pulsar_family_encoder *x = encoder_of(e);
+    return x ? x->dim(e) : 0;
+}
+uint32_t pulsar_engine_encode_max_tokens(const pulsar_engine *e) {
+    const pulsar_family_encoder *x = encoder_of(e);
+    return x ? x->max_tokens(e) : 0;
+}
+bool pulsar_engine_encode_render(pulsar_engine *e, pulsar_encode_role role, const char *text, const char *doc,
+                                 pulsar_tokens *out, char *err, size_t errlen) {
+    PULSAR_FAMILY_REQUIRES_E(e, PULSAR_FAMILY_CAP_ENCODE, "encoding (a decoder family)", false);
+    if (!e || !out) {
+        if (err) snprintf(err, errlen, "no engine or no output");
+        return false;
+    }
+    return e->family->encoder->render(e, role, text, doc, out, err, errlen);
+}
+int pulsar_engine_encode(pulsar_engine *e, const pulsar_tokens *inputs, uint32_t n, float *out, char *err,
+                         size_t errlen) {
+    PULSAR_FAMILY_REQUIRES_E(e, PULSAR_FAMILY_CAP_ENCODE, "encoding (a decoder family)", -1);
+    if (!e || (n && (!inputs || !out))) {
+        if (err) snprintf(err, errlen, "no engine, inputs or output");
+        return -1;
+    }
+    return e->family->encoder->encode(e, inputs, n, out, err, errlen);
+}
+
 void pulsar_session_set_progress(pulsar_session *s, pulsar_session_progress_fn fn, void *ud) { if (s) s->set_progress(fn, ud); }
 void pulsar_session_set_display_progress(pulsar_session *s, pulsar_session_progress_fn fn, void *ud) { if (s) s->set_display_progress(fn, ud); }
 void pulsar_session_set_cancel(pulsar_session *s, pulsar_session_cancel_fn fn, void *ud) { if (s) s->set_cancel(fn, ud); }

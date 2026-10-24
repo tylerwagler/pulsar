@@ -107,6 +107,7 @@ typedef enum {
     PULSAR_FAMILY_ID_QWEN4_EXP = 1,  ///< Qwen3.8-Flash-Next (HF model_type qwen4_exp)
     PULSAR_FAMILY_ID_INKLING   = 2,  ///< Thinking Machines' Inkling (HF model_type inkling_mm_model; src/families/inkling)
     PULSAR_FAMILY_ID_NEMOTRON_H = 3, ///< NVIDIA Nemotron-H (Nemotron 3.5 Super VL; HF nemotron_h_omni; src/families/nemotron_h)
+    PULSAR_FAMILY_ID_NEMOTRON_ENC = 4, ///< NVIDIA Nemotron-3.5 Embed / Rerank encoders (HF mistral3; src/families/nemotron_enc)
 } pulsar_family_id;
 
 /** The conversation format a front end must render for the loaded model: the
@@ -119,6 +120,7 @@ typedef enum {
     PULSAR_CHAT_QWEN    = 2,  ///< Qwen chat template (L251 S5)
     PULSAR_CHAT_INKLING = 3,  ///< Inkling-Small native renderer (L294 E6: src/lib/inkling_chat)
     PULSAR_CHAT_NEMOTRON_H = 4,  ///< Nemotron-H ChatML + think-tag renderer (L296 N8: src/lib/nemotron_chat)
+    PULSAR_CHAT_NONE    = 5,  ///< no conversation: an encoder family (L321) renders its inputs through pulsar_engine_encode_render
 } pulsar_chat_format;
 
 /** The speculative drafter a family's artifacts carry. */
@@ -264,6 +266,45 @@ const char *pulsar_engine_family_name(const pulsar_engine *e);
  * A front end that takes text refuses an engine without one at startup; the
  * tokenizer entries themselves end the process by name if reached anyway. */
 bool pulsar_engine_has_tokenizer(const pulsar_engine *e);
+
+/* ---- encoders (L321) ----------------------------------------------------------------------------------------------
+ * An ENCODER family's model maps an input to one vector or one score instead of a next token: no session, no
+ * sampler, no chat.  Its inputs are the family's own renders (its template: a query or passage prefix, a query /
+ * document pair), tokenized by its tokenizer, and one call runs a batch of them through one bidirectional forward.
+ * A decoder family declares no encoder: the entries below refuse by name (PULSAR_ENCODER_NONE, 0). */
+
+/** What an encoder returns per input. */
+typedef enum {
+    PULSAR_ENCODER_NONE   = 0,  ///< a decoder family: no encode entry applies
+    PULSAR_ENCODER_EMBED  = 1,  ///< an embedding: pulsar_engine_encode_dim floats, L2-normalised
+    PULSAR_ENCODER_RERANK = 2,  ///< a relevance score (the head's raw logit; higher is more relevant): one float
+} pulsar_encoder_kind;
+
+/** Which render of the family's template an input takes. */
+typedef enum {
+    PULSAR_ENCODE_QUERY   = 0,  ///< an embedder's query (a search string)
+    PULSAR_ENCODE_PASSAGE = 1,  ///< an embedder's passage (a document chunk)
+    PULSAR_ENCODE_PAIR    = 2,  ///< a reranker's (query, document) pair
+} pulsar_encode_role;
+
+/** The loaded family's encoder kind (NONE on a decoder or no engine). */
+pulsar_encoder_kind pulsar_engine_encoder(const pulsar_engine *e);
+/** Floats per encoded input (an embedding's width, or 1 for a score); 0 on a decoder. */
+uint32_t pulsar_engine_encode_dim(const pulsar_engine *e);
+/** The most tokens one input may have (its render included): the positions the model serves exactly; 0 on a
+ *  decoder.  A longer input is refused, never cut -- truncation is the caller's choice. */
+uint32_t pulsar_engine_encode_max_tokens(const pulsar_engine *e);
+/** Render one input in the family's template and tokenize it, appending to `out`: `text` the query or passage
+ *  (QUERY / PASSAGE), or the query with `doc` the document (PAIR).  Client text never forms a special token.
+ *  false + `err` on a role the encoder does not take or text that is not UTF-8. */
+bool pulsar_engine_encode_render(pulsar_engine *e, pulsar_encode_role role, const char *text, const char *doc,
+                                 pulsar_tokens *out, char *err, size_t errlen);
+/** Encode n rendered inputs: out [n][pulsar_engine_encode_dim] floats.  Each input's result is the same bytes
+ *  whatever else rides in the call (the forward is row-independent outside attention, and attention stays inside
+ *  its input).  Calls are serialised on the engine.  0, or -1 + `err` (an empty or over-long input, a decoder
+ *  family, a device failure). */
+int pulsar_engine_encode(pulsar_engine *e, const pulsar_tokens *inputs, uint32_t n, float *out, char *err,
+                         size_t errlen);
 
 /** DSpark speculative-decode counters for the server /metrics endpoint. All
  * cumulative/monotonic since engine open.
