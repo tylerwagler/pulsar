@@ -88,8 +88,26 @@ def mem_available():
     return 0
 
 
+def fstype(path):
+    """the filesystem type of the mount holding `path` (the longest mount point that prefixes it)"""
+    path, best, kind = os.path.realpath(path), "", ""
+    for line in open("/proc/self/mountinfo"):
+        f = line.split()
+        mnt, typ = f[4], f[f.index("-") + 1]
+        if (path == mnt or path.startswith(mnt.rstrip("/") + "/")) and len(mnt) >= len(best):
+            best, kind = mnt, typ
+    return kind
+
+
 def start(tag):
-    kv = tempfile.mkdtemp(prefix="kvhead-")
+    # L322: the disk tier on disk, never in memory.  mkdtemp's default is $TMPDIR else /tmp, and on the Spark /tmp is
+    # tmpfs: under gates-dev (no TMPDIR, gpuq #448) every persisted segment (~12 MiB per 4k tokens, 0.83 GiB over the
+    # fill) came out of MemAvailable and the floor check failed by 0.34 GiB.  L319's own runs set TMPDIR to a disk dir.
+    kv = tempfile.mkdtemp(prefix="kvhead-", dir=os.environ.get("TMPDIR") or "/var/tmp")
+    if fstype(kv) in ("tmpfs", "ramfs"):
+        shutil.rmtree(kv, ignore_errors=True)
+        raise SystemExit("FAIL the disk KV dir %s is on %s: its segments would be counted against MemAvailable -- "
+                         "set TMPDIR to a disk directory" % (os.path.dirname(kv), fstype(os.path.dirname(kv))))
     scratch.append(kv)
     log = os.path.join(kv, "server.log")
     env = dict(os.environ, PULSAR_MSEQ_BANKS=str(a.banks))
