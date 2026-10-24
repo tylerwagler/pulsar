@@ -510,6 +510,15 @@ int ds4_exl3_dense_multi_launch(const ds4_exl3_dense_proj *p, int n, const void 
         }
         return 0;
     }
+    /* L321: decode rows are the GEMV, whose MMA is m16n8k16 (sm_80+); prompt chunks above are cuBLASLt fp16, which a
+     * Turing card has.  A device without the MMA refuses decode rows here, by name, instead of trapping in the kernel. */
+    if (pulsar_cuda_device_major() < 8) {
+        static bool said = false;
+        if (!__atomic_exchange_n(&said, true, __ATOMIC_RELAXED))
+            fprintf(stderr, "%s: EXL3 dense decode rows need sm_80 (mma m16n8k16); this device is sm_%dx -- refusing "
+                            "(prompt chunks run)\n", tag, pulsar_cuda_device_major());
+        return -1;
+    }
     if (M > kRows) {
         /* L288 C1: decode rows past the MMA's 16 (a wide verify) run the GEMV a 16-row block at a time -- each block
          * the call it is alone, so every row is the bytes a one-row decode gives at ANY width.  The GEMM above lost

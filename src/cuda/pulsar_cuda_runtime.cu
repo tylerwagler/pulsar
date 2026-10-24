@@ -1,5 +1,4 @@
 #include "pulsar_cuda_internal.h"
-#include "pulsar_cuda_arch.cuh"   /* pulsar_cuda_device_major: declared there, defined below */
 #include "engine/exl3_trellis.h" /* L269 W1: exl3_expert_cut, the EXL3 expert half */
 
 #include <list>
@@ -1188,16 +1187,6 @@ static int cuda_tu_archs_ok(const cudaDeviceProp *prop) {
 }
 
 
-
-int pulsar_cuda_device_major(void) {
-    static int major = -1;
-    if (major < 0) {
-        int dev = 0, m = 0;
-        major = (cudaGetDevice(&dev) == cudaSuccess &&
-                 cudaDeviceGetAttribute(&m, cudaDevAttrComputeCapabilityMajor, dev) == cudaSuccess) ? m : 0;
-    }
-    return major;
-}
 
 int pulsar_gpu_init(void) {
     int dev = 0;
