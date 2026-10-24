@@ -802,6 +802,7 @@ int pulsar_gpu_qsa_forward(const pulsar_qsa_layer *layer,
                            const pulsar_qsa_seq *seqs, uint32_t n_seqs,
                            const uint32_t *row_seq, const uint32_t *row_pos, uint32_t n_rows,
                            const pulsar_qsa_io *io, pulsar_gpu_tensor *workspace) {
+    PULSAR_REQUIRE_CC(80, "QSA attention (bf16 m16n8k16)", 0);   /* L321: refuse below the lane's arch, before its kernels trap */
     if (!layer || !seqs || !row_seq || !row_pos || !io || !workspace || n_rows == 0 || n_seqs == 0) {
         return qsa_refuse("a NULL argument or zero rows");
     }

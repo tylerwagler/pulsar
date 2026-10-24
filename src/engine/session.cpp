@@ -664,6 +664,28 @@ int pulsar_engine::open(pulsar_engine **out, const pulsar_engine_options *opt) {
             *out = NULL;
             return 1;
         }
+        /* L321: every layout the model holds, asked of THIS device before any weight reaches it -- an older card
+         * refuses a model by name here (an MXFP8 checkpoint on Turing) instead of a kernel running without what
+         * it needs.  The drafter's own artifact too, when it has one. */
+        for (const pulsar_model *m : {&e->model, e->dspark_ready && e->dspark_external ? &e->dspark_model : nullptr}) {
+            if (!m) continue;
+            uint64_t seen = 0;   /* one bit per layout id (< 64) */
+            for (uint64_t i = 0; i < m->n_tensors; i++) {
+                const uint32_t ty = m->tensors[i].type;
+                if (ty >= 64 || (seen >> ty & 1u)) continue;
+                seen |= 1ull << ty;
+                const char *need = "";
+                if (!pulsar_gpu_layout_supported(ty, &need)) {
+                    uint64_t n = 0;
+                    for (uint64_t j = 0; j < m->n_tensors; j++) n += m->tensors[j].type == ty;
+                    fprintf(stderr, "pulsar: this GPU cannot run the model's %s weights (%" PRIu64 " tensors): the "
+                                    "layout needs %s; aborting startup\n", tensor_type_name(ty), n, need);
+                    e->destroy();
+                    *out = NULL;
+                    return 1;
+                }
+            }
+        }
         (void)pulsar_gpu_set_model_fd(e->model.fd);
         const int model_map_ok =
             pulsar_gpu_set_model_map_range(e->model.map,

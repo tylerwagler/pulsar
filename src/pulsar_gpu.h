@@ -151,6 +151,10 @@
 typedef struct pulsar_gpu_tensor pulsar_gpu_tensor;
 
 int pulsar_gpu_init(void);
+/** L321: can THIS device run a weight layout (a PULSAR_TENSOR_* id)?  1 yes; 0 no, with *need (if not NULL) naming
+ *  what the layout's kernels require.  The engine asks it for every layout a model holds, after pulsar_gpu_init and
+ *  before any weight reaches the GPU, so an older card refuses a model by name at load instead of tripping a kernel. */
+int pulsar_gpu_layout_supported(uint32_t layout, const char **need);
 void pulsar_gpu_cleanup(void);
 
 /** Running total of live tensor-alloc bytes (owned allocations only, views
