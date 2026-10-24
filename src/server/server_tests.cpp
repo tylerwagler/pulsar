@@ -6561,6 +6561,38 @@ static void test_l264_segstore_chain_lookup(void) {
     TEST_ASSERT(system(cmd) == 0);
 }
 
+/* L280: the store identity carries the rope.  rope_id 0 (the rope the model id implies) is the identity as it was,
+ * so existing stores stay readable; any scaled rope sets a nonzero top byte, so a YaRN server never indexes a native
+ * store's segments (or the reverse) -- the payload layout digest refusing them at load is the second line, not the
+ * only one. */
+static void test_l280_kv_identity_rope(void) {
+    TEST_ASSERT(pulsar_segstore_identity(2, 36, 0) == (2u << 8 | 36u));
+    const uint64_t ropes[] = {1ull, 0x9e3779b97f4a7c15ull, 0x0101ull /* folds to 0 */, ~0ull};
+    for (uint64_t r : ropes) {
+        const uint32_t id = pulsar_segstore_identity(2, 36, r);
+        TEST_ASSERT((id & 0xffffffu) == (2u << 8 | 36u));
+        TEST_ASSERT((id >> 24) != 0u);
+    }
+    TEST_ASSERT(pulsar_segstore_identity(2, 36, 0x0101ull) >> 24 == 1u);
+    char tmpl[] = "/tmp/pulsar-seg-rope.XXXXXX";
+    char *dir = mkdtemp(tmpl);
+    TEST_ASSERT(dir != NULL);
+    if (!dir) return;
+    const uint32_t native = pulsar_segstore_identity(2, 36, 0), yarn = pulsar_segstore_identity(2, 36, 0x1234abcdull);
+    pulsar_segstore *st = pulsar_segstore_open(dir, 0, native, NULL, NULL);
+    char root[41];
+    TEST_ASSERT(st && test_seg_put(st, "", 0, 128, "SYSTEM:", 100, 0x11, root));
+    pulsar_segstore_close(st);
+    pulsar_segstore *other = pulsar_segstore_open(dir, 0, yarn, NULL, NULL);
+    TEST_ASSERT(other && pulsar_segstore_count(other) == 0);
+    pulsar_segstore_close(other);
+    st = pulsar_segstore_open(dir, 0, native, NULL, NULL);   /* and the native store kept it */
+    TEST_ASSERT(st && pulsar_segstore_count(st) == 1);
+    pulsar_segstore_drop(st, root);
+    pulsar_segstore_close(st);
+    rmdir(dir);
+}
+
 /* L323: where a persist ends segments -- the canonical grid.  Every multiple of the grid past the stored chain up to
  * the deepest checkpoint, then (closing) the tail to that checkpoint; never a cut where the writer's own checkpoints
  * fell (2026-10-24: copies cut at turn ends -- [7808,7936) [7936,8064) ... -- deduped nothing). */
@@ -7959,7 +7991,7 @@ static void test_kv_disk_default_dir_resolution(void) {
     /* XDG_CACHE_HOME wins; nonexistent model path falls back to its raw
      * basename; the .gguf extension is stripped case-insensitively. */
     setenv("XDG_CACHE_HOME", "/tmp/ds4-kvtest-xdg", 1);
-    char *d = server_default_kv_disk_dir("/no/such/dir/ds4flash-test.gguf");
+    char *d = server_default_kv_disk_dir("/no/such/dir/ds4flash-test.gguf", 0.0);
     TEST_ASSERT(d && !strcmp(d, "/tmp/ds4-kvtest-xdg/pulsar/kv-ds4flash-test"));
     free(d);
 
@@ -7976,7 +8008,7 @@ static void test_kv_disk_default_dir_resolution(void) {
         TEST_ASSERT(fp != NULL);
         if (fp) fclose(fp);
         TEST_ASSERT(symlink(artifact, pointer) == 0);
-        d = server_default_kv_disk_dir(pointer);
+        d = server_default_kv_disk_dir(pointer, 0.0);
         TEST_ASSERT(d && !strcmp(d, "/tmp/ds4-kvtest-xdg/pulsar/kv-ds4flash-v9-test"));
         free(d);
         unlink(pointer);
@@ -7988,22 +8020,31 @@ static void test_kv_disk_default_dir_resolution(void) {
      * the model name are sanitized. */
     unsetenv("XDG_CACHE_HOME");
     setenv("HOME", "/tmp/ds4-kvtest-home", 1);
-    d = server_default_kv_disk_dir("weird name!.GGUF");
+    d = server_default_kv_disk_dir("weird name!.GGUF", 0.0);
     TEST_ASSERT(d && !strcmp(d, "/tmp/ds4-kvtest-home/.cache/pulsar/kv-weird_name_"));
     free(d);
 
     /* A relative XDG_CACHE_HOME is ignored per the XDG spec (it would key
      * the cache off the current working directory). */
     setenv("XDG_CACHE_HOME", "relative-cache", 1);
-    d = server_default_kv_disk_dir("x.gguf");
+    d = server_default_kv_disk_dir("x.gguf", 0.0);
     TEST_ASSERT(d && !strcmp(d, "/tmp/ds4-kvtest-home/.cache/pulsar/kv-x"));
     free(d);
     unsetenv("XDG_CACHE_HOME");
 
+    /* L280: --rope-yarn keys its own directory (a segment's name hashes its text, so a native and a YaRN server
+     * must not share one); the native rope's directory is unchanged */
+    d = server_default_kv_disk_dir("/no/such/qwen38fn-dflash2", 4.0);
+    TEST_ASSERT(d && !strcmp(d, "/tmp/ds4-kvtest-home/.cache/pulsar/kv-qwen38fn-dflash2-rope-yarn4"));
+    free(d);
+    d = server_default_kv_disk_dir("/no/such/qwen38fn-dflash2", 2.5);
+    TEST_ASSERT(d && !strcmp(d, "/tmp/ds4-kvtest-home/.cache/pulsar/kv-qwen38fn-dflash2-rope-yarn2.5"));
+    free(d);
+
     /* No cache home at all: resolution reports NULL (server then runs with
      * the disk cache disabled instead of guessing a path). */
     unsetenv("HOME");
-    TEST_ASSERT(server_default_kv_disk_dir("x.gguf") == NULL);
+    TEST_ASSERT(server_default_kv_disk_dir("x.gguf", 0.0) == NULL);
 
     test_env_restore("XDG_CACHE_HOME", old_xdg);
     test_env_restore("HOME", old_home);
@@ -10370,6 +10411,7 @@ static void pulsar_server_unit_tests_run(void) {
     test_writeback_preserves_bytes();
     test_sha1_bytes_hex_matches_known_vector();
     test_l264_segstore_chain_lookup();
+    test_l280_kv_identity_rope();
     test_l323_kvchain_segment_ends();
     test_l323_grid_cut_dedupes_copies();
     test_l323_tail_supersession();

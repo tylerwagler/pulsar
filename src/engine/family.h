@@ -335,9 +335,16 @@ struct pulsar_family {
     pulsar_chat_format (*chat_format)(const pulsar_engine *e);
     int (*model_id)(const pulsar_engine *e);
     /** The longest context the loaded model's positions were trained for, with whatever position scaling the
-     *  family implements (DeepSeek: YaRN's original context x factor; Qwen: max_position_embeddings until L280's
-     *  YaRN).  pulsar_session_create refuses a larger one (L284: past it a session ran untrained positions). */
+     *  family implements (DeepSeek: YaRN's original context x factor; Qwen: max_position_embeddings, or YaRN's
+     *  original context x factor under rope_parameters / --rope-yarn, L280).  pulsar_session_create refuses a
+     *  larger one (L284: past it a session ran untrained positions). */
     uint64_t (*trained_context)(const pulsar_engine *e);
+    /** L280: the identity of the rope the loaded positions run, where model_id does not already fix it: 0 = the
+     *  one rope the family's model id implies (DeepSeek's container YaRN, Qwen's native rope, the rope-free
+     *  trunks), else a digest of the scaling (Qwen under YaRN).  The disk-KV store identity
+     *  (pulsar_engine_kv_identity) and the TP hello carry it, so KV computed under one rope is never indexed,
+     *  loaded or mirrored under another. */
+    uint64_t (*rope_id)(const pulsar_engine *e);
     /** The tensor-parallel transport's shape (L266): exchange slots per step (layers), the row width an
      *  all-reduce moves, and the vocab -- the TP identity and the slab are sized by it. */
     void (*tp_shape)(const pulsar_engine *e, uint32_t *n_layer, uint32_t *n_embd, uint32_t *n_vocab);
@@ -383,6 +390,9 @@ extern const pulsar_family PULSAR_FAMILY_QWEN4_EXP;
  * architecture and the known ones and returns NULL when none does; a missing
  * key is refused the same way. */
 const pulsar_family *pulsar_family_for_model(const pulsar_model *m);
+
+/** L280: the rope_id of every family whose model id already fixes its rope -- 0. */
+uint64_t pulsar_family_rope_fixed(const pulsar_engine *e);
 
 /** True when the engine's family declares `cap`.  Otherwise prints, once per
  * (op) call site, "<family> does not implement <op>" and returns false: the

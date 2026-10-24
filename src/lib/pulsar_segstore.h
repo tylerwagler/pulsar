@@ -63,13 +63,31 @@ typedef void (*pulsar_segstore_log_fn)(void *ud, const char *msg);
 /** Writes exactly the bytes promised into fp; 0 on success. */
 typedef int (*pulsar_segstore_write_fn)(FILE *fp, void *ud, char *err, size_t errlen);
 
-/** What a store's segments were computed by: the model AND its routed-expert
+/** What a store's segments were computed by: the model, its routed-expert
  * format (pulsar_engine_routed_quant_bits -- the IQ2, MXFP4 and EXL3 builds of
  * one model share a model id and a KV row layout, so a segment's shape cannot
- * tell them apart, but their KV differs).  The one rule both writers and
- * readers key with. */
-static inline uint32_t pulsar_segstore_identity(uint32_t model_id, uint32_t routed_quant_bits) {
-    return model_id << 8 | (routed_quant_bits & 0xffu);
+ * tell them apart, but their KV differs) AND its rope where the model id does
+ * not fix it (L280: the family's rope_id, 0 for the rope the model id implies;
+ * Qwen under YaRN writes other K bytes into the same layout).  The one rule
+ * both writers and readers key with; callers take it from
+ * pulsar_engine_kv_identity.
+ *
+ * A rope_id of 0 leaves the identity as it was before L280 (model_id << 8 |
+ * bits), so stores written under a model's own rope stay readable.  Any other
+ * rope_id sets the top byte to a nonzero fold of it: such a store never shares
+ * an identity with a rope_id-0 one.  Two scaled ropes whose folds collide (1 in
+ * 255) share an index, and the engine's payload layout digest -- which mixes the
+ * whole rope_id -- still refuses every segment of the other at load (and the
+ * server drops it), so a fold collision costs a refused load, never another
+ * rope's KV. */
+static inline uint32_t pulsar_segstore_identity(uint32_t model_id, uint32_t routed_quant_bits, uint64_t rope_id) {
+    uint32_t id = (model_id & 0xffffu) << 8 | (routed_quant_bits & 0xffu);
+    if (rope_id) {
+        uint8_t f = 0;
+        for (int i = 0; i < 8; i++) f ^= (uint8_t)(rope_id >> (8 * i));
+        id |= (uint32_t)(f ? f : 1u) << 24;
+    }
+    return id;
 }
 
 /** Open (create) the store and index its segments.  budget_bytes 0 = unbounded.

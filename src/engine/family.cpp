@@ -81,6 +81,9 @@ const pulsar_family *pulsar_family_for_model(const pulsar_model *m) {
     return NULL;
 }
 
+/* L280: the rope_id of a family whose model id fixes its rope (family.h) */
+uint64_t pulsar_family_rope_fixed(const pulsar_engine *) { return 0; }
+
 bool pulsar_family_require(const pulsar_engine *e, uint32_t cap, const char *op) {
     if (!e || (e->family->caps & cap) == cap) return true;
     /* Once per op name (rule 9): a caller that keeps asking gets its refusal

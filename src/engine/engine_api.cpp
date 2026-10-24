@@ -3,6 +3,7 @@
 #include "spec_block.h"
 #include "pulsar_nvtx.h"
 #include "../tp/pulsar_tp.h"
+#include "../lib/pulsar_segstore.h"
 #include <unistd.h>
 #include <string>
 
@@ -322,6 +323,10 @@ int pulsar_engine_collect_imatrix(pulsar_engine *e,
                                int max_tokens) { PULSAR_FAMILY_REQUIRES_E(e, PULSAR_FAMILY_CAP_IMATRIX, "imatrix collection", 1); return e ? e->collect_imatrix(dataset_path, output_path, ctx_size, max_prompts, max_tokens) : 1; }
 void pulsar_engine_dump_tokens(pulsar_engine *e, const pulsar_tokens *tokens) { PULSAR_FAMILY_REQUIRES_E(e, PULSAR_FAMILY_CAP_CHAT, "token dumps (no tokenizer)", (void)0); if (e->family->tokenizer) e->family->tokenizer->dump(e, stdout, tokens); }
 int pulsar_engine_routed_quant_bits(pulsar_engine *e) { return e ? e->routed_quant_bits() : 0; }
+uint32_t pulsar_engine_kv_identity(pulsar_engine *e) {
+    return pulsar_segstore_identity((uint32_t)pulsar_engine_model_id(e), (uint32_t)pulsar_engine_routed_quant_bits(e),
+                                    e ? e->family->rope_id(e) : 0u);
+}
 bool pulsar_engine_has_spec_rounds(const pulsar_engine *e) { return e && e->drafter_ops && e->family->spec; }
 bool pulsar_engine_can_rewind(const pulsar_engine *e) { return e && (e->family->caps & PULSAR_FAMILY_CAP_REWIND) != 0; }
 bool pulsar_engine_has_fused_step(const pulsar_engine *e) { return e && e->family->session->decode_fused; }
@@ -563,7 +568,8 @@ int pulsar_session_create(pulsar_session **out, pulsar_engine *e, int ctx_size) 
     const uint64_t trained = e ? e->family->trained_context(e) : 0;
     if (e && ctx_size > 0 && (uint64_t)ctx_size > trained) {
         fprintf(stderr, "pulsar: a %d-token context is past %s's trained %" PRIu64 " positions -- refusing "
-                        "(no position scaling extends it)\n", ctx_size, e->family->name, trained);
+                        "(the rope that runs is the container's rope_parameters, or --rope-yarn F over a native "
+                        "one: Qwen's model card serves 1048576 at --rope-yarn 4)\n", ctx_size, e->family->name, trained);
         if (out) *out = NULL;
         return 1;
     }

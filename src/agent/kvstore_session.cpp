@@ -148,8 +148,7 @@ bool agent_session_file_read(const char *path, agent_session_file *f, char *err,
 bool agent_kv_open(agent_worker *w) {
     char *dir = pulsar_kvtext_path_join(w->cache_dir, "segments");
     w->kv = pulsar_segstore_open(dir, (uint64_t)AGENT_KV_BUDGET_MB << 20,
-                                 pulsar_segstore_identity((uint32_t)pulsar_engine_model_id(w->engine),
-                                                          (uint32_t)pulsar_engine_routed_quant_bits(w->engine)),
+                                 pulsar_engine_kv_identity(w->engine),
                                  NULL, NULL);
     if (!w->kv)
         fprintf(stderr, "pulsar-agent: KV cache %s unusable; sessions save without cached KV\n", dir);
