@@ -209,6 +209,12 @@ int pulsar_engine::collect_imatrix(const char *dataset_path,
 }
 
 
+/* L321: engines live in this process (pulsar_engine_open_group).  The instance lock, the GPU runtime and every
+ * model's mapping live until the LAST one closes: an earlier close defers its unmaps to then (the runtime's caches are
+ * keyed by mapping, and a reused address must never meet a stale entry). */
+static uint32_t g_live_engines;
+static std::vector<pulsar_model> g_deferred_models;
+
 /* Register every mapping of a model with the staged-fd route -- the only route
  * onto the GPU here, since cudaHostRegister reports "operation not supported" on
  * GB10.  A GGUF has one mapping; a safetensors checkpoint has one per layer, and
@@ -523,7 +529,8 @@ bool pulsar_ds4_family_after_gpu(pulsar_engine *e) {
     return ds4_tp_groups(e);
 }
 
-int pulsar_engine::open(pulsar_engine **out, const pulsar_engine_options *opt) {
+/* Phase 1: options, the instance, the artifact, the family's load (and the inspect-only exit). */
+static int open_load(pulsar_engine **out, const pulsar_engine_options *opt) {
     pulsar_engine *e = (pulsar_engine *)xcalloc(1, sizeof(*e));
     e->model.fd = -1;
     e->dspark_model.fd = -1;
@@ -597,7 +604,9 @@ int pulsar_engine::open(pulsar_engine **out, const pulsar_engine_options *opt) {
         e->directional_steering_attn_scale = opt->directional_steering_attn;
         e->directional_steering_ffn_scale = opt->directional_steering_ffn;
     }
-    pulsar_acquire_instance_lock();
+    /* the instance lock is the PROCESS's: taken by its first live engine, released with its last (L321 groups) */
+    if (g_live_engines++ == 0) pulsar_acquire_instance_lock();
+    e->live = true;
 
     const bool graph_backend = pulsar_backend_uses_graph(opt->backend);
     if (graph_backend) pulsar_linux_graph_backend_set_oom_score(opt->backend);
@@ -648,21 +657,21 @@ int pulsar_engine::open(pulsar_engine **out, const pulsar_engine_options *opt) {
         *out = NULL;
         return 1;
     }
-    /* the family's load binds everything (drafter and vision tower included)
-     * before the inspect-only exit: --inspect proves the whole artifact binds */
-    if (opt->inspect_only) {
-        *out = e;
-        return 0;
-    }
+    *out = e;
+    return 0;
+}
 
+
+/* Phase 2: the device, the layouts it can run, every mapping set (no weight staged yet: setting a mapping drops what
+ * was staged, so a group sets all of its members' before any member stages). */
+static bool open_map(pulsar_engine *e) {
+    const bool graph_backend = pulsar_backend_uses_graph(e->backend);
     if (graph_backend) {
         e->gpu_ready = pulsar_gpu_init() != 0;
         if (!e->gpu_ready) {
             fprintf(stderr, "pulsar: %s backend unavailable; aborting startup\n",
                     pulsar_backend_name(e->backend));
-            e->destroy();
-            *out = NULL;
-            return 1;
+            return false;
         }
         /* L321: every layout the model holds, asked of THIS device before any weight reaches it -- an older card
          * refuses a model by name here (an MXFP8 checkpoint on Turing) instead of a kernel running without what
@@ -680,13 +689,12 @@ int pulsar_engine::open(pulsar_engine **out, const pulsar_engine_options *opt) {
                     for (uint64_t j = 0; j < m->n_tensors; j++) n += m->tensors[j].type == ty;
                     fprintf(stderr, "pulsar: this GPU cannot run the model's %s weights (%" PRIu64 " tensors): the "
                                     "layout needs %s; aborting startup\n", tensor_type_name(ty), n, need);
-                    e->destroy();
-                    *out = NULL;
-                    return 1;
+                    return false;
                 }
             }
         }
-        (void)pulsar_gpu_set_model_fd(e->model.fd);
+        /* the fd names its mapping (a group's later member must not re-key the first's) */
+        (void)pulsar_gpu_set_model_fd_for_map(e->model.fd, e->model.map);
         const int model_map_ok =
             pulsar_gpu_set_model_map_range(e->model.map,
                                         e->model.size,
@@ -698,9 +706,7 @@ int pulsar_engine::open(pulsar_engine **out, const pulsar_engine_options *opt) {
                     "pulsar: %s failed to map model views; aborting startup. "
                     "This is commonly caused by insufficient memory or accelerator VM budget.\n",
                     pulsar_backend_name(e->backend));
-            e->destroy();
-            *out = NULL;
-            return 1;
+            return false;
         }
         if (e->dspark_ready && e->dspark_external &&
             !pulsar_gpu_set_model_map_range(e->dspark_model.map,
@@ -713,33 +719,34 @@ int pulsar_engine::open(pulsar_engine **out, const pulsar_engine_options *opt) {
                     "pulsar: %s failed to map DSpark model views; aborting startup. "
                     "This is commonly caused by insufficient memory or accelerator VM budget.\n",
                     pulsar_backend_name(e->backend));
-            e->destroy();
-            *out = NULL;
-            return 1;
+            return false;
         }
+    }
+    return true;
+}
+
+/* Phase 3: the weights staged into the device cache. */
+static bool open_stage(pulsar_engine *e) {
+    if (pulsar_backend_uses_graph(e->backend)) {
         register_model_fds(&e->model);
         if (!accelerator_cache_model_tensors(e->backend, &e->model,
                                              NULL, NULL, 0,
                                              e->dspark_ready ? NULL : "dspark.")) {
             fprintf(stderr, "pulsar: %s failed to prepare optional model cache\n",
                     pulsar_backend_name(e->backend));
-            e->destroy();
-            *out = NULL;
-            return 1;
+            return false;
         }
         if (e->dspark_ready && e->dspark_external) {
             /* An external drafter is its own model: it stages its own expert
              * stacks, for the same rank. */
-            e->dspark_model.tp_rank = tp_rank_at_load;
-            e->dspark_model.tp_n_ranks = tp_n_ranks_at_load;
+            e->dspark_model.tp_rank = e->model.tp_rank;
+            e->dspark_model.tp_n_ranks = e->model.tp_n_ranks;
             register_model_fds(&e->dspark_model);
             if (!accelerator_cache_model_tensors(e->backend, &e->dspark_model,
                                                  NULL, NULL, 0, NULL)) {
                 fprintf(stderr, "pulsar: %s failed to prepare optional DSpark model cache\n",
                         pulsar_backend_name(e->backend));
-                e->destroy();
-                *out = NULL;
-                return 1;
+                return false;
             }
             /* The main model's fd no longer needs restoring here: the fd route
              * is a per-mapping table now, so registering the drafter's mapping
@@ -750,14 +757,18 @@ int pulsar_engine::open(pulsar_engine **out, const pulsar_engine_options *opt) {
                                                 &e->overlay_model)) {
             fprintf(stderr, "pulsar: %s failed to prepare expert-overlay spans\n",
                     pulsar_backend_name(e->backend));
-            e->destroy();
-            *out = NULL;
-            return 1;
+            return false;
         }
         fprintf(stderr, "pulsar: %s backend initialized for graph diagnostics\n",
                 pulsar_backend_name(e->backend));
     }
 
+    return true;
+}
+
+/* Phase 4: the TP transport, the family's device-side registrations, the host pages released. */
+static bool open_finish(pulsar_engine *e, const pulsar_engine_options *opt) {
+    const bool graph_backend = pulsar_backend_uses_graph(e->backend);
     /* Two-rank TP (slice 4b, prefill big-gate arm).  Built here, after the
      * model/weights are bound and the GPU is up, because the identity needs the
      * resolved shape and the slab needs the CUDA runtime.  Only the graph
@@ -767,9 +778,7 @@ int pulsar_engine::open(pulsar_engine **out, const pulsar_engine_options *opt) {
         if (!graph_backend) {
             fprintf(stderr, "pulsar: tensor parallelism requires the CUDA/graph "
                             "backend, not %s\n", pulsar_backend_name(e->backend));
-            e->destroy();
-            *out = NULL;
-            return 1;
+            return false;
         }
         char tperr[512];
         pulsar_tp_options tp_opt;
@@ -784,8 +793,8 @@ int pulsar_engine::open(pulsar_engine **out, const pulsar_engine_options *opt) {
         else               tp_opt.peer = opt->tp_peer;
         /* The rank and group size were decided ONCE, before staging (slice 4f);
          * the transport is built for that same identity. */
-        tp_opt.rank = tp_rank_at_load;
-        tp_opt.n_ranks = (int)tp_n_ranks_at_load;
+        tp_opt.rank = e->model.tp_rank;
+        tp_opt.n_ranks = (int)e->model.tp_n_ranks;
         tp_opt.build = opt->build_id;
         uint32_t tp_layers = 0, tp_embd = 0, tp_vocab = 0;
         e->family->tp_shape(e, &tp_layers, &tp_embd, &tp_vocab);
@@ -805,9 +814,7 @@ int pulsar_engine::open(pulsar_engine **out, const pulsar_engine_options *opt) {
         if (!tp_ok) {
             fprintf(stderr, "pulsar: tensor parallelism bring-up failed: %s\n",
                     tperr);
-            e->destroy();
-            *out = NULL;
-            return 1;
+            return false;
         }
         if (opt->tp_kv_dir && opt->tp_kv_dir[0]) e->tp_kv_dir = pulsar_strdup(opt->tp_kv_dir);
         e->tp_slab_bytes = pulsar_tp_slab_bytes(tp_layers, tp_embd);
@@ -822,9 +829,7 @@ int pulsar_engine::open(pulsar_engine **out, const pulsar_engine_options *opt) {
                 !(e->tp_bulk_dev = pulsar_tp_gpu_slab_device_ptr(e->tp_bulk_base, tperr, sizeof(tperr)))) {
                 fprintf(stderr, "pulsar: tensor parallelism bulk buffer (%llu bytes) setup failed: %s\n",
                         (unsigned long long)e->tp_bulk_bytes, tperr);
-                e->destroy();
-                *out = NULL;
-                return 1;
+                return false;
             }
             pulsar_tp_set_bulk(e->tp, e->tp_bulk_base, e->tp_bulk_bytes);
         }
@@ -835,16 +840,12 @@ int pulsar_engine::open(pulsar_engine **out, const pulsar_engine_options *opt) {
             !(e->tp_slab_dev = pulsar_tp_gpu_slab_device_ptr(e->tp_slab_base, tperr, sizeof(tperr)))) {
             fprintf(stderr, "pulsar: tensor parallelism slab setup failed: %s\n",
                     tperr);
-            e->destroy();
-            *out = NULL;
-            return 1;
+            return false;
         }
         if (pulsar_tp_row_lane(e->tp)) {
             if (!pulsar_gpu_tp_wait_init(tperr, sizeof(tperr))) {
                 fprintf(stderr, "pulsar: tensor parallelism row lane refused: %s\n", tperr);
-                e->destroy();
-                *out = NULL;
-                return 1;
+                return false;
             }
             pulsar_tp_row_lane_layout_t L;
             pulsar_tp_row_lane_layout(e->tp, &L);
@@ -859,9 +860,7 @@ int pulsar_engine::open(pulsar_engine **out, const pulsar_engine_options *opt) {
                             "the transport came up as rank %d/%u -- refusing\n",
                     e->model.tp_rank, e->model.tp_n_ranks,
                     pulsar_tp_rank(e->tp), pulsar_tp_n_ranks(e->tp));
-            e->destroy();
-            *out = NULL;
-            return 1;
+            return false;
         }
         fprintf(stderr, "pulsar: TP rank %d/%d armed (prefill big-gate), slab %zu bytes, %.2f GiB of stored tensors "
                         "unstaged (the plan's)\n",
@@ -871,9 +870,7 @@ int pulsar_engine::open(pulsar_engine **out, const pulsar_engine_options *opt) {
 
     /* The rank's TP slices (the core's plan), then the family's own device-side registrations and announces. */
     if (graph_backend && (!pulsar_tp_plan_run(e) || !e->family->after_gpu(e))) {
-        e->destroy();
-        *out = NULL;
-        return 1;
+        return false;
     }
 
     /* Every weight the device reads now lives in device memory (the staged spans,
@@ -898,8 +895,53 @@ int pulsar_engine::open(pulsar_engine **out, const pulsar_engine_options *opt) {
         }
     }
 
-    *out = e;
-    return 0;
+    return true;
+}
+
+int pulsar_engine::open(pulsar_engine **out, const pulsar_engine_options *opt) { return open_group(out, opt, 1); }
+
+/* L321: n engines in one process on one GPU (pulsar.h pulsar_engine_open_group).  Each phase runs for every member
+ * before the next phase starts -- every mapping is set before any weight is staged, the external drafter's order --
+ * so no member's staging is dropped by another's mapping.  A single open is a group of one: the same phases in the
+ * same order as before. */
+int pulsar_engine::open_group(pulsar_engine **out, const pulsar_engine_options *opts, uint32_t n) {
+    for (uint32_t i = 0; i < n; i++) out[i] = NULL;
+    const char *why = NULL;
+    if (n == 0) why = "an empty group";
+    else if (g_live_engines > 0) why = "engines are already live in this process (open every engine of a process in one group)";
+    for (uint32_t i = 0; n > 1 && !why && i < n; i++) {
+        if (opts[i].tp_role != 0 || opts[i].tp_peers) why = "tensor parallelism in a group";
+        else if (opts[i].inspect_only) why = "an inspect-only open in a group";
+        else if (!pulsar_backend_uses_graph(opts[i].backend)) why = "a group off the GPU backend";
+    }
+    if (why) {
+        fprintf(stderr, "pulsar: engine open refused: %s\n", why);
+        return 1;
+    }
+    bool ok = true;
+    for (uint32_t i = 0; ok && i < n; i++) ok = open_load(&out[i], &opts[i]) == 0;
+    /* the family's load binds everything (drafter and vision tower included) before the inspect-only exit:
+     * --inspect proves the whole artifact binds */
+    if (ok && n == 1 && opts[0].inspect_only) return 0;
+    for (uint32_t i = 0; ok && i < n; i++) ok = open_map(out[i]);
+    if (ok && n > 1 && pulsar_gpu_model_reads_host_pages()) {
+        /* a registered mapping is the integrated GPU's single-model route; a group stages every member */
+        fprintf(stderr, "pulsar: engine open refused: a group needs every model staged in device memory, and this "
+                        "device reads a mapping through host registration\n");
+        ok = false;
+    }
+    for (uint32_t i = 0; ok && i < n; i++) ok = open_stage(out[i]);
+    for (uint32_t i = 0; ok && i < n; i++) ok = open_finish(out[i], &opts[i]);
+    if (ok) {
+        if (n > 1) fprintf(stderr, "pulsar: %u engines open in one process\n", n);
+        return 0;
+    }
+    for (uint32_t i = n; i-- > 0;)
+        if (out[i]) {
+            out[i]->destroy();
+            out[i] = NULL;
+        }
+    return 1;
 }
 
 
@@ -1045,11 +1087,21 @@ void pulsar_engine::destroy() {
     e->vocab.vocab_free();
     /* Tear down GPU state (which cudaHostUnregisters the mmap'd weight ranges)
      * before munmap'ing the model — unmapping still-registered pages is UB. */
-    pulsar_gpu_cleanup();
-    if (e->dspark_ready && e->dspark_external) model_close(&e->dspark_model);
-    if (e->overlay_ready) model_close(&e->overlay_model);
-    model_close(&e->model);
-    pulsar_release_instance_lock();
+    if (e->live) g_live_engines--;
+    if (g_live_engines > 0) {
+        /* other engines live on: this one's mappings stay until the last close (L321) */
+        if (e->dspark_ready && e->dspark_external) g_deferred_models.push_back(e->dspark_model);
+        if (e->overlay_ready) g_deferred_models.push_back(e->overlay_model);
+        g_deferred_models.push_back(e->model);
+    } else {
+        pulsar_gpu_cleanup();
+        for (pulsar_model &m : g_deferred_models) model_close(&m);
+        g_deferred_models.clear();
+        if (e->dspark_ready && e->dspark_external) model_close(&e->dspark_model);
+        if (e->overlay_ready) model_close(&e->overlay_model);
+        model_close(&e->model);
+        if (e->live) pulsar_release_instance_lock();
+    }
     free(e->directional_steering_dirs);
     free(e->directional_steering_file);
     free(e);

@@ -1972,6 +1972,7 @@ struct pulsar_engine {
     uint32_t tp_worker_n;
     uint32_t tp_worker_cap;
     bool gpu_ready;             ///< CUDA backend initialised and weights resident
+    bool live;                  ///< L321: counted among the process's live engines (holds the instance)
     bool dspark_ready;          ///< a usable drafter is loaded; false disables speculation
     const struct pulsar_drafter_ops *drafter_ops;   ///< L272 P1: the loaded drafter behind the round API (spec_ops.h), or NULL = none
     /** L298: the loaded block drafter (spec_block.h: its declaration, tap points, weights, state ids), or NULL -- set
@@ -2003,6 +2004,8 @@ struct pulsar_engine {
      * managed exactly as before via open()/destroy() (xcalloc/free), NOT
      * constructors/destructors. */
     static int open(pulsar_engine **out, const pulsar_engine_options *opt);
+    /** L321: n engines in one process (pulsar.h pulsar_engine_open_group). */
+    static int open_group(pulsar_engine **out, const pulsar_engine_options *opts, uint32_t n);
     void destroy();  ///< was pulsar_engine_close
     /** Print a human-readable model summary (shape, quantisation, memory) to
      * stderr. */

@@ -153,6 +153,10 @@ static void print_model_runtime(FILE *fp, const help_colors *c,
     title(fp, c, "Model And Runtime");
     opt(fp, c, "-m, --model PATH", "Checkpoint to serve: a shard directory or a single");
     opt(fp, c, "", "file. Default: ./model, else $PULSAR_MODEL_DIR/model");
+    if (tool == PULSAR_HELP_SERVER) {
+        opt(fp, c, "", "Repeat -m to serve several ENCODER models (embed, rerank) from one");
+        opt(fp, c, "", "process on one GPU, each on its own endpoint.");
+    }
     if (tool != PULSAR_HELP_BENCH) {
         opt(fp, c, "-c, --ctx N", "Allocated context tokens.");
     }

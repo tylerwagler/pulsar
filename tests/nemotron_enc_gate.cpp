@@ -2,6 +2,7 @@
  * encoder API only (pulsar.h pulsar_engine_encode*).  Needs the GPU.
  *
  *   nemotron_enc_gate MODEL INPUTS.json OUT.f32
+ *   nemotron_enc_gate --group MODEL_A INPUTS_A.json REF_A.f32 MODEL_B INPUTS_B.json REF_B.f32
  *
  * INPUTS.json: [{"name": .., "role": "query" | "passage" | "pair", "text": .., "doc": ..}, ...] -- the fixed set the
  * reference was captured on (retriever/ref/inputs.py; retriever/engine/grade.py writes this file and grades OUT.f32,
@@ -13,7 +14,15 @@
  *       input, and the pool runs in row order);
  *   E4  an embedding is unit length; a score is finite;
  *   E5  refusals: an empty input, an input one token past the cap.
- * Prints the batch's tokens per second (info).  Exit 0 = every check passed. */
+ * Prints the batch's tokens per second (info).
+ *
+ * --group (pulsar_engine_open_group: several engines in one process, one GPU; REF_* = each model's OUT.f32 from a run
+ * of its own):
+ *   G1  one group opens both; G2  an open while they live is refused;
+ *   G3  each engine's vectors == its own run's, bit for bit, with the calls interleaved (A, B, A);
+ *   G4  A closed, B still encodes its bytes (A's mappings outlive it until the last close);
+ *   G5  B closed, the process opens A alone again and encodes its bytes.
+ * Exit 0 = every check passed. */
 #include "../src/pulsar.h"
 #include "../src/lib/pyjson.h"
 
@@ -50,47 +59,136 @@ struct input {
     pulsar_tokens tok;
 };
 
-int main(int argc, char **argv) {
-    if (argc != 4) {
-        fprintf(stderr, "usage: nemotron_enc_gate MODEL INPUTS.json OUT.f32\n");
-        return 2;
-    }
+/* the inputs file -> inputs; false (said) when it is not one */
+static bool load_inputs(const char *path, std::vector<input> *in) {
     std::string js;
-    {
-        FILE *f = fopen(argv[2], "rb");
-        if (!f) {
-            fprintf(stderr, "nemotron_enc_gate: cannot read %s\n", argv[2]);
-            return 2;
-        }
-        char buf[1 << 16];
-        size_t n;
-        while ((n = fread(buf, 1, sizeof buf, f)) > 0) js.append(buf, n);
-        fclose(f);
+    FILE *f = fopen(path, "rb");
+    if (!f) {
+        fprintf(stderr, "nemotron_enc_gate: cannot read %s\n", path);
+        return false;
     }
+    char buf[1 << 16];
+    size_t n;
+    while ((n = fread(buf, 1, sizeof buf, f)) > 0) js.append(buf, n);
+    fclose(f);
     pyjson_value doc;
     char err[512];
     if (!pyjson_parse(js.data(), js.size(), &doc, err, sizeof err) || doc.kind != pyjson_value::ARR) {
-        fprintf(stderr, "nemotron_enc_gate: %s is not a JSON array: %s\n", argv[2], err);
-        return 2;
+        fprintf(stderr, "nemotron_enc_gate: %s is not a JSON array: %s\n", path, err);
+        return false;
     }
-    std::vector<input> in;
     for (const pyjson_value &x : doc.a) {
         input i = {};
-        const pyjson_value *n = x.get("name"), *r = x.get("role"), *t = x.get("text"), *d = x.get("doc");
-        if (!n || !r || !t) {
+        const pyjson_value *nm = x.get("name"), *r = x.get("role"), *t = x.get("text"), *d = x.get("doc");
+        if (!nm || !r || !t) {
             fprintf(stderr, "nemotron_enc_gate: an input without name / role / text\n");
-            return 2;
+            return false;
         }
-        i.name = n->s;
+        i.name = nm->s;
         i.text = t->s;
         i.doc = d ? d->s : "";
         i.role = r->s == "query" ? PULSAR_ENCODE_QUERY : r->s == "passage" ? PULSAR_ENCODE_PASSAGE : PULSAR_ENCODE_PAIR;
-        in.push_back(i);
+        in->push_back(i);
     }
+    return true;
+}
 
+static pulsar_engine_options options(const char *model) {
     pulsar_engine_options opt = {};
-    opt.model_path = argv[1];
+    opt.model_path = model;
     opt.backend = PULSAR_BACKEND_CUDA;
+    return opt;
+}
+
+/* one model's inputs, rendered by its engine, and the vectors its own run wrote */
+struct member {
+    const char *model;
+    std::vector<input> in;
+    std::vector<pulsar_tokens> tok;
+    std::vector<float> ref;
+};
+
+static bool load_member(const char *model, const char *inputs, const char *ref, member *m) {
+    m->model = model;
+    if (!load_inputs(inputs, &m->in)) return false;
+    FILE *f = fopen(ref, "rb");
+    if (!f) {
+        fprintf(stderr, "nemotron_enc_gate: cannot read %s\n", ref);
+        return false;
+    }
+    float v;
+    while (fread(&v, 4, 1, f) == 1) m->ref.push_back(v);
+    fclose(f);
+    return true;
+}
+
+static bool render_member(pulsar_engine *e, member *m) {
+    char err[384];
+    m->tok.assign(m->in.size(), pulsar_tokens{});
+    for (size_t i = 0; i < m->in.size(); i++)
+        if (!pulsar_engine_encode_render(e, m->in[i].role, m->in[i].text.c_str(), m->in[i].doc.c_str(), &m->tok[i], err,
+                                         sizeof err)) {
+            fprintf(stderr, "nemotron_enc_gate: %s: %s\n", m->model, err);
+            return false;
+        }
+    return true;
+}
+
+/* the member's inputs through `e` == its own run's vectors, bit for bit */
+static bool same_as_own_run(pulsar_engine *e, const member &m) {
+    char err[384];
+    const uint32_t D = pulsar_engine_encode_dim(e);
+    if (m.ref.size() != m.in.size() * D) return false;
+    std::vector<float> out(m.ref.size());
+    return pulsar_engine_encode(e, m.tok.data(), (uint32_t)m.tok.size(), out.data(), err, sizeof err) == 0 &&
+           memcmp(out.data(), m.ref.data(), out.size() * 4) == 0;
+}
+
+static int group_main(char **argv) {
+    member A, B;
+    if (!load_member(argv[0], argv[1], argv[2], &A) || !load_member(argv[3], argv[4], argv[5], &B)) return 2;
+    const pulsar_engine_options opts[2] = {options(A.model), options(B.model)};
+    pulsar_engine *g[2] = {};
+    fprintf(stderr, "G1 one group\n");
+    const int rc = pulsar_engine_open_group(g, opts, 2);
+    check(rc == 0 && g[0] && g[1], "both open in one process");
+    if (rc != 0) return 1;
+    check(pulsar_engine_encoder(g[0]) != PULSAR_ENCODER_NONE && pulsar_engine_encoder(g[1]) != PULSAR_ENCODER_NONE,
+          "both encoders (%s, %s)", pulsar_engine_served_model_id(g[0]), pulsar_engine_served_model_id(g[1]));
+    if (!render_member(g[0], &A) || !render_member(g[1], &B)) return 1;
+    fprintf(stderr, "G2 a late open\n");
+    pulsar_engine *late = NULL;
+    check(pulsar_engine_open(&late, &opts[0]) != 0 && !late, "an open while the group lives is refused");
+    fprintf(stderr, "G3 interleaved\n");
+    check(same_as_own_run(g[0], A), "%s == its own run", pulsar_engine_served_model_id(g[0]));
+    check(same_as_own_run(g[1], B), "%s == its own run", pulsar_engine_served_model_id(g[1]));
+    check(same_as_own_run(g[0], A), "%s again == its own run", pulsar_engine_served_model_id(g[0]));
+    fprintf(stderr, "G4 the first closed\n");
+    pulsar_engine_close(g[0]);
+    check(same_as_own_run(g[1], B), "the other still == its own run");
+    fprintf(stderr, "G5 the last closed, a fresh open\n");
+    pulsar_engine_close(g[1]);
+    pulsar_engine *e = NULL;
+    check(pulsar_engine_open(&e, &opts[0]) == 0 && e && same_as_own_run(e, A), "%s alone == its own run", A.model);
+    if (e) pulsar_engine_close(e);
+    for (member *m : {&A, &B})
+        for (pulsar_tokens &t : m->tok) pulsar_tokens_free(&t);
+    fprintf(stderr, "nemotron_enc_gate --group: %s\n", n_fail ? "FAIL" : "PASS");
+    return n_fail ? 1 : 0;
+}
+
+int main(int argc, char **argv) {
+    if (argc == 8 && !strcmp(argv[1], "--group")) return group_main(argv + 2);
+    if (argc != 4) {
+        fprintf(stderr, "usage: nemotron_enc_gate MODEL INPUTS.json OUT.f32\n"
+                        "       nemotron_enc_gate --group MODEL_A INPUTS_A.json REF_A.f32 MODEL_B INPUTS_B.json REF_B.f32\n");
+        return 2;
+    }
+    std::vector<input> in;
+    if (!load_inputs(argv[2], &in)) return 2;
+    char err[512];
+
+    const pulsar_engine_options opt = options(argv[1]);
     pulsar_engine *e = NULL;
     if (pulsar_engine_open(&e, &opt) != 0 || !e) {
         fprintf(stderr, "nemotron_enc_gate: the engine did not open %s\n", argv[1]);

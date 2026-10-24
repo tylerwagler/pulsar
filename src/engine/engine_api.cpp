@@ -252,6 +252,9 @@ static inline const pulsar_family_bank_ops *session_banks(const pulsar_session *
 
 
 int pulsar_engine_open(pulsar_engine **out, const pulsar_engine_options *opt) { return pulsar_engine::open(out, opt); }
+int pulsar_engine_open_group(pulsar_engine **out, const pulsar_engine_options *opts, uint32_t n) {
+    return pulsar_engine::open_group(out, opts, n);
+}
 void pulsar_engine_close(pulsar_engine *e) { if (e) e->destroy(); }
 void pulsar_engine_summary(pulsar_engine *e) { e->summary(); }
 int pulsar_engine_vocab_size(pulsar_engine *e) { return e ? e->vocab_size() : 0; }
