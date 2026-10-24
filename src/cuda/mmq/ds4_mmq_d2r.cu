@@ -1055,7 +1055,7 @@ bool ds4_mmq_iq2_xxs_moe_d2r_available(int cc) {
     if (cached_cc != cc) {
         cached_cc = cc;
         cached = (GGML_CUDA_CC_IS_NVIDIA(cc) &&
-                  ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_AMPERE &&
+                  pulsar_cuda_block_scale_mma(cc / 100) &&   /* the DEVICE has the MMA (L321) */
                   ds4_iq2_grid_magnitudes_ok()) ? 1 : 0;
     }
     return cached != 0;

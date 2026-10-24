@@ -39,6 +39,7 @@
  */
 #include <cuda_fp8.h>
 #include "pulsar_cuda_internal.h"
+#include "pulsar_cuda_arch.cuh"
 
 #include <cstdio>
 
@@ -126,13 +127,13 @@ __device__ __forceinline__ static void idx_mma_m16n8k32(
           "r"(sfa), "h"(bid), "h"(tid),
           "r"(sfb), "h"(bid), "h"(tid));
 #else
-    /* The PTX-only pass compiles this arm.  Producing ZEROS here would be the
-     * exact hazard this codebase keeps finding: a path that silently returns
-     * plausible-looking wrong numbers instead of refusing.  Emit NaN so that if
-     * this image is ever JITed and run, the scores are visibly broken rather
-     * than quietly mis-selecting rows. */
+    /* The PTX-only pass (and any image below sm_120f) compiles this arm.  It
+     * traps (L321): NaN scores still returned, and the launcher used to key on
+     * the head count alone.  It now refuses a device without the MMA, so this
+     * only runs if that refusal was bypassed. */
+    (void)d0; (void)d1; (void)d2; (void)d3;
     (void)a0; (void)a1; (void)a2; (void)a3; (void)b0; (void)b1; (void)sfa; (void)sfb;
-    d0 = d1 = d2 = d3 = __int_as_float(0x7fffffff);
+    __trap();
 #endif
 }
 
@@ -477,6 +478,16 @@ int pulsar_gpu_indexer_scores_mxfp4(
     if (!scores || !q || !weights || !comp) return 0;
     if (!pulsar_idx_mxfp4_heads_supported(n_head) || head_dim != IDX_HEAD_DIM) return 0;
     if (n_comp == 0u || n_tokens == 0u) return 0;
+    /* The scorer's MMA is the sm_12x block-scaled kind: ask the DEVICE (L321). */
+    if (!pulsar_cuda_block_scale_mma(pulsar_cuda_device_major())) {
+        static bool said = false;
+        if (!said) {
+            said = true;
+            fprintf(stderr, "pulsar: indexer mxfp4 needs the sm_12x block-scaled MMA; this device is sm_%dx -- refusing\n",
+                    pulsar_cuda_device_major());
+        }
+        return 0;
+    }
 
     /* Pre-pack Q once per token; the scorer then only copies bytes.  Every size
      * below is the RUNTIME head count -- the two instantiations differ in their
