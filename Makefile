@@ -288,7 +288,7 @@ pulsar-agent: $(AGENT_OBJS) src/lib/pulsar_help.o src/lib/pulsar_kvtext.o src/li
 CUDA_REGRESSION_BINS = tests/cuda_long_context_smoke tests/moe_route_bounds_gate tests/expert_table_gate \
                        tests/exl3_moe_epilogue_gate tests/exl3_dense_gate tests/exl3_moe_prefill_gate tests/exl3_half_gate \
                        tests/gdn_gate tests/qsa_attn_gate tests/qsa_yarn_test tests/qwen_s4_gate tests/router_gate tests/gqa_attn_gate tests/sconv_gate tests/head_gate \
-                       tests/bf16_rows_gate tests/nvfp4_rows_gate tests/mamba2_gate tests/rowops_gate tests/arch_gate
+                       tests/bf16_rows_gate tests/nvfp4_rows_gate tests/mamba2_gate tests/rowops_gate tests/arch_gate tests/pool_gate
 # 2026-10-14: they run CONCURRENTLY, each one's output kept together (-O).  They are model-free and mostly
 # host-bound (their references run on the CPU: measured alone, 258 s in series, the longest 114 s of which 113 s
 # user time), so in series they were 258 s of the battery's serial front.  No gate here grades a time.
@@ -821,10 +821,15 @@ head-mini-grade: tests/head_gate
 # own Qwen4ExpTextGatedDeltaNet).  The engine's NVCCFLAGS plus -fPIC.  Not a gate.
 tests/libpulsar_gdn.so: src/cuda/pulsar_cuda_gdn.cu src/cuda/pulsar_cuda_gdn.h src/cuda/pulsar_cuda_mx.cuh Makefile
 	$(NVCC) $(NVCCFLAGS) -Xcompiler -fPIC -shared -Isrc -o $@ src/cuda/pulsar_cuda_gdn.cu
-# L251 S3: the Qwen full-attention + QSA layer (pulsar_cuda_qsa.cu) against a
-# double host reference -- cache encode, top-512 selection incl. exact ties,
-# output, the o_proj E4M3 slot, decode == prefill, mutations.  Model-free;
-# needs a device.  Links the PRODUCTION objects.
+
+# L321: the encoders' mean pool -- f32, row order, bit-exact to the host loop (model-free).
+tests/pool_gate: tests/pool_gate.cu src/cuda/pulsar_cuda_pool.o src/cuda/pulsar_cuda_pool.h Makefile
+	$(NVCC) $(NVCCFLAGS) -std=c++17 -Isrc -Isrc/cuda -o $@ tests/pool_gate.cu src/cuda/pulsar_cuda_pool.o
+
+.PHONY: pool-gate
+pool-gate: tests/pool_gate
+	./tests/pool_gate
+
 # L321: lanes that exist only for some devices decide by the DEVICE, not the compiled arch (model-free).
 tests/arch_gate: tests/arch_gate.cu Makefile src/pulsar_gpu.h src/cuda/pulsar_cuda_arch.cuh src/cuda/mmq/ds4_mmq.h \
                  $(CUDA_OBJS) $(CUTLASS_CUDA_OBJS) $(MMQ_OBJS)
@@ -835,6 +840,10 @@ tests/arch_gate: tests/arch_gate.cu Makefile src/pulsar_gpu.h src/cuda/pulsar_cu
 arch-gate: tests/arch_gate
 	./tests/arch_gate
 
+# L251 S3: the Qwen full-attention + QSA layer (pulsar_cuda_qsa.cu) against a
+# double host reference -- cache encode, top-512 selection incl. exact ties,
+# output, the o_proj E4M3 slot, decode == prefill, mutations.  Model-free;
+# needs a device.  Links the PRODUCTION objects.
 tests/qsa_attn_gate: tests/qsa_attn_gate.cu Makefile src/pulsar_gpu.h src/cuda/pulsar_cuda_mx.cuh \
                      $(CUDA_OBJS) $(CUTLASS_CUDA_OBJS) $(MMQ_OBJS)
 	$(NVCC) $(NVCCFLAGS) -std=c++17 -Isrc -Isrc/cuda -o $@ tests/qsa_attn_gate.cu \
