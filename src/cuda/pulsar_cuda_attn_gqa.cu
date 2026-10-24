@@ -90,6 +90,17 @@ struct gqa_args {
     float                *tap;
 };
 
+#if !PULSAR_SM80
+/* A packed bf16 pair as the packed fp16 pair of the SAME values: a bf16 has 8 significant bits and fp16 11, so the
+ * widening is exact for every value inside fp16's normal range (|x| in [2^-14, 65504]).  The attention's operands sit
+ * far inside it (q / k / v peak ~32 in the Nemotron-3.5 encoders, retriever/README.md; P and its lo part are in
+ * [0, 1]), and a P lo term small enough to land in fp16's subnormals carries at most 2^-8 of a weight already < 2^-14. */
+__device__ __forceinline__ uint32_t gqa_bf2h(uint32_t w) {
+    const __half2 h = __floats2half2_rn(__uint_as_float(w << 16), __uint_as_float(w & 0xffff0000u));
+    return *reinterpret_cast<const uint32_t *>(&h);
+}
+#endif
+
 __device__ __forceinline__ void gqa_mma(float (&d)[4], uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3,
                                         uint32_t b0, uint32_t b1) {
 #if PULSAR_SM80
@@ -98,7 +109,19 @@ __device__ __forceinline__ void gqa_mma(float (&d)[4], uint32_t a0, uint32_t a1,
                  : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
                  : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
 #else
-    __trap();
+    /* sm_75 (L321): Turing has no bf16 MMA and no k16 shape.  The same products as fp16 operands (gqa_bf2h, exact)
+     * on two m16n8k8 MMAs, k 0..7 then k 8..15: the k16 fragment's registers split along k exactly so (A a0 a1 / B b0
+     * hold k 0..7, a2 a3 / b1 hold k 8..15), the split exllamav3's sm_75 port uses.  f32 accumulate as on sm_80. */
+    const uint32_t A0 = gqa_bf2h(a0), A1 = gqa_bf2h(a1), A2 = gqa_bf2h(a2), A3 = gqa_bf2h(a3);
+    const uint32_t B0 = gqa_bf2h(b0), B1 = gqa_bf2h(b1);
+    asm volatile("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 "
+                 "{%0,%1,%2,%3}, {%4,%5}, {%6}, {%0,%1,%2,%3};\n"
+                 : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
+                 : "r"(A0), "r"(A1), "r"(B0));
+    asm volatile("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 "
+                 "{%0,%1,%2,%3}, {%4,%5}, {%6}, {%0,%1,%2,%3};\n"
+                 : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
+                 : "r"(A2), "r"(A3), "r"(B1));
 #endif
 }
 __device__ __forceinline__ void gqa_ldsm4(uint32_t (&r)[4], const void *p) {
