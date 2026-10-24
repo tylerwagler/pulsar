@@ -51,6 +51,7 @@
  * reference's rms and the mean max attention weight. */
 #include "cuda/pulsar_cuda_attn_gqa.h"
 #include "gqa_ref.h"
+#include "lib/pulsar_yarn.h"   /* L321: the YaRN table of the encoder case */
 
 #include <cuda_runtime.h>
 
@@ -849,7 +850,9 @@ static void run_long(Case &C, uint32_t P0) {
  * nothing is stored.  The pool-less run equals the same run over a pool bit for bit, grades against the host
  * authority with every row seeing the whole run, and the causal mutation fails it; a pool-less run that does not
  * start at 0 (it would need earlier keys) is refused. */
-static void run_encoder(Case &C, uint32_t N) {
+/* `plain` (optional): the same layer with the plain NeoX rope -- grading the run against it must FAIL, which proves a
+ * frequency table on C is the one the kernel used */
+static void run_encoder(Case &C, uint32_t N, const Case *plain = nullptr) {
     printf("\n=== %s: an encoder input -- one bidirectional run of %u rows from position 0, no pool\n", C.name, N);
     Case Bk = C;
     Bk.L.block = 1;
@@ -878,6 +881,13 @@ static void run_encoder(Case &C, uint32_t N) {
         const Grade M = grade(C, H, pl, gp);   /* the causal reference */
         check(M.fro >= 20 * BAR_FRO || M.max >= 20 * BAR_MAX,
               "mutation 'causal' fails the encoder grade: fro %.2e, max %.2e", M.fro, M.max);
+        if (plain) {
+            History Hp;
+            history_build(*plain, 900, N, Hp, 0, 0);
+            const Grade Pm = grade(*plain, Hp, pl, gp, gref_mut(), &hi);
+            check(Pm.fro > BAR_FRO || Pm.max > BAR_MAX,
+                  "mutation 'plain rope' (no frequency table) fails the encoder grade: fro %.2e, max %.2e", Pm.fro, Pm.max);
+        }
     }
     std::vector<std::pair<uint32_t, uint32_t>> late;
     for (uint32_t i = 5; i < 13; i++) late.push_back({0u, i});
@@ -1106,6 +1116,30 @@ int main(int argc, char **argv) {
     case_init(ge, "encoder-full-rope", 32, 8, 128, 0, 600, false, 0, 0.f, 0.f, false, 1.0f / sqrtf(128.f), 600, 111);
     ge.R.rope_theta = 1e6f; ge.L.rope_theta = 1e6f;
     run_encoder(ge, 600);
+
+    /* L321: the same with Ministral-3's YaRN rope (factor 16, original context 16384, beta_fast 32, beta_slow 1;
+     * mscale = mscale_all_dim = 1, so transformers' attention factor is exactly 1): the per-pair table in transformers'
+     * form from src/lib/pulsar_yarn.h, in double and rounded once to f32 -- the kernel reads it, the reference too */
+    Case gy;
+    case_init(gy, "encoder-full-yarn", 32, 8, 128, 0, 600, false, 0, 0.f, 0.f, false, 1.0f / sqrtf(128.f), 600, 111);
+    gy.R.rope_theta = 1e6f; gy.L.rope_theta = 1e6f;
+    {
+        double low = 0, high = 0;
+        pulsar_yarn_corr_range<double>(128u, 16384u, 1e6, 32.0, 1.0, &low, &high);
+        gy.R.inv_freq.resize(64);
+        for (uint32_t i = 0; i < 64; i++) {
+            const double pf = pow(1e6, (double)(2u * i) / 128.0);
+            gy.R.inv_freq[i] = (float)pulsar_yarn_blend<double>(1.0 / (16.0 * pf), 1.0 / pf,
+                                                               pulsar_yarn_extrap_weight<double>(low, high, (double)i));
+        }
+        float *d_inv = nullptr;
+        CK(cudaMalloc(&d_inv, 64 * sizeof(float)));
+        CK(cudaMemcpy(d_inv, gy.R.inv_freq.data(), 64 * sizeof(float), cudaMemcpyHostToDevice));
+        gy.L.rope_inv_freq = d_inv;
+        printf("\n(YaRN table: ramp pairs [%.0f, %.0f]; inv_freq[0] %.6g, [32] %.6g, [63] %.6g)\n", low, high,
+               gy.R.inv_freq[0], gy.R.inv_freq[32], gy.R.inv_freq[63]);
+    }
+    run_encoder(gy, 600, &ge);
 
     run_refusals(g1, gr);
 
