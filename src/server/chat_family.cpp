@@ -909,6 +909,7 @@ const server_family_ops *server_family_for_format(pulsar_chat_format fmt) {
     case PULSAR_CHAT_QWEN:    return &k_family_qwen;
     case PULSAR_CHAT_INKLING: return &k_family_inkling;
     case PULSAR_CHAT_NEMOTRON_H: return &k_family_nemotron_h;
+    case PULSAR_CHAT_NONE: break;   /* an encoder: no conversation to serve */
     }
     pulsar_die("server_family_for_format: a chat format without a server family table");
     return NULL;   /* unreachable: pulsar_die exits */
