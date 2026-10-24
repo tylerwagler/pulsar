@@ -24,6 +24,8 @@
 #include "pulsar_cuda_rope.cuh"   /* the NeoX bf16 rotation: ONE authority (rope_neox_bf16_pair_dev) */
 #include "pulsar_cuda_arch.cuh"
 
+#include <type_traits>
+
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>
@@ -185,9 +187,17 @@ struct gqa_prep_args {
     __nv_bfloat16        *q;          /* workspace */
     uint8_t              *fresh;      /* workspace */
 };
+/* L321: a scaled rope's (YaRN) per-pair inverse frequencies ride a DERIVED argument block, so the plain kernel's
+ * parameters -- and its code -- are exactly what they were */
+struct gqa_prep_table_args : gqa_prep_args {
+    const float *rope_inv;
+};
 
-template <int HD>
-__global__ void __launch_bounds__(256) gqa_prep_kernel(const gqa_prep_args a) {
+/* A = gqa_prep_args (the plain rope: 1 / theta^(2p/d)) or gqa_prep_table_args (the frequencies from a.rope_inv).
+ * A template, not a branch: the plain instantiation is the kernel it was. */
+template <int HD, class A>
+__global__ void __launch_bounds__(256) gqa_prep_kernel(const A a) {
+    constexpr bool TABLE = std::is_same<A, gqa_prep_table_args>::value;
     constexpr int NJ = HD / 32;
     const uint32_t row = blockIdx.x;
     const uint32_t job = blockIdx.y * 8u + (threadIdx.x >> 5);
@@ -235,7 +245,9 @@ __global__ void __launch_bounds__(256) gqa_prep_kernel(const gqa_prep_args a) {
         #pragma unroll
         for (int j = 0; j < NJ / 2; j++) {
             float r0, r1;
-            rope_neox_bf16_pair_dev(x[j], x[j + NJ / 2], lane + 32u * (uint32_t)j, HD, pos, a.rope_theta, &r0, &r1);
+            const uint32_t pr = lane + 32u * (uint32_t)j;
+            if constexpr (TABLE) rope_neox_bf16_pair_inv_dev(x[j], x[j + NJ / 2], a.rope_inv[pr], pos, &r0, &r1);
+            else rope_neox_bf16_pair_dev(x[j], x[j + NJ / 2], pr, HD, pos, a.rope_theta, &r0, &r1);
             x[j] = r0;
             x[j + NJ / 2] = r1;
         }
@@ -612,7 +624,14 @@ template <int HD>
 int gqa_launch(const pulsar_gqa_layer *L, const gqa_prep_args &pa, const gqa_args &aa, uint32_t n_rows,
                uint32_t n_tiles, uint32_t grid_chunks, bool fold, cudaStream_t st, const gqa_ws &ws) {
     const uint32_t jobs = L->n_q + 2u * L->n_kv;
-    gqa_prep_kernel<HD><<<dim3(n_rows, (jobs + 7u) / 8u), 256, 0, st>>>(pa);
+    if (L->rope_inv_freq) {
+        gqa_prep_table_args ta;
+        static_cast<gqa_prep_args &>(ta) = pa;
+        ta.rope_inv = L->rope_inv_freq;
+        gqa_prep_kernel<HD, gqa_prep_table_args><<<dim3(n_rows, (jobs + 7u) / 8u), 256, 0, st>>>(ta);
+    } else {
+        gqa_prep_kernel<HD, gqa_prep_args><<<dim3(n_rows, (jobs + 7u) / 8u), 256, 0, st>>>(pa);
+    }
     const bool bias = L->rel_extent > 0u;
     if (L->kv_fmt == PULSAR_GQA_KV_E4M3) {   /* L298: no relative bias with E4M3 rows (refused at the declaration) */
         if (fold) gqa_attn_kernel<HD, false, true, true><<<dim3(1, L->n_kv, n_tiles), 128, 0, st>>>(aa);
@@ -681,6 +700,7 @@ static int gqa_layer_refusal(const pulsar_gqa_layer *L) {
         return gqa_refuse("the temperature floor is negative or its alpha is not finite");
     }
     if (L->rope_theta < 0.f || !isfinite(L->rope_theta)) return gqa_refuse("the rope base is negative or not finite");
+    if (L->rope_inv_freq && !(L->rope_theta > 0.f)) return gqa_refuse("a rope frequency table with the rope off (rope_theta 0)");
     if (L->block && L->rel_extent) return gqa_refuse("a block (bidirectional run) with a relative bias has no built tile");
     return 0;
 }
@@ -810,14 +830,14 @@ int pulsar_gqa_launch(const pulsar_gqa_layer *L, const pulsar_gqa_call *call, co
                                           ((uint64_t)L->n_q << 24) ^ ((uint64_t)L->n_kv << 16) ^ ((uint64_t)HD << 4) ^
                                           ((uint64_t)L->span << 2) ^ (L->rel_extent ? 2u : 0u) ^ (L->temp_floor > 0.f ? 1u : 0u) ^
                                           (L->rope_theta > 0.f ? 0x100u : 0u) ^ (L->block ? 0x200u : 0u) ^
-                                          (L->kv_fmt == PULSAR_GQA_KV_E4M3 ? 0x400u : 0u));
+                                          (L->kv_fmt == PULSAR_GQA_KV_E4M3 ? 0x400u : 0u) ^ (L->rope_inv_freq ? 0x800u : 0u));
     if (pulsar_shape_once_first(&g_gqa_announce, key, "gqa attention")) {
         fprintf(stderr, "pulsar: gqa attention: %uq/%ukv/%u, KV %s, %s %u, rel bias %s (extent %u), temperature %s, "
                         "qk norm %s, gate %s, rope %s, %s: %u rows in %u tiles, %s\n",
                 L->n_q, L->n_kv, HD, L->kv_fmt == PULSAR_GQA_KV_E4M3 ? "E4M3" : "BF16",
                 L->span == PULSAR_GQA_WINDOW ? "window" : "full", L->window,
                 L->rel_extent ? "on" : "off", L->rel_extent, L->temp_floor > 0.f ? "on" : "off",
-                L->qk_norm ? "on" : "off", L->out_gate ? "on" : "off", L->rope_theta > 0.f ? "neox" : "off",
+                L->qk_norm ? "on" : "off", L->out_gate ? "on" : "off", L->rope_theta > 0.f ? (L->rope_inv_freq ? "neox (frequency table)" : "neox") : "off",
                 L->block ? "bidirectional runs, not stored" : "causal", n_rows, call->n_tiles,
                 fold ? "chunks folded in the CTA" : "chunks in parallel + combine");
     }
@@ -919,8 +939,16 @@ int pulsar_gqa_store(const pulsar_gqa_layer *L, const pulsar_gqa_seq *seqs, uint
     pa.e4m3 = L->kv_fmt == PULSAR_GQA_KV_E4M3 ? 1u : 0u;
     pa.fresh = fresh;
     const dim3 grid(n_rows, (2u * L->n_kv + 7u) / 8u);
-    if (L->head_dim == 128u) gqa_prep_kernel<128><<<grid, 256, 0, st>>>(pa);
-    else                     gqa_prep_kernel<64><<<grid, 256, 0, st>>>(pa);
+    gqa_prep_table_args ta;
+    static_cast<gqa_prep_args &>(ta) = pa;
+    ta.rope_inv = L->rope_inv_freq;
+    if (L->head_dim == 128u) {
+        if (L->rope_inv_freq) gqa_prep_kernel<128, gqa_prep_table_args><<<grid, 256, 0, st>>>(ta);
+        else                  gqa_prep_kernel<128, gqa_prep_args><<<grid, 256, 0, st>>>(pa);
+    } else {
+        if (L->rope_inv_freq) gqa_prep_kernel<64, gqa_prep_table_args><<<grid, 256, 0, st>>>(ta);
+        else                  gqa_prep_kernel<64, gqa_prep_args><<<grid, 256, 0, st>>>(pa);
+    }
     gqa_commit_kernel<<<n_rows, 128, 0, st>>>(rows, fresh, (uint32_t)tb);
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) {

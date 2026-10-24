@@ -22,7 +22,8 @@
  *   output gate   optional y *= sigmoid(gate) per (row, head, dim)
  *   rope          optional rotary position encoding of the normed q and k
  *                 at the row's position: the NeoX half-split rotation of
- *                 the whole head, base `rope_theta`, in the HF / vLLM bf16
+ *                 the whole head, base `rope_theta` (or, L321, a per-pair
+ *                 inverse-frequency table: YaRN), in the HF / vLLM bf16
  *                 arithmetic (cos and sin rounded to bf16, each product and
  *                 the sum one bf16 rounding)
  *   block         optional (L298, a block drafter's query block): every row
@@ -117,6 +118,9 @@ typedef struct {
     int               out_gate;     /**< 1: y *= sigmoid(gate) */
     float             rope_theta;   /**< > 0: NeoX rope of q and k at base rope_theta; 0 = none */
     int               block;        /**< 1: a run's rows attend its later rows too and are never stored (no bias) */
+    const float      *rope_inv_freq;/**< L321: device f32 [head_dim / 2]: pair p's inverse frequency in place of
+                                         1 / rope_theta^(2p / head_dim) -- a scaled rope (YaRN) the family builds on
+                                         the host (src/lib/pulsar_yarn.h); needs rope_theta > 0; NULL = plain NeoX */
 } pulsar_gqa_layer;
 
 /** One sequence's KV pool for ONE layer. */

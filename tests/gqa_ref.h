@@ -81,6 +81,7 @@ struct gref_layer {
     float floor_, alpha;        /* floor_ 0 = no temperature */
     bool gate;
     float rope_theta = 0.f;     /* > 0: NeoX rope of q and k */
+    std::vector<float> inv_freq;/* L321: non-empty = pair p's inverse frequency (a YaRN table) in place of theta's */
     bool e4m3 = false;          /* E4M3 KV rows: the stored k and v are gref_e4m3 of their bf16 values */
 };
 
@@ -94,7 +95,7 @@ static inline void gref_rope(const gref_layer &L, uint32_t pos, float *x, int mo
     const uint32_t d = L.hd, half = d / 2u;
     for (uint32_t p = 0; p < half; p++) {
         volatile float e = (float)(2u * p) / (float)d;
-        volatile float inv = 1.0f / powf(L.rope_theta, e);
+        volatile float inv = L.inv_freq.empty() ? 1.0f / powf(L.rope_theta, e) : L.inv_freq[p];
         volatile float ang = (float)pos * inv;
         const float c = gref_round(cosf(ang)), s = gref_round(sinf(ang));
         const uint32_t i0 = mode == GREF_ROPE_INTERLEAVED ? 2u * p : p;

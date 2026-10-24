@@ -78,12 +78,17 @@ __device__ static inline void rope_pair_rotate_core_dev(
  * fast-math leaves alone) and rounded once to f32 -- the f32 value torch's / libm's f32 functions return -- and the
  * division and the product are the IEEE intrinsics. */
 __device__ static inline float rope_neox_bf16_round_dev(float x) { return __bfloat162float(__float2bfloat16_rn(x)); }
-__device__ static inline void rope_neox_bf16_pair_dev(float x0, float x1, uint32_t p, uint32_t d, uint32_t pos,
-                                                      float base, float *r0, float *r1) {
-    const float e = __fdiv_rn((float)(2u * p), (float)d);
-    const float inv = __fdiv_rn(1.0f, (float)pow((double)base, (double)e));
+/* The rotation at a GIVEN inverse frequency `inv` (L321: a scaled rope -- YaRN -- hands its per-pair table here;
+ * src/lib/pulsar_yarn.h builds it on the host). */
+__device__ static inline void rope_neox_bf16_pair_inv_dev(float x0, float x1, float inv, uint32_t pos, float *r0, float *r1) {
     const double ang = (double)__fmul_rn((float)pos, inv);
     const float c = rope_neox_bf16_round_dev((float)cos(ang)), s = rope_neox_bf16_round_dev((float)sin(ang));
     *r0 = rope_neox_bf16_round_dev(__fsub_rn(rope_neox_bf16_round_dev(__fmul_rn(x0, c)), rope_neox_bf16_round_dev(__fmul_rn(x1, s))));
     *r1 = rope_neox_bf16_round_dev(__fadd_rn(rope_neox_bf16_round_dev(__fmul_rn(x1, c)), rope_neox_bf16_round_dev(__fmul_rn(x0, s))));
+}
+__device__ static inline void rope_neox_bf16_pair_dev(float x0, float x1, uint32_t p, uint32_t d, uint32_t pos,
+                                                      float base, float *r0, float *r1) {
+    const float e = __fdiv_rn((float)(2u * p), (float)d);
+    const float inv = __fdiv_rn(1.0f, (float)pow((double)base, (double)e));
+    rope_neox_bf16_pair_inv_dev(x0, x1, inv, pos, r0, r1);
 }
