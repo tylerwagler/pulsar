@@ -754,7 +754,7 @@ static uint64_t agent_session_release_kv(agent_worker *w, const agent_session_fi
     size_t text_len = 0;
     char *text = pulsar_kvtext_render_tokens_text(w->engine, &f->tokens, &text_len);
     pulsar_segstore_seg chain[PULSAR_KVCHAIN_MAX];
-    const int n = text ? pulsar_segstore_lookup(w->kv, text, text_len, chain, PULSAR_KVCHAIN_MAX) : 0;
+    const int n = text ? pulsar_segstore_lookup(w->kv, text, text_len, NULL, chain, PULSAR_KVCHAIN_MAX) : 0;
     free(text);
     if (n == 0) return 0;
     char sys_tip[41];

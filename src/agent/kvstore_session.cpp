@@ -219,7 +219,7 @@ void agent_kv_system_tip(agent_worker *w, char tip[41]) {
     size_t text_len = 0;
     char *text = pulsar_kvtext_render_tokens_text(w->engine, &sys, &text_len);
     pulsar_segstore_seg chain[PULSAR_KVCHAIN_MAX];
-    const int n = text ? pulsar_segstore_lookup(w->kv, text, text_len, chain, PULSAR_KVCHAIN_MAX) : 0;
+    const int n = text ? pulsar_segstore_lookup(w->kv, text, text_len, NULL, chain, PULSAR_KVCHAIN_MAX) : 0;
     if (n > 0) memcpy(tip, chain[n - 1].key, 41);
     free(text);
     pulsar_tokens_free(&sys);

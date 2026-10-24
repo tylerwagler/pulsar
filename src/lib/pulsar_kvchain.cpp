@@ -29,14 +29,56 @@ pulsar_tokens view(const pulsar_tokens *t, int from, int to) {
     v.len = v.cap = to - from;
     return v;
 }
+enum put_rc { PUT_FAILED, PUT_NO_CUT, PUT_STORED };
+/* Store the bank's segment [G_prev, G) under `parent` (its key into key_out).  PUT_NO_CUT: [G_prev, G) is not a
+ * segment span (an image block lies across G); PUT_FAILED: `r->err` says why.  A segment the store holds is not
+ * written again -- the same key -- unless the store's copy lacks the state this bank holds at G (pulsar_segstore_put
+ * replaces it in place); only a write counts in r. */
+put_rc kvchain_put(pulsar_segstore *st, pulsar_engine *e, pulsar_session *s, const pulsar_tokens *toks,
+                   const char *parent, int G_prev, int G, const pulsar_kvchain_trailer *trailer,
+                   pulsar_kvchain_persist_result *r, char key_out[41]) {
+    uint64_t state_bytes = 0;
+    const uint64_t payload = pulsar_session_segment_bytes(s, G_prev, G, &state_bytes);
+    if (payload == 0) return PUT_NO_CUT;
+    const pulsar_tokens span = view(toks, G_prev, G);
+    size_t text_len = 0;
+    char *text = pulsar_kvtext_render_tokens_text(e, &span, &text_len);
+    if (!text) {
+        snprintf(r->err, sizeof(r->err), "segment [%d,%d) could not be rendered", G_prev, G);
+        return PUT_FAILED;
+    }
+    uint64_t tbytes = 0;
+    if (trailer && !trailer->size(trailer->ud, text, &tbytes)) tbytes = 0;
+    seg_ctx ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.s = s;
+    ctx.G_prev = G_prev;
+    ctx.G = G;
+    ctx.text = text;
+    ctx.trailer = trailer;
+    pulsar_segstore_child_key(parent, text, text_len, ctx.key);
+    pulsar_segstore_seg had;
+    const bool held = pulsar_segstore_get(st, ctx.key, &had) && (had.state_bytes > 0 || state_bytes == 0);
+    const bool ok = pulsar_segstore_put(st, parent, (uint32_t)G_prev, (uint32_t)G, text, text_len, payload, state_bytes,
+                                        write_payload, tbytes, tbytes ? write_trailer : NULL, &ctx, key_out, r->err,
+                                        sizeof(r->err));
+    free(text);
+    if (!ok) return PUT_FAILED;
+    if (!held) {
+        r->written++;
+        r->bytes += payload + tbytes;
+    }
+    return PUT_STORED;
+}
 }  // namespace
 
-int pulsar_kvchain_segment_ends(const int *Gs, int n, int prev, int span, bool close, int *ends) {
+int pulsar_kvchain_grid(pulsar_session *s) { return pulsar_session_prefill_cap(s); }
+
+int pulsar_kvchain_segment_ends(int prev, int deepest, int grid, bool close, int *ends, int cap) {
+    if (grid <= 0 || prev < 0 || deepest <= prev) return 0;
     int m = 0;
-    for (int k = 0; k < n; k++) {
-        if (Gs[k] <= prev) continue;
-        if (Gs[k] - prev >= span || (close && k == n - 1)) ends[m++] = prev = Gs[k];
-    }
+    for (int g = (prev / grid + 1) * grid; g <= deepest && m < cap; g += grid) ends[m++] = g;
+    if (close && deepest % grid != 0 && m < cap) ends[m++] = deepest;
     return m;
 }
 
@@ -45,76 +87,64 @@ int pulsar_kvchain_persist(pulsar_segstore *st, pulsar_engine *e, pulsar_session
     pulsar_kvchain_persist_result r;
     memset(&r, 0, sizeof(r));
     const pulsar_tokens *toks = st ? pulsar_session_tokens(s) : NULL;
-    /* The bank's grid checkpoints at or before the chain's end, deepest first:
-     * where new segments can end.  No checkpoint is captured inside an image
-     * block, so the end is never inside one either.  L281: the end is past every
-     * block the session records (its segment carries the record), short of the
-     * first it does not. */
+    /* The chain ends at the bank's deepest grid checkpoint at or before the persist end: the rows below it are the
+     * prefill's (a checkpoint is valid only while the bank holds that history), and its state is the tail's.  No
+     * checkpoint is captured inside an image block.  L281: the end is past every block the session records (its
+     * segment carries the record), short of the first it does not. */
     const int end = toks ? pulsar_session_persist_end(s) : 0;
     if (end < 0) {
         snprintf(r.err, sizeof(r.err), "the history's image blocks are malformed; nothing persisted");
         if (out) *out = r;
         return 0;
     }
-    int Gs[PULSAR_KVCHAIN_MAX];
-    int n = 0;
-    for (int G = pulsar_session_checkpoint_best(s, end); G > 0 && n < PULSAR_KVCHAIN_MAX;
-         G = pulsar_session_checkpoint_best(s, G - 1)) Gs[n++] = G;
-    if (n == 0 || Gs[0] < min_tokens) {
+    const int deepest = end > 0 ? pulsar_session_checkpoint_best(s, end) : 0;
+    const int grid = pulsar_kvchain_grid(s);
+    if (deepest <= 0 || deepest < min_tokens || grid <= 0) {
         if (out) *out = r;
         return 0;
     }
+    /* L323: the parent is the deepest stored GRID-ENDED chain of this history -- a tail is never extended */
     char parent[41] = "";
     int prev = 0;
     {
-        const pulsar_tokens head = view(toks, 0, Gs[0]);
+        const pulsar_tokens head = view(toks, 0, deepest);
         size_t full_len = 0;
         char *full = pulsar_kvtext_render_tokens_text(e, &head, &full_len);
+        const pulsar_segstore_end grid_end = { (uint32_t)grid, false };
         pulsar_segstore_seg chain[PULSAR_KVCHAIN_MAX];
-        const int c = full ? pulsar_segstore_lookup(st, full, full_len, chain, PULSAR_KVCHAIN_MAX) : 0;
+        const int c = full ? pulsar_segstore_lookup(st, full, full_len, &grid_end, chain, PULSAR_KVCHAIN_MAX) : 0;
         free(full);
-        if (c > 0 && (int)chain[c - 1].G <= Gs[0]) {
+        if (c > 0 && (int)chain[c - 1].G <= deepest) {
             const pulsar_tokens upto = view(toks, 0, (int)chain[c - 1].G);
             size_t upto_len = 0;
             free(pulsar_kvtext_render_tokens_text(e, &upto, &upto_len));
             if (upto_len == chain[c - 1].text_end) {
                 memcpy(parent, chain[c - 1].key, 41);
                 prev = (int)chain[c - 1].G;
+                /* a stored segment of it without the state this bank holds at its end gets it, in place (the same
+                 * key), so a branch parting in the cell above resumes there and not a cell lower */
+                for (int i = 0; i < c; i++) {
+                    if (chain[i].state_bytes || pulsar_session_checkpoint_best(s, (int)chain[i].G) != (int)chain[i].G)
+                        continue;
+                    char key[41];
+                    if (kvchain_put(st, e, s, toks, i ? chain[i - 1].key : "", (int)chain[i].G_prev, (int)chain[i].G,
+                                    trailer, &r, key) == PUT_FAILED) break;
+                }
             }
         }
     }
-    int up[PULSAR_KVCHAIN_MAX], ends[PULSAR_KVCHAIN_MAX];
-    for (int k = 0; k < n; k++) up[k] = Gs[n - 1 - k];
-    const int m = pulsar_kvchain_segment_ends(up, n, prev, pulsar_session_prefill_cap(s), close, ends);
+    int ends[PULSAR_KVCHAIN_MAX];
+    const int m = r.err[0] ? 0 : pulsar_kvchain_segment_ends(prev, deepest, grid, close, ends, PULSAR_KVCHAIN_MAX);
     for (int k = 0; k < m; k++) {
-        const int G = ends[k];
-        const pulsar_tokens span = view(toks, prev, G);
-        size_t text_len = 0;
-        char *text = pulsar_kvtext_render_tokens_text(e, &span, &text_len);
-        uint64_t tbytes = 0;
-        if (!text || (trailer && !trailer->size(trailer->ud, text, &tbytes))) tbytes = 0;
-        seg_ctx ctx;
-        memset(&ctx, 0, sizeof(ctx));
-        ctx.s = s;
-        ctx.G_prev = prev;
-        ctx.G = G;
-        ctx.text = text;
-        ctx.trailer = trailer;
-        if (text) pulsar_segstore_child_key(parent, text, text_len, ctx.key);
-        const uint64_t payload = pulsar_session_segment_bytes(s, prev, G);
         char key[41];
-        const bool ok = text && pulsar_segstore_put(st, parent, (uint32_t)prev, (uint32_t)G, text, text_len, payload,
-                                                    write_payload, tbytes, tbytes ? write_trailer : NULL, &ctx, key,
-                                                    r.err, sizeof(r.err));
-        free(text);
-        if (!ok) {
-            if (!r.err[0]) snprintf(r.err, sizeof(r.err), "segment [%d,%d) could not be rendered", prev, G);
+        const put_rc rc = kvchain_put(st, e, s, toks, parent, prev, ends[k], trailer, &r, key);
+        if (rc == PUT_NO_CUT && ends[k] != deepest) continue;   /* an image block across this grid point: no cut */
+        if (rc != PUT_STORED) {
+            if (!r.err[0]) snprintf(r.err, sizeof(r.err), "[%d,%d) is not a segment span", prev, ends[k]);
             break;
         }
-        r.written++;
-        r.bytes += payload + tbytes;
         memcpy(parent, key, 41);
-        prev = G;
+        prev = ends[k];
     }
     r.end = prev;
     memcpy(r.key, parent, 41);
@@ -128,7 +158,8 @@ int pulsar_kvchain_find(pulsar_segstore *st, const char *text, size_t text_len, 
     if (bytes) *bytes = 0;
     if (err && errlen) err[0] = '\0';
     if (!st || !text) return 0;
-    int n = pulsar_segstore_lookup(st, text, text_len, chain, cap);
+    const pulsar_segstore_end state_end = { 0u, true };   /* L323: a restore needs the state at the chain's end */
+    int n = pulsar_segstore_lookup(st, text, text_len, &state_end, chain, cap);
     /* L281: how far the request's images let the chain go -- every segment's image records must be the request's
      * next images, by content and in order; the chain stops at the last segment below the first that is not */
     {
@@ -155,10 +186,17 @@ int pulsar_kvchain_find(pulsar_segstore *st, const char *text, size_t text_len, 
             }
         }
     }
+    while (n > 0 && chain[n - 1].state_bytes == 0) n--;   /* L323: back to the last state below an image cut */
     if (n == 0 || (int)chain[n - 1].G < min_tokens) return 0;
-    if (bytes)
-        for (int i = 0; i < n; i++) *bytes += chain[i].payload_bytes + chain[i].trailer_bytes;
+    if (bytes) *bytes = pulsar_kvchain_load_bytes(chain, n);
     return n;
+}
+
+uint64_t pulsar_kvchain_load_bytes(const pulsar_segstore_seg *chain, int n) {
+    uint64_t bytes = 0;
+    for (int i = 0; i < n; i++)
+        bytes += chain[i].payload_bytes - (i < n - 1 ? chain[i].state_bytes : 0u) + chain[i].trailer_bytes;
+    return bytes;
 }
 
 int pulsar_kvchain_load(pulsar_segstore *st, pulsar_engine *e, pulsar_session *s, const char *text,

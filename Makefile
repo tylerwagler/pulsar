@@ -2348,13 +2348,13 @@ RUNNER_GATES = multiseq_frontier_gate rewind_frontier_gate mseq_rewind_probe tok
                decode_reference_gate session_contract_gate chat_decode_smoke head_graph_replay_gate \
                sync_budget_gate scratch_poison_gate mtp_spec_gate bank_adopt_gate
 RUNNER_OBJS = $(RUNNER_GATES:%=tests/runner/%.o)
-tests/runner/%.o: tests/%.cpp tests/gate_entry.h tests/gate_fixture.h tests/gate_util.h src/pulsar.h src/pulsar_gpu.h src/engine/pulsar_engine_internal.h src/lib/pulsar_segstore.h
+tests/runner/%.o: tests/%.cpp tests/gate_entry.h tests/gate_fixture.h tests/gate_util.h src/pulsar.h src/pulsar_gpu.h src/engine/pulsar_engine_internal.h src/lib/pulsar_segstore.h src/lib/pulsar_kvchain.h
 	@mkdir -p tests/runner
 	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -Isrc/engine -DPULSAR_GATE_RUNNER -DGATE_ENTRY=gate_$*_main \
 		-DPULSAR_GATE_BUILD_REF='"$(GATE_BUILD_REF)"' -c -o $@ $<
 tests/gates_runner.o: tests/gates_runner.cpp tests/gate_entry.h tests/gate_util.h src/pulsar.h src/engine/pulsar_engine_internal.h
 	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -Isrc/engine -c -o $@ tests/gates_runner.cpp
-tests/gates_runner: tests/gates_runner.o $(RUNNER_OBJS) src/lib/pulsar_help.o src/lib/pulsar_segstore.o $(CORE_OBJS)
+tests/gates_runner: tests/gates_runner.o $(RUNNER_OBJS) src/lib/pulsar_help.o src/lib/pulsar_segstore.o src/lib/pulsar_kvchain.o src/lib/pulsar_kvtext.o $(CORE_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 # The runner receives exactly what the individual targets passed: the prefill
 # baseline blob and its ref, the reference-capture dir (skips loudly when
@@ -2882,7 +2882,7 @@ tests/accounting_gate.o: tests/accounting_gate.cpp src/engine/pulsar_engine_inte
 
 tests/comp_state_gate.o: tests/comp_state_gate.cpp src/engine/pulsar_engine_internal.h src/pulsar.h src/pulsar_gpu.h
 	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -Isrc/engine -c -o $@ tests/comp_state_gate.cpp
-tests/chunk_neutrality_gate.o: tests/chunk_neutrality_gate.cpp tests/gate_entry.h src/pulsar.h src/lib/pulsar_segstore.h
+tests/chunk_neutrality_gate.o: tests/chunk_neutrality_gate.cpp tests/gate_entry.h src/pulsar.h src/lib/pulsar_segstore.h src/lib/pulsar_kvchain.h
 	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -Isrc/engine -c -o $@ tests/chunk_neutrality_gate.cpp
 tests/vision_chunk_gate.o: tests/vision_chunk_gate.cpp tests/gate_entry.h src/pulsar.h src/engine/pulsar_engine_internal.h
 	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -Isrc/engine -c -o $@ tests/vision_chunk_gate.cpp
@@ -3070,7 +3070,7 @@ cuda-fixed-tile-probe: tests/fixed_tile_gemm_probe
 tests/accounting_gate: tests/accounting_gate.o src/lib/pulsar_help.o $(CORE_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
-tests/chunk_neutrality_gate: tests/chunk_neutrality_gate.o src/lib/pulsar_help.o src/lib/pulsar_segstore.o $(CORE_OBJS)
+tests/chunk_neutrality_gate: tests/chunk_neutrality_gate.o src/lib/pulsar_help.o src/lib/pulsar_segstore.o src/lib/pulsar_kvchain.o src/lib/pulsar_kvtext.o $(CORE_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 tests/vision_chunk_gate: tests/vision_chunk_gate.o src/lib/pulsar_help.o $(CORE_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)

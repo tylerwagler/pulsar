@@ -13,7 +13,7 @@
  *     (the frontier rule); a resume restores the deepest one at or below the prefill frontier and
  *     prefills from there (checkpoint.cpp, session.cpp);
  *   - disk segments: the tokens [G_prev, G), every APPEND-ONLY row pool's rows for that span, and
- *     the checkpoint at G -- a chain of them rebuilds a bank (session_payload.cpp, then
+ *     the checkpoint at G where the bank holds it (L323) -- a chain of them rebuilds a bank (session_payload.cpp, then
  *     src/lib/pulsar_segstore + pulsar_kvchain, the server, the agent, TP mirroring).
  *
  * A model answers the question with a pulsar_kv_state_ops: which of its state is append-only (row
