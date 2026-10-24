@@ -272,6 +272,21 @@ static bool qwen_read_rope(const pulsar_model *m, const pulsar_engine_options *o
         return false;
     }
     if (!pulsar_qsa_rope_init(&s->qsa_rope, src ? &s->yarn : NULL)) return false;
+    /* the rope's ONE identity (family.h rope_id): 0 = native; else an FNV-1a digest of the four YaRN numbers, never
+     * 0.  The artifact digest mixes it (a segment or payload of another rope refuses to load) and the disk-KV store
+     * identity carries it (such a segment is not even indexed) */
+    s->rope_id = 0;
+    if (src) {
+        uint64_t h = 1469598103934665603ull;
+        auto mix = [&h](const void *p, size_t n) {
+            for (size_t i = 0; i < n; i++) { h ^= ((const uint8_t *)p)[i]; h *= 1099511628211ull; }
+        };
+        mix(&s->yarn.factor, sizeof(s->yarn.factor));
+        mix(&s->yarn.orig_ctx, sizeof(s->yarn.orig_ctx));
+        mix(&s->yarn.beta_fast, sizeof(s->yarn.beta_fast));
+        mix(&s->yarn.beta_slow, sizeof(s->yarn.beta_slow));
+        s->rope_id = h ? h : 1u;
+    }
     if (src) {
         fprintf(stderr, "pulsar: %s: rope YaRN x%g over %u trained positions (%s): %llu positions, ramp beta %g / %g, "
                         "attention factor %.9g\n", PULSAR_QWEN_ARCH, s->yarn.factor, s->yarn.orig_ctx, src,
@@ -787,13 +802,9 @@ static bool qwen_family_load(pulsar_engine *e, const pulsar_engine_options *opt)
             mix(&t->bytes, sizeof(t->bytes));
         }
         /* L280: a YaRN rope writes other K bytes, so its segments and payloads never load into a native bank (or
-         * one of another factor); the native rope leaves the digest -- and every existing segment -- as it was */
-        if (s.yarn.factor != 0.0) {
-            mix(&s.yarn.factor, sizeof(s.yarn.factor));
-            mix(&s.yarn.orig_ctx, sizeof(s.yarn.orig_ctx));
-            mix(&s.yarn.beta_fast, sizeof(s.yarn.beta_fast));
-            mix(&s.yarn.beta_slow, sizeof(s.yarn.beta_slow));
-        }
+         * one of another factor); the native rope (rope_id 0) leaves the digest -- and every existing segment -- as
+         * it was */
+        if (s.rope_id) mix(&s.rope_id, sizeof(s.rope_id));
         e->qwen_weights->artifact_digest = h;
     }
     /* L272 B7: the whole-artifact scans DeepSeek's bind runs -- a tensor type no reader takes, a NaN
@@ -928,6 +939,8 @@ static pulsar_chat_format qwen_chat_format(const pulsar_engine *) { return PULSA
 /* Disk-KV compatibility id: 0 and 1 are DeepSeek's two profiles. */
 static int qwen_model_id(const pulsar_engine *) { return 2; }
 /* The trained positions, or YaRN's original context x factor (L280) */
+/* L280: the rope's identity (qwen_read_rope): 0 native, a digest of the YaRN numbers */
+static uint64_t qwen_rope_id(const pulsar_engine *) { return g_qwen_shape.rope_id; }
 static uint64_t qwen_trained_context(const pulsar_engine *) {
     const pulsar_qsa_yarn &y = g_qwen_shape.yarn;
     return y.factor != 0.0 ? (uint64_t)((double)y.orig_ctx * y.factor) : g_qwen_shape.max_position;
@@ -1448,6 +1461,7 @@ const pulsar_family PULSAR_FAMILY_QWEN4_EXP = {
     /* .chat_format  = */ qwen_chat_format,
     /* .model_id     = */ qwen_model_id,
     /* .trained_ctx  = */ qwen_trained_context,
+    /* .rope_id      = */ qwen_rope_id,
     /* .tp_shape     = */ qwen_tp_shape,
     /* .drafter      = */ qwen_drafter,
     /* .quant_bits   = */ qwen_quant_bits,

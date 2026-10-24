@@ -256,11 +256,11 @@ static void kv_seg_log(void *ud, const char *msg) {
     server_log(PULSAR_LOG_KVCACHE, "pulsar-server: kv cache %s", msg);
 }
 
-bool kv_cache_open(kv_disk_cache *kc, const char *dir, uint64_t budget_mb, uint32_t model_id,
+bool kv_cache_open(kv_disk_cache *kc, const char *dir, uint64_t budget_mb, uint32_t identity,
                    kv_cache_options opt) {
     memset(kc, 0, sizeof(*kc));
     kc->opt = opt;
-    kc->st = pulsar_segstore_open(dir, budget_mb << 20, model_id, kv_seg_log, NULL);
+    kc->st = pulsar_segstore_open(dir, budget_mb << 20, identity, kv_seg_log, NULL);
     if (!kc->st) return false;
     kc->dir = xstrdup(dir);
     kc->enabled = true;

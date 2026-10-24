@@ -408,9 +408,17 @@ static const char *resolve_default_model(void) {
  * ggufs of the same shape sharing a directory could cross-restore each
  * other's checkpoints.  gguf/model.gguf is an ACTIVE-POINTER symlink by
  * convention; its realpath basename is the versioned artifact name and
- * therefore the right identity key.  Returns a heap path (process lifetime),
+ * therefore the right identity key.
+ *
+ * L280: --rope-yarn F suffixes the key with "-rope-yarnF".  A segment's file
+ * name is the hash of its TEXT, so a native and a YaRN server sharing one
+ * directory would write the same names for the same conversation (each
+ * renaming over the other's file, each under its own budget); with their own
+ * directories both profiles keep their stores across a restart that switches
+ * them.  The store identity (pulsar_engine_kv_identity) still guards an
+ * explicit --kv-disk-dir both name.  Returns a heap path (process lifetime),
  * or NULL when no cache home can be resolved. */
-static char *server_default_kv_disk_dir(const char *model_path) {
+static char *server_default_kv_disk_dir(const char *model_path, double rope_yarn_factor) {
     char resolved[PATH_MAX];
     const char *src = model_path ? model_path : "";
     if (model_path && realpath(model_path, resolved)) src = resolved;
@@ -422,13 +430,17 @@ static char *server_default_kv_disk_dir(const char *model_path) {
     if (len == 0) {
         strcpy(key, "model");
     } else {
-        if (len > sizeof(key) - 1) len = sizeof(key) - 1;
+        if (len > sizeof(key) - 32) len = sizeof(key) - 32;   /* room for the rope suffix below */
         for (size_t j = 0; j < len; j++) {
             unsigned char ch = (unsigned char)base[j];
             key[j] = (isalnum(ch) || ch == '.' || ch == '_' || ch == '-') ?
                      (char)ch : '_';
         }
         key[len] = '\0';
+    }
+    if (rope_yarn_factor != 0.0) {
+        const size_t at = strlen(key);
+        snprintf(key + at, sizeof(key) - at, "-rope-yarn%g", rope_yarn_factor);
     }
     buf b = {0};
     /* Per the XDG spec a non-absolute XDG_CACHE_HOME is ignored (a relative
@@ -458,7 +470,7 @@ static void server_resolve_kv_disk_dir(server_config *c) {
         return;
     }
     if (c->kv_disk_dir) return; /* explicit path: unchanged behavior */
-    c->kv_disk_dir = server_default_kv_disk_dir(c->engine.model_path);
+    c->kv_disk_dir = server_default_kv_disk_dir(c->engine.model_path, c->engine.rope_yarn_factor);
     if (c->kv_disk_dir) {
         server_log(PULSAR_LOG_DEFAULT,
                    "pulsar-server: disk KV cache default dir %s "
@@ -1140,8 +1152,7 @@ int main(int argc, char **argv) {
     s.tool_mem.max_entries = PULSAR_TOOL_MEMORY_DEFAULT_MAX_IDS;
     if (cfg.kv_disk_dir &&
         !kv_cache_open(&s.kv, cfg.kv_disk_dir, cfg.kv_disk_space_mb,
-                       pulsar_segstore_identity((uint32_t)pulsar_engine_model_id(engine),
-                                                (uint32_t)pulsar_engine_routed_quant_bits(engine)),
+                       pulsar_engine_kv_identity(engine),
                        cfg.kv_cache))
     {
         /* Never fatal: an uncreatable/read-only directory logs its reason in

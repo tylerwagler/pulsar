@@ -157,7 +157,7 @@ static void print_model_runtime(FILE *fp, const help_colors *c,
         opt(fp, c, "-c, --ctx N", "Allocated context tokens.");
     }
     if (tool == PULSAR_HELP_SERVER || tool == PULSAR_HELP_DS4) {
-        opt(fp, c, "--rope-yarn F", "YaRN rope scaling at factor F over the trained context, for a container whose rope is native (Qwen: 4 = 1M positions, static at every length). A container that declares YaRN takes only its own factor; a family without a rope refuses.");
+        opt(fp, c, "--rope-yarn F", "YaRN rope scaling at factor F over the trained context, for a container whose rope is native (Qwen: 4 = 1M positions, static at every length). A container that declares YaRN takes only its own factor; a family without a rope refuses; refused under tensor parallelism. The server's default disk KV directory gets a -rope-yarnF suffix (the store identity carries the rope too).");
     }
     if (tool != PULSAR_HELP_SERVER) {
         opt(fp, c, "--prefill-chunk N", "GPU graph prefill chunk size. Default: auto (PRO long prompts use 8192; others use 4096).");

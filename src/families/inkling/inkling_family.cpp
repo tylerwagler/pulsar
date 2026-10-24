@@ -167,6 +167,7 @@ const pulsar_family PULSAR_FAMILY_INKLING = {
     /* .chat_format  = */ chat_format,
     /* .model_id     = */ model_id,
     /* .trained_ctx  = */ trained_context,
+    /* .rope_id      = */ pulsar_family_rope_fixed,
     /* .tp_shape     = */ NULL,   /* no CAP_TP: the open refuses tensor parallelism before it would ask */
     /* .drafter      = */ drafter,
     /* .quant_bits   = */ quant_bits,

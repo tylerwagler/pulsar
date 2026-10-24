@@ -87,6 +87,7 @@ typedef struct {
      * QSA call passes).  Not part of the known geometry: qwen_shape_check does not compare them. */
     pulsar_qsa_yarn yarn;
     pulsar_qsa_rope qsa_rope;
+    uint64_t rope_id;          ///< the rope's identity (family.h rope_id): 0 native, else a digest of `yarn`
     /* L266 step 7: this rank of a tensor-parallel group (0 of 0 / 1 = one GPU).  Under TP the four head counts
      * above are THIS RANK's (gdn_n_k_head 8, gdn_n_v_head 24, n_head 12, n_head_kv 1): the load binds the
      * container against the whole model, then pulsar_qwen_tp_load halves them, so every derived width,

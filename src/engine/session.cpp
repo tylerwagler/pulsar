@@ -561,6 +561,16 @@ int pulsar_engine::open(pulsar_engine **out, const pulsar_engine_options *opt) {
         *out = NULL;
         return 1;
     }
+    /* L280: each rank parses its own --rope-yarn, and the TP hello compares the artifact, not the rope -- a pair
+     * given two factors would mix two ropes in one forward.  A pair runs YaRN only from a container that declares
+     * it (the same bytes on both ranks, compared by the hello). */
+    if (tp_n_ranks_at_load > 1 && opt->rope_yarn_factor != 0.0) {
+        fprintf(stderr, "pulsar: --rope-yarn is not supported under tensor parallelism (the TP hello does not "
+                        "compare the rope) -- refusing\n");
+        free(e);
+        *out = NULL;
+        return 1;
+    }
     /* The draft schedule's overrides (the numbers are the drafter's, spec_ops.h): the options, else the
      * environment pair, else 0 = the drafter's own. */
     e->spec_depth = opt->spec_depth;
