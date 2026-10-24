@@ -8,7 +8,7 @@
  *          the grid checkpoint below it;
  *   SIDE   P to its message endpoint (the generation header's start) plus another user turn and its header (Claude
  *          Code's side request): split-invariant families adopt the endpoint record, DeepSeek the grid point below;
- *   SEAM   (L322) P plus 211 tokens again, adopted from bank 3, which prefilled P with one early system-message
+ *   SEAM   (L322; run last, after the LENDER check below) P plus 211 tokens again, adopted from bank 3, which prefilled P with one early system-message
  *          token RE-SPELLED as two (the same bytes: the history a byte-only disk match loads) and decoded past it:
  *          the adopt must pass the seam (by ids the two part there), and the reference is the stitched prompt -- bank
  *          3's spelling to its end, Q's tokens after it -- prefilled cold, the bytes a seamed own-bank resume runs;
@@ -147,7 +147,24 @@ int GATE_ENTRY(int argc, char **argv) {
     for (int i = 0; i < E; i++) pulsar_tokens_push(&Q, P.v[i]);
     for (int i = U; i < side.len; i++) pulsar_tokens_push(&Q, side.v[i]);
     shape(e, s, &live, "SIDE", &Q);
-    /* SEAM (L322): bank 3 holds P with its first splittable system-message token at k >= 16 re-spelled as two tokens
+    /* SAME */
+    shape(e, s, &live, "SAME", &P);
+    /* the lender: bank 0 still resumes P at its prompt end, with the cold logits (bank 2 last synced P cold) */
+    const int W = pulsar_engine_logits_width(e);
+    float *l2 = (float *)malloc((size_t)W * sizeof(float)), *l0 = (float *)malloc((size_t)W * sizeof(float));
+    bool okc = install(s, &live, 2) && pulsar_session_sync(s, &P, err, sizeof err) == 0;   /* resumes at its own end */
+    if (okc) pulsar_session_copy_logits(s, l2, W);
+    const bool ok0 = okc && install(s, &live, 0) && pulsar_session_sync(s, &P, err, sizeof err) == 0;
+    const int o0 = pulsar_session_resume_origin(s);
+    if (ok0) pulsar_session_copy_logits(s, l0, W);
+    say(ok0 && o0 == P.len && !memcmp(l0, l2, (size_t)W * sizeof(float)),
+        "LENDER: bank 0 resumes P at its prompt end (origin %d of %d), logits == cold %s", o0, P.len, err);
+    free(l0);
+    free(l2);
+    /* SEAM (L322), LAST: it fills the record pool (bank 3's prompt end and endpoint, bank 1's copy), and the pool is
+     * LRU over n + n/2 = 6 records at 4 banks -- run before the LENDER check it evicted bank 0's prompt end (the
+     * least recently used record: gpuq #445, "origin 2688 of 2701"), which the LENDER check exists to keep.
+     * Bank 3 holds P with its first splittable system-message token at k >= 16 re-spelled as two tokens
      * of the same bytes (its first byte, then the rest), prefilled and decoded past; Q = EXT's prompt, canonical */
     {
         int k = -1;
@@ -184,20 +201,6 @@ int GATE_ENTRY(int argc, char **argv) {
             shape(e, s, &live, "SEAM", &ext, 3, &S, k);
         }
     }
-    /* SAME */
-    shape(e, s, &live, "SAME", &P);
-    /* the lender: bank 0 still resumes P at its prompt end, with the cold logits (bank 2 last synced P cold) */
-    const int W = pulsar_engine_logits_width(e);
-    float *l2 = (float *)malloc((size_t)W * sizeof(float)), *l0 = (float *)malloc((size_t)W * sizeof(float));
-    bool okc = install(s, &live, 2) && pulsar_session_sync(s, &P, err, sizeof err) == 0;   /* resumes at its own end */
-    if (okc) pulsar_session_copy_logits(s, l2, W);
-    const bool ok0 = okc && install(s, &live, 0) && pulsar_session_sync(s, &P, err, sizeof err) == 0;
-    const int o0 = pulsar_session_resume_origin(s);
-    if (ok0) pulsar_session_copy_logits(s, l0, W);
-    say(ok0 && o0 == P.len && !memcmp(l0, l2, (size_t)W * sizeof(float)),
-        "LENDER: bank 0 resumes P at its prompt end (origin %d of %d), logits == cold %s", o0, P.len, err);
-    free(l0);
-    free(l2);
     }
 out:
     if (s) pulsar_session_free(s);
