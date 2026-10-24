@@ -629,6 +629,13 @@ int main(int argc, char **argv) {
         pulsar_engine_close(engine);
         return wrc;
     }
+    /* L321: an encoder serves its own endpoints (no session, no chat, no scheduler) */
+    if (pulsar_engine_encoder(engine) != PULSAR_ENCODER_NONE) {
+        const int rc = encode_serve(engine, &cfg);
+        pulsar_engine_close(engine);
+        free(tp_kv_dir);
+        return rc;
+    }
     /* A family whose tokenizer and chat renderer this build does not carry
      * cannot take a request: refused at startup, by name (L251). */
     if (!pulsar_engine_has_tokenizer(engine)) {

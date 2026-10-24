@@ -3404,6 +3404,12 @@ void append_openai_logprobs_json(buf *b, const logprob_ledger *lg, int from, int
 void append_model_json_values(buf *b, const char *id, const char *name,
                                      int ctx, int default_tokens);
 void *client_main(void *arg);
+/** Read one request (headers + body, bounded in size and time) from `fd`; false on a malformed or late one. */
+bool read_http_request(int fd, http_request *r);
+void http_request_free(http_request *r);
+/** L321: serve an ENCODER engine (pulsar_engine_encoder != NONE) on cfg's host and port until a stop signal:
+ *  /v1/embeddings or /v1/rerank, /v1/models, /health (encode_server.cpp).  The process's exit code. */
+int encode_serve(pulsar_engine *e, const server_config *cfg);
 int listen_on(const char *host, int port);
 void configure_client_socket(int fd);
 void set_client_socket_nonblocking(int fd);

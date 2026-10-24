@@ -6,7 +6,7 @@
 
 
 
-static void http_request_free(http_request *r) {
+void http_request_free(http_request *r) {
     free(r->body);
     memset(r, 0, sizeof(*r));
 }
@@ -58,7 +58,7 @@ static long content_length(const char *h, size_t n) {
 
 
 
-static bool read_http_request(int fd, http_request *r) {
+bool read_http_request(int fd, http_request *r) {
     buf b = {0};
     ssize_t hend = -1;
     const size_t max_header = 64 * 1024;
