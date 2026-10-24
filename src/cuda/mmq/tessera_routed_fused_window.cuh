@@ -91,6 +91,7 @@
 #include <type_traits>
 #include <cmath>
 #include <limits>
+#include "cuda/pulsar_cuda_arch.cuh"
 
 #ifndef TESSERA_ROUTED_FUSED_FP8
 #error "compile with -DTESSERA_ROUTED_FUSED_FP8=0 (the value family's library) or =1 (the E4M3 family's)"
@@ -464,28 +465,48 @@ __device__ __forceinline__ void bar_arrive(int id, int count) {
 }
 __device__ __forceinline__ void cp_async16(void* smem, const void* gmem) {
     const uint32_t s = static_cast<uint32_t>(__cvta_generic_to_shared(smem));
+#if PULSAR_SM80
     asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" :: "r"(s), "l"(gmem) : "memory");
+#else
+    __trap();
+#endif
 }
 // The 8-byte copy is the tail of an odd-rate half whose first word is
 // 16-byte aligned (t64 even): 2 * rate words is 2 mod 4 there.
 __device__ __forceinline__ void cp_async8(void* smem, const void* gmem) {
     const uint32_t s = static_cast<uint32_t>(__cvta_generic_to_shared(smem));
+#if PULSAR_SM80
     asm volatile("cp.async.ca.shared.global [%0], [%1], 8;" :: "r"(s), "l"(gmem) : "memory");
+#else
+    __trap();
+#endif
 }
 // The 4-byte copy is the staged stream history's word (PREV_STAGED).
 __device__ __forceinline__ void cp_async4(void* smem, const void* gmem) {
     const uint32_t s = static_cast<uint32_t>(__cvta_generic_to_shared(smem));
+#if PULSAR_SM80
     asm volatile("cp.async.ca.shared.global [%0], [%1], 4;" :: "r"(s), "l"(gmem) : "memory");
+#else
+    __trap();
+#endif
 }
 __device__ __forceinline__ void prefetch_l1(const void* gmem) {
     asm volatile("prefetch.global.L1 [%0];" :: "l"(gmem));
 }
 __device__ __forceinline__ void cp_async_commit() {
+#if PULSAR_SM80
     asm volatile("cp.async.commit_group;" ::: "memory");
+#else
+    __trap();
+#endif
 }
 template <int N>
 __device__ __forceinline__ void cp_async_wait() {
+#if PULSAR_SM80
     asm volatile("cp.async.wait_group %0;" :: "n"(N) : "memory");
+#else
+    __trap();
+#endif
 }
 __device__ __forceinline__ void ldmatrix_x4(uint32_t (&r)[4], const void* smem) {
     const uint32_t s = static_cast<uint32_t>(__cvta_generic_to_shared(smem));
@@ -501,20 +522,34 @@ template <bool F16>
 __device__ __forceinline__ void mma16816(float (&d)[4], const uint32_t (&a)[4],
                                          const uint32_t (&b)[2]) {
     if constexpr (F16) {
+#if PULSAR_SM80
         asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
                      "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
                      : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
                      : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
+#else
+        __trap();
+#endif
     } else {
+#if PULSAR_SM80
         asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
                      "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
                      : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
                      : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
+#else
+        __trap();
+#endif
     }
 }
 __device__ __forceinline__ uint32_t e4m3x2_to_f16x2(uint16_t v) {
     uint32_t r;
+#if PULSAR_SM89
     asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(r) : "h"(v));
+#else
+    (void)v;
+    r = 0;
+    __trap();
+#endif
     return r;
 }
 __device__ __forceinline__ uint16_t bf16_bits_rn(float f) {
@@ -560,10 +595,14 @@ __device__ __forceinline__ int b8off(int chunk, int k) {     // chunk: eight n
 }
 __device__ __forceinline__ void mma16832_e4m3(float (&d)[4], const uint32_t (&a)[4],
                                               const uint32_t (&b)[2]) {
+#if PULSAR_SM89
     asm volatile("mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 "
                  "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
                  : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
                  : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
+#else
+    __trap();
+#endif
 }
 // Four table bytes (each in a register's low byte) as one word, first lowest.
 __device__ __forceinline__ uint32_t pack4(uint32_t a, uint32_t b, uint32_t c, uint32_t d) {

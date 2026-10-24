@@ -36,6 +36,7 @@
  * sum's ulp grid, and only the adds that leave a binade or round a tie run one at a time. */
 #include "pulsar_cuda_internal.h"
 #include "pulsar_cuda_libm.cuh"
+#include "pulsar_cuda_arch.cuh"
 
 #include <cub/device/device_radix_sort.cuh>
 
@@ -834,7 +835,7 @@ __device__ __forceinline__ uint64_t block_scan_excl_u64(uint64_t v, unsigned lon
 template <uint32_t THREADS>
 __device__ __forceinline__ uint32_t block_min_u32(uint32_t c, uint32_t *wmin) {
     const uint32_t lane = threadIdx.x & 31u, warp = threadIdx.x >> 5;
-    c = __reduce_min_sync(0xffffffffu, c);
+    c = pulsar_warp_min(c);
     if (lane == 0) wmin[warp] = c;
     __syncthreads();
     uint32_t r = UINT32_MAX;

@@ -69,6 +69,7 @@
 #include "pulsar_cuda_internal.h"
 #include "pulsar_cuda_mx.cuh"
 #include "pulsar_cuda_rope.cuh"
+#include "pulsar_cuda_arch.cuh"
 
 #include <cstdio>
 #include <cstring>
@@ -220,24 +221,21 @@ __device__ __forceinline__ static void af16_part_header(float *partials, uint32_
     rec[1] = l;
 }
 
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
-#define PULSAR_ATTN_F16_MMA 1
-#else
-#define PULSAR_ATTN_F16_MMA 0
-#endif
-
-#if PULSAR_ATTN_F16_MMA
 __device__ __forceinline__ static void af16_mma(
         float &d0, float &d1, float &d2, float &d3,
         uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3,
         uint32_t b0, uint32_t b1) {
+#if PULSAR_SM80
     asm volatile(
         "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
         "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
         : "+f"(d0), "+f"(d1), "+f"(d2), "+f"(d3)
         : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
-}
+#else
+    (void)d0; (void)d1; (void)d2; (void)d3; (void)a0; (void)a1; (void)a2; (void)a3; (void)b0; (void)b1;
+    __trap();
 #endif
+}
 
 /* Load a pair of ADJACENT stored-Q elements as one packed-f16 fragment word.
  * For __half storage the bytes are already the fragment encoding, so it is a
@@ -254,7 +252,7 @@ __device__ __forceinline__ uint32_t af16_load_pair<__half>(const __half *p, uint
     return *(const uint32_t *)(p + i);
 }
 
-/* Not under PULSAR_ATTN_F16_MMA: the fused Q-prep pair builder below (L037)
+/* Not under PULSAR_SM80: the fused Q-prep pair builder below (L037)
  * calls af16_pack from outside the MMA-only region. */
 __device__ __forceinline__ static uint32_t af16_pack(float lo, float hi) {
     return (uint32_t)__half_as_ushort(__float2half(lo)) |
@@ -409,19 +407,6 @@ static void attn_f16_kernel(
          * the classic whole-window walk on blockIdx.z == 0 and store heads
          * here.  n_dec == 0 with partials == NULL is every prefill launch. */
         float *__restrict__ partials, uint32_t n_dec) {
-#if !PULSAR_ATTN_F16_MMA
-    (void)heads; (void)sinks; (void)q; (void)raw_kv; (void)comp_kv; (void)topk;
-    (void)n_tokens; (void)n_comp; (void)window; (void)ratio; (void)n_head;
-    (void)pos0; (void)n_raw; (void)raw_cap; (void)raw_start_in; (void)top_k;
-    (void)positions; (void)seq_id; (void)comp_bank_ptrs; (void)comp_cap; (void)n_banks;
-    (void)vis_left; (void)vis_right;
-    (void)ring; (void)non_causal;
-    (void)gact_data; (void)gact_scale; (void)gact_kbp; (void)gact_slab;
-    (void)n_groups; (void)n_nope;
-    (void)gact_tok0; (void)gact_ntok;
-    (void)qp; (void)q_raw;
-    (void)partials; (void)n_dec;
-#else
     const uint32_t t = blockIdx.x;
     const uint32_t hbase = blockIdx.y * AF16_HPB;
     if (t >= n_tokens || hbase >= n_head) return;
@@ -1151,7 +1136,6 @@ static void attn_f16_kernel(
             }
         }
     }
-#endif
 }
 
 /* L210: fold one (token, head)'s per-split partials into normalised heads.
@@ -1222,11 +1206,10 @@ static void attn_f16_combine_kernel(pulsar_heads_t *__restrict__ heads,
 
 /* ---- launcher ----------------------------------------------------------- */
 
-/* PULSAR_ATTN_F16_MMA is a DEVICE-side guard -- __CUDA_ARCH__ is undefined in
- * the host pass, so testing it here would compile the launcher down to
- * "return 0" and the kernel would look like a permanent shape-gate refusal.
- * The host question is a runtime one: does this device actually have the
- * m16n8k16 tensor cores?  Ask the driver, once. */
+/* PULSAR_SM80 says what the COMPILE target has (pulsar_cuda_arch.cuh) and is
+ * true in every host pass, so it cannot answer for the device.  The host
+ * question is a runtime one: does this device actually have the m16n8k16
+ * tensor cores?  Ask the driver, once. */
 /* L189: every launcher precondition names itself and its values when it
  * refuses.  The dispatcher prints a generic "fp16 ... FAILED" after a 0 from
  * here; WHICH check failed was invisible, and that is what cost three days on

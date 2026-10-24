@@ -22,6 +22,7 @@
 #include "mmq/ds4_mmid.cuh"
 #include "mmq/ds4_mmq.h"
 #include "pulsar_cuda_scratch.h"
+#include "pulsar_cuda_arch.cuh"
 #endif
 
 #include <cuda_bf16.h>
@@ -43,10 +44,14 @@ static_assert(stage_bytes<1>() <= 48 * 1024 && stage_bytes<2>() <= 48 * 1024 && 
               "the staged chunk must fit the default dynamic shared memory");
 
 __device__ __forceinline__ void mma_bf16_16816(float (&d)[4], const uint32_t (&a)[4], uint32_t b0, uint32_t b1) {
+#if PULSAR_SM80
     asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
                  "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
                  : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
                  : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+#else
+    __trap();
+#endif
 }
 
 /** One CTA's 128 outputs [o0, o0 + 128) of W [out][in] for nr <= 8 NT activation rows: row i of the call is
