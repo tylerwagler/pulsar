@@ -53,6 +53,7 @@
 #include "ds4_exl3_dev.cuh"
 #include "cuda/pulsar_cuda_mx.cuh"
 #include "engine/exl3_trellis.h"
+#include "cuda/pulsar_cuda_arch.cuh"
 
 #include <climits>
 #include <cstdio>
@@ -138,10 +139,14 @@ __device__ __forceinline__ const dense_proj &proj_at(const dense_set &P, int j) 
 __device__ __forceinline__ float pow2f(int e) { return __int_as_float((127 + e) << 23); }   /* e in [-126, 127] */
 
 __device__ __forceinline__ void mma_16816(float (&d)[4], const uint32_t (&a)[4], uint32_t b0, uint32_t b1) {
+#if PULSAR_SM80
     asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
                  "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
                  : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
                  : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+#else
+    __trap();
+#endif
 }
 
 __device__ __forceinline__ void ldmatrix_x4(uint32_t (&a)[4], const __half *p) {
@@ -153,7 +158,11 @@ __device__ __forceinline__ void ldmatrix_x4(uint32_t (&a)[4], const __half *p) {
 /** 16 bytes global -> shared, asynchronously; src_bytes 0 writes zeros. */
 __device__ __forceinline__ void cp_async16(void *smem, const void *gmem, int src_bytes) {
     const uint32_t s = (uint32_t)__cvta_generic_to_shared(smem);
+#if PULSAR_SM80
     asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" :: "r"(s), "l"(gmem), "r"(src_bytes));
+#else
+    __trap();
+#endif
 }
 
 /** A 16 x 16 fp16 tile in shared memory as 32 chunks of 8 halves: chunk
@@ -285,7 +294,11 @@ exl3_dense_kernel(const dense_set P, const __nv_bfloat16 *__restrict__ xb, int M
             const int m = t / nb, i = t - m * nb;
             s_inv[i][m] = p.inv[(size_t)m * blocks + b_lo + i];
         }
+#if PULSAR_SM80
         asm volatile("cp.async.commit_group;\ncp.async.wait_group 0;\n" ::: "memory");
+#else
+        __trap();
+#endif
     }
     __syncthreads();
 

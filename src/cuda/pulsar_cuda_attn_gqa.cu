@@ -22,6 +22,7 @@
 #include "pulsar_cuda_attn_gqa.h"
 #include "pulsar_cuda_internal.h"
 #include "pulsar_cuda_rope.cuh"   /* the NeoX bf16 rotation: ONE authority (rope_neox_bf16_pair_dev) */
+#include "pulsar_cuda_arch.cuh"
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -91,10 +92,14 @@ struct gqa_args {
 
 __device__ __forceinline__ void gqa_mma(float (&d)[4], uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3,
                                         uint32_t b0, uint32_t b1) {
+#if PULSAR_SM80
     asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
                  "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
                  : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
                  : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+#else
+    __trap();
+#endif
 }
 __device__ __forceinline__ void gqa_ldsm4(uint32_t (&r)[4], const void *p) {
     const uint32_t a = (uint32_t)__cvta_generic_to_shared(p);

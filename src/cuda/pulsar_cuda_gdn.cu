@@ -3,6 +3,7 @@
 #include "pulsar_cuda_gdn.h"
 #include <cuda_bf16.h>
 #include "pulsar_cuda_mx.cuh"
+#include "pulsar_cuda_arch.cuh"
 
 #include <cooperative_groups.h>
 #include <stdio.h>
@@ -209,8 +210,21 @@ constexpr int RPW = DK / RW;                 /* 16 state rows per warp */
 constexpr int VQ = 4;                        /* CTAs (column quarters) per V head */
 static_assert(DV == VQ * 32, "a CTA's columns are one warp wide");
 
+/* Thread-block clusters are sm_90+ (pulsar_cuda_arch.cuh).  Below that the kernel compiles against a cluster that
+ * traps on use: same source, no second implementation, and the host refuses the lane before any launch. */
+#if PULSAR_SM90
+#define GDN_CLUSTER_DIMS __cluster_dims__(1, 1, VQ)
+#else
+#define GDN_CLUSTER_DIMS
+struct gdn_no_cluster {
+    __device__ unsigned block_rank() const { __trap(); return 0; }
+    __device__ void sync() const { __trap(); }
+    template <typename T> __device__ T *map_shared_rank(T *p, int) const { __trap(); return p; }
+};
+#endif
+
 template <int TP>
-__global__ void __cluster_dims__(1, 1, VQ) __launch_bounds__(256)
+__global__ void GDN_CLUSTER_DIMS __launch_bounds__(256)
 gdn_recur_norm_kernel(const float *__restrict__ qkvn,
                       const float *__restrict__ gb,
                       const float *__restrict__ z, int ld_z,
@@ -233,7 +247,11 @@ gdn_recur_norm_kernel(const float *__restrict__ qkvn,
     __shared__ float  redKQ[2][RW];
     __shared__ float  ssp[2][T2];            /* this CTA's sum of o^2, read by the cluster */
 
+#if PULSAR_SM90
     cg::cluster_group cluster = cg::this_cluster();
+#else
+    const gdn_no_cluster cluster;
+#endif
     const int seq  = blockIdx.x;
     const int h    = blockIdx.y;
     const int qr   = (int)cluster.block_rank();          /* == blockIdx.z */

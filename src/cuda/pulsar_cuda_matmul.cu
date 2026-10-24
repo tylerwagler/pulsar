@@ -2,6 +2,7 @@
 #include "pulsar_cuda_internal.h"
 #include "pulsar_cuda_mx.cuh"   /* the single source for pulsar_mx_sfoff */
 #include "pulsar_cuda_bf16_rows.cuh"   /* PULSAR_GPU_BATCHED_GEMM_CANON */
+#include "pulsar_cuda_arch.cuh"
 
 
 
@@ -532,10 +533,14 @@ __global__ static void grouped_fp8mx_a_nt_a8_kernel(
 #define PULSAR_MMA_TOK 32  /* tokens per launch (MT <= 2) */
 __device__ __forceinline__ static void mma_e4m3_m16n8k32(float d[4], uint32_t a0, uint32_t a1, uint32_t a2,
                                                          uint32_t a3, uint32_t b0, uint32_t b1) {
+#if PULSAR_SM89
     asm volatile("mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 "
                  "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%10,%10,%10};\n"
                  : "=f"(d[0]), "=f"(d[1]), "=f"(d[2]), "=f"(d[3])
                  : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1), "f"(0.0f));
+#else
+    __trap();
+#endif
 }
 /* Byte offset of the scale word holding blocks 4*kb4 .. 4*kb4+3 of `row`
  * (pulsar_mx_sfoff at kb % 4 == 0). */

@@ -5,6 +5,7 @@
  * exactly -- the same expressions in the same order -- so moving a family onto this file moves no byte; the
  * families now differ only in the cfg they declare. */
 #include "pulsar_cuda_router.h"
+#include "pulsar_cuda_arch.cuh"
 
 #include <cuda_bf16.h>
 #include <math.h>
@@ -232,8 +233,8 @@ router_select_kernel(router_args a, const float *__restrict__ logits, const int3
             lo = min(lo, key[i]);
             hi = max(hi, key[i]);
         }
-        lo = __reduce_min_sync(0xffffffffu, lo);
-        hi = __reduce_max_sync(0xffffffffu, hi);
+        lo = pulsar_warp_min(lo);
+        hi = pulsar_warp_max(hi);
         const int free_bits = lo == hi ? 0 : 32 - __clz((int)(lo ^ hi));
         uint32_t kt = free_bits == 32 ? 0u : hi >> free_bits << free_bits;
 #pragma unroll 1
@@ -242,7 +243,7 @@ router_select_kernel(router_args a, const float *__restrict__ logits, const int3
             int n = 0;
 #pragma unroll
             for (int i = 0; i < PER; ++i) n += key[i] >= cand ? 1 : 0;
-            if (__reduce_add_sync(0xffffffffu, n) >= TOPK) kt = cand;
+            if (pulsar_warp_add(n) >= TOPK) kt = cand;
         }
         /* the keys above kt are all picks; the remaining picks are the keys equal to kt with the lowest ids: the
          * last one's id xt is the largest x with fewer than `need` ties below it */
@@ -252,8 +253,8 @@ router_select_kernel(router_args a, const float *__restrict__ logits, const int3
             n_gt += key[i] > kt ? 1 : 0;
             n_eq += key[i] == kt ? 1 : 0;
         }
-        n_gt = __reduce_add_sync(0xffffffffu, n_gt);
-        n_eq = __reduce_add_sync(0xffffffffu, n_eq);
+        n_gt = pulsar_warp_add(n_gt);
+        n_eq = pulsar_warp_add(n_eq);
         const int need = TOPK - n_gt;
         int xt = NE;
         if (n_eq > need) {
@@ -265,7 +266,7 @@ router_select_kernel(router_args a, const float *__restrict__ logits, const int3
                 int n = 0;
 #pragma unroll
                 for (int i = 0; i < PER; ++i) n += key[i] == kt && lane + 32 * i < cand ? 1 : 0;
-                if (__reduce_add_sync(0xffffffffu, n) < need) xt = cand;
+                if (pulsar_warp_add(n) < need) xt = cand;
             }
         }
         /* compact the TOPK picks into shared memory (lane order), then each lands at its rank among the picks */
