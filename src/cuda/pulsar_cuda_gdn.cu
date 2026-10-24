@@ -476,6 +476,7 @@ int gdn_forward_tp(const pulsar_gdn_weights *w, const pulsar_gdn_call *c, cudaSt
 } // namespace
 
 extern "C" int pulsar_gdn_forward(const pulsar_gdn_weights *w, const pulsar_gdn_call *c, cudaStream_t stream) {
+    PULSAR_REQUIRE_CC(90, "the GDN recurrence (thread-block clusters)", -1);   /* L321: refuse below the lane's arch, before its kernels trap */
     if (!w || !c) return refuse("null weights or call");
     if (!w->conv_w || !w->A_log || !w->dt_bias || !w->norm_w) return refuse("a weight pointer is null");
     if (((uintptr_t)w->conv_w & 7u) != 0) return refuse("conv_w not 8-byte aligned (a bf16 uint2 row)");

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cuda_runtime.h>
+#include <cstdio>
 
 /* Device-pass capability tiers (L321): the ONE place a kernel asks which instructions its compile target has.
  *
@@ -78,17 +79,35 @@ __device__ __forceinline__ T pulsar_warp_max(T v) {
 /* Host side: what the DEVICE has.  The tiers above say what an IMAGE was compiled with; a launch decision must ask the
  * device, or a build for an older target selects a lane its card cannot run (L321: an sm_75 build on an sm_75 card chose
  * the routed IQ2 MMQ lane, whose block-scaled MMA exists only in the sm_120f image; its other arm returned NaN). */
-/* The current device's compute-capability major, asked once per process; 0 if unknown.  Inline (one cache per program)
- * so a model-free gate that links a single kernel object needs no runtime object for it. */
-inline int pulsar_cuda_device_major(void) {
-    static int major = -1;
-    if (major < 0) {
-        int dev = 0, m = 0;
-        major = (cudaGetDevice(&dev) == cudaSuccess &&
-                 cudaDeviceGetAttribute(&m, cudaDevAttrComputeCapabilityMajor, dev) == cudaSuccess) ? m : 0;
+/* The current device's compute capability as major * 10 + minor (75 Turing, 89 Ada, 121 GB10), asked once per process;
+ * 0 if unknown.  Inline (one cache per program) so a model-free gate that links a single kernel object needs no
+ * runtime object for it. */
+inline int pulsar_cuda_device_cc(void) {
+    static int cc = -1;
+    if (cc < 0) {
+        int dev = 0, ma = 0, mi = 0;
+        cc = (cudaGetDevice(&dev) == cudaSuccess &&
+              cudaDeviceGetAttribute(&ma, cudaDevAttrComputeCapabilityMajor, dev) == cudaSuccess &&
+              cudaDeviceGetAttribute(&mi, cudaDevAttrComputeCapabilityMinor, dev) == cudaSuccess) ? ma * 10 + mi : 0;
     }
-    return major;
+    return cc;
 }
+inline int pulsar_cuda_device_major(void) { return pulsar_cuda_device_cc() / 10; }
+
+/* A lane whose kernels need compute capability `cc` (major * 10 + minor) refuses on a lesser device -- on the host, by
+ * name, once per call site -- returning `ret`; its kernels' trapping arms (the tiers above) then never run.  (L321) */
+#define PULSAR_REQUIRE_CC(cc, lane, ret)                                                                          \
+    do {                                                                                                         \
+        if (pulsar_cuda_device_cc() < (cc)) {                                                                     \
+            static bool said_ = false;                                                                           \
+            if (!said_) {                                                                                        \
+                said_ = true;                                                                                    \
+                fprintf(stderr, "pulsar: %s needs sm_%d or newer; this device is sm_%d -- refusing\n", (lane), (cc), \
+                        pulsar_cuda_device_cc());                                                                \
+            }                                                                                                    \
+            return ret;                                                                                          \
+        }                                                                                                        \
+    } while (0)
 
 /* mma.sync.kind::mxf8f6f4.block_scale (MXFP8 experts, MXFP4 indexer): the sm_12x family only. */
 static inline bool pulsar_cuda_block_scale_mma(int major) { return major == 12; }

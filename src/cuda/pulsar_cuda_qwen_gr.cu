@@ -876,6 +876,7 @@ static int gr_read_kernels(const pulsar_qwen_gr_dev *w, const uint16_t *streams,
 extern "C" int pulsar_qwen_gr_read_launch(const pulsar_qwen_gr_dev *w, const uint16_t *streams, int T,
                                           uint16_t *x_bf16, float *inj,
                                           void *ws, size_t ws_bytes, cudaStream_t stream) {
+    PULSAR_REQUIRE_CC(80, "the Qwen GR read (bf16 m16n8k16, cp.async)", -1);   /* L321: refuse below the lane's arch, before its kernels trap */
     if (!w || !w->norm_w || !w->down.w || !w->up.w || !streams || T <= 0 ||
         !x_bf16 || (w->inject && !inj)) {
         fprintf(stderr, "pulsar: qwen GR read: a null input -- refusing\n");
@@ -952,6 +953,7 @@ extern "C" int pulsar_qwen_gr_write_launch(uint16_t *streams, const float *out, 
  * 80 blocks are walked by one warp in order. */
 extern "C" int pulsar_qwen_mxfp8_linear_launch(const pulsar_qwen_lowrank *l, const uint16_t *x_bf16, int rows,
                                                float *y, void *ws, size_t ws_bytes, cudaStream_t stream) {
+    PULSAR_REQUIRE_CC(80, "the Qwen MXFP8 linear (tensor-core rows kernel)", -1);   /* L321: refuse below the lane's arch, before its kernels trap */
     (void)ws;
     (void)ws_bytes;
     /* L251 / ac69748f: the bf16 activation, so the W8=false arm of the same kernel.  The E4M3 slot and

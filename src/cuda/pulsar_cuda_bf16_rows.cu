@@ -230,6 +230,7 @@ bool aligned16(const void *p) { return ((uintptr_t)p & 15u) == 0; }
 
 int pulsar_bf16_rows_linear_launch(const void *w, const uint16_t *x_bf16, int rows, int in, int out, float *y,
                                    bool prompt, cudaStream_t stream) {
+    PULSAR_REQUIRE_CC(80, "the bf16 rows linear (bf16 m16n8k16 / cuBLASLt bf16)", -1);   /* L321: refuse below the lane's arch, before its kernels trap */
     if (!w || !x_bf16 || !y || rows <= 0 || in <= 0 || out <= 0 || in % 64 || !aligned16(w) || !aligned16(x_bf16) ||
         !aligned16(y)) {
         fprintf(stderr, "pulsar: BF16 linear (bf16 rows): %d -> %d at %d rows needs in %% 64 and 16-byte aligned "
@@ -273,6 +274,7 @@ int pulsar_bf16_rows_linear_launch(const void *w, const uint16_t *x_bf16, int ro
 int pulsar_bf16_moe_routed_launch(const pulsar_bf16_moe &w, const int32_t *sel, const float *wts, int T, int top_k,
                                   float clamp, const uint16_t *x_bf16, float *gate_z, float *up_z, uint16_t *mid,
                                   float *down_z, float *out, uint32_t *nf_flag, uint32_t nf_code, cudaStream_t stream) {
+    PULSAR_REQUIRE_CC(80, "the bf16 routed MoE (bf16 m16n8k16)", -1);   /* L321: refuse below the lane's arch, before its kernels trap */
     const char *tag = "pulsar: routed MoE (bf16 rows, BF16 experts)";
     /* the activation names the stacks: SWIGLU gate + up, RELU2 up alone (a non-gated expert: no gate stack) */
     const bool gated = w.act == PULSAR_FFN_ACT_SWIGLU;

@@ -51,6 +51,7 @@ void tessera_host_check(bool ok, const char *msg) {
  * include and restored after it. */
 #pragma nv_diag_suppress 549
 #include "tessera_routed_fused_window.cuh"
+#include "cuda/pulsar_cuda_arch.cuh"
 #pragma nv_diag_default 549
 
 namespace {
@@ -246,6 +247,7 @@ extern "C" size_t pulsar_tessera_dense_workspace_bytes(const pulsar_tessera_proj
 
 extern "C" int pulsar_tessera_dense_launch(const pulsar_tessera_proj *w, const uint16_t *x, int M, uint16_t *out,
                                            long out_stride, void *ws, size_t ws_bytes, cudaStream_t stream) {
+    PULSAR_REQUIRE_CC(89, "Tessera dense (e4m3 mma, cp.async)", -1);   /* L321: refuse below the lane's arch, before its kernels trap */
     if (!proj_ok(w, 2, "dense")) return -1;
     if (w->E != 1 || !x || !out || M <= 0 || out_stride < w->N || out_stride % 2 != 0) {
         fprintf(stderr, "pulsar: tessera: dense launch: E %d (must be 1), M %d, out_stride %ld (even, >= N %d) -- "
@@ -320,6 +322,7 @@ extern "C" int pulsar_tessera_moe_launch(const pulsar_tessera_proj *gate, const 
                                          const pulsar_tessera_proj *down, const uint16_t *x, int T, int top_k,
                                          const int32_t *expert_ids, const float *weights, uint16_t *out,
                                          void *ws, size_t ws_bytes, cudaStream_t stream) {
+    PULSAR_REQUIRE_CC(89, "Tessera MoE (e4m3 mma, cp.async)", -1);   /* L321: refuse below the lane's arch, before its kernels trap */
     if (!proj_ok(gate, 0, "moe gate") || !proj_ok(up, 0, "moe up") || !proj_ok(down, 2, "moe down")) return -1;
     const int E = gate->E, H = gate->K, I = gate->N;
     if (up->E != E || up->K != H || up->N != I || up->words_stride != gate->words_stride ||

@@ -659,6 +659,7 @@ int exl3_moe_prefill_launch(const void *table, int k2, bool rotate_input, const 
                             const int32_t *ids_dst, const int32_t *ids_src, const int32_t *expert_bounds,
                             float *out, int M, int K, int64_t n_assign, int n_experts,
                             void *ws, size_t ws_bytes, cudaStream_t stream) {
+    PULSAR_REQUIRE_CC(80, "the EXL3 MoE prefill GEMM (m16n8k16, cp.async)", -1);   /* L321: refuse below the lane's arch, before its kernels trap */
     const char *tag = "exl3_moe_prefill_launch";
     const bool e4m3 = act.format == EXL3_MOE_ACT_E4M3_SLOT;
     if (!table || !act.x || !ids_dst || !ids_src || !expert_bounds || !out || !ws || n_assign <= 0 ||
@@ -752,6 +753,7 @@ int exl3_moe_decode_launch(const void *table0, const void *table1, int k2, bool 
                            const int32_t *ids_dst, const int32_t *ids_src, const int32_t *expert_bounds, int M, int K,
                            int64_t n_assign, int n_experts, void *ws, size_t ws_bytes, exl3_moe_partials *out,
                            cudaStream_t stream) {
+    PULSAR_REQUIRE_CC(80, "the EXL3 MoE decode (m16n8k16)", -1);   /* L321: refuse below the lane's arch, before its kernels trap */
     const char *tag = "exl3_moe_decode_launch";
     const bool e4m3 = act.format == EXL3_MOE_ACT_E4M3_SLOT;
     const int n_proj = table1 ? 2 : 1;

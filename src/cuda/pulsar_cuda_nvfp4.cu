@@ -244,6 +244,7 @@ int pulsar_nvfp4_ksplit(int in, int out) {
 
 int pulsar_nvfp4_rows_multi_launch(const void *const *w, int n, const uint16_t *x_bf16, int rows, int in, int out,
                                    float *const *y, uint16_t *const *y_bf16, cudaStream_t stream) {
+    PULSAR_REQUIRE_CC(120, "the NVFP4 rows linear (sm_12x e2m1 / e4m3 conversions)", -1);   /* L321: refuse below the lane's arch, before its kernels trap */
     uint64_t vb = 0, sb = 0, stride = 0;
     bool ok = w && n >= 1 && n <= PULSAR_NVFP4_MULTI_MAX && x_bf16 && rows > 0 && out > 0 &&
               pulsar_nvfp4_layout((uint64_t)in, (uint64_t)out, &vb, &sb, &stride) && aligned16(x_bf16);
@@ -290,5 +291,6 @@ int pulsar_nvfp4_rows_multi_launch(const void *const *w, int n, const uint16_t *
 
 int pulsar_nvfp4_rows_linear_launch(const void *w, const uint16_t *x_bf16, int rows, int in, int out, float *y,
                                     uint16_t *y_bf16, cudaStream_t stream) {
+    PULSAR_REQUIRE_CC(120, "the NVFP4 rows linear (sm_12x e2m1 / e4m3 conversions)", -1);   /* L321: refuse below the lane's arch, before its kernels trap */
     return pulsar_nvfp4_rows_multi_launch(&w, 1, x_bf16, rows, in, out, &y, &y_bf16, stream);
 }
