@@ -42,6 +42,7 @@ import qwen as Q           # noqa: E402
 import deepseek as D       # noqa: E402
 import inkling as I        # noqa: E402
 import nemotron_h as N     # noqa: E402
+import nemotron_enc as NE  # noqa: E402
 import entries as EN       # noqa: E402
 
 ALIGN = 32
@@ -327,8 +328,9 @@ def write_index(out_dir):
 # The family modules, registered by the checkpoint's config.json model_type -- the one authority for which naming
 # table applies.  deepseek.py: V4 Flash / Vision-Exp and V4.1; qwen.py: qwen4_exp; inkling.py: Inkling
 # (InklingForConditionalGeneration, model_type inkling_mm_model); nemotron_h.py: Nemotron-H (the Omni checkpoint,
-# NemotronH_Omni_Reasoning_V3, model_type nemotron_h_omni).
-FAMILIES = {'deepseek_v4': D, 'deepseek_v41': D, 'qwen4_exp': Q, I.MODEL_TYPE: I, N.MODEL_TYPE: N}
+# NemotronH_Omni_Reasoning_V3, model_type nemotron_h_omni); nemotron_enc.py: the Nemotron-3.5 retrieval encoders
+# (Mistral3Model / Mistral3ForSequenceClassification, model_type mistral3; L321).
+FAMILIES = {'deepseek_v4': D, 'deepseek_v41': D, 'qwen4_exp': Q, I.MODEL_TYPE: I, N.MODEL_TYPE: N, NE.MODEL_TYPE: NE}
 
 
 def family_of(hf):

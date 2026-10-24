@@ -1,0 +1,24 @@
+{
+ "schema": "pulsar.recipe.v1",
+ "recipe": "nemotron_enc-rerank-exl3-k4",
+ "model_type": "mistral3",
+ "about": "Nemotron-3.5 Rerank-8B on the uniform 4.0 bpw EXL3 pack of the staged text trunk (retriever/exl3/stage_text_trunk.py; exllamav3, mul1 codebook): every trunk Linear (q / k / v / o, gate / up / down) exl3m_k4, byte copies of the pack (--exl3); the norms, the embedding and the score head from the BF16 checkpoint (--hf) as stored. The vision tower is consumed by name (v1: text only). Graded on Ferret's eval 2026-10-24: Embed MRR 0.955 at 4.0 vs 0.932 fp16; Rerank order unchanged (retriever/README.md).",
+ "rows": [
+  {
+   "role": "dense",
+   "format": "exl3m_k4"
+  },
+  {
+   "role": "norm",
+   "format": "native"
+  },
+  {
+   "role": "embed",
+   "format": "native"
+  },
+  {
+   "role": "head",
+   "format": "native"
+  }
+ ]
+}
