@@ -706,10 +706,13 @@ int pulsar_gqa_plan(const pulsar_gqa_layer *L, const pulsar_gqa_seq *seqs, uint3
         const uint32_t sq = row_seq[r];
         if (sq >= n_seqs) return gqa_refuse("row_seq names no sequence");
         const pulsar_gqa_seq &S = seqs[sq];
-        if (!S.kv || S.cap == 0 || S.bytes < (uint64_t)S.cap * tb || ((uintptr_t)S.kv & 15u)) {
+        /* L321: a FULL block run from position 0 (an encoder's whole input) reads only its own fresh rows -- there are
+         * no earlier keys -- and stores nothing, so it may name no pool at all (checked below: the run starts at 0) */
+        const bool poolless = L->block && L->span == PULSAR_GQA_FULL && !S.kv;
+        if (!poolless && (!S.kv || S.cap == 0 || S.bytes < (uint64_t)S.cap * tb || ((uintptr_t)S.kv & 15u))) {
             return gqa_refuse("a sequence's pool is missing, short, or not 16-byte aligned");
         }
-        if (L->span == PULSAR_GQA_FULL && row_pos[r] >= S.cap) return gqa_refuse("a row's position is past its pool's cap");
+        if (!poolless && L->span == PULSAR_GQA_FULL && row_pos[r] >= S.cap) return gqa_refuse("a row's position is past its pool's cap");
         if (L->span == PULSAR_GQA_WINDOW && S.cap < L->window) return gqa_refuse("a ring holds fewer slots than the window");
         if (row_pos[r] >= 0x7fffffffu) return gqa_refuse("a row position past 2^31");
         if (run_first[sq] == UINT32_MAX) {
@@ -721,9 +724,15 @@ int pulsar_gqa_plan(const pulsar_gqa_layer *L, const pulsar_gqa_seq *seqs, uint3
         max_ctx = std::max(max_ctx, row_pos[r] + 1u);
     }
     if (ctx_bound && max_ctx > ctx_bound) return gqa_refuse("a row's position is at or past the call's ctx_bound");
-    for (uint32_t sq = 0; L->block && sq < n_seqs; sq++)
-        if (run_first[sq] != UINT32_MAX && run_last[sq] - run_first[sq] >= GQA_CHUNK)
-            return gqa_refuse("a block run longer than 256 rows (a block row reads at most 255 keys past it)");
+    for (uint32_t sq = 0; L->block && sq < n_seqs; sq++) {
+        if (run_first[sq] == UINT32_MAX) continue;
+        /* a WINDOW block's chunk bound counts at most GQA_CHUNK - 1 keys past a row (gqa_max_chunks); a FULL one's is the
+         * context's, so a FULL run (an encoder's input, L321) may be as long as the call */
+        if (L->span == PULSAR_GQA_WINDOW && run_last[sq] - run_first[sq] >= GQA_CHUNK)
+            return gqa_refuse("a windowed block run longer than 256 rows (a block row reads at most 255 keys past it)");
+        if (!seqs[sq].kv && row_pos[run_first[sq]] != 0)
+            return gqa_refuse("a block run with no pool must start at position 0 (it has no earlier keys to read)");
+    }
 
     gqa_row *h_rows = (gqa_row *)desc;
     gqa_tile *h_tiles = (gqa_tile *)((uint8_t *)desc + gqa_up((uint64_t)n_rows * sizeof(gqa_row)));
