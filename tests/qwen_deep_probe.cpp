@@ -229,8 +229,8 @@ int main(int argc, char **argv) {
               "C1 sync(P[0:%d]) then sync(P[0:%d]): %.1f s; checkpoints kept at %d and %d %s", k, D, t1 - t0, Gk, GD,
               err);
         FILE *a = ok ? fopen(f1.c_str(), "wb") : NULL, *b = ok ? fopen(f2.c_str(), "wb") : NULL;
-        b1 = ok ? pulsar_session_segment_bytes(s, 0, Gk) : 0;
-        b2 = ok ? pulsar_session_segment_bytes(s, Gk, GD) : 0;
+        b1 = ok ? pulsar_session_segment_bytes(s, 0, Gk, NULL) : 0;
+        b2 = ok ? pulsar_session_segment_bytes(s, Gk, GD, NULL) : 0;
         const double t2 = now_s();
         ok = ok && a && b && pulsar_session_save_segment(s, a, 0, Gk, NULL, err, sizeof err) == 0 &&
              pulsar_session_save_segment(s, b, Gk, GD, NULL, err, sizeof err) == 0;
