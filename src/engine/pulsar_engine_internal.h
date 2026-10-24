@@ -2749,7 +2749,7 @@ struct pulsar_session {
      * whose version or shape does not match this build. @return 0 on success. */
     int load_payload(FILE *fp, uint64_t payload_bytes, char *err, size_t errlen);
     /** L264 S4 disk segments (pulsar.h, pulsar_session_save_segment). */
-    uint64_t segment_bytes(uint32_t G_prev, uint32_t G);
+    uint64_t segment_bytes(uint32_t G_prev, uint32_t G, uint64_t *state_bytes);
     int save_segment(FILE *fp, uint32_t G_prev, uint32_t G, char *err, size_t errlen);
     int load_segment(FILE *fp, uint64_t bytes, bool last, uint32_t *G_out, char *err, size_t errlen);
     /** Capture the session into an owned in-memory blob. @return 0 on success. */

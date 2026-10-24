@@ -252,17 +252,27 @@ static int payload_read_tensor_span(payload_io *io, pulsar_gpu_tensor *tensor,
 
 /* ===== L264 S4 / L265: disk segments ====================================
  * One segment = tokens [G_prev, G), every append-only POOL's rows for those
- * positions, and the grid checkpoint at G (pulsar.h, pulsar_session_save_segment).
- * What the pools and the slot are is the model's (kv_state.h); this framing is
- * not.  The header pins the model's layout by a digest of what makes the bytes
- * readable -- the state model's name, its grid, the slot size and every pool's
- * granularity and row width -- so a segment written under another layout is
- * refused, never misread. */
-#define SEGMENT_U32_FIELDS 8u
+ * positions, and -- when the installed bank holds it -- the grid checkpoint at G
+ * (pulsar.h, pulsar_session_save_segment).  What the pools and the slot are is
+ * the model's (kv_state.h); this framing is not.  The header pins the model's
+ * layout by a digest of what makes the bytes readable -- the state model's
+ * name, its grid, the slot size and every pool's granularity and row width --
+ * so a segment written under another layout is refused, never misread.
+ *
+ * L323 (v6): the state is OPTIONAL and comes LAST, behind its own digest.  The
+ * stream is the header (word 8: the state flag), the tokens, the image records,
+ * the pool rows, the rows' digest, then -- when flagged -- the slot and the
+ * state's digest.  A chain load reads the rows of every segment and the state of
+ * its last one only (pulsar_session_load_segment's `last`): restoring a point
+ * needs ONE state, the nearest stored one at or below it, and a recurrent
+ * family's state is ~133 MiB against ~13 KiB a token of rows (Qwen3.8 FN, L320). */
+#define SEGMENT_U32_FIELDS 9u
+#define SEGMENT_FLAG_STATE 1u
 /* L281 (v3): after the span's tokens, the image blocks lying wholly inside the span -- a u32 count, then per block
  * u32 start, u32 end, u64 content (two u32) -- so a chain carries rows past an image together with WHICH image they
- * are (image_identity.cpp).  A span boundary is a grid checkpoint, never inside a block, so every block a chain holds
- * is in exactly one segment.  Each rank's copy carries them: a worker's load sets the same identity as the leader's. */
+ * are (image_identity.cpp).  A span boundary is never inside a block (segment_cut_ok; a checkpoint never is), so
+ * every block a chain holds is in exactly one segment.  Each rank's copy carries them: a worker's load sets the same
+ * identity as the leader's. */
 
 /* the session's records of the blocks inside [G_prev, G) */
 static uint32_t segment_images(const pulsar_session *s, uint32_t G_prev, uint32_t G, const pulsar_image_block **first) {
@@ -343,17 +353,39 @@ static bool segment_span_ok(const pulsar_ckpt_store *st, uint32_t G_prev, uint32
     return G > G_prev && G_prev % grid == 0u && G % grid == 0u;
 }
 
-/* the bytes of a segment over [G_prev, G) carrying `n_images` image records.  Only the current version loads:
- * older segments are refused and the chain rewrites itself (on-disk KV carries no back-compat, Tyler 2026-10-13). */
-static uint64_t segment_bytes_for(pulsar_ckpt_store *st, uint32_t G_prev, uint32_t G, uint32_t n_images) {
+/* L323: a segment may END at G only where no image block of the history lies across it (a checkpoint never does;
+ * a rows-only grid cut must check) -- every block a chain holds is then inside exactly one segment */
+static bool segment_cut_ok(const pulsar_session *s, uint32_t G) {
+    for (uint32_t i = 0; i < s->live_images.n; i++)
+        if (s->live_images.b[i].start < G && G < s->live_images.b[i].end) return false;
+    return true;
+}
+
+/* L323: does a segment ending at G carry the state there?  The ONE predicate a save, its size and the store's
+ * pricing read: the installed bank holds its grid checkpoint at G. */
+static bool segment_has_state(pulsar_ckpt_store *st, uint32_t bank, uint32_t G) {
+    pulsar_gpu_tensor *slab = NULL;
+    uint64_t off = 0;
+    return pulsar_ckpt_locate(st, bank, G, &slab, &off);
+}
+
+/* The state part of a segment: the slot and its digest (0 for a rows-only segment). */
+static uint64_t segment_state_bytes_for(const pulsar_ckpt_store *st, bool state) {
+    return state ? st->slot_bytes + sizeof(uint64_t) : 0u;
+}
+
+/* the bytes of a segment over [G_prev, G) carrying `n_images` image records, and the state at G when `state`.  Only
+ * the current version loads: older segments are refused and the chain rewrites itself (on-disk KV carries no
+ * back-compat, Tyler 2026-10-13). */
+static uint64_t segment_bytes_for(pulsar_ckpt_store *st, uint32_t G_prev, uint32_t G, uint32_t n_images, bool state) {
     pulsar_kv_pool pools[PULSAR_KV_POOLS_MAX];
     const uint32_t n = segment_pools(st, pools);
     uint64_t bytes = (uint64_t)SEGMENT_U32_FIELDS * sizeof(uint32_t);
     bytes += (uint64_t)(G - G_prev) * sizeof(uint32_t);
     bytes += sizeof(uint32_t) + (uint64_t)n_images * SEGMENT_IMAGE_U32 * sizeof(uint32_t);
-    bytes += st->slot_bytes;
     bytes += pools_span_bytes(pools, n, G_prev, G);
-    return bytes + sizeof(uint64_t);   /* the trailing digest */
+    bytes += sizeof(uint64_t);   /* the rows' digest */
+    return bytes + segment_state_bytes_for(st, state);
 }
 
 /* L281: a stored segment's image records, read from its payload's head without loading it.  The bytes are the
@@ -377,11 +409,14 @@ int pulsar_session_segment_images(FILE *fp, uint64_t bytes, uint64_t *hashes, ui
     return 0;
 }
 
-uint64_t pulsar_session::segment_bytes(uint32_t G_prev, uint32_t G) {
+uint64_t pulsar_session::segment_bytes(uint32_t G_prev, uint32_t G, uint64_t *state_bytes) {
     pulsar_ckpt_store *st = pulsar_session_kv_store(this);
-    if (!segment_span_ok(st, G_prev, G)) return 0;
+    if (state_bytes) *state_bytes = 0u;
+    if (!segment_span_ok(st, G_prev, G) || !segment_cut_ok(this, G_prev) || !segment_cut_ok(this, G)) return 0;
+    const bool state = segment_has_state(st, pulsar_session_live_bank(this), G);
+    if (state_bytes) *state_bytes = segment_state_bytes_for(st, state);
     const pulsar_image_block *first = NULL;
-    return segment_bytes_for(st, G_prev, G, segment_images(this, G_prev, G, &first));
+    return segment_bytes_for(st, G_prev, G, segment_images(this, G_prev, G, &first), state);
 }
 
 int pulsar_session::save_segment(FILE *fp, uint32_t G_prev, uint32_t G, char *err, size_t errlen) {
@@ -396,12 +431,14 @@ int pulsar_session::save_segment(FILE *fp, uint32_t G_prev, uint32_t G, char *er
         payload_set_err(err, errlen, "save segment: the bank's rows do not reach the segment's end");
         return 1;
     }
-    pulsar_gpu_tensor *slab = NULL;
-    uint64_t slot_off = 0;
-    if (!pulsar_ckpt_locate(st, bank, G, &slab, &slot_off)) {
-        payload_set_err(err, errlen, "save segment: the bank holds no grid checkpoint at the segment's end");
+    if (!segment_cut_ok(s, G_prev) || !segment_cut_ok(s, G)) {
+        payload_set_err(err, errlen, "save segment: an image block lies across the span's edge");
         return 1;
     }
+    /* L323: the state at G rides along when the bank holds its checkpoint there (segment_has_state) */
+    pulsar_gpu_tensor *slab = NULL;
+    uint64_t slot_off = 0;
+    const bool state = pulsar_ckpt_locate(st, bank, G, &slab, &slot_off);
     if (pulsar_gpu_synchronize() == 0) {
         payload_set_err(err, errlen, "save segment: failed to synchronize accelerator");
         return 1;
@@ -414,6 +451,7 @@ int pulsar_session::save_segment(FILE *fp, uint32_t G_prev, uint32_t G, char *er
     const uint32_t header[SEGMENT_U32_FIELDS] = {
         PULSAR_SESSION_SEGMENT_MAGIC, PULSAR_SESSION_SEGMENT_VERSION,
         (uint32_t)layout, (uint32_t)(layout >> 32), (uint32_t)st->slot_bytes, st->ops->resume_grid, G_prev, G,
+        state ? SEGMENT_FLAG_STATE : 0u,
     };
     for (uint32_t i = 0; i < SEGMENT_U32_FIELDS; i++)
         if (payload_write_u32(&io, header[i], err, errlen) != 0) return 1;
@@ -425,17 +463,25 @@ int pulsar_session::save_segment(FILE *fp, uint32_t G_prev, uint32_t G, char *er
         if (payload_write_images(&io, b, n_img, err, errlen) != 0) return 1;
     }
     uint8_t *buf = (uint8_t *)xmalloc(PULSAR_SESSION_IO_CHUNK);
-    int rc = payload_write_tensor_span(&io, slab, slot_off, st->slot_bytes, buf, PULSAR_SESSION_IO_CHUNK, err, errlen);
     pulsar_kv_pool pools[PULSAR_KV_POOLS_MAX];
     const uint32_t n = segment_pools(st, pools);
-    if (rc == 0) rc = pools_span_io(&io, pools, n, G_prev, G, true, buf, NULL, err, errlen);
+    int rc = pools_span_io(&io, pools, n, G_prev, G, true, buf, NULL, err, errlen);
+    /* the rows' digest closes the part every load reads; the state part, when present, has its own */
+    for (int part = 0; rc == 0 && part < (state ? 2 : 1); part++) {
+        if (part == 1) {
+            payload_digest_init(&io.digest);
+            rc = payload_write_tensor_span(&io, slab, slot_off, st->slot_bytes, buf, PULSAR_SESSION_IO_CHUNK, err,
+                                           errlen);
+            if (rc != 0) break;
+        }
+        const uint64_t dg = payload_digest_final(&io.digest);
+        if (fwrite(&dg, 1, sizeof(dg), fp) != sizeof(dg)) {
+            payload_set_err(err, errlen, "save segment: failed to write a digest");
+            rc = 1;
+        }
+    }
     free(buf);
     if (rc != 0) return rc;
-    const uint64_t dg = payload_digest_final(&io.digest);
-    if (fwrite(&dg, 1, sizeof(dg), fp) != sizeof(dg)) {
-        payload_set_err(err, errlen, "save segment: failed to write the digest");
-        return 1;
-    }
     pulsar_writeback_finish(&io.wb);
     return 0;
 }
@@ -507,7 +553,19 @@ int pulsar_session::load_segment(FILE *fp, uint64_t bytes, bool last, uint32_t *
             return 1;
         }
     }
-    if (bytes != segment_bytes_for(st, G_prev, G, n_img)) {
+    /* L323: the state flag; the chain's last segment must carry the state its load restores */
+    if ((h[8] & ~SEGMENT_FLAG_STATE) != 0u) {
+        token_vec_free(&toks);
+        payload_set_err(err, errlen, "load segment: unknown header flags");
+        return 1;
+    }
+    const bool state = (h[8] & SEGMENT_FLAG_STATE) != 0u;
+    if (last && !state) {
+        token_vec_free(&toks);
+        payload_set_err(err, errlen, "load segment: the chain's last segment carries no state to restore");
+        return 1;
+    }
+    if (bytes != segment_bytes_for(st, G_prev, G, n_img, state)) {
         token_vec_free(&toks);
         payload_set_err(err, errlen, "load segment: size does not match its span");
         return 1;
@@ -522,36 +580,46 @@ int pulsar_session::load_segment(FILE *fp, uint64_t bytes, bool last, uint32_t *
     pulsar_gpu_tensor *slab = NULL;
     uint64_t slot_off = 0;
     uint32_t slot = 0;
-    if (!pulsar_ckpt_claim(st, bank, G, &slab, &slot_off, &slot)) {
+    if (last && !pulsar_ckpt_claim(st, bank, G, &slab, &slot_off, &slot)) {
         payload_set_err(err, errlen, "load segment: no grid-checkpoint slot");
         return fail();
     }
     uint8_t *buf = (uint8_t *)xmalloc(PULSAR_SESSION_IO_CHUNK);
-    int rc = payload_read_tensor_span(&io, slab, slot_off, st->slot_bytes, buf, PULSAR_SESSION_IO_CHUNK,
-                                      &remaining, err, errlen);
     pulsar_kv_pool pools[PULSAR_KV_POOLS_MAX];
     const uint32_t n = segment_pools(st, pools);
-    if (rc == 0) rc = pools_span_io(&io, pools, n, G_prev, G, false, buf, &remaining, err, errlen);
+    int rc = pools_span_io(&io, pools, n, G_prev, G, false, buf, &remaining, err, errlen);
+    /* the rows' digest; then, for the chain's last segment, its state and the state's digest (an earlier segment's
+     * state is not read: the load restores one) */
+    for (int part = 0; rc == 0 && part < (last ? 2 : 1); part++) {
+        if (part == 1) {
+            payload_digest_init(&io.digest);
+            rc = payload_read_tensor_span(&io, slab, slot_off, st->slot_bytes, buf, PULSAR_SESSION_IO_CHUNK,
+                                          &remaining, err, errlen);
+            if (rc != 0) break;
+        }
+        uint64_t stored_dg = 0;
+        const uint64_t after = part == 0 ? segment_state_bytes_for(st, state) : 0u;
+        if (remaining != sizeof(uint64_t) + after || fread(&stored_dg, 1, sizeof(stored_dg), fp) != sizeof(stored_dg) ||
+            stored_dg != payload_digest_final(&io.digest)) {
+            payload_set_err(err, errlen, "load segment: digest mismatch (corrupt segment)");
+            rc = 1;
+        }
+        remaining -= sizeof(uint64_t);
+    }
     free(buf);
     if (rc != 0) return fail();
-    uint64_t stored_dg = 0;
-    if (remaining != sizeof(uint64_t) || fread(&stored_dg, 1, sizeof(stored_dg), fp) != sizeof(stored_dg) ||
-        stored_dg != payload_digest_final(&io.digest)) {
-        payload_set_err(err, errlen, "load segment: digest mismatch (corrupt segment)");
-        return fail();
-    }
     if (pulsar_gpu_synchronize() == 0) {
         payload_set_err(err, errlen, "load segment: failed to synchronize accelerator after the copy");
         return fail();
     }
-    /* Commit: the history, the frontier, then the checkpoint (after the frontier
-     * write, which could otherwise drop it).  The lanes and window describe no
-     * position yet -- stale until the last segment restores its checkpoint. */
+    /* Commit: the history, the frontier, then the last segment's checkpoint (after the frontier write, which could
+     * otherwise drop it).  The lanes and window describe no position yet -- stale until the last segment restores
+     * its checkpoint. */
     for (int i = 0; i < toks.len; i++) token_vec_push(&s->checkpoint, toks.v[i]);
     token_vec_free(&toks);
     for (uint32_t i = 0; i < n_img; i++) s->live_images.b[s->live_images.n++] = imgs[i];   /* L281 */
     st->ops->set_frontier_stale(st->state, G);
-    pulsar_ckpt_commit(st, bank, slot, G);
+    if (last) pulsar_ckpt_commit(st, bank, slot, G);
     s->prefill_frontier = (int)G;   /* L195: a prefill reached G (the family's own counter is set_frontier_stale's) */
     s->checkpoint_valid = true;
     /* the chain's last checkpoint: the family's standalone restore where it has one (DeepSeek: the history and the

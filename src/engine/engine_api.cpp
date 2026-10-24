@@ -1794,9 +1794,10 @@ const pulsar_tokens *pulsar_session_tokens(pulsar_session *s) { return s ? s->to
 uint64_t pulsar_session_payload_bytes(pulsar_session *s) { PULSAR_FAMILY_REQUIRES_S(s, PULSAR_FAMILY_CAP_PAYLOAD, "session payloads", 0); return s ? s->payload_bytes() : 0; }
 int pulsar_session_save_payload(pulsar_session *s, FILE *fp, char *err, size_t errlen) { PULSAR_FAMILY_REQUIRES_S(s, PULSAR_FAMILY_CAP_PAYLOAD, "session payloads", 1); return s ? s->save_payload(fp, err, errlen) : 1; }
 int pulsar_session_load_payload(pulsar_session *s, FILE *fp, uint64_t payload_bytes, char *err, size_t errlen) { PULSAR_FAMILY_REQUIRES_S(s, PULSAR_FAMILY_CAP_PAYLOAD, "session payloads", 1); return s ? s->load_payload(fp, payload_bytes, err, errlen) : 1; }
-uint64_t pulsar_session_segment_bytes(pulsar_session *s, int G_prev, int G) {
+uint64_t pulsar_session_segment_bytes(pulsar_session *s, int G_prev, int G, uint64_t *state_bytes) {
+    if (state_bytes) *state_bytes = 0;
     PULSAR_FAMILY_REQUIRES_S(s, PULSAR_FAMILY_CAP_SEGMENTS, "disk KV segments", 0);
-    return s && G_prev >= 0 && G > G_prev ? s->segment_bytes((uint32_t)G_prev, (uint32_t)G) : 0;
+    return s && G_prev >= 0 && G > G_prev ? s->segment_bytes((uint32_t)G_prev, (uint32_t)G, state_bytes) : 0;
 }
 /* L264 S4e: on a TP group every rank keeps its own copy of each segment (KV is
  * replicated per rank), named by the leader's store key.  Both operations are

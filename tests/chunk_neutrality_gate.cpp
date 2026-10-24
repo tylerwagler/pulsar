@@ -33,7 +33,10 @@
  *   O  sync(N), persist the session as a chain of disk SEGMENTS in a segment
  *                                store (L264 S4), restart (store reopened, session
  *                                fresh), find the chain by text, load it, sync(N):
- *                                resumes at 8576 -- the disk cache end to end
+ *                                resumes at 8576 -- the disk cache end to end (L323:
+ *                                the server's persist, cut on the canonical grid --
+ *                                [0,4096) [4096,8192) + the tail [8192,8576) -- and its
+ *                                restore: every segment's rows, the last one's state)
  *   P  M's history persisted as a segment chain to 3968 and resumed from it --
  *                                the reasoning-stripping turn coming back from disk
  * And one leg outside the table, X: a segment chain to 8576 restored, then
@@ -86,7 +89,8 @@
  */
 #include "pulsar.h"
 #include "gate_entry.h"
-#include "pulsar_segstore.h"
+#include "pulsar_kvchain.h"
+#include "pulsar_kvtext.h"
 
 #include <dirent.h>
 #include <unistd.h>
@@ -128,38 +132,18 @@ static char *read_file(const char *path, size_t *len_out) {
     return buf;
 }
 
-/* L264 S4: persist the session's grid checkpoints up to `limit` as a chain of
- * segments in a real segment STORE -- keyed by the rendered text of their
- * tokens, the way the server's disk KV cache keys them -- close the store and
- * throw the session away (the restart), reopen the store, find the chain by a
- * text lookup of the whole prompt alone, and load it into a fresh session.  Says
- * the chain it moved, so the log shows the segment path ran. */
-struct segment_writer { pulsar_session *s; int G_prev, G; };
-static int segment_write(FILE *fp, void *ud, char *err, size_t errlen) {
-    const segment_writer *w = (const segment_writer *)ud;
-    return pulsar_session_save_segment(w->s, fp, w->G_prev, w->G, NULL, err, errlen);
-}
-static char *render_span(pulsar_engine *e, const pulsar_tokens *t, int from, int to, size_t *len) {
-    size_t cap = 4096, n = 0;
-    char *out = (char *)malloc(cap);
-    for (int i = from; out && i < to; i++) {
-        size_t pl = 0;
-        char *piece = pulsar_token_text(e, t->v[i], &pl);
-        if (n + pl + 1 > cap) { while (n + pl + 1 > cap) cap *= 2; out = (char *)realloc(out, cap); }
-        if (out) { memcpy(out + n, piece, pl); n += pl; }
-        free(piece);
-    }
-    if (out) out[n] = 0;
-    *len = n;
-    return out;
-}
+/* L264 S4: persist the session as a segment chain in a real segment STORE -- the server's own persist and restore
+ * (pulsar_kvchain, keyed by the rendered text of the tokens) -- close the store and throw the session away (the
+ * restart), reopen the store, find the chain by a text lookup of the whole prompt alone, and load it into a fresh
+ * session.  L323: the chain is cut on the canonical disk grid (grid segments, then the tail to the deepest
+ * checkpoint, `limit`), a grid segment whose checkpoint the ladder thinned away carries rows only, and the load reads
+ * every segment's rows and the last one's state.  Says the chain it moved and which segments carry a state, so the
+ * log shows the segment path ran. */
 static int segment_round_trip(pulsar_engine *e, pulsar_session **sp, const pulsar_tokens *prompt, int limit,
                               char *err, size_t errlen) {
-    int Gs[64];
+    const int deepest = pulsar_session_checkpoint_best(*sp, limit);
+    if (deepest <= 0) { snprintf(err, errlen, "no grid checkpoint at or below %d to persist", limit); return 1; }
     int n = 0;
-    for (int G = pulsar_session_checkpoint_best(*sp, limit); G > 0 && n < 64;
-         G = pulsar_session_checkpoint_best(*sp, G - 1)) Gs[n++] = G;
-    if (n == 0) { snprintf(err, errlen, "no grid checkpoint at or below %d to persist", limit); return 1; }
     const char *tmp = getenv("TMPDIR");
     char dir[512];
     snprintf(dir, sizeof dir, "%s/chunk_neutrality_segs.XXXXXX", tmp && *tmp ? tmp : "/tmp");
@@ -169,25 +153,15 @@ static int segment_round_trip(pulsar_engine *e, pulsar_session **sp, const pulsa
     int rc = 1;
     pulsar_segstore *st = pulsar_segstore_open(dir, 0, model, NULL, NULL);
     if (!st) { snprintf(err, errlen, "segment store open failed"); goto out; }
-    printf("  [segments]");
     {
-        char parent[41] = "";
-        const pulsar_tokens *hist = pulsar_session_tokens(*sp);
-        for (int k = n - 1, prev = 0; k >= 0; prev = Gs[k], k--) {
-            size_t tl = 0;
-            char *text = render_span(e, hist, prev, Gs[k], &tl);
-            segment_writer w = { *sp, prev, Gs[k] };
-            char key[41];
-            const bool ok = text && pulsar_segstore_put(st, parent, (uint32_t)prev, (uint32_t)Gs[k], text, tl,
-                                                        pulsar_session_segment_bytes(*sp, prev, Gs[k]), segment_write,
-                                                        0, NULL, &w, key, err, errlen);
-            free(text);
-            if (!ok) goto out;
-            memcpy(parent, key, sizeof key);
-            printf(" [%d,%d)", prev, Gs[k]);
+        pulsar_kvchain_persist_result r;
+        pulsar_kvchain_persist(st, e, *sp, 0, true, NULL, &r);
+        if (r.err[0] || r.end != deepest) {
+            snprintf(err, errlen, "the persist stored a chain to %d, not %d: %.180s", r.end, deepest, r.err);
+            goto out;
         }
+        n = r.written;
     }
-    printf("\n");
     pulsar_segstore_close(st);
     st = NULL;
     pulsar_session_free(*sp);
@@ -197,22 +171,21 @@ static int segment_round_trip(pulsar_engine *e, pulsar_session **sp, const pulsa
     if (pulsar_session_create(sp, e, GATE_CTX) != 0) { snprintf(err, errlen, "session create failed"); goto out; }
     {
         size_t tl = 0;
-        char *text = render_span(e, prompt, 0, prompt->len, &tl);
-        pulsar_segstore_seg chain[64];
-        const int m = text ? pulsar_segstore_lookup(st, text, tl, chain, 64) : 0;
-        free(text);
-        if (m != n || (int)chain[m - 1].G != Gs[0]) {
-            snprintf(err, errlen, "text lookup found a chain of %d to %d, persisted %d to %d", m,
-                     m ? (int)chain[m - 1].G : 0, n, Gs[0]);
+        char *full = pulsar_kvtext_render_tokens_text(e, prompt, &tl);
+        pulsar_segstore_seg chain[PULSAR_KVCHAIN_MAX];
+        int loaded = 0;
+        const int G = full ? pulsar_kvchain_restore(st, e, *sp, full, tl, NULL, 0, 0, chain, PULSAR_KVCHAIN_MAX, &loaded,
+                                                    err, errlen)
+                           : 0;
+        free(full);
+        printf("  [segments]");
+        for (int i = 0; i < loaded; i++)
+            printf(" [%u,%u)%s", chain[i].G_prev, chain[i].G, chain[i].state_bytes ? "+state" : "");
+        printf("\n");
+        if (G != deepest || loaded != n) {
+            if (!err[0]) snprintf(err, errlen, "the restore stood at %d (%d segments), persisted to %d", G, loaded,
+                                  deepest);
             goto out;
-        }
-        for (int i = 0; i < m; i++) {
-            uint64_t pb = 0;
-            FILE *fp = pulsar_segstore_open_payload(st, chain[i].key, &pb);
-            int G = 0;
-            const int lrc = fp ? pulsar_session_load_segment(*sp, fp, pb, i == m - 1, &G, chain[i].key, err, errlen) : 1;
-            if (fp) fclose(fp);
-            if (lrc != 0) { if (!fp) snprintf(err, errlen, "segment %d unreadable", i); goto out; }
         }
     }
     rc = 0;

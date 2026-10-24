@@ -2183,7 +2183,7 @@ struct server {
      * No-op when `bank` is already live. Worker thread only. */
     bool bank_switch(int bank);
     /** Evict exactly one idle victim so a fresh conversation gets a bank.
-     * Live-tool owners are protected; LRU-superseded victims go first, else
+     * Live-tool owners are protected; dominated victims go first, else
      * plain LRU (worker_evict_one's picker). Reuses the proven eviction body
      * (snapshot + ledger release + bank reset). Worker thread only; returns
      * true when a bank was freed. */
@@ -2192,14 +2192,11 @@ struct server {
      * @return false when the file is missing or unreadable, which forces the
      * conversation to replay from a checkpoint instead. */
     bool bank_restore_spilled(int bank);
-    /** plan-33 inc D victim policy: an idle bank is LRU-SUPERSEDED when its whole
-     * committed history is a token-prefix of ANOTHER live bank's history (a sibling
-     * that already extends past it) — its KV is redundant, so evicting it loses the
-     * least. Returns such a slot's index (the least-recently-served among them), or
-     * -1. Pure host reads (pulsar_session_bank_tokens / _common_prefix are the same
-     * host-carry reads routing already uses on idle banks; no CUDA, no install).
-     */
-    int pick_superseded_idle(const bool *protect);
+    /** L323: which slots are DOMINATED -- a bank whose whole history is the prefix of another resident or spilled
+     * bank's (bank_dominated_core, the one predicate).  The guard's spill and the make-room eviction take a
+     * dominated bank before any LRU choice.  Pure host reads (pulsar_session_bank_tokens / _common_prefix, the
+     * host-carry reads routing already uses on idle banks; no CUDA, no install); all false off the bank pool. */
+    void dominated_slots(bool dominated[PULSAR_SESSION_POOL_CAP]);
     /** Spill one idle bank: install it, snapshot its KV to disk, save its host carry,
      * repoint AWAY (free_physical refuses the cur bank), then cudaFree its physical.
      */
@@ -2213,9 +2210,10 @@ struct server {
      *  fails that request by name.  @return true when one was readmitted (or failed). */
     bool worker_readmit_preempted();
     /** LRU-idle smallest-frontier victim: NOT bank 0 (pinned), NOT in the live decode
-     * set, no active job, not already spilled. -1 if none.
+     * set, no active job, not already spilled. -1 if none.  L323: a slot `dominated`
+     * marks (dominated_slots; NULL = none) goes first.
      */
-    int guard_pick_victim(session_slot **dec, int n);
+    int guard_pick_victim(session_slot **dec, int n, const bool *dominated = nullptr);
     /** Proactive-eviction guard: spill banks to disk until resident KV is back
      * under guard_touched_budget. @param dec the decode set that must be kept
      * resident. @param n its length. */
@@ -3325,10 +3323,13 @@ uint64_t server_ledger_release(uint64_t committed_total, uint64_t slot_cost);
  * tie-broken by smallest committed bytes; slot 0 pinned; protect[i] (may be
  * NULL) marks slots a queued live continuation still needs. Returns a slot
  * index or -1. Pure selection over host fields — never touches the session
- * (defined in generate.cpp; unit-tested in cli_main.cpp). */
+ * (defined in server_sched.cpp; unit-tested in server_tests.cpp).  L323: a slot
+ * `dominated` marks (server::dominated_slots; NULL = none) goes before any LRU
+ * choice. */
 int server_evict_pick_victim(const session_slot *slots, int n_slots,
                                     const bool *protect,
-                                    bool allow_slot0 = false);
+                                    bool allow_slot0 = false,
+                                    const bool *dominated = nullptr);
 void trace_cache_capture(
         trace_cache_diag *d,
         const pulsar_tokens *live,
