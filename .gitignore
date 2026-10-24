@@ -191,6 +191,7 @@ tests/dspark_batch_gate
 /tests/qwen_chat_gate
 /tests/inkling_chat_gate
 /tests/nemotron_chat_gate
+/tests/nemotron_enc_tok_gate
 tests/api-golden/out.txt
 tests/sse-golden/out.txt
 /tests/comp_state_gate

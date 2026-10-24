@@ -1295,6 +1295,19 @@ nemotron-chat-gate: tests/nemotron_chat_gate
 	./tests/nemotron_chat_gate --tok $(NEMOTRON_TOK_DIR) --vectors tests/test-vectors/nemotron_h \
 	    --cases $(QWEN_RENDER_CASES) --calib $(QWEN_CALIB)
 
+# L321: the Nemotron-3.5 encoders' tokenizer (tekken + the U+200C Replace pair) graded against HF tokenizers -- T1-T4 of
+# the chat gate (adversarial, span guard, every scalar value, the calibration corpus); goldens from
+# tests/nemotron_enc/gen_tok_goldens.py.  Model-free; NEMOTRON_ENC_TOK_DIR holds the checkpoint's tokenizer.json +
+# config.json (Embed and Rerank ship the same tokenizer).
+NEMOTRON_ENC_TOK_DIR ?= $(firstword $(wildcard /mnt/models/hub/models--nvidia--Nemotron-3.5-Embed-8B-BF16/snapshots/*))
+tests/nemotron_enc_tok_gate: tests/nemotron_enc_tok_gate.cpp tests/bpe_gate_util.h src/lib/bpe_tokenizer.cpp \
+                             src/lib/pyjson.cpp src/lib/bpe_tokenizer.h src/lib/bpe_unicode_tables.inc src/lib/pyjson.h \
+                             src/lib/sha1.hpp Makefile
+	$(CXX) $(CXXFLAGS) -Isrc -Isrc/lib -o $@ tests/nemotron_enc_tok_gate.cpp src/lib/bpe_tokenizer.cpp src/lib/pyjson.cpp
+.PHONY: nemotron-enc-tok-gate
+nemotron-enc-tok-gate: tests/nemotron_enc_tok_gate
+	./tests/nemotron_enc_tok_gate --tok $(NEMOTRON_ENC_TOK_DIR) --vectors tests/test-vectors/nemotron_enc --calib $(QWEN_CALIB)
+
 # The attention layout table gate (two profiles, one engine) -- HOST ONLY.  The
 # table is a pure function of the artifact's declared metadata, so both profiles'
 # mode rows are checkable with no model and no device.  The arrays in the test are

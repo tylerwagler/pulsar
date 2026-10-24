@@ -21,6 +21,7 @@ namespace {
 struct bpe_tokenizer {
     const bpe_pretok_pattern *pattern = nullptr;
     bool nfc = false;                     ///< runs are NFC-normalised first (HF's NFC normaliser)
+    bool drop_zwnj = false;               ///< a U+200C right after '[' or '<' is dropped first (L321: HF's Replace pair)
     int n_tokens = 0;
     std::vector<std::string> bytes;       ///< id -> decoded bytes
     int byte_id[256];                     ///< raw byte -> its single-byte token
@@ -464,6 +465,15 @@ void encode_run(const bpe_tokenizer *t, const char *text, size_t len, std::vecto
         i += (size_t)k;
     }
     if (t->nfc) nfc(&cps);
+    if (t->drop_zwnj) {
+        /* the Nemotron-3.5 encoders' normaliser: Replace "[\u200c" -> "[" then "<\u200c" -> "<" (HF's non-overlapping
+         * left-to-right scans; neither can make a match for the other), i.e. a U+200C goes when the code point
+         * BEFORE it in the run as written is '[' or '<' */
+        size_t o = 0;
+        for (size_t i = 0; i < cps.size(); i++)
+            if (!(cps[i] == 0x200Cu && i > 0 && (cps[i - 1] == '[' || cps[i - 1] == '<'))) cps[o++] = cps[i];
+        cps.resize(o);
+    }
     std::vector<uint32_t> cl(cps.size());
     for (size_t i = 0; i < cps.size(); i++) cl[i] = cls(cps[i]);
     std::string piece;
@@ -589,16 +599,29 @@ struct hf_pipeline {
     const char *post_processor;
     const char *affix;           ///< model.continuing_subword_prefix and .end_of_word_suffix
     bool ignore_merges;          ///< a piece found whole in the vocab is that token (tokenizers' BPE::ignore_merges)
+    bool drop_zwnj;              ///< the normaliser is the Replace pair dropping U+200C after '[' / '<' (L321)
 };
 const hf_pipeline k_hf_pipelines[] = {
     {"qwen35", R"({"type": "NFC"})", true,
      R"({"type": "ByteLevel", "add_prefix_space": false, "trim_offsets": false, "use_regex": false})",
      R"({"type": "ByteLevel", "add_prefix_space": false, "trim_offsets": false, "use_regex": false})",
-     R"({"type": "ByteLevel", "add_prefix_space": false, "trim_offsets": false, "use_regex": false})", "\"\"", false},
+     R"({"type": "ByteLevel", "add_prefix_space": false, "trim_offsets": false, "use_regex": false})", "\"\"", false,
+     false},
     {"tekken", "null", false,
      R"({"type": "ByteLevel", "add_prefix_space": false, "trim_offsets": true, "use_regex": false})",
      R"({"type": "ByteLevel", "add_prefix_space": true, "trim_offsets": true, "use_regex": true})",
-     R"({"type": "ByteLevel", "add_prefix_space": true, "trim_offsets": false, "use_regex": true})", "null", true},
+     R"({"type": "ByteLevel", "add_prefix_space": true, "trim_offsets": false, "use_regex": true})", "null", true,
+     false},
+    /* L321: the Nemotron-3.5 encoders (Embed / Rerank): tekken with a normaliser that drops a zero-width non-joiner
+     * after '[' or '<' (their chat template writes one into client text so no added token can form there) */
+    {"tekken",
+     "{\"type\": \"Sequence\", \"normalizers\": [{\"type\": \"Replace\", \"pattern\": {\"String\": \"[\xe2\x80\x8c\"}, "
+     "\"content\": \"[\"}, {\"type\": \"Replace\", \"pattern\": {\"String\": \"<\xe2\x80\x8c\"}, \"content\": \"<\"}]}",
+     false,
+     R"({"type": "ByteLevel", "add_prefix_space": false, "trim_offsets": true, "use_regex": false})",
+     R"({"type": "ByteLevel", "add_prefix_space": true, "trim_offsets": true, "use_regex": true})",
+     R"({"type": "ByteLevel", "add_prefix_space": true, "trim_offsets": false, "use_regex": true})", "null", true,
+     true},
 };
 
 }  // namespace
@@ -624,9 +647,13 @@ bpe_tokenizer *bpe_tokenizer_load_hf(const char *tokenizer_json, size_t tokenize
         refuse(err, errlen, "the pre-tokenizer's Split regex is not a registered pattern (bpe_pretok_*)");
         return NULL;
     }
+    /* A pattern may carry more than one row (L321: tekken with and without the encoders' Replace pair): the
+     * file's normaliser picks among them; a pattern none of whose rows spells it is refused below, by section. */
     const hf_pipeline *pl = NULL;
+    std::string norm_got;
+    if (doc.get("normalizer")) pyjson_dump(*doc.get("normalizer"), &norm_got);
     for (const hf_pipeline &x : k_hf_pipelines)
-        if (!strcmp(x.pattern, pattern->name)) pl = &x;
+        if (!strcmp(x.pattern, pattern->name) && (!pl || norm_got == x.normalizer)) pl = &x;
     if (!pl) {
         refuse(err, errlen, "pattern \"%s\" has no HF pipeline row (k_hf_pipelines)", pattern->name);
         return NULL;
@@ -668,6 +695,7 @@ bpe_tokenizer *bpe_tokenizer_load_hf(const char *tokenizer_json, size_t tokenize
     bpe_tokenizer *t = new bpe_tokenizer();
     t->pattern = pattern;
     t->nfc = pl->nfc;
+    t->drop_zwnj = pl->drop_zwnj;
     uint32_t cp_of[256];
     byte_level_map(cp_of);
     std::unordered_map<uint32_t, int> byte_of_cp;
