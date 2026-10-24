@@ -215,6 +215,12 @@ typedef struct {
 } pulsar_session_snapshot;
 
 int pulsar_engine_open(pulsar_engine **out, const pulsar_engine_options *opt);
+/** L321: open n engines in ONE process, sharing its GPU (one instance, one CUDA context): out[i] is opts[i]'s model.
+ *  Every engine of a process is opened in one group -- an open while engines are live is refused -- and a group
+ *  refuses tensor parallelism, inspect-only opens and a device that reads weights through host registration (each
+ *  member's weights are staged into device memory).  Close the members with pulsar_engine_close in any order; the
+ *  GPU state goes with the last.  0, or 1 with every out[i] NULL (said on stderr). */
+int pulsar_engine_open_group(pulsar_engine **out, const pulsar_engine_options *opts, uint32_t n);
 /** Tensor parallelism (slice 4e, L238): is this engine a WORKER rank of a TP
  * group?  A worker drives no sessions of its own -- its driver must call
  * pulsar_tp_worker_run right after open and exit when it returns; every
@@ -301,7 +307,7 @@ bool pulsar_engine_encode_render(pulsar_engine *e, pulsar_encode_role role, cons
                                  pulsar_tokens *out, char *err, size_t errlen);
 /** Encode n rendered inputs: out [n][pulsar_engine_encode_dim] floats.  Each input's result is the same bytes
  *  whatever else rides in the call (the forward is row-independent outside attention, and attention stays inside
- *  its input).  Calls are serialised on the engine.  0, or -1 + `err` (an empty or over-long input, a decoder
+ *  its input).  Calls are serialised across the process's encoders (they share one scratch).  0, or -1 + `err` (an empty or over-long input, a decoder
  *  family, a device failure). */
 int pulsar_engine_encode(pulsar_engine *e, const pulsar_tokens *inputs, uint32_t n, float *out, char *err,
                          size_t errlen);

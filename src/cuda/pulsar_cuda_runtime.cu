@@ -2279,12 +2279,6 @@ static int cuda_model_set_host_map(const void *model_map, uint64_t model_size) {
     }
     g_model_cache_full = 0;
     g_model_mapping_failure_notice_printed = 0;
-    /* The legacy pulsar_gpu_set_model_fd(fd) registers an fd before the map is
-     * known, so an entry can exist keyed by NULL; bind it to this mapping now.
-     * The safetensors lane never needs this -- it passes the map explicitly. */
-    for (int i = 0; i < g_model_fd_count; i++) {
-        if (g_model_fds[i].map == NULL) g_model_fds[i].map = model_map;
-    }
     return 1;
 }
 
@@ -2412,9 +2406,7 @@ int pulsar_gpu_set_model_fd_for_map(int fd, const void *model_map) {
 
 
 
-int pulsar_gpu_set_model_fd(int fd) {
-    return pulsar_gpu_set_model_fd_for_map(fd, g_model_host_base);
-}
+
 
 
 

@@ -1,8 +1,11 @@
-/* encode_server.cpp -- L321: pulsar-server for an ENCODER engine (pulsar.h pulsar_engine_encode*).
+/* encode_server.cpp -- L321: pulsar-server for ENCODER engines (pulsar.h pulsar_engine_encode*).
  *
  * An encoder has no session, no chat and no decode schedule, so it serves its own small surface beside none of the
  * decoder's machinery: one thread per connection, each request rendered, tokenized and encoded in one engine call
- * (the engine serialises calls; a request's inputs ride one call, packed into its forwards).
+ * (the engines serialise their calls; a request's inputs ride one call, packed into its forwards).  One process may
+ * serve several encoders (-m repeated: pulsar_engine_open_group, one GPU): a request goes to the engine of its
+ * endpoint's kind -- an embedder for /v1/embeddings, a reranker for /v1/rerank -- and, when two engines share a
+ * kind, the one its "model" names (with one, "model" is not read).
  *
  *   GET  /health, /healthz, /ping, /v1/models
  *   POST /v1/embeddings   (an embedder; OpenAI's shape)
@@ -40,8 +43,17 @@ struct enc_ctx {
     const char *id;
 };
 
+/** Every engine the process serves, and the connections in flight (shutdown waits for them: the engines close
+ *  after encode_serve returns). */
+struct enc_server {
+    std::vector<enc_ctx> m;
+    pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER;
+    pthread_cond_t idle = PTHREAD_COND_INITIALIZER;
+    int clients = 0;
+};
+
 struct enc_arg {
-    const enc_ctx *c;
+    const enc_server *srv;
     int fd;
 };
 
@@ -258,66 +270,114 @@ void rerank(const enc_ctx *c, int fd, const pyjson_value &o) {
     send_json(fd, &b);
 }
 
-void health(const enc_ctx *c, int fd) {
+const char *kind_name(pulsar_encoder_kind k) { return k == PULSAR_ENCODER_EMBED ? "embed" : "rerank"; }
+const char *kind_path(pulsar_encoder_kind k) { return k == PULSAR_ENCODER_EMBED ? "/v1/embeddings" : "/v1/rerank"; }
+
+void health(const enc_server *srv, int fd) {
     buf b = {0};
-    buf_puts(&b, "{\"status\":\"ok\",\"model\":");
-    json_escape(&b, c->id);
-    buf_printf(&b, ",\"encoder\":\"%s\",\"dim\":%u,\"max_tokens\":%u,\"endpoints\":[\"/health\",\"/v1/models\",\"%s\"]}\n",
-               c->kind == PULSAR_ENCODER_EMBED ? "embed" : "rerank", c->dim, c->cap,
-               c->kind == PULSAR_ENCODER_EMBED ? "/v1/embeddings" : "/v1/rerank");
+    buf_puts(&b, "{\"status\":\"ok\",\"models\":[");
+    for (size_t i = 0; i < srv->m.size(); i++) {
+        const enc_ctx &c = srv->m[i];
+        buf_puts(&b, i ? ",{\"model\":" : "{\"model\":");
+        json_escape(&b, c.id);
+        buf_printf(&b, ",\"encoder\":\"%s\",\"dim\":%u,\"max_tokens\":%u,\"endpoint\":\"%s\"}", kind_name(c.kind), c.dim,
+                   c.cap, kind_path(c.kind));
+    }
+    buf_puts(&b, "]}\n");
     send_json(fd, &b);
 }
 
-void models(const enc_ctx *c, int fd) {
+void models(const enc_server *srv, int fd) {
     buf b = {0};
-    buf_puts(&b, "{\"object\":\"list\",\"data\":[{\"id\":");
-    json_escape(&b, c->id);
-    buf_puts(&b, ",\"object\":\"model\",\"owned_by\":\"pulsar\"}]}\n");
+    buf_puts(&b, "{\"object\":\"list\",\"data\":[");
+    for (size_t i = 0; i < srv->m.size(); i++) {
+        buf_puts(&b, i ? ",{\"id\":" : "{\"id\":");
+        json_escape(&b, srv->m[i].id);
+        buf_puts(&b, ",\"object\":\"model\",\"owned_by\":\"pulsar\"}");
+    }
+    buf_puts(&b, "]}\n");
     send_json(fd, &b);
+}
+
+/* the engine a request for `kind` goes to: the only one of that kind, else the one its "model" names; NULL + `err` */
+const enc_ctx *route(const enc_server *srv, pulsar_encoder_kind kind, const pyjson_value &o, std::string *err) {
+    std::vector<const enc_ctx *> of;
+    for (const enc_ctx &c : srv->m)
+        if (c.kind == kind) of.push_back(&c);
+    if (of.size() == 1) return of[0];
+    const pyjson_value *mv = o.get("model");
+    for (const enc_ctx *c : of)
+        if (mv && mv->kind == pyjson_value::STR && mv->s == c->id) return c;
+    std::string ids;
+    for (const enc_ctx *c : of) ids += std::string(ids.empty() ? "" : ", ") + c->id;
+    *err = "\"model\" must name one of this server's " + std::string(kind_name(kind)) + " models: " + ids;
+    return NULL;
 }
 
 void *client(void *arg) {
     enc_arg *a = (enc_arg *)arg;
-    const enc_ctx *c = a->c;
+    const enc_server *srv = a->srv;
     const int fd = a->fd;
     free(a);
     http_request hr = {};
+    bool has[3] = {};
+    for (const enc_ctx &c : srv->m) has[c.kind] = true;
     if (!read_http_request(fd, &hr)) {
         http_error(fd, 400, "bad HTTP request");
     } else if (!strcmp(hr.method, "GET") && !strcmp(hr.path, "/health")) {
-        health(c, fd);
+        health(srv, fd);
     } else if (!strcmp(hr.method, "GET") && (!strcmp(hr.path, "/healthz") || !strcmp(hr.path, "/ping"))) {
         http_response(fd, 200, "text/plain", "ok\n");
     } else if (!strcmp(hr.method, "GET") && !strcmp(hr.path, "/v1/models")) {
-        models(c, fd);
+        models(srv, fd);
     } else if (!strcmp(hr.method, "POST") &&
-               (c->kind == PULSAR_ENCODER_EMBED ? !strcmp(hr.path, "/v1/embeddings")
-                                                : !strcmp(hr.path, "/v1/rerank") || !strcmp(hr.path, "/rerank"))) {
+               ((has[PULSAR_ENCODER_EMBED] && !strcmp(hr.path, "/v1/embeddings")) ||
+                (has[PULSAR_ENCODER_RERANK] && (!strcmp(hr.path, "/v1/rerank") || !strcmp(hr.path, "/rerank"))))) {
+        const pulsar_encoder_kind kind = !strcmp(hr.path, "/v1/embeddings") ? PULSAR_ENCODER_EMBED : PULSAR_ENCODER_RERANK;
         pyjson_value o;
         char err[256];
+        std::string why;
+        const enc_ctx *c = NULL;
         if (!pyjson_parse(hr.body ? hr.body : "", hr.body_len, &o, err, sizeof err) || o.kind != pyjson_value::OBJ) {
             http_error(fd, 400, "the body is not a JSON object");
+        } else if (!(c = route(srv, kind, o, &why))) {
+            http_error(fd, 400, why.c_str());
         } else {
             const double t0 = server_now_sec();
-            if (c->kind == PULSAR_ENCODER_EMBED) embeddings(c, fd, o);
+            if (kind == PULSAR_ENCODER_EMBED) embeddings(c, fd, o);
             else rerank(c, fd, o);
-            server_log(PULSAR_LOG_DEFAULT, "pulsar-server: %s %.0f ms", hr.path, (server_now_sec() - t0) * 1e3);
+            server_log(PULSAR_LOG_DEFAULT, "pulsar-server: %s %s %.0f ms", hr.path, c->id, (server_now_sec() - t0) * 1e3);
         }
     } else {
-        http_error(fd, 404, c->kind == PULSAR_ENCODER_EMBED
-                                ? "an embedder serves POST /v1/embeddings, GET /v1/models and /health"
-                                : "a reranker serves POST /v1/rerank, GET /v1/models and /health");
+        std::string eps;
+        if (has[PULSAR_ENCODER_EMBED]) eps += "POST /v1/embeddings, ";
+        if (has[PULSAR_ENCODER_RERANK]) eps += "POST /v1/rerank, ";
+        http_error(fd, 404, ("this server serves " + eps + "GET /v1/models and /health").c_str());
     }
     http_request_free(&hr);
     close(fd);
+    enc_server *ms = const_cast<enc_server *>(srv);
+    pthread_mutex_lock(&ms->mu);
+    if (--ms->clients == 0) pthread_cond_broadcast(&ms->idle);
+    pthread_mutex_unlock(&ms->mu);
     return NULL;
 }
 
 }  // namespace
 
-int encode_serve(pulsar_engine *e, const server_config *cfg) {
-    enc_ctx c = {e, pulsar_engine_encoder(e), pulsar_engine_encode_dim(e), pulsar_engine_encode_max_tokens(e),
-                 pulsar_engine_served_model_id(e)};
+int encode_serve(pulsar_engine *const *engines, int n, const server_config *cfg) {
+    enc_server srv;
+    for (int i = 0; i < n; i++) {
+        pulsar_engine *e = engines[i];
+        srv.m.push_back({e, pulsar_engine_encoder(e), pulsar_engine_encode_dim(e), pulsar_engine_encode_max_tokens(e),
+                         pulsar_engine_served_model_id(e)});
+        for (int j = 0; j < i; j++)
+            if (!strcmp(srv.m[j].id, srv.m[i].id)) {
+                server_log(PULSAR_LOG_DEFAULT, "pulsar-server: two models serve as %s (-m %s and -m %s): a request "
+                           "could not name one -- refusing", srv.m[i].id, cfg->models[j], cfg->models[i]);
+                return 1;
+            }
+    }
     const int lfd = listen_on(cfg->host, cfg->port);
     if (lfd < 0) {
         server_log(PULSAR_LOG_DEFAULT, "pulsar-server: failed to listen on %s:%d: %s", cfg->host, cfg->port,
@@ -325,10 +385,11 @@ int encode_serve(pulsar_engine *e, const server_config *cfg) {
         return 1;
     }
     g_listen_fd = lfd;
-    server_log(PULSAR_LOG_DEFAULT, "pulsar-server: %s (%s, %u floats an input, inputs up to %u tokens) listening on "
-               "http://%s:%d (pulsar %s)", c.id, c.kind == PULSAR_ENCODER_EMBED ? "embedder: POST /v1/embeddings"
-                                                                               : "reranker: POST /v1/rerank",
-               c.dim, c.cap, cfg->host, cfg->port, PULSAR_VERSION_STR);
+    for (const enc_ctx &c : srv.m)
+        server_log(PULSAR_LOG_DEFAULT, "pulsar-server: %s: %s, POST %s (%u floats an input, inputs up to %u tokens)", c.id,
+                   c.kind == PULSAR_ENCODER_EMBED ? "embedder" : "reranker", kind_path(c.kind), c.dim, c.cap);
+    server_log(PULSAR_LOG_DEFAULT, "pulsar-server: listening on http://%s:%d (pulsar %s)", cfg->host, cfg->port,
+               PULSAR_VERSION_STR);
     while (!g_stop_requested) {
         const int fd = accept(lfd, NULL, NULL);
         if (fd < 0) {
@@ -339,10 +400,16 @@ int encode_serve(pulsar_engine *e, const server_config *cfg) {
         }
         configure_client_socket(fd);
         enc_arg *a = (enc_arg *)server_xmalloc(sizeof(*a));
-        a->c = &c;
+        a->srv = &srv;
         a->fd = fd;
+        pthread_mutex_lock(&srv.mu);
+        srv.clients++;
+        pthread_mutex_unlock(&srv.mu);
         pthread_t th;
         if (pthread_create(&th, NULL, client, a) != 0) {
+            pthread_mutex_lock(&srv.mu);
+            srv.clients--;
+            pthread_mutex_unlock(&srv.mu);
             free(a);
             http_error_retry(fd, 503, "too many connections", HTTP_RETRY_BUSY_S);
             close(fd);
@@ -354,6 +421,9 @@ int encode_serve(pulsar_engine *e, const server_config *cfg) {
         close(lfd);
         g_listen_fd = -1;
     }
-    server_log(PULSAR_LOG_DEFAULT, "pulsar-server: shutdown requested");
+    server_log(PULSAR_LOG_DEFAULT, "pulsar-server: shutdown requested, draining requests");
+    pthread_mutex_lock(&srv.mu);
+    while (srv.clients > 0) pthread_cond_wait(&srv.idle, &srv.mu);
+    pthread_mutex_unlock(&srv.mu);
     return 0;
 }

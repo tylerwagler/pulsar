@@ -2757,6 +2757,9 @@ typedef struct {
     int fd;       ///< the accepted socket this thread owns
 } client_arg;
 
+/** L321: the most models one server process opens (-m given that many times). */
+#define SERVER_MODELS_MAX 8
+
 /** Startup configuration, resolved once from CLI flags and immutable
  * afterwards -- the worker reads it without locking on that basis. */
 typedef struct {
@@ -2771,6 +2774,10 @@ typedef struct {
     bool kv_disk_disable;          ///< turn the disk cache off entirely
     uint64_t kv_disk_space_mb;     ///< disk-cache budget in MiB
     kv_cache_options kv_cache;     ///< checkpoint placement policy
+    /** L321: every -m in order (engine.model_path is the first); more than one opens them as one engine group in
+     *  this process, which serves encoders only (encode_server.cpp) */
+    const char *models[SERVER_MODELS_MAX];
+    int n_models;
 } server_config;
 
 /* ---- shared globals ---- */
@@ -3407,9 +3414,9 @@ void *client_main(void *arg);
 /** Read one request (headers + body, bounded in size and time) from `fd`; false on a malformed or late one. */
 bool read_http_request(int fd, http_request *r);
 void http_request_free(http_request *r);
-/** L321: serve an ENCODER engine (pulsar_engine_encoder != NONE) on cfg's host and port until a stop signal:
- *  /v1/embeddings or /v1/rerank, /v1/models, /health (encode_server.cpp).  The process's exit code. */
-int encode_serve(pulsar_engine *e, const server_config *cfg);
+/** L321: serve ENCODER engines (pulsar_engine_encoder != NONE; one group, several models) on cfg's host and port until
+ *  a stop signal: /v1/embeddings and / or /v1/rerank, /v1/models, /health (encode_server.cpp).  The exit code. */
+int encode_serve(pulsar_engine *const *engines, int n, const server_config *cfg);
 int listen_on(const char *host, int port);
 void configure_client_socket(int fd);
 void set_client_socket_nonblocking(int fd);

@@ -51,25 +51,31 @@ constexpr uint32_t NE_SEQS_MAX = 256;
 /** The U+200C the template writes after '[' and '<' in client text. */
 const char ZWNJ[] = "\xe2\x80\x8c";
 
+/* The forward's scratch, the PROCESS's (L321): every encoder engine of a process (pulsar_engine_open_group) runs on
+ * one GPU, one call at a time, so they share one set of buffers -- each sized to the largest member's need -- and the
+ * lock that serialises their calls. */
+enum ne_buf { B_IDS, B_H, B_XN, B_Q, B_K, B_V, B_A, B_G, B_U, B_S, B_DELTA, B_STAGE, B_LWS, B_AWS, B_POOLED, B_COUNT };
+
+struct ne_scratch {
+    uint32_t refs;                       ///< the engines sharing it
+    pulsar_gpu_tensor *t[B_COUNT];       ///< ids i32 [rows]; h, xn bf16 [rows][n_embd]; q, k, v, a bf16 [rows][heads *
+                                         ///< head_dim]; g, u, s bf16 [NE_CHUNK][n_ff]; delta bf16 [NE_CHUNK][n_embd];
+                                         ///< stage f32 [NE_CHUNK][2 n_ff] (a multi launch's staging, the widest: gate
+                                         ///< | up); the linears' workspace at NE_CHUNK rows; the attention's at `rows`;
+                                         ///< pooled f32 [NE_SEQS_MAX][n_embd]
+    uint64_t bytes[B_COUNT];
+    pthread_mutex_t mu;                  ///< one encode at a time, across the engines
+};
+
+ne_scratch *g_scratch;
+
 }  // namespace
 
 struct pulsar_nemotron_enc_run {
     pulsar_gqa_layer attn;
     uint32_t rows;                 ///< rows one forward carries: the shape's input cap
     pulsar_gpu_tensor *rope;       ///< f32 [head_dim / 2]: the YaRN inverse frequencies
-    pulsar_gpu_tensor *ids;        ///< i32 [rows]
-    pulsar_gpu_tensor *h, *xn;     ///< bf16 [rows][n_embd]: the residual, its normed rows
-    pulsar_gpu_tensor *q, *k, *v;  ///< bf16 [rows][heads * head_dim]
-    pulsar_gpu_tensor *a;          ///< bf16 [rows][n_head * head_dim]: the attention's output
-    pulsar_gpu_tensor *g, *u, *s;  ///< bf16 [NE_CHUNK][n_ff]
-    pulsar_gpu_tensor *delta;      ///< bf16 [NE_CHUNK][n_embd]
-    pulsar_gpu_tensor *stage;      ///< f32 [NE_CHUNK][2 n_ff]: a multi launch's staging (the widest: gate | up)
-    pulsar_gpu_tensor *lws;        ///< the linears' workspace at NE_CHUNK rows
-    uint64_t lws_bytes;
-    pulsar_gpu_tensor *aws;        ///< the attention's workspace at `rows` rows
-    uint64_t aws_bytes;
-    pulsar_gpu_tensor *pooled;     ///< f32 [NE_SEQS_MAX][n_embd]
-    pthread_mutex_t mu;            ///< one encode at a time (the scratch is the engine's)
+    ne_scratch *sc;                ///< the process's scratch (g_scratch)
 };
 
 namespace {
@@ -106,17 +112,18 @@ bool linears(const pulsar_engine *e, const pulsar_nemotron_enc_run *r, int n, co
     pulsar_rows_linear l[3];
     const pulsar_rows_linear *lp[3];
     float *st[3];
-    float *stage = dp<float>(r->stage);
+    float *stage = dp<float>(r->sc->t[B_STAGE]);
     for (int j = 0; j < n; j++) {
         if (!pulsar_linear_rows_ref(&e->model, t[j], in, out[j], true, what[j], &l[j])) return false;
         lp[j] = &l[j];
         st[j] = stage;
         stage += (size_t)rows * (size_t)out[j];
     }
-    return pulsar_rows_linear_multi_bf16_launch(lp, n, x, (int)rows, st, yb, dp(r->lws), r->lws_bytes, 0) == 0;
+    return pulsar_rows_linear_multi_bf16_launch(lp, n, x, (int)rows, st, yb, dp(r->sc->t[B_LWS]), r->sc->bytes[B_LWS],
+                                                0) == 0;
 }
 
-/* One forward over inputs [0, n): their pooled rows into r->pooled.  `rows` = the inputs' total length. */
+/* One forward over inputs [0, n): their pooled rows into the scratch's B_POOLED.  `rows` = the inputs' total length. */
 bool forward(pulsar_engine *e, const pulsar_tokens *in, uint32_t n, uint32_t rows, char *err, size_t errlen) {
     pulsar_nemotron_enc_model *w = W(e);
     pulsar_nemotron_enc_run *r = w->run;
@@ -136,17 +143,19 @@ bool forward(pulsar_engine *e, const pulsar_tokens *in, uint32_t n, uint32_t row
             row_seq[o] = i;
             row_pos[o] = (uint32_t)t;
         }
-    if (!pulsar_gpu_tensor_write(r->ids, 0, ids.data(), (uint64_t)rows * 4u)) return fail(err, errlen, "the ids upload failed");
+    if (!pulsar_gpu_tensor_write(r->sc->t[B_IDS], 0, ids.data(), (uint64_t)rows * 4u))
+        return fail(err, errlen, "the ids upload failed");
     pulsar_head_decl hd = {};
     hd.n_embd = E;
     hd.n_logits = s.n_vocab;
     hd.n_real = s.n_vocab;
     hd.logit_scale = 1.0f;
-    uint16_t *h = dp<uint16_t>(r->h), *xn = dp<uint16_t>(r->xn), *q = dp<uint16_t>(r->q), *k = dp<uint16_t>(r->k),
-             *v = dp<uint16_t>(r->v), *a = dp<uint16_t>(r->a), *g = dp<uint16_t>(r->g), *u = dp<uint16_t>(r->u),
-             *sw = dp<uint16_t>(r->s), *dl = dp<uint16_t>(r->delta);
+    pulsar_gpu_tensor *const *T = r->sc->t;
+    uint16_t *h = dp<uint16_t>(T[B_H]), *xn = dp<uint16_t>(T[B_XN]), *q = dp<uint16_t>(T[B_Q]), *k = dp<uint16_t>(T[B_K]),
+             *v = dp<uint16_t>(T[B_V]), *a = dp<uint16_t>(T[B_A]), *g = dp<uint16_t>(T[B_G]), *u = dp<uint16_t>(T[B_U]),
+             *sw = dp<uint16_t>(T[B_S]), *dl = dp<uint16_t>(T[B_DELTA]);
     const uint16_t *table = wp(w->embed, "nemotron_enc embed");
-    if (!table || pulsar_head_embed_launch(&hd, table, s.n_vocab, dp<int32_t>(r->ids), rows, h, E, 0) != 0)
+    if (!table || pulsar_head_embed_launch(&hd, table, s.n_vocab, dp<int32_t>(r->sc->t[B_IDS]), rows, h, E, 0) != 0)
         return fail(err, errlen, "the embedding refused");
     if (pulsar_rows_rmsnorm_launch(h, E, rows, E, wp(w->layer[0].attn_norm, "nemotron_enc attn_norm"), s.rms_eps, xn,
                                    E, 0) != 0)
@@ -157,8 +166,8 @@ bool forward(pulsar_engine *e, const pulsar_tokens *in, uint32_t n, uint32_t row
     io.v = {v, KV, s.head_dim};
     io.out_bf16 = a;
     io.ld_out = Q;
-    io.workspace = dp(r->aws);
-    io.workspace_bytes = r->aws_bytes;
+    io.workspace = dp(r->sc->t[B_AWS]);
+    io.workspace_bytes = r->sc->bytes[B_AWS];
     for (uint32_t il = 0; il < s.n_layer; il++) {
         const pulsar_nemotron_enc_layer &L = w->layer[il];
         const uint16_t *next = il + 1 < s.n_layer ? wp(w->layer[il + 1].attn_norm, "nemotron_enc attn_norm")
@@ -200,8 +209,8 @@ bool forward(pulsar_engine *e, const pulsar_tokens *in, uint32_t n, uint32_t row
         }
     }
     for (uint32_t i = 0, o = 0; i < n; o += (uint32_t)in[i].len, i++)
-        if (pulsar_rows_mean_f32_launch(xn + (size_t)o * E, E, (uint32_t)in[i].len, E, dp<float>(r->pooled) + (size_t)i * E,
-                                        0) != 0)
+        if (pulsar_rows_mean_f32_launch(xn + (size_t)o * E, E, (uint32_t)in[i].len, E,
+                                        dp<float>(T[B_POOLED]) + (size_t)i * E, 0) != 0)
             return fail(err, errlen, "the pool refused");
     return true;
 }
@@ -261,7 +270,7 @@ int encode(pulsar_engine *e, const pulsar_tokens *in, uint32_t n, float *out, ch
             if (err) snprintf(err, errlen, "%s: input %u has %d tokens (1 .. %u)", ARCH, i, in[i].len, r->rows);
             return -1;
         }
-    pthread_mutex_lock(&r->mu);
+    pthread_mutex_lock(&r->sc->mu);
     std::vector<float> pooled((size_t)NE_SEQS_MAX * E);
     bool ok = true;
     /* inputs in order, greedily packed into forwards of at most r->rows rows and NE_SEQS_MAX inputs */
@@ -269,7 +278,7 @@ int encode(pulsar_engine *e, const pulsar_tokens *in, uint32_t n, float *out, ch
         uint32_t i1 = i0, rows = 0;
         while (i1 < n && i1 - i0 < NE_SEQS_MAX && rows + (uint32_t)in[i1].len <= r->rows) rows += (uint32_t)in[i1++].len;
         ok = forward(e, in + i0, i1 - i0, rows, err, errlen) &&
-             (pulsar_gpu_tensor_read(r->pooled, 0, pooled.data(), (uint64_t)(i1 - i0) * E * 4u) ||
+             (pulsar_gpu_tensor_read(r->sc->t[B_POOLED], 0, pooled.data(), (uint64_t)(i1 - i0) * E * 4u) ||
               fail(err, errlen, "the pooled rows' read failed"));
         for (uint32_t i = i0; ok && i < i1; i++) {
             const float *p = &pooled[(size_t)(i - i0) * E];
@@ -287,7 +296,7 @@ int encode(pulsar_engine *e, const pulsar_tokens *in, uint32_t n, float *out, ch
         }
         i0 = i1;
     }
-    pthread_mutex_unlock(&r->mu);
+    pthread_mutex_unlock(&r->sc->mu);
     return ok ? 0 : -1;
 }
 
@@ -304,10 +313,13 @@ const pulsar_family_encoder PULSAR_NEMOTRON_ENC_ENCODER = {
 void pulsar_nemotron_enc_run_free(pulsar_nemotron_enc_model *w) {
     pulsar_nemotron_enc_run *r = w ? w->run : NULL;
     if (!r) return;
-    for (pulsar_gpu_tensor *t : {r->rope, r->ids, r->h, r->xn, r->q, r->k, r->v, r->a, r->g, r->u, r->s, r->delta,
-                                 r->stage, r->lws, r->aws, r->pooled})
-        pulsar_gpu_tensor_free(t);
-    pthread_mutex_destroy(&r->mu);
+    pulsar_gpu_tensor_free(r->rope);
+    if (r->sc && --r->sc->refs == 0) {   /* the last encoder of the process: its scratch goes */
+        for (pulsar_gpu_tensor *t : r->sc->t) pulsar_gpu_tensor_free(t);
+        pthread_mutex_destroy(&r->sc->mu);
+        delete r->sc;
+        g_scratch = NULL;
+    }
     delete r;
     w->run = NULL;
 }
@@ -319,7 +331,6 @@ bool pulsar_nemotron_enc_run_create(pulsar_engine *e) {
                    F = s.n_ff, R = s.rope_orig_ctx, C = NE_CHUNK;
     pulsar_nemotron_enc_run *r = new pulsar_nemotron_enc_run();
     w->run = r;   /* unload frees it, whatever this verdict */
-    pthread_mutex_init(&r->mu, NULL);
     r->rows = s.rope_orig_ctx;
     pulsar_gqa_layer &A = r->attn;
     A.n_q = s.n_head;
@@ -359,35 +370,43 @@ bool pulsar_nemotron_enc_run_create(pulsar_engine *e) {
             if (b > lws) lws = b;
         }
     }
-    r->lws_bytes = lws;
-    r->aws_bytes = pulsar_gqa_workspace_bytes(&A, (uint32_t)R, (uint32_t)R);
-    r->ids = pulsar_gpu_tensor_alloc(R * 4u);
-    r->h = pulsar_gpu_tensor_alloc(R * E * 2u);
-    r->xn = pulsar_gpu_tensor_alloc(R * E * 2u);
-    r->q = pulsar_gpu_tensor_alloc(R * Q * 2u);
-    r->k = pulsar_gpu_tensor_alloc(R * KV * 2u);
-    r->v = pulsar_gpu_tensor_alloc(R * KV * 2u);
-    r->a = pulsar_gpu_tensor_alloc(R * Q * 2u);
-    r->g = pulsar_gpu_tensor_alloc(C * F * 2u);
-    r->u = pulsar_gpu_tensor_alloc(C * F * 2u);
-    r->s = pulsar_gpu_tensor_alloc(C * F * 2u);
-    r->delta = pulsar_gpu_tensor_alloc(C * E * 2u);
-    r->stage = pulsar_gpu_tensor_alloc(C * 2u * F * 4u);
-    r->lws = pulsar_gpu_tensor_alloc(lws ? lws : 256u);
-    r->aws = pulsar_gpu_tensor_alloc(r->aws_bytes);
-    r->pooled = pulsar_gpu_tensor_alloc((uint64_t)NE_SEQS_MAX * E * 4u);
-    for (pulsar_gpu_tensor *t : {r->ids, r->h, r->xn, r->q, r->k, r->v, r->a, r->g, r->u, r->s, r->delta, r->stage,
-                                 r->lws, r->aws, r->pooled})
-        if (!t) {
-            fprintf(stderr, "pulsar: %s: the forward's scratch did not fit the device -- refusing\n", ARCH);
-            return false;
+    /* this engine's need of every buffer; the process's scratch grows to it (the engines open as one group, before
+     * any of them encodes, so nothing reads a buffer while it is replaced) */
+    uint64_t need[B_COUNT] = {};
+    need[B_IDS] = R * 4u;
+    need[B_H] = need[B_XN] = R * E * 2u;
+    need[B_Q] = need[B_A] = R * Q * 2u;
+    need[B_K] = need[B_V] = R * KV * 2u;
+    need[B_G] = need[B_U] = need[B_S] = C * F * 2u;
+    need[B_DELTA] = C * E * 2u;
+    need[B_STAGE] = C * 2u * F * 4u;
+    need[B_LWS] = lws ? lws : 256u;
+    need[B_AWS] = pulsar_gqa_workspace_bytes(&A, (uint32_t)R, (uint32_t)R);
+    need[B_POOLED] = (uint64_t)NE_SEQS_MAX * E * 4u;
+    if (!g_scratch) {
+        g_scratch = new ne_scratch();
+        pthread_mutex_init(&g_scratch->mu, NULL);
+    }
+    r->sc = g_scratch;
+    r->sc->refs++;
+    uint64_t grown = 0, total = 0;
+    for (int b = 0; b < B_COUNT; b++) {
+        if (need[b] > r->sc->bytes[b]) {
+            pulsar_gpu_tensor_free(r->sc->t[b]);
+            r->sc->t[b] = pulsar_gpu_tensor_alloc(need[b]);
+            r->sc->bytes[b] = r->sc->t[b] ? need[b] : 0;
+            if (!r->sc->t[b]) {
+                fprintf(stderr, "pulsar: %s: the forward's scratch did not fit the device -- refusing\n", ARCH);
+                return false;
+            }
+            grown += need[b];
         }
+        total += r->sc->bytes[b];
+    }
     const double mib = 1.0 / 1048576.0;
-    fprintf(stderr, "pulsar: %s: forward scratch %.0f MiB (rows %llu: %.0f MiB; linears at %llu rows: %.0f MiB; "
-                    "attention workspace %.0f MiB)\n", ARCH,
-            (double)(R * (4u + 2u * (2u * E + 2u * Q + 2u * KV)) + C * (6u * F + 2u * E + 8u * F) + lws +
-                     r->aws_bytes + NE_SEQS_MAX * E * 4u) * mib,
-            (unsigned long long)R, (double)(R * (4u + 2u * (2u * E + 2u * Q + 2u * KV))) * mib, (unsigned long long)C,
-            (double)(C * (6u * F + 2u * E + 8u * F) + lws) * mib, (double)r->aws_bytes * mib);
+    fprintf(stderr, "pulsar: %s: forward scratch %.0f MiB, shared by the process's %u encoder(s) (%.0f MiB allocated "
+                    "for this one; rows %llu, linears at %llu rows, attention workspace %.0f MiB)\n", ARCH,
+            (double)total * mib, r->sc->refs, (double)grown * mib, (unsigned long long)R, (unsigned long long)C,
+            (double)r->sc->bytes[B_AWS] * mib);
     return true;
 }
