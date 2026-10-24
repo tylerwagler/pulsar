@@ -1300,7 +1300,7 @@ void pulsar_tokens_prefix_match(pulsar_engine *e,
     int i = 0, j = 0;          /* token cursors */
     size_t oa = 0, ob = 0;     /* byte offsets inside the current tokens */
     int best_i = 0, best_j = 0;
-    const char *ta = NULL, *tb = NULL;
+    char *ta = NULL, *tb = NULL;   /* pulsar_token_text's copies (malloc'd), each freed as its cursor leaves the token */
     size_t la = 0, lb = 0;
     while (i < a_len && j < b_len) {
         if (oa == 0 && ob == 0) {
@@ -1310,10 +1310,12 @@ void pulsar_tokens_prefix_match(pulsar_engine *e,
             seamed = true;   /* same bytes ahead, different boundaries */
         }
         if (oa == 0) {
+            free(ta);
             ta = pulsar_token_text(e, a[i], &la);
             if (!ta || la == 0) break;   /* control/special: id-only match */
         }
         if (ob == 0) {
+            free(tb);
             tb = pulsar_token_text(e, b[j], &lb);
             if (!tb || lb == 0) break;
         }
@@ -1326,6 +1328,8 @@ void pulsar_tokens_prefix_match(pulsar_engine *e,
     }
     if (oa == 0 && ob == 0) { best_i = i; best_j = j; }
 done:
+    free(ta);
+    free(tb);
     out->live_cut = best_i;
     out->prompt_cut = best_j;
     out->seamed = seamed;

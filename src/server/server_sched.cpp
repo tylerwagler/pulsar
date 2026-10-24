@@ -477,6 +477,21 @@ int server_route_header_anchor(const pulsar_tokens *bank, int prefilled, const p
     return -1;
 }
 
+/* L322: the bank's route anchor -- the shallower of its last-turn anchor and its generation-header anchor that exists.
+ * Each alone is the evidence server_route_in_place reads (a request matching past it is this conversation's: its next
+ * turn, its side request, an edit of its last turn), so the anchor is the first one the match may pass.  L311 combined
+ * them by the DEEPER one, so a bank that also held a header past its last user marker -- always, once a side request
+ * had run on it -- lost the last-turn rule: Claude Code's SUGGESTION MODE call (the conversation + ~340 tokens, after
+ * every finished turn) ran in place and left its header at the bank's end, the next real turn diverged five tokens
+ * past the real turn's end, inside that call's user turn, and took a fresh bank, which reloaded the whole chain from
+ * disk (2026-10-24, Qwen at 178-193k: 32-34 GB, 22-25 s a turn).  -1 when neither exists. */
+int server_route_anchor(const pulsar_tokens *bank, int prefilled, const pulsar_turn_markers *m) {
+    const int turn = server_route_turn_anchor(bank, prefilled, m);
+    const int header = server_route_header_anchor(bank, prefilled, m);
+    if (turn < 0) return header;
+    return header < 0 || turn < header ? turn : header;
+}
+
 /* L264: does the job continue on its best bank?  Yes when it carries everything
  * that bank PREFILLED (common >= prefilled: it IS that conversation's next turn,
  * whatever it did to the bank's generated tail -- an agent client drops the
@@ -624,14 +639,11 @@ session_slot *server::choose_slot_for_job(job *j, int *reject_ctx,
     }
     const int frontier = best ? s->slot_frontier_pos(best) : 0;
     const int prefilled = best && s->sess ? pulsar_session_bank_prefill_frontier(s->sess, best->bank) : 0;
-    /* L275: the bank's last-turn anchor, from the history it prefilled; L311: or its generation header's */
-    int anchor = -1;
-    if (best && s->sess) {
-        const pulsar_tokens *bt = pulsar_session_bank_tokens(s->sess, best->bank);
-        anchor = server_route_turn_anchor(bt, prefilled, &s->turn_markers);
-        const int header = server_route_header_anchor(bt, prefilled, &s->turn_markers);
-        if (header > anchor) anchor = header;
-    }
+    /* L275: the bank's last-turn anchor, from the history it prefilled; L311: or its generation header's; L322: the
+     * shallower of the two */
+    const int anchor = best && s->sess
+        ? server_route_anchor(pulsar_session_bank_tokens(s->sess, best->bank), prefilled, &s->turn_markers)
+        : -1;
     const bool in_place = best && server_route_in_place(best_common, best_score, frontier, prefilled,
                                                         s->slot_trivial_common_tokens, anchor);
     /* One line per bind decision: which bank, how deep the match, where it resumes, what it costs the bank, and

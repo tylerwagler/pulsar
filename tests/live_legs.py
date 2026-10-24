@@ -53,6 +53,8 @@ LEGS = [
     ("preempt-exact", "preempt_live", "PreemptLeg", {"margin": 1.25}, ("qwen",)),
     # L318 (make resume-deepest-live runs it alone)
     ("resume-deepest", "resume_deepest_live", "ResumeDeepestLeg", {}, ("qwen",)),
+    # L322 (make sidecall-turns-live runs it alone)
+    ("sidecall-turns", "sidecall_turns_live", "SidecallLeg", {}, ("qwen",)),
     ("opencode-turns", "opencode_turns_live", "OpencodeLeg", {}, ("nemotron",)),
 ]
 

@@ -3269,8 +3269,11 @@ int server_route_turn_anchor(const pulsar_tokens *bank, int prefilled, const pul
 /** L311: the last token of the last assistant marker (the generation header) among the bank's prefilled tokens,
  *  first turn included; a request that matches past it is the conversation's next turn.  -1 when none / unknown. */
 int server_route_header_anchor(const pulsar_tokens *bank, int prefilled, const pulsar_turn_markers *m);
+/** L322: the bank's route anchor -- the SHALLOWER of the two above that exists (each alone says a request matching
+ *  past it is this conversation's), -1 when neither does. */
+int server_route_anchor(const pulsar_tokens *bank, int prefilled, const pulsar_turn_markers *m);
 /* L264 S3 + L275: does the best-scoring free bank take the request in place, or
- * is a fresh bank preferred.  `anchor` is server_route_turn_anchor's answer for
+ * is a fresh bank preferred.  `anchor` is server_route_anchor's answer for
  * that bank (defined in server_sched.cpp; unit-tested in server_tests.cpp). */
 bool server_route_in_place(int common, int score, int frontier, int prefilled, int protect_floor,
                            int anchor);

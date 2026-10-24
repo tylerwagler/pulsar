@@ -2047,8 +2047,8 @@ prefix-turns-live-gate: pulsar-server
 	python3 tests/prefix_turns_live.py $(PREFIX_TURNS_LIVE_MODEL) --binary ./pulsar-server \
 	  --work $(PREFIX_TURNS_LIVE_WORK) --tag gate --reply 600
 # L317: the battery's live legs on ONE server per model (tests/live_legs.py): constrained-live, server-live and the
-# abandon leg on DeepSeek and Qwen, the L312 stall check, prefix-turns (L316's gate and the side shape), preempt-exact and
-# (L318) resume-deepest on Qwen,
+# abandon leg on DeepSeek and Qwen, the L312 stall check, prefix-turns (L316's gate and the side shape), preempt-exact,
+# (L318) resume-deepest and (L322) sidecall-turns on Qwen,
 # opencode-turns on Nemotron's LiLiCorr pack.  Per model: the shared server, then -- only if a leg needs it -- one
 # instance with the test hooks (the injected grammar failure, the KV-budget override), then one fresh instance for
 # every leg's reuse == cold reference.  Each leg keeps its own checks and PASS/FAIL; the targets above still run a
@@ -2090,6 +2090,16 @@ RESUME_LIVE_WORK ?= $(or $(TMPDIR),/var/tmp)/pulsar-l318-$(USER)
 .PHONY: resume-deepest-live
 resume-deepest-live: pulsar-server
 	python3 tests/resume_deepest_live.py $(RESUME_LIVE_MODEL) --binary ./pulsar-server --work $(RESUME_LIVE_WORK)
+
+# L322: Claude Code's SUGGESTION MODE side call extends a conversation's bank; the next real turn routes in place on
+# that bank, rewinds to its own checkpoint below the divergence and prefills the delta (not a fresh bank + a disk
+# chain), and stays reuse == cold against a fresh server.  The Qwen pack, 4 banks, 64k; two loads, ~3 min.  The battery
+# runs it as a leg of live-legs; gates-dev runs it on a routing / kv path.
+SIDECALL_LIVE_WORK ?= $(CURDIR)/.build/sidecall-turns-live
+.PHONY: sidecall-turns-live
+sidecall-turns-live: pulsar-server
+	sync; sudo -n sh -c "echo 3 > /proc/sys/vm/drop_caches" 2>/dev/null; \
+	python3 tests/sidecall_turns_live.py $(RESUME_LIVE_MODEL) --binary ./pulsar-server --work $(SIDECALL_LIVE_WORK)
 
 cuda-spec-width-gate: pulsar
 	python3 tests/spec_verify_width_gate.py $(FRONTIER_MODEL) --binary ./pulsar
@@ -2702,7 +2712,7 @@ gates-dev:
 	if [ $$poison -eq 1 ]; then printf '  scratch-poison-gate: selected (L307: the graphed lanes and their scratch, poisoned == unpoisoned on DeepSeek, DFlash2, LiLiCorr)\n'; fi; \
 	if [ $$server -eq 1 ]; then printf '  server: chat smoke + the --server/--api unit switches\n'; fi; \
 	if [ $$kvmem -eq 1 ]; then printf '  server-kv-headroom-live: selected (L319: the touched-KV ceiling is the measured headroom; admission / guard / bank paths)\n'; fi; \
-	if [ $$resume -eq 1 ]; then printf '  resume-deepest-live: selected (L318: routing / resume / disk-chain paths, Open WebUI shape on the Qwen pack)\n'; fi; \
+	if [ $$resume -eq 1 ]; then printf '  resume-deepest-live + sidecall-turns-live: selected (L318 / L322: routing / resume / disk-chain paths, the Open WebUI and the Claude Code side-call shapes on the Qwen pack)\n'; fi; \
 	$(MAKE) --no-print-directory seam-check CUDA_ARCH=sm_120f || rc=1; \
 	$(MAKE) --no-print-directory cuda-reap-router-audit CUDA_ARCH=sm_120f \
 	      FRONTIER_MODEL="$(FRONTIER_MODEL)" || rc=1; \
@@ -2747,6 +2757,7 @@ gates-dev:
 	fi; \
 	if [ $$resume -eq 1 ]; then \
 	  $(MAKE) --no-print-directory resume-deepest-live CUDA_ARCH=sm_120f || rc=1; \
+	  $(MAKE) --no-print-directory sidecall-turns-live CUDA_ARCH=sm_120f || rc=1; \
 	fi; \
 	if [ $$kvmem -eq 1 ]; then \
 	  $(MAKE) --no-print-directory server-kv-headroom-live CUDA_ARCH=sm_120f || rc=1; \

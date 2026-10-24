@@ -7416,6 +7416,72 @@ static void test_l311_route_header_anchor(void) {
     pulsar_tokens_free(&b);
 }
 
+/* L322: the side-call shape (Claude Code's SUGGESTION MODE, 2026-10-24, Qwen at 178-193k).  Turn N ran on the bank and
+ * its terminal checkpoint re-prefilled its reply; the side call (the conversation + ~340 tokens: a user turn, its
+ * header) then ran in place -- it carries everything the bank prefilled -- and its own terminal checkpoint re-prefilled
+ * its reply too, so the bank's history ends in the side call's header and reply.  The next real turn carries turn N
+ * through its end and the next user marker, then diverges inside the side call's user turn.  The bank's last-turn
+ * anchor (that user marker) says it is this conversation's: in place, rewound to the bank's own checkpoint below the
+ * match.  L311 took the DEEPER of that anchor and the side call's header, and every such turn took a fresh bank (and,
+ * with the adopt capped at a seam, the whole chain from disk: 22-25 s a turn). */
+static void test_l322_route_side_call(void) {
+    const int start = 151644, end = 151645, u = 872, a = 77091, nl = 198, think = 151667, think_end = 151668;
+    const pulsar_turn_markers q = {{start, u}, 2, {start, a}, 2};
+    pulsar_tokens b = {0};
+    pulsar_tokens_push(&b, start);  pulsar_tokens_push(&b, 8948);   /* 0 <|im_start|>system */
+    for (int i = 0; i < 300; i++) pulsar_tokens_push(&b, 1000 + i); /* 2 .. 301 the system prompt + tools */
+    pulsar_tokens_push(&b, start);  pulsar_tokens_push(&b, u);      /* 302 <|im_start|>user: the task */
+    for (int i = 0; i < 40; i++) pulsar_tokens_push(&b, 2000 + i);
+    pulsar_tokens_push(&b, start);  pulsar_tokens_push(&b, a);      /* 344 turn N-1's header ... */
+    for (int i = 0; i < 100; i++) pulsar_tokens_push(&b, 3000 + i); /* ... and its reply */
+    pulsar_tokens_push(&b, end);    pulsar_tokens_push(&b, nl);
+    const int user_n = b.len;                                       /* 448 <|im_start|>user: turn N */
+    pulsar_tokens_push(&b, start);  pulsar_tokens_push(&b, u);
+    for (int i = 0; i < 60; i++) pulsar_tokens_push(&b, 4000 + i);
+    pulsar_tokens_push(&b, start);  pulsar_tokens_push(&b, a);      /* turn N's header ... */
+    pulsar_tokens_push(&b, nl);     pulsar_tokens_push(&b, think);
+    for (int i = 0; i < 200; i++) pulsar_tokens_push(&b, 5000 + i); /* ... its reply, terminal-checkpointed */
+    pulsar_tokens_push(&b, think_end);
+    const int turn_end = b.len;                                     /* the side call's match: all of it */
+    pulsar_tokens_push(&b, end);    pulsar_tokens_push(&b, nl);
+    const int side_user = b.len;                                    /* the side call's <|im_start|>user */
+    pulsar_tokens_push(&b, start);  pulsar_tokens_push(&b, u);
+    for (int i = 0; i < 330; i++) pulsar_tokens_push(&b, 6000 + i); /* "SUGGESTION MODE ..." */
+    const int side_header = b.len;
+    pulsar_tokens_push(&b, start);  pulsar_tokens_push(&b, a);
+    pulsar_tokens_push(&b, nl);     pulsar_tokens_push(&b, think);
+    for (int i = 0; i < 250; i++) pulsar_tokens_push(&b, 7000 + i); /* its reply, terminal-checkpointed */
+    const int prefilled = b.len, frontier = b.len;
+    TEST_ASSERT(server_route_turn_anchor(&b, prefilled, &q) == side_user);
+    TEST_ASSERT(server_route_header_anchor(&b, prefilled, &q) == side_header + 1);
+    TEST_ASSERT(server_route_anchor(&b, prefilled, &q) == side_user);
+    /* the real turn N+1: turn N to its end, "<|im_end|>\n<|im_start|>user\n", then its own message -- the 14:18:06
+     * shape (common 178833 = the real turn's end 178828 + 5; resume 178816, the grid checkpoint below) */
+    const int common = side_user + 3, score = turn_end - turn_end % 128 > 0 ? turn_end - turn_end % 128 : 128;
+    TEST_ASSERT(frontier - score >= 157);   /* the protect floor alone would not keep it */
+    TEST_ASSERT(server_route_in_place(common, score, frontier, prefilled, 157, server_route_anchor(&b, prefilled, &q)));
+    /* ...where the deeper anchor (L311's combination) took a fresh bank */
+    TEST_ASSERT(!server_route_in_place(common, score, frontier, prefilled, 157, server_route_header_anchor(&b, prefilled, &q)));
+    /* the side call itself carries everything the bank prefilled before it: in place either way */
+    TEST_ASSERT(server_route_in_place(turn_end, score, turn_end, turn_end, 157, server_route_anchor(&b, turn_end, &q)));
+    /* a request that leaves the history BEFORE the bank's last user marker (an edit of an earlier turn, a subagent
+     * sibling sharing the conversation only up to there) is not taken by the anchor */
+    TEST_ASSERT(!server_route_in_place(turn_end, score, frontier, prefilled, 157, server_route_anchor(&b, prefilled, &q)));
+    TEST_ASSERT(!server_route_in_place(user_n + 20, 384, frontier, prefilled, 157, server_route_anchor(&b, prefilled, &q)));
+    /* the 2026-10-04 clobber (another conversation inside the first user message) stays fresh */
+    TEST_ASSERT(!server_route_in_place(320, 256, frontier, prefilled, 157, server_route_anchor(&b, prefilled, &q)));
+    /* a first-turn bank has no last-turn anchor: the header's decides (L311) */
+    TEST_ASSERT(server_route_anchor(&b, side_user - 1, &q) == user_n);   /* turn N prefilled through its reply */
+    pulsar_tokens fb = {0};
+    for (int i = 0; i < 349; i++) pulsar_tokens_push(&fb, b.v[i]);   /* system, task, turn N-1's header + 3 */
+    TEST_ASSERT(server_route_turn_anchor(&fb, fb.len, &q) == -1);
+    TEST_ASSERT(server_route_anchor(&fb, fb.len, &q) == 345);
+    const pulsar_turn_markers none = {{0, 0}, 0, {0, 0}, 0};
+    TEST_ASSERT(server_route_anchor(&b, prefilled, &none) == -1 && server_route_anchor(NULL, 9, &q) == -1);
+    pulsar_tokens_free(&fb);
+    pulsar_tokens_free(&b);
+}
+
 static void test_l275_route_in_place_through_last_turn(void) {
     const int floor_ = 157;
     /* the session recap on the idle main bank: the bank prefilled 41670 (its
@@ -9803,6 +9869,7 @@ static void pulsar_server_unit_tests_run(void) {
     test_l273_image_cold_cut();
     test_l275_route_in_place_through_last_turn();
     test_l311_route_header_anchor();
+    test_l322_route_side_call();
     test_slot_writer_defers_and_preserves_order();
     test_slot_writer_stall_times_out();
     test_unterminated_think_stays_off_content();

@@ -1120,6 +1120,8 @@ int pulsar_session_restore_checkpoint(pulsar_session *s, int G, char *err, size_
  *  history), copied in -- src's pool rows below T, then its checkpoint -- so the installed bank stands at T with src's
  *  tokens to T as its view (and, at a prompt end that IS the prompt, its logits); the sync that follows prefills the
  *  rest, the cold prefill's bytes.  src may be busy (its rows below T never change while its history reaches T).
+ *  L322: "carries" is the token-seam match (pulsar_tokens_prefix_match, the route's and the own resume's), T a
+ *  boundary both spellings share; the sync re-stitches the prompt onto src's tokens there.
  *  A text history only.  @return T, 0 when src serves nothing (or holds an image block below it), -1 with `err` on a
  *  refusal (a tensor-parallel engine, not another bank, a copy that failed: the installed bank then describes no
  *  position and must be synced from nothing). */

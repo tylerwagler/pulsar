@@ -273,7 +273,8 @@ vision, image-smoke and live / abandon server legs, which the runner does not co
 `make gates`' last section since L317, `live-legs`: constrained-live, server-live, the abandon leg, the L312
 stall check, (L316) `prefix-turns-live-gate` -- an agent loop's in-loop and re-sent turns == a fresh server's on
 the production Qwen pack, release-blocking (prefix-cache checks are must-pass) --, prefix-turns' side shape,
-preempt-exact, (L318) resume-deepest and opencode-turns.
+preempt-exact, (L318) resume-deepest, (L322) sidecall-turns -- the side call's conversation stays on its bank -- and
+opencode-turns.
 
 ### The GPU queue (gpuq)
 

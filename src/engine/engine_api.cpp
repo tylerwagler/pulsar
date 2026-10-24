@@ -1654,34 +1654,42 @@ int pulsar_session_bank_resume_at(pulsar_session *s, uint32_t bank, const pulsar
     const uint32_t G = pulsar_session_resume_point(s, bank, m.live_cut, m.live_cut + (prompt->len - m.prompt_cut));
     return (int)G < m.live_cut ? (int)G : m.prompt_cut;
 }
-/* L313: where `src`'s published state serves `prompt` -- its deepest grid checkpoint within the shared ids and its
- * prefill-only history (one short of the prompt), or a deeper record by the resume rule's own terms -- and the record
- * (NULL for a grid point).  0 when none. */
+/* L313: where `src`'s published state serves `prompt` -- the one resume rule (pulsar_session_resume_point, the rule a
+ * bank's own resume reads) on src: its deepest grid checkpoint within the match and its prefill-only history (one short
+ * of the prompt), or a deeper record by the rule's own terms -- and the record (NULL for a grid point); `*len` is the
+ * prompt's length in src's currency (the stitched prompt's).  0 when none.
+ * L322: the match is the token-seam one (pulsar_tokens_prefix_match), as the route and the bank's own resume read it,
+ * not the exact-id common prefix: a history loaded from a byte-only disk match (another spelling of the same bytes)
+ * parts from every later prompt by id at that seam, and the id rule capped every adopt of it there (8192, 2026-10-24,
+ * Claude Code at 178-193k).  The adopted view is src's tokens to T, and the sync re-stitches it against the prompt, so
+ * T must be a boundary the two spellings share: a T inside a re-spelled stretch is no adopt point (the stitch would
+ * stand short of T, below every checkpoint the adopt leaves, and prefill from 0). */
 static uint32_t bank_adopt_point(pulsar_session *s, uint32_t src, const pulsar_tokens *prompt,
-                                 const pulsar_ckpt_record **rec) {
+                                 const pulsar_ckpt_record **rec, int *len) {
     *rec = NULL;
-    const pulsar_ckpt_store *st = pulsar_session_kv_store(s);
+    *len = prompt->len;
     const pulsar_tokens *h = pulsar_bank_history(s, src);
-    if (!st || !st->ops || !h || prompt->len <= 0) return 0u;
-    const uint32_t common = (uint32_t)pulsar_tokens_common_prefix(h, prompt);
-    const uint32_t pf = (uint32_t)pulsar_session_bank_prefill_frontier(s, src);
-    uint32_t limit = common < pf ? common : pf;
-    uint32_t rlimit = limit < (uint32_t)prompt->len ? limit : (uint32_t)prompt->len;
-    if (limit > (uint32_t)prompt->len - 1u) limit = (uint32_t)prompt->len - 1u;
-    const uint32_t G = limit ? pulsar_ckpt_best(st, src, limit) : 0u;
-    const pulsar_ckpt_record *r = pulsar_ckpt_record_best(st, src, h->v, (uint32_t)h->len, rlimit, (uint32_t)prompt->len);
-    if (r && r->T > G && (r->T == (uint32_t)prompt->len || st->ops->split_invariant)) {
-        *rec = r;
-        return r->T;
+    if (!h || prompt->len <= 0) return 0u;
+    pulsar_prefix_match m;
+    pulsar_tokens_prefix_match(s->engine, h->v, h->len, prompt->v, prompt->len, &m);
+    *len = m.live_cut + (prompt->len - m.prompt_cut);
+    const uint32_t T = pulsar_session_resume_point(s, src, m.live_cut, *len);
+    if (T == 0u) return 0u;
+    if (m.seamed) {
+        pulsar_prefix_match at;
+        pulsar_tokens_prefix_match(s->engine, h->v, (int)T, prompt->v, prompt->len, &at);
+        if (at.live_cut != (int)T) return 0u;
     }
-    return G;
+    *rec = pulsar_session_resume_record(s, src, T, *len);
+    return T;
 }
 
 int pulsar_session_bank_adopt_score(pulsar_session *s, uint32_t src, const pulsar_tokens *prompt) {
     if (!s || !prompt || src >= (uint32_t)pulsar_session_bank_count(s) || src == pulsar_session_live_bank(s)) return 0;
     if (tp_mirror_target(s)) return 0;   /* a pair does not mirror the adopt (pulsar_session_bank_adopt refuses it) */
     const pulsar_ckpt_record *r = NULL;
-    return (int)bank_adopt_point(s, src, prompt, &r);
+    int len = 0;
+    return (int)bank_adopt_point(s, src, prompt, &r, &len);
 }
 
 int pulsar_session_bank_adopt(pulsar_session *s, uint32_t src, const pulsar_tokens *prompt, char *err,
@@ -1699,7 +1707,8 @@ int pulsar_session_bank_adopt(pulsar_session *s, uint32_t src, const pulsar_toke
         return -1;
     }
     const pulsar_ckpt_record *r = NULL;
-    const uint32_t T = bank_adopt_point(s, src, prompt, &r);
+    int len = 0;   /* the prompt in src's currency: a prompt end is the WHOLE (stitched) prompt */
+    const uint32_t T = bank_adopt_point(s, src, prompt, &r, &len);
     if (T == 0u) return 0;
     const pulsar_tokens *h = pulsar_bank_history(s, src);
     /* the records and checkpoints keep no image identity across banks: a history with an image block stays its own */
@@ -1707,7 +1716,7 @@ int pulsar_session_bank_adopt(pulsar_session *s, uint32_t src, const pulsar_toke
     pulsar_tokens view = {0};
     for (uint32_t i = 0; i < T; i++) pulsar_tokens_push(&view, h->v[i]);   /* h is src's carry: copy before moving */
     pulsar_ckpt_store *st = pulsar_session_kv_store(s);
-    const bool at_end = r && r->logits && T == (uint32_t)prompt->len;
+    const bool at_end = r && r->logits && T == (uint32_t)len;
     if (at_end) memcpy(s->logits, r->logits, (size_t)st->end_width * sizeof(float));
     s->checkpoint_valid = false;   /* the state moves below */
     if (!pulsar_ckpt_adopt(st, dst, src, T, r) || (at_end && !s->live_from_host(s->logits))) {
