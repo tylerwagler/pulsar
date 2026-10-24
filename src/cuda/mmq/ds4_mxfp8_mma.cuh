@@ -67,13 +67,16 @@ __device__ __forceinline__ static void ds4_mma_m16n8k32_e4m3(
           "r"(sfa), "h"(bid), "h"(tid),
           "r"(sfb), "h"(bid), "h"(tid));
 #else
-    /* NaN, never zeros.  A fallback that returns plausible numbers is the exact
-     * hazard this codebase keeps finding: it would make a JITed image silently
-     * compute wrong expert outputs instead of visibly failing.  Same choice as
+    /* Trap, not NaN (L321).  NaN was chosen over zeros so a JITed image could
+     * not pass for working, but NaN still RETURNS: on an sm_75 card it flowed
+     * through the experts as numbers.  The host now asks the device
+     * (pulsar_cuda_block_scale_mma) before choosing this lane; reaching here
+     * means that refusal was bypassed, and the kernel stops.  Same choice as
      * pulsar_cuda_indexer_mxfp4.cu's PTX-pass arm. */
+    (void)d0; (void)d1; (void)d2; (void)d3;
     (void)a0; (void)a1; (void)a2; (void)a3; (void)b0; (void)b1;
     (void)sfa; (void)sfb;
-    d0 = d1 = d2 = d3 = __int_as_float(0x7fffffff);
+    __trap();
 #endif
 }
 

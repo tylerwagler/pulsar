@@ -72,3 +72,11 @@ __device__ __forceinline__ T pulsar_warp_max(T v) {
 #endif
 }
 #endif
+
+/* Host side: what the DEVICE has.  The tiers above say what an IMAGE was compiled with; a launch decision must ask the
+ * device, or a build for an older target selects a lane its card cannot run (L321: an sm_75 build on an sm_75 card chose
+ * the routed IQ2 MMQ lane, whose block-scaled MMA exists only in the sm_120f image; its other arm returned NaN). */
+int pulsar_cuda_device_major(void);   /* the current device's compute-capability major, cached once; 0 if unknown */
+
+/* mma.sync.kind::mxf8f6f4.block_scale (MXFP8 experts, MXFP4 indexer): the sm_12x family only. */
+static inline bool pulsar_cuda_block_scale_mma(int major) { return major == 12; }

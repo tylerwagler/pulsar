@@ -1224,17 +1224,7 @@ static void attn_f16_combine_kernel(pulsar_heads_t *__restrict__ heads,
     } while (0)
 
 static int af16_device_supported(void) {
-    static int ok = -1;
-    if (ok < 0) {
-        int major = 0, minor = 0, dev = 0;
-        if (cudaGetDevice(&dev) != cudaSuccess) { ok = 0; return ok; }
-        if (cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev) != cudaSuccess ||
-            cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, dev) != cudaSuccess) {
-            ok = 0; return ok;
-        }
-        ok = (major >= 8) ? 1 : 0;      /* mma.m16n8k16.f16 is sm_80+ */
-    }
-    return ok;
+    return pulsar_cuda_device_major() >= 8 ? 1 : 0;   /* mma.m16n8k16.f16 is sm_80+ */
 }
 
 /* Does the backend's prefill attention read packed comp rows natively?  Since

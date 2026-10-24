@@ -177,23 +177,23 @@ static bool ds4_should_use_mmq_impl(uint32_t layout, int cc, int64_t ne11, int64
      * Serving a layout is a claim about the kernels behind it, so a stale entry
      * here is worse than a short list. */
     if (layout != PULSAR_TENSOR_IQ2_XXS_MMQ_K) return false;
+    (void)ne11; (void)n_experts;
 
-    if (turing_mma_available(cc)) {
-        return true;
+    /* The D2R kernels behind this layout multiply with the sm_12x block-scaled
+     * MMA (ds4_mxfp8_mma.cuh), so the answer is the DEVICE's, never the image's
+     * (L321).  Upstream's Turing / DP4A / fp16 knee that used to follow asked
+     * the compiled arch and chose the lane on an sm_75 card built for sm_75,
+     * where the MMA's non-sm_120f arm returned NaN experts; on GB10 it always
+     * answered yes, which is what this still says there.  A decline is
+     * terminal: the routed-MoE callers fail closed and name the layer. */
+    if (GGML_CUDA_CC_IS_NVIDIA(cc) && pulsar_cuda_block_scale_mma(cc / 100)) return true;
+    static bool said = false;
+    if (!said) {
+        said = true;
+        fprintf(stderr, "pulsar: routed IQ2_XXS MMQ needs the sm_12x block-scaled MMA; this device is cc %d.%d -- "
+                        "declining (no other routed-IQ2 lane exists)\n", cc / 100, (cc % 100) / 10);
     }
-    if (ggml_cuda_highest_compiled_arch(cc) < GGML_CUDA_CC_DP4A) {
-        return false;
-    }
-    /* The AMD arms are gone (L066 step 3, 2026-08-18).  Upstream branched here
-     * on CDNA / CDNA3 / RDNA3 / RDNA3_0 / RDNA3_5 via amd_mfma_available and
-     * amd_wmma_available; this engine runs on GB10 and nothing else, and `cc`
-     * is read from the DEVICE, so those arms were unreachable at runtime rather
-     * than merely uncompiled.  They were also the majority of what common.cuh
-     * still had to supply -- eight CC macros and two predicates for branches
-     * that cannot be taken -- which is what kept a 1,669-line vendored header
-     * alive.  The NVIDIA behaviour below is unchanged, including the pre-Turing
-     * fp16/DP4A knee, which is still reachable on an older NVIDIA part. */
-    return !fp16_mma_hardware_available(cc) || ne11 < MMQ_DP4A_MAX_BATCH_SIZE;
+    return false;
 }
 
 extern "C" int ds4_mmq_should_use(uint32_t layout, int64_t ne11, int64_t n_experts) {
