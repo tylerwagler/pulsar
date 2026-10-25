@@ -9795,6 +9795,37 @@ static void test_l280_prompt_kv_admission(void) {
     TEST_ASSERT(server_prompt_kv_verdict(30 * GiB, 0, 23 * GiB, NULL, 0, false, &k) == PROMPT_KV_FITS && k == 0);
 }
 
+/* L326 -- L314's readmission decides from the reserved base (server_kv_reserved), as every admission does.  gpuq
+ * #472's shape (Nemotron mini, 2048 B a token, budget 2.2 x 6000 tokens): A decodes on bank 0 at ~6300 tokens; B
+ * (~5966 tokens) was PREEMPTED so C's 6000-token prompt could bind; C is admitted but its prefill has not run.  On
+ * touched alone B fit again at once (READMITTED 0.0 s later) and C's prefill then took the pool over budget with
+ * no victim.  From the reserved base B waits while C is in flight, and comes back (spilling C's idle bank) after C
+ * ends; a bank already past its prompt reserves nothing; the fresh prompt that preempted B fit by the same base. */
+static void test_l326_readmit_reserved(void) {
+    const uint64_t tok = 2048, budget = (uint64_t)(2.2 * 6000) * tok;
+    const uint64_t a = 6300 * tok, b = 5966 * tok, c = 6010 * tok;
+    int k = -1;
+    /* C bound, nothing of it touched: the readmission waits for a job to end */
+    const uint64_t want_c[1] = {c}, none[1] = {0};
+    const uint64_t base = server_kv_reserved(a, want_c, none, 1);
+    TEST_ASSERT(base == a + c);
+    TEST_ASSERT(server_prompt_kv_verdict(a, b, budget, NULL, 0, true, &k) == PROMPT_KV_FITS);   /* the defect */
+    TEST_ASSERT(server_prompt_kv_verdict(base, b, budget, NULL, 0, true, &k) == PROMPT_KV_WAIT && k == 0);
+    /* C prefilled and decoding: it holds its prompt, so it reserves nothing more -- still no room beside A and C */
+    const uint64_t have_c[1] = {c + 16 * tok};
+    TEST_ASSERT(server_kv_reserved(a + c + 16 * tok, want_c, have_c, 1) == a + c + 16 * tok);
+    TEST_ASSERT(server_prompt_kv_verdict(a + c + 16 * tok, b, budget, NULL, 0, true, &k) == PROMPT_KV_WAIT);
+    /* C ended: its bank is an idle victim -- B comes back by spilling it */
+    const uint64_t drop_c[1] = {c + 16 * tok};
+    TEST_ASSERT(server_prompt_kv_verdict(a + c + 16 * tok, b, budget, drop_c, 1, true, &k) == PROMPT_KV_SPILL &&
+                k == 1);
+    /* nothing running and no room: the parked decoder is ended by name (REFUSE), never left parked forever */
+    TEST_ASSERT(server_prompt_kv_verdict(base, b, budget, NULL, 0, false, &k) == PROMPT_KV_REFUSE);
+    /* the preemption's own fit (prompt C on A alone after B's KV is freed) reads the same base: it fits */
+    TEST_ASSERT(server_prompt_kv_verdict(server_kv_reserved(a, NULL, NULL, 0), c, budget, NULL, 0, true, &k) ==
+                PROMPT_KV_FITS);
+}
+
 /* L179 branch 11 -- worker_evict_one's slot reset (evict_reset_slot_fields).
  * Invariant: the evicted slot is a reusable hole -- unprovisioned,
  * SLOT_EVICTED, no gen, no job, ctx 0, ledger cost 0, no scheduler
@@ -10651,6 +10682,7 @@ static void pulsar_server_unit_tests_run(void) {
     test_l179_guard_victim_skips_pinned_live_spilled();
     test_l179_guard_spill_plan_is_minimum();
     test_l280_prompt_kv_admission();
+    test_l326_readmit_reserved();
     test_l281_prefill_chunk_publishes_the_slot_gauges();
     test_l179_evict_reset_leaves_a_reusable_hole();
     test_l179_mixed_head_cap_drops_only_intermediate_prefill_head();
