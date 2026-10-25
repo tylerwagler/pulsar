@@ -2265,8 +2265,10 @@ struct server {
      *  KV dir, its physical freed, its job parked (session_slot::preempted) -- only one whose freed KV makes `need`
      *  bytes fit the budget.  @return true when one was. */
     bool preempt_newest_decoder(const session_slot *keep, uint64_t need);
-    /** L314: reload the first-preempted decoder whose KV fits the budget again (one a call); a reload that fails
-     *  fails that request by name.  @return true when one was readmitted (or failed). */
+    /** L314: reload the first-preempted decoder (FIFO: only the first is considered) once its KV fits the budget
+     *  again by the admission arithmetic on kv_reserved_bytes (L326: a prompt admitted but not yet prefilled holds
+     *  its room, so the decoder stays parked until a job ends); a reload that fails fails that request by name.
+     *  @return true when one was readmitted (or failed). */
     bool worker_readmit_preempted();
     /** LRU-idle smallest-frontier victim: NOT bank 0 (pinned), NOT in the live decode
      * set, no active job, not already spilled. -1 if none.  L323: a slot `dominated`
@@ -2282,6 +2284,11 @@ struct server {
      * watches.  Fills `order` with the idle victims to spill first (*n_spill of them) when that is what fitting
      * takes; *need is the bank's growth.  Worker thread only. */
     prompt_kv_verdict prompt_kv_check(const session_slot *sl, const job *j, int *order, int *n_spill, uint64_t *need);
+    /** L326: the base every KV admission decision (a prompt's, a preemption's fit, a readmission's) reads: the
+     *  pool's touched KV plus what each job bound to a slot other than `except` still adds before its prompt is in
+     *  its bank (its growth to the prompt's length past what the bank holds; parked decoders excluded).  Worker
+     *  thread only. */
+    uint64_t kv_reserved_bytes(const session_slot *except);
     /** Apply prompt_kv_check at bind: spill what it says, or keep the head queued (a busy bank will turn into a
      * victim), or answer the client 503 (nothing ever will).  True = the job may bind to `sl` now. */
     bool prompt_kv_admit(session_slot *sl, job *j, bool *refused);

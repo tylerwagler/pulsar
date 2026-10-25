@@ -1963,6 +1963,36 @@ static int guard_victim_order(server *s, session_slot **dec, int n, int *order, 
 static prompt_kv_verdict server_prompt_kv_verdict(uint64_t touched, uint64_t delta, uint64_t bound,
                                                   const uint64_t *drop, int n_victims, bool busy_may_free,
                                                   int *n_spill);
+
+/* L326: the resident KV an admission decision starts from -- what is touched now plus what every admitted job will
+ * still add before it decodes (want[i] = its bank's growth to its prompt's length, have[i] = what the bank holds;
+ * a bank already past its prompt adds nothing).  Admitting a prompt touches none of its KV until its prefill runs,
+ * so `touched` alone let L314's readmission retake, in the same worker turn, the room a preemption had just made
+ * for that prompt (gpuq #472: PREEMPTED, READMITTED 0.0 s later, the guard over budget with no victim). */
+static uint64_t server_kv_reserved(uint64_t touched, const uint64_t *want, const uint64_t *have, int n) {
+    uint64_t r = touched;
+    for (int i = 0; i < n; i++)
+        if (want[i] > have[i]) r += want[i] - have[i];
+    return r;
+}
+
+uint64_t server::kv_reserved_bytes(const session_slot *except) {
+    auto *s = this;
+    pulsar_session *pool = s->sess;
+    uint64_t want[PULSAR_SESSION_POOL_CAP], have[PULSAR_SESSION_POOL_CAP];
+    int n = 0;
+    for (int i = 0; i < s->n_slots && n < PULSAR_SESSION_POOL_CAP; i++) {
+        const session_slot *c = &s->slots[i];
+        /* a parked decoder holds nothing until its readmission, which is this decision's own subject */
+        if (c == except || !c->active_job || c->preempted) continue;
+        const int len = c->active_job->req.prompt.len > 0 ? c->active_job->req.prompt.len : 0;
+        want[n] = pulsar_session_quantum_growth_bytes_per_bank(pool, (uint32_t)len);
+        have[n] = pulsar_session_bank_touched_kv_bytes(pool, c->bank);
+        n++;
+    }
+    return server_kv_reserved(pulsar_session_touched_kv_bytes(pool), want, have, n);
+}
+
 bool server::preempt_newest_decoder(const session_slot *keep, uint64_t need) {
     auto *s = this;
     if (s->pool_banks <= 1 || !s->kv.enabled || !s->kv.dir || pulsar_engine_is_tp(s->engine)) return false;
@@ -1977,7 +2007,7 @@ bool server::preempt_newest_decoder(const session_slot *keep, uint64_t need) {
                 continue;
             /* a preemption that does not make the prompt fit only churns (the prompt waits either way) */
             const uint64_t freed = pulsar_session_bank_touched_kv_bytes(s->sess, c->bank);
-            const uint64_t touched = pulsar_session_touched_kv_bytes(s->sess);
+            const uint64_t touched = s->kv_reserved_bytes(keep);   /* L326: the admitted jobs' growth included */
             if ((touched > freed ? touched - freed : 0) + need > s->guard_touched_budget) continue;
             if (!v || c->gen->t0 > v->gen->t0) v = c;
         }
@@ -2034,7 +2064,9 @@ bool server::worker_readmit_preempted() {
     if (!v) return false;
     pulsar_session *pool = s->sess;
     if (s->guard_enabled) {
-        /* the admission arithmetic over the idle banks, as a prompt's (L280): fits, or fits once idle banks spill */
+        /* the admission arithmetic over the idle banks, as a prompt's (L280): fits, or fits once idle banks spill --
+         * from the same reserved base (L326: an admitted prompt's coming prefill counts, so the room a preemption
+         * made for it is not retaken before it lands; the decoder stays parked until a job ends and frees it) */
         int order[PULSAR_SESSION_POOL_CAP], n_spill = 0;
         uint64_t drop[PULSAR_SESSION_POOL_CAP];
         const int n_victims = guard_victim_order(s, NULL, 0, order);
@@ -2042,7 +2074,7 @@ bool server::worker_readmit_preempted() {
         bool busy = false;   /* another job whose end may make room */
         for (int i = 0; i < s->n_slots && !busy; i++)
             busy = &s->slots[i] != v && s->slots[i].active_job && !s->slots[i].preempted;
-        const prompt_kv_verdict pv = server_prompt_kv_verdict(pulsar_session_touched_kv_bytes(pool), v->preempt_bytes,
+        const prompt_kv_verdict pv = server_prompt_kv_verdict(s->kv_reserved_bytes(v), v->preempt_bytes,
                                                               s->guard_touched_budget, drop, n_victims, busy, &n_spill);
         if (pv == PROMPT_KV_WAIT) return false;
         if (pv == PROMPT_KV_REFUSE) {
@@ -2072,7 +2104,7 @@ bool server::worker_readmit_preempted() {
             if (!s->spill_bank(&s->slots[order[k]])) return false;
             s->count_metric(&s->m_spills);
         }
-        if (pulsar_session_touched_kv_bytes(pool) + v->preempt_bytes > s->guard_touched_budget) return false;
+        if (s->kv_reserved_bytes(v) + v->preempt_bytes > s->guard_touched_budget) return false;
     }
     const double t0 = server_now_sec();
     char err[256] = "";
@@ -2227,8 +2259,9 @@ prompt_kv_verdict server::prompt_kv_check(const session_slot *sl, const job *j, 
     bool busy = false;
     for (int i = 1; i < s->n_slots && !busy; i++)
         busy = &s->slots[i] != sl && s->slots[i].provisioned && !s->slots[i].spilled && s->slots[i].active_job;
-    return server_prompt_kv_verdict(pulsar_session_touched_kv_bytes(pool), *need, s->guard_touched_budget, drop,
-                                    n_victims, busy, n_spill);
+    /* L326: from the reserved base -- prompts bound earlier in this worker turn have touched nothing yet */
+    return server_prompt_kv_verdict(s->kv_reserved_bytes(sl), *need, s->guard_touched_budget, drop, n_victims, busy,
+                                    n_spill);
 }
 
 bool server::prompt_kv_admit(session_slot *sl, job *j, bool *refused) {
@@ -2244,9 +2277,8 @@ bool server::prompt_kv_admit(session_slot *sl, job *j, bool *refused) {
            s->preempt_newest_decoder(sl, need))
         v = s->prompt_kv_check(sl, j, order, &n_spill, &need);
     if (v == PROMPT_KV_FITS) return true;
-    pulsar_session *pool = s->sess;
     const double gib = 1024.0 * 1024.0 * 1024.0;
-    const uint64_t touched = pulsar_session_touched_kv_bytes(pool);
+    const uint64_t touched = s->kv_reserved_bytes(sl);   /* the base the verdict read (L326) */
     if (v == PROMPT_KV_SPILL) {
         server_log(PULSAR_LOG_DEFAULT,
                    "pulsar-server: kv admission: a %d-token prompt adds %.2f GiB of KV to bank %u (resident %.2f + "
