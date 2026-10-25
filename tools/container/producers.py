@@ -528,7 +528,7 @@ PRODUCERS = {f.__name__: f for f in (mxfp8_lt, mxfp8_lt_from_bf16, cutlass_mxfp4
                                       fp8_e4m3_soa_k_from_bf16, i64_to_i32, tessera_planes, rows_strided, rows_gather,
                                       i32_values, f16_from_f32)}
 # the engine's native layouts, by the stored dtype (`st_layout_type`): the recipe's `native` format
-NATIVE_LAYOUT = {"BF16": "bf16", "F16": "f16", "F32": "f32", "I32": "i32"}
+NATIVE_LAYOUT = {"BF16": "bf16", "F32": "f32", "I32": "i32"}
 
 # The ONE producer table (L279 step 1): (source kind, target format) -> the producer that writes it, COPY for the
 # source's own bytes verbatim.  A source kind is the stored dtype, `+scale` with a block-scale companion, `+nvfp4`
@@ -538,7 +538,6 @@ NATIVE_LAYOUT = {"BF16": "bf16", "F16": "f16", "F32": "f32", "I32": "i32"}
 COPY = "copy"
 PRODUCER_FOR = {
     ("BF16", "bf16"): COPY,
-    ("F16", "f16"): COPY,
     ("F32", "f16"): "f16_from_f32",
     ("F32", "f32"): COPY,
     ("I32", "i32"): COPY,
