@@ -1112,11 +1112,8 @@ void pulsar_session_rewind(pulsar_session *s, int pos);
  * holds none at G (nothing changed), or on a tensor-parallel engine, which does
  * not mirror the restore. */
 int pulsar_session_checkpoint_best(pulsar_session *s, int limit);
-/** The same question for any bank of the pool, installed or not -- a host scan,
- * no device work.  The router's score for a bank (L264 S3): a request whose bytes
- * match the bank's history to `limit` tokens resumes there from this position. */
-int pulsar_session_bank_checkpoint_best(pulsar_session *s, uint32_t bank, int limit);
 /** L266: where a sync of `prompt` on `bank` starts its prefill -- the prompt tokens the bank's state serves,
+ *  and (L325) the router's score for the bank, so the route ranks banks by the rule their syncs resume by,
  *  every family by one rule (L284; DeepSeek answered -1 before and its callers trusted the byte match).  The
  *  sync runs on the token-seam stitch (pulsar_session_bank_prefix_match): an extension of a history the bank
  *  continues where it stands (prefilled whole, at a cut the model's prefill reproduces, its state live) serves

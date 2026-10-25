@@ -16,6 +16,7 @@
 #include "pulsar_server_internal.h"
 #include "../lib/nemotron_chat.h"
 
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -118,7 +119,9 @@ void nemotron_forced_call_prefill(const request *r, const char *prompt, size_t *
 }
 
 bool nemotron_render(pulsar_engine *e, server *s, chat_conversation *c, request *r, char *err, size_t errlen) {
-    if (!chat_openai_tools_json(c, r, err, errlen)) return false;
+    char *head_raw = NULL;
+    if (!chat_openai_tools_json(c, r, &head_raw, err, errlen)) return false;
+    const std::unique_ptr<char, void (*)(void *)> head(head_raw, free);
     r->has_tools = r->tools_json != NULL;
     render_prelude(s, c, r);
     nemotron_msgs nm;
@@ -126,7 +129,7 @@ bool nemotron_render(pulsar_engine *e, server *s, chat_conversation *c, request 
     nemotron_render_in in = {};
     in.msgs = nm.m.data();
     in.n_msgs = (int)nm.m.size();
-    in.tools_json = r->tools_json;
+    in.tools_json = head.get();   /* the tools block; r->tools_json (every declared tool) types the parser (L325) */
     in.effort = (nemotron_effort)r->family_effort;
     in.add_generation_prompt = true;
     nemotron_render_out out;
@@ -245,6 +248,16 @@ char *nemotron_tool_error_suffix(const request *r, const thinking_state *, const
 
 }  // namespace
 
+/* L325: a tool loaded mid-conversation, in place: the tools block's <function> elements inside <tools></tools> (nemotron_chat_tool_defs). */
+static char *nemotron_tool_defs_text(const char *lines, size_t len, char *err, size_t errlen) {
+    char *json = tool_schema_lines_openai_tools(lines, len, err, errlen);
+    if (!json) return NULL;
+    nemotron_render_out out;
+    const bool ok = nemotron_chat_tool_defs(json, &out, err, errlen);
+    free(json);
+    return ok ? xstrndup(out.text.data(), out.text.size()) : NULL;
+}
+
 const server_family_ops k_family_nemotron_h = {
     /* .name                  = */ "Nemotron-H",
     /* .format                = */ PULSAR_CHAT_NEMOTRON_H,
@@ -260,4 +273,5 @@ const server_family_ops k_family_nemotron_h = {
     /* .forced_call_prefill   = */ nemotron_forced_call_prefill,
     /* .grammar               = */ &k_grammar_qwen_xml,   /* Qwen's markup (nemotron_chat.cpp) */
     /* .find_call_block       = */ nemotron_find_call_block,
+    /* .tool_defs_text        = */ nemotron_tool_defs_text,
 };

@@ -298,6 +298,17 @@ bool render_msg(writer &w, const qwen_msg_in &m, const char *prev, const char *n
 /* The head: the system block the template writes before the first message -- the effort line, the tools
  * block (`tools` NULL = none) and the system message's content (`system` NULL = none), or nothing at all when
  * there is no effort line, no tools and no system text. */
+/* The tools block's entries: each tool on its own line, tojson -- the one encoding of a tool definition, in the head
+ * and (L325) in place where a deferred tool is loaded. */
+void write_tool_entries(writer &w, const pyjson_value &tools) {
+    for (const pyjson_value &tool : tools.a) {
+        w.lit("\n");
+        std::string dumped;
+        pyjson_dump(tool, &dumped);
+        w.client(dumped);
+    }
+}
+
 void write_head(writer &w, const pyjson_value *tools, const char *system, qwen_effort effort) {
     const std::string instructions = effort_line(effort);
     const std::string content = py_strip(system);
@@ -305,12 +316,7 @@ void write_head(writer &w, const pyjson_value *tools, const char *system, qwen_e
         w.lit("<|im_start|>system\n");
         if (!instructions.empty()) w.lit(instructions + "\n\n");
         w.lit(kToolsHead);
-        for (const pyjson_value &tool : tools->a) {
-            w.lit("\n");
-            std::string dumped;
-            pyjson_dump(tool, &dumped);
-            w.client(dumped);
-        }
+        write_tool_entries(w, *tools);
         w.lit(kToolsTail);
         if (!content.empty()) {
             w.lit("\n\n");
@@ -379,6 +385,21 @@ bool qwen_chat_render(const qwen_render_in &in, qwen_render_out *out, char *err,
                         i == 0, i, err, errlen))
             return false;
     if (in.add_generation_prompt) w.lit(generation_prompt_text(in.effort));
+    return finish(out, err, errlen);
+}
+
+bool qwen_chat_tool_defs(const char *tools_json, qwen_render_out *out, char *err, size_t errlen) {
+    out->text.clear();
+    out->spans.clear();
+    writer w{out};
+    pyjson_value tools;
+    char jerr[160];
+    if (!tools_json || !pyjson_parse(tools_json, strlen(tools_json), &tools, jerr, sizeof jerr))
+        return refuse(err, errlen, "tools_not_array", "tools: %s", tools_json ? jerr : "none");
+    if (tools.kind != pyjson_value::ARR) return refuse(err, errlen, "tools_not_array", "tools is not a JSON array");
+    w.lit("<tools>");
+    write_tool_entries(w, tools);
+    w.lit("\n</tools>");
     return finish(out, err, errlen);
 }
 

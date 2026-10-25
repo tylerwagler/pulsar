@@ -2449,6 +2449,16 @@ RENDER_GATE_CASES ?=
 render-gate: pulsar_test
 	python3 tests/render_gate.py --reference "$(V41_REFERENCE_ENCODING)" --vectors $(if $(RENDER_GATE_CASES),--cases $(RENDER_GATE_CASES),)
 
+# L325: the prefix-stability replay gate.  A client that changes its request only in cache-preserving ways (a tool
+# loaded by ToolSearch: defer_loading + tool_reference; reminders in the last user turn; mid-conversation system
+# messages; a suggestion side call; Nemotron's truncate_history_thinking) must find the previous request's rendered
+# prompt in the next one up to the previous request's last cache_control breakpoint.  Claude Code 2.1.310's captured
+# requests (tests/prefix-stability/) plus synthetic shapes, rendered by the server's renderer for every family
+# (pulsar_test --render-cases, no model, no GPU), the first differing byte named on a failure.
+.PHONY: prefix-stability-gate
+prefix-stability-gate: pulsar_test
+	python3 tests/prefix_stability_gate.py --pulsar-test ./pulsar_test
+
 # The model-dependent gates run inside ONE process, cuda-runner-gate (L163:
 # tests/gates_runner.cpp) -- one 92 GB model load per engine configuration
 # instead of one per gate.  Their individual targets below remain for
@@ -2475,14 +2485,15 @@ GATE_TARGETS =unit-test-gate agent-test-gate \
 # L278: plus the chat / tokenizer contract (qwen-chat-gate: tokenize, render, parser vs HF goldens; inkling-chat-gate:
 # the same against HF and vLLM, L295 F5), the server
 # goldens for both families (api-golden: parsed requests, DeepSeek and Qwen rows; sse-golden: stream bytes) and
-# the speculation depth rule both drafters share, and render-gate (the V4.1 reference encoder's goldens, pinned in the
-# shared hub) -- seconds each, overlapping the runner.  (tp-plan-gate stays out of the overlap: its scan of the pair's
+# the speculation depth rule both drafters share, render-gate (the V4.1 reference encoder's goldens, pinned in the
+# shared hub) and prefix-stability-gate (L325: consecutive client requests render as prefixes of each other, every
+# family) -- seconds each, overlapping the runner.  (tp-plan-gate stays out of the overlap: its scan of the pair's
 # DeepSeek is a 12 GB process over 167 GB of NFS page cache beside a 90 GB engine on unified memory.)
 HOST_GATE_TARGETS = cuda-reap-router-audit vision-layout-gate vision-pixel-gate \
 	vision-codec-gate vision-span-gate vision-visible-gate vision-placeholder-gate vision-qwen-pixel-gate seam-check \
 	exl3-dequant-gate host-checks qwen-chat-gate inkling-chat-gate nemotron-chat-gate api-golden-gate sse-golden-gate \
 	spec-depth-gate \
-	loader-contract-gate render-gate
+	loader-contract-gate render-gate prefix-stability-gate
 # Every gate target is phony, declared HERE where the list is defined (the
 # .PHONY line at the top of the file expands before GATE_TARGETS exists).  A
 # file named like a gate would otherwise satisfy make and print nothing -- the
@@ -2664,7 +2675,7 @@ gates-dev:
 	fi; \
 	$(MAKE) -j$(GATE_JOBS) --no-print-directory tests/gates_runner pulsar_test CUDA_ARCH=sm_120f || exit 1; \
 	$(MAKE) --no-print-directory gates-preflight || exit 1; \
-	paths='$(PATHS)'; why=''; attn=0; server=0; vision=0; exl3=0; family=0; gdn=0; router=0; blocks=0; bf16=0; minp=0; drafter=0; poison=0; mtp=0; resume=0; kvmem=0; chunk=0; \
+	paths='$(PATHS)'; why=''; attn=0; server=0; render=0; vision=0; exl3=0; family=0; gdn=0; router=0; blocks=0; bf16=0; minp=0; drafter=0; poison=0; mtp=0; resume=0; kvmem=0; chunk=0; \
 	if [ -z "$$paths" ]; then \
 	  paths=$$( { git diff --name-only HEAD; git ls-files --others --exclude-standard; } 2>/dev/null \
 	            | grep -E '\.(c|cc|cpp|cu|cuh|h|hpp)$$' | sort -u ); \
@@ -2697,6 +2708,7 @@ gates-dev:
 	      case "$$p" in *spec_block*|*blockdraft*|*candsel*|*lilicorr*|*mtp_spec*|*attn_gqa*|*rope*|src/engine/session_spec.cpp|src/families/nemotron_h/*|src/engine/family_qwen.cpp) drafter=1 ;; esac; \
 	      case "$$p" in *mtp*|src/engine/family_qwen.cpp|src/engine/family_qwen.h|src/engine/step_driver*|src/families/nemotron_h/nemotron_h_family.cpp|src/families/nemotron_h/nemotron_h.h) mtp=1 ;; esac; \
 	      case "$$p" in src/server/server_jobs.cpp|src/server/server_sched.cpp|src/server/kv_cache.cpp|src/lib/pulsar_kvchain*|src/lib/pulsar_segstore*) resume=1 ;; esac; \
+	      case "$$p" in src/server/*|src/lib/*_chat*|src/lib/pyjson*) render=1 ;; esac; \
 	      case "$$p" in src/server/cli_main.cpp|src/server/server_sched.cpp|src/engine/state_kinds*|src/engine/session_banks*|tests/server_kv_headroom_live.py) kvmem=1 ;; esac; \
 	      case "$$p" in src/cuda/pulsar_cuda_runtime.cu|src/cuda/*scratch*|src/engine/gpu_graph_*|src/engine/gpu_decode.cpp|src/engine/step_driver*|src/engine/spec_block*|src/engine/verify_curve.cpp|*scratch_poison*) poison=1 ;; esac; \
 	      case "$$p" in src/engine/gpu_prefill*|src/engine/prefill_loop*|src/engine/kv_state*|src/engine/checkpoint*|src/engine/sync_driver*|src/engine/session*|src/lib/pulsar_segstore*|*chunk*) chunk=1 ;; esac; \
@@ -2732,6 +2744,7 @@ gates-dev:
 	if [ $$mtp -eq 1 ]; then printf '  mtp-spec-gate: selected (L305: the dormant MTP lane, on an MTP path change, on the Nemotron mini)\n'; fi; \
 	if [ $$poison -eq 1 ]; then printf '  scratch-poison-gate: selected (L307: the graphed lanes and their scratch, poisoned == unpoisoned on DeepSeek, DFlash2, LiLiCorr)\n'; fi; \
 	if [ $$server -eq 1 ]; then printf '  server: chat smoke + the --server/--api unit switches\n'; fi; \
+	if [ $$render -eq 1 ]; then printf '  prefix-stability-gate: selected (L325: server / chat-render paths, every family, no model)\n'; fi; \
 	if [ $$kvmem -eq 1 ]; then printf '  server-kv-headroom-live: selected (L319: the touched-KV ceiling is the measured headroom; admission / guard / bank paths)\n'; fi; \
 	if [ $$resume -eq 1 ]; then printf '  resume-deepest-live + sidecall-turns-live + kv-dup-live: selected (L318 / L322 / L324: routing / resume / disk-chain paths, the Open WebUI and the Claude Code side-call shapes and the fan-out duplicate census on the Qwen pack)\n'; fi; \
 	$(MAKE) --no-print-directory seam-check CUDA_ARCH=sm_120f || rc=1; \
@@ -2742,6 +2755,9 @@ gates-dev:
 	  PULSAR_TEST_MODEL="$(FRONTIER_MODEL)" ./pulsar_test $(GATES_DEV_UNIT_SERVER) || rc=1; \
 	  $(MAKE) -j$(GATE_JOBS) --no-print-directory cuda-chat-smoke-gate CUDA_ARCH=sm_120f \
 	        FRONTIER_MODEL="$(FRONTIER_MODEL)" || rc=1; \
+	fi; \
+	if [ $$render -eq 1 ]; then \
+	  $(MAKE) --no-print-directory prefix-stability-gate CUDA_ARCH=sm_120f || rc=1; \
 	fi; \
 	if [ $$attn -eq 1 ]; then \
 	  $(MAKE) -j$(GATE_JOBS) --no-print-directory cuda-attn-gates CUDA_ARCH=sm_120f || rc=1; \
