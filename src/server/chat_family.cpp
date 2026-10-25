@@ -25,7 +25,6 @@ void chat_conversation_free(chat_conversation *c) {
     free(c->tools_raw);
     free(c->tool_schemas);
     free(c->deferred_tool_schemas);
-    buf_free(&c->loaded_tool_schemas);
     free(c->tool_choice_wire);
     for (int i = 0; i < c->n_controls; i++) free(c->controls[i].raw);
     free(c->controls);
@@ -285,7 +284,7 @@ static const server_effort_map k_effort_deepseek_v4 = {
 
 static bool deepseek_render(pulsar_engine *e, server *s, chat_conversation *c, request *r, char *err,
                             size_t errlen) {
-    /* Responses can also carry schemas in its input items (tool_search output). */
+    /* the tools block's schemas (deferred tools and tool_search loads render in place, chat_expand_tool_refs) */
     buf schemas = {0};
     conversation_tool_schema_lines(c, &schemas);
     r->has_tools = c->tool_choice != CHAT_TOOL_CHOICE_NONE && schemas.len;
@@ -414,8 +413,8 @@ static char *qwen_take_render(qwen_render_out *out, chat_text_span **spans_out, 
 
 /* The tools of a family whose template takes OpenAI's tools array (Qwen, Inkling): none with tool_choice none; an
  * OpenAI request's array as sent (HF's / vLLM's input); else the conversation's schema lines -- every protocol's
- * kinds and tool_search's loads, as for DeepSeek (L284) -- in OpenAI's shape.  r->tools_json stays NULL when there
- * are none; false + err when the lines do not convert. */
+ * kinds, as for DeepSeek (L284; deferred tools and tool_search's loads declared, not in the head) -- in OpenAI's
+ * shape.  r->tools_json stays NULL when there are none; false + err when the lines do not convert. */
 bool chat_openai_tools_json(const chat_conversation *c, request *r, char **head_json, char *err, size_t errlen) {
     *head_json = NULL;
     if (c->tool_choice == CHAT_TOOL_CHOICE_NONE) return true;

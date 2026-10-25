@@ -281,7 +281,10 @@ static void test_responses_input_tool_search_output_loads_tools(void) {
     TEST_ASSERT(msgs.len == 2);
     TEST_ASSERT(msgs.v[0].calls.len == 1);
     TEST_ASSERT(!strcmp(msgs.v[0].calls.v[0].name, "tool_search"));
-    TEST_ASSERT(strstr(msgs.v[1].content, "mcp__perplexity__") != NULL);
+    /* L326: the item's message references the loaded tool (rendered there, chat_expand_tool_refs), not its JSON */
+    TEST_ASSERT(msgs.v[1].content && !msgs.v[1].content[0]);
+    TEST_ASSERT(msgs.v[1].tool_refs_len == 1 && msgs.v[1].tool_ref_off[0] == 0 &&
+                !strcmp(msgs.v[1].tool_ref_name[0], "mcp__perplexity__perplexity_search"));
 
     buf_free(&loaded);
     tool_schema_orders_free(&orders);
@@ -7822,6 +7825,67 @@ static void test_l325_deferred_tool_in_place(void) {
     }
 }
 
+/* L326: the Responses API's tool search (Codex): a tool_search_output's `tools` are the loads; each renders its
+ * definition at the item, through L325's mechanism (chat_expand_tool_refs, the family's tool_defs_text), not in the
+ * tools block -- so the request before the load is a prefix of the one after it.  Every family: the definition once,
+ * after the search call; declared for the parser; the tools block (Bash) unchanged. */
+static void test_l326_responses_tool_search_in_place(void) {
+    static const char *const kTools =
+        "\"tools\":[{\"type\":\"function\",\"name\":\"bash\",\"description\":\"Run a command.\",\"parameters\":"
+        "{\"type\":\"object\",\"properties\":{\"command\":{\"type\":\"string\"}},\"required\":[\"command\"]}},"
+        "{\"type\":\"tool_search\",\"execution\":\"client\"}]";
+    const std::string u1 = "{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\","
+                           "\"text\":\"Find the weather.\"}]}";
+    const std::string search =
+        ",{\"type\":\"tool_search_call\",\"call_id\":\"call_s\",\"execution\":\"client\","
+        "\"arguments\":{\"query\":\"weather lookup\"}},"
+        "{\"type\":\"tool_search_output\",\"call_id\":\"call_s\",\"status\":\"completed\",\"execution\":\"client\","
+        "\"tools\":[{\"type\":\"function\",\"name\":\"get_weather\",\"description\":\"Current weather for a city.\","
+        "\"parameters\":{\"type\":\"object\",\"properties\":{\"city\":{\"type\":\"string\"}},\"required\":[\"city\"]},"
+        "\"defer_loading\":true}]}";
+    const pulsar_chat_format fmts[] = {PULSAR_CHAT_DS4_V41, PULSAR_CHAT_QWEN, PULSAR_CHAT_NEMOTRON_H,
+                                       PULSAR_CHAT_INKLING};
+    for (pulsar_chat_format fmt : fmts) {
+        const std::string before = "{\"model\":\"m\",\"input\":[" + u1 + "]," + kTools + "}";
+        /* the tools array before the input this time: the loads join the deferred tools whatever the member order */
+        const std::string after = std::string("{\"model\":\"m\",") + kTools + ",\"input\":[" + u1 + search + "]}";
+        char *text[2] = {NULL, NULL};
+        for (int k = 0; k < 2; k++) {
+            chat_conversation c = {};
+            request r;
+            request_init(&r, REQ_CHAT, 128);
+            r.api = API_RESPONSES;
+            char err[200] = {0};
+            TEST_ASSERT(parse_chat_conversation_responses((k ? after : before).c_str(), &c, &r, err, sizeof err));
+            const bool ok = render_chat_conversation(NULL, fmt, NULL, &c, &r, err, sizeof err);
+            if (!ok) fprintf(stderr, "l326 fmt %d body %d: %s\n", (int)fmt, k, err);
+            TEST_ASSERT(ok);
+            if (ok) {
+                text[k] = xstrdup(r.prompt_text);
+                TEST_ASSERT(tool_call_declared(&r, "get_weather", NULL, 0) == (k == 1));
+                TEST_ASSERT(tool_call_declared(&r, "bash", NULL, 0));
+            }
+            request_free(&r);
+            chat_conversation_free(&c);
+        }
+        if (!text[0] || !text[1]) {
+            free(text[0]);
+            free(text[1]);
+            continue;
+        }
+        const char *t = text[1];
+        const char *def = strstr(t, "Current weather for a city.");
+        const char *use = strstr(t, "weather lookup");
+        TEST_ASSERT(def && use && def > use);                               /* at the item, after the search */
+        TEST_ASSERT(def && !strstr(def + 1, "Current weather for a city."));   /* once */
+        TEST_ASSERT(!strstr(t, "defer_loading\": true}]}"));                /* not the item's raw JSON */
+        const char *m = strstr(text[0], "Find the weather.");
+        TEST_ASSERT(m && !strncmp(text[0], t, (size_t)(m - text[0]) + strlen("Find the weather.")));
+        free(text[0]);
+        free(text[1]);
+    }
+}
+
 static void test_l322_route_side_call(void) {
     const int start = 151644, end = 151645, u = 872, a = 77091, nl = 198, think = 151667, think_end = 151668;
     const pulsar_turn_markers q = {{start, u}, 2, {start, a}, 2};
@@ -10359,6 +10423,7 @@ static void pulsar_server_unit_tests_run(void) {
     test_l311_route_header_anchor();
     test_l322_route_side_call();
     test_l325_deferred_tool_in_place();
+    test_l326_responses_tool_search_in_place();
     test_slot_writer_defers_and_preserves_order();
     test_slot_writer_stall_times_out();
     test_unterminated_think_stays_off_content();

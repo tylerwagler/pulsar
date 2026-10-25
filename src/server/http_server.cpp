@@ -905,6 +905,12 @@ bool server::send_metrics(int fd) {
     buf_puts(&b, "# TYPE pulsar:kv_touched_budget_bytes gauge\n");
     buf_printf(&b, "pulsar:kv_touched_budget_bytes %llu\n",
                s->guard_enabled ? (unsigned long long)s->guard_touched_budget : 0ULL);
+    /* L326: the eager floor that min() subtracts, as the server holds it (guard_eager_bytes) -- the touched budget
+     * alone does not give it back once the headroom term binds (L319), so tests read it here, not from a log line. */
+    buf_puts(&b, "# HELP pulsar:kv_eager_floor_bytes Eager KV floor already resident that the eviction guard's ledger share subtracts (kv budget minus this, L319/L326; 0 = guard off).\n");
+    buf_puts(&b, "# TYPE pulsar:kv_eager_floor_bytes gauge\n");
+    buf_printf(&b, "pulsar:kv_eager_floor_bytes %llu\n",
+               s->guard_enabled ? (unsigned long long)s->guard_eager_bytes : 0ULL);
 
     /* plan-31b phase A: whole-box reconciliation -- the signed gap between
      * what the BOX says this process consumed since a post-boot baseline and

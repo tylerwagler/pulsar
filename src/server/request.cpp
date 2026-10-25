@@ -1368,10 +1368,6 @@ bool anthropic_tools_supported(const char *tools_json, char *err, size_t errlen)
  * their client-facing name and namespace for response output. */
 void conversation_tool_schema_lines(const chat_conversation *c, buf *out) {
     if (c->tool_schemas && c->tool_schemas[0]) buf_puts(out, c->tool_schemas);
-    if (c->loaded_tool_schemas.len) {
-        if (out->len) buf_putc(out, '\n');
-        buf_append(out, c->loaded_tool_schemas.ptr, c->loaded_tool_schemas.len);
-    }
 }
 
 void conversation_declared_tool_schema_lines(const chat_conversation *c, buf *out) {

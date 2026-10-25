@@ -5,10 +5,11 @@ pulsar-server.
     python3 tests/preempt_live.py MODEL exact    [--binary ./pulsar-server] [--work DIR] [--port 8314] [--margin 1.5]
     python3 tests/preempt_live.py MODEL pressure [--ctx 1048576 --banks 16 --n 12 --prompt 48000 --gen 128 --fit 3]
 
-exact     The guard's eager floor and one bank's KV bytes a token are read from a server of this --ctx / --banks (its
-          startup line, /metrics kv_bank_bytes over the context), and the prompts are counted on it; a server whose
-          KV budget is overridden (PULSAR_SERVER_KV_BUDGET_OVERRIDE, the guard's test hook) so request A (a long
-          prompt decoding 1500 greedy tokens) fits alone, B (a longer prompt, 1 token) fits alone, and both do not.
+exact     The guard's eager floor and one bank's KV bytes a token are read from a server of this --ctx / --banks
+          (/metrics kv_eager_floor_bytes, L326; kv_bank_bytes over the context), and the prompts are counted on it; a
+          server whose KV budget is overridden (PULSAR_SERVER_KV_BUDGET_OVERRIDE, the guard's test hook) so request A
+          (a long prompt decoding 1500 greedy tokens) fits alone, B (a longer prompt, 1 token) fits alone, and both do
+          not.
           B arrives while A decodes: A must be PREEMPTED (the server's log), B answered, A READMITTED and finished --
           and A's text must equal A's on a fresh server, uninterrupted, byte for byte (a single stream on both sides:
           greedy decode is deterministic there).  Every request asks for logprobs, which keeps it on the plain lane
@@ -23,7 +24,7 @@ L317: `exact` is a leg of tests/live_legs.py: the probe and the counts on the mo
 preemption on its hooks instance (the budget override), A uninterrupted on its fresh instance (0 cached tokens
 asserted).  The servers run with their disk-KV dirs under the work dir (never /tmp).  Exit 0 only when every check
 passed."""
-import os, re, sys, threading, time
+import os, sys, threading, time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from live_server import Leg, Server, check_fresh  # noqa: E402
@@ -45,29 +46,21 @@ def chat(srv, text, max_tokens, logprobs=True):
     return 200, (m.get("reasoning_content") or "") + "\n--\n" + (m.get("content") or ""), d.get("usage", {})
 
 
-# the guard's startup line (cli_main.cpp, L319): "touched budget T GiB = min(kv budget K − eager E, touched U +
-# MemAvailable A − floor F post-warmup)" -- the ceiling is the smaller of the ledger's share (K - E) and the measured
-# headroom (U + A - F)
-GUARD = re.compile(r"touched budget ([0-9.]+) GiB = min\(kv budget ([0-9.]+) \S+ eager ([0-9.]+), "
-                   r"touched ([0-9.]+) \+ MemAvailable ([0-9.]+) \S+ floor ([0-9.]+) post-warmup\)")
-
-
-def guard_line(srv):
-    """(touched budget, kv budget, eager, touched + MemAvailable - floor) in GiB from the startup line, or None"""
-    m = GUARD.search(srv.text())
-    if not m:
-        return None
-    t, k, e, u, a, f = (float(x) for x in m.groups())
-    return t, k, e, u + a - f
+def guard(srv):
+    """(touched budget, eager floor) in bytes as the server holds them (/metrics, L326), or None with the guard off.
+    The touched budget is min(kv budget - eager, touched + MemAvailable - floor post-warmup) (cli_main.cpp, L319)."""
+    m = srv.metrics()
+    t, e = m.get("pulsar:kv_touched_budget_bytes", 0.0), m.get("pulsar:kv_eager_floor_bytes", 0.0)
+    return (t, e) if t > 0 and e > 0 else None
 
 
 def probe(srv, ctx):
     """(the guard's eager floor, one bank's KV bytes a token) of this server's --ctx / --banks"""
-    gl = guard_line(srv)
+    gl = guard(srv)
     bank_bytes = srv.metrics().get("pulsar:kv_bank_bytes", 0.0)
     if not gl or bank_bytes <= 0:
         return None
-    return gl[2] * 2**30, bank_bytes / ctx
+    return gl[1], bank_bytes / ctx
 
 
 def slot_decoding(srv):
@@ -109,11 +102,13 @@ class PreemptLeg(Leg):
         over = srv.grep("KV budget OVERRIDDEN")
         self.g.check(over, "the hooks instance runs the overridden budget: %s" % (over[0][-80:] if over else "no line"))
         # the override sizes the ledger's share (kv budget - eager); the ceiling is the smaller of it and the measured
-        # headroom (L319), so the frame holds only when the ledger's share binds
-        gl = guard_line(srv)
-        self.g.check(gl is not None and gl[1] - gl[2] <= gl[3],
+        # headroom (L319), so the frame holds only when the ledger's share binds: touched budget == override - eager
+        gl = guard(srv)
+        share = self.budget - gl[1] if gl else 0
+        self.g.check(gl is not None and abs(gl[0] - share) < 2**20,
                      "the overridden ledger share binds the touched budget: %s" %
-                     ("%.2f GiB = min(%.2f - %.2f, headroom %.2f)" % gl if gl else "no guard line"))
+                     ("%.2f GiB (ledger share %.2f - eager %.2f = %.2f)" %
+                      (gl[0] / 2**30, self.budget / 2**30, gl[1] / 2**30, share / 2**30) if gl else "guard off"))
         mark = srv.mark()
         chat(srv, W_TEXT, 1)
         th = threading.Thread(target=lambda: self.res.__setitem__("A", chat(srv, A_TEXT, GEN_A)))
