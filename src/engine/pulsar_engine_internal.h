@@ -3223,7 +3223,8 @@ typedef enum {
     PULSAR_ACT_SLOT_BF16 = 0,   ///< the slot's bf16 plane (DeepSeek's plain F32 / BF16 weights, cuBLAS)
     PULSAR_ACT_ROWS_BF16 = 1,   ///< raw bf16 rows (Qwen)
     PULSAR_ACT_SLOT_E4M3 = 2,   ///< the slot's E4M3 MX plane (DeepSeek's MXFP8 dense and routed experts)
-    PULSAR_ACT_COUNT = 3,
+    PULSAR_ACT_ROWS_F16 = 3,    ///< raw f16 rows (L321: an fp16 tensor-core consumer's operand -- the Turing lane)
+    PULSAR_ACT_COUNT = 4,
 } pulsar_act_format;
 #define PULSAR_ACTS(a) (1u << (a))
 /** L272 P4c: the kernel arm a dense linear takes for (stored format, activation) -- admission (pulsar_format_serves)

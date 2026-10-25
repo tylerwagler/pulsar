@@ -2,7 +2,8 @@
  * its decode table (nemotron_parse.h section 2).
  *
  * The formats: every Linear (the ViT's, the neck's convolutions as Linears, the decoder's) and the tied embedding /
- * head f16 -- the f16 rows arm (pulsar_cuda_f16_rows.h); the embedding gathered from the same f16 table; every norm,
+ * head f16 -- the f16 rows arm (pulsar_cuda_f16_rows.h), at f16 operand rows (the decoder's attention output: bf16
+ * rows); the embedding gathered from the same f16 table; every norm,
  * bias, the class tokens and the position field f32 as stored (the position field read on the host).
  *
  * The tokenizer: Parse's tokenizer.json is a Nougat / Galactica BPE (NFKC, a digit / punctuation pre-tokenizer, the
@@ -25,7 +26,8 @@ const char *const OWNER = PULSAR_NEMOTRON_PARSE_ARCH;
 
 const pulsar_role_admit A_F32 = {PULSAR_ROLE_PLAIN(PULSAR_TENSOR_F32), false, PULSAR_ROLE_DENSE, 0};
 const pulsar_role_admit A_F16 = {PULSAR_ROLE_PLAIN(PULSAR_TENSOR_F16), false, PULSAR_ROLE_DENSE, 0};
-const pulsar_role_admit A_LINEAR = {0, true, PULSAR_ROLE_DENSE, PULSAR_ACTS(PULSAR_ACT_ROWS_BF16)};
+const pulsar_role_admit A_LINEAR = {0, true, PULSAR_ROLE_DENSE,
+                                    PULSAR_ACTS(PULSAR_ACT_ROWS_F16) | PULSAR_ACTS(PULSAR_ACT_ROWS_BF16)};
 
 bool read_text(const std::string &path, std::string *out) {
     FILE *f = fopen(path.c_str(), "rb");
@@ -76,7 +78,7 @@ std::string byte_level(const std::string &t, const int map[512]) {
 bool pulsar_nemotron_parse_bind(const pulsar_model *m, pulsar_nemotron_parse_model *w) {
     const pulsar_nemotron_parse_shape *s = &w->shape;
     pulsar_role_binder *b = pulsar_role_binder_open(m, OWNER);
-    const uint64_t D = s->vit_width, HS = (uint64_t)s->vit_heads * s->vit_head_stored, M = s->vit_mlp;
+    const uint64_t D = s->vit_width, HS = (uint64_t)s->vit_heads * s->vit_head_dim, M = s->vit_mlp;
     const uint64_t N = s->neck_width, E = s->width, F = s->ffn, KV = (uint64_t)s->kv_heads * (s->width / s->heads);
     auto top = [&](const char *r) { return pulsar_role_top(r); };
     const uint64_t P = (uint64_t)s->patch * s->patch * 3u;

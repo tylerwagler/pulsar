@@ -6,8 +6,8 @@
  *   ViT     C-RADIOv4-SO400M: patch Linear 768 -> 1152 (no bias) + the learned 128 x 128 position field resampled to
  *           the page's content grid (content-normalised: antialiased bilinear interpolate, then grid_sample at each
  *           patch's content-clamped centre -- computed on the host, torch's arithmetic), 10 class tokens before the
- *           patches, then 27 timm blocks: x += proj(MHA(LN1 x)); x += fc2(GELU(fc1(LN2 x))) -- 16 heads of 72
- *           (stored padded to 96, the attention's tile), bidirectional, qkv / proj / fc biases, LayerNorm eps 1e-6
+ *           patches, then 27 timm blocks: x += proj(MHA(LN1 x)); x += fc2(GELU(fc1(LN2 x))) -- 16 heads of 72,
+ *           bidirectional, qkv / proj / fc biases, LayerNorm eps 1e-6
  *   neck    patches: LN(conv1 x) (1x1, 1152 -> 1024); four horizontally adjacent rows merged by conv2 (a Linear
  *           4096 -> 1024, the builder's [out, kw, ch]) + LN; the summary: LN(Linear(class tokens 0 | 1)) -- the
  *           decoder's visual prefix, the summary row last
@@ -43,7 +43,7 @@ extern const pulsar_family PULSAR_FAMILY_NEMOTRON_PARSE;
 /* ---- 1. Shape -------------------------------------------------------------------------------------------------- */
 
 typedef struct {
-    uint32_t vit_width, vit_depth, vit_heads, vit_head_dim, vit_head_stored, vit_mlp, patch, n_cls, pos_grid;
+    uint32_t vit_width, vit_depth, vit_heads, vit_head_dim, vit_mlp, patch, n_cls, pos_grid;
     float vit_eps;
     uint32_t neck_width, merge;
     float neck_eps;
@@ -112,7 +112,7 @@ std::string pulsar_nemotron_parse_decode(const pulsar_nemotron_parse_vocab *v, c
 typedef struct {
     uint32_t h, w;              ///< the padded canvas (multiples of 16 and 64)
     uint32_t ch, cw;            ///< the content (the resized image) inside it, top-left
-    std::vector<uint16_t> patches;   ///< bf16 [(h / 16) * (w / 16)][768]
+    std::vector<uint16_t> patches;   ///< f16 [(h / 16) * (w / 16)][768]
 } pulsar_nemotron_parse_page;
 
 /** Decode (PNG / JPEG), resize (Pillow BILINEAR, only when larger than the canvas), pad, normalise, patch.  false +

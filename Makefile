@@ -140,8 +140,8 @@ SERVER_OBJS = $(SERVER_SRCS:.cpp=.o)
 SERVER_HDRS = $(wildcard src/server/*.h)
 # CUTLASS TUs need the CUTLASS include path + c++17; they build via dedicated rules below,
 # so keep them out of the generic src/cuda/%.o rule.
-CUTLASS_CUDA_OBJS = src/cuda/pulsar_mxfp4_cutlass.o
-CUDA_SRCS = $(filter-out src/cuda/pulsar_mxfp4_cutlass.cu,$(wildcard src/cuda/*.cu))
+CUTLASS_CUDA_OBJS = src/cuda/pulsar_mxfp4_cutlass.o src/cuda/pulsar_cuda_fmha.o
+CUDA_SRCS = $(filter-out src/cuda/pulsar_mxfp4_cutlass.cu src/cuda/pulsar_cuda_fmha.cu,$(wildcard src/cuda/*.cu))
 CUDA_OBJS = $(CUDA_SRCS:.cu=.o)
 # Vendored llama.cpp MMQ (plan 41b, see src/cuda/mmq/VENDOR.md).  The wildcard is
 # empty unless the tree has actually been vendored, in which case PULSAR_HAVE_MMQ
@@ -288,7 +288,7 @@ pulsar-agent: $(AGENT_OBJS) src/lib/pulsar_help.o src/lib/pulsar_kvtext.o src/li
 CUDA_REGRESSION_BINS = tests/cuda_long_context_smoke tests/moe_route_bounds_gate tests/expert_table_gate \
                        tests/exl3_moe_epilogue_gate tests/exl3_dense_gate tests/exl3_moe_prefill_gate tests/exl3_half_gate \
                        tests/gdn_gate tests/qsa_attn_gate tests/qsa_yarn_test tests/qwen_s4_gate tests/router_gate tests/gqa_attn_gate tests/sconv_gate tests/head_gate \
-                       tests/bf16_rows_gate tests/nvfp4_rows_gate tests/mamba2_gate tests/rowops_gate tests/arch_gate tests/pool_gate tests/f16_rows_gate
+                       tests/bf16_rows_gate tests/nvfp4_rows_gate tests/mamba2_gate tests/rowops_gate tests/arch_gate tests/pool_gate tests/f16_rows_gate tests/fmha_gate
 # 2026-10-14: they run CONCURRENTLY, each one's output kept together (-O).  They are model-free and mostly
 # host-bound (their references run on the CPU: measured alone, 258 s in series, the longest 114 s of which 113 s
 # user time), so in series they were 258 s of the battery's serial front.  No gate here grades a time.
@@ -821,6 +821,14 @@ head-mini-grade: tests/head_gate
 # own Qwen4ExpTextGatedDeltaNet).  The engine's NVCCFLAGS plus -fPIC.  Not a gate.
 tests/libpulsar_gdn.so: src/cuda/pulsar_cuda_gdn.cu src/cuda/pulsar_cuda_gdn.h src/cuda/pulsar_cuda_mx.cuh Makefile
 	$(NVCC) $(NVCCFLAGS) -Xcompiler -fPIC -shared -Isrc -o $@ src/cuda/pulsar_cuda_gdn.cu
+
+# L321: CUTLASS's memory-efficient attention (pulsar_cuda_fmha) vs a double reference (model-free).
+tests/fmha_gate: tests/fmha_gate.cu src/cuda/pulsar_cuda_fmha.o src/cuda/pulsar_cuda_fmha.h Makefile
+	$(NVCC) $(NVCCFLAGS) -std=c++17 -Isrc -Isrc/cuda -o $@ tests/fmha_gate.cu src/cuda/pulsar_cuda_fmha.o
+
+.PHONY: fmha-gate
+fmha-gate: tests/fmha_gate
+	./tests/fmha_gate
 
 # L321: the f16 rows arm (fp16 tensor cores, the fixed-algorithm GEMM) + the LayerNorm / bias / GELU row ops vs host
 # references, row independence bit for bit (model-free).
@@ -3090,6 +3098,11 @@ src/cuda/mmq/pulsar_tessera.o: src/cuda/mmq/pulsar_tessera.cu $(MMQ_HDRS) $(CUDA
 # mxf4 block-scale MMA; build the whole engine with CUDA_ARCH=sm_120f so all objects match arch.
 src/cuda/pulsar_mxfp4_cutlass.o: src/cuda/pulsar_mxfp4_cutlass.cu src/pulsar_gpu.h $(CUDA_FLAG_STAMP) | cutlass-check
 	$(NVCC) $(NVCCFLAGS) -std=c++17 --expt-relaxed-constexpr --expt-extended-lambda -diag-suppress 20012 -diag-suppress 177 -Isrc $(CUTLASS_INC) -c -o $@ src/cuda/pulsar_mxfp4_cutlass.cu
+
+# L321: CUTLASS's memory-efficient attention (vendored in src/cuda/fmha/, VENDOR.md) -- the CUTLASS include path
+src/cuda/pulsar_cuda_fmha.o: src/cuda/pulsar_cuda_fmha.cu src/cuda/pulsar_cuda_fmha.h $(wildcard src/cuda/fmha/*.h src/cuda/fmha/*/*.h) \
+                             $(CUDA_FLAG_STAMP) | cutlass-check
+	$(NVCC) $(NVCCFLAGS) -std=c++17 --expt-relaxed-constexpr --expt-extended-lambda -diag-suppress 20012 -diag-suppress 177 -Isrc $(CUTLASS_INC) -c -o $@ src/cuda/pulsar_cuda_fmha.cu
 
 tests/cuda_long_context_smoke: tests/cuda_long_context_smoke.o $(CUDA_OBJS) $(CUTLASS_CUDA_OBJS) $(MMQ_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)

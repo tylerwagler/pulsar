@@ -1,6 +1,6 @@
 /* F16 ROWS GATE (L321): the f16 rows arm (src/cuda/pulsar_cuda_f16_rows.cu over pulsar_cuda_lt_fixed.cu) and the
- * row ops it brings (LayerNorm, the biased residual add, the biased GELU emit; pulsar_cuda_rowops.cu) -- the production
- * objects, model-free, at Nemotron Parse's shapes.
+ * row ops it brings (the f32-residual LayerNorm and add, the biased GELU emit, the f16 gather; pulsar_cuda_rowops.cu)
+ * -- the production objects, model-free, at Nemotron Parse's shapes.
  *
  *   L1  the linear vs a double host reference: |y - ref| <= 8 sqrt(K) 2^-24 * sum_k |x_k w_k| per output (the f32
  *       accumulation of exact products: the operand is the bf16 row scaled by a power of two), every output
@@ -8,11 +8,16 @@
  *   L2  row independence, bit for bit: each prompt row alone == the same row in a call of all of them, and each
  *       decode row alone == batched (decode rows ride blocks of 16: 37 rows is three blocks);
  *   L3  the refusals (a width not a multiple of 8, a short workspace, a misaligned weight);
- *   R1  layernorm vs a double host LayerNorm: within one bf16 ulp of the reference value (rsqrtf, the f32 sums);
- *   R2  bias add: res + (x + bias) rounded once (bit-exact to the host), then the LayerNorm of the stored row ==
- *       R1's on that row, bit for bit;
- *   R3  bias emit + GELU vs a double host GELU (erf): within one bf16 ulp plus the f32 cancellation of 1 + erf in the
- *       negative tail (torch's CUDA GELU computes the same expression in f32: 2^-22 |v|); no activation: bit-exact.
+ *   L4  f16 operand rows (pulsar_f16_rows_linear_h_launch): == the bf16 entry on the same values (both are exact
+ *       operands of the one GEMM: an f16 row whose values are bf16 values gives the bf16 row's bytes), bit for bit;
+ *   R1  layernorm32 vs a double host LayerNorm, from bf16 rows and from f32 rows + a bias: f32 out within 2^-20
+ *       relative, bf16 / f16 out within one ulp of their format plus 2^-18 absolute (rsqrtf, the f32 sums);
+ *   R2  res32_add: res + (x + bias) in f32 (bit-exact to the host), then its fused LayerNorm == layernorm32 of the
+ *       stored row, bit for bit, in both 16-bit formats;
+ *   R3  bias emit + GELU vs a double host GELU (erf): within one ulp of the output format plus the f32 cancellation of
+ *       1 + erf in the negative tail (torch's CUDA GELU computes the same expression in f32: 2^-22 |v|); no
+ *       activation: bit-exact;
+ *   R4  the f16 gather: table row * scale as f32, bit-exact (an exact product), a NaN row for an id outside.
  *
  * usage: ./tests/f16_rows_gate */
 #include "../src/cuda/pulsar_cuda_f16_rows.h"
@@ -131,7 +136,7 @@ static int linear_case(int in, int out, int rows) {
     return 0;
 }
 
-static void ln_ref(const float *x, int W, const float *w, const float *b, double eps, double *y) {
+static void ln_ref(const double *x, int W, const float *w, const float *b, double eps, double *y) {
     double mean = 0, var = 0;
     for (int c = 0; c < W; c++) mean += x[c];
     mean /= W;
@@ -140,63 +145,146 @@ static void ln_ref(const float *x, int W, const float *w, const float *b, double
     for (int c = 0; c < W; c++) y[c] = (x[c] - mean) * rstd * w[c] + b[c];
 }
 
+static float f16_val(uint16_t h) { return __half2float(__ushort_as_half(h)); }
+static double f16_ulp(double v) {
+    int e;
+    frexp(fabs(v) > 6.2e-5 ? v : 6.2e-5, &e);
+    return ldexp(1.0, e - 11);
+}
+
+/* the 16-bit value in `fmt` and its ulp */
+static double out_val(uint16_t u, pulsar_rows_out fmt) { return fmt == PULSAR_ROWS_OUT_F16 ? f16_val(u) : bf16_val(u); }
+static double out_ulp(double v, pulsar_rows_out fmt) { return fmt == PULSAR_ROWS_OUT_F16 ? f16_ulp(v) : bf16_ulp(v); }
+
 static int rowops_case(int W, int rows) {
-    std::vector<uint16_t> res((size_t)rows * W);
-    std::vector<float> x((size_t)rows * W), w(W), b(W), bias(W);
-    for (auto &v : res) v = bf16_bits((float)(rndn() * 3.0 + 0.5));
+    std::vector<uint16_t> xb((size_t)rows * W);
+    std::vector<float> res((size_t)rows * W), x((size_t)rows * W), w(W), b(W), bias(W);
+    for (auto &v : xb) v = bf16_bits((float)(rndn() * 3.0 + 0.5));
+    for (auto &v : res) v = (float)(rndn() * 30.0);
     for (auto &v : x) v = (float)(rndn() * 2.0);
     for (int c = 0; c < W; c++) { w[c] = (float)(1.0 + 0.2 * rndn()); b[c] = (float)(0.1 * rndn()); bias[c] = (float)(0.3 * rndn()); }
-    uint16_t *dres = dev(res), *dy = nullptr;
-    float *dx = dev(x), *dw = dev(w), *db = dev(b), *dbias = dev(bias);
-    CK(cudaMalloc(&dy, (size_t)rows * W * 2));
-    /* R1 */
-    int rc = pulsar_rows_layernorm_launch(dres, W, rows, W, dw, db, 1e-6f, dy, W, 0);
-    CK(cudaDeviceSynchronize());
-    std::vector<uint16_t> y = host(dy, (size_t)rows * W);
-    size_t bad = 0;
-    std::vector<double> ref(W);
-    std::vector<float> rowf(W);
-    for (int r = 0; r < rows; r++) {
-        for (int c = 0; c < W; c++) rowf[c] = bf16_val(res[(size_t)r * W + c]);
-        ln_ref(rowf.data(), W, w.data(), b.data(), 1e-6, ref.data());
-        for (int c = 0; c < W; c++) bad += !(fabs(bf16_val(y[(size_t)r * W + c]) - ref[c]) <= bf16_ulp(ref[c]));
-    }
-    CHECK(rc == 0 && bad == 0, "R1 layernorm width %d: rc %d, %zu values past one bf16 ulp", W, rc, bad);
-    /* R2 */
-    rc = pulsar_rows_bias_add_launch(dres, W, dx, W, dbias, rows, W, dw, db, 1e-6f, dy, W, 0);
-    CK(cudaDeviceSynchronize());
-    const std::vector<uint16_t> res2 = host(dres, (size_t)rows * W), y2 = host(dy, (size_t)rows * W);
-    size_t bad_add = 0;
-    for (size_t i = 0; i < res.size(); i++) {
-        const float d = x[i] + bias[i % W];
-        bad_add += res2[i] != bf16_bits(bf16_val(res[i]) + d);
-    }
-    uint16_t *dy3 = nullptr;
-    CK(cudaMalloc(&dy3, (size_t)rows * W * 2));
-    rc |= pulsar_rows_layernorm_launch(dres, W, rows, W, dw, db, 1e-6f, dy3, W, 0);
-    CK(cudaDeviceSynchronize());
-    const std::vector<uint16_t> y3 = host(dy3, (size_t)rows * W);
-    CHECK(rc == 0 && bad_add == 0 && y2 == y3, "R2 bias add width %d: rc %d, %zu sums differ from one rounding, fused "
-          "norm %s the norm alone", W, rc, bad_add, y2 == y3 ? "==" : "!=");
-    /* R3 */
-    for (pulsar_rows_act act : {PULSAR_ROWS_ACT_NONE, PULSAR_ROWS_ACT_GELU}) {
-        rc = pulsar_rows_bias_emit_launch(dx, W, rows, W, dbias, act, dy, W, 0);
-        CK(cudaDeviceSynchronize());
-        y = host(dy, (size_t)rows * W);
-        size_t b3 = 0;
-        for (size_t i = 0; i < x.size(); i++) {
-            const float z = x[i] + bias[i % W];
-            if (act == PULSAR_ROWS_ACT_NONE) b3 += y[i] != bf16_bits(z);
-            else {
-                const double g = 0.5 * z * (1.0 + erf(z / sqrt(2.0)));
-                b3 += !(fabs(bf16_val(y[i]) - g) <= bf16_ulp(g) + ldexp(fabs((double)z), -22));
+    uint16_t *dxb = dev(xb), *dy = nullptr, *dy2 = nullptr;
+    float *dres = dev(res), *dx = dev(x), *dw = dev(w), *db = dev(b), *dbias = dev(bias), *dyf = nullptr;
+    CK(cudaMalloc(&dy, (size_t)rows * W * 2)); CK(cudaMalloc(&dy2, (size_t)rows * W * 2));
+    CK(cudaMalloc(&dyf, (size_t)rows * W * 4));
+    std::vector<double> in(W), ref(W);
+    /* R1: from bf16 rows, and from f32 rows + a bias */
+    for (int src = 0; src < 2; src++)
+        for (pulsar_rows_out fmt : {PULSAR_ROWS_OUT_BF16, PULSAR_ROWS_OUT_F16}) {
+            const int rc = src == 0 ? pulsar_rows_layernorm32_launch(dxb, false, W, NULL, rows, W, dw, db, 1e-6f, dy, W, fmt,
+                                                                     dyf, W, 0)
+                                    : pulsar_rows_layernorm32_launch(dx, true, W, dbias, rows, W, dw, db, 1e-6f, dy, W,
+                                                                     fmt, dyf, W, 0);
+            CK(cudaDeviceSynchronize());
+            const std::vector<uint16_t> y = host(dy, (size_t)rows * W);
+            const std::vector<float> yf = host(dyf, (size_t)rows * W);
+            size_t bad = 0;
+            for (int r = 0; r < rows; r++) {
+                for (int c = 0; c < W; c++)
+                    in[c] = src == 0 ? (double)bf16_val(xb[(size_t)r * W + c]) : (double)x[(size_t)r * W + c] + bias[c];
+                ln_ref(in.data(), W, w.data(), b.data(), 1e-6, ref.data());
+                for (int c = 0; c < W; c++) {
+                    /* one ulp of the format, plus the f32 arithmetic's own error near zero (2^-18 absolute) */
+                    bad += !(fabs(out_val(y[(size_t)r * W + c], fmt) - ref[c]) <= out_ulp(ref[c], fmt) + ldexp(1.0, -18));
+                    bad += !(fabs(yf[(size_t)r * W + c] - ref[c]) <= ldexp(fabs(ref[c]) + 1.0, -20));
+                }
             }
+            CHECK(rc == 0 && bad == 0, "R1 layernorm32 width %d from %s to %s: rc %d, %zu values off", W,
+                  src ? "f32 + bias" : "bf16", fmt ? "f16" : "bf16", rc, bad);
         }
-        CHECK(rc == 0 && b3 == 0, "R3 bias emit (%s) width %d: rc %d, %zu values off", act ? "gelu" : "none", W, rc, b3);
+    /* R2 */
+    for (pulsar_rows_out fmt : {PULSAR_ROWS_OUT_BF16, PULSAR_ROWS_OUT_F16}) {
+        float *dr = dev(res);
+        int rc = pulsar_rows_res32_add_launch(dr, W, dx, W, dbias, rows, W, dw, db, 1e-6f, dy, W, fmt, 0);
+        CK(cudaDeviceSynchronize());
+        const std::vector<float> r2 = host(dr, (size_t)rows * W);
+        size_t bad_add = 0;
+        for (size_t i = 0; i < res.size(); i++) bad_add += r2[i] != res[i] + (x[i] + bias[i % W]);
+        rc |= pulsar_rows_layernorm32_launch(dr, true, W, NULL, rows, W, dw, db, 1e-6f, dy2, W, fmt, NULL, 0, 0);
+        CK(cudaDeviceSynchronize());
+        CHECK(rc == 0 && bad_add == 0 && host(dy, (size_t)rows * W) == host(dy2, (size_t)rows * W),
+              "R2 res32 add width %d (%s): rc %d, %zu sums differ from f32, the fused norm %s the norm alone", W,
+              fmt ? "f16" : "bf16", rc, bad_add, host(dy, (size_t)rows * W) == host(dy2, (size_t)rows * W) ? "==" : "!=");
+        cudaFree(dr);
     }
-    printf("  rows width %4d x %d: layernorm within a bf16 ulp, bias add one rounding + fused norm == norm, bias emit "
-           "(none bit-exact, gelu within a ulp)\n", W, rows);
-    cudaFree(dres); cudaFree(dy); cudaFree(dy3); cudaFree(dx); cudaFree(dw); cudaFree(db); cudaFree(dbias);
+    /* R3 */
+    for (pulsar_rows_out fmt : {PULSAR_ROWS_OUT_BF16, PULSAR_ROWS_OUT_F16})
+        for (pulsar_rows_act act : {PULSAR_ROWS_ACT_NONE, PULSAR_ROWS_ACT_GELU}) {
+            const int rc = pulsar_rows_bias_emit_launch(dx, W, rows, W, dbias, act, dy, W, fmt, 0);
+            CK(cudaDeviceSynchronize());
+            const std::vector<uint16_t> y = host(dy, (size_t)rows * W);
+            size_t b3 = 0;
+            for (size_t i = 0; i < x.size(); i++) {
+                const float z = x[i] + bias[i % W];
+                if (act == PULSAR_ROWS_ACT_NONE) {
+                    b3 += y[i] != (fmt == PULSAR_ROWS_OUT_F16 ? __half_as_ushort(__float2half_rn(z)) : bf16_bits(z));
+                } else {
+                    const double g = 0.5 * z * (1.0 + erf(z / sqrt(2.0)));
+                    b3 += !(fabs(out_val(y[i], fmt) - g) <= out_ulp(g, fmt) + ldexp(fabs((double)z), -22));
+                }
+            }
+            CHECK(rc == 0 && b3 == 0, "R3 bias emit (%s, %s) width %d: rc %d, %zu values off", act ? "gelu" : "none",
+                  fmt ? "f16" : "bf16", W, rc, b3);
+        }
+    printf("  rows width %4d x %d: layernorm32 (bf16 / f32 + bias in; bf16 / f16 / f32 out) within an ulp, res32 add "
+           "exact + fused norm == norm, bias emit (none bit-exact, gelu within an ulp)\n", W, rows);
+    cudaFree(dxb); cudaFree(dy); cudaFree(dy2); cudaFree(dyf); cudaFree(dres); cudaFree(dx); cudaFree(dw); cudaFree(db);
+    cudaFree(dbias);
+    return 0;
+}
+
+/* L4: f16 operand rows whose values are bf16 values == the bf16 entry on them, bit for bit */
+static int f16_operand_case(int in, int out, int rows) {
+    std::vector<__half> w((size_t)out * in);
+    for (auto &v : w) v = __float2half((float)(rndn() * 0.05));
+    std::vector<uint16_t> xb((size_t)rows * in), xh((size_t)rows * in);
+    for (size_t i = 0; i < xb.size(); i++) {
+        xb[i] = bf16_bits((float)(rndn() * 4.0));
+        xh[i] = __half_as_ushort(__float2half_rn(bf16_val(xb[i])));   /* exact: |x| is small and normal */
+    }
+    __half *dw = dev(w);
+    uint16_t *dxb = dev(xb), *dxh = dev(xh);
+    float *y1 = nullptr, *y2 = nullptr;
+    CK(cudaMalloc(&y1, (size_t)rows * out * 4)); CK(cudaMalloc(&y2, (size_t)rows * out * 4));
+    const size_t wsb = pulsar_f16_rows_workspace_bytes(rows, in);
+    void *ws = nullptr;
+    CK(cudaMalloc(&ws, wsb));
+    bool same = true;
+    for (bool prompt : {true, false}) {
+        const int a = pulsar_f16_rows_linear_launch(dw, dxb, rows, in, out, y1, prompt, ws, wsb, 0);
+        const int b = pulsar_f16_rows_linear_h_launch(dw, dxh, rows, in, out, y2, prompt, 0);
+        CK(cudaDeviceSynchronize());
+        same = same && a == 0 && b == 0 && host(y1, (size_t)rows * out) == host(y2, (size_t)rows * out);
+    }
+    CHECK(same, "L4 %d -> %d: the f16 operand entry != the bf16 entry on the same values", in, out);
+    printf("  f16 operands %4d -> %4d x %d rows: == the bf16 entry on the same values (prompt and decode)\n", in, out,
+           rows);
+    cudaFree(dw); cudaFree(dxb); cudaFree(dxh); cudaFree(y1); cudaFree(y2); cudaFree(ws);
+    return 0;
+}
+
+/* R4 */
+static int gather_case(void) {
+    const uint32_t V = 300, Wd = 1024, n = 5;
+    std::vector<__half> t((size_t)V * Wd);
+    for (auto &v : t) v = __float2half((float)(rndn() * 0.1));
+    const std::vector<int32_t> ids = {7, 0, 299, 300, 42};
+    __half *dt = dev(t);
+    int32_t *di = dev(ids);
+    float *dy = nullptr;
+    CK(cudaMalloc(&dy, (size_t)n * Wd * 4));
+    const int rc = pulsar_rows_gather_f16_launch((const uint16_t *)dt, V, Wd, di, n, 32.0f, dy, Wd, 0);
+    CK(cudaDeviceSynchronize());
+    const std::vector<float> y = host(dy, (size_t)n * Wd);
+    size_t bad = 0;
+    for (uint32_t r = 0; r < n; r++)
+        for (uint32_t c = 0; c < Wd; c++) {
+            const float g = y[(size_t)r * Wd + c];
+            bad += ids[r] < (int32_t)V ? g != __half2float(t[(size_t)ids[r] * Wd + c]) * 32.0f : !isnan(g);
+        }
+    CHECK(rc == 0 && bad == 0, "R4 gather: rc %d, %zu values off", rc, bad);
+    printf("  gather f16 x 32 -> f32: exact, an id past the table a NaN row\n");
+    cudaFree(dt); cudaFree(di); cudaFree(dy);
     return 0;
 }
 
@@ -217,8 +305,11 @@ int main(void) {
     CHECK(pulsar_f16_rows_linear_launch(w + 1, x, 2, 64, 64, y, true, ws, 1 << 20, 0) == -1, "L3 a misaligned weight accepted");
     cudaFree(ws); cudaFree(w); cudaFree(x); cudaFree(y);
     printf("  refusals: a width not a multiple of 8, a short workspace, a misaligned weight\n");
+    for (auto &s : shapes)
+        if (f16_operand_case(s[0], s[1], 37)) return 1;
     for (int W : {1152, 1024})
         if (rowops_case(W, 300)) return 1;
+    if (gather_case()) return 1;
     printf(g_fail ? "F16 ROWS GATE FAIL\n" : "F16 ROWS GATE PASS\n");
     return g_fail;
 }

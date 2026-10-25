@@ -682,11 +682,7 @@ uint64_t pulsar_gqa_desc_bytes(uint32_t n_rows) {
 static int gqa_layer_refusal(const pulsar_gqa_layer *L) {
     if (L->n_q == 0 || L->n_kv == 0 || L->n_q % L->n_kv) return gqa_refuse("n_q is not a positive multiple of n_kv");
     if (L->n_q / L->n_kv > GQA_MAX_GROUP) return gqa_refuse("the query group n_q / n_kv is wider than 64 (one CTA's MMA rows)");
-    if (L->head_dim != 64u && L->head_dim != 96u && L->head_dim != 128u)
-        return gqa_refuse("head_dim has no built tile (64, 96, 128)");
-    /* the rope pairs lane j with lane j + NJ / 2 of the head's NJ = head_dim / 32 per lane: an even NJ (L321: 96 is
-     * a rope-free tile -- Parse's ViT heads, stored padded) */
-    if (L->rope_theta > 0.f && L->head_dim % 64u) return gqa_refuse("rope on a head_dim that is not a multiple of 64");
+    if (L->head_dim != 64u && L->head_dim != 128u) return gqa_refuse("head_dim has no built tile (64, 128)");
     if (L->kv_fmt != PULSAR_GQA_KV_BF16 && L->kv_fmt != PULSAR_GQA_KV_E4M3)
         return gqa_refuse("the KV row format has no tile loader (BF16, E4M3)");
     if (L->kv_fmt == PULSAR_GQA_KV_E4M3 && L->rel_extent) return gqa_refuse("E4M3 KV rows with a relative bias have no built tile");
@@ -873,7 +869,6 @@ int pulsar_gqa_launch(const pulsar_gqa_layer *L, const pulsar_gqa_call *call, co
     aa.tap = io->tap_out_f32;
 
     return HD == 128u ? gqa_launch<128>(L, pa, aa, n_rows, call->n_tiles, call->grid_chunks, fold, st, ws)
-         : HD == 96u  ? gqa_launch<96>(L, pa, aa, n_rows, call->n_tiles, call->grid_chunks, fold, st, ws)
                       : gqa_launch<64>(L, pa, aa, n_rows, call->n_tiles, call->grid_chunks, fold, st, ws);
 }
 
@@ -950,8 +945,6 @@ int pulsar_gqa_store(const pulsar_gqa_layer *L, const pulsar_gqa_seq *seqs, uint
     if (L->head_dim == 128u) {
         if (L->rope_inv_freq) gqa_prep_kernel<128, gqa_prep_table_args><<<grid, 256, 0, st>>>(ta);
         else                  gqa_prep_kernel<128, gqa_prep_args><<<grid, 256, 0, st>>>(pa);
-    } else if (L->head_dim == 96u) {   /* rope-free (refused above with a rope) */
-        gqa_prep_kernel<96, gqa_prep_args><<<grid, 256, 0, st>>>(pa);
     } else {
         if (L->rope_inv_freq) gqa_prep_kernel<64, gqa_prep_table_args><<<grid, 256, 0, st>>>(ta);
         else                  gqa_prep_kernel<64, gqa_prep_args><<<grid, 256, 0, st>>>(pa);

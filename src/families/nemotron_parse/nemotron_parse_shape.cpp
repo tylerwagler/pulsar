@@ -7,7 +7,7 @@
 #include <stddef.h>
 
 const pulsar_nemotron_parse_shape PULSAR_NEMOTRON_PARSE_SHAPE = {
-    /* vit  */ 1152, 27, 16, 72, 96, 4304, 16, 10, 128, 1e-6f,
+    /* vit  */ 1152, 27, 16, 72, 4304, 16, 10, 128, 1e-6f,
     /* neck */ 1024, 4, 1e-6f,
     /* dec  */ 1024, 10, 16, 8, 4096, 72512, 1e-5f, 32.0f,
     /* ids  */ 16384, 0, 2, 1,
@@ -33,7 +33,7 @@ struct np_key {
 #define F(k, f) {"nemotron_parse." k, K_F32, offsetof(pulsar_nemotron_parse_shape, f)}
 const np_key k_keys[] = {
     U("vit.width", vit_width), U("vit.depth", vit_depth), U("vit.heads", vit_heads), U("vit.head_dim", vit_head_dim),
-    U("vit.head_dim_stored", vit_head_stored), U("vit.mlp", vit_mlp), U("vit.patch", patch), U("vit.n_cls", n_cls),
+    U("vit.mlp", vit_mlp), U("vit.patch", patch), U("vit.n_cls", n_cls),
     U("vit.pos_grid", pos_grid), F("vit.norm_eps", vit_eps),
     U("neck.width", neck_width), U("neck.merge", merge), F("neck.norm_eps", neck_eps),
     U("dec.width", width), U("dec.layers", n_layer), U("dec.heads", heads), U("dec.kv_heads", kv_heads),

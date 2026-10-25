@@ -7,7 +7,7 @@
  *              then past its width w' = 1664, h' = int(w' / aspect); Pillow BILINEAR (vision_pil_resize_rgb) when the
  *              size changed -- the content
  *   pad        _pad_to_navit_grid: white (255) at the bottom and right to multiples of 16 rows and 64 columns
- *   normalise  ToTensor's f32 p / 255, then (x - mean) / std in f32, rounded once to bf16
+ *   normalise  ToTensor's f32 p / 255, then (x - mean) / std in f32, rounded once to f16 (the patch Linear's operand)
  *   patches    unfold 16 x 16, permuted (row, column, channel, y, x): element ch * 256 + y * 16 + x of patch
  *              (r, c) is pixel (16 r + y, 16 c + x) of channel ch
  * THE POSITIONS (hf_prefix_geometry.py _normalized_2d_position_pages, content-normalised): the 128 x 128 field
@@ -16,6 +16,7 @@
  *   pooling when either side is one patch -- then grid_sample'd (bilinear, border, align_corners False; f32, as torch
  *   computes it) at each canvas patch's centre clamped to the content, normalised by the content size. */
 #include "nemotron_parse.h"
+#include "engine/exl3_trellis.h"   /* exl3_f32_to_f16: the host f32 -> f16 conversion */
 
 #include <math.h>
 #include <stdlib.h>
@@ -144,19 +145,16 @@ bool pulsar_nemotron_parse_page_prepare(const pulsar_nemotron_parse_shape *s, co
             const float x = (float)p / 255.0f;
             lut[ch][p] = (x - s->mean[ch]) / s->std[ch];
         }
-    auto bf16 = [](float v) {
-        uint32_t u;
-        memcpy(&u, &v, 4);
-        u += 0x7fffu + ((u >> 16) & 1u);
-        return (uint16_t)(u >> 16);
-    };
+    uint16_t lut16[3][256];   /* f16 bits, round to nearest even (the values are small and normal: |x| < 3) */
+    for (int ch = 0; ch < 3; ch++)
+        for (int p = 0; p < 256; p++) lut16[ch][p] = exl3_f32_to_f16(lut[ch][p]);
     for (uint32_t y = 0; y < page->h; y++)
         for (uint32_t x = 0; x < page->w; x++) {
             const bool in = y < (uint32_t)nh && x < (uint32_t)nw;
             const uint8_t *px = in ? rgb + ((size_t)y * nw + x) * 3u : NULL;
             uint16_t *patch = &page->patches[((size_t)(y / P) * cols + x / P) * E];
             for (int ch = 0; ch < 3; ch++)
-                patch[(size_t)ch * P * P + (y % P) * P + x % P] = bf16(lut[ch][in ? px[ch] : 255]);
+                patch[(size_t)ch * P * P + (y % P) * P + x % P] = lut16[ch][in ? px[ch] : 255];
         }
     free(rgb);
     return true;

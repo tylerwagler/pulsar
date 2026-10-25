@@ -931,7 +931,7 @@ static void run_refusals(Case &C, Case &Rp) {
     }
     L = C.L;
     L.n_kv = 3; expect("n_q not a multiple of n_kv", L, {{0, 0}});
-    L = C.L; L.head_dim = 80; expect("head_dim 80 (no built tile)", L, {{0, 0}});
+    L = C.L; L.head_dim = 96; expect("head_dim 96 (no built tile)", L, {{0, 0}});
     L = C.L; L.rel_dim = 32; expect("rel_dim 32", L, {{0, 0}});
     L = C.L; L.qk_norm = 1; L.q_norm_w = nullptr; expect("qk_norm without its weight", L, {{0, 0}});
     L = C.L; L.window = 5000; L.span = PULSAR_GQA_WINDOW; expect("a ring smaller than the window", L, {{0, 0}});
@@ -1116,22 +1116,6 @@ int main(int argc, char **argv) {
     case_init(ge, "encoder-full-rope", 32, 8, 128, 0, 600, false, 0, 0.f, 0.f, false, 1.0f / sqrtf(128.f), 600, 111);
     ge.R.rope_theta = 1e6f; ge.L.rope_theta = 1e6f;
     run_encoder(ge, 600);
-
-    /* L321: Nemotron Parse's RADIO ViT -- 16q/16kv heads of 72 stored padded to the 96 tile, no rope, scale
-     * 1/sqrt(72), one 600-row bidirectional run with no pool; a rope on the 96 tile is refused (its pairing needs a
-     * head_dim that is a multiple of 64) */
-    Case gv;
-    case_init(gv, "encoder-vit-96", 16, 16, 96, 0, 600, false, 0, 0.f, 0.f, false, 1.0f / sqrtf(72.f), 600, 113);
-    run_encoder(gv, 600);
-    {
-        Case gr96 = gv;
-        gr96.L.rope_theta = 1e4f;
-        gr96.L.block = 1;
-        Seq none{};
-        none.sid = 901;
-        std::vector<Seq *> v{&none};
-        check(run_call(gr96, v, {{0u, 0u}}, nullptr) == -1, "refused: a rope on the 96 tile");
-    }
 
     /* L321: the same with Ministral-3's YaRN rope (factor 16, original context 16384, beta_fast 32, beta_slow 1;
      * mscale = mscale_all_dim = 1, so transformers' attention factor is exactly 1): the per-pair table in transformers'
