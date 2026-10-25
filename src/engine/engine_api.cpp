@@ -1640,11 +1640,6 @@ int pulsar_session_checkpoint_best(pulsar_session *s, int limit) {
     const pulsar_ckpt_store *st = pulsar_session_kv_store(s);
     return st && st->ops ? (int)pulsar_ckpt_best(st, pulsar_session_live_bank(s), (uint32_t)limit) : 0;
 }
-int pulsar_session_bank_checkpoint_best(pulsar_session *s, uint32_t bank, int limit) {
-    if (!s || limit <= 0 || bank >= PULSAR_MSEQ_MAX) return 0;
-    const pulsar_ckpt_store *st = pulsar_session_kv_store(s);
-    return st && st->ops ? (int)pulsar_ckpt_best(st, bank, (uint32_t)limit) : 0;
-}
 int pulsar_session_bank_resume_at(pulsar_session *s, uint32_t bank, const pulsar_tokens *prompt) {
     if (!s || !prompt || prompt->len <= 0) return 0;
     const pulsar_tokens *t = pulsar_bank_history(s, bank);

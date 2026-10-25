@@ -172,12 +172,12 @@ struct constrain_tool {
     std::string schema;
 };
 
-/* The conversation's tools (conversation_tool_schema_lines: one function schema a line).  `any_strict`: some
- * tool says "strict": true. */
+/* The conversation's declared tools (conversation_declared_tool_schema_lines: one function schema a line, L325: the
+ * deferred ones too -- loaded in place, callable).  `any_strict`: some tool says "strict": true. */
 static bool constrain_tools(const chat_conversation *c, std::vector<constrain_tool> *out, bool *any_strict,
                             char *err, size_t errlen) {
     buf lines = {0};
-    conversation_tool_schema_lines(c, &lines);
+    conversation_declared_tool_schema_lines(c, &lines);
     *any_strict = false;
     bool ok = true;
     for (size_t at = 0; ok && at < lines.len;) {

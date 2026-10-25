@@ -108,6 +108,11 @@ struct inkling_render_out {
 /** Render.  false + "<refusal key>: detail" on refusal. */
 bool inkling_chat_render(const inkling_render_in &in, inkling_render_out *out, char *err, size_t errlen);
 
+/** L325: tool definitions in the tool_declare encoding (the canonical [{description, name, parameters, type}] array
+ *  the template's tool_declare message carries), for a tool loaded mid-conversation, rendered in place inside the
+ *  turn that loaded it.  `tools_json` is an OpenAI tools array.  Refusals: tool_declare_json's. */
+bool inkling_chat_tool_defs(const char *tools_json, inkling_render_out *out, char *err, size_t errlen);
+
 /* ---- the pieces a live conversation appends (the server's suffix hooks, the engine's chat front).  Each is
  * the full render's own writer, so the prompt so far + a piece == the full render of the longer conversation,
  * byte for byte (inkling-chat-gate S1). */

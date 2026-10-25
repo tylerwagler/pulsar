@@ -14,6 +14,8 @@
 #include "deepseek_dsml.h"
 #include "../lib/qwen_chat.h"
 
+#include <algorithm>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -22,6 +24,7 @@ void chat_conversation_free(chat_conversation *c) {
     chat_msgs_free(&c->msgs);
     free(c->tools_raw);
     free(c->tool_schemas);
+    free(c->deferred_tool_schemas);
     buf_free(&c->loaded_tool_schemas);
     free(c->tool_choice_wire);
     for (int i = 0; i < c->n_controls; i++) free(c->controls[i].raw);
@@ -413,18 +416,119 @@ static char *qwen_take_render(qwen_render_out *out, chat_text_span **spans_out, 
  * OpenAI request's array as sent (HF's / vLLM's input); else the conversation's schema lines -- every protocol's
  * kinds and tool_search's loads, as for DeepSeek (L284) -- in OpenAI's shape.  r->tools_json stays NULL when there
  * are none; false + err when the lines do not convert. */
-bool chat_openai_tools_json(const chat_conversation *c, request *r, char *err, size_t errlen) {
+bool chat_openai_tools_json(const chat_conversation *c, request *r, char **head_json, char *err, size_t errlen) {
+    *head_json = NULL;
     if (c->tool_choice == CHAT_TOOL_CHOICE_NONE) return true;
-    if (r->api == API_OPENAI && c->tools_raw) {
+    const bool deferred = c->deferred_tool_schemas && c->deferred_tool_schemas[0];
+    /* HF's input as sent -- unless some tool is deferred (L325), which only the schema lines separate */
+    if (r->api == API_OPENAI && c->tools_raw && !deferred) {
         r->tools_json = xstrdup(c->tools_raw);
+        *head_json = xstrdup(c->tools_raw);
         return true;
     }
-    buf lines = {0};
-    conversation_tool_schema_lines(c, &lines);
-    if (lines.len) r->tools_json = tool_schema_lines_openai_tools(lines.ptr, lines.len, err, errlen);
-    const bool failed = lines.len && !r->tools_json;
-    buf_free(&lines);
+    buf head = {0}, all = {0};
+    conversation_tool_schema_lines(c, &head);
+    conversation_declared_tool_schema_lines(c, &all);
+    if (all.len) r->tools_json = tool_schema_lines_openai_tools(all.ptr, all.len, err, errlen);
+    if (head.len && r->tools_json) *head_json = tool_schema_lines_openai_tools(head.ptr, head.len, err, errlen);
+    const bool failed = (all.len && !r->tools_json) || (head.len && !*head_json);
+    buf_free(&head);
+    buf_free(&all);
     return !failed;
+}
+
+/* ---- L325: a tool loaded mid-conversation renders where it was loaded ------------------------------------------- */
+
+/* DeepSeek's tools block lists the schema lines themselves (append_tools_prompt_text, "### Available Tool Schemas"):
+ * a loaded tool is its line. */
+static char *deepseek_tool_defs_text(const char *lines, size_t len, char *, size_t) { return xstrndup(lines, len); }
+
+/* Qwen's: the tools block's entries inside <tools></tools> (qwen_chat_tool_defs). */
+static char *qwen_tool_defs_text(const char *lines, size_t len, char *err, size_t errlen) {
+    char *json = tool_schema_lines_openai_tools(lines, len, err, errlen);
+    if (!json) return NULL;
+    qwen_render_out out;
+    const bool ok = qwen_chat_tool_defs(json, &out, err, errlen);
+    free(json);
+    return ok ? xstrndup(out.text.data(), out.text.size()) : NULL;
+}
+
+/* The deferred tool `name`'s schema line (malloc'd), or NULL when the request defers no tool of that name. */
+static char *deferred_tool_line(const chat_conversation *c, const char *name) {
+    for (const char *at = c->deferred_tool_schemas ? c->deferred_tool_schemas : ""; *at;) {
+        const char *nl = strchr(at, '\n');
+        const size_t len = nl ? (size_t)(nl - at) : strlen(at);
+        const std::string line(at, len);
+        at += len + (nl ? 1 : 0);
+        char *raw = json_object_member_raw(line.c_str(), "name");
+        const char *rp = raw;
+        char *got = NULL;
+        const bool hit = rp && json_string(&rp, &got) && !strcmp(got, name);
+        free(got);
+        free(raw);
+        if (hit) return xstrdup(line.c_str());
+    }
+    return NULL;
+}
+
+/* The pending definitions `lines` written to `out` in the family's encoding (nothing when there are none). */
+static bool flush_tool_defs(buf *out, buf *lines, const request *r, char *err, size_t errlen) {
+    if (!lines->len) return true;
+    char *text = r->family->tool_defs_text(lines->ptr, lines->len, err, errlen);
+    buf_free(lines);
+    if (!text) return false;
+    buf_puts(out, text);
+    free(text);
+    return true;
+}
+
+bool chat_expand_tool_refs(chat_conversation *c, const request *r, char *err, size_t errlen) {
+    for (int i = 0; i < c->msgs.len; i++) {
+        chat_msg *m = &c->msgs.v[i];
+        if (m->tool_refs_len == 0) continue;
+        const char *src = m->content ? m->content : "";
+        const size_t n = strlen(src);
+        buf out = {0};
+        size_t at = 0;
+        std::vector<size_t> moved(m->image_ph_off, m->image_ph_off + m->images_len);
+        for (int k = 0; k < m->tool_refs_len;) {
+            const size_t off = std::min(m->tool_ref_off[k], n);
+            buf_append(&out, src + at, off - at);
+            at = off;
+            const size_t before = out.len;
+            /* the run of references at this offset, in order; consecutive deferred ones are ONE block of definitions */
+            buf lines = {0};
+            for (; k < m->tool_refs_len && std::min(m->tool_ref_off[k], n) == off; k++) {
+                char *line = deferred_tool_line(c, m->tool_ref_name[k]);
+                if (line) {
+                    if (lines.len) buf_putc(&lines, '\n');
+                    buf_puts(&lines, line);
+                    free(line);
+                    continue;
+                }
+                if (!flush_tool_defs(&out, &lines, r, err, errlen)) {
+                    buf_free(&out);
+                    return false;
+                }
+                /* not deferred: the tools block already renders it (or nothing declares it) -- only the fact */
+                buf_printf(&out, "[tool available: %s]", m->tool_ref_name[k]);
+            }
+            if (!flush_tool_defs(&out, &lines, r, err, errlen)) {
+                buf_free(&out);
+                return false;
+            }
+            /* every image placeholder at or after the run moves by what it wrote */
+            for (int q = 0; q < m->images_len; q++)
+                if (m->image_ph_off[q] >= off) moved[(size_t)q] += out.len - before;
+        }
+        buf_append(&out, src + at, n - at);
+        for (int q = 0; q < m->images_len; q++) m->image_ph_off[q] = moved[(size_t)q];
+        free(m->content);
+        m->content = buf_take(&out);
+        if (!m->content) m->content = xstrdup("");
+        chat_msg_clear_tool_refs(m);
+    }
+    return true;
 }
 
 /* HF's apply_chat_template byte for byte (qwen_chat_render, with the L223 client-span map), tokenised
@@ -436,7 +540,9 @@ bool chat_openai_tools_json(const chat_conversation *c, request *r, char *err, s
  * array goes to the template as sent (HF's input). */
 static bool qwen_render(pulsar_engine *e, server *s, chat_conversation *c, request *r, char *err, size_t errlen) {
     const qwen_effort qe = (qwen_effort)r->family_effort;
-    if (!chat_openai_tools_json(c, r, err, errlen)) return false;
+    char *head_raw = NULL;
+    if (!chat_openai_tools_json(c, r, &head_raw, err, errlen)) return false;
+    const std::unique_ptr<char, void (*)(void *)> head(head_raw, free);
     r->has_tools = r->tools_json != NULL;
     render_prelude(s, c, r);
     std::vector<qwen_msg_in> qm;
@@ -445,7 +551,7 @@ static bool qwen_render(pulsar_engine *e, server *s, chat_conversation *c, reque
     std::vector<qwen_msg_images> imgs;
     if (!qwen_messages(&c->msgs, 0, false, &qm, &qc, &notes, &imgs, err, errlen)) return false;
     qwen_render_out out;
-    if (!qwen_chat_render({qm.data(), (int)qm.size(), r->tools_json, qe, true}, &out, err, errlen)) return false;
+    if (!qwen_chat_render({qm.data(), (int)qm.size(), head.get(), qe, true}, &out, err, errlen)) return false;
     free(r->prompt_spans);
     r->prompt_text = qwen_take_render(&out, &r->prompt_spans, &r->prompt_n_spans);
     /* A required call (OpenAI "required" or a named function, Anthropic "any" or "tool"): the turn is
@@ -759,6 +865,7 @@ static const server_family_ops k_family_deepseek_v41 = {
     /* .forced_call_prefill   = */ deepseek_forced_call_prefill,
     /* .grammar               = */ &k_grammar_deepseek_v41,
     /* .find_call_block       = */ find_next_dsml_tool_block,
+    /* .tool_defs_text        = */ deepseek_tool_defs_text,
 };
 static const server_family_ops k_family_deepseek_v4 = {
     /* .name                  = */ "DeepSeek V4 (0731)",
@@ -775,6 +882,7 @@ static const server_family_ops k_family_deepseek_v4 = {
     /* .forced_call_prefill   = */ deepseek_forced_call_prefill,
     /* .grammar               = */ &k_grammar_deepseek_v4,
     /* .find_call_block       = */ find_next_dsml_tool_block,
+    /* .tool_defs_text        = */ deepseek_tool_defs_text,
 };
 static const server_family_ops k_family_qwen = {
     /* .name                  = */ "Qwen",
@@ -791,6 +899,7 @@ static const server_family_ops k_family_qwen = {
     /* .forced_call_prefill   = */ qwen_forced_call_prefill,
     /* .grammar               = */ &k_grammar_qwen_xml,
     /* .find_call_block       = */ qwen_find_call_block,
+    /* .tool_defs_text        = */ qwen_tool_defs_text,
 };
 
 const server_family_ops *server_family_for_format(pulsar_chat_format fmt) {
@@ -826,5 +935,7 @@ bool render_chat_conversation(pulsar_engine *e, pulsar_chat_format fmt, server *
         !s->responses_validate_tool_outputs(&c->msgs, r->think_mode, &r->responses_requires_live_tool_state,
                                             &r->responses_requires_live_reasoning, err, errlen))
         return false;
+    /* L325: tool_reference blocks become their tools' definitions (or notices) before any render reads the messages */
+    if (!chat_expand_tool_refs(c, r, err, errlen)) return false;
     return r->family->render(e, s, c, r, err, errlen) && constrain_plan_build(e, s, c, r, err, errlen);
 }

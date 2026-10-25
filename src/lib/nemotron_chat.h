@@ -85,6 +85,11 @@ struct nemotron_render_out {
 /** Render.  false + "<refusal key>: detail" on refusal. */
 bool nemotron_chat_render(const nemotron_render_in &in, nemotron_render_out *out, char *err, size_t errlen);
 
+/** L325: tool definitions in the tools block's encoding -- "<tools>", one function element per tool, "\n</tools>"
+ *  (the block without its head and call-format tail) -- for a tool loaded mid-conversation, rendered in place
+ *  inside the turn that loaded it.  `tools_json` is an OpenAI tools array.  Refusal: tools_not_array. */
+bool nemotron_chat_tool_defs(const char *tools_json, nemotron_render_out *out, char *err, size_t errlen);
+
 /** The assistant turn `m` as the model SAMPLES it after the generation prompt -- the bytes the full render writes
  *  for the turn (it is after the last user message: nothing is truncated) past "<|im_start|>assistant\n<think>\n"
  *  with `thinking`, past "<|im_start|>assistant\n<think></think>" without: reasoning, "</think>", content (the turn

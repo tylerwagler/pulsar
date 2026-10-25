@@ -362,6 +362,16 @@ typedef struct {
      * results itself; DeepSeek's folds them back into the one user turn they arrived in
      * (anthropic_fold_tool_results). */
     bool anthropic_continues;
+    /** L325: the tool_reference blocks read into `content`, in order: each one's byte offset in `content` (where the
+     * block sat) and the tool it names.  A reference to a DEFERRED tool (defer_loading: true) is where that tool's
+     * definition renders -- the family's own encoding (server_family_ops::tool_defs_text), in place, never in the
+     * prompt's tools block -- so a tool loaded mid-conversation leaves every earlier byte as it was;
+     * chat_expand_tool_refs writes them into `content` before the family renders (any other name renders its
+     * notice).  Parallel arrays, owned. */
+    size_t *tool_ref_off;
+    char **tool_ref_name;
+    int tool_refs_len;
+    int tool_refs_cap;
 } chat_msg;
 
 /** A parsed conversation. */
@@ -587,6 +597,11 @@ typedef struct server_family_ops {
     /** Tool memory: the earliest complete tool-call block at or after `p` in a transcript's text
      *  (`*end` = one past it); NULL = none.  The block's bytes are the replay key. */
     const char *(*find_call_block)(const char *p, const char **end);
+    /** L325: tool definitions as the family's tools block encodes them, for a tool loaded mid-conversation (a
+     *  tool_reference to a deferred tool renders its definition IN PLACE, chat_expand_tool_refs): `lines` is one
+     *  function schema a line (parse_tools_value).  Required: every family declares tools.  malloc'd text, NULL +
+     *  err when the lines do not convert. */
+    char *(*tool_defs_text)(const char *lines, size_t len, char *err, size_t errlen);
 } server_family_ops;
 
 /* ---- L272 P3 steps 2-3: the family's OUTPUT PARSER ----------------------------------------------
@@ -657,9 +672,12 @@ extern const char *const k_effort_names[CHAT_EFFORT_NAMES];
 /* What every family's render shares (chat_family.cpp), for a table in its own file: */
 /** The tool memory and the protocols' live continuations, between the family's folding and its template. */
 void render_prelude(struct server *s, struct chat_conversation *c, struct request *r);
-/** The tools as OpenAI's array into r->tools_json, for a template that takes one (NULL = none, or tool_choice
- *  none); false + err when the conversation's schema lines do not convert. */
-bool chat_openai_tools_json(const struct chat_conversation *c, struct request *r, char *err, size_t errlen);
+/** The tools as OpenAI's array, for a template that takes one: r->tools_json = every DECLARED tool (the output
+ *  parser's: conversation_declared_tool_schema_lines), *head_json = the ones the template's tools block renders (L325:
+ *  without the deferred tools; malloc'd, NULL = none).  Both NULL for none or tool_choice none; false + err when the
+ *  conversation's schema lines do not convert. */
+bool chat_openai_tools_json(const struct chat_conversation *c, struct request *r, char **head_json, char *err,
+                            size_t errlen);
 /** After tokenising: each image's sentinel block where its placeholder sits (a text-only request untouched). */
 bool request_prepare_images(pulsar_engine *e, const chat_msgs *msgs, struct request *r, char *err, size_t errlen);
 
@@ -2863,6 +2881,10 @@ void tool_calls_push(tool_calls *calls, tool_call tc);
 void chat_msg_add_tool_call_id(chat_msg *m, const char *id);
 /** Attach an encoded image file (`bytes` taken) whose placeholder sits at `placeholder_off` in content. */
 void chat_msg_add_image(chat_msg *m, uint8_t *bytes, size_t len, size_t placeholder_off);
+/** L325: record a tool_reference to `name` at byte `off` of the message's content (chat_msg::tool_ref_off). */
+void chat_msg_add_tool_ref(chat_msg *m, size_t off, const char *name);
+/** L325: drop the message's tool_reference records (chat_expand_tool_refs has written them). */
+void chat_msg_clear_tool_refs(chat_msg *m);
 /** Fold each Anthropic message's parts back into the one user turn DeepSeek's template renders. */
 void anthropic_fold_tool_results(chat_msgs *msgs);
 void chat_msgs_free(chat_msgs *msgs);
@@ -2892,12 +2914,24 @@ size_t utf8_stream_safe_len(const char *s, size_t start,
 bool parse_stream_options(const char **p, bool *include_usage);
 void tool_schema_orders_add_json(tool_schema_orders *orders, const char *json);
 bool anthropic_tools_supported(const char *tools_json, char *err, size_t errlen);
-bool parse_tools_value(const char **p, char **out, tool_schema_orders *orders);
+/** The tools array as one function schema a line into `out` and its declared order into `orders`.  L325: with
+ *  `deferred`, a tool marked defer_loading: true goes there instead of `out` (still declared in `orders`); without
+ *  it every tool goes to `out`. */
+bool parse_tools_value(const char **p, char **out, tool_schema_orders *orders, char **deferred = NULL);
 struct chat_conversation;
 /** L284: every tool the conversation offers, one function schema a line -- the tools array (parse_tools_value,
  *  every protocol's dialect: functions, Responses namespaces and tool_search, Anthropic-shaped) then the schemas
  *  Responses input items loaded (tool_search output).  Appended to `out`; every family renders from this. */
 void conversation_tool_schema_lines(const struct chat_conversation *c, buf *out);
+/** L325: every tool the request DECLARES -- conversation_tool_schema_lines then the deferred tools (rendered in place
+ *  where a tool_reference loads them, not in the tools block): what the output parser and the grammar read. */
+void conversation_declared_tool_schema_lines(const struct chat_conversation *c, buf *out);
+/** L325: every tool_reference of the conversation written into its message (chat_msg::tool_ref_off): a run of
+ *  references at one offset naming deferred tools becomes ONE block of their definitions in the family's encoding
+ *  (r->family->tool_defs_text), any other name the "[tool available: NAME]" notice; image placeholders after it move
+ *  with it.  Run by render_chat_conversation before the family renders, so every render of the messages (the full
+ *  prompt, a live tail, a fold) reads the same bytes.  false + err when the family cannot encode them. */
+bool chat_expand_tool_refs(struct chat_conversation *c, const struct request *r, char *err, size_t errlen);
 /** L284: schema lines as an OpenAI tools array ([{"type":"function","function":{name, description, parameters}}]),
  *  for a template that renders OpenAI's shape (Qwen).  A line's parameters are `parameters` or, Anthropic-shaped,
  *  `input_schema`.  malloc'd; NULL + err when a line has no name. */
@@ -3037,6 +3071,10 @@ typedef struct chat_conversation {
     char *tools_raw;                ///< the tools array as sent; NULL when absent or null
     char *tool_schemas;             ///< the same tools, one function schema a line (parse_tools_value)
     buf loaded_tool_schemas;        ///< Responses: schemas carried by input items (tool_search output)
+    /** L325: the tools array's DEFERRED tools (defer_loading: true), one function schema a line: declared (callable,
+     *  typed for the parser and the grammar) but not rendered in the tools block; each renders where a tool_reference
+     *  names it (chat_msg::tool_ref_off).  NULL = none. */
+    char *deferred_tool_schemas;
     chat_tool_choice tool_choice;   ///< what the client asked of the tools
     char *tool_choice_wire;         ///< the choice as the client spelled it (for a refusal); NULL = named
     chat_control *controls;         ///< thinking / effort controls in arrival order, owned
