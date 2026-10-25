@@ -1509,28 +1509,28 @@ bad:
 
 
 
-/* Decode the `url` of an OpenAI image_url block.  Only an inline base64 data:
+/* Decode an inline image URL (the chat image_url block, /v1/parse).  Only an inline base64 data:
  * URL is accepted.  A remote http(s) URL is refused with a clear message: this
  * server does not fetch remote content, and quietly dropping the image is
  * exactly the silent-context loss this path exists to prevent.  Returns
  * malloc'd encoded-file bytes (PNG or JPEG) and sets `*len_out`, or NULL with
  * `err` set. */
-static uint8_t *decode_image_data_url(const char *url, size_t *len_out,
+uint8_t *server_decode_image_data_url(const char *url, size_t *len_out,
                                       char *err, size_t errlen) {
     *len_out = 0;
     if (!url || !url[0]) {
-        snprintf(err, errlen, "image_url.url is missing");
+        snprintf(err, errlen, "the image URL is missing");
         return NULL;
     }
     if (!strncmp(url, "http://", 7) || !strncmp(url, "https://", 8)) {
         snprintf(err, errlen,
-                 "image_url uses a remote http(s) URL, but this server does not fetch remote "
+                 "the image is a remote http(s) URL, but this server does not fetch remote "
                  "content; send the image inline as a base64 data: URL");
         return NULL;
     }
     static const char prefix[] = "data:";
     if (strncmp(url, prefix, sizeof(prefix) - 1)) {
-        snprintf(err, errlen, "image_url must be an inline base64 data: URL");
+        snprintf(err, errlen, "an image must be an inline base64 data: URL");
         return NULL;
     }
     const char *comma = strchr(url, ',');
@@ -1585,7 +1585,7 @@ bool server_add_image_block(chat_msg *msg, const char *url, buf *out,
         return false;
     }
     size_t n = 0;
-    uint8_t *bytes = decode_image_data_url(url, &n, err, errlen);
+    uint8_t *bytes = server_decode_image_data_url(url, &n, err, errlen);
     if (!bytes) return false;
     chat_msg_add_image(msg, bytes, n, out->len);
     buf_puts(out, PULSAR_IMAGE_PLACEHOLDER);

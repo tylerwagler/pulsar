@@ -8,7 +8,9 @@
  *   D1  the decode table: decode(HF's ids) == HF's text, byte for byte (the family's tokenizer contract);
  *   P1  pulsar_engine_parse_page on the PNG: the prompt is HF's, and the generated ids are compared with HF's --
  *       identical, or the first position they differ at -- and the text with HF's text;
- *   P2  a parse refuses a non-image and a prompt that is not the model's tokens, by name; a session is refused.
+ *       and stats.finished says whether the page ended on the eos;
+ *   P2  a parse refuses a non-image and a prompt that is not the model's tokens, by name (-2: the request's); a session
+ *       is refused.
  * Prints per page the image, the prefix, the tokens and the times (vision / prefill / decode); OUTDIR gets each page's
  * text as <stem>.raw.txt (for retriever/parse/grade_markdown.py).  PULSAR_PARSE_DUMP=DIR
  * writes the first page's stages for retriever/parse/grade_stages.py.  Exit 0 = D1 and P2 pass and every page parses;
@@ -121,6 +123,8 @@ int main(int argc, char **argv) {
             continue;
         }
         parsed++;
+        check(st.finished == (ids.len > 0 && ids.v[ids.len - 1] == (int)w->shape.eos), "%s: finished = %d",
+              stems[i].c_str(), (int)st.finished);
         size_t k = 0;
         while (k < (size_t)ids.len && k < R.size() && ids.v[k] == R[k]) k++;
         const bool eq = k == R.size() && k == (size_t)ids.len;
@@ -154,15 +158,15 @@ int main(int argc, char **argv) {
         pulsar_tokens ids = {};
         char *text = NULL, err[512] = "";
         const uint8_t junk[16] = {1, 2, 3};
-        check(pulsar_engine_parse_page(e, junk, sizeof junk, NULL, &ids, &text, NULL, err, sizeof err) != 0 && err[0],
-              "a non-image: %s", err);
+        check(pulsar_engine_parse_page(e, junk, sizeof junk, NULL, &ids, &text, NULL, err, sizeof err) == -2 && err[0],
+              "a non-image: -2, %s", err);
         std::string png;
         slurp(ref + "/" + stems[0] + ".png", &png);
         pulsar_parse_options po = {};
         po.prompt = "<s>hello";
         err[0] = 0;
         check(pulsar_engine_parse_page(e, (const uint8_t *)png.data(), png.size(), &po, &ids, &text, NULL, err,
-                                       sizeof err) != 0 && err[0], "a prompt that is not the model's tokens: %s", err);
+                                       sizeof err) == -2 && err[0], "a prompt that is not the model's tokens: -2, %s", err);
         pulsar_session *s = NULL;
         check(pulsar_session_create(&s, e, 4096) != 0 && !s, "a session is refused");
     }

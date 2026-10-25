@@ -3591,6 +3591,23 @@ int vision_image_grid(int width, int height, const pulsar_vision_args *args,
  * loudly on 0 rather than guessing at a format.  `*rgb_out` is malloc'd and the
  * caller owns it.  CMYK/YCCK JPEG is refused: Pillow keeps those in CMYK and its
  * own .convert("RGB") is a different transform from libjpeg's. */
+/** L321: the process's GPU phase lock.  The engines of a group (pulsar_engine_open_group) share one GPU, the fixed
+ *  GEMM's shapes and workspace and the encoders' scratch, so a single-call family (an encoder, a parser) runs its GPU
+ *  work in PHASES -- a packed encode forward, one ViT block, a page's prefill, one decode step -- each one a
+ *  pulsar_group_gpu_phase: the lock held, the device synchronised before it goes.  Phases of different engines
+ *  interleave; a phase is never shared, so whatever a phase leaves for the next lives in its engine's own buffers. */
+void pulsar_group_gpu_lock(void);
+void pulsar_group_gpu_unlock(void);
+struct pulsar_group_gpu_phase {
+    pulsar_group_gpu_phase() { pulsar_group_gpu_lock(); }
+    ~pulsar_group_gpu_phase() {
+        (void)pulsar_gpu_synchronize();   /* a failure surfaces at the phase's own next launch or read */
+        pulsar_group_gpu_unlock();
+    }
+    pulsar_group_gpu_phase(const pulsar_group_gpu_phase &) = delete;
+    pulsar_group_gpu_phase &operator=(const pulsar_group_gpu_phase &) = delete;
+};
+
 /** Pillow's resample filters the image paths use (L321: BILINEAR for Nemotron Parse). */
 typedef enum { PULSAR_PIL_BICUBIC = 0, PULSAR_PIL_BILINEAR = 1 } pulsar_pil_filter;
 /** Pillow's Image.resize(BICUBIC | BILINEAR) of packed RGB8 (ImagingResample, fixed-point, horizontal then vertical),

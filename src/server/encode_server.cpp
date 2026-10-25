@@ -1,11 +1,12 @@
-/* encode_server.cpp -- L321: pulsar-server for ENCODER engines (pulsar.h pulsar_engine_encode*).
+/* encode_server.cpp -- L321: pulsar-server for the SINGLE-CALL engines: encoders (pulsar.h pulsar_engine_encode*)
+ * and parsers (pulsar_engine_parse_page).
  *
- * An encoder has no session, no chat and no decode schedule, so it serves its own small surface beside none of the
- * decoder's machinery: one thread per connection, each request rendered, tokenized and encoded in one engine call
- * (the engines serialise their calls; a request's inputs ride one call, packed into its forwards).  One process may
- * serve several encoders (-m repeated: pulsar_engine_open_group, one GPU): a request goes to the engine of its
- * endpoint's kind -- an embedder for /v1/embeddings, a reranker for /v1/rerank -- and, when two engines share a
- * kind, the one its "model" names (with one, "model" is not read).
+ * Neither has a session, a chat or a decode schedule, so they serve their own small surface beside none of the
+ * decoder's machinery: one thread per connection, each request one engine call (a request's inputs ride one encode
+ * call, packed into its forwards; a page is one parse call).  One process may serve several (-m repeated:
+ * pulsar_engine_open_group, one GPU, the engines taking turns a GPU phase at a time): a request goes to the engine of
+ * its endpoint's kind -- an embedder for /v1/embeddings, a reranker for /v1/rerank, a parser for /v1/parse -- and,
+ * when two engines share a kind, the one its "model" names (with one, "model" is not read).
  *
  *   GET  /health, /healthz, /ping, /v1/models
  *   POST /v1/embeddings   (an embedder; OpenAI's shape)
@@ -20,6 +21,13 @@
  *        -> {"model": id, "results": [{"index": i, "relevance_score": s [, "document": {"text": ..}]}, ...],
  *            "usage": {"total_tokens": n}}   results best first; s = sigmoid(the head's logit) -- a score in (0, 1)
  *            as the shape's clients threshold it -- or the logit itself with raw_scores.
+ *   POST /v1/parse   (a parser: one page image in, the model's text out)
+ *        {"image": "data:image/png;base64,..." (PNG or JPEG, inline), "prompt": the task's added tokens (default the
+ *         model's own), "max_tokens": n (default the model's), "return_ids": bool, "model": any}
+ *        -> {"object": "parse", "model": id, "text": the decode of the prompt and the generated tokens (the model's
+ *            markup, special tokens kept: the checkpoint's postprocessing reads it), "finish_reason": "stop" | "length",
+ *            ["ids": [...]], "image": {"width": w, "height": h}, "usage": {"prompt_tokens", "completion_tokens",
+ *            "total_tokens"}, "timings": {"vision_ms", "prefill_ms", "decode_ms"}}
  * An input longer than the model's cap (pulsar_engine_encode_max_tokens) is refused (400) unless truncate is END,
  * which keeps its first cap tokens. */
 #include "pulsar_server_internal.h"
@@ -36,10 +44,13 @@ namespace {
 /** Inputs one request may carry. */
 constexpr size_t ENC_INPUTS_MAX = 2048;
 
+/** What an engine serves: the encoder kinds' values (pulsar_encoder_kind) and the parser. */
+enum srv_kind { K_EMBED = PULSAR_ENCODER_EMBED, K_RERANK = PULSAR_ENCODER_RERANK, K_PARSE, K_COUNT };
+
 struct enc_ctx {
     pulsar_engine *e;
-    pulsar_encoder_kind kind;
-    uint32_t dim, cap;
+    srv_kind kind;
+    uint32_t dim, cap;   ///< an encoder's
     const char *id;
 };
 
@@ -270,8 +281,80 @@ void rerank(const enc_ctx *c, int fd, const pyjson_value &o) {
     send_json(fd, &b);
 }
 
-const char *kind_name(pulsar_encoder_kind k) { return k == PULSAR_ENCODER_EMBED ? "embed" : "rerank"; }
-const char *kind_path(pulsar_encoder_kind k) { return k == PULSAR_ENCODER_EMBED ? "/v1/embeddings" : "/v1/rerank"; }
+void parse(const enc_ctx *c, int fd, const pyjson_value &o) {
+    const pyjson_value *im = o.get("image");
+    if (!im || im->kind != pyjson_value::STR) {
+        http_error(fd, 400, "\"image\" must be an inline base64 data: URL (data:image/png;base64,...)");
+        return;
+    }
+    const std::string *prompt = NULL;
+    if (!opt_str(o, "prompt", &prompt)) {
+        http_error(fd, 400, "\"prompt\" must be a string (the model's added tokens, back to back)");
+        return;
+    }
+    uint32_t max_new = 0;
+    if (const pyjson_value *k = o.get("max_tokens")) {
+        if (k->kind != pyjson_value::INT || k->num[0] == '-' || k->num == "0" || k->num.size() > 9) {
+            http_error(fd, 400, "\"max_tokens\" must be a positive integer");
+            return;
+        }
+        max_new = (uint32_t)strtoul(k->num.c_str(), NULL, 10);
+    }
+    bool return_ids = false;
+    if (const pyjson_value *v = o.get("return_ids")) {
+        if (v->kind != pyjson_value::BOOL) {
+            http_error(fd, 400, "\"return_ids\" must be a boolean");
+            return;
+        }
+        return_ids = v->b;
+    }
+    char why[512];
+    size_t n = 0;
+    uint8_t *bytes = server_decode_image_data_url(im->s.c_str(), &n, why, sizeof why);
+    if (!bytes) {
+        http_error(fd, 400, why);
+        return;
+    }
+    pulsar_parse_options po = {prompt ? prompt->c_str() : NULL, max_new};
+    pulsar_tokens ids = {};
+    char *text = NULL;
+    pulsar_parse_stats st = {};
+    const int rc = pulsar_engine_parse_page(c->e, bytes, n, &po, &ids, &text, &st, why, sizeof why);
+    free(bytes);
+    if (rc != 0) {
+        pulsar_tokens_free(&ids);
+        http_error(fd, rc == -2 ? 400 : 500, why);
+        return;
+    }
+    buf b = {0};
+    buf_puts(&b, "{\"object\":\"parse\",\"model\":");
+    json_escape(&b, c->id);
+    buf_puts(&b, ",\"text\":");
+    json_escape(&b, text);
+    buf_printf(&b, ",\"finish_reason\":\"%s\"", st.finished ? "stop" : "length");
+    if (return_ids) {
+        buf_puts(&b, ",\"ids\":[");
+        for (int i = 0; i < ids.len; i++) buf_printf(&b, i ? ",%d" : "%d", ids.v[i]);
+        buf_putc(&b, ']');
+    }
+    buf_printf(&b, ",\"image\":{\"width\":%u,\"height\":%u},\"usage\":{\"prompt_tokens\":%u,\"completion_tokens\":%u,"
+                   "\"total_tokens\":%u},\"timings\":{\"vision_ms\":%.1f,\"prefill_ms\":%.1f,\"decode_ms\":%.1f}}\n",
+               st.image_w, st.image_h, st.prompt_tokens, st.generated_tokens, st.prompt_tokens + st.generated_tokens,
+               st.vision_ms, st.prefill_ms, st.decode_ms);
+    free(text);
+    pulsar_tokens_free(&ids);
+    send_json(fd, &b);
+}
+
+const char *kind_name(srv_kind k) { return k == K_EMBED ? "embed" : k == K_RERANK ? "rerank" : "parse"; }
+const char *kind_path(srv_kind k) { return k == K_EMBED ? "/v1/embeddings" : k == K_RERANK ? "/v1/rerank" : "/v1/parse"; }
+/* the endpoint a POST path names, K_COUNT for none */
+srv_kind path_kind(const char *p) {
+    return !strcmp(p, "/v1/embeddings") ? K_EMBED
+           : !strcmp(p, "/v1/rerank") || !strcmp(p, "/rerank") ? K_RERANK
+           : !strcmp(p, "/v1/parse") ? K_PARSE
+                                      : K_COUNT;
+}
 
 void health(const enc_server *srv, int fd) {
     buf b = {0};
@@ -280,8 +363,10 @@ void health(const enc_server *srv, int fd) {
         const enc_ctx &c = srv->m[i];
         buf_puts(&b, i ? ",{\"model\":" : "{\"model\":");
         json_escape(&b, c.id);
-        buf_printf(&b, ",\"encoder\":\"%s\",\"dim\":%u,\"max_tokens\":%u,\"endpoint\":\"%s\"}", kind_name(c.kind), c.dim,
-                   c.cap, kind_path(c.kind));
+        if (c.kind == K_PARSE) buf_printf(&b, ",\"parser\":true,\"endpoint\":\"%s\"}", kind_path(c.kind));
+        else
+            buf_printf(&b, ",\"encoder\":\"%s\",\"dim\":%u,\"max_tokens\":%u,\"endpoint\":\"%s\"}", kind_name(c.kind),
+                       c.dim, c.cap, kind_path(c.kind));
     }
     buf_puts(&b, "]}\n");
     send_json(fd, &b);
@@ -300,7 +385,7 @@ void models(const enc_server *srv, int fd) {
 }
 
 /* the engine a request for `kind` goes to: the only one of that kind, else the one its "model" names; NULL + `err` */
-const enc_ctx *route(const enc_server *srv, pulsar_encoder_kind kind, const pyjson_value &o, std::string *err) {
+const enc_ctx *route(const enc_server *srv, srv_kind kind, const pyjson_value &o, std::string *err) {
     std::vector<const enc_ctx *> of;
     for (const enc_ctx &c : srv->m)
         if (c.kind == kind) of.push_back(&c);
@@ -320,7 +405,7 @@ void *client(void *arg) {
     const int fd = a->fd;
     free(a);
     http_request hr = {};
-    bool has[3] = {};
+    bool has[K_COUNT] = {};
     for (const enc_ctx &c : srv->m) has[c.kind] = true;
     if (!read_http_request(fd, &hr)) {
         http_error(fd, 400, "bad HTTP request");
@@ -330,10 +415,8 @@ void *client(void *arg) {
         http_response(fd, 200, "text/plain", "ok\n");
     } else if (!strcmp(hr.method, "GET") && !strcmp(hr.path, "/v1/models")) {
         models(srv, fd);
-    } else if (!strcmp(hr.method, "POST") &&
-               ((has[PULSAR_ENCODER_EMBED] && !strcmp(hr.path, "/v1/embeddings")) ||
-                (has[PULSAR_ENCODER_RERANK] && (!strcmp(hr.path, "/v1/rerank") || !strcmp(hr.path, "/rerank"))))) {
-        const pulsar_encoder_kind kind = !strcmp(hr.path, "/v1/embeddings") ? PULSAR_ENCODER_EMBED : PULSAR_ENCODER_RERANK;
+    } else if (!strcmp(hr.method, "POST") && path_kind(hr.path) != K_COUNT && has[path_kind(hr.path)]) {
+        const srv_kind kind = path_kind(hr.path);
         pyjson_value o;
         char err[256];
         std::string why;
@@ -344,14 +427,15 @@ void *client(void *arg) {
             http_error(fd, 400, why.c_str());
         } else {
             const double t0 = server_now_sec();
-            if (kind == PULSAR_ENCODER_EMBED) embeddings(c, fd, o);
-            else rerank(c, fd, o);
+            if (kind == K_EMBED) embeddings(c, fd, o);
+            else if (kind == K_RERANK) rerank(c, fd, o);
+            else parse(c, fd, o);
             server_log(PULSAR_LOG_DEFAULT, "pulsar-server: %s %s %.0f ms", hr.path, c->id, (server_now_sec() - t0) * 1e3);
         }
     } else {
         std::string eps;
-        if (has[PULSAR_ENCODER_EMBED]) eps += "POST /v1/embeddings, ";
-        if (has[PULSAR_ENCODER_RERANK]) eps += "POST /v1/rerank, ";
+        for (int k = 0; k < K_COUNT; k++)
+            if (has[k]) eps += std::string("POST ") + kind_path((srv_kind)k) + ", ";
         http_error(fd, 404, ("this server serves " + eps + "GET /v1/models and /health").c_str());
     }
     http_request_free(&hr);
@@ -369,8 +453,8 @@ int encode_serve(pulsar_engine *const *engines, int n, const server_config *cfg)
     enc_server srv;
     for (int i = 0; i < n; i++) {
         pulsar_engine *e = engines[i];
-        srv.m.push_back({e, pulsar_engine_encoder(e), pulsar_engine_encode_dim(e), pulsar_engine_encode_max_tokens(e),
-                         pulsar_engine_served_model_id(e)});
+        srv.m.push_back({e, pulsar_engine_is_parser(e) ? K_PARSE : (srv_kind)pulsar_engine_encoder(e),
+                         pulsar_engine_encode_dim(e), pulsar_engine_encode_max_tokens(e), pulsar_engine_served_model_id(e)});
         for (int j = 0; j < i; j++)
             if (!strcmp(srv.m[j].id, srv.m[i].id)) {
                 server_log(PULSAR_LOG_DEFAULT, "pulsar-server: two models serve as %s (-m %s and -m %s): a request "
@@ -386,8 +470,10 @@ int encode_serve(pulsar_engine *const *engines, int n, const server_config *cfg)
     }
     g_listen_fd = lfd;
     for (const enc_ctx &c : srv.m)
-        server_log(PULSAR_LOG_DEFAULT, "pulsar-server: %s: %s, POST %s (%u floats an input, inputs up to %u tokens)", c.id,
-                   c.kind == PULSAR_ENCODER_EMBED ? "embedder" : "reranker", kind_path(c.kind), c.dim, c.cap);
+        if (c.kind == K_PARSE) server_log(PULSAR_LOG_DEFAULT, "pulsar-server: %s: parser, POST %s", c.id, kind_path(c.kind));
+        else
+            server_log(PULSAR_LOG_DEFAULT, "pulsar-server: %s: %s, POST %s (%u floats an input, inputs up to %u tokens)",
+                       c.id, c.kind == K_EMBED ? "embedder" : "reranker", kind_path(c.kind), c.dim, c.cap);
     server_log(PULSAR_LOG_DEFAULT, "pulsar-server: listening on http://%s:%d (pulsar %s)", cfg->host, cfg->port,
                PULSAR_VERSION_STR);
     while (!g_stop_requested) {

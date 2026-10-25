@@ -45,6 +45,8 @@
 #include <pthread.h>
 #include <time.h>
 
+#include <optional>
+
 namespace {
 
 const char *const ARCH = PULSAR_NEMOTRON_PARSE_ARCH;
@@ -76,7 +78,7 @@ struct pulsar_nemotron_parse_run {
     const float *cls_rows;     ///< f32 [n_cls][vit_width] (the mapping's)
     uint32_t pos_h, pos_w, pos_ch, pos_cw;   ///< the cached position rows' geometry
     std::vector<float> pos_rows;             ///< f32 [patches][vit_width]
-    pthread_mutex_t mu;
+    pthread_mutex_t mu;                      ///< one page at a time on this engine (its KV spans the steps)
 };
 
 namespace {
@@ -156,6 +158,9 @@ bool tower(ctx &c, const pulsar_nemotron_parse_page &pg, uint32_t n_patch) {
         pulsar_nemotron_parse_positions(&s, w->pos_field, pg.h, pg.w, pg.ch, pg.cw, &r->pos_rows);
         r->pos_h = pg.h; r->pos_w = pg.w; r->pos_ch = pg.ch; r->pos_cw = pg.cw;
     }
+    /* phases (pulsar_group_gpu_phase): the seed through the first LayerNorm, each block, the output's rows */
+    std::optional<pulsar_group_gpu_phase> ph;
+    ph.emplace();
     if (!pulsar_gpu_tensor_write(r->t[B_RES], 0, r->cls_rows, (uint64_t)NC * D * 4u) ||
         !pulsar_gpu_tensor_write(r->t[B_RES], (uint64_t)NC * D * 4u, r->pos_rows.data(), (uint64_t)n_patch * D * 4u) ||
         !pulsar_gpu_tensor_write(r->t[B_PATCH], 0, pg.patches.data(), (uint64_t)n_patch * P * 2u))
@@ -173,6 +178,8 @@ bool tower(ctx &c, const pulsar_nemotron_parse_page &pg, uint32_t n_patch) {
         return fail(c.err, c.errlen, "the first LayerNorm refused");
     const float scale = 1.0f / sqrtf((float)HD);
     for (uint32_t il = 0; il < s.vit_depth; il++) {
+        ph.reset();
+        ph.emplace();
         const pulsar_nemotron_parse_vit_block &B = w->vit[il];
         for (uint32_t r0 = 0; r0 < N; r0 += NP_CHUNK) {
             const uint32_t m = N - r0 < NP_CHUNK ? N - r0 : NP_CHUNK;
@@ -205,6 +212,8 @@ bool tower(ctx &c, const pulsar_nemotron_parse_page &pg, uint32_t n_patch) {
         }
         if (il == 13) c.put("vit_mid", r->t[B_RES], N, D);
     }
+    ph.reset();
+    ph.emplace();
     c.put("vit_out", r->t[B_RES], N, D);
     /* the neck reads the tower's output as f16 rows (its Linears' operand), into xn */
     if (pulsar_rows_bias_emit_launch(res, D, N, D, NULL, PULSAR_ROWS_ACT_NONE, xn, D, F16, 0) != 0)
@@ -361,31 +370,39 @@ int parse(pulsar_engine *e, const uint8_t *image, size_t len, const pulsar_parse
     pulsar_parse_stats st = {};
     std::vector<int> prompt = w->prompt_ids;
     if (opt && opt->prompt && !pulsar_nemotron_parse_encode_prompt(w->vocab, opt->prompt, &prompt, err, errlen))
-        return -1;
+        return -2;
     if (prompt.size() > NP_PROMPT_MAX) {
         if (err) snprintf(err, errlen, "%s: a prompt of %zu tokens (at most %u)", ARCH, prompt.size(), NP_PROMPT_MAX);
-        return -1;
+        return -2;
     }
     const double t0 = now_ms();
     pulsar_nemotron_parse_page pg;
-    if (!pulsar_nemotron_parse_page_prepare(&s, image, len, &pg, err, errlen)) return -1;
+    if (!pulsar_nemotron_parse_page_prepare(&s, image, len, &pg, err, errlen)) return -2;
     const uint32_t n_patch = (pg.h / s.patch) * (pg.w / s.patch);
     st.image_w = pg.cw;
     st.image_h = pg.ch;
     pthread_mutex_lock(&r->mu);
     uint32_t n_prefix = 0;
     bool ok = n_patch + s.n_cls <= r->n_max || fail(err, errlen, "the page is larger than the canvas");
-    ok = ok && tower(c, pg, n_patch) && neck(c, n_patch, &n_prefix);
-    (void)pulsar_gpu_synchronize();
+    /* the GPU work in the group's phases (pulsar_group_gpu_phase): the tower's (its own), the neck, the prefill, each
+     * decode step; the engine's own lock (r->mu) holds the page's buffers and KV across them */
+    ok = ok && tower(c, pg, n_patch);
+    {
+        pulsar_group_gpu_phase ph;
+        ok = ok && neck(c, n_patch, &n_prefix);
+    }
     const double t1 = now_ms();
     std::vector<int> seq = prompt;
     std::vector<float> logits(s.vocab);
     std::vector<uint8_t> seen(s.vocab, 0);
-    ok = ok && gather(c, prompt.data(), (uint32_t)prompt.size(), n_prefix) &&
-         decoder(c, 0, n_prefix + (uint32_t)prompt.size(), true) &&
-         (pulsar_gpu_tensor_read(r->t[B_LOGITS], 0, logits.data(), (uint64_t)s.vocab * 4u) ||
-          fail(err, errlen, "the logits' read failed"));
-    if (ok) c.put("logits0", r->t[B_LOGITS], 1, s.vocab);
+    {
+        pulsar_group_gpu_phase ph;
+        ok = ok && gather(c, prompt.data(), (uint32_t)prompt.size(), n_prefix) &&
+             decoder(c, 0, n_prefix + (uint32_t)prompt.size(), true) &&
+             (pulsar_gpu_tensor_read(r->t[B_LOGITS], 0, logits.data(), (uint64_t)s.vocab * 4u) ||
+              fail(err, errlen, "the logits' read failed"));
+        if (ok) c.put("logits0", r->t[B_LOGITS], 1, s.vocab);
+    }
     const double t2 = now_ms();
     const uint32_t max_new = opt && opt->max_new_tokens ? opt->max_new_tokens : s.max_new;
     uint32_t n_new = 0;
@@ -395,6 +412,7 @@ int parse(pulsar_engine *e, const uint8_t *image, size_t len, const pulsar_parse
         n_new++;
         const uint32_t pos = n_prefix + (uint32_t)seq.size() - 1u;
         if ((uint32_t)tok == s.eos || n_new >= max_new || pos + 1u >= s.max_seq) break;
+        pulsar_group_gpu_phase ph;
         ok = gather(c, &tok, 1, 0) && decoder(c, pos, 1, false) &&
              (pulsar_gpu_tensor_read(r->t[B_LOGITS], 0, logits.data(), (uint64_t)s.vocab * 4u) ||
               fail(err, errlen, "the logits' read failed"));
@@ -410,6 +428,7 @@ int parse(pulsar_engine *e, const uint8_t *image, size_t len, const pulsar_parse
     st.prefix_rows = n_prefix;
     st.prompt_tokens = (uint32_t)prompt.size();
     st.generated_tokens = n_new;
+    st.finished = (uint32_t)seq.back() == s.eos;
     st.vision_ms = t1 - t0;
     st.prefill_ms = t2 - t1;
     st.decode_ms = t3 - t2;

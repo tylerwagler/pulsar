@@ -640,7 +640,8 @@ int main(int argc, char **argv) {
     cfg.engine.build_id = PULSAR_VERSION_STR;
 
     pulsar_engine *engine = NULL;
-    /* L321: several -m: one engine group (one process, one GPU) -- encoders only, served by their own endpoints */
+    /* L321: several -m: one engine group (one process, one GPU) -- encoders and parsers, served by their own
+     * endpoints */
     if (cfg.n_models > 1) {
         pulsar_engine_options opts[SERVER_MODELS_MAX];
         pulsar_engine *engines[SERVER_MODELS_MAX] = {};
@@ -651,9 +652,9 @@ int main(int argc, char **argv) {
         if (pulsar_engine_open_group(engines, opts, (uint32_t)cfg.n_models) != 0) return 1;
         int rc = 0;
         for (int i = 0; i < cfg.n_models; i++)
-            if (pulsar_engine_encoder(engines[i]) == PULSAR_ENCODER_NONE) {
+            if (pulsar_engine_encoder(engines[i]) == PULSAR_ENCODER_NONE && !pulsar_engine_is_parser(engines[i])) {
                 server_log(PULSAR_LOG_DEFAULT, "pulsar-server: %s is a %s model; a server with several models serves "
-                           "encoders only (a chat model serves alone) -- refusing", cfg.models[i],
+                           "encoders and parsers only (a chat model serves alone) -- refusing", cfg.models[i],
                            pulsar_engine_family_name(engines[i]));
                 rc = 1;
             }
@@ -672,8 +673,8 @@ int main(int argc, char **argv) {
         pulsar_engine_close(engine);
         return wrc;
     }
-    /* L321: an encoder serves its own endpoints (no session, no chat, no scheduler) */
-    if (pulsar_engine_encoder(engine) != PULSAR_ENCODER_NONE) {
+    /* L321: an encoder or a parser serves its own endpoints (no session, no chat, no scheduler) */
+    if (pulsar_engine_encoder(engine) != PULSAR_ENCODER_NONE || pulsar_engine_is_parser(engine)) {
         const int rc = encode_serve(&engine, 1, &cfg);
         pulsar_engine_close(engine);
         free(tp_kv_dir);

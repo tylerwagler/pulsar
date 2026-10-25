@@ -313,7 +313,7 @@ bool pulsar_engine_encode_render(pulsar_engine *e, pulsar_encode_role role, cons
                                  pulsar_tokens *out, char *err, size_t errlen);
 /** Encode n rendered inputs: out [n][pulsar_engine_encode_dim] floats.  Each input's result is the same bytes
  *  whatever else rides in the call (the forward is row-independent outside attention, and attention stays inside
- *  its input).  Calls are serialised across the process's encoders (they share one scratch).  0, or -1 + `err` (an empty or over-long input, a decoder
+ *  its input).  A group's encoders and parsers take turns on the GPU a forward at a time (they share one scratch).  0, or -1 + `err` (an empty or over-long input, a decoder
  *  family, a device failure). */
 int pulsar_engine_encode(pulsar_engine *e, const pulsar_tokens *inputs, uint32_t n, float *out, char *err,
                          size_t errlen);
@@ -321,7 +321,8 @@ int pulsar_engine_encode(pulsar_engine *e, const pulsar_tokens *inputs, uint32_t
 /* ---- parsers (L321) -------------------------------------------------------------------------------------------------
  * A PARSER family's model reads a page image and writes its text (Nemotron Parse: markdown with classes and boxes in
  * the model's own markup): no session, no chat -- one call, one page, generated greedily by the model's own recipe.
- * Calls are serialised on the engine.  A family without a parser refuses by name. */
+ * Calls are serialised on the engine; between its GPU phases (the vision, the prefill, each decode step) the group's
+ * other engines run theirs, so an encode waits a step, not a page.  A family without a parser refuses by name. */
 typedef struct {
     const char *prompt;        ///< the task prompt (the model's added tokens, back to back); NULL = the model's default
     uint32_t max_new_tokens;   ///< 0 = the model's default
@@ -331,6 +332,7 @@ typedef struct {
     uint32_t image_w, image_h;     ///< the image as decoded
     uint32_t prefix_rows;          ///< the visual prefix the page became
     uint32_t prompt_tokens, generated_tokens;
+    bool finished;                 ///< the model ended the page (its eos), not a cap
     double vision_ms, prefill_ms, decode_ms;
 } pulsar_parse_stats;
 
@@ -338,7 +340,8 @@ typedef struct {
 bool pulsar_engine_is_parser(const pulsar_engine *e);
 /** Parse one page (`image`: PNG or JPEG bytes).  `ids` (appended): the whole sequence, prompt and generated, eos
  *  included when reached; `*text`: its decode (malloc'd; the model's tokenizer, special tokens kept); `stats` may be
- *  NULL.  0, or -1 + `err` (an image the model does not take, a prompt that is not its tokens, a device failure). */
+ *  NULL.  0; -2 + `err`: the request refused (an image the model does not take, a prompt that is not its tokens);
+ *  -1 + `err`: the engine failed (a device failure). */
 int pulsar_engine_parse_page(pulsar_engine *e, const uint8_t *image, size_t len, const pulsar_parse_options *opt,
                              pulsar_tokens *ids, char **text, pulsar_parse_stats *stats, char *err, size_t errlen);
 
