@@ -13,9 +13,10 @@
 //              8x finer than the bf16 row it came from (exllamav3's and TensorFold's operand; a second
 //              "lo" plane doubled the GEMM for precision the input does not carry).
 //   3. GEMM    one cuBLASLt tensor-core GEMM, Z = X W_q, f32 accumulate and output -- a row's bytes
-//              independent of how many rows share the call (L266): the reduction scheme pinned to NONE
-//              and ONE algorithm per (K, N), chosen at the production prefill chunk's row count and
-//              checked to support each other row count (an unsupported one refuses).
+//              independent of how many rows share the call (L266): the fixed-algorithm GEMM
+//              (pulsar_cuda_lt_fixed.h, L321: the contract now shared with the f16 rows arm) -- the
+//              reduction scheme pinned to NONE and ONE algorithm per (K, N), chosen at the production
+//              prefill chunk's row count and checked to support each other row count.
 //              cublasGemmEx(CUBLAS_GEMM_DEFAULT) sat here and picked a kernel (and split-K) by M, so a
 //              prompt cut at G got different bytes from the same prompt prefilled whole --
 //              the chunk-neutrality gate (now tests/session_contract_gate) measured 1-2 nats of logit difference.  DeepSeek's bf16
@@ -30,8 +31,7 @@
 #include "engine/exl3_trellis.h"
 
 #include <cstdio>
-#include <cublasLt.h>
-#include "pulsar.h"   /* PULSAR_PREFILL_CHUNK_DEFAULT: the canonical row count */
+#include "cuda/pulsar_cuda_lt_fixed.h"
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 
@@ -130,99 +130,6 @@ dense_epilogue_kernel(float *__restrict__ y, const float *__restrict__ tail, con
 
 uint8_t *g_scratch = nullptr;
 size_t g_scratch_bytes = 0;
-cublasLtHandle_t g_lt = nullptr;
-constexpr size_t kLtWorkspace = 32u << 20;
-constexpr int kCanonRows = (int)PULSAR_PREFILL_CHUNK_DEFAULT;
-
-/* ONE algorithm per weight shape (K, N), chosen at kCanonRows with split-K excluded */
-struct lt_shape {
-    int K, N;
-    bool valid;
-    cublasLtMatmulDesc_t op;
-    cublasLtMatrixLayout_t la;
-    cublasLtMatmulAlgo_t algo;
-};
-/* per (shape, M, output columns n, output ld): the call's layouts -- A the shape's W_q columns [0, n) (ld the
- * stored N), B the M rows, D [M][n] at ld -- and the check that the shape's algorithm supports them.  n = N, ld = N
- * is the whole GEMM; a logical width short of the stored one (L295 F7) runs the 128-multiple head of the columns into
- * y (ld the logical width) and the last stored block into the tail scratch (ld 128), each with the shape's one
- * algorithm, so every column is the arithmetic the whole GEMM gives it. */
-struct lt_call {
-    int K, N, M, n, ldd;
-    bool valid;
-    cublasLtMatrixLayout_t la, lb, ld;
-};
-lt_shape g_shapes[16];
-int g_shapes_next;
-lt_call g_calls[64];
-int g_calls_next;
-
-/* column-major view: Y^T (N x M, ld N) = W_q^T (N x K, ld N) . X^T (K x M, ld K) */
-const lt_shape *lt_shape_for(int K, int N, const char *tag) {
-    for (lt_shape &sh : g_shapes)
-        if (sh.valid && sh.K == K && sh.N == N) return &sh;
-    lt_shape ns = {};
-    ns.K = K; ns.N = N;
-    if (cublasLtMatmulDescCreate(&ns.op, CUBLAS_COMPUTE_32F, CUDA_R_32F) != CUBLAS_STATUS_SUCCESS) return nullptr;
-    cublasLtMatrixLayoutCreate(&ns.la, CUDA_R_16F, N, K, N);
-    cublasLtMatrixLayout_t lb, ld;
-    cublasLtMatrixLayoutCreate(&lb, CUDA_R_16F, K, kCanonRows, K);
-    cublasLtMatrixLayoutCreate(&ld, CUDA_R_32F, N, kCanonRows, N);
-    cublasLtMatmulPreference_t pf;
-    cublasLtMatmulPreferenceCreate(&pf);
-    cublasLtMatmulPreferenceSetAttribute(pf, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &kLtWorkspace, sizeof(kLtWorkspace));
-    const uint32_t red = CUBLASLT_REDUCTION_SCHEME_NONE;
-    cublasLtMatmulPreferenceSetAttribute(pf, CUBLASLT_MATMUL_PREF_REDUCTION_SCHEME_MASK, &red, sizeof(red));
-    cublasLtMatmulHeuristicResult_t hr;
-    int got = 0;
-    const cublasStatus_t hs = cublasLtMatmulAlgoGetHeuristic(g_lt, ns.op, ns.la, lb, ld, ld, pf, 1, &hr, &got);
-    cublasLtMatmulPreferenceDestroy(pf);
-    cublasLtMatrixLayoutDestroy(lb);
-    cublasLtMatrixLayoutDestroy(ld);
-    if (hs != CUBLAS_STATUS_SUCCESS || !got) {
-        cublasLtMatrixLayoutDestroy(ns.la);
-        cublasLtMatmulDescDestroy(ns.op);
-        fprintf(stderr, "%s: no fixed-order cuBLASLt kernel for K=%d N=%d at %d rows -- refusing\n", tag, K, N, kCanonRows);
-        return nullptr;
-    }
-    ns.algo = hr.algo;
-    ns.valid = true;
-    lt_shape &slot = g_shapes[g_shapes_next];
-    g_shapes_next = (g_shapes_next + 1) & 15;
-    if (slot.valid) { cublasLtMatrixLayoutDestroy(slot.la); cublasLtMatmulDescDestroy(slot.op); }
-    slot = ns;
-    return &slot;
-}
-
-const lt_call *lt_call_for(const lt_shape &sh, int M, int n, int ldd, const char *tag) {
-    for (lt_call &c : g_calls)
-        if (c.valid && c.K == sh.K && c.N == sh.N && c.M == M && c.n == n && c.ldd == ldd) return &c;
-    lt_call nc = {};
-    nc.K = sh.K; nc.N = sh.N; nc.M = M; nc.n = n; nc.ldd = ldd;
-    cublasLtMatrixLayoutCreate(&nc.la, CUDA_R_16F, n, sh.K, sh.N);
-    cublasLtMatrixLayoutCreate(&nc.lb, CUDA_R_16F, sh.K, M, sh.K);
-    cublasLtMatrixLayoutCreate(&nc.ld, CUDA_R_32F, n, M, ldd);
-    cublasLtMatmulHeuristicResult_t chk;
-    const cublasStatus_t cs = cublasLtMatmulAlgoCheck(g_lt, sh.op, nc.la, nc.lb, nc.ld, nc.ld, &sh.algo, &chk);
-    if (cs != CUBLAS_STATUS_SUCCESS || chk.state != CUBLAS_STATUS_SUCCESS || chk.workspaceSize > kLtWorkspace) {
-        cublasLtMatrixLayoutDestroy(nc.la);
-        cublasLtMatrixLayoutDestroy(nc.lb);
-        cublasLtMatrixLayoutDestroy(nc.ld);
-        fprintf(stderr, "%s: the fixed kernel for K=%d N=%d (chosen at %d rows) does not support %d rows x %d columns "
-                        "(ld %d) -- refusing\n", tag, sh.K, sh.N, kCanonRows, M, n, ldd);
-        return nullptr;
-    }
-    nc.valid = true;
-    lt_call &slot = g_calls[g_calls_next];
-    g_calls_next = (g_calls_next + 1) & 63;
-    if (slot.valid) {
-        cublasLtMatrixLayoutDestroy(slot.la);
-        cublasLtMatrixLayoutDestroy(slot.lb);
-        cublasLtMatrixLayoutDestroy(slot.ld);
-    }
-    slot = nc;
-    return &slot;
-}
 
 size_t up256(size_t b) { return (b + 255u) & ~(size_t)255u; }
 
@@ -239,7 +146,7 @@ int qwen_exl3_dense_prefill_launch(const void *w, int k2, const void *x_bf16, fl
     const int N = (int)exl3_out_stored((uint64_t)Ny), n_main = Ny / 128 * 128;
     const size_t wq_b = up256((size_t)K * N * sizeof(__half)), pl_b = up256((size_t)M * K * sizeof(__half));
     const size_t tail_b = Ny == N ? 0 : up256((size_t)M * 128 * sizeof(float));
-    const size_t need = wq_b + pl_b + up256((size_t)M * sizeof(float)) + tail_b + kLtWorkspace;
+    const size_t need = wq_b + pl_b + up256((size_t)M * sizeof(float)) + tail_b;
     if (need > g_scratch_bytes) {
         if (g_scratch) cudaFree(g_scratch);
         g_scratch = nullptr;
@@ -250,23 +157,10 @@ int qwen_exl3_dense_prefill_launch(const void *w, int k2, const void *x_bf16, fl
         }
         g_scratch_bytes = need;
     }
-    if (!g_lt && cublasLtCreate(&g_lt) != CUBLAS_STATUS_SUCCESS) {
-        g_lt = nullptr;
-        fprintf(stderr, "%s: cuBLASLt unavailable -- refusing\n", tag);
-        return -1;
-    }
-    const lt_shape *sh = lt_shape_for(K, N, tag);
-    if (!sh) return -1;
-    /* the whole GEMM, or (a logical width short of the stored one) its 128-multiple head into y and its last stored
-     * block into the tail */
-    const lt_call *call = n_main ? lt_call_for(*sh, M, n_main, Ny, tag) : nullptr;
-    const lt_call *tcall = Ny != N ? lt_call_for(*sh, M, 128, 128, tag) : nullptr;
-    if ((n_main && !call) || (Ny != N && !tcall)) return -1;
     __half *wq = reinterpret_cast<__half *>(g_scratch);
     __half *xhi = reinterpret_cast<__half *>(g_scratch + wq_b);
     float *inv = reinterpret_cast<float *>(g_scratch + wq_b + pl_b);
     float *tail = Ny != N ? reinterpret_cast<float *>(g_scratch + wq_b + pl_b + up256((size_t)M * sizeof(float))) : nullptr;
-    void *lt_ws = g_scratch + wq_b + pl_b + up256((size_t)M * sizeof(float)) + tail_b;
     const uint32_t *tr = static_cast<const uint32_t *>(w);
     const __half *suh = reinterpret_cast<const __half *>(static_cast<const uint8_t *>(w) + trellis_bytes);
     const __half *svh = suh + K;
@@ -299,16 +193,17 @@ int qwen_exl3_dense_prefill_launch(const void *w, int k2, const void *x_bf16, fl
         prep_smem_set = prep_smem;
     }
     dense_prep_kernel<<<M, 256, prep_smem, stream>>>(static_cast<const __nv_bfloat16 *>(x_bf16), suh, xhi, inv, K);
-    const float one = 1.0f, zero = 0.0f;
-    for (const lt_call *c : {call, tcall}) {
-        if (!c) continue;
-        float *d = c == tcall ? tail : y;
-        const cublasStatus_t st = cublasLtMatmul(g_lt, sh->op, &one, c == tcall ? wq + n_main : wq, c->la, xhi, c->lb,
-                                                 &zero, d, c->ld, d, c->ld, &sh->algo, lt_ws, kLtWorkspace, stream);
-        if (st != CUBLAS_STATUS_SUCCESS) {
-            fprintf(stderr, "%s: cuBLAS GEMM failed (%d) -- refusing\n", tag, (int)st);
-            return -3;
-        }
+    /* the whole GEMM, or (a logical width short of the stored one) its 128-multiple head into y and its last stored
+     * block into the tail */
+    if (n_main) {
+        const int rc = pulsar_lt_fixed_gemm(PULSAR_LT_A_KN, PULSAR_LT_PROMPT, wq, K, N, 0, n_main, xhi, M, y, Ny, stream,
+                                            tag);
+        if (rc) return rc;
+    }
+    if (Ny != N) {
+        const int rc = pulsar_lt_fixed_gemm(PULSAR_LT_A_KN, PULSAR_LT_PROMPT, wq, K, N, n_main, 128, xhi, M, tail, 128,
+                                            stream, tag);
+        if (rc) return rc;
     }
     const int64_t etasks = (int64_t)M * (N >> 7);
     dense_epilogue_kernel<<<(unsigned)((etasks + 7) / 8), 256, 0, stream>>>(y, tail, inv, svh, M, Ny, n_main);

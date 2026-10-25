@@ -1032,6 +1032,7 @@ static bool weights_tensor_type_supported(uint32_t type) {
     case PULSAR_TENSOR_F32:
     case PULSAR_TENSOR_I32:
     case PULSAR_TENSOR_BF16:
+    case PULSAR_TENSOR_F16:
     case PULSAR_TENSOR_MXFP8_LT:
     case PULSAR_TENSOR_CUTLASS_MXFP4:
     case PULSAR_TENSOR_IQ2_XXS_MMQ_K:

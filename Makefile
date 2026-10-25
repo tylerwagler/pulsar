@@ -288,7 +288,7 @@ pulsar-agent: $(AGENT_OBJS) src/lib/pulsar_help.o src/lib/pulsar_kvtext.o src/li
 CUDA_REGRESSION_BINS = tests/cuda_long_context_smoke tests/moe_route_bounds_gate tests/expert_table_gate \
                        tests/exl3_moe_epilogue_gate tests/exl3_dense_gate tests/exl3_moe_prefill_gate tests/exl3_half_gate \
                        tests/gdn_gate tests/qsa_attn_gate tests/qwen_s4_gate tests/router_gate tests/gqa_attn_gate tests/sconv_gate tests/head_gate \
-                       tests/bf16_rows_gate tests/nvfp4_rows_gate tests/mamba2_gate tests/rowops_gate tests/arch_gate tests/pool_gate
+                       tests/bf16_rows_gate tests/nvfp4_rows_gate tests/mamba2_gate tests/rowops_gate tests/arch_gate tests/pool_gate tests/f16_rows_gate
 # 2026-10-14: they run CONCURRENTLY, each one's output kept together (-O).  They are model-free and mostly
 # host-bound (their references run on the CPU: measured alone, 258 s in series, the longest 114 s of which 113 s
 # user time), so in series they were 258 s of the battery's serial front.  No gate here grades a time.
@@ -568,9 +568,9 @@ exl3-moe-epilogue-gate: tests/exl3_moe_epilogue_gate
 # host authority in double; M-neutrality bit-exact; mutations; refusals.
 # Links the PRODUCTION object (the MMQ rule, the engine's NVCCFLAGS), so pass
 # the served arch: make exl3-dense-gate CUDA_ARCH=sm_120f.  Model-free.
-tests/exl3_dense_gate: tests/exl3_dense_gate.cu tests/exl3_dense_ref.h src/cuda/mmq/ds4_exl3_dense.o src/cuda/mmq/qwen_exl3_dense_prefill.o Makefile \
+tests/exl3_dense_gate: tests/exl3_dense_gate.cu tests/exl3_dense_ref.h src/cuda/mmq/ds4_exl3_dense.o src/cuda/mmq/qwen_exl3_dense_prefill.o src/cuda/pulsar_cuda_lt_fixed.o Makefile \
                        src/cuda/mmq/ds4_exl3_dense.cuh src/cuda/pulsar_cuda_mx.cuh src/engine/exl3_trellis.h
-	$(NVCC) $(NVCCFLAGS) -std=c++17 -Isrc -Isrc/cuda -o $@ tests/exl3_dense_gate.cu src/cuda/mmq/ds4_exl3_dense.o src/cuda/mmq/qwen_exl3_dense_prefill.o -lcublasLt
+	$(NVCC) $(NVCCFLAGS) -std=c++17 -Isrc -Isrc/cuda -o $@ tests/exl3_dense_gate.cu src/cuda/mmq/ds4_exl3_dense.o src/cuda/mmq/qwen_exl3_dense_prefill.o src/cuda/pulsar_cuda_lt_fixed.o -lcublasLt
 
 .PHONY: exl3-dense-gate
 exl3-dense-gate: tests/exl3_dense_gate
@@ -620,9 +620,9 @@ tests/exl3_moe_decode_bench: tests/exl3_moe_decode_bench.cu $(CUDA_OBJS) $(CUTLA
 # L251: the dense arm on a REAL exllamav3-quantized weight, driven by
 # pulsar-notes research/l251/exl3-dense/xcheck.py (which compares it with
 # exllamav3's own forward on the same activations).  Not a gate.
-tests/exl3_dense_xcheck: tests/exl3_dense_xcheck.cu tests/exl3_dense_ref.h src/cuda/mmq/ds4_exl3_dense.o src/cuda/mmq/qwen_exl3_dense_prefill.o Makefile \
+tests/exl3_dense_xcheck: tests/exl3_dense_xcheck.cu tests/exl3_dense_ref.h src/cuda/mmq/ds4_exl3_dense.o src/cuda/mmq/qwen_exl3_dense_prefill.o src/cuda/pulsar_cuda_lt_fixed.o Makefile \
                          src/cuda/mmq/ds4_exl3_dense.cuh src/cuda/pulsar_cuda_mx.cuh src/engine/exl3_trellis.h
-	$(NVCC) $(NVCCFLAGS) -std=c++17 -Isrc -Isrc/cuda -o $@ tests/exl3_dense_xcheck.cu src/cuda/mmq/ds4_exl3_dense.o src/cuda/mmq/qwen_exl3_dense_prefill.o -lcublasLt
+	$(NVCC) $(NVCCFLAGS) -std=c++17 -Isrc -Isrc/cuda -o $@ tests/exl3_dense_xcheck.cu src/cuda/mmq/ds4_exl3_dense.o src/cuda/mmq/qwen_exl3_dense_prefill.o src/cuda/pulsar_cuda_lt_fixed.o -lcublasLt
 
 # L251: the dense arm's microbenchmark -- EXL3 K=2..5 vs the engine's MXFP8
 # decode GEMV (the production wrapper, decode rows declared, the A8 slot armed)
@@ -821,6 +821,17 @@ head-mini-grade: tests/head_gate
 # own Qwen4ExpTextGatedDeltaNet).  The engine's NVCCFLAGS plus -fPIC.  Not a gate.
 tests/libpulsar_gdn.so: src/cuda/pulsar_cuda_gdn.cu src/cuda/pulsar_cuda_gdn.h src/cuda/pulsar_cuda_mx.cuh Makefile
 	$(NVCC) $(NVCCFLAGS) -Xcompiler -fPIC -shared -Isrc -o $@ src/cuda/pulsar_cuda_gdn.cu
+
+# L321: the f16 rows arm (fp16 tensor cores, the fixed-algorithm GEMM) + the LayerNorm / bias / GELU row ops vs host
+# references, row independence bit for bit (model-free).
+tests/f16_rows_gate: tests/f16_rows_gate.cu src/cuda/pulsar_cuda_f16_rows.o src/cuda/pulsar_cuda_lt_fixed.o \
+                     src/cuda/pulsar_cuda_rowops.o src/cuda/pulsar_cuda_f16_rows.h src/cuda/pulsar_cuda_rowops.h Makefile
+	$(NVCC) $(NVCCFLAGS) -std=c++17 -Isrc -Isrc/cuda -o $@ tests/f16_rows_gate.cu src/cuda/pulsar_cuda_f16_rows.o \
+	        src/cuda/pulsar_cuda_lt_fixed.o src/cuda/pulsar_cuda_rowops.o -lcublasLt
+
+.PHONY: f16-rows-gate
+f16-rows-gate: tests/f16_rows_gate
+	./tests/f16_rows_gate
 
 # L321: the encoders' mean pool -- f32, row order, bit-exact to the host loop (model-free).
 tests/pool_gate: tests/pool_gate.cu src/cuda/pulsar_cuda_pool.o src/cuda/pulsar_cuda_pool.h Makefile

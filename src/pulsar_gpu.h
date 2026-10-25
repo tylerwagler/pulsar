@@ -410,6 +410,9 @@ enum {
      * scale plane (one per 16 inputs) and the f32 global scale; pulsar_nvfp4_layout() in
      * src/cuda/pulsar_cuda_nvfp4.h is the one byte model. */
     PULSAR_TENSOR_NVFP4 = 14,
+    /* L321: IEEE f16, the Turing lane's dense format (no bf16 tensor cores below sm_80): a Linear [in, out] the f16
+     * rows arm multiplies on the fp16 tensor cores (pulsar_cuda_f16_rows.h), or a table read as f16. */
+    PULSAR_TENSOR_F16 = 15,
     PULSAR_TENSOR_TYPE_COUNT
 };
 
