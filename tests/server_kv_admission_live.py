@@ -14,15 +14,18 @@ real server on a small model at a small --ctx, with the guard's budget lowered t
            tokenizer's tokens per word
   S  SPILL   chat A, chat B (resident, within the budget), then chat C on a fresh bank: the server spills an idle
              bank BEFORE C binds ("kv admission: ... spilling 1 idle bank(s) first"); every answer 200
-  W  WAIT    (a fresh server) A and B as two long streamed completions, so bank 0 and bank 1 are both busy, then
-             C: no idle bank to spill, a busy one will free -- C stays queued ("queued until a busy bank's job
-             ends", logged once) and answers 200 only after B's stream ended
+  W  PREEMPT (a fresh server) A and B as two long streamed completions, so two banks are busy, then C: no idle
+             bank to spill.  Since L314 the server does not queue C behind a busy bank: the NEWEST decoder (B) is
+             PREEMPTED through its terminal checkpoint, C answers 200 while B is parked, and B is READMITTED and
+             streams all its tokens (L326: this phase was L280's WAIT and was not rerun after L314 changed the rule;
+             the WAIT arm is now the one for a decoder that cannot be preempted)
   R  REFUSE  a prompt whose KV alone is past the budget: 503 with the numbers, at once; the server keeps serving
   P  REUSE   chat B asked again (spilled to disk in S) answers exactly as B did cold -- the prefix cache unchanged
-  never      the decode guard's "NO idle victim -- back-pressure" (proceeding past its budget), in any phase
+  never      the decode guard's "NO idle victim -- back-pressure" (proceeding past its budget), in any phase; a
+             violation names the phase and prints the line with the admission / preempt / guard lines before it
 
 Family-neutral: the bank price and the spill are the engine's bank ops.  Exit 0 only when every check passed.
-Scratch (the disk-KV dirs) goes under $TMPDIR."""
+Scratch (the disk-KV dirs) goes under $TMPDIR; --log keeps every guarded server's log (one file, by phase)."""
 import argparse, json, os, random, re, shutil, subprocess, sys, tempfile, threading, time, urllib.error, urllib.request
 
 ap = argparse.ArgumentParser()
@@ -35,7 +38,8 @@ ap.add_argument("--log", default=None, help="keep the guarded servers' logs here
 a = ap.parse_args()
 URL = "http://127.0.0.1:%d" % a.port
 fails = 0
-logs = []
+logs = []   # (phase, the server's log) per stopped server
+tags = {}   # log path -> phase
 
 
 def check(ok, what):
@@ -52,6 +56,7 @@ def start(env_extra, tag):
     p = subprocess.Popen([a.binary, "-m", a.model, "--host", "127.0.0.1", "--port", str(a.port), "--ctx", str(a.ctx),
                           "--kv-disk-dir", kv, "--kv-disk-space-mb", "4096"], stdout=f, stderr=subprocess.STDOUT,
                          env=env)
+    tags[log] = tag
     for _ in range(900):
         if "listening on" in open(log).read():
             return p, kv, log
@@ -68,8 +73,18 @@ def stop(p, kv, log):
         p.wait(120)
     except subprocess.TimeoutExpired:
         p.kill()
-    logs.append(open(log).read())
+    logs.append((tags.get(log, "?"), open(log).read()))
     shutil.rmtree(kv, ignore_errors=True)
+
+
+# the scheduler's KV decisions, for a failure's context
+KV_LINE = re.compile(r"kv admission|PREEMPTED|READMITTED|preemption|guard|spill", re.I)
+
+
+def kv_lines(text, upto=None, n=14):
+    """the last `n` KV-decision lines of a log (before line index `upto`)"""
+    lines = text.splitlines()[:upto]
+    return [l for l in lines if KV_LINE.search(l)][-n:]
 
 
 def metrics():
@@ -183,7 +198,7 @@ finally:
 
 p, kv, log = start(env, "W")
 try:
-    print("W: A and B streaming on banks 0 and 1, then C", flush=True)
+    print("W: A and B streaming on two banks, then C: B preempted for C, then readmitted (L314)", flush=True)
     res = {}
     fa, fb = threading.Event(), threading.Event()
     ta = threading.Thread(target=long_stream, args=(A, fa, res, "a"))
@@ -200,16 +215,29 @@ try:
     check(res.get("a", (0,))[0] == 200 and res.get("b", (0,))[0] == 200,
           "A and B streamed %s / %s tokens" % (res.get("a", (0, 0))[1], res.get("b", (0, 0))[1]))
     check(rc[0] == 200, "C answered %s" % rc[0])
-    check(txt.count("queued until a busy bank's job ends") == 1, "C waited for a busy bank, logged once (%d lines)"
-          % txt.count("queued until a busy bank's job ends"))
-    ends = sorted(v[2] for v in res.values())
-    check(len(ends) == 2 and ends[0] <= c_end, "C finished after a busy bank's stream ended (%.1f s later)"
-          % (c_end - ends[0] if ends else 0))
+    npre, nre = txt.count("PREEMPTED bank"), txt.count("READMITTED")
+    nwait = txt.count("queued until a busy bank's job ends")
+    ok = npre == 1 and nre == 1 and nwait == 0
+    check(ok, "C took the newest decoder's bank: preempted %d, readmitted %d, queued %d (want 1, 1, 0)"
+          % (npre, nre, nwait))
+    b_end = res.get("b", (0, 0, 0))[2]
+    check(b_end > 0 and c_end <= b_end, "C finished while B was parked, before B's stream ended (%.1f s before)"
+          % (b_end - c_end if b_end else 0))
+    if not ok:
+        for l in kv_lines(txt):
+            print("#   W: " + l[-220:])
 finally:
     stop(p, kv, log)
-allt = "\n".join(logs)
-check("NO idle victim" not in allt, "the decode guard never proceeded past its budget (no back-pressure line)")
+bp = [(ph, i, l) for ph, t in logs for i, l in enumerate(t.splitlines()) if "NO idle victim" in l]
+check(not bp, "the decode guard never proceeded past its budget (no back-pressure line%s)"
+      % ("; %d in phase(s) %s" % (len(bp), ",".join(sorted({ph for ph, _, _ in bp}))) if bp else ""))
+for ph, i, l in bp[:2]:   # the first ones, with the decisions that led there
+    text = dict(logs)[ph]
+    for c in kv_lines(text, upto=i):
+        print("#   %s: %s" % (ph, c[-220:]))
+    print("#   %s: >> %s" % (ph, l[-220:]))
 if a.log:
-    open(a.log, "w").write(allt)
+    open(a.log, "w").write("\n".join("==== phase %s\n%s" % (ph, t) for ph, t in logs))
+    print("server logs: %s" % a.log)
 print("server-kv-admission-live: %s (%d failed)" % ("PASS" if fails == 0 else "FAIL", fails))
 sys.exit(1 if fails else 0)
