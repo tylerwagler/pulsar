@@ -22,6 +22,7 @@
 #include "mmq/exl3_moe.cuh"
 #include "pulsar_cuda_bf16_rows.cuh"
 #include "pulsar_cuda_nvfp4.h"
+#include "pulsar_cuda_f16_rows.h"
 #include "pulsar_cuda_rowops.h"
 #ifdef PULSAR_HAVE_MMQ
 #include "mmq/pulsar_tessera.h"
@@ -179,7 +180,7 @@ static bool launch_ok(const char *what) {
 
 extern "C" size_t pulsar_rows_linear_workspace_bytes(const pulsar_rows_linear *l, int rows) {
     if (!l || rows <= 0) return 0;
-    return ds4_exl3_dense_workspace_bytes(rows, l->in, l->out);
+    return l->f16 ? pulsar_f16_rows_workspace_bytes(rows, l->in) : ds4_exl3_dense_workspace_bytes(rows, l->in, l->out);
 }
 
 extern "C" int pulsar_rows_linear_launch(const pulsar_rows_linear *l, const uint16_t *x_bf16, int rows, float *y,
@@ -190,13 +191,15 @@ extern "C" int pulsar_rows_linear_launch(const pulsar_rows_linear *l, const uint
         fprintf(stderr, "pulsar: qwen linear: no weight or no bf16 activation of width %d -- refusing\n", l ? l->in : -1);
         return -1;
     }
-    if (l->bf16 || l->nvfp4) {              /* L295 F7 / L298: a BF16 / nvfp4 weight; needs no workspace */
-        if (l->k2 || l->sf || (l->bf16 && l->nvfp4)) {
-            fprintf(stderr, "pulsar: rows linear: a %d->%d BF16 / nvfp4 weight with an EXL3 rate, an E8M0 plane or both "
-                            "flags -- refusing\n", l->in, l->out);
+    if (l->bf16 || l->nvfp4 || l->f16) {    /* L295 F7 / L298 / L321: a BF16 / nvfp4 / f16 weight */
+        if (l->k2 || l->sf || (int)l->bf16 + (int)l->nvfp4 + (int)l->f16 != 1) {
+            fprintf(stderr, "pulsar: rows linear: a %d->%d BF16 / nvfp4 / f16 weight with an EXL3 rate, an E8M0 plane or "
+                            "two flags -- refusing\n", l->in, l->out);
             return -1;
         }
         if (l->nvfp4) return pulsar_nvfp4_rows_linear_launch(l->w, x_bf16, rows, l->in, l->out, y, nullptr, stream);
+        if (l->f16) return pulsar_f16_rows_linear_launch(l->w, x_bf16, rows, l->in, l->out, y, l->prompt, ws, ws_bytes,
+                                                         stream);
         return pulsar_bf16_rows_linear_launch(l->w, x_bf16, rows, l->in, l->out, y, l->prompt, stream);
     }
     if (l->k2 == 0) {                       /* the recipe's mxfp8_lt dense tier */
@@ -224,12 +227,18 @@ extern "C" size_t pulsar_rows_linear_multi_workspace_bytes(const pulsar_rows_lin
     if (!ls || n < 1 || n > DS4_EXL3_DENSE_MAX_PROJ || rows <= 0) return 0;
     ds4_exl3_dense_proj p[DS4_EXL3_DENSE_MAX_PROJ] = {};
     int ne = 0;
+    size_t f16 = 0;   /* L321: an f16 Linear runs alone after the EXL3 launch, on the same workspace */
     for (int j = 0; j < n; ++j) {
         if (!ls[j] || ls[j]->in != ls[0]->in) return 0;
+        if (ls[j]->f16) {
+            f16 = pulsar_f16_rows_workspace_bytes(rows, ls[0]->in);
+            continue;
+        }
         /* an EXL3 Linear (any logical width, L295 F7), or a width an EXL3 one could have (mxfp8_lt needs none) */
         if (ls[j]->k2 || ls[j]->out % 128 == 0) p[ne++].N = ls[j]->out;
     }
-    return ne ? ds4_exl3_dense_multi_workspace_bytes(p, ne, rows, ls[0]->in) : 0;
+    const size_t exl3 = ne ? ds4_exl3_dense_multi_workspace_bytes(p, ne, rows, ls[0]->in) : 0;
+    return exl3 > f16 ? exl3 : f16;
 }
 
 /* The multi launch, f32 outputs y (yb NULL) or bf16 rows yb with y[j] the f32 staging of the arms that have no bf16

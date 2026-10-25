@@ -120,6 +120,8 @@ typedef struct pulsar_rows_linear {
     bool bf16;
     /** L298: an nvfp4 slice (k2 0, sf NULL; pulsar_cuda_nvfp4.h): the NVFP4 W4A16 rows arm. */
     bool nvfp4;
+    /** L321: an f16 weight [out][in] (k2 0, sf NULL; pulsar_cuda_f16_rows.h): the fp16 tensor-core rows arm. */
+    bool f16;
 } pulsar_rows_linear;
 
 /** L251 MTP: the head-side weights of the input combine (the sidecar's tensors). */

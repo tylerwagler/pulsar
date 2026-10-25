@@ -34,7 +34,7 @@ import exl3_rates
 
 SCHEMA = "pulsar.recipe.v1"
 CONSUMED = ("ple_rows", "kv", "omit")
-FORMATS = {"native", "bf16", "f32", "i32", "mxfp8_lt", "fp8_e4m3_soa_k", "cutlass_mxfp4", "nvfp4", "tessera",
+FORMATS = {"native", "bf16", "f16", "f32", "i32", "mxfp8_lt", "fp8_e4m3_soa_k", "cutlass_mxfp4", "nvfp4", "tessera",
            *exl3_rates.K2, *CONSUMED}
 SOURCES = ("hf", "exl3", "exl3_experts", "tessera")
 BLOCKS = ("layers", "mtp")

@@ -132,6 +132,9 @@ class Mapped:
     # role table ({"role": ..., "block": ..., "layer": ...}) so the loader binds by role, not by parsing names.
     # Empty for the families whose loaders bind by name (DeepSeek's blk.N gguf names, qwen4_exp's HF names).
     bind: tuple = ()
+    # L321: a permutation of the source's dims an elementwise producer applies before writing (a convolution's weight
+    # read as the Linear it is); empty = as stored
+    axes: tuple = ()
 
 
 def shard_order(shape: ModelShape) -> list[str]:
