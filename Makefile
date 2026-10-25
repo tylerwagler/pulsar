@@ -1093,9 +1093,10 @@ TP_PAIR_DS_MODEL ?= /mnt/models/DeepSeek-v4-Flash
 # L269 W1: the V4.1 layer-subset fixture (layer 4 = source layer 20, OUR EXL3 K3; the rest CUTLASS MXFP4) -- the
 # plan's EXL3 expert halves beside the MXFP4 ones.
 TP_V41_FIXTURE ?= /mnt/models/v41-tp1-fixture
-# Qwen's plan stays on the MTP pack (its golden's name): the served pack has no TP plan -- the plan refuses a block
-# drafter under TP and an EXL3 head (L305) -- and Qwen is not a pair model (no DeepSeek/Qwen on the work pair).
-TP_QWEN_PLAN_MODEL ?= /mnt/models/qwen38fn-u-e4-d5-mtp
+# Qwen's plan runs on the U-e4-d5 trunk (the NAS copy, no drafter): the served pack has no TP plan -- the plan refuses
+# a block drafter under TP and an EXL3 head (L305) -- and Qwen is not a pair model (no DeepSeek/Qwen on the work pair).
+# The MTP overlay it used was deleted 2026-10-25; the trunk's plan is the old golden minus its mtp.layers.0 rows.
+TP_QWEN_PLAN_MODEL ?= /mnt/models/qwen38fn-u-e4-d5
 TP_PLAN_MODELS = $(TP_PAIR_DS_MODEL) $(TP_QWEN_PLAN_MODEL) $(TP_V41_FIXTURE)
 .PHONY: tp-plan-gate tp-plan-golden
 tp-plan-gate: tests/tp_plan_test
