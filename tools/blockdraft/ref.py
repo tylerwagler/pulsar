@@ -20,8 +20,10 @@ Arithmetic follows vLLM's: bf16 activations between ops, f32 inside each op.
 f32 transcription it was graded against): the same backbone (the engine's E4M3 ring too), rope_parameters' theta,
 the head the target's lm_head and the CandidateSelector's walk.  --container DIR reads every drafter tensor and the
 target's input embedding from the PULSAR CONTAINER the engine served (nvfp4 entries decoded exactly,
-tools/container/producers.nvfp4_decode; the head's draft-vocabulary rows and ids as stored), so the --dump grade
-isolates the engine's arithmetic from the container's quantisation; the selector's chain is graded too.
+weights.nvfp4_planes: e2m1 x e4m3, the global scale on the GEMM's output as the kernel applies it; the head's
+draft-vocabulary rows and ids as stored), so the --dump grade isolates the engine's arithmetic from the container's
+quantisation; the selector's chain is graded too.  (L300) Drafter(src=...) takes any weights.py source instead --
+fmtgrade.py's weight-format arms -- and ctx_kv / forward(kv=...) let a caller keep the context rows' K / V.
 
     ~/venvs/tf/bin/python tools/blockdraft/ref.py --drafter /mnt/models/nemotron35-super-lilicorr \
         --target-hf /mnt/models/nemotron35-super-vl-bf16 (--golden F | --dump DIR) [--rounds N] [--device cpu|cuda]
@@ -41,8 +43,8 @@ import torch
 from safetensors import safe_open
 
 import sys
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "container"))
-import producers as PR  # noqa: E402
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import weights as WS  # noqa: E402
 
 BF16 = torch.bfloat16
 E2M1 = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0])
@@ -58,48 +60,36 @@ def e4m3(x):
 
 
 class Container:
-    """A pulsar container's tensors by name (every shard's header; an nvfp4 entry decoded through its pulsar.tensors
-    declaration)."""
+    """A pulsar container's tensors by name (every shard's header, weights.Shards): a native tensor as stored, an
+    nvfp4 Linear as its exact planes with the global scale kept for the GEMM's output (weights.nvfp4_planes, as the
+    engine's kernel applies it)."""
 
     def __init__(self, d):
-        self.at = {}
-        for fn in sorted(os.listdir(d)):
-            if not fn.endswith(".safetensors"):
-                continue
-            p = os.path.join(d, fn)
-            with open(p, "rb") as f:
-                n = struct.unpack("<Q", f.read(8))[0]
-                h = json.loads(f.read(n))
-            decl = json.loads(h.pop("__metadata__", {}).get("pulsar.tensors", "{}"))
-            for k, v in h.items():
-                self.at[k] = (p, 8 + n + v["data_offsets"][0], v["data_offsets"][1] - v["data_offsets"][0], v,
-                              decl.get(k, {}))
-
-    def raw(self, name):
-        p, off, n, _v, _d = self.at[name]
-        with open(p, "rb") as f:
-            f.seek(off)
-            return f.read(n)
+        self.s = WS.Shards(d)
 
     def has(self, name):
-        return name in self.at
+        return self.s.has(name)
 
     def tensor(self, name):
-        """bf16 / i32 as stored ([shape]); an nvfp4 Linear as (W f32 [out][in], None) -- the global scale folded"""
-        _p, _o, _n, v, d = self.at[name]
-        b = self.raw(name)
+        """bf16 / i32 as stored ([shape])"""
+        lay = self.s.decl(name).get("layout")
+        if lay not in (None, "bf16", "i32"):
+            raise SystemExit(f"{name}: layout {lay} is a Linear's (Container.linear), not a native tensor")
+        return self.s.plain(name)
+
+    def linear(self, name):
+        """(W f32 [out][in], the nvfp4 global scale or None)"""
+        d = self.s.decl(name)
         if d.get("layout") == "nvfp4":
             inp, out = d["dims_ne"]
-            return torch.from_numpy(PR.nvfp4_decode(b, out, inp).copy())
-        if v["dtype"] == "BF16":
-            return torch.from_numpy(np.frombuffer(b, dtype=np.int16).copy()).view(BF16).reshape(v["shape"])
-        if v["dtype"] == "I32":
-            return torch.from_numpy(np.frombuffer(b, dtype=np.int32).copy()).reshape(v["shape"])
-        raise SystemExit(f"{name}: {v['dtype']} {d.get('layout')} is not a layout the reference reads")
+            return WS.nvfp4_planes(self.s.raw(name), out, inp)
+        if self.s.entry(name)["dtype"] == "BF16":
+            return self.s.plain(name).float(), None
+        raise SystemExit(f"{name}: {self.s.entry(name)['dtype']} {d.get('layout')} is not a layout the reference reads")
 
 
 class Drafter:
-    def __init__(self, path, target_hf, device, container=None):
+    def __init__(self, path, target_hf, device, container=None, src=None):
         self.dev = device
         cfg = json.load(open(os.path.join(path, "config.json")))
         dc = cfg["dflash_config"]
@@ -112,9 +102,9 @@ class Drafter:
         if self.dflash2:   # L299: its keys, the container's tensors
             self.eps, self.theta, self.W = cfg["rms_norm_eps"], cfg["rope_parameters"]["rope_theta"], cfg["sliding_window"]
             self.block, self.k, self.kv8 = dc["block_size"], dc["selector_top_k"], True
-            if container is None:
+            if src is None and container is None:
                 raise SystemExit("--container: the DFlash2 reference reads the drafter as the container stores it")
-            self.c = Container(container)
+            self.c = src if src is not None else Container(container)   # src: a weights.Arm (fmtgrade.py)
             self.emb = self.c.tensor("model.language_model.embed_tokens.weight").to(device)
         else:
             self.f = safe_open(os.path.join(path, "model.safetensors"), framework="pt", device="cpu")
@@ -158,8 +148,8 @@ class Drafter:
     def linear(self, name):
         """(W f32 [out][in], global scale or None)"""
         if self.dflash2:
-            t = self.c.tensor("drafter." + name + ".weight")
-            return t.float().to(self.dev), None
+            w, s2 = self.c.linear("drafter." + name + ".weight")
+            return w.to(self.dev), s2
         if name + ".weight_scale" in self.keys:
             w = self.f.get_tensor(name + ".weight")                      # u8 [out][in/2]
             sc = self.f.get_tensor(name + ".weight_scale").float()       # e4m3 [out][in/16]
@@ -208,9 +198,17 @@ class Drafter:
         c = self.lin(taps, self.fc)
         return c, self.rms(c, self.hn)
 
-    def forward(self, cn, cpos, P, carry):
-        """the block at positions P .. P + block - 1 over the context rows cn (bf16 [n][hidden]) at cpos: per-layer
-        intermediates, the final hidden o, the log-softmax rows"""
+    def ctx_kv(self, cn, cpos):
+        """per layer the context rows' (K, V) as the ring stores them (normed, roped, the ring's row format).  Each
+        row's are a function of that row and its position alone, so a cache of them is exact (fmtgrade.py)."""
+        kvf = e4m3 if self.kv8 else (lambda x: x)
+        return [(kvf(self.rope(self.rms(self.lin(cn, Lw["k"]).reshape(-1, self.NKV, self.HD), Lw["kn"]), cpos)),
+                 kvf(self.lin(cn, Lw["v"]).reshape(-1, self.NKV, self.HD))) for Lw in self.lay]
+
+    def forward(self, cn, cpos, P, carry, kv=None):
+        """the block at positions P .. P + block - 1 over the context rows cn (bf16 [n][hidden]) at cpos -- or their
+        ctx_kv rows `kv` (cn then unused): per-layer intermediates, the final hidden o, the log-softmax rows"""
+        kv = kv if kv is not None else self.ctx_kv(cn, cpos)
         B, NQ, NKV, HD, G = self.block, self.NQ, self.NKV, self.HD, self.G
         qpos = torch.arange(P, P + B, device=self.dev)
         ids = torch.tensor([carry] + [self.mask] * (B - 1), device=self.dev)
@@ -228,8 +226,7 @@ class Drafter:
             kvf = e4m3 if self.kv8 else (lambda x: x)   # the ring's row format (the engine's E4M3)
             kq = kvf(self.rope(self.rms(self.lin(cx, Lw["k"]).reshape(B, NKV, HD), Lw["kn"]), qpos))
             vq = kvf(self.lin(cx, Lw["v"]).reshape(B, NKV, HD))
-            kc = kvf(self.rope(self.rms(self.lin(cn, Lw["k"]).reshape(-1, NKV, HD), Lw["kn"]), cpos))
-            vc = kvf(self.lin(cn, Lw["v"]).reshape(-1, NKV, HD))
+            kc, vc = kv[l]
             K, V = torch.cat([kc, kq]).float(), torch.cat([vc, vq]).float()
             kp = torch.cat([cpos, qpos])
             rep = NQ // NKV
