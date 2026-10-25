@@ -10,7 +10,7 @@ earlyoom killed the server mid-request (the client saw the connection close with
 real server on a small model at a small --ctx, with the guard's budget lowered through its test hook
 (PULSAR_SERVER_KV_BUDGET_OVERRIDE) to 2.2 conversations of --tokens tokens, so three cannot all stay resident:
 
-  phase 0  a probe server: the eager floor (/metrics: ledger budget - touched budget), KV bytes per token and the
+  phase 0  a probe server: the eager floor (/metrics pulsar:kv_eager_floor_bytes, L326), KV bytes per token and the
            tokenizer's tokens per word
   S  SPILL   chat A, chat B (resident, within the budget), then chat C on a fresh bank: the server spills an idle
              bank BEFORE C binds ("kv admission: ... spilling 1 idle bank(s) first"); every answer 200
@@ -135,7 +135,10 @@ def words(seed, n):
 p, kv, log = start({}, "probe")
 try:
     m = metrics()
-    eager = m["pulsar:kv_ledger_budget_bytes"] - m["pulsar:kv_touched_budget_bytes"]
+    # the server's own eager floor (L326): ledger - touched budget is only that while the ledger's share binds; the
+    # touched budget is min(ledger - eager, touched + MemAvailable - floor) since L319
+    eager = m["pulsar:kv_eager_floor_bytes"]
+    check(eager > 0, "the probe server reports its eager floor (%.2f GiB)" % (eager / 2**30))
     per_token = m["pulsar:kv_bank_bytes"] / a.ctx
     code, _, usage = chat(words(1, 400))
     tpw = usage["prompt_tokens"] / 400.0 if usage else 3.0

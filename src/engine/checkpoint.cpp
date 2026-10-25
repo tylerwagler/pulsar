@@ -353,6 +353,10 @@ bool pulsar_ckpt_adopt(pulsar_ckpt_store *st, uint32_t dst, uint32_t src, uint32
             pulsar_gpu_tensor_copy_async(ds, doff, slab, off, st->slot_bytes) != 0)
             pulsar_ckpt_commit(st, dst, slot, T);
     } else {
+        /* L326: lending the record is a use of it -- stamped before dst's copy picks its slot, so neither that copy
+         * nor the next capture evicts the record a bank was just served from (it was the LRU victim first) */
+        pulsar_ckpt_record *lent = &st->rec[r - st->rec];
+        lent->used = ++st->rec_clock;
         pulsar_ckpt_record *w = ckpt_record_pick(st);
         if (w != r && w->cap >= r->cap) {
             w->T = 0u;

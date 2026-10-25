@@ -2172,17 +2172,18 @@ static void test_server_unit_group(void) {
     pulsar_server_unit_tests_run();
 }
 
-/* L325: a render case's protocol ("_api": "openai" | "anthropic", default openai) and family ("_family":
- * "deepseek-v41" | "deepseek-v4" | "qwen" | "nemotron" | "inkling", default deepseek-v41), read from the body (the
- * protocol parsers skip unknown members).  false = a value this list does not name. */
-static bool test_render_case_target(const char *body, bool *anthropic, pulsar_chat_format *fmt) {
-    *anthropic = false;
+/* L325: a render case's protocol ("_api": "openai" | "anthropic" | "responses" (L326), default openai) and family
+ * ("_family": "deepseek-v41" | "deepseek-v4" | "qwen" | "nemotron" | "inkling", default deepseek-v41), read from the
+ * body (the protocol parsers skip unknown members).  false = a value this list does not name. */
+static bool test_render_case_target(const char *body, api_style *style, pulsar_chat_format *fmt) {
+    *style = API_OPENAI;
     *fmt = PULSAR_CHAT_DS4_V41;
     char *api = json_object_member_raw(body, "_api");
     char *fam = json_object_member_raw(body, "_family");
     bool ok = true;
     if (api) {
-        if (!strcmp(api, "\"anthropic\"")) *anthropic = true;
+        if (!strcmp(api, "\"anthropic\"")) *style = API_ANTHROPIC;
+        else if (!strcmp(api, "\"responses\"")) *style = API_RESPONSES;
         else ok = !strcmp(api, "\"openai\"");
     }
     if (fam) {
@@ -2232,9 +2233,9 @@ static void test_render_cases(void) {
         long id = idp ? strtol(idp + 6, NULL, 10) : -1;
         request r;
         char err[160] = "";
-        bool anthropic = false;
+        api_style style = API_OPENAI;
         pulsar_chat_format fmt = PULSAR_CHAT_DS4_V41;
-        if (!test_render_case_target(line, &anthropic, &fmt)) {
+        if (!test_render_case_target(line, &style, &fmt)) {
             printf("===CASE %ld REFUSED unknown _api or _family===\n", id);
             refused++;
             continue;
@@ -2242,8 +2243,9 @@ static void test_render_cases(void) {
         request_init(&r, REQ_CHAT, 128);
         chat_conversation c;
         memset(&c, 0, sizeof(c));
-        const bool ok = (anthropic ? parse_chat_conversation_anthropic : parse_chat_conversation_openai)(
-                            line, &c, &r, err, sizeof err) &&
+        const bool ok = (style == API_ANTHROPIC   ? parse_chat_conversation_anthropic
+                         : style == API_RESPONSES ? parse_chat_conversation_responses
+                                                  : parse_chat_conversation_openai)(line, &c, &r, err, sizeof err) &&
                         render_chat_conversation(NULL, fmt, NULL, &c, &r, err, sizeof err);
         chat_conversation_free(&c);
         if (!ok) {
@@ -4113,6 +4115,13 @@ static bool fake_true_why(void *, uint32_t, char *, size_t) { return true; }
 static bool fake_true_at(void *, uint32_t) { return true; }
 static void fake_restored(void *) {}
 static bool fake_install(void *, uint32_t, uint32_t) { return true; }
+/* L326: one pool a bank (one token a row, 16 B), rows a dry tensor */
+static pulsar_gpu_tensor *fake_rows[3];
+static uint32_t fake_bank_pools(void *, uint32_t bank, pulsar_kv_pool *out, uint32_t cap) {
+    if (bank >= 3u || cap < 1u || !fake_rows[bank]) return 0u;
+    out[0] = {fake_rows[bank], 1u, 16u, false};
+    return 1u;
+}
 
 static void test_ckpt_records(void) {
     pulsar_kv_state_ops ops = {};
@@ -4194,6 +4203,30 @@ static void test_ckpt_records(void) {
     TEST_ASSERT(!pulsar_ckpt_adopt(st, 0, 0, 100, NULL));
     pulsar_ckpt_drop_bank(st, 0);
     pulsar_ckpt_drop_bank(st, 1);
+    /* L326: lending a record stamps it used.  Dry tensors (every copy a no-op that succeeds) give the banks paired
+     * pools and the records slabs.  The full pool's least recently used record is the lender's prompt end; bank 1
+     * adopts it: the copy takes another slot (it took the lent record's own, so none was made) and the next capture
+     * evicts another record (it evicted the record bank 1 was just served from). */
+    pulsar_gpu_tensor_dry_begin();
+    for (uint32_t b = 0; b < 3u; b++) fake_rows[b] = pulsar_gpu_tensor_alloc(600u * 16u);
+    for (uint32_t i = 0; i < st->n_rec; i++) st->rec[i].slab = pulsar_gpu_tensor_alloc(st->rec[i].cap);
+    pulsar_gpu_tensor_dry_end(NULL, NULL);
+    ops.bank_pools = fake_bank_pools;
+    TEST_ASSERT(pulsar_ckpt_record_capture(st, 0, PULSAR_CKPT_REC_END, 300, toks, lg, 4));   /* the oldest */
+    TEST_ASSERT(pulsar_ckpt_record_capture(st, 2, PULSAR_CKPT_REC_END, 250, toks, lg, 4));
+    TEST_ASSERT(pulsar_ckpt_record_capture(st, 2, PULSAR_CKPT_REC_ENDPOINT, 240, toks, NULL, 0));
+    r = pulsar_ckpt_record_of(st, 0, PULSAR_CKPT_REC_END);
+    TEST_ASSERT(r && pulsar_ckpt_adopt(st, 1, 0, 300, r));
+    TEST_ASSERT(pulsar_ckpt_end(st, 1) == 300u && pulsar_ckpt_end(st, 0) == 300u);   /* dst's copy, the lender's own */
+    TEST_ASSERT(pulsar_ckpt_record_capture(st, 1, PULSAR_CKPT_REC_ENDPOINT, 290, toks, NULL, 0));
+    TEST_ASSERT(pulsar_ckpt_end(st, 0) == 300u);                                    /* still the lender's */
+    TEST_ASSERT(pulsar_ckpt_record_of(st, 2, PULSAR_CKPT_REC_ENDPOINT) == NULL);   /* the LRU went instead */
+    ops.bank_pools = NULL;
+    for (uint32_t b = 0; b < 3u; b++) {
+        pulsar_ckpt_drop_bank(st, b);
+        pulsar_gpu_tensor_free(fake_rows[b]);
+        fake_rows[b] = NULL;
+    }
     /* the cut rule stops a chunk at the plan's endpoint, then at the final grid point: [0, 297), [297, 384),
      * [384, 400) for a 400-token prompt (cap 4096) */
     pulsar_prefill_shape shape = {4096u, 4096u, 1u};

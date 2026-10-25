@@ -2927,8 +2927,9 @@ bool anthropic_tools_supported(const char *tools_json, char *err, size_t errlen)
 bool parse_tools_value(const char **p, char **out, tool_schema_orders *orders, char **deferred = NULL);
 struct chat_conversation;
 /** L284: every tool the conversation offers, one function schema a line -- the tools array (parse_tools_value,
- *  every protocol's dialect: functions, Responses namespaces and tool_search, Anthropic-shaped) then the schemas
- *  Responses input items loaded (tool_search output).  Appended to `out`; every family renders from this. */
+ *  every protocol's dialect: functions, Responses namespaces and tool_search, Anthropic-shaped) without its deferred
+ *  tools: the tools block.  Appended to `out`; every family's tools block renders from this.  (L326: a Responses
+ *  tool_search_output's loads are deferred tools too, rendered at the item.) */
 void conversation_tool_schema_lines(const struct chat_conversation *c, buf *out);
 /** L325: every tool the request DECLARES -- conversation_tool_schema_lines then the deferred tools (rendered in place
  *  where a tool_reference loads them, not in the tools block): what the output parser and the grammar read. */
@@ -3081,10 +3082,10 @@ typedef struct chat_conversation {
     chat_msgs msgs;                 ///< the conversation, system / instructions first when sent
     char *tools_raw;                ///< the tools array as sent; NULL when absent or null
     char *tool_schemas;             ///< the same tools, one function schema a line (parse_tools_value)
-    buf loaded_tool_schemas;        ///< Responses: schemas carried by input items (tool_search output)
     /** L325: the tools array's DEFERRED tools (defer_loading: true), one function schema a line: declared (callable,
      *  typed for the parser and the grammar) but not rendered in the tools block; each renders where a tool_reference
-     *  names it (chat_msg::tool_ref_off).  NULL = none. */
+     *  names it (chat_msg::tool_ref_off).  L326: then a Responses input's tool_search_output loads (their item
+     *  carries the references).  NULL = none. */
     char *deferred_tool_schemas;
     chat_tool_choice tool_choice;   ///< what the client asked of the tools
     char *tool_choice_wire;         ///< the choice as the client spelled it (for a refusal); NULL = named
@@ -3126,8 +3127,10 @@ bool parse_chat_request(pulsar_engine *e, server *s, const char *body, int def_t
                                request *r, char *err, size_t errlen);
 bool parse_anthropic_request(pulsar_engine *e, server *s, const char *body, int def_tokens,
                                     request *r, char *err, size_t errlen);
+/** Responses `input` items into `msgs`; a tool_search_output's tools appended to `loaded` (one schema a line, the
+ *  item's message referencing each: L326, rendered in place) and declared in `orders`. */
 bool parse_responses_input(const char **p, chat_msgs *msgs,
-                                  buf *loaded_tool_schemas,
+                                  buf *loaded,
                                   tool_schema_orders *orders,
                                   char *err, size_t errlen);
 bool parse_responses_request(pulsar_engine *e, server *s, const char *body, int def_tokens,
