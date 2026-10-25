@@ -3586,10 +3586,12 @@ int vision_image_grid(int width, int height, const pulsar_vision_args *args,
  * loudly on 0 rather than guessing at a format.  `*rgb_out` is malloc'd and the
  * caller owns it.  CMYK/YCCK JPEG is refused: Pillow keeps those in CMYK and its
  * own .convert("RGB") is a different transform from libjpeg's. */
-/** Pillow's Image.resize(BICUBIC) of packed RGB8 (ImagingResample, fixed-point, horizontal then vertical), bit for
- *  bit -- every family's resize whose reference is Pillow (DeepSeek's load_image, Qwen's PIL processor).  Returns
- *  a malloc'd dst_w x dst_h image (a copy when the size is unchanged), NULL on failure. */
-uint8_t *vision_pil_resize_rgb(const uint8_t *src, int src_w, int src_h, int dst_w, int dst_h);
+/** Pillow's resample filters the image paths use (L321: BILINEAR for Nemotron Parse). */
+typedef enum { PULSAR_PIL_BICUBIC = 0, PULSAR_PIL_BILINEAR = 1 } pulsar_pil_filter;
+/** Pillow's Image.resize(BICUBIC | BILINEAR) of packed RGB8 (ImagingResample, fixed-point, horizontal then vertical),
+ *  bit for bit -- every family's resize whose reference is Pillow (DeepSeek's load_image, Qwen's PIL processor,
+ *  Parse's).  Returns a malloc'd dst_w x dst_h image (a copy when the size is unchanged), NULL on failure. */
+uint8_t *vision_pil_resize_rgb(const uint8_t *src, int src_w, int src_h, int dst_w, int dst_h, pulsar_pil_filter filter);
 int vision_decode_rgb(const uint8_t *bytes, size_t len,
                       uint8_t **rgb_out, int *w_out, int *h_out);
 

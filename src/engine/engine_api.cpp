@@ -363,6 +363,18 @@ bool pulsar_engine_encode_render(pulsar_engine *e, pulsar_encode_role role, cons
     }
     return e->family->encoder->render(e, role, text, doc, out, err, errlen);
 }
+bool pulsar_engine_is_parser(const pulsar_engine *e) {
+    return e && (e->family->caps & PULSAR_FAMILY_CAP_PARSE) && e->family->parser;
+}
+int pulsar_engine_parse_page(pulsar_engine *e, const uint8_t *image, size_t len, const pulsar_parse_options *opt,
+                             pulsar_tokens *ids, char **text, pulsar_parse_stats *stats, char *err, size_t errlen) {
+    PULSAR_FAMILY_REQUIRES_E(e, PULSAR_FAMILY_CAP_PARSE, "page parsing (not a parser family)", -1);
+    if (!e || !image || !ids || !text) {
+        if (err) snprintf(err, errlen, "no engine, image or output");
+        return -1;
+    }
+    return e->family->parser->parse(e, image, len, opt, ids, text, stats, err, errlen);
+}
 int pulsar_engine_encode(pulsar_engine *e, const pulsar_tokens *inputs, uint32_t n, float *out, char *err,
                          size_t errlen) {
     PULSAR_FAMILY_REQUIRES_E(e, PULSAR_FAMILY_CAP_ENCODE, "encoding (a decoder family)", -1);

@@ -25,13 +25,22 @@ def kind_of(hf, name: str) -> str:
     return PR.source_kind(hf.dtype(name), "scale" if hf.has(s) else None)
 
 
-def dense(hf, name: str, layout: str, dshape: list, mxfp8_mode: str = "rederive", axes: tuple = ()) -> dict:
+def dense(hf, name: str, layout: str, dshape: list, mxfp8_mode: str = "rederive", axes: tuple = (),
+          pad: tuple = ()) -> dict:
     """{dtype, shape, nbytes, src} of the entry writing HF tensor `name` as `layout`, declared `dshape` (the
     shape the container holds; dims_ne is its reverse).  `axes` (Mapped.axes): the source dims' permutation an
-    elementwise producer applies first."""
+    elementwise producer applies first; `pad` (Mapped.pad): the heads it zero-pads (f16, or an f32 copy)."""
     kind = kind_of(hf, name)
     prod = PR.producer_for(kind, layout, name)
     hshape = hf.shape(name)
+    if pad and prod == PR.COPY and kind == "F32" and layout == "f32":
+        n_el = 1
+        for d in dshape:
+            n_el *= d
+        return {"dtype": "F32", "shape": list(dshape), "nbytes": 4 * n_el,
+                "src": ("produce", PR.spec("f32_padded", [name], shape=list(hshape), pad=list(pad)))}
+    if pad and prod != "f16_from_f32":
+        raise SystemExit(f"{name}: padded heads are written by f16_from_f32 or as an f32 copy, not {prod}")
     if prod == PR.COPY:
         src, n = hf.copy_src(name)          # the source's own bytes: a range, or a family view's derivation
         return {"dtype": hf.dtype(name), "shape": list(dshape), "nbytes": n, "src": src}
@@ -45,10 +54,10 @@ def dense(hf, name: str, layout: str, dshape: list, mxfp8_mode: str = "rederive"
         n_el = 1
         for d in hshape:
             n_el *= d
-        if nbytes != 2 * n_el:
+        if not pad and nbytes != 2 * n_el:
             raise SystemExit(f"{name}: declared {dshape} holds {nbytes // 2} elements, the source {hshape} {n_el}")
         return {"dtype": "F16", "shape": list(dshape), "nbytes": nbytes,
-                "src": ("produce", PR.spec(prod, [name], shape=list(hshape), axes=list(axes)))}
+                "src": ("produce", PR.spec(prod, [name], shape=list(hshape), axes=list(axes), pad=list(pad)))}
     if axes:
         raise SystemExit(f"{name}: a permutation is an elementwise producer's (f16); {prod} reads the source as is")
     if len(hshape) != 2:

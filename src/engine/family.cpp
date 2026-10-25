@@ -46,6 +46,7 @@ const char *pulsar_layer_plan_check(const pulsar_layer_plan *p, uint32_t *at_lay
 extern const pulsar_family PULSAR_FAMILY_INKLING;
 extern const pulsar_family PULSAR_FAMILY_NEMOTRON_H;
 extern const pulsar_family PULSAR_FAMILY_NEMOTRON_ENC;
+extern const pulsar_family PULSAR_FAMILY_NEMOTRON_PARSE;
 
 /* Every family the engine serves.  The ONE place an architecture string is
  * mapped to code. */
@@ -55,6 +56,7 @@ static const pulsar_family *const k_families[] = {
     &PULSAR_FAMILY_INKLING,
     &PULSAR_FAMILY_NEMOTRON_H,
     &PULSAR_FAMILY_NEMOTRON_ENC,
+    &PULSAR_FAMILY_NEMOTRON_PARSE,
 };
 
 const pulsar_family *pulsar_family_for_model(const pulsar_model *m) {
@@ -73,9 +75,10 @@ const pulsar_family *pulsar_family_for_model(const pulsar_model *m) {
                     f->banks ? "out of step with its PULSAR_FAMILY_CAP_REWIND" : "missing");
             return NULL;
         }
-        if (((f->caps & PULSAR_FAMILY_CAP_ENCODE) != 0) != (f->encoder != NULL)) {
-            fprintf(stderr, "pulsar: the %s family's encoder entries are out of step with its PULSAR_FAMILY_CAP_ENCODE "
-                            "-- refusing\n", f->name);
+        if (((f->caps & PULSAR_FAMILY_CAP_ENCODE) != 0) != (f->encoder != NULL) ||
+            ((f->caps & PULSAR_FAMILY_CAP_PARSE) != 0) != (f->parser != NULL)) {
+            fprintf(stderr, "pulsar: the %s family's encoder / parser entries are out of step with its "
+                            "PULSAR_FAMILY_CAP_ENCODE / _PARSE -- refusing\n", f->name);
             return NULL;
         }
         return f;

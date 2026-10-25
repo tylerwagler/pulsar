@@ -70,11 +70,18 @@ PINS = {
 }
 PROMPT = "</s><s><predict_bbox><predict_classes><output_markdown><predict_text_in_pic>"   # the card's default
 
-# per ViT block: HF suffix -> (bind role, recipe role, shape)
+# The ViT's heads (16 of 72) are stored zero-padded to 96 -- a tile of the shared attention kernel (pulsar_cuda_attn_gqa:
+# 64, 96, 128): q | k | v each 16 x 96 wide, the projection reading 16 x 96 inputs.  A zero weight row writes an exact
+# zero, a zero column reads nothing, so the padded attention is the unpadded one (its scale stays 1 / sqrt(72)).
+VIT_PAD_QKV = (0, 3, 16, 72, 96)
+VIT_PAD_PROJ = (1, 1, 16, 72, 96)
+# per ViT block: HF suffix -> (bind role, recipe role, shape[, declared shape, pad])
 VIT_BLOCK = {
     "norm1.weight": ("vit_norm1", "norm", [1152]), "norm1.bias": ("vit_norm1_bias", "norm", [1152]),
-    "attn.qkv.weight": ("vit_qkv", "dense", [3456, 1152]), "attn.qkv.bias": ("vit_qkv_bias", "norm", [3456]),
-    "attn.proj.weight": ("vit_proj", "dense", [1152, 1152]), "attn.proj.bias": ("vit_proj_bias", "norm", [1152]),
+    "attn.qkv.weight": ("vit_qkv", "dense", [3456, 1152], [4608, 1152], VIT_PAD_QKV),
+    "attn.qkv.bias": ("vit_qkv_bias", "norm", [3456], [4608], VIT_PAD_QKV),
+    "attn.proj.weight": ("vit_proj", "dense", [1152, 1152], [1152, 1536], VIT_PAD_PROJ),
+    "attn.proj.bias": ("vit_proj_bias", "norm", [1152]),
     "norm2.weight": ("vit_norm2", "norm", [1152]), "norm2.bias": ("vit_norm2_bias", "norm", [1152]),
     "mlp.fc1.weight": ("vit_fc1", "dense", [4304, 1152]), "mlp.fc1.bias": ("vit_fc1_bias", "norm", [4304]),
     "mlp.fc2.weight": ("vit_fc2", "dense", [1152, 4304]), "mlp.fc2.bias": ("vit_fc2_bias", "norm", [1152]),
@@ -167,17 +174,18 @@ def expected():
     """{HF name: (dtype, source shape, Mapped)} for every tensor the declaration writes."""
     out = {}
 
-    def add(name, shape, bind, role, shard, block=None, layer=None, dshape=None, axes=()):
+    def add(name, shape, bind, role, shard, block=None, layer=None, dshape=None, axes=(), pad=()):
         rec = (("role", bind),) + ((("block", block), ("layer", layer)) if block is not None else ())
         fam = "layer" if layer is not None else "top"
         out[name] = ("F32", shape, Mapped(name, name, fam, shard, layer, None, None, False, role=role, bind=rec,
-                                          axes=tuple(axes)), dshape or shape)
+                                          axes=tuple(axes), pad=tuple(pad)), dshape or shape)
 
     for name, (bind, role, shp, dshp, axes) in VISION_TOP.items():
         add(name, shp, bind, role, "vision", dshape=dshp, axes=axes)
     for il in range(N_VIT):
-        for s, (bind, role, shp) in VIT_BLOCK.items():
-            add(f"{VIT}blocks.{il}.{s}", shp, bind, role, "vision", "vit", il)
+        for s, (bind, role, shp, *dp) in VIT_BLOCK.items():
+            add(f"{VIT}blocks.{il}.{s}", shp, bind, role, "vision", "vit", il, dshape=dp[0] if dp else None,
+                pad=dp[1] if dp else ())
     for il in range(N_DEC):
         for s, (bind, role, shp) in DEC_LAYER.items():
             add(f"decoder.layers.{il}.{s}", shp, bind, role, f"layers.{il}", "layers", il)
@@ -275,6 +283,7 @@ def build_kv(hf, ctx):
            ("general.name", "string", "Nemotron-3.5-Parse"),
            (P + "vit.width", "u32", 1152), (P + "vit.depth", "u32", N_VIT), (P + "vit.heads", "u32", 16),
            (P + "vit.mlp", "u32", 4304), (P + "vit.patch", "u32", 16), (P + "vit.n_cls", "u32", 10),
+           (P + "vit.head_dim", "u32", 72), (P + "vit.head_dim_stored", "u32", 96),
            (P + "vit.pos_grid", "u32", 128), (P + "vit.norm_eps", "f32", 1e-6),
            (P + "neck.width", "u32", 1024), (P + "neck.merge", "u32", 4), (P + "neck.norm_eps", "f32", 1e-6),
            (P + "dec.width", "u32", 1024), (P + "dec.layers", "u32", N_DEC), (P + "dec.heads", "u32", 16),
