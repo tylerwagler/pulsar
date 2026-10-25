@@ -28,6 +28,10 @@ bool load(pulsar_engine *e, const pulsar_engine_options *opt) {
         fprintf(stderr, "pulsar: %s: --expert-overlay is a DeepSeek routed-expert tool; refusing\n", ARCH);
         return false;
     }
+    if (opt->rope_yarn_factor != 0.0) {
+        fprintf(stderr, "pulsar: %s: --rope-yarn: this family has no rope to scale; refusing\n", ARCH);
+        return false;
+    }
     if (opt->directional_steering_file && opt->directional_steering_file[0]) {
         fprintf(stderr, "pulsar: %s: directional steering is not implemented for this family; refusing\n", ARCH);
         return false;
@@ -131,6 +135,7 @@ const pulsar_family PULSAR_FAMILY_NEMOTRON_PARSE = {
     /* .chat_format  = */ chat_format,
     /* .model_id     = */ model_id,
     /* .trained_ctx  = */ trained_context,
+    /* .rope_id      = */ pulsar_family_rope_fixed,
     /* .tp_shape     = */ NULL,
     /* .drafter      = */ drafter,
     /* .quant_bits   = */ quant_bits,
