@@ -195,10 +195,15 @@ static double vc_slope(const pulsar_verify_curve *c) {
     return c->slope.get(&v) && v > 0.0 ? v : 0.0;
 }
 
+/* The verify forward of `rows` rows: the profile + the correction (rows past the profile clamp to its widest). */
+static double vc_forward_ms(const pulsar_verify_curve *c, uint32_t rows) {
+    if (rows > c->rows_max) rows = c->rows_max;
+    return c->base_ms[rows] + vc_slope(c) * (double)rows;
+}
+
 /* round_ms(n, rows): see the head of the file.  rows in [1, rows_max]. */
 static double vc_round_ms(const pulsar_verify_curve *c, uint32_t n, uint32_t rows) {
-    return c->base_ms[rows] + vc_slope(c) * (double)rows + vc_recent(c->host, &c->host_any, n) +
-           vc_recent(c->draft, &c->draft_any, n);
+    return vc_forward_ms(c, rows) + vc_recent(c->host, &c->host_any, n) + vc_recent(c->draft, &c->draft_any, n);
 }
 
 /* The curve the server's pick reads: the engine's -- on a tensor-parallel group only the leader holds one, and its
@@ -386,6 +391,8 @@ void pulsar_engine_verify_curve_view(const pulsar_engine *e, pulsar_verify_curve
 }
 
 /* ---- the profile and its cache ----------------------------------------------------------------------------- */
+
+static void pf_announce(const pulsar_prefill_cost_fit *f, const char *why);   /* L327, below */
 
 /* What a profile depends on: the container (and an external drafter's), the drafter, the widest step, the bank pool
  * and context the session was built with, and the build that runs the kernels. */
@@ -618,6 +625,16 @@ int pulsar_session_verify_curve_open(pulsar_session *s, const char *cache_dir, c
     fprintf(stderr, "pulsar: verify curve %s (key %016llx, %.1f s): ms at 1..%u rows:%s\n",
             c->cached ? "loaded from the cache" : "profiled", (unsigned long long)c->key, now_sec() - t0, rows_max,
             line);
+    /* L327: the prompt chunk cost fit beside it, under its key -- read back only with a cached curve (a curve
+     * profiled again starts a fresh fit), written as it moves; a pair's leader fits nothing (the observations stop
+     * at e->tp) */
+    pulsar_prefill_cost_fit *pf = &e->prefill_cost;
+    pf->cache_path[0] = '\0';
+    if (!e->tp && pulsar_prefill_fit_path(cache_dir, key, pf->cache_path, sizeof pf->cache_path)) {
+        pf->cache_key = key;
+        if (cached && pulsar_prefill_fit_read(pf->cache_path, key, pf)) pf_announce(pf, "loaded from the cache");
+        else pf->saved_n = pf->n;
+    }
     return 0;
 }
 
@@ -643,114 +660,254 @@ void pulsar_spec_calibration_note(pulsar_engine *e, bool copy, const float *conf
     }
 }
 
-/* ---- L304: the fused step's prompt cost ------------------------------------------------------------------------
+
+/* ---- L304 / L327: what a prompt chunk costs ---------------------------------------------------------------------
  *
- * After DeepInfer's prefill load balancer (doc/inference_deployment_qa.md, "within a single GPU"): a fused step's
- * cost is fitted, not assumed, so the server can price every chunk it might carry (L312: the value-per-time round
- * selection, src/server/sched_value.cpp, reads it through pulsar_engine_fused_step_ms).  A fused step's forward
- * carries the decode banks' verify rows and each riding prompt's chunk of q rows over the c rows of it already
- * computed; the chunk's rows each pay the dense and expert work (linear in q) and attend over c + their own causal
- * prefix (q * (c + q / 2) pairs).  So
+ * After DeepInfer's prefill load balancer (doc/inference_deployment_qa.md, "within a single GPU"): a prompt chunk's
+ * cost is fitted, not assumed.  A chunk of q rows over the c rows of its prompt already computed pays the dense and
+ * expert work of its rows (linear in q) and attention over c + its own causal prefix (q * (c + q / 2) pairs), on top
+ * of a fixed cost per chunk:
  *
- *     forward_ms = a + alpha * sum q + beta * sum q (c + q / 2)
+ *     chunk_ms = fixed[kind] + alpha * q + beta * q (c + q / 2)
  *
- * with a the verify rows and the step's fixed cost.  An exponentially weighted least-squares fit over the fused steps
- * the server reports (weight 1 - 1/64 a step: a prompt's chunks move c through the window); beta clamps at 0 (a
- * short context's attention is lost in the noise: the two-term fit then).  No number until 8 steps are in and the
- * terms are positive. */
+ * ONE exponentially weighted least-squares fit over every chunk the engine runs (weight 1 - 1/64 a chunk: a prompt's
+ * chunks move c through the window), two kinds of chunk:
+ *
+ *   - solo: a prefill chunk of the sync's own loop (prefill_loop.cpp), the whole forward -- what a single-user server
+ *     runs almost exclusively (L320: 17 fused rounds in 22 h of Claude Code, the fit armed after every restore
+ *     decision had gone unpriced);
+ *   - fused: the prompt runs riding a spec round's forward beside its verify rows (L260), reported by the server with
+ *     the step's wall; the verify rows' forward on the L301 curve (the profile + its online correction: the same
+ *     number the decode-only round is priced with) is taken off, so what is fitted is what the prompt ADDS to the
+ *     round.  No curve, no fused observation.
+ *
+ * The rows and pairs terms are shared: both kinds run the prompt rows on the prefill arms (a split-invariant family's
+ * every prompt row, session_contract_gate C1), so a row and a pair cost the same wherever the chunk rides.  The fixed
+ * term is the kind's own, because it is not the same quantity: a solo chunk pays the whole step (the launches, the
+ * weights' first pass for few rows, the head), a fused one only what its prompt adds to a step the verify rows
+ * already paid for -- L320's fused fit, verify rows and all in its fixed term, over-predicted the 18:08 solo prefill
+ * of 79.7k tokens by 28% (82.5 s vs 64.2 s).  Measured, never argued: if the two coincide, the two fixed terms say so.
+ * The fused fixed term may be negative (the verify rows' forward a prompt chunk shares); the solo one clamps at 0.
+ *
+ * Which term reads what: the round selection (L312) prices a fused round as the decode-only round plus
+ * pulsar_engine_fused_prompt_ms (the fused terms); the disk tier's restore-vs-recompute (L310) prices a recompute as
+ * a solo prefill, pulsar_engine_prefill_ms (the solo terms, the fixed one a chunk of the prefill grid).  A kind is
+ * priced once 8 chunks are in, 4 of them its own (its fixed term is no one chunk's noise), and the shared terms
+ * come out positive; beta clamps at 0 (a short context's attention is lost in the noise: the fit without it then).
+ *
+ * The fit persists beside the verify curve (pulsar_session_verify_curve_open), under the curve's key -- the
+ * container, drafter, pool, context and build -- and only with it: a curve profiled again (a new build, the TTL)
+ * starts a fresh fit.  Written every FC_SAVE_EVERY chunks and when a kind arms. */
 #define FC_DECAY (1.0 - 1.0 / 64.0)
 #define FC_MIN_OBS 8u
+#define FC_KIND_MIN 4u
+#define FC_SAVE_EVERY 16u
+#define FC_PIVOT_MIN 1e-7   /* of the scaled normal matrix (unit diagonal): a column that the others all but span */
 
-static bool fc_solve(const pulsar_fused_cost_fit *f, double *a, double *alpha, double *beta) {
-    /* the normal equations of [1, x1, x2] */
-    const double m[3][3] = {{f->w, f->s1, f->s2}, {f->s1, f->s11, f->s12}, {f->s2, f->s12, f->s22}};
-    const double v[3] = {f->sy, f->s1y, f->s2y};
-    const auto det3 = [](const double (&x)[3][3]) {
-        return x[0][0] * (x[1][1] * x[2][2] - x[1][2] * x[2][1]) - x[0][1] * (x[1][0] * x[2][2] - x[1][2] * x[2][0]) +
-               x[0][2] * (x[1][0] * x[2][1] - x[1][1] * x[2][0]);
-    };
-    const double d = det3(m);
-    if (fabs(d) > 1e-9 * (f->w * f->s11 * f->s22 + 1.0)) {
-        double r[3];
-        for (int k = 0; k < 3; k++) {
-            double mk[3][3];
-            memcpy(mk, m, sizeof mk);
-            for (int i = 0; i < 3; i++) mk[i][k] = v[i];
-            r[k] = det3(mk) / d;
-        }
-        if (r[1] > 0.0 && r[2] >= 0.0) {
-            *a = r[0];
-            *alpha = r[1];
-            *beta = r[2];
-            return true;
+/* The normal equations over the columns `cols`, scaled to a unit diagonal, by elimination with partial pivoting;
+ * false when a column is (all but) spanned by the others. */
+static bool pf_solve(const pulsar_prefill_cost_fit *f, const int *cols, int k, double *out) {
+    double a[PULSAR_PREFILL_FIT_DIM][PULSAR_PREFILL_FIT_DIM + 1], d[PULSAR_PREFILL_FIT_DIM];
+    for (int i = 0; i < k; i++) {
+        if (!(f->m[cols[i]][cols[i]] > 0.0)) return false;
+        d[i] = 1.0 / sqrt(f->m[cols[i]][cols[i]]);
+    }
+    for (int i = 0; i < k; i++) {
+        for (int j = 0; j < k; j++) a[i][j] = f->m[cols[i]][cols[j]] * d[i] * d[j];
+        a[i][k] = f->v[cols[i]] * d[i];
+    }
+    for (int p = 0; p < k; p++) {
+        int piv = p;
+        for (int i = p + 1; i < k; i++)
+            if (fabs(a[i][p]) > fabs(a[piv][p])) piv = i;
+        if (!(fabs(a[piv][p]) > FC_PIVOT_MIN)) return false;
+        if (piv != p)
+            for (int j = 0; j <= k; j++) std::swap(a[p][j], a[piv][j]);
+        for (int i = p + 1; i < k; i++) {
+            const double r = a[i][p] / a[p][p];
+            for (int j = p; j <= k; j++) a[i][j] -= r * a[p][j];
         }
     }
-    /* the two-term fit [1, x1] */
-    const double d2 = f->w * f->s11 - f->s1 * f->s1;
-    if (!(d2 > 1e-9 * (f->w * f->s11 + 1.0))) return false;
-    *alpha = (f->w * f->s1y - f->s1 * f->sy) / d2;
-    *a = (f->sy - *alpha * f->s1) / f->w;
-    *beta = 0.0;
-    return *alpha > 0.0;
+    for (int i = k - 1; i >= 0; i--) {
+        double s = a[i][k];
+        for (int j = i + 1; j < k; j++) s -= a[i][j] * out[j];
+        out[i] = s / a[i][i];
+    }
+    for (int i = 0; i < k; i++) out[i] *= d[i];
+    return true;
 }
 
-void pulsar_engine_fused_cost_observe(pulsar_engine *e, uint32_t n_runs, const uint32_t *q, const uint32_t *c,
-                                      double forward_ms) {
-    if (!e || e->tp || n_runs == 0u || !(forward_ms > 0.0)) return;
-    double x1 = 0.0, x2 = 0.0;
-    for (uint32_t i = 0; i < n_runs; i++) {
-        x1 += (double)q[i];
-        x2 += (double)q[i] * ((double)c[i] + 0.5 * (double)q[i]);
+/* The terms from the sums: every kind seen, the rows, the pairs -- or without the pairs when their term comes out
+ * negative (or they cannot be told from the rows). */
+static void pf_refit(pulsar_prefill_cost_fit *f) {
+    f->valid[PULSAR_CHUNK_SOLO] = f->valid[PULSAR_CHUNK_FUSED] = false;
+    if (f->n < FC_MIN_OBS) return;
+    int cols[PULSAR_PREFILL_FIT_DIM], k = 0;
+    for (int kind = 0; kind < PULSAR_CHUNK_KINDS; kind++)
+        if (f->n_kind[kind] > 0u && f->m[kind][kind] > 0.0) cols[k++] = kind;
+    const int nk = k;
+    if (nk == 0) return;
+    cols[k++] = 2;
+    cols[k++] = 3;
+    double r[PULSAR_PREFILL_FIT_DIM];
+    bool ok = pf_solve(f, cols, k, r) && r[nk] > 0.0 && r[nk + 1] >= 0.0;
+    if (!ok) {
+        ok = pf_solve(f, cols, k - 1, r) && r[nk] > 0.0;
+        r[nk + 1] = 0.0;
     }
-    x2 *= 1e-6;   /* in M pairs: the normal equations stay well scaled */
-    pulsar_fused_cost_fit *f = &e->fused_cost;
-    f->w = f->w * FC_DECAY + 1.0;
-    f->s1 = f->s1 * FC_DECAY + x1;
-    f->s2 = f->s2 * FC_DECAY + x2;
-    f->s11 = f->s11 * FC_DECAY + x1 * x1;
-    f->s12 = f->s12 * FC_DECAY + x1 * x2;
-    f->s22 = f->s22 * FC_DECAY + x2 * x2;
-    f->sy = f->sy * FC_DECAY + forward_ms;
-    f->s1y = f->s1y * FC_DECAY + x1 * forward_ms;
-    f->s2y = f->s2y * FC_DECAY + x2 * forward_ms;
+    if (!ok) return;
+    for (int i = 0; i < nk; i++) {
+        f->fixed_ms[cols[i]] = cols[i] == PULSAR_CHUNK_SOLO && r[i] < 0.0 ? 0.0 : r[i];
+        f->valid[cols[i]] = f->n_kind[cols[i]] >= FC_KIND_MIN;
+    }
+    f->alpha_ms = r[nk];
+    f->beta_ms = r[nk + 1] * 1e-6;
+}
+
+bool pulsar_prefill_fit_path(const char *cache_dir, uint64_t key, char *out, size_t cap) {
+    if (!cache_dir || !cache_dir[0] || cap == 0u) return false;
+    const int n = snprintf(out, cap, "%s/%016llx.fit", cache_dir, (unsigned long long)key);
+    return n > 0 && (size_t)n < cap;
+}
+
+#define PF_CACHE_VERSION 1u
+
+bool pulsar_prefill_fit_read(const char *path, uint64_t key, pulsar_prefill_cost_fit *f) {
+    FILE *fp = path && path[0] ? fopen(path, "r") : NULL;
+    if (!fp) return false;
+    unsigned version = 0, n = 0, ns = 0, nf = 0;
+    unsigned long long k = 0;
+    bool ok = fscanf(fp, "pulsar-prefill-fit %u key %llx n %u solo %u fused %u", &version, &k, &n, &ns, &nf) == 5 &&
+              version == PF_CACHE_VERSION && k == key && ns + nf == n;
+    double m[PULSAR_PREFILL_FIT_DIM][PULSAR_PREFILL_FIT_DIM], v[PULSAR_PREFILL_FIT_DIM];
+    for (int i = 0; ok && i < PULSAR_PREFILL_FIT_DIM; i++)
+        for (int j = i; ok && j < PULSAR_PREFILL_FIT_DIM; j++) {
+            ok = fscanf(fp, "%lf", &m[i][j]) == 1 && isfinite(m[i][j]);
+            m[j][i] = m[i][j];
+        }
+    for (int i = 0; ok && i < PULSAR_PREFILL_FIT_DIM; i++) ok = fscanf(fp, "%lf", &v[i]) == 1 && isfinite(v[i]);
+    fclose(fp);
+    if (!ok) return false;
+    memcpy(f->m, m, sizeof m);
+    memcpy(f->v, v, sizeof v);
+    f->n = n;
+    f->n_kind[PULSAR_CHUNK_SOLO] = ns;
+    f->n_kind[PULSAR_CHUNK_FUSED] = nf;
+    f->saved_n = n;
+    f->ann_n = n;
+    f->ann_kind[PULSAR_CHUNK_SOLO] = f->ann_kind[PULSAR_CHUNK_FUSED] = false;
+    pf_refit(f);
+    f->ann_alpha = f->alpha_ms;
+    f->ann_beta = f->beta_ms;
+    for (int kind = 0; kind < PULSAR_CHUNK_KINDS; kind++) f->ann_kind[kind] = f->valid[kind];
+    return true;
+}
+
+bool pulsar_prefill_fit_write(const char *path, uint64_t key, const pulsar_prefill_cost_fit *f) {
+    char tmp[4200];
+    if (!path || !path[0] || snprintf(tmp, sizeof tmp, "%s.%d.tmp", path, (int)getpid()) >= (int)sizeof tmp)
+        return false;
+    FILE *fp = fopen(tmp, "w");
+    if (!fp) return false;
+    fprintf(fp, "pulsar-prefill-fit %u key %016llx n %u solo %u fused %u\n", PF_CACHE_VERSION,
+            (unsigned long long)key, f->n, f->n_kind[PULSAR_CHUNK_SOLO], f->n_kind[PULSAR_CHUNK_FUSED]);
+    for (int i = 0; i < PULSAR_PREFILL_FIT_DIM; i++)
+        for (int j = i; j < PULSAR_PREFILL_FIT_DIM; j++) fprintf(fp, "%.17g\n", f->m[i][j]);
+    for (int i = 0; i < PULSAR_PREFILL_FIT_DIM; i++) fprintf(fp, "%.17g\n", f->v[i]);
+    /* no fsync: it is rewritten as it moves, and a torn file fails the read's checks (a fresh fit) */
+    const bool ok = fclose(fp) == 0 && rename(tmp, path) == 0;
+    if (!ok) unlink(tmp);
+    return ok;
+}
+
+static void pf_announce(const pulsar_prefill_cost_fit *f, const char *why) {
+    char t[2][32];
+    for (int kind = 0; kind < PULSAR_CHUNK_KINDS; kind++) {
+        if (f->valid[kind]) snprintf(t[kind], sizeof t[kind], "%.1f", f->fixed_ms[kind]);
+        else snprintf(t[kind], sizeof t[kind], "-");
+    }
+    fprintf(stderr, "pulsar: prompt chunk cost %s: solo %s / fused %s ms + %.4f x rows + %.3f x M pairs (%u chunks: "
+                    "%u solo, %u fused)\n",
+            why, t[PULSAR_CHUNK_SOLO], t[PULSAR_CHUNK_FUSED], f->alpha_ms, f->beta_ms * 1e6, f->n,
+            f->n_kind[PULSAR_CHUNK_SOLO], f->n_kind[PULSAR_CHUNK_FUSED]);
+}
+
+static void pf_observe(pulsar_engine *e, int kind, uint32_t n_runs, const uint32_t *q, const uint32_t *c, double y) {
+    double x[PULSAR_PREFILL_FIT_DIM] = {kind == PULSAR_CHUNK_SOLO ? 1.0 : 0.0, kind == PULSAR_CHUNK_FUSED ? 1.0 : 0.0,
+                                        0.0, 0.0};
+    for (uint32_t i = 0; i < n_runs; i++) {
+        x[2] += (double)q[i];
+        x[3] += (double)q[i] * ((double)c[i] + 0.5 * (double)q[i]);
+    }
+    x[3] *= 1e-6;   /* in M pairs: the normal equations stay well scaled */
+    pulsar_prefill_cost_fit *f = &e->prefill_cost;
+    for (int i = 0; i < PULSAR_PREFILL_FIT_DIM; i++) {
+        for (int j = 0; j < PULSAR_PREFILL_FIT_DIM; j++) f->m[i][j] = f->m[i][j] * FC_DECAY + x[i] * x[j];
+        f->v[i] = f->v[i] * FC_DECAY + x[i] * y;
+    }
     f->n++;
-    double a = 0.0, al = 0.0, be = 0.0;
-    f->valid = f->n >= FC_MIN_OBS && fc_solve(f, &a, &al, &be);
-    if (!f->valid) return;
-    f->a_ms = a > 0.0 ? a : 0.0;
-    f->alpha_ms = al;
-    f->beta_ms = be * 1e-6;
-    /* rule 5: the fit announces itself when it arms and, at most once in 256 steps, when a term moved by half */
-    const bool first = f->ann_n == 0u;
-    const bool moved = !first && f->n - f->ann_n >= 256u &&
+    f->n_kind[kind]++;
+    pf_refit(f);
+    /* rule 5: the fit announces each kind as it arms and, at most once in 256 chunks, a shared term moved by half */
+    bool armed = false;
+    for (int k = 0; k < PULSAR_CHUNK_KINDS; k++)
+        if (f->valid[k] && !f->ann_kind[k]) armed = f->ann_kind[k] = true;
+    const bool any = f->valid[PULSAR_CHUNK_SOLO] || f->valid[PULSAR_CHUNK_FUSED];
+    const bool moved = any && !armed && f->n - f->ann_n >= 256u &&
                        (fabs(f->alpha_ms - f->ann_alpha) * 2.0 > f->ann_alpha ||
                         fabs(f->beta_ms - f->ann_beta) * 2.0 > f->ann_beta + 1e-12);
-    if (first || moved) {
+    if (armed || moved) {
         f->ann_n = f->n;
         f->ann_alpha = f->alpha_ms;
         f->ann_beta = f->beta_ms;
-        fprintf(stderr, "pulsar: fused step cost measured: %.1f + %.4f x rows + %.3f x M pairs ms (%u steps%s)\n",
-                f->a_ms, f->alpha_ms, f->beta_ms * 1e6, f->n, first ? "" : ", moved");
+        pf_announce(f, armed ? "measured" : "moved");
+    }
+    if (f->cache_path[0] && (armed || f->n - f->saved_n >= FC_SAVE_EVERY)) {
+        f->saved_n = f->n;
+        static bool said = false;   /* rule 9: once */
+        if (!pulsar_prefill_fit_write(f->cache_path, f->cache_key, f) && !said) {
+            said = true;
+            fprintf(stderr, "pulsar: prompt chunk cost: cannot write %s (%s); the fit is measured again next start\n",
+                    f->cache_path, strerror(errno));
+        }
     }
 }
 
-bool pulsar_engine_fused_step_ms(const pulsar_engine *e, uint32_t n_runs, const uint32_t *q, const uint32_t *c,
-                                 double *ms) {
-    const pulsar_fused_cost_fit *f = e ? &e->fused_cost : NULL;
+void pulsar_engine_fused_cost_observe(pulsar_engine *e, uint32_t n_runs, const uint32_t *q, const uint32_t *c,
+                                      uint32_t verify_rows, double forward_ms) {
+    const pulsar_verify_curve *vc = vc_leader(e);
+    if (!e || e->tp || !vc || n_runs == 0u || !(forward_ms > 0.0)) return;
+    pf_observe(e, PULSAR_CHUNK_FUSED, n_runs, q, c, forward_ms - (verify_rows ? vc_forward_ms(vc, verify_rows) : 0.0));
+}
+
+void pulsar_engine_prefill_chunk_observe(pulsar_engine *e, uint32_t q, uint32_t c, double ms) {
+    if (!e || e->tp || q == 0u || !(ms > 0.0)) return;
+    pf_observe(e, PULSAR_CHUNK_SOLO, 1u, &q, &c, ms);
+}
+
+static double pf_rows_ms(const pulsar_prefill_cost_fit *f, uint32_t q, uint32_t c) {
+    return f->alpha_ms * (double)q + f->beta_ms * (double)q * ((double)c + 0.5 * (double)q);
+}
+
+bool pulsar_engine_fused_prompt_ms(const pulsar_engine *e, uint32_t n_runs, const uint32_t *q, const uint32_t *c,
+                                   double *ms) {
+    const pulsar_prefill_cost_fit *f = e ? &e->prefill_cost : NULL;
     *ms = 0.0;
-    if (!f || !f->valid) return false;
-    double t = f->a_ms;
-    for (uint32_t i = 0; i < n_runs; i++)
-        t += f->alpha_ms * (double)q[i] + f->beta_ms * (double)q[i] * ((double)c[i] + 0.5 * (double)q[i]);
+    if (!f || !f->valid[PULSAR_CHUNK_FUSED]) return false;
+    double t = f->fixed_ms[PULSAR_CHUNK_FUSED];
+    for (uint32_t i = 0; i < n_runs; i++) t += pf_rows_ms(f, q[i], c[i]);
     *ms = t;
     return true;
 }
 
 bool pulsar_engine_prefill_ms(const pulsar_engine *e, uint32_t q, uint32_t c, uint32_t chunk, double *ms) {
-    const pulsar_fused_cost_fit *f = e ? &e->fused_cost : NULL;
+    const pulsar_prefill_cost_fit *f = e ? &e->prefill_cost : NULL;
     *ms = 0.0;
-    if (!f || !f->valid || chunk == 0u) return false;
-    const uint32_t chunks = q / chunk + (q % chunk != 0u ? 1u : 0u);
-    *ms = f->a_ms * (double)chunks + f->alpha_ms * (double)q + f->beta_ms * (double)q * ((double)c + 0.5 * (double)q);
+    if (!f || !f->valid[PULSAR_CHUNK_SOLO] || chunk == 0u) return false;
+    /* the chunks a prefill of [c, c + q) runs: one per cell of the grid it crosses (pulsar_prefill_plan_next_end
+     * snaps every chunk end to the grid) */
+    const uint64_t end = (uint64_t)c + q;
+    const uint64_t chunks = q ? (end + chunk - 1u) / chunk - (uint64_t)c / chunk : 0u;
+    *ms = f->fixed_ms[PULSAR_CHUNK_SOLO] * (double)chunks + pf_rows_ms(f, q, c);
     return true;
 }

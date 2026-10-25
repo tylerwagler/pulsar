@@ -95,6 +95,8 @@ int pulsar_kvchain_find(pulsar_segstore *st, const char *text, size_t text_len, 
 /** L323: the bytes a load of `chain` (n segments) reads -- every segment's rows and trailer, the last one's state too
  *  -- the read pulsar_kvchain_find prices against the prefill it saves. */
 uint64_t pulsar_kvchain_load_bytes(const pulsar_segstore_seg *chain, int n);
+/** L327: how many of those bytes are in the page cache now (pulsar_segstore_cached_bytes over the same parts). */
+uint64_t pulsar_kvchain_cached_bytes(pulsar_segstore *st, const pulsar_segstore_seg *chain, int n);
 /** L310: load the `n` segments pulsar_kvchain_find returned for `text` into the installed bank.  Returns the position
  *  the bank stands at; 0 when a segment would not load or the chain disagrees with its tokens at the boundary (that
  *  chain is dropped, the bank invalidated, `err` says which).  The chain is touched on success. */

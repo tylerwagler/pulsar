@@ -127,6 +127,10 @@ FILE *pulsar_segstore_open_payload(pulsar_segstore *st, const char key[41], uint
 /** Open a segment's trailer for reading, positioned at its first byte; NULL when
  * the segment carries none. */
 FILE *pulsar_segstore_open_trailer(pulsar_segstore *st, const char key[41], uint64_t *trailer_bytes);
+/** L327: how many bytes of a segment's first `payload_len` payload bytes (and, with `trailer`, of its trailer) are in
+ *  the page cache now (mincore; 0 for a key not stored or a file that will not map) -- a read of them costs memory
+ *  bandwidth, not the disk's. */
+uint64_t pulsar_segstore_cached_bytes(pulsar_segstore *st, const char key[41], uint64_t payload_len, bool trailer);
 /** Record a use of every segment of a chain (hit count + last_used). */
 void pulsar_segstore_touch(pulsar_segstore *st, const pulsar_segstore_seg *chain, int n);
 /** Called with every key the store removes (drop, release, eviction, an orphan

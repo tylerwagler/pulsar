@@ -12,8 +12,10 @@
  *     at its price out_value + f_d * inv_i, a finishing chunk's first token at out_value, and each prompt row at its
  *     price 1 + f_p * inv_j.  Value is counted in prompt tokens.
  *   - T(a): the round's predicted wall on the engine's MEASURED costs, the one authority for each: a decode-only
- *     round on the L301 verify curve, round_ms(n, rows); a fused round on the L304 fused-step fit plus the curve's
- *     part outside the forward (host + drafting).  No cost model of its own, no constant of a deployment.
+ *     round on the L301 verify curve, round_ms(n, rows); a fused round as that round plus what its prompt chunks add
+ *     to it (L327: the prompt chunk cost fit's fused terms, pulsar_engine_fused_prompt_ms -- the fit takes the verify
+ *     rows' forward off each fused step it observes, on the same curve).  No cost model of its own, no constant of a
+ *     deployment.
  *   - The age terms (Flare's decode-age continuation): c prices a stream's waiting per ms^2, so holding n streams
  *     for T costs c (A T + T^2 / 2) each; dividing by T and dropping what every candidate shares leaves the two terms
  *     above (A_i: stream i's time since its last output, T_dec: the reference round, the decode-only one, since
@@ -86,12 +88,13 @@ double sched_prompt_rate_max(const pulsar_engine *e, const sched_round *r, const
     const int k = sched_cands(pr, room_rows, c, SCHED_CANDS_MAX);
     if (k == 0) return 0.0;
     double outside = 0.0;
-    if (!(pulsar_engine_verify_round_ms(e, r->n_live ? r->n_live : 1u, r->n_live ? r->n_live : 1u, &outside) > 0.0))
-        return 0.0;
+    const double base =
+            pulsar_engine_verify_round_ms(e, r->n_live ? r->n_live : 1u, r->n_live ? r->n_live : 1u, &outside);
+    if (!(base > 0.0)) return 0.0;
     const uint32_t q = c[k - 1].q, at = pr->p0;
     double ms = 0.0;
-    if (!pulsar_engine_fused_step_ms(e, 1u, &q, &at, &ms)) return 0.0;
-    return (double)q / (ms + outside);
+    if (!pulsar_engine_fused_prompt_ms(e, 1u, &q, &at, &ms)) return 0.0;
+    return (double)q / (base + ms);
 }
 
 double sched_decode_rate_max(const pulsar_engine *e, double tokens, uint32_t rows) {
@@ -119,7 +122,7 @@ void sched_choose(const pulsar_engine *e, const sched_prefs *p, const sched_roun
     const double t_dec = r->n_live ? pulsar_engine_verify_round_ms(e, r->n_live, r->rows, &outside) : 0.0;
     double probe_ms = 0.0;
     const uint32_t zq = 0u, zc = 0u;
-    out->priced = t_dec > 0.0 && pulsar_engine_fused_step_ms(e, 1u, &zq, &zc, &probe_ms);
+    out->priced = t_dec > 0.0 && pulsar_engine_fused_prompt_ms(e, 1u, &zq, &zc, &probe_ms);
     out->t_dec_ms = t_dec;
 
     if (!out->priced) {
@@ -196,9 +199,9 @@ void sched_choose(const pulsar_engine *e, const sched_prefs *p, const sched_roun
                     qq[m] = qj;
                     cc[m++] = pr[j].p0;
                 }
-                double fwd = 0.0;
-                (void)pulsar_engine_fused_step_ms(e, m, qq, cc, &fwd);
-                const double t = fwd + outside;
+                double add = 0.0;
+                (void)pulsar_engine_fused_prompt_ms(e, m, qq, cc, &add);
+                const double t = t_dec + add;
                 const double v = value - v0 + price[i] * c.q + (c.fin ? p->out_value : 0.0);
                 const double s = score(v, t);
                 if (s > best) {
