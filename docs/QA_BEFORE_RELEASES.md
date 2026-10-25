@@ -113,9 +113,10 @@ head, no MTP module); Nemotron's drafter gate is LiLiCorr's, DeepSeek's is DSpar
 release-blocking, tested on MTP-path changes only.**  `mtp-spec-gate` is out of `make gates` (its runner entry is
 gone; the target builds and runs by hand on `MTP_GATE_MODEL`, the Nemotron mini), and `make gates-dev` runs it when a
 touched path is an MTP one (`*mtp*`, the family MTP bindings in `family_qwen`, `nemotron_h_family`, `step_driver`).
-`sync-budget-gate` runs each hosted model's own drafter, so its Qwen leg is DFlash2's.  The one Qwen leg left on the
-MTP pack is `tp-plan-gate`'s (manual; `TP_QWEN_PLAN_MODEL`): the served pack has no TP plan (a block drafter under
-TP and an EXL3 head refuse) and Qwen is not a pair model.
+`sync-budget-gate` runs each hosted model's own drafter, so its Qwen leg is DFlash2's.  No Qwen leg uses an MTP pack
+any more (the packs were deleted 2026-10-25): `tp-plan-gate` (manual; `TP_QWEN_PLAN_MODEL`) plans the U-e4-d5 trunk
+without a drafter, since the served pack has no TP plan (a block drafter under TP and an EXL3 head refuse) and Qwen
+is not a pair model.
 
 ### Battery wall time
 

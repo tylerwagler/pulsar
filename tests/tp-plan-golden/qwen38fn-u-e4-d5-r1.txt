@@ -287,10 +287,3 @@ built exl3_cols model.language_model.layers.47.self_attn.v_proj.weight bytes 415
 built exl3_rows model.language_model.layers.47.self_attn.o_proj.weight bytes 4926464 fnv d752ff764a15e8a7
 stage_range model.language_model.layers.47.mlp.experts.gate_up_proj off 429765600 +421396480 bytes 421396480
 stage_range model.language_model.layers.47.mlp.experts.down_proj off 7058400 +211353600 bytes 211353600
-built exl3_cols mtp.layers.0.self_attn.q_proj.weight bytes 9847808 fnv dd5c1a2f18f71be1
-built exl3_cols mtp.layers.0.self_attn.k_proj.weight bytes 415232 fnv 5be41e46f7e9d731
-built exl3_cols mtp.layers.0.self_attn.v_proj.weight bytes 415232 fnv 095798e5a520a49a
-built exl3_rows mtp.layers.0.self_attn.o_proj.weight bytes 4926464 fnv 0f96e1c2d12f0587
-stage_range mtp.layers.0.mlp.experts.gate_proj off 351585248 +158924800 bytes 158924800
-stage_range mtp.layers.0.mlp.experts.up_proj off 669434848 +158924800 bytes 158924800
-stage_range mtp.layers.0.mlp.experts.down_proj off 33735648 +158924800 bytes 158924800
