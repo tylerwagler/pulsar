@@ -6386,37 +6386,69 @@ static void test_kv_cache_sys_prefix_cut_clears_preamble_jitter(void) {
 }
 
 /* L310: a disk hit loads only when its measured read beats half the priced prefill of what it adds (Flare 2.10);
- * an unmeasured read rate or an unpriced prefill loads (the first load measures the rate); a chain that adds nothing
- * is never read.  The rate is an exponentially weighted mean of each load's bytes per ms. */
+ * an unmeasured read or an unpriced prefill loads (the first load measures the read); a chain that adds nothing is
+ * never read.  L327: the read is priced by the loads' measured cost with the disk's bytes and the page cache's apart
+ * -- one load prices both at its own rate, loads that tell them apart separate them -- and replayed on L320's loads
+ * (2026-10-22, 18:07-18:53) it no longer lags: 18:53 read 9728 MiB, 8735 of them left in memory by the 18:49 load,
+ * in 3.1 s against ~12 s of prefill; the mean of each load's rate priced it at 8.2 s (recompute, wrong), the split
+ * prices it under half the prefill (load), while 18:49's mostly-cold 8.7 GiB for ~7 s of prefill stays a recompute
+ * (it took 7.1 s). */
 static void test_l310_restore_vs_recompute(void) {
-    double t = -1.0;
-    /* 260 MiB (L298's Mamba slice) at 2 GB/s = ~136 ms of read */
-    const uint64_t bytes = 260ull << 20;
-    const double rate = 2.0e6;   /* bytes per ms */
-    TEST_ASSERT(kv_restore_decide(bytes, 40000, rate, true, 8000.0, &t) == KV_RESTORE_LOAD);
-    TEST_ASSERT(t > 136.0 && t < 137.0);
-    /* the same read for 256 tokens of ~60 ms prefill: recompute */
-    TEST_ASSERT(kv_restore_decide(bytes, 256, rate, true, 60.0, &t) == KV_RESTORE_RECOMPUTE);
+    /* the decision, pure */
+    TEST_ASSERT(kv_restore_decide(40000, true, 136.0, true, 8000.0) == KV_RESTORE_LOAD);
+    TEST_ASSERT(kv_restore_decide(256, true, 136.0, true, 60.0) == KV_RESTORE_RECOMPUTE);
     /* the boundary: the read must be strictly under half the prefill */
-    TEST_ASSERT(kv_restore_decide(1000, 100, 1.0, true, 2000.0, &t) == KV_RESTORE_RECOMPUTE);
-    TEST_ASSERT(kv_restore_decide(999, 100, 1.0, true, 2000.0, &t) == KV_RESTORE_LOAD);
+    TEST_ASSERT(kv_restore_decide(100, true, 1000.0, true, 2000.0) == KV_RESTORE_RECOMPUTE);
+    TEST_ASSERT(kv_restore_decide(100, true, 999.0, true, 2000.0) == KV_RESTORE_LOAD);
     /* nothing gained past the bank's own resume: never read, whatever the prices */
-    TEST_ASSERT(kv_restore_decide(bytes, 0, rate, true, 1e9, &t) == KV_RESTORE_RECOMPUTE);
-    TEST_ASSERT(kv_restore_decide(bytes, 0, 0.0, false, 0.0, &t) == KV_RESTORE_RECOMPUTE);
+    TEST_ASSERT(kv_restore_decide(0, true, 1.0, true, 1e9) == KV_RESTORE_RECOMPUTE);
+    TEST_ASSERT(kv_restore_decide(0, false, 0.0, false, 0.0) == KV_RESTORE_RECOMPUTE);
     /* before the first load, and before the engine's fit: load */
-    TEST_ASSERT(kv_restore_decide(bytes, 40000, 0.0, true, 8000.0, &t) == KV_RESTORE_UNMEASURED && t == 0.0);
-    TEST_ASSERT(kv_restore_decide(bytes, 40000, rate, false, 0.0, &t) == KV_RESTORE_UNPRICED);
+    TEST_ASSERT(kv_restore_decide(40000, false, 0.0, true, 8000.0) == KV_RESTORE_UNMEASURED);
+    TEST_ASSERT(kv_restore_decide(40000, true, 136.0, false, 0.0) == KV_RESTORE_UNPRICED);
     /* the names are the /metrics labels */
     TEST_ASSERT(!strcmp(kv_restore_verdict_names[KV_RESTORE_LOAD], "load"));
     TEST_ASSERT(!strcmp(kv_restore_verdict_names[KV_RESTORE_RECOMPUTE], "recompute"));
-    /* the rate: the first sample whole, then 1/8 of each step toward the next; a zero-time or empty load is ignored */
-    double r = kv_restore_rate_update(0.0, 0, 8000, 4.0);
-    TEST_ASSERT(r == 2000.0);
-    r = kv_restore_rate_update(r, 1, 8000, 2.0);   /* sample 4000 */
-    TEST_ASSERT(r == 2250.0);
-    TEST_ASSERT(kv_restore_rate_update(r, 2, 8000, 0.0) == r);
-    TEST_ASSERT(kv_restore_rate_update(r, 2, 0, 5.0) == r);
+
+    /* the read cost: nothing before the first load; one load prices every byte at its own rate, cached or not */
+    const uint64_t MiB = 1ull << 20;
+    kv_read_cost rc;
+    memset(&rc, 0, sizeof rc);
+    double ms = -1.0;
+    TEST_ASSERT(!kv_read_cost_ms(&rc, 100 * MiB, 0, &ms) && ms == 0.0);
+    kv_read_cost_observe(&rc, 1024 * MiB, 0, 0.0);   /* a zero-time or empty load is no observation */
+    kv_read_cost_observe(&rc, 0, 0, 5.0);
+    TEST_ASSERT(rc.loads == 0u);
+    kv_read_cost_observe(&rc, 2048 * MiB, 0, 1000.0);
+    TEST_ASSERT(kv_read_cost_ms(&rc, 1024 * MiB, 0, &ms) && fabs(ms - 500.0) < 1e-6);
+    TEST_ASSERT(kv_read_cost_ms(&rc, 1024 * MiB, 1024 * MiB, &ms) && fabs(ms - 500.0) < 1e-6);
+    TEST_ASSERT(kv_read_cost_ms(&rc, 1024 * MiB, 4096 * MiB, &ms) && fabs(ms - 500.0) < 1e-6);   /* cached <= bytes */
+    /* loads that tell them apart: disk 500 ms a GiB, page cache 100 */
+    for (int i = 0; i < 40; i++) {
+        const uint64_t b = (uint64_t)(512 + 256 * (i % 5)) * MiB, c = (uint64_t)(i % 3) * b / 2u;
+        kv_read_cost_observe(&rc, b, c, ((double)(b - c) * 500.0 + (double)c * 100.0) / (double)(1024 * MiB));
+    }
+    TEST_ASSERT(fabs(rc.cold_ms_per_gib - 500.0) < 1.0 && fabs(rc.cached_ms_per_gib - 100.0) < 1.0);
+    TEST_ASSERT(kv_read_cost_ms(&rc, 3072 * MiB, 2048 * MiB, &ms) && fabs(ms - 700.0) < 3.0);
+
+    /* L320's loads, replayed (MiB; the cached share as the earlier loads of the same segments leave it) */
+    memset(&rc, 0, sizeof rc);
+    kv_read_cost_observe(&rc, (uint64_t)(362.6 * MiB), 0, 365.4);                       /* 17:35, cold */
+    kv_read_cost_observe(&rc, (uint64_t)(362.6 * MiB), (uint64_t)(362.6 * MiB), 177.0);   /* 18:07, the same chain */
+    double t49 = 0.0;
+    TEST_ASSERT(kv_read_cost_ms(&rc, (uint64_t)(8735.3 * MiB), (uint64_t)(362.6 * MiB), &t49));
+    TEST_ASSERT(kv_restore_decide(6400, true, t49, true, 7000.0) == KV_RESTORE_RECOMPUTE);   /* it took 7.1 s */
+    kv_read_cost_observe(&rc, (uint64_t)(8735.3 * MiB), (uint64_t)(362.6 * MiB), 7077.7);
+    double t53 = 0.0;
+    TEST_ASSERT(kv_read_cost_ms(&rc, (uint64_t)(9728.0 * MiB), (uint64_t)(8735.3 * MiB), &t53));
+    TEST_ASSERT(t53 < 6000.0 && kv_restore_decide(11264, true, t53, true, 12000.0) == KV_RESTORE_LOAD);
+    /* the single rate it replaces (each load's bytes per ms, weight 1/8) priced 18:53 past half the prefill */
+    double rate = 362.6 * MiB / 365.4;
+    rate += (362.6 * MiB / 177.0 - rate) / 8.0;
+    rate += (8735.3 * MiB / 7077.7 - rate) / 8.0;
+    TEST_ASSERT(9728.0 * MiB / rate > 6000.0);
 }
+
 
 /* L318: the one resume decision takes the DEEPEST valid state.  The production case (2026-10-21, Open WebUI on Qwen):
  * a fresh bank (own 0), bank 14's thinned grid checkpoint adoptable at 8192, a disk chain to 28672 below the
@@ -6550,6 +6582,26 @@ static void test_l264_segstore_chain_lookup(void) {
     FILE *fp = pulsar_segstore_open_payload(st, a2, &pb);
     TEST_ASSERT(fp != NULL && pb == 300);
     if (fp) { TEST_ASSERT(fgetc(fp) == 0x33); fclose(fp); }
+    /* L327: a payload just read is in the page cache, by the byte (and a prefix of it, and the chain's sum); a key
+     * not stored has none */
+    {
+        n = pulsar_segstore_lookup(st, req, strlen(req), NULL, chain, 8);
+        for (int i = 0; i < n; i++) {
+            uint64_t len = 0;
+            FILE *pf = pulsar_segstore_open_payload(st, chain[i].key, &len);
+            char sink[512];
+            TEST_ASSERT(pf != NULL && len <= sizeof sink && fread(sink, 1, (size_t)len, pf) == len);
+            if (pf) fclose(pf);
+        }
+        TEST_ASSERT(pulsar_segstore_cached_bytes(st, a2, 300, false) == 300u);
+        TEST_ASSERT(pulsar_segstore_cached_bytes(st, a2, 120, true) == 120u);   /* no trailer */
+        TEST_ASSERT(pulsar_segstore_cached_bytes(st, a2, 1000, false) == 300u);   /* clamped to the payload */
+        TEST_ASSERT(n == 3 && pulsar_kvchain_cached_bytes(st, chain, n) == 600u);
+        char none[41];
+        memset(none, 'f', 40);
+        none[40] = '\0';
+        TEST_ASSERT(pulsar_segstore_cached_bytes(st, none, 100, true) == 0u);
+    }
 
     /* reopen: the index and the chain lengths come back from the files */
     pulsar_segstore_close(st);

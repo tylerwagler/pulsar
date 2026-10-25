@@ -199,6 +199,14 @@ uint64_t pulsar_kvchain_load_bytes(const pulsar_segstore_seg *chain, int n) {
     return bytes;
 }
 
+uint64_t pulsar_kvchain_cached_bytes(pulsar_segstore *st, const pulsar_segstore_seg *chain, int n) {
+    uint64_t bytes = 0;
+    for (int i = 0; i < n; i++)
+        bytes += pulsar_segstore_cached_bytes(st, chain[i].key,
+                                              chain[i].payload_bytes - (i < n - 1 ? chain[i].state_bytes : 0u), true);
+    return bytes;
+}
+
 int pulsar_kvchain_load(pulsar_segstore *st, pulsar_engine *e, pulsar_session *s, const char *text,
                         const pulsar_segstore_seg *chain, int n, char *err, size_t errlen) {
     if (err && errlen) err[0] = '\0';

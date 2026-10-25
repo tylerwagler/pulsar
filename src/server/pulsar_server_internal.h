@@ -1050,10 +1050,12 @@ typedef struct pulsar_segstore pulsar_segstore;
 
 /** L310: what a disk hit's restore-vs-recompute decided (after Flare's prefix-cache offload policy, 2.10): a chain
  *  loads only when reading it takes under half the prefill of the tokens it adds over the bank's own resume, both
- *  priced from measurements -- the read rate of this store's loads, the prefill from the engine's one cost fit
- *  (pulsar_engine_prefill_ms, L304).  Either way the bank ends with the same bytes (a segment is the prefill's own
- *  rows, L264), so the verdict moves time, never a number.  Before either rate exists the chain loads: the first
- *  load is what measures the read rate, and with no fit there is no prefill price to beat. */
+ *  priced from measurements -- the read from this store's loads (kv_read_cost, L327: disk and page cache apart), the
+ *  prefill from the engine's one prompt chunk cost fit (pulsar_engine_prefill_ms, L304 / L327: its solo terms, fed by
+ *  every solo prefill chunk and kept across restarts beside the verify curve).  Either way the bank ends with the same
+ *  bytes (a segment is the prefill's own rows, L264), so the verdict moves time, never a number.  Before either is
+ *  measured the chain loads: the first load is what measures the read, and with no fit there is no prefill price to
+ *  beat. */
 typedef enum {
     KV_RESTORE_LOAD = 0,       ///< priced: the read beats half the prefill
     KV_RESTORE_RECOMPUTE,      ///< priced: prefilling the gain is cheaper than reading it -- the chain stays on disk
@@ -1063,14 +1065,27 @@ typedef enum {
 } kv_restore_verdict;
 /** The verdict's names, the /metrics label and the log word (one authority). */
 extern const char *const kv_restore_verdict_names[KV_RESTORE_VERDICTS];
-/** The decision, pure: `bytes` read for `gained` tokens past what the bank serves; `read_bytes_per_ms` 0 = unmeasured;
- *  `priced` false = no prefill fit, else `prefill_ms` prices the gain.  *transfer_ms the read's estimate (0 when
- *  unmeasured).  A chain that adds nothing (gained 0) is never read. */
-kv_restore_verdict kv_restore_decide(uint64_t bytes, uint32_t gained, double read_bytes_per_ms, bool priced,
-                                     double prefill_ms, double *transfer_ms);
-/** The measured read rate's update: an exponentially weighted mean (weight 1/8) of each load's bytes per ms of wall
- *  time, the first sample taken whole.  Returns the new rate. */
-double kv_restore_rate_update(double rate, uint32_t n, uint64_t bytes, double ms);
+/** The decision, pure: a read for `gained` tokens past what the bank serves, `measured` false = no load has measured
+ *  the read yet, else `transfer_ms` its estimate (kv_read_cost_ms); `priced` false = no solo prefill fit, else
+ *  `prefill_ms` prices the gain.  A chain that adds nothing (gained 0) is never read. */
+kv_restore_verdict kv_restore_decide(uint32_t gained, bool measured, double transfer_ms, bool priced,
+                                     double prefill_ms);
+
+/** L327: what a chain load costs, measured -- an exponentially weighted (1/8 a load) least squares of each load's wall
+ *  on the bytes it read from the DISK and the bytes it read from the PAGE CACHE (pulsar_kvchain_cached_bytes, taken
+ *  just before the load), no intercept: load_ms = cold_bytes * u + cached_bytes * w.  One rate did not do: L320's
+ *  loads ran 1.0-4.2 GB/s by how much of the chain an earlier load had left in memory, and the mean of the last eight
+ *  lagged that by a factor of 2.7 (18:53: priced at 1.24 GB/s, read at 3.3).  A ridge toward u == w (KV_READ_RIDGE,
+ *  GiB^2) keeps the system solvable before the loads tell the two apart -- one load prices both at its own rate. */
+typedef struct {
+    double scc, scw, sww, scy, swy;   ///< EW sums over loads, bytes in GiB: cold^2, cold*cached, cached^2, cold*ms, cached*ms
+    uint32_t loads;
+    double cold_ms_per_gib, cached_ms_per_gib;   ///< the solved costs, valid from the first load
+} kv_read_cost;
+#define KV_READ_RIDGE 1e-3
+void kv_read_cost_observe(kv_read_cost *c, uint64_t bytes, uint64_t cached, double ms);
+/** The estimated read of `bytes`, `cached` of them in the page cache; false (and 0) before the first load. */
+bool kv_read_cost_ms(const kv_read_cost *c, uint64_t bytes, uint64_t cached, double *ms);
 
 /** L318: where a request's sync resumes -- the DEEPEST valid state among the bank's own (its grid checkpoint, record
  *  or the history it continues), another resident bank's published checkpoint copied in (L313's adopt), and the disk
@@ -1100,14 +1115,14 @@ typedef struct {
     pulsar_segstore_seg chain[PULSAR_KVCHAIN_MAX];
     int n;               ///< segments, root first (0: none)
     uint64_t bytes;      ///< what a load reads
+    uint64_t cached;     ///< L327: ... of which in the page cache when it was found
 } kv_chain_hit;
 
 /** L310: the restore-vs-recompute telemetry, on /metrics.  Worker-written under server::mu. */
 typedef struct {
     uint64_t picks[RESUME_PICKS];      ///< L318: every resume decision, by the source it picked
     uint64_t abandon_persisted_tokens; ///< L318: tokens an abandoned prefill persisted past its chain's stored end
-    double read_bytes_per_ms;          ///< measured; 0 until the first load
-    uint32_t reads;                    ///< loads that measured it
+    kv_read_cost read;                 ///< L327: the loads' measured cost, disk and page cache apart
     uint64_t verdicts[KV_RESTORE_VERDICTS];
     uint64_t restored_tokens;          ///< tokens the loaded chains added over the banks' own resumes
     uint64_t recomputed_tokens;        ///< tokens a RECOMPUTE verdict left to the prefill

@@ -140,9 +140,17 @@ struct prefill_loop_ctx {
     bool at_resume_point;
 };
 
+/* L327: each chunk is also an observation of what a prompt chunk costs (verify_curve.cpp): its wall, the stream
+ * drained first by the step's own drain (end_commands: a no-op wait where the family's chunk already ended in one, as
+ * the step driver's does; a flag it reads fails the chunk, as at any step's end) -- not a chunk of a sync that merges
+ * images, whose encoder the fit does not model. */
 static bool prefill_loop_chunk(void *ud, uint32_t pos0, uint32_t rows, bool last) {
     const prefill_loop_ctx *c = (const prefill_loop_ctx *)ud;
-    return c->chunk(c->s, c->prompt, pos0, rows, last, c->ud);
+    const double t0 = now_sec();
+    if (!c->chunk(c->s, c->prompt, pos0, rows, last, c->ud) || pulsar_gpu_end_commands() == 0) return false;
+    if (c->s->sync_n_images == 0)
+        pulsar_engine_prefill_chunk_observe(c->s->engine, rows, pos0, (now_sec() - t0) * 1e3);
+    return true;
 }
 
 static bool prefill_loop_landed(void *ud, uint32_t chunk_end) {

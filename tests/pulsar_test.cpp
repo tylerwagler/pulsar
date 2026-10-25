@@ -3836,54 +3836,181 @@ static void test_verify_pick(void) {
     test_l315_tp_pick();
 }
 
-/* L304 / L312: the fused step's cost fit (verify_curve.cpp).  Rounds whose forward is 30 + 0.4 ms a prompt row +
- * 2e-6 ms an attention pair, over chunks of 128..2048 rows at contexts 0..60k, refit to those terms; a step's
- * predicted forward is the fixed term plus each run's; with no fit there is no number.  And the round cost the
- * selection reads beside it on the verify curve: the profile + the correction + host + draft (its part outside the
- * forward); rows past the profile clamp to its widest; none with no curve; a pair's leader reads its own (L315). */
+/* L304 / L312 / L327: the prompt chunk cost fit (verify_curve.cpp).
+ *   - No chunk yet: no number for either kind.  A fused step with no verify curve is no observation.
+ *   - Solo chunks only (the single-user server, L320): 120 + 0.4 ms a row + 2e-6 ms a pair over chunks of 128..4096
+ *     rows at contexts 0..60k refit to those terms; the solo kind is priced, the fused one is not.  A solo prefill is
+ *     priced a fixed term per cell of the prefill grid it crosses (4096 rows from 2000 cross two cells).
+ *   - Both kinds on a curve with a measured correction: a fused step's wall is the verify rows' forward (the profile
+ *     + 0.5 ms a row) + 30 + the same rows and pairs; the fit takes the verify forward off and recovers 120 / 30 and
+ *     the shared terms, so a fused round prices what its prompt adds (30 + ...) and a solo prefill pays 120 a chunk
+ *     -- the fused fit's fixed term, verify rows and all, no longer prices a solo prefill (L320: 82.5 s predicted vs
+ *     64.2 s served).
+ *   - Persistence: the fit round-trips through its file (same terms, counts), a file of another key or version or a
+ *     torn one is refused and leaves the fit untouched; a fit with a cache path writes itself every 16 chunks.
+ * And the round cost the selection reads beside it on the verify curve: the profile + the correction + host + draft
+ * (its part outside the forward); rows past the profile clamp to its widest; none with no curve; a pair's leader reads
+ * its own (L315). */
+static void l326_solo(pulsar_engine *e, double fixed, uint32_t n) {
+    for (uint32_t i = 0; i < n; i++) {
+        const uint32_t q = i % 4u == 3u ? 128u * (1u + i % 31u) : 4096u, c = 4096u * (i % 15u);
+        pulsar_engine_prefill_chunk_observe(e, q, c, fixed + 0.4 * q + 2e-6 * q * (c + 0.5 * q));
+    }
+}
 static void test_fused_cost(void) {
     pulsar_engine *e = (pulsar_engine *)calloc(1, sizeof(pulsar_engine));
-    double ms = 1.0, out = 1.0;
+    double ms = 1.0, out = 1.0, pms = -1.0;
     const uint32_t q1 = 512u, c1 = 0u;
-    TEST_ASSERT(!pulsar_engine_fused_step_ms(e, 1u, &q1, &c1, &ms) && ms == 0.0);
+    TEST_ASSERT(!pulsar_engine_fused_prompt_ms(e, 1u, &q1, &c1, &ms) && ms == 0.0);
     TEST_ASSERT(pulsar_engine_verify_round_ms(e, 4u, 8u, &out) == 0.0 && out == 0.0);
-    double pms = -1.0;
     TEST_ASSERT(!pulsar_engine_prefill_ms(e, 4096u, 0u, 4096u, &pms) && pms == 0.0);
-    for (uint32_t i = 0; i < 64; i++) {
-        const uint32_t q[2] = {128u * (1u + i % 16u), 256u};
-        const uint32_t c[2] = {4096u * (i % 15u), 1024u};
-        const uint32_t n = i % 3u == 0u ? 2u : 1u;
-        double y = 30.0;
-        for (uint32_t r = 0; r < n; r++) y += 0.4 * q[r] + 2e-6 * q[r] * (c[r] + 0.5 * q[r]);
-        pulsar_engine_fused_cost_observe(e, n, q, c, y);
+    pulsar_engine_fused_cost_observe(e, 1u, &q1, &c1, 8u, 300.0);   /* no curve: no observation */
+    TEST_ASSERT(e->prefill_cost.n == 0u);
+    /* solo chunks only */
+    l326_solo(e, 120.0, 64u);
+    {
+        const pulsar_prefill_cost_fit &f = e->prefill_cost;
+        TEST_ASSERT(f.valid[PULSAR_CHUNK_SOLO] && !f.valid[PULSAR_CHUNK_FUSED]);
+        TEST_ASSERT(fabs(f.fixed_ms[PULSAR_CHUNK_SOLO] - 120.0) < 0.05 && fabs(f.alpha_ms - 0.4) < 1e-5 &&
+                    fabs(f.beta_ms - 2e-6) < 1e-10);
     }
-    const pulsar_fused_cost_fit &f = e->fused_cost;
-    TEST_ASSERT(f.valid && fabs(f.a_ms - 30.0) < 0.05 && fabs(f.alpha_ms - 0.4) < 1e-4 && fabs(f.beta_ms - 2e-6) < 1e-9);
-    const uint32_t q[2] = {512u, 128u}, c[2] = {1000u, 60000u};
-    TEST_ASSERT(pulsar_engine_fused_step_ms(e, 2u, q, c, &ms));
-    TEST_ASSERT(fabs(ms - (30.0 + 0.4 * 640.0 + 2e-6 * (512.0 * 1256.0 + 128.0 * 60064.0))) < 0.06);
-    /* L310: the same fit priced as a prefill -- the fixed term once a chunk (10000 rows at 4096 = 3 chunks) */
-    TEST_ASSERT(pulsar_engine_prefill_ms(e, 10000u, 2000u, 4096u, &pms));
-    TEST_ASSERT(fabs(pms - (3 * 30.0 + 0.4 * 10000 + 2e-6 * 10000 * (2000 + 5000))) < 0.5);
-    TEST_ASSERT(pulsar_engine_prefill_ms(e, 4096u, 0u, 4096u, &pms) && fabs(pms - (30.0 + 0.4 * 4096 + 2e-6 * 4096 * 2048)) < 0.5);
+    TEST_ASSERT(!pulsar_engine_fused_prompt_ms(e, 1u, &q1, &c1, &ms) && ms == 0.0);
+    TEST_ASSERT(pulsar_engine_prefill_ms(e, 10000u, 2000u, 4096u, &pms));   /* [2000, 12000): 3 grid cells */
+    TEST_ASSERT(fabs(pms - (3 * 120.0 + 0.4 * 10000 + 2e-6 * 10000 * (2000 + 5000))) < 0.5);
+    TEST_ASSERT(pulsar_engine_prefill_ms(e, 4096u, 0u, 4096u, &pms) &&
+                fabs(pms - (120.0 + 0.4 * 4096 + 2e-6 * 4096 * 2048)) < 0.5);
+    TEST_ASSERT(pulsar_engine_prefill_ms(e, 4096u, 2000u, 4096u, &pms) &&   /* [2000, 6096): 2 cells */
+                fabs(pms - (2 * 120.0 + 0.4 * 4096 + 2e-6 * 4096 * (2000 + 2048))) < 0.5);
+    TEST_ASSERT(pulsar_engine_prefill_ms(e, 0u, 2000u, 4096u, &pms) && pms == 0.0);
+    /* the L320 prompt: 79,724 tokens from 7,552, priced on the solo terms */
+    TEST_ASSERT(pulsar_engine_prefill_ms(e, 79724u - 7552u, 7552u, 4096u, &pms) &&
+                fabs(pms - (19 * 120.0 + 0.4 * 72172 + 2e-6 * 72172 * (7552 + 36086))) < 2.0);
     free(e);
+
+    /* both kinds on a curve whose correction is measured: +0.5 ms a row past the profile */
     double base[PULSAR_SPEC_LOGITS_ROWS + 1];
     l301_staircase(base, PULSAR_SPEC_LOGITS_ROWS);
     pulsar_engine *v = l301_engine(base, PULSAR_SPEC_LOGITS_ROWS);
-    for (uint32_t i = 0; i < 20; i++) pulsar_engine_verify_curve_observe(v, 4u, 8u, base[8], 6.0, 3.0);
-    TEST_ASSERT(fabs(pulsar_engine_verify_round_ms(v, 4u, 8u, &out) - (base[8] + 9.0)) < 1e-9 && out == 9.0);
-    TEST_ASSERT(fabs(pulsar_engine_verify_round_ms(v, 4u, 99u, &out) - (base[PULSAR_SPEC_LOGITS_ROWS] + 9.0)) < 1e-9);
+    for (uint32_t i = 0; i < 20; i++) pulsar_engine_verify_curve_observe(v, 4u, 8u, base[8] + 4.0, 6.0, 3.0);
+    for (uint32_t i = 0; i < 20; i++) pulsar_engine_verify_curve_observe(v, 4u, 20u, base[20] + 10.0, 6.0, 3.0);
+    l326_solo(v, 120.0, 24u);
+    for (uint32_t i = 0; i < 64; i++) {
+        /* a kind is priced from its 4th chunk, not off one chunk's noise (the solo kind armed long before) */
+        if (i == 3u || i == 4u)
+            TEST_ASSERT(v->prefill_cost.valid[PULSAR_CHUNK_SOLO] && v->prefill_cost.valid[PULSAR_CHUNK_FUSED] == (i == 4u));
+        const uint32_t q[2] = {128u * (1u + i % 16u), 256u};
+        const uint32_t c[2] = {4096u * (i % 15u), 1024u};
+        const uint32_t n = i % 3u == 0u ? 2u : 1u, rows = i % 2u ? 8u : 20u;
+        double y = base[rows] + 0.5 * rows + 30.0;
+        for (uint32_t r = 0; r < n; r++) y += 0.4 * q[r] + 2e-6 * q[r] * (c[r] + 0.5 * q[r]);
+        pulsar_engine_fused_cost_observe(v, n, q, c, rows, y);
+    }
+    {
+        const pulsar_prefill_cost_fit &f = v->prefill_cost;
+        TEST_ASSERT(f.valid[PULSAR_CHUNK_SOLO] && f.valid[PULSAR_CHUNK_FUSED] && f.n == 88u &&
+                    f.n_kind[PULSAR_CHUNK_SOLO] == 24u && f.n_kind[PULSAR_CHUNK_FUSED] == 64u);
+        TEST_ASSERT(fabs(f.fixed_ms[PULSAR_CHUNK_SOLO] - 120.0) < 0.05 && fabs(f.fixed_ms[PULSAR_CHUNK_FUSED] - 30.0) < 0.05);
+        TEST_ASSERT(fabs(f.alpha_ms - 0.4) < 1e-5 && fabs(f.beta_ms - 2e-6) < 1e-10);
+    }
+    const uint32_t q[2] = {512u, 128u}, c[2] = {1000u, 60000u};
+    TEST_ASSERT(pulsar_engine_fused_prompt_ms(v, 2u, q, c, &ms));
+    TEST_ASSERT(fabs(ms - (30.0 + 0.4 * 640.0 + 2e-6 * (512.0 * 1256.0 + 128.0 * 60064.0))) < 0.06);
+    TEST_ASSERT(pulsar_engine_prefill_ms(v, 4096u, 0u, 4096u, &pms) &&
+                fabs(pms - (120.0 + 0.4 * 4096 + 2e-6 * 4096 * 2048)) < 0.5);
+
+    /* persistence: the round trip, and the files it refuses */
+    char dir_t[] = "/tmp/pulsar-l326-fit.XXXXXX";
+    const char *dir = mkdtemp(dir_t);
+    TEST_ASSERT(dir != NULL);
+    char path[4096];
+    TEST_ASSERT(pulsar_prefill_fit_path(dir, 0xabcdef0123456789ull, path, sizeof path));
+    TEST_ASSERT(strstr(path, "/abcdef0123456789.fit") != NULL);
+    TEST_ASSERT(!pulsar_prefill_fit_path("", 1u, path, sizeof path) && !pulsar_prefill_fit_path(dir, 1u, path, 8u));
+    TEST_ASSERT(pulsar_prefill_fit_path(dir, 0xabcdef0123456789ull, path, sizeof path));
+    TEST_ASSERT(pulsar_prefill_fit_write(path, 0xabcdef0123456789ull, &v->prefill_cost));
+    {
+        pulsar_prefill_cost_fit g;
+        memset(&g, 0, sizeof g);
+        TEST_ASSERT(!pulsar_prefill_fit_read(path, 0x1234u, &g) && g.n == 0u);   /* another key */
+        TEST_ASSERT(pulsar_prefill_fit_read(path, 0xabcdef0123456789ull, &g));
+        const pulsar_prefill_cost_fit &f = v->prefill_cost;
+        TEST_ASSERT(g.n == f.n && g.n_kind[0] == f.n_kind[0] && g.n_kind[1] == f.n_kind[1] && g.valid[0] && g.valid[1]);
+        TEST_ASSERT(fabs(g.fixed_ms[0] - f.fixed_ms[0]) < 1e-9 && fabs(g.fixed_ms[1] - f.fixed_ms[1]) < 1e-9 &&
+                    fabs(g.alpha_ms - f.alpha_ms) < 1e-12 && fabs(g.beta_ms - f.beta_ms) < 1e-15);
+        /* a torn file and another version are refused, the fit untouched */
+        FILE *fp = fopen(path, "r");
+        char buf[4096];
+        const size_t got = fp ? fread(buf, 1, sizeof buf, fp) : 0u;
+        if (fp) fclose(fp);
+        TEST_ASSERT(got > 64u);
+        fp = fopen(path, "w");
+        TEST_ASSERT(fp != NULL);
+        fwrite(buf, 1, got / 2u, fp);
+        fclose(fp);
+        pulsar_prefill_cost_fit h;
+        memset(&h, 0, sizeof h);
+        TEST_ASSERT(!pulsar_prefill_fit_read(path, 0xabcdef0123456789ull, &h) && h.n == 0u);
+        buf[19] = '9';   /* "pulsar-prefill-fit 9 key ..." */
+        fp = fopen(path, "w");
+        TEST_ASSERT(fp != NULL);
+        fwrite(buf, 1, got, fp);
+        fclose(fp);
+        TEST_ASSERT(!pulsar_prefill_fit_read(path, 0xabcdef0123456789ull, &h) && h.n == 0u);
+        TEST_ASSERT(!pulsar_prefill_fit_read("/nonexistent/x.fit", 0xabcdef0123456789ull, &h));
+    }
+    /* a fit with a cache path writes itself as it moves: every 16 chunks, and when a kind arms */
+    {
+        pulsar_engine *w = (pulsar_engine *)calloc(1, sizeof(pulsar_engine));
+        TEST_ASSERT(pulsar_prefill_fit_path(dir, 0x42u, w->prefill_cost.cache_path, sizeof w->prefill_cost.cache_path));
+        w->prefill_cost.cache_key = 0x42u;
+        l326_solo(w, 90.0, 7u);
+        pulsar_prefill_cost_fit g;
+        memset(&g, 0, sizeof g);
+        TEST_ASSERT(!pulsar_prefill_fit_read(w->prefill_cost.cache_path, 0x42u, &g));   /* nothing written yet */
+        l326_solo(w, 90.0, 1u);   /* the 8th chunk arms the solo kind: written */
+        TEST_ASSERT(pulsar_prefill_fit_read(w->prefill_cost.cache_path, 0x42u, &g) && g.n == 8u && g.valid[0]);
+        l326_solo(w, 90.0, 15u);
+        TEST_ASSERT(pulsar_prefill_fit_read(w->prefill_cost.cache_path, 0x42u, &g) && g.n == 8u);
+        l326_solo(w, 90.0, 1u);   /* 16 past the last write */
+        TEST_ASSERT(pulsar_prefill_fit_read(w->prefill_cost.cache_path, 0x42u, &g) && g.n == 24u);
+        TEST_ASSERT(fabs(g.fixed_ms[0] - 90.0) < 0.05);
+        /* the restart (L320: the fit was lost at every one): a fresh engine reads it back as the curve's open does,
+         * and its first disk hit is priced -- 11,264 tokens past 63,360 (18:53's shape) -- not "unpriced" */
+        pulsar_engine *z = (pulsar_engine *)calloc(1, sizeof(pulsar_engine));
+        double pz = 0.0;
+        TEST_ASSERT(!pulsar_engine_prefill_ms(z, 11264u, 63360u, 4096u, &pz));
+        TEST_ASSERT(kv_restore_decide(11264u, true, 3000.0, false, pz) == KV_RESTORE_UNPRICED);
+        TEST_ASSERT(pulsar_prefill_fit_read(w->prefill_cost.cache_path, 0x42u, &z->prefill_cost));
+        TEST_ASSERT(pulsar_engine_prefill_ms(z, 11264u, 63360u, 4096u, &pz));
+        TEST_ASSERT(fabs(pz - (4 * 90.0 + 0.4 * 11264 + 2e-6 * 11264 * (63360 + 5632))) < 0.5);
+        TEST_ASSERT(kv_restore_decide(11264u, true, 3000.0, true, pz) == KV_RESTORE_LOAD);
+        TEST_ASSERT(kv_restore_decide(11264u, true, 3500.0, true, pz) == KV_RESTORE_RECOMPUTE);
+        free(z);
+        unlink(w->prefill_cost.cache_path);
+        free(w);
+    }
+    unlink(path);
+    rmdir(dir);
+
+    TEST_ASSERT(fabs(pulsar_engine_verify_round_ms(v, 4u, 8u, &out) - (base[8] + 4.0 + 9.0)) < 1e-9 && out == 9.0);
+    TEST_ASSERT(fabs(pulsar_engine_verify_round_ms(v, 4u, 99u, &out) -
+                     (base[PULSAR_SPEC_LOGITS_ROWS] + 0.5 * PULSAR_SPEC_LOGITS_ROWS + 9.0)) < 1e-9);
     v->tp = (struct pulsar_tp *)v;   /* never dereferenced: a pair's leader prices its round selection (L315) */
-    TEST_ASSERT(fabs(pulsar_engine_verify_round_ms(v, 4u, 8u, &out) - (base[8] + 9.0)) < 1e-9 && out == 9.0);
+    TEST_ASSERT(fabs(pulsar_engine_verify_round_ms(v, 4u, 8u, &out) - (base[8] + 4.0 + 9.0)) < 1e-9 && out == 9.0);
+    const uint32_t n_before = v->prefill_cost.n;
+    pulsar_engine_fused_cost_observe(v, 1u, &q1, &c1, 8u, 300.0);   /* ... and fits nothing */
+    pulsar_engine_prefill_chunk_observe(v, 4096u, 0u, 2000.0);
+    TEST_ASSERT(v->prefill_cost.n == n_before);
     v->tp = NULL;
     l301_engine_free(v);
 }
 
 /* L312 -- the round selection, simulated (after Flare's scripts/scheduling_sim): the real sched_choose and service
- * prices over the engine's real cost authorities (the fused-step fit, the verify curve and its pick), the device
- * replaced by a cost model from the fused-step fit the server measured in L312's sweep (gpuq #411, Qwen DFlash2, one
- * Spark: 225-242 ms + 0.57-0.60 ms a prompt row + 1.4e-5..2.4e-5 ms an attention pair; here 230 + 0.58 q + 2.0e-5;
- * 28 ms outside the forward;
+ * prices over the engine's real cost authorities (the prompt chunk cost fit, the verify curve and its pick), the
+ * device replaced by a cost model from the fused-step fit the server measured in L312's sweep (gpuq #411, Qwen
+ * DFlash2, one Spark: 225-242 ms + 0.57-0.60 ms a prompt row + 1.4e-5..2.4e-5 ms an attention pair, verify rows
+ * included; here the verify rows' forward + 170 + 0.58 q + 2.0e-5, ~230 at 4 streams; L327: the fit takes the verify
+ * rows off on the curve); 28 ms outside the forward;
  * a decode-only round 88 ms at 4 streams, alone p50 87 ms; 5% noise; drafts survive at 0.65 a position, 7 a stream)
  * and the server's glue around them (the quantum, worker_decode_budget, prices started at a 1/n share).  Scenarios:
  *   (a) L304's: 4 streams decode while a 53k-token prompt prefills -- it finishes, no gap reaches 1.5 s (L304: max
@@ -3914,7 +4041,7 @@ struct stats {
     double gap_max, gap_p99, dec_tps, alone_tps;
     int fused, decode_only, unpriced;
 };
-static const double FWD_A = 230.0, FWD_ROW = 0.58, FWD_PAIR = 2.0e-5, OUTSIDE = 28.0, SURV = 0.65;
+static const double FWD_A = 170.0, FWD_ROW = 0.58, FWD_PAIR = 2.0e-5, OUTSIDE = 28.0, SURV = 0.65;
 static double dec_fwd(uint32_t r) { return 35.0 + 1.6 * r + (r > 16u ? 18.0 : 0.0); }
 static double tokens_of(uint32_t k) {
     double t = 1.0, s = 1.0;
@@ -3930,7 +4057,8 @@ static stats run(int ndec, prompt *P, int np, double horizon_ms, bool warm, cons
     /* the short prompts a server has seen before: the fit's evidence at shallow context */
     for (uint32_t i = 0; warm && i < 12u; i++) {
         const uint32_t q = 32u + 37u * i, c = 0u;
-        pulsar_engine_fused_cost_observe(e, 1u, &q, &c, (FWD_A + FWD_ROW * q + FWD_PAIR * q * q / 2.0) * g->noise());
+        pulsar_engine_fused_cost_observe(e, 1u, &q, &c, 16u,
+                                         (dec_fwd(16u) + FWD_A + FWD_ROW * q + FWD_PAIR * q * q / 2.0) * g->noise());
     }
     const uint32_t heads_max = 32u, prefill_cap = 4096u, fuse_rows = prefill_cap - heads_max;
     std::vector<double> gaps, inv(ndec, 0.0), last_out(ndec, 0.0);
@@ -3981,7 +4109,7 @@ static stats run(int ndec, prompt *P, int np, double horizon_ms, bool warm, cons
             sched_choose(e, pf, &sr, sp, n_ps, fuse_rows, ri == 0 && qt >= PULSAR_SERVER_DECODE_QUANTUM_TOKENS,
                          (probes & 1u) ? 6u * SCHED_CHUNK_ALIGN : 2u * SCHED_CHUNK_ALIGN, &ch);
             uint32_t nr = 0, q[4], c[4], pf_rows = 0;
-            double fwd = FWD_A;
+            double fwd = dec_fwd(rows) + FWD_A;
             bool fin = false;
             for (int k = 0; k < n_ps; k++) {
                 if (!ch.q[k]) continue;
@@ -3994,7 +4122,7 @@ static stats run(int ndec, prompt *P, int np, double horizon_ms, bool warm, cons
             TEST_ASSERT(pf_rows <= fuse_rows);
             if (nr) {
                 fwd *= g->noise();
-                pulsar_engine_fused_cost_observe(e, nr, q, c, fwd);
+                pulsar_engine_fused_cost_observe(e, nr, q, c, rows, fwd);
                 st.fused++;
             } else {
                 fwd = dec_fwd(rows) * g->noise();
@@ -4047,7 +4175,7 @@ static void test_fused_sched(void) {
         for (int i = 0; i < 20; i++) pulsar_engine_verify_curve_observe(e, 2u, 6u, base[6], 5.0, 4.0);
         for (uint32_t i = 0; i < 12u; i++) {
             const uint32_t q = 64u + 100u * i, c = 0u;
-            pulsar_engine_fused_cost_observe(e, 1u, &q, &c, 150.0 + 0.5 * q);
+            pulsar_engine_fused_cost_observe(e, 1u, &q, &c, 6u, base[6] + 150.0 + 0.5 * q);
         }
         sched_round sr;
         memset(&sr, 0, sizeof sr);
@@ -4454,7 +4582,7 @@ static const pulsar_test_entry test_entries[] = {
     {"--lib-think", "lib-think", "shared <think> scanner: split tags, hold-back, spacing, seeded state", test_lib_think_scan},
     {"--attn-layout", "attn-layout", "CSA2 attention layout table: modes + sources derived from the V4.1 source sets (L218)", test_attn_layout_table},
     {"--lane-cost", "lane-cost", "lane cost fit: a step's measured cost to its terms, its centre, or no price at all (L263, L284)", test_lane_cost_fit},
-    {"--fused-cost", "fused-cost", "the fused step's cost fit and the verify curve's round cost, what the round selection prices by (L304, L312)", test_fused_cost},
+    {"--fused-cost", "fused-cost", "the prompt chunk cost fit (solo + fused, persisted) and the verify curve's round cost, what the round selection and the disk restore price by (L304, L312, L327)", test_fused_cost},
     {"--fused-sched", "fused-sched", "the round selection simulated on L304's logged costs: L304's and L277's cases, the stall, no prompt, the cold fit (L312)", test_fused_sched},
     {"--ckpt-records", "ckpt-records", "the record pool (prompt ends, message endpoints: capture, match, LRU, frontier rule) and the endpoint cut (L311)", test_ckpt_records},
     {"--verify-pick", "verify-pick", "the verify pick: the brute-force argmax on a staircase curve, the robust online correction, the lockstep continuation (L301); the copy estimate's re-probe (L308)", test_verify_pick},

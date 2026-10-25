@@ -392,19 +392,43 @@ int server::kv_cache_persist(session_slot *sl, const char *reason, bool close, i
 
 const char *const kv_restore_verdict_names[KV_RESTORE_VERDICTS] = { "load", "recompute", "unmeasured", "unpriced" };
 
-kv_restore_verdict kv_restore_decide(uint64_t bytes, uint32_t gained, double read_bytes_per_ms, bool priced,
-                                     double prefill_ms, double *transfer_ms) {
-    *transfer_ms = read_bytes_per_ms > 0.0 ? (double)bytes / read_bytes_per_ms : 0.0;
+kv_restore_verdict kv_restore_decide(uint32_t gained, bool measured, double transfer_ms, bool priced,
+                                     double prefill_ms) {
     if (gained == 0u) return KV_RESTORE_RECOMPUTE;
-    if (!(read_bytes_per_ms > 0.0)) return KV_RESTORE_UNMEASURED;
+    if (!measured) return KV_RESTORE_UNMEASURED;
     if (!priced) return KV_RESTORE_UNPRICED;
-    return *transfer_ms < 0.5 * prefill_ms ? KV_RESTORE_LOAD : KV_RESTORE_RECOMPUTE;
+    return transfer_ms < 0.5 * prefill_ms ? KV_RESTORE_LOAD : KV_RESTORE_RECOMPUTE;
 }
 
-double kv_restore_rate_update(double rate, uint32_t n, uint64_t bytes, double ms) {
-    if (!(ms > 0.0) || bytes == 0) return rate;
-    const double sample = (double)bytes / ms;
-    return n == 0 || !(rate > 0.0) ? sample : rate + (sample - rate) / 8.0;
+#define KV_READ_DECAY (1.0 - 1.0 / 8.0)
+#define KV_GIB (1024.0 * 1024.0 * 1024.0)
+
+void kv_read_cost_observe(kv_read_cost *c, uint64_t bytes, uint64_t cached, double ms) {
+    if (!(ms > 0.0) || bytes == 0u) return;
+    if (cached > bytes) cached = bytes;
+    const double x = (double)(bytes - cached) / KV_GIB, z = (double)cached / KV_GIB;
+    c->scc = c->scc * KV_READ_DECAY + x * x;
+    c->scw = c->scw * KV_READ_DECAY + x * z;
+    c->sww = c->sww * KV_READ_DECAY + z * z;
+    c->scy = c->scy * KV_READ_DECAY + x * ms;
+    c->swy = c->swy * KV_READ_DECAY + z * ms;
+    c->loads++;
+    /* the normal equations with the ridge lambda (u - w)^2: [scc + l, scw - l; scw - l, sww + l] [u; w] = [scy; swy];
+     * positive definite for any loads (the ridge alone spans u - w, a load spans the rest) */
+    const double l = KV_READ_RIDGE, a = c->scc + l, b = c->scw - l, d = c->sww + l;
+    const double det = a * d - b * b;
+    if (!(det > 0.0)) return;
+    const double u = (c->scy * d - b * c->swy) / det, w = (a * c->swy - b * c->scy) / det;
+    c->cold_ms_per_gib = u > 0.0 ? u : 0.0;
+    c->cached_ms_per_gib = w > 0.0 ? w : 0.0;
+}
+
+bool kv_read_cost_ms(const kv_read_cost *c, uint64_t bytes, uint64_t cached, double *ms) {
+    *ms = 0.0;
+    if (c->loads == 0u) return false;
+    if (cached > bytes) cached = bytes;
+    *ms = (double)(bytes - cached) / KV_GIB * c->cold_ms_per_gib + (double)cached / KV_GIB * c->cached_ms_per_gib;
+    return true;
 }
 
 int server::kv_cache_try_load_text(session_slot *sl, const char *prompt_text,
@@ -442,11 +466,14 @@ int server::kv_cache_find(const char *prompt_text, const uint64_t *image_hashes,
     auto *s = this;
     hit->n = 0;
     hit->bytes = 0;
+    hit->cached = 0;
     if (!s->kv.enabled || !prompt_text) return 0;
     char err[384];
     hit->n = pulsar_kvchain_find(s->kv.st, prompt_text, strlen(prompt_text), image_hashes, n_images,
                                  s->kv.opt.min_tokens, hit->chain, PULSAR_KVCHAIN_MAX, &hit->bytes, err, sizeof(err));
     if (err[0]) server_log(hit->n ? PULSAR_LOG_KVCACHE : PULSAR_LOG_WARNING, "pulsar-server: kv cache %s", err);
+    /* L327: how much of that read the page cache holds -- the read is priced, and measured, by the two apart */
+    if (hit->n > 0) hit->cached = pulsar_kvchain_cached_bytes(s->kv.st, hit->chain, hit->n);
     return hit->n > 0 ? (int)hit->chain[hit->n - 1].G : 0;
 }
 
@@ -472,9 +499,9 @@ kv_restore_verdict server::kv_cache_price(const kv_chain_hit *hit, int base) {
     const bool priced = pulsar_engine_prefill_ms(s->engine, gained, (uint32_t)base, cap > 0 ? (uint32_t)cap : 0u,
                                                  &prefill_ms);
     pthread_mutex_lock(&s->mu);
-    const double rate = s->kv.meter.read_bytes_per_ms;
+    const bool measured = kv_read_cost_ms(&s->kv.meter.read, bytes, hit->cached, &transfer_ms);
     pthread_mutex_unlock(&s->mu);
-    const kv_restore_verdict v = kv_restore_decide(bytes, gained, rate, priced, prefill_ms, &transfer_ms);
+    const kv_restore_verdict v = kv_restore_decide(gained, measured, transfer_ms, priced, prefill_ms);
     pthread_mutex_lock(&s->mu);
     s->kv.meter.verdicts[v]++;
     s->kv.meter.last_transfer_ms = transfer_ms;
@@ -482,10 +509,11 @@ kv_restore_verdict server::kv_cache_price(const kv_chain_hit *hit, int base) {
     if (v == KV_RESTORE_RECOMPUTE) s->kv.meter.recomputed_tokens += gained;
     pthread_mutex_unlock(&s->mu);
     server_log(PULSAR_LOG_KVCACHE,
-               "pulsar-server: kv cache restore-vs-recompute: chain to %u (%d segments, %.1f MiB) adds %u tokens past "
-               "%d: read %.1f ms (%.0f MB/s%s) vs prefill %.1f ms%s -> %s",
-               chain_G, n, (double)bytes / (1024.0 * 1024.0), gained, base, transfer_ms, rate * 1e-3,
-               rate > 0.0 ? "" : ", unmeasured", prefill_ms, priced ? "" : " (no fit)", kv_restore_verdict_names[v]);
+               "pulsar-server: kv cache restore-vs-recompute: chain to %u (%d segments, %.1f MiB, %.1f MiB cached) adds "
+               "%u tokens past %d: read %.1f ms%s vs prefill %.1f ms%s -> %s",
+               chain_G, n, (double)bytes / (1024.0 * 1024.0), (double)hit->cached / (1024.0 * 1024.0), gained, base,
+               transfer_ms, measured ? "" : " (unmeasured)", prefill_ms, priced ? "" : " (no fit)",
+               kv_restore_verdict_names[v]);
     return v;
 }
 
@@ -506,9 +534,7 @@ int server::kv_cache_load(const kv_chain_hit *hit, const char *prompt_text, cons
         const double load_ms = (server_now_sec() - t0) * 1000.0;
         if (base < 0) base = 0;
         pthread_mutex_lock(&s->mu);
-        s->kv.meter.read_bytes_per_ms = kv_restore_rate_update(s->kv.meter.read_bytes_per_ms, s->kv.meter.reads,
-                                                               hit->bytes, load_ms);
-        s->kv.meter.reads++;
+        kv_read_cost_observe(&s->kv.meter.read, hit->bytes, hit->cached, load_ms);
         s->kv.meter.restored_tokens += G > base ? (uint64_t)(G - base) : 0u;
         pthread_mutex_unlock(&s->mu);
     }

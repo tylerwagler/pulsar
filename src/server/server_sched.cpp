@@ -3168,14 +3168,15 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n, int quantum_
             break;
         }
 
-        /* L304: the fused forward's wall against its prompt runs -- the fit the next continuation chunk is cut by */
+        /* L304 / L327: the fused forward's wall against its prompt runs and its verify rows (whose forward the engine
+         * takes off on its verify curve) -- the prompt chunk cost fit the round selection prices the next by */
         if (n_fr > 0) {
             uint32_t fq[PULSAR_SESSION_POOL_CAP], fc[PULSAR_SESSION_POOL_CAP];
             for (int r = 0; r < n_fr; r++) {
                 fq[r] = (uint32_t)fr[r].k;
                 fc[r] = (uint32_t)fr[r].p0;
             }
-            pulsar_engine_fused_cost_observe(s->engine, (uint32_t)n_fr, fq, fc, (fwd_t1 - fwd_t0) * 1e3);
+            pulsar_engine_fused_cost_observe(s->engine, (uint32_t)n_fr, fq, fc, rows, (fwd_t1 - fwd_t0) * 1e3);
         }
 
         /* ---- L260 fusion: each riding chunk joins its bank (checkpoint +

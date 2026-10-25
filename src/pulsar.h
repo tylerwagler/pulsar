@@ -1223,7 +1223,9 @@ double pulsar_lane_cost_ms(const pulsar_lane_cost *c, double rows);
  *  step.  On a tensor-parallel group (L315) the leader opens it: a profile runs on every rank in step
  *  (pulsar_session_verify_profile), the key names the group's width, and only the leader holds the curve.  0, or -1
  *  with `err` (no batched speculative lane: no drafter, no bank pool; or the profile failed) -- the engine then has
- *  no curve and the row budget alone admits drafts. */
+ *  no curve and the row budget alone admits drafts.  L327: the prompt chunk cost fit (pulsar_engine_prefill_ms) is
+ *  kept beside it, under the same key: read back when the curve is (a curve profiled again starts a fresh fit),
+ *  written as it moves. */
 int pulsar_session_verify_curve_open(pulsar_session *s, const char *cache_dir, const char *build_id, char *err,
                                      size_t errlen);
 /** One decode round of the batched spec lane (the server reports every round that carried no prompt rows):
@@ -1267,17 +1269,20 @@ typedef struct {
     double bin_conf[2][10], bin_label[2][10];
 } pulsar_spec_calibration;
 void pulsar_engine_spec_calibration(const pulsar_engine *e, pulsar_spec_calibration *out);
-/** L304: the fused step's cost (src/engine/verify_curve.cpp has the model): forward_ms = a + alpha * sum q +
- *  beta * sum q (c + q / 2) over its prompt runs (q rows each over c already computed), fitted from the fused steps
- *  the server reports (`forward_ms` the step's whole forward, verify rows included).  pulsar_engine_fused_step_ms:
- *  the predicted forward of a step carrying `n_runs` runs into *ms, false (and 0) with no fit yet. */
+/** L304 / L327: what a prompt chunk costs (src/engine/verify_curve.cpp has the model): ONE fit over every chunk the
+ *  engine runs, solo or fused, chunk_ms = fixed[kind] + alpha * q + beta * q (c + q / 2) for q rows over c already
+ *  computed.  The solo chunks are the engine's own (its prefill loop); the server reports each fused step here with
+ *  its verify rows, whose forward on the verify curve (L301) is taken off the step's wall -- so a fused chunk's terms
+ *  are what its prompt adds to the round (no curve: no fused observation).  pulsar_engine_fused_prompt_ms: what
+ *  `n_runs` such runs add to a round's verify forward into *ms, false (and 0) until the fused terms are measured. */
 void pulsar_engine_fused_cost_observe(pulsar_engine *e, uint32_t n_runs, const uint32_t *q, const uint32_t *c,
-                                      double forward_ms);
-bool pulsar_engine_fused_step_ms(const pulsar_engine *e, uint32_t n_runs, const uint32_t *q, const uint32_t *c,
-                                 double *ms);
-/** L310: the same fit priced as a prefill of q tokens over the c already computed, cut into chunks of at most `chunk`
- *  rows: each chunk pays the step's fixed term a, the rows alpha * q + beta * q (c + q / 2).  false (and *ms 0) with
- *  no fit yet -- the one prefill cost model, never a second (the disk tier's restore-vs-recompute reads it). */
+                                      uint32_t verify_rows, double forward_ms);
+bool pulsar_engine_fused_prompt_ms(const pulsar_engine *e, uint32_t n_runs, const uint32_t *q, const uint32_t *c,
+                                   double *ms);
+/** L310 / L327: the same fit priced as a solo prefill of q tokens over the c already computed, on the prefill grid of
+ *  `chunk` rows (a prefill's chunks end on its absolute multiples): each chunk pays the solo fixed term, the rows
+ *  alpha * q + beta * q (c + q / 2).  false (and *ms 0) until the solo terms are measured -- the one prefill cost
+ *  model, never a second (the disk tier's restore-vs-recompute reads it). */
 bool pulsar_engine_prefill_ms(const pulsar_engine *e, uint32_t q, uint32_t c, uint32_t chunk, double *ms);
 /** The loaded drafter's name ("" with none). */
 const char *pulsar_engine_drafter_name(const pulsar_engine *e);

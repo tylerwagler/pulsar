@@ -1,7 +1,7 @@
 /* L312: the fused lane's value-per-time round selection (sched_value.cpp has the rule and its rationale).
  *
- * A selection layer only: it reads the engine's two measured cost authorities (the L304 fused-step fit, the L301
- * verify curve) and the riders' service prices, and says which prompt chunks the next spec round carries.  It knows
+ * A selection layer only: it reads the engine's two measured cost authorities (the L304 / L327 prompt chunk cost fit,
+ * the L301 verify curve) and the riders' service prices, and says which prompt chunks the next spec round carries.  It knows
  * nothing of slots, banks or routing; server_sched.cpp's spec quantum gathers its inputs and applies its choice. */
 #ifndef PULSAR_SCHED_VALUE_H
 #define PULSAR_SCHED_VALUE_H
