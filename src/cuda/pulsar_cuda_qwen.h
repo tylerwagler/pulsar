@@ -197,6 +197,11 @@ const void *const *pulsar_exl3_expert_table(const void *stack, uint32_t n_expert
 int pulsar_qwen_embed_launch(const uint16_t *table, const int32_t *tokens, int T, int n_vocab, uint16_t *streams,
                              cudaStream_t stream);
 
+/** L321: y [rows][out] f32 = the complete Linear of f16 rows x_f16 (an fp16 consumer's operand format: the f16 arm
+ *  alone reads it -- any other weight refuses by name).  No workspace. */
+int pulsar_rows_linear_f16_launch(const pulsar_rows_linear *l, const uint16_t *x_f16, int rows, float *y,
+                                  cudaStream_t stream);
+
 /** Workspace bytes pulsar_rows_linear_launch needs for `rows` rows. */
 size_t pulsar_rows_linear_workspace_bytes(const pulsar_rows_linear *l, int rows);
 /** y [rows][out] f32 = the complete Linear of the bf16 rows in `x_bf16`. */

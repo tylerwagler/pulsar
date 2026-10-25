@@ -8,7 +8,9 @@
  *   y = (x16 . W^T) * 2^-P   f32 accumulate and output: the fixed-algorithm GEMM (pulsar_cuda_lt_fixed.h) -- PROMPT
  *            rows on the algorithm chosen at the prefill chunk, DECODE rows in blocks of PULSAR_GPU_MNEUTRAL_ROWS_MAX on
  *            the one chosen there -- so a row's bytes never depend on how many rows share its call.
- * No bias here: a family with biases adds them where it emits (pulsar_rows_emit_bias_bf16_launch). */
+ * Or the operand rows ARE f16 (L321: their producer wrote the fp16 consumer's format -- pulsar_rows_out): the GEMM on
+ * them as they are, no prescale (pulsar_f16_rows_linear_h_launch; their range is the producer's).
+ * No bias here: a family with biases adds them where it emits (pulsar_rows_bias_emit_launch / res32_add). */
 #ifndef PULSAR_CUDA_F16_ROWS_H
 #define PULSAR_CUDA_F16_ROWS_H
 
@@ -23,5 +25,10 @@ size_t pulsar_f16_rows_workspace_bytes(int rows, int in);
  *  out multiples of 8).  @return 0, -1 refused (named on stderr), -3 launch failure. */
 int pulsar_f16_rows_linear_launch(const void *w, const uint16_t *x_bf16, int rows, int in, int out, float *y,
                                   bool prompt, void *ws, size_t ws_bytes, cudaStream_t stream);
+
+/** y [rows][out] f32 = the f16 rows x [rows][in] times the f16 weight w [out][in], on the fixed-algorithm GEMM of the
+ *  row kind; no workspace.  @return 0, -1 refused (named on stderr), -3 launch failure. */
+int pulsar_f16_rows_linear_h_launch(const void *w, const uint16_t *x_f16, int rows, int in, int out, float *y,
+                                    bool prompt, cudaStream_t stream);
 
 #endif

@@ -62,10 +62,10 @@ bool load(pulsar_engine *e, const pulsar_engine_options *opt) {
     }
     if (!pulsar_nemotron_parse_load_vocab(w, opt->model_path)) return false;
     const pulsar_nemotron_parse_shape *s = &w->shape;
-    fprintf(stderr, "pulsar: %s: Nemotron-3.5 Parse: RADIO ViT %u x %u (%u heads of %u, stored at %u), neck -> %u, "
+    fprintf(stderr, "pulsar: %s: Nemotron-3.5 Parse: RADIO ViT %u x %u (%u heads of %u), neck -> %u, "
                     "mBART decoder %u x %u (%uq/%ukv), causal visual prefix; pages up to %u x %u, greedy + repetition "
                     "penalty %.2f, up to %u new tokens\n",
-            ARCH, s->vit_depth, s->vit_width, s->vit_heads, s->vit_head_dim, s->vit_head_stored, s->neck_width,
+            ARCH, s->vit_depth, s->vit_width, s->vit_heads, s->vit_head_dim, s->neck_width,
             s->n_layer, s->width, s->heads, s->kv_heads, s->canvas_w, s->canvas_h, (double)s->rep_penalty, s->max_new);
     return true;
 }

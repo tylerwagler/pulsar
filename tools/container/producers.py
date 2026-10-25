@@ -409,37 +409,16 @@ def rows_gather(buf: bytes, row_bytes: int, rows: list) -> bytes:
     return a[ix].tobytes()
 
 
-def _pad_heads(v: np.ndarray, pad: list) -> np.ndarray:
-    """Axis `pad[0]` (groups x heads x dim) with each head zero-padded to `pad[4]` (Mapped.pad)."""
-    axis, groups, heads, dim, to = (int(x) for x in pad)
-    if v.shape[axis] != groups * heads * dim or to < dim:
-        raise ValueError(f"pad_heads: axis {axis} of {v.shape} is not {groups} x {heads} x {dim} (to {to})")
-    v = np.moveaxis(v, axis, 0)
-    rest = v.shape[1:]
-    out = np.zeros((groups, heads, to) + rest, dtype=v.dtype)
-    out[:, :, :dim] = v.reshape((groups, heads, dim) + rest)
-    return np.moveaxis(out.reshape((groups * heads * to,) + rest), 0, axis)
-
-
-def f16_from_f32(raw: bytes, shape: list, axes: list = (), pad: list = ()) -> bytes:
+def f16_from_f32(raw: bytes, shape: list, axes: list = ()) -> bytes:
     """An F32 tensor as IEEE f16, round to nearest even (numpy's cast), refused when a value would overflow (L321: the
     Turing lane's dense format).  `axes`: a permutation of `shape` applied first -- a family reading a convolution's
-    weight as the Linear it is (Nemotron Parse's neck: [out, ch, 1, kw] -> [out, kw, ch]); `pad`: then its heads
-    zero-padded (_pad_heads)."""
+    weight as the Linear it is (Nemotron Parse's neck: [out, ch, 1, kw] -> [out, kw, ch])."""
     v = np.frombuffer(raw, dtype="<f4").reshape([int(d) for d in shape])
     if axes:
         v = v.transpose([int(a) for a in axes])
-    if pad:
-        v = _pad_heads(v, pad)
     if v.size and np.abs(v).max() > np.finfo(np.float16).max:
         raise ValueError(f"f16_from_f32: |value| {float(np.abs(v).max()):.4g} past f16's range")
     return np.ascontiguousarray(v).astype("<f2").tobytes()
-
-
-def f32_padded(raw: bytes, shape: list, pad: list) -> bytes:
-    """An F32 tensor with its heads zero-padded (_pad_heads): the bias of a padded attention projection."""
-    v = np.frombuffer(raw, dtype="<f4").reshape([int(d) for d in shape])
-    return np.ascontiguousarray(_pad_heads(v, pad)).astype("<f4").tobytes()
 
 
 def i32_values(values: list) -> bytes:
@@ -547,7 +526,7 @@ def rows_strided(buf: bytes, n_rows: int, row_bytes: int, start: int, step: int)
 
 PRODUCERS = {f.__name__: f for f in (mxfp8_lt, mxfp8_lt_from_bf16, cutlass_mxfp4, nvfp4, nvfp4_from_bf16,
                                       fp8_e4m3_soa_k_from_bf16, i64_to_i32, tessera_planes, rows_strided, rows_gather,
-                                      i32_values, f16_from_f32, f32_padded)}
+                                      i32_values, f16_from_f32)}
 # the engine's native layouts, by the stored dtype (`st_layout_type`): the recipe's `native` format
 NATIVE_LAYOUT = {"BF16": "bf16", "F16": "f16", "F32": "f32", "I32": "i32"}
 

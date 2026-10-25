@@ -223,6 +223,16 @@ extern "C" int pulsar_rows_linear_launch(const pulsar_rows_linear *l, const uint
     return ds4_exl3_dense_launch(l->w, l->k2, x_bf16, y, rows, l->in, l->out, ws, ws_bytes, stream, l->prompt);
 }
 
+extern "C" int pulsar_rows_linear_f16_launch(const pulsar_rows_linear *l, const uint16_t *x_f16, int rows, float *y,
+                                             cudaStream_t stream) {
+    if (!l || !l->w || !l->f16 || l->bf16 || l->nvfp4 || l->k2 || l->sf) {
+        fprintf(stderr, "pulsar: rows linear: f16 operand rows are read by the f16 arm only (a %d->%d weight that is not "
+                        "f16) -- refusing\n", l ? l->in : -1, l ? l->out : -1);
+        return -1;
+    }
+    return pulsar_f16_rows_linear_h_launch(l->w, x_f16, rows, l->in, l->out, y, l->prompt, stream);
+}
+
 extern "C" size_t pulsar_rows_linear_multi_workspace_bytes(const pulsar_rows_linear *const *ls, int n, int rows) {
     if (!ls || n < 1 || n > DS4_EXL3_DENSE_MAX_PROJ || rows <= 0) return 0;
     ds4_exl3_dense_proj p[DS4_EXL3_DENSE_MAX_PROJ] = {};

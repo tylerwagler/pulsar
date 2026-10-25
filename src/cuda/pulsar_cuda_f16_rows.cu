@@ -86,3 +86,22 @@ int pulsar_f16_rows_linear_launch(const void *w, const uint16_t *x_bf16, int row
     }
     return 0;
 }
+
+int pulsar_f16_rows_linear_h_launch(const void *w, const uint16_t *x_f16, int rows, int in, int out, float *y,
+                                    bool prompt, cudaStream_t stream) {
+    const char *tag = "pulsar: f16 rows linear (f16 operand)";
+    if (!w || !x_f16 || !y || rows <= 0 || in <= 0 || out <= 0 || in % 8 || out % 8 || ((uintptr_t)w & 15u) ||
+        ((uintptr_t)x_f16 & 15u)) {
+        fprintf(stderr, "%s: %d rows %d -> %d, a null / misaligned weight or operand, or a width not a multiple of 8 "
+                        "-- refusing\n", tag, rows, in, out);
+        return -1;
+    }
+    const int blk = prompt ? rows : (int)PULSAR_GPU_MNEUTRAL_ROWS_MAX;
+    for (int r0 = 0; r0 < rows; r0 += blk) {
+        const int m = rows - r0 < blk ? rows - r0 : blk;
+        const int rc = pulsar_lt_fixed_gemm(PULSAR_LT_A_NK, prompt ? PULSAR_LT_PROMPT : PULSAR_LT_DECODE, w, in, out, 0,
+                                            out, x_f16 + (size_t)r0 * in, m, y + (size_t)r0 * out, out, stream, tag);
+        if (rc) return rc;
+    }
+    return 0;
+}
