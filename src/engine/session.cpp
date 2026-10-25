@@ -215,6 +215,24 @@ int pulsar_engine::collect_imatrix(const char *dataset_path,
 static uint32_t g_live_engines;
 static std::vector<pulsar_model> g_deferred_models;
 
+/* the group's GPU phase lock (pulsar_engine_internal.h): a ticket lock, FIFO -- a phase that lets go and asks again
+ * queues behind the phases already waiting, so a parse's next step never starves an encode */
+static pthread_mutex_t g_group_gpu_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t g_group_gpu_turn = PTHREAD_COND_INITIALIZER;
+static uint64_t g_group_gpu_next, g_group_gpu_serving;
+void pulsar_group_gpu_lock(void) {
+    pthread_mutex_lock(&g_group_gpu_mu);
+    const uint64_t me = g_group_gpu_next++;
+    while (g_group_gpu_serving != me) pthread_cond_wait(&g_group_gpu_turn, &g_group_gpu_mu);
+    pthread_mutex_unlock(&g_group_gpu_mu);
+}
+void pulsar_group_gpu_unlock(void) {
+    pthread_mutex_lock(&g_group_gpu_mu);
+    g_group_gpu_serving++;
+    pthread_cond_broadcast(&g_group_gpu_turn);
+    pthread_mutex_unlock(&g_group_gpu_mu);
+}
+
 /* Register every mapping of a model with the staged-fd route -- the only route
  * onto the GPU here, since cudaHostRegister reports "operation not supported" on
  * GB10.  A GGUF has one mapping; a safetensors checkpoint has one per layer, and

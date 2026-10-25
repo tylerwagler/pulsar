@@ -52,8 +52,9 @@ constexpr uint32_t NE_SEQS_MAX = 256;
 const char ZWNJ[] = "\xe2\x80\x8c";
 
 /* The forward's scratch, the PROCESS's (L321): every encoder engine of a process (pulsar_engine_open_group) runs on
- * one GPU, one call at a time, so they share one set of buffers -- each sized to the largest member's need -- and the
- * lock that serialises their calls. */
+ * one GPU, one forward at a time (the group's GPU phase lock), so they share one set of buffers -- each sized to the
+ * largest member's need.  A packed forward is self-contained: it writes every buffer it reads, and its pooled rows are
+ * read back before the lock goes. */
 enum ne_buf { B_IDS, B_H, B_XN, B_Q, B_K, B_V, B_A, B_G, B_U, B_S, B_DELTA, B_STAGE, B_LWS, B_AWS, B_POOLED, B_COUNT };
 
 struct ne_scratch {
@@ -64,7 +65,6 @@ struct ne_scratch {
                                          ///< | up); the linears' workspace at NE_CHUNK rows; the attention's at `rows`;
                                          ///< pooled f32 [NE_SEQS_MAX][n_embd]
     uint64_t bytes[B_COUNT];
-    pthread_mutex_t mu;                  ///< one encode at a time, across the engines
 };
 
 ne_scratch *g_scratch;
@@ -270,16 +270,18 @@ int encode(pulsar_engine *e, const pulsar_tokens *in, uint32_t n, float *out, ch
             if (err) snprintf(err, errlen, "%s: input %u has %d tokens (1 .. %u)", ARCH, i, in[i].len, r->rows);
             return -1;
         }
-    pthread_mutex_lock(&r->sc->mu);
     std::vector<float> pooled((size_t)NE_SEQS_MAX * E);
     bool ok = true;
     /* inputs in order, greedily packed into forwards of at most r->rows rows and NE_SEQS_MAX inputs */
     for (uint32_t i0 = 0; ok && i0 < n;) {
         uint32_t i1 = i0, rows = 0;
         while (i1 < n && i1 - i0 < NE_SEQS_MAX && rows + (uint32_t)in[i1].len <= r->rows) rows += (uint32_t)in[i1++].len;
-        ok = forward(e, in + i0, i1 - i0, rows, err, errlen) &&
-             (pulsar_gpu_tensor_read(r->sc->t[B_POOLED], 0, pooled.data(), (uint64_t)(i1 - i0) * E * 4u) ||
-              fail(err, errlen, "the pooled rows' read failed"));
+        {
+            pulsar_group_gpu_phase ph;
+            ok = forward(e, in + i0, i1 - i0, rows, err, errlen) &&
+                 (pulsar_gpu_tensor_read(r->sc->t[B_POOLED], 0, pooled.data(), (uint64_t)(i1 - i0) * E * 4u) ||
+                  fail(err, errlen, "the pooled rows' read failed"));
+        }
         for (uint32_t i = i0; ok && i < i1; i++) {
             const float *p = &pooled[(size_t)(i - i0) * E];
             float *o = out + (size_t)i * D;
@@ -296,7 +298,6 @@ int encode(pulsar_engine *e, const pulsar_tokens *in, uint32_t n, float *out, ch
         }
         i0 = i1;
     }
-    pthread_mutex_unlock(&r->sc->mu);
     return ok ? 0 : -1;
 }
 
@@ -316,7 +317,6 @@ void pulsar_nemotron_enc_run_free(pulsar_nemotron_enc_model *w) {
     pulsar_gpu_tensor_free(r->rope);
     if (r->sc && --r->sc->refs == 0) {   /* the last encoder of the process: its scratch goes */
         for (pulsar_gpu_tensor *t : r->sc->t) pulsar_gpu_tensor_free(t);
-        pthread_mutex_destroy(&r->sc->mu);
         delete r->sc;
         g_scratch = NULL;
     }
@@ -383,10 +383,7 @@ bool pulsar_nemotron_enc_run_create(pulsar_engine *e) {
     need[B_LWS] = lws ? lws : 256u;
     need[B_AWS] = pulsar_gqa_workspace_bytes(&A, (uint32_t)R, (uint32_t)R);
     need[B_POOLED] = (uint64_t)NE_SEQS_MAX * E * 4u;
-    if (!g_scratch) {
-        g_scratch = new ne_scratch();
-        pthread_mutex_init(&g_scratch->mu, NULL);
-    }
+    if (!g_scratch) g_scratch = new ne_scratch();
     r->sc = g_scratch;
     r->sc->refs++;
     uint64_t grown = 0, total = 0;
