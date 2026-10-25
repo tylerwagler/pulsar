@@ -5,7 +5,7 @@
  *
  * What a family declares (pulsar_gqa_layer), all at RUNTIME:
  *   geometry      n_q query heads, n_kv KV heads (n_q % n_kv == 0, the group
- *                 G = n_q / n_kv <= 64), head_dim (a built tile: 64 or 128)
+ *                 G = n_q / n_kv <= 64), head_dim (a built tile: 64, 128, or -- rope-free -- 96)
  *   KV rows       the row format (pulsar_gqa_kv_fmt; BF16 today)
  *   span          FULL (every earlier key) or WINDOW (the last `window` keys,
  *                 self included, held in a ring of `cap` >= window slots)
@@ -101,7 +101,7 @@ typedef enum {
 typedef struct {
     uint32_t          n_q;          /**< query heads */
     uint32_t          n_kv;         /**< KV heads; n_q % n_kv == 0, n_q / n_kv <= 64 */
-    uint32_t          head_dim;     /**< 64 or 128 */
+    uint32_t          head_dim;     /**< 64, 128, or 96 (no rope: L321, Parse's ViT heads stored padded) */
     pulsar_gqa_kv_fmt kv_fmt;
     pulsar_gqa_span   span;
     uint32_t          window;       /**< WINDOW: keys per row (self included); FULL: 0 */

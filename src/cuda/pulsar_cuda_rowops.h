@@ -23,6 +23,11 @@
  *   bias_add  res[t][c] = bf16_rn(res[t][c] + (x[t][c] + bias[c]))  for a linear's f32 output x -- the bias and the
  *                         residual add in one rounding -- then, when w is given, y = layernorm(res) of the stored row
  *   bias_emit y[t][c]   = bf16_rn(act(x[t][c] + bias[c])),  act = none or GELU (erf: 0.5 v (1 + erf(v / sqrt 2)))
+ *   gather    y[t][c]   = bf16_rn(f32(table[ids[t]][c]) * scale)  from an f16 table (a tied f16 embedding / head)
+ * and an f32 RESIDUAL stream (a ViT's: its few very-high-norm tokens make a bf16 residual drop the small updates every
+ * other row gets, and drift -- Nemotron Parse's RADIO tower measured it), the same arithmetic without the roundings:
+ *   res32_add    res[t][c] += x[t][c] + bias[c]  (f32), then, with w, y = bf16(layernorm(res))
+ *   layernorm32  y = layernorm(x) from bf16 or f32 rows, to bf16 rows and / or f32 rows
  *
  * Every pointer is a device pointer, 16-byte aligned; widths and leading dimensions are in elements, multiples of 8. */
 #ifndef PULSAR_CUDA_ROWOPS_H
@@ -34,6 +39,7 @@
 typedef struct CUstream_st *cudaStream_t;
 #endif
 
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -87,6 +93,23 @@ int pulsar_rows_bias_add_launch(uint16_t *res, uint64_t ld_res, const float *x, 
  *  NULL).  @return 0, -1 refused, -3 launch failure. */
 int pulsar_rows_bias_emit_launch(const float *x, uint64_t ld_x, uint32_t n_rows, uint32_t width, const float *bias,
                                  pulsar_rows_act act, uint16_t *y, uint64_t ld_y, cudaStream_t stream);
+
+/** res += x + bias in f32 (res and x f32 rows ld_res / ld_x apart, multiples of 4; bias f32 [width] or NULL), then,
+ *  when `w` is given, y = bf16(layernorm(res) * w + b).  @return 0, -1 refused, -3 launch failure. */
+int pulsar_rows_res32_add_launch(float *res, uint64_t ld_res, const float *x, uint64_t ld_x, const float *bias,
+                                 uint32_t n_rows, uint32_t width, const float *w, const float *b, float eps, uint16_t *y,
+                                 uint64_t ld_y, cudaStream_t stream);
+
+/** layernorm(x) * w + b for n_rows rows of `width`: x bf16 rows (x_f32 false) or f32 rows, ld_x apart; out to y (bf16,
+ *  ld_y) and / or yf (f32, ld_yf) -- at least one.  @return 0, -1 refused, -3 launch failure. */
+int pulsar_rows_layernorm32_launch(const void *x, bool x_f32, uint64_t ld_x, uint32_t n_rows, uint32_t width,
+                                   const float *w, const float *b, float eps, uint16_t *y, uint64_t ld_y, float *yf,
+                                   uint64_t ld_yf, cudaStream_t stream);
+
+/** y[t] = bf16(table[ids[t]] * scale) for n device ids (an id outside [0, n_vocab) writes a NaN row), table f16
+ *  [n_vocab][width] (16-byte aligned).  @return 0, -1 refused, -3 launch failure. */
+int pulsar_rows_gather_f16_launch(const uint16_t *table, uint32_t n_vocab, uint32_t width, const int32_t *ids,
+                                  uint32_t n, float scale, uint16_t *y, uint64_t ld_y, cudaStream_t stream);
 
 #ifdef __cplusplus
 }

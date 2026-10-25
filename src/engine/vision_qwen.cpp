@@ -65,7 +65,7 @@ bool qwen_vision_preprocess(const uint8_t *bytes, size_t len, qwen_vision_pixels
         free(rgb);
         return false;
     }
-    uint8_t *px = vision_pil_resize_rgb(rgb, w, h, rw, rh);
+    uint8_t *px = vision_pil_resize_rgb(rgb, w, h, rw, rh, PULSAR_PIL_BICUBIC);
     free(rgb);
     if (!px) {
         snprintf(err, errlen, "resizing %dx%d to %dx%d failed", w, h, rw, rh);

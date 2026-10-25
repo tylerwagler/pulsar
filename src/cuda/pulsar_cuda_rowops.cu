@@ -2,6 +2,7 @@
 #include "pulsar_cuda_rowops.h"
 
 #include <cuda_bf16.h>
+#include <cuda_fp16.h>
 #include <cuda_runtime.h>
 #include <math.h>
 #include <stdio.h>
@@ -195,6 +196,73 @@ rows_bias_emit_kernel(const float *__restrict__ x, uint64_t ld_x, uint32_t width
     *(uint2 *)(y + t * ld_y + c) = make_uint2(o[0] | (o[1] << 16), o[2] | (o[3] << 16));
 }
 
+/* L321: the f32-residual LayerNorm, one CTA a row, thread i owning columns i, i + 256, ... (f32 or bf16 input): with
+ * x, res += x + bias first (f32); then the sum, the mean, the centred squares -- f32 chains per thread in column order,
+ * folded as ln_block_sum -- and the outputs (bf16 and / or f32). */
+template <bool IN_F32>
+__global__ void __launch_bounds__(kNormThreads)
+rows_ln32_kernel(void *__restrict__ res_, uint64_t ld_res, const float *__restrict__ x, uint64_t ld_x,
+                 const float *__restrict__ bias, uint32_t width, const float *__restrict__ w,
+                 const float *__restrict__ b, float eps, uint16_t *__restrict__ y, uint64_t ld_y,
+                 float *__restrict__ yf, uint64_t ld_yf) {
+    __shared__ float warp_s[kNormThreads / 32];
+    __shared__ float s_sum, s_sq;
+    const uint64_t t = blockIdx.x;
+    float *rf = IN_F32 ? (float *)res_ + t * ld_res : nullptr;
+    const uint16_t *rb = IN_F32 ? nullptr : (const uint16_t *)res_ + t * ld_res;
+    float sum = 0.0f;
+    for (uint32_t c = threadIdx.x; c < width; c += kNormThreads) {
+        float v;
+        if constexpr (IN_F32) {
+            v = rf[c];
+            if (x) {
+                v = __fadd_rn(v, __fadd_rn(x[t * ld_x + c], bias ? bias[c] : 0.0f));
+                rf[c] = v;
+            }
+        } else {
+            v = bf2f(rb[c]);
+        }
+        sum = __fadd_rn(sum, v);
+    }
+    if (!w) return;   /* an add alone */
+    const float mean = __fdiv_rn(ln_block_sum(sum, warp_s, &s_sum), (float)width);
+    float sq = 0.0f;
+    for (uint32_t c = threadIdx.x; c < width; c += kNormThreads) {   /* this thread's own columns: its writes visible */
+        const float a = __fsub_rn(IN_F32 ? rf[c] : bf2f(rb[c]), mean);
+        sq = __fmaf_rn(a, a, sq);
+    }
+    const float rstd = rsqrtf(__fadd_rn(__fdiv_rn(ln_block_sum(sq, warp_s, &s_sq), (float)width), eps));
+    for (uint32_t c = threadIdx.x; c < width; c += kNormThreads) {
+        const float v = __fadd_rn(__fmul_rn(__fmul_rn(__fsub_rn(IN_F32 ? rf[c] : bf2f(rb[c]), mean), rstd), w[c]), b[c]);
+        if (y) y[t * ld_y + c] = (uint16_t)f2bf(v);
+        if (yf) yf[t * ld_yf + c] = v;
+    }
+}
+
+/* Eight elements a thread: one f16 table row, scaled, as bf16 (a NaN row for an id outside the table). */
+__global__ void __launch_bounds__(kEmitThreads)
+rows_gather_f16_kernel(const uint4 *__restrict__ table, uint32_t n_vocab, uint32_t width, const int32_t *__restrict__ ids,
+                       float scale, uint16_t *__restrict__ y, uint64_t ld_y) {
+    const uint64_t t = blockIdx.y;
+    const uint32_t c8 = blockIdx.x * kEmitThreads + threadIdx.x;
+    if (8u * c8 >= width) return;
+    const int32_t id = ids[t];
+    uint32_t o[4];
+    if (id < 0 || (uint32_t)id >= n_vocab) {
+        o[0] = o[1] = o[2] = o[3] = 0x7fc07fc0u;
+    } else {
+        const uint4 v = table[(uint64_t)id * (width / 8u) + c8];
+        const uint32_t u[4] = {v.x, v.y, v.z, v.w};
+#pragma unroll
+        for (int k = 0; k < 4; ++k) {
+            const float lo = __fmul_rn(__half2float(__ushort_as_half((unsigned short)(u[k] & 0xffffu))), scale);
+            const float hi = __fmul_rn(__half2float(__ushort_as_half((unsigned short)(u[k] >> 16))), scale);
+            o[k] = f2bf(lo) | (f2bf(hi) << 16);
+        }
+    }
+    *(uint4 *)(y + t * ld_y + 8u * c8) = make_uint4(o[0], o[1], o[2], o[3]);
+}
+
 int launched(const char *who) {
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) {
@@ -304,4 +372,49 @@ extern "C" int pulsar_rows_bias_emit_launch(const float *x, uint64_t ld_x, uint3
     const dim3 grid((width / 4 + kEmitThreads - 1) / kEmitThreads, n_rows);
     rows_bias_emit_kernel<<<grid, kEmitThreads, 0, stream>>>(x, ld_x, width, bias, (int)act, y, ld_y);
     return launched("bias emit");
+}
+
+extern "C" int pulsar_rows_gather_f16_launch(const uint16_t *table, uint32_t n_vocab, uint32_t width, const int32_t *ids,
+                                             uint32_t n, float scale, uint16_t *y, uint64_t ld_y, cudaStream_t stream) {
+    if (!table || !ids || !y || n == 0 || n > 65535u || n_vocab == 0 || width == 0 || width % 8 || ld_y < width ||
+        ld_y % 8 || !aligned16(table) || !aligned16(y) || !isfinite(scale)) {
+        fprintf(stderr, "pulsar: rows gather f16: %u ids (1 .. 65535) of width %u (a multiple of 8), aligned table and "
+                        "rows, a finite scale -- refusing\n", n, width);
+        return -1;
+    }
+    const dim3 grid((width / 8 + kEmitThreads - 1) / kEmitThreads, n);
+    rows_gather_f16_kernel<<<grid, kEmitThreads, 0, stream>>>((const uint4 *)table, n_vocab, width, ids, scale, y, ld_y);
+    return launched("gather f16");
+}
+
+extern "C" int pulsar_rows_res32_add_launch(float *res, uint64_t ld_res, const float *x, uint64_t ld_x, const float *bias,
+                                            uint32_t n_rows, uint32_t width, const float *w, const float *b, float eps,
+                                            uint16_t *y, uint64_t ld_y, cudaStream_t stream) {
+    if (!res || !x || n_rows == 0 || n_rows > 0x7fffffffu || width == 0 || width % 4 || ld_res < width || ld_res % 4 ||
+        ld_x < width || ld_x % 4 || (!w != !b) || (w && (!y || ld_y < width || !(eps >= 0.0f)))) {
+        fprintf(stderr, "pulsar: rows res32 add: %u rows of width %u (a multiple of 4), leading dimensions >= the width "
+                        "(multiples of 4), a norm weight with its bias and its output -- refusing\n", n_rows, width);
+        return -1;
+    }
+    rows_ln32_kernel<true><<<n_rows, kNormThreads, 0, stream>>>(res, ld_res, x, ld_x, bias, width, w, b, eps, y, ld_y,
+                                                                nullptr, 0);
+    return launched("res32 add");
+}
+
+extern "C" int pulsar_rows_layernorm32_launch(const void *x, bool x_f32, uint64_t ld_x, uint32_t n_rows, uint32_t width,
+                                              const float *w, const float *b, float eps, uint16_t *y, uint64_t ld_y,
+                                              float *yf, uint64_t ld_yf, cudaStream_t stream) {
+    if (!x || !w || !b || (!y && !yf) || n_rows == 0 || n_rows > 0x7fffffffu || width == 0 || ld_x < width ||
+        (y && ld_y < width) || (yf && ld_yf < width) || !(eps >= 0.0f)) {
+        fprintf(stderr, "pulsar: rows layernorm32: %u rows of width %u, a weight and a bias, an output, leading dimensions "
+                        ">= the width -- refusing\n", n_rows, width);
+        return -1;
+    }
+    if (x_f32)
+        rows_ln32_kernel<true><<<n_rows, kNormThreads, 0, stream>>>(const_cast<void *>(x), ld_x, nullptr, 0, nullptr,
+                                                                    width, w, b, eps, y, ld_y, yf, ld_yf);
+    else
+        rows_ln32_kernel<false><<<n_rows, kNormThreads, 0, stream>>>(const_cast<void *>(x), ld_x, nullptr, 0, nullptr,
+                                                                     width, w, b, eps, y, ld_y, yf, ld_yf);
+    return launched("layernorm32");
 }

@@ -135,6 +135,9 @@ class Mapped:
     # L321: a permutation of the source's dims an elementwise producer applies before writing (a convolution's weight
     # read as the Linear it is); empty = as stored
     axes: tuple = ()
+    # L321: (axis, groups, heads, dim, to) -- the axis holds groups x heads x dim, each head zero-padded to `to` (an
+    # attention's head width brought to a kernel's tile: Parse's ViT heads of 72 stored as 80); empty = as stored
+    pad: tuple = ()
 
 
 def shard_order(shape: ModelShape) -> list[str]:

@@ -181,6 +181,7 @@ enum : uint32_t {
     PULSAR_FAMILY_CAP_SEGMENTS = 1u << 9, ///< disk KV segments: span files of the grid checkpoint store (L264; Qwen L266)
     PULSAR_FAMILY_CAP_MIXED_PREFILL = 1u << 10, ///< decode_mixed carries prefill runs beside its decode rows (the plain lane's mixed quantum); without it a prompt rides only the fused step
     PULSAR_FAMILY_CAP_ENCODE  = 1u << 11, ///< L321: an encoder -- the family provides pulsar_family::encoder (pulsar.h pulsar_engine_encode*)
+    PULSAR_FAMILY_CAP_PARSE   = 1u << 12, ///< L321: a page parser -- the family provides pulsar_family::parser (pulsar.h pulsar_engine_parse_page)
 };
 
 /** The session operations every family implements.  The C API
@@ -325,6 +326,12 @@ typedef struct pulsar_family_encoder {
     int (*encode)(pulsar_engine *e, const pulsar_tokens *inputs, uint32_t n, float *out, char *err, size_t errlen);
 } pulsar_family_encoder;
 
+/** L321: a page-parser family's entry (pulsar.h pulsar_engine_parse_page), behind PULSAR_FAMILY_CAP_PARSE. */
+typedef struct pulsar_family_parser {
+    int (*parse)(pulsar_engine *e, const uint8_t *image, size_t len, const pulsar_parse_options *opt, pulsar_tokens *ids,
+                 char **text, pulsar_parse_stats *stats, char *err, size_t errlen);
+} pulsar_family_parser;
+
 /** One model family.  Instances are static and const; pulsar_engine::family
  * points at one for the engine's lifetime. */
 struct pulsar_family {
@@ -395,6 +402,8 @@ struct pulsar_family {
     void (*unload)(pulsar_engine *e);
     /** L321: the encoder entries (PULSAR_FAMILY_CAP_ENCODE), or NULL = a decoder. */
     const pulsar_family_encoder *encoder;
+    /** L321: the page parser (PULSAR_FAMILY_CAP_PARSE), or NULL. */
+    const pulsar_family_parser *parser;
 };
 
 extern const pulsar_family PULSAR_FAMILY_DEEPSEEK4;

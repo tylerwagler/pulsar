@@ -112,7 +112,7 @@ def dense_entry(hf, fam, m, name, fmt, ctx):
     elif layout == 'tessera':
         PR.produce(PR.spec(PR.producer_for('tessera', layout, name), []), ctx.sources[src])
     else:
-        entry.update(EN.dense(hf, name, layout, dshape, ctx.mxfp8_mode, m.axes))
+        entry.update(EN.dense(hf, name, layout, dshape, ctx.mxfp8_mode, m.axes, m.pad))
     return entry, dims_ne
 
 
