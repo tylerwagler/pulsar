@@ -16,8 +16,9 @@ real server on a small model at a small --ctx, with the guard's budget lowered t
              bank BEFORE C binds ("kv admission: ... spilling 1 idle bank(s) first"); every answer 200
   W  PREEMPT (a fresh server) A and B as two long streamed completions, so two banks are busy, then C: no idle
              bank to spill.  Since L314 the server does not queue C behind a busy bank: the NEWEST decoder (B) is
-             PREEMPTED through its terminal checkpoint, C answers 200 while B is parked, and B is READMITTED and
-             streams all its tokens (L326: this phase was L280's WAIT and was not rerun after L314 changed the rule;
+             PREEMPTED through its terminal checkpoint, C answers 200 while B is parked, and B is READMITTED -- only
+             after a decoder finished (L326: C's admitted prompt holds its room) -- and streams all its tokens
+             (L326: this phase was L280's WAIT and was not rerun after L314 changed the rule;
              the WAIT arm is now the one for a decoder that cannot be preempted)
   R  REFUSE  a prompt whose KV alone is past the budget: 503 with the numbers, at once; the server keeps serving
   P  REUSE   chat B asked again (spilled to disk in S) answers exactly as B did cold -- the prefix cache unchanged
@@ -210,10 +211,25 @@ try:
     tb = threading.Thread(target=long_stream, args=(Bt, fb, res, "b"))
     tb.start()
     fb.wait(600)
+    # L326: when the readmission lands (/metrics, polled at 10 Hz): only after a decoder finished frees the room
+    readmit = {}
+
+    def poll_readmit():
+        t_stop = time.time() + 1800
+        while time.time() < t_stop and "t" not in readmit and tb.is_alive():
+            try:
+                if metrics().get("pulsar:decoder_readmissions_total", 0) >= 1:
+                    readmit["t"] = time.time()
+            except OSError:
+                pass
+            time.sleep(0.1)
+    tp = threading.Thread(target=poll_readmit)
+    tp.start()
     rc = chat(C)
     c_end = time.time()
     ta.join()
     tb.join()
+    tp.join()
     txt = open(log).read()
     check(res.get("a", (0,))[0] == 200 and res.get("b", (0,))[0] == 200,
           "A and B streamed %s / %s tokens" % (res.get("a", (0, 0))[1], res.get("b", (0, 0))[1]))
@@ -226,6 +242,12 @@ try:
     b_end = res.get("b", (0, 0, 0))[2]
     check(b_end > 0 and c_end <= b_end, "C finished while B was parked, before B's stream ended (%.1f s before)"
           % (b_end - c_end if b_end else 0))
+    # a decoder must have finished first (C's 16 tokens or A's stream): never in the turn that preempted B
+    first_end = min([c_end] + [v[2] for k_, v in res.items() if k_ == "a" and v[2]])
+    rt = readmit.get("t")
+    check(rt is not None and rt >= first_end - 0.15,
+          "B READMITTED only after a decoder finished (%s)" %
+          ("%.1f s after the first end" % (rt - first_end) if rt is not None else "no readmission seen on /metrics"))
     if not ok:
         for l in kv_lines(txt):
             print("#   W: " + l[-220:])
