@@ -2749,7 +2749,7 @@ struct pulsar_session {
      * whose version or shape does not match this build. @return 0 on success. */
     int load_payload(FILE *fp, uint64_t payload_bytes, char *err, size_t errlen);
     /** L264 S4 disk segments (pulsar.h, pulsar_session_save_segment). */
-    uint64_t segment_bytes(uint32_t G_prev, uint32_t G);
+    uint64_t segment_bytes(uint32_t G_prev, uint32_t G, uint64_t *state_bytes);
     int save_segment(FILE *fp, uint32_t G_prev, uint32_t G, char *err, size_t errlen);
     int load_segment(FILE *fp, uint64_t bytes, bool last, uint32_t *G_out, char *err, size_t errlen);
     /** Capture the session into an owned in-memory blob. @return 0 on success. */
@@ -3344,6 +3344,10 @@ void pulsar_bank_carry_save_view(pulsar_session *s, uint32_t bank);
 /** Bring `bank`'s saved view back into the host view.  false = nothing valid was saved (the family
  *  decides what a bank with no carry means). */
 bool pulsar_bank_carry_restore_view(pulsar_session *s, uint32_t bank);
+/** L322: the host view of a bank nothing was saved for -- empty and INVALID, so its first sync resets the bank and
+ *  prefills cold (never continues another bank's history: the host view the caller held describes the bank it was
+ *  synced on).  Every family's restore of such a bank installs it. */
+void pulsar_bank_carry_fresh_view(pulsar_session *s);
 /** A bank's committed history: the live view for the live bank, else its carry.  NULL = none. */
 const pulsar_tokens *pulsar_bank_history(pulsar_session *s, uint32_t bank);
 

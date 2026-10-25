@@ -135,7 +135,7 @@ int GATE_ENTRY(int argc, char **argv) {
 
     /* the spill: bank 1 installed, its chain persisted, its carry saved, bank 0 installed */
     FILE *seg = tmpfile();
-    const uint64_t seg_bytes = ok ? pulsar_session_segment_bytes(s, 0, G) : 0;
+    const uint64_t seg_bytes = ok ? pulsar_session_segment_bytes(s, 0, G, NULL) : 0;
     ok = ok && seg && pulsar_session_bank_state_restore(s, 1) && pulsar_session_checkpoint_best(s, G) == G &&
          pulsar_session_save_segment(s, seg, 0, G, NULL, err, sizeof(err)) == 0;
     if (ok) pulsar_session_bank_state_save(s, 1);

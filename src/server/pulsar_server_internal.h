@@ -1581,6 +1581,39 @@ typedef struct {
     int deferral;
 } lane_price;
 
+/** L324: a pair of banks whose shared prefix reaches this deep shares more than the client preamble (Claude Code's
+ *  tools + system prompt render to ~14-25k tokens; 2026-10-23 measured 13.7-24.5k): the census logs it by bank and
+ *  reports it in the `deep` class. */
+#define PULSAR_KV_DUP_DEEP_TOKENS 32768
+
+/** L324: the duplicate-prefix census of the RESIDENT banks -- how much GPU KV the pool holds twice because two banks
+ *  carry the same token prefix.  A PAGE is one cell of the disk grid (pulsar_kvchain_grid, the L323 authority: the
+ *  prefill chunk, 4096 in production); bank b holds page p when its history covers [p*grid, (p+1)*grid) whole, and
+ *  two banks hold the SAME page p when their token ids agree to (p+1)*grid -- the condition under which one physical
+ *  copy could serve both (KV at a position depends on every token before it) and under which the L323 store gives
+ *  their grid segments one key.  Measured from the host carries only (pulsar_session_bank_common_prefix, the
+ *  route's and the dominance predicate's compare); never a GPU read.  Published under mu for /metrics. */
+struct kv_dup_census {
+    int grid;                    ///< tokens per page (0: no census yet)
+    uint64_t page_bytes;         ///< GPU KV bytes one page of one bank holds (the bank growth price of `grid` tokens)
+    int banks;                   ///< resident banks holding at least one whole page
+    uint64_t pages_resident;     ///< whole pages held, summed over resident banks
+    uint64_t pages_distinct;     ///< of those, distinct (shared pages counted once)
+    uint64_t pages_shared;       ///< distinct pages held by >= 2 resident banks
+    uint64_t pages_duplicate;    ///< extra copies: pages_resident - pages_distinct
+    uint64_t dup_bytes;          ///< what the extra copies cost: pages_duplicate * page_bytes
+    int pairs[2];                ///< bank pairs sharing >= 1 whole page: [0] preamble (< PULSAR_KV_DUP_DEEP_TOKENS), [1] deep
+    int longest[2];              ///< the longest shared prefix (tokens) of a pair in each class (0: no such pair)
+};
+
+/** L324: the census over injected per-slot facts (pure; server::kv_dup_census_update reads them): `n` slots,
+ *  `hist_len[i]` the slot's history length (0 = none), `resident[i]` whether its KV is in GPU memory, `common[a][b]`
+ *  the common token prefix of slots a and b, read only where hist_len[a] <= hist_len[b] and both are > 0 (the
+ *  dominance matrix's fill rule, bank_common_matrix).  `deep[a]` gets a bit b (b > a) for every resident pair whose
+ *  shared prefix is at least PULSAR_KV_DUP_DEEP_TOKENS (NULL: not wanted). */
+void kv_dup_census_core(int n, const int *hist_len, const bool *resident, const int *const *common, int grid,
+                        uint64_t page_bytes, kv_dup_census *out, uint32_t *deep);
+
 /** The whole server: engine, session pool, scheduler queue, caches, metrics.
  *
  * ONE worker thread does every piece of engine work; client threads only parse,
@@ -1807,6 +1840,9 @@ struct server {
     uint64_t m_restore_failures;  ///< spilled bank could not be restored
     uint64_t m_preemptions;  ///< L314: running decoders preempted through their terminal checkpoint
     uint64_t m_readmissions;  ///< L314: preempted decoders reloaded and stepping again
+    kv_dup_census m_dup;          ///< L324: the last duplicate-prefix census (kv_dup_census_update)
+    uint64_t m_dup_censuses;      ///< L324: censuses taken
+    uint64_t m_dup_bytes_peak;    ///< L324: the largest dup_bytes any census saw
     /** Why the queue is stuck. Counted once per job (job::refusal_counted) so a
      * head that cannot bind for many quanta registers once, not once a tick. */
     uint64_t m_refusals[PROVISION_REFUSAL_COUNT];
@@ -2183,7 +2219,7 @@ struct server {
      * No-op when `bank` is already live. Worker thread only. */
     bool bank_switch(int bank);
     /** Evict exactly one idle victim so a fresh conversation gets a bank.
-     * Live-tool owners are protected; LRU-superseded victims go first, else
+     * Live-tool owners are protected; dominated victims go first, else
      * plain LRU (worker_evict_one's picker). Reuses the proven eviction body
      * (snapshot + ledger release + bank reset). Worker thread only; returns
      * true when a bank was freed. */
@@ -2192,14 +2228,16 @@ struct server {
      * @return false when the file is missing or unreadable, which forces the
      * conversation to replay from a checkpoint instead. */
     bool bank_restore_spilled(int bank);
-    /** plan-33 inc D victim policy: an idle bank is LRU-SUPERSEDED when its whole
-     * committed history is a token-prefix of ANOTHER live bank's history (a sibling
-     * that already extends past it) — its KV is redundant, so evicting it loses the
-     * least. Returns such a slot's index (the least-recently-served among them), or
-     * -1. Pure host reads (pulsar_session_bank_tokens / _common_prefix are the same
-     * host-carry reads routing already uses on idle banks; no CUDA, no install).
-     */
-    int pick_superseded_idle(const bool *protect);
+    /** L323: which slots are DOMINATED -- a bank whose whole history is the prefix of another resident or spilled
+     * bank's (bank_dominated_core, the one predicate).  The guard's spill and the make-room eviction take a
+     * dominated bank before any LRU choice.  Pure host reads (pulsar_session_bank_tokens / _common_prefix, the
+     * host-carry reads routing already uses on idle banks; no CUDA, no install); all false off the bank pool. */
+    void dominated_slots(bool dominated[PULSAR_SESSION_POOL_CAP]);
+    /** L324: take the duplicate-prefix census of the resident banks (kv_dup_census_core over the host carries; no
+     * CUDA) and publish it for /metrics; log, once per pair, a resident pair that shares more than the preamble
+     * (PULSAR_KV_DUP_DEEP_TOKENS).  Worker thread, at each request's end.  No-op off the bank pool. */
+    void kv_dup_census_update();
+    uint32_t w_dup_deep[PULSAR_SESSION_POOL_CAP];  ///< L324: the deep pairs the last census logged (bit b of slot a)
     /** Spill one idle bank: install it, snapshot its KV to disk, save its host carry,
      * repoint AWAY (free_physical refuses the cur bank), then cudaFree its physical.
      */
@@ -2213,9 +2251,10 @@ struct server {
      *  fails that request by name.  @return true when one was readmitted (or failed). */
     bool worker_readmit_preempted();
     /** LRU-idle smallest-frontier victim: NOT bank 0 (pinned), NOT in the live decode
-     * set, no active job, not already spilled. -1 if none.
+     * set, no active job, not already spilled. -1 if none.  L323: a slot `dominated`
+     * marks (dominated_slots; NULL = none) goes first.
      */
-    int guard_pick_victim(session_slot **dec, int n);
+    int guard_pick_victim(session_slot **dec, int n, const bool *dominated = nullptr);
     /** Proactive-eviction guard: spill banks to disk until resident KV is back
      * under guard_touched_budget. @param dec the decode set that must be kept
      * resident. @param n its length. */
@@ -3234,7 +3273,7 @@ void id_list_push_unique(stop_list *ids, const char *id);
 void id_list_free(stop_list *ids);
 void collect_tool_call_ids(const chat_msgs *msgs, stop_list *ids);
 char *path_join(const char *dir, const char *name);
-bool kv_cache_open(kv_disk_cache *kc, const char *dir, uint64_t budget_mb, uint32_t model_id,
+bool kv_cache_open(kv_disk_cache *kc, const char *dir, uint64_t budget_mb, uint32_t identity,
                    kv_cache_options opt);
 void kv_cache_close(kv_disk_cache *kc);
 char *render_tokens_text(pulsar_engine *engine, const pulsar_tokens *tokens, size_t *out_len);
@@ -3269,8 +3308,11 @@ int server_route_turn_anchor(const pulsar_tokens *bank, int prefilled, const pul
 /** L311: the last token of the last assistant marker (the generation header) among the bank's prefilled tokens,
  *  first turn included; a request that matches past it is the conversation's next turn.  -1 when none / unknown. */
 int server_route_header_anchor(const pulsar_tokens *bank, int prefilled, const pulsar_turn_markers *m);
+/** L322: the bank's route anchor -- the SHALLOWER of the two above that exists (each alone says a request matching
+ *  past it is this conversation's), -1 when neither does. */
+int server_route_anchor(const pulsar_tokens *bank, int prefilled, const pulsar_turn_markers *m);
 /* L264 S3 + L275: does the best-scoring free bank take the request in place, or
- * is a fresh bank preferred.  `anchor` is server_route_turn_anchor's answer for
+ * is a fresh bank preferred.  `anchor` is server_route_anchor's answer for
  * that bank (defined in server_sched.cpp; unit-tested in server_tests.cpp). */
 bool server_route_in_place(int common, int score, int frontier, int prefilled, int protect_floor,
                            int anchor);
@@ -3322,10 +3364,13 @@ uint64_t server_ledger_release(uint64_t committed_total, uint64_t slot_cost);
  * tie-broken by smallest committed bytes; slot 0 pinned; protect[i] (may be
  * NULL) marks slots a queued live continuation still needs. Returns a slot
  * index or -1. Pure selection over host fields — never touches the session
- * (defined in generate.cpp; unit-tested in cli_main.cpp). */
+ * (defined in server_sched.cpp; unit-tested in server_tests.cpp).  L323: a slot
+ * `dominated` marks (server::dominated_slots; NULL = none) goes before any LRU
+ * choice. */
 int server_evict_pick_victim(const session_slot *slots, int n_slots,
                                     const bool *protect,
-                                    bool allow_slot0 = false);
+                                    bool allow_slot0 = false,
+                                    const bool *dominated = nullptr);
 void trace_cache_capture(
         trace_cache_diag *d,
         const pulsar_tokens *live,

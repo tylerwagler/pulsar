@@ -545,13 +545,8 @@ static void decl_bank_save(pulsar_session *s, uint32_t bank) {
 static bool decl_bank_restore(pulsar_session *s, uint32_t bank) {
     if (!s || !s->states || bank >= s->states->n_banks) return false;
     s->states->live_bank = bank;
-    if (pulsar_bank_carry_restore_view(s, bank)) return true;
-    /* a bank nothing was saved for: an empty, INVALID view, so its first sync resets the bank and prefills cold
-     * (never continues whatever the device state holds) */
-    s->checkpoint.len = 0;
-    s->checkpoint_valid = false;
-    s->logits_stale = true;
-    spec_lookahead_reset(s);   /* no shadow was saved: the fresh bank has no pendings, carry or quench */
+    /* a bank nothing was saved for: the fresh view (its first sync resets the bank and prefills cold) */
+    if (!pulsar_bank_carry_restore_view(s, bank)) pulsar_bank_carry_fresh_view(s);
     return true;
 }
 

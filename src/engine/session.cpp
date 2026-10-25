@@ -288,6 +288,12 @@ bool pulsar_ds4_family_load(pulsar_engine *e, const pulsar_engine_options *opt) 
     if (!ds4_load_stage_ok("the tokenizer")) return false;
     config_validate_model(&e->model);
     if (!ds4_load_stage_ok("the configuration")) return false;
+    /* L280: DeepSeek's container declares its YaRN (validated above); the option may only restate it */
+    if (opt->rope_yarn_factor != 0.0 && opt->rope_yarn_factor != (double)PULSAR_ROPE_SCALE_FACTOR) {
+        fprintf(stderr, "pulsar: --rope-yarn %g contradicts the container's YaRN factor %g -- refusing\n",
+                opt->rope_yarn_factor, (double)PULSAR_ROPE_SCALE_FACTOR);
+        return false;
+    }
     if (opt->expert_overlay && opt->expert_overlay[0]) {
         const char *sep = strrchr(opt->expert_overlay, ':');
         if (!sep || sep == opt->expert_overlay || !sep[1]) {
@@ -551,6 +557,16 @@ int pulsar_engine::open(pulsar_engine **out, const pulsar_engine_options *opt) {
     if (tp_n_ranks_at_load > 1 && opt->expert_overlay) {
         fprintf(stderr, "pulsar: --expert-overlay is not supported under tensor parallelism "
                         "(the overlay's experts have no owner) -- refusing\n");
+        free(e);
+        *out = NULL;
+        return 1;
+    }
+    /* L280: each rank parses its own --rope-yarn, and the TP hello compares the artifact, not the rope -- a pair
+     * given two factors would mix two ropes in one forward.  A pair runs YaRN only from a container that declares
+     * it (the same bytes on both ranks, compared by the hello). */
+    if (tp_n_ranks_at_load > 1 && opt->rope_yarn_factor != 0.0) {
+        fprintf(stderr, "pulsar: --rope-yarn is not supported under tensor parallelism (the TP hello does not "
+                        "compare the rope) -- refusing\n");
         free(e);
         *out = NULL;
         return 1;
@@ -1300,7 +1316,7 @@ void pulsar_tokens_prefix_match(pulsar_engine *e,
     int i = 0, j = 0;          /* token cursors */
     size_t oa = 0, ob = 0;     /* byte offsets inside the current tokens */
     int best_i = 0, best_j = 0;
-    const char *ta = NULL, *tb = NULL;
+    char *ta = NULL, *tb = NULL;   /* pulsar_token_text's copies (malloc'd), each freed as its cursor leaves the token */
     size_t la = 0, lb = 0;
     while (i < a_len && j < b_len) {
         if (oa == 0 && ob == 0) {
@@ -1310,10 +1326,12 @@ void pulsar_tokens_prefix_match(pulsar_engine *e,
             seamed = true;   /* same bytes ahead, different boundaries */
         }
         if (oa == 0) {
+            free(ta);
             ta = pulsar_token_text(e, a[i], &la);
             if (!ta || la == 0) break;   /* control/special: id-only match */
         }
         if (ob == 0) {
+            free(tb);
             tb = pulsar_token_text(e, b[j], &lb);
             if (!tb || lb == 0) break;
         }
@@ -1326,6 +1344,8 @@ void pulsar_tokens_prefix_match(pulsar_engine *e,
     }
     if (oa == 0 && ob == 0) { best_i = i; best_j = j; }
 done:
+    free(ta);
+    free(tb);
     out->live_cut = best_i;
     out->prompt_cut = best_j;
     out->seamed = seamed;

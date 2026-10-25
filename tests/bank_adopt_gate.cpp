@@ -8,10 +8,14 @@
  *          the grid checkpoint below it;
  *   SIDE   P to its message endpoint (the generation header's start) plus another user turn and its header (Claude
  *          Code's side request): split-invariant families adopt the endpoint record, DeepSeek the grid point below;
+ *   SEAM   (L322; run last, after the LENDER check below) P plus 211 tokens again, adopted from bank 3, which prefilled P with one early system-message
+ *          token RE-SPELLED as two (the same bytes: the history a byte-only disk match loads) and decoded past it:
+ *          the adopt must pass the seam (by ids the two part there), and the reference is the stitched prompt -- bank
+ *          3's spelling to its end, Q's tokens after it -- prefilled cold, the bytes a seamed own-bank resume runs;
  *   SAME   P itself: every family adopts P's prompt end with its logits and evaluates no row;
- * bank 1 adopts bank 0's state for Q and syncs Q; bank 2 syncs Q cold from nothing; their logits after the sync and
- * N greedy tokens after it must be identical.  Last, bank 0 -- which lent its state -- still resumes P at its prompt
- * end with the cold logits.
+ * bank 1 adopts the lender's state for Q and syncs Q; bank 2 syncs Q (SEAM: the stitched prompt) cold from nothing;
+ * their logits after the sync and N greedy tokens after it must be identical.  Last, bank 0 -- which lent its state --
+ * still resumes P at its prompt end with the cold logits.
  *
  * usage: ./tests/bank_adopt_gate MODEL */
 #include "pulsar.h"
@@ -54,7 +58,11 @@ static bool greedy(pulsar_session *s, int n, int *out, char *err, size_t errlen)
     return true;
 }
 
-static void shape(pulsar_engine *e, pulsar_session *s, int *live, const char *name, const pulsar_tokens *Q) {
+/* bank 1 adopts `src`'s state for Q and syncs Q; bank 2 syncs `cold` (Q itself, or SEAM's stitched prompt) from
+ * nothing; the adopt must reach past `past` */
+static void shape(pulsar_engine *e, pulsar_session *s, int *live, const char *name, const pulsar_tokens *Q,
+                  uint32_t src = 0, const pulsar_tokens *cold = NULL, int past = 0) {
+    if (!cold) cold = Q;
     char err[320] = "";
     const int W = pulsar_engine_logits_width(e);
     float *la = (float *)malloc((size_t)W * sizeof(float)), *lc = (float *)malloc((size_t)W * sizeof(float));
@@ -62,17 +70,17 @@ static void shape(pulsar_engine *e, pulsar_session *s, int *live, const char *na
     /* bank 1 adopts */
     bool ok = install(s, live, 1);
     if (ok) pulsar_session_invalidate(s);
-    const int T = ok ? pulsar_session_bank_adopt(s, 0, Q, err, sizeof err) : -1;
+    const int T = ok ? pulsar_session_bank_adopt(s, src, Q, err, sizeof err) : -1;
     const int rs = T >= 0 ? pulsar_session_sync(s, Q, err, sizeof err) : 1;
     const int origin = pulsar_session_resume_origin(s);
     if (rs == 0) pulsar_session_copy_logits(s, la, W);
     const bool ga = rs == 0 && greedy(s, N_GEN, ta, err, sizeof err);
-    say(T > 0 && rs == 0 && ga, "%s: bank 1 adopts bank 0's state at %d of %d and syncs (origin %d) %s", name, T, Q->len,
-        origin, err);
+    say(T > past && rs == 0 && ga, "%s: bank 1 adopts bank %u's state at %d of %d (past %d) and syncs (origin %d) %s",
+        name, src, T, Q->len, past, origin, err);
     /* bank 2 cold */
     ok = install(s, live, 2);
     if (ok) pulsar_session_invalidate(s);
-    const int rc = ok ? pulsar_session_sync(s, Q, err, sizeof err) : 1;
+    const int rc = ok ? pulsar_session_sync(s, cold, err, sizeof err) : 1;
     const int origin_c = pulsar_session_resume_origin(s);
     if (rc == 0) pulsar_session_copy_logits(s, lc, W);
     const bool gc = rc == 0 && greedy(s, N_GEN, tc, err, sizeof err);
@@ -95,7 +103,7 @@ int GATE_ENTRY(int argc, char **argv) {
     opt.backend = PULSAR_BACKEND_CUDA;
     if (gate_engine_open(&e, &opt) != 0) { fprintf(stderr, "engine open failed\n"); return 1; }
     pulsar_session *s = NULL;
-    pulsar_tokens P = {0}, side = {0}, ext = {0}, story = {0}, Q = {0};
+    pulsar_tokens P = {0}, side = {0}, ext = {0}, story = {0}, Q = {0}, H = {0}, S = {0};
     char *text = NULL;
     int live = -1;
     {
@@ -153,6 +161,48 @@ int GATE_ENTRY(int argc, char **argv) {
         "LENDER: bank 0 resumes P at its prompt end (origin %d of %d), logits == cold %s", o0, P.len, err);
     free(l0);
     free(l2);
+    /* SEAM (L322), LAST: it fills the record pool (bank 3's prompt end and endpoint, bank 1's copy), and the pool is
+     * LRU over n + n/2 = 6 records at 4 banks -- run before the LENDER check it evicted bank 0's prompt end (the
+     * least recently used record: gpuq #445, "origin 2688 of 2701"), which the LENDER check exists to keep.
+     * Bank 3 holds P with its first splittable system-message token at k >= 16 re-spelled as two tokens
+     * of the same bytes (its first byte, then the rest), prefilled and decoded past; Q = EXT's prompt, canonical */
+    {
+        int k = -1;
+        pulsar_tokens a = {0}, b = {0};
+        for (int i = 16; i < E && k < 0; i++) {
+            size_t n = 0;
+            char *t = pulsar_token_text(e, P.v[i], &n);
+            bool word = t && n >= 3;
+            for (size_t c = 0; word && c < n; c++) word = (t[c] >= 'a' && t[c] <= 'z') || (t[c] >= 'A' && t[c] <= 'Z');
+            if (word) {
+                char head[2] = {t[0], '\0'};
+                a.len = b.len = 0;
+                pulsar_tokenize_text(e, head, &a);
+                pulsar_tokenize_text(e, t + 1, &b);
+                if (a.len >= 1 && b.len >= 1) k = i;   /* two spellings of the token's bytes */
+            }
+            free(t);
+        }
+        for (int i = 0; k >= 0 && i < P.len; i++) {
+            if (i != k) { pulsar_tokens_push(&H, P.v[i]); continue; }
+            for (int j = 0; j < a.len; j++) pulsar_tokens_push(&H, a.v[j]);
+            for (int j = 0; j < b.len; j++) pulsar_tokens_push(&H, b.v[j]);
+        }
+        pulsar_tokens_free(&a);
+        pulsar_tokens_free(&b);
+        int pre3[N_PRE];
+        /* no invalidate after the install, deliberately: a bank nothing was saved for must come up with the fresh view
+         * on every family (pulsar_bank_carry_fresh_view; on DeepSeek it kept bank 0's view of P until L322, gpuq #446) */
+        const bool b3 = k >= 0 && install(s, &live, 3) && pulsar_session_sync(s, &H, err, sizeof err) == 0 &&
+                        greedy(s, N_PRE, pre3, err, sizeof err);
+        say(b3, "SEAM: bank 3 prefilled P re-spelled at %d (%d tokens for its %d) and decoded %d past it %s", k, H.len,
+            P.len, N_PRE, err);
+        if (b3) {
+            for (int i = 0; i < H.len; i++) pulsar_tokens_push(&S, H.v[i]);
+            for (int i = P.len; i < ext.len; i++) pulsar_tokens_push(&S, ext.v[i]);
+            shape(e, s, &live, "SEAM", &ext, 3, &S, k);
+        }
+    }
     }
 out:
     if (s) pulsar_session_free(s);
@@ -161,6 +211,8 @@ out:
     pulsar_tokens_free(&ext);
     pulsar_tokens_free(&story);
     pulsar_tokens_free(&Q);
+    pulsar_tokens_free(&H);
+    pulsar_tokens_free(&S);
     free(text);
     gate_engine_close(e);
     fprintf(stderr, "bank-adopt gate: %s\n", g_fail ? "FAIL" : "PASS");

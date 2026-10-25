@@ -250,6 +250,7 @@ const pulsar_family PULSAR_FAMILY_DEEPSEEK4 = {
     /* .chat_format  = */ ds4_chat_format,
     /* .model_id     = */ ds4_model_id,
     /* .trained_ctx  = */ ds4_trained_context,
+    /* .rope_id      = */ pulsar_family_rope_fixed,
     /* .tp_shape     = */ ds4_tp_shape,
     /* .drafter      = */ ds4_drafter,
     /* .quant_bits   = */ ds4_quant_bits,

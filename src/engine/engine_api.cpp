@@ -3,6 +3,7 @@
 #include "spec_block.h"
 #include "pulsar_nvtx.h"
 #include "../tp/pulsar_tp.h"
+#include "../lib/pulsar_segstore.h"
 #include <unistd.h>
 #include <string>
 
@@ -322,6 +323,10 @@ int pulsar_engine_collect_imatrix(pulsar_engine *e,
                                int max_tokens) { PULSAR_FAMILY_REQUIRES_E(e, PULSAR_FAMILY_CAP_IMATRIX, "imatrix collection", 1); return e ? e->collect_imatrix(dataset_path, output_path, ctx_size, max_prompts, max_tokens) : 1; }
 void pulsar_engine_dump_tokens(pulsar_engine *e, const pulsar_tokens *tokens) { PULSAR_FAMILY_REQUIRES_E(e, PULSAR_FAMILY_CAP_CHAT, "token dumps (no tokenizer)", (void)0); if (e->family->tokenizer) e->family->tokenizer->dump(e, stdout, tokens); }
 int pulsar_engine_routed_quant_bits(pulsar_engine *e) { return e ? e->routed_quant_bits() : 0; }
+uint32_t pulsar_engine_kv_identity(pulsar_engine *e) {
+    return pulsar_segstore_identity((uint32_t)pulsar_engine_model_id(e), (uint32_t)pulsar_engine_routed_quant_bits(e),
+                                    e ? e->family->rope_id(e) : 0u);
+}
 bool pulsar_engine_has_spec_rounds(const pulsar_engine *e) { return e && e->drafter_ops && e->family->spec; }
 bool pulsar_engine_can_rewind(const pulsar_engine *e) { return e && (e->family->caps & PULSAR_FAMILY_CAP_REWIND) != 0; }
 bool pulsar_engine_has_fused_step(const pulsar_engine *e) { return e && e->family->session->decode_fused; }
@@ -563,7 +568,8 @@ int pulsar_session_create(pulsar_session **out, pulsar_engine *e, int ctx_size) 
     const uint64_t trained = e ? e->family->trained_context(e) : 0;
     if (e && ctx_size > 0 && (uint64_t)ctx_size > trained) {
         fprintf(stderr, "pulsar: a %d-token context is past %s's trained %" PRIu64 " positions -- refusing "
-                        "(no position scaling extends it)\n", ctx_size, e->family->name, trained);
+                        "(the rope that runs is the container's rope_parameters, or --rope-yarn F over a native "
+                        "one: Qwen's model card serves 1048576 at --rope-yarn 4)\n", ctx_size, e->family->name, trained);
         if (out) *out = NULL;
         return 1;
     }
@@ -1654,34 +1660,42 @@ int pulsar_session_bank_resume_at(pulsar_session *s, uint32_t bank, const pulsar
     const uint32_t G = pulsar_session_resume_point(s, bank, m.live_cut, m.live_cut + (prompt->len - m.prompt_cut));
     return (int)G < m.live_cut ? (int)G : m.prompt_cut;
 }
-/* L313: where `src`'s published state serves `prompt` -- its deepest grid checkpoint within the shared ids and its
- * prefill-only history (one short of the prompt), or a deeper record by the resume rule's own terms -- and the record
- * (NULL for a grid point).  0 when none. */
+/* L313: where `src`'s published state serves `prompt` -- the one resume rule (pulsar_session_resume_point, the rule a
+ * bank's own resume reads) on src: its deepest grid checkpoint within the match and its prefill-only history (one short
+ * of the prompt), or a deeper record by the rule's own terms -- and the record (NULL for a grid point); `*len` is the
+ * prompt's length in src's currency (the stitched prompt's).  0 when none.
+ * L322: the match is the token-seam one (pulsar_tokens_prefix_match), as the route and the bank's own resume read it,
+ * not the exact-id common prefix: a history loaded from a byte-only disk match (another spelling of the same bytes)
+ * parts from every later prompt by id at that seam, and the id rule capped every adopt of it there (8192, 2026-10-24,
+ * Claude Code at 178-193k).  The adopted view is src's tokens to T, and the sync re-stitches it against the prompt, so
+ * T must be a boundary the two spellings share: a T inside a re-spelled stretch is no adopt point (the stitch would
+ * stand short of T, below every checkpoint the adopt leaves, and prefill from 0). */
 static uint32_t bank_adopt_point(pulsar_session *s, uint32_t src, const pulsar_tokens *prompt,
-                                 const pulsar_ckpt_record **rec) {
+                                 const pulsar_ckpt_record **rec, int *len) {
     *rec = NULL;
-    const pulsar_ckpt_store *st = pulsar_session_kv_store(s);
+    *len = prompt->len;
     const pulsar_tokens *h = pulsar_bank_history(s, src);
-    if (!st || !st->ops || !h || prompt->len <= 0) return 0u;
-    const uint32_t common = (uint32_t)pulsar_tokens_common_prefix(h, prompt);
-    const uint32_t pf = (uint32_t)pulsar_session_bank_prefill_frontier(s, src);
-    uint32_t limit = common < pf ? common : pf;
-    uint32_t rlimit = limit < (uint32_t)prompt->len ? limit : (uint32_t)prompt->len;
-    if (limit > (uint32_t)prompt->len - 1u) limit = (uint32_t)prompt->len - 1u;
-    const uint32_t G = limit ? pulsar_ckpt_best(st, src, limit) : 0u;
-    const pulsar_ckpt_record *r = pulsar_ckpt_record_best(st, src, h->v, (uint32_t)h->len, rlimit, (uint32_t)prompt->len);
-    if (r && r->T > G && (r->T == (uint32_t)prompt->len || st->ops->split_invariant)) {
-        *rec = r;
-        return r->T;
+    if (!h || prompt->len <= 0) return 0u;
+    pulsar_prefix_match m;
+    pulsar_tokens_prefix_match(s->engine, h->v, h->len, prompt->v, prompt->len, &m);
+    *len = m.live_cut + (prompt->len - m.prompt_cut);
+    const uint32_t T = pulsar_session_resume_point(s, src, m.live_cut, *len);
+    if (T == 0u) return 0u;
+    if (m.seamed) {
+        pulsar_prefix_match at;
+        pulsar_tokens_prefix_match(s->engine, h->v, (int)T, prompt->v, prompt->len, &at);
+        if (at.live_cut != (int)T) return 0u;
     }
-    return G;
+    *rec = pulsar_session_resume_record(s, src, T, *len);
+    return T;
 }
 
 int pulsar_session_bank_adopt_score(pulsar_session *s, uint32_t src, const pulsar_tokens *prompt) {
     if (!s || !prompt || src >= (uint32_t)pulsar_session_bank_count(s) || src == pulsar_session_live_bank(s)) return 0;
     if (tp_mirror_target(s)) return 0;   /* a pair does not mirror the adopt (pulsar_session_bank_adopt refuses it) */
     const pulsar_ckpt_record *r = NULL;
-    return (int)bank_adopt_point(s, src, prompt, &r);
+    int len = 0;
+    return (int)bank_adopt_point(s, src, prompt, &r, &len);
 }
 
 int pulsar_session_bank_adopt(pulsar_session *s, uint32_t src, const pulsar_tokens *prompt, char *err,
@@ -1699,7 +1713,8 @@ int pulsar_session_bank_adopt(pulsar_session *s, uint32_t src, const pulsar_toke
         return -1;
     }
     const pulsar_ckpt_record *r = NULL;
-    const uint32_t T = bank_adopt_point(s, src, prompt, &r);
+    int len = 0;   /* the prompt in src's currency: a prompt end is the WHOLE (stitched) prompt */
+    const uint32_t T = bank_adopt_point(s, src, prompt, &r, &len);
     if (T == 0u) return 0;
     const pulsar_tokens *h = pulsar_bank_history(s, src);
     /* the records and checkpoints keep no image identity across banks: a history with an image block stays its own */
@@ -1707,7 +1722,7 @@ int pulsar_session_bank_adopt(pulsar_session *s, uint32_t src, const pulsar_toke
     pulsar_tokens view = {0};
     for (uint32_t i = 0; i < T; i++) pulsar_tokens_push(&view, h->v[i]);   /* h is src's carry: copy before moving */
     pulsar_ckpt_store *st = pulsar_session_kv_store(s);
-    const bool at_end = r && r->logits && T == (uint32_t)prompt->len;
+    const bool at_end = r && r->logits && T == (uint32_t)len;
     if (at_end) memcpy(s->logits, r->logits, (size_t)st->end_width * sizeof(float));
     s->checkpoint_valid = false;   /* the state moves below */
     if (!pulsar_ckpt_adopt(st, dst, src, T, r) || (at_end && !s->live_from_host(s->logits))) {
@@ -1785,9 +1800,10 @@ const pulsar_tokens *pulsar_session_tokens(pulsar_session *s) { return s ? s->to
 uint64_t pulsar_session_payload_bytes(pulsar_session *s) { PULSAR_FAMILY_REQUIRES_S(s, PULSAR_FAMILY_CAP_PAYLOAD, "session payloads", 0); return s ? s->payload_bytes() : 0; }
 int pulsar_session_save_payload(pulsar_session *s, FILE *fp, char *err, size_t errlen) { PULSAR_FAMILY_REQUIRES_S(s, PULSAR_FAMILY_CAP_PAYLOAD, "session payloads", 1); return s ? s->save_payload(fp, err, errlen) : 1; }
 int pulsar_session_load_payload(pulsar_session *s, FILE *fp, uint64_t payload_bytes, char *err, size_t errlen) { PULSAR_FAMILY_REQUIRES_S(s, PULSAR_FAMILY_CAP_PAYLOAD, "session payloads", 1); return s ? s->load_payload(fp, payload_bytes, err, errlen) : 1; }
-uint64_t pulsar_session_segment_bytes(pulsar_session *s, int G_prev, int G) {
+uint64_t pulsar_session_segment_bytes(pulsar_session *s, int G_prev, int G, uint64_t *state_bytes) {
+    if (state_bytes) *state_bytes = 0;
     PULSAR_FAMILY_REQUIRES_S(s, PULSAR_FAMILY_CAP_SEGMENTS, "disk KV segments", 0);
-    return s && G_prev >= 0 && G > G_prev ? s->segment_bytes((uint32_t)G_prev, (uint32_t)G) : 0;
+    return s && G_prev >= 0 && G > G_prev ? s->segment_bytes((uint32_t)G_prev, (uint32_t)G, state_bytes) : 0;
 }
 /* L264 S4e: on a TP group every rank keeps its own copy of each segment (KV is
  * replicated per rank), named by the leader's store key.  Both operations are

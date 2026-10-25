@@ -21,7 +21,7 @@
  * (KV unrecoverable): the bank is NOT installed and cur_bank is unchanged, so the
  * caller MUST fail the request rather than sample/commit on the wrong bank's KV
  * (review finding 1). True on success (or classic mode / no-op). */
-/* Evict ONE idle victim (LRU-superseded preferred, else plain LRU) so a fresh
+/* Evict ONE idle victim (a dominated bank preferred, else plain LRU) so a fresh
  * conversation has a bank; live-tool owners protected. Defined near
  * worker_evict_one; forward-declared for the routing path above it. */
 
@@ -477,6 +477,21 @@ int server_route_header_anchor(const pulsar_tokens *bank, int prefilled, const p
     return -1;
 }
 
+/* L322: the bank's route anchor -- the shallower of its last-turn anchor and its generation-header anchor that exists.
+ * Each alone is the evidence server_route_in_place reads (a request matching past it is this conversation's: its next
+ * turn, its side request, an edit of its last turn), so the anchor is the first one the match may pass.  L311 combined
+ * them by the DEEPER one, so a bank that also held a header past its last user marker -- always, once a side request
+ * had run on it -- lost the last-turn rule: Claude Code's SUGGESTION MODE call (the conversation + ~340 tokens, after
+ * every finished turn) ran in place and left its header at the bank's end, the next real turn diverged five tokens
+ * past the real turn's end, inside that call's user turn, and took a fresh bank, which reloaded the whole chain from
+ * disk (2026-10-24, Qwen at 178-193k: 32-34 GB, 22-25 s a turn).  -1 when neither exists. */
+int server_route_anchor(const pulsar_tokens *bank, int prefilled, const pulsar_turn_markers *m) {
+    const int turn = server_route_turn_anchor(bank, prefilled, m);
+    const int header = server_route_header_anchor(bank, prefilled, m);
+    if (turn < 0) return header;
+    return header < 0 || turn < header ? turn : header;
+}
+
 /* L264: does the job continue on its best bank?  Yes when it carries everything
  * that bank PREFILLED (common >= prefilled: it IS that conversation's next turn,
  * whatever it did to the bank's generated tail -- an agent client drops the
@@ -624,14 +639,11 @@ session_slot *server::choose_slot_for_job(job *j, int *reject_ctx,
     }
     const int frontier = best ? s->slot_frontier_pos(best) : 0;
     const int prefilled = best && s->sess ? pulsar_session_bank_prefill_frontier(s->sess, best->bank) : 0;
-    /* L275: the bank's last-turn anchor, from the history it prefilled; L311: or its generation header's */
-    int anchor = -1;
-    if (best && s->sess) {
-        const pulsar_tokens *bt = pulsar_session_bank_tokens(s->sess, best->bank);
-        anchor = server_route_turn_anchor(bt, prefilled, &s->turn_markers);
-        const int header = server_route_header_anchor(bt, prefilled, &s->turn_markers);
-        if (header > anchor) anchor = header;
-    }
+    /* L275: the bank's last-turn anchor, from the history it prefilled; L311: or its generation header's; L322: the
+     * shallower of the two */
+    const int anchor = best && s->sess
+        ? server_route_anchor(pulsar_session_bank_tokens(s->sess, best->bank), prefilled, &s->turn_markers)
+        : -1;
     const bool in_place = best && server_route_in_place(best_common, best_score, frontier, prefilled,
                                                         s->slot_trivial_common_tokens, anchor);
     /* One line per bind decision: which bank, how deep the match, where it resumes, what it costs the bank, and
@@ -765,22 +777,25 @@ uint64_t server_ledger_release(uint64_t committed_total, uint64_t slot_cost) {
 
 
 int server_evict_pick_victim(const session_slot *slots, int n_slots,
-                             const bool *protect, bool allow_slot0) {
+                             const bool *protect, bool allow_slot0, const bool *dominated) {
     int victim = -1;
     /* Slot 0 competes in LRU only when the caller says so (pool mode, where
      * bank 0 is just another bank): an idle conversation squatting bank 0 was
      * otherwise IMMORTAL, silently shrinking the evictable pool to N-1 and
      * seeding the churned-pool LRU domino (measured 2026-08-10: a one-shot's
      * leftovers on bank 0 forced an 8-conversation load into 7 banks, and the
-     * shortage evicted a live conversation every turn forever). */
+     * shortage evicted a live conversation every turn forever).  L323: a
+     * dominated slot (server::dominated_slots) goes before any LRU choice. */
     for (int i = allow_slot0 ? 0 : 1; i < n_slots; i++) {
         const session_slot *sl = &slots[i];
         if (!sl->provisioned || sl->active_job) continue;
         if (protect && protect[i]) continue;
-        if (victim < 0 ||
-            sl->last_serviced_us < slots[victim].last_serviced_us ||
-            (sl->last_serviced_us == slots[victim].last_serviced_us &&
-             sl->est_cost_bytes < slots[victim].est_cost_bytes))
+        const bool dom = dominated && dominated[i], vdom = victim >= 0 && dominated && dominated[victim];
+        if (victim < 0 || (dom && !vdom) ||
+            (dom == vdom &&
+             (sl->last_serviced_us < slots[victim].last_serviced_us ||
+              (sl->last_serviced_us == slots[victim].last_serviced_us &&
+               sl->est_cost_bytes < slots[victim].est_cost_bytes))))
         {
             victim = i;
         }
@@ -956,10 +971,15 @@ static int evict_reset_slot_fields(session_slot *sl) {
 bool server::worker_evict_one(bool protect[PULSAR_SESSION_POOL_CAP]) {
     PULSAR_NVTX_FN();
     auto *s = this;
+    bool dominated[PULSAR_SESSION_POOL_CAP];
+    s->dominated_slots(dominated);
     const int vi = server_evict_pick_victim(s->slots, s->n_slots, protect,
-                                            /*allow_slot0=*/s->pool_banks > 0);
+                                            /*allow_slot0=*/s->pool_banks > 0, dominated);
     if (vi < 0) return false;
     session_slot *sl = &s->slots[vi];
+    if (dominated[vi])
+        server_log(PULSAR_LOG_KVCACHE, "pulsar-server: evict: bank %u is dominated (another bank holds its whole "
+                                       "history)", sl->bank);
 
     /* Tier-2: install the victim's bank so the snapshot store below reads its
      * OWN frontier (not the pool's live cursor). server_bank_switch restores a
@@ -1036,74 +1056,148 @@ bool server::worker_evict_one(bool protect[PULSAR_SESSION_POOL_CAP]) {
 
 
 
-/* plan-33 inc D victim policy: an idle bank is LRU-SUPERSEDED when its whole
- * committed history is a token-prefix of ANOTHER live bank's history (a sibling
- * that already extends past it) — its KV is redundant, so evicting it loses the
- * least. Returns such a slot's index (the least-recently-served among them), or
- * -1. Pure host reads (pulsar_session_bank_tokens / _common_prefix are the same
- * host-carry reads routing already uses on idle banks; no CUDA, no install). */
-/* The supersession scan itself (L179 branch 6), over injected per-slot facts:
- * a is a CANDIDATE iff eligible[a] (provisioned and idle -- the caller's
- * reads), not protected, and hist_len[a] > 0 (an empty bank
- * is plain LRU's business). Slot k SUPERSEDES a iff frontier[k] > hist_len[a]
- * (k is strictly longer; an unprovisioned k has frontier 0) AND common[a][k]
- * >= hist_len[a] (a's whole history is k's prefix). Among superseded
- * candidates the least-recently-served (smallest last_us, first index on a
- * tie) wins; -1 when none is superseded. common[a] may be NULL for a
- * non-candidate row and common[a][k] is only read once frontier[k] >
- * hist_len[a] holds (the caller fills it under the same test). */
-static int superseded_pick_core(int n_slots, const bool *protect, const bool *eligible,
-                                const int *hist_len, const int *frontier,
-                                const int *const *common, const uint64_t *last_us) {
-    int victim = -1;
-    for (int i = 0; i < n_slots; i++) {
-        if (!eligible[i] || (protect && protect[i]) || hist_len[i] <= 0) continue;
-        bool superseded = false;
-        for (int k = 0; k < n_slots && !superseded; k++) {
-            if (k == i) continue;
-            if (frontier[k] > hist_len[i] && common[i][k] >= hist_len[i]) superseded = true;
-        }
-        if (!superseded) continue;
-        if (victim < 0 || last_us[i] < last_us[victim]) victim = i;
+/* L323: the ONE bank-dominance predicate, over injected per-slot facts (server::dominated_slots reads them).  Slot a
+ * is DOMINATED when it holds a history (hist_len[a] > 0; an empty bank is plain LRU's business) and another slot k
+ * -- resident or spilled, any provisioned bank (an unprovisioned one has hist_len 0) -- holds a's whole history as
+ * its prefix (common[a][k] >= hist_len[a]) and reaches at least as far: hist_len[k] > hist_len[a], or an identical
+ * copy at a lower index (so of two identical copies exactly one is dominated).  Its KV is redundant -- every request
+ * it serves, k serves at least as deep, and a spilled k's history is on disk -- so the guard spills it, and the
+ * make-room eviction evicts it, before any LRU choice.  common[a][k] is read only where the length test holds (the
+ * caller fills it there).  Before L323 this was plan-33 inc D's "LRU-superseded" pick, consulted by fresh_make_room
+ * alone and over resident banks only; the guard spilled by LRU and kept dominated copies resident (2026-10-24: 9 of
+ * 16 banks at 150-205k, mostly copies of one conversation). */
+static bool bank_dominated_core(int a, int n_slots, const int *hist_len, const int *const *common) {
+    if (hist_len[a] <= 0) return false;
+    for (int k = 0; k < n_slots; k++) {
+        if (k == a || hist_len[k] < hist_len[a] || (hist_len[k] == hist_len[a] && k > a)) continue;
+        if (common[a][k] >= hist_len[a]) return true;
     }
-    return victim;
+    return false;
 }
 
-int server::pick_superseded_idle(const bool *protect) {
-    auto *s = this;
+/* L323/L324: the common-prefix matrix of the slots' histories, the ONE fill both the dominance predicate and the
+ * duplicate census read: hist_len[i] (0 = no history; unprovisioned slots have none) and, where hist_len[i] > 0 and
+ * hist_len[k] >= hist_len[i] (k != i), common_rows[i][k] = their common token prefix; -1 elsewhere.  Host-carry
+ * prefix reads (the same reads routing does on idle banks; no CUDA), only where a reader looks: two conversations
+ * part within a few thousand tokens, so a compare runs long only between copies of one. */
+static void bank_common_matrix(server *s, int hist_len[PULSAR_SESSION_POOL_CAP],
+                               int common_rows[PULSAR_SESSION_POOL_CAP][PULSAR_SESSION_POOL_CAP]) {
     pulsar_session *pool = s->sess;
-    if (!pool) return -1;
-    bool eligible[PULSAR_SESSION_POOL_CAP];
-    int hist_len[PULSAR_SESSION_POOL_CAP];
-    int frontier[PULSAR_SESSION_POOL_CAP];
-    uint64_t last_us[PULSAR_SESSION_POOL_CAP];
     const pulsar_tokens *hist[PULSAR_SESSION_POOL_CAP];
-    int common_rows[PULSAR_SESSION_POOL_CAP][PULSAR_SESSION_POOL_CAP];
-    const int *common[PULSAR_SESSION_POOL_CAP];
     for (int i = 0; i < s->n_slots; i++) {
         const session_slot *a = &s->slots[i];
-        eligible[i] = a->provisioned && !a->active_job;
-        hist[i] = eligible[i] ? pulsar_session_bank_tokens(pool, a->bank) : NULL;
+        hist[i] = a->provisioned ? pulsar_session_bank_tokens(pool, a->bank) : NULL;
         hist_len[i] = hist[i] ? hist[i]->len : 0;
-        frontier[i] = s->slot_frontier_pos(a);      /* 0 when unprovisioned */
-        last_us[i] = a->last_serviced_us;
-        common[i] = common_rows[i];
     }
-    /* Host-carry prefix reads (the same reads routing does on idle banks; no
-     * CUDA), only where the core will look: candidate rows, strictly-longer
-     * columns. */
-    for (int i = 0; i < s->n_slots; i++) {
-        if (!eligible[i] || (protect && protect[i]) || hist_len[i] <= 0) continue;
+    for (int i = 0; i < s->n_slots; i++)
         for (int k = 0; k < s->n_slots; k++)
-            common_rows[i][k] = (k != i && frontier[k] > hist_len[i])
+            common_rows[i][k] = (hist_len[i] > 0 && k != i && hist_len[k] >= hist_len[i])
                 ? pulsar_session_bank_common_prefix(pool, s->slots[k].bank, hist[i]) : -1;
+}
+
+void server::dominated_slots(bool dominated[PULSAR_SESSION_POOL_CAP]) {
+    auto *s = this;
+    for (int i = 0; i < PULSAR_SESSION_POOL_CAP; i++) dominated[i] = false;
+    if (!s->sess || s->pool_banks <= 0) return;
+    int hist_len[PULSAR_SESSION_POOL_CAP];
+    int common_rows[PULSAR_SESSION_POOL_CAP][PULSAR_SESSION_POOL_CAP];
+    const int *common[PULSAR_SESSION_POOL_CAP];
+    bank_common_matrix(s, hist_len, common_rows);
+    for (int i = 0; i < s->n_slots; i++) common[i] = common_rows[i];
+    for (int i = 0; i < s->n_slots; i++) dominated[i] = bank_dominated_core(i, s->n_slots, hist_len, common);
+}
+
+/* L324: the common prefix of slots a and b from the matrix (read in the direction bank_common_matrix fills). */
+static int dup_pair_common(int a, int b, const int *hist_len, const int *const *common) {
+    return hist_len[a] <= hist_len[b] ? common[a][b] : common[b][a];
+}
+
+void kv_dup_census_core(int n, const int *hist_len, const bool *resident, const int *const *common, int grid,
+                        uint64_t page_bytes, kv_dup_census *out, uint32_t *deep) {
+    memset(out, 0, sizeof *out);
+    out->grid = grid;
+    out->page_bytes = page_bytes;
+    if (deep)
+        for (int a = 0; a < n; a++) deep[a] = 0;
+    if (grid <= 0) return;
+    int pages[PULSAR_SESSION_POOL_CAP];
+    int max_pages = 0;
+    for (int a = 0; a < n; a++) {
+        pages[a] = resident[a] && hist_len[a] > 0 ? hist_len[a] / grid : 0;
+        if (pages[a] > 0) out->banks++;
+        out->pages_resident += (uint64_t)pages[a];
+        max_pages = std::max(max_pages, pages[a]);
     }
-    return superseded_pick_core(s->n_slots, protect, eligible, hist_len, frontier, common, last_us);
+    /* Page p: the banks that hold it whole fall into classes by "same ids to (p+1)*grid" (an equivalence: prefix
+     * agreement is transitive).  A class's first member stands for it; the others are its extra copies. */
+    for (int p = 0; p < max_pages; p++) {
+        const int end = (p + 1) * grid;
+        for (int a = 0; a < n; a++) {
+            if (pages[a] <= p) continue;
+            bool first = true;
+            for (int b = 0; b < a && first; b++)
+                if (pages[b] > p && dup_pair_common(a, b, hist_len, common) >= end) first = false;
+            if (!first) continue;
+            out->pages_distinct++;
+            for (int b = a + 1; b < n; b++)
+                if (pages[b] > p && dup_pair_common(a, b, hist_len, common) >= end) { out->pages_shared++; break; }
+        }
+    }
+    out->pages_duplicate = out->pages_resident - out->pages_distinct;
+    out->dup_bytes = out->pages_duplicate * page_bytes;
+    for (int a = 0; a < n; a++)
+        for (int b = a + 1; b < n; b++) {
+            if (pages[a] <= 0 || pages[b] <= 0) continue;
+            const int c = dup_pair_common(a, b, hist_len, common);
+            if (c < grid) continue;
+            const int cls = c >= PULSAR_KV_DUP_DEEP_TOKENS ? 1 : 0;
+            out->pairs[cls]++;
+            out->longest[cls] = std::max(out->longest[cls], c);
+            if (cls && deep) deep[a] |= 1u << b;
+        }
+}
+
+void server::kv_dup_census_update() {
+    auto *s = this;
+    if (!s->sess || s->pool_banks <= 0) return;
+    int hist_len[PULSAR_SESSION_POOL_CAP];
+    int common_rows[PULSAR_SESSION_POOL_CAP][PULSAR_SESSION_POOL_CAP];
+    const int *common[PULSAR_SESSION_POOL_CAP];
+    bool resident[PULSAR_SESSION_POOL_CAP];
+    bank_common_matrix(s, hist_len, common_rows);
+    for (int i = 0; i < s->n_slots; i++) {
+        common[i] = common_rows[i];
+        resident[i] = s->slots[i].provisioned && !pulsar_session_bank_is_evicted(s->sess, s->slots[i].bank);
+    }
+    const int grid = pulsar_kvchain_grid(s->sess);
+    const uint64_t page_bytes = grid > 0 ? pulsar_session_quantum_growth_bytes_per_bank(s->sess, (uint32_t)grid) : 0;
+    kv_dup_census c;
+    uint32_t deep[PULSAR_SESSION_POOL_CAP];
+    kv_dup_census_core(s->n_slots, hist_len, resident, common, grid, page_bytes, &c, deep);
+    /* a pair that shares more than the preamble: once per pair until it stops (a bank that moves on clears it) */
+    for (int a = 0; a < s->n_slots; a++) {
+        const uint32_t fresh = deep[a] & ~s->w_dup_deep[a];
+        for (int b = a + 1; b < s->n_slots; b++) {
+            if (!(fresh >> b & 1u)) continue;
+            const int shared = dup_pair_common(a, b, hist_len, common);
+            server_log(PULSAR_LOG_KVCACHE,
+                       "pulsar-server: kv dup: banks %u and %u share %d tokens (%d whole pages of %d, %.2f GiB held "
+                       "twice) -- deeper than the preamble (%d)", s->slots[a].bank, s->slots[b].bank, shared,
+                       shared / grid, grid, (double)((uint64_t)(shared / grid) * page_bytes) / (1024.0 * 1024.0 * 1024.0),
+                       PULSAR_KV_DUP_DEEP_TOKENS);
+        }
+        s->w_dup_deep[a] = deep[a];
+    }
+    pthread_mutex_lock(&s->mu);
+    s->m_dup = c;
+    s->m_dup_censuses++;
+    s->m_dup_bytes_peak = std::max(s->m_dup_bytes_peak, c.dup_bytes);
+    pthread_mutex_unlock(&s->mu);
 }
 
 /* Evict exactly one NON-trunk victim so a warm fork gets a free bank. Trunk is
- * always protected (a sibling still matches it); LRU-superseded victims go
- * first, else plain LRU (worker_evict_one's picker). Reuses the proven eviction
+ * always protected (a sibling still matches it); dominated victims go first,
+ * else plain LRU (worker_evict_one's picker). Reuses the proven eviction
  * body (snapshot + ledger release + bank reset). Worker thread only; returns
  * true when a bank was freed. */
 bool server::fresh_make_room() {
@@ -1111,20 +1205,9 @@ bool server::fresh_make_room() {
     if (s->pool_banks <= 0) return false;
     bool protect[PULSAR_SESSION_POOL_CAP];
     s->worker_protect_queued_owner_slots(protect);      /* live-tool owners */
-    const int sup = s->pick_superseded_idle(protect);
-    if (sup >= 0) {
-        /* Force worker_evict_one onto the superseded pick by protecting all others. */
-        bool only[PULSAR_SESSION_POOL_CAP];
-        for (int i = 0; i < PULSAR_SESSION_POOL_CAP; i++) only[i] = (i != sup);
-        server_log(PULSAR_LOG_KVCACHE,
-                   "pulsar-server: fresh-slot make-room: evicting LRU-superseded bank %u",
-                   s->slots[sup].bank);
-        return s->worker_evict_one(only);
-    }
-    /* No superseded victim: plain LRU among unprotected idle. Two-phase: first
-     * avoid banks that are a queued job's usable warm match (the fresh-path
-     * domino), then — if that leaves no victim — retry without the overlay,
-     * because binding must progress. */
+    /* Two-phase: first avoid banks that are a queued job's usable warm match
+     * (the fresh-path domino), then — if that leaves no victim — retry without
+     * the overlay, because binding must progress. */
     bool with_warm[PULSAR_SESSION_POOL_CAP];
     memcpy(with_warm, protect, sizeof with_warm);
     s->worker_protect_queued_warm_matches(with_warm);
@@ -1876,7 +1959,7 @@ bool server::spill_bank(session_slot *victim) {
  * sampling alike; beside other decoders the batched lanes are nondeterministic by design, L118).  Readmission is
  * first-preempted first, as soon as the bank's resident KV fits the budget again.  An image request keeps its bank
  * (as Flare's: its image features are not reconstructed). */
-static int guard_victim_order(server *s, session_slot **dec, int n, int *order);
+static int guard_victim_order(server *s, session_slot **dec, int n, int *order, bool *dominated_out = nullptr);
 static prompt_kv_verdict server_prompt_kv_verdict(uint64_t touched, uint64_t delta, uint64_t bound,
                                                   const uint64_t *drop, int n_victims, bool busy_may_free,
                                                   int *n_spill);
@@ -2032,11 +2115,13 @@ bool server::worker_readmit_preempted() {
 }
 
 /* LRU-idle smallest-frontier victim: NOT bank 0 (pinned), NOT in the live decode
- * set, no active job, not already spilled. -1 if none. */
-int server::guard_pick_victim(session_slot **dec, int n) {
+ * set, no active job, not already spilled. -1 if none.  L323: a dominated bank
+ * (server::dominated_slots; `dominated` may be NULL) goes before any LRU choice. */
+int server::guard_pick_victim(session_slot **dec, int n, const bool *dominated) {
     auto *s = this;
     pulsar_session *pool = s->sess;
     int best = -1;
+    bool best_dom = false;
     uint64_t best_us = UINT64_MAX, best_touched = UINT64_MAX;
     for (int i = 1; i < s->n_slots; i++) {         /* bank 0 pinned */
         session_slot *sl = &s->slots[i];
@@ -2045,9 +2130,11 @@ int server::guard_pick_victim(session_slot **dec, int n) {
         for (int k = 0; k < n; k++) if (dec[k] == sl) { live = true; break; }
         if (live) continue;
         const uint64_t t = pulsar_session_bank_touched_kv_bytes(pool, sl->bank);
-        if (sl->last_serviced_us < best_us ||
-            (sl->last_serviced_us == best_us && t < best_touched)) {
-            best = i; best_us = sl->last_serviced_us; best_touched = t;
+        const bool dom = dominated && dominated[i];
+        if (best < 0 || (dom && !best_dom) ||
+            (dom == best_dom && (sl->last_serviced_us < best_us ||
+                                 (sl->last_serviced_us == best_us && t < best_touched)))) {
+            best = i; best_dom = dom; best_us = sl->last_serviced_us; best_touched = t;
         }
     }
     return best;
@@ -2076,17 +2163,22 @@ static int guard_spill_plan(uint64_t touched, uint64_t delta, uint64_t bound,
  * for the filter and the LRU key; the slots already ordered are appended to
  * its live-exclusion set so each call yields the next. At most n_slots
  * entries. */
-static int guard_victim_order(server *s, session_slot **dec, int n, int *order) {
+static int guard_victim_order(server *s, session_slot **dec, int n, int *order, bool *dominated_out) {
     session_slot *excl[2 * PULSAR_SESSION_POOL_CAP];
     for (int i = 0; i < n; i++) excl[i] = dec[i];
+    /* L323: the dominance facts once for the whole order -- a spill leaves every bank's history (the host carry)
+     * as it was, so they hold across it */
+    bool dominated[PULSAR_SESSION_POOL_CAP];
+    s->dominated_slots(dominated);
     int m = 0;
     while (n + m < 2 * PULSAR_SESSION_POOL_CAP) {
-        const int vi = s->guard_pick_victim(excl, n + m);
+        const int vi = s->guard_pick_victim(excl, n + m, dominated);
         if (vi < 0) break;
         order[m] = vi;
         excl[n + m] = &s->slots[vi];
         m++;
     }
+    if (dominated_out) memcpy(dominated_out, dominated, sizeof dominated);
     return m;
 }
 
@@ -2217,13 +2309,17 @@ void server::guard_maybe_evict(session_slot **dec, int n) {
      * per-quantum count log lets the smoke assert no cascade. */
     int order[PULSAR_SESSION_POOL_CAP];
     uint64_t drop[PULSAR_SESSION_POOL_CAP];
-    const int n_victims = guard_victim_order(s, dec, n, order);
+    bool dominated[PULSAR_SESSION_POOL_CAP];
+    const int n_victims = guard_victim_order(s, dec, n, order, dominated);
     for (int k = 0; k < n_victims; k++)
         drop[k] = pulsar_session_bank_touched_kv_bytes(pool, s->slots[order[k]].bank);
     const int plan = guard_spill_plan(pulsar_session_touched_kv_bytes(pool), delta, bound,
                                       drop, n_victims);
     int spilled_this_quantum = 0;
     for (int k = 0; k < plan; k++) {
+        if (dominated[order[k]])
+            server_log(PULSAR_LOG_KVCACHE, "pulsar-server: guard: bank %u is dominated (another bank holds its whole "
+                                           "history) -- spilled first", s->slots[order[k]].bank);
         if (!s->spill_bank(&s->slots[order[k]])) break;   /* spill failed — stop */
         spilled_this_quantum++;
         s->count_metric(&s->m_spills);

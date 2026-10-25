@@ -6487,7 +6487,7 @@ static bool test_seg_put(pulsar_segstore *st, const char *parent, uint32_t a, ui
                          uint64_t n, uint8_t fill, char key[41]) {
     test_seg_payload p = { n, fill };
     char err[256];
-    return pulsar_segstore_put(st, parent, a, b, text, strlen(text), n, test_seg_write, 0, NULL, &p, key,
+    return pulsar_segstore_put(st, parent, a, b, text, strlen(text), n, 0, test_seg_write, 0, NULL, &p, key,
                                err, sizeof err);
 }
 
@@ -6515,19 +6515,19 @@ static void test_l264_segstore_chain_lookup(void) {
 
     pulsar_segstore_seg chain[8];
     const char *req = "SYSTEM:user A asks and follows up -- and the new turn";
-    int n = pulsar_segstore_lookup(st, req, strlen(req), chain, 8);
+    int n = pulsar_segstore_lookup(st, req, strlen(req), NULL, chain, 8);
     TEST_ASSERT(n == 3);
     TEST_ASSERT(n == 3 && !strcmp(chain[0].key, root) && !strcmp(chain[2].key, a2) && chain[2].G == 384);
     TEST_ASSERT(n == 3 && chain[2].text_end == strlen("SYSTEM:user A asks and follows up"));
     /* a request that diverges inside a segment stops at the one before it */
     const char *edited = "SYSTEM:user A asks and FOLLOWS up";
-    n = pulsar_segstore_lookup(st, edited, strlen(edited), chain, 8);
+    n = pulsar_segstore_lookup(st, edited, strlen(edited), NULL, chain, 8);
     TEST_ASSERT(n == 2 && !strcmp(chain[1].key, a1));
     /* the other conversation shares only the root */
     const char *other = "SYSTEM:user B asks something else";
-    n = pulsar_segstore_lookup(st, other, strlen(other), chain, 8);
+    n = pulsar_segstore_lookup(st, other, strlen(other), NULL, chain, 8);
     TEST_ASSERT(n == 2 && !strcmp(chain[1].key, b1));
-    TEST_ASSERT(pulsar_segstore_lookup(st, "SYS", 3, chain, 8) == 0);
+    TEST_ASSERT(pulsar_segstore_lookup(st, "SYS", 3, NULL, chain, 8) == 0);
 
     /* the payload round-trips */
     uint64_t pb = 0;
@@ -6538,7 +6538,7 @@ static void test_l264_segstore_chain_lookup(void) {
     /* reopen: the index and the chain lengths come back from the files */
     pulsar_segstore_close(st);
     st = pulsar_segstore_open(dir, 0, 7, NULL, NULL);
-    n = pulsar_segstore_lookup(st, req, strlen(req), chain, 8);
+    n = pulsar_segstore_lookup(st, req, strlen(req), NULL, chain, 8);
     TEST_ASSERT(n == 3 && chain[2].text_end == strlen("SYSTEM:user A asks and follows up"));
     /* another model's store sees none of it */
     pulsar_segstore *other_model = pulsar_segstore_open(dir, 0, 8, NULL, NULL);
@@ -6553,39 +6553,348 @@ static void test_l264_segstore_chain_lookup(void) {
     char bad[41];
     char err[256];
     test_seg_payload p = { 10, 0 };
-    TEST_ASSERT(!pulsar_segstore_put(st, a1, 256, 384, "x", 1, 10, test_seg_write, 0, NULL, &p, bad, err, sizeof err));
-    TEST_ASSERT(!pulsar_segstore_put(st, "", 128, 256, "x", 1, 10, test_seg_write, 0, NULL, &p, bad, err, sizeof err));
+    TEST_ASSERT(!pulsar_segstore_put(st, a1, 256, 384, "x", 1, 10, 0, test_seg_write, 0, NULL, &p, bad, err, sizeof err));
+    TEST_ASSERT(!pulsar_segstore_put(st, "", 128, 256, "x", 1, 10, 0, test_seg_write, 0, NULL, &p, bad, err, sizeof err));
     pulsar_segstore_close(st);
     char cmd[512];
     snprintf(cmd, sizeof cmd, "rm -rf '%s'", dir);
     TEST_ASSERT(system(cmd) == 0);
 }
 
-/* L264: where a persist ends segments.  A prompt riding decode steps lands a grid checkpoint every 128-token
- * slice; the store writes one segment per prefill chunk (4096) of it, and the chain's end only when the persist
- * closes (prompt end, evict, spill) -- never one segment per slice (2026-10-16: 133 segments, 35 GB in 10 min). */
-static void test_l264_kvchain_segment_ends(void) {
+/* L280: the store identity carries the rope.  rope_id 0 (the rope the model id implies) is the identity as it was,
+ * so existing stores stay readable; any scaled rope sets a nonzero top byte, so a YaRN server never indexes a native
+ * store's segments (or the reverse) -- the payload layout digest refusing them at load is the second line, not the
+ * only one. */
+static void test_l280_kv_identity_rope(void) {
+    TEST_ASSERT(pulsar_segstore_identity(2, 36, 0) == (2u << 8 | 36u));
+    const uint64_t ropes[] = {1ull, 0x9e3779b97f4a7c15ull, 0x0101ull /* folds to 0 */, ~0ull};
+    for (uint64_t r : ropes) {
+        const uint32_t id = pulsar_segstore_identity(2, 36, r);
+        TEST_ASSERT((id & 0xffffffu) == (2u << 8 | 36u));
+        TEST_ASSERT((id >> 24) != 0u);
+    }
+    TEST_ASSERT(pulsar_segstore_identity(2, 36, 0x0101ull) >> 24 == 1u);
+    char tmpl[] = "/tmp/pulsar-seg-rope.XXXXXX";
+    char *dir = mkdtemp(tmpl);
+    TEST_ASSERT(dir != NULL);
+    if (!dir) return;
+    const uint32_t native = pulsar_segstore_identity(2, 36, 0), yarn = pulsar_segstore_identity(2, 36, 0x1234abcdull);
+    pulsar_segstore *st = pulsar_segstore_open(dir, 0, native, NULL, NULL);
+    char root[41];
+    TEST_ASSERT(st && test_seg_put(st, "", 0, 128, "SYSTEM:", 100, 0x11, root));
+    pulsar_segstore_close(st);
+    pulsar_segstore *other = pulsar_segstore_open(dir, 0, yarn, NULL, NULL);
+    TEST_ASSERT(other && pulsar_segstore_count(other) == 0);
+    pulsar_segstore_close(other);
+    st = pulsar_segstore_open(dir, 0, native, NULL, NULL);   /* and the native store kept it */
+    TEST_ASSERT(st && pulsar_segstore_count(st) == 1);
+    pulsar_segstore_drop(st, root);
+    pulsar_segstore_close(st);
+    rmdir(dir);
+}
+
+/* L323: where a persist ends segments -- the canonical grid.  Every multiple of the grid past the stored chain up to
+ * the deepest checkpoint, then (closing) the tail to that checkpoint; never a cut where the writer's own checkpoints
+ * fell (2026-10-24: copies cut at turn ends -- [7808,7936) [7936,8064) ... -- deduped nothing). */
+static void test_l323_kvchain_segment_ends(void) {
     int ends[16];
-    /* riding slices: the four retained checkpoints just after 4096 landed, chain stored to 0 */
-    const int riding[] = { 3712, 3840, 3968, 4096 };
-    TEST_ASSERT(pulsar_kvchain_segment_ends(riding, 4, 0, 4096, false, ends) == 1 && ends[0] == 4096);
-    /* the next slice: nothing until a whole chunk past the stored end */
-    const int next[] = { 3968, 4096, 4224 };
-    TEST_ASSERT(pulsar_kvchain_segment_ends(next, 3, 4096, 4096, false, ends) == 0);
-    /* the prompt's end closes the chain at its deepest checkpoint */
-    const int fin[] = { 8192, 8832, 8960, 9088 };
-    TEST_ASSERT(pulsar_kvchain_segment_ends(fin, 4, 8192, 4096, true, ends) == 1 && ends[0] == 9088);
-    TEST_ASSERT(pulsar_kvchain_segment_ends(fin, 4, 8192, 4096, false, ends) == 0);
-    /* a chunked prefill (checkpoints a chunk apart, the last at the final cut) stores every one, as before */
-    const int chunked[] = { 4096, 8192, 11648 };
-    TEST_ASSERT(pulsar_kvchain_segment_ends(chunked, 3, 0, 4096, false, ends) == 2 && ends[0] == 4096 &&
+    /* a prefill from 0 past two grid points: both, and the tail when it closes */
+    TEST_ASSERT(pulsar_kvchain_segment_ends(0, 9088, 4096, false, ends, 16) == 2 && ends[0] == 4096 &&
                 ends[1] == 8192);
-    TEST_ASSERT(pulsar_kvchain_segment_ends(chunked, 3, 0, 4096, true, ends) == 3 && ends[2] == 11648);
-    /* a resumed history: spans count from the stored end, not from 0 */
-    const int resumed[] = { 5120, 9216, 9344 };
-    TEST_ASSERT(pulsar_kvchain_segment_ends(resumed, 3, 5120, 4096, false, ends) == 1 && ends[0] == 9216);
-    /* a stored chain at or past the deepest checkpoint: nothing new, closing or not */
-    TEST_ASSERT(pulsar_kvchain_segment_ends(fin, 4, 9088, 4096, true, ends) == 0);
+    TEST_ASSERT(pulsar_kvchain_segment_ends(0, 9088, 4096, true, ends, 16) == 3 && ends[2] == 9088);
+    /* a deepest checkpoint ON the grid is a grid segment, not a tail too */
+    TEST_ASSERT(pulsar_kvchain_segment_ends(4096, 8192, 4096, true, ends, 16) == 1 && ends[0] == 8192);
+    /* a turn inside the cell above the stored grid point: only the tail, and nothing while it rides (progress) */
+    TEST_ASSERT(pulsar_kvchain_segment_ends(8192, 9600, 4096, true, ends, 16) == 1 && ends[0] == 9600);
+    TEST_ASSERT(pulsar_kvchain_segment_ends(8192, 9600, 4096, false, ends, 16) == 0);
+    /* nothing past the stored chain, closing or not; no grid, nothing */
+    TEST_ASSERT(pulsar_kvchain_segment_ends(8192, 8192, 4096, true, ends, 16) == 0);
+    TEST_ASSERT(pulsar_kvchain_segment_ends(0, 9088, 0, true, ends, 16) == 0);
+    /* the cap bounds the write */
+    TEST_ASSERT(pulsar_kvchain_segment_ends(0, 40960, 4096, true, ends, 3) == 3 && ends[2] == 12288);
+}
+
+/* L323 fixtures: a conversation of tokens ("t00000 ", "t00001 ", ...), persisted the way
+ * pulsar_kvchain_persist does it (parent = the deepest stored grid-ended chain of the history, then
+ * pulsar_kvchain_segment_ends), with payloads whose head is a real v6 segment header (pulsar_kvchain_find reads the
+ * image records there) and whose last `state` bytes stand for the state at G -- held only where `held(G)` says the
+ * writer's bank holds its checkpoint (a tail always does: it ends at one). */
+static const uint64_t L323_STATE = 1000, L323_ROW = 10;   /* a fixture state part and row bytes per token */
+struct l323_payload { uint32_t G_prev, G; uint64_t bytes; };
+static uint64_t l323_rows_bytes(uint32_t G_prev, uint32_t G) {
+    return 9u * 4u + 4ull * (G - G_prev) + 4u + (uint64_t)L323_ROW * (G - G_prev) + 8u;
+}
+static int l323_payload_write(FILE *fp, void *ud, char *err, size_t errlen) {
+    (void)err; (void)errlen;
+    const l323_payload *p = (const l323_payload *)ud;
+    const uint32_t h[9] = { PULSAR_SESSION_SEGMENT_MAGIC, PULSAR_SESSION_SEGMENT_VERSION, 0, 0, 0, 0, p->G_prev, p->G, 0 };
+    uint64_t done = 0;
+    if (fwrite(h, 4, 9, fp) != 9) return 1;
+    done += 36;
+    for (uint32_t t = p->G_prev; t < p->G; t++, done += 4)   /* the span's tokens */
+        if (fwrite(&t, 4, 1, fp) != 1) return 1;
+    const uint32_t no_images = 0;
+    if (fwrite(&no_images, 4, 1, fp) != 1) return 1;
+    done += 4;
+    for (; done < p->bytes; done++) if (fputc(0x5a, fp) == EOF) return 1;
+    return 0;
+}
+static void l323_text(int from, int to, std::string *out) {
+    out->clear();
+    char tok[16];
+    for (int i = from; i < to; i++) { snprintf(tok, sizeof tok, "t%05d ", i); out->append(tok); }
+}
+/* Persist the history [0, deepest); returns the segments the store did not hold, the chain's last key in tip. */
+static int l323_persist(pulsar_segstore *st, int deepest, int grid, bool close, bool (*held)(int G), char tip[41]) {
+    std::string full;
+    l323_text(0, deepest, &full);
+    const pulsar_segstore_end grid_end = { (uint32_t)grid, false };
+    pulsar_segstore_seg chain[64];
+    const int c = pulsar_segstore_lookup(st, full.data(), full.size(), &grid_end, chain, 64);
+    char parent[41] = "";
+    int prev = 0;
+    if (c > 0) { memcpy(parent, chain[c - 1].key, 41); prev = (int)chain[c - 1].G; }
+    /* the stored segments of it this writer holds the state of but the store does not: re-put (the upgrade) */
+    int ends[128], from[128], m = 0;
+    for (int i = 0; i < c; i++)
+        if (!chain[i].state_bytes && held((int)chain[i].G)) { from[m] = i; ends[m++] = -1; }
+    const int n_up = m;
+    m += pulsar_kvchain_segment_ends(prev, deepest, grid, close, ends + m, 64);
+    int written = 0;
+    for (int k = 0; k < m; k++) {
+        if (k < n_up) {   /* an upgrade: its own parent and span */
+            const pulsar_segstore_seg *u = &chain[from[k]];
+            static const char root[41] = "";
+            memcpy(parent, from[k] ? chain[from[k] - 1].key : root, 41);
+            prev = (int)u->G_prev;
+            ends[k] = (int)u->G;
+        } else if (k == n_up && c > 0) {
+            memcpy(parent, chain[c - 1].key, 41);
+            prev = (int)chain[c - 1].G;
+        }
+        const int G = ends[k];
+        const bool state = G == deepest || held(G);
+        l323_payload p = { (uint32_t)prev, (uint32_t)G, l323_rows_bytes((uint32_t)prev, (uint32_t)G) +
+                                                          (state ? L323_STATE : 0u) };
+        std::string text;
+        l323_text(prev, G, &text);
+        char key[41], err[256];
+        pulsar_segstore_child_key(parent, text.data(), text.size(), key);
+        pulsar_segstore_seg had;
+        const bool new_seg = !pulsar_segstore_get(st, key, &had) || (!had.state_bytes && state);
+        TEST_ASSERT(pulsar_segstore_put(st, parent, (uint32_t)prev, (uint32_t)G, text.data(), text.size(), p.bytes,
+                                        state ? L323_STATE : 0u, l323_payload_write, 0, NULL, &p, key, err,
+                                        sizeof err));
+        written += new_seg ? 1 : 0;
+        memcpy(parent, key, 41);
+        prev = G;
+    }
+    memcpy(tip, parent, 41);
+    return written;
+}
+static bool l323_held_all(int) { return true; }
+static bool l323_held_none(int) { return false; }
+static bool l323_held_8192(int G) { return G == 8192; }
+static int l323_seg_files(const char *dir) {
+    int n = 0;
+    DIR *d = opendir(dir);
+    for (struct dirent *de; d && (de = readdir(d));) n += strstr(de->d_name, ".seg") && !strstr(de->d_name, ".tmp");
+    if (d) closedir(d);
+    return n;
+}
+static char *l323_tmpdir(char *tmpl) { return mkdtemp(tmpl); }
+static void l323_rmdir(const char *dir) {
+    char cmd[600];
+    snprintf(cmd, sizeof cmd, "rm -rf '%s'", dir);
+    TEST_ASSERT(system(cmd) == 0);
+}
+
+/* L323 (1): two copies of one conversation, cut at different turn ends, produce IDENTICAL grid segment keys; in
+ * one store the second copy writes only its tail; and the same key put twice is one file. */
+static void test_l323_grid_cut_dedupes_copies(void) {
+    char ta[] = "/tmp/pulsar-l323-a.XXXXXX", tb[] = "/tmp/pulsar-l323-b.XXXXXX";
+    char *da = l323_tmpdir(ta), *db = l323_tmpdir(tb);
+    TEST_ASSERT(da && db);
+    if (!da || !db) return;
+    pulsar_segstore *A = pulsar_segstore_open(da, 0, 7, NULL, NULL), *B = pulsar_segstore_open(db, 0, 7, NULL, NULL);
+    char tip[41];
+    /* copy A: turns end at 7808, 7936, 8064 and 10368 (the 2026-10-24 shape); copy B: one turn to 9000, then 13000 */
+    TEST_ASSERT(l323_persist(A, 7808, 4096, true, l323_held_all, tip) == 2);    /* [0,4096) + tail */
+    TEST_ASSERT(l323_persist(A, 7936, 4096, true, l323_held_all, tip) == 1);    /* a new tail only */
+    TEST_ASSERT(l323_persist(A, 8064, 4096, true, l323_held_all, tip) == 1);
+    TEST_ASSERT(l323_persist(A, 10368, 4096, true, l323_held_all, tip) == 2);   /* [4096,8192) + tail */
+    TEST_ASSERT(l323_persist(B, 9000, 4096, true, l323_held_all, tip) == 3);
+    TEST_ASSERT(l323_persist(B, 13000, 4096, true, l323_held_all, tip) == 2);   /* [8192,12288) + tail */
+    TEST_ASSERT(l323_persist(A, 13000, 4096, true, l323_held_all, tip) == 2);
+    /* the grid segments of both copies carry the same keys */
+    std::string text;
+    l323_text(0, 13000, &text);
+    const pulsar_segstore_end grid_end = { 4096u, false };
+    pulsar_segstore_seg ca[8], cb[8];
+    const int na = pulsar_segstore_lookup(A, text.data(), text.size(), &grid_end, ca, 8);
+    const int nb = pulsar_segstore_lookup(B, text.data(), text.size(), &grid_end, cb, 8);
+    TEST_ASSERT(na == 3 && nb == 3);
+    for (int i = 0; i < na && i < nb; i++) TEST_ASSERT(!strcmp(ca[i].key, cb[i].key) && ca[i].G == cb[i].G);
+    TEST_ASSERT(na == 3 && ca[0].G == 4096 && ca[1].G == 8192 && ca[2].G == 12288);
+    /* and their tails too: the tail is a pure function of the history */
+    pulsar_segstore_seg fa[8], fb[8];
+    TEST_ASSERT(pulsar_segstore_lookup(A, text.data(), text.size(), NULL, fa, 8) == 4 &&
+                pulsar_segstore_lookup(B, text.data(), text.size(), NULL, fb, 8) == 4 && !strcmp(fa[3].key, fb[3].key));
+    /* one store, both copies: B's history after A's writes nothing it already has but its own tail */
+    TEST_ASSERT(l323_persist(A, 9000, 4096, true, l323_held_all, tip) == 1);
+    const int before = pulsar_segstore_count(A);
+    TEST_ASSERT(l323_persist(A, 13000, 4096, true, l323_held_all, tip) == 0 && pulsar_segstore_count(A) == before);
+    TEST_ASSERT(l323_seg_files(da) == pulsar_segstore_count(A));
+    pulsar_segstore_close(A);
+    /* an older store version's segment is removed at open (it can never load and sits outside the budget); a file
+     * of another format is left alone */
+    {
+        char path[600];
+        snprintf(path, sizeof path, "%s/%040d.seg", da, 1);
+        FILE *f = fopen(path, "wb");
+        const uint32_t v1[2] = { PULSAR_SEGSTORE_MAGIC, 1u };
+        TEST_ASSERT(f && fwrite(v1, 4, 2, f) == 2);
+        if (f) fclose(f);
+        snprintf(path, sizeof path, "%s/%040d.seg", da, 2);
+        f = fopen(path, "wb");
+        TEST_ASSERT(f && fwrite("not a segment", 1, 13, f) == 13);
+        if (f) fclose(f);
+        A = pulsar_segstore_open(da, 0, 7, NULL, NULL);
+        snprintf(path, sizeof path, "%s/%040d.seg", da, 1);
+        TEST_ASSERT(access(path, F_OK) != 0);
+        snprintf(path, sizeof path, "%s/%040d.seg", da, 2);
+        TEST_ASSERT(access(path, F_OK) == 0);
+        pulsar_segstore_close(A);
+    }
+    pulsar_segstore_close(B);
+    l323_rmdir(da);
+    l323_rmdir(db);
+}
+
+/* L323 (2): a tail is superseded -- dominated -- once its conversation goes on under the same parent (a later tail,
+ * or the grid segment covering it); a real branch is not; a dominated leaf is evicted before any LRU choice; and the
+ * marks are re-derived at open. */
+static void test_l323_tail_supersession(void) {
+    char t[] = "/tmp/pulsar-l323-tail.XXXXXX";
+    char *dir = l323_tmpdir(t);
+    TEST_ASSERT(dir != NULL);
+    if (!dir) return;
+    pulsar_segstore *st = pulsar_segstore_open(dir, 0, 7, NULL, NULL);
+    char t1[41], t2[41], g2[41], tip[41];
+    l323_persist(st, 4200, 4096, true, l323_held_all, t1);   /* [0,4096) + tail [4096,4200) */
+    l323_persist(st, 4600, 4096, true, l323_held_all, t2);   /* a later tail under the same grid point */
+    pulsar_segstore_seg s1, s2;
+    TEST_ASSERT(pulsar_segstore_get(st, t1, &s1) && s1.dominated && s1.G == 4200);
+    TEST_ASSERT(pulsar_segstore_get(st, t2, &s2) && !s2.dominated);
+    l323_persist(st, 8192, 4096, true, l323_held_all, g2);   /* the grid segment that covers both */
+    TEST_ASSERT(pulsar_segstore_get(st, t2, &s2) && s2.dominated);
+    TEST_ASSERT(pulsar_segstore_get(st, g2, &s2) && !s2.dominated && s2.G == 8192);
+    /* a branch: same grid parent, text that parts from the main line -- never dominated */
+    char bkey[41], err[256];
+    std::string head, btext;
+    l323_text(4096, 4150, &head);
+    btext = head + "a branch the main line never says";
+    pulsar_segstore_seg grid0;
+    std::string t0;
+    l323_text(0, 4096, &t0);
+    const pulsar_segstore_end g_end = { 4096u, false };
+    TEST_ASSERT(pulsar_segstore_lookup(st, t0.data(), t0.size(), &g_end, &grid0, 1) == 1);
+    l323_payload p = { 4096, 4160, l323_rows_bytes(4096, 4160) + L323_STATE };
+    TEST_ASSERT(pulsar_segstore_put(st, grid0.key, 4096, 4160, btext.data(), btext.size(), p.bytes, L323_STATE,
+                                    l323_payload_write, 0, NULL, &p, bkey, err, sizeof err));
+    pulsar_segstore_seg sb;
+    TEST_ASSERT(pulsar_segstore_get(st, bkey, &sb) && !sb.dominated);
+    /* reopen: the marks come back from the files */
+    pulsar_segstore_close(st);
+    st = pulsar_segstore_open(dir, 0, 7, NULL, NULL);
+    TEST_ASSERT(pulsar_segstore_get(st, t1, &s1) && s1.dominated);
+    TEST_ASSERT(pulsar_segstore_get(st, bkey, &sb) && !sb.dominated);
+    pulsar_segstore_close(st);
+    /* eviction: the branch is made the OLDEST leaf (its header's last_used), so plain LRU would take it; the
+     * dominated tails go first all the same */
+    {
+        char path[600];
+        snprintf(path, sizeof path, "%s/%.40s.seg", dir, bkey);
+        FILE *f = fopen(path, "r+b");
+        TEST_ASSERT(f != NULL);
+        uint8_t old[8] = { 1, 0, 0, 0, 0, 0, 0, 0 };
+        if (f) { TEST_ASSERT(fseek(f, 144, SEEK_SET) == 0 && fwrite(old, 1, 8, f) == 8); fclose(f); }
+    }
+    const uint64_t used = [&]() { pulsar_segstore *o = pulsar_segstore_open(dir, 0, 7, NULL, NULL);
+                                  const uint64_t u = pulsar_segstore_used_bytes(o); pulsar_segstore_close(o); return u; }();
+    st = pulsar_segstore_open(dir, used + 200, 7, NULL, NULL);   /* room for nothing big: a put must evict */
+    TEST_ASSERT(l323_persist(st, 8400, 4096, true, l323_held_all, tip) == 1);
+    TEST_ASSERT(pulsar_segstore_contains(st, bkey));                           /* the old branch stays */
+    TEST_ASSERT(!pulsar_segstore_contains(st, t1) || !pulsar_segstore_contains(st, t2));   /* a dominated tail went */
+    pulsar_segstore_close(st);
+    l323_rmdir(dir);
+}
+
+/* L323 (3): state only at grid points the writer held, and at the tail.  A restore finds the deepest chain that ENDS
+ * at a stored state at or below the request's divergence (pulsar_kvchain_find) and reads every segment's rows and
+ * the last one's state (pulsar_kvchain_load_bytes); a rows-only grid segment above it adds nothing. */
+static void test_l323_state_restore_math(void) {
+    char t[] = "/tmp/pulsar-l323-state.XXXXXX";
+    char *dir = l323_tmpdir(t);
+    TEST_ASSERT(dir != NULL);
+    if (!dir) return;
+    pulsar_segstore *st = pulsar_segstore_open(dir, 0, 7, NULL, NULL);
+    char tip[41];
+    /* the writer held only the checkpoint at 8192 (its ladder thinned 4096 and 12288 away): [0,4096) rows,
+     * [4096,8192) +state, [8192,12288) rows, tail [12288,13000) +state */
+    TEST_ASSERT(l323_persist(st, 13000, 4096, true, l323_held_8192, tip) == 4);
+    pulsar_segstore_seg chain[PULSAR_KVCHAIN_MAX];
+    uint64_t bytes = 0;
+    char err[384];
+    std::string req;
+    /* the whole history: four segments, rows of all four, the tail's state */
+    l323_text(0, 13000, &req);
+    req += "and the next turn";
+    int n = pulsar_kvchain_find(st, req.data(), req.size(), NULL, 0, 0, chain, PULSAR_KVCHAIN_MAX, &bytes, err,
+                                sizeof err);
+    TEST_ASSERT(n == 4 && chain[3].G == 13000);
+    uint64_t rows = 0;
+    for (int i = 0; i < 4; i++) rows += l323_rows_bytes(chain[i].G_prev, chain[i].G);
+    TEST_ASSERT(bytes == rows + L323_STATE);   /* one state, not two */
+    /* a request that parts inside the tail's cell: the deepest STATE at or below is 8192 (12288 holds rows only) --
+     * the restore stands there and the sync prefills [8192, divergence) */
+    l323_text(0, 12500, &req);
+    req += "an edit";
+    n = pulsar_kvchain_find(st, req.data(), req.size(), NULL, 0, 0, chain, PULSAR_KVCHAIN_MAX, &bytes, err, sizeof err);
+    TEST_ASSERT(n == 2 && chain[1].G == 8192 && chain[1].state_bytes == L323_STATE);
+    TEST_ASSERT(bytes == l323_rows_bytes(0, 4096) + l323_rows_bytes(4096, 8192) + L323_STATE);
+    TEST_ASSERT(pulsar_kvchain_load_bytes(chain, n) == bytes);
+    /* below the first stored state: nothing to restore (0 at 4096 holds rows only) */
+    l323_text(0, 6000, &req);
+    req += "an early edit";
+    TEST_ASSERT(pulsar_kvchain_find(st, req.data(), req.size(), NULL, 0, 0, chain, PULSAR_KVCHAIN_MAX, &bytes, err,
+                                    sizeof err) == 0);
+    /* a later writer that holds 12288 upgrades the rows-only segment in place: same key, same child, now a state */
+    pulsar_segstore_seg before, after;
+    l323_text(0, 12288, &req);
+    const pulsar_segstore_end g_end = { 4096u, false };
+    TEST_ASSERT(pulsar_segstore_lookup(st, req.data(), req.size(), &g_end, chain, 8) == 3);
+    TEST_ASSERT(pulsar_segstore_get(st, chain[2].key, &before) && before.state_bytes == 0);
+    const int count = pulsar_segstore_count(st);
+    TEST_ASSERT(l323_persist(st, 13000, 4096, true, l323_held_all, tip) == 2);   /* 4096 and 12288 upgraded */
+    TEST_ASSERT(pulsar_segstore_get(st, before.key, &after) && after.state_bytes == L323_STATE &&
+                after.file_bytes == before.file_bytes + L323_STATE && pulsar_segstore_count(st) == count);
+    l323_text(0, 12500, &req);
+    req += "an edit";
+    n = pulsar_kvchain_find(st, req.data(), req.size(), NULL, 0, 0, chain, PULSAR_KVCHAIN_MAX, &bytes, err, sizeof err);
+    TEST_ASSERT(n == 3 && chain[2].G == 12288);
+    /* a writer that holds nothing on the grid still cuts there (rows only), and its tail carries the state */
+    pulsar_segstore_close(st);
+    l323_rmdir(dir);
+    char t2[] = "/tmp/pulsar-l323-rows.XXXXXX";
+    dir = l323_tmpdir(t2);
+    st = pulsar_segstore_open(dir, 0, 7, NULL, NULL);
+    TEST_ASSERT(l323_persist(st, 9000, 4096, true, l323_held_none, tip) == 3);
+    l323_text(0, 9000, &req);
+    n = pulsar_kvchain_find(st, req.data(), req.size(), NULL, 0, 0, chain, PULSAR_KVCHAIN_MAX, &bytes, err, sizeof err);
+    TEST_ASSERT(n == 3 && chain[0].state_bytes == 0 && chain[1].state_bytes == 0 && chain[2].state_bytes == L323_STATE);
+    pulsar_segstore_close(st);
+    l323_rmdir(dir);
 }
 
 /* L264: releasing one chain's KV (the agent's /strip and /del) takes only the
@@ -6628,7 +6937,7 @@ static void test_l264_segstore_eviction_and_hygiene(void) {
     char *dir = mkdtemp(tmpl);
     TEST_ASSERT(dir != NULL);
     if (!dir) return;
-    /* each segment costs 152 header + text + 1000 payload */
+    /* each segment costs 160 header + text + 1000 payload */
     pulsar_segstore *st = pulsar_segstore_open(dir, 3 * 1200, 1, NULL, NULL);
     char r[41], c1[41], c2[41], d[41];
     TEST_ASSERT(test_seg_put(st, "", 0, 128, "root", 1000, 1, r));
@@ -6651,7 +6960,7 @@ static void test_l264_segstore_eviction_and_hygiene(void) {
     char err[256];
     pulsar_segstore_close(st);
     st = pulsar_segstore_open(dir, 0, 1, NULL, NULL);
-    TEST_ASSERT(pulsar_segstore_put(st, d, 256, 384, "tool turn", 9, 10, test_seg_write, 5, test_seg_trailer, &p, t,
+    TEST_ASSERT(pulsar_segstore_put(st, d, 256, 384, "tool turn", 9, 10, 0, test_seg_write, 5, test_seg_trailer, &p, t,
                                     err, sizeof err));
     struct seen_t { int n; bool text_ok; bool bytes_ok; } seen = { 0, false, false };
     pulsar_segstore_foreach_trailer(st, [](FILE *fp, uint64_t bytes, const char *text, size_t len, void *ud) {
@@ -6771,7 +7080,7 @@ static void test_kv_tool_map_restores_before_prompt_render(void) {
         TEST_ASSERT(src.kv_tool_map_serialized_size(dsml, &trailer) && trailer > 0);
         struct ctx_t { server *s; const char *text; } ctx = { &src, dsml };
         char key[41], err[256];
-        TEST_ASSERT(pulsar_segstore_put(st, "", 0, 128, dsml, strlen(dsml), 4,
+        TEST_ASSERT(pulsar_segstore_put(st, "", 0, 128, dsml, strlen(dsml), 4, 0,
             [](FILE *fp, void *, char *, size_t) { return fwrite("PAYL", 1, 4, fp) == 4 ? 0 : 1; },
             trailer,
             [](FILE *fp, void *ud, char *, size_t) {
@@ -7416,6 +7725,72 @@ static void test_l311_route_header_anchor(void) {
     pulsar_tokens_free(&b);
 }
 
+/* L322: the side-call shape (Claude Code's SUGGESTION MODE, 2026-10-24, Qwen at 178-193k).  Turn N ran on the bank and
+ * its terminal checkpoint re-prefilled its reply; the side call (the conversation + ~340 tokens: a user turn, its
+ * header) then ran in place -- it carries everything the bank prefilled -- and its own terminal checkpoint re-prefilled
+ * its reply too, so the bank's history ends in the side call's header and reply.  The next real turn carries turn N
+ * through its end and the next user marker, then diverges inside the side call's user turn.  The bank's last-turn
+ * anchor (that user marker) says it is this conversation's: in place, rewound to the bank's own checkpoint below the
+ * match.  L311 took the DEEPER of that anchor and the side call's header, and every such turn took a fresh bank (and,
+ * with the adopt capped at a seam, the whole chain from disk: 22-25 s a turn). */
+static void test_l322_route_side_call(void) {
+    const int start = 151644, end = 151645, u = 872, a = 77091, nl = 198, think = 151667, think_end = 151668;
+    const pulsar_turn_markers q = {{start, u}, 2, {start, a}, 2};
+    pulsar_tokens b = {0};
+    pulsar_tokens_push(&b, start);  pulsar_tokens_push(&b, 8948);   /* 0 <|im_start|>system */
+    for (int i = 0; i < 300; i++) pulsar_tokens_push(&b, 1000 + i); /* 2 .. 301 the system prompt + tools */
+    pulsar_tokens_push(&b, start);  pulsar_tokens_push(&b, u);      /* 302 <|im_start|>user: the task */
+    for (int i = 0; i < 40; i++) pulsar_tokens_push(&b, 2000 + i);
+    pulsar_tokens_push(&b, start);  pulsar_tokens_push(&b, a);      /* 344 turn N-1's header ... */
+    for (int i = 0; i < 100; i++) pulsar_tokens_push(&b, 3000 + i); /* ... and its reply */
+    pulsar_tokens_push(&b, end);    pulsar_tokens_push(&b, nl);
+    const int user_n = b.len;                                       /* 448 <|im_start|>user: turn N */
+    pulsar_tokens_push(&b, start);  pulsar_tokens_push(&b, u);
+    for (int i = 0; i < 60; i++) pulsar_tokens_push(&b, 4000 + i);
+    pulsar_tokens_push(&b, start);  pulsar_tokens_push(&b, a);      /* turn N's header ... */
+    pulsar_tokens_push(&b, nl);     pulsar_tokens_push(&b, think);
+    for (int i = 0; i < 200; i++) pulsar_tokens_push(&b, 5000 + i); /* ... its reply, terminal-checkpointed */
+    pulsar_tokens_push(&b, think_end);
+    const int turn_end = b.len;                                     /* the side call's match: all of it */
+    pulsar_tokens_push(&b, end);    pulsar_tokens_push(&b, nl);
+    const int side_user = b.len;                                    /* the side call's <|im_start|>user */
+    pulsar_tokens_push(&b, start);  pulsar_tokens_push(&b, u);
+    for (int i = 0; i < 330; i++) pulsar_tokens_push(&b, 6000 + i); /* "SUGGESTION MODE ..." */
+    const int side_header = b.len;
+    pulsar_tokens_push(&b, start);  pulsar_tokens_push(&b, a);
+    pulsar_tokens_push(&b, nl);     pulsar_tokens_push(&b, think);
+    for (int i = 0; i < 250; i++) pulsar_tokens_push(&b, 7000 + i); /* its reply, terminal-checkpointed */
+    const int prefilled = b.len, frontier = b.len;
+    TEST_ASSERT(server_route_turn_anchor(&b, prefilled, &q) == side_user);
+    TEST_ASSERT(server_route_header_anchor(&b, prefilled, &q) == side_header + 1);
+    TEST_ASSERT(server_route_anchor(&b, prefilled, &q) == side_user);
+    /* the real turn N+1: turn N to its end, "<|im_end|>\n<|im_start|>user\n", then its own message -- the 14:18:06
+     * shape (common 178833 = the real turn's end 178828 + 5; resume 178816, the grid checkpoint below) */
+    const int common = side_user + 3, score = turn_end - turn_end % 128 > 0 ? turn_end - turn_end % 128 : 128;
+    TEST_ASSERT(frontier - score >= 157);   /* the protect floor alone would not keep it */
+    TEST_ASSERT(server_route_in_place(common, score, frontier, prefilled, 157, server_route_anchor(&b, prefilled, &q)));
+    /* ...where the deeper anchor (L311's combination) took a fresh bank */
+    TEST_ASSERT(!server_route_in_place(common, score, frontier, prefilled, 157, server_route_header_anchor(&b, prefilled, &q)));
+    /* the side call itself carries everything the bank prefilled before it: in place either way */
+    TEST_ASSERT(server_route_in_place(turn_end, score, turn_end, turn_end, 157, server_route_anchor(&b, turn_end, &q)));
+    /* a request that leaves the history BEFORE the bank's last user marker (an edit of an earlier turn, a subagent
+     * sibling sharing the conversation only up to there) is not taken by the anchor */
+    TEST_ASSERT(!server_route_in_place(turn_end, score, frontier, prefilled, 157, server_route_anchor(&b, prefilled, &q)));
+    TEST_ASSERT(!server_route_in_place(user_n + 20, 384, frontier, prefilled, 157, server_route_anchor(&b, prefilled, &q)));
+    /* the 2026-10-04 clobber (another conversation inside the first user message) stays fresh */
+    TEST_ASSERT(!server_route_in_place(320, 256, frontier, prefilled, 157, server_route_anchor(&b, prefilled, &q)));
+    /* a first-turn bank has no last-turn anchor: the header's decides (L311) */
+    TEST_ASSERT(server_route_anchor(&b, side_user - 1, &q) == user_n);   /* turn N prefilled through its reply */
+    pulsar_tokens fb = {0};
+    for (int i = 0; i < 349; i++) pulsar_tokens_push(&fb, b.v[i]);   /* system, task, turn N-1's header + 3 */
+    TEST_ASSERT(server_route_turn_anchor(&fb, fb.len, &q) == -1);
+    TEST_ASSERT(server_route_anchor(&fb, fb.len, &q) == 345);
+    const pulsar_turn_markers none = {{0, 0}, 0, {0, 0}, 0};
+    TEST_ASSERT(server_route_anchor(&b, prefilled, &none) == -1 && server_route_anchor(NULL, 9, &q) == -1);
+    pulsar_tokens_free(&fb);
+    pulsar_tokens_free(&b);
+}
+
 static void test_l275_route_in_place_through_last_turn(void) {
     const int floor_ = 157;
     /* the session recap on the idle main bank: the bank prefilled 41670 (its
@@ -7616,7 +7991,7 @@ static void test_kv_disk_default_dir_resolution(void) {
     /* XDG_CACHE_HOME wins; nonexistent model path falls back to its raw
      * basename; the .gguf extension is stripped case-insensitively. */
     setenv("XDG_CACHE_HOME", "/tmp/ds4-kvtest-xdg", 1);
-    char *d = server_default_kv_disk_dir("/no/such/dir/ds4flash-test.gguf");
+    char *d = server_default_kv_disk_dir("/no/such/dir/ds4flash-test.gguf", 0.0);
     TEST_ASSERT(d && !strcmp(d, "/tmp/ds4-kvtest-xdg/pulsar/kv-ds4flash-test"));
     free(d);
 
@@ -7633,7 +8008,7 @@ static void test_kv_disk_default_dir_resolution(void) {
         TEST_ASSERT(fp != NULL);
         if (fp) fclose(fp);
         TEST_ASSERT(symlink(artifact, pointer) == 0);
-        d = server_default_kv_disk_dir(pointer);
+        d = server_default_kv_disk_dir(pointer, 0.0);
         TEST_ASSERT(d && !strcmp(d, "/tmp/ds4-kvtest-xdg/pulsar/kv-ds4flash-v9-test"));
         free(d);
         unlink(pointer);
@@ -7645,22 +8020,31 @@ static void test_kv_disk_default_dir_resolution(void) {
      * the model name are sanitized. */
     unsetenv("XDG_CACHE_HOME");
     setenv("HOME", "/tmp/ds4-kvtest-home", 1);
-    d = server_default_kv_disk_dir("weird name!.GGUF");
+    d = server_default_kv_disk_dir("weird name!.GGUF", 0.0);
     TEST_ASSERT(d && !strcmp(d, "/tmp/ds4-kvtest-home/.cache/pulsar/kv-weird_name_"));
     free(d);
 
     /* A relative XDG_CACHE_HOME is ignored per the XDG spec (it would key
      * the cache off the current working directory). */
     setenv("XDG_CACHE_HOME", "relative-cache", 1);
-    d = server_default_kv_disk_dir("x.gguf");
+    d = server_default_kv_disk_dir("x.gguf", 0.0);
     TEST_ASSERT(d && !strcmp(d, "/tmp/ds4-kvtest-home/.cache/pulsar/kv-x"));
     free(d);
     unsetenv("XDG_CACHE_HOME");
 
+    /* L280: --rope-yarn keys its own directory (a segment's name hashes its text, so a native and a YaRN server
+     * must not share one); the native rope's directory is unchanged */
+    d = server_default_kv_disk_dir("/no/such/qwen38fn-dflash2", 4.0);
+    TEST_ASSERT(d && !strcmp(d, "/tmp/ds4-kvtest-home/.cache/pulsar/kv-qwen38fn-dflash2-rope-yarn4"));
+    free(d);
+    d = server_default_kv_disk_dir("/no/such/qwen38fn-dflash2", 2.5);
+    TEST_ASSERT(d && !strcmp(d, "/tmp/ds4-kvtest-home/.cache/pulsar/kv-qwen38fn-dflash2-rope-yarn2.5"));
+    free(d);
+
     /* No cache home at all: resolution reports NULL (server then runs with
      * the disk cache disabled instead of guessing a path). */
     unsetenv("HOME");
-    TEST_ASSERT(server_default_kv_disk_dir("x.gguf") == NULL);
+    TEST_ASSERT(server_default_kv_disk_dir("x.gguf", 0.0) == NULL);
 
     test_env_restore("XDG_CACHE_HOME", old_xdg);
     test_env_restore("HOME", old_home);
@@ -8955,66 +9339,147 @@ static void test_l190_mem_floor_warn_is_rate_limited(void) {
     TEST_ASSERT(skipped == 1);
 }
 
-/* L179 branch 6 (i) -- fresh_make_room's LRU-superseded victim scan
- * (superseded_pick_core). Invariant: slot a is picked only if it is
- * eligible, unprotected, has history (hist_len > 0) and some OTHER slot k is
- * STRICTLY longer (frontier[k] > hist_len[a]) with a's whole history as its
- * prefix (common[a][k] >= hist_len[a]); among such slots the smallest
- * last_us wins (first index on a tie); a plain-LRU idle slot that nothing
- * supersedes is never picked over a superseded one; no supersession is -1. */
-static void test_l179_superseded_pick_prefers_redundant_history(void) {
-    enum { N = 4 };
-    bool protect[N] = {false, false, false, false};
-    bool eligible[N] = {true, true, true, true};
-    int hist_len[N] = {100, 300, 50, 0};
-    int frontier[N] = {100, 300, 50, 0};
-    uint64_t last_us[N] = {10, 20, 5, 1};   /* slot 2 is the LRU with history */
+/* L324: the duplicate-prefix census (kv_dup_census_core) on a Claude Code shape at the production grid.  Invariants:
+ * a page is a whole grid cell [p*grid, (p+1)*grid) of a RESIDENT bank's history; two banks hold the same page iff
+ * their common token prefix reaches (p+1)*grid (exactly reaching it counts); distinct pages count each class once,
+ * pages_duplicate = resident - distinct, dup_bytes = pages_duplicate * page_bytes; a pair counts in a class only when
+ * it shares a whole page, deep iff it shares >= PULSAR_KV_DUP_DEEP_TOKENS; a spilled bank holds nothing. */
+static void test_l324_kv_dup_census(void) {
+    enum { N = 7, G = 4096 };
+    const uint64_t PB = 52ull << 20;
+    /* 0 main conversation; 1, 2 fan-out siblings (24.5k in common, 14k with the main one: the same-config
+     * preamble); 3 a third sibling, SPILLED; 4 a dominated copy of 0 at 150k; 5 another conversation; 6 empty */
+    int hist_len[N] = {180000, 30000, 28000, 26000, 150000, 10000, 0};
+    bool resident[N] = {true, true, true, false, true, true, true};
     int rows[N][N];
     const int *common[N];
     for (int i = 0; i < N; i++) {
         common[i] = rows[i];
         for (int k = 0; k < N; k++) rows[i][k] = -1;
     }
-    /* slot 1's history extends slot 0's whole 100 tokens; slot 2 shares only
-     * 30 with either: the superseded slot 0 is picked over the LRU slot 2 */
+    auto set = [&](int a, int b, int v) { rows[a][b] = v; rows[b][a] = v; };
+    set(0, 1, 14000); set(0, 2, 14000); set(0, 3, 14000); set(0, 4, 150000); set(0, 5, 200);
+    set(1, 2, 24500); set(1, 3, 24500); set(1, 4, 14000); set(1, 5, 200);
+    set(2, 3, 24500); set(2, 4, 14000); set(2, 5, 200);
+    set(3, 4, 14000); set(3, 5, 200); set(4, 5, 200);
+    kv_dup_census c;
+    uint32_t deep[N];
+    kv_dup_census_core(N, hist_len, resident, common, G, PB, &c, deep);
+    TEST_ASSERT(c.grid == G && c.page_bytes == PB);
+    TEST_ASSERT(c.banks == 5);                       /* the spilled and the empty bank hold no page */
+    TEST_ASSERT(c.pages_resident == 43 + 7 + 6 + 36 + 2);
+    /* p0-1: {0,1,2,4} {5}; p2: {0,1,2,4}; p3-4: {0,4} {1,2}; p5: {0,4} {1} {2} (24500 < 6*4096); p6: {0,4} {1};
+     * p7-35: {0,4}; p36-42: {0} */
+    TEST_ASSERT(c.pages_distinct == 2 + 2 + 1 + 2 + 2 + 3 + 2 + 29 + 7);
+    TEST_ASSERT(c.pages_shared == 1 + 1 + 1 + 2 + 2 + 1 + 1 + 29);
+    TEST_ASSERT(c.pages_duplicate == 44);
+    TEST_ASSERT(c.dup_bytes == 44 * PB);
+    TEST_ASSERT(c.pairs[0] == 5 && c.pairs[1] == 1);  /* (0,1) (0,2) (1,2) (1,4) (2,4); deep (0,4); 5 shares no page */
+    TEST_ASSERT(c.longest[0] == 24500 && c.longest[1] == 150000);
+    TEST_ASSERT(deep[0] == 1u << 4);
+    for (int a = 1; a < N; a++) TEST_ASSERT(deep[a] == 0);
+    /* the spilled sibling resident again: it shares p0-4 with 1 and 2 and p0-2 with 0 and 4 */
+    resident[3] = true;
+    kv_dup_census_core(N, hist_len, resident, common, G, PB, &c, NULL);
+    TEST_ASSERT(c.banks == 6 && c.pages_resident == 94 + 6);
+    TEST_ASSERT(c.pages_duplicate == 44 + 5 && c.pairs[0] == 5 + 4);
+    /* exactly reaching a page end shares it: two identical 8192-token copies hold 2 pages once each */
+    {
+        int hl[2] = {8192, 8192};
+        bool rs[2] = {true, true};
+        int r[2][2] = {{-1, 8192}, {8192, -1}};
+        const int *cm[2] = {r[0], r[1]};
+        kv_dup_census_core(2, hl, rs, cm, G, PB, &c, NULL);
+        TEST_ASSERT(c.pages_resident == 4 && c.pages_distinct == 2 && c.pages_shared == 2 && c.pages_duplicate == 2);
+        TEST_ASSERT(c.pairs[0] == 1 && c.longest[0] == 8192 && c.pairs[1] == 0);
+        r[0][1] = r[1][0] = 8191;   /* one token short of the second page end */
+        kv_dup_census_core(2, hl, rs, cm, G, PB, &c, NULL);
+        TEST_ASSERT(c.pages_distinct == 3 && c.pages_duplicate == 1);
+    }
+    /* no grid, no census */
+    kv_dup_census_core(N, hist_len, resident, common, 0, PB, &c, deep);
+    TEST_ASSERT(c.pages_resident == 0 && c.dup_bytes == 0 && deep[0] == 0);
+}
+
+/* L323 (4): the ONE bank-dominance predicate (bank_dominated_core; L179 branch 6's superseded scan before it).
+ * Invariant: slot a is dominated only if it has a history and some OTHER slot k reaches at least as far
+ * (hist_len[k] > hist_len[a], or an identical copy at a lower index) with a's whole history as its prefix
+ * (common[a][k] >= hist_len[a]); an empty bank, a partial prefix and a shorter slot never dominate; of two identical
+ * copies exactly one is dominated.  Then both pickers take a dominated slot before any LRU choice. */
+static void test_l323_bank_dominated(void) {
+    enum { N = 4 };
+    int hist_len[N] = {100, 300, 50, 0};
+    int rows[N][N];
+    const int *common[N];
+    for (int i = 0; i < N; i++) {
+        common[i] = rows[i];
+        for (int k = 0; k < N; k++) rows[i][k] = -1;
+    }
+    /* slot 1 extends slot 0's whole 100 tokens; slot 2 shares only 30 */
     rows[0][1] = 100;
     rows[2][0] = 30;
     rows[2][1] = 30;
-    TEST_ASSERT(superseded_pick_core(N, protect, eligible, hist_len, frontier, common, last_us) == 0);
-    TEST_ASSERT(superseded_pick_core(N, NULL, eligible, hist_len, frontier, common, last_us) == 0);
-    /* protected or ineligible: never picked, and nothing else qualifies */
-    protect[0] = true;
-    TEST_ASSERT(superseded_pick_core(N, protect, eligible, hist_len, frontier, common, last_us) == -1);
-    protect[0] = false;
-    eligible[0] = false;
-    TEST_ASSERT(superseded_pick_core(N, protect, eligible, hist_len, frontier, common, last_us) == -1);
-    eligible[0] = true;
-    /* the superseder's own eligibility is irrelevant -- only its frontier */
-    eligible[1] = false;
-    TEST_ASSERT(superseded_pick_core(N, protect, eligible, hist_len, frontier, common, last_us) == 0);
-    eligible[1] = true;
-    /* two superseded slots: LRU wins (slot 2 at 5 us over slot 0 at 10 us) */
-    rows[2][0] = 50;
-    TEST_ASSERT(superseded_pick_core(N, protect, eligible, hist_len, frontier, common, last_us) == 2);
-    rows[2][0] = 30;
-    /* strictly longer: a superseder at EXACTLY a's length does not count */
-    frontier[1] = 100;
-    TEST_ASSERT(superseded_pick_core(N, protect, eligible, hist_len, frontier, common, last_us) == -1);
-    frontier[1] = 300;
+    TEST_ASSERT(bank_dominated_core(0, N, hist_len, common));
+    TEST_ASSERT(!bank_dominated_core(1, N, hist_len, common));   /* the longest is never dominated */
+    TEST_ASSERT(!bank_dominated_core(2, N, hist_len, common));
+    TEST_ASSERT(!bank_dominated_core(3, N, hist_len, common));   /* an empty bank is plain LRU's business */
     /* a's whole history must be the prefix: 99 of 100 is not */
     rows[0][1] = 99;
-    TEST_ASSERT(superseded_pick_core(N, protect, eligible, hist_len, frontier, common, last_us) == -1);
+    TEST_ASSERT(!bank_dominated_core(0, N, hist_len, common));
     rows[0][1] = 100;
-    /* an empty bank is plain LRU's business even though common >= 0 holds */
-    rows[3][1] = 0;
-    TEST_ASSERT(superseded_pick_core(N, protect, eligible, hist_len, frontier, common, last_us) == 0);
-    /* no supersession anywhere: -1 */
-    rows[0][1] = -1;
-    TEST_ASSERT(superseded_pick_core(N, protect, eligible, hist_len, frontier, common, last_us) == -1);
-    /* a slot never supersedes itself (the diagonal is skipped) */
-    rows[0][0] = 100;
-    frontier[0] = 200;
-    TEST_ASSERT(superseded_pick_core(N, protect, eligible, hist_len, frontier, common, last_us) == -1);
+    /* a shorter slot never dominates, whatever its common reads */
+    rows[1][0] = 100;
+    TEST_ASSERT(!bank_dominated_core(1, N, hist_len, common));
+    /* identical copies (slot 2 made a copy of slot 0): exactly one, the higher index, is dominated */
+    hist_len[2] = 100;
+    rows[2][0] = 100;
+    rows[0][2] = 100;
+    TEST_ASSERT(bank_dominated_core(2, N, hist_len, common));
+    rows[0][1] = -1;   /* slot 0 now has only its identical copy above it */
+    TEST_ASSERT(!bank_dominated_core(0, N, hist_len, common));
+    /* a slot never dominates itself (the diagonal is skipped) */
+    rows[1][1] = 300;
+    TEST_ASSERT(!bank_dominated_core(1, N, hist_len, common));
+
+    /* the make-room eviction: a dominated slot goes first even when it is the most recently served */
+    session_slot slots[PULSAR_SESSION_POOL_CAP];
+    memset(slots, 0, sizeof(slots));
+    for (int i = 0; i < 4; i++) slots[i].provisioned = true;
+    slots[1].last_serviced_us = 10;   /* LRU */
+    slots[2].last_serviced_us = 90;
+    slots[3].last_serviced_us = 50;
+    bool dom[PULSAR_SESSION_POOL_CAP] = {false};
+    TEST_ASSERT(server_evict_pick_victim(slots, 4, NULL, false, dom) == 1);
+    dom[2] = true;
+    TEST_ASSERT(server_evict_pick_victim(slots, 4, NULL, false, dom) == 2);
+    dom[3] = true;   /* two dominated: LRU among them */
+    TEST_ASSERT(server_evict_pick_victim(slots, 4, NULL, false, dom) == 3);
+    bool protect[PULSAR_SESSION_POOL_CAP] = {false};
+    protect[3] = true;
+    TEST_ASSERT(server_evict_pick_victim(slots, 4, protect, false, dom) == 2);   /* protection still wins */
+    TEST_ASSERT(server_evict_pick_victim(slots, 4, NULL, false, NULL) == 1);     /* no facts: plain LRU */
+
+    /* the guard's spill pick, the same order */
+    server s;
+    memset(&s, 0, sizeof s);
+    s.n_slots = 4;
+    for (int i = 0; i < 4; i++) {
+        s.slots[i].provisioned = true;
+        s.slots[i].bank = (uint32_t)i;
+        s.slots[i].last_serviced_us = slots[i].last_serviced_us;
+    }
+    bool gdom[PULSAR_SESSION_POOL_CAP] = {false};
+    TEST_ASSERT(s.guard_pick_victim(NULL, 0, gdom) == 1);
+    gdom[2] = true;
+    TEST_ASSERT(s.guard_pick_victim(NULL, 0, gdom) == 2);
+    session_slot *dec[1] = {&s.slots[2]};   /* a live decoder is never a victim, dominated or not */
+    TEST_ASSERT(s.guard_pick_victim(dec, 1, gdom) == 1);
+    s.slots[2].spilled = true;               /* nor a spilled one */
+    TEST_ASSERT(s.guard_pick_victim(NULL, 0, gdom) == 1);
+    /* off the bank pool there are no dominance facts */
+    bool none[PULSAR_SESSION_POOL_CAP];
+    s.dominated_slots(none);
+    for (int i = 0; i < PULSAR_SESSION_POOL_CAP; i++) TEST_ASSERT(!none[i]);
 }
 
 /* L179 branch 7 (i) -- guard_pick_victim on a host-only server (sess NULL:
@@ -9803,6 +10268,7 @@ static void pulsar_server_unit_tests_run(void) {
     test_l273_image_cold_cut();
     test_l275_route_in_place_through_last_turn();
     test_l311_route_header_anchor();
+    test_l322_route_side_call();
     test_slot_writer_defers_and_preserves_order();
     test_slot_writer_stall_times_out();
     test_unterminated_think_stays_off_content();
@@ -9945,7 +10411,11 @@ static void pulsar_server_unit_tests_run(void) {
     test_writeback_preserves_bytes();
     test_sha1_bytes_hex_matches_known_vector();
     test_l264_segstore_chain_lookup();
-    test_l264_kvchain_segment_ends();
+    test_l280_kv_identity_rope();
+    test_l323_kvchain_segment_ends();
+    test_l323_grid_cut_dedupes_copies();
+    test_l323_tail_supersession();
+    test_l323_state_restore_math();
     test_l264_segstore_eviction_and_hygiene();
     test_l264_segstore_release();
     test_l179_tool_admission_is_bound_decode_only();
@@ -9969,7 +10439,8 @@ static void pulsar_server_unit_tests_run(void) {
     test_l184_dsml_entity_pair_round_trips();
     test_l185_every_renderer_produces_the_authority_bytes();
     test_l192_tool_history_validation_is_nearest_preceding();
-    test_l179_superseded_pick_prefers_redundant_history();
+    test_l323_bank_dominated();
+    test_l324_kv_dup_census();
     test_l179_guard_victim_skips_pinned_live_spilled();
     test_l179_guard_spill_plan_is_minimum();
     test_l280_prompt_kv_admission();

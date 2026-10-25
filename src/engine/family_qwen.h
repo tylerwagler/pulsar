@@ -29,6 +29,8 @@
 #include <stdint.h>
 #include <stdbool.h>
 
+#include "pulsar_gpu.h"
+
 #include "family.h"
 
 /* ---- 1. Shape -------------------------------------------------------------
@@ -80,6 +82,12 @@ typedef struct {
     uint32_t max_position;     ///< max_position_embeddings (262144)
     uint32_t eos_id;           ///< eos_token_id (248044), also the PLE context reset token
     uint32_t n_mtp_layer;      ///< mtp_num_hidden_layers (1)
+    /* L280: the QSA rope as loaded -- rope_parameters' YaRN, or the --rope-yarn option's over a native container
+     * (yarn.factor 0 = the native rope) -- and its table (pulsar_qsa_rope_init, made once at load, the one every
+     * QSA call passes).  Not part of the known geometry: qwen_shape_check does not compare them. */
+    pulsar_qsa_yarn yarn;
+    pulsar_qsa_rope qsa_rope;
+    uint64_t rope_id;          ///< the rope's identity (family.h rope_id): 0 native, else a digest of `yarn`
     /* L266 step 7: this rank of a tensor-parallel group (0 of 0 / 1 = one GPU).  Under TP the four head counts
      * above are THIS RANK's (gdn_n_k_head 8, gdn_n_v_head 24, n_head 12, n_head_kv 1): the load binds the
      * container against the whole model, then pulsar_qwen_tp_load halves them, so every derived width,

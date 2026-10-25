@@ -110,6 +110,9 @@ bool fwd(Layer &L, std::vector<pulsar_qsa_seq> &seqs, const std::vector<uint32_t
     io.out_e4m3 = P(L.slot);
     io.out_scale = P(L.sc);
     io.out_sf_pitch = pulsar_mx_kbp(PULSAR_QSA_OUT_DIM);
+    static pulsar_qsa_rope rope;   /* the native rope: the bench times the kernels, not a rope */
+    static const bool rope_ok = pulsar_qsa_rope_init(&rope, NULL) == 1;
+    io.rope = rope_ok ? &rope : NULL;
     return pulsar_gpu_qsa_forward(&lw, seqs.data(), (uint32_t)seqs.size(), rs.data(), rp.data(), (uint32_t)rs.size(), &io, L.ws);
 }
 

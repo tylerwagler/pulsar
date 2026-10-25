@@ -265,7 +265,7 @@ static void part_chunks(pulsar_engine *e, int W, bool explicit_chunk) {
         CHECK(ok && pulsar_session_checkpoint_best(a, 512) == 512 && pulsar_session_checkpoint_best(a, N) == Gend,
               "C4 checkpoints at 512 and %d after two syncs: %s", Gend, err);
         FILE *f1 = tmpfile(), *f2 = tmpfile();
-        const uint64_t b1 = pulsar_session_segment_bytes(a, 0, 512), b2 = pulsar_session_segment_bytes(a, 512, Gend);
+        const uint64_t b1 = pulsar_session_segment_bytes(a, 0, 512, NULL), b2 = pulsar_session_segment_bytes(a, 512, Gend, NULL);
         ok = ok && f1 && f2 && pulsar_session_save_segment(a, f1, 0, 512, NULL, err, sizeof(err)) == 0 &&
              pulsar_session_save_segment(a, f2, 512, Gend, NULL, err, sizeof(err)) == 0;
         CHECK(ok, "C4 saved [0, 512) %llu B and [512, %d) %llu B: %s", (unsigned long long)b1, Gend, (unsigned long long)b2, err);

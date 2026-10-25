@@ -147,6 +147,11 @@ typedef struct {
      *  container holds; of two, the block drafter on Qwen (L299: dflash2 by default), a choice required on Nemotron-H;
      *  a name the container does not hold refuses the open by name. */
     const char *drafter;
+    /** L280 (--rope-yarn F): YaRN rope scaling at factor F over the container's trained context, for a container
+     *  whose rope is native (Qwen's ship `rope_type: default`; the model card's recipe is F 4 = 1M).  0 = the
+     *  container's own rope.  A container that already declares YaRN takes only its own factor, and a family whose
+     *  rope has no YaRN refuses the option by name -- it never reaches a model silently. */
+    double rope_yarn_factor;
     /** "FILE:PREFIX" — swap routed-expert tensors whose name starts with
      * PREFIX for the same-named tensors in FILE (a donor GGUF). Measurement
      * aid for per-layer quant-format KL probes (the prisma allocator, archived at tag archive/gguf-tooling-2026-09-24). */
@@ -298,6 +303,10 @@ void pulsar_engine_spec_metrics(pulsar_engine *e, pulsar_spec_metrics *out);
  * KV files with the previously-zero reserved byte remain Flash-compatible;
  * Pro and later shapes must use nonzero ids. */
 int pulsar_engine_model_id(pulsar_engine *e);
+/** L280: the identity a disk-KV segment store is opened with (pulsar_segstore_identity): the model id, the routed
+ *  experts' format and the rope the loaded positions run (the family's rope_id -- Qwen under YaRN).  The one
+ *  answer every store opener asks; a store of another identity is not indexed. */
+uint32_t pulsar_engine_kv_identity(pulsar_engine *e);
 /** True when the loaded model is expert-pruned (REAP compact: some layers carry
  * fewer physical routed experts than the architecture's n_expert). Fidelity
  * tests against full-model reference vectors are meaningless when true. */
@@ -1120,6 +1129,8 @@ int pulsar_session_restore_checkpoint(pulsar_session *s, int G, char *err, size_
  *  history), copied in -- src's pool rows below T, then its checkpoint -- so the installed bank stands at T with src's
  *  tokens to T as its view (and, at a prompt end that IS the prompt, its logits); the sync that follows prefills the
  *  rest, the cold prefill's bytes.  src may be busy (its rows below T never change while its history reaches T).
+ *  L322: "carries" is the token-seam match (pulsar_tokens_prefix_match, the route's and the own resume's), T a
+ *  boundary both spellings share; the sync re-stitches the prompt onto src's tokens there.
  *  A text history only.  @return T, 0 when src serves nothing (or holds an image block below it), -1 with `err` on a
  *  refusal (a tensor-parallel engine, not another bank, a copy that failed: the installed bank then describes no
  *  position and must be synced from nothing). */
@@ -1309,21 +1320,28 @@ int pulsar_session_save_payload(pulsar_session *s, FILE *fp, char *err, size_t e
 int pulsar_session_load_payload(pulsar_session *s, FILE *fp, uint64_t payload_bytes, char *err, size_t errlen);
 int pulsar_session_save_snapshot(pulsar_session *s, pulsar_session_snapshot *snap, char *err, size_t errlen);
 
-/** L264 S4: a disk SEGMENT -- the tokens [G_prev, G), every kv source's
- * compressed and index-K rows for those positions, and the grid checkpoint at G
- * (G_prev and G are grid points; G_prev may be 0).  A chain of segments from
- * position 0 rebuilds a bank exactly at its last G, which is how the server's
- * disk cache persists a conversation: each new prefill adds the segments past the
- * chain's last one, so a write costs the new tokens, not the whole history.
- *   save: the installed bank must hold the history to G and its checkpoint at G.
+/** L264 S4: a disk SEGMENT -- the tokens [G_prev, G), every append-only pool's
+ * rows for those positions (DeepSeek: every kv source's compressed and index-K
+ * rows), and -- when the installed bank holds it -- the grid checkpoint at G
+ * (G_prev and G are grid points, G_prev may be 0, and no image block lies across
+ * either).  A chain of segments from position 0 rebuilds a bank exactly at its
+ * last G, which is how the server's disk cache persists a conversation: each new
+ * prefill adds the segments past the chain's last one, so a write costs the new
+ * tokens, not the whole history.
+ *   save: the installed bank must hold the history and its rows to G; the state
+ *         at G is written iff the bank holds its checkpoint there (L323).
  *   load: the installed bank must stand at G_prev (a root, G_prev 0, resets it).
- *         Every segment's checkpoint is kept; `last` restores the final one, so
- *         the bank stands LIVE at G and the next sync evaluates from there. */
+ *         L323: only `last` reads the segment's state and restores it (refused
+ *         when the segment carries none), so the bank stands LIVE at G and the
+ *         next sync evaluates from there; an earlier segment's rows are read and
+ *         its state skipped -- the bank keeps the one checkpoint at the end. */
 #define PULSAR_SESSION_SEGMENT_MAGIC UINT32_C(0x31474553) /* "SEG1" */
 /* v2 (L265): the header names the state layout by a digest (the model's state ops) instead of
  * DeepSeek's strides; v1 segments are refused and the chain rewrites itself. */
-#define PULSAR_SESSION_SEGMENT_VERSION UINT32_C(5)   /* v3 (L281): the span's image block records; v4 (L268): with each block's 2D grid; v5 (L292): NVFP4 KV rows from IEEE divides -- v4 rows differ in a few codes, so they are refused and rewritten */
-uint64_t pulsar_session_segment_bytes(pulsar_session *s, int G_prev, int G);
+#define PULSAR_SESSION_SEGMENT_VERSION UINT32_C(6)   /* v3 (L281): the span's image block records; v4 (L268): with each block's 2D grid; v5 (L292): NVFP4 KV rows from IEEE divides -- v4 rows differ in a few codes, so they are refused and rewritten; v6 (L323): the state is optional and last, behind its own digest (header word 8 flags it), so a load reads rows + one state */
+/** The bytes pulsar_session_save_segment writes for [G_prev, G) (0: not a segment span), and in *state_bytes (may be
+ *  NULL) the trailing part a load of a non-last segment skips: the state at G and its digest (0 = rows only). */
+uint64_t pulsar_session_segment_bytes(pulsar_session *s, int G_prev, int G, uint64_t *state_bytes);
 /** `key`: the segment's store key (pulsar_segstore_child_key).  Off a TP group
  *  it is unused (NULL is fine); on one it names every worker's own copy, and
  *  save and load are mirrored verdicts whose disagreement is a miss on every

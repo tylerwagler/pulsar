@@ -145,6 +145,7 @@ static bool same_config(const pulsar_engine_options *a, const pulsar_engine_opti
     return same_str(a->model_path, b->model_path) &&
            same_str(a->drafter, b->drafter) &&
            a->dspark_disable == b->dspark_disable &&
+           a->rope_yarn_factor == b->rope_yarn_factor &&   /* L280: another rope is another model */
            same_str(a->expert_overlay, b->expert_overlay) &&
            a->backend == b->backend &&
            prefill_chunk_resolved(a->prefill_chunk) == prefill_chunk_resolved(b->prefill_chunk) &&

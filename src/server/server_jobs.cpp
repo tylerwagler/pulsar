@@ -1667,6 +1667,8 @@ void server::gen_step_finish(session_slot *sl) {
          * without scraping every response. */
         s->observe_request_timings(t, finish_t - g->t0);
     }
+    /* L324: the pool's duplicate-prefix census at each request's end (host carries only, off the decode path) */
+    s->kv_dup_census_update();
 
     bool tool_open = false, tool_closed = false;
     if (g->parser->tool_progress) g->parser->tool_progress(g->parser_st, &tool_open, &tool_closed);

@@ -287,7 +287,7 @@ pulsar-agent: $(AGENT_OBJS) src/lib/pulsar_help.o src/lib/pulsar_kvtext.o src/li
 # S4 (router / MoE / GR / PLE) beside DeepSeek's and the shared EXL3 arms.
 CUDA_REGRESSION_BINS = tests/cuda_long_context_smoke tests/moe_route_bounds_gate tests/expert_table_gate \
                        tests/exl3_moe_epilogue_gate tests/exl3_dense_gate tests/exl3_moe_prefill_gate tests/exl3_half_gate \
-                       tests/gdn_gate tests/qsa_attn_gate tests/qwen_s4_gate tests/router_gate tests/gqa_attn_gate tests/sconv_gate tests/head_gate \
+                       tests/gdn_gate tests/qsa_attn_gate tests/qsa_yarn_test tests/qwen_s4_gate tests/router_gate tests/gqa_attn_gate tests/sconv_gate tests/head_gate \
                        tests/bf16_rows_gate tests/nvfp4_rows_gate tests/mamba2_gate tests/rowops_gate
 # 2026-10-14: they run CONCURRENTLY, each one's output kept together (-O).  They are model-free and mostly
 # host-bound (their references run on the CPU: measured alone, 258 s in series, the longest 114 s of which 113 s
@@ -833,6 +833,18 @@ tests/qsa_attn_gate: tests/qsa_attn_gate.cu Makefile src/pulsar_gpu.h src/cuda/p
 .PHONY: qsa-attn-gate
 qsa-attn-gate: tests/qsa_attn_gate
 	./tests/qsa_attn_gate
+
+# L280: the QSA rope table (native and YaRN) against transformers' own rope init, element-wise
+# (tests/qsa_yarn_golden.h, made by tools/qwen/yarn_golden.py).  Host only; links the production objects
+# for pulsar_qsa_rope_init.
+tests/qsa_yarn_test: tests/qsa_yarn_test.cu tests/qsa_yarn_golden.h Makefile src/pulsar_gpu.h src/lib/pulsar_yarn.h \
+                     $(CUDA_OBJS) $(CUTLASS_CUDA_OBJS) $(MMQ_OBJS)
+	$(NVCC) $(NVCCFLAGS) -std=c++17 -Isrc -Isrc/cuda -Itests -o $@ tests/qsa_yarn_test.cu \
+	        $(CUDA_OBJS) $(CUTLASS_CUDA_OBJS) $(MMQ_OBJS) $(CUDA_LDLIBS)
+
+.PHONY: qsa-yarn-test
+qsa-yarn-test: tests/qsa_yarn_test
+	./tests/qsa_yarn_test
 
 # L251 S3: replay one real attention layer's captured projections through the
 # same entry point, for the offline grade against transformers (see the tool's
@@ -2047,8 +2059,8 @@ prefix-turns-live-gate: pulsar-server
 	python3 tests/prefix_turns_live.py $(PREFIX_TURNS_LIVE_MODEL) --binary ./pulsar-server \
 	  --work $(PREFIX_TURNS_LIVE_WORK) --tag gate --reply 600
 # L317: the battery's live legs on ONE server per model (tests/live_legs.py): constrained-live, server-live and the
-# abandon leg on DeepSeek and Qwen, the L312 stall check, prefix-turns (L316's gate and the side shape), preempt-exact and
-# (L318) resume-deepest on Qwen,
+# abandon leg on DeepSeek and Qwen, the L312 stall check, prefix-turns (L316's gate and the side shape), preempt-exact,
+# (L318) resume-deepest and (L322) sidecall-turns on Qwen,
 # opencode-turns on Nemotron's LiLiCorr pack.  Per model: the shared server, then -- only if a leg needs it -- one
 # instance with the test hooks (the injected grammar failure, the KV-budget override), then one fresh instance for
 # every leg's reuse == cold reference.  Each leg keeps its own checks and PASS/FAIL; the targets above still run a
@@ -2090,6 +2102,25 @@ RESUME_LIVE_WORK ?= $(or $(TMPDIR),/var/tmp)/pulsar-l318-$(USER)
 .PHONY: resume-deepest-live
 resume-deepest-live: pulsar-server
 	python3 tests/resume_deepest_live.py $(RESUME_LIVE_MODEL) --binary ./pulsar-server --work $(RESUME_LIVE_WORK)
+
+# L322: Claude Code's SUGGESTION MODE side call extends a conversation's bank; the next real turn routes in place on
+# that bank, rewinds to its own checkpoint below the divergence and prefills the delta (not a fresh bank + a disk
+# chain), and stays reuse == cold against a fresh server.  The Qwen pack, 4 banks, 64k; two loads, ~3 min.  The battery
+# runs it as a leg of live-legs; gates-dev runs it on a routing / kv path.
+SIDECALL_LIVE_WORK ?= $(CURDIR)/.build/sidecall-turns-live
+.PHONY: sidecall-turns-live
+sidecall-turns-live: pulsar-server
+	sync; sudo -n sh -c "echo 3 > /proc/sys/vm/drop_caches" 2>/dev/null; \
+	python3 tests/sidecall_turns_live.py $(RESUME_LIVE_MODEL) --binary ./pulsar-server --work $(SIDECALL_LIVE_WORK)
+
+# L324: the duplicate-prefix census (/metrics pulsar:kv_dup_*): three fan-out siblings sharing a ~14k-token system
+# prompt, each on a fresh bank that adopts the prefix, show their shared pages as duplicates.  The Qwen pack, 4 banks,
+# 64k; one load, ~2 min.  The battery runs it as a leg of live-legs (Qwen, Nemotron); gates-dev on a routing / kv path.
+KV_DUP_LIVE_WORK ?= $(CURDIR)/.build/kv-dup-live
+.PHONY: kv-dup-live
+kv-dup-live: pulsar-server
+	sync; sudo -n sh -c "echo 3 > /proc/sys/vm/drop_caches" 2>/dev/null; \
+	python3 tests/kv_dup_live.py $(RESUME_LIVE_MODEL) --binary ./pulsar-server --work $(KV_DUP_LIVE_WORK)
 
 cuda-spec-width-gate: pulsar
 	python3 tests/spec_verify_width_gate.py $(FRONTIER_MODEL) --binary ./pulsar
@@ -2338,13 +2369,13 @@ RUNNER_GATES = multiseq_frontier_gate rewind_frontier_gate mseq_rewind_probe tok
                decode_reference_gate session_contract_gate chat_decode_smoke head_graph_replay_gate \
                sync_budget_gate scratch_poison_gate mtp_spec_gate bank_adopt_gate
 RUNNER_OBJS = $(RUNNER_GATES:%=tests/runner/%.o)
-tests/runner/%.o: tests/%.cpp tests/gate_entry.h tests/gate_fixture.h tests/gate_util.h src/pulsar.h src/pulsar_gpu.h src/engine/pulsar_engine_internal.h src/lib/pulsar_segstore.h
+tests/runner/%.o: tests/%.cpp tests/gate_entry.h tests/gate_fixture.h tests/gate_util.h src/pulsar.h src/pulsar_gpu.h src/engine/pulsar_engine_internal.h src/lib/pulsar_segstore.h src/lib/pulsar_kvchain.h
 	@mkdir -p tests/runner
 	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -Isrc/engine -DPULSAR_GATE_RUNNER -DGATE_ENTRY=gate_$*_main \
 		-DPULSAR_GATE_BUILD_REF='"$(GATE_BUILD_REF)"' -c -o $@ $<
 tests/gates_runner.o: tests/gates_runner.cpp tests/gate_entry.h tests/gate_util.h src/pulsar.h src/engine/pulsar_engine_internal.h
 	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -Isrc/engine -c -o $@ tests/gates_runner.cpp
-tests/gates_runner: tests/gates_runner.o $(RUNNER_OBJS) src/lib/pulsar_help.o src/lib/pulsar_segstore.o $(CORE_OBJS)
+tests/gates_runner: tests/gates_runner.o $(RUNNER_OBJS) src/lib/pulsar_help.o src/lib/pulsar_segstore.o src/lib/pulsar_kvchain.o src/lib/pulsar_kvtext.o $(CORE_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 # The runner receives exactly what the individual targets passed: the prefill
 # baseline blob and its ref, the reference-capture dir (skips loudly when
@@ -2702,7 +2733,7 @@ gates-dev:
 	if [ $$poison -eq 1 ]; then printf '  scratch-poison-gate: selected (L307: the graphed lanes and their scratch, poisoned == unpoisoned on DeepSeek, DFlash2, LiLiCorr)\n'; fi; \
 	if [ $$server -eq 1 ]; then printf '  server: chat smoke + the --server/--api unit switches\n'; fi; \
 	if [ $$kvmem -eq 1 ]; then printf '  server-kv-headroom-live: selected (L319: the touched-KV ceiling is the measured headroom; admission / guard / bank paths)\n'; fi; \
-	if [ $$resume -eq 1 ]; then printf '  resume-deepest-live: selected (L318: routing / resume / disk-chain paths, Open WebUI shape on the Qwen pack)\n'; fi; \
+	if [ $$resume -eq 1 ]; then printf '  resume-deepest-live + sidecall-turns-live + kv-dup-live: selected (L318 / L322 / L324: routing / resume / disk-chain paths, the Open WebUI and the Claude Code side-call shapes and the fan-out duplicate census on the Qwen pack)\n'; fi; \
 	$(MAKE) --no-print-directory seam-check CUDA_ARCH=sm_120f || rc=1; \
 	$(MAKE) --no-print-directory cuda-reap-router-audit CUDA_ARCH=sm_120f \
 	      FRONTIER_MODEL="$(FRONTIER_MODEL)" || rc=1; \
@@ -2747,6 +2778,8 @@ gates-dev:
 	fi; \
 	if [ $$resume -eq 1 ]; then \
 	  $(MAKE) --no-print-directory resume-deepest-live CUDA_ARCH=sm_120f || rc=1; \
+	  $(MAKE) --no-print-directory sidecall-turns-live CUDA_ARCH=sm_120f || rc=1; \
+	  $(MAKE) --no-print-directory kv-dup-live CUDA_ARCH=sm_120f || rc=1; \
 	fi; \
 	if [ $$kvmem -eq 1 ]; then \
 	  $(MAKE) --no-print-directory server-kv-headroom-live CUDA_ARCH=sm_120f || rc=1; \
@@ -2871,7 +2904,7 @@ tests/accounting_gate.o: tests/accounting_gate.cpp src/engine/pulsar_engine_inte
 
 tests/comp_state_gate.o: tests/comp_state_gate.cpp src/engine/pulsar_engine_internal.h src/pulsar.h src/pulsar_gpu.h
 	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -Isrc/engine -c -o $@ tests/comp_state_gate.cpp
-tests/chunk_neutrality_gate.o: tests/chunk_neutrality_gate.cpp tests/gate_entry.h src/pulsar.h src/lib/pulsar_segstore.h
+tests/chunk_neutrality_gate.o: tests/chunk_neutrality_gate.cpp tests/gate_entry.h src/pulsar.h src/lib/pulsar_segstore.h src/lib/pulsar_kvchain.h
 	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -Isrc/engine -c -o $@ tests/chunk_neutrality_gate.cpp
 tests/vision_chunk_gate.o: tests/vision_chunk_gate.cpp tests/gate_entry.h src/pulsar.h src/engine/pulsar_engine_internal.h
 	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -Isrc/engine -c -o $@ tests/vision_chunk_gate.cpp
@@ -3059,7 +3092,7 @@ cuda-fixed-tile-probe: tests/fixed_tile_gemm_probe
 tests/accounting_gate: tests/accounting_gate.o src/lib/pulsar_help.o $(CORE_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
-tests/chunk_neutrality_gate: tests/chunk_neutrality_gate.o src/lib/pulsar_help.o src/lib/pulsar_segstore.o $(CORE_OBJS)
+tests/chunk_neutrality_gate: tests/chunk_neutrality_gate.o src/lib/pulsar_help.o src/lib/pulsar_segstore.o src/lib/pulsar_kvchain.o src/lib/pulsar_kvtext.o $(CORE_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 tests/vision_chunk_gate: tests/vision_chunk_gate.o src/lib/pulsar_help.o $(CORE_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
@@ -3142,6 +3175,20 @@ QWEN_GEN_N      ?= 32
 tests/qwen_generate.o: tests/qwen_generate.cpp
 	$(CXX) $(CXXFLAGS) -Isrc -Isrc/engine -c -o $@ $<
 tests/qwen_generate: tests/qwen_generate.o src/lib/pulsar_help.o $(CORE_OBJS)
+	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
+# L291 / L280: the teacher-forced depth walk -- windows ending at a depth, one engine load (tools/qwen/kv_grade.py
+# grades its outputs).  The K/V format and the rope are the engine's (--rope-yarn F passes the option).  Needs a
+# real container.
+tests/qwen_kv_walk.o: tests/qwen_kv_walk.cpp
+	$(CXX) $(CXXFLAGS) -Isrc -Isrc/engine -c -o $@ $<
+tests/qwen_kv_walk: tests/qwen_kv_walk.o src/lib/pulsar_help.o $(CORE_OBJS)
+	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
+# L280: the session mechanisms past the native 262,144 positions (resume, the disk chain, spec == plain, the
+# payload) at one depth, each against one cold prefill.  Not in the battery (two prefills at the depth: ~10 min at
+# 300K); needs a real container and a long token file.
+tests/qwen_deep_probe.o: tests/qwen_deep_probe.cpp
+	$(CXX) $(CXXFLAGS) -Isrc -Isrc/engine -c -o $@ $<
+tests/qwen_deep_probe: tests/qwen_deep_probe.o src/lib/pulsar_help.o $(CORE_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 tests/qwen_chat_smoke.o: tests/qwen_chat_smoke.cpp
 	$(CXX) $(CXXFLAGS) -Isrc -Isrc/engine -c -o $@ $<

@@ -485,6 +485,9 @@ bool server::send_metrics(int fd) {
     const kv_restore_meter disk_meter = s->kv.meter;   /* L310 */
     const unsigned long long preemptions = (unsigned long long)s->m_preemptions;    /* L314 */
     const unsigned long long readmissions = (unsigned long long)s->m_readmissions;
+    const kv_dup_census dup = s->m_dup;                                              /* L324 */
+    const unsigned long long dup_censuses = (unsigned long long)s->m_dup_censuses;
+    const unsigned long long dup_bytes_peak = (unsigned long long)s->m_dup_bytes_peak;
     uint64_t refusals[PROVISION_REFUSAL_COUNT];
     for (int i = 0; i < PROVISION_REFUSAL_COUNT; i++) refusals[i] = s->m_refusals[i];
     const int block_reason = s->m_queue_block_reason;
@@ -789,6 +792,48 @@ bool server::send_metrics(int fd) {
     buf_puts(&b, "# HELP pulsar:decoder_readmissions_total Preempted decoders reloaded and decoding again.\n");
     buf_puts(&b, "# TYPE pulsar:decoder_readmissions_total counter\n");
     buf_printf(&b, "pulsar:decoder_readmissions_total %llu\n", readmissions);
+
+    /* L324: the duplicate-prefix census of the resident banks (server::kv_dup_census_update, at each request's
+     * end): whole grid pages held by more than one bank, what the extra copies cost, and how deep pairs share --
+     * the evidence for (or against) sharing prefix pages in GPU memory. */
+    buf_puts(&b, "# HELP pulsar:kv_dup_page_tokens Tokens per page of the duplicate census (the disk grid, L323).\n");
+    buf_puts(&b, "# TYPE pulsar:kv_dup_page_tokens gauge\n");
+    buf_printf(&b, "pulsar:kv_dup_page_tokens %d\n", dup.grid);
+    buf_puts(&b, "# HELP pulsar:kv_dup_page_bytes GPU KV bytes one bank holds for one page.\n");
+    buf_puts(&b, "# TYPE pulsar:kv_dup_page_bytes gauge\n");
+    buf_printf(&b, "pulsar:kv_dup_page_bytes %llu\n", (unsigned long long)dup.page_bytes);
+    buf_puts(&b, "# HELP pulsar:kv_dup_banks Resident banks holding at least one whole page.\n");
+    buf_puts(&b, "# TYPE pulsar:kv_dup_banks gauge\n");
+    buf_printf(&b, "pulsar:kv_dup_banks %d\n", dup.banks);
+    buf_puts(&b, "# HELP pulsar:kv_dup_pages_resident Whole pages held, summed over resident banks.\n");
+    buf_puts(&b, "# TYPE pulsar:kv_dup_pages_resident gauge\n");
+    buf_printf(&b, "pulsar:kv_dup_pages_resident %llu\n", (unsigned long long)dup.pages_resident);
+    buf_puts(&b, "# HELP pulsar:kv_dup_pages_distinct Distinct pages among them (a page two banks share by token prefix counts once).\n");
+    buf_puts(&b, "# TYPE pulsar:kv_dup_pages_distinct gauge\n");
+    buf_printf(&b, "pulsar:kv_dup_pages_distinct %llu\n", (unsigned long long)dup.pages_distinct);
+    buf_puts(&b, "# HELP pulsar:kv_dup_pages_shared Distinct pages held by two or more resident banks.\n");
+    buf_puts(&b, "# TYPE pulsar:kv_dup_pages_shared gauge\n");
+    buf_printf(&b, "pulsar:kv_dup_pages_shared %llu\n", (unsigned long long)dup.pages_shared);
+    buf_puts(&b, "# HELP pulsar:kv_dup_pages_duplicate Extra page copies (resident minus distinct).\n");
+    buf_puts(&b, "# TYPE pulsar:kv_dup_pages_duplicate gauge\n");
+    buf_printf(&b, "pulsar:kv_dup_pages_duplicate %llu\n", (unsigned long long)dup.pages_duplicate);
+    buf_puts(&b, "# HELP pulsar:kv_dup_bytes GPU KV bytes the extra page copies cost.\n");
+    buf_puts(&b, "# TYPE pulsar:kv_dup_bytes gauge\n");
+    buf_printf(&b, "pulsar:kv_dup_bytes %llu\n", (unsigned long long)dup.dup_bytes);
+    buf_puts(&b, "# HELP pulsar:kv_dup_bytes_peak The largest kv_dup_bytes any census saw since start.\n");
+    buf_puts(&b, "# TYPE pulsar:kv_dup_bytes_peak gauge\n");
+    buf_printf(&b, "pulsar:kv_dup_bytes_peak %llu\n", dup_bytes_peak);
+    buf_printf(&b, "# HELP pulsar:kv_dup_pairs Resident bank pairs sharing at least one whole page, by depth class (preamble: under %d shared tokens).\n", PULSAR_KV_DUP_DEEP_TOKENS);
+    buf_puts(&b, "# TYPE pulsar:kv_dup_pairs gauge\n");
+    buf_printf(&b, "pulsar:kv_dup_pairs{class=\"preamble\"} %d\n", dup.pairs[0]);
+    buf_printf(&b, "pulsar:kv_dup_pairs{class=\"deep\"} %d\n", dup.pairs[1]);
+    buf_puts(&b, "# HELP pulsar:kv_dup_longest_shared_tokens The longest shared token prefix of a resident bank pair, by depth class.\n");
+    buf_puts(&b, "# TYPE pulsar:kv_dup_longest_shared_tokens gauge\n");
+    buf_printf(&b, "pulsar:kv_dup_longest_shared_tokens{class=\"preamble\"} %d\n", dup.longest[0]);
+    buf_printf(&b, "pulsar:kv_dup_longest_shared_tokens{class=\"deep\"} %d\n", dup.longest[1]);
+    buf_puts(&b, "# HELP pulsar:kv_dup_censuses_total Duplicate censuses taken (one at each request's end).\n");
+    buf_puts(&b, "# TYPE pulsar:kv_dup_censuses_total counter\n");
+    buf_printf(&b, "pulsar:kv_dup_censuses_total %llu\n", dup_censuses);
 
     /* L310: the disk tier's restore-vs-recompute -- what each hit decided, the measured read rate it priced the
      * read with, the last decision's two prices, and the tokens each side carried. */

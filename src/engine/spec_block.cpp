@@ -57,6 +57,24 @@ bool want_bool(const pulsar_model *m, const char *key, bool want) {
     return true;
 }
 
+/* L280: the GQA block runs the native NeoX rope at the drafter's own base (rope_theta), at the target's absolute
+ * positions -- the HF reference's rope.  A config that declares another rope type (YaRN, linear, ...) under `key`
+ * describes a rope that would not run, so it refuses; an absent key is the native rope. */
+bool want_native_rope(const pulsar_model *m, const char *key) {
+    bool present = false;
+    for (uint64_t i = 0; i < m->n_kv && !present; i++) present = pulsar_streq(m->kv[i].key, key);
+    if (!present) return true;
+    pulsar_str v = {NULL, 0};
+    if (!model_get_string(m, key, &v)) return refuse("%s is not a string%s", key);
+    if (!pulsar_streq(v, "default")) {
+        fprintf(stderr, "pulsar: block drafter: %s = '%.*s': the block runs the native rope only -- refusing\n", key,
+                (int)v.len, v.ptr);
+        pulsar_load_refuse();
+        return false;
+    }
+    return true;
+}
+
 /* an array of unsigned block ids */
 bool get_ids(const pulsar_model *m, const char *key, uint32_t *out, uint32_t cap, uint32_t *n) {
     pulsar_array_ref arr;
@@ -98,6 +116,7 @@ struct kind_decl {
     const char *mask, *conv_taps, *conv_group, *window, *topk, *taps;
     const char *non_causal;   /* a bool key that must be false: bidirectional inside the block */
     const char *swa;          /* a bool key that must be true: every layer windowed over the context */
+    const char *rope_type;    /* L280: where the config names its rope type; absent or "default" = the native rope */
 };
 
 /* LiLiCorr (L298): vLLM's lilicorr config; tau measured (L298, the l297 bench single stream T0, the priced width on):
@@ -112,12 +131,13 @@ const kind_decl k_kinds[] = {
      "num_attention_heads", "num_key_value_heads", "head_dim", "intermediate_size", "vocab_size", "block_size",
      "rms_norm_eps", "rope_theta", "dflash.mask_token_id", "dflash.conv_kernel_size", "dflash.conv_group_size",
      "dflash.swa_window_size", "dflash.lilicorr_candidate_topk", "dflash.target_layer_ids", "dflash.causal",
-     "dflash.use_swa"},
+     "dflash.use_swa", "rope_scaling.rope_type"},
     {"dflash2", PULSAR_BLOCK_HEAD_SELECTOR, 0.5f, "hidden_size", "num_hidden_layers",
      "num_attention_heads", "num_key_value_heads", "head_dim", "intermediate_size", "vocab_size",
      "dflash_config.block_size", "rms_norm_eps", "rope_parameters.rope_theta", "dflash_config.mask_token_id",
      "dflash_config.conv_kernel_size", "dflash_config.conv_group_size", "sliding_window",
-     "dflash_config.selector_top_k", "dflash_config.target_layer_ids", "is_causal", "use_sliding_window"},
+     "dflash_config.selector_top_k", "dflash_config.target_layer_ids", "is_causal", "use_sliding_window",
+     "rope_parameters.rope_type"},
 };
 const kind_decl *kind_find(const char *kind) {
     for (const kind_decl &k : k_kinds)
@@ -189,6 +209,7 @@ bool pulsar_block_drafter_read(const pulsar_model *m, pulsar_block_drafter *d) {
     ok = get_u32(m, kkey(kd, K->topk), &d->topk) && ok;
     ok = want_bool(m, kkey(kd, K->non_causal), false) && ok;   /* bidirectional inside the block */
     ok = want_bool(m, kkey(kd, K->swa), true) && ok;           /* every layer windowed over the context */
+    ok = want_native_rope(m, kkey(kd, K->rope_type)) && ok;   /* L280: the drafter's own rope, never the target's */
     ok = get_ids(m, kkey(kd, K->taps), d->tap_block, PULSAR_BLOCK_MAX_TAPS, &d->n_taps) && ok;
     if (!ok) return false;
     /* the numbers the blocks implement (the shared GQA block's tiles, the round record, the top-k kernel) */

@@ -28,6 +28,10 @@ bool load(pulsar_engine *e, const pulsar_engine_options *opt) {
         fprintf(stderr, "pulsar: %s: directional steering is not implemented for this family; refusing\n", ARCH);
         return false;
     }
+    if (opt->rope_yarn_factor != 0.0) {
+        fprintf(stderr, "pulsar: %s: --rope-yarn: this family's trunk has no rope to scale; refusing\n", ARCH);
+        return false;
+    }
     pulsar_nemotron_h_model *w = (pulsar_nemotron_h_model *)xcalloc(1, sizeof(*w));
     e->family_state = w;   /* unload frees it, whatever this load's verdict */
     pulsar_load_refusals_reset();   /* the loader's one failure policy (family.cpp) */
@@ -214,6 +218,7 @@ const pulsar_family PULSAR_FAMILY_NEMOTRON_H = {
     /* .chat_format  = */ chat_format,
     /* .model_id     = */ model_id,
     /* .trained_ctx  = */ trained_context,
+    /* .rope_id      = */ pulsar_family_rope_fixed,
     /* .tp_shape     = */ NULL,   /* no CAP_TP: the open refuses tensor parallelism before it would ask */
     /* .drafter      = */ drafter,
     /* .quant_bits   = */ quant_bits,

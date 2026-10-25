@@ -148,8 +148,7 @@ bool agent_session_file_read(const char *path, agent_session_file *f, char *err,
 bool agent_kv_open(agent_worker *w) {
     char *dir = pulsar_kvtext_path_join(w->cache_dir, "segments");
     w->kv = pulsar_segstore_open(dir, (uint64_t)AGENT_KV_BUDGET_MB << 20,
-                                 pulsar_segstore_identity((uint32_t)pulsar_engine_model_id(w->engine),
-                                                          (uint32_t)pulsar_engine_routed_quant_bits(w->engine)),
+                                 pulsar_engine_kv_identity(w->engine),
                                  NULL, NULL);
     if (!w->kv)
         fprintf(stderr, "pulsar-agent: KV cache %s unusable; sessions save without cached KV\n", dir);
@@ -219,7 +218,7 @@ void agent_kv_system_tip(agent_worker *w, char tip[41]) {
     size_t text_len = 0;
     char *text = pulsar_kvtext_render_tokens_text(w->engine, &sys, &text_len);
     pulsar_segstore_seg chain[PULSAR_KVCHAIN_MAX];
-    const int n = text ? pulsar_segstore_lookup(w->kv, text, text_len, chain, PULSAR_KVCHAIN_MAX) : 0;
+    const int n = text ? pulsar_segstore_lookup(w->kv, text, text_len, NULL, chain, PULSAR_KVCHAIN_MAX) : 0;
     if (n > 0) memcpy(tip, chain[n - 1].key, 41);
     free(text);
     pulsar_tokens_free(&sys);

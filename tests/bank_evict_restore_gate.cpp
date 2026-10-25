@@ -10,8 +10,9 @@
  *   1. prefill bank 0 to L tokens; capture its frontier; CHECKSUM its comp/index
  *      rows (raw D2H fold).
  *   2. save bank 0 as a chain of SEGMENTS, one per grid checkpoint it holds
- *      (server: kv_cache_persist "spill" ends segments at a chunk-spaced subset
- *      of them, pulsar_kvchain_segment_ends; every one here is the stricter test).
+ *      (server: kv_cache_persist "spill" cuts on the canonical disk grid plus a
+ *      tail, pulsar_kvchain_segment_ends -- L323; every checkpoint here is the
+ *      stricter test, and the load reads every segment's rows, the last one's state).
  *   3. repoint to bank 1       -- bank 0 is now idle (free_physical refuses cur).
  *   4. free_physical(bank 0)   -- DIRECT cudaFree of bank 0's split comp/index;
  *      assert is_evicted==true.  The cudaMemGetInfo delta is PRINTED, not
@@ -146,7 +147,7 @@ static int save_chain(pulsar_session *s, int limit, FILE **fp, uint64_t *bytes, 
     for (int i = 0, prev = 0; i < n; prev = Gs[i], i++) {
         Gs[i] = desc[n - 1 - i];
         fp[i] = tmpfile();
-        bytes[i] = pulsar_session_segment_bytes(s, prev, Gs[i]);
+        bytes[i] = pulsar_session_segment_bytes(s, prev, Gs[i], NULL);
         if (!fp[i] || pulsar_session_save_segment(s, fp[i], prev, Gs[i], NULL, err, errlen) != 0) {
             for (int k = 0; k <= i; k++) if (fp[k]) fclose(fp[k]);
             return 0;
@@ -315,7 +316,7 @@ int GATE_ENTRY(int argc, char **argv) {
           if (!fp) break;
           if (leg == 0) fwrite(seg, 1, nb / 2, fp);
           else {
-              seg[nb - sizeof(uint64_t) - 1] ^= 0x40u;   /* the last row byte before the digest */
+              seg[nb - sizeof(uint64_t) - 1] ^= 0x40u;   /* the last byte before the final digest: the state's (L323) */
               fwrite(seg, 1, nb, fp);
           }
           rewind(fp);

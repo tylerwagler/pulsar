@@ -27,6 +27,11 @@
  *       query/gate order swapped, interleaved RoPE pairs, w in place of 1 + w,
  *       the tie rule reversed, the tail dropped, pooling after the norm, the
  *       block key roped at the block's end, one cache byte flipped.
+ *   G10 L280 YaRN x4: fixture A's rows at rope positions up to ~1M (the mRoPE
+ *       table carries them, so the cache stays 3000 rows) -- G1, block keys,
+ *       G2, G4 and decode == prefill under the YaRN table and attention factor;
+ *       the native frequencies, and YaRN without its factor, must be caught;
+ *       pulsar_qsa_rope_init refuses the degenerate parameters.
  *
  * usage: qsa_attn_gate            (needs a device; ~1-2 min on GB10) */
 #include "pulsar_gpu.h"
@@ -112,9 +117,15 @@ void gen_row(int fix, uint32_t pos, float *qg, float *k, float *v, float *idx) {
 struct Mut {
     bool swap_qg = false, rope_interleaved = false, plain_w = false, tie_high = false,
          no_tail = false, pool_after_norm = false, bkey_rope_end = false,
-         mrope_sectioned = false;   /* L268: the axes as contiguous 11/11/10 sections, not HF's interleave */
+         mrope_sectioned = false,   /* L268: the axes as contiguous 11/11/10 sections, not HF's interleave */
+         yarn_native_freq = false,  /* L280: the native frequencies under a YaRN rope ... */
+         yarn_no_mscale = false;    /* ... and YaRN's frequencies without its attention factor on cos / sin */
 };
-float g_inv[PULSAR_QSA_ROT_DIM / 2];
+/* L280: the rope every call passes (pulsar_qsa_io::rope) and the reference reads -- the native rope, except while
+ * G10 runs YaRN -- and the native one, for the mutation that forgets YaRN's frequencies. */
+pulsar_qsa_rope g_rope, g_native;
+double ref_inv(uint32_t i, const Mut &m) { return (m.yarn_native_freq ? g_native : g_rope).inv_freq[i]; }
+double ref_mscale(const Mut &m) { return m.yarn_no_mscale ? 1.0 : (double)g_rope.mscale; }
 /* L268 G9: the (T, H, W) rope position of every token while a check runs an image layout (NULL = text: the token's
  * position on every axis).  The reference reads it here; run() hands the kernel the same table. */
 const std::vector<std::array<uint32_t, 3>> *g_rope3 = nullptr;
@@ -135,8 +146,8 @@ void ref_norm_rope(double *x, uint32_t n, const float *w, uint32_t pos, const Mu
     for (uint32_t i = 0; i < n; i++) x[i] = x[i] * r * (m.plain_w ? (double)w[i] : 1.0 + (double)w[i]);
     if (!rope) return;
     for (uint32_t i = 0; i < PULSAR_QSA_ROT_DIM / 2; i++) {
-        const float ang = (float)ref_rope_pos(pos, i, m) * g_inv[i];   /* the f32 angle transformers forms */
-        const double c = cos((double)ang), s = sin((double)ang);
+        const float ang = (float)ref_rope_pos(pos, i, m) * (float)ref_inv(i, m);   /* the f32 angle transformers forms */
+        const double c = cos((double)ang) * ref_mscale(m), s = sin((double)ang) * ref_mscale(m);
         const uint32_t a = m.rope_interleaved ? 2 * i : i, b = m.rope_interleaved ? 2 * i + 1 : i + 32;
         const double x0 = x[a], x1 = x[b];
         x[a] = x0 * c - x1 * s;
@@ -290,6 +301,7 @@ void call(std::vector<Seq> &seqs, const std::vector<Piece> &pieces,
             }
         io.row_rope = rope.data();
     }
+    io.rope = &g_rope;
     if (!pulsar_gpu_qsa_forward(&L, sd.data(), (uint32_t)sd.size(), rs.data(), rp.data(), n, &io, d.ws)) {
         printf("FAIL  pulsar_gpu_qsa_forward refused\n");
         exit(1);
@@ -391,8 +403,8 @@ std::vector<double> host_bkey(int fix, uint32_t b, const Mut &m) {
     if (m.pool_after_norm) {   /* rope only: the norm already ran per token */
         std::vector<double> y = x;
         for (uint32_t i = 0; i < PULSAR_QSA_ROT_DIM / 2; i++) {
-            const float ang = (float)(4 * b) * g_inv[i];
-            const double c = cos((double)ang), s = sin((double)ang);
+            const float ang = (float)(4 * b) * (float)ref_inv(i, m);
+            const double c = cos((double)ang) * ref_mscale(m), s = sin((double)ang) * ref_mscale(m);
             y[i] = x[i] * c - x[i + 32] * s;
             y[i + 32] = x[i + 32] * c + x[i] * s;
         }
@@ -562,7 +574,8 @@ SelStats check_selection(const Seq &s, const Run &R, const std::vector<uint32_t>
 int main() {
     if (!pulsar_gpu_init()) { printf("no device\n"); return 2; }
     gen_norms();
-    pulsar_qsa_inv_freq(g_inv);
+    if (!pulsar_qsa_rope_init(&g_native, NULL)) { printf("FAIL  the native rope refused\n"); return 1; }
+    g_rope = g_native;
     const uint32_t TA = 3000, TT = 2600, TB = 40000;
     dev_init(2048, TB + 4);
     printf("qsa_attn_gate: fixtures A %u tok, T %u tok (ties), B %u tok\n", TA, TT, TB);
@@ -814,6 +827,85 @@ int main() {
         g_rope3 = nullptr;
     }
 
+    printf("G10 YaRN x4 over 262144 (L280): fixture A at rope positions %u.. (its KV rows 0..%u), and the refusals\n",
+           1048576u - TA - 1000u, TA - 1u);
+    {
+        const pulsar_qsa_yarn y4{4.0, 262144u, 32.0, 1.0};
+        CHECK(pulsar_qsa_rope_init(&g_rope, &y4) == 1 && g_rope.mscale > 1.13f && g_rope.mscale < 1.14f,
+              "the YaRN table (graded element-wise against transformers by qsa_yarn_test): mscale %.9g",
+              (double)g_rope.mscale);
+        /* the rope positions end 1000 short of 1M: the angles the 1M lane takes, on a 3000-row cache */
+        const uint32_t off = 1048576u - TA - 1000u;
+        std::vector<std::array<uint32_t, 3>> lay(TA);
+        for (uint32_t p = 0; p < TA; p++) lay[p] = {p + off, p + off, p + off};
+        g_rope3 = &lay;
+        Run Y = run(SA, chunks(0, TA, {1000}), all);
+        {
+            std::vector<uint64_t> bad(TA), allow(TA);
+            par_for(TA, [&](size_t p) { Tok t = host_tok(FIX_A, (uint32_t)p, Mut()); bad[p] = check_encode(&Y.kv[0][p * REC], t, &allow[p]); });
+            uint64_t nb = 0, na = 0;
+            for (uint32_t p = 0; p < TA; p++) { nb += bad[p]; na += allow[p]; }
+            CHECK(nb == 0, "K/V E4M3/MX32 under YaRN: %llu unexplained of %llu elements (%llu at a midpoint)",
+                  (unsigned long long)nb, (unsigned long long)TA * 1024, (unsigned long long)na);
+        }
+        auto bkey_over = [&](const Mut &m) {
+            uint64_t over = 0;
+            for (uint32_t b = 0; b < TA / 4; b++) {
+                std::vector<double> x = host_bkey(FIX_A, b, m);
+                double rms = 0;
+                for (double v : x) rms += v * v;
+                rms = sqrt(rms / ID);
+                for (uint32_t d = 0; d < ID; d++) {
+                    uint16_t u;
+                    memcpy(&u, &Y.bkey[0][(size_t)b * PULSAR_QSA_BKEY_BYTES + d * 2], 2);
+                    if (fabs(bf16_to_d(u) - x[d]) > ldexp(fabs(x[d]), -8) + 1e-6 * rms) over++;
+                }
+            }
+            return over;
+        };
+        CHECK(bkey_over(Mut()) == 0, "indexer block keys under YaRN: within one bf16 rounding of the double reference");
+        {
+            SelStats st = check_selection(SA[0], Y, sel_rows, Mut(), 1e-5);
+            CHECK(st.bad_rows == 0 && st.identical * 10 >= st.rows * 9,
+                  "selection under YaRN: %llu rows, %llu identical, %llu near-tie, %llu wrong",
+                  (unsigned long long)st.rows, (unsigned long long)st.identical,
+                  (unsigned long long)st.near_tie_rows, (unsigned long long)st.bad_rows);
+        }
+        auto worst_out = [&](const Mut &m) {
+            std::vector<double> err(out_rows.size());
+            par_for(out_rows.size(), [&](size_t i) { err[i] = check_row_out(SA[0], Y.kv[0], out_rows[i], Y.outs[0][out_rows[i]], m); });
+            return *std::max_element(err.begin(), err.end());
+        };
+        const double w = worst_out(Mut());
+        CHECK(w <= g4_bar, "gated output under YaRN: %zu rows, max rel err %.3g (bar %.0e)", out_rows.size(), w, g4_bar);
+        {
+            auto none = [](uint32_t, uint32_t) { return false; };
+            Run D = run(SA, chunks(0, TA, {1, 2, 3, 5, 7, 513, 1027, 2, 900, 11}), none);
+            same_run(Y, D, 0, TA, "YaRN decode == prefill: odd chunks 1,2,3,5,7,513,...");
+        }
+        {
+            uint64_t same = 0;
+            for (uint32_t p = 0; p < TA; p++) same += memcmp(&Y.kv[0][(size_t)p * REC], &A.kv[0][(size_t)p * REC], REC) == 0;
+            CHECK(same == 0, "YaRN moved every token's K record off the native rope's (%llu of %u identical)",
+                  (unsigned long long)same, TA);
+        }
+        Mut mn, mm;
+        mn.yarn_native_freq = true;
+        mm.yarn_no_mscale = true;
+        CHECK(worst_out(mn) > g4_bar && bkey_over(mn) > 0, "native frequencies under YaRN -> caught (output and block keys)");
+        CHECK(worst_out(mm) > g4_bar && bkey_over(mm) > 0, "YaRN without its attention factor -> caught (output and block keys)");
+        g_rope3 = nullptr;
+        g_rope = g_native;
+
+        pulsar_qsa_rope r;
+        const pulsar_qsa_yarn bad[] = {{1.0, 262144u, 32.0, 1.0}, {0.5, 262144u, 32.0, 1.0}, {4.0, 0u, 32.0, 1.0},
+                                       {4.0, 262144u, 1.0, 32.0}, {4.0, 262144u, 32.0, 0.0}, {4.0, 4u, 32.0, 1.0}};
+        int refused = 0;
+        for (const pulsar_qsa_yarn &b : bad) refused += pulsar_qsa_rope_init(&r, &b) == 0;
+        CHECK(refused == 6, "rope_init refuses factor <= 1, no original context, reversed / zero betas, an empty ramp "
+                            "(%d of 6)", refused);
+    }
+
     printf("G8 tensor parallelism (L266 step 7): each rank's KV head + its 12 query heads == the full layer's (fixture A)\n");
     {
         const uint32_t REC2 = pulsar_qsa_kv_token_bytes(2), QIN2 = QIN / 2u, KVIN2 = KVIN / 2u, OUT2 = OUT / 2u;
@@ -854,6 +946,7 @@ int main() {
                 io.out_scale = pulsar_gpu_tensor_device_ptr(d.slot_sc);
                 io.out_sf_pitch = (int)(OUT2 / 32u);
                 io.tap_out_f32 = d.tap;
+                io.rope = &g_rope;
                 if (!pulsar_gpu_qsa_forward(&L, &sd, 1, rs.data(), rp.data(), n, &io, d.ws)) {
                     CHECK(false, "rank %u: pulsar_gpu_qsa_forward refused at %u", r, p0);
                     break;
