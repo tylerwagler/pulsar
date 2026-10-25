@@ -305,6 +305,17 @@ const char *inkling_find_call_block(const char *p, const char **end) {
     return NULL;
 }
 
+bool inkling_chat_tool_defs(const char *tools_json, inkling_render_out *out, char *err, size_t errlen) {
+    out->text.clear();
+    out->spans.clear();
+    if (!tools_json) return refuse(err, errlen, "tools_not_array", "none");
+    std::string declare;
+    if (!tool_declare_json(tools_json, &declare, err, errlen)) return false;
+    out->text = declare;
+    out->spans.push_back({0, (uint32_t)declare.size()});
+    return true;
+}
+
 bool inkling_chat_render(const inkling_render_in &in, inkling_render_out *out, char *err, size_t errlen) {
     out->text.clear();
     out->spans.clear();

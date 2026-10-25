@@ -522,8 +522,8 @@ bool server_route_in_place(int common, int score, int frontier, int prefilled, i
  *      door checks against slot 0's ctx and cannot see the owner's smaller
  *      one).
  *   2. Among free slots with enough context, the highest SCORE wins (L264):
- *      the deepest grid checkpoint at or below the request's byte match, i.e.
- *      where the sync will resume; the longer match breaks a tie.
+ *      where the bank's sync will resume (L325: the one resume rule,
+ *      pulsar_session_bank_resume_at); the longer match breaks a tie.
  *   3. The winner continues in place unless that would discard meaningful
  *      warm state of a DIFFERENT conversation (server_route_in_place); then a
  *      fresh lazily provisioned slot is preferred (budget permitting, after
@@ -571,13 +571,13 @@ session_slot *server::choose_slot_for_job(job *j, int *reject_ctx,
         session_slot *sl = &s->slots[i];
         if (sl->active_job || !sl->provisioned || sl->ctx_size < needed) continue;
         const int common = s->slot_common_prefix(sl, &j->req.prompt);
-        int score = pulsar_session_bank_checkpoint_best(s->sess, sl->bank, common);
-        /* L289: a bank holding the whole prompt scores where its sync starts (its prompt end, past every grid
-         * checkpoint below it) */
-        if (common >= j->req.prompt.len) {
-            const int at = pulsar_session_bank_resume_at(s->sess, sl->bank, &j->req.prompt);
-            if (at > score) score = at;
-        }
+        /* L325: the bank scores where its sync resumes -- pulsar_session_bank_resume_at, the one resume rule over the
+         * token-seam stitch that the bank's own resume reads and an adopt (bank_adopt_point, L322) reads too: its grid
+         * checkpoints AND its records (prompt end, message endpoint) within the match and its prefill frontier, or
+         * the whole match for a history it continues.  The route scored the grid checkpoint below the match alone (a
+         * record only for a bank holding the whole prompt, L289), so a bank whose turn-end record stood above its
+         * thinned grid ranked below a shallower bank. */
+        const int score = pulsar_session_bank_resume_at(s->sess, sl->bank, &j->req.prompt);
         if (route_debug)
             server_log(PULSAR_LOG_DEFAULT,
                        "pulsar-server: route-scan slot %d bank %u: frontier=%d common=%d score=%d",
@@ -862,8 +862,8 @@ void server::worker_protect_queued_warm_matches(bool protect[PULSAR_SESSION_POOL
         for (int k = 0; k < s->n_slots && k < PULSAR_SESSION_POOL_CAP; k++) {
             const session_slot *sl = &s->slots[k];
             if (!sl->provisioned) continue;
-            const int score = pulsar_session_bank_checkpoint_best(
-                    s->sess, sl->bank, s->slot_common_prefix(sl, &q->req.prompt));
+            /* L325: the route's score (pulsar_session_bank_resume_at, choose_slot_for_job) */
+            const int score = pulsar_session_bank_resume_at(s->sess, sl->bank, &q->req.prompt);
             if (score > best_score) { best_score = score; best_i = k; }
         }
         if (best_i >= 0) protect[best_i] = true;

@@ -267,9 +267,9 @@ void extra_keys(writer &w, const pyjson_value *d, std::initializer_list<const ch
     }
 }
 
-/* The tools block (one function per tool, the template's XML), its tool data client text throughout. */
-void write_tools(writer &w, const pyjson_value &tools) {
-    w.lit(kToolsHead);
+/* One <function> element per tool, the template's XML, its tool data client text throughout -- the one encoding of a
+ * tool definition, in the tools block and (L325) in place where a deferred tool is loaded. */
+void write_tool_functions(writer &w, const pyjson_value &tools) {
     for (const pyjson_value &t : tools.a) {
         const pyjson_value *fn = t.get("function");
         const pyjson_value *tool = fn ? fn : &t;
@@ -320,6 +320,12 @@ void write_tools(writer &w, const pyjson_value &tools) {
         extra_keys(w, tool, {"type", "name", "description", "parameters"});
         w.lit("\n</function>");
     }
+}
+
+/* The tools block: the template's head, the functions, its tail (the call format and the reminder). */
+void write_tools(writer &w, const pyjson_value &tools) {
+    w.lit(kToolsHead);
+    write_tool_functions(w, tools);
     w.lit(kToolsTail);
 }
 
@@ -552,6 +558,21 @@ bool nemotron_chat_render_tail(const nemotron_msg_in *msgs, int n, nemotron_effo
     w.lit("<|im_end|>\n");
     if (!write_messages(w, msgs, n, "assistant", last_user_of(msgs, n), effort, err, errlen)) return false;
     w.lit(nemotron_generation_prompt(effort));
+    return finish(out, err, errlen);
+}
+
+bool nemotron_chat_tool_defs(const char *tools_json, nemotron_render_out *out, char *err, size_t errlen) {
+    out->text.clear();
+    out->spans.clear();
+    writer w{out};
+    pyjson_value tools;
+    char jerr[160];
+    if (!tools_json || !pyjson_parse(tools_json, strlen(tools_json), &tools, jerr, sizeof jerr))
+        return refuse(err, errlen, "tools_not_array", "tools: %s", tools_json ? jerr : "none");
+    if (tools.kind != pyjson_value::ARR) return refuse(err, errlen, "tools_not_array", "tools is not a JSON array");
+    w.lit("<tools>");
+    write_tool_functions(w, tools);
+    w.lit("\n</tools>");
     return finish(out, err, errlen);
 }
 

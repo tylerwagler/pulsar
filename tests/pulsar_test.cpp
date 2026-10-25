@@ -2172,12 +2172,42 @@ static void test_server_unit_group(void) {
     pulsar_server_unit_tests_run();
 }
 
+/* L325: a render case's protocol ("_api": "openai" | "anthropic", default openai) and family ("_family":
+ * "deepseek-v41" | "deepseek-v4" | "qwen" | "nemotron" | "inkling", default deepseek-v41), read from the body (the
+ * protocol parsers skip unknown members).  false = a value this list does not name. */
+static bool test_render_case_target(const char *body, bool *anthropic, pulsar_chat_format *fmt) {
+    *anthropic = false;
+    *fmt = PULSAR_CHAT_DS4_V41;
+    char *api = json_object_member_raw(body, "_api");
+    char *fam = json_object_member_raw(body, "_family");
+    bool ok = true;
+    if (api) {
+        if (!strcmp(api, "\"anthropic\"")) *anthropic = true;
+        else ok = !strcmp(api, "\"openai\"");
+    }
+    if (fam) {
+        static const struct { const char *name; pulsar_chat_format fmt; } k[] = {
+            {"\"deepseek-v41\"", PULSAR_CHAT_DS4_V41}, {"\"deepseek-v4\"", PULSAR_CHAT_DS4_V4},
+            {"\"qwen\"", PULSAR_CHAT_QWEN}, {"\"nemotron\"", PULSAR_CHAT_NEMOTRON_H},
+            {"\"inkling\"", PULSAR_CHAT_INKLING}};
+        bool named = false;
+        for (const auto &f : k)
+            if (!strcmp(fam, f.name)) { *fmt = f.fmt; named = true; }
+        ok = ok && named;
+    }
+    free(api);
+    free(fam);
+    return ok;
+}
+
 /* The renderer gate's engine side: PULSAR_RENDER_CASES names a JSONL file of
- * OpenAI chat-completion request bodies, one per line, each carrying an
- * "_id" field.  Every body is parsed and RENDERED (not tokenised: no model
- * is loaded) and the bytes are printed between markers for
- * tests/render_gate.py to compare against the reference encoder.  A body the
- * parser refuses is reported as such, so the gate can count it. */
+ * chat request bodies, one per line, each carrying an "_id" field (first, so
+ * no client text can shadow it).  Every body is parsed and RENDERED (not
+ * tokenised: no model is loaded) and the bytes are printed between markers
+ * for tests/render_gate.py to compare against the reference encoder (OpenAI
+ * bodies, DeepSeek V4.1) and tests/prefix_stability_gate.py (L325: any
+ * protocol and family, test_render_case_target).  A body the parser refuses
+ * is reported as such, so the gate can count it. */
 static void test_render_cases(void) {
     const char *path = getenv("PULSAR_RENDER_CASES");
     /* Env-gated on purpose: tests/render_gate.py sets PULSAR_RENDER_CASES and
@@ -2201,9 +2231,24 @@ static void test_render_cases(void) {
         const char *idp = strstr(line, "\"_id\":");
         long id = idp ? strtol(idp + 6, NULL, 10) : -1;
         request r;
-        char err[160];
-        if (!parse_chat_request_render(NULL, NULL, line, 128, &r, err, sizeof err)) {
-            printf("===CASE %ld REFUSED %s===\n", id, err);
+        char err[160] = "";
+        bool anthropic = false;
+        pulsar_chat_format fmt = PULSAR_CHAT_DS4_V41;
+        if (!test_render_case_target(line, &anthropic, &fmt)) {
+            printf("===CASE %ld REFUSED unknown _api or _family===\n", id);
+            refused++;
+            continue;
+        }
+        request_init(&r, REQ_CHAT, 128);
+        chat_conversation c;
+        memset(&c, 0, sizeof(c));
+        const bool ok = (anthropic ? parse_chat_conversation_anthropic : parse_chat_conversation_openai)(
+                            line, &c, &r, err, sizeof err) &&
+                        render_chat_conversation(NULL, fmt, NULL, &c, &r, err, sizeof err);
+        chat_conversation_free(&c);
+        if (!ok) {
+            printf("===CASE %ld REFUSED %s===\n", id, err[0] ? err : "invalid JSON request");
+            request_free(&r);
             refused++;
             continue;
         }

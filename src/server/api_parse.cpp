@@ -124,8 +124,9 @@ static const char *chat_control_key(const char *key) {
 }
 
 /* The tools array: as sent (NULL for null), and one function schema a line with
- * their declared order (parse_tools_value, every protocol's dialect).  Anthropic's
- * server-tool entries are checked first, with the Messages API's own wording. */
+ * their declared order (parse_tools_value, every protocol's dialect), the deferred
+ * ones (defer_loading, L325) apart.  Anthropic's server-tool entries are checked
+ * first, with the Messages API's own wording. */
 static bool take_tools(const char **p, chat_conversation *c, request *r, bool anthropic, char *err,
                        size_t errlen) {
     char *raw = NULL;
@@ -136,8 +137,10 @@ static bool take_tools(const char **p, chat_conversation *c, request *r, bool an
     }
     free(c->tool_schemas);
     c->tool_schemas = NULL;
+    free(c->deferred_tool_schemas);
+    c->deferred_tool_schemas = NULL;
     const char *tp = raw;
-    if (!parse_tools_value(&tp, &c->tool_schemas, &r->tool_orders)) {
+    if (!parse_tools_value(&tp, &c->tool_schemas, &r->tool_orders, &c->deferred_tool_schemas)) {
         free(raw);
         return false;
     }

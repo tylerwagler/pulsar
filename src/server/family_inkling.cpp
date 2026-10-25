@@ -17,6 +17,7 @@
 #include "pulsar_server_internal.h"
 #include "../lib/inkling_chat.h"
 
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -114,7 +115,9 @@ bool inkling_render(pulsar_engine *e, server *s, chat_conversation *c, request *
                  c->tool_choice == CHAT_TOOL_CHOICE_ANY ? "required" : "naming a function");
         return false;
     }
-    if (!chat_openai_tools_json(c, r, err, errlen)) return false;
+    char *head_raw = NULL;
+    if (!chat_openai_tools_json(c, r, &head_raw, err, errlen)) return false;
+    const std::unique_ptr<char, void (*)(void *)> head(head_raw, free);
     r->has_tools = r->tools_json != NULL;
     render_prelude(s, c, r);
     inkling_msgs im;
@@ -122,7 +125,7 @@ bool inkling_render(pulsar_engine *e, server *s, chat_conversation *c, request *
     inkling_render_in in = {};
     in.msgs = im.m.data();
     in.n_msgs = (int)im.m.size();
-    in.tools_json = r->tools_json;
+    in.tools_json = head.get();   /* the tools block; r->tools_json (every declared tool) types the parser (L325) */
     in.effort = r->family_effort;
     in.add_generation_prompt = true;
     inkling_render_out out;
@@ -266,6 +269,16 @@ const server_grammar_shape k_grammar_inkling = {
 
 }  // namespace
 
+/* L325: a tool loaded mid-conversation, in place: the tool_declare array (inkling_chat_tool_defs). */
+static char *inkling_tool_defs_text(const char *lines, size_t len, char *err, size_t errlen) {
+    char *json = tool_schema_lines_openai_tools(lines, len, err, errlen);
+    if (!json) return NULL;
+    inkling_render_out out;
+    const bool ok = inkling_chat_tool_defs(json, &out, err, errlen);
+    free(json);
+    return ok ? xstrndup(out.text.data(), out.text.size()) : NULL;
+}
+
 const server_family_ops k_family_inkling = {
     /* .name                  = */ "Inkling",
     /* .format                = */ PULSAR_CHAT_INKLING,
@@ -281,4 +294,5 @@ const server_family_ops k_family_inkling = {
     /* .forced_call_prefill   = */ NULL,
     /* .grammar               = */ &k_grammar_inkling,
     /* .find_call_block       = */ inkling_find_call_block,
+    /* .tool_defs_text        = */ inkling_tool_defs_text,
 };

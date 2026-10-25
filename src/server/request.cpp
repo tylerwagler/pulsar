@@ -179,6 +179,28 @@ void chat_msg_add_image(chat_msg *m, uint8_t *bytes, size_t len, size_t placehol
 
 
 
+/* L325: one tool_reference at byte `off` of the message's content (chat_msg::tool_ref_off). */
+void chat_msg_add_tool_ref(chat_msg *m, size_t off, const char *name) {
+    if (m->tool_refs_len == m->tool_refs_cap) {
+        m->tool_refs_cap = m->tool_refs_cap ? m->tool_refs_cap * 2 : 4;
+        m->tool_ref_off = (size_t *)server_xrealloc(m->tool_ref_off, (size_t)m->tool_refs_cap * sizeof(size_t));
+        m->tool_ref_name = (char **)server_xrealloc(m->tool_ref_name, (size_t)m->tool_refs_cap * sizeof(char *));
+    }
+    m->tool_ref_off[m->tool_refs_len] = off;
+    m->tool_ref_name[m->tool_refs_len] = xstrdup(name ? name : "");
+    m->tool_refs_len++;
+}
+
+void chat_msg_clear_tool_refs(chat_msg *m) {
+    for (int i = 0; i < m->tool_refs_len; i++) free(m->tool_ref_name[i]);
+    free(m->tool_ref_off);
+    free(m->tool_ref_name);
+    m->tool_ref_off = NULL;
+    m->tool_ref_name = NULL;
+    m->tool_refs_len = 0;
+    m->tool_refs_cap = 0;
+}
+
 static void chat_msg_free(chat_msg *m) {
     free(m->role);
     free(m->content);
@@ -187,6 +209,7 @@ static void chat_msg_free(chat_msg *m) {
     for (int i = 0; i < m->tool_call_ids_len; i++) free(m->tool_call_ids[i]);
     free(m->tool_call_ids);
     chat_msg_clear_images(m);
+    chat_msg_clear_tool_refs(m);
     tool_calls_free(&m->calls);
     memset(m, 0, sizeof(*m));
 }
@@ -1351,6 +1374,14 @@ void conversation_tool_schema_lines(const chat_conversation *c, buf *out) {
     }
 }
 
+void conversation_declared_tool_schema_lines(const chat_conversation *c, buf *out) {
+    conversation_tool_schema_lines(c, out);
+    if (c->deferred_tool_schemas && c->deferred_tool_schemas[0]) {
+        if (out->len) buf_putc(out, '\n');
+        buf_puts(out, c->deferred_tool_schemas);
+    }
+}
+
 char *tool_schema_lines_openai_tools(const char *lines, size_t len, char *err, size_t errlen) {
     buf out = {0};
     buf_putc(&out, '[');
@@ -1390,7 +1421,18 @@ char *tool_schema_lines_openai_tools(const char *lines, size_t len, char *err, s
     return buf_take(&out);
 }
 
-bool parse_tools_value(const char **p, char **out, tool_schema_orders *orders) {
+/* L325: the tool entry says defer_loading: true (Anthropic's tool search, Responses' too): declared, loaded later. */
+static bool tool_entry_deferred(const char *raw) {
+    char *v = json_object_member_raw(raw, "defer_loading");
+    const char *vp = v;
+    bool deferred = false;
+    if (vp && !json_bool(&vp, &deferred)) deferred = false;
+    free(v);
+    return deferred;
+}
+
+bool parse_tools_value(const char **p, char **out, tool_schema_orders *orders, char **deferred) {
+    if (deferred) *deferred = NULL;
     json_ws(p);
     if (json_lit(p, "null")) {
         *out = xstrdup("");
@@ -1398,7 +1440,8 @@ bool parse_tools_value(const char **p, char **out, tool_schema_orders *orders) {
     }
     if (**p != '[') return false;
     (*p)++;
-    buf schemas = {0};
+    buf all_schemas = {0};
+    buf deferred_schemas = {0};
 
     json_ws(p);
     while (**p && **p != ']') {
@@ -1417,6 +1460,8 @@ bool parse_tools_value(const char **p, char **out, tool_schema_orders *orders) {
             json_ws(p);
             continue;
         }
+        /* L325: a deferred tool's line goes to `deferred` (the tools block never renders it); one write path below */
+        buf &schemas = deferred && tool_entry_deferred(raw) ? deferred_schemas : all_schemas;
         char *function = openai_function_schema_from_tool(raw);
         if (function) {
             append_raw_json_line(&schemas, function);
@@ -1453,10 +1498,12 @@ bool parse_tools_value(const char **p, char **out, tool_schema_orders *orders) {
     }
     if (**p != ']') goto bad;
     (*p)++;
-    *out = buf_take(&schemas);
+    *out = buf_take(&all_schemas);
+    if (deferred) *deferred = buf_take(&deferred_schemas);
     return true;
 bad:
-    buf_free(&schemas);
+    buf_free(&all_schemas);
+    buf_free(&deferred_schemas);
     return false;
 }
 
@@ -1868,6 +1915,9 @@ static bool anthropic_tool_result_read(chat_msg *part, const char *content_raw, 
                 } else {
                     chat_msg inner = {0};
                     const bool ok = parse_anthropic_content_block(&rp, NULL, &inner, err, errlen);
+                    /* L325: a tool_reference's position moves with the text it sits in */
+                    for (int k = 0; ok && k < inner.tool_refs_len; k++)
+                        chat_msg_add_tool_ref(part, out.len + inner.tool_ref_off[k], inner.tool_ref_name[k]);
                     if (ok && inner.content) buf_puts(&out, inner.content);
                     chat_msg_free(&inner);
                     free(raw);
@@ -2163,13 +2213,10 @@ static bool parse_anthropic_content_block(const char **p, chat_msgs *parts, chat
         free(msg->content);
         msg->content = buf_take(&b);
     } else if (type && !strcmp(type, "tool_reference")) {
-        /* MCP tool search loaded this tool.  This server always offers every
-         * tool, so only the fact is rendered. */
-        buf b = {0};
-        buf_puts(&b, msg->content ? msg->content : "");
-        buf_printf(&b, "[tool available: %s]", tool_name ? tool_name : "(unnamed)");
-        free(msg->content);
-        msg->content = buf_take(&b);
+        /* Tool search loaded this tool.  L325: only its position is read here (the tools array may follow the
+         * messages); chat_expand_tool_refs writes the definition, or a notice, there before the family renders. */
+        if (!msg->content) msg->content = xstrdup("");
+        chat_msg_add_tool_ref(msg, strlen(msg->content), tool_name ? tool_name : "(unnamed)");
     } else if (type && !strcmp(type, "redacted_thinking")) {
         /* Encrypted reasoning only Anthropic's API can read.  It arrives only
          * in history produced there (a resumed session); nothing here can use

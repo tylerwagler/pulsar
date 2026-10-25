@@ -118,6 +118,12 @@ struct qwen_render_out {
 /** Render.  false + "<refusal key>: detail" on refusal. */
 bool qwen_chat_render(const qwen_render_in &in, qwen_render_out *out, char *err, size_t errlen);
 
+/** L325: tool definitions in the tools block's encoding -- "<tools>", each tool on its own line as tojson,
+ *  "\n</tools>" -- for a tool loaded mid-conversation, rendered in place inside the turn that loaded it (the
+ *  server writes it into that tool result's text).  `tools_json` is an OpenAI tools array.  Refusal:
+ *  tools_not_array. */
+bool qwen_chat_tool_defs(const char *tools_json, qwen_render_out *out, char *err, size_t errlen);
+
 /** The assistant turn `m` as the model SAMPLES it: the bytes the full render writes for the turn past
  * the generation prompt -- past "<|im_start|>assistant\n<think>\n" with `thinking`, past the closed
  * empty think block without it -- so prefix + this = the full render of the history with the turn

@@ -5975,6 +5975,20 @@ static void test_anthropic_image_content_blocks(void) {
 
 
 
+
+/* L325: the messages' tool_reference records written into their text (chat_expand_tool_refs, as
+ * render_chat_conversation runs it before a family renders), in DeepSeek V4.1's encoding (request_init's family). */
+static void test_expand_tool_refs(chat_msgs *msgs) {
+    chat_conversation c = {};
+    c.msgs = *msgs;
+    request r;
+    request_init(&r, REQ_CHAT, 16);
+    char err[160] = {0};
+    TEST_ASSERT(chat_expand_tool_refs(&c, &r, err, sizeof err));
+    *msgs = c.msgs;
+    request_free(&r);
+}
+
 /* L252 P1: Claude Code sends document, tool_reference and redacted_thinking
  * blocks.  Each has one fixed rendering, so a session that carries one keeps
  * working; a type nobody named is still refused. */
@@ -5993,6 +6007,7 @@ static void test_anthropic_document_reference_redacted_blocks(void) {
     char err[256] = {0};
     const char *p = json;
     TEST_ASSERT(parse_anthropic_messages(&p, &msgs, err, sizeof err));
+    test_expand_tool_refs(&msgs);   /* L325: the notice is written where the renders read it */
     TEST_ASSERT(msgs.len == 2);
     if (msgs.len == 2) {
         const char *user = msgs.v[0].content;
@@ -6048,6 +6063,7 @@ static void test_anthropic_tool_result_nested_blocks(void) {
         char err[256] = {0};
         const char *p = json.ptr;
         TEST_ASSERT(parse_anthropic_messages(&p, &msgs, err, sizeof err));
+        test_expand_tool_refs(&msgs);         /* L325: before any render reads the messages */
         anthropic_fold_tool_results(&msgs);   /* DeepSeek's turn (L267) */
         if (msgs.len == 1) {
             const char *c = msgs.v[0].content;
@@ -7733,6 +7749,79 @@ static void test_l311_route_header_anchor(void) {
  * anchor (that user marker) says it is this conversation's: in place, rewound to the bank's own checkpoint below the
  * match.  L311 took the DEEPER of that anchor and the side call's header, and every such turn took a fresh bank (and,
  * with the adopt capped at a seam, the whole chain from disk: 22-25 s a turn). */
+/* L325: a deferred tool (defer_loading: true) is declared but not rendered in the tools block; a tool_reference to
+ * it renders its definition IN PLACE, in the family's tools-block encoding, so loading it leaves every earlier byte
+ * as it was (Claude Code 2.1.310's ToolSearch: the loaded tool joins `tools` in name order, deferred).  Every family:
+ * the definition appears once, after the call that loaded it; the parser's tools (r->tools_json) and the declared
+ * names still carry it; a reference to a tool the block renders keeps the notice; an image after a reference keeps
+ * its placeholder (its offset moves with the inserted text). */
+static void test_l325_deferred_tool_in_place(void) {
+    static const char *const kTools0 =
+        "\"tools\":[{\"name\":\"Bash\",\"description\":\"Run a command.\",\"input_schema\":{\"type\":\"object\","
+        "\"properties\":{\"command\":{\"type\":\"string\"}},\"required\":[\"command\"]}},"
+        "{\"name\":\"ToolSearch\",\"description\":\"Load deferred tools.\",\"input_schema\":{\"type\":\"object\","
+        "\"properties\":{\"query\":{\"type\":\"string\"}},\"required\":[\"query\"]}}";
+    static const char *const kTaskStop =
+        ",{\"name\":\"TaskStop\",\"description\":\"Stops a background task.\",\"input_schema\":{\"type\":\"object\","
+        "\"properties\":{\"task_id\":{\"type\":\"string\"}},\"required\":[\"task_id\"]},\"defer_loading\":true}";
+    static const char *const kPng =
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAC0lEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+    const std::string m1 = "{\"role\":\"user\",\"content\":\"Stop task 7.\"}";
+    const std::string call = ",{\"role\":\"assistant\",\"content\":[{\"type\":\"tool_use\",\"id\":\"toolu_1\","
+                             "\"name\":\"ToolSearch\",\"input\":{\"query\":\"select:TaskStop,Bash\"}}]}";
+    const pulsar_chat_format fmts[] = {PULSAR_CHAT_DS4_V41, PULSAR_CHAT_QWEN, PULSAR_CHAT_NEMOTRON_H,
+                                       PULSAR_CHAT_INKLING};
+    for (pulsar_chat_format fmt : fmts) {
+        /* an image after the references where the family renders images (Nemotron's and Inkling's fronts refuse) */
+        const bool image = fmt == PULSAR_CHAT_DS4_V41 || fmt == PULSAR_CHAT_QWEN;
+        const std::string loaded = std::string(",{\"role\":\"user\",\"content\":[{\"type\":\"tool_result\","
+                                   "\"tool_use_id\":\"toolu_1\",\"content\":[{\"type\":\"text\",\"text\":\"Loaded: \"},"
+                                   "{\"type\":\"tool_reference\",\"tool_name\":\"TaskStop\"},"
+                                   "{\"type\":\"tool_reference\",\"tool_name\":\"Bash\"}") +
+                                   (image ? std::string(",{\"type\":\"image\",\"source\":{\"type\":\"base64\","
+                                                        "\"media_type\":\"image/png\",\"data\":\"") + kPng + "\"}}"
+                                          : std::string()) + "]}]}";
+        const std::string before = "{\"model\":\"m\",\"messages\":[" + m1 + "]," + kTools0 + "]}";
+        /* the tools array after the messages: the definition is resolved at render, whatever the member order */
+        const std::string after =
+            "{\"model\":\"m\",\"messages\":[" + m1 + call + loaded + "]," + kTools0 + kTaskStop + "]}";
+        char *text[2] = {NULL, NULL};
+        for (int k = 0; k < 2; k++) {
+            chat_conversation c = {};
+            request r;
+            request_init(&r, REQ_CHAT, 128);
+            char err[200] = {0};
+            TEST_ASSERT(parse_chat_conversation_anthropic((k ? after : before).c_str(), &c, &r, err, sizeof err));
+            const bool ok = render_chat_conversation(NULL, fmt, NULL, &c, &r, err, sizeof err);
+            if (!ok) fprintf(stderr, "l325 fmt %d body %d: %s\n", (int)fmt, k, err);
+            TEST_ASSERT(ok);
+            if (ok) {
+                text[k] = xstrdup(r.prompt_text);
+                TEST_ASSERT(tool_call_declared(&r, "TaskStop", NULL, 0) == (k == 1));
+                if (fmt != PULSAR_CHAT_DS4_V41) TEST_ASSERT(k == 0 || (r.tools_json && strstr(r.tools_json, "TaskStop")));
+            }
+            request_free(&r);
+            chat_conversation_free(&c);
+        }
+        if (!text[0] || !text[1]) {
+            free(text[0]);
+            free(text[1]);
+            continue;
+        }
+        const char *t = text[1];
+        const char *def = strstr(t, "Stops a background task.");
+        const char *use = strstr(t, "select:TaskStop");
+        TEST_ASSERT(def && use && def > use);                          /* in place, after the call that loaded it */
+        TEST_ASSERT(def && !strstr(def + 1, "Stops a background task."));   /* once */
+        TEST_ASSERT(strstr(t, "Loaded: ") && strstr(t, "[tool available: Bash]"));   /* the block renders Bash */
+        /* the earlier render is a prefix of this one up to its last message (the generation prompt aside) */
+        const char *m = strstr(text[0], "Stop task 7.");
+        TEST_ASSERT(m && !strncmp(text[0], t, (size_t)(m - text[0]) + strlen("Stop task 7.")));
+        free(text[0]);
+        free(text[1]);
+    }
+}
+
 static void test_l322_route_side_call(void) {
     const int start = 151644, end = 151645, u = 872, a = 77091, nl = 198, think = 151667, think_end = 151668;
     const pulsar_turn_markers q = {{start, u}, 2, {start, a}, 2};
@@ -10269,6 +10358,7 @@ static void pulsar_server_unit_tests_run(void) {
     test_l275_route_in_place_through_last_turn();
     test_l311_route_header_anchor();
     test_l322_route_side_call();
+    test_l325_deferred_tool_in_place();
     test_slot_writer_defers_and_preserves_order();
     test_slot_writer_stall_times_out();
     test_unterminated_think_stays_off_content();
