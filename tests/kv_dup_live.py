@@ -11,13 +11,15 @@ on a FRESH bank (it diverges before the bank's last user marker; L322's in-place
 shared prefix from the bank before it (L313/L322).  Every bank then holds its own copy of the shared grid pages.
 
 Here: SIBLINGS Anthropic /v1/messages requests, one after another (greedy, 48 tokens each), each with the system
-prompt [tag] + the first PREAMBLE characters of the story (~14k tokens at 56000: three whole 4096-token pages) + its
-own task.  Checks, from the server's log and /metrics after the last one:
+prompt [tag] + the first PREAMBLE characters of the story (~12.5k tokens at 56000 on Qwen and Nemotron: three whole
+4096-token pages) + its own task.  Checks, from the server's log and /metrics after the last one:
   * DISTINCT BANKS: every sibling ran on a bank of its own (the resume line's bank), so the census has copies to count;
   * CENSUS RAN: pulsar:kv_dup_censuses_total grew by at least SIBLINGS (one census at each request's end);
-  * PAGES: pulsar:kv_dup_page_tokens > 0 and pulsar:kv_dup_page_bytes > 0; at least SHARED = floor(min shared prompt /
-    page) - 1 distinct pages held by >= 2 banks (one page of slack for the tokenizer's count of the preamble), and at
-    least (SIBLINGS - 1) * SHARED extra copies;
+  * PAGES: pulsar:kv_dup_page_tokens > 0 and pulsar:kv_dup_page_bytes > 0; at least SHARED = floor((min prompt - TAIL)
+    / page) distinct pages held by >= 2 banks, and at least (SIBLINGS - 1) * SHARED extra copies.  min prompt - TAIL
+    is a lower bound of the shared prefix (the prompts are the server's own counts; TAIL = 400 tokens over-covers each
+    sibling's own task, the user turn and the template's close, ~30 tokens), and the census's pages sit on the grid
+    from token 0, so its floor is a lower bound of the whole pages shared -- no further slack;
   * BYTES: pulsar:kv_dup_bytes == kv_dup_pages_duplicate * kv_dup_page_bytes;
   * PAIRS: at least SIBLINGS * (SIBLINGS - 1) / 2 pairs in the preamble class, the longest at least SHARED pages.
 Other legs on a shared server may hold banks of their own; every check is a lower bound, so they only add.
@@ -30,6 +32,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from live_server import Leg  # noqa: E402
 from prefix_turns_live import STORY, post  # noqa: E402
 
+TAIL = 400   # tokens: over-covers what follows the shared preamble (a sibling's task, the user turn, the template)
 RESUME = re.compile(r"resume: bank (\d+) own ")
 TASKS = [
     "Your sub-task: list the characters who appear in the first chapter.",
@@ -77,8 +80,9 @@ class KvDupLeg(Leg):
         self.g.check(page > 0 and pbytes > 0, "the census priced its pages: %d tokens, %d bytes a page" % (page, pbytes))
         if page <= 0:
             return
-        # the siblings share the system prompt up to their task: a lower bound of the shared prefix, one page of slack
-        shared = max(0, int((min(prompts) - 400) // page) - 1)
+        # the siblings share the system prompt up to their task: min prompt - TAIL is a lower bound of the shared prefix,
+        # and the grid's pages start at token 0, so its floor is a lower bound of the whole pages shared
+        shared = max(0, int((min(prompts) - TAIL) // page))
         self.g.check(shared >= 2, "the preamble spans at least 2 whole pages to share (%d)" % shared)
         self.g.check(get("kv_dup_pages_shared") >= shared,
                      "kv_dup_pages_shared %d >= %d" % (get("kv_dup_pages_shared"), shared))

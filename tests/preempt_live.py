@@ -45,13 +45,29 @@ def chat(srv, text, max_tokens, logprobs=True):
     return 200, (m.get("reasoning_content") or "") + "\n--\n" + (m.get("content") or ""), d.get("usage", {})
 
 
+# the guard's startup line (cli_main.cpp, L319): "touched budget T GiB = min(kv budget K − eager E, touched U +
+# MemAvailable A − floor F post-warmup)" -- the ceiling is the smaller of the ledger's share (K - E) and the measured
+# headroom (U + A - F)
+GUARD = re.compile(r"touched budget ([0-9.]+) GiB = min\(kv budget ([0-9.]+) \S+ eager ([0-9.]+), "
+                   r"touched ([0-9.]+) \+ MemAvailable ([0-9.]+) \S+ floor ([0-9.]+) post-warmup\)")
+
+
+def guard_line(srv):
+    """(touched budget, kv budget, eager, touched + MemAvailable - floor) in GiB from the startup line, or None"""
+    m = GUARD.search(srv.text())
+    if not m:
+        return None
+    t, k, e, u, a, f = (float(x) for x in m.groups())
+    return t, k, e, u + a - f
+
+
 def probe(srv, ctx):
     """(the guard's eager floor, one bank's KV bytes a token) of this server's --ctx / --banks"""
-    m = re.search(r"touched budget ([0-9.]+) GiB \(kv budget ([0-9.]+) \S+ eager ([0-9.]+)\)", srv.text())
+    gl = guard_line(srv)
     bank_bytes = srv.metrics().get("pulsar:kv_bank_bytes", 0.0)
-    if not m or bank_bytes <= 0:
+    if not gl or bank_bytes <= 0:
         return None
-    return float(m.group(3)) * 2**30, bank_bytes / ctx
+    return gl[2] * 2**30, bank_bytes / ctx
 
 
 def slot_decoding(srv):
@@ -92,6 +108,12 @@ class PreemptLeg(Leg):
     def hooked(self, srv):
         over = srv.grep("KV budget OVERRIDDEN")
         self.g.check(over, "the hooks instance runs the overridden budget: %s" % (over[0][-80:] if over else "no line"))
+        # the override sizes the ledger's share (kv budget - eager); the ceiling is the smaller of it and the measured
+        # headroom (L319), so the frame holds only when the ledger's share binds
+        gl = guard_line(srv)
+        self.g.check(gl is not None and gl[1] - gl[2] <= gl[3],
+                     "the overridden ledger share binds the touched budget: %s" %
+                     ("%.2f GiB = min(%.2f - %.2f, headroom %.2f)" % gl if gl else "no guard line"))
         mark = srv.mark()
         chat(srv, W_TEXT, 1)
         th = threading.Thread(target=lambda: self.res.__setitem__("A", chat(srv, A_TEXT, GEN_A)))
