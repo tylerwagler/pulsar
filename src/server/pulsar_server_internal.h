@@ -2814,6 +2814,9 @@ typedef struct {
     int fd;       ///< the accepted socket this thread owns
 } client_arg;
 
+/** L321: the most models one server process opens (-m given that many times). */
+#define SERVER_MODELS_MAX 8
+
 /** Startup configuration, resolved once from CLI flags and immutable
  * afterwards -- the worker reads it without locking on that basis. */
 typedef struct {
@@ -2828,6 +2831,10 @@ typedef struct {
     bool kv_disk_disable;          ///< turn the disk cache off entirely
     uint64_t kv_disk_space_mb;     ///< disk-cache budget in MiB
     kv_cache_options kv_cache;     ///< checkpoint placement policy
+    /** L321: every -m in order (engine.model_path is the first); more than one opens them as one engine group in
+     *  this process, which serves encoders and parsers only (encode_server.cpp) */
+    const char *models[SERVER_MODELS_MAX];
+    int n_models;
 } server_config;
 
 /* ---- shared globals ---- */
@@ -2938,6 +2945,10 @@ bool chat_expand_tool_refs(struct chat_conversation *c, const struct request *r,
 char *tool_schema_lines_openai_tools(const char *lines, size_t len, char *err, size_t errlen);
 bool parse_messages(const char **p, chat_msgs *msgs, char *err, size_t errlen);
 bool parse_anthropic_messages(const char **p, chat_msgs *msgs, char *err, size_t errlen);
+/** An inline base64 `data:image/...;base64,` URL -> the encoded file's bytes (malloc'd, `*len_out` set), or NULL +
+ *  `err` (a remote URL, another scheme, a malformed payload).  The one reader of inline images: the chat / Responses
+ *  image blocks and /v1/parse (L321). */
+uint8_t *server_decode_image_data_url(const char *url, size_t *len_out, char *err, size_t errlen);
 /* Attach one inline image block to `msg` and write its placeholder into `out`.
  * The single authority behind the chat `image_url` and Responses `input_image`
  * readers. */
@@ -3487,6 +3498,12 @@ void append_openai_logprobs_json(buf *b, const logprob_ledger *lg, int from, int
 void append_model_json_values(buf *b, const char *id, const char *name,
                                      int ctx, int default_tokens);
 void *client_main(void *arg);
+/** Read one request (headers + body, bounded in size and time) from `fd`; false on a malformed or late one. */
+bool read_http_request(int fd, http_request *r);
+void http_request_free(http_request *r);
+/** L321: serve ENCODER engines (pulsar_engine_encoder != NONE; one group, several models) on cfg's host and port until
+ *  a stop signal: /v1/embeddings and / or /v1/rerank, /v1/models, /health (encode_server.cpp).  The exit code. */
+int encode_serve(pulsar_engine *const *engines, int n, const server_config *cfg);
 int listen_on(const char *host, int port);
 void configure_client_socket(int fd);
 void set_client_socket_nonblocking(int fd);

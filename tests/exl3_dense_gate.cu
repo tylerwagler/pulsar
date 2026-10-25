@@ -167,6 +167,60 @@ static int run(const dev &d, int k2, int M, int K, int N, std::vector<float> &y,
     return 0;
 }
 
+/* 3. a prompt chunk through the prefill GEMM (qwen_exl3_dense_prefill.cu), graded against the double reference;
+ * y16 = the decode GEMV's M = 16 rows to compare rows 0..15 with, or NULL on a device without the GEMV (L321). */
+static void grade_prefill(const dev &d, const weight &w, const slot &s, const std::vector<double> &what,
+                          const std::vector<double> &yref, int k2, int max_rows, int K, int N, const char *what_s,
+                          double tol, const std::vector<float> *y16) {
+    std::vector<float> y;
+    double mx, med;
+    int rc;
+    /* 3. prefill rows: a prompt chunk, row blocks of 16 (the last partial), and slabs of 128 */
+    rc = run(d, k2, max_rows, K, N, y, true);
+    CHECK(rc == 0, "prefill M=%d launch rc=%d", max_rows, rc);
+    if (!rc) {
+        /* a prompt chunk is the PREFILL GEMM (qwen_exl3_dense_prefill.cu, L251): it sums in its own
+         * order, so its rows agree with the decode GEMV to rounding, not to the bit -- every
+         * row is graded against the double reference instead, rows 0..15 included */
+        /* ...its operand is ONE fp16 plane (qwen_exl3_dense_prefill.cu), so each output is graded
+         * against that rounding's exact envelope (exl3t_fp16_operand_bound) plus the f32-order
+         * tolerance of its row -- not the GEMV's f32-class limit */
+        const bool same16 = y16 && memcmp(y.data(), y16->data(), y16->size() * sizeof(float)) == 0;
+        std::vector<double> bnd;
+        exl3t_fp16_operand_bound(w.bytes.data(), what, K, N, k2, s.x.data(), max_rows, bnd);
+        size_t over = 0;
+        double worst = 0;
+        for (int r = 0; r < max_rows; r++) {
+            double sc = 0;
+            for (int n = 0; n < N; n++) sc = fmax(sc, fabs(yref[(size_t)r * N + n]));
+            for (int n = 0; n < N; n++) {
+                const size_t i = (size_t)r * N + n;
+                const double err = fabs((double)y[i] - yref[i]), lim = bnd[i] + tol * sc;
+                over += err > lim;
+                worst = fmax(worst, err / lim);
+            }
+        }
+        grade(y, yref, max_rows, N, 0, &mx, &med);
+        CHECK(over == 0, "prefill M=%d: %zu outputs past the fp16-operand envelope (worst err/limit %.3f)",
+              max_rows, over, worst);
+        printf("  prefill GEMM M=%d: every output within its fp16-operand envelope (worst err/limit %.3f); "
+               "max rel %.2e median %.2e (rows 0..15 %s the GEMV's bits)\n", max_rows, worst, mx, med,
+               !y16 ? "not compared (no GEMV on this device) with" : same16 ? "equal to" : "rounding-close to");
+        /* L266: a PROMPT chunk of any width takes this GEMM, and a row's bytes do not depend on
+         * how many rows share the call (the pinned cuBLASLt algorithm, no split-K) -- what makes
+         * a prompt cut anywhere equal to one prefilled whole */
+        size_t diff_p = 0;
+        std::vector<float> yp;
+        for (int Mp : {1, 3, 16, 17}) {
+            rc = run(d, k2, Mp, K, N, yp, true);
+            CHECK(rc == 0, "prompt M=%d launch rc=%d", Mp, rc);
+            if (!rc) diff_p += memcmp(yp.data(), y.data(), yp.size() * sizeof(float)) != 0;
+        }
+        CHECK(diff_p == 0, "%s K=%d: %zu of 4 prompt widths (M=1,3,16,17) differ from the same rows at M=%d",
+              what_s, k2 / 2, diff_p, max_rows);
+    }
+}
+
 int main(void) {
     struct shape { int K, N; const char *what; };
     const shape shapes[] = {
@@ -182,6 +236,16 @@ int main(void) {
     const int widths[] = {1, 2, 4, 8};
     const double tol = 2e-5;
     printf("exl3-dense-gate: the EXL3 dense arm (production object) vs src/engine/exl3_trellis.h + double\n");
+    /* L321: the decode GEMV's MMA is m16n8k16 (sm_80+).  Below that the launcher refuses decode rows by name and only
+     * prompt chunks run (cuBLASLt fp16, which Turing's tensor cores have): grade the prefill GEMM and the refusal, and
+     * say what is not covered on this device. */
+    int dev_id = 0, major = 0;
+    CUDA_OK(cudaGetDevice(&dev_id));
+    CUDA_OK(cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev_id));
+    const bool gemv = major >= 8;
+    if (!gemv)
+        printf("  device major %d: no decode GEMV here -- grading the prefill GEMM and the decode refusal only; sections "
+               "1, 2, 4-8 (GEMV rows, mutations, refusals, multi, heads, short widths) need sm_80\n", major);
 
     for (const shape &sh : shapes) {
         const int K = sh.K, N = sh.N;
@@ -195,6 +259,13 @@ int main(void) {
             exl3t_reference(w.bytes.data(), what, K, N, k2, s.x.data(), max_rows, yref);
             dev d;
             upload(w, s, max_rows, d);
+            if (!gemv) {
+                std::vector<float> yr;
+                CHECK(run(d, k2, 16, K, N, yr) == -1, "%s K=%d: decode rows accepted on a device without sm_80", sh.what, k2 / 2);
+                if (max_rows > 16) grade_prefill(d, w, s, what, yref, k2, max_rows, K, N, sh.what, tol, nullptr);
+                release(d);
+                continue;
+            }
             std::vector<float> y16, y;
             int rc = run(d, k2, 16, K, N, y16);
             CHECK(rc == 0, "%s K=%d: launch rc=%d", sh.what, k2 / 2, rc);
@@ -244,50 +315,7 @@ int main(void) {
                       "alone", sh.what, k2 / 2, diff_w, blocks);
                 printf("  decode M=17/32/%d: %zu row blocks bit-identical to their rows alone; max rel %.2e median %.2e\n",
                        max_rows, blocks - diff_w, wmx, wmed);
-                /* 3. prefill rows: a prompt chunk, row blocks of 16 (the last partial), and slabs of 128 */
-                rc = run(d, k2, max_rows, K, N, y, true);
-                CHECK(rc == 0, "prefill M=%d launch rc=%d", max_rows, rc);
-                if (!rc) {
-                    /* a prompt chunk is the PREFILL GEMM (qwen_exl3_dense_prefill.cu, L251): it sums in its own
-                     * order, so its rows agree with the decode GEMV to rounding, not to the bit -- every
-                     * row is graded against the double reference instead, rows 0..15 included */
-                    /* ...its operand is ONE fp16 plane (qwen_exl3_dense_prefill.cu), so each output is graded
-                     * against that rounding's exact envelope (exl3t_fp16_operand_bound) plus the f32-order
-                     * tolerance of its row -- not the GEMV's f32-class limit */
-                    const bool same16 = memcmp(y.data(), y16.data(), y16.size() * sizeof(float)) == 0;
-                    std::vector<double> bnd;
-                    exl3t_fp16_operand_bound(w.bytes.data(), what, K, N, k2, s.x.data(), max_rows, bnd);
-                    size_t over = 0;
-                    double worst = 0;
-                    for (int r = 0; r < max_rows; r++) {
-                        double sc = 0;
-                        for (int n = 0; n < N; n++) sc = fmax(sc, fabs(yref[(size_t)r * N + n]));
-                        for (int n = 0; n < N; n++) {
-                            const size_t i = (size_t)r * N + n;
-                            const double err = fabs((double)y[i] - yref[i]), lim = bnd[i] + tol * sc;
-                            over += err > lim;
-                            worst = fmax(worst, err / lim);
-                        }
-                    }
-                    grade(y, yref, max_rows, N, 0, &mx, &med);
-                    CHECK(over == 0, "prefill M=%d: %zu outputs past the fp16-operand envelope (worst err/limit %.3f)",
-                          max_rows, over, worst);
-                    printf("  prefill GEMM M=%d: every output within its fp16-operand envelope (worst err/limit %.3f); "
-                           "max rel %.2e median %.2e (rows 0..15 %s the GEMV's bits)\n", max_rows, worst, mx, med,
-                           same16 ? "equal to" : "rounding-close to");
-                    /* L266: a PROMPT chunk of any width takes this GEMM, and a row's bytes do not depend on
-                     * how many rows share the call (the pinned cuBLASLt algorithm, no split-K) -- what makes
-                     * a prompt cut anywhere equal to one prefilled whole */
-                    size_t diff_p = 0;
-                    std::vector<float> yp;
-                    for (int Mp : {1, 3, 16, 17}) {
-                        rc = run(d, k2, Mp, K, N, yp, true);
-                        CHECK(rc == 0, "prompt M=%d launch rc=%d", Mp, rc);
-                        if (!rc) diff_p += memcmp(yp.data(), y.data(), yp.size() * sizeof(float)) != 0;
-                    }
-                    CHECK(diff_p == 0, "%s K=%d: %zu of 4 prompt widths (M=1,3,16,17) differ from the same rows at M=%d",
-                          sh.what, k2 / 2, diff_p, max_rows);
-                }
+                grade_prefill(d, w, s, what, yref, k2, max_rows, K, N, sh.what, tol, &y16);
             }
             if (sh.N == 10240 && k2 == 8) {
                 /* 4. mutations: the gate must be able to fail */
@@ -326,7 +354,7 @@ int main(void) {
     /* 6. L288 exl3-dense: the multi launch.  Up to four projections of one input -- mixed widths and rates, the
      * shapes the GDN / QSA blocks and the shared expert give it -- each output bit for bit its single launch's,
      * at every decode width, from one prep launch and one GEMV launch per rate; prompt chunks too. */
-    {
+    if (gemv) {
         struct set { int K, n; int N[4], k2[4]; const char *what; };
         const set sets[] = {
             {2560, 4, {12288, 512, 512, 640}, {10, 10, 10, 10}, "Qwen QSA q / k / v / index (one rate)"},
@@ -426,7 +454,7 @@ int main(void) {
      * 9 are bit for bit its M = 16 rows; (b) three 2560-output windows (the first, one inside, the last) cut from the
      * head's bytes (exl3_expert_cut) and run alone are bit for bit the head's columns -- the split count is K's alone
      * at both widths -- and are graded against the double reference at the section-1 limit. */
-    {
+    if (gemv) {
         struct head { int N, k2; const char *what; };
         const head heads[] = {{248320, 6, "lm_head"}, {248320, 8, "lm_head"}, {248320, 10, "lm_head"},
                               {82304, 6, "MTP draft head"}, {82304, 8, "MTP draft head"}};
@@ -520,7 +548,7 @@ int main(void) {
      * the stored width's remainder); (c) the stored call's pad outputs are exactly 0 (svh 0); (d) graded against the
      * double reference -- the whole output for the small shapes, the head's last 2560 stored columns (cut out with
      * exl3_expert_cut, the tail block among them) for the head; (e) a logical width off 4 is refused. */
-    {
+    if (gemv) {
         struct pad { int K, N, k2; const char *what; };
         const pad pads[] = {{4096, 201024, 12, "Inkling head"}, {4096, 201024, 10, "Inkling head"},
                             {512, 1088, 8, "one tail block"}, {512, 200, 12, "n % 16 != 0"},

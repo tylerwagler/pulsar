@@ -32,6 +32,7 @@
 #include "pulsar_cuda_internal.h"
 #include "pulsar_cuda_mx.cuh"
 #include "lib/pulsar_yarn.h"
+#include "pulsar_cuda_arch.cuh"
 
 #include <algorithm>
 
@@ -377,10 +378,14 @@ static_assert(QSA_SPLIT == 64u, "the warp layout below tiles 64 tokens: 4 warps 
 
 __device__ __forceinline__ void qsa_mma(float (&d)[4], uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3,
                                         uint32_t b0, uint32_t b1) {
+#if PULSAR_SM80
     asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
                  "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
                  : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
                  : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+#else
+    __trap();
+#endif
 }
 /* f32 pair -> (hi, lo) packed f16x2 words: hi = f16(x), lo = f16(x - hi). */
 __device__ __forceinline__ void qsa_split2(float x0, float x1, uint32_t &hi, uint32_t &lo) {
@@ -797,6 +802,7 @@ int pulsar_gpu_qsa_forward(const pulsar_qsa_layer *layer,
                            const pulsar_qsa_seq *seqs, uint32_t n_seqs,
                            const uint32_t *row_seq, const uint32_t *row_pos, uint32_t n_rows,
                            const pulsar_qsa_io *io, pulsar_gpu_tensor *workspace) {
+    PULSAR_REQUIRE_CC(80, "QSA attention (bf16 m16n8k16)", 0);   /* L321: refuse below the lane's arch, before its kernels trap */
     if (!layer || !seqs || !row_seq || !row_pos || !io || !workspace || n_rows == 0 || n_seqs == 0) {
         return qsa_refuse("a NULL argument or zero rows");
     }

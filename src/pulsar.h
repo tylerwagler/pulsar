@@ -107,6 +107,8 @@ typedef enum {
     PULSAR_FAMILY_ID_QWEN4_EXP = 1,  ///< Qwen3.8-Flash-Next (HF model_type qwen4_exp)
     PULSAR_FAMILY_ID_INKLING   = 2,  ///< Thinking Machines' Inkling (HF model_type inkling_mm_model; src/families/inkling)
     PULSAR_FAMILY_ID_NEMOTRON_H = 3, ///< NVIDIA Nemotron-H (Nemotron 3.5 Super VL; HF nemotron_h_omni; src/families/nemotron_h)
+    PULSAR_FAMILY_ID_NEMOTRON_ENC = 4, ///< NVIDIA Nemotron-3.5 Embed / Rerank encoders (HF mistral3; src/families/nemotron_enc)
+    PULSAR_FAMILY_ID_NEMOTRON_PARSE = 5, ///< NVIDIA Nemotron-3.5 Parse (HF nemotron_parse; src/families/nemotron_parse)
 } pulsar_family_id;
 
 /** The conversation format a front end must render for the loaded model: the
@@ -119,6 +121,7 @@ typedef enum {
     PULSAR_CHAT_QWEN    = 2,  ///< Qwen chat template (L251 S5)
     PULSAR_CHAT_INKLING = 3,  ///< Inkling-Small native renderer (L294 E6: src/lib/inkling_chat)
     PULSAR_CHAT_NEMOTRON_H = 4,  ///< Nemotron-H ChatML + think-tag renderer (L296 N8: src/lib/nemotron_chat)
+    PULSAR_CHAT_NONE    = 5,  ///< no conversation: an encoder family (L321) renders its inputs through pulsar_engine_encode_render
 } pulsar_chat_format;
 
 /** The speculative drafter a family's artifacts carry. */
@@ -218,6 +221,12 @@ typedef struct {
 } pulsar_session_snapshot;
 
 int pulsar_engine_open(pulsar_engine **out, const pulsar_engine_options *opt);
+/** L321: open n engines in ONE process, sharing its GPU (one instance, one CUDA context): out[i] is opts[i]'s model.
+ *  Every engine of a process is opened in one group -- an open while engines are live is refused -- and a group
+ *  refuses tensor parallelism, inspect-only opens and a device that reads weights through host registration (each
+ *  member's weights are staged into device memory).  Close the members with pulsar_engine_close in any order; the
+ *  GPU state goes with the last.  0, or 1 with every out[i] NULL (said on stderr). */
+int pulsar_engine_open_group(pulsar_engine **out, const pulsar_engine_options *opts, uint32_t n);
 /** Tensor parallelism (slice 4e, L238): is this engine a WORKER rank of a TP
  * group?  A worker drives no sessions of its own -- its driver must call
  * pulsar_tp_worker_run right after open and exit when it returns; every
@@ -269,6 +278,72 @@ const char *pulsar_engine_family_name(const pulsar_engine *e);
  * A front end that takes text refuses an engine without one at startup; the
  * tokenizer entries themselves end the process by name if reached anyway. */
 bool pulsar_engine_has_tokenizer(const pulsar_engine *e);
+
+/* ---- encoders (L321) ----------------------------------------------------------------------------------------------
+ * An ENCODER family's model maps an input to one vector or one score instead of a next token: no session, no
+ * sampler, no chat.  Its inputs are the family's own renders (its template: a query or passage prefix, a query /
+ * document pair), tokenized by its tokenizer, and one call runs a batch of them through one bidirectional forward.
+ * A decoder family declares no encoder: the entries below refuse by name (PULSAR_ENCODER_NONE, 0). */
+
+/** What an encoder returns per input. */
+typedef enum {
+    PULSAR_ENCODER_NONE   = 0,  ///< a decoder family: no encode entry applies
+    PULSAR_ENCODER_EMBED  = 1,  ///< an embedding: pulsar_engine_encode_dim floats, L2-normalised
+    PULSAR_ENCODER_RERANK = 2,  ///< a relevance score (the head's raw logit; higher is more relevant): one float
+} pulsar_encoder_kind;
+
+/** Which render of the family's template an input takes. */
+typedef enum {
+    PULSAR_ENCODE_QUERY   = 0,  ///< an embedder's query (a search string)
+    PULSAR_ENCODE_PASSAGE = 1,  ///< an embedder's passage (a document chunk)
+    PULSAR_ENCODE_PAIR    = 2,  ///< a reranker's (query, document) pair
+} pulsar_encode_role;
+
+/** The loaded family's encoder kind (NONE on a decoder or no engine). */
+pulsar_encoder_kind pulsar_engine_encoder(const pulsar_engine *e);
+/** Floats per encoded input (an embedding's width, or 1 for a score); 0 on a decoder. */
+uint32_t pulsar_engine_encode_dim(const pulsar_engine *e);
+/** The most tokens one input may have (its render included): the positions the model serves exactly; 0 on a
+ *  decoder.  A longer input is refused, never cut -- truncation is the caller's choice. */
+uint32_t pulsar_engine_encode_max_tokens(const pulsar_engine *e);
+/** Render one input in the family's template and tokenize it, appending to `out`: `text` the query or passage
+ *  (QUERY / PASSAGE), or the query with `doc` the document (PAIR).  Client text never forms a special token.
+ *  false + `err` on a role the encoder does not take or text that is not UTF-8. */
+bool pulsar_engine_encode_render(pulsar_engine *e, pulsar_encode_role role, const char *text, const char *doc,
+                                 pulsar_tokens *out, char *err, size_t errlen);
+/** Encode n rendered inputs: out [n][pulsar_engine_encode_dim] floats.  Each input's result is the same bytes
+ *  whatever else rides in the call (the forward is row-independent outside attention, and attention stays inside
+ *  its input).  A group's encoders and parsers take turns on the GPU a forward at a time (they share one scratch).  0, or -1 + `err` (an empty or over-long input, a decoder
+ *  family, a device failure). */
+int pulsar_engine_encode(pulsar_engine *e, const pulsar_tokens *inputs, uint32_t n, float *out, char *err,
+                         size_t errlen);
+
+/* ---- parsers (L321) -------------------------------------------------------------------------------------------------
+ * A PARSER family's model reads a page image and writes its text (Nemotron Parse: markdown with classes and boxes in
+ * the model's own markup): no session, no chat -- one call, one page, generated greedily by the model's own recipe.
+ * Calls are serialised on the engine; between its GPU phases (the vision, the prefill, each decode step) the group's
+ * other engines run theirs, so an encode waits a step, not a page.  A family without a parser refuses by name. */
+typedef struct {
+    const char *prompt;        ///< the task prompt (the model's added tokens, back to back); NULL = the model's default
+    uint32_t max_new_tokens;   ///< 0 = the model's default
+} pulsar_parse_options;
+
+typedef struct {
+    uint32_t image_w, image_h;     ///< the image as decoded
+    uint32_t prefix_rows;          ///< the visual prefix the page became
+    uint32_t prompt_tokens, generated_tokens;
+    bool finished;                 ///< the model ended the page (its eos), not a cap
+    double vision_ms, prefill_ms, decode_ms;
+} pulsar_parse_stats;
+
+/** Does the loaded family parse pages? */
+bool pulsar_engine_is_parser(const pulsar_engine *e);
+/** Parse one page (`image`: PNG or JPEG bytes).  `ids` (appended): the whole sequence, prompt and generated, eos
+ *  included when reached; `*text`: its decode (malloc'd; the model's tokenizer, special tokens kept); `stats` may be
+ *  NULL.  0; -2 + `err`: the request refused (an image the model does not take, a prompt that is not its tokens);
+ *  -1 + `err`: the engine failed (a device failure). */
+int pulsar_engine_parse_page(pulsar_engine *e, const uint8_t *image, size_t len, const pulsar_parse_options *opt,
+                             pulsar_tokens *ids, char **text, pulsar_parse_stats *stats, char *err, size_t errlen);
 
 /** DSpark speculative-decode counters for the server /metrics endpoint. All
  * cumulative/monotonic since engine open.

@@ -1972,6 +1972,7 @@ struct pulsar_engine {
     uint32_t tp_worker_n;
     uint32_t tp_worker_cap;
     bool gpu_ready;             ///< CUDA backend initialised and weights resident
+    bool live;                  ///< L321: counted among the process's live engines (holds the instance)
     bool dspark_ready;          ///< a usable drafter is loaded; false disables speculation
     const struct pulsar_drafter_ops *drafter_ops;   ///< L272 P1: the loaded drafter behind the round API (spec_ops.h), or NULL = none
     /** L298: the loaded block drafter (spec_block.h: its declaration, tap points, weights, state ids), or NULL -- set
@@ -2003,6 +2004,8 @@ struct pulsar_engine {
      * managed exactly as before via open()/destroy() (xcalloc/free), NOT
      * constructors/destructors. */
     static int open(pulsar_engine **out, const pulsar_engine_options *opt);
+    /** L321: n engines in one process (pulsar.h pulsar_engine_open_group). */
+    static int open_group(pulsar_engine **out, const pulsar_engine_options *opts, uint32_t n);
     void destroy();  ///< was pulsar_engine_close
     /** Print a human-readable model summary (shape, quantisation, memory) to
      * stderr. */
@@ -3220,7 +3223,8 @@ typedef enum {
     PULSAR_ACT_SLOT_BF16 = 0,   ///< the slot's bf16 plane (DeepSeek's plain F32 / BF16 weights, cuBLAS)
     PULSAR_ACT_ROWS_BF16 = 1,   ///< raw bf16 rows (Qwen)
     PULSAR_ACT_SLOT_E4M3 = 2,   ///< the slot's E4M3 MX plane (DeepSeek's MXFP8 dense and routed experts)
-    PULSAR_ACT_COUNT = 3,
+    PULSAR_ACT_ROWS_F16 = 3,    ///< raw f16 rows (L321: an fp16 tensor-core consumer's operand -- the Turing lane)
+    PULSAR_ACT_COUNT = 4,
 } pulsar_act_format;
 #define PULSAR_ACTS(a) (1u << (a))
 /** L272 P4c: the kernel arm a dense linear takes for (stored format, activation) -- admission (pulsar_format_serves)
@@ -3234,6 +3238,7 @@ typedef enum {
     PULSAR_DENSE_ARM_EXL3_ROWS,    ///< EXL3 at a dense-arm rate, raw bf16 rows
     PULSAR_DENSE_ARM_BF16_ROWS,    ///< bf16 weight, raw bf16 rows (L295 F7: the tensor-core rows kernel / cuBLASLt)
     PULSAR_DENSE_ARM_NVFP4_ROWS,   ///< nvfp4 weight, raw bf16 rows (L298: the W4A16 rows kernel, every row kind)
+    PULSAR_DENSE_ARM_F16_ROWS,     ///< f16 weight, raw bf16 rows (L321: the fp16 tensor-core arm, every row kind, sm_75+)
 } pulsar_dense_arm;
 pulsar_dense_arm pulsar_dense_arm_for(uint32_t type, pulsar_act_format act);
 /** L272 P4c: the dense linear's front door (linear.cpp).  A weight's device pointer: the rank's TP slice, else the
@@ -3586,10 +3591,29 @@ int vision_image_grid(int width, int height, const pulsar_vision_args *args,
  * loudly on 0 rather than guessing at a format.  `*rgb_out` is malloc'd and the
  * caller owns it.  CMYK/YCCK JPEG is refused: Pillow keeps those in CMYK and its
  * own .convert("RGB") is a different transform from libjpeg's. */
-/** Pillow's Image.resize(BICUBIC) of packed RGB8 (ImagingResample, fixed-point, horizontal then vertical), bit for
- *  bit -- every family's resize whose reference is Pillow (DeepSeek's load_image, Qwen's PIL processor).  Returns
- *  a malloc'd dst_w x dst_h image (a copy when the size is unchanged), NULL on failure. */
-uint8_t *vision_pil_resize_rgb(const uint8_t *src, int src_w, int src_h, int dst_w, int dst_h);
+/** L321: the process's GPU phase lock.  The engines of a group (pulsar_engine_open_group) share one GPU, the fixed
+ *  GEMM's shapes and workspace and the encoders' scratch, so a single-call family (an encoder, a parser) runs its GPU
+ *  work in PHASES -- a packed encode forward, one ViT block, a page's prefill, one decode step -- each one a
+ *  pulsar_group_gpu_phase: the lock held, the device synchronised before it goes.  Phases of different engines
+ *  interleave; a phase is never shared, so whatever a phase leaves for the next lives in its engine's own buffers. */
+void pulsar_group_gpu_lock(void);
+void pulsar_group_gpu_unlock(void);
+struct pulsar_group_gpu_phase {
+    pulsar_group_gpu_phase() { pulsar_group_gpu_lock(); }
+    ~pulsar_group_gpu_phase() {
+        (void)pulsar_gpu_synchronize();   /* a failure surfaces at the phase's own next launch or read */
+        pulsar_group_gpu_unlock();
+    }
+    pulsar_group_gpu_phase(const pulsar_group_gpu_phase &) = delete;
+    pulsar_group_gpu_phase &operator=(const pulsar_group_gpu_phase &) = delete;
+};
+
+/** Pillow's resample filters the image paths use (L321: BILINEAR for Nemotron Parse). */
+typedef enum { PULSAR_PIL_BICUBIC = 0, PULSAR_PIL_BILINEAR = 1 } pulsar_pil_filter;
+/** Pillow's Image.resize(BICUBIC | BILINEAR) of packed RGB8 (ImagingResample, fixed-point, horizontal then vertical),
+ *  bit for bit -- every family's resize whose reference is Pillow (DeepSeek's load_image, Qwen's PIL processor,
+ *  Parse's).  Returns a malloc'd dst_w x dst_h image (a copy when the size is unchanged), NULL on failure. */
+uint8_t *vision_pil_resize_rgb(const uint8_t *src, int src_w, int src_h, int dst_w, int dst_h, pulsar_pil_filter filter);
 int vision_decode_rgb(const uint8_t *bytes, size_t len,
                       uint8_t **rgb_out, int *w_out, int *h_out);
 

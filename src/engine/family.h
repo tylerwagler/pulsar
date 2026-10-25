@@ -180,6 +180,8 @@ enum : uint32_t {
     PULSAR_FAMILY_CAP_CHAT    = 1u << 7,  ///< tokenizer + chat renderer (a family without it cannot take text)
     PULSAR_FAMILY_CAP_SEGMENTS = 1u << 9, ///< disk KV segments: span files of the grid checkpoint store (L264; Qwen L266)
     PULSAR_FAMILY_CAP_MIXED_PREFILL = 1u << 10, ///< decode_mixed carries prefill runs beside its decode rows (the plain lane's mixed quantum); without it a prompt rides only the fused step
+    PULSAR_FAMILY_CAP_ENCODE  = 1u << 11, ///< L321: an encoder -- the family provides pulsar_family::encoder (pulsar.h pulsar_engine_encode*)
+    PULSAR_FAMILY_CAP_PARSE   = 1u << 12, ///< L321: a page parser -- the family provides pulsar_family::parser (pulsar.h pulsar_engine_parse_page)
 };
 
 /** The session operations every family implements.  The C API
@@ -313,6 +315,23 @@ typedef struct {
     bool (*pooled)(const pulsar_session *s);
 } pulsar_family_bank_ops;
 
+/** L321: an encoder family's entries (pulsar.h pulsar_engine_encode*): the C API checks PULSAR_FAMILY_CAP_ENCODE and
+ *  calls these.  Present exactly when the family declares the cap (pulsar_family_for_model asserts it). */
+typedef struct pulsar_family_encoder {
+    pulsar_encoder_kind (*kind)(const pulsar_engine *e);
+    uint32_t (*dim)(const pulsar_engine *e);
+    uint32_t (*max_tokens)(const pulsar_engine *e);
+    bool (*render)(pulsar_engine *e, pulsar_encode_role role, const char *text, const char *doc, pulsar_tokens *out,
+                   char *err, size_t errlen);
+    int (*encode)(pulsar_engine *e, const pulsar_tokens *inputs, uint32_t n, float *out, char *err, size_t errlen);
+} pulsar_family_encoder;
+
+/** L321: a page-parser family's entry (pulsar.h pulsar_engine_parse_page), behind PULSAR_FAMILY_CAP_PARSE. */
+typedef struct pulsar_family_parser {
+    int (*parse)(pulsar_engine *e, const uint8_t *image, size_t len, const pulsar_parse_options *opt, pulsar_tokens *ids,
+                 char **text, pulsar_parse_stats *stats, char *err, size_t errlen);
+} pulsar_family_parser;
+
 /** One model family.  Instances are static and const; pulsar_engine::family
  * points at one for the engine's lifetime. */
 struct pulsar_family {
@@ -381,6 +400,10 @@ struct pulsar_family {
     /** L295 E1: release what load built into pulsar_engine::family_state (engine destroy, before the model is
      *  unmapped; also after a load that failed part way).  NULL = the family keeps nothing there. */
     void (*unload)(pulsar_engine *e);
+    /** L321: the encoder entries (PULSAR_FAMILY_CAP_ENCODE), or NULL = a decoder. */
+    const pulsar_family_encoder *encoder;
+    /** L321: the page parser (PULSAR_FAMILY_CAP_PARSE), or NULL. */
+    const pulsar_family_parser *parser;
 };
 
 extern const pulsar_family PULSAR_FAMILY_DEEPSEEK4;

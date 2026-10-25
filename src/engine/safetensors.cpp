@@ -456,6 +456,7 @@ static uint32_t st_layout_type(const char *layout, const char *dtype, const char
         if (!strcmp(dtype, "F32")) return PULSAR_TENSOR_F32;
         if (!strcmp(dtype, "I32")) return PULSAR_TENSOR_I32;
         if (!strcmp(dtype, "BF16")) return PULSAR_TENSOR_BF16;
+        if (!strcmp(dtype, "F16")) return PULSAR_TENSOR_F16;
         st_die("safetensors: %s: native tensor with unsupported dtype '%s'", what, dtype);
     }
     if (!strcmp(layout, "fp8_e4m3")) {
@@ -483,6 +484,7 @@ static uint64_t st_bytes_for(uint32_t type, const uint64_t *dim, uint32_t nd) {
     case PULSAR_TENSOR_I32:
         return elements * 4;
     case PULSAR_TENSOR_BF16:
+    case PULSAR_TENSOR_F16:
         return elements * 2;
     case PULSAR_TENSOR_IQ2_XXS_MMQ_K:
         if (nd < 2 || elements % 256) st_die("safetensors: IQ2 tensor has a bad shape");
@@ -631,12 +633,12 @@ static void st_add_declared(st_dir *d, st_shard *s) {
                         s->name, hf);
         uint32_t type = st_layout_type(layout, ft->dtype, hf);
         /* L278 (the loader contract): the header dtype must be the one the layout is stored as -- the builder's
-         * table (tools/container/build.py NATIVE_DTYPES): the typed layouts bf16 / f32 / i32 as BF16 / F32 / I32,
+         * table (tools/container/build.py NATIVE_DTYPES): the typed layouts bf16 / f16 / f32 / i32 as BF16 / F16 / F32 / I32,
          * `native` as whatever it says (st_layout_type reads it), every packed layout as U8 [nbytes].  A header that
          * says otherwise is a container that disagrees with itself; it loaded anyway, the layout silently winning. */
         if (strcmp(layout, "native") != 0) {
-            const char *want_dtype = !strcmp(layout, "bf16") ? "BF16" : !strcmp(layout, "f32") ? "F32"
-                                   : !strcmp(layout, "i32") ? "I32" : "U8";
+            const char *want_dtype = !strcmp(layout, "bf16") ? "BF16" : !strcmp(layout, "f16") ? "F16"
+                                   : !strcmp(layout, "f32") ? "F32" : !strcmp(layout, "i32") ? "I32" : "U8";
             if (strcmp(ft->dtype, want_dtype) != 0)
                 st_die("safetensors: %s: %s is layout %s but stored as %s, not %s -- the container disagrees with itself",
                        s->name, hf, layout, ft->dtype, want_dtype);

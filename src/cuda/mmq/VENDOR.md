@@ -42,9 +42,10 @@
 > **Constants that outlived their files** now live in `ds4_act_block.cuh`:
 > `block_mx_act_mmq` (renamed from `block_q8_1_mmq`; it holds E4M3, not q8_1),
 > `DS4_ACT_BLOCK_VALS` (was `QK8_1_MMQ`), `DS4_ACT_QUANT_BLOCK` (was
-> `CUDA_QUANTIZE_BLOCK_SIZE_MMQ`) and `MMQ_DP4A_MAX_BATCH_SIZE`, which is still
-> read by the live `ds4_mmq_should_use` gate and is kept at upstream's value so
-> the routing decision is unchanged by the deletion.
+> `CUDA_QUANTIZE_BLOCK_SIZE_MMQ`).  `MMQ_DP4A_MAX_BATCH_SIZE` survived here until
+> L321, read by `ds4_mmq_should_use`'s pre-Turing knee; that gate now asks only
+> whether the device has the sm_12x block-scaled MMA, and the constant, the
+> compiled-arch fold and the turing/fp16 MMA predicates are deleted with it.
 >
 > **A re-vendor is now much smaller, and the rename conflict noted below is
 > moot** for `mmq.cuh` and `quantize.cu` — both are deleted.

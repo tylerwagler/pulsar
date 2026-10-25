@@ -28,8 +28,10 @@ RECURSIVE              = YES
 #
 # Our own adapters in that directory (ds4_mmq*, ds4_mmid*, ds4_ggml_stubs*,
 # ds4_act_block.cuh, ds4_quantize_e4m3.cu) stay IN scope -- they are ours to
-# document.
+# document.  src/cuda/fmha is CUTLASS examples/41 at the pin (its VENDOR.md),
+# out of scope for the same reason; its wrapper pulsar_cuda_fmha.* is ours.
 EXCLUDE                = src/vendor \
+                         src/cuda/fmha \
                          src/cuda/mmq/mma.cuh \
                          src/cuda/mmq/mmid.cu \
                          src/cuda/mmq/mmid.cuh \

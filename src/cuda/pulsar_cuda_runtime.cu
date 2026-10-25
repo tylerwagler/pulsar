@@ -1,4 +1,5 @@
 #include "pulsar_cuda_internal.h"
+#include "pulsar_cuda_arch.cuh"   /* pulsar_cuda_device_cc: the layout / startup checks (L321) */
 #include "engine/exl3_trellis.h" /* L269 W1: exl3_expert_cut, the EXL3 expert half */
 
 #include <list>
@@ -800,8 +801,25 @@ static uint64_t cuda_model_cache_limit_bytes(void) {
     /* One Spark can run the IQ2 model (~81 GiB) and larger mixed models
      * (~91 GiB) via the startup tensor cache.  Keep enough headroom for
      * scratch and KV; anything bigger is rejected at load so the model stays
-     * fully resident.  (The env override had no caller; L159 inc 4.) */
-    return 96ull * 1073741824ull;
+     * fully resident.  (The env override had no caller; L159 inc 4.)
+     * L321: that is the INTEGRATED budget.  A discrete card's is its own memory less the headroom its scratch and
+     * activations need (the larger of 2 GiB and a fifth), asked of the device once -- a 16 GB Turing card is not a
+     * 121 GiB GB10, and a model past its budget must refuse at load rather than die half staged. */
+    static uint64_t limit = 0;
+    if (!limit) {
+        int dev = 0, integrated = 1;
+        size_t free_b = 0, total_b = 0;
+        if (cudaGetDevice(&dev) == cudaSuccess &&
+            cudaDeviceGetAttribute(&integrated, cudaDevAttrIntegrated, dev) == cudaSuccess && !integrated &&
+            cudaMemGetInfo(&free_b, &total_b) == cudaSuccess && total_b) {
+            const uint64_t head = std::max<uint64_t>(2ull * 1073741824ull, (uint64_t)total_b / 5u);
+            limit = (uint64_t)total_b > head ? (uint64_t)total_b - head : 0u;
+        } else {
+            (void)cudaGetLastError();
+            limit = 96ull * 1073741824ull;
+        }
+    }
+    return limit;
 }
 
 
@@ -1188,6 +1206,26 @@ static int cuda_tu_archs_ok(const cudaDeviceProp *prop) {
 
 
 
+int pulsar_gpu_layout_supported(uint32_t layout, const char **need) {
+    const int cc = pulsar_cuda_device_cc();
+    int ok = 1;
+    const char *why = "";
+    switch (layout) {
+    case PULSAR_TENSOR_MXFP8_LT:
+        ok = cc >= 100; why = "sm_100+ (cuBLASLt block-scaled MXFP8, VEC32_UE8M0)"; break;
+    case PULSAR_TENSOR_IQ2_XXS_MMQ_K:
+    case PULSAR_TENSOR_CUTLASS_MXFP4:
+    case PULSAR_TENSOR_NVFP4:
+        ok = pulsar_cuda_block_scale_mma(cc / 10); why = "the sm_12x family (block-scaled MMA / e2m1 conversions)"; break;
+    case PULSAR_TENSOR_FP8_E4M3_SOA_K:
+        ok = cc >= 89; why = "sm_89+ (e4m3 MMA)"; break;
+    default:   /* f32 / i32 / bf16 / the EXL3 rates: their lanes refuse per arm (EXL3 decode rows, bf16 rows: sm_80) */
+        break;
+    }
+    if (need) *need = why;
+    return ok;
+}
+
 int pulsar_gpu_init(void) {
     int dev = 0;
     if (!cuda_ok(cudaSetDevice(dev), "set device")) return 0;
@@ -1196,20 +1234,15 @@ int pulsar_gpu_init(void) {
         fprintf(stderr, "pulsar: CUDA backend initialized on %s (sm_%d%d)\n",
                 prop.name, prop.major, prop.minor);
         if (!cuda_tu_archs_ok(&prop)) return 0;
-        /* The dense path is cuBLASLt block-scaled MXFP8 (MATRIX_SCALE_VEC32_UE8M0) and the expert
-         * path is CUTLASS sm_120f; neither has a fallback (rule 1).  Refuse HERE, by name and
-         * once, instead of letting the descriptor's scale-mode attribute come back
-         * NOT_SUPPORTED and the matmul then run WITHOUT its block scales: matmul.cu does not
-         * check those return values, so the failure mode on an older device is silently wrong
-         * numbers rather than an error.  This is the dense half of the 2x A6000 port's work
-         * list; the GDN kernels' sm_90+ thread-block clusters (pulsar_cuda_gdn.cu) are the
-         * other half -- and note the existing arch trap cannot cover either, because a
-         * sm_86-only build matches a sm_86 device and passes cuda_tu_archs_ok. */
-        if (prop.major < 10) {
-            fprintf(stderr,
-                    "pulsar: the dense and expert paths need Blackwell tensor cores "
-                    "(block-scaled MXFP8 MATRIX_SCALE_VEC32_UE8M0 + CUTLASS sm_120f); this GPU "
-                    "(%s) is sm_%d%d, and there is no fallback path\n",
+        /* L321: this used to refuse every device below sm_100, because the MXFP8 dense path (cuBLASLt block-scaled
+         * VEC32_UE8M0) does not check the scale-mode return values and on an older device would run WITHOUT its
+         * block scales -- silently wrong numbers.  That hazard now refuses where it lives: a model whose layouts this
+         * device cannot run is refused at load, by layout (pulsar_gpu_layout_supported: mxfp8_lt needs sm_100+), and
+         * each lane whose kernels need more than sm_75 refuses on its host side (PULSAR_REQUIRE_CC, the EXL3 decode
+         * rows, attn_f16, the block-scaled MMA gates) before a kernel could trap.  What stays global is the floor
+         * every lane needs: Turing's fp16 tensor cores (mma m16n8k8, ldmatrix). */
+        if (prop.major * 10 + prop.minor < 75) {
+            fprintf(stderr, "pulsar: this GPU (%s) is sm_%d%d; pulsar needs sm_75 (Turing) or newer\n",
                     prop.name, prop.major, prop.minor);
             return 0;
         }
@@ -2246,12 +2279,6 @@ static int cuda_model_set_host_map(const void *model_map, uint64_t model_size) {
     }
     g_model_cache_full = 0;
     g_model_mapping_failure_notice_printed = 0;
-    /* The legacy pulsar_gpu_set_model_fd(fd) registers an fd before the map is
-     * known, so an entry can exist keyed by NULL; bind it to this mapping now.
-     * The safetensors lane never needs this -- it passes the map explicitly. */
-    for (int i = 0; i < g_model_fd_count; i++) {
-        if (g_model_fds[i].map == NULL) g_model_fds[i].map = model_map;
-    }
     return 1;
 }
 
@@ -2269,8 +2296,24 @@ int pulsar_gpu_set_model_map(const void *model_map, uint64_t model_size) {
      * (the old PULSAR_CUDA_HOST_REGISTER_PLAIN) let registration SUCCEED on GB10
      * and then served -12% prefill / -26% decode with DIFFERENT LOGITS, i.e. the
      * weights the GPU read did not match. */
-    cudaError_t err = cudaHostRegister((void *)model_map, (size_t)model_size,
-                                       cudaHostRegisterMapped | cudaHostRegisterReadOnly);
+    /* L321: registration is the INTEGRATED GPU's strategy (GB10: one memory, the mapping is where the weights live).
+     * A discrete card would accept it too and then read every weight over PCIe on every use, ~1/30 of its own
+     * memory's bandwidth -- so a discrete card takes the staged route instead, which copies each span into device
+     * memory once (cuda_model_range_ptr_from_fd).  One question, asked of the device: cudaDevAttrIntegrated. */
+    int dev_id = 0, integrated = 0;
+    if (cudaGetDevice(&dev_id) != cudaSuccess ||
+        cudaDeviceGetAttribute(&integrated, cudaDevAttrIntegrated, dev_id) != cudaSuccess) {
+        (void)cudaGetLastError();
+        integrated = 0;
+    }
+    cudaError_t err = cudaErrorNotSupported;
+    if (integrated) {
+        err = cudaHostRegister((void *)model_map, (size_t)model_size, cudaHostRegisterMapped | cudaHostRegisterReadOnly);
+    } else {
+        fprintf(stderr, "pulsar: discrete GPU: the model's %.2f GiB are staged into device memory span by span "
+                        "(not host-registered: that would read every weight over PCIe)\n",
+                (double)model_size / 1073741824.0);
+    }
     if (err == cudaSuccess) {
         void *dev = NULL;
         err = cudaHostGetDevicePointer(&dev, (void *)model_map, 0);
@@ -2284,7 +2327,7 @@ int pulsar_gpu_set_model_map(const void *model_map, uint64_t model_size) {
             (void)cudaGetLastError();
         }
     } else {
-        fprintf(stderr, "pulsar: CUDA host registration skipped: %s\n", cudaGetErrorString(err));
+        if (integrated) fprintf(stderr, "pulsar: CUDA host registration skipped: %s\n", cudaGetErrorString(err));
         (void)cudaGetLastError();
         const uint64_t limit = cuda_model_local_model_limit_bytes();
         if (model_size > limit) {
@@ -2363,9 +2406,7 @@ int pulsar_gpu_set_model_fd_for_map(int fd, const void *model_map) {
 
 
 
-int pulsar_gpu_set_model_fd(int fd) {
-    return pulsar_gpu_set_model_fd_for_map(fd, g_model_host_base);
-}
+
 
 
 

@@ -252,6 +252,9 @@ static inline const pulsar_family_bank_ops *session_banks(const pulsar_session *
 
 
 int pulsar_engine_open(pulsar_engine **out, const pulsar_engine_options *opt) { return pulsar_engine::open(out, opt); }
+int pulsar_engine_open_group(pulsar_engine **out, const pulsar_engine_options *opts, uint32_t n) {
+    return pulsar_engine::open_group(out, opts, n);
+}
 void pulsar_engine_close(pulsar_engine *e) { if (e) e->destroy(); }
 void pulsar_engine_summary(pulsar_engine *e) { e->summary(); }
 int pulsar_engine_vocab_size(pulsar_engine *e) { return e ? e->vocab_size() : 0; }
@@ -339,6 +342,53 @@ bool pulsar_engine_has_mixed_prefill(const pulsar_engine *e) {
 bool pulsar_engine_has_snapshots(const pulsar_engine *e) { return e && (e->family->caps & PULSAR_FAMILY_CAP_PAYLOAD) != 0; }
 bool pulsar_engine_has_vision(const pulsar_engine *e) { return e && e->family->vision && e->vision_ready; }
 pulsar_drafter_kind pulsar_engine_drafter(pulsar_engine *e) { return e ? e->family->drafter(e) : PULSAR_DRAFTER_NONE; }
+
+/* L321: the encoder entries -- the family's (pulsar_family_encoder), behind PULSAR_FAMILY_CAP_ENCODE */
+static const pulsar_family_encoder *encoder_of(const pulsar_engine *e) {
+    return e && (e->family->caps & PULSAR_FAMILY_CAP_ENCODE) ? e->family->encoder : NULL;
+}
+pulsar_encoder_kind pulsar_engine_encoder(const pulsar_engine *e) {
+    const pulsar_family_encoder *x = encoder_of(e);
+    return x ? x->kind(e) : PULSAR_ENCODER_NONE;
+}
+uint32_t pulsar_engine_encode_dim(const pulsar_engine *e) {
+    const pulsar_family_encoder *x = encoder_of(e);
+    return x ? x->dim(e) : 0;
+}
+uint32_t pulsar_engine_encode_max_tokens(const pulsar_engine *e) {
+    const pulsar_family_encoder *x = encoder_of(e);
+    return x ? x->max_tokens(e) : 0;
+}
+bool pulsar_engine_encode_render(pulsar_engine *e, pulsar_encode_role role, const char *text, const char *doc,
+                                 pulsar_tokens *out, char *err, size_t errlen) {
+    PULSAR_FAMILY_REQUIRES_E(e, PULSAR_FAMILY_CAP_ENCODE, "encoding (a decoder family)", false);
+    if (!e || !out) {
+        if (err) snprintf(err, errlen, "no engine or no output");
+        return false;
+    }
+    return e->family->encoder->render(e, role, text, doc, out, err, errlen);
+}
+bool pulsar_engine_is_parser(const pulsar_engine *e) {
+    return e && (e->family->caps & PULSAR_FAMILY_CAP_PARSE) && e->family->parser;
+}
+int pulsar_engine_parse_page(pulsar_engine *e, const uint8_t *image, size_t len, const pulsar_parse_options *opt,
+                             pulsar_tokens *ids, char **text, pulsar_parse_stats *stats, char *err, size_t errlen) {
+    PULSAR_FAMILY_REQUIRES_E(e, PULSAR_FAMILY_CAP_PARSE, "page parsing (not a parser family)", -1);
+    if (!e || !image || !ids || !text) {
+        if (err) snprintf(err, errlen, "no engine, image or output");
+        return -1;
+    }
+    return e->family->parser->parse(e, image, len, opt, ids, text, stats, err, errlen);
+}
+int pulsar_engine_encode(pulsar_engine *e, const pulsar_tokens *inputs, uint32_t n, float *out, char *err,
+                         size_t errlen) {
+    PULSAR_FAMILY_REQUIRES_E(e, PULSAR_FAMILY_CAP_ENCODE, "encoding (a decoder family)", -1);
+    if (!e || (n && (!inputs || !out))) {
+        if (err) snprintf(err, errlen, "no engine, inputs or output");
+        return -1;
+    }
+    return e->family->encoder->encode(e, inputs, n, out, err, errlen);
+}
 
 void pulsar_session_set_progress(pulsar_session *s, pulsar_session_progress_fn fn, void *ud) { if (s) s->set_progress(fn, ud); }
 void pulsar_session_set_display_progress(pulsar_session *s, pulsar_session_progress_fn fn, void *ud) { if (s) s->set_display_progress(fn, ud); }

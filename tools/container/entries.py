@@ -25,9 +25,10 @@ def kind_of(hf, name: str) -> str:
     return PR.source_kind(hf.dtype(name), "scale" if hf.has(s) else None)
 
 
-def dense(hf, name: str, layout: str, dshape: list, mxfp8_mode: str = "rederive") -> dict:
+def dense(hf, name: str, layout: str, dshape: list, mxfp8_mode: str = "rederive", axes: tuple = ()) -> dict:
     """{dtype, shape, nbytes, src} of the entry writing HF tensor `name` as `layout`, declared `dshape` (the
-    shape the container holds; dims_ne is its reverse)."""
+    shape the container holds; dims_ne is its reverse).  `axes` (Mapped.axes): the source dims' permutation an
+    elementwise producer applies first."""
     kind = kind_of(hf, name)
     prod = PR.producer_for(kind, layout, name)
     hshape = hf.shape(name)
@@ -39,6 +40,17 @@ def dense(hf, name: str, layout: str, dshape: list, mxfp8_mode: str = "rederive"
         for d in hshape:
             n_el *= d
         return {"dtype": "I32", "shape": list(dshape), "nbytes": 4 * n_el, "src": ("produce", PR.spec(prod, [name]))}
+    if prod == "f16_from_f32":   # elementwise: any rank, the declared shape the (permuted) source's elements
+        nbytes = PR.bytes_for(layout, list(reversed(dshape)))
+        n_el = 1
+        for d in hshape:
+            n_el *= d
+        if nbytes != 2 * n_el:
+            raise SystemExit(f"{name}: declared {dshape} holds {nbytes // 2} elements, the source {hshape} {n_el}")
+        return {"dtype": "F16", "shape": list(dshape), "nbytes": nbytes,
+                "src": ("produce", PR.spec(prod, [name], shape=list(hshape), axes=list(axes)))}
+    if axes:
+        raise SystemExit(f"{name}: a permutation is an elementwise producer's (f16); {prod} reads the source as is")
     if len(hshape) != 2:
         raise SystemExit(f"{name}: {prod} writes a matrix, the source is {hf.dtype(name)} {hshape}")
     nbytes = PR.bytes_for(layout, list(reversed(dshape)))

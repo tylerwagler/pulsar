@@ -22,6 +22,7 @@
 #include "mmq/ds4_mmid.cuh"
 #include "mmq/ds4_mmq.h"
 #include "pulsar_cuda_scratch.h"
+#include "pulsar_cuda_arch.cuh"
 #endif
 
 #include <cuda_bf16.h>
@@ -43,10 +44,14 @@ static_assert(stage_bytes<1>() <= 48 * 1024 && stage_bytes<2>() <= 48 * 1024 && 
               "the staged chunk must fit the default dynamic shared memory");
 
 __device__ __forceinline__ void mma_bf16_16816(float (&d)[4], const uint32_t (&a)[4], uint32_t b0, uint32_t b1) {
+#if PULSAR_SM80
     asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
                  "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
                  : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
                  : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+#else
+    __trap();
+#endif
 }
 
 /** One CTA's 128 outputs [o0, o0 + 128) of W [out][in] for nr <= 8 NT activation rows: row i of the call is
@@ -225,6 +230,7 @@ bool aligned16(const void *p) { return ((uintptr_t)p & 15u) == 0; }
 
 int pulsar_bf16_rows_linear_launch(const void *w, const uint16_t *x_bf16, int rows, int in, int out, float *y,
                                    bool prompt, cudaStream_t stream) {
+    PULSAR_REQUIRE_CC(80, "the bf16 rows linear (bf16 m16n8k16 / cuBLASLt bf16)", -1);   /* L321: refuse below the lane's arch, before its kernels trap */
     if (!w || !x_bf16 || !y || rows <= 0 || in <= 0 || out <= 0 || in % 64 || !aligned16(w) || !aligned16(x_bf16) ||
         !aligned16(y)) {
         fprintf(stderr, "pulsar: BF16 linear (bf16 rows): %d -> %d at %d rows needs in %% 64 and 16-byte aligned "
@@ -268,6 +274,7 @@ int pulsar_bf16_rows_linear_launch(const void *w, const uint16_t *x_bf16, int ro
 int pulsar_bf16_moe_routed_launch(const pulsar_bf16_moe &w, const int32_t *sel, const float *wts, int T, int top_k,
                                   float clamp, const uint16_t *x_bf16, float *gate_z, float *up_z, uint16_t *mid,
                                   float *down_z, float *out, uint32_t *nf_flag, uint32_t nf_code, cudaStream_t stream) {
+    PULSAR_REQUIRE_CC(80, "the bf16 routed MoE (bf16 m16n8k16)", -1);   /* L321: refuse below the lane's arch, before its kernels trap */
     const char *tag = "pulsar: routed MoE (bf16 rows, BF16 experts)";
     /* the activation names the stacks: SWIGLU gate + up, RELU2 up alone (a non-gated expert: no gate stack) */
     const bool gated = w.act == PULSAR_FFN_ACT_SWIGLU;

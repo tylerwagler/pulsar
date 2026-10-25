@@ -77,7 +77,7 @@ bool pulsar_linear_rows_ref(const pulsar_model *m, const pulsar_tensor *t, int i
                             const char *what, pulsar_rows_linear *l) {
     const pulsar_dense_arm arm = pulsar_dense_arm_for(t->type, PULSAR_ACT_ROWS_BF16);
     if (arm != PULSAR_DENSE_ARM_MXFP8_ROWS && arm != PULSAR_DENSE_ARM_EXL3_ROWS && arm != PULSAR_DENSE_ARM_BF16_ROWS &&
-        arm != PULSAR_DENSE_ARM_NVFP4_ROWS) {
+        arm != PULSAR_DENSE_ARM_NVFP4_ROWS && arm != PULSAR_DENSE_ARM_F16_ROWS) {
         say_no_arm(t, "raw bf16 rows");
         return false;
     }
@@ -85,11 +85,12 @@ bool pulsar_linear_rows_ref(const pulsar_model *m, const pulsar_tensor *t, int i
     l->in = in;
     l->out = out;
     /* the launcher's arm: k2 = the EXL3 rate, or 0 with the mxfp8_lt E8M0 plane (after the [out][in] E4M3), or the
-     * BF16 flag (L295 F7) */
+     * BF16 flag (L295 F7), the nvfp4 one (L298), the f16 one (L321) */
     l->k2 = arm == PULSAR_DENSE_ARM_EXL3_ROWS ? exl3_type_k2(t->type) : 0;
     l->sf = arm == PULSAR_DENSE_ARM_MXFP8_ROWS && l->w ? (const uint8_t *)l->w + (uint64_t)out * in : NULL;
     l->prompt = prompt;
     l->bf16 = arm == PULSAR_DENSE_ARM_BF16_ROWS;
     l->nvfp4 = arm == PULSAR_DENSE_ARM_NVFP4_ROWS;
+    l->f16 = arm == PULSAR_DENSE_ARM_F16_ROWS;
     return l->w != NULL;
 }

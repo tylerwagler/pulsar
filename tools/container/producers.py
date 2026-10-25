@@ -409,6 +409,18 @@ def rows_gather(buf: bytes, row_bytes: int, rows: list) -> bytes:
     return a[ix].tobytes()
 
 
+def f16_from_f32(raw: bytes, shape: list, axes: list = ()) -> bytes:
+    """An F32 tensor as IEEE f16, round to nearest even (numpy's cast), refused when a value would overflow (L321: the
+    Turing lane's dense format).  `axes`: a permutation of `shape` applied first -- a family reading a convolution's
+    weight as the Linear it is (Nemotron Parse's neck: [out, ch, 1, kw] -> [out, kw, ch])."""
+    v = np.frombuffer(raw, dtype="<f4").reshape([int(d) for d in shape])
+    if axes:
+        v = v.transpose([int(a) for a in axes])
+    if v.size and np.abs(v).max() > np.finfo(np.float16).max:
+        raise ValueError(f"f16_from_f32: |value| {float(np.abs(v).max()):.4g} past f16's range")
+    return np.ascontiguousarray(v).astype("<f2").tobytes()
+
+
 def i32_values(values: list) -> bytes:
     """A small I32 table the family's view states itself (L299: the drafter head's vocabulary ids), little-endian."""
     v = np.asarray(values, dtype=np.int64)
@@ -514,7 +526,7 @@ def rows_strided(buf: bytes, n_rows: int, row_bytes: int, start: int, step: int)
 
 PRODUCERS = {f.__name__: f for f in (mxfp8_lt, mxfp8_lt_from_bf16, cutlass_mxfp4, nvfp4, nvfp4_from_bf16,
                                       fp8_e4m3_soa_k_from_bf16, i64_to_i32, tessera_planes, rows_strided, rows_gather,
-                                      i32_values)}
+                                      i32_values, f16_from_f32)}
 # the engine's native layouts, by the stored dtype (`st_layout_type`): the recipe's `native` format
 NATIVE_LAYOUT = {"BF16": "bf16", "F32": "f32", "I32": "i32"}
 
@@ -526,6 +538,7 @@ NATIVE_LAYOUT = {"BF16": "bf16", "F32": "f32", "I32": "i32"}
 COPY = "copy"
 PRODUCER_FOR = {
     ("BF16", "bf16"): COPY,
+    ("F32", "f16"): "f16_from_f32",
     ("F32", "f32"): COPY,
     ("I32", "i32"): COPY,
     ("I64", "i32"): "i64_to_i32",
@@ -606,7 +619,7 @@ def bytes_for(layout: str, dims_ne: list, dtype: str | None = None) -> int:
     elements = _prod(dims_ne)
     if layout in ("f32", "i32"):
         return elements * 4
-    if layout == "bf16":
+    if layout in ("bf16", "f16"):
         return elements * 2
     if layout == "iq2_xxs_mmq_k":
         if len(dims_ne) < 2 or elements % 256:

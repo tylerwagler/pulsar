@@ -18,6 +18,7 @@
 #include "cutlass/gemm/dispatch_policy.hpp"
 #include "cutlass/util/packed_stride.hpp"
 #include "cutlass/detail/sm100_blockscaled_layout.hpp"
+#include "pulsar_cuda_arch.cuh"
 
 using namespace cute;
 
@@ -1049,10 +1050,14 @@ __global__ static void ffn_group_slots_kernel(const int32_t *sel, unsigned n_slo
 
 __device__ __forceinline__ static void ffn_mma_e4m3(float d[4], uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3,
                                                     uint32_t b0, uint32_t b1) {
+#if PULSAR_SM89
   asm volatile("mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 "
                "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%10,%10,%10};\n"
                : "=f"(d[0]), "=f"(d[1]), "=f"(d[2]), "=f"(d[3])
                : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1), "f"(0.0f));
+#else
+  __trap();
+#endif
 }
 /* 4 e2m1 nibbles (low 16 bits, nibble j = value j) -> 4 e4m3 bytes, exact:
  * magnitudes {0,.5,1,1.5,2,3,4,6} = e4m3 0x00 0x30 0x38 0x3C 0x40 0x44 0x48 0x4C. */

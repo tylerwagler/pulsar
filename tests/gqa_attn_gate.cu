@@ -51,6 +51,7 @@
  * reference's rms and the mean max attention weight. */
 #include "cuda/pulsar_cuda_attn_gqa.h"
 #include "gqa_ref.h"
+#include "lib/pulsar_yarn.h"   /* L321: the YaRN table of the encoder case */
 
 #include <cuda_runtime.h>
 
@@ -844,6 +845,57 @@ static void run_long(Case &C, uint32_t P0) {
     seq_free(A); seq_free(B);
 }
 
+/* L321: an encoder's input (Nemotron-3.5 Embed / Rerank: Ministral-3, is_causal false) -- ONE FULL bidirectional run
+ * from position 0 over the whole call, longer than a chunk, with NO pool: every key is a fresh row of the call and
+ * nothing is stored.  The pool-less run equals the same run over a pool bit for bit, grades against the host
+ * authority with every row seeing the whole run, and the causal mutation fails it; a pool-less run that does not
+ * start at 0 (it would need earlier keys) is refused. */
+/* `plain` (optional): the same layer with the plain NeoX rope -- grading the run against it must FAIL, which proves a
+ * frequency table on C is the one the kernel used */
+static void run_encoder(Case &C, uint32_t N, const Case *plain = nullptr) {
+    printf("\n=== %s: an encoder input -- one bidirectional run of %u rows from position 0, no pool\n", C.name, N);
+    Case Bk = C;
+    Bk.L.block = 1;
+    History H;
+    history_build(C, 900, N, H, 0, 0);
+    Seq none{};
+    none.sid = 900;
+    Seq pooled = seq_new(C, 900);
+    std::vector<std::pair<uint32_t, uint32_t>> rows;
+    for (uint32_t i = 0; i < N; i++) rows.push_back({0u, i});
+    std::vector<Out> a, b;
+    std::vector<Seq *> v1{&none}, v2{&pooled};
+    const int rc1 = run_call(Bk, v1, rows, &a), rc2 = run_call(Bk, v2, rows, &b);
+    check(rc1 == 0 && rc2 == 0, "encoder: the pool-less and the pooled %u-row run accepted (rc %d, %d)", N, rc1, rc2);
+    if (rc1 == 0 && rc2 == 0) {
+        bool eq = true;
+        for (uint32_t i = 0; i < N; i++) eq = eq && same(a[i], b[i]);
+        check(eq, "encoder: the pool-less run == the same run over a pool, bit-exact (%u rows)", N);
+        std::vector<uint32_t> pl(N), hi(N, N - 1u);
+        std::vector<const Out *> gp(N);
+        for (uint32_t i = 0; i < N; i++) { pl[i] = i; gp[i] = &a[i]; }
+        const Grade G = grade(C, H, pl, gp, gref_mut(), &hi);
+        check(G.fro <= BAR_FRO && G.max <= BAR_MAX && G.eq >= BAR_EQ,
+              "encoder fidelity (%u rows, every row seeing all %u keys): fro %.2e, max %.2e, bf16 out == bf16(ref) %.4f",
+              N, N, G.fro, G.max, G.eq);
+        const Grade M = grade(C, H, pl, gp);   /* the causal reference */
+        check(M.fro >= 20 * BAR_FRO || M.max >= 20 * BAR_MAX,
+              "mutation 'causal' fails the encoder grade: fro %.2e, max %.2e", M.fro, M.max);
+        if (plain) {
+            History Hp;
+            history_build(*plain, 900, N, Hp, 0, 0);
+            const Grade Pm = grade(*plain, Hp, pl, gp, gref_mut(), &hi);
+            check(Pm.fro > BAR_FRO || Pm.max > BAR_MAX,
+                  "mutation 'plain rope' (no frequency table) fails the encoder grade: fro %.2e, max %.2e", Pm.fro, Pm.max);
+        }
+    }
+    std::vector<std::pair<uint32_t, uint32_t>> late;
+    for (uint32_t i = 5; i < 13; i++) late.push_back({0u, i});
+    const int rc3 = run_call(Bk, v1, late, nullptr);
+    check(rc3 == -1, "refused: a pool-less block run starting at position 5 (rc %d)", rc3);
+    seq_free(pooled);
+}
+
 /* C: a layer with a relative bias; Rp: a rope window layer without one (the L298 refusals) */
 static void run_refusals(Case &C, Case &Rp) {
     printf("\n=== refusals (each must return -1 and launch nothing)\n");
@@ -1057,6 +1109,37 @@ int main(int argc, char **argv) {
     run_rope_long(er, 100000);
     run_block(er, {1, 37, 299, 300, 301, 515, 777, 1000});
     run_block(eb, {8441, 8444, 8200, 8700, 300, 8443, 9000, 8442});
+
+    /* L321: the Nemotron-3.5 encoders' attention -- 32q/8kv/128, FULL, NeoX rope base 1e6, scale 1/sqrt(128), no qk
+     * norm / bias / temperature / gate; one 600-row bidirectional run (three chunks) with no pool */
+    Case ge;
+    case_init(ge, "encoder-full-rope", 32, 8, 128, 0, 600, false, 0, 0.f, 0.f, false, 1.0f / sqrtf(128.f), 600, 111);
+    ge.R.rope_theta = 1e6f; ge.L.rope_theta = 1e6f;
+    run_encoder(ge, 600);
+
+    /* L321: the same with Ministral-3's YaRN rope (factor 16, original context 16384, beta_fast 32, beta_slow 1;
+     * mscale = mscale_all_dim = 1, so transformers' attention factor is exactly 1): the per-pair table in transformers'
+     * form from src/lib/pulsar_yarn.h, in double and rounded once to f32 -- the kernel reads it, the reference too */
+    Case gy;
+    case_init(gy, "encoder-full-yarn", 32, 8, 128, 0, 600, false, 0, 0.f, 0.f, false, 1.0f / sqrtf(128.f), 600, 111);
+    gy.R.rope_theta = 1e6f; gy.L.rope_theta = 1e6f;
+    {
+        double low = 0, high = 0;
+        pulsar_yarn_corr_range<double>(128u, 16384u, 1e6, 32.0, 1.0, &low, &high);
+        gy.R.inv_freq.resize(64);
+        for (uint32_t i = 0; i < 64; i++) {
+            const double pf = pow(1e6, (double)(2u * i) / 128.0);
+            gy.R.inv_freq[i] = (float)pulsar_yarn_blend<double>(1.0 / (16.0 * pf), 1.0 / pf,
+                                                               pulsar_yarn_extrap_weight<double>(low, high, (double)i));
+        }
+        float *d_inv = nullptr;
+        CK(cudaMalloc(&d_inv, 64 * sizeof(float)));
+        CK(cudaMemcpy(d_inv, gy.R.inv_freq.data(), 64 * sizeof(float), cudaMemcpyHostToDevice));
+        gy.L.rope_inv_freq = d_inv;
+        printf("\n(YaRN table: ramp pairs [%.0f, %.0f]; inv_freq[0] %.6g, [32] %.6g, [63] %.6g)\n", low, high,
+               gy.R.inv_freq[0], gy.R.inv_freq[32], gy.R.inv_freq[63]);
+    }
+    run_encoder(gy, 600, &ge);
 
     run_refusals(g1, gr);
 

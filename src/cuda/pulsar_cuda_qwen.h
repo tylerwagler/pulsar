@@ -120,6 +120,8 @@ typedef struct pulsar_rows_linear {
     bool bf16;
     /** L298: an nvfp4 slice (k2 0, sf NULL; pulsar_cuda_nvfp4.h): the NVFP4 W4A16 rows arm. */
     bool nvfp4;
+    /** L321: an f16 weight [out][in] (k2 0, sf NULL; pulsar_cuda_f16_rows.h): the fp16 tensor-core rows arm. */
+    bool f16;
 } pulsar_rows_linear;
 
 /** L251 MTP: the head-side weights of the input combine (the sidecar's tensors). */
@@ -194,6 +196,11 @@ const void *const *pulsar_exl3_expert_table(const void *stack, uint32_t n_expert
  *  embed_tokens row (bf16 [n_vocab][2560]) repeated into the 4 streams. */
 int pulsar_qwen_embed_launch(const uint16_t *table, const int32_t *tokens, int T, int n_vocab, uint16_t *streams,
                              cudaStream_t stream);
+
+/** L321: y [rows][out] f32 = the complete Linear of f16 rows x_f16 (an fp16 consumer's operand format: the f16 arm
+ *  alone reads it -- any other weight refuses by name).  No workspace. */
+int pulsar_rows_linear_f16_launch(const pulsar_rows_linear *l, const uint16_t *x_f16, int rows, float *y,
+                                  cudaStream_t stream);
 
 /** Workspace bytes pulsar_rows_linear_launch needs for `rows` rows. */
 size_t pulsar_rows_linear_workspace_bytes(const pulsar_rows_linear *l, int rows);

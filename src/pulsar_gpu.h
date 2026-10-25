@@ -151,6 +151,10 @@
 typedef struct pulsar_gpu_tensor pulsar_gpu_tensor;
 
 int pulsar_gpu_init(void);
+/** L321: can THIS device run a weight layout (a PULSAR_TENSOR_* id)?  1 yes; 0 no, with *need (if not NULL) naming
+ *  what the layout's kernels require.  The engine asks it for every layout a model holds, after pulsar_gpu_init and
+ *  before any weight reaches the GPU, so an older card refuses a model by name at load instead of tripping a kernel. */
+int pulsar_gpu_layout_supported(uint32_t layout, const char **need);
 void pulsar_gpu_cleanup(void);
 
 /** Running total of live tensor-alloc bytes (owned allocations only, views
@@ -324,7 +328,6 @@ int pulsar_gpu_scratch_poison_step(pulsar_gpu_tensor *const *regions, uint32_t n
 void pulsar_gpu_scratch_poison_counts(uint64_t *steps, uint64_t *bytes);
 
 int pulsar_gpu_set_model_map(const void *model_map, uint64_t model_size);
-int pulsar_gpu_set_model_fd(int fd);
 int pulsar_gpu_set_model_fd_for_map(int fd, const void *model_map);
 int pulsar_gpu_set_model_map_range(const void *model_map, uint64_t model_size, uint64_t map_offset, uint64_t map_size, uint64_t max_tensor_bytes);
 int pulsar_gpu_cache_model_range(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes, const char *label);
@@ -407,6 +410,9 @@ enum {
      * scale plane (one per 16 inputs) and the f32 global scale; pulsar_nvfp4_layout() in
      * src/cuda/pulsar_cuda_nvfp4.h is the one byte model. */
     PULSAR_TENSOR_NVFP4 = 14,
+    /* L321: IEEE f16, the Turing lane's dense format (no bf16 tensor cores below sm_80): a Linear [in, out] the f16
+     * rows arm multiplies on the fp16 tensor cores (pulsar_cuda_f16_rows.h), or a table read as f16. */
+    PULSAR_TENSOR_F16 = 15,
     PULSAR_TENSOR_TYPE_COUNT
 };
 

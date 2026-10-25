@@ -37,6 +37,7 @@
  */
 #include "pulsar_cuda_qwen.h"
 #include "pulsar_cuda_mx.cuh"
+#include "pulsar_cuda_arch.cuh"
 
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
@@ -348,10 +349,14 @@ constexpr int kMmaKs  = kMmaStage * 32;          ///< k per stage
 constexpr int kMmaPad = kMmaKs + 8;              ///< smem row stride in bf16: 16-byte rows, conflict-free ldmatrix
 
 __device__ __forceinline__ void mma_bf16_16816(float (&d)[4], const uint32_t (&a)[4], uint32_t b0, uint32_t b1) {
+#if PULSAR_SM80
     asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
                  "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
                  : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
                  : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+#else
+    __trap();
+#endif
 }
 
 __device__ __forceinline__ void gr_ldsm_x4(uint32_t (&r)[4], const void *p) {
@@ -565,7 +570,11 @@ static_assert(kUpRowBytes % 16 == 0 && (kUpRowStride / 4) % 32 == 20, "the padde
 
 __device__ __forceinline__ void gr_cp_async16(void *smem, const void *gmem) {
     const unsigned s = (unsigned)__cvta_generic_to_shared(smem);
+#if PULSAR_SM80
     asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" :: "r"(s), "l"(gmem));
+#else
+    __trap();
+#endif
 }
 
 template <bool W8, int TB>
@@ -601,7 +610,11 @@ qwen_gr_up_kernel(const void *__restrict__ wv, const uint8_t *__restrict__ wsf,
             const uint8_t *src = (const uint8_t *)wv + ((size_t)ss * kH + blockIdx.x * 32 + cc) * kR + ch * 16;
             gr_cp_async16(s_w + rr * kUpRowStride + ch * 16, src);
         }
+#if PULSAR_SM80
         asm volatile("cp.async.commit_group;\n" ::: "memory");
+#else
+        __trap();
+#endif
     }
     /* mid: warp s takes the (token, 32-group) pairs s, s + 4, ...; lane = element */
     for (int g = s; g < nt * NB; g += kS) {
@@ -620,7 +633,13 @@ qwen_gr_up_kernel(const void *__restrict__ wv, const uint8_t *__restrict__ wsf,
         for (int ss = 0; ss < kS; ++ss) zi += injp[((size_t)t * kS + ss) * kS + j];
         inj[t * kS + j] = 2.0f / (1.0f + expf(-zi * (1.0f / kS)));
     }
-    if constexpr (STAGE) asm volatile("cp.async.wait_all;\n" ::: "memory");
+    if constexpr (STAGE) {
+#if PULSAR_SM80
+        asm volatile("cp.async.wait_all;\n" ::: "memory");
+#else
+        __trap();
+#endif
+    }
     __syncthreads();
     float z[TB];
 #pragma unroll
@@ -857,6 +876,7 @@ static int gr_read_kernels(const pulsar_qwen_gr_dev *w, const uint16_t *streams,
 extern "C" int pulsar_qwen_gr_read_launch(const pulsar_qwen_gr_dev *w, const uint16_t *streams, int T,
                                           uint16_t *x_bf16, float *inj,
                                           void *ws, size_t ws_bytes, cudaStream_t stream) {
+    PULSAR_REQUIRE_CC(80, "the Qwen GR read (bf16 m16n8k16, cp.async)", -1);   /* L321: refuse below the lane's arch, before its kernels trap */
     if (!w || !w->norm_w || !w->down.w || !w->up.w || !streams || T <= 0 ||
         !x_bf16 || (w->inject && !inj)) {
         fprintf(stderr, "pulsar: qwen GR read: a null input -- refusing\n");
@@ -933,6 +953,7 @@ extern "C" int pulsar_qwen_gr_write_launch(uint16_t *streams, const float *out, 
  * 80 blocks are walked by one warp in order. */
 extern "C" int pulsar_qwen_mxfp8_linear_launch(const pulsar_qwen_lowrank *l, const uint16_t *x_bf16, int rows,
                                                float *y, void *ws, size_t ws_bytes, cudaStream_t stream) {
+    PULSAR_REQUIRE_CC(80, "the Qwen MXFP8 linear (tensor-core rows kernel)", -1);   /* L321: refuse below the lane's arch, before its kernels trap */
     (void)ws;
     (void)ws_bytes;
     /* L251 / ac69748f: the bf16 activation, so the W8=false arm of the same kernel.  The E4M3 slot and

@@ -14,6 +14,7 @@
 // slice 0 adds them in slice order, applies the global scale and stores (f32 and / or bf16).
 
 #include "pulsar_cuda_nvfp4.h"
+#include "pulsar_cuda_arch.cuh"
 
 #include <cuda_bf16.h>
 #include <stdio.h>
@@ -29,10 +30,15 @@ constexpr int kTargetCtas = 192;   ///< the K split's goal (pulsar_nvfp4_ksplit)
 constexpr int kBlockRows = 64;     ///< the widest launch: 8 n8 tiles (prompt chunks; the weight read once a 64 rows)
 
 __device__ __forceinline__ void mma_bf16_16816(float (&d)[4], const uint32_t (&a)[4], uint32_t b0, uint32_t b1) {
+#if PULSAR_SM80
     asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
                  "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
                  : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
                  : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+#else
+    (void)d; (void)a; (void)b0; (void)b1;
+    __trap();
+#endif
 }
 
 /* The decode is the SM12x family's conversions (as FlashInfer's native SM12x bf16 x fp4 kernels decode,
@@ -238,6 +244,7 @@ int pulsar_nvfp4_ksplit(int in, int out) {
 
 int pulsar_nvfp4_rows_multi_launch(const void *const *w, int n, const uint16_t *x_bf16, int rows, int in, int out,
                                    float *const *y, uint16_t *const *y_bf16, cudaStream_t stream) {
+    PULSAR_REQUIRE_CC(120, "the NVFP4 rows linear (sm_12x e2m1 / e4m3 conversions)", -1);   /* L321: refuse below the lane's arch, before its kernels trap */
     uint64_t vb = 0, sb = 0, stride = 0;
     bool ok = w && n >= 1 && n <= PULSAR_NVFP4_MULTI_MAX && x_bf16 && rows > 0 && out > 0 &&
               pulsar_nvfp4_layout((uint64_t)in, (uint64_t)out, &vb, &sb, &stride) && aligned16(x_bf16);
@@ -284,5 +291,6 @@ int pulsar_nvfp4_rows_multi_launch(const void *const *w, int n, const uint16_t *
 
 int pulsar_nvfp4_rows_linear_launch(const void *w, const uint16_t *x_bf16, int rows, int in, int out, float *y,
                                     uint16_t *y_bf16, cudaStream_t stream) {
+    PULSAR_REQUIRE_CC(120, "the NVFP4 rows linear (sm_12x e2m1 / e4m3 conversions)", -1);   /* L321: refuse below the lane's arch, before its kernels trap */
     return pulsar_nvfp4_rows_multi_launch(&w, 1, x_bf16, rows, in, out, &y, &y_bf16, stream);
 }

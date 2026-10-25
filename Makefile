@@ -140,8 +140,8 @@ SERVER_OBJS = $(SERVER_SRCS:.cpp=.o)
 SERVER_HDRS = $(wildcard src/server/*.h)
 # CUTLASS TUs need the CUTLASS include path + c++17; they build via dedicated rules below,
 # so keep them out of the generic src/cuda/%.o rule.
-CUTLASS_CUDA_OBJS = src/cuda/pulsar_mxfp4_cutlass.o
-CUDA_SRCS = $(filter-out src/cuda/pulsar_mxfp4_cutlass.cu,$(wildcard src/cuda/*.cu))
+CUTLASS_CUDA_OBJS = src/cuda/pulsar_mxfp4_cutlass.o src/cuda/pulsar_cuda_fmha.o
+CUDA_SRCS = $(filter-out src/cuda/pulsar_mxfp4_cutlass.cu src/cuda/pulsar_cuda_fmha.cu,$(wildcard src/cuda/*.cu))
 CUDA_OBJS = $(CUDA_SRCS:.cu=.o)
 # Vendored llama.cpp MMQ (plan 41b, see src/cuda/mmq/VENDOR.md).  The wildcard is
 # empty unless the tree has actually been vendored, in which case PULSAR_HAVE_MMQ
@@ -288,7 +288,7 @@ pulsar-agent: $(AGENT_OBJS) src/lib/pulsar_help.o src/lib/pulsar_kvtext.o src/li
 CUDA_REGRESSION_BINS = tests/cuda_long_context_smoke tests/moe_route_bounds_gate tests/expert_table_gate \
                        tests/exl3_moe_epilogue_gate tests/exl3_dense_gate tests/exl3_moe_prefill_gate tests/exl3_half_gate \
                        tests/gdn_gate tests/qsa_attn_gate tests/qsa_yarn_test tests/qwen_s4_gate tests/router_gate tests/gqa_attn_gate tests/sconv_gate tests/head_gate \
-                       tests/bf16_rows_gate tests/nvfp4_rows_gate tests/mamba2_gate tests/rowops_gate
+                       tests/bf16_rows_gate tests/nvfp4_rows_gate tests/mamba2_gate tests/rowops_gate tests/arch_gate tests/pool_gate tests/f16_rows_gate tests/fmha_gate
 # 2026-10-14: they run CONCURRENTLY, each one's output kept together (-O).  They are model-free and mostly
 # host-bound (their references run on the CPU: measured alone, 258 s in series, the longest 114 s of which 113 s
 # user time), so in series they were 258 s of the battery's serial front.  No gate here grades a time.
@@ -568,9 +568,9 @@ exl3-moe-epilogue-gate: tests/exl3_moe_epilogue_gate
 # host authority in double; M-neutrality bit-exact; mutations; refusals.
 # Links the PRODUCTION object (the MMQ rule, the engine's NVCCFLAGS), so pass
 # the served arch: make exl3-dense-gate CUDA_ARCH=sm_120f.  Model-free.
-tests/exl3_dense_gate: tests/exl3_dense_gate.cu tests/exl3_dense_ref.h src/cuda/mmq/ds4_exl3_dense.o src/cuda/mmq/qwen_exl3_dense_prefill.o Makefile \
+tests/exl3_dense_gate: tests/exl3_dense_gate.cu tests/exl3_dense_ref.h src/cuda/mmq/ds4_exl3_dense.o src/cuda/mmq/qwen_exl3_dense_prefill.o src/cuda/pulsar_cuda_lt_fixed.o Makefile \
                        src/cuda/mmq/ds4_exl3_dense.cuh src/cuda/pulsar_cuda_mx.cuh src/engine/exl3_trellis.h
-	$(NVCC) $(NVCCFLAGS) -std=c++17 -Isrc -Isrc/cuda -o $@ tests/exl3_dense_gate.cu src/cuda/mmq/ds4_exl3_dense.o src/cuda/mmq/qwen_exl3_dense_prefill.o -lcublasLt
+	$(NVCC) $(NVCCFLAGS) -std=c++17 -Isrc -Isrc/cuda -o $@ tests/exl3_dense_gate.cu src/cuda/mmq/ds4_exl3_dense.o src/cuda/mmq/qwen_exl3_dense_prefill.o src/cuda/pulsar_cuda_lt_fixed.o -lcublasLt
 
 .PHONY: exl3-dense-gate
 exl3-dense-gate: tests/exl3_dense_gate
@@ -620,9 +620,9 @@ tests/exl3_moe_decode_bench: tests/exl3_moe_decode_bench.cu $(CUDA_OBJS) $(CUTLA
 # L251: the dense arm on a REAL exllamav3-quantized weight, driven by
 # pulsar-notes research/l251/exl3-dense/xcheck.py (which compares it with
 # exllamav3's own forward on the same activations).  Not a gate.
-tests/exl3_dense_xcheck: tests/exl3_dense_xcheck.cu tests/exl3_dense_ref.h src/cuda/mmq/ds4_exl3_dense.o src/cuda/mmq/qwen_exl3_dense_prefill.o Makefile \
+tests/exl3_dense_xcheck: tests/exl3_dense_xcheck.cu tests/exl3_dense_ref.h src/cuda/mmq/ds4_exl3_dense.o src/cuda/mmq/qwen_exl3_dense_prefill.o src/cuda/pulsar_cuda_lt_fixed.o Makefile \
                          src/cuda/mmq/ds4_exl3_dense.cuh src/cuda/pulsar_cuda_mx.cuh src/engine/exl3_trellis.h
-	$(NVCC) $(NVCCFLAGS) -std=c++17 -Isrc -Isrc/cuda -o $@ tests/exl3_dense_xcheck.cu src/cuda/mmq/ds4_exl3_dense.o src/cuda/mmq/qwen_exl3_dense_prefill.o -lcublasLt
+	$(NVCC) $(NVCCFLAGS) -std=c++17 -Isrc -Isrc/cuda -o $@ tests/exl3_dense_xcheck.cu src/cuda/mmq/ds4_exl3_dense.o src/cuda/mmq/qwen_exl3_dense_prefill.o src/cuda/pulsar_cuda_lt_fixed.o -lcublasLt
 
 # L251: the dense arm's microbenchmark -- EXL3 K=2..5 vs the engine's MXFP8
 # decode GEMV (the production wrapper, decode rows declared, the A8 slot armed)
@@ -702,7 +702,7 @@ tests/blockdraft_gate: tests/blockdraft_gate.cu src/cuda/pulsar_cuda_blockdraft.
 blockdraft-gate: tests/blockdraft_gate
 	./tests/blockdraft_gate
 src/cuda/pulsar_cuda_attn_gqa.o: src/cuda/pulsar_cuda_attn_gqa.h
-tests/gqa_attn_gate: tests/gqa_attn_gate.cu tests/gqa_ref.h src/cuda/pulsar_cuda_attn_gqa.o src/cuda/pulsar_cuda_attn_gqa.h Makefile
+tests/gqa_attn_gate: tests/gqa_attn_gate.cu tests/gqa_ref.h src/cuda/pulsar_cuda_attn_gqa.o src/cuda/pulsar_cuda_attn_gqa.h src/lib/pulsar_yarn.h Makefile
 	$(NVCC) $(NVCCFLAGS) -std=c++17 -Isrc -Isrc/cuda -o $@ tests/gqa_attn_gate.cu src/cuda/pulsar_cuda_attn_gqa.o
 
 .PHONY: gqa-attn-gate
@@ -821,6 +821,44 @@ head-mini-grade: tests/head_gate
 # own Qwen4ExpTextGatedDeltaNet).  The engine's NVCCFLAGS plus -fPIC.  Not a gate.
 tests/libpulsar_gdn.so: src/cuda/pulsar_cuda_gdn.cu src/cuda/pulsar_cuda_gdn.h src/cuda/pulsar_cuda_mx.cuh Makefile
 	$(NVCC) $(NVCCFLAGS) -Xcompiler -fPIC -shared -Isrc -o $@ src/cuda/pulsar_cuda_gdn.cu
+
+# L321: CUTLASS's memory-efficient attention (pulsar_cuda_fmha) vs a double reference (model-free).
+tests/fmha_gate: tests/fmha_gate.cu src/cuda/pulsar_cuda_fmha.o src/cuda/pulsar_cuda_fmha.h Makefile
+	$(NVCC) $(NVCCFLAGS) -std=c++17 -Isrc -Isrc/cuda -o $@ tests/fmha_gate.cu src/cuda/pulsar_cuda_fmha.o
+
+.PHONY: fmha-gate
+fmha-gate: tests/fmha_gate
+	./tests/fmha_gate
+
+# L321: the f16 rows arm (fp16 tensor cores, the fixed-algorithm GEMM) + the LayerNorm / bias / GELU row ops vs host
+# references, row independence bit for bit (model-free).
+tests/f16_rows_gate: tests/f16_rows_gate.cu src/cuda/pulsar_cuda_f16_rows.o src/cuda/pulsar_cuda_lt_fixed.o \
+                     src/cuda/pulsar_cuda_rowops.o src/cuda/pulsar_cuda_f16_rows.h src/cuda/pulsar_cuda_rowops.h Makefile
+	$(NVCC) $(NVCCFLAGS) -std=c++17 -Isrc -Isrc/cuda -o $@ tests/f16_rows_gate.cu src/cuda/pulsar_cuda_f16_rows.o \
+	        src/cuda/pulsar_cuda_lt_fixed.o src/cuda/pulsar_cuda_rowops.o -lcublasLt
+
+.PHONY: f16-rows-gate
+f16-rows-gate: tests/f16_rows_gate
+	./tests/f16_rows_gate
+
+# L321: the encoders' mean pool -- f32, row order, bit-exact to the host loop (model-free).
+tests/pool_gate: tests/pool_gate.cu src/cuda/pulsar_cuda_pool.o src/cuda/pulsar_cuda_pool.h Makefile
+	$(NVCC) $(NVCCFLAGS) -std=c++17 -Isrc -Isrc/cuda -o $@ tests/pool_gate.cu src/cuda/pulsar_cuda_pool.o
+
+.PHONY: pool-gate
+pool-gate: tests/pool_gate
+	./tests/pool_gate
+
+# L321: lanes that exist only for some devices decide by the DEVICE, not the compiled arch (model-free).
+tests/arch_gate: tests/arch_gate.cu Makefile src/pulsar_gpu.h src/cuda/pulsar_cuda_arch.cuh src/cuda/mmq/ds4_mmq.h \
+                 $(CUDA_OBJS) $(CUTLASS_CUDA_OBJS) $(MMQ_OBJS)
+	$(NVCC) $(NVCCFLAGS) -std=c++17 -Isrc -Isrc/cuda -o $@ tests/arch_gate.cu \
+	        $(CUDA_OBJS) $(CUTLASS_CUDA_OBJS) $(MMQ_OBJS) $(CUDA_LDLIBS)
+
+.PHONY: arch-gate
+arch-gate: tests/arch_gate
+	./tests/arch_gate
+
 # L251 S3: the Qwen full-attention + QSA layer (pulsar_cuda_qsa.cu) against a
 # double host reference -- cache encode, top-512 selection incl. exact ties,
 # output, the o_proj E4M3 slot, decode == prefill, mutations.  Model-free;
@@ -1285,6 +1323,19 @@ nemotron-chat-gate: tests/nemotron_chat_gate
 	./tests/nemotron_chat_gate --tok $(NEMOTRON_TOK_DIR) --vectors tests/test-vectors/nemotron_h \
 	    --cases $(QWEN_RENDER_CASES) --calib $(QWEN_CALIB)
 
+# L321: the Nemotron-3.5 encoders' tokenizer (tekken + the U+200C Replace pair) graded against HF tokenizers -- T1-T4 of
+# the chat gate (adversarial, span guard, every scalar value, the calibration corpus); goldens from
+# tests/nemotron_enc/gen_tok_goldens.py.  Model-free; NEMOTRON_ENC_TOK_DIR holds the checkpoint's tokenizer.json +
+# config.json (Embed and Rerank ship the same tokenizer).
+NEMOTRON_ENC_TOK_DIR ?= $(firstword $(wildcard /mnt/models/hub/models--nvidia--Nemotron-3.5-Embed-8B-BF16/snapshots/*))
+tests/nemotron_enc_tok_gate: tests/nemotron_enc_tok_gate.cpp tests/bpe_gate_util.h src/lib/bpe_tokenizer.cpp \
+                             src/lib/pyjson.cpp src/lib/bpe_tokenizer.h src/lib/bpe_unicode_tables.inc src/lib/pyjson.h \
+                             src/lib/sha1.hpp Makefile
+	$(CXX) $(CXXFLAGS) -Isrc -Isrc/lib -o $@ tests/nemotron_enc_tok_gate.cpp src/lib/bpe_tokenizer.cpp src/lib/pyjson.cpp
+.PHONY: nemotron-enc-tok-gate
+nemotron-enc-tok-gate: tests/nemotron_enc_tok_gate
+	./tests/nemotron_enc_tok_gate --tok $(NEMOTRON_ENC_TOK_DIR) --vectors tests/test-vectors/nemotron_enc --calib $(QWEN_CALIB)
+
 # The attention layout table gate (two profiles, one engine) -- HOST ONLY.  The
 # table is a pure function of the artifact's declared metadata, so both profiles'
 # mode rows are checkable with no model and no device.  The arrays in the test are
@@ -1689,7 +1740,7 @@ cuda-reap-router-audit:
 CONTAINER_PY ?= python3
 .PHONY: container-tests
 container-tests:
-	cd tools/container && for t in test_exl3_rates.py test_names.py test_kv.py test_producers.py test_deepseek.py test_qwen.py test_inkling.py test_nemotron_h.py; do \
+	cd tools/container && for t in test_exl3_rates.py test_names.py test_kv.py test_producers.py test_deepseek.py test_qwen.py test_inkling.py test_nemotron_h.py test_nemotron_enc.py test_nemotron_parse.py; do \
 	  $(CONTAINER_PY) $$t || exit 1; done
 
 # plan-34 phase-2 inc 4: TRUE mixed step — decode banks + one K-row prefill run
@@ -3048,6 +3099,11 @@ src/cuda/mmq/pulsar_tessera.o: src/cuda/mmq/pulsar_tessera.cu $(MMQ_HDRS) $(CUDA
 src/cuda/pulsar_mxfp4_cutlass.o: src/cuda/pulsar_mxfp4_cutlass.cu src/pulsar_gpu.h $(CUDA_FLAG_STAMP) | cutlass-check
 	$(NVCC) $(NVCCFLAGS) -std=c++17 --expt-relaxed-constexpr --expt-extended-lambda -diag-suppress 20012 -diag-suppress 177 -Isrc $(CUTLASS_INC) -c -o $@ src/cuda/pulsar_mxfp4_cutlass.cu
 
+# L321: CUTLASS's memory-efficient attention (vendored in src/cuda/fmha/, VENDOR.md) -- the CUTLASS include path
+src/cuda/pulsar_cuda_fmha.o: src/cuda/pulsar_cuda_fmha.cu src/cuda/pulsar_cuda_fmha.h $(wildcard src/cuda/fmha/*.h src/cuda/fmha/*/*.h) \
+                             $(CUDA_FLAG_STAMP) | cutlass-check
+	$(NVCC) $(NVCCFLAGS) -std=c++17 --expt-relaxed-constexpr --expt-extended-lambda -diag-suppress 20012 -diag-suppress 177 -Isrc $(CUTLASS_INC) -c -o $@ src/cuda/pulsar_cuda_fmha.cu
+
 tests/cuda_long_context_smoke: tests/cuda_long_context_smoke.o $(CUDA_OBJS) $(CUTLASS_CUDA_OBJS) $(MMQ_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
@@ -3223,6 +3279,17 @@ tests/nemotron_family_gate.o: tests/nemotron_family_gate.cpp src/families/nemotr
                               src/engine/pulsar_engine_internal.h src/pulsar.h
 	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -c -o $@ $<
 tests/nemotron_family_gate: tests/nemotron_family_gate.o $(CORE_OBJS)
+	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
+# L321: Nemotron-3.5 Parse on a container vs the HF fp32 reference (tests/nemotron_parse_gate.cpp)
+tests/nemotron_parse_gate.o: tests/nemotron_parse_gate.cpp src/families/nemotron_parse/nemotron_parse.h src/pulsar.h \
+                             src/engine/pulsar_engine_internal.h
+	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -c -o $@ $<
+tests/nemotron_parse_gate: tests/nemotron_parse_gate.o $(CORE_OBJS)
+	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
+# L321: the Nemotron-3.5 encoders on a container (tests/nemotron_enc_gate.cpp; public API only)
+tests/nemotron_enc_gate.o: tests/nemotron_enc_gate.cpp src/pulsar.h src/lib/pyjson.h
+	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -c -o $@ $<
+tests/nemotron_enc_gate: tests/nemotron_enc_gate.o $(CORE_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 # L296 N7: the Nemotron-H forward on the core driver, on a container (tests/nemotron_fwd_gate.cpp; public API only)
 tests/nemotron_fwd_gate.o: tests/nemotron_fwd_gate.cpp tests/gate_entry.h tests/gate_util.h src/pulsar.h src/pulsar_gpu.h
@@ -3602,7 +3669,7 @@ test: pulsar_test seam-check
 clean:
 	rm -rf .build
 	rm -rf tests/runner
-	rm -f tests/gates_runner pulsar pulsar-server pulsar-bench pulsar-eval pulsar-agent pulsar_test pulsar_agent_test src/engine/*.o src/families/*/*.o src/families/*/*.d src/tp/*.o src/agent/*.o src/server/*.o src/cuda/*.o src/cuda/mmq/*.o src/cuda/mmq/test/*.o src/cli/*.o src/lib/*.o src/vendor/*.o $(XGRAMMAR_OBJS) $(XGRAMMAR_OBJS:.o=.d) tests/*.o src/engine/*.d src/agent/*.d src/server/*.d src/cuda/*.d src/cuda/mmq/*.d src/cuda/mmq/test/*.d src/cli/*.d src/lib/*.d src/vendor/*.d tests/*.d tests/vision_visible_gate tests/vision_hc_gate tests/vision_image_gate tests/vision_placeholder_gate tests/vision_image_sync_gate tests/vision_chunk_gate tests/cuda_long_context_smoke tests/moe_route_bounds_gate tests/expert_table_gate tests/multiseq_frontier_gate tests/multiseq_decode_gate tests/prefill_bitexact_gate tests/bank_spec_gate tests/spec_sampling_gate tests/spec_sampling_gate_wide tests/accounting_gate tests/bank_evict_restore_gate tests/session_payload_gate tests/algo_stability_gate tests/mixed_prefill_gate tests/mixed_zero_prefill_gate tests/fused_step_gate tests/head_graph_replay_gate tests/draft_refusal_gate tests/scratch_poison_gate tests/scratch_poison_gate_mutant tests/gates_runner_mutant_* tests/mutant/family_qwen_s4_l307.cpp tests/mutant/family_qwen_s4_l307.o tests/mutant/family_qwen_s4_l307.d tests/decode_reference_gate tests/verify_width_probe tests/mixed_neutrality_gate tests/comp_state_gate tests/spec_teacher_forced_probe tests/attn_f16_kernel_test tests/attn_f16_banked_test tests/kv_rows_pack_gate tests/kv_rows_pack_gate_fastmath tests/sampler_device_gate tests/dspark_batch_gate tests/nt_crossover_sweep tests/vision_router_gate tests/router_gate tests/bf16_rows_gate tests/nvfp4_rows_gate tests/lilicorr_head_gate tests/qwen_family_gate tests/inkling_family_gate tests/nemotron_family_gate tests/nemotron_fwd_gate tests/rowops_gate tests/state_kinds_gate tests/payload_frontier_gate tests/prompt_end_gate tests/bank_adopt_gate tests/bank_residency_gate
+	rm -f tests/gates_runner pulsar pulsar-server pulsar-bench pulsar-eval pulsar-agent pulsar_test pulsar_agent_test src/engine/*.o src/families/*/*.o src/families/*/*.d src/tp/*.o src/agent/*.o src/server/*.o src/cuda/*.o src/cuda/mmq/*.o src/cuda/mmq/test/*.o src/cli/*.o src/lib/*.o src/vendor/*.o $(XGRAMMAR_OBJS) $(XGRAMMAR_OBJS:.o=.d) tests/*.o src/engine/*.d src/agent/*.d src/server/*.d src/cuda/*.d src/cuda/mmq/*.d src/cuda/mmq/test/*.d src/cli/*.d src/lib/*.d src/vendor/*.d tests/*.d tests/vision_visible_gate tests/vision_hc_gate tests/vision_image_gate tests/vision_placeholder_gate tests/vision_image_sync_gate tests/vision_chunk_gate tests/cuda_long_context_smoke tests/moe_route_bounds_gate tests/expert_table_gate tests/multiseq_frontier_gate tests/multiseq_decode_gate tests/prefill_bitexact_gate tests/bank_spec_gate tests/spec_sampling_gate tests/spec_sampling_gate_wide tests/accounting_gate tests/bank_evict_restore_gate tests/session_payload_gate tests/algo_stability_gate tests/mixed_prefill_gate tests/mixed_zero_prefill_gate tests/fused_step_gate tests/head_graph_replay_gate tests/draft_refusal_gate tests/scratch_poison_gate tests/scratch_poison_gate_mutant tests/gates_runner_mutant_* tests/mutant/family_qwen_s4_l307.cpp tests/mutant/family_qwen_s4_l307.o tests/mutant/family_qwen_s4_l307.d tests/decode_reference_gate tests/verify_width_probe tests/mixed_neutrality_gate tests/comp_state_gate tests/spec_teacher_forced_probe tests/attn_f16_kernel_test tests/attn_f16_banked_test tests/kv_rows_pack_gate tests/kv_rows_pack_gate_fastmath tests/sampler_device_gate tests/dspark_batch_gate tests/nt_crossover_sweep tests/vision_router_gate tests/router_gate tests/bf16_rows_gate tests/nvfp4_rows_gate tests/lilicorr_head_gate tests/qwen_family_gate tests/inkling_family_gate tests/nemotron_family_gate tests/nemotron_fwd_gate tests/nemotron_enc_gate tests/nemotron_parse_gate tests/rowops_gate tests/state_kinds_gate tests/payload_frontier_gate tests/prompt_end_gate tests/bank_adopt_gate tests/bank_residency_gate
 
 # Pull in the generated header dependencies.  `-include` (not `include`) so a
 # tree with no .d files yet -- a fresh clone, or right after `make clean` -- is

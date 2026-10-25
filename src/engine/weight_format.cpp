@@ -8,7 +8,8 @@
  *
  *   dense            slot bf16 plane: F32, BF16 (cuBLAS)            slot E4M3: MXFP8_LT (cuBLASLt)
  *                    bf16 rows: MXFP8_LT (split-K GEMV / MMA), EXL3 at a dense-arm rate, BF16 (L295 F7),
- *                               NVFP4 (L298: W4A16, any family)
+ *                               NVFP4 (L298: W4A16, any family), F16 (L321: the Turing lane, fp16 tensor cores)
+ *                    f16 rows:  F16 (L321: the operand an fp16 consumer's producer wrote)
  *   expert gate/up   slot E4M3: CUTLASS MXFP4, IQ2 MMQ, EXL3 at a pair-arm rate   rows: EXL3 pair-arm, BF16
  *   expert down      slot E4M3: CUTLASS MXFP4, IQ2 MMQ, EXL3 at a down-arm rate   rows: EXL3 down-arm, BF16
  *   fused gate_up    bf16 rows: EXL3 at a fused-arm rate
@@ -40,7 +41,10 @@ pulsar_dense_arm pulsar_dense_arm_for(uint32_t type, pulsar_act_format act) {
         return type == PULSAR_TENSOR_MXFP8_LT ? PULSAR_DENSE_ARM_MXFP8_ROWS
              : type == PULSAR_TENSOR_BF16 ? PULSAR_DENSE_ARM_BF16_ROWS
              : type == PULSAR_TENSOR_NVFP4 ? PULSAR_DENSE_ARM_NVFP4_ROWS
+             : type == PULSAR_TENSOR_F16 ? PULSAR_DENSE_ARM_F16_ROWS
              : exl3_arm(type, EXL3_ARM_DENSE) ? PULSAR_DENSE_ARM_EXL3_ROWS : PULSAR_DENSE_ARM_NONE;
+    case PULSAR_ACT_ROWS_F16:   /* L321: only the f16 arm reads f16 operand rows (pulsar_rows_linear_f16_launch) */
+        return type == PULSAR_TENSOR_F16 ? PULSAR_DENSE_ARM_F16_ROWS : PULSAR_DENSE_ARM_NONE;
     case PULSAR_ACT_COUNT: break;
     }
     return PULSAR_DENSE_ARM_NONE;
@@ -69,7 +73,8 @@ bool pulsar_format_serves(uint32_t type, pulsar_weight_role role, pulsar_act_for
 
 static const char *const k_role_name[] = {"a dense linear", "a routed expert's gate / up", "a routed expert's down",
                                           "a fused routed gate_up", "a shared expert"};
-static const char *const k_act_name[] = {"the MX slot's bf16 plane", "raw bf16 rows", "the MX slot's E4M3"};
+static const char *const k_act_name[] = {"the MX slot's bf16 plane", "raw bf16 rows", "the MX slot's E4M3",
+                                         "raw f16 rows"};
 
 bool pulsar_tensor_admit_role(const pulsar_tensor *t, const char *owner, pulsar_weight_role role, uint32_t acts) {
     for (int a = 0; a < PULSAR_ACT_COUNT; a++)

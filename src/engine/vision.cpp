@@ -358,6 +358,12 @@ void vision_window_topk_visible(int window_size, int n, const int32_t *left,
 
 #define PIL_PRECISION_BITS 22   /* (32 - 8 - 2): 8 bits of result, 2 of overflow */
 
+/* Pillow's bilinear (triangle) filter, support 1.0 (L321: Nemotron Parse's resize). */
+static double pil_bilinear_filter(double x) {
+    if (x < 0.0) x = -x;
+    return x < 1.0 ? 1.0 - x : 0.0;
+}
+
 static double pil_bicubic_filter(double x) {
     const double a = -0.5;
     if (x < 0.0) x = -x;
@@ -378,12 +384,12 @@ static inline uint8_t pil_clip8(int32_t in) {
     return (uint8_t)v;
 }
 
-/* Pillow's precompute_coeffs() for BICUBIC (support 2.0), double coefficients. */
-static int pil_precompute_coeffs(int in_size, float in0, float in1, int out_size,
+/* Pillow's precompute_coeffs() for BICUBIC (support 2.0) or BILINEAR (support 1.0), double coefficients. */
+static int pil_precompute_coeffs(int in_size, float in0, float in1, int out_size, pulsar_pil_filter filter,
                                  int **bounds_out, double **kk_out) {
     double scale = (double)(in1 - in0) / (double)out_size;
     double filterscale = scale < 1.0 ? 1.0 : scale;
-    const double support = 2.0 * filterscale;
+    const double support = (filter == PULSAR_PIL_BILINEAR ? 1.0 : 2.0) * filterscale;
     const int ksize = (int)ceil(support) * 2 + 1;
     double *kk = (double *)calloc((size_t)out_size * (size_t)ksize, sizeof(double));
     int *bounds = (int *)malloc((size_t)out_size * 2u * sizeof(int));
@@ -399,7 +405,8 @@ static int pil_precompute_coeffs(int in_size, float in0, float in1, int out_size
         xmax -= xmin;
         double *k = &kk[(size_t)xx * (size_t)ksize];
         for (int x = 0; x < xmax; x++) {
-            const double w = pil_bicubic_filter(((double)x + xmin - center + 0.5) * inv_filterscale);
+            const double u = ((double)x + xmin - center + 0.5) * inv_filterscale;
+            const double w = filter == PULSAR_PIL_BILINEAR ? pil_bilinear_filter(u) : pil_bicubic_filter(u);
             k[x] = w;
             ww += w;
         }
@@ -468,14 +475,14 @@ static void pil_resample_axis(uint8_t *dst, int dst_w, int dst_h,
  * skipping a pass whose size is unchanged (Pillow's need_horizontal/vertical).
  * `box` is always the whole source, which is what Image.resize uses. */
 uint8_t *vision_pil_resize_rgb(const uint8_t *src, int src_w, int src_h,
-                               int dst_w, int dst_h) {
+                               int dst_w, int dst_h, pulsar_pil_filter filter) {
     uint8_t *cur = (uint8_t *)src;
     uint8_t *alloc1 = NULL, *alloc2 = NULL;
     int cur_w = src_w, cur_h = src_h;
 
     if (dst_w != src_w) {
         int *bounds = NULL; double *pre = NULL;
-        int ksize = pil_precompute_coeffs(src_w, 0.0f, (float)src_w, dst_w, &bounds, &pre);
+        int ksize = pil_precompute_coeffs(src_w, 0.0f, (float)src_w, dst_w, filter, &bounds, &pre);
         if (!ksize) return NULL;
         int32_t *kk = (int32_t *)malloc((size_t)dst_w * (size_t)ksize * sizeof(int32_t));
         alloc1 = (uint8_t *)malloc((size_t)dst_w * (size_t)cur_h * 3u);
@@ -487,7 +494,7 @@ uint8_t *vision_pil_resize_rgb(const uint8_t *src, int src_w, int src_h,
     }
     if (dst_h != src_h) {
         int *bounds = NULL; double *pre = NULL;
-        int ksize = pil_precompute_coeffs(src_h, 0.0f, (float)src_h, dst_h, &bounds, &pre);
+        int ksize = pil_precompute_coeffs(src_h, 0.0f, (float)src_h, dst_h, filter, &bounds, &pre);
         if (!ksize) { free(alloc1); return NULL; }
         int32_t *kk = (int32_t *)malloc((size_t)dst_h * (size_t)ksize * sizeof(int32_t));
         alloc2 = (uint8_t *)malloc((size_t)cur_w * (size_t)dst_h * 3u);
@@ -586,7 +593,7 @@ int vision_preprocess_rgb(const uint8_t *rgb, int width, int height,
     /* The resize/pad branch, then ImageOps.pad's contain + centred paste. */
     uint8_t *canvas = NULL;
     if (max_wh > 0.0f && (float)width >= max_wh * (float)height) {
-        canvas = vision_pil_resize_rgb(rgb, width, height, best_w, best_h);
+        canvas = vision_pil_resize_rgb(rgb, width, height, best_w, best_h, PULSAR_PIL_BICUBIC);
     } else {
         const double im_ratio = (double)width / (double)height;
         const double dest_ratio = (double)best_w / (double)best_h;
@@ -600,7 +607,7 @@ int vision_preprocess_rgb(const uint8_t *rgb, int width, int height,
                 if (nw != best_w) cw = nw;
             }
         }
-        uint8_t *resized = vision_pil_resize_rgb(rgb, width, height, cw, ch);
+        uint8_t *resized = vision_pil_resize_rgb(rgb, width, height, cw, ch, PULSAR_PIL_BICUBIC);
         if (!resized) return 0;
         if (cw == best_w && ch == best_h) {
             canvas = resized;

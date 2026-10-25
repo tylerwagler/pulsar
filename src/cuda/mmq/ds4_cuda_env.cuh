@@ -34,6 +34,7 @@
 #include <array>
 
 #include "ds4_ggml_stubs.h"   // GGML_ASSERT/ABORT/UNUSED, GGML_CUDA_MAX_DEVICES
+#include "cuda/pulsar_cuda_arch.cuh"   // pulsar_cuda_block_scale_mma: the device question
 #define GGML_COMMON_DECL_CUDA   // selects the CUDA declarations in ggml-common.h
 #define GGML_COMMON_IMPL_CUDA   // ...and EMITS the tables (iq2xxs_grid et al) as
                                 // `static const __device__`.  DECL alone declares
@@ -50,7 +51,6 @@
 #define MATRIX_ROW_PADDING 512
 
 #define GGML_CUDA_CC_PASCAL          600
-#define GGML_CUDA_CC_DP4A            610 // minimum compute capability for __dp4a
 #define GGML_CUDA_CC_VOLTA           700
 #define GGML_CUDA_CC_TURING          750
 #define GGML_CUDA_CC_AMPERE          800
@@ -168,52 +168,13 @@ void ggml_cuda_error(const char * stmt, const char * func, const char * file, in
 
 #define CUDA_CHECK(err) CUDA_CHECK_GEN(err, cudaSuccess, cudaGetErrorString)
 
-// ----------------------------------------------------------------------------
-// Which archs is this binary compiled for?  Upstream's recursive constexpr fold
-// over __CUDA_ARCH_LIST__, unchanged -- the predicates below ask "is the DEVICE
-// at least arch X AND did we emit code for it", and dropping the second half
-// would silently answer yes for a device we cannot run on.
-// ----------------------------------------------------------------------------
-
-#ifdef __CUDA_ARCH_LIST__
-constexpr int ggml_cuda_highest_compiled_arch_impl(const int /*arch*/, const int cur) {
-    if (cur == 0) {
-        return -1;
-    }
-    return cur;
-}
-
-template<class ... Archs>
-constexpr int ggml_cuda_highest_compiled_arch_impl(const int arch, const int cur, const int first, Archs... rest) {
-    if (first <= arch && first > cur) {
-        return ggml_cuda_highest_compiled_arch_impl(arch, first, rest...);
-    } else {
-        return ggml_cuda_highest_compiled_arch_impl(arch, cur, rest...);
-    }
-}
-
-constexpr int ggml_cuda_highest_compiled_arch(const int arch) {
-    return ggml_cuda_highest_compiled_arch_impl(arch, 0, __CUDA_ARCH_LIST__);
-}
-#else
-static int ggml_cuda_highest_compiled_arch(const int arch) {
-    return arch;
-}
-#endif // __CUDA_ARCH_LIST__
-
-// ----------------------------------------------------------------------------
-// Feature predicates.  NVIDIA-only forms of upstream's; see the header note.
-// ----------------------------------------------------------------------------
-
-// For feature selection of external libraries, e.g. cuBLAS.  Hardware check:
-// asks about the DEVICE, not about what we compiled.
-static bool fp16_mma_hardware_available(const int cc) {
-    return GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_VOLTA;
-}
-
-static bool turing_mma_available(const int cc) {
-    return GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_TURING;
-}
+// Upstream's compiled-arch fold (ggml_cuda_highest_compiled_arch) and the
+// turing/fp16 MMA predicates built on it are deleted (L321): they asked what
+// the IMAGE was compiled for, so an sm_75 build on an sm_75 card chose the
+// routed MMQ lane whose block-scaled MMA only the sm_120f image has.  The one
+// question left -- does the DEVICE have that MMA -- is
+// pulsar_cuda_block_scale_mma (cuda/pulsar_cuda_arch.cuh); the wrong-arch
+// build itself is cuda_tu_archs_ok's job at startup.
 
 static constexpr __device__ int ggml_cuda_get_physical_warp_size() {
     return 32;

@@ -186,10 +186,15 @@ tests/dspark_batch_gate
 /tests/mamba2_gate
 /tests/mamba2_bench
 /tests/head_gate
+/tests/arch_gate
+/tests/pool_gate
+/tests/f16_rows_gate
+/tests/fmha_gate
 /tests/rowops_gate
 /tests/qwen_chat_gate
 /tests/inkling_chat_gate
 /tests/nemotron_chat_gate
+/tests/nemotron_enc_tok_gate
 tests/api-golden/out.txt
 tests/sse-golden/out.txt
 /tests/comp_state_gate
@@ -204,6 +209,8 @@ tests/sse-golden/out.txt
 /tests/inkling_family_gate
 /tests/nemotron_family_gate
 /tests/nemotron_fwd_gate
+/tests/nemotron_enc_gate
+/tests/nemotron_parse_gate
 /tests/mtp_spec_gate
 /tests/draft_refusal_gate
 /tests/scratch_poison_gate
