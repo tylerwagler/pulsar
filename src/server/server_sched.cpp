@@ -1976,6 +1976,15 @@ static uint64_t server_kv_reserved(uint64_t touched, const uint64_t *want, const
     return r;
 }
 
+/* Does the slot's job still owe its bank the prompt's KV?  Bound with no gen yet, or prefilling.  A parked decoder
+ * holds nothing until its readmission (that decision's own subject); a decoder's bank holds its prompt -- and its
+ * per-bank figure can lag the pool's while it decodes in a batch (gpuq #473: a decoding A read 0.02 GiB short of its
+ * prompt, which kept the preemption B needed from fitting, and B ended up on the pinned bank 0). */
+static bool server_slot_reserves(const session_slot *c) {
+    if (!c->active_job || c->preempted) return false;
+    return !c->gen || c->gen->phase == GEN_PREFILL_COLD || c->gen->phase == GEN_PREFILL_MAIN;
+}
+
 uint64_t server::kv_reserved_bytes(const session_slot *except) {
     auto *s = this;
     pulsar_session *pool = s->sess;
@@ -1983,8 +1992,7 @@ uint64_t server::kv_reserved_bytes(const session_slot *except) {
     int n = 0;
     for (int i = 0; i < s->n_slots && n < PULSAR_SESSION_POOL_CAP; i++) {
         const session_slot *c = &s->slots[i];
-        /* a parked decoder holds nothing until its readmission, which is this decision's own subject */
-        if (c == except || !c->active_job || c->preempted) continue;
+        if (c == except || !server_slot_reserves(c)) continue;
         const int len = c->active_job->req.prompt.len > 0 ? c->active_job->req.prompt.len : 0;
         want[n] = pulsar_session_quantum_growth_bytes_per_bank(pool, (uint32_t)len);
         have[n] = pulsar_session_bank_touched_kv_bytes(pool, c->bank);

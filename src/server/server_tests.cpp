@@ -9824,6 +9824,42 @@ static void test_l326_readmit_reserved(void) {
     /* the preemption's own fit (prompt C on A alone after B's KV is freed) reads the same base: it fits */
     TEST_ASSERT(server_prompt_kv_verdict(server_kv_reserved(a, NULL, NULL, 0), c, budget, NULL, 0, true, &k) ==
                 PROMPT_KV_FITS);
+
+    /* gpuq #473 (preempt-exact, Qwen, 13440 B a token, touched budget 0.15 GiB): only a job whose prompt is not in its
+     * bank yet reserves -- bound with no gen, or prefilling; never a decoder (its per-bank figure lagged the pool's,
+     * 0.02 GiB of phantom reservation that kept B's preemption from fitting) nor a parked or finished one */
+    {
+        session_slot sl;
+        memset(&sl, 0, sizeof sl);
+        gen_state g;
+        memset(&g, 0, sizeof g);
+        int dummy = 0;
+        TEST_ASSERT(!server_slot_reserves(&sl));                       /* no job */
+        sl.active_job = (job *)&dummy;
+        TEST_ASSERT(server_slot_reserves(&sl));                        /* bound, its gen not begun */
+        sl.gen = &g;
+        g.phase = GEN_PREFILL_COLD;
+        TEST_ASSERT(server_slot_reserves(&sl));
+        g.phase = GEN_PREFILL_MAIN;
+        TEST_ASSERT(server_slot_reserves(&sl));
+        g.phase = GEN_DECODE_INIT;
+        TEST_ASSERT(!server_slot_reserves(&sl));
+        g.phase = GEN_DECODE;
+        TEST_ASSERT(!server_slot_reserves(&sl));
+        g.phase = GEN_PREFILL_MAIN;
+        sl.preempted = true;
+        TEST_ASSERT(!server_slot_reserves(&sl));                       /* parked */
+    }
+    /* #473's readmission: A (5726 tokens) parked, W (1841) on the pinned bank 0, B (8051) the only other job.  While B
+     * runs, A waits; once B ends its bank is the one idle victim, and A comes back by spilling it -- never refused */
+    const uint64_t q = 13440, bq = 11984 * q, w = 1841 * q, pa = 5726 * q, pb = 8051 * q;
+    TEST_ASSERT(server_prompt_kv_verdict(w + pb, pa, bq, NULL, 0, true, &k) == PROMPT_KV_WAIT);
+    const uint64_t drop_b[1] = {pb};
+    TEST_ASSERT(server_prompt_kv_verdict(w + pb, pa, bq, drop_b, 1, false, &k) == PROMPT_KV_SPILL && k == 1);
+    /* the preemption that made room for B: W + A resident, A (decoding) reserves nothing, A's bank frees */
+    TEST_ASSERT((w + pa) - pa + pb <= bq);
+    /* the limit kept on purpose: B on bank 0 (never a victim, spill_bank parks there) leaves A no room -- refused */
+    TEST_ASSERT(server_prompt_kv_verdict(pb, pa, bq, NULL, 0, false, &k) == PROMPT_KV_REFUSE);
 }
 
 /* L179 branch 11 -- worker_evict_one's slot reset (evict_reset_slot_fields).
