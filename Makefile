@@ -1093,9 +1093,10 @@ TP_PAIR_DS_MODEL ?= /mnt/models/DeepSeek-v4-Flash
 # L269 W1: the V4.1 layer-subset fixture (layer 4 = source layer 20, OUR EXL3 K3; the rest CUTLASS MXFP4) -- the
 # plan's EXL3 expert halves beside the MXFP4 ones.
 TP_V41_FIXTURE ?= /mnt/models/v41-tp1-fixture
-# Qwen's plan stays on the MTP pack (its golden's name): the served pack has no TP plan -- the plan refuses a block
-# drafter under TP and an EXL3 head (L305) -- and Qwen is not a pair model (no DeepSeek/Qwen on the work pair).
-TP_QWEN_PLAN_MODEL ?= /mnt/models/qwen38fn-u-e4-d5-mtp
+# Qwen's plan runs on the U-e4-d5 trunk (the NAS copy, no drafter): the served pack has no TP plan -- the plan refuses
+# a block drafter under TP and an EXL3 head (L305) -- and Qwen is not a pair model (no DeepSeek/Qwen on the work pair).
+# The MTP overlay it used was deleted 2026-10-25; the trunk's plan is the old golden minus its mtp.layers.0 rows.
+TP_QWEN_PLAN_MODEL ?= /mnt/models/qwen38fn-u-e4-d5
 TP_PLAN_MODELS = $(TP_PAIR_DS_MODEL) $(TP_QWEN_PLAN_MODEL) $(TP_V41_FIXTURE)
 .PHONY: tp-plan-gate tp-plan-golden
 tp-plan-gate: tests/tp_plan_test
@@ -2124,13 +2125,16 @@ live-legs: pulsar-server
 	  --model deepseek=$(FRONTIER_MODEL) --model qwen=$(QWEN_GATE_MODEL) --model nemotron=$(LILICORR_GATE_MODEL) \
 	  $(if $(LIVE_LEGS),--legs $(LIVE_LEGS),)
 
-# L280: a prompt's KV is admitted against the 2b guard's budget before it lands (spill first / wait for a busy bank /
-# 503), never past it into memory pressure.  A real server on a SMALL model (the guard's budget lowered through its
-# test hook to 2.2 conversations), so it fits beside a running production server; ~2 min.  Family-neutral.
+# L280: a prompt's KV is admitted against the 2b guard's budget before it lands (spill first / preempt the newest
+# decoder, L314 / 503), never past it into memory pressure.  A real server on a SMALL model (the guard's budget lowered
+# through its test hook to 2.2 conversations), so it fits beside a running production server; ~2 min.  Family-neutral.
+# The guarded servers' logs are kept (L326) in .build/kv-admission/servers.log.
 KV_ADMISSION_MODEL ?= /mnt/models/nemotron35-mini-pulsar
 .PHONY: server-kv-admission-live
 server-kv-admission-live: pulsar-server
-	python3 tests/server_kv_admission_live.py $(KV_ADMISSION_MODEL) --binary ./pulsar-server
+	mkdir -p .build/kv-admission
+	python3 tests/server_kv_admission_live.py $(KV_ADMISSION_MODEL) --binary ./pulsar-server \
+	  --log .build/kv-admission/servers.log
 
 # L319: the touched-KV ceiling is the box's measured headroom (min of the ledger's share and MemAvailable - floor at the
 # post-warmup reading), so long sessions spill / wait at the floor instead of running the machine dry (the work hang:

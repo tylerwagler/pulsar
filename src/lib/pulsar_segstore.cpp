@@ -9,6 +9,7 @@
 #include <stdarg.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
@@ -472,6 +473,42 @@ FILE *pulsar_segstore_open_trailer(pulsar_segstore *st, const char key[41], uint
     if (fseek(fp, (long)(HDR + e.text_len + e.payload_bytes), SEEK_SET) != 0) { fclose(fp); return nullptr; }
     if (trailer_bytes) *trailer_bytes = e.trailer_bytes;
     return fp;
+}
+
+/* The bytes of [off, off + len) of an open file that sit in the page cache, by mincore over a read-only mapping of
+ * the pages that span it (pages straddling the range's ends count by their overlap). */
+static uint64_t segstore_resident(int fd, uint64_t off, uint64_t len) {
+    if (len == 0u) return 0u;
+    const long pg_l = sysconf(_SC_PAGESIZE);
+    const uint64_t pg = pg_l > 0 ? (uint64_t)pg_l : 4096u;
+    const uint64_t a0 = off / pg * pg, a1 = (off + len + pg - 1u) / pg * pg;
+    void *map = mmap(nullptr, (size_t)(a1 - a0), PROT_READ, MAP_SHARED, fd, (off_t)a0);
+    if (map == MAP_FAILED) return 0u;
+    std::vector<unsigned char> vec((size_t)((a1 - a0) / pg));
+    uint64_t got = 0u;
+    if (mincore(map, (size_t)(a1 - a0), vec.data()) == 0)
+        for (size_t i = 0; i < vec.size(); i++) {
+            if (!(vec[i] & 1u)) continue;
+            const uint64_t p0 = a0 + (uint64_t)i * pg, p1 = p0 + pg;
+            const uint64_t lo = p0 > off ? p0 : off, hi = p1 < off + len ? p1 : off + len;
+            got += hi > lo ? hi - lo : 0u;
+        }
+    munmap(map, (size_t)(a1 - a0));
+    return got;
+}
+
+uint64_t pulsar_segstore_cached_bytes(pulsar_segstore *st, const char key[41], uint64_t payload_len, bool trailer) {
+    if (!st) return 0u;
+    auto it = st->segs.find(std::string(key, 40));
+    if (it == st->segs.end()) return 0u;
+    const pulsar_segstore_seg &e = it->second;
+    const int fd = open(st->path(it->first.c_str()).c_str(), O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return 0u;
+    const uint64_t at = HDR + e.text_len;
+    uint64_t got = segstore_resident(fd, at, payload_len < e.payload_bytes ? payload_len : e.payload_bytes);
+    if (trailer) got += segstore_resident(fd, at + e.payload_bytes, e.trailer_bytes);
+    close(fd);
+    return got;
 }
 
 void pulsar_segstore_touch(pulsar_segstore *st, const pulsar_segstore_seg *chain, int n) {

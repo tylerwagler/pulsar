@@ -229,8 +229,9 @@ bool pulsar_ckpt_record_restore(pulsar_ckpt_store *st, uint32_t bank, const puls
  *  record `r` at T: every pool's rows below T copied from src's own pools (ops->bank_pools), then src's checkpoint
  *  walked into dst, exactly what a restore on src would leave there (a published checkpoint is any bank's to restore
  *  while its own bank's history still reaches T, the frontier rule).  dst's own checkpoints and records go (its
- *  history is replaced); it keeps a copy of the one it now stands at.  False, said, when the banks' pools do not pair,
- *  one is freed, or a copy failed (dst's state then describes no position). */
+ *  history is replaced); it keeps a copy of the one it now stands at.  A lent record is stamped used (the pool's LRU,
+ *  L326).  False, said, when the banks' pools do not pair, one is freed, or a copy failed (dst's state then describes
+ *  no position). */
 bool pulsar_ckpt_adopt(pulsar_ckpt_store *st, uint32_t dst, uint32_t src, uint32_t T, const pulsar_ckpt_record *r);
 /** Where a walk's FINAL chunk [pos0, end) ends (P13, every walk's): at the prompt's last grid point when that lies
  *  strictly inside it -- so the prefill leaves the checkpoint the next turn resumes from -- else at `end`.  The

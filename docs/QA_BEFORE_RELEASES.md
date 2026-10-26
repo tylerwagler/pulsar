@@ -113,9 +113,10 @@ head, no MTP module); Nemotron's drafter gate is LiLiCorr's, DeepSeek's is DSpar
 release-blocking, tested on MTP-path changes only.**  `mtp-spec-gate` is out of `make gates` (its runner entry is
 gone; the target builds and runs by hand on `MTP_GATE_MODEL`, the Nemotron mini), and `make gates-dev` runs it when a
 touched path is an MTP one (`*mtp*`, the family MTP bindings in `family_qwen`, `nemotron_h_family`, `step_driver`).
-`sync-budget-gate` runs each hosted model's own drafter, so its Qwen leg is DFlash2's.  The one Qwen leg left on the
-MTP pack is `tp-plan-gate`'s (manual; `TP_QWEN_PLAN_MODEL`): the served pack has no TP plan (a block drafter under
-TP and an EXL3 head refuse) and Qwen is not a pair model.
+`sync-budget-gate` runs each hosted model's own drafter, so its Qwen leg is DFlash2's.  No Qwen leg uses an MTP pack
+any more (the packs were deleted 2026-10-25): `tp-plan-gate` (manual; `TP_QWEN_PLAN_MODEL`) plans the U-e4-d5 trunk
+without a drafter, since the served pack has no TP plan (a block drafter under TP and an EXL3 head refuse) and Qwen
+is not a pair model.
 
 ### Battery wall time
 
@@ -156,9 +157,9 @@ own table.  The total is the target (L317: about 50 min with the live legs), not
 | `cuda-runner-gate [DeepSeek V4]` | 1150 | the whole table, 2 engine opens |
 | `cuda-runner-gate [Qwen4-exp]` | 720 | the whole table where its needs allow, 2 opens; block-spec (DFlash2) |
 | `cuda-runner-gate [Nemotron-H]` | 300 | block-spec (LiLiCorr), scratch-poison, bank-adopt; 1 open |
-| `live-legs [deepseek]` | 600 | constrained, server-live, abandon: warm + hooks instances |
+| `live-legs [deepseek]` | 1150 | constrained, server-live, abandon: warm + hooks instances.  L326: 600 -> 1150, measured 985 / 986 s (#440 / #456; constrained ~800 s warm since L317) + 15% |
 | `live-legs [qwen]` | 1500 | the stall check, abandon, constrained, server-live, prefix-turns x2, preempt: warm + hooks + fresh |
-| `live-legs [nemotron]` | 240 | opencode-turns: warm + fresh |
+| `live-legs [nemotron]` | 420 | kv-dup, opencode-turns: warm + fresh.  L326: 240 -> 420, measured 365 s (#456: L324's kv-dup leg +~49 s, the warm load cold-cache 214 s vs 136) + 15% |
 | `server-kv-headroom-live` | 240 | L319: the touched-KV ceiling is the measured headroom; a balloon, the Nemotron mini |
 | `host-only gates (longest)` | 90 | overlap the runner |
 | `suite total` | 3000 | the target: <= ~50 min, the live legs included |

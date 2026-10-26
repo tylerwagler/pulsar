@@ -1870,16 +1870,28 @@ typedef struct {
     uint32_t ann_n;                   ///< `n` at that announcement
 } pulsar_lane_cost_fit;
 
-/* L304: the fused step's measured cost (verify_curve.cpp pulsar_engine_fused_cost_observe): an EW least-squares fit
- * of the forward's wall on [1, prompt rows, prompt attention pairs]. */
+/* L304 / L327: what a prompt chunk costs (verify_curve.cpp has the model): ONE exponentially weighted least-squares
+ * fit over every prompt chunk the engine runs -- solo prefill chunks (the prefill loop's own) and fused ones (beside a
+ * round's verify rows: the server's report less the verify curve's forward of those rows) -- on
+ * x = [solo, fused, prompt rows, prompt attention pairs]: a fixed term per chunk kind, the rows and pairs shared. */
+enum { PULSAR_CHUNK_SOLO = 0, PULSAR_CHUNK_FUSED = 1, PULSAR_CHUNK_KINDS = 2 };
+#define PULSAR_PREFILL_FIT_DIM 4
 typedef struct {
-    double w, s1, s2, s11, s12, s22, sy, s1y, s2y;   ///< EW sums (x2 in M pairs)
-    uint32_t n;                                      ///< steps observed
-    bool valid;                                      ///< the terms below may be used
-    double a_ms, alpha_ms, beta_ms;                  ///< fixed, per prompt row, per attention pair
-    uint32_t ann_n;                                  ///< `n` at the last announcement (0: never)
+    double m[PULSAR_PREFILL_FIT_DIM][PULSAR_PREFILL_FIT_DIM];   ///< EW sums of x x^T (pairs in M)
+    double v[PULSAR_PREFILL_FIT_DIM];                           ///< EW sums of x y
+    uint32_t n;                                                  ///< chunks observed
+    uint32_t n_kind[PULSAR_CHUNK_KINDS];                         ///< ... of each kind
+    bool valid[PULSAR_CHUNK_KINDS];       ///< a chunk of that kind may be priced (its fixed term + the shared ones)
+    double fixed_ms[PULSAR_CHUNK_KINDS];  ///< each kind's fixed term
+    double alpha_ms, beta_ms;             ///< per prompt row, per attention pair
+    bool ann_kind[PULSAR_CHUNK_KINDS];    ///< rule 5: the kind's terms were announced
+    uint32_t ann_n;                       ///< `n` at the last announcement
     double ann_alpha, ann_beta;
-} pulsar_fused_cost_fit;
+    /** L327: the file the fit persists to beside the verify curve, named by the curve's key ("" = none) */
+    char cache_path[4096];
+    uint64_t cache_key;
+    uint32_t saved_n;                     ///< `n` at the last write
+} pulsar_prefill_cost_fit;
 
 struct pulsar_engine {
     /** The model family, chosen once at open from `general.architecture`
@@ -1928,9 +1940,9 @@ struct pulsar_engine {
     struct pulsar_verify_curve *verify_curve;
     /** L301: the drafters' confidence calibration per draft position (pulsar_spec_calibration_note). */
     pulsar_spec_calibration spec_calibration;
-    /** L304: the fused step's measured cost, what the server's round selection prices a chunk by (L312,
-     *  pulsar_engine_fused_step_ms). */
-    pulsar_fused_cost_fit fused_cost;
+    /** L304 / L327: what a prompt chunk costs, solo or fused -- what the server's round selection prices a riding
+     *  chunk by (L312, pulsar_engine_fused_prompt_ms) and the disk tier a recompute (L310, pulsar_engine_prefill_ms). */
+    pulsar_prefill_cost_fit prefill_cost;
     char *directional_steering_file;   ///< steering-vector file path, or NULL
     float *directional_steering_dirs;  ///< loaded steering directions, or NULL
     float directional_steering_attn_scale;  ///< steering strength on the attention stream
@@ -2992,6 +3004,15 @@ uint32_t pulsar_verify_curve_pick(const struct pulsar_verify_curve *c, uint32_t 
 uint32_t pulsar_verify_chain_pick(const struct pulsar_verify_curve *c, const pulsar_lane_cost *step, uint32_t cap,
                                   uint32_t n_chains, const float *drafted, uint32_t n_drafted, const float *run,
                                   uint32_t n_live, double spent_ms, bool *go);
+/** L327: a solo prefill chunk of q rows over the c already computed took `ms` (the prefill loop's own report; the
+ *  fused chunks come through pulsar_engine_fused_cost_observe). */
+void pulsar_engine_prefill_chunk_observe(pulsar_engine *e, uint32_t q, uint32_t c, double ms);
+/** L327: the fit's persistence beside the verify curve -- the file a fit of `key` is kept in under `cache_dir`, read
+ *  into *f (false, *f untouched, when absent, of another key or version, or unreadable) and written (tmp + rename;
+ *  said once when it cannot be).  The engine-free forms the tests drive. */
+bool pulsar_prefill_fit_path(const char *cache_dir, uint64_t key, char *out, size_t cap);
+bool pulsar_prefill_fit_read(const char *path, uint64_t key, pulsar_prefill_cost_fit *f);
+bool pulsar_prefill_fit_write(const char *path, uint64_t key, const pulsar_prefill_cost_fit *f);
 /** The read-only view of one fit (its terms, count and weighted centre). */
 pulsar_lane_cost lane_cost_fit_view(const pulsar_lane_cost_fit *f);
 /** A TP worker takes the leader's terms as they rode the wire. */

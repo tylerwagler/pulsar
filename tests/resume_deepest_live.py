@@ -25,6 +25,9 @@ Checks (must-pass; --report-only prints them and exits 0, for measuring a binary
     that chain's end -- the abandoned prefix is not prefilled again.
   * REUSE == COLD: the last turn's and the re-send's greedy replies equal a FRESH server's (an empty disk tier, which
     must report 0 cached tokens) byte for byte.
+  * PRICED (L327): the conversation's prefills run solo (one client), and they measure the prompt chunk cost fit; no
+    restore-vs-recompute decision after that is `unpriced`, at least one is priced (load / recompute); and the fresh
+    instance (same binary) reads the fit back from beside its verify curve.
 
 L317 (tests/live_legs.py): ResumeDeepestLeg has the Leg shape -- warm(srv) on the model's shared server, cold(srv) on
 the fresh instance (fresh = True) -- and uses only srv.url / mark / since / post_json; its LEGS row would be
@@ -146,8 +149,29 @@ class ResumeDeepestLeg:
         else:
             self.g.check(cond, msg)
 
+    def priced(self, srv, m0):
+        """L327 PRICED: the restore-vs-recompute decisions this leg caused, against the server's prompt chunk cost fit.
+        A single-client conversation prefills SOLO, and before L327 only fused rounds fed the fit, so every decision
+        here said `unpriced` (L320 section 3).  Once the log says the solo terms are measured (or loaded from the
+        cache), no decision may be unpriced, and at least one must be priced -- load or recompute (the first disk hit
+        of a server may be `unmeasured`: no load has measured the read yet)."""
+        text = srv.since(0)
+        fit = re.search(r"prompt chunk cost (?:measured|loaded from the cache|moved): solo [\d.]+ ", text)
+        fit_at = fit.start() if fit else None
+        verdicts = [(d.start(), d.group(1)) for d in
+                    re.finditer(r"kv cache restore-vs-recompute: .*-> (\w+)", text) if d.start() >= m0]
+        after = [v for at, v in verdicts if fit_at is not None and at > fit_at]
+        self.g.note("restore decisions: %s; solo fit %s" % (",".join(v for _, v in verdicts) or "none",
+                                                           "at byte %d of the log" % fit_at if fit else "never"))
+        self.check(fit is not None, "the solo prefills measured the prompt chunk cost fit (%s)"
+                   % (fit.group(0).strip() if fit else "no 'prompt chunk cost ... solo' line"))
+        self.check("unpriced" not in after, "no restore decision after the solo fit was unpriced (%s)" % ",".join(after))
+        self.check(any(v in ("load", "recompute") for v in after),
+                   "a restore decision was priced: load or recompute (%s)" % (",".join(after) or "none after the fit"))
+
     # ---- the phases ----
     def warm(self, srv):
+        m0 = srv.mark()
         self.build(srv)
         history = []
         for k in range(1, self.turns + 1):
@@ -169,6 +193,7 @@ class ResumeDeepestLeg:
             self.g.note("turns > 1: mean prefilled %.0f tokens, mean ttft %.3f s"
                         % (sum(r[3] for r in later) / len(later), sum(r[4] for r in later) / len(later)))
         self.abandon(srv, history)
+        self.priced(srv, m0)
 
     def abandon(self, srv, history):
         """The conversation with its system prompt rewritten at the start (a new document edition): the whole prompt to
@@ -213,6 +238,9 @@ class ResumeDeepestLeg:
         self.refs.append(("the re-send", msgs, self.reply(d)))
 
     def cold(self, srv):
+        # L327: the fresh instance (same binary, same verify-curve cache) starts with the warm instance's fit
+        self.check(re.search(r"prompt chunk cost loaded from the cache: solo [\d.]+ ", srv.since(0)) is not None,
+                   "the fresh instance read the prompt chunk cost fit back from beside its verify curve")
         for what, msgs, warm in self.refs:
             d = self.chat(srv, msgs)
             cached = d.get("timings", {}).get("cached_n", -1)

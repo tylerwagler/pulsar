@@ -5,13 +5,15 @@ previous request's KV in the next one's prompt.
     python3 tests/prefix_stability_gate.py [--pulsar-test ./pulsar_test] [--shape NAME ...] [--family F ...]
                                            [--keep DIR] [--list]
 
-Each SHAPE is a sequence of request bodies (Anthropic Messages or OpenAI chat) with, per request, its PARENT (the
-earlier request it continues; default the one before).  Every body is rendered by the server's real renderer
+Each SHAPE is a sequence of request bodies (Anthropic Messages, OpenAI chat or Responses) with, per request, its
+PARENT (the earlier request it continues; default the one before).  Every body is rendered by the server's real renderer
 (`pulsar_test --render-cases`: the protocol parser + the family's render, no model, no GPU) for every family the shape
 names, and for each (parent N, request M) the gate asserts that M's rendered prompt extends N's up to N's STABLE POINT:
 
   - the end of N's last message that carries a `cache_control` breakpoint (the client's own statement of what it
-    expects to be cached), else the end of N's last message;
+    expects to be cached), else the end of N's last message (a Responses body: its last `input` item -- OpenAI's
+    caching is the automatic prefix; an item with no text to carry the sentinel, a tool_search_output, gets it in a
+    user message right after it);
   - or, where a shape declares `stable_through` = k, the end of N's message k (a family template that by its own
     definition re-renders later turns: Nemotron's truncate_history_thinking drops the reasoning of turns before the
     last user message, L311).
@@ -29,6 +31,8 @@ Shapes:
   mid-system                      role "system" messages mid-conversation, the last one carrying the breakpoint (L113)
   suggestion-side-call            Claude Code's SUGGESTION MODE side call after a turn, then the real next turn (L322)
   nemotron-truncate-thinking      opencode on Nemotron: reasoning in history, truncate_history_thinking (L311)
+  codex-tool-search               synthetic Responses (Codex): a client tool_search loads a tool through
+                                  tool_search_output's `tools`, then it is called (L326)
 
 Exit status non-zero on any violation or refusal."""
 import argparse, copy, json, os, subprocess, sys, tempfile
@@ -161,6 +165,35 @@ def shape_nemotron_truncate_thinking():
                          {"body": oai([sys_m, u1, a1, t1, a2, u2]), "stable_through": 1}]}
 
 
+def shape_codex_tool_search():
+    """The Responses API's tool search as Codex drives it (execution "client"): the tools array holds the eager tools
+    and the tool_search tool; the search's output item carries the loaded tool's definition (`tools`, itself
+    defer_loading), then the model calls it.  OpenAI's own rule: the loaded tools enter the context at the output
+    item, so the prompt before it is kept."""
+    tools = [{"type": "function", "name": "shell", "description": "Run a shell command.",
+              "parameters": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}},
+             {"type": "tool_search", "execution": "client", "description": "Search the deferred tools.",
+              "parameters": {"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]}}]
+    weather = {"type": "function", "name": "get_weather", "description": "Current weather for a city.",
+               "parameters": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]},
+               "defer_loading": True}
+    # (no `developer` message: Qwen's template refuses that role -- a Codex-on-Qwen gap of its own, L326)
+    i1 = [{"type": "message", "role": "user", "content": [{"type": "input_text", "text": "Sandbox: workspace-write."}]},
+          {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "Weather in Oslo?"}]}]
+    i2 = i1 + [{"type": "tool_search_call", "call_id": "call_s1", "execution": "client",
+                "arguments": {"query": "weather"}},
+               {"type": "tool_search_output", "call_id": "call_s1", "status": "completed", "execution": "client",
+                "tools": [weather]}]
+    i3 = i2 + [{"type": "function_call", "call_id": "call_w1", "name": "get_weather",
+                "arguments": "{\"city\":\"Oslo\"}"},
+               {"type": "function_call_output", "call_id": "call_w1", "output": "4 C, rain"}]
+
+    def resp(items):
+        return {"model": "gpt-5.5-codex", "instructions": "You are Codex.", "input": items, "tools": tools,
+                "tool_choice": "auto", "stream": True}
+    return {"api": "responses", "requests": [{"body": resp(i1)}, {"body": resp(i2)}, {"body": resp(i3)}]}
+
+
 def shape_captures(name):
     d = os.path.join(FIXTURES, name)
     files = sorted(f for f in os.listdir(d) if f.endswith(".json"))
@@ -174,14 +207,20 @@ SHAPES = {
     "mid-system": shape_mid_system,
     "suggestion-side-call": shape_suggestion_side_call,
     "nemotron-truncate-thinking": shape_nemotron_truncate_thinking,
+    "codex-tool-search": shape_codex_tool_search,
 }
 
 
 # ---- the gate --------------------------------------------------------------------------------------------------------
 
+def messages(body):
+    """The body's conversation: `messages`, or a Responses body's `input` items."""
+    return body["messages"] if "messages" in body else body["input"]
+
+
 def breakpoint_message(body):
     """Index of the last message carrying a cache_control breakpoint, else the last message."""
-    msgs = body["messages"]
+    msgs = messages(body)
     for i in range(len(msgs) - 1, -1, -1):
         m = msgs[i]
         if m.get("cache_control"):
@@ -194,10 +233,15 @@ def breakpoint_message(body):
 
 def with_sentinel(body, k):
     b = copy.deepcopy(body)
-    m = b["messages"][k]
+    msgs = messages(b)
+    m = msgs[k]
     c = m.get("content")
-    if isinstance(c, list):
-        c.append({"type": "text", "text": SENTINEL})
+    if "input" in b and isinstance(m.get("output"), str):     # a Responses tool output: its text
+        m["output"] += SENTINEL
+    elif "input" in b and m.get("type", "message") != "message":   # no text of its own: the next message carries it
+        msgs.insert(k + 1, {"type": "message", "role": "user", "content": [{"type": "input_text", "text": SENTINEL}]})
+    elif isinstance(c, list):
+        c.append({"type": "input_text" if "input" in b else "text", "text": SENTINEL})
     else:
         m["content"] = (c or "") + SENTINEL
     return b

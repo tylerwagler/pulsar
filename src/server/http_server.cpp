@@ -835,16 +835,24 @@ bool server::send_metrics(int fd) {
     buf_puts(&b, "# TYPE pulsar:kv_dup_censuses_total counter\n");
     buf_printf(&b, "pulsar:kv_dup_censuses_total %llu\n", dup_censuses);
 
-    /* L310: the disk tier's restore-vs-recompute -- what each hit decided, the measured read rate it priced the
-     * read with, the last decision's two prices, and the tokens each side carried. */
+    /* L310: the disk tier's restore-vs-recompute -- what each hit decided, the measured read rates it priced the
+     * read with (L327: from the disk and from the page cache), the last decision's two prices, and the tokens each
+     * side carried. */
     buf_puts(&b, "# HELP pulsar:kv_disk_restore_decisions_total Disk chain hits by restore-vs-recompute verdict.\n");
     buf_puts(&b, "# TYPE pulsar:kv_disk_restore_decisions_total counter\n");
     for (int i = 0; i < KV_RESTORE_VERDICTS; i++)
         buf_printf(&b, "pulsar:kv_disk_restore_decisions_total{verdict=\"%s\"} %llu\n", kv_restore_verdict_names[i],
                    (unsigned long long)disk_meter.verdicts[i]);
-    buf_puts(&b, "# HELP pulsar:kv_disk_read_bytes_per_second Measured disk chain load rate (0 until the first load).\n");
+    buf_puts(&b, "# HELP pulsar:kv_disk_read_bytes_per_second Measured disk chain load rate, of the bytes read from "
+                 "the disk and from the page cache (0 until the first load).\n");
     buf_puts(&b, "# TYPE pulsar:kv_disk_read_bytes_per_second gauge\n");
-    buf_printf(&b, "pulsar:kv_disk_read_bytes_per_second %.0f\n", disk_meter.read_bytes_per_ms * 1000.0);
+    {
+        const double per_gib[2] = {disk_meter.read.cold_ms_per_gib, disk_meter.read.cached_ms_per_gib};
+        const char *from[2] = {"disk", "page_cache"};
+        for (int i = 0; i < 2; i++)
+            buf_printf(&b, "pulsar:kv_disk_read_bytes_per_second{from=\"%s\"} %.0f\n", from[i],
+                       per_gib[i] > 0.0 ? 1024.0 * 1024.0 * 1024.0 * 1000.0 / per_gib[i] : 0.0);
+    }
     buf_puts(&b, "# HELP pulsar:kv_disk_last_transfer_ms The last disk hit's estimated chain read time.\n");
     buf_puts(&b, "# TYPE pulsar:kv_disk_last_transfer_ms gauge\n");
     buf_printf(&b, "pulsar:kv_disk_last_transfer_ms %.3f\n", disk_meter.last_transfer_ms);
@@ -905,6 +913,12 @@ bool server::send_metrics(int fd) {
     buf_puts(&b, "# TYPE pulsar:kv_touched_budget_bytes gauge\n");
     buf_printf(&b, "pulsar:kv_touched_budget_bytes %llu\n",
                s->guard_enabled ? (unsigned long long)s->guard_touched_budget : 0ULL);
+    /* L326: the eager floor that min() subtracts, as the server holds it (guard_eager_bytes) -- the touched budget
+     * alone does not give it back once the headroom term binds (L319), so tests read it here, not from a log line. */
+    buf_puts(&b, "# HELP pulsar:kv_eager_floor_bytes Eager KV floor already resident that the eviction guard's ledger share subtracts (kv budget minus this, L319/L326; 0 = guard off).\n");
+    buf_puts(&b, "# TYPE pulsar:kv_eager_floor_bytes gauge\n");
+    buf_printf(&b, "pulsar:kv_eager_floor_bytes %llu\n",
+               s->guard_enabled ? (unsigned long long)s->guard_eager_bytes : 0ULL);
 
     /* plan-31b phase A: whole-box reconciliation -- the signed gap between
      * what the BOX says this process consumed since a post-boot baseline and

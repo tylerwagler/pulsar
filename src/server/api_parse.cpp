@@ -733,9 +733,17 @@ fail:
  *     visible transcript rather than killing a recoverable agent session.
  *
  * Reasoning items are merged into the next assistant message so
- * render_chat_prompt_text can wrap them in <think>. */
+ * render_chat_prompt_text can wrap them in <think>.
+ *
+ * L326: a tool_search_output's `tools` (the tools the search loaded) go to
+ * `loaded`, one function schema a line (declared: tool_orders, the parser, the
+ * grammar), and the item's message records one tool_reference per tool at the
+ * end of its body -- L325's mechanism: chat_expand_tool_refs renders their
+ * definitions THERE, in the family's encoding, so a load leaves every earlier
+ * byte of the prompt (the tools block included) as it was.  The caller makes
+ * `loaded` part of the conversation's deferred tools. */
 bool parse_responses_input(const char **p, chat_msgs *msgs,
-                                  buf *loaded_tool_schemas,
+                                  buf *loaded,
                                   tool_schema_orders *orders,
                                   char *err, size_t errlen) {
     char local_err[192];
@@ -1127,11 +1135,9 @@ item_fail:
                    !strcmp(t, "tool_search_call_output") ||
                    !strcmp(t, "image_generation_call_output"))
         {
-            if (!strcmp(t, "tool_search_output") && tools_json &&
-                loaded_tool_schemas && orders)
-            {
+            char *schemas = NULL;
+            if (!strcmp(t, "tool_search_output") && tools_json) {
                 const char *tools_p = tools_json;
-                char *schemas = NULL;
                 if (!parse_tools_value(&tools_p, &schemas, orders)) {
                     free(schemas);
                     free(type);
@@ -1152,18 +1158,32 @@ item_fail:
                     buf_free(&pending_reasoning);
                     return false;
                 }
-                if (schemas && schemas[0]) {
-                    if (loaded_tool_schemas->len) buf_putc(loaded_tool_schemas, '\n');
-                    buf_puts(loaded_tool_schemas, schemas);
+                if (schemas[0]) {
+                    if (loaded->len) buf_putc(loaded, '\n');
+                    buf_puts(loaded, schemas);
                 }
-                free(schemas);
             }
             chat_msg msg = {0};
             msg.role = xstrdup("tool");
+            /* a tool_search_output's tools are its loads (above): their definitions render at its references */
             const char *body = output ? output :
                                result ? result :
-                               tools_json ? tools_json : "";
+                               tools_json && !schemas ? tools_json : "";
             msg.content = xstrdup(body);
+            for (const char *at = schemas ? schemas : ""; *at;) {
+                const char *nl = strchr(at, '\n');
+                const size_t len = nl ? (size_t)(nl - at) : strlen(at);
+                char *line = xstrndup(at, len);
+                at += len + (nl ? 1 : 0);
+                char *raw = json_object_member_raw(line, "name");
+                const char *rp = raw;
+                char *tool_name = NULL;
+                if (rp && json_string(&rp, &tool_name)) chat_msg_add_tool_ref(&msg, strlen(body), tool_name);
+                free(tool_name);
+                free(raw);
+                free(line);
+            }
+            free(schemas);
             if (call_id || item_id) {
                 chat_msg_add_tool_call_id(&msg, call_id ? call_id : item_id);
             }
@@ -1301,6 +1321,7 @@ bool parse_chat_conversation_responses(const char *body, chat_conversation *c, r
     bool got_input = false;
     int skr = 0;
     char *instructions = NULL;
+    buf loaded = {0};   /* L326: the input's tool_search_output loads (parse_responses_input) */
 
     json_ws(&p);
     if (*p != '{') return false;
@@ -1319,6 +1340,7 @@ bool parse_chat_conversation_responses(const char *body, chat_conversation *c, r
         ok = true;
         if (!strcmp(key, "input")) {
             chat_msgs_free(&c->msgs);
+            buf_free(&loaded);
             json_ws(&p);
             /* Codex CLI always sends `input` as an array; tolerate bare strings
              * for parity with other Responses-API callers. */
@@ -1332,7 +1354,7 @@ bool parse_chat_conversation_responses(const char *body, chat_conversation *c, r
                     chat_msgs_push(&c->msgs, msg);
                 }
             } else {
-                ok = parse_responses_input(&p, &c->msgs, &c->loaded_tool_schemas, &r->tool_orders, err, errlen);
+                ok = parse_responses_input(&p, &c->msgs, &loaded, &r->tool_orders, err, errlen);
             }
             got_input = true;
         } else if (!strcmp(key, "instructions")) {
@@ -1451,9 +1473,23 @@ bool parse_chat_conversation_responses(const char *body, chat_conversation *c, r
         c->msgs.v[0] = tmp;
     }
     free(instructions);
+    /* L326: the loads are deferred tools of the conversation (after the tools array, whichever key came first):
+     * declared, rendered only at their tool_search_output (chat_expand_tool_refs), never in the tools block */
+    if (loaded.len) {
+        buf all = {0};
+        if (c->deferred_tool_schemas && c->deferred_tool_schemas[0]) {
+            buf_puts(&all, c->deferred_tool_schemas);
+            buf_putc(&all, '\n');
+        }
+        buf_append(&all, loaded.ptr, loaded.len);
+        buf_free(&loaded);
+        free(c->deferred_tool_schemas);
+        c->deferred_tool_schemas = buf_take(&all);
+    }
     return true;
 bad:
     free(instructions);
+    buf_free(&loaded);
     return false;
 }
 
