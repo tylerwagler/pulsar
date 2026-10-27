@@ -275,7 +275,9 @@ vision, image-smoke and live / abandon server legs, which the runner does not co
 stall check, (L316) `prefix-turns-live-gate` -- an agent loop's in-loop and re-sent turns == a fresh server's on
 the production Qwen pack, release-blocking (prefix-cache checks are must-pass) --, prefix-turns' side shape,
 preempt-exact, (L318) resume-deepest, (L322) sidecall-turns -- the side call's conversation stays on its bank --,
-(L324) kv-dup -- fan-out siblings' shared prefix pages show in the `/metrics` duplicate census -- and opencode-turns.
+(L324) kv-dup -- fan-out siblings' shared prefix pages show in the `/metrics` duplicate census --, (L329)
+fanout-prefix -- siblings arriving together on a new shared prefix prefill it once, each reply == the request
+alone -- and opencode-turns.
 
 ### The GPU queue (gpuq)
 

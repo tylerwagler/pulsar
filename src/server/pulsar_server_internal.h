@@ -1110,6 +1110,64 @@ int server_resume_memory_depth(int own, int adopt);
  *  else the bank's own state. */
 resume_pick server_resume_pick(int own, int adopt, int disk, kv_restore_verdict disk_verdict);
 
+/** L329 (a): the shared-prefix wait (after TensorFold #1321).  Requests that arrive together on a NEW shared prefix
+ *  (Claude Code's subagent fan-out: a dozen requests within seconds over one ~20-25k-token preamble) all bound at
+ *  once and each prefilled the preamble on its own bank: the adopt (L313) serves only checkpoints a bank has already
+ *  captured, and a request's resume is decided at its bind.  Now a queued request whose prompt shares a cut another
+ *  prompt's prefill has not reached yet stays queued -- holding no bank and reserving no KV, as any queued job --
+ *  while that prefill is asked to stop at the cut (gen_state::share_mark: a chunk ends there and the prefill captures
+ *  its grid checkpoint, as the cold-store phase's does); it binds once the leader stands at the cut, the leader's
+ *  prefill has ended or the bound passed, and its ordinary resume (server_resume_pick) adopts the cut and prefills
+ *  only its own part.  Bit-exact: a chunk end on the resume grid is the cold prefill's bytes
+ *  (cuda-chunk-neutrality-gate) and the adopt is (bank-adopt-gate).  A request waits at most once and only on a BOUND
+ *  prefill, which never waits: no cycle, the leader always runs, and a waiter keeps its queue place while later
+ *  requests that do not wait bind past it.  PULSAR_SERVER_PREFIX_WAIT_MS bounds a wait (this default; 0 = off). */
+#define PULSAR_SERVER_PREFIX_WAIT_MS_DEFAULT 60000
+
+/** A queued job's wait for another prompt's prefill (job::pw).  Worker-thread state only. */
+typedef struct {
+    bool decided;           ///< the wait was decided for this job (it waits at most once)
+    uint64_t leader;        ///< the bound job it waits on (job::seq), 0 = not waiting
+    int slot;               ///< that job's slot (server::slots index)
+    int mark;               ///< the cut the leader's prefill is to stand at
+    int have;               ///< what served the request when it started waiting (the gain is mark - have)
+    double since;           ///< server_now_sec() when it started waiting
+} prefix_wait;
+
+/** One bound prefill a queued request could wait on. */
+typedef struct {
+    int shared;   ///< tokens the two prompts share from 0 (the same ids)
+    int pos;      ///< where the leader's prefill stands (its bank's rows)
+    int len;      ///< the leader's prompt length
+} prefix_lead;
+
+/** The wait's decision, pure: the lead (index into `leads`, -1 for none) whose prefill a request of `prompt_len`
+ *  tokens waits on, and the cut `*mark` -- the deepest resume-grid point both prompts share, short of either's end,
+ *  that the lead has not reached and that starts the request's sync more than `min_gain` tokens (the adopt's own
+ *  threshold, PULSAR_SERVER_ADOPT_MIN_GAIN) deeper than `have`, the deepest state serving it now.  Ties go to the
+ *  lead nearest its cut. */
+int server_prefix_wait_pick(int have, int prompt_len, int grid, int min_gain, const prefix_lead *leads, int n,
+                            int *mark);
+
+/** Whether a waiting request goes on (server_prefix_wait_check). */
+typedef enum {
+    PREFIX_WAIT_HOLD = 0,   ///< still waiting
+    PREFIX_WAIT_REACHED,    ///< the leader stands at (or past) the cut
+    PREFIX_WAIT_LEFT,       ///< the leader's prefill ended short of it (cancelled, failed, another job on its bank)
+    PREFIX_WAIT_TIMEOUT,    ///< the bound passed
+    PREFIX_WAIT_OUTCOMES
+} prefix_wait_verdict;
+/** The outcomes' names: the log word and the /metrics label (one authority). */
+extern const char *const prefix_wait_names[PREFIX_WAIT_OUTCOMES];
+/** The release rule, pure: `live` = the job it waits on still prefills on its bank. */
+prefix_wait_verdict server_prefix_wait_check(bool live, int leader_pos, int mark, double waited_ms, double bound_ms);
+/** The cut a leader's prefill stops at, pure: its pending mark `cur` unless stale (<= `pos`) or deeper than a
+ *  waiter's `want` -- the shallowest pending cut first; a deeper waiter re-asserts its own once that one is reached. */
+int server_prefix_mark_merge(int cur, int want, int pos);
+/** PULSAR_SERVER_PREFIX_WAIT_MS's value, pure: unset or empty = the default, else whole milliseconds (0 = off);
+ *  -1 for anything else (the server refuses to start on it). */
+int server_prefix_wait_parse(const char *text);
+
 /** L310: the chain a disk restore would load (pulsar_kvchain_find), nothing loaded yet. */
 typedef struct {
     pulsar_segstore_seg chain[PULSAR_KVCHAIN_MAX];
@@ -1757,7 +1815,11 @@ struct server {
     pthread_cond_t stream_cv;
     job *head;                   ///< queue head; the next job to bind
     job *tail;                   ///< queue tail; where enqueue appends
-    bool stopping;               ///< shutdown in progress; stop accepting and drain
+    uint64_t job_seq;            ///< L329 (a): the last job::seq enqueue gave (under mu)
+    /** L329 (a): PULSAR_SERVER_PREFIX_WAIT_MS -- how long a queued request may wait for a cut another prompt's
+     *  prefill is filling (0: never; set at startup, read by the worker only). */
+    int prefix_wait_ms;
+    bool stopping;              ///< shutdown in progress; stop accepting and drain
     time_t started;  ///< wall-clock when the listener came up (uptime for /health)
     int clients;                 ///< connected clients, for the shutdown drain
     int stream_clients;          ///< live /metrics/stream subscribers (under mu)
@@ -1876,6 +1938,8 @@ struct server {
     kv_dup_census m_dup;          ///< L324: the last duplicate-prefix census (kv_dup_census_update)
     uint64_t m_dup_censuses;      ///< L324: censuses taken
     uint64_t m_dup_bytes_peak;    ///< L324: the largest dup_bytes any census saw
+    uint64_t m_prefix_waits[PREFIX_WAIT_OUTCOMES];   ///< L329 (a): finished waits by outcome ([HOLD] = started)
+    uint64_t m_prefix_wait_gain;  ///< L329 (a): tokens the waits that reached their cut moved the resume (mark - have)
     /** Why the queue is stuck. Counted once per job (job::refusal_counted) so a
      * head that cannot bind for many quanta registers once, not once a tick. */
     uint64_t m_refusals[PROVISION_REFUSAL_COUNT];
@@ -2372,7 +2436,10 @@ struct server {
     bool worker_evict_one(bool protect[PULSAR_SESSION_POOL_CAP]);
     /** Bind the head job to a slot if routing allows it. Strict FIFO: when the
      * head must wait (its owner slot is busy, or no fitting slot is free), later
-     * jobs wait behind it — simple and starvation-free. Returns true when the
+     * jobs wait behind it — simple and starvation-free.  L329 (a): the "head" is
+     * the first queued job that is not waiting for another prompt's prefill
+     * (prefix_wait_release / prefix_wait_decide): a waiter keeps its place and
+     * is passed over, never reordered.  Returns true when the
      * head was consumed: bound to a slot, or failed explicitly (a continuation
      * that cannot fit its owner slot — see choose_slot_for_job). When the head
      * cannot be placed cleanly (nothing fits, or only a warm slot it would
@@ -2384,6 +2451,15 @@ struct server {
      * increment-3 scheduler did.
      */
     bool worker_try_bind();
+    /** L329 (a): unlink a queued job wherever it stands in the queue (the worker is the only popper).  Takes mu. */
+    void queue_unlink(job *j);
+    /** L329 (a): every waiting job of the `n` queued ones (queue order) that may go on goes on -- its leader stands
+     *  at its cut, its leader's prefill ended, or the bound passed (server_prefix_wait_check) -- and every one still
+     *  waiting re-asserts its cut on its leader's prefill (server_prefix_mark_merge).  Worker thread only. */
+    void prefix_wait_release(job *const *queued, int n);
+    /** L329 (a): decide, once, whether queued `j` waits for a bound prompt's prefill (server_prefix_wait_pick over
+     *  every bound text prefill, against the deepest state any bank serves it now); true = it waits.  Worker only. */
+    bool prefix_wait_decide(job *j);
     /** Detach a finished job from its slot and wake its client thread. */
     void worker_finish_slot(session_slot *sl);
     /** L282: service a slot the scheduler picked -- one step unless it is already GEN_DONE, then release it if it is
@@ -2553,6 +2629,10 @@ struct job {
     /** The routing line last logged for this job (L280): a head the worker re-routes every quantum while it waits
      * (the KV admission's WAIT) logs its route once per distinct decision, not once per attempt.  0 = none yet. */
     uint64_t route_logged;
+    /** L329 (a): the job's number, given at enqueue from 1: a waiter names its leader by it (a later job at the
+     *  freed address is not the leader). */
+    uint64_t seq;
+    prefix_wait pw;   ///< L329 (a): its wait for another prompt's prefill while queued
 };
 
 
@@ -2708,6 +2788,10 @@ struct gen_state {
     server_prefill_progress progress;  ///< stable address: callback userdata
     int cold_store_len;  ///< the shared-preamble cut (chat_anchor_pos, system prompt + tools before the task message) written as a "sys-prefix" entry after its own prefill phase; always < the prompt; 0 = no cold write
     pulsar_tokens cold_prefix;  ///< the token prefix the cold write covers
+    /** L329 (a): a cut on the resume grid that a queued request waits for this prefill to stand at (0: none; stale
+     *  once the bank stands at or past it).  The prefill's next chunk ends there, so it captures the grid checkpoint
+     *  the waiter adopts (server::prefix_wait_release sets it, gen_step_prefill and the fused round honour it). */
+    int share_mark;
 
     /* prefill quantum policy (see gen_prefill_cancel_cb) */
     uint32_t prefill_min_suffix;  ///< 0 = interrupting is never exact

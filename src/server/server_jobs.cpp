@@ -1066,6 +1066,17 @@ void server::gen_step_prefill(session_slot *sl) {
      * checkpoint it leaves is one the main image sync extends. */
     const int n_images = cold ? 0 : g->j->req.n_images;
     gen_arm_prefill_callbacks(s->sess, g);
+    /* L329 (a): a queued request waits for this prefill to stand at share_mark (a resume-grid point inside the
+     * target): the sync goes to it first, so its last chunk ends there and captures the grid checkpoint the waiter
+     * adopts -- the cold phase's mechanism, for a cut a sibling request named.  A text prefill only (a waiter never
+     * names an image prompt's). */
+    pulsar_tokens to_cut = {0};
+    const bool cut = n_images == 0 && g->share_mark > pulsar_session_bank_pos(s->sess, (uint32_t)sl->bank) &&
+                     g->share_mark < target->len;
+    if (cut) {
+        tokens_copy_prefix(&to_cut, target, g->share_mark);
+        target = &to_cut;
+    }
 
     g->prefill_chunks_done = 0;
     g->prefill_last_current = -1;
@@ -1074,6 +1085,7 @@ void server::gen_step_prefill(session_slot *sl) {
         ? pulsar_session_sync_mm(s->sess, target, g->j->req.images, n_images,
                                  g->err, sizeof(g->err))
         : pulsar_session_sync(s->sess, target, g->err, sizeof(g->err));
+    pulsar_tokens_free(&to_cut);
     if (rc == PULSAR_SESSION_SYNC_INTERRUPTED) {
         if (gen_client_disconnected(g->j->fd)) {
             /* Client cancelled mid-prefill: abandon rather than resume or fail, so
@@ -1091,6 +1103,14 @@ void server::gen_step_prefill(session_slot *sl) {
     if (rc != 0) {
         s->gen_prefill_fail(sl, true);
         return;
+    }
+
+    if (cut) {
+        /* rule 5: the cut the prefill stopped at, and the checkpoint the waiters adopt (the next pass binds them) */
+        server_log(PULSAR_LOG_PREFILL, "pulsar-server: bank %u stands at %d, the shared cut a queued request "
+                   "waits for (prompt %d; grid checkpoint %d)", sl->bank, g->share_mark, g->prompt_for_sync->len,
+                   pulsar_session_checkpoint_best(s->sess, g->share_mark));
+        return;   /* a quantum boundary: the waiters bind before this prompt's next chunk */
     }
 
     if (cold) {

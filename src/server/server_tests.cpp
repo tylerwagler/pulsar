@@ -9544,6 +9544,240 @@ static void test_l190_mem_floor_warn_is_rate_limited(void) {
     TEST_ASSERT(skipped == 1);
 }
 
+/* L329 (a): the shared-prefix wait's decision -- the deepest resume-grid cut a bound prefill will reach that both
+ * prompts share, short of either's end, more than the adopt's threshold past what serves the request now. */
+static void test_l329_prefix_wait_pick(void) {
+    const int G = PULSAR_SERVER_ADOPT_MIN_GAIN;
+    int mark = -1;
+    /* the production fan-out (2026-10-23 16:08): the leader adopted 8192 from another conversation, its prompt
+     * 25078; a sibling of 24903 shares 24000 with it */
+    const prefix_lead fan[] = {{24000, 8192, 25078}};
+    TEST_ASSERT(server_prefix_wait_pick(8192, 24903, 128, G, fan, 1, &mark) == 0 && mark == 23936);
+    /* the leader stands at or past the cut: the bind adopts what it captured, nothing to wait for */
+    const prefix_lead past[] = {{24000, 23936, 25078}};
+    TEST_ASSERT(server_prefix_wait_pick(8192, 24903, 128, G, past, 1, &mark) == -1 && mark == 0);
+    /* the adopt's threshold: a cut must start the sync more than G deeper than what serves the request now */
+    TEST_ASSERT(server_prefix_wait_pick(23936 - G, 24903, 128, G, fan, 1, &mark) == -1);
+    TEST_ASSERT(server_prefix_wait_pick(23936 - G - 1, 24903, 128, G, fan, 1, &mark) == 0 && mark == 23936);
+    /* an unrelated prompt: the template header only */
+    const prefix_lead other[] = {{41, 0, 30000}};
+    TEST_ASSERT(server_prefix_wait_pick(0, 25000, 128, G, other, 1, &mark) == -1);
+    /* short of either end: a request that is a prefix of the leader's prompt; a leader whose whole prompt it carries */
+    const prefix_lead longer[] = {{10000, 0, 30000}};
+    TEST_ASSERT(server_prefix_wait_pick(0, 10000, 128, G, longer, 1, &mark) == 0 && mark == 9984);
+    const prefix_lead whole[] = {{10000, 0, 10000}};
+    TEST_ASSERT(server_prefix_wait_pick(0, 20000, 128, G, whole, 1, &mark) == 0 && mark == 9984);
+    /* several leads: the deepest cut; at the same cut the lead nearest it */
+    const prefix_lead three[] = {{12000, 0, 30000}, {20000, 4096, 30000}, {20000, 8192, 30000}};
+    TEST_ASSERT(server_prefix_wait_pick(0, 25000, 128, G, three, 3, &mark) == 2 && mark == 19968);
+    TEST_ASSERT(server_prefix_wait_pick(0, 25000, 128, G, three, 0, &mark) == -1 && mark == 0);
+    TEST_ASSERT(server_prefix_wait_pick(0, 25000, 0, G, three, 3, &mark) == -1);
+}
+
+/* L329 (a): the release rule, the leader's cut, the setting. */
+static void test_l329_prefix_wait_release_rule(void) {
+    TEST_ASSERT(server_prefix_wait_check(true, 8192, 23936, 10.0, 60000.0) == PREFIX_WAIT_HOLD);
+    TEST_ASSERT(server_prefix_wait_check(true, 23936, 23936, 10.0, 60000.0) == PREFIX_WAIT_REACHED);
+    TEST_ASSERT(server_prefix_wait_check(true, 24576, 23936, 10.0, 60000.0) == PREFIX_WAIT_REACHED);
+    TEST_ASSERT(server_prefix_wait_check(false, 0, 23936, 10.0, 60000.0) == PREFIX_WAIT_LEFT);
+    TEST_ASSERT(server_prefix_wait_check(false, 0, 23936, 1e9, 60000.0) == PREFIX_WAIT_LEFT);
+    TEST_ASSERT(server_prefix_wait_check(true, 8192, 23936, 60000.0, 60000.0) == PREFIX_WAIT_TIMEOUT);
+    /* the leader's cut: the shallowest pending one first, a stale one replaced */
+    TEST_ASSERT(server_prefix_mark_merge(0, 23936, 8192) == 23936);
+    TEST_ASSERT(server_prefix_mark_merge(19968, 23936, 8192) == 19968);
+    TEST_ASSERT(server_prefix_mark_merge(23936, 19968, 8192) == 19968);
+    TEST_ASSERT(server_prefix_mark_merge(19968, 23936, 19968) == 23936);
+    /* PULSAR_SERVER_PREFIX_WAIT_MS: unset or empty = the default, whole milliseconds, 0 = off, anything else refused */
+    TEST_ASSERT(server_prefix_wait_parse(NULL) == PULSAR_SERVER_PREFIX_WAIT_MS_DEFAULT);
+    TEST_ASSERT(server_prefix_wait_parse("") == PULSAR_SERVER_PREFIX_WAIT_MS_DEFAULT);
+    TEST_ASSERT(server_prefix_wait_parse("0") == 0);
+    TEST_ASSERT(server_prefix_wait_parse("250") == 250);
+    TEST_ASSERT(server_prefix_wait_parse("x") == -1 && server_prefix_wait_parse("-5") == -1 &&
+                server_prefix_wait_parse("1.5") == -1 && server_prefix_wait_parse(" 5") == -1 &&
+                server_prefix_wait_parse("99999999999") == -1);
+    TEST_ASSERT(!strcmp(prefix_wait_names[PREFIX_WAIT_HOLD], "started") &&
+                !strcmp(prefix_wait_names[PREFIX_WAIT_REACHED], "reached") &&
+                !strcmp(prefix_wait_names[PREFIX_WAIT_LEFT], "left") &&
+                !strcmp(prefix_wait_names[PREFIX_WAIT_TIMEOUT], "timeout"));
+}
+
+/* L329 (a): synthetic arrival shapes through the wait's decisions and the worker's order -- each pass releases the
+ * waiters that may go on, decides each new queued request once and binds the first that does not wait (a waiter
+ * keeps its place and is passed over), then one prompt chunk runs round-robin: chunks end on the absolute 4096 grid
+ * or at the cut a waiter named (gen_step_prefill), a chunk end on the 128 grid is a checkpoint, a bound request
+ * resumes from the deepest checkpoint a bank holds within its match when that is past the adopt's threshold
+ * (server_resume_memory_depth), a chunk costs 30 ms + rows / 1450 ms (GB10 Qwen, 2026-10-23's log). */
+enum { L329_N = 16, L329_CK = 64 };
+typedef struct {
+    double arrive;     ///< seconds
+    int group;         ///< requests of one group share `shared` tokens; groups share nothing
+    int shared;
+    int len;
+    double cancel_at;  ///< the client hangs up then (0: never); its bank's state goes with it
+} l329_req;
+typedef struct {
+    long prefilled;
+    double first[L329_N], bound_at[L329_N], last_first;
+    int resume[L329_N];
+    bool waited[L329_N], done[L329_N];
+    int outcomes[PREFIX_WAIT_OUTCOMES];
+} l329_out;
+
+static int l329_common(const l329_req *a, const l329_req *b) {
+    if (a->group != b->group) return 0;
+    const int c = a->shared < b->shared ? a->shared : b->shared;
+    return c < a->len && c < b->len ? c : (a->len < b->len ? a->len : b->len);
+}
+
+static void l329_fanout(const l329_req *rq, int n, int wait_ms, l329_out *o) {
+    const int G = PULSAR_SERVER_ADOPT_MIN_GAIN, grid = 128, cap = 4096;
+    struct st { bool bound, finished, cancelled; int pos, mark, n_ck, ck[L329_CK]; prefix_wait pw; };
+    st r[L329_N];
+    memset(r, 0, sizeof r);
+    memset(o, 0, sizeof *o);
+    double t = 0.0;
+    int rr = 0;
+    for (int iter = 0; iter < 100000; iter++) {
+        /* the client hangs up: a queued job is reaped, a prefill abandoned with its bank */
+        for (int i = 0; i < n; i++)
+            if (rq[i].cancel_at > 0.0 && t >= rq[i].cancel_at && !r[i].finished && !r[i].cancelled) {
+                r[i].cancelled = true;
+                r[i].n_ck = 0;
+            }
+        /* the bind pass (worker_try_bind's order) */
+        for (int k = 0; k < n; k++) {
+            prefix_wait *w = &r[k].pw;
+            if (!w->leader || r[k].bound || r[k].cancelled || rq[k].arrive > t) continue;
+            st *l = &r[w->slot];
+            const bool live = l->bound && !l->finished && !l->cancelled;
+            const prefix_wait_verdict v = server_prefix_wait_check(live, l->pos, w->mark, (t - w->since) * 1e3, wait_ms);
+            if (v == PREFIX_WAIT_HOLD) {
+                l->mark = server_prefix_mark_merge(l->mark, w->mark, l->pos);
+                continue;
+            }
+            o->outcomes[v]++;
+            w->leader = 0;
+        }
+        for (bool bound_one = true; bound_one;) {
+            bound_one = false;
+            for (int k = 0; k < n && !bound_one; k++) {
+                if (r[k].bound || r[k].cancelled || rq[k].arrive > t || r[k].pw.leader) continue;
+                int have = 0, nl = 0, lead_of[L329_N];
+                prefix_lead leads[L329_N];
+                for (int b = 0; b < n; b++) {
+                    if (!r[b].bound || r[b].cancelled) continue;
+                    const int c = l329_common(&rq[k], &rq[b]);
+                    for (int x = 0; x < r[b].n_ck; x++)
+                        if (r[b].ck[x] <= c && r[b].ck[x] > have) have = r[b].ck[x];
+                    if (!r[b].finished) {
+                        leads[nl] = {c, r[b].pos, rq[b].len};
+                        lead_of[nl++] = b;
+                    }
+                }
+                if (!r[k].pw.decided) {
+                    r[k].pw.decided = true;
+                    int mark = 0;
+                    const int pick = wait_ms > 0 ? server_prefix_wait_pick(have, rq[k].len, grid, G, leads, nl, &mark)
+                                                 : -1;
+                    if (pick >= 0) {
+                        r[k].pw = {true, (uint64_t)lead_of[pick] + 1u, lead_of[pick], mark, have, t};
+                        st *l = &r[lead_of[pick]];
+                        l->mark = server_prefix_mark_merge(l->mark, mark, l->pos);
+                        o->waited[k] = true;
+                        o->outcomes[PREFIX_WAIT_HOLD]++;
+                        continue;   /* passed over: the next queued request may bind */
+                    }
+                }
+                r[k].bound = true;
+                r[k].pos = server_resume_memory_depth(0, have);
+                o->resume[k] = r[k].pos;
+                o->bound_at[k] = t;
+                bound_one = true;
+            }
+        }
+        /* one prompt chunk, round-robin */
+        int pick = -1;
+        for (int k = 0; k < n && pick < 0; k++) {
+            const int i = (rr + k) % n;
+            if (r[i].bound && !r[i].finished && !r[i].cancelled) pick = i;
+        }
+        if (pick < 0) {
+            double next = -1.0;
+            for (int i = 0; i < n; i++)
+                if (rq[i].arrive > t && (next < 0.0 || rq[i].arrive < next)) next = rq[i].arrive;
+            bool queued = false;
+            for (int i = 0; i < n; i++) queued |= !r[i].bound && !r[i].cancelled && rq[i].arrive <= t;
+            if (next < 0.0 && !queued) break;
+            t = next > 0.0 ? next : t + 0.01;
+            continue;
+        }
+        rr = pick + 1;
+        st *p = &r[pick];
+        int end = (p->pos / cap + 1) * cap;
+        if (end > rq[pick].len) end = rq[pick].len;
+        if (p->mark > p->pos && p->mark < end) end = p->mark;
+        t += 0.030 + (end - p->pos) / 1450.0;
+        o->prefilled += end - p->pos;
+        p->pos = end;
+        if (end % grid == 0 && p->n_ck < L329_CK) p->ck[p->n_ck++] = end;
+        if (end == rq[pick].len) {
+            p->finished = true;
+            o->done[pick] = true;
+            o->first[pick] = t;
+            if (t > o->last_first) o->last_first = t;
+        }
+    }
+}
+
+static void test_l329_fanout_sim(void) {
+    /* A: the Claude Code fan-out -- a dozen subagents within 3 s over a 22000-token shared preamble, plus an
+     * unrelated request (another conversation) arriving among them */
+    l329_req a[13];
+    for (int i = 0; i < 12; i++) a[i] = {0.25 * i, 1, 22000, 22000 + 2500 + 97 * i, 0.0};
+    a[12] = {1.1, 2, 0, 6000, 0.0};
+    l329_out on, off;
+    l329_fanout(a, 13, PULSAR_SERVER_PREFIX_WAIT_MS_DEFAULT, &on);
+    l329_fanout(a, 13, 0, &off);
+    const int cut = 22000 / 128 * 128;
+    long distinct = a[0].len + a[12].len;
+    bool all_cut = true;
+    for (int i = 1; i < 12; i++) {
+        distinct += a[i].len - cut;
+        all_cut &= on.resume[i] == cut;
+    }
+    for (int i = 0; i < 13; i++) TEST_ASSERT(on.done[i] && off.done[i]);
+    TEST_ASSERT(on.resume[0] == 0 && all_cut);          /* the preamble prefilled once: every sibling resumes at it */
+    TEST_ASSERT(on.prefilled == distinct);
+    TEST_ASSERT(off.prefilled > on.prefilled + 4L * cut); /* without the wait most siblings prefill most of it */
+    TEST_ASSERT(on.last_first < off.last_first);
+    TEST_ASSERT(on.outcomes[PREFIX_WAIT_HOLD] > 0 && on.outcomes[PREFIX_WAIT_REACHED] == on.outcomes[PREFIX_WAIT_HOLD]);
+    TEST_ASSERT(off.outcomes[PREFIX_WAIT_HOLD] == 0);
+    /* the unrelated request neither waits nor is held behind the waiters queued before it */
+    TEST_ASSERT(!on.waited[12] && on.resume[12] == 0 && on.bound_at[12] <= off.bound_at[12] + 1e-9);
+    fprintf(stderr, "  l329 fan-out sim: 12 siblings + 1 unrelated: prefilled %ld -> %ld tokens, last first token "
+            "%.1f -> %.1f s (wait off -> on)\n", off.prefilled, on.prefilled, off.last_first, on.last_first);
+
+    /* B: the leader's client hangs up before the cut: its waiter goes on at once and prefills the prompt itself */
+    l329_req b[2] = {{0.0, 1, 22000, 24000, 4.0}, {0.5, 1, 22000, 25000, 0.0}};
+    l329_out ob;
+    l329_fanout(b, 2, PULSAR_SERVER_PREFIX_WAIT_MS_DEFAULT, &ob);
+    TEST_ASSERT(ob.waited[1] && ob.outcomes[PREFIX_WAIT_LEFT] == 1 && ob.done[1] && !ob.done[0] && ob.resume[1] == 0);
+    TEST_ASSERT(ob.bound_at[1] >= 4.0 && ob.bound_at[1] < 4.0 + 3.0);
+
+    /* C: the bound passes before the leader reaches the cut: the waiter binds with what the leader captured */
+    l329_out oc;
+    l329_req c[2] = {{0.0, 1, 22000, 24000, 0.0}, {0.5, 1, 22000, 25000, 0.0}};
+    l329_fanout(c, 2, 5000, &oc);
+    TEST_ASSERT(oc.waited[1] && oc.outcomes[PREFIX_WAIT_TIMEOUT] == 1 && oc.done[0] && oc.done[1]);
+    TEST_ASSERT(oc.resume[1] > 0 && oc.resume[1] < cut && oc.resume[1] % 4096 == 0);
+
+    /* D: requests that share only the template header never wait */
+    l329_req d[3] = {{0.0, 1, 40, 9000, 0.0}, {0.2, 2, 40, 9000, 0.0}, {0.4, 3, 40, 9000, 0.0}};
+    l329_out od;
+    l329_fanout(d, 3, PULSAR_SERVER_PREFIX_WAIT_MS_DEFAULT, &od);
+    TEST_ASSERT(od.outcomes[PREFIX_WAIT_HOLD] == 0 && od.prefilled == 27000);
+}
+
 /* L324: the duplicate-prefix census (kv_dup_census_core) on a Claude Code shape at the production grid.  Invariants:
  * a page is a whole grid cell [p*grid, (p+1)*grid) of a RESIDENT bank's history; two banks hold the same page iff
  * their common token prefix reaches (p+1)*grid (exactly reaching it counts); distinct pages count each class once,
@@ -10615,6 +10849,9 @@ static void pulsar_server_unit_tests_run(void) {
     test_kv_cache_sys_prefix_cut_clears_preamble_jitter();
     test_l310_restore_vs_recompute();
     test_l318_resume_picks_the_deepest();
+    test_l329_prefix_wait_pick();
+    test_l329_prefix_wait_release_rule();
+    test_l329_fanout_sim();
     test_writeback_preserves_bytes();
     test_sha1_bytes_hex_matches_known_vector();
     test_l264_segstore_chain_lookup();

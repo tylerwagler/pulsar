@@ -1181,6 +1181,22 @@ int main(int argc, char **argv) {
                    s.slot_trivial_common_tokens, hdr_len,
                    PULSAR_SERVER_SLOT_TRIVIAL_ALLOWANCE_TOKENS);
     }
+    /* L329 (a): the shared-prefix wait's bound (server::prefix_wait_decide) -- read once, announced */
+    {
+        const char *pw = getenv("PULSAR_SERVER_PREFIX_WAIT_MS");
+        s.prefix_wait_ms = server_prefix_wait_parse(pw);
+        if (s.prefix_wait_ms < 0) {
+            server_log(PULSAR_LOG_ERROR, "pulsar-server: PULSAR_SERVER_PREFIX_WAIT_MS=\"%s\" is not whole "
+                       "milliseconds (0 = off, at most a day) -- refusing to start", pw);
+            pulsar_session_free(session);
+            pulsar_engine_close(engine);
+            return 1;
+        }
+        if (s.pool_banks > 1)
+            server_log(PULSAR_LOG_DEFAULT, "pulsar-server: prefix wait: a queued request waits up to %d ms for a cut "
+                       "another prompt's prefill is filling, then adopts it (PULSAR_SERVER_PREFIX_WAIT_MS; 0 = off)",
+                       s.prefix_wait_ms);
+    }
     /* L272 B5: the template's turn markers, for the sys-prefix cold store and the routing anchor. */
     if (!pulsar_chat_turn_markers(engine, &s.turn_markers))
         server_log(PULSAR_LOG_WARNING, "pulsar-server: the tokenizer does not spell the chat turn markers: "

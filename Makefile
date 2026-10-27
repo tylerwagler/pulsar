@@ -2112,7 +2112,7 @@ prefix-turns-live-gate: pulsar-server
 	  --work $(PREFIX_TURNS_LIVE_WORK) --tag gate --reply 600
 # L317: the battery's live legs on ONE server per model (tests/live_legs.py): constrained-live, server-live and the
 # abandon leg on DeepSeek and Qwen, the L312 stall check, prefix-turns (L316's gate and the side shape), preempt-exact,
-# (L318) resume-deepest and (L322) sidecall-turns on Qwen,
+# (L318) resume-deepest, (L322) sidecall-turns and (L329) fanout-prefix on Qwen,
 # opencode-turns on Nemotron's LiLiCorr pack.  Per model: the shared server, then -- only if a leg needs it -- one
 # instance with the test hooks (the injected grammar failure, the KV-budget override), then one fresh instance for
 # every leg's reuse == cold reference.  Each leg keeps its own checks and PASS/FAIL; the targets above still run a
@@ -2176,6 +2176,19 @@ KV_DUP_LIVE_WORK ?= $(CURDIR)/.build/kv-dup-live
 kv-dup-live: pulsar-server
 	sync; sudo -n sh -c "echo 3 > /proc/sys/vm/drop_caches" 2>/dev/null; \
 	python3 tests/kv_dup_live.py $(RESUME_LIVE_MODEL) --binary ./pulsar-server --work $(KV_DUP_LIVE_WORK)
+
+# L329 (a): the shared-prefix wait -- ten fan-out siblings sent 0.25 s apart over a NEW ~20k-token system prompt
+# prefill it once (the first stops at the shared cut, the rest wait queued and adopt it), and each reply (one token,
+# its top-5 logprobs) == the request alone on a fresh server.  The Qwen pack, 16 banks, 64k; two loads (three with
+# FANOUT_AB=1: the same burst with PULSAR_SERVER_PREFIX_WAIT_MS=0, the last first token on vs off), ~3-5 min.  The
+# battery runs it as a leg of live-legs (Qwen); gates-dev on a routing / kv path.
+FANOUT_LIVE_WORK ?= $(CURDIR)/.build/fanout-prefix-live
+FANOUT_AB ?=
+.PHONY: fanout-prefix-live
+fanout-prefix-live: pulsar-server
+	sync; sudo -n sh -c "echo 3 > /proc/sys/vm/drop_caches" 2>/dev/null; \
+	python3 tests/fanout_prefix_live.py $(RESUME_LIVE_MODEL) --binary ./pulsar-server --work $(FANOUT_LIVE_WORK) \
+	  $(if $(FANOUT_AB),--ab,)
 
 cuda-spec-width-gate: pulsar
 	python3 tests/spec_verify_width_gate.py $(FRONTIER_MODEL) --binary ./pulsar
@@ -2801,7 +2814,7 @@ gates-dev:
 	if [ $$server -eq 1 ]; then printf '  server: chat smoke + the --server/--api unit switches\n'; fi; \
 	if [ $$render -eq 1 ]; then printf '  prefix-stability-gate: selected (L325: server / chat-render paths, every family, no model)\n'; fi; \
 	if [ $$kvmem -eq 1 ]; then printf '  server-kv-headroom-live: selected (L319: the touched-KV ceiling is the measured headroom; admission / guard / bank paths)\n'; fi; \
-	if [ $$resume -eq 1 ]; then printf '  resume-deepest-live + sidecall-turns-live + kv-dup-live: selected (L318 / L322 / L324: routing / resume / disk-chain paths, the Open WebUI and the Claude Code side-call shapes and the fan-out duplicate census on the Qwen pack)\n'; fi; \
+	if [ $$resume -eq 1 ]; then printf '  resume-deepest-live + sidecall-turns-live + kv-dup-live + fanout-prefix-live: selected (L318 / L322 / L324 / L329: routing / resume / disk-chain paths, the Open WebUI and the Claude Code side-call shapes, the fan-out duplicate census and the fan-out shared-prefix wait on the Qwen pack)\n'; fi; \
 	$(MAKE) --no-print-directory seam-check CUDA_ARCH=sm_120f || rc=1; \
 	$(MAKE) --no-print-directory cuda-reap-router-audit CUDA_ARCH=sm_120f \
 	      FRONTIER_MODEL="$(FRONTIER_MODEL)" || rc=1; \
@@ -2851,6 +2864,7 @@ gates-dev:
 	  $(MAKE) --no-print-directory resume-deepest-live CUDA_ARCH=sm_120f || rc=1; \
 	  $(MAKE) --no-print-directory sidecall-turns-live CUDA_ARCH=sm_120f || rc=1; \
 	  $(MAKE) --no-print-directory kv-dup-live CUDA_ARCH=sm_120f || rc=1; \
+	  $(MAKE) --no-print-directory fanout-prefix-live CUDA_ARCH=sm_120f || rc=1; \
 	fi; \
 	if [ $$kvmem -eq 1 ]; then \
 	  $(MAKE) --no-print-directory server-kv-headroom-live CUDA_ARCH=sm_120f || rc=1; \
