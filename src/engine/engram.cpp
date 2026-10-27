@@ -241,6 +241,7 @@ struct pulsar_engram_io {
     pulsar_engram_gather *bg_head, *bg_tail;   ///< L329 (b2): read-aheads with rows left to take, FIFO
     uint32_t hi_busy;       ///< foreground slices being read
     uint32_t bg_busy;       ///< background rows being read (<= PULSAR_ENGRAM_AHEAD_READERS)
+    uint64_t bg_pending;    ///< background rows queued, not yet taken (<= PULSAR_ENGRAM_AHEAD_PENDING_MAX)
     pulsar_read_ahead_stats ahead;   ///< the background class's counters (under the lock)
     pthread_t *threads;
     uint32_t n_threads;
@@ -306,7 +307,7 @@ static void *engram_io_worker(void *arg) {
                 if (!io->head) io->tail = NULL;
             }
         }
-        if (bg) io->bg_busy++; else io->hi_busy++;
+        if (bg) { io->bg_busy++; io->bg_pending -= i1 - i0; } else io->hi_busy++;
         /* a prefetch or a read-ahead wakes one reader (L289); each reader wakes the next while slices remain */
         if (io->head || engram_bg_ready(io)) pthread_cond_signal(&io->work);
         pthread_mutex_unlock(&io->lock);
@@ -435,13 +436,29 @@ uint32_t pulsar_engram_read_ahead(pulsar_engram_io *io, const pulsar_engram_tabl
     g->detached = 1;
     g->tag = tag;
     pthread_mutex_lock(&io->lock);
+    /* bounded: the rows queued and not yet read never pass the cap (each a cold row is about one page of cache) */
+    if (io->bg_pending + n_rows > PULSAR_ENGRAM_AHEAD_PENDING_MAX) {
+        io->ahead.rows_refused += n_rows;
+        pthread_mutex_unlock(&io->lock);
+        free(ids);
+        free(g);
+        return 0;
+    }
     if (io->bg_tail) io->bg_tail->q_next = g; else io->bg_head = g;
     io->bg_tail = g;
+    io->bg_pending += n_rows;
     io->ahead.issued++;
     io->ahead.rows_queued += n_rows;
     if (engram_bg_ready(io)) pthread_cond_signal(&io->work);
     pthread_mutex_unlock(&io->lock);
     return n_rows;
+}
+
+void pulsar_engram_read_ahead_skipped(pulsar_engram_io *io) {
+    if (!io) return;
+    pthread_mutex_lock(&io->lock);
+    io->ahead.skipped++;
+    pthread_mutex_unlock(&io->lock);
 }
 
 uint32_t pulsar_engram_read_ahead_cancel(pulsar_engram_io *io, uint64_t tag) {
@@ -452,6 +469,7 @@ uint32_t pulsar_engram_read_ahead_cancel(pulsar_engram_io *io, uint64_t tag) {
         nx = g->q_next;
         if (g->tag != tag) { prev = g; continue; }
         dropped += g->n_rows - g->next;
+        io->bg_pending -= g->n_rows - g->next;
         g->n_rows = g->next;   /* the rows already taken are the last it reads */
         engram_bg_unlink(io, prev, g);
         /* no row of it in flight: nobody else will finish it; else its last finisher reaps it */
@@ -468,7 +486,7 @@ void pulsar_engram_read_ahead_stats(pulsar_engram_io *io, pulsar_read_ahead_stat
     pthread_mutex_lock(&io->lock);
     *out = io->ahead;
     out->in_flight = io->bg_busy;
-    for (const pulsar_engram_gather *g = io->bg_head; g; g = g->q_next) out->rows_pending += g->n_rows - g->next;
+    out->rows_pending = io->bg_pending;
     pthread_mutex_unlock(&io->lock);
 }
 

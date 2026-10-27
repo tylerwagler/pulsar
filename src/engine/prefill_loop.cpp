@@ -132,7 +132,12 @@ int pulsar_prefill_walk_run(const pulsar_prefill_walk *w, uint32_t start, uint32
  * lane's prompt runs (the server calls pulsar_session_prompt_read_ahead per round): one chunk past the rows in
  * flight, one record per bank so a run that advances by less than a chunk queues each row once.  The family supplies
  * the rows (pulsar_driver_ops::read_ahead) and the pool reads them on its background class, below every gather
- * (engram.cpp).  A hint: the gather reads every byte itself, so no byte changes with it on or off. */
+ * (engram.cpp).  A hint: the gather reads every byte itself, so no byte changes with it on or off.
+ *
+ * Bounded (window #477/#478: systemd-oomd's pressure kill took the job's whole unit during gates-dev): it runs only
+ * for a prompt a server is serving (the walk's license is pulsar_session_set_prefill_ahead; nothing else -- a gate,
+ * the CLI, imatrix -- ever reads ahead), the pool holds at most PULSAR_ENGRAM_AHEAD_PENDING_MAX unread rows (~1 GiB of
+ * cache), and an arm is skipped while MemAvailable is under PULSAR_READ_AHEAD_MEM_HEADROOM plus that cap. */
 
 static uint64_t read_ahead_hash(const int *v, uint32_t from, uint32_t to) {
     uint64_t h = 1469598103934665603ull;
@@ -163,6 +168,24 @@ bool pulsar_read_ahead_plan(const pulsar_read_ahead_mark *mark, const int *promp
     return true;
 }
 
+bool pulsar_read_ahead_admit(uint64_t mem_available) {
+    /* the headroom plus the most the pool can hold unread, a page a row (a cold row ~ one page of cache) */
+    return mem_available != 0 && mem_available > PULSAR_READ_AHEAD_MEM_HEADROOM + PULSAR_ENGRAM_AHEAD_PENDING_MAX * 4096ull;
+}
+
+/* MemAvailable from /proc/meminfo in bytes, 0 when unreadable (the admit then fails closed).  Read once per arm --
+ * a chunk, or a fused round that queues -- never per row or per step. */
+uint64_t pulsar_read_ahead_mem_available(void) {
+    FILE *fp = fopen("/proc/meminfo", "r");
+    if (!fp) return 0;
+    char line[256];
+    unsigned long long kib = 0;
+    while (fgets(line, sizeof(line), fp))
+        if (sscanf(line, "MemAvailable: %llu kB", &kib) == 1) break;
+    fclose(fp);
+    return (uint64_t)kib * 1024ull;
+}
+
 static uint64_t read_ahead_tag(const pulsar_session *s, uint32_t bank) {
     return ((uint64_t)(uintptr_t)s << 16) ^ bank;   /* banks < 2^16; one tag per session and bank */
 }
@@ -187,8 +210,19 @@ uint32_t pulsar_session_read_ahead(pulsar_session *s, uint32_t bank, const pulsa
         *m = {};
     }
     if (!go) return 0;
+    if (!pulsar_read_ahead_admit(pulsar_read_ahead_mem_available())) {
+        pulsar_engram_read_ahead_skipped(ops->read_ahead_pool(s->engine));
+        static bool said = false;   /* rule 5: the stand-down, once */
+        if (!said) {
+            said = true;
+            fprintf(stderr, "pulsar: L329 (b2) read-ahead stood down: MemAvailable under %llu GiB + the arm's pages "
+                            "(counted: pulsar:ple_read_ahead_rows_total{outcome=\"skipped\"})\n",
+                    (unsigned long long)(PULSAR_READ_AHEAD_MEM_HEADROOM >> 30));
+        }
+        return 0;
+    }
     const uint32_t rows = ops->read_ahead(s->engine, tag, prompt->v, from, to);
-    if (rows == 0) return 0;   /* off (said at load), or a token the gather will refuse by name */
+    if (rows == 0) return 0;   /* off (said at load), at the pool's cap (counted), or a token the gather refuses */
     *m = next;
     static bool announced = false;   /* rule 5: the path taken, once */
     if (!announced) {
@@ -236,8 +270,9 @@ struct prefill_loop_ctx {
 static bool prefill_loop_chunk(void *ud, uint32_t pos0, uint32_t rows, bool last) {
     const prefill_loop_ctx *c = (const prefill_loop_ctx *)ud;
     /* L329 (b2): the next chunk's rows, read while this one computes (queued first; this chunk's own gather, issued
-     * at its embed, goes ahead of them) */
-    (void)pulsar_session_read_ahead(c->s, c->bank, c->s->prefill_ahead ? c->s->prefill_ahead : c->prompt, pos0 + rows);
+     * at its embed, goes ahead of them) -- for a SERVED prompt only: the one a server named for this sync
+     * (pulsar_session_set_prefill_ahead); a sync nobody licensed (a gate, the CLI, imatrix) passes NULL, reads nothing */
+    (void)pulsar_session_read_ahead(c->s, c->bank, c->s->prefill_ahead, pos0 + rows);
     const double t0 = now_sec();
     if (!c->chunk(c->s, c->prompt, pos0, rows, last, c->ud) || pulsar_gpu_end_commands() == 0) return false;
     if (c->s->sync_n_images == 0)

@@ -893,13 +893,18 @@ bool server::send_metrics(int fd) {
     pulsar_read_ahead_stats ra;
     if (pulsar_engine_read_ahead_stats(s->engine, &ra)) {
         buf_puts(&b, "# HELP pulsar:ple_read_ahead_rows_total Prompt rows the next-chunk read-ahead queued, read into the "
-                     "page cache, failed, or dropped before a reader took them (cancelled).\n");
+                     "page cache, failed, or dropped before a reader took them (cancelled), or not queued at the pool's cap of unread rows (refused).\n");
         buf_puts(&b, "# TYPE pulsar:ple_read_ahead_rows_total counter\n");
         buf_printf(&b, "pulsar:ple_read_ahead_rows_total{outcome=\"queued\"} %llu\n", (unsigned long long)ra.rows_queued);
         buf_printf(&b, "pulsar:ple_read_ahead_rows_total{outcome=\"read\"} %llu\n", (unsigned long long)ra.rows_read);
         buf_printf(&b, "pulsar:ple_read_ahead_rows_total{outcome=\"failed\"} %llu\n", (unsigned long long)ra.rows_failed);
         buf_printf(&b, "pulsar:ple_read_ahead_rows_total{outcome=\"cancelled\"} %llu\n",
                    (unsigned long long)ra.rows_cancelled);
+        buf_printf(&b, "pulsar:ple_read_ahead_rows_total{outcome=\"refused\"} %llu\n", (unsigned long long)ra.rows_refused);
+        buf_puts(&b, "# HELP pulsar:ple_read_ahead_skipped_total Read-aheads not queued: MemAvailable under the "
+                     "read-ahead's headroom (memory pressure).\n");
+        buf_puts(&b, "# TYPE pulsar:ple_read_ahead_skipped_total counter\n");
+        buf_printf(&b, "pulsar:ple_read_ahead_skipped_total %llu\n", (unsigned long long)ra.skipped);
         buf_puts(&b, "# HELP pulsar:ple_read_ahead_bytes_total Bytes the read-ahead read.\n");
         buf_puts(&b, "# TYPE pulsar:ple_read_ahead_bytes_total counter\n");
         buf_printf(&b, "pulsar:ple_read_ahead_bytes_total %llu\n", (unsigned long long)ra.bytes_read);

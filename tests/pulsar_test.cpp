@@ -4256,7 +4256,14 @@ static uint32_t fake_bank_pools(void *, uint32_t bank, pulsar_kv_pool *out, uint
  * old rows.  (2) The pool's background class on a synthetic row file: the bytes a gather returns are the file's, the
  * same with the read-ahead on as off (it only warms the cache); a gather completes while a long read-ahead is still
  * queued (strict priority); a cancel drops the untaken rows; every queued row is accounted read, failed or cancelled;
- * a pool destroyed with read-ahead queued frees it. */
+ * the unread rows never pass the pool's cap; a pool destroyed with read-ahead queued frees it.  (3) Memory pressure:
+ * the admit rule.  (4) No served prompt, no read-ahead: an unlicensed session never reaches the family's reader. */
+static int g_fake_ahead_calls = 0;
+static uint32_t fake_ahead_read(const pulsar_engine *, uint64_t, const int32_t *, uint32_t from, uint32_t to) {
+    g_fake_ahead_calls++;
+    return (to - from) * 16u;
+}
+static pulsar_engram_io *fake_ahead_pool(const pulsar_engine *) { return NULL; }
 static void test_read_ahead(void) {
     /* (1) the rule */
     const uint32_t W = 4096, LEN = 20000;
@@ -4347,11 +4354,15 @@ static void test_read_ahead(void) {
     TEST_ASSERT(drained(&st) && st.issued == 2 && st.rows_queued == other.size() + G &&
                 st.rows_read == st.rows_queued && st.rows_failed == 0 && st.rows_cancelled == 0 &&
                 st.bytes_read == st.rows_read * RB);
-    /* strict priority: a gather lands while a long read-ahead (4M rows) is still queued; a cancel drops the rest */
-    const uint32_t BIG = 4u << 20;
+    /* strict priority: a gather lands while a long read-ahead (the pool's whole unread cap) is still queued; a cancel
+     * drops the rest.  Bounded: a second one while the first is unread passes the cap -- refused whole, counted */
+    const uint32_t BIG = (uint32_t)PULSAR_ENGRAM_AHEAD_PENDING_MAX;
     std::vector<uint64_t> big(BIG);
     for (uint32_t i = 0; i < BIG; i++) big[i] = other[i % other.size()];
     TEST_ASSERT(pulsar_engram_read_ahead(io, &tb, big.data(), BIG, 9u) == BIG);
+    TEST_ASSERT(pulsar_engram_read_ahead(io, &tb, big.data(), BIG, 12u) == 0);
+    pulsar_engram_read_ahead_stats(io, &st);
+    TEST_ASSERT(st.rows_refused == BIG && st.rows_pending <= PULSAR_ENGRAM_AHEAD_PENDING_MAX);
     TEST_ASSERT(pulsar_engram_gather_wait(pulsar_engram_gather_start(io, &tb, ids.data(), G, on_bytes.data())));
     pulsar_read_ahead_stats mid;
     pulsar_engram_read_ahead_stats(io, &mid);
@@ -4368,6 +4379,39 @@ static void test_read_ahead(void) {
     pulsar_engram_io_destroy(io);
     pulsar_engram_table_close(&tb);
     unlink(path);
+
+    /* (3) memory pressure: nothing is queued under the headroom (+ the pool's unread cap), or when MemAvailable is
+     * unreadable (0: fail closed) */
+    const uint64_t floor_b = PULSAR_READ_AHEAD_MEM_HEADROOM + PULSAR_ENGRAM_AHEAD_PENDING_MAX * 4096ull;
+    TEST_ASSERT(!pulsar_read_ahead_admit(0) && !pulsar_read_ahead_admit(floor_b) && pulsar_read_ahead_admit(floor_b + 1));
+    TEST_ASSERT(!pulsar_read_ahead_admit(4ull << 30) && pulsar_read_ahead_admit(64ull << 30));
+
+    /* (4) no served prompt, no read-ahead: a session whose syncs no server licensed (a gate's, the CLI's, imatrix's)
+     * never reaches the family's reader -- the walk passes its license, NULL; a licensed prompt does reach it */
+    static pulsar_driver_ops dops{};
+    dops.read_ahead = fake_ahead_read;
+    dops.read_ahead_pool = fake_ahead_pool;
+    static pulsar_family fam{};
+    fam.driver = &dops;
+    pulsar_engine *fe = (pulsar_engine *)calloc(1, sizeof(pulsar_engine));
+    fe->family = &fam;
+    pulsar_session *fs = (pulsar_session *)calloc(1, sizeof(pulsar_session));
+    fs->engine = fe;
+    fs->prefill_cap = W;
+    TEST_ASSERT(fs->prefill_ahead == NULL);   /* the default: unlicensed */
+    TEST_ASSERT(pulsar_session_read_ahead(fs, 0, fs->prefill_ahead, W) == 0 && g_fake_ahead_calls == 0);
+    TEST_ASSERT(pulsar_session_prompt_read_ahead(fs, 0, NULL, (int)W) == 0 && g_fake_ahead_calls == 0);
+    pulsar_tokens served = {p.data(), (int)LEN, (int)LEN};
+    pulsar_session_set_prefill_ahead(fs, &served);
+    const uint32_t got = pulsar_session_read_ahead(fs, 0, fs->prefill_ahead, W);
+    const bool roomy = pulsar_read_ahead_admit(pulsar_read_ahead_mem_available());
+    TEST_ASSERT(roomy ? got == W && g_fake_ahead_calls == 1 : got == 0 && g_fake_ahead_calls == 0);
+    pulsar_session_set_prefill_ahead(fs, NULL);
+    pulsar_session_read_ahead_cancel(fs, 0);   /* a NULL pool: nothing to drop, the record cleared */
+    TEST_ASSERT(fs->n_ahead == 0 || fs->ahead[0].from == fs->ahead[0].to);
+    free(fs->ahead);
+    free(fs);
+    free(fe);
 }
 
 static void test_ckpt_records(void) {
