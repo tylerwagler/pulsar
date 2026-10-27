@@ -4251,6 +4251,125 @@ static uint32_t fake_bank_pools(void *, uint32_t bank, pulsar_kv_pool *out, uint
     return 1u;
 }
 
+/* L329 (b2): the next-chunk read-ahead.  (1) THE rule (pulsar_read_ahead_plan): one chunk past the rows in flight,
+ * nothing queued twice for the same tokens, nothing under half a chunk short of the end, a changed prompt drops the
+ * old rows.  (2) The pool's background class on a synthetic row file: the bytes a gather returns are the file's, the
+ * same with the read-ahead on as off (it only warms the cache); a gather completes while a long read-ahead is still
+ * queued (strict priority); a cancel drops the untaken rows; every queued row is accounted read, failed or cancelled;
+ * a pool destroyed with read-ahead queued frees it. */
+static void test_read_ahead(void) {
+    /* (1) the rule */
+    const uint32_t W = 4096, LEN = 20000;
+    std::vector<int> p(LEN), q(LEN);
+    for (uint32_t i = 0; i < LEN; i++) p[i] = q[i] = (int)(i * 7u % 1000u);
+    pulsar_read_ahead_mark m = {}, nx = {};
+    uint32_t f = 0, t = 0;
+    bool drop = false;
+    /* a walk: the chunk [0, 4096) in flight reads [4096, 8192) ahead */
+    TEST_ASSERT(pulsar_read_ahead_plan(&m, p.data(), LEN, W, W, &f, &t, &drop, &nx) && f == W && t == 2 * W && !drop);
+    m = nx;
+    /* the next chunk [4096, 8192) in flight: [8192, 12288); the old record is behind the run, its rows dropped */
+    TEST_ASSERT(pulsar_read_ahead_plan(&m, p.data(), LEN, 2 * W, W, &f, &t, &drop, &nx) && f == 2 * W && t == 3 * W && drop);
+    m = nx;
+    /* a fused run that advanced 512 rows: [8704, 12800) is queued but for [12288, 12800) -- under half a chunk: wait */
+    TEST_ASSERT(!pulsar_read_ahead_plan(&m, p.data(), LEN, 2 * W + 512, W, &f, &t, &drop, &nx) && !drop);
+    /* ... at 2W + W/2 the new rows reach half a chunk: only those are queued, the record moves to the run */
+    TEST_ASSERT(pulsar_read_ahead_plan(&m, p.data(), LEN, 2 * W + W / 2, W, &f, &t, &drop, &nx) && f == 3 * W &&
+                t == 3 * W + W / 2 && !drop && nx.from == 2 * W + W / 2 && nx.to == t);
+    m = nx;
+    /* the prompt's tail is queued however short */
+    TEST_ASSERT(pulsar_read_ahead_plan(&m, p.data(), LEN, LEN - 100, W, &f, &t, &drop, &nx) && t == LEN);
+    TEST_ASSERT(!pulsar_read_ahead_plan(&m, p.data(), LEN, LEN, W, &f, &t, &drop, &nx));
+    /* another prompt on the bank (one token differs inside the record): not the record's rows -- dropped, re-read */
+    m = {};
+    TEST_ASSERT(pulsar_read_ahead_plan(&m, p.data(), LEN, W, W, &f, &t, &drop, &nx));
+    m = nx;
+    q[W + 10] += 1;
+    TEST_ASSERT(pulsar_read_ahead_plan(&m, q.data(), LEN, W + 512, W, &f, &t, &drop, &nx) && drop && f == W + 512 &&
+                t == 2 * W + 512);
+    /* ... and a token the n-gram reaches back to (two before the record) counts too */
+    q = p;
+    q[W - 2] += 1;
+    TEST_ASSERT(pulsar_read_ahead_plan(&m, q.data(), LEN, W + 512, W, &f, &t, &drop, &nx) && drop);
+    /* a bank that went back (a resume below the record) drops and reads from where it stands */
+    TEST_ASSERT(pulsar_read_ahead_plan(&m, p.data(), LEN, 128, W, &f, &t, &drop, &nx) && drop && f == 128);
+
+    /* (2) the pool, on a synthetic table: 4096 rows of 320 B behind the 64-byte header */
+    const uint32_t RB = 320, NR = 4096;
+    char path[256];
+    const char *tmp = getenv("TMPDIR");
+    snprintf(path, sizeof path, "%s/pulsar-read-ahead-%d.rows", tmp && tmp[0] ? tmp : "/tmp", (int)getpid());
+    std::vector<unsigned char> file(64 + (size_t)NR * RB);
+    uint32_t s = 329u;
+    for (auto &c : file) { s = s * 1664525u + 1013904223u; c = (unsigned char)(s >> 24); }
+    FILE *fp = fopen(path, "wb");
+    TEST_ASSERT(fp && fwrite(file.data(), 1, file.size(), fp) == file.size());
+    if (fp) fclose(fp);
+    pulsar_engram_table tb;
+    const char *paths[1] = {path};
+    const uint64_t base = 64;
+    TEST_ASSERT(pulsar_engram_table_open_parts(&tb, 1, 1, paths, &base, NR, RB, NR));
+    pulsar_engram_io *io = pulsar_engram_io_create(PULSAR_ENGRAM_IO_THREADS);
+    TEST_ASSERT(io != NULL);
+    const uint32_t G = 20000;
+    std::vector<uint64_t> ids(G), other(200000);
+    for (auto &r : ids) { s = s * 1664525u + 1013904223u; r = (s >> 8) % NR; }
+    for (auto &r : other) { s = s * 1664525u + 1013904223u; r = (s >> 8) % NR; }
+    auto evict = [&] {
+        const int fd = open(path, O_RDONLY);
+        if (fd >= 0) { (void)posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED); close(fd); }
+    };
+    auto expect_bytes = [&](const std::vector<unsigned char> &dst) {
+        uint32_t bad = 0;
+        for (uint32_t i = 0; i < G; i++)
+            if (memcmp(dst.data() + (size_t)i * RB, file.data() + 64 + ids[i] * RB, RB) != 0) bad++;
+        return bad;
+    };
+    auto drained = [&](pulsar_read_ahead_stats *st) {
+        for (int k = 0; k < 20000; k++) {   /* <= 20 s */
+            pulsar_engram_read_ahead_stats(io, st);
+            if (st->rows_pending == 0 && st->in_flight == 0) return true;
+            usleep(1000);
+        }
+        return false;
+    };
+    std::vector<unsigned char> off_bytes((size_t)G * RB), on_bytes((size_t)G * RB);
+    evict();
+    TEST_ASSERT(pulsar_engram_gather_wait(pulsar_engram_gather_start(io, &tb, ids.data(), G, off_bytes.data())));
+    TEST_ASSERT(expect_bytes(off_bytes) == 0);
+    /* the same gather with the read-ahead running: its own rows and another prompt's, queued first */
+    evict();
+    TEST_ASSERT(pulsar_engram_read_ahead(io, &tb, other.data(), (uint32_t)other.size(), 7u) == other.size());
+    TEST_ASSERT(pulsar_engram_read_ahead(io, &tb, ids.data(), G, 8u) == G);
+    TEST_ASSERT(pulsar_engram_gather_wait(pulsar_engram_gather_start(io, &tb, ids.data(), G, on_bytes.data())));
+    TEST_ASSERT(expect_bytes(on_bytes) == 0 && memcmp(off_bytes.data(), on_bytes.data(), on_bytes.size()) == 0);
+    pulsar_read_ahead_stats st;
+    TEST_ASSERT(drained(&st) && st.issued == 2 && st.rows_queued == other.size() + G &&
+                st.rows_read == st.rows_queued && st.rows_failed == 0 && st.rows_cancelled == 0 &&
+                st.bytes_read == st.rows_read * RB);
+    /* strict priority: a gather lands while a long read-ahead (4M rows) is still queued; a cancel drops the rest */
+    const uint32_t BIG = 4u << 20;
+    std::vector<uint64_t> big(BIG);
+    for (uint32_t i = 0; i < BIG; i++) big[i] = other[i % other.size()];
+    TEST_ASSERT(pulsar_engram_read_ahead(io, &tb, big.data(), BIG, 9u) == BIG);
+    TEST_ASSERT(pulsar_engram_gather_wait(pulsar_engram_gather_start(io, &tb, ids.data(), G, on_bytes.data())));
+    pulsar_read_ahead_stats mid;
+    pulsar_engram_read_ahead_stats(io, &mid);
+    TEST_ASSERT(mid.rows_pending > 0 && expect_bytes(on_bytes) == 0);
+    TEST_ASSERT(pulsar_engram_read_ahead_cancel(io, 8u) == 0);   /* another tag's rows stay */
+    const uint32_t dropped = pulsar_engram_read_ahead_cancel(io, 9u);
+    TEST_ASSERT(dropped > 0 && drained(&st));
+    TEST_ASSERT(st.rows_cancelled == dropped && st.rows_read + st.rows_failed + st.rows_cancelled == st.rows_queued);
+    /* a row past the table: counted failed, nothing else */
+    const uint64_t past = NR;
+    TEST_ASSERT(pulsar_engram_read_ahead(io, &tb, &past, 1, 10u) == 1 && drained(&st) && st.rows_failed == 1);
+    /* destroyed with a read-ahead queued: freed, no reader left behind */
+    TEST_ASSERT(pulsar_engram_read_ahead(io, &tb, big.data(), BIG, 11u) == BIG);
+    pulsar_engram_io_destroy(io);
+    pulsar_engram_table_close(&tb);
+    unlink(path);
+}
+
 static void test_ckpt_records(void) {
     pulsar_kv_state_ops ops = {};
     ops.name = "fake";
@@ -4617,6 +4736,7 @@ static const pulsar_test_entry test_entries[] = {
     {"--lane-cost", "lane-cost", "lane cost fit: a step's measured cost to its terms, its centre, or no price at all (L263, L284)", test_lane_cost_fit},
     {"--fused-cost", "fused-cost", "the prompt chunk cost fit (solo + fused, persisted) and the verify curve's round cost, what the round selection and the disk restore price by (L304, L312, L327)", test_fused_cost},
     {"--fused-sched", "fused-sched", "the round selection simulated on L304's logged costs: L304's and L277's cases, the stall, no prompt, the cold fit (L312)", test_fused_sched},
+    {"--read-ahead", "read-ahead", "the next-chunk PLE read-ahead: its rule (one chunk ahead, each row once, a changed prompt drops), the pool's background class (bytes unchanged, below every gather, cancel, accounting) (L329 b2)", test_read_ahead},
     {"--ckpt-records", "ckpt-records", "the record pool (prompt ends, message endpoints: capture, match, LRU, frontier rule) and the endpoint cut (L311)", test_ckpt_records},
     {"--verify-pick", "verify-pick", "the verify pick: the brute-force argmax on a staircase curve, the robust online correction, the lockstep continuation (L301); the copy estimate's re-probe (L308)", test_verify_pick},
     {"--lib-image-rope", "lib-image-rope", "multi-axis rope positions from the image records vs HF get_rope_index (L268)", test_lib_image_rope},

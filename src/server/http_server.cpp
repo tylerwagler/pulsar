@@ -889,6 +889,31 @@ bool server::send_metrics(int fd) {
                  "past what served them when they began waiting.\n");
     buf_puts(&b, "# TYPE pulsar:prefix_wait_gain_tokens_total counter\n");
     buf_printf(&b, "pulsar:prefix_wait_gain_tokens_total %llu\n", prefix_wait_gain);
+    /* L329 (b2): the next-chunk PLE read-ahead (the disk row table's background readers; the pool keeps them) */
+    pulsar_read_ahead_stats ra;
+    if (pulsar_engine_read_ahead_stats(s->engine, &ra)) {
+        buf_puts(&b, "# HELP pulsar:ple_read_ahead_rows_total Prompt rows the next-chunk read-ahead queued, read into the "
+                     "page cache, failed, or dropped before a reader took them (cancelled).\n");
+        buf_puts(&b, "# TYPE pulsar:ple_read_ahead_rows_total counter\n");
+        buf_printf(&b, "pulsar:ple_read_ahead_rows_total{outcome=\"queued\"} %llu\n", (unsigned long long)ra.rows_queued);
+        buf_printf(&b, "pulsar:ple_read_ahead_rows_total{outcome=\"read\"} %llu\n", (unsigned long long)ra.rows_read);
+        buf_printf(&b, "pulsar:ple_read_ahead_rows_total{outcome=\"failed\"} %llu\n", (unsigned long long)ra.rows_failed);
+        buf_printf(&b, "pulsar:ple_read_ahead_rows_total{outcome=\"cancelled\"} %llu\n",
+                   (unsigned long long)ra.rows_cancelled);
+        buf_puts(&b, "# HELP pulsar:ple_read_ahead_bytes_total Bytes the read-ahead read.\n");
+        buf_puts(&b, "# TYPE pulsar:ple_read_ahead_bytes_total counter\n");
+        buf_printf(&b, "pulsar:ple_read_ahead_bytes_total %llu\n", (unsigned long long)ra.bytes_read);
+        buf_puts(&b, "# HELP pulsar:ple_read_ahead_seconds_total Reader time on read-ahead rows, summed over the readers.\n");
+        buf_puts(&b, "# TYPE pulsar:ple_read_ahead_seconds_total counter\n");
+        buf_printf(&b, "pulsar:ple_read_ahead_seconds_total %.6f\n", (double)ra.read_ns * 1e-9);
+        buf_puts(&b, "# HELP pulsar:ple_read_ahead_issued_total Read-aheads queued (one per prompt chunk ahead).\n");
+        buf_puts(&b, "# TYPE pulsar:ple_read_ahead_issued_total counter\n");
+        buf_printf(&b, "pulsar:ple_read_ahead_issued_total %llu\n", (unsigned long long)ra.issued);
+        buf_puts(&b, "# HELP pulsar:ple_read_ahead_pending_rows Read-ahead rows queued now, not yet read.\n");
+        buf_puts(&b, "# TYPE pulsar:ple_read_ahead_pending_rows gauge\n");
+        buf_printf(&b, "pulsar:ple_read_ahead_pending_rows %llu\n",
+                   (unsigned long long)(ra.rows_pending + ra.in_flight));
+    }
 
     /* Why requests queue. num_requests_waiting says that they do; this says
      * whether evicting something would help or the box is simply out of room. */

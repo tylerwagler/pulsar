@@ -3281,6 +3281,8 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n, int quantum_
             uint32_t at = rows;
             for (int r = 0; r < n_fr; r++) {
                 const pulsar_tokens *t = fr[r].sl->gen->prompt_for_sync;
+                /* L329 (b2): the rider's next chunk of PLE rows, read while this round computes */
+                (void)pulsar_session_prompt_read_ahead(pool, (uint32_t)fr[r].sl->bank, t, fr[r].p0 + fr[r].k);
                 for (int j = 0; j < fr[r].k; j++) {
                     fused_reqs[at].bank = (uint32_t)fr[r].sl->bank;
                     fused_reqs[at].pos = fr[r].p0 + j;

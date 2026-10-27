@@ -189,22 +189,47 @@ void pulsar_engram_table_close(pulsar_engram_table *t) {
  * a 16-row Qwen decode gather in slices of 4 kept 4 of 16 threads busy, four reads
  * deep -- 1.2 ms the GPU sat idle at the PLE layer of every decode step (nsys,
  * qwen-perf 2026-10-11).  Failures are counted on the gather and reported once at
- * wait. */
+ * wait.
+ *
+ * L329 (b2): the pool has a second, BACKGROUND class -- the read-ahead of a prompt's
+ * next chunk (pulsar_engram_read_ahead).  Strict priority, so a read-ahead never
+ * delays a gather someone waits on (TensorFold left its read-ahead opt-in over
+ * exactly that hazard: one FIFO, a decode gather queued behind a chunk's reads):
+ *   - a worker takes a background row only when no gather or prefetch has rows left
+ *     to take AND none is still being read (hi_busy 0): the device then serves the
+ *     foreground's reads alone, but for the background reads already in flight;
+ *   - at most PULSAR_ENGRAM_AHEAD_READERS workers read in the background at once,
+ *     so a gather arriving finds the rest of the pool idle and at most that many
+ *     background reads ahead of it at the device;
+ *   - a background slice is ONE row, so a background reader re-checks the
+ *     foreground before every read.
+ * Background rows are read into a throwaway stack buffer: the point is the page
+ * cache, and the real gather reads the same bytes again (the read-ahead changes
+ * no byte anyone receives).  A tag (the issuer's session and bank) lets the
+ * issuer drop the rows nobody took yet (pulsar_engram_read_ahead_cancel).
+ * Why preads on bounded threads and not posix_fadvise(WILLNEED) / readahead(2):
+ * both populate the cache too (measured on the NAS copy, 2026-10-27), but they
+ * return at once and leave every row's read queued at the device -- 65,536 rows
+ * at whatever depth the kernel picks, ahead of the next decode gather, with no
+ * completion to count and nothing to cancel. */
 #define PULSAR_ENGRAM_IO_SLICE 4u
+/** The widest row a background read throws away (its stack buffer; Engram 264 B, Qwen PLE 320 B). */
+#define PULSAR_ENGRAM_AHEAD_ROW_MAX 512u
 
 struct pulsar_engram_gather {
     pulsar_engram_io *io;   ///< the pool it was issued on; wait blocks on it
     const pulsar_engram_table *table;
     const uint64_t *rows;
-    uint32_t n_rows;
+    uint32_t n_rows;        ///< rows to read (a cancelled read-ahead shrinks it to the rows already taken)
     uint32_t slice;         ///< rows a worker takes at once (1 .. PULSAR_ENGRAM_IO_SLICE)
-    unsigned char *dst;
+    unsigned char *dst;     ///< NULL on a read-ahead: each row lands in the reader's throwaway buffer
     uint32_t next;          ///< next row index a worker takes (under the pool lock)
     uint32_t done;          ///< rows finished (ok or failed)
     uint32_t failed;        ///< rows whose read failed
     uint64_t first_bad;     ///< the first failing row id, for the message
     int      first_errno;
-    int      detached;      ///< a prefetch (L289): nobody waits; the worker finishing its last row frees it
+    int      detached;      ///< a prefetch (L289) or a read-ahead: nobody waits; the worker finishing its last row frees it
+    uint64_t tag;           ///< L329 (b2): a read-ahead's issuer (pulsar_engram_read_ahead_cancel)
     pulsar_engram_gather *q_next;
 };
 
@@ -212,58 +237,109 @@ struct pulsar_engram_io {
     pthread_mutex_t lock;
     pthread_cond_t  work;   ///< a gather has rows to take
     pthread_cond_t  idle;   ///< a gather finished a row (waiters re-check `done`)
-    pulsar_engram_gather *head, *tail;   ///< gathers with rows left to take, FIFO
+    pulsar_engram_gather *head, *tail;         ///< gathers with rows left to take, FIFO
+    pulsar_engram_gather *bg_head, *bg_tail;   ///< L329 (b2): read-aheads with rows left to take, FIFO
+    uint32_t hi_busy;       ///< foreground slices being read
+    uint32_t bg_busy;       ///< background rows being read (<= PULSAR_ENGRAM_AHEAD_READERS)
+    pulsar_read_ahead_stats ahead;   ///< the background class's counters (under the lock)
     pthread_t *threads;
     uint32_t n_threads;
     int stopping;
 };
 
+static uint64_t engram_now_ns(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
+
+static void engram_gather_free(pulsar_engram_gather *g) {
+    free(g->dst);
+    free((void *)g->rows);
+    free(g);
+}
+
+/* pread row r of `tb` into d; false with errno set on a failure (0 for an id past the table) */
+static bool engram_read_row(const pulsar_engram_table *tb, uint64_t r, unsigned char *d) {
+    if (r >= tb->n_rows) { errno = 0; return false; }
+    const uint32_t rb = tb->row_bytes;
+    const pulsar_engram_part *pt = &tb->parts[r / tb->rows_per_part];
+    const off_t off = (off_t)(pt->base + (r % tb->rows_per_part) * rb);
+    size_t got = 0;
+    while (got < rb) {
+        const ssize_t n = pread(pt->fd, d + got, rb - got, off + (off_t)got);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) return false;
+        got += (size_t)n;
+    }
+    return true;
+}
+
+/* L329 (b2): may a worker take a background row now?  (under the lock) */
+static bool engram_bg_ready(const pulsar_engram_io *io) {
+    return io->bg_head && !io->head && io->hi_busy == 0 && io->bg_busy < PULSAR_ENGRAM_AHEAD_READERS;
+}
+
+/* drop g from the background take-queue (under the lock; prev = its predecessor or NULL) */
+static void engram_bg_unlink(pulsar_engram_io *io, pulsar_engram_gather *prev, pulsar_engram_gather *g) {
+    if (prev) prev->q_next = g->q_next; else io->bg_head = g->q_next;
+    if (io->bg_tail == g) io->bg_tail = prev;
+    g->q_next = NULL;
+}
+
 static void *engram_io_worker(void *arg) {
     pulsar_engram_io *io = (pulsar_engram_io *)arg;
     for (;;) {
         pthread_mutex_lock(&io->lock);
-        while (!io->head && !io->stopping) pthread_cond_wait(&io->work, &io->lock);
-        if (io->stopping && !io->head) { pthread_mutex_unlock(&io->lock); return NULL; }
-        pulsar_engram_gather *g = io->head;
+        while (!io->head && !io->stopping && !engram_bg_ready(io)) pthread_cond_wait(&io->work, &io->lock);
+        if (io->stopping && !io->head) { pthread_mutex_unlock(&io->lock); return NULL; }   /* read-aheads are dropped */
+        const bool bg = !io->head;   /* the foreground first, always */
+        pulsar_engram_gather *g = bg ? io->bg_head : io->head;
         const uint32_t i0 = g->next;
         const uint32_t i1 = i0 + g->slice < g->n_rows ? i0 + g->slice : g->n_rows;
         g->next = i1;
-        if (g->next >= g->n_rows) {   /* nothing left to take: drop it from the take-queue */
-            io->head = g->q_next;
-            if (!io->head) io->tail = NULL;
+        if (g->next >= g->n_rows) {   /* nothing left to take: drop it from its take-queue */
+            if (bg) {
+                engram_bg_unlink(io, NULL, g);
+            } else {
+                io->head = g->q_next;
+                if (!io->head) io->tail = NULL;
+            }
         }
-        /* a prefetch wakes one reader (L289); each reader wakes the next while slices remain */
-        if (io->head) pthread_cond_signal(&io->work);
+        if (bg) io->bg_busy++; else io->hi_busy++;
+        /* a prefetch or a read-ahead wakes one reader (L289); each reader wakes the next while slices remain */
+        if (io->head || engram_bg_ready(io)) pthread_cond_signal(&io->work);
         pthread_mutex_unlock(&io->lock);
 
         uint32_t failed = 0, first_errno = 0;
         uint64_t first_bad = 0;
+        const uint64_t t0 = bg ? engram_now_ns() : 0;
+        unsigned char sink[PULSAR_ENGRAM_AHEAD_ROW_MAX];
         for (uint32_t i = i0; i < i1; i++) {
-            const uint64_t r = g->rows[i];
-            const pulsar_engram_table *tb = g->table;
-            const uint32_t rb = tb->row_bytes;
-            unsigned char *d = g->dst + (uint64_t)i * rb;
-            int ok = r < tb->n_rows;
-            if (ok) {
-                const pulsar_engram_part *pt = &tb->parts[r / tb->rows_per_part];
-                const off_t off = (off_t)(pt->base + (r % tb->rows_per_part) * rb);
-                size_t got = 0;
-                while (ok && got < rb) {
-                    const ssize_t n = pread(pt->fd, d + got, rb - got, off + (off_t)got);
-                    if (n <= 0) { if (n < 0 && errno == EINTR) continue; ok = 0; break; }
-                    got += (size_t)n;
-                }
+            unsigned char *d = g->dst ? g->dst + (uint64_t)i * g->table->row_bytes : sink;
+            if (!engram_read_row(g->table, g->rows[i], d)) {
+                if (!failed) { first_bad = g->rows[i]; first_errno = (uint32_t)errno; }
+                failed++;
             }
-            if (!ok) { if (!failed) { first_bad = r; first_errno = errno; } failed++; }
         }
         pthread_mutex_lock(&io->lock);
         g->done += i1 - i0;
         if (failed) { if (!g->failed) { g->first_bad = first_bad; g->first_errno = (int)first_errno; } g->failed += failed; }
-        /* a prefetch is out of the take-queue once its last slice is taken, so its last finisher is its last user */
+        if (bg) {
+            io->bg_busy--;
+            io->ahead.rows_read += i1 - i0 - failed;
+            io->ahead.rows_failed += failed;   /* a hint's failure is the later gather's to report */
+            io->ahead.bytes_read += (uint64_t)(i1 - i0 - failed) * g->table->row_bytes;
+            io->ahead.read_ns += engram_now_ns() - t0;
+            if (engram_bg_ready(io)) pthread_cond_signal(&io->work);
+        } else if (--io->hi_busy == 0 && engram_bg_ready(io)) {
+            pthread_cond_signal(&io->work);   /* the foreground went quiet: the background resumes */
+        }
+        /* a detached gather is out of the take-queue once its last slice is taken, so its last finisher is its last user */
         const bool reap = g->detached && g->done >= g->n_rows;
         if (!g->detached) pthread_cond_broadcast(&io->idle);
         pthread_mutex_unlock(&io->lock);
-        if (reap) { free(g->dst); free((void *)g->rows); free(g); }
+        if (reap) engram_gather_free(g);
     }
 }
 
@@ -293,6 +369,11 @@ void pulsar_engram_io_destroy(pulsar_engram_io *io) {
     pthread_cond_broadcast(&io->work);
     pthread_mutex_unlock(&io->lock);
     for (uint32_t i = 0; i < io->n_threads; i++) pthread_join(io->threads[i], NULL);
+    /* the workers are gone: a read-ahead still queued has no row in flight (a taken row was finished) */
+    for (pulsar_engram_gather *g = io->bg_head, *nx; g; g = nx) {
+        nx = g->q_next;
+        engram_gather_free(g);
+    }
     pthread_mutex_destroy(&io->lock);
     pthread_cond_destroy(&io->work);
     pthread_cond_destroy(&io->idle);
@@ -336,6 +417,59 @@ void pulsar_engram_prefetch(pulsar_engram_io *io, const pulsar_engram_table *t, 
     memcpy(ids, rows, (size_t)n_rows * sizeof(uint64_t));
     unsigned char *dst = (unsigned char *)xmalloc((size_t)n_rows * t->row_bytes);
     (void)engram_gather_issue(io, t, ids, n_rows, dst, 1);   /* the pool owns ids and dst now */
+}
+
+uint32_t pulsar_engram_read_ahead(pulsar_engram_io *io, const pulsar_engram_table *t, const uint64_t *rows,
+                                  uint32_t n_rows, uint64_t tag) {
+    if (!io || !t || !t->parts || !rows || n_rows == 0) return 0;
+    if (t->row_bytes > PULSAR_ENGRAM_AHEAD_ROW_MAX)
+        pulsar_die("engram read-ahead: a row wider than the background reader's buffer");
+    uint64_t *ids = (uint64_t *)xmalloc((size_t)n_rows * sizeof(uint64_t));
+    memcpy(ids, rows, (size_t)n_rows * sizeof(uint64_t));
+    pulsar_engram_gather *g = (pulsar_engram_gather *)xcalloc(1, sizeof *g);
+    g->io = io;
+    g->table = t;
+    g->rows = ids;   /* the pool owns them now */
+    g->n_rows = n_rows;
+    g->slice = 1;
+    g->detached = 1;
+    g->tag = tag;
+    pthread_mutex_lock(&io->lock);
+    if (io->bg_tail) io->bg_tail->q_next = g; else io->bg_head = g;
+    io->bg_tail = g;
+    io->ahead.issued++;
+    io->ahead.rows_queued += n_rows;
+    if (engram_bg_ready(io)) pthread_cond_signal(&io->work);
+    pthread_mutex_unlock(&io->lock);
+    return n_rows;
+}
+
+uint32_t pulsar_engram_read_ahead_cancel(pulsar_engram_io *io, uint64_t tag) {
+    if (!io) return 0;
+    uint32_t dropped = 0;
+    pthread_mutex_lock(&io->lock);
+    for (pulsar_engram_gather *g = io->bg_head, *prev = NULL, *nx; g; g = nx) {
+        nx = g->q_next;
+        if (g->tag != tag) { prev = g; continue; }
+        dropped += g->n_rows - g->next;
+        g->n_rows = g->next;   /* the rows already taken are the last it reads */
+        engram_bg_unlink(io, prev, g);
+        /* no row of it in flight: nobody else will finish it; else its last finisher reaps it */
+        if (g->done >= g->n_rows) engram_gather_free(g);
+    }
+    io->ahead.rows_cancelled += dropped;
+    pthread_mutex_unlock(&io->lock);
+    return dropped;
+}
+
+void pulsar_engram_read_ahead_stats(pulsar_engram_io *io, pulsar_read_ahead_stats *out) {
+    memset(out, 0, sizeof *out);
+    if (!io) return;
+    pthread_mutex_lock(&io->lock);
+    *out = io->ahead;
+    out->in_flight = io->bg_busy;
+    for (const pulsar_engram_gather *g = io->bg_head; g; g = g->q_next) out->rows_pending += g->n_rows - g->next;
+    pthread_mutex_unlock(&io->lock);
 }
 
 /* Blocks until every row is accounted for.  A worker adds its slice to `done`

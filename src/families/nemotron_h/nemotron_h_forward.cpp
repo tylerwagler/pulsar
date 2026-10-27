@@ -1205,5 +1205,7 @@ const pulsar_driver_ops PULSAR_NEMOTRON_H_DRIVER = {
     /* .dump          = */ dump,
     /* .artifact      = */ artifact,
     /* .stage         = */ stage,   /* L296 perf: the host half; the ops are launch-only (a decode step graphs) */
+    /* .read_ahead    = */ NULL,    /* no disk row table */
+    /* .read_ahead_pool = */ NULL,
 };
 static_assert(PULSAR_LAYER_BLOCKS == 4 && PULSAR_LAYER_KIND_COUNT == 5, "the block table's slot is the kind's value");

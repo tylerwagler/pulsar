@@ -33,6 +33,7 @@ struct pulsar_qwen_ple_io {
     uint32_t cap;                   ///< tokens the host buffers hold
     pulsar_engram_gather *pending;  ///< the gather embed issued, waited on by the PLE op
     uint32_t pending_n;             ///< its tokens
+    bool ahead;                     ///< L329 (b2): the prompt read-ahead runs (PULSAR_PLE_READ_AHEAD, at load)
 };
 
 namespace {
@@ -516,6 +517,17 @@ bool pulsar_qwen_s4_load(pulsar_engine *e, const pulsar_engine_options *opt) {
         free(io);
         return false;
     }
+    /* L329 (b2): the next prompt chunk's rows read ahead (prefill_loop.cpp); PULSAR_PLE_READ_AHEAD=0 is the A/B's off
+     * arm -- a diagnostic switch, no byte changes either way -- and any other value but 1 refuses the load */
+    const char *ra = getenv("PULSAR_PLE_READ_AHEAD");
+    if (ra && strcmp(ra, "0") != 0 && strcmp(ra, "1") != 0) {
+        fprintf(stderr, "pulsar: %s: PULSAR_PLE_READ_AHEAD=%s -- 0 (off) or 1 (on, the default); refusing\n",
+                PULSAR_QWEN_ARCH, ra);
+        pulsar_engram_table_close(&io->table);
+        free(io);
+        return false;
+    }
+    io->ahead = !ra || strcmp(ra, "1") == 0;
     io->io = pulsar_engram_io_create(PULSAR_ENGRAM_IO_THREADS);
     if (!io->io) {
         pulsar_engram_table_close(&io->table);
@@ -523,6 +535,12 @@ bool pulsar_qwen_s4_load(pulsar_engine *e, const pulsar_engine_options *opt) {
         return false;
     }
     w->ple_io = io;
+    if (io->ahead)
+        fprintf(stderr, "pulsar: L329 (b2) qwen PLE read-ahead: on -- a prefill reads the next chunk's rows on %u "
+                        "background readers, below every gather (PULSAR_PLE_READ_AHEAD=0 turns it off)\n",
+                PULSAR_ENGRAM_AHEAD_READERS);
+    else
+        fprintf(stderr, "pulsar: L329 (b2) qwen PLE read-ahead: OFF (PULSAR_PLE_READ_AHEAD=0)\n");
     fprintf(stderr, "pulsar: L251 qwen PLE rows: %s (%llu rows x %u B, %u per token, %u pread threads); S4 tensors "
                     "admitted (routed experts: %u layers fused gate_up + down EXL3, %u layers Tessera value family "
                     "[L255]; dense EXL3, GR low-rank MXFP8)\n",
@@ -639,6 +657,27 @@ void pulsar_qwen_s4_ple_prefetch(const pulsar_qwen_weights *w, int32_t ctx[2], c
     ctx[0] = c.prev[0];
     ctx[1] = c.prev[1];
     pulsar_engram_prefetch(io->io, &io->table, ids, n * PULSAR_QWEN_NGRAM_COLS);
+}
+
+uint32_t pulsar_qwen_s4_ple_read_ahead(const pulsar_qwen_weights *w, uint64_t tag, const int32_t *prompt, uint32_t from,
+                                       uint32_t to) {
+    pulsar_qwen_ple_io *io = w ? w->ple_io : NULL;
+    if (!io || !io->ahead || !prompt || to <= from) return 0;
+    /* the n-gram reaches two tokens back: the context at `from` is the prompt's own (EOS before its start) */
+    for (uint32_t i = from >= 2u ? from - 2u : 0u; i < to; i++)
+        if (prompt[i] < 0 || (uint32_t)prompt[i] >= io->layout.vocab) return 0;   /* the embed refuses it by name */
+    pulsar_qwen_ngram_ctx c;
+    pulsar_qwen_ngram_ctx_init(&io->layout, &c);
+    if (from >= 2u) c.prev[0] = prompt[from - 2u];
+    if (from >= 1u) c.prev[1] = prompt[from - 1u];
+    const uint32_t n = to - from;
+    std::vector<uint64_t> ids((size_t)n * PULSAR_QWEN_NGRAM_COLS);
+    pulsar_qwen_ngram_rows(&io->layout, &c, prompt + from, n, ids.data());
+    return pulsar_engram_read_ahead(io->io, &io->table, ids.data(), n * PULSAR_QWEN_NGRAM_COLS, tag);
+}
+
+pulsar_engram_io *pulsar_qwen_s4_ple_pool(const pulsar_qwen_weights *w) {
+    return w && w->ple_io ? w->ple_io->io : NULL;
 }
 
 bool pulsar_qwen_s4_step_end(const pulsar_qwen_step *st, bool ok) {

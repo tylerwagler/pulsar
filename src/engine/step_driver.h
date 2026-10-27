@@ -192,6 +192,12 @@ typedef struct pulsar_driver_ops {
      *  X7: graphed == eager; mtp-spec-gate on the verify lane).  NULL = the ops upload as they go and every step
      *  runs eager. */
     bool (*stage)(const pulsar_driver_step *st, uint64_t *graph_key);
+    /** Optional (L329 b2): the family's prompt rows come from a disk-resident row table (Qwen's PLE) -- queue the
+     *  rows the tokens prompt[from, to) will gather on the table pool's background class, tagged `tag`
+     *  (pulsar_engram_read_ahead); returns the rows queued.  NULL = the family's prefill reads no disk table. */
+    uint32_t (*read_ahead)(const pulsar_engine *e, uint64_t tag, const int32_t *prompt, uint32_t from, uint32_t to);
+    /** Present with read_ahead: the pool its rows go through (the core cancels a tag's rows and reads the counters). */
+    struct pulsar_engram_io *(*read_ahead_pool)(const pulsar_engine *e);
 } pulsar_driver_ops;
 
 /** The first thing a forward over `plan` would need that `ops` lacks -- "embed", the block of a layer kind (its

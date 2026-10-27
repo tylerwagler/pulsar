@@ -2714,7 +2714,7 @@ gates: tests/gates_runner pulsar-server pulsar-eval tests/qwen_chat_gate tests/i
 # stamp (`.build/cuda-flags.stamp`), so an invocation that leaves it empty
 # rewrites the stamp for the empty arch and the next `make gates` rebuilds
 # every .cu.  Every sub-make below carries it for the same reason.
-GATES_DEV_UNIT ?= --ctxmem --spec-math --lib-utf8 --lib-think --verify-pick --fused-cost --fused-sched --ckpt-records
+GATES_DEV_UNIT ?= --ctxmem --spec-math --lib-utf8 --lib-think --verify-pick --fused-cost --fused-sched --ckpt-records --read-ahead
 GATES_DEV_UNIT_SERVER ?= --server --api-sampling-flags --api-min-p-range --api-logprobs-parse --api-count-tokens
 # attention kernels: their own oracle (cuda-attn-gates) + the fused mixed step,
 # which is where an attention/compressor row change shows up as a logits delta.

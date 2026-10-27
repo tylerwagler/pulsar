@@ -393,6 +393,19 @@ int pulsar_engine_encode(pulsar_engine *e, const pulsar_tokens *inputs, uint32_t
 void pulsar_session_set_progress(pulsar_session *s, pulsar_session_progress_fn fn, void *ud) { if (s) s->set_progress(fn, ud); }
 void pulsar_session_set_display_progress(pulsar_session *s, pulsar_session_progress_fn fn, void *ud) { if (s) s->set_display_progress(fn, ud); }
 void pulsar_session_set_cancel(pulsar_session *s, pulsar_session_cancel_fn fn, void *ud) { if (s) s->set_cancel(fn, ud); }
+void pulsar_session_set_prefill_ahead(pulsar_session *s, const pulsar_tokens *prompt) { if (s) s->prefill_ahead = prompt; }
+uint32_t pulsar_session_prompt_read_ahead(pulsar_session *s, uint32_t bank, const pulsar_tokens *prompt, int run_end) {
+    return run_end >= 0 ? pulsar_session_read_ahead(s, bank, prompt, (uint32_t)run_end) : 0u;
+}
+bool pulsar_engine_read_ahead_stats(pulsar_engine *e, pulsar_read_ahead_stats *out) {
+    const pulsar_driver_ops *ops = e ? e->family->driver : NULL;
+    if (!ops || !ops->read_ahead) {
+        memset(out, 0, sizeof *out);
+        return false;
+    }
+    pulsar_engram_read_ahead_stats(ops->read_ahead_pool(e), out);
+    return true;
+}
 uint64_t pulsar_session_touched_kv_bytes(const pulsar_session *s) {
     PULSAR_FAMILY_REQUIRES_S(s, PULSAR_FAMILY_CAP_BANKS, "the touched-KV count", 0);
     if (!s) return 0;
@@ -719,6 +732,7 @@ int pulsar_session_family_eval(pulsar_session *s, int token, char *err, size_t e
 }
 void pulsar_session_family_invalidate(pulsar_session *s) {
     if (s->engine->family->session->invalidate) s->engine->family->session->invalidate(s);
+    pulsar_session_read_ahead_cancel(s, pulsar_session_live_bank(s));   /* L329 (b2): its prompt is gone */
     s->checkpoint_valid = false;
     s->checkpoint.len = 0;
     s->logits_stale = true;
