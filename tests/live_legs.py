@@ -57,6 +57,9 @@ LEGS = [
     ("sidecall-turns", "sidecall_turns_live", "SidecallLeg", {}, ("qwen",)),
     # L324 (make kv-dup-live runs it alone): the duplicate-prefix census counts fan-out siblings' shared pages
     ("kv-dup", "kv_dup_live", "KvDupLeg", {}, ("qwen", "nemotron")),
+    # L329 (a) (make fanout-prefix-live runs it alone, FANOUT_AB=1 with the wait-off A/B): a fan-out on a new shared
+    # prefix prefills it once, every reply == the request alone
+    ("fanout-prefix", "fanout_prefix_live", "FanoutPrefixLeg", {}, ("qwen",)),
     ("opencode-turns", "opencode_turns_live", "OpencodeLeg", {}, ("nemotron",)),
 ]
 

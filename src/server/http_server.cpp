@@ -488,6 +488,9 @@ bool server::send_metrics(int fd) {
     const kv_dup_census dup = s->m_dup;                                              /* L324 */
     const unsigned long long dup_censuses = (unsigned long long)s->m_dup_censuses;
     const unsigned long long dup_bytes_peak = (unsigned long long)s->m_dup_bytes_peak;
+    unsigned long long prefix_waits[PREFIX_WAIT_OUTCOMES];                          /* L329 (a) */
+    for (int i = 0; i < PREFIX_WAIT_OUTCOMES; i++) prefix_waits[i] = (unsigned long long)s->m_prefix_waits[i];
+    const unsigned long long prefix_wait_gain = (unsigned long long)s->m_prefix_wait_gain;
     uint64_t refusals[PROVISION_REFUSAL_COUNT];
     for (int i = 0; i < PROVISION_REFUSAL_COUNT; i++) refusals[i] = s->m_refusals[i];
     const int block_reason = s->m_queue_block_reason;
@@ -876,6 +879,16 @@ bool server::send_metrics(int fd) {
     buf_puts(&b, "# TYPE pulsar:prefill_abandon_persisted_tokens_total counter\n");
     buf_printf(&b, "pulsar:prefill_abandon_persisted_tokens_total %llu\n",
                (unsigned long long)disk_meter.abandon_persisted_tokens);
+    /* L329 (a): queued requests that waited for a cut another prompt's prefill was filling, and how each wait ended */
+    buf_puts(&b, "# HELP pulsar:prefix_waits_total Queued requests' waits for a cut another prompt's prefill was "
+                 "filling: started, and ended by outcome (reached, left, timeout).\n");
+    buf_puts(&b, "# TYPE pulsar:prefix_waits_total counter\n");
+    for (int i = 0; i < PREFIX_WAIT_OUTCOMES; i++)
+        buf_printf(&b, "pulsar:prefix_waits_total{outcome=\"%s\"} %llu\n", prefix_wait_names[i], prefix_waits[i]);
+    buf_puts(&b, "# HELP pulsar:prefix_wait_gain_tokens_total Tokens the reached waits moved their requests' resume "
+                 "past what served them when they began waiting.\n");
+    buf_puts(&b, "# TYPE pulsar:prefix_wait_gain_tokens_total counter\n");
+    buf_printf(&b, "pulsar:prefix_wait_gain_tokens_total %llu\n", prefix_wait_gain);
 
     /* Why requests queue. num_requests_waiting says that they do; this says
      * whether evicting something would help or the box is simply out of room. */

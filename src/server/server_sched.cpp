@@ -34,12 +34,31 @@ bool server::enqueue(job *j) {
         pthread_mutex_unlock(&s->mu);
         return false;
     }
+    j->seq = ++s->job_seq;
     if (s->tail) s->tail->next = j; else s->head = j;
     s->tail = j;
     s->n_queued++;
     pthread_cond_signal(&s->cv);
     pthread_mutex_unlock(&s->mu);
     return true;
+}
+
+/* L329 (a): a waiter is passed over, so the job the worker binds or drops need not be the head (mu held) */
+static void queue_unlink_locked(server *s, job *j) {
+    job *prev = NULL, *q = s->head;
+    for (; q && q != j; q = q->next) prev = q;
+    if (q != j) return;   /* not queued */
+    if (prev) prev->next = j->next;
+    else s->head = j->next;
+    if (s->tail == j) s->tail = prev;
+    if (s->n_queued > 0) s->n_queued--;
+    j->next = NULL;
+}
+
+void server::queue_unlink(job *j) {
+    pthread_mutex_lock(&mu);
+    queue_unlink_locked(this, j);
+    pthread_mutex_unlock(&mu);
 }
 
 
@@ -1217,9 +1236,148 @@ bool server::fresh_make_room() {
 
 
 
+/* =========================================================================
+ * L329 (a): the shared-prefix wait (PULSAR_SERVER_PREFIX_WAIT_MS_DEFAULT in pulsar_server_internal.h says why).
+ *
+ * Production 2026-10-23 16:08 (Qwen, Claude Code fanning out 11 subagents over a ~25k-token prompt sharing 20-24k):
+ * five requests bound at 16:08:23 adopted the leader's 12288 checkpoint and each prefilled [12288, 20480) again,
+ * six more at 16:08:50 adopted 20480; 108k prompt tokens prefilled for ~68k of distinct work, the leader's prompt
+ * done after 100.6 s.  Here a request that a bound prefill will serve deeper waits in the queue for it.
+ * ========================================================================= */
+
+static bool slot_prefilling(const session_slot *c);
+
+const char *const prefix_wait_names[PREFIX_WAIT_OUTCOMES] = {"started", "reached", "left", "timeout"};
+
+int server_prefix_wait_pick(int have, int prompt_len, int grid, int min_gain, const prefix_lead *leads, int n,
+                            int *mark) {
+    int best = -1;
+    *mark = 0;
+    if (grid <= 0) return -1;
+    for (int i = 0; i < n; i++) {
+        const prefix_lead *l = &leads[i];
+        int cut = l->shared;
+        if (cut > prompt_len - 1) cut = prompt_len - 1;   /* the request's sync evaluates at least its last token */
+        if (cut > l->len - 1) cut = l->len - 1;           /* inside the leader's prompt: its prefill stops there */
+        cut = cut / grid * grid;
+        /* a cut the leader stands at or past is served now (have), and one the adopt would not take is not waited
+         * for (server_resume_memory_depth: more than min_gain past what serves it) */
+        if (cut <= l->pos || cut <= have + min_gain) continue;
+        if (cut > *mark || (cut == *mark && l->pos > leads[best].pos)) {
+            best = i;
+            *mark = cut;
+        }
+    }
+    return best;
+}
+
+prefix_wait_verdict server_prefix_wait_check(bool live, int leader_pos, int mark, double waited_ms, double bound_ms) {
+    if (!live) return PREFIX_WAIT_LEFT;
+    if (leader_pos >= mark) return PREFIX_WAIT_REACHED;
+    if (waited_ms >= bound_ms) return PREFIX_WAIT_TIMEOUT;
+    return PREFIX_WAIT_HOLD;
+}
+
+int server_prefix_mark_merge(int cur, int want, int pos) {
+    return cur <= pos || cur > want ? want : cur;
+}
+
+int server_prefix_wait_parse(const char *text) {
+    if (!text || !*text) return PULSAR_SERVER_PREFIX_WAIT_MS_DEFAULT;
+    long v = 0;
+    for (const char *p = text; *p; p++) {
+        if (*p < '0' || *p > '9') return -1;
+        v = v * 10 + (*p - '0');
+        if (v > 24L * 3600 * 1000) return -1;   /* past a day is no bound */
+    }
+    return (int)v;
+}
+
+void server::prefix_wait_release(job *const *queued, int n) {
+    auto *s = this;
+    const double now = server_now_sec();
+    for (int k = 0; k < n; k++) {
+        prefix_wait *w = &queued[k]->pw;
+        if (!w->leader) continue;
+        session_slot *ls = &s->slots[w->slot];
+        const bool live = slot_prefilling(ls) && ls->active_job->seq == w->leader;
+        const int pos = live ? pulsar_session_bank_pos(s->sess, (uint32_t)ls->bank) : 0;
+        const double waited_ms = (now - w->since) * 1e3;
+        const prefix_wait_verdict v = server_prefix_wait_check(live, pos, w->mark, waited_ms, (double)s->prefix_wait_ms);
+        if (v == PREFIX_WAIT_HOLD) {
+            ls->gen->share_mark = server_prefix_mark_merge(ls->gen->share_mark, w->mark, pos);
+            continue;
+        }
+        server_log(PULSAR_LOG_KVCACHE,
+                   "pulsar-server: prefix wait %s after %.1f s: a queued request (prompt %d) waited for bank %u to "
+                   "stand at %d (it stands at %d%s); it binds now", prefix_wait_names[v], waited_ms / 1e3,
+                   queued[k]->req.prompt.len, ls->bank, w->mark, pos, live ? "" : ", its prefill ended");
+        pthread_mutex_lock(&s->mu);
+        s->m_prefix_waits[v]++;
+        if (v == PREFIX_WAIT_REACHED) s->m_prefix_wait_gain += (uint64_t)(w->mark - w->have);
+        pthread_mutex_unlock(&s->mu);
+        w->leader = 0;
+    }
+}
+
+bool server::prefix_wait_decide(job *j) {
+    auto *s = this;
+    prefix_wait *w = &j->pw;
+    if (w->decided) return false;
+    w->decided = true;   /* once: a released waiter never waits again, so waits never chain */
+    const request *r = &j->req;
+    /* the adopt is what serves the cut: a pooled, single-GPU text request that no live tool state pins to its bank
+     * (pulsar_session_bank_adopt refuses a tensor-parallel engine and an image history) */
+    if (s->prefix_wait_ms <= 0 || s->pool_banks <= 1 || !s->sess || pulsar_engine_is_tp(s->engine) ||
+        r->n_images > 0 || r->prompt.len <= 0 || r->responses_live_call_ids.len > 0 ||
+        r->anthropic_live_call_ids.len > 0)
+        return false;
+    prefix_lead leads[PULSAR_SESSION_POOL_CAP];
+    int lead_slot[PULSAR_SESSION_POOL_CAP];
+    int n = 0, have = 0;
+    for (int i = 0; i < s->n_slots; i++) {
+        session_slot *sl = &s->slots[i];
+        if (!sl->provisioned || sl->spilled || sl->preempted) continue;
+        /* the deepest state a bank serves the prompt from now: its own resume, which is what an adopt of it reads */
+        const int at = pulsar_session_bank_resume_at(s->sess, (uint32_t)sl->bank, &r->prompt);
+        if (at > have) have = at;
+        if (!slot_prefilling(sl) || sl->gen->j->req.n_images > 0 || !sl->gen->prompt_for_sync) continue;
+        const pulsar_tokens *lp = sl->gen->prompt_for_sync;
+        const int m = lp->len < r->prompt.len ? lp->len : r->prompt.len;
+        int shared = 0;
+        while (shared < m && lp->v[shared] == r->prompt.v[shared]) shared++;
+        leads[n] = {shared, pulsar_session_bank_pos(s->sess, (uint32_t)sl->bank), lp->len};
+        lead_slot[n++] = i;
+    }
+    int mark = 0;
+    const int pick = server_prefix_wait_pick(have, r->prompt.len, (int)pulsar_session_resume_grid(s->sess),
+                                             PULSAR_SERVER_ADOPT_MIN_GAIN, leads, n, &mark);
+    if (pick < 0) return false;
+    session_slot *ls = &s->slots[lead_slot[pick]];
+    w->leader = ls->active_job->seq;
+    w->slot = lead_slot[pick];
+    w->mark = mark;
+    w->have = have;
+    w->since = server_now_sec();
+    ls->gen->share_mark = server_prefix_mark_merge(ls->gen->share_mark, mark, leads[pick].pos);
+    pthread_mutex_lock(&s->mu);
+    s->m_prefix_waits[PREFIX_WAIT_HOLD]++;
+    pthread_mutex_unlock(&s->mu);
+    server_log(PULSAR_LOG_KVCACHE,
+               "pulsar-server: prefix wait: a queued request (prompt %d) waits for bank %u's prefill to stand at %d "
+               "(shares %d of its %d; it stands at %d, the best state for the request now %d; bound %d ms)",
+               r->prompt.len, ls->bank, mark, leads[pick].shared, leads[pick].len, leads[pick].pos, have,
+               s->prefix_wait_ms);
+    return true;
+}
+
+
+
 /* Bind the head job to a slot if routing allows it. Strict FIFO: when the
  * head must wait (its owner slot is busy, or no fitting slot is free), later
- * jobs wait behind it — simple and starvation-free. Returns true when the
+ * jobs wait behind it — simple and starvation-free.  L329 (a): a job waiting
+ * for another prompt's prefill is not the head; it keeps its place and is
+ * passed over until it may go on (bounded). Returns true when the
  * head was consumed: bound to a slot, or failed explicitly (a continuation
  * that cannot fit its owner slot — see choose_slot_for_job). When the head
  * cannot be placed cleanly (nothing fits, or only a warm slot it would
@@ -1233,13 +1391,37 @@ bool server::fresh_make_room() {
 bool server::worker_try_bind() {
     PULSAR_NVTX_FN();
     auto *s = this;
+    /* peek: only the worker pops, so the queued jobs stay valid once the lock is dropped (a client thread only
+     * appends at the tail and flags its own job cancelled) */
+    job *queued[PULSAR_SERVER_MAX_CLIENTS];
+    int n_queued = 0;
     pthread_mutex_lock(&s->mu);
-    job *j = s->head; /* peek: only the worker pops */
+    for (job *q = s->head; q && n_queued < PULSAR_SERVER_MAX_CLIENTS; q = q->next) queued[n_queued++] = q;
     /* Nothing queued means nothing is blocked; without this the gauge would
      * keep reporting the last reason long after the queue drained. */
-    if (!j) s->m_queue_block_reason = 0;
+    if (n_queued == 0) s->m_queue_block_reason = 0;
     pthread_mutex_unlock(&s->mu);
-    if (!j) return false;
+    if (n_queued == 0) return false;
+
+    /* L329 (a): the head is the first queued job that does not wait for another prompt's prefill -- the waiters
+     * that may go on first go on (they kept their places), a job never seen before decides its wait once here --
+     * or the first cancelled one, reaped below */
+    s->prefix_wait_release(queued, n_queued);
+    job *j = NULL;
+    bool head_cancelled = false;
+    for (int k = 0; k < n_queued && !j; k++) {
+        job *q = queued[k];
+        pthread_mutex_lock(&q->mu);
+        head_cancelled = q->cancelled;
+        pthread_mutex_unlock(&q->mu);
+        if (head_cancelled || (!q->pw.leader && !s->prefix_wait_decide(q))) j = q;
+    }
+    if (!j) {
+        pthread_mutex_lock(&s->mu);
+        s->m_queue_block_reason = 0;   /* every queued job waits for a prefill: not an admission refusal */
+        pthread_mutex_unlock(&s->mu);
+        return false;
+    }
 
     /* Reap a head whose client disconnected while queued BEFORE the bind
      * machinery: choose_slot_for_job can evict warm banks and spend seconds
@@ -1247,16 +1429,8 @@ bool server::worker_try_bind() {
      * thread only flags and stays parked on j->cv until this signal, so the
      * worker remains the sole popper (the invariant the queued-job protect
      * helpers rely on). No HTTP error write: the socket is gone. */
-    pthread_mutex_lock(&j->mu);
-    const bool head_cancelled = j->cancelled;
-    pthread_mutex_unlock(&j->mu);
     if (head_cancelled) {
-        pthread_mutex_lock(&s->mu);
-        s->head = j->next;
-        if (!s->head) s->tail = NULL;
-        if (s->n_queued > 0) s->n_queued--;
-        pthread_mutex_unlock(&s->mu);
-        j->next = NULL;
+        s->queue_unlink(j);
         server_log(PULSAR_LOG_DEFAULT,
                    "pulsar-server: dropping queued job for disconnected client fd=%d",
                    j->fd);
@@ -1311,12 +1485,7 @@ bool server::worker_try_bind() {
          * context_length_exceeded client error (against the owner slot's
          * context), then wake the client thread exactly like
          * worker_finish_slot does for a completed job. */
-        pthread_mutex_lock(&s->mu);
-        s->head = j->next;
-        if (!s->head) s->tail = NULL;
-        if (s->n_queued > 0) s->n_queued--;
-        pthread_mutex_unlock(&s->mu);
-        j->next = NULL;
+        s->queue_unlink(j);
         http_error_context_length_exceeded(j->fd, &j->req,
                                            j->req.prompt.len, reject_ctx);
         pthread_mutex_lock(&j->mu);
@@ -1332,12 +1501,7 @@ bool server::worker_try_bind() {
          * predicate), so answer the client with a 500 and pop the job, the
          * way the context-length reject above does. */
         s->note_provision_refusal(j, refusal);
-        pthread_mutex_lock(&s->mu);
-        s->head = j->next;
-        if (!s->head) s->tail = NULL;
-        if (s->n_queued > 0) s->n_queued--;
-        pthread_mutex_unlock(&s->mu);
-        j->next = NULL;
+        s->queue_unlink(j);
         const char *emsg = "session bank could not be installed (state restore refused)";
         if (j->req.api == API_ANTHROPIC) http_error_anthropic(j->fd, 500, emsg);
         else http_error(j->fd, 500, emsg);
@@ -1360,12 +1524,7 @@ bool server::worker_try_bind() {
         bool kv_refused = false;
         if (!s->prompt_kv_admit(sl, j, &kv_refused)) {
             if (!kv_refused) return false;
-            pthread_mutex_lock(&s->mu);
-            s->head = j->next;
-            if (!s->head) s->tail = NULL;
-            if (s->n_queued > 0) s->n_queued--;
-            pthread_mutex_unlock(&s->mu);
-            j->next = NULL;
+            s->queue_unlink(j);
             pthread_mutex_lock(&j->mu);
             j->done = true;
             pthread_cond_signal(&j->cv);
@@ -1376,12 +1535,9 @@ bool server::worker_try_bind() {
 
     pthread_mutex_lock(&s->mu);
     s->m_queue_block_reason = 0; /* the head bound — the queue is moving again */
-    s->head = j->next;
-    if (!s->head) s->tail = NULL;
-    if (s->n_queued > 0) s->n_queued--;
+    queue_unlink_locked(s, j);
     s->n_generating++;
     pthread_mutex_unlock(&s->mu);
-    j->next = NULL;
 
     s->generate_job_begin(sl, j);
     return true;
@@ -2951,6 +3107,14 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n, int quantum_
         }
         for (int i = 0; i < n_ps; i++) {
             session_slot *c = ps[i];
+            /* L329 (a): a chunk that would cross the cut a queued request waits for ends on it (a resume-grid point,
+             * so 128-aligned and captured: note_prefilled's grid rule); it cannot finish the prompt, which ends past
+             * the cut */
+            const int mk = pgs[i]->share_mark;
+            if (ch.q[i] > 0u && mk > (int)sp[i].p0 && sp[i].p0 + ch.q[i] > (uint32_t)mk) {
+                ch.q[i] = (uint32_t)mk - sp[i].p0;
+                ch.fin[i] = false;
+            }
             if (ch.q[i] == 0u) {
                 rv[c - s->slots].why = ch.priced ? "worth less than the wait it causes this round"
                                                  : "unpriced: a continuation rides a full quantum's first round";
@@ -3583,6 +3747,7 @@ session_slot *server::worker_find_fuse_prefill() {
         const int P = pulsar_session_bank_pos(pool, sl->bank);
         const int len = g->prompt_for_sync->len;
         if (P <= 0 || P >= len) continue;                       /* first chunk / done: classic */
+        if (g->share_mark > P) continue;                        /* L329 (a): the classic sync stops at the cut */
         return sl;                                              /* P=1: first qualifier */
     }
     return NULL;
@@ -3905,7 +4070,10 @@ void *worker_main(void *arg) {
             bool kv_wait;
             {
                 pulsar::ScopedLock lk(&s->mu);
-                kv_wait = s->head && s->head->refusal_counted == PROVISION_REFUSED_KV_TOUCHED;
+                /* L329 (a): the head a waiter is passed over for (pw is worker-thread state) */
+                const job *h = s->head;
+                while (h && h->pw.leader) h = h->next;
+                kv_wait = h && h->refusal_counted == PROVISION_REFUSED_KV_TOUCHED;
             }
             if (!kv_wait && s->worker_readmit_preempted()) bound = true;
         }
