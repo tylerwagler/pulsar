@@ -16,16 +16,19 @@ real server on a small model at a small --ctx, with the guard's budget lowered t
              bank BEFORE C binds ("kv admission: ... spilling 1 idle bank(s) first"); every answer 200
   W  PREEMPT (a fresh server) A and B as two long streamed completions, so two banks are busy, then C: no idle
              bank to spill.  Since L314 the server does not queue C behind a busy bank: the NEWEST decoder (B) is
-             PREEMPTED through its terminal checkpoint, C answers 200 while B is parked, and B is READMITTED and
-             streams all its tokens (L326: this phase was L280's WAIT and was not rerun after L314 changed the rule;
+             PREEMPTED through its terminal checkpoint, C answers 200 while B is parked, and B is READMITTED -- only
+             after a decoder finished (L326: C's admitted prompt holds its room) -- and streams all its tokens
+             (L326: this phase was L280's WAIT and was not rerun after L314 changed the rule;
              the WAIT arm is now the one for a decoder that cannot be preempted)
   R  REFUSE  a prompt whose KV alone is past the budget: 503 with the numbers, at once; the server keeps serving
-  P  REUSE   chat B asked again (spilled to disk in S) answers exactly as B did cold -- the prefix cache unchanged
+  P  REUSE   chats A and B asked again answer exactly as they did cold -- the one S spilled (L328: bank 0's A, the
+             LRU idle bank, now that bank 0 is a victim like any) comes back from its chain (L330: in slices) -- the
+             prefix cache unchanged
   never      the decode guard's "NO idle victim -- back-pressure" (proceeding past its budget), in any phase; a
              violation names the phase and prints the line with the admission / preempt / guard lines before it.
-             KNOWN_L328: today W reproduces it (gpuq #472: READMITTED 0.0 s after PREEMPTED, then the line), so it
-             is a STRICT expected failure: reported as XFAIL (L328), and a run that does NOT reproduce it FAILS
-             ("XPASS: ... drop KNOWN_L328") -- the fix in L328 drops the marker in the same commit
+             KNOWN_L328 was a STRICT expected failure while W reproduced it (gpuq #472: READMITTED 0.0 s after
+             PREEMPTED, then the line); L328 (the reserved base for every admission decision, the guard preempting
+             rather than proceeding) dropped it: the check is must-pass again
 
 Family-neutral: the bank price and the spill are the engine's bank ops.  Exit 0 only when every check passed.
 Scratch (the disk-KV dirs) goes under $TMPDIR; --log keeps every guarded server's log (one file, by phase)."""
@@ -190,10 +193,11 @@ try:
     check(rd[0] == 503 and "not enough KV memory" in rd[1], "D refused %s in %.1f s: %s" % (rd[0], time.time() - t0,
                                                                                           rd[1][:200]))
     print("P: reuse == cold", flush=True)
-    rb2 = chat(Bt)
-    check(rb2[0] == 200 and rb2[1] == rb[1] and len(json.loads(rb[1])[1]) > 0,
-          "B again (restored from its spill) answers as B cold, token for token with the same logprobs (%d tokens)"
-          % len(json.loads(rb[1])[1]))
+    for key, text, cold in (("A", A, ra), ("B", Bt, rb)):
+        again = chat(text)
+        check(again[0] == 200 and again[1] == cold[1] and len(json.loads(cold[1])[1]) > 0,
+              "%s again (from its bank or its spill) answers as %s cold, token for token with the same logprobs (%d "
+              "tokens)" % (key, key, len(json.loads(cold[1])[1])))
     txt = open(log).read()
     check(txt.count("kv admission REFUSED") == 1, "one refusal line for the one refused request")
 finally:
@@ -210,10 +214,25 @@ try:
     tb = threading.Thread(target=long_stream, args=(Bt, fb, res, "b"))
     tb.start()
     fb.wait(600)
+    # L326: when the readmission lands (/metrics, polled at 10 Hz): only after a decoder finished frees the room
+    readmit = {}
+
+    def poll_readmit():
+        t_stop = time.time() + 1800
+        while time.time() < t_stop and "t" not in readmit and tb.is_alive():
+            try:
+                if metrics().get("pulsar:decoder_readmissions_total", 0) >= 1:
+                    readmit["t"] = time.time()
+            except OSError:
+                pass
+            time.sleep(0.1)
+    tp = threading.Thread(target=poll_readmit)
+    tp.start()
     rc = chat(C)
     c_end = time.time()
     ta.join()
     tb.join()
+    tp.join()
     txt = open(log).read()
     check(res.get("a", (0,))[0] == 200 and res.get("b", (0,))[0] == 200,
           "A and B streamed %s / %s tokens" % (res.get("a", (0, 0))[1], res.get("b", (0, 0))[1]))
@@ -226,14 +245,20 @@ try:
     b_end = res.get("b", (0, 0, 0))[2]
     check(b_end > 0 and c_end <= b_end, "C finished while B was parked, before B's stream ended (%.1f s before)"
           % (b_end - c_end if b_end else 0))
+    # a decoder must have finished first (C's 16 tokens or A's stream): never in the turn that preempted B
+    first_end = min([c_end] + [v[2] for k_, v in res.items() if k_ == "a" and v[2]])
+    rt = readmit.get("t")
+    check(rt is not None and rt >= first_end - 0.15,
+          "B READMITTED only after a decoder finished (%s)" %
+          ("%.1f s after the first end" % (rt - first_end) if rt is not None else "no readmission seen on /metrics"))
     if not ok:
         for l in kv_lines(txt):
             print("#   W: " + l[-220:])
 finally:
     stop(p, kv, log)
-# L328 owns this: KV admission (L314's readmission among it) ignores admitted-but-unprefilled prompts, so W's parked B
-# is readmitted before C prefills and the guard ends over budget with no victim.  Its fix sets this False.
-KNOWN_L328 = True
+# L328 owned this (KV admission ignored admitted-but-unprefilled prompts, so W's parked B was readmitted before C
+# prefilled and the guard ended over budget with no victim); its fix set this False.
+KNOWN_L328 = False
 bp = [(ph, i, l) for ph, t in logs for i, l in enumerate(t.splitlines()) if "NO idle victim" in l]
 where = "; %d in phase(s) %s" % (len(bp), ",".join(sorted({ph for ph, _, _ in bp}))) if bp else ""
 if KNOWN_L328:

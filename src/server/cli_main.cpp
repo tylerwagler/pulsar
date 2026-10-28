@@ -1197,6 +1197,19 @@ int main(int argc, char **argv) {
                        "another prompt's prefill is filling, then adopts it (PULSAR_SERVER_PREFIX_WAIT_MS; 0 = off)",
                        s.prefix_wait_ms);
     }
+    /* L330: the restore slice's test hook -- read once, refused when malformed (announced with the disk tier below) */
+    {
+        const char *rs = getenv("PULSAR_SERVER_KV_RESTORE_SLICE_MS");
+        s.restore_slice_ms = server_restore_slice_parse(rs);
+        if (s.restore_slice_ms < 0) {
+            server_log(PULSAR_LOG_ERROR, "pulsar-server: PULSAR_SERVER_KV_RESTORE_SLICE_MS=\"%s\" is not whole "
+                       "milliseconds in 1..600000 (unset: one prefill chunk's priced time a slice) -- refusing to "
+                       "start", rs);
+            pulsar_session_free(session);
+            pulsar_engine_close(engine);
+            return 1;
+        }
+    }
     /* L272 B5: the template's turn markers, for the sys-prefix cold store and the routing anchor. */
     if (!pulsar_chat_turn_markers(engine, &s.turn_markers))
         server_log(PULSAR_LOG_WARNING, "pulsar-server: the tokenizer does not spell the chat turn markers: "
@@ -1241,6 +1254,18 @@ int main(int argc, char **argv) {
         server_log(PULSAR_LOG_DEFAULT,
                    "pulsar-server: Tier-2 2b guard DISABLED: it spills to the disk KV cache, which is off");
     }
+    /* L330 (rule 5): how a disk chain comes back */
+    if (s.kv.enabled && s.restore_slice_ms > 0)
+        server_log(PULSAR_LOG_WARNING,
+                   "pulsar-server: disk KV restores are SLICED between rounds (L330): a slice reads the segments "
+                   "%d ms reads (PULSAR_SERVER_KV_RESTORE_SLICE_MS, test hook; one segment while the read meter is "
+                   "unmeasured); the job reserves the chain's KV from bind", s.restore_slice_ms);
+    else if (s.kv.enabled)
+        server_log(PULSAR_LOG_DEFAULT,
+                   "pulsar-server: disk KV restores are SLICED between rounds (L330): a request's chain, or a spilled "
+                   "bank's history, loads the segments one prefill chunk's priced time reads per worker turn (one "
+                   "segment while the read meter or the prefill fit is unmeasured); the job reserves the chain's KV "
+                   "from bind");
     pthread_mutex_init(&s.mu, NULL);
     pthread_cond_init(&s.cv, NULL);
     pthread_cond_init(&s.clients_cv, NULL);
@@ -1361,12 +1386,12 @@ int main(int argc, char **argv) {
 
     for (int i = 0; i < s.n_slots; i++) {
         session_slot *sl = &s.slots[i];
-        if (!sl->provisioned) continue;
+        /* L330: a guard-spilled bank's history is on disk already (the spill persisted it): nothing to store */
+        if (!sl->provisioned || sl->spilled) continue;
         /* Tier-2: install this slot's bank so tokens/store read ITS frontier,
          * not the pool's last-live cursor (worker has joined; single-threaded).
-         * Must go through server_bank_switch, NOT a bare state_restore: a bank
-         * parked by the guard spill has had its comp/index slabs cudaFree'd, and
-         * only server_bank_switch reloads them from spill-bank-N.kv first.  The
+         * Must go through server_bank_switch, NOT a bare state_restore (a
+         * spilled bank's slabs were cudaFree'd, so it is skipped above).  The
          * bare restore left gpu_graph_bank_repoint to fail partway through the
          * layer loop, which both lost THIS slot's snapshot and left the graph
          * half-repointed with cur_bank stale — so the next slot whose bank

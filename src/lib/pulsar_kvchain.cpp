@@ -194,8 +194,7 @@ int pulsar_kvchain_find(pulsar_segstore *st, const char *text, size_t text_len, 
 
 uint64_t pulsar_kvchain_load_bytes(const pulsar_segstore_seg *chain, int n) {
     uint64_t bytes = 0;
-    for (int i = 0; i < n; i++)
-        bytes += chain[i].payload_bytes - (i < n - 1 ? chain[i].state_bytes : 0u) + chain[i].trailer_bytes;
+    for (int i = 0; i < n; i++) bytes += pulsar_kvchain_segment_load_bytes(chain, n, i);
     return bytes;
 }
 
@@ -207,26 +206,53 @@ uint64_t pulsar_kvchain_cached_bytes(pulsar_segstore *st, const pulsar_segstore_
     return bytes;
 }
 
-int pulsar_kvchain_load(pulsar_segstore *st, pulsar_engine *e, pulsar_session *s, const char *text,
-                        const pulsar_segstore_seg *chain, int n, char *err, size_t errlen) {
+uint64_t pulsar_kvchain_segment_load_bytes(const pulsar_segstore_seg *chain, int n, int i) {
+    return chain[i].payload_bytes - (i < n - 1 ? chain[i].state_bytes : 0u) + chain[i].trailer_bytes;
+}
+
+int pulsar_kvchain_load_slice_with(pulsar_segstore *st, const pulsar_segstore_seg *chain, int n, int *next, int k,
+                                   pulsar_kvchain_segment_loader load, void *ud, char *err, size_t errlen) {
     if (err && errlen) err[0] = '\0';
-    if (!st || !text || n <= 0) return 0;
-    for (int i = 0; i < n; i++) {
+    if (!st || !next || *next < 0 || *next >= n || k <= 0) {
+        if (err && errlen) snprintf(err, errlen, "chain slice [%d, +%d) is not inside a chain of %d", next ? *next : -1,
+                                    k, n);
+        return 1;
+    }
+    const int end = *next + k < n ? *next + k : n;
+    for (int i = *next; i < end; i++) {
         uint64_t pb = 0;
         FILE *fp = pulsar_segstore_open_payload(st, chain[i].key, &pb);
         char lerr[256] = "segment file unreadable";
         int G = 0;
-        const int rc = fp ? pulsar_session_load_segment(s, fp, pb, i == n - 1, &G, chain[i].key, lerr, sizeof(lerr)) : 1;
+        const int rc = fp ? load(ud, fp, pb, i == n - 1, &G, chain[i].key, lerr, sizeof(lerr)) : 1;
         if (fp) fclose(fp);
         if (rc != 0) {
             if (err && errlen)
                 snprintf(err, errlen, "segment %s [%u,%u) failed to load (%s) -- dropped with its chain",
                          chain[i].key, chain[i].G_prev, chain[i].G, lerr);
             pulsar_segstore_drop(st, chain[i].key);
-            pulsar_session_invalidate(s);
-            return 0;
+            return 1;
         }
+        *next = i + 1;
     }
+    return 0;
+}
+
+static int session_segment_loader(void *ud, FILE *fp, uint64_t bytes, bool last, int *G, const char *key, char *err,
+                                  size_t errlen) {
+    return pulsar_session_load_segment((pulsar_session *)ud, fp, bytes, last, G, key, err, errlen);
+}
+
+int pulsar_kvchain_load_slice(pulsar_segstore *st, pulsar_session *s, const pulsar_segstore_seg *chain, int n,
+                              int *next, int k, char *err, size_t errlen) {
+    const int rc = pulsar_kvchain_load_slice_with(st, chain, n, next, k, session_segment_loader, s, err, errlen);
+    if (rc != 0) pulsar_session_invalidate(s);
+    return rc;
+}
+
+int pulsar_kvchain_load_check(pulsar_segstore *st, pulsar_engine *e, pulsar_session *s, const char *text,
+                              const pulsar_segstore_seg *chain, int n, char *err, size_t errlen) {
+    if (err && errlen) err[0] = '\0';
     const pulsar_tokens *loaded = pulsar_session_tokens(s);
     /* L196: a chain whose text ends with an EOS its tokens never sampled (or the
      * reverse) would have the rest tokenised from the wrong byte. */
@@ -240,6 +266,16 @@ int pulsar_kvchain_load(pulsar_segstore *st, pulsar_engine *e, pulsar_session *s
     }
     pulsar_segstore_touch(st, chain, n);
     return (int)chain[n - 1].G;
+}
+
+int pulsar_kvchain_load(pulsar_segstore *st, pulsar_engine *e, pulsar_session *s, const char *text,
+                        const pulsar_segstore_seg *chain, int n, char *err, size_t errlen) {
+    if (err && errlen) err[0] = '\0';
+    if (!st || !text || n <= 0) return 0;
+    /* the one-shot load is the sliced load's one slice: the whole chain */
+    int next = 0;
+    if (pulsar_kvchain_load_slice(st, s, chain, n, &next, n, err, errlen) != 0) return 0;
+    return pulsar_kvchain_load_check(st, e, s, text, chain, n, err, errlen);
 }
 
 int pulsar_kvchain_restore(pulsar_segstore *st, pulsar_engine *e, pulsar_session *s, const char *text,

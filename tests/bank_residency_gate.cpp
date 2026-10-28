@@ -1,5 +1,5 @@
 /* L284 #3: a family pool's bank physical residency, through the public API -- what the server's 2b guard does to
- * an idle bank (server spill_bank / bank_restore_spilled), graded on the real model.
+ * an idle bank (server spill_bank / bank_unspill + the chain load), graded on the real model.
  *
  *   PULSAR_MSEQ_BANKS=4 ./tests/bank_residency_gate <model> [G]
  *

@@ -247,7 +247,7 @@ static int attention_decode_batch_launch(
     const uint32_t kernel_n_banks = descr ? n_banks : 1u;
     /* comp_kv is the per-bank comp cache. With split allocations + a base-pointer
      * table (increment 2a) each bank is its OWN comp_cap-row allocation, and
-     * comp_kv is bank 0's — so the byte bound is per-bank (comp_cap), not
+     * comp_kv is a resident bank's (L328) — so the byte bound is per-bank (comp_cap), not
      * n_banks*comp_cap. Without a table (legacy contiguous), it spans all banks. */
     const uint64_t comp_rows_min = (descr && comp_bank_ptrs) ? (uint64_t)comp_cap
                                  : descr ? (uint64_t)n_banks * comp_cap
@@ -555,7 +555,7 @@ int pulsar_gpu_attention_indexed_mixed_batch_heads_mx_tensor(
         return 0;
     }
     const uint64_t kv_banks = descr ? n_banks : 1u;
-    /* Per-bank split: comp_kv is bank 0's comp_cap-row allocation when the base-
+    /* Per-bank split: comp_kv is a resident bank's comp_cap-row allocation when the base-
      * pointer table is present (see attention_decode_batch_launch). */
     const uint64_t comp_rows_min = (descr && comp_bank_ptrs) ? (uint64_t)comp_cap
                                  : descr ? (uint64_t)n_banks * comp_cap

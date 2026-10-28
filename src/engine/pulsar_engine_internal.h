@@ -3947,8 +3947,10 @@ pulsar_gpu_tensor *gpu_graph_bank_raw_pool(pulsar_gpu_graph *g, uint32_t il);
 /** Nominal comp/index operand for the batched attention/indexer wrappers. With
  * per-bank split allocations there is no single slab; the batched (descriptor)
  * path addresses banks through the base-pointer table (below), so this returns
- * bank 0's allocation as the nominal typed operand (its per-bank size drives the
- * wrappers' buffer-size validation). Pool disabled → the classic tensor.
+ * the lowest RESIDENT bank's allocation as the nominal typed operand (every
+ * bank's is the same size, which drives the wrappers' buffer-size validation;
+ * L328: bank 0 can be spilled like any idle bank). Pool disabled → the classic
+ * tensor.
  */
 pulsar_gpu_tensor *gpu_graph_bank_attn_comp_pool(pulsar_gpu_graph *g, uint32_t il);
 pulsar_gpu_tensor *gpu_graph_bank_index_comp_pool(pulsar_gpu_graph *g, uint32_t il);

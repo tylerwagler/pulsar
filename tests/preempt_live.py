@@ -9,7 +9,11 @@ exact     The guard's eager floor and one bank's KV bytes a token are read from 
           (/metrics kv_eager_floor_bytes, L326; kv_bank_bytes over the context), and the prompts are counted on it; a
           server whose KV budget is overridden (PULSAR_SERVER_KV_BUDGET_OVERRIDE, the guard's test hook) so request A
           (a long prompt decoding 1500 greedy tokens) fits alone, B (a longer prompt, 1 token) fits alone, and both do
-          not.
+          not, beside W.  L328 (4): at B's arrival 0.12 GiB was touched against W + A's 0.10 (gpuq #474) -- bank 0's
+          warmup high-water (prefill-cap + 64 prompt tokens), which W sits under on a fresh server.  While bank 0 was
+          never a spill victim that floor stayed resident, B never fit beside it once A was preempted, and the leg
+          passed only through L328 (1)'s hole (A readmitted before B prefilled).  L328 (2): bank 0 is a victim like
+          any idle bank, the preemption's fit counts the idle banks as room, and B's admission spills them.
           B arrives while A decodes: A must be PREEMPTED (the server's log), B answered, A READMITTED and finished --
           and A's text must equal A's on a fresh server, uninterrupted, byte for byte (a single stream on both sides:
           greedy decode is deterministic there).  Every request asks for logprobs, which keeps it on the plain lane
@@ -74,6 +78,8 @@ class PreemptLeg(Leg):
     def __init__(self, g, work, margin=1.5, tag=None):   # tag: the old command line's, kept for its callers
         Leg.__init__(self, g, work)
         self.margin, self.budget, self.res = margin, None, {}
+        self.per_tok = 0.0
+        self.LB = self.LA0 = self.LW = 0
 
     def warm(self, srv):
         pr = probe(srv, srv.ctx)
@@ -81,8 +87,9 @@ class PreemptLeg(Leg):
             return
         eager, per_tok = pr
         # the prompts counted on the shared server: the budget holds B alone (and A alone: A's prompt + its generation
-        # is below B's prompt) with a margin, never both.  Bank 0 is never preempted (the guard keeps it resident): an
-        # unrelated conversation W takes it first, so A lands on a bank of its own and decodes alone.
+        # is below B's prompt) with a margin, never both -- beside W.  An unrelated conversation W comes first, so A
+        # lands on a bank of its own and decodes alone; when B arrives the idle banks (W's, bank 0's warmup high-water,
+        # an earlier leg's) are spilled and A is preempted (L328 (2): bank 0 is a victim like any idle bank).
         lens = {}
         for k, t in (("B", B_TEXT), ("A", A_TEXT), ("W", W_TEXT)):
             st, _, u = chat(srv, t, 1)
@@ -91,6 +98,15 @@ class PreemptLeg(Leg):
         if not self.g.check(0 < LA < LB and LW > 0, "the counted prompts (A + generation %d, B %d, W %d) frame a "
                             "preemption" % (LA, LB, LW)):
             return
+        # B can also take W's idle bank, reusing what W touched (L280's "continuing on bank N" -- W's history is
+        # persisted first, gen_begin's "evict" store): that bank then holds max(W, B) = B beside A, so A + B past the
+        # budget is what forces the preemption on every bank B may take (gpuq #485: the frame that also budgeted
+        # bank 0's warmup high-water let B fit on bank 0 beside A, and nothing was preempted)
+        if not self.g.check(lens["A"] + LB > LW + self.margin * LB,
+                            "A's prompt %d + B %d is past the budget's %.0f tokens: B fits on no bank beside A, W's "
+                            "idle bank included" % (lens["A"], LB, LW + self.margin * LB)):
+            return
+        self.per_tok, self.LB, self.LA0, self.LW = per_tok, LB, lens["A"], LW
         self.budget = int(eager + per_tok * (LW + self.margin * LB))
         self.g.note("eager %.2f GiB, %.0f B a token: budget override %.2f GiB" % (eager / 2**30, per_tok,
                                                                                     self.budget / 2**30))
@@ -110,23 +126,45 @@ class PreemptLeg(Leg):
                      ("%.2f GiB (ledger share %.2f - eager %.2f = %.2f)" %
                       (gl[0] / 2**30, self.budget / 2**30, gl[1] / 2**30, share / 2**30) if gl else "guard off"))
         mark = srv.mark()
+        spills0 = srv.metrics().get("pulsar:bank_spills_total", 0.0)
         chat(srv, W_TEXT, 1)
+        t_w = srv.metrics().get("pulsar:kv_touched_bytes", 0.0)   # W (and bank 0's warmup, any earlier leg's bank)
+        self.g.check(t_w >= self.per_tok * self.LW - 2**20,
+                     "touched after W %.3f GiB holds W's %.3f" % (t_w / 2**30, self.per_tok * self.LW / 2**30))
         th = threading.Thread(target=lambda: self.res.__setitem__("A", chat(srv, A_TEXT, GEN_A)))
         th.start()
         t0 = time.time()   # A decoding: a slot's phase reads decode on /metrics
         while time.time() - t0 < 600 and not slot_decoding(srv):
             time.sleep(0.25)
         time.sleep(2.0)
+        # L328 (4): the resident KV at B's arrival is what stood after W plus A's bank -- the frame's accounting
+        mb = srv.metrics()
+        touched = mb.get("pulsar:kv_touched_bytes", 0.0)
+        a_tok = (touched - t_w) / self.per_tok   # what A's bank added
+        self.g.check(self.LA0 - 64 <= a_tok <= self.LA0 + GEN_A + 64,
+                     "touched at B's arrival %.3f GiB = %.3f before A + A at ~%.0f tokens (prompt %d, decoding)" %
+                     (touched / 2**30, t_w / 2**30, a_tok, self.LA0))
         self.res["B"] = chat(srv, B_TEXT, 1)
         th.join()
         log = srv.since(mark)
         mt = srv.metrics()
         self.g.check(self.res["B"][0] == 200, "B (the prompt that did not fit) answered: %d" % self.res["B"][0])
+        self.g.check("continuing on bank" not in log, "B did not fit beside A on W's idle bank (no L280 clobber route)")
         self.g.check("PREEMPTED" in log and "READMITTED" in log,
                      "A preempted and readmitted (preemptions %d, readmissions %d)" %
                      (mt.get("pulsar:decoder_preemptions_total", -1), mt.get("pulsar:decoder_readmissions_total", -1)))
         for l in [l for l in log.splitlines() if "PREEMPTED" in l or "READMITTED" in l][:4]:
             print("#   " + l[-220:])
+        # L328 (3): B's retries take the bank its first try provisioned -- no bank provisioned per retry, no
+        # conversation evicted for it -- and (2): no readmission is refused
+        provs = [l for l in log.splitlines() if "provisioned bank" in l]
+        self.g.check(len(provs) <= 3, "banks provisioned for W, A and B: %d (L328: one per conversation, not one per "
+                     "retry)" % len(provs))
+        self.g.check("evicted slot" not in log, "no conversation evicted to make B a bank")
+        self.g.check("no longer fits" not in log, "A's readmission was never refused")
+        spills = mt.get("pulsar:bank_spills_total", 0.0) - spills0
+        self.g.check(spills >= 1, "the idle banks beside A were spilled for B (%d spills; bank 0's warmup high-water "
+                     "among the victims, L328 (2))" % spills)
 
     def cold(self, srv):
         if "A" not in self.res:

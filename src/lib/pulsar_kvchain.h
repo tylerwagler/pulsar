@@ -97,9 +97,34 @@ int pulsar_kvchain_find(pulsar_segstore *st, const char *text, size_t text_len, 
 uint64_t pulsar_kvchain_load_bytes(const pulsar_segstore_seg *chain, int n);
 /** L327: how many of those bytes are in the page cache now (pulsar_segstore_cached_bytes over the same parts). */
 uint64_t pulsar_kvchain_cached_bytes(pulsar_segstore *st, const pulsar_segstore_seg *chain, int n);
-/** L310: load the `n` segments pulsar_kvchain_find returned for `text` into the installed bank.  Returns the position
- *  the bank stands at; 0 when a segment would not load or the chain disagrees with its tokens at the boundary (that
- *  chain is dropped, the bank invalidated, `err` says which).  The chain is touched on success. */
+/** L330: what a load of segment `i` of `chain` (n segments) reads: its rows and trailer, and its state when it is the
+ *  last (pulsar_kvchain_load_bytes is the sum over the chain). */
+uint64_t pulsar_kvchain_segment_load_bytes(const pulsar_segstore_seg *chain, int n, int i);
+/** L330: one segment's load into whatever `ud` names (pulsar_session_load_segment's contract: `last` restores the
+ *  segment's state; 0 = loaded, *G the position it stands at). */
+typedef int (*pulsar_kvchain_segment_loader)(void *ud, FILE *fp, uint64_t bytes, bool last, int *G, const char *key,
+                                             char *err, size_t errlen);
+/** L330: load the next slice of a chain -- segments [*next, *next + k) of the `n` pulsar_kvchain_find returned, cut at
+ *  the chain's end -- in order through `load`, advancing *next past each segment loaded.  The whole chain in one slice
+ *  is the one-shot load (pulsar_kvchain_load); the server reads a long chain a slice per worker turn.  1 when a segment
+ *  would not load: it is dropped from the store (and so is everything below it, by key) and `err` says which; *next
+ *  stays at it.  Bytes and order are the one-shot's whatever `k` is: a slice ends at a segment boundary, where the bank
+ *  stands at the next segment's start. */
+int pulsar_kvchain_load_slice_with(pulsar_segstore *st, const pulsar_segstore_seg *chain, int n, int *next, int k,
+                                   pulsar_kvchain_segment_loader load, void *ud, char *err, size_t errlen);
+/** pulsar_kvchain_load_slice_with into the installed bank of `s` (pulsar_session_load_segment); a failed slice leaves
+ *  the bank invalidated. */
+int pulsar_kvchain_load_slice(pulsar_segstore *st, pulsar_session *s, const pulsar_segstore_seg *chain, int n,
+                              int *next, int k, char *err, size_t errlen);
+/** L330: a loaded chain's last word (L196): the bank's tokens end at the chain's end and agree with `text` at its
+ *  boundary.  Returns the position (the chain is touched); 0 when they disagree (the chain's last segment is dropped,
+ *  the bank invalidated, `err` says so). */
+int pulsar_kvchain_load_check(pulsar_segstore *st, pulsar_engine *e, pulsar_session *s, const char *text,
+                              const pulsar_segstore_seg *chain, int n, char *err, size_t errlen);
+/** L310: load the `n` segments pulsar_kvchain_find returned for `text` into the installed bank -- the whole chain as
+ *  one slice, then the boundary check.  Returns the position the bank stands at; 0 when a segment would not load or
+ *  the chain disagrees with its tokens at the boundary (that chain is dropped, the bank invalidated, `err` says
+ *  which).  The chain is touched on success. */
 int pulsar_kvchain_load(pulsar_segstore *st, pulsar_engine *e, pulsar_session *s, const char *text,
                         const pulsar_segstore_seg *chain, int n, char *err, size_t errlen);
 

@@ -6,7 +6,8 @@
  * fills modest, never approaches OOM).
  *
  * Flow (L264: the server's spill IS the disk KV cache's segment chain, so the
- * gate drives the same engine calls -- spill_bank / bank_restore_spilled):
+ * gate drives the same engine calls -- spill_bank, and the chain load a job bound to the
+ * spilled bank runs, L330):
  *   1. prefill bank 0 to L tokens; capture its frontier; CHECKSUM its comp/index
  *      rows (raw D2H fold).
  *   2. save bank 0 as a chain of SEGMENTS, one per grid checkpoint it holds
@@ -22,6 +23,10 @@
  *   6. repoint to bank 0; load the chain (server: kv_cache_try_load_text).
  *   7. CHECKSUM bank 0's comp/index again; assert == step 1 (bit-identical), and
  *      the bank stands at the chain's end.
+ *   7b. L330: the SLICED restore -- evict bank 0 again and load the same chain a
+ *      segment at a time with a bank switch away and back between segments (the
+ *      server's bank_switch: save the outgoing carry, restore the incoming one),
+ *      as a restore between decode rounds does; CHECKSUM == step 1.
  *
  * MODEL-DEPENDENT, GPU-resident; run manually under the memory discipline (hold
  * temp/gpu.lock, drop_caches, no foreign ds4 process). NOT part of `make test`.
@@ -237,8 +242,9 @@ int GATE_ENTRY(int argc, char **argv) {
      * the reclaim against touched with a tolerance.  The guard itself decides
      * on the deterministic touched accounting, never this gauge. */
 
-    /* 5-6. Restore bank 0 the way bank_restore_spilled does: fresh physical,
-     * repoint, load the chain root first (a root resets the bank). */
+    /* 5-6. Restore bank 0 the way the server does (bank_unspill, then the job's
+     * chain load): fresh physical, repoint, load the chain root first (a root
+     * resets the bank). */
     { double t0 = now_ms();
       CHECK(pulsar_session_bank_alloc_physical(s, 0), "alloc_physical(bank 0) failed");
       CHECK(pulsar_session_bank_state_restore(s, 0), "repoint to bank 0 failed");
@@ -268,6 +274,39 @@ int GATE_ENTRY(int argc, char **argv) {
           sum_after, sum_before);
     fprintf(stderr, "evict_restore_gate: restored checksum=%016" PRIx64 " (bit-identical: %s)\n",
             sum_after, sum_after == sum_before ? "YES" : "NO");
+
+    /* ===== 7b. L330 -- the SLICED restore: one segment per "worker turn", and between turns another bank installed
+     * and the restoring one installed again exactly as server::bank_switch does (save the outgoing bank's carry and
+     * counters, restore the incoming one's).  Each segment must find the bank standing at its start, and the rows
+     * must come back bit-identical to the one-shot load's. ===== */
+    { CHECK(pulsar_session_bank_state_restore(s, 1), "sliced: repoint to bank 1");
+      CHECK(pulsar_session_bank_free_physical(s, 0), "sliced: free_physical(bank 0)");
+      CHECK(pulsar_session_bank_alloc_physical(s, 0), "sliced: alloc_physical(bank 0)");
+      CHECK(pulsar_session_bank_state_restore(s, 0), "sliced: repoint to bank 0");
+      pulsar_session_invalidate(s);   /* bank_unspill: the re-backed bank holds nothing */
+      double t0 = now_ms();
+      for (int i = 0; i < n_chain; i++) {
+          CHECK(fseek(chain_fp[i], 0, SEEK_SET) == 0, "sliced: rewind segment %d", i);
+          int G = 0;
+          CHECK(pulsar_session_load_segment(s, chain_fp[i], chain_bytes[i], i == n_chain - 1, &G, NULL, err, sizeof err) == 0,
+                "sliced: segment %d load (after a switch away and back): %s", i, err);
+          CHECK(G == chain_G[i], "sliced: segment %d loaded G=%d, saved %d", i, G, chain_G[i]);
+          if (i == n_chain - 1) break;
+          /* the turn ends: another bank's quantum installs it, the next turn installs bank 0 again */
+          pulsar_session_bank_state_save(s, 0);
+          CHECK(pulsar_session_bank_state_restore(s, 1), "sliced: switch to bank 1 after segment %d", i);
+          pulsar_session_bank_state_save(s, 1);
+          CHECK(pulsar_session_bank_state_restore(s, 0), "sliced: switch back to bank 0 after segment %d", i);
+      }
+      fprintf(stderr, "evict_restore_gate: sliced load (%d segments, a switch between each) %.1f ms\n", n_chain,
+              now_ms() - t0); }
+    CHECK(pulsar_session_pos(s) == L, "sliced: restored bank stands at %d, not %d", pulsar_session_pos(s), L);
+    (void)pulsar_gpu_synchronize();
+    const uint64_t sum_sliced = checksum_bank_kv(s, 0);
+    CHECK(sum_sliced == sum_before, "sliced: KV NOT bit-identical to the one-shot load (%016" PRIx64 " vs %016" PRIx64
+          ")", sum_sliced, sum_before);
+    fprintf(stderr, "evict_restore_gate: sliced checksum=%016" PRIx64 " (bit-identical: %s)\n", sum_sliced,
+            sum_sliced == sum_before ? "YES" : "NO");
 
     /* ===== Review finding 2 — a freed bank stops counting toward touched (so the
      * guard evicts exactly the minimum, not the whole idle set / cascade). Prefill

@@ -367,14 +367,15 @@ bool server::send_root(int fd) {
  * slot reports all five series with a 0/1 value — the Prometheus state-set
  * convention — so the series set is stable and label values never churn. */
 static const char *const slot_phase_names[] = {
-    "idle", "prefill_cold", "prefill_main", "decode", "finish",
+    "idle", "prefill_cold", "prefill_main", "decode", "finish", "restore",
 };
-enum { SLOT_PHASE_COUNT = 5 };
+enum { SLOT_PHASE_COUNT = 6 };
 
 /* Map a published m_slot_phase (gen_phase + 1; 0 = no bound job) onto that
  * label set. */
 static int slot_phase_index(int phase_plus_one) {
     switch (phase_plus_one - 1) {
+    case GEN_RESTORE:      return 5;   /* L330: a disk chain restoring, a slice per worker turn */
     case GEN_PREFILL_COLD: return 1;
     case GEN_PREFILL_MAIN: return 2;
     case GEN_DECODE_INIT:
@@ -482,6 +483,10 @@ bool server::send_metrics(int fd) {
     const unsigned long long spills = (unsigned long long)s->m_spills;
     const unsigned long long restores = (unsigned long long)s->m_restores;
     const unsigned long long restore_failures = (unsigned long long)s->m_restore_failures;
+    const unsigned long long restore_slices = (unsigned long long)s->m_restore_slices;    /* L330 */
+    const double restore_stall_max_s = s->m_restore_stall_max_ms / 1000.0;
+    const unsigned long long kv_touched = (unsigned long long)s->m_kv_touched;            /* L328 */
+    const unsigned long long kv_reserved = (unsigned long long)s->m_kv_reserved;
     const kv_restore_meter disk_meter = s->kv.meter;   /* L310 */
     const unsigned long long preemptions = (unsigned long long)s->m_preemptions;    /* L314 */
     const unsigned long long readmissions = (unsigned long long)s->m_readmissions;
@@ -689,7 +694,7 @@ bool server::send_metrics(int fd) {
     int prefilling = 0;
     for (int i = 0; i < n_slots; i++) {
         const int idx = slot_phase_index(slot_phase[i]);
-        if (idx == 1 || idx == 2) prefilling++;
+        if (idx == 1 || idx == 2 || idx == 5) prefilling++;   /* L330: a restoring prompt is ingesting too */
     }
     /* The pool this run was sized for. Publishes the same number /health
      * reports as slots.capacity, so a scraper can compute "how much of the pool
@@ -731,7 +736,7 @@ bool server::send_metrics(int fd) {
     buf_puts(&b, "# TYPE pulsar:slot_prefill_total_tokens gauge\n");
     for (int i = 0; i < n_slots; i++)
         buf_printf(&b, "pulsar:slot_prefill_total_tokens{slot=\"%d\"} %d\n", i, slot_pf_total[i]);
-    buf_puts(&b, "# HELP pulsar:num_requests_prefilling Requests currently in a prefill phase.\n");
+    buf_puts(&b, "# HELP pulsar:num_requests_prefilling Requests currently in a prefill phase (or restoring a disk KV chain, L330).\n");
     buf_puts(&b, "# TYPE pulsar:num_requests_prefilling gauge\n");
     buf_printf(&b, "pulsar:num_requests_prefilling %d\n", prefilling);
 
@@ -781,12 +786,20 @@ bool server::send_metrics(int fd) {
     buf_puts(&b, "# HELP pulsar:bank_spills_total Banks spilled to disk by the proactive-eviction guard.\n");
     buf_puts(&b, "# TYPE pulsar:bank_spills_total counter\n");
     buf_printf(&b, "pulsar:bank_spills_total %llu\n", spills);
-    buf_puts(&b, "# HELP pulsar:bank_restores_total Spilled banks reloaded from disk.\n");
+    buf_puts(&b, "# HELP pulsar:bank_restores_total Spilled banks brought back for a job (re-backed; the job restores the chain, L330).\n");
     buf_puts(&b, "# TYPE pulsar:bank_restores_total counter\n");
     buf_printf(&b, "pulsar:bank_restores_total %llu\n", restores);
-    buf_puts(&b, "# HELP pulsar:bank_restore_failures_total Spilled banks that could not be reloaded.\n");
+    buf_puts(&b, "# HELP pulsar:bank_restore_failures_total Spilled banks that could not be re-backed.\n");
     buf_puts(&b, "# TYPE pulsar:bank_restore_failures_total counter\n");
     buf_printf(&b, "pulsar:bank_restore_failures_total %llu\n", restore_failures);
+    /* L330: a disk chain loads a slice of segments per worker turn; the longest slice is the longest the worker -- and
+     * every stream beside the restore -- stood still for one */
+    buf_puts(&b, "# HELP pulsar:kv_restore_slices_total Disk KV chain slices read (a restore reads one per worker turn; a one-shot load is one).\n");
+    buf_puts(&b, "# TYPE pulsar:kv_restore_slices_total counter\n");
+    buf_printf(&b, "pulsar:kv_restore_slices_total %llu\n", restore_slices);
+    buf_puts(&b, "# HELP pulsar:kv_restore_stall_max_seconds The longest worker stall a disk KV restore caused: its longest slice.\n");
+    buf_puts(&b, "# TYPE pulsar:kv_restore_stall_max_seconds gauge\n");
+    buf_printf(&b, "pulsar:kv_restore_stall_max_seconds %.6f\n", restore_stall_max_s);
 
     /* L314: running decoders preempted through their terminal checkpoint for a prompt that did not fit, and back */
     buf_puts(&b, "# HELP pulsar:decoder_preemptions_total Running decoders preempted (terminal checkpoint to disk) to admit a prompt.\n");
@@ -962,6 +975,14 @@ bool server::send_metrics(int fd) {
     buf_puts(&b, "# TYPE pulsar:kv_eager_floor_bytes gauge\n");
     buf_printf(&b, "pulsar:kv_eager_floor_bytes %llu\n",
                s->guard_enabled ? (unsigned long long)s->guard_eager_bytes : 0ULL);
+    /* L328: the resident KV every guard and admission decision reads, and the base they read it from (touched plus
+     * what the admitted prompts and restoring chains still add) */
+    buf_puts(&b, "# HELP pulsar:kv_touched_bytes Demand-paged KV resident now, the pool's high-water rows (0 = guard off).\n");
+    buf_puts(&b, "# TYPE pulsar:kv_touched_bytes gauge\n");
+    buf_printf(&b, "pulsar:kv_touched_bytes %llu\n", kv_touched);
+    buf_puts(&b, "# HELP pulsar:kv_reserved_bytes The base every KV admission decision reads: touched plus what admitted prompts and restoring chains still add (L326/L330; 0 = guard off).\n");
+    buf_puts(&b, "# TYPE pulsar:kv_reserved_bytes gauge\n");
+    buf_printf(&b, "pulsar:kv_reserved_bytes %llu\n", kv_reserved);
 
     /* plan-31b phase A: whole-box reconciliation -- the signed gap between
      * what the BOX says this process consumed since a post-boot baseline and

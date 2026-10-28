@@ -9907,6 +9907,7 @@ static void test_l323_bank_dominated(void) {
         s.slots[i].bank = (uint32_t)i;
         s.slots[i].last_serviced_us = slots[i].last_serviced_us;
     }
+    s.slots[0].last_serviced_us = 70;   /* L328: bank 0 is a candidate like any bank -- here not the LRU one */
     bool gdom[PULSAR_SESSION_POOL_CAP] = {false};
     TEST_ASSERT(s.guard_pick_victim(NULL, 0, gdom) == 1);
     gdom[2] = true;
@@ -9923,11 +9924,12 @@ static void test_l323_bank_dominated(void) {
 
 /* L179 branch 7 (i) -- guard_pick_victim on a host-only server (sess NULL:
  * bank_touched_kv_bytes reads 0).
- * Invariant: bank 0 is never a victim; nothing in the live decode set is;
- * unprovisioned, spilled and bound slots are skipped; among the rest the
- * smallest last_serviced_us wins (touched-bytes tie-break, then first
+ * Invariant (L328: bank 0 is a victim like any other bank -- the pool parks on
+ * another resident bank, server_park_pick): nothing in the live decode set is a
+ * victim; unprovisioned, spilled and bound slots are skipped; among the rest
+ * the smallest last_serviced_us wins (touched-bytes tie-break, then first
  * index); no candidate is -1. */
-static void test_l179_guard_victim_skips_pinned_live_spilled(void) {
+static void test_l179_guard_victim_skips_live_spilled(void) {
     server s;
     memset(&s, 0, sizeof s);
     s.n_slots = 5;
@@ -9938,7 +9940,10 @@ static void test_l179_guard_victim_skips_pinned_live_spilled(void) {
         s.slots[i].last_serviced_us = us[i];
     }
     session_slot *dec[2] = {&s.slots[4], &s.slots[3]};
-    /* bank 0 (LRU) is pinned, 3 and 4 are live: LRU of {1, 2} is 2 */
+    /* 3 and 4 are live: LRU of {0, 1, 2} is bank 0 (before L328 it was pinned and 2 was picked) */
+    TEST_ASSERT(s.guard_pick_victim(dec, 2) == 0);
+    /* bank 0 bound: LRU of {1, 2} is 2 */
+    s.slots[0].active_job = (struct job *)&s;
     TEST_ASSERT(s.guard_pick_victim(dec, 2) == 2);
     /* only 2 live: LRU of {1, 3, 4} is 4 */
     dec[0] = &s.slots[2];
@@ -9952,8 +9957,7 @@ static void test_l179_guard_victim_skips_pinned_live_spilled(void) {
     /* a bound one too: nothing left -> -1 */
     s.slots[1].active_job = (struct job *)&s;
     TEST_ASSERT(s.guard_pick_victim(dec, 1) == -1);
-    /* with no decode set slot 2 is idle again and is the only candidate;
-     * bank 0 (still the oldest) is still never picked */
+    /* with no decode set slot 2 is idle again and is the only candidate */
     TEST_ASSERT(s.guard_pick_victim(dec, 0) == 2);
     s.slots[1].active_job = NULL;
     /* tie on last_serviced_us across 1, 2, 3 (touched is 0 for every bank
@@ -9962,9 +9966,15 @@ static void test_l179_guard_victim_skips_pinned_live_spilled(void) {
     s.slots[2].last_serviced_us = us[1];
     s.slots[3].last_serviced_us = us[1];
     TEST_ASSERT(s.guard_pick_victim(dec, 0) == 1);
-    /* a one-slot pool has no victim */
+    /* bank 0 idle again in the tie: it is the first index */
+    s.slots[0].active_job = NULL;
+    s.slots[0].last_serviced_us = us[1];
+    TEST_ASSERT(s.guard_pick_victim(dec, 0) == 0);
+    /* a one-slot pool: bank 0 is the candidate, and the spill finds nowhere to park (server_park_pick -1) */
     s.n_slots = 1;
-    TEST_ASSERT(s.guard_pick_victim(dec, 0) == -1);
+    TEST_ASSERT(s.guard_pick_victim(dec, 0) == 0);
+    const bool one[1] = {true};
+    TEST_ASSERT(server_park_pick(one, 1, 0) == -1);
 }
 
 /* L179 branch 7 (ii) -- guard_maybe_evict's control law (guard_spill_plan).
@@ -10027,6 +10037,370 @@ static void test_l280_prompt_kv_admission(void) {
     TEST_ASSERT(server_prompt_kv_verdict(20 * GiB, 24 * GiB, 23 * GiB, all, 1, true, &k) == PROMPT_KV_REFUSE && k == 0);
     /* nothing to add (a continuation on its own resident bank) always fits, even over a breached pool */
     TEST_ASSERT(server_prompt_kv_verdict(30 * GiB, 0, 23 * GiB, NULL, 0, false, &k) == PROMPT_KV_FITS && k == 0);
+}
+
+/* L326 -- L314's readmission decides from the reserved base (server_kv_reserved), as every admission does.  gpuq
+ * #472's shape (Nemotron mini, 2048 B a token, budget 2.2 x 6000 tokens): A decodes on bank 0 at ~6300 tokens; B
+ * (~5966 tokens) was PREEMPTED so C's 6000-token prompt could bind; C is admitted but its prefill has not run.  On
+ * touched alone B fit again at once (READMITTED 0.0 s later) and C's prefill then took the pool over budget with
+ * no victim.  From the reserved base B waits while C is in flight, and comes back (spilling C's idle bank) after C
+ * ends; a bank already past its prompt reserves nothing; the fresh prompt that preempted B fit by the same base. */
+/* L328 -- the KV admission decisions, one at a time, on the numbers of the runs that found them.
+ *  (1) a job reserves its prompt's room from bind: restoring a chain (L330) as well as prefilling;
+ *  (2) a preemption is declined when its readmission could never fit beside bank 0 (never a spill victim);
+ *  (3) a provisioned empty bank is the fresh bank -- the retry of a KV-queued prompt takes the bank it left;
+ *  (4) preempt-exact's frame: bank 0's warmup high-water is the resident a W on bank 0 sits under;
+ *  (5) the decode guard preempts while that makes progress, and a readmission fits its growth first. */
+static void test_l328_admission_decisions(void) {
+    /* (1) every phase that still owes the bank its prompt reserves; a decoder, a parked or a finished job do not */
+    {
+        session_slot sl;
+        memset(&sl, 0, sizeof sl);
+        gen_state g;
+        memset(&g, 0, sizeof g);
+        int dummy = 0;
+        sl.active_job = (job *)&dummy;
+        sl.gen = &g;
+        g.phase = GEN_RESTORE;
+        TEST_ASSERT(server_slot_reserves(&sl));
+        sl.preempted = true;
+        TEST_ASSERT(!server_slot_reserves(&sl));
+        sl.preempted = false;
+        g.phase = GEN_FINISH;
+        TEST_ASSERT(!server_slot_reserves(&sl));
+    }
+    /* (2) bank 0 is a spill victim like any other (Tyler, 2026-10-28).  The pool parks while a bank's physical goes:
+     * bank 0 when it is resident and not the one freed, else the lowest other resident bank, -1 when there is none */
+    const uint64_t q = 13440, budget = 11984 * q, growth = 16 * q;
+    const uint64_t a = 5710 * q;
+    {
+        const bool all[4] = {true, true, true, true};
+        TEST_ASSERT(server_park_pick(all, 4, 2) == 0);         /* a spill of bank 2: parked on bank 0, as before */
+        TEST_ASSERT(server_park_pick(all, 4, 0) == 1);         /* a spill of bank 0 itself: the next resident one */
+        const bool b0_out[4] = {false, false, true, true};      /* bank 0 spilled, bank 1 preempted (no physical) */
+        TEST_ASSERT(server_park_pick(b0_out, 4, 3) == 2);
+        TEST_ASSERT(server_park_pick(b0_out, 4, 2) == 3);
+        const bool last[4] = {false, false, true, false};
+        TEST_ASSERT(server_park_pick(last, 4, 2) == -1);        /* the only resident bank cannot be freed */
+        TEST_ASSERT(server_park_pick(last, 4, 0) == 2);
+    }
+    /* gpuq #474: bank 0 held its warmup high-water (4172 tokens) under W, A (5710) decoded beside it, B (8051) came:
+     * resident 0.12 GiB.  Every idle bank spilled is not room enough (A + B > budget), so A is preempted -- and the
+     * preemption's fit counts the idle bank 0 as room (the re-check spills it), where the pinned bank 0 had kept B
+     * from fitting at all; then B's re-check SPILLs bank 0 and B binds */
+    {
+        const uint64_t warm0 = 4172 * q, b = 8051 * q, frame = (1841 + 8051 + 8051 / 4) * q;   /* LW + 1.25 LB */
+        int k = -1;
+        const uint64_t drop0[1] = {warm0};
+        TEST_ASSERT(server_prompt_kv_verdict(warm0 + a, b, frame, drop0, 1, true, &k) == PROMPT_KV_WAIT);
+        TEST_ASSERT(!server_preempt_fits(warm0 + a, a, 0, b, frame));      /* bank 0 not counted: no fit (the old) */
+        TEST_ASSERT(server_preempt_fits(warm0 + a, a, warm0, b, frame));   /* bank 0 spillable: the preemption fits */
+        TEST_ASSERT(server_prompt_kv_verdict(warm0, b, frame, drop0, 1, true, &k) == PROMPT_KV_SPILL && k == 1);
+        /* the readmission after B ends: B's bank and bank 0 (spilled already, or idle) are victims; A comes back */
+        const uint64_t drop_b[1] = {b};
+        TEST_ASSERT(server_prompt_kv_verdict(b, server_readmit_need(a, 0, growth), frame, drop_b, 1, false, &k) ==
+                    PROMPT_KV_SPILL && k == 1);
+        /* a preemption fit never underflows: freed + idle past the base reads as an empty pool */
+        TEST_ASSERT(server_preempt_fits(a, a, warm0, b, frame));
+        TEST_ASSERT(!server_preempt_fits(a, a, warm0, frame + 1, frame));
+    }
+    /* (3) the empty bank with the most resident pages (server_pick_free_bank's rule over the empty ones) */
+    {
+        const bool taken[4] = {true, false, true, false};   /* banks 1 and 3 are provisioned and empty */
+        const uint64_t resident[4] = {0, 7 * q, 0, 9 * q};
+        TEST_ASSERT(server_pick_free_bank(taken, resident, 4) == 3);
+        const bool none[2] = {true, true};
+        TEST_ASSERT(server_pick_free_bank(none, resident, 2) == -1);
+    }
+    /* (4) preempt-exact's frame (margin 1.25): W 1841, B 8051, A 5405 + 1500, bank 0's warmup high-water 4172 (the
+     * excess touched KV at B's arrival in #474).  With bank 0 a spill victim the frame is LW + 1.25 LB again, and it
+     * holds wherever W lands: on bank 0 under its warmup high-water (fresh server) or on a bank of its own beside
+     * an idle bank 0 -- B fits alone once A is preempted and the idle banks spill, A + B never fit, A's whole run fits
+     * alone, and A comes back once B's bank spills. */
+    {
+        const uint64_t LW = 1841, LB = 8051, LA0 = 5405, LA = LA0 + 1500, WARM = 4172;
+        const uint64_t frame = LW + LB + LB / 4;
+        for (int w_on_0 = 0; w_on_0 < 2; w_on_0++) {
+            /* the idle banks beside A: bank 0 holding max(W, its warmup) -- or the warmup, and W on its own bank */
+            const uint64_t idle = w_on_0 ? (WARM > LW ? WARM : LW) : WARM + LW;
+            TEST_ASSERT(server_preempt_fits((idle + LA0) * q, LA0 * q, idle * q, LB * q, frame * q));   /* B alone */
+            TEST_ASSERT(LA0 + LB > frame);                                    /* A at arrival + B: the preemption */
+            TEST_ASSERT(LA <= frame);                                         /* A's whole run alone */
+            /* B on W's idle bank instead (L280's clobber route, prompt_kv_check(best)): it adds LB past what that bank
+             * holds, and nothing else is idle -- WAIT, so B takes a fresh bank and A is preempted.  gpuq #485 at
+             * 229f174c budgeted the warmup too (WARM + LW + 1.25 LB): there B FIT on bank 0 beside A, nothing was
+             * preempted, and the leg's PREEMPTED check failed */
+            if (w_on_0) {
+                const uint64_t hw0 = WARM > LW ? WARM : LW, A485 = 5485;
+                int k = -1;
+                TEST_ASSERT(server_prompt_kv_verdict((hw0 + A485) * q, (LB - hw0) * q, frame * q, NULL, 0, true, &k) ==
+                            PROMPT_KV_WAIT);
+                TEST_ASSERT(server_prompt_kv_verdict((hw0 + A485) * q, (LB - hw0) * q, (WARM + frame) * q, NULL, 0,
+                                                     true, &k) == PROMPT_KV_FITS);
+            }
+            int k = -1;
+            const uint64_t drop_b[1] = {LB * q};
+            TEST_ASSERT(server_prompt_kv_verdict(LB * q, server_readmit_need(LA0 * q, 0, growth), frame * q, drop_b, 1,
+                                                 false, &k) == PROMPT_KV_SPILL && k == 1);
+        }
+    }
+    /* (5) the guard preempts beside another decoder or a job holding reserved room, never a lone decoder */
+    TEST_ASSERT(!server_guard_may_preempt(1, false));
+    TEST_ASSERT(server_guard_may_preempt(2, false));
+    TEST_ASSERT(server_guard_may_preempt(1, true));
+    TEST_ASSERT(!server_guard_may_preempt(0, false));
+    /* a readmission needs its KV and the growth of every decoder stepping once it is back (it among them) */
+    TEST_ASSERT(server_readmit_need(a, 0, growth) == a + growth);
+    TEST_ASSERT(server_readmit_need(a, 2, growth) == a + 3 * growth);
+    /* no preempt / readmit churn: the guard preempted the newest of 2 decoders because touched + 2 quanta did not fit
+     * (the other's growth then fits); the readmission's need beside the one left is that same breach -- it waits */
+    {
+        const uint64_t t = budget - growth;   /* two decoders, one quantum each over the budget */
+        const uint64_t v = 3000 * q;
+        TEST_ASSERT(t + 2 * growth > budget && (t - v) + growth <= budget);
+        int k = -1;
+        TEST_ASSERT(server_prompt_kv_verdict(t - v, server_readmit_need(v, 1, growth), budget, NULL, 0, true, &k) ==
+                    PROMPT_KV_WAIT);
+    }
+}
+
+/* L330 -- the sliced disk restore, on a synthetic chain (the L323 fixtures: v6 segment headers, rows and states).
+ * A loader that records every segment it is handed into a byte "bank" stands for pulsar_session_load_segment: the
+ * slices hand it the one-shot load's segments, in its order, with its `last` flags, whatever the slice size -- so the
+ * bank's bytes are the one-shot's.  A failing segment stops the load there and drops the chain; a cancel between
+ * slices (the server's: the client gone) keeps it stored.  The job's reservation holds the chain's room from bind. */
+struct l330_bank {
+    std::vector<uint8_t> bytes;   ///< every segment's payload, in load order
+    std::string order;            ///< "G_prev-G[L] " per segment
+    int pos = 0;                  ///< where the bank stands (the next segment must start here)
+    int fail_at = -1;             ///< the segment G_prev to refuse (a corrupt segment)
+};
+static int l330_loader(void *ud, FILE *fp, uint64_t bytes, bool last, int *G, const char *key, char *err,
+                       size_t errlen) {
+    (void)key;
+    l330_bank *b = (l330_bank *)ud;
+    uint32_t h[9];
+    if (fread(h, 4, 9, fp) != 9) { snprintf(err, errlen, "short header"); return 1; }
+    if ((int)h[6] != b->pos) { snprintf(err, errlen, "bank stands at %d, segment starts at %u", b->pos, h[6]); return 1; }
+    if ((int)h[6] == b->fail_at) { snprintf(err, errlen, "digest mismatch (corrupt segment)"); return 1; }
+    b->bytes.insert(b->bytes.end(), (const uint8_t *)h, (const uint8_t *)h + 36);
+    for (uint64_t i = 36; i < bytes; i++) {
+        const int c = fgetc(fp);
+        if (c == EOF) { snprintf(err, errlen, "short payload"); return 1; }
+        b->bytes.push_back((uint8_t)c);
+    }
+    char rec[48];
+    snprintf(rec, sizeof rec, "%u-%u%s ", h[6], h[7], last ? "L" : "");
+    b->order += rec;
+    b->pos = (int)h[7];
+    *G = (int)h[7];
+    return 0;
+}
+static void test_l330_sliced_restore(void) {
+    char t[] = "/tmp/pulsar-l330.XXXXXX";
+    char *dir = l323_tmpdir(t);
+    TEST_ASSERT(dir != NULL);
+    if (!dir) return;
+    pulsar_segstore *st = pulsar_segstore_open(dir, 0, 7, NULL, NULL);
+    char tip[41];
+    /* [0,4096) [4096,8192) [8192,12288) [12288,16384) [16384,20480) tail [20480,21000), every one with its state */
+    TEST_ASSERT(l323_persist(st, 21000, 4096, true, l323_held_all, tip) == 6);
+    std::string req;
+    l323_text(0, 21000, &req);
+    req += "and the next turn";
+    pulsar_segstore_seg chain[PULSAR_KVCHAIN_MAX];
+    uint64_t bytes = 0;
+    char err[384];
+    const int n = pulsar_kvchain_find(st, req.data(), req.size(), NULL, 0, 0, chain, PULSAR_KVCHAIN_MAX, &bytes, err,
+                                      sizeof err);
+    TEST_ASSERT(n == 6 && chain[n - 1].G == 21000);
+    if (n != 6) { pulsar_segstore_close(st); l323_rmdir(dir); return; }
+    /* the one-shot load: the whole chain as one slice */
+    l330_bank one;
+    int next = 0;
+    TEST_ASSERT(pulsar_kvchain_load_slice_with(st, chain, n, &next, n, l330_loader, &one, err, sizeof err) == 0);
+    TEST_ASSERT(next == n && one.pos == 21000);
+    TEST_ASSERT(one.order == "0-4096 4096-8192 8192-12288 12288-16384 16384-20480 20480-21000L ");
+    uint64_t sum = 0;
+    for (int i = 0; i < n; i++) sum += pulsar_kvchain_segment_load_bytes(chain, n, i);
+    TEST_ASSERT(sum == pulsar_kvchain_load_bytes(chain, n));
+    /* every slice size, and a mixed schedule: the same bytes, the same order, the same `last` */
+    for (int k = 1; k <= n + 1; k++) {
+        l330_bank sliced;
+        int nx = 0, slices = 0;
+        while (nx < n && slices < 2 * n) {
+            TEST_ASSERT(pulsar_kvchain_load_slice_with(st, chain, n, &nx, k, l330_loader, &sliced, err, sizeof err) ==
+                        0);
+            slices++;
+        }
+        TEST_ASSERT(nx == n && slices == (n + k - 1) / k);
+        TEST_ASSERT(sliced.bytes == one.bytes && sliced.order == one.order);
+    }
+    {
+        static const int sched[] = {2, 1, 3};
+        l330_bank mixed;
+        int nx = 0;
+        for (int i = 0; i < 3; i++)
+            TEST_ASSERT(pulsar_kvchain_load_slice_with(st, chain, n, &nx, sched[i], l330_loader, &mixed, err,
+                                                       sizeof err) == 0);
+        TEST_ASSERT(nx == n && mixed.bytes == one.bytes && mixed.order == one.order);
+    }
+    /* a slice past the chain is refused by name, nothing read */
+    {
+        l330_bank none;
+        int nx = n;
+        TEST_ASSERT(pulsar_kvchain_load_slice_with(st, chain, n, &nx, 1, l330_loader, &none, err, sizeof err) == 1);
+        TEST_ASSERT(nx == n && none.bytes.empty() && strstr(err, "not inside"));
+    }
+    /* cancel mid-chain: the restore stops between slices -- the bank holds rows that describe no state (the server
+     * invalidates it; only the chain's last segment carries one), and the chain stays stored for the next request */
+    {
+        l330_bank part;
+        int nx = 0;
+        TEST_ASSERT(pulsar_kvchain_load_slice_with(st, chain, n, &nx, 2, l330_loader, &part, err, sizeof err) == 0);
+        TEST_ASSERT(nx == 2 && part.order == "0-4096 4096-8192 ");
+        pulsar_segstore_seg g;
+        for (int i = 0; i < n; i++) TEST_ASSERT(pulsar_segstore_get(st, chain[i].key, &g));
+        uint64_t again = 0;
+        pulsar_segstore_seg c2[PULSAR_KVCHAIN_MAX];
+        TEST_ASSERT(pulsar_kvchain_find(st, req.data(), req.size(), NULL, 0, 0, c2, PULSAR_KVCHAIN_MAX, &again, err,
+                                        sizeof err) == n);
+    }
+    /* a read failure mid-chain (segment [8192,12288) corrupt): the slice stops AT it, says which, and the store drops
+     * it and every segment below it -- what the one-shot load does on the same segment */
+    {
+        l330_bank bad;
+        bad.fail_at = 8192;
+        int nx = 0;
+        TEST_ASSERT(pulsar_kvchain_load_slice_with(st, chain, n, &nx, 2, l330_loader, &bad, err, sizeof err) == 0);
+        TEST_ASSERT(nx == 2);
+        TEST_ASSERT(pulsar_kvchain_load_slice_with(st, chain, n, &nx, 2, l330_loader, &bad, err, sizeof err) == 1);
+        TEST_ASSERT(nx == 2 && strstr(err, chain[2].key) && strstr(err, "corrupt"));
+        pulsar_segstore_seg g;
+        TEST_ASSERT(!pulsar_segstore_get(st, chain[2].key, &g));
+        TEST_ASSERT(!pulsar_segstore_get(st, chain[n - 1].key, &g));
+        TEST_ASSERT(pulsar_segstore_get(st, chain[1].key, &g));   /* above it stays */
+        uint64_t left = 0;
+        pulsar_segstore_seg c2[PULSAR_KVCHAIN_MAX];
+        TEST_ASSERT(pulsar_kvchain_find(st, req.data(), req.size(), NULL, 0, 0, c2, PULSAR_KVCHAIN_MAX, &left, err,
+                                        sizeof err) == 2);
+    }
+    pulsar_segstore_close(st);
+    l323_rmdir(dir);
+
+    /* the slice size: segments while their predicted reads fit one prefill chunk's priced time, at least one, and
+     * exactly one while the read meter (pred < 0) or the prefill fit (target 0) has no measurement */
+    const double pred[6] = {100.0, 100.0, 100.0, 250.0, 100.0, 40.0};
+    TEST_ASSERT(server_restore_slice_segments(pred, 0, 6, 300.0) == 3);
+    TEST_ASSERT(server_restore_slice_segments(pred, 3, 6, 300.0) == 1);   /* 250 + 100 > 300 */
+    TEST_ASSERT(server_restore_slice_segments(pred, 4, 6, 300.0) == 2);
+    TEST_ASSERT(server_restore_slice_segments(pred, 3, 6, 100.0) == 1);   /* a segment past the target: alone */
+    TEST_ASSERT(server_restore_slice_segments(pred, 0, 6, 0.0) == 1);
+    TEST_ASSERT(server_restore_slice_segments(pred, 6, 6, 300.0) == 0);
+    const double unmeasured[3] = {-1.0, -1.0, -1.0};
+    TEST_ASSERT(server_restore_slice_segments(unmeasured, 0, 3, 1000.0) == 1);
+    /* the test hook's value: unset = the derived slice, whole ms 1..600000, anything else refuses the start */
+    TEST_ASSERT(server_restore_slice_parse(NULL) == 0 && server_restore_slice_parse("") == 0);
+    TEST_ASSERT(server_restore_slice_parse("250") == 250 && server_restore_slice_parse("600000") == 600000);
+    TEST_ASSERT(server_restore_slice_parse("0") == -1 && server_restore_slice_parse("600001") == -1);
+    TEST_ASSERT(server_restore_slice_parse("-5") == -1 && server_restore_slice_parse("2.5") == -1 &&
+                server_restore_slice_parse("ms") == -1);
+    /* the production shape: 238 segments of a 34.1 GiB chain read at 1.49 GB/s (~103 ms each) against a 2 s chunk:
+     * slices of 19, ~2 s each -- 13 of them, not one 24.6 s stall */
+    {
+        double p[238];
+        for (int i = 0; i < 238; i++) p[i] = 34.1 * 1073741824.0 / 238.0 / 1.49e9 * 1000.0;
+        int nx = 0, slices = 0, kmax = 0;
+        while (nx < 238) {
+            const int k = server_restore_slice_segments(p, nx, 238, 2000.0);
+            kmax = k > kmax ? k : kmax;
+            nx += k;
+            slices++;
+        }
+        TEST_ASSERT(kmax == 19 && slices == 13);
+    }
+
+    /* the reservation from bind: a job restoring a chain of W bytes into its bank reserves what it has not read yet,
+     * so the base an admission reads stays touched-before + W through the whole restore, slice after slice */
+    {
+        const uint64_t q = 13440, T0 = 4172 * q, W = 21000 * q;
+        const uint64_t want[1] = {W};
+        for (int done = 0; done <= 6; done++) {
+            const uint64_t have = (uint64_t)(done < 6 ? done * 4096 : 21000) * q;
+            const uint64_t have1[1] = {have};
+            TEST_ASSERT(server_kv_reserved(T0 + have, want, have1, 1) == T0 + W);
+        }
+        /* a prompt arriving mid-restore that fits only on what is touched does not fit on the reserved base */
+        int k = -1;
+        const uint64_t budget = T0 + W + 1000 * q, p = 2000 * q;
+        const uint64_t have1[1] = {8192 * q};
+        TEST_ASSERT(server_prompt_kv_verdict(T0 + 8192 * q, p, budget, NULL, 0, true, &k) == PROMPT_KV_FITS);
+        TEST_ASSERT(server_prompt_kv_verdict(server_kv_reserved(T0 + 8192 * q, want, have1, 1), p, budget, NULL, 0,
+                                             true, &k) == PROMPT_KV_WAIT);
+    }
+}
+
+static void test_l326_readmit_reserved(void) {
+    const uint64_t tok = 2048, budget = (uint64_t)(2.2 * 6000) * tok;
+    const uint64_t a = 6300 * tok, b = 5966 * tok, c = 6010 * tok;
+    int k = -1;
+    /* C bound, nothing of it touched: the readmission waits for a job to end */
+    const uint64_t want_c[1] = {c}, none[1] = {0};
+    const uint64_t base = server_kv_reserved(a, want_c, none, 1);
+    TEST_ASSERT(base == a + c);
+    TEST_ASSERT(server_prompt_kv_verdict(a, b, budget, NULL, 0, true, &k) == PROMPT_KV_FITS);   /* the defect */
+    TEST_ASSERT(server_prompt_kv_verdict(base, b, budget, NULL, 0, true, &k) == PROMPT_KV_WAIT && k == 0);
+    /* C prefilled and decoding: it holds its prompt, so it reserves nothing more -- still no room beside A and C */
+    const uint64_t have_c[1] = {c + 16 * tok};
+    TEST_ASSERT(server_kv_reserved(a + c + 16 * tok, want_c, have_c, 1) == a + c + 16 * tok);
+    TEST_ASSERT(server_prompt_kv_verdict(a + c + 16 * tok, b, budget, NULL, 0, true, &k) == PROMPT_KV_WAIT);
+    /* C ended: its bank is an idle victim -- B comes back by spilling it */
+    const uint64_t drop_c[1] = {c + 16 * tok};
+    TEST_ASSERT(server_prompt_kv_verdict(a + c + 16 * tok, b, budget, drop_c, 1, true, &k) == PROMPT_KV_SPILL &&
+                k == 1);
+    /* nothing running and no room: the parked decoder is ended by name (REFUSE), never left parked forever */
+    TEST_ASSERT(server_prompt_kv_verdict(base, b, budget, NULL, 0, false, &k) == PROMPT_KV_REFUSE);
+    /* the preemption's own fit (prompt C on A alone after B's KV is freed) reads the same base: it fits */
+    TEST_ASSERT(server_prompt_kv_verdict(server_kv_reserved(a, NULL, NULL, 0), c, budget, NULL, 0, true, &k) ==
+                PROMPT_KV_FITS);
+
+    /* gpuq #473 (preempt-exact, Qwen, 13440 B a token, touched budget 0.15 GiB): only a job whose prompt is not in its
+     * bank yet reserves -- bound with no gen, or prefilling; never a decoder (its per-bank figure lagged the pool's,
+     * 0.02 GiB of phantom reservation that kept B's preemption from fitting) nor a parked or finished one */
+    {
+        session_slot sl;
+        memset(&sl, 0, sizeof sl);
+        gen_state g;
+        memset(&g, 0, sizeof g);
+        int dummy = 0;
+        TEST_ASSERT(!server_slot_reserves(&sl));                       /* no job */
+        sl.active_job = (job *)&dummy;
+        TEST_ASSERT(server_slot_reserves(&sl));                        /* bound, its gen not begun */
+        sl.gen = &g;
+        g.phase = GEN_PREFILL_COLD;
+        TEST_ASSERT(server_slot_reserves(&sl));
+        g.phase = GEN_PREFILL_MAIN;
+        TEST_ASSERT(server_slot_reserves(&sl));
+        g.phase = GEN_DECODE_INIT;
+        TEST_ASSERT(!server_slot_reserves(&sl));
+        g.phase = GEN_DECODE;
+        TEST_ASSERT(!server_slot_reserves(&sl));
+        g.phase = GEN_PREFILL_MAIN;
+        sl.preempted = true;
+        TEST_ASSERT(!server_slot_reserves(&sl));                       /* parked */
+    }
+    /* #473's readmission: A (5726 tokens) parked, W (1841) on bank 0, B (8051) the only other job.  While B
+     * runs, A waits; once B ends its bank is the one idle victim, and A comes back by spilling it -- never refused */
+    const uint64_t q = 13440, bq = 11984 * q, w = 1841 * q, pa = 5726 * q, pb = 8051 * q;
+    TEST_ASSERT(server_prompt_kv_verdict(w + pb, pa, bq, NULL, 0, true, &k) == PROMPT_KV_WAIT);
+    const uint64_t drop_b[1] = {pb};
+    TEST_ASSERT(server_prompt_kv_verdict(w + pb, pa, bq, drop_b, 1, false, &k) == PROMPT_KV_SPILL && k == 1);
+    /* the preemption that made room for B: W + A resident, A (decoding) reserves nothing, A's bank frees */
+    TEST_ASSERT((w + pa) - pa + pb <= bq);
+    /* L328 (2): B on bank 0 once left A no room -- bank 0 was no victim -- and A was refused; bank 0 is a victim like
+     * any idle bank now, so A comes back by spilling it */
+    const uint64_t drop_b0[1] = {pb};
+    TEST_ASSERT(server_prompt_kv_verdict(pb, pa, bq, drop_b0, 1, false, &k) == PROMPT_KV_SPILL && k == 1);
 }
 
 /* L179 branch 11 -- worker_evict_one's slot reset (evict_reset_slot_fields).
@@ -10885,9 +11259,12 @@ static void pulsar_server_unit_tests_run(void) {
     test_l192_tool_history_validation_is_nearest_preceding();
     test_l323_bank_dominated();
     test_l324_kv_dup_census();
-    test_l179_guard_victim_skips_pinned_live_spilled();
+    test_l179_guard_victim_skips_live_spilled();
     test_l179_guard_spill_plan_is_minimum();
     test_l280_prompt_kv_admission();
+    test_l326_readmit_reserved();
+    test_l328_admission_decisions();
+    test_l330_sliced_restore();
     test_l281_prefill_chunk_publishes_the_slot_gauges();
     test_l179_evict_reset_leaves_a_reusable_hole();
     test_l179_mixed_head_cap_drops_only_intermediate_prefill_head();
