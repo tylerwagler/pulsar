@@ -5,8 +5,8 @@
 // back to the smem launcher below the cap, and the n_expert_used==1 fast path
 // needs the <1> instantiation that upstream's switch never emits.  Including the
 // translation unit puts those statics in scope without touching upstream's file,
-// which is the whole point: mmid.cu carries a 9-line __syncwarp fix and nothing
-// else, so re-syncing it stays a copy.
+// which is the whole point: mmid.cu is upstream's file with one line changed (it
+// includes ds4_cuda_env.cuh for common.cuh), so re-syncing it stays a copy.
 //
 // The Makefile filters mmid.cu out of MMQ_SRCS so it is compiled ONLY here --
 // compiling both would duplicate every symbol.
@@ -72,9 +72,10 @@ static __global__ void mm_ids_helper_global(
             }
         } else {
             // Implementation optimized for specific numbers of experts used:
-            static_assert(n_expert_used == 6 || n_expert_used == 10 || warp_size % n_expert_used == 0, "bad n_expert_used");
-            // Padded to next higher power of 2 (the shared-memory helper's rule, mmid.cu; 10 = Qwen's top-10, L284).
-            const int neu_padded = n_expert_used == 6 ? 8 : n_expert_used == 10 ? 16 : n_expert_used;
+            // A warp holds a whole number of token slots: the shared-memory helper's padding (mmid.cu's
+            // mm_ids_pow2, upstream #27978/#29940), so both kernels group lanes identically.
+            constexpr int neu_padded = mm_ids_pow2<n_expert_used_template>::value;
+            static_assert(neu_padded <= warp_size && warp_size % neu_padded == 0, "bad n_expert_used");
             for (int it0 = 0; it0 < n_tokens; it0 += warp_size/neu_padded) {
                 const int it = it0 + threadIdx.x / neu_padded;
 

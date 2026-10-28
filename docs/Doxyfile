@@ -20,7 +20,7 @@ FILE_PATTERNS          = *.h *.hpp *.c *.cpp *.cu *.cuh *.md
 RECURSIVE              = YES
 # VENDORED CODE IS OUT OF SCOPE, and this is a correctness rule rather than a
 # taste one. src/cuda/mmq/VENDOR.md records that mma.cuh, mmid.*, ggml-common.h
-# and the ggml redirect headers are byte-identical to llama.cpp pin 5c0e946 and
+# and the ggml redirect headers are upstream's at llama.cpp pin cf24317b and
 # are therefore "free to replace outright" on a re-sync. Adding our own doc
 # comments to them would destroy exactly that property and turn a clean
 # re-vendor into a merge. ds4_cuda_env.cuh is a derived extract of upstream's

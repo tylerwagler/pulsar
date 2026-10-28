@@ -50,6 +50,19 @@
 > **A re-vendor is now much smaller, and the rename conflict noted below is
 > moot** for `mmq.cuh` and `quantize.cu` — both are deleted.
 
+> ## 2026-10-28 re-sync to `cf24317b` (b11972): what is carried now
+>
+> | file | state against the pin |
+> |---|---|
+> | `mmid.cu` | upstream's file with ONE line changed: `#include "ds4_cuda_env.cuh"` for `common.cuh`.  Our two local patches are retired in favour of upstream's own: the `__syncwarp()` after the store[] writes ("UPSTREAM BUG", ours since 2026-08) is upstream's `ggml_cuda_syncwarp()` from #28475 (`73a43d1f`), and L284's `6 -> 8 / 10 -> 16` padding is upstream's `mm_ids_pow2` from #27978 (`f1793c1c`) + #29940 (`0eb6d9a8`) -- the same padding for every count we launch, so the id maps are byte-identical.  `write_inverse` was already upstream's (#25441). |
+> | `mmid.cuh` | verbatim. |
+> | `ds4_cuda_env.cuh` | gains `ggml_cuda_syncwarp` (upstream's NVIDIA arm).  The other carried helpers (`warp_reduce_sum/any`, `ggml_cuda_memcpy_1`, `ggml_cuda_get_max_cpy_bytes`) were re-read against the pin's `common.cuh`: unchanged on the NVIDIA arm. |
+> | `mma.cuh` (241-line slice) | re-read against upstream: the `tile<I, J, T, DATA_LAYOUT_I_MAJOR>` struct and the `tile<8, 8>` `load_ldmatrix` we keep are unchanged since `5c0e9468`.  Upstream's changes in the window are the new swizzled loaders (#29612), a Volta guard on a trimmed overload and HIP bf16 vector types -- none touches the slice, nothing re-imported. |
+> | `ggml-common.h` extract | `QK8_1` and `iq2xxs_grid` unchanged upstream (the window only adds `block_q2_0` and renames `kvalues_mxfp4`). |
+>
+> `ds4_mmid.cu`'s large-n global twin reads the same `mm_ids_pow2`, so the two kernels pad by one rule.
+> Everything below this box that names `5c0e946` is the history of the first vendor.
+
 This directory contains source files copied verbatim from
 [llama.cpp's `ggml-cuda` backend](https://github.com/ggml-org/llama.cpp/tree/master/ggml/src/ggml-cuda),
 plus a thin ds4-side adapter (`ds4_ggml_stubs.{h,cu}` and `ds4_mmq.{h,cu}`)
@@ -68,9 +81,9 @@ keeps ds4 self-contained at the cost of a periodic re-sync.
 | Field         | Value                                                                                                              |
 |---------------|--------------------------------------------------------------------------------------------------------------------|
 | Source        | https://github.com/ggml-org/llama.cpp                                                                              |
-| Commit        | `5c0e9468378eba6bf3cc1989ff5d62fbbe4d9e3a`                                                                         |
-| Commit date   | 2026-05-14                                                                                                         |
-| Commit title  | `ggml-hexagon: cpy: add contiguous fast-path in reshape copy (#23076)`                                             |
+| Commit        | `cf24317bea431b807dc93319d74c61bed6e20aff` (tag `b11972`; was `5c0e9468` until 2026-10-28)                        |
+| Commit date   | 2026-10-28                                                                                                         |
+| Commit title  | `common, mtmd: bound control vector layer indices and M-RoPE position loops (#31336)`                             |
 | License       | MIT (`LICENSE` at the repository root, copyright "2023-2026 The ggml authors"). Compatible with ds4's MIT license. |
 
 ## File inventory
@@ -190,7 +203,7 @@ Re-vendoring is a **patch-carrying merge**, not a copy.  The procedure:
 
 ```sh
 # 1. Establish the three-way base: the pinned upstream revision.
-PIN=5c0e9468378eba6bf3cc1989ff5d62fbbe4d9e3a
+PIN=cf24317bea431b807dc93319d74c61bed6e20aff
 # 2. For each patched file, extract our delta against the PIN (not master):
 #      diff <pinned copy> <our copy>  > ds4-<file>.patch
 # 3. Drop in the new upstream revision for every file.

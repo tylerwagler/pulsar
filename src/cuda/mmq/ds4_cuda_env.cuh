@@ -202,6 +202,12 @@ static __device__ void no_device_code(
     GGML_UNUSED(no_device_code); // suppress unused function warning
 }
 
+// Upstream's HIP arm is a no-op; the NVIDIA arm is the barrier mmid.cu needs
+// between its shared-memory store[] writes and the cross-lane reads (#28475).
+static __device__ __forceinline__ void ggml_cuda_syncwarp() {
+    __syncwarp();
+}
+
 #ifdef __CUDA_ARCH__
 #define NO_DEVICE_CODE no_device_code(__FILE__, __LINE__, __FUNCTION__, __CUDA_ARCH__, STRINGIZE(__CUDA_ARCH_LIST__))
 #else

@@ -19,6 +19,11 @@ struct mm_ids_helper_store {
 };
 static_assert(sizeof(mm_ids_helper_store) == 4, "unexpected size for mm_ids_helper_store");
 
+// the generic path passes 0, which needs no padding since it never groups lanes by token
+template <int n> struct mm_ids_pow2 { static constexpr int value = 2*mm_ids_pow2<(n + 1)/2>::value; };
+template <>      struct mm_ids_pow2<1> { static constexpr int value = 1; };
+template <>      struct mm_ids_pow2<0> { static constexpr int value = 1; };
+
 // Helper function for mul_mat_id, converts ids to a more convenient format.
 // ids_src1 describes how to permute the flattened column indices of src1 in order to get a compact src1 tensor sorted by expert.
 // ids_dst describes the same mapping but for the dst tensor.
@@ -60,10 +65,9 @@ static __global__ void mm_ids_helper(
         }
     } else {
         // Implementation optimized for specific numbers of experts used:
-        static_assert(n_expert_used == 6 || n_expert_used == 10 || warp_size % n_expert_used == 0, "bad n_expert_used");
-        // Padded to next higher power of 2 (L284: 10 -> 16, Qwen's top-10, which took the one-token-a-step generic
-        // path above: 2.9 ms per 4096-row chunk).
-        const int neu_padded = n_expert_used == 6 ? 8 : n_expert_used == 10 ? 16 : n_expert_used;
+        // a warp holds a whole number of token slots, so the slot count is padded to a power of 2
+        constexpr int neu_padded = mm_ids_pow2<n_expert_used_template>::value;
+        static_assert(neu_padded <= warp_size && warp_size % neu_padded == 0, "bad n_expert_used");
         for (int it0 = 0; it0 < n_tokens; it0 += warp_size/neu_padded) {
             const int it = it0 + threadIdx.x / neu_padded;
 
@@ -95,17 +99,7 @@ static __global__ void mm_ids_helper(
         }
     }
     nex_prev = warp_reduce_sum<warp_size>(nex_prev);
-
-    // ds4 (UPSTREAM BUG): post-Volta independent thread scheduling means the
-    // store[] writes above are done by some warp lanes and read below by other
-    // lanes.  Without an explicit warp barrier those shared-memory writes are
-    // not guaranteed visible to the cross-lane reads, so a lane can read a
-    // stale/uninitialized store[] slot -> wrong compacted expert ids ->
-    // nondeterministic MoE routing.  On GB10 (sm_121) this realized as
-    // cont-multiseq non-determinism + BOS spam (compute-sanitizer racecheck:
-    // "RAW hazard at __shared__" between the store writes and these reads).
-    // Candidate to contribute upstream, which would retire this patch.
-    __syncwarp();
+    ggml_cuda_syncwarp();
 
     for (int itc = threadIdx.x; itc < it_compact; itc += warp_size) {
         const mm_ids_helper_store store_it = store[itc];
