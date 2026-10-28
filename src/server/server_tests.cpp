@@ -9907,6 +9907,7 @@ static void test_l323_bank_dominated(void) {
         s.slots[i].bank = (uint32_t)i;
         s.slots[i].last_serviced_us = slots[i].last_serviced_us;
     }
+    s.slots[0].last_serviced_us = 70;   /* L328: bank 0 is a candidate like any bank -- here not the LRU one */
     bool gdom[PULSAR_SESSION_POOL_CAP] = {false};
     TEST_ASSERT(s.guard_pick_victim(NULL, 0, gdom) == 1);
     gdom[2] = true;
@@ -9923,11 +9924,12 @@ static void test_l323_bank_dominated(void) {
 
 /* L179 branch 7 (i) -- guard_pick_victim on a host-only server (sess NULL:
  * bank_touched_kv_bytes reads 0).
- * Invariant: bank 0 is never a victim; nothing in the live decode set is;
- * unprovisioned, spilled and bound slots are skipped; among the rest the
- * smallest last_serviced_us wins (touched-bytes tie-break, then first
+ * Invariant (L328: bank 0 is a victim like any other bank -- the pool parks on
+ * another resident bank, server_park_pick): nothing in the live decode set is a
+ * victim; unprovisioned, spilled and bound slots are skipped; among the rest
+ * the smallest last_serviced_us wins (touched-bytes tie-break, then first
  * index); no candidate is -1. */
-static void test_l179_guard_victim_skips_pinned_live_spilled(void) {
+static void test_l179_guard_victim_skips_live_spilled(void) {
     server s;
     memset(&s, 0, sizeof s);
     s.n_slots = 5;
@@ -9938,7 +9940,10 @@ static void test_l179_guard_victim_skips_pinned_live_spilled(void) {
         s.slots[i].last_serviced_us = us[i];
     }
     session_slot *dec[2] = {&s.slots[4], &s.slots[3]};
-    /* bank 0 (LRU) is pinned, 3 and 4 are live: LRU of {1, 2} is 2 */
+    /* 3 and 4 are live: LRU of {0, 1, 2} is bank 0 (before L328 it was pinned and 2 was picked) */
+    TEST_ASSERT(s.guard_pick_victim(dec, 2) == 0);
+    /* bank 0 bound: LRU of {1, 2} is 2 */
+    s.slots[0].active_job = (struct job *)&s;
     TEST_ASSERT(s.guard_pick_victim(dec, 2) == 2);
     /* only 2 live: LRU of {1, 3, 4} is 4 */
     dec[0] = &s.slots[2];
@@ -9952,8 +9957,7 @@ static void test_l179_guard_victim_skips_pinned_live_spilled(void) {
     /* a bound one too: nothing left -> -1 */
     s.slots[1].active_job = (struct job *)&s;
     TEST_ASSERT(s.guard_pick_victim(dec, 1) == -1);
-    /* with no decode set slot 2 is idle again and is the only candidate;
-     * bank 0 (still the oldest) is still never picked */
+    /* with no decode set slot 2 is idle again and is the only candidate */
     TEST_ASSERT(s.guard_pick_victim(dec, 0) == 2);
     s.slots[1].active_job = NULL;
     /* tie on last_serviced_us across 1, 2, 3 (touched is 0 for every bank
@@ -9962,9 +9966,15 @@ static void test_l179_guard_victim_skips_pinned_live_spilled(void) {
     s.slots[2].last_serviced_us = us[1];
     s.slots[3].last_serviced_us = us[1];
     TEST_ASSERT(s.guard_pick_victim(dec, 0) == 1);
-    /* a one-slot pool has no victim */
+    /* bank 0 idle again in the tie: it is the first index */
+    s.slots[0].active_job = NULL;
+    s.slots[0].last_serviced_us = us[1];
+    TEST_ASSERT(s.guard_pick_victim(dec, 0) == 0);
+    /* a one-slot pool: bank 0 is the candidate, and the spill finds nowhere to park (server_park_pick -1) */
     s.n_slots = 1;
-    TEST_ASSERT(s.guard_pick_victim(dec, 0) == -1);
+    TEST_ASSERT(s.guard_pick_victim(dec, 0) == 0);
+    const bool one[1] = {true};
+    TEST_ASSERT(server_park_pick(one, 1, 0) == -1);
 }
 
 /* L179 branch 7 (ii) -- guard_maybe_evict's control law (guard_spill_plan).
@@ -10059,15 +10069,41 @@ static void test_l328_admission_decisions(void) {
         g.phase = GEN_FINISH;
         TEST_ASSERT(!server_slot_reserves(&sl));
     }
-    /* (2) gpuq #474, Qwen at 13440 B a token, budget 11984 tokens: B (8051) on bank 0, A (5710) preempted for it --
-     * once B ends bank 0 still holds 8051 and A can never come back: declined.  B on a bank of its own: bank 0 holds
-     * its warmup high-water (4172) and A comes back once B's bank spills: allowed. */
+    /* (2) bank 0 is a spill victim like any other (Tyler, 2026-10-28).  The pool parks while a bank's physical goes:
+     * bank 0 when it is resident and not the one freed, else the lowest other resident bank, -1 when there is none */
     const uint64_t q = 13440, budget = 11984 * q, growth = 16 * q;
-    const uint64_t a = 5710 * q, b = 8051 * q, warm = 4172 * q;
-    TEST_ASSERT(!server_preempt_readmissible(b, a, growth, budget));
-    TEST_ASSERT(server_preempt_readmissible(warm, a, growth, budget));
-    TEST_ASSERT(server_preempt_readmissible(budget - a - growth, a, growth, budget));       /* the edge fits */
-    TEST_ASSERT(!server_preempt_readmissible(budget - a - growth + 1, a, growth, budget));
+    const uint64_t a = 5710 * q;
+    {
+        const bool all[4] = {true, true, true, true};
+        TEST_ASSERT(server_park_pick(all, 4, 2) == 0);         /* a spill of bank 2: parked on bank 0, as before */
+        TEST_ASSERT(server_park_pick(all, 4, 0) == 1);         /* a spill of bank 0 itself: the next resident one */
+        const bool b0_out[4] = {false, false, true, true};      /* bank 0 spilled, bank 1 preempted (no physical) */
+        TEST_ASSERT(server_park_pick(b0_out, 4, 3) == 2);
+        TEST_ASSERT(server_park_pick(b0_out, 4, 2) == 3);
+        const bool last[4] = {false, false, true, false};
+        TEST_ASSERT(server_park_pick(last, 4, 2) == -1);        /* the only resident bank cannot be freed */
+        TEST_ASSERT(server_park_pick(last, 4, 0) == 2);
+    }
+    /* gpuq #474: bank 0 held its warmup high-water (4172 tokens) under W, A (5710) decoded beside it, B (8051) came:
+     * resident 0.12 GiB.  Every idle bank spilled is not room enough (A + B > budget), so A is preempted -- and the
+     * preemption's fit counts the idle bank 0 as room (the re-check spills it), where the pinned bank 0 had kept B
+     * from fitting at all; then B's re-check SPILLs bank 0 and B binds */
+    {
+        const uint64_t warm0 = 4172 * q, b = 8051 * q, frame = (1841 + 8051 + 8051 / 4) * q;   /* LW + 1.25 LB */
+        int k = -1;
+        const uint64_t drop0[1] = {warm0};
+        TEST_ASSERT(server_prompt_kv_verdict(warm0 + a, b, frame, drop0, 1, true, &k) == PROMPT_KV_WAIT);
+        TEST_ASSERT(!server_preempt_fits(warm0 + a, a, 0, b, frame));      /* bank 0 not counted: no fit (the old) */
+        TEST_ASSERT(server_preempt_fits(warm0 + a, a, warm0, b, frame));   /* bank 0 spillable: the preemption fits */
+        TEST_ASSERT(server_prompt_kv_verdict(warm0, b, frame, drop0, 1, true, &k) == PROMPT_KV_SPILL && k == 1);
+        /* the readmission after B ends: B's bank and bank 0 (spilled already, or idle) are victims; A comes back */
+        const uint64_t drop_b[1] = {b};
+        TEST_ASSERT(server_prompt_kv_verdict(b, server_readmit_need(a, 0, growth), frame, drop_b, 1, false, &k) ==
+                    PROMPT_KV_SPILL && k == 1);
+        /* a preemption fit never underflows: freed + idle past the base reads as an empty pool */
+        TEST_ASSERT(server_preempt_fits(a, a, warm0, b, frame));
+        TEST_ASSERT(!server_preempt_fits(a, a, warm0, frame + 1, frame));
+    }
     /* (3) the empty bank with the most resident pages (server_pick_free_bank's rule over the empty ones) */
     {
         const bool taken[4] = {true, false, true, false};   /* banks 1 and 3 are provisioned and empty */
@@ -10076,27 +10112,24 @@ static void test_l328_admission_decisions(void) {
         const bool none[2] = {true, true};
         TEST_ASSERT(server_pick_free_bank(none, resident, 2) == -1);
     }
-    /* (4) preempt-exact's frame (margin 1.25): W 1841, B 8051, A 5405 + 1500, bank 0's warmup high-water 4172.  The
-     * old frame priced bank 0 as W: budget LW + 1.25 LB = 11905 tokens -- but bank 0 holds max(W, 4172), so B alone
-     * did not fit beside it once A was preempted (the "pass" of #463 came through the hole of (1)).  The frame on the
-     * warmup + W + 1.25 LB holds wherever W lands: B fits alone, A + B do not, A's whole run fits alone, A comes back
-     * once B's bank spills, and the preemption is readmissible beside bank 0. */
+    /* (4) preempt-exact's frame (margin 1.25): W 1841, B 8051, A 5405 + 1500, bank 0's warmup high-water 4172 (the
+     * excess touched KV at B's arrival in #474).  With bank 0 a spill victim the frame is LW + 1.25 LB again, and it
+     * holds wherever W lands: on bank 0 under its warmup high-water (fresh server) or on a bank of its own beside
+     * an idle bank 0 -- B fits alone once A is preempted and the idle banks spill, A + B never fit, A's whole run fits
+     * alone, and A comes back once B's bank spills. */
     {
         const uint64_t LW = 1841, LB = 8051, LA0 = 5405, LA = LA0 + 1500, WARM = 4172;
-        const uint64_t old_budget = LW + LB + LB / 4;   /* 1.25 LB */
-        TEST_ASSERT((WARM > LW ? WARM : LW) + LB > old_budget);
-        const uint64_t frame = WARM + LW + LB + LB / 4;
+        const uint64_t frame = LW + LB + LB / 4;
         for (int w_on_0 = 0; w_on_0 < 2; w_on_0++) {
-            /* bank 0, and the rest resident beside A: W under bank 0's high-water, or W on a bank of its own */
-            const uint64_t bank0 = w_on_0 ? (WARM > LW ? WARM : LW) : WARM, rest = w_on_0 ? 0 : LW;
-            TEST_ASSERT(bank0 + rest + LB <= frame);              /* B alone (A preempted) */
-            TEST_ASSERT(bank0 + LA0 + LB > frame);                /* A at arrival + B, every idle bank spilled */
-            TEST_ASSERT(bank0 + rest + LA <= frame);              /* A's whole run alone */
+            /* the idle banks beside A: bank 0 holding max(W, its warmup) -- or the warmup, and W on its own bank */
+            const uint64_t idle = w_on_0 ? (WARM > LW ? WARM : LW) : WARM + LW;
+            TEST_ASSERT(server_preempt_fits((idle + LA0) * q, LA0 * q, idle * q, LB * q, frame * q));   /* B alone */
+            TEST_ASSERT(LA0 + LB > frame);                                    /* A at arrival + B: the preemption */
+            TEST_ASSERT(LA <= frame);                                         /* A's whole run alone */
             int k = -1;
             const uint64_t drop_b[1] = {LB * q};
-            TEST_ASSERT(server_prompt_kv_verdict((bank0 + LB) * q, server_readmit_need(LA0 * q, 0, growth), frame * q,
-                                                 drop_b, 1, false, &k) == PROMPT_KV_SPILL && k == 1);
-            TEST_ASSERT(server_preempt_readmissible(bank0 * q, LA0 * q, growth, frame * q));
+            TEST_ASSERT(server_prompt_kv_verdict(LB * q, server_readmit_need(LA0 * q, 0, growth), frame * q, drop_b, 1,
+                                                 false, &k) == PROMPT_KV_SPILL && k == 1);
         }
     }
     /* (5) the guard preempts beside another decoder or a job holding reserved room, never a lone decoder */
@@ -10344,7 +10377,7 @@ static void test_l326_readmit_reserved(void) {
         sl.preempted = true;
         TEST_ASSERT(!server_slot_reserves(&sl));                       /* parked */
     }
-    /* #473's readmission: A (5726 tokens) parked, W (1841) on the pinned bank 0, B (8051) the only other job.  While B
+    /* #473's readmission: A (5726 tokens) parked, W (1841) on bank 0, B (8051) the only other job.  While B
      * runs, A waits; once B ends its bank is the one idle victim, and A comes back by spilling it -- never refused */
     const uint64_t q = 13440, bq = 11984 * q, w = 1841 * q, pa = 5726 * q, pb = 8051 * q;
     TEST_ASSERT(server_prompt_kv_verdict(w + pb, pa, bq, NULL, 0, true, &k) == PROMPT_KV_WAIT);
@@ -10352,8 +10385,10 @@ static void test_l326_readmit_reserved(void) {
     TEST_ASSERT(server_prompt_kv_verdict(w + pb, pa, bq, drop_b, 1, false, &k) == PROMPT_KV_SPILL && k == 1);
     /* the preemption that made room for B: W + A resident, A (decoding) reserves nothing, A's bank frees */
     TEST_ASSERT((w + pa) - pa + pb <= bq);
-    /* the limit kept on purpose: B on bank 0 (never a victim, spill_bank parks there) leaves A no room -- refused */
-    TEST_ASSERT(server_prompt_kv_verdict(pb, pa, bq, NULL, 0, false, &k) == PROMPT_KV_REFUSE);
+    /* L328 (2): B on bank 0 once left A no room -- bank 0 was no victim -- and A was refused; bank 0 is a victim like
+     * any idle bank now, so A comes back by spilling it */
+    const uint64_t drop_b0[1] = {pb};
+    TEST_ASSERT(server_prompt_kv_verdict(pb, pa, bq, drop_b0, 1, false, &k) == PROMPT_KV_SPILL && k == 1);
 }
 
 /* L179 branch 11 -- worker_evict_one's slot reset (evict_reset_slot_fields).
@@ -11212,7 +11247,7 @@ static void pulsar_server_unit_tests_run(void) {
     test_l192_tool_history_validation_is_nearest_preceding();
     test_l323_bank_dominated();
     test_l324_kv_dup_census();
-    test_l179_guard_victim_skips_pinned_live_spilled();
+    test_l179_guard_victim_skips_live_spilled();
     test_l179_guard_spill_plan_is_minimum();
     test_l280_prompt_kv_admission();
     test_l326_readmit_reserved();

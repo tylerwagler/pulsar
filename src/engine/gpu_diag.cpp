@@ -865,16 +865,25 @@ pulsar_gpu_tensor *gpu_graph_bank_raw_pool(pulsar_gpu_graph *g, uint32_t il) {
 /* Nominal comp/index operand for the batched attention/indexer wrappers. With
  * per-bank split allocations there is no single slab; the batched (descriptor)
  * path addresses banks through the base-pointer table (below), so this returns
- * bank 0's allocation as the nominal typed operand (its per-bank size drives the
- * wrappers' buffer-size validation). Pool disabled → the classic tensor. */
+ * a RESIDENT bank's allocation as the nominal typed operand (every bank's is the
+ * same size, which drives the wrappers' buffer-size validation; the kernels read
+ * through the table).  L328: the lowest resident bank, not bank 0 -- the server
+ * spills bank 0 like any idle bank, and a freed slab is NULL; a step always has
+ * a resident bank (its own rows).  Pool disabled → the classic tensor. */
+static pulsar_gpu_tensor *bank_nominal_slab(pulsar_gpu_tensor *const *per_bank, uint32_t n_banks) {
+    for (uint32_t b = 0; b < n_banks; b++)
+        if (per_bank[b]) return per_bank[b];
+    return NULL;
+}
+
 pulsar_gpu_tensor *gpu_graph_bank_attn_comp_pool(pulsar_gpu_graph *g, uint32_t il) {
     if (!g || il >= PULSAR_N_LAYER) return NULL;
-    return g->banks.n_banks ? g->banks.comp[il][0] : g->layer_attn_comp_cache[il];
+    return g->banks.n_banks ? bank_nominal_slab(g->banks.comp[il], g->banks.n_banks) : g->layer_attn_comp_cache[il];
 }
 
 pulsar_gpu_tensor *gpu_graph_bank_index_comp_pool(pulsar_gpu_graph *g, uint32_t il) {
     if (!g || il >= PULSAR_N_LAYER) return NULL;
-    return g->banks.n_banks ? g->banks.index[il][0] : g->layer_index_comp_cache[il];
+    return g->banks.n_banks ? bank_nominal_slab(g->banks.index[il], g->banks.n_banks) : g->layer_index_comp_cache[il];
 }
 
 /* Per-bank comp/index base-pointer tables (device arrays of n_banks pointers,

@@ -1124,7 +1124,6 @@ int main(int argc, char **argv) {
          * server_guard_touched_budget); a pool with no measured headroom does not start -- unguarded, its banks
          * would grow until the box runs dry */
         s.guard_touched_budget = server_guard_touched_budget(budget, s.guard_eager_bytes, warm_touched, warm_avail);
-        s.guard_warm_touched = warm_touched;
         s.guard_enabled = (s.guard_touched_budget > 0);
         const double gib = 1024.0 * 1024.0 * 1024.0;
         if (!s.guard_enabled) {

@@ -976,18 +976,13 @@ bool server::send_metrics(int fd) {
     buf_printf(&b, "pulsar:kv_eager_floor_bytes %llu\n",
                s->guard_enabled ? (unsigned long long)s->guard_eager_bytes : 0ULL);
     /* L328: the resident KV every guard and admission decision reads, and the base they read it from (touched plus
-     * what the admitted prompts and restoring chains still add), and the warmup's share of it -- bank 0's high-water,
-     * resident for the life of the process (bank 0 is never a spill victim) */
+     * what the admitted prompts and restoring chains still add) */
     buf_puts(&b, "# HELP pulsar:kv_touched_bytes Demand-paged KV resident now, the pool's high-water rows (0 = guard off).\n");
     buf_puts(&b, "# TYPE pulsar:kv_touched_bytes gauge\n");
     buf_printf(&b, "pulsar:kv_touched_bytes %llu\n", kv_touched);
     buf_puts(&b, "# HELP pulsar:kv_reserved_bytes The base every KV admission decision reads: touched plus what admitted prompts and restoring chains still add (L326/L330; 0 = guard off).\n");
     buf_puts(&b, "# TYPE pulsar:kv_reserved_bytes gauge\n");
     buf_printf(&b, "pulsar:kv_reserved_bytes %llu\n", kv_reserved);
-    buf_puts(&b, "# HELP pulsar:kv_warmup_touched_bytes Touched KV at the post-warmup reading: bank 0's warmup high-water, resident for the life of the process (L328; 0 = guard off).\n");
-    buf_puts(&b, "# TYPE pulsar:kv_warmup_touched_bytes gauge\n");
-    buf_printf(&b, "pulsar:kv_warmup_touched_bytes %llu\n",
-               s->guard_enabled ? (unsigned long long)s->guard_warm_touched : 0ULL);
 
     /* plan-31b phase A: whole-box reconciliation -- the signed gap between
      * what the BOX says this process consumed since a post-boot baseline and

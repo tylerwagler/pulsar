@@ -21,7 +21,9 @@ real server on a small model at a small --ctx, with the guard's budget lowered t
              (L326: this phase was L280's WAIT and was not rerun after L314 changed the rule;
              the WAIT arm is now the one for a decoder that cannot be preempted)
   R  REFUSE  a prompt whose KV alone is past the budget: 503 with the numbers, at once; the server keeps serving
-  P  REUSE   chat B asked again (spilled to disk in S) answers exactly as B did cold -- the prefix cache unchanged
+  P  REUSE   chats A and B asked again answer exactly as they did cold -- the one S spilled (L328: bank 0's A, the
+             LRU idle bank, now that bank 0 is a victim like any) comes back from its chain (L330: in slices) -- the
+             prefix cache unchanged
   never      the decode guard's "NO idle victim -- back-pressure" (proceeding past its budget), in any phase; a
              violation names the phase and prints the line with the admission / preempt / guard lines before it.
              KNOWN_L328 was a STRICT expected failure while W reproduced it (gpuq #472: READMITTED 0.0 s after
@@ -191,10 +193,11 @@ try:
     check(rd[0] == 503 and "not enough KV memory" in rd[1], "D refused %s in %.1f s: %s" % (rd[0], time.time() - t0,
                                                                                           rd[1][:200]))
     print("P: reuse == cold", flush=True)
-    rb2 = chat(Bt)
-    check(rb2[0] == 200 and rb2[1] == rb[1] and len(json.loads(rb[1])[1]) > 0,
-          "B again (restored from its spill) answers as B cold, token for token with the same logprobs (%d tokens)"
-          % len(json.loads(rb[1])[1]))
+    for key, text, cold in (("A", A, ra), ("B", Bt, rb)):
+        again = chat(text)
+        check(again[0] == 200 and again[1] == cold[1] and len(json.loads(cold[1])[1]) > 0,
+              "%s again (from its bank or its spill) answers as %s cold, token for token with the same logprobs (%d "
+              "tokens)" % (key, key, len(json.loads(cold[1])[1])))
     txt = open(log).read()
     check(txt.count("kv admission REFUSED") == 1, "one refusal line for the one refused request")
 finally:

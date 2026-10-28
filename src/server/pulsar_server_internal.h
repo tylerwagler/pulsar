@@ -1798,11 +1798,6 @@ struct server {
     bool         guard_enabled;          ///< the proactive-eviction guard is active
     uint64_t     guard_touched_budget;   ///< resident-KV ceiling the guard keeps touched_kv under
     uint64_t     guard_eager_bytes;      ///< eager floor already resident
-    /** L328 (4): the touched KV at the post-warmup reading -- bank 0's warmup high-water (its prefill-cap + 64 prompt
-     *  tokens and decode), which stays resident for the life of the process: bank 0 is never a spill victim and
-     *  only a spill returns pages */
-    uint64_t     guard_warm_touched;
-    warn_limiter preempt_decline_warn;   ///< L328 (2): the declined-preemption line, rate-limited
     uint64_t     guard_evictions;        ///< spills performed, for metrics
     warn_limiter mem_floor_warn;         ///< the per-request MemAvailable-floor refusal line, rate-limited (L190 C1)
     /** Trivial-match threshold for the choose-vs-provision routing decision:
@@ -2369,9 +2364,10 @@ struct server {
      *  a worker turn (gen_begin, GEN_RESTORE_SPILLED); the make-room eviction and the shutdown persist keep what the
      *  spill stored.  The caller saved the outgoing bank (bank_switch).  @return false when it cannot be re-backed. */
     bool bank_unspill(int bank, spilled_history *was);
-    /** L328 (2): what bank 0 -- never a spill victim, so its pages stay resident for good -- holds once `keep`'s
-     *  prompt (adding `need`, when `keep` is bank 0's) and any prompt already bound to it are in. */
-    uint64_t bank0_floor(const session_slot *keep, uint64_t need);
+    /** L328 (2): the bank the pool parks on while bank `except`'s physical is freed (free_physical refuses the
+     *  installed bank): bank 0 when it is resident and not `except`, else the lowest other resident bank
+     *  (server_park_pick over pulsar_session_bank_is_evicted); -1 when there is none -- the move is refused. */
+    int park_bank(int except);
     /** L328 (3): an idle provisioned bank that holds nothing -- a fresh bank already provisioned (the one with the
      *  most resident pages); NULL when there is none. */
     session_slot *empty_bank();
@@ -2399,9 +2395,10 @@ struct server {
      *  its room, so the decoder stays parked until a job ends); a reload that fails fails that request by name.
      *  @return true when one was readmitted (or failed). */
     bool worker_readmit_preempted();
-    /** LRU-idle smallest-frontier victim: NOT bank 0 (pinned), NOT in the live decode
-     * set, no active job, not already spilled. -1 if none.  L323: a slot `dominated`
-     * marks (dominated_slots; NULL = none) goes first.
+    /** LRU-idle smallest-frontier victim: NOT in the live decode set, no active job, not
+     * already spilled; L328: bank 0 is one like any other (the pool parks elsewhere,
+     * park_bank). -1 if none.  L323: a slot `dominated` marks (dominated_slots; NULL =
+     * none) goes first.
      */
     int guard_pick_victim(session_slot **dec, int n, const bool *dominated = nullptr);
     /** Proactive-eviction guard: spill banks to disk until resident KV is back

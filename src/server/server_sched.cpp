@@ -695,7 +695,7 @@ session_slot *server::choose_slot_for_job(job *j, int *reject_ctx,
     /* L328 (3): a provisioned bank that holds nothing IS a fresh bank.  A prompt queued on KV leaves the bank its try
      * provisioned behind, empty, and provisioning another on every retry filled the pool until the make-room eviction
      * took a conversation's bank for it (gpuq #463 / #473 / #474: banks 3..15 provisioned on retries, slot 0 evicted,
-     * B on the pinned bank 0) -- the retry now takes the same bank again. */
+     * B on bank 0) -- the retry now takes the same bank again. */
     session_slot *empty = s->empty_bank();
     /* L280: a fresh bank is preferred to keep the best bank's conversation -- but the prompt's KV lands in it, and
      * when that cannot fit the resident-KV budget even by spilling idle banks (prompt_kv_check on the empty bank),
@@ -2078,6 +2078,13 @@ bool server::spill_bank(session_slot *victim) {
     /* The victim is never spilled (the pick excludes spilled banks), so this
      * never reloads, but the installing state restore can refuse; then the
      * persist below would write ANOTHER bank's history (L190 A4).  Abort. */
+    /* L328 (2): the pool parks on another resident bank while vb's physical goes (bank 0 is a victim like any) */
+    const int park = s->park_bank((int)vb);
+    if (park < 0) {
+        server_log(PULSAR_LOG_WARNING, "pulsar-server: guard: bank %u is the only resident bank -- nowhere to park the "
+                   "pool, spill refused", vb);
+        return false;
+    }
     if (!s->bank_switch((int)vb)) {
         server_log(PULSAR_LOG_WARNING,
                    "pulsar-server: guard: bank %u install failed (state restore refused); "
@@ -2087,8 +2094,8 @@ bool server::spill_bank(session_slot *victim) {
     const double t0 = server_now_sec();
     s->kv_cache_persist(victim, "spill", true);
     pulsar_session_bank_state_save(pool, vb);         /* preserve host carry for restore */
-    if (!pulsar_session_bank_state_restore(pool, 0)) return false;
-    s->live_bank = 0;
+    if (!pulsar_session_bank_state_restore(pool, (uint32_t)park)) return false;
+    s->live_bank = park;
     /* Finding 4: free_physical returns false ONLY on a precondition refusal (nothing
      * freed, bank still live).  A true return means the bank IS evicted (slabs
      * freed), so mark it spilled unconditionally -- no half-evicted state. */
@@ -2150,22 +2157,33 @@ static uint64_t server_kv_reserved(uint64_t touched, const uint64_t *want, const
  * chain's rows not yet read land in the bank slice by slice, so its room is held from bind), or prefilling.  A parked
  * decoder holds nothing until its readmission (that decision's own subject); a decoder's bank holds its prompt -- and
  * its per-bank figure can lag the pool's while it decodes in a batch (gpuq #473: a decoding A read 0.02 GiB short of
- * its prompt, which kept the preemption B needed from fitting, and B ended up on the pinned bank 0). */
+ * its prompt, which kept the preemption B needed from fitting, and B ended up on bank 0). */
 static bool server_slot_reserves(const session_slot *c) {
     if (!c->active_job || c->preempted) return false;
     return !c->gen || c->gen->phase == GEN_RESTORE || c->gen->phase == GEN_PREFILL_COLD ||
            c->gen->phase == GEN_PREFILL_MAIN;
 }
 
-/* L328 (2): can a decoder preempted now ever be readmitted?  Bank 0 is never a spill victim (every guard move parks
- * the pool on it), and a bank's pages leave only with its physical, so what bank 0 will hold (floor0,
- * server::bank0_floor) stays resident for good; every other bank is a victim once its job ends.  The readmission is
- * possible only when the decoder's KV and one quantum's growth fit beside bank 0 alone (gpuq #474: B landed on bank 0
- * with 8051 tokens, A's 5710 were preempted for it, and A's readmission was refused -- "a preempted decode no longer
- * fits the KV budget ... and nothing running can make room").  A preemption that fails this is declined: the prompt
- * waits for the decoder instead. */
-static bool server_preempt_readmissible(uint64_t floor0, uint64_t victim_bytes, uint64_t growth, uint64_t budget) {
-    return floor0 + victim_bytes + growth <= budget;
+/* L328 (2): where the pool parks while a bank's physical is freed (free_physical refuses the installed bank), pure:
+ * bank 0 when it is resident and not the one freed -- what every guard move used before bank 0 could be spilled --
+ * else the lowest other resident bank; -1 when the freed bank is the only resident one (the move is refused).  Any
+ * resident bank serves: parking installs its views and carry and nothing reads it until the next switch, and
+ * DeepSeek's batched launches name a resident bank's slab as their nominal operand
+ * (gpu_graph_bank_attn_comp_pool), reading every bank through the base-pointer table. */
+static int server_park_pick(const bool *resident, int n, int except) {
+    if (n > 0 && resident[0] && except != 0) return 0;
+    for (int b = 1; b < n; b++)
+        if (resident[b] && b != except) return b;
+    return -1;
+}
+
+/* L328 (2): does preempting a decoder of `freed` bytes make a prompt adding `need` fit, pure -- beside the reserved
+ * base, once the idle banks (`idle`, their bytes summed) are spilled too: the re-check after the preemption spills
+ * them (PROMPT_KV_SPILL).  Before bank 0 could be spilled, an idle bank 0 holding the warmup's high-water was no
+ * victim, and this fit ignored every idle bank (gpuq #474: 0.12 GiB resident against W + A's 0.10). */
+static bool server_preempt_fits(uint64_t reserved, uint64_t freed, uint64_t idle, uint64_t need, uint64_t budget) {
+    const uint64_t gone = freed + idle;
+    return (reserved > gone ? reserved - gone : 0) + need <= budget;
 }
 
 /* L328 (5): what a readmission must fit beside the reserved base: the decoder's KV and one decode quantum's growth of
@@ -2184,18 +2202,12 @@ static bool server_guard_may_preempt(int n_decoding, bool reserving) {
     return n_decoding > 1 || reserving;
 }
 
-uint64_t server::bank0_floor(const session_slot *keep, uint64_t need) {
+int server::park_bank(int except) {
     auto *s = this;
-    if (s->pool_banks <= 0 || s->n_slots <= 0) return 0;
-    const session_slot *z = &s->slots[0];
-    uint64_t f = pulsar_session_bank_touched_kv_bytes(s->sess, 0);
-    if (keep == z) return f + need;
-    if (server_slot_reserves(z)) {
-        const int len = z->active_job->req.prompt.len > 0 ? z->active_job->req.prompt.len : 0;
-        const uint64_t want = pulsar_session_quantum_growth_bytes_per_bank(s->sess, (uint32_t)len);
-        if (want > f) f = want;
-    }
-    return f;
+    bool resident[PULSAR_SESSION_POOL_CAP];
+    const int n = s->pool_banks < PULSAR_SESSION_POOL_CAP ? s->pool_banks : PULSAR_SESSION_POOL_CAP;
+    for (int b = 0; b < n; b++) resident[b] = !pulsar_session_bank_is_evicted(s->sess, (uint32_t)b);
+    return server_park_pick(resident, n, except);
 }
 
 uint64_t server::kv_reserved_bytes(const session_slot *except) {
@@ -2218,47 +2230,33 @@ bool server::preempt_newest_decoder(const session_slot *keep, uint64_t need) {
     auto *s = this;
     if (s->pool_banks <= 1 || !s->kv.enabled || !s->kv.dir || pulsar_engine_is_tp(s->engine)) return false;
     bool tried[PULSAR_SESSION_POOL_CAP] = {};
-    /* L328 (2): what bank 0 will hold once `keep`'s prompt is in -- the floor every readmission sits beside */
-    const uint64_t floor0 = s->bank0_floor(keep, keep ? need : 0);
-    const uint64_t growth = pulsar_session_quantum_growth_bytes_per_bank(s->sess, PULSAR_SERVER_DECODE_QUANTUM_TOKENS);
+    /* L328 (2): the idle banks the re-check after a preemption spills -- bank 0 among them -- are room too */
+    uint64_t idle = 0;
+    {
+        int order[PULSAR_SESSION_POOL_CAP];
+        session_slot *self[1] = {(session_slot *)keep};
+        const int n_victims = guard_victim_order(s, self, keep ? 1 : 0, order);
+        for (int k = 0; k < n_victims; k++) idle += pulsar_session_bank_touched_kv_bytes(s->sess, s->slots[order[k]].bank);
+    }
     for (;;) {
-        /* the newest decoder not yet tried -- never bank 0, which every guard move keeps resident (spill_bank
-         * installs it), never an image request's */
+        /* the newest decoder not yet tried, never an image request's */
         session_slot *v = NULL;
-        int stranded = -1;   /* a decoder whose preemption would fit but never come back */
-        for (int i = 1; i < s->n_slots; i++) {
+        for (int i = 0; i < s->n_slots; i++) {
             session_slot *c = &s->slots[i];
             if (c == keep || tried[i] || !slot_is_batchable_decode(c) || c->spilled || c->active_job->req.n_images > 0)
                 continue;
             /* a preemption that does not make the prompt fit only churns (the prompt waits either way) */
             const uint64_t freed = pulsar_session_bank_touched_kv_bytes(s->sess, c->bank);
-            const uint64_t touched = s->kv_reserved_bytes(keep);   /* L326: the admitted jobs' growth included */
-            if ((touched > freed ? touched - freed : 0) + need > s->guard_touched_budget) continue;
-            if (!server_preempt_readmissible(floor0, freed, growth, s->guard_touched_budget)) {
-                stranded = i;
-                continue;
-            }
+            /* L326: the admitted jobs' growth included */
+            if (!server_preempt_fits(s->kv_reserved_bytes(keep), freed, idle, need, s->guard_touched_budget)) continue;
             if (!v || c->gen->t0 > v->gen->t0) v = c;
-        }
-        if (!v && stranded >= 0) {
-            unsigned skipped = 0;
-            if (warn_limiter_due(&s->preempt_decline_warn, server_now_sec(), PULSAR_SERVER_MEM_FLOOR_WARN_SEC,
-                                 &skipped))
-                server_log(PULSAR_LOG_WARNING,
-                           "pulsar-server: preemption of bank %d's decoder DECLINED: its %.2f GiB could never come "
-                           "back beside bank 0's %.2f GiB (never a spill victim; budget %.2f GiB) -- the prompt waits "
-                           "for it (%u lines in the last %.0f s not logged)",
-                           stranded, (double)pulsar_session_bank_touched_kv_bytes(s->sess, s->slots[stranded].bank) /
-                                         (1024.0 * 1024.0 * 1024.0),
-                           (double)floor0 / (1024.0 * 1024.0 * 1024.0),
-                           (double)s->guard_touched_budget / (1024.0 * 1024.0 * 1024.0), skipped,
-                           PULSAR_SERVER_MEM_FLOOR_WARN_SEC);
         }
         if (!v) return false;
         tried[v - s->slots] = true;
         gen_state *g = v->gen;
         if (g->batch_active && !s->batch_leave(v)) continue;   /* the plain batch's sampled token is committed first */
-        if (g->phase != GEN_DECODE || !s->bank_switch((int)v->bank)) continue;
+        const int park = s->park_bank((int)v->bank);   /* L328 (2): where the pool parks while v's physical goes */
+        if (park < 0 || g->phase != GEN_DECODE || !s->bank_switch((int)v->bank)) continue;
         pulsar_session *pool = s->sess;
         const double t0 = server_now_sec();
         const uint64_t bytes = pulsar_session_bank_touched_kv_bytes(pool, v->bank);
@@ -2274,8 +2272,8 @@ bool server::preempt_newest_decoder(const session_slot *keep, uint64_t need) {
         if (fp) ok = fclose(fp) == 0 && ok;
         if (ok) {
             pulsar_session_bank_state_save(pool, v->bank);
-            ok = pulsar_session_bank_state_restore(pool, 0);   /* free_physical refuses the installed bank */
-            if (ok) s->live_bank = 0;
+            ok = pulsar_session_bank_state_restore(pool, (uint32_t)park);   /* free_physical refuses the installed bank */
+            if (ok) s->live_bank = park;
         }
         ok = ok && pulsar_session_bank_free_physical(pool, v->bank);
         if (!ok) {
@@ -2396,16 +2394,18 @@ bool server::worker_readmit_preempted() {
     return true;
 }
 
-/* LRU-idle smallest-frontier victim: NOT bank 0 (pinned), NOT in the live decode
- * set, no active job, not already spilled. -1 if none.  L323: a dominated bank
- * (server::dominated_slots; `dominated` may be NULL) goes before any LRU choice. */
+/* LRU-idle smallest-frontier victim: NOT in the live decode set, no active job,
+ * not already spilled (L328: bank 0 is a victim like any other -- the pool parks
+ * on another resident bank, server::park_bank). -1 if none.  L323: a dominated
+ * bank (server::dominated_slots; `dominated` may be NULL) goes before any LRU
+ * choice. */
 int server::guard_pick_victim(session_slot **dec, int n, const bool *dominated) {
     auto *s = this;
     pulsar_session *pool = s->sess;
     int best = -1;
     bool best_dom = false;
     uint64_t best_us = UINT64_MAX, best_touched = UINT64_MAX;
-    for (int i = 1; i < s->n_slots; i++) {         /* bank 0 pinned */
+    for (int i = 0; i < s->n_slots; i++) {
         session_slot *sl = &s->slots[i];
         if (!sl->provisioned || sl->spilled || sl->active_job) continue;
         bool live = false;
@@ -2499,15 +2499,14 @@ prompt_kv_verdict server::prompt_kv_check(const session_slot *sl, const job *j, 
     const uint64_t want = pulsar_session_quantum_growth_bytes_per_bank(pool, (uint32_t)len);
     const uint64_t have = sl ? pulsar_session_bank_touched_kv_bytes(pool, sl->bank) : 0;   /* NULL: an empty bank */
     *need = want > have ? want - have : 0;
-    /* the victims: every idle bank but the job's own (guard_pick_victim's filter: never bank 0, never a bound or
-     * spilled bank) */
+    /* the victims: every idle bank but the job's own (guard_pick_victim's filter: never a bound or spilled bank) */
     session_slot *self[1] = {(session_slot *)sl};
     const int n_victims = guard_victim_order(s, self, sl ? 1 : 0, order);
     uint64_t drop[PULSAR_SESSION_POOL_CAP];
     for (int k = 0; k < n_victims; k++) drop[k] = pulsar_session_bank_touched_kv_bytes(pool, s->slots[order[k]].bank);
-    /* a bank bound to a job now is a victim once that job ends (bank 0 never is) */
+    /* a bank bound to a job now is a victim once that job ends */
     bool busy = false;
-    for (int i = 1; i < s->n_slots && !busy; i++)
+    for (int i = 0; i < s->n_slots && !busy; i++)
         busy = &s->slots[i] != sl && s->slots[i].provisioned && !s->slots[i].spilled && s->slots[i].active_job;
     /* L326: from the reserved base -- prompts bound earlier in this worker turn have touched nothing yet */
     return server_prompt_kv_verdict(s->kv_reserved_bytes(sl), *need, s->guard_touched_budget, drop, n_victims, busy,
@@ -2611,8 +2610,7 @@ int server::guard_maybe_evict(session_slot *const *dec, int n, session_slot **ke
     if (spilled_this_quantum == n_victims) {
         /* L328 (5): every idle victim is spilled (or there was none) and the breach stands: the newest decoders are
          * preempted through their terminal checkpoints (L314), one at a time while one makes the others' growth fit
-         * -- where that makes progress (server_guard_may_preempt) and the decoder can come back beside bank 0
-         * (preempt_newest_decoder).  Before, the guard proceeded past its budget here whenever every bank was live,
+         * -- where that makes progress (server_guard_may_preempt).  Before, the guard proceeded past its budget here whenever every bank was live,
          * the MemAvailable floor the only backstop (L319 item 2; gpuq #472's "NO idle victim -- back-pressure"). */
         bool reserving = false;
         for (int i = 0; i < s->n_slots && !reserving; i++) reserving = server_slot_reserves(&s->slots[i]);
@@ -2634,8 +2632,8 @@ int server::guard_maybe_evict(session_slot *const *dec, int n, session_slot **ke
                 if (slot_is_batchable_decode(kept[i])) kept[m++] = kept[i];
             n = m;
         }
-        /* What still stands is back-pressure: proceed and let the live floor guard (a lone decoder, or one whose
-         * readmission bank 0 would strand). */
+        /* What still stands is back-pressure: proceed and let the live floor guard (a lone decoder with nothing
+         * bound beside it, or no preemption that makes the rest fit). */
         const uint64_t projected = s->kv_reserved_bytes(NULL) + (uint64_t)n * dpb;
         static uint64_t last_warn_us;
         const uint64_t now_us = (uint64_t)(server_now_sec() * 1e6);
