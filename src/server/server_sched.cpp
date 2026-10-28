@@ -2620,8 +2620,18 @@ int server::guard_maybe_evict(session_slot *const *dec, int n, session_slot **ke
                s->preempt_newest_decoder(NULL, n > 0 ? (uint64_t)(n - 1) * dpb : 0)) {
             int m = 0;
             for (int i = 0; i < n; i++)
-                if (!kept[i]->preempted) kept[m++] = kept[i];
+                if (slot_is_batchable_decode(kept[i])) kept[m++] = kept[i];
             if (m == n) break;   /* the preempted decoder was not in this quantum's set: nothing here moved */
+            n = m;
+        }
+        /* A candidate's batch_leave commits the plain batch's sampled token, and that token can END its decode (a stop,
+         * the budget, a failed step: GEN_FINISH) -- then it was not preempted, and whether or not another was, it must
+         * not ride this quantum: the ENTRY loops read batch_feed_valid, not the phase, and would decode past its end.
+         * The worker's post-quantum pass finishes it. */
+        {
+            int m = 0;
+            for (int i = 0; i < n; i++)
+                if (slot_is_batchable_decode(kept[i])) kept[m++] = kept[i];
             n = m;
         }
         /* What still stands is back-pressure: proceed and let the live floor guard (a lone decoder, or one whose
