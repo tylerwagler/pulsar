@@ -9,7 +9,8 @@
  *   1. pulsar_mx_shared_exp(x) == the exact exponent (the float's IEEE exponent field, which needs no math library),
  *   2. the encode's inverse scale exp2f(-se) is the exact power of two for every se the helper can return
  *      (-127 .. 120: a finite amax is below 2^128).
- * It also prints how often the retired form errs (informational; 7430 floats high, 0 low on GB10, CUDA 13.3) --
+ * It also prints how often the retired form errs (informational; on GB10, CUDA 13.3: 6896 floats high once clamped
+ * as the packer clamped -- 7430 unclamped -- and 0 low) --
  * a low exponent would have been worse, saturating E4M3 past 448.
  * GPU, ~1 s. */
 #include "cuda/pulsar_cuda_mx.cuh"
