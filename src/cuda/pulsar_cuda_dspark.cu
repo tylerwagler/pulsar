@@ -60,9 +60,11 @@ __device__ __forceinline__ static void dspark_w2_load4(const void *w2, uint32_t 
          * 4-byte load.  Stock 38's 33-byte blocks forced five byte loads per
          * lane per i and held this arm at 152 GB/s (L213 round 5); the planes
          * took it to 161 us, 212 GB/s.
-         * v0 is 4-aligned so its four v share one scale.  ldexpf keeps byte 0
-         * (2^-127, an f32 subnormal) exact, as the CPU codec's ldexpf does; the
-         * E4M3 -> f32 hardware conversion is exact. */
+         * v0 is 4-aligned so its four v share one scale.  ldexpf is exact for
+         * bytes 1..254; byte 0 (2^-127, an f32 subnormal) is flushed to 0 by
+         * this TU's --use_fast_math (-ftz, measured 2026-10-28), as every
+         * custom E8M0 decode is, where the CPU codec keeps it -- a group of
+         * values below 448 x 2^-127.  The E4M3 -> f32 conversion is exact. */
         const uint8_t *sc  = (const uint8_t *)w2;
         const uint8_t *pay = sc + (uint64_t)embed_dim * (vocab_size >> 5);
         const float scale = ldexpf(1.0f, (int)sc[(uint64_t)i * (vocab_size >> 5) + (v0 >> 5)] - 127);
