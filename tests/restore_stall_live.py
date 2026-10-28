@@ -157,7 +157,9 @@ class RestoreStallLeg(Leg):
             return
         w0, w1 = min(win) - 0.05, max(win) + 0.05
         stamps = d.get("stamps", [])
-        gaps_in = [b - a for a, b in zip(stamps, stamps[1:]) if b >= w0 and a <= w1]
+        # the gaps wholly inside the window: the slices and the decode rounds between them (the gap that runs on into
+        # the prompt's first prefill chunk after the restore is the prefill's, not the restore's)
+        gaps_in = [b - a for a, b in zip(stamps, stamps[1:]) if a >= w0 and b <= w1]
         gaps_out = [b - a for a, b in zip(stamps, stamps[1:]) if b < w0 or a > w1]
         stall_max = mt1.get("pulsar:kv_restore_stall_max_seconds", 0.0)
         bound = stall_max + max(0.5, 4.0 * pct(gaps_out, 50))
