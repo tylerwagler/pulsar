@@ -118,11 +118,12 @@ using GElemD  = typename GGemm::EpilogueOutputOp::ElementOutput;
 
 // ---- device activation packer: f32 [M,K] RowMajor -> A data (E4M3, 1 byte/elem) + SF (swizzled UE8M0).
 // W4A8: activations are MXFP8 (E4M3) with a DYNAMIC per-32-element UE8M0 block scale, matching the
-// DeepSeek-V4-Flash source scheme (activation_scheme dynamic, fmt e4m3, scale_fmt ue8m0). The scale
-// exponent convention mirrors the engine's cuBLASLt MXFP8 packer (mxfp8_quant_act_kernel): se =
-// floor(log2(amax)) - 7, data = v * 2^-se, SF byte = se+127; CUTLASS reconstructs v = data*2^(se-127+127-... )
-// i.e. data * 2^(SF-127) = v exactly. The SF is written through the CUTLASS tile-atom SFA layout object
-// (identical swizzle to the weight SFB), NOT the cuBLASLt VEC32 swizzle. ----
+// DeepSeek-V4-Flash source scheme (activation_scheme dynamic, fmt e4m3, scale_fmt ue8m0). The shared
+// exponent is pulsar_mx_shared_exp's (pulsar_cuda_mx.cuh: floor(log2(amax)) - 7, read off frexpf -- a
+// re-derived floorf(log2f()) here is lg2.approx under --use_fast_math and one binade too high for the ~29
+// floats below each power of two), data = v * 2^-se, SF byte = se+127, so data * 2^(SF-127) reconstructs v.
+// The SF is written through the CUTLASS tile-atom SFA layout object (identical swizzle to the weight SFB),
+// NOT the cuBLASLt VEC32 swizzle. ----
 
 
 /* SwiGLU with the E4M3+E8M0 epilogue: one warp = four consecutive 32-blocks
@@ -158,8 +159,7 @@ __global__ void swiglu_pack_e4m3_warp_kernel(uint8_t *A_data, TSFA tSFA,
   mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, 2));
   mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, 4));
 
-  int se=-127; if(mx>0.f){ int e=(int)floorf(log2f(mx)); se=e-7; }
-  if(se<-127)se=-127; if(se>127)se=127;
+  const int se=pulsar_mx_shared_exp(mx);
   const float inv=exp2f((float)-se);
 
   cutlass::float_e4m3_t ob[4];

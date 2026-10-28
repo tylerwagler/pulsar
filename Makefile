@@ -288,7 +288,8 @@ pulsar-agent: $(AGENT_OBJS) src/lib/pulsar_help.o src/lib/pulsar_kvtext.o src/li
 CUDA_REGRESSION_BINS = tests/cuda_long_context_smoke tests/moe_route_bounds_gate tests/expert_table_gate \
                        tests/exl3_moe_epilogue_gate tests/exl3_dense_gate tests/exl3_moe_prefill_gate tests/exl3_half_gate \
                        tests/gdn_gate tests/qsa_attn_gate tests/qsa_yarn_test tests/qwen_s4_gate tests/router_gate tests/gqa_attn_gate tests/sconv_gate tests/head_gate \
-                       tests/bf16_rows_gate tests/nvfp4_rows_gate tests/mamba2_gate tests/rowops_gate tests/arch_gate tests/pool_gate tests/f16_rows_gate tests/fmha_gate
+                       tests/bf16_rows_gate tests/nvfp4_rows_gate tests/mamba2_gate tests/rowops_gate tests/arch_gate tests/pool_gate tests/f16_rows_gate tests/fmha_gate \
+                       tests/mx_exp_gate
 # 2026-10-14: they run CONCURRENTLY, each one's output kept together (-O).  They are model-free and mostly
 # host-bound (their references run on the CPU: measured alone, 258 s in series, the longest 114 s of which 113 s
 # user time), so in series they were 258 s of the battery's serial front.  No gate here grades a time.
@@ -848,6 +849,15 @@ tests/pool_gate: tests/pool_gate.cu src/cuda/pulsar_cuda_pool.o src/cuda/pulsar_
 .PHONY: pool-gate
 pool-gate: tests/pool_gate
 	./tests/pool_gate
+
+# The MX shared exponent (pulsar_mx_shared_exp) exact on every positive normal float under the engine's fast-math
+# flags, and its encode scale exact (model-free; the upstream-intake audit, 2026-10-28).
+tests/mx_exp_gate: tests/mx_exp_gate.cu src/cuda/pulsar_cuda_mx.cuh Makefile
+	$(NVCC) $(NVCCFLAGS) -std=c++17 -Isrc -o $@ tests/mx_exp_gate.cu
+
+.PHONY: mx-exp-gate
+mx-exp-gate: tests/mx_exp_gate
+	./tests/mx_exp_gate
 
 # L321: lanes that exist only for some devices decide by the DEVICE, not the compiled arch (model-free).
 tests/arch_gate: tests/arch_gate.cu Makefile src/pulsar_gpu.h src/cuda/pulsar_cuda_arch.cuh src/cuda/mmq/ds4_mmq.h \

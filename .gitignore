@@ -190,6 +190,7 @@ tests/dspark_batch_gate
 /tests/pool_gate
 /tests/f16_rows_gate
 /tests/fmha_gate
+/tests/mx_exp_gate
 /tests/rowops_gate
 /tests/qwen_chat_gate
 /tests/inkling_chat_gate
