@@ -4,17 +4,33 @@
  *
  * Inputs are zero-weight containers made by tests/qwen_family_container.py
  * from the HF checkpoint's own headers and config (the container contract,
- * family_qwen.h section 2): good.safetensors plus four mutants the loader must
- * refuse by name (arch, shape, tensor, layer-type).  Nothing reads a weight.
+ * family_qwen.h section 2): good.safetensors plus six mutants the loader must
+ * refuse by name (arch, shape, tensor, layer-type, s4-format, ple-rows).
  *
  *   ./tests/qwen_family_gate DIR          host part (no GPU needed)
  *   ./tests/qwen_family_gate DIR --gpu    + a real session on the device
  *
  * The --gpu part opens the container for inspection and then initialises the
- * device on that engine by hand: the skeleton's session needs no weights on
- * the GPU (every op refuses before any runs), and staging 234 GiB of sparse
- * zeros would measure nothing. */
+ * device on that engine by hand, registering the container's descriptors for
+ * its mappings as open_stage does (register_model_fds): the forward's first
+ * touch of each tensor stages it through the production fd route (O_DIRECT
+ * where the filesystem gives it, each chunk's pages dropped after its copy).
+ * Unregistered, the runtime took the synthetic-mapping device copy -- a memcpy
+ * from the mmap -- and the ~61 GiB of zeros the forward touches went through
+ * the page cache as mapped pages and stayed there beside their device copy:
+ * the reclaim drove memory PSI past systemd-oomd's 50 %-for-20 s on Sparky
+ * (L329, gpuq #477 / #478 / #481).  What the forward adds to the fixture's
+ * page-cache residency is asserted, so that route cannot come back unseen.
+ *
+ * The bind itself reads a few bytes of every routed expert (read-around makes
+ * that ~6 GiB of page cache per container that binds -- good, tensor,
+ * s4-format, ple-rows); the gate drops each container's pages once its engine
+ * is closed, so the host part leaves none of them behind the device part. */
 #include "pulsar_engine_internal.h"
+
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <unistd.h>
 
 #include <stdarg.h>
 #include <stdio.h>
@@ -42,6 +58,31 @@ static pulsar_engine *open_inspect(const char *path) {
     pulsar_engine *e = NULL;
     if (pulsar_engine_open(&e, &opt) != 0) return NULL;
     return e;
+}
+
+/* The bytes of the container's mappings resident in the page cache (mincore on its shared file mappings);
+ * UINT64_MAX when mincore refuses (the caller's check fails it). */
+static uint64_t fixture_resident_bytes(const pulsar_model *m) {
+    const uint64_t pg = (uint64_t)sysconf(_SC_PAGESIZE);
+    uint64_t resident = 0;
+    for (uint64_t i = 0; i < m->n_shards; i++) {
+        const uint64_t pages = (m->shard_size[i] + pg - 1) / pg;
+        unsigned char *vec = (unsigned char *)xmalloc((size_t)pages);
+        const bool ok = mincore((void *)m->shard_map[i], (size_t)m->shard_size[i], vec) == 0;
+        for (uint64_t p = 0; ok && p < pages; p++) resident += vec[p] & 1u;
+        free(vec);
+        if (!ok) return UINT64_MAX;
+    }
+    return resident * pg;
+}
+
+/* A closed container's page cache dropped (its mapping is gone, so the clean pages go at once): the gate's own
+ * hygiene between containers, nothing the engine does. */
+static void drop_fixture_pages(const char *path) {
+    const int fd = open(path, O_RDONLY);
+    if (fd < 0) return;
+    (void)posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED);
+    (void)close(fd);
 }
 
 static void host_part(const char *dir) {
@@ -109,6 +150,7 @@ static void host_part(const char *dir) {
         check(miss && !strcmp(miss, "head"), "no head -> the walk names the head last");
     }
     pulsar_engine_close(e);
+    drop_fixture_pages(path);
 
     static const char *const mutants[] = { "arch", "shape", "tensor", "layer-type", "s4-format", "ple-rows" };
     for (size_t i = 0; i < sizeof(mutants) / sizeof(mutants[0]); i++) {
@@ -117,6 +159,7 @@ static void host_part(const char *dir) {
         pulsar_engine *m = open_inspect(path);
         check(m == NULL, "mutant '%s' refused", mutants[i]);
         if (m) pulsar_engine_close(m);
+        drop_fixture_pages(path);
     }
 }
 
@@ -135,6 +178,17 @@ static void gpu_part(const char *dir) {
         pulsar_engine_close(e);
         return;
     }
+    /* the production staged route: every shard's fd for its mapping, as open_stage registers them */
+    bool fds = e->model.n_shards > 0;
+    for (uint64_t i = 0; fds && i < e->model.n_shards; i++)
+        fds = pulsar_gpu_set_model_fd_for_map(e->model.shard_fd[i], e->model.shard_map[i]) != 0;
+    check(fds, "the container's %llu shard fd(s) registered for their mappings (the staged fd route)",
+          (unsigned long long)e->model.n_shards);
+    if (!fds) {
+        pulsar_engine_close(e);
+        return;
+    }
+    const uint64_t resident_at_bind = fixture_resident_bytes(&e->model);   /* the bind's own reads */
     e->prefill_chunk = 4096;
     /* The session at Tyler's KV target, priced by the create run dry (the fixture has no MTP layer). */
     {
@@ -209,6 +263,19 @@ static void gpu_part(const char *dir) {
         free(l0);
     }
     free(logits);
+    /* L329: the forward staged the container's tensors through the fd route, which leaves none of their pages in the
+     * page cache; the mmap-copy route left every staged byte there (~61 GiB beside its device copy).  The bound is on
+     * what the forward ADDED to the bind's residency. */
+    {
+        const uint64_t res = fixture_resident_bytes(&e->model);
+        const uint64_t bound = 1ull << 30;
+        const bool measured = res != UINT64_MAX && resident_at_bind != UINT64_MAX;
+        const uint64_t added = measured && res > resident_at_bind ? res - resident_at_bind : 0;
+        check(measured && added <= bound, "the forward added %.1f MiB to the fixture's page cache (%.1f MiB at bind, "
+              "bound %.0f MiB: staged through the fd, not paged in through the mapping)",
+              measured ? (double)added / 1048576.0 : -1.0,
+              measured ? (double)resident_at_bind / 1048576.0 : -1.0, (double)bound / 1048576.0);
+    }
     /* L272 P1 S3: Qwen speculates through the round API -- the family declares CAP_SPEC and its verify hooks;
      * whether rounds run is the drafter's call, and the fixture carries no MTP sidecar (qwen_family_container.py
      * skips those tensors), so this engine has none. */
