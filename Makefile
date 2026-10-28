@@ -974,9 +974,11 @@ exl3-dequant-gate: tests/exl3_dequant_gate
 # L251 S1: the Qwen4-exp family skeleton -- load, layer plan, weight bind,
 # session-state sizing at the 1.5-2M-token target, and the by-name refusal of
 # every step -- over ZERO-WEIGHT containers made from the HF checkpoint's own
-# headers and config (tests/qwen_family_container.py: sparse files, no weight
-# byte is read), plus four mutants the loader must refuse by name.
-# qwen-family-gate-device adds a real session on the GPU (the battery's entry).
+# headers and config (tests/qwen_family_container.py: sparse files, the bodies
+# holes), plus six mutants the loader must refuse by name.
+# qwen-family-gate-device adds a real session on the GPU (the battery's entry):
+# an 8-token forward that stages the ~61 GiB of zeros it touches through the
+# production fd route, never the page cache (L329: tests/qwen_family_gate.cpp).
 QWEN_HF_DIR   ?= /mnt/models/hub/models--Qwen--Qwen3.8-Flash-Next/snapshots/de4b8e4d43b917e7706784d8bb445c9af86a3540
 QWEN_GATE_DIR ?= /var/tmp/qwen-family-gate-$(USER)
 # The adaptive draft depth rule (src/engine/spec_depth.h), shared by DSpark and the Qwen MTP drafter.
