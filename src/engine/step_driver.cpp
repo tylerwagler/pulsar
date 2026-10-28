@@ -30,6 +30,7 @@ const char *pulsar_driver_first_missing(const pulsar_driver_ops *ops, const puls
             return "block";
         }
     }
+    if (!ops->read_ahead != !ops->read_ahead_pool) return "read_ahead_pool";   /* L329 (b2): the two come together */
     return ops->head ? NULL : "head";
 }
 

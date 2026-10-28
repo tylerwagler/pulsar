@@ -553,6 +553,32 @@ int  pulsar_engram_gather_wait(pulsar_engram_gather *g);
  *  nothing waits on it): the later gather reads the same bytes, faster.  A hint -- it changes no bytes and a
  *  failed read is the later gather's to report. */
 void pulsar_engram_prefetch(pulsar_engram_io *io, const pulsar_engram_table *t, const uint64_t *rows, uint32_t n_rows);
+/** L329 (b2): the pool's BACKGROUND readers -- at most this many read ahead at once, and only while no gather or
+ *  prefetch is queued or being read (engram.cpp has the priority rule).  16 cold reads in flight (~150 us each on the
+ *  NVMe) read a 4096-token chunk's 65,536 rows in ~0.6 s, inside the ~2.4 s that chunk computes (L329 window #476),
+ *  and leave 48 of the 64 threads idle for the next decode gather. */
+#define PULSAR_ENGRAM_AHEAD_READERS 16u
+/** L329 (b2): the most read-ahead rows a pool holds queued and unread -- four 4096-token chunks of Qwen PLE rows
+ *  (16 a token).  A cold row costs about one 4 KB page of cache (0.94 distinct rows per page, L329 (b)), so the
+ *  read-ahead never has more than ~1 GiB of reads outstanding; a read-ahead that would pass it is refused whole. */
+#define PULSAR_ENGRAM_AHEAD_PENDING_MAX (4ull * 4096ull * 16ull)
+/** L329 (b2): MemAvailable must exceed this plus the pool's unread cap (a page a row) for a read-ahead to be queued (else it is
+ *  skipped and counted): under memory pressure the page cache it would fill is the reclaim the box is already
+ *  doing, so the read-ahead stands down rather than add to it.  8 GiB = twice the server's live floor
+ *  (PULSAR_SERVER_MEM_FLOOR_BYTES) and well above where systemd-oomd's pressure kill and earlyoom act. */
+#define PULSAR_READ_AHEAD_MEM_HEADROOM (8ull << 30)
+/** L329 (b2): warm the page cache with rows a LATER gather will read -- the next prompt chunk's -- on the pool's
+ *  background class: below every gather and prefetch, at most PULSAR_ENGRAM_AHEAD_READERS readers, each row into a
+ *  throwaway buffer.  A hint: it changes no byte any gather returns.  `tag` names the issuer for the cancel.  Returns
+ *  the rows queued (0 on a bad argument). */
+uint32_t pulsar_engram_read_ahead(pulsar_engram_io *io, const pulsar_engram_table *t, const uint64_t *rows,
+                                  uint32_t n_rows, uint64_t tag);
+/** L329 (b2): count a read-ahead not queued for memory pressure (pulsar_read_ahead_admit). */
+void pulsar_engram_read_ahead_skipped(pulsar_engram_io *io);
+/** L329 (b2): drop the rows of `tag`'s read-aheads no reader has taken yet (rows in flight finish).  Returns them. */
+uint32_t pulsar_engram_read_ahead_cancel(pulsar_engram_io *io, uint64_t tag);
+/** L329 (b2): the background class's counters since the pool started (pulsar.h pulsar_read_ahead_stats). */
+void pulsar_engram_read_ahead_stats(pulsar_engram_io *io, pulsar_read_ahead_stats *out);
 
 /** ---- Engram on the DeepSeek forward (L242 slice 5; L269 W2) ------------------
  *
@@ -2532,6 +2558,12 @@ struct pulsar_session {
     void *display_progress_ud;             ///< user data for display_progress
     pulsar_session_cancel_fn cancel;       ///< cooperative cancellation hook, polled at safe points only
     void *cancel_ud;                       ///< user data for cancel
+    /** L329 (b2): the prompt a sync's read-ahead follows (pulsar_session_set_prefill_ahead; borrowed for one sync),
+     *  NULL = the sync's own */
+    const pulsar_tokens *prefill_ahead;
+    /** L329 (b2): each bank's read-ahead record (pulsar_read_ahead_plan), [n_ahead], grown on first use */
+    struct pulsar_read_ahead_mark *ahead;
+    uint32_t n_ahead;
     uint32_t prefill_cap;                  ///< max tokens per prefill chunk for this session
     int ctx_size;                          ///< allocated context length, in tokens
     bool checkpoint_valid;                 ///< false when `checkpoint` no longer describes the graph's KV (forces a rebuild on the next sync)
@@ -3485,6 +3517,33 @@ struct pulsar_prefill_walk {
     bool (*stop)(void *ud);
     void *ud;
 };
+/** L329 (b2): what a bank's prompt read-ahead has queued -- the rows of prompt[from, to), decided by the tokens
+ *  [from - 2, to) (the n-gram reaches two back) whose FNV-1a is `hash`.  from == to = nothing queued. */
+struct pulsar_read_ahead_mark {
+    uint32_t from, to;
+    uint64_t hash;
+};
+/** L329 (b2): THE read-ahead rule (prefill_loop.cpp), a pure function of the bank's record and the call: a prefill
+ *  has rows to `run_end` of prompt[0, len) in flight; the rows to read ahead are [*from, *to) within [run_end,
+ *  run_end + window) (window = the prefill chunk): not those `mark` already queued for the same tokens, and nothing
+ *  when that adds less than window / 2 short of the prompt's end.  *drop: the record is for other tokens (or
+ *  behind the run) -- its queued rows are dropped first.  Returns true when [*from, *to) is to be queued; the caller
+ *  then records *next as the bank's mark.  Pure, so the host test drives it (pulsar_test --read-ahead). */
+bool pulsar_read_ahead_plan(const pulsar_read_ahead_mark *mark, const int *prompt, uint32_t len, uint32_t run_end,
+                            uint32_t window, uint32_t *from, uint32_t *to, bool *drop, pulsar_read_ahead_mark *next);
+/** L329 (b2): may a read-ahead be queued with MemAvailable at `mem_available` bytes (0 = unreadable: fail closed)?
+ *  Only above PULSAR_READ_AHEAD_MEM_HEADROOM plus the pool's whole unread cap at a page a row (~9 GiB).  Pure
+ *  (pulsar_test --read-ahead). */
+bool pulsar_read_ahead_admit(uint64_t mem_available);
+/** L329 (b2): MemAvailable from /proc/meminfo in bytes, 0 when unreadable (read once per arm, never per row). */
+uint64_t pulsar_read_ahead_mem_available(void);
+/** L329 (b2): the session's read-ahead for `bank` (pulsar.h pulsar_session_prompt_read_ahead, which is this) and its
+ *  cancel -- the bank's queued rows dropped, its record cleared (pulsar_session_family_invalidate, the walk).  It
+ *  runs ONLY for a served prompt: `prompt` is the one a server named (the fused lane's call, or the sync's
+ *  pulsar_session_set_prefill_ahead); NULL -- every sync nobody licensed (a CLI, a gate, imatrix, a tool sync) --
+ *  reads nothing ahead. */
+uint32_t pulsar_session_read_ahead(pulsar_session *s, uint32_t bank, const pulsar_tokens *prompt, uint32_t run_end);
+void pulsar_session_read_ahead_cancel(pulsar_session *s, uint32_t bank);
 /** Run the walk over [start, end): 0 when it reached `end`, PULSAR_SESSION_SYNC_INTERRUPTED when `stop`
  *  said so at a chunk boundary (the device drained), 1 when a hook failed or a cut was out of range. */
 int pulsar_prefill_walk_run(const pulsar_prefill_walk *w, uint32_t start, uint32_t end);

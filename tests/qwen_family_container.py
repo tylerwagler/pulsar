@@ -14,7 +14,8 @@ the engine's Qwen family binds (src/engine/family_qwen.h section 2):
   theirs at load: routed experts exl3m_k4 -- the fused gate_up and the down as
   3-D stacks --, the shared expert and the PLE projections exl3m_k5, the
   per-layer GR low-rank mxfp8_lt; every other tensor bf16, S2's / S3's until
-  their ops land).  The data region is a hole: nothing reads it at --inspect.
+  their ops land).  The data region is a hole: what the bind reads of it (a few
+  bytes per routed expert) and what the gate's device forward stages are zeros.
   Beside it, a SPARSE PLE row file (PENGRAM1 v2 header, the n-gram table's row
   count, a hole for the rows) that pulsar.ple_rows.* names -- the S4 load opens
   and header-checks it, and nothing gathers from it.

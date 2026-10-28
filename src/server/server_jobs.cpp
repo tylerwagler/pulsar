@@ -1081,10 +1081,14 @@ void server::gen_step_prefill(session_slot *sl) {
     g->prefill_chunks_done = 0;
     g->prefill_last_current = -1;
     g->prefill_total = 0;
+    /* L329 (b2): the sync reads the next chunk's PLE rows ahead along the whole request, past a cold-store or a
+     * share_mark cut too (the chunk after the cut is the next sync's first) */
+    pulsar_session_set_prefill_ahead(s->sess, g->prompt_for_sync);
     const int rc = n_images > 0
         ? pulsar_session_sync_mm(s->sess, target, g->j->req.images, n_images,
                                  g->err, sizeof(g->err))
         : pulsar_session_sync(s->sess, target, g->err, sizeof(g->err));
+    pulsar_session_set_prefill_ahead(s->sess, NULL);
     pulsar_tokens_free(&to_cut);
     if (rc == PULSAR_SESSION_SYNC_INTERRUPTED) {
         if (gen_client_disconnected(g->j->fd)) {

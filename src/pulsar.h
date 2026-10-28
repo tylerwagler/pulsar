@@ -622,6 +622,40 @@ void pulsar_session_set_display_progress(pulsar_session *s, pulsar_session_progr
  * safe boundaries where the live checkpoint is either unchanged or represents a
  * valid token prefix, and returns PULSAR_SESSION_SYNC_INTERRUPTED when it stops. */
 void pulsar_session_set_cancel(pulsar_session *s, pulsar_session_cancel_fn fn, void *ud);
+/** L329 (b2): license the next sync's read-ahead: `prompt` is the request a SERVER is prefilling (the whole of it,
+ *  past a cold-store or shared-prefix cut, so the chunk after the cut is read ahead too).  Borrowed: set right before
+ *  the sync, cleared (NULL) right after.  NULL -- the default, and every sync no server licensed (the CLI, the gates,
+ *  imatrix, tool syncs) -- reads nothing ahead.  A hint only (the read-ahead warms the page cache, the gather reads
+ *  the bytes): a prompt that differs reads rows nobody gathers. */
+void pulsar_session_set_prefill_ahead(pulsar_session *s, const pulsar_tokens *prompt);
+/** L329 (b2): a prefill of `bank` has rows up to `run_end` of `prompt` in flight (a fused step's prompt run, a
+ *  sync's chunk): read ahead the rows of the prompt's next chunk -- [run_end, run_end + the prefill chunk) -- on the
+ *  disk table's background readers, so that chunk's gather finds them in the page cache.  The family's prefill
+ *  must read a disk-resident row table (Qwen's PLE); 0 otherwise.  One record per bank keeps the depth to one chunk
+ *  ahead: rows already queued for the same tokens are not queued again, a call that adds less than half a chunk
+ *  (short of the prompt's end) waits for the next, and a bank whose prompt changed drops its old rows.  Returns the
+ *  tokens whose rows were queued.  Bounded: the pool holds at most PULSAR_ENGRAM_AHEAD_PENDING_MAX unread rows (an
+ *  arm past it is refused, counted), and nothing is queued while MemAvailable is under the read-ahead's headroom
+ *  (skipped, counted).  A licensed sync's walk calls it per chunk itself (pulsar_session_set_prefill_ahead; and
+ *  pulsar_session_invalidate drops the bank's rows); a server that prefills by other steps -- the fused lane --
+ *  calls it per step.  Only a server serving `prompt` calls it. */
+uint32_t pulsar_session_prompt_read_ahead(pulsar_session *s, uint32_t bank, const pulsar_tokens *prompt, int run_end);
+/** L329 (b2): the read-ahead's counters since the engine opened (the disk table's background class). */
+typedef struct {
+    uint64_t issued;          ///< read-aheads queued
+    uint64_t rows_queued;     ///< rows they asked for
+    uint64_t rows_read;       ///< rows read into the page cache
+    uint64_t rows_failed;     ///< rows whose read failed (the later gather reports its own)
+    uint64_t rows_cancelled;  ///< rows dropped before a reader took them (a bank's prompt changed or was invalidated)
+    uint64_t rows_refused;    ///< rows not queued: the pool already held its cap of unread rows (bounded bytes)
+    uint64_t skipped;         ///< read-aheads not queued: MemAvailable below the read-ahead's headroom (memory pressure)
+    uint64_t bytes_read;
+    uint64_t read_ns;         ///< reader wall time on read-ahead rows, summed over the readers
+    uint64_t rows_pending;    ///< rows queued now, not yet taken
+    uint32_t in_flight;       ///< read-ahead rows being read now
+} pulsar_read_ahead_stats;
+/** false = the loaded family reads no disk row table during prefill (nothing is read ahead); *out zeroed. */
+bool pulsar_engine_read_ahead_stats(pulsar_engine *e, pulsar_read_ahead_stats *out);
 
 /** Synchronize the live session to a full prompt token prefix.  If the current
  * checkpoint is a prefix, the prompt is evaluated from the bank's latest

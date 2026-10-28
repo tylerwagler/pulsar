@@ -1297,6 +1297,8 @@ uint64_t pulsar_engine::demand_paged_bytes_per_bank(int ctx_size) {
 void pulsar_session::destroy() {
     auto *s = this;
     if (!s) return;
+    for (uint32_t b = 0; b < s->n_ahead; b++) pulsar_session_read_ahead_cancel(s, b);   /* L329 (b2) */
+    free(s->ahead);
     s->engine->family->session->destroy(s);
     token_vec_free(&s->checkpoint);
     s->bank_carry_free();

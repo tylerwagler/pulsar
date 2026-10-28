@@ -118,6 +118,129 @@ int pulsar_prefill_walk_run(const pulsar_prefill_walk *w, uint32_t start, uint32
     return 0;
 }
 
+/* ---- L329 (b2): the prompt read-ahead ---------------------------------------
+ *
+ * A Qwen prefill chunk's PLE gather (16 rows a token, 65,536 for a 4096-token chunk, from the ~96 GB ple-l1.rows on
+ * the NVMe) is issued at the chunk's embed and waited at layer 1; layer 0 hides ~60 ms of it.  The table does not fit
+ * the page cache beside the model, so a production prefill's rows are mostly cold, and the cold remainder sat on the
+ * critical path: +94..152 ms at 4k, +1.09..1.19 s at 32k (~5 % of TTFT; L329 window #476).  But the prompt is
+ * tokenized whole before the prefill starts, so the NEXT chunk's rows are known while this one computes: read them
+ * then, and that chunk's gather finds them cached.
+ *
+ * The rule is the core's, for every prefill path that gathers -- this walk (solo prefill, a cold-store or L329 (a)
+ * shared-prefix cut, which reads ahead along the whole request: pulsar_session_set_prefill_ahead) and the fused
+ * lane's prompt runs (the server calls pulsar_session_prompt_read_ahead per round): one chunk past the rows in
+ * flight, one record per bank so a run that advances by less than a chunk queues each row once.  The family supplies
+ * the rows (pulsar_driver_ops::read_ahead) and the pool reads them on its background class, below every gather
+ * (engram.cpp).  A hint: the gather reads every byte itself, so no byte changes with it on or off.
+ *
+ * Bounded (window #477/#478: systemd-oomd's pressure kill took the job's whole unit during gates-dev): it runs only
+ * for a prompt a server is serving (the walk's license is pulsar_session_set_prefill_ahead; nothing else -- a gate,
+ * the CLI, imatrix -- ever reads ahead), the pool holds at most PULSAR_ENGRAM_AHEAD_PENDING_MAX unread rows (~1 GiB of
+ * cache), and an arm is skipped while MemAvailable is under PULSAR_READ_AHEAD_MEM_HEADROOM plus that cap. */
+
+static uint64_t read_ahead_hash(const int *v, uint32_t from, uint32_t to) {
+    uint64_t h = 1469598103934665603ull;
+    for (uint32_t i = from >= 2u ? from - 2u : 0u; i < to; i++) {
+        h ^= (uint32_t)v[i];
+        h *= 1099511628211ull;
+    }
+    return h ^ ((uint64_t)from << 32) ^ to;
+}
+
+bool pulsar_read_ahead_plan(const pulsar_read_ahead_mark *mark, const int *prompt, uint32_t len, uint32_t run_end,
+                            uint32_t window, uint32_t *from, uint32_t *to, bool *drop, pulsar_read_ahead_mark *next) {
+    *from = *to = run_end;
+    *drop = false;
+    if (!prompt || window == 0u || run_end >= len) return false;
+    const uint32_t end = len - run_end < window ? len : run_end + window;
+    /* the record holds rows still ahead of the run for these very tokens: queue only past it */
+    const bool live = mark && mark->from < mark->to && mark->from <= run_end && run_end < mark->to && mark->to <= len &&
+                      read_ahead_hash(prompt, mark->from, mark->to) == mark->hash;
+    *drop = mark && mark->from < mark->to && !live;
+    const uint32_t f = live ? mark->to : run_end;
+    if (f >= end || (end < len && end - f < window / 2u)) return false;
+    *from = f;
+    *to = end;
+    next->from = run_end;
+    next->to = end;
+    next->hash = read_ahead_hash(prompt, run_end, end);
+    return true;
+}
+
+bool pulsar_read_ahead_admit(uint64_t mem_available) {
+    /* the headroom plus the most the pool can hold unread, a page a row (a cold row ~ one page of cache) */
+    return mem_available != 0 && mem_available > PULSAR_READ_AHEAD_MEM_HEADROOM + PULSAR_ENGRAM_AHEAD_PENDING_MAX * 4096ull;
+}
+
+/* MemAvailable from /proc/meminfo in bytes, 0 when unreadable (the admit then fails closed).  Read once per arm --
+ * a chunk, or a fused round that queues -- never per row or per step. */
+uint64_t pulsar_read_ahead_mem_available(void) {
+    FILE *fp = fopen("/proc/meminfo", "r");
+    if (!fp) return 0;
+    char line[256];
+    unsigned long long kib = 0;
+    while (fgets(line, sizeof(line), fp))
+        if (sscanf(line, "MemAvailable: %llu kB", &kib) == 1) break;
+    fclose(fp);
+    return (uint64_t)kib * 1024ull;
+}
+
+static uint64_t read_ahead_tag(const pulsar_session *s, uint32_t bank) {
+    return ((uint64_t)(uintptr_t)s << 16) ^ bank;   /* banks < 2^16; one tag per session and bank */
+}
+
+uint32_t pulsar_session_read_ahead(pulsar_session *s, uint32_t bank, const pulsar_tokens *prompt, uint32_t run_end) {
+    const pulsar_driver_ops *ops = s ? s->engine->family->driver : NULL;
+    if (!ops || !ops->read_ahead || !prompt || bank >= 0x10000u) return 0;
+    if (bank >= s->n_ahead) {
+        const uint32_t n = bank + 1u;
+        s->ahead = (pulsar_read_ahead_mark *)xrealloc(s->ahead, (size_t)n * sizeof(*s->ahead));
+        memset(s->ahead + s->n_ahead, 0, (size_t)(n - s->n_ahead) * sizeof(*s->ahead));
+        s->n_ahead = n;
+    }
+    pulsar_read_ahead_mark *m = &s->ahead[bank], next = {};
+    uint32_t from = 0, to = 0;
+    bool drop = false;
+    const bool go = pulsar_read_ahead_plan(m, prompt->v, (uint32_t)prompt->len, run_end, s->prefill_cap, &from, &to,
+                                           &drop, &next);
+    const uint64_t tag = read_ahead_tag(s, bank);
+    if (drop) {
+        (void)pulsar_engram_read_ahead_cancel(ops->read_ahead_pool(s->engine), tag);
+        *m = {};
+    }
+    if (!go) return 0;
+    if (!pulsar_read_ahead_admit(pulsar_read_ahead_mem_available())) {
+        pulsar_engram_read_ahead_skipped(ops->read_ahead_pool(s->engine));
+        static bool said = false;   /* rule 5: the stand-down, once */
+        if (!said) {
+            said = true;
+            fprintf(stderr, "pulsar: L329 (b2) read-ahead stood down: MemAvailable under %llu GiB + the arm's pages "
+                            "(counted: pulsar:ple_read_ahead_rows_total{outcome=\"skipped\"})\n",
+                    (unsigned long long)(PULSAR_READ_AHEAD_MEM_HEADROOM >> 30));
+        }
+        return 0;
+    }
+    const uint32_t rows = ops->read_ahead(s->engine, tag, prompt->v, from, to);
+    if (rows == 0) return 0;   /* off (said at load), at the pool's cap (counted), or a token the gather refuses */
+    *m = next;
+    static bool announced = false;   /* rule 5: the path taken, once */
+    if (!announced) {
+        announced = true;
+        fprintf(stderr, "pulsar: L329 (b2) read-ahead ran: bank %u, tokens [%u, %u) of %d (%u rows) queued for the "
+                        "background readers while the rows to %u are in flight\n",
+                bank, from, to, prompt->len, rows, run_end);
+    }
+    return to - from;
+}
+
+void pulsar_session_read_ahead_cancel(pulsar_session *s, uint32_t bank) {
+    const pulsar_driver_ops *ops = s ? s->engine->family->driver : NULL;
+    if (!ops || !ops->read_ahead || bank >= s->n_ahead || s->ahead[bank].from == s->ahead[bank].to) return;
+    (void)pulsar_engram_read_ahead_cancel(ops->read_ahead_pool(s->engine), read_ahead_tag(s, bank));
+    s->ahead[bank] = {};
+}
+
 static void prefill_loop_progress(pulsar_session *s, int current, int total) {
     if (s->progress) s->progress(s->progress_ud, "prefill_chunk", current, total);
     if (s->display_progress) s->display_progress(s->display_progress_ud, "prefill_display", current, total);
@@ -146,6 +269,10 @@ struct prefill_loop_ctx {
  * images, whose encoder the fit does not model. */
 static bool prefill_loop_chunk(void *ud, uint32_t pos0, uint32_t rows, bool last) {
     const prefill_loop_ctx *c = (const prefill_loop_ctx *)ud;
+    /* L329 (b2): the next chunk's rows, read while this one computes (queued first; this chunk's own gather, issued
+     * at its embed, goes ahead of them) -- for a SERVED prompt only: the one a server named for this sync
+     * (pulsar_session_set_prefill_ahead); a sync nobody licensed (a gate, the CLI, imatrix) passes NULL, reads nothing */
+    (void)pulsar_session_read_ahead(c->s, c->bank, c->s->prefill_ahead, pos0 + rows);
     const double t0 = now_sec();
     if (!c->chunk(c->s, c->prompt, pos0, rows, last, c->ud) || pulsar_gpu_end_commands() == 0) return false;
     if (c->s->sync_n_images == 0)

@@ -1407,6 +1407,10 @@ static_assert(PULSAR_QWEN_HEAD_ROWS_MAX == PULSAR_DRIVER_HEADS_MAX, "the lane's 
 static const pulsar_spec_depth_policy k_mtp_depth = {4, 7, 0.0f, 0, 0.0f, 0u, 0u, 1u};
 const pulsar_drafter_ops PULSAR_QWEN_MTP_DRAFTER =
     PULSAR_MTP_DRAFTER_OPS("MTP", 4u, PULSAR_MTP_DRAFT_MAX, 0.7f, &k_mtp_depth);
+static uint32_t qwen_read_ahead(const pulsar_engine *e, uint64_t tag, const int32_t *prompt, uint32_t from, uint32_t to) {
+    return pulsar_qwen_s4_ple_read_ahead(e->qwen_weights, tag, prompt, from, to);
+}
+static pulsar_engram_io *qwen_read_ahead_pool(const pulsar_engine *e) { return pulsar_qwen_s4_ple_pool(e->qwen_weights); }
 static const pulsar_driver_ops k_qwen_driver = {
     /* .create        = */ qwen_create,
     /* .destroy       = */ qwen_destroy,
@@ -1424,6 +1428,9 @@ static const pulsar_driver_ops k_qwen_driver = {
     /* .image_rows    = */ qwen_image_rows,
     /* .dump          = */ qwen_dump,
     /* .artifact      = */ qwen_artifact,
+    /* .stage         = */ NULL,
+    /* .read_ahead    = */ qwen_read_ahead,        /* L329 (b2): the PLE rows of the next prompt chunk */
+    /* .read_ahead_pool = */ qwen_read_ahead_pool,
 };
 static_assert(PULSAR_LAYER_QWEN_GDN == 2 && PULSAR_LAYER_QWEN_QSA == 3, "the block table's slots are the kinds' values");
 
