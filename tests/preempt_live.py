@@ -98,6 +98,14 @@ class PreemptLeg(Leg):
         if not self.g.check(0 < LA < LB and LW > 0, "the counted prompts (A + generation %d, B %d, W %d) frame a "
                             "preemption" % (LA, LB, LW)):
             return
+        # B can also take W's idle bank, reusing what W touched (L280's "continuing on bank N" -- W's history is
+        # persisted first, gen_begin's "evict" store): that bank then holds max(W, B) = B beside A, so A + B past the
+        # budget is what forces the preemption on every bank B may take (gpuq #485: the frame that also budgeted
+        # bank 0's warmup high-water let B fit on bank 0 beside A, and nothing was preempted)
+        if not self.g.check(lens["A"] + LB > LW + self.margin * LB,
+                            "A's prompt %d + B %d is past the budget's %.0f tokens: B fits on no bank beside A, W's "
+                            "idle bank included" % (lens["A"], LB, LW + self.margin * LB)):
+            return
         self.per_tok, self.LB, self.LA0, self.LW = per_tok, LB, lens["A"], LW
         self.budget = int(eager + per_tok * (LW + self.margin * LB))
         self.g.note("eager %.2f GiB, %.0f B a token: budget override %.2f GiB" % (eager / 2**30, per_tok,
@@ -141,6 +149,7 @@ class PreemptLeg(Leg):
         log = srv.since(mark)
         mt = srv.metrics()
         self.g.check(self.res["B"][0] == 200, "B (the prompt that did not fit) answered: %d" % self.res["B"][0])
+        self.g.check("continuing on bank" not in log, "B did not fit beside A on W's idle bank (no L280 clobber route)")
         self.g.check("PREEMPTED" in log and "READMITTED" in log,
                      "A preempted and readmitted (preemptions %d, readmissions %d)" %
                      (mt.get("pulsar:decoder_preemptions_total", -1), mt.get("pulsar:decoder_readmissions_total", -1)))

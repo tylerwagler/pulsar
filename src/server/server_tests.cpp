@@ -10126,6 +10126,18 @@ static void test_l328_admission_decisions(void) {
             TEST_ASSERT(server_preempt_fits((idle + LA0) * q, LA0 * q, idle * q, LB * q, frame * q));   /* B alone */
             TEST_ASSERT(LA0 + LB > frame);                                    /* A at arrival + B: the preemption */
             TEST_ASSERT(LA <= frame);                                         /* A's whole run alone */
+            /* B on W's idle bank instead (L280's clobber route, prompt_kv_check(best)): it adds LB past what that bank
+             * holds, and nothing else is idle -- WAIT, so B takes a fresh bank and A is preempted.  gpuq #485 at
+             * 229f174c budgeted the warmup too (WARM + LW + 1.25 LB): there B FIT on bank 0 beside A, nothing was
+             * preempted, and the leg's PREEMPTED check failed */
+            if (w_on_0) {
+                const uint64_t hw0 = WARM > LW ? WARM : LW, A485 = 5485;
+                int k = -1;
+                TEST_ASSERT(server_prompt_kv_verdict((hw0 + A485) * q, (LB - hw0) * q, frame * q, NULL, 0, true, &k) ==
+                            PROMPT_KV_WAIT);
+                TEST_ASSERT(server_prompt_kv_verdict((hw0 + A485) * q, (LB - hw0) * q, (WARM + frame) * q, NULL, 0,
+                                                     true, &k) == PROMPT_KV_FITS);
+            }
             int k = -1;
             const uint64_t drop_b[1] = {LB * q};
             TEST_ASSERT(server_prompt_kv_verdict(LB * q, server_readmit_need(LA0 * q, 0, growth), frame * q, drop_b, 1,
