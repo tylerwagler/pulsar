@@ -623,7 +623,7 @@ bool gpu_graph_bank_alloc_physical(pulsar_gpu_graph *g, uint32_t bank) {
     if (!ok) {
         /* TRANSACTIONAL: roll the bank back to fully-evicted rather than leaving
          * layers 0..k allocated.  A half-allocated bank is the dangerous state —
-         * callers (server_bank_restore_spilled) return false, so the slot stays
+         * callers (server::bank_unspill) return false, so the slot stays
          * marked spilled, but the bank now LOOKS partly live.  Returning it to a
          * clean evicted state keeps gpu_graph_bank_is_evicted's answer truthful
          * and lets a later retry start from scratch. */

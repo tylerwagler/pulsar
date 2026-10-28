@@ -1167,6 +1167,10 @@ int server_prefix_mark_merge(int cur, int want, int pos);
 /** PULSAR_SERVER_PREFIX_WAIT_MS's value, pure: unset or empty = the default, else whole milliseconds (0 = off);
  *  -1 for anything else (the server refuses to start on it). */
 int server_prefix_wait_parse(const char *text);
+/** L330: PULSAR_SERVER_KV_RESTORE_SLICE_MS's value, pure -- a test hook: unset or empty = 0 (a slice is what one
+ *  prefill chunk's priced time reads), else whole milliseconds 1..600000 to read per slice instead (the live leg cuts a
+ *  chain a few GiB short of production's into many slices); -1 for anything else (the server refuses to start). */
+int server_restore_slice_parse(const char *text);
 
 /** L310: the chain a disk restore would load (pulsar_kvchain_find), nothing loaded yet. */
 typedef struct {
@@ -1560,8 +1564,9 @@ typedef struct session_slot {
     /** Tier-2 task #55 increment 2b — proactive-eviction guard. `spilled` means this
      * bank's comp/index PHYSICAL was cudaFree'd, its history persisted as a
      * segment chain in the disk KV cache (L264), while its conversation stays
-     * bound here; it is restored (alloc_physical + the chain's load) before this
-     * slot next decodes. Distinct from SLOT_EVICTED (which frees the bank for a
+     * bound here; L330: the next job bound to it re-backs it empty
+     * (server::bank_unspill) and restores the chain a slice per worker turn
+     * before it resolves. Distinct from SLOT_EVICTED (which frees the bank for a
      * DIFFERENT conversation). */
     bool         spilled;
     /** L311: the slot's last turn finished with decode rows past its prefill: when the worker is idle, its bank's
@@ -1592,6 +1597,9 @@ struct job;
 struct server_prefill_progress;
 struct thinking_state;
 struct trace_cache_diag;
+struct kv_restore;        /* L330 */
+struct gen_resolution;
+struct spilled_history;
 typedef enum {
     PROVISION_OK = 0,
     PROVISION_REFUSED_POOL_FULL,   /* no free slot entry — eviction helps */
@@ -1790,6 +1798,11 @@ struct server {
     bool         guard_enabled;          ///< the proactive-eviction guard is active
     uint64_t     guard_touched_budget;   ///< resident-KV ceiling the guard keeps touched_kv under
     uint64_t     guard_eager_bytes;      ///< eager floor already resident
+    /** L328 (4): the touched KV at the post-warmup reading -- bank 0's warmup high-water (its prefill-cap + 64 prompt
+     *  tokens and decode), which stays resident for the life of the process: bank 0 is never a spill victim and
+     *  only a spill returns pages */
+    uint64_t     guard_warm_touched;
+    warn_limiter preempt_decline_warn;   ///< L328 (2): the declined-preemption line, rate-limited
     uint64_t     guard_evictions;        ///< spills performed, for metrics
     warn_limiter mem_floor_warn;         ///< the per-request MemAvailable-floor refusal line, rate-limited (L190 C1)
     /** Trivial-match threshold for the choose-vs-provision routing decision:
@@ -1819,6 +1832,7 @@ struct server {
     /** L329 (a): PULSAR_SERVER_PREFIX_WAIT_MS -- how long a queued request may wait for a cut another prompt's
      *  prefill is filling (0: never; set at startup, read by the worker only). */
     int prefix_wait_ms;
+    int restore_slice_ms;   ///< L330: PULSAR_SERVER_KV_RESTORE_SLICE_MS (0: one prefill chunk's priced time a slice)
     bool stopping;              ///< shutdown in progress; stop accepting and drain
     time_t started;  ///< wall-clock when the listener came up (uptime for /health)
     int clients;                 ///< connected clients, for the shutdown drain
@@ -1931,8 +1945,12 @@ struct server {
      * on a busy pool, and none of it was previously observable. */
     uint64_t m_evictions;  ///< slots evicted to make room
     uint64_t m_spills;  ///< banks spilled to disk by the guard
-    uint64_t m_restores;  ///< spilled banks brought back
-    uint64_t m_restore_failures;  ///< spilled bank could not be restored
+    uint64_t m_restores;  ///< spilled banks brought back (L330: re-backed for a job, which restores the chain)
+    uint64_t m_restore_failures;  ///< spilled bank could not be re-backed
+    uint64_t m_restore_slices;    ///< L330: disk chain slices read (a one-shot load is one)
+    double   m_restore_stall_max_ms;  ///< L330: the longest slice -- the longest worker stall a disk restore caused
+    uint64_t m_kv_touched;        ///< L328: resident demand-paged KV (pulsar_session_touched_kv_bytes), published
+    uint64_t m_kv_reserved;       ///< L328: kv_reserved_bytes(NULL), the base every admission reads, published
     uint64_t m_preemptions;  ///< L314: running decoders preempted through their terminal checkpoint
     uint64_t m_readmissions;  ///< L314: preempted decoders reloaded and stepping again
     kv_dup_census m_dup;          ///< L324: the last duplicate-prefix census (kv_dup_census_update)
@@ -2071,6 +2089,24 @@ struct server {
     int kv_cache_load(const kv_chain_hit *hit, const char *prompt_text, const pulsar_text_span *prompt_spans,
                       uint32_t prompt_n_spans, int base, pulsar_tokens *effective_prompt, char **loaded_key_out,
                       bool responses_protocol);
+    /** L330: start a load of `hit` (nothing read yet); `sliced` prices each segment's read for
+     *  server_restore_slice_segments (a one-shot load reads the chain as one slice and needs none). */
+    void kv_restore_begin(kv_restore *r, const kv_chain_hit *hit, int base, bool sliced);
+    /** L330: read the next `k` segments of r's chain into the installed bank (a worker stall: timed, counted on
+     *  /metrics).  @return 1 when the chain is in, 0 when segments remain, -1 when a segment would not load (it is
+     *  dropped, the bank invalid -- what a failed one-shot load leaves). */
+    int kv_restore_slice(kv_restore *r, int k);
+    /** L330: the next slice of a sliced restore (kv_restore_begin's `sliced`): the segments whose predicted reads fit
+     *  one prefill chunk's priced time at the depth the restore stands at (pulsar_engine_prefill_ms; at least one, and
+     *  exactly one while the read meter or the prefill fit has no measurement) -- or restore_slice_ms when the test
+     *  hook sets it.  @return as kv_restore_slice. */
+    int kv_restore_next(kv_restore *r);
+    /** L330: the loaded chain's boundary check against `text` (pulsar_kvchain_load_check), then what a load leaves
+     *  besides the rows: the read meter's observation, the chain's tool maps, and (when `effective_prompt`) the
+     *  prompt to sync -- the exact stored tokens + the rest of `text`.  @return the position restored, 0 when the
+     *  chain disagrees with its tokens (the bank is then invalid). */
+    int kv_restore_finish(kv_restore *r, const char *text, const pulsar_text_span *spans, uint32_t n_spans,
+                          pulsar_tokens *effective_prompt, char **loaded_key_out, bool responses_protocol);
     /** A chain whose restore the prefill then failed on: drop its last segment. */
     void kv_cache_discard_failed_chain(const char *key);
     /** Tool-output-only Responses continuation.
@@ -2171,6 +2207,13 @@ struct server {
      * moves forward.
      */
     void gen_begin(session_slot *sl);
+    /** L330: the rest of gen_begin once the prompt is resolved (`r`): image placement, the request's accounting and
+     *  trace, the prefill progress and its plan (the cold-store cut, the phase). */
+    void gen_begin_plan(session_slot *sl, gen_resolution *r);
+    /** L330: one restore quantum: the next slice of the chain (server_restore_slice_segments), or -- the chain in, a
+     *  read failure, or the client gone -- the restore's end: the plan continues from what the bank holds (a failure
+     *  or a cancel leaves it invalid, the recompute a failed one-shot load leaves). */
+    void gen_step_restore(session_slot *sl);
     /** One prefill quantum: (re-)issue the sync toward the phase's target; the
      * cancel callback stops it after one completed chunk and the checkpoint
      * carries the progress to the next quantum.
@@ -2314,17 +2357,24 @@ struct server {
     /** Make `bank` the live bank on the shared session: lazily save the
      * outgoing bank's device views + host carry, restore the incoming one.
      * No-op when `bank` is already live. Worker thread only. */
-    bool bank_switch(int bank);
+    bool bank_switch(int bank, spilled_history *was = nullptr);
     /** Evict exactly one idle victim so a fresh conversation gets a bank.
      * Live-tool owners are protected; dominated victims go first, else
      * plain LRU (worker_evict_one's picker). Reuses the proven eviction body
      * (snapshot + ledger release + bank reset). Worker thread only; returns
      * true when a bank was freed. */
     bool fresh_make_room();
-    /** Bring a spilled bank's KV back from the spill directory.
-     * @return false when the file is missing or unreadable, which forces the
-     * conversation to replay from a checkpoint instead. */
-    bool bank_restore_spilled(int bank);
+    /** L330: install a guard-spilled bank EMPTY: re-back its physical and invalidate it, its history left on disk
+     *  where the spill put it (into `was` when given).  A job bound to it restores that history a slice of segments
+     *  a worker turn (gen_begin, GEN_RESTORE_SPILLED); the make-room eviction and the shutdown persist keep what the
+     *  spill stored.  The caller saved the outgoing bank (bank_switch).  @return false when it cannot be re-backed. */
+    bool bank_unspill(int bank, spilled_history *was);
+    /** L328 (2): what bank 0 -- never a spill victim, so its pages stay resident for good -- holds once `keep`'s
+     *  prompt (adding `need`, when `keep` is bank 0's) and any prompt already bound to it are in. */
+    uint64_t bank0_floor(const session_slot *keep, uint64_t need);
+    /** L328 (3): an idle provisioned bank that holds nothing -- a fresh bank already provisioned (the one with the
+     *  most resident pages); NULL when there is none. */
+    session_slot *empty_bank();
     /** L323: which slots are DOMINATED -- a bank whose whole history is the prefix of another resident or spilled
      * bank's (bank_dominated_core, the one predicate).  The guard's spill and the make-room eviction take a
      * dominated bank before any LRU choice.  Pure host reads (pulsar_session_bank_tokens / _common_prefix, the
@@ -2355,9 +2405,11 @@ struct server {
      */
     int guard_pick_victim(session_slot **dec, int n, const bool *dominated = nullptr);
     /** Proactive-eviction guard: spill banks to disk until resident KV is back
-     * under guard_touched_budget. @param dec the decode set that must be kept
-     * resident. @param n its length. */
-    void guard_maybe_evict(session_slot **dec, int n);
+     * under guard_touched_budget; L328 (5): with every idle bank spilled and the breach standing, preempt the
+     * newest decoders (L314) while one makes the rest fit.  @param dec the decode set that must be kept
+     * resident. @param n its length. @param kept receives the decoders left, in order (room for n).  @return how
+     * many. */
+    int guard_maybe_evict(session_slot *const *dec, int n, session_slot **kept);
     /** The prompt's KV admission (L280): what binding `j` to `sl` does to the resident KV -- the prompt's rows
      * land in the bank while its prefill (or disk-chain load) runs, before any decode quantum the guard above
      * watches.  Fills `order` with the idle victims to spill first (*n_spill of them) when that is what fitting
@@ -2662,6 +2714,60 @@ typedef struct trace_cache_diag {
     int prompt_id[TRACE_CACHE_WINDOW];  ///< the incoming prompt's ids across the same window
 } trace_cache_diag;
 
+/** L330: one disk chain load (server::kv_restore_slice / kv_restore_finish).  A one-shot load is one slice of the
+ *  whole chain; a request's restore reads it a slice per worker turn, the job in GEN_RESTORE between decode rounds as
+ *  a long prompt prefills in chunks -- the same segments in the same order (pulsar_kvchain_load_slice), so the bank
+ *  ends byte-for-byte where the one-shot load leaves it. */
+typedef struct kv_restore {
+    const kv_chain_hit *hit;   ///< the chain (pulsar_kvchain_find's), not owned
+    int next;                  ///< segments loaded so far
+    int base;                  ///< where the bank resumed without the chain (the restored-tokens counter)
+    double read_ms;            ///< the slices' own wall time: the read the meter observes
+    double slice_max_ms;       ///< the longest slice -- the longest the worker stood still for this restore
+    int slices;                ///< slices read
+    /** each segment's predicted read (the read meter's at the restore's start; < 0 while it has measured no load) --
+     *  what server_restore_slice_segments sizes the slices by */
+    double pred_ms[PULSAR_KVCHAIN_MAX];
+} kv_restore;
+
+/** L330: gen_begin's resolution of the prompt, handed to its plan (server::gen_begin_plan) -- in the same call, or
+ *  across a sliced disk restore when the resume pick is the disk chain (then the plan runs once the chain is in). */
+typedef struct gen_resolution {
+    const pulsar_tokens *prompt_for_sync;   ///< &j->req.prompt or &g->effective_prompt
+    int cached;                             ///< tokens the bank serves the prompt from
+    const char *cache_source;               ///< which layer served them (the trace's and the log's word)
+    int disk_cached;                        ///< ... of which a disk chain loaded
+    bool responses_live_continuation;       ///< a live Responses continuation (the effective prompt is its)
+    bool anthropic_live_continuation;       ///< a live Anthropic continuation
+    const char *responses_live_match;       ///< how the Responses continuation matched (the log's word)
+    int responses_live_match_ids;           ///< ... and on how many call ids
+    int anthropic_live_match_ids;           ///< the Anthropic continuation's matched call ids
+    trace_cache_diag cache_diag;            ///< the trace's record of the live match
+} gen_resolution;
+
+/** L330: what restores while a job is in GEN_RESTORE. */
+typedef enum {
+    GEN_RESTORE_RESUME = 0,   ///< the request's resume pick (L318 RESUME_DISK): the plan continues from the chain
+    GEN_RESTORE_SPILLED,      ///< its guard-spilled bank's own history, before the job resolves (gen_begin again)
+} gen_restore_kind;
+
+/** L330: a job's restore in progress (gen_state::restore). */
+struct gen_restore {
+    gen_restore_kind kind;   ///< what completes it
+    kv_chain_hit hit;        ///< the chain
+    kv_restore r;            ///< its load
+    gen_resolution res;      ///< GEN_RESTORE_RESUME: the resolution the plan continues
+    char *text;              ///< GEN_RESTORE_SPILLED: the bank's history rendered (the chain's boundary text), owned
+};
+
+/** L330: a guard-spilled bank's history as it was when server::bank_switch installed the bank EMPTY: the text and
+ *  image records its job's restore finds the chain by.  `text` is owned (NULL: the bank held nothing). */
+typedef struct spilled_history {
+    char *text;            ///< the history rendered
+    uint64_t hashes[64];   ///< its image records' content hashes, in order
+    int n_img;             ///< how many
+} spilled_history;
+
 /** Userdata for the engine's prefill progress callback.
  *
  * Its ADDRESS is handed to the engine, so it must live at a stable location
@@ -2713,7 +2819,8 @@ typedef struct thinking_state {
  * phase and drives the batched/fused decode lanes through the batch_*
  * fields, so the definition is shared here. */
 typedef enum {
-    GEN_PREFILL_COLD = 0, /* syncing the cold-store prefix, one chunk/quantum */
+    GEN_RESTORE = 0,      /* L330: loading a disk segment chain, one slice of segments/quantum */
+    GEN_PREFILL_COLD,     /* syncing the cold-store prefix, one chunk/quantum */
     GEN_PREFILL_MAIN,     /* syncing the effective prompt, one chunk/quantum */
     GEN_DECODE_INIT,      /* (re)initialize a decode attempt (old decode_again) */
     GEN_DECODE,           /* sampling loop, K tokens per quantum */
@@ -2769,6 +2876,8 @@ void parser_kit_probe_free(void *probe);
 struct gen_state {
     job *j;            ///< the request being generated
     gen_phase phase;   ///< resume point: which step runs on the next quantum
+    /** L330: the disk chain restoring while phase is GEN_RESTORE (owned; NULL otherwise) */
+    struct gen_restore *restore;
 
     /** prompt/cache resolution (owned by gen_begin, read by later phases) */
     /** Failure reason for the error paths.

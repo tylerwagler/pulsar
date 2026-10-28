@@ -2192,6 +2192,17 @@ fanout-prefix-live: pulsar-server
 	python3 tests/fanout_prefix_live.py $(RESUME_LIVE_MODEL) --binary ./pulsar-server --work $(FANOUT_LIVE_WORK) \
 	  $(if $(FANOUT_AB),--ab,)
 
+# L330: a disk KV restore loads its chain a slice of segments per worker turn, so a decoding stream beside it stalls
+# about one slice, not the whole read.  A ~200k-token prompt abandoned at 90% of its prefill (its prefix stored as a
+# chain), then re-sent from the dropped page cache while a greedy stream decodes; the slice's test hook
+# (PULSAR_SERVER_KV_RESTORE_SLICE_MS=250) cuts the ~2.4 GiB chain into many slices.  The Qwen pack, 262k, 4 banks; one
+# load, ~5 min.  gates-dev runs it on a routing / kv path.
+RESTORE_STALL_LIVE_WORK ?= $(CURDIR)/.build/restore-stall-live
+.PHONY: restore-stall-live
+restore-stall-live: pulsar-server
+	sync; sudo -n sh -c "echo 3 > /proc/sys/vm/drop_caches" 2>/dev/null; \
+	python3 tests/restore_stall_live.py $(RESUME_LIVE_MODEL) --binary ./pulsar-server --work $(RESTORE_STALL_LIVE_WORK)
+
 cuda-spec-width-gate: pulsar
 	python3 tests/spec_verify_width_gate.py $(FRONTIER_MODEL) --binary ./pulsar
 
@@ -2816,7 +2827,7 @@ gates-dev:
 	if [ $$server -eq 1 ]; then printf '  server: chat smoke + the --server/--api unit switches\n'; fi; \
 	if [ $$render -eq 1 ]; then printf '  prefix-stability-gate: selected (L325: server / chat-render paths, every family, no model)\n'; fi; \
 	if [ $$kvmem -eq 1 ]; then printf '  server-kv-headroom-live: selected (L319: the touched-KV ceiling is the measured headroom; admission / guard / bank paths)\n'; fi; \
-	if [ $$resume -eq 1 ]; then printf '  resume-deepest-live + sidecall-turns-live + kv-dup-live + fanout-prefix-live: selected (L318 / L322 / L324 / L329: routing / resume / disk-chain paths, the Open WebUI and the Claude Code side-call shapes, the fan-out duplicate census and the fan-out shared-prefix wait on the Qwen pack)\n'; fi; \
+	if [ $$resume -eq 1 ]; then printf '  resume-deepest-live + sidecall-turns-live + kv-dup-live + fanout-prefix-live + restore-stall-live: selected (L318 / L322 / L324 / L329 / L330: routing / resume / disk-chain paths, the Open WebUI and the Claude Code side-call shapes, the fan-out duplicate census, the fan-out shared-prefix wait and the sliced disk restore on the Qwen pack)\n'; fi; \
 	$(MAKE) --no-print-directory seam-check CUDA_ARCH=sm_120f || rc=1; \
 	$(MAKE) --no-print-directory cuda-reap-router-audit CUDA_ARCH=sm_120f \
 	      FRONTIER_MODEL="$(FRONTIER_MODEL)" || rc=1; \
@@ -2867,6 +2878,7 @@ gates-dev:
 	  $(MAKE) --no-print-directory sidecall-turns-live CUDA_ARCH=sm_120f || rc=1; \
 	  $(MAKE) --no-print-directory kv-dup-live CUDA_ARCH=sm_120f || rc=1; \
 	  $(MAKE) --no-print-directory fanout-prefix-live CUDA_ARCH=sm_120f || rc=1; \
+	  $(MAKE) --no-print-directory restore-stall-live CUDA_ARCH=sm_120f || rc=1; \
 	fi; \
 	if [ $$kvmem -eq 1 ]; then \
 	  $(MAKE) --no-print-directory server-kv-headroom-live CUDA_ARCH=sm_120f || rc=1; \

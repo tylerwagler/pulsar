@@ -24,9 +24,9 @@ real server on a small model at a small --ctx, with the guard's budget lowered t
   P  REUSE   chat B asked again (spilled to disk in S) answers exactly as B did cold -- the prefix cache unchanged
   never      the decode guard's "NO idle victim -- back-pressure" (proceeding past its budget), in any phase; a
              violation names the phase and prints the line with the admission / preempt / guard lines before it.
-             KNOWN_L328: today W reproduces it (gpuq #472: READMITTED 0.0 s after PREEMPTED, then the line), so it
-             is a STRICT expected failure: reported as XFAIL (L328), and a run that does NOT reproduce it FAILS
-             ("XPASS: ... drop KNOWN_L328") -- the fix in L328 drops the marker in the same commit
+             KNOWN_L328 was a STRICT expected failure while W reproduced it (gpuq #472: READMITTED 0.0 s after
+             PREEMPTED, then the line); L328 (the reserved base for every admission decision, the guard preempting
+             rather than proceeding) dropped it: the check is must-pass again
 
 Family-neutral: the bank price and the spill are the engine's bank ops.  Exit 0 only when every check passed.
 Scratch (the disk-KV dirs) goes under $TMPDIR; --log keeps every guarded server's log (one file, by phase)."""
@@ -253,9 +253,9 @@ try:
             print("#   W: " + l[-220:])
 finally:
     stop(p, kv, log)
-# L328 owns this: KV admission (L314's readmission among it) ignores admitted-but-unprefilled prompts, so W's parked B
-# is readmitted before C prefills and the guard ends over budget with no victim.  Its fix sets this False.
-KNOWN_L328 = True
+# L328 owned this (KV admission ignored admitted-but-unprefilled prompts, so W's parked B was readmitted before C
+# prefilled and the guard ended over budget with no victim); its fix set this False.
+KNOWN_L328 = False
 bp = [(ph, i, l) for ph, t in logs for i, l in enumerate(t.splitlines()) if "NO idle victim" in l]
 where = "; %d in phase(s) %s" % (len(bp), ",".join(sorted({ph for ph, _, _ in bp}))) if bp else ""
 if KNOWN_L328:

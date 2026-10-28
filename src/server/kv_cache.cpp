@@ -517,27 +517,110 @@ kv_restore_verdict server::kv_cache_price(const kv_chain_hit *hit, int base) {
     return v;
 }
 
-int server::kv_cache_load(const kv_chain_hit *hit, const char *prompt_text, const pulsar_text_span *prompt_spans,
-                          uint32_t prompt_n_spans, int base, pulsar_tokens *effective_prompt, char **loaded_key_out,
-                          bool responses_protocol) {
+/* ===== L330: a chain load in slices ======================================
+ *
+ * A restore used to read its whole chain inside one worker turn: production chains reach 34 GiB / 24 s (the archived
+ * 10-22..10-24 log, a 192k Claude Code conversation), and every other stream stood still for the whole read.  Now a
+ * request's restore reads a SLICE of segments per worker turn, its job in GEN_RESTORE between decode rounds, the way a
+ * long prompt prefills a chunk per turn: segments straight from the store into the installed bank (no whole-chain host
+ * buffer -- GB10's memory is the GPU's, ~12 GiB available during those restores), the same segments in the same order
+ * as the one-shot load (pulsar_kvchain_load_slice; the one-shot load is ONE slice of the whole chain, here and in the
+ * library), so the bank ends byte-for-byte where it would have. */
+
+/* How many segments the next slice reads, pure: from `next`, every segment while their predicted reads (pred_ms) sum
+ * within `target_ms` -- one prefill chunk's priced time at the depth the restore stands at, so a restoring job holds
+ * the worker no longer than a prefilling one does -- and at least one.  Exactly one while either is unknown: the read
+ * meter has measured no load (pred < 0) or the prefill fit has no price (target <= 0). */
+static int server_restore_slice_segments(const double *pred_ms, int next, int n, double target_ms) {
+    if (next >= n) return 0;
+    if (!(target_ms > 0.0) || !(pred_ms[next] >= 0.0)) return 1;
+    double t = pred_ms[next];
+    int k = 1;
+    while (next + k < n && pred_ms[next + k] >= 0.0 && t + pred_ms[next + k] <= target_ms) t += pred_ms[next + k++];
+    return k;
+}
+
+void server::kv_restore_begin(kv_restore *r, const kv_chain_hit *hit, int base, bool sliced) {
     auto *s = this;
-    if (loaded_key_out) *loaded_key_out = NULL;
-    const pulsar_segstore_seg *chain = hit->chain;
-    const int n = hit->n;
-    const size_t prompt_bytes = strlen(prompt_text);
+    r->hit = hit;
+    r->next = 0;
+    r->base = base < 0 ? 0 : base;
+    r->read_ms = 0.0;
+    r->slice_max_ms = 0.0;
+    r->slices = 0;
+    if (!sliced) return;
+    /* the read each segment costs, disk and page cache apart (L327), as the meter prices the whole chain */
+    for (int i = 0; i < hit->n; i++) {
+        const pulsar_segstore_seg *g = &hit->chain[i];
+        const uint64_t bytes = pulsar_kvchain_segment_load_bytes(hit->chain, hit->n, i);
+        const uint64_t cached = pulsar_segstore_cached_bytes(s->kv.st, g->key, bytes - g->trailer_bytes, true);
+        double ms = 0.0;
+        pthread_mutex_lock(&s->mu);
+        const bool measured = kv_read_cost_ms(&s->kv.meter.read, bytes, cached, &ms);
+        pthread_mutex_unlock(&s->mu);
+        r->pred_ms[i] = measured ? ms : -1.0;
+    }
+}
+
+int server::kv_restore_slice(kv_restore *r, int k) {
+    auto *s = this;
     const double t0 = server_now_sec();
     char err[384];
-    const int G = pulsar_kvchain_load(s->kv.st, s->engine, s->sess, prompt_text, chain, n, err, sizeof(err));
+    const int rc = pulsar_kvchain_load_slice(s->kv.st, s->sess, r->hit->chain, r->hit->n, &r->next, k, err, sizeof err);
+    const double ms = (server_now_sec() - t0) * 1000.0;
+    r->read_ms += ms;
+    r->slices++;
+    if (ms > r->slice_max_ms) r->slice_max_ms = ms;
+    pthread_mutex_lock(&s->mu);
+    s->m_restore_slices++;
+    if (ms > s->m_restore_stall_max_ms) s->m_restore_stall_max_ms = ms;
+    pthread_mutex_unlock(&s->mu);
+    if (rc != 0) {
+        server_log(PULSAR_LOG_WARNING, "pulsar-server: kv cache %s", err);
+        return -1;
+    }
+    return r->next >= r->hit->n ? 1 : 0;
+}
+
+int server_restore_slice_parse(const char *text) {
+    if (!text || !*text) return 0;
+    long v = 0;
+    for (const char *p = text; *p; p++) {
+        if (*p < '0' || *p > '9') return -1;
+        v = v * 10 + (*p - '0');
+        if (v > 600000) return -1;
+    }
+    return v > 0 ? (int)v : -1;
+}
+
+int server::kv_restore_next(kv_restore *r) {
+    auto *s = this;
+    /* the slice: one prefill chunk's priced time at the depth the restore stands at (the test hook's, when set) */
+    double target_ms = (double)s->restore_slice_ms;
+    if (s->restore_slice_ms <= 0) {
+        const int cap = pulsar_session_prefill_cap(s->sess);
+        const uint32_t depth = r->hit->chain[r->next].G_prev;
+        if (cap <= 0 || !pulsar_engine_prefill_ms(s->engine, (uint32_t)cap, depth, (uint32_t)cap, &target_ms))
+            target_ms = 0.0;
+    }
+    return kv_restore_slice(r, server_restore_slice_segments(r->pred_ms, r->next, r->hit->n, target_ms));
+}
+
+int server::kv_restore_finish(kv_restore *r, const char *text, const pulsar_text_span *spans, uint32_t n_spans,
+                              pulsar_tokens *effective_prompt, char **loaded_key_out, bool responses_protocol) {
+    auto *s = this;
+    if (loaded_key_out) *loaded_key_out = NULL;
+    const pulsar_segstore_seg *chain = r->hit->chain;
+    const int n = r->hit->n;
+    char err[384];
+    const int G = pulsar_kvchain_load_check(s->kv.st, s->engine, s->sess, text, chain, n, err, sizeof err);
     if (err[0]) server_log(PULSAR_LOG_WARNING, "pulsar-server: kv cache %s", err);
     if (G == 0) return 0;
-    {
-        const double load_ms = (server_now_sec() - t0) * 1000.0;
-        if (base < 0) base = 0;
-        pthread_mutex_lock(&s->mu);
-        kv_read_cost_observe(&s->kv.meter.read, hit->bytes, hit->cached, load_ms);
-        s->kv.meter.restored_tokens += G > base ? (uint64_t)(G - base) : 0u;
-        pthread_mutex_unlock(&s->mu);
-    }
+    const size_t text_bytes = strlen(text);
+    pthread_mutex_lock(&s->mu);
+    kv_read_cost_observe(&s->kv.meter.read, r->hit->bytes, r->hit->cached, r->read_ms);
+    s->kv.meter.restored_tokens += G > r->base ? (uint64_t)(G - r->base) : 0u;
+    pthread_mutex_unlock(&s->mu);
     const pulsar_tokens *loaded = pulsar_session_tokens(s->sess);
     const uint64_t text_end = chain[n - 1].text_end;
     /* The chain's tool maps: the exact DSML of every tool call inside it. */
@@ -553,18 +636,33 @@ int server::kv_cache_load(const kv_chain_hit *hit, const char *prompt_text, cons
          * it -- carrying the client-data ranges into the suffix's coordinates
          * so client bytes stay plain text there too (L223). */
         uint32_t tail_n = 0;
-        pulsar_text_span *tail = pulsar_text_spans_slice(prompt_spans, prompt_n_spans, (uint32_t)text_end,
-                                                         (uint32_t)(prompt_bytes - text_end), &tail_n);
-        build_prompt_from_exact_prefix_and_text_suffix(s->engine, loaded, prompt_text + text_end,
-                                                       tail, tail_n, effective_prompt);
+        pulsar_text_span *tail = pulsar_text_spans_slice(spans, n_spans, (uint32_t)text_end,
+                                                         (uint32_t)(text_bytes - text_end), &tail_n);
+        build_prompt_from_exact_prefix_and_text_suffix(s->engine, loaded, text + text_end, tail, tail_n,
+                                                       effective_prompt);
         free(tail);
     }
     if (loaded_key_out) *loaded_key_out = xstrdup(chain[n - 1].key);
     server_log(PULSAR_LOG_KVCACHE,
-               "pulsar-server: kv cache hit%s chain of %d to %u (text %llu of %zu bytes) load=%.1f ms",
-               responses_protocol ? " [responses]" : "", n, chain[n - 1].G,
-               (unsigned long long)text_end, prompt_bytes, (server_now_sec() - t0) * 1000.0);
+               "pulsar-server: kv cache hit%s chain of %d to %u (text %llu of %zu bytes) load=%.1f ms in %d slice%s "
+               "(longest %.1f ms)",
+               responses_protocol ? " [responses]" : "", n, chain[n - 1].G, (unsigned long long)text_end, text_bytes,
+               r->read_ms, r->slices, r->slices == 1 ? "" : "s", r->slice_max_ms);
     return G;
+}
+
+int server::kv_cache_load(const kv_chain_hit *hit, const char *prompt_text, const pulsar_text_span *prompt_spans,
+                          uint32_t prompt_n_spans, int base, pulsar_tokens *effective_prompt, char **loaded_key_out,
+                          bool responses_protocol) {
+    if (loaded_key_out) *loaded_key_out = NULL;
+    /* the one-shot load: the whole chain as one slice (canonicalize_tool_checkpoint's rebuild, the one caller, runs to
+     * completion inside its quantum like the sync it serves -- and reads only what L310 prices under half the
+     * prefill it saves, so the read never stalls longer than that sync would) */
+    kv_restore r;
+    kv_restore_begin(&r, hit, base, false);
+    if (kv_restore_slice(&r, hit->n) != 1) return 0;
+    return kv_restore_finish(&r, prompt_text, prompt_spans, prompt_n_spans, effective_prompt, loaded_key_out,
+                             responses_protocol);
 }
 
 void server::kv_cache_discard_failed_chain(const char *key) {
