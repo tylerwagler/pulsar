@@ -1,7 +1,7 @@
 xgrammar C++ core, vendored verbatim for pulsar L303 (grammar-constrained decoding).
 
 upstream: https://github.com/mlc-ai/xgrammar  (Apache-2.0; LICENSE and NOTICE beside this file)
-pin:      614ab01d2af3fdfdde73ae3e4171a7f36db45c23  (v0.2.8+22, 2026-10-17)
+pin:      b319ac9f908e2c7f2bde6086c108c70f82f526c6  (v0.2.8+25, 2026-10-28)
 dlpack:   bbd2f4d32427e548797929af08cfe2a9cbb3cf12  (3rdparty/dlpack/dlpack.h only; Apache-2.0, LICENSE beside it)
 picojson: as carried by xgrammar's 3rdparty/picojson (BSD-2-Clause, in the header)
 
