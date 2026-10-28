@@ -19,10 +19,14 @@
 # WARNS if the clone's HEAD != this sha (that check found the dev box and
 # sparky on different revisions the day it was written).
 #
-# This sha is v4.8.0 (released 2026-09-22), bumped from v4.7.0 dcf215af on
-# 2026-09-23 (L244; Tyler: "it may have some improvements for us" -- the notes
-# name GeForce/sm_120 blockscaled GEMM, block-32 scale factors and grouped
-# blockscaled GEMM).  The pin was created on 2026-08-23 at v4.7.0 because
+# This sha is v4.8.1 (released 2026-10-20), bumped from v4.8.0 098de2a6 on
+# 2026-10-28 (upstream intake).  Between the two tags include/ differs ONLY in
+# cutlass/version.h (CUTLASS_PATCH 0 -> 1), which no header under include/ or
+# tools/util/include includes, and examples/41 (src/cuda/fmha) is unchanged:
+# the build reads byte-identical headers.  v4.8.0 itself was bumped from
+# v4.7.0 dcf215af on 2026-09-23 (L244; Tyler: "it may have some improvements
+# for us" -- the notes name GeForce/sm_120 blockscaled GEMM, block-32 scale
+# factors and grouped blockscaled GEMM).  The pin was created on 2026-08-23 at v4.7.0 because
 # three machines gave three answers (sparky v4.7.0, the dev box v4.6.1,
 # AGENTS.md claiming v4.5.2).
 #
@@ -34,4 +38,4 @@
 #
 # Point CUTLASS_DIR at a clone of this sha, or run `make cutlass`.
 url=https://github.com/NVIDIA/cutlass.git
-sha=098de2a652cf8f00fd70b2df54051c7eccbb855a
+sha=2c85f497547eb441f0fe80bfb0fb2e6f9add1719
