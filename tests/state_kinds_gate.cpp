@@ -342,6 +342,55 @@ static void plan_b(void) {
     check(!pulsar_state_create(NULL, &bad, NULL, 1, 64, 0), "a DELTA without its commit: refused");
 }
 
+/* gpuq #504: the chunk pool (runtime POOL mode, once per process -- so last).  A small pool: the chunks mapped before
+ * it are adopted, a step maps from the free list, an empty list refuses the step by name (-2, nothing created), a spill
+ * returns the bank's chunks to the list (nothing released), and the rows map again from them. */
+static void plan_pool(void) {
+    fprintf(stderr, "state-kinds gate: the chunk pool\n");
+    static pulsar_state_plan p;
+    plan_inkling(&p);
+    pulsar_state_set *ss = pulsar_state_create(NULL, &p, NULL, 2, 8190, PULSAR_STATE_VERIFY_ROWS);
+    check(ss != NULL, "a 2-bank set for the pool");
+    if (!ss) return;
+    const uint64_t chunk = pulsar_gpu_commit_chunk_bytes();
+    const int32_t first[1] = {99}, b0[1] = {0};
+    check(pulsar_state_pools_cover(ss, first, b0, 1), "bank 0's first rows map before the pool (DIRECT)");
+    const uint64_t adopted = pulsar_gpu_chunk_mapped_bytes() / chunk;
+    char err[256] = "";
+    check(pulsar_gpu_chunk_pool_reserve(7 * chunk, err, sizeof err) && pulsar_gpu_chunk_pool_on(),
+          "the pool reserves 7 chunks (%s)", err[0] ? err : "ok");
+    uint64_t total = 0, in_use = 0, free_c = 0;
+    pulsar_gpu_chunk_pool_stats(&total, &in_use, &free_c, NULL);
+    check(total == 7 + adopted && in_use == adopted && free_c == 7,
+          "the %llu chunks mapped before it are the pool's: total %llu, in use %llu, free %llu",
+          (unsigned long long)adopted, (unsigned long long)total, (unsigned long long)in_use,
+          (unsigned long long)free_c);
+    /* bank 1: 7 pools, one chunk each covers its first rows -- the list's 7 chunks */
+    const int32_t one[1] = {99}, b1[1] = {1};
+    check(pulsar_state_pools_cover(ss, one, b1, 1) && pulsar_gpu_chunk_pool_free_bytes() == 0,
+          "bank 1 maps its 7 pools' first chunks from the list (free now %llu B)",
+          (unsigned long long)pulsar_gpu_chunk_pool_free_bytes());
+    const int32_t far[1] = {8000};
+    check(!pulsar_state_pools_cover(ss, far, b1, 1), "an empty list refuses bank 1's next rows (nothing created)");
+    pulsar_gpu_chunk_pool_stats(&total, &in_use, &free_c, NULL);
+    check(total == 7 + adopted && free_c == 0, "the refusal created no chunk (total %llu)", (unsigned long long)total);
+    pulsar_state_bank_free(ss, 1);
+    pulsar_gpu_chunk_pool_stats(&total, &in_use, &free_c, NULL);
+    check(free_c == 7 && total == 7 + adopted, "a spill returns bank 1's chunks to the list (free %llu, total %llu)",
+          (unsigned long long)free_c, (unsigned long long)total);
+    check(pulsar_state_bank_alloc(ss, 1) && pulsar_state_pools_cover(ss, one, b1, 1) &&
+              pulsar_gpu_chunk_pool_free_bytes() == 0,
+          "the readmit maps them again from the list");
+    std::vector<uint8_t> row = pattern(KV_ROW, 11);
+    check(wr(pulsar_state_pool(ss, 5, A_KV_GLOBAL, 1), 99ull * KV_ROW, row) &&
+              rd(pulsar_state_pool(ss, 5, A_KV_GLOBAL, 1), 99ull * KV_ROW, KV_ROW) == row,
+          "a row on a pooled chunk reads back what was written");
+    pulsar_state_destroy(ss);
+    pulsar_gpu_chunk_pool_stats(&total, &in_use, &free_c, NULL);
+    check(free_c == total, "the set's destroy returns every chunk to the list (free %llu of %llu)",
+          (unsigned long long)free_c, (unsigned long long)total);
+}
+
 int main(void) {
     if (!pulsar_gpu_init()) {
         fprintf(stderr, "state-kinds gate: no device\n");
@@ -349,6 +398,7 @@ int main(void) {
     }
     plan_a();
     plan_b();
+    plan_pool();
     if (n_fail) {
         fprintf(stderr, "STATE-KINDS GATE FAIL (%d)\n", n_fail);
         return 1;

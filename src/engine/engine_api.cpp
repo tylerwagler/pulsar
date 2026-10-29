@@ -417,6 +417,12 @@ uint64_t pulsar_session_touched_kv_bytes(const pulsar_session *s) {
 }
 bool pulsar_session_bank_is_evicted(const pulsar_session *s, uint32_t bank) { PULSAR_FAMILY_REQUIRES_S(s, PULSAR_FAMILY_CAP_BANKS, "bank residency", false); return s ? session_banks(s)->is_evicted(s, bank) : false; }
 uint64_t pulsar_session_bank_touched_kv_bytes(pulsar_session *s, uint32_t bank) { PULSAR_FAMILY_REQUIRES_S(s, PULSAR_FAMILY_CAP_BANKS, "the touched-KV count", 0); return s ? session_banks(s)->touched_kv_bytes(s, bank) : 0; }
+uint64_t pulsar_session_kv_capacity_bytes(const pulsar_session *s) {
+    return s && s->states ? pulsar_state_pools_capacity_bytes(s->states) : 0;
+}
+uint64_t pulsar_session_kv_mapping_overhead_bytes(const pulsar_session *s) {
+    return s && s->states ? pulsar_state_mapping_overhead_bytes(s->states) : 0;
+}
 uint64_t pulsar_session_quantum_growth_bytes_per_bank(pulsar_session *s, uint32_t q) { PULSAR_FAMILY_REQUIRES_S(s, PULSAR_FAMILY_CAP_BANKS, "the bank growth price", 0); return session_banks(s)->growth_bytes(s, q); }
 /* The bank wrappers are defined with the mirror below (increment 2). */
 

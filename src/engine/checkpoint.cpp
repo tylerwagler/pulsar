@@ -344,7 +344,8 @@ bool pulsar_ckpt_adopt(pulsar_ckpt_store *st, uint32_t dst, uint32_t src, uint32
         if (crc != 1) {
             fprintf(stderr, "pulsar: adopting bank %u's state at %u into bank %u: its %llu MiB of pool rows could not "
                             "be backed (%s)\n", src, T, dst, (unsigned long long)((rows * dp[i].row_bytes) >> 20),
-                    crc < 0 ? "MemAvailable would fall under the commit floor" : "the driver refused");
+                    crc == -2 ? "the KV chunk pool is empty"
+                    : crc < 0 ? "MemAvailable would fall under the commit floor" : "the driver refused");
             ok = false;
             break;
         }

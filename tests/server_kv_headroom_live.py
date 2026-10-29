@@ -36,7 +36,10 @@ ap.add_argument("--binary", default="./pulsar-server")
 ap.add_argument("--port", type=int, default=8198)
 ap.add_argument("--ctx", type=int, default=1048576)
 ap.add_argument("--banks", type=int, default=4)
-ap.add_argument("--headroom-gib", type=float, default=0.5, help="MemAvailable above the floor the server starts with")
+ap.add_argument("--headroom-gib", type=float, default=1.5,
+                help="MemAvailable above the floor the server starts with (gpuq #504: its KV chunk pool leaves 1 GiB of "
+                     "it for non-KV growth, so the ceiling is about this less 1 GiB)")
+ap.add_argument("--ceiling-gib", type=float, default=0.5, help="the touched ceiling the frame is sized to")
 ap.add_argument("--slack-gib", type=float, default=0.5, help="how far under the floor MemAvailable may dip (unpriced)")
 ap.add_argument("--abort-gib", type=float, default=1.0, help="a dip this far under the floor ends the run as a FAIL")
 ap.add_argument("--timeout", type=int, default=1500)
@@ -209,24 +212,48 @@ try:
             mb[off:off + len(chunk)] = chunk
     print("balloon %.2f GiB: MemAvailable now %.2f GiB" % (want / GiB, mem_available() / GiB), flush=True)
 
-    # ---- H: the guarded server's ceiling is its measured headroom
-    p, log = start("guarded")
-    txt = open(log).read()
-    av = post_warmup_avail(txt)
-    mb_ = re.search(r"touched ceiling ([0-9.]+) GiB", txt)
-    mf = re.search(r"memory floor ([0-9.]+) MiB", txt)   # 2026-10-29: the derived floor every check reads
-    if mf:
-        FLOOR = float(mf.group(1)) * (1 << 20)
-    mt = re.search(r"touched ([0-9.]+) \+ MemAvailable", txt)
-    ceiling = float(mb_.group(1)) * GiB if mb_ else -1.0
-    touched0 = float(mt.group(1)) * GiB if mt else 0.0
-    headroom = av - FLOOR
+    # ---- H: the guarded server's ceiling is its measured headroom.  gpuq #504: the probe's cost estimate can miss by
+    # a GiB or more, and a ceiling one conversation cannot exceed by 1.25x inside 0.9 of the context proves nothing --
+    # so the frame is sized from the ceiling the server announces: too big, the server stops, the balloon grows by the
+    # excess and it starts again (at most 3 tries); still too big, the frame fails up front.
+    for attempt in range(3):
+        p, log = start("guarded")
+        txt = open(log).read()
+        av = post_warmup_avail(txt)
+        mbs = re.findall(r"touched ceiling ([0-9.]+) GiB", txt)   # the startup line, then the chunk pool's cut
+        mf = re.search(r"memory floor ([0-9.]+) MiB", txt)   # 2026-10-29: the derived floor every check reads
+        if mf:
+            FLOOR = float(mf.group(1)) * (1 << 20)
+        mt = re.search(r"touched ([0-9.]+) \+ MemAvailable", txt)
+        ceiling = float(mbs[-1]) * GiB if mbs else -1.0
+        ceiling0 = float(mbs[0]) * GiB if mbs else -1.0
+        touched0 = float(mt.group(1)) * GiB if mt else 0.0
+        headroom = av - FLOOR
+        reach = 0.9 * a.ctx * per_token   # the most KV one conversation can hold
+        if ceiling < 0 or 1.25 * ceiling <= reach or attempt == 2:
+            break
+        grow = ceiling - a.ceiling_gib * GiB
+        print("H: ceiling %.2f GiB is past what one conversation can exceed by 1.25x (%.2f GiB of KV at 0.9 ctx): "
+              "the balloon grows by %.2f GiB and the server starts again" % (ceiling / GiB, reach / GiB, grow / GiB),
+              flush=True)
+        stop(p)
+        procs.remove(p)
+        time.sleep(5)
+        if grow > 0:
+            mb = mmap.mmap(-1, int(grow), flags=mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS | getattr(mmap, "MAP_POPULATE", 0))
+            balloon.append(mb)
+            chunk = b"\x01" * (64 << 20)
+            for off in range(0, len(mb) - len(chunk) + 1, len(chunk)):
+                mb[off:off + len(chunk)] = chunk
     print("H: post-warmup MemAvailable %.2f GiB (headroom %.2f GiB over the floor), touched budget %.2f GiB"
           % (av / GiB, headroom / GiB, ceiling / GiB), flush=True)
     check(ceiling >= 0, "the server announced its touched budget")
-    check(ceiling <= touched0 + headroom + 0.02 * GiB,
+    check(1.25 * ceiling <= 0.9 * a.ctx * per_token,
+          "the frame: one conversation can exceed the %.2f GiB ceiling by 1.25x inside 0.9 of --ctx (%.2f GiB of KV)"
+          % (ceiling / GiB, 0.9 * a.ctx * per_token / GiB))
+    check(ceiling0 <= touched0 + headroom + 0.02 * GiB,
           "the touched budget %.2f GiB is within touched %.2f + the measured headroom %.2f GiB"
-          % (ceiling / GiB, touched0 / GiB, headroom / GiB))
+          % (ceiling0 / GiB, touched0 / GiB, headroom / GiB))
 
     # ---- F: one conversation grows in place past the headroom; MemAvailable sampled throughout
     low = [mem_available()]
@@ -249,8 +276,9 @@ try:
 
     th = threading.Thread(target=sample, daemon=True)
     th.start()
-    turn_tokens = int(0.3 * max(headroom, 0.1 * GiB) / per_token)
-    n_turns = min(int(2.5 / 0.3) + 2, int(0.9 * a.ctx / turn_tokens))
+    # turns of 0.3x the ceiling, enough of them for 1.25x of it (gpuq #504: sized from the ceiling, not the headroom)
+    turn_tokens = max(1, int(0.3 * max(ceiling, 0.1 * GiB) / per_token))
+    n_turns = min(int(1.25 / 0.3) + 2, int(0.9 * a.ctx / turn_tokens))
     print("F: one conversation growing in place, %d turns of ~%d tokens (%.2f GiB of KV each)" % (
         n_turns, turn_tokens, turn_tokens * per_token / GiB), flush=True)
     msgs, refused = [], None
@@ -278,8 +306,20 @@ try:
     th.join()
     txt = open(log).read() if os.path.exists(log) else ""
     check(not aborted.is_set(), "the run was not stopped at the floor")
-    check(low[0] <= av - 0.5 * headroom, "the fill pressed: MemAvailable fell %.2f GiB from its post-warmup %.2f GiB "
-          "(at least half the headroom)" % ((av - low[0]) / GiB, av / GiB))
+    # the fill pressed: with the KV chunk pool (gpuq #504) the KV takes the pool's chunks, not MemAvailable -- it was
+    # taken at startup -- so the pressure shows as chunks in use (at least half the ceiling); without one, as
+    # MemAvailable falling (at least half the headroom)
+    mm = metrics() if p.poll() is None else {}
+    pool_in_use = mm.get('pulsar:kv_pool_chunks{state="in_use"}', 0.0) * mm.get("pulsar:kv_pool_chunk_bytes", 0.0)
+    if mm.get('pulsar:kv_pool_chunks{state="total"}', 0.0) > 0:
+        bound = any(x in txt for x in ("spilling", "guard: spilled", "kv admission REFUSED", "prefill REFUSED (503)",
+                                       "queued until a busy bank"))
+        check(pool_in_use >= 0.5 * ceiling or bound, "the fill pressed: %.2f GiB of the KV chunk pool in use at the "
+              "end (at least half the %.2f GiB ceiling), or the guard bound on the way" % (pool_in_use / GiB,
+                                                                                         ceiling / GiB))
+    else:
+        check(low[0] <= av - 0.5 * headroom, "the fill pressed: MemAvailable fell %.2f GiB from its post-warmup %.2f "
+              "GiB (at least half the headroom)" % ((av - low[0]) / GiB, av / GiB))
     check(low[0] >= FLOOR - a.slack_gib * GiB, "MemAvailable stayed within %.2f GiB of the floor (low %.2f GiB)"
           % (a.slack_gib, low[0] / GiB))
     adm = (txt.count("spilling") + txt.count("queued until a busy bank") + txt.count("guard: spilled") +

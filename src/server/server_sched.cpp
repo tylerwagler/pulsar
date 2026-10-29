@@ -146,9 +146,13 @@ uint64_t server::guard_budget() {
         guard_avail = server_mem_available_bytes();
         guard_avail_at = now;
     }
+    /* the room the KV may still take: MemAvailable over the floor -- plus, once the chunk pool is reserved, the
+     * pool's free chunks, which KV growth takes instead of MemAvailable (so a spill, which returns chunks to the pool
+     * and not to MemAvailable, keeps the budget where it was, and only growth nobody accounts for lowers it) */
+    const uint64_t pool_free = pulsar_gpu_chunk_pool_free_bytes();
     const uint64_t live =
         server_guard_touched_budget(guard_kv_budget, guard_eager_bytes, pulsar_session_touched_kv_bytes(sess),
-                                    guard_avail);
+                                    guard_avail ? guard_avail + pool_free : 0);
     const uint64_t b = live < guard_touched_ceiling ? live : guard_touched_ceiling;
     /* rule 5: the budget the guard is keeping, said when it moves by half a GiB or more */
     const uint64_t step = 512ull << 20;
@@ -2613,16 +2617,31 @@ bool server::prompt_kv_admit(session_slot *sl, job *j, bool *refused) {
  * step being assembled): it leaves the fused lane, and its classic quantum runs this whole rule. */
 const char *const prefill_mem_step_names[PREFILL_MEM_STEPS] = { "go", "spill", "preempt", "refuse" };
 
-prefill_mem_step server_prefill_mem_step(uint64_t avail, uint64_t need, uint64_t floor, int n_idle_victims,
-                                         bool preemptible) {
-    if (server_headroom_admits(avail, need, floor)) return PREFILL_MEM_GO;
+bool server_kv_room_admits(uint64_t avail, uint64_t floor, bool pool_on, uint64_t pool_free, uint64_t need) {
+    if (pool_on) return server_headroom_admits(avail, 0, floor) && pool_free >= need;
+    return server_headroom_admits(avail, need, floor);
+}
+
+prefill_mem_step server_prefill_mem_step(bool fits, int n_idle_victims, bool preemptible) {
+    if (fits) return PREFILL_MEM_GO;
     if (n_idle_victims > 0) return PREFILL_MEM_SPILL;
     if (preemptible) return PREFILL_MEM_PREEMPT;
     return PREFILL_MEM_REFUSE;
 }
 
 uint64_t server::prefill_chunk_need() {
-    return pulsar_session_quantum_growth_bytes_per_bank(sess, (uint32_t)pulsar_session_prefill_cap(sess));
+    /* a chunk's rows, plus (pool mode) the most its mapping can open beyond them: a chunk a pool and the slack */
+    const uint64_t rows = pulsar_session_quantum_growth_bytes_per_bank(sess, (uint32_t)pulsar_session_prefill_cap(sess));
+    const int n = pulsar_session_bank_count(sess);
+    return rows + (pulsar_gpu_chunk_pool_on() && n > 0 ? pulsar_session_kv_mapping_overhead_bytes(sess) / (uint64_t)n
+                                                       : 0);
+}
+
+bool server::prefill_room_now(uint64_t need, uint64_t *avail_out) {
+    const uint64_t avail = server_mem_available_bytes();
+    if (avail_out) *avail_out = avail;
+    return server_kv_room_admits(avail, server_mem_floor(), pulsar_gpu_chunk_pool_on() != 0,
+                                 pulsar_gpu_chunk_pool_free_bytes(), need);
 }
 
 bool server::prefill_headroom_ok(session_slot *sl) {
@@ -2630,7 +2649,8 @@ bool server::prefill_headroom_ok(session_slot *sl) {
     gen_state *g = sl->gen;
     const uint64_t need = s->prefill_chunk_need(), floor = server_mem_floor();
     const double gib = 1024.0 * 1024.0 * 1024.0;
-    uint64_t avail = server_mem_available_bytes();
+    uint64_t avail = 0;
+    bool fits = s->prefill_room_now(need, &avail);
     bool preempt_tried = false;
     const char *why = "nothing left to free";   /* the refusal says which: a REFUSE verdict, or a remedy that failed */
     int spilled = 0;
@@ -2644,13 +2664,14 @@ bool server::prefill_headroom_ok(session_slot *sl) {
         bool decoders = false;
         for (int i = 0; i < s->n_slots && !preempt_tried; i++)
             decoders |= &s->slots[i] != sl && slot_is_batchable_decode(&s->slots[i]);
-        const prefill_mem_step step = server_prefill_mem_step(avail, need, floor, n_idle, decoders && !preempt_tried);
+        const prefill_mem_step step = server_prefill_mem_step(fits, n_idle, decoders && !preempt_tried);
         if (step == PREFILL_MEM_GO) return true;
         if (step == PREFILL_MEM_REFUSE) break;
         server_log(PULSAR_LOG_DEFAULT,
-                   "pulsar-server: prefill on bank %u: MemAvailable %.2f GiB does not cover the next chunk's %.2f GiB "
-                   "over the %.2f GiB floor -- %s first",
-                   sl->bank, (double)avail / gib, (double)need / gib, (double)floor / gib,
+                   "pulsar-server: prefill on bank %u: no room for the next chunk's %.2f GiB (MemAvailable %.2f GiB, "
+                   "floor %.2f GiB, chunk pool %.2f GiB free) -- %s first",
+                   sl->bank, (double)need / gib, (double)avail / gib, (double)floor / gib,
+                   (double)pulsar_gpu_chunk_pool_free_bytes() / gib,
                    step == PREFILL_MEM_SPILL ? "spilling the least-recently-used idle bank"
                                              : "preempting the newest decoder");
         if (step == PREFILL_MEM_SPILL) {
@@ -2662,13 +2683,14 @@ bool server::prefill_headroom_ok(session_slot *sl) {
             if (!s->preempt_newest_decoder(sl, need)) continue;   /* none could go: the next round refuses */
         }
         if (!s->bank_switch(sl->bank)) { why = "the bank could not be reinstalled after a remedy"; break; }
-        avail = server_mem_available_bytes();
+        fits = s->prefill_room_now(need, &avail);
     }
     s->count_metric(&s->m_prefill_mem_refusals);
     snprintf(g->err, sizeof g->err,
-             "not enough memory to continue this prompt now (MemAvailable %.2f GiB, next chunk %.2f GiB, floor "
-             "%.2f GiB); the part computed is kept, retry later",
-             (double)avail / gib, (double)need / gib, (double)floor / gib);
+             "not enough memory to continue this prompt now (MemAvailable %.2f GiB, floor %.2f GiB, next chunk "
+             "%.2f GiB, pool %.2f GiB free); the part computed is kept",
+             (double)avail / gib, (double)floor / gib, (double)need / gib,
+             (double)pulsar_gpu_chunk_pool_free_bytes() / gib);
     unsigned skipped = 0;
     if (warn_limiter_due(&s->prefill_mem_warn, server_now_sec(), PULSAR_SERVER_MEM_FLOOR_WARN_SEC, &skipped))
         server_log(PULSAR_LOG_WARNING, "pulsar-server: prefill REFUSED (503) on bank %u at %d of %d tokens -- %s after "
@@ -2691,7 +2713,7 @@ bool server::prefill_headroom_ok(session_slot *sl) {
 }
 
 bool server::prefill_headroom_fused_ok(session_slot *sl) {
-    if (server_headroom_admits(server_mem_available_bytes(), prefill_chunk_need(), server_mem_floor())) return true;
+    if (prefill_room_now(prefill_chunk_need(), NULL)) return true;
     sl->gen->no_fuse = "the memory floor (its classic quantum re-checks it, with the guard's remedies)";
     return false;
 }

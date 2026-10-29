@@ -485,6 +485,11 @@ uint64_t pulsar_session_bank_touched_kv_bytes(pulsar_session *s, uint32_t bank);
 /** Conservative per-bank comp/index growth over one q-token decode quantum (the
  * guard's Delta term; over-charges the index side so the guard fires early). */
 uint64_t pulsar_session_quantum_growth_bytes_per_bank(pulsar_session *s, uint32_t q);
+/** work/kv-vmm: the declared state's reserved KV bytes, every bank's pools (0 for a family with none: DeepSeek's
+ *  comp/index stay managed until phase 2), and the most the mapping adds over the touched rows (a chunk a pool plus
+ *  the read slack, every bank) -- what the server's chunk pool is sized from. */
+uint64_t pulsar_session_kv_capacity_bytes(const pulsar_session *s);
+uint64_t pulsar_session_kv_mapping_overhead_bytes(const pulsar_session *s);
 /** GPU bytes the session's create allocated (allocator delta measured across
  * pulsar_session_create).  Equal to pulsar_engine_session_cost_bytes at the
  * same context and pool size -- the server asserts it after each create. */

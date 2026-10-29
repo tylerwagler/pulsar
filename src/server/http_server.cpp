@@ -986,6 +986,18 @@ bool server::send_metrics(int fd) {
     buf_puts(&b, "# HELP pulsar:prefill_mem_refusals_total Prefills stopped mid-prompt because MemAvailable was under the memory floor before a chunk.\n");
     buf_puts(&b, "# TYPE pulsar:prefill_mem_refusals_total counter\n");
     buf_printf(&b, "pulsar:prefill_mem_refusals_total %llu\n", prefill_mem_refusals);
+    {
+        uint64_t total = 0, in_use = 0, free_chunks = 0, chunk = 0;
+        pulsar_gpu_chunk_pool_stats(&total, &in_use, &free_chunks, &chunk);
+        buf_puts(&b, "# HELP pulsar:kv_pool_chunks KV chunk pool (work/kv-vmm): chunks reserved at startup, by state (0s without a pool).\n");
+        buf_puts(&b, "# TYPE pulsar:kv_pool_chunks gauge\n");
+        buf_printf(&b, "pulsar:kv_pool_chunks{state=\"total\"} %llu\n", (unsigned long long)total);
+        buf_printf(&b, "pulsar:kv_pool_chunks{state=\"in_use\"} %llu\n", (unsigned long long)in_use);
+        buf_printf(&b, "pulsar:kv_pool_chunks{state=\"free\"} %llu\n", (unsigned long long)free_chunks);
+        buf_puts(&b, "# HELP pulsar:kv_pool_chunk_bytes Bytes a KV chunk.\n");
+        buf_puts(&b, "# TYPE pulsar:kv_pool_chunk_bytes gauge\n");
+        buf_printf(&b, "pulsar:kv_pool_chunk_bytes %llu\n", (unsigned long long)chunk);
+    }
     buf_puts(&b, "# HELP pulsar:worker_stalled_seconds Seconds the worker has made no progress while jobs wait (the stall watchdog; 0 = progressing or off).\n");
     buf_puts(&b, "# TYPE pulsar:worker_stalled_seconds gauge\n");
     buf_printf(&b, "pulsar:worker_stalled_seconds %lld\n", (long long)__atomic_load_n(&s->stall_s, __ATOMIC_RELAXED));

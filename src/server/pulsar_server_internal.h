@@ -1515,6 +1515,10 @@ typedef struct {
  * the instantaneous worst case. One /proc/meminfo read per provisioning
  * attempt, never on a hot path. */
 #define PULSAR_SERVER_MEM_FLOOR_BYTES        (4ull * 1024ull * 1024ull * 1024ull)
+/** gpuq #504: what the KV chunk pool leaves above the floor at startup for the growth beside the KV while serving --
+ *  host heap, page cache, the driver's own -- since KV growth takes only the pool.  Sparky's #490 trace: ~1 GiB of
+ *  such growth over 20 minutes of three 210k conversations. */
+#define PULSAR_SERVER_POOL_NONKV_BYTES       (1ull * 1024ull * 1024ull * 1024ull)
 
 typedef enum {
     SLOT_IDLE = 0,     /* no live job; the slot's KV may be warm and reusable */
@@ -2225,8 +2229,11 @@ struct server {
     /** The fused / mixed lanes' form: no remedy (banks would move under the step being assembled) and no refusal --
      *  short of the floor the prompt leaves the fused lane (gen->no_fuse) and its classic quantum decides. */
     bool prefill_headroom_fused_ok(session_slot *sl);
-    /** One prefill chunk's new KV on one bank (the per-chunk re-check's need). */
+    /** One prefill chunk's new KV on one bank (the per-chunk re-check's need): its rows, plus with the chunk pool the
+     *  most its mapping opens past them. */
     uint64_t prefill_chunk_need();
+    /** server_kv_room_admits over the live readings (MemAvailable into *avail_out). */
+    bool prefill_room_now(uint64_t need, uint64_t *avail_out);
     warn_limiter prefill_mem_warn;   ///< the prefill-refused line, rate-limited (each refusal is counted)
     /** Resolve the prompt against every cache layer and decide the prefill plan.
      * Clients resend full prompts as text.  The worker first tries the old exact
@@ -3667,12 +3674,15 @@ uint64_t server_persist_host_bytes(int tokens);
 #define PERSIST_TEXT_BYTES_PER_TOKEN 64u
 /** Does MemAvailable `avail` leave `floor` after `need` more bytes?  avail 0 (unreadable) is no. */
 bool server_headroom_admits(uint64_t avail, uint64_t need, uint64_t floor);
-/** The per-chunk prefill re-check's next move (server::prefill_headroom_ok): GO when MemAvailable covers the chunk
- *  over the floor; else SPILL while an idle bank can go, else PREEMPT while a decoder can, else REFUSE. */
+/** The per-chunk prefill re-check's next move (server::prefill_headroom_ok): GO when the chunk fits
+ *  (server_kv_room_admits); else SPILL while an idle bank can go, else PREEMPT while a decoder can, else REFUSE. */
 typedef enum { PREFILL_MEM_GO = 0, PREFILL_MEM_SPILL, PREFILL_MEM_PREEMPT, PREFILL_MEM_REFUSE, PREFILL_MEM_STEPS } prefill_mem_step;
 extern const char *const prefill_mem_step_names[PREFILL_MEM_STEPS];
-prefill_mem_step server_prefill_mem_step(uint64_t avail, uint64_t need, uint64_t floor, int n_idle_victims,
-                                         bool preemptible);
+prefill_mem_step server_prefill_mem_step(bool fits, int n_idle_victims, bool preemptible);
+/** Is there room for `need` more bytes of KV now?  Before the chunk pool (DIRECT): MemAvailable covers it over the
+ *  floor.  With the pool reserved: the pool's free chunks cover it AND MemAvailable is still over the floor (growth
+ *  nobody accounts for -- the host heap, the page cache -- takes MemAvailable; KV takes only the pool). */
+bool server_kv_room_admits(uint64_t avail, uint64_t floor, bool pool_on, uint64_t pool_free, uint64_t need);
 
 /* MemAvailable from /proc/meminfo, in bytes (0 on parse failure — callers
  * fail closed).  Never called on a token/layer hot path (defined in

@@ -727,6 +727,11 @@ int main(int argc, char **argv) {
     /* Slice 4e (L238): a TP worker rank serves no HTTP and schedules nothing;
      * it applies the leader's frames until the leader stops it. */
     if (pulsar_engine_is_tp_worker(engine)) {
+        /* work/kv-vmm: a worker rank serves no request and sizes no guard, so it reserves no chunk pool (a gap: its
+         * commits create chunks on demand) -- but every one is gated by the same floor's OS margin and the kernel's
+         * watermarks, so a worker never maps the box into its min watermark */
+        pulsar_gpu_set_commit_floor(server_mem_floor_init(server_zone_high_watermark_bytes(),
+                                                          server_persist_host_bytes(cfg.ctx_size)));
         char werr[512];
         const int wrc = pulsar_tp_worker_run(engine, werr, sizeof(werr));
         if (wrc != 0) server_log(PULSAR_LOG_DEFAULT, "pulsar-server: TP worker stopped on a failure: %s", werr);
@@ -1221,6 +1226,64 @@ int main(int argc, char **argv) {
                    "budget under it (touched + MemAvailable − floor now); spills persist to the disk KV cache",
                    (double)s.guard_touched_ceiling / gib, (double)budget / gib, (double)s.guard_eager_bytes / gib,
                    (double)warm_touched / gib, (double)warm_avail / gib, (double)server_mem_floor() / gib);
+    }
+    /* gpuq #503/#504: the KV chunk pool -- every 2 MiB chunk the KV pools will ever map, created NOW, while memory is
+     * clean, so no cuMemCreate runs while serving (near the floor each one drove reclaim and compaction; the squeeze
+     * leg's unit was killed by systemd-oomd twice).  Sized to what the KV may hold -- the guard's ceiling plus what the
+     * mapping adds over its rows (a chunk a pool and the read slack, every bank), or the pools' whole capacity without
+     * a guard -- and never past MemAvailable over the floor.  The guard's ceiling is then cut to what the pool holds.
+     * A start that cannot fill it refuses: there is no runtime create to fall back on (rule 1).  A family with no
+     * reserved pools (DeepSeek, until phase 2) reserves nothing. */
+    {
+        const uint64_t capacity = pulsar_session_kv_capacity_bytes(session);
+        const uint64_t overhead = pulsar_session_kv_mapping_overhead_bytes(session);
+        const uint64_t mapped = pulsar_gpu_chunk_mapped_bytes();   /* the warmup's chunks: the pool's from here */
+        const uint64_t avail = server_mem_available_bytes();
+        /* the pool leaves PULSAR_SERVER_POOL_NONKV_BYTES above the floor for what grows beside the KV while serving
+         * (host heap, page cache): KV growth takes only the pool, so that margin is all the non-KV side has */
+        const uint64_t keep = server_mem_floor() + PULSAR_SERVER_POOL_NONKV_BYTES;
+        const uint64_t room = avail > keep ? avail - keep : 0;
+        uint64_t want = s.guard_enabled ? s.guard_touched_ceiling + overhead : capacity;
+        if (want > capacity) want = capacity;
+        uint64_t fresh = want > mapped ? want - mapped : 0;
+        if (fresh > room) fresh = room;
+        const double gib = 1024.0 * 1024.0 * 1024.0;
+        if (capacity > 0) {
+            const double t0 = server_now_sec();
+            char perr[256] = "";
+            if (!pulsar_gpu_chunk_pool_reserve(fresh, perr, sizeof perr)) {
+                server_log(PULSAR_LOG_ERROR, "pulsar-server: refusing to start: the KV chunk pool (%.2f GiB) could not "
+                           "be reserved: %s", (double)fresh / gib, perr);
+                pulsar_session_free(session);
+                pulsar_engine_close(engine);
+                return 1;
+            }
+            uint64_t total = 0, chunk = 0;
+            pulsar_gpu_chunk_pool_stats(&total, NULL, NULL, &chunk);
+            const uint64_t pool_bytes = total * chunk;
+            if (s.guard_enabled) {
+                const uint64_t held = pool_bytes > overhead ? pool_bytes - overhead : 0;
+                if (held < s.guard_touched_ceiling) s.guard_touched_ceiling = held;
+                if (s.guard_touched_ceiling == 0) {
+                    server_log(PULSAR_LOG_ERROR, "pulsar-server: refusing to start: the KV chunk pool (%.2f GiB) holds "
+                               "no touched KV past the mapping's %.2f GiB of overhead -- lower PULSAR_MSEQ_BANKS",
+                               (double)pool_bytes / gib, (double)overhead / gib);
+                    pulsar_session_free(session);
+                    pulsar_engine_close(engine);
+                    return 1;
+                }
+            }
+            server_log(PULSAR_LOG_DEFAULT,
+                       "pulsar-server: KV chunk pool reserved: %llu chunks of %llu MiB = %.2f GiB (%llu created in "
+                       "%.2f s, %llu adopted from the warmup; mapping overhead %.2f GiB; pools' capacity %.2f GiB); "
+                       "MemAvailable %.2f -> %.2f GiB (%.2f GiB kept over the floor for non-KV growth); touched "
+                       "ceiling %.2f GiB -- no chunk is created or released while serving",
+                       (unsigned long long)total, (unsigned long long)(chunk >> 20), (double)pool_bytes / gib,
+                       (unsigned long long)(fresh / (chunk ? chunk : 1)), server_now_sec() - t0,
+                       (unsigned long long)(mapped / (chunk ? chunk : 1)), (double)overhead / gib,
+                       (double)capacity / gib, (double)avail / gib, (double)server_mem_available_bytes() / gib,
+                       (double)PULSAR_SERVER_POOL_NONKV_BYTES / gib, (double)s.guard_touched_ceiling / gib);
+        }
     }
     s.sess = session;                /* the one session; slot 0 describes it */
     /* ctx_size on slot 0 is the pool's shared per-bank ctx reference and is

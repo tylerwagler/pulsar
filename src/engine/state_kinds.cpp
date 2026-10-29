@@ -130,7 +130,8 @@ bool pulsar_state_pools_cover_bank(pulsar_state_set *ss, uint32_t bank, uint32_t
             fprintf(stderr, "pulsar: %s: bank %u's '%s' pool (slot %u) could not be backed to %u tokens (%.1f MiB "
                             "mapped, %.1f MiB wanted): %s -- refusing the step\n", p->name, bank, p->decl[id].name,
                     k, T, (double)pulsar_gpu_tensor_committed_bytes(t) / 1048576.0, (double)need / 1048576.0,
-                    rc < 0 ? "MemAvailable would fall under the commit floor" : "the driver refused the memory");
+                    rc == -2 ? "the KV chunk pool is empty (every reserved chunk is mapped)"
+                    : rc < 0 ? "MemAvailable would fall under the commit floor" : "the driver refused the memory");
             return false;
         }
     }
@@ -155,6 +156,28 @@ bool pulsar_state_pools_cover(pulsar_state_set *ss, const int32_t *pos, const in
 /* The TRUNK slots' pools only: what a spill frees.  A drafter slot's pool (Nemotron's MTP module, a block drafter's)
  * trails the trunk by a row, is no segment's, and so stays mapped across a spill -- nothing could restore it -- as it
  * stayed resident under the managed pools (gpuq #497). */
+uint64_t pulsar_state_pools_capacity_bytes(const pulsar_state_set *ss) {
+    const pulsar_state_plan *p = ss->plan;
+    uint64_t bytes = 0;
+    for (uint32_t b = 0; b < ss->n_banks; b++)
+        for (uint32_t k = 0; k < p->n_slots; k++)
+            for (uint32_t id = 0; id < p->n_decl; id++)
+                if (has(p->slot[k], id) && p->decl[id].kind == PULSAR_STATE_POOL && ss->pool[k][id][b])
+                    bytes += pulsar_gpu_tensor_bytes(ss->pool[k][id][b]);
+    return bytes;
+}
+
+uint64_t pulsar_state_mapping_overhead_bytes(const pulsar_state_set *ss) {
+    const pulsar_state_plan *p = ss->plan;
+    const uint64_t chunk = pulsar_gpu_commit_chunk_bytes();
+    uint64_t bank = 0;
+    for (uint32_t k = 0; k < p->n_slots; k++)
+        for (uint32_t id = 0; id < p->n_decl; id++)
+            if (has(p->slot[k], id) && p->decl[id].kind == PULSAR_STATE_POOL)
+                bank += chunk + pool_rows_bytes(p->decl[id], PULSAR_STATE_POOL_READ_SLACK);
+    return bank * ss->n_banks;
+}
+
 uint64_t pulsar_state_bank_committed_bytes(const pulsar_state_set *ss, uint32_t bank) {
     const pulsar_state_plan *p = ss->plan;
     uint64_t bytes = 0;

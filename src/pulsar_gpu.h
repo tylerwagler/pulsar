@@ -202,10 +202,10 @@ pulsar_gpu_tensor *pulsar_gpu_tensor_alloc_managed(uint64_t bytes);
  *  (the KV pools, state_kinds.cpp).  NULL (said once) when the device has no VMM.  A dry run prices it as the
  *  demand-paged share. */
 pulsar_gpu_tensor *pulsar_gpu_tensor_reserve(uint64_t bytes);
-/** Back [0, bytes) of a reserved tensor with physical (whole chunks, created and mapped on the host): 1 = backed,
- *  -1 = refused by the commit floor (MemAvailable would not cover the next chunk over it; nothing created), 0 = the
- *  driver could not (nothing half-mapped).  The caller names the pool and the tokens.  A plain tensor is backed
- *  whole: 1 for any bytes inside it. */
+/** Back [0, bytes) of a reserved tensor with physical (whole chunks, mapped on the host): 1 = backed, -2 = the chunk
+ *  pool is empty (POOL mode), -1 = refused by the commit floor (DIRECT mode: MemAvailable would not cover the next
+ *  chunk over it; nothing created), 0 = the driver could not (nothing half-mapped).  The caller names the pool and
+ *  the tokens.  A plain tensor is backed whole: 1 for any bytes inside it. */
 int pulsar_gpu_tensor_commit(pulsar_gpu_tensor *t, uint64_t bytes);
 /** The MemAvailable every commit keeps free (the server's derived floor, set once at startup; 0 = no gate).  On
  *  GB10 the driver's cuMemCreate does not refuse before the kernel's margin (gpuq #492), so this gate is what does. */
@@ -217,6 +217,19 @@ int pulsar_gpu_tensor_decommit(pulsar_gpu_tensor *t);
 uint64_t pulsar_gpu_tensor_committed_bytes(const pulsar_gpu_tensor *t);
 /** The commit granularity (bytes a chunk). */
 uint64_t pulsar_gpu_commit_chunk_bytes(void);
+/** gpuq #503/#504: reserve the process's chunk pool -- create `bytes` of 2 MiB chunks now, once, into a free list,
+ *  and switch every commit to mapping from it (a commit with the list empty returns -2; a decommit returns its chunks
+ *  to the list; nothing is created or released after this).  Chunks mapped before it (the warmup's) join the pool.
+ *  1 = reserved; 0 = refused (err says which chunk the driver refused; nothing is kept). */
+int pulsar_gpu_chunk_pool_reserve(uint64_t bytes, char *err, size_t errlen);
+/** 1 when the pool is reserved (POOL mode), 0 before (DIRECT: a commit creates, gated by the commit floor). */
+int pulsar_gpu_chunk_pool_on(void);
+/** The pool's chunks: owned, mapped (in use), on the free list, and a chunk's bytes (0s before the reserve). */
+void pulsar_gpu_chunk_pool_stats(uint64_t *total, uint64_t *in_use, uint64_t *free_chunks, uint64_t *chunk_bytes);
+/** The pool's free bytes (0 before the reserve). */
+uint64_t pulsar_gpu_chunk_pool_free_bytes(void);
+/** The bytes every reserved tensor has mapped now. */
+uint64_t pulsar_gpu_chunk_mapped_bytes(void);
 pulsar_gpu_tensor *pulsar_gpu_tensor_view(const pulsar_gpu_tensor *base, uint64_t offset, uint64_t bytes);
 void pulsar_gpu_tensor_free(pulsar_gpu_tensor *tensor);
 uint64_t pulsar_gpu_tensor_bytes(const pulsar_gpu_tensor *tensor);

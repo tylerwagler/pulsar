@@ -213,6 +213,11 @@ bool pulsar_state_pools_cover(pulsar_state_set *ss, const int32_t *pos, const in
  *  and is not counted).  NOT the guard's touched ledger, which stays the high-water's rows (state_kinds.cpp,
  *  decl_bank_touched_kv_bytes, gpuq #500). */
 uint64_t pulsar_state_bank_committed_bytes(const pulsar_state_set *ss, uint32_t bank);
+/** Every bank's pools' reserved bytes: the most the KV can ever map. */
+uint64_t pulsar_state_pools_capacity_bytes(const pulsar_state_set *ss);
+/** What the mapping adds over the rows ledger at most, every bank: a chunk a pool (the open one) plus the read
+ *  slack's rows.  The chunk pool is sized to the ledger's ceiling plus this. */
+uint64_t pulsar_state_mapping_overhead_bytes(const pulsar_state_set *ss);
 /** L284 #3: a bank's physical residency -- its trunk pools.  _free releases them (and zeroes its high-water),
  *  _alloc re-backs whichever are missing (idempotent; on a failure the bank is left wholly evicted), _evicted is
  *  true while any is missing. */

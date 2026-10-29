@@ -23,6 +23,9 @@
  *   INFO        what taking the physical costs the box: /proc/vmstat reclaim (pgscan / pgsteal) and compaction
  *               (compact_stall / fail / success) deltas and PSI memory, for the VMM rounds, for the same bytes as one
  *               GPU-touched cudaMallocManaged buffer (the old pools' allocator), and for the gated oversubscription
+ *   pool        at that floor, the chunks the gated phase holds are a pre-created pool: unmapped and mapped at
+ *               another VA (a spill and a readmit) round after round, with no compaction stall (gpuq #504: the server
+ *               creates its chunks once at startup and only maps them while serving)
  *   timing      commit (create + map + set access) and decommit (unmap + release) per chunk, median / max, at 2 MiB
  *               and at --chunk-mib
  *
@@ -569,6 +572,47 @@ int main(int argc, char **argv) {
                 (double)gated_chunks * chunk / GiB, low / GiB, slowest,
                 !(dm_ok0 && dm_ok1) ? "unreadable (run with dmesg access to check)" : hits ? first.c_str() : "clean",
                 last != CUDA_SUCCESS ? "; the driver refused first: " : "", last != CUDA_SUCCESS ? cu_err(last) : "");
+        /* ---- pool (gpuq #504): the server creates its chunks once, at startup, and from then on only MAPS them.  Here,
+         * at the floor the gated phase left the box at, the chunks it holds are the pre-created pool: POOL_CYCLES
+         * rounds unmap POOL_BATCH of them and map them again at another VA (a spill and a readmit), checking the data
+         * on the new VA.  PASS: no create, no compaction stall, every map < 50 ms (the reclaim scan is reported). */
+        if (gated_refused && held.size() >= 64) {
+            const int POOL_CYCLES = 50;
+            const size_t POOL_BATCH = 32;
+            CUdeviceptr pv = 0;
+            const bool pv_ok = p_cuMemAddressReserve(&pv, POOL_BATCH * chunk, gmin, 0, 0) == CUDA_SUCCESS;
+            const vmstat_snap p0 = vmstat_read();
+            double slow_map = 0;
+            bool pool_ok = pv_ok;
+            for (int cyc = 0; pool_ok && cyc < POOL_CYCLES; cyc++) {
+                for (size_t i = 0; pool_ok && i < POOL_BATCH; i++) {
+                    auto &x = held[held.size() - 1 - i];
+                    const double t0 = now_ms();
+                    pool_ok = p_cuMemUnmap(x.first, chunk) == CUDA_SUCCESS &&
+                              p_cuMemMap(pv + i * chunk, chunk, 0, x.second, 0) == CUDA_SUCCESS &&
+                              p_cuMemSetAccess(pv + i * chunk, chunk, &g_access, 1) == CUDA_SUCCESS;
+                    slow_map = std::max(slow_map, now_ms() - t0);
+                }
+                if (pool_ok && cyc == POOL_CYCLES - 1)
+                    pool_ok = rw_ok(pv, chunk, 0x900du, pinned, pageable.data(), bad, why, sizeof why);
+                for (size_t i = 0; pool_ok && i < POOL_BATCH; i++) {   /* back where they were */
+                    auto &x = held[held.size() - 1 - i];
+                    pool_ok = p_cuMemUnmap(pv + i * chunk, chunk) == CUDA_SUCCESS &&
+                              p_cuMemMap(x.first, chunk, 0, x.second, 0) == CUDA_SUCCESS &&
+                              p_cuMemSetAccess(x.first, chunk, &g_access, 1) == CUDA_SUCCESS;
+                }
+            }
+            const vmstat_snap p1 = vmstat_read();
+            if (pv_ok) p_cuMemAddressFree(pv, POOL_BATCH * chunk);
+            /* the property is the compaction (an allocation's); kswapd may scan for others' pages near the floor */
+            verdict(pool_ok && p1.compact_stall == p0.compact_stall && slow_map < 50.0,
+                    "pool", "%d rounds of %zu pre-created chunks unmapped and mapped at another VA at MemAvailable "
+                    "%.2f GiB: compaction stalls +%llu, pgscan +%llu, slowest map %.2f ms%s%s", POOL_CYCLES, POOL_BATCH,
+                    mem_available() / GiB, p1.compact_stall - p0.compact_stall, p1.pgscan - p0.pgscan, slow_map,
+                    pool_ok ? "" : " -- ", pool_ok ? "" : why);
+        } else {
+            verdict(false, "pool", "no pre-created chunks to cycle (the gated phase did not reach its floor)");
+        }
         /* informational: the ungated driver, from the floor down to --stop-gib */
         if (gated_refused && !skip_ungated) {
             bool stopped = false;

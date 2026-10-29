@@ -35,6 +35,9 @@ PASS (exit 0) only when every check holds:
   7. dmesg (when readable) has no new page-allocation failure or nvidia-uvm line
   8. a prefill refused at the floor had nothing left to free: the guard's remedies (spill an idle bank with KV,
      preempt the newest decoder) ran first wherever there was something (the refusal line says which)
+  9. the KV chunk pool was reserved at startup, and MemAvailable stayed flat under KV growth: it fell by at most
+     --nonkv-gib (1.5) from the server's ready reading (gpuq #504)
+ 10. no compaction stall (/proc/vmstat compact_stall) while serving: no chunk is created after startup
 
 Needs the box to itself (it measures system MemAvailable): a quiet gpuq job, production stopped.  ~1-2 h at the
 defaults (three 200k conversations at ~550 t/s of continued prefill)."""
@@ -53,6 +56,7 @@ ap.add_argument("--turn", type=int, default=15000, help="tokens a continued pref
 ap.add_argument("--headroom-gib", type=float, default=3.0, help="MemAvailable above the derived floor at start")
 ap.add_argument("--slack-gib", type=float, default=0.25, help="how far under the floor MemAvailable may dip")
 ap.add_argument("--req-timeout", type=int, default=900)
+ap.add_argument("--nonkv-gib", type=float, default=1.5, help="how far MemAvailable may fall while serving (non-KV)")
 ap.add_argument("--timeout", type=int, default=7200)
 ap.add_argument("--log", default=os.path.join(os.environ.get("TMPDIR", "/var/tmp"), "nemotron-mem-squeeze.log"))
 a = ap.parse_args()
@@ -175,6 +179,15 @@ def chat(messages, max_tokens=16):
         return -1, {}, str(e)
 
 
+def vmstat():
+    out = {}
+    for line in open("/proc/vmstat"):
+        k, _, v = line.partition(" ")
+        if k in ("compact_stall", "compact_fail") or k.startswith("pgscan_"):
+            out[k] = out.get(k, 0) + int(v)
+    return out
+
+
 def words(seed, n):
     r = random.Random(seed)
     return " ".join("%s%d" % (r.choice(("alpha", "bravo", "cedar", "delta", "ember", "fjord")), r.randrange(10**6))
@@ -213,6 +226,8 @@ try:
     print("B: balloon %.2f GiB, MemAvailable now %.2f GiB" % (max(want, 0) / GiB, mem_available() / GiB), flush=True)
 
     p, log = start("squeezed")
+    avail_ready = mem_available()   # gpuq #504: the KV chunk pool is reserved by now; KV growth must not move this
+    vm_ready = vmstat()
     low = [mem_available()]
     stalled_seen, health_bad = [], []
     done = threading.Event()
@@ -294,6 +309,20 @@ try:
     check(all("nothing left to free" in l for l in ref_lines),
           "8 every prefill refused at the floor had nothing left to free (%d refusals, %d remedy lines): %s" % (
               len(ref_lines), remedies, [l[-160:] for l in ref_lines if "nothing left to free" not in l][:2] or "ok"))
+    # 9 / 10 (gpuq #504): the KV chunk pool was reserved at startup, so KV growth takes chunks, not MemAvailable --
+    # MemAvailable may fall only by the growth nobody accounts for (host heap, page cache: --nonkv-gib), and no chunk
+    # is created while serving, so the window has no compaction stall
+    pool_line = re.search(r"KV chunk pool reserved: (\d+) chunks .* = ([0-9.]+) GiB", txt)
+    check(pool_line is not None, "9a the server reserved its KV chunk pool at startup: %s" % (
+        pool_line.group(0)[:120] if pool_line else "no 'KV chunk pool reserved' line"))
+    check(avail_ready - low[0] <= a.nonkv_gib * GiB,
+          "9 MemAvailable stayed flat under KV growth: %.2f GiB at ready, low %.2f (fell %.2f, at most %.2f GiB of "
+          "non-KV growth)" % (avail_ready / GiB, low[0] / GiB, (avail_ready - low[0]) / GiB, a.nonkv_gib))
+    vm_end = vmstat()
+    stalls = vm_end.get("compact_stall", 0) - vm_ready.get("compact_stall", 0)
+    check(stalls == 0, "10 no compaction stall while serving (+%d; pgscan +%d)" % (
+        stalls, sum(v for k, v in vm_end.items() if k.startswith("pgscan_")) -
+        sum(v for k, v in vm_ready.items() if k.startswith("pgscan_"))))
     dmesg1 = dmesg_lines()
     if dmesg0 is not None and dmesg1 is not None:
         new = dmesg1[len(dmesg0):]

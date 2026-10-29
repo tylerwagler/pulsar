@@ -11162,16 +11162,29 @@ static void test_persist_skipped_under_the_floor(void) {
  * idle bank while one can go, else preempt a decoder while one can -- and refuses only when nothing can be freed (the
  * headroom leg's single conversation: one bank, nothing to spill, the 503 is right). */
 static void test_prefill_mem_step_tries_remedies_first(void) {
-    const uint64_t MiB = 1024ull * 1024ull, F = 4538ull * MiB, need = 52ull * MiB;
-    TEST_ASSERT(server_prefill_mem_step(F + need, need, F, 0, false) == PREFILL_MEM_GO);
-    TEST_ASSERT(server_prefill_mem_step(F + need, need, F, 3, true) == PREFILL_MEM_GO);     /* room: no remedy */
-    TEST_ASSERT(server_prefill_mem_step(F + need - 1, need, F, 3, true) == PREFILL_MEM_SPILL);
-    TEST_ASSERT(server_prefill_mem_step(F, need, F, 1, false) == PREFILL_MEM_SPILL);       /* an idle bank first */
-    TEST_ASSERT(server_prefill_mem_step(F, need, F, 0, true) == PREFILL_MEM_PREEMPT);      /* then a decoder */
-    TEST_ASSERT(server_prefill_mem_step(F, need, F, 0, false) == PREFILL_MEM_REFUSE);      /* nothing to free */
-    TEST_ASSERT(server_prefill_mem_step(0, need, F, 0, false) == PREFILL_MEM_REFUSE);      /* unreadable: closed */
-    TEST_ASSERT(server_prefill_mem_step(0, need, F, 2, false) == PREFILL_MEM_SPILL);       /* ... but freeing helps */
+    TEST_ASSERT(server_prefill_mem_step(true, 0, false) == PREFILL_MEM_GO);
+    TEST_ASSERT(server_prefill_mem_step(true, 3, true) == PREFILL_MEM_GO);       /* room: no remedy */
+    TEST_ASSERT(server_prefill_mem_step(false, 3, true) == PREFILL_MEM_SPILL);   /* an idle bank first */
+    TEST_ASSERT(server_prefill_mem_step(false, 1, false) == PREFILL_MEM_SPILL);
+    TEST_ASSERT(server_prefill_mem_step(false, 0, true) == PREFILL_MEM_PREEMPT); /* then a decoder */
+    TEST_ASSERT(server_prefill_mem_step(false, 0, false) == PREFILL_MEM_REFUSE); /* nothing to free */
     TEST_ASSERT(!strcmp(prefill_mem_step_names[PREFILL_MEM_REFUSE], "refuse"));
+}
+
+/* gpuq #504: the room a chunk needs.  Before the chunk pool, MemAvailable over the floor pays for it; with the pool
+ * reserved, KV takes the pool's free chunks and MemAvailable only has to stay over the floor (the heap, the page
+ * cache) -- an empty pool is no room however much MemAvailable reads, and a box under its floor is no room however
+ * many chunks are free. */
+static void test_kv_room_with_and_without_the_pool(void) {
+    const uint64_t MiB = 1024ull * 1024ull, F = 4538ull * MiB, need = 70ull * MiB;
+    TEST_ASSERT(server_kv_room_admits(F + need, F, false, 0, need));
+    TEST_ASSERT(!server_kv_room_admits(F + need - 1, F, false, 0, need));
+    TEST_ASSERT(!server_kv_room_admits(0, F, false, 0, 0));                       /* unreadable: closed */
+    TEST_ASSERT(server_kv_room_admits(F, F, true, need, need));                   /* the pool pays, MemAvailable holds */
+    TEST_ASSERT(!server_kv_room_admits(F, F, true, need - 1, need));              /* the pool is short */
+    TEST_ASSERT(!server_kv_room_admits(64000ull * MiB, F, true, 0, need));        /* empty pool: no room */
+    TEST_ASSERT(!server_kv_room_admits(F - 1, F, true, 4096ull * MiB, need));     /* under the floor: no room */
+    TEST_ASSERT(!server_kv_room_admits(0, F, true, 4096ull * MiB, need));         /* unreadable: closed */
 }
 
 /* The stall watchdog's two rules: the env value (malformed refuses to start), and when a quiet worker is a stall. */
@@ -11245,6 +11258,7 @@ static void pulsar_server_unit_tests_run(void) {
     test_guard_budget_reads_live_memavailable();
     test_persist_skipped_under_the_floor();
     test_prefill_mem_step_tries_remedies_first();
+    test_kv_room_with_and_without_the_pool();
     test_stall_watchdog_rules();
     test_health_reports_a_stall();
     test_stall_marks_beat();

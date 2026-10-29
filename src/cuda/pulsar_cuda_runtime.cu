@@ -4,6 +4,7 @@
 #include "engine/exl3_trellis.h" /* L269 W1: exl3_expert_cut, the EXL3 expert half */
 
 #include <list>
+#include <vector>
 
 
 static const void *g_model_host_base;
@@ -1576,6 +1577,64 @@ static bool commit_floor_admits(uint64_t chunk) {
     return avail != 0 && avail >= g_commit_floor + chunk;
 }
 
+/* ==== The chunk pool (gpuq #503/#504) ===========================================================================
+ * On GB10 a 2 MiB cuMemCreate is a physically contiguous allocation: at low pressure it costs nothing, but near the
+ * floor, on a box whose memory a long uptime fragmented, every create drove reclaim and compaction (vmm-probe: 2580
+ * failed compactions, PSI memory 21 %; the squeeze leg's gpuq unit killed by systemd-oomd twice).  So a SERVING
+ * process creates its chunks once, at startup, while memory is clean (pulsar_gpu_chunk_pool_reserve), into a free
+ * list: from then on a commit maps a handle from the list and a decommit unmaps it back -- no cuMemCreate, no
+ * cuMemRelease, and MemAvailable stays flat while KV grows.  An empty list is a refusal (-2), by name, never a create.
+ *
+ * Two modes, fixed per process: POOL once reserve ran (the server, always -- a start that cannot fill its pool
+ * refuses), DIRECT before it (the warmup that sizes the pool, and the model-free gates and tools, which have no budget
+ * to size one from and run with the box to themselves): DIRECT creates each chunk on demand, gated by the commit floor.
+ * The chunks DIRECT mapped before reserve are adopted: they belong to the pool from then on, returned to its list when
+ * unmapped. */
+static struct {
+    bool on;                                   /* POOL mode */
+    std::vector<CUmemGenericAllocationHandle> free_list;
+    uint64_t total;                            /* chunks the pool owns (created at reserve + adopted) */
+} g_pool;
+static uint64_t g_mapped_chunks;               /* chunks mapped now, every reserved tensor's */
+
+uint64_t pulsar_gpu_chunk_mapped_bytes(void) { return g_mapped_chunks * (g_vmm.state > 0 ? g_vmm.chunk : 0); }
+
+int pulsar_gpu_chunk_pool_reserve(uint64_t bytes, char *err, size_t errlen) {
+    if (g_pool.on) { snprintf(err, errlen, "the chunk pool is reserved already"); return 0; }
+    if (!vmm_ready()) { snprintf(err, errlen, "CUDA VMM is not available on this device"); return 0; }
+    const uint64_t n = (bytes + g_vmm.chunk - 1) / g_vmm.chunk;
+    g_pool.free_list.reserve((size_t)n);
+    for (uint64_t i = 0; i < n; i++) {
+        CUmemGenericAllocationHandle h = 0;
+        const CUresult r = g_vmm.create(&h, (size_t)g_vmm.chunk, &g_vmm.prop, 0);
+        if (r != CUDA_SUCCESS) {
+            snprintf(err, errlen, "cuMemCreate refused chunk %llu of %llu (%llu MiB in): CUresult %d",
+                     (unsigned long long)i, (unsigned long long)n,
+                     (unsigned long long)((i * g_vmm.chunk) >> 20), (int)r);
+            for (CUmemGenericAllocationHandle x : g_pool.free_list) (void)g_vmm.release(x);
+            g_pool.free_list.clear();
+            return 0;
+        }
+        g_pool.free_list.push_back(h);
+    }
+    g_pool.total = n + g_mapped_chunks;   /* the warmup's chunks are the pool's too */
+    g_pool.on = true;
+    return 1;
+}
+
+int pulsar_gpu_chunk_pool_on(void) { return g_pool.on ? 1 : 0; }
+
+void pulsar_gpu_chunk_pool_stats(uint64_t *total, uint64_t *in_use, uint64_t *free_chunks, uint64_t *chunk_bytes) {
+    if (total) *total = g_pool.on ? g_pool.total : 0;
+    if (in_use) *in_use = g_pool.on ? g_pool.total - g_pool.free_list.size() : 0;
+    if (free_chunks) *free_chunks = g_pool.on ? g_pool.free_list.size() : 0;
+    if (chunk_bytes) *chunk_bytes = g_vmm.state > 0 ? g_vmm.chunk : 0;
+}
+
+uint64_t pulsar_gpu_chunk_pool_free_bytes(void) {
+    return g_pool.on ? (uint64_t)g_pool.free_list.size() * g_vmm.chunk : 0;
+}
+
 uint64_t pulsar_gpu_commit_chunk_bytes(void) {
     return vmm_ready() ? g_vmm.chunk : PULSAR_VMM_CHUNK_MIN;
 }
@@ -1618,19 +1677,28 @@ int pulsar_gpu_tensor_commit(pulsar_gpu_tensor *t, uint64_t bytes) {
     const CUdeviceptr base = (CUdeviceptr)(uintptr_t)t->ptr;
     while (m->committed < want) {
         const CUdeviceptr at = base + m->committed * m->chunk;
-        if (!commit_floor_admits(m->chunk)) return -1;   /* under the floor: refused before any create */
         CUmemGenericAllocationHandle h = 0;
-        CUresult r = g_vmm.create(&h, (size_t)m->chunk, &g_vmm.prop, 0);
+        CUresult r;
+        if (g_pool.on) {   /* POOL: a handle from the list, never a create */
+            if (g_pool.free_list.empty()) return -2;
+            h = g_pool.free_list.back();
+            r = CUDA_SUCCESS;
+        } else {           /* DIRECT: a create, gated by the commit floor */
+            if (!commit_floor_admits(m->chunk)) return -1;
+            r = g_vmm.create(&h, (size_t)m->chunk, &g_vmm.prop, 0);
+        }
         if (r == CUDA_SUCCESS) {
             r = g_vmm.map(at, (size_t)m->chunk, 0, h, 0);
             if (r == CUDA_SUCCESS) {
                 r = g_vmm.access(at, (size_t)m->chunk, &g_vmm.desc, 1);
                 if (r != CUDA_SUCCESS) (void)g_vmm.unmap(at, (size_t)m->chunk);
             }
-            if (r != CUDA_SUCCESS) (void)g_vmm.release(h);
+            if (r != CUDA_SUCCESS && !g_pool.on) (void)g_vmm.release(h);
         }
         if (r != CUDA_SUCCESS) return 0;   /* the caller names the pool and the tokens; nothing half-mapped */
+        if (g_pool.on) g_pool.free_list.pop_back();
         m->handle[m->committed++] = h;
+        g_mapped_chunks++;
         g_commit_since += m->chunk;
     }
     return 1;
@@ -1652,8 +1720,10 @@ int pulsar_gpu_tensor_decommit(pulsar_gpu_tensor *t) {
     int ok = 1;
     for (uint64_t c = 0; c < m->committed; c++) {
         ok &= g_vmm.unmap(base + c * m->chunk, (size_t)m->chunk) == CUDA_SUCCESS;
-        ok &= g_vmm.release(m->handle[c]) == CUDA_SUCCESS;
+        if (g_pool.on) g_pool.free_list.push_back(m->handle[c]);   /* back to the list: no release after startup */
+        else ok &= g_vmm.release(m->handle[c]) == CUDA_SUCCESS;
         m->handle[c] = 0;
+        g_mapped_chunks--;
     }
     m->committed = 0;
     if (!ok) fprintf(stderr, "pulsar: a KV pool's decommit failed (unmap / release) -- its VA stays reserved\n");
