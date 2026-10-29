@@ -7,8 +7,12 @@ module, vision tensors):
   * the grouping: blocks [mamba, moe, mamba, attention, moe] -> 3 pulsar layers {M,E} {M,-} {*,E}; every record's
     role / block / layer is the PULSAR layer; the conv declared [K, C]; the shared expert index 0; routed families
     up / down bf16 with entry_name + layer + role + block; the drafter's input side and out norm on mtp.0
-  * pulsar.kv: llm_config verbatim, time_step_limit as its two pinned facts, mtp / vision presence; no vision
-    tensor in the container
+  * pulsar.kv: llm_config verbatim, time_step_limit as its two pinned facts, mtp / vision presence
+  * the vision tower (L331), a tiny C-RADIO at the real layout: every written tensor's record (role, block `vit`,
+    layer), layout (the LayerNorm / bias vectors f32 == the bf16 widened, the rest bf16 bytes as stored), the
+    position table declared [G*G, D]; the video embedder / input conditioner / summary_idxs consumed by name; the
+    nemotron_h_vision.* facts; the tower omitted whole -> vision_present false and no tower tensor; refusals: half the
+    tower omitted, a conditioner mean that is not the config's, a switch (SwiGLU), no MTP (no final norm)
   * an EXL3 build of every dense Linear and the shared expert (dense arm), the routed experts BF16: bytes == the
     pack's [trellis | suh | svh], the pack keyed as exllamav3 writes it (no `language_model.` prefix)
   * a full EXL3 build (L296): the up-only routed experts too, from the pack (expert width 128, an EXL3 multiple):
@@ -46,14 +50,19 @@ from test_qwen import bf16, write_st, exl3_parts  # noqa: E402
 FAILS: list[str] = []
 # sha256 over (file name, sha256(file)) of every emitted file but the side files; fixed when the family landed (L296 N1),
 # moved once by L298: pulsar.kv gained `pulsar.drafter` = "" (and its pulsar.kv_arch copy) -- every tensor header and
-# payload byte-identical to L296's (graded against origin/dev 8e9d4c13's builder on this checkpoint, bf16 and k4)
+# payload byte-identical to L296's (graded against origin/dev 8e9d4c13's builder on this checkpoint, bf16 and k4);
+# moved by L331: the synthetic checkpoint gained a whole (tiny) vision tower and its config, and the recipe writes it --
+# every language-model tensor's payload, record and shard byte-identical to origin/dev 65d463a5's builder on this
+# checkpoint (which consumes the tower by name), the change the tower's tensors in the primary shard and the kv
 GOLDEN = {
-    "bf16": "fb82c1c902bf57de861545a4c7cb8f0598b16cb1284af1eb4679fbcce25e9b06",
+    "bf16": "97ab0f868e1a561304925038686b8b0f0092d536891a862aa410acc8b9d1fa86",
 }
 H, V, NQ, NKV, HD = 128, 64, 4, 2, 32
 NH, HDM, N, G, CK = 8, 32, 16, 2, 4          # Mamba: heads, head dim (d_inner 256 = 2 x H), state, groups, conv
 X, TOPK, FF, LAT, SFF = 4, 2, 64, 128, 128    # experts, top-k, expert width, latent, shared width
 BLOCKS = ["mamba", "moe", "mamba", "attention", "moe"]
+VD, VL, VP, VG, VPH = 32, 2, 4, 4, 64         # the tower: width, blocks, patch, position grid, projector hidden
+RAD = "vision_model.radio_model."
 DI, CD = NH * HDM, NH * HDM + 2 * G * N
 LM, BB, MTPP = "language_model.", "language_model.backbone.", "language_model.mtp."
 SIDE = ("tokenizer.json", "tokenizer_config.json", "chat_template.jinja", "generation_config.json", "config.json")
@@ -68,7 +77,14 @@ def check(ok, what):
 def config():
     return {
         "architectures": ["NemotronH_Omni_Reasoning_V3"], "model_type": "nemotron_h_omni", "eos_token_id": 11,
-        "vision_config": {"model_type": "radio", "hidden_size": 32}, "tie_word_embeddings": False,
+        "vision_config": {"model_type": "radio", "hidden_size": VD, "num_hidden_layers": VL, "num_attention_heads": 2,
+                          "mlp_ratio": 4.0, "patch_size": VP, "num_cls_tokens": 3, "num_registers": 1,
+                          "max_img_size": VP * VG, "layer_norm_eps": 1e-6, "qkv_bias": True, "use_swiglu_ffn": False,
+                          "hidden_act": "gelu", "layerscale_value": 1.0, "drop_path_rate": 0.0, "min_num_patches": 16,
+                          "max_num_patches": 64, "norm_mean": [0.48145466, 0.4578275, 0.40821073],
+                          "norm_std": [0.26862954, 0.26130258, 0.27577711]},
+        "downsample_ratio": 0.5, "ps_version": "v2", "vit_hidden_size": VD, "projector_hidden_size": VPH,
+        "tie_word_embeddings": False,
         "llm_config": {
             "architectures": ["NemotronHForCausalLM"], "model_type": "nemotron_h", "hidden_size": H, "vocab_size": V,
             "layers_block_type": list(BLOCKS), "mtp_layers_block_type": ["attention", "moe"],
@@ -121,8 +137,22 @@ def make_hf(root, rng, cfg=None, edit=None):
     block(f"{MTPP}layers.0.", "attention"); block(f"{MTPP}layers.1.", "moe")
     mat(MTPP + "layers.0.enorm.weight", H); mat(MTPP + "layers.0.hnorm.weight", H)
     mat(MTPP + "layers.0.eh_proj.weight", H, 2 * H); mat(MTPP + "layers.1.final_layernorm.weight", H)
-    mat("vision_model.radio_model.model.blocks.0.attn.qkv.weight", 96, 32); mat("mlp1.0.weight", 128)
-    mat("vision_projector.vision_final_layernorm.weight", 32)
+    pg = RAD + "model.patch_generator."
+    mat(pg + "embedder.weight", VD, 3 * VP * VP); mat(pg + "video_embedder.weight", VD, 6 * VP * VP)
+    mat(pg + "cls_token.token", 4, VD); mat(pg + "pos_embed", 1, VG * VG, VD)
+    for i in range(VL):
+        b = f"{RAD}model.blocks.{i}."
+        mat(b + "norm1.weight", VD); mat(b + "norm1.bias", VD); mat(b + "attn.qkv.weight", 3 * VD, VD)
+        mat(b + "attn.qkv.bias", 3 * VD); mat(b + "attn.proj.weight", VD, VD); mat(b + "attn.proj.bias", VD)
+        mat(b + "norm2.weight", VD); mat(b + "norm2.bias", VD); mat(b + "mlp.fc1.weight", 4 * VD, VD)
+        mat(b + "mlp.fc1.bias", 4 * VD); mat(b + "mlp.fc2.weight", VD, 4 * VD); mat(b + "mlp.fc2.bias", VD)
+    mean = np.asarray(config()["vision_config"]["norm_mean"], np.float32).reshape(3, 1, 1)
+    std = np.asarray(config()["vision_config"]["norm_std"], np.float32).reshape(3, 1, 1)
+    t[RAD + "input_conditioner.norm_mean"] = ("F32", [3, 1, 1], mean.tobytes())
+    t[RAD + "input_conditioner.norm_std"] = ("F32", [3, 1, 1], std.tobytes())
+    t["vision_model.summary_idxs"] = ("I64", [2], np.asarray([0, 1], "<i8").tobytes())
+    mat("vision_projector.vision_final_layernorm.weight", VD); mat("vision_projector.vision_final_layernorm.bias", VD)
+    mat("mlp1.0.weight", 4 * VD); mat("mlp1.1.weight", VPH, 4 * VD); mat("mlp1.3.weight", H, VPH)
     if edit:
         edit(t)
     names = sorted(t)
@@ -458,7 +488,13 @@ def shard_digest(d):
     return h.hexdigest()
 
 
+VISION_ROWS = [{"role": "vision", "format": "native"}, {"role": "vision_norm", "format": "f32"}]
+
+
 def recipe(tmp, label, rows):
+    """A test recipe; the tower's rows (L331) added as the shipped recipes write it unless `rows` names the tower."""
+    if not any(isinstance(r, dict) and r.get("role", "").startswith("vision") for r in rows):
+        rows = list(rows) + VISION_ROWS
     p = os.path.join(tmp, f"recipe-{label}.json")
     json.dump({"recipe": f"test-{label}", "model_type": "nemotron_h_omni", "rows": rows}, open(p, "w"))
     return p
@@ -505,13 +541,18 @@ def main():
               and kv["nemotron_h.mtp_layers_block_type"]["v"] == ["attention", "moe"]
               and kv["nemotron_h.time_step_limit.min"] == 0.0 and kv["nemotron_h.time_step_limit.max_inf"] is True
               and "nemotron_h.time_step_limit" not in kv and kv["nemotron_h.moe_latent_size"] == LAT
-              and kv["pulsar.mtp_present"] is True and kv["pulsar.vision_present"] is False
+              and kv["pulsar.mtp_present"] is True and kv["pulsar.vision_present"] is True
               and kv["pulsar.drafter"] == "" and not any(k.startswith("lilicorr.") for k in kv)
               and "pulsar.source.drafter" not in kv
-              and not any(k.startswith("nemotron_h.vision") for k in kv)
-              and [k for k in hv if k != "__metadata__"] == [],
-              "pulsar.kv: llm_config verbatim, time_step_limit as min 0 + max_inf, presence; the primary shard holds no "
-              "tensor")
+              and not any(k.startswith("nemotron_h.vision") for k in kv),
+              "pulsar.kv: llm_config verbatim, time_step_limit as min 0 + max_inf, presence")
+        vf = {k[len("nemotron_h_vision."):]: v for k, v in kv.items() if k.startswith("nemotron_h_vision.")}
+        check(vf.get("vit.width") == VD and vf.get("vit.depth") == VL and vf.get("vit.heads") == 2
+              and vf.get("vit.head_dim") == VD // 2 and vf.get("vit.mlp") == 4 * VD and vf.get("vit.patch") == VP
+              and vf.get("vit.prefix") == 4 and vf.get("vit.pos_grid") == VG and vf.get("proj.merge") == 2
+              and vf.get("proj.hidden") == VPH and vf.get("image.min_patches") == 16
+              and vf.get("image.max_patches") == 64 and len(vf) == 20,
+              f"nemotron_h_vision.*: the tower's facts from the config ({len(vf)} keys)")
         allnames = set()
         decl = {}
         fams = {}
@@ -520,8 +561,35 @@ def main():
             allnames |= set(h) - {"__metadata__"}
             decl.update(json.loads(h["__metadata__"]["pulsar.tensors"]))
             fams[h["__metadata__"]["pulsar.shard_key"]] = json.loads(h["__metadata__"]["pulsar.experts"])
-        check(not any(n.startswith(("vision_model.", "vision_projector.", "mlp1.")) for n in allnames),
-              "no vision tensor in the container (consumed by name)")
+        vnames = {n for n in allnames if n.startswith(("vision_model.", "vision_projector.", "mlp1."))}
+        hv_names = set(hv) - {"__metadata__"}
+        pg = RAD + "model.patch_generator."
+        b1 = RAD + "model.blocks.1."
+        check(vnames == hv_names and len(vnames) == 3 + 12 * VL + 5
+              and not any(n in vnames for n in (pg + "video_embedder.weight", RAD + "input_conditioner.norm_mean",
+                                                 RAD + "input_conditioner.norm_std", "vision_model.summary_idxs")),
+              f"the tower in the primary shard: {len(vnames)} tensors; video embedder / conditioner / summary_idxs "
+              f"consumed by name")
+        f0 = shards[0]
+        check(decl[pg + "pos_embed"] == {"layout": "bf16", "dims_ne": [VD, VG * VG], "role": "vit_pos",
+                                         "gguf_name": pg + "pos_embed"}
+              and decl[pg + "embedder.weight"]["role"] == "vit_patch" and decl[pg + "embedder.weight"]["dims_ne"] == [3 * VP * VP, VD]
+              and decl[pg + "cls_token.token"]["role"] == "vit_cls"
+              and decl[b1 + "attn.qkv.weight"] == {"layout": "bf16", "dims_ne": [VD, 3 * VD], "role": "vit_qkv",
+                                                   "gguf_name": b1 + "attn.qkv.weight", "block": "vit", "layer": 1}
+              and decl[b1 + "norm2.bias"] == {"layout": "f32", "dims_ne": [VD], "role": "vit_norm2_bias",
+                                              "gguf_name": b1 + "norm2.bias", "block": "vit", "layer": 1}
+              and decl["mlp1.0.weight"]["role"] == "proj_norm" and decl["mlp1.0.weight"]["layout"] == "bf16"
+              and decl["mlp1.1.weight"]["role"] == "proj_fc1" and decl["mlp1.3.weight"]["dims_ne"] == [VPH, H]
+              and decl["vision_projector.vision_final_layernorm.bias"]["layout"] == "f32"
+              and decl["vision_projector.vision_final_layernorm.weight"]["role"] == "vit_final_norm",
+              "tower records: role / block vit / layer; LayerNorm + bias f32, the rest bf16; pos [G*G, D]")
+        wide = np.frombuffer(entry_bytes(o, f0, b1 + "norm2.bias"), "<f4")
+        src = np.frombuffer(t[b1 + "norm2.bias"][2], "<u2").astype("<u4") << 16
+        check(np.array_equal(wide.view("<u4"), src)
+              and entry_bytes(o, f0, b1 + "attn.qkv.weight") == t[b1 + "attn.qkv.weight"][2]
+              and entry_bytes(o, f0, pg + "pos_embed") == t[pg + "pos_embed"][2],
+              "tower payloads: an f32 vector == its bf16 widened; a Linear and the position table byte copies")
         m0, m4 = BB + "layers.0.mixer.", BB + "layers.4.mixer."
         check(decl[m0 + "conv1d.weight"]["dims_ne"] == [CK, CD] and decl[m0 + "conv1d.weight"]["role"] == "ssm_conv"
               and decl[BB + "layers.0.norm.weight"]["role"] == "ssm_pre_norm"
@@ -622,6 +690,43 @@ def main():
               "no mtp shard, pulsar.mtp_present false")
         ok, out = run("verify", "--hf", hf, "--recipe", rom, "--out", oo, "--all")
         check(ok and "failing: 0" in out, "verify PASS (drafter omitted)")
+
+        print("vision tower omitted (L331):")
+        rbase = json.load(open(rbf))["rows"]
+        rvo = recipe(tmp, "vision-omit", [r for r in rbase if not (isinstance(r, dict) and r.get("role", "").startswith(
+            "vision"))] + [{"role": "vision", "format": "omit"}, {"role": "vision_norm", "format": "omit"}])
+        ov = os.path.join(tmp, "vision-omit")
+        ok, _ = run("emit", "--hf", hf, "--recipe", rvo, "--out", ov, "--all")
+        files = sorted(f for f in os.listdir(ov) if f.endswith(".safetensors")) if ok else []
+        hvo = header(os.path.join(ov, files[0]))[0] if files else {}
+        kvv = {e["key"]: e["value"] for e in json.loads(hvo["__metadata__"]["pulsar.kv"])} if files else {}
+        check(ok and kvv.get("pulsar.vision_present") is False and set(hvo) == {"__metadata__"}
+              and not any(k.startswith("nemotron_h_vision.") for k in kvv),
+              "the tower omitted whole: vision_present false, no tower tensor, no tower facts")
+        ok, out = run("verify", "--hf", hf, "--recipe", rvo, "--out", ov, "--all")
+        check(ok and "failing: 0" in out, "verify PASS (tower omitted)")
+        rvh = recipe(tmp, "vision-half", [r for r in rbase if not (isinstance(r, dict) and r.get("role") == "vision_norm")]
+                     + [{"role": "vision_norm", "format": "omit"}])
+        ok, _ = run("plan", "--hf", hf, "--recipe", rvh, expect_fail=True, contains="part of the vision tower")
+        check(ok, "half the tower omitted -> refused")
+        rvb = recipe(tmp, "vision-bf16", [r for r in rbase if not (isinstance(r, dict) and r.get("role") == "vision_norm")]
+                     + [{"role": "vision_norm", "format": "native"}])
+        ok, _ = run("plan", "--hf", hf, "--recipe", rvb, expect_fail=True, contains="binds this vision_norm tensor")
+        check(ok, "the LayerNorm vectors as bf16 -> refused (the row ops read f32)")
+        for label, edit_cfg, edit_t, needle in (
+                ("SwiGLU in the tower", lambda c: c["vision_config"].__setitem__("use_swiglu_ffn", True), None,
+                 "use_swiglu_ffn"),
+                ("a conditioner mean that is not the config's", None,
+                 lambda t: t.__setitem__(RAD + "input_conditioner.norm_mean",
+                                         ("F32", [3, 1, 1], np.asarray([0.5, 0.5, 0.5], np.float32).tobytes())),
+                 "input_conditioner.norm_mean")):
+            cv = config()
+            if edit_cfg:
+                edit_cfg(cv)
+            hv2 = os.path.join(tmp, "hf-v-" + label.split()[0])
+            make_hf(hv2, np.random.default_rng(5), cfg=cv, edit=edit_t)
+            ok, _ = run("plan", "--hf", hv2, "--recipe", rbf, expect_fail=True, contains=needle)
+            check(ok, f"{label} -> refused")
 
         print("LiLiCorr drafter (--drafter lilicorr, L298):")
         drafter_tests(tmp, hf, t)
