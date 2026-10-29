@@ -188,6 +188,7 @@ tests/dspark_batch_gate
 /tests/head_gate
 /tests/arch_gate
 /tests/pool_gate
+/tests/vmm_probe
 /tests/f16_rows_gate
 /tests/fmha_gate
 /tests/rowops_gate

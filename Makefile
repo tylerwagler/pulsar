@@ -849,6 +849,17 @@ tests/pool_gate: tests/pool_gate.cu src/cuda/pulsar_cuda_pool.o src/cuda/pulsar_
 pool-gate: tests/pool_gate
 	./tests/pool_gate
 
+# work/kv-vmm: can the KV pools be CUDA VMM (explicitly mapped physical, no UVM fault path) on this device?  One
+# PASS / FAIL line per check -- attr, reserve 16 x 8 GiB, kernel R/W + D2H, remap with the data intact, graph replay
+# across a recommit, MemAvailable tracks mapped physical, oversubscription refused cleanly (no stall, no dmesg
+# uvm line), commit / decommit timing.  Model-free; the box to itself (a quiet gpuq job, production stopped).
+tests/vmm_probe: tests/vmm_probe.cu Makefile
+	$(NVCC) $(NVCCFLAGS) -std=c++17 -o $@ tests/vmm_probe.cu
+
+.PHONY: vmm-probe
+vmm-probe: tests/vmm_probe
+	./tests/vmm_probe
+
 # L321: lanes that exist only for some devices decide by the DEVICE, not the compiled arch (model-free).
 tests/arch_gate: tests/arch_gate.cu Makefile src/pulsar_gpu.h src/cuda/pulsar_cuda_arch.cuh src/cuda/mmq/ds4_mmq.h \
                  $(CUDA_OBJS) $(CUTLASS_CUDA_OBJS) $(MMQ_OBJS)
