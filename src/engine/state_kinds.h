@@ -207,7 +207,8 @@ uint64_t pulsar_state_pool_bytes_at(const pulsar_state_set *ss, uint64_t rows);
 bool pulsar_state_pools_cover_bank(pulsar_state_set *ss, uint32_t bank, uint32_t T);
 /** The same for a step's rows (`pos` / `bank`, n rows): each bank covered to its furthest row + 1. */
 bool pulsar_state_pools_cover(pulsar_state_set *ss, const int32_t *pos, const int32_t *bank, uint32_t n);
-/** A bank's mapped pool bytes (every slot's): the touched KV the guard budgets. */
+/** A bank's mapped TRUNK pool bytes: the touched KV the guard budgets, exactly what a spill frees (a drafter slot's
+ *  pool stays mapped across a spill and is not counted -- state_kinds.cpp). */
 uint64_t pulsar_state_bank_committed_bytes(const pulsar_state_set *ss, uint32_t bank);
 /** L284 #3: a bank's physical residency -- its trunk pools.  _free releases them (and zeroes its high-water),
  *  _alloc re-backs whichever are missing (idempotent; on a failure the bank is left wholly evicted), _evicted is

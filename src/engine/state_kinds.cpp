@@ -151,11 +151,17 @@ bool pulsar_state_pools_cover(pulsar_state_set *ss, const int32_t *pos, const in
     return true;
 }
 
+/* The TRUNK slots' pools only: what a spill frees.  A drafter slot's pool (Nemotron's MTP module, a block drafter's)
+ * trails the trunk by a row, is no segment's, and so stays mapped across a spill -- nothing could restore it -- as it
+ * stayed resident under the managed pools.  Counting it here would make the guard's spill plan (which drops a victim's
+ * touched bytes) promise memory a spill does not return (gpuq #497: B5 read 2 MiB after bank 1's eviction).  Those
+ * pages are still out of MemAvailable, so the live budget (server::guard_budget) sees them; only this ledger does
+ * not. */
 uint64_t pulsar_state_bank_committed_bytes(const pulsar_state_set *ss, uint32_t bank) {
     const pulsar_state_plan *p = ss->plan;
     uint64_t bytes = 0;
     if (bank >= ss->n_banks) return 0;
-    for (uint32_t k = 0; k < p->n_slots; k++)
+    for (uint32_t k = 0; k < p->n_trunk; k++)
         for (uint32_t id = 0; id < p->n_decl; id++)
             if (has(p->slot[k], id) && p->decl[id].kind == PULSAR_STATE_POOL && ss->pool[k][id][bank])
                 bytes += pulsar_gpu_tensor_committed_bytes(ss->pool[k][id][bank]);
@@ -615,9 +621,9 @@ static uint64_t decl_demand_paged_bytes(pulsar_engine *e, int ctx_size) {
     return managed;
 }
 
-/* L270 / work/kv-vmm: a bank's touched pools are its MAPPED physical -- exact, whole chunks (a page is there once a
- * commit put it there, until free_physical decommits the bank); a quantum of q tokens grows them by at most q rows
- * (plus the chunk a row may open). */
+/* L270 / work/kv-vmm: a bank's touched pools are its trunk pools' MAPPED physical -- exact, whole chunks (a page is
+ * there once a commit put it there, until free_physical decommits the bank: the touched bytes are what a spill
+ * frees); a quantum of q tokens grows them by at most q rows (plus the chunk a row may open). */
 static uint64_t decl_bank_touched_kv_bytes(pulsar_session *s, uint32_t bank) {
     if (!s->states || bank >= s->states->n_banks) return 0;
     return pulsar_state_bank_committed_bytes(s->states, bank);

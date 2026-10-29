@@ -275,9 +275,18 @@ static void plan_b(void) {
     check(ss->ops.pools(ss, pools, 8) == 1 && pools[0].tokens_per_row == 4 &&
           ss->ops.trailing_pools(ss, pools, 8) == 1 && pools[0].tokens_per_row == 1 && pools[0].row_bytes == 128,
           "the trunk's pool is a segment's; the drafter slot's trails");
+    /* gpuq #497 (B5): the touched bytes are the trunk's -- what a spill frees; the drafter slot's pool stays mapped */
+    {
+        const int32_t pos[1] = {40}, bk[1] = {1};
+        check(pulsar_state_pools_cover(ss, pos, bk, 1) && pulsar_state_bank_committed_bytes(ss, 1) > 0 &&
+                  pulsar_gpu_tensor_committed_bytes(pulsar_state_pool(ss, 3, B_TRAIL, 1)) > 0,
+              "a step maps the trunk's pool and the drafter slot's");
+    }
     pulsar_state_bank_free(ss, 1);
-    check(pulsar_state_bank_evicted(ss, 1) && pulsar_state_pool(ss, 3, B_TRAIL, 1) != NULL,
-          "free_physical leaves a drafter slot's pool resident");
+    check(pulsar_state_bank_evicted(ss, 1) && pulsar_state_pool(ss, 3, B_TRAIL, 1) != NULL &&
+              pulsar_gpu_tensor_committed_bytes(pulsar_state_pool(ss, 3, B_TRAIL, 1)) > 0 &&
+              pulsar_state_bank_committed_bytes(ss, 1) == 0,
+          "free_physical leaves a drafter slot's pool resident (mapped), and the bank's touched KV is 0");
     check(pulsar_state_bank_alloc(ss, 1), "and alloc_physical re-backs the trunk's");
     check(ss->cap_rows[B_DELTA] && ss->cap_rows[B_STAGE] && ss->cap_runs[B_STAGE] && ss->cap_host[B_HOST] &&
           !ss->cap_rows[B_TRAIL] && pulsar_gpu_tensor_bytes(ss->cap_runs[B_STAGE]) >= 1ull * 16 * 4 * STAGE_ROW,
