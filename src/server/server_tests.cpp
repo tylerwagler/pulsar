@@ -11158,6 +11158,22 @@ static void test_persist_skipped_under_the_floor(void) {
     pthread_mutex_destroy(&s.mu);
 }
 
+/* 2026-10-29 (gpuq #491): the per-chunk prefill re-check tries the guard's remedies before it refuses -- spill an
+ * idle bank while one can go, else preempt a decoder while one can -- and refuses only when nothing can be freed (the
+ * headroom leg's single conversation: one bank, nothing to spill, the 503 is right). */
+static void test_prefill_mem_step_tries_remedies_first(void) {
+    const uint64_t MiB = 1024ull * 1024ull, F = 4538ull * MiB, need = 52ull * MiB;
+    TEST_ASSERT(server_prefill_mem_step(F + need, need, F, 0, false) == PREFILL_MEM_GO);
+    TEST_ASSERT(server_prefill_mem_step(F + need, need, F, 3, true) == PREFILL_MEM_GO);     /* room: no remedy */
+    TEST_ASSERT(server_prefill_mem_step(F + need - 1, need, F, 3, true) == PREFILL_MEM_SPILL);
+    TEST_ASSERT(server_prefill_mem_step(F, need, F, 1, false) == PREFILL_MEM_SPILL);       /* an idle bank first */
+    TEST_ASSERT(server_prefill_mem_step(F, need, F, 0, true) == PREFILL_MEM_PREEMPT);      /* then a decoder */
+    TEST_ASSERT(server_prefill_mem_step(F, need, F, 0, false) == PREFILL_MEM_REFUSE);      /* nothing to free */
+    TEST_ASSERT(server_prefill_mem_step(0, need, F, 0, false) == PREFILL_MEM_REFUSE);      /* unreadable: closed */
+    TEST_ASSERT(server_prefill_mem_step(0, need, F, 2, false) == PREFILL_MEM_SPILL);       /* ... but freeing helps */
+    TEST_ASSERT(!strcmp(prefill_mem_step_names[PREFILL_MEM_REFUSE], "refuse"));
+}
+
 /* The stall watchdog's two rules: the env value (malformed refuses to start), and when a quiet worker is a stall. */
 static void test_stall_watchdog_rules(void) {
     char err[256];
@@ -11228,6 +11244,7 @@ static void pulsar_server_unit_tests_run(void) {
     test_mem_floor_is_derived_from_the_watermarks();
     test_guard_budget_reads_live_memavailable();
     test_persist_skipped_under_the_floor();
+    test_prefill_mem_step_tries_remedies_first();
     test_stall_watchdog_rules();
     test_health_reports_a_stall();
     test_stall_marks_beat();

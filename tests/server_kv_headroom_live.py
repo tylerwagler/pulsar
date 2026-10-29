@@ -269,7 +269,10 @@ try:
             break
         msgs.append({"role": "assistant", "content": reply})
     if refused:
-        check(refused[1] == 503 and "not enough KV memory" in refused[2],
+        # fail closed is either refusal: the admission's (L280) or the per-chunk memory re-check's (2026-10-29: one
+        # bank, nothing to spill or preempt -- the guard's remedies have nothing to free, so the 503 is right)
+        check(refused[1] == 503 and ("not enough KV memory" in refused[2] or
+                                     "not enough memory to continue" in refused[2]),
               "turn %d past the ceiling refused (fail closed): %s %s" % (refused[0], refused[1], refused[2][:160]))
     stop_sampling.set()
     th.join()
@@ -280,7 +283,7 @@ try:
     check(low[0] >= FLOOR - a.slack_gib * GiB, "MemAvailable stayed within %.2f GiB of the floor (low %.2f GiB)"
           % (a.slack_gib, low[0] / GiB))
     adm = (txt.count("spilling") + txt.count("queued until a busy bank") + txt.count("guard: spilled") +
-           txt.count("kv admission REFUSED"))
+           txt.count("kv admission REFUSED") + txt.count("prefill REFUSED (503)"))
     check(adm > 0, "the ceiling bound: %d spill / wait / refusal line(s)" % adm)
     check("NO idle victim" not in txt, "the decode guard never proceeded past its budget (no back-pressure line)")
     if p.poll() is None:

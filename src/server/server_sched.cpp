@@ -2603,6 +2603,99 @@ bool server::prompt_kv_admit(session_slot *sl, job *j, bool *refused) {
     return false;
 }
 
+/* ==== 2026-10-29: the per-chunk memory re-check of a prefill =================================================
+ * Each prefill quantum (one chunk) starts only when MemAvailable covers that chunk's new KV over the floor.  The
+ * admission verdict (L280) priced the whole prompt when the job bound; this re-check is against what the box holds
+ * NOW, because memory nobody accounts for goes meanwhile.  Short of it, the guard's own remedies run first, while
+ * there is something to free -- spill the least-recently-used idle bank, else preempt the newest decoder (L314) --
+ * and only then is the request refused (503, retry): never proceed.  Nothing is invalidated on a refusal: the bank
+ * keeps every chunk it computed.  A fused / mixed rider is not refused there (a remedy would move banks under the
+ * step being assembled): it leaves the fused lane, and its classic quantum runs this whole rule. */
+const char *const prefill_mem_step_names[PREFILL_MEM_STEPS] = { "go", "spill", "preempt", "refuse" };
+
+prefill_mem_step server_prefill_mem_step(uint64_t avail, uint64_t need, uint64_t floor, int n_idle_victims,
+                                         bool preemptible) {
+    if (server_headroom_admits(avail, need, floor)) return PREFILL_MEM_GO;
+    if (n_idle_victims > 0) return PREFILL_MEM_SPILL;
+    if (preemptible) return PREFILL_MEM_PREEMPT;
+    return PREFILL_MEM_REFUSE;
+}
+
+uint64_t server::prefill_chunk_need() {
+    return pulsar_session_quantum_growth_bytes_per_bank(sess, (uint32_t)pulsar_session_prefill_cap(sess));
+}
+
+bool server::prefill_headroom_ok(session_slot *sl) {
+    auto *s = this;
+    gen_state *g = sl->gen;
+    const uint64_t need = s->prefill_chunk_need(), floor = server_mem_floor();
+    const double gib = 1024.0 * 1024.0 * 1024.0;
+    uint64_t avail = server_mem_available_bytes();
+    bool preempt_tried = false;
+    const char *why = "nothing left to free";   /* the refusal says which: a REFUSE verdict, or a remedy that failed */
+    int spilled = 0;
+    for (int round = 0; round <= PULSAR_SESSION_POOL_CAP; round++) {
+        int order[PULSAR_SESSION_POOL_CAP], useful[PULSAR_SESSION_POOL_CAP];
+        session_slot *self[1] = {sl};
+        const int n_order = s->guard_enabled && s->pool_banks > 0 ? guard_victim_order(s, self, 1, order) : 0;
+        int n_idle = 0;   /* in the guard's pick order, the idle banks whose spill frees something */
+        for (int k = 0; k < n_order; k++)
+            if (pulsar_session_bank_touched_kv_bytes(s->sess, s->slots[order[k]].bank) > 0) useful[n_idle++] = order[k];
+        bool decoders = false;
+        for (int i = 0; i < s->n_slots && !preempt_tried; i++)
+            decoders |= &s->slots[i] != sl && slot_is_batchable_decode(&s->slots[i]);
+        const prefill_mem_step step = server_prefill_mem_step(avail, need, floor, n_idle, decoders && !preempt_tried);
+        if (step == PREFILL_MEM_GO) return true;
+        if (step == PREFILL_MEM_REFUSE) break;
+        server_log(PULSAR_LOG_DEFAULT,
+                   "pulsar-server: prefill on bank %u: MemAvailable %.2f GiB does not cover the next chunk's %.2f GiB "
+                   "over the %.2f GiB floor -- %s first",
+                   sl->bank, (double)avail / gib, (double)need / gib, (double)floor / gib,
+                   step == PREFILL_MEM_SPILL ? "spilling the least-recently-used idle bank"
+                                             : "preempting the newest decoder");
+        if (step == PREFILL_MEM_SPILL) {
+            if (!s->spill_bank(&s->slots[useful[0]])) { why = "a spill failed (its line above)"; break; }
+            s->count_metric(&s->m_spills);
+            spilled++;
+        } else {
+            preempt_tried = true;
+            if (!s->preempt_newest_decoder(sl, need)) continue;   /* none could go: the next round refuses */
+        }
+        if (!s->bank_switch(sl->bank)) { why = "the bank could not be reinstalled after a remedy"; break; }
+        avail = server_mem_available_bytes();
+    }
+    s->count_metric(&s->m_prefill_mem_refusals);
+    snprintf(g->err, sizeof g->err,
+             "not enough memory to continue this prompt now (MemAvailable %.2f GiB, next chunk %.2f GiB, floor "
+             "%.2f GiB); the part computed is kept, retry later",
+             (double)avail / gib, (double)need / gib, (double)floor / gib);
+    unsigned skipped = 0;
+    if (warn_limiter_due(&s->prefill_mem_warn, server_now_sec(), PULSAR_SERVER_MEM_FLOOR_WARN_SEC, &skipped))
+        server_log(PULSAR_LOG_WARNING, "pulsar-server: prefill REFUSED (503) on bank %u at %d of %d tokens -- %s after "
+                   "%d spill(s)%s: %s (%u more refused since the last line)", sl->bank,
+                   pulsar_session_bank_pos(s->sess, (uint32_t)sl->bank), g->prompt_tokens, why, spilled,
+                   preempt_tried ? " and a preemption try" : "", g->err, skipped);
+    pulsar_session_set_cancel(s->sess, NULL, NULL);
+    pulsar_session_set_progress(s->sess, NULL, NULL);
+    pulsar_session_set_display_progress(s->sess, NULL, NULL);
+    s->trace_event(g->trace_id, "prefill refused: %s", g->err);
+    if (g->j->req.stream && g->progress.headers_sent) {
+        if (!g->progress.stream_failed) (void)sse_error_event(g->j->fd, &g->j->req, g->err);
+    } else if (g->j->req.api == API_ANTHROPIC) {
+        http_error_anthropic(g->j->fd, 503, g->err);
+    } else {
+        http_error_retry(g->j->fd, 503, g->err, HTTP_RETRY_GOING_AWAY_S);
+    }
+    g->phase = GEN_DONE;
+    return false;
+}
+
+bool server::prefill_headroom_fused_ok(session_slot *sl) {
+    if (server_headroom_admits(server_mem_available_bytes(), prefill_chunk_need(), server_mem_floor())) return true;
+    sl->gen->no_fuse = "the memory floor (its classic quantum re-checks it, with the guard's remedies)";
+    return false;
+}
+
 int server::guard_maybe_evict(session_slot *const *dec, int n, session_slot **kept) {
     auto *s = this;
     for (int i = 0; i < n; i++) kept[i] = dec[i];
@@ -3195,11 +3288,9 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n, int quantum_
                 s->worker_finish_slot(c);   /* L282: released where abandoned (nothing in this quantum steps it) */
                 continue;
             }
-            /* 2026-10-29: a rider's chunk is a prefill chunk -- the same per-chunk memory re-check */
-            if (!s->prefill_headroom_ok(c)) {
-                s->worker_finish_slot(c);   /* refused (503) and done: released here, as an abandon is */
-                continue;
-            }
+            /* 2026-10-29: a rider's chunk is a prefill chunk -- the per-chunk memory re-check; short of it the
+             * prompt leaves the fused lane, and its classic quantum runs the remedies or refuses it */
+            if (!s->prefill_headroom_fused_ok(c)) { rv[k].why = pg->no_fuse; continue; }
             if (!pg->fuse_ready && !s->fuse_prepare(c)) { rv[k].why = pg->no_fuse; continue; }
             const int p0 = pulsar_session_bank_pos(pool, (uint32_t)c->bank);
             if (pg->prompt_for_sync->len - p0 <= 0) { rv[k].why = "nothing left"; continue; }
@@ -3942,9 +4033,8 @@ session_slot *server::worker_find_fuse_prefill() {
         const int len = g->prompt_for_sync->len;
         if (P <= 0 || P >= len) continue;                       /* first chunk / done: classic */
         if (g->share_mark > P) continue;                        /* L329 (a): the classic sync stops at the cut */
-        /* 2026-10-29: the fused run is prefill chunks too -- the per-chunk memory re-check; a refused prompt is done
-         * (503) and the worker's next pass releases it */
-        if (!s->prefill_headroom_ok(sl)) continue;
+        /* 2026-10-29: the fused run is prefill chunks too -- short of the floor it goes classic (prefill_headroom_ok) */
+        if (!s->prefill_headroom_fused_ok(sl)) continue;
         return sl;                                              /* P=1: first qualifier */
     }
     return NULL;

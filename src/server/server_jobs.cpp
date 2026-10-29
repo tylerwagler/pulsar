@@ -538,41 +538,6 @@ void server::gen_prefill_fail(session_slot *sl, bool discard_loaded_entry) {
     g->phase = GEN_DONE;
 }
 
-/* 2026-10-29: each prefill quantum (one chunk) starts only when MemAvailable covers that chunk's new KV pages over the
- * floor.  The admission verdict (L280) priced the whole prompt against the guard's budget when the job bound; this is
- * the per-chunk re-check against what the box holds NOW, because memory nobody accounts for can go meanwhile, and a
- * GPU fault on an unbacked managed page under the kernel's min watermark never returns (the work hang).  Under it the
- * request is refused (503, retry): never proceed.  Nothing is invalidated -- the bank keeps every chunk it computed
- * (its grid checkpoints and the "continued" segments already stored), so a re-send resumes there. */
-bool server::prefill_headroom_ok(session_slot *sl) {
-    auto *s = this;
-    gen_state *g = sl->gen;
-    const uint64_t need = pulsar_session_quantum_growth_bytes_per_bank(s->sess, (uint32_t)pulsar_session_prefill_cap(s->sess));
-    const uint64_t avail = server_mem_available_bytes();
-    if (server_headroom_admits(avail, need, server_mem_floor())) return true;
-    s->count_metric(&s->m_prefill_mem_refusals);
-    const double gib = 1024.0 * 1024.0 * 1024.0;
-    snprintf(g->err, sizeof g->err,
-             "not enough memory to continue this prompt now: MemAvailable %.2f GiB does not cover the next prefill "
-             "chunk's %.2f GiB over the server's %.2f GiB floor; the part already computed is kept, retry later",
-             (double)avail / gib, (double)need / gib, (double)server_mem_floor() / gib);
-    server_log(PULSAR_LOG_WARNING, "pulsar-server: prefill REFUSED (503) on bank %u at %d of %d tokens: %s", sl->bank,
-               pulsar_session_bank_pos(s->sess, (uint32_t)sl->bank), g->prompt_tokens, g->err);
-    pulsar_session_set_cancel(s->sess, NULL, NULL);
-    pulsar_session_set_progress(s->sess, NULL, NULL);
-    pulsar_session_set_display_progress(s->sess, NULL, NULL);
-    s->trace_event(g->trace_id, "prefill refused: %s", g->err);
-    if (g->j->req.stream && g->progress.headers_sent) {
-        if (!g->progress.stream_failed) (void)sse_error_event(g->j->fd, &g->j->req, g->err);
-    } else if (g->j->req.api == API_ANTHROPIC) {
-        http_error_anthropic(g->j->fd, 503, g->err);
-    } else {
-        http_error_retry(g->j->fd, 503, g->err, HTTP_RETRY_GOING_AWAY_S);
-    }
-    g->phase = GEN_DONE;
-    return false;
-}
-
 void server::gen_prefill_abandon(session_slot *sl) {
     auto *s = this;
     gen_state *g = sl->gen;

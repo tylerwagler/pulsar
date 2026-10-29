@@ -2218,9 +2218,16 @@ struct server {
      * chain closed at the bank's deepest grid checkpoint, the last grid point the prefill reached -- so the re-send
      * (a Stop and re-send, a client timeout) resumes there instead of re-prefilling it; then gen_prefill_fail. */
     void gen_prefill_abandon(session_slot *sl);
-    /** 2026-10-29: may this prefill quantum start?  MemAvailable must cover one chunk's new KV over the floor;
+    /** 2026-10-29: may this prefill quantum start?  MemAvailable must cover one chunk's new KV over the floor; short
+     *  of it the guard's remedies run first (spill an idle bank, preempt the newest decoder: server_prefill_mem_step).
      *  false = the request was refused (503) and its gen is done -- the bank keeps what it prefilled. */
     bool prefill_headroom_ok(session_slot *sl);
+    /** The fused / mixed lanes' form: no remedy (banks would move under the step being assembled) and no refusal --
+     *  short of the floor the prompt leaves the fused lane (gen->no_fuse) and its classic quantum decides. */
+    bool prefill_headroom_fused_ok(session_slot *sl);
+    /** One prefill chunk's new KV on one bank (the per-chunk re-check's need). */
+    uint64_t prefill_chunk_need();
+    warn_limiter prefill_mem_warn;   ///< the prefill-refused line, rate-limited (each refusal is counted)
     /** Resolve the prompt against every cache layer and decide the prefill plan.
      * Clients resend full prompts as text.  The worker first tries the old exact
      * token-prefix hit, then a rendered-text prefix hit for the live checkpoint,
@@ -3660,6 +3667,12 @@ uint64_t server_persist_host_bytes(int tokens);
 #define PERSIST_TEXT_BYTES_PER_TOKEN 64u
 /** Does MemAvailable `avail` leave `floor` after `need` more bytes?  avail 0 (unreadable) is no. */
 bool server_headroom_admits(uint64_t avail, uint64_t need, uint64_t floor);
+/** The per-chunk prefill re-check's next move (server::prefill_headroom_ok): GO when MemAvailable covers the chunk
+ *  over the floor; else SPILL while an idle bank can go, else PREEMPT while a decoder can, else REFUSE. */
+typedef enum { PREFILL_MEM_GO = 0, PREFILL_MEM_SPILL, PREFILL_MEM_PREEMPT, PREFILL_MEM_REFUSE, PREFILL_MEM_STEPS } prefill_mem_step;
+extern const char *const prefill_mem_step_names[PREFILL_MEM_STEPS];
+prefill_mem_step server_prefill_mem_step(uint64_t avail, uint64_t need, uint64_t floor, int n_idle_victims,
+                                         bool preemptible);
 
 /* MemAvailable from /proc/meminfo, in bytes (0 on parse failure — callers
  * fail closed).  Never called on a token/layer hot path (defined in

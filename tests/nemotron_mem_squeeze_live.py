@@ -33,6 +33,8 @@ PASS (exit 0) only when every check holds:
   6. the run pressed: MemAvailable came within 1 GiB of the floor, or the guard spilled / refused (else it proved
      nothing)
   7. dmesg (when readable) has no new page-allocation failure or nvidia-uvm line
+  8. a prefill refused at the floor had nothing left to free: the guard's remedies (spill an idle bank with KV,
+     preempt the newest decoder) ran first wherever there was something (the refusal line says which)
 
 Needs the box to itself (it measures system MemAvailable): a quiet gpuq job, production stopped.  ~1-2 h at the
 defaults (three 200k conversations at ~550 t/s of continued prefill)."""
@@ -285,6 +287,13 @@ try:
              txt.count("PREEMPTED") + int(skipped))
     check(pressed or acted > 0, "6 the run pressed (low %.2f GiB vs floor %.2f; %d guard / refusal actions)" % (
         low[0] / GiB, floor / GiB, acted))
+    # 2026-10-29 (gpuq #491): a prefill refused at the floor while another conversation held KV must have tried the
+    # guard's remedies first -- every "prefill REFUSED" after the first remedy line, or none had anything to free
+    ref_lines = [l for l in txt.splitlines() if "prefill REFUSED (503)" in l]
+    remedies = txt.count("spilling the least-recently-used idle bank") + txt.count("preempting the newest decoder")
+    check(all("nothing left to free" in l for l in ref_lines),
+          "8 every prefill refused at the floor had nothing left to free (%d refusals, %d remedy lines): %s" % (
+              len(ref_lines), remedies, [l[-160:] for l in ref_lines if "nothing left to free" not in l][:2] or "ok"))
     dmesg1 = dmesg_lines()
     if dmesg0 is not None and dmesg1 is not None:
         new = dmesg1[len(dmesg0):]
