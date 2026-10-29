@@ -51,6 +51,7 @@ __pycache__/
 /tests/lilicorr_head_gate
 /tests/qwen_family_gate
 /tests/state_kinds_gate
+/tests/vmm_probe
 /tests/fixed_tile_gemm_probe
 /tests/nt_crossover_sweep
 /tests/tp_identity_test
