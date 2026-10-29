@@ -1532,6 +1532,50 @@ static int vmm_ready(void) {
     return 1;
 }
 
+/* The floor every commit keeps (pulsar_gpu_set_commit_floor; 0 = none, before the server sets it).  gpuq #492 on
+ * GB10: cuMemCreate does NOT refuse before the kernel's own margin -- it went on succeeding down to 1.47 GiB
+ * MemAvailable, retrying inside the driver (NVRM NV_ERR_NO_MEMORY lines, a 926 ms create) -- so the driver's answer
+ * alone would let a pool run the box into the min watermark.  Every chunk is gated here, on the host, before its
+ * create: MemAvailable (re-read at most every 0.25 s, less what this process mapped since) must cover the chunk over
+ * the floor, else the commit refuses (-1) and nothing is created. */
+static uint64_t g_commit_floor;
+static uint64_t g_commit_avail;      /* the last MemAvailable reading */
+static double g_commit_avail_at;     /* when (CLOCK_MONOTONIC s); 0 = never */
+static uint64_t g_commit_since;      /* bytes mapped since that reading */
+
+void pulsar_gpu_set_commit_floor(uint64_t bytes) {
+    g_commit_floor = bytes;
+    g_commit_avail_at = 0.0;
+}
+
+uint64_t pulsar_gpu_commit_floor(void) { return g_commit_floor; }
+
+static uint64_t commit_mem_available(void) {
+    FILE *fp = fopen("/proc/meminfo", "r");
+    if (!fp) return 0;
+    char line[256];
+    unsigned long long kib = 0;
+    while (fgets(line, sizeof line, fp))
+        if (sscanf(line, "MemAvailable: %llu kB", &kib) == 1) break;
+    fclose(fp);
+    return (uint64_t)kib * 1024ull;
+}
+
+/* may one more chunk be created?  (always, with no floor set) */
+static bool commit_floor_admits(uint64_t chunk) {
+    if (g_commit_floor == 0) return true;
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    const double now = (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
+    if (g_commit_avail_at == 0.0 || now - g_commit_avail_at >= 0.25) {
+        g_commit_avail = commit_mem_available();
+        g_commit_avail_at = now;
+        g_commit_since = 0;
+    }
+    const uint64_t avail = g_commit_avail > g_commit_since ? g_commit_avail - g_commit_since : 0;
+    return avail != 0 && avail >= g_commit_floor + chunk;
+}
+
 uint64_t pulsar_gpu_commit_chunk_bytes(void) {
     return vmm_ready() ? g_vmm.chunk : PULSAR_VMM_CHUNK_MIN;
 }
@@ -1574,6 +1618,7 @@ int pulsar_gpu_tensor_commit(pulsar_gpu_tensor *t, uint64_t bytes) {
     const CUdeviceptr base = (CUdeviceptr)(uintptr_t)t->ptr;
     while (m->committed < want) {
         const CUdeviceptr at = base + m->committed * m->chunk;
+        if (!commit_floor_admits(m->chunk)) return -1;   /* under the floor: refused before any create */
         CUmemGenericAllocationHandle h = 0;
         CUresult r = g_vmm.create(&h, (size_t)m->chunk, &g_vmm.prop, 0);
         if (r == CUDA_SUCCESS) {
@@ -1586,6 +1631,7 @@ int pulsar_gpu_tensor_commit(pulsar_gpu_tensor *t, uint64_t bytes) {
         }
         if (r != CUDA_SUCCESS) return 0;   /* the caller names the pool and the tokens; nothing half-mapped */
         m->handle[m->committed++] = h;
+        g_commit_since += m->chunk;
     }
     return 1;
 }

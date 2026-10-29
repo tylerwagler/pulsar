@@ -340,10 +340,11 @@ bool pulsar_ckpt_adopt(pulsar_ckpt_store *st, uint32_t dst, uint32_t src, uint32
         const uint64_t rows = (T + sp[i].tokens_per_row - 1u) / sp[i].tokens_per_row;
         /* work/kv-vmm: the destination's rows are mapped before the copy writes them (the source's are, by the steps
          * that wrote them); a box that cannot back them refuses the adopt */
-        if (!pulsar_gpu_tensor_commit(dp[i].rows, rows * dp[i].row_bytes)) {
+        const int crc = pulsar_gpu_tensor_commit(dp[i].rows, rows * dp[i].row_bytes);
+        if (crc != 1) {
             fprintf(stderr, "pulsar: adopting bank %u's state at %u into bank %u: its %llu MiB of pool rows could not "
-                            "be backed (the box is out of memory)\n", src, T, dst,
-                    (unsigned long long)((rows * dp[i].row_bytes) >> 20));
+                            "be backed (%s)\n", src, T, dst, (unsigned long long)((rows * dp[i].row_bytes) >> 20),
+                    crc < 0 ? "MemAvailable would fall under the commit floor" : "the driver refused");
             ok = false;
             break;
         }

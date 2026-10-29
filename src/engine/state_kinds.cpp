@@ -125,11 +125,12 @@ bool pulsar_state_pools_cover_bank(pulsar_state_set *ss, uint32_t bank, uint32_t
                 return false;
             }
             const uint64_t need = pool_rows_bytes(p->decl[id], T);
-            if (pulsar_gpu_tensor_commit(t, need)) continue;
+            const int rc = pulsar_gpu_tensor_commit(t, need);
+            if (rc == 1) continue;
             fprintf(stderr, "pulsar: %s: bank %u's '%s' pool (slot %u) could not be backed to %u tokens (%.1f MiB "
-                            "mapped, %.1f MiB wanted): the box is out of memory -- refusing (no fault is left to "
-                            "stall on)\n", p->name, bank, p->decl[id].name, k, T,
-                    (double)pulsar_gpu_tensor_committed_bytes(t) / 1048576.0, (double)need / 1048576.0);
+                            "mapped, %.1f MiB wanted): %s -- refusing the step\n", p->name, bank, p->decl[id].name,
+                    k, T, (double)pulsar_gpu_tensor_committed_bytes(t) / 1048576.0, (double)need / 1048576.0,
+                    rc < 0 ? "MemAvailable would fall under the commit floor" : "the driver refused the memory");
             return false;
         }
     }

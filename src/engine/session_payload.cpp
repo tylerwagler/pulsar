@@ -348,8 +348,11 @@ static int pools_span_io(payload_io *io, const pulsar_kv_pool *pools, uint32_t n
                                               pools[i].tokens_per_row - 1u) / pools[i].tokens_per_row) *
                                    pools[i].row_bytes;
         const uint64_t cap = pulsar_gpu_tensor_bytes(pools[i].rows);
-        if (!write && !pulsar_gpu_tensor_commit(pools[i].rows, slack_end < cap ? slack_end : cap)) {
-            payload_set_err(err, errlen, "a KV pool's rows could not be backed (the box is out of memory)");
+        const int crc = write ? 1 : pulsar_gpu_tensor_commit(pools[i].rows, slack_end < cap ? slack_end : cap);
+        if (crc != 1) {
+            payload_set_err(err, errlen, crc < 0 ? "a KV pool's rows were refused: MemAvailable would fall under the "
+                                                   "commit floor"
+                                                 : "a KV pool's rows could not be backed (the driver refused)");
             return 1;
         }
         if (write && pulsar_gpu_tensor_committed_bytes(pools[i].rows) < off + bytes) {

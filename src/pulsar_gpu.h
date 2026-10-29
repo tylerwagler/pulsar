@@ -203,9 +203,14 @@ pulsar_gpu_tensor *pulsar_gpu_tensor_alloc_managed(uint64_t bytes);
  *  demand-paged share. */
 pulsar_gpu_tensor *pulsar_gpu_tensor_reserve(uint64_t bytes);
 /** Back [0, bytes) of a reserved tensor with physical (whole chunks, created and mapped on the host): 1 = backed,
- *  0 = the box could not (nothing half-mapped; the caller names it).  A plain tensor is backed whole: 1 for any
- *  bytes inside it. */
+ *  -1 = refused by the commit floor (MemAvailable would not cover the next chunk over it; nothing created), 0 = the
+ *  driver could not (nothing half-mapped).  The caller names the pool and the tokens.  A plain tensor is backed
+ *  whole: 1 for any bytes inside it. */
 int pulsar_gpu_tensor_commit(pulsar_gpu_tensor *t, uint64_t bytes);
+/** The MemAvailable every commit keeps free (the server's derived floor, set once at startup; 0 = no gate).  On
+ *  GB10 the driver's cuMemCreate does not refuse before the kernel's margin (gpuq #492), so this gate is what does. */
+void pulsar_gpu_set_commit_floor(uint64_t bytes);
+uint64_t pulsar_gpu_commit_floor(void);
 /** Release a reserved tensor's physical, keeping its VA (the device drains first).  1 = done (a plain tensor: 1). */
 int pulsar_gpu_tensor_decommit(pulsar_gpu_tensor *t);
 /** The bytes behind a tensor now: a reserved tensor's mapped chunks (capped at its size), a plain one's size. */

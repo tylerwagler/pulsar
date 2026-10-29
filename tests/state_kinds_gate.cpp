@@ -170,6 +170,17 @@ static void plan_a(void) {
           "covering a step's rows maps each bank's pools to its furthest row: %llu / %llu B (chunks of %llu B)",
           (unsigned long long)pulsar_state_bank_committed_bytes(ss, 0),
           (unsigned long long)pulsar_state_bank_committed_bytes(ss, 1), (unsigned long long)chunk);
+    /* gpuq #492: the driver does not refuse before the kernel's margin, so every commit is gated by the floor */
+    {
+        const uint64_t before = pulsar_state_bank_committed_bytes(ss, 1);
+        pulsar_gpu_set_commit_floor(UINT64_MAX / 4);   /* no box has this much free */
+        const int32_t far_pos[1] = {(int32_t)(ss->ctx - 1)}, far_bank[1] = {1};
+        const bool refused = !pulsar_state_pools_cover(ss, far_pos, far_bank, 1);
+        pulsar_gpu_set_commit_floor(0);
+        check(refused && pulsar_state_bank_committed_bytes(ss, 1) == before,
+              "a commit under the floor is refused before any create (bank 1 still %llu B mapped)",
+              (unsigned long long)before);
+    }
     std::vector<uint8_t> row = pattern(KV_ROW, 9);
     check(wr(pulsar_state_pool(ss, 5, A_KV_GLOBAL, 0), 299ull * KV_ROW, row) &&
               rd(pulsar_state_pool(ss, 5, A_KV_GLOBAL, 0), 299ull * KV_ROW, KV_ROW) == row,

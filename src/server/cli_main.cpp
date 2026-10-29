@@ -983,6 +983,7 @@ int main(int argc, char **argv) {
             session, (uint32_t)pulsar_session_prefill_cap(session));
         const uint64_t persist = server_persist_host_bytes(cfg.ctx_size);
         const uint64_t floor = server_mem_floor_init(zone_high, chunk_kv + persist);
+        pulsar_gpu_set_commit_floor(floor);   /* work/kv-vmm: every KV pool commit keeps it (gpuq #492) */
         const double mib = 1024.0 * 1024.0;
         server_log(PULSAR_LOG_DEFAULT,
                    "pulsar-server: memory floor %.0f MiB = OS margin %.0f + kernel high watermarks %.0f%s + one "

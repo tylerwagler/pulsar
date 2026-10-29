@@ -15,15 +15,17 @@
  *   graph       a captured graph's kernel on a pool address replays correctly after that VA was decommitted and
  *               recommitted (graphs keep pointers; the VA must stay valid)
  *   memavail    mapping --memavail-gib GiB lowers MemAvailable by >= 90% of it; releasing it gives >= 90% back
- *   oversub     chunks are created until cuMemCreate refuses -- cleanly (an error code, each call < 2 s, no new
- *               page-allocation / uvm / Xid line in dmesg) -- or MemAvailable reaches --stop-gib, where the probe
- *               stops for the box's sake and FAILs the check (the driver would let a pool run into the watermark)
+ *   oversub     chunks are created while MemAvailable covers the next one over --floor-gib (the engine's commit
+ *               gate): the gate must refuse cleanly (never more than a chunk under the floor, each create < 2 s, no new
+ *               dmesg uvm / page-allocation / Xid line).  Then, INFO only, the ungated driver down to --stop-gib --
+ *               on GB10 (gpuq #492) cuMemCreate did not refuse by itself, which is why every commit is gated
  *   timing      commit (create + map + set access) and decommit (unmap + release) per chunk, median / max, at 2 MiB
  *               and at --chunk-mib
  *
  * Exit 0 only when every check passed.  Model-free; needs the GPU to itself for the memavail / oversub checks (a
  * quiet gpuq job, production stopped).  Usage:
- *     ./tests/vmm_probe [--chunk-mib 64] [--memavail-gib 4] [--stop-gib 1.5] [--skip-oversub]
+ *     ./tests/vmm_probe [--chunk-mib 64] [--memavail-gib 4] [--floor-gib 6] [--stop-gib 1.5] [--skip-oversub]
+ *                       [--skip-ungated]
  */
 #include <cuda.h>
 #include <cuda_runtime.h>
@@ -204,14 +206,20 @@ void stats(std::vector<double> v, double *med, double *mx) {
 
 int main(int argc, char **argv) {
     size_t chunk_mib = 64;
-    double memavail_gib = 4.0, stop_gib = 1.5;
-    bool skip_oversub = false;
+    double memavail_gib = 4.0, stop_gib = 1.5, floor_gib = 6.0;
+    bool skip_oversub = false, skip_ungated = false;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--chunk-mib") && i + 1 < argc) chunk_mib = strtoul(argv[++i], nullptr, 10);
         else if (!strcmp(argv[i], "--memavail-gib") && i + 1 < argc) memavail_gib = atof(argv[++i]);
         else if (!strcmp(argv[i], "--stop-gib") && i + 1 < argc) stop_gib = atof(argv[++i]);
+        else if (!strcmp(argv[i], "--floor-gib") && i + 1 < argc) floor_gib = atof(argv[++i]);
         else if (!strcmp(argv[i], "--skip-oversub")) skip_oversub = true;
-        else { fprintf(stderr, "usage: %s [--chunk-mib N] [--memavail-gib G] [--stop-gib G] [--skip-oversub]\n", argv[0]); return 2; }
+        else if (!strcmp(argv[i], "--skip-ungated")) skip_ungated = true;
+        else {
+            fprintf(stderr, "usage: %s [--chunk-mib N] [--memavail-gib G] [--floor-gib G] [--stop-gib G] [--skip-oversub] "
+                            "[--skip-ungated]\n", argv[0]);
+            return 2;
+        }
     }
     const double GiB = 1024.0 * 1024.0 * 1024.0;
     if (cudaSetDevice(0) != cudaSuccess || cudaFree(0) != cudaSuccess) {
@@ -399,24 +407,30 @@ int main(int argc, char **argv) {
                 sz >> 10, reps, cm, cx, dm, dx);
     }
 
-    /* ---- oversub: until cuMemCreate refuses (cleanly) or the box nears its floor */
+    /* ---- oversub (gpuq #492: GB10's cuMemCreate does NOT refuse before the kernel's margin -- it kept succeeding
+     * down to 1.47 GiB, retrying inside the driver).  So the engine gates every commit by a floor (the runtime's
+     * pulsar_gpu_set_commit_floor), and this check is that rule: chunks are created only while MemAvailable covers the
+     * next chunk over --floor-gib.  PASS: the gate refuses cleanly (MemAvailable never under the floor by more than a
+     * chunk, every create < 2 s, no new dmesg uvm / page-allocation / Xid line).  Then, informational, the ungated
+     * driver from there to --stop-gib: does it refuse by itself? (INFO line, never a FAIL.) */
     if (skip_oversub) {
         printf("SKIP oversub   (--skip-oversub)\n");
     } else {
         bool dm_ok0 = false;
         const std::vector<std::string> d0 = dmesg_lines(&dm_ok0);
         std::vector<std::pair<CUdeviceptr, CUmemGenericAllocationHandle>> held;
-        CUresult last = CUDA_SUCCESS;
-        double slowest = 0;
-        bool stopped = false;
-        /* its own VA: twice the device's memory, so the physical runs out before the range does */
         const size_t ov_bytes = ((size_t)dp.totalGlobalMem * 2 + gmin - 1) / gmin * gmin;
         CUdeviceptr ov = 0;
         const CUresult rv = p_cuMemAddressReserve(&ov, ov_bytes, gmin, 0, 0);
         size_t off = 0;
-        for (; rv == CUDA_SUCCESS;) {
-            if ((double)mem_available() < stop_gib * GiB) { stopped = true; break; }
-            if (off + chunk > ov_bytes) break;
+        double slowest = 0;
+        uint64_t low = mem_available();
+        bool gated_refused = false;
+        CUresult last = CUDA_SUCCESS;
+        for (; rv == CUDA_SUCCESS && off + chunk <= ov_bytes;) {
+            const uint64_t av = mem_available();
+            low = std::min(low, av);
+            if ((double)av < floor_gib * GiB + (double)chunk) { gated_refused = true; break; }   /* the gate */
             CUmemGenericAllocationHandle hh;
             const double t0 = now_ms();
             last = commit(ov + off, chunk, &hh);
@@ -425,9 +439,8 @@ int main(int argc, char **argv) {
             held.push_back({ov + off, hh});
             off += chunk;
         }
-        const uint64_t at = mem_available();
-        for (auto &x : held) decommit(x.first, chunk, x.second);
-        if (rv == CUDA_SUCCESS) p_cuMemAddressFree(ov, ov_bytes);
+        low = std::min(low, mem_available());
+        const size_t gated_chunks = held.size();
         bool dm_ok1 = false;
         const std::vector<std::string> d1 = dmesg_lines(&dm_ok1);
         int hits = 0;
@@ -438,15 +451,37 @@ int main(int argc, char **argv) {
                     d1[i].find("uvm") != std::string::npos || d1[i].find("Xid") != std::string::npos) {
                     if (!hits++) first = d1[i];
                 }
-        const bool refused = last != CUDA_SUCCESS && !stopped;
-        verdict(refused && slowest < 2000.0 && hits == 0, "oversub",
-                "%zu chunks (%.2f GiB) mapped; %s at MemAvailable %.2f GiB; slowest commit %.1f ms; dmesg %s",
-                held.size(), (double)held.size() * chunk / GiB,
-                refused ? (std::string("cuMemCreate refused: ") + cu_err(last)).c_str()
-                        : stopped ? "STOPPED at --stop-gib with cuMemCreate still succeeding (no clean refusal seen)"
-                                  : rv != CUDA_SUCCESS ? "its VA could not be reserved" : "its VA filled first",
-                at / GiB, slowest,
-                !(dm_ok0 && dm_ok1) ? "unreadable" : hits ? first.c_str() : "clean");
+        verdict(gated_refused && (double)low >= floor_gib * GiB - (double)chunk && slowest < 2000.0 && hits == 0,
+                "oversub", "a commit gated at a %.2f GiB floor refused cleanly after %zu chunks (%.2f GiB): MemAvailable "
+                "low %.2f GiB, slowest create %.1f ms, dmesg %s%s%s", floor_gib, gated_chunks,
+                (double)gated_chunks * chunk / GiB, low / GiB, slowest,
+                !(dm_ok0 && dm_ok1) ? "unreadable (run with dmesg access to check)" : hits ? first.c_str() : "clean",
+                last != CUDA_SUCCESS ? "; the driver refused first: " : "", last != CUDA_SUCCESS ? cu_err(last) : "");
+        /* informational: the ungated driver, from the floor down to --stop-gib */
+        if (gated_refused && !skip_ungated) {
+            bool stopped = false;
+            double slow_u = 0;
+            CUresult lu = CUDA_SUCCESS;
+            for (; off + chunk <= ov_bytes;) {
+                if ((double)mem_available() < stop_gib * GiB) { stopped = true; break; }
+                CUmemGenericAllocationHandle hh;
+                const double t0 = now_ms();
+                lu = commit(ov + off, chunk, &hh);
+                slow_u = std::max(slow_u, now_ms() - t0);
+                if (lu != CUDA_SUCCESS) break;
+                held.push_back({ov + off, hh});
+                off += chunk;
+            }
+            const std::string what = lu != CUDA_SUCCESS ? std::string("the driver refused: ") + cu_err(lu)
+                                     : stopped ? std::string("the driver did NOT refuse before --stop-gib")
+                                               : std::string("the VA filled");
+            printf("INFO ungated   %zu more chunks past the floor: %s at MemAvailable %.2f GiB; slowest create %.1f ms "
+                   "(why the engine gates every commit)\n", held.size() - gated_chunks, what.c_str(),
+                   mem_available() / GiB, slow_u);
+            fflush(stdout);
+        }
+        for (auto &x : held) decommit(x.first, chunk, x.second);
+        if (rv == CUDA_SUCCESS) p_cuMemAddressFree(ov, ov_bytes);
     }
 
     for (int bb = 0; bb < NB; bb++) p_cuMemAddressFree(va[bb], bank_va);
