@@ -154,10 +154,32 @@ static void plan_a(void) {
     pulsar_gpu_tensor_free(slab);
 
     /* physical residency: bank 0's pools go and come back; the rest stays */
+    /* work/kv-vmm: rows are mapped before they are written -- 300 tokens of bank 0 are 7 pools' whole chunks */
     pulsar_state_set_pos(ss, 0, 300);
+    const uint64_t chunk = pulsar_gpu_commit_chunk_bytes();
+    const uint64_t mapped0 = pulsar_state_bank_committed_bytes(ss, 0);
+    check(mapped0 == 0, "a fresh bank maps nothing (%llu B)", (unsigned long long)mapped0);
+    const int32_t cpos[2] = {299, 120}, cbank[2] = {0, 1};
+    /* each pool to its furthest row + 1 + the read slack (capped at the capacity), in whole chunks */
+    const auto mapped_for = [&](uint64_t T) {
+        T = T + PULSAR_STATE_POOL_READ_SLACK > ss->ctx ? ss->ctx : T + PULSAR_STATE_POOL_READ_SLACK;
+        return 7ull * ((T * KV_ROW + chunk - 1) / chunk) * chunk;
+    };
+    check(pulsar_state_pools_cover(ss, cpos, cbank, 2) && pulsar_state_bank_committed_bytes(ss, 0) == mapped_for(300) &&
+              pulsar_state_bank_committed_bytes(ss, 1) == mapped_for(121),
+          "covering a step's rows maps each bank's pools to its furthest row: %llu / %llu B (chunks of %llu B)",
+          (unsigned long long)pulsar_state_bank_committed_bytes(ss, 0),
+          (unsigned long long)pulsar_state_bank_committed_bytes(ss, 1), (unsigned long long)chunk);
+    std::vector<uint8_t> row = pattern(KV_ROW, 9);
+    check(wr(pulsar_state_pool(ss, 5, A_KV_GLOBAL, 0), 299ull * KV_ROW, row) &&
+              rd(pulsar_state_pool(ss, 5, A_KV_GLOBAL, 0), 299ull * KV_ROW, KV_ROW) == row,
+          "a mapped row reads back what was written");
     pulsar_state_bank_free(ss, 0);
-    check(pulsar_state_bank_evicted(ss, 0) && ss->kv_hw[0] == 0 && !pulsar_state_bank_evicted(ss, 1) &&
-          pulsar_state_tensor(ss, 5, A_SCONV) != NULL, "free_physical: bank 0's pools gone, its high-water 0, bank 1 whole");
+    check(pulsar_state_bank_evicted(ss, 0) && pulsar_state_bank_committed_bytes(ss, 0) == 0 &&
+              pulsar_state_pool(ss, 5, A_KV_GLOBAL, 0) == NULL && !pulsar_state_bank_evicted(ss, 1) &&
+              pulsar_state_bank_committed_bytes(ss, 1) > 0 && pulsar_state_tensor(ss, 5, A_SCONV) != NULL,
+          "free_physical: bank 0's pools unmapped (0 B, no pool handed out), bank 1 whole");
+    check(!pulsar_state_pools_cover_bank(ss, 0, 10), "an evicted bank's rows are refused, not mapped");
     check(pulsar_state_bank_alloc(ss, 0) && !pulsar_state_bank_evicted(ss, 0) && pulsar_state_bank_alloc(ss, 0),
           "alloc_physical re-backs it (idempotent)");
 

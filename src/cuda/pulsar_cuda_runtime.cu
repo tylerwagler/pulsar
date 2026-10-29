@@ -1,4 +1,5 @@
 #include "pulsar_cuda_internal.h"
+#include <cuda.h>   /* work/kv-vmm: the cuMem* types (entry points through cudaGetDriverEntryPointByVersion) */
 #include "pulsar_cuda_arch.cuh"   /* pulsar_cuda_device_cc: the layout / startup checks (L321) */
 #include "engine/exl3_trellis.h" /* L269 W1: exl3_expert_cut, the EXL3 expert half */
 
@@ -1434,6 +1435,195 @@ pulsar_gpu_tensor *pulsar_gpu_tensor_alloc_managed(uint64_t bytes) {
 
 
 
+/* ==== work/kv-vmm: reserved tensors -- a VA range whose physical is mapped explicitly ========================
+ *
+ * The 2026-10-29 work hang: the KV pools were cudaMallocManaged, so the GPU's first touch of a page was a fault
+ * nvidia-uvm serviced; at the kernel's min watermark its own GFP_KERNEL allocation failed, the fault was never
+ * serviced and the GPU waited forever.  A reserved tensor has no fault path: the VA is reserved whole
+ * (cuMemAddressReserve, the pool's full --ctx capacity, as the managed VA was), and the physical behind [0, n) is
+ * created and mapped on the HOST before any step writes it (pulsar_gpu_tensor_commit: cuMemCreate + cuMemMap +
+ * cuMemSetAccess, chunk by chunk).  A commit the box cannot back is a return code, said by the caller; a decommit
+ * (a guard spill) unmaps and releases the physical and keeps the VA, so every pointer to the tensor -- a graph's,
+ * a base table's -- stays valid.  A kernel that reaches an uncommitted byte faults loudly (an illegal address), it
+ * never waits.  Chunks are the device's minimum granularity rounded up to PULSAR_VMM_CHUNK_MIN.
+ * tests/vmm_probe.cu measured the API on the device (make vmm-probe). */
+#define PULSAR_VMM_CHUNK_MIN (2ull << 20)
+
+typedef CUresult (*vmm_reserve_fn)(CUdeviceptr *, size_t, size_t, CUdeviceptr, unsigned long long);
+typedef CUresult (*vmm_free_fn)(CUdeviceptr, size_t);
+typedef CUresult (*vmm_create_fn)(CUmemGenericAllocationHandle *, size_t, const CUmemAllocationProp *,
+                                  unsigned long long);
+typedef CUresult (*vmm_release_fn)(CUmemGenericAllocationHandle);
+typedef CUresult (*vmm_map_fn)(CUdeviceptr, size_t, size_t, CUmemGenericAllocationHandle, unsigned long long);
+typedef CUresult (*vmm_unmap_fn)(CUdeviceptr, size_t);
+typedef CUresult (*vmm_access_fn)(CUdeviceptr, size_t, const CUmemAccessDesc *, size_t);
+typedef CUresult (*vmm_gran_fn)(size_t *, const CUmemAllocationProp *, CUmemAllocationGranularity_flags);
+typedef CUresult (*vmm_attr_fn)(int *, CUdevice_attribute, CUdevice);
+
+static struct {
+    int state;   /* 0 = not asked, 1 = ready, -1 = refused (said once) */
+    vmm_reserve_fn reserve;
+    vmm_free_fn free_va;
+    vmm_create_fn create;
+    vmm_release_fn release;
+    vmm_map_fn map;
+    vmm_unmap_fn unmap;
+    vmm_access_fn access;
+    CUmemAllocationProp prop;
+    CUmemAccessDesc desc;
+    uint64_t chunk;
+} g_vmm;
+
+struct pulsar_vmm_map {
+    uint64_t chunk;                         /* bytes a chunk */
+    uint64_t n_chunks;                      /* the VA's chunks */
+    uint64_t committed;                     /* chunks [0, committed) are mapped */
+    CUmemGenericAllocationHandle *handle;   /* [n_chunks] */
+};
+
+static void *vmm_sym(const char *name) {
+    void *p = NULL;
+    cudaDriverEntryPointQueryResult q = cudaDriverEntryPointSymbolNotFound;
+    if (cudaGetDriverEntryPointByVersion(name, &p, 12000, cudaEnableDefault, &q) != cudaSuccess ||
+        q != cudaDriverEntryPointSuccess)
+        return NULL;
+    return p;
+}
+
+/* The API on this device, asked once.  0 (said once) when the driver or the device lacks it: no reserved tensor
+ * can be made, and the session create that wants one refuses (rule 1: there is no managed arm to drop to). */
+static int vmm_ready(void) {
+    if (g_vmm.state) return g_vmm.state > 0;
+    int dev = 0, vmm = 0;
+    vmm_attr_fn attr = (vmm_attr_fn)vmm_sym("cuDeviceGetAttribute");
+    vmm_gran_fn gran = (vmm_gran_fn)vmm_sym("cuMemGetAllocationGranularity");
+    g_vmm.reserve = (vmm_reserve_fn)vmm_sym("cuMemAddressReserve");
+    g_vmm.free_va = (vmm_free_fn)vmm_sym("cuMemAddressFree");
+    g_vmm.create = (vmm_create_fn)vmm_sym("cuMemCreate");
+    g_vmm.release = (vmm_release_fn)vmm_sym("cuMemRelease");
+    g_vmm.map = (vmm_map_fn)vmm_sym("cuMemMap");
+    g_vmm.unmap = (vmm_unmap_fn)vmm_sym("cuMemUnmap");
+    g_vmm.access = (vmm_access_fn)vmm_sym("cuMemSetAccess");
+    size_t g = 0;
+    memset(&g_vmm.prop, 0, sizeof g_vmm.prop);
+    g_vmm.prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
+    g_vmm.prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+    const bool syms = attr && gran && g_vmm.reserve && g_vmm.free_va && g_vmm.create && g_vmm.release && g_vmm.map &&
+                      g_vmm.unmap && g_vmm.access;
+    if (syms && cudaGetDevice(&dev) == cudaSuccess) {
+        g_vmm.prop.location.id = dev;
+        if (attr(&vmm, CU_DEVICE_ATTRIBUTE_VIRTUAL_MEMORY_MANAGEMENT_SUPPORTED, (CUdevice)dev) != CUDA_SUCCESS) vmm = 0;
+        if (vmm && gran(&g, &g_vmm.prop, CU_MEM_ALLOC_GRANULARITY_MINIMUM) != CUDA_SUCCESS) g = 0;
+    }
+    if (!syms || !vmm || g == 0) {
+        fprintf(stderr, "pulsar: CUDA virtual memory management is not available on this device (%s) -- the KV "
+                        "pools are reserved tensors and cannot be made\n",
+                !syms ? "the driver exports no cuMem* entry points" : !vmm ? "the device says unsupported"
+                                                                     : "no allocation granularity");
+        g_vmm.state = -1;
+        return 0;
+    }
+    g_vmm.chunk = ((PULSAR_VMM_CHUNK_MIN + g - 1) / g) * g;
+    g_vmm.desc.location = g_vmm.prop.location;
+    g_vmm.desc.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+    g_vmm.state = 1;
+    fprintf(stderr, "pulsar: KV pools are reserved VA with explicitly mapped physical (CUDA VMM, %llu KiB chunks; "
+                    "device granularity %zu KiB)\n", (unsigned long long)(g_vmm.chunk >> 10), g >> 10);
+    return 1;
+}
+
+uint64_t pulsar_gpu_commit_chunk_bytes(void) {
+    return vmm_ready() ? g_vmm.chunk : PULSAR_VMM_CHUNK_MIN;
+}
+
+pulsar_gpu_tensor *pulsar_gpu_tensor_reserve(uint64_t bytes) {
+    if (bytes == 0) bytes = 1;
+    if (g_dry.active) return dry_alloc(bytes, 1);   /* priced as the demand-paged share, as the managed VA was */
+    if (!vmm_ready()) return NULL;
+    const uint64_t chunk = g_vmm.chunk, n = (bytes + chunk - 1) / chunk;
+    pulsar_gpu_tensor *t = (pulsar_gpu_tensor *)calloc(1, sizeof(*t));
+    pulsar_vmm_map *m = (pulsar_vmm_map *)calloc(1, sizeof(*m));
+    CUmemGenericAllocationHandle *h = (CUmemGenericAllocationHandle *)calloc((size_t)n, sizeof(*h));
+    CUdeviceptr va = 0;
+    const CUresult r = t && m && h ? g_vmm.reserve(&va, (size_t)(n * chunk), (size_t)chunk, 0, 0)
+                                   : CUDA_ERROR_OUT_OF_MEMORY;
+    if (r != CUDA_SUCCESS) {
+        fprintf(stderr, "pulsar: reserving %.2f GiB of VA for a KV pool failed (CUresult %d)\n",
+                (double)(n * chunk) / 1073741824.0, (int)r);
+        free(t);
+        free(m);
+        free(h);
+        return NULL;
+    }
+    m->chunk = chunk;
+    m->n_chunks = n;
+    m->handle = h;
+    t->ptr = (void *)(uintptr_t)va;
+    t->bytes = bytes;
+    t->owner = 1;
+    t->vmm = m;
+    __atomic_add_fetch(&g_tensor_alloc_bytes, bytes, __ATOMIC_RELAXED);
+    return t;
+}
+
+int pulsar_gpu_tensor_commit(pulsar_gpu_tensor *t, uint64_t bytes) {
+    if (!t || bytes > t->bytes) return 0;
+    if (!t->vmm || t->dry) return 1;   /* a plain tensor is backed whole; a priced one is a placeholder */
+    pulsar_vmm_map *m = t->vmm;
+    const uint64_t want = (bytes + m->chunk - 1) / m->chunk;
+    const CUdeviceptr base = (CUdeviceptr)(uintptr_t)t->ptr;
+    while (m->committed < want) {
+        const CUdeviceptr at = base + m->committed * m->chunk;
+        CUmemGenericAllocationHandle h = 0;
+        CUresult r = g_vmm.create(&h, (size_t)m->chunk, &g_vmm.prop, 0);
+        if (r == CUDA_SUCCESS) {
+            r = g_vmm.map(at, (size_t)m->chunk, 0, h, 0);
+            if (r == CUDA_SUCCESS) {
+                r = g_vmm.access(at, (size_t)m->chunk, &g_vmm.desc, 1);
+                if (r != CUDA_SUCCESS) (void)g_vmm.unmap(at, (size_t)m->chunk);
+            }
+            if (r != CUDA_SUCCESS) (void)g_vmm.release(h);
+        }
+        if (r != CUDA_SUCCESS) return 0;   /* the caller names the pool and the tokens; nothing half-mapped */
+        m->handle[m->committed++] = h;
+    }
+    return 1;
+}
+
+uint64_t pulsar_gpu_tensor_committed_bytes(const pulsar_gpu_tensor *t) {
+    if (!t) return 0;
+    if (!t->vmm) return t->bytes;
+    const uint64_t b = t->vmm->committed * t->vmm->chunk;
+    return b < t->bytes ? b : t->bytes;
+}
+
+int pulsar_gpu_tensor_decommit(pulsar_gpu_tensor *t) {
+    if (!t || !t->vmm || t->dry || t->vmm->committed == 0) return 1;
+    /* nothing in flight may read the pages: a spill is rare, so the whole device drains first */
+    if (!cuda_ok(cudaDeviceSynchronize(), "decommit drain")) return 0;
+    pulsar_vmm_map *m = t->vmm;
+    const CUdeviceptr base = (CUdeviceptr)(uintptr_t)t->ptr;
+    int ok = 1;
+    for (uint64_t c = 0; c < m->committed; c++) {
+        ok &= g_vmm.unmap(base + c * m->chunk, (size_t)m->chunk) == CUDA_SUCCESS;
+        ok &= g_vmm.release(m->handle[c]) == CUDA_SUCCESS;
+        m->handle[c] = 0;
+    }
+    m->committed = 0;
+    if (!ok) fprintf(stderr, "pulsar: a KV pool's decommit failed (unmap / release) -- its VA stays reserved\n");
+    return ok;
+}
+
+static void vmm_tensor_free(pulsar_gpu_tensor *t) {
+    (void)pulsar_gpu_tensor_decommit(t);
+    (void)g_vmm.free_va((CUdeviceptr)(uintptr_t)t->ptr, (size_t)(t->vmm->n_chunks * t->vmm->chunk));
+    free(t->vmm->handle);
+    free(t->vmm);
+    t->vmm = NULL;
+}
+
+
+
 static uint64_t cuda_managed_kv_reserve_bytes(uint64_t total_bytes) {
     const uint64_t min_reserve = 8ull * 1073741824ull;
     const uint64_t max_reserve = 40ull * 1073741824ull;
@@ -1491,7 +1681,10 @@ pulsar_gpu_tensor *pulsar_gpu_tensor_view(const pulsar_gpu_tensor *base, uint64_
 
 void pulsar_gpu_tensor_free(pulsar_gpu_tensor *tensor) {
     if (!tensor) return;
-    if (tensor->owner && tensor->ptr && !tensor->dry) {
+    if (tensor->owner && tensor->ptr && !tensor->dry && tensor->vmm) {
+        vmm_tensor_free(tensor);
+        __atomic_sub_fetch(&g_tensor_alloc_bytes, tensor->bytes, __ATOMIC_RELAXED);
+    } else if (tensor->owner && tensor->ptr && !tensor->dry) {
         (void)cudaFree(tensor->ptr);
         __atomic_sub_fetch(&g_tensor_alloc_bytes, tensor->bytes, __ATOMIC_RELAXED);
     }

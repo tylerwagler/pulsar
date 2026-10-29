@@ -342,6 +342,20 @@ static int pools_span_io(payload_io *io, const pulsar_kv_pool *pools, uint32_t n
             return 1;
         }
         const uint64_t off = (uint64_t)row0 * pools[i].row_bytes, bytes = (uint64_t)rows * pools[i].row_bytes;
+        /* work/kv-vmm: a load maps the rows it writes first -- to the same end a step would (its rows + the read
+         * slack, state_kinds.h), so a restored bank holds what its prefill held; a save reads only mapped rows */
+        const uint64_t slack_end = (uint64_t)(pool_row(pools[i], t1) + (PULSAR_STATE_POOL_READ_SLACK +
+                                              pools[i].tokens_per_row - 1u) / pools[i].tokens_per_row) *
+                                   pools[i].row_bytes;
+        const uint64_t cap = pulsar_gpu_tensor_bytes(pools[i].rows);
+        if (!write && !pulsar_gpu_tensor_commit(pools[i].rows, slack_end < cap ? slack_end : cap)) {
+            payload_set_err(err, errlen, "a KV pool's rows could not be backed (the box is out of memory)");
+            return 1;
+        }
+        if (write && pulsar_gpu_tensor_committed_bytes(pools[i].rows) < off + bytes) {
+            payload_set_err(err, errlen, "a KV pool's rows to save were never mapped (no step wrote them)");
+            return 1;
+        }
         rc = write ? payload_write_tensor_span(io, pools[i].rows, off, bytes, buf, PULSAR_SESSION_IO_CHUNK, err, errlen)
                    : payload_read_tensor_span(io, pools[i].rows, off, bytes, buf, PULSAR_SESSION_IO_CHUNK, remaining,
                                               err, errlen);

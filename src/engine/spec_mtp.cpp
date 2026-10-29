@@ -29,7 +29,8 @@ pulsar_gpu_tensor *pend_tensor(const pulsar_session *s) {
  * not read past). */
 bool step(pulsar_session *s, const pulsar_mtp_step &m) {
     pulsar_mtp_lane *l = LANE(s);
-    if (l->ops->forward(s, &m)) return true;
+    /* work/kv-vmm: the module's pool rows (the drafter slot's) are mapped before it writes them */
+    if ((!s->states || pulsar_state_pools_cover(s->states, m.pos, m.bank, m.n)) && l->ops->forward(s, &m)) return true;
     fprintf(stderr, "pulsar: %s: the MTP step failed; its banks' drafter state is dropped\n", ARCH(s));
     for (uint32_t r = 0; r < m.n; r++)
         if ((uint32_t)m.bank[r] < l->n_banks) l->pend_pos[m.bank[r]] = UINT32_MAX;

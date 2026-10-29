@@ -338,6 +338,15 @@ bool pulsar_ckpt_adopt(pulsar_ckpt_store *st, uint32_t dst, uint32_t src, uint32
     bool ok = r ? st->ops->install_frontier(st->state, T, T) : st->ops->prepare_restore(st->state, T);
     for (uint32_t i = 0; ok && i < n; i++) {
         const uint64_t rows = (T + sp[i].tokens_per_row - 1u) / sp[i].tokens_per_row;
+        /* work/kv-vmm: the destination's rows are mapped before the copy writes them (the source's are, by the steps
+         * that wrote them); a box that cannot back them refuses the adopt */
+        if (!pulsar_gpu_tensor_commit(dp[i].rows, rows * dp[i].row_bytes)) {
+            fprintf(stderr, "pulsar: adopting bank %u's state at %u into bank %u: its %llu MiB of pool rows could not "
+                            "be backed (the box is out of memory)\n", src, T, dst,
+                    (unsigned long long)((rows * dp[i].row_bytes) >> 20));
+            ok = false;
+            break;
+        }
         ok = pulsar_gpu_tensor_copy_async(dp[i].rows, 0, sp[i].rows, 0, rows * sp[i].row_bytes) != 0;
     }
     ok = ok && st->ops->walk(st->state, 1, r != NULL, slab, off, T, NULL);
