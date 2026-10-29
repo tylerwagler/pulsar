@@ -15,6 +15,7 @@
 #include "pulsar_kvchain.h"
 #include "pulsar_dsml.h"
 #include "pulsar_utf8.h"
+#include "pulsar_stall.h"
 /* The JSON scanner is shared with the engine's safetensors reader, so it lives
  * in src/lib and is declared there. */
 #include "pulsar_json.h"
@@ -60,6 +61,7 @@
 #include <sys/types.h>
 #include <time.h>
 #include <unistd.h>
+#include <sys/syscall.h>
 
 
 /* Build-time version string (Makefile passes -DPULSAR_VERSION_STR from
@@ -1796,8 +1798,21 @@ struct server {
      * floor already resident.
      * `guard_evictions` counts spills for metrics. */
     bool         guard_enabled;          ///< the proactive-eviction guard is active
-    uint64_t     guard_touched_budget;   ///< resident-KV ceiling the guard keeps touched_kv under
+    uint64_t     guard_touched_ceiling;  ///< the startup ceiling (post-warmup reading); the live budget never exceeds it
+    uint64_t     guard_kv_budget;        ///< the ledger budget the ceiling was cut from
     uint64_t     guard_eager_bytes;      ///< eager floor already resident
+    uint64_t     guard_avail;            ///< the MemAvailable reading the live budget last used
+    double       guard_avail_at;         ///< when it was read (server_now_sec); re-read at most every 0.25 s
+    uint64_t     guard_budget_said;      ///< the live budget last logged (a move of 0.5 GiB or more is said)
+    /** The stall watchdog (watchdog.cpp).  `stall_s` is written by the watchdog and read by /health (__atomic);
+     *  `worker_tid` / `worker_thread` are set by worker_main for the dump. */
+    int          stall_limit_s;          ///< PULSAR_STALL_WATCHDOG_S (0 = off)
+    int64_t      stall_s;                ///< seconds the worker has been stalled (0 = progressing)
+    int          worker_tid;             ///< the worker's kernel thread id
+    pthread_t    worker_thread;
+    pthread_t    watchdog_thread;
+    bool         watchdog_running;
+    bool         watchdog_quit;          ///< __atomic: ends the watchdog
     uint64_t     guard_evictions;        ///< spills performed, for metrics
     warn_limiter mem_floor_warn;         ///< the per-request MemAvailable-floor refusal line, rate-limited (L190 C1)
     /** Trivial-match threshold for the choose-vs-provision routing decision:
@@ -1945,6 +1960,9 @@ struct server {
     uint64_t m_restore_slices;    ///< L330: disk chain slices read (a one-shot load is one)
     double   m_restore_stall_max_ms;  ///< L330: the longest slice -- the longest worker stall a disk restore caused
     uint64_t m_kv_touched;        ///< L328: resident demand-paged KV (pulsar_session_touched_kv_bytes), published
+    uint64_t m_kv_budget;         ///< the guard's live budget (server::guard_budget), published
+    uint64_t m_persist_skipped;   ///< disk-KV persists skipped: MemAvailable could not cover them over the floor
+    uint64_t m_prefill_mem_refusals;  ///< prefills stopped mid-prompt: MemAvailable under the floor before a chunk
     uint64_t m_kv_reserved;       ///< L328: kv_reserved_bytes(NULL), the base every admission reads, published
     uint64_t m_preemptions;  ///< L314: running decoders preempted through their terminal checkpoint
     uint64_t m_readmissions;  ///< L314: preempted decoders reloaded and stepping again
@@ -2058,6 +2076,17 @@ struct server {
      * each time.  *chain_end (when given): where the stored chain ends after the
      * write (0: none).  @return segments written (0: nothing new, or disabled). */
     int kv_cache_persist(session_slot *sl, const char *reason, bool close, int *chain_end = nullptr);
+    warn_limiter persist_skip_warn;   ///< the persist-skipped line, rate-limited (each skip is counted)
+    /** The guard's live touched-KV budget: server_guard_touched_budget over the CURRENT MemAvailable (re-read at most
+     *  every 0.25 s) and touched KV, never above the startup ceiling -- so memory nobody accounts for (host heap,
+     *  page cache, the driver) shrinks the room KV may take, and the guard spills / waits / refuses before
+     *  MemAvailable reaches the floor.  0 when MemAvailable is unreadable (every decision then fails closed). */
+    uint64_t guard_budget();
+    /** Start / stop the stall watchdog (watchdog.cpp); start is a no-op when stall_limit_s is 0. */
+    bool watchdog_start();
+    void watchdog_stop();
+    /** The watchdog's one dump for a stall of `stalled_s` seconds (watchdog.cpp). */
+    void watchdog_dump(int64_t stalled_s);
     /** Load the deepest stored chain whose text is a byte prefix of
      * `prompt_text` into the installed bank (live at the chain's end), and build
      * the prompt to sync: the exact stored tokens + the rest of the text --
@@ -2189,6 +2218,16 @@ struct server {
      * chain closed at the bank's deepest grid checkpoint, the last grid point the prefill reached -- so the re-send
      * (a Stop and re-send, a client timeout) resumes there instead of re-prefilling it; then gen_prefill_fail. */
     void gen_prefill_abandon(session_slot *sl);
+    /** 2026-10-29: may this prefill quantum start?  MemAvailable must cover one chunk's new KV over the floor; short
+     *  of it the guard's remedies run first (spill an idle bank, preempt the newest decoder: server_prefill_mem_step).
+     *  false = the request was refused (503) and its gen is done -- the bank keeps what it prefilled. */
+    bool prefill_headroom_ok(session_slot *sl);
+    /** The fused / mixed lanes' form: no remedy (banks would move under the step being assembled) and no refusal --
+     *  short of the floor the prompt leaves the fused lane (gen->no_fuse) and its classic quantum decides. */
+    bool prefill_headroom_fused_ok(session_slot *sl);
+    /** One prefill chunk's new KV on one bank (the per-chunk re-check's need). */
+    uint64_t prefill_chunk_need();
+    warn_limiter prefill_mem_warn;   ///< the prefill-refused line, rate-limited (each refusal is counted)
     /** Resolve the prompt against every cache layer and decide the prefill plan.
      * Clients resend full prompts as text.  The worker first tries the old exact
      * token-prefix hit, then a rendered-text prefix hit for the live checkpoint,
@@ -3591,15 +3630,69 @@ bool server_kv_admits(uint64_t kv_budget_bytes,
  * at provisioning time on top of the ledger (defined in cli_main.cpp;
  * unit-tested there). avail == 0 (unreadable /proc/meminfo) fails closed. */
 bool server_mem_floor_admits(uint64_t avail_bytes, uint64_t est_bytes);
-/* L319: the touched-KV ceiling -- min(kv budget − eager, touched + MemAvailable − floor at the post-warmup reading);
- * 0 when MemAvailable is at or under the floor, or unreadable (defined in cli_main.cpp; unit-tested there). */
+/* L319: the touched-KV ceiling -- min(kv budget − eager, touched + MemAvailable − floor); 0 when MemAvailable is at
+ * or under the floor, or unreadable (defined in cli_main.cpp; unit-tested there).  The startup ceiling reads the
+ * post-warmup MemAvailable; the guard's live budget (server::guard_budget) the current one. */
 uint64_t server_guard_touched_budget(uint64_t kv_budget_bytes, uint64_t eager_bytes, uint64_t touched_bytes,
                                      uint64_t avail_bytes);
+
+/* ==== The memory floor (2026-10-29 work hang) ==============================================================
+ * The hang: Nemotron 3.5 Super, 16 banks at --ctx 1M, a continued prefill at ~188k.  The guard's ceiling had
+ * spent the post-warmup headroom down to the 4 GiB floor on touched KV alone, while memory nobody counts (host
+ * heap, page cache, the driver's own) kept growing, so the box reached the kernel's min watermark.  nvidia-uvm
+ * then failed to allocate its uvm_va_block_context_t (GFP_KERNEL, dmesg) while servicing a GPU fault on a
+ * managed KV pool, the fault was never serviced, and the worker spun in the driver for 36 minutes.
+ *
+ * ONE floor, derived at startup and logged (server_mem_floor_init): the OS margin PULSAR_SERVER_MEM_FLOOR_BYTES
+ * (multi-GiB swings the accounting cannot see; the incident had one), plus the kernel's own reserve -- every
+ * zone's HIGH watermark from /proc/zoneinfo, the point under which kswapd reclaims and GFP_KERNEL allocations
+ * such as the UVM fault path's start to fail -- plus the largest host/driver demand one worker step makes between
+ * two checks (a prefill chunk's new KV pages on one bank and a persist's dirty-page window).  NVIDIA documents no
+ * headroom figure for GB10's UVM; the watermark is the kernel's number for it.  Every MemAvailable check reads it:
+ * bank provisioning, the guard's live budget, each prefill quantum and each disk-KV persist.  Until init runs (a
+ * test, a tool) it is the OS margin alone. */
+/** The derived floor (bytes). */
+uint64_t server_mem_floor(void);
+/** Derive and set the floor: the OS margin + `zone_high_bytes` + `step_bytes`; returns it. */
+uint64_t server_mem_floor_init(uint64_t zone_high_bytes, uint64_t step_bytes);
+/** Sum of every zone's `high` watermark in a /proc/zoneinfo text, in bytes (pages of `page_bytes`); 0 when none
+ *  parses (the caller logs it and the floor keeps the OS margin). */
+uint64_t server_zoneinfo_high_bytes(const char *zoneinfo, uint64_t page_bytes);
+/** /proc/zoneinfo's high watermarks (server_zoneinfo_high_bytes over the live file); 0 when unreadable. */
+uint64_t server_zone_high_watermark_bytes(void);
+/** The host bytes one disk-KV persist of a `tokens`-long history can take beyond the pinned staging buffer: the
+ *  writeback window of dirty page cache (PULSAR_WRITEBACK_STEP) and the two renders of the history's text
+ *  (pulsar_kvchain_persist), bounded at PERSIST_TEXT_BYTES_PER_TOKEN a token. */
+uint64_t server_persist_host_bytes(int tokens);
+#define PERSIST_TEXT_BYTES_PER_TOKEN 64u
+/** Does MemAvailable `avail` leave `floor` after `need` more bytes?  avail 0 (unreadable) is no. */
+bool server_headroom_admits(uint64_t avail, uint64_t need, uint64_t floor);
+/** The per-chunk prefill re-check's next move (server::prefill_headroom_ok): GO when MemAvailable covers the chunk
+ *  over the floor; else SPILL while an idle bank can go, else PREEMPT while a decoder can, else REFUSE. */
+typedef enum { PREFILL_MEM_GO = 0, PREFILL_MEM_SPILL, PREFILL_MEM_PREEMPT, PREFILL_MEM_REFUSE, PREFILL_MEM_STEPS } prefill_mem_step;
+extern const char *const prefill_mem_step_names[PREFILL_MEM_STEPS];
+prefill_mem_step server_prefill_mem_step(uint64_t avail, uint64_t need, uint64_t floor, int n_idle_victims,
+                                         bool preemptible);
 
 /* MemAvailable from /proc/meminfo, in bytes (0 on parse failure — callers
  * fail closed).  Never called on a token/layer hot path (defined in
  * generate.cpp; also used by startup warmup/budget derivation in cli_main.cpp). */
 uint64_t server_mem_available_bytes(void);
+
+/* ==== The stall watchdog (watchdog.cpp) ===================================================================
+ * The worker marks every CUDA-heavy section it enters (src/lib/pulsar_stall.h; each mark a heartbeat).  A watchdog
+ * thread checks once a second: when jobs are queued or running and no mark has landed for PULSAR_STALL_WATCHDOG_S
+ * seconds (default 120; 0 = off), the worker is stalled -- ONE dump goes to the log (each slot's phase / bank /
+ * position, the queue, the KV and MemAvailable figures, the last section entered, every thread's state, the
+ * worker's backtrace) and /health reports status "stalled" with "stalled": seconds (503) until a mark lands again.
+ * The normal path only marks; nothing else changes. */
+#define PULSAR_STALL_WATCHDOG_DEFAULT_S 120
+/** Parse PULSAR_STALL_WATCHDOG_S (`v` NULL or "" = the default; "0" = off; else whole seconds 1..86400).
+ *  false (err says why) on anything else: the server refuses to start. */
+bool server_stall_limit_parse(const char *v, int *limit_s, char *err, size_t errlen);
+/** How long the worker has been stalled: `now_ms - beat_ms` in whole seconds when `busy` and it is at least
+ *  `limit_s` (> 0), else 0. */
+int64_t server_stall_seconds(int64_t now_ms, int64_t beat_ms, bool busy, int limit_s);
 /* Log priced-vs-actual for a freshly created session and return the bytes the
  * ledger commits (the actual); 0 when they differ -- the price is the
  * allocator run dry, so a difference is an accounting hole and the caller

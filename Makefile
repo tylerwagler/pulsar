@@ -2150,6 +2150,16 @@ KV_HEADROOM_MODEL ?= /mnt/models/nemotron35-mini-pulsar
 server-kv-headroom-live: pulsar-server
 	python3 tests/server_kv_headroom_live.py $(KV_HEADROOM_MODEL) --binary ./pulsar-server
 
+# 2026-10-29, the work hang as a leg: Nemotron 3.5 Super (K4 + LiLiCorr, 16 banks, --ctx 1M), three conversations grown
+# by ~15k-token continued prefills toward 200k under a balloon that leaves the derived floor + 3 GiB.  PASS: no request
+# hangs, the stall watchdog stays quiet, MemAvailable never goes more than 0.25 GiB under the floor, persists happen or
+# are skipped loudly, every answer is 200 or a named 503, no uvm / page-allocation line in dmesg.  ~1-2 h, the box to
+# itself (a quiet gpuq job, production stopped).  Not in gates-dev: run it for a guard / floor / persist change.
+MEM_SQUEEZE_MODEL ?= /srv/models/nemotron35-super-k4
+.PHONY: nemotron-mem-squeeze-live
+nemotron-mem-squeeze-live: pulsar-server
+	python3 tests/nemotron_mem_squeeze_live.py $(MEM_SQUEEZE_MODEL) --binary ./pulsar-server
+
 # L318: an Open WebUI conversation (the history rewritten inside the previous turn, ~30k-token prompts) resumes within
 # one segment of its byte match from the deepest valid state -- own bank, adopt, disk chain -- a prefill its client
 # abandons keeps its computed prefix for the re-send, and both stay reuse == cold against a fresh server.  Production's

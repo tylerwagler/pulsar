@@ -374,6 +374,31 @@ int server::kv_cache_persist(session_slot *sl, const char *reason, bool close, i
      * chunk verdicts.  The prompt-end store after it persists the same
      * checkpoints. */
     if (pulsar_session_in_mirrored_sync(s->sess)) return 0;
+    /* 2026-10-29 (the work hang: a "continued" persist at ~188k under the kernel's min watermark): a persist runs
+     * only when MemAvailable covers what it can take -- its dirty-page window and the history's text renders (the
+     * device reads stream through the session's pinned buffer, which allocates nothing) -- over the floor.  Else
+     * it is SKIPPED, counted and said: the history stays live in its bank, only its disk copy is not written now
+     * (a later persist of the same bank writes every segment the store lacks).  A documented outcome, not a
+     * fallback: no other write path runs. */
+    {
+        const pulsar_tokens *toks = pulsar_session_tokens(s->sess);
+        const uint64_t need = server_persist_host_bytes(toks ? toks->len : 0);
+        const uint64_t avail = server_mem_available_bytes();
+        if (!server_headroom_admits(avail, need, server_mem_floor())) {
+            s->count_metric(&s->m_persist_skipped);
+            unsigned skipped = 0;
+            if (warn_limiter_due(&s->persist_skip_warn, server_now_sec(), PULSAR_SERVER_MEM_FLOOR_WARN_SEC, &skipped)) {
+                const double gib = 1024.0 * 1024.0 * 1024.0;
+                server_log(PULSAR_LOG_WARNING,
+                           "pulsar-server: kv cache persist SKIPPED reason=%s: MemAvailable %.2f GiB does not cover "
+                           "the %.2f GiB it may take over the %.2f GiB floor%s (%u more skipped since the last line)",
+                           reason, (double)avail / gib, (double)need / gib, (double)server_mem_floor() / gib,
+                           avail ? "" : " (MemAvailable unreadable)", skipped);
+            }
+            return 0;
+        }
+    }
+    pulsar_stall_mark("kv cache persist");
     const double t0 = server_now_sec();
     const pulsar_kvchain_trailer tool_maps = { s, seg_trailer_size, seg_trailer_write };
     pulsar_kvchain_persist_result r;

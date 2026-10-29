@@ -12,6 +12,7 @@
  * the gates' classic suffix): the cut is the plan's, the effects are each caller's hooks.  The events are
  * prefill_chunk / prefill_display at the start and after each chunk. */
 #include "pulsar_engine_internal.h"
+#include "lib/pulsar_stall.h"
 
 void pulsar_prefill_plan_init(pulsar_prefill_plan *p, const pulsar_prefill_shape *shape, uint32_t start,
                               const pulsar_ckpt_store *store, const pulsar_engine *e, const pulsar_tokens *prompt,
@@ -274,6 +275,7 @@ static bool prefill_loop_chunk(void *ud, uint32_t pos0, uint32_t rows, bool last
      * (pulsar_session_set_prefill_ahead); a sync nobody licensed (a gate, the CLI, imatrix) passes NULL, reads nothing */
     (void)pulsar_session_read_ahead(c->s, c->bank, c->s->prefill_ahead, pos0 + rows);
     const double t0 = now_sec();
+    pulsar_stall_mark("prefill chunk");
     if (!c->chunk(c->s, c->prompt, pos0, rows, last, c->ud) || pulsar_gpu_end_commands() == 0) return false;
     if (c->s->sync_n_images == 0)
         pulsar_engine_prefill_chunk_observe(c->s->engine, rows, pos0, (now_sec() - t0) * 1e3);

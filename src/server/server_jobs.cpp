@@ -1192,6 +1192,7 @@ void server::gen_step_prefill(session_slot *sl) {
      * plain text sync -- interruptible like any text prefill -- and the
      * checkpoint it leaves is one the main image sync extends. */
     const int n_images = cold ? 0 : g->j->req.n_images;
+    if (!s->prefill_headroom_ok(sl)) return;   /* refused loudly (503); the bank keeps what it prefilled */
     gen_arm_prefill_callbacks(s->sess, g);
     /* L329 (a): a queued request waits for this prefill to stand at share_mark (a resume-grid point inside the
      * target): the sync goes to it first, so its last chunk ends there and captures the grid checkpoint the waiter

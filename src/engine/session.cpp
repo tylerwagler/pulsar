@@ -1191,6 +1191,14 @@ int pulsar_session::create(pulsar_session **out, pulsar_engine *e, int ctx_size)
     pulsar_session *s = session_build(e, ctx_size, gpu_graph_bank_pool_n());
     if (!s) return 1;
     s->resident_bytes = pulsar_gpu_tensor_alloc_bytes_current() - alloc_before;
+    /* the disk-KV staging buffer, pinned once (pulsar_session::io_buf): a session that cannot have it does not open */
+    s->io_buf = (uint8_t *)pulsar_gpu_host_alloc(PULSAR_SESSION_IO_CHUNK);
+    if (!s->io_buf) {
+        fprintf(stderr, "pulsar: session create: the %u MiB pinned disk-KV staging buffer could not be allocated -- "
+                        "refusing\n", PULSAR_SESSION_IO_CHUNK >> 20);
+        s->destroy();
+        return 1;
+    }
     /* Slice 4e: the mirror id both ranks agree on by construction -- the engine's create ordinal, assigned
      * here, where every family's session begins (L266: it was DeepSeek's create, so a Qwen session was never
      * mirrored).  A session created with no pair armed keeps 0 and stays out of the mirror. */
@@ -1303,6 +1311,7 @@ void pulsar_session::destroy() {
     token_vec_free(&s->checkpoint);
     s->bank_carry_free();
     pulsar_session_dev_free(s);
+    pulsar_gpu_host_free(s->io_buf);
     free(s->logits);
     free(s);
 }

@@ -45,7 +45,7 @@ ap.add_argument("--log", default=os.path.join(os.environ.get("TMPDIR", "/var/tmp
 a = ap.parse_args()
 URL = "http://127.0.0.1:%d" % a.port
 GiB = float(1 << 30)
-FLOOR = 4 * GiB   # PULSAR_SERVER_MEM_FLOOR_BYTES
+FLOOR = 4 * GiB   # PULSAR_SERVER_MEM_FLOOR_BYTES, the OS margin; the derived floor is read from the guarded server
 fails = 0
 procs = []        # every child to kill on the way out (servers)
 balloon = []      # the balloon's mapping
@@ -188,6 +188,9 @@ try:
     code, usage, _ = chat([ask(words(1, 400))])
     tpw = usage.get("prompt_tokens", 1200) / 400.0
     a1 = post_warmup_avail(open(log).read())
+    mf = re.search(r"memory floor ([0-9.]+) MiB", open(log).read())   # 2026-10-29: the derived floor (cli_main.cpp)
+    if mf:
+        FLOOR = float(mf.group(1)) * (1 << 20)
     stop(p)
     cost = a0 - a1
     print("phase 0: MemAvailable %.2f GiB, the server costs %.2f GiB to its post-warmup reading; %.0f B of KV a token, "
@@ -210,7 +213,10 @@ try:
     p, log = start("guarded")
     txt = open(log).read()
     av = post_warmup_avail(txt)
-    mb_ = re.search(r"touched budget ([0-9.]+) GiB", txt)
+    mb_ = re.search(r"touched ceiling ([0-9.]+) GiB", txt)
+    mf = re.search(r"memory floor ([0-9.]+) MiB", txt)   # 2026-10-29: the derived floor every check reads
+    if mf:
+        FLOOR = float(mf.group(1)) * (1 << 20)
     mt = re.search(r"touched ([0-9.]+) \+ MemAvailable", txt)
     ceiling = float(mb_.group(1)) * GiB if mb_ else -1.0
     touched0 = float(mt.group(1)) * GiB if mt else 0.0
@@ -263,7 +269,10 @@ try:
             break
         msgs.append({"role": "assistant", "content": reply})
     if refused:
-        check(refused[1] == 503 and "not enough KV memory" in refused[2],
+        # fail closed is either refusal: the admission's (L280) or the per-chunk memory re-check's (2026-10-29: one
+        # bank, nothing to spill or preempt -- the guard's remedies have nothing to free, so the 503 is right)
+        check(refused[1] == 503 and ("not enough KV memory" in refused[2] or
+                                     "not enough memory to continue" in refused[2]),
               "turn %d past the ceiling refused (fail closed): %s %s" % (refused[0], refused[1], refused[2][:160]))
     stop_sampling.set()
     th.join()
@@ -274,7 +283,7 @@ try:
     check(low[0] >= FLOOR - a.slack_gib * GiB, "MemAvailable stayed within %.2f GiB of the floor (low %.2f GiB)"
           % (a.slack_gib, low[0] / GiB))
     adm = (txt.count("spilling") + txt.count("queued until a busy bank") + txt.count("guard: spilled") +
-           txt.count("kv admission REFUSED"))
+           txt.count("kv admission REFUSED") + txt.count("prefill REFUSED (503)"))
     check(adm > 0, "the ceiling bound: %d spill / wait / refusal line(s)" % adm)
     check("NO idle victim" not in txt, "the decode guard never proceeded past its budget (no back-pressure line)")
     if p.poll() is None:

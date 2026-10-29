@@ -51,10 +51,11 @@ def chat(srv, text, max_tokens, logprobs=True):
 
 
 def guard(srv):
-    """(touched budget, eager floor) in bytes as the server holds them (/metrics, L326), or None with the guard off.
-    The touched budget is min(kv budget - eager, touched + MemAvailable - floor post-warmup) (cli_main.cpp, L319)."""
+    """(touched ceiling, eager floor) in bytes as the server holds them (/metrics, L326), or None with the guard off.
+    The ceiling is min(kv budget - eager, touched + MemAvailable - floor post-warmup) (cli_main.cpp, L319); the guard's
+    live budget (pulsar:kv_touched_budget_bytes, 2026-10-29) is at most it and moves with MemAvailable."""
     m = srv.metrics()
-    t, e = m.get("pulsar:kv_touched_budget_bytes", 0.0), m.get("pulsar:kv_eager_floor_bytes", 0.0)
+    t, e = m.get("pulsar:kv_touched_ceiling_bytes", 0.0), m.get("pulsar:kv_eager_floor_bytes", 0.0)
     return (t, e) if t > 0 and e > 0 else None
 
 
