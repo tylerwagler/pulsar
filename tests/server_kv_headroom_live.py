@@ -45,7 +45,7 @@ ap.add_argument("--log", default=os.path.join(os.environ.get("TMPDIR", "/var/tmp
 a = ap.parse_args()
 URL = "http://127.0.0.1:%d" % a.port
 GiB = float(1 << 30)
-FLOOR = 4 * GiB   # PULSAR_SERVER_MEM_FLOOR_BYTES
+FLOOR = 4 * GiB   # PULSAR_SERVER_MEM_FLOOR_BYTES, the OS margin; the derived floor is read from the guarded server
 fails = 0
 procs = []        # every child to kill on the way out (servers)
 balloon = []      # the balloon's mapping
@@ -188,6 +188,9 @@ try:
     code, usage, _ = chat([ask(words(1, 400))])
     tpw = usage.get("prompt_tokens", 1200) / 400.0
     a1 = post_warmup_avail(open(log).read())
+    mf = re.search(r"memory floor ([0-9.]+) MiB", open(log).read())   # 2026-10-29: the derived floor (cli_main.cpp)
+    if mf:
+        FLOOR = float(mf.group(1)) * (1 << 20)
     stop(p)
     cost = a0 - a1
     print("phase 0: MemAvailable %.2f GiB, the server costs %.2f GiB to its post-warmup reading; %.0f B of KV a token, "
@@ -210,7 +213,10 @@ try:
     p, log = start("guarded")
     txt = open(log).read()
     av = post_warmup_avail(txt)
-    mb_ = re.search(r"touched budget ([0-9.]+) GiB", txt)
+    mb_ = re.search(r"touched ceiling ([0-9.]+) GiB", txt)
+    mf = re.search(r"memory floor ([0-9.]+) MiB", txt)   # 2026-10-29: the derived floor every check reads
+    if mf:
+        FLOOR = float(mf.group(1)) * (1 << 20)
     mt = re.search(r"touched ([0-9.]+) \+ MemAvailable", txt)
     ceiling = float(mb_.group(1)) * GiB if mb_ else -1.0
     touched0 = float(mt.group(1)) * GiB if mt else 0.0
