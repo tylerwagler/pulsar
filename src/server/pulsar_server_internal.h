@@ -24,6 +24,7 @@
 
 #include <new>
 #include <string>
+#include <vector>
 #include <unordered_map>
 
 /* OpenAI/Anthropic compatible local server.
@@ -373,6 +374,17 @@ typedef struct {
     int tool_refs_len;
     int tool_refs_cap;
 } chat_msg;
+
+#ifdef __cplusplus
+/** L268 / L331: a message's content without the parser's image markers, and where each image sits in what is left
+ *  (byte offsets, ascending) -- what a family renderer places its image literal at (chat_family.cpp). */
+struct chat_msg_images {
+    std::string content;
+    std::vector<uint32_t> at;
+};
+/** false + err: an image whose marker is not at its offset. */
+bool chat_strip_image_markers(const chat_msg *m, chat_msg_images *out, char *err, size_t errlen);
+#endif
 
 /** A parsed conversation. */
 typedef struct {

@@ -514,6 +514,112 @@ uint8_t *vision_pil_resize_rgb(const uint8_t *src, int src_w, int src_h,
     return cur;
 }
 
+/* ---------------------------------------------------------------------------
+ * L331: torch's CPU F.interpolate(mode="bicubic", antialias=True, align_corners=False) of float32 planes -- the
+ * resize of the processors that run it on the uint8 image widened to f32 (Nemotron 3.5 Super VL's
+ * image_processing_nemotron_h_omni.py).  ATen's UpSampleKernel.cpp separable path, its arithmetic in float:
+ *   scale = f32(in) / out; support = 2 * scale (downsampling) else 2; invscale = 1 / scale else 1;
+ *   center = f32(scale * (i + 0.5)) (the product in double); xmin = max(int(center - support + 0.5), 0),
+ *   xsize = min(int(center + support + 0.5), in) - xmin, clamped to ceil(support) * 2 + 1;
+ *   w_j = filter(f32((f32(j + xmin - center) + 0.5) * invscale)), Keys' cubic a = -0.5, normalised by their f32 sum;
+ *   out = in[xmin] * w_0, then out += in[xmin + j] * w_j -- the width pass first, then the height pass, a pass
+ *   skipped when its size does not change.
+ * The fused multiply-adds are explicit, where torch's build contracts (its compiler's contraction is on): the
+ * filter's polynomial always, the accumulation when the pass UPsamples -- a downsampling pass accumulates unfused
+ * (measured on x86 torch 2.15: the weights bit-exact only with the filter's fmas, the upsampled and downsampled values
+ * bit-exact only so; nemotron-vision-pixel-gate pins it against tests/nemotron_vision_goldens.py's processor). */
+static float torch_cubic_aa(float x) {
+    const float a = -0.5f;
+    x = fabsf(x);
+    if (x < 1.0f) return fmaf(fmaf(a + 2.0f, x, -(a + 3.0f)) * x, x, 1.0f);
+    if (x < 2.0f) return fmaf(fmaf(fmaf(a, x, -(5.0f * a)), x, 8.0f * a), x, -(4.0f * a));
+    return 0.0f;
+}
+
+/* One axis's taps: xmin[o], n[o] and weights w[o * max + j]. */
+static int torch_aa_taps(int in, int out, int **xmin_out, int **n_out, float **w_out) {
+    const float scale = (float)in / (float)out;
+    const float support = scale >= 1.0f ? (float)(2.0 * (double)scale) : 2.0f;
+    const float invscale = scale >= 1.0f ? (float)(1.0 / (double)scale) : 1.0f;
+    const int max = (int)ceil((double)support) * 2 + 1;
+    int *xmin = (int *)malloc((size_t)out * sizeof(int)), *n = (int *)malloc((size_t)out * sizeof(int));
+    float *w = (float *)calloc((size_t)out * (size_t)max, sizeof(float));
+    if (!xmin || !n || !w) {
+        free(xmin); free(n); free(w);
+        return 0;
+    }
+    for (int i = 0; i < out; i++) {
+        const float center = (float)((double)scale * ((double)i + 0.5));
+        int lo = (int)((double)(center - support) + 0.5);
+        if (lo < 0) lo = 0;
+        int hi = (int)((double)(center + support) + 0.5);
+        if (hi > in) hi = in;
+        int sz = hi - lo;
+        if (sz < 0) sz = 0;
+        if (sz > max) sz = max;
+        float *wi = w + (size_t)i * max, tot = 0.0f;
+        for (int j = 0; j < sz; j++) {
+            wi[j] = torch_cubic_aa((float)(((double)((float)(j + lo) - center) + 0.5) * (double)invscale));
+            tot += wi[j];
+        }
+        if (tot != 0.0f)
+            for (int j = 0; j < sz; j++) wi[j] /= tot;
+        xmin[i] = lo;
+        n[i] = sz;
+    }
+    *xmin_out = xmin;
+    *n_out = n;
+    *w_out = w;
+    return max;
+}
+
+/* planes [c][h][w_in] -> [c][h][w_out] (axis 0: along w) or [c][h_in][w] -> [c][h_out][w] (axis 1: along h). */
+static float *torch_aa_pass(const float *src, int c, int h, int w, int axis, int out) {
+    const int in = axis == 0 ? w : h;
+    int *xmin = NULL, *n = NULL;
+    float *wt = NULL;
+    const int max = torch_aa_taps(in, out, &xmin, &n, &wt);
+    const int oh = axis == 0 ? h : out, ow = axis == 0 ? out : w;
+    const bool down = in > out;   /* the accumulation's contraction (above) */
+    float *dst = max ? (float *)malloc((size_t)c * oh * ow * sizeof(float)) : NULL;
+    if (dst) {
+        for (int p = 0; p < c; p++)
+            for (int y = 0; y < oh; y++)
+                for (int x = 0; x < ow; x++) {
+                    const int o = axis == 0 ? x : y;
+                    const float *wi = wt + (size_t)o * max;
+                    const size_t step = axis == 0 ? 1u : (size_t)w;
+                    const float *s = axis == 0 ? src + ((size_t)p * h + y) * w + xmin[o]
+                                               : src + ((size_t)p * h + xmin[o]) * w + x;
+                    float acc = n[o] > 0 ? s[0] * wi[0] : 0.0f;
+                    for (int j = 1; j < n[o]; j++)
+                        acc = down ? acc + s[(size_t)j * step] * wi[j] : fmaf(s[(size_t)j * step], wi[j], acc);
+                    dst[((size_t)p * oh + y) * ow + x] = acc;
+                }
+    }
+    free(xmin); free(n); free(wt);
+    return dst;
+}
+
+float *vision_torch_bicubic_aa_rgb(const uint8_t *rgb, int w, int h, int dw, int dh) {
+    if (!rgb || w <= 0 || h <= 0 || dw <= 0 || dh <= 0) return NULL;
+    float *cur = (float *)malloc((size_t)3 * w * h * sizeof(float));
+    if (!cur) return NULL;
+    for (int c = 0; c < 3; c++)
+        for (size_t i = 0; i < (size_t)w * h; i++) cur[(size_t)c * w * h + i] = (float)rgb[i * 3 + c];
+    if (dw != w) {
+        float *next = torch_aa_pass(cur, 3, h, w, 0, dw);
+        free(cur);
+        if (!(cur = next)) return NULL;
+    }
+    if (dh != h) {
+        float *next = torch_aa_pass(cur, 3, h, dw, 1, dh);
+        free(cur);
+        cur = next;
+    }
+    return cur;
+}
+
 /* Python's round(): ties-to-even, which is what ImageOps.pad uses for the paste
  * offset and ImageOps.contain for the contained size. */
 static int py_round(double v) {

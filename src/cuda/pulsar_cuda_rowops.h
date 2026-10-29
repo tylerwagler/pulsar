@@ -25,7 +25,8 @@
  *               -- torch's LayerNorm, two passes (the mean, then the centred squares), each an f32 chain per thread
  *               folded as rmsnorm's -- from bf16 rows or f32 rows (+ an f32 bias first: a linear's output and its
  *               bias, normalised with no rounding between), to bf16 / f16 rows and / or f32 rows
- *   bias_emit   y[t][c] = act(x[t][c] + bias[c]),  act = none or GELU (erf: 0.5 v (1 + erf(v / sqrt 2))), as bf16 / f16
+ *   bias_emit   y[t][c] = act(x[t][c] + bias[c]),  act = none, GELU (erf: 0.5 v (1 + erf(v / sqrt 2))) or (L331) relu^2
+ *               (max(v, 0)^2, one rounding of the f32 square), as bf16 / f16
  *   gather      y[t][c] = f32(table[ids[t]][c]) * scale  as f32 rows, from an f16 table (a tied f16 embedding / head)
  *
  * Every pointer is a device pointer, 16-byte aligned; widths and leading dimensions are in elements, multiples of 8. */
@@ -75,6 +76,7 @@ int pulsar_rows_emit_bf16_launch(const float *x, uint64_t ld_x, uint32_t n_rows,
 typedef enum {
     PULSAR_ROWS_ACT_NONE = 0,
     PULSAR_ROWS_ACT_GELU = 1,   /**< exact (erf) GELU, torch's default */
+    PULSAR_ROWS_ACT_RELU2 = 2,  /**< L331: relu(v)^2 (Nemotron's ReLU-squared: the vision projector's mlp1) */
 } pulsar_rows_act;
 
 /** L321: the 16-bit rows an op writes -- the consumer's operand format (bf16 rows, or the f16 rows of an fp16

@@ -3694,6 +3694,11 @@ typedef enum { PULSAR_PIL_BICUBIC = 0, PULSAR_PIL_BILINEAR = 1 } pulsar_pil_filt
  *  bit for bit -- every family's resize whose reference is Pillow (DeepSeek's load_image, Qwen's PIL processor,
  *  Parse's).  Returns a malloc'd dst_w x dst_h image (a copy when the size is unchanged), NULL on failure. */
 uint8_t *vision_pil_resize_rgb(const uint8_t *src, int src_w, int src_h, int dst_w, int dst_h, pulsar_pil_filter filter);
+/** L331: torch's CPU F.interpolate(bicubic, antialias=True, align_corners=False) of packed RGB8 widened to f32 -- the
+ *  resize of a processor that runs torch on the image's uint8 values (Nemotron 3.5 Super VL's).  Returns malloc'd f32
+ *  planes [3][dst_h][dst_w] (a widened copy when the size is unchanged), NULL on failure.  Within an f32 ulp of torch
+ *  (vision.cpp, where the arithmetic is spelled out). */
+float *vision_torch_bicubic_aa_rgb(const uint8_t *rgb, int w, int h, int dst_w, int dst_h);
 int vision_decode_rgb(const uint8_t *bytes, size_t len,
                       uint8_t **rgb_out, int *w_out, int *h_out);
 

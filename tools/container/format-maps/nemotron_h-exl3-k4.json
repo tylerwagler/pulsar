@@ -2,7 +2,7 @@
  "schema": "pulsar.recipe.v1",
  "recipe": "nemotron_h-exl3-k4",
  "model_type": "nemotron_h_omni",
- "about": "Nemotron 3.5 Super VL on the uniform K4 EXL3 pack (/mnt/models/nemotron35-exl3-k4, exllamav3 1.6.2, mul1 codebook): every Linear -- Mamba in / out, attention, latent fc1 / fc2, the shared expert, the up-only routed experts, the drafter's -- exl3m_k4 and the head exl3m_k6, byte copies of the pack (--exl3); norms, conv, A_log / D / dt_bias, the router (BF16) and its selection bias (F32) and the embedding from the BF16 checkpoint (--hf) as stored. The drafter (MTP, K4 in the pack) is written; the vision tower is consumed by name (v1: text only).",
+ "about": "Nemotron 3.5 Super VL on the uniform K4 EXL3 pack (/mnt/models/nemotron35-exl3-k4, exllamav3 1.6.2, mul1 codebook): every Linear -- Mamba in / out, attention, latent fc1 / fc2, the shared expert, the up-only routed experts, the drafter's -- exl3m_k4 and the head exl3m_k6, byte copies of the pack (--exl3); norms, conv, A_log / D / dt_bias, the router (BF16) and its selection bias (F32) and the embedding from the BF16 checkpoint (--hf) as stored. The drafter (MTP, K4 in the pack) is written; the vision tower (L331) as stored, BF16, its LayerNorm weights and biases f32.",
  "rows": [
   {"role": "dense", "format": "exl3m_k4"},
   {"role": "shared_expert", "format": "exl3m_k4"},
@@ -12,6 +12,8 @@
   {"role": "norm", "format": "native"},
   {"role": "embed", "format": "native"},
   {"role": "head", "format": "exl3m_k6"},
-  {"role": "other", "format": "native"}
+  {"role": "other", "format": "native"},
+  {"role": "vision", "format": "native"},
+  {"role": "vision_norm", "format": "f32"}
  ]
 }

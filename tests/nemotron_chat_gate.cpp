@@ -12,6 +12,9 @@
  *   T4 calibration corpus         HF-rendered rows: count + sha1(ids) == HF   (--calib)
  *   R1 render hand cases          text == HF; the message-level spans == HF's (the tools block's are the renderer's
  *                                 own); ids == HF (or the guarded ids where client text spells a marker); refusals
+ *   R3 image renders              L331: image parts (offsets in the joined text) == the template's render_content then
+ *                                 the processor's <img> expansion at one <image> per image (image_render_cases.json,
+ *                                 tests/nemotron/gen_nemotron_image_renders.py): text, ids, the refusals
  *   R2 render corpus              every L216 case, two configurations: sha1(text), sha1(ids) where derivable, refusal
  *                                 keys == HF, per case file   (--cases)
  *   P1 output parser round trip   every assistant turn of the corpus with reasoning rendered, its sampled bytes parsed
@@ -32,6 +35,7 @@
 #include <string.h>
 
 #include <algorithm>
+#include <deque>
 #include <map>
 #include <string>
 #include <vector>
@@ -770,6 +774,71 @@ static void c1_composition(const bpe_tokenizer *t) {
     printf("C1 turn-by-turn composition (a tool loop): %d efforts, %d mismatched\n", n, bad);
 }
 
+/* L331: R3 -- image parts.  A content list becomes the joined text with each image at its offset (what the server's
+ * parser hands the renderer: chat_strip_image_markers). */
+static void r3_images(const bpe_tokenizer *t, const std::string &dir) {
+    const pyjson_value v = load_json(dir + "/image_render_cases.json");
+    const pyjson_value *cases = v.get("cases");
+    int bad = 0, refusals = 0, images = 0;
+    for (const auto &c : cases->a) {
+        const std::string &name = c.get("name")->s;
+        conv cv;
+        build_conv(*c.get("messages"), NULL, &cv);
+        std::deque<std::string> joined;
+        std::vector<std::vector<uint32_t>> at(cv.msgs.size());
+        bool other_part = false;
+        for (size_t i = 0; i < cv.msgs.size(); i++) {
+            const pyjson_value *content = c.get("messages")->a[i].get("content");
+            if (!content || content->kind != pyjson_value::ARR) continue;
+            std::string s;
+            for (const auto &p : content->a) {
+                const std::string &ty = p.get("type")->s;
+                if (ty == "text") s += p.get("text")->s;
+                else if (ty == "image") at[i].push_back((uint32_t)s.size());
+                else other_part = true;
+            }
+            joined.push_back(s);
+            cv.msgs[i].content = joined.back().c_str();
+            cv.msgs[i].image_at = at[i].empty() ? NULL : at[i].data();
+            cv.msgs[i].n_images = (int)at[i].size();
+            images += (int)at[i].size();
+        }
+        cv.parts = other_part;
+        nemotron_render_out out;
+        std::string refusal;
+        const bool ok = render(cv, effort_of(c.get("effort")->s), true, &out, &refusal);
+        const int before = g_fail;
+        g_checks++;
+        if (const pyjson_value *want_refusal = c.get("refusal")) {
+            refusals++;
+            if (ok || refusal != want_refusal->s)
+                fail("R3 %s: expected refusal %s, got %s", name.c_str(), want_refusal->s.c_str(),
+                     ok ? "a render" : refusal.c_str());
+        } else if (!ok) {
+            fail("R3 %s: refused (%s)", name.c_str(), refusal.c_str());
+        } else {
+            const std::string &want = c.get("text")->s;
+            if (out.text != want) {
+                size_t i = 0;
+                while (i < out.text.size() && i < want.size() && out.text[i] == want[i]) i++;
+                std::string ours, theirs;
+                pyjson_dump_string(out.text.data() + i, std::min<size_t>(80, out.text.size() - i), &ours);
+                pyjson_dump_string(want.data() + i, std::min<size_t>(80, want.size() - i), &theirs);
+                fail("R3 %s: text differs at byte %zu: ours %s vs HF %s", name.c_str(), i, ours.c_str(), theirs.c_str());
+            }
+            const std::vector<int> got = encode(t, out.text, &out.spans), want_ids = json_ids(*c.get("ids"));
+            if (got != want_ids) fail("R3 %s: ids %s", name.c_str(), first_diff(got, want_ids).c_str());
+            int n18 = 0;
+            for (int id : got) n18 += id == bpe_tokenizer_added_id(t, "<image>");
+            if (n18 != atoi(c.get("n_images")->num.c_str()))
+                fail("R3 %s: %d <image> ids, HF %s", name.c_str(), n18, c.get("n_images")->num.c_str());
+        }
+        bad += g_fail != before;
+    }
+    printf("R3 image renders: %zu cases (%d images, %d refusals), %d mismatched\n", cases->a.size(), images, refusals,
+           bad);
+}
+
 int main(int argc, char **argv) {
     std::string tok_dir, vec_dir, cases_dir, calib;
     for (int i = 1; i < argc; i++) {
@@ -812,6 +881,7 @@ int main(int argc, char **argv) {
     if (!calib.empty()) t4_calib(t, vec_dir, calib);
     else printf("T4 calibration corpus: SKIPPED (no --calib)\n");
     r1_hand(t, vec_dir);
+    r3_images(t, vec_dir);
     if (!cases_dir.empty()) {
         r2_corpus(t, vec_dir, cases_dir);
         p1_roundtrip(cases_dir, vec_dir);

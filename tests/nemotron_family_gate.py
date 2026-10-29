@@ -65,7 +65,8 @@ def mutate(shards, what):
         return 'nemotron_h.time_step_limit.min = 0.001', ['nemotron_h.time_step_limit.min']
     if what == 'vision':
         IG.set_kv(shards, 'pulsar.vision_present', 'bool', True)
-        return 'pulsar.vision_present = true', ['pulsar.vision_present']
+        return 'pulsar.vision_present = true with no tower (L331: its facts and tensors are then required)', \
+            ['nemotron_h_vision.vit.width']
     if what == 'drafter':
         IG.set_kv(shards, 'nemotron_h.num_nextn_predict_layers', 'u32', 0)
         return 'num_nextn_predict_layers = 0 with the drafter written', ['pulsar.mtp_present']

@@ -148,7 +148,7 @@ bool tower(ctx &c, const pulsar_nemotron_parse_page &pg, uint32_t n_patch) {
     pulsar_nemotron_parse_run *r = c.r;
     const pulsar_nemotron_parse_model *w = c.w;
     const pulsar_nemotron_parse_shape &s = w->shape;
-    const uint32_t D = s.vit_width, NC = s.n_cls, N = NC + n_patch, HD = s.vit_head_dim, HS = s.vit_heads * HD;
+    const uint32_t D = s.vit_width, NC = s.n_cls, N = NC + n_patch, HD = s.vit_head_dim;
     const uint32_t M = s.vit_mlp, P = 3u * s.patch * s.patch;
     float *res = dp<float>(r->t[B_RES]);
     uint16_t *xn = dp<uint16_t>(r->t[B_XN]), *qkv = dp<uint16_t>(r->t[B_QKV]), *att = dp<uint16_t>(r->t[B_ATT]),
@@ -173,45 +173,26 @@ bool tower(ctx &c, const pulsar_nemotron_parse_page &pg, uint32_t n_patch) {
             return fail(c.err, c.errlen, "the patch embedding refused");
     }
     c.put("vit_in", r->t[B_RES], N, D);
-    if (pulsar_rows_layernorm32_launch(res, true, D, NULL, N, D, c.fp(w->vit[0].norm1, "vit norm1"),
-                                       c.fp(w->vit[0].norm1_b, "vit norm1"), s.vit_eps, xn, D, F16, NULL, 0, 0) != 0)
-        return fail(c.err, c.errlen, "the first LayerNorm refused");
-    const float scale = 1.0f / sqrtf((float)HD);
-    for (uint32_t il = 0; il < s.vit_depth; il++) {
-        ph.reset();
-        ph.emplace();
-        const pulsar_nemotron_parse_vit_block &B = w->vit[il];
-        for (uint32_t r0 = 0; r0 < N; r0 += NP_CHUNK) {
-            const uint32_t m = N - r0 < NP_CHUNK ? N - r0 : NP_CHUNK;
-            if (!c.lin(B.qkv, (int)D, (int)(3u * HS), xn + (size_t)r0 * D, m, true, "vit qkv") ||
-                pulsar_rows_bias_emit_launch(c.stage(), 3u * HS, m, 3u * HS, c.fp(B.qkv_b, "vit qkv bias"),
-                                             PULSAR_ROWS_ACT_NONE, qkv + (size_t)r0 * 3u * HS, 3u * HS, F16, 0) != 0)
-                return fail(c.err, c.errlen, "the ViT's qkv refused");
-        }
-        if (pulsar_fmha_f16_launch(qkv, 3u * HS, qkv + HS, 3u * HS, qkv + 2u * HS, 3u * HS, N, s.vit_heads, HD, scale, att,
-                                   HS, 0) != 0)
-            return fail(c.err, c.errlen, "the ViT's attention refused");
-        const bool last = il + 1 == s.vit_depth;
-        const float *n1 = last ? NULL : c.fp(w->vit[il + 1].norm1, "vit norm1");
-        const float *n1b = last ? NULL : c.fp(w->vit[il + 1].norm1_b, "vit norm1");
-        for (uint32_t r0 = 0; r0 < N; r0 += NP_CHUNK) {
-            const uint32_t m = N - r0 < NP_CHUNK ? N - r0 : NP_CHUNK;
-            float *rc = res + (size_t)r0 * D;
-            uint16_t *xc = xn + (size_t)r0 * D;
-            if (!c.lin(B.proj, (int)HS, (int)D, att + (size_t)r0 * HS, m, true, "vit proj") ||
-                pulsar_rows_res32_add_launch(rc, D, c.stage(), D, c.fp(B.proj_b, "vit proj bias"), m, D,
-                                             c.fp(B.norm2, "vit norm2"), c.fp(B.norm2_b, "vit norm2"), s.vit_eps, xc, D,
-                                             F16, 0) != 0 ||
-                !c.lin(B.fc1, (int)D, (int)M, xc, m, true, "vit fc1") ||
-                pulsar_rows_bias_emit_launch(c.stage(), M, m, M, c.fp(B.fc1_b, "vit fc1 bias"), PULSAR_ROWS_ACT_GELU, mlp,
-                                             M, F16, 0) != 0 ||
-                !c.lin(B.fc2, (int)M, (int)D, mlp, m, true, "vit fc2") ||
-                pulsar_rows_res32_add_launch(rc, D, c.stage(), D, c.fp(B.fc2_b, "vit fc2 bias"), m, D, n1, n1b, s.vit_eps,
-                                             last ? NULL : xc, D, F16, 0) != 0)
-                return fail(c.err, c.errlen, "a ViT block refused");
-        }
-        if (il == 13) c.put("vit_mid", r->t[B_RES], N, D);
-    }
+    /* the blocks: the shared ViT encoder (engine/vit_encoder.h) on f16 operand rows, each block its own GPU phase */
+    struct hooks_ud {
+        ctx *c;
+        std::optional<pulsar_group_gpu_phase> *ph;
+        uint32_t N, D;
+    } hu = {&c, &ph, N, D};
+    const pulsar_vit_hooks hooks = {
+        [](void *ud, uint32_t) {
+            hooks_ud *h = (hooks_ud *)ud;
+            h->ph->reset();
+            h->ph->emplace();
+        },
+        [](void *ud, uint32_t il) {
+            hooks_ud *h = (hooks_ud *)ud;
+            if (il == 13) h->c->put("vit_mid", h->c->r->t[B_RES], h->N, h->D);
+        },
+        &hu};
+    const pulsar_vit_dims dims = {D, s.vit_heads, HD, M, s.vit_depth, s.vit_eps};
+    const pulsar_vit_bufs bufs = {res, xn, qkv, att, mlp, c.stage(), NULL, 0, NP_CHUNK};
+    if (!pulsar_vit_encode(&c.e->model, dims, w->vit, F16, bufs, N, &hooks, c.err, c.errlen)) return false;
     ph.reset();
     ph.emplace();
     c.put("vit_out", r->t[B_RES], N, D);

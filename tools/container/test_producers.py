@@ -516,6 +516,18 @@ def check_refusals() -> None:
        "bytes_for nvfp4")
 
 
+def check_f32_from_bf16() -> None:
+    """L331: BF16 -> f32 widening is exact: every bf16 bit pattern (finite, inf, nan) widens to the f32 with the same top
+    16 bits and zero below, and the producer table routes (BF16, f32) to it."""
+    raw = np.arange(1 << 16, dtype="<u2").tobytes()
+    got = np.frombuffer(P.f32_from_bf16(raw, [1 << 16]), "<u4")
+    want = np.arange(1 << 16, dtype=np.uint32) << 16
+    if np.array_equal(got, want) and P.producer_for("BF16", "f32", "x") == "f32_from_bf16":
+        ok("f32_from_bf16: all 65536 bf16 patterns widen exactly; (BF16, f32) -> f32_from_bf16")
+    else:
+        fail("f32_from_bf16: a bf16 pattern did not widen exactly, or the table does not route (BF16, f32)")
+
+
 def check_nvfp4_from_bf16() -> None:
     """L299: the BF16 -> nvfp4 producer against a scalar transcription of its recipe (the least-squared-error scale of
     the max-based code and the NVFP4_SCALE_SEARCH below it), on a [200, 128] weight with an all-zero block and an
@@ -579,6 +591,7 @@ def main() -> int:
     print(f"served {SERVED}\nsource {HF}")
     check_e4m3_encoder()
     check_nvfp4_from_bf16()
+    check_f32_from_bf16()
     check_refusals()
     for rows, kb in [(128, 4), (256, 8), (512, 128), (2048, 64), (200, 5), (130, 3)]:
         check_swizzle(rows, kb)

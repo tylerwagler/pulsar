@@ -87,7 +87,7 @@ bool pulsar_nemotron_parse_bind(const pulsar_model *m, pulsar_nemotron_parse_mod
     w->pos = pulsar_role_bind(b, top("vit_pos"), A_F32, 2, D, (uint64_t)s->pos_grid * s->pos_grid);
     for (uint32_t il = 0; il < s->vit_depth; il++) {
         auto k = [&](const char *r) { return pulsar_role_in(r, "vit", (int32_t)il); };
-        pulsar_nemotron_parse_vit_block &B = w->vit[il];
+        pulsar_vit_block &B = w->vit[il];
         B.norm1 = pulsar_role_bind(b, k("vit_norm1"), A_F32, 1, D);
         B.norm1_b = pulsar_role_bind(b, k("vit_norm1_bias"), A_F32, 1, D);
         B.qkv = pulsar_role_bind(b, k("vit_qkv"), A_LINEAR, 2, D, 3u * HS);

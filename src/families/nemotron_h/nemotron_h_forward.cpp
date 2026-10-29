@@ -627,6 +627,14 @@ bool embed(const pulsar_driver_step *st0) {
            fail("the embedding refused");
 }
 
+/* L331: a prompt chunk's image rows over the embeddings of their `<image>` ids (HF's masked_scatter): the residual
+ * rows as the embed wrote them, one stream */
+bool image_rows(const pulsar_driver_step *st0, const uint16_t *rows, uint32_t n_rows, uint32_t row0, uint32_t n_tokens) {
+    const nh_step *st = S(st0);
+    return pulsar_image_write_stream_rows(st->res, rows, n_rows, row0, n_tokens, st->w->shape.n_embd, 1) ||
+           fail("the image rows did not reach the residual");
+}
+
 /* ---- the diagnostic taps (PULSAR_CUDA_GRAPH_DUMP_PREFIX: what the block grade reads) ------------------------------ */
 
 /* a bf16 [n_rows][width] region of an arena, widened to f32 by the dump (named `name`, layer il) */
@@ -1201,7 +1209,7 @@ const pulsar_driver_ops PULSAR_NEMOTRON_H_DRIVER = {
     /* .absorb        = */ pulsar_drafter_lane_absorb,   /* N9 / L298: the MTP or block lane's lockstep (none: nothing) */
     /* .mtp           = */ &k_mtp_ops,          /* N9: the MTP module (spec_mtp.h) */
     /* .rope          = */ NULL,   /* no positional encoding anywhere (NoPE) */
-    /* .image_rows    = */ NULL,   /* images: N11 */
+    /* .image_rows    = */ image_rows,   /* L331: the tower's rows over their <image> embeddings */
     /* .dump          = */ dump,
     /* .artifact      = */ artifact,
     /* .stage         = */ stage,   /* L296 perf: the host half; the ops are launch-only (a decode step graphs) */

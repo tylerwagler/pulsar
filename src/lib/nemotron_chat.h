@@ -14,9 +14,20 @@
  *   - a system message after the first renders in place, as a system turn; any other role renders as its own turn;
  *   - a tool result opens a user turn after a non-tool message and closes it before one -- a tool result that is
  *     the conversation's first message opens nothing (the template's loop.previtem test).
+ * IMAGES (L331).  A message's images render as the template's render_content writes a content list, followed by the
+ * processor's expansion of each `<image>` (processing_nemotron_h_omni.py: `<img>` + the image's `<image>` tokens +
+ * `</img>`, a text substitution before tokenisation): where image k sits, a "\n" first when text came since the last
+ * image and the content so far does not end in one, then "<image k>" when the message has more than one image (k from
+ * 1, per message), then the literal "<img><image></img>" outside client data (the engine's image front expands its
+ * `<image>` into the tile's block).  Images render in system, user and tool messages (render_content is the content
+ * of every turn); an assistant turn with an image is refused (image_position: a sampled turn never holds one, so its
+ * replay could not compose).  A message whose text spells "<image>" beside image parts is refused
+ * (image_marker_in_text): the template would drop the image parts and the processor fill the CLIENT's spelling, and
+ * client text spelling a marker stays text here (L223).
  * Refusals, by name: no_messages; tools_not_array; tool_name_missing; tool_arguments_not_json (a call's arguments
  * text does not parse); tool_arguments_not_object (it parses to a non-object: the template's |items raises);
- * raw_calls_without_calls; prompt_too_large; reasoning_without_thinking (the sampled-turn writer only).
+ * raw_calls_without_calls; prompt_too_large; reasoning_without_thinking (the sampled-turn writer only);
+ * image_position; image_marker_in_text.
  *
  * EFFORT.  The template knows three levels: thinking off (enable_thinking=false: the generation prompt closes an
  * empty think block), medium (medium_effort: the last user message's suffix) and high (its default).
@@ -67,6 +78,10 @@ struct nemotron_msg_in {
      *  tool memory): written in place of rendering `calls`, so a replayed turn byte-matches the live KV.  NULL =
      *  render `calls`. */
     const char *raw_calls;
+    /** L331: the byte offsets in `content` (ascending) where the message's images sit -- the template's
+     *  render_content writes each there (nemotron_chat_render, "IMAGES").  NULL / 0 = none. */
+    const uint32_t *image_at;
+    int n_images;
 };
 
 struct nemotron_render_in {

@@ -40,14 +40,15 @@ def dense(hf, name: str, layout: str, dshape: list, mxfp8_mode: str = "rederive"
         for d in hshape:
             n_el *= d
         return {"dtype": "I32", "shape": list(dshape), "nbytes": 4 * n_el, "src": ("produce", PR.spec(prod, [name]))}
-    if prod == "f16_from_f32":   # elementwise: any rank, the declared shape the (permuted) source's elements
+    if prod in ("f16_from_f32", "f32_from_bf16"):   # elementwise: any rank, the declared shape the (permuted) source's
+        esz = 2 if prod == "f16_from_f32" else 4     # elements
         nbytes = PR.bytes_for(layout, list(reversed(dshape)))
         n_el = 1
         for d in hshape:
             n_el *= d
-        if nbytes != 2 * n_el:
-            raise SystemExit(f"{name}: declared {dshape} holds {nbytes // 2} elements, the source {hshape} {n_el}")
-        return {"dtype": "F16", "shape": list(dshape), "nbytes": nbytes,
+        if nbytes != esz * n_el:
+            raise SystemExit(f"{name}: declared {dshape} holds {nbytes // esz} elements, the source {hshape} {n_el}")
+        return {"dtype": "F16" if esz == 2 else "F32", "shape": list(dshape), "nbytes": nbytes,
                 "src": ("produce", PR.spec(prod, [name], shape=list(hshape), axes=list(axes)))}
     if axes:
         raise SystemExit(f"{name}: a permutation is an elementwise producer's (f16); {prod} reads the source as is")

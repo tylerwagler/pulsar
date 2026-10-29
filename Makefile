@@ -1664,6 +1664,43 @@ vision-qwen-pixel-gate: tests/vision_qwen_pixel_gate
 vision-qwen-tower-gate: tests/vision_qwen_tower_gate
 	./tests/vision_qwen_tower_gate $(QWEN_GATE_MODEL) tests/test-vectors/vision-qwen-tower-goldens.bin
 
+# L331: Nemotron 3.5 Super VL's image path.  The fixture is tests/nemotron_vision_goldens.py's (the checkpoint's own
+# processor / C-RADIO / projector code, FP32 on any CPU).
+#   nemotron-vision-pixel-gate   HOST, model-free: the tile rule (every size), the pixels bit-exact to torch's
+#                                processor (f32 and the bf16 the tower reads), the patch order, the image front
+#                                (a tower-less engine refuses by name; the expansion's block)
+#   nemotron-vision-tower-gate   GPU: the device tower's LLM rows vs the FP32 reference, each image within 3x the
+#                                reference's own bf16-vs-fp32 floor (L268's rule); NEMOTRON_VISION_MODEL holds the tower
+#   nemotron-vision-smoke        GPU: one image question through the engine (tests/image_chat_smoke.cpp): "red"
+#   nemotron-vision-live         GPU: a real server (tests/nemotron_vision_live.py): V1-V8 name the images' content,
+#                                and the prefix cache resumes past the same image, not past a different one
+#   nemotron-vision-refuse-live  GPU: a container WITHOUT the tower (NEMOTRON_TEXT_MODEL) refuses an image 400, by name
+NEMOTRON_VISION_MODEL ?= /srv/models/nemotron35-k4-lilicorr-vision-pulsar
+NEMOTRON_TEXT_MODEL ?= /srv/models/nemotron35-k4-lilicorr-pulsar
+.PHONY: nemotron-vision-pixel-gate nemotron-vision-tower-gate nemotron-vision-smoke nemotron-vision-live \
+        nemotron-vision-refuse-live
+nemotron-vision-pixel-gate: tests/nemotron_vision_pixel_gate
+	./tests/nemotron_vision_pixel_gate tests/test-vectors/nemotron-vision-goldens.bin
+nemotron-vision-tower-gate: tests/nemotron_vision_tower_gate
+	./tests/nemotron_vision_tower_gate $(NEMOTRON_VISION_MODEL) tests/test-vectors/nemotron-vision-goldens.bin
+nemotron-vision-smoke: tests/image_chat_smoke
+	python3 -c "import sys;sys.path.insert(0,'tests');import nemotron_vision_live as L;open('/var/tmp/nemotron-vision-smoke.png','wb').write(L.disc())"
+	./tests/image_chat_smoke $(NEMOTRON_VISION_MODEL) /var/tmp/nemotron-vision-smoke.png "What colour is the circle in this image? Answer with one word." red
+nemotron-vision-live: pulsar-server
+	python3 tests/nemotron_vision_live.py $(NEMOTRON_VISION_MODEL) --binary ./pulsar-server
+nemotron-vision-refuse-live: pulsar-server
+	python3 tests/nemotron_vision_live.py $(NEMOTRON_TEXT_MODEL) --binary ./pulsar-server --refuse
+tests/nemotron_vision_pixel_gate.o: tests/nemotron_vision_pixel_gate.cpp src/families/nemotron_h/nemotron_h.h \
+                                    src/engine/pulsar_engine_internal.h src/pulsar.h src/pulsar_gpu.h
+	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -Isrc/engine -c -o $@ tests/nemotron_vision_pixel_gate.cpp
+tests/nemotron_vision_pixel_gate: tests/nemotron_vision_pixel_gate.o src/lib/pulsar_help.o $(CORE_OBJS)
+	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
+tests/nemotron_vision_tower_gate.o: tests/nemotron_vision_tower_gate.cpp src/families/nemotron_h/nemotron_h.h \
+                                    src/engine/pulsar_engine_internal.h src/pulsar.h src/pulsar_gpu.h
+	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -Isrc/engine -c -o $@ tests/nemotron_vision_tower_gate.cpp
+tests/nemotron_vision_tower_gate: tests/nemotron_vision_tower_gate.o src/lib/pulsar_help.o $(CORE_OBJS)
+	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
+
 vision-tower-gate: tests/vision_tower_gate
 	@if [ -z "$(VISION_MODEL)" ]; then \
 		echo "  SKIP  vision-tower-gate: set VISION_MODEL=/path/to/a/vision-exp/checkpoint"; \
@@ -2571,7 +2608,7 @@ GATE_TARGETS =unit-test-gate agent-test-gate \
 # family) -- seconds each, overlapping the runner.  (tp-plan-gate stays out of the overlap: its scan of the pair's
 # DeepSeek is a 12 GB process over 167 GB of NFS page cache beside a 90 GB engine on unified memory.)
 HOST_GATE_TARGETS = cuda-reap-router-audit vision-layout-gate vision-pixel-gate \
-	vision-codec-gate vision-span-gate vision-visible-gate vision-placeholder-gate vision-qwen-pixel-gate seam-check \
+	vision-codec-gate vision-span-gate vision-visible-gate vision-placeholder-gate vision-qwen-pixel-gate nemotron-vision-pixel-gate seam-check \
 	exl3-dequant-gate host-checks qwen-chat-gate inkling-chat-gate nemotron-chat-gate api-golden-gate sse-golden-gate \
 	spec-depth-gate \
 	loader-contract-gate render-gate prefix-stability-gate
@@ -2845,7 +2882,7 @@ gates-dev:
 	fi; \
 	if [ $$vision -eq 1 ]; then \
 	  for h in vision-layout-gate vision-pixel-gate vision-codec-gate vision-span-gate \
-	           vision-visible-gate vision-placeholder-gate; do \
+	           vision-visible-gate vision-placeholder-gate nemotron-vision-pixel-gate; do \
 	    $(MAKE) --no-print-directory $$h CUDA_ARCH=sm_120f FRONTIER_MODEL="$(FRONTIER_MODEL)" || rc=1; \
 	  done; \
 	fi; \
@@ -2921,6 +2958,11 @@ src/families/%.o: src/families/%.cpp src/engine/pulsar_engine_internal.h src/eng
 # which vision-layout-gate catches).  Strict FP semantics for this one TU.
 src/engine/vision.o: src/engine/vision.cpp src/engine/pulsar_engine_internal.h src/pulsar.h src/pulsar_gpu.h
 	$(CXX) $(filter-out -ffast-math,$(CXXFLAGS)) $(PULSAR_INC) -c -o $@ src/engine/vision.cpp
+# L331: Nemotron 3.5 Super VL's tile rule is the processor's float64 Python (sqrt / floor / ceil / round half to even)
+# and its pixels torch's float32 -- strict FP semantics for this TU too (nemotron-vision-pixel-gate grades it).
+src/families/nemotron_h/nemotron_h_image.o: src/families/nemotron_h/nemotron_h_image.cpp src/families/nemotron_h/nemotron_h.h \
+                                            src/engine/pulsar_engine_internal.h src/pulsar.h src/pulsar_gpu.h
+	$(CXX) $(filter-out -ffast-math,$(CXXFLAGS)) $(PULSAR_INC) -c -o $@ src/families/nemotron_h/nemotron_h_image.cpp
 
 src/tp/%.o: src/tp/%.cpp src/tp/pulsar_tp.h
 	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -c -o $@ $<

@@ -9,12 +9,14 @@ namespace {
 const char *const ARCH = PULSAR_NEMOTRON_H_ARCH;
 
 void unload(pulsar_engine *e) {
-    if (e->family_state) {
-        bpe_tokenizer_free(((pulsar_nemotron_h_model *)e->family_state)->tok);
-        free(((pulsar_nemotron_h_model *)e->family_state)->block);
+    pulsar_nemotron_h_model *w = (pulsar_nemotron_h_model *)e->family_state;
+    if (w) {
+        bpe_tokenizer_free(w->tok);
+        free(w->block);
+        pulsar_nemotron_h_vision_run_free(&w->vision);
     }
     e->block_drafter = NULL;
-    free(e->family_state);
+    delete w;   /* the state holds the tower's host tables (std::vector): new / delete */
     e->family_state = NULL;
 }
 
@@ -32,7 +34,7 @@ bool load(pulsar_engine *e, const pulsar_engine_options *opt) {
         fprintf(stderr, "pulsar: %s: --rope-yarn: this family's trunk has no rope to scale; refusing\n", ARCH);
         return false;
     }
-    pulsar_nemotron_h_model *w = (pulsar_nemotron_h_model *)xcalloc(1, sizeof(*w));
+    pulsar_nemotron_h_model *w = new pulsar_nemotron_h_model();   /* value-initialised: every field zero */
     e->family_state = w;   /* unload frees it, whatever this load's verdict */
     pulsar_load_refusals_reset();   /* the loader's one failure policy (family.cpp) */
     /* stage 1: the shape and the plan */
@@ -105,6 +107,12 @@ bool load(pulsar_engine *e, const pulsar_engine_options *opt) {
     }
     /* stage 4: the tokenizer beside the shards */
     if (!pulsar_nemotron_h_load_tokenizer(w, opt->model_path)) return false;
+    /* L331: the tower's tokens -- then images are served (the core's front, this family's tower); a container without
+     * the tower refuses them by name (vision_ready false) */
+    if (w->vision.present) {
+        if (!pulsar_nemotron_h_vision_tokens(&w->vision, w->tok)) return false;
+        e->vision_ready = true;
+    }
     /* N9 / L298: the selected drafter behind the round API (none when the open turned drafting off) */
     if (w->block) w->block->embed = w->embed;
     e->block_drafter = w->block;
@@ -132,13 +140,14 @@ bool load(pulsar_engine *e, const pulsar_engine_options *opt) {
         n_moe += e->plan.desc[il].ffn == PULSAR_FFN_MOE;
     }
     fprintf(stderr, "pulsar: %s: %s, %u blocks -> %u layers: %u Mamba-2 + %u attention mixers, %u MoE (%u of %u experts "
-                    "on a %u latent + 1 shared) + %u mixer-only; drafter %s; vision not in the container (v1)\n",
+                    "on a %u latent + 1 shared) + %u mixer-only; drafter %s; vision %s\n",
             ARCH, s->name, s->n_blocks, s->n_layer, n_mamba, s->n_layer - n_mamba, n_moe, s->n_expert_used, s->n_expert,
             s->latent, s->n_layer - n_moe,
             w->drafting ? "the MTP module (the chained-MTP drafter)"
             : w->block  ? "LiLiCorr (the block drafter; the MTP module unloaded)"
             : s->mtp_written || s->block_written ? "in the container, unloaded (drafting off)"
-                                                 : "not in the container");
+                                                 : "not in the container",
+            w->vision.present ? "C-RADIO ViT-H/16 + mlp1 (images served)" : "not in the container (images refused)");
     if (w->block) {
         char d[256];
         pulsar_block_drafter_describe(w->block, d, sizeof d);
@@ -150,6 +159,8 @@ bool load(pulsar_engine *e, const pulsar_engine_options *opt) {
 /* The lane, announced once at open (rule 5): the core driver over the family's blocks, and what its table lacks for
  * the plan (a session refuses with exactly that). */
 bool after_gpu(pulsar_engine *e) {
+    if (!pulsar_nemotron_h_vision_run_create(&e->model, &((pulsar_nemotron_h_model *)e->family_state)->vision))
+        return false;
     uint32_t at = 0;
     const char *miss = pulsar_driver_first_missing(e->family->driver, &e->plan, &at);
     const pulsar_state_plan *sp = &e->state_plan;
@@ -206,10 +217,10 @@ const pulsar_family PULSAR_FAMILY_NEMOTRON_H = {
     /* .arch         = */ PULSAR_NEMOTRON_H_ARCH,
     /* .name         = */ "Nemotron-H",
     /* .caps         = */ PULSAR_FAMILY_CAP_CHAT | PULSAR_FAMILY_CAP_BANKS | PULSAR_FAMILY_CAP_SEGMENTS |
-                          PULSAR_FAMILY_CAP_PAYLOAD | PULSAR_FAMILY_CAP_SPEC,
+                          PULSAR_FAMILY_CAP_PAYLOAD | PULSAR_FAMILY_CAP_SPEC | PULSAR_FAMILY_CAP_VISION,
                           /* the tokenizer + chat front (N8); the driver's session ops over the declared state (N3,
-                           * N7); SPEC: the driver's verify target under the MTP drafter (N9); then TP (N12), VISION
-                           * (N11) */
+                           * N7); SPEC: the driver's verify target under the MTP drafter (N9); VISION: the image
+                           * front over the C-RADIO tower (N11, L331); then TP (N12) */
     /* .load         = */ load,
     /* .after_gpu    = */ after_gpu,
     /* .logits_width = */ logits_width,
@@ -227,7 +238,7 @@ const pulsar_family PULSAR_FAMILY_NEMOTRON_H = {
     /* .tokenizer    = */ &PULSAR_NEMOTRON_H_TOKENIZER,   /* nemotron_h_tokenizer.cpp (F5's BPE engine + renderer) */
     /* .tp_slices    = */ NULL,
     /* .act_kind     = */ PULSAR_ACT_KIND_ROWS,
-    /* .vision       = */ NULL,   /* N11: the RADIO tower; v1 containers hold none */
+    /* .vision       = */ &PULSAR_NEMOTRON_H_IMAGE_FRONT,   /* L331: the C-RADIO tower (nemotron_h_vision.cpp) */
     /* .banks        = */ &PULSAR_BANK_OPS_DECLARED,   /* state_kinds.cpp over the declared state */
     /* .imatrix      = */ NULL,
     /* .driver       = */ &PULSAR_NEMOTRON_H_DRIVER,   /* nemotron_h_forward.cpp */

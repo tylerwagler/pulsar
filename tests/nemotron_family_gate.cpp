@@ -127,7 +127,8 @@ int main(int argc, char **argv) {
         check(block_bound(D.block, attn_moe) && D.embed_norm && D.hidden_norm && D.in_proj && D.out_norm,
               "the drafter's {attention, MoE} layer, its input side and its out norm are bound");
     }
-    check(!pulsar_engine_has_vision(e), "images are refused (no vision front until N11)");
+    check(pulsar_engine_has_vision(e) == s->vision_written,
+          "images served exactly when the container holds the tower (L331; vision_present %d)", (int)s->vision_written);
 
     /* the engine facts */
     check(pulsar_engine_logits_width(e) == (int)PULSAR_NEMOTRON_H_SHAPE_SUPER.n_vocab, "logits width %d",

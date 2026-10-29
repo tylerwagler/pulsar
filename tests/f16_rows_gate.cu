@@ -209,25 +209,28 @@ static int rowops_case(int W, int rows) {
     }
     /* R3 */
     for (pulsar_rows_out fmt : {PULSAR_ROWS_OUT_BF16, PULSAR_ROWS_OUT_F16})
-        for (pulsar_rows_act act : {PULSAR_ROWS_ACT_NONE, PULSAR_ROWS_ACT_GELU}) {
+        for (pulsar_rows_act act : {PULSAR_ROWS_ACT_NONE, PULSAR_ROWS_ACT_GELU, PULSAR_ROWS_ACT_RELU2}) {
             const int rc = pulsar_rows_bias_emit_launch(dx, W, rows, W, dbias, act, dy, W, fmt, 0);
             CK(cudaDeviceSynchronize());
             const std::vector<uint16_t> y = host(dy, (size_t)rows * W);
             size_t b3 = 0;
             for (size_t i = 0; i < x.size(); i++) {
                 const float z = x[i] + bias[i % W];
-                if (act == PULSAR_ROWS_ACT_NONE) {
-                    b3 += y[i] != (fmt == PULSAR_ROWS_OUT_F16 ? __half_as_ushort(__float2half_rn(z)) : bf16_bits(z));
+                if (act == PULSAR_ROWS_ACT_NONE || act == PULSAR_ROWS_ACT_RELU2) {
+                    /* L331 relu^2: max(z, 0), one f32 square, one rounding -- bit-exact like the plain emit */
+                    const float q = act == PULSAR_ROWS_ACT_NONE ? z : (z > 0.0f ? z : 0.0f) * (z > 0.0f ? z : 0.0f);
+                    b3 += y[i] != (fmt == PULSAR_ROWS_OUT_F16 ? __half_as_ushort(__float2half_rn(q)) : bf16_bits(q));
                 } else {
                     const double g = 0.5 * z * (1.0 + erf(z / sqrt(2.0)));
                     b3 += !(fabs(out_val(y[i], fmt) - g) <= out_ulp(g, fmt) + ldexp(fabs((double)z), -22));
                 }
             }
-            CHECK(rc == 0 && b3 == 0, "R3 bias emit (%s, %s) width %d: rc %d, %zu values off", act ? "gelu" : "none",
+            CHECK(rc == 0 && b3 == 0, "R3 bias emit (%s, %s) width %d: rc %d, %zu values off",
+                  act == PULSAR_ROWS_ACT_GELU ? "gelu" : act == PULSAR_ROWS_ACT_RELU2 ? "relu2" : "none",
                   fmt ? "f16" : "bf16", W, rc, b3);
         }
     printf("  rows width %4d x %d: layernorm32 (bf16 / f32 + bias in; bf16 / f16 / f32 out) within an ulp, res32 add "
-           "exact + fused norm == norm, bias emit (none bit-exact, gelu within an ulp)\n", W, rows);
+           "exact + fused norm == norm, bias emit (none / relu2 bit-exact, gelu within an ulp)\n", W, rows);
     cudaFree(dxb); cudaFree(dy); cudaFree(dy2); cudaFree(dyf); cudaFree(dres); cudaFree(dx); cudaFree(dw); cudaFree(db);
     cudaFree(dbias);
     return 0;

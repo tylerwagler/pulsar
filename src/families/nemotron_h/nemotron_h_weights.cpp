@@ -109,6 +109,8 @@ bool pulsar_nemotron_h_bind(const pulsar_model *m, pulsar_nemotron_h_model *w) {
                     OWNER, (unsigned long long)n);
         }
     }
+    /* L331: the vision tower, when the container holds it (nemotron_h_vision.cpp) */
+    if (s->vision_written) (void)pulsar_nemotron_h_vision_bind(m, b, &w->vision);
     /* the census: every directory entry declared, every byte priced (the extras refused by name) */
     return pulsar_role_binder_close(b, &w->census);
 }

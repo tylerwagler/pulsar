@@ -211,6 +211,8 @@ tests/sse-golden/out.txt
 /tests/nemotron_fwd_gate
 /tests/nemotron_enc_gate
 /tests/nemotron_parse_gate
+/tests/nemotron_vision_pixel_gate
+/tests/nemotron_vision_tower_gate
 /tests/mtp_spec_gate
 /tests/draft_refusal_gate
 /tests/scratch_poison_gate

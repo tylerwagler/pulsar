@@ -218,12 +218,11 @@ bool group(const char kinds[][12], uint32_t n, const char *key, uint32_t *n_laye
 bool pulsar_nemotron_h_read_shape(const pulsar_model *m, pulsar_nemotron_h_shape *s) {
     *s = PULSAR_NEMOTRON_H_SHAPE_SUPER;   /* the name and the profile's values; every read field is overwritten */
     bool ok = true;
-    bool vision = false;
-    if (!model_get_bool(m, "pulsar.mtp_present", &s->mtp_written) || !model_get_bool(m, "pulsar.vision_present", &vision))
+    /* L331: the vision tower -- its facts and tensors are the tower's declaration (nemotron_h_vision.cpp) */
+    if (!model_get_bool(m, "pulsar.mtp_present", &s->mtp_written) ||
+        !model_get_bool(m, "pulsar.vision_present", &s->vision_written))
         ok = refuse("%s / pulsar.vision_present: the container does not say whether it holds the drafter and the "
                     "tower%s", "pulsar.mtp_present");
-    if (vision) ok = refuse("%s is true: the vision tower is not part of this declaration (v1: text; N11)%s",
-                            "pulsar.vision_present");
     /* L298: a block drafter the container holds (absent: none -- containers built before it) */
     pulsar_str dk = {NULL, 0};
     s->block_written = false;

@@ -132,6 +132,7 @@ rows_bias_emit_kernel(const float *__restrict__ x, uint64_t ld_x, uint32_t width
     for (int k = 0; k < 4; ++k) {
         float z = bias ? __fadd_rn(f[k], bias[c + k]) : f[k];
         if (act == PULSAR_ROWS_ACT_GELU) z = __fmul_rn(__fmul_rn(0.5f, z), __fadd_rn(1.0f, erff(__fmul_rn(z, 0.70710678118654752f))));
+        else if (act == PULSAR_ROWS_ACT_RELU2) { z = fmaxf(z, 0.0f); z = __fmul_rn(z, z); }
         o[k] = f2out(z, f16);
     }
     *(uint2 *)(y + t * ld_y + c) = make_uint2(o[0] | (o[1] << 16), o[2] | (o[3] << 16));
@@ -284,7 +285,7 @@ extern "C" int pulsar_rows_bias_emit_launch(const float *x, uint64_t ld_x, uint3
                                             pulsar_rows_out y_fmt, cudaStream_t stream) {
     if (!x || !y || n_rows == 0 || n_rows > 65535u || width == 0 || width % 8 || ld_x < width || ld_x % 4 ||
         ld_y < width || ld_y % 8 || !aligned16(x) || !aligned16(y) || (bias && !aligned16(bias)) ||
-        (act != PULSAR_ROWS_ACT_NONE && act != PULSAR_ROWS_ACT_GELU) ||
+        (act != PULSAR_ROWS_ACT_NONE && act != PULSAR_ROWS_ACT_GELU && act != PULSAR_ROWS_ACT_RELU2) ||
         (y_fmt != PULSAR_ROWS_OUT_BF16 && y_fmt != PULSAR_ROWS_OUT_F16)) {
         fprintf(stderr, "pulsar: rows bias emit: %u rows (1 .. 65535) of width %u (a multiple of 8), aligned rows, "
                         "ld_x %llu (a multiple of 4) / ld_y %llu (of 8) >= the width, a known activation -- refusing\n",

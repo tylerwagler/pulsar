@@ -4491,15 +4491,44 @@ static void test_nemotron_refusals(void) {
                            "<function>\n<name>f</name>\n<parameters>\n</parameters>\n</function>\n</tools>";
     TEST_ASSERT(r.has_tools && !strncmp(r.prompt_text, declared, strlen(declared)));
     request_free(&r);
-    chat_msgs msgs = {0};
-    chat_msgs_push(&msgs, qwen_test_image_msg("user", "Look: ", ""));
-    chat_conversation c = {};
-    c.msgs = msgs;
-    request_init(&r, REQ_CHAT, 16);
-    TEST_ASSERT(!render_chat_conversation(NULL, PULSAR_CHAT_NEMOTRON_H, NULL, &c, &r, err, sizeof err));
-    TEST_ASSERT(strstr(err, "vision front (N11)") != NULL);
-    request_free(&r);
-    chat_conversation_free(&c);
+    /* L331: an image renders as render_content + the processor's expansion -- the "\n" after text not ending in one,
+     * the literal outside client data (the span ends before it) -- and the refusals by name */
+    {
+        chat_msgs msgs = {0};
+        chat_msgs_push(&msgs, qwen_test_image_msg("user", "Look: ", "ok"));
+        chat_conversation c = {};
+        c.msgs = msgs;
+        request_init(&r, REQ_CHAT, 16);
+        TEST_ASSERT(render_chat_conversation(NULL, PULSAR_CHAT_NEMOTRON_H, NULL, &c, &r, err, sizeof err));
+        const char *want = "<|im_start|>system\n<|im_end|>\n<|im_start|>user\nLook: \n<img><image></img>ok<|im_end|>\n"
+                           "<|im_start|>assistant\n<think>\n";
+        TEST_ASSERT(r.prompt_text && !strcmp(r.prompt_text, want));
+        const char *lit = r.prompt_text ? strstr(r.prompt_text, "<img>") : NULL;
+        bool outside = lit != NULL;
+        for (uint32_t i = 0; lit && i < r.prompt_n_spans; i++)
+            outside &= !(r.prompt_spans[i].lo < (uint32_t)(lit - r.prompt_text) + 18u &&
+                         r.prompt_spans[i].hi > (uint32_t)(lit - r.prompt_text));
+        TEST_ASSERT(outside);
+        request_free(&r);
+        chat_conversation_free(&c);
+    }
+    for (int k = 0; k < 2; k++) {
+        chat_msgs msgs = {0};
+        if (k == 0) {
+            chat_msgs_push(&msgs, qwen_test_image_msg("user", "see <image> here ", ""));
+        } else {
+            chat_msgs_push(&msgs, qwen_test_msg("user", "hi"));
+            chat_msgs_push(&msgs, qwen_test_image_msg("assistant", "look ", ""));
+            chat_msgs_push(&msgs, qwen_test_msg("user", "ok"));
+        }
+        chat_conversation c = {};
+        c.msgs = msgs;
+        request_init(&r, REQ_CHAT, 16);
+        TEST_ASSERT(!render_chat_conversation(NULL, PULSAR_CHAT_NEMOTRON_H, NULL, &c, &r, err, sizeof err));
+        TEST_ASSERT(strstr(err, k == 0 ? "image_marker_in_text" : "image_position") != NULL);
+        request_free(&r);
+        chat_conversation_free(&c);
+    }
 }
 
 /* The model-visible retry: the turn's close, ONE tool result (the error, the system turn reminded), the generation

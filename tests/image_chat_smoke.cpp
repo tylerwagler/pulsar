@@ -46,6 +46,11 @@ int main(int argc, char **argv) {
     if (pulsar_engine_chat_format(e) == PULSAR_CHAT_QWEN) {
         text = std::string("<|im_start|>user\n<|vision_start|><|image_pad|><|vision_end|>") + argv[3] +
                "<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n";
+    } else if (pulsar_engine_chat_format(e) == PULSAR_CHAT_NEMOTRON_H) {
+        /* L331: the template's empty system turn, the image (the processor's <img><image></img>) before the question,
+         * thinking off (nemotron_chat.h; tests/test-vectors/nemotron_h/image_render_cases.json) */
+        text = std::string("<|im_start|>system\n<|im_end|>\n<|im_start|>user\n<img><image></img>") + argv[3] +
+               "<|im_end|>\n<|im_start|>assistant\n<think></think>";
     } else {
         fprintf(stderr, "image smoke: the %s family's template is not written here (DeepSeek's image path has its "
                         "own gates)\n", pulsar_engine_family_name(e));

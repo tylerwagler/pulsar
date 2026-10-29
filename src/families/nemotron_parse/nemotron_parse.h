@@ -29,6 +29,7 @@
 
 #include "engine/pulsar_engine_internal.h"
 #include "engine/role_bind.h"
+#include "engine/vit_encoder.h"
 
 #include <string>
 #include <unordered_map>
@@ -65,10 +66,6 @@ bool pulsar_nemotron_parse_read_shape(const pulsar_model *m, pulsar_nemotron_par
 /* ---- 2. Weights + the decode table ----------------------------------------------------------------------------- */
 
 typedef struct {
-    pulsar_tensor *norm1, *norm1_b, *qkv, *qkv_b, *proj, *proj_b, *norm2, *norm2_b, *fc1, *fc1_b, *fc2, *fc2_b;
-} pulsar_nemotron_parse_vit_block;
-
-typedef struct {
     pulsar_tensor *attn_norm, *attn_norm_b, *q, *q_b, *k, *k_b, *v, *v_b, *o, *o_b;
     pulsar_tensor *ffn_norm, *ffn_norm_b, *up, *up_b, *down, *down_b;
 } pulsar_nemotron_parse_dec_layer;
@@ -86,7 +83,7 @@ struct pulsar_nemotron_parse_run;
 typedef struct {
     pulsar_nemotron_parse_shape shape;
     pulsar_tensor *patch, *cls, *pos;
-    pulsar_nemotron_parse_vit_block vit[PULSAR_NEMOTRON_PARSE_VIT_MAX];
+    pulsar_vit_block vit[PULSAR_NEMOTRON_PARSE_VIT_MAX];   ///< the shared ViT encoder's blocks (engine/vit_encoder.h)
     pulsar_tensor *neck_proj, *neck_proj_b, *neck_norm1, *neck_norm1_b, *neck_merge, *neck_norm2, *neck_norm2_b;
     pulsar_tensor *summary, *summary_b, *neck_norm3, *neck_norm3_b;
     pulsar_tensor *embed, *embed_norm, *embed_norm_b, *output_norm, *output_norm_b;

@@ -421,6 +421,15 @@ def f16_from_f32(raw: bytes, shape: list, axes: list = ()) -> bytes:
     return np.ascontiguousarray(v).astype("<f2").tobytes()
 
 
+def f32_from_bf16(raw: bytes, shape: list, axes: list = ()) -> bytes:
+    """A BF16 tensor widened to f32 -- exact (L331: the LayerNorm weights and biases the shared row ops read as f32,
+    Nemotron 3.5 Super VL's tower).  `axes` as f16_from_f32's (none in use)."""
+    u = np.frombuffer(raw, dtype="<u2").reshape([int(d) for d in shape])
+    if axes:
+        u = u.transpose([int(a) for a in axes])
+    return (np.ascontiguousarray(u).astype("<u4") << 16).astype("<u4").tobytes()
+
+
 def i32_values(values: list) -> bytes:
     """A small I32 table the family's view states itself (L299: the drafter head's vocabulary ids), little-endian."""
     v = np.asarray(values, dtype=np.int64)
@@ -526,7 +535,7 @@ def rows_strided(buf: bytes, n_rows: int, row_bytes: int, start: int, step: int)
 
 PRODUCERS = {f.__name__: f for f in (mxfp8_lt, mxfp8_lt_from_bf16, cutlass_mxfp4, nvfp4, nvfp4_from_bf16,
                                       fp8_e4m3_soa_k_from_bf16, i64_to_i32, tessera_planes, rows_strided, rows_gather,
-                                      i32_values, f16_from_f32)}
+                                      i32_values, f16_from_f32, f32_from_bf16)}
 # the engine's native layouts, by the stored dtype (`st_layout_type`): the recipe's `native` format
 NATIVE_LAYOUT = {"BF16": "bf16", "F32": "f32", "I32": "i32"}
 
@@ -539,6 +548,7 @@ COPY = "copy"
 PRODUCER_FOR = {
     ("BF16", "bf16"): COPY,
     ("F32", "f16"): "f16_from_f32",
+    ("BF16", "f32"): "f32_from_bf16",
     ("F32", "f32"): COPY,
     ("I32", "i32"): COPY,
     ("I64", "i32"): "i64_to_i32",

@@ -1,0 +1,721 @@
+{
+ "generator": "tests/nemotron/gen_nemotron_image_renders.py",
+ "cases": [
+  {
+   "name": "image only",
+   "messages": [
+    {
+     "role": "user",
+     "content": [
+      {
+       "type": "image"
+      }
+     ]
+    }
+   ],
+   "effort": "default",
+   "text": "<|im_start|>system\n<|im_end|>\n<|im_start|>user\n<img><image></img><|im_end|>\n<|im_start|>assistant\n<think>\n",
+   "ids": [
+    10,
+    25708,
+    1010,
+    11,
+    1010,
+    10,
+    3263,
+    1010,
+    19,
+    18,
+    20,
+    11,
+    1010,
+    10,
+    1503,
+    19464,
+    1010,
+    12,
+    1010
+   ],
+   "n_images": 1
+  },
+  {
+   "name": "text then image",
+   "messages": [
+    {
+     "role": "user",
+     "content": [
+      {
+       "type": "text",
+       "text": "What is in this picture?"
+      },
+      {
+       "type": "image"
+      }
+     ]
+    }
+   ],
+   "effort": "default",
+   "text": "<|im_start|>system\n<|im_end|>\n<|im_start|>user\nWhat is in this picture?\n<img><image></img><|im_end|>\n<|im_start|>assistant\n<think>\n",
+   "ids": [
+    10,
+    25708,
+    1010,
+    11,
+    1010,
+    10,
+    3263,
+    1010,
+    7493,
+    1395,
+    1294,
+    1593,
+    13083,
+    9551,
+    19,
+    18,
+    20,
+    11,
+    1010,
+    10,
+    1503,
+    19464,
+    1010,
+    12,
+    1010
+   ],
+   "n_images": 1
+  },
+  {
+   "name": "image then text",
+   "messages": [
+    {
+     "role": "user",
+     "content": [
+      {
+       "type": "image"
+      },
+      {
+       "type": "text",
+       "text": "Describe it."
+      }
+     ]
+    }
+   ],
+   "effort": "default",
+   "text": "<|im_start|>system\n<|im_end|>\n<|im_start|>user\n<img><image></img>Describe it.<|im_end|>\n<|im_start|>assistant\n<think>\n",
+   "ids": [
+    10,
+    25708,
+    1010,
+    11,
+    1010,
+    10,
+    3263,
+    1010,
+    19,
+    18,
+    20,
+    5847,
+    13089,
+    1494,
+    1046,
+    11,
+    1010,
+    10,
+    1503,
+    19464,
+    1010,
+    12,
+    1010
+   ],
+   "n_images": 1
+  },
+  {
+   "name": "text ending in a newline",
+   "messages": [
+    {
+     "role": "user",
+     "content": [
+      {
+       "type": "text",
+       "text": "Look:\n"
+      },
+      {
+       "type": "image"
+      },
+      {
+       "type": "text",
+       "text": " and say."
+      }
+     ]
+    }
+   ],
+   "effort": "default",
+   "text": "<|im_start|>system\n<|im_end|>\n<|im_start|>user\nLook:\n<img><image></img> and say.<|im_end|>\n<|im_start|>assistant\n<think>\n",
+   "ids": [
+    10,
+    25708,
+    1010,
+    11,
+    1010,
+    10,
+    3263,
+    1010,
+    23971,
+    1877,
+    19,
+    18,
+    20,
+    1321,
+    4150,
+    1046,
+    11,
+    1010,
+    10,
+    1503,
+    19464,
+    1010,
+    12,
+    1010
+   ],
+   "n_images": 1
+  },
+  {
+   "name": "two images numbered",
+   "messages": [
+    {
+     "role": "user",
+     "content": [
+      {
+       "type": "image"
+      },
+      {
+       "type": "image"
+      },
+      {
+       "type": "text",
+       "text": "Which is red?"
+      }
+     ]
+    }
+   ],
+   "effort": "default",
+   "text": "<|im_start|>system\n<|im_end|>\n<|im_start|>user\n<image 1><img><image></img><image 2><img><image></img>Which is red?<|im_end|>\n<|im_start|>assistant\n<think>\n",
+   "ids": [
+    10,
+    25708,
+    1010,
+    11,
+    1010,
+    10,
+    3263,
+    1010,
+    1060,
+    5497,
+    1032,
+    1049,
+    1062,
+    19,
+    18,
+    20,
+    1060,
+    5497,
+    1032,
+    1050,
+    1062,
+    19,
+    18,
+    20,
+    45184,
+    1395,
+    4804,
+    1063,
+    11,
+    1010,
+    10,
+    1503,
+    19464,
+    1010,
+    12,
+    1010
+   ],
+   "n_images": 2
+  },
+  {
+   "name": "text between two images",
+   "messages": [
+    {
+     "role": "user",
+     "content": [
+      {
+       "type": "text",
+       "text": "A"
+      },
+      {
+       "type": "image"
+      },
+      {
+       "type": "text",
+       "text": "B"
+      },
+      {
+       "type": "image"
+      },
+      {
+       "type": "text",
+       "text": "C"
+      }
+     ]
+    }
+   ],
+   "effort": "default",
+   "text": "<|im_start|>system\n<|im_end|>\n<|im_start|>user\nA\n<image 1><img><image></img>B\n<image 2><img><image></img>C<|im_end|>\n<|im_start|>assistant\n<think>\n",
+   "ids": [
+    10,
+    25708,
+    1010,
+    11,
+    1010,
+    10,
+    3263,
+    1010,
+    1065,
+    1010,
+    1060,
+    5497,
+    1032,
+    1049,
+    1062,
+    19,
+    18,
+    20,
+    1066,
+    1010,
+    1060,
+    5497,
+    1032,
+    1050,
+    1062,
+    19,
+    18,
+    20,
+    1067,
+    11,
+    1010,
+    10,
+    1503,
+    19464,
+    1010,
+    12,
+    1010
+   ],
+   "n_images": 2
+  },
+  {
+   "name": "an empty text part",
+   "messages": [
+    {
+     "role": "user",
+     "content": [
+      {
+       "type": "text",
+       "text": ""
+      },
+      {
+       "type": "image"
+      }
+     ]
+    }
+   ],
+   "effort": "default",
+   "text": "<|im_start|>system\n<|im_end|>\n<|im_start|>user\n<img><image></img><|im_end|>\n<|im_start|>assistant\n<think>\n",
+   "ids": [
+    10,
+    25708,
+    1010,
+    11,
+    1010,
+    10,
+    3263,
+    1010,
+    19,
+    18,
+    20,
+    11,
+    1010,
+    10,
+    1503,
+    19464,
+    1010,
+    12,
+    1010
+   ],
+   "n_images": 1
+  },
+  {
+   "name": "numbering per message",
+   "messages": [
+    {
+     "role": "user",
+     "content": [
+      {
+       "type": "image"
+      },
+      {
+       "type": "text",
+       "text": "one"
+      }
+     ]
+    },
+    {
+     "role": "assistant",
+     "content": "ok"
+    },
+    {
+     "role": "user",
+     "content": [
+      {
+       "type": "text",
+       "text": "and"
+      },
+      {
+       "type": "image"
+      }
+     ]
+    }
+   ],
+   "effort": "default",
+   "text": "<|im_start|>system\n<|im_end|>\n<|im_start|>user\n<img><image></img>one<|im_end|>\n<|im_start|>assistant\n<think></think>ok<|im_end|>\n<|im_start|>user\nand\n<img><image></img><|im_end|>\n<|im_start|>assistant\n<think>\n",
+   "ids": [
+    10,
+    25708,
+    1010,
+    11,
+    1010,
+    10,
+    3263,
+    1010,
+    19,
+    18,
+    20,
+    1774,
+    11,
+    1010,
+    10,
+    1503,
+    19464,
+    1010,
+    12,
+    13,
+    1662,
+    11,
+    1010,
+    10,
+    3263,
+    1010,
+    1421,
+    1010,
+    19,
+    18,
+    20,
+    11,
+    1010,
+    10,
+    1503,
+    19464,
+    1010,
+    12,
+    1010
+   ],
+   "n_images": 2
+  },
+  {
+   "name": "thinking off",
+   "messages": [
+    {
+     "role": "user",
+     "content": [
+      {
+       "type": "text",
+       "text": "Colour?"
+      },
+      {
+       "type": "image"
+      }
+     ]
+    }
+   ],
+   "effort": "none",
+   "text": "<|im_start|>system\n<|im_end|>\n<|im_start|>user\nColour?\n<img><image></img><|im_end|>\n<|im_start|>assistant\n<think></think>",
+   "ids": [
+    10,
+    25708,
+    1010,
+    11,
+    1010,
+    10,
+    3263,
+    1010,
+    77480,
+    9551,
+    19,
+    18,
+    20,
+    11,
+    1010,
+    10,
+    1503,
+    19464,
+    1010,
+    12,
+    13
+   ],
+   "n_images": 1
+  },
+  {
+   "name": "medium effort",
+   "messages": [
+    {
+     "role": "user",
+     "content": [
+      {
+       "type": "text",
+       "text": "Colour?"
+      },
+      {
+       "type": "image"
+      }
+     ]
+    }
+   ],
+   "effort": "medium",
+   "text": "<|im_start|>system\n<|im_end|>\n<|im_start|>user\nColour?\n<img><image></img>\n\n{reasoning effort: efficient}<|im_end|>\n<|im_start|>assistant\n<think>\n",
+   "ids": [
+    10,
+    25708,
+    1010,
+    11,
+    1010,
+    10,
+    3263,
+    1010,
+    77480,
+    9551,
+    19,
+    18,
+    20,
+    1267,
+    1123,
+    80277,
+    1302,
+    8267,
+    1058,
+    12871,
+    1125,
+    11,
+    1010,
+    10,
+    1503,
+    19464,
+    1010,
+    12,
+    1010
+   ],
+   "n_images": 1
+  },
+  {
+   "name": "system message image",
+   "messages": [
+    {
+     "role": "system",
+     "content": [
+      {
+       "type": "text",
+       "text": "Reference:"
+      },
+      {
+       "type": "image"
+      }
+     ]
+    },
+    {
+     "role": "user",
+     "content": "What is it?"
+    }
+   ],
+   "effort": "default",
+   "text": "<|im_start|>system\nReference:\n<img><image></img><|im_end|>\n<|im_start|>user\nWhat is it?<|im_end|>\n<|im_start|>assistant\n<think>\n",
+   "ids": [
+    10,
+    25708,
+    1010,
+    17298,
+    1877,
+    19,
+    18,
+    20,
+    11,
+    1010,
+    10,
+    3263,
+    1010,
+    7493,
+    1395,
+    1494,
+    1063,
+    11,
+    1010,
+    10,
+    1503,
+    19464,
+    1010,
+    12,
+    1010
+   ],
+   "n_images": 1
+  },
+  {
+   "name": "tool result screenshot",
+   "messages": [
+    {
+     "role": "user",
+     "content": "Take a screenshot."
+    },
+    {
+     "role": "assistant",
+     "content": "",
+     "tool_calls": [
+      {
+       "id": "c1",
+       "type": "function",
+       "function": {
+        "name": "screenshot",
+        "arguments": {}
+       }
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "tool_call_id": "c1",
+     "content": [
+      {
+       "type": "text",
+       "text": "Here:"
+      },
+      {
+       "type": "image"
+      }
+     ]
+    }
+   ],
+   "effort": "default",
+   "text": "<|im_start|>system\n<|im_end|>\n<|im_start|>user\nTake a screenshot.<|im_end|>\n<|im_start|>assistant\n<think></think>\n<tool_call>\n<function=screenshot>\n</function>\n</tool_call>\n<|im_end|>\n<|im_start|>user\n<tool_response>\nHere:\n<img><image></img>\n</tool_response>\n<|im_end|>\n<|im_start|>assistant\n<think>\n",
+   "ids": [
+    10,
+    25708,
+    1010,
+    11,
+    1010,
+    10,
+    3263,
+    1010,
+    35510,
+    1261,
+    60523,
+    1046,
+    11,
+    1010,
+    10,
+    1503,
+    19464,
+    1010,
+    12,
+    13,
+    1010,
+    14,
+    1010,
+    1060,
+    5165,
+    71987,
+    68506,
+    1561,
+    1885,
+    5165,
+    1561,
+    15,
+    1010,
+    11,
+    1010,
+    10,
+    3263,
+    1010,
+    16,
+    1010,
+    11745,
+    1877,
+    19,
+    18,
+    20,
+    1010,
+    17,
+    1010,
+    11,
+    1010,
+    10,
+    1503,
+    19464,
+    1010,
+    12,
+    1010
+   ],
+   "n_images": 1
+  },
+  {
+   "name": "text spelling <image> beside an image",
+   "messages": [
+    {
+     "role": "user",
+     "content": [
+      {
+       "type": "text",
+       "text": "see <image> here"
+      },
+      {
+       "type": "image"
+      }
+     ]
+    }
+   ],
+   "effort": "default",
+   "refusal": "image_marker_in_text"
+  },
+  {
+   "name": "an image in an assistant turn",
+   "messages": [
+    {
+     "role": "user",
+     "content": "hi"
+    },
+    {
+     "role": "assistant",
+     "content": [
+      {
+       "type": "text",
+       "text": "look"
+      },
+      {
+       "type": "image"
+      }
+     ]
+    },
+    {
+     "role": "user",
+     "content": "ok"
+    }
+   ],
+   "effort": "default",
+   "refusal": "image_position"
+  }
+ ]
+}
