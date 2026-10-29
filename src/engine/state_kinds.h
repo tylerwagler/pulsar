@@ -141,6 +141,7 @@ typedef struct pulsar_state_set {
     int32_t run_pos0[PULSAR_STATE_VERIFY_ROWS];
     /* per bank */
     uint32_t *bank_pos;            ///< tokens each bank's state holds (pulsar_state_set_pos writes it)
+    uint32_t *kv_hw;               ///< L270: the most tokens each bank has held -- the touched KV ledger's rows
     bool *evicted;                 ///< L284 #3 / work/kv-vmm: the bank's trunk pools are decommitted (a spill)
     uint32_t *prefill_pos;         ///< L266: the end of each bank's prefill-only history (the cold prefill's bytes)
     bool *frontier_stale;          ///< a segment load wrote the pools without the lanes
@@ -158,9 +159,10 @@ void pulsar_state_destroy(pulsar_state_set *ss);
 /** A bank starts over: its device state zeroed, its host decls at their init, its counters 0, its drafter row
  *  dropped and its checkpoints gone. */
 bool pulsar_state_reset_bank(pulsar_state_set *ss, uint32_t bank);
-/** L270: the one writer of a bank's position. */
+/** L270: the one writer of a bank's position; it keeps the bank's high-water. */
 static inline void pulsar_state_set_pos(pulsar_state_set *ss, uint32_t bank, uint32_t pos) {
     ss->bank_pos[bank] = pos;
+    if (pos > ss->kv_hw[bank]) ss->kv_hw[bank] = pos;
 }
 /** The tensor of a FIXED / STAGED / RING decl on slot `slot` (every bank's). */
 static inline pulsar_gpu_tensor *pulsar_state_tensor(const pulsar_state_set *ss, uint32_t slot, uint32_t id) {
@@ -207,8 +209,9 @@ uint64_t pulsar_state_pool_bytes_at(const pulsar_state_set *ss, uint64_t rows);
 bool pulsar_state_pools_cover_bank(pulsar_state_set *ss, uint32_t bank, uint32_t T);
 /** The same for a step's rows (`pos` / `bank`, n rows): each bank covered to its furthest row + 1. */
 bool pulsar_state_pools_cover(pulsar_state_set *ss, const int32_t *pos, const int32_t *bank, uint32_t n);
-/** A bank's mapped TRUNK pool bytes: the touched KV the guard budgets, exactly what a spill frees (a drafter slot's
- *  pool stays mapped across a spill and is not counted -- state_kinds.cpp). */
+/** A bank's mapped TRUNK pool bytes -- the physical a spill frees (a drafter slot's pool stays mapped across a spill
+ *  and is not counted).  NOT the guard's touched ledger, which stays the high-water's rows (state_kinds.cpp,
+ *  decl_bank_touched_kv_bytes, gpuq #500). */
 uint64_t pulsar_state_bank_committed_bytes(const pulsar_state_set *ss, uint32_t bank);
 /** L284 #3: a bank's physical residency -- its trunk pools.  _free releases them (and zeroes its high-water),
  *  _alloc re-backs whichever are missing (idempotent; on a failure the bank is left wholly evicted), _evicted is

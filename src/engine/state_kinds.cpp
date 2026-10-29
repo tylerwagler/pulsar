@@ -139,13 +139,14 @@ bool pulsar_state_pools_cover_bank(pulsar_state_set *ss, uint32_t bank, uint32_t
 
 bool pulsar_state_pools_cover(pulsar_state_set *ss, const int32_t *pos, const int32_t *bank, uint32_t n) {
     for (uint32_t r = 0; r < n; r++) {
+        if (bank[r] < 0 || pos[r] < 0) continue;   /* a row that writes no position (a padding row) maps nothing */
         bool first = true;   /* a bank once, at the furthest row it takes */
         for (uint32_t q = 0; q < r && first; q++) first = bank[q] != bank[r];
         if (!first) continue;
         int32_t end = pos[r] + 1;
         for (uint32_t q = r + 1; q < n; q++)
             if (bank[q] == bank[r] && pos[q] + 1 > end) end = pos[q] + 1;
-        if (bank[r] < 0 || end <= 0 || !pulsar_state_pools_cover_bank(ss, (uint32_t)bank[r], (uint32_t)end))
+        if (!pulsar_state_pools_cover_bank(ss, (uint32_t)bank[r], (uint32_t)end))
             return false;
     }
     return true;
@@ -153,10 +154,7 @@ bool pulsar_state_pools_cover(pulsar_state_set *ss, const int32_t *pos, const in
 
 /* The TRUNK slots' pools only: what a spill frees.  A drafter slot's pool (Nemotron's MTP module, a block drafter's)
  * trails the trunk by a row, is no segment's, and so stays mapped across a spill -- nothing could restore it -- as it
- * stayed resident under the managed pools.  Counting it here would make the guard's spill plan (which drops a victim's
- * touched bytes) promise memory a spill does not return (gpuq #497: B5 read 2 MiB after bank 1's eviction).  Those
- * pages are still out of MemAvailable, so the live budget (server::guard_budget) sees them; only this ledger does
- * not. */
+ * stayed resident under the managed pools (gpuq #497). */
 uint64_t pulsar_state_bank_committed_bytes(const pulsar_state_set *ss, uint32_t bank) {
     const pulsar_state_plan *p = ss->plan;
     uint64_t bytes = 0;
@@ -174,6 +172,7 @@ void pulsar_state_bank_free(pulsar_state_set *ss, uint32_t bank) {
         for (uint32_t id = 0; id < p->n_decl; id++)
             if (ss->pool[k][id] && ss->pool[k][id][bank]) (void)pulsar_gpu_tensor_decommit(ss->pool[k][id][bank]);
     ss->evicted[bank] = true;   /* its rows are gone; the restore's loads map them again */
+    ss->kv_hw[bank] = 0;        /* and the ledger's rows with them; the restore's loads raise it again */
 }
 
 bool pulsar_state_bank_alloc(pulsar_state_set *ss, uint32_t bank) {
@@ -213,6 +212,7 @@ void pulsar_state_destroy(pulsar_state_set *ss) {
         free(ss->cap_host[id]);
     }
     free(ss->bank_pos);
+    free(ss->kv_hw);
     free(ss->evicted);
     free(ss->prefill_pos);
     free(ss->frontier_stale);
@@ -539,6 +539,7 @@ pulsar_state_set *pulsar_state_create(const void *engine, const pulsar_state_pla
         if (ok) ok = (ss->cap_rows[id] = pulsar_gpu_tensor_alloc(rows * capture_row_bytes(&d))) != NULL;
     }
     ss->bank_pos = (uint32_t *)xcalloc(n_banks, sizeof(uint32_t));
+    ss->kv_hw = (uint32_t *)xcalloc(n_banks, sizeof(uint32_t));
     ss->evicted = (bool *)xcalloc(n_banks, sizeof(bool));
     ss->prefill_pos = (uint32_t *)xcalloc(n_banks, sizeof(uint32_t));
     ss->frontier_stale = (bool *)xcalloc(n_banks, sizeof(bool));
@@ -621,12 +622,17 @@ static uint64_t decl_demand_paged_bytes(pulsar_engine *e, int ctx_size) {
     return managed;
 }
 
-/* L270 / work/kv-vmm: a bank's touched pools are its trunk pools' MAPPED physical -- exact, whole chunks (a page is
- * there once a commit put it there, until free_physical decommits the bank: the touched bytes are what a spill
- * frees); a quantum of q tokens grows them by at most q rows (plus the chunk a row may open). */
+/* L270: a bank's touched KV is its high-water's rows (every slot's pools, until free_physical decommits the bank);
+ * a quantum of q tokens grows it by q rows (decl_bank_growth_bytes) -- one linear ledger, the guard's control law's.
+ * gpuq #500: the MAPPED bytes (whole 2 MiB chunks a pool, plus the read slack) were tried as this figure and broke
+ * the law: a bank's first token cost a chunk per pool (Qwen: two pools an attention layer), growth jumped a chunk at a
+ * time while the projection grew a row at a time, and the override-sized legs (kv-admission, preempt-exact) spilled
+ * and preempted where the rows said they fit.  The mapping's rounding is real memory all the same -- at most a chunk a
+ * pool plus the slack, a bank -- and it is out of MemAvailable, so the guard's live budget (server::guard_budget)
+ * and the commit floor (pulsar_gpu_set_commit_floor) see it; only this ledger is the rows'. */
 static uint64_t decl_bank_touched_kv_bytes(pulsar_session *s, uint32_t bank) {
     if (!s->states || bank >= s->states->n_banks) return 0;
-    return pulsar_state_bank_committed_bytes(s->states, bank);
+    return pulsar_state_pool_bytes_at(s->states, s->states->kv_hw[bank]);
 }
 
 static uint64_t decl_bank_growth_bytes(pulsar_session *s, uint32_t q) {

@@ -4415,6 +4415,72 @@ static void test_read_ahead(void) {
     free(fe);
 }
 
+/* gpuq #500 (work/kv-vmm): the declared state's bank residency on reserved pools, priced (dry: no device) -- a
+ * decoding bank's rows are its touched KV and grow a row a token (the guard's linear ledger, not the 2 MiB chunks the
+ * mapping rounds to), a spill (free_physical) drops the touched KV to 0 and refuses the bank's rows while keeping its
+ * position, a padding row maps nothing, and a readmit (alloc_physical, then the payload's rows) brings the bank back
+ * to the same position and the same touched KV. */
+static void test_state_pools(void) {
+    pulsar_gpu_tensor_dry_begin();
+    pulsar_state_plan p = {};
+    p.name = "pools-test";
+    p.resume_grid = 128u;
+    p.ckpt_slots = 2u;
+    enum { D_STATE = 0, D_KV, D_TRAIL };
+    pulsar_state_plan_add(&p, {"state", PULSAR_STATE_FIXED, PULSAR_STATE_CAPTURE_NONE, false, false, 0, 64, 0, 0, NULL,
+                              NULL, NULL});
+    pulsar_state_plan_add(&p, {"kv", PULSAR_STATE_POOL, PULSAR_STATE_CAPTURE_NONE, false, false, 1, 1024, 0, 0, NULL,
+                              NULL, NULL});
+    pulsar_state_plan_add(&p, {"trail", PULSAR_STATE_POOL, PULSAR_STATE_CAPTURE_NONE, false, false, 1, 256, 0, 0, NULL,
+                              NULL, NULL});
+    p.slot[0] = 1u << D_STATE | 1u << D_KV;
+    p.slot[1] = 1u << D_STATE | 1u << D_KV;
+    p.slot[2] = 1u << D_TRAIL;   /* a drafter slot: never evicted */
+    p.n_trunk = 2;
+    p.n_slots = 3;
+    pulsar_state_set *ss = pulsar_state_create(NULL, &p, NULL, 3, 8192, 0);
+    TEST_ASSERT(ss != NULL);
+    if (!ss) { pulsar_gpu_tensor_dry_end(NULL, NULL); return; }
+    pulsar_session *fs = (pulsar_session *)calloc(1, sizeof(pulsar_session));
+    fs->states = ss;
+    const pulsar_family_bank_ops &ops = PULSAR_BANK_OPS_DECLARED;
+    const uint64_t row = 2 * 1024 + 256;   /* a token's rows: two trunk pools and the drafter's */
+    /* a decoding bank: its rows are its touched KV, a row a token */
+    const int32_t prompt_end[1] = {5404}, bk1[1] = {1};
+    TEST_ASSERT(pulsar_state_pools_cover(ss, prompt_end, bk1, 1));
+    pulsar_state_set_pos(ss, 1, 5405);
+    TEST_ASSERT(ops.touched_kv_bytes(fs, 1) == 5405ull * row);
+    TEST_ASSERT(ops.touched_kv_bytes(fs, 0) == 0 && ops.touched_kv_bytes(fs, 2) == 0);
+    const int32_t next[1] = {5405};
+    TEST_ASSERT(pulsar_state_pools_cover(ss, next, bk1, 1));
+    pulsar_state_set_pos(ss, 1, 5406);
+    TEST_ASSERT(ops.touched_kv_bytes(fs, 1) == 5406ull * row);   /* one decode row: one row more, not a chunk */
+    TEST_ASSERT(ops.growth_bytes(fs, 8) == 8ull * row);
+    /* a padding row (no bank, no position) maps nothing and refuses nothing */
+    const int32_t pad_pos[2] = {-1, 5406}, pad_bank[2] = {-1, 1};
+    TEST_ASSERT(pulsar_state_pools_cover(ss, pad_pos, pad_bank, 2));
+    /* the spill: the live bank is refused, an idle one goes -- touched 0, its rows refused, its position kept */
+    ss->live_bank = 1;
+    TEST_ASSERT(!ops.free_physical(fs, 1));
+    ss->live_bank = 0;
+    TEST_ASSERT(ops.free_physical(fs, 1) && ops.is_evicted(fs, 1));
+    TEST_ASSERT(ops.touched_kv_bytes(fs, 1) == 0);
+    TEST_ASSERT(ss->bank_pos[1] == 5406u);
+    TEST_ASSERT(pulsar_state_pool(ss, 0, D_KV, 1) == NULL && pulsar_state_pool(ss, 2, D_TRAIL, 1) != NULL);
+    TEST_ASSERT(!pulsar_state_pools_cover(ss, next, bk1, 1));
+    TEST_ASSERT(!ops.is_evicted(fs, 0) && !ops.is_evicted(fs, 2));
+    /* the readmit: alloc_physical, then the payload's rows put the bank back where it was */
+    TEST_ASSERT(ops.alloc_physical(fs, 1) && !ops.is_evicted(fs, 1) && pulsar_state_pool(ss, 0, D_KV, 1) != NULL);
+    TEST_ASSERT(pulsar_state_pools_cover_bank(ss, 1, 5406));
+    pulsar_state_set_pos(ss, 1, 5406);
+    TEST_ASSERT(ss->bank_pos[1] == 5406u && ops.touched_kv_bytes(fs, 1) == 5406ull * row);
+    /* and the next decode row is that position's */
+    TEST_ASSERT(pulsar_state_pools_cover(ss, next, bk1, 1));
+    free(fs);
+    pulsar_state_destroy(ss);
+    pulsar_gpu_tensor_dry_end(NULL, NULL);
+}
+
 static void test_ckpt_records(void) {
     pulsar_kv_state_ops ops = {};
     ops.name = "fake";
@@ -4782,6 +4848,7 @@ static const pulsar_test_entry test_entries[] = {
     {"--fused-cost", "fused-cost", "the prompt chunk cost fit (solo + fused, persisted) and the verify curve's round cost, what the round selection and the disk restore price by (L304, L312, L327)", test_fused_cost},
     {"--fused-sched", "fused-sched", "the round selection simulated on L304's logged costs: L304's and L277's cases, the stall, no prompt, the cold fit (L312)", test_fused_sched},
     {"--read-ahead", "read-ahead", "the next-chunk PLE read-ahead: its rule (one chunk ahead, each row once, a changed prompt drops), the pool's background class (bytes unchanged, below every gather, cancel, accounting) (L329 b2)", test_read_ahead},
+    {"--state-pools", "state-pools", "the declared state's bank residency on reserved pools (dry): a decoding bank's rows are its touched KV, a spill drops it and keeps the position, a readmit restores both (gpuq #500)", test_state_pools},
     {"--ckpt-records", "ckpt-records", "the record pool (prompt ends, message endpoints: capture, match, LRU, frontier rule) and the endpoint cut (L311)", test_ckpt_records},
     {"--verify-pick", "verify-pick", "the verify pick: the brute-force argmax on a staircase curve, the robust online correction, the lockstep continuation (L301); the copy estimate's re-probe (L308)", test_verify_pick},
     {"--lib-image-rope", "lib-image-rope", "multi-axis rope positions from the image records vs HF get_rope_index (L268)", test_lib_image_rope},

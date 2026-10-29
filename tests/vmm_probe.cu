@@ -20,6 +20,9 @@
  *               gate): the gate must refuse cleanly (never more than a chunk under the floor, each create < 2 s, no new
  *               dmesg uvm / page-allocation / Xid line).  Then, INFO only, the ungated driver down to --stop-gib --
  *               on GB10 (gpuq #492) cuMemCreate did not refuse by itself, which is why every commit is gated
+ *   INFO        what taking the physical costs the box: /proc/vmstat reclaim (pgscan / pgsteal) and compaction
+ *               (compact_stall / fail / success) deltas and PSI memory, for the VMM rounds, for the same bytes as one
+ *               GPU-touched cudaMallocManaged buffer (the old pools' allocator), and for the gated oversubscription
  *   timing      commit (create + map + set access) and decommit (unmap + release) per chunk, median / max, at 2 MiB
  *               and at --chunk-mib
  *
@@ -92,6 +95,47 @@ double now_ms() {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (double)ts.tv_sec * 1e3 + (double)ts.tv_nsec / 1e6;
+}
+
+/* the kernel's reclaim / compaction counters (/proc/vmstat) and its memory pressure (/proc/pressure/memory): what
+ * taking physical costs the box -- gpuq #503's squeeze leg was killed by systemd-oomd on PSI with Pgscan 81M */
+struct vmstat_snap {
+    unsigned long long pgscan = 0, pgsteal = 0, compact_stall = 0, compact_fail = 0, compact_success = 0;
+};
+vmstat_snap vmstat_read() {
+    vmstat_snap v;
+    FILE *fp = fopen("/proc/vmstat", "r");
+    if (!fp) return v;
+    char k[128];
+    unsigned long long x = 0;
+    while (fscanf(fp, "%127s %llu", k, &x) == 2) {
+        if (!strncmp(k, "pgscan_", 7)) v.pgscan += x;
+        else if (!strncmp(k, "pgsteal_", 8)) v.pgsteal += x;
+        else if (!strcmp(k, "compact_stall")) v.compact_stall = x;
+        else if (!strcmp(k, "compact_fail")) v.compact_fail = x;
+        else if (!strcmp(k, "compact_success")) v.compact_success = x;
+    }
+    fclose(fp);
+    return v;
+}
+std::string psi_memory() {
+    FILE *fp = fopen("/proc/pressure/memory", "r");
+    if (!fp) return "unreadable";
+    char line[256];
+    std::string out;
+    while (fgets(line, sizeof line, fp)) {
+        line[strcspn(line, "\n")] = 0;
+        if (!out.empty()) out += " | ";
+        out += line;
+    }
+    fclose(fp);
+    return out;
+}
+void vmstat_info(const char *what, const vmstat_snap &a, const vmstat_snap &b) {
+    printf("INFO %-9s pgscan +%llu, pgsteal +%llu, compact stalls +%llu (fail +%llu, success +%llu); PSI memory: %s\n",
+           what, b.pgscan - a.pgscan, b.pgsteal - a.pgsteal, b.compact_stall - a.compact_stall,
+           b.compact_fail - a.compact_fail, b.compact_success - a.compact_success, psi_memory().c_str());
+    fflush(stdout);
 }
 
 uint64_t mem_free() {
@@ -391,6 +435,7 @@ int main(int argc, char **argv) {
         sync();
         usleep(1000000);
         const uint64_t start = mem_available();
+        const vmstat_snap vs_start = vmstat_read();
         for (int rep = 0; rep < MEMAVAIL_REPS && made_all; rep++) {
             const uint64_t a0 = mem_available(), f0 = mem_free();
             size_t made = 0;
@@ -408,6 +453,31 @@ int main(int argc, char **argv) {
             drop_f.push_back((double)f0 - (double)f1);
         }
         const uint64_t end = mem_available();
+        const vmstat_snap vs_end = vmstat_read();
+        vmstat_info("vmm-cost", vs_start, vs_end);
+        /* the same bytes as one cudaMallocManaged buffer the GPU touches (the pools' old allocator): what the managed
+         * path took from the box, beside the VMM chunks' -- MemFree / MemAvailable and the same counters */
+        {
+            void *mp = nullptr;
+            const size_t mb = (size_t)n * chunk;
+            const uint64_t a0 = mem_available(), f0 = mem_free();
+            const vmstat_snap m0 = vmstat_read();
+            if (cudaMallocManaged(&mp, mb) == cudaSuccess) {
+                fill_kernel<<<256, 256>>>((uint32_t *)mp, mb / 4, 7u);
+                cudaDeviceSynchronize();
+                usleep(1000000);
+                const uint64_t a1 = mem_available(), f1 = mem_free();
+                const vmstat_snap m1 = vmstat_read();
+                cudaFree(mp);
+                printf("INFO managed   the same %.2f GiB as cudaMallocManaged, GPU-touched: MemAvailable -%.2f, MemFree "
+                       "-%.2f GiB\n", (double)mb / GiB, ((double)a0 - (double)a1) / GiB,
+                       ((double)f0 - (double)f1) / GiB);
+                vmstat_info("mgd-cost", m0, m1);
+            } else {
+                printf("INFO managed   cudaMallocManaged of %.2f GiB failed: %s\n", (double)mb / GiB,
+                       cudaGetErrorString(cudaGetLastError()));
+            }
+        }
         double da, xa, ba, xb, df, xf;
         stats(drop_a, &da, &xa);
         stats(back_a, &ba, &xb);
@@ -458,6 +528,7 @@ int main(int argc, char **argv) {
     } else {
         bool dm_ok0 = false;
         const std::vector<std::string> d0 = dmesg_lines(&dm_ok0);
+        const vmstat_snap vs_ov0 = vmstat_read();
         std::vector<std::pair<CUdeviceptr, CUmemGenericAllocationHandle>> held;
         const size_t ov_bytes = ((size_t)dp.totalGlobalMem * 2 + gmin - 1) / gmin * gmin;
         CUdeviceptr ov = 0;
@@ -481,6 +552,7 @@ int main(int argc, char **argv) {
         }
         low = std::min(low, mem_available());
         const size_t gated_chunks = held.size();
+        vmstat_info("gated", vs_ov0, vmstat_read());
         bool dm_ok1 = false;
         const std::vector<std::string> d1 = dmesg_lines(&dm_ok1);
         int hits = 0;
