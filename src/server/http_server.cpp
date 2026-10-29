@@ -291,15 +291,17 @@ bool server::send_health(int fd) {
     if (running < 0) running = 0;
     if (waiting < 0) waiting = 0;
     const long uptime = started ? (long)(time(NULL) - started) : 0;
+    /* the stall watchdog's verdict (watchdog.cpp): a stalled worker is not serving, whatever the queue says */
+    const long long stalled = (long long)__atomic_load_n(&s->stall_s, __ATOMIC_RELAXED);
 
     buf b = {0};
     buf_printf(&b,
         "{\"status\":\"%s\",\"version\":\"%s\",\"model\":\"%s\","
-        "\"uptime_s\":%ld,\"slots\":{\"total\":%d,\"running\":%d,\"waiting\":%d,"
+        "\"uptime_s\":%ld,\"stalled\":%lld,\"slots\":{\"total\":%d,\"running\":%d,\"waiting\":%d,"
         "\"capacity\":%d},"
         "\"kv_cache_usage\":%.6f,",
-        draining ? "draining" : "ok", PULSAR_VERSION_STR, model,
-        uptime, n_slots, running, waiting, capacity, kv);
+        draining ? "draining" : stalled > 0 ? "stalled" : "ok", PULSAR_VERSION_STR, model,
+        uptime, stalled, n_slots, running, waiting, capacity, kv);
     /* The tp block (pulsar-gui docs/contract.md, "Upstream: the /health tp
      * block").  Only `failed` and `connected` are live, and both come from one
      * atomic load; everything else was fixed at bring-up.  Every rank but this
@@ -321,7 +323,7 @@ bool server::send_health(int fd) {
         buf_putc(&b, '}');
     }
     buf_puts(&b, "]}}\n");
-    bool ok = draining
+    bool ok = draining || stalled > 0
         ? http_response_retry(fd, 503, "application/json", b.ptr, HTTP_RETRY_GOING_AWAY_S)
         : http_response(fd, 200, "application/json", b.ptr);
     buf_free(&b);
@@ -487,6 +489,9 @@ bool server::send_metrics(int fd) {
     const double restore_stall_max_s = s->m_restore_stall_max_ms / 1000.0;
     const unsigned long long kv_touched = (unsigned long long)s->m_kv_touched;            /* L328 */
     const unsigned long long kv_reserved = (unsigned long long)s->m_kv_reserved;
+    const unsigned long long kv_budget_live = (unsigned long long)s->m_kv_budget;   /* 2026-10-29 */
+    const unsigned long long persist_skipped = (unsigned long long)s->m_persist_skipped;
+    const unsigned long long prefill_mem_refusals = (unsigned long long)s->m_prefill_mem_refusals;
     const kv_restore_meter disk_meter = s->kv.meter;   /* L310 */
     const unsigned long long preemptions = (unsigned long long)s->m_preemptions;    /* L314 */
     const unsigned long long readmissions = (unsigned long long)s->m_readmissions;
@@ -965,10 +970,25 @@ bool server::send_metrics(int fd) {
      * carries every bank's eager floor, so budget / kv_bank_bytes overstates
      * the tokens the box holds before the 2b guard spills (6.0 of 13.1 GiB on
      * 16 banks at 1M).  0 when the guard is off (no overcommit). */
-    buf_puts(&b, "# HELP pulsar:kv_touched_budget_bytes Demand-paged KV the eviction guard allows resident before spilling idle banks (the smaller of the ledger budget minus the eager floor and the measured post-warmup headroom, L319; 0 = guard off).\n");
+    buf_puts(&b, "# HELP pulsar:kv_touched_budget_bytes Demand-paged KV the eviction guard allows resident before spilling idle banks, live: touched plus MemAvailable minus the memory floor now, never above the startup ceiling (L319, 2026-10-29; 0 = guard off).\n");
     buf_puts(&b, "# TYPE pulsar:kv_touched_budget_bytes gauge\n");
-    buf_printf(&b, "pulsar:kv_touched_budget_bytes %llu\n",
-               s->guard_enabled ? (unsigned long long)s->guard_touched_budget : 0ULL);
+    buf_printf(&b, "pulsar:kv_touched_budget_bytes %llu\n", s->guard_enabled ? kv_budget_live : 0ULL);
+    buf_puts(&b, "# HELP pulsar:kv_touched_ceiling_bytes The startup ceiling the live touched budget never exceeds (min of the ledger share and the post-warmup headroom, L319; 0 = guard off).\n");
+    buf_puts(&b, "# TYPE pulsar:kv_touched_ceiling_bytes gauge\n");
+    buf_printf(&b, "pulsar:kv_touched_ceiling_bytes %llu\n",
+               s->guard_enabled ? (unsigned long long)s->guard_touched_ceiling : 0ULL);
+    buf_puts(&b, "# HELP pulsar:mem_floor_bytes MemAvailable every admission, guard, prefill and persist check keeps free (OS margin + kernel high watermarks + one step's demand).\n");
+    buf_puts(&b, "# TYPE pulsar:mem_floor_bytes gauge\n");
+    buf_printf(&b, "pulsar:mem_floor_bytes %llu\n", (unsigned long long)server_mem_floor());
+    buf_puts(&b, "# HELP pulsar:kv_persist_skipped_total Disk-KV persists skipped because MemAvailable could not cover them over the memory floor.\n");
+    buf_puts(&b, "# TYPE pulsar:kv_persist_skipped_total counter\n");
+    buf_printf(&b, "pulsar:kv_persist_skipped_total %llu\n", persist_skipped);
+    buf_puts(&b, "# HELP pulsar:prefill_mem_refusals_total Prefills stopped mid-prompt because MemAvailable was under the memory floor before a chunk.\n");
+    buf_puts(&b, "# TYPE pulsar:prefill_mem_refusals_total counter\n");
+    buf_printf(&b, "pulsar:prefill_mem_refusals_total %llu\n", prefill_mem_refusals);
+    buf_puts(&b, "# HELP pulsar:worker_stalled_seconds Seconds the worker has made no progress while jobs wait (the stall watchdog; 0 = progressing or off).\n");
+    buf_puts(&b, "# TYPE pulsar:worker_stalled_seconds gauge\n");
+    buf_printf(&b, "pulsar:worker_stalled_seconds %lld\n", (long long)__atomic_load_n(&s->stall_s, __ATOMIC_RELAXED));
     /* L326: the eager floor that min() subtracts, as the server holds it (guard_eager_bytes) -- the touched budget
      * alone does not give it back once the headroom term binds (L319), so tests read it here, not from a log line. */
     buf_puts(&b, "# HELP pulsar:kv_eager_floor_bytes Eager KV floor already resident that the eviction guard's ledger share subtracts (kv budget minus this, L319/L326; 0 = guard off).\n");

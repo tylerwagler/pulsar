@@ -2564,6 +2564,11 @@ struct pulsar_session {
     /** L329 (b2): each bank's read-ahead record (pulsar_read_ahead_plan), [n_ahead], grown on first use */
     struct pulsar_read_ahead_mark *ahead;
     uint32_t n_ahead;
+    /** The disk-KV staging buffer: PULSAR_SESSION_IO_CHUNK pinned bytes, allocated once at create (a live session
+     *  only; a priced dry one has none).  Every segment and kv-state payload streams through it, so a persist or a
+     *  restore allocates no host memory and its device reads are DMA into pinned pages, not the driver's pageable
+     *  staging (the 2026-10-29 work hang: a persist at ~190k context under ~5 GB MemAvailable). */
+    uint8_t *io_buf;
     uint32_t prefill_cap;                  ///< max tokens per prefill chunk for this session
     int ctx_size;                          ///< allocated context length, in tokens
     bool checkpoint_valid;                 ///< false when `checkpoint` no longer describes the graph's KV (forces a rebuild on the next sync)

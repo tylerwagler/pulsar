@@ -12,6 +12,7 @@
  * bank's prompt end and its last message endpoint.  The same validity rule; a record is replaced by the bank's next
  * one of its kind, else evicted least recently used when the pool is full. */
 #include "pulsar_engine_internal.h"
+#include "lib/pulsar_stall.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -131,6 +132,7 @@ static bool ckpt_capture(pulsar_ckpt_store *st, uint32_t bank, uint32_t G) {
         return false;
     }
     const uint32_t s = ckpt_pick_slot(st, bank, G);
+    pulsar_stall_mark("grid checkpoint capture");
     st->pos[bank][s] = 0u;   /* not a checkpoint until the copy is issued whole */
     if (!st->ops->walk(st->state, 0, false, st->slab[bank], (uint64_t)s * st->slot_bytes, G, NULL)) {
         fprintf(stderr, "pulsar: grid checkpoint at %u on bank %u: copy failed\n", G, bank);

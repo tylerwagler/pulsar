@@ -15,6 +15,7 @@ static pulsar_image_block image_rec_unpack(const uint32_t (&rec)[SEGMENT_IMAGE_U
     return (pulsar_image_block){ rec[0], rec[1], (uint64_t)rec[2] | (uint64_t)rec[3] << 32, rec[4], rec[5] };
 }
 #include "lib/pulsar_writeback.h"
+#include "lib/pulsar_stall.h"
 
 void payload_set_err(char *err, size_t errlen, const char *msg) {
     if (errlen != 0) snprintf(err, errlen, "%s", msg);
@@ -439,6 +440,7 @@ int pulsar_session::save_segment(FILE *fp, uint32_t G_prev, uint32_t G, char *er
     pulsar_gpu_tensor *slab = NULL;
     uint64_t slot_off = 0;
     const bool state = pulsar_ckpt_locate(st, bank, G, &slab, &slot_off);
+    pulsar_stall_mark("segment save: device drain");
     if (pulsar_gpu_synchronize() == 0) {
         payload_set_err(err, errlen, "save segment: failed to synchronize accelerator");
         return 1;
@@ -462,13 +464,15 @@ int pulsar_session::save_segment(FILE *fp, uint32_t G_prev, uint32_t G, char *er
         const uint32_t n_img = segment_images(s, G_prev, G, &b);
         if (payload_write_images(&io, b, n_img, err, errlen) != 0) return 1;
     }
-    uint8_t *buf = (uint8_t *)xmalloc(PULSAR_SESSION_IO_CHUNK);
+    uint8_t *buf = s->io_buf;   /* pinned once at create (pulsar_session::io_buf) */
     pulsar_kv_pool pools[PULSAR_KV_POOLS_MAX];
     const uint32_t n = segment_pools(st, pools);
+    pulsar_stall_mark("segment save: pool rows to disk");
     int rc = pools_span_io(&io, pools, n, G_prev, G, true, buf, NULL, err, errlen);
     /* the rows' digest closes the part every load reads; the state part, when present, has its own */
     for (int part = 0; rc == 0 && part < (state ? 2 : 1); part++) {
         if (part == 1) {
+            pulsar_stall_mark("segment save: state slot to disk");
             payload_digest_init(&io.digest);
             rc = payload_write_tensor_span(&io, slab, slot_off, st->slot_bytes, buf, PULSAR_SESSION_IO_CHUNK, err,
                                            errlen);
@@ -480,7 +484,6 @@ int pulsar_session::save_segment(FILE *fp, uint32_t G_prev, uint32_t G, char *er
             rc = 1;
         }
     }
-    free(buf);
     if (rc != 0) return rc;
     pulsar_writeback_finish(&io.wb);
     return 0;
@@ -584,9 +587,10 @@ int pulsar_session::load_segment(FILE *fp, uint64_t bytes, bool last, uint32_t *
         payload_set_err(err, errlen, "load segment: no grid-checkpoint slot");
         return fail();
     }
-    uint8_t *buf = (uint8_t *)xmalloc(PULSAR_SESSION_IO_CHUNK);
+    uint8_t *buf = s->io_buf;   /* pinned once at create (pulsar_session::io_buf) */
     pulsar_kv_pool pools[PULSAR_KV_POOLS_MAX];
     const uint32_t n = segment_pools(st, pools);
+    pulsar_stall_mark("segment load: disk to pool rows");
     int rc = pools_span_io(&io, pools, n, G_prev, G, false, buf, &remaining, err, errlen);
     /* the rows' digest; then, for the chain's last segment, its state and the state's digest (an earlier segment's
      * state is not read: the load restores one) */
@@ -606,7 +610,6 @@ int pulsar_session::load_segment(FILE *fp, uint64_t bytes, bool last, uint32_t *
         }
         remaining -= sizeof(uint64_t);
     }
-    free(buf);
     if (rc != 0) return fail();
     if (pulsar_gpu_synchronize() == 0) {
         payload_set_err(err, errlen, "load segment: failed to synchronize accelerator after the copy");
@@ -820,12 +823,11 @@ int pulsar_session::save_payload(FILE *fp, char *err, size_t errlen) {
         rc = 1;
     }
     if (rc == 0) rc = payload_write_bytes(&io, live, (uint64_t)p.width * sizeof(float), err, errlen);
-    uint8_t *buf = (uint8_t *)xmalloc(PULSAR_SESSION_IO_CHUNK);
+    uint8_t *buf = s->io_buf;   /* pinned once at create (pulsar_session::io_buf) */
     if (rc == 0 && p.G)
         rc = payload_write_tensor_span(&io, slab, slot_off, st->slot_bytes, buf, PULSAR_SESSION_IO_CHUNK, err, errlen);
     if (rc == 0) rc = payload_write_tensor_span(&io, front, 0, fb, buf, PULSAR_SESSION_IO_CHUNK, err, errlen);
     if (rc == 0) rc = pools_span_io(&io, p.pools, p.n_pools, 0u, p.T, true, buf, NULL, err, errlen);
-    free(buf);
     pulsar_gpu_tensor_free(front);
     if (rc != 0) return rc;
     const uint64_t dg = payload_digest_final(&io.digest);
@@ -939,14 +941,13 @@ int pulsar_session::load_payload(FILE *fp, uint64_t payload_bytes, char *err, si
         payload_set_err(err, errlen, "session payload: staging the frontier's state failed");
         return fail();
     }
-    uint8_t *buf = (uint8_t *)xmalloc(PULSAR_SESSION_IO_CHUNK);
+    uint8_t *buf = s->io_buf;   /* pinned once at create (pulsar_session::io_buf) */
     int rc = 0;
     if (G) rc = payload_read_tensor_span(&io, slab, slot_off, st->slot_bytes, buf, PULSAR_SESSION_IO_CHUNK, &remaining,
                                          err, errlen);
     if (rc == 0) rc = payload_read_tensor_span(&io, front, 0, fb, buf, PULSAR_SESSION_IO_CHUNK,
                                                &remaining, err, errlen);
     if (rc == 0) rc = pools_span_io(&io, pools, n, 0u, T, false, buf, &remaining, err, errlen);
-    free(buf);
     if (rc != 0) return fail();
     uint64_t stored_dg = 0;
     if (remaining != sizeof(uint64_t) || fread(&stored_dg, 1, sizeof(stored_dg), fp) != sizeof(stored_dg) ||

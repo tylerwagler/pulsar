@@ -11064,7 +11064,173 @@ static void test_health_capacity_is_one_in_classic_mode(void) {
     pthread_mutex_destroy(&s.mu);
 }
 
+/* 2026-10-29 (the work hang): the floor is derived -- the OS margin + the kernel's high watermarks + one step's
+ * demand -- and /proc/zoneinfo's "high" lines are the only ones summed (not a per-cpu pageset's "high:", not
+ * "high_wmark"-like words).  The work box's Normal zone read min 243584 / low 370396 / high 497208 kB (dmesg). */
+static void test_mem_floor_is_derived_from_the_watermarks(void) {
+    const uint64_t MiB = 1024ull * 1024ull;
+    static const char zi[] =
+        "Node 0, zone      DMA\n"
+        "  pages free     3840\n"
+        "        min      1000\n"
+        "        low      1500\n"
+        "        high     2000\n"
+        "        spanned  4096\n"
+        "  pagesets\n"
+        "    cpu: 0\n"
+        "              count: 12\n"
+        "              high:  378\n"
+        "              batch: 63\n"
+        "Node 0, zone   Normal\n"
+        "  pages free     64085\n"
+        "        min      60896\n"
+        "        low      92599\n"
+        "        high     124302\n"
+        "        promo    150000\n"
+        "        high_x   99999\n";
+    TEST_ASSERT(server_zoneinfo_high_bytes(zi, 4096) == (2000ull + 124302ull) * 4096ull);
+    TEST_ASSERT(server_zoneinfo_high_bytes("Node 0, zone Normal\n  pages free 5\n", 4096) == 0);   /* none: 0 */
+    TEST_ASSERT(server_zoneinfo_high_bytes("", 4096) == 0);
+    TEST_ASSERT(server_zoneinfo_high_bytes("        high     7", 4096) == 0);   /* a line must be whole */
+    /* the floor: the margin + the watermarks + the step; every MemAvailable check reads it */
+    const uint64_t zone = 486ull * MiB, step = 160ull * MiB;
+    TEST_ASSERT(server_mem_floor_init(zone, step) == PULSAR_SERVER_MEM_FLOOR_BYTES + zone + step);
+    TEST_ASSERT(server_mem_floor() == PULSAR_SERVER_MEM_FLOOR_BYTES + zone + step);
+    const uint64_t F = server_mem_floor();
+    TEST_ASSERT(server_mem_floor_admits(F + 10 * MiB, 10 * MiB));
+    TEST_ASSERT(!server_mem_floor_admits(F + 10 * MiB - 1, 10 * MiB));
+    /* the guard's ceiling keeps the derived floor free */
+    TEST_ASSERT(server_guard_touched_budget(64ull << 30, 0, 0, F + 3 * MiB) == 3 * MiB);
+    TEST_ASSERT(server_guard_touched_budget(64ull << 30, 0, 0, F) == 0);
+    /* headroom: unreadable MemAvailable (0) is never room; no wrap */
+    TEST_ASSERT(!server_headroom_admits(0, 0, 0));
+    TEST_ASSERT(server_headroom_admits(5, 2, 3));
+    TEST_ASSERT(!server_headroom_admits(4, 2, 3));
+    TEST_ASSERT(!server_headroom_admits(UINT64_MAX, UINT64_MAX, 2));
+    /* a persist's host demand: the writeback window + two renders of the text, at the bound a token */
+    TEST_ASSERT(server_persist_host_bytes(0) == PULSAR_WRITEBACK_STEP);
+    TEST_ASSERT(server_persist_host_bytes(-5) == PULSAR_WRITEBACK_STEP);
+    TEST_ASSERT(server_persist_host_bytes(188416) ==
+                PULSAR_WRITEBACK_STEP + 2ull * 188416ull * PERSIST_TEXT_BYTES_PER_TOKEN);
+    (void)server_mem_floor_init(0, 0);   /* back to the OS margin for the tests after this one */
+    TEST_ASSERT(server_mem_floor() == PULSAR_SERVER_MEM_FLOOR_BYTES);
+}
+
+/* 2026-10-29: the guard's decisions read the LIVE budget -- touched + MemAvailable − floor now -- never above the
+ * startup ceiling.  The incident's shape: the ceiling was cut at warmup, then memory nobody counts went (host heap,
+ * page cache, the driver), and the startup number kept admitting KV into the floor. */
+static void test_guard_budget_reads_live_memavailable(void) {
+    const uint64_t GiB = 1024ull * 1024ull * 1024ull;
+    server s;
+    memset(&s, 0, sizeof s);
+    const uint64_t F = server_mem_floor();
+    s.guard_enabled = true;
+    s.guard_kv_budget = 40 * GiB;
+    s.guard_eager_bytes = 31 * GiB;
+    s.guard_touched_ceiling = 5 * GiB;          /* cut at warmup: MemAvailable was floor + 5 GiB */
+    s.guard_budget_said = 5 * GiB;              /* no line for the cases below that stay put */
+    s.guard_avail_at = server_now_sec();        /* the reading below is fresh: no /proc read in this test */
+    s.guard_avail = F + 2 * GiB;                /* 3 GiB went to something no ledger counts */
+    TEST_ASSERT(s.guard_budget() == 2 * GiB);   /* the live headroom binds */
+    s.guard_avail = F + 20 * GiB;               /* memory came back: never above the startup ceiling */
+    TEST_ASSERT(s.guard_budget() == 5 * GiB);
+    s.guard_avail = F;                          /* at the floor: nothing more may be touched */
+    TEST_ASSERT(s.guard_budget() == 0);
+    s.guard_avail = 0;                          /* unreadable: fail closed */
+    TEST_ASSERT(s.guard_budget() == 0);
+}
+
+/* 2026-10-29: a persist MemAvailable cannot cover over the floor is skipped -- counted and said, nothing written,
+ * no device read issued (the segment store is never reached: this server has none). */
+static void test_persist_skipped_under_the_floor(void) {
+    server s;
+    memset(&s, 0, sizeof s);
+    pthread_mutex_init(&s.mu, NULL);
+    s.kv.enabled = true;                                 /* a store is configured ... */
+    (void)server_mem_floor_init(UINT64_MAX / 4, 0);      /* ... and no box has this much free */
+    int end = -1;
+    TEST_ASSERT(s.kv_cache_persist(NULL, "continued", false, &end) == 0);
+    TEST_ASSERT(end == 0);
+    TEST_ASSERT(s.m_persist_skipped == 1);
+    TEST_ASSERT(s.kv_cache_persist(NULL, "prompt", true) == 0);
+    TEST_ASSERT(s.m_persist_skipped == 2);
+    (void)server_mem_floor_init(0, 0);
+    pthread_mutex_destroy(&s.mu);
+}
+
+/* The stall watchdog's two rules: the env value (malformed refuses to start), and when a quiet worker is a stall. */
+static void test_stall_watchdog_rules(void) {
+    char err[256];
+    int lim = -1;
+    TEST_ASSERT(server_stall_limit_parse(NULL, &lim, err, sizeof err) && lim == PULSAR_STALL_WATCHDOG_DEFAULT_S);
+    TEST_ASSERT(server_stall_limit_parse("", &lim, err, sizeof err) && lim == PULSAR_STALL_WATCHDOG_DEFAULT_S);
+    TEST_ASSERT(server_stall_limit_parse("0", &lim, err, sizeof err) && lim == 0);
+    TEST_ASSERT(server_stall_limit_parse("45", &lim, err, sizeof err) && lim == 45);
+    TEST_ASSERT(server_stall_limit_parse("86400", &lim, err, sizeof err) && lim == 86400);
+    const char *bad[] = {"-1", "86401", "12s", "1.5", " 30", "30 ", "abc", "0x10", "99999999999999999999"};
+    for (const char *b : bad) {
+        err[0] = '\0';
+        TEST_ASSERT(!server_stall_limit_parse(b, &lim, err, sizeof err));
+        TEST_ASSERT(err[0] != '\0');
+    }
+    /* a stall: busy and quiet for at least the limit */
+    TEST_ASSERT(server_stall_seconds(200000, 80000, true, 120) == 120);
+    TEST_ASSERT(server_stall_seconds(200000, 80001, true, 120) == 0);    /* 119.999 s: not yet */
+    TEST_ASSERT(server_stall_seconds(2236000, 100000, true, 120) == 2136);
+    TEST_ASSERT(server_stall_seconds(2236000, 100000, false, 120) == 0);  /* idle: a quiet worker is fine */
+    TEST_ASSERT(server_stall_seconds(2236000, 100000, true, 0) == 0);     /* off */
+    TEST_ASSERT(server_stall_seconds(1000, 2000, true, 1) == 0);          /* a beat after now: not a stall */
+}
+
+/* /health under a stall: status "stalled", the seconds, and a 503 -- and "stalled":0 with 200 when progressing. */
+static void test_health_reports_a_stall(void) {
+    for (int stalled = 0; stalled < 2; stalled++) {
+        server s;
+        memset(&s, 0, sizeof s);
+        pthread_mutex_init(&s.mu, NULL);
+        s.n_slots = 4;
+        s.pool_banks = 4;
+        s.n_generating = 1;
+        s.started = time(NULL);
+        s.stall_s = stalled ? 2160 : 0;
+        int fds[2];
+        TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0);
+        TEST_ASSERT(s.send_health(fds[0]) == true);
+        char buf[2048];
+        const int n = stream_read_within(fds[1], buf, sizeof buf - 1, 2000);
+        TEST_ASSERT(n > 0);
+        buf[n > 0 ? n : 0] = '\0';
+        if (stalled) {
+            TEST_ASSERT(strstr(buf, " 503 ") != NULL);
+            TEST_ASSERT(strstr(buf, "\"status\":\"stalled\"") != NULL);
+            TEST_ASSERT(strstr(buf, "\"stalled\":2160") != NULL);
+        } else {
+            TEST_ASSERT(strstr(buf, " 200 ") != NULL);
+            TEST_ASSERT(strstr(buf, "\"status\":\"ok\"") != NULL);
+            TEST_ASSERT(strstr(buf, "\"stalled\":0") != NULL);
+        }
+        close(fds[0]);
+        close(fds[1]);
+        pthread_mutex_destroy(&s.mu);
+    }
+}
+
+/* A mark is a beat and names the section (pulsar_stall.h): what the dump reports as "last section entered". */
+static void test_stall_marks_beat(void) {
+    const uint64_t b0 = g_pulsar_stall.beats.load();
+    pulsar_stall_mark("test section");
+    TEST_ASSERT(g_pulsar_stall.beats.load() == b0 + 1);
+    TEST_ASSERT(!strcmp(g_pulsar_stall.where.load(), "test section"));
+    TEST_ASSERT(g_pulsar_stall.where_ms.load() > 0);
+}
+
 static void pulsar_server_unit_tests_run(void) {
+    test_mem_floor_is_derived_from_the_watermarks();
+    test_guard_budget_reads_live_memavailable();
+    test_persist_skipped_under_the_floor();
+    test_stall_watchdog_rules();
+    test_health_reports_a_stall();
+    test_stall_marks_beat();
     test_logprob_token_json_sanitizes_ill_formed_utf8();
     test_random_prefixed_id_format();
     test_kv_disk_default_dir_resolution();
