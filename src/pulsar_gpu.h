@@ -198,6 +198,20 @@ typedef enum pulsar_elt_fmt {
 pulsar_gpu_tensor *pulsar_gpu_tensor_alloc_elt(uint64_t n_elems, uint32_t esz,
                                                pulsar_elt_fmt fmt);
 pulsar_gpu_tensor *pulsar_gpu_tensor_alloc_managed(uint64_t bytes);
+/** work/kv-vmm: a RESERVED tensor -- `bytes` of VA (CUDA VMM) with no physical until pulsar_gpu_tensor_commit maps it
+ *  (the KV pools, state_kinds.cpp).  NULL (said once) when the device has no VMM.  A dry run prices it as the
+ *  demand-paged share. */
+pulsar_gpu_tensor *pulsar_gpu_tensor_reserve(uint64_t bytes);
+/** Back [0, bytes) of a reserved tensor with physical (whole chunks, created and mapped on the host): 1 = backed,
+ *  0 = the box could not (nothing half-mapped; the caller names it).  A plain tensor is backed whole: 1 for any
+ *  bytes inside it. */
+int pulsar_gpu_tensor_commit(pulsar_gpu_tensor *t, uint64_t bytes);
+/** Release a reserved tensor's physical, keeping its VA (the device drains first).  1 = done (a plain tensor: 1). */
+int pulsar_gpu_tensor_decommit(pulsar_gpu_tensor *t);
+/** The bytes behind a tensor now: a reserved tensor's mapped chunks (capped at its size), a plain one's size. */
+uint64_t pulsar_gpu_tensor_committed_bytes(const pulsar_gpu_tensor *t);
+/** The commit granularity (bytes a chunk). */
+uint64_t pulsar_gpu_commit_chunk_bytes(void);
 pulsar_gpu_tensor *pulsar_gpu_tensor_view(const pulsar_gpu_tensor *base, uint64_t offset, uint64_t bytes);
 void pulsar_gpu_tensor_free(pulsar_gpu_tensor *tensor);
 uint64_t pulsar_gpu_tensor_bytes(const pulsar_gpu_tensor *tensor);

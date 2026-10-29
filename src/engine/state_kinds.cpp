@@ -88,47 +88,95 @@ static uint32_t pool_capacity(const pulsar_state_plan *p, uint32_t ctx) {
     return (uint32_t)(ceil_div(ctx, align) * align);
 }
 
-/* Bank b's pools on slot k, each made where it is missing. */
-static bool slot_bank_alloc(pulsar_state_set *ss, uint32_t k, uint32_t b) {
+/* work/kv-vmm: a bank's pools are RESERVED tensors (pulsar_gpu_tensor_reserve: the full capacity's VA, no physical)
+ * made once at create; their physical is mapped as the bank's rows reach it (pulsar_state_pools_cover) and released by
+ * a spill (pulsar_state_bank_free).  There is no fault path: a row no commit covered is never written, and a commit
+ * the box cannot back refuses the step on the host.  Before, each pool was cudaMallocManaged (physical on the GPU's
+ * first touch), and a fault nvidia-uvm could not service at the kernel's min watermark stalled the GPU for good (the
+ * 2026-10-29 work hang). */
+static bool slot_bank_reserve(pulsar_state_set *ss, uint32_t k, uint32_t b) {
     const pulsar_state_plan *p = ss->plan;
     bool ok = true;
     for (uint32_t id = 0; ok && id < p->n_decl; id++) {
         if (!has(p->slot[k], id) || p->decl[id].kind != PULSAR_STATE_POOL) continue;
-        pulsar_gpu_tensor *&t = ss->pool[k][id][b];
-        if (!t) t = pulsar_gpu_tensor_alloc_managed(ceil_div(ss->ctx, p->decl[id].tokens) * p->decl[id].bytes);
-        ok = t != NULL;
+        ok = (ss->pool[k][id][b] =
+                  pulsar_gpu_tensor_reserve(ceil_div(ss->ctx, p->decl[id].tokens) * p->decl[id].bytes)) != NULL;
     }
     return ok;
 }
 
-static void slot_bank_free(pulsar_state_set *ss, uint32_t k, uint32_t b) {
-    for (uint32_t id = 0; id < ss->plan->n_decl; id++) {
-        if (!ss->pool[k][id]) continue;
-        pulsar_gpu_tensor_free(ss->pool[k][id][b]);
-        ss->pool[k][id][b] = NULL;
-    }
-}
+/* The bytes positions [0, T) of decl d take in one pool */
+static uint64_t pool_rows_bytes(const pulsar_state_decl &d, uint64_t T) { return ceil_div(T, d.tokens) * d.bytes; }
 
-void pulsar_state_bank_free(pulsar_state_set *ss, uint32_t bank) {
-    for (uint32_t k = 0; k < ss->plan->n_trunk; k++) slot_bank_free(ss, k, bank);
-    ss->kv_hw[bank] = 0;   /* its pages are gone; the restore's loads raise it again */
-}
-
-bool pulsar_state_bank_alloc(pulsar_state_set *ss, uint32_t bank) {
-    for (uint32_t k = 0; k < ss->plan->n_trunk; k++) {
-        if (!slot_bank_alloc(ss, k, bank)) {
-            pulsar_state_bank_free(ss, bank);   /* never half-backed */
+bool pulsar_state_pools_cover_bank(pulsar_state_set *ss, uint32_t bank, uint32_t T) {
+    const pulsar_state_plan *p = ss->plan;
+    if (bank >= ss->n_banks) return false;
+    /* the rows a step reads past its frontier stay mapped too: a kernel's masked tile may load up to a tile beyond
+     * the last row (a managed pool faulted such a page in; an unmapped one is an illegal address) */
+    T = (uint64_t)T + PULSAR_STATE_POOL_READ_SLACK > ss->ctx ? ss->ctx : T + PULSAR_STATE_POOL_READ_SLACK;
+    for (uint32_t k = 0; k < p->n_slots; k++) {
+        for (uint32_t id = 0; id < p->n_decl; id++) {
+            if (!has(p->slot[k], id) || p->decl[id].kind != PULSAR_STATE_POOL) continue;
+            pulsar_gpu_tensor *t = ss->pool[k][id][bank];
+            if (!t) continue;   /* a priced (dry) set */
+            if (k < p->n_trunk && ss->evicted[bank]) {
+                fprintf(stderr, "pulsar: %s: bank %u is evicted -- its pools are re-backed only by alloc_physical; "
+                                "refusing rows to %u\n", p->name, bank, T);
+                return false;
+            }
+            const uint64_t need = pool_rows_bytes(p->decl[id], T);
+            if (pulsar_gpu_tensor_commit(t, need)) continue;
+            fprintf(stderr, "pulsar: %s: bank %u's '%s' pool (slot %u) could not be backed to %u tokens (%.1f MiB "
+                            "mapped, %.1f MiB wanted): the box is out of memory -- refusing (no fault is left to "
+                            "stall on)\n", p->name, bank, p->decl[id].name, k, T,
+                    (double)pulsar_gpu_tensor_committed_bytes(t) / 1048576.0, (double)need / 1048576.0);
             return false;
         }
     }
     return true;
 }
 
+bool pulsar_state_pools_cover(pulsar_state_set *ss, const int32_t *pos, const int32_t *bank, uint32_t n) {
+    for (uint32_t r = 0; r < n; r++) {
+        bool first = true;   /* a bank once, at the furthest row it takes */
+        for (uint32_t q = 0; q < r && first; q++) first = bank[q] != bank[r];
+        if (!first) continue;
+        int32_t end = pos[r] + 1;
+        for (uint32_t q = r + 1; q < n; q++)
+            if (bank[q] == bank[r] && pos[q] + 1 > end) end = pos[q] + 1;
+        if (bank[r] < 0 || end <= 0 || !pulsar_state_pools_cover_bank(ss, (uint32_t)bank[r], (uint32_t)end))
+            return false;
+    }
+    return true;
+}
+
+uint64_t pulsar_state_bank_committed_bytes(const pulsar_state_set *ss, uint32_t bank) {
+    const pulsar_state_plan *p = ss->plan;
+    uint64_t bytes = 0;
+    if (bank >= ss->n_banks) return 0;
+    for (uint32_t k = 0; k < p->n_slots; k++)
+        for (uint32_t id = 0; id < p->n_decl; id++)
+            if (has(p->slot[k], id) && p->decl[id].kind == PULSAR_STATE_POOL && ss->pool[k][id][bank])
+                bytes += pulsar_gpu_tensor_committed_bytes(ss->pool[k][id][bank]);
+    return bytes;
+}
+
+void pulsar_state_bank_free(pulsar_state_set *ss, uint32_t bank) {
+    const pulsar_state_plan *p = ss->plan;
+    for (uint32_t k = 0; k < p->n_trunk; k++)
+        for (uint32_t id = 0; id < p->n_decl; id++)
+            if (ss->pool[k][id] && ss->pool[k][id][bank]) (void)pulsar_gpu_tensor_decommit(ss->pool[k][id][bank]);
+    ss->evicted[bank] = true;   /* its rows are gone; the restore's loads map them again */
+}
+
+bool pulsar_state_bank_alloc(pulsar_state_set *ss, uint32_t bank) {
+    if (bank >= ss->n_banks) return false;
+    ss->evicted[bank] = false;   /* the VA never went; the rows map as the restore writes them */
+    return true;
+}
+
 bool pulsar_state_bank_evicted(const pulsar_state_set *ss, uint32_t bank) {
-    for (uint32_t k = 0; k < ss->plan->n_trunk; k++)
-        for (uint32_t id = 0; id < ss->plan->n_decl; id++)
-            if (ss->pool[k][id] && !ss->pool[k][id][bank]) return true;
-    return false;
+    return bank < ss->n_banks && ss->evicted[bank];
 }
 
 uint64_t pulsar_state_pool_bytes_at(const pulsar_state_set *ss, uint64_t rows) {
@@ -158,7 +206,7 @@ void pulsar_state_destroy(pulsar_state_set *ss) {
         free(ss->cap_host[id]);
     }
     free(ss->bank_pos);
-    free(ss->kv_hw);
+    free(ss->evicted);
     free(ss->prefill_pos);
     free(ss->frontier_stale);
     if (ss->ckpt.ops) pulsar_ckpt_release(&ss->ckpt);
@@ -375,7 +423,7 @@ static uint32_t slot_pools(pulsar_state_set *ss, uint32_t bank, uint32_t k0, uin
         for (uint32_t id = 0; id < p->n_decl; id++) {
             const pulsar_state_decl &d = p->decl[id];
             if (!has(p->slot[k], id) || d.kind != PULSAR_STATE_POOL) continue;
-            if (n < cap) out[n] = {ss->pool[k][id][bank], d.tokens, d.bytes, d.whole_rows};
+            if (n < cap) out[n] = {pulsar_state_pool(ss, k, id, bank), d.tokens, d.bytes, d.whole_rows};
             n++;
         }
     }
@@ -453,12 +501,12 @@ pulsar_state_set *pulsar_state_create(const void *engine, const pulsar_state_pla
     const uint64_t nb = n_banks;
     bool ok = true;
     for (uint32_t k = 0; ok && k < plan->n_slots; k++) {
-        /* Demand-paged pools first, one tensor per bank (L284 #3: a bank's pages return only when its own tensors
-         * go), each sized from ss->ctx -- the capacity the ops view; then the slot's resident state, bank-major. */
+        /* Reserved pools first, one tensor per bank (its VA at ss->ctx -- the capacity the ops view; its physical
+         * mapped as its rows land), then the slot's resident state, bank-major. */
         for (uint32_t id = 0; id < plan->n_decl; id++)
             if (has(plan->slot[k], id) && plan->decl[id].kind == PULSAR_STATE_POOL)
                 ss->pool[k][id] = (pulsar_gpu_tensor **)xcalloc(n_banks, sizeof(pulsar_gpu_tensor *));
-        for (uint32_t b = 0; ok && b < n_banks; b++) ok = slot_bank_alloc(ss, k, b);
+        for (uint32_t b = 0; ok && b < n_banks; b++) ok = slot_bank_reserve(ss, k, b);
         for (uint32_t id = 0; ok && id < plan->n_decl; id++) {
             if (!has(plan->slot[k], id) || plan->decl[id].kind == PULSAR_STATE_POOL) continue;
             ok = (ss->t[k][id] = pulsar_gpu_tensor_alloc(nb * pulsar_state_decl_bank_bytes(&plan->decl[id]))) != NULL;
@@ -484,7 +532,7 @@ pulsar_state_set *pulsar_state_create(const void *engine, const pulsar_state_pla
         if (ok) ok = (ss->cap_rows[id] = pulsar_gpu_tensor_alloc(rows * capture_row_bytes(&d))) != NULL;
     }
     ss->bank_pos = (uint32_t *)xcalloc(n_banks, sizeof(uint32_t));
-    ss->kv_hw = (uint32_t *)xcalloc(n_banks, sizeof(uint32_t));
+    ss->evicted = (bool *)xcalloc(n_banks, sizeof(bool));
     ss->prefill_pos = (uint32_t *)xcalloc(n_banks, sizeof(uint32_t));
     ss->frontier_stale = (bool *)xcalloc(n_banks, sizeof(bool));
     ss->ops = {
@@ -566,11 +614,12 @@ static uint64_t decl_demand_paged_bytes(pulsar_engine *e, int ctx_size) {
     return managed;
 }
 
-/* L270: a bank's touched pools are its high-water's rows (the pages stay resident once written, until
- * free_physical returns the bank's own tensors); a quantum of q tokens grows them by at most q rows. */
+/* L270 / work/kv-vmm: a bank's touched pools are its MAPPED physical -- exact, whole chunks (a page is there once a
+ * commit put it there, until free_physical decommits the bank); a quantum of q tokens grows them by at most q rows
+ * (plus the chunk a row may open). */
 static uint64_t decl_bank_touched_kv_bytes(pulsar_session *s, uint32_t bank) {
     if (!s->states || bank >= s->states->n_banks) return 0;
-    return pulsar_state_pool_bytes_at(s->states, s->states->kv_hw[bank]);
+    return pulsar_state_bank_committed_bytes(s->states, bank);
 }
 
 static uint64_t decl_bank_growth_bytes(pulsar_session *s, uint32_t q) {

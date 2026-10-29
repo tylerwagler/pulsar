@@ -4,14 +4,15 @@
  * A family names each piece of per-bank state once, as a pulsar_state_decl of one of four KINDS, and says which
  * layer slots carry which declarations (pulsar_state_plan).  From that table alone the core
  *   - allocates it, and prices it (the session's create run dry, session.cpp);
- *   - pages it: a POOL is demand-paged one tensor per bank, so free_physical / alloc_physical return and re-back a
- *     bank's touched pages, and the touched / growth bytes admission reads are the pools' row sizes;
+ *   - pages it: a POOL is one RESERVED tensor per bank (its VA whole, its physical mapped explicitly as its rows
+ *     land: pulsar_state_pools_cover), so free_physical returns a bank's mapped pages and the touched bytes
+ *     admission reads are exactly what is mapped;
  *   - answers the kv-state questions (kv_state.h) -- the slot walk, the pools, stands_at, the frontier -- so the grid
  *     checkpoints (prefix reuse at chunk boundaries), the disk segments and the session payload need nothing more;
  *   - captures a verify step's undo state and commits / rolls back each bank's run of it (speculation).
  *
  * THE KINDS
- *   (a) POOL    per-token rows, append-only, demand-paged per bank: full-attention KV, pooled index keys.  Row r
+ *   (a) POOL    per-token rows, append-only, mapped per bank as they land: full-attention KV, pooled index keys.  Row r
  *               holds tokens [r * tokens, (r + 1) * tokens); a segment carries them, a checkpoint references them.
  *   (b) RING    a sliding window's KV: `tokens` = the window W, the ring holds W - 1 + PULSAR_STATE_VERIFY_ROWS slots (a
  *               verify of k rows writes slots the window still needs only past W - 1 + k), resident, walked whole
@@ -29,7 +30,7 @@
  *               the new frontier.
  *
  * LAYOUT.  A device decl's state is one tensor per (slot, decl), bank-major (bank b at b * its per-bank bytes);
- * a POOL is one managed tensor per (slot, decl, bank); a host decl (session-wide only) one host array.  A capture
+ * a POOL is one reserved tensor per (slot, decl, bank); a host decl (session-wide only) one host array.  A capture
  * is one tensor per decl, [the slots carrying it][verify rows] -- slot k's rows at k * verify_rows.  Slots
  * [n_trunk, n_slots) are a drafter's layers: they trail the trunk by one row, so their pools are no segment's
  * (a payload carries them as trailing pools), they are never evicted and never captured.
@@ -140,7 +141,7 @@ typedef struct pulsar_state_set {
     int32_t run_pos0[PULSAR_STATE_VERIFY_ROWS];
     /* per bank */
     uint32_t *bank_pos;            ///< tokens each bank's state holds (pulsar_state_set_pos writes it)
-    uint32_t *kv_hw;               ///< L270: the most tokens each bank has held -- its touched pool pages
+    bool *evicted;                 ///< L284 #3 / work/kv-vmm: the bank's trunk pools are decommitted (a spill)
     uint32_t *prefill_pos;         ///< L266: the end of each bank's prefill-only history (the cold prefill's bytes)
     bool *frontier_stale;          ///< a segment load wrote the pools without the lanes
     uint32_t live_bank;            ///< the bank sync / eval / the store's walk run on
@@ -157,19 +158,20 @@ void pulsar_state_destroy(pulsar_state_set *ss);
 /** A bank starts over: its device state zeroed, its host decls at their init, its counters 0, its drafter row
  *  dropped and its checkpoints gone. */
 bool pulsar_state_reset_bank(pulsar_state_set *ss, uint32_t bank);
-/** L270: the one writer of a bank's position; it keeps the bank's high-water. */
+/** L270: the one writer of a bank's position. */
 static inline void pulsar_state_set_pos(pulsar_state_set *ss, uint32_t bank, uint32_t pos) {
     ss->bank_pos[bank] = pos;
-    if (pos > ss->kv_hw[bank]) ss->kv_hw[bank] = pos;
 }
 /** The tensor of a FIXED / STAGED / RING decl on slot `slot` (every bank's). */
 static inline pulsar_gpu_tensor *pulsar_state_tensor(const pulsar_state_set *ss, uint32_t slot, uint32_t id) {
     return ss->t[slot][id];
 }
-/** Bank `bank`'s tensor of a POOL decl on slot `slot` (NULL while the bank is evicted). */
+/** Bank `bank`'s tensor of a POOL decl on slot `slot` (NULL while the bank is evicted: a trunk pool's physical is
+ *  gone then, a drafter slot's never goes). */
 static inline pulsar_gpu_tensor *pulsar_state_pool(const pulsar_state_set *ss, uint32_t slot, uint32_t id,
                                                    uint32_t bank) {
-    return ss->pool[slot][id] ? ss->pool[slot][id][bank] : NULL;
+    if (!ss->pool[slot][id] || (slot < ss->plan->n_trunk && ss->evicted[bank])) return NULL;
+    return ss->pool[slot][id][bank];
 }
 /** Bank `bank`'s bytes of a session host decl. */
 static inline void *pulsar_state_host(const pulsar_state_set *ss, uint32_t id, uint32_t bank) {
@@ -196,6 +198,17 @@ bool pulsar_state_commit(pulsar_state_set *ss, uint32_t bank, const int32_t *tok
 
 /** L270: the demand-paged bytes `rows` positions take in one bank (every slot's pools). */
 uint64_t pulsar_state_pool_bytes_at(const pulsar_state_set *ss, uint64_t rows);
+/** work/kv-vmm: positions past a step's last row that stay mapped -- more than any kernel's tile reads ahead of the
+ *  frontier (a masked tail tile) -- and so the guard's touched bytes run up to this much ahead of the rows. */
+#define PULSAR_STATE_POOL_READ_SLACK 256u
+/** work/kv-vmm: map the physical behind positions [0, T + the slack) of every pool of bank `bank` (every slot's), BEFORE any step
+ *  or load writes them -- the commit point (state_kinds.cpp).  false (said: the bank, the pool, the tokens) when the
+ *  box cannot back it, or the bank is evicted: the caller refuses its step.  A no-op past the chunks already mapped. */
+bool pulsar_state_pools_cover_bank(pulsar_state_set *ss, uint32_t bank, uint32_t T);
+/** The same for a step's rows (`pos` / `bank`, n rows): each bank covered to its furthest row + 1. */
+bool pulsar_state_pools_cover(pulsar_state_set *ss, const int32_t *pos, const int32_t *bank, uint32_t n);
+/** A bank's mapped pool bytes (every slot's): the touched KV the guard budgets. */
+uint64_t pulsar_state_bank_committed_bytes(const pulsar_state_set *ss, uint32_t bank);
 /** L284 #3: a bank's physical residency -- its trunk pools.  _free releases them (and zeroes its high-water),
  *  _alloc re-backs whichever are missing (idempotent; on a failure the bank is left wholly evicted), _evicted is
  *  true while any is missing. */

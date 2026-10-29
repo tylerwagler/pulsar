@@ -281,6 +281,9 @@ static bool driver_forward(pulsar_session *s, pulsar_step_mode mode, const int32
     }
     st.n_runs = n_runs;
     st.run_first = n_runs ? run_first : NULL;
+    /* work/kv-vmm: the commit point -- every pool row this step writes is mapped first, on the host; a bank the box
+     * cannot back refuses the step here (said), never as a GPU fault nobody services */
+    if (!pulsar_state_pools_cover(ss, pos, bank, n_rows)) return false;
     const uint32_t n_vruns = st.verify ? pulsar_step_verify_runs(&st) : 0u;
     /* the verify's runs, and each run's host state before the step: a commit finds its bank's run */
     if (st.verify) pulsar_state_verify_begin(ss, n_vruns, run_first, bank, pos);

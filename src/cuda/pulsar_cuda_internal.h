@@ -390,6 +390,9 @@ struct pulsar_gpu_tensor {
      * so pre-existing zero-initialised tensors keep meaning what they meant;
      * set from the *_ELT_FMT authority at alloc_elt, inherited by views. */
     uint32_t fmt;
+    /** work/kv-vmm: a RESERVED tensor (pulsar_gpu_tensor_reserve): `ptr` is a VA range of `bytes` whose physical is
+     *  mapped chunk by chunk (pulsar_gpu_tensor_commit); NULL for every other tensor. */
+    struct pulsar_vmm_map *vmm;
 };
 
 /* The element size to actually use.  Never read t->esz directly. */
@@ -415,6 +418,8 @@ static inline pulsar_gpu_tensor pulsar_tensor_subview(const pulsar_gpu_tensor *b
     t.owner = 0;
     t.fmt = b ? b->fmt : 0u;
     t.esz = b->esz;
+    t.dry = b->dry;
+    t.vmm = NULL;   /* a view never owns the mapping */
     return t;
 }
 
