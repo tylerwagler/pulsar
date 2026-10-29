@@ -3683,6 +3683,10 @@ prefill_mem_step server_prefill_mem_step(bool fits, int n_idle_victims, bool pre
  *  floor.  With the pool reserved: the pool's free chunks cover it AND MemAvailable is still over the floor (growth
  *  nobody accounts for -- the host heap, the page cache -- takes MemAvailable; KV takes only the pool). */
 bool server_kv_room_admits(uint64_t avail, uint64_t floor, bool pool_on, uint64_t pool_free, uint64_t need);
+/** gpuq #505: may a preempted decoder come back with the KV chunk pool?  Its `want` (rows + a bank's mapping overhead
+ *  + the next quantum's growth) must fit the free chunks LESS what the prefilling prompts are `owed` (their next
+ *  chunks): the room a preemption made for a prompt is not retaken before the prompt lands. */
+bool server_readmit_pool_fits(uint64_t pool_free, uint64_t want, uint64_t owed);
 
 /* MemAvailable from /proc/meminfo, in bytes (0 on parse failure — callers
  * fail closed).  Never called on a token/layer hot path (defined in

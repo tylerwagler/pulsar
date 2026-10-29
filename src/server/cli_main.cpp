@@ -1238,6 +1238,9 @@ int main(int argc, char **argv) {
         const uint64_t capacity = pulsar_session_kv_capacity_bytes(session);
         const uint64_t overhead = pulsar_session_kv_mapping_overhead_bytes(session);
         const uint64_t mapped = pulsar_gpu_chunk_mapped_bytes();   /* the warmup's chunks: the pool's from here */
+        /* gpuq #505: the model's pages refaulted into the page cache since the load (a debug read, a family's own
+         * row table) go before the creates, so fewer of them stand fragmented between the chunks */
+        const uint64_t dropped = capacity > 0 ? pulsar_engine_drop_page_cache(engine) : 0;
         const uint64_t avail = server_mem_available_bytes();
         /* the pool leaves PULSAR_SERVER_POOL_NONKV_BYTES above the floor for what grows beside the KV while serving
          * (host heap, page cache): KV growth takes only the pool, so that margin is all the non-KV side has */
@@ -1251,7 +1254,8 @@ int main(int argc, char **argv) {
         if (capacity > 0) {
             const double t0 = server_now_sec();
             char perr[256] = "";
-            if (!pulsar_gpu_chunk_pool_reserve(fresh, perr, sizeof perr)) {
+            pulsar_gpu_pool_reserve_report rep;
+            if (!pulsar_gpu_chunk_pool_reserve(fresh, &rep, perr, sizeof perr)) {
                 server_log(PULSAR_LOG_ERROR, "pulsar-server: refusing to start: the KV chunk pool (%.2f GiB) could not "
                            "be reserved: %s", (double)fresh / gib, perr);
                 pulsar_session_free(session);
@@ -1275,14 +1279,17 @@ int main(int argc, char **argv) {
             }
             server_log(PULSAR_LOG_DEFAULT,
                        "pulsar-server: KV chunk pool reserved: %llu chunks of %llu MiB = %.2f GiB (%llu created in "
-                       "%.2f s, %llu adopted from the warmup; mapping overhead %.2f GiB; pools' capacity %.2f GiB); "
-                       "MemAvailable %.2f -> %.2f GiB (%.2f GiB kept over the floor for non-KV growth); touched "
-                       "ceiling %.2f GiB -- no chunk is created or released while serving",
+                       "%.2f s -- %.1f s paused for memory pressure, PSI some avg10 at most %.1f, %llu compaction "
+                       "stalls; %llu adopted from the warmup; %.2f GiB of model page cache dropped first; mapping "
+                       "overhead %.2f GiB; pools' capacity %.2f GiB); MemAvailable %.2f -> %.2f GiB (%.2f GiB kept "
+                       "over the floor for non-KV growth); touched ceiling %.2f GiB -- no chunk is created or "
+                       "released while serving",
                        (unsigned long long)total, (unsigned long long)(chunk >> 20), (double)pool_bytes / gib,
-                       (unsigned long long)(fresh / (chunk ? chunk : 1)), server_now_sec() - t0,
-                       (unsigned long long)(mapped / (chunk ? chunk : 1)), (double)overhead / gib,
-                       (double)capacity / gib, (double)avail / gib, (double)server_mem_available_bytes() / gib,
-                       (double)PULSAR_SERVER_POOL_NONKV_BYTES / gib, (double)s.guard_touched_ceiling / gib);
+                       (unsigned long long)rep.created, server_now_sec() - t0, rep.paused_s, rep.psi_max,
+                       rep.compact_stalls, (unsigned long long)(mapped / (chunk ? chunk : 1)), (double)dropped / gib,
+                       (double)overhead / gib, (double)capacity / gib, (double)avail / gib,
+                       (double)server_mem_available_bytes() / gib, (double)PULSAR_SERVER_POOL_NONKV_BYTES / gib,
+                       (double)s.guard_touched_ceiling / gib);
         }
     }
     s.sess = session;                /* the one session; slot 0 describes it */

@@ -1597,14 +1597,69 @@ static struct {
 } g_pool;
 static uint64_t g_mapped_chunks;               /* chunks mapped now, every reserved tensor's */
 
+/* the stream a newly mapped chunk is zeroed on (non-blocking: never part of a step's stream or a capture) */
+static cudaStream_t vmm_zero_stream(void) {
+    static cudaStream_t st = NULL;
+    if (!st && cudaStreamCreateWithFlags(&st, cudaStreamNonBlocking) != cudaSuccess) {
+        (void)cudaGetLastError();
+        st = NULL;
+    }
+    return st;
+}
+
 uint64_t pulsar_gpu_chunk_mapped_bytes(void) { return g_mapped_chunks * (g_vmm.state > 0 ? g_vmm.chunk : 0); }
 
-int pulsar_gpu_chunk_pool_reserve(uint64_t bytes, char *err, size_t errlen) {
+/* gpuq #505: the reserve itself can be the storm -- 21.6 GiB of creates right after a 62 GB model load (a full,
+ * fragmented page cache) drove PSI memory to 80 % and systemd-oomd killed the job.  So the creates are PACED: every
+ * POOL_BATCH chunks the reserve reads the kernel's memory pressure (/proc/pressure/memory, "some avg10") and, while it
+ * is over POOL_PSI_PAUSE, waits (POOL_PAUSE_MS a step, at most POOL_PAUSE_MAX_S in all) for reclaim to settle --
+ * the pressure an oomd-style monitor integrates stays under its kill line.  The compaction stalls it cost and the
+ * pauses are reported. */
+#define POOL_BATCH 128u
+#define POOL_PSI_PAUSE 10.0
+#define POOL_PAUSE_MS 200u
+#define POOL_PAUSE_MAX_S 120.0
+
+static double psi_memory_some_avg10(void) {
+    FILE *fp = fopen("/proc/pressure/memory", "r");
+    if (!fp) return 0.0;
+    double v = 0.0;
+    char line[256];
+    while (fgets(line, sizeof line, fp))
+        if (sscanf(line, "some avg10=%lf", &v) == 1) break;
+    fclose(fp);
+    return v;
+}
+
+static unsigned long long vmstat_compact_stalls(void) {
+    FILE *fp = fopen("/proc/vmstat", "r");
+    if (!fp) return 0;
+    char k[128];
+    unsigned long long x = 0, v = 0;
+    while (fscanf(fp, "%127s %llu", k, &x) == 2)
+        if (!strcmp(k, "compact_stall")) { v = x; break; }
+    fclose(fp);
+    return v;
+}
+
+int pulsar_gpu_chunk_pool_reserve(uint64_t bytes, pulsar_gpu_pool_reserve_report *rep, char *err, size_t errlen) {
+    if (rep) memset(rep, 0, sizeof *rep);
     if (g_pool.on) { snprintf(err, errlen, "the chunk pool is reserved already"); return 0; }
     if (!vmm_ready()) { snprintf(err, errlen, "CUDA VMM is not available on this device"); return 0; }
     const uint64_t n = (bytes + g_vmm.chunk - 1) / g_vmm.chunk;
     g_pool.free_list.reserve((size_t)n);
+    const unsigned long long stalls0 = vmstat_compact_stalls();
+    double paused = 0.0, psi_max = 0.0;
     for (uint64_t i = 0; i < n; i++) {
+        if (i % POOL_BATCH == 0 && i > 0) {
+            double psi = psi_memory_some_avg10();
+            if (psi > psi_max) psi_max = psi;
+            while (psi > POOL_PSI_PAUSE && paused < POOL_PAUSE_MAX_S) {
+                usleep(POOL_PAUSE_MS * 1000u);
+                paused += POOL_PAUSE_MS / 1000.0;
+                psi = psi_memory_some_avg10();
+            }
+        }
         CUmemGenericAllocationHandle h = 0;
         const CUresult r = g_vmm.create(&h, (size_t)g_vmm.chunk, &g_vmm.prop, 0);
         if (r != CUDA_SUCCESS) {
@@ -1619,6 +1674,12 @@ int pulsar_gpu_chunk_pool_reserve(uint64_t bytes, char *err, size_t errlen) {
     }
     g_pool.total = n + g_mapped_chunks;   /* the warmup's chunks are the pool's too */
     g_pool.on = true;
+    if (rep) {
+        rep->created = n;
+        rep->compact_stalls = vmstat_compact_stalls() - stalls0;
+        rep->paused_s = paused;
+        rep->psi_max = psi_max;
+    }
     return 1;
 }
 
@@ -1694,6 +1755,17 @@ int pulsar_gpu_tensor_commit(pulsar_gpu_tensor *t, uint64_t bytes) {
                 if (r != CUDA_SUCCESS) (void)g_vmm.unmap(at, (size_t)m->chunk);
             }
             if (r != CUDA_SUCCESS && !g_pool.on) (void)g_vmm.release(h);
+        }
+        /* gpuq #505: a mapped chunk reads as zeros, as a managed page's first touch did -- a pooled chunk last held
+         * another bank's rows, and a row past the frontier (a masked tile's tail, the open row) must never be them.
+         * On the runtime's own stream, waited for: ordered before any step, and never inside a capture. */
+        if (r == CUDA_SUCCESS && (cudaMemsetAsync((void *)(uintptr_t)at, 0, (size_t)m->chunk, vmm_zero_stream()) !=
+                                      cudaSuccess ||
+                                  cudaStreamSynchronize(vmm_zero_stream()) != cudaSuccess)) {
+            (void)cudaGetLastError();
+            (void)g_vmm.unmap(at, (size_t)m->chunk);
+            if (!g_pool.on) (void)g_vmm.release(h);
+            r = CUDA_ERROR_UNKNOWN;
         }
         if (r != CUDA_SUCCESS) return 0;   /* the caller names the pool and the tokens; nothing half-mapped */
         if (g_pool.on) g_pool.free_list.pop_back();

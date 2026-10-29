@@ -357,7 +357,7 @@ static void plan_pool(void) {
     check(pulsar_state_pools_cover(ss, first, b0, 1), "bank 0's first rows map before the pool (DIRECT)");
     const uint64_t adopted = pulsar_gpu_chunk_mapped_bytes() / chunk;
     char err[256] = "";
-    check(pulsar_gpu_chunk_pool_reserve(7 * chunk, err, sizeof err) && pulsar_gpu_chunk_pool_on(),
+    check(pulsar_gpu_chunk_pool_reserve(7 * chunk, NULL, err, sizeof err) && pulsar_gpu_chunk_pool_on(),
           "the pool reserves 7 chunks (%s)", err[0] ? err : "ok");
     uint64_t total = 0, in_use = 0, free_c = 0;
     pulsar_gpu_chunk_pool_stats(&total, &in_use, &free_c, NULL);

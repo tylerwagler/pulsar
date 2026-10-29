@@ -2230,6 +2230,10 @@ static uint64_t server_readmit_need(uint64_t bytes, int n_decoding, uint64_t gro
     return bytes + (uint64_t)(n_decoding + 1) * growth;
 }
 
+bool server_readmit_pool_fits(uint64_t pool_free, uint64_t want, uint64_t owed) {
+    return owed <= pool_free && want <= pool_free - owed;
+}
+
 /* L328 (5): the decode guard preempts while that makes progress: beside another decoder, or beside a job that holds
  * reserved room (a prompt prefilling or a chain restoring, whose end frees it).  A lone decoder with nothing bound
  * beside it would only come straight back -- nothing it waits on ever ends -- so it proceeds (back-pressure, the
@@ -2389,6 +2393,24 @@ bool server::worker_readmit_preempted() {
             s->count_metric(&s->m_spills);
         }
         if (s->kv_reserved_bytes(v) + want > s->guard_budget()) return false;
+    }
+    /* gpuq #505: with the KV chunk pool the binding room is the pool's free chunks, not the ledger: a readmission
+     * takes its rows plus a bank's mapping overhead, and the chunks every prefilling prompt's next chunk is owed stay
+     * its (L328 (1)'s reserved base, in chunks) -- before, the readmission retook the chunks the preemption had just
+     * freed for the prefill that caused it, 243 times (preempt, readmit, preempt) */
+    if (pulsar_gpu_chunk_pool_on()) {
+        uint64_t owed = 0;
+        int n_decoding = 0;
+        for (int i = 0; i < s->n_slots; i++) {
+            const session_slot *c = &s->slots[i];
+            if (c != v && !c->preempted && slot_prefilling(c)) owed += s->prefill_chunk_need();
+            if (slot_is_batchable_decode(c)) n_decoding++;
+        }
+        const int nb = pulsar_session_bank_count(pool);
+        const uint64_t want = server_readmit_need(
+            v->preempt_bytes + (nb > 0 ? pulsar_session_kv_mapping_overhead_bytes(pool) / (uint64_t)nb : 0), n_decoding,
+            pulsar_session_quantum_growth_bytes_per_bank(pool, PULSAR_SERVER_DECODE_QUANTUM_TOKENS));
+        if (!server_readmit_pool_fits(pulsar_gpu_chunk_pool_free_bytes(), want, owed)) return false;
     }
     const double t0 = server_now_sec();
     char err[256] = "";

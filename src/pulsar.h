@@ -489,6 +489,10 @@ uint64_t pulsar_session_quantum_growth_bytes_per_bank(pulsar_session *s, uint32_
  *  comp/index stay managed until phase 2), and the most the mapping adds over the touched rows (a chunk a pool plus
  *  the read slack, every bank) -- what the server's chunk pool is sized from. */
 uint64_t pulsar_session_kv_capacity_bytes(const pulsar_session *s);
+/** gpuq #505: drop the model files' pages from the page cache again (they refault after the load's own release) --
+ *  before a large physical reserve, so fewer of them stand fragmented between its chunks.  The bytes that were
+ *  resident; 0 when the device reads weights through the host mapping (then they are kept). */
+uint64_t pulsar_engine_drop_page_cache(pulsar_engine *e);
 uint64_t pulsar_session_kv_mapping_overhead_bytes(const pulsar_session *s);
 /** GPU bytes the session's create allocated (allocator delta measured across
  * pulsar_session_create).  Equal to pulsar_engine_session_cost_bytes at the

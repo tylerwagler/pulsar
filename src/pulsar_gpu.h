@@ -217,11 +217,18 @@ int pulsar_gpu_tensor_decommit(pulsar_gpu_tensor *t);
 uint64_t pulsar_gpu_tensor_committed_bytes(const pulsar_gpu_tensor *t);
 /** The commit granularity (bytes a chunk). */
 uint64_t pulsar_gpu_commit_chunk_bytes(void);
-/** gpuq #503/#504: reserve the process's chunk pool -- create `bytes` of 2 MiB chunks now, once, into a free list,
+/** gpuq #503/#504/#505: reserve the process's chunk pool -- create `bytes` of 2 MiB chunks now, once (paced by the
+ *  kernel's memory pressure; `rep` reports it, may be NULL), into a free list,
  *  and switch every commit to mapping from it (a commit with the list empty returns -2; a decommit returns its chunks
  *  to the list; nothing is created or released after this).  Chunks mapped before it (the warmup's) join the pool.
  *  1 = reserved; 0 = refused (err says which chunk the driver refused; nothing is kept). */
-int pulsar_gpu_chunk_pool_reserve(uint64_t bytes, char *err, size_t errlen);
+typedef struct {
+    uint64_t created;                  ///< chunks created
+    unsigned long long compact_stalls; ///< /proc/vmstat compact_stall over the reserve
+    double paused_s;                   ///< seconds the reserve waited for memory pressure to settle
+    double psi_max;                    ///< the highest PSI memory "some avg10" it read
+} pulsar_gpu_pool_reserve_report;
+int pulsar_gpu_chunk_pool_reserve(uint64_t bytes, pulsar_gpu_pool_reserve_report *rep, char *err, size_t errlen);
 /** 1 when the pool is reserved (POOL mode), 0 before (DIRECT: a commit creates, gated by the commit floor). */
 int pulsar_gpu_chunk_pool_on(void);
 /** The pool's chunks: owned, mapped (in use), on the free list, and a chunk's bytes (0s before the reserve). */

@@ -11175,6 +11175,19 @@ static void test_prefill_mem_step_tries_remedies_first(void) {
  * reserved, KV takes the pool's free chunks and MemAvailable only has to stay over the floor (the heap, the page
  * cache) -- an empty pool is no room however much MemAvailable reads, and a box under its floor is no room however
  * many chunks are free. */
+/* gpuq #505's livelock, its exact shape: a 22-chunk pool (0.04 GiB), bank 2's prompt owed its next chunk (0.01 GiB),
+ * bank 1's decoder preempted for it (29 MiB of rows) -- the readmission must wait while the freed chunks are owed, and
+ * comes back once the prompt has landed (owes nothing). */
+static void test_readmit_does_not_retake_the_owed_chunks(void) {
+    const uint64_t MiB = 1024ull * 1024ull;
+    const uint64_t free_after_preempt = 22 * 2 * MiB, owed = 12 * MiB, want = 29 * MiB + 6 * MiB;
+    TEST_ASSERT(!server_readmit_pool_fits(free_after_preempt, want, owed));   /* would retake the prompt's chunks */
+    TEST_ASSERT(server_readmit_pool_fits(free_after_preempt, want, 0));       /* the prompt landed: room again */
+    TEST_ASSERT(!server_readmit_pool_fits(owed - 1, 0, owed));                /* owed past the pool: never */
+    TEST_ASSERT(server_readmit_pool_fits(want + owed, want, owed));           /* exactly enough */
+    TEST_ASSERT(!server_readmit_pool_fits(want + owed - 1, want, owed));
+}
+
 static void test_kv_room_with_and_without_the_pool(void) {
     const uint64_t MiB = 1024ull * 1024ull, F = 4538ull * MiB, need = 70ull * MiB;
     TEST_ASSERT(server_kv_room_admits(F + need, F, false, 0, need));
@@ -11259,6 +11272,7 @@ static void pulsar_server_unit_tests_run(void) {
     test_persist_skipped_under_the_floor();
     test_prefill_mem_step_tries_remedies_first();
     test_kv_room_with_and_without_the_pool();
+    test_readmit_does_not_retake_the_owed_chunks();
     test_stall_watchdog_rules();
     test_health_reports_a_stall();
     test_stall_marks_beat();

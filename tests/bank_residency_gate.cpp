@@ -198,6 +198,71 @@ int GATE_ENTRY(int argc, char **argv) {
           "R3 freed+restored bank 1 == never-freed bank 2: sync(Q) + 16 greedy steps byte-identical "
           "(first diff at step %d, max |diff| %.3g)", first_diff, worst);
 
+    /* R4 (gpuq #505): the server's preemption, N times, over the KV chunk pool -- bank 3 prefills G, then each cycle
+     * saves its payload (the terminal checkpoint), frees its physical (its chunks back to the pool), lets bank 1 take
+     * chunks from the pool and write over them (so the readmission maps chunks another bank's rows were in), re-backs
+     * bank 3 and loads the payload.  After the cycles bank 3 and a never-freed bank 0 sync the same extension Q and
+     * decode 16 greedy tokens: logits byte-identical.  The pool is reserved here (the process's POOL mode: last). */
+    {
+        const int N = 8;
+        bool rok = ok && pulsar_session_bank_state_restore(s, 3) && pulsar_session_sync(s, &P, err, sizeof(err)) == 0;
+        if (rok) pulsar_session_bank_state_save(s, 3);
+        char perr[256] = "";
+        const uint64_t chunk = pulsar_gpu_commit_chunk_bytes();
+        rok = rok && pulsar_gpu_chunk_pool_reserve(2 * t1 + 64 * chunk, NULL, perr, sizeof perr);
+        CHECK(rok, "R4 bank 3 prefilled G and the chunk pool reserved: %s%s", err, perr);
+        int cycles = 0;
+        for (; rok && cycles < N; cycles++) {
+            FILE *pf = tmpfile();
+            rok = pf && pulsar_session_bank_state_restore(s, 3) && pulsar_session_save_payload(s, pf, err, sizeof err) == 0;
+            if (rok) pulsar_session_bank_state_save(s, 3);
+            rok = rok && pulsar_session_bank_state_restore(s, 0) && pulsar_session_bank_free_physical(s, 3);
+            /* bank 1 grows over the chunks bank 3 just returned */
+            pulsar_tokens more = {0};
+            for (int k = 0; k < 256 && rok; k++) pulsar_tokens_push(&more, Q.v[k % Q.len]);
+            rok = rok && pulsar_session_bank_state_restore(s, 1);
+            if (rok) {
+                pulsar_tokens grown = {0};
+                const pulsar_tokens *h = pulsar_session_tokens(s);
+                for (int k = 0; k < h->len; k++) pulsar_tokens_push(&grown, h->v[k]);
+                for (int k = 0; k < more.len; k++) pulsar_tokens_push(&grown, more.v[k]);
+                rok = pulsar_session_sync(s, &grown, err, sizeof err) == 0;
+                pulsar_tokens_free(&grown);
+                if (rok) pulsar_session_bank_state_save(s, 1);
+            }
+            pulsar_tokens_free(&more);
+            long n = 0;
+            if (rok) {
+                fseek(pf, 0, SEEK_END);
+                n = ftell(pf);
+                rewind(pf);
+            }
+            rok = rok && pulsar_session_bank_alloc_physical(s, 3) && pulsar_session_bank_state_restore(s, 3) &&
+                  pulsar_session_load_payload(s, pf, (uint64_t)n, err, sizeof err) == 0;
+            if (rok) pulsar_session_bank_state_save(s, 3);
+            if (pf) fclose(pf);
+        }
+        CHECK(rok && cycles == N, "R4 %d preempt / readmit cycles of bank 3 over the pool (bank 1 writing over its "
+              "returned chunks between them): %s", cycles, err);
+        std::vector<int> t3, t0;
+        const std::vector<std::vector<float>> got3 = rok && pulsar_session_bank_state_restore(s, 3)
+                                                         ? continue_greedy(s, &Q, 16, W, &t3)
+                                                         : std::vector<std::vector<float>>();
+        if (rok) pulsar_session_bank_state_save(s, 3);
+        const bool r0 = rok && pulsar_session_bank_state_restore(s, 0) && pulsar_session_sync(s, &P, err, sizeof err) == 0;
+        const std::vector<std::vector<float>> ref0 = r0 ? continue_greedy(s, &Q, 16, W, &t0)
+                                                        : std::vector<std::vector<float>>();
+        bool eq = got3.size() == 17 && ref0.size() == 17;
+        int diff = -1;
+        for (size_t i = 0; eq && i < got3.size(); i++)
+            if (got3[i].size() != (size_t)W || ref0[i].size() != (size_t)W ||
+                (memcmp(got3[i].data(), ref0[i].data(), (size_t)W * sizeof(float)) != 0 && diff < 0))
+                diff = (int)i;
+        CHECK(eq && diff < 0 && t3 == t0,
+              "R4 after %d pooled preempt / readmit cycles bank 3 == never-freed bank 0: sync(Q) + 16 greedy steps "
+              "byte-identical (first diff at step %d)", cycles, diff);
+    }
+
     if (seg) fclose(seg);
     pulsar_session_free(s);
     pulsar_tokens_free(&all);

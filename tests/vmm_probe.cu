@@ -26,6 +26,8 @@
  *   pool        at that floor, the chunks the gated phase holds are a pre-created pool: unmapped and mapped at
  *               another VA (a spill and a readmit) round after round, with no compaction stall (gpuq #504: the server
  *               creates its chunks once at startup and only maps them while serving)
+ *   cache       (with --cache-file, INFO) a pool-sized reserve right after filling the page cache with that file,
+ *               with its cache kept and after dropping it: time, compaction stalls, reclaim, PSI (gpuq #505)
  *   timing      commit (create + map + set access) and decommit (unmap + release) per chunk, median / max, at 2 MiB
  *               and at --chunk-mib
  *
@@ -36,6 +38,10 @@
  */
 #include <cuda.h>
 #include <cuda_runtime.h>
+
+#include <dirent.h>
+#include <errno.h>
+#include <fcntl.h>
 
 #include <algorithm>
 #include <stdarg.h>
@@ -267,6 +273,8 @@ int main(int argc, char **argv) {
     size_t chunk_mib = 64;
     double memavail_gib = 4.0, stop_gib = 1.5, floor_gib = 6.0;
     bool skip_oversub = false, skip_ungated = false;
+    const char *cache_file = nullptr;
+    double cache_reserve_gib = 20.0;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--chunk-mib") && i + 1 < argc) chunk_mib = strtoul(argv[++i], nullptr, 10);
         else if (!strcmp(argv[i], "--memavail-gib") && i + 1 < argc) memavail_gib = atof(argv[++i]);
@@ -274,9 +282,11 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--floor-gib") && i + 1 < argc) floor_gib = atof(argv[++i]);
         else if (!strcmp(argv[i], "--skip-oversub")) skip_oversub = true;
         else if (!strcmp(argv[i], "--skip-ungated")) skip_ungated = true;
+        else if (!strcmp(argv[i], "--cache-file") && i + 1 < argc) cache_file = argv[++i];
+        else if (!strcmp(argv[i], "--cache-reserve-gib") && i + 1 < argc) cache_reserve_gib = atof(argv[++i]);
         else {
             fprintf(stderr, "usage: %s [--chunk-mib N] [--memavail-gib G] [--floor-gib G] [--stop-gib G] [--skip-oversub] "
-                            "[--skip-ungated]\n", argv[0]);
+                            "[--skip-ungated] [--cache-file PATH] [--cache-reserve-gib G]\n", argv[0]);
             return 2;
         }
     }
@@ -638,6 +648,69 @@ int main(int argc, char **argv) {
         }
         for (auto &x : held) decommit(x.first, chunk, x.second);
         if (rv == CUDA_SUCCESS) p_cuMemAddressFree(ov, ov_bytes);
+    }
+
+    /* ---- cache (gpuq #505: the 21.6 GiB pool reserve right after a 62 GB model load drove PSI to 80 % and oomd
+     * killed the job): fill the page cache with --cache-file (a model's shards, ~60 GB), then create
+     * --cache-reserve-gib of chunks the way the server's pool does, twice -- with the file's cache kept, and after
+     * dropping it (posix_fadvise DONTNEED) -- reporting time, compaction stalls, reclaim and the highest PSI.
+     * INFO only: the numbers that choose the reserve's order and pacing. */
+    if (cache_file) {
+        /* a file, or every regular file in a directory (a model's shards) */
+        std::vector<std::string> files;
+        if (DIR *d = opendir(cache_file)) {
+            while (struct dirent *de = readdir(d))
+                if (de->d_name[0] != '.') files.push_back(std::string(cache_file) + "/" + de->d_name);
+            closedir(d);
+        } else {
+            files.push_back(cache_file);
+        }
+        for (int pass = 0; pass < 2; pass++) {
+            std::vector<char> buf(64u << 20);
+            uint64_t read_bytes = 0;
+            for (const std::string &f : files) {
+                const int fd = open(f.c_str(), O_RDONLY);
+                if (fd < 0) continue;
+                for (ssize_t r; (r = read(fd, buf.data(), buf.size())) > 0;) read_bytes += (uint64_t)r;
+                if (pass == 1) (void)posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED);
+                close(fd);
+            }
+            if (read_bytes == 0) { printf("INFO cache     %s: nothing readable\n", cache_file); break; }
+            usleep(1000000);
+            const uint64_t a0 = mem_available();
+            double want = cache_reserve_gib * GiB;
+            const double cap = (double)a0 - (floor_gib + 2.0) * GiB;
+            if (want > cap) want = cap > 0 ? cap : 0;
+            const size_t n = (size_t)(want / (double)gmin);
+            std::vector<CUmemGenericAllocationHandle> hs;
+            hs.reserve(n);
+            const vmstat_snap v0 = vmstat_read();
+            const double t0 = now_ms();
+            double psi_max = 0, slowest = 0;
+            for (size_t i = 0; i < n; i++) {
+                if (i % 128 == 0) {
+                    const std::string ps = psi_memory();
+                    double v = 0;
+                    if (sscanf(ps.c_str(), "some avg10=%lf", &v) == 1 && v > psi_max) psi_max = v;
+                }
+                CUmemGenericAllocationHandle h;
+                const double c0 = now_ms();
+                if (p_cuMemCreate(&h, gmin, &g_prop, 0) != CUDA_SUCCESS) break;
+                slowest = std::max(slowest, now_ms() - c0);
+                hs.push_back(h);
+            }
+            const double took = now_ms() - t0;
+            const vmstat_snap v1 = vmstat_read();
+            for (auto h : hs) p_cuMemRelease(h);
+            printf("INFO cache     %s cache (%.1f GiB read): %zu chunks (%.2f GiB) created in %.2f s, slowest %.1f ms; "
+                   "compact stalls +%llu (fail +%llu), pgscan +%llu; PSI some avg10 at most %.1f; MemAvailable before "
+                   "%.2f GiB\n", pass ? "after dropping the file's" : "with the file's", (double)read_bytes / GiB,
+                   hs.size(), (double)hs.size() * gmin / GiB, took / 1e3, slowest,
+                   v1.compact_stall - v0.compact_stall, v1.compact_fail - v0.compact_fail, v1.pgscan - v0.pgscan,
+                   psi_max, a0 / GiB);
+            fflush(stdout);
+            usleep(5000000);   /* let the pressure average settle between the passes */
+        }
     }
 
     for (int bb = 0; bb < NB; bb++) p_cuMemAddressFree(va[bb], bank_va);
