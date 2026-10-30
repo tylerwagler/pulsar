@@ -141,7 +141,7 @@ int GATE_ENTRY(int argc, char **argv) {
     {
         pulsar_prefix_match m;
         pulsar_tokens_prefix_match(e, live, live_len, canon.v, canon.len, &m);
-        const int a_n = m.live_cut, b_n = m.prompt_cut;
+        const int a_n = m.live_cut.raw(), b_n = m.prompt_cut.raw();
         CHECK(m.seamed, "walk did not report the synthetic seam");
         CHECK(a_n == live_len && b_n == canon.len,
               "walk stopped at (%d,%d), want (%d,%d) [seam at %d]",
@@ -234,7 +234,7 @@ int GATE_ENTRY(int argc, char **argv) {
          * assert it so the leg cannot silently test a different shape. */
         pulsar_prefix_match m3;
         pulsar_tokens_prefix_match(e, plive.v, plive.len, pecho.v, pecho.len, &m3);
-        const int a_n = m3.live_cut, b_n = m3.prompt_cut;
+        const int a_n = m3.live_cut.raw(), b_n = m3.prompt_cut.raw();
         CHECK(a_n == l1 && b_n == c1,
               "leg3 walk (%d,%d) want (%d,%d) — tails may share a leading byte",
               a_n, b_n, l1, c1);

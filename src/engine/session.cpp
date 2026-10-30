@@ -1411,8 +1411,8 @@ void pulsar_tokens_prefix_match(pulsar_engine *e,
                                 const int *a, int a_len,
                                 const int *b, int b_len,
                                 pulsar_prefix_match *out) {
-    out->live_cut = 0;
-    out->prompt_cut = 0;
+    out->live_cut = LiveToks{0};
+    out->prompt_cut = PromptToks{0};
     out->seamed = false;
     if (!e || !a || !b) return;
     bool seamed = false;
@@ -1449,16 +1449,16 @@ void pulsar_tokens_prefix_match(pulsar_engine *e,
 done:
     free(ta);
     free(tb);
-    out->live_cut = best_i;
-    out->prompt_cut = best_j;
+    out->live_cut = LiveToks{best_i};
+    out->prompt_cut = PromptToks{best_j};
     out->seamed = seamed;
 }
 
 void pulsar_session::prefix_match(const pulsar_tokens *prompt,
                                  pulsar_prefix_match *out) {
     auto *s = this;
-    out->live_cut = 0;
-    out->prompt_cut = 0;
+    out->live_cut = LiveToks{0};
+    out->prompt_cut = PromptToks{0};
     out->seamed = false;
     if (!s->checkpoint_valid || !prompt) return;
     pulsar_tokens_prefix_match(s->engine,

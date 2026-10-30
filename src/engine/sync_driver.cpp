@@ -68,17 +68,17 @@ bool pulsar_session_seam_stitch(pulsar_session *s, const pulsar_tokens *prompt, 
                                 int n_images, int past, pulsar_seam_stitch *out) {
     pulsar_prefix_match m;
     s->prefix_match(prompt, &m);
-    if (m.live_cut <= past) return false;
-    const int live_n = m.live_cut, prompt_n = m.prompt_cut;
+    if (m.live_cut <= LiveToks{past}) return false;
+    const int live_n = m.live_cut.raw(), prompt_n = m.prompt_cut.raw();
     pulsar_tokens *st = &out->tokens;
     free(st->v);
-    st->cap = live_n + (prompt->len - prompt_n);
+    st->cap = pulsar_prefix_match_stitched_len(&m, PromptToks{prompt->len}).raw();
     st->v = (int *)xmalloc((size_t)st->cap * sizeof(int));
     memcpy(st->v, s->checkpoint.v, (size_t)live_n * sizeof(int));
     memcpy(st->v + live_n, prompt->v + prompt_n, (size_t)(prompt->len - prompt_n) * sizeof(int));
     st->len = st->cap;
-    out->live_cut = live_n;
-    out->prompt_cut = prompt_n;
+    out->live_cut = m.live_cut;
+    out->prompt_cut = m.prompt_cut;
     /* L226/L273: a block below the seam sits at its live position (which the prompt's canonical ids may have
      * shifted), a block above it moves with the suffix, and the images arrive in prompt order, so the stitched
      * prompt's sentinel blocks, walked in order, are their positions.  A stitch that cuts a block (the walk
@@ -136,7 +136,7 @@ int pulsar_session_sync_default(pulsar_session *s, const pulsar_tokens *prompt, 
             return 1;
         }
         fprintf(stderr, "pulsar: %s: token seam -- keeping %d live tokens for the prompt's first %d (shared by "
-                        "id %d)\n", ops->name, seam.live_cut, seam.prompt_cut, common);
+                        "id %d)\n", ops->name, seam.live_cut.raw(), seam.prompt_cut.raw(), common);
         prompt = &seam.tokens;
         if (n_images > 0) images = seam.placed;
         common = pulsar_tokens_common_prefix(&s->checkpoint, prompt);

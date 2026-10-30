@@ -11334,8 +11334,81 @@ static void test_l333_kv_units(void) {
     TEST_ASSERT(KvBytes{-1}.raw() == (uint64_t)-1 && KvRows{(uint32_t)8192}.raw() == 8192u);
 }
 
+/* L334: the token seam's two currencies (pulsar_units.h LiveToks / PromptToks) refuse every mix at compile time, with
+ * each other and with L333's units -- the compile-fail checks, as above. */
+static_assert(!std::is_convertible_v<LiveToks, PromptToks> && !std::is_convertible_v<PromptToks, LiveToks> &&
+                  !std::is_constructible_v<LiveToks, PromptToks> && !std::is_constructible_v<PromptToks, LiveToks>,
+              "the live and the prompt side never convert into each other, not even explicitly");
+static_assert(!std::is_constructible_v<KvRows, LiveToks> && !std::is_constructible_v<LiveToks, KvRows> &&
+                  !std::is_constructible_v<PromptToks, KvRows>,
+              "a seam count is no KV row count: rows enter where they are measured");
+static_assert(!std::is_convertible_v<int, LiveToks> && !std::is_convertible_v<LiveToks, int> &&
+                  !std::is_convertible_v<int, PromptToks> && !std::is_convertible_v<PromptToks, int>,
+              "no implicit way in or out");
+static_assert(std::is_constructible_v<LiveToks, int> && std::is_constructible_v<PromptToks, uint32_t> &&
+                  !std::is_constructible_v<PromptToks, double> && !std::is_constructible_v<LiveToks, bool>,
+              "the explicit integer entry exists; a float or a bool is no token count");
+static_assert(std::is_same_v<decltype(LiveToks{}.raw()), int> && std::is_same_v<decltype(KvBytes{}.raw()), uint64_t>,
+              "each unit leaves as the integer it replaced");
+static_assert(!l333_adds<LiveToks, PromptToks> && !l333_adds<PromptToks, int> && !l333_adds<LiveToks, KvRows> &&
+                  l333_adds<LiveToks, LiveToks> && l333_adds<PromptToks, PromptToks>,
+              "arithmetic only within a currency");
+static_assert(!l333_orders<LiveToks, PromptToks> && !l333_orders<PromptToks, int> && l333_orders<LiveToks, LiveToks>,
+              "ordering only within a currency");
+static_assert(!l333_equates<LiveToks, PromptToks> && !l333_equates<LiveToks, int> &&
+                  l333_equates<PromptToks, PromptToks>,
+              "equality only within a currency");
+static_assert(!l333_assigns<LiveToks &, PromptToks> && !l333_assigns<PromptToks &, int> &&
+                  l333_assigns<LiveToks &, LiveToks>,
+              "assignment only within a currency");
+static_assert(std::is_same_v<decltype(pulsar_prefix_match{}.live_cut), LiveToks> &&
+                  std::is_same_v<decltype(pulsar_prefix_match{}.prompt_cut), PromptToks>,
+              "the prefix match carries one count of each currency");
+static_assert(LiveToks::max().raw() == std::numeric_limits<int>::max() && (LiveToks{2} - LiveToks{5}).raw() == -3,
+              "int semantics: signed, as the int fields they replaced");
+
+/* L334: the currencies are the ints they replaced -- round trip and every operator against int, negatives included
+ * (no case overflows: signed overflow stays the caller's, as before) -- and the stitch's length is the expression
+ * its three former copies computed. */
+static void test_l334_seam_currencies(void) {
+    const int vals[] = {-4097, -1, 0, 1, 127, 4096, 178193, 1 << 20};
+    for (int a : vals) {
+        TEST_ASSERT(LiveToks{a}.raw() == a && PromptToks{a}.raw() == a);
+        for (int b : vals) {
+            const LiveToks x{a}, y{b};
+            const PromptToks p{a}, q{b};
+            TEST_ASSERT((x + y).raw() == a + b && (x - y).raw() == a - b);
+            TEST_ASSERT((p + q).raw() == a + b && (p - q).raw() == a - b);
+            TEST_ASSERT((x < y) == (a < b) && (x <= y) == (a <= b) && (x > y) == (a > b) && (x >= y) == (a >= b));
+            TEST_ASSERT((p < q) == (a < b) && (p <= q) == (a <= b) && (p > q) == (a > b) && (p >= q) == (a >= b));
+            TEST_ASSERT((x == y) == (a == b) && (x != y) == (a != b) && (p == q) == (a == b) && (p != q) == (a != b));
+            LiveToks z = x;
+            z += y;
+            TEST_ASSERT(z.raw() == a + b);
+            z -= y;
+            TEST_ASSERT(z == x);
+            TEST_ASSERT(x.times(3).raw() == a * 3 && p.times(-2).raw() == a * -2);
+        }
+    }
+    TEST_ASSERT(LiveToks{}.raw() == 0 && PromptToks{}.raw() == 0);   /* value-initialised: zero */
+    TEST_ASSERT(LiveToks{(uint32_t)4096}.raw() == 4096 && PromptToks{(int64_t)-1}.raw() == -1);
+    /* the stitch: live[0, live_cut) + prompt[prompt_cut, prompt_len) -- a seam that spends 3 live tokens on the bytes
+     * of 2 prompt ones, and the seamless case where the currencies coincide */
+    struct { int live_cut, prompt_cut, prompt_len; } cases[] = {{0, 0, 9}, {100, 99, 140}, {4096, 4093, 4093},
+                                                                 {57, 57, 300}, {178193, 178190, 191000}};
+    for (const auto &c : cases) {
+        pulsar_prefix_match m;
+        m.live_cut = LiveToks{c.live_cut};
+        m.prompt_cut = PromptToks{c.prompt_cut};
+        m.seamed = c.live_cut != c.prompt_cut;
+        TEST_ASSERT(pulsar_prefix_match_stitched_len(&m, PromptToks{c.prompt_len}).raw() ==
+                    c.live_cut + (c.prompt_len - c.prompt_cut));
+    }
+}
+
 static void pulsar_server_unit_tests_run(void) {
     test_l333_kv_units();
+    test_l334_seam_currencies();
     test_mem_floor_is_derived_from_the_watermarks();
     test_guard_budget_reads_live_memavailable();
     test_persist_skipped_under_the_floor();
