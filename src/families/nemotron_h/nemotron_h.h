@@ -39,6 +39,9 @@
  *   are stored [in, out] in ne order; the conv [kernel, channels]; routed experts are pulsar.experts stacks
  *   [in, out, n_expert] (up: latent -> ff, down: ff -> latent).
  */
+/** @file nemotron_h.h
+ *  @brief The Nemotron-H family module's declarations: shape, weights, state declaration and the driver / drafter
+ *  tables. */
 #ifndef PULSAR_FAMILY_NEMOTRON_H_H
 #define PULSAR_FAMILY_NEMOTRON_H_H
 
@@ -46,6 +49,7 @@
 #include "engine/role_bind.h"
 #include "engine/spec_block.h"
 
+/// The `general.architecture` value this family claims.
 #define PULSAR_NEMOTRON_H_ARCH "nemotron_h"
 /** The most HF blocks a container's layers_block_type may list (the full model has 88). */
 #define PULSAR_NEMOTRON_H_MAX_BLOCKS 128u
@@ -59,6 +63,7 @@ extern const pulsar_family PULSAR_FAMILY_NEMOTRON_H;
  *  declared for these numbers; a second geometry is a second profile, added on purpose); the PLAN -- the block kinds,
  *  and so the grouped layers -- is the container's (the 5-block mini and the 88-block model are one profile). */
 typedef struct {
+    /// The profile's display name; the boot line and model_name print it.
     const char *name;
     /* geometry: pinned */
     uint32_t n_embd;           ///< hidden_size (4096)
@@ -92,9 +97,11 @@ typedef struct {
     /** L298: HF block b's place in the plan -- pulsar layer block_layer[b], its mixer (PULSAR_BLOCK_TAP_MIXER) or its
      *  MoE (PULSAR_BLOCK_TAP_FFN): where a block drafter's tap after block b reads the residual */
     uint8_t block_layer[PULSAR_NEMOTRON_H_MAX_BLOCKS];
+    /// L298: HF block b's half of its layer: PULSAR_BLOCK_TAP_MIXER or PULSAR_BLOCK_TAP_FFN (pairs with block_layer)
     uint8_t block_sub[PULSAR_NEMOTRON_H_MAX_BLOCKS];
 } pulsar_nemotron_h_shape;
 
+/// The one profile (Nemotron-3.5 Super): the geometry every container must equal.
 extern const pulsar_nemotron_h_shape PULSAR_NEMOTRON_H_SHAPE_SUPER;
 
 /** Read the shape from the container's keys and check it (nemotron_h_shape.cpp).  Every refusal is said and counted
@@ -139,6 +146,7 @@ typedef struct {
 
 /** The MTP module: one {attention, MoE} layer plus its input side and its out norm. */
 typedef struct {
+    /// The module's {attention, MoE} layer, bound under `mtp` index 0.
     pulsar_nemotron_h_block block;
     pulsar_tensor *embed_norm;       ///< draft_embed_norm [n_embd] (enorm)
     pulsar_tensor *hidden_norm;      ///< draft_hidden_norm [n_embd] (hnorm)
@@ -148,11 +156,14 @@ typedef struct {
 
 /** The family's state (pulsar_engine::family_state). */
 typedef struct {
+    /// The loaded, checked shape (pulsar_nemotron_h_read_shape).
     pulsar_nemotron_h_shape shape;
     pulsar_tensor *embed;            ///< embed [n_vocab rows of n_embd]
     pulsar_tensor *output_norm;      ///< output_norm [n_embd] (norm_f)
     pulsar_tensor *head;             ///< head [n_embd -> n_vocab] (untied)
+    /// The trunk layers (grouped from the HF blocks); entries [0, shape.n_layer) are bound.
     pulsar_nemotron_h_block layer[PULSAR_FAMILY_MAX_LAYER];
+    /// The MTP module; bound only when the container holds it and the open selected it (drafting), else all NULL.
     pulsar_nemotron_h_draft mtp;
     /** What the binding priced (role_bind.h): every byte the core stages, by role. */
     pulsar_role_census census;
@@ -181,6 +192,8 @@ bool pulsar_nemotron_h_load_tokenizer(pulsar_nemotron_h_model *w, const char *mo
 bool pulsar_nemotron_h_bind(const pulsar_model *m, pulsar_nemotron_h_model *w);
 
 /** The loaded family's state, or NULL on another family's engine. */
+/** @param e  any engine (NULL allowed)
+ *  @return the Nemotron-H state, or NULL */
 static inline const pulsar_nemotron_h_model *pulsar_nemotron_h_of(const pulsar_engine *e) {
     return e && e->family && e->family->id == PULSAR_FAMILY_ID_NEMOTRON_H
                ? (const pulsar_nemotron_h_model *)e->family_state

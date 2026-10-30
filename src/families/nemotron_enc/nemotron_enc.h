@@ -31,12 +31,15 @@
  *   side file read: tokenizer.json (the loader's one stop id is nemotron_enc.eos_token_id: the checkpoints ship no
  *   generation_config.json, and an encoder never stops).
  */
+/** @file nemotron_enc.h
+ *  @brief The Nemotron-3.5 retrieval encoders (Embed-8B, Rerank-8B) as one encoder family: shape, weights, forward. */
 #ifndef PULSAR_FAMILY_NEMOTRON_ENC_H
 #define PULSAR_FAMILY_NEMOTRON_ENC_H
 
 #include "engine/pulsar_engine_internal.h"
 #include "engine/role_bind.h"
 
+/// The `general.architecture` value this family claims.
 #define PULSAR_NEMOTRON_ENC_ARCH "nemotron_enc"
 
 /** The family descriptor (nemotron_enc_family.cpp); family.cpp registers it. */
@@ -47,6 +50,7 @@ extern const pulsar_family PULSAR_FAMILY_NEMOTRON_ENC;
 /** The loaded shape.  The geometry is checked field by field against PULSAR_NEMOTRON_ENC_SHAPE_8B; the layer count is
  *  the container's (a mini and the 34-layer model are one profile); the kind is the builder's fact. */
 typedef struct {
+    /// The profile's display name; the boot line prints it.
     const char *name;
     uint32_t n_embd;           ///< hidden_size (4096)
     uint32_t n_vocab;          ///< vocab_size (131072): the embedding rows (every id real)
@@ -66,6 +70,7 @@ typedef struct {
     pulsar_encoder_kind kind;  ///< pulsar.encoder: EMBED or RERANK
 } pulsar_nemotron_enc_shape;
 
+/// The one profile (Nemotron-3.5 Embed / Rerank 8B): the geometry every container must equal.
 extern const pulsar_nemotron_enc_shape PULSAR_NEMOTRON_ENC_SHAPE_8B;
 
 /** Read the shape from the container's keys and check it (nemotron_enc_shape.cpp).  Every refusal is said and counted
@@ -95,10 +100,12 @@ struct pulsar_nemotron_enc_run;
 
 /** The family's state (pulsar_engine::family_state). */
 typedef struct {
+    /// The loaded, checked shape (pulsar_nemotron_enc_read_shape).
     pulsar_nemotron_enc_shape shape;
     pulsar_tensor *embed;        ///< embed [n_vocab rows of n_embd]
     pulsar_tensor *output_norm;  ///< output_norm [n_embd]
     pulsar_tensor *score;        ///< score [n_embd -> 1] (Rerank only)
+    /// The trunk layers; entries [0, shape.n_layer) are bound.
     pulsar_nemotron_enc_layer layer[PULSAR_FAMILY_MAX_LAYER];
     /** The score head widened to f32 at load (Rerank): the host's dot with the pooled row. */
     float *score_f32;
@@ -107,6 +114,7 @@ typedef struct {
     /** The tokenizer: F5's shared BPE engine in its HF configuration (tekken, the U+200C Replace normaliser), loaded
      *  at open from tokenizer.json + config.json beside the container's shards. */
     struct bpe_tokenizer *tok;
+    /// The forward's device state: built by after_gpu (pulsar_nemotron_enc_run_create), freed by unload; NULL before.
     struct pulsar_nemotron_enc_run *run;
 } pulsar_nemotron_enc_model;
 

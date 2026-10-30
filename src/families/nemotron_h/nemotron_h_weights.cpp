@@ -11,24 +11,44 @@
  * (moe.cpp pulsar_moe_arm_up_only: BF16 up + down, N4; EXL3 up + down, the routed front door's up-only form), so a
  * container whose experts no arm runs is refused here, once, not at its first step.  Norms, the conv, dt_bias / A_log
  * / D and the router are read as stored: bf16, the router's selection bias f32. */
+/** @file nemotron_h_weights.cpp
+ *  @brief Nemotron-H's weights: every tensor bound by role, its format admitted and priced; the unselected drafter
+ *  unloaded. */
 #include "nemotron_h.h"
 
 namespace {
 
+/// The binder's and the format checks' owner name.
 const char *const OWNER = PULSAR_NEMOTRON_H_ARCH;
+/// The trunk layers' block name in role keys.
 const char *const LAYERS = "layers";
+/// The MTP module's block name in role keys.
 const char *const MTP = "mtp";
 
+/// Read as stored: bf16 only (norms, the conv, the SSM parameters, the router).
 const pulsar_role_admit A_BF16 = {PULSAR_ROLE_PLAIN(PULSAR_TENSOR_BF16), false, PULSAR_ROLE_DENSE, 0};
+/// Read as stored: f32 only (the router's selection bias).
 const pulsar_role_admit A_F32 = {PULSAR_ROLE_PLAIN(PULSAR_TENSOR_F32), false, PULSAR_ROLE_DENSE, 0};
+/// A dense linear: whatever the registry serves at bf16 rows.
 const pulsar_role_admit A_LINEAR = {0, true, PULSAR_ROLE_DENSE, PULSAR_ACTS(PULSAR_ACT_ROWS_BF16)};
+/// The head: bf16 as stored, or a dense-arm format at bf16 rows.
 const pulsar_role_admit A_HEAD = {PULSAR_ROLE_PLAIN(PULSAR_TENSOR_BF16), true, PULSAR_ROLE_DENSE,
                                   PULSAR_ACTS(PULSAR_ACT_ROWS_BF16)};
+/// The shared expert's linears at bf16 rows.
 const pulsar_role_admit A_SHARED = {0, true, PULSAR_ROLE_SHARED_EXPERT, PULSAR_ACTS(PULSAR_ACT_ROWS_BF16)};
+/// The routed up stack at bf16 rows (admitted as a gate / up stack; the experts have no gate).
 const pulsar_role_admit A_EXP_UP = {0, true, PULSAR_ROLE_EXPERT_GATE_UP, PULSAR_ACTS(PULSAR_ACT_ROWS_BF16)};
+/// The routed down stack at bf16 rows.
 const pulsar_role_admit A_EXP_DOWN = {0, true, PULSAR_ROLE_EXPERT_DOWN, PULSAR_ACTS(PULSAR_ACT_ROWS_BF16)};
 
 /* One pulsar layer: a trunk layer (`layers`, il) or the drafter's (`mtp`, 0).  mamba / moe from the plan. */
+/** @param b      the open binder
+ *  @param s      the shape (widths)
+ *  @param block  the role block name (LAYERS or MTP)
+ *  @param il     the layer index within that block
+ *  @param mamba  bind the Mamba-2 mixer; false = the attention mixer
+ *  @param moe    also bind the latent MoE
+ *  @param L      receives the layer's tensors */
 void bind_block(pulsar_role_binder *b, const pulsar_nemotron_h_shape *s, const char *block, int32_t il, bool mamba,
                 bool moe, pulsar_nemotron_h_block *L) {
     const uint64_t E = s->n_embd;
@@ -75,6 +95,9 @@ void bind_block(pulsar_role_binder *b, const pulsar_nemotron_h_shape *s, const c
 
 }  // namespace
 
+/** @param m  the container
+ *  @param w  the family state: its shape, drafting and block are read; the tensors and the census are written
+ *  @return true = bound; false = refused (said) */
 bool pulsar_nemotron_h_bind(const pulsar_model *m, pulsar_nemotron_h_model *w) {
     const pulsar_nemotron_h_shape *s = &w->shape;
     pulsar_role_binder *b = pulsar_role_binder_open(m, OWNER);

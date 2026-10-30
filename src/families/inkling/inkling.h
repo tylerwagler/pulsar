@@ -29,15 +29,19 @@
  *   in ne order; the short convs [kernel, channels]; routed experts are pulsar.experts stacks [in, out, n_expert],
  *   gate and up apart (the builder de-interleaves the checkpoint's w13; the loader never does).
  */
+/** @file inkling.h
+ *  @brief The Inkling family module's declarations: shape, weights, tokenizer and the family's state. */
 #ifndef PULSAR_FAMILY_INKLING_H
 #define PULSAR_FAMILY_INKLING_H
 
 #include "engine/pulsar_engine_internal.h"
 #include "engine/role_bind.h"
 
+/// The `general.architecture` value this family claims.
 #define PULSAR_INKLING_ARCH "inkling"
 /** The most MTP layers a drafter block can hold (Inkling-Small has 8) and shared experts a MoE layer (2). */
 #define PULSAR_INKLING_MTP_MAX 8u
+/// The most shared experts a MoE layer can hold (Inkling-Small: 2).
 #define PULSAR_INKLING_SHARED_MAX 2u
 /** The hmlp tower's linears (Inkling-Small: 4). */
 #define PULSAR_INKLING_VISION_MAX 4u
@@ -52,6 +56,7 @@ extern const pulsar_family PULSAR_FAMILY_INKLING;
  *  facts -- how many layers, which are windowed, which are dense, the drafter's -- are the container's (the 3-layer
  *  mini and the 42-layer model are one profile). */
 typedef struct {
+    /// The profile's display name ("Inkling-Small"); the boot line and model_name print it.
     const char *name;
     /* geometry: pinned */
     uint32_t n_embd;           ///< hidden_size (4096)
@@ -101,6 +106,7 @@ typedef struct {
     bool vision_written;       ///< pulsar.vision_present: the container holds the tower
 } pulsar_inkling_shape;
 
+/// The one profile (Inkling-Small): the geometry every container must equal, and the tower's widths.
 extern const pulsar_inkling_shape PULSAR_INKLING_SHAPE_SMALL;
 
 /** Read the shape from the container's keys and check it (inkling_shape.cpp).  Every refusal is said and counted
@@ -146,6 +152,7 @@ typedef struct {
 
 /** One MTP layer: a dense block plus its input side. */
 typedef struct {
+    /// The drafter layer's transformer block, bound under `mtp` index n (always the dense MLP).
     pulsar_inkling_block block;
     pulsar_tensor *embed_norm;       ///< draft_embed_norm [n_embd]
     pulsar_tensor *hidden_norm;      ///< draft_hidden_norm [n_embd]
@@ -154,12 +161,15 @@ typedef struct {
 
 /** The family's state (pulsar_engine::family_state). */
 typedef struct {
+    /// The loaded, checked shape (pulsar_inkling_read_shape) every bind and forward reads.
     pulsar_inkling_shape shape;
     pulsar_tensor *embed;            ///< embed [n_vocab rows of n_embd]
     pulsar_tensor *embed_norm;       ///< embed_norm [n_embd]
     pulsar_tensor *output_norm;      ///< output_norm [n_embd]
     pulsar_tensor *head;             ///< head [n_embd -> n_vocab] (untied)
+    /// The trunk blocks; entries [0, shape.n_layer) are bound, the rest stay zero.
     pulsar_inkling_block layer[PULSAR_FAMILY_MAX_LAYER];
+    /// The drafter's chained layers; entries [0, shape.n_mtp) are bound when shape.mtp_written, else all NULL.
     pulsar_inkling_draft_layer mtp[PULSAR_INKLING_MTP_MAX];
     pulsar_tensor *vis_linear[PULSAR_INKLING_VISION_MAX];     ///< vision_linear, index i
     pulsar_tensor *vis_norm[PULSAR_INKLING_VISION_MAX - 1];   ///< vision_norm, index i (between linears)
@@ -183,6 +193,8 @@ bool pulsar_inkling_load_tokenizer(pulsar_inkling_model *w, const char *model_pa
 bool pulsar_inkling_bind(const pulsar_model *m, pulsar_inkling_model *w);
 
 /** The loaded family's state, or NULL on another family's engine. */
+/** @param e  any engine (NULL allowed)
+ *  @return the Inkling state, or NULL */
 static inline const pulsar_inkling_model *pulsar_inkling_of(const pulsar_engine *e) {
     return e && e->family && e->family->id == PULSAR_FAMILY_ID_INKLING ? (const pulsar_inkling_model *)e->family_state
                                                                        : NULL;

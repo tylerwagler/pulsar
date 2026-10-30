@@ -1,27 +1,39 @@
 /* inkling_family.cpp -- the Inkling family's descriptor (family.h): load, the engine facts, and the session
  * entries, which refuse by name until the forward is wired (inkling.h). */
+/** @file inkling_family.cpp
+ *  @brief The Inkling family descriptor: load, the engine facts, and session entries that refuse until the forward is
+ *  wired. */
 #include "inkling.h"
 #include "engine/exl3_trellis.h"
 #include "lib/bpe_tokenizer.h"
 
 namespace {
 
+/// The architecture name every refusal and announce line is prefixed with.
 const char *const ARCH = PULSAR_INKLING_ARCH;
 
 /* What a session needs that is not built yet, named once for every entry that refuses for it.  The core pieces are
  * in (F4 the row-step driver, F3 the state kinds, F1 attention, F2 router, E3 SConv, E5 head); Inkling's use of them is
  * not: its pulsar_driver_ops (block[PULSAR_LAYER_BLOCKS] composing desc[il] from those blocks, embed, head) and its
  * state declaration.  pulsar_family::driver stays NULL until then. */
+/// The one reason every session entry refuses with, until Inkling's driver blocks exist.
 const char *const NOT_WIRED =
     "forward not yet wired: Inkling's driver blocks (pulsar_family::driver -- block[PULSAR_LAYER_BLOCKS] over F1 "
     "attention, F2 router, E3 SConv, E5 head on the core row-step driver) and its state declaration (F3 kinds)";
 
+/** pulsar_family::unload: free the tokenizer and the family state load allocated (safe after a partial load).
+ *  @param e  the engine; its family_state is freed and set to NULL */
 void unload(pulsar_engine *e) {
     if (e->family_state) bpe_tokenizer_free(((pulsar_inkling_model *)e->family_state)->tok);
     free(e->family_state);
     e->family_state = NULL;
 }
 
+/** pulsar_family::load: refuse other families' options, then read the shape and plan, scan the artifact, bind and
+ *  price every tensor, and load the tokenizer beside the shards.
+ *  @param e    the engine; family_state and plan are written (family_state even on failure, for unload)
+ *  @param opt  the open options (model_path locates the tokenizer files)
+ *  @return true = loaded; false = refused (said, and counted through pulsar_load_refuse) */
 bool load(pulsar_engine *e, const pulsar_engine_options *opt) {
     /* the options that name another family's feature refuse here, by name, rather than being ignored */
     if (opt->drafter && opt->drafter[0]) {
@@ -83,26 +95,51 @@ bool load(pulsar_engine *e, const pulsar_engine_options *opt) {
     return true;
 }
 
+/** pulsar_family::after_gpu: nothing to register on the device; announces that every session refuses.
+ *  @return always true */
 bool after_gpu(pulsar_engine *) {
     fprintf(stderr, "pulsar: %s: %s -- every session refuses\n", ARCH, NOT_WIRED);
     return true;
 }
 
+/** The engine's family state as Inkling's (no family check: only this family's hooks call it).
+ *  @param e  an engine this family loaded
+ *  @return its pulsar_inkling_model */
 const pulsar_inkling_model *model_of(const pulsar_engine *e) { return (const pulsar_inkling_model *)e->family_state; }
 
+/** pulsar_family::logits_width.
+ *  @param e  the engine
+ *  @return n_vocab (201024): the padded head width, not the tokenizer's table */
 uint32_t logits_width(const pulsar_engine *e) { return model_of(e)->shape.n_vocab; }
+/** pulsar_family::model_name.
+ *  @param e  the engine
+ *  @return the shape's profile name (static) */
 const char *model_name(const pulsar_engine *e) { return model_of(e)->shape.name; }
+/** pulsar_family::served_model_id.
+ *  @return "inkling-small" (static) */
 const char *served_model_id(const pulsar_engine *) { return "inkling-small"; }
 /* F5's renderer (src/lib/inkling_chat.h): the engine's chat front (inkling_tokenizer.cpp) and the server's family
  * table (src/server/family_inkling.cpp) */
+/** pulsar_family::chat_format.
+ *  @return PULSAR_CHAT_INKLING */
 pulsar_chat_format chat_format(const pulsar_engine *) { return PULSAR_CHAT_INKLING; }
 /* Disk-KV compatibility id: 0 and 1 are DeepSeek's profiles, 2 Qwen's. */
+/** pulsar_family::model_id.
+ *  @return 3, the disk-KV compatibility id */
 int model_id(const pulsar_engine *) { return 3; }
 /* positions: no RoPE; the log-scaled global attention is trained to model_max_length */
+/** pulsar_family::trained_context.
+ *  @param e  the engine
+ *  @return the shape's max_context, in tokens */
 uint64_t trained_context(const pulsar_engine *e) { return model_of(e)->shape.max_context; }
 /* the MTP layers are bound when written, but no drafter runs on them until F6 (the chained-MTP drafter) */
+/** pulsar_family::drafter.
+ *  @return PULSAR_DRAFTER_NONE */
 pulsar_drafter_kind drafter(pulsar_engine *) { return PULSAR_DRAFTER_NONE; }
 /* the routed experts' tier in EXL3's value space (family.h quant_bits): 20 + the highest rate in half bits */
+/** pulsar_family::quant_bits: the highest EXL3 rate over the routed expert stacks.
+ *  @param e  the engine
+ *  @return 20 + K in half bits for EXL3 experts; 0 when no stack is EXL3 (BF16 experts, or no MoE layer) */
 int quant_bits(pulsar_engine *e) {
     const pulsar_inkling_model *w = model_of(e);
     int bits = 0;
@@ -116,24 +153,43 @@ int quant_bits(pulsar_engine *e) {
 
 /* ---- the session: refused by name until the driver blocks -------------------------------------------------------------------- */
 
+/** pulsar_family_session_ops::create: refuses (NOT_WIRED).
+ *  @return always 1 (refused) */
 int session_create(pulsar_session *, uint32_t) {
     fprintf(stderr, "pulsar: %s: %s -- refusing the session\n", ARCH, NOT_WIRED);
     return 1;
 }
 /* create refuses, so no session of this family exists to destroy, sync or step; the step entries say why anyway */
+/** The step entries' shared refusal.
+ *  @param err     receives "<arch>: NOT_WIRED" when non-NULL
+ *  @param errlen  err's capacity in bytes
+ *  @return always -1 */
 int step_refused(char *err, size_t errlen) {
     if (err) snprintf(err, errlen, "%s: %s", ARCH, NOT_WIRED);
     return -1;
 }
+/** pulsar_family_session_ops::eval_row: refuses (no session can exist).
+ *  @param err     the refusal text
+ *  @param errlen  err's capacity in bytes
+ *  @return always -1 */
 int eval_row(pulsar_session *, int, char *err, size_t errlen) { return step_refused(err, errlen); }
+/** pulsar_family_session_ops::decode_multiseq: refuses (no session can exist).
+ *  @param err     the refusal text
+ *  @param errlen  err's capacity in bytes
+ *  @return always -1 */
 int decode_multiseq(pulsar_session *, const pulsar_multiseq_req *, uint32_t, float *, int, char *err, size_t errlen) {
     return step_refused(err, errlen);
 }
+/** pulsar_family_session_ops::decode_mixed: refuses (no session can exist).
+ *  @param err     the refusal text
+ *  @param errlen  err's capacity in bytes
+ *  @return always -1 */
 int decode_mixed(pulsar_session *, const pulsar_multiseq_req *, uint32_t, float *, int, uint32_t *, uint32_t, char *err,
                  size_t errlen) {
     return step_refused(err, errlen);
 }
 
+/// The session table: create refuses, so the step entries only ever say why.
 const pulsar_family_session_ops k_session_ops = {
     /* .create          = */ session_create,
     /* .destroy         = */ NULL,   /* no session is ever built (create refuses) */
@@ -149,6 +205,7 @@ const pulsar_family_session_ops k_session_ops = {
 /* The bank pool: every hook takes a session, and none can exist (create refuses); the family declares no CAP_BANKS,
  * so the engine-level price (pulsar_engine_demand_paged_bytes_per_bank) refuses by name before it would ask.  F3's
  * declared state kinds give the core what it derives these from. */
+/// The bank table: every hook NULL (no session exists to bank; no CAP_BANKS).
 const pulsar_family_bank_ops k_bank_ops = {};
 
 }  // namespace

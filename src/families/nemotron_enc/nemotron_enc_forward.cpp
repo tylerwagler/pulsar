@@ -25,6 +25,8 @@
  * ramp and the blend in f32 (torch) -- evaluated once on the host; the kernel's angle is pos * inv_freq in f32, cos and
  * sin rounded to bf16 (F1's rope contract).  The attention factor is exactly 1 (the shape pins mscale =
  * mscale_all_dim = 1), and the llama-4 q scale is exactly 1 below position 16384 (the input cap). */
+/** @file nemotron_enc_forward.cpp
+ *  @brief The Nemotron-3.5 encoders' bidirectional forward, mean pool and the encoder entries. */
 #include "nemotron_enc.h"
 #include "lib/bpe_tokenizer.h"
 #include "lib/pulsar_yarn.h"
@@ -43,6 +45,7 @@
 
 namespace {
 
+/// The architecture name every refusal is prefixed with.
 const char *const ARCH = PULSAR_NEMOTRON_ENC_ARCH;
 /** Rows a linear launch carries (the f32 staging is sized by it). */
 constexpr uint32_t NE_CHUNK = 2048;
@@ -55,8 +58,11 @@ const char ZWNJ[] = "\xe2\x80\x8c";
  * one GPU, one forward at a time (the group's GPU phase lock), so they share one set of buffers -- each sized to the
  * largest member's need.  A packed forward is self-contained: it writes every buffer it reads, and its pooled rows are
  * read back before the lock goes. */
+/** The scratch buffers, an index into ne_scratch::t / ::bytes (shapes on ne_scratch::t); B_COUNT counts them. */
 enum ne_buf { B_IDS, B_H, B_XN, B_Q, B_K, B_V, B_A, B_G, B_U, B_S, B_DELTA, B_STAGE, B_LWS, B_AWS, B_POOLED, B_COUNT };
 
+/** The process's forward scratch: one set of device buffers every encoder engine of the process shares, each grown to
+ *  the largest member's need (pulsar_nemotron_enc_run_create) and freed with the last member (run_free). */
 struct ne_scratch {
     uint32_t refs;                       ///< the engines sharing it
     pulsar_gpu_tensor *t[B_COUNT];       ///< ids i32 [rows]; h, xn bf16 [rows][n_embd]; q, k, v, a bf16 [rows][heads *
@@ -64,14 +70,19 @@ struct ne_scratch {
                                          ///< stage f32 [NE_CHUNK][2 n_ff] (a multi launch's staging, the widest: gate
                                          ///< | up); the linears' workspace at NE_CHUNK rows; the attention's at `rows`;
                                          ///< pooled f32 [NE_SEQS_MAX][n_embd]
+    /// Each buffer's allocated size in bytes (0 = not allocated)
     uint64_t bytes[B_COUNT];
 };
 
+/// The process's one scratch, created by the first run_create and freed (NULL again) by the last run_free.
 ne_scratch *g_scratch;
 
 }  // namespace
 
+/** The forward's device state (one per encoder engine): the attention declaration, the rope table, and a reference on
+ *  the process's scratch. */
 struct pulsar_nemotron_enc_run {
+    /// The attention declaration: full span, one block per run (bidirectional), bf16 KV, YaRN rope from `rope`.
     pulsar_gqa_layer attn;
     uint32_t rows;                 ///< rows one forward carries: the shape's input cap
     pulsar_gpu_tensor *rope;       ///< f32 [head_dim / 2]: the YaRN inverse frequencies
@@ -80,17 +91,31 @@ struct pulsar_nemotron_enc_run {
 
 namespace {
 
+/** The engine's family state as the encoder's (no family check: only this family's hooks call it).
+ *  @param e  an engine this family loaded
+ *  @return its pulsar_nemotron_enc_model */
 pulsar_nemotron_enc_model *W(const pulsar_engine *e) { return (pulsar_nemotron_enc_model *)e->family_state; }
 
+/** A device tensor's base pointer, typed.
+ *  @tparam T  the element type
+ *  @param t   the tensor
+ *  @return its device address as T* */
 template <class T = void>
 T *dp(const pulsar_gpu_tensor *t) { return (T *)pulsar_gpu_tensor_device_ptr(t); }
 
+/** Say a forward or entry refusal into `err`.
+ *  @param err     receives "<arch>: <what>" when non-NULL
+ *  @param errlen  err's capacity in bytes
+ *  @param what    the reason
+ *  @return always false */
 bool fail(char *err, size_t errlen, const char *what) {
     if (err) snprintf(err, errlen, "%s: %s", ARCH, what);
     return false;
 }
 
 /* transformers' YaRN inverse frequencies for the pinned shape (see the file comment) */
+/** @param s  the shape (head_dim, rope_theta, rope_factor, rope_orig_ctx, beta_fast / beta_slow)
+ *  @return the head_dim / 2 inverse frequencies, f32 */
 std::vector<float> yarn_inv_freq(const pulsar_nemotron_enc_shape &s) {
     const uint32_t dim = s.head_dim, half = dim / 2u;
     double low = 0, high = 0;
@@ -107,6 +132,17 @@ std::vector<float> yarn_inv_freq(const pulsar_nemotron_enc_shape &s) {
 }
 
 /* n (1..3) linears of the same bf16 input x [rows][in] -> their bf16 rows yb[j] [rows][out[j]], on the prompt arms */
+/** @param e     the engine (the model the weights live in)
+ *  @param r     the run (its scratch's f32 stage and linear workspace)
+ *  @param n     the number of linears, 1..3
+ *  @param t     the n weight tensors
+ *  @param in    the input width (columns of x)
+ *  @param out   the n output widths
+ *  @param what  the n names a refusal reports
+ *  @param x     the bf16 input rows, [rows][in]
+ *  @param rows  the row count (at most NE_CHUNK: the stage is sized for it)
+ *  @param yb    the n bf16 outputs, yb[j] [rows][out[j]]
+ *  @return true = launched; false = a weight refused or the launch failed */
 bool linears(const pulsar_engine *e, const pulsar_nemotron_enc_run *r, int n, const pulsar_tensor *const *t, int in,
              const int *out, const char *const *what, const uint16_t *x, uint32_t rows, uint16_t *const *yb) {
     pulsar_rows_linear l[3];
@@ -124,6 +160,13 @@ bool linears(const pulsar_engine *e, const pulsar_nemotron_enc_run *r, int n, co
 }
 
 /* One forward over inputs [0, n): their pooled rows into the scratch's B_POOLED.  `rows` = the inputs' total length. */
+/** @param e       the engine
+ *  @param in      the n inputs' token ids
+ *  @param n       the input count (at most NE_SEQS_MAX)
+ *  @param rows    the inputs' total length in tokens (at most the run's rows)
+ *  @param err     the refusal text
+ *  @param errlen  err's capacity in bytes
+ *  @return true = the pooled rows are in B_POOLED (f32 [n][n_embd]); false = refused (err says why) */
 bool forward(pulsar_engine *e, const pulsar_tokens *in, uint32_t n, uint32_t rows, char *err, size_t errlen) {
     pulsar_nemotron_enc_model *w = W(e);
     pulsar_nemotron_enc_run *r = w->run;
@@ -217,11 +260,23 @@ bool forward(pulsar_engine *e, const pulsar_tokens *in, uint32_t n, uint32_t row
 
 /* ---- the entries ------------------------------------------------------------------------------------------------- */
 
+/** pulsar_family_encoder::kind.
+ *  @param e  the engine
+ *  @return EMBED or RERANK, the container's pulsar.encoder */
 pulsar_encoder_kind kind(const pulsar_engine *e) { return W(e)->shape.kind; }
+/** pulsar_family_encoder::dim: the floats encode writes per input.
+ *  @param e  the engine
+ *  @return n_embd for Embed, 1 for Rerank */
 uint32_t dim(const pulsar_engine *e) { return W(e)->shape.kind == PULSAR_ENCODER_EMBED ? W(e)->shape.n_embd : 1u; }
+/** pulsar_family_encoder::max_tokens.
+ *  @param e  the engine
+ *  @return the longest input in tokens: rope_orig_ctx (16384) */
 uint32_t max_tokens(const pulsar_engine *e) { return W(e)->shape.rope_orig_ctx; }
 
 /* client text, as the template writes it: a U+200C after every '[' and '<' -- and a span over it */
+/** @param out    the rendered text, appended to
+ *  @param spans  receives the byte range of the appended client text (ZWNJs included)
+ *  @param text   the client text, NUL-terminated */
 void mark(std::string *out, std::vector<pulsar_text_span> *spans, const char *text) {
     const uint32_t lo = (uint32_t)out->size();
     for (const char *p = text; *p; p++) {
@@ -231,6 +286,15 @@ void mark(std::string *out, std::vector<pulsar_text_span> *spans, const char *te
     spans->push_back({lo, (uint32_t)out->size()});
 }
 
+/** pulsar_family_encoder::render: the template's text for one input, tokenized with its client spans.
+ *  @param e       the engine
+ *  @param role    QUERY or PASSAGE for Embed; PAIR for Rerank (any other combination refuses)
+ *  @param text    the query or passage text
+ *  @param doc     the document (PAIR only)
+ *  @param out     the ids are appended here
+ *  @param err     the refusal text
+ *  @param errlen  err's capacity in bytes
+ *  @return true = rendered; false = refused */
 bool render(pulsar_engine *e, pulsar_encode_role role, const char *text, const char *doc, pulsar_tokens *out,
             char *err, size_t errlen) {
     const pulsar_encoder_kind k = W(e)->shape.kind;
@@ -260,6 +324,14 @@ bool render(pulsar_engine *e, pulsar_encode_role role, const char *text, const c
     return true;
 }
 
+/** pulsar_family_encoder::encode: the inputs packed in order into forwards, then finished on the host.
+ *  @param e       the engine
+ *  @param in      the n rendered inputs, each 1 .. max_tokens tokens
+ *  @param n       the input count
+ *  @param out     f32 [n][dim]: Embed's L2-normalised vectors, or Rerank's scores
+ *  @param err     the refusal text
+ *  @param errlen  err's capacity in bytes
+ *  @return 0 = encoded; -1 = refused (err says why) */
 int encode(pulsar_engine *e, const pulsar_tokens *in, uint32_t n, float *out, char *err, size_t errlen) {
     pulsar_nemotron_enc_model *w = W(e);
     pulsar_nemotron_enc_run *r = w->run;
@@ -311,6 +383,9 @@ const pulsar_family_encoder PULSAR_NEMOTRON_ENC_ENCODER = {
     /* .encode     = */ encode,
 };
 
+/** Free the run and drop its reference on the process's scratch (the last reference frees the scratch).  Safe on a
+ *  NULL `w` or a NULL run.
+ *  @param w  the family state; its run is set to NULL */
 void pulsar_nemotron_enc_run_free(pulsar_nemotron_enc_model *w) {
     pulsar_nemotron_enc_run *r = w ? w->run : NULL;
     if (!r) return;
@@ -324,6 +399,8 @@ void pulsar_nemotron_enc_run_free(pulsar_nemotron_enc_model *w) {
     w->run = NULL;
 }
 
+/** @param e  the engine; its family state's run is written (kept for unload even on failure)
+ *  @return true = built; false = refused (said) */
 bool pulsar_nemotron_enc_run_create(pulsar_engine *e) {
     pulsar_nemotron_enc_model *w = W(e);
     const pulsar_nemotron_enc_shape &s = w->shape;

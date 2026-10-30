@@ -1,13 +1,20 @@
 /* nemotron_h_family.cpp -- the Nemotron-H family's descriptor (family.h): load, the engine facts, and the session --
  * the core row-step driver over the family's blocks (nemotron_h_forward.cpp) and its declared state (state_kinds.h). */
+/** @file nemotron_h_family.cpp
+ *  @brief The Nemotron-H family descriptor: load (drafter selection included), the engine facts and the driver's
+ *  session. */
 #include "nemotron_h.h"
 #include "engine/exl3_trellis.h"
 #include "lib/bpe_tokenizer.h"
 
 namespace {
 
+/// The architecture name every refusal and announce line is prefixed with.
 const char *const ARCH = PULSAR_NEMOTRON_H_ARCH;
 
+/** pulsar_family::unload: free the tokenizer, the block drafter's record and the family state, and clear the engine's
+ *  block-drafter pointer (safe after a partial load).
+ *  @param e  the engine; its family_state is freed and set to NULL */
 void unload(pulsar_engine *e) {
     if (e->family_state) {
         bpe_tokenizer_free(((pulsar_nemotron_h_model *)e->family_state)->tok);
@@ -18,6 +25,12 @@ void unload(pulsar_engine *e) {
     e->family_state = NULL;
 }
 
+/** pulsar_family::load: refuse other families' options, read the shape and plan, select the drafter (MTP, LiLiCorr or
+ *  none) from those the container holds and --drafter, scan the artifact, bind and price every tensor, load the
+ *  tokenizer, then declare the session's state and digest the artifact for its disk segments.
+ *  @param e    the engine; family_state, plan, state_plan, drafter_ops and block_drafter are written
+ *  @param opt  the open options (drafter, dspark_disable, model_path)
+ *  @return true = loaded; false = refused (said) */
 bool load(pulsar_engine *e, const pulsar_engine_options *opt) {
     /* the options that name another family's feature refuse here, by name, rather than being ignored */
     if (opt->expert_overlay && opt->expert_overlay[0]) {
@@ -149,6 +162,8 @@ bool load(pulsar_engine *e, const pulsar_engine_options *opt) {
 
 /* The lane, announced once at open (rule 5): the core driver over the family's blocks, and what its table lacks for
  * the plan (a session refuses with exactly that). */
+/** @param e  the engine
+ *  @return always true (a missing block is said here and refused by the session) */
 bool after_gpu(pulsar_engine *e) {
     uint32_t at = 0;
     const char *miss = pulsar_driver_first_missing(e->family->driver, &e->plan, &at);
@@ -165,24 +180,48 @@ bool after_gpu(pulsar_engine *e) {
     return true;
 }
 
+/** The engine's family state as Nemotron-H's (no family check: only this family's hooks call it).
+ *  @param e  an engine this family loaded
+ *  @return its pulsar_nemotron_h_model */
 const pulsar_nemotron_h_model *model_of(const pulsar_engine *e) { return (const pulsar_nemotron_h_model *)e->family_state; }
 
+/** pulsar_family::logits_width.
+ *  @param e  the engine
+ *  @return n_vocab (131072: every id real) */
 uint32_t logits_width(const pulsar_engine *e) { return model_of(e)->shape.n_vocab; }
+/** pulsar_family::model_name.
+ *  @param e  the engine
+ *  @return the shape's profile name (static) */
 const char *model_name(const pulsar_engine *e) { return model_of(e)->shape.name; }
+/** pulsar_family::served_model_id.
+ *  @return "nemotron-3.5-super" (static) */
 const char *served_model_id(const pulsar_engine *) { return "nemotron-3.5-super"; }
 /* the ChatML + <think> renderer (src/lib/nemotron_chat.h): the engine's chat front (nemotron_h_tokenizer.cpp) and the
  * server's family table (src/server/family_nemotron_h.cpp) */
+/** pulsar_family::chat_format.
+ *  @return PULSAR_CHAT_NEMOTRON_H */
 pulsar_chat_format chat_format(const pulsar_engine *) { return PULSAR_CHAT_NEMOTRON_H; }
 /* Disk-KV compatibility id: 0 and 1 are DeepSeek's profiles, 2 Qwen's, 3 Inkling's. */
+/** pulsar_family::model_id.
+ *  @return 4 */
 int model_id(const pulsar_engine *) { return 4; }
 /* no positional encoding: the attention layers are trained to max_position_embeddings; the Mamba state is O(1) */
+/** pulsar_family::trained_context.
+ *  @param e  the engine
+ *  @return the shape's max_context (max_position_embeddings), in tokens */
 uint64_t trained_context(const pulsar_engine *e) { return model_of(e)->shape.max_context; }
 /* N9: the MTP module drafts (the chained-MTP drafter, spec_mtp.h) when the container holds it */
+/** pulsar_family::drafter.
+ *  @param e  the engine
+ *  @return MTP when the module drafts, BLOCK when LiLiCorr does, else NONE */
 pulsar_drafter_kind drafter(pulsar_engine *e) {
     return model_of(e)->drafting ? PULSAR_DRAFTER_MTP : model_of(e)->block ? PULSAR_DRAFTER_BLOCK : PULSAR_DRAFTER_NONE;
 }
 /* the routed experts' tier in EXL3's value space (family.h quant_bits): 20 + the highest rate in half bits, 0 when
  * they are not EXL3 (BF16 today) */
+/** pulsar_family::quant_bits: the highest EXL3 rate over the routed up / down stacks.
+ *  @param e  the engine
+ *  @return 20 + K in half bits, or 0 when the experts are not EXL3 */
 int quant_bits(pulsar_engine *e) {
     const pulsar_nemotron_h_model *w = model_of(e);
     int bits = 0;
@@ -196,7 +235,9 @@ int quant_bits(pulsar_engine *e) {
 
 /* ---- the session: the core row-step driver (step_driver.cpp) over the family's ops (nemotron_h_forward.cpp) ----- */
 
+/// The session's sync: the core driver's, over the declared state.
 const pulsar_sync_ops k_sync = PULSAR_DRIVER_SYNC_OPS(PULSAR_NEMOTRON_H_ARCH);
+/// The session table: the core row-step driver's ops (step_driver.cpp) over k_sync.
 const pulsar_family_session_ops k_session_ops = PULSAR_DRIVER_SESSION_OPS(&k_sync);
 
 }  // namespace

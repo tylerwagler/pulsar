@@ -6,6 +6,8 @@
  * q / k / v / o, gate / up / down -- takes what the registry serves a dense linear at bf16 rows (an EXL3 dense-arm
  * rate, BF16; a device without the format refuses at open, L321 S0c).  Norms and the embedding are read as stored,
  * bf16; the Reranker's score head too, widened here to f32 once for the host's dot. */
+/** @file nemotron_enc_weights.cpp
+ *  @brief The Nemotron-3.5 encoders' weights bound by role, the score head widened, and the tokenizer load. */
 #include "nemotron_enc.h"
 #include "lib/bpe_tokenizer.h"
 
@@ -17,12 +19,20 @@
 
 namespace {
 
+/// The binder's owner name and every refusal's prefix.
 const char *const OWNER = PULSAR_NEMOTRON_ENC_ARCH;
+/// The trunk layers' block name in role keys.
 const char *const LAYERS = "layers";
 
+/// Read as stored: bf16 only (norms, the embedding, the score head).
 const pulsar_role_admit A_BF16 = {PULSAR_ROLE_PLAIN(PULSAR_TENSOR_BF16), false, PULSAR_ROLE_DENSE, 0};
+/// A dense linear: whatever the registry serves at bf16 rows.
 const pulsar_role_admit A_LINEAR = {0, true, PULSAR_ROLE_DENSE, PULSAR_ACTS(PULSAR_ACT_ROWS_BF16)};
 
+/** Read a whole file.
+ *  @param path  the file
+ *  @param out   receives its bytes (cleared first)
+ *  @return false when the file cannot be opened or a read fails */
 bool read_text(const std::string &path, std::string *out) {
     FILE *f = fopen(path.c_str(), "rb");
     if (!f) return false;
@@ -35,6 +45,11 @@ bool read_text(const std::string &path, std::string *out) {
     return ok;
 }
 
+/** Tokenize raw text with no client spans (the tokenizer's self-check).
+ *  @param t     the tokenizer
+ *  @param text  NUL-terminated UTF-8
+ *  @param ids   receives the ids (cleared first)
+ *  @return the tokenizer's verdict (false = refused) */
 bool encode(const bpe_tokenizer *t, const char *text, std::vector<int> *ids) {
     char err[128];
     ids->clear();
@@ -43,6 +58,9 @@ bool encode(const bpe_tokenizer *t, const char *text, std::vector<int> *ids) {
 
 }  // namespace
 
+/** @param m  the container
+ *  @param w  the family state: its shape is read; the tensors, the census and (Rerank) score_f32 are written
+ *  @return true = bound; false = refused (said) */
 bool pulsar_nemotron_enc_bind(const pulsar_model *m, pulsar_nemotron_enc_model *w) {
     const pulsar_nemotron_enc_shape *s = &w->shape;
     pulsar_role_binder *b = pulsar_role_binder_open(m, OWNER);
@@ -78,6 +96,9 @@ bool pulsar_nemotron_enc_bind(const pulsar_model *m, pulsar_nemotron_enc_model *
     return true;
 }
 
+/** @param w           the family state: its shape is read; tok is written
+ *  @param model_path  the container's directory, or a shard path inside it
+ *  @return true = loaded and checked (tekken, the U+200C normaliser, n_vocab ids); false = refused (said) */
 bool pulsar_nemotron_enc_load_tokenizer(pulsar_nemotron_enc_model *w, const char *model_path) {
     std::string dir = model_path ? model_path : "";
     struct stat st;
