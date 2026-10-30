@@ -11546,6 +11546,18 @@ static void test_l334_none_fails_closed(void) {
     TEST_ASSERT(!l334_aborts([&] { sink = (int)pulsar_kv_rows(TokCount{0}).raw(); }));
 }
 
+/* L334 tidy: the scheduler reads a bank that holds no history as an empty one (server_bank_pos), and a live
+ * continuation's resume is its kept prefix -- one currency with the tokens it serves; a prefix past the live history
+ * fails closed. */
+static void test_l334_server_positions(void) {
+    TEST_ASSERT(pulsar_session_bank_pos(NULL, 0).is_none() && server_bank_pos(NULL, 0) == TokPos{0});
+    TEST_ASSERT(server_live_continuation_start(TokCount{0}, TokPos{0}) == TokPos{0});
+    TEST_ASSERT(server_live_continuation_start(TokCount{389}, TokPos{390}) == TokPos{389});   /* a dropped stop */
+    TEST_ASSERT(server_live_continuation_start(TokCount{390}, TokPos{390}) == TokPos{390});
+    TEST_ASSERT(l334_aborts([&] { l334_sink = server_live_continuation_start(TokCount{391}, TokPos{390}).raw(); }));
+    TEST_ASSERT(l334_aborts([&] { l334_sink = server_live_continuation_start(TokCount{-1}, TokPos{390}).raw(); }));
+}
+
 /* L334 fix: a toy vocabulary for the seam walks -- id i spells l334_vocab[i] ("" = a control token). */
 static const char *const l334_vocab[] = {"<ctl>", "X", "a", "b", "c", "d", "ab", "abc", "bc", "cd", "bcd", "Y", "Z"};
 enum { L334_CTL, L334_X, L334_A, L334_B, L334_C, L334_D, L334_AB, L334_ABC, L334_BC, L334_CD, L334_BCD, L334_Y,
@@ -11604,6 +11616,7 @@ static void pulsar_server_unit_tests_run(void) {
     test_l334_seam_currencies();
     test_l334_positions_are_ints();
     test_l334_none_fails_closed();
+    test_l334_server_positions();
     test_l334_prompt_held_across_a_seam();
     test_mem_floor_is_derived_from_the_watermarks();
     test_guard_budget_reads_live_memavailable();

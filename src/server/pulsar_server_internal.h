@@ -2772,9 +2772,10 @@ typedef struct gen_resolution {
     const pulsar_tokens *prompt_for_sync;   ///< &j->req.prompt or &g->effective_prompt
     int cached;                             ///< tokens the bank serves the prompt from (the request's: the cache read)
     /** L334: where the sync's computed rows start on the prompt it runs (the prefill watermark, the progress line's
-     *  start): `cached` except across a token seam, where the bank's own resume and an adopt start at a live-side
-     *  position that holds fewer of the request's tokens */
-    int resumed_at;
+     *  start): a live continuation's and a disk chain's end are `cached` itself (server_live_continuation_start);
+     *  across a token seam the bank's own resume and an adopt start at a live-side position that holds fewer of the
+     *  request's tokens */
+    TokPos resumed_at;
     const char *cache_source;               ///< which layer served them (the trace's and the log's word)
     int disk_cached;                        ///< ... of which a disk chain loaded
     bool responses_live_continuation;       ///< a live Responses continuation (the effective prompt is its)
@@ -3710,6 +3711,22 @@ uint64_t server_reconciled_session_cost(int slot_idx, int ctx,
  * leaking budget forever) if the pairing ever underflows (defined in
  * generate.cpp; unit-tested in cli_main.cpp). */
 uint64_t server_ledger_release(uint64_t committed_total, uint64_t slot_cost);
+/** L334: a bank's position for the scheduler -- pulsar_session_bank_pos, where a bank that holds no history (never
+ *  populated or invalidated; or outside the pool, which the engine refuses by name) stands at position 0: nothing
+ *  of it is reused, so routing, metrics, the prefix waits, the prefill bounds and the committed frontier read it as
+ *  an empty bank.
+ *  @param s the pool session
+ *  @param bank the bank */
+inline TokPos server_bank_pos(pulsar_session *s, uint32_t bank) {
+    const TokPos p = pulsar_session_bank_pos(s, bank);
+    return p.is_none() ? TokPos{0} : p;
+}
+/** L334: where a live continuation's sync starts computing -- its common prefix with the live history (the tokens
+ *  the continuation keeps), a position on that history and the same number as the tokens it serves.  A prefix
+ *  longer than the history (`live_pos`) is no prefix of it: fatal (the two currencies parted).
+ *  @param common the continuation's kept tokens
+ *  @param live_pos the live history's end */
+TokPos server_live_continuation_start(TokCount common, TokPos live_pos);
 /* Tier-2 bank-aware frontier position of `sl`, correct whether or not sl->bank
  * is the currently-installed bank of the shared pool session (a non-live bank
  * reads its saved host carry via pulsar_session_bank_pos; the live bank reads the

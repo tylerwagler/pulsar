@@ -1207,7 +1207,20 @@ bool pulsar_session_bank_alloc_physical(pulsar_session *s, uint32_t bank) {
     PULSAR_FAMILY_REQUIRES_S(s, PULSAR_FAMILY_CAP_BANKS, "bank residency", false);
     return s ? tp_mirror_bank_physical(s, 0, bank) : false;
 }
-TokPos pulsar_session_bank_pos(pulsar_session *s, uint32_t bank) { PULSAR_FAMILY_REQUIRES_S(s, PULSAR_FAMILY_CAP_BANKS, "per-bank state", TokPos{0}); const pulsar_tokens *t = pulsar_bank_history(s, bank); return TokPos{t ? t->len : 0}; }
+TokPos pulsar_bank_pos_of(uint32_t bank, uint32_t n_banks, const pulsar_tokens *history) {
+    if (bank >= n_banks) {
+        static bool said = false;   /* once (rule 9): the caller keeps its none() every time */
+        if (!said) fprintf(stderr, "pulsar: bank_pos of bank %u, outside the pool of %u -- refusing\n", bank, n_banks);
+        said = true;
+        return TokPos::none();
+    }
+    return history ? TokPos{history->len} : TokPos::none();
+}
+TokPos pulsar_session_bank_pos(pulsar_session *s, uint32_t bank) {
+    PULSAR_FAMILY_REQUIRES_S(s, PULSAR_FAMILY_CAP_BANKS, "per-bank state", TokPos::none());
+    if (!s) return TokPos::none();
+    return pulsar_bank_pos_of(bank, (uint32_t)session_banks(s)->count(s), pulsar_bank_history(s, bank));
+}
 /* The session's grid checkpoints: the family's store (L266). */
 pulsar_ckpt_store *pulsar_session_kv_store(pulsar_session *s) {
     return s ? session_banks(s)->kv_store(s) : NULL;
@@ -1782,27 +1795,32 @@ PromptToks pulsar_session_bank_prompt_held(pulsar_session *s, uint32_t bank, con
     return pulsar_tokens_prompt_held_with(engine_api_token_text, s->engine, h->v, at, prompt->v, prompt->len);
 }
 
-TokPos pulsar_session_bank_adopt(pulsar_session *s, uint32_t src, const pulsar_tokens *prompt, char *err,
-                                 size_t errlen) {
+pulsar_bank_adopt_result pulsar_session_bank_adopt(pulsar_session *s, uint32_t src, const pulsar_tokens *prompt,
+                                                   char *err, size_t errlen) {
     PULSAR_NVTX_FN();
-    PULSAR_FAMILY_REQUIRES_S(s, PULSAR_FAMILY_CAP_BANKS, "bank adopt", TokPos::none());
-    if (!s || !prompt) return TokPos::none();
+    const pulsar_bank_adopt_result refused = {PULSAR_ADOPT_REFUSED, TokPos::none()};
+    const pulsar_bank_adopt_result none = {PULSAR_ADOPT_NONE, TokPos{0}};
+    PULSAR_FAMILY_REQUIRES_S(s, PULSAR_FAMILY_CAP_BANKS, "bank adopt", refused);
+    if (!s || !prompt) {
+        snprintf(err, errlen, "bank adopt: no session or prompt");
+        return refused;
+    }
     if (tp_mirror_target(s)) {
         snprintf(err, errlen, "bank adopt: a tensor-parallel engine does not mirror it");
-        return TokPos::none();
+        return refused;
     }
     const uint32_t dst = pulsar_session_live_bank(s);
     if (src >= (uint32_t)pulsar_session_bank_count(s) || src == dst) {
         snprintf(err, errlen, "bank adopt: bank %u is not another bank of the pool", src);
-        return TokPos::none();
+        return refused;
     }
     const pulsar_ckpt_record *r = NULL;
     int len = 0;   /* the prompt in src's currency: a prompt end is the WHOLE (stitched) prompt */
     const uint32_t T = bank_adopt_point(s, src, prompt, &r, &len);
-    if (T == 0u) return TokPos{0};
+    if (T == 0u) return none;
     const pulsar_tokens *h = pulsar_bank_history(s, src);
     /* the records and checkpoints keep no image identity across banks: a history with an image block stays its own */
-    if (pulsar_image_block_starts(s->engine, h, (int)T, NULL, 0) != 0) return TokPos{0};
+    if (pulsar_image_block_starts(s->engine, h, (int)T, NULL, 0) != 0) return none;
     pulsar_tokens view = {0};
     for (uint32_t i = 0; i < T; i++) pulsar_tokens_push(&view, h->v[i]);   /* h is src's carry: copy before moving */
     pulsar_ckpt_store *st = pulsar_session_kv_store(s);
@@ -1812,7 +1830,7 @@ TokPos pulsar_session_bank_adopt(pulsar_session *s, uint32_t src, const pulsar_t
     if (!pulsar_ckpt_adopt(st, dst, src, T, r) || (at_end && !s->live_from_host(s->logits))) {
         pulsar_tokens_free(&view);
         snprintf(err, errlen, "bank adopt: bank %u's state at %u did not copy into bank %u", src, T, dst);
-        return TokPos::none();
+        return refused;
     }
     s->checkpoint.len = 0;
     for (uint32_t i = 0; i < T; i++) token_vec_push(&s->checkpoint, view.v[i]);
@@ -1824,7 +1842,7 @@ TokPos pulsar_session_bank_adopt(pulsar_session *s, uint32_t src, const pulsar_t
     spec_lookahead_reset(s);   /* the bank's pending drafts were its old history's */
     fprintf(stderr, "pulsar: bank %u adopts bank %u's %s at %u (prompt %d)\n", dst, src,
             !r ? "grid checkpoint" : r->kind == PULSAR_CKPT_REC_END ? "prompt end" : "message endpoint", T, prompt->len);
-    return TokPos{(int)T};
+    return {PULSAR_ADOPT_ADOPTED, TokPos{(int)T}};
 }
 
 int pulsar_session_restore_checkpoint(pulsar_session *s, TokPos G, char *err, size_t errlen) {

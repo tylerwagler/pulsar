@@ -70,14 +70,15 @@ static void shape(pulsar_engine *e, pulsar_session *s, int *live, const char *na
     /* bank 1 adopts */
     bool ok = install(s, live, 1);
     if (ok) pulsar_session_invalidate(s);
-    const TokPos T = ok ? pulsar_session_bank_adopt(s, src, Q, err, sizeof err) : TokPos::none();
-    const int rs = !T.is_none() ? pulsar_session_sync(s, Q, err, sizeof err) : 1;
+    const pulsar_bank_adopt_result ad = ok ? pulsar_session_bank_adopt(s, src, Q, err, sizeof err)
+                                           : pulsar_bank_adopt_result{PULSAR_ADOPT_REFUSED, TokPos::none()};
+    const int rs = ad.status != PULSAR_ADOPT_REFUSED ? pulsar_session_sync(s, Q, err, sizeof err) : 1;
     const int origin = pulsar_session_resume_origin(s).raw();
     if (rs == 0) pulsar_session_copy_logits(s, la, W);
     const bool ga = rs == 0 && greedy(s, N_GEN, ta, err, sizeof err);
-    say(!T.is_none() && T > TokPos{past} && rs == 0 && ga,
-        "%s: bank 1 adopts bank %u's state at %d of %d (past %d) and syncs (origin %d) %s", name, src, T.raw(), Q->len,
-        past, origin, err);
+    say(ad.status == PULSAR_ADOPT_ADOPTED && ad.at > TokPos{past} && rs == 0 && ga,
+        "%s: bank 1 adopts bank %u's state at %d of %d (past %d) and syncs (origin %d) %s", name, src, ad.at.raw(),
+        Q->len, past, origin, err);
     /* bank 2 cold */
     ok = install(s, live, 2);
     if (ok) pulsar_session_invalidate(s);

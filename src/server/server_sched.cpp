@@ -232,7 +232,7 @@ TokPos server::slot_frontier_pos(const session_slot *sl) const {
     const auto *s = this;
     if (!sl || !sl->provisioned) return TokPos{0};
     if (!s->sess) return TokPos{0}; /* host-only server (unit tests): no session to read */
-    if (s->pool_banks > 0) return pulsar_session_bank_pos(s->sess, sl->bank);
+    if (s->pool_banks > 0) return server_bank_pos(s->sess, sl->bank);
     return pulsar_session_pos(s->sess);
 }
 
@@ -1352,7 +1352,7 @@ void server::prefix_wait_release(job *const *queued, int n) {
         if (!w->leader) continue;
         session_slot *ls = &s->slots[w->slot];
         const bool live = slot_prefilling(ls) && ls->active_job->seq == w->leader;
-        const int pos = live ? pulsar_session_bank_pos(s->sess, (uint32_t)ls->bank).raw() : 0;
+        const int pos = live ? server_bank_pos(s->sess, (uint32_t)ls->bank).raw() : 0;
         const double waited_ms = (now - w->since) * 1e3;
         const prefix_wait_verdict v = server_prefix_wait_check(live, pos, w->mark, waited_ms, (double)s->prefix_wait_ms);
         if (v == PREFIX_WAIT_HOLD) {
@@ -1397,7 +1397,7 @@ bool server::prefix_wait_decide(job *j) {
         const int m = lp->len < r->prompt.len ? lp->len : r->prompt.len;
         int shared = 0;
         while (shared < m && lp->v[shared] == r->prompt.v[shared]) shared++;
-        leads[n] = {shared, pulsar_session_bank_pos(s->sess, (uint32_t)sl->bank).raw(), lp->len};
+        leads[n] = {shared, server_bank_pos(s->sess, (uint32_t)sl->bank).raw(), lp->len};
         lead_slot[n++] = i;
     }
     int mark = 0;
@@ -2326,7 +2326,7 @@ bool server::preempt_newest_decoder(const session_slot *keep, KvBytes need) {
         s->count_metric(&s->m_preemptions);
         server_log(PULSAR_LOG_DEFAULT,
                    "pulsar-server: PREEMPTED bank %u's decoder at %d tokens (%d generated): terminal checkpoint "
-                   "%.1f MiB in %.1f ms, physical freed (%.2f GiB)", v->bank, pulsar_session_bank_pos(pool, v->bank).raw(),
+                   "%.1f MiB in %.1f ms, physical freed (%.2f GiB)", v->bank, server_bank_pos(pool, v->bank).raw(),
                    g->completion_total + g->completion, (double)payload_bytes / 1048576.0,
                    (server_now_sec() - t0) * 1e3, (double)bytes.raw() / (1024.0 * 1024.0 * 1024.0));
         return true;
@@ -2682,7 +2682,7 @@ bool server::prefill_headroom_ok(session_slot *sl) {
     if (warn_limiter_due(&s->prefill_mem_warn, server_now_sec(), PULSAR_SERVER_MEM_FLOOR_WARN_SEC, &skipped))
         server_log(PULSAR_LOG_WARNING, "pulsar-server: prefill REFUSED (503) on bank %u at %d of %d tokens -- %s after "
                    "%d spill(s)%s: %s (%u more refused since the last line)", sl->bank,
-                   pulsar_session_bank_pos(s->sess, (uint32_t)sl->bank).raw(), g->prompt_tokens, why, spilled,
+                   server_bank_pos(s->sess, (uint32_t)sl->bank).raw(), g->prompt_tokens, why, spilled,
                    preempt_tried ? " and a preemption try" : "", g->err, skipped);
     pulsar_session_set_cancel(s->sess, NULL, NULL);
     pulsar_session_set_progress(s->sess, NULL, NULL);
@@ -3302,7 +3302,7 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n, int quantum_
              * prompt leaves the fused lane, and its classic quantum runs the remedies or refuses it */
             if (!s->prefill_headroom_fused_ok(c)) { rv[k].why = pg->no_fuse; continue; }
             if (!pg->fuse_ready && !s->fuse_prepare(c)) { rv[k].why = pg->no_fuse; continue; }
-            const int p0 = pulsar_session_bank_pos(pool, (uint32_t)c->bank).raw();
+            const int p0 = server_bank_pos(pool, (uint32_t)c->bank).raw();
             if (pg->prompt_for_sync->len - p0 <= 0) { rv[k].why = "nothing left"; continue; }
             ps[n_ps] = c;
             pgs[n_ps] = pg;
@@ -3794,7 +3794,7 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n, int quantum_
                 pulsar_session_bank_state_save(pool, (uint32_t)sl->bank);
                 s->live_bank = -1;   /* saved: the next install need not save it again */
             }
-            sl->committed_pos = pulsar_session_bank_pos(pool, (uint32_t)sl->bank);
+            sl->committed_pos = server_bank_pos(pool, (uint32_t)sl->bank);
             sl->tokens_emitted += (uint64_t)done;
             /* L119: request-scoped DSpark accounting — the round's truth,
              * accumulated here where it is unambiguous (row_nb = base+K rows
@@ -3928,7 +3928,7 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n, int quantum_
         const session_slot *c = &s->slots[k];
         const int len = c->gen && c->gen->prompt_for_sync ? c->gen->prompt_for_sync->len : -1;
         server_log(PULSAR_LOG_PREFILL, "pulsar-server: fuse: bank %d at %d/%d rode %d rows in %d of %d rounds%s%s",
-                   c->bank, pulsar_session_bank_pos(pool, (uint32_t)c->bank).raw(), len, rv[k].rows, rv[k].rounds,
+                   c->bank, server_bank_pos(pool, (uint32_t)c->bank).raw(), len, rv[k].rows, rv[k].rounds,
                    round_ix, rv[k].why ? "; last miss: " : "", rv[k].why ? rv[k].why : "");
     }
     for (int i = 0; i < n; i++) {
@@ -4039,7 +4039,7 @@ session_slot *server::worker_find_fuse_prefill() {
         if (!sl->active_job || !g || g->phase != GEN_PREFILL_MAIN || !g->prompt_for_sync ||
             g->no_fuse)
             continue;
-        const int P = pulsar_session_bank_pos(pool, sl->bank).raw();
+        const int P = server_bank_pos(pool, sl->bank).raw();
         const int len = g->prompt_for_sync->len;
         if (P <= 0 || P >= len) continue;                       /* first chunk / done: classic */
         if (g->share_mark > P) continue;                        /* L329 (a): the classic sync stops at the cut */
@@ -4321,7 +4321,7 @@ static int worker_decode_budget(server *s) {
         const gen_state *g = c->gen;
         const pulsar_tokens *target = g->phase == GEN_PREFILL_COLD ? &g->cold_prefix : g->prompt_for_sync;
         if (!target) continue;
-        const int left = target->len - pulsar_session_bank_pos(s->sess, (uint32_t)c->bank).raw();
+        const int left = target->len - server_bank_pos(s->sess, (uint32_t)c->bank).raw();
         if (left <= cap) return 1;
     }
     return PULSAR_SERVER_DECODE_QUANTUM_TOKENS;
