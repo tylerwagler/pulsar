@@ -1,1205 +1,298 @@
 # Pulsar
 
-**Pulsar** is a small native inference engine built for **DeepSeek V4
-Flash** on a single **NVIDIA GB10 (DGX Spark, ~128 GB unified memory)**. It is
-intentionally narrow: not a generic GGUF runner, not a wrapper around another
-runtime: it is completely self-contained. Other than running the model in a
-correct and fast way, the project goal is to provide DeepSeek specific loading,
-prompt rendering, tool calling, and KV state handling (RAM and on-disk) behind an
-OpenAI- and Anthropic-compatible server API, ready to work with local coding
-agents. The shipped release is a single binary — **`pulsar-server`** — that serves
-that API; that is the product. There are also offline tools for GGUF and imatrix
-generation, plus development tools for quality and speed testing (see the
-Development tools note under Building).
+Pulsar is a native CUDA inference server for a small, fixed set of open-weight
+model families. The product is one binary, **`pulsar-server`**, which loads one
+model container and serves it over OpenAI-, Anthropic- and Responses-compatible
+HTTP APIs, with tool calling, structured output, image input (where the model
+has a vision tower), speculative decoding, multi-session batching and an on-disk
+KV cache built for long agent sessions.
 
-This tree is the **CUDA-only fork** of
-[antirez/ds4](https://github.com/antirez/ds4) targeting **NVIDIA CUDA on
-Linux**, with special care for the **DGX Spark (GB10)** and its ~128 GB of
-unified memory. The upstream Metal (macOS) and ROCm backends were removed in
-this fork; see [AGENTS.md](AGENTS.md) for the source layout, supported weight
-formats, and validation notes.
+It is narrow on purpose. Each family is implemented end to end in this tree:
+weight layouts, kernels, tokenizer, chat template, tool-call parser and KV state.
+There is no generic model loader, and nothing links against another runtime. The
+production target is one **NVIDIA DGX Spark (GB10, `sm_121`, ~128 GB unified
+memory)**. Two-node tensor-parallel serving over a GB10 pair is supported for the
+families that implement it.
 
-This project would not exist without **llama.cpp and GGML**, make sure to read
-the acknowledgements section, a big thank you to Georgi Gerganov and all the
-other contributors.
+Pulsar started as the CUDA-only fork of [antirez/ds4](https://github.com/antirez/ds4),
+a DeepSeek V4 Flash engine. It has since grown a family plug-in layer and several
+more models; see [Acknowledgements](#acknowledgements).
 
-This fork's target is deliberately narrow: **DeepSeek-V4-Flash on a single
-GB10**. Flash is the right fit for a 128 GB box — quasi-frontier capability,
-2-bit-tolerant experts, and a compressed KV cache that makes million-token
-contexts practical. The bet is one model, one class of machine, done end to
-end rather than a generic runner. If a materially better open-weight model
-lands for this size class, the engine can follow it; the model is a target,
-not a permanent commitment.
+Status: beta. Releases are tagged on `dev`; what changed in this one is in
+[docs/RELEASE_NOTES_0.5.0.md](docs/RELEASE_NOTES_0.5.0.md).
 
-## Acknowledgements to llama.cpp and GGML
+## Model families
 
-Pulsar does not link against GGML, but it **exists thanks to the path opened by the
-llama.cpp project and the kernels, quantization formats, GGUF ecosystem, and hard-won
-engineering knowledge developed there**.
-We are thankful and indebted to [`llama.cpp`](https://github.com/ggml-org/llama.cpp)
-and its contributors. Their implementation, kernels, tests, and design choices were
-an essential reference while building this DeepSeek V4 specific inference path.
-Some source-level pieces are retained or adapted here under the MIT license: GGUF
-quant layouts and tables, host-side quant/dot logic, and certain kernels. For this
-reason, and because we are genuinely grateful, we keep the GGML authors copyright
-notice in our `LICENSE` file.
+A model is a **pulsar safetensors container** (see [Models](#models)). The
+container's `general.architecture` key picks the family; anything else is refused
+at load.
 
-This fork also stands on:
+**GB10 (DGX Spark, `sm_121`) is the focus.** It is the production machine and
+the only one the release battery runs on. **The only model with good test
+coverage is Qwen3.8-Flash-Next.** It is the production model, and most of the
+battery's serving legs run on it. Treat every other row below as less proven, to
+the degree its coverage column says.
 
-- **[antirez/ds4](https://github.com/antirez/ds4)** — the upstream DeepSeek V4
-  inference engine this project is forked from.
-- **DeepSeek** — for the DeepSeek V4 Flash / PRO open-weight models and their
-  compressed-KV architecture.
-- **[PrismaQuant](https://github.com/RobTand/prismaquant)** (Rob Tand) — the
-  measured-KL mixed-precision quant allocation approach used to build this
-  fork's mixed-precision artifacts (the map lives in `tools/container/format-maps/`).
-- **[REAP](https://arxiv.org/abs/2510.13999)** (Router-weighted Expert
-  Activation Pruning) — the expert-pruning method behind the production build's
-  25%-pruned routed experts.
-- **[eouya2](https://huggingface.co/eouya2/DeepSeek-V4-Flash-REAP25-LCB50-DS4)**
-  — the REAP-25 (LiveCodeBench-50-calibrated) DeepSeek-V4-Flash expert-survivor
-  set, used by the earlier REAP-trimmed builds (tooling archived at tag
-  `archive/gguf-tooling-2026-09-24`).
+| Model (family) | Served id | Weight formats | Runs on | Features | Test coverage |
+| --- | --- | --- | --- | --- | --- |
+| **Qwen3.8-Flash-Next** (`qwen4_exp`) | `qwen3.8-flash-next` | EXL3 experts and head, MXFP8 / BF16 dense, NVFP4 drafter; PLE n-gram row file beside the container | GB10 | DFlash2 block drafter (default) or MTP; 262k context, 1M with `--rope-yarn 4`; banks + disk KV; images; TP=2 | **Good.** Production; most of the battery's live serving legs (scheduling, preemption, prefix reuse, resume, fan-out, structured output); its session, speculation, chunk-neutrality and KL-vs-BF16 reference gates; chat-template and vision-tower gates. Declared gaps (`tests/contracts.tsv`): TP on a real pair, whole-session payloads, mixed-prefill neutrality |
+| **DeepSeek V4 Flash** Vision-Exp / 0731 (`deepseek4`) | `deepseek-v4-flash` | MXFP8 dense, MXFP4 / IQ2_XXS / EXL3 routed experts, BF16 head | GB10 (needs `sm_12x`) | DSpark drafter merged in the container; 1M context; banks + disk KV; images (Vision-Exp); TP=2 | **Partial.** The Vision-Exp container is the battery runner's primary model (kernels, bit-exact prefill and decode baselines, the reference gates, sessions, speculation) and runs four live legs. Not exercised in production in this release |
+| **DeepSeek V4.1 Flash** (`deepseek4`) | `deepseek-v4-pro` (see note) | as above, EXL3 routed experts; Engram table on disk | GB10 | DSpark when the container carries it; 1M context; banks + disk KV; no images (its image path refuses); TP=2 | **Thin.** Renderer goldens only (`render-gate`); no model gate in the battery |
+| **Nemotron 3.5 Super** (`nemotron_h`) | `nemotron-3.5-super` | EXL3 K4, NVFP4 W4A16 LiLiCorr drafter | GB10 | LiLiCorr or MTP drafter; banks + disk KV; no images; no TP | **Partial.** Its LiLiCorr container runs three runner legs (block speculation, scratch poison, bank adoption) and two live legs; KV-admission legs on a mini fixture; chat-template gate |
+| **Inkling** (`inkling`) | `inkling-small` | EXL3 K3 | GB10 | single session; no drafter, banks, images or TP | **Minimal.** Tokenizer and chat-template gate only |
+| **Nemotron 3.5 Embed-8B / Rerank-8B** (`nemotron_enc`) | `nemotron-embed` / `nemotron-rerank` | EXL3 4.0 | Turing `sm_75` (in service on an RTX 5000); GB10 builds | `/v1/embeddings`, `/v1/rerank`; several in one process | **Manual.** `tests/nemotron_enc_gate` run by hand; not in the battery |
+| **Nemotron 3.5 Parse** (`nemotron_parse`) | `nemotron-parse` | f16 | Turing `sm_75` (in service on an RTX 5000); GB10 builds | `/v1/parse`, one page image a call | **Manual.** `tests/nemotron_parse_gate` against the HF fp32 reference, run by hand; not in the battery |
 
-## Status
+"Runs on" lists what has been run. Other GPUs are not tested. What they could
+run follows from the code: the runtime floor is `sm_75`, and anything below it is
+refused. Containers are refused at load by storage layout:
 
-This is **beta quality**, but releases ship regularly. The current release
-serves the **v5 (0731, srcfmt) artifact** — DeepSeek-V4-Flash-0731 weights
-carrying the checkpoint's native numerics, the REAP-25 per-layer expert trim,
-the matching 0731 DSpark drafter merged in-file, and the
-type-43 `IQ2_XXS_MMQ` aligned pre-store (see Model Weights). The inference
-path, the MXFP4/MXFP8/IQ2 quantization, and speculative decoding are validated
-against the tests in this tree and the `tool-eval-bench` quality suite — the
-pinned TEB score is 84-85, level with the strongest competing GB10 engine, and
-the 84-scenario short set scores identically at 0 and at ~295k tokens of live
-context pressure.
-This release line makes speculative decoding adaptive and moves the last
-F32 compute onto the tensor cores. **Adaptive draft depth**: the drafter's
-depth is no longer a fixed knob -- a per-session controller walks it between
-2 and 5 (5 = the drafter's trained block) from realized acceptance and the
-confidence head's per-position scores, capturing each workload's measured
-optimum (prose settles shallow, structured/tool output rides the deep end;
-`--spec-depth` sets the STARTING depth). **BF16 tensor-core compute for
-the F32-source weight family** (`hc_attn_fn`/`hc_ffn_fn`/`output_hc_fn`/APEs):
-storage stays checkpoint-exact F32, compute runs bf16 -- which is *closer to
-the source model's own numerics* (its residual stream is BF16), confirmed by
-the source-reference gate at every confident depth and by the disappearance
-of a long-standing top-1 disagreement with the B300 reference at depth 512.
-Net single-stream speculative decode moved ~+25% on raw-completion prose and
-~+7-10% on served structured output versus v0.4.2. Under the hood: the
-drafter's markov walk is device-chained (one readback per round instead of
-one per position), draft results harvest lazily so token emission overlaps
-drafter GPU time, per-thread-stream synchronization replaces device-wide
-syncs, and an engine-wide audit (the "colonoscopy") deleted every unjustified
-dual path it found, with element-format tags making activation formats
-type-checked rather than convention.
-Earlier: v0.4.x moved the engine onto the tensor cores end to end: the
-vendored-MMQ D2R path runs every 2-bit routed-expert GEMM on the tensor cores,
-attention is fp16 tensor-core on every path (one kernel since L166), the
-indexer scorer runs block-scaled MXFP4, and the fp16 decode walk lifts shallow-context decode
-— cold prefill now holds ~900-950 t/s from 2k through 32k (see Speed). On the
-serving side it adds the 0731 three-level reasoning-effort scheme, the
-Anthropic `web_search` server tool (removed again on 2026-09-06: the router in
-front of the server owns web search now; server-tool entries are dropped at
-parse), request-latency/admission metrics, and an 8-bank warm-state pool (up
-from 5; see Model residency).
-Earlier lines: v0.3.x brought Tier-2 batched multi-session decode, KV
-overcommit with proactive eviction, and the pooled-routing and KV round-trip
-fixes that stabilized agentic serving; v0.3.1 was re-verified quality-neutral
-versus v0.2.3 on the full 84-scenario hardmode suite.
-Model serving is
-a large surface, so rough edges remain; we keep the project usable and are
-actively hardening it. If you hit a problem, run `pulsar-server --trace
-/tmp/pulsar-trace.txt` to capture the session and open an issue with the full
-trace.
+- `mxfp8_lt` needs `sm_100` or newer.
+- MXFP4, IQ2_XXS and NVFP4 need the `sm_12x` family.
+- `fp8_e4m3_soa_k` needs `sm_89` or newer.
 
+Individual lanes refuse below their own floor: bf16 rows, EXL3 MoE and QSA
+attention need `sm_80`, Tessera needs `sm_89`, and Qwen's GDN recurrence needs
+`sm_90`. The decoder families therefore need GB10-class hardware. The gates build
+only `sm_120f` and `sm_75`. Any other `CUDA_ARCH` is untested, whether or not it
+builds.
 
-## More Documentation
+The family capability flags (`src/engine/family.h`, `PULSAR_FAMILY_CAP_*`) are the
+authority for features: a feature a family does not declare is refused by name,
+never approximated.
 
-If you are looking for very specific things, we have other
-sub-README files. Otherwise for normal usage keep reading the
-next sections.
+Notes:
 
-- [docs/CONTRIBUTING.md](docs/CONTRIBUTING.md): correctness and speed regression testing
-  guide for contributors. **Read this before sending a pull request**.
-- [tools/container/README.md](tools/container/README.md): the direct artifact
-  builder -- HF checkpoint(s) to the served safetensors container, no GGUF (L247).
-- [tools/imatrix/README.md](tools/imatrix/README.md): how the routed-MoE imatrix
-  is collected and used.
-- [tools/imatrix/dataset/README.md](tools/imatrix/dataset/README.md): how the
-  calibration prompt corpus is generated.
-- [tools/reap/README.md](tools/reap/README.md): the router audit the battery runs.
-- [docs/ARTIFACT_BUILD.md](docs/ARTIFACT_BUILD.md): building the serving
-  artifact straight from the HF checkpoint with `tools/container/build.py`
-  (no GGUF), the five format decisions, and the entry-for-entry instrument
-  that proves a build against the served artifact.
-- [docs/MODEL_CARD.md](docs/MODEL_CARD.md): synopsis of the official DeepSeek
-  V4 model card, with the architecture details that matter for Pulsar.
-- [tools/quality-testing/README.md](tools/quality-testing/README.md): how local
-  checkpoints are scored against official DeepSeek V4 Flash/PRO continuations.
-- [dir-steering/README.md](dir-steering/README.md): directional steering data,
-  vector generation, and usage.
-- [speed-bench/README.md](speed-bench/README.md): benchmark commands, charts,
-  and CSV generation.
-- [tools/serve-bench/scoreboard.sh](tools/serve-bench/scoreboard.sh): the served-speed scoreboard against
-  another engine (pulsar-server or TensorFold, untraced, same client and prompts; tok/s, tokens a round and ms a
-  round per cell, plus TensorFold's own public client); `serve_matrix.py table` prints the comparison.
-- [tests/test-vectors/README.md](tests/test-vectors/README.md): official
-  continuation vectors used for regression checks.
+- **Qwen3.8-Flash-Next** is served from EXL3 weights. Its per-layer n-gram (PLE)
+  table is a separate row file that the container names. Pulsar streams it from
+  disk while the model runs, so keep the container on local NVMe. The trained
+  context is 262,144 positions; `--rope-yarn 4` serves 1M (1,048,576).
+- **DeepSeek V4.1** containers currently report the served id `deepseek-v4-pro`.
+  This is a leftover of the old Flash/Pro naming (`ds4_served_model_id` in
+  `src/engine/family_deepseek.cpp`). DeepSeek V4 **Pro** itself is no longer a
+  loadable shape.
+- The encoder and Parse families serve their own endpoints (`/v1/embeddings`,
+  `/v1/rerank`, `/v1/parse`). They do not chat. One process can host several of
+  them (`-m` repeated).
 
-## Model Weights
+## Hardware
 
-This implementation is not a general GGUF loader: the engine binds one known
-DeepSeek V4 tensor layout and rejects everything else. **This fork's weight
-binder is stricter than upstream's.** It accepts exactly:
+- **GB10 / DGX Spark**: build with `make cuda-spark` (`CUDA_ARCH=sm_120f`).
+- **Turing** (encoder and Parse families): build with
+  `make pulsar-server CUDA_ARCH=sm_75`. Other GPUs: see the table above.
+- A binary started on a GPU it was not compiled for fails at startup with
+  rebuild instructions. It does not crash later inside a kernel.
+- Weights are fully resident. A model that does not fit is rejected at load;
+  there is no partial or streamed weight path. The Qwen PLE rows are table data,
+  not weights.
 
-| Tensor group | Accepted formats |
+## Build
+
+Requirements: Linux, the CUDA toolkit (the tree is built with 13.x), a C++23
+compiler, `libpng` and `libjpeg` (the image decoder), and CUTLASS, which is an
+external header-only dependency pinned in [`cutlass.pin`](cutlass.pin). It is
+deliberately not a submodule.
+
+```sh
+make cutlass            # once: clone the pinned CUTLASS into ./cutlass
+                        # (or pass CUTLASS_DIR=/path/to/cutlass to every make)
+make cuda-spark         # GB10: rebuilds pulsar-server at CUDA_ARCH=sm_120f
+make pulsar-server CUDA_ARCH=native   # another local GPU
+make help               # the other targets
+```
+
+Plain `make` prints the targets; it does not pick one. The binaries land in the
+repository root. Only `pulsar-server` is the release. `pulsar` (CLI and
+diagnostics), `pulsar-bench`, `pulsar-eval` and `pulsar-agent` are development
+tools: build them by name.
+
+Tests and release gates are described in
+[docs/QA_BEFORE_RELEASES.md](docs/QA_BEFORE_RELEASES.md) and
+[docs/CONTRIBUTING.md](docs/CONTRIBUTING.md). In short:
+
+- `make test`: the main test runner. It needs a model in `PULSAR_TEST_MODEL`.
+- `make cuda-regression`: modelless kernel smokes.
+- `make gates-dev`: the fast tier.
+- `make gates`: the full release battery.
+
+## Models
+
+Pulsar reads one format: a **safetensors container** in which every tensor is
+stored in the layout its kernel reads, declared by name in the shard metadata
+(`pulsar.kv`, `pulsar.tensors`, `pulsar.experts`; reader in
+`src/engine/safetensors.cpp`). The engine converts nothing at load, and an
+unknown or retired layout name is refused. GGUF is not read or written anywhere.
+The old GGUF tooling is archived at the tag `archive/gguf-tooling-2026-09-24`.
+
+Containers are built from Hugging Face checkpoints, or from EXL3 packs for the
+EXL3 builds, by [`tools/container/build.py`](tools/container/README.md). How to
+run it, the recipe format and how a build is checked against a served artifact
+are in [docs/ARTIFACT_BUILD.md](docs/ARTIFACT_BUILD.md).
+
+A published DeepSeek V4 Flash container (the Vision-Exp repack with MXFP4 routed
+experts and the DSpark drafter merged in) is on Hugging Face as
+[`ElytronAI/DeepSeek-v4-Flash`](https://huggingface.co/ElytronAI/DeepSeek-v4-Flash):
+
+```sh
+hf download ElytronAI/DeepSeek-v4-Flash --local-dir /path/to/DeepSeek-v4-Flash
+```
+
+## Run
+
+```sh
+./pulsar-server -m /path/to/container --ctx 262144
+# Qwen3.8-Flash-Next at its 1M context:
+./pulsar-server -m /path/to/qwen-container --rope-yarn 4
+```
+
+`-m` takes a shard directory or a single file. Without `-m` the server looks for
+`./model` or `./model.safetensors`, then the same names under `$PULSAR_MODEL_DIR`.
+The server listens on `0.0.0.0:8000` by default and has **no authentication**: run
+it on a network you control, or bind it with `--host 127.0.0.1` and put your own
+authenticating proxy in front.
+
+Flags a user normally sets:
+
+| Flag | Default | Meaning |
+| --- | --- | --- |
+| `-m, --model PATH` | `./model`, then `$PULSAR_MODEL_DIR/model` | The container. Repeat it to host several encoder / Parse models in one process. |
+| `-c, --ctx N` | 1048576 | Context per session. A context past the model's trained positions is refused. |
+| `--rope-yarn F` | off | YaRN scaling over a native rope (Qwen: `4` = 1M positions). Refused under TP and by families without a rope. |
+| `--host H` / `--port N` | `0.0.0.0` / `8000` | Bind address. |
+| `--kv-disk-dir DIR` | `$XDG_CACHE_HOME/pulsar/kv-<model>` (else `~/.cache/pulsar/...`) | Disk KV cache directory. `""` disables it. |
+| `--no-kv-disk` | | Disable the disk KV cache. |
+| `--kv-disk-space-mb N` | no limit | Disk KV budget. |
+| `--no-dspark` | | Run without the container's drafter (any family). |
+| `--drafter NAME` | the container's | `mtp`, `dflash2` (Qwen) or `lilicorr` (Nemotron). |
+| `--spec-depth N`, `--spec-tau F\|off` | the drafter's | Starting draft depth and draft stop threshold. |
+| `--trace FILE` | | Write rendered prompts, cache decisions, output and tool-call events. |
+
+The complete list (tensor parallelism, steering, request capture), every
+`PULSAR_*` environment variable, and the server's behaviour in detail are in
+**[docs/SERVER.md](docs/SERVER.md)**. `./pulsar-server --help [topic]` prints the
+built-in help.
+
+## API
+
+| Endpoint | |
 | --- | --- |
-| Attention projections, shared experts | MXFP8 (FP8 E4M3 values + per-32 E8M0 scales), run on the FP8 tensor-core GEMM path |
-| Routed experts gate/up/down | Per layer: gate/up as a matching pair in `IQ2_XXS`/`IQ2_XXS_SOA`/`IQ2_XXS_MMQ`/`Q2_K`/`MXFP4`, down independently in `IQ2_XXS`/`IQ2_XXS_SOA`/`IQ2_XXS_MMQ`/`Q2_K`/`MXFP4`; or all three in the CUTLASS tensor-core `MXFP4` layout |
-| Output head | `BF16` or MXFP8 |
-| Norms, embeddings, indexer, HC | `F32`/`F16` |
-
-The served artifact is a **declared-layout safetensors checkpoint**: every
-tensor is stored in the layout the kernel reads (`mxfp8_lt` dense, `cutlass_mxfp4`
-/ `iq2_xxs_mmq_k` / EXL3 `exl3m_k*` routed experts, native `bf16`/`f32` for the
-rest) and declared by name in the shard metadata; the engine converts nothing at
-load.  GGUF is not read, written or built anywhere in this tree since
-2026-09-24 (the old pipeline is archived at tag `archive/gguf-tooling-2026-09-24`;
-the direct builder that replaces it is `tools/container/`, L247).
-
-The shipped Flash checkpoint is published on Hugging Face as
-[`ElytronAI/DeepSeek-v4-Flash`](https://huggingface.co/ElytronAI/DeepSeek-v4-Flash)
-(the source-precision repack of DeepSeek-V4-Flash-Vision-Exp: MXFP4 routed
-experts byte-lossless from the source's FP4, MXFP8 attention/dense, the DSpark
-drafter merged in; 48 shards, 168 GB).  Fetch it with the Hugging Face CLI:
-
-```sh
-hf download ElytronAI/DeepSeek-v4-Flash --local-dir /srv/models/DeepSeek-v4-Flash
-```
-
-CUTLASS is an external, header-only dependency. It is deliberately **not** a
-git submodule (see `cutlass.pin`); fetch the pinned revision once, anywhere you
-like, and point `CUTLASS_DIR` at it:
-
-```sh
-make cutlass               # clones the pinned sha into ./cutlass
-# ...or reuse a clone you already have:
-#   make cuda-spark CUTLASS_DIR=$HOME/cutlass
-make cuda-spark            # Linux CUDA, DGX Spark / GB10 (sm_120f)
-```
-
-The build checks the headers exist before compiling the CUTLASS translation
-unit, and warns if the clone's HEAD does not match `cutlass.pin`.
-
-Pass the checkpoint directory with `-m`; run `./pulsar-server --help` for the
-full flag list, and start serving with:
-
-```sh
-./pulsar-server -m /srv/models/DeepSeek-v4-Flash --ctx 100000
-```
-
-## Speed
-
-### Current branch (2026-08-09, GB10, locked clocks)
-
-Measured with `pulsar-bench` at `sudo nvidia-smi -lgc 2600` on the
-`v5mx4-0731-mmqaligned` artifact — IQ2_XXS_MMQ
-(type 43) routed experts with 16 layers at CUTLASS MXFP4 (type 40).  Three
-numeric tiers are **on by default** on this branch, each behind an `=0`
-opt-out and each gated by measured fidelity (suite-v1 teacher-forced KL and
-the 84-scenario hardmode eval; full ledger in `docs/engine-perf-map.md`):
-
-- fp16 tensor-core prefill attention (all window, indexed, banked and
-  continued-prefill paths; reads the packed comp cache directly). Default-on;
-  its `PULSAR_CUDA_ATTN_F16=0` opt-out was retired 2026-09-02 along with the
-  unfused cuBLAS two-GEMM arm it fell back to — there is no longer a second
-  multi-token attention path.
-- Block-scaled MXFP4 indexer scorer. Default-on; its opt-out switch
-  (`PULSAR_CUDA_INDEXER_MXFP4`) was retired in the v0.5.0 switch audit and the
-  packed indexer cache is now allocated unconditionally.
-- One attention kernel: the fp16 tensor-core tier serves prefill (raw and
-  static-mixed), indexed top-k and batched decode at every row count
-  (n_tokens == 1 included), every context length and both visibility rules
-  (the drafter's non-causal raw window included).  The four f32 online
-  kernels -- prefill raw, prefill mixed, indexed heads8-online, decode
-  heads8-online with its split-KV merge -- were deleted 2026-09-04 (L166)
-  once their last shapes moved over; a shape the tier does not serve
-  (head_dim != 512, n_head % 32 != 0, no sm_80+ tensor cores) is refused by
-  name, never computed another way.
-
-| Context | Prefill (t/s, cold) | Decode plain (t/s) |
-| ---: | ---: | ---: |
-| 2k  | 951 | 20.7 |
-| 4k  | 918 | 17.8 |
-| 8k  | 945 | 17.5 |
-| 16k | 932 | 17.5 |
-| 32k | 909 | 17.1 |
-
-Single-stream speculative decode (drafter on) on the v0.5.0 build:
-raw-completion prose ~28 t/s and served structured output ~28-30 t/s at
-shallow context under adaptive depth (server wall-clock, temp 0; the v0.4.x
-figure on the same protocol was ~24.6 with bursts above 30).  Aggregate decode under
-concurrency (pp2048/tg128, llama-benchy protocol): 23.1 t/s at c2/d0 and
-26.2 at c4/d0, still 17.3-17.7 at c2-c4/d8192 — throughput *rises* with
-stream count.  Deep context is measured, not advertised: the 84-scenario
-short set scores **identically (97/97) at 0 and at ~295k tokens of live
-context pressure** on a 384k window, with prefill sustaining ~900+ t/s at
-that depth.
-
-Earlier-build numbers below are kept for history; the protocols differ
-(server wall-clock vs locked-clock bench), so do not compare across tables.
-
-Historic v0.3.1 numbers were measured on the ~92 GB REAP-pruned Flash
-build of that era. The artifact unifies every
-MXFP4 routed-expert layer onto the CUTLASS tensor-core **type-40 W4A8 path**
-(4-bit weights, E4M3 activations) and stores all MXFP8 workhorse weights in the
-**type-41 MXFP8_LT** swizzle (zero-copy, no runtime repack) — both since v0.2.3.
-Since v0.4.0 the 2-bit routed experts may also be stored in the **type-42
-`IQ2_XXS_SOA`** pre-store: the same 66 B/block content as `IQ2_XXS`, with the
-per-block scale and the quantised bytes split into separate planes so the weight
-stream is 16-byte aligned instead of 2-byte aligned. It is a pure permutation —
-identical bit count, byte-identical logits — and buys **+2.3% prefill @2048 and
-+1.9% @8192**. Numbers below are the **v0.3.1** build. Prefill is measured
-**cold** (`cache_prompt` off, unique-prefix probe — a warm cache reports
-arbitrarily high prompt-processing rates and is not a real prefill number);
-decode is measured with the merged DSpark speculative drafter, single stream, on
-the server's own wall-clock. All numbers below are the median of three runs at
-real depth-varying prompts.
-
-| Context (actual) | Prefill (t/s, cold) | TTFT (cold) | Decode structured (t/s) | Decode prose (t/s) |
-| ---: | ---: | ---: | ---: | ---: |
-| ~0.3k | — | ~1.2 s | ~25.7 | ~23.0 |
-| ~2.3k | ~393 | ~6.2 s | ~24.9 | ~23.6 |
-| ~9.3k | ~363 | ~25.9 s | ~21.8 | ~20.6 |
-
-Decode figures are the production speculative path (drafter on, thinking on),
-greedy (`temp:0`), single stream. Measured on the v0.3.1 build. Decode improved
-over v0.2.3: an under-occupied-kernel fix recovered ~+4.6% at shallow depth
-(bit-exact), and the recalibrated yield-quench no longer false-quenches, so the
-prose rows in particular sit a few percent higher than the prior build (which
-read prose 18.1/20.7/19.6 at the same depths). Prefill is flat versus v0.2.3
-(~393 t/s at ~2.3k) and **declines** with depth to ~363 t/s at ~9.3k — cold
-prefill slows as attention-at-depth grows, and speculative-decode acceptance
-falls, which is the physically expected shape. (The v0.2.3 table's "413 rising at
-9.3k" and a 9.3k structured cell above its 2.3k value were non-monotonic
-measurement artifacts; these v0.3.1 numbers are internally consistent across the
-log estimator, the server `timings{}` block, and a unique-nonce cold probe.) The
-build is **fidelity-neutral to source** — the f32→BF16 residual carrier and all
-quant paths were re-verified quality-neutral on the full 84-scenario hardmode
-suite (see Status). (Speculative decode at `temp:1.0` is comparable and on
-several depths faster but is stochastic run-to-run, so the greedy rows are the
-reported baseline; the one genuinely noisy cell above is 9.3k structured, where
-acceptance forks run-to-run — the median is defensible, a single run is not.)
-
-The MXFP4 rich-expert layers (~4.25 bpw versus the ~2 bpw floor) read ~2x the
-weight bytes and set the prefill rate; the type-40 grouped W4A8 GEMM runs those
-layers on the tensor cores. An expert-tiled big-batch kernel keeps each decoded
-weight resident across a wide token tile so its decode cost amortizes across the
-batch. (A uniform 2-bit build prefills faster but scores lower on quality — the
-measured allocation trades some prefill for the tool-use win, beating the uniform
-2-bit build on hard-mode tool-eval-bench.)
-
-Draft acceptance varies with workload and depth: measured against this build,
-structured/tool output holds ~70% conditional acceptance per drafted position
-through depth 5, while general prose runs markedly lower (~50% first-token) --
-so the speedup is largest on structured workloads. **Draft depth is adaptive
-(v0.5.0)**: a per-session controller walks depth within [2, 5] from realized
-accepts and the drafter confidence head's per-position scores (the head is
-measured well-calibrated: scores >=0.9 corresponded to 100% realized
-acceptance). A depth sweep measured opposite per-workload optima -- prose
-fastest at depth 2, structured at depth 5 -- and the controller captures both
-in one configuration; 5 is a hard ceiling because it is the drafter's trained
-block width (position 6 is out of distribution and measurably counter-
-productive). `--spec-depth N` sets the starting depth (default 3) and `--spec-tau F` the draft stop (default 0.55). Plain (non-speculative) decode is
-roughly flat and bandwidth-bound; speculation is a speedup layered on top. On
-shallow, low-acceptance requests speculation can run slightly *slower* than
-plain, so **its downside is capped to a few percent by the yield-quench safety
-net** described under Speculative decoding — not "speculation never hurts." It
-never changes the output distribution — exact sampled acceptance at all
-temperatures — so it is a pure speed knob, not a quality one. (Prefill is
-measured cold with `cache_prompt` off and a unique-prefix probe to defeat the
-prefix cache; decode is measured on the server's own wall-clock. Speculative t/s
-is stochastic run-to-run under sampling; the numbers above are `--temp 0`.)
-
-## Model residency
-
-Pulsar is a fully resident engine for **weights**: the CUDA path makes the
-whole model (~85 GiB of tensor spans + merged DSpark drafter) resident in
-GPU-addressable memory at load time. A model that does not fit is rejected at
-startup with a clear error instead of silently degrading — there is no
-partial-residency or streaming fallback for weights, so a successful load is a
-residency guarantee for the whole run. Since v0.2.3, MXFP8 workhorse weights are
-stored in the type-41 **MXFP8_LT** swizzle and loaded zero-copy (no runtime
-repack cache), and the type-40 W4A8 expert path runs the rich layers on the
-tensor cores.
-
-**KV state is overcommitted rather than fully charged** (since v0.3.1). The default
-context is **1M tokens** with **overcommit ON**: a small pool of banks (auto-sized,
-up to 8 by default — banks are warm-state slots, not decode streams, and 8 is the
-measured fast-lane boundary (N=12 aggregate decode held 29.2 tok/s at 8 banks
-vs 21.9 at 12 when it was set), so the default never auto-sizes past it; an operator
-`PULSAR_MSEQ_BANKS` pin up to 16 is allowed for TTFT-focused deploys that accept
-the >8-row slow-lane cliff) comes up "grow-to-1M-capable," but only the *eager floor* (raw sliding
-window + state lanes + drafter) is charged at admission — the ctx-scaled
-compressed-KV/indexer term is virtual-address-only, made physical on touch. A
-short session pays only for the KV it actually uses. Banks that genuinely grow
-toward 1M are bounded by a **proactive LRU-idle eviction guard** (task #55): at
-each batched decode-quantum, if the live banks' projected touched-KV would breach
-the physical budget, the guard spills the least-recently-used idle bank's KV to
-disk and `cudaFree`s its physical slabs, reloading it (bit-identically) on its
-next turn. This was stress-validated — under sustained concurrent multi-bank
-growth the guard fired repeatedly, bounded memory itself (an independent
-out-of-memory watchdog never engaged), and every restore was byte-identical.
-
-Two boundaries are worth knowing: the proactive guard runs **only in the batched
-decode lane** (≥2 concurrent decoding banks — the overcommit default's target
-regime); a purely sequential single-stream workload leans on admission plus a
-live-`MemAvailable` floor backstop instead. And the guard is **decode-quantum
-granular**, so a bank's *prefill* growth between checks is not proactively
-bounded — the layered defenses (admission floor + MemAvailable backstop) catch
-that case. An operator who wants a hard per-session cap passes a smaller `--ctx`;
-`PULSAR_OVERCOMMIT=0` reverts to classic full-charge admission (1M ⇒ a single
-session).
-
-### Startup warmup and session admission
-
-At startup, before the listener accepts requests, the server logs the overcommit
-fit table and runs a short warmup generation that materializes the
-first-generation CUDA working set (~7.2 GiB). Warmup lets admission measure the
-*actual* memory cost of a slot rather than estimate it. At the 1M default the
-boot log reads, for example (this capture is from an earlier 5-bank-default
-build; the current default auto-sizes up to 8 banks, and the GiB figures vary
-with the artifact — the shape of the ledger is what matters; to be re-captured
-on the next boot):
-
-```text
-pulsar-server: context buffers 2.94 GiB (ctx=1048576, backend=cuda,
-  prefill_chunk=4096, kv=2.44 GiB [raw 0.07 + comp/idx 2.38], scratch 0.50 GiB,
-  raw_kv_rows=4352, compressed_kv_rows=262146)
-Tier-2 pool fit table (budget 14.0 GiB, cap 5 banks):
-  ctx  131072: fits 5 bank(s) (1-bank 4.57 GiB, 5-bank 7.41 GiB)
-  ctx 1048576: fits 2 bank(s) (1-bank 9.59 GiB, 2-bank 13.89 GiB)
-Tier-2 OVERCOMMIT auto-sized to 5 bank(s) for --ctx 1048576: eager floor
-  0.20 GiB/bank charged; demand-paged VA 2.38 GiB/bank reserved (physical on
-  touch, NOT charged); shared 5.28 GiB; admission est 6.26 GiB (batching ON)
-warmup generation: 4160 prompt + 12 decode tokens in 10.8 s;
-  MemAvailable 16.08 -> 12.13 GiB (first-generation working set materialized)
-Tier-2 shared pool ACTIVE: 5 banks, unified batch decode (L118), per-bank
-  marginal 1.25 GiB (pool resident actual 26.80 GiB)
-Tier-2 2b guard ENABLED: touched budget 7.69 GiB (kv budget 13.95 - eager 6.26),
-  spill dir ./ds4-spill
-```
-
-Without overcommit the 1M context would admit a single session (the full-charge
-fit table shows only 2 banks fit even at the 1M ceiling); with overcommit the
-same box brings up the full bank pool at the eager floor and lets each grow into its
-touched budget under the eviction guard. Admission is driven by this measured
-ledger, not a fixed slot count. (Prefill numbers are effectively post-warmup —
-the first real request already has its working set resident, which is why cold
-and process-warm prefill agree within run-to-run noise.)
-
-Long-context KV state is kept compact by default: the compressed-attention
-cache uses a bit-exact packed value layout (`PULSAR_ATTN_PACK`, on by default),
-and the ratio-4 indexer cache — the dominant KV term at very long context —
-is stored MXFP4-packed (`PULSAR_IDX_FP4`, on by default). Set either to `0` only
-for debugging comparisons against the plain f32 layouts.
-
-## Speculative decoding (DSpark)
-
-Pulsar has exactly one drafter: **DSpark**. The earlier MTP drafter path
-was removed rather than kept as a semi-supported variant. The drafter's
-tensors ship merged inside the main model GGUF and the engine auto-enables
-speculative decoding when it detects them at load — no extra file or flag
-needed. `--no-dspark` opts out. The `pulsar-bench` development tool
-intentionally measures the plain-decode baseline.
-
-Acceptance is **the plain sampler's own draw at all temperatures**: every
-token of a request has its own key in the request's seeded stream, a function
-of (seed, token index) only, and a draw at a key is an exponential race (the
-Gumbel-max trick) with one uniform per candidate hashed from (key, token id).
-The verify walk draws the target's token at each row at that key -- exactly
-what plain decode would emit there -- and a draft is accepted iff it IS that
-token; the drafter draws its sampled drafts at the same keys, so a draft is
-the target's token with probability at least (1 - TV) / (1 + TV) of the two
-distributions, whatever order either ranks its candidates in (the
-drafter-invariant coupling). The speculative path filters logits exactly
-like the plain sampler (temperature scale, top-k, min-p, top-p), so the walk
-introduces no bias -- greedy decoding is just the point-mass special case of
-the same walk -- and a seeded request is the same text whichever lane decodes
-which of its tokens (the server's lane price moves a stream between the plain
-and speculative lanes on measured wall-clock prices). Speculative decoding is a
-speed knob, not a quality knob, and it applies to the sampling recipes people
-actually use, not only temperature 0.
-
-One honest numerics caveat: the verify pass evaluates draft rows through the
-batch kernel family, whose floating-point accumulation order differs from
-single-token decode by ~1 ULP — the same class of difference as batched
-inference in any engine (and as our own M≥2 co-batched decode, noted under
-Server). On a near-tie argmax that can flip a token, so a speculative greedy
-continuation is not guaranteed byte-identical to plain greedy decode; the
-divergence is quality-neutral (verified on the 84-scenario hardmode suite)
-and irrelevant under sampling. Within one numerics class the engine is
-run-to-run deterministic: fixed accumulation orders, no atomic-order races,
-so the same prompt, parameters, and seed reproduce the same output across
-runs.
-
-### Yield-quench safety net
-
-A draft that is rarely accepted costs more than it saves, so on shallow or
-low-acceptance requests speculation can be a net slowdown. This release pairs the
-drafter with a **yield-quench** controller: it tracks each request's realized
-draft economics (an EWMA of per-step speedup and an accumulated debt) and, once a
-request is clearly losing, latches *that request* to plain decode for the
-remainder — bounding the worst case. The controller has to run a short mandatory
-pre-latch window (`WARMUP=3` + `MINEV=8` steps) speculatively before it can fire,
-so on very short or low-α generations a small residual cost survives. Measured in
-this release's sweep, quench caps the worst case from **~−26%** (unquenched
-speculation on the historically-losing prose / `temp:1.0` / thinking-off cell)
-to a **−2% to −6%** residual on the shallow, low-acceptance cells. The honest
-claim is therefore **"speculation's downside is now capped to a few percent,"**
-not "speculation never hurts." When quench fires it logs, e.g.:
-
-```text
-pulsar: dspark yield-quench pos=330 steps=13 debt=5.92 ewma=-0.60 -> plain decode for request remainder
-```
-
-The min-p draft prefilter on the speculative path is bit-exact at the production
-sampling parameters (`top_p=1.0`), so both quench and the prefilter change only
-speed, never the sampled output distribution.
-
-## Prefill chunking
-
-Prefill chunking is configurable and affects the KV checkpoint/logit path.
-Sessions prefill long prompts in 4096-token chunks by default; use
-`PULSAR_CUDA_PREFILL_CHUNK=N` (or `pulsar-bench --prefill-chunk N`) to compare
-another chunk size, for example `2048` to match the strict official-vector
-checkpoint path,
-or `0` to prefill a prompt as one whole batch when memory allows. Changing the
-chunk changes the KV checkpoint/logit path, so compare it as an explicit run
-configuration. Chunked GPU prefill reuses the same range-capable layer-major
-graph for each chunk, preserving absolute compressor/indexer boundaries while
-avoiding the old per-layer chunk dispatch path.
-
-## Server
-
-Start a local OpenAI/Anthropic-compatible server:
-
-```sh
-./pulsar-server --ctx 100000
-```
-
-The disk KV cache is on by default (see [Disk KV Cache](#disk-kv-cache));
-add `--kv-disk-dir DIR` / `--kv-disk-space-mb N` only to relocate or resize it,
-or `--no-kv-disk` to turn it off.
-
-For benchmarking and evals, `PULSAR_EVAL_PIN=1` makes serving
-**history-independent**: thinking-bind routing, warm bank forks and live
-prefix continuation are all disabled at their choke points, so every request
-cold-prefills and the same request always produces the same output no matter
-what the server handled before.  Warm reuse legitimately moves borderline
-outputs in either direction (measured at up to ±10 points of eval swing on
-identical greedy requests), so published numbers should be taken pinned —
-pair with `--no-kv-disk` for a fully cold protocol.  Production leaves the
-pin off: the reuse is the TTFT win.
-
-The model id reported in `/v1/models`, `/version`, and the `/metrics` label is
-derived from the loaded GGUF shape (`deepseek-v4-flash` / `deepseek-v4-pro`);
-the display name is the model's shape name. Neither affects the KV cache
-(keyed by gguf path + numeric model id) or request acceptance (the incoming
-`model` field is not validated).
-
-The server keeps one mutable backend/KV checkpoint in memory,
-so stateless clients that resend a longer version of the same prompt can reuse
-the shared prefix instead of pre-filling from token zero.
-
-Request parsing and sockets run in client threads; inference runs on one graph
-worker. The server serves **multiple concurrent sessions** from a small pool of
-banks admitted against a measured KV/VRAM budget. As of **v0.3.1**, concurrently
-decoding banks share **one batched decode step** (Tier-2 batched multi-session
-decode), so aggregate decode throughput now *scales* with concurrency rather than
-being the single-stream rate divided across sessions; concurrent prefills overlap
-as well. The default context is the model's **1M-token** limit with overcommit
-on, so a bank is admitted at its eager floor and grows into its touched budget
-under the eviction guard rather than being charged the full 1M up front (see
-Model residency). A returning client whose bank was evicted resumes from a disk
-KV snapshot instead of re-prefilling, and requests beyond the admission budget
-queue or are refused rather than driving the box out of memory.
-
-One property of batched decode is worth noting for reproducibility: an M≥2
-co-batched forward differs by ~1 ULP from the single-sequence path (different
-GEMM tiling / reduction order). This is invisible under sampling (`temp` > 0) and
-distribution-preserving, but at **greedy `temp:0`** it can flip a near-tie argmax,
-so a request's greedy continuation can depend on what else is co-scheduled at the
-moment — the same class of numerical nondeterminism as batched inference in other
-engines. Likewise, v0.3.1's head-grouped decode-attention kernel is not
-bit-identical to v0.2.3 at depth, so a given greedy prompt's continuation may
-differ from the prior release (quality-verified neutral). The
-`PULSAR_CUDA_NO_INDEXED_DECODE_HEADS8` escape hatch that once restored the prior
-kernel was retired in the v0.5.0 switch audit — there is no longer a second
-kernel to fall back to.
-Two further guardrails keep a misbehaving client from wedging the server:
-concurrent client connections are capped (64; connections over the cap get an
-immediate 503 instead of piling up threads), and a whole-request read deadline
-(30 seconds) drops clients that never finish sending their request.
-
-Supported endpoints:
-
-- `GET /health` — readiness + live status: `{status, version, model, uptime_s, slots{total,running,waiting}, kv_cache_usage}`; **200** when serving, **503 `{"status":"draining"}`** once shutdown is requested (so a load balancer stops routing)
-- `GET /healthz`, `GET /ping` — liveness (always **200** while the process runs, independent of drain state)
-- `GET /version` — `{version, engine, cuda_arch, model, model_name, context}`
-- `GET /` — banner with version + endpoint list
-- `GET /v1/models`
-- `GET /v1/models/{id}`
-- `POST /v1/chat/completions` — OpenAI-compatible
-- `POST /v1/completions` — OpenAI-compatible: the prompt is continued raw (no chat template, no thinking), on every family
-- `POST /v1/responses` — OpenAI Responses (Codex CLI)
-- `POST /v1/messages` — Anthropic-compatible (Claude Code style clients)
-- `GET /metrics` — Prometheus counters (spec-decode acceptance, token totals,
-  request latency, per-slot generation phase, pool churn and admission pressure)
-
-`GET /v1/models/{id}` accepts any id (`deepseek-v4-flash`, `deepseek-v4-pro`)
-as a compatibility alias: it reports the model actually loaded from the GGUF
-passed with `-m`; the id does not select a different model.
-
-Use `GET /health` for readiness/status (or `GET /v1/models`, which also
-returns 200 when the model is loaded and serving).
-
-`/v1/chat/completions` accepts the usual OpenAI-style `messages`,
-`max_tokens`/`max_completion_tokens`, `temperature`, `top_p`, `top_k`, `min_p`,
-`seed`, `stream`, `stream_options.include_usage`, `tools`, `tool_choice`,
-`logprobs`, and `top_logprobs` (0–20). Tool schemas are rendered into
-DeepSeek's DSML tool format, and generated DSML tool calls are mapped back to
-OpenAI tool calls. A `logprobs` request decodes with speculative decoding
-disabled — the reported distribution is the target model's at each drawn
-position, which the fused speculative step cannot reconstruct — so it trades
-decode throughput for honest numbers.
-
-`/v1/responses` accepts OpenAI Responses-style `input`, `instructions`,
-`tools`, `tool_choice`, `max_output_tokens`, `temperature`, `top_p`, `top_k`,
-`min_p`, `seed`, `stream`,
-and `reasoning`. It is the preferred endpoint for Codex CLI. The server keeps
-Responses continuations bound to live state when possible, and can fall back to
-the same DSML rendering and KV prefix reuse used by chat completions.
-
-`/v1/messages` is the Anthropic-compatible endpoint used by Claude Code style
-clients. It accepts `system`, `messages`, `tools`, `tool_choice`, `max_tokens`,
-`temperature`, `top_p`, `top_k`, `min_p`, `seed`, `stream`, `stop_sequences`,
-and thinking controls. Tool uses are returned as Anthropic `tool_use` blocks.
-
-Default sampled API generation uses `temperature=1`, `top_p=1`, and
-`min_p=0.05`, so the default filter is relative probability rather than
-nucleus mass. Those defaults apply only to parameters the request leaves
-absent (in thinking and non-thinking mode alike); any sampling knob the client
-sends explicitly is respected as-is, including `temperature=0` to select
-greedy decode (which lets DSpark speculative decoding engage). During
-structured tool-call output the server still forces greedy decode regardless
-of the request's sampling parameters. `min_p` is range-validated at parse time:
-an out-of-range value disables the min-p filter (the same convention `top_p`
-uses out of range) rather than being silently clamped.
-
-The chat, Responses, and Anthropic endpoints support SSE streaming. In thinking
-mode, reasoning is streamed in the native API shape instead of being mixed into
-final text. This holds even when generation stops inside an unterminated
-`<think>` block (token cap or stop sequence): the partial reasoning is
-returned on the reasoning channel and never as visible content, on both the
-streaming and non-streaming paths. OpenAI chat streaming
-also streams tool calls as soon as the DSML invocation is recognized: the tool
-header is sent first, then parameter bytes are forwarded as
-`tool_calls[].function.arguments` deltas while generation continues. The
-Anthropic endpoint streams thinking and text live, then emits structured
-`tool_use` blocks when the generated tool block is complete.
-The Responses endpoint streams the Responses event lifecycle expected by Codex,
-including `response.output_text.delta`, function-call argument events, and
-terminal `response.completed` / `response.incomplete` / `response.failed`
-events.
-
-> **Network exposure.** `pulsar-server` binds **`0.0.0.0` (all interfaces) by
-> default** and has **no authentication** — any host that can reach the port can
-> use the model, the agent tools, and `/metrics`. This is a deliberate
-> single-node, trusted-LAN design: run it only on a network you control. To
-> restrict it to the local machine, pass `--host 127.0.0.1`. Do not expose the
-> port directly to the public internet; put it behind your own authenticating
-> reverse proxy if you need remote access.
-
-### Tool call handling and canonicalization
-
-DeepSeek V4 emits tool calls as [DSML text](https://huggingface.co/deepseek-ai/DeepSeek-V4-Pro/blob/main/encoding/README.md). Agent clients do not send that
-same text back on the next request: they send normalized OpenAI/Anthropic JSON
-tool-call objects. **If the server re-rendered those objects slightly
-differently, the rendered byte prefix would no longer match the live KV
-checkpoint** and the next turn would have to be rebuilt.
-
-The first line of defense is exact replay. Every tool call gets an unguessable
-API tool ID, and the server remembers `tool id -> exact sampled DSML block` in
-a bounded in-memory map backed by radix trees. When the client later sends that
-tool ID back, the prompt renderer uses the exact DSML bytes the model sampled,
-not a freshly formatted approximation. This map can also be saved inside KV
-cache files, so exact replay survives server restarts for cached histories.
-
-**Canonicalization is only the backup path**. If the exact DSML block is
-missing, the server renders a deterministic DSML form from the JSON tool
-object. After a tool-call
-turn, it compares the live sampled token stream with the prompt that the next
-client request will render. If needed, it rewrites the live checkpoint, or
-falls back to an older disk KV snapshot and replays only the suffix. This keeps
-the model continuation aligned with the stateless API transcript.
-
-Tool **schemas** are canonicalized on the way in (ported from upstream ds4):
-the OpenAI `function` object is re-rendered in the official tokenizer's
-lexical form — Python separators, decoded UTF-8, preserved key order — so
-semantically identical toolsets tokenize identically no matter how the
-client's JSON serializer spells them.  That keeps schema bytes on the
-model's trained distribution, and it means two clients advertising the same
-tools (or one client changing serializers) hit the same warm-bank prefixes
-and disk KV keys instead of forking cold.  A schema the canonicalizer cannot
-round-trip is passed through verbatim (fail-open).
-
-Truncated tool calls are repaired rather than dropped: a generation cut
-mid-call (length stop) has its missing DSML closing tags appended, a
-trailing partial closing tag of any DSML style is trimmed instead of leaking
-into the argument value, and the streaming paths close an open string and
-args object so the wire JSON stays well-formed with `finish_reason` marking
-the cut.
-
-During generation, the server also treats DSML syntax differently from payload.
-When the model is emitting stable protocol structure such as DSML tags,
-parameter headers, JSON punctuation, or closing markers, sampling is forced to
-`temperature=0` so the tool call stays parseable. This greedy mode does **not**
-apply to argument payloads: `string=true` parameter bodies and JSON string
-values, including file contents and edit text, use the request's normal sampling
-settings. That separation is important: deterministic decoding is helpful for
-syntax, but can create repeated text when applied to long code or file bodies.
-
-Minimal OpenAI example:
-
-```sh
-curl http://127.0.0.1:8000/v1/chat/completions \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "model":"deepseek-v4-flash",
-    "messages":[{"role":"user","content":"List three Redis design principles."}],
-    "stream":true
-  }'
-```
-
-### Anthropic server tools
-
-Anthropic-style clients (Claude Code among them) may advertise **server**
-tools -- a `{"type":"web_search_20250305"}` entry that expects the backend to
-run the search mid-request. `pulsar-server` executes no server tools: such
-entries are dropped at parse time (one `tool`-level log line per request)
-so the model never emits a call nobody can run. Web search, when wanted, is
-the job of the router in front of the server, which injects results into the
-prompt.
-
-### Agent Client Usage
-
-`pulsar-server` can be used by local coding agents that speak OpenAI-compatible
-chat completions. Start the server first, and set the client context limit no
-higher than the `--ctx` value you started the server with:
-
-```sh
-./pulsar-server --ctx 100000
-```
-
-You can use larger context and larger cache if you wish, up to the model's
-1M-token context limit. The default MXFP4-packed indexer cache keeps
-long-context KV state far below its old f32 cost, but configure a context
-which makes sense in your system: on the GB10 with ~128GB of unified memory,
-the ~91GB Flash build takes most of the memory, so size the context window to
-the headroom you actually have and to the prefill time you are willing to pay.
-
-The `384000` output limit below avoids token caps since the model is able
-to generate very long replies otherwise (up to 384k tokens). The server
-still stops when the configured context window is full.
-
-For **opencode**, add a provider and agent entry to
-`~/.config/opencode/opencode.json`:
-
-```json
-{
-  "$schema": "https://opencode.ai/config.json",
-  "provider": {
-    "pulsar": {
-      "name": "pulsar (local)",
-      "npm": "@ai-sdk/openai-compatible",
-      "options": {
-        "baseURL": "http://127.0.0.1:8000/v1",
-        "apiKey": "dsv4-local"
-      },
-      "models": {
-        "deepseek-v4-flash": {
-          "name": "DeepSeek V4 Flash (pulsar local)",
-          "limit": {
-            "context": 100000,
-            "output": 384000
-          }
-        }
-      }
-    }
-  },
-  "agent": {
-    "pulsar": {
-      "description": "DeepSeek V4 Flash served by local pulsar-server",
-      "model": "pulsar/deepseek-v4-flash",
-      "temperature": 0
-    }
-  }
-}
-```
-
-For **Pi**, add a provider to `~/.pi/agent/models.json`:
-
-```json
-{
-  "providers": {
-    "pulsar": {
-      "name": "pulsar local",
-      "baseUrl": "http://127.0.0.1:8000/v1",
-      "api": "openai-completions",
-      "apiKey": "dsv4-local",
-      "compat": {
-        "supportsStore": false,
-        "supportsDeveloperRole": false,
-        "supportsReasoningEffort": true,
-        "supportsUsageInStreaming": true,
-        "maxTokensField": "max_tokens",
-        "supportsStrictMode": false,
-        "thinkingFormat": "deepseek",
-        "requiresReasoningContentOnAssistantMessages": true
-      },
-      "models": [
-        {
-          "id": "deepseek-v4-flash",
-          "name": "DeepSeek V4 Flash (pulsar local)",
-          "reasoning": true,
-          "thinkingLevelMap": {
-            "off": null,
-            "minimal": "low",
-            "low": "low",
-            "medium": "medium",
-            "high": "high",
-            "xhigh": "xhigh"
-          },
-          "input": ["text"],
-          "contextWindow": 100000,
-          "maxTokens": 384000,
-          "cost": {
-            "input": 0,
-            "output": 0,
-            "cacheRead": 0,
-            "cacheWrite": 0
-          }
-        }
-      ]
-    }
-  }
-}
-```
-
-Optionally make it the default Pi model in `~/.pi/agent/settings.json`:
-
-```json
-{
-  "defaultProvider": "pulsar",
-  "defaultModel": "deepseek-v4-flash"
-}
-```
-
-For **Codex CLI**, use the Responses wire API:
-
-```toml
-[model_providers.pulsar]
-name = "Pulsar"
-base_url = "http://127.0.0.1:8000/v1"
-wire_api = "responses"
-stream_idle_timeout_ms = 1000000
-```
-
-Then run:
-
-```sh
-codex --model deepseek-v4-flash -c model_provider=pulsar
-```
-
-For **Claude Code**, use the Anthropic-compatible endpoint. A wrapper like this
-matches the local `~/bin/claude-ds4` setup:
-
-```sh
-#!/bin/sh
-unset ANTHROPIC_API_KEY
-
-export ANTHROPIC_BASE_URL="${PULSAR_ANTHROPIC_BASE_URL:-http://127.0.0.1:8000}"
-export ANTHROPIC_AUTH_TOKEN="${PULSAR_API_KEY:-dsv4-local}"
-export ANTHROPIC_MODEL="deepseek-v4-flash"
-
-export ANTHROPIC_CUSTOM_MODEL_OPTION="deepseek-v4-flash"
-export ANTHROPIC_CUSTOM_MODEL_OPTION_NAME="DeepSeek V4 Flash local pulsar"
-export ANTHROPIC_CUSTOM_MODEL_OPTION_DESCRIPTION="pulsar local GGUF"
-
-export ANTHROPIC_DEFAULT_SONNET_MODEL="deepseek-v4-flash"
-export ANTHROPIC_DEFAULT_HAIKU_MODEL="deepseek-v4-flash"
-export ANTHROPIC_DEFAULT_OPUS_MODEL="deepseek-v4-flash"
-export CLAUDE_CODE_SUBAGENT_MODEL="deepseek-v4-flash"
-
-export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
-export CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK=1
-export CLAUDE_STREAM_IDLE_TIMEOUT_MS=600000
-
-exec "$HOME/.local/bin/claude" "$@"
-```
-
-Claude Code may send a large initial prompt, often around 25k tokens, before it
-starts doing useful work. Keep the default-on disk KV cache enabled (do not pass
-`--no-kv-disk`): after the first expensive prefill, the disk KV cache lets later
-continuations or restarted sessions reuse the saved prefix instead of
-processing the whole prompt again.
-
-## Thinking Modes
-
-DeepSeek V4 Flash has a non-thinking mode plus the three 0731 reasoning-effort
-levels: `low` (the default — plain thinking, no effort prefix), `high`, and
-`max`, each realized as a fixed instruction prefix rendered before the system
-message. The server defaults to `low`. `reasoning_effort=high` and
-`reasoning_effort=max` request their prefixes, but only when the context size
-is large enough for the model card recommendation; smaller contexts fall back
-to `low`. OpenAI `reasoning_effort=xhigh` maps to `max`, and
-`minimal`/`medium` map to `low`.
-
-For direct replies, use `thinking: {"type":"disabled"}`, `think:false`, or a
-non-thinking model alias such as `deepseek-chat`.
-
-## Disk KV Cache
-
-Chat/completion APIs are stateless: agent clients usually resend the whole
-conversation every request. `pulsar-server` first tries the cheap exact token-prefix
-check, then falls back to comparing rendered prompt bytes with decoded
-checkpoint bytes. The live in-memory checkpoint covers the current session; the
-disk KV cache makes useful prefixes survive session switches and server
-restarts.
-
-For RAM reasons there is currently only one live KV cache in memory. When a new
-unrelated session replaces it, the old checkpoint can only be resumed without
-re-processing if it was written to the disk KV cache. In other words, memory
-cache handles the active session; disk cache is the resume mechanism for
-different sessions.
-
-The disk KV cache is **on by default**. When `--kv-disk-dir` is not given, the
-server resolves `$XDG_CACHE_HOME/pulsar/kv-<model>` (else `~/.cache/pulsar/kv-<model>`),
-where `<model>` is the symlink-resolved gguf basename — so two different model
-artifacts never share a default directory, while restarts of the same model
-find their checkpoints again. The resolved directory and disk budget are logged
-at startup. If the directory cannot be created or is not writable, the server
-logs that once and keeps serving with the disk cache disabled — it never fails
-to start over cache placement.
-
-```sh
-./pulsar-server                                        # default-on, default dir
-./pulsar-server --kv-disk-dir /tmp/ds4-kv --kv-disk-space-mb 8192   # custom
-./pulsar-server --no-kv-disk                           # opt out (or --kv-disk-dir "")
-```
-
-The disk budget defaults to 65536 MiB (`--kv-disk-space-mb`); least-valuable
-checkpoints are evicted when the budget fills. Snapshot behavior is unchanged
-by the default-on switch: files are written with ordinary write + fsync + rename
-into place, and the store validates the model variant and the rendered byte
-prefix before restoring (quant bits are recorded and logged, not refused;
-the per-artifact default directory is what keeps different builds'
-checkpoints apart). Note that on unified-memory hosts (GB10) the
-checkpoint writes pass through the host page cache, which competes with GPU
-memory — the usual `sync; echo 3 > /proc/sys/vm/drop_caches` discipline before
-a model load still applies; pass `--no-kv-disk` if you want none of that
-pressure.
-
-The cache key is the SHA1 of the rendered byte prefix, and files are named
-`<sha1>.kv`. The Pulsar payload still stores the exact token IDs and graph state
-for that prefix. This matters for continued chats: the model may have generated
-one token whose decoded text is later sent back by a client as two canonical
-prompt tokens. A rendered byte-prefix hit can still reuse the checkpoint and
-tokenize only the new suffix.
-The file is intentionally written with ordinary `read`/`write` I/O, not
-`mmap`, so restoring cache entries does not add more VM mappings to a process
-that already maps the model.
-
-Tool calls also keep a bounded exact-DSML replay map keyed by unguessable tool
-IDs, so client JSON history can be rendered back to the exact sampled text. The
-RAM map keeps up to 100000 IDs (oldest pruned first); when an ID is missing,
-the server falls back to canonical JSON-to-DSML rendering.
-
-On disk, a cache file is:
-
-```text
-KVC fixed header, 48 bytes
-u32 rendered_text_bytes
-rendered_text_bytes of UTF-8-ish token text
-Pulsar session payload, payload_bytes from the KVC header
-optional tool-id map section
-```
-
-The fixed header is little-endian:
-
-```text
-0   u8[3]  magic = "KVC"
-3   u8     version = 1
-4   u8     routed expert quant bits, currently 2 or 4
-5   u8     save reason: 0 unknown, 1 cold, 2 continued, 3 evict, 4 shutdown
-6   u8     extension flags, bit 0 = appended tool-id map
-7   u8     reserved
-8   u32    cached token count
-12  u32    hit count
-16  u32    context size the snapshot was written for
-20  u8[4]  reserved
-24  u64    creation Unix time
-32  u64    last-used Unix time
-40  u64    Pulsar session payload byte count
-```
-
-The rendered text is the tokenizer-decoded text for the cached token prefix.
-It is both the human-inspectable prefix and the lookup identity: its SHA1 is
-the filename, and a file is reusable only when those bytes are a prefix of the
-incoming rendered prompt. After load, the exact checkpoint tokens from the Pulsar
-payload remain authoritative, and only the incoming text suffix after the cached
-bytes is tokenized.
-
-The optional tool-id map is present only when header extension bit 0 is set.
-Appended sections use fixed bit order, so future extension bits can add fields
-without ambiguity. The map stores unguessable API tool call IDs back to the
-exact DSML block the model sampled. Only mappings whose DSML block is present
-in the rendered cached text are stored. This lets restarted servers render
-later client history byte-for-byte like the original model output, even if the
-client reorders JSON arguments.
-
-The current tool-id map section is:
-
-```text
-0   u8[3]  magic = "KTM"
-3   u8     version = 1
-4   u32    entry count
-
-For each entry:
-0   u32    tool id byte length
-4   u32    sampled DSML byte length
-8   bytes  tool id
-... bytes  exact sampled DSML block
-```
-
-The section is auxiliary replay memory, not model state. A cache hit restores
-the session payload first, then loads the map if present. Before rendering a
-request, the server can also scan cache files for the tool IDs present in the
-client history and load just those mappings, so an exact DSML replay can survive
-server restarts even when the matching KV snapshot is not the one ultimately
-used for the rendered-prefix hit.
-
-The Pulsar session payload starts with thirteen little-endian `u32` fields:
-
-```text
-0   magic = "DSV4"
-1   payload version = 2
-2   saved context size
-3   prefill chunk size
-4   raw KV ring capacity
-5   raw sliding-window length
-6   compressed KV capacity
-7   checkpoint token count
-8   layer count
-9   raw/head KV dimension
-10  indexer head dimension
-11  vocabulary size
-12  live raw rows serialized below
-```
-
-Then it stores:
-
-- `u32[token_count]` checkpoint token IDs.
-- `float32[vocab_size]` logits for the next token after that checkpoint.
-- `u32[layer_count]` compressed attention row counts.
-- `u32[layer_count]` ratio-4 indexer row counts.
-- For every layer: the live raw sliding-window KV rows, written in logical
-  position order rather than physical ring order.
-- For compressed layers: live compressed KV rows and compressor frontier
-  tensors.
-- For ratio-4 compressed layers: live indexer compressed rows and indexer
-  frontier tensors.
-
-The logits are raw IEEE-754 `float32` values from the host `pulsar_session`
-buffer. They are saved immediately after the checkpoint tokens so a loaded
-snapshot can sample or continue from the exact next-token distribution without
-running one extra decode step. Speculative draft state is not persisted; after
-loading a disk checkpoint it is invalidated and rebuilt by normal generation.
-
-The tensor payload is Pulsar-specific KV/session state, not a generic inference
-graph dump. It is expected to be portable only across compatible Pulsar
-builds for this model layout.
-
-The cache stores checkpoints at four moments:
-
-- `cold`: after a long first prompt reaches a stable prefix, before generation.
-- `continued`: when prefill or generation reaches the next absolute aligned frontier.
-- `evict`: before an unrelated request replaces the live in-memory session.
-- `shutdown`: when the server exits cleanly.
-
-Cold saves intentionally trim a small token suffix and align down to a prefill
-chunk boundary. This avoids common BPE boundary retokenization misses when a
-future request appends text to the same prompt. The policy is fixed and
-conservative: store prefixes of at least 512 tokens, cold-save prompts up to
-30000 tokens, trim 32 tail tokens, and align to 2048-token chunks.
-
-Continued saves use the same alignment and are written only when the live graph
-naturally reaches an absolute frontier. With the defaults this means roughly
-every 10k tokens, independent of where the first cold checkpoint landed, so long
-generations leave restart points behind without persisting the fragile final few
-tokens.
-
-Checkpoints may be reused across the 2-bit and 4-bit routed-expert
-variants if the rendered prefix matches (quant bits are recorded and logged).
-
-The cache directory is disposable. If behavior looks suspicious, stop the
-server and remove it. You can investigate what is cached with hexdump as
-the kv cache files include the verbatim prompt cached.
-
-## Building
-
-Pulsar is **CUDA-only**; the whole model runs as a single CUDA-graph
-inference path. Plain `make` prints the available build targets instead of
-selecting one implicitly. For the DGX Spark / GB10 (the validated production
-target) build with:
-
-```sh
-make cuda-spark
-```
-
-The CUTLASS MXFP4 expert path requires the **`sm_120f`** family arch for its
-block-scaled tensor-core MMA, so `cuda-spark` builds with `CUDA_ARCH=sm_120f`.
-This fork targets the GB10 only; there is a single build target, and
-`make cuda-spark` builds only the shipped binary, `pulsar-server`.
-
-If a binary is run on a GPU whose architecture it was not built for, it **fails
-fast at startup**: every translation unit's compiled arch list is checked at
-init, and a mismatch aborts with rebuild instructions instead of crashing later
-inside a kernel launch.
-
-### Development tools
-
-The tree also builds `pulsar` (the CLI), `pulsar-bench` (speed microbench), `pulsar-eval`
-(embedded capability check), and `pulsar-agent` (native coding agent) via
-`make <name>` — for example `make pulsar-bench`. These are development tools for
-contributors; they are not part of the release and are not built by
-`make cuda-spark`. Some are untested after the pre-release cleanup.
-
-## Steering
-
-This project supports steering with single-vector activation directions; see the
-`dir-steering` directory for more information. This follows the core idea of the
-[Refusal in Language Models Is Mediated by a Single Direction](https://arxiv.org/abs/2406.11717)
-paper. You can use it to make the model more or less verbose, less likely to
-answer programming questions if it is a chatbot for your car rental web site,
-and so forth, much faster than fine-tuning.
-This is also useful for cybersecurity researchers who want to reduce a model's
-willingness to provide dual-use or offensive security guidance.
-
-`pulsar-server` exposes steering directly: point it at a direction file and set the
-per-path scales (`--dir-steering-ffn` after FFN outputs, `--dir-steering-attn`
-after attention outputs):
-
-```sh
-./pulsar-server -m ds4flash.gguf --ctx 100000 \
-  --dir-steering-file dir-steering/out/verbosity.f32 \
-  --dir-steering-ffn -4.0
-```
-
-With no steering file or zero scales the server follows the normal inference
-path.
-
-## Test Vectors
-
-`tests/test-vectors` contains short and long-context continuation vectors
-captured from the official DeepSeek V4 Flash API. The requests use
-`deepseek-v4-flash`, greedy decoding, thinking disabled, and the maximum
-`top_logprobs` slice exposed by the API. Local vectors are generated with
-`./pulsar --dump-logprobs` (the `pulsar` development CLI, built with `make pulsar`) and
-compared by token bytes, so tokenizer/template or
-attention regressions show up before they become long generation failures. The
-C runner pins `PULSAR_CUDA_PREFILL_CHUNK=2048` for this strict API-vector
-comparison.
-
-All project tests are driven by the C runners:
-
-```sh
-make test                  # pulsar_test
-./pulsar_test --logprob-vectors
-./pulsar_test --server
-```
-
-`pulsar_test` loads a model (`PULSAR_TEST_MODEL`, default `./ds4flash.gguf`);
-`pulsar_agent_test` and the eval self-test run without one. `make
-cuda-regression` runs a GPU kernel smoke test that needs no model.
-
-## Debugging Notes
-
-When a generation looks wrong, a few small tools are usually enough to get a
-first answer. `pulsar-server --trace` is the one that works against the shipped
-binary; the `--dump-*` probes live on the `pulsar` development CLI (`make pulsar`):
-
-```sh
-./pulsar-server --trace /tmp/pulsar-trace.txt ...
-./pulsar --dump-tokens -p "..."
-./pulsar --dump-logprobs /tmp/out.json --logprobs-top-k 20 --temp 0 -p "..."
-./pulsar --dump-logits /tmp/logits.json --nothink --prompt-file prompt.txt
-```
-
-- `--dump-tokens` tokenizes the `-p` or `--prompt-file` string exactly as
-  written, recognizes Pulsar protocol specials, and then exits before inference
-  starts. For example, the DSML tool close marker starts as two tokens: `</`
-  and `｜DSML｜`.
-- `--dump-logprobs` stores a greedy continuation with the top local
-  alternatives at each step, which helps separate sampling choices from
-  logit/model issues.
-- `pulsar-server --trace` writes the rendered prompts, cache decisions, generated
-  text, and tool-parser events for a whole agent session.
-
-## Roadmap
-
-This is the current development direction. Near-term items are planned for
-the v1.x series; longer-term items are directional and may be reordered or
-dropped as measurements come in.
-
-### Near term (v1.x)
-
-- **Fused K-row GPU accept kernel.** The sampled verify currently reads
-  per-row logits back to the host; a fused accept kernel removes that
-  readback from the decode loop.
-- **Online drafter confidence calibration.** Replace the static
-  confidence schedule that trims low-confidence draft tails with an
-  adaptive threshold calibrated from observed acceptance.
-- **Agent-loop speculative decoding.** Wire speculative decoding into the
-  native agent loop, with rewind-on-forced-token handling so injected
-  protocol tokens do not desynchronize the drafter.
-
-Shipped and off the roadmap: the measured-allocation release artifact (the
-`v5mx` build, then the v4/0731 line), **temperature-matched draft sampling**
-(drafts are now sampled from the drafter's own distribution at the request's
-sampling parameters, at the key the target's draw for that token reads —
-see Speculative decoding), **batched multi-session decode** (Tier-2, since
-v0.3.1 — see Server), and the **CPU inference path retirement** (deleted;
-the engine is CUDA-only end to end).
-
-### Longer term
-
-- **MXFP6 tensor-core paths**, if measured demand holds. MXFP6 (E2M3) is
-  expected to beat `Q6_K` on quality-per-byte for FP8-source tensors.
-- **MoE verify-microbatch routing audit.** Verify batches are only a few
-  rows but currently pass through prefill-shaped routing machinery; audit
-  it and skip what a small batch does not need.
-- **Grouped MXFP4 prefill GEMM.** Prefill dispatches the CUTLASS MXFP4
-  expert GEMM per expert behind a blocking per-layer offset readback. A
-  single ptr-array grouped launch (available in the SM120 blockscaled
-  builder without a CUTLASS bump) would remove that readback and the
-  per-expert launch overhead — a prefill-only win, worth profiling first
-  since prefill is already competitive.
-- **Revisit the Q8_K activation quantization** used by the MoE kernels (the
-  CPU inference path itself is already gone).
-- **Upstream quantization-pipeline fixes.** Offer the fixes developed here
-  for the measured-KL allocation pipeline — Fisher-proxy normalization,
-  footprint accounting, solver corrections, DP decision units — to the
-  [PrismaQuant](https://github.com/RobTand/prismaquant) project.
+| `POST /v1/chat/completions` | OpenAI Chat Completions: streaming, tools, `tool_choice`, `response_format`, `logprobs`, images |
+| `POST /v1/responses` | OpenAI Responses (Codex CLI): streaming, function and custom tools, tool search, `text.format`, images |
+| `POST /v1/messages` | Anthropic Messages (Claude Code): streaming, thinking, tools, `output_config`, images |
+| `POST /v1/messages/count_tokens` | Anthropic token counting, rendered exactly as `/v1/messages` would |
+| `POST /v1/completions` | OpenAI Completions: the prompt is continued raw, with no chat template |
+| `GET /v1/models`, `GET /v1/models/{id}` | The loaded model only |
+| `GET /health` | Readiness and status: 200 `ok`; 503 `draining` or `stalled` |
+| `GET /healthz`, `GET /ping` | Liveness: always 200 while the process runs |
+| `GET /version`, `GET /` | Build and model identity; endpoint list |
+| `GET /metrics`, `GET /metrics/stream` | Prometheus text (vLLM-compatible names plus `pulsar:*`); an SSE change feed |
+| `POST /v1/embeddings`, `POST /v1/rerank`, `POST /v1/parse` | Encoder and Parse families only |
+
+Request fields, thinking and effort controls, tool-call handling, structured
+output and image rules are in [docs/SERVER.md#requests](docs/SERVER.md#requests).
+Ready-made settings for opencode, Pi, Codex CLI and Claude Code are in
+[docs/SERVER.md#client-setup](docs/SERVER.md#client-setup).
+
+## How serving behaves
+
+- **Banks.** A server holds a pool of warm session states ("banks"), sized at
+  startup against a measured memory budget (up to 16). Concurrent decoders share
+  one batched step, and queued prompts ride the decode rounds. A request is
+  routed to the bank holding the longest matching prefix. A prompt that does not
+  fit can preempt a running decoder, which resumes later exactly where it was.
+  Requests that arrive together on a new shared prefix wait for its first prefill
+  instead of each prefilling it.
+- **Disk KV cache.** On by default. Conversations persist as content-addressed
+  segment chains, cut on a fixed token grid, so copies and branches of one
+  conversation share segments. A returning conversation restores the deepest
+  stored state that matches it, in slices between decode rounds, and only when
+  reading it beats recomputing it.
+- **Memory floor and stall watchdog.** The server derives one free-memory floor
+  at startup and checks it before every bank, prefill chunk and disk write. When
+  memory runs short it spills idle banks, then preempts, and only then refuses
+  the request with a retryable 503. A watchdog thread reports a worker that has
+  stopped making progress on `/health` (503 `stalled`) and dumps its state to the
+  log once.
+- **Speculative decoding** is exact. A draft is accepted only if it is the token
+  the plain sampler would draw at that position, at every temperature. Greedy
+  continuations can still differ from plain decode by float rounding on near
+  ties, as with any batched engine.
+
+The details, defaults and the metrics that show each mechanism are in
+[docs/SERVER.md](docs/SERVER.md).
+
+## Documentation
+
+- [docs/SERVER.md](docs/SERVER.md): the server reference (flags, environment,
+  endpoints, request fields, scheduling, disk KV, memory, metrics, TP, clients).
+- [docs/RELEASE_NOTES_0.5.0.md](docs/RELEASE_NOTES_0.5.0.md): what changed since 0.4.2.
+- [docs/DESIGN.md](docs/DESIGN.md): the shape of the engine. Also the Doxygen
+  main page: `doxygen docs/Doxyfile` from the repository root.
+- [docs/ENGINEERING-RULES.md](docs/ENGINEERING-RULES.md),
+  [docs/CONTRIBUTING.md](docs/CONTRIBUTING.md),
+  [docs/QA_BEFORE_RELEASES.md](docs/QA_BEFORE_RELEASES.md): how changes are made
+  and gated.
+- [AGENTS.md](AGENTS.md): source layout and conventions (written for coding
+  agents; useful for people too).
+- [docs/ARTIFACT_BUILD.md](docs/ARTIFACT_BUILD.md) and
+  [tools/container/README.md](tools/container/README.md): building model
+  containers.
+- [docs/tensor-parallel-port.md](docs/tensor-parallel-port.md) and
+  [docs/tensor-parallel-split.md](docs/tensor-parallel-split.md): the
+  tensor-parallel design records.
+- [dir-steering/README.md](dir-steering/README.md): directional steering vectors.
+- [speed-bench/README.md](speed-bench/README.md) and
+  [tools/serve-bench/](tools/serve-bench/): speed measurement.
+- [tests/test-vectors/README.md](tests/test-vectors/README.md): reference vectors
+  used by the gates.
+- [docs/history/](docs/history/): dated reviews, bring-up notes and finished
+  plans, kept for the record and not maintained.
+
+## Acknowledgements
+
+Pulsar exists because of the work below. Code that is vendored or ported keeps
+its upstream licence and notice.
+
+- **[antirez/ds4](https://github.com/antirez/ds4)** (Salvatore Sanfilippo and
+  contributors): the DeepSeek V4 engine this tree was forked from. Its MIT
+  copyright notice is kept in [`LICENSE`](LICENSE).
+- **[llama.cpp / GGML](https://github.com/ggml-org/llama.cpp)** (Georgi Gerganov
+  and contributors): Pulsar does not link GGML, but its quantization layouts and
+  tables, host-side quant and dot logic, and the MMQ kernels that the 2-bit
+  routed-expert path descends from were retained or adapted under the MIT
+  licence. The GGML authors' notice is kept in [`LICENSE`](LICENSE); see
+  [src/cuda/mmq/VENDOR.md](src/cuda/mmq/VENDOR.md).
+- **[CUTLASS](https://github.com/NVIDIA/cutlass)** (NVIDIA, BSD-3-Clause): the
+  MXFP4 block-scaled grouped GEMM, and the memory-efficient attention kernel from
+  its examples (originally from xFormers), vendored verbatim in `src/cuda/fmha/`
+  ([VENDOR.md](src/cuda/fmha/VENDOR.md)).
+- **[xgrammar](https://github.com/mlc-ai/xgrammar)** (MLC, Apache-2.0): the
+  grammar engine behind structured output, vendored verbatim in
+  `src/vendor/xgrammar/` with its `LICENSE` and `NOTICE` (pin in `UPSTREAM`).
+- **[exllamav3](https://github.com/turboderp-org/exllamav3)** (turboderp): the
+  EXL3 trellis format. Pulsar's EXL3 decode is graded byte-exact against it, and
+  the Qwen3.8-Flash-Next containers are built from turboderp's EXL3 packs.
+- **[Tessera](https://github.com/RobTand/tessera)** (Robert Tand): the fused
+  routed-window kernel, vendored in `src/cuda/mmq/` with its licence
+  ([VENDOR-TESSERA.md](src/cuda/mmq/VENDOR-TESSERA.md)), and
+  **[PrismaQuant](https://github.com/RobTand/prismaquant)**, the measured-KL
+  mixed-precision allocation used for the DeepSeek builds.
+- **[FlashInfer](https://github.com/flashinfer-ai/flashinfer)** and its **b12x**
+  kernels: the model for the SM12x NVFP4 decode and the scale-plane layout
+  (`src/cuda/pulsar_cuda_nvfp4.cu`).
+- **[linenoise](https://github.com/antirez/linenoise)** (BSD-2-Clause): line
+  editing in the development CLI (`src/vendor/linenoise.*`).
+- The model authors: **DeepSeek** (V4 Flash, V4.1), **Qwen** (Qwen3.8-Flash-Next),
+  **NVIDIA** (Nemotron 3.5 Super, Embed, Rerank and Parse, and the LiLiCorr
+  drafter), the **Inkling** authors, and **incoai** (the DFlash2 drafter).
+- **[REAP](https://arxiv.org/abs/2510.13999)**: the router-weighted expert pruning
+  used by earlier DeepSeek builds.
+- **NVIDIA Flare**: the value-per-time idea behind the fused-lane round
+  selection (L312).
+
+## Licence
+
+MIT; see [`LICENSE`](LICENSE). Vendored components carry their own licences
+beside them: CUTLASS and its examples (BSD-3-Clause), xgrammar (Apache-2.0, with
+dlpack under Apache-2.0 and picojson under BSD-2-Clause), Tessera
+(`src/cuda/mmq/LICENSE-TESSERA`) and linenoise (BSD-2-Clause).

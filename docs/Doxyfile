@@ -8,7 +8,7 @@
 # curate.
 
 PROJECT_NAME           = "pulsar"
-PROJECT_BRIEF          = "CUDA inference engine for DeepSeek-V4-Flash (GB10)"
+PROJECT_BRIEF          = "Multi-family CUDA inference server (GB10)"
 OUTPUT_DIRECTORY       = docs/api
 CREATE_SUBDIRS         = NO
 OPTIMIZE_OUTPUT_FOR_C  = YES
