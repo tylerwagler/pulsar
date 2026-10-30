@@ -1,10 +1,10 @@
 #!/bin/bash
 # L264 TP2 validation: the KV state model (grid checkpoints, segment chains,
 # their TP mirroring -- protocol v23) on the pair.  Run on the HEAD
-# (ca1070wk30008) as the serving user, from the engine tree built on BOTH nodes
+# (rank 0; WORKER and PEERS name the pair, tools/tp2/lib.sh) as the serving user, from the engine tree built on BOTH nodes
 # at the same path:
 #
-#   tools/tp2-l264/run.sh /home/tyler.wagler.local/pulsar-l264
+#   WORKER=hostB PEERS=A_IP:5590,B_IP:5590 tools/tp2-l264/run.sh $HOME/pulsar-l264
 #
 # See docs/history/tp2-l264-README.md for what each step proves and how to read a
 # failure.  Every step logs to $OUT; the last lines are the verdict.

@@ -2,7 +2,7 @@
  "schema": "pulsar.recipe.v1",
  "recipe": "inkling-mini-k3",
  "model_type": "inkling_mm_model",
- "about": "The 3-layer Inkling mini (/mnt/models/inkling-small-mini, L294) on its uniform K3 EXL3 pack: every attention / dense / shared / routed Linear exl3m_k3 and the head exl3m_k6 (the pack's, stored 201088 wide for 201024 logits; L295 F7) from --exl3, byte copies of the pack; norms, short convs, relative bases, router, scales, embed and the hmlp tower in their source dtype. The mini has no drafter.",
+ "about": "The 3-layer Inkling mini (L294) on its uniform K3 EXL3 pack: every attention / dense / shared / routed Linear exl3m_k3 and the head exl3m_k6 (the pack's, stored 201088 wide for 201024 logits; L295 F7) from --exl3, byte copies of the pack; norms, short convs, relative bases, router, scales, embed and the hmlp tower in their source dtype. The mini has no drafter.",
  "rows": [
   {"role": "dense", "format": "exl3m_k3"},
   {"role": "shared_expert", "format": "exl3m_k3"},

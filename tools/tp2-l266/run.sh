@@ -1,10 +1,10 @@
 #!/bin/bash
 # L266 TP2 validation: Qwen3.8-Flash-Next on turboderp's EXL3 packs across the pair (heads split, experts
 # 256 a rank, y summed after every mixer and MoE, the vocab-split head gathered).  Run on the HEAD
-# (ca1070wk30008) as the serving user, from the engine tree built on BOTH nodes at the same path, with the
+# (rank 0; WORKER and PEERS name the pair, tools/tp2/lib.sh) as the serving user, from the engine tree built on BOTH nodes at the same path, with the
 # two containers on BOTH nodes at the same paths:
 #
-#   tools/tp2-l266/run.sh /home/tyler.wagler.local/pulsar-l266
+#   WORKER=hostB PEERS=A_IP:5590,B_IP:5590 tools/tp2-l266/run.sh $HOME/pulsar-l266
 #
 # See docs/history/tp2-l266-README.md for what each step proves.  Every step logs to $OUT; the last lines are the
 # verdict.  The pair plumbing is tools/tp2/lib.sh (shared with tp2-l264).

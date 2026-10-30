@@ -1,7 +1,7 @@
 {
   "recipe": "U-e4-d5",
   "model_type": "qwen4_exp",
-  "about": "Qwen3.8-Flash-Next, the L251 uniform recipe: routed experts EXL3 K4 (gate_up fused), every EXL3-able dense Linear EXL3 K5, gated-residual low-rank + DeltaNet a/b + QSA indexer MXFP8 (mxfp8_lt), embed / head / top-level mixer / router / norms / gates BF16. Full-model KL vs BF16 9.28e-2/token (pulsar-notes research/l251/full-kl). Every checkpoint tensor must match exactly one row; a row that matches nothing is refused too.",
+  "about": "Qwen3.8-Flash-Next, the L251 uniform recipe: routed experts EXL3 K4 (gate_up fused), every EXL3-able dense Linear EXL3 K5, gated-residual low-rank + DeltaNet a/b + QSA indexer MXFP8 (mxfp8_lt), embed / head / top-level mixer / router / norms / gates BF16. Full-model KL vs BF16 9.28e-2/token (L251). Every checkpoint tensor must match exactly one row; a row that matches nothing is refused too.",
   "formats": {
     "bf16": "the checkpoint's BF16 bytes, verbatim",
     "mxfp8_lt": "producers.mxfp8_lt_from_bf16: per-32 E8M0 + E4M3 RNE from the BF16 source",

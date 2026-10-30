@@ -11094,9 +11094,9 @@ static void test_health_capacity_is_one_in_classic_mode(void) {
     pthread_mutex_destroy(&s.mu);
 }
 
-/* 2026-10-29 (the work hang): the floor is derived -- the OS margin + the kernel's high watermarks + one step's
+/* 2026-10-29 (a production hang under memory pressure): the floor is derived -- the OS margin + the kernel's high watermarks + one step's
  * demand -- and /proc/zoneinfo's "high" lines are the only ones summed (not a per-cpu pageset's "high:", not
- * "high_wmark"-like words).  The work box's Normal zone read min 243584 / low 370396 / high 497208 kB (dmesg). */
+ * "high_wmark"-like words).  The hung box's Normal zone read min 243584 / low 370396 / high 497208 kB (dmesg). */
 static void test_mem_floor_is_derived_from_the_watermarks(void) {
     const uint64_t MiB = 1024ull * 1024ull;
     static const char zi[] =

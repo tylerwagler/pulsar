@@ -1,3 +1,9 @@
+# Machine-local settings: model, fixture and reference paths live in local.mk (gitignored), never here.  Every
+# such variable below defaults to a refusal that names it (need_path), raised only when a recipe that needs it runs:
+# set it in local.mk (see local.mk.example), on the command line, or in the environment.
+-include local.mk
+need_path = $(error $(1) is not set -- give it the path (local.mk, the command line or the environment))
+
 NATIVE_CPU_FLAG ?= -march=native
 
 DEBUG_FLAGS ?= -g
@@ -231,7 +237,7 @@ help:
 	@echo "  make cuda-attn-gates     fp16 attention correctness gates: kernel oracle,"
 	@echo "                           banked KV-leak isolation, one-row launch (modelless)"
 	@echo "  make cuda-frontier-gate  Multiseq frontier-isolation gate (needs the model;"
-	@echo "                           FRONTIER_MODEL=$(FRONTIER_MODEL) by default)"
+	@echo "                           FRONTIER_MODEL, set in local.mk)"
 	@echo "  make cuda-multiseq-gate  Multiseq-vs-solo token-stream gate + aggregate"
 	@echo "                           throughput at N=1..3 (needs the model)"
 	@echo "  make cuda-multiseq-gate-nodspark"
@@ -256,7 +262,7 @@ help:
 	@echo "                           oracle + acceptance alpha (needs the model)"
 	@echo "  make gates               Run EVERY release-blocking gate and print a"
 	@echo "                           pass/fail summary (needs the GB10 + model:"
-	@echo "                           make gates FRONTIER_MODEL=/srv/models/x)"
+	@echo "                           model paths in local.mk, or FRONTIER_MODEL=DIR ...)"
 	@echo "                           = $(GATE_TARGETS)"
 	@echo "                           + host-only, run alongside cuda-runner-gate:"
 	@echo "                             $(HOST_GATE_TARGETS)"
@@ -329,9 +335,9 @@ nvfp4-rows-bench: tests/nvfp4_rows_gate
 
 # L298: the LiLiCorr candidate-lattice head + greedy walk vs vLLM's own draft rounds (the fixtures
 # tools/lilicorr/reference.py `fixture` writes from tools/lilicorr/vllm_dump.py's goldens).  Needs a GPU, the drafter
-# checkpoint and the fixtures: LILICORR_DRAFTER (default /mnt/models/nemotron35-super-lilicorr), LILICORR_FIXTURES.
-LILICORR_DRAFTER ?= /mnt/models/nemotron35-super-lilicorr
-LILICORR_FIXTURES ?= $(HOME)/l298h/head_fixture
+# checkpoint and the fixtures: LILICORR_DRAFTER (default /path/to/models/nemotron35-super-lilicorr), LILICORR_FIXTURES.
+LILICORR_DRAFTER ?= $(call need_path,LILICORR_DRAFTER)
+LILICORR_FIXTURES ?= $(call need_path,LILICORR_FIXTURES)
 tests/lilicorr_head_gate: tests/lilicorr_head_gate.cu src/cuda/pulsar_cuda_lilicorr.h src/cuda/pulsar_cuda_nvfp4.h \
                           src/cuda/pulsar_cuda_qwen.h $(CUDA_OBJS) $(CUTLASS_CUDA_OBJS) $(MMQ_OBJS) Makefile
 	$(NVCC) $(NVCCFLAGS) -std=c++17 -Isrc -Isrc/cuda -o $@ tests/lilicorr_head_gate.cu \
@@ -368,7 +374,7 @@ cuda-sampler-device-gate: tests/sampler_device_gate
 # fill sentinel.  Measured 2026-08-15 on clean cf33e3e: FAIL without the flag,
 # PASS (never-written = 0, rel L2 5.2e-04) with it, i.e. the gate had been
 # red for reasons that had nothing to do with the code under test.
-# Presumed introduced by the sparky nvcc 13.0 -> 13.3 bump moving the default
+# Presumed introduced by the GB10's nvcc 13.0 -> 13.3 bump moving the default
 # arch; pin it so the default can never decide whether a gate is honest.
 ATTN_GATE_ARCH ?= sm_120f
 
@@ -651,9 +657,9 @@ qwen-s4-gate: tests/qwen_s4_gate
 # fp32 reference are on the box, the router on REAL Inkling router weights vs transformers' own InklingTopkRouter
 # (the fixture is generated each run by tests/inkling_router_fixture.py on the CPU, into .build/).  Without them the
 # real-weights section SKIPS LOUDLY and the rest still grades.
-INKLING_MINI_DIR ?= /mnt/models/inkling-small-mini
-INKLING_MINI_REF ?= /mnt/models/inkling-small-mini-ref/ref_fp32.pt
-INKLING_PY ?= $(HOME)/inkling/.venv/bin/python
+INKLING_MINI_DIR ?= $(call need_path,INKLING_MINI_DIR)
+INKLING_MINI_REF ?= $(call need_path,INKLING_MINI_REF)
+INKLING_PY ?= $(call need_path,INKLING_PY)
 tests/router_gate: tests/router_gate.cu src/cuda/pulsar_cuda_router.h src/cuda/pulsar_cuda_qwen.h $(CUDA_OBJS) \
                    $(CUTLASS_CUDA_OBJS) $(MMQ_OBJS) Makefile
 	$(NVCC) $(NVCCFLAGS) -std=c++17 -Isrc -Isrc/cuda -o $@ tests/router_gate.cu \
@@ -713,7 +719,7 @@ gqa-attn-gate: tests/gqa_attn_gate
 # mini, source layers 0 / 2 / 5), graded against transformers' InklingAttention in fp32 and required
 # to be at least as close to it as transformers' bf16 run.  GQA_MINI_FIXTURE is the directory
 # tests/gqa_mini_fixture.py writes (CPU, seconds): python3 tests/gqa_mini_fixture.py
-# /mnt/models/inkling-small-mini /mnt/models/inkling-small-mini-ref/ref_fp32.pt DIR.
+# /path/to/models/inkling-small-mini /path/to/models/inkling-small-mini-ref/ref_fp32.pt DIR.
 # The block's decode / verify / prefill timings at Inkling's shapes against a measured read-bandwidth and
 # mma.sync roofline (L295 F1).  Not a gate.
 tests/gqa_attn_bench: tests/gqa_attn_bench.cu src/cuda/pulsar_cuda_attn_gqa.o src/cuda/pulsar_cuda_attn_gqa.h Makefile
@@ -752,8 +758,8 @@ tests/sconv_bench: tests/sconv_bench.cu src/cuda/pulsar_cuda_sconv.o src/cuda/pu
 # The block on the Inkling-Small mini checkpoint's layer 0 (L294's 3-layer mini): the four
 # streams' real inputs and weights against transformers' InklingShortConvolution in fp32.
 # SCONV_MINI_FIXTURE is the directory tests/sconv_mini_fixture.py writes (CPU, about a
-# minute): python3 tests/sconv_mini_fixture.py /mnt/models/inkling-small-mini
-# /mnt/models/inkling-small-mini-ref/ref_fp32.pt DIR.
+# minute): python3 tests/sconv_mini_fixture.py /path/to/models/inkling-small-mini
+# /path/to/models/inkling-small-mini-ref/ref_fp32.pt DIR.
 .PHONY: sconv-mini-grade
 sconv-mini-grade: tests/sconv_gate
 	@test -n "$(SCONV_MINI_FIXTURE)" || { echo "sconv-mini-grade: set SCONV_MINI_FIXTURE (see tests/sconv_mini_fixture.py)"; exit 1; }
@@ -780,7 +786,7 @@ tests/mamba2_bench: tests/mamba2_bench.cu src/cuda/pulsar_cuda_mamba2.o src/cuda
 # NemotronHMamba2Mixer in fp32: the block's distance must be its declared bf16 rounding points' (vLLM's) and
 # nothing more; the f32 state and arithmetic graded against a double with those rounding points.
 # MAMBA2_MINI_FIXTURE is the directory tests/mamba2_mini_fixture.py writes (CPU, a few minutes):
-# python3 tests/mamba2_mini_fixture.py /mnt/models/nemotron35-super-vl-bf16 DIR.
+# python3 tests/mamba2_mini_fixture.py /path/to/models/nemotron35-super-vl-bf16 DIR.
 .PHONY: mamba2-mini-grade
 mamba2-mini-grade: tests/mamba2_gate
 	@test -n "$(MAMBA2_MINI_FIXTURE)" || { echo "mamba2-mini-grade: set MAMBA2_MINI_FIXTURE (see tests/mamba2_mini_fixture.py)"; exit 1; }
@@ -927,7 +933,7 @@ cuda-attn-pack-gate: tests/attn_pack_gate
 # GEMM product is the reference's product, only the accumulation order and one
 # bf16 rounding differ.  Host reference math -fno-fast-math.  Needs the layer aux
 # files (engram_rows build) under ENGRAM_DIR; not the 189 GiB row files.
-ENGRAM_DIR ?= /mnt/pve1-models/engram-v41
+ENGRAM_DIR ?= $(call need_path,ENGRAM_DIR)
 tests/engram_gate.o: tests/engram_gate.cpp src/pulsar_gpu.h
 	$(CXX) $(CXXFLAGS) -fno-fast-math -Isrc -c -o $@ tests/engram_gate.cpp
 tests/engram_gate: tests/engram_gate.o $(CUDA_OBJS) $(CUTLASS_CUDA_OBJS) $(MMQ_OBJS)
@@ -979,7 +985,7 @@ exl3-dequant-gate: tests/exl3_dequant_gate
 # qwen-family-gate-device adds a real session on the GPU (the battery's entry):
 # an 8-token forward that stages the ~61 GiB of zeros it touches through the
 # production fd route, never the page cache (L329: tests/qwen_family_gate.cpp).
-QWEN_HF_DIR   ?= /mnt/models/hub/models--Qwen--Qwen3.8-Flash-Next/snapshots/de4b8e4d43b917e7706784d8bb445c9af86a3540
+QWEN_HF_DIR   ?= $(call need_path,QWEN_HF_DIR)
 QWEN_GATE_DIR ?= /var/tmp/qwen-family-gate-$(USER)
 # The adaptive draft depth rule (src/engine/spec_depth.h), shared by DSpark and the Qwen MTP drafter.
 .PHONY: spec-depth-gate
@@ -992,7 +998,7 @@ spec-depth-gate: tests/spec_depth_gate
 # layer-12 weights.  The fixtures come from tools/tessera/kernel_fixture.py (needs Tessera + torch), at the
 # vendored revision (VENDOR-TESSERA.md): the 32-expert one (dense qkv/out_proj + routed, 12 cases) and the full
 # 512-expert stack with the capture's own routing (--moe-only --real-routing, 5 cases).  17 of 17 is the bar.
-TESSERA_FIXTURES ?= /mnt/models/tessera-l255/fx-37742e0f/tessera_kernel.fx /mnt/models/tessera-l255/fx-37742e0f/full512.fx
+TESSERA_FIXTURES ?= $(call need_path,TESSERA_FIXTURES)
 .PHONY: tessera-kernel-gate
 tests/tessera_kernel_gate: tests/tessera_kernel_gate.cu src/cuda/mmq/pulsar_tessera.o src/cuda/mmq/pulsar_tessera.h Makefile
 	$(NVCC) $(NVCCFLAGS) -std=c++17 -Isrc -Isrc/cuda/mmq -o $@ tests/tessera_kernel_gate.cu \
@@ -1024,13 +1030,13 @@ state-kinds-gate: tests/state_kinds_gate
 # neutrality C1-C5 incl. the interruptible sync, the bank surface B1-B5), one target per family's model.  The
 # zero-weight family gate above proves wiring only.  A new family adds one line here.
 # the served pack (L305): U-e4-d5 with the DFlash2 block drafter (B6 needs a drafter) and the EXL3 K5 head, no MTP
-QWEN_GATE_MODEL ?= /srv/models/qwen38fn-dflash2
+QWEN_GATE_MODEL ?= $(call need_path,QWEN_GATE_MODEL)
 # L278 contract 4: Qwen's reference anchors, graded by the runner's cuda-reference-gate-* on the hosted Qwen model.
 # The capture is the CONTAINER's (HF qwen4_exp modules on these quantized weights, layer-streamed; L251
 # 2026-09-28) -- matched precision, as DeepSeek's B300 capture is, so a KL here is OUR arithmetic's divergence,
-# not the quantization's.  (~/ref-qwen38fn beside it is the BF16 source: a quant-quality reading, qwen-ref-gate.)
+# not the quantization's.  (QWEN_REF_DIR is the BF16 source: a quant-quality reading, qwen-ref-gate.)
 # No quotes in these values: gates-dev passes them through a shell variable.
-QWEN_REF_ANCHOR_DIR ?= /mnt/models/sparky-parked/home-claude/ref-qwen38fn-q
+QWEN_REF_ANCHOR_DIR ?= $(call need_path,QWEN_REF_ANCHOR_DIR)
 # Re-recorded 2026-10-21 on the SERVED pack (L305: QWEN_GATE_MODEL, the EXL3 K5 head; the anchors' capture and the
 # 2026-10-07 budgets, e21a0868, were the MTP pack's BF16 head -- code 512 0.076 then), report-only `--dump-kl`, the same
 # numbers at dev ec5bd400 and on the Flare series (gpuq #420):
@@ -1091,14 +1097,14 @@ bank-residency-gate-qwen: tests/bank_residency_gate
 # only for a change that MEANS to move a slice.
 # DeepSeek's is the pair's model: its TP builds the expert halves from CUTLASS MXFP4 stacks, which FRONTIER_MODEL
 # (vexp, IQ2 experts) does not have.  A cold first run reads the artifact's scans over NFS (~7 min); cached, seconds.
-TP_PAIR_DS_MODEL ?= /mnt/models/DeepSeek-v4-Flash
+TP_PAIR_DS_MODEL ?= $(call need_path,TP_PAIR_DS_MODEL)
 # L269 W1: the V4.1 layer-subset fixture (layer 4 = source layer 20, OUR EXL3 K3; the rest CUTLASS MXFP4) -- the
 # plan's EXL3 expert halves beside the MXFP4 ones.
-TP_V41_FIXTURE ?= /mnt/models/v41-tp1-fixture
+TP_V41_FIXTURE ?= $(call need_path,TP_V41_FIXTURE)
 # Qwen's plan runs on the U-e4-d5 trunk (the NAS copy, no drafter): the served pack has no TP plan -- the plan refuses
 # a block drafter under TP and an EXL3 head (L305) -- and Qwen is not a pair model (no DeepSeek/Qwen on the work pair).
 # The MTP overlay it used was deleted 2026-10-25; the trunk's plan is the old golden minus its mtp.layers.0 rows.
-TP_QWEN_PLAN_MODEL ?= /mnt/models/qwen38fn-u-e4-d5
+TP_QWEN_PLAN_MODEL ?= $(call need_path,TP_QWEN_PLAN_MODEL)
 TP_PLAN_MODELS = $(TP_PAIR_DS_MODEL) $(TP_QWEN_PLAN_MODEL) $(TP_V41_FIXTURE)
 .PHONY: tp-plan-gate tp-plan-golden
 tp-plan-gate: tests/tp_plan_test
@@ -1119,9 +1125,9 @@ loader-contract-gate: tests/loader_open
 # its bind record, every byte priced, the plan, the facts, the session refusals -- on the container and its header
 # clone; then each Inkling mutant (a missing tensor, a wrong shape, an unknown or flipped switch, ...) refused by
 # name, and the loader contract's neutral faults on it (its `format` fault is the BF16 build's refusal: no bf16-rows
-# routed arm until F7).  Host-only.  The container: tools/container/build.py emit --hf /mnt/models/inkling-small-mini
+# routed arm until F7).  Host-only.  The container: tools/container/build.py emit --hf /path/to/models/inkling-small-mini
 # --exl3 <the mini's K3 pack> --recipe format-maps/inkling-mini-k3.json (L294 / L295 E1).
-INKLING_GATE_MODEL ?= /mnt/models/inkling-mini-k3-pulsar
+INKLING_GATE_MODEL ?= $(call need_path,INKLING_GATE_MODEL)
 .PHONY: inkling-family-gate
 inkling-family-gate: tests/inkling_family_gate tests/loader_open
 	python3 tests/inkling_family_gate.py --probe ./tests/inkling_family_gate --open ./tests/loader_open \
@@ -1132,8 +1138,8 @@ inkling-family-gate: tests/inkling_family_gate tests/loader_open
 # drafter, the facts, the tokenizer + chat front, the session refusals -- on the container and its header clone; then
 # each Nemotron-H mutant refused by name, and the loader contract's neutral faults.  Host-only.  The container: the
 # 5-block BF16 mini (tools/nemotron/make_mini.py), built by tools/container/build.py emit --hf
-# /mnt/models/nemotron35-mini --recipe format-maps/nemotron_h-bf16.json --all.
-NEMOTRON_GATE_MODEL ?= /mnt/models/nemotron35-mini-pulsar
+# /path/to/models/nemotron35-mini --recipe format-maps/nemotron_h-bf16.json --all.
+NEMOTRON_GATE_MODEL ?= $(call need_path,NEMOTRON_GATE_MODEL)
 .PHONY: nemotron-family-gate
 nemotron-family-gate: tests/nemotron_family_gate tests/loader_open
 	python3 tests/nemotron_family_gate.py --probe ./tests/nemotron_family_gate --open ./tests/loader_open \
@@ -1162,7 +1168,7 @@ mtp-spec-gate: tests/mtp_spec_gate
 # toolsample's per-position modes.  L317: the battery runs it in the runner on the hosted engines (block-spec-gate on
 # Qwen's DFlash2 and Nemotron's LiLiCorr, 128 tokens a stream); these two targets are the gates-dev depth (256) on a
 # drafter path change, and the hand run.
-LILICORR_GATE_MODEL ?= /srv/models/nemotron35-k4-lilicorr-pulsar
+LILICORR_GATE_MODEL ?= $(call need_path,LILICORR_GATE_MODEL)
 .PHONY: lilicorr-spec-gate
 lilicorr-spec-gate: tests/mtp_spec_gate
 	./tests/mtp_spec_gate $(LILICORR_GATE_MODEL) $(MTP_GATE_TOKENS)
@@ -1202,7 +1208,7 @@ scratch-poison-gate-mutant: tests/scratch_poison_gate_mutant
 # L299: Qwen's drafter selection at open, host-only (pulsar --inspect): of two, DFlash2 by default (announced); --drafter
 # mtp picks the MTP module; a one-drafter container runs its own; unknown names and a missing drafter shard refused.
 # The base is the same model built without a block drafter (the MTP-only container is it + the MTP sidecar).
-QWEN_SELECT_BASE ?= /mnt/models/qwen38fn-u-e4-d5
+QWEN_SELECT_BASE ?= $(call need_path,QWEN_SELECT_BASE)
 QWEN_SELECT_WORK ?= $(or $(TMPDIR),/var/tmp)/qwen-drafter-select-$(USER)
 .PHONY: qwen-drafter-select-gate
 qwen-drafter-select-gate: pulsar
@@ -1211,8 +1217,8 @@ qwen-drafter-select-gate: pulsar
 # ... and its draft grade: the MTP module's first-step logits at every position of capture_ref.py's prompt, the engine's
 # DECODE and PROMPT paths (mtp_spec_gate probe), against transformers' modules on the fp32 trunk
 # (tools/nemotron/capture_mtp_ref.py) with transformers' own bf16 beside it (the floor); PASS within 2x the floor's KL.
-NEMOTRON_MTP_REF ?= /mnt/models/nemotron35-mini-ref/mtp_ref_fp32.pt
-NEMOTRON_MTP_REF_BF16 ?= /mnt/models/nemotron35-mini-ref/mtp_ref_bf16.pt
+NEMOTRON_MTP_REF ?= $(call need_path,NEMOTRON_MTP_REF)
+NEMOTRON_MTP_REF_BF16 ?= $(call need_path,NEMOTRON_MTP_REF_BF16)
 NEMOTRON_MTP_GRADE_DIR ?= $(or $(TMPDIR),/var/tmp)/nemotron-mtp-grade-$(USER)
 .PHONY: nemotron-mtp-grade
 nemotron-mtp-grade: tests/mtp_spec_gate
@@ -1225,10 +1231,10 @@ nemotron-mtp-grade: tests/mtp_spec_gate
 # ... and its block grade against the transformers fp32 capture (tools/nemotron/capture_ref.py; dt unclamped) with
 # transformers' own bf16 run beside it (capture_ref.py --dtype bf16): per HF block, the final norm, the logits
 # (tests/nemotron_mini_grade.py; torch + safetensors: NEMOTRON_GRADE_PY).
-NEMOTRON_MINI_HF ?= /mnt/models/nemotron35-mini
-NEMOTRON_MINI_REF ?= /mnt/models/nemotron35-mini-ref/ref_fp32.pt
-NEMOTRON_MINI_REF_BF16 ?= /mnt/models/nemotron35-mini-ref/ref_bf16.pt
-NEMOTRON_GRADE_PY ?= $(HOME)/inkling/.venv/bin/python
+NEMOTRON_MINI_HF ?= $(call need_path,NEMOTRON_MINI_HF)
+NEMOTRON_MINI_REF ?= $(call need_path,NEMOTRON_MINI_REF)
+NEMOTRON_MINI_REF_BF16 ?= $(call need_path,NEMOTRON_MINI_REF_BF16)
+NEMOTRON_GRADE_PY ?= $(call need_path,NEMOTRON_GRADE_PY)
 NEMOTRON_GRADE_DIR ?= $(or $(TMPDIR),/var/tmp)/nemotron-mini-grade-$(USER)
 .PHONY: nemotron-mini-grade
 nemotron-mini-grade: tests/nemotron_fwd_gate
@@ -1261,8 +1267,8 @@ engram-table-check: tests/engram_table_test
 # whole-sequence and chunked (decode steps), plus the row gather over the checkpoint's
 # 128 shard tensors through the Engram pool -- HOST ONLY.  Vectors from
 # tools/qwen/gen_ngram_vectors.py (the corpus file lives beside the checkpoint on
-# sparky; the small in-tree one covers 4 corpus prefixes + the EOS cases, ids only).
-QWEN_NGRAM_VECTORS ?= /mnt/models/qwen-s4/ngram-corpus.vec
+# the GB10; the small in-tree one covers 4 corpus prefixes + the EOS cases, ids only).
+QWEN_NGRAM_VECTORS ?= $(call need_path,QWEN_NGRAM_VECTORS)
 # the container's PENGRAM1 v2 row file (tools/container/ple_rows.py); empty = read the
 # checkpoint's shard parts named in the vectors instead
 QWEN_NGRAM_ROWFILE ?=
@@ -1281,9 +1287,9 @@ qwen-ngram-test: tests/qwen_ngram_test
 # -- transformers' apply_chat_template + tokenizers).  Model-free; the inputs are
 # the checkpoint's tokenizer.json + generation_config.json, the L216 corpus case
 # files and the 466-row calibration corpus HF rendered from them.
-QWEN_TOK_DIR ?= /mnt/models/hub/models--Qwen--Qwen3.8-Flash-Next/snapshots/de4b8e4d43b917e7706784d8bb445c9af86a3540
-QWEN_RENDER_CASES ?= /mnt/models/reap-corpus/cases
-QWEN_CALIB ?= /mnt/models/qwen38-calib/calib-qwen38-v1.jsonl
+QWEN_TOK_DIR ?= $(call need_path,QWEN_TOK_DIR)
+QWEN_RENDER_CASES ?= $(call need_path,QWEN_RENDER_CASES)
+QWEN_CALIB ?= $(call need_path,QWEN_CALIB)
 QWEN_CHAT_SRCS = src/lib/bpe_tokenizer.cpp src/lib/pyjson.cpp src/lib/qwen_chat.cpp src/lib/qwen_output.cpp src/lib/out_parse_kit.cpp
 tests/qwen_chat_gate: tests/qwen_chat_gate.cpp tests/bpe_gate_util.h $(QWEN_CHAT_SRCS) src/lib/bpe_tokenizer.h \
                       src/lib/bpe_unicode_tables.inc src/lib/pyjson.h src/lib/qwen_chat.h src/lib/out_parse_kit.h src/lib/pulsar_utf8.h \
@@ -1298,7 +1304,7 @@ qwen-chat-gate: tests/qwen_chat_gate
 # against HF tokenizers on tokenizer.json, the renderer against vLLM's native Inkling renderer, the output-parser
 # kit's Inkling configuration against vLLM's parser engine (goldens from tests/inkling/gen_inkling_goldens.py).
 # Model-free; the inputs are the checkpoint's tokenizer files (hf download, no weights) and the L216 corpus.
-INKLING_TOK_DIR ?= /mnt/models/inkling-small-tokenizer
+INKLING_TOK_DIR ?= $(call need_path,INKLING_TOK_DIR)
 INKLING_CHAT_SRCS = src/lib/bpe_tokenizer.cpp src/lib/pyjson.cpp src/lib/inkling_chat.cpp src/lib/out_parse_kit.cpp
 tests/inkling_chat_gate: tests/inkling_chat_gate.cpp tests/bpe_gate_util.h $(INKLING_CHAT_SRCS) src/lib/bpe_tokenizer.h \
                          src/lib/bpe_unicode_tables.inc src/lib/pyjson.h src/lib/inkling_chat.h src/lib/out_parse_kit.h \
@@ -1314,7 +1320,7 @@ inkling-chat-gate: tests/inkling_chat_gate
 # chat_template.jinja through transformers, the output-parser kit's Nemotron configuration against vLLM's nemotron_v3
 # parser engine (goldens from tests/nemotron/gen_nemotron_goldens.py).  Model-free; the inputs are the checkpoint's
 # tokenizer files and the L216 corpus.
-NEMOTRON_TOK_DIR ?= /mnt/models/nemotron35-super-vl-bf16
+NEMOTRON_TOK_DIR ?= $(call need_path,NEMOTRON_TOK_DIR)
 NEMOTRON_CHAT_SRCS = src/lib/bpe_tokenizer.cpp src/lib/pyjson.cpp src/lib/nemotron_chat.cpp src/lib/qwen_output.cpp \
                      src/lib/out_parse_kit.cpp
 tests/nemotron_chat_gate: tests/nemotron_chat_gate.cpp tests/bpe_gate_util.h $(NEMOTRON_CHAT_SRCS) src/lib/bpe_tokenizer.h \
@@ -1330,7 +1336,7 @@ nemotron-chat-gate: tests/nemotron_chat_gate
 # the chat gate (adversarial, span guard, every scalar value, the calibration corpus); goldens from
 # tests/nemotron_enc/gen_tok_goldens.py.  Model-free; NEMOTRON_ENC_TOK_DIR holds the checkpoint's tokenizer.json +
 # config.json (Embed and Rerank ship the same tokenizer).
-NEMOTRON_ENC_TOK_DIR ?= $(firstword $(wildcard /mnt/models/hub/models--nvidia--Nemotron-3.5-Embed-8B-BF16/snapshots/*))
+NEMOTRON_ENC_TOK_DIR ?= $(call need_path,NEMOTRON_ENC_TOK_DIR)
 tests/nemotron_enc_tok_gate: tests/nemotron_enc_tok_gate.cpp tests/bpe_gate_util.h src/lib/bpe_tokenizer.cpp \
                              src/lib/pyjson.cpp src/lib/bpe_tokenizer.h src/lib/bpe_unicode_tables.inc src/lib/pyjson.h \
                              src/lib/sha1.hpp Makefile
@@ -1455,7 +1461,7 @@ expert-stream-probe: tests/expert_stream_probe
 .PHONY: decode-kernel-census
 decode-kernel-census:
 	python3 tests/decode_kernel_census.py --binary ./pulsar \
-		--model $(if $(FRONTIER_MODEL),$(FRONTIER_MODEL),/srv/models/vexp-safetensors)
+		--model $(FRONTIER_MODEL)
 
 # Backend-seam enforcement (see the contract atop src/pulsar_gpu.h): nothing
 # outside src/cuda/ may touch CUDA APIs directly. tools/seam_check.py strips
@@ -1486,7 +1492,7 @@ seam-check:
 # artifact itself -- the per-layer-shard safetensors checkpoint the engine reads
 # and the promotion lane swaps shards in.  Every gate takes this as a PATH, so
 # one line moved the whole battery off GGUF.
-FRONTIER_MODEL ?= /srv/models/vexp-safetensors
+FRONTIER_MODEL ?= $(call need_path,FRONTIER_MODEL)
 # 3 banks, not 2: clause (c) binds the graph's device views to an idle third
 # bank while the two-bank step runs, so a frontier access that resolves
 # through cur_bank has somewhere to land that the step must not touch.
@@ -1991,7 +1997,7 @@ PREFILL_BASELINE_REF ?= 13bcbab1
 # default.  The 684fa8d blob of the deleted 0731 artifact was deleted 2026-10-30
 # (git history keeps it; its note is docs/history/).  13bcbab1 is
 # the Vision-Exp blob the battery names (the f5bea7aa one it replaced was dumped
-# by ~/devref-clean's own binary; this one by `cuda-prefill-gate-baseline` at the
+# by a clean dev checkout's own binary; this one by `cuda-prefill-gate-baseline` at the
 # ref, see its .md).
 PREFILL_BASELINE     ?= tests/test-vectors/prefill_bitexact_baseline-$(PREFILL_BASELINE_REF).bin
 # CUTLASS MXFP4 byte coverage, ON THE PROMOTION LANE.
@@ -2004,7 +2010,7 @@ PREFILL_BASELINE     ?= tests/test-vectors/prefill_bitexact_baseline-$(PREFILL_B
 # already absent, so it had been asserting nothing.
 #
 # The promotion lane is what makes the coverage reachable again:
-# /srv/models/vexp-promoted-L30 is the served artifact with ONE shard swapped,
+# /path/to/models/vexp-promoted-L30 is the served artifact with ONE shard swapped,
 # carrying 3 CUTLASS-MXFP4 routed layers (layer 30 @ the source's own MXFP4).
 # 12 cutlass_mxfp4 tensors, 126 iq2_xxs_mmq_k.
 #
@@ -2014,7 +2020,7 @@ PREFILL_BASELINE     ?= tests/test-vectors/prefill_bitexact_baseline-$(PREFILL_B
 # the blob is dumped at CUTLASS_MXFP4_BASELINE_REF and the gate grades drift
 # FROM that point on -- a regression detector, not a fidelity claim.  Which is
 # what a byte gate is for; the fidelity question is the B300 study's.
-CUTLASS_MXFP4_GATE_MODEL        ?= /srv/models/vexp-promoted-L30
+CUTLASS_MXFP4_GATE_MODEL        ?= $(call need_path,CUTLASS_MXFP4_GATE_MODEL)
 PREFILL_CUTLASS_MXFP4_BASELINE_REF ?= e823df67
 PREFILL_CUTLASS_MXFP4_BASELINE  ?= tests/test-vectors/prefill_cutlass_mxfp4_baseline-$(PREFILL_CUTLASS_MXFP4_BASELINE_REF).bin
 PREFILL_DECODE_BASELINE_REF ?= 13bcbab1
@@ -2131,7 +2137,7 @@ live-legs: pulsar-server
 # decoder, L314 / 503), never past it into memory pressure.  A real server on a SMALL model (the guard's budget lowered
 # through its test hook to 2.2 conversations), so it fits beside a running production server; ~2 min.  Family-neutral.
 # The guarded servers' logs are kept (L326) in .build/kv-admission/servers.log.
-KV_ADMISSION_MODEL ?= /mnt/models/nemotron35-mini-pulsar
+KV_ADMISSION_MODEL ?= $(call need_path,KV_ADMISSION_MODEL)
 .PHONY: server-kv-admission-live
 server-kv-admission-live: pulsar-server
 	mkdir -p .build/kv-admission
@@ -2145,7 +2151,7 @@ server-kv-admission-live: pulsar-server
 # fresh banks; MemAvailable is sampled throughout and a dip past the floor stops the run as a FAIL.  Needs the box to
 # itself (a quiet gpuq job, production stopped); the Nemotron mini, ~5 min, under a timeout.  gates-dev runs it on an
 # admission / guard / bank path.
-KV_HEADROOM_MODEL ?= /mnt/models/nemotron35-mini-pulsar
+KV_HEADROOM_MODEL ?= $(call need_path,KV_HEADROOM_MODEL)
 .PHONY: server-kv-headroom-live
 server-kv-headroom-live: pulsar-server
 	python3 tests/server_kv_headroom_live.py $(KV_HEADROOM_MODEL) --binary ./pulsar-server
@@ -2155,7 +2161,7 @@ server-kv-headroom-live: pulsar-server
 # hangs, the stall watchdog stays quiet, MemAvailable never goes more than 0.25 GiB under the floor, persists happen or
 # are skipped loudly, every answer is 200 or a named 503, no uvm / page-allocation line in dmesg.  ~1-2 h, the box to
 # itself (a quiet gpuq job, production stopped).  Not in gates-dev: run it for a guard / floor / persist change.
-MEM_SQUEEZE_MODEL ?= /srv/models/nemotron35-super-k4
+MEM_SQUEEZE_MODEL ?= $(call need_path,MEM_SQUEEZE_MODEL)
 .PHONY: nemotron-mem-squeeze-live
 nemotron-mem-squeeze-live: pulsar-server
 	python3 tests/nemotron_mem_squeeze_live.py $(MEM_SQUEEZE_MODEL) --binary ./pulsar-server
@@ -2299,13 +2305,13 @@ KL_BUDGET_STORY ?= tests/test-vectors/kl-budget-story.txt
 KL_BUDGET_CODE  ?= tests/test-vectors/kl-budget-code.txt
 # The reference capture the battery grades against BY DEFAULT (L240): the
 # Vision-Exp B300 capture staged on the Spark (blobs + token files, 4.7 MB;
-# source: ~/reference-capture-archive-2026-09-23/vexp/out + the shared
+# source: the 2026-09-23 reference-capture archive (vexp/out) + the shared
 # *.tokens.bin, same prompt fnv).  Every battery from the Vision-Exp switch to
 # 2026-09-23 printed "SKIP cuda-reference-gate" because nothing set this;
 # rule 7 was not being exercised.  A configured dir with no readable blob is a
 # FAIL in the runner, never a skip -- stage the capture or override with an
 # empty value to skip deliberately (PULSAR_REF_DIR=).
-PULSAR_REF_DIR ?= /home/claude/ref-vexp
+PULSAR_REF_DIR ?= $(call need_path,PULSAR_REF_DIR)
 # The capture's documented depths, passed to the runner as this model's data (L278: the runner holds none).  The
 # anchors are the SERVED model's (Vision-Exp, L240, 2026-09-23): the story blob's documented argmax flip is the
 # file-end row 30464 (ours 6712 at 24.06 over 915 at 23.54; the source had them 0.125 apart at a 2.4-nat
@@ -2504,7 +2510,7 @@ cuda-runner-gate: tests/gates_runner
 #
 # Continues past failures so one broken gate does not hide the rest, prints a
 # summary, and exits non-zero if any failed.  Needs the GB10 and the model:
-#   make gates FRONTIER_MODEL=/srv/models/<checkpoint-dir>
+#   make gates FRONTIER_MODEL=/path/to/models/<checkpoint-dir>
 # The unit suite (make test) runs INSIDE the battery since 2026-09-03: it was
 # the one test set a landing could skip, and L156 found a golden in it that had
 # been failing since May because nobody ran it.  Same model as the frontier
@@ -2533,8 +2539,8 @@ agent-test-gate: pulsar_agent_test
 # for the corpus); no model is loaded.  RENDER_GATE_CASES names JSON case
 # files or directories in the L216 corpus layout (default: the reference's
 # goldens only).
-# L278: the V4.1 checkpoint's own encoding/ in the shared hub (sparky mounts it at /mnt/models; 120 KB, no model)
-V41_REFERENCE_ENCODING ?= /mnt/models/hub/models--deepseek-ai--DeepSeek-V4.1-Flash/snapshots/2cba9e42aa026125f3ed06c6d98c1db82f7ca027/encoding
+# L278: the V4.1 checkpoint's own encoding/ in the shared hub (the hub is mounted at /path/to/models; 120 KB, no model)
+V41_REFERENCE_ENCODING ?= $(call need_path,V41_REFERENCE_ENCODING)
 RENDER_GATE_CASES ?=
 .PHONY: render-gate
 render-gate: pulsar_test
@@ -3270,8 +3276,8 @@ tests/bank_residency_gate: tests/bank_residency_gate.o src/lib/pulsar_help.o $(C
 # L251 (4): the Qwen reference gate -- the engine on the anchors' tokens vs the
 # BF16 streamed reference.  Needs a real container and the anchors on disk:
 #   make qwen-ref-gate QWEN_REF_MODEL=<container> QWEN_REF_DIR=<anchors>
-QWEN_REF_MODEL ?= $(HOME)/qwen-container
-QWEN_REF_DIR   ?= $(HOME)/ref-qwen38fn
+QWEN_REF_MODEL ?= $(call need_path,QWEN_REF_MODEL)
+QWEN_REF_DIR   ?= $(call need_path,QWEN_REF_DIR)
 tests/qwen_ref_gate.o: tests/qwen_ref_gate.cpp
 	$(CXX) $(CXXFLAGS) -Isrc -Isrc/engine -c -o $@ $<
 tests/qwen_ref_gate: tests/qwen_ref_gate.o src/lib/pulsar_help.o $(CORE_OBJS)
@@ -3283,8 +3289,8 @@ qwen-ref-gate: tests/qwen_ref_gate
 # L251: end-to-end generation for the Qwen4-exp lane -- token ids in, token ids out (the family has
 # no tokenizer or renderer yet, S5, so the CLI's text path refuses by design).  Decode the emitted
 # ids with qwen_generate_decode.py.  Needs a real container and a prompt's tokens.bin on disk.
-QWEN_GEN_MODEL  ?= $(HOME)/qwen-container
-QWEN_GEN_TOKENS ?= $(HOME)/ref-qwen38fn/code.tokens.bin
+QWEN_GEN_MODEL  ?= $(call need_path,QWEN_GEN_MODEL)
+QWEN_GEN_TOKENS ?= $(call need_path,QWEN_GEN_TOKENS)
 QWEN_GEN_N      ?= 32
 tests/qwen_generate.o: tests/qwen_generate.cpp
 	$(CXX) $(CXXFLAGS) -Isrc -Isrc/engine -c -o $@ $<

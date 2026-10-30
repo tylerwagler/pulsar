@@ -3641,7 +3641,7 @@ bool server_mem_floor_admits(uint64_t avail_bytes, uint64_t est_bytes);
 KvBytes server_guard_touched_budget(KvBytes kv_budget_bytes, KvBytes eager_bytes, KvBytes touched_bytes,
                                     KvBytes avail_bytes);
 
-/* ==== The memory floor (2026-10-29 work hang) ==============================================================
+/* ==== The memory floor (2026-10-29 production hang) ========================================================
  * The hang: Nemotron 3.5 Super, 16 banks at --ctx 1M, a continued prefill at ~188k.  The guard's ceiling had
  * spent the post-warmup headroom down to the 4 GiB floor on touched KV alone, while memory nobody counts (host
  * heap, page cache, the driver's own) kept growing, so the box reached the kernel's min watermark.  nvidia-uvm

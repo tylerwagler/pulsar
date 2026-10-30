@@ -374,7 +374,7 @@ int server::kv_cache_persist(session_slot *sl, const char *reason, bool close, i
      * chunk verdicts.  The prompt-end store after it persists the same
      * checkpoints. */
     if (pulsar_session_in_mirrored_sync(s->sess)) return 0;
-    /* 2026-10-29 (the work hang: a "continued" persist at ~188k under the kernel's min watermark): a persist runs
+    /* 2026-10-29 (a production hang under memory pressure: a "continued" persist at ~188k under the kernel's min watermark): a persist runs
      * only when MemAvailable covers what it can take -- its dirty-page window and the history's text renders (the
      * device reads stream through the session's pinned buffer, which allocates nothing) -- over the floor.  Else
      * it is SKIPPED, counted and said: the history stays live in its bank, only its disk copy is not written now

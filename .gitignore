@@ -222,3 +222,6 @@ tests/sse-golden/out.txt
 /tests/vision_merge_gate
 /tests/vision_tower_gate
 /tests/tessera_kernel_gate
+
+# Machine-local Makefile settings (model and fixture paths); see the top of the Makefile.
+/local.mk

@@ -37,12 +37,12 @@
 #
 # No positional args.  Environment:
 #   PULSAR_TP_HOSTS    REQUIRED. ssh targets in RANK ORDER, rank 0 first, at
-#                      least two.  e.g. "sparky workrig"
+#                      least two.  e.g. "hostA hostB"
 #   PULSAR_TP_ADDRS    the addresses the ENGINE dials, in the same rank order
 #                      (default: the ssh targets).  The mesh resolves these with
 #                      getaddrinfo on every rank -- an ssh-config alias is not
 #                      an address; on a pair this is the RoCE-side name or IP.
-#   PULSAR_TP_MODEL    checkpoint dir (default /mnt/pve1-models/DeepSeek-v4-Flash, the
+#   PULSAR_TP_MODEL    REQUIRED. checkpoint dir (no default; use the
 #                      full-fidelity MXFP4 build -- the artifact a pair exists for; the
 #                      one-box IQ2 build refuses TP at layer 0 by design)
 #   PULSAR_TP_BIN      engine binary on each host, relative to $HOME or
@@ -99,7 +99,7 @@ set -u
 
 HOSTS=${PULSAR_TP_HOSTS:-}
 ADDRS=${PULSAR_TP_ADDRS:-$HOSTS}
-MODEL=${PULSAR_TP_MODEL:-/mnt/pve1-models/DeepSeek-v4-Flash}
+MODEL=${PULSAR_TP_MODEL:?set PULSAR_TP_MODEL to the checkpoint dir (tools/tp-pair-engine-grade.sh)}
 BIN=${PULSAR_TP_BIN:-'$HOME/pulsar'}
 PORT=${PULSAR_TP_PORT:-5590}
 RDMA_DEV=${PULSAR_TP_RDMA_DEV:-}

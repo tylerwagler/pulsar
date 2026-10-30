@@ -138,7 +138,7 @@ uint64_t server_mem_available_bytes(void) {
 
 /* The guard's live budget (pulsar_server_internal.h, server::guard_budget).  Before 2026-10-29 every decision read
  * the startup ceiling, i.e. it priced the post-warmup headroom as KV's alone for the life of the process: whatever
- * else grew took the floor (the work hang).  One /proc read per 0.25 s at most -- a decision reads it, never a
+ * else grew took the floor (the 2026-10-29 production hang).  One /proc read per 0.25 s at most -- a decision reads it, never a
  * token. */
 KvBytes server::guard_budget() {
     const double now = server_now_sec();

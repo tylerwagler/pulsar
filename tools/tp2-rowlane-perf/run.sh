@@ -8,7 +8,7 @@
 #   tools/tp2-rowlane-perf/run.sh <build A dir> <build B dir>
 #
 # Both dirs at the same paths on both nodes, each built with `make pulsar pulsar-server`.  Run on the HEAD
-# (ca1070wk30008) as the serving user.  Settings (env): STREAMS ("1 2 4"), PP (512), TG (256), ROUNDS (2),
+# (rank 0) as the serving user.  Settings (env): WORKER and PEERS (required, tools/tp2/lib.sh), STREAMS ("1 2 4"), PP (512), TG (256), ROUNDS (2),
 # V4FIX (~/models/vexp-tp-fixture), V41FIX (~/models/v41-tp1-fixture-mx), MODEL (~/models/DeepSeek-v4-Flash).
 # See docs/history/tp2-rowlane-perf-README.md.  The pair plumbing is tools/tp2/lib.sh.
 set -u
@@ -66,7 +66,7 @@ for r in $(seq 1 "$ROUNDS"); do
 done
 
 # ---- 2. fixtures (optional): 256 greedy tokens through the TP=2 CLI, ms/token per build, logprobs A == B -------
-# A 7-layer fixture is where the lane's cost is largest relative to the work (L269: on sparky's loopback the V4
+# A 7-layer fixture is where the lane's cost is largest relative to the work (L269: on a one-GPU loopback the V4
 # fixture went 5.15 -> 15.5 s per 256 tokens with the lane on).  Build A predating v26 runs these fixtures with the
 # lane OFF (the gate ring was too small for < 12 layers, and V4.1's 20 KB rows exceeded the old 16 KB cap); build B
 # runs them with it ON -- the comparison is "lane off vs lane on" for A < v26, "spin vs wait" for A >= v26.

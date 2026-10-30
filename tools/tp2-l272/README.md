@@ -11,9 +11,20 @@ Both are bit-exact by construction -- the same slices, the same kernels in the s
 new build **byte for byte against a reference build from before P4** on the same greedy requests, plus the
 engine's own per-frame cross-rank identity. Protocol v24, unchanged by L272: the reference pairs with the same frames.
 
-Hosts and launch recipe: the plumbing is shared in `tools/tp2/lib.sh` -- run on the head (rank 0); the worker host,
-the peer list, the two RDMA rails and the KV directory are its defaults, each overridable through the environment
-(`WORKER`, `PEERS`, `RDMA_DEV`, `RDMA_DEV2`, `KV`, `OUT`; the models: `DS`, `Q405`, `Q605`).  Both ranks run
+Hosts and launch recipe: the plumbing is shared in `tools/tp2/lib.sh` (also used by the tp2-l264, tp2-l266 and
+tp2-rowlane-perf kits). Run on the head (rank 0). It reads these from the environment:
+
+| Variable | Default | |
+|---|---|---|
+| `WORKER` | **required** | rank 1's ssh target |
+| `PEERS` | **required** | both ranks' TP-wire `HOST:PORT`, rank 0 (this host) first, e.g. `10.0.9.13:5590,10.0.9.12:5590` |
+| `RDMA_DEV`, `RDMA_DEV2` | `mlx5_3`, `mlx5_1` | the two RDMA rails (`PULSAR_TP_RDMA_DEV` / `_DEV2`) |
+| `CTX`, `PROTO` | 1048576, the kit's | context and the TP protocol both nodes must speak |
+| `KV`, `OUT` | `$HOME/<kit>-kv`, `$HOME/<kit>-<date>` | the disk KV dir (on both nodes) and the log dir |
+| `DS`, `Q405`, `Q605` | `~/models/...` (below) | this kit's models |
+
+`lib.sh` refuses to start without `WORKER` and `PEERS`: the pair's hosts are the operator's, so the tree carries no
+default for them.  Both ranks run
 `pulsar-server --tp-rank R --tp-nranks 2 --tp-peers HEAD:PORT,WORKER:PORT` under a transient systemd unit, worker
 first.  The kit stops the pair's `pulsar-tp` unit first and leaves it stopped.
 
@@ -46,7 +57,8 @@ build it with `pulsar-server tests/qwen_generate` only (the plan golden is check
 ## 3. Run on the head
 
 ```sh
-~/pulsar-l272/tools/tp2-l272/run.sh ~/pulsar-l272 ~/pulsar-l272-ref
+WORKER=<rank-1 host> PEERS=<rank-0 ip>:5590,<rank-1 ip>:5590 \
+  ~/pulsar-l272/tools/tp2-l272/run.sh ~/pulsar-l272 ~/pulsar-l272-ref
 ```
 
 About 45 minutes with a reference (six model loads), 25 without. Logs: `~/l272-tp2-<date>/`; the last block of `run.log`

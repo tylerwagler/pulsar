@@ -28,8 +28,8 @@ import argparse, importlib, os, sys, time, traceback
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from live_server import Grader, Server, StartError  # noqa: E402
 
-# Each model's instances run production's flags exactly, the legs inside them (L317, 2026-10-21), as read from Sparky's
-# ~/pulsar-serve/{deepseek,qwen,nemotron}.env that day -- a change there moves this table in the same row.  All three
+# Each model's instances run production's flags exactly, the legs inside them (L317, 2026-10-21), as read from the production
+# server's per-model environment files that day -- a change there moves this table in the same row.  All three
 # set PULSAR_MSEQ_BANKS=16 in the environment (Server's `banks`):
 #   deepseek  --ctx 1048576 (the disk tier at the server's default size)
 #   qwen      --ctx 262144 --kv-disk-space-mb 65536

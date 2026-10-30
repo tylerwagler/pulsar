@@ -53,6 +53,12 @@ and any non-default flags for every manual run.
 make gates FRONTIER_MODEL=/path/to/<checkpoint-dir>
 ```
 
+The battery reads its models, fixtures and reference captures from about 40
+Makefile variables (`FRONTIER_MODEL`, `QWEN_GATE_MODEL`, `LILICORR_GATE_MODEL`,
+...). They have no defaults in the tree. Set them in a gitignored `local.mk` at
+the engine root; `local.mk.example` lists them. A gate whose variable is unset
+refuses by name when it runs.
+
 It runs every gate below, continues past failures so one break does not hide
 the rest, prints a PASS/FAIL summary, and exits non-zero if any failed.
 

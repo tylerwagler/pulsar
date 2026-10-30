@@ -1,6 +1,6 @@
 /* The stall watchdog (pulsar_server_internal.h, "The stall watchdog").
  *
- * 2026-10-29, the work box: the worker spun inside libcuda for 36 minutes (a GPU fault on a managed KV page that
+ * 2026-10-29, a production hang under memory pressure: the worker spun inside libcuda for 36 minutes (a GPU fault on a managed KV page that
  * nvidia-uvm could not service at the kernel's min watermark) while /health said "ok" and the log's last line was a
  * prefill chunk.  This thread turns that into one loud dump and a /health verdict.  It never touches the engine or a
  * worker-owned structure: it reads the worker's marks (pulsar_stall.h), the snapshot the worker publishes under mu

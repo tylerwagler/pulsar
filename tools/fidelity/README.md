@@ -66,10 +66,11 @@ the server must be down)
 Use the script; it preflights the things that have bitten us before (a live
 `pulsar-server`, low MemAvailable, a plain-`make` binary):
 
-    tools/fidelity/capture_pulsar_side.sh /path/to/model [SUITE_DIR] [OUT_DIR]
+    tools/fidelity/capture_pulsar_side.sh /path/to/model SUITE_DIR [OUT_DIR]
 
 The model is a container directory (`-m` takes a shard directory or a single
-safetensors file); the `pulsar` CLI is a development binary (`make pulsar`).
+safetensors file); `SUITE_DIR` (no default) is the fidelity suite on your model store.  The `pulsar` CLI is a
+development binary (`make pulsar CUDA_ARCH=sm_120f`).
 
 ## Reproducibility control (do this on an IDLE rig, ~1 min)
 

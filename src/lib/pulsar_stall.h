@@ -1,6 +1,6 @@
 /* The worker's progress marks (the stall watchdog's input; src/server/watchdog.cpp).
  *
- * The work box hung 2026-10-29 (Nemotron 3.5 Super, 16 banks, ~190k context): the worker spun inside libcuda for 36
+ * A production server hung under memory pressure 2026-10-29 (Nemotron 3.5 Super, 16 banks, ~190k context): the worker spun inside libcuda for 36
  * minutes, /health said "ok", and nothing in the log said where it was.  The marks below are the "where am I": every
  * CUDA-heavy section the worker enters -- a prefill chunk, a grid-checkpoint capture, a segment's device reads, a
  * decode quantum, a disk-KV persist -- names itself here first, and each mark is a heartbeat.  A worker that has

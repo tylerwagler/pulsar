@@ -3,8 +3,10 @@
 # bring-up, the journals, the identity / alarm verdicts and the one-tree preflight.  Sourced by a kit after it
 # sets D (the build dir, same path on both nodes), KIT (its name) and, where it differs from the defaults
 # below, MODEL / CTX / KV / PROTO.  Every helper reads these; nothing here is kit-specific.
-WORKER=${WORKER:-ca1070wk30007}
-PEERS=${PEERS:-192.168.9.13:5590,192.168.9.12:5590}     # rank 0 (this host) first
+# The pair itself has no default (the hosts are the operator's): WORKER is rank 1's ssh target, PEERS the two ranks'
+# TP-wire HOST:PORT, rank 0 (this host) first -- e.g. WORKER=hostB PEERS=10.0.9.13:5590,10.0.9.12:5590.
+: "${WORKER:?set WORKER to the ssh target of rank 1 (tools/tp2/lib.sh)}"
+: "${PEERS:?set PEERS to the TP-wire HOST:PORT list, rank 0 (this host) first (tools/tp2/lib.sh)}"
 RDMA_DEV=${RDMA_DEV:-mlx5_3}
 RDMA_DEV2=${RDMA_DEV2:-mlx5_1}
 CTX=${CTX:-1048576}

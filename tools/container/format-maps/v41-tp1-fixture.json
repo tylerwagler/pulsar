@@ -2,7 +2,7 @@
  "schema": "pulsar.recipe.v1",
  "recipe": "v41-tp1-fixture",
  "model_type": "deepseek_v41",
- "about": "L269 W2: the one-Spark V4.1 bring-up fixture -- source layers 1,2,3,14,20,21,24 (build.py --layers), the FP4 source experts as cutlass_mxfp4 everywhere but layer 20, whose routed experts are our own EXL3 K3 (/mnt/models/v41-exl3-ours-est/l20/exl3-k3, --exl3).  Everything else in its source dtype's layout.",
+ "about": "L269 W2: the one-Spark V4.1 bring-up fixture -- source layers 1,2,3,14,20,21,24 (build.py --layers), the FP4 source experts as cutlass_mxfp4 everywhere but layer 20, whose routed experts are our own EXL3 K3 (--exl3).  Everything else in its source dtype's layout.",
  "rows": [
   {
    "role": "dense",
