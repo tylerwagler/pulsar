@@ -1,3 +1,7 @@
+/** @file
+ *  Request plumbing: ids, tool calls, chat messages and conversations (build, free, fold), forced tool-choice
+ *  prefill and the request's own lifecycle.
+ */
 #include "pulsar_server_internal.h"
 
 #include <string>

@@ -1,3 +1,6 @@
+/** @file
+ *  HTTP response writers and the OpenAI chat / completions SSE stream and protocol sink.
+ */
 #include "pulsar_server_internal.h"
 
 

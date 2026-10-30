@@ -1,3 +1,7 @@
+/** @file
+ *  The disk KV cache (L264): segment-chain persist / find / restore with the restore-vs-recompute price, the
+ *  tool-map trailer, and the protocols' live-continuation prompts.
+ */
 #include "pulsar_server_internal.h"
 #include "pulsar_lock.hpp"
 #include "lib/pulsar_segstore.h"

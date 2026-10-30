@@ -14,6 +14,9 @@
  * Departures from vLLM, each the rule every family shares: client text spelling a marker stays text (L223); a
  * call the turn ends inside is broken (L272); a message's text parts arrive joined by the protocol parsers, so
  * they render as one text block where vLLM writes one block a part. */
+/** @file
+ *  The Inkling family's server table (server_family_ops) over src/lib/inkling_chat.
+ */
 #include "pulsar_server_internal.h"
 #include "../lib/inkling_chat.h"
 

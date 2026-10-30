@@ -13,6 +13,9 @@
  *     the server reads enable_thinking and reasoning_effort only; "medium" is the medium_effort level.
  * Departures from vLLM: client text spelling a marker stays text (L223); a call the turn ends inside is broken
  * (L272); a message's text parts arrive joined. */
+/** @file
+ *  The Nemotron-H family's server table (server_family_ops) over src/lib/nemotron_chat.
+ */
 #include "pulsar_server_internal.h"
 #include "../lib/nemotron_chat.h"
 

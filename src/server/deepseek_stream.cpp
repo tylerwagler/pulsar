@@ -6,6 +6,10 @@
  * Anthropic content blocks or Responses items.  Before L267 each protocol carried its own copy of this
  * walk; tests/sse_golden pins the bytes they sent.  The final DSML parse is deepseek_dsml.cpp's, and the
  * finish is the protocol's. */
+/** @file
+ *  DeepSeek's live stream projection (L267): one walk over the generated text that drives every protocol's
+ *  sink.
+ */
 #include "deepseek_dsml.h"
 
 void deepseek_stream_walk_init(deepseek_stream_walk *w, const request *r) {

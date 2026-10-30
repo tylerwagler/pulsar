@@ -5,6 +5,9 @@
  * prefill chunk.  This thread turns that into one loud dump and a /health verdict.  It never touches the engine or a
  * worker-owned structure: it reads the worker's marks (pulsar_stall.h), the snapshot the worker publishes under mu
  * (publish_metrics_snapshot), /proc, and -- once per stall -- asks the worker for its own backtrace by signal. */
+/** @file
+ *  The stall watchdog thread and its one dump per stall.
+ */
 #include "pulsar_server_internal.h"
 
 #include <dirent.h>

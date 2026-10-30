@@ -7,6 +7,9 @@
  * server_resolve_kv_disk_dir) remain reachable exactly as before.
  * A standalone compile (no PULSAR_SERVER_TEST) yields an empty object
  * for the pulsar-server link. */
+/** @file
+ *  The server's in-file unit tests, compiled only inside tests/pulsar_test.cpp (PULSAR_SERVER_TEST).
+ */
 #include "pulsar_server_internal.h"
 #include "deepseek_dsml.h"
 #include "lib/pulsar_writeback.h"

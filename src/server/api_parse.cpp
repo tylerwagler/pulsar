@@ -1,3 +1,7 @@
+/** @file
+ *  The protocol parsers: OpenAI chat / completions, Anthropic Messages and Responses request bodies into a request
+ *  (and chat_conversation), plus the sampling knobs every surface shares.
+ */
 #include "pulsar_server_internal.h"
 
 

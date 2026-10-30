@@ -4,6 +4,10 @@
  * admission/ledger/mem-floor helpers, LRU eviction and the warm
  * make-room path, the proactive spill/restore guard, Tier-2 bank
  * switching, and the frontier/committed-pos readers. */
+/** @file
+ *  The scheduler / worker: worker_main and its lanes, job-to-slot routing, provisioning, admission, eviction,
+ *  the spill / preempt guard and bank switching.
+ */
 #include "pulsar_server_internal.h"
 #include "pulsar_nvtx.h"
 #include "pulsar_lock.hpp"

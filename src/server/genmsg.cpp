@@ -1,3 +1,7 @@
+/** @file
+ *  Client output from the worker: the non-blocking deferred slot writer, the prefill keepalive / heartbeat and
+ *  the blocking send helpers.
+ */
 #include "pulsar_server_internal.h"
 
 

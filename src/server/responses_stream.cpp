@@ -1,3 +1,6 @@
+/** @file
+ *  OpenAI Responses API responses: the final JSON body, the SSE event stream and its protocol sink.
+ */
 #include "pulsar_server_internal.h"
 
 

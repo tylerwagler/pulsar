@@ -1,3 +1,7 @@
+/** @file
+ *  DeepSeek's prompt renderer (the DSML template, verbatim per variant) and the Responses / Anthropic
+ *  tool-output validation that precedes rendering.
+ */
 #include "pulsar_server_internal.h"
 
 

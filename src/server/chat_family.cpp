@@ -10,6 +10,10 @@
  * step 4), and refuses by name what that template cannot express.  A new family adds one table -- in its own
  * file (Inkling: family_inkling.cpp, over F5's src/lib/inkling_chat) -- and one case in
  * server_family_for_format; a new protocol adds one parser and no arm. */
+/** @file
+ *  The model-family half of a chat request (L267): render_chat_conversation, the family tables and their
+ *  shared helpers (DeepSeek's and Qwen's tables live here).
+ */
 #include "pulsar_server_internal.h"
 #include "deepseek_dsml.h"
 #include "../lib/qwen_chat.h"

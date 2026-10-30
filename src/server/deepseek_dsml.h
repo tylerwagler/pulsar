@@ -4,6 +4,9 @@
  * and DeepSeek's hooks in chat_family.cpp) plus the unit tests; the shared server reaches all of it through
  * server_output_parser_ops and server_family_ops.  The tag literals and the syntax table are src/lib/pulsar_dsml.h;
  * the renderer that WRITES DSML is prompt_render.cpp. */
+/** @file
+ *  Declarations of DeepSeek's DSML machinery (deepseek_dsml.cpp, deepseek_stream.cpp, parser_deepseek.cpp).
+ */
 #ifndef PULSAR_SERVER_DEEPSEEK_DSML_H
 #define PULSAR_SERVER_DEEPSEEK_DSML_H
 

@@ -1,3 +1,7 @@
+/** @file
+ *  Tool memory (call bodies by id and block bytes, LRU) and the protocols' live tool-state bindings; also
+ *  server_now_sec and server_log.
+ */
 #include "pulsar_server_internal.h"
 #include "pulsar_lock.hpp"
 

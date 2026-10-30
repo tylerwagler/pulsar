@@ -48,6 +48,9 @@
  * probe_rows on the first round of a full decode quantum (L260's decode share), the prompt that rode least recently
  * first.  Each such round is an observation the fit is made of; the server alternates two probe widths so the fit
  * can separate its fixed term from its per-row one. */
+/** @file
+ *  The fused lane's value-per-time round selection (L312): which prompt chunks ride the next spec round.
+ */
 #include "sched_value.h"
 
 #include <math.h>

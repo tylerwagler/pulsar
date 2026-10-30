@@ -7,6 +7,10 @@
  * on (server_family_ops::find_call_block) and the model-visible tool error (server_family_ops::tool_error_suffix).
  * Until L295 these bodies sat in openai_stream.cpp, genmsg.cpp, anthropic_stream.cpp, kv_cache.cpp,
  * tool_memory.cpp, server_jobs.cpp and generate.cpp. */
+/** @file
+ *  DeepSeek's DSML machinery (L295 F5): the decode-time tracker, the live tool-stream projection, the final
+ *  parse, the call-block finder and the model-visible tool error.
+ */
 #include "deepseek_dsml.h"
 
 /* ---- the raw-text helpers and the decode-time tracker ------------------------------------------------ */

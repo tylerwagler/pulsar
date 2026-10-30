@@ -19,6 +19,10 @@
  * L272's tool-name mask is this mechanism's first case: a forced call's seed is fed to the gate as if sampled,
  * so "required" over several tools constrains the name AND its arguments, in every lane (the name mask held
  * speculation off; the gate does not). */
+/** @file
+ *  Structured outputs (L303): response formats and strict / forced tool calls compiled to grammars, and the
+ *  per-attempt gate that masks the draws inside a grammar region.
+ */
 #include "pulsar_server_internal.h"
 #include "../lib/pulsar_grammar.h"
 

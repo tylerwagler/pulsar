@@ -1,3 +1,7 @@
+/** @file
+ *  Generation helpers shared by every lane: the OpenAI logprobs ledger, the reasoning tracker
+ *  (thinking_state) and the turn-finish rules.
+ */
 #include "pulsar_server_internal.h"
 
 

@@ -14,6 +14,9 @@
  * model-visible tool error when allowed, else it is text.  The turn's calls as sampled (the parser's raw
  * span of g->text) are the tool memory's key, replayed verbatim by the renderer so the next prompt
  * byte-matches the live KV. */
+/** @file
+ *  The output-parser kit behind server_output_parser_ops: the hooks shared by every kit-configured family.
+ */
 #include "pulsar_server_internal.h"
 
 kit_gen::~kit_gen() {

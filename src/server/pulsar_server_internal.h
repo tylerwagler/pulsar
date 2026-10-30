@@ -1,6 +1,10 @@
 /* pulsar_server_internal.h — internal shared declarations for the server sources.
  * Produced by the multi-TU split of pulsar_server.c; edit freely (the
  * generator is not part of the build). */
+/** @file
+ *  Internal shared declarations for the server sources: the request, slot, job and server types and every
+ *  cross-file server function.
+ */
 #ifndef PULSAR_SERVER_INTERNAL_H
 #define PULSAR_SERVER_INTERNAL_H
 

@@ -6,6 +6,10 @@
  * (server_sched.cpp). gen_state/gen_phase live in pulsar_server_internal.h
  * because the scheduler TU steps jobs by phase and drives the batched
  * lanes through the batch_* fields. */
+/** @file
+ *  The job lifecycle around one request: the resumable gen_state machine (prefill, decode, finish) and the
+ *  generate_job_* driver the scheduler steps.
+ */
 #include "pulsar_server_internal.h"
 #include "pulsar_lock.hpp"
 

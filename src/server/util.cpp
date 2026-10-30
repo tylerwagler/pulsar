@@ -1,3 +1,7 @@
+/** @file
+ *  Small server utilities: allocation that dies on failure, the growable buffer, JSON helpers, random ids and
+ *  the stop signal.
+ */
 #include "pulsar_server_internal.h"
 #include "pulsar_json.h"
 

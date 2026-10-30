@@ -1,3 +1,6 @@
+/** @file
+ *  Anthropic Messages responses: the final JSON body, the SSE event stream and its protocol sink (chat_sink).
+ */
 #include "pulsar_server_internal.h"
 
 

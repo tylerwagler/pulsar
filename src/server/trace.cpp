@@ -1,3 +1,6 @@
+/** @file
+ *  Request tracing (--trace): the cache-decision record, per-request events and the final parse.
+ */
 #include "pulsar_server_internal.h"
 
 

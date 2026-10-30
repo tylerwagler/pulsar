@@ -1,3 +1,7 @@
+/** @file
+ *  pulsar-server's entry point: option parsing, the KV budget / memory-floor arithmetic, engine and session
+ *  startup, the listener and the shutdown drain.
+ */
 #include "pulsar_server_internal.h"
 #include "lib/pulsar_segstore.h"
 #include "pulsar_lock.hpp"

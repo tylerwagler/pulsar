@@ -30,6 +30,10 @@
  *            "total_tokens"}, "timings": {"vision_ms", "prefill_ms", "decode_ms"}}
  * An input longer than the model's cap (pulsar_engine_encode_max_tokens) is refused (400) unless truncate is END,
  * which keeps its first cap tokens. */
+/** @file
+ *  pulsar-server for the single-call engines (L321): /v1/embeddings, /v1/rerank and /v1/parse over encoders
+ *  and parsers, one thread per connection.
+ */
 #include "pulsar_server_internal.h"
 #include "lib/pyjson.h"
 

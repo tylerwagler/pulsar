@@ -1,3 +1,7 @@
+/** @file
+ *  The HTTP front door: request reading, the client threads' routing, /health, /version, /v1/models,
+ *  /metrics and /metrics/stream.
+ */
 #include "pulsar_server_internal.h"
 #include <time.h>
 #include "pulsar_lock.hpp"

@@ -7,6 +7,9 @@
  * projection into the protocol sink (deepseek_stream.cpp's one walk), and the finish -- the final DSML
  * parse, the shared rule for a broken call (L284 P4: retry or text, never a repaired tag), the stream's
  * ids onto the parsed calls, tool memory.  Nothing here is reached except through k_parser_deepseek. */
+/** @file
+ *  DeepSeek's output parser behind server_output_parser_ops (k_parser_deepseek).
+ */
 #include "deepseek_dsml.h"
 
 static void *ds_parser_create(server *, gen_state *g, char *, size_t) {
