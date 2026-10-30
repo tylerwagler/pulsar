@@ -2770,7 +2770,11 @@ typedef struct kv_restore {
  *  across a sliced disk restore when the resume pick is the disk chain (then the plan runs once the chain is in). */
 typedef struct gen_resolution {
     const pulsar_tokens *prompt_for_sync;   ///< &j->req.prompt or &g->effective_prompt
-    int cached;                             ///< tokens the bank serves the prompt from
+    int cached;                             ///< tokens the bank serves the prompt from (the request's: the cache read)
+    /** L334: where the sync's computed rows start on the prompt it runs (the prefill watermark, the progress line's
+     *  start): `cached` except across a token seam, where the bank's own resume and an adopt start at a live-side
+     *  position that holds fewer of the request's tokens */
+    int resumed_at;
     const char *cache_source;               ///< which layer served them (the trace's and the log's word)
     int disk_cached;                        ///< ... of which a disk chain loaded
     bool responses_live_continuation;       ///< a live Responses continuation (the effective prompt is its)

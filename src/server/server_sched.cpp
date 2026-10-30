@@ -638,7 +638,7 @@ session_slot *server::choose_slot_for_job(job *j, int *reject_ctx,
          * the whole match for a history it continues.  The route scored the grid checkpoint below the match alone (a
          * record only for a bank holding the whole prompt, L289), so a bank whose turn-end record stood above its
          * thinned grid ranked below a shallower bank. */
-        const int score = pulsar_session_bank_resume_at(s->sess, sl->bank, &j->req.prompt).raw();
+        const int score = pulsar_session_bank_resume_at(s->sess, sl->bank, &j->req.prompt).served.raw();
         if (route_debug)
             server_log(PULSAR_LOG_DEFAULT,
                        "pulsar-server: route-scan slot %d bank %u: frontier=%d common=%d score=%d",
@@ -930,7 +930,7 @@ void server::worker_protect_queued_warm_matches(bool protect[PULSAR_SESSION_POOL
             const session_slot *sl = &s->slots[k];
             if (!sl->provisioned) continue;
             /* L325: the route's score (pulsar_session_bank_resume_at, choose_slot_for_job) */
-            const int score = pulsar_session_bank_resume_at(s->sess, sl->bank, &q->req.prompt).raw();
+            const int score = pulsar_session_bank_resume_at(s->sess, sl->bank, &q->req.prompt).served.raw();
             if (score > best_score) { best_score = score; best_i = k; }
         }
         if (best_i >= 0) protect[best_i] = true;
@@ -1390,7 +1390,7 @@ bool server::prefix_wait_decide(job *j) {
         session_slot *sl = &s->slots[i];
         if (!sl->provisioned || sl->spilled || sl->preempted) continue;
         /* the deepest state a bank serves the prompt from now: its own resume, which is what an adopt of it reads */
-        const int at = pulsar_session_bank_resume_at(s->sess, (uint32_t)sl->bank, &r->prompt).raw();
+        const int at = pulsar_session_bank_resume_at(s->sess, (uint32_t)sl->bank, &r->prompt).served.raw();
         if (at > have) have = at;
         if (!slot_prefilling(sl) || sl->gen->j->req.n_images > 0 || !sl->gen->prompt_for_sync) continue;
         const pulsar_tokens *lp = sl->gen->prompt_for_sync;
@@ -3164,7 +3164,7 @@ bool server::fuse_prepare(session_slot *sl) {
         pulsar_session_invalidate(pool);     /* a fresh conversation: the bank empty on the device too */
     } else if (pulsar_session_common_prefix(pool, g->prompt_for_sync) != pos) {
         g->no_fuse = "needs a rewind/stitch";   /* the classic sync owns that */
-    } else if (const int at = pulsar_session_bank_resume_at(pool, (uint32_t)sl->bank, g->prompt_for_sync).raw();
+    } else if (const int at = pulsar_session_bank_resume_at(pool, (uint32_t)sl->bank, g->prompt_for_sync).at.raw();
                at >= 0 && at != pos) {
         /* L284: a bank-pool family's sync would not continue this history where it stands (decode rows past
          * its prefill: it resumes from a checkpoint below); a fused chunk starts only where the sync would */
