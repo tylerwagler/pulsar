@@ -243,7 +243,7 @@ typedef struct {
 #define PULSAR_QWEN_MAX_NGRAM_HEADS 32u   ///< n-gram tables (Flash-Next: 2 orders x 8 heads = 16)
 
 /** L251 MTP: the one multi-token-prediction layer's head-side tensors (the sidecar shard; the spec is
- *  l251/docs/MTP-SPEC-2026-09-29.md).  The layer itself is bound as a QSA layer in
+ *  the L251 MTP spec (2026-09-29, private notes)).  The layer itself is bound as a QSA layer in
  *  pulsar_qwen_weights::layer[n_layer] (split experts, no PLE), so the trunk's ops run it unchanged. */
 typedef struct {
     bool present;                  ///< the artifact carries mtp.* (all of it, or the load refuses)

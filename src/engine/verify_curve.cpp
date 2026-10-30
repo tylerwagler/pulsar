@@ -33,7 +33,7 @@
  * (pulsar_spec_chain_step, which adds the next drafter step's measured cost to the round).  It replaces L288's
  * marginal threshold (row_us / token_ms), its 16 / 32 width probes and the drafters' token_ms price.
  *
- * A tensor-parallel group (L315, after Flare's rank-0 decision: docs/scheduling-runtime-design.md, "rank zero supplies
+ * A tensor-parallel group (L315, after Flare's rank-0 decision: NVIDIA/flare-local-inference's docs/scheduling-runtime-design.md, "rank zero supplies
  * the confidence curve ... every rank receives the same root-selected operation"): the leader profiles the curve
  * with every rank running the profile's forwards in step (pulsar_session_verify_profile), corrects it from its own
  * rounds, and the SERVER'S pick -- the rows each bank verifies, pulsar_engine_verify_pick -- reads it there; the

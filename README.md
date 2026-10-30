@@ -37,7 +37,7 @@ the degree its coverage column says.
 | --- | --- | --- | --- | --- | --- |
 | **Qwen3.8-Flash-Next** (`qwen4_exp`) | `qwen3.8-flash-next` | EXL3 experts and head, MXFP8 / BF16 dense, NVFP4 drafter; PLE n-gram row file beside the container | GB10 | DFlash2 block drafter (default) or MTP; 262k context, 1M with `--rope-yarn 4`; banks + disk KV; images; TP=2 | **Good.** Production; most of the battery's live serving legs (scheduling, preemption, prefix reuse, resume, fan-out, structured output); its session, speculation, chunk-neutrality and KL-vs-BF16 reference gates; chat-template and vision-tower gates. Declared gaps (`tests/contracts.tsv`): TP on a real pair, whole-session payloads, mixed-prefill neutrality |
 | **DeepSeek V4 Flash** Vision-Exp / 0731 (`deepseek4`) | `deepseek-v4-flash` | MXFP8 dense, MXFP4 / IQ2_XXS / EXL3 routed experts, BF16 head | GB10 (needs `sm_12x`) | DSpark drafter merged in the container; 1M context; banks + disk KV; images (Vision-Exp); TP=2 | **Partial.** The Vision-Exp container is the battery runner's primary model (kernels, bit-exact prefill and decode baselines, the reference gates, sessions, speculation) and runs four live legs. Not exercised in production in this release |
-| **DeepSeek V4.1 Flash** (`deepseek4`) | `deepseek-v4-pro` (see note) | as above, EXL3 routed experts; Engram table on disk | GB10 | DSpark when the container carries it; 1M context; banks + disk KV; no images (its image path refuses); TP=2 | **Thin.** Renderer goldens only (`render-gate`); no model gate in the battery |
+| **DeepSeek V4.1 Flash** (`deepseek4`) | `deepseek-v4.1-flash` | as above, EXL3 routed experts; Engram table on disk | GB10 | DSpark when the container carries it; 1M context; banks + disk KV; no images (its image path refuses); TP=2 | **Thin.** Renderer goldens only (`render-gate`); no model gate in the battery |
 | **Nemotron 3.5 Super** (`nemotron_h`) | `nemotron-3.5-super` | EXL3 K4, NVFP4 W4A16 LiLiCorr drafter | GB10 | LiLiCorr or MTP drafter; banks + disk KV; no images; no TP | **Partial.** Its LiLiCorr container runs three runner legs (block speculation, scratch poison, bank adoption) and two live legs; KV-admission legs on a mini fixture; chat-template gate |
 | **Inkling** (`inkling`) | `inkling-small` | EXL3 K3 | GB10 | single session; no drafter, banks, images or TP | **Minimal.** Tokenizer and chat-template gate only |
 | **Nemotron 3.5 Embed-8B / Rerank-8B** (`nemotron_enc`) | `nemotron-embed` / `nemotron-rerank` | EXL3 4.0 | Turing `sm_75` (in service on an RTX 5000); GB10 builds | `/v1/embeddings`, `/v1/rerank`; several in one process | **Manual.** `tests/nemotron_enc_gate` run by hand; not in the battery |
@@ -67,10 +67,8 @@ Notes:
   table is a separate row file that the container names. Pulsar streams it from
   disk while the model runs, so keep the container on local NVMe. The trained
   context is 262,144 positions; `--rope-yarn 4` serves 1M (1,048,576).
-- **DeepSeek V4.1** containers currently report the served id `deepseek-v4-pro`.
-  This is a leftover of the old Flash/Pro naming (`ds4_served_model_id` in
-  `src/engine/family_deepseek.cpp`). DeepSeek V4 **Pro** itself is no longer a
-  loadable shape.
+- DeepSeek V4 **Pro** is no longer a loadable shape. Its old id slot belongs to
+  V4.1, which reports `deepseek-v4.1-flash`.
 - The encoder and Parse families serve their own endpoints (`/v1/embeddings`,
   `/v1/rerank`, `/v1/parse`). They do not chat. One process can host several of
   them (`-m` repeated).

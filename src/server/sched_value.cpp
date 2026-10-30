@@ -1,6 +1,6 @@
 /* L312 -- the fused lane's round selection: value per time, with a decode-age price and token-fairness prices.
  *
- * After NVIDIA Flare's scheduler (docs/scheduling-utility.md, helios/src/scheduler/{policy,utility}.rs), ported in
+ * After NVIDIA Flare's scheduler (NVIDIA/flare-local-inference: its docs/scheduling-utility.md and helios/src/scheduler/{policy,utility}.rs), ported in
  * design, not in code.  Every spec round the server may carry chunks of the prefilling prompts beside the decoders'
  * verify rows (L260 fusion).  Which chunks, and how wide, is one rule: of every candidate round -- decode only, or
  * decode plus some prompts' chunks -- run the one with the most value per time, net of what the round makes the

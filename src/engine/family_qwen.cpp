@@ -1202,7 +1202,7 @@ static bool qwen_image_rows(const pulsar_driver_step *st, const uint16_t *rows, 
 }
 
 /* ---- L251 MTP: the MTP layer as the chained-MTP drafter's module (spec_mtp.h, L296 N9) ----------------------------
- * (l251/docs/MTP-SPEC-2026-09-29.md.)  An MTP row at position p reads the trunk's pre-mixer stack at p and the token
+ * (The spec: the L251 MTP spec (2026-09-29, private notes).)  An MTP row at position p reads the trunk's pre-mixer stack at p and the token
  * x_{p+1}; it writes the MTP layer's KV at p and predicts x_{p+2}.  The core's lane (spec_mtp.cpp) decides which rows a
  * step carries -- the lockstep with the trunk (a prompt chunk's rows with the next prompt token, the chunk's LAST row
  * parked in the MTP_PEND state for the token the next step feeds), the absorb of a round's kept rows, the draft chains

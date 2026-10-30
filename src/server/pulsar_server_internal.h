@@ -1773,14 +1773,6 @@ struct server {
      * uniform eviction of slot 0 zeroed it, silently poisoning every later
      * provision with ctx 0 (banks the router then skipped forever). */
     int          pool_ctx_size;
-    /** PULSAR_EVAL_PIN=1: history-independent serving for reproducible evals.
-     * Kills every cross-request reuse channel at its choke point — thinking-
-     * bind routing, warm forks, and in-place prefix continuation (common
-     * prefix reported as 0, so every request cold-prefills from position 0).
-     * Same request -> same output regardless of what the server did before.
-     * The 2026-08-09 TEB investigation measured +-10 final points of history
-     * dependence on identical requests at temperature 0; this flag is how an
-     * eval pins behavior WITHOUT changing production defaults. */
     uint64_t     bank_marginal_bytes;  ///< Tier-2: per-bank ledger charge in pooled mode (even split of the admitted pool cost; conservative, demand-paged reality is smaller). 0 in classic mode.
     uint64_t     kv_budget_bytes;  ///< admission ceiling computed at startup
     /** Context-scaled KV one bank holds at the configured context — the

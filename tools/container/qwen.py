@@ -5,7 +5,7 @@ Sources (no GGUF anywhere, L247):
            the tokenizer)
   --exl3   an exllamav3-layout checkpoint holding the EXL3 tensors the recipe names: <linear>.{trellis,suh,svh,mul1}
            under the HF Linear name (dense: minus ".weight"; routed experts: mlp.experts.<e>.<part>).  Ours
-           (research/l251/container/qwen_exl3_quant.py: gate_up fused) or turboderp's (gate / up separate).
+           (the L251 quantizer, private: gate_up fused) or turboderp's (gate / up separate).
   --exl3-experts   optional: a DIFFERENT exllamav3 checkpoint for the routed experts only (e.g. turboderp's K4
            experts beside our K5 dense).  Named explicitly; nothing falls back from one source to the other.
   --recipe a pulsar.recipe.v1 (recipe.py; format-maps/qwen38fn-*.json, name-pattern rows): every checkpoint tensor
@@ -14,7 +14,7 @@ Sources (no GGUF anywhere, L247):
   --ple-rows  the PLE row-file manifest (ple_rows.py build): its header facts become pulsar.kv entries so the
            loader can refuse a mismatched table.
 
-What the container holds (the loader's contract, published in pulsar-notes research/l251/container/README.md):
+What the container holds (the loader's contract, published in the L251 container notes, private):
   * names ARE the HF names.  Routed experts fold to one U8 entry per expert-projection,
     `model.language_model.layers.L.mlp.experts.<e>.<part>.weight`, contiguous in expert order, part in
     {gate_up_proj} (fused) or {gate_proj, up_proj} (split) plus {down_proj}; each family in pulsar.experts carries

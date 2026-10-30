@@ -167,13 +167,15 @@ static void print_model_runtime(FILE *fp, const help_colors *c,
         opt(fp, c, "--prefill-chunk N", "GPU graph prefill chunk size. Default: auto (PRO long prompts use 8192; others use 4096).");
     }
     if (full) {
-        if (tool != PULSAR_HELP_BENCH) {
-            opt(fp, c, "--no-dspark", "Disable the DSpark speculative drafter bundled in the checkpoint.");
+        /* the drafter flags are parsed by the server and the CLI only (cli_main.cpp, pulsar_cli.cpp) */
+        if (tool == PULSAR_HELP_SERVER || tool == PULSAR_HELP_DS4) {
+            opt(fp, c, "--no-dspark", "Run without the container's speculative drafter (DSpark, MTP or a block drafter).");
             opt(fp, c, "--drafter NAME", "Which drafter the container holds runs, and so is loaded at all: mtp, or its block drafter -- lilicorr (Nemotron-H), dflash2 (Qwen3.8-Flash-Next). Default: the one the container holds; of two, the block drafter on Qwen (dflash2), a choice on Nemotron-H; a name it does not hold refuses.");
             opt(fp, c, "--spec-depth N", "Draft depth a session starts at (default: the drafter's -- DSpark 3, then its adaptive controller walks 2..5; MTP 4, its controller walks 4..7 and a chain stops sooner when one more draft would not pay its step and verify row). Env PULSAR_SPEC_DEPTH.");
             opt(fp, c, "--spec-tau F|off", "Draft stop threshold: a chain ends at its first draft whose confidence is under F, that draft its last verified (default: the drafter's -- DSpark 0.55, MTP 0.7). Env PULSAR_SPEC_TAU.");
-            opt(fp, c, "--expert-overlay PATH:PFX", "Swap routed-expert tensors matching PFX for the same tensors in donor checkpoint PATH (quant-format measurement).");
         }
+        if (tool == PULSAR_HELP_DS4)
+            opt(fp, c, "--expert-overlay PATH:PFX", "Swap routed-expert tensors matching PFX for the same tensors in donor checkpoint PATH (quant-format measurement).");
     }
     fputc('\n', fp);
 }
@@ -274,17 +276,18 @@ static void print_server_api(FILE *fp, const help_colors *c) {
     opt(fp, c, "--port N", "Bind port. Default: 8000");
     opt(fp, c, "--trace FILE", "Write prompts, cache decisions, output, and tool calls.");
     para(fp, c, "Endpoints: /v1/chat/completions, /v1/responses, /v1/completions, and /v1/messages.");
-    para(fp, c, "The model endpoint id reflects the loaded model's shape: deepseek-v4-flash or deepseek-v4-pro (one at a time).");
+    para(fp, c, "Also /v1/messages/count_tokens, /v1/models, /health, /version, /metrics and /metrics/stream.");
+    para(fp, c, "The model id is the loaded model's (e.g. qwen3.8-flash-next, deepseek-v4-flash); the request's model selects nothing.");
     fputc('\n', fp);
 }
 
 static void print_server_thinking(FILE *fp, const help_colors *c) {
     title(fp, c, "Server Thinking Defaults");
-    para(fp, c, "DeepSeek-compatible chat requests default to thinking at low reasoning effort.");
-    para(fp, c, "reasoning_effort (or output_config.effort) selects low, high, or max (0731 levels).");
-    para(fp, c, "high and max require --ctx >= 393216; smaller contexts use low.");
-    para(fp, c, "thinking={type:disabled}, think=false, or model=deepseek-chat selects non-thinking mode.");
-    para(fp, c, "In thinking mode, client sampling knobs are ignored like the official API.");
+    para(fp, c, "Chat requests think by default, at the loaded family's default effort.");
+    para(fp, c, "reasoning_effort (or reasoning.effort, output_config.effort) takes none, minimal, low, medium, high, xhigh,");
+    para(fp, c, "max or 1..100; the family maps it to its template's levels (docs/SERVER.md, Thinking and effort).");
+    para(fp, c, "thinking={type:disabled}, think=false, enable_thinking=false, effort none, or (DeepSeek) model=deepseek-chat");
+    para(fp, c, "selects non-thinking mode.  Sampling knobs a request sends are used as sent; absent ones take the defaults.");
     fputc('\n', fp);
 }
 
@@ -292,7 +295,7 @@ static void print_kv_cache(FILE *fp, const help_colors *c) {
     title(fp, c, "Disk KV Cache");
     opt(fp, c, "--kv-disk-dir DIR", "Disk KV checkpoint dir. Default (on): $XDG_CACHE_HOME/pulsar/kv-<model>, else ~/.cache/pulsar/kv-<model>. \"\" disables.");
     opt(fp, c, "--no-kv-disk", "Disable the disk KV cache.");
-    opt(fp, c, "--kv-disk-space-mb N", "Disk budget. Default: 65536");
+    opt(fp, c, "--kv-disk-space-mb N", "Disk budget in MiB. Default: unbounded unless set.");
     fputc('\n', fp);
 }
 

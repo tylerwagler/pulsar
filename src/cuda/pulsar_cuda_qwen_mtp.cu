@@ -1,5 +1,5 @@
 /* Qwen3.8-Flash-Next MTP (L251): the input combine that starts the MTP layer's streams.
- * The spec is l251/docs/MTP-SPEC-2026-09-29.md (vLLM v0.30.0 qwen4_exp/nvidia/mtp.py:293-313, which
+ * The spec is the L251 MTP spec (2026-09-29, private notes), from vLLM's reference (vLLM v0.30.0 qwen4_exp/nvidia/mtp.py:293-313, which
  * TensorFold matches); contracts in pulsar_cuda_qwen.h.
  *
  * For each row (target position p, token x_{p+1}):

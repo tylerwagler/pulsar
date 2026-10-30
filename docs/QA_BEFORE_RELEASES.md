@@ -415,7 +415,7 @@ The server must keep compatibility across OpenAI, Responses, and Anthropic
 clients.
 
 - `GET /v1/models` lists exactly the loaded model's served id
-  (`deepseek-v4-flash` / `deepseek-v4-pro`, `qwen3.8-flash-next`,
+  (`deepseek-v4-flash` / `deepseek-v4.1-flash`, `qwen3.8-flash-next`,
   `nemotron-3.5-super`, `inkling-small`, ...), and `GET /v1/models/<id>`
   answers for that id only (any other id is a 404).
 - Test OpenAI chat completion, OpenAI Responses, and Anthropic messages.

@@ -134,7 +134,7 @@ typedef struct {
     pulsar_qwen_lowrank fc_hidden;   /**< mtp.fc_hidden mxfp8_lt [2560][2560], applied per stream */
 } pulsar_qwen_mtp_dev;
 
-/** The MTP input combine (l251/docs/MTP-SPEC-2026-09-29.md (b)): for each row, h_streams [T][4][2560]
+/** The MTP input combine (the L251 MTP spec (2026-09-29, private notes), part (b)): for each row, h_streams [T][4][2560]
  *  bf16 (the trunk's pre-mixer stack at position p) and tokens [T] int32 on the device (x_{p+1}) ->
  *  out_streams [T][4][2560] bf16, the MTP layer's starting streams:
  *    s_i = bf16( bf16(fc_hidden(hn_i)) + bf16(fc_embedding(ein)) ),

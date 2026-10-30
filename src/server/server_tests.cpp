@@ -6232,10 +6232,10 @@ static void test_model_metadata_clamps_completion_to_context(void) {
     TEST_ASSERT(strstr(b.ptr, "\"max_completion_tokens\":32768") != NULL);
     buf_free(&b);
 
-    append_model_json_values(&b, "deepseek-v4-pro", "DeepSeek V4 Pro",
+    append_model_json_values(&b, "deepseek-v4.1-flash", "DeepSeek V4.1 Flash",
                              100000, 4096);
-    TEST_ASSERT(strstr(b.ptr, "\"id\":\"deepseek-v4-pro\"") != NULL);
-    TEST_ASSERT(strstr(b.ptr, "\"name\":\"DeepSeek V4 Pro\"") != NULL);
+    TEST_ASSERT(strstr(b.ptr, "\"id\":\"deepseek-v4.1-flash\"") != NULL);
+    TEST_ASSERT(strstr(b.ptr, "\"name\":\"DeepSeek V4.1 Flash\"") != NULL);
     TEST_ASSERT(strstr(b.ptr, "\"context_length\":100000") != NULL);
     TEST_ASSERT(strstr(b.ptr, "\"max_completion_tokens\":4096") != NULL);
     buf_free(&b);

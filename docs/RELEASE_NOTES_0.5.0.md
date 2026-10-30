@@ -109,6 +109,14 @@ rounds. A duplicate-prefix census is exported (L324).
   default `--ctx` is still 1M, so a Qwen container needs `--rope-yarn 4` or a
   `--ctx` of 262144 or less.
 - `GET /v1/models/{id}` answers only for the served id; other ids are 404.
+- **DeepSeek V4.1 is served as `deepseek-v4.1-flash`.** It used to report
+  `deepseek-v4-pro`, a leftover from when that variant slot was V4 Pro's. The id
+  appears in `/v1/models`, `/version`, `/health`, the responses' `model` field
+  and the `/metrics` labels, so clients and dashboards that matched on it need
+  updating. V4 (0731 / Vision-Exp) is still `deepseek-v4-flash`.
+- `--help` now matches the code: the disk KV budget is unbounded unless set,
+  `--expert-overlay` is listed for the `pulsar` CLI only, and the server's
+  thinking and model-id notes are current.
 - **Thinking effort is per family.** No context size demotes an effort any more.
   DeepSeek's default is the encoder's (V4.1 high, 0731 low; L239).
 - Graph capture refuses instead of falling back to eager (L306).
@@ -188,9 +196,6 @@ rounds. A duplicate-prefix census is exported (L324).
 - Batched and speculative decode are not bit-reproducible across load. A greedy
   near tie can flip with what else is co-scheduled. Under sampling the
   distribution is preserved.
-- DeepSeek V4.1 containers report the served id `deepseek-v4-pro`, a leftover
-  of the old Flash/Pro naming.
-- Without `--kv-disk-space-mb` the disk KV cache has no size limit, although
-  `--help` still says 65536.
+- Without `--kv-disk-space-mb` the disk KV cache has no size limit.
 - The default context (1M) is refused by a container whose trained context is
   smaller. Pass `--ctx` or `--rope-yarn`.

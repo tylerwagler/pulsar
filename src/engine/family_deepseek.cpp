@@ -62,8 +62,10 @@ static void ds4_tp_shape(const pulsar_engine *, uint32_t *n_layer, uint32_t *n_e
 }
 
 static const char *ds4_model_name(const pulsar_engine *) { return PULSAR_MODEL_SHAPE_NAME; }
+/* The id each profile is served as, spelled like the other families' (qwen3.8-flash-next, nemotron-3.5-super): variant
+ * 1 was V4 Pro's before L218 made it V4.1 Flash, and served "deepseek-v4-pro" until 2026-10-30. */
 static const char *ds4_served_model_id(const pulsar_engine *) {
-    return PULSAR_MODEL_VARIANT == 1 ? "deepseek-v4-pro" : "deepseek-v4-flash";
+    return g_pulsar_shape.variant == PULSAR_VARIANT_V41 ? "deepseek-v4.1-flash" : "deepseek-v4-flash";
 }
 
 /* The conversation format follows the profile: 0731 has its own template,
