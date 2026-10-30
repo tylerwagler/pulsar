@@ -87,9 +87,12 @@ struct qwen_tool_call_in {
 /** One message.  `content` NULL renders as empty (the template's `none`). */
 struct qwen_msg_in {
     const char *role;       ///< system | user | assistant | tool
+    /// The message text (client data); NULL renders as empty.  Stripped (Jinja |trim) when rendered.
     const char *content;
     const char *reasoning;  ///< assistant reasoning_content; NULL = none
+    /// The assistant message's tool calls (n_calls of them); NULL when none.
     const qwen_tool_call_in *calls;
+    /// Number of entries in `calls`.
     int n_calls;
     /** The calls' SAMPLED bytes, from the first "<tool_call>" to the last "</tool_call>" (the server's
      * tool memory, L272 P3): written verbatim after the template's separator in place of rendering
@@ -99,18 +102,26 @@ struct qwen_msg_in {
      *  render_content writes each as <|vision_start|><|image_pad|><|vision_end|> there, outside client data.
      *  NULL / 0 = none.  An image in a system or assistant message is refused, as the template refuses it. */
     const uint32_t *image_at;
+    /// Number of entries in `image_at`.
     int n_images;
 };
 
+/// A full render's request: the conversation, its tools and the effort.
 struct qwen_render_in {
+    /// The conversation's messages, in order.
     const qwen_msg_in *msgs;
+    /// Number of entries in `msgs` (0 is refused as no_messages).
     int n_msgs;
     const char *tools_json;   ///< the request's tools array as JSON text; NULL = none
+    /// The thinking level (the effort line and the generation prompt follow it).
     qwen_effort effort;
+    /// End with the generation prompt for `effort`.
     bool add_generation_prompt;
 };
 
+/// A render's result: the prompt text and the client-data span map.
 struct qwen_render_out {
+    /// The rendered text (at most UINT32_MAX bytes, else prompt_too_large).
     std::string text;
     std::vector<pulsar_text_span> spans;   ///< client-data ranges, ascending, disjoint
 };
@@ -201,17 +212,40 @@ public:
                size_t *at) override;
 
 private:
+    /// Advance pay_ over the body's new bytes and set pay_.payload for the next byte.
+    /// @param b    the call's body so far
+    /// @param held bytes the kit holds back as a possible "</tool_call>"
     void scan_payload(const std::string &b, size_t held);
+    /// Read one "<parameter=KEY>\nVALUE\n</parameter>" of function `fn` at b[*i] (the reading close() and the
+    /// stream share).
+    /// @param b   the call's body
+    /// @param i   in: where the parameter starts; out: past it (on 1)
+    /// @param fn  the call's function name (its schema types the value)
+    /// @param key receives the parameter's name
+    /// @param v   receives the typed value
+    /// @param why receives what is missing or wrong (static string)
+    /// @return 1 = read, 0 = not complete yet, -1 = not a parameter
     int read_param(const std::string &b, size_t *i, const std::string &fn, std::string *key, pyjson_value *v,
                    const char **why) const;
+    /// Emit a TOOL_ARGS fragment for each parameter that closed since the last call.
+    /// @param b     the call's body so far
+    /// @param index the call's index, for the events
+    /// @param ev    receives the fragments
     void stream_params(const std::string &b, int index, std::vector<out_event> *ev);
+    /// @param fn  a function name
+    /// @param key one of its parameters
+    /// @return "string" when the schema declares the property a string (or a type list holding string), "other" for
+    ///         any other declaration, NULL when the tool or the property is not declared
     const char *param_type(const std::string &fn, const std::string &key) const;
 
+    /** @var pay_
+    *  Where the open block's decode is (in_payload), scanned incrementally. */
     bool began_ = false;       ///< TOOL_BEGIN sent for the open call
     std::string fn_;           ///< the open call's function name, once complete
     size_t arg_pos_ = 0;       ///< body offset past the last parameter streamed (TOOL_ARGS)
     int arg_n_ = 0;            ///< parameters streamed for the open call
     bool arg_stop_ = false;    ///< the open call stopped streaming: its next bytes are not a parameter
+    /// The incremental payload scanner's state for the open call.
     struct payload_scan {      ///< where the open block's decode is (in_payload), scanned incrementally
         size_t pos = 0;        ///< bytes of the body classified
         bool value = false;    ///< inside a parameter value
@@ -235,9 +269,15 @@ public:
     /** `thinking`: the generation prompt opened a think block (the turn starts in reasoning).  `tools_json`:
      * the request's tools (NULL for none) -- the schema that types arguments.  false + reason if tools_json
      * is not a JSON array. */
+    /// @param thinking   the turn starts in OUT_REASONING
+    /// @param tools_json the request's tools array as JSON text, or NULL
+    /// @param err        receives "tools_not_array: <detail>" on failure
+    /// @param errlen     its size
+    /// @return true when the parser is ready for the turn
     bool init(bool thinking, const char *tools_json, char *err, size_t errlen);
     out_parser *clone() const override;
 
 private:
+    /// The call-body reader (Qwen's XML format), schema-typed by the request's tools.
     qwen_xml_call_body body_;
 };

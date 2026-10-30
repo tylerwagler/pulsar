@@ -11,17 +11,26 @@
 namespace pulsar {
 namespace {
 
+/** Print `msg` to stderr and exit(1); the allocation-failure path of the helpers below.
+ *  @param msg what failed */
 [[noreturn]] void kv_die(const char *msg) {
     fprintf(stderr, "pulsar-kvtext: %s\n", msg);
     exit(1);
 }
 
+/** realloc that never returns NULL: dies on OOM; a size of 0 allocates 1 byte.
+ *  @param p block to resize (NULL to allocate)
+ *  @param n new size in bytes
+ *  @return the resized block */
 void *kv_xrealloc(void *p, size_t n) {
     p = realloc(p, n ? n : 1);
     if (!p) kv_die("out of memory");
     return p;
 }
 
+/** strdup that dies on OOM.
+ *  @param s NUL-terminated string to copy
+ *  @return a malloc'd copy (caller frees) */
 char *kv_xstrdup(const char *s) {
     size_t n = strlen(s);
     char *p = static_cast<char *>(kv_xrealloc(NULL, n + 1));
@@ -31,6 +40,7 @@ char *kv_xstrdup(const char *s) {
 
 /* Growable NUL-terminated byte builder. Deliberately malloc-backed, not
  * std::string: take() hands the buffer to C callers that free() it. */
+/** Growable malloc-backed byte builder; take() hands the buffer to a caller that free()s it. */
 class KvBuf {
 public:
     KvBuf() = default;
@@ -38,9 +48,14 @@ public:
     KvBuf &operator=(const KvBuf &) = delete;
     ~KvBuf() { free(ptr_); }
 
+    /** @return bytes written, excluding the NUL */
     size_t len() const { return len_; }
+    /** @return the bytes (NUL-terminated), or NULL before anything was appended */
     const char *data() const { return ptr_; }
 
+    /** Append n bytes and keep the buffer NUL-terminated.
+     *  @param p bytes to append
+     *  @param n byte count */
     void append(const void *p, size_t n) {
         reserve(n);
         memcpy(ptr_ + len_, p, n);
@@ -48,10 +63,15 @@ public:
         ptr_[len_] = '\0';
     }
 
+    /** Append one byte.
+     *  @param c the byte */
     void putc(char c) { append(&c, 1); }
+    /** Append a NUL-terminated string (without its NUL).
+     *  @param s the string */
     void puts(const char *s) { append(s, strlen(s)); }
 
     /* Transfer ownership to the caller (who free()s it). */
+    /** @return the buffer (an empty string if nothing was appended); the builder is left empty */
     char *take() {
         if (!ptr_) return kv_xstrdup("");
         char *p = ptr_;
@@ -62,6 +82,8 @@ public:
     }
 
 private:
+    /** Grow so `add` more bytes plus the NUL fit; dies on size overflow or OOM.
+     *  @param add bytes about to be appended */
     void reserve(size_t add) {
         if (add > SIZE_MAX - len_ - 1) kv_die("buffer overflow");
         size_t need = len_ + add + 1;
@@ -72,8 +94,11 @@ private:
         cap_ = cap;
     }
 
+    /// Malloc'd bytes, owned; NULL until the first append
     char *ptr_ = nullptr;
+    /// Bytes written, excluding the NUL
     size_t len_ = 0;
+    /// Bytes allocated at ptr_
     size_t cap_ = 0;
 };
 

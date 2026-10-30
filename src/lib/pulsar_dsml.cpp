@@ -55,9 +55,13 @@ static const struct {
 /* Minimal growable byte builder; malloc-backed, aborts on OOM like the
  * server's and agent's own x-allocators (an out-of-memory tool name is not a
  * condition either program recovers from). */
+/** Growable NUL-terminated byte buffer used to build DSML output. */
 typedef struct {
+    /// Malloc'd bytes, NUL-terminated once written; NULL before the first reserve
     char *ptr;
+    /// Bytes written, excluding the NUL
     size_t len;
+    /// Bytes allocated at `ptr`
     size_t cap;
 } dsml_buf;
 

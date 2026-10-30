@@ -42,20 +42,39 @@ bool inkling_effort_text(int centi, std::string *out) {
 
 namespace {
 
+/// Opens a user message block.
 const char kMessageUser[] = "<|message_user|>";
+/// Opens a model (assistant) message block; also the generation prompt.
 const char kMessageModel[] = "<|message_model|>";
+/// Opens a system message block (system and developer roles).
 const char kMessageSystem[] = "<|message_system|>";
+/// Opens a tool-result message block.
 const char kMessageTool[] = "<|message_tool|>";
+/// Content kind: text.
 const char kContentText[] = "<|content_text|>";
+/// Content kind: an image.
 const char kContentImage[] = "<|content_image|>";
+/// Closes a model turn that made no call (the turn's stop).
 const char kContentModelEndSampling[] = "<|content_model_end_sampling|>";
+/// Content kind: reasoning.
 const char kContentThinking[] = "<|content_thinking|>";
+/// Content kind: XML (the tool declaration block's kind).
 const char kContentXml[] = "<|content_xml|>";
+/// Content kind: a JSON tool call (author = the function's name).
 const char kContentInvokeToolJson[] = "<|content_invoke_tool_json|>";
+/// Content kind: a text tool call (a grammar marker only; the renderer writes JSON calls).
 const char kContentInvokeToolText[] = "<|content_invoke_tool_text|>";
+/// Content kind: a tool error (a grammar marker only).
 const char kContentToolError[] = "<|content_tool_error|>";
+/// Closes every message block.
 const char kEndMessage[] = "<|end_message|>";
 
+/// Write "<key>: <fmt...>" into `err` (when given) and fail.
+/// @param err    the caller's error buffer, or NULL
+/// @param errlen its size in bytes
+/// @param key    the refusal's name
+/// @param fmt    printf format of the detail
+/// @return false, always
 bool refuse(char *err, size_t errlen, const char *key, const char *fmt, ...) {
     if (err && errlen) {
         char msg[300];
@@ -69,6 +88,8 @@ bool refuse(char *err, size_t errlen, const char *key, const char *fmt, ...) {
 }
 
 /* role -> its message marker (developer folds into system); NULL for a role vLLM does not take */
+/// @param role the message's role, or NULL
+/// @return its message marker, or NULL
 const char *role_marker(const char *role) {
     if (!role) return NULL;
     if (!strcmp(role, "user")) return kMessageUser;
@@ -78,10 +99,15 @@ const char *role_marker(const char *role) {
     return NULL;
 }
 
+/// Appends to a render's output, recording client-data spans (abutting spans merged).
 struct writer {
+    /// The output being written (not owned).
     inkling_render_out *out;
+    /// Append template text.
+    /// @param s the literal
     void put(const char *s) { out->text += s; }
     /* client bytes: recorded as a span */
+    /// @param s the client's text (nothing is recorded when empty)
     void client(const std::string &s) {
         if (s.empty()) return;
         const uint32_t lo = (uint32_t)out->text.size();
@@ -92,6 +118,11 @@ struct writer {
     }
     /* `marker` [author] `kind` body `<|end_message|>` -- _append_message; the author and body are client
      * text unless `trusted` */
+    /// @param marker  the message marker
+    /// @param author  the block's author (a tool or function name; "" for none)
+    /// @param kind    the content-kind marker
+    /// @param body    the block's body
+    /// @param trusted the author and body are engine bytes, not client data (no span)
     void block(const char *marker, const std::string &author, const char *kind, const std::string &body,
                bool trusted = false) {
         put(marker);
@@ -105,6 +136,8 @@ struct writer {
 };
 
 /* str.strip() would leave nothing: empty or Python whitespace only (invalid UTF-8 is not blank) */
+/// @param s a NUL-terminated string
+/// @return true when `s` is empty or only Python whitespace
 bool py_blank(const char *s) {
     const unsigned char *u = (const unsigned char *)s;
     const size_t n = strlen(s);
@@ -120,6 +153,11 @@ bool py_blank(const char *s) {
 }
 
 /* The tool_declare body: [{description, name, parameters, type}] per tool, canonical. */
+/// @param tools_json the OpenAI tools array as JSON text
+/// @param out        receives the canonical JSON (appended)
+/// @param err        the error buffer
+/// @param errlen     its size
+/// @return false on tools_not_array, tool_spec_invalid or json_not_finite
 bool tool_declare_json(const char *tools_json, std::string *out, char *err, size_t errlen) {
     pyjson_value tools;
     char jerr[160];
@@ -161,6 +199,11 @@ bool tool_declare_json(const char *tools_json, std::string *out, char *err, size
 }
 
 /* A call's body: {"name":NAME,"args":CANONICAL} -- _tool_call_json */
+/// @param c      the call
+/// @param out    receives the body (appended)
+/// @param err    the error buffer
+/// @param errlen its size
+/// @return false on tool_name_missing, tool_arguments_not_json, tool_arguments_not_object or json_not_finite
 bool tool_call_json(const inkling_tool_call_in &c, std::string *out, char *err, size_t errlen) {
     if (!c.name) return refuse(err, errlen, "tool_name_missing", "a tool call's function name is not a string");
     pyjson_value args;
@@ -185,17 +228,28 @@ bool tool_call_json(const inkling_tool_call_in &c, std::string *out, char *err, 
 /* One message as render_inkling_messages writes it (its loop body after the effort block), with the
  * tool_call_id -> name map the earlier calls filled.  `end_sampling`: an assistant message closes with
  * <|content_model_end_sampling|> (false: a sampled tool-call turn, whose close is its tail's first bytes). */
+/// Writes messages one at a time, remembering call ids so a later tool result can be named.
 struct message_writer {
+    /// The output.
     writer w;
+    /// tool_call_id -> function name, filled as calls render (or are noted).
     std::map<std::string, std::string> call_name_of_id;   /* tool_call_id -> name, filled as calls render */
 
     /* the ids only: a message before a turn, whose calls the turn's tool results may name */
+    /// @param m a message before the piece being rendered (only an assistant message's ids are kept)
     void note_calls(const inkling_msg_in &m) {
         if (!m.role || strcmp(m.role, "assistant")) return;
         for (int k = 0; k < m.n_calls; k++)
             if (m.calls[k].id && m.calls[k].id[0] && m.calls[k].name) call_name_of_id[m.calls[k].id] = m.calls[k].name;
     }
 
+    /// Write one message.
+    /// @param m            the message (its role already checked by check_role)
+    /// @param i            its index, for refusals
+    /// @param end_sampling close an assistant message with <|content_model_end_sampling|>
+    /// @param err          the error buffer
+    /// @param errlen       its size
+    /// @return false on a refusal (tool_result_not_text, raw_calls_without_calls, a call's)
     bool message(const inkling_msg_in &m, int i, bool end_sampling, char *err, size_t errlen) {
         const char *marker = role_marker(m.role);
         if (!strcmp(m.role, "tool")) {
@@ -260,11 +314,20 @@ struct message_writer {
     }
 };
 
+/// @param m      the message
+/// @param i      its index, for the refusal
+/// @param err    the error buffer
+/// @param errlen its size
+/// @return false (unexpected_role) when the role has no message marker
 bool check_role(const inkling_msg_in &m, int i, char *err, size_t errlen) {
     if (role_marker(m.role)) return true;
     return refuse(err, errlen, "unexpected_role", "message %d has role %s", i, m.role ? m.role : "(none)");
 }
 
+/// @param out    the finished render
+/// @param err    the error buffer
+/// @param errlen its size
+/// @return false (prompt_too_large) when the text passes the 32-bit span map
 bool fits(const inkling_render_out *out, char *err, size_t errlen) {
     if (out->text.size() > UINT32_MAX) return refuse(err, errlen, "prompt_too_large", "the render passes 4 GiB");
     return true;
@@ -272,6 +335,8 @@ bool fits(const inkling_render_out *out, char *err, size_t errlen) {
 
 /* where one call block that starts at `q` (just past its role marker) ends: the author (no marker inside), the
  * call kind, the body up to the first <|end_message|> -- the parser's reading of it; NULL if `q` starts none */
+/// @param q just past a call block's role marker
+/// @return one past the block's <|end_message|>, or NULL
 const char *call_block_end(const char *q) {
     const char *kind = strstr(q, kContentInvokeToolJson);
     if (!kind) return NULL;

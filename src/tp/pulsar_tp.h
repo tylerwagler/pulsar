@@ -40,13 +40,22 @@ typedef enum {
     PULSAR_TP_ROLE_WORKER = 2,
 } pulsar_tp_role;
 
+/** How this rank joins its TP group: the engine's --tp-* options as the transport
+ *  takes them (legacy two-rank pair: role + peer; n-way mesh: rank + n_ranks + peers). */
 typedef struct {
+    /// Legacy two-rank pair: LEADER or WORKER (roles must differ); an n-way mesh accepts any role.
     pulsar_tp_role role;    /* legacy 2-rank: LEADER/WORKER; n-way: any (ranks are symmetric) */
+    /// This rank's index in the group, or -1 when unset.
     int rank;               /* this rank's index in the group; -1 = unset */
+    /// Group size; 0 or 1 means unset.
     int n_ranks;            /* group size; 0/1 = unset */
+    /// Legacy pair: the worker's "host" dial target; NULL on the leader.
     const char *peer;       /* legacy 2-rank: worker's dial target (NULL on the leader) */
+    /// n-way mesh: the ordered "host:port,..." list naming every rank, this one included.
     const char *peers;      /* n-way: ordered "host:port,..." list for ALL n ranks */
+    /// This rank's own control/listen TCP port.
     int port;               /* this rank's own control/listen port */
+    /// This rank's build id (git describe), sent to every peer in the NODE frame; NULL or "" = not stamped.
     const char *build;      /* this rank's build id (git describe), carried to every
                              * peer in the NODE frame; NULL/"" = not stamped */
 } pulsar_tp_options;
@@ -57,49 +66,84 @@ typedef struct {
  * be empty.  This exists for operators (/health's tp block), never for the data
  * plane: nothing here is compared or acted on. */
 #define PULSAR_TP_NODE_STR 64
+/// One rank's operator-facing record from the NODE frame (see the comment above).
 typedef struct {
+    /// The rank this record describes.
     int rank;
+    /// That rank's host name (gethostname()).
     char host[PULSAR_TP_NODE_STR];        /* gethostname() on that rank */
+    /// That rank's build id (its pulsar_tp_options::build).
     char build[PULSAR_TP_NODE_STR];       /* pulsar_tp_options.build on that rank */
+    /// That rank's TP endpoint "host:port", "" when not known.
     char addr[PULSAR_TP_NODE_STR];        /* its TP endpoint ("host:port"), if known */
+    /// The RDMA HCA name that rank opened; "" under TCP.
     char rdma_device[PULSAR_TP_NODE_STR]; /* the HCA it opened; "" under TCP */
+    /// The HCA port number in use; 0 under TCP.
     int rdma_port;                        /* the HCA port; 0 under TCP */
 } pulsar_tp_node;
 
 /* Engine identity exchanged in the hello so a mismatched pair aborts before
  * any inference runs.  Field-for-field mirror of upstream ds4_tp_identity. */
+/// The model identity both ranks must agree on before any inference runs (see the comment above).
 typedef struct {
+    /// Size in bytes of the mapped model file (the engine passes model.mapped_bytes).
     uint64_t gguf_bytes;
+    /// The family's model id (pulsar_engine::model_id()).
     uint32_t model_id;
+    /// Transformer layer count of the model as the pair runs it.
     uint32_t n_layer;
+    /// Hidden width (elements); the f32 partial vector is n_embd * 4 bytes.
     uint32_t n_embd;
+    /// Vocabulary size (logits row width).
     uint32_t n_vocab;
+    /// Quantization bits of the routed experts (pulsar_engine::routed_quant_bits()).
     uint32_t quant_bits;
+    /// Context size in tokens; exchanged so each side can read the peer's, never compared.
     uint32_t ctx_size;
     /* Decode gate schedule, used to place recvs into the right slab slot.
      * per_token 0 falls back to the identity mapping over all slots. */
+    /// First slab slot of the decode gate schedule (used only when gates_per_token != 0).
     uint32_t gate_slot_start;
+    /// Slot stride between successive gates of one token (used only when gates_per_token != 0).
     uint32_t gate_slot_step;
+    /// Gates fired per decode token; 0 selects the identity slot mapping (pulsar_tp_gate_slot).
     uint32_t gates_per_token;
 } pulsar_tp_identity;
 
 /* Fixed-size wire prefix of the hello; the RDMA key block follows it. */
+/// The hello frame's fixed-size wire layout (see the comment above); both sides write theirs and read the peer's.
 typedef struct {
+    /// PULSAR_TP_MAGIC; a mismatch means a byte-order mix-up or a foreign peer.
     uint32_t magic;      /* also detects byte-order mismatch */
+    /// PULSAR_TP_PROTOCOL_VERSION; must equal the peer's.
     uint32_t version;
+    /// The sender's pulsar_tp_role; a legacy pair refuses two equal roles.
     uint32_t role;
+    /// Nonzero when the sender opened a usable verbs device; RDMA runs only when both sides say so.
     uint32_t rdma_ok;    /* this side has a usable verbs device */
+    /// pulsar_tp_identity::gguf_bytes of the sender.
     uint64_t gguf_bytes;
+    /// pulsar_tp_identity::model_id of the sender.
     uint32_t model_id;
+    /// pulsar_tp_identity::n_layer of the sender.
     uint32_t n_layer;
+    /// pulsar_tp_identity::n_embd of the sender.
     uint32_t n_embd;
+    /// pulsar_tp_identity::n_vocab of the sender.
     uint32_t n_vocab;
+    /// pulsar_tp_identity::quant_bits of the sender.
     uint32_t quant_bits;
+    /// pulsar_tp_identity::ctx_size of the sender (read as the peer's ctx, not compared).
     uint32_t ctx_size;
+    /// pulsar_tp_identity::gate_slot_start of the sender.
     uint32_t gate_slot_start;
+    /// pulsar_tp_identity::gate_slot_step of the sender.
     uint32_t gate_slot_step;
+    /// pulsar_tp_identity::gates_per_token of the sender.
     uint32_t gates_per_token;
+    /// The sender's rank; must differ from the receiver's (and match the expected rank when one is set).
     uint32_t rank;       /* this rank's index in the TP group (n-way) */
+    /// The sender's group size; must equal the receiver's.
     uint32_t n_ranks;    /* group size */
 } pulsar_tp_hello_fixed;
 
@@ -117,15 +161,25 @@ typedef struct {
  *   batch out      n_layer*MAX_ROWS*vec   (verify-block partial rows)
  *   batch in       n_layer*MAX_ROWS*vec
  */
+/// Byte offsets of each region in the registered slab, from its base VA (see the layout above).
 typedef struct {
+    /// Out vectors: S slots of vec_bytes, written by local GPU kernels.
     uint64_t out_off;
+    /// In vectors: S slots of vec_bytes, written by the peer (RDMA or TCP).
     uint64_t in_off;
+    /// In seq flags: S u64 words; word 0 is the row lane's done word.
     uint64_t in_flags_off;
+    /// Token slot: 16 bytes {seq u64, token i32, pad}, leader to worker.
     uint64_t token_off;
+    /// Out flag staging: S u64 words; words 0..2 are the row lane's descriptor.
     uint64_t out_flags_off;
+    /// GPU flags: S u32 words; word 0 is the row lane's error latch.
     uint64_t gpu_flags_off;
+    /// Batch out: n_layer blocks of PULSAR_TP_BATCH_MAX_ROWS vectors (verify-block partial rows).
     uint64_t batch_out_off;
+    /// Batch in: n_layer blocks of PULSAR_TP_BATCH_MAX_ROWS vectors.
     uint64_t batch_in_off;
+    /// Total slab size in bytes (end of the batch-in region).
     uint64_t slab_bytes;
 } pulsar_tp_slab;
 
@@ -318,14 +372,23 @@ int pulsar_tp_gate_exchange(pulsar_tp *tp, uint32_t layer, uint32_t gate,
  * every combine behind one sees the error and leaves its destination alone; the
  * engine refuses at its next host sync through pulsar_tp_row_lane_check. */
 #define PULSAR_TP_DONE_RELEASE (1ull << 62)
+/// The row lane's slab layout, exported for the GPU stage/combine kernels (offsets from the slab base).
 typedef struct {
+    /// Out-vector ring (message slots this rank sends from); in_off is documented below.
     uint64_t out_off, in_off;   /* gate-slot rings (message slots) */
+    /// Descriptor: u64[3] {exchange id (written last), first message, rows}; GPU-written.
     uint64_t desc_off;          /* u64[3] {exchange id (written last), first msg, rows} */
+    /// Done word: u64, the last exchange the proxy completed (PULSAR_TP_DONE_RELEASE ORed in on release).
     uint64_t done_off;          /* u64: last exchange the proxy completed */
+    /// Error latch: u32, 0 clean, 1 failed, 2 aborted.
     uint64_t err_off;           /* u32: error latch (1 failed, 2 aborted) */
+    /// Bytes per row vector (n_embd * 4, f32).
     uint64_t vec_bytes;
+    /// Ring slots; message t lives in slot (t-1) % n_slots.
     uint32_t n_slots;
 } pulsar_tp_row_lane_layout_t;
+/** @var pulsar_tp_row_lane_layout_t::in_off
+ *  In-vector ring (message slots the peer's rows land in). */
 
 bool pulsar_tp_row_lane(const pulsar_tp *tp);
 void pulsar_tp_row_lane_layout(const pulsar_tp *tp, pulsar_tp_row_lane_layout_t *out);
@@ -347,7 +410,14 @@ int pulsar_tp_row_lane_check(pulsar_tp *tp);
  * buffers alternate per bulk exchange: the peer can only be one exchange ahead,
  * so the buffer it writes next is never the one being read.  A payload larger
  * than cap_bytes is the caller's to cut. */
+/// The bulk lane's buffer layout: out | in[0] | in[1], each cap_bytes (see the comment above).
 typedef struct { uint64_t cap_bytes, out_off, in_off[2]; } pulsar_tp_bulk_layout_t;
+/** @var pulsar_tp_bulk_layout_t::cap_bytes
+ *  Bytes per region; a multiple of vec_bytes.  A payload larger than this is the caller's to cut. */
+/** @var pulsar_tp_bulk_layout_t::out_off
+ *  Offset of the region this rank stages its rows into, from the bulk buffer's base. */
+/** @var pulsar_tp_bulk_layout_t::in_off
+ *  Offsets of the two receive regions the peer writes, alternating per bulk exchange. */
 void pulsar_tp_set_bulk(pulsar_tp *tp, void *base, uint64_t bytes);
 bool pulsar_tp_bulk_lane(const pulsar_tp *tp);
 void pulsar_tp_bulk_layout(const pulsar_tp *tp, pulsar_tp_bulk_layout_t *out);
@@ -467,16 +537,35 @@ int pulsar_tp_send_set_logits(pulsar_tp *tp, uint64_t session_id,
                               const float *logits, uint32_t n);
 /* The one payload every speculative frame shares.  Which of i0..i3 a frame
  * uses is documented on its sender; unused fields are 0. */
+/// The shared payload of every speculative frame (see the comment above); also the per-bank step record of SPEC_*_BATCH.
 typedef struct {
+    /// The mirrored session the frame acts on.
     uint64_t session_id;
+    /// The round's bank (the live bank when the leader sent the frame).
     int32_t  bank;        /* the round's bank (the live bank when the leader sent it) */
+    /// Frame-specific integer argument 0 (documented on each sender; 0 when unused); i1..i3 below.
     int32_t  i0, i1, i2, i3;
+    /// Sampling temperature of the round; top_p and min_p are documented below.
     float    temperature, top_p, min_p;
+    /// Top-k sampling cutoff of the round.
     int32_t  top_k;
+    /// The rng state the call consumes, as it was BEFORE the call.
     uint64_t rng;         /* the rng state the call consumes, as it was BEFORE the call */
+    /// REDRAFT_BATCH: rounds (banks[count] then rngs[count] follow); SPEC_*_BATCH: step records that follow.
     uint32_t count;       /* REDRAFT_BATCH: rounds; banks[count] then rngs[count] follow */
+    /// v28: a SPEC_ROUND_END_BATCH step's pulsar_spec_step::greedy_rows; 0 elsewhere.
     uint32_t greedy_rows; /* v28: a SPEC_ROUND_END_BATCH step's pulsar_spec_step::greedy_rows; 0 elsewhere */
 } pulsar_tp_spec_command;
+/** @var pulsar_tp_spec_command::i1
+ *  Frame-specific integer argument 1 (documented on each sender; 0 when unused). */
+/** @var pulsar_tp_spec_command::i2
+ *  Frame-specific integer argument 2 (documented on each sender; 0 when unused). */
+/** @var pulsar_tp_spec_command::i3
+ *  Frame-specific integer argument 3 (documented on each sender; 0 when unused). */
+/** @var pulsar_tp_spec_command::top_p
+ *  Nucleus (top-p) sampling cutoff of the round. */
+/** @var pulsar_tp_spec_command::min_p
+ *  Min-p sampling cutoff of the round. */
 
 /* Increment 4: one sender for every speculative frame; `banks`/`rngs` are
  * REDRAFT_BATCH's arrays (count entries each) and NULL elsewhere. */
@@ -725,10 +814,13 @@ typedef enum {
 
 /** One segment operation (L264 S4e). */
 typedef struct {
+    /// The mirrored session the segment belongs to.
     uint64_t session_id;
+    /// Start of the token span [G_prev, G) (the parent segment's end, 0 for a root); G is documented inline.
     int32_t G_prev, G;    ///< the span (SAVE), the span loaded (LOAD)
     uint64_t digest;      ///< LOAD: pulsar_session_checkpoint_digest after the leader's load
     int32_t last;         ///< LOAD: the chain's last segment (restores its checkpoint)
+    /// Pad to keep `key` 8-byte aligned; 0 on the wire.
     uint32_t reserved;
     char key[40];         ///< the segment's store key, 40 lowercase hex
 } pulsar_tp_segment_command;
@@ -740,37 +832,61 @@ int pulsar_tp_send_segment(pulsar_tp *tp, pulsar_tp_frame_type type, const pulsa
 int pulsar_tp_send_segment_reconcile(pulsar_tp *tp, const char *keys, uint32_t n_keys);
 
 
+/** One mirrored command as a worker receives it (pulsar_tp_recv_command).  Which fields
+ *  a frame fills depends on `type`; release the malloc'd arrays with pulsar_tp_command_free. */
 typedef struct {
+    /// The frame type received; PULSAR_TP_FRAME_ERROR until a frame parses.
     pulsar_tp_frame_type type;
+    /// The session the frame acts on (0 for session-less frames such as STOP or SEGMENT_RECONCILE).
     uint64_t session_id;
+    /// EVAL: the gate sequence; SESSION_CREATE: the bank-pool size; SYNC_CHECK: the leader's cached-prefix digest.
     uint64_t seq;
+    /// Frame scalar: EVAL token, REWIND pos, SESSION_CREATE ctx_size, the bank of a bank frame or spec frame,
+    /// MIXED_BATCH head_runs, NOTE_PREFILLED headed run (-1 none), SYNC_CHECK the leader's cached position.
     int value;
+    /// Token array (malloc'd) for SYNC, SYNC_MM, VERIFY, NOTE_COMMITTED and NOTE_PREFILLED; n_tokens entries.
     int *tokens;          /* malloc'd for FRAME_SYNC/VERIFY/MIXED_BATCH */
+    /// Entries in `tokens`.
     uint32_t n_tokens;
+    /// Batch rows (malloc'd) for EVAL_BATCH / MIXED_BATCH / FUSED_BATCH; n_items entries.
     pulsar_tp_batch_item *items;  /* malloc'd for EVAL_BATCH/MIXED_BATCH/FUSED_BATCH */
+    /// Entries in `items`.
     uint32_t n_items;
     /* FUSED_BATCH: the step's shape. */
+    /// FUSED_BATCH: the step's shape, as the leader's pulsar_session_decode_fused took it.
     pulsar_fused_shape fused;
     /* The bank of a save / restore / repoint rides `value`. */
     /* SET_LOGITS: the leader's live logits row (malloc'd, n_logits floats). */
+    /// SET_LOGITS: the leader's live logits row (malloc'd); n_logits floats.
     float *logits;
+    /// Entries in `logits`.
     uint32_t n_logits;
     /* The speculative frames: the shared payload, plus REDRAFT_BATCH's arrays
      * (malloc'd, spec.count each). */
+    /// The speculative frames' shared payload (also the header of SPEC_*_BATCH).
     pulsar_tp_spec_command spec;
+    /// REDRAFT_BATCH: the round banks (malloc'd), spec.count entries; NULL elsewhere.
     uint32_t *spec_banks;
+    /// REDRAFT_BATCH: each round's rng state (malloc'd), spec.count entries; NULL elsewhere.
     uint64_t *spec_rngs;
     /* SPEC_*_BATCH: the per-bank records (malloc'd, spec.count). */
+    /// SPEC_*_BATCH: the per-bank step records (malloc'd), spec.count entries; NULL elsewhere.
     pulsar_tp_spec_command *spec_steps;
     /* SYNC_MM: the images (malloc'd table whose `bytes` point into
      * `image_bytes`, one malloc'd block). */
+    /// SYNC_MM: the image table (malloc'd); each entry's `bytes` points into image_bytes.
     pulsar_image_ref *images;
+    /// Entries in `images`.
     uint32_t n_images;
+    /// SYNC_MM: every image's bytes, concatenated in table order (one malloc'd block).
     uint8_t *image_bytes;
     /* SEGMENT_SAVE / LOAD / DROP. */
+    /// SEGMENT_SAVE / LOAD / DROP: the segment operation.
     pulsar_tp_segment_command segment;
     /* SEGMENT_RECONCILE: n_keys x 40 hex (malloc'd). */
+    /// SEGMENT_RECONCILE: n_keys keys of 40 hex each, back to back, NUL-terminated (malloc'd).
     char *keys;
+    /// Keys in `keys`.
     uint32_t n_keys;
 } pulsar_tp_command;
 

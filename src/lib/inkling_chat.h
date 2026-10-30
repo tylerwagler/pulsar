@@ -70,6 +70,7 @@ struct inkling_tool_call_in {
 
 /** One content part: text, or an image. */
 struct inkling_part_in {
+    /// The part is an image (rendered as a bare <|content_image|> block); else a text part.
     bool image;
     const char *text;       ///< a text part's text (NULL = "")
 };
@@ -77,11 +78,16 @@ struct inkling_part_in {
 /** One message.  Its content is `content` (a string; NULL = none) or, when `parts` is set, the parts. */
 struct inkling_msg_in {
     const char *role;       ///< system | developer | user | assistant | tool
+    /// The message's string content (client data); NULL = none.  Ignored when `parts` is set.
     const char *content;
+    /// The message's content parts (n_parts of them); NULL = use `content`.
     const inkling_part_in *parts;
+    /// Number of entries in `parts`.
     int n_parts;
     const char *reasoning;  ///< assistant reasoning; NULL or "" = none
+    /// An assistant message's tool calls (n_calls of them); NULL when none.
     const inkling_tool_call_in *calls;
+    /// Number of entries in `calls`.
     int n_calls;
     const char *name;           ///< a tool result's tool name (NULL = look it up by tool_call_id)
     const char *tool_call_id;   ///< a tool result's call id
@@ -92,15 +98,21 @@ struct inkling_msg_in {
     const char *raw_calls;
 };
 
+/// A full render's request: the conversation, its tools and the effort.
 struct inkling_render_in {
+    /// The conversation's messages, in order.
     const inkling_msg_in *msgs;
+    /// Number of entries in `msgs`.
     int n_msgs;
     const char *tools_json;   ///< the request's tools array as JSON text; NULL = none
     int effort;               ///< hundredths, [0, 99]
+    /// End with the generation prompt (<|message_model|>).
     bool add_generation_prompt;
 };
 
+/// A render's result: the prompt text and the client-data span map.
 struct inkling_render_out {
+    /// The rendered text (at most UINT32_MAX bytes, else prompt_too_large).
     std::string text;
     std::vector<pulsar_text_span> spans;   ///< client-data ranges, ascending, disjoint
 };
@@ -155,9 +167,11 @@ class inkling_output_parser : public out_parser {
 public:
     /** `initial`: where the prompt left the turn -- OUT_HEADER after the generation prompt's
      *  `<|message_model|>`. */
+    /// @param initial the state the turn starts in
     void init(out_state initial);
     out_parser *clone() const override;
 
 private:
+    /// The call-body reader: the shared JSON {"name", "args"} body.
     out_json_call_body body_;
 };

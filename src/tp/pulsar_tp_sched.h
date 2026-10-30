@@ -22,15 +22,23 @@
  * and stays monotonic across tokens — do NOT pass a token index as `e`.
  */
 
+/** The two CUDA-touching steps of a gate exchange, as host hooks (see the file
+ *  comment above).  Both are required; called on the engine worker thread. */
 typedef struct {
+    /// Hook-set name, for diagnostics only.
     const char *name;   /* hook-set name, diagnostics only */
+    /// Opaque context handed back to both hooks (engine tensors / CUDA state).
     void *ud;           /* opaque context (engine tensors / CUDA state) */
     /* Publish this exchange's f32 partial (vec_bytes) into slab out-slot
      * [layer,gate].  4c's implementation reads the engine's hidden state,
      * and, when a GPU kernel produces it, signals the gate-ready flags. */
+    /** Publish exchange `e`'s f32 partial into slab out-slot [layer, gate].
+     *  @return nonzero on success, 0 fails the step. */
     int (*write_partial)(void *ud, uint32_t layer, uint32_t gate, uint64_t e);
     /* Consume the peer's landed partial from slab in-slot [layer,gate]
      * (e.g. accumulate into the engine's hidden state). */
+    /** Consume the peer's landed partial for exchange `e` from slab in-slot [layer, gate].
+     *  @return nonzero on success, 0 fails the step. */
     int (*read_partial)(void *ud, uint32_t layer, uint32_t gate, uint64_t e);
 } pulsar_tp_sched_hooks;
 

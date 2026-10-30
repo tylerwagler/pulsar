@@ -36,9 +36,13 @@
 #include <utility>
 #include <vector>
 
+/** One JSON value as json.loads would build it; only the field(s) of `kind` are meaningful. */
 struct pyjson_value {
+    /** The value's type: null, bool, Python int, float, string, array, object. */
     enum kind_t { NUL, BOOL, INT, FLOAT, STR, ARR, OBJ };
+    /// Which field holds the value
     kind_t kind = NUL;
+    /// BOOL
     bool b = false;
     std::string num;   ///< INT: the canonical decimal digits
     double f = 0.0;    ///< FLOAT
@@ -47,6 +51,8 @@ struct pyjson_value {
     std::vector<std::pair<std::string, pyjson_value>> o;  ///< OBJ, document order
 
     /** Object member by key, or NULL (also NULL when this is not an object). */
+    /// @param key NUL-terminated member name, compared bytewise
+    /// @return the member's value (owned by this object), or NULL
     const pyjson_value *get(const char *key) const;
 };
 

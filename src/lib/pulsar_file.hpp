@@ -29,6 +29,7 @@ public:
     /** Construct empty; holds no file. */
     FileHandle() = default;
     /** Take ownership of `fp`, which may be NULL. */
+    /// @param fp stream to own; closed by this handle from now on
     explicit FileHandle(FILE *fp) : fp_(fp) {}
     /** Close the handle if still open, discarding any flush error. */
     ~FileHandle() { if (fp_) fclose(fp_); }
@@ -36,14 +37,18 @@ public:
     FileHandle(const FileHandle &) = delete;
     FileHandle &operator=(const FileHandle &) = delete;
     /** Move-construct, leaving `o` empty. */
+    /// @param o handle to take the stream from
     FileHandle(FileHandle &&o) noexcept : fp_(o.fp_) { o.fp_ = nullptr; }
     /** Move-assign, closing any handle already held. */
+    /// @param o handle to take the stream from; left empty
+    /// @return `*this`
     FileHandle &operator=(FileHandle &&o) noexcept {
         if (this != &o) { if (fp_) fclose(fp_); fp_ = o.fp_; o.fp_ = nullptr; }
         return *this;
     }
 
     /** The owned handle, or NULL. Borrowed -- do not fclose it. */
+    /// @return the held stream, or NULL
     FILE *get() const { return fp_; }
     /** True when a file is held. */
     explicit operator bool() const { return fp_ != nullptr; }

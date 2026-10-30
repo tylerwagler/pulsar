@@ -16,6 +16,7 @@
 #include <stdint.h>
 #include <time.h>
 
+/** The process-global progress marks (one instance, g_pulsar_stall); written by pulsar_stall_mark, read by the watchdog. */
 struct pulsar_stall_marks {
     std::atomic<uint64_t> beats{0};            ///< every mark bumps it: the heartbeat
     std::atomic<const char *> where{nullptr};  ///< the section last entered (a string literal)

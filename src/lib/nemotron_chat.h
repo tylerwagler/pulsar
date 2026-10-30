@@ -59,9 +59,12 @@ struct nemotron_tool_call_in {
 /** One message.  `content` NULL renders as empty. */
 struct nemotron_msg_in {
     const char *role;       ///< system | user | assistant | tool (any other role renders as its own turn)
+    /// The message text (client data); NULL renders as empty.
     const char *content;
     const char *reasoning;  ///< assistant reasoning_content; NULL = none
+    /// The assistant message's tool calls (n_calls of them); NULL when none.
     const nemotron_tool_call_in *calls;
+    /// Number of entries in `calls`.
     int n_calls;
     /** The calls' SAMPLED bytes, from the first "<tool_call>" to the end of the last "</tool_call>" (the server's
      *  tool memory): written in place of rendering `calls`, so a replayed turn byte-matches the live KV.  NULL =
@@ -69,15 +72,22 @@ struct nemotron_msg_in {
     const char *raw_calls;
 };
 
+/// A full render's request: the conversation, its tools and the effort.
 struct nemotron_render_in {
+    /// The conversation's messages, in order.
     const nemotron_msg_in *msgs;
+    /// Number of entries in `msgs` (0 is refused as no_messages).
     int n_msgs;
     const char *tools_json;   ///< the request's tools array as JSON text; NULL = none
+    /// The thinking level the generation prompt and the medium suffix follow.
     nemotron_effort effort;
+    /// End with nemotron_generation_prompt(effort).
     bool add_generation_prompt;
 };
 
+/// A render's result: the prompt text and the client-data span map.
 struct nemotron_render_out {
+    /// The rendered text (UTF-8; at most UINT32_MAX bytes, else prompt_too_large).
     std::string text;
     std::vector<pulsar_text_span> spans;   ///< client-data ranges, ascending, disjoint
 };
@@ -141,9 +151,15 @@ public:
     /** `thinking`: the generation prompt opened a think block (the turn starts in reasoning).  `tools_json`: the
      *  request's tools (NULL for none) -- the schema that types arguments.  false + reason if tools_json is not a
      *  JSON array. */
+    /// @param thinking   the turn starts in OUT_REASONING
+    /// @param tools_json the request's tools array as JSON text, or NULL
+    /// @param err        receives "tools_not_array: <detail>" on failure
+    /// @param errlen     its size
+    /// @return true when the parser is ready for the turn
     bool init(bool thinking, const char *tools_json, char *err, size_t errlen);
     out_parser *clone() const override;
 
 private:
+    /// The call-body reader (Qwen's XML format, Python scalar spelling), schema-typed by the request's tools.
     qwen_xml_call_body body_;
 };

@@ -38,15 +38,21 @@ typedef struct pulsar_segstore pulsar_segstore;
 
 /** One segment as the index knows it. */
 typedef struct {
+    /// This segment's key: 40 hex chars of sha1(parent || text) + NUL
     char key[41];
     char parent[41];          ///< "" for a root
+    /** Token span [G_prev, G): G_prev is the parent's end (0 for a root), G this segment's end. */
     uint32_t G_prev, G;       ///< token span
     uint64_t text_end;        ///< bytes of chain text from position 0 to G (index-derived)
     uint64_t text_len;        ///< this segment's own text bytes
+    /// Engine payload bytes (rows + optional state), pulsar_session_save_segment's output
     uint64_t payload_bytes;
     uint64_t state_bytes;     ///< L323: the payload's trailing state part (0 = rows only, no state at G)
+    /// Optional trailer bytes after the payload (0 = none)
     uint64_t trailer_bytes;
+    /// The whole .seg file: header + text + payload + trailer; what the budget counts
     uint64_t file_bytes;
+    /// Lookups that used this segment (pulsar_segstore_touch)
     uint32_t hits;
     uint64_t last_used;       ///< unix seconds
     bool dominated;           ///< L323: a leaf whose text is a byte prefix of a sibling's (index-derived)
@@ -55,7 +61,9 @@ typedef struct {
 /** L323: which chain ends a lookup accepts.  `grid`: the last segment's G is a multiple of it (0 = any end);
  *  `state`: the last segment carries a state. */
 typedef struct {
+    /// In tokens: the chain's end G must be a multiple of it (0 = any end)
     uint32_t grid;
+    /// The last segment must carry a state part (state_bytes > 0)
     bool state;
 } pulsar_segstore_end;
 

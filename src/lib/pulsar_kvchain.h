@@ -52,8 +52,11 @@
 /** An optional per-segment trailer (the server's tool map).  `size` reports the
  *  trailer for a segment's text (0 bytes = none); `write` writes exactly it. */
 typedef struct {
+    /// Caller context passed back to `size` and `write`
     void *ud;
+    /** Report the trailer's size for a segment whose rendered text is `text` into *bytes; false = no trailer. */
     bool (*size)(void *ud, const char *text, uint64_t *bytes);
+    /** Write exactly the bytes `size` reported for `text` into fp; 0 on success, else a message in err. */
     int (*write)(FILE *fp, void *ud, const char *text, char *err, size_t errlen);
 } pulsar_kvchain_trailer;
 

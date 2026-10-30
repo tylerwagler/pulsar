@@ -25,16 +25,22 @@
  * mismatch is an empty accept (replay_n 0).
  */
 
+/// The leader's reference-grading hook for a verify round (see the file comment above).
 typedef struct {
+    /// Opaque context handed back to grade_matches.
     void *ud;
     /* For each of n drafts, report in match[i] whether the leader's reference
      * run agrees with the draft token at position i.  Called on the caller's
      * thread with a (n) match array; never after the round returns. */
+    /// Fill match[i] (i < n) with whether the leader's reference agrees with drafts[i].
     void (*grade_matches)(void *ud, const int *drafts, uint32_t n, bool *match);
 } pulsar_tp_verify_hooks;
 
+/// A verify round's outcome, as broadcast on VERIFY_COMMIT.
 typedef struct {
+    /// 1 when every draft row matched (accept all n), else 0.
     int full_accept;   /* 1 when every draft row matched (accept all n) */
+    /// Accepted rows: the matched prefix length; == n iff full_accept.
     uint32_t replay_n; /* accepted rows; == n iff full_accept */
 } pulsar_tp_verify_decision;
 

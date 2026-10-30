@@ -34,9 +34,13 @@ static int json_hex(char c) {
 }
 
 /* ---- local scratch buffer (replaces the server's `buf`) ---- */
+/** Growable NUL-terminated byte buffer used by the JSON helpers in this file. */
 typedef struct {
+    /// Malloc'd bytes, NUL-terminated once written; NULL before the first reserve
     char *p;
+    /// Bytes written, excluding the NUL
     size_t len;
+    /// Bytes allocated at `p`
     size_t cap;
 } json_buf;
 

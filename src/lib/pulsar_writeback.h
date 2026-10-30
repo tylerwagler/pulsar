@@ -19,8 +19,11 @@
 
 #define PULSAR_WRITEBACK_STEP (UINT64_C(64) << 20)
 
+/** Writeback state of one output stream (pulsar_writeback_init sets it up). */
 typedef struct {
+    /// The stream being written; NULL disables writeback.
     FILE *fp;        /* NULL: writeback off (a read stream, or not a regular file) */
+    /// File offset up to which bytes have been written back and dropped from the page cache.
     off_t synced;    /* bytes already pushed to disk and dropped from the cache */
 } pulsar_writeback;
 

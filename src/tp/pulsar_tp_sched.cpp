@@ -9,10 +9,15 @@
 #include <stdio.h>
 #include <stdlib.h>
 
+/// One rank's gate scheduler: the transport, its CUDA hooks and the exchange counter.
 struct pulsar_tp_sched {
+    /// The transport the exchanges run on (borrowed; not freed by pulsar_tp_sched_free).
     pulsar_tp *tp;
+    /// Copy of the caller's hook set, taken at pulsar_tp_sched_new.
     pulsar_tp_sched_hooks hooks;
+    /// Next per-exchange counter `e` to hand out (1-based, monotonic across tokens).
     uint64_t next_e;            /* next per-exchange counter (1-based) */
+    /// The last failure message, kept even when the caller passed no `err` buffer.
     char last_err[256];
 };
 

@@ -83,11 +83,14 @@ public:
     template <class I, typename std::enable_if<std::is_integral<I>::value && !std::is_same<I, bool>::value, int>::type = 0>
     constexpr explicit pulsar_unit(I v) : v_(static_cast<Rep>(v)) {}
     /** The raw count, where the value leaves the type system (printf, /metrics, JSON, an index). */
+    /// @return the count as `Rep`
     constexpr Rep raw() const { return v_; }
     /** The largest representable quantity (the saturation bound the overflow checks compare against). */
+    /// @return the quantity holding numeric_limits<Rep>::max()
     static constexpr pulsar_unit max() { return pulsar_unit(std::numeric_limits<Rep>::max()); }
     /** `n` copies of this quantity (n banks' growth, n pages): `Rep` multiplication.
      *  @param n how many */
+    /// @return this quantity times n, in the same unit
     constexpr pulsar_unit times(Rep n) const { return pulsar_unit(v_ * n); }
 
     /** Sum (as `Rep`: modular for an unsigned one). */
@@ -95,8 +98,12 @@ public:
     /** Difference (as `Rep`: modular for an unsigned one, so callers that must not wrap compare first, as before). */
     friend constexpr pulsar_unit operator-(pulsar_unit a, pulsar_unit b) { return pulsar_unit(a.v_ - b.v_); }
     /** Add in place. */
+    /// @param b the quantity to add
+    /// @return `*this`
     constexpr pulsar_unit &operator+=(pulsar_unit b) { v_ += b.v_; return *this; }
     /** Subtract in place. */
+    /// @param b the quantity to subtract
+    /// @return `*this`
     constexpr pulsar_unit &operator-=(pulsar_unit b) { v_ -= b.v_; return *this; }
     /** Equal. */
     friend constexpr bool operator==(pulsar_unit a, pulsar_unit b) { return a.v_ == b.v_; }
@@ -148,8 +155,10 @@ typedef pulsar_unit<pulsar_prompt_toks_tag, int> PromptToks;
  *  (L334).  Held as Dist's Rep, the integer it replaces; -1 is none(), "no position". */
 template <class Dist>
 class pulsar_point {
+    /// The signed integer a position is held as: Dist's Rep.
     typedef decltype(Dist{}.raw()) Rep;
     static_assert(std::is_signed<Rep>::value, "a position's sentinel is -1: it is held signed");
+    /// The raw value of none().
     static constexpr Rep kNone = Rep(-1);
 
     /** Abort when this is none(). @param what the operation */
@@ -159,6 +168,7 @@ class pulsar_point {
     /** A computed position, refused when it lands on none(): arithmetic never forges the sentinel.
      *  @param v the result
      *  @param what the operation */
+    /// @return the position v
     static constexpr pulsar_point moved(Rep v, const char *what) {
         return v == kNone ? (pulsar_point_fail(what, "lands on"), pulsar_point(v)) : pulsar_point(v);
     }
@@ -172,17 +182,22 @@ public:
     template <class I, typename std::enable_if<std::is_integral<I>::value && !std::is_same<I, bool>::value, int>::type = 0>
     constexpr explicit pulsar_point(I v) : v_(static_cast<Rep>(v)) {}
     /** No position. */
+    /// @return the none() sentinel (raw -1)
     static constexpr pulsar_point none() { return pulsar_point(kNone); }
     /** Is this none()? */
+    /// @return true for none()
     constexpr bool is_none() const { return v_ == kNone; }
     /** The raw position, where the value leaves the type system (printf, JSON, an index, a kernel's launch, an
      *  untyped engine body); none() leaves as -1. */
+    /// @return the position as `Rep`
     constexpr Rep raw() const { return v_; }
     /** The position after the first `n` tokens (position 0 plus n): where a length ends (a count of -1 would land on
      *  none(): fatal).
      *  @param n the tokens before it */
+    /// @return position n
     static constexpr pulsar_point after(Dist n) { return moved(n.raw(), "after(count)"); }
     /** The tokens before this position (it minus position 0). */
+    /// @return the distance from position 0 (fatal on none())
     constexpr Dist before() const { return live("before()"), Dist(v_); }
 
     /** A position moved forward by a distance. */
@@ -198,8 +213,12 @@ public:
         return a.live("pos - pos"), b.live("pos - pos"), Dist(a.v_ - b.v_);
     }
     /** Move forward in place. */
+    /// @param d the distance to move
+    /// @return `*this`
     constexpr pulsar_point &operator+=(Dist d) { return *this = *this + d; }
     /** Move back in place. */
+    /// @param d the distance to move
+    /// @return `*this`
     constexpr pulsar_point &operator-=(Dist d) { return *this = *this - d; }
     /** Equal (none() equals none() only). */
     friend constexpr bool operator==(pulsar_point a, pulsar_point b) { return a.v_ == b.v_; }
