@@ -209,7 +209,7 @@ int GATE_ENTRY(int argc, char **argv) {
         if (rok) pulsar_session_bank_state_save(s, 3);
         char perr[256] = "";
         const uint64_t chunk = pulsar_gpu_commit_chunk_bytes();
-        rok = rok && pulsar_gpu_chunk_pool_reserve(2 * t1 + 64 * chunk, NULL, perr, sizeof perr);
+        rok = rok && pulsar_gpu_chunk_pool_resize(pulsar_gpu_chunk_mapped_bytes() + 2 * t1 + 64 * chunk, NULL, perr, sizeof perr);
         CHECK(rok, "R4 bank 3 prefilled G and the chunk pool reserved: %s%s", err, perr);
         int cycles = 0;
         for (; rok && cycles < N; cycles++) {

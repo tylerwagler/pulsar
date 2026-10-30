@@ -585,13 +585,15 @@ int main(int argc, char **argv) {
         /* ---- pool (gpuq #504): the server creates its chunks once, at startup, and from then on only MAPS them.  Here,
          * at the floor the gated phase left the box at, the chunks it holds are the pre-created pool: POOL_CYCLES
          * rounds unmap POOL_BATCH of them and map them again at another VA (a spill and a readmit), checking the data
-         * on the new VA.  PASS: no create, no compaction stall, every map < 50 ms (the reclaim scan is reported). */
+         * on the new VA.  PASS: no compaction stall past what the idle box shows over as long (the counter is the
+         * system's), every map < 50 ms (the reclaim scan is reported). */
         if (gated_refused && held.size() >= 64) {
             const int POOL_CYCLES = 50;
             const size_t POOL_BATCH = 32;
             CUdeviceptr pv = 0;
             const bool pv_ok = p_cuMemAddressReserve(&pv, POOL_BATCH * chunk, gmin, 0, 0) == CUDA_SUCCESS;
             const vmstat_snap p0 = vmstat_read();
+            const double tc0 = now_ms();
             double slow_map = 0;
             bool pool_ok = pv_ok;
             for (int cyc = 0; pool_ok && cyc < POOL_CYCLES; cyc++) {
@@ -613,13 +615,20 @@ int main(int argc, char **argv) {
                 }
             }
             const vmstat_snap p1 = vmstat_read();
+            const double took = now_ms() - tc0;
             if (pv_ok) p_cuMemAddressFree(pv, POOL_BATCH * chunk);
-            /* the property is the compaction (an allocation's); kswapd may scan for others' pages near the floor */
-            verdict(pool_ok && p1.compact_stall == p0.compact_stall && slow_map < 50.0,
+            /* gpuq #506: compact_stall is system-wide -- at the floor another process's allocations stall too (#506
+             * read +15 here).  So the same span is measured again with the probe idle, still at the floor: the maps
+             * cause a stall only past what the idle box shows in as long. */
+            const vmstat_snap q0 = vmstat_read();
+            usleep((useconds_t)(took * 1000.0));
+            const vmstat_snap q1 = vmstat_read();
+            const unsigned long long busy_st = p1.compact_stall - p0.compact_stall, idle_st = q1.compact_stall - q0.compact_stall;
+            verdict(pool_ok && busy_st <= idle_st && slow_map < 50.0,
                     "pool", "%d rounds of %zu pre-created chunks unmapped and mapped at another VA at MemAvailable "
-                    "%.2f GiB: compaction stalls +%llu, pgscan +%llu, slowest map %.2f ms%s%s", POOL_CYCLES, POOL_BATCH,
-                    mem_available() / GiB, p1.compact_stall - p0.compact_stall, p1.pgscan - p0.pgscan, slow_map,
-                    pool_ok ? "" : " -- ", pool_ok ? "" : why);
+                    "%.2f GiB in %.2f s: compaction stalls +%llu (the idle box in as long: +%llu), pgscan +%llu, "
+                    "slowest map %.2f ms%s%s", POOL_CYCLES, POOL_BATCH, mem_available() / GiB, took / 1e3, busy_st,
+                    idle_st, p1.pgscan - p0.pgscan, slow_map, pool_ok ? "" : " -- ", pool_ok ? "" : why);
         } else {
             verdict(false, "pool", "no pre-created chunks to cycle (the gated phase did not reach its floor)");
         }

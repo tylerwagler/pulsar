@@ -351,7 +351,10 @@ session_slot *server::provision_bank(provision_refusal *refusal) {
      * nothing active), so the worker hard-spins re-reading /proc/meminfo and
      * the first request never completes.  One bank's eager floor is small;
      * admission pressure on a tight box belongs to the SECOND bank onward. */
-    const uint64_t avail = server_mem_available_bytes();
+    /* gpuq #506: with the KV chunk pool a bank's pages come from the pool's free chunks, which MemAvailable no
+     * longer holds (the pool took them at startup): the room is both */
+    const uint64_t avail_mem = server_mem_available_bytes();
+    const uint64_t avail = avail_mem ? avail_mem + pulsar_gpu_chunk_pool_free_bytes() : 0;
     if (server_bank_floor_refuses(n_provisioned, resident[idx] > 0, avail, s->bank_marginal_bytes)) {
         /* A per-request condition: the head job is re-tried every quantum and
          * the next job meets the same floor.  One line per period with the
@@ -987,7 +990,8 @@ bool server::worker_eviction_could_help(const job *j,
      * the block comment above), so if the floor refuses NOW it will refuse
      * after the eviction too; skip. Fail closed on an unreadable gauge,
      * matching provision_slot. One /proc read per failed bind attempt. */
-    const uint64_t avail = server_mem_available_bytes();
+    const uint64_t avail_mem = server_mem_available_bytes();   /* + the chunk pool's free room (gpuq #506) */
+    const uint64_t avail = avail_mem ? avail_mem + pulsar_gpu_chunk_pool_free_bytes() : 0;
     if (!server_mem_floor_admits(avail, est)) return false;
     uint64_t reclaimable = 0;
     bool any = false;
@@ -2230,6 +2234,13 @@ static uint64_t server_readmit_need(uint64_t bytes, int n_decoding, uint64_t gro
     return bytes + (uint64_t)(n_decoding + 1) * growth;
 }
 
+readmit_pool_step server_readmit_pool_step(bool fits, bool idle_with_kv, bool running) {
+    if (fits) return READMIT_POOL_GO;
+    if (idle_with_kv) return READMIT_POOL_SPILL;
+    if (running) return READMIT_POOL_WAIT;
+    return READMIT_POOL_END;
+}
+
 bool server_readmit_pool_fits(uint64_t pool_free, uint64_t want, uint64_t owed) {
     return owed <= pool_free && want <= pool_free - owed;
 }
@@ -2344,6 +2355,23 @@ bool server::worker_readmit_preempted() {
         if (s->slots[i].preempted && (!v || s->slots[i].preempt_t < v->preempt_t)) v = &s->slots[i];
     if (!v) return false;
     pulsar_session *pool = s->sess;
+    /* a parked decoder that can never come back ends by name -- never waits forever (gpuq #506) */
+    auto end_parked = [&]() -> bool {
+        v->gen->finish = "error";
+        v->gen->phase = GEN_FINISH;
+        server_log(PULSAR_LOG_WARNING, "pulsar-server: bank %u: %s", v->bank, v->gen->err);
+        unlink(v->preempt_path);
+        free(v->preempt_path);
+        v->preempt_path = NULL;
+        v->preempted = false;
+        /* an empty bank again, its history gone with it (never a view over rows it no longer holds) */
+        if (pulsar_session_bank_alloc_physical(pool, v->bank) && pulsar_session_bank_state_restore(pool, v->bank)) {
+            s->live_bank = (int)v->bank;
+            pulsar_session_invalidate(pool);
+            pulsar_session_bank_state_save(pool, v->bank);
+        }
+        return true;
+    };
     if (s->guard_enabled) {
         /* the admission arithmetic over the idle banks, as a prompt's (L280): fits, or fits once idle banks spill --
          * from the same reserved base (L326: an admitted prompt's coming prefill counts, so the room a preemption
@@ -2373,20 +2401,7 @@ bool server::worker_readmit_preempted() {
                      "GiB) and nothing running can make room", (double)v->preempt_bytes / (1024.0 * 1024.0 * 1024.0),
                      (double)pulsar_session_touched_kv_bytes(pool) / (1024.0 * 1024.0 * 1024.0),
                      (double)s->guard_budget() / (1024.0 * 1024.0 * 1024.0));
-            v->gen->finish = "error";
-            v->gen->phase = GEN_FINISH;
-            server_log(PULSAR_LOG_WARNING, "pulsar-server: bank %u: %s", v->bank, v->gen->err);
-            unlink(v->preempt_path);
-            free(v->preempt_path);
-            v->preempt_path = NULL;
-            v->preempted = false;
-            /* an empty bank again, its history gone with it (never a view over rows it no longer holds) */
-            if (pulsar_session_bank_alloc_physical(pool, v->bank) && pulsar_session_bank_state_restore(pool, v->bank)) {
-                s->live_bank = (int)v->bank;
-                pulsar_session_invalidate(pool);
-                pulsar_session_bank_state_save(pool, v->bank);
-            }
-            return true;
+            return end_parked();
         }
         for (int k = 0; k < n_spill; k++) {
             if (!s->spill_bank(&s->slots[order[k]])) return false;
@@ -2398,19 +2413,49 @@ bool server::worker_readmit_preempted() {
      * takes its rows plus a bank's mapping overhead, and the chunks every prefilling prompt's next chunk is owed stay
      * its (L328 (1)'s reserved base, in chunks) -- before, the readmission retook the chunks the preemption had just
      * freed for the prefill that caused it, 243 times (preempt, readmit, preempt) */
-    if (pulsar_gpu_chunk_pool_on()) {
+    /* gpuq #506: and the pool's room is MADE when it can be: the idle banks that hold KV spill first (a refused
+     * prompt's bank among them: its mapped chunks were what the parked decoders waited for -- gpuq #506's starvation);
+     * with nothing to spill it waits while anything runs or prefills (its end frees chunks), and with nothing running
+     * either it can never come back -- ended by name (server_readmit_pool_step) */
+    for (int round = 0; pulsar_gpu_chunk_pool_on() && round <= PULSAR_SESSION_POOL_CAP; round++) {
         uint64_t owed = 0;
         int n_decoding = 0;
+        bool running = false;
         for (int i = 0; i < s->n_slots; i++) {
             const session_slot *c = &s->slots[i];
             if (c != v && !c->preempted && slot_prefilling(c)) owed += s->prefill_chunk_need();
             if (slot_is_batchable_decode(c)) n_decoding++;
+            running = running || (c != v && c->active_job && !c->preempted && c->gen && c->gen->phase != GEN_DONE);
         }
         const int nb = pulsar_session_bank_count(pool);
         const uint64_t want = server_readmit_need(
             v->preempt_bytes + (nb > 0 ? pulsar_session_kv_mapping_overhead_bytes(pool) / (uint64_t)nb : 0), n_decoding,
             pulsar_session_quantum_growth_bytes_per_bank(pool, PULSAR_SERVER_DECODE_QUANTUM_TOKENS));
-        if (!server_readmit_pool_fits(pulsar_gpu_chunk_pool_free_bytes(), want, owed)) return false;
+        int order[PULSAR_SESSION_POOL_CAP], useful = -1;
+        const int n_order = s->guard_enabled ? guard_victim_order(s, NULL, 0, order) : 0;
+        for (int k = 0; k < n_order && useful < 0; k++)
+            if (&s->slots[order[k]] != v && pulsar_session_bank_touched_kv_bytes(pool, s->slots[order[k]].bank) > 0)
+                useful = order[k];
+        const readmit_pool_step step = server_readmit_pool_step(
+            server_readmit_pool_fits(pulsar_gpu_chunk_pool_free_bytes(), want, owed), useful >= 0, running);
+        if (step == READMIT_POOL_GO) break;
+        if (step == READMIT_POOL_WAIT) return false;
+        if (step == READMIT_POOL_SPILL) {
+            server_log(PULSAR_LOG_DEFAULT, "pulsar-server: readmission of bank %u: the KV chunk pool has %.2f GiB free "
+                       "for its %.2f GiB (%.2f GiB owed to prefills) -- spilling idle bank %u first", v->bank,
+                       (double)pulsar_gpu_chunk_pool_free_bytes() / (1024.0 * 1024.0 * 1024.0),
+                       (double)want / (1024.0 * 1024.0 * 1024.0), (double)owed / (1024.0 * 1024.0 * 1024.0),
+                       s->slots[useful].bank);
+            if (!s->spill_bank(&s->slots[useful])) return false;
+            s->count_metric(&s->m_spills);
+            continue;
+        }
+        snprintf(v->gen->err, sizeof v->gen->err,
+                 "a preempted decode cannot come back: the KV chunk pool has %.2f GiB free for its %.2f GiB, no idle "
+                 "bank holds KV to spill and nothing running will free any",
+                 (double)pulsar_gpu_chunk_pool_free_bytes() / (1024.0 * 1024.0 * 1024.0),
+                 (double)want / (1024.0 * 1024.0 * 1024.0));
+        return end_parked();
     }
     const double t0 = server_now_sec();
     char err[256] = "";

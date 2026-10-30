@@ -1581,15 +1581,16 @@ static bool commit_floor_admits(uint64_t chunk) {
  * On GB10 a 2 MiB cuMemCreate is a physically contiguous allocation: at low pressure it costs nothing, but near the
  * floor, on a box whose memory a long uptime fragmented, every create drove reclaim and compaction (vmm-probe: 2580
  * failed compactions, PSI memory 21 %; the squeeze leg's gpuq unit killed by systemd-oomd twice).  So a SERVING
- * process creates its chunks once, at startup, while memory is clean (pulsar_gpu_chunk_pool_reserve), into a free
+ * process creates its chunks once, at startup, while memory is clean (pulsar_gpu_chunk_pool_resize), into a free
  * list: from then on a commit maps a handle from the list and a decommit unmaps it back -- no cuMemCreate, no
  * cuMemRelease, and MemAvailable stays flat while KV grows.  An empty list is a refusal (-2), by name, never a create.
  *
- * Two modes, fixed per process: POOL once reserve ran (the server, always -- a start that cannot fill its pool
- * refuses), DIRECT before it (the warmup that sizes the pool, and the model-free gates and tools, which have no budget
- * to size one from and run with the box to themselves): DIRECT creates each chunk on demand, gated by the commit floor.
- * The chunks DIRECT mapped before reserve are adopted: they belong to the pool from then on, returned to its list when
- * unmapped. */
+ * Two modes: POOL once pulsar_gpu_chunk_pool_resize ran (the server, always -- it sizes the pool before the weights
+ * load, while memory is clean, and settles it after the warmup; a start that cannot fill it refuses), DIRECT otherwise
+ * (the model-free gates and tools, which have no budget to size one from and run with the box to themselves; and a
+ * server process that turns out to serve no declared-state KV goes back to it, pulsar_gpu_chunk_pool_off): DIRECT
+ * creates each chunk on demand, gated by the commit floor.  Chunks DIRECT mapped before the first resize are the
+ * pool's from then on, returned to its list when unmapped. */
 static struct {
     bool on;                                   /* POOL mode */
     std::vector<CUmemGenericAllocationHandle> free_list;
@@ -1642,44 +1643,74 @@ static unsigned long long vmstat_compact_stalls(void) {
     return v;
 }
 
-int pulsar_gpu_chunk_pool_reserve(uint64_t bytes, pulsar_gpu_pool_reserve_report *rep, char *err, size_t errlen) {
+int pulsar_gpu_chunk_pool_resize(uint64_t total_bytes, pulsar_gpu_pool_reserve_report *rep, char *err,
+                                 size_t errlen) {
     if (rep) memset(rep, 0, sizeof *rep);
-    if (g_pool.on) { snprintf(err, errlen, "the chunk pool is reserved already"); return 0; }
     if (!vmm_ready()) { snprintf(err, errlen, "CUDA VMM is not available on this device"); return 0; }
-    const uint64_t n = (bytes + g_vmm.chunk - 1) / g_vmm.chunk;
-    g_pool.free_list.reserve((size_t)n);
+    if (!g_pool.on) {   /* POOL from here: what DIRECT mapped before is the pool's */
+        g_pool.total = g_mapped_chunks;
+        g_pool.on = true;
+    }
+    const uint64_t in_use = g_pool.total - g_pool.free_list.size();
+    uint64_t target = (total_bytes + g_vmm.chunk - 1) / g_vmm.chunk;
+    if (target < in_use) target = in_use;   /* a mapped chunk is never taken back */
     const unsigned long long stalls0 = vmstat_compact_stalls();
     double paused = 0.0, psi_max = 0.0;
-    for (uint64_t i = 0; i < n; i++) {
-        if (i % POOL_BATCH == 0 && i > 0) {
-            double psi = psi_memory_some_avg10();
-            if (psi > psi_max) psi_max = psi;
-            while (psi > POOL_PSI_PAUSE && paused < POOL_PAUSE_MAX_S) {
-                usleep(POOL_PAUSE_MS * 1000u);
-                paused += POOL_PAUSE_MS / 1000.0;
-                psi = psi_memory_some_avg10();
+    uint64_t created = 0, released = 0;
+    if (target > g_pool.total) {
+        const uint64_t n = target - g_pool.total;
+        g_pool.free_list.reserve((size_t)(g_pool.free_list.size() + n));
+        for (uint64_t i = 0; i < n; i++) {
+            if (i % POOL_BATCH == 0 && i > 0) {
+                double psi = psi_memory_some_avg10();
+                if (psi > psi_max) psi_max = psi;
+                while (psi > POOL_PSI_PAUSE && paused < POOL_PAUSE_MAX_S) {
+                    usleep(POOL_PAUSE_MS * 1000u);
+                    paused += POOL_PAUSE_MS / 1000.0;
+                    psi = psi_memory_some_avg10();
+                }
             }
+            CUmemGenericAllocationHandle h = 0;
+            const CUresult r = g_vmm.create(&h, (size_t)g_vmm.chunk, &g_vmm.prop, 0);
+            if (r != CUDA_SUCCESS) {
+                snprintf(err, errlen, "cuMemCreate refused chunk %llu of %llu (%llu MiB in): CUresult %d",
+                         (unsigned long long)i, (unsigned long long)n,
+                         (unsigned long long)((i * g_vmm.chunk) >> 20), (int)r);
+                for (uint64_t k = 0; k < i; k++) {   /* this call's chunks go; the pool stands as it was */
+                    (void)g_vmm.release(g_pool.free_list.back());
+                    g_pool.free_list.pop_back();
+                }
+                return 0;
+            }
+            g_pool.free_list.push_back(h);
+            created++;
         }
-        CUmemGenericAllocationHandle h = 0;
-        const CUresult r = g_vmm.create(&h, (size_t)g_vmm.chunk, &g_vmm.prop, 0);
-        if (r != CUDA_SUCCESS) {
-            snprintf(err, errlen, "cuMemCreate refused chunk %llu of %llu (%llu MiB in): CUresult %d",
-                     (unsigned long long)i, (unsigned long long)n,
-                     (unsigned long long)((i * g_vmm.chunk) >> 20), (int)r);
-            for (CUmemGenericAllocationHandle x : g_pool.free_list) (void)g_vmm.release(x);
-            g_pool.free_list.clear();
-            return 0;
+        g_pool.total += created;
+    } else {
+        while (g_pool.total > target && !g_pool.free_list.empty()) {
+            (void)g_vmm.release(g_pool.free_list.back());
+            g_pool.free_list.pop_back();
+            g_pool.total--;
+            released++;
         }
-        g_pool.free_list.push_back(h);
     }
-    g_pool.total = n + g_mapped_chunks;   /* the warmup's chunks are the pool's too */
-    g_pool.on = true;
     if (rep) {
-        rep->created = n;
+        rep->created = created;
+        rep->released = released;
         rep->compact_stalls = vmstat_compact_stalls() - stalls0;
         rep->paused_s = paused;
         rep->psi_max = psi_max;
     }
+    return 1;
+}
+
+int pulsar_gpu_chunk_pool_off(void) {
+    if (!g_pool.on) return 1;
+    if (g_pool.free_list.size() != g_pool.total) return 0;   /* a chunk is mapped: the pool stays */
+    for (CUmemGenericAllocationHandle h : g_pool.free_list) (void)g_vmm.release(h);
+    g_pool.free_list.clear();
+    g_pool.total = 0;
+    g_pool.on = false;
     return 1;
 }
 

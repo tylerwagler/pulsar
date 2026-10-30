@@ -174,7 +174,23 @@ print("phase 0: eager %.2f GiB, %.0f B of KV per token, %.2f tokens per word; to
       "tokens" % (eager / 2**30, per_token, tpw, budget_touched / 2**20, T), flush=True)
 A, Bt, C, D = (words(11, nw(T)), words(12, nw(T)), words(13, nw(T)), words(15, nw(2.5 * T)))
 
+def pool_frame(log, tag):
+    """gpuq #506: with the KV chunk pool the frame is in chunks -- the pool, less the mapping's overhead (a chunk a pool
+    and the read slack, every bank), must hold two conversations' rows, or A and B cannot both stay resident and the
+    phases test the pool's arithmetic instead of the admission's.  Checked up front, as preempt-exact's frame is."""
+    txt = open(log).read()
+    mp = re.search(r"KV chunk pool reserved: (\d+) chunks of (\d+) MiB .*?mapping overhead ([0-9.]+) GiB", txt)
+    if not mp:
+        return
+    pool_b = int(mp.group(1)) * int(mp.group(2)) * 2**20
+    over_b = float(mp.group(3)) * 2**30
+    two = 2 * T * per_token
+    check(pool_b - over_b >= two, "%s frame: the KV chunk pool (%.1f MiB) less its mapping overhead (%.1f MiB) holds two "
+          "conversations' %.1f MiB of rows" % (tag, pool_b / 2**20, over_b / 2**20, two / 2**20))
+
+
 p, kv, log = start(env, "S")
+pool_frame(log, "S")
 try:
     m = metrics()
     check(abs(m["pulsar:kv_touched_budget_bytes"] - budget_touched) < 2**20,
@@ -204,6 +220,7 @@ finally:
     stop(p, kv, log)
 
 p, kv, log = start(env, "W")
+pool_frame(log, "W")
 try:
     print("W: A and B streaming on two banks, then C: B preempted for C, then readmitted (L314)", flush=True)
     res = {}

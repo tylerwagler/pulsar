@@ -3671,6 +3671,9 @@ uint64_t server_zone_high_watermark_bytes(void);
  *  writeback window of dirty page cache (PULSAR_WRITEBACK_STEP) and the two renders of the history's text
  *  (pulsar_kvchain_persist), bounded at PERSIST_TEXT_BYTES_PER_TOKEN a token. */
 uint64_t server_persist_host_bytes(int tokens);
+/** The bytes of a model on disk: the file, or every *.safetensors in the directory (0 unreadable) -- the weights the
+ *  load stages, which the KV chunk pool's provisional size leaves room for (gpuq #506). */
+uint64_t server_model_disk_bytes(const char *path);
 #define PERSIST_TEXT_BYTES_PER_TOKEN 64u
 /** Does MemAvailable `avail` leave `floor` after `need` more bytes?  avail 0 (unreadable) is no. */
 bool server_headroom_admits(uint64_t avail, uint64_t need, uint64_t floor);
@@ -3687,6 +3690,11 @@ bool server_kv_room_admits(uint64_t avail, uint64_t floor, bool pool_on, uint64_
  *  + the next quantum's growth) must fit the free chunks LESS what the prefilling prompts are `owed` (their next
  *  chunks): the room a preemption made for a prompt is not retaken before the prompt lands. */
 bool server_readmit_pool_fits(uint64_t pool_free, uint64_t want, uint64_t owed);
+/** gpuq #506: a parked decoder's next move with the pool: GO when it fits; else SPILL while an idle bank holds KV
+ *  (a refused prompt's bank among them); else WAIT while anything runs or prefills; else END by name -- a parked
+ *  decoder never waits forever. */
+typedef enum { READMIT_POOL_GO = 0, READMIT_POOL_SPILL, READMIT_POOL_WAIT, READMIT_POOL_END } readmit_pool_step;
+readmit_pool_step server_readmit_pool_step(bool fits, bool idle_with_kv, bool running);
 
 /* MemAvailable from /proc/meminfo, in bytes (0 on parse failure — callers
  * fail closed).  Never called on a token/layer hot path (defined in

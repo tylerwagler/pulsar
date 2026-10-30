@@ -224,11 +224,22 @@ uint64_t pulsar_gpu_commit_chunk_bytes(void);
  *  1 = reserved; 0 = refused (err says which chunk the driver refused; nothing is kept). */
 typedef struct {
     uint64_t created;                  ///< chunks created
-    unsigned long long compact_stalls; ///< /proc/vmstat compact_stall over the reserve
-    double paused_s;                   ///< seconds the reserve waited for memory pressure to settle
-    double psi_max;                    ///< the highest PSI memory "some avg10" it read
+    uint64_t released;                 ///< chunks released (a trim)
+    unsigned long long compact_stalls; ///< /proc/vmstat compact_stall over the call
+    double paused_s;                   ///< seconds the creates waited for memory pressure to settle
+    double psi_max;                    ///< the highest PSI memory "some avg10" read
 } pulsar_gpu_pool_reserve_report;
-int pulsar_gpu_chunk_pool_reserve(uint64_t bytes, pulsar_gpu_pool_reserve_report *rep, char *err, size_t errlen);
+/** gpuq #503..#506: the process's KV chunk pool.  The first call switches every commit to POOL mode (a commit maps a
+ *  handle from the free list, an empty list returns -2; a decommit returns its chunks to the list); the chunks DIRECT
+ *  mapped before it are the pool's.  Each call sizes the pool to `total_bytes` (whole 2 MiB chunks): it creates the
+ *  missing chunks (paced by the kernel's memory pressure) or releases free ones -- never a mapped one.  Startup only:
+ *  the server sizes it before the weights load, trims it for the session's eager state, and settles it after the
+ *  warmup; nothing is created or released while serving.  1 = done; 0 = the driver refused a create (err; this call's
+ *  chunks are released, the pool stands as it was).  `rep` (may be NULL) reports it. */
+int pulsar_gpu_chunk_pool_resize(uint64_t total_bytes, pulsar_gpu_pool_reserve_report *rep, char *err, size_t errlen);
+/** Back to DIRECT mode, every chunk released -- a process that turned out to serve no declared-state KV (a TP worker,
+ *  an encoder, a family without reserved pools).  0 (nothing done) while any chunk is mapped. */
+int pulsar_gpu_chunk_pool_off(void);
 /** 1 when the pool is reserved (POOL mode), 0 before (DIRECT: a commit creates, gated by the commit floor). */
 int pulsar_gpu_chunk_pool_on(void);
 /** The pool's chunks: owned, mapped (in use), on the free list, and a chunk's bytes (0s before the reserve). */

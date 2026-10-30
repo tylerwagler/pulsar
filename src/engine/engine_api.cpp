@@ -256,14 +256,6 @@ int pulsar_engine_open_group(pulsar_engine **out, const pulsar_engine_options *o
     return pulsar_engine::open_group(out, opts, n);
 }
 void pulsar_engine_close(pulsar_engine *e) { if (e) e->destroy(); }
-uint64_t pulsar_engine_drop_page_cache(pulsar_engine *e) {
-    /* what the load's own release does (session.cpp), again: kept only when the device reads through the mapping */
-    if (!e || !pulsar_backend_uses_graph(e->backend) || !e->gpu_ready || pulsar_gpu_model_reads_host_pages()) return 0;
-    uint64_t released = pulsar_model_release_host_pages(&e->model);
-    if (e->dspark_ready && e->dspark_external) released += pulsar_model_release_host_pages(&e->dspark_model);
-    if (e->overlay_ready) released += pulsar_model_release_host_pages(&e->overlay_model);
-    return released;
-}
 void pulsar_engine_summary(pulsar_engine *e) { e->summary(); }
 int pulsar_engine_vocab_size(pulsar_engine *e) { return e ? e->vocab_size() : 0; }
 int pulsar_engine_logits_width(const pulsar_engine *e) { return e ? e->logits_width() : 0; }

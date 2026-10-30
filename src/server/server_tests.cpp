@@ -11188,6 +11188,28 @@ static void test_readmit_does_not_retake_the_owed_chunks(void) {
     TEST_ASSERT(!server_readmit_pool_fits(want + owed - 1, want, owed));
 }
 
+/* gpuq #506's starvation, its shape: two decoders preempted for a prompt, the prompt then refused (nothing left to free
+ * for IT), so nothing runs -- the refused prompt's bank still holds its chunks.  Neither parked decoder may wait
+ * forever: the first move spills that idle bank, then it fits and comes back; and with no idle bank to spill and
+ * nothing running it ends by name. */
+static void test_parked_decoders_never_wait_forever(void) {
+    const uint64_t MiB = 1024ull * 1024ull;
+    /* after the refusal: 1 chunk free, the decoder wants 3, nothing owed (the prompt is done), C's idle bank holds KV */
+    TEST_ASSERT(server_readmit_pool_step(server_readmit_pool_fits(2 * MiB, 6 * MiB, 0), true, false) ==
+                READMIT_POOL_SPILL);
+    /* C's bank spilled: its chunks are free again -- B comes back, then A */
+    TEST_ASSERT(server_readmit_pool_step(server_readmit_pool_fits(14 * MiB, 6 * MiB, 0), false, false) ==
+                READMIT_POOL_GO);
+    TEST_ASSERT(server_readmit_pool_step(server_readmit_pool_fits(8 * MiB, 6 * MiB, 0), false, true) ==
+                READMIT_POOL_GO);
+    /* a prompt still prefilling: wait for it (its end frees chunks) */
+    TEST_ASSERT(server_readmit_pool_step(server_readmit_pool_fits(2 * MiB, 6 * MiB, 2 * MiB), false, true) ==
+                READMIT_POOL_WAIT);
+    /* nothing to spill, nothing running: it can never come back -- ended by name, never parked forever */
+    TEST_ASSERT(server_readmit_pool_step(server_readmit_pool_fits(2 * MiB, 6 * MiB, 0), false, false) ==
+                READMIT_POOL_END);
+}
+
 static void test_kv_room_with_and_without_the_pool(void) {
     const uint64_t MiB = 1024ull * 1024ull, F = 4538ull * MiB, need = 70ull * MiB;
     TEST_ASSERT(server_kv_room_admits(F + need, F, false, 0, need));
@@ -11273,6 +11295,7 @@ static void pulsar_server_unit_tests_run(void) {
     test_prefill_mem_step_tries_remedies_first();
     test_kv_room_with_and_without_the_pool();
     test_readmit_does_not_retake_the_owed_chunks();
+    test_parked_decoders_never_wait_forever();
     test_stall_watchdog_rules();
     test_health_reports_a_stall();
     test_stall_marks_beat();
