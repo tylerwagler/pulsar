@@ -47,33 +47,54 @@ constexpr size_t ENC_INPUTS_MAX = 2048;
 /** What an engine serves: the encoder kinds' values (pulsar_encoder_kind) and the parser. */
 enum srv_kind { K_EMBED = PULSAR_ENCODER_EMBED, K_RERANK = PULSAR_ENCODER_RERANK, K_PARSE, K_COUNT };
 
+/** One served engine.  Built once in encode_serve before the accept loop; read-only after, by every client thread. */
 struct enc_ctx {
+    /// The engine (owned by encode_serve's caller).
     pulsar_engine *e;
+    /// The endpoint it serves.
     srv_kind kind;
+    /** dim: floats an embedding (a reranker's 1); cap: an input's token limit (pulsar_engine_encode_max_tokens).
+     *  Unused for a parser. */
     uint32_t dim, cap;   ///< an encoder's
+    /// The served model id the "model" field names (pulsar_engine_served_model_id).
     const char *id;
 };
 
 /** Every engine the process serves, and the connections in flight (shutdown waits for them: the engines close
  *  after encode_serve returns). */
 struct enc_server {
+    /// The engines, in -m order; fixed before the first accept.
     std::vector<enc_ctx> m;
+    /// Guards `clients`.
     pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER;
+    /// Signalled when `clients` drops to 0.
     pthread_cond_t idle = PTHREAD_COND_INITIALIZER;
+    /// Connection threads in flight, under `mu`.
     int clients = 0;
 };
 
+/** A connection thread's argument: malloc'd by the accept loop, freed by client(). */
 struct enc_arg {
+    /// The server (outlives every client thread: encode_serve waits for them).
     const enc_server *srv;
+    /// The accepted socket; the client thread closes it.
     int fd;
 };
 
+/** Send `b` as a 200 application/json response and free it.
+ *  @param fd the client socket
+ *  @param b the body (an empty buffer sends "{}"); freed
+ *  @return false when the write failed */
 bool send_json(int fd, buf *b) {
     const bool ok = http_response(fd, 200, "application/json", b->ptr ? b->ptr : "{}");
     buf_free(b);
     return ok;
 }
 
+/** Append the standard base64 (with '=' padding) of `n` bytes.
+ *  @param b the buffer appended to
+ *  @param p the bytes
+ *  @param n their count */
 void append_base64(buf *b, const uint8_t *p, size_t n) {
     static const char A[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     for (size_t i = 0; i < n; i += 3) {
@@ -87,6 +108,10 @@ void append_base64(buf *b, const uint8_t *p, size_t n) {
 }
 
 /* the optional string member `key` of `o` (NULL when absent); false when present and not a string */
+/** @param o a JSON object
+ *  @param key the member's name
+ *  @param out set to the member's string (pointing into `o`), NULL when absent
+ *  @return false when the member is present and not a string */
 bool opt_str(const pyjson_value &o, const char *key, const std::string **out) {
     const pyjson_value *v = o.get(key);
     *out = v ? &v->s : NULL;
@@ -94,6 +119,10 @@ bool opt_str(const pyjson_value &o, const char *key, const std::string **out) {
 }
 
 /* the request's truncate: NONE (refuse an over-long input) or END (keep its first cap tokens) */
+/** @param o the request object
+ *  @param cut set true for END
+ *  @param err the 400 message on failure
+ *  @return false when "truncate" is present and neither "NONE" nor "END" */
 bool read_truncate(const pyjson_value &o, bool *cut, std::string *err) {
     const std::string *t = NULL;
     if (!opt_str(o, "truncate", &t) || (t && *t != "NONE" && *t != "END")) {
@@ -105,6 +134,15 @@ bool read_truncate(const pyjson_value &o, bool *cut, std::string *err) {
 }
 
 /* render one input; an over-long one cut (truncate END) or refused */
+/** @param c the engine
+ *  @param role query, passage, or (rerank) a query-document pair
+ *  @param text the input (the query for a pair)
+ *  @param doc the document of a pair; NULL otherwise
+ *  @param cut truncate END: keep the first `c->cap` tokens instead of refusing
+ *  @param t the rendered tokens (the caller frees them, also on failure)
+ *  @param index the input's index, for the message
+ *  @param err the 400 message on failure
+ *  @return false when the template refused the input or it is over `c->cap` tokens without `cut` */
 bool render_one(const enc_ctx *c, pulsar_encode_role role, const char *text, const char *doc, bool cut,
                 pulsar_tokens *t, size_t index, std::string *err) {
     char why[384];
@@ -124,10 +162,16 @@ bool render_one(const enc_ctx *c, pulsar_encode_role role, const char *text, con
     return true;
 }
 
+/** Free every token list in `v` (the vector itself stays).
+ *  @param v the rendered inputs */
 void free_all(std::vector<pulsar_tokens> *v) {
     for (pulsar_tokens &t : *v) pulsar_tokens_free(&t);
 }
 
+/** Serve POST /v1/embeddings (the shape in the file comment): validate, render every input, one encode call, reply.
+ *  @param c the embedder
+ *  @param fd the client socket (a response or an error is always sent)
+ *  @param o the request body */
 void embeddings(const enc_ctx *c, int fd, const pyjson_value &o) {
     std::string err;
     const pyjson_value *in = o.get("input");
@@ -201,6 +245,11 @@ void embeddings(const enc_ctx *c, int fd, const pyjson_value &o) {
     send_json(fd, &b);
 }
 
+/** Serve POST /v1/rerank: one (query, document) pair an input, one encode call; results sorted by logit, best
+ *  first (stable: ties keep document order), cut to top_n.
+ *  @param c the reranker
+ *  @param fd the client socket (a response or an error is always sent)
+ *  @param o the request body */
 void rerank(const enc_ctx *c, int fd, const pyjson_value &o) {
     std::string err;
     const pyjson_value *q = o.get("query"), *docs = o.get("documents");
@@ -281,6 +330,11 @@ void rerank(const enc_ctx *c, int fd, const pyjson_value &o) {
     send_json(fd, &b);
 }
 
+/** Serve POST /v1/parse: decode the data: URL image, one pulsar_engine_parse_page call, reply with its text.
+ *  An engine rc of -2 (the input) answers 400, any other failure 500.
+ *  @param c the parser
+ *  @param fd the client socket (a response or an error is always sent)
+ *  @param o the request body */
 void parse(const enc_ctx *c, int fd, const pyjson_value &o) {
     const pyjson_value *im = o.get("image");
     if (!im || im->kind != pyjson_value::STR) {
@@ -346,9 +400,15 @@ void parse(const enc_ctx *c, int fd, const pyjson_value &o) {
     send_json(fd, &b);
 }
 
+/** @param k an endpoint kind
+ *  @return its short name ("embed", "rerank", "parse") */
 const char *kind_name(srv_kind k) { return k == K_EMBED ? "embed" : k == K_RERANK ? "rerank" : "parse"; }
+/** @param k an endpoint kind
+ *  @return its canonical POST path */
 const char *kind_path(srv_kind k) { return k == K_EMBED ? "/v1/embeddings" : k == K_RERANK ? "/v1/rerank" : "/v1/parse"; }
 /* the endpoint a POST path names, K_COUNT for none */
+/** @param p the request path
+ *  @return the endpoint kind it names; K_COUNT for none */
 srv_kind path_kind(const char *p) {
     return !strcmp(p, "/v1/embeddings") ? K_EMBED
            : !strcmp(p, "/v1/rerank") || !strcmp(p, "/rerank") ? K_RERANK
@@ -356,6 +416,9 @@ srv_kind path_kind(const char *p) {
                                       : K_COUNT;
 }
 
+/** Serve GET /health: every served model with its kind, dimension, token cap and endpoint.
+ *  @param srv the server
+ *  @param fd the client socket */
 void health(const enc_server *srv, int fd) {
     buf b = {0};
     buf_puts(&b, "{\"status\":\"ok\",\"models\":[");
@@ -372,6 +435,9 @@ void health(const enc_server *srv, int fd) {
     send_json(fd, &b);
 }
 
+/** Serve GET /v1/models (OpenAI's list shape).
+ *  @param srv the server
+ *  @param fd the client socket */
 void models(const enc_server *srv, int fd) {
     buf b = {0};
     buf_puts(&b, "{\"object\":\"list\",\"data\":[");
@@ -385,6 +451,11 @@ void models(const enc_server *srv, int fd) {
 }
 
 /* the engine a request for `kind` goes to: the only one of that kind, else the one its "model" names; NULL + `err` */
+/** @param srv the server
+ *  @param kind the endpoint's kind (the caller checked one engine serves it)
+ *  @param o the request body (its "model" is read only when several engines share the kind)
+ *  @param err the 400 message when no engine matches
+ *  @return the engine, or NULL */
 const enc_ctx *route(const enc_server *srv, srv_kind kind, const pyjson_value &o, std::string *err) {
     std::vector<const enc_ctx *> of;
     for (const enc_ctx &c : srv->m)
@@ -399,6 +470,10 @@ const enc_ctx *route(const enc_server *srv, srv_kind kind, const pyjson_value &o
     return NULL;
 }
 
+/** A connection thread: read one HTTP request, serve it, close the socket, and drop enc_server::clients (waking
+ *  encode_serve's drain at 0).
+ *  @param arg an enc_arg (freed here)
+ *  @return NULL */
 void *client(void *arg) {
     enc_arg *a = (enc_arg *)arg;
     const enc_server *srv = a->srv;

@@ -57,12 +57,20 @@
 
 namespace {
 
+/** One candidate chunk of a prompt. */
 struct cand {
+    /// Rows the chunk carries (from the prompt's frontier p0).
     uint32_t q;
+    /// The chunk reaches the prompt's end (it needs a head row).
     bool fin;
 };
 
 /* The prompt's candidate ends, narrowest first, within `room` rows. */
+/** @param p the prompt
+ *  @param room the round's prompt rows left
+ *  @param out the candidates, narrowest first
+ *  @param cap entries at `out`
+ *  @return the candidates written (0: the prompt is done or there is no room) */
 static int sched_cands(const sched_prompt *p, uint32_t room, cand *out, int cap) {
     int k = 0;
     if (p->len <= p->p0 || room == 0u) return 0;

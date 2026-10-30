@@ -47,6 +47,7 @@ typedef struct {
     double age_ms;        ///< the decoders' summed time since their last output
 } sched_round;
 
+/** One round's selection (sched_choose's output), indexed like its `pr` array. */
 typedef struct {
     uint32_t q[SCHED_PROMPTS_MAX];   ///< rows each prompt rides (0: it waits)
     bool fin[SCHED_PROMPTS_MAX];     ///< its chunk finishes it (a head row)
@@ -55,6 +56,8 @@ typedef struct {
     double t_dec_ms;                 ///< the decode-only round's predicted wall
     double score, score_dec;         ///< their value per time, net of the decoders' waiting
 } sched_choice;
+/** @var sched_choice::score
+ *  The chosen round's score (value in prompt tokens per ms of wall, net of the decoders' waiting); 0 unpriced. */
 
 /** The choice for one round.  room_rows bounds the round's prompt rows (the fused step's widest run);
  *  first_full_round: this is the first round of a full decode quantum (the unpriced rule's only use of it);

@@ -119,9 +119,13 @@ bool response_format_parse(const char *raw, response_format_spec *out, char *err
 
 /* ==== the plan: the request's grammars ==================================================================== */
 
+/// A request's compiled grammars (request::constrain); owned by the request, freed by constrain_plan_free.
 struct constrain_plan {
+    /// The response format's grammar; NULL when the request has none.
     pulsar_grammar *answer = nullptr;   /* the answer region (a response format): ends on a stop token */
+    /// The grammar of one tool-call region; NULL when no tool is constrained.
     pulsar_grammar *calls = nullptr;    /* one call region, opened by the call trigger in free text: ends when complete */
+    /// The family's grammar markup the regions were built from (static, not owned).
     const server_grammar_shape *shape = nullptr;
 };
 
@@ -167,8 +171,11 @@ static pulsar_grammar_compiler *constrain_compiler(server *s, pulsar_engine *e, 
 }
 
 /* One declared tool: its name and its arguments' schema (a strict tool's declared one, another's `true`). */
+/// One declared tool for the call grammar.
 struct constrain_tool {
+    /// The function name.
     std::string name;
+    /// The arguments' JSON schema text.
     std::string schema;
 };
 
@@ -373,9 +380,14 @@ bool constrain_plan_build(pulsar_engine *e, server *s, const chat_conversation *
 /* ==== the gate ============================================================================================ */
 
 /* One byte pattern under KMP. */
+/// A byte-pattern matcher (Knuth-Morris-Pratt) the gate runs over the free text to spot region openers.
 struct constrain_kmp {
+    /// The pattern bytes; empty = never matches.
     std::string pat;
+    /// KMP failure function: fail[i] = length of the longest proper border of pat[0..i].
     std::vector<int> fail;
+    /// Set the pattern and build its failure function.
+    /// @param p the pattern (NUL-terminated); NULL = empty (never matches)
     void init(const char *p) {
         pat = p ? p : "";
         fail.assign(pat.size(), 0);
@@ -386,6 +398,9 @@ struct constrain_kmp {
         }
     }
     /* Advance state `st` by byte `c`; true = the pattern just completed (st is reset). */
+    /// @param st the match state: bytes of `pat` matched so far (0 = none); updated in place
+    /// @param c the next byte
+    /// @return true when the pattern just completed (st is reset to 0)
     bool step(int &st, char c) const {
         if (pat.empty()) return false;
         while (st && pat[(size_t)st] != c) st = fail[(size_t)st - 1];
@@ -401,32 +416,67 @@ struct constrain_kmp {
 enum constrain_phase : uint8_t { GATE_THINK, GATE_FREE, GATE_REGION };
 
 /* What one advance changed, to undo it. */
+/// The gate state before one advance (gate_feed), kept in constrain_gate::hist so gate_rollback can undo it.
 struct constrain_rec {
+    /// The gate's phase before the advance.
     constrain_phase phase;
+    /// The three KMP states (think close, call trigger, answer opener) before the advance.
     int kmp_think, kmp_call, kmp_answer;
+    /// Index into constrain_gate::matchers of the live matcher before the advance (-1 = none).
     int cur;          /* the live matcher's index before */
+    /// Accepts this advance made into an existing matcher (a rollback undoes them).
     int ops;          /* accepts made into matcher `cur_after` (an existing one) that a rollback undoes */
+    /// The matcher `ops` went into (-1 = none).
     int cur_after;
+    /// This advance created a matcher.
     bool opened;      /* this advance created a matcher (a rollback frees it; its accepts go with it) */
 };
 
+/** @var constrain_rec::kmp_call
+ *  The call trigger's KMP state before the advance. */
+/** @var constrain_rec::kmp_answer
+ *  The answer opener's KMP state before the advance. */
+
+/// One request's grammar gate (gen_state::gate): tracks where the generated turn is (reasoning, free text, or a
+/// constrained region) and holds the region matchers that mask and accept tokens.  Built by gen_constrain_begin,
+/// freed by gen_constrain_end; touched only by the thread generating the request (the worker).
 struct constrain_gate {
+    /// The request's grammars (request::constrain; not owned).
     const constrain_plan *plan;
+    /// uint32_t words in one vocabulary mask row (gen_constrain_words).
     uint32_t words;
+    /// Where the turn is: reasoning, free text, or inside a region (matchers[cur] live).
     constrain_phase phase = GATE_FREE;
+    /// Pattern matchers for the reasoning close, the call trigger and a separate answer opener.
     constrain_kmp think, call, answer;   /* the reasoning close, the call trigger, a separate answer opener */
+    /// The KMP states of think, call and answer (bytes matched so far).
     int kmp_think = 0, kmp_call = 0, kmp_answer = 0;
+    /// Every region's matcher in the order opened (owned; freed by the destructor).
     std::vector<pulsar_grammar_matcher *> matchers;   /* every region's, in order; the live one is `cur` */
+    /// Index of the live matcher in `matchers`; -1 = none opened yet.
     int cur = -1;
+    /// The advances since the last emitted token, newest last (gate_rollback pops them; cleared on accept).
     std::vector<constrain_rec> hist;
+    /// One round's masks: rows x `words`, the buffer gen_constrain_round hands out.
     std::vector<uint32_t> rows;   /* a round's masks */
+    /// One draw's mask (`words` long), the buffer gen_constrain_base_mask hands out.
     std::vector<uint32_t> one;    /* a single draw's mask */
+    /// Emitted tokens accepted while a region was live (PULSAR_GRAMMAR_FAIL_AFTER counts these).
     int live_accepts = 0;         /* emitted tokens a live region took (the failure injection's count) */
+    /// The last failure's message (NUL-terminated; empty = none).
     char err[200];
     ~constrain_gate() {
         for (auto *m : matchers) pulsar_grammar_matcher_free(m);
     }
 };
+/** @var constrain_gate::call
+ *  Matches the family's call trigger in free text (opens a call region). */
+/** @var constrain_gate::answer
+ *  Matches a separate answer opener in free text; empty when the answer opens at the reasoning close. */
+/** @var constrain_gate::kmp_call
+ *  `call`'s KMP state. */
+/** @var constrain_gate::kmp_answer
+ *  `answer`'s KMP state. */
 
 static bool gate_open(constrain_gate *gt, const pulsar_grammar *gr, bool end_at_complete, const char *bytes,
                       size_t n, constrain_rec *rec) {

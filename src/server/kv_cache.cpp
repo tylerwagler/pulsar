@@ -353,9 +353,21 @@ int kv_cache_sys_prefix_cut(const kv_disk_cache *kc, int anchor) {
 }
 
 namespace {
+/** pulsar_kvchain_trailer::size: the tool-map trailer a segment of `text` carries.
+ *  @param ud the server
+ *  @param text the segment's prefix text
+ *  @param bytes the trailer's size in bytes (0 = none)
+ *  @return false when it cannot be measured */
 bool seg_trailer_size(void *ud, const char *text, uint64_t *bytes) {
     return ((server *)ud)->kv_tool_map_serialized_size(text, bytes);
 }
+/** pulsar_kvchain_trailer::write: write that trailer (server::kv_tool_map_write).
+ *  @param fp the segment file, at the trailer's offset
+ *  @param ud the server
+ *  @param text the segment's prefix text
+ *  @param err the failure
+ *  @param errlen bytes at `err`
+ *  @return 0 on success, 1 + err on failure */
 int seg_trailer_write(FILE *fp, void *ud, const char *text, char *err, size_t errlen) {
     uint64_t written = 0;
     if (((server *)ud)->kv_tool_map_write(fp, text, &written)) return 0;

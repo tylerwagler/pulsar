@@ -36,6 +36,7 @@ typedef enum {
  * return a different tool-call reading than the final parse on one protocol
  * but not the other. */
 typedef struct dsml_tool_stream dsml_tool_stream;
+/** One DSML tool block's live projection into protocol tool-call events (dsml_tool_stream_update). */
 struct dsml_tool_stream {
     dsml_tool_stream_state state;  ///< where the projection is in the block
     const pulsar_dsml_syntax *syn; ///< the marker literals this block opened with; borrowed
@@ -59,7 +60,10 @@ typedef enum {
     DS_WALK_SUPPRESS,   ///< nothing more goes out live (a block the finish sends, or the end)
 } deepseek_walk_mode;
 
+/** The one live walk over DeepSeek's generated text (deepseek_stream_update): one per streamed decode attempt,
+ *  worker thread only. */
 typedef struct {
+    /** Where the walk is: reasoning, answer, a DSML block, or suppressed. */
     deepseek_walk_mode mode;
     size_t emit_pos;             ///< bytes of generated text already turned into events
     bool checked_think_prefix;   ///< the leading `<think>` check has been done once
@@ -105,6 +109,7 @@ typedef struct {
 /** L272 P3: DeepSeek's output-parser state for one decode attempt (parser_deepseek.cpp). */
 typedef struct {
     deepseek_stream_walk walk;        ///< the live projection into the sink (walk_on: a streamed chat)
+    /** `walk` is initialised and fed: the attempt has a streaming text sink (g->sink.text). */
     bool walk_on;
     dsml_decode_tracker tracker;      ///< decode-time DSML marker tracking: the greedy region of a call
     bool saw_tool_start;              ///< a tool-call opening marker has appeared

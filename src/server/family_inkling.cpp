@@ -26,9 +26,15 @@ namespace {
 /* ---- the effort map: the renderer's hundredths (inkling_chat.h, its one authority) ------------------------ */
 
 /* An integer effort 1..100 (pulsar's axis) is that many hundredths, capped at the renderer's 0.99 */
+/** server_effort_map::integer for Inkling.
+ *  @param value the integer effort, 1..100
+ *  @return the renderer's effort in hundredths, capped at 99 */
 int inkling_effort_integer(int value) { return value < 99 ? value : 99; }
+/** server_effort_map::default_level for Inkling: the renderer's default effort (inkling_effort_default).
+ *  @return the level in hundredths */
 int inkling_effort_default_level(pulsar_engine *) { return inkling_effort_default(); }
 
+/** Inkling's effort map (server_family_ops::effort): the named levels are the renderer's own, in hundredths. */
 const server_effort_map k_effort_inkling = [] {
     server_effort_map m = {};
     for (int i = 0; i < CHAT_EFFORT_NAMES; i++) {
@@ -47,12 +53,24 @@ const server_effort_map k_effort_inkling = [] {
  * append it to the array), then the messages in order -- or, for a TAIL from `start`, the messages before it (they
  * only name the calls a tool result answers) and those from it, the system field not among them.  `*from` = where
  * the rendered piece starts.  false + err: an image (E9's front is not wired). */
+/** The renderer's message list built by inkling_messages; its strings borrow the chat_msgs it was built from. */
 struct inkling_msgs {
+    /// The messages in render order.
     std::vector<inkling_msg_in> m;
+    /// Per SOURCE message index: its calls (`m` points in).
     std::vector<std::vector<inkling_tool_call_in>> calls;
+    /// Index into `m` where the rendered piece starts.
     int from = 0;
 };
 
+/** Build `out` from `msgs` (the rule above).
+ *  @param msgs the parsed messages (borrowed: must outlive `out`)
+ *  @param start a tail's first message index (read only when `tail`)
+ *  @param tail build a tail from `start` instead of the whole conversation
+ *  @param out the result
+ *  @param err the refusal (an image)
+ *  @param errlen bytes at `err`
+ *  @return false + err when a message carries an image */
 bool inkling_messages(const chat_msgs *msgs, int start, bool tail, inkling_msgs *out, char *err, size_t errlen) {
     out->m.clear();
     out->calls.assign((size_t)msgs->len, {});
@@ -93,6 +111,10 @@ bool inkling_messages(const chat_msgs *msgs, int start, bool tail, inkling_msgs 
 }
 
 /* A render's text and client-data ranges as the request owns them (malloc'd; the ranges NULL when none). */
+/** @param out the renderer's output
+ *  @param spans_out set to a malloc'd copy of the client-data spans (NULL when none); NULL = not wanted
+ *  @param n_spans_out set to the span count (read only with `spans_out`)
+ *  @return the rendered text, malloc'd */
 char *inkling_take_render(const inkling_render_out &out, chat_text_span **spans_out, uint32_t *n_spans_out) {
     if (spans_out) {
         *spans_out = NULL;
@@ -108,6 +130,14 @@ char *inkling_take_render(const inkling_render_out &out, chat_text_span **spans_
 /* vLLM's render_inkling_messages over the request: the tools (OpenAI's array) declared in the leading system block,
  * the effort line (r->family_effort, the hundredths the effort map resolved), the generation prompt
  * <|message_model|>; tokenised with the client spans (L223). */
+/** server_family_ops::render for Inkling.
+ *  @param e the engine (NULL = render only: no tokenisation, no images)
+ *  @param s the server
+ *  @param c the parsed conversation
+ *  @param r the request: prompt_text / prompt_spans / prompt, has_tools and tools_json written
+ *  @param err the refusal
+ *  @param errlen bytes at `err`
+ *  @return false + err for a forced tool_choice, an image, or a render the renderer refuses */
 bool inkling_render(pulsar_engine *e, server *s, chat_conversation *c, request *r, char *err, size_t errlen) {
     if (c->tool_choice == CHAT_TOOL_CHOICE_ANY || c->tool_choice == CHAT_TOOL_CHOICE_NAMED) {
         snprintf(err, errlen, "tool_choice %s: Inkling's renderer has no forced tool call (vLLM's native Inkling "
@@ -142,6 +172,9 @@ bool inkling_render(pulsar_engine *e, server *s, chat_conversation *c, request *
 /* L272 B6: the longest prefix two UNRELATED prompts share by template construction.  With no tools and no system
  * message every Inkling prompt opens with the effort block and a user text block's opener; the longest of those over
  * the named efforts (the client's first byte is where the shared part ends). */
+/** server_family_ops::trivial_header_tokens for Inkling.
+ *  @param e the engine (its tokenizer)
+ *  @return the header's length in tokens (the longest over the named efforts) */
 int inkling_trivial_header_tokens(pulsar_engine *e) {
     int hdr_len = 0;
     inkling_msg_in user = {};
@@ -167,12 +200,15 @@ int inkling_trivial_header_tokens(pulsar_engine *e) {
 
 /* ---- the output parser: the kit in Inkling's configuration, from the generation prompt's header ----------- */
 
+/** server_output_parser_ops::create for Inkling: the parser kit started in a block header.  Never fails.
+ *  @return the parser state (parser_kit_destroy frees it) */
 void *inkling_parser_create(server *, gen_state *, char *, size_t) {
     inkling_output_parser *p = new inkling_output_parser();
     p->init(OUT_HEADER);   /* the prompt ends with <|message_model|>: the turn starts in its first block's header */
     return parser_kit_start(p);
 }
 
+/** Inkling's output parser table: the parser kit's hooks. */
 const server_output_parser_ops k_parser_inkling = {
     /* .create        = */ inkling_parser_create,
     /* .destroy       = */ parser_kit_destroy,
@@ -192,6 +228,13 @@ const server_output_parser_ops k_parser_inkling = {
 /* The turn as sampled after the generation prompt: reasoning (NULL = not replayed), content, the calls -- their
  * sampled bytes when the tool memory has them -- and the stop token only when no call was made.  Inkling's turn
  * has no think-mode spelling: `think` changes nothing the template writes. */
+/** server_family_ops::assistant_turn_sampled for Inkling.
+ *  @param reasoning the reasoning to replay; NULL = none
+ *  @param content the content text
+ *  @param calls the turn's calls; NULL = none
+ *  @param spans_out the client-data spans (malloc'd; NULL when none); NULL = not wanted
+ *  @param n_spans_out the span count
+ *  @return the turn's text (malloc'd), or NULL when the renderer refused it (logged) */
 char *inkling_assistant_turn_sampled(const request *, bool, const char *reasoning, const char *content,
                                      const tool_calls *calls, chat_text_span **spans_out, uint32_t *n_spans_out) {
     std::vector<inkling_tool_call_in> k;
@@ -215,6 +258,12 @@ char *inkling_assistant_turn_sampled(const request *, bool, const char *reasonin
 
 /* After a tool-call turn: its stop token, the messages from `start` (tool results authored by the calls they
  * answer, a mid-loop system message as a system block), the generation prompt. */
+/** server_family_ops::tool_result_tail for Inkling.
+ *  @param msgs the conversation's messages
+ *  @param start the first new user-side message
+ *  @param spans_out the client-data spans (malloc'd; NULL when none); NULL = not wanted
+ *  @param n_spans_out the span count
+ *  @return the tail's text (malloc'd), or NULL when refused (logged) */
 char *inkling_tool_result_tail(const request *, const chat_msgs *msgs, int start, chat_text_span **spans_out,
                                uint32_t *n_spans_out) {
     if (spans_out) { *spans_out = NULL; *n_spans_out = 0; }
@@ -233,6 +282,12 @@ char *inkling_tool_result_tail(const request *, const chat_msgs *msgs, int start
  * system turn reminded (the tool declaration and the system text, Qwen's reminder) -- is ONE tool result in the
  * template's own spelling, a <|message_tool|> text block with no author (no call was read to name it), then the
  * generation prompt.  vLLM's renderer writes no other error form (<|content_tool_error|> is never rendered). */
+/** server_family_ops::tool_error_suffix for Inkling.
+ *  @param r the request (its prompt_text supplies the system reminder)
+ *  @param detail what was malformed; NULL or empty = no detail
+ *  @param spans_out the client-data spans (malloc'd; NULL when none); NULL = not wanted
+ *  @param n_spans_out the span count
+ *  @return the suffix's text (malloc'd), or NULL when refused */
 char *inkling_tool_error_suffix(const request *r, const thinking_state *, const char *detail, chat_text_span **spans_out,
                                 uint32_t *n_spans_out) {
     std::string text = "Tool error: malformed tool call";
@@ -253,6 +308,7 @@ char *inkling_tool_error_suffix(const request *r, const thinking_state *, const 
 
 /* L303: the answer is a text block's body (<|content_text|> ... <|end_message|>); a call is an invoke_tool_json
  * block's body, {"name":NAME,"args":ARGS} in the renderer's compact JSON (tool_call_json), then its end. */
+/** Inkling's grammar shape (server_family_ops::grammar). */
 const server_grammar_shape k_grammar_inkling = {
     /* .answer_open           = */ "<|content_text|>",
     /* .answer_at_think_close = */ false,

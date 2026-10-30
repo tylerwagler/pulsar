@@ -338,8 +338,11 @@ static const server_effort_map k_effort_qwen = {
 
 /* L268: a message's content without the parser's image markers (PULSAR_IMAGE_PLACEHOLDER at image_ph_off -- the
  * offsets, not the spelling, are the authority) and where each image sits in what is left. */
+/** One message's text with its image placeholders removed (qwen_strip_image_markers). */
 struct qwen_msg_images {
+    /** The content without the placeholders. */
     std::string content;
+    /** Per image, in order: its byte offset into `content`. */
     std::vector<uint32_t> at;
 };
 
