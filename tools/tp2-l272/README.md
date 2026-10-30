@@ -11,7 +11,11 @@ Both are bit-exact by construction -- the same slices, the same kernels in the s
 new build **byte for byte against a reference build from before P4** on the same greedy requests, plus the
 engine's own per-frame cross-rank identity. Protocol v24, unchanged by L272: the reference pairs with the same frames.
 
-Hosts and launch recipe: as `tools/tp2-l264/README.md`. The plumbing is shared in `tools/tp2/lib.sh`.
+Hosts and launch recipe: the plumbing is shared in `tools/tp2/lib.sh` -- run on the head (rank 0); the worker host,
+the peer list, the two RDMA rails and the KV directory are its defaults, each overridable through the environment
+(`WORKER`, `PEERS`, `RDMA_DEV`, `RDMA_DEV2`, `KV`, `OUT`; the models: `DS`, `Q405`, `Q605`).  Both ranks run
+`pulsar-server --tp-rank R --tp-nranks 2 --tp-peers HEAD:PORT,WORKER:PORT` under a transient systemd unit, worker
+first.  The kit stops the pair's `pulsar-tp` unit first and leaves it stopped.
 
 ## 1. Build both trees on both nodes, at the same paths
 
@@ -61,7 +65,7 @@ is the verdict. The pair is left stopped: `sudo systemctl start pulsar-tp` on bo
 ## Reading a failure
 
 - **`DeepSeek TP plan` differs:** the pair's model copy is not the artifact the golden was recorded from (offsets in
-  the diff), or the plan changed. Compare `sha256sum model.safetensors.index.json` with sparky's copy first.
+  the diff), or the plan changed. Compare `sha256sum model.safetensors.index.json` with the copy the golden was recorded from first.
 - **`A/B` differs but `identity` passes:** both ranks agree, the build changed the numbers. Run the two `qa-*.json`
   side by side: the first differing token's request names the path (a dense projection: the dense door; an MoE layer:
   the routed door; the shared expert under TP: the K slice). P4c's single-box proof is the battery, so a TP-only

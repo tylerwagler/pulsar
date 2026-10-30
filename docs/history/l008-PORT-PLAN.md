@@ -1,3 +1,5 @@
+> **Historical, not maintained** (moved to docs/history/ on 2026-10-30): the L008 MMQ vendor re-sync port plan, 2026-08-13; the vendored MMQ tree it planned for was deleted in L066 (was docs/l008/PORT-PLAN.md; its patch files are still in docs/l008/). The code at the tip of `dev` is the authority.
+
 # L008 — MMQ vendor re-sync: measured port plan
 
 State of branch `l008-mmq-vendor` as of 2026-08-13. **Incomplete and does not

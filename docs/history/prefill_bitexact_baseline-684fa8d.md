@@ -1,3 +1,5 @@
+> **Historical, not maintained** (moved to docs/history/ on 2026-10-30): provenance of a superseded prefill bit-exact baseline, 2026-09-06; the Makefile now defaults to 13bcbab1 (was tests/test-vectors/; the .bin is still there). The code at the tip of `dev` is the authority.
+
 # prefill_bitexact_baseline-684fa8d.bin — provenance
 
 The committed baseline for `make cuda-prefill-gate` (see the gate section of
@@ -10,7 +12,7 @@ the top-level Makefile and `tests/prefill_bitexact_gate.cpp`).
   numerics change: every prefill logit moves; graded CLOSER to the B300 reference
   (story net -25.2%, code net -58.2% over the confident depths, 2026-09-06).
 - **Depths:** 512, 2048, 4096, 4102, 6144, 8196, 16388.  GATE_CTX 16512.
-- **Dumped:** 2026-09-06, on sparky (GB10, sm_120f, CUDA 13.3), by
+- **Dumped:** 2026-09-06, on the dev GB10 (GB10, sm_120f, CUDA 13.3), by
   `make cuda-prefill-gate-baseline PREFILL_BASELINE_REF=684fa8d` in `~/pulsar-bank`.
 - **Artifact:** the gate's `ds4flash.gguf` symlink (the blob's own header pins
   the model — a different artifact fails the header compare).

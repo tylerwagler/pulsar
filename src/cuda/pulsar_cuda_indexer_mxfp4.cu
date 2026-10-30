@@ -5,7 +5,7 @@
  * the compressed rows into a 32 KB fp16 tile) with one block-scaled GEMM that
  * consumes the cache close to its stored form.
  *
- * Design + measurements: docs/indexer-mxfp4-scorer.md
+ * Design + measurements: docs/history/indexer-mxfp4-scorer.md
  * Instruction contract:  tests/idx_mxfp4_probe.cu   (every constant below is
  *                        measured on GB10, not read off a spec)
  * Operand choice:        e2m1 for BOTH operands since L090.4 -- Q arrives as

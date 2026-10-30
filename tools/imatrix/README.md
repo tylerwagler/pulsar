@@ -1,8 +1,10 @@
-# DS4 Imatrix Pipeline
+# Imatrix collection
 
-This directory contains the calibration dataset and instructions used to build
-activation importance matrices for DeepSeek V4 Flash and Pro
-quantization (the direct container builder, tools/container, L247).
+This directory contains the calibration dataset and the tools to collect
+activation importance matrices (llama.cpp's legacy `.dat` format) with the
+`pulsar` development CLI (`make pulsar`).  Two families implement collection
+(`PULSAR_FAMILY_CAP_IMATRIX`): DeepSeek V4 (Flash / Pro) and Qwen4-exp
+(Qwen3.8-Flash-Next).
 
 The current imatrix target is the routed MoE path.  Flash has 43 layers and
 256 routed experts per layer.  Pro has 61 layers and 384 routed experts per
@@ -15,12 +17,15 @@ layer.  Both variants expose three routed expert tensors per layer:
 For gate/up tensors, the collector records the squared FFN-normalized input
 activation.  For down tensors, it records the squared routed SwiGLU row after
 route weighting.  The result tells the quantizer which input columns are used
-more heavily by the actual DS4 inference graph.
+more heavily by the actual inference graph.
 
 ## 1. Build The Calibration Dataset
 
-The tracked dataset is in `tools/imatrix/dataset/`.  Regenerate it from
-the repository root with:
+The tracked dataset is in `tools/imatrix/dataset/`.  Treat the tracked files as
+the dataset: the generator below still names the upstream ds4 source files
+(`ds4.c`, `ds4_server.c`, `ds4_eval.c`, `metal/*.metal`, ...) that this tree no
+longer has and skips missing ones silently, so re-running it does not reproduce
+the tracked prompts.  The generator is:
 
 ```sh
 python3 tools/imatrix/dataset/build_ds4_imatrix_dataset.py
@@ -32,24 +37,24 @@ The important output is:
 tools/imatrix/dataset/rendered_prompts.txt
 ```
 
-It contains DS4-rendered chat prompts, separated by visible
+It contains DeepSeek-rendered chat prompts, separated by visible
 `DS4_IMATRIX_PROMPT` markers.  The prompts include:
 
-- C/CUDA source-review prompts from this repository.
+- C/CUDA source-review prompts from the upstream ds4 tree at generation time.
 - Long-context snippets.
-- Agent/tool-call prompts using DS4's DSML syntax.
+- Agent/tool-call prompts using DeepSeek's DSML syntax.
 - Language/prose rewriting, summarization, extraction, and translation prompts.
-- `ds4-eval` GPQA Diamond, SuperGPQA, and AIME2025 benchmark prompts.
+- `pulsar-eval` GPQA Diamond, SuperGPQA, and AIME2025 benchmark prompts.
 - Both thinking and non-thinking assistant prefixes.
 
-The current tracked dataset has 4682 rendered prompts and roughly 2.91M tokens
-by the coarse bytes/4 estimate.  Check
+The current tracked dataset has 4690 rendered prompts (manifest version 4) and
+roughly 2.92M tokens by the coarse bytes/4 estimate.  Check
 `tools/imatrix/dataset/manifest.json` for the exact generated-file
 summary.
 
 ## 2. Collect The Imatrix
 
-Use the DS4 runtime itself to collect routed MoE activation statistics.  The
+Use the `pulsar` CLI to collect routed MoE activation statistics.  The
 collector uses the loaded checkpoint's metadata, so the same command shape works for
 Flash and Pro.
 
@@ -57,9 +62,9 @@ Flash example:
 
 ```sh
 ./pulsar \
-  -m /srv/models/<checkpoint-dir> \
+  -m /path/to/<container-dir> \
   --imatrix-dataset tools/imatrix/dataset/rendered_prompts.txt \
-  --imatrix-out ../deepseek-v4-quants/imatrix/DeepSeek-V4-Flash-chat-v2-routed-moe-ds4-1p5m.dat \
+  --imatrix-out DeepSeek-V4-Flash-routed-moe.dat \
   --ctx 32768
 ```
 
@@ -67,9 +72,9 @@ Pro example with a smaller calibration budget:
 
 ```sh
 ./pulsar \
-  -m /srv/models/<checkpoint-dir> \
+  -m /path/to/<container-dir> \
   --imatrix-dataset tools/imatrix/dataset/rendered_prompts.txt \
-  --imatrix-out ../deepseek-v4-quants/imatrix/DeepSeek-V4-Pro-Instruct-routed-moe-ds4-small.dat \
+  --imatrix-out DeepSeek-V4-Pro-routed-moe-small.dat \
   --imatrix-max-prompts 16 \
   --imatrix-max-tokens 32768 \
   --ctx 32768
@@ -79,7 +84,7 @@ Useful smoke-test limits:
 
 ```sh
 ./pulsar \
-  -m /srv/models/<checkpoint-dir> \
+  -m /path/to/<container-dir> \
   --imatrix-dataset tools/imatrix/dataset/rendered_prompts.txt \
   --imatrix-out /tmp/ds4-test.imatrix.dat \
   --imatrix-max-prompts 1 \
@@ -106,7 +111,7 @@ Collection runs on one GPU (a tensor-parallel engine refuses).  `read_dat.py FIL
 python3 tools/imatrix/read_dat.py out.dat --quiet --expect-substr experts
 ```
 
-The output format is llama.cpp's legacy binary `.dat` imatrix format.  DS4 packs
+The output format is llama.cpp's legacy binary `.dat` imatrix format.  DeepSeek packs
 per-expert vectors into one entry per routed expert tensor:
 
 ```text
@@ -119,41 +124,20 @@ Flash's 256.
 
 ## 3. Using the imatrix
 
-The GGUF quantizer this section used to describe was archived 2026-09-24
-(tag `archive/gguf-tooling-2026-09-24`, L247).  The `.dat` file is consumed by the
-direct container builder's quantising producers (tools/container).
-
-## 4. Evaluate
-
-Useful local tools:
-
-```text
-tools/quality-testing/
-```
-
-`tools/quality-testing/` can score local GGUFs against official DeepSeek
-API continuations by target-token negative log likelihood.
-
-The Q4 imatrix file uploaded to Hugging Face was tested on 100 official
-DeepSeek V4 Flash continuations:
-
-```text
-old Q4 avg NLL:         0.177357819
-Q4 imatrix avg NLL:     0.173895148
-relative NLL change:   -1.95%
-case wins:              54 imatrix / 46 old
-first-token matches:    83 imatrix / 81 old
-avg greedy LCP:         12.21 imatrix / 11.94 old
-```
+Nothing in this tree consumes the `.dat` today.  The GGUF quantizer that did
+(`deepseek4-quantize`) was archived 2026-09-24 (tag
+`archive/gguf-tooling-2026-09-24`, L247), and the direct container builder
+(`tools/container`) has no imatrix-weighted producer: its routed-expert formats
+come from the source checkpoint (`cutlass_mxfp4` from DeepSeek's FP4) or from an
+exllamav3 EXL3 pack.  `act_cache_to_imatrix_dat.py` converts a PrismaQuant
+activation cache into the same `.dat` layout, and `read_dat.py` parses and
+validates any `.dat` either tool writes.
 
 ## Compatibility
 
-The `.dat` file is intentionally in llama.cpp's legacy imatrix format, so the
-data is not conceptually tied to DS4.  In practice, it is immediately useful
-only with a quantizer that understands DS4's tensor names and packed per-expert
-entries.  The current `deepseek4-quantize` tooling does that.
-
-Other quantizers can use the same imatrix if they implement the same
-name mapping and per-expert slicing convention.  Without that DS4-specific
-mapping, a generic imatrix loader will see valid data but will not know how to
-apply the packed routed-expert vectors correctly.
+The `.dat` file is llama.cpp's legacy imatrix format.  DeepSeek entries are
+named by the engine's binding names (`blk.N.ffn_{gate,up,down}_exps.weight`)
+and pack every expert's vector into one entry, so a quantizer must slice
+`n_columns` values per expert; a generic imatrix loader will read valid data
+but will not know how to apply the packed routed-expert vectors.  Qwen entries
+are named by the checkpoint's tensor names.

@@ -50,7 +50,7 @@ __global__ static void bench_mxf8f6f4(float *sink, int iters) {
     if (threadIdx.x == 0) sink[blockIdx.x] = d0 + d1 + d2 + d3;
 }
 
-/* The attention question (docs/engine-perf-map.md): attention is 22-25% of
+/* The attention question (docs/history/engine-perf-map.md): attention is 22-25% of
  * prefill with pipe_tensor at 0%, and moving it onto the tensor cores means
  * choosing an operand format.  pulsar_cuda_attn_f16.cu's header measures what
  * each format COSTS; these two measure what fp16 and bf16 BUY, against the

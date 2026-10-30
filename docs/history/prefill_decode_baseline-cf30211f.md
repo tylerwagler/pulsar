@@ -1,3 +1,5 @@
+> **Historical, not maintained** (moved to docs/history/ on 2026-10-30): provenance of a superseded prefill-decode baseline, 2026-09-11; the Makefile now defaults to 13bcbab1 (was tests/test-vectors/; the .bin is still there). The code at the tip of `dev` is the authority.
+
 # prefill_decode_baseline-cf30211f.bin — provenance
 
 The committed baseline for `make cuda-prefill-decode-gate` (L181): the full-vocab
@@ -22,7 +24,7 @@ the depths 1001, 4102 and 8197.  Magic `DS4PFXD1`; otherwise the prefill blob's 
   graded 3.1e-8..5.3e-9 against 4d0172e), and the top-1 is stable at every depth.
 - **Measured:** locked-clock decode +1.8% @2k / +2.0% @8k against d6d3feb
   (`pulsar-bench`, teacher_forced_corpus, 128 greedy tokens, two rounds).
-- **Dumped:** 2026-09-11, on sparky (GB10, sm_120f, CUDA 13.3), by
+- **Dumped:** 2026-09-11, on the dev GB10 (GB10, sm_120f, CUDA 13.3), by
   `make cuda-prefill-decode-gate-baseline PREFILL_DECODE_BASELINE_REF=cf30211f`
   in `~/pulsar-bank`.
 - **Artifact:** the gate's `ds4flash.gguf` symlink (the blob's own header pins

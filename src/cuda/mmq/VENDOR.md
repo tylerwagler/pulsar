@@ -20,10 +20,22 @@
 >
 > | file | why it survives |
 > |---|---|
-> | `mma.cuh` | `ggml_cuda_mma::tile` / `load_ldmatrix`, used by our D2R GEMM |
-> | `mmid.cu` + `mmid.cuh` | `#include`d by `ds4_mmid.cu` because upstream's `launch_mm_ids_helper<N>` is file-static |
-> | `ggml-common.h` | `block_iq2_xxs` and friends -- the on-disk quant layouts |
-> | `ggml*.h`, `vendors/` | redirect headers the above need |
+> | `mma.cuh` | `ggml_cuda_mma::tile` / `load_ldmatrix`, used by our D2R GEMM (trimmed 2026-08-19 to the live slice: 1,456 -> 241 lines; no longer byte-identical to the pin) |
+> | `mmid.cu` + `mmid.cuh` | `#include`d by `ds4_mmid.cu` because upstream's `launch_mm_ids_helper<N>` is file-static (carries ds4 patches) |
+> | `ggml-common.h` | `QK8_1` and the `iq2xxs_grid` table (trimmed to 103 lines) |
+> | `ds4_cuda_env.cuh` | the reachable extract of upstream's `common.cuh` (derived work) |
+>
+> The `ggml.h` / `ggml-impl.h` / `ggml-cuda.h` redirect headers and `vendors/`
+> are gone too (2026-08-19).  The adapter that remains is ours:
+> `ds4_ggml_stubs.{h,cu}`, `ds4_mmq.{h,cu}`, `ds4_mmid.*`, `ds4_mmq_d2r.*`,
+> `ds4_act_block.cuh`, `ds4_quantize_e4m3.cu`, and the EXL3 / Tessera files
+> beside them (`exl3_moe*`, `ds4_exl3_*`, `qwen_exl3_dense_prefill.cu`,
+> `pulsar_tessera.*`; Tessera's own note is `VENDOR-TESSERA.md`).
+>
+> **Everything from "File inventory" down to "pulsar-side provenance" is the
+> as-imported record** (2026-08-07 .. 2026-08-13): file names, line counts, the
+> testing matrix and the performance table describe the tree as vendored, not
+> as it is now.
 >
 > **`common.cuh` and `unary.cuh` are GONE (2026-08-18, L066 step 3.)**  `unary.cuh`
 > was 114 lines of declarations for functions we never implemented or called --
@@ -36,7 +48,7 @@
 > across the call, so sharing one region would alias live buffers).  With the pool
 > gone the remaining surface is small enough to state: device info, `CUDA_CHECK`,
 > five constants, two arch predicates, two warp reduces and `memcpy_1` -- and it
-> now lives in `ds4_cuda_env.cuh` (256 lines), which is still derived work and
+> now lives in `ds4_cuda_env.cuh` (297 lines today), which is still derived work and
 > still tracked below.
 >
 > **Constants that outlived their files** now live in `ds4_act_block.cuh`:
@@ -175,8 +187,10 @@ where MMQ really does quantise activations to q8_1; in this fork it is not.
 | `mmvq.cuh`      | +18 / −0   | matching prototype exposure + the same gate |
 | `mmid.cuh`      | +4 / −0    | prototype exposure for the above |
 
-Byte-identical to the pin, and therefore free to replace outright:
-`mma.cuh`, `ggml-common.h`, `vendors/cuda.h`, and the `ds4_cuda_env.cuh` extract.
+Byte-identical to the pin at the time of that measurement: `mma.cuh`,
+`ggml-common.h`, `vendors/cuda.h`, and the `ds4_cuda_env.cuh` extract.  Since
+2026-08-19 `mma.cuh` and `ggml-common.h` are trimmed extracts and
+`vendors/cuda.h` is gone, so none of them can be replaced outright any more.
 
 ## Re-syncing with upstream
 
@@ -269,9 +283,8 @@ default `DS4_CUDA_MMQ_MOE_MIN_TOKENS=2` (legacy decode preserved):
 | 16384  | 357.99          | 1001.29    | **2.80x**  | 38.71            | 37.86       | 0.978x    |
 
 Sustained ~2.80x prefill speedup across the swept context range; gen
-within 2.5% of baseline (run-to-run variance).  See `local/docs/`
-(auto-round companion repo) for the full Phase 0-7 execution log,
-parity-test output, and detailed plan.
+within 2.5% of baseline (run-to-run variance).  (Measured by the fork this
+tree was imported from; its execution log is not in this repository.)
 
 ---
 
@@ -311,9 +324,9 @@ Result: routed IQ2 down 33.24 -> 8.98 ms/layer, and all IQ2 MoE moved from
 
 The llama.cpp files may be refreshed from upstream normally. The four files
 above carry pulsar-only additions that are **purely additive** (new symbols and
-one new dispatch branch); re-apply them after any re-sync.
-`gguf-tools/d2r_iq2_single_launch.inc` and `gguf-tools/patch_iq2_d2r_single.py`
-reproduce both mechanically.
+one new dispatch branch); re-apply them after any re-sync.  (The
+`gguf-tools/` scripts that reproduced them mechanically were archived with the
+GGUF tooling, tag `archive/gguf-tooling-2026-09-24`.)
 
 ## Local modifications: `ds4_mmq.cu` -- the EXL3 arms left (task #44)
 

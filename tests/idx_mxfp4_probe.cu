@@ -1,4 +1,4 @@
-/* Block-scaled MMA probe for the indexer scorer (design: docs/indexer-mxfp4-scorer.md).
+/* Block-scaled MMA probe for the indexer scorer (design: docs/history/indexer-mxfp4-scorer.md).
  *
  * Modelless, standalone, no CUTLASS. Answers the three make-or-break questions
  * BEFORE any kernel gets written, following the precedent of the MoE's
@@ -35,7 +35,7 @@
  *        tests/idx_mxfp4_probe.cu
  *   /tmp/idx_mxfp4_probe
  *
- * MEASURED CONTRACT (all phases pass; see docs/indexer-mxfp4-scorer.md):
+ * MEASURED CONTRACT (all phases pass; see docs/history/indexer-mxfp4-scorer.md):
  *   A (e4m3)  : one value per byte at bit 0, decodes to the standard table.
  *   B (e2m1)  : nibble at bits [5:2] of its byte; decodes to 4x the e2m1 table.
  *   ue8m0     : value = 2^(byte - 128)  -- NOT the spec's 127 bias.

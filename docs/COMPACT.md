@@ -1,5 +1,10 @@
 # Pulsar Agent Context Compaction
 
+How `pulsar-agent` (the native terminal coding agent, a development tool:
+`make pulsar-agent`) compacts its context.  The constants below are
+`AGENT_COMPACT_*` in `src/agent/pulsar_agent_internal.h`; the loop is
+`src/agent/compaction.cpp`.
+
 The agent should compact context before long sessions become brittle, and also
 when a tool result would otherwise not fit.
 
@@ -24,7 +29,7 @@ Compaction uses the live session once, before rewriting the prompt:
    are not part of the user-visible session.
 4. Take the recent tail verbatim by scanning backward from `BOTTOM` up to 10%
    of the configured context, capped at 50000 tokens. Align the tail to a
-   rendered `<｜User｜>` boundary when possible.
+   rendered user-turn boundary (DeepSeek's `<｜User｜>`) when possible.
 5. Rebuild the transcript as:
    - system prompt and tool contract
    - compacted durable-state summary
@@ -68,7 +73,7 @@ During compaction the terminal should make the state explicit:
 - stream the generated summary so the user can see what is retained
 - then show the normal prefill progress while the compacted context is rebuilt
 
-## Validation Log
+## Validation Log (at the time the feature landed)
 
 - With `--ctx 12000`, read `README.md` lines 1-500, then let the model call
   `more count=500`. The second tool result did not fit, so hard compaction ran,

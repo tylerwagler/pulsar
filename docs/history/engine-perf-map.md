@@ -1,3 +1,5 @@
+> **Historical, not maintained** (moved to docs/history/ on 2026-10-30): the prefill (and superseded decode) time map of the 0731 GGUF-era build, measured 2026-08-08..10, checked 2026-09-01 (was docs/engine-perf-map.md). The code at the tip of `dev` is the authority.
+
 # Where prefill time actually goes
 
 > **Scope and currency (checked 2026-09-01).** This is a PREFILL map. Its ranked
@@ -43,9 +45,9 @@
 > only the single-stream number, read it as a statement about 2026-08-08.
 
 
-Measured 2026-08-08 on sparky (GB10, sm_121, 48 SMs), `pulsar-bench` at a
+Measured 2026-08-08 on the dev GB10 (GB10, sm_121, 48 SMs), `pulsar-bench` at a
 4001-token pure prefill (`--gen-tokens 0`) against
-`/srv/models/v5mx4-0731-mmqaligned.gguf`, nsys `cuda_gpu_kern_sum`.
+`/path/to/models/v5mx4-0731-mmqaligned.gguf`, nsys `cuda_gpu_kern_sum`.
 
 Reproduce:
 
@@ -488,7 +490,7 @@ than by refusing to batch. The paragraph above is history, not a task.
   shuffle reduction.  They look like the pack did but are not the same bug.
 - The indexer scorer GEMM: 35 TMAC/s against a measured 125 TMAC/s instruction
   ceiling, and the whole indexer complex is ~2% of prefill.  See
-  `docs/indexer-mxfp4-scorer.md`.
+  `docs/history/indexer-mxfp4-scorer.md`.
 
 ## Method note
 

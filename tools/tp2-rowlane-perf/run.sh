@@ -10,7 +10,7 @@
 # Both dirs at the same paths on both nodes, each built with `make pulsar pulsar-server`.  Run on the HEAD
 # (ca1070wk30008) as the serving user.  Settings (env): STREAMS ("1 2 4"), PP (512), TG (256), ROUNDS (2),
 # V4FIX (~/models/vexp-tp-fixture), V41FIX (~/models/v41-tp1-fixture-mx), MODEL (~/models/DeepSeek-v4-Flash).
-# See tools/tp2-rowlane-perf/README.md.  The pair plumbing is tools/tp2/lib.sh.
+# See docs/history/tp2-rowlane-perf-README.md.  The pair plumbing is tools/tp2/lib.sh.
 set -u
 A=${1:?usage: run.sh <build A dir> <build B dir>}
 B=${2:?usage: run.sh <build A dir> <build B dir>}

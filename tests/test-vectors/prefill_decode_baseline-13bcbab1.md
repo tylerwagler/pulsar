@@ -10,11 +10,11 @@ which is why it is anchored separately from `prefill_bitexact_baseline`.
   same reason as the prefill twin (see `prefill_bitexact_baseline-13bcbab1.md`):
   the 0731 NVFP4 KV row's divides are IEEE now, a deliberate numerics change
   accepted by Tyler's 2026-10-13 override.
-- **Artifact:** `/srv/models/vexp-safetensors` (the battery's `FRONTIER_MODEL`).
+- **Artifact:** the Vision-Exp container (the battery's `FRONTIER_MODEL`).
 - **Depths:** 1001, 4102, 8197.
-- **Dumped:** 2026-10-13, on sparky (GB10, sm_120f, CUDA 13.3), by
+- **Dumped:** 2026-10-13, on a GB10 (sm_120f, CUDA 13.3), by
   `make cuda-prefill-decode-gate-baseline PREFILL_DECODE_BASELINE_REF=13bcbab1
-  FRONTIER_MODEL=/srv/models/vexp-safetensors`, 0 build warnings.
+  FRONTIER_MODEL=<the Vision-Exp container>`, 0 build warnings.
 - **Size / sha256:** 1551448 bytes /
   `5c94215d3c1730f74d62bf9bc7feff1d7b138add14479451158d83749b5ad199`
 - **Superseded blob:** `prefill_decode_baseline-f5bea7aa.bin` is deleted with

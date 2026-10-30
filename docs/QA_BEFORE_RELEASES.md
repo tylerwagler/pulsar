@@ -8,7 +8,7 @@ machine.
 
 This fork is CUDA-only and targets the DGX Spark (GB10, ~128 GB unified
 memory); all release testing happens on that host.  Do not run multiple huge
-model processes at the same time.  Record the commit, GGUF file, context size,
+model processes at the same time.  Record the commit, checkpoint (container) path, context size,
 and any non-default flags for every manual run.
 
 ## 1. Repository And Build Sanity
@@ -50,7 +50,7 @@ and any non-default flags for every manual run.
 **Run them with one command:**
 
 ```
-make gates FRONTIER_MODEL=/srv/models/<checkpoint-dir>
+make gates FRONTIER_MODEL=/path/to/<checkpoint-dir>
 ```
 
 It runs every gate below, continues past failures so one break does not hide
@@ -79,10 +79,12 @@ model.  Record pass/fail against the release commit:
   indexed, decode-batch, one-row), banked cross-session KV-leak isolation
   (modelless).
 - `make cuda-prefill-gate` — full-vocab frontier byte-compare against the
-  `PREFILL_BASELINE_REF` blob.  **The baseline ref must postdate type-43**
-  (the aligned-MMQ pre-store): a pre-type-43 baseline build cannot load the
-  shipped artifact and the gate cannot certify the release.  Rebuild the blob
-  with `make cuda-prefill-gate-baseline` after bumping the ref.
+  `PREFILL_BASELINE_REF` blob (default `13bcbab1`, the L292 NVFP4
+  exact-divide fix; provenance in `tests/test-vectors/`).  **The baseline
+  build must be able to load the shipped artifact**: a baseline ref that
+  predates the artifact's layouts or payload version cannot run at all, and
+  the gate cannot certify the release.  Rebuild the blob with
+  `make cuda-prefill-gate-baseline` after bumping the ref.
 - `make cuda-evict-restore-gate` — bank evict/restore bit-identity.
 - `make cuda-rewind-gate` — compressor frontier position-truth across ghost
   rewinds (L120): counters equal pos/ratio at every mod-4 residue and the
@@ -108,7 +110,7 @@ model.  Record pass/fail against the release commit:
 - `make cuda-spec-sampling-gate` — speculative-sampling chi-square exactness.
 
 **The battery runs the production drafters (L305, 2026-10-21).**  Qwen's hosted model and every Qwen gate default
-(`QWEN_GATE_MODEL`, `DFLASH2_GATE_MODEL`) are the served pack, `/srv/models/qwen38fn-dflash2` (DFlash2, the EXL3 K5
+(`QWEN_GATE_MODEL`, `DFLASH2_GATE_MODEL`) are the served pack, `qwen38fn-dflash2` (DFlash2, the EXL3 K5
 head, no MTP module); Nemotron's drafter gate is LiLiCorr's, DeepSeek's is DSpark's.  **MTP is a dormant lane: not
 release-blocking, tested on MTP-path changes only.**  `mtp-spec-gate` is out of `make gates` (its runner entry is
 gone; the target builds and runs by hand on `MTP_GATE_MODEL`, the Nemotron mini), and `make gates-dev` runs it when a
@@ -172,7 +174,7 @@ on an engine it now shares.
 | leg | before | now |
 |---|---|---|
 | constrained-live, server-live, server-abandon (DeepSeek, Qwen) | own servers after `make gates`, 4 loads a model | `live-legs`, the last section of `make gates`: the model's shared server; constrained's isolation on its hooks instance |
-| L312 stall check | `~/flare-work` script + `~/l312w/tbt2.py`, own server (262k ctx, 16 banks, no disk) | `tests/stall_live.py`, Qwen's shared server, first (production's shape: 262k ctx, 16 banks, 64 GB disk tier) |
+| L312 stall check | an out-of-tree script, own server (262k ctx, 16 banks, no disk) | `tests/stall_live.py`, Qwen's shared server, first (production's shape: 262k ctx, 16 banks, 64 GB disk tier) |
 | prefix-turns reply / side (Qwen) | 2 servers each (warm, cold) | shared server; the reference on Qwen's one fresh instance (0 cached tokens asserted); L316's instrument (thinking echoed, one prompt asserted) |
 | preempt-exact (Qwen) | 4 servers (probe, count, preempt, alone) | probe + counts on the shared server, the preemption on the hooks instance (budget override), A alone on the fresh instance |
 | opencode-turns (Nemotron) | 2 servers | shared + fresh (Nemotron has one leg) |
@@ -187,7 +189,7 @@ on an engine it now shares.
   after a `--model` restricts a hosted model to its own legs; a runner entry marked DEV runs only when
   `--only` names it (gates-dev), and every run lists them by name.  A hosted model none of whose entries the
   selection takes is not opened.
-- *The live legs* run at each model's production flags (`tests/live_legs.py` MODELS, from `~/pulsar-serve/*.env`:
+- *The live legs* run at each model's production flags (`tests/live_legs.py` MODELS, from the production serve env files:
   all PULSAR_MSEQ_BANKS=16; DeepSeek 1M ctx; Qwen 262k ctx, 64 GB disk tier; Nemotron 1M ctx, LiLiCorr, 64 GB disk
   tier).  `tests/live_legs.py`, `make live-legs`, `LIVE_LEGS=a,b` for a subset: per model the
   shared server, then one instance with every server-wide test hook its legs need (only if one does), then
@@ -199,7 +201,7 @@ on an engine it now shares.
   mutated TU per moved leg (`tests/runner_mutants.py`, plus L307's scratch-poison mutant), each run with the
   selection that must catch it.
 
-**Before (2026-10-13, 1b33c1d4, sparky `~/qland2-battery-1013-2134`):** 3,324 s wall, of which 3,240 s
+**Before (2026-10-13, 1b33c1d4):** 3,324 s wall, of which 3,240 s
 suite: the runner 2,629 s (52 sub-gates, 9 engine opens), the serial GPU targets in front of it 611 s.
 The slowest sub-gates:
 
@@ -244,7 +246,7 @@ The slowest sub-gates:
   own-engine tests so they reuse the shared engine.  Five model loads -> three.  pulsar_test, pulsar,
   pulsar_agent_test and the cuda-regression binaries are `gates` prerequisites, built in the one parallel
   make before the timed loop.
-- **Measured per piece** (2026-10-14, a targeted run on sparky, not a battery: the changed runner gates on
+- **Measured per piece** (2026-10-14, a targeted run on the GB10, not a battery: the changed runner gates on
   both hosted models, cuda-regression and unit-test-gate): decode-reference story 392 -> 93 s, code 67 -> 31;
   dspark-batch depth1 30 -> 8, depth4 30 -> 9, wide 47 -> 25; tp-head-split 20 -> 0; cuda-regression 262 -> 77;
   unit-test-gate 231 -> 167 (its compile now in the prerequisite build); 4 engine opens for two hosted models.
@@ -265,7 +267,7 @@ not hygiene):
 - cuda-head-graph-replay-gate's run C (26 s): it only proves eager determinism, the premise of B == A.
 - The spec-sampling oracles' 1,250 trajectories per mode (L163 already halved them).
 
-**Outside `make gates` (2026-10-13; L317 moved the live legs into it):** the landing scripts' extra legs (`~/*-battery.sh` after `make gates`:
+**Outside `make gates` (2026-10-13; L317 moved the live legs into it):** the landing scripts' extra legs (run after `make gates`:
 `session-contract-gate-qwen`, `cuda-chunk-neutrality-gate` and `cuda-spec-sampling-gate` on
 `$(QWEN_GATE_MODEL)`, ~12 min on 2026-10-13) repeat what the runner already runs on the hosted Qwen
 (`session-contract-gate [Qwen4-exp]`, `cuda-chunk-neutrality-gate [Qwen4-exp]`,
@@ -281,15 +283,15 @@ alone -- and opencode-turns.
 
 ### The GPU queue (gpuq)
 
-Sparky's GPU is shared through `gpuq` (`tools/gpuq/`, installed as `~/bin/gpuq`, daemon `gpuq.service`, a
+The GB10's GPU is shared through `gpuq` (`tools/gpuq/`, installed by `tools/gpuq/install.sh` as `~/bin/gpuq`, daemon `gpuq.service`, a
 systemd user unit; spool `~/.gpuq/`).  It replaces `tools/gpu-run.sh` and `tools/gpu-lock-status.sh` (#43)
 and a bare `flock -o ~/gpu.lock`, which is not FIFO (seven waiters ran in random order on 2026-10-14), knows
 no job classes and no memory, and shows little.
 
     gpuq submit --class short --timeout 20m --wait -- make gates-dev PATHS=src/engine/session.cpp
-    gpuq submit --class quiet --timeout 75m --wait -- ~/qland3-battery.sh <sha>     # a battery
+    gpuq submit --class quiet --timeout 75m --wait -- ./battery.sh <sha>             # a battery
     gpuq submit --class long --timeout 20h --mem 40G --min-hold 1h --yield-grace 90m \
-         --label inkling-k3 -- bash ~/inkling/runs/k3_slice.sh                      # prints the job id
+         --label my-long-job -- bash ./long_job.sh                                     # prints the job id
     gpuq status [--json]    gpuq log [-f] ID    gpuq cancel ID
 
 - **Classes, in priority order.**  `quiet` > `short` > `long`; FIFO within a class; one job at a time,
@@ -352,24 +354,27 @@ no job classes and no memory, and shows little.
   a shim that holds the lock and writes the outcome, and the next daemon re-adopts live shims, finalizes
   those that finished while it was down, and marks the rest lost (killing what is left of them).  Every
   state file is written atomically; every scheduling decision is in `~/.gpuq/gpuq.log` and the journal.
-  The user unit needs `loginctl enable-linger claude` to outlive the last login session.
-- **Tests.**  `python3 tools/gpuq/test_gpuq.py -v` on Sparky (scratch in `~/gpuq-test/`): a real daemon per
+  The user unit needs `loginctl enable-linger $USER` to outlive the last login session.
+- **Tests.**  `python3 tools/gpuq/test_gpuq.py -v` on the GPU host (scratch in `~/gpuq-test/`): a real daemon per
   test in test mode (`GPUQ_TEST=1` with its own `GPUQ_HOME`, `GPUQ_LOCK`, `GPUQ_MARKER`, a fake
   `GPUQ_MEMINFO` and drop_caches command), dummy jobs, no GPU, ~75 s.  Install: `tools/gpuq/install.sh`.
 - **Spool format, version 1, and the v2 plan.**  Every job record, outcome and the daemon state carry
-  `"version": 1`, and every job names its resources (`"resources": ["sparky:gpu0"]`, from the hostname;
-  `--gpus gpu0` or `--gpus sparky:gpu0`).  The lock and the memory pool are per resource; v1 owns one
+  `"version": 1`, and every job names its resources (`"resources": ["HOST:gpu0"]`, HOST from the hostname;
+  `--gpus gpu0` or `--gpus HOST:gpu0`).  The lock and the memory pool are per resource; v1 owns one
   resource per host and refuses any other by name.  v2 (not built): a coordinator reads several hosts'
   spools over ssh (`~/.gpuq/jobs/*.json`, `state.json`) and adds gang jobs that need every listed resource
-  at once (the two-Spark pair: `--gpus sparky:gpu0,spark2:gpu0`), taking each host's lock before starting.
+  at once (a two-Spark pair: `--gpus hostA:gpu0,hostB:gpu0`), taking each host's lock before starting.
 
 
-## 3. Flash Inference Path
+## 3. Inference Path (CLI)
 
-Use the served Flash checkpoint that 128 GB users run.
+Use the shipped checkpoint of each family the release serves; the steps below
+are written for DeepSeek V4 Flash (the logprob, thinking-effort and
+long-context recall tests are DeepSeek-specific).
+
 
 - One-shot CLI:
-  `./pulsar -m /srv/models/<checkpoint-dir> --ctx 32768 --nothink -p "Explain C pointers in one paragraph."`
+  `./pulsar -m /path/to/<checkpoint-dir> --ctx 32768 --nothink -p "Explain C pointers in one paragraph."`
 - Thinking and max-thinking prompts:
   run one short coding prompt with default thinking and one with max thinking.
 - Long-context recall:
@@ -403,8 +408,10 @@ Disk KV cache bugs are high impact for server users.
 The server must keep compatibility across OpenAI, Responses, and Anthropic
 clients.
 
-- `GET /v1/models/deepseek-v4-flash` and `GET /v1/models/deepseek-v4-pro`
-  should both serve whichever GGUF is loaded.
+- `GET /v1/models` lists exactly the loaded model's served id
+  (`deepseek-v4-flash` / `deepseek-v4-pro`, `qwen3.8-flash-next`,
+  `nemotron-3.5-super`, `inkling-small`, ...), and `GET /v1/models/<id>`
+  answers for that id only (any other id is a 404).
 - Test OpenAI chat completion, OpenAI Responses, and Anthropic messages.
 - Test SSE streaming with thinking enabled and disabled.
 - Test keepalive during long prefill and confirm clients do not time out.
@@ -450,15 +457,12 @@ The agent is the most stateful component.  Test it manually, not only by build.
   status bar fill to terminal width, syntax highlighting in Markdown/code blocks,
   and SSH/remote terminal flicker.
 
-## 7. Download Script And Model Files
+## 7. Model Files
 
-- Test `download_model.sh` in a temporary directory so local weights are not
-  overwritten.
-- Test one Flash target enough to verify URL, resume, Hugging Face CLI/curl
-  behavior, file naming, and symlink policy.
-- Verify legacy removed targets fail clearly.
-- Verify README model names match the script and Hugging Face repository.
-- Run the container audit on every shipped checkpoint (`tools/container`, L247): every
+- Verify the README's model names and Hugging Face repository names match what
+  is published, and that a fresh `hf download` of each shipped checkpoint loads.
+- Run the container audit on every shipped checkpoint
+  (`python3 tools/container/build.py audit --out DIR`, L247): every
   tensor declared in the layout its kernel reads, no plain twin of a pre-formatted
   layout, the expert stacks contiguous.  (The GGUF-era `audit_artifact_types.py` was
   archived 2026-09-24 at tag `archive/gguf-tooling-2026-09-24`.)
@@ -508,7 +512,7 @@ Do not sign off until:
 
 - `make test` and `make cuda-regression` passed on the GB10 host.
 - The CUDA gates ledger (section 2) passed against the release commit and the
-  shipped artifact, with a post-type-43 prefill-gate baseline.
+  shipped artifact, with a prefill-gate baseline (`PREFILL_BASELINE_REF`) whose build loads the shipped artifact.
 - The Flash inference path (CLI, thinking modes, long-context recall) was
   exercised.
 - Disk KV cache was exercised.
