@@ -264,6 +264,7 @@ typedef struct pulsar_gpu_sync_stats {
     uint64_t stream_syncs;   ///< pulsar_gpu_end_commands: the stream drained
     uint64_t device_syncs;   ///< pulsar_gpu_synchronize
     uint64_t d2h;            ///< blocking device -> host copies (tensor reads, the step-end flag reads)
+    /** Bytes moved by the blocking device -> host copies counted in d2h. */
     uint64_t d2h_bytes;
     uint64_t h2d;            ///< blocking host -> device copies (tensor writes, flag clears)
 } pulsar_gpu_sync_stats;
@@ -2455,11 +2456,17 @@ enum {
 /** One row's draw: the request's knobs as it carries them (the sampler clamps them as the host's always did), the
  *  key (pulsar_sample_key at the token's index), the flags, and the row of the token mask it reads. */
 typedef struct pulsar_gpu_sample_req {
+    /** Softmax temperature; <= 0 = greedy (the argmax).  Not finite: the row refuses (REFUSED_KNOB) unless greedy. */
     float temperature;
+    /** Nucleus mass; outside (0, 1] = 1 (off). */
     float top_p;
+    /** Min-p floor relative to the best token's probability; < 0 = 0 (off). */
     float min_p;
+    /** Top-k cut; <= 0 = off, clamped to 1024. */
     int32_t top_k;
+    /** The draw's random key: pulsar_sample_key at the token's index in the request's stream. */
     uint64_t key;
+    /** PULSAR_GPU_SAMPLE_* flag bits (PULSAR_GPU_SAMPLE_GREEDY). */
     uint32_t flags;
     uint32_t mask_row;   ///< row of the launch's mask (bit i of word i/32 set = token i allowed), or PULSAR_GPU_SAMPLE_NO_MASK
     int32_t probe;       ///< a token whose emitted probability the row reports (a verify row's draft; L301), or -1
@@ -2471,6 +2478,7 @@ typedef struct pulsar_gpu_sample_out {
     int32_t token;     ///< -1 = refused
     uint32_t status;   ///< PULSAR_GPU_SAMPLE_*
     float probe_p;     ///< the probe's probability in the emitted distribution (0 when not emitted; greedy: 1 for the argmax)
+    /** Padding to 16 bytes; carries nothing. */
     uint32_t pad_;
 } pulsar_gpu_sample_out;
 
@@ -2495,20 +2503,29 @@ int pulsar_gpu_sample_rows(const pulsar_gpu_tensor *logits, uint64_t logits_offs
 /** A verify run for the device walk: the sampler rows [row0, row0 + k] of one bank (the draw after the base and
  *  after each of its k drafts) and the drafts. */
 typedef struct pulsar_gpu_spec_run {
+    /** The run's first sampler row (the draw after the base token), an index into the launch's out rows. */
     uint32_t row0;
+    /** Drafts in the run (<= 16); the run reads rows [row0, row0 + k]. */
     uint32_t k;
     uint32_t greedy_rows;   ///< bit j: row j drew greedy (its calibration label is the acceptance itself)
+    /** The draft tokens, pend[0 .. k). */
     int32_t pend[16];
 } pulsar_gpu_spec_run;
 /** The walk's verdict for a run: drafts kept, the carry token (-1 when a row refused), the refusing row's status,
  *  and L301's calibration labels for the drafts it reached: label[j] = 1/0 (greedy row: argmax == draft) or the
  *  target's emitted probability of draft j (sampled row), hit[j] = the row drew draft j. */
 typedef struct pulsar_gpu_spec_walk_out {
+    /** Drafts kept (0 .. k). */
     uint32_t commit;
+    /** The token the walk's stopping row drew (a rejection's draw, or a full accept's row k); -1 when a row refused. */
     int32_t carry;
+    /** PULSAR_GPU_SAMPLE_OK, or the refusing row's PULSAR_GPU_SAMPLE_REFUSED_*. */
     uint32_t status;
+    /** Entries of label / hit written: the drafts the walk reached. */
     uint32_t n_label;
+    /** Per reached draft j: 1/0 (greedy row: argmax == draft) or the target's emitted probability of draft j. */
     float label[16];
+    /** Per reached draft j: 1 = the row drew draft j. */
     uint8_t hit[16];
 } pulsar_gpu_spec_walk_out;
 /** The speculative walk over a sampler launch's rows (pulsar_gpu_sample_rows' out at rows_offset_bytes): a draft is
@@ -2520,15 +2537,22 @@ int pulsar_gpu_spec_walk(const pulsar_gpu_tensor *rows, uint64_t rows_offset_byt
 /** The logprob outputs of a row (the host's pulsar_token_score, field for field). */
 #define PULSAR_GPU_LOGPROB_TOPK_MAX 20u
 #define PULSAR_GPU_LOGPROB_NEG_INF (-1.0e30f)
+/** One token's score in a logprob row (the host's pulsar_token_score). */
 typedef struct pulsar_gpu_token_score {
+    /** Token id; -1 in a top slot past the row's finite candidates. */
     int32_t id;
+    /** The raw logit (after the mask); PULSAR_GPU_LOGPROB_NEG_INF in an empty slot. */
     float logit;
+    /** log-softmax of the logit over the row; PULSAR_GPU_LOGPROB_NEG_INF for a non-finite logit or an empty slot. */
     float logprob;
 } pulsar_gpu_token_score;
+/** What pulsar_gpu_logprobs_rows writes per row. */
 typedef struct pulsar_gpu_logprob_row {
     uint32_t n_top;        ///< entries in top (0: the row has no finite logit)
     uint32_t have_token;   ///< token holds the scored token's score
+    /** The scored token's score; valid when have_token. */
     pulsar_gpu_token_score token;
+    /** The row's best tokens, best first; entries [0, n_top) are real. */
     pulsar_gpu_token_score top[PULSAR_GPU_LOGPROB_TOPK_MAX];
 } pulsar_gpu_logprob_row;
 /** Logprobs of n_rows rows: the scored token of row r (tokens at tokens_offset_bytes + r * token_stride int32s;
@@ -2550,13 +2574,24 @@ uint64_t pulsar_gpu_logprobs_scratch_bytes(uint32_t n_vocab);
 #define PULSAR_GPU_CHAIN_SLOTS_MAX 16u
 #define PULSAR_GPU_CHAIN_TOPK_MAX 64u
 #define PULSAR_GPU_CHAINS_MAX 16u
+/** One chain's draw request for pulsar_gpu_sample_chains. */
 typedef struct pulsar_gpu_chain_req {
     float temperature, top_p, min_p;
+    /** Top-k cut (the pulsar_gpu_sample_req rules, as are temperature / top_p / min_p). */
     int32_t top_k;
+    /** The chain's index in cand / scores. */
     uint32_t chain;   /* the chain's index in cand / scores */
+    /** Slots to walk (<= slots, <= PULSAR_GPU_CHAIN_SLOTS_MAX). */
     uint32_t n;       /* slots to walk (<= slots) */
+    /** Per slot j: the draw's random key (pulsar_sample_key at the token's index). */
     uint64_t key[PULSAR_GPU_CHAIN_SLOTS_MAX];
 } pulsar_gpu_chain_req;
+/** @var pulsar_gpu_chain_req::temperature
+ *  Sampler temperature (pulsar_gpu_sample_req rules). */
+/** @var pulsar_gpu_chain_req::top_p
+ *  Sampler nucleus mass (pulsar_gpu_sample_req rules). */
+/** @var pulsar_gpu_chain_req::min_p
+ *  Sampler min-p floor (pulsar_gpu_sample_req rules). */
 int pulsar_gpu_sample_chains(const pulsar_gpu_tensor *cand, uint64_t cand_offset_bytes, const pulsar_gpu_tensor *scores,
                              uint64_t scores_offset_bytes, uint32_t slots, uint32_t topk, uint32_t vocab,
                              const pulsar_gpu_chain_req *reqs, uint32_t n_chains, pulsar_gpu_tensor *out,
@@ -2750,12 +2785,27 @@ __attribute__((constructor)) void pulsar_tu_archs_register_(void) {
 typedef struct {
     uint64_t patch_proj, patch_bias, norm;
     uint64_t aligner_w1, aligner_b1, aligner_w2, aligner_b2;
+    /** Per transformer block: its norm1, attn.wqkv (+ bias), attn.wo (+ bias), norm2 and MLP w1 / w2 tensors. */
     struct {
         uint64_t norm1, wqkv, wqkv_bias, wo, wo_bias, norm2, w1, w2;
     } block[PULSAR_VISION_LAYERS];
     uint32_t n_layers;              ///< must be PULSAR_VISION_LAYERS
     uint32_t text_dim;              ///< the aligner's output width (the text model's n_embd)
 } pulsar_vision_offsets;
+/** @var pulsar_vision_offsets::patch_proj
+ *  vision.patch_embed.proj.weight: the patch embedding. */
+/** @var pulsar_vision_offsets::patch_bias
+ *  vision.patch_embed.proj.bias. */
+/** @var pulsar_vision_offsets::norm
+ *  vision.norm.weight: the RMSNorm after the last block. */
+/** @var pulsar_vision_offsets::aligner_w1
+ *  aligner.w1.weight: the aligner's first linear (a DOWNSAMPLE^2 patch group to text_dim, then GELU). */
+/** @var pulsar_vision_offsets::aligner_b1
+ *  aligner.w1.bias. */
+/** @var pulsar_vision_offsets::aligner_w2
+ *  aligner.w2.weight: the aligner's second linear. */
+/** @var pulsar_vision_offsets::aligner_b2
+ *  aligner.w2.bias. */
 
 /** ViT + aligner over ONE image's patches: `patches` is
  * (n_h*n_w, 3, PATCH, PATCH) bf16, the result is (out_rows, text_dim) bf16
@@ -2787,15 +2837,62 @@ int pulsar_cuda_vision_gemm(float *c, int ldc, const uint16_t *a, int lda, const
 #define PULSAR_QWEN_VISION_POS_SIDE   48u       /* num_position_embeddings 2304 = 48 x 48 */
 #define PULSAR_QWEN_VISION_OUT        2560u     /* out_hidden_size: the language model's width */
 #define PULSAR_QWEN_VISION_ROPE_THETA 10000.0f
+/** One Qwen vision block's weights: bf16 pointers into the model's mapping (device-readable; not owned), each the
+ *  `model.visual.blocks.<l>.*` tensor named below.  Linear shapes are (in, out). */
 typedef struct {
     const void *norm1_w, *norm1_b, *qkv_w, *qkv_b, *proj_w, *proj_b;
     const void *norm2_w, *norm2_b, *fc1_w, *fc1_b, *fc2_w, *fc2_b;
 } pulsar_qwen_vision_block_dev;
+/** @var pulsar_qwen_vision_block_dev::norm1_w
+ *  norm1.weight, DIM (the LayerNorm before attention). */
+/** @var pulsar_qwen_vision_block_dev::norm1_b
+ *  norm1.bias, DIM. */
+/** @var pulsar_qwen_vision_block_dev::qkv_w
+ *  attn.qkv.weight, (DIM, 3 DIM). */
+/** @var pulsar_qwen_vision_block_dev::qkv_b
+ *  attn.qkv.bias, 3 DIM. */
+/** @var pulsar_qwen_vision_block_dev::proj_w
+ *  attn.proj.weight, (DIM, DIM). */
+/** @var pulsar_qwen_vision_block_dev::proj_b
+ *  attn.proj.bias, DIM. */
+/** @var pulsar_qwen_vision_block_dev::norm2_w
+ *  norm2.weight, DIM (the LayerNorm before the MLP). */
+/** @var pulsar_qwen_vision_block_dev::norm2_b
+ *  norm2.bias, DIM. */
+/** @var pulsar_qwen_vision_block_dev::fc1_w
+ *  mlp.linear_fc1.weight, (DIM, INTER). */
+/** @var pulsar_qwen_vision_block_dev::fc1_b
+ *  mlp.linear_fc1.bias, INTER. */
+/** @var pulsar_qwen_vision_block_dev::fc2_w
+ *  mlp.linear_fc2.weight, (INTER, DIM). */
+/** @var pulsar_qwen_vision_block_dev::fc2_b
+ *  mlp.linear_fc2.bias, DIM. */
+/** The Qwen vision tower's weights (vision_qwen.cpp binds them): bf16 pointers into the model's mapping
+ *  (device-readable; not owned), each the `model.visual.*` tensor named below.  Linear shapes are (in, out). */
 typedef struct {
     const void *patch_w, *patch_b, *pos_embed;
+    /** The PULSAR_QWEN_VISION_LAYERS blocks, in order. */
     pulsar_qwen_vision_block_dev block[PULSAR_QWEN_VISION_LAYERS];
     const void *merger_norm_w, *merger_norm_b, *merger_fc1_w, *merger_fc1_b, *merger_fc2_w, *merger_fc2_b;
 } pulsar_qwen_vision_weights_dev;
+/** @var pulsar_qwen_vision_weights_dev::patch_w
+ *  patch_embed.proj.weight: the patch projection, PATCH_IN (3 channels, 2 frames, 16 x 16) to DIM. */
+/** @var pulsar_qwen_vision_weights_dev::patch_b
+ *  patch_embed.proj.bias, DIM. */
+/** @var pulsar_qwen_vision_weights_dev::pos_embed
+ *  pos_embed.weight: the learned position table, POS_SIDE^2 rows of DIM. */
+/** @var pulsar_qwen_vision_weights_dev::merger_norm_w
+ *  merger.norm.weight, DIM. */
+/** @var pulsar_qwen_vision_weights_dev::merger_norm_b
+ *  merger.norm.bias, DIM. */
+/** @var pulsar_qwen_vision_weights_dev::merger_fc1_w
+ *  merger.linear_fc1.weight, (4 DIM, 4 DIM): over a 2x2 merge block's concatenated rows. */
+/** @var pulsar_qwen_vision_weights_dev::merger_fc1_b
+ *  merger.linear_fc1.bias, 4 DIM. */
+/** @var pulsar_qwen_vision_weights_dev::merger_fc2_w
+ *  merger.linear_fc2.weight, (4 DIM, OUT). */
+/** @var pulsar_qwen_vision_weights_dev::merger_fc2_b
+ *  merger.linear_fc2.bias, OUT. */
 /** Tower + merger over ONE image: `patches` (n_tok x PATCH_IN bf16, 2x2 merge-block order), `pos` (n_tok x 2
  *  int32: the patch's row and column), the learned-position taps (n_tok x 4 int32 table rows, n_tok x 4 f32
  *  weights).  Writes n_tok/4 x OUT bf16 rows.  `dbg` (NULL in production) receives 3 x n_tok x DIM bf16: the
@@ -2854,10 +2951,23 @@ void pulsar_gpu_tp_err_word_set(const volatile uint32_t *word);
  * dst_k[r * pitch_k + peer_col0_k + c] = the peer's (the same layout, in the
  * row-lane in-slots).  Copies only.  Behind the stream wait like the sums. */
 #define PULSAR_TP_GATHER_BLOCKS_MAX 8
+/** One projection's block in a row-split gather (pulsar_gpu_tp_combine_gather_blocks).  Every count is in
+ *  elements, not bytes. */
 typedef struct {
+    /** The block's full destination rows, [rows][pitch]; both halves are written into it. */
     pulsar_gpu_tensor *dst;
     uint64_t elem0, width, pitch, own_col0, peer_col0;
 } pulsar_tp_gather_block;
+/** @var pulsar_tp_gather_block::elem0
+ *  Element offset of this block's packed [rows][width] half in the exchange payload (own and peer alike). */
+/** @var pulsar_tp_gather_block::width
+ *  Columns of one rank's half of the block. */
+/** @var pulsar_tp_gather_block::pitch
+ *  Row stride of dst, elements. */
+/** @var pulsar_tp_gather_block::own_col0
+ *  First dst column of this rank's half. */
+/** @var pulsar_tp_gather_block::peer_col0
+ *  First dst column of the peer's half. */
 int pulsar_gpu_tp_combine_gather_blocks(const pulsar_tp_gather_block *blocks, uint32_t n_blocks,
                                         uint32_t rows, const pulsar_gpu_tensor *own,
                                         const void *slab_dev, uint64_t in_off, uint64_t vec_bytes,
@@ -2927,15 +3037,22 @@ enum {
  *  rotations (transformers' defaults 32 / 1).  The math is lib/pulsar_yarn.h's, shared with DeepSeek's rope. */
 typedef struct {
     double   factor;               /**< double, as transformers reads the config's number */
+    /** The context the rope was trained at, tokens (original_max_position_embeddings); 0 refuses. */
     uint32_t orig_ctx;
     double   beta_fast, beta_slow;
 } pulsar_qsa_yarn;
+/** @var pulsar_qsa_yarn::beta_fast
+ *  The ramp's high-frequency bound, rotations (transformers' default 32). */
+/** @var pulsar_qsa_yarn::beta_slow
+ *  The ramp's low-frequency bound, rotations (transformers' default 1). */
 
 /** The QSA rope of a loaded model: the f32 inverse frequency of each rotary pair and the factor on cos and sin
  *  (YaRN's attention factor; exactly 1 for the native rope).  pulsar_qsa_rope_init is its one producer, run once
  *  per load; every pulsar_gpu_qsa_forward call names it (pulsar_qsa_io::rope). */
 typedef struct {
+    /** Per rotary pair i (dims i, i + 32): the inverse frequency, radians per position. */
     float inv_freq[PULSAR_QSA_ROT_DIM / 2];
+    /** The factor on cos and sin: YaRN's attention factor, exactly 1 for the native rope. */
     float mscale;
 } pulsar_qsa_rope;
 
@@ -2947,8 +3064,11 @@ int pulsar_qsa_rope_init(pulsar_qsa_rope *out, const pulsar_qsa_yarn *yarn);
 
 /** One sequence's cache for ONE attention layer (layout above). */
 typedef struct {
+    /** The KV records, cap x pulsar_qsa_kv_token_bytes per token (E4M3 K and V plus E8M0 scales; caller-owned). */
     pulsar_gpu_tensor *kv;
+    /** cap / 4 x 128 bf16: each complete indexer block's pooled, normed, roped key (caller-owned). */
     pulsar_gpu_tensor *bkey;
+    /** 4 x 128 f32: the raw indexer keys of the open (incomplete) block (caller-owned). */
     pulsar_gpu_tensor *stage;
     uint32_t cap;              /**< token capacity, a multiple of 4 */
 } pulsar_qsa_seq;
@@ -2965,6 +3085,8 @@ typedef struct {
     const uint16_t *idx_k_norm;  /**< [128] bf16 */
 } pulsar_qsa_layer;
 
+/** One pulsar_gpu_qsa_forward call's activations: the projections' outputs in, o_proj's input slot out, plus the
+ *  rope, the tensor-parallel degree and optional gate taps.  Every pointer is borrowed. */
 typedef struct {
     const pulsar_gpu_tensor *qg;    /**< f32 [n_rows][12288] q_proj output */
     const pulsar_gpu_tensor *k;     /**< f32 [n_rows][512] k_proj output */

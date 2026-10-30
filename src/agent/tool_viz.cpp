@@ -809,6 +809,7 @@ static void agent_stream_normal_byte(agent_stream_renderer *sr, char c) {
 struct agent_stream_think_sink {
     agent_stream_renderer *sr;  ///< the stream being projected
     /** DSML bytes are not prose: no tag recognition while a block is parsed. */
+    /** @return true when no DSML block is open */
     bool tags_enabled() const { return !sr->dsml_active; }
     /** `<think>` consumed: release a held marker tail in the pre-think state. */
     void think_open_tag() { sr->post_think_gap = false; agent_stream_flush_start_tail(sr); }
@@ -819,12 +820,14 @@ struct agent_stream_think_sink {
         sr->post_think_gap = true;
     }
     /** Whether the renderer's last byte was a newline. */
+    /** @return true at the start of a line */
     bool at_line_start() const { return sr->renderer->last_output_newline; }
     /** Raw newline, outside markdown (renderer_write tracks last_output_newline). */
     void newline() { renderer_write(sr->renderer, "\n", 1); }
     /** One byte: into the DSML parser while a block is open, else the normal
      * route -- thinking bytes included, so an accidental in-think tool stanza
      * is suppressed cleanly instead of shown raw or, worse, executed. */
+    /** @param c the byte */
     void text(char c) {
         if (sr->dsml_active) agent_stream_feed_dsml_byte(sr, c);
         else agent_stream_normal_byte(sr, c);

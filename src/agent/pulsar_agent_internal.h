@@ -210,7 +210,9 @@ typedef struct {
      *  results), rendered WHOLE into the transcript by the family's chat front when the assistant turn opens
      *  (agent_turn_flush).  `content` is owned. */
     pulsar_chat_message *turn;
+    /** Messages in `turn`. */
     int turn_len;
+    /** Slots allocated in `turn` (grows by doubling). */
     int turn_cap;
 
     char *cache_dir;            ///< directory holding saved sessions (`<sha>.session`) and `segments/`
@@ -289,7 +291,13 @@ typedef struct agent_tail_capture {
     size_t start;   ///< index of the oldest retained byte
     size_t len;     ///< bytes currently retained (<= cap)
     size_t total;   ///< bytes ever appended, including those overwritten
+    /** Append bytes, overwriting the oldest once the ring is full (allocates `buf` on first use).
+     *  @param s bytes to append
+     *  @param n byte count */
     void append(const char *s, size_t n);  ///< was agent_tail_capture_append
+    /** Take the retained bytes and reset the capture (frees `buf`, zeroes every field).
+     *  @param len receives the byte count returned; may be NULL
+     *  @return a malloc'd NUL-terminated copy of the retained bytes, oldest first; caller frees */
     char *take(size_t *len);  ///< was agent_tail_capture_take
 } agent_tail_capture;
 
@@ -567,7 +575,17 @@ struct agent_syntax {
     const char *multiline_start;  ///< block-comment opener, or NULL
     const char *multiline_end;    ///< block-comment closer, or NULL
     unsigned flags;          ///< per-language lexer options (AGENT_SYNTAX_* bits)
+    /** Whether a line comment starts at `p`.
+     *  @param p position in the line
+     *  @return the matching entry of singleline_comments, or NULL */
     const char *line_comment(const char *p) const;  ///< was agent_syntax_line_comment
+    /** Whether one of `keywords` starts at `p` and ends at a separator.
+     *  @param p        position in the line
+     *  @param line_end end of the line (exclusive)
+     *  @param out_len  receives the keyword's length on a match
+     *  @param out_hl   receives AGENT_HL_KEYWORD2 for a secondary keyword (listed with a trailing '|'), else
+     *                  AGENT_HL_KEYWORD1
+     *  @return true on a match */
     bool match_keyword(const char *p, const char *line_end, size_t *out_len, int *out_hl) const;  ///< was agent_syntax_match_keyword
 };
 
@@ -699,14 +717,18 @@ struct agent_bash_job {
      *  @{
      */
     /** Output lines captured so far (newline count, plus a trailing partial). */
+    /** @return the line count; 0 before any output */
     int display_lines() const;
     /** Account for `n` freshly captured bytes (byte and newline counters). */
+    /** @param s the captured bytes
+     *  @param n byte count */
     void note_output(const char *s, size_t n);
     /** Release the job: close descriptors, unlink the temp file, free `cmd`. */
     void job_free();
     /** Read whatever the child has written into the pipe right now. */
     void drain();
     /** Record the child's exit `status` and mark the job no longer running. */
+    /** @param status the waitpid status (exit_status becomes its exit code, 128 + signal, or -1) */
     void finalize(int status);
     /** Non-blocking progress step: drain output, reap the child if it exited,
      * and enforce the timeout. */
@@ -722,11 +744,13 @@ struct agent_bash_job {
     char *read_head(int max_lines, size_t max_bytes, int *lines_read, bool *byte_limited) const;
     /** Read the last `max_lines` lines of the output.
      * @return newly allocated text, caller frees. */
+    /** @param max_lines line cap (read from the last AGENT_BASH_TAIL_BYTES of the output file) */
     char *read_tail_lines(int max_lines) const;
     /** Build the tool result describing this job: status line, then output.
      * The FIRST observation shows the head of the output; later ones show the
      * tail. @param mark_observed record that the model has now seen the job,
      * which is what flips head display to tail. */
+    /** @return the tool result text, newly allocated; caller frees */
     char *observation(bool mark_observed);
     /** @} */
 };

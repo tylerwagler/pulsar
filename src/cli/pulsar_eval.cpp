@@ -2112,18 +2112,21 @@ static void stream_append_visible(eval_ui *ui, const char *p, size_t n) {
 struct eval_think_sink {
     eval_ui *ui;    ///< the TUI whose stream buffer receives the bytes
     /** No DSML lane here: tags are always prose markers. */
+    /** @return always true */
     bool tags_enabled() const { return true; }
     /** Nothing to do at `<think>`: the next byte takes the thinking style. */
     void think_open_tag() {}
     /** Nothing to undo at `</think>`: styles are per byte. */
     void think_close_tag() {}
     /** Whether the stream buffer is empty or ends in '\n'. */
+    /** @return true at the start of a line */
     bool at_line_start() const {
         return ui->stream.len == 0 || ui->stream.v[ui->stream.len - 1] == '\n';
     }
     /** Newline in the reply style. */
     void newline() { stream_append_visible(ui, "\n", 1); }
     /** One byte in the current style. */
+    /** @param c the byte */
     void text(char c) { stream_append_visible(ui, &c, 1); }
 };
 

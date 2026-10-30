@@ -204,16 +204,19 @@ static void token_printer_write_char(token_printer *p, char c) {
 struct token_printer_think_sink {
     token_printer *p;   ///< the printer being driven
     /** The CLI has no DSML lane: tags are always prose markers. */
+    /** @return always true */
     bool tags_enabled() const { return true; }
     /** Nothing to do at `<think>`: the next text byte turns grey. */
     void think_open_tag() {}
     /** Close the grey SGR run. */
     void think_close_tag() { token_printer_reset_color(p); }
     /** Whether the last byte printed was '\n'. */
+    /** @return true at the start of a line */
     bool at_line_start() const { return p->last_output_newline; }
     /** Raw newline. */
     void newline() { token_printer_write_char(p, '\n'); }
     /** One byte of prose or thinking text. */
+    /** @param c the byte */
     void text(char c) { token_printer_write_char(p, c); }
 };
 
@@ -1059,6 +1062,8 @@ typedef struct {
      *  it instead of rebuilding the whole transcript. */
     int head_len;
     pulsar_think_mode head_mode;  ///< the mode the head in the transcript was rendered for
+    /** A head has been rendered into the transcript (head_len / head_mode are valid); false until the first
+     *  repl_chat_apply_head. */
     bool head_applied;
 } repl_chat;
 

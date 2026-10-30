@@ -67,8 +67,11 @@ typedef enum {
  * sentinel therefore sits a few slots in.  `bytes`/`len` are the encoded image
  * file (PNG or JPEG). */
 typedef struct {
+    /** The encoded image file (PNG or JPEG); borrowed, the caller keeps it alive for the call. */
     const uint8_t *bytes;
+    /** Bytes at `bytes`. */
     size_t         len;
+    /** Token index of the image block's first slot in the prompt (the length of the prompt when the block was appended). */
     int            start_pos;
 } pulsar_image_ref;
 
@@ -179,10 +182,15 @@ typedef struct {
      * session mirror); there is no per-lane arm to select (L239 retired
      * `--tp-arm`, which had selected nothing since slice 4c). */
     int tp_role;
+    /** Legacy 2-rank worker: the leader's host to dial (with tp_port); unused when tp_peers is set. */
     const char *tp_peer;
+    /** This rank's control/listen port (the legacy leader listens on it, the legacy worker dials it); <= 0 = 5588. */
     int tp_port;
+    /** This rank's index in the group, [0, tp_nranks); -1 = unset. */
     int tp_rank;        /* this rank's index in the group; -1 = unset */
+    /** Group size; 0 = unset (legacy -> 2). */
     int tp_nranks;      /* group size; 0 = unset (legacy -> 2) */
+    /** n-way: ordered "host:port,..." list for all n ranks; NULL = the legacy 2-rank style. */
     const char *tp_peers;   /* ordered "host:port,..." list for all n ranks */
     /** This build's id (git describe), carried to every TP peer in the NODE
      *  frame so each rank can report the whole group's builds.  NULL = not
@@ -325,11 +333,13 @@ int pulsar_engine_encode(pulsar_engine *e, const pulsar_tokens *inputs, uint32_t
  * the model's own markup): no session, no chat -- one call, one page, generated greedily by the model's own recipe.
  * Calls are serialised on the engine; between its GPU phases (the vision, the prefill, each decode step) the group's
  * other engines run theirs, so an encode waits a step, not a page.  A family without a parser refuses by name. */
+/** Options for one pulsar_engine_parse_page call; NULL options = the model's defaults. */
 typedef struct {
     const char *prompt;        ///< the task prompt (the model's added tokens, back to back); NULL = the model's default
     uint32_t max_new_tokens;   ///< 0 = the model's default
 } pulsar_parse_options;
 
+/** What one pulsar_engine_parse_page call did: the page's size, token counts and per-phase wall times. */
 typedef struct {
     uint32_t image_w, image_h;     ///< the image as decoded
     uint32_t prefix_rows;          ///< the visual prefix the page became
@@ -337,6 +347,18 @@ typedef struct {
     bool finished;                 ///< the model ended the page (its eos), not a cap
     double vision_ms, prefill_ms, decode_ms;
 } pulsar_parse_stats;
+/** @var pulsar_parse_stats::image_w
+ *  Decoded image width, pixels (image_h its height). */
+/** @var pulsar_parse_stats::prompt_tokens
+ *  Tokens of the task prompt (the visual prefix not counted). */
+/** @var pulsar_parse_stats::generated_tokens
+ *  Tokens the model generated, its eos included when reached. */
+/** @var pulsar_parse_stats::vision_ms
+ *  Wall time of the vision encoder, ms. */
+/** @var pulsar_parse_stats::prefill_ms
+ *  Wall time of the prompt prefill, ms. */
+/** @var pulsar_parse_stats::decode_ms
+ *  Wall time of the greedy decode loop, ms. */
 
 /** Does the loaded family parse pages? */
 bool pulsar_engine_is_parser(const pulsar_engine *e);
@@ -602,8 +624,10 @@ bool pulsar_token_is_stop(pulsar_engine *e, int token);
  * once, never a marker that matches at the wrong place. */
 typedef struct {
     int user[2];       ///< the user-turn marker, n_user tokens
+    /** Tokens in `user` (1 or 2; 0 when the tokenizer does not spell the marker). */
     int n_user;
     int assistant[2];  ///< the assistant-turn marker, n_assistant tokens
+    /** Tokens in `assistant` (1 or 2; 0 when the tokenizer does not spell the marker). */
     int n_assistant;
 } pulsar_turn_markers;
 bool pulsar_chat_turn_markers(pulsar_engine *e, pulsar_turn_markers *out);
@@ -652,6 +676,7 @@ typedef struct {
     uint64_t rows_cancelled;  ///< rows dropped before a reader took them (a bank's prompt changed or was invalidated)
     uint64_t rows_refused;    ///< rows not queued: the pool already held its cap of unread rows (bounded bytes)
     uint64_t skipped;         ///< read-aheads not queued: MemAvailable below the read-ahead's headroom (memory pressure)
+    /** Bytes read into the page cache by read-ahead rows. */
     uint64_t bytes_read;
     uint64_t read_ns;         ///< reader wall time on read-ahead rows, summed over the readers
     uint64_t rows_pending;    ///< rows queued now, not yet taken
@@ -820,12 +845,19 @@ int pulsar_session_argmax_excluding(pulsar_session *s, int excluded_id);
  * tool call's structure, L296); `mask` (NULL = none; ceil(logits width / 32) words, bit i set = token i allowed)
  * makes every other token -inf before every transform (L303's structured outputs, L272's tool names). */
 typedef struct pulsar_row_draw {
+    /** Softmax temperature; <= 0 draws the argmax.  Not finite (and not greedy): the draw refuses. */
     float temperature;
+    /** Keep the k most likely tokens; <= 0 = off, clamped to 1024. */
     int top_k;
+    /** Nucleus mass to keep; outside (0, 1] = 1 (off). */
     float top_p;
+    /** Drop tokens under min_p times the best token's probability; < 0 = 0 (off). */
     float min_p;
+    /** The request's sampler stream (pulsar_sample_key index); read and stepped past the drawn token. Borrowed. */
     uint64_t *rng;
+    /** Draw the argmax whatever the temperature (a tool call's structure, L296). */
     bool greedy;
+    /** Allowed-token bitmask, ceil(logits width / 32) words, bit i set = token i allowed; NULL = none.  Borrowed. */
     const uint32_t *mask;
 } pulsar_row_draw;
 /** A draw from the session's live logits. @return the token, or PULSAR_SAMPLE_REFUSED. */
@@ -967,9 +999,13 @@ int pulsar_session_decode_mixed(pulsar_session *s, const pulsar_multiseq_req *re
  * pulsar_engine_fused_heads_max (the family's cap). */
 /** The most prompt runs one fused step carries (the shape's head_last bound). */
 #define PULSAR_FUSED_PF_MAX 16u
+/** The row layout of one pulsar_session_decode_fused step (see the L260 fusion note above). */
 typedef struct {
+    /** Decode / verify rows, rows [0, n_dec) of the step; every one is headed. */
     uint32_t n_dec;
+    /** Prefill runs after the decode rows, one bank each, in order; <= PULSAR_FUSED_PF_MAX. */
     uint32_t n_pf;
+    /** Per prefill run r: nonzero heads run r's last row into the next logits row after the decode rows. */
     uint8_t  head_last[PULSAR_FUSED_PF_MAX];   /* indexed by prefill run, n_pf <= PULSAR_FUSED_PF_MAX */
 } pulsar_fused_shape;
 int pulsar_session_decode_fused(pulsar_session *s, const pulsar_multiseq_req *reqs,
@@ -1129,22 +1165,33 @@ typedef enum {
     PULSAR_SPEC_STEP_EOS = 4,            /* assemble: the base token is EOS -- emit it, never eval it */
     PULSAR_SPEC_STEP_FAILED = 5,         /* the phase refused; err says why */
 } pulsar_spec_step_status;
+/** One bank's step in a batched spec-lane phase (pulsar_session_spec_assemble_batch, _round_end_batch,
+ *  _redraft_commit_batch): the caller fills the inputs, the phase writes the outputs. */
 typedef struct {
     /* in */
+    /** The bank this step restores, runs and saves. */
     uint32_t bank;
+    /** The bank's spec round (caller-owned; the phases fill and consume it). */
     pulsar_spec_round *round;
     float temperature, top_p, min_p;
+    /** Sampler top-k (the pulsar_row_draw knobs; temperature / top_p / min_p beside it). */
     int top_k;
+    /** The request's sampler stream (assemble: the base draw; round_end: the walk).  Borrowed. */
     uint64_t *rng;           /* assemble (base draw), round_end (walk) */
+    /** assemble: tokens left in the request. */
     int max_tokens;          /* assemble: tokens left in the request */
+    /** assemble: drafts allocated under overflow (the verify pick); -1 = no allocation. */
     int k_alloc;             /* assemble: drafts allocated under overflow; -1 = no allocation */
+    /** assemble: round_begin's cap; round_end: capacity of `accepted`, tokens. */
     int accepted_cap;        /* assemble: round_begin's cap; round_end: accepted[] capacity */
+    /** round_end: receives this bank's accepted tokens (caller-owned, accepted_cap slots). */
     int *accepted;           /* round_end: this bank's accepted tokens */
     /* round_end (L296): bit i set = verify row i -- the token after the base and drafts 0..i-1; row K is a full
      * accept's carry -- draws greedy whatever `temperature` says.  The caller's sampling authority evaluated at
      * each position of the round (the server's tool-call override: a call's structure greedy, its payload sampled),
      * so a round that crosses between the two draws every token as one-token-a-step decoding would.  The carry and
      * the next chain record the carry row's params.  0 = `temperature` at every row. */
+    /** round_end: bit i set = verify row i draws greedy; 0 = `temperature` at every row (see above). */
     uint32_t greedy_rows;
     /* L303: token masks, the device sampler's mask rows (pulsar_row_draw.mask; pulsar_engine_logits_width wide); NULL = unconstrained,
      * today's bytes.  assemble: row 0 masks a FRESH base draw (a carry was drawn under the previous round's row
@@ -1153,19 +1200,35 @@ typedef struct {
      * `mask_rows` > the row the walk stops at (a row past a draft the mask refuses is never read).  A masked row
      * is drawn through the mask exactly as a plain lane draws it -- spec == plain.  Not on a pair:
      * the masks do not cross it (the step fails by name). */
+    /** Token mask rows, [mask_rows][ceil(pulsar_engine_logits_width / 32)] words; NULL = unconstrained (see above).  Borrowed. */
     const uint32_t *masks;
+    /** Rows in `masks`. */
     uint32_t mask_rows;
     /* assemble out, round_end in */
+    /** The round's base token, drawn by assemble; -1 when the step drew none. */
     int first_token;
+    /** The bank's first row in the shared forward. */
     uint32_t row0;           /* the bank's first row in the shared forward */
+    /** Rows the bank contributed to the shared forward (base + drafts). */
     uint32_t n_rows;         /* base + drafts it contributed */
     /* out */
+    /** The step's outcome, a pulsar_spec_step_status. */
     int status;              /* pulsar_spec_step_status */
+    /** round_end: tokens written to `accepted`. */
     int n_accepted;          /* round_end */
+    /** round_end: the round's base position (L155). */
     TokPos pos_before;       /* round_end: the round's base position (L155) */
+    /** round_end: the bank's frontier after the round. */
     TokPos pos_after;        /* round_end: the bank's frontier after the round */
+    /** Why the step failed (NUL-terminated); empty when it did not. */
     char err[160];
 } pulsar_spec_step;
+/** @var pulsar_spec_step::temperature
+ *  Sampler temperature for the base draw and the walk (pulsar_row_draw rules). */
+/** @var pulsar_spec_step::top_p
+ *  Sampler nucleus mass (pulsar_row_draw rules). */
+/** @var pulsar_spec_step::min_p
+ *  Sampler min-p floor (pulsar_row_draw rules). */
 /** Per step: restore; LENGTH at ctx; SKIPPED when 1 + K (the allocation, or
  * the pendings) would pass `row_budget` -- checked BEFORE the base draw, so a
  * residual carry survives; the base draw (EOS short-circuits); round_begin;
@@ -1425,6 +1488,7 @@ uint32_t pulsar_engine_verify_pick(const pulsar_engine *e, uint32_t n_seqs, cons
 double pulsar_engine_verify_round_ms(const pulsar_engine *e, uint32_t n_seqs, uint32_t rows, double *outside_ms);
 /** The curve as /metrics shows it (valid false: none). */
 typedef struct {
+    /** A curve exists (profiled or loaded); false = none, the other fields zero. */
     bool valid;
     bool cached;                                  ///< loaded from the disk cache (else profiled by this process)
     uint32_t rows_max;                            ///< the widest verify step
@@ -1444,11 +1508,27 @@ void pulsar_engine_verify_curve_view(const pulsar_engine *e, pulsar_verify_curve
  *  vs mean label (bias), the Brier score (sq_err / n) and the mean absolute calibration error; the ten confidence
  *  bins give the ECE (sum_b |bin_conf - bin_label| / sum_b bin_n). */
 typedef struct {
+    /** [drafter][position]: drafts observed (those with a confidence). */
     uint64_t n[2][16];
     double conf[2][16], label[2][16], hit[2][16], abs_err[2][16], sq_err[2][16];
+    /** [drafter][bin]: drafts whose confidence fell in bin b = floor(10 * conf) (1.0 in bin 9). */
     uint64_t bin_n[2][10];
     double bin_conf[2][10], bin_label[2][10];
 } pulsar_spec_calibration;
+/** @var pulsar_spec_calibration::conf
+ *  [drafter][position]: sum of the drafts' confidences (clamped to 1). */
+/** @var pulsar_spec_calibration::label
+ *  [drafter][position]: sum of the drafts' acceptance labels. */
+/** @var pulsar_spec_calibration::hit
+ *  [drafter][position]: drafts accepted (the row drew the draft), as a sum of 1.0s. */
+/** @var pulsar_spec_calibration::abs_err
+ *  [drafter][position]: sum of |conf - label|. */
+/** @var pulsar_spec_calibration::sq_err
+ *  [drafter][position]: sum of (conf - label)^2 (Brier score = sq_err / n). */
+/** @var pulsar_spec_calibration::bin_conf
+ *  [drafter][bin]: sum of the bin's confidences. */
+/** @var pulsar_spec_calibration::bin_label
+ *  [drafter][bin]: sum of the bin's acceptance labels. */
 void pulsar_engine_spec_calibration(const pulsar_engine *e, pulsar_spec_calibration *out);
 /** L304 / L327: what a prompt chunk costs (src/engine/verify_curve.cpp has the model): ONE fit over every chunk the
  *  engine runs, solo or fused, chunk_ms = fixed[kind] + alpha * q + beta * q (c + q / 2) for q rows over c already
