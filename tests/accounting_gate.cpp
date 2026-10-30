@@ -189,7 +189,7 @@ int GATE_ENTRY(int argc, char **argv) {
     (void)pulsar_gpu_synchronize();
     pulsar_gpu_mem_info(&free0, &total0);
     free_prev = free0;
-    touched_prev = pulsar_session_touched_kv_bytes(s);
+    touched_prev = pulsar_session_touched_kv_bytes(s).raw();
     const uint64_t touched_base0 = touched_prev;
 
     int fail = 0;
@@ -215,7 +215,7 @@ int GATE_ENTRY(int argc, char **argv) {
 
         uint64_t free_now = 0, total_now = 0;
         pulsar_gpu_mem_info(&free_now, &total_now);
-        const uint64_t touched = pulsar_session_touched_kv_bytes(s);
+        const uint64_t touched = pulsar_session_touched_kv_bytes(s).raw();
 
         const int64_t phys_delta = (int64_t)free_prev - (int64_t)free_now;      /* physical grew */
         const int64_t touched_delta = (int64_t)touched - (int64_t)touched_prev; /* frontier grew */
@@ -278,13 +278,13 @@ int GATE_ENTRY(int argc, char **argv) {
             (void)pulsar_gpu_synchronize();
             uint64_t f_a = 0, t_a = 0;
             pulsar_gpu_mem_info(&f_a, &t_a);
-            const uint64_t touched_a = pulsar_session_touched_kv_bytes(s);
+            const uint64_t touched_a = pulsar_session_touched_kv_bytes(s).raw();
             pulsar_session_rewind(s, cut);
             gpu_graph_bank_counters_capture(s->graph, s->graph->banks.n_banks ? s->graph->banks.cur_bank : 0);
             (void)pulsar_gpu_synchronize();
             uint64_t f_b = 0;
             pulsar_gpu_mem_info(&f_b, &t_a);
-            const uint64_t touched_b = pulsar_session_touched_kv_bytes(s);
+            const uint64_t touched_b = pulsar_session_touched_kv_bytes(s).raw();
             const int64_t phys_moved = (int64_t)f_b - (int64_t)f_a;   /* > 0: pages returned */
             const int64_t tol = (int64_t)(768ull * 1024 * 1024);      /* the growth check's noise floor */
             const int rewind_ok = touched_b == touched_a && phys_moved <= tol && phys_moved >= -tol;
@@ -306,7 +306,7 @@ int GATE_ENTRY(int argc, char **argv) {
                 fail = 1;
             } else {
                 gpu_graph_bank_counters_capture(s->graph, s->graph->banks.n_banks ? s->graph->banks.cur_bank : 0);
-                const uint64_t touched_c = pulsar_session_touched_kv_bytes(s);
+                const uint64_t touched_c = pulsar_session_touched_kv_bytes(s).raw();
                 const int regrow_ok = touched_c == touched_a;
                 if (!regrow_ok) fail = 1;
                 fprintf(stderr, "accounting_gate: REGROW %d -> %d: touched %.3f GiB (was %.3f) -> %s\n",
@@ -322,7 +322,7 @@ int GATE_ENTRY(int argc, char **argv) {
         uint64_t free_now = 0, total_now = 0;
         pulsar_gpu_mem_info(&free_now, &total_now);
         const uint64_t phys_used = free0 > free_now ? free0 - free_now : 0;
-        const uint64_t touched = pulsar_session_touched_kv_bytes(s);
+        const uint64_t touched = pulsar_session_touched_kv_bytes(s).raw();
         const uint64_t touched_grown = touched - touched_base0;   /* since warm baseline */
         const int ok = touched_grown <= phys_used + (uint64_t)(256ull * 1024 * 1024);
         if (!ok) fail = 1;
@@ -341,7 +341,7 @@ int GATE_ENTRY(int argc, char **argv) {
     if (s->graph->banks.n_banks) {
         pulsar_gpu_graph *g = s->graph;
         (void)pulsar_gpu_synchronize();
-        const uint64_t touched_bank0 = pulsar_session_touched_kv_bytes(s); /* only bank 0 prefilled */
+        const uint64_t touched_bank0 = pulsar_session_touched_kv_bytes(s).raw(); /* only bank 0 prefilled */
         uint64_t f_before = 0, tt = 0;
         pulsar_gpu_mem_info(&f_before, &tt);
         for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {

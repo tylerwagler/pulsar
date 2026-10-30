@@ -278,22 +278,23 @@ bool server_kv_admits(uint64_t kv_budget_bytes,
  * itself. Non-static: provision_slot and the eviction precheck (generate.cpp)
  * call it; unit tests live in this TU. */
 bool server_mem_floor_admits(uint64_t avail_bytes, uint64_t est_bytes) {
-    return server_headroom_admits(avail_bytes, est_bytes, server_mem_floor());
+    /* the ledger's session estimate and the /proc reading enter the floor's unit here */
+    return server_headroom_admits(KvBytes{avail_bytes}, KvBytes{est_bytes}, server_mem_floor());
 }
 
-bool server_headroom_admits(uint64_t avail, uint64_t need, uint64_t floor) {
-    if (avail == 0 || need > UINT64_MAX - floor) return false;
+bool server_headroom_admits(KvBytes avail, KvBytes need, KvBytes floor) {
+    if (avail == KvBytes{} || need > KvBytes::max() - floor) return false;
     return avail >= need + floor;
 }
 
 /* The one floor (pulsar_server_internal.h, "The memory floor"): set once at startup, before the listener opens and
  * the worker starts, and read-only after that. */
-static uint64_t g_server_mem_floor = PULSAR_SERVER_MEM_FLOOR_BYTES;
+static KvBytes g_server_mem_floor{PULSAR_SERVER_MEM_FLOOR_BYTES};
 
-uint64_t server_mem_floor(void) { return g_server_mem_floor; }
+KvBytes server_mem_floor(void) { return g_server_mem_floor; }
 
-uint64_t server_mem_floor_init(uint64_t zone_high_bytes, uint64_t step_bytes) {
-    g_server_mem_floor = PULSAR_SERVER_MEM_FLOOR_BYTES + zone_high_bytes + step_bytes;
+KvBytes server_mem_floor_init(uint64_t zone_high_bytes, KvBytes step_bytes) {
+    g_server_mem_floor = KvBytes{PULSAR_SERVER_MEM_FLOOR_BYTES + zone_high_bytes} + step_bytes;
     return g_server_mem_floor;
 }
 
@@ -339,13 +340,13 @@ uint64_t server_persist_host_bytes(int tokens) {
  * --ctx 1M the ceiling was 9.05 GiB against 5.16 GiB of headroom, the guard never spilled, MemAvailable reached
  * zero, and the GPU stalled on unbacked pages (work, 2026-10-22) or earlyoom killed the server (Sparky).  avail 0
  * (/proc/meminfo unreadable) is 0: the caller refuses to start rather than run unguarded. */
-uint64_t server_guard_touched_budget(uint64_t kv_budget_bytes, uint64_t eager_bytes, uint64_t touched_bytes,
-                                     uint64_t avail_bytes) {
-    const uint64_t floor = server_mem_floor();
-    if (avail_bytes <= floor) return 0;
-    const uint64_t ledger = kv_budget_bytes > eager_bytes ? kv_budget_bytes - eager_bytes : 0;
-    const uint64_t headroom = avail_bytes - floor;
-    const uint64_t physical = touched_bytes > UINT64_MAX - headroom ? UINT64_MAX : touched_bytes + headroom;
+KvBytes server_guard_touched_budget(KvBytes kv_budget_bytes, KvBytes eager_bytes, KvBytes touched_bytes,
+                                    KvBytes avail_bytes) {
+    const KvBytes floor = server_mem_floor();
+    if (avail_bytes <= floor) return KvBytes{};
+    const KvBytes ledger = kv_budget_bytes > eager_bytes ? kv_budget_bytes - eager_bytes : KvBytes{};
+    const KvBytes headroom = avail_bytes - floor;
+    const KvBytes physical = touched_bytes > KvBytes::max() - headroom ? KvBytes::max() : touched_bytes + headroom;
     return ledger < physical ? ledger : physical;
 }
 
@@ -825,7 +826,7 @@ int main(int argc, char **argv) {
         const uint64_t banked1 = pulsar_engine_session_cost_bytes_banked(engine, cfg.ctx_size, 1);
         const uint64_t banked2 = pulsar_engine_session_cost_bytes_banked(engine, cfg.ctx_size, 2);
         const uint64_t marginal = banked2 > banked1 ? banked2 - banked1 : 0;
-        oc_demand_pb = pulsar_engine_demand_paged_bytes_per_bank(engine, cfg.ctx_size);
+        oc_demand_pb = pulsar_engine_demand_paged_bytes_per_bank(engine, cfg.ctx_size).raw();   /* into the ledger */
         oc_eager_pb = marginal > oc_demand_pb ? marginal - oc_demand_pb : 0;
         oc_shared = banked1 > marginal ? banked1 - marginal : 0;
     }
@@ -979,20 +980,23 @@ int main(int argc, char **argv) {
      * host/driver demand -- a prefill chunk's new KV pages on one bank plus a persist at the full context. */
     {
         const uint64_t zone_high = server_zone_high_watermark_bytes();
-        const uint64_t chunk_kv = pulsar_session_quantum_growth_bytes_per_bank(
-            session, (uint32_t)pulsar_session_prefill_cap(session));
+        const KvBytes chunk_kv = pulsar_session_quantum_growth_bytes_per_bank(
+            session, KvRows{(uint32_t)pulsar_session_prefill_cap(session)});
         const uint64_t persist = server_persist_host_bytes(cfg.ctx_size);
-        const uint64_t floor = server_mem_floor_init(zone_high, chunk_kv + persist);
+        const KvBytes step = chunk_kv + KvBytes{persist};
+        const KvBytes floor = server_mem_floor_init(zone_high, step);
         const double mib = 1024.0 * 1024.0;
         server_log(PULSAR_LOG_DEFAULT,
                    "pulsar-server: memory floor %.0f MiB = OS margin %.0f + kernel high watermarks %.0f%s + one "
                    "step's demand %.0f (a %d-token prefill chunk's KV %.0f + a persist at %d tokens %.0f)",
-                   (double)floor / mib, (double)PULSAR_SERVER_MEM_FLOOR_BYTES / mib, (double)zone_high / mib,
-                   zone_high ? "" : " (/proc/zoneinfo unreadable)", (double)(chunk_kv + persist) / mib,
-                   pulsar_session_prefill_cap(session), (double)chunk_kv / mib, cfg.ctx_size, (double)persist / mib);
+                   (double)floor.raw() / mib, (double)PULSAR_SERVER_MEM_FLOOR_BYTES / mib, (double)zone_high / mib,
+                   zone_high ? "" : " (/proc/zoneinfo unreadable)", (double)step.raw() / mib,
+                   pulsar_session_prefill_cap(session), (double)chunk_kv.raw() / mib, cfg.ctx_size,
+                   (double)persist / mib);
     }
     uint64_t kv_budget_final = kv_budget;
-    uint64_t warm_avail = 0, warm_touched = 0;   /* L319: the touched-KV ceiling's measurement (below) */
+    uint64_t warm_avail = 0;   /* L319: the touched-KV ceiling's measurement (below) */
+    KvBytes warm_touched{};
     {
         /* What of slot 0 is RESIDENT now, and so already out of MemAvailable:
          * its priced cost less the pool's demand-paged comp/index VA that no
@@ -1003,17 +1007,19 @@ int main(int argc, char **argv) {
          * 61.3 GiB, box full at ~12 GiB of KV).  A single session allocates its
          * comp/index eagerly, so all of it is resident. */
         const int banks_now = pulsar_session_bank_count(session);
-        const uint64_t demand_va = banks_now > 1
-            ? (uint64_t)banks_now * pulsar_engine_demand_paged_bytes_per_bank(engine, cfg.ctx_size)
-            : 0;
-        const uint64_t touched_now = pulsar_session_touched_kv_bytes(session);
-        const uint64_t untouched_va = demand_va > touched_now ? demand_va - touched_now : 0;
+        const KvBytes demand_va = banks_now > 1
+            ? pulsar_engine_demand_paged_bytes_per_bank(engine, cfg.ctx_size).times((uint64_t)banks_now)
+            : KvBytes{};
+        const KvBytes touched_now = pulsar_session_touched_kv_bytes(session);
+        /* the KV figures leave the type system here: the measured budget is the untyped session-cost ledger's */
+        const uint64_t untouched_va = (demand_va > touched_now ? demand_va - touched_now : KvBytes{}).raw();
         const uint64_t resident_now = session_actual > untouched_va ? session_actual - untouched_va : 0;
         const uint64_t avail_now = server_mem_available_bytes();
         warm_avail = avail_now;
         warm_touched = touched_now;
         if (avail_now > 0) {
-            const uint64_t headroom = avail_now > server_mem_floor() ? avail_now - server_mem_floor() : 0;
+            const uint64_t floor = server_mem_floor().raw();
+            const uint64_t headroom = avail_now > floor ? avail_now - floor : 0;
             uint64_t measured = resident_now + headroom;
             /* The measured budget is one-shot and PERMANENT, while the
              * MemAvailable it derives from can read transiently low at
@@ -1049,7 +1055,7 @@ int main(int argc, char **argv) {
                        "static bound %.2f GiB)",
                        (double)kv_budget_final / (1024.0 * 1024.0 * 1024.0),
                        (double)avail_now / (1024.0 * 1024.0 * 1024.0),
-                       (double)server_mem_floor() / (1024.0 * 1024.0 * 1024.0),
+                       (double)floor / (1024.0 * 1024.0 * 1024.0),
                        (double)resident_now / (1024.0 * 1024.0 * 1024.0),
                        (double)session_actual / (1024.0 * 1024.0 * 1024.0),
                        (double)untouched_va / (1024.0 * 1024.0 * 1024.0),
@@ -1194,22 +1200,23 @@ int main(int argc, char **argv) {
                            (double)budget / (1024.0 * 1024.0 * 1024.0));
             }
         }
-        s.guard_eager_bytes = overcommit_admission_est;   /* eager floor resident */
+        s.guard_eager_bytes = KvBytes{overcommit_admission_est};   /* eager floor resident (the ledger's figure) */
         /* L319: the ceiling is the smaller of the ledger's share and the measured headroom (see
          * server_guard_touched_budget); a pool with no measured headroom does not start -- unguarded, its banks
          * would grow until the box runs dry.  2026-10-29: every guard decision reads the LIVE budget under this
          * ceiling (server::guard_budget). */
-        s.guard_kv_budget = budget;
-        s.guard_touched_ceiling = server_guard_touched_budget(budget, s.guard_eager_bytes, warm_touched, warm_avail);
-        s.guard_enabled = (s.guard_touched_ceiling > 0);
+        s.guard_kv_budget = KvBytes{budget};
+        s.guard_touched_ceiling =
+            server_guard_touched_budget(s.guard_kv_budget, s.guard_eager_bytes, warm_touched, KvBytes{warm_avail});
+        s.guard_enabled = (s.guard_touched_ceiling > KvBytes{});
         const double gib = 1024.0 * 1024.0 * 1024.0;
         if (!s.guard_enabled) {
             server_log(PULSAR_LOG_ERROR,
                        "pulsar-server: refusing to start: a %d-bank pool has no touched-KV headroom (MemAvailable "
                        "%.2f GiB post-warmup, floor %.2f GiB; kv budget %.2f − eager %.2f GiB) -- lower --ctx or "
                        "PULSAR_MSEQ_BANKS (L319)",
-                       s.pool_banks, (double)warm_avail / gib, (double)server_mem_floor() / gib,
-                       (double)budget / gib, (double)s.guard_eager_bytes / gib);
+                       s.pool_banks, (double)warm_avail / gib, (double)server_mem_floor().raw() / gib,
+                       (double)budget / gib, (double)s.guard_eager_bytes.raw() / gib);
             pulsar_session_free(session);
             pulsar_engine_close(engine);
             return 1;
@@ -1218,8 +1225,9 @@ int main(int argc, char **argv) {
                    "pulsar-server: Tier-2 2b guard ENABLED: touched ceiling %.2f GiB = min(kv budget %.2f − eager "
                    "%.2f, touched %.2f + MemAvailable %.2f − floor %.2f post-warmup); every decision reads the live "
                    "budget under it (touched + MemAvailable − floor now); spills persist to the disk KV cache",
-                   (double)s.guard_touched_ceiling / gib, (double)budget / gib, (double)s.guard_eager_bytes / gib,
-                   (double)warm_touched / gib, (double)warm_avail / gib, (double)server_mem_floor() / gib);
+                   (double)s.guard_touched_ceiling.raw() / gib, (double)budget / gib,
+                   (double)s.guard_eager_bytes.raw() / gib, (double)warm_touched.raw() / gib, (double)warm_avail / gib,
+                   (double)server_mem_floor().raw() / gib);
     }
     s.sess = session;                /* the one session; slot 0 describes it */
     /* ctx_size on slot 0 is the pool's shared per-bank ctx reference and is

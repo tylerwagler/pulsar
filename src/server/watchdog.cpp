@@ -186,9 +186,10 @@ void server::watchdog_dump(int64_t stalled_s) {
                    "pulsar-server: STALL:   queue %d waiting, %d running; KV touched %.2f GiB, reserved %.2f GiB, "
                    "guard budget %.2f GiB (ceiling %.2f); MemAvailable %.2f GiB, floor %.2f GiB, swap used %.2f of "
                    "%.2f GiB",
-                   s->n_queued, s->n_generating, (double)s->m_kv_touched / gib, (double)s->m_kv_reserved / gib,
-                   (double)s->m_kv_budget / gib, (double)s->guard_touched_ceiling / gib, (double)avail / gib,
-                   (double)server_mem_floor() / gib, (double)(swap_total - swap_free) / (1024.0 * 1024.0),
+                   s->n_queued, s->n_generating, (double)s->m_kv_touched.raw() / gib,
+                   (double)s->m_kv_reserved.raw() / gib, (double)s->m_kv_budget.raw() / gib,
+                   (double)s->guard_touched_ceiling.raw() / gib, (double)avail / gib,
+                   (double)server_mem_floor().raw() / gib, (double)(swap_total - swap_free) / (1024.0 * 1024.0),
                    (double)swap_total / (1024.0 * 1024.0));
         for (int i = 0; i < s->n_slots; i++) {
             const int ph = s->m_slot_phase[i];

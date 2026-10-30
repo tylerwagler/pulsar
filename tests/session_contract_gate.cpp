@@ -443,15 +443,17 @@ static void part_banks(pulsar_engine *e, int W) {
 
     /* B5 (L270; the fork legs went with the bank fork, L264/L265) */
     {
-        const uint64_t t0 = pulsar_session_bank_touched_kv_bytes(s, 0), t1 = pulsar_session_bank_touched_kv_bytes(s, 1);
-        const uint64_t all = pulsar_session_touched_kv_bytes(s), q = pulsar_session_quantum_growth_bytes_per_bank(s, 8);
+        const uint64_t t0 = pulsar_session_bank_touched_kv_bytes(s, 0).raw();
+        const uint64_t t1 = pulsar_session_bank_touched_kv_bytes(s, 1).raw();
+        const uint64_t all = pulsar_session_touched_kv_bytes(s).raw();
+        const uint64_t q = pulsar_session_quantum_growth_bytes_per_bank(s, KvRows{8}).raw();
         CHECK(t0 > 0 && t1 > 0 && all >= t0 + t1 && q > 0,
               "B5 touched KV per bank %llu / %llu B, session %llu B, an 8-token quantum %llu B",
               (unsigned long long)t0, (unsigned long long)t1, (unsigned long long)all, (unsigned long long)q);
         /* the eviction contract (L284 #3: every family's): an idle bank's pages are released, and it then holds
          * none (bank_residency_gate grades the way back) */
         const bool freed = pulsar_session_bank_free_physical(s, 1);
-        const uint64_t t1_after = pulsar_session_bank_touched_kv_bytes(s, 1);
+        const uint64_t t1_after = pulsar_session_bank_touched_kv_bytes(s, 1).raw();
         CHECK(freed && t1_after == 0 && pulsar_session_bank_is_evicted(s, 1),
               "B5 a per-bank physical eviction released idle bank 1 (touched after: %llu B)",
               (unsigned long long)t1_after);

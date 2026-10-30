@@ -12,11 +12,11 @@
 static bool ds4_bank_free_physical(pulsar_session *s, uint32_t bank) { return gpu_graph_bank_free_physical(s->graph, bank); }
 static bool ds4_bank_alloc_physical(pulsar_session *s, uint32_t bank) { return gpu_graph_bank_alloc_physical(s->graph, bank); }
 static bool ds4_bank_is_evicted(const pulsar_session *s, uint32_t bank) { return gpu_graph_bank_is_evicted(s->graph, bank); }
-static uint64_t ds4_bank_touched_kv_bytes(pulsar_session *s, uint32_t bank) {
+static KvBytes ds4_bank_touched_kv_bytes(pulsar_session *s, uint32_t bank) {
     return gpu_graph_bank_touched_kv_bytes(s->graph, bank);
 }
-static uint64_t ds4_bank_growth_bytes(pulsar_session *, uint32_t q) { return gpu_graph_quantum_growth_bytes_per_bank(q); }
-static uint64_t ds4_demand_paged_bytes(pulsar_engine *e, int ctx_size) { return e->demand_paged_bytes_per_bank(ctx_size); }
+static KvBytes ds4_bank_growth_bytes(pulsar_session *, KvRows q) { return gpu_graph_quantum_growth_bytes_per_bank(q); }
+static KvBytes ds4_demand_paged_bytes(pulsar_engine *e, int ctx_size) { return e->demand_paged_bytes_per_bank(ctx_size); }
 
 /* ===== Tier-2 PATH A: per-bank HOST carry (pulsar_bank_carry) ================
  *

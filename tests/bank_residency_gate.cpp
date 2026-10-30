@@ -143,7 +143,8 @@ int GATE_ENTRY(int argc, char **argv) {
     CHECK(ok, "bank 1 persisted as [0, %d) (%.1f MiB): %s", G, seg_bytes / 1048576.0, err);
 
     /* R1 */
-    const uint64_t t1 = pulsar_session_bank_touched_kv_bytes(s, 1), all0 = pulsar_session_touched_kv_bytes(s);
+    const uint64_t t1 = pulsar_session_bank_touched_kv_bytes(s, 1).raw();
+    const uint64_t all0 = pulsar_session_touched_kv_bytes(s).raw();
     CHECK(!pulsar_session_bank_free_physical(s, 0) && !pulsar_session_bank_is_evicted(s, 0),
           "R1 free_physical refuses the live bank 0 and frees nothing");
     const long long ma0 = mem_available_kb();
@@ -157,7 +158,8 @@ int GATE_ENTRY(int argc, char **argv) {
         const long long m = mem_available_kb();
         if (m > ma1) ma1 = m;
     }
-    const uint64_t t1_after = pulsar_session_bank_touched_kv_bytes(s, 1), all1 = pulsar_session_touched_kv_bytes(s);
+    const uint64_t t1_after = pulsar_session_bank_touched_kv_bytes(s, 1).raw();
+    const uint64_t all1 = pulsar_session_touched_kv_bytes(s).raw();
     CHECK(freed && pulsar_session_bank_is_evicted(s, 1) && t1_after == 0 && all0 - all1 == t1 && t1 > 0,
           "R1 bank 1 freed: evicted, touched %.1f -> %.1f MiB, session %.1f -> %.1f MiB", t1 / 1048576.0,
           t1_after / 1048576.0, all0 / 1048576.0, all1 / 1048576.0);
@@ -174,9 +176,9 @@ int GATE_ENTRY(int argc, char **argv) {
     if (seg) rewind(seg);
     const bool loaded = backed && pulsar_session_bank_state_restore(s, 1) &&
                         pulsar_session_load_segment(s, seg, seg_bytes, true, &g, NULL, err, sizeof(err)) == 0;
-    CHECK(loaded && g == G && pulsar_session_bank_touched_kv_bytes(s, 1) == t1,
+    CHECK(loaded && g == G && pulsar_session_bank_touched_kv_bytes(s, 1).raw() == t1,
           "R2 the chain loaded bank 1 back to %d (touched %.1f MiB): %s", g,
-          pulsar_session_bank_touched_kv_bytes(s, 1) / 1048576.0, err);
+          pulsar_session_bank_touched_kv_bytes(s, 1).raw() / 1048576.0, err);
 
     /* R3 */
     std::vector<int> toks1, toks2;

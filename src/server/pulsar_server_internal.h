@@ -1580,7 +1580,7 @@ typedef struct session_slot {
      *  freed, its job parked with everything the decode loop keeps (stream, budget, stop / grammar / penalty state,
      *  the keyed sampler stream).  The scheduler steps it again once server::worker_readmit_preempted reloads it. */
     bool         preempted;
-    uint64_t     preempt_bytes;   ///< its resident KV when preempted -- what the readmission must fit
+    KvBytes      preempt_bytes;   ///< its resident KV when preempted -- what the readmission must fit
     double       preempt_t;       ///< when (the readmission order: first preempted, first back)
     char        *preempt_path;
     /** Protocol live bindings for THIS slot's sampled KV frontier (guarded by
@@ -1696,13 +1696,13 @@ typedef struct {
  *  route's and the dominance predicate's compare); never a GPU read.  Published under mu for /metrics. */
 struct kv_dup_census {
     int grid;                    ///< tokens per page (0: no census yet)
-    uint64_t page_bytes;         ///< GPU KV bytes one page of one bank holds (the bank growth price of `grid` tokens)
+    KvBytes page_bytes;          ///< GPU KV bytes one page of one bank holds (the bank growth price of `grid` tokens)
     int banks;                   ///< resident banks holding at least one whole page
     uint64_t pages_resident;     ///< whole pages held, summed over resident banks
     uint64_t pages_distinct;     ///< of those, distinct (shared pages counted once)
     uint64_t pages_shared;       ///< distinct pages held by >= 2 resident banks
     uint64_t pages_duplicate;    ///< extra copies: pages_resident - pages_distinct
-    uint64_t dup_bytes;          ///< what the extra copies cost: pages_duplicate * page_bytes
+    KvBytes dup_bytes;           ///< what the extra copies cost: pages_duplicate * page_bytes
     int pairs[2];                ///< bank pairs sharing >= 1 whole page: [0] preamble (< PULSAR_KV_DUP_DEEP_TOKENS), [1] deep
     int longest[2];              ///< the longest shared prefix (tokens) of a pair in each class (0: no such pair)
 };
@@ -1713,7 +1713,7 @@ struct kv_dup_census {
  *  dominance matrix's fill rule, bank_common_matrix).  `deep[a]` gets a bit b (b > a) for every resident pair whose
  *  shared prefix is at least PULSAR_KV_DUP_DEEP_TOKENS (NULL: not wanted). */
 void kv_dup_census_core(int n, const int *hist_len, const bool *resident, const int *const *common, int grid,
-                        uint64_t page_bytes, kv_dup_census *out, uint32_t *deep);
+                        KvBytes page_bytes, kv_dup_census *out, uint32_t *deep);
 
 /** The whole server: engine, session pool, scheduler queue, caches, metrics.
  *
@@ -1788,7 +1788,7 @@ struct server {
      *  reserved as VA and resident only on touch; published because dividing the
      *  budget by it is the only way to answer "how many tokens of KV does this
      *  box actually hold", which the configured slot count does not answer. */
-    uint64_t     kv_bank_bytes;
+    KvBytes      kv_bank_bytes;
     uint64_t     kv_committed_bytes;  ///< sum of est_cost_bytes over live slots (under mu)
     /** Tier-2 task #55 increment 2b — proactive-eviction guard. `guard_enabled`
      * gates the whole mechanism (on iff overcommit sized N>1 banks and the disk
@@ -1798,12 +1798,12 @@ struct server {
      * floor already resident.
      * `guard_evictions` counts spills for metrics. */
     bool         guard_enabled;          ///< the proactive-eviction guard is active
-    uint64_t     guard_touched_ceiling;  ///< the startup ceiling (post-warmup reading); the live budget never exceeds it
-    uint64_t     guard_kv_budget;        ///< the ledger budget the ceiling was cut from
-    uint64_t     guard_eager_bytes;      ///< eager floor already resident
-    uint64_t     guard_avail;            ///< the MemAvailable reading the live budget last used
+    KvBytes      guard_touched_ceiling;  ///< the startup ceiling (post-warmup reading); the live budget never exceeds it
+    KvBytes      guard_kv_budget;        ///< the ledger budget the ceiling was cut from
+    KvBytes      guard_eager_bytes;      ///< eager floor already resident
+    KvBytes      guard_avail;            ///< the MemAvailable reading the live budget last used
     double       guard_avail_at;         ///< when it was read (server_now_sec); re-read at most every 0.25 s
-    uint64_t     guard_budget_said;      ///< the live budget last logged (a move of 0.5 GiB or more is said)
+    KvBytes      guard_budget_said;      ///< the live budget last logged (a move of 0.5 GiB or more is said)
     /** The stall watchdog (watchdog.cpp).  `stall_s` is written by the watchdog and read by /health (__atomic);
      *  `worker_tid` / `worker_thread` are set by worker_main for the dump. */
     int          stall_limit_s;          ///< PULSAR_STALL_WATCHDOG_S (0 = off)
@@ -1959,16 +1959,16 @@ struct server {
     uint64_t m_restore_failures;  ///< spilled bank could not be re-backed
     uint64_t m_restore_slices;    ///< L330: disk chain slices read (a one-shot load is one)
     double   m_restore_stall_max_ms;  ///< L330: the longest slice -- the longest worker stall a disk restore caused
-    uint64_t m_kv_touched;        ///< L328: resident demand-paged KV (pulsar_session_touched_kv_bytes), published
-    uint64_t m_kv_budget;         ///< the guard's live budget (server::guard_budget), published
+    KvBytes  m_kv_touched;        ///< L328: resident demand-paged KV (pulsar_session_touched_kv_bytes), published
+    KvBytes  m_kv_budget;         ///< the guard's live budget (server::guard_budget), published
     uint64_t m_persist_skipped;   ///< disk-KV persists skipped: MemAvailable could not cover them over the floor
     uint64_t m_prefill_mem_refusals;  ///< prefills stopped mid-prompt: MemAvailable under the floor before a chunk
-    uint64_t m_kv_reserved;       ///< L328: kv_reserved_bytes(NULL), the base every admission reads, published
+    KvBytes  m_kv_reserved;       ///< L328: kv_reserved_bytes(NULL), the base every admission reads, published
     uint64_t m_preemptions;  ///< L314: running decoders preempted through their terminal checkpoint
     uint64_t m_readmissions;  ///< L314: preempted decoders reloaded and stepping again
     kv_dup_census m_dup;          ///< L324: the last duplicate-prefix census (kv_dup_census_update)
     uint64_t m_dup_censuses;      ///< L324: censuses taken
-    uint64_t m_dup_bytes_peak;    ///< L324: the largest dup_bytes any census saw
+    KvBytes  m_dup_bytes_peak;    ///< L324: the largest dup_bytes any census saw
     uint64_t m_prefix_waits[PREFIX_WAIT_OUTCOMES];   ///< L329 (a): finished waits by outcome ([HOLD] = started)
     uint64_t m_prefix_wait_gain;  ///< L329 (a): tokens the waits that reached their cut moved the resume (mark - have)
     /** Why the queue is stuck. Counted once per job (job::refusal_counted) so a
@@ -2081,7 +2081,7 @@ struct server {
      *  every 0.25 s) and touched KV, never above the startup ceiling -- so memory nobody accounts for (host heap,
      *  page cache, the driver) shrinks the room KV may take, and the guard spills / waits / refuses before
      *  MemAvailable reaches the floor.  0 when MemAvailable is unreadable (every decision then fails closed). */
-    uint64_t guard_budget();
+    KvBytes guard_budget();
     /** Start / stop the stall watchdog (watchdog.cpp); start is a no-op when stall_limit_s is 0. */
     bool watchdog_start();
     void watchdog_stop();
@@ -2226,7 +2226,7 @@ struct server {
      *  short of the floor the prompt leaves the fused lane (gen->no_fuse) and its classic quantum decides. */
     bool prefill_headroom_fused_ok(session_slot *sl);
     /** One prefill chunk's new KV on one bank (the per-chunk re-check's need). */
-    uint64_t prefill_chunk_need();
+    KvBytes prefill_chunk_need();
     warn_limiter prefill_mem_warn;   ///< the prefill-refused line, rate-limited (each refusal is counted)
     /** Resolve the prompt against every cache layer and decide the prefill plan.
      * Clients resend full prompts as text.  The worker first tries the old exact
@@ -2428,7 +2428,7 @@ struct server {
      *  spec or plain lane, the disk KV cache on, not a tensor-parallel engine): its bank's frontier payload to the disk
      *  KV dir, its physical freed, its job parked (session_slot::preempted) -- only one whose freed KV makes `need`
      *  bytes fit the budget.  @return true when one was. */
-    bool preempt_newest_decoder(const session_slot *keep, uint64_t need);
+    bool preempt_newest_decoder(const session_slot *keep, KvBytes need);
     /** L314: reload the first-preempted decoder (FIFO: only the first is considered) once its KV fits the budget
      *  again by the admission arithmetic on kv_reserved_bytes (L326: a prompt admitted but not yet prefilled holds
      *  its room, so the decoder stays parked until a job ends); a reload that fails fails that request by name.
@@ -2450,12 +2450,12 @@ struct server {
      * land in the bank while its prefill (or disk-chain load) runs, before any decode quantum the guard above
      * watches.  Fills `order` with the idle victims to spill first (*n_spill of them) when that is what fitting
      * takes; *need is the bank's growth.  Worker thread only. */
-    prompt_kv_verdict prompt_kv_check(const session_slot *sl, const job *j, int *order, int *n_spill, uint64_t *need);
+    prompt_kv_verdict prompt_kv_check(const session_slot *sl, const job *j, int *order, int *n_spill, KvBytes *need);
     /** L326: the base every KV admission decision (a prompt's, a preemption's fit, a readmission's) reads: the
      *  pool's touched KV plus what each job bound to a slot other than `except` still adds before its prompt is in
      *  its bank (its growth to the prompt's length past what the bank holds; parked decoders excluded).  Worker
      *  thread only. */
-    uint64_t kv_reserved_bytes(const session_slot *except);
+    KvBytes kv_reserved_bytes(const session_slot *except);
     /** Apply prompt_kv_check at bind: spill what it says, or keep the head queued (a busy bank will turn into a
      * victim), or answer the client 503 (nothing ever will).  True = the job may bind to `sl` now. */
     bool prompt_kv_admit(session_slot *sl, job *j, bool *refused);
@@ -3633,8 +3633,8 @@ bool server_mem_floor_admits(uint64_t avail_bytes, uint64_t est_bytes);
 /* L319: the touched-KV ceiling -- min(kv budget − eager, touched + MemAvailable − floor); 0 when MemAvailable is at
  * or under the floor, or unreadable (defined in cli_main.cpp; unit-tested there).  The startup ceiling reads the
  * post-warmup MemAvailable; the guard's live budget (server::guard_budget) the current one. */
-uint64_t server_guard_touched_budget(uint64_t kv_budget_bytes, uint64_t eager_bytes, uint64_t touched_bytes,
-                                     uint64_t avail_bytes);
+KvBytes server_guard_touched_budget(KvBytes kv_budget_bytes, KvBytes eager_bytes, KvBytes touched_bytes,
+                                    KvBytes avail_bytes);
 
 /* ==== The memory floor (2026-10-29 work hang) ==============================================================
  * The hang: Nemotron 3.5 Super, 16 banks at --ctx 1M, a continued prefill at ~188k.  The guard's ceiling had
@@ -3652,9 +3652,9 @@ uint64_t server_guard_touched_budget(uint64_t kv_budget_bytes, uint64_t eager_by
  * bank provisioning, the guard's live budget, each prefill quantum and each disk-KV persist.  Until init runs (a
  * test, a tool) it is the OS margin alone. */
 /** The derived floor (bytes). */
-uint64_t server_mem_floor(void);
+KvBytes server_mem_floor(void);
 /** Derive and set the floor: the OS margin + `zone_high_bytes` + `step_bytes`; returns it. */
-uint64_t server_mem_floor_init(uint64_t zone_high_bytes, uint64_t step_bytes);
+KvBytes server_mem_floor_init(uint64_t zone_high_bytes, KvBytes step_bytes);
 /** Sum of every zone's `high` watermark in a /proc/zoneinfo text, in bytes (pages of `page_bytes`); 0 when none
  *  parses (the caller logs it and the floor keeps the OS margin). */
 uint64_t server_zoneinfo_high_bytes(const char *zoneinfo, uint64_t page_bytes);
@@ -3666,12 +3666,12 @@ uint64_t server_zone_high_watermark_bytes(void);
 uint64_t server_persist_host_bytes(int tokens);
 #define PERSIST_TEXT_BYTES_PER_TOKEN 64u
 /** Does MemAvailable `avail` leave `floor` after `need` more bytes?  avail 0 (unreadable) is no. */
-bool server_headroom_admits(uint64_t avail, uint64_t need, uint64_t floor);
+bool server_headroom_admits(KvBytes avail, KvBytes need, KvBytes floor);
 /** The per-chunk prefill re-check's next move (server::prefill_headroom_ok): GO when MemAvailable covers the chunk
  *  over the floor; else SPILL while an idle bank can go, else PREEMPT while a decoder can, else REFUSE. */
 typedef enum { PREFILL_MEM_GO = 0, PREFILL_MEM_SPILL, PREFILL_MEM_PREEMPT, PREFILL_MEM_REFUSE, PREFILL_MEM_STEPS } prefill_mem_step;
 extern const char *const prefill_mem_step_names[PREFILL_MEM_STEPS];
-prefill_mem_step server_prefill_mem_step(uint64_t avail, uint64_t need, uint64_t floor, int n_idle_victims,
+prefill_mem_step server_prefill_mem_step(KvBytes avail, KvBytes need, KvBytes floor, int n_idle_victims,
                                          bool preemptible);
 
 /* MemAvailable from /proc/meminfo, in bytes (0 on parse failure — callers

@@ -487,9 +487,9 @@ bool server::send_metrics(int fd) {
     const unsigned long long restore_failures = (unsigned long long)s->m_restore_failures;
     const unsigned long long restore_slices = (unsigned long long)s->m_restore_slices;    /* L330 */
     const double restore_stall_max_s = s->m_restore_stall_max_ms / 1000.0;
-    const unsigned long long kv_touched = (unsigned long long)s->m_kv_touched;            /* L328 */
-    const unsigned long long kv_reserved = (unsigned long long)s->m_kv_reserved;
-    const unsigned long long kv_budget_live = (unsigned long long)s->m_kv_budget;   /* 2026-10-29 */
+    const unsigned long long kv_touched = (unsigned long long)s->m_kv_touched.raw();      /* L328 */
+    const unsigned long long kv_reserved = (unsigned long long)s->m_kv_reserved.raw();
+    const unsigned long long kv_budget_live = (unsigned long long)s->m_kv_budget.raw();   /* 2026-10-29 */
     const unsigned long long persist_skipped = (unsigned long long)s->m_persist_skipped;
     const unsigned long long prefill_mem_refusals = (unsigned long long)s->m_prefill_mem_refusals;
     const kv_restore_meter disk_meter = s->kv.meter;   /* L310 */
@@ -497,7 +497,7 @@ bool server::send_metrics(int fd) {
     const unsigned long long readmissions = (unsigned long long)s->m_readmissions;
     const kv_dup_census dup = s->m_dup;                                              /* L324 */
     const unsigned long long dup_censuses = (unsigned long long)s->m_dup_censuses;
-    const unsigned long long dup_bytes_peak = (unsigned long long)s->m_dup_bytes_peak;
+    const unsigned long long dup_bytes_peak = (unsigned long long)s->m_dup_bytes_peak.raw();
     unsigned long long prefix_waits[PREFIX_WAIT_OUTCOMES];                          /* L329 (a) */
     for (int i = 0; i < PREFIX_WAIT_OUTCOMES; i++) prefix_waits[i] = (unsigned long long)s->m_prefix_waits[i];
     const unsigned long long prefix_wait_gain = (unsigned long long)s->m_prefix_wait_gain;
@@ -822,7 +822,7 @@ bool server::send_metrics(int fd) {
     buf_printf(&b, "pulsar:kv_dup_page_tokens %d\n", dup.grid);
     buf_puts(&b, "# HELP pulsar:kv_dup_page_bytes GPU KV bytes one bank holds for one page.\n");
     buf_puts(&b, "# TYPE pulsar:kv_dup_page_bytes gauge\n");
-    buf_printf(&b, "pulsar:kv_dup_page_bytes %llu\n", (unsigned long long)dup.page_bytes);
+    buf_printf(&b, "pulsar:kv_dup_page_bytes %llu\n", (unsigned long long)dup.page_bytes.raw());
     buf_puts(&b, "# HELP pulsar:kv_dup_banks Resident banks holding at least one whole page.\n");
     buf_puts(&b, "# TYPE pulsar:kv_dup_banks gauge\n");
     buf_printf(&b, "pulsar:kv_dup_banks %d\n", dup.banks);
@@ -840,7 +840,7 @@ bool server::send_metrics(int fd) {
     buf_printf(&b, "pulsar:kv_dup_pages_duplicate %llu\n", (unsigned long long)dup.pages_duplicate);
     buf_puts(&b, "# HELP pulsar:kv_dup_bytes GPU KV bytes the extra page copies cost.\n");
     buf_puts(&b, "# TYPE pulsar:kv_dup_bytes gauge\n");
-    buf_printf(&b, "pulsar:kv_dup_bytes %llu\n", (unsigned long long)dup.dup_bytes);
+    buf_printf(&b, "pulsar:kv_dup_bytes %llu\n", (unsigned long long)dup.dup_bytes.raw());
     buf_puts(&b, "# HELP pulsar:kv_dup_bytes_peak The largest kv_dup_bytes any census saw since start.\n");
     buf_puts(&b, "# TYPE pulsar:kv_dup_bytes_peak gauge\n");
     buf_printf(&b, "pulsar:kv_dup_bytes_peak %llu\n", dup_bytes_peak);
@@ -962,7 +962,7 @@ bool server::send_metrics(int fd) {
     buf_printf(&b, "pulsar:kv_ledger_committed_bytes %llu\n", ledger_committed);
     buf_puts(&b, "# HELP pulsar:kv_bank_bytes KV bytes one bank holds at the configured context, compressed rows plus index. Demand-paged under overcommit: reserved as VA, resident on touch.\n");
     buf_puts(&b, "# TYPE pulsar:kv_bank_bytes gauge\n");
-    buf_printf(&b, "pulsar:kv_bank_bytes %llu\n", (unsigned long long)s->kv_bank_bytes);
+    buf_printf(&b, "pulsar:kv_bank_bytes %llu\n", (unsigned long long)s->kv_bank_bytes.raw());
     buf_puts(&b, "# HELP pulsar:kv_ledger_budget_bytes Admission ceiling computed at startup.\n");
     buf_puts(&b, "# TYPE pulsar:kv_ledger_budget_bytes gauge\n");
     buf_printf(&b, "pulsar:kv_ledger_budget_bytes %llu\n", ledger_budget);
@@ -976,10 +976,10 @@ bool server::send_metrics(int fd) {
     buf_puts(&b, "# HELP pulsar:kv_touched_ceiling_bytes The startup ceiling the live touched budget never exceeds (min of the ledger share and the post-warmup headroom, L319; 0 = guard off).\n");
     buf_puts(&b, "# TYPE pulsar:kv_touched_ceiling_bytes gauge\n");
     buf_printf(&b, "pulsar:kv_touched_ceiling_bytes %llu\n",
-               s->guard_enabled ? (unsigned long long)s->guard_touched_ceiling : 0ULL);
+               s->guard_enabled ? (unsigned long long)s->guard_touched_ceiling.raw() : 0ULL);
     buf_puts(&b, "# HELP pulsar:mem_floor_bytes MemAvailable every admission, guard, prefill and persist check keeps free (OS margin + kernel high watermarks + one step's demand).\n");
     buf_puts(&b, "# TYPE pulsar:mem_floor_bytes gauge\n");
-    buf_printf(&b, "pulsar:mem_floor_bytes %llu\n", (unsigned long long)server_mem_floor());
+    buf_printf(&b, "pulsar:mem_floor_bytes %llu\n", (unsigned long long)server_mem_floor().raw());
     buf_puts(&b, "# HELP pulsar:kv_persist_skipped_total Disk-KV persists skipped because MemAvailable could not cover them over the memory floor.\n");
     buf_puts(&b, "# TYPE pulsar:kv_persist_skipped_total counter\n");
     buf_printf(&b, "pulsar:kv_persist_skipped_total %llu\n", persist_skipped);
@@ -994,7 +994,7 @@ bool server::send_metrics(int fd) {
     buf_puts(&b, "# HELP pulsar:kv_eager_floor_bytes Eager KV floor already resident that the eviction guard's ledger share subtracts (kv budget minus this, L319/L326; 0 = guard off).\n");
     buf_puts(&b, "# TYPE pulsar:kv_eager_floor_bytes gauge\n");
     buf_printf(&b, "pulsar:kv_eager_floor_bytes %llu\n",
-               s->guard_enabled ? (unsigned long long)s->guard_eager_bytes : 0ULL);
+               s->guard_enabled ? (unsigned long long)s->guard_eager_bytes.raw() : 0ULL);
     /* L328: the resident KV every guard and admission decision reads, and the base they read it from (touched plus
      * what the admitted prompts and restoring chains still add) */
     buf_puts(&b, "# HELP pulsar:kv_touched_bytes Demand-paged KV resident now, the pool's high-water rows (0 = guard off).\n");

@@ -6,6 +6,8 @@
 #include <stdint.h>
 #include <stdio.h>
 
+#include "lib/pulsar_units.h"   /* KvRows / KvBytes: the KV accounting's units (L333) */
+
 
 /* Public engine boundary.
  *
@@ -451,7 +453,7 @@ uint64_t pulsar_engine_session_cost_bytes_banked(pulsar_engine *e, int ctx_size,
  * context — the physical-on-touch VA the overcommit auto-size reserves but does
  * NOT charge at admission (only the eager floor is charged). 0 if no session
  * could be priced. */
-uint64_t pulsar_engine_demand_paged_bytes_per_bank(pulsar_engine *e, int ctx_size);
+KvBytes pulsar_engine_demand_paged_bytes_per_bank(pulsar_engine *e, int ctx_size);
 /** The bank-pool size the next session will be created with, and whether the
  * operator pinned it (PULSAR_MSEQ_BANKS).  A server that derives the size
  * itself SETS it here -- the engine owns the number; nothing else parses the
@@ -464,7 +466,7 @@ void     pulsar_engine_set_bank_pool(uint32_t n_banks);
  * accounting-exactness gate proves it matches the physical cudaMemGetInfo delta.
  * For the current bank the live frontier is used; idle banks use their captured
  * frontier — capture the current bank first if you need it fully current. */
-uint64_t pulsar_session_touched_kv_bytes(const pulsar_session *s);
+KvBytes pulsar_session_touched_kv_bytes(const pulsar_session *s);
 /** Tier-2 task #55 increment 2b — per-bank physical evict/restore for the proactive
  * eviction guard. free_physical: DIRECT cudaFree of one idle bank's split comp/index
  * (reclaims physical on GB10); caller must have persisted the bank's KV to DISK
@@ -481,10 +483,11 @@ uint64_t pulsar_session_touched_kv_bytes(const pulsar_session *s);
 bool pulsar_session_bank_free_physical(pulsar_session *s, uint32_t bank);
 bool pulsar_session_bank_alloc_physical(pulsar_session *s, uint32_t bank);
 bool pulsar_session_bank_is_evicted(const pulsar_session *s, uint32_t bank);
-uint64_t pulsar_session_bank_touched_kv_bytes(pulsar_session *s, uint32_t bank);
-/** Conservative per-bank comp/index growth over one q-token decode quantum (the
- * guard's Delta term; over-charges the index side so the guard fires early). */
-uint64_t pulsar_session_quantum_growth_bytes_per_bank(pulsar_session *s, uint32_t q);
+KvBytes pulsar_session_bank_touched_kv_bytes(pulsar_session *s, uint32_t bank);
+/** Conservative per-bank comp/index growth over `q` token rows (the guard's Delta term over a decode quantum, a
+ * prompt's KV, a prefill chunk's): the ONE conversion of rows to bytes, the family's own price (family.h
+ * growth_bytes) -- each pool rounds its own rows, so there is no scalar bytes-per-row (pulsar_units.h). */
+KvBytes pulsar_session_quantum_growth_bytes_per_bank(pulsar_session *s, KvRows q);
 /** GPU bytes the session's create allocated (allocator delta measured across
  * pulsar_session_create).  Equal to pulsar_engine_session_cost_bytes at the
  * same context and pool size -- the server asserts it after each create. */

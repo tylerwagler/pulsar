@@ -190,7 +190,8 @@ int main(int argc, char **argv) {
         const double t0 = now_s();
         bool ok = pulsar_session_create(&s, e, ctx) == 0 && pulsar_session_sync(s, &P, err, sizeof err) == 0;
         const double t1 = now_s();
-        const uint64_t touched = ok ? pulsar_session_touched_kv_bytes(s) : 0, resident = ok ? pulsar_session_resident_bytes(s) : 0;
+        const uint64_t touched = ok ? pulsar_session_touched_kv_bytes(s).raw() : 0;
+        const uint64_t resident = ok ? pulsar_session_resident_bytes(s) : 0;
         CHECK(ok, "COLD sync(P[0:%d]) in one call: %.1f s (%.0f tok/s); touched KV %.2f GiB (%.0f B/token), resident %.2f GiB %s",
               D, t1 - t0, D / (t1 - t0), touched / 1073741824.0, (double)touched / D, resident / 1073741824.0, err);
         ok = ok && after_sync(s, next, W, &cold, err, sizeof err);

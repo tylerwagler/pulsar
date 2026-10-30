@@ -285,11 +285,12 @@ typedef struct {
     uint32_t (*live)(pulsar_session *s);
     /** L270: the demand-paged (physical-on-touch) KV bytes ONE bank reserves at ctx_size -- the share
      * admission prices as it is touched, not up front. */
-    uint64_t (*demand_paged_bytes)(pulsar_engine *e, int ctx_size);
+    KvBytes (*demand_paged_bytes)(pulsar_engine *e, int ctx_size);
     /** L270: `bank`'s touched demand-paged KV: what its pages physically hold. */
-    uint64_t (*touched_kv_bytes)(pulsar_session *s, uint32_t bank);
-    /** L270: the most one bank's touched KV can grow over a decode quantum of q tokens. */
-    uint64_t (*growth_bytes)(pulsar_session *s, uint32_t q);
+    KvBytes (*touched_kv_bytes)(pulsar_session *s, uint32_t bank);
+    /** L270: the most one bank's touched KV can grow over q token rows (a decode quantum, a prompt, a chunk): the
+     *  family's one conversion of rows to bytes (L333). */
+    KvBytes (*growth_bytes)(pulsar_session *s, KvRows q);
     /** L284 #3: return an idle bank's demand-paged KV physical (cudaFree) -- the
      *  pulsar_session_bank_free_physical contract: false ONLY on a refusal (the live bank, a
      *  bank out of range) with nothing freed; true = the bank is evicted, its touched KV 0. */
