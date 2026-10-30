@@ -1292,10 +1292,10 @@ uint64_t pulsar_engine::session_cost_bytes(int ctx_size) {
     return session_cost_bytes_banked(ctx_size, (int)gpu_graph_bank_pool_n());
 }
 
-uint64_t pulsar_engine::demand_paged_bytes_per_bank(int ctx_size) {
+KvBytes pulsar_engine::demand_paged_bytes_per_bank(int ctx_size) {
     auto *e = this;
-    if (!e || ctx_size <= 0) return 0;
-    if (!pulsar_backend_uses_graph(e->backend) || !e->gpu_ready) return 0;
+    if (!e || ctx_size <= 0) return KvBytes{};
+    if (!pulsar_backend_uses_graph(e->backend) || !e->gpu_ready) return KvBytes{};
     return gpu_graph_demand_paged_bytes_per_bank((uint32_t)ctx_size);
 }
 

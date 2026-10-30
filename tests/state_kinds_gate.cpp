@@ -106,8 +106,9 @@ static void plan_a(void) {
           (unsigned long long)dry);
     check(managed == (uint64_t)banks * 7 * ctx * KV_ROW, "demand-paged %llu B == banks x 7 global layers x ctx x 4 KiB",
           (unsigned long long)managed);
-    check(pulsar_state_pool_bytes_at(ss, 1000) == 7ull * 1000 * KV_ROW, "a bank's 1000 touched tokens: %llu B of pool",
-          (unsigned long long)pulsar_state_pool_bytes_at(ss, 1000));
+    check(pulsar_state_pool_bytes_at(ss, KvRows{1000}) == KvBytes{7ull * 1000 * KV_ROW},
+          "a bank's 1000 touched tokens: %llu B of pool",
+          (unsigned long long)pulsar_state_pool_bytes_at(ss, KvRows{1000}).raw());
     const uint64_t slot = 42 * SCONV_BYTES + 35 * ring;
     check(ss->ckpt.slot_bytes == ((slot + 255u) & ~255ull), "a checkpoint slot: every SConv state and ring (%llu B)",
           (unsigned long long)ss->ckpt.slot_bytes);

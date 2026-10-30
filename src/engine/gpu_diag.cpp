@@ -343,8 +343,8 @@ static void gpu_graph_compute_dims(
  * floor is charged; physical materializes as the frontier grows, tracked by
  * pulsar_session_touched_kv_bytes).  The comp/index term of the KV-policy sizing,
  * from the same function (steering.cpp). */
-uint64_t gpu_graph_demand_paged_bytes_per_bank(uint32_t ctx_size) {
-    return gpu_graph_comp_index_bytes_for_context(ctx_size);
+KvBytes gpu_graph_demand_paged_bytes_per_bank(uint32_t ctx_size) {
+    return KvBytes{gpu_graph_comp_index_bytes_for_context(ctx_size)};
 }
 
 
@@ -1015,10 +1015,10 @@ void gpu_graph_bank_counters_install(pulsar_gpu_graph *g, uint32_t bank) {
  * both halves: growth tracks the physical delta, and a rewind leaves both still.
  * Only the ctx-scaled comp/index are counted; the eager raw ring + state lanes
  * are the fixed floor and are already resident. */
-uint64_t gpu_graph_bank_touched_kv_bytes(const pulsar_gpu_graph *g, uint32_t bank) {
-    if (!g) return 0;
+KvBytes gpu_graph_bank_touched_kv_bytes(const pulsar_gpu_graph *g, uint32_t bank) {
+    if (!g) return KvBytes{};
     const uint32_t nb = gpu_graph_bank_pool_count(g);
-    if (bank >= nb) return 0;
+    if (bank >= nb) return KvBytes{};
     const uint64_t attn_row = pulsar_kv_row_bytes(PULSAR_KV_ROW_COMP);
     const uint64_t idx_row = pulsar_kv_row_bytes(PULSAR_KV_ROW_INDEX);
     uint64_t bytes = 0;
@@ -1027,14 +1027,15 @@ uint64_t gpu_graph_bank_touched_kv_bytes(const pulsar_gpu_graph *g, uint32_t ban
         /* one emit writes a comp row AND an index-K row */
         bytes += (uint64_t)g->ms_comp_hw[bank][il] * (attn_row + idx_row);
     }
-    return bytes;
+    return KvBytes{bytes};   /* per-layer compressed rows times their row bytes: the conversion, raw inside */
 }
 
 /* Tier-2 task #55 increment 2b — CONSERVATIVE per-bank comp/index growth over one
  * decode quantum of `q` tokens: Σ_kv-sources ceil(q/ratio)·(comp_row + index_row)
  * (one emit writes both rows).  Position-independent, so total Δ =
  * n_live_growing_banks × this. */
-uint64_t gpu_graph_quantum_growth_bytes_per_bank(uint32_t q) {
+KvBytes gpu_graph_quantum_growth_bytes_per_bank(KvRows rows) {
+    const uint32_t q = (uint32_t)rows.raw();   /* token rows, uint32 as before; each layer compresses them by its ratio */
     const uint64_t attn_row = pulsar_kv_row_bytes(PULSAR_KV_ROW_COMP);
     const uint64_t idx_row = pulsar_kv_row_bytes(PULSAR_KV_ROW_INDEX);
     uint64_t bytes = 0;
@@ -1043,7 +1044,7 @@ uint64_t gpu_graph_quantum_growth_bytes_per_bank(uint32_t q) {
         const uint32_t ratio = pulsar_layer_compress_ratio(il);
         bytes += (uint64_t)((q + ratio - 1u) / ratio) * (attn_row + idx_row);
     }
-    return bytes;
+    return KvBytes{bytes};
 }
 
 bool gpu_graph_multiseq_step_begin(pulsar_gpu_graph *g, const int32_t *pos,

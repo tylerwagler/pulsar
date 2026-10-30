@@ -7507,29 +7507,35 @@ static void test_kv_admission_budget_math(void) {
  * 31.24 GiB, nothing touched.  The ledger's share alone was 9.05 GiB of touched KV against 5.18 GiB above the floor:
  * the guard never spilled and the box ran dry (rows/L319.md).  At the ceiling, MemAvailable must still read the
  * floor: avail − (ceiling − touched) >= floor, whatever the inputs. */
+/** L333: a test's byte figure entered into the KV accounting's unit (pulsar_units.h); the tests below keep their
+ *  arithmetic in plain integers and type it at the call, as the server types a measured or configured figure. */
+static constexpr KvBytes kvb(uint64_t v) { return KvBytes{v}; }
+
 static void test_guard_touched_budget_is_physical(void) {
     const uint64_t MiB = 1024ull * 1024ull;
     const uint64_t GiB = 1024ull * MiB;
     const uint64_t F = PULSAR_SERVER_MEM_FLOOR_BYTES;
     const uint64_t avail = 9400ull * MiB, budget = 41257ull * MiB, eager = 31990ull * MiB;   /* 9.18 / 40.29 / 31.24 */
-    const uint64_t c = server_guard_touched_budget(budget, eager, 0, avail);
-    TEST_ASSERT(c == avail - F);                     /* the headroom binds, not the ledger's 9.05 GiB */
-    TEST_ASSERT(c < budget - eager);
+    const KvBytes c = server_guard_touched_budget(kvb(budget), kvb(eager), kvb(0), kvb(avail));
+    TEST_ASSERT(c == kvb(avail - F));                /* the headroom binds, not the ledger's 9.05 GiB */
+    TEST_ASSERT(c < kvb(budget - eager));
     /* pages the warmup touched are already out of MemAvailable: they count toward the ceiling */
-    TEST_ASSERT(server_guard_touched_budget(budget, eager, 1 * GiB, avail) == avail - F + 1 * GiB);
+    TEST_ASSERT(server_guard_touched_budget(kvb(budget), kvb(eager), kvb(1 * GiB), kvb(avail)) ==
+                kvb(avail - F + 1 * GiB));
     /* a roomy box: the ledger's share binds */
-    TEST_ASSERT(server_guard_touched_budget(budget, eager, 0, 64 * GiB) == budget - eager);
+    TEST_ASSERT(server_guard_touched_budget(kvb(budget), kvb(eager), kvb(0), kvb(64 * GiB)) == kvb(budget - eager));
     /* no headroom, or /proc/meminfo unreadable: 0 (startup refuses rather than run the pool unguarded) */
-    TEST_ASSERT(server_guard_touched_budget(budget, eager, 0, F) == 0);
-    TEST_ASSERT(server_guard_touched_budget(budget, eager, 0, F - 1) == 0);
-    TEST_ASSERT(server_guard_touched_budget(budget, eager, 0, 0) == 0);
-    TEST_ASSERT(server_guard_touched_budget(eager, eager, 0, avail) == 0);
-    TEST_ASSERT(server_guard_touched_budget(UINT64_MAX, 0, UINT64_MAX, avail) == UINT64_MAX);   /* no wrap */
+    TEST_ASSERT(server_guard_touched_budget(kvb(budget), kvb(eager), kvb(0), kvb(F)) == KvBytes{});
+    TEST_ASSERT(server_guard_touched_budget(kvb(budget), kvb(eager), kvb(0), kvb(F - 1)) == KvBytes{});
+    TEST_ASSERT(server_guard_touched_budget(kvb(budget), kvb(eager), kvb(0), kvb(0)) == KvBytes{});
+    TEST_ASSERT(server_guard_touched_budget(kvb(eager), kvb(eager), kvb(0), kvb(avail)) == KvBytes{});
+    TEST_ASSERT(server_guard_touched_budget(kvb(UINT64_MAX), kvb(0), kvb(UINT64_MAX), kvb(avail)) ==
+                KvBytes::max());   /* no wrap */
     /* the invariant over a sweep */
     for (uint64_t a = F + 1; a < 40 * GiB; a += 777 * MiB)
         for (uint64_t t = 0; t < 8 * GiB; t += 1531 * MiB)
             for (uint64_t b = 0; b < 64 * GiB; b += 2999 * MiB) {
-                const uint64_t ceil = server_guard_touched_budget(b, eager / 4, t, a);
+                const uint64_t ceil = server_guard_touched_budget(kvb(b), kvb(eager / 4), kvb(t), kvb(a)).raw();
                 TEST_ASSERT(ceil <= t || a - (ceil - t) >= F);
             }
 }
@@ -8567,18 +8573,18 @@ static void test_l179_bank_floor_exempts_first_bank(void) {
  * lowest index on a tie, provisioned banks never; -1 on a full pool. */
 static void test_bank_pick_prefers_resident_hole(void) {
     bool prov[6] = {true, false, false, true, false, false};
-    uint64_t res[6] = {999, 0, 0, 999, 0, 0};
+    KvBytes res[6] = {kvb(999), kvb(0), kvb(0), kvb(999), kvb(0), kvb(0)};
     TEST_ASSERT(server_pick_free_bank(prov, res, 6) == 1);    /* all fresh: lowest */
-    res[4] = 5;
+    res[4] = kvb(5);
     TEST_ASSERT(server_pick_free_bank(prov, res, 6) == 4);    /* the recycled hole */
-    res[2] = 7;
+    res[2] = kvb(7);
     TEST_ASSERT(server_pick_free_bank(prov, res, 6) == 2);    /* the most resident */
-    res[5] = 7;
+    res[5] = kvb(7);
     TEST_ASSERT(server_pick_free_bank(prov, res, 6) == 2);    /* tie: lowest index */
-    res[0] = 1ull << 40;                                      /* provisioned: ignored */
+    res[0] = kvb(1ull << 40);                                 /* provisioned: ignored */
     TEST_ASSERT(server_pick_free_bank(prov, res, 6) == 2);
     bool full[3] = {true, true, true};
-    uint64_t r3[3] = {0, 0, 0};
+    KvBytes r3[3] = {kvb(0), kvb(0), kvb(0)};
     TEST_ASSERT(server_pick_free_bank(full, r3, 3) == -1);
 }
 
@@ -9803,8 +9809,8 @@ static void test_l324_kv_dup_census(void) {
     set(3, 4, 14000); set(3, 5, 200); set(4, 5, 200);
     kv_dup_census c;
     uint32_t deep[N];
-    kv_dup_census_core(N, hist_len, resident, common, G, PB, &c, deep);
-    TEST_ASSERT(c.grid == G && c.page_bytes == PB);
+    kv_dup_census_core(N, hist_len, resident, common, G, kvb(PB), &c, deep);
+    TEST_ASSERT(c.grid == G && c.page_bytes == kvb(PB));
     TEST_ASSERT(c.banks == 5);                       /* the spilled and the empty bank hold no page */
     TEST_ASSERT(c.pages_resident == 43 + 7 + 6 + 36 + 2);
     /* p0-1: {0,1,2,4} {5}; p2: {0,1,2,4}; p3-4: {0,4} {1,2}; p5: {0,4} {1} {2} (24500 < 6*4096); p6: {0,4} {1};
@@ -9812,14 +9818,14 @@ static void test_l324_kv_dup_census(void) {
     TEST_ASSERT(c.pages_distinct == 2 + 2 + 1 + 2 + 2 + 3 + 2 + 29 + 7);
     TEST_ASSERT(c.pages_shared == 1 + 1 + 1 + 2 + 2 + 1 + 1 + 29);
     TEST_ASSERT(c.pages_duplicate == 44);
-    TEST_ASSERT(c.dup_bytes == 44 * PB);
+    TEST_ASSERT(c.dup_bytes == kvb(44 * PB));
     TEST_ASSERT(c.pairs[0] == 5 && c.pairs[1] == 1);  /* (0,1) (0,2) (1,2) (1,4) (2,4); deep (0,4); 5 shares no page */
     TEST_ASSERT(c.longest[0] == 24500 && c.longest[1] == 150000);
     TEST_ASSERT(deep[0] == 1u << 4);
     for (int a = 1; a < N; a++) TEST_ASSERT(deep[a] == 0);
     /* the spilled sibling resident again: it shares p0-4 with 1 and 2 and p0-2 with 0 and 4 */
     resident[3] = true;
-    kv_dup_census_core(N, hist_len, resident, common, G, PB, &c, NULL);
+    kv_dup_census_core(N, hist_len, resident, common, G, kvb(PB), &c, NULL);
     TEST_ASSERT(c.banks == 6 && c.pages_resident == 94 + 6);
     TEST_ASSERT(c.pages_duplicate == 44 + 5 && c.pairs[0] == 5 + 4);
     /* exactly reaching a page end shares it: two identical 8192-token copies hold 2 pages once each */
@@ -9828,16 +9834,16 @@ static void test_l324_kv_dup_census(void) {
         bool rs[2] = {true, true};
         int r[2][2] = {{-1, 8192}, {8192, -1}};
         const int *cm[2] = {r[0], r[1]};
-        kv_dup_census_core(2, hl, rs, cm, G, PB, &c, NULL);
+        kv_dup_census_core(2, hl, rs, cm, G, kvb(PB), &c, NULL);
         TEST_ASSERT(c.pages_resident == 4 && c.pages_distinct == 2 && c.pages_shared == 2 && c.pages_duplicate == 2);
         TEST_ASSERT(c.pairs[0] == 1 && c.longest[0] == 8192 && c.pairs[1] == 0);
         r[0][1] = r[1][0] = 8191;   /* one token short of the second page end */
-        kv_dup_census_core(2, hl, rs, cm, G, PB, &c, NULL);
+        kv_dup_census_core(2, hl, rs, cm, G, kvb(PB), &c, NULL);
         TEST_ASSERT(c.pages_distinct == 3 && c.pages_duplicate == 1);
     }
     /* no grid, no census */
-    kv_dup_census_core(N, hist_len, resident, common, 0, PB, &c, deep);
-    TEST_ASSERT(c.pages_resident == 0 && c.dup_bytes == 0 && deep[0] == 0);
+    kv_dup_census_core(N, hist_len, resident, common, 0, kvb(PB), &c, deep);
+    TEST_ASSERT(c.pages_resident == 0 && c.dup_bytes == KvBytes{} && deep[0] == 0);
 }
 
 /* L323 (4): the ONE bank-dominance predicate (bank_dominated_core; L179 branch 6's superseded scan before it).
@@ -9987,26 +9993,26 @@ static void test_l179_guard_victim_skips_live_spilled(void) {
  * saturates at zero. */
 static void test_l179_guard_spill_plan_is_minimum(void) {
     const uint64_t GiB = 1024ull * 1024ull * 1024ull;
-    const uint64_t drops[3] = {GiB, GiB, GiB};
+    const KvBytes drops[3] = {kvb(GiB), kvb(GiB), kvb(GiB)};
     /* fits (exactly at the bound): no spill */
-    TEST_ASSERT(guard_spill_plan(10 * GiB, GiB, 11 * GiB, drops, 3) == 0);
+    TEST_ASSERT(guard_spill_plan(kvb(10 * GiB), kvb(GiB), kvb(11 * GiB), drops, 3) == 0);
     /* breach by one byte, three victims available: exactly one spill */
-    TEST_ASSERT(guard_spill_plan(10 * GiB + 1, GiB, 11 * GiB, drops, 3) == 1);
+    TEST_ASSERT(guard_spill_plan(kvb(10 * GiB + 1), kvb(GiB), kvb(11 * GiB), drops, 3) == 1);
     /* breach that one victim cannot clear: two */
-    TEST_ASSERT(guard_spill_plan(12 * GiB, GiB, 11 * GiB, drops, 3) == 2);
+    TEST_ASSERT(guard_spill_plan(kvb(12 * GiB), kvb(GiB), kvb(11 * GiB), drops, 3) == 2);
     /* breach with no victim: nothing to spill (caller back-pressures) */
-    TEST_ASSERT(guard_spill_plan(12 * GiB, GiB, 11 * GiB, NULL, 0) == 0);
+    TEST_ASSERT(guard_spill_plan(kvb(12 * GiB), kvb(GiB), kvb(11 * GiB), NULL, 0) == 0);
     /* victims exhausted while still breaching: all three (caller back-pressures) */
-    TEST_ASSERT(guard_spill_plan(20 * GiB, GiB, 11 * GiB, drops, 3) == 3);
+    TEST_ASSERT(guard_spill_plan(kvb(20 * GiB), kvb(GiB), kvb(11 * GiB), drops, 3) == 3);
     /* a hollow victim (nothing resident) does not clear the breach by itself */
-    const uint64_t hollow[2] = {0, GiB};
-    TEST_ASSERT(guard_spill_plan(10 * GiB + 1, GiB, 11 * GiB, hollow, 2) == 2);
+    const KvBytes hollow[2] = {kvb(0), kvb(GiB)};
+    TEST_ASSERT(guard_spill_plan(kvb(10 * GiB + 1), kvb(GiB), kvb(11 * GiB), hollow, 2) == 2);
     /* a drop above the running total saturates instead of wrapping */
-    const uint64_t huge[1] = {100 * GiB};
-    TEST_ASSERT(guard_spill_plan(12 * GiB, GiB, 11 * GiB, huge, 1) == 1);
+    const KvBytes huge[1] = {kvb(100 * GiB)};
+    TEST_ASSERT(guard_spill_plan(kvb(12 * GiB), kvb(GiB), kvb(11 * GiB), huge, 1) == 1);
     /* growth alone can breach an empty pool: nothing resident to drop, so
      * every victim is "spilled" to no effect and the caller back-pressures */
-    TEST_ASSERT(guard_spill_plan(0, 2 * GiB, GiB, drops, 3) == 3);
+    TEST_ASSERT(guard_spill_plan(kvb(0), kvb(2 * GiB), kvb(GiB), drops, 3) == 3);
 }
 
 /* L280 -- the prompt's KV admission (server_prompt_kv_verdict).  The case that took the box down: a third 1M chain
@@ -10018,25 +10024,32 @@ static void test_l179_guard_spill_plan_is_minimum(void) {
 static void test_l280_prompt_kv_admission(void) {
     const uint64_t GiB = 1024ull * 1024ull * 1024ull;
     int k = -1;
-    const uint64_t drops[3] = {3 * GiB, 2 * GiB, 5 * GiB};
+    const KvBytes drops[3] = {kvb(3 * GiB), kvb(2 * GiB), kvb(5 * GiB)};
     /* fits, exactly at the bound */
-    TEST_ASSERT(server_prompt_kv_verdict(10 * GiB, 13 * GiB, 23 * GiB, drops, 3, false, &k) == PROMPT_KV_FITS && k == 0);
+    TEST_ASSERT(server_prompt_kv_verdict(kvb(10 * GiB), kvb(13 * GiB), kvb(23 * GiB), drops, 3, false,
+                                         &k) == PROMPT_KV_FITS && k == 0);
     /* the window-C case: 29 GiB resident (two 1M banks: pinned bank 0 + a bound one), +14.6 GiB, budget 23.18 GiB */
     const uint64_t t = 29 * GiB, d = 14 * GiB + 600 * 1024 * 1024, b = 23 * GiB + 180 * 1024 * 1024;
-    TEST_ASSERT(server_prompt_kv_verdict(t, d, b, NULL, 0, true, &k) == PROMPT_KV_WAIT && k == 0);
-    TEST_ASSERT(server_prompt_kv_verdict(t, d, b, NULL, 0, false, &k) == PROMPT_KV_REFUSE && k == 0);
+    TEST_ASSERT(server_prompt_kv_verdict(kvb(t), kvb(d), kvb(b), NULL, 0, true, &k) == PROMPT_KV_WAIT && k == 0);
+    TEST_ASSERT(server_prompt_kv_verdict(kvb(t), kvb(d), kvb(b), NULL, 0, false, &k) == PROMPT_KV_REFUSE && k == 0);
     /* idle victims that make room: the minimum number, in their order */
-    TEST_ASSERT(server_prompt_kv_verdict(12 * GiB, 13 * GiB, 23 * GiB, drops, 3, false, &k) == PROMPT_KV_SPILL && k == 1);
-    TEST_ASSERT(server_prompt_kv_verdict(14 * GiB, 13 * GiB, 23 * GiB, drops, 3, false, &k) == PROMPT_KV_SPILL && k == 2);
+    TEST_ASSERT(server_prompt_kv_verdict(kvb(12 * GiB), kvb(13 * GiB), kvb(23 * GiB), drops, 3, false,
+                                         &k) == PROMPT_KV_SPILL && k == 1);
+    TEST_ASSERT(server_prompt_kv_verdict(kvb(14 * GiB), kvb(13 * GiB), kvb(23 * GiB), drops, 3, false,
+                                         &k) == PROMPT_KV_SPILL && k == 2);
     /* victims that cannot make room are never spilled: wait for a busy bank, or refuse */
-    const uint64_t small[2] = {GiB, GiB};
-    TEST_ASSERT(server_prompt_kv_verdict(20 * GiB, 10 * GiB, 23 * GiB, small, 2, true, &k) == PROMPT_KV_WAIT && k == 0);
-    TEST_ASSERT(server_prompt_kv_verdict(20 * GiB, 10 * GiB, 23 * GiB, small, 2, false, &k) == PROMPT_KV_REFUSE && k == 0);
+    const KvBytes small[2] = {kvb(GiB), kvb(GiB)};
+    TEST_ASSERT(server_prompt_kv_verdict(kvb(20 * GiB), kvb(10 * GiB), kvb(23 * GiB), small, 2, true,
+                                         &k) == PROMPT_KV_WAIT && k == 0);
+    TEST_ASSERT(server_prompt_kv_verdict(kvb(20 * GiB), kvb(10 * GiB), kvb(23 * GiB), small, 2, false,
+                                         &k) == PROMPT_KV_REFUSE && k == 0);
     /* a prompt past the budget by itself: refused even with everything spillable and a busy bank to wait for */
-    const uint64_t all[1] = {20 * GiB};
-    TEST_ASSERT(server_prompt_kv_verdict(20 * GiB, 24 * GiB, 23 * GiB, all, 1, true, &k) == PROMPT_KV_REFUSE && k == 0);
+    const KvBytes all[1] = {kvb(20 * GiB)};
+    TEST_ASSERT(server_prompt_kv_verdict(kvb(20 * GiB), kvb(24 * GiB), kvb(23 * GiB), all, 1, true,
+                                         &k) == PROMPT_KV_REFUSE && k == 0);
     /* nothing to add (a continuation on its own resident bank) always fits, even over a breached pool */
-    TEST_ASSERT(server_prompt_kv_verdict(30 * GiB, 0, 23 * GiB, NULL, 0, false, &k) == PROMPT_KV_FITS && k == 0);
+    TEST_ASSERT(server_prompt_kv_verdict(kvb(30 * GiB), kvb(0), kvb(23 * GiB), NULL, 0, false,
+                                         &k) == PROMPT_KV_FITS && k == 0);
 }
 
 /* L326 -- L314's readmission decides from the reserved base (server_kv_reserved), as every admission does.  gpuq
@@ -10091,23 +10104,27 @@ static void test_l328_admission_decisions(void) {
     {
         const uint64_t warm0 = 4172 * q, b = 8051 * q, frame = (1841 + 8051 + 8051 / 4) * q;   /* LW + 1.25 LB */
         int k = -1;
-        const uint64_t drop0[1] = {warm0};
-        TEST_ASSERT(server_prompt_kv_verdict(warm0 + a, b, frame, drop0, 1, true, &k) == PROMPT_KV_WAIT);
-        TEST_ASSERT(!server_preempt_fits(warm0 + a, a, 0, b, frame));      /* bank 0 not counted: no fit (the old) */
-        TEST_ASSERT(server_preempt_fits(warm0 + a, a, warm0, b, frame));   /* bank 0 spillable: the preemption fits */
-        TEST_ASSERT(server_prompt_kv_verdict(warm0, b, frame, drop0, 1, true, &k) == PROMPT_KV_SPILL && k == 1);
+        const KvBytes drop0[1] = {kvb(warm0)};
+        TEST_ASSERT(server_prompt_kv_verdict(kvb(warm0 + a), kvb(b), kvb(frame), drop0, 1, true, &k) == PROMPT_KV_WAIT);
+        TEST_ASSERT(!server_preempt_fits(kvb(warm0 + a), kvb(a), kvb(0), kvb(b),
+                                         kvb(frame)));      /* bank 0 not counted: no fit (the old) */
+        TEST_ASSERT(server_preempt_fits(kvb(warm0 + a), kvb(a), kvb(warm0), kvb(b),
+                                        kvb(frame)));   /* bank 0 spillable: the preemption fits */
+        TEST_ASSERT(server_prompt_kv_verdict(kvb(warm0), kvb(b), kvb(frame), drop0, 1, true,
+                                             &k) == PROMPT_KV_SPILL && k == 1);
         /* the readmission after B ends: B's bank and bank 0 (spilled already, or idle) are victims; A comes back */
-        const uint64_t drop_b[1] = {b};
-        TEST_ASSERT(server_prompt_kv_verdict(b, server_readmit_need(a, 0, growth), frame, drop_b, 1, false, &k) ==
+        const KvBytes drop_b[1] = {kvb(b)};
+        TEST_ASSERT(server_prompt_kv_verdict(kvb(b), server_readmit_need(kvb(a), 0, kvb(growth)), kvb(frame), drop_b, 1,
+                                             false, &k) ==
                     PROMPT_KV_SPILL && k == 1);
         /* a preemption fit never underflows: freed + idle past the base reads as an empty pool */
-        TEST_ASSERT(server_preempt_fits(a, a, warm0, b, frame));
-        TEST_ASSERT(!server_preempt_fits(a, a, warm0, frame + 1, frame));
+        TEST_ASSERT(server_preempt_fits(kvb(a), kvb(a), kvb(warm0), kvb(b), kvb(frame)));
+        TEST_ASSERT(!server_preempt_fits(kvb(a), kvb(a), kvb(warm0), kvb(frame + 1), kvb(frame)));
     }
     /* (3) the empty bank with the most resident pages (server_pick_free_bank's rule over the empty ones) */
     {
         const bool taken[4] = {true, false, true, false};   /* banks 1 and 3 are provisioned and empty */
-        const uint64_t resident[4] = {0, 7 * q, 0, 9 * q};
+        const KvBytes resident[4] = {kvb(0), kvb(7 * q), kvb(0), kvb(9 * q)};
         TEST_ASSERT(server_pick_free_bank(taken, resident, 4) == 3);
         const bool none[2] = {true, true};
         TEST_ASSERT(server_pick_free_bank(none, resident, 2) == -1);
@@ -10123,7 +10140,8 @@ static void test_l328_admission_decisions(void) {
         for (int w_on_0 = 0; w_on_0 < 2; w_on_0++) {
             /* the idle banks beside A: bank 0 holding max(W, its warmup) -- or the warmup, and W on its own bank */
             const uint64_t idle = w_on_0 ? (WARM > LW ? WARM : LW) : WARM + LW;
-            TEST_ASSERT(server_preempt_fits((idle + LA0) * q, LA0 * q, idle * q, LB * q, frame * q));   /* B alone */
+            TEST_ASSERT(server_preempt_fits(kvb((idle + LA0) * q), kvb(LA0 * q), kvb(idle * q), kvb(LB * q),
+                                            kvb(frame * q)));   /* B alone */
             TEST_ASSERT(LA0 + LB > frame);                                    /* A at arrival + B: the preemption */
             TEST_ASSERT(LA <= frame);                                         /* A's whole run alone */
             /* B on W's idle bank instead (L280's clobber route, prompt_kv_check(best)): it adds LB past what that bank
@@ -10133,14 +10151,17 @@ static void test_l328_admission_decisions(void) {
             if (w_on_0) {
                 const uint64_t hw0 = WARM > LW ? WARM : LW, A485 = 5485;
                 int k = -1;
-                TEST_ASSERT(server_prompt_kv_verdict((hw0 + A485) * q, (LB - hw0) * q, frame * q, NULL, 0, true, &k) ==
+                TEST_ASSERT(server_prompt_kv_verdict(kvb((hw0 + A485) * q), kvb((LB - hw0) * q), kvb(frame * q), NULL,
+                                                     0, true, &k) ==
                             PROMPT_KV_WAIT);
-                TEST_ASSERT(server_prompt_kv_verdict((hw0 + A485) * q, (LB - hw0) * q, (WARM + frame) * q, NULL, 0,
+                TEST_ASSERT(server_prompt_kv_verdict(kvb((hw0 + A485) * q), kvb((LB - hw0) * q),
+                                                     kvb((WARM + frame) * q), NULL, 0,
                                                      true, &k) == PROMPT_KV_FITS);
             }
             int k = -1;
-            const uint64_t drop_b[1] = {LB * q};
-            TEST_ASSERT(server_prompt_kv_verdict(LB * q, server_readmit_need(LA0 * q, 0, growth), frame * q, drop_b, 1,
+            const KvBytes drop_b[1] = {kvb(LB * q)};
+            TEST_ASSERT(server_prompt_kv_verdict(kvb(LB * q), server_readmit_need(kvb(LA0 * q), 0, kvb(growth)),
+                                                 kvb(frame * q), drop_b, 1,
                                                  false, &k) == PROMPT_KV_SPILL && k == 1);
         }
     }
@@ -10150,8 +10171,8 @@ static void test_l328_admission_decisions(void) {
     TEST_ASSERT(server_guard_may_preempt(1, true));
     TEST_ASSERT(!server_guard_may_preempt(0, false));
     /* a readmission needs its KV and the growth of every decoder stepping once it is back (it among them) */
-    TEST_ASSERT(server_readmit_need(a, 0, growth) == a + growth);
-    TEST_ASSERT(server_readmit_need(a, 2, growth) == a + 3 * growth);
+    TEST_ASSERT(server_readmit_need(kvb(a), 0, kvb(growth)) == kvb(a + growth));
+    TEST_ASSERT(server_readmit_need(kvb(a), 2, kvb(growth)) == kvb(a + 3 * growth));
     /* no preempt / readmit churn: the guard preempted the newest of 2 decoders because touched + 2 quanta did not fit
      * (the other's growth then fits); the readmission's need beside the one left is that same breach -- it waits */
     {
@@ -10159,7 +10180,8 @@ static void test_l328_admission_decisions(void) {
         const uint64_t v = 3000 * q;
         TEST_ASSERT(t + 2 * growth > budget && (t - v) + growth <= budget);
         int k = -1;
-        TEST_ASSERT(server_prompt_kv_verdict(t - v, server_readmit_need(v, 1, growth), budget, NULL, 0, true, &k) ==
+        TEST_ASSERT(server_prompt_kv_verdict(kvb(t - v), server_readmit_need(kvb(v), 1, kvb(growth)), kvb(budget), NULL,
+                                             0, true, &k) ==
                     PROMPT_KV_WAIT);
     }
 }
@@ -10324,18 +10346,20 @@ static void test_l330_sliced_restore(void) {
      * so the base an admission reads stays touched-before + W through the whole restore, slice after slice */
     {
         const uint64_t q = 13440, T0 = 4172 * q, W = 21000 * q;
-        const uint64_t want[1] = {W};
+        const KvBytes want[1] = {kvb(W)};
         for (int done = 0; done <= 6; done++) {
             const uint64_t have = (uint64_t)(done < 6 ? done * 4096 : 21000) * q;
-            const uint64_t have1[1] = {have};
-            TEST_ASSERT(server_kv_reserved(T0 + have, want, have1, 1) == T0 + W);
+            const KvBytes have1[1] = {kvb(have)};
+            TEST_ASSERT(server_kv_reserved(kvb(T0 + have), want, have1, 1) == kvb(T0 + W));
         }
         /* a prompt arriving mid-restore that fits only on what is touched does not fit on the reserved base */
         int k = -1;
         const uint64_t budget = T0 + W + 1000 * q, p = 2000 * q;
-        const uint64_t have1[1] = {8192 * q};
-        TEST_ASSERT(server_prompt_kv_verdict(T0 + 8192 * q, p, budget, NULL, 0, true, &k) == PROMPT_KV_FITS);
-        TEST_ASSERT(server_prompt_kv_verdict(server_kv_reserved(T0 + 8192 * q, want, have1, 1), p, budget, NULL, 0,
+        const KvBytes have1[1] = {kvb(8192 * q)};
+        TEST_ASSERT(server_prompt_kv_verdict(kvb(T0 + 8192 * q), kvb(p), kvb(budget), NULL, 0, true,
+                                             &k) == PROMPT_KV_FITS);
+        TEST_ASSERT(server_prompt_kv_verdict(server_kv_reserved(kvb(T0 + 8192 * q), want, have1, 1), kvb(p),
+                                             kvb(budget), NULL, 0,
                                              true, &k) == PROMPT_KV_WAIT);
     }
 }
@@ -10345,23 +10369,27 @@ static void test_l326_readmit_reserved(void) {
     const uint64_t a = 6300 * tok, b = 5966 * tok, c = 6010 * tok;
     int k = -1;
     /* C bound, nothing of it touched: the readmission waits for a job to end */
-    const uint64_t want_c[1] = {c}, none[1] = {0};
-    const uint64_t base = server_kv_reserved(a, want_c, none, 1);
-    TEST_ASSERT(base == a + c);
-    TEST_ASSERT(server_prompt_kv_verdict(a, b, budget, NULL, 0, true, &k) == PROMPT_KV_FITS);   /* the defect */
-    TEST_ASSERT(server_prompt_kv_verdict(base, b, budget, NULL, 0, true, &k) == PROMPT_KV_WAIT && k == 0);
+    const KvBytes want_c[1] = {kvb(c)}, none[1] = {kvb(0)};
+    const KvBytes base = server_kv_reserved(kvb(a), want_c, none, 1);
+    TEST_ASSERT(base == kvb(a + c));
+    TEST_ASSERT(server_prompt_kv_verdict(kvb(a), kvb(b), kvb(budget), NULL, 0, true,
+                                         &k) == PROMPT_KV_FITS);   /* the defect */
+    TEST_ASSERT(server_prompt_kv_verdict(base, kvb(b), kvb(budget), NULL, 0, true, &k) == PROMPT_KV_WAIT && k == 0);
     /* C prefilled and decoding: it holds its prompt, so it reserves nothing more -- still no room beside A and C */
-    const uint64_t have_c[1] = {c + 16 * tok};
-    TEST_ASSERT(server_kv_reserved(a + c + 16 * tok, want_c, have_c, 1) == a + c + 16 * tok);
-    TEST_ASSERT(server_prompt_kv_verdict(a + c + 16 * tok, b, budget, NULL, 0, true, &k) == PROMPT_KV_WAIT);
+    const KvBytes have_c[1] = {kvb(c + 16 * tok)};
+    TEST_ASSERT(server_kv_reserved(kvb(a + c + 16 * tok), want_c, have_c, 1) == kvb(a + c + 16 * tok));
+    TEST_ASSERT(server_prompt_kv_verdict(kvb(a + c + 16 * tok), kvb(b), kvb(budget), NULL, 0, true,
+                                         &k) == PROMPT_KV_WAIT);
     /* C ended: its bank is an idle victim -- B comes back by spilling it */
-    const uint64_t drop_c[1] = {c + 16 * tok};
-    TEST_ASSERT(server_prompt_kv_verdict(a + c + 16 * tok, b, budget, drop_c, 1, true, &k) == PROMPT_KV_SPILL &&
+    const KvBytes drop_c[1] = {kvb(c + 16 * tok)};
+    TEST_ASSERT(server_prompt_kv_verdict(kvb(a + c + 16 * tok), kvb(b), kvb(budget), drop_c, 1, true,
+                                         &k) == PROMPT_KV_SPILL &&
                 k == 1);
     /* nothing running and no room: the parked decoder is ended by name (REFUSE), never left parked forever */
-    TEST_ASSERT(server_prompt_kv_verdict(base, b, budget, NULL, 0, false, &k) == PROMPT_KV_REFUSE);
+    TEST_ASSERT(server_prompt_kv_verdict(base, kvb(b), kvb(budget), NULL, 0, false, &k) == PROMPT_KV_REFUSE);
     /* the preemption's own fit (prompt C on A alone after B's KV is freed) reads the same base: it fits */
-    TEST_ASSERT(server_prompt_kv_verdict(server_kv_reserved(a, NULL, NULL, 0), c, budget, NULL, 0, true, &k) ==
+    TEST_ASSERT(server_prompt_kv_verdict(server_kv_reserved(kvb(a), NULL, NULL, 0), kvb(c), kvb(budget), NULL, 0, true,
+                                         &k) ==
                 PROMPT_KV_FITS);
 
     /* gpuq #473 (preempt-exact, Qwen, 13440 B a token, touched budget 0.15 GiB): only a job whose prompt is not in its
@@ -10392,15 +10420,17 @@ static void test_l326_readmit_reserved(void) {
     /* #473's readmission: A (5726 tokens) parked, W (1841) on bank 0, B (8051) the only other job.  While B
      * runs, A waits; once B ends its bank is the one idle victim, and A comes back by spilling it -- never refused */
     const uint64_t q = 13440, bq = 11984 * q, w = 1841 * q, pa = 5726 * q, pb = 8051 * q;
-    TEST_ASSERT(server_prompt_kv_verdict(w + pb, pa, bq, NULL, 0, true, &k) == PROMPT_KV_WAIT);
-    const uint64_t drop_b[1] = {pb};
-    TEST_ASSERT(server_prompt_kv_verdict(w + pb, pa, bq, drop_b, 1, false, &k) == PROMPT_KV_SPILL && k == 1);
+    TEST_ASSERT(server_prompt_kv_verdict(kvb(w + pb), kvb(pa), kvb(bq), NULL, 0, true, &k) == PROMPT_KV_WAIT);
+    const KvBytes drop_b[1] = {kvb(pb)};
+    TEST_ASSERT(server_prompt_kv_verdict(kvb(w + pb), kvb(pa), kvb(bq), drop_b, 1, false,
+                                         &k) == PROMPT_KV_SPILL && k == 1);
     /* the preemption that made room for B: W + A resident, A (decoding) reserves nothing, A's bank frees */
     TEST_ASSERT((w + pa) - pa + pb <= bq);
     /* L328 (2): B on bank 0 once left A no room -- bank 0 was no victim -- and A was refused; bank 0 is a victim like
      * any idle bank now, so A comes back by spilling it */
-    const uint64_t drop_b0[1] = {pb};
-    TEST_ASSERT(server_prompt_kv_verdict(pb, pa, bq, drop_b0, 1, false, &k) == PROMPT_KV_SPILL && k == 1);
+    const KvBytes drop_b0[1] = {kvb(pb)};
+    TEST_ASSERT(server_prompt_kv_verdict(kvb(pb), kvb(pa), kvb(bq), drop_b0, 1, false,
+                                         &k) == PROMPT_KV_SPILL && k == 1);
 }
 
 /* L179 branch 11 -- worker_evict_one's slot reset (evict_reset_slot_fields).
@@ -11094,26 +11124,26 @@ static void test_mem_floor_is_derived_from_the_watermarks(void) {
     TEST_ASSERT(server_zoneinfo_high_bytes("        high     7", 4096) == 0);   /* a line must be whole */
     /* the floor: the margin + the watermarks + the step; every MemAvailable check reads it */
     const uint64_t zone = 486ull * MiB, step = 160ull * MiB;
-    TEST_ASSERT(server_mem_floor_init(zone, step) == PULSAR_SERVER_MEM_FLOOR_BYTES + zone + step);
-    TEST_ASSERT(server_mem_floor() == PULSAR_SERVER_MEM_FLOOR_BYTES + zone + step);
-    const uint64_t F = server_mem_floor();
+    TEST_ASSERT(server_mem_floor_init(zone, kvb(step)) == kvb(PULSAR_SERVER_MEM_FLOOR_BYTES + zone + step));
+    TEST_ASSERT(server_mem_floor() == kvb(PULSAR_SERVER_MEM_FLOOR_BYTES + zone + step));
+    const uint64_t F = server_mem_floor().raw();
     TEST_ASSERT(server_mem_floor_admits(F + 10 * MiB, 10 * MiB));
     TEST_ASSERT(!server_mem_floor_admits(F + 10 * MiB - 1, 10 * MiB));
     /* the guard's ceiling keeps the derived floor free */
-    TEST_ASSERT(server_guard_touched_budget(64ull << 30, 0, 0, F + 3 * MiB) == 3 * MiB);
-    TEST_ASSERT(server_guard_touched_budget(64ull << 30, 0, 0, F) == 0);
+    TEST_ASSERT(server_guard_touched_budget(kvb(64ull << 30), kvb(0), kvb(0), kvb(F + 3 * MiB)) == kvb(3 * MiB));
+    TEST_ASSERT(server_guard_touched_budget(kvb(64ull << 30), kvb(0), kvb(0), kvb(F)) == KvBytes{});
     /* headroom: unreadable MemAvailable (0) is never room; no wrap */
-    TEST_ASSERT(!server_headroom_admits(0, 0, 0));
-    TEST_ASSERT(server_headroom_admits(5, 2, 3));
-    TEST_ASSERT(!server_headroom_admits(4, 2, 3));
-    TEST_ASSERT(!server_headroom_admits(UINT64_MAX, UINT64_MAX, 2));
+    TEST_ASSERT(!server_headroom_admits(kvb(0), kvb(0), kvb(0)));
+    TEST_ASSERT(server_headroom_admits(kvb(5), kvb(2), kvb(3)));
+    TEST_ASSERT(!server_headroom_admits(kvb(4), kvb(2), kvb(3)));
+    TEST_ASSERT(!server_headroom_admits(kvb(UINT64_MAX), kvb(UINT64_MAX), kvb(2)));
     /* a persist's host demand: the writeback window + two renders of the text, at the bound a token */
     TEST_ASSERT(server_persist_host_bytes(0) == PULSAR_WRITEBACK_STEP);
     TEST_ASSERT(server_persist_host_bytes(-5) == PULSAR_WRITEBACK_STEP);
     TEST_ASSERT(server_persist_host_bytes(188416) ==
                 PULSAR_WRITEBACK_STEP + 2ull * 188416ull * PERSIST_TEXT_BYTES_PER_TOKEN);
-    (void)server_mem_floor_init(0, 0);   /* back to the OS margin for the tests after this one */
-    TEST_ASSERT(server_mem_floor() == PULSAR_SERVER_MEM_FLOOR_BYTES);
+    (void)server_mem_floor_init(0, kvb(0));   /* back to the OS margin for the tests after this one */
+    TEST_ASSERT(server_mem_floor() == kvb(PULSAR_SERVER_MEM_FLOOR_BYTES));
 }
 
 /* 2026-10-29: the guard's decisions read the LIVE budget -- touched + MemAvailable − floor now -- never above the
@@ -11123,21 +11153,21 @@ static void test_guard_budget_reads_live_memavailable(void) {
     const uint64_t GiB = 1024ull * 1024ull * 1024ull;
     server s;
     memset(&s, 0, sizeof s);
-    const uint64_t F = server_mem_floor();
+    const uint64_t F = server_mem_floor().raw();
     s.guard_enabled = true;
-    s.guard_kv_budget = 40 * GiB;
-    s.guard_eager_bytes = 31 * GiB;
-    s.guard_touched_ceiling = 5 * GiB;          /* cut at warmup: MemAvailable was floor + 5 GiB */
-    s.guard_budget_said = 5 * GiB;              /* no line for the cases below that stay put */
+    s.guard_kv_budget = kvb(40 * GiB);
+    s.guard_eager_bytes = kvb(31 * GiB);
+    s.guard_touched_ceiling = kvb(5 * GiB);     /* cut at warmup: MemAvailable was floor + 5 GiB */
+    s.guard_budget_said = kvb(5 * GiB);         /* no line for the cases below that stay put */
     s.guard_avail_at = server_now_sec();        /* the reading below is fresh: no /proc read in this test */
-    s.guard_avail = F + 2 * GiB;                /* 3 GiB went to something no ledger counts */
-    TEST_ASSERT(s.guard_budget() == 2 * GiB);   /* the live headroom binds */
-    s.guard_avail = F + 20 * GiB;               /* memory came back: never above the startup ceiling */
-    TEST_ASSERT(s.guard_budget() == 5 * GiB);
-    s.guard_avail = F;                          /* at the floor: nothing more may be touched */
-    TEST_ASSERT(s.guard_budget() == 0);
-    s.guard_avail = 0;                          /* unreadable: fail closed */
-    TEST_ASSERT(s.guard_budget() == 0);
+    s.guard_avail = kvb(F + 2 * GiB);           /* 3 GiB went to something no ledger counts */
+    TEST_ASSERT(s.guard_budget() == kvb(2 * GiB));   /* the live headroom binds */
+    s.guard_avail = kvb(F + 20 * GiB);          /* memory came back: never above the startup ceiling */
+    TEST_ASSERT(s.guard_budget() == kvb(5 * GiB));
+    s.guard_avail = kvb(F);                     /* at the floor: nothing more may be touched */
+    TEST_ASSERT(s.guard_budget() == KvBytes{});
+    s.guard_avail = KvBytes{};                  /* unreadable: fail closed */
+    TEST_ASSERT(s.guard_budget() == KvBytes{});
 }
 
 /* 2026-10-29: a persist MemAvailable cannot cover over the floor is skipped -- counted and said, nothing written,
@@ -11147,14 +11177,14 @@ static void test_persist_skipped_under_the_floor(void) {
     memset(&s, 0, sizeof s);
     pthread_mutex_init(&s.mu, NULL);
     s.kv.enabled = true;                                 /* a store is configured ... */
-    (void)server_mem_floor_init(UINT64_MAX / 4, 0);      /* ... and no box has this much free */
+    (void)server_mem_floor_init(UINT64_MAX / 4, kvb(0));      /* ... and no box has this much free */
     int end = -1;
     TEST_ASSERT(s.kv_cache_persist(NULL, "continued", false, &end) == 0);
     TEST_ASSERT(end == 0);
     TEST_ASSERT(s.m_persist_skipped == 1);
     TEST_ASSERT(s.kv_cache_persist(NULL, "prompt", true) == 0);
     TEST_ASSERT(s.m_persist_skipped == 2);
-    (void)server_mem_floor_init(0, 0);
+    (void)server_mem_floor_init(0, kvb(0));
     pthread_mutex_destroy(&s.mu);
 }
 
@@ -11163,14 +11193,20 @@ static void test_persist_skipped_under_the_floor(void) {
  * headroom leg's single conversation: one bank, nothing to spill, the 503 is right). */
 static void test_prefill_mem_step_tries_remedies_first(void) {
     const uint64_t MiB = 1024ull * 1024ull, F = 4538ull * MiB, need = 52ull * MiB;
-    TEST_ASSERT(server_prefill_mem_step(F + need, need, F, 0, false) == PREFILL_MEM_GO);
-    TEST_ASSERT(server_prefill_mem_step(F + need, need, F, 3, true) == PREFILL_MEM_GO);     /* room: no remedy */
-    TEST_ASSERT(server_prefill_mem_step(F + need - 1, need, F, 3, true) == PREFILL_MEM_SPILL);
-    TEST_ASSERT(server_prefill_mem_step(F, need, F, 1, false) == PREFILL_MEM_SPILL);       /* an idle bank first */
-    TEST_ASSERT(server_prefill_mem_step(F, need, F, 0, true) == PREFILL_MEM_PREEMPT);      /* then a decoder */
-    TEST_ASSERT(server_prefill_mem_step(F, need, F, 0, false) == PREFILL_MEM_REFUSE);      /* nothing to free */
-    TEST_ASSERT(server_prefill_mem_step(0, need, F, 0, false) == PREFILL_MEM_REFUSE);      /* unreadable: closed */
-    TEST_ASSERT(server_prefill_mem_step(0, need, F, 2, false) == PREFILL_MEM_SPILL);       /* ... but freeing helps */
+    TEST_ASSERT(server_prefill_mem_step(kvb(F + need), kvb(need), kvb(F), 0, false) == PREFILL_MEM_GO);
+    TEST_ASSERT(server_prefill_mem_step(kvb(F + need), kvb(need), kvb(F), 3,
+                                        true) == PREFILL_MEM_GO);     /* room: no remedy */
+    TEST_ASSERT(server_prefill_mem_step(kvb(F + need - 1), kvb(need), kvb(F), 3, true) == PREFILL_MEM_SPILL);
+    TEST_ASSERT(server_prefill_mem_step(kvb(F), kvb(need), kvb(F), 1,
+                                        false) == PREFILL_MEM_SPILL);       /* an idle bank first */
+    TEST_ASSERT(server_prefill_mem_step(kvb(F), kvb(need), kvb(F), 0,
+                                        true) == PREFILL_MEM_PREEMPT);      /* then a decoder */
+    TEST_ASSERT(server_prefill_mem_step(kvb(F), kvb(need), kvb(F), 0,
+                                        false) == PREFILL_MEM_REFUSE);      /* nothing to free */
+    TEST_ASSERT(server_prefill_mem_step(kvb(0), kvb(need), kvb(F), 0,
+                                        false) == PREFILL_MEM_REFUSE);      /* unreadable: closed */
+    TEST_ASSERT(server_prefill_mem_step(kvb(0), kvb(need), kvb(F), 2,
+                                        false) == PREFILL_MEM_SPILL);       /* ... but freeing helps */
     TEST_ASSERT(!strcmp(prefill_mem_step_names[PREFILL_MEM_REFUSE], "refuse"));
 }
 
@@ -11240,7 +11276,66 @@ static void test_stall_marks_beat(void) {
     TEST_ASSERT(g_pulsar_stall.where_ms.load() > 0);
 }
 
+/* L333: the KV accounting's units (lib/pulsar_units.h) refuse every mix at compile time -- these asserts are the
+ * compile-fail checks: if a conversion or a cross-unit operation ever compiled, this TU would not. */
+/** Does `a + b` compile for these operand types? */
+template <class A, class B> concept l333_adds = requires(A a, B b) { a + b; };
+/** Does `a < b` compile for these operand types? */
+template <class A, class B> concept l333_orders = requires(A a, B b) { a < b; };
+/** Does `a == b` compile for these operand types? */
+template <class A, class B> concept l333_equates = requires(A a, B b) { a == b; };
+/** Does `a = b` compile for these operand types? */
+template <class A, class B> concept l333_assigns = requires(A a, B b) { a = b; };
+static_assert(!std::is_convertible_v<KvRows, KvBytes> && !std::is_convertible_v<KvBytes, KvRows>,
+              "rows and bytes never convert into each other");
+static_assert(!std::is_constructible_v<KvBytes, KvRows> && !std::is_constructible_v<KvRows, KvBytes>,
+              "not even explicitly: rows become bytes only through a family's price");
+static_assert(!std::is_convertible_v<uint64_t, KvBytes> && !std::is_convertible_v<KvBytes, uint64_t> &&
+                  !std::is_convertible_v<int, KvRows> && !std::is_convertible_v<KvRows, uint64_t>,
+              "no implicit way in or out");
+static_assert(std::is_constructible_v<KvBytes, uint64_t> && std::is_constructible_v<KvRows, int>,
+              "the explicit entry exists");
+static_assert(!std::is_constructible_v<KvBytes, double> && !std::is_constructible_v<KvBytes, bool>,
+              "a float or a bool is no byte count");
+static_assert(!l333_adds<KvRows, KvBytes> && !l333_adds<KvBytes, uint64_t> && !l333_adds<int, KvRows> &&
+                  l333_adds<KvBytes, KvBytes> && l333_adds<KvRows, KvRows>,
+              "arithmetic only within a unit");
+static_assert(!l333_orders<KvRows, KvBytes> && !l333_orders<KvBytes, uint64_t> && l333_orders<KvBytes, KvBytes>,
+              "ordering only within a unit");
+static_assert(!l333_equates<KvRows, KvBytes> && !l333_equates<KvBytes, int> && l333_equates<KvRows, KvRows>,
+              "equality only within a unit");
+static_assert(!l333_assigns<KvBytes &, uint64_t> && !l333_assigns<KvBytes &, KvRows> && l333_assigns<KvBytes &,
+              KvBytes>,
+              "assignment only within a unit");
+static_assert((KvBytes{2} + KvBytes{3}).raw() == 5 && KvRows{7}.raw() == 7 && KvBytes::max().raw() == UINT64_MAX,
+              "constexpr, and raw() is the value that went in");
+
+/* L333: the units are the uint64_t they replaced -- a value round-trips through the type unchanged, and every
+ * operation computes what the raw expression did, wrap included (the bit-exact-by-construction claim). */
+static void test_l333_kv_units(void) {
+    const uint64_t vals[] = {0, 1, 4096, 52ull << 20, 13440ull * 11984ull, UINT64_MAX - 1, UINT64_MAX};
+    for (uint64_t a : vals) {
+        TEST_ASSERT(KvBytes{a}.raw() == a && KvRows{a}.raw() == a);
+        for (uint64_t b : vals) {
+            const KvBytes x{a}, y{b};
+            TEST_ASSERT((x + y).raw() == a + b && (x - y).raw() == a - b);   /* modular, as uint64_t */
+            TEST_ASSERT((x < y) == (a < b) && (x <= y) == (a <= b) && (x > y) == (a > b) && (x >= y) == (a >= b));
+            TEST_ASSERT((x == y) == (a == b) && (x != y) == (a != b));
+            KvBytes z = x;
+            z += y;
+            TEST_ASSERT(z.raw() == a + b);
+            z -= y;
+            TEST_ASSERT(z == x);
+            TEST_ASSERT(x.times(b).raw() == a * b);
+        }
+    }
+    TEST_ASSERT(KvBytes{}.raw() == 0 && KvRows{}.raw() == 0);   /* value-initialised: zero */
+    /* an int enters as the uint64_t it was assigned to before (a negative one wraps the same way) */
+    TEST_ASSERT(KvBytes{-1}.raw() == (uint64_t)-1 && KvRows{(uint32_t)8192}.raw() == 8192u);
+}
+
 static void pulsar_server_unit_tests_run(void) {
+    test_l333_kv_units();
     test_mem_floor_is_derived_from_the_watermarks();
     test_guard_budget_reads_live_memavailable();
     test_persist_skipped_under_the_floor();

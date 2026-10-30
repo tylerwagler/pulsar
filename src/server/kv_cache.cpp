@@ -384,7 +384,7 @@ int server::kv_cache_persist(session_slot *sl, const char *reason, bool close, i
         const pulsar_tokens *toks = pulsar_session_tokens(s->sess);
         const uint64_t need = server_persist_host_bytes(toks ? toks->len : 0);
         const uint64_t avail = server_mem_available_bytes();
-        if (!server_headroom_admits(avail, need, server_mem_floor())) {
+        if (!server_headroom_admits(KvBytes{avail}, KvBytes{need}, server_mem_floor())) {
             s->count_metric(&s->m_persist_skipped);
             unsigned skipped = 0;
             if (warn_limiter_due(&s->persist_skip_warn, server_now_sec(), PULSAR_SERVER_MEM_FLOOR_WARN_SEC, &skipped)) {
@@ -392,7 +392,7 @@ int server::kv_cache_persist(session_slot *sl, const char *reason, bool close, i
                 server_log(PULSAR_LOG_WARNING,
                            "pulsar-server: kv cache persist SKIPPED reason=%s: MemAvailable %.2f GiB does not cover "
                            "the %.2f GiB it may take over the %.2f GiB floor%s (%u more skipped since the last line)",
-                           reason, (double)avail / gib, (double)need / gib, (double)server_mem_floor() / gib,
+                           reason, (double)avail / gib, (double)need / gib, (double)server_mem_floor().raw() / gib,
                            avail ? "" : " (MemAvailable unreadable)", skipped);
             }
             return 0;

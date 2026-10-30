@@ -131,14 +131,14 @@ bool pulsar_state_bank_evicted(const pulsar_state_set *ss, uint32_t bank) {
     return false;
 }
 
-uint64_t pulsar_state_pool_bytes_at(const pulsar_state_set *ss, uint64_t rows) {
+KvBytes pulsar_state_pool_bytes_at(const pulsar_state_set *ss, KvRows rows) {
     const pulsar_state_plan *p = ss->plan;
-    uint64_t bytes = 0;
+    uint64_t bytes = 0;   /* each pool's rows times its row's bytes: the conversion itself, so raw inside */
     for (uint32_t k = 0; k < p->n_slots; k++)
         for (uint32_t id = 0; id < p->n_decl; id++)
             if (has(p->slot[k], id) && p->decl[id].kind == PULSAR_STATE_POOL)
-                bytes += ceil_div(rows, p->decl[id].tokens) * p->decl[id].bytes;
-    return bytes;
+                bytes += ceil_div(rows.raw(), p->decl[id].tokens) * p->decl[id].bytes;
+    return KvBytes{bytes};
 }
 
 void pulsar_state_destroy(pulsar_state_set *ss) {
@@ -560,21 +560,21 @@ static uint32_t decl_bank_live(pulsar_session *s) { return s && s->states ? s->s
 
 /* L270: one bank's demand-paged share at ctx_size -- the managed bytes of the session's own dry create (the pools
  * are cudaMallocManaged: VA reserved, physical on touch). */
-static uint64_t decl_demand_paged_bytes(pulsar_engine *e, int ctx_size) {
+static KvBytes decl_demand_paged_bytes(pulsar_engine *e, int ctx_size) {
     uint64_t managed = 0;
     e->session_cost_bytes_banked(ctx_size, 1, &managed);
-    return managed;
+    return KvBytes{managed};
 }
 
 /* L270: a bank's touched pools are its high-water's rows (the pages stay resident once written, until
  * free_physical returns the bank's own tensors); a quantum of q tokens grows them by at most q rows. */
-static uint64_t decl_bank_touched_kv_bytes(pulsar_session *s, uint32_t bank) {
-    if (!s->states || bank >= s->states->n_banks) return 0;
-    return pulsar_state_pool_bytes_at(s->states, s->states->kv_hw[bank]);
+static KvBytes decl_bank_touched_kv_bytes(pulsar_session *s, uint32_t bank) {
+    if (!s->states || bank >= s->states->n_banks) return KvBytes{};
+    return pulsar_state_pool_bytes_at(s->states, KvRows{s->states->kv_hw[bank]});
 }
 
-static uint64_t decl_bank_growth_bytes(pulsar_session *s, uint32_t q) {
-    return s->states ? pulsar_state_pool_bytes_at(s->states, q) : 0;
+static KvBytes decl_bank_growth_bytes(pulsar_session *s, KvRows q) {
+    return s->states ? pulsar_state_pool_bytes_at(s->states, q) : KvBytes{};
 }
 
 /* L284 #3: only the live bank is refused -- sync / eval / the segment walk run on it; a bank the batched lane

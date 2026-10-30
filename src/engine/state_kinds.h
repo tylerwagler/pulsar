@@ -43,6 +43,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "../lib/pulsar_units.h"
+
 /* Included from pulsar_engine_internal.h after kv_state.h and family.h; not standalone. */
 
 /** Declarations one family's table carries (a slot's set is a mask of their ids). */
@@ -194,8 +196,9 @@ bool pulsar_state_verify_capture(pulsar_state_set *ss);
  *  counter is the caller's.  false (said) = refused or a copy failed. */
 bool pulsar_state_commit(pulsar_state_set *ss, uint32_t bank, const int32_t *tokens, uint32_t keep);
 
-/** L270: the demand-paged bytes `rows` positions take in one bank (every slot's pools). */
-uint64_t pulsar_state_pool_bytes_at(const pulsar_state_set *ss, uint64_t rows);
+/** L270: the demand-paged bytes `rows` positions take in one bank (every slot's pools): the declared families' one
+ *  conversion of rows to bytes, each pool rounding its own ceil(rows / tokens-per-row) (L333). */
+KvBytes pulsar_state_pool_bytes_at(const pulsar_state_set *ss, KvRows rows);
 /** L284 #3: a bank's physical residency -- its trunk pools.  _free releases them (and zeroes its high-water),
  *  _alloc re-backs whichever are missing (idempotent; on a failure the bank is left wholly evicted), _evicted is
  *  true while any is missing. */

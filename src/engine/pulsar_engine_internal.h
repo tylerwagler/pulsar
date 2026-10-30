@@ -2076,7 +2076,7 @@ struct pulsar_engine {
     uint64_t session_cost_bytes_banked(int ctx_size, int n_banks, uint64_t *managed_bytes = NULL);
     /** Demand-paged (not reserved) bytes ONE bank actually materialises at
      * `ctx_size` -- the overcommit figure, below the reserved capacity. */
-    uint64_t demand_paged_bytes_per_bank(int ctx_size);
+    KvBytes demand_paged_bytes_per_bank(int ctx_size);
     /** Resident weight bytes, excluding per-session state. */
     uint64_t weights_resident_bytes();
     /** Run the dataset through the model accumulating per-tensor activation
@@ -3895,7 +3895,7 @@ bool gpu_graph_bank_repoint(pulsar_gpu_graph *g, uint32_t bank);
 uint32_t gpu_graph_bank_pool_count(const pulsar_gpu_graph *g);
 /** Tier-2 overcommit (task #55): demand-paged comp+index VA bytes for ONE bank at
  * a context (the overcommit-reserved, physical-on-touch part).  See gpu_diag.cpp. */
-uint64_t gpu_graph_demand_paged_bytes_per_bank(uint32_t ctx_size);
+KvBytes gpu_graph_demand_paged_bytes_per_bank(uint32_t ctx_size);
 /** Compressed rows a layer of compress ratio `ratio` (non-zero) holds at
  * ctx_size: the one capacity formula, read by gpu_graph_compute_dims (the
  * allocator's per-layer caps) and the KV sizing in steering.cpp. */
@@ -3921,14 +3921,15 @@ uint32_t gpu_graph_comp_cap_max(uint32_t ctx_size);
  * victim tie-break; the server's provisioning reads it to prefer a bank whose
  * pages are already resident.
  */
-uint64_t gpu_graph_bank_touched_kv_bytes(const pulsar_gpu_graph *g, uint32_t bank);
-/** Tier-2 task #55 increment 2b — CONSERVATIVE per-bank comp/index growth over one
- * decode quantum of `q` tokens: Σ_layers( ceil(q/ratio)·comp_row + q·index_row ).
- * The index term charges q (not ceil(q/ratio)) rows — a deliberate over-estimate
- * so the guard fires EARLY (safe side). Position-independent, so total Δ =
- * n_live_growing_banks × this.
+KvBytes gpu_graph_bank_touched_kv_bytes(const pulsar_gpu_graph *g, uint32_t bank);
+/** Tier-2 task #55 increment 2b — CONSERVATIVE per-bank comp/index growth over
+ * `rows` token rows: Σ_kv-sources ceil(rows/ratio)·(comp_row + index_row) (one
+ * emit writes both rows; the ceil rounds up, the safe side).  Position-
+ * independent, so total Δ = n_live_growing_banks × this.  DeepSeek's one
+ * conversion of token rows to bytes (L333); its per-layer compressed rows never
+ * leave it.
  */
-uint64_t gpu_graph_quantum_growth_bytes_per_bank(uint32_t q);
+KvBytes gpu_graph_quantum_growth_bytes_per_bank(KvRows rows);
 /** Tier-2 task #55 increment 2b — per-bank physical evict/restore reclaim
  * primitives (direct cudaFree / cudaMallocManaged of one bank's split comp/index
  * + base-table rebuild). See gpu_diag.cpp. */

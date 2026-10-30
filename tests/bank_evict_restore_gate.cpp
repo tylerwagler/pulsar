@@ -197,7 +197,7 @@ int GATE_ENTRY(int argc, char **argv) {
     (void)pulsar_gpu_synchronize();
     frontier_coverage(s->graph, 0, L);
     const uint64_t sum_before = checksum_bank_kv(s, 0);
-    const uint64_t touched0 = pulsar_session_bank_touched_kv_bytes(s, 0);
+    const uint64_t touched0 = pulsar_session_bank_touched_kv_bytes(s, 0).raw();
     CHECK(sum_before != 0, "checksum_before failed");
     fprintf(stderr, "evict_restore_gate: bank0 prefilled pos=%d touched=%.3f GiB checksum=%016" PRIx64 "\n",
             pulsar_session_pos(s), (double)touched0 / GIB, sum_before);
@@ -323,13 +323,13 @@ int GATE_ENTRY(int argc, char **argv) {
           pulsar_session_bank_pos(s, 1), L);
     CHECK(pulsar_session_bank_state_restore(s, 0), "finding2: repoint back to bank 0");
     (void)pulsar_gpu_synchronize();
-    const uint64_t t_b0 = pulsar_session_bank_touched_kv_bytes(s, 0);
-    const uint64_t t_b1 = pulsar_session_bank_touched_kv_bytes(s, 1);
-    const uint64_t t_both = pulsar_session_touched_kv_bytes(s);
+    const uint64_t t_b0 = pulsar_session_bank_touched_kv_bytes(s, 0).raw();
+    const uint64_t t_b1 = pulsar_session_bank_touched_kv_bytes(s, 1).raw();
+    const uint64_t t_both = pulsar_session_touched_kv_bytes(s).raw();
     CHECK(t_both == t_b0 + t_b1, "finding2: pool touched (%.3f) != bank0+bank1 (%.3f+%.3f) GiB",
           (double)t_both/GIB, (double)t_b0/GIB, (double)t_b1/GIB);
     CHECK(pulsar_session_bank_free_physical(s, 1), "finding2: free bank 1 (cur is 0)");
-    const uint64_t t_after = pulsar_session_touched_kv_bytes(s);
+    const uint64_t t_after = pulsar_session_touched_kv_bytes(s).raw();
     CHECK(t_after == t_b0,
           "finding2 (CASCADE BUG): touched after free bank1 = %.3f GiB, expected bank0-only %.3f GiB "
           "— a freed bank still counts, so the guard would spill every idle bank on one breach",
@@ -364,10 +364,10 @@ int GATE_ENTRY(int argc, char **argv) {
           fclose(fp);
           const char *what = leg == 0 ? "(a) truncated" : "(b) flipped byte";
           CHECK(lrc != 0, "finding3%s: load ACCEPTED it", what);
-          CHECK(pulsar_session_bank_touched_kv_bytes(s, 1) == 0 && pulsar_session_pos(s) == 0,
+          CHECK(pulsar_session_bank_touched_kv_bytes(s, 1).raw() == 0 && pulsar_session_pos(s) == 0,
                 "finding3%s: bank1 advertises rows after the failed load", what);
           fprintf(stderr, "evict_restore_gate: finding-3%s rejected: rc=%d (%s) touched(1)=%.3f : %s\n", what, lrc,
-                  err, (double)pulsar_session_bank_touched_kv_bytes(s, 1) / GIB, lrc != 0 ? "OK" : "FAIL");
+                  err, (double)pulsar_session_bank_touched_kv_bytes(s, 1).raw() / GIB, lrc != 0 ? "OK" : "FAIL");
       }
       free(seg); }
     for (int i = 0; i < n_chain; i++) fclose(chain_fp[i]);
