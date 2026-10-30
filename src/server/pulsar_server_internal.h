@@ -1547,7 +1547,7 @@ typedef struct gen_state gen_state;
 typedef struct session_slot {
     bool         provisioned;  ///< false until admitted; cleared on eviction (the slot is a reusable hole). Every reader that used to skip sess == NULL skips this.
     uint32_t     bank;  ///< Tier-2: this slot's bank id in the shared pool (slot i -> bank i). 0 in classic (non-pooled) mode.
-    int          committed_pos;  ///< Tier-2: this bank's committed KV frontier length (== pulsar_session_pos when this bank is the live one). Kept current at every op boundary so routing/metrics can read a non-live bank's position without a bank swap.
+    TokPos       committed_pos;  ///< Tier-2: this bank's committed KV frontier length (== pulsar_session_pos when this bank is the live one). Kept current at every op boundary so routing/metrics can read a non-live bank's position without a bank swap.
     struct job  *active_job;  ///< request bound to this slot, or NULL
     gen_state   *gen;  ///< resumable state for active_job
     slot_state   state;  ///< lifecycle state; SLOT_EVICTED marks a reusable hole
@@ -2681,7 +2681,7 @@ struct server {
      */
     int job_needed_ctx(const job *j) const;
     /** The slot's committed KV position -- where a continuation would append. */
-    int slot_frontier_pos(const session_slot *sl) const;
+    TokPos slot_frontier_pos(const session_slot *sl) const;
     /** Context a lazily provisioned slot would be created with for this job: the
      * secondary-slot default, raised to the job's need, capped at slot 0's ctx.
      * Shared by the provisioning path and the eviction could-it-help precheck so
@@ -3023,7 +3023,7 @@ struct gen_state {
                             ///< speculation once that lane can carry every decoder: server::batch_leave, L271/L284)
     bool batch_feed_valid;  ///< batch_feed_token/_pos hold a real pending commit
     int  batch_feed_token;  ///< next token to commit
-    int  batch_feed_pos;    ///< position to commit it at (the bank's KV frontier)
+    TokPos batch_feed_pos;  ///< position to commit it at (the bank's KV frontier)
     pulsar_tokens batch_pending;  ///< tokens committed via multiseq since the bank's last host checkpoint
     /** plan-34 inc 5: why this prefill slot is not fusable (NULL: it may fuse) -- a
      * fused step rejected its run as not-position-true, or fuse_prepare found its bank

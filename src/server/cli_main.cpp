@@ -54,7 +54,7 @@ static bool server_warmup_generation(pulsar_engine *engine, pulsar_session *sess
     /* One full prefill-cap chunk plus a tail: exercises the widened chunk
      * prefill shape AND the sub-chunk tail shape.  The session's resolved
      * cap is used (the config value can be 0 = engine default). */
-    const int prefill_cap = pulsar_session_prefill_cap(session);
+    const int prefill_cap = pulsar_session_prefill_cap(session).raw();
     int want = prefill_cap + 64;
     if (want < 64) want = 64;
     if (want > ctx_size - 256) want = ctx_size - 256;
@@ -981,7 +981,7 @@ int main(int argc, char **argv) {
     {
         const uint64_t zone_high = server_zone_high_watermark_bytes();
         const KvBytes chunk_kv = pulsar_session_quantum_growth_bytes_per_bank(
-            session, KvRows{(uint32_t)pulsar_session_prefill_cap(session)});
+            session, pulsar_kv_rows(pulsar_session_prefill_cap(session)));
         const uint64_t persist = server_persist_host_bytes(cfg.ctx_size);
         const KvBytes step = chunk_kv + KvBytes{persist};
         const KvBytes floor = server_mem_floor_init(zone_high, step);
@@ -991,7 +991,7 @@ int main(int argc, char **argv) {
                    "step's demand %.0f (a %d-token prefill chunk's KV %.0f + a persist at %d tokens %.0f)",
                    (double)floor.raw() / mib, (double)PULSAR_SERVER_MEM_FLOOR_BYTES / mib, (double)zone_high / mib,
                    zone_high ? "" : " (/proc/zoneinfo unreadable)", (double)step.raw() / mib,
-                   pulsar_session_prefill_cap(session), (double)chunk_kv.raw() / mib, cfg.ctx_size,
+                   pulsar_session_prefill_cap(session).raw(), (double)chunk_kv.raw() / mib, cfg.ctx_size,
                    (double)persist / mib);
     }
     uint64_t kv_budget_final = kv_budget;

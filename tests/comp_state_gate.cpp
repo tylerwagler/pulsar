@@ -203,7 +203,7 @@ int GATE_ENTRY(int argc, char **argv) {
         for (int L = L_ALIGNED + 1; L <= L_ALIGNED + 2; L++) {
             /* Path A: one prefill of L tokens */
             if (sync_prefix(s, &prompt, L, err, sizeof(err))) { fprintf(stderr, "sync(%d): %s\n", L, err); goto done; }
-            if (pulsar_session_pos(s) != L) { fprintf(stderr, "pos after sync(%d) = %d\n", L, pulsar_session_pos(s)); goto done; }
+            if (pulsar_session_pos(s).raw() != L) { fprintf(stderr, "pos after sync(%d) = %d\n", L, pulsar_session_pos(s).raw()); goto done; }
             for (uint32_t il = 0; il < n_layer; il++) {
                 if (!gpu_graph_layer_has_comp_state(il)) continue;
                 read_state(s->graph, il, &A[il]);
@@ -211,7 +211,7 @@ int GATE_ENTRY(int argc, char **argv) {
             /* Path B: prefill of L - 1 tokens, then one classic decode step of the same token */
             if (sync_prefix(s, &prompt, L - 1, err, sizeof(err))) { fprintf(stderr, "sync(%d): %s\n", L - 1, err); goto done; }
             if (pulsar_session_eval(s, prompt.v[L - 1], err, sizeof(err)) != 0) { fprintf(stderr, "eval: %s\n", err); goto done; }
-            if (pulsar_session_pos(s) != L) { fprintf(stderr, "pos after decode = %d, expected %d\n", pulsar_session_pos(s), L); goto done; }
+            if (pulsar_session_pos(s).raw() != L) { fprintf(stderr, "pos after decode = %d, expected %d\n", pulsar_session_pos(s).raw(), L); goto done; }
             int checked = 0;
             double min_pend = 0.0, worst_pend = 0.0;
             for (uint32_t il = 0; il < n_layer; il++) {

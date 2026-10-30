@@ -51,7 +51,7 @@ static int ds4_batch_step(pulsar_session *s, const pulsar_multiseq_req *reqs, ui
     int32_t *bank = (int32_t *)xmalloc((size_t)n_rows * sizeof(*bank));
     int *tokens = (int *)xmalloc((size_t)n_rows * sizeof(*tokens));
     for (uint32_t k = 0; k < n_rows; k++) {
-        pos[k]    = reqs[k].pos;
+        pos[k]    = reqs[k].pos.raw();   /* L334: the device rows stay raw */
         bank[k]   = (int32_t)reqs[k].bank;
         tokens[k] = reqs[k].token;
     }

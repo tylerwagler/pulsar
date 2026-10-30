@@ -143,7 +143,7 @@ int GATE_ENTRY(int argc, char **argv) {
     }
     for (int i = P; i < T0; i++)
         if (pulsar_session_eval(A, base.v[i], err, sizeof err) != 0) { say(false, "A eval: %s", err); goto done; }
-    T = pulsar_session_pos(A);
+    T = pulsar_session_pos(A).raw();
     pulsar_session_copy_logits(A, ref0, W);
     const uint64_t pb = pulsar_session_payload_bytes(A);
     fp = tmpfile();
@@ -163,8 +163,8 @@ int GATE_ENTRY(int argc, char **argv) {
     err[0] = '\0';
     if (load_bytes(B, f1, f1_len, err, sizeof err) != 0) { say(false, "2. FRONTIER: load: %s", err); goto done; }
     pulsar_session_copy_logits(B, got, W);
-    say(pulsar_session_pos(B) == T && !memcmp(got, ref0, (size_t)W * sizeof(float)),
-        "2. FRONTIER: loaded at pos %d, logits byte-identical to the saved session's", pulsar_session_pos(B));
+    say(pulsar_session_pos(B).raw() == T && !memcmp(got, ref0, (size_t)W * sizeof(float)),
+        "2. FRONTIER: loaded at pos %d, logits byte-identical to the saved session's", pulsar_session_pos(B).raw());
     int first_diff = -1;
     for (int i = 0; i < N_CHECK && first_diff < 0; i++) {
         if (pulsar_session_eval(B, base.v[T0 + i], err, sizeof err) != 0) { say(false, "B eval: %s", err); goto done; }
@@ -207,10 +207,10 @@ int GATE_ENTRY(int argc, char **argv) {
     for (int i = 0; i < P + 3; i++) pulsar_tokens_push(&q, base.v[i]);
     q.v[P + 2] = base.v[7] != base.v[P + 2] ? base.v[7] : base.v[8];
     const int sa = pulsar_session_sync(A, &q, err, sizeof err);
-    const int oa = pulsar_session_resume_origin(A);
+    const int oa = pulsar_session_resume_origin(A).raw();
     pulsar_session_copy_logits(A, live, W);
     const int sb = sa == 0 ? pulsar_session_sync(B, &q, err, sizeof err) : 1;
-    const int ob = pulsar_session_resume_origin(B);
+    const int ob = pulsar_session_resume_origin(B).raw();
     pulsar_session_copy_logits(B, got, W);
     const int sx = sb == 0 ? pulsar_session_sync(X, &q, err, sizeof err) : 1;
     pulsar_session_copy_logits(X, cold, W);

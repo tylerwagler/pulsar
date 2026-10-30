@@ -520,7 +520,7 @@ kv_restore_verdict server::kv_cache_price(const kv_chain_hit *hit, int base) {
     if (base < 0) base = 0;
     const uint32_t gained = chain_G > (uint32_t)base ? chain_G - (uint32_t)base : 0u;
     double prefill_ms = 0.0, transfer_ms = 0.0;
-    const int cap = s->sess ? pulsar_session_prefill_cap(s->sess) : 0;
+    const int cap = s->sess ? pulsar_session_prefill_cap(s->sess).raw() : 0;
     const bool priced = pulsar_engine_prefill_ms(s->engine, gained, (uint32_t)base, cap > 0 ? (uint32_t)cap : 0u,
                                                  &prefill_ms);
     pthread_mutex_lock(&s->mu);
@@ -623,7 +623,7 @@ int server::kv_restore_next(kv_restore *r) {
     /* the slice: one prefill chunk's priced time at the depth the restore stands at (the test hook's, when set) */
     double target_ms = (double)s->restore_slice_ms;
     if (s->restore_slice_ms <= 0) {
-        const int cap = pulsar_session_prefill_cap(s->sess);
+        const int cap = pulsar_session_prefill_cap(s->sess).raw();
         const uint32_t depth = r->hit->chain[r->next].G_prev;
         if (cap <= 0 || !pulsar_engine_prefill_ms(s->engine, (uint32_t)cap, depth, (uint32_t)cap, &target_ms))
             target_ms = 0.0;

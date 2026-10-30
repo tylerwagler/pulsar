@@ -165,7 +165,7 @@ run_rec run(pulsar_engine *e, const std::vector<pulsar_tokens> &P, int n, bool p
         T.rows = rows;
         for (uint32_t k = 0; k < rows; k++) {
             T.req.push_back((int32_t)reqs[k].bank);
-            T.req.push_back(reqs[k].pos);
+            T.req.push_back(reqs[k].pos.raw());
             T.req.push_back(reqs[k].token);
         }
         if (m == 0 || rows == 0) {

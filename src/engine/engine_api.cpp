@@ -690,7 +690,7 @@ static pulsar_tp_batch_item *tp_mirror_rows(const pulsar_session *s, const pulsa
     for (uint32_t i = 0; i < n; i++) {
         items[i].session_id = s->tp_session_id;
         items[i].bank       = (int32_t)reqs[i].bank;
-        items[i].pos        = reqs[i].pos;
+        items[i].pos        = reqs[i].pos.raw();   /* the wire's int32 */
         items[i].token      = reqs[i].token;
         items[i].reserved   = 0;
     }
@@ -876,10 +876,11 @@ int pulsar_session_image_hashes(pulsar_session *s, uint64_t *hashes, int cap) {
     return (int)s->live_images.n;
 }
 
-int pulsar_session_persist_end(pulsar_session *s) {
-    if (!s || !s->checkpoint_valid) return 0;
-    return pulsar_image_persist_end(s->engine->family->vision, s->engine, s->checkpoint.v, s->checkpoint.len,
-                                    &s->live_images);
+TokPos pulsar_session_persist_end(pulsar_session *s) {
+    if (!s || !s->checkpoint_valid) return TokPos{0};
+    /* the core's walk answers -1 for malformed blocks: it enters as none() */
+    return TokPos{pulsar_image_persist_end(s->engine->family->vision, s->engine, s->checkpoint.v, s->checkpoint.len,
+                                           &s->live_images)};
 }
 
 int pulsar_expand_image_placeholders(pulsar_engine *e, const pulsar_tokens *prompt, int from,
@@ -896,8 +897,8 @@ int pulsar_expand_image_placeholders(pulsar_engine *e, const pulsar_tokens *prom
     if (!ok) pulsar_tokens_free(out);
     return ok ? 1 : 0;
 }
-int pulsar_session_common_prefix(pulsar_session *s, const pulsar_tokens *prompt) { return s->common_prefix(prompt); }
-void pulsar_session_prefix_match(pulsar_session *s, const pulsar_tokens *prompt, pulsar_prefix_match *out) { if (s) { s->prefix_match(prompt, out); } else if (out) { out->live_cut = LiveToks{0}; out->prompt_cut = PromptToks{0}; out->seamed = false; } }
+TokCount pulsar_session_common_prefix(pulsar_session *s, const pulsar_tokens *prompt) { return TokCount{s->common_prefix(prompt)}; }
+void pulsar_session_prefix_match(pulsar_session *s, const pulsar_tokens *prompt, pulsar_prefix_match *out) { if (s) { s->prefix_match(prompt, out); } else if (out) { out->live_cut = TokCount{0}; out->prompt_cut = PromptToks{0}; out->seamed = false; } }
 int pulsar_session_argmax(pulsar_session *s) { return s->argmax(); }
 int pulsar_session_argmax_excluding(pulsar_session *s, int excluded_id) { return s ? s->argmax_excluding(excluded_id) : -1; }
 int pulsar_session_sample(pulsar_session *s, float temperature, int top_k, float top_p, float min_p, uint64_t *rng) { return s->sample(temperature, top_k, top_p, min_p, rng); }
@@ -1206,7 +1207,7 @@ bool pulsar_session_bank_alloc_physical(pulsar_session *s, uint32_t bank) {
     PULSAR_FAMILY_REQUIRES_S(s, PULSAR_FAMILY_CAP_BANKS, "bank residency", false);
     return s ? tp_mirror_bank_physical(s, 0, bank) : false;
 }
-int pulsar_session_bank_pos(pulsar_session *s, uint32_t bank) { PULSAR_FAMILY_REQUIRES_S(s, PULSAR_FAMILY_CAP_BANKS, "per-bank state", 0); const pulsar_tokens *t = pulsar_bank_history(s, bank); return t ? t->len : 0; }
+TokPos pulsar_session_bank_pos(pulsar_session *s, uint32_t bank) { PULSAR_FAMILY_REQUIRES_S(s, PULSAR_FAMILY_CAP_BANKS, "per-bank state", TokPos{0}); const pulsar_tokens *t = pulsar_bank_history(s, bank); return TokPos{t ? t->len : 0}; }
 /* The session's grid checkpoints: the family's store (L266). */
 pulsar_ckpt_store *pulsar_session_kv_store(pulsar_session *s) {
     return s ? session_banks(s)->kv_store(s) : NULL;
@@ -1217,7 +1218,7 @@ uint32_t pulsar_session_live_bank(pulsar_session *s) {
 uint32_t pulsar_session_resume_point(pulsar_session *s, uint32_t bank, int common, int prompt_len) {
     if (!s || common <= 0 || prompt_len <= 0) return 0;
     uint32_t limit = (uint32_t)common;
-    const int pf = pulsar_session_bank_prefill_frontier(s, bank);
+    const int pf = pulsar_session_bank_prefill_frontier(s, bank).raw();   /* L334: the body stays raw (P2b) */
     const uint32_t frontier = pf < 0 ? 0u : (uint32_t)pf;
     if (limit > frontier) limit = frontier;
     if (limit > (uint32_t)prompt_len - 1u) limit = (uint32_t)prompt_len - 1u;
@@ -1251,7 +1252,7 @@ const pulsar_ckpt_record *pulsar_session_resume_record(pulsar_session *s, uint32
 bool pulsar_session_bank_continues(pulsar_session *s, uint32_t bank, int len) {
     const pulsar_ckpt_store *st = pulsar_session_kv_store(s);
     if (!st || !st->ops || len < 0) return false;
-    return pulsar_session_bank_prefill_frontier(s, bank) >= len &&
+    return pulsar_session_bank_prefill_frontier(s, bank).raw() >= len &&   /* L334: raw body (P2b) */
            (st->ops->split_invariant || (uint32_t)len % st->ops->resume_grid == 0u) &&
            !pulsar_session_bank_comp_stale(s, bank);
 }
@@ -1263,8 +1264,8 @@ bool pulsar_session_split_invariant(const pulsar_session *s) {
     const pulsar_ckpt_store *st = pulsar_session_kv_store(const_cast<pulsar_session *>(s));
     return st && st->ops && st->ops->split_invariant;
 }
-int pulsar_session_bank_prefill_frontier(pulsar_session *s, uint32_t bank) {
-    return s ? (int)session_banks(s)->prefill_frontier(s, bank) : 0; }
+TokPos pulsar_session_bank_prefill_frontier(pulsar_session *s, uint32_t bank) {
+    return TokPos{s ? (int)session_banks(s)->prefill_frontier(s, bank) : 0}; }
 int pulsar_session_bank_spec_depth(pulsar_session *s, uint32_t bank) { PULSAR_FAMILY_REQUIRES_S(s, PULSAR_FAMILY_CAP_SPEC, "speculative decoding", 0); return pulsar_spec_bank_depth(s, bank); }
 bool pulsar_session_bank_comp_stale(pulsar_session *s, uint32_t bank) {
     const pulsar_ckpt_store *st = pulsar_session_kv_store(s);
@@ -1276,12 +1277,12 @@ const pulsar_tokens *pulsar_session_bank_tokens(pulsar_session *s, uint32_t bank
 static const pulsar_tokens *session_bank_history(pulsar_session *s, uint32_t bank) {
     return pulsar_bank_history(s, bank);
 }
-int pulsar_session_bank_common_prefix(pulsar_session *s, uint32_t bank, const pulsar_tokens *prompt) { PULSAR_FAMILY_REQUIRES_S(s, PULSAR_FAMILY_CAP_BANKS, "per-bank state", 0);
-    return pulsar_tokens_common_prefix(session_bank_history(s, bank), prompt); }
+TokCount pulsar_session_bank_common_prefix(pulsar_session *s, uint32_t bank, const pulsar_tokens *prompt) { PULSAR_FAMILY_REQUIRES_S(s, PULSAR_FAMILY_CAP_BANKS, "per-bank state", TokCount{0});
+    return TokCount{pulsar_tokens_common_prefix(session_bank_history(s, bank), prompt)}; }
 /* L115: the prefix-reuse authority against one bank's committed history. */
 void pulsar_session_bank_prefix_match(pulsar_session *s, uint32_t bank, const pulsar_tokens *prompt, pulsar_prefix_match *out) { if (s && !pulsar_family_require(s->engine, PULSAR_FAMILY_CAP_BANKS, "per-bank state")) s = NULL;
     if (!out) return;
-    out->live_cut = LiveToks{0}; out->prompt_cut = PromptToks{0}; out->seamed = false;
+    out->live_cut = TokCount{0}; out->prompt_cut = PromptToks{0}; out->seamed = false;
     if (!s) return;
     const pulsar_tokens *t = session_bank_history(s, bank);
     if (t && prompt) pulsar_tokens_prefix_match(s->engine, t->v, t->len, prompt->v, prompt->len, out); }
@@ -1699,16 +1700,16 @@ void pulsar_engine_spec_cost_set(pulsar_engine *e, int32_t flat_us, int32_t row_
     f->row_us = row_us;
     f->valid = valid && flat_us > 0 && row_us > 0;
 }
-int pulsar_session_checkpoint_best(pulsar_session *s, int limit) {
-    if (!s || limit <= 0) return 0;
+TokPos pulsar_session_checkpoint_best(pulsar_session *s, TokPos limit) {
+    if (!s || limit.is_none() || limit <= TokPos{0}) return TokPos{0};
     const pulsar_ckpt_store *st = pulsar_session_kv_store(s);
-    return st && st->ops ? (int)pulsar_ckpt_best(st, pulsar_session_live_bank(s), (uint32_t)limit) : 0;
+    return TokPos{st && st->ops ? (int)pulsar_ckpt_best(st, pulsar_session_live_bank(s), (uint32_t)limit.raw()) : 0};
 }
 static char *engine_api_token_text(void *ud, int token, size_t *len) {
     return pulsar_token_text((pulsar_engine *)ud, token, len);
 }
 pulsar_bank_resume pulsar_session_bank_resume_at(pulsar_session *s, uint32_t bank, const pulsar_tokens *prompt) {
-    const pulsar_bank_resume none = {LiveToks{0}, PromptToks{0}};
+    const pulsar_bank_resume none = {TokPos{0}, PromptToks{0}};
     if (!s || !prompt || prompt->len <= 0) return none;
     const pulsar_tokens *t = pulsar_bank_history(s, bank);
     if (!t) return none;
@@ -1717,17 +1718,17 @@ pulsar_bank_resume pulsar_session_bank_resume_at(pulsar_session *s, uint32_t ban
     pulsar_prefix_match m;
     pulsar_tokens_prefix_match(s->engine, t->v, t->len, prompt->v, prompt->len, &m);
     /* an extension (or the same prompt) of a history the sync continues where it stands */
-    if (m.live_cut == LiveToks{t->len} && pulsar_session_bank_continues(s, bank, m.live_cut.raw()))
-        return {m.live_cut, m.prompt_cut};
+    if (m.live_cut == TokCount{t->len} && pulsar_session_bank_continues(s, bank, m.live_cut.raw()))
+        return {TokPos::after(m.live_cut), m.prompt_cut};
     /* else the one resume rule over the stitched prompt (G <= the cut: below it the stitched prompt is the bank's
      * own tokens) */
     const uint32_t G = pulsar_session_resume_point(s, bank, m.live_cut.raw(),
                                                    pulsar_prefix_match_stitched_len(&m, PromptToks{prompt->len}).raw());
-    const LiveToks at{(int)G};
+    const TokPos at{(int)G};
     /* L334: at the cut the state serves the match's prompt side; below it, what the bank's tokens to G hold of the
      * request (pulsar_tokens_prompt_held_with) -- G itself when no seam lies below it, fewer when a re-spelled stretch
      * does (G was returned as the prompt-side count unconverted before) */
-    if (at < m.live_cut)
+    if (at < TokPos::after(m.live_cut))
         return {at, pulsar_tokens_prompt_held_with(engine_api_token_text, s->engine, t->v, at, prompt->v, prompt->len)};
     return {at, m.prompt_cut};
 }
@@ -1755,53 +1756,53 @@ static uint32_t bank_adopt_point(pulsar_session *s, uint32_t src, const pulsar_t
     if (m.seamed) {
         pulsar_prefix_match at;
         pulsar_tokens_prefix_match(s->engine, h->v, (int)T, prompt->v, prompt->len, &at);
-        if (at.live_cut != LiveToks{(int)T}) return 0u;
+        if (at.live_cut != TokCount{(int)T}) return 0u;
     }
     *rec = pulsar_session_resume_record(s, src, T, *len);
     return T;
 }
 
 pulsar_bank_resume pulsar_session_bank_adopt_score(pulsar_session *s, uint32_t src, const pulsar_tokens *prompt) {
-    const pulsar_bank_resume none = {LiveToks{0}, PromptToks{0}};
+    const pulsar_bank_resume none = {TokPos{0}, PromptToks{0}};
     if (!s || !prompt || src >= (uint32_t)pulsar_session_bank_count(s) || src == pulsar_session_live_bank(s))
         return none;
     /* a pair does not mirror the adopt (pulsar_session_bank_adopt refuses it) */
     if (tp_mirror_target(s)) return none;
     const pulsar_ckpt_record *r = NULL;
     int len = 0;
-    const LiveToks T{(int)bank_adopt_point(s, src, prompt, &r, &len)};
+    const TokPos T{(int)bank_adopt_point(s, src, prompt, &r, &len)};
     /* L334: T is on src's history; the depth an adopt is ranked by is what src's tokens to T hold of the request */
     return {T, pulsar_session_bank_prompt_held(s, src, prompt, T)};
 }
 
-PromptToks pulsar_session_bank_prompt_held(pulsar_session *s, uint32_t bank, const pulsar_tokens *prompt, LiveToks at) {
-    if (!s || !prompt || at <= LiveToks{0}) return PromptToks{0};
+PromptToks pulsar_session_bank_prompt_held(pulsar_session *s, uint32_t bank, const pulsar_tokens *prompt, TokPos at) {
+    if (!s || !prompt || at.is_none() || at <= TokPos{0}) return PromptToks{0};
     const pulsar_tokens *h = pulsar_bank_history(s, bank);
-    if (!h || at > LiveToks{h->len}) return PromptToks{0};
+    if (!h || at > TokPos{h->len}) return PromptToks{0};
     return pulsar_tokens_prompt_held_with(engine_api_token_text, s->engine, h->v, at, prompt->v, prompt->len);
 }
 
-int pulsar_session_bank_adopt(pulsar_session *s, uint32_t src, const pulsar_tokens *prompt, char *err,
-                              size_t errlen) {
+TokPos pulsar_session_bank_adopt(pulsar_session *s, uint32_t src, const pulsar_tokens *prompt, char *err,
+                                 size_t errlen) {
     PULSAR_NVTX_FN();
-    PULSAR_FAMILY_REQUIRES_S(s, PULSAR_FAMILY_CAP_BANKS, "bank adopt", -1);
-    if (!s || !prompt) return -1;
+    PULSAR_FAMILY_REQUIRES_S(s, PULSAR_FAMILY_CAP_BANKS, "bank adopt", TokPos::none());
+    if (!s || !prompt) return TokPos::none();
     if (tp_mirror_target(s)) {
         snprintf(err, errlen, "bank adopt: a tensor-parallel engine does not mirror it");
-        return -1;
+        return TokPos::none();
     }
     const uint32_t dst = pulsar_session_live_bank(s);
     if (src >= (uint32_t)pulsar_session_bank_count(s) || src == dst) {
         snprintf(err, errlen, "bank adopt: bank %u is not another bank of the pool", src);
-        return -1;
+        return TokPos::none();
     }
     const pulsar_ckpt_record *r = NULL;
     int len = 0;   /* the prompt in src's currency: a prompt end is the WHOLE (stitched) prompt */
     const uint32_t T = bank_adopt_point(s, src, prompt, &r, &len);
-    if (T == 0u) return 0;
+    if (T == 0u) return TokPos{0};
     const pulsar_tokens *h = pulsar_bank_history(s, src);
     /* the records and checkpoints keep no image identity across banks: a history with an image block stays its own */
-    if (pulsar_image_block_starts(s->engine, h, (int)T, NULL, 0) != 0) return 0;
+    if (pulsar_image_block_starts(s->engine, h, (int)T, NULL, 0) != 0) return TokPos{0};
     pulsar_tokens view = {0};
     for (uint32_t i = 0; i < T; i++) pulsar_tokens_push(&view, h->v[i]);   /* h is src's carry: copy before moving */
     pulsar_ckpt_store *st = pulsar_session_kv_store(s);
@@ -1811,7 +1812,7 @@ int pulsar_session_bank_adopt(pulsar_session *s, uint32_t src, const pulsar_toke
     if (!pulsar_ckpt_adopt(st, dst, src, T, r) || (at_end && !s->live_from_host(s->logits))) {
         pulsar_tokens_free(&view);
         snprintf(err, errlen, "bank adopt: bank %u's state at %u did not copy into bank %u", src, T, dst);
-        return -1;
+        return TokPos::none();
     }
     s->checkpoint.len = 0;
     for (uint32_t i = 0; i < T; i++) token_vec_push(&s->checkpoint, view.v[i]);
@@ -1823,12 +1824,15 @@ int pulsar_session_bank_adopt(pulsar_session *s, uint32_t src, const pulsar_toke
     spec_lookahead_reset(s);   /* the bank's pending drafts were its old history's */
     fprintf(stderr, "pulsar: bank %u adopts bank %u's %s at %u (prompt %d)\n", dst, src,
             !r ? "grid checkpoint" : r->kind == PULSAR_CKPT_REC_END ? "prompt end" : "message endpoint", T, prompt->len);
-    return (int)T;
+    return TokPos{(int)T};
 }
 
-int pulsar_session_restore_checkpoint(pulsar_session *s, int G, char *err, size_t errlen) {
+int pulsar_session_restore_checkpoint(pulsar_session *s, TokPos G, char *err, size_t errlen) {
     PULSAR_NVTX_FN();
-    if (!s || G <= 0) { snprintf(err, errlen, "restore checkpoint: no session or position %d", G); return 1; }
+    if (!s || G.is_none() || G <= TokPos{0}) {
+        snprintf(err, errlen, "restore checkpoint: no session or position %d", G.raw());
+        return 1;
+    }
     /* L272 B1: a family without a standalone restore restores its grid checkpoints inside sync (the resume,
      * L266 step 5); before this gate the entry read DeepSeek's zeroed store and refused with "holds no
      * checkpoint". */
@@ -1842,30 +1846,30 @@ int pulsar_session_restore_checkpoint(pulsar_session *s, int G, char *err, size_
         snprintf(err, errlen, "restore checkpoint: a tensor-parallel engine does not mirror it");
         return 1;
     }
-    if (!ops->restore_checkpoint(s, (uint32_t)G)) {
-        snprintf(err, errlen, "restore checkpoint: the installed bank holds no checkpoint at %d", G);
+    if (!ops->restore_checkpoint(s, (uint32_t)G.raw())) {
+        snprintf(err, errlen, "restore checkpoint: the installed bank holds no checkpoint at %d", G.raw());
         return 1;
     }
     return 0;
 }
-void pulsar_session_rewind(pulsar_session *s, int pos) {
+void pulsar_session_rewind(pulsar_session *s, TokPos pos) {
     PULSAR_NVTX_FN();
     PULSAR_FAMILY_REQUIRES_S(s, PULSAR_FAMILY_CAP_REWIND, "rewind", (void)0);
     if (!s) return;
     const pulsar_family_bank_ops *ops = session_banks(s);
     pulsar_tp *tp = tp_mirror_target(s);
-    if (!tp) { ops->rewind(s, pos); return; }
+    if (!tp) { ops->rewind(s, pos.raw()); return; }   /* L334: the family's rewind stays raw (P2b) */
     char err[256];
     if (tp_mirror_worker_drives_nothing(tp, "rewind", err, sizeof(err))) {
         pulsar_tp_mirror_fail_void(tp, "rewind", err);
         return;
     }
     if (!tp_mirror_sent(tp, "rewind",
-                        pulsar_tp_send_rewind(tp, s->tp_session_id, pos), NULL, 0)) return;
-    ops->rewind(s, pos);
+                        pulsar_tp_send_rewind(tp, s->tp_session_id, pos.raw()), NULL, 0)) return;
+    ops->rewind(s, pos.raw());
 }
-int pulsar_session_pos(pulsar_session *s) { return s->pos(); }
-int pulsar_session_ctx(pulsar_session *s) { return s->ctx(); }
+TokPos pulsar_session_pos(pulsar_session *s) { return TokPos{s->pos()}; }
+TokCount pulsar_session_ctx(pulsar_session *s) { return TokCount{s->ctx()}; }
 /* Multi-session serving: is interrupting a sync at a chunk boundary (the cancel hook) and re-issuing it bit-identical
  * to letting it run?  Every family's prefill is the core loop over one cut rule (prefill_loop.cpp), a pure function
  * of the chunk's start, and a stop is honoured only where the resume continues exactly (L281 (b)), so the resumed
@@ -1883,10 +1887,15 @@ const pulsar_tokens *pulsar_session_tokens(pulsar_session *s) { return s ? s->to
 uint64_t pulsar_session_payload_bytes(pulsar_session *s) { PULSAR_FAMILY_REQUIRES_S(s, PULSAR_FAMILY_CAP_PAYLOAD, "session payloads", 0); return s ? s->payload_bytes() : 0; }
 int pulsar_session_save_payload(pulsar_session *s, FILE *fp, char *err, size_t errlen) { PULSAR_FAMILY_REQUIRES_S(s, PULSAR_FAMILY_CAP_PAYLOAD, "session payloads", 1); return s ? s->save_payload(fp, err, errlen) : 1; }
 int pulsar_session_load_payload(pulsar_session *s, FILE *fp, uint64_t payload_bytes, char *err, size_t errlen) { PULSAR_FAMILY_REQUIRES_S(s, PULSAR_FAMILY_CAP_PAYLOAD, "session payloads", 1); return s ? s->load_payload(fp, payload_bytes, err, errlen) : 1; }
-uint64_t pulsar_session_segment_bytes(pulsar_session *s, int G_prev, int G, uint64_t *state_bytes) {
+/* L334: a segment's span [G_prev, G): G_prev a position (none() is none), G past it. */
+static bool segment_span_ok(TokPos G_prev, TokPos G) {
+    return !G_prev.is_none() && !G.is_none() && G_prev >= TokPos{0} && G > G_prev;
+}
+uint64_t pulsar_session_segment_bytes(pulsar_session *s, TokPos G_prev, TokPos G, uint64_t *state_bytes) {
     if (state_bytes) *state_bytes = 0;
     PULSAR_FAMILY_REQUIRES_S(s, PULSAR_FAMILY_CAP_SEGMENTS, "disk KV segments", 0);
-    return s && G_prev >= 0 && G > G_prev ? s->segment_bytes((uint32_t)G_prev, (uint32_t)G, state_bytes) : 0;
+    return s && segment_span_ok(G_prev, G) ? s->segment_bytes((uint32_t)G_prev.raw(), (uint32_t)G.raw(), state_bytes)
+                                          : 0;
 }
 /* L264 S4e: on a TP group every rank keeps its own copy of each segment (KV is
  * replicated per rank), named by the leader's store key.  Both operations are
@@ -1932,23 +1941,26 @@ int pulsar_engine_segment_reconcile(pulsar_engine *e, const char *keys, int n_ke
     return pulsar_tp_send_segment_reconcile(e->tp, keys, (uint32_t)n_keys) ? 0 : 1;
 }
 bool pulsar_session_in_mirrored_sync(const pulsar_session *s) { return s && s->tp_in_sync; }
-int pulsar_session_save_segment(pulsar_session *s, FILE *fp, int G_prev, int G, const char *key,
+int pulsar_session_save_segment(pulsar_session *s, FILE *fp, TokPos G_prev, TokPos G, const char *key,
                                 char *err, size_t errlen) {
     PULSAR_NVTX_FN();
     PULSAR_FAMILY_REQUIRES_S(s, PULSAR_FAMILY_CAP_SEGMENTS, "disk KV segments", 1);
-    if (!s || G_prev < 0 || G <= G_prev) { snprintf(err, errlen, "save segment: bad span [%d, %d)", G_prev, G); return 1; }
+    if (!s || !segment_span_ok(G_prev, G)) {
+        snprintf(err, errlen, "save segment: bad span [%d, %d)", G_prev.raw(), G.raw());
+        return 1;
+    }
     pulsar_tp *tp = tp_mirror_target(s);
-    if (!tp) return s->save_segment(fp, (uint32_t)G_prev, (uint32_t)G, err, errlen);
+    if (!tp) return s->save_segment(fp, (uint32_t)G_prev.raw(), (uint32_t)G.raw(), err, errlen);
     if (tp_segment_refused(s, tp, "kv segment save", key, err, errlen)) return 1;
     /* Ship first, write second: each rank writes its own copy of the SAME state
      * (nothing else moves on the control plane until the verdict is in), so the
      * writes overlap instead of running back to back. */
     pulsar_tp_segment_command c = tp_segment_command(s, key);
-    c.G_prev = G_prev;
-    c.G = G;
+    c.G_prev = G_prev.raw();   /* the wire's int32 */
+    c.G = G.raw();
     if (!tp_mirror_sent(tp, "kv segment save", pulsar_tp_send_segment(tp, PULSAR_TP_FRAME_SEGMENT_SAVE, &c),
                         err, errlen)) return 1;
-    const int own = s->save_segment(fp, (uint32_t)G_prev, (uint32_t)G, err, errlen);
+    const int own = s->save_segment(fp, (uint32_t)G_prev.raw(), (uint32_t)G.raw(), err, errlen);
     int peers = 0;
     char perr[256];
     perr[0] = '\0';
@@ -1968,11 +1980,11 @@ int pulsar_session_save_segment(pulsar_session *s, FILE *fp, int G_prev, int G, 
     }
     return 0;
 }
-int pulsar_session_load_segment(pulsar_session *s, FILE *fp, uint64_t bytes, bool last, int *G_out,
+int pulsar_session_load_segment(pulsar_session *s, FILE *fp, uint64_t bytes, bool last, TokPos *G_out,
                                 const char *key, char *err, size_t errlen) {
     PULSAR_NVTX_FN();
     PULSAR_FAMILY_REQUIRES_S(s, PULSAR_FAMILY_CAP_SEGMENTS, "disk KV segments", 1);
-    if (G_out) *G_out = 0;
+    if (G_out) *G_out = TokPos{0};
     if (!s) { snprintf(err, errlen, "load segment: no session"); return 1; }
     pulsar_tp *tp = tp_mirror_target(s);
     if (tp && tp_segment_refused(s, tp, "kv segment load", key, err, errlen)) return 1;
@@ -1983,7 +1995,7 @@ int pulsar_session_load_segment(pulsar_session *s, FILE *fp, uint64_t bytes, boo
      * rank to the same empty state. */
     const int own = s->load_segment(fp, bytes, last, &G, err, errlen);
     if (own != 0 || !tp) {
-        if (G_out) *G_out = (int)G;
+        if (G_out) *G_out = TokPos{(int)G};
         return own;
     }
     pulsar_tp_segment_command c = tp_segment_command(s, key);
@@ -2008,7 +2020,7 @@ int pulsar_session_load_segment(pulsar_session *s, FILE *fp, uint64_t bytes, boo
                               "a miss on every rank", key);
         return 1;
     }
-    if (G_out) *G_out = (int)G;
+    if (G_out) *G_out = TokPos{(int)G};
     return 0;
 }
 int pulsar_session_save_snapshot(pulsar_session *s, pulsar_session_snapshot *snap, char *err, size_t errlen) { PULSAR_FAMILY_REQUIRES_S(s, PULSAR_FAMILY_CAP_PAYLOAD, "session snapshots", 1); return s ? s->save_snapshot(snap, err, errlen) : 1; }

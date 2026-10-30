@@ -229,10 +229,10 @@ static void gpu_part(const char *dir) {
      * The fixture's weights are ZEROS: this proves the wiring and the buffer
      * shapes run end to end, NOT the numbers (the reference gate grades those). */
     check(pulsar_session_sync(sess, &prompt, err, sizeof(err)) == 0, "prefill ran: %s", err);
-    check(pulsar_session_pos(sess) == 8, "the prefill committed 8 positions (pos %d)", pulsar_session_pos(sess));
+    check(pulsar_session_pos(sess).raw() == 8, "the prefill committed 8 positions (pos %d)", pulsar_session_pos(sess).raw());
     err[0] = '\0';
     check(pulsar_session_eval(sess, 1, err, sizeof(err)) == 0, "eval ran: %s", err);
-    pulsar_multiseq_req row = { 0u, 0, 1 };
+    pulsar_multiseq_req row = { 0u, TokPos{0}, 1 };
     float *logits = (float *)xmalloc(248320u * sizeof(float));
     err[0] = '\0';
     check(pulsar_session_decode_multiseq(sess, &row, 1, logits, 248320, err, sizeof(err)) != 0,
@@ -252,9 +252,9 @@ static void gpu_part(const char *dir) {
         const uint64_t pb = pulsar_session_payload_bytes(sess);
         bool ok = pb > 0 && pulsar_session_copy_logits(sess, l0, w) == w &&
                   pulsar_session_save_snapshot(sess, &snap, err, sizeof(err)) == 0 && snap.len == pb;
-        check(ok, "payload saved at pos %d (%llu bytes) %s", pulsar_session_pos(sess), (unsigned long long)pb, err);
+        check(ok, "payload saved at pos %d (%llu bytes) %s", pulsar_session_pos(sess).raw(), (unsigned long long)pb, err);
         ok = ok && pulsar_session_eval(sess, 2, err, sizeof(err)) == 0 && pulsar_session_copy_logits(sess, l1, w) == w &&
-             pulsar_session_load_snapshot(sess, &snap, err, sizeof(err)) == 0 && pulsar_session_pos(sess) == 9 &&
+             pulsar_session_load_snapshot(sess, &snap, err, sizeof(err)) == 0 && pulsar_session_pos(sess).raw() == 9 &&
              pulsar_session_copy_logits(sess, l0b, w) == w && pulsar_session_eval(sess, 2, err, sizeof(err)) == 0 &&
              pulsar_session_copy_logits(sess, l1b, w) == w;
         check(ok && !memcmp(l0, l0b, (size_t)w * sizeof(float)) && !memcmp(l1, l1b, (size_t)w * sizeof(float)),

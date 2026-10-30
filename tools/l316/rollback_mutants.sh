@@ -32,7 +32,7 @@ if [ "$mode" = build ]; then
   mut snap-row src/engine/state_kinds.cpp \
       's/(o \* VR + f + (keep - 1u)) \* d.bytes, d.bytes)/(o * VR + f + (keep > 1u ? keep - 2u : 0u)) * d.bytes, d.bytes) \/* L316 MUTATION *\//' tests/mtp_spec_gate
   mut frontier src/engine/engine_api.cpp \
-      's/return pulsar_session_bank_prefill_frontier(s, bank) >= len &&/return (true || pulsar_session_bank_prefill_frontier(s, bank) >= len) \&\& \/* L316 MUTATION *\//' tests/mtp_spec_gate
+      's/return pulsar_session_bank_prefill_frontier(s, bank).raw() >= len &&/return (true || pulsar_session_bank_prefill_frontier(s, bank).raw() >= len) \&\& \/* L316 MUTATION *\//' tests/mtp_spec_gate
   exit 0
 fi
 rc=0

@@ -1112,7 +1112,7 @@ static void test_image_prefill_interrupt_resumes(void) {
         pulsar_image_ref again = img;
         rc = pulsar_session_sync_mm(sr, &prompt, &again, 1, err, sizeof err);
         quanta++;
-        if (quanta > 1 && pulsar_session_resume_origin(sr) == 0) restarts++;   /* a resumed quantum started cold */
+        if (quanta > 1 && pulsar_session_resume_origin(sr).raw() == 0) restarts++;   /* a resumed quantum started cold */
     }
     TEST_ASSERT(rc == 0);
     if (rc != 0) fprintf(stderr, "  the quantum loop ended rc %d: %s\n", rc, err);
@@ -1214,7 +1214,7 @@ static void test_image_chain_round_trip(void) {
     bool okb = G > 0 && pulsar_session_sync_mm(sb, &longer, &ib, 1, err, sizeof err) == 0 &&
                pulsar_session_copy_logits(sb, reused, vocab) == vocab;
     TEST_ASSERT(okb);
-    TEST_ASSERT(okb && pulsar_session_resume_origin(sb) > img.start_pos);   /* resumed past the block, not rebuilt */
+    TEST_ASSERT(okb && pulsar_session_resume_origin(sb).raw() > img.start_pos);   /* resumed past the block, not rebuilt */
     if (sb) pulsar_session_free(sb);
     pulsar_session *sc = NULL;
     TEST_ASSERT(pulsar_session_create(&sc, engine, ctx) == 0);

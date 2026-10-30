@@ -112,10 +112,10 @@ static void run_length(pulsar_engine *e, pulsar_session *A, pulsar_session *C, c
     pulsar_session_invalidate(A);
     pulsar_session_invalidate(C);
     const int s1 = pulsar_session_sync(A, &p, err, sizeof err);
-    const int o1a = pulsar_session_resume_origin(A);
+    const int o1a = pulsar_session_resume_origin(A).raw();
     const int s1c = s1 == 0 ? pulsar_session_sync(C, &p, err, sizeof err) : 1;
-    say(s1 == 0 && s1c == 0 && o1a == 0 && pulsar_session_resume_origin(C) == 0,
-        "1. COLD: both prefill from 0 (origins %d, %d) %s", o1a, pulsar_session_resume_origin(C), err);
+    say(s1 == 0 && s1c == 0 && o1a == 0 && pulsar_session_resume_origin(C).raw() == 0,
+        "1. COLD: both prefill from 0 (origins %d, %d) %s", o1a, pulsar_session_resume_origin(C).raw(), err);
     if (s1 || s1c) goto done;
 
     /* 2. REUSE: the same speculation on both, then the repeat */
@@ -127,12 +127,12 @@ static void run_length(pulsar_engine *e, pulsar_session *A, pulsar_session *C, c
     say(!memcmp(ta, tc, sizeof(int) * N_PRE), "2. the two sessions decoded the same %d tokens before the repeat", N_PRE);
     pulsar_session_invalidate(C);
     const int s2 = pulsar_session_sync(A, &p, err, sizeof err);
-    const int o2a = pulsar_session_resume_origin(A);
+    const int o2a = pulsar_session_resume_origin(A).raw();
     const int s2c = s2 == 0 ? pulsar_session_sync(C, &p, err, sizeof err) : 1;
-    const int o2c = pulsar_session_resume_origin(C);
-    say(s2 == 0 && s2c == 0 && o2a == P && o2c == 0 && pulsar_session_pos(A) == P,
+    const int o2c = pulsar_session_resume_origin(C).raw();
+    say(s2 == 0 && s2c == 0 && o2a == P && o2c == 0 && pulsar_session_pos(A).raw() == P,
         "2. REUSE: A resumes at its prompt end (origin %d of %d, pos %d), C prefills cold (origin %d) %s", o2a, P,
-        pulsar_session_pos(A), o2c, err);
+        pulsar_session_pos(A).raw(), o2c, err);
     if (s2 || s2c) goto done;
 
     /* 3. STATE */
@@ -174,7 +174,7 @@ static void run_length(pulsar_engine *e, pulsar_session *A, pulsar_session *C, c
 
     /* 5. AGAIN */
     const int s5 = pulsar_session_sync(A, &p, err, sizeof err);
-    const int o5 = pulsar_session_resume_origin(A);
+    const int o5 = pulsar_session_resume_origin(A).raw();
     pulsar_session_copy_logits(A, la, W);
     say(s5 == 0 && o5 == P && !memcmp(la, lc, (size_t)W * sizeof(float)),
         "5. AGAIN: after its own reuse and %d rounds A resumes at %d again (origin %d), logits == cold %s", na, P, o5,
@@ -184,7 +184,7 @@ static void run_length(pulsar_engine *e, pulsar_session *A, pulsar_session *C, c
     for (int i = 0; i < P; i++) pulsar_tokens_push(&m, base->v[i]);
     m.v[P - 1] = base->v[P - 1] != base->v[P] ? base->v[P] : base->v[P + 1];
     const int s6 = pulsar_session_sync(A, &m, err, sizeof err);
-    const int o6 = pulsar_session_resume_origin(A);
+    const int o6 = pulsar_session_resume_origin(A).raw();
     pulsar_session_copy_logits(A, la, W);
     pulsar_session_invalidate(C);
     const int s6c = s6 == 0 ? pulsar_session_sync(C, &m, err, sizeof err) : 1;

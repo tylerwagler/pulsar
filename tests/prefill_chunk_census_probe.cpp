@@ -103,7 +103,7 @@ int main(int argc, char **argv) {
                 for (size_t i = 0; i < (size_t)width * sizeof(float); i++) { h ^= b[i]; h *= 1099511628211ull; }
                 int am = 0; for (int i = 1; i < width; i++) if (row[i] > row[am]) am = i;
                 printf("CENSUS LOGITS: frontier row %d, fnv1a %016llx, argmax %d (%.6f), resume origin %d\n", n - 1,
-                       (unsigned long long)h, am, (double)row[am], pulsar_session_resume_origin(s));
+                       (unsigned long long)h, am, (double)row[am], pulsar_session_resume_origin(s).raw());
             }
             free(row);
         }

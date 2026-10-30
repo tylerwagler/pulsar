@@ -50,7 +50,7 @@ static bool decode_cont(pulsar_session *s, uint32_t bank, int F, int *out) {
     char e[256];
     bool ok = true;
     for (int i = 1; i < NGEN && ok; i++) {
-        pulsar_multiseq_req r = {.bank = bank, .pos = F + i - 1, .token = out[i - 1]};
+        pulsar_multiseq_req r = {.bank = bank, .pos = TokPos{F + i - 1}, .token = out[i - 1]};
         uint32_t nr = 0;
         if (pulsar_session_decode_mixed(s, &r, 1, lg, vocab, &nr, 0u, e, sizeof e) != 0) {
             fprintf(stderr, "cont step %d: %s\n", i, e);
@@ -85,7 +85,7 @@ static bool solo_decode_row(float *lg_out) {
     bool ok = gate_populate_bank(s, 0, g_toks.v + 1000, C0, NULL, "solo partner");
     char e[256];
     uint32_t nr = 0;
-    pulsar_multiseq_req r = {.bank = 0, .pos = C0, .token = g_toks.v[1000 + C0]};
+    pulsar_multiseq_req r = {.bank = 0, .pos = TokPos{C0}, .token = g_toks.v[1000 + C0]};
     if (ok && pulsar_session_decode_mixed(s, &r, 1, lg_out, (int)PULSAR_N_VOCAB, &nr, 0u, e, sizeof e) != 0) {
         fprintf(stderr, "solo decode row: %s\n", e);
         ok = false;
@@ -110,8 +110,8 @@ static bool mixed_zero(int K, bool dirty, float *dec_lg, float *pf_lg, int *out)
     const int vocab = (int)PULSAR_N_VOCAB;
     float *lg = (float *)malloc(2 * (size_t)vocab * sizeof(float));
     pulsar_multiseq_req *rq = (pulsar_multiseq_req *)malloc((size_t)(K + 1) * sizeof(*rq));
-    rq[0].bank = 0; rq[0].pos = C0; rq[0].token = g_toks.v[1000 + C0];
-    for (int j = 0; j < K; j++) { rq[1 + j].bank = 1; rq[1 + j].pos = j; rq[1 + j].token = g_toks.v[j]; }
+    rq[0].bank = 0; rq[0].pos = TokPos{C0}; rq[0].token = g_toks.v[1000 + C0];
+    for (int j = 0; j < K; j++) { rq[1 + j].bank = 1; rq[1 + j].pos = TokPos{j}; rq[1 + j].token = g_toks.v[j]; }
     char e[256];
     uint32_t nr = 0;
     if (ok && pulsar_session_decode_mixed(s, rq, (uint32_t)(K + 1), lg, 2 * vocab, &nr, 0u, e, sizeof e) != 0) {

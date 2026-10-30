@@ -68,7 +68,7 @@ bool pulsar_session_seam_stitch(pulsar_session *s, const pulsar_tokens *prompt, 
                                 int n_images, int past, pulsar_seam_stitch *out) {
     pulsar_prefix_match m;
     s->prefix_match(prompt, &m);
-    if (m.live_cut <= LiveToks{past}) return false;
+    if (m.live_cut <= TokCount{past}) return false;
     const int live_n = m.live_cut.raw(), prompt_n = m.prompt_cut.raw();
     pulsar_tokens *st = &out->tokens;
     free(st->v);

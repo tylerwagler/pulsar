@@ -165,7 +165,7 @@ int main(int argc, char **argv) {
             for (int k = 0; ok4 && k < 3; k++)
                 ok4 = pulsar_session_eval(sess, pulsar_session_argmax(sess), err4, sizeof err4) == 0;
             if (ok4) {
-                pulsar_session_rewind(sess, pulsar_session_pos(sess) - 1);   /* the ghost token */
+                pulsar_session_rewind(sess, TokPos{pulsar_session_pos(sess).raw() - 1});   /* the ghost token */
                 /* the installed bank's flag (pulsar_session_bank_comp_stale answers for a bank POOL; this session
                  * is classic, one bank) */
                 step = "stale after the ghost rewind";
@@ -192,7 +192,7 @@ int main(int argc, char **argv) {
                 step = "image turn on the stale bank";
                 ok4 = pulsar_session_sync_mm(sess, &turn, &img4, 1, err4, sizeof err4) == 0;
             }
-            const int origin = ok4 ? pulsar_session_resume_origin(sess) : -1;
+            const int origin = ok4 ? pulsar_session_resume_origin(sess).raw() : -1;
             std::vector<float> resumed((size_t)PULSAR_N_VOCAB);
             if (ok4) {
                 step = "the cold prefill of the same prompt";

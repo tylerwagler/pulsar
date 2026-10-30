@@ -88,7 +88,7 @@ static bool run_script(bool eager, run_rec *r) {
         for (uint32_t j = 0; j < n_dec; j++) {
             const uint32_t b = dec_banks[j];
             rq[n].bank = b;
-            rq[n].pos = pos[b];
+            rq[n].pos = TokPos{pos[b]};
             rq[n].token = g_toks.v[bank_off[b] + pos[b]];
             pos[b]++;
             n++;
@@ -98,7 +98,7 @@ static bool run_script(bool eager, run_rec *r) {
         if (phase_fused(ph)) {
             for (uint32_t j = 0; j < PF_ROWS; j++, n++) {
                 rq[n].bank = 2;
-                rq[n].pos = pos[2];
+                rq[n].pos = TokPos{pos[2]};
                 rq[n].token = g_toks.v[bank_off[2] + pos[2]];
                 pos[2]++;
             }

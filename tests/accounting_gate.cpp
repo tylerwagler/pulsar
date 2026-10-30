@@ -279,7 +279,7 @@ int GATE_ENTRY(int argc, char **argv) {
             uint64_t f_a = 0, t_a = 0;
             pulsar_gpu_mem_info(&f_a, &t_a);
             const uint64_t touched_a = pulsar_session_touched_kv_bytes(s).raw();
-            pulsar_session_rewind(s, cut);
+            pulsar_session_rewind(s, TokPos{cut});
             gpu_graph_bank_counters_capture(s->graph, s->graph->banks.n_banks ? s->graph->banks.cur_bank : 0);
             (void)pulsar_gpu_synchronize();
             uint64_t f_b = 0;

@@ -356,9 +356,9 @@ void worker_answer_queued_user_drain(agent_worker *w, char *text) {
 int agent_worker_sync_tokens(agent_worker *w, const pulsar_tokens *tokens,
                                     bool publish_progress,
                                     char *err, size_t err_len) {
-    int old_pos = pulsar_session_pos(w->session);
-    int common = pulsar_session_common_prefix(w->session, tokens);
-    int cached = common == old_pos && tokens->len >= old_pos ? common : 0;
+    const TokPos old_pos = pulsar_session_pos(w->session);
+    const TokCount common = pulsar_session_common_prefix(w->session, tokens);
+    int cached = TokPos::after(common) == old_pos && TokPos{tokens->len} >= old_pos ? common.raw() : 0;
     int suffix = tokens->len - cached;
     if (suffix < 0) suffix = tokens->len;
 

@@ -305,7 +305,7 @@ void server::responses_live_remember(session_slot *sl, const char *visible_text,
             id_list_push_unique(&sl->responses_live.call_ids, calls->v[i].id);
         }
     }
-    sl->responses_live.live_tokens = s->slot_frontier_pos(sl);
+    sl->responses_live.live_tokens = s->slot_frontier_pos(sl).raw();
     sl->responses_live.valid = true;
 }
 
@@ -319,7 +319,7 @@ void server::anthropic_live_remember(session_slot *sl, const tool_calls *calls) 
     for (int i = 0; i < calls->len; i++) {
         id_list_push_unique(&sl->anthropic_live.call_ids, calls->v[i].id);
     }
-    sl->anthropic_live.live_tokens = s->slot_frontier_pos(sl);
+    sl->anthropic_live.live_tokens = s->slot_frontier_pos(sl).raw();
     sl->anthropic_live.valid = sl->anthropic_live.call_ids.len > 0;
 }
 
@@ -442,7 +442,7 @@ session_slot *server::live_slot_for_ids(const stop_list *ids,
                                               : &sl->responses_live;
         /* Bank-aware: match against THIS slot's bank frontier, not the pool's
          * live cursor (Tier-2 shared pool). -1 for an unprovisioned slot. */
-        const int pos = sl->provisioned ? s->slot_frontier_pos(sl) : -1;
+        const int pos = sl->provisioned ? s->slot_frontier_pos(sl).raw() : -1;
         if (live_state_matches_ids_locked(st, ids, pos)) found = sl;
     }
     pthread_mutex_unlock(&s->tool_mu);

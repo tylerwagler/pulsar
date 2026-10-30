@@ -16,7 +16,8 @@ struct seg_ctx {
 };
 int write_payload(FILE *fp, void *ud, char *err, size_t errlen) {
     const seg_ctx *c = (const seg_ctx *)ud;
-    return pulsar_session_save_segment(c->s, fp, c->G_prev, c->G, c->key, err, errlen);
+    /* L334: the chain keeps its spans raw (the disk chain is a later phase); they enter as positions here */
+    return pulsar_session_save_segment(c->s, fp, TokPos{c->G_prev}, TokPos{c->G}, c->key, err, errlen);
 }
 int write_trailer(FILE *fp, void *ud, char *err, size_t errlen) {
     const seg_ctx *c = (const seg_ctx *)ud;
@@ -38,7 +39,7 @@ put_rc kvchain_put(pulsar_segstore *st, pulsar_engine *e, pulsar_session *s, con
                    const char *parent, int G_prev, int G, const pulsar_kvchain_trailer *trailer,
                    pulsar_kvchain_persist_result *r, char key_out[41]) {
     uint64_t state_bytes = 0;
-    const uint64_t payload = pulsar_session_segment_bytes(s, G_prev, G, &state_bytes);
+    const uint64_t payload = pulsar_session_segment_bytes(s, TokPos{G_prev}, TokPos{G}, &state_bytes);
     if (payload == 0) return PUT_NO_CUT;
     const pulsar_tokens span = view(toks, G_prev, G);
     size_t text_len = 0;
@@ -72,7 +73,7 @@ put_rc kvchain_put(pulsar_segstore *st, pulsar_engine *e, pulsar_session *s, con
 }
 }  // namespace
 
-int pulsar_kvchain_grid(pulsar_session *s) { return pulsar_session_prefill_cap(s); }
+int pulsar_kvchain_grid(pulsar_session *s) { return pulsar_session_prefill_cap(s).raw(); }
 
 int pulsar_kvchain_segment_ends(int prev, int deepest, int grid, bool close, int *ends, int cap) {
     if (grid <= 0 || prev < 0 || deepest <= prev) return 0;
@@ -91,13 +92,14 @@ int pulsar_kvchain_persist(pulsar_segstore *st, pulsar_engine *e, pulsar_session
      * prefill's (a checkpoint is valid only while the bank holds that history), and its state is the tail's.  No
      * checkpoint is captured inside an image block.  L281: the end is past every block the session records (its
      * segment carries the record), short of the first it does not. */
-    const int end = toks ? pulsar_session_persist_end(s) : 0;
-    if (end < 0) {
+    const TokPos end_pos = toks ? pulsar_session_persist_end(s) : TokPos{0};
+    if (end_pos.is_none()) {
         snprintf(r.err, sizeof(r.err), "the history's image blocks are malformed; nothing persisted");
         if (out) *out = r;
         return 0;
     }
-    const int deepest = end > 0 ? pulsar_session_checkpoint_best(s, end) : 0;
+    const int end = end_pos.raw();
+    const int deepest = end > 0 ? pulsar_session_checkpoint_best(s, end_pos).raw() : 0;
     const int grid = pulsar_kvchain_grid(s);
     if (deepest <= 0 || deepest < min_tokens || grid <= 0) {
         if (out) *out = r;
@@ -124,7 +126,8 @@ int pulsar_kvchain_persist(pulsar_segstore *st, pulsar_engine *e, pulsar_session
                 /* a stored segment of it without the state this bank holds at its end gets it, in place (the same
                  * key), so a branch parting in the cell above resumes there and not a cell lower */
                 for (int i = 0; i < c; i++) {
-                    if (chain[i].state_bytes || pulsar_session_checkpoint_best(s, (int)chain[i].G) != (int)chain[i].G)
+                    const TokPos Gi{(int)chain[i].G};
+                    if (chain[i].state_bytes || pulsar_session_checkpoint_best(s, Gi) != Gi)
                         continue;
                     char key[41];
                     if (kvchain_put(st, e, s, toks, i ? chain[i - 1].key : "", (int)chain[i].G_prev, (int)chain[i].G,
@@ -240,7 +243,10 @@ int pulsar_kvchain_load_slice_with(pulsar_segstore *st, const pulsar_segstore_se
 
 static int session_segment_loader(void *ud, FILE *fp, uint64_t bytes, bool last, int *G, const char *key, char *err,
                                   size_t errlen) {
-    return pulsar_session_load_segment((pulsar_session *)ud, fp, bytes, last, G, key, err, errlen);
+    TokPos at{0};
+    const int rc = pulsar_session_load_segment((pulsar_session *)ud, fp, bytes, last, G ? &at : NULL, key, err, errlen);
+    if (G) *G = at.raw();
+    return rc;
 }
 
 int pulsar_kvchain_load_slice(pulsar_segstore *st, pulsar_session *s, const pulsar_segstore_seg *chain, int n,

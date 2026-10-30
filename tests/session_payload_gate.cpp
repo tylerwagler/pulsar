@@ -125,7 +125,7 @@ static uint64_t checksum_lanes(pulsar_session *s, const char *tag) {
      * frontier's grid point, whole slot. */
     uint32_t G = 0;
     if (ok) {
-        int pf = pulsar_session_pos(s);
+        int pf = pulsar_session_pos(s).raw();
         if (pf > s->prefill_frontier) pf = s->prefill_frontier;
         G = pulsar_ckpt_best(&g->ckpt, gpu_graph_cur_bank(g), pulsar_ckpt_grid_floor(&g->ckpt, (uint32_t)pf));
         pulsar_gpu_tensor *slab = NULL;
@@ -202,7 +202,7 @@ int GATE_ENTRY(int argc, char **argv) {
     pulsar_tokens pn; memset(&pn, 0, sizeof pn);
     pn.v = base.v; pn.len = pn.cap = L + 1;
     CHECK(pulsar_session_sync(a, &pn, err, sizeof err) == 0, "A sync L+1: %s", err);
-    const int origin_a = pulsar_session_resume_origin(a);
+    const int origin_a = pulsar_session_resume_origin(a).raw();
     float *ref = (float *)malloc((size_t)width * sizeof(float));
     CHECK(ref != NULL, "alloc ref");
     CHECK(pulsar_session_copy_logits(a, ref, width) == width, "A copy_logits");
@@ -223,7 +223,7 @@ int GATE_ENTRY(int argc, char **argv) {
           (unsigned long long)fnv_a, (unsigned long long)fnv_b);
 
     CHECK(pulsar_session_sync(b, &pn, err, sizeof err) == 0, "B sync L+1: %s", err);
-    const int origin_b = pulsar_session_resume_origin(b);
+    const int origin_b = pulsar_session_resume_origin(b).raw();
     fprintf(stderr, "  resume origins: live %d, restored %d\n", origin_a, origin_b);
     CHECK(origin_a == origin_b && origin_b > 0,
           "the restored session resumed from %d, the live one from %d: not the same computation",

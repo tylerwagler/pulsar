@@ -141,7 +141,7 @@ static char *read_file(const char *path, size_t *len_out) {
  * log shows the segment path ran. */
 static int segment_round_trip(pulsar_engine *e, pulsar_session **sp, const pulsar_tokens *prompt, int limit,
                               char *err, size_t errlen) {
-    const int deepest = pulsar_session_checkpoint_best(*sp, limit);
+    const int deepest = pulsar_session_checkpoint_best(*sp, TokPos{limit}).raw();
     if (deepest <= 0) { snprintf(err, errlen, "no grid checkpoint at or below %d to persist", limit); return 1; }
     int n = 0;
     const char *tmp = getenv("TMPDIR");
@@ -243,19 +243,19 @@ static int run_schedule(pulsar_engine *e, const pulsar_tokens *toks, int first, 
         /* an edited tail (a client that drops what it saw): the bank is rewound BELOW its
          * prefill frontier; the resume must start at the grid point below the
          * cut (the dogfood case of 2026-09-06 12:08 was cold from 0 here) */
-        pulsar_session_rewind(s, cut);
+        pulsar_session_rewind(s, TokPos{cut});
     }
     if (restore > 0) {
         /* L264: the grid checkpoint the first sync's prefill captured.  Say which
          * one, and that it was there: a restore that silently found nothing would
          * leave the sync below resuming some other way. */
-        const int best = pulsar_session_checkpoint_best(s, restore);
+        const int best = pulsar_session_checkpoint_best(s, TokPos{restore}).raw();
         printf("  [restore] checkpoints <= %d: deepest %d\n", restore, best);
         if (best != restore) {
             snprintf(err, errlen, "no grid checkpoint at %d (deepest at or below it: %d)", restore, best);
             goto done;
         }
-        if (pulsar_session_restore_checkpoint(s, restore, err, errlen) != 0) goto done;
+        if (pulsar_session_restore_checkpoint(s, TokPos{restore}, err, errlen) != 0) goto done;
     }
     if (segments > 0 && segment_round_trip(e, &s, toks, segments, err, errlen) != 0) goto done;
     if (via_snapshot) {
@@ -272,9 +272,9 @@ static int run_schedule(pulsar_engine *e, const pulsar_tokens *toks, int first, 
     }
     p.len = GATE_N;
     if (pulsar_session_sync(s, &p, err, errlen) != 0) goto done;
-    if (pulsar_session_resume_origin(s) != origin) {
+    if (pulsar_session_resume_origin(s).raw() != origin) {
         snprintf(err, errlen, "resume origin %d, schedule expects %d (the resume did not start where this schedule says)",
-                 pulsar_session_resume_origin(s), origin);
+                 pulsar_session_resume_origin(s).raw(), origin);
         goto done;
     }
     if (pulsar_session_copy_logits(s, frontier, width) != width) { snprintf(err, errlen, "frontier logits read failed"); goto done; }
@@ -507,7 +507,7 @@ int GATE_ENTRY(int argc, char **argv) {
                       pulsar_session_sync(sx, &px, err, sizeof err) == 0 &&
                       pulsar_session_copy_logits(sx, cold, width) == width &&
                       segment_round_trip(e, &sx, &px, X, err, sizeof err) == 0 &&
-                      pulsar_session_pos(sx) == X &&
+                      pulsar_session_pos(sx).raw() == X &&
                       pulsar_session_sync(sx, &px, err, sizeof err) == 0 &&
                       pulsar_session_copy_logits(sx, back, width) == width;
             if (!ok) {
@@ -515,7 +515,7 @@ int GATE_ENTRY(int argc, char **argv) {
                 fails++;
             } else {
                 printf("  [exact] chain to %d restored, sync(%d) resumed from %d\n", X, X,
-                       pulsar_session_resume_origin(sx));
+                       pulsar_session_resume_origin(sx).raw());
                 fails += compare_rows("frontier", "X: segment chain to 8576, sync(8576) exactly", cold, back, width);
             }
             pulsar_session_free(sx);

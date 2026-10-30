@@ -146,14 +146,14 @@ static void frontier_coverage(const pulsar_gpu_graph *g, uint32_t bank, int L) {
 static int save_chain(pulsar_session *s, int limit, FILE **fp, uint64_t *bytes, int *Gs, char *err, size_t errlen) {
     int desc[GATE_CHAIN_MAX];
     int n = 0;
-    for (int G = pulsar_session_checkpoint_best(s, limit); G > 0 && n < GATE_CHAIN_MAX;
-         G = pulsar_session_checkpoint_best(s, G - 1)) desc[n++] = G;
+    for (int G = pulsar_session_checkpoint_best(s, TokPos{limit}).raw(); G > 0 && n < GATE_CHAIN_MAX;
+         G = pulsar_session_checkpoint_best(s, TokPos{G - 1}).raw()) desc[n++] = G;
     if (n == 0) { snprintf(err, errlen, "no grid checkpoint at or below %d", limit); return 0; }
     for (int i = 0, prev = 0; i < n; prev = Gs[i], i++) {
         Gs[i] = desc[n - 1 - i];
         fp[i] = tmpfile();
-        bytes[i] = pulsar_session_segment_bytes(s, prev, Gs[i], NULL);
-        if (!fp[i] || pulsar_session_save_segment(s, fp[i], prev, Gs[i], NULL, err, errlen) != 0) {
+        bytes[i] = pulsar_session_segment_bytes(s, TokPos{prev}, TokPos{Gs[i]}, NULL);
+        if (!fp[i] || pulsar_session_save_segment(s, fp[i], TokPos{prev}, TokPos{Gs[i]}, NULL, err, errlen) != 0) {
             for (int k = 0; k <= i; k++) if (fp[k]) fclose(fp[k]);
             return 0;
         }
@@ -200,7 +200,7 @@ int GATE_ENTRY(int argc, char **argv) {
     const uint64_t touched0 = pulsar_session_bank_touched_kv_bytes(s, 0).raw();
     CHECK(sum_before != 0, "checksum_before failed");
     fprintf(stderr, "evict_restore_gate: bank0 prefilled pos=%d touched=%.3f GiB checksum=%016" PRIx64 "\n",
-            pulsar_session_pos(s), (double)touched0 / GIB, sum_before);
+            pulsar_session_pos(s).raw(), (double)touched0 / GIB, sum_before);
 
     /* 2. Save bank 0 (cur) as its segment chain.  Measure the write: an eviction
      * stalls the evicted session's next turn by save+reload time. */
@@ -249,13 +249,13 @@ int GATE_ENTRY(int argc, char **argv) {
       CHECK(pulsar_session_bank_alloc_physical(s, 0), "alloc_physical(bank 0) failed");
       CHECK(pulsar_session_bank_state_restore(s, 0), "repoint to bank 0 failed");
       for (int i = 0; i < n_chain; i++) {
-          int G = 0;
+          TokPos G{0};
           CHECK(pulsar_session_load_segment(s, chain_fp[i], chain_bytes[i], i == n_chain - 1, &G, NULL, err, sizeof err) == 0,
                 "segment %d load: %s", i, err);
-          CHECK(G == chain_G[i], "segment %d loaded G=%d, saved %d", i, G, chain_G[i]);
+          CHECK(G.raw() == chain_G[i], "segment %d loaded G=%d, saved %d", i, G.raw(), chain_G[i]);
       }
       fprintf(stderr, "evict_restore_gate: segment load %.1f ms\n", now_ms() - t0); }
-    CHECK(pulsar_session_pos(s) == L, "restored bank stands at %d, not %d", pulsar_session_pos(s), L);
+    CHECK(pulsar_session_pos(s).raw() == L, "restored bank stands at %d, not %d", pulsar_session_pos(s).raw(), L);
     CHECK(!pulsar_session_bank_is_evicted(s, 0), "bank 0 still evicted after restore");
     /* base-table entry must point at the fresh comp[il][0]. */
     { int checked = 0;
@@ -287,10 +287,10 @@ int GATE_ENTRY(int argc, char **argv) {
       double t0 = now_ms();
       for (int i = 0; i < n_chain; i++) {
           CHECK(fseek(chain_fp[i], 0, SEEK_SET) == 0, "sliced: rewind segment %d", i);
-          int G = 0;
+          TokPos G{0};
           CHECK(pulsar_session_load_segment(s, chain_fp[i], chain_bytes[i], i == n_chain - 1, &G, NULL, err, sizeof err) == 0,
                 "sliced: segment %d load (after a switch away and back): %s", i, err);
-          CHECK(G == chain_G[i], "sliced: segment %d loaded G=%d, saved %d", i, G, chain_G[i]);
+          CHECK(G.raw() == chain_G[i], "sliced: segment %d loaded G=%d, saved %d", i, G.raw(), chain_G[i]);
           if (i == n_chain - 1) break;
           /* the turn ends: another bank's quantum installs it, the next turn installs bank 0 again */
           pulsar_session_bank_state_save(s, 0);
@@ -300,7 +300,7 @@ int GATE_ENTRY(int argc, char **argv) {
       }
       fprintf(stderr, "evict_restore_gate: sliced load (%d segments, a switch between each) %.1f ms\n", n_chain,
               now_ms() - t0); }
-    CHECK(pulsar_session_pos(s) == L, "sliced: restored bank stands at %d, not %d", pulsar_session_pos(s), L);
+    CHECK(pulsar_session_pos(s).raw() == L, "sliced: restored bank stands at %d, not %d", pulsar_session_pos(s).raw(), L);
     (void)pulsar_gpu_synchronize();
     const uint64_t sum_sliced = checksum_bank_kv(s, 0);
     CHECK(sum_sliced == sum_before, "sliced: KV NOT bit-identical to the one-shot load (%016" PRIx64 " vs %016" PRIx64
@@ -319,8 +319,8 @@ int GATE_ENTRY(int argc, char **argv) {
       char e2[256];
       CHECK(pulsar_session_sync(s, &p1, e2, sizeof e2) == 0, "finding2: bank1 sync: %s", e2); }
     gpu_graph_bank_counters_capture(s->graph, 1);
-    CHECK(pulsar_session_bank_pos(s, 1) == L, "finding2: bank1 prefill pos=%d != %d (test setup)",
-          pulsar_session_bank_pos(s, 1), L);
+    CHECK(pulsar_session_bank_pos(s, 1).raw() == L, "finding2: bank1 prefill pos=%d != %d (test setup)",
+          pulsar_session_bank_pos(s, 1).raw(), L);
     CHECK(pulsar_session_bank_state_restore(s, 0), "finding2: repoint back to bank 0");
     (void)pulsar_gpu_synchronize();
     const uint64_t t_b0 = pulsar_session_bank_touched_kv_bytes(s, 0).raw();
@@ -359,12 +359,12 @@ int GATE_ENTRY(int argc, char **argv) {
               fwrite(seg, 1, nb, fp);
           }
           rewind(fp);
-          int G = 0;
+          TokPos G{0};
           const int lrc = pulsar_session_load_segment(s, fp, nb, true, &G, NULL, err, sizeof err);
           fclose(fp);
           const char *what = leg == 0 ? "(a) truncated" : "(b) flipped byte";
           CHECK(lrc != 0, "finding3%s: load ACCEPTED it", what);
-          CHECK(pulsar_session_bank_touched_kv_bytes(s, 1).raw() == 0 && pulsar_session_pos(s) == 0,
+          CHECK(pulsar_session_bank_touched_kv_bytes(s, 1).raw() == 0 && pulsar_session_pos(s).raw() == 0,
                 "finding3%s: bank1 advertises rows after the failed load", what);
           fprintf(stderr, "evict_restore_gate: finding-3%s rejected: rc=%d (%s) touched(1)=%.3f : %s\n", what, lrc,
                   err, (double)pulsar_session_bank_touched_kv_bytes(s, 1).raw() / GIB, lrc != 0 ? "OK" : "FAIL");

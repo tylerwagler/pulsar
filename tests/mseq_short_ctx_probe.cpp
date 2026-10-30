@@ -90,7 +90,7 @@ int GATE_ENTRY(int argc, char **argv) {
 
         /* C: classic eval on bank 0 */
         if (!gate_bank_sync(s, 0, prompt.v, prompt.len, NULL, "row-neutrality")) goto done;
-        const int pos = pulsar_session_pos(s);
+        const int pos = pulsar_session_pos(s).raw();
         const int tok = pulsar_session_argmax(s);
         int tok2 = 0;
         {
@@ -104,14 +104,14 @@ int GATE_ENTRY(int argc, char **argv) {
         if (only) {
             /* dump mode: exactly one step in this process */
             if (!strcmp(only, "one")) {
-                pulsar_multiseq_req r = { 0u, pos, tok };
+                pulsar_multiseq_req r = { 0u, TokPos{pos}, tok };
                 uint32_t got = 0;
                 if (pulsar_session_decode_mixed(s, &r, 1, A, vw, &got, 0u, err, sizeof(err)) != 0 || got != 1) {
                     fprintf(stderr, "1-row step: %s\n", err); goto done;
                 }
             } else {
                 if (!gate_bank_sync(s, 1, prompt.v, prompt.len, NULL, "row-neutrality")) goto done;
-                pulsar_multiseq_req r[2] = { { 0u, pos, tok }, { 1u, pos, tok } };
+                pulsar_multiseq_req r[2] = { { 0u, TokPos{pos}, tok }, { 1u, TokPos{pos}, tok } };
                 uint32_t got = 0;
                 if (pulsar_session_decode_mixed(s, r, 2, B, 2 * vw, &got, 0u, err, sizeof(err)) != 0 || got != 2) {
                     fprintf(stderr, "2-row step: %s\n", err); goto done;
@@ -127,7 +127,7 @@ int GATE_ENTRY(int argc, char **argv) {
         /* A: 1-row decode_mixed on bank 0 */
         if (!gate_bank_sync(s, 0, prompt.v, prompt.len, NULL, "row-neutrality")) goto done;
         {
-            pulsar_multiseq_req r = { 0u, pos, tok };
+            pulsar_multiseq_req r = { 0u, TokPos{pos}, tok };
             uint32_t got = 0;
             if (pulsar_session_decode_mixed(s, &r, 1, A, vw, &got, 0u, err, sizeof(err)) != 0 || got != 1) {
                 fprintf(stderr, "1-row step: %s\n", err); goto done;
@@ -137,7 +137,7 @@ int GATE_ENTRY(int argc, char **argv) {
         if (!gate_bank_sync(s, 0, prompt.v, prompt.len, NULL, "row-neutrality")) goto done;
         if (!gate_bank_sync(s, 1, prompt.v, prompt.len, NULL, "row-neutrality")) goto done;
         {
-            pulsar_multiseq_req r[2] = { { 0u, pos, tok }, { 1u, pos, tok } };
+            pulsar_multiseq_req r[2] = { { 0u, TokPos{pos}, tok }, { 1u, TokPos{pos}, tok } };
             uint32_t got = 0;
             if (pulsar_session_decode_mixed(s, r, 2, B, 2 * vw, &got, 0u, err, sizeof(err)) != 0 || got != 2) {
                 fprintf(stderr, "2-row step: %s\n", err); goto done;
@@ -147,7 +147,7 @@ int GATE_ENTRY(int argc, char **argv) {
         if (!gate_bank_sync(s, 0, prompt.v, prompt.len, NULL, "row-neutrality")) goto done;
         if (!gate_bank_sync(s, 1, prompt.v, prompt.len, NULL, "row-neutrality")) goto done;
         {
-            pulsar_multiseq_req r[2] = { { 0u, pos, tok }, { 1u, pos, tok2 } };
+            pulsar_multiseq_req r[2] = { { 0u, TokPos{pos}, tok }, { 1u, TokPos{pos}, tok2 } };
             uint32_t got = 0;
             if (pulsar_session_decode_mixed(s, r, 2, D, 2 * vw, &got, 0u, err, sizeof(err)) != 0 || got != 2) {
                 fprintf(stderr, "2-row step (D): %s\n", err); goto done;

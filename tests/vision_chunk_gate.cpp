@@ -135,9 +135,9 @@ static bool run(pulsar_engine *e, const pulsar_tokens *prompt, const pulsar_imag
         if (!head_img) got_owner = d;
         ok = pulsar_session_sync_mm(s, prompt, img, 1, err, errlen) == 0;
     }
-    const int origin = ok ? pulsar_session_resume_origin(s) : -1;
-    if (ok && origin != head) {
-        snprintf(err, errlen, "%s: the image prompt resumed at %d, the case needs %d", tag, origin, head);
+    const TokPos origin = ok ? pulsar_session_resume_origin(s) : TokPos::none();
+    if (ok && origin != TokPos{head}) {
+        snprintf(err, errlen, "%s: the image prompt resumed at %d, the case needs %d", tag, origin.raw(), head);
         ok = false;
     }
     if (ok && got_owner != owner) {

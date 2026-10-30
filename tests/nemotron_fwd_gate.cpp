@@ -153,8 +153,8 @@ static int capture(pulsar_engine *e, const std::vector<int32_t> &ids, const char
         pulsar_session *s = NULL;
         CHECK(pulsar_session_create(&s, e, T + 64) == 0 && s, "capture: a one-bank session of %d tokens", T + 64);
         if (!s) return 1;
-        CHECK(pulsar_session_prefill_cap(s) >= T, "capture: the prefill chunk %d holds the prompt (%d) whole",
-              pulsar_session_prefill_cap(s), T);
+        CHECK(pulsar_session_prefill_cap(s).raw() >= T, "capture: the prefill chunk %d holds the prompt (%d) whole",
+              pulsar_session_prefill_cap(s).raw(), T);
         pulsar_tokens P = toks(ids, 0, ids.size());
         const double t0 = gate_now_s();
         const int rc = pulsar_session_sync(s, &P, err, sizeof(err));
@@ -242,7 +242,7 @@ static void exact(pulsar_engine *e, const std::vector<int32_t> &ids, int W) {
             }
             for (int step = 0; step < 2; step++) {
                 pulsar_multiseq_req rows[4];
-                for (int b = 0; b < 4; b++) rows[b] = {(uint32_t)b, pos[b] + step, next[(b + step) % 4]};
+                for (int b = 0; b < 4; b++) rows[b] = {(uint32_t)b, TokPos{pos[b] + step}, next[(b + step) % 4]};
                 std::vector<float> out((size_t)4 * W);
                 err[0] = '\0';
                 const int rc = pulsar_session_decode_multiseq(s, rows, 4, out.data(), 4 * W, err, sizeof(err));
@@ -299,8 +299,9 @@ static void exact(pulsar_engine *e, const std::vector<int32_t> &ids, int W) {
         if (pulsar_session_create(&s, e, ctx) == 0 && s) {
             pulsar_tokens P = toks(ids, 0, N), Q = toks(q, 0, q.size());
             bool ok = pulsar_session_sync(s, &P, err, sizeof(err)) == 0 && pulsar_session_sync(s, &Q, err, sizeof(err)) == 0;
-            const int origin = ok ? pulsar_session_resume_origin(s) : -1;
-            CHECK(ok && origin == 896, "X4 sync(P) then sync(Q) diverging at 950 resumed from %d (want 896): %s", origin, err);
+            const TokPos origin = ok ? pulsar_session_resume_origin(s) : TokPos::none();
+            CHECK(ok && origin == TokPos{896}, "X4 sync(P) then sync(Q) diverging at 950 resumed from %d (want 896): %s",
+                  origin.raw(), err);
             if (ok) {
                 got.push_back(logits_of(s, W));
                 for (int i = 0; i < 4 && ok; i++) {
@@ -421,7 +422,7 @@ static bool decode_run(pulsar_engine *e, const std::vector<int32_t> &ids, int ba
     for (int step = 0; ok && step < steps; step++) {
         if (step == warm) { (void)pulsar_gpu_synchronize(); t0 = gate_now_s(); }
         std::vector<pulsar_multiseq_req> rows((size_t)banks);
-        for (int b = 0; b < banks; b++) rows[(size_t)b] = {(uint32_t)b, pos[(size_t)b] + step, next[(size_t)b]};
+        for (int b = 0; b < banks; b++) rows[(size_t)b] = {(uint32_t)b, TokPos{pos[(size_t)b] + step}, next[(size_t)b]};
         ok = pulsar_session_decode_multiseq(s, rows.data(), (uint32_t)banks, lg.data(), banks * W, err, sizeof(err)) == 0;
         /* the next token in place (a per-row copy is a fresh 512 KiB allocation a step: page faults the timing
          * would charge to the engine); the rows kept only when the caller compares them */

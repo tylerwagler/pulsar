@@ -131,9 +131,9 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
         agent_turn_flush(w, think_mode);
 
         const pulsar_tokens *prompt_for_sync = &w->transcript;
-        int old_pos = pulsar_session_pos(w->session);
-        int common = pulsar_session_common_prefix(w->session, &w->transcript);
-        int cached = common == old_pos && w->transcript.len >= old_pos ? common : 0;
+        const TokPos old_pos = pulsar_session_pos(w->session);
+        const TokCount common = pulsar_session_common_prefix(w->session, &w->transcript);
+        int cached = TokPos::after(common) == old_pos && TokPos{w->transcript.len} >= old_pos ? common.raw() : 0;
 
         int suffix = prompt_for_sync->len - cached;
         agent_trace(w, "prefill tool_round=%d transcript=%d prompt=%d cached=%d suffix=%d think=%s",
@@ -179,7 +179,7 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
         }
 
         int max_tokens = cfg->gen.n_predict;
-        int room = pulsar_session_ctx(w->session) - pulsar_session_pos(w->session);
+        int room = (pulsar_session_ctx(w->session) - pulsar_session_pos(w->session).before()).raw();
         if (room <= 1) max_tokens = 0;
         else if (max_tokens > room - 1) max_tokens = room - 1;
 

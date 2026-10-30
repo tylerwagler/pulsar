@@ -97,12 +97,12 @@ static bool prefix_resumed(pulsar_session *s, const int *toks, uint32_t n, int *
     /* a multiseq step left the classic view stale (session_multiseq.cpp); the carry saved after the last sync
      * re-establishes it, as the server's bank switch does */
     if (!pulsar_session_bank_state_restore(s, 0)) { fprintf(stderr, "decode reference: bank 0 restore failed\n"); return false; }
-    const int G = pulsar_session_checkpoint_best(s, (int)n);
+    const int G = pulsar_session_checkpoint_best(s, TokPos{(int)n}).raw();
     if (G <= 0) {
         fprintf(stderr, "decode reference: no grid checkpoint at or below %u -- the cold prefill left none\n", n);
         return false;
     }
-    if (pulsar_session_restore_checkpoint(s, G, err, sizeof err) != 0) {
+    if (pulsar_session_restore_checkpoint(s, TokPos{G}, err, sizeof err) != 0) {
         fprintf(stderr, "decode reference: %s\n", err);
         return false;
     }
@@ -111,9 +111,9 @@ static bool prefix_resumed(pulsar_session *s, const int *toks, uint32_t n, int *
         fprintf(stderr, "decode reference: resume sync to %u failed: %s\n", n, err);
         return false;
     }
-    if (pulsar_session_resume_origin(s) != G) {
+    if (pulsar_session_resume_origin(s).raw() != G) {
         fprintf(stderr, "decode reference: the sync to %u resumed from %d, not the restored checkpoint %d\n", n,
-                pulsar_session_resume_origin(s), G);
+                pulsar_session_resume_origin(s).raw(), G);
         return false;
     }
     pulsar_session_bank_state_save(s, 0);
@@ -127,7 +127,7 @@ static bool decode_rows(pulsar_session *s, const int *toks, uint32_t d, uint32_t
                         bool serial) {
     bool ok = true;
     pulsar_multiseq_req rq[PULSAR_SPEC_LOGITS_ROWS];
-    for (uint32_t j = 0; j < w; j++) { rq[j].bank = 0; rq[j].pos = (int32_t)(d - w + j); rq[j].token = toks[d - w + j]; }
+    for (uint32_t j = 0; j < w; j++) { rq[j].bank = 0; rq[j].pos = TokPos{(int32_t)(d - w + j)}; rq[j].token = toks[d - w + j]; }
     float *lg = (float *)malloc((size_t)w * (size_t)width * sizeof(float));
     uint32_t nr = 0;
     char err[256];

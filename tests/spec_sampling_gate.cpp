@@ -172,7 +172,7 @@ static int sampled_plain_batch(pulsar_session *s, const start_state *snap,
     int pos0 = -1;
     for (int b = 0; b < nb; b++) {
         if (bank_reset(s, (uint32_t)b, snap, err, errlen) != 0) return -1;
-        const int p = pulsar_session_pos(s);
+        const int p = pulsar_session_pos(s).raw();
         if (pos0 < 0) pos0 = p;
         if (p != pos0) { snprintf(err, errlen, "bank %d at pos %d, bank 0 at %d", b, p, pos0); return -1; }
         rng[b] = traj_seed(t0 + b, 0);
@@ -180,7 +180,7 @@ static int sampled_plain_batch(pulsar_session *s, const start_state *snap,
         seq[t0 + b][0] = tok;
         got[b] = 1;
         live[b] = !pulsar_token_is_stop(e, tok) && DEPTH > 1;
-        reqs[b].bank = (uint32_t)b; reqs[b].pos = pos0; reqs[b].token = tok;
+        reqs[b].bank = (uint32_t)b; reqs[b].pos = TokPos{pos0}; reqs[b].token = tok;
     }
     for (int step = 1; step < DEPTH; step++) {
         pulsar_multiseq_req batch[SAMPLED_BANKS_PLAIN];
@@ -211,7 +211,7 @@ static int sampled_plain_batch(pulsar_session *s, const start_state *snap,
             const int b = who[q];
             const int tok = drawn[q];
             seq[t0 + b][got[b]++] = tok;
-            reqs[b].pos++; reqs[b].token = tok;
+            reqs[b].pos += TokCount{1}; reqs[b].token = tok;
             if (pulsar_token_is_stop(e, tok) || got[b] >= DEPTH) live[b] = 0;
         }
     }
@@ -502,7 +502,7 @@ int GATE_ENTRY(int argc, char **argv) {
     }
     printf("model=%s temp=%.2f top_p=%.2f min_p=%.2f ctx_depth=%d traj=%d\n",
            model, (double)TEMP, (double)TOP_P, (double)MIN_P,
-           pulsar_session_pos(session), traj);
+           pulsar_session_pos(session).raw(), traj);
     const bool snapshots = pulsar_engine_has_snapshots(engine);
     if (snapshots && pulsar_session_save_snapshot(session, &snap, err, sizeof(err)) != 0) {
         fprintf(stderr, "snapshot failed: %s\n", err);
