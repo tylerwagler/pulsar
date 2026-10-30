@@ -127,5 +127,5 @@ the shards: the tokenizer rides in `pulsar.kv`.
 
 - V4.1's tower lacks `image_pad`; the V4.1 shape profile declares an unpadded image span and the engine's image path refuses it (`shape_profiles.cpp`, `session.cpp`).  The builder emits what the checkpoint has.
 - Engram (V4.1) row tables stay side files (L242); `wkv/q/k` are ordinary layer-shard tensors.
-- No IQ2 producer: the type-44 permutation lived in the archived `repack_iq2_mmq.py`; a recipe row naming IQ2 refuses.  The GGUF-era `format-maps/v5mx4-format-map.json` (91 IQ2 rows) is no longer read by anything (its re-key path left with `--format-map`, L279); building IQ2 or retiring the map is L279's step 7.
+- No IQ2 producer: the type-44 permutation lived in the archived `repack_iq2_mmq.py`; a recipe row naming IQ2 refuses.  The GGUF-era `format-maps/v5mx4-format-map.json` (91 IQ2 rows), which nothing read after `--format-map` left (L279), was deleted 2026-10-30 (git history keeps it); building IQ2 is L279's step 7.
 - DeepSeek EXL3 dense refuses by name: the DeepSeek loader admits its dense linears at the MX slot only (weights.cpp `tensor_expect_mxfp8`); the EXL3 dense arm reads bf16 rows.

@@ -129,6 +129,7 @@ EXL3 builds, by [`tools/container/build.py`](tools/container/README.md). How to
 run it, the recipe format and how a build is checked against a served artifact
 are in [docs/ARTIFACT_BUILD.md](docs/ARTIFACT_BUILD.md).
 
+<!-- VERIFY-LOAD (0.5.0-rc1): confirm this container loads on this release before tagging; then drop this comment. -->
 A published DeepSeek V4 Flash container (the Vision-Exp repack with MXFP4 routed
 experts and the DSpark drafter merged in) is on Hugging Face as
 [`ElytronAI/DeepSeek-v4-Flash`](https://huggingface.co/ElytronAI/DeepSeek-v4-Flash):

@@ -18,8 +18,6 @@ recipe is generated from `policy.py` (`build.py recipe` prints it); every other 
 | `inkling-mini-k3.json` | the 3-layer Inkling mini on its K3 EXL3 pack (L294) |
 | `v41-tp1-fixture.json` | a DeepSeek V4.1 layer-subset fixture (`build.py --layers`) for one-GPU bring-up (L269) |
 
-Two files are GGUF-era records that nothing reads any more: `v5mx4-format-map.json` (the PrismaQuant allocator's
-measured per-layer expert-format map for the 0731 / Vision-Exp builds) and `ds4_engine.json` (its engine
-descriptor).  Both are keyed by GGUF-era tensor names; the `--format-map` path that read them left with L279, and
-there is no IQ2 producer for its 91 IQ2 rows (see docs/ARTIFACT_BUILD.md).  The scripts that produced them were
-archived 2026-09-24 (tag `archive/gguf-tooling-2026-09-24`).
+The GGUF-era `v5mx4-format-map.json` (the PrismaQuant allocator's per-layer expert-format map for the 0731 /
+Vision-Exp builds) and `ds4_engine.json` (its engine descriptor) were read by nothing after L279 and were deleted
+2026-10-30. Git history keeps them, and their producers are archived at the tag `archive/gguf-tooling-2026-09-24`.

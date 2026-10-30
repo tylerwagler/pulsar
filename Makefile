@@ -1988,8 +1988,8 @@ PREFILL_BASELINE_REF ?= 13bcbab1
 # directly (no symlink indirection), and the `ds4flash.gguf` symlink points at
 # that same file -- so the default, the battery's model and the symlink are ONE
 # fact and the trap cannot be re-entered by taking a different route to the
-# default.  The 684fa8d blob documents the deleted 0731 artifact and is kept as
-# history; it is not the baseline for anything this tree runs now.  13bcbab1 is
+# default.  The 684fa8d blob of the deleted 0731 artifact was deleted 2026-10-30
+# (git history keeps it; its note is docs/history/).  13bcbab1 is
 # the Vision-Exp blob the battery names (the f5bea7aa one it replaced was dumped
 # by ~/devref-clean's own binary; this one by `cuda-prefill-gate-baseline` at the
 # ref, see its .md).

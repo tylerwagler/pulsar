@@ -188,7 +188,7 @@ on batteries").**  ONE full battery per landing SERIES, on the last sha whose
 numeric paths changed -- not one per increment, and not again for a delta
 that cannot move a number:
 
-- `src/engine`, `src/cuda`, `src/server`, `src/tp` changed on a path a token
+- `src/engine`, `src/families`, `src/cuda`, `src/server`, `src/tp` changed on a path a token
   takes: the full `make gates` at that sha.
 - After that battery, a delta of refusal paths, announces, tests, tools,
   docs or Makefile recipes: the gate that covers it plus `make gates-dev`

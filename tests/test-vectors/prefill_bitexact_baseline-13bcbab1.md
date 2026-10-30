@@ -28,8 +28,8 @@ the top-level Makefile and `tests/prefill_bitexact_gate.cpp`).
   `209cb5310d7fb32bc279e9b2dd8c2aeafda582999831bd70b36f90f5e666efe2`
 - **Superseded blob:** `prefill_bitexact_baseline-f5bea7aa.bin` (same artifact,
   the fast-divide KV row) is deleted with this re-anchor, as numerics re-anchors
-  do.  `prefill_bitexact_baseline-684fa8d.bin` stays as the deleted 0731
-  artifact's history.
+  do.  `prefill_bitexact_baseline-684fa8d.bin` (the deleted 0731 artifact's)
+  was deleted 2026-10-30; its note is in docs/history/.
 
 Self-describing format (`DS4PFXG1` magic): ref stamp, logits width, depth
 list, FNV-1a of the prompt token ids, then the raw f32 logits per depth.

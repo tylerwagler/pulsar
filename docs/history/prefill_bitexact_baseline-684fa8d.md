@@ -1,4 +1,4 @@
-> **Historical, not maintained** (moved to docs/history/ on 2026-10-30): provenance of a superseded prefill bit-exact baseline, 2026-09-06; the Makefile now defaults to 13bcbab1 (was tests/test-vectors/; the .bin is still there). The code at the tip of `dev` is the authority.
+> **Historical, not maintained** (moved to docs/history/ on 2026-10-30): provenance of a superseded prefill bit-exact baseline, 2026-09-06; the Makefile now defaults to 13bcbab1 (was tests/test-vectors/; the .bin was deleted 2026-10-30, git history keeps it). The code at the tip of `dev` is the authority.
 
 # prefill_bitexact_baseline-684fa8d.bin — provenance
 

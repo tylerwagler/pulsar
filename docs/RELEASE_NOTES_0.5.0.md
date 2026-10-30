@@ -89,8 +89,9 @@ rounds. A duplicate-prefix census is exported (L324).
 - **`cached_tokens` is correct at token seams** (L334). When a client re-spells
   text the model generated, the reported cached count is now the request's own
   tokens that the reused state serves. Before, it was a position on the live side.
-  Strong unit types (`KvRows`, `KvBytes`, `LiveToks`, `PromptToks`; L333, L334)
-  now keep those currencies apart in the code.
+  Strong unit types (`KvRows` and `KvBytes`, L333; `TokCount`, `TokPos` and
+  `PromptToks` in `src/lib/pulsar_units.h`, L334) now keep those currencies
+  apart in the code.
 - **Memory-floor refusals.** A request that cannot get memory above the floor
   is answered with a retryable **503**, after the server has tried spilling idle
   banks and preempting. It is no longer run until the box stalls.
