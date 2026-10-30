@@ -3428,8 +3428,8 @@ struct pulsar_seam_stitch {
     enum { IMAGES_MAX = 64 };
     pulsar_tokens tokens = {};                ///< owned; freed with the stitch
     pulsar_image_ref placed[IMAGES_MAX] = {};  ///< the request's images, start_pos on `tokens`
-    int live_cut = 0;                         ///< live tokens the stitch keeps
-    int prompt_cut = 0;                       ///< prompt tokens the kept live tokens re-spell
+    LiveToks live_cut{0};                     ///< live tokens the stitch keeps
+    PromptToks prompt_cut{0};                 ///< prompt tokens the kept live tokens re-spell
     pulsar_seam_stitch() = default;
     pulsar_seam_stitch(const pulsar_seam_stitch &) = delete;
     pulsar_seam_stitch &operator=(const pulsar_seam_stitch &) = delete;

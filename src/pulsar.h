@@ -749,12 +749,24 @@ int pulsar_session_common_prefix(pulsar_session *s, const pulsar_tokens *prompt)
  * live/bank side (KV rows, cut points, rewind targets); `prompt_cut` is the
  * request side (accounting, cache_read_tokens, prefill bounds).  Mixing
  * them is the hazard this struct exists to make impossible — a live-side
- * count used to index the request array can run past its end. */
+ * count used to index the request array can run past its end — so each is
+ * its own type (L334, pulsar_units.h: LiveToks, PromptToks), and the one
+ * conversion between them is pulsar_prefix_match_stitched_len. */
 typedef struct {
-    int  live_cut;    ///< live/bank-side token count: KV rows, cut points, rewind targets
-    int  prompt_cut;  ///< request-side token count for the SAME bytes: accounting, prefill bounds
-    bool seamed;      ///< token ids disagreed inside the covered region (same bytes, different split)
+    LiveToks   live_cut;    ///< live/bank-side token count: KV rows, cut points, rewind targets
+    PromptToks prompt_cut;  ///< request-side token count for the SAME bytes: accounting, prefill bounds
+    bool seamed;            ///< token ids disagreed inside the covered region (same bytes, different split)
 } pulsar_prefix_match;
+
+/** L334: the length, in live-side tokens, of the prompt a sync runs for a request of `prompt_len` tokens -- the
+ *  stitch (live[0, live_cut) + prompt[prompt_cut, prompt_len)): past the cut the stitched prompt carries the
+ *  request's own tokens, so a prompt-side distance there is a live-side one.  The one conversion between the
+ *  currencies.
+ *  @param m the match the stitch is cut at
+ *  @param prompt_len the request prompt's length */
+static inline LiveToks pulsar_prefix_match_stitched_len(const pulsar_prefix_match *m, PromptToks prompt_len) {
+    return m->live_cut + LiveToks{(prompt_len - m->prompt_cut).raw()};
+}
 
 void pulsar_tokens_prefix_match(pulsar_engine *e,
                                 const int *live, int live_len,
@@ -1230,8 +1242,8 @@ int pulsar_session_checkpoint_best(pulsar_session *s, int limit);
  *  sync runs on the token-seam stitch (pulsar_session_bank_prefix_match): an extension of a history the bank
  *  continues where it stands (prefilled whole, at a cut the model's prefill reproduces, its state live) serves
  *  the whole match; anything else serves its deepest grid checkpoint within the match, the prefill-only history
- *  and the stitched prompt's length - 1, else nothing (0). */
-int pulsar_session_bank_resume_at(pulsar_session *s, uint32_t bank, const pulsar_tokens *prompt);
+ *  and the stitched prompt's length - 1, else nothing (0).  A request-side count (L334: PromptToks). */
+PromptToks pulsar_session_bank_resume_at(pulsar_session *s, uint32_t bank, const pulsar_tokens *prompt);
 int pulsar_session_restore_checkpoint(pulsar_session *s, int G, char *err, size_t errlen);
 /** L313: bank-independent checkpoints -- the INSTALLED bank adopts ANOTHER bank's published state for `prompt`: the
  *  deepest of `src`'s grid checkpoints and records the prompt carries (the resume rule's terms, over src's prefill-only
@@ -1245,8 +1257,9 @@ int pulsar_session_restore_checkpoint(pulsar_session *s, int G, char *err, size_
  *  position and must be synced from nothing). */
 int pulsar_session_bank_adopt(pulsar_session *s, uint32_t src, const pulsar_tokens *prompt, char *err, size_t errlen);
 /** L313: the T pulsar_session_bank_adopt would adopt from `src` for `prompt` (a host scan, no device work; 0 for the
- *  installed bank, none, or a tensor-parallel engine). */
-int pulsar_session_bank_adopt_score(pulsar_session *s, uint32_t src, const pulsar_tokens *prompt);
+ *  installed bank, none, or a tensor-parallel engine).  A position on src's history: the live side of the seam
+ *  (L334: LiveToks). */
+LiveToks pulsar_session_bank_adopt_score(pulsar_session *s, uint32_t src, const pulsar_tokens *prompt);
 int pulsar_session_pos(pulsar_session *s);
 int pulsar_session_ctx(pulsar_session *s);
 int pulsar_session_prefill_cap(pulsar_session *s);

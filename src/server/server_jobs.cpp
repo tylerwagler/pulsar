@@ -310,7 +310,7 @@ void server::canonicalize_tool_checkpoint(session_slot *sl,
      * from 0 even with a grid checkpoint below the cut.  L318: a disk chain deeper than the bank's own resume loads
      * when L310 prices the read under the prefill it saves, as a request's does. */
     {
-        const int resume = pulsar_session_bank_resume_at(s->sess, (uint32_t)sl->bank, &canonical);
+        const int resume = pulsar_session_bank_resume_at(s->sess, (uint32_t)sl->bank, &canonical).raw();
         char *path = NULL;
         pulsar_tokens effective = {0};
         const int loaded = s->kv_cache_try_load_text(sl, rendered.ptr ? rendered.ptr : "", rendered.spans,
@@ -761,7 +761,7 @@ void server::gen_begin(session_slot *sl) {
     /* L115: one authority, both currencies (see pulsar_prefix_match). */
     pulsar_prefix_match pm;
     s->slot_prefix_match(sl, &j->req.prompt, &pm);
-    const int common = pm.live_cut;          /* live/bank side: KV rows */
+    const int common = pm.live_cut.raw();    /* live/bank side: KV rows */
     trace_cache_diag cache_diag = {0};
     trace_cache_capture(&cache_diag, pulsar_session_tokens(s->sess),
                         &j->req.prompt, old_pos, common);
@@ -870,13 +870,16 @@ void server::gen_begin(session_slot *sl) {
         /* L266/L284: the byte match is what the bank's tokens re-spell; the count is where the sync actually
          * starts -- the match itself when the sync continues the bank where it stands, else the grid
          * checkpoint it resumes from (every family: decode rows past the prefill are recomputed) */
-        const int resume = pulsar_session_bank_resume_at(s->sess, sl->bank, &j->req.prompt);
-        memory_resume = resume;
+        const PromptToks resume = pulsar_session_bank_resume_at(s->sess, sl->bank, &j->req.prompt);
+        memory_resume = resume.raw();
         /* L289: a bank that serves the WHOLE prompt (its prompt end, or a history it continues) is never declined
          * as shallow -- nothing serves that prompt better (a short repeated prompt sat under the trivial line and
          * was counted cold, and with the disk on, persisted and searched for nothing) */
-        cached = (pm.prompt_cut > 0 && (!trivial || resume == j->req.prompt.len)) ? resume : 0;
-        cache_source = cached <= 0 ? "none" : cached == pm.prompt_cut ? "memory-token" : "memory-checkpoint";
+        const bool serves = pm.prompt_cut > PromptToks{0} && (!trivial || resume == PromptToks{j->req.prompt.len});
+        cached = serves ? resume.raw() : 0;
+        cache_source = !serves || resume <= PromptToks{0} ? "none"
+                       : resume == pm.prompt_cut           ? "memory-token"
+                                                           : "memory-checkpoint";
     }
     if (cached == 0 && old_pos > 0) {
         server_log(PULSAR_LOG_WARNING,
@@ -907,7 +910,10 @@ void server::gen_begin(session_slot *sl) {
                 if (o == sl || !o->provisioned || o->spilled || o->preempted ||
                     (o->gen && o->gen->phase == GEN_RESTORE))
                     continue;
-                const int T = pulsar_session_bank_adopt_score(s->sess, o->bank, &j->req.prompt);
+                /* L334, reported and left as it was: T is a position on o's history (the live side), ranked
+                 * below against `own` and the prompt's length, which are prompt-side counts; they agree when no
+                 * seam lies below T */
+                const int T = pulsar_session_bank_adopt_score(s->sess, o->bank, &j->req.prompt).raw();
                 if (T > adopt_at) { adopt_at = T; adopt_src = (int)o->bank; }
             }
         }
@@ -924,7 +930,7 @@ void server::gen_begin(session_slot *sl) {
         pthread_mutex_unlock(&s->mu);
         server_log(PULSAR_LOG_KVCACHE,
                    "pulsar-server: resume: bank %u own %d adopt %d%s disk %d of %d (match %d) -> %s", sl->bank, own,
-                   adopt_at, adopt_src >= 0 ? "" : " (none)", disk_at, j->req.prompt.len, pm.prompt_cut,
+                   adopt_at, adopt_src >= 0 ? "" : " (none)", disk_at, j->req.prompt.len, pm.prompt_cut.raw(),
                    resume_pick_names[pick]);
     }
     if (s->kv.enabled && old_pos >= s->kv.opt.min_tokens && (cached == 0 || pick != RESUME_OWN)) {
