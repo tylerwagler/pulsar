@@ -1201,8 +1201,11 @@ bool pulsar_session_split_invariant(const pulsar_session *s);
  * _common_prefix describe only the live bank, so server routing and /metrics
  * must use these for non-active banks.  Pure host reads (no CUDA); the caller
  * must keep idle banks' carries current (bank_state_save at job end). Return
- * position 0 / a 0 count / NULL for an out-of-range or never-populated bank -- 0, not none(), so such a bank reads
- * exactly as an empty one. */
+ * a 0 count / NULL for an out-of-range or never-populated bank.
+ *
+ * L334: bank_pos is none() for a bank that holds no history -- never populated, or its view invalidated (the two
+ * are one engine state: no valid checkpoint) -- and position 0 for one whose valid history is empty.  A bank outside
+ * the pool is a caller's bug: refused by name (logged once) with none(). */
 TokPos pulsar_session_bank_pos(pulsar_session *s, uint32_t bank);
 /** L264: the end of the last prompt the bank PREFILLED (its generated tokens lie
  *  past it).  A request that carries all of it is that conversation's next turn. */
@@ -1288,10 +1291,21 @@ int pulsar_session_restore_checkpoint(pulsar_session *s, TokPos G, char *err, si
  *  rest, the cold prefill's bytes.  src may be busy (its rows below T never change while its history reaches T).
  *  L322: "carries" is the token-seam match (pulsar_tokens_prefix_match, the route's and the own resume's), T a
  *  boundary both spellings share; the sync re-stitches the prompt onto src's tokens there.
- *  A text history only.  @return T, position 0 when src serves nothing (or holds an image block below it), none()
- *  with `err` on a refusal (a tensor-parallel engine, not another bank, a copy that failed: the installed bank then
- *  describes no position and must be synced from nothing). */
-TokPos pulsar_session_bank_adopt(pulsar_session *s, uint32_t src, const pulsar_tokens *prompt, char *err, size_t errlen);
+ *  A text history only.  @return the outcome (pulsar_bank_adopt_result). */
+typedef enum {
+    PULSAR_ADOPT_ADOPTED = 0,   /* the installed bank stands at `at` (> 0) on src's tokens */
+    PULSAR_ADOPT_NONE = 1,      /* src serves nothing for the prompt (or holds an image block below it): nothing moved */
+    PULSAR_ADOPT_REFUSED = 2,   /* refused, `err` says why: no session or prompt, a tensor-parallel engine, not another
+                                 * bank (nothing moved), or a copy that failed (the installed bank then describes no
+                                 * position and must be synced from nothing) */
+} pulsar_adopt_status;
+/** L334: pulsar_session_bank_adopt's outcome and its position, apart. */
+typedef struct {
+    pulsar_adopt_status status;   ///< how the adopt ended
+    TokPos at;                    ///< ADOPTED: T; NONE: position 0; REFUSED: none()
+} pulsar_bank_adopt_result;
+pulsar_bank_adopt_result pulsar_session_bank_adopt(pulsar_session *s, uint32_t src, const pulsar_tokens *prompt,
+                                                   char *err, size_t errlen);
 /** L313: the T pulsar_session_bank_adopt would adopt from `src` for `prompt` (a host scan, no device work; 0 for the
  *  installed bank, none, or a tensor-parallel engine).  L334: `at` = T, a position on src's history (the live side),
  *  `served` the request's tokens src's history to T holds, the depth an adopt is ranked by. */

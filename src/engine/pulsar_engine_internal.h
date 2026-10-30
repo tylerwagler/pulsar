@@ -3413,6 +3413,12 @@ bool pulsar_bank_carry_restore_view(pulsar_session *s, uint32_t bank);
 void pulsar_bank_carry_fresh_view(pulsar_session *s);
 /** A bank's committed history: the live view for the live bank, else its carry.  NULL = none. */
 const pulsar_tokens *pulsar_bank_history(pulsar_session *s, uint32_t bank);
+/** L334: pulsar_session_bank_pos's rule over what the pool knows: none() for a bank outside a pool of `n_banks`
+ *  (refused by name, logged once) or one that holds no history (`history` NULL), else the history's length.
+ *  @param bank the bank asked about
+ *  @param n_banks the pool's banks
+ *  @param history the bank's history (pulsar_bank_history) */
+TokPos pulsar_bank_pos_of(uint32_t bank, uint32_t n_banks, const pulsar_tokens *history);
 
 /** The session's cooperative cancel hook, polled at a prefill chunk boundary (session.cpp).  A mirrored
  *  session stops only together: the leader decides and ships the verdict, every worker reads it, so every

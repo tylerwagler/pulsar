@@ -2169,8 +2169,30 @@ static void test_lib_think_scan(void) {
     }
 }
 
+/* L334 tidy: bank_pos's rule -- a bank outside the pool is refused by name (none(), logged once), one holding no
+ * history is none(), an empty valid history is position 0 -- and bank_adopt's refusals carry their status apart from
+ * the position (the ADOPTED / NONE paths need a model: bank_adopt_gate). */
+static void test_l334_bank_pos_and_adopt_result(void) {
+    int toks[7] = {1, 2, 3, 4, 5, 6, 7};
+    const pulsar_tokens empty = {toks, 0, 7}, seven = {toks, 7, 7};
+    TEST_ASSERT(pulsar_bank_pos_of(4, 4, &seven).is_none());   /* out of range, whatever it is handed */
+    TEST_ASSERT(pulsar_bank_pos_of(9, 4, NULL).is_none());
+    TEST_ASSERT(pulsar_bank_pos_of(1, 4, NULL).is_none());     /* no history: never populated / invalidated */
+    TEST_ASSERT(pulsar_bank_pos_of(1, 4, &empty) == TokPos{0});
+    TEST_ASSERT(pulsar_bank_pos_of(3, 4, &seven) == TokPos{7});
+    TEST_ASSERT(pulsar_session_bank_pos(NULL, 0).is_none());
+    char err[160] = "";
+    const pulsar_bank_adopt_result r = pulsar_session_bank_adopt(NULL, 1, &seven, err, sizeof err);
+    TEST_ASSERT(r.status == PULSAR_ADOPT_REFUSED && r.at.is_none() && strstr(err, "no session") != NULL);
+    pulsar_session *none_s = NULL;
+    err[0] = '\0';
+    const pulsar_bank_adopt_result q = pulsar_session_bank_adopt(none_s, 1, NULL, err, sizeof err);
+    TEST_ASSERT(q.status == PULSAR_ADOPT_REFUSED && q.at.is_none() && err[0] != '\0');
+}
+
 static void test_server_unit_group(void) {
     pulsar_server_unit_tests_run();
+    test_l334_bank_pos_and_adopt_result();
 }
 
 /* L325: a render case's protocol ("_api": "openai" | "anthropic" | "responses" (L326), default openai) and family
