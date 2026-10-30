@@ -3,7 +3,7 @@
 
     python3 tests/mamba2_mini_fixture.py CHECKPOINT DIR [--rows T]
 
-CHECKPOINT is Nemotron 3.5 Super VL in BF16 (/mnt/models/nemotron35-super-vl-bf16).  On the CPU, in fp32, from the
+CHECKPOINT is Nemotron 3.5 Super VL in BF16 (/path/to/models/nemotron35-super-vl-bf16).  On the CPU, in fp32, from the
 safetensors through the index (no model is built):
 
   - T real tokens (the checkpoint's README through its own tokenizer) -> embeddings;

@@ -2,12 +2,13 @@
 # Conditional step 4 of the MXFP6 pre-check: tool-eval-bench --short smoke on a
 # spliced artifact. Run ONLY if the frontier-logit drift is borderline-or-better,
 # and ONLY under the GPU flock:
-#   flock -w 28800 /home/tyler/Projects/AI/temp/gpu.lock \
-#       bash tools/mxfp6/run_teb_smoke.sh MODEL.gguf TAG
+#   WT=<built tree> ART=<artifact dir> TEB_DIR=<tool-eval-bench checkout> flock -w 28800 $LOCK \
+#       bash tools/mxfp6/run_teb_smoke.sh MODEL TAG
 # Expect ~97 if quality holds (v5mx --short precedent).
 set -u
-WT=/home/tyler/Projects/AI/temp/wt-mxfp6
-ART=/home/tyler/Projects/AI/temp/mxfp6-artifacts
+WT=${WT:?set WT to the built tree}
+ART=${ART:?set ART to the artifact directory}
+TEB_DIR=${TEB_DIR:?set TEB_DIR to the tool-eval-bench checkout}
 MODEL="${1:?model gguf required}"
 TAG="${2:?tag required}"
 PORT=8077
@@ -38,7 +39,7 @@ for _ in $(seq 240); do
 done
 curl -sf "http://127.0.0.1:$PORT/v1/models" >/dev/null || { echo "FATAL: server never became ready" | tee -a "$LOG"; exit 1; }
 
-cd /home/tyler/Projects/AI/tool-eval-bench
+cd "$TEB_DIR"
 uv run tool-eval-bench --base-url "http://127.0.0.1:$PORT/v1" --short --no-live \
     --json-file "$ART/teb-$TAG.json" > "$LOG" 2>&1
 rc=$?

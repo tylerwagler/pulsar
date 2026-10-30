@@ -19,7 +19,7 @@
  * This is deliberately a transcription rather than a shared fixture: when the
  * device gate lands it compares the MXFP4 tier's kernels against THIS, and an
  * oracle sharing code with the thing under test can be wrong in the same
- * direction.  Transcribed from /mnt/models/dsv4-flash-0731/inference/model.py
+ * direction.  Transcribed from /path/to/models/dsv4-flash-0731/inference/model.py
  * class Indexer, forward() lines 408-439.
  *
  * The gate compares the masked scores (tolerance, -inf aware -- the reference and

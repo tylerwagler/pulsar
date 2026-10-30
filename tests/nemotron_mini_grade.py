@@ -19,7 +19,7 @@ The engine's taps (PULSAR_CUDA_GRAPH_DUMP_PREFIX = CAP_DIR/d): for pulsar layer 
 nemotron_mid (the residual after the mixer, a layer with the MoE), nemotron_ffn (the MoE's delta), nemotron_h (the
 residual after the layer).  pulsar layer il groups HF block b (its mixer) and b + 1 (the MoE after it, when it has one).
 
-Metrics: rel-fro = ||ours - ref||_F / ||ref||_F.  Needs torch + safetensors (~/inkling/.venv on Sparky).
+Metrics: rel-fro = ||ours - ref||_F / ||ref||_F.  Needs torch + safetensors (~/inkling/.venv on the GB10 host).
 """
 import argparse
 import glob

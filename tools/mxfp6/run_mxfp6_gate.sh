@@ -10,13 +10,14 @@
 #   5. drift tables -> $WT/temp/mxfp6-gate-results.txt
 #
 # All model loads run inside gate_phase.sh under
-# flock /home/tyler/Projects/AI/temp/gpu.lock.
+# flock $LOCK.  Settings (env, required): WT the built tree, ART the artifact dir, LOCK the GPU lock file,
+# PROD the production model, PY the interpreter with the splice tool's deps.
 set -u
-WT=/home/tyler/Projects/AI/temp/wt-mxfp6
-ART=/home/tyler/Projects/AI/temp/mxfp6-artifacts
-LOCK=/home/tyler/Projects/AI/temp/gpu.lock
-PROD=/home/tyler/Projects/AI/ds4-gb10/gguf/model.gguf
-PY=/home/tyler/Projects/AI/prismaquant/.venv-gb10/bin/python
+WT=${WT:?set WT to the built tree}
+ART=${ART:?set ART to the artifact directory}
+LOCK=${LOCK:?set LOCK to the GPU lock file}
+PROD=${PROD:?set PROD to the production model}
+PY=${PY:?set PY to the interpreter with the splice dependencies}
 RES="$WT/temp/mxfp6-gate-results.txt"
 LOG="$ART/gate.log"
 

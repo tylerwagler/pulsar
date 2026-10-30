@@ -2552,7 +2552,7 @@ bool gpu_graph_encode_layer_attention_batch(
  * rate): cudaGraphLaunch is expensive on integrated Blackwell, and 43 small
  * graph launches per round lose to eager launches the host already hides at
  * 92% busy. Deleted; the output head keeps capture (1 dense graph/round,
- * +1-2% measured). Full chain: pulsar-notes rows/L119.md. */
+ * +1-2% measured). Full chain: ledger row L119. */
 /* Slice 4b: one prefill big-gate exchange for `il` over the whole chunk.  Read
  * this layer's n_embd-width routed contribution to host, swap it with the peer
  * via the pair transport, and write the combined (local + peer) value back so

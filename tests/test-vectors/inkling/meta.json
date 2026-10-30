@@ -8,7 +8,7 @@
   "special_tokens_map.json": "abc97715b4b3b30eb65ea6895afd7b529c32bd10c28901f9ddae7edc39723b0f"
  },
  "calib": {
-  "path": "/mnt/models/qwen38-calib/calib-qwen38-v1.jsonl",
+  "path": "<model-store>/qwen38-calib/calib-qwen38-v1.jsonl",
   "sha256": "870e3226e28ce2ee27e1fea2ff936b856a810467b800ddf50d9bda851ee9e8eb"
  },
  "n_tokens": 200058,

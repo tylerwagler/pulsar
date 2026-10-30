@@ -2,7 +2,7 @@
 """Generate vision-layout goldens from the checkpoint's OWN image_processor.py.
 
 Run this where the Vision-Exp snapshot is readable and torch+PIL are importable
-(sparky: /home/claude/Projects/AI/prismaquant/.venv/bin/python).  It imports the
+(any interpreter with torch, transformers and PIL).  It imports the
 reference module and calls its functions -- it does NOT reimplement them -- so
 the C++ port in src/engine/vision.cpp is graded against the authority, not
 against a second transcription of it.

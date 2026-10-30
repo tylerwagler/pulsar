@@ -1,4 +1,4 @@
-# depth kl   (recorded /home/claude/ref-vexp/story.ref.bin)
+# depth kl   (recorded against the Vision-Exp reference capture, story.ref.bin)
 512 0.33547523669871721
 2048 2.5643271214264724e-06
 4096 1.4853253031220173e-05

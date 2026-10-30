@@ -13,7 +13,7 @@
       p + 1) -- the teacher-forced draft-1 acceptance on this fixture, the reference's and ours.
 
 PASS: on both engine paths, KL mean <= 2 x the bf16 floor's and top-1 within 2 points of it (the floor graded the same
-way); decode vs prefill reported.  Needs torch (~/inkling/.venv on Sparky).
+way); decode vs prefill reported.  Needs torch (~/inkling/.venv on the GB10 host).
 """
 import argparse
 import os

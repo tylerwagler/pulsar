@@ -18,7 +18,7 @@
  * Unregistered, the runtime took the synthetic-mapping device copy -- a memcpy
  * from the mmap -- and the ~61 GiB of zeros the forward touches went through
  * the page cache as mapped pages and stayed there beside their device copy:
- * the reclaim drove memory PSI past systemd-oomd's 50 %-for-20 s on Sparky
+ * the reclaim drove memory PSI past systemd-oomd's 50 %-for-20 s on the GB10 host
  * (L329, gpuq #477 / #478 / #481).  What the forward adds to the fixture's
  * page-cache residency is asserted, so that route cannot come back unseen.
  *

@@ -25,7 +25,7 @@
  */
 /* Self-contained like the attention gates: #includes the shipped packer TU so
  * it drives the REAL kernels, links nothing else, and builds standalone on
- * the GPU box (the dev box has no GPU; sparky is aarch64, so a dev-box binary
+ * the GPU box (the dev box has no GPU; the GB10 host is aarch64, so a dev-box binary
  * does not travel). */
 #include "../src/cuda/pulsar_cuda_kvrows.cu"
 int cuda_ok(cudaError_t err, const char *what) {

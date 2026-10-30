@@ -1376,7 +1376,7 @@ static const pulsar_mtp_ops k_qwen_mtp = {
 };
 static_assert(PULSAR_QWEN_HEAD_ROWS_MAX == PULSAR_DRIVER_HEADS_MAX, "the lane's lockstep rows are the draft head's");
 
-/* The MTP drafter's numbers (the functions are the chained-MTP lane's).  Swept on sparky over three code prompts
+/* The MTP drafter's numbers (the functions are the chained-MTP lane's).  Swept on the GB10 host over three code prompts
  * (2026-09-29, L270): depth 4 with a confidence stop at 0.7 gave 58.7 / 58.9 / 59.2 tok/s vs 53.4 for a fixed 3;
  * TensorFold's own 6 / 0.6 was 53.6 here -- a verify row costs more on this engine (4 rows read up to 40 distinct
  * experts).  The adaptive depth controller (spec_depth.h) LOST to the fixed depth (52-59 vs 59.5-60.4 tok/s at tau

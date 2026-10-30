@@ -1,4 +1,4 @@
-# depth kl   (recorded /mnt/models/sparky-parked/home-claude/ref-qwen38fn-q/code.ref.bin)
+# depth kl   (recorded against the Qwen3.8-Flash-Next reference capture, code.ref.bin)
 512 0.086439835125536629
 2048 0.00060162428744111912
 3957 0.039437234064857919

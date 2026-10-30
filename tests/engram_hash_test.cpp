@@ -2,7 +2,7 @@
  *
  * No model, no device: the hash is integer arithmetic over a fixed layout, so
  * this binary grades the C++ port against vectors generated from the real V4.1
- * layout by pulsar-notes/gate-baseline/l218-v41/gen_engram_fixture.py.
+ * layout by the private notes' gate-baseline/l218-v41/gen_engram_fixture.py.
  *
  * What this pins, and why each part is worth a check:
  *

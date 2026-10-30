@@ -8,7 +8,7 @@
  * validated); first asserted by the unified lane's position-true admission
  * check, first fired by production anthropic live continuations (the one
  * serving path with no counter-rebuilding re-route between the rewind and
- * the check).  See pulsar-notes rows/L120.md.
+ * the check).  See ledger row L120.
  *
  * Shape (deterministic — no residue luck, unlike the serving repro):
  *   1. prefill to a frontier past several ratio-4 boundaries;

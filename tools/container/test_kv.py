@@ -25,9 +25,18 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from kv import build_kv, f32  # noqa: E402
 
-SERVED = '/mnt/models/DeepSeek-v4-Flash'
-VEXP = '/mnt/models/hub/models--deepseek-ai--DeepSeek-V4-Flash-Vision-Exp/snapshots/*/'
-V41 = '/mnt/models/hub/models--deepseek-ai--DeepSeek-V4.1-Flash/snapshots/*/'
+
+def need(var, what):
+    """An oracle path from the environment (make container-tests passes local.mk's); refuse by name when unset."""
+    v = os.environ.get(var, "")
+    if not v:
+        raise SystemExit(f"{var} is not set: {what} (make container-tests passes it from local.mk)")
+    return v
+
+
+SERVED = need('PULSAR_SERVED', 'the served DeepSeek-v4-Flash container directory')
+VEXP = need('PULSAR_HF_SNAPSHOT', 'the DeepSeek-V4-Flash-Vision-Exp HF snapshot directory (a glob matching one is fine)')
+V41 = need('PULSAR_V41_SNAPSHOT', 'the DeepSeek-V4.1-Flash HF snapshot directory (a glob matching one is fine)')
 
 # Served keys the direct builder has no source for: GGUF bookkeeping numbers and
 # the quantizer's provenance.  Nothing in src/ reads any of them (kv.py docstring).

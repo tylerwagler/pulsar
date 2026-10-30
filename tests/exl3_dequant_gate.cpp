@@ -26,8 +26,8 @@
  *   5. a mutation: one flipped stream bit in a real block must change W_hat.
  *      A gate that passes an all-zero comparison is measuring nothing.
  *
- * Vector format (little-endian; producer: pulsar-notes research, the
- * exl3_goldens.py script on sparky): 32-byte header {char magic[8]="EXL3VEC1";
+ * Vector format (little-endian; producer: the private notes' research, the
+ * exl3_goldens.py script on the GB10 host): 32-byte header {char magic[8]="EXL3VEC1";
  * u32 k_tiles, n_tiles, words_per_tile, k_x2, flags, reserved}; then trellis
  * i16[k_tiles][n_tiles][words], suh f16[k_tiles*16], svh f16[n_tiles*16],
  * what f16[k_tiles*16][n_tiles*16], w_fused (same).  flags bit0 = real

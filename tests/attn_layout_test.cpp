@@ -209,7 +209,7 @@ static void install_and_grade(const pulsar_shape *shape, const char *what,
 }
 
 /* L269 W2: a LAYER-SUBSET FIXTURE of V4.1 (tools/container build.py --layers 1,2,3,14,20,21,24, what
- * /mnt/models/v41-tp1-fixture keeps): the block table must be the source layers' own modes, the sources and the
+ * /path/to/models/v41-tp1-fixture keeps): the block table must be the source layers' own modes, the sources and the
  * candidate re-bound to the kept blocks, and a fixture that drops a source its kept readers read must refuse
  * (the install exits; run in a child). */
 static const uint32_t FIX_SRC[7] = { 1, 2, 3, 14, 20, 21, 24 };

@@ -2,9 +2,10 @@
 # Prefill composition profiling on the post-widening dev build (77d579d).
 # nsys kernel trace + PULSAR_MOE_TIME per-format split, at prefill-chunk 2048 and 8192.
 set -u
-WT=/home/tyler/Projects/AI/temp/wt-prof
-OUT=/home/tyler/Projects/AI/temp
-MODEL=/home/tyler/Projects/AI/ds4-gb10/gguf/model.gguf
+# Settings (env, required): WT the built engine tree, OUT the output directory, MODEL the model container.
+WT=${WT:?set WT to the built engine tree}
+OUT=${OUT:?set OUT to the output directory}
+MODEL=${MODEL:?set MODEL to the model container}
 PROMPT=$WT/speed-bench/promessi_sposi.txt
 cd "$WT" || exit 1
 

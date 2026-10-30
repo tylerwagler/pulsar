@@ -4539,7 +4539,8 @@ static const bpe_tokenizer *qwen_test_tokenizer(void) {
     if (tried) return tok;
     tried = true;
     const char *env = getenv("PULSAR_TEST_QWEN_TOKENIZER");
-    const std::string dir = env && env[0] ? env : "/srv/models/qwen38fn-dflash2";
+    /* no default: the Makefile's test targets pass QWEN_GATE_MODEL (local.mk) */
+    const std::string dir = env && env[0] ? env : "";
     std::string tj, gj;
     const auto slurp = [](const std::string &path, std::string *out) {
         FILE *f = fopen(path.c_str(), "rb");
@@ -4551,7 +4552,9 @@ static const bpe_tokenizer *qwen_test_tokenizer(void) {
         return true;
     };
     char err[256] = "";
-    if (!slurp(dir + "/tokenizer.json", &tj) || !slurp(dir + "/generation_config.json", &gj))
+    if (dir.empty())
+        snprintf(err, sizeof err, "not set -- point it at a Qwen container or HF snapshot directory");
+    else if (!slurp(dir + "/tokenizer.json", &tj) || !slurp(dir + "/generation_config.json", &gj))
         snprintf(err, sizeof err, "no tokenizer.json + generation_config.json in %s", dir.c_str());
     else
         tok = bpe_tokenizer_load_hf(tj.data(), tj.size(), gj.data(), gj.size(), err, sizeof err);

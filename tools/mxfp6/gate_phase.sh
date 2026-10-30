@@ -1,11 +1,11 @@
 #!/bin/bash
 # One GPU lock-hold phase: run prefill-only frontier-logit dumps for each
 # MODEL:OUTDIR pair given as arguments. Invoked as:
-#   flock -w SECS /home/tyler/Projects/AI/temp/gpu.lock bash gate_phase.sh LOGFILE M1:D1 [M2:D2 ...]
+#   WT=<built tree> flock -w SECS $LOCK bash gate_phase.sh LOGFILE M1:D1 [M2:D2 ...]
 # Before every model load: drop_caches + require 95 GiB MemAvailable
 # (model is 91 GB; we never touch processes we did not start).
 set -u
-WT=/home/tyler/Projects/AI/temp/wt-mxfp6
+WT=${WT:?set WT to the built tree}
 BENCH="$WT/pulsar-bench"
 PROMPT="$WT/speed-bench/promessi_sposi.txt"
 LOG="$1"; shift

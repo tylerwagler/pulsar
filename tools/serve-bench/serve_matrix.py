@@ -35,7 +35,7 @@ stream, from the median stream's rate).
 
   serve_matrix.py single  --port 8000 --prompts code,codex,prose,story --temps 0,0.7,1.0 --tokens 512 --reps 3
   serve_matrix.py conc    --port 8000 --streams 4 --temps 0 --tokens 256
-  serve_matrix.py prefill --port 8000 --lengths 1024,8192,32768 --tokenizer /srv/models/.../tokenizer.json
+  serve_matrix.py prefill --port 8000 --lengths 1024,8192,32768 --tokenizer /path/to/.../tokenizer.json
 """
 
 import argparse

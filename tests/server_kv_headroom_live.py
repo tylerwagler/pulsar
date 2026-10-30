@@ -8,7 +8,7 @@ or wait at the floor instead of running the machine out of memory.
 The defect (L319, 2026-10-22, e80e7a66): the 2b guard's ceiling was the ledger's share (kv budget - eager), and in
 pooled mode the ledger's budget is not physical (a startup clamp lifts it to slot 0 + one session estimate).  On
 Nemotron 3.5 Super at --ctx 1M it allowed 9.05 GiB of touched KV against 5.16 GiB above the floor; the guard never
-spilled, MemAvailable reached zero under long opencode sessions, and the GPU stalled on unbacked pages at work (96%
+spilled, MemAvailable reached zero under long opencode sessions, and the GPU stalled on unbacked pages in production (96%
 busy, no XID) while earlyoom killed the server at home.  This reproduces that box at a small scale: a balloon takes
 all but the floor plus --headroom-gib of the box's memory BEFORE the server starts (so its post-warmup reading is
 the tight one), then one conversation grows in place, turn by turn, toward ~2.5x the headroom -- the shape that ran

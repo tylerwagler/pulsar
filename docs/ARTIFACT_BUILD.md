@@ -113,8 +113,20 @@ would have refused at load (the confidence head's rank, the k-major
 `markov_w2` dims) while every payload byte already matched.  `test_names.py`
 grades `dims_ne` against the served artifact for that reason.
 
-The tests need numpy; `make container-tests` runs every `test_*.py` (it is
-part of `make host-checks`).
+The tests need numpy. `make container-tests` runs every `test_*.py`, and it is
+part of `make host-checks`. The oracle tests (`test_names.py`, `test_kv.py`,
+`test_producers.py`) read their checkpoints from the environment, with no
+defaults:
+
+| Variable | What it points at |
+| --- | --- |
+| `PULSAR_SERVED` | the served container |
+| `PULSAR_HF_SNAPSHOT` | the Vision-Exp HF snapshot |
+| `PULSAR_V41_SNAPSHOT` | the V4.1 HF snapshot |
+| `PULSAR_V41_EXL3` | a glob of the V4.1 EXL3 shards |
+
+The make target fills them from `CONTAINER_SERVED`, `CONTAINER_VEXP_HF`,
+`CONTAINER_V41_HF` and `CONTAINER_V41_EXL3` in `local.mk`.
 
 ## What the artifact directory holds
 

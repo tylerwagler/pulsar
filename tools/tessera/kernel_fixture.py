@@ -7,7 +7,7 @@ file.  The gate then runs pulsar's launcher (src/cuda/mmq/pulsar_tessera.cu, the
 on the same inputs and requires the same bytes.  Value family (BF16 grid, folded arithmetic) only -- the one
 pulsar vendors.
 
-    python3 kernel_fixture.py --blobs BLOBS_BF16.pt --act /mnt/models/qwen38fn-act-L12 --out tessera_kernel.fx
+    python3 kernel_fixture.py --blobs BLOBS_BF16.pt --act /path/to/qwen38fn-act-L12 --out tessera_kernel.fx
 
 BLOBS is a torch.save dict {"experts": [ids], "gate"/"up"/"down": [unit blob bytes per expert],
 "qkv"/"oproj": [one blob]} of q256 1024 BF16-grid units (``tessera.export.encode_linears``).  Needs Tessera on

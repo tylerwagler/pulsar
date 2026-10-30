@@ -624,7 +624,7 @@ tests/exl3_moe_decode_bench: tests/exl3_moe_decode_bench.cu $(CUDA_OBJS) $(CUTLA
 		$(CUDA_OBJS) $(CUTLASS_CUDA_OBJS) $(MMQ_OBJS) $(CUDA_LDLIBS)
 
 # L251: the dense arm on a REAL exllamav3-quantized weight, driven by
-# pulsar-notes research/l251/exl3-dense/xcheck.py (which compares it with
+# the private notes' research/l251/exl3-dense/xcheck.py (which compares it with
 # exllamav3's own forward on the same activations).  Not a gate.
 tests/exl3_dense_xcheck: tests/exl3_dense_xcheck.cu tests/exl3_dense_ref.h src/cuda/mmq/ds4_exl3_dense.o src/cuda/mmq/qwen_exl3_dense_prefill.o src/cuda/pulsar_cuda_lt_fixed.o Makefile \
                          src/cuda/mmq/ds4_exl3_dense.cuh src/cuda/pulsar_cuda_mx.cuh src/engine/exl3_trellis.h
@@ -823,7 +823,7 @@ head-mini-grade: tests/head_gate
 	./tests/head_gate --fixture $(HEAD_MINI_FIXTURE)
 
 # L251: the same TU as a shared object for the real-weight harness in
-# pulsar-notes research/l251/gdn/ (ctypes from torch, against transformers'
+# the private notes' research/l251/gdn/ (ctypes from torch, against transformers'
 # own Qwen4ExpTextGatedDeltaNet).  The engine's NVCCFLAGS plus -fPIC.  Not a gate.
 tests/libpulsar_gdn.so: src/cuda/pulsar_cuda_gdn.cu src/cuda/pulsar_cuda_gdn.h src/cuda/pulsar_cuda_mx.cuh Makefile
 	$(NVCC) $(NVCCFLAGS) -Xcompiler -fPIC -shared -Isrc -o $@ src/cuda/pulsar_cuda_gdn.cu
@@ -1747,9 +1747,17 @@ cuda-reap-router-audit:
 # refuse when the checkpoints are not mounted; the codecs need numpy, so pass
 # the interpreter that has it (CONTAINER_PY=.../.venv/bin/python).
 CONTAINER_PY ?= python3
+# The oracles test_names / test_kv / test_producers read (local.mk): the served DeepSeek container, the Vision-Exp
+# and V4.1 HF snapshots (a glob matching one directory is fine) and a glob of the V4.1 EXL3 shards.
+CONTAINER_SERVED   ?= $(call need_path,CONTAINER_SERVED)
+CONTAINER_VEXP_HF  ?= $(call need_path,CONTAINER_VEXP_HF)
+CONTAINER_V41_HF   ?= $(call need_path,CONTAINER_V41_HF)
+CONTAINER_V41_EXL3 ?= $(call need_path,CONTAINER_V41_EXL3)
 .PHONY: container-tests
 container-tests:
-	cd tools/container && for t in test_exl3_rates.py test_names.py test_kv.py test_producers.py test_deepseek.py test_qwen.py test_inkling.py test_nemotron_h.py test_nemotron_enc.py test_nemotron_parse.py; do \
+	cd tools/container && export PULSAR_SERVED='$(CONTAINER_SERVED)' PULSAR_HF_SNAPSHOT='$(CONTAINER_VEXP_HF)' \
+	  PULSAR_V41_SNAPSHOT='$(CONTAINER_V41_HF)' PULSAR_V41_EXL3='$(CONTAINER_V41_EXL3)' && \
+	for t in test_exl3_rates.py test_names.py test_kv.py test_producers.py test_deepseek.py test_qwen.py test_inkling.py test_nemotron_h.py test_nemotron_enc.py test_nemotron_parse.py; do \
 	  $(CONTAINER_PY) $$t || exit 1; done
 
 # plan-34 phase-2 inc 4: TRUE mixed step — decode banks + one K-row prefill run
@@ -1942,7 +1950,7 @@ context-coherence-probe:
 # so the tree is the MORE ACCURATE arithmetic, and graded against the B300
 # reference it is closer at 6 of 9 depths -- including ALL THREE known-high
 # outliers (story 512 0.643->0.569, story 30464 0.255->0.173, code 3840
-# 0.196->0.190).  See pulsar-notes/bit-exact-vs-source-2026-08-24.md.
+# 0.196->0.190).  See the private notes' bit-exact-vs-source-2026-08-24.md.
 #
 # ⇒ THE RULE THIS ESTABLISHES, alongside "re-baseline whenever a numerics change
 # SHIPS": a byte-gate FAIL is not by itself a reason to revert.  Grade the change
@@ -2278,7 +2286,7 @@ cuda-prefill-decode-gate-baseline:
 # something we did not produce -- every other gate compares us to ourselves,
 # which cannot catch an error we make consistently.
 #
-# The blobs are ~4.6 MB and live OUTSIDE this repo (pulsar-notes is private and
+# The blobs are ~4.6 MB and live OUTSIDE this repo (the private notes are private and
 # stays that way), so the path comes from PULSAR_REF_DIR.  When it is unset or
 # the blobs are missing this SKIPS LOUDLY rather than passing: a gate that
 # quietly succeeds when its fixture is absent is worse than no gate, which is
@@ -2296,7 +2304,7 @@ PULSAR_REF_TOL ?= 1e-4
 # Per-depth KL budgets: the gate grades DIRECTION against these (closer to the
 # source = pass).  Absent, it falls back to the absolute-ceiling check only,
 # which cannot see direction -- see the 2026-08-24 note in
-# pulsar-notes/bit-exact-vs-source-2026-08-24.md.  RECORDED FROM THE SERVED
+# the private notes' bit-exact-vs-source-2026-08-24.md.  RECORDED FROM THE SERVED
 # MODEL (Vision-Exp, dev 4499f93d, L240, 2026-09-23, `--dump-kl`); the 0731
 # budgets they replaced graded a different model's numbers.  RE-RECORDED
 # 2026-10-13 at 13bcbab1 (L292 NVFP4 exact divide) under Tyler's documented
@@ -2522,7 +2530,7 @@ cuda-runner-gate: tests/gates_runner
 # 2026-10-14: --gating, every test but the informational ones (logprob-vectors: a drift dashboard whose mismatches
 # can never fail the suite, at the price of its own model load).  `make test` still runs everything.
 unit-test-gate: pulsar_test
-	PULSAR_TEST_MODEL="$(FRONTIER_MODEL)" ./pulsar_test --gating
+	PULSAR_TEST_MODEL="$(FRONTIER_MODEL)" PULSAR_TEST_QWEN_TOKENIZER="$(QWEN_GATE_MODEL)" ./pulsar_test --gating
 
 # The AGENT's host-only unit suite (the DSML parser/detector over every syntax
 # row, the edit anchors, and the KV store's stripped-checkpoint refusal).  It is
@@ -2847,9 +2855,9 @@ gates-dev:
 	$(MAKE) --no-print-directory seam-check CUDA_ARCH=sm_120f || rc=1; \
 	$(MAKE) --no-print-directory cuda-reap-router-audit CUDA_ARCH=sm_120f \
 	      FRONTIER_MODEL="$(FRONTIER_MODEL)" || rc=1; \
-	PULSAR_TEST_MODEL="$(FRONTIER_MODEL)" ./pulsar_test $(GATES_DEV_UNIT) || rc=1; \
+	PULSAR_TEST_MODEL="$(FRONTIER_MODEL)" PULSAR_TEST_QWEN_TOKENIZER="$(QWEN_GATE_MODEL)" ./pulsar_test $(GATES_DEV_UNIT) || rc=1; \
 	if [ $$server -eq 1 ]; then \
-	  PULSAR_TEST_MODEL="$(FRONTIER_MODEL)" ./pulsar_test $(GATES_DEV_UNIT_SERVER) || rc=1; \
+	  PULSAR_TEST_MODEL="$(FRONTIER_MODEL)" PULSAR_TEST_QWEN_TOKENIZER="$(QWEN_GATE_MODEL)" ./pulsar_test $(GATES_DEV_UNIT_SERVER) || rc=1; \
 	  $(MAKE) -j$(GATE_JOBS) --no-print-directory cuda-chat-smoke-gate CUDA_ARCH=sm_120f \
 	        FRONTIER_MODEL="$(FRONTIER_MODEL)" || rc=1; \
 	fi; \
@@ -3712,7 +3720,7 @@ tp-dmabuf-probe: tests/tp_dmabuf_probe
 	@echo "built tests/tp_dmabuf_probe; run on the pair (GDR negative on GB10/610)"
 
 test: pulsar_test seam-check
-	./pulsar_test
+	PULSAR_TEST_QWEN_TOKENIZER="$(QWEN_GATE_MODEL)" ./pulsar_test
 
 clean:
 	rm -rf .build

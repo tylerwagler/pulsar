@@ -973,7 +973,7 @@ static void attn_f16_kernel(
                  * instruction rather than paid in address arithmetic.
                  *
                  * BIT-IDENTICAL, verified rather than assumed: a standalone probe
-                 * (pulsar-notes/probes/ldm_probe.cu) filled this exact [16][520]
+                 * (the private notes' probes/ldm_probe.cu) filled this exact [16][520]
                  * layout with position-encoding values, built the fragment both
                  * ways and compared the raw registers -- 0 of 512 differed across
                  * all warps and lanes.  Guessing an ldmatrix lane mapping is

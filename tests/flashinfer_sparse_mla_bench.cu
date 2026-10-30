@@ -33,8 +33,8 @@
  *
  * Build:
  *   nvcc -O3 --use_fast_math -arch=sm_120a -std=c++17 \
- *     -I/home/claude/fi/include -o /tmp/fibench \
- *     tests/flashinfer_sparse_mla_bench.cu /home/claude/fi/sparse_mla_sm120_prefill.cu
+ *     -I$FLASHINFER/include -o /tmp/fibench \
+ *     tests/flashinfer_sparse_mla_bench.cu $FLASHINFER/sparse_mla_sm120_prefill.cu   (FLASHINFER: a FlashInfer checkout)
  */
 #include <cstdio>
 #include <cstdlib>

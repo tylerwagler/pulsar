@@ -33,9 +33,20 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import producers as P  # noqa: E402
 
-SERVED = os.environ.get("PULSAR_SERVED", "/mnt/models/DeepSeek-v4-Flash")
-HF = os.environ.get("PULSAR_HF_SNAPSHOT") or sorted(glob.glob(
-    "/mnt/models/hub/models--deepseek-ai--DeepSeek-V4-Flash-Vision-Exp/snapshots/*/"))[0]
+
+def need(var, what):
+    """An oracle path from the environment (make container-tests passes local.mk's); refuse by name when unset."""
+    v = os.environ.get(var, "")
+    if not v:
+        raise SystemExit(f"{var} is not set: {what} (make container-tests passes it from local.mk)")
+    return v
+
+
+SERVED = need('PULSAR_SERVED', 'the served DeepSeek-v4-Flash container directory')
+_hf = sorted(glob.glob(need('PULSAR_HF_SNAPSHOT', 'the DeepSeek-V4-Flash-Vision-Exp HF snapshot directory (a glob matching one is fine)')))
+if len(_hf) != 1:
+    raise SystemExit(f'PULSAR_HF_SNAPSHOT: expected exactly one snapshot, found {_hf}')
+HF = _hf[0]
 
 FAILS: list[str] = []
 NOTES: list[str] = []

@@ -694,7 +694,7 @@ static int fidelity_row(const float *cur, const float *ref, int width,
  *
  * The blob here is NOT one of ours: it comes from the official checkpoint served
  * by a second engine (vLLM on a rented box — see
- * pulsar-notes/reference-capture/README.md for the capture protocol and the
+ * the private notes' reference-capture/README.md for the capture protocol and the
  * 2026-08-21 blobs).  That changes three contracts relative to --check-fidelity:
  *
  *   1. TOKEN AUTHORITY IS A FILE.  The gate's own tokenizer path
@@ -815,7 +815,7 @@ static void row_entropy(const float *row, int width, double *H_out, double *p1_o
  * hc_expand adoption's 4102, 2.0e-06 -> 1.975e-07, still counts; only its
  * 6144 vote, 3.9e-07 -> 9.6e-08, would have gone quiet, changing nothing
  * about that verdict).  Mutation controls for each branch are recorded in
- * pulsar-notes rows/L211.md.  Because the budget is NOT re-recorded for an
+ * ledger row L211.  Because the budget is NOT re-recorded for an
  * UNCHANGED grade, sub-floor moves cannot stack unseen: they accumulate
  * against the last CLOSER anchor until one crosses the floor and votes. */
 #define GATE_NET_FLOOR 1e-6
@@ -1264,7 +1264,7 @@ int GATE_ENTRY(int argc, char **argv) {
         if (argc < 5) {
             fprintf(stderr, "%s --check-reference requires REF.bin and TOKENS.bin — the "
                             "reference blob and the int32 token file it was captured "
-                            "against (see pulsar-notes/reference-capture/)\n", argv[0]);
+                            "against (see the private notes' reference-capture protocol)\n", argv[0]);
             return 2;
         }
         /* [KL_TOL] [--known-high d1,d2,...]

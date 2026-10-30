@@ -150,14 +150,15 @@ static const char PULSAR_V4_REASONING_EFFORT_MAX_PREFIX[] =
 #define PULSAR_ROPE_ORIG_CTX             (g_pulsar_shape.rope_orig_ctx)
 
 /** =========================================================================
- * GGUF Quant Block Formats.
+ * The 2-bit routed-expert block size.
  * =========================================================================
  *
- * These layouts and IQ2 tables match the GGUF quantized tensor format,
- * reduced to only the formats ds4.c currently reads:
- *   - Q2_K routed down experts
- *   - IQ2_XXS routed gate/up experts
- *   - Q8_K temporary activation blocks for dot products
+ * QK_K is the super-block width (256 weights) of the one llama.cpp-derived
+ * quant layout the engine still reads: IQ2_XXS (block_iq2_xxs below), stored
+ * as the iq2_xxs_mmq_k container layout for DeepSeek's routed experts.  The
+ * Q2_K and Q8_K blocks this section once described, and the GGUF container
+ * they came in, are gone; model.cpp recognises a GGUF file only to refuse it
+ * by name (PULSAR_GGUF_MAGIC).
  */
 #define QK_K 256
 
@@ -4441,13 +4442,14 @@ void pulsar_acquire_instance_lock(void);
 /** ---- shared inline helpers ---- */
 
 /** =========================================================================
- * Scalar Conversion and Quantized Tensor Kernels.
+ * Scalar Conversion and Small Host Helpers.
  * =========================================================================
  *
- * These functions are the CPU reference math used by the C backend and by
- * GPU diagnostics.  They implement only the tensor formats present in the
- * DeepSeek V4 Flash GGUF: F16, F32, Q2_K, IQ2_XXS, and Q8_K activation
- * blocks used for expert dot products.
+ * Host-side helpers the engine's TUs share: the f16 -> f32 scalar conversion
+ * (the host reads of f16 tensors and diagnostics), the drafter's starting
+ * depth, and the TP slice-registry key offsets.  There is no CPU inference
+ * backend and no host quantized dot product; every model format is computed
+ * on the GPU.
  */
 
 static inline float f16_to_f32(uint16_t h) {

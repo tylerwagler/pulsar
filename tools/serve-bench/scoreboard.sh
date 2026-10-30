@@ -5,10 +5,10 @@
 # (TF_DIR/.venv/bin/tensorfold serve, default ~/tf-run, `--parallel $TF_PARALLEL`, default 8, so concurrent
 # streams batch; TF_PARALLEL= serves without it).  STREAMS_SET= skips the concurrent cells, NO_PUB=1 the public client.  The server
 # runs as a direct child in its own process group, killed on every exit path; the script refuses a busy port and
-# never leaves a listener.  Run it under the GPU lock with the lock fd closed, e.g. on sparky:
+# never leaves a listener.  Run it under the GPU lock with the lock fd closed, e.g. on the GB10 host:
 #
-#   flock -o ~/gpu.lock -c 'timeout 1800 tools/serve-bench/scoreboard.sh pulsar /srv/models/X ~/sb ours'
-#   flock -o ~/gpu.lock -c 'timeout 1800 tools/serve-bench/scoreboard.sh tensorfold /srv/models/tf-exl3-305 ~/sb tf'
+#   flock -o ~/gpu.lock -c 'timeout 1800 tools/serve-bench/scoreboard.sh pulsar /path/to/X ~/sb ours'
+#   flock -o ~/gpu.lock -c 'timeout 1800 tools/serve-bench/scoreboard.sh tensorfold /path/to/tf-exl3-305 ~/sb tf'
 #   tools/serve-bench/serve_matrix.py table ~/sb/ours.jsonl ~/sb/tf.jsonl
 #
 # Cells (serve_matrix.py scoreboard, untraced): single code T0 / prose T0 / code T0.7 (median of 3 x 512 tokens), edit T0

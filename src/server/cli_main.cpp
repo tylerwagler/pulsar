@@ -338,7 +338,7 @@ uint64_t server_persist_host_bytes(int tokens) {
  * (budget less the eager floor).  Before L319 it was the ledger's share alone, and the ledger's budget is not a
  * physical number in pooled mode (its startup clamp lifts it to slot 0 + one session estimate): on Nemotron at
  * --ctx 1M the ceiling was 9.05 GiB against 5.16 GiB of headroom, the guard never spilled, MemAvailable reached
- * zero, and the GPU stalled on unbacked pages (work, 2026-10-22) or earlyoom killed the server (Sparky).  avail 0
+ * zero, and the GPU stalled on unbacked pages (a production box, 2026-10-22) or earlyoom killed the server (the GB10 host).  avail 0
  * (/proc/meminfo unreadable) is 0: the caller refuses to start rather than run unguarded. */
 KvBytes server_guard_touched_budget(KvBytes kv_budget_bytes, KvBytes eager_bytes, KvBytes touched_bytes,
                                     KvBytes avail_bytes) {
@@ -1103,7 +1103,7 @@ int main(int argc, char **argv) {
      * spec_max_live crossover knob (PULSAR_SERVER_SPEC_MAX_LIVE), and the
      * PULSAR_CLASSIC_DECODE A/B hatch are DELETED — decode runs through the
      * batched quanta at every n >= 1, a solo session being a batch of one.
-     * Parity evidence: pulsar-notes rows/L118.md. */
+     * Parity evidence: ledger row L118. */
     /* plan-34 phase-2 inc 5: fused mixed-batch lane. Default OFF (OPT-IN via
      * PULSAR_MIXED_BATCH=1). It is a workload-dependent TRADE, not a safe blanket
      * default — three measured regimes:

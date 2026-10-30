@@ -2,7 +2,7 @@
  * Linears work through pulsar_gpu_qsa_forward on projections captured from the
  * BF16 source, for grading against transformers' module offline.
  *
- * DIR holds (written by the capture script, research/l251/attn in pulsar-notes):
+ * DIR holds (written by the capture script, research/l251/attn in the private notes):
  *   qg.bf16 [T][12288]  k.bf16 [T][512]  v.bf16 [T][512]  idx.bf16 [T][640]
  *   norms.f32  q_norm[256] k_norm[256] idx_q_norm[128] idx_k_norm[128]
  * and receives:

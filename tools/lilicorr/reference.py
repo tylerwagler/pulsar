@@ -47,8 +47,15 @@ import torch.nn.functional as F
 from safetensors import safe_open
 from safetensors.torch import load_file, save_file
 
-DRAFT = "/mnt/models/nemotron35-super-lilicorr"
-TARGET = "/srv/models/nemotron35-super-vl-nvfp4"
+def _need(var, what):
+    v = os.environ.get(var, "")
+    if not v:
+        raise SystemExit(f"{var} is not set: {what}")
+    return v
+
+
+DRAFT = _need("LILICORR_DRAFT", "the LiLiCorr drafter checkpoint directory")
+TARGET = _need("NEMOTRON_NVFP4", "the Nemotron 3.5 Super VL NVFP4 checkpoint directory")
 TARGET_EMBED = "language_model.backbone.embeddings.weight"
 BF = torch.bfloat16
 

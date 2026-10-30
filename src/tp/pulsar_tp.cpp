@@ -260,7 +260,7 @@ union tp_ibv_gid {
 
 /* struct ibv_gid_entry (gid_type at @24): returned by _ibv_query_gid_ex.
  * RoCEv1 and RoCEv2 GIDs carry the SAME 16 bytes — only this per-entry type
- * tells them apart; the pair's table has ::ffff:192.168.9.x as v1 (idx 2)
+ * tells them apart; the pair's table has ::ffff:<pair IPv4> as v1 (idx 2)
  * AND v2 (idx 3), and the v1 index is an invalid AV under RoCEv2. */
 struct tp_ibv_gid_entry {
     union tp_ibv_gid gid;         /* @0  */
@@ -1019,7 +1019,7 @@ static int tp_rdma_open_device(pulsar_tp_rdma *r, const char *want_name, const c
     } else {
         /* Prefer a RoCEv2 GID, keyed by its per-entry gid_type.  RoCEv1 and
          * RoCEv2 GIDs share IDENTICAL 16 bytes on an IP'd port (the pair's
-         * ::ffff:192.168.9.x is both v1@index2 and v2@index3; only the type
+         * ::ffff:<pair IPv4> is both v1@index2 and v2@index3; only the type
          * tells them apart).  Under RoCEv2 the v1 index is not a valid AV:
          * RC rejects it at RTR with EINVAL, UC silently dead-connects — the
          * pair's original hang class.  pick1 = first RoCEv2 IPv4-mapped

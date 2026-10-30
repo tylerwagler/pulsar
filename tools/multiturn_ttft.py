@@ -5,9 +5,9 @@ question — with a warm bank the prefix is resident and TTFT is small; with
 fewer banks than conversations, older banks get evicted and every turn pays
 a cold re-prefill.  Reports per-turn TTFT percentiles and total wall.
 """
-import json, sys, time, urllib.request
+import json, os, sys, time, urllib.request
 
-BASE = "http://sparky.defense.lan:8099"
+BASE = os.environ.get("PULSAR_BASE_URL") or sys.exit("set PULSAR_BASE_URL to the server, e.g. http://HOST:8099")
 N = int(sys.argv[1]) if len(sys.argv) > 1 else 12
 TURNS = int(sys.argv[2]) if len(sys.argv) > 2 else 3
 

@@ -96,6 +96,6 @@ GENERATE_TREEVIEW      = YES
 SORT_MEMBER_DOCS       = NO
 SORT_BRIEF_DOCS        = NO
 
-# The ledger rows and design docs live in pulsar-notes (PRIVATE). Do NOT add
+# The ledger rows and design docs live in the private notes. Do NOT add
 # that tree here -- it must not end up in generated output that could be
 # published from the public repo.
