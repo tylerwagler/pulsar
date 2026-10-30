@@ -760,18 +760,43 @@ typedef struct {
 
 /** L334: the length, in live-side tokens, of the prompt a sync runs for a request of `prompt_len` tokens -- the
  *  stitch (live[0, live_cut) + prompt[prompt_cut, prompt_len)): past the cut the stitched prompt carries the
- *  request's own tokens, so a prompt-side distance there is a live-side one.  The one conversion between the
- *  currencies.
+ *  request's own tokens, so a prompt-side distance there is a live-side one.  The conversion from prompt to live
+ *  side past the cut; the other way, below it, is pulsar_tokens_prompt_held_with.
  *  @param m the match the stitch is cut at
  *  @param prompt_len the request prompt's length */
 static inline LiveToks pulsar_prefix_match_stitched_len(const pulsar_prefix_match *m, PromptToks prompt_len) {
     return m->live_cut + LiveToks{(prompt_len - m->prompt_cut).raw()};
 }
 
+/** A token's text for the seam walks: a malloc'd copy the caller frees (NULL = none), its length in *len
+ *  (pulsar_token_text's contract; 0 bytes = a control/special token, matched by id only). */
+typedef char *(*pulsar_token_text_fn)(void *ud, int token, size_t *len);
+
 void pulsar_tokens_prefix_match(pulsar_engine *e,
                                 const int *live, int live_len,
                                 const int *prompt, int prompt_len,
                                 pulsar_prefix_match *out);
+/** pulsar_tokens_prefix_match over any vocabulary's text (`text`, `ud`): the walk itself, which the engine's entry
+ *  runs with its tokenizer's text. */
+void pulsar_tokens_prefix_match_with(pulsar_token_text_fn text, void *ud,
+                                     const int *live, int live_len,
+                                     const int *prompt, int prompt_len,
+                                     pulsar_prefix_match *out);
+/** L334: the prompt tokens the live history up to `at` holds -- the conversion from live to prompt side below the
+ *  cut, the one authority for "how many of the request's tokens does a state at live position `at` serve".  The
+ *  request's tokens whose bytes lie wholly inside live[0, at) and equal them: at a boundary both spellings share,
+ *  exactly the prompt-side position of `at` (the token-seam match of live[0, at), its prompt_cut); inside a
+ *  re-spelled stretch, that shared boundary below `at` plus the prompt tokens of the stretch that end at or before
+ *  `at`'s byte (a prompt token the state holds only part of is not served).  Never more than the full match's
+ *  prompt_cut for any `at` up to its live_cut.
+ *  @param text the vocabulary's token text
+ *  @param ud its context
+ *  @param live the live history
+ *  @param at the live position (<= the history's length)
+ *  @param prompt the request's tokens
+ *  @param prompt_len their count */
+PromptToks pulsar_tokens_prompt_held_with(pulsar_token_text_fn text, void *ud, const int *live, LiveToks at,
+                                          const int *prompt, int prompt_len);
 void pulsar_session_prefix_match(pulsar_session *s, const pulsar_tokens *prompt,
                                  pulsar_prefix_match *out);
 void pulsar_session_bank_prefix_match(pulsar_session *s, uint32_t bank,
@@ -1236,14 +1261,23 @@ void pulsar_session_rewind(pulsar_session *s, int pos);
  * holds none at G (nothing changed), or on a tensor-parallel engine, which does
  * not mirror the restore. */
 int pulsar_session_checkpoint_best(pulsar_session *s, int limit);
+/** L334: where a bank's state serves a request from, in both currencies: `at` where the sync's computed rows start
+ *  on the prompt it runs (the stitch: the live side -- a checkpoint, a record, or the bank's frontier), `served` how
+ *  many of the REQUEST's tokens that state holds (pulsar_tokens_prompt_held_with of `at`: the prompt side, what a
+ *  cache read counts and what depths are ranked by).  They differ only where a re-spelled stretch lies below `at`. */
+typedef struct {
+    LiveToks at;         ///< the sync starts computing here, on the stitched prompt
+    PromptToks served;   ///< the request's tokens the state at `at` holds
+} pulsar_bank_resume;
 /** L266: where a sync of `prompt` on `bank` starts its prefill -- the prompt tokens the bank's state serves,
  *  and (L325) the router's score for the bank, so the route ranks banks by the rule their syncs resume by,
  *  every family by one rule (L284; DeepSeek answered -1 before and its callers trusted the byte match).  The
  *  sync runs on the token-seam stitch (pulsar_session_bank_prefix_match): an extension of a history the bank
  *  continues where it stands (prefilled whole, at a cut the model's prefill reproduces, its state live) serves
  *  the whole match; anything else serves its deepest grid checkpoint within the match, the prefill-only history
- *  and the stitched prompt's length - 1, else nothing (0).  A request-side count (L334: PromptToks). */
-PromptToks pulsar_session_bank_resume_at(pulsar_session *s, uint32_t bank, const pulsar_tokens *prompt);
+ *  and the stitched prompt's length - 1, else nothing (0).  L334: both currencies (pulsar_bank_resume); the route's
+ *  score and the cache read are `served`. */
+pulsar_bank_resume pulsar_session_bank_resume_at(pulsar_session *s, uint32_t bank, const pulsar_tokens *prompt);
 int pulsar_session_restore_checkpoint(pulsar_session *s, int G, char *err, size_t errlen);
 /** L313: bank-independent checkpoints -- the INSTALLED bank adopts ANOTHER bank's published state for `prompt`: the
  *  deepest of `src`'s grid checkpoints and records the prompt carries (the resume rule's terms, over src's prefill-only
@@ -1257,9 +1291,12 @@ int pulsar_session_restore_checkpoint(pulsar_session *s, int G, char *err, size_
  *  position and must be synced from nothing). */
 int pulsar_session_bank_adopt(pulsar_session *s, uint32_t src, const pulsar_tokens *prompt, char *err, size_t errlen);
 /** L313: the T pulsar_session_bank_adopt would adopt from `src` for `prompt` (a host scan, no device work; 0 for the
- *  installed bank, none, or a tensor-parallel engine).  A position on src's history: the live side of the seam
- *  (L334: LiveToks). */
-LiveToks pulsar_session_bank_adopt_score(pulsar_session *s, uint32_t src, const pulsar_tokens *prompt);
+ *  installed bank, none, or a tensor-parallel engine).  L334: `at` = T, a position on src's history (the live side),
+ *  `served` the request's tokens src's history to T holds, the depth an adopt is ranked by. */
+pulsar_bank_resume pulsar_session_bank_adopt_score(pulsar_session *s, uint32_t src, const pulsar_tokens *prompt);
+/** L334: the request's tokens bank `bank`'s history up to `at` holds (pulsar_tokens_prompt_held_with over it; 0 for an
+ *  out-of-range or never-populated bank) -- after an adopt, what its T serves. */
+PromptToks pulsar_session_bank_prompt_held(pulsar_session *s, uint32_t bank, const pulsar_tokens *prompt, LiveToks at);
 int pulsar_session_pos(pulsar_session *s);
 int pulsar_session_ctx(pulsar_session *s);
 int pulsar_session_prefill_cap(pulsar_session *s);

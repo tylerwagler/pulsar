@@ -1704,25 +1704,32 @@ int pulsar_session_checkpoint_best(pulsar_session *s, int limit) {
     const pulsar_ckpt_store *st = pulsar_session_kv_store(s);
     return st && st->ops ? (int)pulsar_ckpt_best(st, pulsar_session_live_bank(s), (uint32_t)limit) : 0;
 }
-PromptToks pulsar_session_bank_resume_at(pulsar_session *s, uint32_t bank, const pulsar_tokens *prompt) {
-    if (!s || !prompt || prompt->len <= 0) return PromptToks{0};
+static char *engine_api_token_text(void *ud, int token, size_t *len) {
+    return pulsar_token_text((pulsar_engine *)ud, token, len);
+}
+pulsar_bank_resume pulsar_session_bank_resume_at(pulsar_session *s, uint32_t bank, const pulsar_tokens *prompt) {
+    const pulsar_bank_resume none = {LiveToks{0}, PromptToks{0}};
+    if (!s || !prompt || prompt->len <= 0) return none;
     const pulsar_tokens *t = pulsar_bank_history(s, bank);
-    if (!t) return PromptToks{0};
+    if (!t) return none;
     /* every family's sync runs on the token-seam stitch (L115/L284): the bank's tokens up to the deepest shared
      * byte boundary, the prompt after it */
     pulsar_prefix_match m;
     pulsar_tokens_prefix_match(s->engine, t->v, t->len, prompt->v, prompt->len, &m);
     /* an extension (or the same prompt) of a history the sync continues where it stands */
     if (m.live_cut == LiveToks{t->len} && pulsar_session_bank_continues(s, bank, m.live_cut.raw()))
-        return m.prompt_cut;
-    /* else the one resume rule over the stitched prompt; a checkpoint below the cut counts its own tokens (the
-     * stitch re-spells only the stretch between the id match and the cut) */
+        return {m.live_cut, m.prompt_cut};
+    /* else the one resume rule over the stitched prompt (G <= the cut: below it the stitched prompt is the bank's
+     * own tokens) */
     const uint32_t G = pulsar_session_resume_point(s, bank, m.live_cut.raw(),
                                                    pulsar_prefix_match_stitched_len(&m, PromptToks{prompt->len}).raw());
-    /* L334, reported and left as it was: G is a position on the stitched prompt -- the live side -- returned as the
-     * prompt-side count unconverted.  The two agree when no seam lies below G; a checkpoint inside the re-spelled
-     * stretch (between the id match and the cut) is counted in live tokens. */
-    return LiveToks{(int)G} < m.live_cut ? PromptToks{(int)G} : m.prompt_cut;
+    const LiveToks at{(int)G};
+    /* L334: at the cut the state serves the match's prompt side; below it, what the bank's tokens to G hold of the
+     * request (pulsar_tokens_prompt_held_with) -- G itself when no seam lies below it, fewer when a re-spelled stretch
+     * does (G was returned as the prompt-side count unconverted before) */
+    if (at < m.live_cut)
+        return {at, pulsar_tokens_prompt_held_with(engine_api_token_text, s->engine, t->v, at, prompt->v, prompt->len)};
+    return {at, m.prompt_cut};
 }
 /* L313: where `src`'s published state serves `prompt` -- the one resume rule (pulsar_session_resume_point, the rule a
  * bank's own resume reads) on src: its deepest grid checkpoint within the match and its prefill-only history (one short
@@ -1754,14 +1761,24 @@ static uint32_t bank_adopt_point(pulsar_session *s, uint32_t src, const pulsar_t
     return T;
 }
 
-LiveToks pulsar_session_bank_adopt_score(pulsar_session *s, uint32_t src, const pulsar_tokens *prompt) {
+pulsar_bank_resume pulsar_session_bank_adopt_score(pulsar_session *s, uint32_t src, const pulsar_tokens *prompt) {
+    const pulsar_bank_resume none = {LiveToks{0}, PromptToks{0}};
     if (!s || !prompt || src >= (uint32_t)pulsar_session_bank_count(s) || src == pulsar_session_live_bank(s))
-        return LiveToks{0};
+        return none;
     /* a pair does not mirror the adopt (pulsar_session_bank_adopt refuses it) */
-    if (tp_mirror_target(s)) return LiveToks{0};
+    if (tp_mirror_target(s)) return none;
     const pulsar_ckpt_record *r = NULL;
     int len = 0;
-    return LiveToks{(int)bank_adopt_point(s, src, prompt, &r, &len)};
+    const LiveToks T{(int)bank_adopt_point(s, src, prompt, &r, &len)};
+    /* L334: T is on src's history; the depth an adopt is ranked by is what src's tokens to T hold of the request */
+    return {T, pulsar_session_bank_prompt_held(s, src, prompt, T)};
+}
+
+PromptToks pulsar_session_bank_prompt_held(pulsar_session *s, uint32_t bank, const pulsar_tokens *prompt, LiveToks at) {
+    if (!s || !prompt || at <= LiveToks{0}) return PromptToks{0};
+    const pulsar_tokens *h = pulsar_bank_history(s, bank);
+    if (!h || at > LiveToks{h->len}) return PromptToks{0};
+    return pulsar_tokens_prompt_held_with(engine_api_token_text, s->engine, h->v, at, prompt->v, prompt->len);
 }
 
 int pulsar_session_bank_adopt(pulsar_session *s, uint32_t src, const pulsar_tokens *prompt, char *err,

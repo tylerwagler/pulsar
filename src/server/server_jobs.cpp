@@ -310,7 +310,8 @@ void server::canonicalize_tool_checkpoint(session_slot *sl,
      * from 0 even with a grid checkpoint below the cut.  L318: a disk chain deeper than the bank's own resume loads
      * when L310 prices the read under the prefill it saves, as a request's does. */
     {
-        const int resume = pulsar_session_bank_resume_at(s->sess, (uint32_t)sl->bank, &canonical).raw();
+        const pulsar_bank_resume own = pulsar_session_bank_resume_at(s->sess, (uint32_t)sl->bank, &canonical);
+        const int resume = own.served.raw();
         char *path = NULL;
         pulsar_tokens effective = {0};
         const int loaded = s->kv_cache_try_load_text(sl, rendered.ptr ? rendered.ptr : "", rendered.spans,
@@ -330,7 +331,7 @@ void server::canonicalize_tool_checkpoint(session_slot *sl,
             .slot = sl,
             .kind = j->req.kind,
             .prompt_tokens = sync_prompt->len,
-            .cached_tokens = cached,
+            .cached_tokens = loaded > 0 ? loaded : own.at.raw(),   /* L334: where the computed rows start */
             .phase = "tool checkpoint canonicalization",
             .has_tools = j->req.has_tools,
             .t0 = server_now_sec(),
@@ -688,6 +689,7 @@ void server::gen_step_restore(session_slot *sl) {
     free(gr);
     if (G > 0) {
         res.cached = G;
+        res.resumed_at = G;
         res.disk_cached = G;
         res.cache_source = "disk-text";
         /* The chain's tokens are usually the request's own up to its end: then the sync runs the request's
@@ -701,6 +703,7 @@ void server::gen_step_restore(session_slot *sl) {
         else res.prompt_for_sync = &g->effective_prompt;
     } else {
         res.cached = 0;   /* the load said why and left the bank invalid: the sync rebuilds it from 0 */
+        res.resumed_at = 0;
         res.disk_cached = 0;
         res.cache_source = "none";
     }
@@ -777,6 +780,10 @@ void server::gen_begin(session_slot *sl) {
     const char *cache_source = "none";
     int disk_cached = 0;
     int memory_resume = 0;   /* L310: where the bank's own state resumes this prompt, kept or declined as shallow */
+    /* L334: where the sync's computed rows start when the bank's own state or an adopt serves (the live side; the
+     * cache read `cached` counts the request's tokens) */
+    int resumed_at = 0;
+    bool resumed_on_seam = false;
     if (image_request) {
         server_log(PULSAR_LOG_PREFILL,
                    "pulsar-server: image request (%d image%s): live and disk resolvers apply, "
@@ -870,13 +877,16 @@ void server::gen_begin(session_slot *sl) {
         /* L266/L284: the byte match is what the bank's tokens re-spell; the count is where the sync actually
          * starts -- the match itself when the sync continues the bank where it stands, else the grid
          * checkpoint it resumes from (every family: decode rows past the prefill are recomputed) */
-        const PromptToks resume = pulsar_session_bank_resume_at(s->sess, sl->bank, &j->req.prompt);
+        const pulsar_bank_resume own = pulsar_session_bank_resume_at(s->sess, sl->bank, &j->req.prompt);
+        const PromptToks resume = own.served;
         memory_resume = resume.raw();
         /* L289: a bank that serves the WHOLE prompt (its prompt end, or a history it continues) is never declined
          * as shallow -- nothing serves that prompt better (a short repeated prompt sat under the trivial line and
          * was counted cold, and with the disk on, persisted and searched for nothing) */
         const bool serves = pm.prompt_cut > PromptToks{0} && (!trivial || resume == PromptToks{j->req.prompt.len});
         cached = serves ? resume.raw() : 0;
+        resumed_at = serves ? own.at.raw() : 0;
+        resumed_on_seam = true;
         cache_source = !serves || resume <= PromptToks{0} ? "none"
                        : resume == pm.prompt_cut           ? "memory-token"
                                                            : "memory-checkpoint";
@@ -910,10 +920,9 @@ void server::gen_begin(session_slot *sl) {
                 if (o == sl || !o->provisioned || o->spilled || o->preempted ||
                     (o->gen && o->gen->phase == GEN_RESTORE))
                     continue;
-                /* L334, reported and left as it was: T is a position on o's history (the live side), ranked
-                 * below against `own` and the prompt's length, which are prompt-side counts; they agree when no
-                 * seam lies below T */
-                const int T = pulsar_session_bank_adopt_score(s->sess, o->bank, &j->req.prompt).raw();
+                /* L334: ranked by the request's tokens o's history to its T holds (`served`), the currency of
+                 * `own` and the prompt's length -- T itself is a position on o's history */
+                const int T = pulsar_session_bank_adopt_score(s->sess, o->bank, &j->req.prompt).served.raw();
                 if (T > adopt_at) { adopt_at = T; adopt_src = (int)o->bank; }
             }
         }
@@ -933,7 +942,9 @@ void server::gen_begin(session_slot *sl) {
                    adopt_at, adopt_src >= 0 ? "" : " (none)", disk_at, j->req.prompt.len, pm.prompt_cut.raw(),
                    resume_pick_names[pick]);
     }
-    if (s->kv.enabled && old_pos >= s->kv.opt.min_tokens && (cached == 0 || pick != RESUME_OWN)) {
+    /* L334: a miss is a sync from token 0 -- the live side (`cached` counts the request's tokens) */
+    const bool sync_from_zero = (resumed_on_seam ? resumed_at : cached) == 0;
+    if (s->kv.enabled && old_pos >= s->kv.opt.min_tokens && (sync_from_zero || pick != RESUME_OWN)) {
         /* The sync from a miss, an adopt and a chain load each replace the bank's history.  Persist it first (only
          * the segments the store lacks), so the newer conversation state outlives them; the chain about to load is
          * touched first, so making room for the persist evicts other leaves. */
@@ -945,7 +956,10 @@ void server::gen_begin(session_slot *sl) {
         const double t_a = server_now_sec();
         const int T = pulsar_session_bank_adopt(s->sess, (uint32_t)adopt_src, &j->req.prompt, aerr, sizeof(aerr));
         if (T > 0) {
-            cached = T;
+            /* L334: the bank stands at T on src's tokens; the cache read is what they hold of the request */
+            cached = pulsar_session_bank_prompt_held(s->sess, sl->bank, &j->req.prompt, LiveToks{T}).raw();
+            resumed_at = T;
+            resumed_on_seam = true;
             cache_source = "bank-adopt";
             server_log(PULSAR_LOG_KVCACHE, "pulsar-server: bank %u adopted bank %d's state at %d of %d (%.1f ms)",
                        sl->bank, adopt_src, T, j->req.prompt.len, (server_now_sec() - t_a) * 1e3);
@@ -954,6 +968,7 @@ void server::gen_begin(session_slot *sl) {
                        adopt_src, aerr);
             pulsar_session_invalidate(s->sess);   /* the bank describes no position: the sync rebuilds it */
             cached = 0;
+            resumed_at = 0;
             cache_source = "none";
         }
     } else if (pick == RESUME_DISK) {
@@ -974,6 +989,7 @@ void server::gen_begin(session_slot *sl) {
     gen_resolution res = {};
     res.prompt_for_sync = prompt_for_sync;
     res.cached = cached;
+    res.resumed_at = resumed_on_seam ? resumed_at : cached;
     res.cache_source = cache_source;
     res.disk_cached = disk_cached;
     res.responses_live_continuation = responses_live_continuation;
@@ -994,6 +1010,7 @@ void server::gen_begin_plan(session_slot *sl, gen_resolution *r) {
     pulsar_tokens &effective_prompt = g->effective_prompt;
     const pulsar_tokens *prompt_for_sync = r->prompt_for_sync;
     int cached = r->cached;
+    int resumed_at = r->resumed_at;
     const char *cache_source = r->cache_source;
     int disk_cached = r->disk_cached;
     bool responses_live_continuation = r->responses_live_continuation;
@@ -1014,6 +1031,7 @@ void server::gen_begin_plan(session_slot *sl, gen_resolution *r) {
             pulsar_tokens_free(&effective_prompt);
             prompt_for_sync = &j->req.prompt;
             cached = 0;
+            resumed_at = 0;
             disk_cached = 0;
             cache_source = "none";
             responses_live_continuation = false;
@@ -1047,13 +1065,13 @@ void server::gen_begin_plan(session_slot *sl, gen_resolution *r) {
     g->trace_id = s->trace_begin(j, cached, prompt_tokens, &r->cache_diag,
                               cache_source, disk_cached, g->disk_cache_path);
     request_ctx_span(g->ctx_span, sizeof(g->ctx_span), cached, prompt_tokens);
-    sl->prefill_counted = cached;   /* L114 counter watermark: computed rows start here */
+    sl->prefill_counted = resumed_at;   /* L114 counter watermark: computed rows start here (L334: the live side) */
     g->progress = (server_prefill_progress){
         .srv = s,
         .slot = sl,
         .kind = j->req.kind,
         .prompt_tokens = prompt_tokens,
-        .cached_tokens = cached,
+        .cached_tokens = resumed_at,   /* L334: the progress line and its persist gate count computed rows */
         .has_tools = j->req.has_tools,
         .responses_protocol = responses_protocol,
         .t0 = g->t0,
@@ -1113,7 +1131,7 @@ void server::gen_begin_plan(session_slot *sl, gen_resolution *r) {
      * prompt -- for entries L261's baseline shows rarely hit.  A long
      * conversation still checkpoints through the continued store. */
     int cold_store_len = 0;
-    if (cached == 0 &&
+    if (resumed_at == 0 &&   /* L334: a sync from token 0 (the live side: what is computed, not what is counted) */
         s->kv.enabled &&
         prompt_for_sync->len >= s->kv.opt.min_tokens)
     {

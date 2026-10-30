@@ -11406,9 +11406,63 @@ static void test_l334_seam_currencies(void) {
     }
 }
 
+/* L334 fix: a toy vocabulary for the seam walks -- id i spells l334_vocab[i] ("" = a control token). */
+static const char *const l334_vocab[] = {"<ctl>", "X", "a", "b", "c", "d", "ab", "abc", "bc", "cd", "bcd", "Y", "Z"};
+enum { L334_CTL, L334_X, L334_A, L334_B, L334_C, L334_D, L334_AB, L334_ABC, L334_BC, L334_CD, L334_BCD, L334_Y,
+       L334_Z };
+static char *l334_text(void *, int token, size_t *len) {
+    const char *t = token == L334_CTL ? "" : l334_vocab[token];
+    *len = strlen(t);
+    return xstrdup(t);
+}
+
+/* L334 fix: what a state at live position G serves of the request across a token seam -- the conversion both the
+ * bank's own resume (pulsar_session_bank_resume_at) and an adopt's rank (pulsar_session_bank_adopt_score) now read.
+ * Before, each answered G itself: a live-side position counted as the request's tokens. */
+static void test_l334_prompt_held_across_a_seam(void) {
+    /* live X|a|b|cd|Y (bytes 1,2,3,5,6), the request X|abc|d|Y|Z (bytes 1,4,5,6,7): the bytes agree through Y, the
+     * ids only on X -- a re-spelled stretch "abcd" that costs 3 live tokens and 2 prompt ones */
+    const int live[] = {L334_X, L334_A, L334_B, L334_CD, L334_Y};
+    const int prompt[] = {L334_X, L334_ABC, L334_D, L334_Y, L334_Z};
+    pulsar_prefix_match m;
+    pulsar_tokens_prefix_match_with(l334_text, NULL, live, 5, prompt, 5, &m);
+    TEST_ASSERT(m.seamed && m.live_cut == LiveToks{5} && m.prompt_cut == PromptToks{4});
+    struct { int G, held; } cases[] = {
+        {0, 0},   /* nothing */
+        {1, 1},   /* the id match: the currencies agree */
+        {2, 1},   /* inside the stretch (byte 2): "abc" ends at byte 4, so only X is held */
+        {3, 1},   /* still inside (byte 3) */
+        {4, 3},   /* the stretch's end, a shared boundary (byte 5): X abc d -- the old answer was 4 */
+        {5, 4},   /* the cut: the match's prompt side */
+    };
+    for (const auto &c : cases) {
+        const PromptToks held = pulsar_tokens_prompt_held_with(l334_text, NULL, live, LiveToks{c.G}, prompt, 5);
+        TEST_ASSERT(held == PromptToks{c.held});
+        /* the old answer -- G as the prompt-side count below the cut, the match's prompt side at it -- is wrong
+         * exactly where a seam lies below a G short of the cut */
+        const int old_answer = LiveToks{c.G} < m.live_cut ? c.G : m.prompt_cut.raw();
+        const bool old_wrong = c.G > 1 && c.G < 5;
+        TEST_ASSERT((held.raw() != old_answer) == old_wrong);
+    }
+    /* a stretch whose request tokens end before G's byte: live X|abc|d (bytes 1,4,5), the request X|a|b|cd (1,2,3,5);
+     * at live 2 (byte 4) the request's X a b lie wholly inside it, "cd" does not (no shared boundary below but X) */
+    const int live2[] = {L334_X, L334_ABC, L334_D};
+    const int prompt2[] = {L334_X, L334_A, L334_B, L334_CD};
+    TEST_ASSERT(pulsar_tokens_prompt_held_with(l334_text, NULL, live2, LiveToks{2}, prompt2, 4) == PromptToks{3});
+    TEST_ASSERT(pulsar_tokens_prompt_held_with(l334_text, NULL, live2, LiveToks{3}, prompt2, 4) == PromptToks{4});
+    /* no seam: the identity */
+    TEST_ASSERT(pulsar_tokens_prompt_held_with(l334_text, NULL, prompt, LiveToks{3}, prompt, 5) == PromptToks{3});
+    /* a control token is matched by id only, never by bytes: live X|a|bc (bytes 1,2,4) holds the request's X and
+     * "ab", and the count stops at the request's control token whatever bytes follow */
+    const int live3[] = {L334_X, L334_A, L334_BC, L334_Y};
+    const int prompt3[] = {L334_X, L334_AB, L334_CTL, L334_Y};
+    TEST_ASSERT(pulsar_tokens_prompt_held_with(l334_text, NULL, live3, LiveToks{3}, prompt3, 4) == PromptToks{2});
+}
+
 static void pulsar_server_unit_tests_run(void) {
     test_l333_kv_units();
     test_l334_seam_currencies();
+    test_l334_prompt_held_across_a_seam();
     test_mem_floor_is_derived_from_the_watermarks();
     test_guard_budget_reads_live_memavailable();
     test_persist_skipped_under_the_floor();

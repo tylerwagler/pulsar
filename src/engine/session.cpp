@@ -1407,14 +1407,14 @@ int pulsar_session::common_prefix(const pulsar_tokens *prompt) {
  * ending on a shared boundary.  Zero-length token texts (control/special
  * ids) only match by ID: a boundary mismatch involving one stops the walk
  * conservatively — role markers must never byte-alias into content. */
-void pulsar_tokens_prefix_match(pulsar_engine *e,
-                                const int *a, int a_len,
-                                const int *b, int b_len,
-                                pulsar_prefix_match *out) {
+void pulsar_tokens_prefix_match_with(pulsar_token_text_fn text, void *ud,
+                                     const int *a, int a_len,
+                                     const int *b, int b_len,
+                                     pulsar_prefix_match *out) {
     out->live_cut = LiveToks{0};
     out->prompt_cut = PromptToks{0};
     out->seamed = false;
-    if (!e || !a || !b) return;
+    if (!text || !a || !b) return;
     bool seamed = false;
     int i = 0, j = 0;          /* token cursors */
     size_t oa = 0, ob = 0;     /* byte offsets inside the current tokens */
@@ -1430,12 +1430,12 @@ void pulsar_tokens_prefix_match(pulsar_engine *e,
         }
         if (oa == 0) {
             free(ta);
-            ta = pulsar_token_text(e, a[i], &la);
+            ta = text(ud, a[i], &la);
             if (!ta || la == 0) break;   /* control/special: id-only match */
         }
         if (ob == 0) {
             free(tb);
-            tb = pulsar_token_text(e, b[j], &lb);
+            tb = text(ud, b[j], &lb);
             if (!tb || lb == 0) break;
         }
         while (oa < la && ob < lb) {
@@ -1452,6 +1452,54 @@ done:
     out->live_cut = LiveToks{best_i};
     out->prompt_cut = PromptToks{best_j};
     out->seamed = seamed;
+}
+
+/* The engine's vocabulary for the seam walks. */
+static char *prefix_walk_engine_text(void *ud, int token, size_t *len) {
+    return pulsar_token_text((pulsar_engine *)ud, token, len);
+}
+
+void pulsar_tokens_prefix_match(pulsar_engine *e,
+                                const int *a, int a_len,
+                                const int *b, int b_len,
+                                pulsar_prefix_match *out) {
+    if (!e) {
+        out->live_cut = LiveToks{0};
+        out->prompt_cut = PromptToks{0};
+        out->seamed = false;
+        return;
+    }
+    pulsar_tokens_prefix_match_with(prefix_walk_engine_text, e, a, a_len, b, b_len, out);
+}
+
+/* L334: the walk of live[0, at) against the prompt stops at the deepest boundary both spellings share at or below
+ * `at` -- the prompt-side position when `at` is one.  Past it (a re-spelled stretch the walk did not close before
+ * `at`) the request's tokens are counted while each is byte-equal to the live bytes that follow and ends at or before
+ * `at`'s byte; a control token (no text) or a differing byte stops the count. */
+PromptToks pulsar_tokens_prompt_held_with(pulsar_token_text_fn text, void *ud, const int *live, LiveToks at,
+                                          const int *prompt, int prompt_len) {
+    pulsar_prefix_match m;
+    pulsar_tokens_prefix_match_with(text, ud, live, at.raw(), prompt, prompt_len, &m);
+    if (m.live_cut == at) return m.prompt_cut;
+    std::string bytes;   /* live[m.live_cut, at) */
+    for (int i = m.live_cut.raw(); i < at.raw(); i++) {
+        size_t n = 0;
+        char *t = text(ud, live[i], &n);
+        if (t) bytes.append(t, n);
+        free(t);
+    }
+    int j = m.prompt_cut.raw();
+    size_t off = 0;
+    while (j < prompt_len) {
+        size_t n = 0;
+        char *t = text(ud, prompt[j], &n);
+        const bool held = t && n > 0 && off + n <= bytes.size() && !memcmp(bytes.data() + off, t, n);
+        free(t);
+        if (!held) break;
+        off += n;
+        j++;
+    }
+    return PromptToks{j};
 }
 
 void pulsar_session::prefix_match(const pulsar_tokens *prompt,
