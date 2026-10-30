@@ -390,7 +390,7 @@ int main(int argc, char **argv) {
 
         const double gen_t0 = bench_now_sec();
         for (int i = 0; i < cfg.gen_tokens; i++) {
-            if (pulsar_session_pos(session) + 1 >= pulsar_session_ctx(session)) {
+            if (pulsar_session_pos(session) + TokCount{1} >= TokPos::after(pulsar_session_ctx(session))) {
                 fprintf(stderr, "pulsar-bench: generation would exceed allocated context at frontier %d\n", frontier);
                 rc = 1;
                 break;

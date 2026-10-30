@@ -70,18 +70,19 @@ static void shape(pulsar_engine *e, pulsar_session *s, int *live, const char *na
     /* bank 1 adopts */
     bool ok = install(s, live, 1);
     if (ok) pulsar_session_invalidate(s);
-    const int T = ok ? pulsar_session_bank_adopt(s, src, Q, err, sizeof err) : -1;
-    const int rs = T >= 0 ? pulsar_session_sync(s, Q, err, sizeof err) : 1;
-    const int origin = pulsar_session_resume_origin(s);
+    const TokPos T = ok ? pulsar_session_bank_adopt(s, src, Q, err, sizeof err) : TokPos::none();
+    const int rs = !T.is_none() ? pulsar_session_sync(s, Q, err, sizeof err) : 1;
+    const int origin = pulsar_session_resume_origin(s).raw();
     if (rs == 0) pulsar_session_copy_logits(s, la, W);
     const bool ga = rs == 0 && greedy(s, N_GEN, ta, err, sizeof err);
-    say(T > past && rs == 0 && ga, "%s: bank 1 adopts bank %u's state at %d of %d (past %d) and syncs (origin %d) %s",
-        name, src, T, Q->len, past, origin, err);
+    say(!T.is_none() && T > TokPos{past} && rs == 0 && ga,
+        "%s: bank 1 adopts bank %u's state at %d of %d (past %d) and syncs (origin %d) %s", name, src, T.raw(), Q->len,
+        past, origin, err);
     /* bank 2 cold */
     ok = install(s, live, 2);
     if (ok) pulsar_session_invalidate(s);
     const int rc = ok ? pulsar_session_sync(s, cold, err, sizeof err) : 1;
-    const int origin_c = pulsar_session_resume_origin(s);
+    const int origin_c = pulsar_session_resume_origin(s).raw();
     if (rc == 0) pulsar_session_copy_logits(s, lc, W);
     const bool gc = rc == 0 && greedy(s, N_GEN, tc, err, sizeof err);
     say(rc == 0 && gc && origin_c == 0, "%s: bank 2 prefills it cold (origin %d) %s", name, origin_c, err);
@@ -155,7 +156,7 @@ int GATE_ENTRY(int argc, char **argv) {
     bool okc = install(s, &live, 2) && pulsar_session_sync(s, &P, err, sizeof err) == 0;   /* resumes at its own end */
     if (okc) pulsar_session_copy_logits(s, l2, W);
     const bool ok0 = okc && install(s, &live, 0) && pulsar_session_sync(s, &P, err, sizeof err) == 0;
-    const int o0 = pulsar_session_resume_origin(s);
+    const int o0 = pulsar_session_resume_origin(s).raw();
     if (ok0) pulsar_session_copy_logits(s, l0, W);
     say(ok0 && o0 == P.len && !memcmp(l0, l2, (size_t)W * sizeof(float)),
         "LENDER: bank 0 resumes P at its prompt end (origin %d of %d), logits == cold %s", o0, P.len, err);

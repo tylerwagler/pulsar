@@ -300,7 +300,7 @@ static int run_session_generation(pulsar_engine *engine, const cli_config *cfg, 
     const double t_prefill1 = cli_now_sec();
 
     int max_tokens = cfg->gen.n_predict;
-    int room = pulsar_session_ctx(session) - pulsar_session_pos(session);
+    int room = (pulsar_session_ctx(session) - pulsar_session_pos(session).before()).raw();
     if (room <= 1) max_tokens = 0;
     else if (max_tokens > room - 1) max_tokens = room - 1;
 
@@ -569,7 +569,7 @@ static int run_logprob_dump(pulsar_engine *engine, const cli_config *cfg, const 
             prompt->len, cfg->gen.ctx_size, k);
     int generated = 0;
     int max_tokens = cfg->gen.n_predict;
-    int room = pulsar_session_ctx(session) - pulsar_session_pos(session);
+    int room = (pulsar_session_ctx(session) - pulsar_session_pos(session).before()).raw();
     if (room <= 1) max_tokens = 0;
     else if (max_tokens > room - 1) max_tokens = room - 1;
     for (; generated < max_tokens; generated++) {
@@ -1154,9 +1154,9 @@ static int run_chat_turn(pulsar_engine *engine, cli_config *cfg, repl_chat *chat
     const pulsar_chat_message user = {"user", user_text, false};
     pulsar_chat_append_turn(engine, &chat->transcript, &user, 1, true, think_mode);
 
-    const int old_pos = pulsar_session_pos(chat->session);
-    const int common = pulsar_session_common_prefix(chat->session, &chat->transcript);
-    const int cached = common == old_pos && chat->transcript.len >= old_pos ? common : 0;
+    const TokPos old_pos = pulsar_session_pos(chat->session);
+    const TokCount common = pulsar_session_common_prefix(chat->session, &chat->transcript);
+    const int cached = TokPos::after(common) == old_pos && TokPos{chat->transcript.len} >= old_pos ? common.raw() : 0;
     const int suffix = chat->transcript.len - cached;
 
     char err[160];
@@ -1192,7 +1192,7 @@ static int run_chat_turn(pulsar_engine *engine, cli_config *cfg, repl_chat *chat
     };
 
     int max_tokens = cfg->gen.n_predict;
-    int room = pulsar_session_ctx(chat->session) - pulsar_session_pos(chat->session);
+    int room = (pulsar_session_ctx(chat->session) - pulsar_session_pos(chat->session).before()).raw();
     if (room <= 1) max_tokens = 0;
     else if (max_tokens > room - 1) max_tokens = room - 1;
 

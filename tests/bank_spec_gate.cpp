@@ -302,7 +302,7 @@ int GATE_ENTRY(int argc, char **argv) {
             pulsar_multiseq_req reqs[2];
             for (int k = 0; k < 2; k++) {
                 reqs[k].bank = (uint32_t)k;
-                reqs[k].pos = g_prompt_len[k];
+                reqs[k].pos = TokPos{g_prompt_len[k]};
                 reqs[k].token = first[k];
             }
             const int rc = pulsar_session_decode_multiseq(s, reqs, 2, logits, 2*vocab,

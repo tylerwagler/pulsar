@@ -364,7 +364,7 @@ int main(int argc, char **argv) {
         float *lg = (float *)malloc((size_t)W * sizeof(float));
         int same = 0;
         for (int i = 0; i + 1 < generated; i++) {
-            const pulsar_multiseq_req rq = {0u, n_tok + i, ids[n_tok + i]};
+            const pulsar_multiseq_req rq = {0u, TokPos{n_tok + i}, ids[n_tok + i]};
             if (pulsar_session_decode_multiseq(sess, &rq, 1, lg, W, err, sizeof(err)) != 0) {
                 fprintf(stderr, "qwen-generate: BATCH step %d failed: %s\n", i, err);
                 free(lg);

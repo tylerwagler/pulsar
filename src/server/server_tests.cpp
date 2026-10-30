@@ -8503,20 +8503,20 @@ static void test_l179_deep_guard_blocks_two_deep_decoders(void) {
     int n_dec = -1;
     long deep = -1;
     /* two decoders at exactly rows: admits (strict >) */
-    slots[0].committed_pos = rows / 2;
-    slots[1].committed_pos = rows / 2;
+    slots[0].committed_pos = TokPos{rows / 2};
+    slots[1].committed_pos = TokPos{rows / 2};
     TEST_ASSERT(!mixed_deep_guard_blocks(slots, 2, rows, &n_dec, &deep));
     TEST_ASSERT(n_dec == 2 && deep == rows);
     /* one row over: refuses */
-    slots[1].committed_pos = rows / 2 + 1;
+    slots[1].committed_pos = TokPos{rows / 2 + 1};
     TEST_ASSERT(mixed_deep_guard_blocks(slots, 2, rows, &n_dec, &deep));
     TEST_ASSERT(deep == rows + 1);
     /* a lone decoder at 10x rows admits */
-    slots[0].committed_pos = 10 * rows;
+    slots[0].committed_pos = TokPos{10 * rows};
     TEST_ASSERT(!mixed_deep_guard_blocks(slots, 1, rows, NULL, NULL));
     /* a second slot that is NOT decoding (prefilling / unbound /
      * unprovisioned) is not a decoder */
-    slots[1].committed_pos = 10 * rows;
+    slots[1].committed_pos = TokPos{10 * rows};
     slots[1].state = SLOT_PREFILLING;
     TEST_ASSERT(!mixed_deep_guard_blocks(slots, 2, rows, &n_dec, NULL));
     TEST_ASSERT(n_dec == 1);
@@ -8752,7 +8752,7 @@ static void test_l293_batch_leave_stops_at_the_budget(void) {
         g.batch_active = true;
         g.batch_feed_valid = true;   /* the last step sampled the next feed token */
         g.batch_feed_token = 42;
-        g.batch_feed_pos = 100 + completion;
+        g.batch_feed_pos = TokPos{100 + completion};
         sl.gen = &g;
         sl.active_job = &j;
         sl.tokens_emitted = (uint64_t)completion;
@@ -10495,7 +10495,7 @@ static void test_l179_evict_reset_leaves_a_reusable_hole(void) {
     memset(&fake_gen, 0, sizeof fake_gen);
     sl.provisioned = true;
     sl.bank = 5;
-    sl.committed_pos = 4096;
+    sl.committed_pos = TokPos{4096};
     sl.active_job = &fake_job;
     sl.gen = &fake_gen;
     sl.state = SLOT_DECODING;
@@ -11334,37 +11334,37 @@ static void test_l333_kv_units(void) {
     TEST_ASSERT(KvBytes{-1}.raw() == (uint64_t)-1 && KvRows{(uint32_t)8192}.raw() == 8192u);
 }
 
-/* L334: the token seam's two currencies (pulsar_units.h LiveToks / PromptToks) refuse every mix at compile time, with
+/* L334: the token seam's two currencies (pulsar_units.h TokCount / PromptToks) refuse every mix at compile time, with
  * each other and with L333's units -- the compile-fail checks, as above. */
-static_assert(!std::is_convertible_v<LiveToks, PromptToks> && !std::is_convertible_v<PromptToks, LiveToks> &&
-                  !std::is_constructible_v<LiveToks, PromptToks> && !std::is_constructible_v<PromptToks, LiveToks>,
+static_assert(!std::is_convertible_v<TokCount, PromptToks> && !std::is_convertible_v<PromptToks, TokCount> &&
+                  !std::is_constructible_v<TokCount, PromptToks> && !std::is_constructible_v<PromptToks, TokCount>,
               "the live and the prompt side never convert into each other, not even explicitly");
-static_assert(!std::is_constructible_v<KvRows, LiveToks> && !std::is_constructible_v<LiveToks, KvRows> &&
+static_assert(!std::is_constructible_v<KvRows, TokCount> && !std::is_constructible_v<TokCount, KvRows> &&
                   !std::is_constructible_v<PromptToks, KvRows>,
               "a seam count is no KV row count: rows enter where they are measured");
-static_assert(!std::is_convertible_v<int, LiveToks> && !std::is_convertible_v<LiveToks, int> &&
+static_assert(!std::is_convertible_v<int, TokCount> && !std::is_convertible_v<TokCount, int> &&
                   !std::is_convertible_v<int, PromptToks> && !std::is_convertible_v<PromptToks, int>,
               "no implicit way in or out");
-static_assert(std::is_constructible_v<LiveToks, int> && std::is_constructible_v<PromptToks, uint32_t> &&
-                  !std::is_constructible_v<PromptToks, double> && !std::is_constructible_v<LiveToks, bool>,
+static_assert(std::is_constructible_v<TokCount, int> && std::is_constructible_v<PromptToks, uint32_t> &&
+                  !std::is_constructible_v<PromptToks, double> && !std::is_constructible_v<TokCount, bool>,
               "the explicit integer entry exists; a float or a bool is no token count");
-static_assert(std::is_same_v<decltype(LiveToks{}.raw()), int> && std::is_same_v<decltype(KvBytes{}.raw()), uint64_t>,
+static_assert(std::is_same_v<decltype(TokCount{}.raw()), int> && std::is_same_v<decltype(KvBytes{}.raw()), uint64_t>,
               "each unit leaves as the integer it replaced");
-static_assert(!l333_adds<LiveToks, PromptToks> && !l333_adds<PromptToks, int> && !l333_adds<LiveToks, KvRows> &&
-                  l333_adds<LiveToks, LiveToks> && l333_adds<PromptToks, PromptToks>,
+static_assert(!l333_adds<TokCount, PromptToks> && !l333_adds<PromptToks, int> && !l333_adds<TokCount, KvRows> &&
+                  l333_adds<TokCount, TokCount> && l333_adds<PromptToks, PromptToks>,
               "arithmetic only within a currency");
-static_assert(!l333_orders<LiveToks, PromptToks> && !l333_orders<PromptToks, int> && l333_orders<LiveToks, LiveToks>,
+static_assert(!l333_orders<TokCount, PromptToks> && !l333_orders<PromptToks, int> && l333_orders<TokCount, TokCount>,
               "ordering only within a currency");
-static_assert(!l333_equates<LiveToks, PromptToks> && !l333_equates<LiveToks, int> &&
+static_assert(!l333_equates<TokCount, PromptToks> && !l333_equates<TokCount, int> &&
                   l333_equates<PromptToks, PromptToks>,
               "equality only within a currency");
-static_assert(!l333_assigns<LiveToks &, PromptToks> && !l333_assigns<PromptToks &, int> &&
-                  l333_assigns<LiveToks &, LiveToks>,
+static_assert(!l333_assigns<TokCount &, PromptToks> && !l333_assigns<PromptToks &, int> &&
+                  l333_assigns<TokCount &, TokCount>,
               "assignment only within a currency");
-static_assert(std::is_same_v<decltype(pulsar_prefix_match{}.live_cut), LiveToks> &&
+static_assert(std::is_same_v<decltype(pulsar_prefix_match{}.live_cut), TokCount> &&
                   std::is_same_v<decltype(pulsar_prefix_match{}.prompt_cut), PromptToks>,
               "the prefix match carries one count of each currency");
-static_assert(LiveToks::max().raw() == std::numeric_limits<int>::max() && (LiveToks{2} - LiveToks{5}).raw() == -3,
+static_assert(TokCount::max().raw() == std::numeric_limits<int>::max() && (TokCount{2} - TokCount{5}).raw() == -3,
               "int semantics: signed, as the int fields they replaced");
 
 /* L334: the currencies are the ints they replaced -- round trip and every operator against int, negatives included
@@ -11373,16 +11373,16 @@ static_assert(LiveToks::max().raw() == std::numeric_limits<int>::max() && (LiveT
 static void test_l334_seam_currencies(void) {
     const int vals[] = {-4097, -1, 0, 1, 127, 4096, 178193, 1 << 20};
     for (int a : vals) {
-        TEST_ASSERT(LiveToks{a}.raw() == a && PromptToks{a}.raw() == a);
+        TEST_ASSERT(TokCount{a}.raw() == a && PromptToks{a}.raw() == a);
         for (int b : vals) {
-            const LiveToks x{a}, y{b};
+            const TokCount x{a}, y{b};
             const PromptToks p{a}, q{b};
             TEST_ASSERT((x + y).raw() == a + b && (x - y).raw() == a - b);
             TEST_ASSERT((p + q).raw() == a + b && (p - q).raw() == a - b);
             TEST_ASSERT((x < y) == (a < b) && (x <= y) == (a <= b) && (x > y) == (a > b) && (x >= y) == (a >= b));
             TEST_ASSERT((p < q) == (a < b) && (p <= q) == (a <= b) && (p > q) == (a > b) && (p >= q) == (a >= b));
             TEST_ASSERT((x == y) == (a == b) && (x != y) == (a != b) && (p == q) == (a == b) && (p != q) == (a != b));
-            LiveToks z = x;
+            TokCount z = x;
             z += y;
             TEST_ASSERT(z.raw() == a + b);
             z -= y;
@@ -11390,20 +11390,160 @@ static void test_l334_seam_currencies(void) {
             TEST_ASSERT(x.times(3).raw() == a * 3 && p.times(-2).raw() == a * -2);
         }
     }
-    TEST_ASSERT(LiveToks{}.raw() == 0 && PromptToks{}.raw() == 0);   /* value-initialised: zero */
-    TEST_ASSERT(LiveToks{(uint32_t)4096}.raw() == 4096 && PromptToks{(int64_t)-1}.raw() == -1);
+    TEST_ASSERT(TokCount{}.raw() == 0 && PromptToks{}.raw() == 0);   /* value-initialised: zero */
+    TEST_ASSERT(TokCount{(uint32_t)4096}.raw() == 4096 && PromptToks{(int64_t)-1}.raw() == -1);
     /* the stitch: live[0, live_cut) + prompt[prompt_cut, prompt_len) -- a seam that spends 3 live tokens on the bytes
      * of 2 prompt ones, and the seamless case where the currencies coincide */
     struct { int live_cut, prompt_cut, prompt_len; } cases[] = {{0, 0, 9}, {100, 99, 140}, {4096, 4093, 4093},
                                                                  {57, 57, 300}, {178193, 178190, 191000}};
     for (const auto &c : cases) {
         pulsar_prefix_match m;
-        m.live_cut = LiveToks{c.live_cut};
+        m.live_cut = TokCount{c.live_cut};
         m.prompt_cut = PromptToks{c.prompt_cut};
         m.seamed = c.live_cut != c.prompt_cut;
         TEST_ASSERT(pulsar_prefix_match_stitched_len(&m, PromptToks{c.prompt_len}).raw() ==
                     c.live_cut + (c.prompt_len - c.prompt_cut));
     }
+}
+
+/* L334 P2a: the affine pair (pulsar_units.h TokPos / TokCount) -- the compile-fail checks.  A position moves by a count
+ * and two positions differ by one; nothing else crosses, and neither mixes with an integer or another unit. */
+/** Does `a - b` compile for these operand types? */
+template <class A, class B> concept l334_subtracts = requires(A a, B b) { a - b; };
+/** Does `a.times(2)` compile for this type? */
+template <class A> concept l334_scales = requires(A a) { a.times(2); };
+/** Does pulsar_kv_rows take this type? */
+template <class A> concept l334_rows_of = requires(A a) { pulsar_kv_rows(a); };
+static_assert(!l333_adds<TokPos, TokPos> && l333_adds<TokPos, TokCount> && !l333_adds<TokCount, TokPos> &&
+                  std::is_same_v<decltype(TokPos{} + TokCount{}), TokPos>,
+              "pos + pos does not compile; pos + count is a position (one spelling: the position first)");
+static_assert(std::is_same_v<decltype(TokPos{} - TokPos{}), TokCount> &&
+                  std::is_same_v<decltype(TokPos{} - TokCount{}), TokPos> && !l334_subtracts<TokCount, TokPos> &&
+                  std::is_same_v<decltype(TokCount{} + TokCount{}), TokCount>,
+              "pos - pos is a count, pos - count a position, count - pos nothing; counts add to counts");
+static_assert(!l334_scales<TokPos> && l334_scales<TokCount>, "a count scales by name, a position never");
+static_assert(!l333_adds<TokPos, int> && !l334_subtracts<TokPos, int> && !l333_adds<TokPos, PromptToks> &&
+                  !l333_adds<TokPos, KvRows> && !l333_adds<TokPos, KvBytes>,
+              "a position moves by a TokCount only: not an int, not the prompt's count, not a KV unit");
+static_assert(!l333_orders<TokPos, TokCount> && !l333_orders<TokPos, int> && !l333_orders<TokPos, PromptToks> &&
+                  !l333_orders<TokPos, KvRows> && l333_orders<TokPos, TokPos>,
+              "positions order among themselves only");
+static_assert(!l333_equates<TokPos, TokCount> && !l333_equates<TokPos, int> && !l333_equates<TokPos, PromptToks> &&
+                  l333_equates<TokPos, TokPos>,
+              "positions equate among themselves only (none() included)");
+static_assert(!l333_assigns<TokPos &, TokCount> && !l333_assigns<TokPos &, int> && !l333_assigns<TokCount &, TokPos> &&
+                  !l333_assigns<TokPos &, PromptToks> && !l333_assigns<KvRows &, TokPos> && l333_assigns<TokPos &, TokPos>,
+              "assignment within the type only");
+static_assert(!std::is_convertible_v<int, TokPos> && !std::is_convertible_v<TokPos, int> &&
+                  !std::is_convertible_v<TokCount, TokPos> && !std::is_convertible_v<TokPos, TokCount>,
+              "no implicit way in or out, nor across the pair");
+static_assert(!std::is_constructible_v<TokPos, TokCount> && !std::is_constructible_v<TokCount, TokPos> &&
+                  !std::is_constructible_v<TokPos, PromptToks> && !std::is_constructible_v<KvRows, TokPos> &&
+                  !std::is_constructible_v<TokPos, KvRows>,
+              "not even explicitly: a count becomes a position only by TokPos::after, a position a count by before()");
+static_assert(std::is_constructible_v<TokPos, int> && std::is_constructible_v<TokPos, uint32_t> &&
+                  !std::is_constructible_v<TokPos, double> && !std::is_constructible_v<TokPos, bool>,
+              "the explicit integer entry exists; a float or a bool is no position");
+static_assert(std::is_same_v<decltype(TokPos{}.raw()), int> && TokPos::none().raw() == -1 && TokPos::none().is_none() &&
+                  !TokPos{0}.is_none() && TokPos{-1} == TokPos::none(),
+              "int semantics; none() is the -1 the int fields carried");
+static_assert(l334_rows_of<TokCount> && !l334_rows_of<TokPos> && !l334_rows_of<PromptToks> && !l334_rows_of<int> &&
+                  std::is_same_v<decltype(pulsar_kv_rows(TokCount{})), KvRows>,
+              "a live count becomes KV rows through pulsar_kv_rows, nothing else does");
+static_assert(std::is_same_v<decltype(pulsar_prefix_match{}.live_cut), TokCount> &&
+                  std::is_same_v<decltype(pulsar_bank_resume{}.at), TokPos> &&
+                  std::is_same_v<decltype(pulsar_multiseq_req{}.pos), TokPos> &&
+                  std::is_same_v<decltype(pulsar_spec_step{}.pos_after), TokPos> &&
+                  std::is_same_v<decltype(pulsar_session_pos(nullptr)), TokPos> &&
+                  std::is_same_v<decltype(pulsar_session_ctx(nullptr)), TokCount>,
+              "the API carries the pair: a cut is a count, a resume point / a row / a frontier a position");
+static_assert((TokPos{5} - TokPos{2}).raw() == 3 && (TokPos{5} + TokCount{-7}).raw() == -2 &&
+                  TokPos::after(TokCount{9}).raw() == 9 && TokPos{9}.before().raw() == 9,
+              "constexpr, and the arithmetic is int's");
+
+/* L334 P2a: the pair is the int it replaced -- every operator against int, negatives included (none() excepted: it is
+ * the one value the operators refuse, as operand or result), and the crossing to the origin is the identity on the raw
+ * value. */
+static void test_l334_positions_are_ints(void) {
+    const int vals[] = {-4097, -2, 0, 1, 127, 4096, 178193, 1 << 20};
+    for (int a : vals) {
+        const TokPos p{a};
+        TEST_ASSERT(p.raw() == a && !p.is_none());
+        TEST_ASSERT(p.before().raw() == a && TokPos::after(TokCount{a}) == p);
+        for (int b : vals) {
+            const TokPos q{b};
+            const TokCount d{b};
+            TEST_ASSERT((p - q).raw() == a - b);
+            if (a + b != -1) TEST_ASSERT((p + d).raw() == a + b);   /* a move that lands on -1 is refused (below) */
+            if (a - b != -1) TEST_ASSERT((p - d).raw() == a - b);
+            TEST_ASSERT((p < q) == (a < b) && (p <= q) == (a <= b) && (p > q) == (a > b) && (p >= q) == (a >= b));
+            TEST_ASSERT((p == q) == (a == b) && (p != q) == (a != b));
+            if (a + b != -1) {
+                TokPos r = p;
+                r += d;
+                TEST_ASSERT(r.raw() == a + b);
+                r -= d;
+                TEST_ASSERT(r == p);
+            }
+            TEST_ASSERT(q + (p - q) == p);   /* the affine identity */
+        }
+        /* none() equals only itself, and is no position the arithmetic produced from a */
+        TEST_ASSERT(p != TokPos::none() && TokPos::none() != p && TokPos::none() == TokPos::none());
+        if (a >= 0) TEST_ASSERT(pulsar_kv_rows(TokCount{a}) == KvRows{(uint32_t)a});
+    }
+    TEST_ASSERT(TokPos{}.raw() == 0 && TokPos{(uint32_t)4096}.raw() == 4096);   /* value-initialised: position 0 */
+    TEST_ASSERT(TokPos{-1}.is_none() && TokPos::none().raw() == -1);           /* the int field's -1 enters as none() */
+}
+
+#include <fcntl.h>
+#include <signal.h>
+#include <sys/wait.h>
+#include <unistd.h>
+/** Run `op` in a child with stderr closed; true when it died of SIGABRT (the fail-closed path). */
+template <class F> static bool l334_aborts(F op) {
+    fflush(NULL);
+    const pid_t pid = fork();
+    if (pid == 0) {
+        const int devnull = open("/dev/null", O_WRONLY);
+        if (devnull >= 0) dup2(devnull, 2);
+        op();
+        _exit(0);
+    }
+    int st = 0;
+    if (pid < 0 || waitpid(pid, &st, 0) != pid) return false;
+    return WIFSIGNALED(st) && WTERMSIG(st) == SIGABRT;
+}
+
+/* L334 P2a: arithmetic and ordering on none() abort (rule 9: fail closed); asking for it does not.  A negative count
+ * is no KV row count. */
+static volatile int l334_sink;   ///< keeps each refused operation live in the child
+static void test_l334_none_fails_closed(void) {
+    volatile int &sink = l334_sink;
+    const TokPos n = TokPos::none(), p{7};
+    const TokCount c{3};
+    TEST_ASSERT(l334_aborts([&] { sink = (n + c).raw(); }));
+    TEST_ASSERT(l334_aborts([&] { sink = (n - c).raw(); }));
+    TEST_ASSERT(l334_aborts([&] { sink = (n - p).raw(); }));
+    TEST_ASSERT(l334_aborts([&] { sink = (p - n).raw(); }));
+    TEST_ASSERT(l334_aborts([&] { TokPos m = n; m += c; sink = m.raw(); }));
+    TEST_ASSERT(l334_aborts([&] { TokPos m = n; m -= c; sink = m.raw(); }));
+    TEST_ASSERT(l334_aborts([&] { sink = n.before().raw(); }));
+    TEST_ASSERT(l334_aborts([&] { sink = n < p; }));
+    TEST_ASSERT(l334_aborts([&] { sink = p < n; }));
+    TEST_ASSERT(l334_aborts([&] { sink = n <= p; }));
+    TEST_ASSERT(l334_aborts([&] { sink = p > n; }));
+    TEST_ASSERT(l334_aborts([&] { sink = n >= n; }));
+    TEST_ASSERT(l334_aborts([&] { sink = (int)pulsar_kv_rows(TokCount{-1}).raw(); }));
+    /* arithmetic never forges the sentinel: a move that lands on -1 is refused, as is a -1 count's end */
+    TEST_ASSERT(l334_aborts([&] { sink = (TokPos{0} - TokCount{1}).raw(); }));
+    TEST_ASSERT(l334_aborts([&] { sink = (TokPos{-2} + TokCount{1}).raw(); }));
+    TEST_ASSERT(l334_aborts([&] { TokPos m{0}; m -= TokCount{1}; sink = m.raw(); }));
+    TEST_ASSERT(l334_aborts([&] { sink = TokPos::after(TokCount{-1}).raw(); }));
+    TEST_ASSERT(!l334_aborts([&] { sink = (TokPos{0} - TokCount{2}).raw() + (TokPos{1} - TokCount{1}).raw(); }));
+    /* the questions are free, and the same operations on a real position run */
+    TEST_ASSERT(!l334_aborts([&] { sink = n.is_none() + (n == n) + (n != p) + n.raw(); }));
+    TEST_ASSERT(!l334_aborts([&] { sink = (p + c).raw() + (p - p).raw() + (p < p) + p.before().raw(); }));
+    TEST_ASSERT(!l334_aborts([&] { sink = (int)pulsar_kv_rows(TokCount{0}).raw(); }));
 }
 
 /* L334 fix: a toy vocabulary for the seam walks -- id i spells l334_vocab[i] ("" = a control token). */
@@ -11426,7 +11566,7 @@ static void test_l334_prompt_held_across_a_seam(void) {
     const int prompt[] = {L334_X, L334_ABC, L334_D, L334_Y, L334_Z};
     pulsar_prefix_match m;
     pulsar_tokens_prefix_match_with(l334_text, NULL, live, 5, prompt, 5, &m);
-    TEST_ASSERT(m.seamed && m.live_cut == LiveToks{5} && m.prompt_cut == PromptToks{4});
+    TEST_ASSERT(m.seamed && m.live_cut == TokCount{5} && m.prompt_cut == PromptToks{4});
     struct { int G, held; } cases[] = {
         {0, 0},   /* nothing */
         {1, 1},   /* the id match: the currencies agree */
@@ -11436,11 +11576,11 @@ static void test_l334_prompt_held_across_a_seam(void) {
         {5, 4},   /* the cut: the match's prompt side */
     };
     for (const auto &c : cases) {
-        const PromptToks held = pulsar_tokens_prompt_held_with(l334_text, NULL, live, LiveToks{c.G}, prompt, 5);
+        const PromptToks held = pulsar_tokens_prompt_held_with(l334_text, NULL, live, TokPos{c.G}, prompt, 5);
         TEST_ASSERT(held == PromptToks{c.held});
         /* the old answer -- G as the prompt-side count below the cut, the match's prompt side at it -- is wrong
          * exactly where a seam lies below a G short of the cut */
-        const int old_answer = LiveToks{c.G} < m.live_cut ? c.G : m.prompt_cut.raw();
+        const int old_answer = TokCount{c.G} < m.live_cut ? c.G : m.prompt_cut.raw();
         const bool old_wrong = c.G > 1 && c.G < 5;
         TEST_ASSERT((held.raw() != old_answer) == old_wrong);
     }
@@ -11448,20 +11588,22 @@ static void test_l334_prompt_held_across_a_seam(void) {
      * at live 2 (byte 4) the request's X a b lie wholly inside it, "cd" does not (no shared boundary below but X) */
     const int live2[] = {L334_X, L334_ABC, L334_D};
     const int prompt2[] = {L334_X, L334_A, L334_B, L334_CD};
-    TEST_ASSERT(pulsar_tokens_prompt_held_with(l334_text, NULL, live2, LiveToks{2}, prompt2, 4) == PromptToks{3});
-    TEST_ASSERT(pulsar_tokens_prompt_held_with(l334_text, NULL, live2, LiveToks{3}, prompt2, 4) == PromptToks{4});
+    TEST_ASSERT(pulsar_tokens_prompt_held_with(l334_text, NULL, live2, TokPos{2}, prompt2, 4) == PromptToks{3});
+    TEST_ASSERT(pulsar_tokens_prompt_held_with(l334_text, NULL, live2, TokPos{3}, prompt2, 4) == PromptToks{4});
     /* no seam: the identity */
-    TEST_ASSERT(pulsar_tokens_prompt_held_with(l334_text, NULL, prompt, LiveToks{3}, prompt, 5) == PromptToks{3});
+    TEST_ASSERT(pulsar_tokens_prompt_held_with(l334_text, NULL, prompt, TokPos{3}, prompt, 5) == PromptToks{3});
     /* a control token is matched by id only, never by bytes: live X|a|bc (bytes 1,2,4) holds the request's X and
      * "ab", and the count stops at the request's control token whatever bytes follow */
     const int live3[] = {L334_X, L334_A, L334_BC, L334_Y};
     const int prompt3[] = {L334_X, L334_AB, L334_CTL, L334_Y};
-    TEST_ASSERT(pulsar_tokens_prompt_held_with(l334_text, NULL, live3, LiveToks{3}, prompt3, 4) == PromptToks{2});
+    TEST_ASSERT(pulsar_tokens_prompt_held_with(l334_text, NULL, live3, TokPos{3}, prompt3, 4) == PromptToks{2});
 }
 
 static void pulsar_server_unit_tests_run(void) {
     test_l333_kv_units();
     test_l334_seam_currencies();
+    test_l334_positions_are_ints();
+    test_l334_none_fails_closed();
     test_l334_prompt_held_across_a_seam();
     test_mem_floor_is_derived_from_the_watermarks();
     test_guard_budget_reads_live_memavailable();

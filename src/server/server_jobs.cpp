@@ -32,10 +32,10 @@ bool server::append_rendered_suffix_to_live_session(session_slot *sl,
 
     pulsar_tokens target = {0};
     (void)build_live_continuation_prompt(s->engine, live, suffix, spans, n_spans, &target);
-    const int before = pulsar_session_pos(s->sess);
+    const TokPos before = pulsar_session_pos(s->sess);
     bool ok = pulsar_session_sync(s->sess, &target, err, errlen) == 0;
     if (ok && tokens_appended) {
-        int delta = pulsar_session_pos(s->sess) - before;
+        int delta = (pulsar_session_pos(s->sess) - before).raw();
         *tokens_appended = delta > 0 ? delta : 0;
     }
     pulsar_tokens_free(&target);
@@ -276,8 +276,8 @@ void server::canonicalize_tool_checkpoint(session_slot *sl,
     pulsar_tokens canonical = {0};
     pulsar_tokenize_rendered_chat_spans(s->engine, rendered.ptr ? rendered.ptr : "",
                                         rendered.spans, rendered.n_spans, &canonical);
-    const int live_len = pulsar_session_pos(s->sess);
-    const int common = pulsar_session_common_prefix(s->sess, &canonical);
+    const int live_len = pulsar_session_pos(s->sess).raw();
+    const int common = pulsar_session_common_prefix(s->sess, &canonical).raw();
     if (common == live_len && canonical.len == live_len) goto done;
 
     size_t live_text_len;
@@ -756,7 +756,7 @@ void server::gen_begin(session_slot *sl) {
      * inside this bind. */
     if (was.text && gen_restore_spilled_start(s, sl, &was)) return;
     free(was.text);
-    const int old_pos = pulsar_session_pos(s->sess);
+    const int old_pos = pulsar_session_pos(s->sess).raw();
     /* EVAL PIN: report no live common prefix, so every request re-prefills
      * from position 0 regardless of what this bank served before.  The
      * choke-point twins live in slot_common_prefix (routing) and the live
@@ -954,16 +954,16 @@ void server::gen_begin(session_slot *sl) {
     if (pick == RESUME_ADOPT) {
         char aerr[192] = "";
         const double t_a = server_now_sec();
-        const int T = pulsar_session_bank_adopt(s->sess, (uint32_t)adopt_src, &j->req.prompt, aerr, sizeof(aerr));
-        if (T > 0) {
+        const TokPos T = pulsar_session_bank_adopt(s->sess, (uint32_t)adopt_src, &j->req.prompt, aerr, sizeof(aerr));
+        if (!T.is_none() && T > TokPos{0}) {
             /* L334: the bank stands at T on src's tokens; the cache read is what they hold of the request */
-            cached = pulsar_session_bank_prompt_held(s->sess, sl->bank, &j->req.prompt, LiveToks{T}).raw();
-            resumed_at = T;
+            cached = pulsar_session_bank_prompt_held(s->sess, sl->bank, &j->req.prompt, T).raw();
+            resumed_at = T.raw();
             resumed_on_seam = true;
             cache_source = "bank-adopt";
             server_log(PULSAR_LOG_KVCACHE, "pulsar-server: bank %u adopted bank %d's state at %d of %d (%.1f ms)",
-                       sl->bank, adopt_src, T, j->req.prompt.len, (server_now_sec() - t_a) * 1e3);
-        } else if (T < 0) {
+                       sl->bank, adopt_src, T.raw(), j->req.prompt.len, (server_now_sec() - t_a) * 1e3);
+        } else if (T.is_none()) {   /* a refusal (the adopt's one negative answer) */
             server_log(PULSAR_LOG_WARNING, "pulsar-server: bank %u could not adopt bank %d's state: %s", sl->bank,
                        adopt_src, aerr);
             pulsar_session_invalidate(s->sess);   /* the bank describes no position: the sync rebuilds it */
@@ -1223,7 +1223,7 @@ void server::gen_step_prefill(session_slot *sl) {
      * adopts -- the cold phase's mechanism, for a cut a sibling request named.  A text prefill only (a waiter never
      * names an image prompt's). */
     pulsar_tokens to_cut = {0};
-    const bool cut = n_images == 0 && g->share_mark > pulsar_session_bank_pos(s->sess, (uint32_t)sl->bank) &&
+    const bool cut = n_images == 0 && g->share_mark > pulsar_session_bank_pos(s->sess, (uint32_t)sl->bank).raw() &&
                      g->share_mark < target->len;
     if (cut) {
         tokens_copy_prefix(&to_cut, target, g->share_mark);
@@ -1265,7 +1265,7 @@ void server::gen_step_prefill(session_slot *sl) {
         /* rule 5: the cut the prefill stopped at, and the checkpoint the waiters adopt (the next pass binds them) */
         server_log(PULSAR_LOG_PREFILL, "pulsar-server: bank %u stands at %d, the shared cut a queued request "
                    "waits for (prompt %d; grid checkpoint %d)", sl->bank, g->share_mark, g->prompt_for_sync->len,
-                   pulsar_session_checkpoint_best(s->sess, g->share_mark));
+                   pulsar_session_checkpoint_best(s->sess, TokPos{g->share_mark}).raw());
         return;   /* a quantum boundary: the waiters bind before this prompt's next chunk */
     }
 
@@ -1411,7 +1411,7 @@ void server::gen_decode_init(session_slot *sl) {
      * max_tokens budget: completion_total holds what earlier attempts already
      * generated. */
     g->max_tokens = j->req.max_tokens - g->completion_total;
-    int room = pulsar_session_ctx(s->sess) - pulsar_session_pos(s->sess);
+    int room = (pulsar_session_ctx(s->sess) - pulsar_session_pos(s->sess).before()).raw();
     g->next_decode_log = 50;
     if (g->max_tokens < 0) g->max_tokens = 0;
     if (g->max_tokens > room) g->max_tokens = room;
@@ -2079,7 +2079,7 @@ bool server::terminal_checkpoint_step() {
         if (pick->responses_live.valid) return true;
     }
     const pulsar_tokens *h = pulsar_session_bank_tokens(s->sess, pick->bank);
-    const int pf = pulsar_session_bank_prefill_frontier(s->sess, pick->bank);
+    const int pf = pulsar_session_bank_prefill_frontier(s->sess, pick->bank).raw();
     if (!h || h->len <= 0) return true;
     int C = h->len;
     if (pulsar_token_is_stop(s->engine, h->v[C - 1])) C--;   /* the render re-spells the stop (L290's join) */
@@ -2089,7 +2089,7 @@ bool server::terminal_checkpoint_step() {
     if (pulsar_session_image_hashes(s->sess, NULL, 0) > 0) return true;
     pulsar_tokens target = {0};
     tokens_copy_prefix(&target, pulsar_session_tokens(s->sess), C);
-    const int old_len = pulsar_session_pos(s->sess);
+    const int old_len = pulsar_session_pos(s->sess).raw();
     pulsar_session_set_cancel(s->sess, NULL, NULL);
     pulsar_session_set_progress(s->sess, NULL, NULL);
     pulsar_session_set_display_progress(s->sess, NULL, NULL);
@@ -2097,7 +2097,8 @@ bool server::terminal_checkpoint_step() {
     char err[192] = "";
     /* the view IS the target when no stop trails it, and a sync of the same prompt is a no-op: the history short of
      * its last token first (that sync resumes below the decode rows), then the token */
-    int rc = 0, origin = -1;
+    int rc = 0;
+    TokPos origin = TokPos::none();
     if (C == old_len) {
         target.len = C - 1;
         rc = pulsar_session_sync(s->sess, &target, err, sizeof(err));
@@ -2105,7 +2106,7 @@ bool server::terminal_checkpoint_step() {
         target.len = C;
     }
     if (rc == 0) rc = pulsar_session_sync(s->sess, &target, err, sizeof(err));
-    if (origin < 0) origin = pulsar_session_resume_origin(s->sess);
+    if (origin.is_none()) origin = pulsar_session_resume_origin(s->sess);
     pick->committed_pos = pulsar_session_pos(s->sess);
     if (rc == 0) {
         /* the bank's frontier moved from the decoded end to C: a live tool binding at the old end describes C now
@@ -2117,7 +2118,7 @@ bool server::terminal_checkpoint_step() {
     server_log(PULSAR_LOG_KVCACHE,
                "pulsar-server: terminal checkpoint: bank %u prefilled [%d, %d) of its turn (prefill frontier was %d) "
                "in %.1f ms%s%s",
-               pick->bank, origin, C, pf, (server_now_sec() - t0) * 1e3, rc == 0 ? "" : " -- FAILED: ", err);
+               pick->bank, origin.raw(), C, pf, (server_now_sec() - t0) * 1e3, rc == 0 ? "" : " -- FAILED: ", err);
     if (rc == 0) s->kv_cache_persist(pick, "terminal", true);
     else pulsar_session_invalidate(s->sess);   /* the bank's state is no position's; its next turn rebuilds it */
     pulsar_tokens_free(&target);

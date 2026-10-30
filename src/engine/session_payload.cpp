@@ -751,7 +751,7 @@ static bool kvp_plan_save(pulsar_session *s, kvp_plan *p, char *err, size_t errl
         payload_set_err(err, errlen, msg);
         return false;
     }
-    p->PF = (uint32_t)pulsar_session_bank_prefill_frontier(s, p->bank);
+    p->PF = (uint32_t)pulsar_session_bank_prefill_frontier(s, p->bank).raw();   /* L334: the payload's raw field */
     if (p->PF > p->T) {
         payload_set_err(err, errlen, "session payload: the prefill frontier lies past the session's tokens");
         return false;

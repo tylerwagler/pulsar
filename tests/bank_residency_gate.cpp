@@ -135,9 +135,9 @@ int GATE_ENTRY(int argc, char **argv) {
 
     /* the spill: bank 1 installed, its chain persisted, its carry saved, bank 0 installed */
     FILE *seg = tmpfile();
-    const uint64_t seg_bytes = ok ? pulsar_session_segment_bytes(s, 0, G, NULL) : 0;
-    ok = ok && seg && pulsar_session_bank_state_restore(s, 1) && pulsar_session_checkpoint_best(s, G) == G &&
-         pulsar_session_save_segment(s, seg, 0, G, NULL, err, sizeof(err)) == 0;
+    const uint64_t seg_bytes = ok ? pulsar_session_segment_bytes(s, TokPos{0}, TokPos{G}, NULL) : 0;
+    ok = ok && seg && pulsar_session_bank_state_restore(s, 1) && pulsar_session_checkpoint_best(s, TokPos{G}).raw() == G &&
+         pulsar_session_save_segment(s, seg, TokPos{0}, TokPos{G}, NULL, err, sizeof(err)) == 0;
     if (ok) pulsar_session_bank_state_save(s, 1);
     ok = ok && pulsar_session_bank_state_restore(s, 0);
     CHECK(ok, "bank 1 persisted as [0, %d) (%.1f MiB): %s", G, seg_bytes / 1048576.0, err);
@@ -172,12 +172,12 @@ int GATE_ENTRY(int argc, char **argv) {
     /* R2: the restore -- re-back, install, load the chain */
     const bool backed = freed && pulsar_session_bank_alloc_physical(s, 1) && pulsar_session_bank_alloc_physical(s, 1);
     CHECK(backed && !pulsar_session_bank_is_evicted(s, 1), "R2 alloc_physical re-backs bank 1 (and again: idempotent)");
-    int g = 0;
+    TokPos g{0};
     if (seg) rewind(seg);
     const bool loaded = backed && pulsar_session_bank_state_restore(s, 1) &&
                         pulsar_session_load_segment(s, seg, seg_bytes, true, &g, NULL, err, sizeof(err)) == 0;
-    CHECK(loaded && g == G && pulsar_session_bank_touched_kv_bytes(s, 1).raw() == t1,
-          "R2 the chain loaded bank 1 back to %d (touched %.1f MiB): %s", g,
+    CHECK(loaded && g.raw() == G && pulsar_session_bank_touched_kv_bytes(s, 1).raw() == t1,
+          "R2 the chain loaded bank 1 back to %d (touched %.1f MiB): %s", g.raw(),
           pulsar_session_bank_touched_kv_bytes(s, 1).raw() / 1048576.0, err);
 
     /* R3 */

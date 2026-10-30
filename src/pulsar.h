@@ -721,17 +721,18 @@ uint64_t pulsar_image_hash(const pulsar_image_ref *img);
  *  holds. */
 int pulsar_session_image_hashes(pulsar_session *s, uint64_t *hashes, int cap);
 /** L281: how much of the session's history a disk chain may hold -- all of it, or up to the first image block whose
- *  image the session does not record.  -1 when its image blocks are malformed. */
-int pulsar_session_persist_end(pulsar_session *s);
+ *  image the session does not record: the position it ends at.  none() when its image blocks are malformed. */
+TokPos pulsar_session_persist_end(pulsar_session *s);
 /** L281: the image records a stored segment carries (`fp` at its payload, `bytes` long), read without loading it:
  *  their content hashes, in order, up to `cap` (*n_out of them; a v2 segment carries none).  0 on success. */
 int pulsar_session_segment_images(FILE *fp, uint64_t bytes, uint64_t *hashes, uint32_t cap, uint32_t *n_out);
 /** Where the last pulsar_session_sync started evaluating: the grid snapshot
- * position it resumed from, 0 when it prefilled from the start, -1 when the
+ * position it resumed from, 0 when it prefilled from the start, none() when the
  * call did not resume (nothing to evaluate, or a checkpoint that was not a
  * prefix).  An instrument for the chunk-neutrality gate (L194). */
-int pulsar_session_resume_origin(pulsar_session *s);
-int pulsar_session_common_prefix(pulsar_session *s, const pulsar_tokens *prompt);
+TokPos pulsar_session_resume_origin(pulsar_session *s);
+/** The tokens the installed bank's history and `prompt` share from position 0 (by id). */
+TokCount pulsar_session_common_prefix(pulsar_session *s, const pulsar_tokens *prompt);
 
 /** L115 — THE prefix-reuse authority.  Every "can this state serve this
  * prompt, and from which cut?" decision (routing, the worker's cache
@@ -750,10 +751,10 @@ int pulsar_session_common_prefix(pulsar_session *s, const pulsar_tokens *prompt)
  * request side (accounting, cache_read_tokens, prefill bounds).  Mixing
  * them is the hazard this struct exists to make impossible — a live-side
  * count used to index the request array can run past its end — so each is
- * its own type (L334, pulsar_units.h: LiveToks, PromptToks), and the one
+ * its own type (L334, pulsar_units.h: TokCount, PromptToks), and the one
  * conversion between them is pulsar_prefix_match_stitched_len. */
 typedef struct {
-    LiveToks   live_cut;    ///< live/bank-side token count: KV rows, cut points, rewind targets
+    TokCount   live_cut;    ///< live/bank-side token count: KV rows, cut points, rewind targets
     PromptToks prompt_cut;  ///< request-side token count for the SAME bytes: accounting, prefill bounds
     bool seamed;            ///< token ids disagreed inside the covered region (same bytes, different split)
 } pulsar_prefix_match;
@@ -764,8 +765,8 @@ typedef struct {
  *  side past the cut; the other way, below it, is pulsar_tokens_prompt_held_with.
  *  @param m the match the stitch is cut at
  *  @param prompt_len the request prompt's length */
-static inline LiveToks pulsar_prefix_match_stitched_len(const pulsar_prefix_match *m, PromptToks prompt_len) {
-    return m->live_cut + LiveToks{(prompt_len - m->prompt_cut).raw()};
+static inline TokCount pulsar_prefix_match_stitched_len(const pulsar_prefix_match *m, PromptToks prompt_len) {
+    return m->live_cut + TokCount{(prompt_len - m->prompt_cut).raw()};
 }
 
 /** A token's text for the seam walks: a malloc'd copy the caller frees (NULL = none), its length in *len
@@ -795,7 +796,7 @@ void pulsar_tokens_prefix_match_with(pulsar_token_text_fn text, void *ud,
  *  @param at the live position (<= the history's length)
  *  @param prompt the request's tokens
  *  @param prompt_len their count */
-PromptToks pulsar_tokens_prompt_held_with(pulsar_token_text_fn text, void *ud, const int *live, LiveToks at,
+PromptToks pulsar_tokens_prompt_held_with(pulsar_token_text_fn text, void *ud, const int *live, TokPos at,
                                           const int *prompt, int prompt_len);
 void pulsar_session_prefix_match(pulsar_session *s, const pulsar_tokens *prompt,
                                  pulsar_prefix_match *out);
@@ -913,7 +914,7 @@ int pulsar_session_eval(pulsar_session *s, int token, char *err, size_t errlen);
  * driver rejects the step otherwise rather than corrupting KV. */
 typedef struct {
     uint32_t bank;   ///< TRUE bank id in the session's pool
-    int32_t  pos;    ///< absolute position of `token` (the bank's committed length)
+    TokPos   pos;    ///< absolute position of `token` (the bank's committed length)
     int      token;  ///< input token id decoded at `pos`
 } pulsar_multiseq_req;
 int pulsar_session_decode_multiseq(pulsar_session *s, const pulsar_multiseq_req *reqs,
@@ -1161,8 +1162,8 @@ typedef struct {
     /* out */
     int status;              /* pulsar_spec_step_status */
     int n_accepted;          /* round_end */
-    int pos_before;          /* round_end: the round's base position (L155) */
-    int pos_after;           /* round_end: the bank's frontier after the round */
+    TokPos pos_before;       /* round_end: the round's base position (L155) */
+    TokPos pos_after;        /* round_end: the bank's frontier after the round */
     char err[160];
 } pulsar_spec_step;
 /** Per step: restore; LENGTH at ctx; SKIPPED when 1 + K (the allocation, or
@@ -1200,14 +1201,14 @@ bool pulsar_session_split_invariant(const pulsar_session *s);
  * _common_prefix describe only the live bank, so server routing and /metrics
  * must use these for non-active banks.  Pure host reads (no CUDA); the caller
  * must keep idle banks' carries current (bank_state_save at job end). Return
- * 0 / NULL for an out-of-range or never-populated bank. */
-int  pulsar_session_bank_pos(pulsar_session *s, uint32_t bank);
+ * position 0 / a 0 count / NULL for an out-of-range or never-populated bank -- 0, not none(), so such a bank reads
+ * exactly as an empty one. */
+TokPos pulsar_session_bank_pos(pulsar_session *s, uint32_t bank);
 /** L264: the end of the last prompt the bank PREFILLED (its generated tokens lie
  *  past it).  A request that carries all of it is that conversation's next turn. */
-int  pulsar_session_bank_prefill_frontier(pulsar_session *s, uint32_t bank);
+TokPos pulsar_session_bank_prefill_frontier(pulsar_session *s, uint32_t bank);
 const pulsar_tokens *pulsar_session_bank_tokens(pulsar_session *s, uint32_t bank);
-int  pulsar_session_bank_common_prefix(pulsar_session *s, uint32_t bank,
-                                    const pulsar_tokens *prompt);
+TokCount pulsar_session_bank_common_prefix(pulsar_session *s, uint32_t bank, const pulsar_tokens *prompt);
 /** True when `bank`'s compressor state is stale: a rewind into a group the
  * verify saves and the projection ring do not cover (on the pair: a 1-token ghost
  * rewind from a ratio-128 group boundary).  Such a bank can only be extended from
@@ -1251,22 +1252,23 @@ void pulsar_session_invalidate(pulsar_session *s);
 /** Trim the committed history back to pos, keeping the KV below it live. For
  * dropping trailing tokens the client never saw (mid-block speculative stop);
  * rewound rows are overwritten by the next prefill/eval. */
-void pulsar_session_rewind(pulsar_session *s, int pos);
+void pulsar_session_rewind(pulsar_session *s, TokPos pos);
 /** L264 grid checkpoints.  A prefill captures the installed bank's state at each
  * grid point it ends a chunk on (every multiple of 128 a chunk boundary lands on,
  * and the last one below the prompt's end); restoring one puts the bank back at
  * that position so the next sync evaluates only the tokens after it -- the cold
  * prefill's computation, byte for byte.  best: the deepest checkpoint <= limit
- * the installed bank holds, 0 when none.  restore: 0 on success; 1 when the bank
+ * the installed bank holds, position 0 when none (no checkpoint sits at 0, and resuming at 0 is prefilling
+ * everything: 0 is the answer, not none()).  restore: 0 on success; 1 when the bank
  * holds none at G (nothing changed), or on a tensor-parallel engine, which does
  * not mirror the restore. */
-int pulsar_session_checkpoint_best(pulsar_session *s, int limit);
+TokPos pulsar_session_checkpoint_best(pulsar_session *s, TokPos limit);
 /** L334: where a bank's state serves a request from, in both currencies: `at` where the sync's computed rows start
  *  on the prompt it runs (the stitch: the live side -- a checkpoint, a record, or the bank's frontier), `served` how
  *  many of the REQUEST's tokens that state holds (pulsar_tokens_prompt_held_with of `at`: the prompt side, what a
  *  cache read counts and what depths are ranked by).  They differ only where a re-spelled stretch lies below `at`. */
 typedef struct {
-    LiveToks at;         ///< the sync starts computing here, on the stitched prompt
+    TokPos at;           ///< the sync starts computing here, on the stitched prompt
     PromptToks served;   ///< the request's tokens the state at `at` holds
 } pulsar_bank_resume;
 /** L266: where a sync of `prompt` on `bank` starts its prefill -- the prompt tokens the bank's state serves,
@@ -1278,7 +1280,7 @@ typedef struct {
  *  and the stitched prompt's length - 1, else nothing (0).  L334: both currencies (pulsar_bank_resume); the route's
  *  score and the cache read are `served`. */
 pulsar_bank_resume pulsar_session_bank_resume_at(pulsar_session *s, uint32_t bank, const pulsar_tokens *prompt);
-int pulsar_session_restore_checkpoint(pulsar_session *s, int G, char *err, size_t errlen);
+int pulsar_session_restore_checkpoint(pulsar_session *s, TokPos G, char *err, size_t errlen);
 /** L313: bank-independent checkpoints -- the INSTALLED bank adopts ANOTHER bank's published state for `prompt`: the
  *  deepest of `src`'s grid checkpoints and records the prompt carries (the resume rule's terms, over src's prefill-only
  *  history), copied in -- src's pool rows below T, then its checkpoint -- so the installed bank stands at T with src's
@@ -1286,20 +1288,23 @@ int pulsar_session_restore_checkpoint(pulsar_session *s, int G, char *err, size_
  *  rest, the cold prefill's bytes.  src may be busy (its rows below T never change while its history reaches T).
  *  L322: "carries" is the token-seam match (pulsar_tokens_prefix_match, the route's and the own resume's), T a
  *  boundary both spellings share; the sync re-stitches the prompt onto src's tokens there.
- *  A text history only.  @return T, 0 when src serves nothing (or holds an image block below it), -1 with `err` on a
- *  refusal (a tensor-parallel engine, not another bank, a copy that failed: the installed bank then describes no
- *  position and must be synced from nothing). */
-int pulsar_session_bank_adopt(pulsar_session *s, uint32_t src, const pulsar_tokens *prompt, char *err, size_t errlen);
+ *  A text history only.  @return T, position 0 when src serves nothing (or holds an image block below it), none()
+ *  with `err` on a refusal (a tensor-parallel engine, not another bank, a copy that failed: the installed bank then
+ *  describes no position and must be synced from nothing). */
+TokPos pulsar_session_bank_adopt(pulsar_session *s, uint32_t src, const pulsar_tokens *prompt, char *err, size_t errlen);
 /** L313: the T pulsar_session_bank_adopt would adopt from `src` for `prompt` (a host scan, no device work; 0 for the
  *  installed bank, none, or a tensor-parallel engine).  L334: `at` = T, a position on src's history (the live side),
  *  `served` the request's tokens src's history to T holds, the depth an adopt is ranked by. */
 pulsar_bank_resume pulsar_session_bank_adopt_score(pulsar_session *s, uint32_t src, const pulsar_tokens *prompt);
 /** L334: the request's tokens bank `bank`'s history up to `at` holds (pulsar_tokens_prompt_held_with over it; 0 for an
  *  out-of-range or never-populated bank) -- after an adopt, what its T serves. */
-PromptToks pulsar_session_bank_prompt_held(pulsar_session *s, uint32_t bank, const pulsar_tokens *prompt, LiveToks at);
-int pulsar_session_pos(pulsar_session *s);
-int pulsar_session_ctx(pulsar_session *s);
-int pulsar_session_prefill_cap(pulsar_session *s);
+PromptToks pulsar_session_bank_prompt_held(pulsar_session *s, uint32_t bank, const pulsar_tokens *prompt, TokPos at);
+/** The installed bank's position: the length of its committed history, where its next token goes. */
+TokPos pulsar_session_pos(pulsar_session *s);
+/** The context the session holds: every position is below it. */
+TokCount pulsar_session_ctx(pulsar_session *s);
+/** The widest prefill chunk, tokens (0 without a session). */
+TokCount pulsar_session_prefill_cap(pulsar_session *s);
 /** Multi-session serving: prefill quantum policy. A server that time-slices
  * prefill interrupts pulsar_session_sync() at chunk boundaries (via the cancel
  * callback) and re-issues the sync to resume. Returns the minimum remaining
@@ -1505,15 +1510,15 @@ int pulsar_session_save_snapshot(pulsar_session *s, pulsar_session_snapshot *sna
 #define PULSAR_SESSION_SEGMENT_VERSION UINT32_C(6)   /* v3 (L281): the span's image block records; v4 (L268): with each block's 2D grid; v5 (L292): NVFP4 KV rows from IEEE divides -- v4 rows differ in a few codes, so they are refused and rewritten; v6 (L323): the state is optional and last, behind its own digest (header word 8 flags it), so a load reads rows + one state */
 /** The bytes pulsar_session_save_segment writes for [G_prev, G) (0: not a segment span), and in *state_bytes (may be
  *  NULL) the trailing part a load of a non-last segment skips: the state at G and its digest (0 = rows only). */
-uint64_t pulsar_session_segment_bytes(pulsar_session *s, int G_prev, int G, uint64_t *state_bytes);
+uint64_t pulsar_session_segment_bytes(pulsar_session *s, TokPos G_prev, TokPos G, uint64_t *state_bytes);
 /** `key`: the segment's store key (pulsar_segstore_child_key).  Off a TP group
  *  it is unused (NULL is fine); on one it names every worker's own copy, and
  *  save and load are mirrored verdicts whose disagreement is a miss on every
  *  rank (L264 S4e).  Refused inside a mirrored sync. */
-int pulsar_session_save_segment(pulsar_session *s, FILE *fp, int G_prev, int G, const char *key,
+int pulsar_session_save_segment(pulsar_session *s, FILE *fp, TokPos G_prev, TokPos G, const char *key,
                                 char *err, size_t errlen);
 int pulsar_session_load_segment(pulsar_session *s, FILE *fp, uint64_t bytes, bool last,
-                                int *G_out, const char *key, char *err, size_t errlen);
+                                TokPos *G_out, const char *key, char *err, size_t errlen);
 /** A store removed segment `key`: the workers delete their copies (void; a
  *  no-op off a TP leader). */
 void pulsar_engine_segment_dropped(pulsar_engine *e, const char *key);

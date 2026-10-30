@@ -413,7 +413,7 @@ static uint64_t vc_key(const pulsar_session *s, const char *build_id) {
     const char *dn = e->drafter_ops && e->drafter_ops->name ? e->drafter_ops->name : "";
     mix(dn, strlen(dn) + 1u);
     const uint32_t v[3] = {pulsar_engine_fused_heads_max(e), (uint32_t)pulsar_session_bank_count((pulsar_session *)s),
-                           (uint32_t)pulsar_session_ctx((pulsar_session *)s)};
+                           (uint32_t)pulsar_session_ctx((pulsar_session *)s).raw()};
     mix(v, sizeof v);
     /* L315: a pair's forward is both ranks' (one Spark's curve is not a pair's) */
     if (e->tp) {
@@ -501,15 +501,15 @@ static void vc_cache_write(const char *path, uint64_t key, uint32_t rows_max, co
 bool pulsar_session_verify_profile_local(pulsar_session *s, uint32_t rows_max, double *base, char *err,
                                          size_t errlen) {
     const uint32_t bank = pulsar_session_live_bank(s);
-    const int P = pulsar_session_pos(s);
+    const TokPos P = pulsar_session_pos(s);
     const uint32_t V = spec_vocab(s);
     if (rows_max == 0u || rows_max > PULSAR_SPEC_LOGITS_ROWS) {
         snprintf(err, errlen, "a %u-row verify profile is outside the landing buffers (%u)", rows_max,
                  PULSAR_SPEC_LOGITS_ROWS);
         return false;
     }
-    if (P < 1 || (int64_t)P + rows_max > (int64_t)pulsar_session_ctx(s)) {
-        snprintf(err, errlen, "the bank holds %d tokens: no room for a %u-row verify", P, rows_max);
+    if (P < TokPos{1} || (int64_t)P.raw() + rows_max > (int64_t)pulsar_session_ctx(s).raw()) {
+        snprintf(err, errlen, "the bank holds %d tokens: no room for a %u-row verify", P.raw(), rows_max);
         return false;
     }
     const pulsar_spec_target_ops *t = spec_target(s);
@@ -521,7 +521,8 @@ bool pulsar_session_verify_profile_local(pulsar_session *s, uint32_t rows_max, d
     bool ok = true;
     spec_bank_save(s, bank);
     for (uint32_t rows = rows_max; ok && rows >= 1u; rows--) {
-        for (uint32_t k = 0; k < rows; k++) reqs[k] = {bank, (int32_t)(P + (int)k), s->checkpoint.v[k % (uint32_t)P]};
+        for (uint32_t k = 0; k < rows; k++)
+            reqs[k] = {bank, P + TokCount{(int)k}, s->checkpoint.v[k % (uint32_t)P.raw()]};
         double ms[VC_PROFILE_REPS];
         uint32_t timed = 0;
         bool warm = false;

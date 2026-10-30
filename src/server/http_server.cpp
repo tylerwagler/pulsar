@@ -163,7 +163,7 @@ static void append_model_json(buf *b, const server *s, const char *id) {
     append_model_json_values(b,
                              id,
                              server_served_model_name(s),
-                             pulsar_session_ctx(s->sess),
+                             pulsar_session_ctx(s->sess).raw(),
                              s->default_tokens);
 }
 
@@ -1328,7 +1328,7 @@ void *client_main(void *arg) {
         req.model = xstrdup(server_served_model_id(s));
     }
     int ctx_size;
-    ctx_size = pulsar_session_ctx(s->sess);
+    ctx_size = pulsar_session_ctx(s->sess).raw();
     if (request_exceeds_context(&req, ctx_size)) {
         http_error_context_length_exceeded(fd, &req, req.prompt.len, ctx_size);
         request_free(&req);

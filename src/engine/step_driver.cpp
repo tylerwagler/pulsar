@@ -462,6 +462,8 @@ int pulsar_driver_eval_row(pulsar_session *s, int token, char *err, size_t errle
     return 0;
 }
 
+/* L334 P2a: a request row's position is typed at the API (pulsar_multiseq_req.pos, TokPos); the driver bodies below
+ * read it raw (.raw()) into their int32 rows until P2b types them. */
 int pulsar_driver_decode_multiseq(pulsar_session *s, const pulsar_multiseq_req *reqs, uint32_t n, float *logits,
                                   int logits_cap, char *err, size_t errlen) {
     pulsar_engine *e = s->engine;
@@ -475,9 +477,9 @@ int pulsar_driver_decode_multiseq(pulsar_session *s, const pulsar_multiseq_req *
     int32_t tok[PULSAR_DRIVER_HEADS_MAX], pos[PULSAR_DRIVER_HEADS_MAX], bank[PULSAR_DRIVER_HEADS_MAX];
     for (uint32_t i = 0; i < n; i++) {
         /* One row per bank, at that bank's next position: a recurrent state advances exactly one token per row. */
-        if (reqs[i].bank >= ss->n_banks || (uint32_t)reqs[i].pos != ss->bank_pos[reqs[i].bank]) {
+        if (reqs[i].bank >= ss->n_banks || (uint32_t)reqs[i].pos.raw() != ss->bank_pos[reqs[i].bank]) {
             if (err) snprintf(err, errlen, "%s: row %u (bank %u pos %d) is not its bank's next position", ARCH(e), i,
-                              reqs[i].bank, reqs[i].pos);
+                              reqs[i].bank, reqs[i].pos.raw());
             return 1;
         }
         for (uint32_t j = 0; j < i; j++) {
@@ -487,7 +489,7 @@ int pulsar_driver_decode_multiseq(pulsar_session *s, const pulsar_multiseq_req *
             }
         }
         tok[i] = reqs[i].token;
-        pos[i] = reqs[i].pos;
+        pos[i] = reqs[i].pos.raw();
         bank[i] = (int32_t)reqs[i].bank;
     }
     const pulsar_driver_ops *ops = DOPS(e);
@@ -516,14 +518,14 @@ static bool driver_verify_rows(pulsar_session *s, const pulsar_multiseq_req *req
     for (uint32_t i = 0; i < n; i++) {
         const uint32_t b = reqs[i].bank;
         const bool run_start = i == 0 || reqs[i - 1].bank != b;
-        const uint32_t want = run_start ? (b < ss->n_banks ? ss->bank_pos[b] : 0u) : (uint32_t)reqs[i - 1].pos + 1u;
-        if (b >= ss->n_banks || (uint32_t)reqs[i].pos != want) {
+        const uint32_t want = run_start ? (b < ss->n_banks ? ss->bank_pos[b] : 0u) : (uint32_t)reqs[i - 1].pos.raw() + 1u;
+        if (b >= ss->n_banks || (uint32_t)reqs[i].pos.raw() != want) {
             if (err) snprintf(err, errlen, "%s: verify row %u (bank %u pos %d) is not its run's next position",
-                              ARCH(s->engine), i, b, reqs[i].pos);
+                              ARCH(s->engine), i, b, reqs[i].pos.raw());
             return false;
         }
         tok[i] = reqs[i].token;
-        pos[i] = reqs[i].pos;
+        pos[i] = reqs[i].pos.raw();
         bk[i] = (int32_t)b;
     }
     return true;
@@ -624,17 +626,17 @@ int pulsar_driver_decode_fused(pulsar_session *s, const pulsar_multiseq_req *req
         n_pf += starts ? 1u : 0u;
         const char *why = n_pf > shape->n_pf                                       ? "starts a run past the shape's"
                           : taken                                                 ? "is on a bank the step already carries"
-                          : !starts && reqs[i].pos != reqs[i - 1].pos + 1         ? "does not follow its run"
+                          : !starts && reqs[i].pos.raw() != reqs[i - 1].pos.raw() + 1         ? "does not follow its run"
                           : !pulsar_session_token_is_id(s, reqs[i].token, NULL, 0) ? "is not a token id"
                           : vis && vis->is_sentinel(e, reqs[i].token)               ? "is an image block's (a sync's)"
                                                                                   : NULL;
         if (why) {
-            if (err) snprintf(err, errlen, "%s: fused prompt row %u (bank %u pos %d) %s", ARCH(e), i, b, reqs[i].pos,
+            if (err) snprintf(err, errlen, "%s: fused prompt row %u (bank %u pos %d) %s", ARCH(e), i, b, reqs[i].pos.raw(),
                               why);
             return 1;
         }
         tok[i] = reqs[i].token;
-        pos[i] = reqs[i].pos;
+        pos[i] = reqs[i].pos.raw();
         bk[i] = (int32_t)b;
     }
     if (n_pf != shape->n_pf) {
@@ -646,7 +648,7 @@ int pulsar_driver_decode_fused(pulsar_session *s, const pulsar_multiseq_req *req
      * records: its rope would read them) */
     for (uint32_t r = 0; r < n_pf; r++) {
         const uint32_t b = reqs[first[r]].bank, m = first[r + 1] - first[r];
-        const int32_t p0 = reqs[first[r]].pos;
+        const int32_t p0 = reqs[first[r]].pos.raw();
         const pulsar_image_identity *img = b < ss->n_banks ? pulsar_session_bank_images(s, b, ss->live_bank) : NULL;
         const char *why = b >= ss->n_banks                            ? "is outside the pool"
                           : p0 != 0 && (uint32_t)p0 != ss->bank_pos[b] ? "holds a different position"
@@ -664,11 +666,11 @@ int pulsar_driver_decode_fused(pulsar_session *s, const pulsar_multiseq_req *req
     bool canonical[PULSAR_FUSED_PF_MAX];
     for (uint32_t r = 0; r < n_pf; r++) {
         const uint32_t b = reqs[first[r]].bank;
-        if (reqs[first[r]].pos == 0 && !pulsar_state_reset_bank(ss, b)) {
+        if (reqs[first[r]].pos.raw() == 0 && !pulsar_state_reset_bank(ss, b)) {
             if (err) snprintf(err, errlen, "%s: fused step: bank %u could not be reset", ARCH(e), b);
             return -1;
         }
-        canonical[r] = ss->prefill_pos[b] == (uint32_t)reqs[first[r]].pos && !ss->frontier_stale[b];
+        canonical[r] = ss->prefill_pos[b] == (uint32_t)reqs[first[r]].pos.raw() && !ss->frontier_stale[b];
     }
     pulsar_driver_heads hl = pulsar_driver_heads_span(0, n_dec);
     for (uint32_t r = 0; r < n_pf; r++)
@@ -683,7 +685,7 @@ int pulsar_driver_decode_fused(pulsar_session *s, const pulsar_multiseq_req *req
         return -1;
     }
     for (uint32_t r = 0; r < n_pf; r++) {
-        const uint32_t b = reqs[first[r]].bank, end = (uint32_t)reqs[first[r]].pos + (first[r + 1] - first[r]);
+        const uint32_t b = reqs[first[r]].bank, end = (uint32_t)reqs[first[r]].pos.raw() + (first[r + 1] - first[r]);
         pulsar_state_set_pos(ss, b, end);
         if (canonical[r]) ss->prefill_pos[b] = end;
         if (b == ss->live_bank) {   /* the live bank moved past the host view */

@@ -175,9 +175,9 @@ static uint64_t value_leg_hash(pulsar_engine *e, pulsar_tokens *toks,
         for (int upto = 143; ok && upto <= 146; upto++)
             ok = extend_one(s, &work, upto);
         if (ok) {
-            pulsar_session_rewind(s, 142);
-            ok = pulsar_session_pos(s) == 142;
-            if (!ok) fprintf(stderr, "value leg: rewind landed at %d\n", pulsar_session_pos(s));
+            pulsar_session_rewind(s, TokPos{142});
+            ok = pulsar_session_pos(s).raw() == 142;
+            if (!ok) fprintf(stderr, "value leg: rewind landed at %d\n", pulsar_session_pos(s).raw());
         }
         memcpy(work.v + 142, saved, sizeof(saved));
     }
@@ -241,9 +241,9 @@ static uint64_t r128_leg_hash(pulsar_engine *e, pulsar_tokens *toks,
         for (int upto = 127; ok && upto <= 130; upto++)
             ok = extend_one(s, &work, upto);
         if (ok) {
-            pulsar_session_rewind(s, 126);
-            ok = pulsar_session_pos(s) == 126;
-            if (!ok) fprintf(stderr, "r128 leg: rewind landed at %d\n", pulsar_session_pos(s));
+            pulsar_session_rewind(s, TokPos{126});
+            ok = pulsar_session_pos(s).raw() == 126;
+            if (!ok) fprintf(stderr, "r128 leg: rewind landed at %d\n", pulsar_session_pos(s).raw());
         }
         memcpy(work.v + 126, saved, sizeof(saved));
     }
@@ -290,9 +290,9 @@ int GATE_ENTRY(int argc, char **argv) {
      * boundary.  Unfixed rewind leaves the counters at the old frontier on
      * every boundary cross. */
     for (int pos = top - 1; pos >= top - 8; pos--) {
-        pulsar_session_rewind(s, pos);
-        CHECK(pulsar_session_pos(s) == pos, "rewind: pos %d want %d",
-              pulsar_session_pos(s), pos);
+        pulsar_session_rewind(s, TokPos{pos});
+        CHECK(pulsar_session_pos(s).raw() == pos, "rewind: pos %d want %d",
+              pulsar_session_pos(s).raw(), pos);
         check_frontiers(s, pos, "post-rewind");
     }
 
@@ -308,7 +308,7 @@ int GATE_ENTRY(int argc, char **argv) {
     /* One more boundary-crossing rewind after the continuation, then a
      * second continuation: rewind machinery must stay position-true under
      * repeated cycles, not just once from a fresh prefill. */
-    pulsar_session_rewind(s, cont - 4);
+    pulsar_session_rewind(s, TokPos{cont - 4});
     check_frontiers(s, cont - 4, "second rewind");
     if (!sync_prefix(s, &toks, 260)) goto done;
     check_frontiers(s, 260, "second continuation");
@@ -385,14 +385,14 @@ int GATE_ENTRY(int argc, char **argv) {
         char err[256];
         bool leg_ok = sync_prefix(st, &toks, 200);
         if (leg_ok) {
-            pulsar_session_rewind(st, 190);
+            pulsar_session_rewind(st, TokPos{190});
             const int erc = pulsar_session_eval(st, toks.v[190], err, sizeof(err));
             CHECK(erc != 0, "stale leg: eval after a rewind off the grid did not refuse");
             if (erc != 0) printf("  stale leg: eval refused as required (%s)\n", err);
             leg_ok = sync_prefix(st, &toks, 191);
-            CHECK(leg_ok && pulsar_session_resume_origin(st) == 128,
+            CHECK(leg_ok && pulsar_session_resume_origin(st).raw() == 128,
                   "stale leg: the sync resumed from %d, want the grid checkpoint 128",
-                  pulsar_session_resume_origin(st));
+                  pulsar_session_resume_origin(st).raw());
             CHECK(pulsar_session_eval(st, toks.v[191], err, sizeof(err)) == 0,
                   "stale leg: eval after the restoring sync failed: %s", err);
         }

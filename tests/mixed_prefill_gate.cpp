@@ -46,7 +46,7 @@ static bool decode_cont(pulsar_session *s, int F, int t0, int *out){
     float *lg = (float *)malloc((size_t)vocab*sizeof(float));
     char e[256]; bool ok=true;
     for(int i=1; i<NGEN && ok; i++){
-        pulsar_multiseq_req r={.bank=0,.pos=F+i-1,.token=out[i-1]};
+        pulsar_multiseq_req r={.bank=0,.pos=TokPos{F+i-1},.token=out[i-1]};
         uint32_t nr=0;
         if(pulsar_session_decode_mixed(s,&r,1,lg,vocab,&nr,0u,e,sizeof e)!=0){ fprintf(stderr,"cont step %d: %s\n",i,e); ok=false; break; }
         out[i]=(int)argmax_f32(lg,(uint64_t)vocab);
@@ -85,7 +85,7 @@ static bool mixed_stream(int c0, int K, int *out, double *secs, float *out_lg){
     const int vocab=(int)PULSAR_N_VOCAB;
     float *lg = (float *)malloc((size_t)vocab*sizeof(float));    /* 1 run => 1 logit row */
     pulsar_multiseq_req *rq = (pulsar_multiseq_req *)malloc((size_t)K*sizeof(*rq));
-    for(int j=0;j<K;j++){ rq[j].bank=0; rq[j].pos=c0+j; rq[j].token=g_toks.v[c0+j]; }
+    for(int j=0;j<K;j++){ rq[j].bank=0; rq[j].pos=TokPos{c0+j}; rq[j].token=g_toks.v[c0+j]; }
     uint32_t nr=0;
     double t0=secs?now_s():0.0;
     if(ok && pulsar_session_decode_mixed(s,rq,(uint32_t)K,lg,vocab,&nr,0u,e,sizeof e)!=0){ fprintf(stderr,"mixed K-run: %s\n",e); ok=false; }

@@ -175,7 +175,7 @@ int GATE_ENTRY(int argc, char **argv) {
         for (uint32_t b = 0; ok && b < nb; b++) ok = populate_bank(s, b, toks, (int)P[b], "serial prefix");
         for (uint32_t b = 0; ok && b < nb; b++)
             for (uint32_t k = 0; ok && k < SERIAL_ROWS; k++) {
-                pulsar_multiseq_req q = {b, (int32_t)(P[b] + k), toks[P[b] + k]};
+                pulsar_multiseq_req q = {b, TokPos{P[b] + k}, toks[P[b] + k]};
                 uint32_t got = 0;
                 ok = pulsar_session_decode_mixed(s, &q, 1, serial.data() + ((size_t)b * SERIAL_ROWS + k) * V, V, &got,
                                                  serial_plain ? 0u : PULSAR_MSEQ_HEAD_ALL_ROWS, err, sizeof err) == 0 &&
@@ -189,7 +189,7 @@ int GATE_ENTRY(int argc, char **argv) {
             for (uint32_t b = 0; ok && b < nb; b++) ok = populate_bank(s, b, toks, (int)P[b], "wide prefix");
             pulsar_multiseq_req q[PULSAR_SPEC_LOGITS_ROWS];
             for (uint32_t b = 0; b < nb; b++)
-                for (uint32_t k = 0; k < r; k++) q[b * r + k] = {b, (int32_t)(P[b] + k), toks[P[b] + k]};
+                for (uint32_t k = 0; k < r; k++) q[b * r + k] = {b, TokPos{P[b] + k}, toks[P[b] + k]};
             uint32_t got = 0;
             ok = pulsar_session_decode_mixed(s, q, w, wide.data(), (int)w * V, &got, PULSAR_MSEQ_HEAD_ALL_ROWS, err,
                                              sizeof err) == 0 && got == w;

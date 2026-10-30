@@ -127,11 +127,11 @@ static bool fused_step_logits(int K, uint32_t head_cap, float *dec_rows, float *
     if (ok && (!reqs || !logits)) ok = false;
     if (ok) {
         for (int k = 0; k < g_n_dec; k++) {
-            reqs[k].bank = (uint32_t)k; reqs[k].pos = g_len[k]; reqs[k].token = argtok[k];
+            reqs[k].bank = (uint32_t)k; reqs[k].pos = TokPos{g_len[k]}; reqs[k].token = argtok[k];
         }
         for (int j = 0; j < K; j++) {
             reqs[g_n_dec + j].bank = (uint32_t)g_n_dec;
-            reqs[g_n_dec + j].pos = C0 + j;
+            reqs[g_n_dec + j].pos = TokPos{C0 + j};
             reqs[g_n_dec + j].token = pptr[C0 + j];
         }
         uint32_t n_runs = 0;
@@ -187,7 +187,7 @@ static bool multirun_step_logits(int rpb, int only_bank, float *out) {
             if (only_bank >= 0 && k != only_bank) continue;
             for (int j = 0; j < rpb; j++, r++) {
                 reqs[r].bank = (uint32_t)k;
-                reqs[r].pos = g_len[k] + j;
+                reqs[r].pos = TokPos{g_len[k] + j};
                 reqs[r].token = j == 0 ? argtok[k] : g_toks.v[g_off[k] + j];
             }
         }
@@ -241,7 +241,7 @@ static bool multirun_step_rows(const int *rpb_of, int only_bank, bool reverse, f
             const int rpb = rpb_of[k];
             for (int j = 0; j < rpb; j++, r++) {
                 reqs[r].bank = (uint32_t)k;
-                reqs[r].pos = g_len[k] + j;
+                reqs[r].pos = TokPos{g_len[k] + j};
                 reqs[r].token = j == 0 ? argtok[k] : g_toks.v[g_off[k] + j];
             }
         }

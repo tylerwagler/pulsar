@@ -172,7 +172,7 @@ static bool multi_run(pulsar_session *s, int n, int steps, int **streams, double
         pulsar_multiseq_req reqs[GATE_MAX_N];
         for (int k = 0; k < n; k++) {
             reqs[k].bank = (uint32_t)k;
-            reqs[k].pos = g_prompt_len[k] + (j - 1);
+            reqs[k].pos = TokPos{g_prompt_len[k] + (j - 1)};
             reqs[k].token = streams[k][j - 1];
         }
         const int rc = use_mixed
@@ -248,7 +248,7 @@ static bool check_stale_classic_fails_loud(void) {
         pulsar_multiseq_req reqs[2];
         for (int k = 0; k < 2; k++) {
             reqs[k].bank = (uint32_t)k;
-            reqs[k].pos = g_prompt_len[k];
+            reqs[k].pos = TokPos{g_prompt_len[k]};
             reqs[k].token = last[k];
         }
         const int rc = pulsar_session_decode_multiseq(s, reqs, 2, logits,
@@ -334,11 +334,11 @@ static bool check_all_rows_head_mode(pulsar_session *s) {
         pulsar_multiseq_req reqs[4];
         for (int j = 0; j < 3; j++) {
             reqs[j].bank = 0u;
-            reqs[j].pos = g_prompt_len[0] + j;
+            reqs[j].pos = TokPos{g_prompt_len[0] + j};
             reqs[j].token = g_first_tok[0];
         }
         reqs[3].bank = 1u;
-        reqs[3].pos = g_prompt_len[1];
+        reqs[3].pos = TokPos{g_prompt_len[1]};
         reqs[3].token = g_first_tok[1];
         uint32_t got = 0;
         const int rc = pulsar_session_decode_mixed(s, reqs, 4u,

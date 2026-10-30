@@ -174,8 +174,8 @@ int GATE_ENTRY(int argc, char **argv) {
         CHECK(pulsar_session_sync(s, &pcanon, err, sizeof(err)) == 0,
               "canonical sync failed: %s", err);
         const int want_len = l1 + 24;
-        CHECK(pulsar_session_pos(s) == want_len,
-              "stitched length %d want %d", pulsar_session_pos(s), want_len);
+        CHECK(pulsar_session_pos(s).raw() == want_len,
+              "stitched length %d want %d", pulsar_session_pos(s).raw(), want_len);
         const pulsar_tokens *toks = pulsar_session_tokens(s);
         CHECK(toks && toks->len == want_len, "session tokens len %d want %d",
               toks ? toks->len : -1, want_len);
@@ -242,9 +242,9 @@ int GATE_ENTRY(int argc, char **argv) {
         CHECK(pulsar_session_sync(s, &pecho, err, sizeof(err)) == 0,
               "leg3 echo sync failed: %s", err);
         const int want_len = l1 + newn;
-        CHECK(pulsar_session_pos(s) == want_len,
+        CHECK(pulsar_session_pos(s).raw() == want_len,
               "leg3 stitched length %d want %d (rebuild would give %d)",
-              pulsar_session_pos(s), want_len, c1 + newn);
+              pulsar_session_pos(s).raw(), want_len, c1 + newn);
         const pulsar_tokens *toks = pulsar_session_tokens(s);
         if (toks && toks->len == want_len) {
             CHECK(toks->v[k] == split.v[0] && toks->v[k + 1] == split.v[1],
@@ -286,9 +286,9 @@ int GATE_ENTRY(int argc, char **argv) {
         for (int i = 0; i < 8 && canon.len > n + i; i++)            /* the bank answers it */
             CHECK(pulsar_session_eval(s, canon.v[n + i], err, sizeof(err)) == 0,
                   "leg5 eval %d failed: %s", i, err);
-        CHECK(pulsar_session_pos(s) > n, "leg5 bank did not advance past the prompt");
+        CHECK(pulsar_session_pos(s).raw() > n, "leg5 bank did not advance past the prompt");
         CHECK(pulsar_session_sync(s, &pp, err, sizeof(err)) == 0, "leg5 re-sync failed: %s", err);
-        CHECK(pulsar_session_pos(s) == n, "leg5 re-sync ended at %d want %d", pulsar_session_pos(s), n);
+        CHECK(pulsar_session_pos(s).raw() == n, "leg5 re-sync ended at %d want %d", pulsar_session_pos(s).raw(), n);
         CHECK(pulsar_session_sync(cold, &pp, err, sizeof(err)) == 0, "leg5 cold sync failed: %s", err);
         const int width = pulsar_engine_logits_width(e);
         float *got = (float *)malloc((size_t)width * sizeof(float));

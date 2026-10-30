@@ -146,7 +146,7 @@ int main(int argc, char **argv) {
         }
         for (int i = 0; ok && i < 6; i++) ok = pulsar_session_eval(s, pulsar_session_argmax(s), err, sizeof err) == 0;
         CHECK(ok, "4 decode steps, %d tokens speculated in %d rounds, 6 plain steps: frontier %d %s", got, rounds,
-              pulsar_session_pos(s), err);
+              pulsar_session_pos(s).raw(), err);
         const std::string fp_ = dir + "/l280-payload.bin";
         FILE *pf = ok ? fopen(fp_.c_str(), "wb") : NULL;
         const uint64_t pb = ok ? pulsar_session_payload_bytes(s) : 0;
@@ -155,13 +155,13 @@ int main(int argc, char **argv) {
         const long wrote = pf ? ftell(pf) : 0;
         if (pf) fclose(pf);
         CHECK(ok && (uint64_t)wrote == pb, "PAYLOAD saved at %d: %.2f GiB (payload_bytes %.2f GiB) in %.1f s %s",
-              pulsar_session_pos(s), wrote / 1073741824.0, pb / 1073741824.0, now_s() - t1, err);
+              pulsar_session_pos(s).raw(), wrote / 1073741824.0, pb / 1073741824.0, now_s() - t1, err);
         pf = ok ? fopen(fp_.c_str(), "rb") : NULL;
         const double t2 = now_s();
         ok = ok && pf && pulsar_session_create(&x, e, ctx) == 0 &&
-             pulsar_session_load_payload(x, pf, pb, err, sizeof err) == 0 && pulsar_session_pos(x) == pulsar_session_pos(s);
+             pulsar_session_load_payload(x, pf, pb, err, sizeof err) == 0 && pulsar_session_pos(x).raw() == pulsar_session_pos(s).raw();
         if (pf) fclose(pf);
-        CHECK(ok, "PAYLOAD loaded into a fresh session at %d in %.1f s %s", x ? pulsar_session_pos(x) : -1,
+        CHECK(ok, "PAYLOAD loaded into a fresh session at %d in %.1f s %s", x ? pulsar_session_pos(x).raw() : -1,
               now_s() - t2, err);
         int diff_rows = 0;
         for (int i = 0; ok && i < 8; i++) {
@@ -222,19 +222,19 @@ int main(int argc, char **argv) {
         bool ok = grid_ok && k < D && pulsar_session_sync(s, &Pk, err, sizeof err) == 0 &&
                   pulsar_session_sync(s, &P, err, sizeof err) == 0;
         const double t1 = now_s();
-        Gk = ok ? pulsar_session_checkpoint_best(s, k) : 0;
-        GD = ok ? pulsar_session_checkpoint_best(s, D) : 0;
+        Gk = ok ? pulsar_session_checkpoint_best(s, TokPos{k}).raw() : 0;
+        GD = ok ? pulsar_session_checkpoint_best(s, TokPos{D}).raw() : 0;
         /* which checkpoints survive is the ladder's call (checkpoint.cpp: Qwen keeps 2 slots), so the chain is cut
          * at whichever grid checkpoint below k the session kept -- the last one must be D's grid point */
         CHECK(ok && Gk > 0 && Gk % (int)grid == 0 && GD == D / (int)grid * (int)grid,
               "C1 sync(P[0:%d]) then sync(P[0:%d]): %.1f s; checkpoints kept at %d and %d %s", k, D, t1 - t0, Gk, GD,
               err);
         FILE *a = ok ? fopen(f1.c_str(), "wb") : NULL, *b = ok ? fopen(f2.c_str(), "wb") : NULL;
-        b1 = ok ? pulsar_session_segment_bytes(s, 0, Gk, NULL) : 0;
-        b2 = ok ? pulsar_session_segment_bytes(s, Gk, GD, NULL) : 0;
+        b1 = ok ? pulsar_session_segment_bytes(s, TokPos{0}, TokPos{Gk}, NULL) : 0;
+        b2 = ok ? pulsar_session_segment_bytes(s, TokPos{Gk}, TokPos{GD}, NULL) : 0;
         const double t2 = now_s();
-        ok = ok && a && b && pulsar_session_save_segment(s, a, 0, Gk, NULL, err, sizeof err) == 0 &&
-             pulsar_session_save_segment(s, b, Gk, GD, NULL, err, sizeof err) == 0;
+        ok = ok && a && b && pulsar_session_save_segment(s, a, TokPos{0}, TokPos{Gk}, NULL, err, sizeof err) == 0 &&
+             pulsar_session_save_segment(s, b, TokPos{Gk}, TokPos{GD}, NULL, err, sizeof err) == 0;
         if (a) fclose(a);
         if (b) fclose(b);
         CHECK(ok, "C4 saved [0, %d) %.2f GiB and [%d, %d) %.2f GiB in %.1f s %s", Gk, b1 / 1073741824.0, Gk, GD,
@@ -253,14 +253,15 @@ int main(int argc, char **argv) {
         pulsar_session *s = NULL, *x = NULL;
         pulsar_tokens P = {(int *)ids.data(), D, D};
         FILE *a = fopen(f1.c_str(), "rb"), *b = fopen(f2.c_str(), "rb");
-        int g1 = 0, g2 = 0;
+        TokPos g1{0}, g2{0};
         const double t0 = now_s();
         bool ok = a && b && pulsar_session_create(&s, e, ctx) == 0 &&
                   pulsar_session_load_segment(s, a, b1, false, &g1, NULL, err, sizeof err) == 0 &&
                   pulsar_session_load_segment(s, b, b2, true, &g2, NULL, err, sizeof err) == 0;
         if (a) fclose(a);
         if (b) fclose(b);
-        CHECK(ok && g1 == Gk && g2 == GD, "C4 a fresh session loaded the chain to %d in %.1f s %s", g2, now_s() - t0, err);
+        CHECK(ok && g1.raw() == Gk && g2.raw() == GD, "C4 a fresh session loaded the chain to %d in %.1f s %s", g2.raw(),
+              now_s() - t0, err);
         std::vector<std::vector<float>> got;
         ok = ok && pulsar_session_sync(s, &P, err, sizeof err) == 0 && after_sync(s, next, W, &got, err, sizeof err);
         double worst = 0;
@@ -302,12 +303,12 @@ int main(int argc, char **argv) {
         const long wrote = pf ? ftell(pf) : 0;
         if (pf) fclose(pf);
         CHECK(ok && (uint64_t)wrote == pb, "PAYLOAD saved at %d: %.2f GiB (payload_bytes %.2f GiB) in %.1f s %s",
-              pulsar_session_pos(s), wrote / 1073741824.0, pb / 1073741824.0, now_s() - t1, err);
+              pulsar_session_pos(s).raw(), wrote / 1073741824.0, pb / 1073741824.0, now_s() - t1, err);
         pf = ok ? fopen(fp_.c_str(), "rb") : NULL;
         ok = ok && pf && pulsar_session_create(&x, e, ctx) == 0 &&
-             pulsar_session_load_payload(x, pf, pb, err, sizeof err) == 0 && pulsar_session_pos(x) == pulsar_session_pos(s);
+             pulsar_session_load_payload(x, pf, pb, err, sizeof err) == 0 && pulsar_session_pos(x).raw() == pulsar_session_pos(s).raw();
         if (pf) fclose(pf);
-        CHECK(ok, "PAYLOAD loaded into a fresh session at %d %s", x ? pulsar_session_pos(x) : -1, err);
+        CHECK(ok, "PAYLOAD loaded into a fresh session at %d %s", x ? pulsar_session_pos(x).raw() : -1, err);
         int diff_rows = 0;
         for (int i = 0; ok && i < 8; i++) {
             const std::vector<float> ls = logits_of(s, W), lx = logits_of(x, W);

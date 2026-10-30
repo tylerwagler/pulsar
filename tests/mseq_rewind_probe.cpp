@@ -95,17 +95,17 @@ int GATE_ENTRY(int argc, char **argv) {
         fprintf(stderr, "sync failed: %s\n", err);
         pulsar_session_free(s); gate_engine_close(e); return 2;
     }
-    show(s, "after prefill(600)", pulsar_session_pos(s));
+    show(s, "after prefill(600)", pulsar_session_pos(s).raw());
 
     /* mimic admission: publish the prefilled frontier into bank 0 */
     pulsar_session_bank_state_save(s, 0u);
-    show(s, "after bank_state_save(0)", pulsar_session_pos(s));
+    show(s, "after bank_state_save(0)", pulsar_session_pos(s).raw());
 
     float *logits = (float *)malloc(sizeof(float) * (size_t)PULSAR_N_VOCAB);
     /* round 1: decode 6 rows through the SERVED entry, one row on bank 0 */
     for (int k = 0; k < 6; k++) {
         pulsar_multiseq_req req;
-        req.bank = 0u; req.pos = (int32_t)pulsar_session_pos(s); req.token = toks[600 + k];
+        req.bank = 0u; req.pos =TokPos{ pulsar_session_pos(s)}; req.token = toks[600 + k];
         uint32_t got = 0;
         const int rc = pulsar_session_decode_mixed(s, &req, 1u, logits,
                                                    (int)PULSAR_N_VOCAB, &got, 0u,
@@ -116,11 +116,11 @@ int GATE_ENTRY(int argc, char **argv) {
         }
         pulsar_session_note_committed_tokens(s, &toks[600 + k], 1);
     }
-    show(s, "after mseq round 1 (6 rows)", pulsar_session_pos(s));
+    show(s, "after mseq round 1 (6 rows)", pulsar_session_pos(s).raw());
 
     /* ghost rewind, exactly as the server does when emission stops mid-batch */
-    const int target = pulsar_session_pos(s) - 3;
-    pulsar_session_rewind(s, target);
+    const int target = pulsar_session_pos(s).raw() - 3;
+    pulsar_session_rewind(s, TokPos{target});
     show(s, "after rewind (single live slot)", target);
     /* THE ASSERTION: both representations clamped, for every compressing layer. */
     {
@@ -147,7 +147,7 @@ int GATE_ENTRY(int argc, char **argv) {
      * step must REFUSE rather than pool a wrong row: before L264 it was
      * accepted against a lane the projection ring may or may not have rebuilt. */
     pulsar_multiseq_req req2;
-    req2.bank = 0u; req2.pos = (int32_t)pulsar_session_pos(s); req2.token = toks[700];
+    req2.bank = 0u; req2.pos =TokPos{ pulsar_session_pos(s)}; req2.token = toks[700];
     uint32_t got2 = 0;
     const int rc2 = pulsar_session_decode_mixed(s, &req2, 1u, logits,
                                                 (int)PULSAR_N_VOCAB, &got2, 0u,
@@ -169,13 +169,13 @@ int GATE_ENTRY(int argc, char **argv) {
         q.v = toks; q.len = q.cap = target + 1;
         const int src = pulsar_session_sync(s, &q, err, sizeof err);
         CHECK(src == 0, "the restoring sync failed: %s", src != 0 ? err : "");
-        CHECK(pulsar_session_resume_origin(s) == 512,
+        CHECK(pulsar_session_resume_origin(s).raw() == 512,
               "the restoring sync resumed from %d, want the grid checkpoint 512",
-              pulsar_session_resume_origin(s));
-        show(s, "after the restoring sync", pulsar_session_pos(s));
+              pulsar_session_resume_origin(s).raw());
+        show(s, "after the restoring sync", pulsar_session_pos(s).raw());
         pulsar_session_bank_state_save(s, 0u);
         pulsar_multiseq_req req3;
-        req3.bank = 0u; req3.pos = (int32_t)pulsar_session_pos(s); req3.token = toks[701];
+        req3.bank = 0u; req3.pos =TokPos{ pulsar_session_pos(s)}; req3.token = toks[701];
         uint32_t got3 = 0;
         const int rc3 = pulsar_session_decode_mixed(s, &req3, 1u, logits,
                                                     (int)PULSAR_N_VOCAB, &got3, 0u,

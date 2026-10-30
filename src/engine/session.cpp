@@ -1411,7 +1411,7 @@ void pulsar_tokens_prefix_match_with(pulsar_token_text_fn text, void *ud,
                                      const int *a, int a_len,
                                      const int *b, int b_len,
                                      pulsar_prefix_match *out) {
-    out->live_cut = LiveToks{0};
+    out->live_cut = TokCount{0};
     out->prompt_cut = PromptToks{0};
     out->seamed = false;
     if (!text || !a || !b) return;
@@ -1449,7 +1449,7 @@ void pulsar_tokens_prefix_match_with(pulsar_token_text_fn text, void *ud,
 done:
     free(ta);
     free(tb);
-    out->live_cut = LiveToks{best_i};
+    out->live_cut = TokCount{best_i};
     out->prompt_cut = PromptToks{best_j};
     out->seamed = seamed;
 }
@@ -1464,7 +1464,7 @@ void pulsar_tokens_prefix_match(pulsar_engine *e,
                                 const int *b, int b_len,
                                 pulsar_prefix_match *out) {
     if (!e) {
-        out->live_cut = LiveToks{0};
+        out->live_cut = TokCount{0};
         out->prompt_cut = PromptToks{0};
         out->seamed = false;
         return;
@@ -1476,11 +1476,11 @@ void pulsar_tokens_prefix_match(pulsar_engine *e,
  * `at` -- the prompt-side position when `at` is one.  Past it (a re-spelled stretch the walk did not close before
  * `at`) the request's tokens are counted while each is byte-equal to the live bytes that follow and ends at or before
  * `at`'s byte; a control token (no text) or a differing byte stops the count. */
-PromptToks pulsar_tokens_prompt_held_with(pulsar_token_text_fn text, void *ud, const int *live, LiveToks at,
+PromptToks pulsar_tokens_prompt_held_with(pulsar_token_text_fn text, void *ud, const int *live, TokPos at,
                                           const int *prompt, int prompt_len) {
     pulsar_prefix_match m;
     pulsar_tokens_prefix_match_with(text, ud, live, at.raw(), prompt, prompt_len, &m);
-    if (m.live_cut == at) return m.prompt_cut;
+    if (TokPos::after(m.live_cut) == at) return m.prompt_cut;
     std::string bytes;   /* live[m.live_cut, at) */
     for (int i = m.live_cut.raw(); i < at.raw(); i++) {
         size_t n = 0;
@@ -1505,7 +1505,7 @@ PromptToks pulsar_tokens_prompt_held_with(pulsar_token_text_fn text, void *ud, c
 void pulsar_session::prefix_match(const pulsar_tokens *prompt,
                                  pulsar_prefix_match *out) {
     auto *s = this;
-    out->live_cut = LiveToks{0};
+    out->live_cut = TokCount{0};
     out->prompt_cut = PromptToks{0};
     out->seamed = false;
     if (!s->checkpoint_valid || !prompt) return;
@@ -1628,10 +1628,10 @@ int pulsar_session::ctx() {
 }
 
 
-int pulsar_session_resume_origin(pulsar_session *s) { return s->resume_origin; }
+TokPos pulsar_session_resume_origin(pulsar_session *s) { return TokPos{s->resume_origin}; }   /* -1 enters as none() */
 
-int pulsar_session_prefill_cap(pulsar_session *s) {
-    return s ? (int)s->prefill_cap : 0;
+TokCount pulsar_session_prefill_cap(pulsar_session *s) {
+    return TokCount{s ? (int)s->prefill_cap : 0};
 }
 
 

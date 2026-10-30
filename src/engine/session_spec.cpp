@@ -1156,7 +1156,7 @@ uint32_t pulsar_spec_round_n_rows(const pulsar_spec_round *r) {
 uint32_t pulsar_spec_round_fill_reqs(const pulsar_spec_round *r, uint32_t bank, pulsar_multiseq_req *out) {
     for (uint32_t i = 0; i < r->n_batch; i++) {
         out[i].bank = bank;
-        out[i].pos = r->saved_len + (int32_t)i;
+        out[i].pos = TokPos{r->saved_len + (int32_t)i};   /* L334: the round's body stays raw (P2b) */
         out[i].token = i == 0 ? (int)r->base : (int)r->pend[i - 1];
     }
     return r->n_batch;
@@ -1376,8 +1376,8 @@ void pulsar_session_spec_round_end_batch_local(pulsar_session *s, pulsar_spec_st
     for (int i = 0; i < n; i++) {
         pulsar_spec_step *st = &steps[i];
         spec_step_reset(st);
-        st->pos_before = pulsar_spec_round_saved_len(st->round);
-        st->pos_after = -1;
+        st->pos_before = TokPos{pulsar_spec_round_saved_len(st->round)};
+        st->pos_after = TokPos::none();   /* until the round ends */
         if (!spec_bank_restore(s, st->bank)) {
             st->status = PULSAR_SPEC_STEP_RESTORE_FAILED;
             continue;
@@ -1393,7 +1393,7 @@ void pulsar_session_spec_round_end_batch_local(pulsar_session *s, pulsar_spec_st
                                        st->accepted, st->accepted_cap, st->err, sizeof st->err);
         if (na < 0) st->status = PULSAR_SPEC_STEP_FAILED;
         else st->n_accepted = na;
-        st->pos_after = s->pos();
+        st->pos_after = TokPos{s->pos()};
         spec_bank_save(s, st->bank);
     }
     if (!s->seed_defer.active) return;
@@ -1451,7 +1451,7 @@ int pulsar_spec_steps_verdict(pulsar_spec_phase phase, const pulsar_spec_step *s
             h = spec_fp(h, st->row0);
             h = spec_fp(h, st->n_rows);
         } else if (phase == PULSAR_SPEC_PHASE_ROUND_END) {
-            h = spec_fp(h, (uint32_t)st->pos_after);
+            h = spec_fp(h, (uint32_t)st->pos_after.raw());
             h = spec_fp(h, (uint32_t)st->n_accepted);
             for (int t = 0; t < st->n_accepted; t++) h = spec_fp(h, (uint32_t)st->accepted[t]);
         }
