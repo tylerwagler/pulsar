@@ -395,7 +395,7 @@ ATTN_GATE_ARCH ?= sm_120f
 # Modelless, single-TU investigations that answer one question each.  Several
 # are cited from SHIPPED source as the provenance for a kernel's layout
 # (pulsar_cuda_attn_f16.cu -> attn_mma_probe, pulsar_cuda_indexer_mxfp4.cu and
-# docs/indexer-mxfp4-scorer.md -> idx_mxfp4_probe, docs/engine-perf-map.md ->
+# docs/history/indexer-mxfp4-scorer.md -> idx_mxfp4_probe, docs/history/engine-perf-map.md ->
 # idx_mma_issue_bench), so they are documentation with a compiler attached.
 #
 # They had NO targets until now, which is exactly how two of them rotted in
@@ -3687,12 +3687,12 @@ tp-tinybuf-test: tests/tp_transport_test tests/tp_wide_test
 
 # TP GPU-slab gate probe (bring-up step 4): nvcc-built so it can run on the
 # pair.  Compile-checked here (no GPU to run); run on the GB10 pair per
-# docs/tensor-parallel-bringup.md.
+# docs/history/tensor-parallel-bringup.md.
 tests/tp_slab_gpu_probe: tests/tp_slab_gpu_probe.cpp src/tp/pulsar_tp.cpp src/tp/pulsar_tp.h src/tp/pulsar_tp_gpu.cpp src/tp/pulsar_tp_gpu.h
 	$(NVCC) $(NVCCFLAGS) -Isrc -o $@ tests/tp_slab_gpu_probe.cpp src/tp/pulsar_tp.cpp src/tp/pulsar_tp_gpu.cpp $(CUDA_LDLIBS)
 
 tp-slab-probe: tests/tp_slab_gpu_probe
-	@echo "built tests/tp_slab_gpu_probe; run on the pair per docs/tensor-parallel-bringup.md"
+	@echo "built tests/tp_slab_gpu_probe; run on the pair per docs/history/tensor-parallel-bringup.md"
 
 # TP GPUDirect capability probe (slab-class verdict): the full dma-buf GDR
 # sequence -- VMM pinned alloc, CUDA-13 GPURDMA flag, export-to-posix-fd,

@@ -1,9 +1,11 @@
-# DS4 Imatrix Calibration Dataset
+# Imatrix calibration dataset
 
-This directory contains DS4-rendered chat prompts for collecting activation
+This directory contains DeepSeek-rendered chat prompts for collecting activation
 statistics before building new low-bit checkpoints.
 
-Run:
+The tracked files are the dataset.  The generator still names the upstream ds4
+source files this tree no longer has (and skips missing files silently), so
+re-running it does not reproduce them:
 
 ```sh
 python3 tools/imatrix/dataset/build_ds4_imatrix_dataset.py
@@ -28,7 +30,7 @@ Some records include DSML tool schemas, sampled DSML tool calls, and tool-result
 turns so the imatrix sees the same special-token patterns used by agent clients.
 The corpus is provider-neutral and also includes language/prose rewriting,
 summarization, copy-editing, extraction, multilingual translation, programming
-prompts, Bash scripting, algorithm recall, `ds4-eval` benchmark-reasoning
+prompts, Bash scripting, algorithm recall, `pulsar-eval` benchmark-reasoning
 prompts, long-context code synthesis, agent transcript replay, log diagnosis,
 prose fact recovery, delayed-constraint and small needle tasks, CUDA/C code
 review tasks, and inference-specific debugging tasks.

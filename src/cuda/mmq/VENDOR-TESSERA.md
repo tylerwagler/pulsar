@@ -11,7 +11,7 @@ dense rates 9-14; the piece-major E4M3 layout; the paired-K32 schedule), the val
 family's `Params` gained `piece_major`, `fixup`, `tile_sem`, `roles` (all zero here:
 pulsar never requests piece-major and launches no multi-role dense), and `table0/1`
 became `const void*`.  Byte parity with Tessera's own build at this revision:
-**17/17 byte-identical** (sparky, 2026-10-08, fixtures regenerated at 37742e0f; the
+**17/17 byte-identical** (GB10, 2026-10-08, fixtures regenerated at 37742e0f; the
 1381c3b7 gate was 17/17 too, and the new fixtures' outputs and planes equal the old
 ones byte for byte -- only the tables' dtype tag moved, int16 -> bf16). Tessera is
 licensed **MIT + Attribution Addendum 1.0** (`LicenseRef-Tessera-Attribution-1.0`);
@@ -23,7 +23,7 @@ requires it to travel with every copy).
 - **A2**: any model or artifact we publish, distribute or offer as a service
   that is *built or served with* this kernel must say, in its model card or
   README: `Made with Tessera by Robert Tand - https://github.com/RobTand/tessera`.
-  That includes the Elytron API if it serves a Tessera-format model.
+  That includes any hosted API that serves a Tessera-format model.
 - **A3/A4**: keep `LICENSE-TESSERA` and the copyright notice with the code; never
   present it as ours. The three pulsar files that touch it carry the credit line.
 - **A5**: "Tessera" names Rob's project only, never a pulsar product or lane.
@@ -64,7 +64,8 @@ so the device code stays upstream's byte for byte.  Re-check at each re-sync.
 ## The gate
 
 `make tessera-kernel-gate` runs `tests/tessera_kernel_gate` on each of
-`TESSERA_FIXTURES` (the Makefile names the two the bar counts), fixtures from
+`TESSERA_FIXTURES` (the Makefile names the two the bar counts; they are not in
+the repo, so set the variable to where yours live), fixtures from
 `tools/tessera/kernel_fixture.py`, which runs **Tessera's
 own build** of this kernel (its torch extension) on Qwen3.8-Flash-Next layer-12
 weights. The gate passes only when every output byte matches and pulsar's

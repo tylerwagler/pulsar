@@ -1,3 +1,5 @@
+> **Historical, not maintained** (moved to docs/history/ on 2026-10-30): the L264 grid-checkpoint / segment-chain test kit for a TP pair, about 2026-10-04 (was tools/tp2-l264/README.md; the scripts stay there). The code at the tip of `dev` is the authority.
+
 # L264 on the TP2 pair: test kit
 
 L264 replaced the KV snapshot machinery with **grid checkpoints** (a resume restores the deepest
@@ -8,8 +10,8 @@ and any disagreement is a *miss* on every rank, never a divergence. Drops and a 
 reconcile keep the copies in step. This is **protocol v23**: an L264 build pairs only with an
 L264 build.
 
-Hosts: head (rank 0) `ca1070wk30008` (TP wire 192.168.9.13); worker (rank 1) `ca1070wk30007`
-(192.168.9.12). Launch recipe as `notes/l260/scripts/run-build.sh`: worker first, `mlx5_3` and
+Hosts: head (rank 0) `pair-b` (TP wire [IP]); worker (rank 1) `pair-a`
+([IP]). Launch recipe as `<private-notes>/l260/scripts/run-build.sh`: worker first, `mlx5_3` and
 the second rail `mlx5_1` on both.
 
 ## 1. Build the same tree on both nodes

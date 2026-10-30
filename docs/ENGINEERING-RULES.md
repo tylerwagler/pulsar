@@ -5,9 +5,9 @@ rule book that came out of L158, the day a routine cleanup found the drafter
 had been multiplying f32 activations for the whole A8 campaign while every
 gate stayed green.  Every rule below is here because its absence cost real
 time on this engine; the evidence is cited so the rule can be argued with,
-not just obeyed.  The goal these rules serve has not changed: serve
-DeepSeek-V4-Flash correctly and as fast as GB10 allows, with the smallest
-tree that does it.
+not just obeyed.  The goal these rules serve has not changed: serve every
+model family the engine carries correctly and as fast as GB10 allows, with
+the smallest tree that does it.
 
 These rules bind every change on `dev`, by anyone, including Claude.  A
 change that needs an exception says so in its commit message and the ledger
@@ -49,7 +49,8 @@ builds were piped through `grep error`.
 -Wextra`, nvcc `#177-D`/`#550-D`); a landing with a new warning is not a
 landing.  Read the whole build log, never `| grep error`.  `nm` is blind to
 statics, types and macros -- delete by reading the callers, and grep the
-macro set when retiring a header (see [feature-macros-die-silently]).
+macro set when retiring a header (a feature macro nothing defines any more
+silently compiles every `#if` it guards to the off arm).
 
 ## 3. Producers emit; consumers never convert.
 
@@ -85,7 +86,7 @@ meant).
 
 *How enforced:* replace the copy with a call or a shared constant; where a
 runtime invariant must hold between two places, assert it in code once
-(`ft_layouts_match`, the static_asserts on the caps), never in a comment.
+(the static_asserts on the caps), never in a comment.
 
 ## 5. An instrument proves it ran the lane.
 
@@ -160,8 +161,9 @@ are labelled as such.
 *Why:* L151-C won 1.4x at 16 rows and lost 4-10% in production; the nt
 kernels' "580 GB/s" was an L2 artefact.
 
-*How enforced:* `prod-ab2.sh` at 1/2/3 clients + drafter-off is the
-throughput oracle for any dense-step change; the sweep tool arms the slot.
+*How enforced:* a served A/B at 1/2/3 clients + drafter-off is the
+throughput oracle for any dense-step change (`tools/serve-bench/scoreboard.sh`
+measures the served lane); the sweep tool arms the slot.
 
 ## 9. Fail closed, loudly, once.
 
@@ -173,7 +175,7 @@ battery reports.
 
 ## 10. Landing discipline.
 
-Every landing: the gate tier its paths call for (below) on sparky at an
+Every landing: the gate tier its paths call for (below) on the GB10 at an
 asserted sha and clean tree, zero build warnings, doxygen zero warnings, the
 unit suite (in the battery since L158), and the ledger row updated in the same
 session.  Byte-exact or graded (rule 7).  Production A/B when the change
@@ -215,13 +217,15 @@ scripts and the router's fork paths are deleted.  The instrument that says so
 is `cuda-chunk-neutrality-gate` (schedules L, M, N: restored resumes
 byte-identical to cold).
 
-1. **`PULSAR_CUDA_PREFILL_CHUNK`** (`src/engine/layers.cpp:22-29`): a test
+1. **`PULSAR_CUDA_PREFILL_CHUNK`** (read by the prefill chunk-cap helper at
+   the top of `src/engine/layers.cpp`): a test
    knob for the prefill chunk width.  Chunk width changes GEMM shapes and so
    cuBLASLt's algorithm choice; a prompt prefilled at chunk 1024 and at chunk
    4096 does not produce the same KV bytes.  *Instrument:* the prefill byte
    gate (`tests/prefill_bitexact_gate.cpp`, `make cuda-prefill-gate`) pins
-   its depths -- 512, 2048, 4096, 4102, 6144 -- at the default chunk of
-   4096; a run with the knob set is not a byte-gate run and says so.
+   its depths -- 512, 2048, 4096, 4102, 6144, 8196, 16388 (`g_prefill_depths`)
+   -- at the default chunk of 4096; a run with the knob set is not a byte-gate
+   run and says so.
 
 2. **`--spec-tau` / `PULSAR_SPEC_TAU`** (the engine's `spec_tau`, read in
    `src/engine/session.cpp` and resolved by `pulsar_spec_tau`; each drafter's

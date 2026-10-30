@@ -6,7 +6,7 @@
 #
 #   tools/tp2-l266/run.sh /home/tyler.wagler.local/pulsar-l266
 #
-# See tools/tp2-l266/README.md for what each step proves.  Every step logs to $OUT; the last lines are the
+# See docs/history/tp2-l266-README.md for what each step proves.  Every step logs to $OUT; the last lines are the
 # verdict.  The pair plumbing is tools/tp2/lib.sh (shared with tp2-l264).
 set -u
 D=${1:?usage: run.sh <build dir, same path on both nodes>}

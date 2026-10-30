@@ -6,7 +6,7 @@
 #
 #   tools/tp2-l264/run.sh /home/tyler.wagler.local/pulsar-l264
 #
-# See tools/tp2-l264/README.md for what each step proves and how to read a
+# See docs/history/tp2-l264-README.md for what each step proves and how to read a
 # failure.  Every step logs to $OUT; the last lines are the verdict.
 set -u
 D=${1:?usage: run.sh <build dir, same path on both nodes>}

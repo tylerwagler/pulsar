@@ -8,28 +8,43 @@ builder is pure Python (numpy for the codecs) and runs anywhere the checkpoints
 are mounted; it never needs a GPU.
 
 The container's tensor names are the HF checkpoint's names.  The engine reads
-exactly three metadata keys (`src/engine/safetensors.cpp`): `pulsar.kv`
+four metadata keys (`src/engine/safetensors.cpp`): `pulsar.kv`
 (the model hyper-parameters and the tokenizer, on the first shard),
-`pulsar.tensors` (per dense tensor: `layout`, `dims_ne`, `gguf_name`) and
-`pulsar.experts` (per routed-expert stack: layout, `expert_bytes`, count).
-It binds tensors by `gguf_name`.
+`pulsar.kv_arch` (the architecture keys, on every shard, checked against the
+first shard's copy), `pulsar.tensors` (per dense tensor: `layout`, `dims_ne`,
+`gguf_name`) and `pulsar.experts` (per routed-expert stack: layout,
+`expert_bytes`, count).  It binds tensors by `gguf_name` (a historical
+spelling of the engine's binding name; nothing GGUF is read).
+
+Families (`build.FAMILIES`, by the checkpoint's `model_type`): DeepSeek V4
+Flash / Vision-Exp and V4.1 (`deepseek.py`), Qwen3.8-Flash-Next (`qwen.py`,
+`qwen4_exp`), Inkling (`inkling.py`), Nemotron-H / Nemotron 3.5 Super
+(`nemotron_h.py`), the Nemotron-3.5 Embed / Rerank encoders
+(`nemotron_enc.py`) and Nemotron-3.5 Parse (`nemotron_parse.py`).  Every
+family but DeepSeek takes its recipe from
+[tools/container/format-maps/](../tools/container/format-maps/README.md).
 
 ## Inputs
 
 | input | what it supplies |
 |---|---|
 | `--hf DIR` | the HF checkpoint (source `hf`): `config.json`, the shards, the tokenizer files.  Every dense tensor, the tower, the drafter, and the routed experts a recipe row reads from it (DeepSeek: the QAT FP4 source, I8 nibbles + E8M0 scale). |
-| `--recipe JSON` | a `pulsar.recipe.v1` (`tools/container/recipe.py`): every emitted tensor's format and source, by ROLE (optionally a block and a layer set) or by HF-name pattern; exactly one row per tensor, no dead rows.  Qwen: required (`format-maps/qwen38fn-*.json`).  DeepSeek: optional; the default is generated from `policy.py` and the EXL3 source (`build.py recipe` prints it -- edit it to choose layers, e.g. what `--exl3-layers 5,18-22` used to select). |
+| `--recipe JSON` | a `pulsar.recipe.v1` (`tools/container/recipe.py`): every emitted tensor's format and source, by ROLE (optionally a block and a layer set) or by HF-name pattern; exactly one row per tensor, no dead rows.  Required for every family but DeepSeek (`format-maps/*.json`).  DeepSeek: optional; the default is generated from `policy.py` and the EXL3 source (`build.py recipe` prints it -- edit it to choose which layers take EXL3 experts). |
 | `--exl3 DIR` | an exllamav3 EXL3 checkpoint (source `exl3`; MIT; the MiaAI V4.1 quantization is public).  DeepSeek's default recipe takes the routed experts of every main layer it holds (`layers.N.ffn.experts.E.{w1,w2,w3}.{trellis,suh,svh}`) at the rate the trellis holds; a recipe row may also name the drafter's (`block: mtp`).  The rate is the recipe's, the source must match, and the engine arm the role runs must read it (`exl3_rates.admit` == `exl3_arm_has_rate`). |
 | `--exl3-experts DIR` | a second exllamav3 checkpoint (source `exl3_experts`; the default source of a routed expert's EXL3 rows when given). |
-| `--tessera DIR` | a Tessera bundle (source `tessera`; `<stack>.pt` unit-blob files).  The format and the producer-table slot exist; the producer lands with L255 and refuses by name until then. |
+| `--tessera DIR` | a Tessera bundle (source `tessera`; `<stack>.pt` unit-blob files).  The format and the producer-table slot exist; the producer is not on dev and refuses by name. |
+| `--drafter KIND DIR` | a separate block-drafter checkpoint written into the container as shard `drafter` (`drafters.py`): `lilicorr` on Nemotron-H (NVIDIA's LiLiCorr, ModelOpt NVFP4), `dflash2` on Qwen3.8-Flash-Next (z-lab's DFlash2, BF16). |
+| `--ple-rows MANIFEST` | Qwen3.8-Flash-Next: the PLE n-gram row file's manifest (`tools/container/ple_rows.py build`).  The row file (~102 GB) is served from local NVMe beside the container. |
+| `--layers L,L,...` | DeepSeek: a layer-subset fixture keeping these source layers, renumbered densely (test fixtures). |
+| `--engram-layout JSON` | DeepSeek V4.1: the Engram hash layout (`tools/engram/engram_layout.py`). |
+| `--reap-map JSON` | a REAP expert-survivor map written into `pulsar.kv`. |
 | `--mxfp8-scale rederive\|verbatim` | how an FP8 dense weight's per-32 E8M0 scale is formed: `rederive` (per-32 amax; byte-identical to the archived C codec and to the served Vision-Exp artifact) or `verbatim` (the source's 128-block scale broadcast).  Default `rederive`. |
 | `--tokenizer DIR` | tokenizer files if not beside the checkpoint. |
 
 ## Commands
 
 ```
-PY=/home/claude/Projects/AI/prismaquant/.venv/bin/python     # any python with numpy
+PY=python3                                                   # any python with numpy
 $PY tools/container/build.py recipe --hf $HF [--exl3 $EXL3] [--recipe R]           # the pulsar.recipe.v1 the build runs (DeepSeek: the generated default)
 $PY tools/container/build.py plan   --hf $HF [--exl3 $EXL3] [--dump F]             # seconds: shards, per-shard layout census, total bytes;
                                                                                    #  --dump: every header + source descriptor (the byte-identity instrument)
@@ -42,7 +57,7 @@ $PY tools/container/build.py audit  --out $DIR                                  
 read, every entry is copied (native spans, EXL3 ranges) or produced straight
 into the file, and `--all` writes `model.safetensors.index.json` at the end.
 Emitting one shard at a time and moving it (`rsync` over ssh, never a stat on an
-in-flight NFS copy) is the way to build onto pve1.
+in-flight NFS copy) is the way to build onto a remote model store.
 
 ## The decisions (DeepSeek's default recipe: `tools/container/policy.py`)
 
@@ -68,18 +83,21 @@ format anywhere in the builder.
 | `hf_source.py` | header-only readers: `HFCheckpoint` (`names/shape/dtype/span/raw/copy_src`, `X#i` = slice i of a stacked tensor, `config` with `text_config` merged), `Exl3Checkpoint` (`names`, `linear(key, k, n, rates)` with every refusal the format allows; the family names the key -- `names.exl3_expert_key` / `exl3_layers` for DeepSeek) | used by every test below |
 | `names.py` | DeepSeek's naming table: HF name -> container entry (`Mapped`: container name, `gguf_name`, role, family, shard, expert/part, `emit`); `ModelShape.from_config`; the shard plan; the EXL3 expert keys | `test_names.py` |
 | `policy.py` | DeepSeek's default formats (`layout_for`) and declared shapes (`declared_shape`) | `test_names.py` |
-| `deepseek.py` / `qwen.py` / `inkling.py` | the family modules (registered by `model_type`, `build.FAMILIES`): the source view (`source`; Inkling's names each projection its fused w13 / expert stacks hold), naming, shard order, what the loader admits, the default recipe, expert grouping, the arch KV.  Inkling also declares its shape (refusing a config or tensor that disagrees) and writes each tensor's bind role into its record | `test_deepseek.py` / `test_qwen.py` / `test_inkling.py` |
+| `deepseek.py` / `qwen.py` / `inkling.py` / `nemotron_h.py` / `nemotron_enc.py` / `nemotron_parse.py` | the family modules (registered by `model_type`, `build.FAMILIES`): the source view (`source`; Inkling's names each projection its fused w13 / expert stacks hold), naming, shard order, what the loader admits, the default recipe, expert grouping, the arch KV.  Inkling also declares its shape (refusing a config or tensor that disagrees) and writes each tensor's bind role into its record | `test_<family>.py` |
+| `drafters.py` | a separate block-drafter checkpoint as shard `drafter` (`--drafter lilicorr\|dflash2 DIR`) | `test_nemotron_h.py`, `test_qwen.py` |
+| `ple_rows.py` | Qwen's PLE n-gram table as one disk row file (`build` / `verify`) | its `verify` subcommand |
+| `tokenizer/core.py` | the `tokenizer.*` kv entries, one core for every family | `test_kv.py` and the family tests |
 | `recipe.py` | `pulsar.recipe.v1`: rows by role / block / layers or name pattern; exactly one row per tensor, no dead rows | `test_deepseek.py`, `test_qwen.py`, `test_inkling.py` |
 | `kv.py` | the `pulsar.kv` block from `config.json` + tokenizer files, in the engine's spelling | `test_kv.py` |
-| `producers.py` | the codecs, bytes in / bytes out (`mxfp8_lt`, `mxfp8_lt_from_bf16`, `cutlass_mxfp4`, `fp8_e4m3_soa_k_from_bf16`, `i64_to_i32`; `rows_strided`, a source view's verbatim rows), the ONE producer table `PRODUCER_FOR` ((source kind, format) -> producer), `bytes_for` (== `st_bytes_for` / `routed_expert_side_layout`) | `test_producers.py` |
+| `producers.py` | the codecs, bytes in / bytes out (`mxfp8_lt`, `mxfp8_lt_from_bf16`, `cutlass_mxfp4`, `nvfp4`, `nvfp4_from_bf16`, `fp8_e4m3_soa_k_from_bf16`, `f16_from_f32`, `i64_to_i32`, `rows_gather`, `i32_values`; `rows_strided`, a source view's verbatim rows), the ONE producer table `PRODUCER_FOR` ((source kind, format) -> producer), `bytes_for` (== `st_bytes_for` / `routed_expert_side_layout`) | `test_producers.py` |
 | `entries.py` | one entry's payload through the producer table (dense, a routed expert, an EXL3 Linear's ranges) | the synthetic goldens |
 | `exl3_rates.py` | the EXL3 rate table and the engine's arms (`exl3_arm_has_rate`) by role | `test_exl3_rates.py` (in host-checks) |
 | `build.py` | the one plan; recipe / plan / emit / verify / audit | the shard comparison below; `test_deepseek.py` / `test_qwen.py` / `test_inkling.py` GOLDEN SHA-256s |
 
 ## The instrument
 
-The oracle is the served Vision-Exp artifact `/mnt/models/DeepSeek-v4-Flash`,
-which the archived lane built from the same HF checkpoint.  The builder must
+The oracle was the then-served Vision-Exp artifact (the container published as
+`ElytronAI/DeepSeek-v4-Flash`), which the archived lane built from the same HF checkpoint.  The builder must
 reproduce it, and the comparison is entry-for-entry, not file-for-file: payload
 bytes by tensor name, declarations (dtype/shape), and the three `pulsar.*`
 blocks.  Result on 2026-09-24 (L247): every one of the 36,909 dense entries and
@@ -95,11 +113,8 @@ would have refused at load (the confidence head's rank, the k-major
 `markov_w2` dims) while every payload byte already matched.  `test_names.py`
 grades `dims_ne` against the served artifact for that reason.
 
-The tests need numpy:
-
-```
-cd tools/container && for t in test_names.py test_kv.py test_producers.py; do $PY $t | tail -1; done
-```
+The tests need numpy; `make container-tests` runs every `test_*.py` (it is
+part of `make host-checks`).
 
 ## What the artifact directory holds
 
@@ -108,9 +123,9 @@ layer, `top`, one per drafter layer), `model.safetensors.index.json`, and
 `config.json` copied from the source for provenance.  The engine needs only
 the shards: the tokenizer rides in `pulsar.kv`.
 
-## Known limits (2026-09-24)
+## Known limits
 
-- V4.1's tower lacks `image_pad`, which `weights.cpp` requires when a tower is present; loading a V4.1 artifact with its tower is an engine question (L247), not a builder one -- the builder emits what the checkpoint has.
+- V4.1's tower lacks `image_pad`; the V4.1 shape profile declares an unpadded image span and the engine's image path refuses it (`shape_profiles.cpp`, `session.cpp`).  The builder emits what the checkpoint has.
 - Engram (V4.1) row tables stay side files (L242); `wkv/q/k` are ordinary layer-shard tensors.
 - No IQ2 producer: the type-44 permutation lived in the archived `repack_iq2_mmq.py`; a recipe row naming IQ2 refuses.  The GGUF-era `format-maps/v5mx4-format-map.json` (91 IQ2 rows) is no longer read by anything (its re-key path left with `--format-map`, L279); building IQ2 or retiring the map is L279's step 7.
 - DeepSeek EXL3 dense refuses by name: the DeepSeek loader admits its dense linears at the MX slot only (weights.cpp `tensor_expect_mxfp8`); the EXL3 dense arm reads bf16 rows.

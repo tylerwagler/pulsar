@@ -2,16 +2,19 @@
 
 Read `ENGINEERING-RULES.md` in this directory first: one path or an error (no
 fallbacks), no dead code kept, producers emit and consumers never convert,
-zero build warnings, and a landing is one squashed commit gated by the full
-battery. Those rules apply to every change on `dev`.
+zero build warnings, and a landing is one squashed commit gated by the tier
+its paths call for: `make gates` (the full battery, once per landing series
+on numeric paths) or `make gates-dev` (the iteration tier; see
+`ENGINEERING-RULES.md` §10 and `QA_BEFORE_RELEASES.md`). Those rules apply to
+every change on `dev`.
 
 Pulsar changes should be tested against the failure mode they can realistically
 affect. The project has two regression tracks: correctness and speed. Please
-include the commands you ran, the machine/backend, the model quant, and any
+include the commands you ran, the machine, the model family and quant, and any
 notable failures in the PR or commit notes.
 
-Do not send PRs affecting one or more inference backends without checking if the
-resulting code is still correct and fast. The only acceptable regression speed
+Do not send PRs affecting a CUDA inference path without checking that the
+resulting code is still correct and fast on every family that runs it. The only acceptable regression speed
 is when an important correctness bug is fixed and it requires some speed penalty.
 
 ## Correctness Regression Tests
@@ -65,7 +68,7 @@ What they cover:
 Point the runner at a checkpoint directory:
 
 ```sh
-PULSAR_TEST_MODEL=/srv/models/<checkpoint-dir> ./pulsar_test --logprob-vectors
+PULSAR_TEST_MODEL=/path/to/<checkpoint-dir> ./pulsar_test --logprob-vectors
 PULSAR_TEST_VECTOR_FILE=/path/to/official.vec ./pulsar_test --logprob-vectors
 PULSAR_TEST_LONG_PROMPT=/path/to/prompt.txt ./pulsar_test --long-context
 ```
@@ -91,10 +94,10 @@ make -C tools/quality-testing
 Then score old and new checkpoints against the same manifest and compare:
 
 ```sh
-tools/quality-testing/score_official /srv/models/OLD-checkpoint \
+tools/quality-testing/score_official /path/to/OLD-checkpoint \
   tools/quality-testing/data/manifest.tsv /tmp/old.tsv 4096
 
-tools/quality-testing/score_official /srv/models/NEW-checkpoint \
+tools/quality-testing/score_official /path/to/NEW-checkpoint \
   tools/quality-testing/data/manifest.tsv /tmp/new.tsv 4096
 
 python3 tools/quality-testing/compare_scores.py /tmp/old.tsv /tmp/new.tsv
@@ -115,7 +118,7 @@ Default linear sweep:
 
 ```sh
 ./pulsar-bench \
-  -m /srv/models/<checkpoint-dir> \
+  -m /path/to/<checkpoint-dir> \
   --prompt-file speed-bench/promessi_sposi.txt \
   --ctx-start 2048 \
   --ctx-max 65536 \
