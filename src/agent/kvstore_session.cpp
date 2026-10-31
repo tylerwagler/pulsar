@@ -1,3 +1,5 @@
+/** @file
+ *  pulsar-agent: the KV segment store and session persistence (save, load, list, titles). */
 #include "pulsar_agent_internal.h"
 
 
@@ -7,8 +9,10 @@
  * ============================================================================
  */
 
+/// @cond AGENT_REDECLARATIONS (redeclares functions documented in pulsar_agent_internal.h)
 char *agent_session_title_from_text(const char *text, size_t text_len,
                                            size_t max_bytes);
+/// @endcond
 
 
 
@@ -26,13 +30,24 @@ char *agent_session_title_from_text(const char *text, size_t text_len,
  * whose segments were evicted or stripped comes back by prefill, never by
  * re-tokenising text (L223). */
 
+/** The session file's magic, "PAS1" little-endian. */
 #define AGENT_SESSION_MAGIC   0x31534150u   /* "PAS1" */
+/** The session file's format version. */
 #define AGENT_SESSION_VERSION 1u
 
+/** @brief Store `v` little-endian at p[0..4). @param p destination @param v the value */
 static void agent_put32(uint8_t *p, uint32_t v) { for (int i = 0; i < 4; i++) p[i] = (uint8_t)(v >> (8 * i)); }
+/** @brief Store `v` little-endian at p[0..8). @param p destination @param v the value */
 static void agent_put64(uint8_t *p, uint64_t v) { for (int i = 0; i < 8; i++) p[i] = (uint8_t)(v >> (8 * i)); }
+/** @brief Load a little-endian u32. @param p source (4 bytes) @return the value */
 static uint32_t agent_get32(const uint8_t *p) { uint32_t v = 0; for (int i = 3; i >= 0; i--) v = (v << 8) | p[i]; return v; }
+/** @brief Load a little-endian u64. @param p source (8 bytes) @return the value */
 static uint64_t agent_get64(const uint8_t *p) { uint64_t v = 0; for (int i = 7; i >= 0; i--) v = (v << 8) | p[i]; return v; }
+/** @brief Fold bytes into an FNV-1a 64-bit hash.
+ *  @param h the running hash (the FNV offset basis to start)
+ *  @param p bytes
+ *  @param n byte count
+ *  @return the updated hash */
 static uint64_t agent_fnv(uint64_t h, const void *p, size_t n) {
     const uint8_t *b = (const uint8_t *)p;
     for (size_t i = 0; i < n; i++) { h ^= b[i]; h *= 1099511628211ull; }
@@ -42,6 +57,7 @@ static uint64_t agent_fnv(uint64_t h, const void *p, size_t n) {
 /* Fixed header: magic, version, model id, title bytes, token count (u32 each),
  * created_at, last_used (u64 each) -> 36 bytes; then the title, the ids (u32
  * each), and an FNV-1a digest of everything before it. */
+/// The session file's fixed header size, bytes (layout above).
 #define AGENT_SESSION_HEADER 36u
 
 void agent_session_file_free(agent_session_file *f) {

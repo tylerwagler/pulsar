@@ -1,7 +1,11 @@
+/** @file
+ *  pulsar-agent: the shared globals (agent_sigint, agent_completion_worker) and forward declarations of
+ *  helpers other translation units define. */
 #include "pulsar_agent_internal.h"
 
 
 
+/// @cond AGENT_REDECLARATIONS (redeclares functions documented in pulsar_agent_internal.h)
 int set_nonblock(int fd, bool on, int *old_flags);
 
 
@@ -37,4 +41,5 @@ bool agent_preflight_edit_old(agent_worker *w, const agent_tool_call *call,
 int agent_worker_sync_tokens(agent_worker *w, const pulsar_tokens *tokens,
                                     bool publish_progress,
                                     char *err, size_t err_len);
+/// @endcond
 

@@ -1,3 +1,5 @@
+/** @file
+ *  pulsar-agent: the terminal prompt, the status footer and asynchronous output rendering. */
 #include "pulsar_agent_internal.h"
 
 
@@ -10,6 +12,11 @@
 static void agent_format_ctx_size(int ctx_size, char *buf, size_t len);
 
 
+/** @brief Append a string to a fixed buffer at `*pos`, truncating at the buffer's end (always NUL-terminated).
+ *  @param buf destination
+ *  @param len bytes at `buf`
+ *  @param pos the write offset, advanced (stops at len - 1)
+ *  @param s   the string */
 static void agent_progress_append(char *buf, size_t len, size_t *pos,
                                   const char *s) {
     if (len == 0 || *pos >= len - 1) return;
@@ -29,6 +36,14 @@ void build_prompt_text(const agent_status *st, char *buf, size_t len) {
 
 
 
+/** @brief Render the footer's progress bar: AGENT_PROGRESS_BAR_WIDTH cells, filled in proportion to done / total,
+ *  with the rate (`" <n>t/s"`) drawn into the unfilled cells when tps > 0.
+ *  @param done  units done (clamped to [0, total])
+ *  @param total units in all (<= 0 = 1)
+ *  @param tps   rate, tokens per second; <= 0 shows none
+ *  @param buf   destination
+ *  @param len   bytes at `buf`
+ *  @param color emit the status-bar SGR styling */
 static void agent_progress_bar(int done, int total, double tps,
                                char *buf, size_t len, bool color) {
     if (len == 0) return;
@@ -75,6 +90,9 @@ unsigned agent_next_prefill_label(void) {
 
 /* Keep each prefill operation on a single playful label so the footer does not
  * visually churn while progress updates stream in. */
+/// @brief The footer's word for a prefill (see above).
+/// @param st the worker status (its prefill_label counter); NULL = the first label
+/// @return a static label
 static const char *agent_prefill_label(const agent_status *st) {
     static const char *labels[] = {
         "reading",
@@ -92,6 +110,10 @@ static const char *agent_prefill_label(const agent_status *st) {
 
 /* Build the one-line footer shown below the prompt.  It is intentionally compact
  * because linenoise redraws it on every progress update. */
+/// @brief Build the one-line footer for the worker's state (see above).
+/// @param st  the worker status
+/// @param buf destination
+/// @param len bytes at `buf`
 static void build_status_text(const agent_status *st, char *buf, size_t len) {
     char used[32], total_ctx[32];
     agent_format_ctx_size(st->ctx_used, used, sizeof(used));
@@ -202,6 +224,9 @@ char *agent_prompt_queue_take_all_echo(agent_prompt_queue *q) {
 
 
 
+/** @brief The oldest queued prompt, without removing it.
+ *  @param q the queue
+ *  @return the prompt (owned by the queue), or NULL when empty */
 static const char *agent_prompt_queue_peek(const agent_prompt_queue *q) {
     return q->len ? q->v[0] : NULL;
 }
@@ -216,6 +241,9 @@ void agent_prompt_queue_free(agent_prompt_queue *q) {
 
 
 
+/** @brief Whether a footer text spans several lines.
+ *  @param status the footer; NULL = no
+ *  @return true when it contains a newline */
 static bool agent_footer_is_multiline(const char *status) {
     return status && strchr(status, '\n');
 }
@@ -295,6 +323,10 @@ void editor_show(agent_editor *ed);
 /* Classify a possible terminal cursor-position reply (ESC[row;colR).  User
  * keystrokes can arrive interleaved with these replies, so we only swallow bytes
  * when they are definitely part of a complete CPR sequence. */
+/// @brief Classify bytes as a cursor-position reply (see above).
+/// @param buf the bytes so far
+/// @param len byte count
+/// @return CPR_PARTIAL (could still become one), CPR_COMPLETE, or CPR_INVALID
 static cpr_state cpr_candidate_state(const char *buf, size_t len) {
     if (len == 0) return CPR_PARTIAL;
     if ((unsigned char)buf[0] != 0x1b) return CPR_INVALID;
@@ -316,6 +348,8 @@ static cpr_state cpr_candidate_state(const char *buf, size_t len) {
 
 
 
+/** @brief Hand held CPR-candidate bytes to linenoise as user input and clear them.
+ *  @param ed the editor */
 static void editor_flush_cpr_candidate(agent_editor *ed) {
     if (!ed->cpr_len) return;
     linenoiseEditQueueInput(&ed->edit, ed->cpr_buf, ed->cpr_len);
@@ -324,6 +358,12 @@ static void editor_flush_cpr_candidate(agent_editor *ed) {
 
 
 
+/** @brief Whether the tail buffer ends with `seq`.
+ *  @param tail     the tail bytes
+ *  @param tail_len bytes at `tail`
+ *  @param seq      the sequence
+ *  @param seq_len  bytes at `seq`
+ *  @return true on a match */
 static bool agent_tail_ends_with(const char *tail, size_t tail_len,
                                  const char *seq, size_t seq_len) {
     return tail_len >= seq_len &&
@@ -332,6 +372,12 @@ static bool agent_tail_ends_with(const char *tail, size_t tail_len,
 
 
 
+/** @brief Whether the tail buffer ends with a proper (shorter) prefix of `seq`: the sequence may be arriving.
+ *  @param tail     the tail bytes
+ *  @param tail_len bytes at `tail`
+ *  @param seq      the sequence
+ *  @param seq_len  bytes at `seq` (>= 1)
+ *  @return true when a 1 .. seq_len - 1 byte prefix ends the tail */
 static bool agent_tail_has_seq_prefix(const char *tail, size_t tail_len,
                                       const char *seq, size_t seq_len) {
     size_t max = tail_len < seq_len - 1 ? tail_len : seq_len - 1;
@@ -346,6 +392,9 @@ static bool agent_tail_has_seq_prefix(const char *tail, size_t tail_len,
 /* Track bracketed paste markers outside linenoise.  The nonblocking event loop
  * may receive a paste in chunks; pausing linenoiseEditFeed() until ESC[201~
  * arrives prevents pasted newlines from being interpreted as Enter. */
+/// @brief Track the bracketed-paste envelope byte by byte (see above).
+/// @param ed the editor
+/// @param c  the input byte
 static void editor_track_bracketed_paste(agent_editor *ed, char c) {
     static const char start[] = "\x1b[200~";
     static const char end[] = "\x1b[201~";
@@ -384,6 +433,9 @@ static void editor_track_bracketed_paste(agent_editor *ed, char c) {
 
 /* Separate late CPR replies from real user input before handing bytes to
  * linenoise. */
+/// @brief Route one input byte (see above): hold a possible CPR reply, drop a complete one, queue the rest.
+/// @param ed the editor
+/// @param c  the input byte
 static void editor_filter_input_byte(agent_editor *ed, char c) {
     if (ed->cpr_len || (unsigned char)c == 0x1b) {
         if (ed->cpr_len == sizeof(ed->cpr_buf)) {
@@ -405,6 +457,10 @@ static void editor_filter_input_byte(agent_editor *ed, char c) {
 
 /* Queue raw terminal bytes into linenoise while preserving paste envelopes and
  * filtering cursor-position replies. */
+/// @brief Queue raw terminal bytes into linenoise (see above).
+/// @param ed  the editor
+/// @param buf the bytes
+/// @param len byte count
 static void editor_queue_bytes(agent_editor *ed, const char *buf, size_t len) {
     for (size_t i = 0; i < len; i++) {
         editor_track_bracketed_paste(ed, buf[i]);
@@ -468,6 +524,10 @@ void editor_replace_input(agent_editor *ed, const char *text) {
 /* Fallback cursor tracking for terminals that do not answer CPR quickly.  It is
  * intentionally approximate for wide Unicode; the CPR path handles exact
  * positioning in normal interactive terminals. */
+/// @brief Advance the approximate output cursor column over written text (see above); CSI sequences are skipped.
+/// @param ed   the editor
+/// @param text the bytes written
+/// @param len  byte count
 static void editor_note_output(agent_editor *ed, const char *text, size_t len) {
     int cols = ed->edit.cols > 0 ? (int)ed->edit.cols : 80;
     for (size_t i = 0; i < len; i++) {
@@ -520,6 +580,9 @@ static void editor_note_output(agent_editor *ed, const char *text, size_t len) {
 
 /* Normalize generated LF to CRLF for terminal output without changing the text
  * stored in the transcript. */
+/// @brief Write text to stdout with LF as CRLF (see above).
+/// @param text the text
+/// @param len  byte count
 static void editor_write_terminal_text(const char *text, size_t len) {
     size_t start = 0;
     for (size_t i = 0; i < len; i++) {
@@ -535,6 +598,14 @@ static void editor_write_terminal_text(const char *text, size_t len) {
 
 /* Locate a CPR reply inside a mixed stdin buffer.  Bytes before/after the reply
  * are user input and must be queued back into linenoise. */
+/// @brief Find the first complete cursor-position reply in a buffer (see above).
+/// @param buf   the bytes
+/// @param len   byte count
+/// @param start receives the reply's offset
+/// @param end   receives the offset just past it
+/// @param row   receives its row (1-based)
+/// @param col   receives its column (1-based)
+/// @return true when one was found
 static bool find_cpr_reply(const char *buf, size_t len, size_t *start, size_t *end,
                            int *row, int *col) {
     for (size_t i = 0; i + 5 < len; i++) {
@@ -565,6 +636,10 @@ static bool find_cpr_reply(const char *buf, size_t len, size_t *start, size_t *e
 /* Ask the terminal for the cursor column after writing model output.  Any user
  * bytes read while waiting for the CPR reply are queued back into linenoise so
  * typing during generation is not lost. */
+/// @brief Query the terminal's cursor column (see above), waiting up to 8 polls of 5 ms.
+/// @param ed      the editor (user bytes read meanwhile are queued back)
+/// @param col_out receives the 1-based column when a reply arrives
+/// @return true with a column > 0; false when stdin / stdout is not a TTY or no reply came
 static bool editor_query_cursor(agent_editor *ed, int *col_out) {
     if (!isatty(STDIN_FILENO) || !isatty(STDOUT_FILENO)) return false;
 
@@ -603,6 +678,8 @@ static bool editor_query_cursor(agent_editor *ed, int *col_out) {
 
 
 
+/** @brief Move the cursor up one row to the tracked output column (the prompt-below-output path).
+ *  @param ed the editor */
 static void editor_move_to_output_cursor(agent_editor *ed) {
     char seq[64];
     write_all(STDOUT_FILENO, "\x1b[1A", 4);
@@ -612,6 +689,10 @@ static void editor_move_to_output_cursor(agent_editor *ed) {
 
 
 
+/** @brief The terminal's size (TIOCGWINSZ on stdout).
+ *  @param rows receives rows
+ *  @param cols receives columns
+ *  @return true when known and non-zero */
 static bool editor_get_terminal_size(int *rows, int *cols) {
     struct winsize ws;
     if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) != 0) return false;
@@ -623,6 +704,9 @@ static bool editor_get_terminal_size(int *rows, int *cols) {
 
 
 
+/** @brief Move the cursor to an absolute position (CSI row;col H).
+ *  @param row 1-based row
+ *  @param col 1-based column */
 static void editor_csi_cursor(int row, int col) {
     char seq[64];
     int n = snprintf(seq, sizeof(seq), "\x1b[%d;%dH", row, col);
@@ -631,6 +715,8 @@ static void editor_csi_cursor(int row, int col) {
 
 
 
+/** @brief Save the output cursor (DECSC) in scroll-region mode; nothing otherwise.
+ *  @param ed the editor */
 static void editor_save_output_cursor(agent_editor *ed) {
     if (!ed->scroll_region) return;
     write_all(STDOUT_FILENO, "\0337", 2);
@@ -639,6 +725,9 @@ static void editor_save_output_cursor(agent_editor *ed) {
 
 
 
+/** @brief Restore the saved output cursor (DECRC), or go to the output region's last row when none was saved;
+ *  scroll-region mode only.
+ *  @param ed the editor */
 static void editor_restore_output_cursor(agent_editor *ed) {
     if (!ed->scroll_region) return;
     if (ed->output_cursor_saved) {
@@ -650,6 +739,8 @@ static void editor_restore_output_cursor(agent_editor *ed) {
 
 
 
+/** @brief Move to the prompt's first row, column 1; scroll-region mode only.
+ *  @param ed the editor */
 static void editor_move_to_prompt_row(agent_editor *ed) {
     if (!ed->scroll_region) return;
     editor_csi_cursor(ed->prompt_row, 1);
@@ -657,6 +748,8 @@ static void editor_move_to_prompt_row(agent_editor *ed) {
 
 
 
+/** @brief Move to linenoise's on-screen cursor (else the prompt row); scroll-region mode only.
+ *  @param ed the editor */
 static void editor_move_to_prompt_cursor(agent_editor *ed) {
     if (!ed->scroll_region) return;
     if (ed->edit.screen_cursor_row > 0 && ed->edit.screen_cursor_col > 0) {
@@ -668,6 +761,8 @@ static void editor_move_to_prompt_cursor(agent_editor *ed) {
 
 
 
+/** @brief Clear one terminal row.
+ *  @param row 1-based row */
 static void editor_clear_row(int row) {
     editor_csi_cursor(row, 1);
     write_all(STDOUT_FILENO, "\r\x1b[0K", 5);
@@ -675,6 +770,9 @@ static void editor_clear_row(int row) {
 
 
 
+/** @brief Clear every row from the prompt row to the bottom and reset linenoise's redraw bookkeeping;
+ *  scroll-region mode only.
+ *  @param ed the editor */
 static void editor_clear_prompt_region(agent_editor *ed) {
     if (!ed->scroll_region) return;
     for (int row = ed->prompt_row; row <= ed->term_rows; row++)
@@ -693,6 +791,8 @@ static void editor_clear_prompt_region(agent_editor *ed) {
 
 
 
+/** @brief Set the terminal's scroll region to rows 1 .. bottom (DECSTBM).
+ *  @param bottom the region's last row, 1-based */
 static void editor_set_scroll_margin(int bottom) {
     char seq[96];
     int n = snprintf(seq, sizeof(seq), "\x1b[1;%dr", bottom);
@@ -701,6 +801,9 @@ static void editor_set_scroll_margin(int bottom) {
 
 
 
+/** @brief Scroll the output region up by `lines` rows (newlines at its bottom row).
+ *  @param bottom the output region's last row
+ *  @param lines  rows to scroll; <= 0 is a no-op */
 static void editor_scroll_output_up(int bottom, int lines) {
     if (lines <= 0) return;
     editor_set_scroll_margin(bottom);
@@ -711,6 +814,14 @@ static void editor_scroll_output_up(int bottom, int lines) {
 
 
 
+/** @brief Reserve the bottom `reserved_rows` rows for prompt and status and scroll output above them, re-laying
+ *  the terminal when the size or reservation changed (output scrolls up when the prompt grows, keeping a partial
+ *  line's column).
+ *  @param ed             the editor
+ *  @param reserved_rows  rows for prompt + status (clamped to [2, rows - 2])
+ *  @param allow_shrink   whether the reservation may shrink at an unchanged terminal size
+ *  @param scroll_on_grow scroll existing output up instead of overwriting it when the reservation grows
+ *  @return false when not in scroll-region mode or the terminal is unknown or smaller than 8 x 20 */
 static bool editor_set_scroll_layout(agent_editor *ed, int reserved_rows,
                                      bool allow_shrink,
                                      bool scroll_on_grow) {
@@ -781,6 +892,12 @@ static bool editor_set_scroll_layout(agent_editor *ed, int reserved_rows,
 
 
 
+/** @brief linenoise's layout callback: re-reserve prompt + status rows for the new prompt height.
+ *  @param l           the linenoise state (unused)
+ *  @param prompt_rows rows the prompt needs (>= 1)
+ *  @param status_rows rows the status needs
+ *  @param privdata    the agent_editor
+ *  @return the prompt's first row, or 0 when not in scroll-region mode or the layout failed */
 static int editor_linenoise_layout_changed(struct linenoiseState *l,
                                            size_t prompt_rows,
                                            size_t status_rows,
@@ -800,6 +917,9 @@ static int editor_linenoise_layout_changed(struct linenoiseState *l,
  * and status footer.  This lets terminals scroll model/tool output naturally
  * without rewriting the prompt on every streamed token, which is especially
  * important over SSH where full redraws are visibly expensive. */
+/// @brief Enter scroll-region mode (see above).
+/// @param ed the editor
+/// @return true when active (already, or now); false without a TTY or with a terminal under 8 x 20
 static bool editor_configure_scroll_region(agent_editor *ed) {
     if (ed->scroll_region) return true;
     if (!isatty(STDIN_FILENO) || !isatty(STDOUT_FILENO)) return false;
@@ -929,6 +1049,8 @@ void editor_stop(agent_editor *ed) {
 /* Hide the live prompt before model output is written.  In scroll-region mode
  * the output cursor was saved before the prompt was drawn, so restoring it is
  * enough to append more model/tool bytes without touching the prompt rows. */
+/// @brief Hide the live prompt (see above).
+/// @param ed the editor; nothing when inactive or already hidden
 static void editor_hide(agent_editor *ed) {
     if (!ed->active || ed->hidden) return;
     if (ed->scroll_region) {
@@ -977,6 +1099,9 @@ void editor_show(agent_editor *ed) {
 
 
 
+/** @brief Set the prompt text (copied, truncated to the editor's buffer).
+ *  @param ed     the editor
+ *  @param prompt the prompt */
 static void editor_update_prompt(agent_editor *ed, const char *prompt) {
     snprintf(ed->prompt, sizeof(ed->prompt), "%s", prompt);
     ed->edit.prompt = ed->prompt;
@@ -985,6 +1110,9 @@ static void editor_update_prompt(agent_editor *ed, const char *prompt) {
 
 
 
+/** @brief Set the footer text (copied) and its styling: a single-line footer gets the status style on a TTY.
+ *  @param ed     the editor
+ *  @param status the footer; NULL = "" */
 static void editor_update_status(agent_editor *ed, const char *status) {
     snprintf(ed->status, sizeof(ed->status), "%s", status ? status : "");
     bool embedded_status = agent_footer_is_multiline(ed->status);
@@ -1016,6 +1144,8 @@ void editor_set_prompt_status(agent_editor *ed, const char *prompt,
 
 
 
+/** @brief Repaint the prompt and footer in their reserved rows and note the time; active scroll-region mode only.
+ *  @param ed the editor */
 static void editor_redraw_visible_prompt(agent_editor *ed) {
     if (!ed->active || !ed->scroll_region) return;
     editor_clear_prompt_region(ed);
@@ -1027,6 +1157,9 @@ static void editor_redraw_visible_prompt(agent_editor *ed) {
 
 
 
+/** @brief Whether AGENT_STATUS_REDRAW_INTERVAL_SEC has passed since the last prompt repaint (or none happened).
+ *  @param ed the editor
+ *  @return true when a repaint is due */
 static bool editor_prompt_redraw_due(agent_editor *ed) {
     double now = agent_now_sec();
     if (ed->last_prompt_redraw_time <= 0.0 ||
@@ -1039,6 +1172,11 @@ static bool editor_prompt_redraw_due(agent_editor *ed) {
 
 
 
+/** @brief Write output into the scroll region without disturbing the prompt: restore the output cursor, write,
+ *  save it, return to the prompt cursor, all inside a synchronized-update bracket (DEC mode 2026).
+ *  @param ed   the editor
+ *  @param text the output
+ *  @param len  byte count; 0 is a no-op */
 static void editor_write_scroll_output_preserve_prompt(agent_editor *ed,
                                                        const char *text,
                                                        size_t len) {
@@ -1156,6 +1294,10 @@ void runtime_help(void) {
 
 
 
+/** @brief Format a token count compactly: "12k", "12.5k", or the plain number under 1000.
+ *  @param ctx_size tokens
+ *  @param buf      destination
+ *  @param len      bytes at `buf` */
 static void agent_format_ctx_size(int ctx_size, char *buf, size_t len) {
     if (ctx_size >= 1000) {
         if (ctx_size % 1000 == 0) snprintf(buf, len, "%dk", ctx_size / 1000);
@@ -1167,6 +1309,10 @@ static void agent_format_ctx_size(int ctx_size, char *buf, size_t len) {
 
 
 
+/** @brief The startup banner line with the context size (coloured on a TTY).
+ *  @param cfg the configuration
+ *  @param buf destination
+ *  @param len bytes at `buf` */
 static void agent_format_welcome_banner(const agent_config *cfg,
                                         char *buf, size_t len) {
     char ctx[32];
@@ -1259,6 +1405,9 @@ void agent_worker_free(agent_worker *w) {
 
 
 
+/** @brief The answer an auto-answered yes/no prompt shows.
+ *  @param answer the auto answer
+ *  @return "yes", "no", or "" for none */
 static const char *agent_yes_no_auto_name(agent_yes_no_auto answer) {
     switch (answer) {
     case AGENT_YES_NO_AUTO_NO: return "no";
@@ -1331,6 +1480,9 @@ bool agent_prompt_yes_no_ex(const char *prompt,
 
 
 
+/** @brief Ask a yes/no question with no timeout or auto answer (agent_prompt_yes_no_ex).
+ *  @param prompt the question
+ *  @return true for yes */
 static bool agent_prompt_yes_no(const char *prompt) {
     return agent_prompt_yes_no_ex(prompt, NULL, NULL);
 }

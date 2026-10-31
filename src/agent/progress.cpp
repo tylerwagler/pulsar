@@ -1,3 +1,5 @@
+/** @file
+ *  pulsar-agent: the worker's progress reporting and the generic growable buffers. */
 #include "pulsar_agent_internal.h"
 
 
@@ -145,6 +147,7 @@ char *agent_session_path_for_sha(const char *dir, const char sha[41]) {
 
 
 
+/** @brief Store `v` little-endian at p[0..8). @param p destination @param v the value */
 static void agent_le_put64(uint8_t *p, uint64_t v) {
     for (int i = 0; i < 8; i++) p[i] = (uint8_t)(v >> (8 * i));
 }

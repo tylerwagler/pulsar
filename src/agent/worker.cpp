@@ -1,3 +1,5 @@
+/** @file
+ *  pulsar-agent: the model worker thread (prefill, generation, tool turns). */
 #include "pulsar_agent_internal.h"
 
 
@@ -17,6 +19,9 @@
  * This helper is intentionally derived only from the current streaming parser
  * state.  The state object is local to one assistant round, so malformed output,
  * EOS, Ctrl+C, or the next turn cannot accidentally leave sampling greedy. */
+/// @brief Whether the next token should be drawn greedily (see above).
+/// @param sr the round's stream renderer; NULL = no
+/// @return true inside DSML structure, a held DSML-shaped opening, or a possible parameter close
 static bool agent_stream_wants_greedy_sampling(const agent_stream_renderer *sr) {
     if (!sr || !sr->parser) return false;
     if (sr->parser->state == AGENT_DSML_ERROR ||
@@ -40,6 +45,12 @@ static bool agent_stream_wants_greedy_sampling(const agent_stream_renderer *sr) 
 
 
 
+/** @brief Draw the next token from the session: the configured temperature / top-p / min-p, or greedy.
+ *  @param w      the worker (its session)
+ *  @param cfg    the configuration (sampling knobs)
+ *  @param greedy draw the argmax instead
+ *  @param rng    the request's sampler stream, stepped
+ *  @return the token, or PULSAR_SAMPLE_REFUSED */
 static int worker_sample_with_mode(agent_worker *w, const agent_config *cfg,
                                    bool greedy, uint64_t *rng) {
     return pulsar_session_sample(w->session,
@@ -52,6 +63,9 @@ static int worker_sample_with_mode(agent_worker *w, const agent_config *cfg,
 
 
 
+/** @brief Publish whether sampling is currently greedy (status.greedy_sampling), waking the UI on a change.
+ *  @param w      the worker; takes w->mu
+ *  @param greedy the new state */
 static void worker_set_greedy_sampling(agent_worker *w, bool greedy) {
     pthread_mutex_lock(&w->mu);
     if (w->status.greedy_sampling != greedy) {
@@ -66,6 +80,10 @@ static void worker_set_greedy_sampling(agent_worker *w, bool greedy) {
 /* Run one user turn until the assistant stops or returns a tool call.  Tool
  * results are appended to the transcript and the loop continues, which gives
  * the model native DSML tool iteration without a client/server protocol. */
+/// @brief Run one user turn, tool iterations included (see above).  Worker thread.
+/// @param w         the worker
+/// @param user_text the user's message
+/// @return 0 (done, or interrupted), or 1 on an error (set with agent_set_error)
 static int worker_run_turn(agent_worker *w, const char *user_text) {
     agent_config *cfg = w->cfg;
     pulsar_think_mode think_mode = cfg->gen.think_mode;
@@ -408,6 +426,9 @@ void worker_request_compact(agent_worker *w) {
 
 
 
+/** @brief Take (read and clear, under w->mu) the UI's save request.
+ *  @param w the worker
+ *  @return true when a save was requested */
 static bool worker_take_save_requested(agent_worker *w) {
     pthread_mutex_lock(&w->mu);
     bool requested = w->save_requested;
@@ -418,6 +439,9 @@ static bool worker_take_save_requested(agent_worker *w) {
 
 
 
+/** @brief Take (read and clear, under w->mu) the UI's compaction request.
+ *  @param w the worker
+ *  @return true when a compaction was requested */
 static bool worker_take_compact_requested(agent_worker *w) {
     pthread_mutex_lock(&w->mu);
     bool requested = w->compact_requested;
@@ -428,6 +452,8 @@ static bool worker_take_compact_requested(agent_worker *w) {
 
 
 
+/** @brief Run a requested session save on the worker thread and report it; nothing when none was requested.
+ *  @param w the worker */
 static void worker_run_deferred_save(agent_worker *w) {
     if (!worker_take_save_requested(w)) return;
     agent_set_status(w, AGENT_WORKER_SAVING);
@@ -443,6 +469,8 @@ static void worker_run_deferred_save(agent_worker *w) {
 
 
 
+/** @brief Run a requested compaction on the worker thread and report it; nothing when none was requested.
+ *  @param w the worker */
 static void worker_run_deferred_compact(agent_worker *w) {
     if (!worker_take_compact_requested(w)) return;
     if (!agent_worker_has_user_session(w)) {

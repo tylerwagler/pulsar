@@ -1,3 +1,5 @@
+/** @file
+ *  pulsar-agent: the edit and search tools. */
 #include "pulsar_agent_internal.h"
 
 
@@ -7,6 +9,13 @@
  * ============================================================================
  */
 
+/** @brief Write `len` bytes to `path`, truncating it.
+ *  @param path   the file
+ *  @param data   bytes to write
+ *  @param len    byte count
+ *  @param err    receives the failure (open / write / close and errno text)
+ *  @param errlen bytes at `err`
+ *  @return 0, or -1 with `err` set */
 static int agent_write_file_bytes(const char *path, const char *data, size_t len,
                                   char *err, size_t errlen) {
     FILE *fp = fopen(path, "wb");
@@ -29,6 +38,11 @@ static int agent_write_file_bytes(const char *path, const char *data, size_t len
 
 
 
+/** @brief Append one numbered line ("<line> <text>\n", the line's content without its terminator) to `b`.
+ *  @param b    the result buffer
+ *  @param data the file's bytes
+ *  @param sp   the line's span in `data`
+ *  @param line its 1-based line number */
 static void agent_edit_result_append_line(agent_buf *b, const char *data,
                                           const agent_line_span *sp,
                                           int line) {
@@ -101,6 +115,12 @@ void agent_edit_result_append_context(agent_buf *b,
 
 
 
+/** @brief Find the first occurrence of `needle` in `hay` (bytes, not NUL-terminated).
+ *  @param hay        the haystack
+ *  @param hay_len    bytes at `hay`
+ *  @param needle     the needle
+ *  @param needle_len bytes at `needle`; 0 matches at `hay`
+ *  @return a pointer into `hay`, or NULL */
 static const char *agent_memmem_simple(const char *hay, size_t hay_len,
                                        const char *needle, size_t needle_len) {
     if (!needle_len) return hay;
@@ -115,6 +135,16 @@ static const char *agent_memmem_simple(const char *hay, size_t hay_len,
 
 
 
+/** @brief Find `needle` in the file, requiring exactly one occurrence.
+ *  @param data       the file's bytes
+ *  @param len        bytes at `data`
+ *  @param needle     the text to find
+ *  @param needle_len bytes at `needle`; 0 refuses
+ *  @param match      receives the occurrence on success
+ *  @param label      what the needle is, for the error ("old text", ...)
+ *  @param err        receives why it failed (empty, not found, not unique)
+ *  @param err_len    bytes at `err`
+ *  @return true with `*match` set, false with `err` set */
 static bool agent_find_unique(const char *data, size_t len,
                               const char *needle, size_t needle_len,
                               const char **match, const char *label,
@@ -149,6 +179,17 @@ static bool agent_find_unique(const char *data, size_t len,
  * may legitimately appear earlier in the file, so checking global uniqueness
  * would reject valid edits.
  */
+/// @brief agent_find_unique, searching only from `start` (see above).
+/// @param data       the file's bytes
+/// @param len        bytes at `data`
+/// @param start      where the search starts, inside [data, data + len]
+/// @param needle     the text to find
+/// @param needle_len bytes at `needle`; 0 refuses
+/// @param match      receives the occurrence on success
+/// @param label      what the needle is, for the error
+/// @param err        receives why it failed
+/// @param err_len    bytes at `err`
+/// @return true with `*match` set, false with `err` set
 static bool agent_find_unique_after(const char *data, size_t len,
                                     const char *start,
                                     const char *needle, size_t needle_len,
@@ -183,6 +224,10 @@ static bool agent_find_unique_after(const char *data, size_t len,
 
 
 
+/** @brief Whether streamed `old` text's first non-whitespace byte is '<' (it may still become a closing tag).
+ *  @param text the text so far
+ *  @param len  bytes at `text`
+ *  @return true when the first non-whitespace byte is '<' */
 static bool agent_edit_old_may_be_closing_tag(const char *text, size_t len) {
     size_t i = 0;
     while (i < len && (text[i] == ' ' || text[i] == '\t' ||
@@ -193,6 +238,10 @@ static bool agent_edit_old_may_be_closing_tag(const char *text, size_t len) {
 
 
 
+/** @brief Whether the text is only spaces, tabs, CRs and LFs (true for an empty text).
+ *  @param text the text
+ *  @param len  bytes at `text`
+ *  @return true when there is no other byte */
 static bool agent_edit_old_is_only_space(const char *text, size_t len) {
     for (size_t i = 0; i < len; i++) {
         if (text[i] != ' ' && text[i] != '\t' &&
@@ -204,6 +253,10 @@ static bool agent_edit_old_is_only_space(const char *text, size_t len) {
 
 
 
+/** @brief Whether the bytes contain any non-isspace() byte.
+ *  @param s   bytes
+ *  @param len byte count
+ *  @return true when one is found */
 static bool agent_span_has_nonspace(const char *s, size_t len) {
     for (size_t i = 0; i < len; i++) {
         if (!isspace((unsigned char)s[i])) return true;
@@ -213,6 +266,11 @@ static bool agent_span_has_nonspace(const char *s, size_t len) {
 
 
 
+/** @brief Whether streamed `old` text is long enough to anchor an [upto] edit: at least
+ *  AGENT_EDIT_UPTO_MIN_PREFIX_BYTES bytes and AGENT_EDIT_UPTO_MIN_PREFIX_LINES complete non-blank lines.
+ *  @param old     the old text so far
+ *  @param old_len bytes at `old`
+ *  @return true when both minimums are met */
 static bool agent_edit_old_prefix_mature_for_upto(const char *old, size_t old_len) {
     if (old_len < AGENT_EDIT_UPTO_MIN_PREFIX_BYTES) return false;
     int nonempty_lines = 0;
@@ -230,6 +288,11 @@ static bool agent_edit_old_prefix_mature_for_upto(const char *old, size_t old_le
 
 
 
+/** @brief Whether the forcer may inject "[upto]" now: old text has none yet, is mature
+ *  (agent_edit_old_prefix_mature_for_upto) and ends at a line end (trailing spaces / tabs / CR ignored).
+ *  @param old     the old text so far (NUL-terminated)
+ *  @param old_len bytes at `old`
+ *  @return true when ready */
 static bool agent_edit_old_ready_for_upto(const char *old, size_t old_len) {
     if (!old_len || strstr(old, "[upto]")) return false;
     if (!agent_edit_old_prefix_mature_for_upto(old, old_len)) return false;
@@ -296,6 +359,17 @@ bool agent_edit_upto_forcer_should_replace(agent_edit_upto_forcer *forcer,
 
 
 
+/** @brief Locate the span the edit's `old` text names: a unique literal match, or with one "[upto]" marker the
+ *  unique head through the first unique tail after it.
+ *  @param data      the file's bytes
+ *  @param len       bytes at `data`
+ *  @param old       the old text (NUL-terminated)
+ *  @param match     receives the span's start
+ *  @param match_len receives the span's length, bytes
+ *  @param anchored  receives true when the span came from an [upto] pair
+ *  @param err       receives why it failed
+ *  @param err_len   bytes at `err`
+ *  @return true with the span set, false with `err` set */
 static bool agent_edit_find_old_span(const char *data, size_t len,
                                      const char *old, const char **match,
                                      size_t *match_len, bool *anchored,
@@ -591,6 +665,15 @@ bool agent_preflight_edit_old(agent_worker *w, const agent_tool_call *call,
 
 
 
+/** @brief Replace bytes [offset, offset + remove_len) of the file's contents with `insert` and write the file.
+ *  @param path       the file
+ *  @param data       its current bytes
+ *  @param len        bytes at `data`
+ *  @param offset     splice start, bytes
+ *  @param remove_len bytes removed
+ *  @param insert     text inserted; NULL = ""
+ *  @param kind       how the span was found, for the result's "Edited <path> using <kind>" line
+ *  @return the tool result (the changed lines in context, or "Tool error: ..."), malloc'd; caller frees */
 static char *agent_apply_file_splice(const char *path,
                                      const char *data, size_t len,
                                      size_t offset, size_t remove_len,
@@ -676,6 +759,12 @@ char *agent_tool_edit(agent_worker *w, const agent_tool_call *call) {
 
 
 
+/** @brief Whether `q` occurs anywhere in s[0, n).
+ *  @param s              the line's bytes
+ *  @param n              byte count
+ *  @param q              the query (NUL-terminated); empty matches
+ *  @param case_sensitive compare bytes exactly, else ASCII case-folded
+ *  @return true on a match */
 static bool agent_literal_match(const char *s, size_t n, const char *q,
                                 bool case_sensitive) {
     size_t qn = strlen(q);
@@ -702,6 +791,11 @@ static bool agent_literal_match(const char *s, size_t n, const char *q,
 
 
 
+/** @brief Whether one line matches the search (the compiled regex, else a literal match).
+ *  @param ctx the search
+ *  @param s   the line's bytes
+ *  @param n   byte count
+ *  @return true on a match */
 static bool agent_search_line_matches(agent_search_ctx *ctx, const char *s, size_t n) {
     if (ctx->use_regex) {
         char *line = xstrndup(s, n);
@@ -714,6 +808,11 @@ static bool agent_search_line_matches(agent_search_ctx *ctx, const char *s, size
 
 
 
+/** @brief Append one result line ("  <line_no> <text>\n") to the search output.
+ *  @param ctx     the search
+ *  @param data    the file's bytes
+ *  @param sp      the line's span
+ *  @param line_no its 1-based line number */
 static void agent_search_emit_line(agent_search_ctx *ctx, const char *data,
                                    agent_line_span sp, int line_no) {
     char prefix[64];
@@ -726,6 +825,9 @@ static void agent_search_emit_line(agent_search_ctx *ctx, const char *data,
 
 
 /* Search one text file and emit matching lines with plain line numbers. */
+/// @brief Search one file (see above); skips files the glob rejects, unreadable files and binary (NUL-bearing) ones.
+/// @param ctx  the search (results counted against max_results)
+/// @param path the file
 static void agent_search_file(agent_search_ctx *ctx, const char *path) {
     if (ctx->results >= ctx->max_results) return;
     if (ctx->glob && ctx->glob[0]) {
@@ -775,6 +877,10 @@ static void agent_search_file(agent_search_ctx *ctx, const char *path) {
 
 /* Recursively search a file or directory, avoiding .git and stopping once the
  * result cap is reached. */
+/// @brief Search a path (see above); symlinks are not followed, depth is capped at 24.
+/// @param ctx   the search
+/// @param path  file or directory
+/// @param depth recursion depth, 0 at the root
 static void agent_search_path(agent_search_ctx *ctx, const char *path, int depth) {
     if (ctx->results >= ctx->max_results || depth > 24) return;
     struct stat st;
