@@ -1338,10 +1338,20 @@ __global__ static void head_rms_norm_rope_tail_kernel(
 
 int pulsar_gpu_head_rms_norm_rope_tail_tensor(pulsar_gpu_tensor *x, uint32_t n_tok, uint32_t n_head, uint32_t head_dim, uint32_t n_rot, uint32_t pos0, uint32_t n_ctx_orig, bool inverse, float freq_base, float freq_scale, float ext_factor, float attn_factor, float beta_fast, float beta_slow, float eps, const pulsar_gpu_tensor *positions) {
     /* Derived from the buffer, never passed in.  Passing it was how decode
-     * came to hand an f16 Q to the f32 kernel. */
+     * came to hand an f16 Q to the f32 kernel.  The declared FORMAT picks the
+     * instantiation, never the width: f16 and bf16 are both two bytes, and a
+     * bf16 Q read as half is the L269 mistake.  There is an f32 and an f16
+     * arm; anything else (bf16, bytes) refuses by name. */
     const size_t esz = x ? pulsar_tensor_esz(x) : 0u;
-    const int q_f16 = (esz == sizeof(__half));
-    if (!x || (esz != sizeof(float) && esz != sizeof(__half)) ||
+    const pulsar_elt_fmt fmt = pulsar_tensor_fmt(x);
+    const bool q_f32 = x && fmt == PULSAR_ELT_F32 && esz == sizeof(float);
+    const bool q_f16 = x && fmt == PULSAR_ELT_F16 && esz == sizeof(__half);
+    if (x && !q_f32 && !q_f16) {
+        fprintf(stderr, "pulsar: head rms norm + rope tail: stored element format %u (%zu bytes) has no arm "
+                        "(f32 and f16 only) -- refusing\n", (unsigned)fmt, esz);
+        return 0;
+    }
+    if (!x ||
         n_rot == 0u || n_rot > head_dim || (n_rot & 1u) ||
         x->bytes < (uint64_t)n_tok * n_head * head_dim * esz ||
         (positions && positions->bytes < (uint64_t)n_tok * sizeof(int32_t))) {
