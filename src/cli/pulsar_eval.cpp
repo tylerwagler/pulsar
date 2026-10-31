@@ -2443,7 +2443,7 @@ static void tui_start(eval_ui *ui, const eval_case *cases, int ncases, int max_t
     ui->requested_case = -1;
     ui->quit_requested = false;
     ui->status = (eval_status *)calloc((size_t)ncases, sizeof(*ui->status));
-    ui->guess = (char (*)[32])calloc((size_t)ncases, sizeof(*ui->guess));
+    ui->guess = (char (*)[EVAL_ANSWER_MAX])calloc((size_t)ncases, sizeof(*ui->guess));
     ui->prompt_tokens = (int *)calloc((size_t)ncases, sizeof(*ui->prompt_tokens));
     ui->generated_tokens = (int *)calloc((size_t)ncases, sizeof(*ui->generated_tokens));
     if (!ui->status || !ui->guess || !ui->prompt_tokens || !ui->generated_tokens) {
