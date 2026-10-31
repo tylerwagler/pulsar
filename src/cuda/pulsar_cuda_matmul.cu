@@ -1148,14 +1148,18 @@ struct f32w_key_hash {
 };
 /// bf16 copies of F32-source weights, by f32w_key (device buffers owned here).
 static std::unordered_map<f32w_key, uint16_t *, f32w_key_hash> g_f32w_bf16;
+/// One entry of g_f32w_bf16 (key and copy together; its address is stable until the map is cleared).
+using f32w_node = std::pair<const f32w_key, uint16_t *>;
 /// Slots of the f32w front cache (a power of two).
 constexpr uint32_t F32W_FC = 8u;
+/* L335, the L191 ordering the fp8 front cache got: a slot is ONE atomic pointer to the map's own entry, which
+ * carries the key and the copy together -- published with release, read with acquire -- so a reader can never pair
+ * one weight's key with another's pointer (the slot used to be a plain {key, ptr} written field by field). */
 /// One slot of the f32w front cache g_f32w_fc (direct-mapped by offset, F32W_FC slots).
-struct f32w_fc_entry { f32w_key key; const uint16_t *ptr; };
-/** @var f32w_fc_entry::key
- *  the weight's identity; the slot hits only when it equals the lookup's */
-/** @var f32w_fc_entry::ptr
- *  the device bf16 copy (owned by g_f32w_bf16), or NULL: an empty slot */
+struct f32w_fc_entry {
+    /// the cached g_f32w_bf16 entry, or NULL: an empty slot; hits only when its key equals the lookup's
+    std::atomic<const f32w_node *> node;
+};
 /// The f32w front cache, direct-mapped by offset.
 static f32w_fc_entry g_f32w_fc[F32W_FC];
 
@@ -2971,7 +2975,7 @@ void cuda_fp8_weight_cache_clear(void) {
      * open in one process served the first model's converted weights. */
     for (auto &kv : g_f32w_bf16) (void)cudaFree(kv.second);
     g_f32w_bf16.clear();
-    for (uint32_t i = 0; i < F32W_FC; i++) { g_f32w_fc[i].key = f32w_key{}; g_f32w_fc[i].ptr = NULL; }
+    for (uint32_t i = 0; i < F32W_FC; i++) g_f32w_fc[i].node.store(NULL, std::memory_order_release);
 }
 
 
@@ -3960,10 +3964,11 @@ static const uint16_t *f32_weight_bf16_resolve(const void *model_map,
                                                uint64_t in_dim, uint64_t out_dim) {
     const f32w_key key{model_map, offset, in_dim, out_dim};
     f32w_fc_entry *fc = &g_f32w_fc[(uint32_t)(offset & (F32W_FC - 1u))];
-    if (fc->ptr && fc->key == key) return fc->ptr;
+    const f32w_node *hit = fc->node.load(std::memory_order_acquire);
+    if (hit && hit->first == key) return hit->second;
     auto it = g_f32w_bf16.find(key);
     if (it != g_f32w_bf16.end()) {
-        fc->key = key; fc->ptr = it->second;
+        fc->node.store(&*it, std::memory_order_release);
         return it->second;
     }
     const uint64_t n = in_dim * out_dim;
@@ -3982,8 +3987,8 @@ static const uint16_t *f32_weight_bf16_resolve(const void *model_map,
     }
     f32_to_bf16_kernel<<<(unsigned)((n + 255) / 256), 256>>>(dst, src, n);
     if (!cuda_ok(cudaGetLastError(), "f32->bf16 weight convert launch")) { (void)cudaFree(dst); return NULL; }
-    g_f32w_bf16[key] = dst;
-    fc->key = key; fc->ptr = dst;
+    const auto ins = g_f32w_bf16.emplace(key, dst);
+    fc->node.store(&*ins.first, std::memory_order_release);
     static uint64_t total = 0;
     total += n * 2;
     static int announced = 0;
