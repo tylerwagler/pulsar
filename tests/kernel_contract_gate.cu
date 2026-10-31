@@ -21,6 +21,8 @@
  *                       (it used to stage the whole 128-row tile), scores equal to a garbage-padded bank's.
  *    6. ring-store-descr the 0731 ring batch store: no descriptor and a full one run; positions without seq_id
  *                       refuses (seq_id was dereferenced unchecked).
+ *    7. hc-fused-width  the fused HC split + norm runs n_embd 4096 and 5120 and refuses 4352 (a width between them used
+ *                       to launch the 5120 unroll with dead groups).
  *
  *  Prints one line per case and KERNEL CONTRACT GATE PASS / FAIL. */
 #include "pulsar_gpu.h"
@@ -341,6 +343,48 @@ static void case_ring_store_descr(void) {
     pulsar_gpu_tensor_free(seq);
 }
 
+/* ---- 7. hc-fused-width ----------------------------------------------------------------------------------------- */
+
+/// Case 7: the fused HC split + norm runs n_embd 4096 and 5120 and refuses 4352 (between them: it used to launch the
+/// 5120 unroll with dead groups -- the s51 corruption).  Weights from a synthetic host slab.
+static void case_hc_fused_width(void) {
+    const uint32_t n_hc = 4u, mix = 2u * n_hc + n_hc * n_hc, rows = 2u, wmax = 5120u;
+    static float slab[3 + 24 + 5120];
+    for (float &v : slab) v = 0.5f;
+    const uint64_t off_scale = 0, off_base = 3u * 4u, off_norm = (3u + mix) * 4u;
+    int bad = 0;
+    for (uint32_t n_embd : {4096u, 4352u, 5120u}) {
+        pulsar_gpu_tensor *norm_out = pulsar_gpu_tensor_alloc((uint64_t)rows * wmax * 4u);
+        pulsar_gpu_tensor *split = pulsar_gpu_tensor_alloc((uint64_t)rows * mix * 4u);
+        pulsar_gpu_tensor *pre = pulsar_gpu_tensor_alloc((uint64_t)rows * n_hc * 4u);
+        pulsar_gpu_tensor *mixt = pulsar_gpu_tensor_alloc((uint64_t)rows * mix * 4u);
+        pulsar_gpu_tensor *res = pulsar_gpu_tensor_alloc_elt((uint64_t)rows * n_hc * wmax, 2u, PULSAR_HC_ELT_FMT);
+        if (!norm_out || !split || !pre || !mixt || !res) {
+            fail("hc-fused-width: alloc");
+        } else {
+            const std::vector<uint8_t> z((size_t)rows * n_hc * wmax * 2u, 0u);
+            pulsar_gpu_tensor_write(res, 0, z.data(), z.size());
+            pulsar_gpu_tensor_write(mixt, 0, z.data(), (uint64_t)rows * mix * 4u);
+            pulsar_gpu_tensor_write(pre, 0, z.data(), (uint64_t)rows * n_hc * 4u);
+            const bool ran = pulsar_gpu_hc_split_weighted_sum_norm_f16_tensor(
+                                 NULL, norm_out, NULL, NULL, 0, NULL, 0u, split, pre, mixt, res, slab, sizeof(slab),
+                                 off_scale, off_base, off_norm, rows, n_embd, n_hc, 2u, 1e-6f, 1e-6f, 0) != 0 &&
+                             pulsar_gpu_synchronize() != 0;
+            if (ran != (n_embd != 4352u)) {
+                fprintf(stderr, "  hc-fused-width: n_embd %u %s\n", n_embd, ran ? "ran" : "refused");
+                bad++;
+            }
+        }
+        pulsar_gpu_tensor_free(norm_out);
+        pulsar_gpu_tensor_free(split);
+        pulsar_gpu_tensor_free(pre);
+        pulsar_gpu_tensor_free(mixt);
+        pulsar_gpu_tensor_free(res);
+    }
+    printf("  7 hc-fused-width: 4096 and 5120 run, 4352 refuses: %s\n", bad ? "NO" : "yes");
+    if (bad) fail("hc-fused-width: a width other than 4096 / 5120 ran, or one of them refused");
+}
+
 /// Runs every case on device 0.
 /// @return 0 on PASS, 1 on FAIL
 int main(void) {
@@ -354,6 +398,7 @@ int main(void) {
     case_hc_expand_nhc();
     case_idx_decode_bound();
     case_ring_store_descr();
+    case_hc_fused_width();
     puts(g_fail ? "KERNEL CONTRACT GATE FAIL" : "KERNEL CONTRACT GATE PASS");
     return g_fail ? 1 : 0;
 }

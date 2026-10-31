@@ -1053,10 +1053,13 @@ int pulsar_gpu_hc_split_weighted_sum_norm_f16_tensor(
      * generic fallback for wider models; it is deleted -- it could not emit
      * E4M3 at all (its parameter list had no norm_out_q) while the caller still
      * marked the activation slot valid, so every MXFP8 consumer downstream read
-     * the previous layer's data against zeroed scales. */
-    if (n_embd > PULSAR_HCFUSED_BLK * PULSAR_HCFUSED_VEC_5120) {
-        fprintf(stderr, "pulsar: hc fused norm cannot handle n_embd=%u (max %u)\n",
-                n_embd, PULSAR_HCFUSED_BLK * PULSAR_HCFUSED_VEC_5120);
+     * the previous layer's data against zeroed scales.  And EXACTLY the two
+     * widths (L335): any other n_embd up to 5120 used to launch with dead groups
+     * -- the s51 corruption the paragraph above describes. */
+    if (n_embd != PULSAR_HCFUSED_BLK * PULSAR_HCFUSED_VEC_4096 &&
+        n_embd != PULSAR_HCFUSED_BLK * PULSAR_HCFUSED_VEC_5120) {
+        fprintf(stderr, "pulsar: hc fused norm: n_embd=%u -- only %u and %u have an exact unroll -- refusing\n",
+                n_embd, PULSAR_HCFUSED_BLK * PULSAR_HCFUSED_VEC_4096, PULSAR_HCFUSED_BLK * PULSAR_HCFUSED_VEC_5120);
         return 0;
     }
     {
@@ -1082,7 +1085,7 @@ int pulsar_gpu_hc_split_weighted_sum_norm_f16_tensor(
 #define PULSAR_HCFUSED_LAUNCH_NW(VEC)                                                \
         do { if (norm_w_bf16) PULSAR_HCFUSED_LAUNCH(VEC, true);                       \
              else             PULSAR_HCFUSED_LAUNCH(VEC, false); } while (0)
-        if (n_embd <= PULSAR_HCFUSED_BLK * PULSAR_HCFUSED_VEC_4096)
+        if (n_embd == PULSAR_HCFUSED_BLK * PULSAR_HCFUSED_VEC_4096)
             PULSAR_HCFUSED_LAUNCH_NW(PULSAR_HCFUSED_VEC_4096);
         else
             PULSAR_HCFUSED_LAUNCH_NW(PULSAR_HCFUSED_VEC_5120);
