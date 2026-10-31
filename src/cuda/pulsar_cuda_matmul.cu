@@ -3425,11 +3425,13 @@ static int bf16_lt_matmul(void *out, const uint16_t *w, const uint16_t *xb, cuda
         cublasLtMatrixLayout_t la;
         cublasLtMatmulAlgo_t algo;
     };
-    static thread_local bf16_lt_shape shapes[16];
-    static thread_local int shapes_next;
-    bf16_lt_shape *sh = NULL;
-    for (int i = 0; i < 16; i++)
-        if (shapes[i].valid && shapes[i].in_dim == in_dim && shapes[i].out_dim == out_dim) { sh = &shapes[i]; break; }
+    /* L335, the L306 rule: never evicted.  This was a 16-slot ring (and the per-row-count entries below a 32-slot
+     * one), evicted round-robin: a dropped shape's heuristic, re-run inside a graph capture, finds no kernel -- the
+     * hazard L306 removed from the decode cache (lt_cache_key).  Keys: (in_dim, out_dim) here, + ntok below. */
+    static thread_local std::unordered_map<lt_cache_key, bf16_lt_shape, lt_cache_key_hash> shapes;
+    const lt_cache_key sk = {in_dim, out_dim, 0u, 0u};
+    auto shit = shapes.find(sk);
+    bf16_lt_shape *sh = shit != shapes.end() ? &shit->second : NULL;
     if (!sh) {
         bf16_lt_shape ns = {};
         ns.in_dim = in_dim; ns.out_dim = out_dim;
@@ -3460,10 +3462,7 @@ static int bf16_lt_matmul(void *out, const uint16_t *w, const uint16_t *xb, cuda
         }
         ns.algo = hr.algo;
         ns.valid = 1;
-        sh = &shapes[shapes_next];
-        shapes_next = (shapes_next + 1) & 15;
-        if (sh->valid) { cublasLtMatrixLayoutDestroy(sh->la); cublasLtMatmulDescDestroy(sh->op); }
-        *sh = ns;
+        sh = &shapes.emplace(sk, ns).first->second;
     }
     /* per (shape, ntok): the row-count layouts and the check that the shape's
      * kernel supports this row count */
@@ -3471,12 +3470,11 @@ static int bf16_lt_matmul(void *out, const uint16_t *w, const uint16_t *xb, cuda
         uint64_t in_dim, out_dim; int ntok; int valid;
         cublasLtMatrixLayout_t lb, ld;
     };
-    static thread_local bf16_lt_call calls[32];
-    static thread_local int calls_next;
+    static thread_local std::unordered_map<lt_cache_key, bf16_lt_call, lt_cache_key_hash> calls;
     const int ntok = (int)n_tok;
-    bf16_lt_call *e = NULL;
-    for (int i = 0; i < 32; i++)
-        if (calls[i].valid && calls[i].in_dim == in_dim && calls[i].out_dim == out_dim && calls[i].ntok == ntok) { e = &calls[i]; break; }
+    const lt_cache_key ck = {in_dim, out_dim, n_tok, 0u};
+    auto chit = calls.find(ck);
+    bf16_lt_call *e = chit != calls.end() ? &chit->second : NULL;
     if (!e) {
         bf16_lt_call ne = {};
         ne.in_dim = in_dim; ne.out_dim = out_dim; ne.ntok = ntok;
@@ -3492,10 +3490,7 @@ static int bf16_lt_matmul(void *out, const uint16_t *w, const uint16_t *xb, cuda
             return 0;
         }
         ne.valid = 1;
-        e = &calls[calls_next];
-        calls_next = (calls_next + 1) & 31;
-        if (e->valid) { cublasLtMatrixLayoutDestroy(e->lb); cublasLtMatrixLayoutDestroy(e->ld); }
-        *e = ne;
+        e = &calls.emplace(ck, ne).first->second;
     }
     cuda_arena ar;
     if (!cuda_arena_begin(&ar, wz, "bf16 lt scratch")) return 0;
