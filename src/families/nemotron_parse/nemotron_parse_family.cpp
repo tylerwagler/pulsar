@@ -97,10 +97,10 @@ bool after_gpu(pulsar_engine *e) { return pulsar_nemotron_parse_run_create(e); }
 const pulsar_nemotron_parse_model *model_of(const pulsar_engine *e) {
     return (const pulsar_nemotron_parse_model *)e->family_state;
 }
+/* no logits row: no session of this family exists to read one (the decoder's logits stay inside parse) */
 /** pulsar_family::logits_width.
- *  @param e  the engine
- *  @return the decoder's vocab (72512); the logits stay inside parse, no session reads them */
-uint32_t logits_width(const pulsar_engine *e) { return model_of(e)->shape.vocab; }
+ *  @return 0 */
+uint32_t logits_width(const pulsar_engine *) { return 0; }
 /** pulsar_family::model_name.
  *  @return "Nemotron-3.5-Parse" (static) */
 const char *model_name(const pulsar_engine *) { return "Nemotron-3.5-Parse"; }

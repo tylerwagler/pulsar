@@ -98,13 +98,10 @@ typedef struct {
     float eps, embed_scale;
     /** @var pulsar_nemotron_parse_shape::max_seq
      *  max_sequence (16384): the decoder's context in tokens (prefix + prompt + generated); each layer's KV pool holds it
-     *  @var pulsar_nemotron_parse_shape::bos
-     *  bos (0): pinned; the forward does not read it (the default prompt spells its own `<s>`)
      *  @var pulsar_nemotron_parse_shape::eos
      *  eos (2): generation stops after sampling it
-     *  @var pulsar_nemotron_parse_shape::pad
-     *  pad (1): pinned; nothing pads (one page per call) */
-    uint32_t max_seq, bos, eos, pad;
+     *  (the container's bos (0) and pad (1) are pinned by the reader and not stored: nothing reads them) */
+    uint32_t max_seq, eos;
     /** @var pulsar_nemotron_parse_shape::canvas_h
      *  image.canvas_h (2048): the largest page height in pixels; a taller image is resized down
      *  @var pulsar_nemotron_parse_shape::canvas_w
