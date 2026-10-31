@@ -1,3 +1,5 @@
+/** @file
+ *  The exception boundary between pulsar and the vendored xgrammar core (built with -fexceptions). */
 /* L303: the exception boundary between pulsar and the vendored xgrammar core (pulsar_grammar.h says why it exists
  * and what crosses it).  Built with -fexceptions; every entry catches everything. */
 #include "pulsar_grammar.h"
@@ -18,6 +20,7 @@
 #include <vector>
 
 /* Workers alive (on time or late): the PULSAR_GRAMMAR_COMPILES_MAX cap. */
+/// Compile workers alive, on time or late; capped at PULSAR_GRAMMAR_COMPILES_MAX.
 static std::atomic<int> g_compiles{0};
 
 /** Opaque compiler handle: one xgrammar compiler over one model vocabulary. */
@@ -46,6 +49,11 @@ struct pulsar_grammar_matcher {
     bool end_at_complete;
 };
 
+/** Write `what` and the exception's message, trimmed of xgrammar's log prefix, as one line into err.
+ *  @param err    the caller's error buffer, or NULL (nothing written)
+ *  @param errlen size of `err`
+ *  @param what   the operation that failed
+ *  @param e      the caught exception, or NULL for a non-std one */
 static void say(char *err, size_t errlen, const char *what, const std::exception *e) {
     if (!err || !errlen) return;
     if (!e) {
@@ -63,6 +71,9 @@ static void say(char *err, size_t errlen, const char *what, const std::exception
         if (*p == '\n') *p = ' ';
 }
 
+/** The catch clauses every entry ends its try block with: any exception becomes `say` + `return fail`.
+ *  @param what the operation, for the message
+ *  @param fail the entry's failure return value */
 #define GRAMMAR_TRY(what, fail)                                                                                        \
     catch (const std::exception &e) {                                                                                  \
         say(err, errlen, what, &e);                                                                                    \

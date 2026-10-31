@@ -1,3 +1,5 @@
+/** @file
+ *  The rendered-text and small format helpers of pulsar_kvtext.h. */
 /* The rendered-text and small format helpers pulsar-server and pulsar-agent
  * share (pulsar_kvtext.h). */
 #include "pulsar_kvtext.h"

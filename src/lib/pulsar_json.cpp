@@ -1,3 +1,5 @@
+/** @file
+ *  The JSON scanner's implementation (moved from src/server/util.cpp). */
 /* pulsar_json.cpp -- see pulsar_json.h.
  *
  * Moved from src/server/util.cpp so the engine can use it too.  The only change
@@ -26,6 +28,8 @@ bool json_lit(const char **p, const char *lit) {
     return true;
 }
 
+/// @param c an ASCII character
+/// @return its hex digit value 0..15, or -1 when `c` is not a hex digit
 static int json_hex(char c) {
     if (c >= '0' && c <= '9') return c - '0';
     if (c >= 'a' && c <= 'f') return 10 + c - 'a';
@@ -44,6 +48,10 @@ typedef struct {
     size_t cap;
 } json_buf;
 
+/// Grow `b` so `extra` more bytes plus a NUL fit (doubling from 64).
+/// @param b     the buffer
+/// @param extra bytes about to be appended
+/// @return false on overflow or allocation failure
 static bool jb_reserve(json_buf *b, size_t extra) {
     if (b->len + extra + 1 <= b->cap) return true;
     size_t cap = b->cap ? b->cap : 64;
@@ -58,12 +66,19 @@ static bool jb_reserve(json_buf *b, size_t extra) {
     return true;
 }
 
+/// Append one byte.
+/// @param b the buffer
+/// @param c the byte
+/// @return false on allocation failure
 static bool jb_putc(json_buf *b, char c) {
     if (!jb_reserve(b, 1)) return false;
     b->p[b->len++] = c;
     return true;
 }
 
+/// Append `cp` as UTF-8; a surrogate or a value past U+10FFFF is written as U+FFFD.
+/// @param b  the buffer
+/// @param cp the codepoint
 static void utf8_put(json_buf *b, uint32_t cp) {
     if (cp > 0x10ffff || (cp >= 0xd800 && cp <= 0xdfff)) cp = 0xfffd;
     if (cp <= 0x7f) {
@@ -83,6 +98,10 @@ static void utf8_put(json_buf *b, uint32_t cp) {
     }
 }
 
+/// Read one `\uXXXX` escape at `*p`.
+/// @param p   cursor at the backslash; advanced past the escape on success
+/// @param out receives the 16-bit code unit
+/// @return true when `*p` is a well-formed \\u escape
 static bool json_u16(const char **p, uint32_t *out) {
     if ((*p)[0] != '\\' || (*p)[1] != 'u') return false;
     uint32_t cp = 0;
@@ -188,6 +207,10 @@ bool json_bool(const char **p, bool *out) {
 
 static bool json_skip_value_depth(const char **p, int depth);
 
+/// Skip an array at `*p`, its elements one level deeper.
+/// @param p     cursor at the '['; advanced past the ']' on success
+/// @param depth the array's nesting depth
+/// @return true when well-formed and within JSON_MAX_NESTING
 static bool json_skip_array_depth(const char **p, int depth) {
     if (depth >= JSON_MAX_NESTING) return false;
     json_ws(p);
@@ -204,6 +227,10 @@ static bool json_skip_array_depth(const char **p, int depth) {
     }
 }
 
+/// Skip an object at `*p`, its members' values one level deeper.
+/// @param p     cursor at the '{'; advanced past the '}' on success
+/// @param depth the object's nesting depth
+/// @return true when well-formed and within JSON_MAX_NESTING
 static bool json_skip_object_depth(const char **p, int depth) {
     if (depth >= JSON_MAX_NESTING) return false;
     json_ws(p);
@@ -226,6 +253,10 @@ static bool json_skip_object_depth(const char **p, int depth) {
     }
 }
 
+/// Skip one value of any type at nesting depth `depth`.
+/// @param p     cursor; advanced past the value on success
+/// @param depth the value's nesting depth
+/// @return true when well-formed and within JSON_MAX_NESTING
 static bool json_skip_value_depth(const char **p, int depth) {
     json_ws(p);
     if (**p == '"') {

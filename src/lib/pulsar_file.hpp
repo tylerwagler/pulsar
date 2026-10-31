@@ -1,3 +1,5 @@
+/** @file
+ *  pulsar::FileHandle, an RAII owner for a C FILE*. */
 #pragma once
 
 #include <cstdio>

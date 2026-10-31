@@ -1,3 +1,5 @@
+/** @file
+ *  The output-parser kit: one incremental reader of think / text / tool-call sections for every family. */
 /* out_parse_kit.h -- the output-parser kit (L295 F5): ONE reading of sampled text for every family whose
  * output is think / text / tool-call sections delimited by literal markers.
  *

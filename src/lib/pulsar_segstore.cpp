@@ -1,3 +1,5 @@
+/** @file
+ *  The content-addressed segment store's implementation (pulsar_segstore.h). */
 /* L264 S4: the content-addressed segment store (pulsar_segstore.h). */
 #include "pulsar_segstore.h"
 #include "pulsar_writeback.h"
@@ -71,9 +73,6 @@ struct pulsar_segstore {
     /// Sum of file_bytes over segs: what the budget is checked against
     uint64_t used = 0;
 
-    // Doxygen skips logf (to the matching end marker): it misreads the inline
-    // __attribute__((format)) and lists the body's statements as struct members.
-    /// @cond PULSAR_SEGSTORE_LOGF
     /** printf-style message to `log` (truncated to 511 bytes); no-op without a sink.
      *  @param fmt printf format */
     void logf(const char *fmt, ...) __attribute__((format(printf, 2, 3))) {
@@ -85,7 +84,6 @@ struct pulsar_segstore {
         va_end(ap);
         log(log_ud, msg);
     }
-    /// @endcond
     /** @param key a segment key
      *  @return the segment's file path, `<dir>/<key>.seg` */
     std::string path(const char *key) const { return dir + "/" + key + ".seg"; }
@@ -370,6 +368,11 @@ bool pulsar_segstore_get(pulsar_segstore *st, const char key[41], pulsar_segstor
     return true;
 }
 
+/** Write all `n` bytes of `p` to `fp`.
+ *  @param fp the open file
+ *  @param p  the bytes
+ *  @param n  their count
+ *  @return 0 when every byte was written, 1 on a short write */
 static int write_all(FILE *fp, const void *p, size_t n) { return fwrite(p, 1, n, fp) == n ? 0 : 1; }
 
 bool pulsar_segstore_put(pulsar_segstore *st, const char *parent, uint32_t G_prev, uint32_t G,
@@ -525,6 +528,11 @@ FILE *pulsar_segstore_open_trailer(pulsar_segstore *st, const char key[41], uint
 
 /* The bytes of [off, off + len) of an open file that sit in the page cache, by mincore over a read-only mapping of
  * the pages that span it (pages straddling the range's ends count by their overlap). */
+/// Page-cache residency of a byte range of an open file (see the comment above).
+/// @param fd  the open file
+/// @param off the range's first byte
+/// @param len the range's length in bytes
+/// @return bytes of the range resident in the page cache; 0 when the mapping fails
 static uint64_t segstore_resident(int fd, uint64_t off, uint64_t len) {
     if (len == 0u) return 0u;
     const long pg_l = sysconf(_SC_PAGESIZE);

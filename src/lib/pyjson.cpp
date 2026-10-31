@@ -1,3 +1,5 @@
+/** @file
+ *  pyjson's strict parser and Python-compatible serializer. */
 /* pyjson.cpp -- see pyjson.h. */
 #include "pyjson.h"
 

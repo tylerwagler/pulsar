@@ -1,3 +1,5 @@
+/** @file
+ *  The Qwen3.8-Flash-Next renderer and reasoning-effort authority (the checkpoint's chat_template.jinja). */
 /* qwen_chat.cpp -- the Qwen3.8-Flash-Next renderer and effort authority.
  * See qwen_chat.h.  Every literal below is the checkpoint's
  * chat_template.jinja (sha256 c3cf9e34...), and the order of the checks is the
@@ -53,6 +55,8 @@ bool qwen_effort_resolve(const char *name, int thinking, qwen_effort *out, char 
 }
 
 /* The template's reasoning_instructions for each effort ("" = none). */
+/// @param e the effort
+/// @return the instruction line the system block carries for `e` (static), "" for none
 static const char *effort_line(qwen_effort e) {
     switch (e) {
     case QWEN_EFFORT_XHIGH:
@@ -69,7 +73,9 @@ static const char *effort_line(qwen_effort e) {
     return "";
 }
 
+/// The tools block's head, up to its "<tools>" (the template's literal).
 static const char kToolsHead[] = "# Tools\n\nYou have access to the following functions:\n\n<tools>";
+/// The tools block's tail from "\n</tools>": the call-format instructions (the template's literal).
 static const char kToolsTail[] =
     "\n</tools>"
     "\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n"

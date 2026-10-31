@@ -1,3 +1,5 @@
+/** @file
+ *  Typed quantities that share a raw integer type but must never mix (L333, L334): KvRows, KvBytes, TokCount, PromptToks, TokPos */
 #ifndef PULSAR_UNITS_H
 #define PULSAR_UNITS_H
 
@@ -251,6 +253,7 @@ typedef pulsar_point<TokCount> TokPos;
 /** The KV rows a token count is, one row per token: the one crossing from a count to the KV accounting's unit.
  *  A negative count is no row count (fatal).
  *  @param n the tokens, >= 0 */
+/// @return `n` as KvRows, one row per token
 inline KvRows pulsar_kv_rows(TokCount n) {
     if (n.raw() < 0) {
         fprintf(stderr, "pulsar: %d tokens are no KV row count\n", n.raw());

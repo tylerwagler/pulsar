@@ -1,3 +1,5 @@
+/** @file
+ *  pulsar::ScopedLock, an RAII scoped lock for a pthread_mutex_t. */
 #pragma once
 
 #include <pthread.h>

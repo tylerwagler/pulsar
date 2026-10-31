@@ -1,3 +1,5 @@
+/** @file
+ *  TP gate scheduler implementation (decode-token and prefill-chunk exchange loops). */
 /*
  * Gate scheduler — host half of the CUDA gate machinery (slice 4b).
  * See pulsar_tp_sched.h for the contract and the exchange-counter `e` rule.
@@ -21,6 +23,12 @@ struct pulsar_tp_sched {
     char last_err[256];
 };
 
+/** Record a failure in s->last_err and copy it to `err`.
+ *  @param s      the scheduler
+ *  @param err    receives the message (may be NULL)
+ *  @param errlen size of `err`
+ *  @param fmt    printf format of the message
+ *  @return 0, so callers can `return sched_fail(...)` */
 static int sched_fail(pulsar_tp_sched *s, char *err, size_t errlen,
                       const char *fmt, ...) {
     va_list ap;

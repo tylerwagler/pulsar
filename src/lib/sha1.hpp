@@ -1,3 +1,5 @@
+/** @file
+ *  Minimal streaming SHA-1 for content-addressed names (not for security). */
 #ifndef PULSAR_SHA1_HPP
 #define PULSAR_SHA1_HPP
 

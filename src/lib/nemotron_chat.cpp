@@ -1,3 +1,5 @@
+/** @file
+ *  The Nemotron-H renderer, effort authority and output grammar (the checkpoint's chat_template.jinja). */
 /* nemotron_chat.cpp -- the Nemotron-H renderer, effort authority and output-parser configuration.  See
  * nemotron_chat.h.  Every literal below is the checkpoint's chat_template.jinja (Nemotron 3.5 Super VL, sha256
  * in tests/test-vectors/nemotron_h/meta.json), in the template's order. */

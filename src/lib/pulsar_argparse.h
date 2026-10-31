@@ -1,3 +1,5 @@
+/** @file
+ *  Shared CLI argument parsers for the pulsar, pulsar-bench, pulsar-eval and pulsar-agent front ends. */
 #ifndef PULSAR_ARGPARSE_H
 #define PULSAR_ARGPARSE_H
 
@@ -15,6 +17,12 @@
 #include <stdio.h>
 #include <stdlib.h>
 
+/** The value after option `opt`: advances *i past it, or exits 2 when argv ends first.
+ *  @param i    in: the option's index; out: the value's index
+ *  @param argc argument count
+ *  @param argv argument vector
+ *  @param opt  the option's name, for the message
+ *  @return the value's string (argv[*i]) */
 static inline const char *need_arg(int *i, int argc, char **argv, const char *opt) {
     if (*i + 1 >= argc) {
         fprintf(stderr, "%s: missing value for %s\n", program_invocation_short_name, opt);
@@ -24,6 +32,9 @@ static inline const char *need_arg(int *i, int argc, char **argv, const char *op
 }
 
 /* Strictly positive int (rejects 0 and negatives). */
+/// @param s   the value's text
+/// @param opt the option's name, for the message
+/// @return the value in [1, INT_MAX]; exits 2 on anything else
 static inline int parse_int(const char *s, const char *opt) {
     char *end = NULL;
     long v = strtol(s, &end, 10);
@@ -35,6 +46,11 @@ static inline int parse_int(const char *s, const char *opt) {
 }
 
 /* Int in [min, max]. */
+/// @param s   the value's text
+/// @param opt the option's name, for the message
+/// @param min the smallest value accepted
+/// @param max the largest value accepted
+/// @return the value in [min, max]; exits 2 on anything else
 static inline int parse_int_range(const char *s, const char *opt, int min, int max) {
     char *end = NULL;
     long v = strtol(s, &end, 10);
@@ -47,6 +63,9 @@ static inline int parse_int_range(const char *s, const char *opt, int min, int m
 }
 
 /* Non-negative int (allows 0). */
+/// @param s   the value's text
+/// @param opt the option's name, for the message
+/// @return the value in [0, INT_MAX]; exits 2 on anything else
 static inline int parse_nonnegative_int(const char *s, const char *opt) {
     char *end = NULL;
     long v = strtol(s, &end, 10);
@@ -58,6 +77,9 @@ static inline int parse_nonnegative_int(const char *s, const char *opt) {
 }
 
 /* Strictly positive uint64. */
+/// @param s   the value's text
+/// @param opt the option's name, for the message
+/// @return the nonzero value; exits 2 on an empty, non-numeric or zero value
 static inline uint64_t parse_u64(const char *s, const char *opt) {
     char *end = NULL;
     unsigned long long v = strtoull(s, &end, 10);
@@ -68,6 +90,12 @@ static inline uint64_t parse_u64(const char *s, const char *opt) {
     return (uint64_t)v;
 }
 
+/** Finite float in [min, max].
+ *  @param s   the value's text
+ *  @param opt the option's name, for the message
+ *  @param min the smallest value accepted
+ *  @param max the largest value accepted
+ *  @return the value; exits 2 on anything else */
 static inline float parse_float_range(const char *s, const char *opt, float min, float max) {
     char *end = NULL;
     float v = strtof(s, &end);
@@ -78,6 +106,10 @@ static inline float parse_float_range(const char *s, const char *opt, float min,
     return v;
 }
 
+/** Any finite double.
+ *  @param s   the value's text
+ *  @param opt the option's name, for the message
+ *  @return the value; exits 2 on an empty, non-numeric or non-finite value */
 static inline double parse_double_arg(const char *s, const char *opt) {
     char *end = NULL;
     double v = strtod(s, &end);

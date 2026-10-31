@@ -1,3 +1,5 @@
+/** @file
+ *  The output-parser kit's implementation and the shared JSON {"name", "args"} call body. */
 /* out_parse_kit.cpp -- the output-parser kit.  See out_parse_kit.h. */
 #include "out_parse_kit.h"
 

@@ -1,3 +1,5 @@
+/** @file
+ *  The Inkling-Small chat format: renderer, effort authority and output-parser configuration. */
 /* inkling_chat.h -- the Inkling-Small chat format (L294 E6, built on the L295 F5 frontend kit): the renderer,
  * the effort authority and the output parser's configuration.
  *
@@ -54,11 +56,17 @@
 #include "pulsar.h"
 
 /** The effort nothing sent resolves to (vLLM's _DEFAULT_REASONING_EFFORT), in hundredths. */
+/// @return the default effort, in hundredths
 int inkling_effort_default(void);
 /** The effort a name means (vLLM's _NAMED_REASONING_EFFORT), in hundredths; -1 for a name it lacks. */
+/// @param name the effort's name
+/// @return the effort in hundredths, or -1 for an unknown name
 int inkling_effort_named(const char *name);
 /** The effort line's number as the renderer writes it ("0.0", "0.1", "0.05", "0.99"); false when `centi`
  * is outside [0, 99]. */
+/// @param centi the effort in hundredths
+/// @param out   receives the number's text (replaced, not appended)
+/// @return true when `centi` is in [0, 99]
 bool inkling_effort_text(int centi, std::string *out);
 
 /** One tool call of an assistant message, as the API carries it. */
@@ -118,11 +126,21 @@ struct inkling_render_out {
 };
 
 /** Render.  false + "<refusal key>: detail" on refusal. */
+/// @param in     the conversation, tools and effort
+/// @param out    receives the text and its client-span map
+/// @param err    receives "<refusal key>: detail" on refusal
+/// @param errlen size of `err`
+/// @return true on success, false on refusal
 bool inkling_chat_render(const inkling_render_in &in, inkling_render_out *out, char *err, size_t errlen);
 
 /** L325: tool definitions in the tool_declare encoding (the canonical [{description, name, parameters, type}] array
  *  the template's tool_declare message carries), for a tool loaded mid-conversation, rendered in place inside the
  *  turn that loaded it.  `tools_json` is an OpenAI tools array.  Refusals: tool_declare_json's. */
+/// @param tools_json the OpenAI tools array as JSON text
+/// @param out        receives the declaration's text and its client-span map
+/// @param err        receives "<refusal key>: detail" on refusal
+/// @param errlen     size of `err`
+/// @return true on success, false on refusal
 bool inkling_chat_tool_defs(const char *tools_json, inkling_render_out *out, char *err, size_t errlen);
 
 /* ---- the pieces a live conversation appends (the server's suffix hooks, the engine's chat front).  Each is
@@ -134,6 +152,15 @@ bool inkling_chat_tool_defs(const char *tools_json, inkling_render_out *out, cha
  * `close_turn`: first the <|content_model_end_sampling|> that ends the sampled turn the piece follows (the
  * transcript stopped before it); `add_generation_prompt`: last, <|message_model|>.  A piece with none of the
  * three is refused (no_messages). */
+/// @param msgs                  the whole conversation so far
+/// @param n                     entries in `msgs`
+/// @param from                  the first message the piece writes
+/// @param close_turn            first write the <|content_model_end_sampling|> that closes the sampled turn
+/// @param add_generation_prompt end with <|message_model|>
+/// @param out                   receives the piece's text and its client-span map
+/// @param err                   receives "<refusal key>: detail" on refusal
+/// @param errlen                size of `err`
+/// @return true on success, false on refusal
 bool inkling_chat_render_turn(const inkling_msg_in *msgs, int n, int from, bool close_turn, bool add_generation_prompt,
                               inkling_render_out *out, char *err, size_t errlen);
 
@@ -141,23 +168,34 @@ bool inkling_chat_render_turn(const inkling_msg_in *msgs, int n, int from, bool 
  * <|message_model|> (the generation prompt wrote it), closed by <|content_model_end_sampling|> only when it
  * made no call (a tool-call turn's close is its tail's: inkling_chat_render_turn's close_turn).  A turn with
  * no reasoning, content or call has no such render (empty_turn). */
+/// @param m      the assistant message
+/// @param out    receives the turn's bytes and their client-span map
+/// @param err    receives "<refusal key>: detail" on refusal
+/// @param errlen size of `err`
+/// @return true on success, false on refusal
 bool inkling_chat_render_assistant_turn(const inkling_msg_in &m, inkling_render_out *out, char *err, size_t errlen);
 
 /** The tool memory's key in a transcript's text: the earliest complete run of call blocks at or after `p`,
  * from a call's author (just past its <|message_model|>, or `p` itself when the author starts it) through the
  * <|end_message|> of the last call that follows block after block; `*end` = one past it.  NULL = none (an
  * unclosed block is none).  The output parser's raw span of a turn's calls has exactly these bounds. */
+/// @param p   NUL-terminated transcript text to search
+/// @param end receives one past the run's last <|end_message|>
+/// @return the run's start, or NULL when there is no complete run
 const char *inkling_find_call_block(const char *p, const char **end);
 
 /** The system turn of a rendered prompt, for the model-visible tool error's reminder: the bodies of its leading
  * system blocks -- the tool declaration, the system messages -- without the effort line, joined by a blank line;
  * empty when it has none. */
+/// @param prompt a rendered prompt (NULL reads as "")
+/// @return the system blocks' bodies joined by a blank line, or "" when there are none
 std::string inkling_rendered_system_text(const char *prompt);
 
 /** Inkling's output grammar for the kit: its eight content-block markers, the transition table, and the
  * tokenizer's other special tokens as dropped markers (vLLM drops a special token that is not a terminal;
  * inkling-chat-gate asserts the two lists are special_tokens_map.json's).  A turn after the generation
  * prompt's `<|message_model|>` starts in OUT_HEADER. */
+/// @return the family's grammar (static storage)
 const out_grammar &inkling_output_grammar(void);
 
 /** The sampled-text parser for one Inkling assistant turn: the kit's parser in Inkling's configuration (its

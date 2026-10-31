@@ -1,3 +1,5 @@
+/** @file
+ *  The segment-chain persist / restore of a session's KV (pulsar_kvchain.h). */
 /* L264: a session's KV as a segment chain (pulsar_kvchain.h). */
 #include "pulsar_kvchain.h"
 #include "pulsar_kvtext.h"
@@ -277,6 +279,16 @@ int pulsar_kvchain_load_slice_with(pulsar_segstore *st, const pulsar_segstore_se
     return 0;
 }
 
+/** The pulsar_kvchain_segment_loader that loads into a session's installed bank (pulsar_session_load_segment).
+ *  @param ud     the pulsar_session
+ *  @param fp     the segment's payload, positioned at its first byte
+ *  @param bytes  the payload's size
+ *  @param last   restore the segment's state too
+ *  @param G      receives the position the bank stands at, or NULL
+ *  @param key    the segment's key
+ *  @param err    receives a reason on failure
+ *  @param errlen size of `err`
+ *  @return pulsar_session_load_segment's status: 0 = loaded */
 static int session_segment_loader(void *ud, FILE *fp, uint64_t bytes, bool last, int *G, const char *key, char *err,
                                   size_t errlen) {
     TokPos at{0};

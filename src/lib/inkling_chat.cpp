@@ -1,3 +1,5 @@
+/** @file
+ *  The Inkling-Small renderer, effort authority and output grammar (vLLM's native Inkling renderer). */
 /* inkling_chat.cpp -- the Inkling-Small renderer, effort authority and output grammar.  See inkling_chat.h.
  * Every literal and every rule below is vLLM's native Inkling renderer (vllm/renderers/inkling.py and
  * inkling_encoding.py) or its parser's transition table (vllm/parser/inkling.py), in vLLM's order, so a

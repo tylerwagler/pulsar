@@ -1,3 +1,5 @@
+/** @file
+ *  The byte-level BPE tokenizer engine: added-token cut, NFC, pre-tokenizer patterns, merges and decode. */
 /* bpe_tokenizer.cpp -- see bpe_tokenizer.h. */
 #include "bpe_tokenizer.h"
 

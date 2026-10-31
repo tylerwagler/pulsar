@@ -1,3 +1,5 @@
+/** @file
+ *  The Qwen3.8-Flash-Next chat format: renderer, reasoning-effort authority and output parser. */
 /* qwen_chat.h -- the Qwen3.8-Flash-Next chat format (L251 S5): the one
  * renderer, the reasoning-effort authority and the output parser.
  *
@@ -58,24 +60,41 @@
 #include "pulsar.h"
 #include "pyjson.h"
 
+/// The reasoning-effort levels the Qwen template can express (its reasoning_effort names; NONE = thinking off).
 enum qwen_effort {
     QWEN_EFFORT_NONE,    ///< enable_thinking=false
+    /// reasoning_effort=low (the template's short-thinking instruction line)
     QWEN_EFFORT_LOW,
+    /// reasoning_effort=medium (no instruction line)
     QWEN_EFFORT_MEDIUM,
+    /// reasoning_effort=xhigh, the template's default (the careful-thinking instruction line)
     QWEN_EFFORT_XHIGH,
 };
 
 /** The family's default effort: the template's `reasoning_effort|default('xhigh')`. */
+/// @return QWEN_EFFORT_XHIGH
 qwen_effort qwen_effort_default(void);
 /** "none", "low", "medium", "xhigh" -> the effort; false for anything else
  * (the template raises on any other name; "none" is thinking-off). */
+/// @param name the effort's name (may be NULL)
+/// @param out  receives the effort when `name` is known
+/// @return true when `name` is "none", "low", "medium" or "xhigh"
 bool qwen_effort_parse(const char *name, qwen_effort *out);
+/// The effort's name, as qwen_effort_parse reads it.
+/// @param e the effort
+/// @return "none", "low", "medium" or "xhigh" ("?" for an out-of-range value)
 const char *qwen_effort_name(qwen_effort e);
 /** The template's own variables resolved (the CLI tools and the engine's default prompt; the server maps
  * every protocol's effort names onto these first -- chat_family.cpp's one effort table).  `name` is a
  * template name (NULL = not sent); `thinking` the switch (-1 not sent, 0 off, 1 on).  Thinking off is
  * QWEN_EFFORT_NONE whatever the name; otherwise an unsent name is qwen_effort_default() and a sent one
  * must be one the template knows; thinking on with "none" is refused. */
+/// @param name     the template effort name, or NULL when not sent
+/// @param thinking the thinking switch: -1 not sent, 0 off, 1 on
+/// @param out      receives the resolved effort
+/// @param err      receives the refusal reason (may be NULL)
+/// @param errlen   size of `err`
+/// @return true on success, false on refusal
 bool qwen_effort_resolve(const char *name, int thinking, qwen_effort *out, char *err, size_t errlen);
 
 /** One tool call of an assistant message, as the API carries it. */
@@ -127,12 +146,22 @@ struct qwen_render_out {
 };
 
 /** Render.  false + "<refusal key>: detail" on refusal. */
+/// @param in     the conversation, tools and effort
+/// @param out    receives the text and its client-span map
+/// @param err    receives "<refusal key>: detail" on refusal
+/// @param errlen size of `err`
+/// @return true on success, false on refusal
 bool qwen_chat_render(const qwen_render_in &in, qwen_render_out *out, char *err, size_t errlen);
 
 /** L325: tool definitions in the tools block's encoding -- "<tools>", each tool on its own line as tojson,
  *  "\n</tools>" -- for a tool loaded mid-conversation, rendered in place inside the turn that loaded it (the
  *  server writes it into that tool result's text).  `tools_json` is an OpenAI tools array.  Refusal:
  *  tools_not_array. */
+/// @param tools_json the OpenAI tools array as JSON text
+/// @param out        receives the tools block's text and its client-span map
+/// @param err        receives "<refusal key>: detail" on refusal
+/// @param errlen     size of `err`
+/// @return true on success, false on refusal
 bool qwen_chat_tool_defs(const char *tools_json, qwen_render_out *out, char *err, size_t errlen);
 
 /** The assistant turn `m` as the model SAMPLES it: the bytes the full render writes for the turn past
@@ -144,6 +173,12 @@ bool qwen_chat_tool_defs(const char *tools_json, qwen_render_out *out, char *err
  * follows it (the live KV ends before the stop token either way; see qwen_chat_render_tail).
  * Refusals: reasoning_without_thinking (a thinking-off turn cannot carry reasoning: its block was
  * closed empty by the prompt), and render_calls' (tool_name_missing, tool_arguments_*). */
+/// @param m        the assistant message
+/// @param thinking the generation prompt opened a think block
+/// @param out      receives the turn's bytes and their client-span map
+/// @param err      receives "<refusal key>: detail" on refusal
+/// @param errlen   size of `err`
+/// @return true on success, false on refusal
 bool qwen_chat_render_assistant_turn(const qwen_msg_in &m, bool thinking, qwen_render_out *out, char *err,
                                      size_t errlen);
 
@@ -153,6 +188,13 @@ bool qwen_chat_render_assistant_turn(const qwen_msg_in &m, bool thinking, qwen_r
  * generation prompt for `effort`.  full(history) + sampled turn + this = full(history + turn + msgs)
  * with add_generation_prompt.  Refusals: no_messages, system_not_first (no tail message is the
  * conversation's first), unexpected_role, and render_calls'. */
+/// @param msgs   the messages after the sampled turn
+/// @param n      entries in `msgs`
+/// @param effort the effort the generation prompt follows
+/// @param out    receives the tail's text and its client-span map
+/// @param err    receives "<refusal key>: detail" on refusal
+/// @param errlen size of `err`
+/// @return true on success, false on refusal
 bool qwen_chat_render_tail(const qwen_msg_in *msgs, int n, qwen_effort effort, qwen_render_out *out, char *err,
                            size_t errlen);
 
@@ -161,6 +203,12 @@ bool qwen_chat_render_tail(const qwen_msg_in *msgs, int n, qwen_effort effort, q
  * system message's `system` content (NULL = none; no tools) -- and is empty when it has neither.
  * full(history) = head + each turn; a turn after an assistant turn is preceded by that turn's close
  * "<|im_end|>\n" (the sampled turn ends before its stop token, as qwen_chat_render_tail's live KV does). */
+/// @param system the system message's content (client data), or NULL for none
+/// @param effort the effort whose instruction line the head carries
+/// @param out    receives the head's text and its client-span map
+/// @param err    receives "<refusal key>: detail" on refusal
+/// @param errlen size of `err`
+/// @return true on success, false on refusal
 bool qwen_chat_render_head(const char *system, qwen_effort effort, qwen_render_out *out, char *err, size_t errlen);
 
 /** One TURN of a conversation built turn by turn: `msgs` as the full render writes them after an assistant
@@ -168,12 +216,22 @@ bool qwen_chat_render_head(const char *system, qwen_effort effort, qwen_render_o
  * `effort` when `generation_prompt`.  Refusals: no_messages (no messages and no generation prompt),
  * system_not_first (a system message here is not the conversation's first -- a front end writes a mid-
  * conversation note as a user turn of qwen_system_reminder), unexpected_role, and render_calls'. */
+/// @param msgs              the turn's messages
+/// @param n                 entries in `msgs`
+/// @param effort            the effort the generation prompt follows
+/// @param generation_prompt end with the generation prompt for `effort`
+/// @param out               receives the turn's text and its client-span map
+/// @param err               receives "<refusal key>: detail" on refusal
+/// @param errlen            size of `err`
+/// @return true on success, false on refusal
 bool qwen_chat_render_turn(const qwen_msg_in *msgs, int n, qwen_effort effort, bool generation_prompt,
                            qwen_render_out *out, char *err, size_t errlen);
 
 /** A system message that is not the conversation's first, as the content of the user turn that carries it
  * (the template has no in-place system turn): the ONE spelling the server's renderer and the turn-by-turn
  * front ends use. */
+/// @param content the system message's text (NULL reads as "")
+/// @return "<system-reminder>\n" + content + "\n</system-reminder>"
 std::string qwen_system_reminder(const char *content);
 
 /** Qwen's tool-call body for the output-parser kit (out_parse_kit.h): XML parameters inside one
@@ -261,6 +319,7 @@ private:
  * on); `<tool_call>` ... `</tool_call>` is a call; text after a call is content again (the prompt forbids
  * it; the client still sees it).  Reasoning and content are reported STRIPPED (the template strips both on
  * replay), so a turn the parser read re-renders to the bytes the model sampled. */
+/// @return the family's grammar (static storage)
 const out_grammar &qwen_output_grammar(void);
 
 /** The sampled-text parser for one Qwen assistant turn: the kit's parser in Qwen's configuration. */
