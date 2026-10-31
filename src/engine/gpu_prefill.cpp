@@ -463,17 +463,6 @@ static bool gpu_graph_comp_ape_fold(
 }
 
 
-/* Run kv source `il`'s compressor over this batch's rows (batch_comp_kv/sc
- * hold the kv / score projections of every row) and emit what completes.
- * Two arms, bit-equivalent by construction:
- *   - batched: a run of one bank starting on a group boundary -- one pool over
- *     the run, the trailing partial group left in the state;
- *   - per row: store each row, emit at each boundary.
- * A single-bank aligned batch is one batched run; a mixed multiseq step runs its
- * decode/verify rows per row and each prompt run per row up to its first group
- * boundary, batched from there.
- * A zero-prefix chunk is the aligned run at row 0.  comp_counts[t] receives
- * the compressed rows visible to row t after its own emit, (pos+1)/ratio. */
 /* The latent's bf16 plane, reserved for the compressor kernel to write beside its f32 rows (rule 3: the producer
  * emits).  Its one consumer is V4.1's index-key projection -- `indexer.wk`, a bf16 Linear in the reference and a bf16
  * tensor in the container -- whose GEMM reads the bf16 plane and refuses a buffer no producer emitted (L159).  0731's
@@ -491,7 +480,18 @@ static bool csa2_latent_bf16_slot(const pulsar_gpu_tensor *latent, uint32_t n_ro
     return false;
 }
 
-/// Kv source il's compressor over the batch (see the block above csa2_latent_bf16_slot).
+/* Run kv source `il`'s compressor over this batch's rows (batch_comp_kv/sc
+ * hold the kv / score projections of every row) and emit what completes.
+ * Two arms, bit-equivalent by construction:
+ *   - batched: a run of one bank starting on a group boundary -- one pool over
+ *     the run, the trailing partial group left in the state;
+ *   - per row: store each row, emit at each boundary.
+ * A single-bank aligned batch is one batched run; a mixed multiseq step runs its
+ * decode/verify rows per row and each prompt run per row up to its first group
+ * boundary, batched from there.
+ * A zero-prefix chunk is the aligned run at row 0.  comp_counts[t] receives
+ * the compressed rows visible to row t after its own emit, (pos+1)/ratio. */
+/// Kv source il's compressor over the batch (the block above).
 /// @param g the graph
 /// @param model the model
 /// @param layer the layer's weights
