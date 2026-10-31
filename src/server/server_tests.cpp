@@ -5490,6 +5490,32 @@ static void test_parse_completion_request_refuses_logprobs(void) {
     }
 }
 
+/* L335: /v1/embeddings' "dimensions" is a number: 1024 and 1024.0 ask for the 1024-wide model alike (the text
+ * comparison refused 1024.0); a non-integral value refuses as not an integer, an integral other width as that. */
+static void test_embeddings_dimensions_compare_as_numbers(void) {
+    static const struct { const char *json; bool ok; const char *why; } k[] = {
+        {"1024", true, NULL},
+        {"1024.0", true, NULL},
+        {"1.024e3", true, NULL},
+        {"1024.5", false, "must be an integer"},
+        {"\"1024\"", false, "must be an integer"},
+        {"null", false, "must be an integer"},
+        {"512", false, "returns 1024 only"},
+        {"512.0", false, "returns 1024 only"},
+        {"-1024", false, "returns 1024 only"},
+    };
+    for (const auto &c : k) {
+        pyjson_value v;
+        char perr[128];
+        TEST_ASSERT(pyjson_parse(c.json, strlen(c.json), &v, perr, sizeof perr));
+        std::string err;
+        TEST_ASSERT(read_dimensions(&v, 1024, &err) == c.ok);
+        TEST_ASSERT(c.ok ? err.empty() : err.find(c.why) != std::string::npos);
+    }
+    std::string err;
+    TEST_ASSERT(read_dimensions(NULL, 1024, &err) && err.empty());   /* absent: the model's width */
+}
+
 /* L335: /v1/completions takes ONE text prompt -- a string or an array of one string.  A batch (an array of more than
  * one prompt), token ids, an empty array or a non-string refuse by name; they used to read as their first element
  * (the rest of the batch dropped) or as "". */
@@ -12044,6 +12070,7 @@ static void pulsar_server_unit_tests_run(void) {
     test_parse_sampling_key_contract();
     test_parse_completion_request_refuses_logprobs();
     test_parse_completion_prompt_shapes();
+    test_embeddings_dimensions_compare_as_numbers();
     test_json_parser_handles_tool_heavy_requests();
     test_json_string_handles_surrogates();
     test_model_metadata_clamps_completion_to_context();

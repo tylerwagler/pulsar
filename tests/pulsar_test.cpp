@@ -26,6 +26,7 @@
 #include "../src/server/http_server.cpp"
 #include "../src/server/watchdog.cpp"
 #include "../src/server/cli_main.cpp"
+#include "../src/server/encode_server.cpp"
 #include "../src/server/server_tests.cpp"
 #include "../src/lib/pulsar_utf8.h"
 #include "../src/lib/pulsar_think_scan.hpp"
