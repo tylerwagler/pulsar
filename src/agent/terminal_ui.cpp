@@ -935,8 +935,13 @@ static bool editor_configure_scroll_region(agent_editor *ed) {
     ed->reserved_rows = 0;
     ed->output_cursor_saved = false;
     ed->output_at_scroll_boundary = false;
+    /* editor_set_scroll_layout acts only with the flag up; a failed layout installs nothing, so the flag comes
+     * down again (else the next call returns "configured" for a region that was never set) */
     ed->scroll_region = true;
-    if (!editor_set_scroll_layout(ed, 2, true, false)) return false;
+    if (!editor_set_scroll_layout(ed, 2, true, false)) {
+        ed->scroll_region = false;
+        return false;
+    }
 
     /* The agent prints backend startup lines before the editor exists.  Once
      * the scroll region is installed, create an append line at the bottom of
