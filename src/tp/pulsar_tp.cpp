@@ -177,7 +177,8 @@ typedef void *tp_ibv_comp_channel;  /* struct ibv_comp_channel * */
  * carries IDENTICAL bytes at a later index, only distinguishable by gid_type.
  * RC rejected that AV with EINVAL at RTR; UC swallowed it into a dead QP.
  * Secondary finding: the mirrored tp_ibv_port_attr put link_layer at offset
- * 39 where the real struct has it at 46.  Both argue for the same discipline —
+ * 39 where the real struct has it at 46 (the fallback below now mirrors the
+ * real layout, offsets asserted).  Both argue for the same discipline —
  * when libibverbs-dev is installed (dev + both Sparks) use the REAL rdma-core
  * structs for every value handed to the verbs stack, and query the per-entry
  * gid_type via _ibv_query_gid_ex.  The TP_IBV_* names below alias to the real
@@ -423,31 +424,42 @@ struct tp_ibv_qp_attr {
     uint32_t rate_limit;
 };
 
-/* struct ibv_port_attr: stable-prefix fields only; the version-varying tail
- * is absorbed by padding.  Load-bearing offsets — state@0, active_mtu@8,
- * gid_tbl_len@12, lid@34, link_layer@39 — are constant across rdma-core. */
+/* struct ibv_port_attr, field for field as rdma-core's libibverbs/verbs.h
+ * declares it; the version-varying tail is absorbed by padding.  The fields
+ * we read -- state, active_mtu, max_msg_sz, lid, link_layer -- sit at the
+ * offsets asserted below (link_layer is @46, after phys_state: the old mirror
+ * had it @39, where max_vl_num lives). */
 struct tp_ibv_port_attr {
     int state;              /* enum ibv_port_state      @0  */
     int max_mtu;            /* enum ibv_mtu             @4  */
     int active_mtu;         /* enum ibv_mtu             @8  */
-    uint32_t gid_tbl_len;   /*                           @12 */
-    uint32_t port_cap_flags_stub;
-    uint32_t max_msg_sz;
+    int gid_tbl_len;        /*                           @12 */
+    uint32_t port_cap_flags;
+    uint32_t max_msg_sz;    /*                           @20 */
     uint32_t bad_pkey_cntr;
     uint32_t qkey_viol_cntr;
     uint16_t pkey_tbl_len;  /*                           @32 */
     uint16_t lid;           /*                           @34 */
     uint16_t sm_lid;
     uint8_t lmc;
-    uint8_t link_layer;     /* enum ibv_link_layer      @39 */
-    uint8_t max_vl_num;
+    uint8_t max_vl_num;     /*                           @39 */
     uint8_t sm_sl;
     uint8_t subnet_timeout;
     uint8_t init_type_reply;
+    uint8_t active_width;
     uint8_t active_speed;
     uint8_t phys_state;
+    uint8_t link_layer;     /* enum ibv_link_layer      @46 */
+    uint8_t flags;
+    uint16_t port_cap_flags2;
+    uint32_t active_speed_ex;
     uint8_t pad[32];        /* version-varying tail */
 };
+static_assert(offsetof(tp_ibv_port_attr, active_mtu) == 8, "rdma-core ibv_port_attr layout");
+static_assert(offsetof(tp_ibv_port_attr, max_msg_sz) == 20, "rdma-core ibv_port_attr layout");
+static_assert(offsetof(tp_ibv_port_attr, lid) == 34, "rdma-core ibv_port_attr layout");
+static_assert(offsetof(tp_ibv_port_attr, link_layer) == 46, "rdma-core ibv_port_attr layout");
+static_assert(offsetof(tp_ibv_port_attr, active_speed_ex) == 52, "rdma-core ibv_port_attr layout");
 
 /* Object prefixes read back from library-owned memory (only the leading,
  * stable members are touched). */
