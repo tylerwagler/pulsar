@@ -16,9 +16,14 @@
  *                       against the host order, selection for selection.
  *    4. hc-expand-nhc   pulsar_gpu_hc_expand_split_tensor runs n_hc 4 and refuses 3 and 5 (a runtime-loop arm used to
  *                       take any other count).
+ *    5. idx-decode-bound pulsar_gpu_indexer_scores_decode_run_tensor over a bank holding ONLY its visible rows, flush
+ *                       against the end of an allocation, with a 1024-wide scores row: no read past the visible rows
+ *                       (it used to stage the whole 128-row tile), scores equal to a garbage-padded bank's.
  *
  *  Prints one line per case and KERNEL CONTRACT GATE PASS / FAIL. */
 #include "pulsar_gpu.h"
+#include "cuda/pulsar_cuda_arch.cuh"
+#include "cuda/pulsar_cuda_internal.h"   /* PULSAR_IDX_MXFP4_HEADS_V4 */
 #include "cuda/pulsar_cuda_mx.cuh"
 
 #include <cuda_runtime.h>
@@ -27,6 +32,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <algorithm>
 #include <vector>
 
@@ -241,6 +247,68 @@ static void case_hc_expand_nhc(void) {
     if (bad) fail("hc-expand-nhc: a carrier count other than 4 ran, or 4 refused");
 }
 
+/* ---- 5. idx-decode-bound --------------------------------------------------------------------------------------- */
+
+/// Case 5: a decode run whose bank holds exactly its visible rows, placed flush against the END of a fresh 2 MiB
+/// allocation, over a 1024-wide scores row (the tile reaches far past the visible rows): the launch must not fault,
+/// and its scores must equal the same run over a bank padded with garbage past the visible rows.
+static void case_idx_decode_bound(void) {
+    if (!pulsar_cuda_block_scale_mma(pulsar_cuda_device_major())) {
+        printf("  5 idx-decode-bound: no block-scaled MMA on this device -- the scorer refuses; not reachable here\n");
+        return;
+    }
+    const uint32_t n_head = PULSAR_IDX_MXFP4_HEADS_V4, rb = PULSAR_MXKV_FP4_ROWBYTES(128u);
+    const uint32_t ratio = 4u, run_pos0 = 37u * 4u, run_n = 1u, n_comp = 1024u;
+    const uint32_t vis = (run_pos0 + run_n) / ratio;   /* 37 */
+    uint64_t s = 0x9e3779b97f4a7c15ull;
+    auto fill = [&s](std::vector<uint8_t> &b, uint32_t rows) {
+        for (uint32_t r = 0; r < rows; r++)
+            for (uint32_t i = 0; i < PULSAR_MXKV_FP4_ROWBYTES(128u); i++) {
+                s = s * 6364136223846793005ull + 1442695040888963407ull;
+                b[(size_t)r * PULSAR_MXKV_FP4_ROWBYTES(128u) + i] = i < 64u ? (uint8_t)(s >> 56) : (uint8_t)127u;
+            }
+    };
+    std::vector<uint8_t> qh((size_t)run_n * n_head * rb), ch((size_t)n_comp * rb);
+    fill(qh, run_n * n_head);
+    fill(ch, n_comp);   /* rows past vis: garbage the padded run must ignore */
+    std::vector<float> wh((size_t)run_n * n_head, 0.25f);
+    const uint64_t big = 2ull << 20;
+    pulsar_gpu_tensor *q = pulsar_gpu_tensor_alloc(qh.size());
+    pulsar_gpu_tensor *w = pulsar_gpu_tensor_alloc(wh.size() * 4u);
+    pulsar_gpu_tensor *pad = pulsar_gpu_tensor_alloc(ch.size());
+    pulsar_gpu_tensor *edge = pulsar_gpu_tensor_alloc(big);
+    pulsar_gpu_tensor *sa = pulsar_gpu_tensor_alloc((uint64_t)run_n * n_comp * 4u);
+    pulsar_gpu_tensor *sb = pulsar_gpu_tensor_alloc((uint64_t)run_n * n_comp * 4u);
+    pulsar_gpu_tensor *flush = edge ? pulsar_gpu_tensor_view(edge, big - (uint64_t)vis * rb, (uint64_t)vis * rb) : NULL;
+    std::vector<float> a((size_t)run_n * n_comp), b((size_t)run_n * n_comp);
+    if (!q || !w || !pad || !edge || !sa || !sb || !flush || !pulsar_gpu_tensor_write(q, 0, qh.data(), qh.size()) ||
+        !pulsar_gpu_tensor_write(w, 0, wh.data(), wh.size() * 4u) ||
+        !pulsar_gpu_tensor_write(pad, 0, ch.data(), ch.size()) ||
+        !pulsar_gpu_tensor_write(flush, 0, ch.data(), (uint64_t)vis * rb)) {
+        fail("idx-decode-bound: alloc / upload");
+    } else if (!pulsar_gpu_indexer_scores_decode_run_tensor(sa, q, w, pad, n_comp, run_n, run_pos0, n_head, 128u, ratio,
+                                                            1.0f) ||
+               !pulsar_gpu_indexer_scores_decode_run_tensor(sb, q, w, flush, n_comp, run_n, run_pos0, n_head, 128u,
+                                                            ratio, 1.0f) ||
+               !pulsar_gpu_synchronize() || !pulsar_gpu_tensor_read(sa, 0, a.data(), a.size() * 4u) ||
+               !pulsar_gpu_tensor_read(sb, 0, b.data(), b.size() * 4u)) {
+        fail("idx-decode-bound: launch (a fault here is the read past the bank's visible rows)");
+    } else {
+        int bad = 0;
+        for (size_t i = 0; i < a.size(); i++) bad += memcmp(&a[i], &b[i], 4) != 0;
+        printf("  5 idx-decode-bound: %u visible of %u, bank flush at the allocation end: %d scores differ\n", vis,
+               n_comp, bad);
+        if (bad) fail("idx-decode-bound: the scores depend on rows past the visible bound");
+    }
+    pulsar_gpu_tensor_free(flush);
+    pulsar_gpu_tensor_free(q);
+    pulsar_gpu_tensor_free(w);
+    pulsar_gpu_tensor_free(pad);
+    pulsar_gpu_tensor_free(edge);
+    pulsar_gpu_tensor_free(sa);
+    pulsar_gpu_tensor_free(sb);
+}
+
 /// Runs every case on device 0.
 /// @return 0 on PASS, 1 on FAIL
 int main(void) {
@@ -252,6 +320,7 @@ int main(void) {
     case_embed_sentinel();
     case_indexer_topk();
     case_hc_expand_nhc();
+    case_idx_decode_bound();
     puts(g_fail ? "KERNEL CONTRACT GATE FAIL" : "KERNEL CONTRACT GATE PASS");
     return g_fail ? 1 : 0;
 }

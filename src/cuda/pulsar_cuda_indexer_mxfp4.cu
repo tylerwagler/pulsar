@@ -342,7 +342,10 @@ static void idx_scores_mxfp4_kernel(
         const uint32_t sl = u >> 3u, rem = u & 7u, hf = rem >> 2u, tg = rem & 3u;
         uint16_t *dst = (uint16_t *)(sB + c * IDX_BPSTRIDE) + tg * 8u + sl * 2u + hf;
         const uint32_t comp_i = tile_c + c;
-        if (comp_i >= n_comp) {
+        /* A row no token of this block can see is never read (L335): its score is -inf whatever the row holds, and
+         * a decode-run caller (pulsar_gpu_indexer_scores_decode_run_tensor) bounds its bank's comp operand at the
+         * visible rows only, not at the n_comp-wide tile. */
+        if (comp_i >= n_comp || (causal && comp_i >= vis_max)) {
             *dst = 0u;
             if (u < IDX_KSLABS) sSFB[c * IDX_KSLABS + u] = 0;
             continue;
