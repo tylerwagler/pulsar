@@ -1,3 +1,5 @@
+/** @file
+ *  Gated DeltaNet block contract: everything between the linear-attention layer's projections, and its state layout. */
 /* Gated DeltaNet (L251, Qwen3.8-Flash-Next): everything BETWEEN the block's
  * projections for the 36 linear-attention layers -- the causal conv (and its
  * 3-token state), SiLU, the q/k L2 norms, the decay/beta gates, the delta-rule
@@ -53,6 +55,7 @@
  * from a CUDA-free TU: the runtime's own typedef is all it needs (it passes 0,
  * the per-thread default stream the engine runs on).  Same guard as
  * pulsar_cuda_qwen.h. */
+/// The CUDA runtime's stream handle, declared for CUDA-free includers (same definition as cuda_runtime.h's).
 typedef struct CUstream_st *cudaStream_t;
 #endif
 
@@ -101,21 +104,28 @@ typedef struct {
  *  pointers; every f32 pointer 16-byte aligned and every pitch a multiple of
  *  4 floats. */
 typedef struct {
+    /** Sequences in the call (>= 1). */
     int            n_seq;
     int            seq_rows;      /**< rows per sequence; with seq_first, the LONGEST sequence's */
     /** L272 P1 S4: device [n_seq + 1] row offsets of ragged sequences (s is rows
      *  [seq_first[s], seq_first[s + 1])), or NULL = uniform (s is rows [s * seq_rows, (s + 1) * seq_rows)).
      *  With it, n_rows is the call's total rows (= seq_first[n_seq]); without, n_rows is 0 or n_seq * seq_rows. */
     const int32_t *seq_first;
+    /** Total rows of a ragged call (= seq_first[n_seq]); 0 or n_seq * seq_rows when uniform. */
     int            n_rows;
     const int32_t *row_slot;      /**< [n_seq * seq_rows] state slot (bank) of each row */
     float         *conv_state;    /**< pool, PULSAR_GDN_CONV_STATE_FLOATS per slot */
     float         *rec_state;     /**< pool, PULSAR_GDN_REC_STATE_FLOATS per slot */
+    /** in_proj_qkv output, f32 [rows][ld_qkv]; ld_qkv (documented after it) is its pitch in floats. */
     const float   *qkv; int ld_qkv;   /**< in_proj_qkv output [rows][10240] */
+    /** in_proj_z output, f32 [rows][ld_z] (the gated norm's gate). */
     const float   *z;   int ld_z;     /**< in_proj_z output [rows][6144] */
+    /** in_proj_a output, f32 [rows][ld_a] (the decay's softplus input). */
     const float   *a;   int ld_a;     /**< in_proj_a output [rows][48] */
+    /** in_proj_b output, f32 [rows][ld_b] (beta's sigmoid input). */
     const float   *b;   int ld_b;     /**< in_proj_b output [rows][48] */
     void          *scratch;           /**< >= pulsar_gdn_scratch_bytes(rows) */
+    /** Bytes at scratch (refused below pulsar_gdn_scratch_bytes(rows)). */
     size_t         scratch_bytes;
     float         *out_f32;           /**< [rows][6144] or NULL */
     void          *out_bf16;          /**< bf16 [rows][6144] or NULL -- what the Qwen out_proj reads
@@ -134,6 +144,8 @@ typedef struct {
      *  exactly the arithmetic this call ran.  Both NULL (every other call) or both set.  The outputs are
      *  unchanged. */
     float         *conv_rows;
+    /** L288 verify: out [rows][pulsar_gdn_upd_floats(tp_ranks)] per-row recurrent updates, or NULL; set
+     *  together with conv_rows (see conv_rows). */
     float         *rec_upd;
     /** L266 step 7: the tensor-parallel degree (0 or 1 = the whole layer).  At 2 the call is ONE rank's
      *  heads -- NK / 2 key heads and the NV / 2 value heads reading them -- with its own qkv / z / a / b
@@ -144,20 +156,36 @@ typedef struct {
 
 /** Scratch bytes a call of up to `rows` rows needs: f32 q^ k^ v [rows][10240] and
  *  decay, beta [rows][96]. */
+/// @param rows the call's rows (the whole layer's width bounds a rank's)
+/// @return scratch bytes
 size_t pulsar_gdn_scratch_bytes(int rows);
 /** Per-slot state floats for one rank at the tensor-parallel degree tp_ranks (0 / 1 = the whole layer:
  *  PULSAR_GDN_CONV_STATE_FLOATS / PULSAR_GDN_REC_STATE_FLOATS). */
+/// @param tp_ranks tensor-parallel degree (2 = one rank's half, anything else = the whole layer)
+/// @return conv-state floats per slot
 size_t pulsar_gdn_conv_state_floats(int tp_ranks);
+/// Per-slot recurrent-state floats for one rank (see pulsar_gdn_conv_state_floats).
+/// @param tp_ranks tensor-parallel degree (2 = one rank's half, anything else = the whole layer)
+/// @return recurrent-state floats per slot
 size_t pulsar_gdn_rec_state_floats(int tp_ranks);
 
 /** L288: floats per row of a verify's recurrent update (pulsar_gdn_call::rec_upd) for one rank at the
  *  tensor-parallel degree tp_ranks: NV x DV deltas, NK x DK k^, NV decays (the rank's heads), padded to 4. */
+/// @param tp_ranks tensor-parallel degree (2 = one rank's half, anything else = the whole layer)
+/// @return floats per row of rec_upd
 size_t pulsar_gdn_upd_floats(int tp_ranks);
 
 /** L288: advance ONE slot's recurrent state by the first `keep` rows of a verify sequence: `upd` is the
  *  sequence's first row in the verify's rec_upd.  Each state element takes S = fmaf(k^_k, delta_v, decay * S)
  *  per row, the operation pulsar_gdn_forward's recurrence performs, on the same f32 values -- so the state is
  *  BIT-IDENTICAL to a forward over those rows.  keep 1 .. the sequence's rows.  0, or -1 refused. */
+/// @param rec_state device recurrent-state pool (16-byte aligned)
+/// @param slot      the slot to advance
+/// @param upd       device: the sequence's first row of the verify's rec_upd
+/// @param keep      rows to apply, 1 .. the sequence's rows (and <= 65536)
+/// @param tp_ranks  tensor-parallel degree the verify ran at
+/// @param stream    stream to launch on
+/// @return 0, or -1 refused (named on stderr)
 int pulsar_gdn_commit(float *rec_state, int slot, const float *upd, int keep, int tp_ranks, cudaStream_t stream);
 
 /** Run the whole non-Linear GDN block for one layer on `stream` (two
@@ -166,6 +194,9 @@ int pulsar_gdn_commit(float *rec_state, int slot, const float *upd, int keep, in
  *  Distinct sequences of one call must be on distinct slots.
  *  @return 0 on success, -1 on a refused contract (named on stderr, nothing
  *  launched), -3 on a launch failure. */
+/// @param w      the layer's non-Linear weights (device)
+/// @param c      the call: rows, slots, inputs, scratch, outputs
+/// @param stream stream to launch on
 int pulsar_gdn_forward(const pulsar_gdn_weights *w, const pulsar_gdn_call *c, cudaStream_t stream);
 
 #ifdef __cplusplus

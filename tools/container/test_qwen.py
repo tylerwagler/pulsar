@@ -41,10 +41,11 @@ from test_deepseek import digest  # noqa: E402
 
 FAILS: list[str] = []
 # sha256 over (file name, sha256(file)) of every emitted file, in name order (test_deepseek.digest); taken at dev
-# bdb62d13 (pre-L279)
+# bdb62d13 (pre-L279), re-taken at 0.5.0-rc1 when qwen38fn-u-e4-d5.json's "about" (carried in the emitted header)
+# stopped naming a private notes path -- no tensor byte moved
 GOLDEN = {
-    "fused": "a4d6fc36f9d898f229f188d6d2f76bf77e8d55a62da9c2d03df85522837e171b",
-    "split": "d818bfd9a3ba47de09a8c1b837be41ed9effa401d89286d277d09667d186cf1a",
+    "fused": "d32f2b83ba1b42dc60ad3faa4333438accb1e8865742f862b8546c83939969a2",
+    "split": "e34ae7f01a133dfba290f22cd0ed12c5f3b916111227b6672d5af4902d7f9670",
 }
 PFX = "model.language_model."
 H, L, E, FF, HC, LR = 256, 4, 4, 128, 4, 64

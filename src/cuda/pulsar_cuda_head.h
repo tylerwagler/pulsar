@@ -1,3 +1,5 @@
+/** @file
+ *  Model-head family options contract (pulsar_head_decl): the embedding norm and the logits finish. */
 /* The model head's family options (L295 E5): what a family DECLARES about the
  * two ends of its stack, run by shared kernels.  The engine owns the head GEMM
  * (the bf16-rows front door, pulsar_rows_linear_launch), the sampler and the
@@ -32,6 +34,7 @@
 #ifdef __CUDACC__
 #include <cuda_runtime.h>
 #else
+/// The CUDA runtime's stream handle, declared for CUDA-free includers (same definition as cuda_runtime.h's).
 typedef struct CUstream_st *cudaStream_t;
 #endif
 
@@ -46,6 +49,7 @@ extern "C" {
 typedef struct {
     uint32_t        n_embd;          /**< the embedding / hidden width (a multiple of 8) */
     const uint16_t *embed_norm_w;    /**< device bf16 [n_embd], used as is (no 1 + w), or NULL: no embedding norm */
+    /** the embedding norm's epsilon (>= 0; read only with embed_norm_w) */
     float           embed_norm_eps;
     uint32_t        n_logits;        /**< the head's rows = the logits row width (the padded vocab) */
     uint32_t        n_real;          /**< ids < n_real are real; 1 .. n_logits */
@@ -57,6 +61,14 @@ typedef struct {
  *  a device [n] array of ids the engine has already checked; an id outside
  *  [0, n_vocab) writes a NaN row (never another row).
  *  @return 0, -1 refused (named on stderr, nothing launched), -3 launch failure. */
+/// @param h       the head declaration
+/// @param table   device bf16 embedding table [n_vocab][n_embd]
+/// @param n_vocab rows in the table
+/// @param ids     device [n] token ids
+/// @param n       rows to embed (one CTA each)
+/// @param out     device bf16 output rows (16-byte aligned)
+/// @param ld_out  out row pitch in elements (a multiple of 8, >= n_embd)
+/// @param stream  stream to launch on
 int pulsar_head_embed_launch(const pulsar_head_decl *h, const uint16_t *table, uint32_t n_vocab, const int32_t *ids,
                              uint32_t n, uint16_t *out, uint64_t ld_out, cudaStream_t stream);
 
@@ -64,6 +76,11 @@ int pulsar_head_embed_launch(const pulsar_head_decl *h, const uint16_t *table, u
  *  (ld >= n_logits), columns [0, n_logits).  Nothing launches when the head
  *  declares neither a scale nor padding.
  *  @return 0, -1 refused, -3 launch failure. */
+/// @param h      the head declaration
+/// @param logits device f32 logits rows, finished in place
+/// @param n      rows (1 .. 65535)
+/// @param ld     row pitch in floats (>= n_logits)
+/// @param stream stream to launch on
 int pulsar_head_logits_finish_launch(const pulsar_head_decl *h, float *logits, uint32_t n, uint64_t ld, cudaStream_t stream);
 
 #ifdef __cplusplus

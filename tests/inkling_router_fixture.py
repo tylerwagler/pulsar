@@ -4,7 +4,7 @@
 The oracle is the reference's own code, not a re-derivation: transformers' InklingTopkRouter (sigmoid scores, the
 selection bias, top-k, log-sigmoid renormalisation over the k routed logits and the S sink logits, x route_scale x
 global_scale) is instantiated, loaded with a layer's gate tensors from the 3-layer mini checkpoint
-(/mnt/models/inkling-small-mini, made by the quantization session from Inkling-Small layers 0 / 2 / 5) and run in
+(/path/to/models/inkling-small-mini, made by the quantization session from Inkling-Small layers 0 / 2 / 5) and run in
 fp32 on bf16 rows.  The rows approximate the MoE input: the mini model's fp32 reference hidden state entering that
 layer (inkling-small-mini-ref/ref_fp32.pt), RMS-normed by the layer's mlp_norm and rounded to bf16 -- the attention
 delta is omitted, so they are realistic in scale and direction, not the exact activations.  Only the router is under

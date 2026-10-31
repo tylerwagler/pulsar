@@ -11,7 +11,22 @@ Both are bit-exact by construction -- the same slices, the same kernels in the s
 new build **byte for byte against a reference build from before P4** on the same greedy requests, plus the
 engine's own per-frame cross-rank identity. Protocol v24, unchanged by L272: the reference pairs with the same frames.
 
-Hosts and launch recipe: as `tools/tp2-l264/README.md`. The plumbing is shared in `tools/tp2/lib.sh`.
+Hosts and launch recipe: the plumbing is shared in `tools/tp2/lib.sh` (also used by the tp2-l264, tp2-l266 and
+tp2-rowlane-perf kits). Run on the head (rank 0). It reads these from the environment:
+
+| Variable | Default | |
+|---|---|---|
+| `WORKER` | **required** | rank 1's ssh target |
+| `PEERS` | **required** | both ranks' TP-wire `HOST:PORT`, rank 0 (this host) first, e.g. `10.0.9.13:5590,10.0.9.12:5590` |
+| `RDMA_DEV`, `RDMA_DEV2` | `mlx5_3`, `mlx5_1` | the two RDMA rails (`PULSAR_TP_RDMA_DEV` / `_DEV2`) |
+| `CTX`, `PROTO` | 1048576, the kit's | context and the TP protocol both nodes must speak |
+| `KV`, `OUT` | `$HOME/<kit>-kv`, `$HOME/<kit>-<date>` | the disk KV dir (on both nodes) and the log dir |
+| `DS`, `Q405`, `Q605` | `~/models/...` (below) | this kit's models |
+
+`lib.sh` refuses to start without `WORKER` and `PEERS`: the pair's hosts are the operator's, so the tree carries no
+default for them.  Both ranks run
+`pulsar-server --tp-rank R --tp-nranks 2 --tp-peers HEAD:PORT,WORKER:PORT` under a transient systemd unit, worker
+first.  The kit stops the pair's `pulsar-tp` unit first and leaves it stopped.
 
 ## 1. Build both trees on both nodes, at the same paths
 
@@ -42,7 +57,8 @@ build it with `pulsar-server tests/qwen_generate` only (the plan golden is check
 ## 3. Run on the head
 
 ```sh
-~/pulsar-l272/tools/tp2-l272/run.sh ~/pulsar-l272 ~/pulsar-l272-ref
+WORKER=<rank-1 host> PEERS=<rank-0 ip>:5590,<rank-1 ip>:5590 \
+  ~/pulsar-l272/tools/tp2-l272/run.sh ~/pulsar-l272 ~/pulsar-l272-ref
 ```
 
 About 45 minutes with a reference (six model loads), 25 without. Logs: `~/l272-tp2-<date>/`; the last block of `run.log`
@@ -61,7 +77,7 @@ is the verdict. The pair is left stopped: `sudo systemctl start pulsar-tp` on bo
 ## Reading a failure
 
 - **`DeepSeek TP plan` differs:** the pair's model copy is not the artifact the golden was recorded from (offsets in
-  the diff), or the plan changed. Compare `sha256sum model.safetensors.index.json` with sparky's copy first.
+  the diff), or the plan changed. Compare `sha256sum model.safetensors.index.json` with the copy the golden was recorded from first.
 - **`A/B` differs but `identity` passes:** both ranks agree, the build changed the numbers. Run the two `qa-*.json`
   side by side: the first differing token's request names the path (a dense projection: the dense door; an MoE layer:
   the routed door; the shared expert under TP: the K slice). P4c's single-box proof is the battery, so a TP-only

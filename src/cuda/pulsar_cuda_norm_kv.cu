@@ -1,3 +1,5 @@
+/** @file
+ *  DeepSeek attention-path rows: RMSNorms, tail RoPE, the indexer FP4 packers and the raw / compressed KV stores. */
 #include "pulsar_cuda_internal.h"
 #include "pulsar_cuda_rope.cuh"   /* the tail-rope math: ONE authority (L074) */
 #include "pulsar_cuda_mx.cuh"
@@ -23,16 +25,16 @@
  * never the adds.  The shared-memory pairwise tree is byte-for-byte the old one
  * (no warp shuffles, no split-K): every float op happens in the same sequence,
  * so this is bit-exact by construction, not by measurement. */
-/* BF16 narrowing, byte-for-byte the expression f32_to_bf16_kernel uses in
- * pulsar_cuda_matmul.cu.  Written out rather than calling __float2bfloat16():
- * this epilogue REPLACES that kernel's output for the same values, so the two
- * must agree bit-for-bit, and "the intrinsic is also round-to-nearest-even"
- * is an assumption where copying the expression is a guarantee. */
-__device__ __forceinline__ static uint16_t pulsar_f32_to_bf16_rne(float f) {
-    const uint32_t u = __float_as_uint(f);
-    return (uint16_t)((u + 0x7fffu + ((u >> 16) & 1u)) >> 16);   ///< round-to-nearest-even
-}
 
+/** Plain RMSNorm of HC residual-carrier rows.  Grid rows; block BLK; static smem BLK floats (the pairwise tree).
+ *  @tparam BLK    block size (a power of two)
+ *  @tparam UNROLL loads batched per thread before their adds
+ *  @param out   f32 [rows][n] out, or NULL (the bf16 copy replaces it)
+ *  @param out_b bf16 bits [rows][n] out, or NULL
+ *  @param x     HC carrier rows [rows][n] (pulsar_hc_load widens them)
+ *  @param n     row width
+ *  @param rows  rows
+ *  @param eps   the norm's epsilon */
 template <uint32_t BLK, uint32_t UNROLL>
 __global__ static void rms_norm_plain_kernel(float *out, uint16_t *out_b,
                                              const pulsar_hc_t *x, uint32_t n, uint32_t rows, float eps) {
@@ -80,13 +82,13 @@ __global__ static void rms_norm_plain_kernel(float *out, uint16_t *out_b,
         for (uint32_t u = 0; u < UNROLL; u++) {
             const float o = v[u] * scale;
             if (orow) orow[i + u * BLK] = o;
-            if (brow) brow[i + u * BLK] = pulsar_f32_to_bf16_rne(o);
+            if (brow) brow[i + u * BLK] = pulsar_bf16_from_f32(o);
         }
     }
     for (; i < n; i += BLK) {
         const float o = pulsar_hc_load(xr, i) * scale;
         if (orow) orow[i] = o;
-        if (brow) brow[i] = pulsar_f32_to_bf16_rne(o);
+        if (brow) brow[i] = pulsar_bf16_from_f32(o);
     }
 }
 
@@ -98,6 +100,19 @@ __global__ static void rms_norm_plain_kernel(float *out, uint16_t *out_b,
 /* WBF16: the norm weight is bf16 (source format) rather than f32. Storage only
  * -- the value is promoted to f32 before it multiplies, so the arithmetic here
  * is identical either way and an f32 artifact stays bit-exact. */
+/** Weighted RMSNorm of f32 rows with optional E4M3 + ue8m0 and bf16 epilogues.  Grid rows; block 256 (a power of
+ *  two, at most 256: the tree's smem is fixed at 256).
+ *  @tparam WBF16 the weight is stored bf16 (else f32)
+ *  @param out     f32 [rows][n] out, or NULL
+ *  @param x       f32 [rows][n]
+ *  @param w       the weight [n] (bf16 or f32 by WBF16)
+ *  @param n       row width (a multiple of 256 with out_q)
+ *  @param rows    rows
+ *  @param eps     the norm's epsilon
+ *  @param out_q   E4M3 slot data, or NULL
+ *  @param out_sf  the slot's ue8m0 scales (with out_q)
+ *  @param out_kbp the slot's scale row pitch in 32-blocks
+ *  @param out_b   bf16 [rows][n] out, or NULL */
 template <bool WBF16>
 __global__ static void rms_norm_weight_kernel(float *out, const float *x, const void *w, uint32_t n, uint32_t rows, float eps,
                                               __nv_fp8_e4m3 *out_q, unsigned char *out_sf, int out_kbp,
@@ -141,6 +156,22 @@ __global__ static void rms_norm_weight_kernel(float *out, const float *x, const 
 /* QWBF16/KVWBF16: storage of q_w and kv_w. Separate flags -- they are separate
  * tensors. `which` is blockIdx.y, so the select below is block-uniform and the
  * branch costs nothing. */
+/** The DeepSeek q / kv RMSNorms in one launch: blockIdx.y 0 norms q's row, 1 kv's.  Grid (rows, 2); block 256.
+ *  @tparam QWBF16  q_w is stored bf16
+ *  @tparam KVWBF16 kv_w is stored bf16
+ *  @param q_out     f32 [rows][q_n] out, or NULL (the E4M3 slot replaces it)
+ *  @param q         f32 [rows][q_n]
+ *  @param q_w       q's norm weight [q_n]
+ *  @param q_n       q row width
+ *  @param kv_out    f32 [rows][kv_n] out
+ *  @param kv        f32 [rows][kv_n]
+ *  @param kv_w      kv's norm weight [kv_n]
+ *  @param kv_n      kv row width
+ *  @param rows      rows
+ *  @param eps       the norms' epsilon
+ *  @param q_out_q   E4M3 slot data for q, or NULL
+ *  @param q_out_sf  that slot's ue8m0 scales
+ *  @param q_out_kbp that slot's scale row pitch in 32-blocks */
 template <bool QWBF16, bool KVWBF16>
 __global__ static void dsv4_qkv_rms_norm_rows_kernel(
         float *q_out,
@@ -210,6 +241,21 @@ __global__ static void dsv4_qkv_rms_norm_rows_kernel(
  * instruction sequence this function had before it was templated -- which is
  * the property the byte gate checks, and the reason the narrowing can land
  * one buffer at a time instead of all at once. */
+/** @tparam T the tail's stored element type (float, __half, __nv_bfloat16)
+ *  @param tail        the head's rope tail, rotated in place at [i], [i + 1]
+ *  @param i           pair offset within the tail (even)
+ *  @param n_rot       rotated dims
+ *  @param rope_pos    the token's position
+ *  @param n_ctx_orig  the model's original context (YaRN)
+ *  @param inverse     nonzero: rotate by -theta
+ *  @param freq_base   rope base
+ *  @param freq_scale  YaRN frequency scale
+ *  @param ext_factor  YaRN extrapolation mix (0: none)
+ *  @param attn_factor magnitude scale
+ *  @param beta_fast   YaRN beta_fast
+ *  @param beta_slow   YaRN beta_slow
+ *  @param out_r0      out: rotated first element, f32
+ *  @param out_r1      out: rotated second element, f32 */
 template <typename T>
 __device__ static void rope_tail_rotate_pair_dev(
         T *tail, uint32_t i, uint32_t n_rot, uint32_t rope_pos,
@@ -237,6 +283,33 @@ __device__ static void rope_tail_rotate_pair_dev(
     *out_r1 = r1;
 }
 
+/** Tail RoPE in place over [n_tok][n_head][head_dim] rows (the last n_rot dims), with an optional grouped E4M3
+ *  epilogue for the attn-output "a" projection.  1-D grid over n_tok * n_head * n_rot / 2 pairs, block 256 (one
+ *  warp a (token, head) when n_rot is 64).
+ *  @tparam T the stored element type
+ *  @param x           rows, rotated in place
+ *  @param n_tok       tokens (rows when n_head is 1)
+ *  @param n_head      heads per token
+ *  @param head_dim    head width
+ *  @param n_rot       rotated tail dims
+ *  @param pos0        position of token 0 (without positions)
+ *  @param pos_stride  position step between tokens (without positions)
+ *  @param n_ctx_orig  the model's original context (YaRN)
+ *  @param inverse     nonzero: rotate by -theta
+ *  @param freq_base   rope base
+ *  @param freq_scale  YaRN frequency scale
+ *  @param ext_factor  YaRN extrapolation mix
+ *  @param attn_factor magnitude scale
+ *  @param beta_fast   YaRN beta_fast
+ *  @param beta_slow   YaRN beta_slow
+ *  @param positions   [n_tok] per-token positions, or NULL
+ *  @param gact_data   grouped E4M3 slab for the "a" GEMM, or NULL
+ *  @param gact_scale  its ue8m0 scales
+ *  @param gact_kbp    its scale row pitch in 32-blocks
+ *  @param gact_slab   scale bytes per group
+ *  @param n_groups    head groups (n_head divisible by it)
+ *  @param gact_tok0   this launch's first slab row
+ *  @param gact_ntok   the slab's rows */
 template <typename T>
 __global__ static void rope_tail_kernel(
         T *x,
@@ -357,12 +430,14 @@ __global__ static void rope_tail_kernel(
  * value is rounded to bf16 first: the reference quantises the bf16 tensor the
  * projection (fp8 GEMM, bf16 out) and RoPE (fp32 math, copied back to bf16)
  * left, and our f32 staging carries those steps unrounded.  0731's 128-point
- * Hadamard rotation before the quant is gone with that checkpoint.
+ * Hadamard rotation before the same quant is indexer_hadamard_block_absmax_dev
+ * below (an indexer that compresses its own keys; V4.1 has none).
  *
  * Both kernels below run this ONE copy (the packing kernel's contract is a
  * bit-identical row to the rope-fused one; two hand-kept copies is how such a
  * contract rots).  Called by all 128 threads of the block after the kernels'
  * own bounds check -- the __syncthreads() are uniform. */
+/// A thread's place in the indexer's shared FP4 quantisation (see the block above).
 struct indexer_fp4_t {
     float    v;           ///< this thread's bf16-rounded value
     uint32_t fp4_block;   ///< which 32-wide FP4 block it lands in
@@ -370,6 +445,11 @@ struct indexer_fp4_t {
     uint32_t block_base;  ///< absbuf[block_base] holds the block's absmax
 };
 
+/** Rounds this thread's element to bf16 and reduces its 32-block's absmax into absbuf (all 128 threads call it).
+ *  @param xr     the f32 row [128]
+ *  @param tid    this thread's dim
+ *  @param absbuf shared [128] scratch; absbuf[block_base] ends holding the block's absmax
+ *  @return the thread's value and place */
 __device__ static inline indexer_fp4_t indexer_block_absmax_dev(const float *xr, uint32_t tid, float *absbuf) {
     const float v = __bfloat162float(__float2bfloat16(xr[tid]));
     const uint32_t fp4_block = tid >> 5u;
@@ -387,6 +467,13 @@ __device__ static inline indexer_fp4_t indexer_block_absmax_dev(const float *xr,
     return { v, fp4_block, lane, block_base };
 }
 
+/** Quantises the thread's value to E2M1 at its block's E8M0 scale and writes the packed 68-byte row.
+ *  @param h             the thread's value and place (indexer_block_absmax_dev)
+ *  @param absbuf        the reduced absmax buffer
+ *  @param nib_sh        shared [128] nibble staging
+ *  @param outr          the packed output row (64 nibble-pair bytes, then 4 scale bytes)
+ *  @param tid           this thread's dim
+ *  @param keep_f32_slot where to write the dequantised value (observers), or NULL */
 __device__ static inline void indexer_fp4_pack_row_dev(const indexer_fp4_t &h, const float *absbuf,
                                                        uint8_t *nib_sh, uint8_t *outr, uint32_t tid,
                                                        float *keep_f32_slot) {
@@ -411,6 +498,24 @@ __device__ static inline void indexer_fp4_pack_row_dev(const indexer_fp4_t &h, c
  * for a kernel boundary (one block owns the whole row).  This kernel writes no
  * f32 back: x is producer-internal rope staging and every consumer reads the
  * packed row, so there is exactly one Q operand encoding (L090.4). */
+/** Indexer Q: tail rope then FP4 pack, one 128-thread block per (token, head) row; no f32 written back.  Grid
+ *  n_rows; block 128; static smem 128 floats + 128 bytes.
+ *  @param x           f32 rows [n_rows][128], roped in place (staging)
+ *  @param out         packed MXKV-FP4 rows [n_rows]
+ *  @param n_rows      rows = n_tok * n_head
+ *  @param n_head      heads per token
+ *  @param head_dim    head width (128)
+ *  @param n_rot       rotated tail dims
+ *  @param pos0        position of token 0 (without positions)
+ *  @param n_ctx_orig  the model's original context (YaRN)
+ *  @param inverse     nonzero: rotate by -theta
+ *  @param freq_base   rope base
+ *  @param freq_scale  YaRN frequency scale
+ *  @param ext_factor  YaRN extrapolation mix
+ *  @param attn_factor magnitude scale
+ *  @param beta_fast   YaRN beta_fast
+ *  @param beta_slow   YaRN beta_slow
+ *  @param positions   [n_tok] per-token positions, or NULL */
 __global__ static void indexer_rope_fp4_pack_q_kernel(
         float *x, uint8_t *out, uint32_t n_rows, uint32_t n_head, uint32_t head_dim, uint32_t n_rot,
         uint32_t pos0, uint32_t n_ctx_orig, int inverse,
@@ -441,6 +546,12 @@ __global__ static void indexer_rope_fp4_pack_q_kernel(
 /* The same pack minus the rope (the kv source's index-K rows, already rotated
  * at their group positions), emitting MXKV FP4 rows -- E2M1 nibble pairs
  * low-nibble-first, then one E8M0 byte per 32-block. */
+/** FP4 pack of f32 rows (no rope).  Grid n_rows; block 128.
+ *  @param x        f32 rows [n_rows][128]; the dequantised values are written back when keep_f32
+ *  @param out      packed MXKV-FP4 rows [n_rows]
+ *  @param n_rows   rows
+ *  @param head_dim head width (128)
+ *  @param keep_f32 nonzero: write the dequantised values back into x (observers only) */
 __global__ static void indexer_fp4_pack_kernel(float *x, uint8_t *out,
                                                uint32_t n_rows, uint32_t head_dim,
                                                int keep_f32) {
@@ -480,6 +591,12 @@ __global__ static void indexer_fp4_pack_kernel(float *x, uint8_t *out,
  * Unreachable for a V4.1 artifact by construction: `indexer_own_compressor` is
  * false there, and V4.1's index key is a projection of the kv source's latent
  * (indexer_fp4_pack_kernel), with no rotation. */
+/** The 128-point natural-order Walsh-Hadamard transform (scaled 1/sqrt(128)) of the row, then the per-32 absmax.
+ *  @param xr     the f32 row [128]
+ *  @param tid    this thread's dim
+ *  @param vals   shared [128] butterfly scratch
+ *  @param absbuf shared [128] absmax scratch
+ *  @return the thread's rotated value and place */
 __device__ static inline indexer_fp4_t indexer_hadamard_block_absmax_dev(
         const float *xr, uint32_t tid, float *vals, float *absbuf) {
     vals[tid] = xr[tid];
@@ -516,6 +633,12 @@ __device__ static inline indexer_fp4_t indexer_hadamard_block_absmax_dev(
 /* Hadamard + fp4 pack, one 128-thread block per row: the indexer compressor's
  * index key.  `keep_f32` writes the DEQUANTISED value back for observers only
  * (every consumer reads the packed row). */
+/** V4 index key: Hadamard rotation then FP4 pack.  Grid n_rows; block 128.
+ *  @param x        f32 rows [n_rows][128]; dequantised values written back when keep_f32
+ *  @param out      packed MXKV-FP4 rows [n_rows]
+ *  @param n_rows   rows
+ *  @param head_dim head width (128)
+ *  @param keep_f32 nonzero: write the dequantised values back into x */
 __global__ static void indexer_hadamard_fp4_pack_kernel(float *x, uint8_t *out,
                                                         uint32_t n_rows, uint32_t head_dim,
                                                         int keep_f32) {
@@ -536,6 +659,23 @@ __global__ static void indexer_hadamard_fp4_pack_kernel(float *x, uint8_t *out,
  * (token, head) row runs the rotation then the Hadamard in place.  One block
  * owns the whole row, so the __syncthreads() between the phases is equivalent to
  * the kernel boundary the two-launch sequence had. */
+/** V4 indexer Q: tail rope, Hadamard rotation, FP4 pack.  Grid n_rows; block 128.
+ *  @param x           f32 rows [n_rows][128], roped in place (staging)
+ *  @param out         packed MXKV-FP4 rows [n_rows]
+ *  @param n_rows      rows = n_tok * n_head
+ *  @param n_head      heads per token
+ *  @param head_dim    head width (128)
+ *  @param n_rot       rotated tail dims
+ *  @param pos0        position of token 0 (without positions)
+ *  @param n_ctx_orig  the model's original context (YaRN)
+ *  @param inverse     nonzero: rotate by -theta
+ *  @param freq_base   rope base
+ *  @param freq_scale  YaRN frequency scale
+ *  @param ext_factor  YaRN extrapolation mix
+ *  @param attn_factor magnitude scale
+ *  @param beta_fast   YaRN beta_fast
+ *  @param beta_slow   YaRN beta_slow
+ *  @param positions   [n_tok] per-token positions, or NULL */
 __global__ static void indexer_rope_hadamard_fp4_pack_q_kernel(
         float *x, uint8_t *out, uint32_t n_rows, uint32_t n_head, uint32_t head_dim, uint32_t n_rot,
         uint32_t pos0, uint32_t n_ctx_orig, int inverse,
@@ -1105,6 +1245,25 @@ int pulsar_gpu_rope_tail_mx_tensor(pulsar_gpu_tensor *x, uint32_t n_tok, uint32_
 /* positions (both RoPE kernels): per-row absolute query positions for banked
  * multi-session batches; NULL degenerates to the classic consecutive pos0+t
  * rule bit-exactly (same arithmetic on the same value). */
+/** Per-head Q RMS norm fused with the tail rope (V4).  Grid n_tok * n_head (one block a head row); block 256
+ *  (a power of two, at most 256).
+ *  @tparam QT the stored element type (float or __half)
+ *  @param x           rows [n_tok][n_head][head_dim], normed and roped in place
+ *  @param n_tok       tokens
+ *  @param n_head      heads per token
+ *  @param head_dim    head width
+ *  @param n_rot       rotated tail dims
+ *  @param pos0        position of token 0 (without positions)
+ *  @param n_ctx_orig  the model's original context (YaRN)
+ *  @param inverse     nonzero: rotate by -theta
+ *  @param freq_base   rope base
+ *  @param freq_scale  YaRN frequency scale
+ *  @param ext_factor  YaRN extrapolation mix
+ *  @param attn_factor magnitude scale
+ *  @param beta_fast   YaRN beta_fast
+ *  @param beta_slow   YaRN beta_slow
+ *  @param eps         the norm's epsilon
+ *  @param positions   [n_tok] positions, or NULL */
 template <typename QT>
 __global__ static void head_rms_norm_rope_tail_kernel(
         QT *x,
@@ -1169,10 +1328,20 @@ __global__ static void head_rms_norm_rope_tail_kernel(
 
 int pulsar_gpu_head_rms_norm_rope_tail_tensor(pulsar_gpu_tensor *x, uint32_t n_tok, uint32_t n_head, uint32_t head_dim, uint32_t n_rot, uint32_t pos0, uint32_t n_ctx_orig, bool inverse, float freq_base, float freq_scale, float ext_factor, float attn_factor, float beta_fast, float beta_slow, float eps, const pulsar_gpu_tensor *positions) {
     /* Derived from the buffer, never passed in.  Passing it was how decode
-     * came to hand an f16 Q to the f32 kernel. */
+     * came to hand an f16 Q to the f32 kernel.  The declared FORMAT picks the
+     * instantiation, never the width: f16 and bf16 are both two bytes, and a
+     * bf16 Q read as half is the L269 mistake.  There is an f32 and an f16
+     * arm; anything else (bf16, bytes) refuses by name. */
     const size_t esz = x ? pulsar_tensor_esz(x) : 0u;
-    const int q_f16 = (esz == sizeof(__half));
-    if (!x || (esz != sizeof(float) && esz != sizeof(__half)) ||
+    const pulsar_elt_fmt fmt = pulsar_tensor_fmt(x);
+    const bool q_f32 = x && fmt == PULSAR_ELT_F32 && esz == sizeof(float);
+    const bool q_f16 = x && fmt == PULSAR_ELT_F16 && esz == sizeof(__half);
+    if (x && !q_f32 && !q_f16) {
+        fprintf(stderr, "pulsar: head rms norm + rope tail: stored element format %u (%zu bytes) has no arm "
+                        "(f32 and f16 only) -- refusing\n", (unsigned)fmt, esz);
+        return 0;
+    }
+    if (!x ||
         n_rot == 0u || n_rot > head_dim || (n_rot & 1u) ||
         x->bytes < (uint64_t)n_tok * n_head * head_dim * esz ||
         (positions && positions->bytes < (uint64_t)n_tok * sizeof(int32_t))) {
@@ -1227,9 +1396,11 @@ int pulsar_gpu_rope_tail_strided_tensor(pulsar_gpu_tensor *x, uint32_t n_rows, u
  * is the seam's copy -- the same shape as the model map and the geometry macros
  * both sides already share.  Default CSA2 keeps a synthetic/test graph that
  * never selects a profile on V4.1's formats, which is what it had before. */
+/// The loaded profile's KV row family, pushed by the engine at load (the seam's copy).
 static pulsar_kv_row_style g_kv_row_style = PULSAR_KV_ROWS_CSA2;
 
 void pulsar_gpu_set_kv_row_style(pulsar_kv_row_style style) { g_kv_row_style = style; }
+/// @return the KV row family the packers use
 pulsar_kv_row_style pulsar_gpu_kv_row_style(void) { return g_kv_row_style; }
 
 uint64_t pulsar_gpu_kv_row_bytes(pulsar_kv_row_kind kind, uint32_t head_dim) {
@@ -1305,6 +1476,17 @@ int pulsar_gpu_kv_ring_pack_tensor(pulsar_gpu_tensor *x, const pulsar_gpu_tensor
  * reads), and the ring then receives THOSE bytes -- never a second quantise of
  * the same values (re-encoding a decoded row is not bit-idempotent at scale
  * boundaries; the ring must hold exactly what attention read). */
+/** Byte-moves already packed ring rows into their ring slots.  Grid n_rows; block 64 (byte-strided copy).
+ *  @param src       packed rows [n_rows][rowbytes]
+ *  @param out       the ring pool
+ *  @param out_row0  first position (without positions)
+ *  @param n_rows    rows
+ *  @param head_dim  head width (unused by the copy)
+ *  @param rowbytes  bytes per packed row (the loaded family's)
+ *  @param positions [n_rows] positions, or NULL
+ *  @param seq_id    [n_rows] bank ids, or NULL
+ *  @param n_banks   banks in the ring pool
+ *  @param raw_cap   ring rows per bank */
 __global__ static void winkv_scatter_kernel(const uint8_t *__restrict__ src, uint8_t *out,
                                             uint32_t out_row0, uint32_t n_rows, uint32_t head_dim,
                                             uint64_t rowbytes,
@@ -1329,6 +1511,13 @@ __global__ static void winkv_scatter_kernel(const uint8_t *__restrict__ src, uin
  * the whole bank pool (byte bound scales by n_banks) and the uint32 row ABI
  * (seq*raw_cap + slot) must not overflow.  pos0 is ignored when positions !=
  * NULL.  Fail-loud, like the banked attention launchers. */
+/** @param positions [n_tokens] positions, or NULL
+ *  @param seq_id    [n_tokens] bank ids, or NULL (both or neither)
+ *  @param n_tokens  rows
+ *  @param n_banks   banks (> 0 in descriptor mode)
+ *  @param raw_cap   ring rows per bank
+ *  @param what      the caller's name for the message
+ *  @return true when the descriptor arguments are consistent (or absent) */
 static bool raw_store_descr_ok(const pulsar_gpu_tensor *positions, const pulsar_gpu_tensor *seq_id,
                                uint32_t n_tokens, uint32_t n_banks, uint32_t raw_cap, const char *what) {
     const bool descr = positions != NULL || seq_id != NULL;
@@ -1432,3 +1621,6 @@ int pulsar_gpu_tensor_read_f32(const pulsar_gpu_tensor *t, uint64_t elem_off,
     return 1;
 }
 
+/** @def PULSAR_QKV_NORM_LAUNCH(A, B)
+ *  Inside pulsar_gpu_dsv4_qkv_rms_norm_rows_mx_tensor: launches dsv4_qkv_rms_norm_rows_kernel with q / kv weight
+ *  storage flags A / B. */

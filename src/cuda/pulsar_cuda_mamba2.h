@@ -1,3 +1,5 @@
+/** @file
+ *  Mamba-2 (SSD) mixer block contract: everything between its two projections, and its state layout. */
 /* Mamba-2 (SSD) mixer block (L296 N2): a family-neutral selective state-space
  * mixer -- everything BETWEEN its two projections.  The in_proj and out_proj
  * GEMMs are the caller's (the format front doors), so the block is the same
@@ -74,11 +76,13 @@ typedef struct {
     uint32_t n_groups;     /**< G: B and C groups, each shared by H / G heads */
     uint32_t conv_kernel;  /**< K taps of the x | B | C convolution, 2 .. PULSAR_SCONV_KMAX */
     uint32_t norm_group;   /**< channels per gated-RMSNorm group: a multiple of 256, <= 8192, dividing H*P */
+    /** The gated RMSNorm's epsilon (must be > 0). */
     float    norm_eps;
 } pulsar_mamba2_geom;
 
 /** One layer: its geometry and its (bf16, device, 16-byte aligned) parameters. */
 typedef struct {
+    /** The layer's geometry (checked against the built instance at every call). */
     pulsar_mamba2_geom geom;
     const uint16_t *conv_w;   /**< [CC][K], tap K-1 on the current row (Conv1d's [CC][1][K]) */
     const uint16_t *conv_b;   /**< [CC] */
@@ -96,32 +100,49 @@ typedef struct {
  *  and multiples of 8.  The three inputs are usually column ranges of the one
  *  in_proj row [z | x B C | dt]. */
 typedef struct {
+    /** Sequences (runs) in the call, >= 1. */
     uint32_t       n_seqs;
     uint32_t       n_rows;        /**< seq_first[n_seqs] */
     uint32_t       max_seq_rows;  /**< >= every sequence's row count */
     const int32_t *seq_first;     /**< device [n_seqs + 1], ascending from 0, every run >= 1 row */
     const int32_t *seq_slot;      /**< device [n_seqs] */
+    /** The gate input z, bf16 [rows][ld_z]; ld_z (documented after it) is its row stride in elements. */
     const uint16_t *z;   uint64_t ld_z;     /**< [rows][H*P], the gate */
+    /** The conv input x | B | C, bf16 [rows][ld_xbc]; ld_xbc is its row stride in elements. */
     const uint16_t *xbc; uint64_t ld_xbc;   /**< [rows][CC], the conv's input */
+    /** dt before its bias, bf16 [rows][ld_dt]; ld_dt is its row stride in elements. */
     const uint16_t *dt;  uint64_t ld_dt;    /**< [rows][H], dt before its bias (any alignment, ld >= H) */
     uint16_t *conv_state;     /**< bf16 pool, pulsar_mamba2_conv_state_elems a slot */
     float    *ssm_state;      /**< f32 pool, pulsar_mamba2_ssm_state_floats a slot, 16-byte aligned */
     uint16_t *conv_capture;   /**< NULL, or the SNAPSHOT records: one conv slot per call row */
     float    *ssm_capture;    /**< NULL, or the DELTA records: pulsar_mamba2_upd_floats per call row */
     void     *scratch;        /**< >= pulsar_mamba2_scratch_bytes(geom, n_rows), 16-byte aligned */
+    /** Bytes at scratch (refused below pulsar_mamba2_scratch_bytes). */
     size_t    scratch_bytes;
+    /** The block's output, bf16 [rows][ld_out]; ld_out is its row stride in elements. */
     uint16_t *out; uint64_t ld_out;         /**< [rows][H*P], the out_proj's input; must not overlap the inputs */
 } pulsar_mamba2_call;
 
 /** CC = H*P + 2*G*N, the convolution's channels. */
+/// @param g the block's geometry
+/// @return the conv channel count CC
 uint32_t pulsar_mamba2_conv_channels(const pulsar_mamba2_geom *g);
 /** bf16 elements of one conv slot / SNAPSHOT record: (K-1) * CC. */
+/// @param g the block's geometry
+/// @return bf16 elements per conv slot
 uint64_t pulsar_mamba2_conv_state_elems(const pulsar_mamba2_geom *g);
 /** f32 elements of one SSM slot: H * P * N. */
+/// @param g the block's geometry
+/// @return f32 elements per SSM slot
 uint64_t pulsar_mamba2_ssm_state_floats(const pulsar_mamba2_geom *g);
 /** f32 elements of one row's DELTA record: H*P + G*N + 2*H, padded to 4. */
+/// @param g the block's geometry
+/// @return f32 elements per row's DELTA record
 uint64_t pulsar_mamba2_upd_floats(const pulsar_mamba2_geom *g);
 /** Scratch bytes a call of `rows` rows needs (the conv output, y, dt and dA). */
+/// @param g    the block's geometry
+/// @param rows the call's rows
+/// @return scratch bytes
 size_t pulsar_mamba2_scratch_bytes(const pulsar_mamba2_geom *g, uint32_t rows);
 
 /** Run the block for one layer on `stream` (conv, [dt / dA: a run longer than
@@ -129,12 +150,21 @@ size_t pulsar_mamba2_scratch_bytes(const pulsar_mamba2_geom *g, uint32_t rows);
  *  SSM slot; writes the captures when set.
  *  @return 0, -1 on a refused contract (named on stderr, nothing launched),
  *  -3 on a launch failure. */
+/// @param layer  the layer's weights and geometry
+/// @param call   the call: rows, slots, inputs, scratch, captures and output
+/// @param stream stream to launch on
 int pulsar_mamba2_forward(const pulsar_mamba2_layer *layer, const pulsar_mamba2_call *call, cudaStream_t stream);
 
 /** Advance SSM slot `slot` by the first `keep` rows of a verify sequence:
  *  `upd` is that sequence's first row's DELTA record (rows
  *  pulsar_mamba2_upd_floats apart).  Bit-identical to a forward over those
  *  rows.  keep >= 1.  @return 0, -1 refused, -3 on a launch failure. */
+/// @param g         the block's geometry
+/// @param ssm_state device SSM state pool
+/// @param slot      the slot to advance
+/// @param upd       device: the sequence's first row's DELTA record
+/// @param keep      rows to apply (>= 1)
+/// @param stream    stream to launch on
 int pulsar_mamba2_commit(const pulsar_mamba2_geom *g, float *ssm_state, uint32_t slot, const float *upd, uint32_t keep,
                          cudaStream_t stream);
 

@@ -7,7 +7,7 @@
 // (ibv_reg_dmabuf_mr, IBVERBS_1.12; the transport dlopens libibverbs, so this
 // symbol resolves the same way).
 //
-// VERDICT on the pair (ca1070wk30007/008, driver 610.57.04, 2026-09-02):
+// VERDICT on the GB10 pair (driver 610.57.04, 2026-09-02):
 //   VMM_SUPPORTED=1  GPU_DIRECT_RDMA_SUPPORTED=0  GDR_WITH_VMM_SUPPORTED=0
 //   cuMemCreate rejects the GPURDMA flag ("invalid device ordinal"); the
 //   plain-pinned dma-buf exports fine but the NIC refuses it (EINVAL).

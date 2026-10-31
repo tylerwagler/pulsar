@@ -332,9 +332,11 @@ bool run_batch(gate &g, uint32_t n_vocab, std::vector<case_row> &rows, pulsar_gp
     return true;
 }
 
-/* The walk: runs over rows the sampler drew, drafts that agree for a while and then do not. */
+/* The walk: runs over rows the sampler drew, drafts that agree for a while and then do not.  `singles` makes every
+ * run draftless, so the launch carries PULSAR_GPU_SAMPLE_ROWS_MAX (33) runs -- past one warp (L335: the walk was
+ * launched 32 wide, and a 33rd run was never walked). */
 bool run_walk(gate &g, uint32_t n_vocab, pulsar_gpu_tensor *dl, pulsar_gpu_tensor *scratch, pulsar_gpu_tensor *dout,
-              pulsar_gpu_tensor *dwalk) {
+              pulsar_gpu_tensor *dwalk, bool singles) {
     std::vector<float> host((size_t)ROWS * n_vocab);
     std::vector<pulsar_gpu_sample_req> reqs(ROWS);
     std::vector<uint32_t> run_len;
@@ -359,7 +361,7 @@ bool run_walk(gate &g, uint32_t n_vocab, pulsar_gpu_tensor *dl, pulsar_gpu_tenso
     }
     std::vector<pulsar_gpu_spec_run> runs;
     for (uint32_t r0 = 0; r0 < ROWS;) {
-        const uint32_t k = std::min<uint32_t>(urand(9), ROWS - r0 - 1u);
+        const uint32_t k = singles ? 0u : std::min<uint32_t>(urand(9), ROWS - r0 - 1u);
         pulsar_gpu_spec_run run{};
         run.row0 = r0;
         run.k = k;
@@ -666,7 +668,7 @@ int main(int argc, char **argv) {
                 fprintf(stderr, "sampler-device-gate: a launch failed\n");
                 return 1;
             }
-            if (!run_walk(g, v, dl, scratch, dout, dwalk)) {
+            if (!run_walk(g, v, dl, scratch, dout, dwalk, b % 4 == 3)) {
                 fprintf(stderr, "sampler-device-gate: a walk launch failed\n");
                 return 1;
             }

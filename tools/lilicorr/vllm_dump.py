@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """vllm_dump.py -- golden dumps of vLLM's LiLiCorr block drafter (L298): every draft round of a few greedy
-generations of Nemotron 3.5 Super VL (NVFP4) drafted by /mnt/models/nemotron35-super-lilicorr, as vLLM computes it.
+generations of Nemotron 3.5 Super VL (NVFP4, $NEMOTRON_NVFP4) drafted by LiLiCorr ($LILICORR_DRAFT), as vLLM computes it.
 
 Runs INSIDE the vLLM image job.sh serves LiLiCorr with (vllm 0.32.0rc1.dev190+g3f1bcfd82), offline (`vllm.LLM`),
 in-process (VLLM_ENABLE_V1_MULTIPROCESSING=0) and eager (no torch.compile, no CUDA graphs) so the Python hooks below
@@ -42,8 +42,15 @@ os.environ.setdefault("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
 
 import torch  # noqa: E402
 
-TARGET = "/srv/models/nemotron35-super-vl-nvfp4"
-DRAFT = "/mnt/models/nemotron35-super-lilicorr"
+def _need(var, what):
+    v = os.environ.get(var, "")
+    if not v:
+        raise SystemExit(f"{var} is not set: {what}")
+    return v
+
+
+TARGET = _need("NEMOTRON_NVFP4", "the Nemotron 3.5 Super VL NVFP4 checkpoint directory")
+DRAFT = _need("LILICORR_DRAFT", "the LiLiCorr drafter checkpoint directory")
 
 TOOLS = [{"type": "function", "function": {
     "name": "get_weather", "description": "Get the current weather and a 3-day forecast for a city.",

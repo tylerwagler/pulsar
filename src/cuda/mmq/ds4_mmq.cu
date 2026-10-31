@@ -1,4 +1,6 @@
 // SPDX-License-Identifier: MIT
+/** @file
+ *  Host wrapper around the vendored mul_mat_q kernels: the public ds4_mmq_* entry points. */
 // ds4_mmq.cu - host wrapper around llama.cpp's vendored mul_mat_q kernels.
 //
 // Implements the public ds4_mmq_* entry points for the aligned-SoA IQ2_XXS
@@ -28,10 +30,12 @@
 #if defined(__has_include)
 #if __has_include(<nvtx3/nvToolsExt.h>)
 #include <nvtx3/nvToolsExt.h>
+/// 1 when the NVTX3 header is available (the launches get profiler ranges), else 0.
 #define DS4_MMQ_HAS_NVTX 1
 #endif
 #endif
 #ifndef DS4_MMQ_HAS_NVTX
+/// 0: no NVTX header, the profiler ranges compile to nothing.
 #define DS4_MMQ_HAS_NVTX 0
 #endif
 
@@ -57,13 +61,19 @@
 // deliberately take the constant instead -- the over-allocation is bounded by
 // 512*sizeof(block_mx_act_mmq) once per call, and a constant cannot be wrong the
 // next time upstream changes how J is chosen.
+/// @return the largest tile width J any launch picks (sizes the staging scratch).
 static constexpr int ds4_mmq_x_max() { return 512; }
 
 // Reservation arithmetic for the scratch arena: each take() 256-aligns, so a
 // reservation must budget the ALIGNED size of every slice it will hand out.
+/// @param b a byte count.
+/// @return b rounded up to a multiple of 256.
 static constexpr size_t ds4_mmq_a256(size_t b) { return (b + 255u) & ~(size_t)255u; }
 
 
+/// @param first the payload's high word.
+/// @param second the payload's low word.
+/// @return (first << 32) | second.
 static uint64_t ds4_mmq_nvtx_payload(uint32_t first, uint32_t second) {
     return ((uint64_t)first << 32) | second;
 }
@@ -73,6 +83,9 @@ static uint64_t ds4_mmq_nvtx_payload(uint32_t first, uint32_t second) {
 class ds4_mmq_nvtx_scope {
 public:
     /** Open a range named `name` carrying `payload`, if `enabled`. */
+    /** @param name     the range's ASCII name (not copied: must outlive the push)
+     *  @param payload  a 64-bit payload attached to the range (ds4_mmq_nvtx_payload packs two u32)
+     *  @param enabled  false: do nothing */
     ds4_mmq_nvtx_scope(const char *name, uint64_t payload, bool enabled)
         : active_(enabled) {
 #if DS4_MMQ_HAS_NVTX
@@ -169,6 +182,11 @@ extern "C" int ds4_mmq_init(int device) {
 // and ggml_backend internals we don't carry over).
 // ----------------------------------------------------------------------------
 
+/// @param layout a PULSAR_TENSOR_* id (only PULSAR_TENSOR_IQ2_XXS_MMQ_K is served).
+/// @param cc the device's compute capability, major * 100 + minor * 10 (ggml_cuda_info).
+/// @param ne11 activation columns (unused).
+/// @param n_experts experts (unused).
+/// @return true for the IQ2_XXS layout on a device with the sm_12x block-scaled MMA (says why once otherwise).
 static bool ds4_should_use_mmq_impl(uint32_t layout, int cc, int64_t ne11, int64_t n_experts) {
     /* Which layouts this adapter can serve -- one.  The list used to be 21 ggml
      * type codes because it was lifted verbatim from upstream's dense
@@ -245,10 +263,31 @@ extern "C" int ds4_mmq_should_use(uint32_t layout, int64_t ne11, int64_t n_exper
 
 /* The K granule the IQ2 D2R kernels walk: 256-value super-blocks.  (The EXL3
  * routed experts have their own front door since task #44: exl3_moe.cuh.) */
+/// K granule of the IQ2 D2R kernels: one 256-value super-block.
 static constexpr int kMoeKGranule = 256;
 
 namespace {
 
+/** The single-weight IQ2_XXS routed-MoE GEMM (the D2R arm, mandatory): mm_ids_helper sorts the assignments by
+ *  expert, the producer's E4M3 activation is gathered into expert-major block_mx_act_mmq, then the D2R kernel runs.
+ *  Scratch is one arena on CUDA_SCRATCH_MMQ.  Contract: ds4_mmq.h (ds4_mmq_iq2_xxs_moe_soa).
+ *  @param tag            the caller's name for messages
+ *  @param W              the weight (must be non-null; the tiles are read from x_soa)
+ *  @param ids            [n_tokens][n_expert_used] int32 expert ids (device)
+ *  @param out_f32        [n_tokens * n_expert_used][M] f32, column-major out[col * M + row]
+ *  @param M              output rows per expert (the weight's rows)
+ *  @param K              input width; a multiple of kMoeKGranule (256)
+ *  @param n_tokens       tokens
+ *  @param n_experts      experts stacked in the weight
+ *  @param n_expert_used  routing slots per token (<= n_experts)
+ *  @param stream         launch stream
+ *  @param x_soa          the aligned-SoA IQ2_XXS artifact (ds4_mmq.h layout)
+ *  @param soa_blocks     IQ2 blocks in it: n_experts * M * (K / 256)
+ *  @param act_q          the producer's E4M3 activation [n_tokens][K] (device); required
+ *  @param act_sf         its ue8m0 scale plane (pulsar_mx_sfoff swizzle); required
+ *  @param act_kbp        scale blocks per activation row
+ *  @return 0; -1 a refused contract (null pointer, bad shape, scratch, D2R declined); -2 mm_ids_helper launch
+ *          failure; -3 activation gather failure; -4 D2R launch failure */
 int ds4_mmq_moe_impl(
         const char    * tag,
         const void    * W,
@@ -503,6 +542,28 @@ int ds4_mmq_moe_impl(
 // structure mirrors ds4_mmq_moe_impl above; the only differences are the
 // two W pointers, the two output pointers, and the second D2R launch with a
 // fresh (x, dst) pair.
+/** ds4_mmq_moe_impl for two weights of one shape over the same activation (gate and up): one mm_ids_helper and
+ *  one activation gather, then a D2R launch per weight.  On error neither output is guaranteed valid.
+ *  @param tag            the caller's name for messages
+ *  @param W_a            first weight (must be non-null; tiles are read from xa_soa)
+ *  @param W_b            second weight (must be non-null; tiles are read from xb_soa)
+ *  @param ids            [n_tokens][n_expert_used] int32 expert ids (device)
+ *  @param out_a          W_a's output, layout as ds4_mmq_moe_impl's out_f32
+ *  @param out_b          W_b's output, same layout
+ *  @param M              output rows per expert (the weight's rows)
+ *  @param K              input width; a multiple of kMoeKGranule (256)
+ *  @param n_tokens       tokens
+ *  @param n_experts      experts stacked in the weight
+ *  @param n_expert_used  routing slots per token (<= n_experts)
+ *  @param stream         launch stream
+ *  @param xa_soa         W_a's aligned-SoA artifact
+ *  @param xb_soa         W_b's aligned-SoA artifact
+ *  @param soa_blocks     IQ2 blocks in each artifact
+ *  @param act_q          the producer's E4M3 activation [n_tokens][K] (device); required
+ *  @param act_sf         its ue8m0 scale plane (pulsar_mx_sfoff swizzle); required
+ *  @param act_kbp        scale blocks per activation row
+ *  @return 0; -1 a refused contract or a declined D2R launch; -2 mm_ids_helper launch failure; -3 activation
+ *          gather failure */
 int ds4_mmq_moe_pair_impl(
         const char    * tag,
         const void    * W_a,

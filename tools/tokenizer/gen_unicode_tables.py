@@ -4,7 +4,7 @@
 
 HF `tokenizers` (0.23.2, the version transformers main pins for Qwen3.8-Flash-Next) runs TWO Unicode
 databases, and they are NOT the same version.  Both were measured, codepoint by codepoint, against the
-library itself (research/l251/render/README.md in pulsar-notes):
+library itself (the L251 render notes, private):
 
   * the pre-tokenizer regex runs in Oniguruma: \\p{L} \\p{M} \\p{N} and \\s are UCD **16.0.0**
     (General_Category L*/M*/N*, PropList White_Space) -- 0 mismatches over every scalar value in

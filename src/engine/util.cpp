@@ -1,3 +1,5 @@
+/** @file util.cpp
+ *  @brief Small stateless leaf helpers: string views, hashing, alignment. */
 #include "pulsar_engine_internal.h"
 #include "pulsar_file.hpp"
 

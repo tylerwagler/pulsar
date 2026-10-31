@@ -14,7 +14,7 @@ over prompt + continuation (teacher-forced on pulsar's tokens) and at every gene
 
 The step-0 row is the FIRST-TOKEN comparison (the prompt's last position).
 
-    python exl3_logit_ref.py --pack /srv/models/nemotron35-exl3-k4 --case NAME PROMPT_FILE DUMP_JSON [--case ...]
+    python exl3_logit_ref.py --pack /path/to/nemotron35-exl3-k4 --case NAME PROMPT_FILE DUMP_JSON [--case ...]
         [--json OUT]
 
 Needs exllamav3 with the NemotronH Omni adapter on PYTHONPATH (~/inkling/exllamav3) and a GPU; run it under gpuq.

@@ -1,4 +1,6 @@
 // SPDX-License-Identifier: MIT
+/** @file
+ *  Minimal ggml-API stubs for the vendored llama.cpp mmq kernels. */
 // ds4_ggml_stubs.h - minimal ggml-API stubs for ds4's vendored mmq kernels.
 //
 // The mma.cuh / mmid.cuh / mmid.cu files in this directory are vendored
@@ -63,6 +65,7 @@
 // ----------------------------------------------------------------------------
 
 #ifndef GGML_ASSERT
+/// Aborts with file and line when `cond` is false (all builds).
 #define GGML_ASSERT(cond) \
     do { if (!(cond)) { \
         fprintf(stderr, "GGML_ASSERT(%s) failed at %s:%d\n", #cond, __FILE__, __LINE__); \
@@ -71,6 +74,7 @@
 #endif
 
 #ifndef GGML_ABORT
+/// Prints a printf-style message with file and line, then aborts.
 #define GGML_ABORT(fmt, ...) \
     do { \
         fprintf(stderr, "GGML_ABORT: " fmt " at %s:%d\n", ##__VA_ARGS__, __FILE__, __LINE__); \
@@ -79,24 +83,39 @@
 #endif
 
 #ifndef GGML_UNUSED
+/// Marks `x` used.
 #define GGML_UNUSED(x) ((void)(x))
 #endif
 
 // Variadic GGML_UNUSED_VARS: drop up to 12 unused names without warnings.
 #ifndef GGML_UNUSED_VARS
+/// Discards an unused parameter list of the matching arity (the variadic GGML_UNUSED_VARS's arms).
 #define GGML_UNUSED_VARS_1(_1)                                             GGML_UNUSED(_1)
+/// Discards an unused parameter list of the matching arity (the variadic GGML_UNUSED_VARS's arms).
 #define GGML_UNUSED_VARS_2(_1,_2)                                          GGML_UNUSED(_1); GGML_UNUSED(_2)
+/// Discards an unused parameter list of the matching arity (the variadic GGML_UNUSED_VARS's arms).
 #define GGML_UNUSED_VARS_3(_1,_2,_3)                                       GGML_UNUSED_VARS_2(_1,_2); GGML_UNUSED(_3)
+/// Discards an unused parameter list of the matching arity (the variadic GGML_UNUSED_VARS's arms).
 #define GGML_UNUSED_VARS_4(_1,_2,_3,_4)                                    GGML_UNUSED_VARS_3(_1,_2,_3); GGML_UNUSED(_4)
+/// Discards an unused parameter list of the matching arity (the variadic GGML_UNUSED_VARS's arms).
 #define GGML_UNUSED_VARS_5(_1,_2,_3,_4,_5)                                 GGML_UNUSED_VARS_4(_1,_2,_3,_4); GGML_UNUSED(_5)
+/// Discards an unused parameter list of the matching arity (the variadic GGML_UNUSED_VARS's arms).
 #define GGML_UNUSED_VARS_6(_1,_2,_3,_4,_5,_6)                              GGML_UNUSED_VARS_5(_1,_2,_3,_4,_5); GGML_UNUSED(_6)
+/// Discards an unused parameter list of the matching arity (the variadic GGML_UNUSED_VARS's arms).
 #define GGML_UNUSED_VARS_7(_1,_2,_3,_4,_5,_6,_7)                           GGML_UNUSED_VARS_6(_1,_2,_3,_4,_5,_6); GGML_UNUSED(_7)
+/// Discards an unused parameter list of the matching arity (the variadic GGML_UNUSED_VARS's arms).
 #define GGML_UNUSED_VARS_8(_1,_2,_3,_4,_5,_6,_7,_8)                        GGML_UNUSED_VARS_7(_1,_2,_3,_4,_5,_6,_7); GGML_UNUSED(_8)
+/// Discards an unused parameter list of the matching arity (the variadic GGML_UNUSED_VARS's arms).
 #define GGML_UNUSED_VARS_9(_1,_2,_3,_4,_5,_6,_7,_8,_9)                     GGML_UNUSED_VARS_8(_1,_2,_3,_4,_5,_6,_7,_8); GGML_UNUSED(_9)
+/// Discards an unused parameter list of the matching arity (the variadic GGML_UNUSED_VARS's arms).
 #define GGML_UNUSED_VARS_10(_1,_2,_3,_4,_5,_6,_7,_8,_9,_10)                GGML_UNUSED_VARS_9(_1,_2,_3,_4,_5,_6,_7,_8,_9); GGML_UNUSED(_10)
+/// Discards an unused parameter list of the matching arity (the variadic GGML_UNUSED_VARS's arms).
 #define GGML_UNUSED_VARS_11(_1,_2,_3,_4,_5,_6,_7,_8,_9,_10,_11)            GGML_UNUSED_VARS_10(_1,_2,_3,_4,_5,_6,_7,_8,_9,_10); GGML_UNUSED(_11)
+/// Discards an unused parameter list of the matching arity (the variadic GGML_UNUSED_VARS's arms).
 #define GGML_UNUSED_VARS_12(_1,_2,_3,_4,_5,_6,_7,_8,_9,_10,_11,_12)        GGML_UNUSED_VARS_11(_1,_2,_3,_4,_5,_6,_7,_8,_9,_10,_11); GGML_UNUSED(_12)
+/// Selects the arity's arm by argument count.
 #define GGML_UNUSED_VARS_PICK(_1,_2,_3,_4,_5,_6,_7,_8,_9,_10,_11,_12,NAME,...) NAME
+/// Marks up to 12 names used.
 #define GGML_UNUSED_VARS(...) \
     GGML_UNUSED_VARS_PICK(__VA_ARGS__, \
         GGML_UNUSED_VARS_12, GGML_UNUSED_VARS_11, GGML_UNUSED_VARS_10, \
@@ -106,10 +125,12 @@
 #endif
 
 #ifndef GGML_PAD
+/// `x` rounded up to a multiple of `n`.
 #define GGML_PAD(x, n) (((x) + (n) - 1) / (n) * (n))
 #endif
 
 #ifndef GGML_CUDA_MAX_DEVICES
+/// Devices ggml_cuda_info records.
 #define GGML_CUDA_MAX_DEVICES 16
 #endif
 

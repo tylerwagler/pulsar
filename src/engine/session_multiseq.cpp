@@ -1,3 +1,5 @@
+/** @file session_multiseq.cpp
+ *  @brief Batched multi-session decode (multiseq, mixed and fused steps) over the bank pool. */
 #include "pulsar_engine_internal.h"
 
 /* Batched multi-session decode over the session's bank pool — see the pulsar.h
@@ -34,6 +36,7 @@
  * The caller owns per-bank histories and must re-establish per-bank state
  * explicitly to resume classic work on a bank: a fresh pulsar_session_sync
  * (rebuild path) clears both flags. */
+/// printf into the caller's (err, errlen) when it gave one.
 #define PULSAR_MULTISEQ_ERR(...) do { \
         if (err && errlen) snprintf(err, errlen, __VA_ARGS__); \
     } while (0)
@@ -43,6 +46,17 @@
  * stack ceiling; the driver still bounds rows and banks itself), gpu_graph_decode_multiseq_batch, and the
  * one reading of its rc.  `what` names the step in the error.  0 = ran, 1 = rejected (recoverable),
  * -1 = failed mid-sweep (session state fatal). */
+/// @param s the session
+/// @param reqs [n_rows] the rows (bank, position, token)
+/// @param n_rows rows
+/// @param logits host logits out, as gpu_graph_decode_multiseq_batch takes it
+/// @param out_n_rows receives the headed rows (NULL ok)
+/// @param max_head_runs the most headed runs
+/// @param shape the fused shape, or NULL
+/// @param what the step's name, for the error
+/// @param err receives the reason
+/// @param errlen its size
+/// @return 0 ran, 1 rejected (recoverable), -1 failed mid-sweep (fatal)
 static int ds4_batch_step(pulsar_session *s, const pulsar_multiseq_req *reqs, uint32_t n_rows, float *logits,
                           uint32_t *out_n_rows, uint32_t max_head_runs, const pulsar_fused_shape *shape,
                           const char *what, char *err, size_t errlen) {

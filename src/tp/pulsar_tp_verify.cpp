@@ -1,3 +1,5 @@
+/** @file
+ *  TP speculative-verify grading implementation. */
 /*
  * Speculative-verify reference grading (host half of engine-slice 4e).
  * See pulsar_tp_verify.h for the contract: pure host C++, the reference

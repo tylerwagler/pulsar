@@ -1,3 +1,5 @@
+> **Historical, not maintained** (moved to docs/history/ on 2026-10-30): a static decode / prefill / quality engine review at dev d6d3feb5, 2026-09-11 (was docs/engine-review-2026-09-11.md). The code at the tip of `dev` is the authority.
+
 # Engine review — 2026-09-11 (static: decode / prefill / quality)
 
 Target: `origin/dev` @ `d6d3feb5` (2026-09-10, "server: --capture-requests PATH …").
@@ -32,7 +34,7 @@ clamp warning), `./pulsar_test --sampler` PASS (169 shape x config combos,
 `./pulsar-eval --self-test-extractors` PASS, `./pulsar_agent_test` PASS,
 `make seam-check` PASS (83 host files CUDA-API clean).
 
-GB10 verification (2026-09-11, sparky, sm_120f, CUDA 13.3, model
+GB10 verification (2026-09-11, the dev GB10, sm_120f, CUDA 13.3, model
 `v5mx4-0731-srcfmt-v1-reapfix-lt`):
 
 - `make cuda-regression` PASS; `make gates` 8/8 **ALL PASS** on the final tip
@@ -103,12 +105,12 @@ GB10 verification (2026-09-11, sparky, sm_120f, CUDA 13.3, model
   overflow K-allocator read a private 6.0 ms row price while L214's refit
   measured 7.17 ms/row and landed it as the quench's row term.  L136's
   "dormant" verdict was at the retired 2-session spec cap; L118 + the L219 pool
-  cap wake it.  Overflow A/B (sparky, N concurrent sampled prose clients): the
+  cap wake it.  Overflow A/B (the dev GB10, N concurrent sampled prose clients): the
   cut prices more rows (conc 8: 41 -> 145 mean/run) with aggregate t/s flat
   (means 54.22 vs 54.30 across 6/8/12/16) and a conc-8 ladder plateau within
   0.85% over [3, 9] ms, while a 30 ms positive control costs 12-19%.  The price
   is now one fact, `PULSAR_SPEC_ROW_MS` (`pulsar.h`), read by both consumers;
-  raw data in `pulsar-notes/gate-baseline/l219-b4-rowprice/RESULTS.md`.
+  raw data in `<private-notes>/gate-baseline/l219-b4-rowprice/RESULTS.md`.
 
 Every item that was still open now has a recorded verdict; see the autonomous
 pass section at the end of this block.  Short form: B5 measured NO-GO twice (the
@@ -159,7 +161,7 @@ changed TUs compile with zero warnings (`g++ -Wall -Wextra`; `nvcc
 -arch=sm_120f` for `attn_f16.cu`); `./pulsar_test --sampler`, `--server` and
 `--sampler-prefilter` PASS; `make seam-check` PASS (83 host files).
 
-GB10 verification at `d847440` (sparky; the bank tree fast-forwarded from
+GB10 verification at `d847440` (the dev GB10; the bank tree fast-forwarded from
 `2e51f069` by git bundle -- GitHub is unreachable from the authoring box -- and
 the two gate binaries rebuilt, 0 warning/error lines):
 
@@ -199,7 +201,7 @@ client, while the split streams them twice.  Even the SPECULATING clients lose
 (8.1 vs 11.7 tok/s at 3+1) -- the spec gain does not come close to a second
 sweep.  **The demotion was buying co-batching, not broken.**  Reverted on
 `l219-review-fixes`; the experiment is kept on branch `b5-lane-split` (`4e12f472`)
-with the probe in `pulsar-notes/probes/b5-mix-probe.py` (1+1: 22.77 vs 29.02;
+with the probe in `<private-notes>/probes/b5-mix-probe.py` (1+1: 22.77 vs 29.02;
 3+1: 32.27 vs 42.40).
 
 The gate is real and discriminating, which is what makes the NO-GO trustworthy:
@@ -288,7 +290,7 @@ dropped with the reason.
   shows the fused chain's intermediate traffic, not its launch count.
 - **B4 (draft-depth controller / cost model) -- premise partly refuted, one
   stale constant.**  `SPEC_DEPTH_MAX = 5` must NOT move: the addendum in
-  `pulsar-notes/draft-depth-sweep-2026-08-25.md` ties the depth-6 cliff to the
+  `<private-notes>/draft-depth-sweep-2026-08-25.md` ties the depth-6 cliff to the
   drafter's TRAINED `block=5` (position 6 is out of distribution -- structured
   accepted/step FALLS 3.31 -> 3.20 while drafted/step jumps 4.76 -> 5.55).  That
   is a model property, not a verify-row-cost one, so L214's 2.6x cheaper row
@@ -304,7 +306,7 @@ dropped with the reason.
   **A/B done and LANDED 2026-09-12 (`366472a3`).**  L136's dormant verdict was
   measured at the retired 2-session spec cap; L118 deleted that cap and L219
   raised the pool auto-cap to 16, and the counters now fire (conc 6: 74-105
-  overflow rounds, 63-183 rows cut at 6.0).  At sparky with N concurrent
+  overflow rounds, 63-183 rows cut at 6.0).  At the dev GB10 with N concurrent
   sampled prose clients: raising the price to 7.17 prices more rows (conc 8,
   mean/run 41 -> 145) while aggregate t/s is flat -- means 54.22 vs 54.30
   across 6/8/12/16 banks -- and a conc-8 ladder (3.0/6.0/7.17/9.0, 5 reps
@@ -313,7 +315,7 @@ dropped with the reason.
   well inside the safe region.  The constant is now ONE fact,
   `PULSAR_SPEC_ROW_MS` (`pulsar.h`), read by both the allocator and the
   quench; the private 6.0f copy and the stale ROWCOST comment are gone.  Raw
-  data: `pulsar-notes/gate-baseline/l219-b4-rowprice/RESULTS.md`.
+  data: `<private-notes>/gate-baseline/l219-b4-rowprice/RESULTS.md`.
 - **C5 (attn-out `low` re-quantized) -- SCOPED, and the best prefill item left.**
   `emit_low_e4m3` (`matmul.cu:2782`) is a deliberate separate pass: "the warp
   that reduces a row does not hold that row's block neighbours", so the fused
@@ -344,7 +346,7 @@ dropped with the reason.
 - **C1 (expert recipe tier imbalance) -- census RE-RUN; do not re-solve on it.**
   Fresh `nsys cuda_gpu_kern_sum`, 4000 ctx, `--gen-tokens 0`, story prompt
   (total ~3.28 s; raw in
-  `pulsar-notes/gate-baseline/l219-c1-census/kern-sum-4000ctx.csv`):
+  `<private-notes>/gate-baseline/l219-c1-census/kern-sum-4000ctx.csv`):
   - MXFP4 grouped expert GEMM **400.5 ms / 12.2%** (9 layers, ~44 ms/layer)
   - IQ2 gate/up `gateup_iq2_d2r_pair_kernel<64>` **952.4 ms / 29.0%**
     (34 layers, ~28 ms/layer)
@@ -414,8 +416,8 @@ dropped with the reason.
   starts from a gated baseline.
 - **D2 (indexer selection fidelity) -- CLOSED, measured: no drift.**  Ran the
   owed reference grade at `867e06f` with the blobs staged from
-  `pulsar-notes/reference-capture/` (`cuda-reference-gate`,
-  `PULSAR_REF_DIR=/home/claude/refcap`).  Every depth grades `same` against the
+  `<private-notes>/reference-capture/` (`cuda-reference-gate`,
+  `PULSAR_REF_DIR=$HOME/refcap`).  Every depth grades `same` against the
   recorded budget, and top-1 MATCHES at the selection-engaged depths:
   story 30464 (KL 2.681e-01) and code 3840 (KL 1.790e-01).  Confident depths are
   story 2048 `9.592e-06`, 4096 `5.400e-06`, 4102 `1.975e-07`, 6144 `9.621e-08`
@@ -424,7 +426,7 @@ dropped with the reason.
   holds.  No drift appeared, so the review's per-128 E8M0 / top-1024 f32
   rescore is NOT needed, and C4/C6 have their selection-engaged gate.
   **Process finding: the reference grade was absent, not passed.**  The landing
-  script exports `PULSAR_REF_DIR=/home/claude/refcap`, which did not exist, so
+  script exports `PULSAR_REF_DIR=$HOME/refcap`, which did not exist, so
   the reference gate SKIPped silently inside every battery that printed
   "8/8 ALL PASS".  The blobs are staged there now (from the notes repo, which
   protects them), and both entry points refuse a configured-but-missing dir

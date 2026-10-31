@@ -1,3 +1,5 @@
+/** @file
+ *  The per-expert address tables (L217): the one place an expert's device address is computed. */
 /* PLAN 94 phase 1 (L217): the per-expert ADDRESS TABLE.
  *
  * Owns the ONE place an expert's address is computed.  Before this existed every
@@ -12,6 +14,8 @@
  * untouched.  Nothing here knows about the MoE arms.
  */
 #include "pulsar_cuda_internal.h"
+
+#include <mutex>
 
 /* PLAN 94 phase 1 (L217): the per-expert ADDRESS TABLE for a routed type-40
  * (CUTLASS MXFP4) stack.
@@ -35,19 +39,41 @@
  * (`pulsar_gpu_cleanup` -> `mxfp4_expert_tables_clear`).  A later engine open in
  * the same process typically maps the model at the same base address, so a
  * surviving entry would false-positive and serve a dangling pointer. */
+/// One cached address table: the key (base, strides, offsets, counts) and its device entries; a singly linked list
+/// (g_expert_tables), freed at backend cleanup.
 struct expert_table {
+    /// Model-arena base the entries were derived from (the cache key's first field).
     const void *base;                 /* the arena base the entries were derived from */
+    /// Plane 0's per-expert stride, bytes.
     uint64_t    stride0;              /* plane 0's per-expert stride, in bytes */
+    /// Plane 1's offset from base, bytes (planes == 2).
     uint64_t    off1;                 /* plane 1's offset from base (planes == 2 only) */
+    /// Plane 1's per-expert stride, bytes (planes == 2).
     uint64_t    stride1;              /* plane 1's per-expert stride, in bytes */
+    /// Experts in the stack (entries per plane).
     uint32_t    n_total;
+    /// Pointers per expert: 1 or 2.
     uint32_t    planes;               /* 1 = type 40 (data; SF at +data_bytes), 2 = type 44 (d,q) */
+    /// Device array [n_total][planes] of expert addresses (cudaMalloc, owned here).
     const void **entries;             /* device array [planes * n_total] */
+    /// The next cached table (host).
     struct expert_table *next;
 };
 
+/// Head of the process-wide table cache (host; every access under g_expert_tables_mu -- L335).
 static struct expert_table *g_expert_tables = NULL;
+/// Guards g_expert_tables: two submitting threads (TP ranks) build and look up tables at once.
+static std::mutex g_expert_tables_mu;
 
+/// entries[e * planes] = base + e * stride0 and, with two planes, entries[e * planes + 1] = base + off1 + e * stride1.
+/// Grid ceil(n_total / 256), 256 threads.
+/// @param entries out: the device table.
+/// @param base the stack's base.
+/// @param stride0 plane 0's per-expert stride, bytes.
+/// @param off1 plane 1's offset, bytes.
+/// @param stride1 plane 1's per-expert stride, bytes.
+/// @param n_total experts.
+/// @param planes pointers per expert (1 or 2).
 __global__ static void expert_table_fill_kernel(
         const void **entries, const uint8_t *base,
         uint64_t stride0, uint64_t off1, uint64_t stride1, uint32_t n_total, uint32_t planes) {
@@ -57,12 +83,23 @@ __global__ static void expert_table_fill_kernel(
     if (planes > 1) entries[(size_t)e * planes + 1] = base + off1 + (size_t)e * stride1;
 }
 
+/// The cached table for this key, built (allocated and filled on the default stream) on first use.
+/// @param base the stack's base.
+/// @param n_total experts.
+/// @param planes pointers per expert.
+/// @param stride0 plane 0's stride, bytes.
+/// @param off1 plane 1's offset, bytes.
+/// @param stride1 plane 1's stride, bytes.
+/// @return the device table, or NULL on a bad key or an allocation / launch failure.
 static const void *const *expert_table_get(const void *base, uint32_t n_total, uint32_t planes,
                                            uint64_t stride0, uint64_t off1, uint64_t stride1) {
     if (!base || !n_total || !stride0) return NULL;
+    std::lock_guard<std::mutex> lock(g_expert_tables_mu);
     for (struct expert_table *t = g_expert_tables; t; t = t->next)
         if (t->base == base && t->stride0 == stride0 && t->off1 == off1 && t->stride1 == stride1 &&
             t->n_total == n_total && t->planes == planes) return t->entries;
+    /* a new table allocates: never inside a capture (L335) */
+    if (cuda_grow_refused_under_capture("an expert address table")) return NULL;
     const void **entries = NULL;
     const size_t bytes = (size_t)n_total * planes * sizeof(*entries);
     if (!cuda_ok(cudaMalloc((void **)&entries, bytes), "expert table alloc")) return NULL;
@@ -111,7 +148,9 @@ const void *const *exl3_expert_table(const void *base, uint32_t n_total, uint64_
     return expert_table_get(base, n_total, 2, stride, split, stride);
 }
 
+/// Frees every cached table (all three kinds); backend cleanup calls it.
 void mxfp4_expert_tables_clear(void) {
+    std::lock_guard<std::mutex> lock(g_expert_tables_mu);
     for (struct expert_table *t = g_expert_tables; t; ) {
         struct expert_table *next = t->next;
         (void)cudaFree((void *)t->entries);

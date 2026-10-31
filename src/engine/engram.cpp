@@ -1,3 +1,5 @@
+/** @file engram.cpp
+ *  @brief Engram n-gram hashing and the row tables' pread pool, host side. */
 /* Engram n-gram hashing, host side (PLAN 95 phase 4 / L218 phase 0c).
  *
  * Mirrors engram.py's `NgramHashState.forward` exactly.  The reference is
@@ -212,13 +214,20 @@ void pulsar_engram_table_close(pulsar_engram_table *t) {
  * return at once and leave every row's read queued at the device -- 65,536 rows
  * at whatever depth the kernel picks, ahead of the next decode gather, with no
  * completion to count and nothing to cancel. */
+/// The most rows a worker takes from a gather at once (see above).
 #define PULSAR_ENGRAM_IO_SLICE 4u
 /** The widest row a background read throws away (its stack buffer; Engram 264 B, Qwen PLE 320 B). */
 #define PULSAR_ENGRAM_AHEAD_ROW_MAX 512u
 
+/** One batch of row reads queued on a pulsar_engram_io pool: a foreground gather (someone waits on it), a
+ * detached prefetch (L289) or a background read-ahead (L329 b2).  A foreground gather is freed by
+ * pulsar_engram_gather_wait; a detached one by the worker that finishes its last row. */
 struct pulsar_engram_gather {
     pulsar_engram_io *io;   ///< the pool it was issued on; wait blocks on it
+    /// the row file read from (borrowed; must outlive the gather)
     const pulsar_engram_table *table;
+    /// row ids to read, `n_rows` of them: borrowed from the caller on a foreground gather (valid until wait),
+    /// owned by the pool on a prefetch / read-ahead (freed with the gather)
     const uint64_t *rows;
     uint32_t n_rows;        ///< rows to read (a cancelled read-ahead shrinks it to the rows already taken)
     uint32_t slice;         ///< rows a worker takes at once (1 .. PULSAR_ENGRAM_IO_SLICE)
@@ -227,33 +236,47 @@ struct pulsar_engram_gather {
     uint32_t done;          ///< rows finished (ok or failed)
     uint32_t failed;        ///< rows whose read failed
     uint64_t first_bad;     ///< the first failing row id, for the message
+    /// errno of the first failing read; 0 when the row id was past the table
     int      first_errno;
     int      detached;      ///< a prefetch (L289) or a read-ahead: nobody waits; the worker finishing its last row frees it
     uint64_t tag;           ///< L329 (b2): a read-ahead's issuer (pulsar_engram_read_ahead_cancel)
+    /// next gather in its pool queue (foreground or background FIFO), under the pool lock
     pulsar_engram_gather *q_next;
 };
 
+/** The engram pread pool: reader threads serving two strict-priority FIFOs of pulsar_engram_gather
+ * (foreground gathers / prefetches, then background read-aheads).  Created by pulsar_engram_io_create,
+ * joined and freed by its destroy. */
 struct pulsar_engram_io {
+    /// guards both queues, the busy / pending counters, `ahead` and every queued gather's next/done/failed
     pthread_mutex_t lock;
     pthread_cond_t  work;   ///< a gather has rows to take
     pthread_cond_t  idle;   ///< a gather finished a row (waiters re-check `done`)
+    /// head of the foreground queue (NULL when empty)
     pulsar_engram_gather *head, *tail;         ///< gathers with rows left to take, FIFO
+    /// head of the background read-ahead queue (NULL when empty)
     pulsar_engram_gather *bg_head, *bg_tail;   ///< L329 (b2): read-aheads with rows left to take, FIFO
     uint32_t hi_busy;       ///< foreground slices being read
     uint32_t bg_busy;       ///< background rows being read (<= PULSAR_ENGRAM_AHEAD_READERS)
     uint64_t bg_pending;    ///< background rows queued, not yet taken (<= PULSAR_ENGRAM_AHEAD_PENDING_MAX)
     pulsar_read_ahead_stats ahead;   ///< the background class's counters (under the lock)
+    /// the reader threads, `n_threads` of them (owned)
     pthread_t *threads;
+    /// reader threads actually started (>= 1)
     uint32_t n_threads;
+    /// set by destroy: workers drain the foreground queue, drop read-aheads and exit
     int stopping;
 };
 
+/// @return CLOCK_MONOTONIC, in ns
 static uint64_t engram_now_ns(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
 }
 
+/// Free a detached gather with its pool-owned rows and dst.
+/// @param g the gather
 static void engram_gather_free(pulsar_engram_gather *g) {
     free(g->dst);
     free((void *)g->rows);
@@ -261,6 +284,10 @@ static void engram_gather_free(pulsar_engram_gather *g) {
 }
 
 /* pread row r of `tb` into d; false with errno set on a failure (0 for an id past the table) */
+/// @param tb the table
+/// @param r the row id
+/// @param[out] d row_bytes bytes
+/// @return false with errno (0 = past the table)
 static bool engram_read_row(const pulsar_engram_table *tb, uint64_t r, unsigned char *d) {
     if (r >= tb->n_rows) { errno = 0; return false; }
     const uint32_t rb = tb->row_bytes;
@@ -277,17 +304,25 @@ static bool engram_read_row(const pulsar_engram_table *tb, uint64_t r, unsigned 
 }
 
 /* L329 (b2): may a worker take a background row now?  (under the lock) */
+/// @param io the pool
+/// @return true when a background row may be taken
 static bool engram_bg_ready(const pulsar_engram_io *io) {
     return io->bg_head && !io->head && io->hi_busy == 0 && io->bg_busy < PULSAR_ENGRAM_AHEAD_READERS;
 }
 
 /* drop g from the background take-queue (under the lock; prev = its predecessor or NULL) */
+/// @param io the pool
+/// @param prev g's predecessor, or NULL
+/// @param g the gather
 static void engram_bg_unlink(pulsar_engram_io *io, pulsar_engram_gather *prev, pulsar_engram_gather *g) {
     if (prev) prev->q_next = g->q_next; else io->bg_head = g->q_next;
     if (io->bg_tail == g) io->bg_tail = prev;
     g->q_next = NULL;
 }
 
+/// A reader thread: takes slices (foreground first) until the pool stops.
+/// @param arg the pool
+/// @return NULL
 static void *engram_io_worker(void *arg) {
     pulsar_engram_io *io = (pulsar_engram_io *)arg;
     for (;;) {
@@ -382,6 +417,14 @@ void pulsar_engram_io_destroy(pulsar_engram_io *io) {
     free(io);
 }
 
+/// Queue a foreground gather or a prefetch and wake readers.
+/// @param io the pool
+/// @param t the table
+/// @param rows [n_rows] row ids (borrowed; owned by the pool when detached)
+/// @param n_rows rows
+/// @param dst [n_rows][row_bytes] destination (owned by the pool when detached)
+/// @param detached nonzero for a prefetch nobody waits on
+/// @return the gather, or NULL on bad arguments
 static pulsar_engram_gather *engram_gather_issue(pulsar_engram_io *io, const pulsar_engram_table *t,
                                                  const uint64_t *rows, uint32_t n_rows, unsigned char *dst,
                                                  int detached) {

@@ -15,7 +15,7 @@
 set -u
 mode=${1:?build|run}; T=${2:?tree}; R=${3:?out dir}
 M="CUDA_ARCH=sm_120f CUTLASS_DIR=${CUTLASS_DIR:-$HOME/cutlass}"
-QWEN=${QWEN:-/srv/models/qwen38fn-dflash2}; NEMOTRON=${NEMOTRON:-/srv/models/nemotron35-k4-lilicorr-pulsar}
+if [ "$mode" = run ]; then QWEN=${QWEN:?set QWEN to the Qwen DFlash2 container}; NEMOTRON=${NEMOTRON:?set NEMOTRON to the Nemotron LiLiCorr container}; fi
 mut() {   # name file sed-expr targets...
   local n=$1 f=$2 e=$3; shift 3
   rm -rf "$R/$n"; mkdir -p "$R"; cp -a "$T" "$R/$n" || return 1

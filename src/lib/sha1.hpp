@@ -1,3 +1,5 @@
+/** @file
+ *  Minimal streaming SHA-1 for content-addressed names (not for security). */
 #ifndef PULSAR_SHA1_HPP
 #define PULSAR_SHA1_HPP
 
@@ -38,6 +40,8 @@ public:
 
     /** Absorb `len` bytes. Buffers a partial 64-byte block internally, so
      * callers may feed arbitrary chunk sizes. */
+    /// @param ptr bytes to hash
+    /// @param len byte count
     void update(const void *ptr, size_t len) {
         const uint8_t *p = static_cast<const uint8_t *>(ptr);
         bytes_ += len;
@@ -57,6 +61,7 @@ public:
 
     /** Append the padding and length, and write the 20-byte digest to `out`.
      * Consumes the state -- call reset() before reusing the object. */
+    /// @param out receives the 20-byte digest
     void final(uint8_t out[20]) {
         uint64_t bits = bytes_ * 8;
         uint8_t one = 0x80;
@@ -75,6 +80,9 @@ public:
     }
 
     /** One-shot digest rendered as 40 lowercase hex chars + NUL. */
+    /// @param ptr bytes to hash
+    /// @param len byte count
+    /// @param out receives the hex digest
     static void bytes_hex(const void *ptr, size_t len, char out[41]) {
         Sha1 c;
         c.update(ptr, len);
@@ -84,6 +92,8 @@ public:
     }
 
     /** Render a 20-byte digest as 40 lowercase hex chars + NUL. */
+    /// @param in the digest
+    /// @param out receives the hex string
     static void hex20(const uint8_t in[20], char out[41]) {
         static const char hex[] = "0123456789abcdef";
         for (int i = 0; i < 20; i++) {
@@ -95,11 +105,15 @@ public:
 
 private:
     /** 32-bit left rotate. */
+    /// @param v the word
+    /// @param n bits to rotate by (1..31)
+    /// @return v rotated left by n
     static uint32_t rol32(uint32_t v, int n) {
         return (v << n) | (v >> (32 - n));
     }
 
     /** Mix one 64-byte block into the running state. */
+    /// @param block the 64-byte message block
     void transform(const uint8_t block[64]) {
         uint32_t w[80];
         for (int i = 0; i < 16; i++) {

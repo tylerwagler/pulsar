@@ -1,3 +1,5 @@
+/** @file spec_depth.h
+ *  @brief The adaptive draft depth (L107), as a rule any drafter can run. */
 /* spec_depth.h -- the adaptive draft depth (L107), as a rule any drafter can run.
  *
  * One round's update of the draft-depth cap from what the round converted.  The rule is DSpark's
@@ -33,7 +35,9 @@
 
 #include <stdint.h>
 
+/** A drafter's adaptive depth controller constants (pulsar_drafter_ops::adapt); read-only, static per drafter. */
 typedef struct {
+    /// The shallowest depth the controller backs off to (drafts per chain).
     int min, max;             ///< the depth bounds
     float conf_up;            ///< UP needs the tail draft's confidence >= this
     int veto_depth;           ///< the one depth whose down-signal a confident tail may forgive (0 = never)
@@ -43,6 +47,7 @@ typedef struct {
     uint8_t up_slack;         ///< UP once commit >= depth - up_slack (0: only a whole chain accepted climbs)
 } pulsar_spec_depth_policy;
 
+/** One session's controller state, updated by pulsar_spec_depth_next each round; zero-initialised = fresh. */
 typedef struct {
     bool down_forgiven;       ///< one down-signal was vetoed; the next backs off regardless
     uint8_t rounds_since_up;  ///< saturating at 255
@@ -51,6 +56,13 @@ typedef struct {
 
 /** The next depth after a round drafted at `depth`, verified K drafts (K <= depth) and committed
  *  `commit` of them.  conf[i] is draft i's confidence (negative: none).  Updates *st. */
+/// @param p the drafter's policy
+/// @param st the session's controller state, updated
+/// @param depth the depth the round drafted at
+/// @param K drafts verified (<= depth)
+/// @param commit drafts committed
+/// @param conf [K] the drafts' confidences
+/// @return the next depth, clamped to [p->min, p->max]
 static inline int pulsar_spec_depth_next(const pulsar_spec_depth_policy *p, pulsar_spec_depth_state *st,
                                          uint32_t depth, uint32_t K, int commit, const float *conf) {
     if (st->climb_cooldown) st->climb_cooldown--;

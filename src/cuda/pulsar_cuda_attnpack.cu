@@ -1,3 +1,5 @@
+/** @file
+ *  The unified NVFP4 attention KV row: its packer and the ring scatter. */
 /* 0731's unified NVFP4 attention KV row: the packer and the ring scatter.
  *
  * WHY A SEPARATE TU.  The two-profile engine stores two different KV row
@@ -29,11 +31,15 @@
  * zero mismatches, every RNE tie and the subnormal range); the ctor IS the
  * cvt.rn.satfinite encoding, so the byte pattern and the round-trip agree by
  * construction.  Static: this TU is their only caller. */
+/// @param x a value.
+/// @return its E4M3FN byte, round to nearest even, saturating.
 __device__ static uint8_t dsv4_e4m3fn_encode_dev(float x) {
     __nv_fp8_e4m3 f(x);
     return *(const uint8_t *)&f;
 }
 
+/// @param x a value.
+/// @return x rounded through E4M3FN and back to f32.
 __device__ static float dsv4_e4m3fn_dequant_dev(float x) {
     return (float)__nv_fp8_e4m3(x);
 }
@@ -47,6 +53,18 @@ __device__ static float dsv4_e4m3fn_dequant_dev(float x) {
  * 64 threads per row.  The per-16 amax is an atomicMax on the int view --
  * non-negative floats order-match their bit patterns, and max is
  * order-independent, so the result is deterministic. */
+/// Grid n_rows, 64 threads (static shared memory sized for head_dim 512).
+/// @param x out: the decoded row values, f32 [n_rows][head_dim], or NULL.
+/// @param src the rows, f32 [n_rows][head_dim].
+/// @param out the packed rows (contiguous run or ring).
+/// @param out_row0 the first destination row / position.
+/// @param n_rows rows.
+/// @param head_dim head width.
+/// @param n_rot rope tail width (stored bf16).
+/// @param positions per-row positions, or NULL.
+/// @param seq_id per-row bank ids, or NULL.
+/// @param n_banks banks.
+/// @param raw_cap ring slots per bank; 0 = contiguous run.
 __global__ static void attn_pack_store_kernel(float *x, const float *src, uint8_t *out,
                                               uint32_t out_row0, uint32_t n_rows,
                                               uint32_t head_dim, uint32_t n_rot,
@@ -113,8 +131,8 @@ __global__ static void attn_pack_store_kernel(float *x, const float *src, uint8_
         const uint32_t v1 = s1 > 0.0f ? pulsar_e2m1_quant_dev(sr[d0 + 1u], s1) : 0u;
         outr[i] = (uint8_t)(v0 | (v1 << 4));
         if (xr) {
-            xr[d0]      = attn_kv4_e2m1(v0, s0);
-            xr[d0 + 1u] = attn_kv4_e2m1(v1, s1);
+            xr[d0]      = pulsar_e2m1_times(v0, s0);
+            xr[d0 + 1u] = pulsar_e2m1_times(v1, s1);
         }
     }
     /* bf16 rope tail, roundtripped in place so the f32 staging keeps holding
@@ -150,34 +168,28 @@ int pulsar_gpu_attn_pack_store_tensor(pulsar_gpu_tensor *x, const pulsar_gpu_ten
     return cuda_ok(cudaGetLastError(), "0731 KV pack launch");
 }
 
-/* Quantise + store one row into a ring slot (raw_cap != 0): the single-row
- * decode store.  seq_id/positions are NULL -- the slot is `row % raw_cap`. */
-int pulsar_gpu_attn_pack_ring_store_tensor(pulsar_gpu_tensor *raw_cache, const pulsar_gpu_tensor *kv,
-                                           uint32_t raw_cap, uint32_t row, uint32_t head_dim) {
-    if (!raw_cache || !kv || raw_cap == 0 ||
-        raw_cache->bytes < (uint64_t)raw_cap * PULSAR_ATTN_PACK_ROWBYTES(head_dim) ||
-        kv->bytes < (uint64_t)head_dim * sizeof(float)) {
-        return 0;
-    }
-    /* x = NULL: kv is const here, so the row is packed WITHOUT the in-place
-     * round-trip the decode store does. */
-    attn_pack_store_kernel<<<1, 64>>>(NULL, (const float *)kv->ptr,
-                                      (uint8_t *)raw_cache->ptr,
-                                      row, 1u, head_dim, PULSAR_ATTN_PACK_NROT,
-                                      NULL, NULL, 1u, raw_cap);
-    return cuda_ok(cudaGetLastError(), "0731 raw pack store launch");
-}
-
 /* Quantise + store a batch into banked ring slots: the prefill store. */
 int pulsar_gpu_attn_pack_ring_store_batch_tensor(pulsar_gpu_tensor *raw_cache, const pulsar_gpu_tensor *kv,
                                                  uint32_t raw_cap, uint32_t pos0, uint32_t n_tokens,
                                                  uint32_t head_dim, const pulsar_gpu_tensor *positions,
                                                  const pulsar_gpu_tensor *seq_id, uint32_t n_banks) {
-    const bool descr = positions != NULL;
+    /* A descriptor is positions AND seq_id, both n_tokens wide, over nonzero banks: the kernel dereferences both
+     * whenever positions is set (L335: seq_id was dereferenced unchecked).  Same contract as the scatter below. */
+    const bool descr = positions != NULL || seq_id != NULL;
+    if (descr && (!positions || !seq_id || n_banks == 0 ||
+                  positions->bytes < (uint64_t)n_tokens * sizeof(int32_t) ||
+                  seq_id->bytes < (uint64_t)n_tokens * sizeof(int32_t))) {
+        fprintf(stderr, "pulsar: 0731 KV ring store: bad descriptor (positions %s, seq_id %s, n_tokens %u, "
+                        "n_banks %u) -- refusing\n", positions ? "set" : "NULL", seq_id ? "set" : "NULL", n_tokens,
+                n_banks);
+        return 0;
+    }
     if (!raw_cache || !kv || raw_cap == 0 ||
-        head_dim != 512u ||
+        head_dim != 512u ||   /* the shared samax/sscale are sized for 28 blocks */
         raw_cache->bytes < (descr ? n_banks : 1u) * (uint64_t)raw_cap * PULSAR_ATTN_PACK_ROWBYTES(head_dim) ||
         kv->bytes < (uint64_t)n_tokens * head_dim * sizeof(float)) {
+        fprintf(stderr, "pulsar: 0731 KV ring store: bad operands (rows %u, head_dim %u, raw_cap %u) -- refusing\n",
+                n_tokens, head_dim, raw_cap);
         return 0;
     }
     if (n_tokens == 0) return 1;
@@ -194,6 +206,16 @@ int pulsar_gpu_attn_pack_ring_store_batch_tensor(pulsar_gpu_tensor *raw_cache, c
  * pulsar_kv_ring_slot with attn_pack_store_kernel, so the destination rule
  * cannot drift between the two.  Copying bytes (rather than re-quantising) is
  * what makes the ring hold exactly what attention read. */
+/// Grid n_rows, 64 threads, a byte copy per row.
+/// @param src packed rows, [n_rows][rowbytes].
+/// @param out the ring.
+/// @param out_row0 the first row's position.
+/// @param n_rows rows.
+/// @param head_dim head width.
+/// @param positions per-row positions, or NULL.
+/// @param seq_id per-row bank ids, or NULL.
+/// @param n_banks banks.
+/// @param raw_cap ring slots per bank.
 __global__ static void attn_pack_scatter_kernel(const uint8_t *__restrict__ src, uint8_t *out,
                                                 uint32_t out_row0, uint32_t n_rows,
                                                 uint32_t head_dim,
@@ -233,7 +255,12 @@ int pulsar_gpu_attn_pack_scatter_tensor(pulsar_gpu_tensor *raw_cache, const puls
         head_dim <= PULSAR_ATTN_PACK_NROT ||
         ((head_dim - PULSAR_ATTN_PACK_NROT) % PULSAR_KV4_NV_BLOCK) != 0 ||
         raw_cache->bytes < kv_banks * raw_cap * rowbytes ||
-        packed->bytes < (uint64_t)n_tokens * rowbytes) return 0;
+        packed->bytes < (uint64_t)n_tokens * rowbytes) {
+        /* L335: this refused silently */
+        fprintf(stderr, "pulsar: 0731 packed raw store: bad operands (rows %u, head_dim %u, raw_cap %u, banks %llu) -- "
+                        "refusing\n", n_tokens, head_dim, raw_cap, (unsigned long long)kv_banks);
+        return 0;
+    }
     if (n_tokens == 0) return 1;
     attn_pack_scatter_kernel<<<n_tokens, 64>>>((const uint8_t *)packed->ptr,
                                                (uint8_t *)raw_cache->ptr,

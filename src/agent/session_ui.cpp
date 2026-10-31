@@ -1,3 +1,5 @@
+/** @file
+ *  pulsar-agent: session listing, history rendering and command completion. */
 #include "pulsar_agent_internal.h"
 
 
@@ -7,6 +9,10 @@
  * ============================================================================
  */
 
+/** @brief Format how long ago `when` was: "<n>s/m/h/d ago" (0 or a future time reads "0s ago").
+ *  @param when unix seconds
+ *  @param buf  destination
+ *  @param len  bytes at `buf` */
 static void agent_format_age(uint64_t when, char *buf, size_t len) {
     uint64_t now = (uint64_t)time(NULL);
     uint64_t age = when && now > when ? now - when : 0;
@@ -18,6 +24,13 @@ static void agent_format_age(uint64_t when, char *buf, size_t len) {
 
 
 
+/** @brief A one-line session title from text: trimmed, whitespace runs collapsed to one space, cut with "..." to
+ *  fit `max_bytes`.
+ *  @param p           text start
+ *  @param end         text end (exclusive)
+ *  @param max_bytes   the title's byte cap (raised to 4); 0 = no cap
+ *  @param empty_title the title when nothing is left
+ *  @return the title, malloc'd; caller frees */
 static char *agent_session_title_from_span(const char *p, const char *end,
                                            size_t max_bytes,
                                            const char *empty_title) {
@@ -64,27 +77,107 @@ char *agent_session_title_from_prompt(const char *prompt,
 
 
 
+/** @brief The text of `n` token ids, concatenated, into out[0..cap) (NUL-terminated); empty when it does not fit.
+ *  @param e    the engine
+ *  @param ids  the ids
+ *  @param n    their count
+ *  @param out  receives the text
+ *  @param cap  out's size in bytes
+ *  @param trim drop leading and trailing isspace() bytes
+ *  @return the text's length in bytes (0 = empty) */
+static size_t agent_turn_mark_text(pulsar_engine *e, const int *ids, int n, char *out, size_t cap, bool trim) {
+    size_t len = 0;
+    out[0] = '\0';
+    for (int i = 0; i < n; i++) {
+        size_t k = 0;
+        char *t = pulsar_token_text(e, ids[i], &k);
+        const bool fits = t && len + k < cap;
+        if (fits) memcpy(out + len, t, k);
+        free(t);
+        if (!fits) {
+            out[0] = '\0';
+            return 0;
+        }
+        len += k;
+    }
+    size_t lo = 0;
+    if (trim) {
+        while (lo < len && isspace((unsigned char)out[lo])) lo++;
+        while (len > lo && isspace((unsigned char)out[len - 1])) len--;
+        memmove(out, out + lo, len - lo);
+        len -= lo;
+    }
+    out[len] = '\0';
+    return len;
+}
+
+void agent_turn_marks_init(pulsar_engine *e, agent_turn_marks *m) {
+    memset(m, 0, sizeof(*m));
+    pulsar_turn_markers tm;
+    if (pulsar_chat_turn_markers(e, &tm)) {
+        m->user_len = agent_turn_mark_text(e, tm.user, tm.n_user, m->user, sizeof m->user, false);
+        m->assistant_len = agent_turn_mark_text(e, tm.assistant, tm.n_assistant, m->assistant, sizeof m->assistant,
+                                                false);
+    }
+    pulsar_tokens end = {0};
+    pulsar_chat_end_assistant(e, &end);
+    m->end_len = agent_turn_mark_text(e, end.v, end.len, m->end, sizeof m->end, true);
+    pulsar_tokens_free(&end);
+}
+
+/** @brief Find the first occurrence of `needle` in `hay` (bytes).
+ *  @param hay        the haystack
+ *  @param hay_len    bytes at `hay`
+ *  @param needle     the needle
+ *  @param needle_len bytes at `needle`; 0 matches at `hay`
+ *  @return a pointer into `hay`, or NULL */
+static const char *agent_memmem(const char *hay, size_t hay_len,
+                                const char *needle, size_t needle_len) {
+    if (!needle_len) return hay;
+    if (needle_len > hay_len) return NULL;
+    const char first = needle[0];
+    const char *end = hay + hay_len - needle_len + 1;
+    for (const char *p = hay; p < end; p++) {
+        if (*p == first && memcmp(p, needle, needle_len) == 0) return p;
+    }
+    return NULL;
+}
+
+/** @brief The first occurrence of a turn marker in [p, end); a marker the family does not spell (len 0) is never
+ *  found.
+ *  @param p   scan start
+ *  @param end scan end (exclusive)
+ *  @param s   the marker's text
+ *  @param n   its length in bytes
+ *  @return its position, or NULL */
+static const char *agent_turn_mark_find(const char *p, const char *end, const char *s, size_t n) {
+    return n ? agent_memmem(p, (size_t)(end - p), s, n) : NULL;
+}
+
 /* Extract a human-readable title from the first user turn stored in the
  * rendered transcript.  max_bytes==0 means "full normalized title"; callers
  * that render to the terminal pass an explicit display budget. */
-char *agent_session_title_from_text(const char *text, size_t text_len,
-                                           size_t max_bytes) {
-    static const char user_mark[] = "<｜User｜>";
-    static const char assistant_mark[] = "<｜Assistant｜>";
-    const char *p = text ? strstr(text, user_mark) : NULL;
+char *agent_session_title_from_text(const agent_turn_marks *marks, const char *text, size_t text_len,
+                                    size_t max_bytes) {
+    const char *end = text ? text + text_len : NULL;
+    const char *p = text ? agent_turn_mark_find(text, end, marks->user, marks->user_len) : NULL;
     if (!p) return xstrdup("(no user prompt)");
-    p += strlen(user_mark);
-    const char *end = text + text_len;
-    const char *assistant = strstr(p, assistant_mark);
-    const char *next_user = strstr(p, user_mark);
-    if (assistant && assistant < end) end = assistant;
-    if (next_user && next_user < end) end = next_user;
+    p += marks->user_len;
+    const char *bounds[] = {agent_turn_mark_find(p, end, marks->assistant, marks->assistant_len),
+                            agent_turn_mark_find(p, end, marks->user, marks->user_len),
+                            agent_turn_mark_find(p, end, marks->end, marks->end_len)};
+    for (const char *m : bounds)
+        if (m && m < end) end = m;
     return agent_session_title_from_span(p, end, max_bytes,
                                          "(empty user prompt)");
 }
 
 
 
+/** @brief Clip a title to `max_bytes`, ending it with "..." when cut (bytes, not UTF-8 aware).
+ *  @param title     the title; NULL = "(no user prompt)"
+ *  @param max_bytes the cap (raised to 4); 0 = no cap
+ *  @return the clipped title, malloc'd; caller frees */
 static char *agent_session_title_clip(const char *title, size_t max_bytes) {
     if (!title) return xstrdup("(no user prompt)");
     size_t len = strlen(title);
@@ -98,6 +191,10 @@ static char *agent_session_title_clip(const char *title, size_t max_bytes) {
 
 
 
+/** @brief Append one marker position and its kind, growing by doubling (16 first).
+ *  @param p    the list
+ *  @param s    the marker's position in the history text
+ *  @param mark its kind */
 static void agent_history_ptrs_push(agent_history_ptrs *p, const char *s,
                                     agent_history_mark mark) {
     if (p->len == p->cap) {
@@ -112,50 +209,41 @@ static void agent_history_ptrs_push(agent_history_ptrs *p, const char *s,
 
 
 
-static const char *agent_memmem(const char *hay, size_t hay_len,
-                                const char *needle, size_t needle_len) {
-    if (!needle_len) return hay;
-    if (needle_len > hay_len) return NULL;
-    const char first = needle[0];
-    const char *end = hay + hay_len - needle_len + 1;
-    for (const char *p = hay; p < end; p++) {
-        if (*p == first && memcmp(p, needle, needle_len) == 0) return p;
-    }
-    return NULL;
-}
-
-
-
-static const char *agent_history_next_marker(const char *p, const char *end,
+/** @brief The next turn marker in rendered history: the loaded family's user, assistant or end-of-turn marker
+ *  (agent_turn_marks), whichever comes first.
+ *  @param marks    the family's markers
+ *  @param p        scan start
+ *  @param end      scan end (exclusive)
+ *  @param mark     receives its kind; may be NULL
+ *  @param mark_len receives its length, bytes; may be NULL
+ *  @return the marker's position, or NULL when none remains */
+static const char *agent_history_next_marker(const agent_turn_marks *marks, const char *p, const char *end,
                                              agent_history_mark *mark,
                                              size_t *mark_len) {
-    static const char user_mark[] = "<｜User｜>";
-    static const char assistant_mark[] = "<｜Assistant｜>";
-    static const char eos_mark[] = "<｜end▁of▁sentence｜>";
-    const char *u = agent_memmem(p, (size_t)(end - p),
-                                 user_mark, sizeof(user_mark) - 1);
-    const char *a = agent_memmem(p, (size_t)(end - p),
-                                 assistant_mark, sizeof(assistant_mark) - 1);
-    const char *e = agent_memmem(p, (size_t)(end - p),
-                                 eos_mark, sizeof(eos_mark) - 1);
+    const char *u = agent_turn_mark_find(p, end, marks->user, marks->user_len);
+    const char *a = agent_turn_mark_find(p, end, marks->assistant, marks->assistant_len);
+    const char *e = agent_turn_mark_find(p, end, marks->end, marks->end_len);
     if (!u && !a && !e) return NULL;
     if (u && (!a || u < a) && (!e || u < e)) {
         if (mark) *mark = AGENT_HISTORY_MARK_USER;
-        if (mark_len) *mark_len = sizeof(user_mark) - 1;
+        if (mark_len) *mark_len = marks->user_len;
         return u;
     }
     if (a && (!e || a < e)) {
         if (mark) *mark = AGENT_HISTORY_MARK_ASSISTANT;
-        if (mark_len) *mark_len = sizeof(assistant_mark) - 1;
+        if (mark_len) *mark_len = marks->assistant_len;
         return a;
     }
     if (mark) *mark = AGENT_HISTORY_MARK_EOS;
-    if (mark_len) *mark_len = sizeof(eos_mark) - 1;
+    if (mark_len) *mark_len = marks->end_len;
     return e;
 }
 
 
 
+/** @brief Trim isspace() bytes from both ends of [*p, *end).
+ *  @param p   the start, advanced
+ *  @param end the end, pulled back */
 static void agent_history_trim(const char **p, const char **end) {
     while (*p < *end && isspace((unsigned char)**p)) (*p)++;
     while (*end > *p && isspace((unsigned char)(*end)[-1])) (*end)--;
@@ -163,6 +251,11 @@ static void agent_history_trim(const char **p, const char **end) {
 
 
 
+/** @brief Whether [p, end) begins with `prefix`.
+ *  @param p      the start
+ *  @param end    the end (exclusive)
+ *  @param prefix NUL-terminated prefix
+ *  @return true on a match */
 static bool agent_history_has_prefix(const char *p, const char *end,
                                      const char *prefix) {
     size_t n = strlen(prefix);
@@ -174,6 +267,10 @@ static bool agent_history_has_prefix(const char *p, const char *end,
 /* Tool messages are rendered as user turns in the transcript.  Return the
  * inner payload for the current <tool_result> wrapper so /history skips these
  * pseudo-user turns and displays their content without leaking the wrapper. */
+/// @brief Narrow [*p, *end) to a `<tool_result>` wrapper's payload (see above).
+/// @param p   the turn's start; set to the payload's on success
+/// @param end the turn's end; set to the payload's on success
+/// @return true when the turn is a tool result
 static bool agent_history_tool_result_payload(const char **p, const char **end) {
     const char *s = *p, *e = *end;
     agent_history_trim(&s, &e);
@@ -197,6 +294,11 @@ static bool agent_history_tool_result_payload(const char **p, const char **end) 
 
 
 
+/** @brief Whether a user turn is really a tool result (a `<tool_result>` wrapper, or text starting "Tool:" /
+ *  "Tool result").
+ *  @param p   the turn's start
+ *  @param end the turn's end (exclusive)
+ *  @return true for a tool-result pseudo-user turn */
 static bool agent_history_is_tool_user(const char *p, const char *end) {
     agent_history_trim(&p, &end);
     return agent_history_tool_result_payload(&p, &end) ||
@@ -206,6 +308,8 @@ static bool agent_history_is_tool_user(const char *p, const char *end) {
 
 
 
+/** @brief Free the list's arrays and zero it.
+ *  @param p the list */
 static void agent_history_ptrs_free(agent_history_ptrs *p) {
     free(p->v);
     free(p->mark);
@@ -220,7 +324,14 @@ static void agent_history_ptrs_free(agent_history_ptrs *p) {
  * legitimately have a tail made only of tool result turns; in that case we
  * fall back to recent tool/assistant events instead of showing an empty
  * history. */
-static const char *agent_history_start_for_turns(const char *text, size_t len,
+/// @brief Where /history starts to show the last `user_turns` human turns (see above).
+/// @param tm         the loaded family's turn markers
+/// @param text       the rendered history
+/// @param len        bytes at `text`
+/// @param user_turns human turns to show
+/// @param tool_only  receives true when only tool/assistant events could be shown
+/// @return a position in `text`; text + len when there is nothing to show
+static const char *agent_history_start_for_turns(const agent_turn_marks *tm, const char *text, size_t len,
                                                  int user_turns,
                                                  bool *tool_only) {
     const char *end = text + len;
@@ -231,13 +342,13 @@ static const char *agent_history_start_for_turns(const char *text, size_t len,
     while (p < end) {
         agent_history_mark mark = AGENT_HISTORY_MARK_NONE;
         size_t mark_len = 0;
-        const char *m = agent_history_next_marker(p, end, &mark, &mark_len);
+        const char *m = agent_history_next_marker(tm, p, end, &mark, &mark_len);
         if (!m) break;
         agent_history_ptrs_push(&marks, m, mark);
         const char *content = m + mark_len;
         agent_history_mark next_mark = AGENT_HISTORY_MARK_NONE;
         size_t next_len = 0;
-        const char *next = agent_history_next_marker(content, end,
+        const char *next = agent_history_next_marker(tm, content, end,
                                                      &next_mark, &next_len);
         const char *content_end = next ? next : end;
         if (mark == AGENT_HISTORY_MARK_USER) {
@@ -281,6 +392,13 @@ static const char *agent_history_start_for_turns(const char *text, size_t len,
 
 
 
+/** @brief Find the last complete compaction summary in the history (between the compaction's start and end
+ *  marker lines).
+ *  @param text      the rendered history
+ *  @param len       bytes at `text`
+ *  @param sum_start receives the summary's start
+ *  @param sum_end   receives its end (exclusive)
+ *  @return true when one was found */
 static bool agent_history_latest_compaction_summary(const char *text,
                                                     size_t len,
                                                     const char **sum_start,
@@ -321,6 +439,11 @@ static void agent_history_publish_limited(agent_worker *w, const char *p,
 
 
 
+/** @brief Show the latest compaction summary, if any, under a "Compacted Summary:" heading (at most 80 lines /
+ *  12000 bytes of its tail).
+ *  @param w    the worker whose UI receives it
+ *  @param text the rendered history
+ *  @param len  bytes at `text` */
 static void agent_history_render_compaction_summary(agent_worker *w,
                                                     const char *text,
                                                     size_t len) {
@@ -339,6 +462,10 @@ static void agent_history_render_compaction_summary(agent_worker *w,
 
 
 
+/** @brief Skip UTF-8 continuation bytes, so a cut lands on a character boundary.
+ *  @param p   the position
+ *  @param end the end (exclusive)
+ *  @return the first non-continuation byte at or after `p` (or `end`) */
 static const char *agent_history_skip_utf8_continuation(const char *p,
                                                         const char *end) {
     while (p < end && (((unsigned char)*p) & 0xc0) == 0x80) p++;
@@ -347,6 +474,13 @@ static const char *agent_history_skip_utf8_continuation(const char *p,
 
 
 
+/** @brief Where the tail of [p, end) that fits `max_lines` lines and `max_bytes` bytes starts.
+ *  @param p         the text's start
+ *  @param end       its end (exclusive)
+ *  @param max_lines line cap; <= 0 = none
+ *  @param max_bytes byte cap; 0 = none
+ *  @param truncated receives true when the tail starts after `p`
+ *  @return the tail's start, on a UTF-8 character boundary */
 static const char *agent_history_tail_start(const char *p, const char *end,
                                             int max_lines, size_t max_bytes,
                                             bool *truncated) {
@@ -381,6 +515,12 @@ static const char *agent_history_tail_start(const char *p, const char *end,
 
 
 
+/** @brief Show the tail of [p, end) within the caps, with a note when earlier text was cut.
+ *  @param w         the worker whose UI receives it
+ *  @param p         the text's start
+ *  @param end       its end (exclusive)
+ *  @param max_lines line cap; <= 0 = none
+ *  @param max_bytes byte cap; 0 = none */
 static void agent_history_publish_limited(agent_worker *w, const char *p,
                                           const char *end, int max_lines,
                                           size_t max_bytes) {
@@ -396,6 +536,11 @@ static void agent_history_publish_limited(agent_worker *w, const char *p,
 
 
 
+/** @brief Replay one saved assistant turn through the live token renderer (markdown and dry-rendered tool calls;
+ *  never executes anything), capped at AGENT_HISTORY_ASSISTANT_MAX_LINES / _MAX_BYTES.
+ *  @param w   the worker whose UI receives it
+ *  @param p   the turn's start
+ *  @param end its end (exclusive) */
 static void agent_history_render_assistant(agent_worker *w,
                                            const char *p, const char *end) {
     agent_history_trim(&p, &end);
@@ -462,6 +607,11 @@ static void agent_history_render_assistant(agent_worker *w,
 /* Re-render saved transcript text for /history and /switch.  It intentionally
  * uses the same assistant/token renderer as live output, so restored history
  * looks like the original terminal stream instead of raw rendered-chat text. */
+/// @brief Replay the last `user_turns` turns of saved history (see above).
+/// @param w          the worker whose UI receives it (its engine's turn markers are scanned for)
+/// @param text       the rendered history
+/// @param len        bytes at `text`
+/// @param user_turns human turns to show (capped at AGENT_HISTORY_MAX_TURNS); <= 0 shows nothing
 static void agent_history_render_text(agent_worker *w, const char *text,
                                       size_t len, int user_turns) {
     if (user_turns <= 0) return;
@@ -471,8 +621,11 @@ static void agent_history_render_text(agent_worker *w, const char *text,
     const char *end = text + len;
     agent_history_render_compaction_summary(w, text, len);
 
+    agent_turn_marks tm_s;
+    agent_turn_marks_init(w->engine, &tm_s);
+    const agent_turn_marks *tm = &tm_s;
     bool tool_only = false;
-    const char *p = agent_history_start_for_turns(text, len, user_turns,
+    const char *p = agent_history_start_for_turns(tm, text, len, user_turns,
                                                   &tool_only);
     if (p >= end) {
         agent_publish(w, "\n(no user history)\n", strlen("\n(no user history)\n"));
@@ -493,12 +646,12 @@ static void agent_history_render_text(agent_worker *w, const char *text,
     while (p < end) {
         agent_history_mark mark = AGENT_HISTORY_MARK_NONE;
         size_t mark_len = 0;
-        const char *m = agent_history_next_marker(p, end, &mark, &mark_len);
+        const char *m = agent_history_next_marker(tm, p, end, &mark, &mark_len);
         if (!m) break;
         const char *content = m + mark_len;
         agent_history_mark next_mark = AGENT_HISTORY_MARK_NONE;
         size_t next_len = 0;
-        const char *next = agent_history_next_marker(content, end,
+        const char *next = agent_history_next_marker(tm, content, end,
                                                      &next_mark, &next_len);
         const char *content_end = next ? next : end;
         const char *tp = content, *te = content_end;
@@ -571,6 +724,10 @@ bool agent_worker_show_history(agent_worker *w, int user_turns,
 
 
 
+/** @brief qsort order for sessions: most recently used (else created) first, then by sha.
+ *  @param a an agent_session_list_item
+ *  @param b an agent_session_list_item
+ *  @return < 0 when `a` sorts first */
 static int agent_session_list_cmp_recent(const void *a, const void *b) {
     const agent_session_list_item *sa = (const agent_session_list_item *)a;
     const agent_session_list_item *sb = (const agent_session_list_item *)b;
@@ -584,6 +741,10 @@ static int agent_session_list_cmp_recent(const void *a, const void *b) {
 
 
 /* <40 hex>.session -> the sha. */
+/// @brief The sha of a session file name (see above).
+/// @param name a directory entry name
+/// @param sha  receives the 40 hex chars + NUL
+/// @return true when `name` is "<40 hex>.session"
 static bool agent_session_name_sha(const char *name, char sha[41]) {
     if (strlen(name) != 48 || strcmp(name + 40, ".session") != 0) return false;
     for (int i = 0; i < 40; i++)
@@ -597,6 +758,11 @@ static bool agent_session_name_sha(const char *name, char sha[41]) {
 
 /* Every saved session of this model whose sha starts with `prefix` ("" for
  * all), read and verified; the caller frees with agent_session_list_free. */
+/// @brief List saved sessions (see above).
+/// @param w      the worker (cache_dir, the model id)
+/// @param prefix sha prefix to match, case-insensitive; "" = all
+/// @param out    receives the array (NULL when none)
+/// @return the number of sessions in `*out`
 static int agent_session_scan(agent_worker *w, const char *prefix, agent_session_list_item **out) {
     *out = NULL;
     DIR *d = opendir(w->cache_dir);
@@ -633,6 +799,9 @@ static int agent_session_scan(agent_worker *w, const char *prefix, agent_session
 
 
 
+/** @brief Free a session list from agent_session_scan.
+ *  @param v the array
+ *  @param n its length */
 static void agent_session_list_free(agent_session_list_item *v, int n) {
     for (int i = 0; i < n; i++) agent_session_file_free(&v[i].f);
     free(v);
@@ -715,6 +884,14 @@ void agent_switch_completion_callback(const char *buf,
 
 
 /* Resolve a user-provided SHA prefix to exactly one saved session. */
+/// @brief Resolve a sha prefix to one saved session (see above).
+/// @param w       the worker
+/// @param prefix  1..40 hex chars
+/// @param sha_out receives the session's sha
+/// @param f_out   receives the session file (caller frees with agent_session_file_free)
+/// @param err     receives why it failed (invalid, no match, ambiguous)
+/// @param err_len bytes at `err`
+/// @return true on exactly one match
 static bool agent_worker_find_session(agent_worker *w, const char *prefix,
                                       char sha_out[41], agent_session_file *f_out,
                                       char *err, size_t err_len) {
@@ -749,6 +926,10 @@ static bool agent_worker_find_session(agent_worker *w, const char *prefix,
 /* Release the KV only this session's chain holds: the segments past the last
  * one any other chain shares, never the system prompt's.  The session keeps its
  * exact ids, so switching to it later prefills what was released. */
+/// @brief Release the KV segments only this session holds (see above).
+/// @param w the worker (its segment store)
+/// @param f the session
+/// @return bytes released (pulsar_segstore_release); 0 with no store or nothing to release
 static uint64_t agent_session_release_kv(agent_worker *w, const agent_session_file *f) {
     if (!w->kv || f->tokens.len <= 0) return 0;
     size_t text_len = 0;

@@ -1,7 +1,11 @@
 # TP engine split — design decisions (slices 4+, Phase 2/4)
 
+> **Status (2026-10-30):** a design and decision record from the TP bring-up (2026-08 to 2026-10). Source
+> comments cite it, so it stays here; the slice plans and open items in it are historical. How to run TP today:
+> [SERVER.md#tensor-parallelism](SERVER.md#tensor-parallelism).
+
 Decision record for how the two Spark ranks split the model, grounded in the
-vLLM DSv4 TP/EP study (private: `pulsar-notes/vllm-ds4-tp-ep-study-2026-08-26.md`
+vLLM DSv4 TP/EP study (private: the ledger's vllm-ds4-tp-ep-study-2026-08-26
 — evidence and sources; this file is the public record the code implements).
 Port decisions: ledger L102, plan 102, docs/tensor-parallel-port.md.
 

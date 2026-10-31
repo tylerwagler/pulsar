@@ -1,3 +1,7 @@
+/** @file
+ *  DeepSeek's prompt renderer (the DSML template, verbatim per variant) and the Responses / Anthropic
+ *  tool-output validation that precedes rendering.
+ */
 #include "pulsar_server_internal.h"
 
 
@@ -79,6 +83,10 @@ void buf_puts_spanned(buf *dst, const char *text, const pulsar_text_span *spans,
 
 /** Write client-supplied bytes as plain text: the range is recorded so the
  * tokeniser will not match a special-token spelling inside it. */
+/// Write client bytes as one plain-text range.
+/// @param b  the prompt buffer
+/// @param s  the client bytes (NULL: nothing)
+/// @param n  bytes at `s` (0: nothing)
 static void buf_puts_content_n(buf *b, const char *s, size_t n) {
     if (!s || !n) return;
     buf_text_begin(b);
@@ -86,6 +94,9 @@ static void buf_puts_content_n(buf *b, const char *s, size_t n) {
     buf_text_end(b);
 }
 
+/// buf_puts_content_n over a NUL-terminated string.
+/// @param b  the prompt buffer
+/// @param s  the client text (NULL or empty: nothing)
 static void buf_puts_content(buf *b, const char *s) {
     if (!s || !s[0]) return;
     buf_puts_content_n(b, s, strlen(s));
@@ -100,26 +111,28 @@ static void buf_puts_content(buf *b, const char *s) {
  * from, never from what the text looks like: a client who types the placeholder
  * spelling has it inside its span and it stays ordinary text.
  *
- * An offset list that does not fit the content (a parser bug, not a client's)
- * falls back to the whole content as one client span: the prompt then carries no
- * image token and the engine refuses the request loudly, which is the failure we
- * want -- never a prompt that silently lost the image. */
+ * The offsets were checked before the render (chat_msg_image_offsets_check, from
+ * deepseek_render: the request refuses by name); an offset list that fails the
+ * check here is a caller that skipped it, and dies loudly (L335: the old
+ * whole-content fallback never advanced its order check, so an out-of-order list
+ * passed and the copy's `off - pos` underflowed). */
+/// Write message content as client text with each parser-inserted image placeholder outside the range.
+/// @param b  the prompt buffer
+/// @param m  the message (its content, images_len and image_ph_off; chat_msg_image_offsets_check holds)
 static void buf_puts_content_images(buf *b, const chat_msg *m) {
     const char *s = m->content;
     const size_t len = s ? strlen(s) : 0;
     const size_t ph = strlen(PULSAR_IMAGE_PLACEHOLDER);
-    if (m->images_len <= 0 || !m->image_ph_off || !len) {
+    if (m->images_len <= 0) {
         buf_puts_content(b, s);
         return;
     }
-    size_t pos = 0;
-    for (int i = 0; i < m->images_len; i++) {
-        const size_t off = m->image_ph_off[i];
-        if (off < pos || off + ph > len || strncmp(s + off, PULSAR_IMAGE_PLACEHOLDER, ph) != 0) {
-            buf_puts_content(b, s);   /* mismatch: no image tokens, engine refuses */
-            return;
-        }
+    char err[160];
+    if (!chat_msg_image_offsets_check(m, err, sizeof(err))) {
+        fprintf(stderr, "pulsar-server: render: %s (the offsets were not checked before the render)\n", err);
+        pulsar_die("buf_puts_content_images: an unchecked image offset list");
     }
+    size_t pos = 0;
     for (int i = 0; i < m->images_len; i++) {
         const size_t off = m->image_ph_off[i];
         buf_puts_content_n(b, s + pos, off - pos);
@@ -129,6 +142,10 @@ static void buf_puts_content_images(buf *b, const chat_msg *m) {
     buf_puts_content_n(b, s + pos, len - pos);
 }
 
+/// Append DeepSeek's tools prompt for the template variant, the schemas inside it as client text.
+/// @param b             the prompt buffer
+/// @param tool_schemas  the tool schema lines (NULL or empty: nothing appended)
+/// @param v41           V4.1's prompt (else V4's)
 static void append_tools_prompt_text(buf *b, const char *tool_schemas, bool v41) {
     if (!tool_schemas || !tool_schemas[0]) return;
     const pulsar_dsml_syntax *d = pulsar_dsml_canonical(v41);
@@ -197,6 +214,8 @@ static void append_tools_prompt_text(buf *b, const char *tool_schemas, bool v41)
 
 
 
+/// Free every key and value and the array; zeroes `args`.
+/// @param args  the parsed arguments
 static void json_args_free(json_args *args) {
     for (int i = 0; i < args->len; i++) {
         free(args->v[i].key);
@@ -208,6 +227,9 @@ static void json_args_free(json_args *args) {
 
 
 
+/// Append one argument (takes ownership of its key and value).
+/// @param args  the list
+/// @param arg   the argument
 static void json_args_push(json_args *args, json_arg arg) {
     if (args->len == args->cap) {
         args->cap = args->cap ? args->cap * 2 : 8;
@@ -218,6 +240,9 @@ static void json_args_push(json_args *args, json_arg arg) {
 
 
 
+/// @param args  the list
+/// @param key   the key to find (NULL: none)
+/// @return the index of the first not-yet-used argument named `key`, or -1
 static int json_args_find_unused(json_args *args, const char *key) {
     if (!key) return -1;
     for (int i = 0; i < args->len; i++) {
@@ -228,6 +253,12 @@ static int json_args_find_unused(json_args *args, const char *key) {
 
 
 
+/// Parse a JSON object's top-level members in order: strings decoded, other values re-serialized in the variant's
+/// spelling (V4.1: Python json.dumps; V4: minified).
+/// @param json  the object text (NULL: "")
+/// @param args  receives the members (freed and zeroed on failure)
+/// @param v41   V4.1's value spelling
+/// @return false when `json` is not one well-formed object
 static bool json_args_parse(const char *json, json_args *args, bool v41) {
     const char *p = json ? json : "";
     json_ws(&p);
@@ -282,6 +313,9 @@ bad:
 
 /* Attribute values (tool and parameter names) carry the ONE entity encoding
  * the parser reverses (pulsar_dsml_unescape via pulsar_dsml_attr). */
+/// Append an attribute value with the DSML entity encoding.
+/// @param b  the prompt buffer
+/// @param s  the attribute value
 static void append_dsml_attr_escaped(buf *b, const char *s) {
     char *escaped = pulsar_dsml_escape_attr(s);
     buf_puts(b, escaped);
@@ -290,6 +324,9 @@ static void append_dsml_attr_escaped(buf *b, const char *s) {
 
 
 
+/// Append a string parameter's text, its "<" escaped as "&lt;" wherever the parameter close tag would start.
+/// @param b  the prompt buffer
+/// @param s  the text (NULL: "")
 static void append_dsml_parameter_text(buf *b, const char *s) {
     const char *end = PULSAR_PARAM_END;
     const size_t endlen = strlen(end);
@@ -305,10 +342,17 @@ static void append_dsml_parameter_text(buf *b, const char *s) {
 
 
 
+/// pulsar_tool_result_escape's sink: append to the buf in `ud`.
+/// @param ud     the buf
+/// @param bytes  the escaped bytes
+/// @param n      bytes at `bytes`
 static void tool_result_buf_emit(void *ud, const char *bytes, size_t n) {
     buf_append((buf *)ud, bytes, n);
 }
 
+/// Append a tool result's text with the engine's escape rule (pulsar_tool_result_escape).
+/// @param b  the prompt buffer
+/// @param s  the result text
 void append_tool_result_text(buf *b, const char *s) {
     /* The escape RULE is the engine's (pulsar_tool_result_escape, L185) so the
      * server's renderer and the engine's token-level twin cannot drift; this
@@ -318,6 +362,9 @@ void append_tool_result_text(buf *b, const char *s) {
 
 
 
+/// Append a non-string parameter's JSON, its "<" written as \\u003c wherever the parameter close tag would start.
+/// @param b  the prompt buffer
+/// @param s  the JSON text (NULL: "")
 static void append_dsml_json_literal(buf *b, const char *s) {
     const char *end = PULSAR_PARAM_END;
     const size_t endlen = strlen(end);
@@ -333,6 +380,9 @@ static void append_dsml_json_literal(buf *b, const char *s) {
 
 
 
+/// Append one DSML parameter element; its name and value are client text.
+/// @param b    the prompt buffer
+/// @param arg  the argument
 static void append_dsml_arg(buf *b, const json_arg *arg) {
     buf_puts(b, PULSAR_PARAM_START " name=\"");
     buf_text_begin(b);
@@ -350,6 +400,12 @@ static void append_dsml_arg(buf *b, const json_arg *arg) {
 
 
 
+/// Append a call's arguments as DSML parameters: the schema's property order first, then the rest as sent.
+/// @param b      the prompt buffer
+/// @param json   the arguments object (V4.1 also accepts it double-encoded)
+/// @param order  the tool's schema order (NULL: as sent)
+/// @param v41    the template variant
+/// @return false when the arguments do not parse (nothing appended)
 bool append_dsml_arguments_from_json(buf *b, const char *json, const tool_schema_order *order, bool v41) {
     json_args args = {0};
     if (!json_args_parse(json, &args, v41)) {
@@ -390,6 +446,9 @@ bool append_dsml_arguments_from_json(buf *b, const char *json, const tool_schema
 
 
 
+/// Append one "key":value member as client text.
+/// @param b    the buffer
+/// @param arg  the argument
 static void append_json_arg_pair(buf *b, const json_arg *arg) {
     buf_text_begin(b);
     json_escape(b, arg->key);
@@ -403,6 +462,9 @@ static void append_json_arg_pair(buf *b, const json_arg *arg) {
 
 
 
+/// Append the arguments as a JSON object re-serialized from its parsed members, or {} when they do not parse.
+/// @param b     the buffer
+/// @param json  the arguments text
 void append_json_object_or_empty(buf *b, const char *json) {
     json_args args = {0};
     if (!json_args_parse(json, &args, true)) {
@@ -422,6 +484,11 @@ void append_json_object_or_empty(buf *b, const char *json) {
 
 
 
+/// Append an assistant turn's tool calls as a DSML block: the sampled bytes when the calls carry them, else
+/// rendered from the calls in the variant's canonical spelling.
+/// @param b      the prompt buffer
+/// @param calls  the calls (NULL or empty: nothing)
+/// @param v41    the template variant
 void append_dsml_tool_calls_text(buf *b, const tool_calls *calls, bool v41) {
     const pulsar_dsml_syntax *d = pulsar_dsml_canonical(v41);
     if (!calls || calls->len == 0) return;
@@ -458,18 +525,25 @@ void append_dsml_tool_calls_text(buf *b, const tool_calls *calls, bool v41) {
 
 
 
+/// @param role  a message role
+/// @return true for "system" and "developer"
 static bool role_is_system(const char *role) {
     return !strcmp(role, "system") || !strcmp(role, "developer");
 }
 
 
 
+/// @param role  a message role
+/// @return true for "user", "tool" and "function"
 static bool role_is_user_like(const char *role) {
     return !strcmp(role, "user") || !strcmp(role, "tool") || !strcmp(role, "function");
 }
 
 
 
+/// @param msgs          the conversation (may be NULL)
+/// @param tool_schemas  the tool schema lines (non-empty: true)
+/// @return true when tools are declared or the history holds an assistant call or a tool result
 bool chat_history_uses_tool_context(const chat_msgs *msgs,
                                            const char *tool_schemas) {
     if (tool_schemas && tool_schemas[0]) return true;
@@ -485,6 +559,13 @@ bool chat_history_uses_tool_context(const chat_msgs *msgs,
 }
 
 
+/// Set up a render's state: the variant's DSML spelling, thinking, tool context and the last user-side turn
+/// (which governs reasoning replay).
+/// @param r                 the render state, zeroed
+/// @param msgs              the conversation
+/// @param tools_advertised  the request declares tools
+/// @param think_mode        the resolved think mode
+/// @param v41               the template variant
 void chat_render_init(chat_render *r, const chat_msgs *msgs, bool tools_advertised,
                       pulsar_think_mode think_mode, bool v41) {
     memset(r, 0, sizeof *r);
@@ -520,6 +601,13 @@ void append_assistant_open(buf *out, bool think) {
 
 
 
+/// Append an assistant turn's body: reasoning, the think close, content (client text) and the calls.
+/// @param out          the prompt buffer
+/// @param close_think  write the reasoning close after the reasoning
+/// @param reasoning    the replayed reasoning (NULL: none)
+/// @param content      the content
+/// @param calls        the turn's calls (may be NULL)
+/// @param v41          the template variant
 static void append_assistant_turn_body(buf *out, bool close_think, const char *reasoning,
                                        const char *content, const tool_calls *calls, bool v41) {
     if (reasoning) buf_puts_content(out, reasoning);
@@ -636,10 +724,8 @@ void chat_render_finish(buf *out, const chat_render *r) {
  * side channel, not a change to the prompt -- which is what keeps the renderer
  * gate, the KV keys and every persisted session valid. */
 char *render_chat_prompt_text_spans(const chat_msgs *msgs, const char *tool_schemas,
-                                    const tool_schema_orders *tool_orders,
                                     pulsar_think_mode think_mode, bool v41,
                                     chat_text_span **spans_out, uint32_t *n_spans_out) {
-    (void)tool_orders;
     if (spans_out) *spans_out = NULL;
     if (n_spans_out) *n_spans_out = 0;
     chat_render r;
@@ -719,10 +805,15 @@ char *render_chat_prompt_text_spans(const chat_msgs *msgs, const char *tool_sche
     return buf_take(&out);
 }
 
+/// render_chat_prompt_text_spans without the client-text ranges.
+/// @param msgs         the conversation
+/// @param tool_schemas the tool schema lines (may be NULL)
+/// @param think_mode   the resolved think mode
+/// @param v41          the template variant
+/// @return the prompt text (malloc'd)
 char *render_chat_prompt_text(const chat_msgs *msgs, const char *tool_schemas,
-                              const tool_schema_orders *tool_orders,
                               pulsar_think_mode think_mode, bool v41) {
-    return render_chat_prompt_text_spans(msgs, tool_schemas, tool_orders, think_mode, v41, NULL, NULL);
+    return render_chat_prompt_text_spans(msgs, tool_schemas, think_mode, v41, NULL, NULL);
 }
 
 
@@ -782,6 +873,9 @@ char *render_live_tool_tail(const chat_msgs *msgs, int start, bool tools_adverti
 
 
 
+/// Collect a message's tool-result ids (tool_call_id and tool_call_ids), deduplicated.
+/// @param m    the message (NULL: nothing)
+/// @param ids  the list appended to (NULL: nothing)
 static void chat_msg_collect_tool_call_ids(const chat_msg *m, stop_list *ids) {
     if (!m || !ids) return;
     id_list_push_unique(ids, m->tool_call_id);
@@ -798,8 +892,12 @@ static void chat_msg_collect_tool_call_ids(const chat_msg *m, stop_list *ids) {
  * passed and looking up at the tool message reproduces the nearest-preceding
  * answer without a per-id backward rescan over an uncapped, client-supplied
  * array (was O(n^2) per request). */
+/// call id -> the nearest preceding assistant message that declared it.
 typedef std::unordered_map<std::string, const chat_msg *> prior_call_map;
 
+/// Register an assistant message's call ids (later messages overwrite earlier ones).
+/// @param map  the map
+/// @param m    the message (not an assistant: nothing)
 static void prior_call_map_add(prior_call_map *map, const chat_msg *m) {
     if (strcmp(m->role, "assistant")) return;
     for (int k = 0; k < m->calls.len; k++) {
@@ -808,6 +906,9 @@ static void prior_call_map_add(prior_call_map *map, const chat_msg *m) {
     }
 }
 
+/// @param map  the map
+/// @param id   the call id (NULL or empty: none)
+/// @return the declaring assistant message, or NULL
 static const chat_msg *prior_call_map_find(const prior_call_map *map, const char *id) {
     if (!id || !id[0]) return NULL;
     auto it = map->find(id);
@@ -883,6 +984,9 @@ bool server::responses_validate_tool_outputs(const chat_msgs *msgs,
  * server state is still exactly at the remembered token frontier before using
  * it.  If another request already replaced the session, normal token/text/disk
  * prefix matching handles the request instead. */
+/// Record a Responses request's live-continuation evidence: the trailing tool outputs' call ids and the family's tool-result tail.
+/// @param r     the request (a Responses one with a family; its responses_live_* fields are set)
+/// @param msgs  the parsed conversation
 void responses_prepare_live_continuation(request *r,
                                                 const chat_msgs *msgs) {
     if (!r || r->api != API_RESPONSES || !msgs || msgs->len == 0) return;
@@ -926,6 +1030,9 @@ void responses_prepare_live_continuation(request *r,
 
 /* An Anthropic tool result: a "tool" part as read (chat_msg::anthropic_continues), or after
  * anthropic_fold_tool_results the user turn it was folded into. */
+/// Whether a message is an Anthropic tool result.
+/// @param m  the message (NULL: false)
+/// @return true for a user or tool message that answers a tool_use id
 static bool anthropic_msg_is_tool_result_tail(const chat_msg *m) {
     return m && (!strcmp(m->role, "user") || !strcmp(m->role, "tool")) &&
            ((m->tool_call_id && m->tool_call_id[0]) ||
@@ -955,7 +1062,7 @@ void anthropic_fold_tool_results(chat_msgs *msgs) {
         for (int k = i; k < end; k++) {
             chat_msg *m = &msgs->v[k];
             const bool result = !strcmp(m->role, "tool");
-            if (!f.role && !result) f.role = xstrdup(m->role);
+            if (!f.role && !result) f.role = server_xstrdup(m->role);
             const char *c = m->content ? m->content : "";
             if (result) {
                 chat_msg_add_tool_call_id(&f, m->tool_call_id);
@@ -965,7 +1072,7 @@ void anthropic_fold_tool_results(chat_msgs *msgs) {
             size_t at = 0;
             for (int im = 0; im <= m->images_len; im++) {
                 const size_t ph = im < m->images_len ? m->image_ph_off[im] : strlen(c);
-                char *run = xstrndup(c + at, ph - at);
+                char *run = server_xstrndup(c + at, ph - at);
                 if (result) append_tool_result_text(&content, run);
                 else buf_puts(&content, run);
                 free(run);
@@ -990,9 +1097,9 @@ void anthropic_fold_tool_results(chat_msgs *msgs) {
                 f.reasoning = buf_take(&r);
             }
         }
-        if (!f.role) f.role = xstrdup("user");
+        if (!f.role) f.role = server_xstrdup("user");
         f.content = buf_take(&content);
-        if (!f.content) f.content = xstrdup("");
+        if (!f.content) f.content = server_xstrdup("");
         chat_msgs_push(&out, f);
         i = end;
     }
@@ -1054,6 +1161,9 @@ bool server::anthropic_validate_tool_results(const chat_msgs *msgs,
  * model sampled.  If the incoming tool_result IDs match the live sampled
  * frontier, generate_job() can skip replay matching entirely and append just
  * EOS + tool_result + next assistant prefix to the real KV. */
+/// Record an Anthropic request's live-continuation evidence: the trailing tool results' ids and the family's tool-result tail.
+/// @param r     the request (an Anthropic one with a family; its anthropic_live_* fields are set)
+/// @param msgs  the parsed conversation
 void anthropic_prepare_live_continuation(request *r,
                                                 const chat_msgs *msgs) {
     if (!r || r->api != API_ANTHROPIC || !msgs || msgs->len == 0) return;

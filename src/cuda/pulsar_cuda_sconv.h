@@ -1,3 +1,5 @@
+/** @file
+ *  Short convolution block contract: a depthwise causal convolution with a per-sequence recurrent state. */
 /* Short convolution block (L295 E3): a family-neutral depthwise causal
  * convolution over a row stream, with a recurrent state of the last
  * kernel - 1 input rows per sequence.  The shared block library offers it to a
@@ -64,6 +66,7 @@
 #ifdef __CUDACC__
 #include <cuda_runtime.h>
 #else
+/// The CUDA runtime's stream handle, declared for CUDA-free includers (same definition as cuda_runtime.h's).
 typedef struct CUstream_st *cudaStream_t;
 #endif
 
@@ -81,6 +84,7 @@ extern "C" {
 
 /** The activation a stream's tap sum goes through before its rounding. */
 enum {
+    /** the tap sum as is */
     PULSAR_SCONV_ACT_NONE = 0,
     PULSAR_SCONV_ACT_SILU = 1,  /**< acc / (1 + exp(-acc)), f32 */
 };
@@ -99,6 +103,7 @@ typedef struct {
  *  Every pointer is a device pointer, 16-byte aligned; every stride is in
  *  bf16 elements and a multiple of 8. */
 typedef struct {
+    /** The stream's convolution (its channels, taps, weights and activation); every stream of a call has the same K. */
     const pulsar_sconv_decl *decl;
     const uint16_t *x;          /**< input rows: row r's channels at x + r * ld_x (may be a strided column range) */
     uint64_t        ld_x;       /**< >= C */
@@ -118,6 +123,7 @@ typedef struct {
  *  Decode is n_seqs runs of 1 row, a prefill chunk 1 run, a verify runs of
  *  2..k rows; any mix in one call. */
 typedef struct {
+    /** Sequences (runs) in the call, >= 1. */
     uint32_t       n_seqs;
     uint32_t       n_rows;        /**< seq_first[n_seqs] */
     uint32_t       max_seq_rows;  /**< >= every sequence's row count (sizes the grid) */
@@ -126,6 +132,8 @@ typedef struct {
 } pulsar_sconv_rows;
 
 /** Elements of one stream's state, (K-1) * C: a slot / capture record at row stride C. */
+/// @param decl the stream's convolution
+/// @return (K-1) * C state elements
 uint64_t pulsar_sconv_state_elems(const pulsar_sconv_decl *decl);
 
 /** Run n_streams (1 .. PULSAR_SCONV_STREAMS_MAX) convolutions over the same
@@ -133,6 +141,10 @@ uint64_t pulsar_sconv_state_elems(const pulsar_sconv_decl *decl);
  *  every sequence's slot of every stream; writes the captures when set.
  *  @return 0 on success, -1 on a refused contract (named on stderr, nothing
  *  launched), -3 on a launch failure. */
+/// @param streams   [n_streams] the streams (all with the same K)
+/// @param n_streams streams, 1 .. PULSAR_SCONV_STREAMS_MAX
+/// @param rows      the call's sequences and their slots
+/// @param stream    stream to launch on
 int pulsar_sconv_forward(const pulsar_sconv_stream *streams, uint32_t n_streams, const pulsar_sconv_rows *rows,
                          cudaStream_t stream);
 
@@ -141,6 +153,10 @@ int pulsar_sconv_forward(const pulsar_sconv_stream *streams, uint32_t n_streams,
  *  apart) to state + slot * state_stride (rows state_ld apart).  A caller whose
  *  streams share one packed record may copy the record whole instead.
  *  @return 0, or -1 refused / -3 on a copy failure. */
+/// @param s      the stream (its capture and state pool)
+/// @param slot   the pool slot to overwrite
+/// @param row    the call row whose captured state to restore
+/// @param stream stream to copy on
 int pulsar_sconv_restore(const pulsar_sconv_stream *s, uint32_t slot, uint32_t row, cudaStream_t stream);
 
 #ifdef __cplusplus

@@ -129,7 +129,7 @@ def report(model, base_ns, base_ct, dec_ns, dec_ct, N):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--model", default="/srv/models/v5-vexp-full256-iq2-t46.gguf")
+    ap.add_argument("--model", required=True, help="the model container (make decode-kernel-census passes FRONTIER_MODEL)")
     ap.add_argument("--binary", default="./pulsar")
     ap.add_argument("--steps", type=int, default=24)
     ap.add_argument("--prompt", default="Explain why the sky is blue, in two sentences.")

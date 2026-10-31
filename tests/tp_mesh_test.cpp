@@ -404,6 +404,41 @@ static int run_mesh_rank(int rank, int n, const int *ports) {
         }
     }
 
+    /* The row and bulk lanes are pair-only: at n > 2 numbering an exchange refuses (by name, on stderr) and
+     * hands out no exchange id. */
+    if (n >= 3) {
+        uint64_t first = 0, exch = 0;
+        uint32_t buf = 7;
+        CHECK(!pulsar_tp_row_lane(tp) && !pulsar_tp_bulk_lane(tp), "rank %d: a lane is up at n=%d", rank, n);
+        CHECK(pulsar_tp_row_lane_begin(tp, 1, &first, &exch) == 0 && exch == 0,
+              "rank %d: the row lane numbered an exchange at n=%d", rank, n);
+        CHECK(pulsar_tp_bulk_begin(tp, 64, &exch, &buf) == 0 && exch == 0 && buf == 7,
+              "rank %d: the bulk lane numbered an exchange at n=%d", rank, n);
+    }
+
+    /* The leader's verify DECISION (pulsar_tp_verify_leader_round's direction):
+     * rank 0 broadcasts VERIFY_COMMIT and every worker reads exactly the
+     * leader's.  Before L335 the leader wrote only to its primary link (rank 1)
+     * and a worker read one commit per mesh peer, so at n > 2 a worker blocked
+     * for ever -- the alarm turns that hang into a failure.  Two rounds with
+     * distinct verdicts: a stray frame left queued would surface in the second. */
+    for (int round = 0; round < 2; round++) {
+        const int32_t want_full = round, want_replay = 5 + round;
+        if (rank == 0) {
+            CHECK(pulsar_tp_send_verify_commit(tp, want_full, want_replay),
+                  "rank 0 verify-commit broadcast round %d failed", round);
+        } else {
+            int32_t fa = -1, rn = -1;
+            alarm(30);
+            const int ok = pulsar_tp_recv_verify_commit(tp, &fa, &rn);
+            alarm(0);
+            CHECK(ok, "rank %d recv of the leader's verify commit (round %d) failed", rank, round);
+            CHECK(!ok || (fa == want_full && rn == want_replay),
+                  "rank %d got the leader's commit (%d,%d), expected (%d,%d)", rank, (int)fa, (int)rn,
+                  (int)want_full, (int)want_replay);
+        }
+    }
+
     /* Session-command plane across the mesh (n>2): rank 0 broadcasts ONE
      * command and collects one ack PER PEER; every other rank receives it and
      * acks.  This is the control path an n-rank session mirror rides, so it

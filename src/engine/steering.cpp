@@ -1,19 +1,32 @@
+/** @file steering.cpp
+ *  @brief Directional steering on the DeepSeek graph, and the graph's KV-cache sizing and debug-dump config. */
 #include "pulsar_engine_internal.h"
 
 
 
+/// @param g the graph (NULL allowed)
+/// @return true when directions are loaded and the attention scale is non-zero
 bool gpu_graph_directional_steering_attn_enabled(const pulsar_gpu_graph *g) {
     return g && g->directional_steering_dirs && g->directional_steering_attn_scale != 0.0f;
 }
 
 
 
+/// @param g the graph (NULL allowed)
+/// @return true when directions are loaded and the FFN scale is non-zero
 bool gpu_graph_directional_steering_ffn_enabled(const pulsar_gpu_graph *g) {
     return g && g->directional_steering_dirs && g->directional_steering_ffn_scale != 0.0f;
 }
 
 
 
+/// Project the loaded steering direction of layer il out of x's rows, at `scale`.
+/// @param g the graph (no directions or scale 0: nothing)
+/// @param x the rows, [rows][PULSAR_N_EMBD]
+/// @param il the layer
+/// @param rows rows
+/// @param scale the projection's scale
+/// @return false = the launch refused
 static bool gpu_graph_apply_directional_steering(
         pulsar_gpu_graph  *g,
         pulsar_gpu_tensor *x,
@@ -31,6 +44,12 @@ static bool gpu_graph_apply_directional_steering(
 
 
 
+/// Steer x's rows at layer il by the attention scale.
+/// @param g the graph
+/// @param x the rows, [rows][PULSAR_N_EMBD]
+/// @param il the layer
+/// @param rows rows
+/// @return false = the launch refused (true when steering is off)
 bool gpu_graph_apply_directional_steering_attn(
         pulsar_gpu_graph  *g,
         pulsar_gpu_tensor *x,
@@ -41,6 +60,12 @@ bool gpu_graph_apply_directional_steering_attn(
 
 
 
+/// Steer x's rows at layer il by the FFN scale.
+/// @param g the graph
+/// @param x the rows, [rows][PULSAR_N_EMBD]
+/// @param il the layer
+/// @param rows rows
+/// @return false = the launch refused (true when steering is off)
 bool gpu_graph_apply_directional_steering_ffn(
         pulsar_gpu_graph  *g,
         pulsar_gpu_tensor *x,
@@ -95,6 +120,12 @@ uint32_t gpu_graph_comp_cap_max(uint32_t ctx_size) {
 
 
 
+/// The context-dependent device bytes of one graph: the KV caches plus the indexer scores and candidate buffers.
+/// @param ctx_size the context, tokens
+/// @param raw_cap the raw ring's rows
+/// @param prefill_cap the prefill chunk's rows
+/// @param kv_cache_bytes_out receives the KV caches' part alone (NULL ok)
+/// @return bytes
 uint64_t gpu_graph_context_bytes_for_kv_policy(
         uint32_t  ctx_size,
         uint32_t  raw_cap,
@@ -122,6 +153,9 @@ uint64_t gpu_graph_context_bytes_for_kv_policy(
 
 
 
+/// @param managed allocate managed (oversubscribable) memory
+/// @param bytes size
+/// @return the tensor, or NULL
 pulsar_gpu_tensor *gpu_graph_alloc_kv_cache_tensor(bool managed, uint64_t bytes) {
     return managed ? pulsar_gpu_tensor_alloc_managed(bytes) : pulsar_gpu_tensor_alloc(bytes);
 }
@@ -145,6 +179,7 @@ pulsar_gpu_tensor *gpu_graph_alloc_kv_cache_tensor(bool managed, uint64_t bytes)
 /* The graph-dump knobs, parsed ONCE (L159 inc 4).  The filters used to be
  * re-read from the environment on every dump call -- three getenv scans per
  * tensor per layer whenever dumping was armed.  One struct, one parse. */
+/** The graph-dump knobs (PULSAR_CUDA_GRAPH_DUMP_*), parsed once into a static by gpu_graph_dump_cfg_get. */
 struct gpu_graph_dump_cfg {
     int         enabled;      ///< PULSAR_CUDA_GRAPH_DUMP_PREFIX set
     const char *prefix;       ///< file prefix
@@ -152,6 +187,7 @@ struct gpu_graph_dump_cfg {
     long        layer;        ///< PULSAR_CUDA_GRAPH_DUMP_LAYER, -1 = all
     long        pos;          ///< PULSAR_CUDA_GRAPH_DUMP_POS, -1 = all
 };
+/// @return the graph-dump knobs, parsed from the environment on first call (static)
 static const gpu_graph_dump_cfg *gpu_graph_dump_cfg_get(void) {
     static gpu_graph_dump_cfg cfg;
     static int parsed = 0;
@@ -172,9 +208,14 @@ static const gpu_graph_dump_cfg *gpu_graph_dump_cfg_get(void) {
 bool gpu_graph_debug_dump_enabled(void) {
     return gpu_graph_dump_cfg_get()->enabled != 0;
 }
+/// @return PULSAR_CUDA_GRAPH_DUMP_PREFIX, or NULL when dumping is off
 const char *gpu_graph_debug_dump_prefix(void) {
     return gpu_graph_dump_cfg_get()->prefix;
 }
+/// @param name the dump name (matched against the NAME filter as a substring of it)
+/// @param il the layer
+/// @param pos the position
+/// @return true when dumping is on and every set filter matches
 bool gpu_graph_debug_wants(const char *name, uint32_t il, uint32_t pos) {
     const gpu_graph_dump_cfg *c = gpu_graph_dump_cfg_get();
     if (!c->enabled) return false;

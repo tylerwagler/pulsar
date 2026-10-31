@@ -1,3 +1,5 @@
+/** @file
+ *  Tessera window-trellis projections, value (BF16, folded) family: the host contract (L255). */
 /* pulsar_tessera.h -- Tessera window-trellis projections, value (BF16, folded) family (L255).
  *
  * Made with Tessera by Robert Tand - https://github.com/RobTand/tessera
@@ -22,6 +24,7 @@
 #include <cuda_runtime.h>
 #else
 /* the engine's CUDA-free TUs (family_qwen_s4.cpp) fill the descriptors: the stream typedef is all they need */
+/// Host-pass stand-in for the CUDA runtime's stream handle (CUDA-free includers).
 typedef struct CUstream_st *cudaStream_t;
 #endif
 #include <stddef.h>
@@ -50,18 +53,41 @@ typedef struct pulsar_tessera_proj {
 } pulsar_tessera_proj;
 
 /** Tessera's ``dense_k_split``: how many ways the dense launch splits K at M rows on ``sms`` SMs. */
+/// @param M activation rows.
+/// @param N output rows of the weight.
+/// @param K input columns.
+/// @param sms SMs the launch may use.
+/// @param tile_words int32 words per 512-row tile.
+/// @return the split count (>= 1).
 int pulsar_tessera_dense_k_split(int M, int N, int K, int sms, int tile_words);
 
 /** Workspace the dense launch needs at M rows (work counter + the split-K fp32 partials). */
+/// @param w the projection.
+/// @param M activation rows.
+/// @return bytes.
 size_t pulsar_tessera_dense_workspace_bytes(const pulsar_tessera_proj *w, int M);
 
 /** out[m, 0:N] = bf16(x[m, :] . W^T) for m < M.  ``x`` is bf16 [M, K] contiguous; ``out`` has unit column
  *  stride and row stride ``out_stride`` (even; a multiple of 4 when the launch splits K).  Returns 0, or -1
  *  after printing the refusal (a geometry the kernel does not serve, a short workspace, a CUDA error). */
+/// @param w the projection.
+/// @param x the bf16 activation rows.
+/// @param M activation rows.
+/// @param out out: the bf16 output rows.
+/// @param out_stride out's row stride, elements.
+/// @param ws device workspace.
+/// @param ws_bytes bytes of ws.
+/// @param stream the stream.
+/// @return 0, or -1 after printing the refusal.
 int pulsar_tessera_dense_launch(const pulsar_tessera_proj *w, const uint16_t *x, int M, uint16_t *out,
                                 long out_stride, void *ws, size_t ws_bytes, cudaStream_t stream);
 
 /** Workspace the routed launch needs for T tokens at top_k (routing tables, activation and route rows). */
+/// @param gate the gate stack.
+/// @param down the down stack.
+/// @param T tokens.
+/// @param top_k experts per token.
+/// @return bytes.
 size_t pulsar_tessera_moe_workspace_bytes(const pulsar_tessera_proj *gate, const pulsar_tessera_proj *down,
                                           int T, int top_k);
 
@@ -69,6 +95,19 @@ size_t pulsar_tessera_moe_workspace_bytes(const pulsar_tessera_proj *gate, const
  *  j order in fp32 and rounded once.  ``x`` is bf16 [T, K]; ``expert_ids`` int32 [T, top_k] in [0, E);
  *  ``weights`` fp32 [T, top_k]; ``out`` bf16 [T, down->N].  gate and up share E, K and N; down is E x
  *  (K = gate->N).  Returns 0, or -1 after printing the refusal. */
+/// @param gate the gate stack.
+/// @param up the up stack.
+/// @param down the down stack.
+/// @param x the bf16 activation rows.
+/// @param T tokens.
+/// @param top_k experts per token.
+/// @param expert_ids the routes, int32 [T, top_k].
+/// @param weights the route weights, fp32 [T, top_k].
+/// @param out out: the bf16 output rows.
+/// @param ws device workspace.
+/// @param ws_bytes bytes of ws.
+/// @param stream the stream.
+/// @return 0, or -1 after printing the refusal.
 int pulsar_tessera_moe_launch(const pulsar_tessera_proj *gate, const pulsar_tessera_proj *up,
                               const pulsar_tessera_proj *down, const uint16_t *x, int T, int top_k,
                               const int32_t *expert_ids, const float *weights, uint16_t *out, void *ws,

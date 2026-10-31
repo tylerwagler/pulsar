@@ -1,3 +1,5 @@
+/** @file
+ *  pulsar-agent: the DSML tool-call parser over the model's streamed text. */
 #include "pulsar_agent_internal.h"
 
 
@@ -18,6 +20,8 @@
  * parameter values are decoded with the server's entity decoder (L184).
  */
 
+/** @brief Free a call's name and arguments and zero it.
+ *  @param c the call; NULL is a no-op */
 static void agent_tool_call_free(agent_tool_call *c) {
     if (!c) return;
     free(c->name);
@@ -31,6 +35,8 @@ static void agent_tool_call_free(agent_tool_call *c) {
 
 
 
+/** @brief Free every call in the list and the list's storage, and zero it.
+ *  @param calls the list; NULL is a no-op */
 static void agent_tool_calls_free(agent_tool_calls *calls) {
     if (!calls) return;
     for (int i = 0; i < calls->len; i++) agent_tool_call_free(&calls->v[i]);
@@ -44,6 +50,12 @@ static void agent_tool_calls_free(agent_tool_calls *calls) {
  * the closing tag inside a value as "&lt;/｜DSML｜ parameter>"); decode them
  * with the ONE decoder the server's parser uses.  JSON-typed values are
  * taken verbatim, as the server does. */
+/// @brief Append one argument to a call (see above), copying name and value.
+/// @param c         the call
+/// @param name      the parameter name
+/// @param value     the value's raw bytes (not NUL-terminated)
+/// @param value_len bytes at `value`
+/// @param is_string a string parameter: entity-decode the value; else it is kept verbatim (JSON)
 static void agent_tool_call_add_arg(agent_tool_call *c, const char *name,
                                     const char *value, size_t value_len,
                                     bool is_string) {
@@ -63,6 +75,10 @@ static void agent_tool_call_add_arg(agent_tool_call *c, const char *name,
 
 
 
+/** @brief Move a completed call into the list (ownership moves; `call` is zeroed).  A call with no name is
+ *  dropped as it stands (not freed).
+ *  @param calls the list
+ *  @param call  the call to move */
 static void agent_tool_calls_push(agent_tool_calls *calls, agent_tool_call *call) {
     if (!call->name) return;
     if (calls->len == calls->cap) {
@@ -103,6 +119,10 @@ void agent_dsml_parser_reset(agent_dsml_parser *p) {
 
 
 
+/** @brief Append streamed bytes to the parser's raw buffer (kept NUL-terminated, grown by doubling from 512).
+ *  @param p the parser
+ *  @param s bytes
+ *  @param n byte count */
 static void agent_dsml_raw_append(agent_dsml_parser *p, const char *s, size_t n) {
     if (!n) return;
     if (p->raw_len + n + 1 > p->raw_cap) {
@@ -126,12 +146,17 @@ void agent_dsml_set_error(agent_dsml_parser *p, const char *msg) {
 
 
 /* The tags the parser recognises; each names a column pair of the table. */
+/// The DSML tags the parser recognises (see above).
 typedef enum {
     AGENT_DSML_TAG_TOOL_CALLS,
     AGENT_DSML_TAG_INVOKE,
     AGENT_DSML_TAG_PARAMETER,
 } agent_dsml_tag;
 
+/** @brief The opening literal of `tag` in one syntax row.
+ *  @param syn the syntax row
+ *  @param tag the tag
+ *  @return the literal (static) */
 static const char *agent_dsml_open_lit(const pulsar_dsml_syntax *syn, agent_dsml_tag tag) {
     switch (tag) {
     case AGENT_DSML_TAG_TOOL_CALLS: return syn->tool_calls_start;
@@ -140,6 +165,10 @@ static const char *agent_dsml_open_lit(const pulsar_dsml_syntax *syn, agent_dsml
     }
 }
 
+/** @brief The closing literal of `tag` in one syntax row.
+ *  @param syn the syntax row
+ *  @param tag the tag
+ *  @return the literal (static; ends in '>') */
 static const char *agent_dsml_close_lit(const pulsar_dsml_syntax *syn, agent_dsml_tag tag) {
     switch (tag) {
     case AGENT_DSML_TAG_TOOL_CALLS: return syn->tool_calls_end;
@@ -150,6 +179,9 @@ static const char *agent_dsml_close_lit(const pulsar_dsml_syntax *syn, agent_dsm
 
 
 
+/** @brief Whether `c` is DSML whitespace (space, tab, CR, LF).
+ *  @param c the byte
+ *  @return true for whitespace */
 static bool agent_dsml_is_ws(char c) {
     return c == ' ' || c == '\t' || c == '\r' || c == '\n';
 }
@@ -158,6 +190,10 @@ static bool agent_dsml_is_ws(char c) {
 
 /* An opening invoke/parameter tag in ANY syntax: the table's literal, then
  * '>' or the whitespace before its attributes. */
+/// @brief Whether `tag` opens a `kind` tag in any syntax (see above).
+/// @param tag  text at a '<'
+/// @param kind the tag kind
+/// @return true on a match
 static bool agent_dsml_open_tag_is(const char *tag, agent_dsml_tag kind) {
     for (size_t i = 0; i < PULSAR_DSML_SYNTAXES; i++) {
         const char *lit = agent_dsml_open_lit(&pulsar_dsml_syntaxes[i], kind);
@@ -173,12 +209,18 @@ static bool agent_dsml_open_tag_is(const char *tag, agent_dsml_tag kind) {
 
 /* The fullwidth bar of the DSML marker, which the model sometimes repeats
  * before a closing tag's '>' ("</｜DSML｜ parameter｜>"). */
+/// The DSML marker's fullwidth bar (see above), UTF-8.
 static const char agent_dsml_bar[] = "｜";
 
 /* A closing tag of `kind` at s, in ANY syntax, accepting the few harmless
  * closing-tag variants the model has been observed to emit: whitespace, a
  * stray bar, whitespace, then '>'.  Opening tags stay strict so accidental
  * prose does not become a tool call. */
+/// @brief Whether a lenient `kind` closing tag starts at `s` (see above).
+/// @param s       text at a '<'
+/// @param kind    the tag kind
+/// @param tag_len receives the matched tag's length, bytes; may be NULL
+/// @return true on a match
 static bool agent_dsml_close_tag_at(const char *s, agent_dsml_tag kind, size_t *tag_len) {
     for (size_t i = 0; i < PULSAR_DSML_SYNTAXES; i++) {
         const char *lit = agent_dsml_close_lit(&pulsar_dsml_syntaxes[i], kind);
@@ -241,6 +283,8 @@ bool agent_dsml_parameter_close_tail(const char *tail, size_t len,
  * Derived from the table; asserts its shape ("</" marker name ">"), the
  * name being the header's PULSAR_DSML_PARAM_NAME (leading space included, so
  * the force arms once the DSML marker itself has closed, before the name). */
+/// @brief The minimum partial-close length that forces greedy sampling (see above); aborts on a malformed table.
+/// @return bytes: "</" plus the shortest marker of any syntax row
 static size_t agent_dsml_close_force_min(void) {
     size_t min = (size_t)-1;
     for (size_t i = 0; i < PULSAR_DSML_SYNTAXES; i++) {
@@ -271,6 +315,9 @@ static size_t agent_dsml_close_force_min(void) {
 
 
 
+/** @brief Recompute param_close_prefix: whether the parameter value's last '<' (within 64 bytes of the end)
+ *  begins an incomplete parameter closing tag at least agent_dsml_close_force_min() long.
+ *  @param p the parser; false outside AGENT_DSML_PARAM_VALUE */
 static void agent_dsml_update_param_close_prefix(agent_dsml_parser *p) {
     p->param_close_prefix = false;
     if (p->state != AGENT_DSML_PARAM_VALUE || p->raw_len <= p->param_value_start)
@@ -297,6 +344,11 @@ static void agent_dsml_update_param_close_prefix(agent_dsml_parser *p) {
 
 
 /* Find a DSML closing tag of `kind` (any syntax, lenient tail). */
+/// @brief Find the first lenient `kind` closing tag in `s` (see above).
+/// @param s       NUL-terminated text to search
+/// @param kind    the tag kind
+/// @param tag_len receives the tag's length, bytes
+/// @return a pointer to its '<' inside `s`, or NULL
 static char *agent_dsml_find_close_tag(const char *s, agent_dsml_tag kind, size_t *tag_len) {
     const char *p = s;
     while ((p = strstr(p, "</")) != NULL) {
@@ -312,6 +364,8 @@ static char *agent_dsml_find_close_tag(const char *s, agent_dsml_tag kind, size_
  * called after every streamed byte: incomplete input leaves state unchanged
  * until enough bytes arrive, while malformed completed input switches to
  * AGENT_DSML_ERROR so the model gets a retryable tool error. */
+/// @brief Advance the parser over its buffered bytes (see above).
+/// @param p the parser
 static void agent_dsml_parse(agent_dsml_parser *p) {
     while (p->state == AGENT_DSML_STRUCTURAL || p->state == AGENT_DSML_PARAM_VALUE) {
         if (p->state == AGENT_DSML_PARAM_VALUE) {

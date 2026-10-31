@@ -4,7 +4,7 @@ draft's head confidence (incl. a stopped draft's, which TF does not verify).  Al
 
   tf_trace.py MODEL_DIR OUTDIR N_TOKENS DEPTH:CONF[,DEPTH:CONF...] prompt...      (prompt in code, prose, story)
   The engine is built for the deepest config; every config runs on it (mtp_decode takes depth / confidence).
-  Runs in TensorFold 0.6.6's venv (sparky: ~/tf-run/.venv/bin/python, CC=gcc-13, TORCH_EXTENSIONS_DIR and
+  Runs in TensorFold 0.6.6's venv (on the GB10 host: TensorFold's own venv, CC=gcc-13, TORCH_EXTENSIONS_DIR and
   TRITON_CACHE_DIR under ~/tf-run).  --render only writes the prompt ids (CPU).  TF_FORCE=DIR teacher-forces TF
   onto pulsar's reply (DIR/ours-td305-<prompt>-d6-off.ids, qwen_generate's out file) so both drafters are graded on
   the same tokens.  Pulsar's side: tests/qwen_generate with QWEN_SPEC=1 QWEN_SPEC_TRACE=... (PULSAR_SPEC_TAU=off

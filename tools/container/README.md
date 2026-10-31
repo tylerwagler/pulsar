@@ -1,14 +1,18 @@
 # tools/container — the direct builder: HF checkpoint(s) → pulsar's safetensors container
 
-No GGUF anywhere (Tyler, 2026-09-24; L247).  The engine reads exactly three
-metadata keys from the container -- `pulsar.kv`, `pulsar.tensors`,
-`pulsar.experts` (`src/engine/safetensors.cpp`) -- and binds tensors by the
-`gguf_name` they carry.  The container's tensor names ARE the HF checkpoint's
-names (DeepSeek's native namespace); the format producers are pure
-bytes-in / bytes-out codecs.  This directory is the driver and the writer
-that replace the header-only GGUF template + `deepseek4-quantize` + the lane's
-GGUF reader.  Read `pulsar-notes/research/direct-container-builder-2026-09-24.md`
-for the file:line evidence behind every statement here.
+No GGUF anywhere (L247; the GGUF-era tooling is archived at tag `archive/gguf-tooling-2026-09-24`).  The engine
+reads four metadata keys from the container -- `pulsar.kv`, `pulsar.tensors`, `pulsar.experts`, and
+`pulsar.kv_arch` (every shard's copy of the architecture keys, checked against the primary shard; L298)
+(`src/engine/safetensors.cpp`) -- and binds tensors by the `gguf_name` they carry (the name is a historical
+spelling; nothing GGUF is read).  The container's tensor names ARE the HF checkpoint's names; the format producers
+are pure bytes-in / bytes-out codecs.  The driver is `build.py`; how to run it and how a build is proved is
+[docs/ARTIFACT_BUILD.md](../../docs/ARTIFACT_BUILD.md).
+
+Families (build.py `FAMILIES`, keyed by `config.json` `model_type`): `deepseek_v4` / `deepseek_v41`
+(`deepseek.py`), `qwen4_exp` (`qwen.py`), Inkling (`inkling.py`), Nemotron-H (`nemotron_h.py`), the Nemotron-3.5
+retrieval encoders (`nemotron_enc.py`, L321) and Nemotron-3.5 Parse (`nemotron_parse.py`, L321).  Recipes live in
+[format-maps/](format-maps/README.md).  The Python unit tests are `test_*.py` beside the modules
+(`make container-tests`).
 
 ## Module contract (the interfaces the modules are written against)
 
@@ -17,7 +21,7 @@ hf_source.py                            # the source readers, family-neutral, he
   class HFCheckpoint(hf_dir)            # .names(), .shape(n), .dtype(n), .span(n), .raw(n) -> bytes, .copy_src(n),
                                         #  .config (text_config merged), .generation_config; `X#i` = slice i of stack X
   class Exl3Checkpoint(dir)             # .names(), .linear(key, k, n, rates) -> (ranges, words); the family names the key
-  class TesseraBundle(dir)              # .names(): <stack>.pt unit-blob files (the producer lands with L255)
+  class TesseraBundle(dir)              # .names(): <stack>.pt unit-blob files (its producer is not on dev; see below)
 
 recipe.py                               # pulsar.recipe.v1 (module docstring): every family's recipe
   class Recipe                          # .load(path, settings); .resolve(mapped) -> {name: (format, source)}:
@@ -54,6 +58,7 @@ deepseek.py / qwen.py / inkling.py      # the family modules (build.FAMILIES, by
                                         #  inkling.Source names the projections Inkling's fused w13 / expert stacks hold
                                         #  (the EXL3 pack's names) and checks names, dtypes, shapes against the declared
                                         #  Shape both ways; Mapped.bind carries the role table into pulsar.tensors
+nemotron_enc.py / nemotron_parse.py      # the Nemotron-3.5 Embed / Rerank encoders and the Parse model (L321)
 nemotron_h.py                           # Nemotron-H (the Omni checkpoint); with_drafter(hf, kind, dir) is build.py's
                                         #  --drafter lilicorr DIR (L298), through drafters.py; the recipe omits the MTP
 drafters.py                             # the block-drafter input, every family's (L298 / L299): with_drafter(hf, kind,
@@ -77,17 +82,20 @@ producers.py                            # every producer: bytes in, bytes out, n
                                                                      #  E4M3 SF | f32 scale_2 + 28 zero B]; in % 64
   def fp8_e4m3_soa_k_from_bf16(w_bf16, rows, cols) -> bytes          # markov_w2, k-major
   def i64_to_i32(raw) -> bytes                                       # tid2eid; refuses a value outside int32
-  def tessera_planes(...)                                            # the (tessera, tessera) slot: refuses until L255
+  def tessera_planes(...)                                            # the (tessera, tessera) slot: refuses (producer not on dev)
   def bytes_for(layout, dims_ne, dtype=None) -> int                  # == st_bytes_for / routed_expert_side_layout
 
+ple_rows.py                             # qwen4_exp: the PLE n-gram table as one disk row file (`build` | `verify`);
+                                        #  build.py --ple-rows MANIFEST names it in the container
+tokenizer/core.py                       # the tokenizer.* kv entries, one core for every family (L279 step 6)
 entries.py                              # one entry's payload through the producer table (dense, expert, EXL3 ranges)
 exl3_rates.py                           # K2 (layout <-> rate), ARMS == exl3_arm_has_rate, ROLE_ARM, admit(role, layout)
 
 kv.py
-  def build_kv(hf: HFCheckpoint, tokenizer_dir: str, reap_map: str | None) -> list[dict]
+  def build_kv(hf, tokenizer_dir, reap_map=None, keep=None, engram_layout=None) -> list[dict]
       # [{'key','type','value'}] in the engine's spelling: types u8 i8 u16 i16 u32 i32 u64 i64 f32 f64 bool string array;
       # arrays as {"__array__": elem_type, "n": N, "v": [...]}; every f32 rounded through struct.pack('<f') first.
-      # Emits the keys the engine CONSUMES (weights.cpp:941-965, 1021-1063, 777-813, 874-882, 838-858, 1072;
+      # Emits the keys the engine CONSUMES (src/engine/weights.cpp and the family loaders;
       # tokenizer.ggml.tokens / merges; drafter deepseek_v4_dspark.embedding_length + dspark.target_layer_ids.N).
 
 build.py                                # the driver: `recipe` | `plan` | `emit` | `verify` | `audit` (docs/ARTIFACT_BUILD.md)
@@ -100,14 +108,9 @@ build.py                                # the driver: `recipe` | `plan` | `emit`
   cmd_audit                             # structure + declarations closed both ways
 ```
 
-## Order of work (L247)
+## History
 
-1. Text stack: names + policy + kv + producers {native, mxfp8_lt, cutlass_mxfp4, exl3} + emit + verify.
-   DONE 2026-09-24: the served Vision-Exp artifact is reproduced entry-for-entry (see the instrument in
-   docs/ARTIFACT_BUILD.md); the V4.1 artifact with EXL3 experts is graded against
-   `/rpool/models/v41-exl3-safetensors` (the last lane emission).
-2. Tower: native passthrough of `vision.*`, `aligner.*`, `image_*` -- DONE (shard 1); V4.1 lacks `image_pad`.
-3. Drafter: `mtp.*`, the V4.1 `markov_head.{embed,head}` rename, k-major `fp8_e4m3_soa_k` -- DONE.
-4. Engram: `wkv/q/k` as ordinary layer-shard tensors; row tables side files named by a kv (with L242 slice 5).
-5. Delete: `deepseek4-quantize`, both template builders, `gguf_hdr.py`, the GGUF tools, the lane's GGUF
-   reader; `quants_*.c` shrink to the codecs the builder still calls; docs/ARTIFACT_BUILD.md rewritten.
+The builder replaced the GGUF pipeline in L247 (2026-09-24): its first instrument reproduced the served
+DeepSeek-V4-Flash Vision-Exp artifact entry-for-entry (docs/ARTIFACT_BUILD.md), then the V4.1 EXL3 artifact,
+the vision tower, the drafters and Engram followed.  L279 made it one plan, one producer table and one recipe
+schema (`pulsar.recipe.v1`) for every family.

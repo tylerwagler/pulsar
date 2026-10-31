@@ -1,11 +1,15 @@
 # Tensor Parallelism (TP) — port seed
 
+> **Status (2026-10-30):** a design and decision record from the TP bring-up (2026-08 to 2026-10). Source
+> comments cite it, so it stays here; the slice plans and open items in it are historical. How to run TP today:
+> [SERVER.md#tensor-parallelism](SERVER.md#tensor-parallelism).
+
 Status of the two-Spark TP effort, kept in-repo as the decision record. The
 `tensor_parallel` branch was retired into `dev` 2026-09-04 (zero commits absent
 from dev; nothing unique lost) — `dev` is the single active line, so read
 `origin/dev` for any engine analysis. All TP code lives only inside dev's
 history.
-Source of truth for scope decisions: `~/Projects/AI/pulsar/notes/plans/102-tensor-parallel-two-sparks.md`
+Source of truth for scope decisions: the private ledger's plan 102 (tensor parallel on two Sparks; not in this repo)
 (private) + ledger L102. This file is the public, in-tree pointer that code
 comments can cite (like the Lnnn tags elsewhere).
 
@@ -19,8 +23,8 @@ comments can cite (like the Lnnn tags elsewhere).
   CUDA work and only the transport (ds4_tp.c ~2.2k lines) lifts.
 - **Interconnect is characterized (read-only, 2026-08-26, re-verified 2026-09-02):**
   the pair has TWO direct-attach 200G NDR RoCE wires: `rocep1s0f1`
-  (192.168.0.12/.13 — the NCCL/vLLM wire) and `roceP2p1s0f1`
-  (192.168.9.12/.13/30, MTU 9000 — the TP bring-up wire, separate from NCCL),
+  ([IP] — the NCCL/vLLM wire) and `roceP2p1s0f1`
+  (a /30, MTU 9000 — the TP bring-up wire, separate from NCCL),
   RS-FEC, 0 CRC errors; no `nvidia_peermem` loaded yet TP2 runs at speed
   (GB10 unified-memory registerable-slabs thesis holds). Production pair is
   off-limits (read-only, ~10 GB free) — engine bring-up needs a spare box or
@@ -109,7 +113,7 @@ Why the revision: the first cut had both ranks run the **same driver with the
 same arguments**, with the worker's wrappers blocking for the leader's frame.
 That holds for the CLI, but a `pulsar-server` worker receives no HTTP requests,
 creates no sessions and issues no operations, so a server pair could not be
-driven that way at all (census in `pulsar-notes/rows/L238.md`). The loop is the
+driven that way at all (census in ledger row L238). The loop is the
 only version that serves production. Increments: (1) registry + loop for the
 frames that exist — create, destroy, sync, eval, batched and mixed decode,
 rewind, invalidate, rng state, stop — with the mixed step's `max_head_runs`

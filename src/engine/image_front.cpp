@@ -1,3 +1,5 @@
+/** @file image_front.cpp
+ *  @brief L268: the image path every family shares. */
 /* image_front.cpp -- L268: the image path every family shares.
  *
  * DeepSeek's image work (L216, L226, L261, L273, L281) built the path inside DeepSeek's code; Qwen's tower (L268)
@@ -16,12 +18,15 @@
 
 #include <time.h>
 
+/// @return CLOCK_MONOTONIC, in seconds
 static double front_now_s(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
 }
 
+/// @param e the engine, or NULL
+/// @return its family's image front, or NULL
 static const pulsar_family_vision *front_of(const pulsar_engine *e) {
     return e && e->family ? e->family->vision : NULL;
 }
@@ -36,25 +41,35 @@ static const pulsar_family_vision *front_of(const pulsar_engine *e) {
  * Byte-capped FIFO, process-global, no lock: the engine's GPU state is shared and merges are serial by construction
  * (prefill is serial), so the cache inherits the same discipline.  It is cleared when the engine changes --
  * pulsar_test opens several engines in one process, and another model's row would be a silently wrong embedding. */
+/// The tower-output cache's byte cap (64 MiB).
 #define IMAGE_TOWER_CACHE_BYTES (64u * 1024u * 1024u)
+/** One cached tower output: the tower rows of one image, keyed by content hash and family. */
 typedef struct {
+    /// pulsar_image_content_hash of the image, XOR the family pointer
     uint64_t key;
     size_t   src_len;   ///< the image's byte length, checked with the key
     int      rows;      ///< tower rows stored
     size_t   bytes;     ///< their size
+    /// the tower rows, `rows` x the family's row_width 16-bit elements (malloc'd; owned by the cache)
     uint16_t *data;
 } tower_cache_entry;
+/// The cache entries, oldest first.
 static tower_cache_entry g_tower_cache[16];
+/// Entries in use (<= 16).
 static int    g_tower_cache_n = 0;
+/// Sum of the entries' bytes (<= IMAGE_TOWER_CACHE_BYTES).
 static size_t g_tower_cache_bytes = 0;
+/// The engine the entries were made by; another engine clears the cache.
 static const pulsar_engine *g_tower_cache_owner = NULL;
 
+/// Free every entry.
 static void tower_cache_reset(void) {
     for (int i = 0; i < g_tower_cache_n; i++) free(g_tower_cache[i].data);
     g_tower_cache_n = 0;
     g_tower_cache_bytes = 0;
 }
 
+/// Free the oldest entry and shift the rest down (needs at least one entry).
 static void tower_cache_drop_oldest(void) {
     g_tower_cache_bytes -= g_tower_cache[0].bytes;
     free(g_tower_cache[0].data);
@@ -62,6 +77,9 @@ static void tower_cache_drop_oldest(void) {
     g_tower_cache_n--;
 }
 
+/// @param key the content key
+/// @param src_len the image's byte length
+/// @return the entry, or NULL
 static const tower_cache_entry *tower_cache_get(uint64_t key, size_t src_len) {
     for (int i = 0; i < g_tower_cache_n; i++)
         if (g_tower_cache[i].key == key && g_tower_cache[i].src_len == src_len) return &g_tower_cache[i];
@@ -69,6 +87,11 @@ static const tower_cache_entry *tower_cache_get(uint64_t key, size_t src_len) {
 }
 
 /* Takes ownership of `data` (freed when it is not kept). */
+/// @param key the content key
+/// @param src_len the image's byte length
+/// @param data the rows (ownership passes in)
+/// @param rows their count
+/// @param bytes their size
 static void tower_cache_put(uint64_t key, size_t src_len, uint16_t *data, int rows, size_t bytes) {
     if (rows <= 0 || bytes > IMAGE_TOWER_CACHE_BYTES) { free(data); return; }   /* not worth caching */
     while (g_tower_cache_n > 0 && g_tower_cache_bytes + bytes > IMAGE_TOWER_CACHE_BYTES) tower_cache_drop_oldest();

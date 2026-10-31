@@ -11,7 +11,7 @@
   "generation_config.json": "015bf4f765008e744f4d325f9320cfc2de35539f9cb972a505979471695a0feb"
  },
  "calib": {
-  "path": "/mnt/models/qwen38-calib/calib-qwen38-v1.jsonl",
+  "path": "<model-store>/qwen38-calib/calib-qwen38-v1.jsonl",
   "sha256": "870e3226e28ce2ee27e1fea2ff936b856a810467b800ddf50d9bda851ee9e8eb"
  },
  "stop_ids": [

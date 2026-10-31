@@ -1,3 +1,5 @@
+/** @file
+ *  pulsar-agent: the bash tool's background jobs (spawn, poll, output capture, observation). */
 #include "pulsar_agent_internal.h"
 
 
@@ -97,6 +99,9 @@ void agent_bash_job::drain() {
 
 
 
+/** @brief Flag (under w->mu) that a child may have changed the terminal mode, so the UI thread re-checks raw mode
+ *  at its next safe point.
+ *  @param w the worker; NULL is a no-op */
 static void agent_worker_note_terminal_mode_may_have_changed(agent_worker *w) {
     if (!w) return;
     pthread_mutex_lock(&w->mu);
@@ -244,6 +249,11 @@ agent_bash_job *agent_bash_start(agent_worker *w, const char *cmd,
 
 
 
+/** @brief Append bytes to `b`, then drop from the front so at most `max` bytes remain (keeps the tail).
+ *  @param b   the buffer (NUL-terminated after the call)
+ *  @param s   bytes to append
+ *  @param n   byte count; 0 is a no-op
+ *  @param max the byte cap kept */
 static void agent_tail_append(agent_buf *b, const char *s, size_t n, size_t max) {
     if (!n) return;
     agent_buf_append(b, s, n);
@@ -332,12 +342,9 @@ char *agent_bash_job::read_tail_lines(int max_lines) const {
 
 
 /* Build the tool result for a bash job.  The first observation shows the HEAD
- * of the output, every later one the TAIL; mark_observed is what flips it.
- *
- * NOTE: this used to say the cursor makes the next status report "only fresh
- * output".  It does not -- observed_bytes/observed_display_lines are assigned
- * here and read nowhere, so a repeated bash_status re-shows the same tail
- * rather than the newly added bytes. */
+ * of the output, every later one the TAIL; mark_observed is what flips it (a
+ * repeated bash_status re-shows the current tail: there is no "new bytes only"
+ * cursor). */
 char *agent_bash_job::observation(bool mark_observed) {
     auto *job = this;
     job->poll();
@@ -414,16 +421,16 @@ char *agent_bash_job::observation(bool mark_observed) {
         agent_buf_puts(&out, line);
     }
 
-    if (mark_observed) {
-        job->observed_bytes = job->bytes;
-        job->observed_display_lines = display_lines;
-        job->observed_once = true;
-    }
+    if (mark_observed) job->observed_once = true;
     return agent_buf_take(&out);
 }
 
 
 
+/** @brief Show a bash observation's output body to the user: a grey "[showing first/last output lines]" note for a
+ *  head/tail section, the body itself (orange when the job finished with a nonzero exit status).
+ *  @param w   the worker whose UI receives it
+ *  @param obs the observation text (agent_bash_job::observation); NULL or empty shows nothing */
 static void agent_bash_publish_observation(agent_worker *w, const char *obs) {
     if (!obs || !obs[0]) return;
     const char *body = NULL;
@@ -469,6 +476,11 @@ static void agent_bash_publish_observation(agent_worker *w, const char *obs) {
 
 
 
+/** @brief Poll a running job for up to `refresh_sec` seconds (100 ms waits on its pipe), stopping early when it
+ *  exits or the worker is interrupted; polls once more at the end.
+ *  @param w           the worker (for the interrupt check)
+ *  @param job         the job to poll
+ *  @param refresh_sec the wait budget, seconds */
 static void agent_bash_refresh_for(agent_worker *w, agent_bash_job *job,
                                    int refresh_sec) {
     double start = agent_now_sec();

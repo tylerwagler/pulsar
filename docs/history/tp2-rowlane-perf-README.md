@@ -1,10 +1,12 @@
+> **Historical, not maintained** (moved to docs/history/ on 2026-10-30): the L269-perf TP row-lane decode A/B, about 2026-10-11 (was tools/tp2-rowlane-perf/README.md; the scripts stay there). The code at the tip of `dev` is the authority.
+
 # Row-lane decode A/B on the pair (L269-perf)
 
 The TP row lane's combine kernels used to **spin on the done word** until the proxy reported the peer's rows. On
-sparky's loopback (both ranks on one GPU, two processes, time-sliced) a spinning kernel keeps its context resident
+the dev GB10's loopback (both ranks on one GPU, two processes, time-sliced) a spinning kernel keeps its context resident
 while the rank it waits for cannot run, so every exchange cost about one GPU timeslice (~2 ms):
 
-| sparky loopback, 256 greedy tokens | lane off (pre-v26) | lane on, spin (fe8ab143) | lane on, stream wait (this build) |
+| the dev GB10 loopback, 256 greedy tokens | lane off (pre-v26) | lane on, spin (fe8ab143) | lane on, stream wait (this build) |
 |---|---|---|---|
 | V4 7-layer fixture (vexp-tp-fixture) | 19.96 ms/token | 60.59 | **18.25** |
 | V4.1 7-layer fixture (v41-tp1-fixture-mx) | 35.42 | 65.16 | **35.21** |
@@ -35,17 +37,17 @@ checks that per arm.
 | Model | Default (env) | Needed |
 |---|---|---|
 | DeepSeek-v4-Flash 0731 (production) | `~/models/DeepSeek-v4-Flash` (`MODEL=`) | yes |
-| V4 Vision-Exp 7-layer MXFP4 fixture, 27 GB | `~/models/vexp-tp-fixture` (`V4FIX=`) | optional: sparky `/srv/models/vexp-tp-fixture` |
+| V4 Vision-Exp 7-layer MXFP4 fixture, 27 GB | `~/models/vexp-tp-fixture` (`V4FIX=`) | optional: the dev GB10 `/path/to/models/vexp-tp-fixture` |
 | V4.1 7-layer fixture, MXFP4 layer 20 | `~/models/v41-tp1-fixture-mx` (`V41FIX=`) | optional, see below |
 
 A fixture missing on either node skips its leg by name. **V4.1 on the pair:** there is no V4.1 artifact on the pair
-(L269). The fixture is sparky `/srv/models/v41-tp1-fixture-mx`: 9 shards, ~57 GB once copied with `cp -L` (eight are
-symlinks into `/srv/models/v41-tp1-fixture`), plus its two Engram tables `engram-l1.rows` / `engram-l14.rows`,
-~94 GB each (`/mnt/models/engram-v41`). Put the tables on local NVMe and keep the two `engram-*.rows` links pointing
+(L269). The fixture is the dev GB10 `/path/to/models/v41-tp1-fixture-mx`: 9 shards, ~57 GB once copied with `cp -L` (eight are
+symlinks into `/path/to/models/v41-tp1-fixture`), plus its two Engram tables `engram-l1.rows` / `engram-l14.rows`,
+~94 GB each (`/path/to/models/engram-v41`). Put the tables on local NVMe and keep the two `engram-*.rows` links pointing
 at them: over NFS the Engram reads dominate the decode (~3 tok/s, L269). That is ~245 GB per node. If that is too
 much to carry, run without it. The V4 fixture covers the same lane at the same 7-layer shape.
 
-## 3. Run on the head (ca1070wk30008), as the serving user
+## 3. Run on the head (pair-b), as the serving user
 
 ```sh
 ~/pulsar-rl-b/tools/tp2-rowlane-perf/run.sh ~/pulsar-rl-a ~/pulsar-rl-b

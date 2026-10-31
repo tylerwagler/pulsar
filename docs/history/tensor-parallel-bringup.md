@@ -1,3 +1,5 @@
+> **Historical, not maintained** (moved to docs/history/ on 2026-10-30): the first two-GB10 tensor-parallel bring-up runbook, 2026-08-26 (was docs/tensor-parallel-bringup.md). The code at the tip of `dev` is the authority.
+
 # TP bring-up runbook (2026-08-26) — the first GPU session, scripted
 
 Purpose: turn the first box session with the work pair (or any spare Spark pair)
@@ -7,7 +9,7 @@ host tests are green on a GPU-less box — what this runbook validates is the
 runtime layer that only exists on real hardware.
 
 ⚠ **Prerequisite / constraint (from 2026-08-26): the work pair
-(`ca1070wk30007/008`) is PRODUCTION and read-only — do not run anything heavy
+(`pair-a/b`) is PRODUCTION and read-only — do not run anything heavy
 or traffic-generating on it without an approved maintenance window, and do not
 build/run our engine next to the live vLLM (~10 GB free). This runbook targets
 a spare pair OR the work pair during an approved window.**
@@ -48,18 +50,18 @@ If a session needs a full engine build first: `make cuda-spark`.
 
 ```sh
 rdma link; ibv_devinfo -l                 # 4 HCAs; all four ports ACTIVE/LINK_UP
-ip -br addr         # 192.168.0.12/.13 (NCCL wire) + 192.168.9.12/.13 (TP wire)
-                    # + 192.168.1.12/.13 (mgmt)
+ip -br addr         # [IP] (NCCL wire) + [IP] (TP wire)
+                    # + [IP] (mgmt)
 cat /sys/class/net/enP2p1s0f1np1/mtu      # 9000 on the TP wire
 ```
-Pass: the `rocep1s0f1` port carrying `192.168.0.x` AND `roceP2p1s0f1` carrying
-`192.168.9.x` are both ACTIVE on both sides.
+Pass: the `rocep1s0f1` port carrying `[IP]` AND `roceP2p1s0f1` carrying
+`[IP]` are both ACTIVE on both sides.
 
-> **TP wire (verified 2026-09-02 on ca1070wk30007/008):** the second 200G cable is
-> `enP2p1s0f1np1` / `roceP2p1s0f1` / `192.168.9.12-.13/30`, MTU 9000, IPv4 GID
+> **TP wire (verified 2026-09-02 on pair-a/b):** the second 200G cable is
+> `enP2p1s0f1np1` / `roceP2p1s0f1` / `[IP]`, MTU 9000, IPv4 GID
 > present (high index — the fallback scan picks it up; `PULSAR_TP_RDMA_GID_INDEX`
 > not needed). It is **separate from the NCCL wire** (`enp1s0f1np1` /
-> `rocep1s0f1` / `192.168.0.x`), so a co-tenant run dials the 9.x address and
+> `rocep1s0f1` / `[IP]`), so a co-tenant run dials the 9.x address and
 > pins `PULSAR_TP_RDMA_DEV=roceP2p1s0f1` on BOTH ranks (tp-pair-bringup.sh
 > threads it through every leg) and never touches the wire vLLM/NCCL uses.
 > `rocep1s0f0` and `roceP2p1s0f0` are LINK_UP but carry no IP — ignore them.
@@ -120,7 +122,7 @@ capture the `cudaGetErrorString`/`strerror` now — it changes the slab design.
 > **Re-verified 2026-09-23 on the current n-rank transport (`work/tp-owned-moe`,
 > 1c22835d):** both ranks `slab attached, GPU-visible (14091976 bytes,
 > host-pinned (pulsar_tp_gpu)), mr=registered` and `tp_slab_probe: rank N ok
-> (GPU slab: gates, batch, big; RDMA)` over `mlx5_3` / 192.168.9.x, gid index 5.
+> (GPU slab: gates, batch, big; RDMA)` over `mlx5_3` / [IP], gid index 5.
 >
 > **Co-tenant with vLLM is a hard block for this step, not a "go light" caution.**
 > With the production vLLM worker resident (~101 GiB of the 121.6 GiB GB10
@@ -140,7 +142,7 @@ Run the PLAN 102 probe's RDMA halves (not on production without a window):
 # record 16 KiB round-trip for each of the two cabled links; expect ~10-30 us.
 # PULSAR_TP_RDMA_DEV=<hca> pins the transport's device per rank for the A/B.
 ```
-Pass: numbers recorded into `pulsar-notes` (1-link vs 2-link; merged 2-link if
+Pass: numbers recorded into the private notes (1-link vs 2-link; merged 2-link if
 later implemented). This closes Phase 0a Q2 (~RTT) and the two-cable question.
 
 > **Two rails for the bulk lane (v18, 2026-09-30, L260).**  Each ConnectX-7
@@ -149,7 +151,7 @@ later implemented). This closes Phase 0a Q2 (~RTT) and the two-cable question.
 > reach the 200G port (ib_write_bw on the pair: 109 alone, 97.9 + 97.9 at
 > once).  `PULSAR_TP_RDMA_DEV2=<hca>` names the second function of the SAME
 > port (`mlx5_1` beside `mlx5_3` on the pair; it carries its own IP, here
-> 192.168.0.x); the bulk lane then splits every exchange over both, and the
+> [IP]); the bulk lane then splits every exchange over both, and the
 > log says `split over two rails, mlx5_3 + mlx5_1`.  Set it on both ranks or on
 > neither -- one-sided is refused at bring-up.  The row (decode) lane stays on
 > the primary device.
@@ -236,7 +238,7 @@ Rule 3 still holds on one box: `cuda-reference-gate` must never be graded while
 it prints SKIP -- since L240 the battery points `PULSAR_REF_DIR` at the staged
 Vision-Exp capture by default, so a SKIP now means the override was set empty.
 
-> **FIRST LIVE PAIR — VERDICT (2026-09-23, ca1070wk30007 = rank 0 / 30008 = rank 1,
+> **FIRST LIVE PAIR — VERDICT (2026-09-23, pair-a = rank 0 / 30008 = rank 1,
 > dev `70c02339` + the fixes on `work/tp-pair-live`, artifact
 > `ElytronAI/DeepSeek-v4-Flash` rev `fc589c1a`, 48 shards = 167,979,453,688 B
 > staged on both ranks; vLLM stopped):** the engine loads across both Sparks.
@@ -252,7 +254,7 @@ Vision-Exp capture by default, so a SKIP now means the override was set empty.
 > both rc=0, zero warnings. Two runs produced byte-identical `rank0.lp.json`
 > (75,015 B, sha256 `5d20a7b9…`). `tools/tp-pair-engine-grade.sh` now launches
 > and grades this unattended (`PULSAR_TP_RDMA_DEV=mlx5_3`,
-> `PULSAR_TP_ADDRS="192.168.9.12 192.168.9.13"`).
+> `PULSAR_TP_ADDRS="[IP] [IP]"`).
 >
 > Three defects stood between the runbook and this result, all fixed on the
 > branch: `--tp-rank 0` was refused by both binaries (strictly-positive int
@@ -301,7 +303,7 @@ Vision-Exp capture by default, so a SKIP now means the override was set empty.
 
 > **LEG C -- REFERENCE GATE PASS THROUGH THE PAIR (2026-09-24, dev `ece8a459` +
 > `work/tp-raw-path-refuse`, capture = the Vision-Exp B300 blobs from
-> pulsar-notes `gate-baseline/ref-vexp`, story.ref.bin 27fec79e / code.ref.bin
+> the private notes `gate-baseline/ref-vexp`, story.ref.bin 27fec79e / code.ref.bin
 > 1b987bf8, tol 1e-4, anchors story known-high 512,30464 / known-flip 30464,
 > code known-high 3840).** Story: 2048 KL 1.45e-6, 4096 4.38e-6, 4102 1.61e-7,
 > 6144 5.34e-9, 30464 **top-1 MATCH** KL 1.89e-2 (known-high, informational);

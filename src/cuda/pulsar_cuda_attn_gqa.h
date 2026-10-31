@@ -1,3 +1,5 @@
+/** @file
+ *  The family-neutral GQA attention block: layer declaration, KV rows, and the plan / launch / store API. */
 /* GQA attention block (L295 F1): the family-neutral grouped-query attention
  * the shared block library offers a family's layer plan.  Everything BETWEEN
  * the attention's projections: the caller runs the q / k / v (and, for a
@@ -74,6 +76,7 @@
 #ifdef __CUDACC__
 #include <cuda_runtime.h>
 #else
+/// Host-pass stand-in for the CUDA runtime's stream handle (C and non-nvcc includers).
 typedef struct CUstream_st *cudaStream_t;
 #endif
 
@@ -102,11 +105,14 @@ typedef struct {
     uint32_t          n_q;          /**< query heads */
     uint32_t          n_kv;         /**< KV heads; n_q % n_kv == 0, n_q / n_kv <= 64 */
     uint32_t          head_dim;     /**< 64 or 128 */
+    /** The KV row format of this layer's pools (and of the call's own fresh rows). */
     pulsar_gqa_kv_fmt kv_fmt;
+    /** Which keys a row attends: FULL or WINDOW (with `window`). */
     pulsar_gqa_span   span;
     uint32_t          window;       /**< WINDOW: keys per row (self included); FULL: 0 */
     float             scale;        /**< softmax scale on q . k */
     int               qk_norm;      /**< 1: per-head RMSNorm of q and k */
+    /** qk_norm: the RMSNorm epsilon (>= 0). */
     float             norm_eps;
     const uint16_t   *q_norm_w;     /**< bf16 [head_dim] (qk_norm) */
     const uint16_t   *k_norm_w;     /**< bf16 [head_dim] (qk_norm) */
@@ -114,6 +120,7 @@ typedef struct {
     uint32_t          rel_dim;      /**< the per-head r width: 16 (one MMA k-step; the only built width) */
     const uint16_t   *rel_proj;     /**< bf16 [rel_dim][rel_extent] */
     float             temp_floor;   /**< log-length temperature floor; 0 = no temperature */
+    /** Log-length temperature slope: tau(pos) = 1 + alpha * ln(max(1, (pos + 1) / temp_floor)); finite when temp_floor > 0. */
     float             temp_alpha;
     int               out_gate;     /**< 1: y *= sigmoid(gate) */
     float             rope_theta;   /**< > 0: NeoX rope of q and k at base rope_theta; 0 = none */
@@ -126,17 +133,23 @@ typedef struct {
 /** One sequence's KV pool for ONE layer. */
 typedef struct {
     void    *kv;       /**< device, cap * pulsar_gqa_kv_token_bytes(layer) */
+    /** Size of the `kv` allocation, bytes (>= cap * pulsar_gqa_kv_token_bytes). */
     uint64_t bytes;
     uint32_t cap;      /**< FULL: token capacity; WINDOW: ring slots (>= window) */
 } pulsar_gqa_seq;
 
 /** A strided bf16 input: element (row, head, i) at ptr[row * ld + head * head_stride + i]. */
 typedef struct {
+    /** Device base, bf16 elements. */
     const void *ptr;
+    /** Row stride, elements. */
     uint64_t    ld;
+    /** Head stride within a row, elements (>= the head's width). */
     uint32_t    head_stride;
 } pulsar_gqa_in;
 
+/** One call's device inputs, output and workspace.  Inputs are bf16; the output is bf16, 4-byte aligned with an even
+ *  ld_out >= n_q * head_dim; the workspace is 256-byte aligned. */
 typedef struct {
     pulsar_gqa_in q;          /**< [rows] x n_q heads x head_dim */
     pulsar_gqa_in k;          /**< [rows] x n_kv heads x head_dim (after any conv the family runs) */
@@ -144,16 +157,24 @@ typedef struct {
     pulsar_gqa_in r;          /**< [rows] x n_q heads x rel_dim (rel_extent > 0) */
     pulsar_gqa_in gate;       /**< [rows] x n_q heads x head_dim (out_gate) */
     void         *out_bf16;   /**< [rows][ld_out] bf16: head h at columns h * head_dim .. */
+    /** out_bf16 row stride, elements (even, >= n_q * head_dim). */
     uint64_t      ld_out;
     float        *tap_out_f32;/**< gate tap, f32 [rows][n_q * head_dim], or NULL in the lane */
     void         *workspace;  /**< device, >= pulsar_gqa_workspace_bytes */
+    /** Size of `workspace`, bytes. */
     uint64_t      workspace_bytes;
 } pulsar_gqa_io;
 
 /** Bytes of one token's KV row for this layer (every KV head, K and V). */
+/// @param layer the layer's declaration.
+/// @return n_kv * 2 * head_dim * (1 for E4M3, 2 for BF16) bytes.
 uint64_t pulsar_gqa_kv_token_bytes(const pulsar_gqa_layer *layer);
 
 /** Workspace for ANY call of at most n_rows rows whose positions are < max_ctx. */
+/// @param layer the layer's declaration.
+/// @param n_rows the most rows a call will carry.
+/// @param max_ctx a bound on every row's position + 1.
+/// @return bytes (256-byte regions; covers both schedules).
 uint64_t pulsar_gqa_workspace_bytes(const pulsar_gqa_layer *layer, uint32_t n_rows, uint32_t max_ctx);
 
 /** Run the layer's attention for n_rows rows on `stream`.  Row r is the token
@@ -163,6 +184,14 @@ uint64_t pulsar_gqa_workspace_bytes(const pulsar_gqa_layer *layer, uint32_t n_ro
  *  Writes the rows' KV into the sequences' pools.
  *  @return 0 on success, -1 on a refused contract (named on stderr, nothing
  *  launched), -3 on a launch failure. */
+/// @param layer the layer's declaration.
+/// @param seqs the sequences' pools (host array).
+/// @param n_seqs entries in seqs.
+/// @param row_seq per row, its sequence index (host, [n_rows]).
+/// @param row_pos per row, its position (host, [n_rows]).
+/// @param n_rows rows in the call (1 .. 65535).
+/// @param io the call's device activations, output and workspace.
+/// @param stream the stream every launch goes on.
 int pulsar_gqa_forward(const pulsar_gqa_layer *layer,
                        const pulsar_gqa_seq *seqs, uint32_t n_seqs,
                        const uint32_t *row_seq, const uint32_t *row_pos, uint32_t n_rows,
@@ -175,7 +204,9 @@ int pulsar_gqa_forward(const pulsar_gqa_layer *layer,
 
 /** A planned call: what its launches depend on. */
 typedef struct {
+    /** Rows in the call (<= 65535). */
     uint32_t n_rows;
+    /** Query tiles: runs of up to 64 / G consecutive rows of one sequence (the attention grid's z). */
     uint32_t n_tiles;
     uint32_t grid_chunks;   /**< the split schedule's chunk CTAs per (KV head, tile) */
     uint32_t ctx_bound;     /**< the workspace's context: the call's bound, else its own last position + 1 */
@@ -183,6 +214,8 @@ typedef struct {
 } pulsar_gqa_call;
 
 /** Bytes of a call's descriptors at n_rows rows (pulsar_gqa_plan's `desc`). */
+/// @param n_rows rows in the call.
+/// @return bytes of the row and tile descriptors, each region 256-byte padded.
 uint64_t pulsar_gqa_desc_bytes(uint32_t n_rows);
 
 /** The host half: the rows' descriptors into `desc` (host, >= pulsar_gqa_desc_bytes(n_rows)) and the call's shape
@@ -191,6 +224,16 @@ uint64_t pulsar_gqa_desc_bytes(uint32_t n_rows);
  *  unbounded call's (a chunk CTA past its tile's last row exits; the combine folds each row's own chunks), so a
  *  graph captured at one bound replays at every position under it.  0 = the call's own positions (the forward's).
  *  @return 0, or -1 on a refused contract (named on stderr). */
+/// @param layer the layer's declaration.
+/// @param seqs the sequences' pools (host array).
+/// @param n_seqs entries in seqs.
+/// @param row_seq per row, its sequence index (host, [n_rows]).
+/// @param row_pos per row, its position (host, [n_rows]).
+/// @param n_rows rows in the call (1 .. 65535).
+/// @param ctx_bound 0, or a bound on every row's position (sizes the launches).
+/// @param desc host buffer the descriptors are written to.
+/// @param desc_cap bytes of desc.
+/// @param out the planned call's shape.
 int pulsar_gqa_plan(const pulsar_gqa_layer *layer, const pulsar_gqa_seq *seqs, uint32_t n_seqs,
                     const uint32_t *row_seq, const uint32_t *row_pos, uint32_t n_rows, uint32_t ctx_bound,
                     void *desc, uint64_t desc_cap, pulsar_gqa_call *out);
@@ -199,6 +242,11 @@ int pulsar_gqa_plan(const pulsar_gqa_layer *layer, const pulsar_gqa_seq *seqs, u
  *  bytes, uploaded by the caller before this runs).  io->workspace is sized by pulsar_gqa_workspace_bytes at the
  *  call's rows and ctx_bound; its descriptor region is unused (the descriptors are desc_dev's).
  *  @return 0, -1 on a refused contract, -3 on a launch failure. */
+/// @param layer the layer's declaration.
+/// @param call the plan's shape.
+/// @param desc_dev the plan's descriptors on the device.
+/// @param io the call's device activations, output and workspace.
+/// @param stream the stream every launch goes on.
 int pulsar_gqa_launch(const pulsar_gqa_layer *layer, const pulsar_gqa_call *call, const void *desc_dev,
                       const pulsar_gqa_io *io, cudaStream_t stream);
 
@@ -210,11 +258,22 @@ int pulsar_gqa_launch(const pulsar_gqa_layer *layer, const pulsar_gqa_call *call
  * forward's (each sequence's rows one run of consecutive positions; a ring keeps the run's last cap). */
 
 /** Workspace for a store of at most n_rows rows. */
+/// @param layer the layer's declaration.
+/// @param n_rows the most rows a store will carry.
+/// @return bytes.
 uint64_t pulsar_gqa_store_workspace_bytes(const pulsar_gqa_layer *layer, uint32_t n_rows);
 
 /** Store n_rows rows' K (normed, roped as declared) and V into the sequences' pools on `stream`.  io->k and io->v
  *  are read; q, r, gate and out are not.  `block` must be 0 (a block's rows are never stored).
  *  @return 0, -1 on a refused contract (named on stderr, nothing launched), -3 on a launch failure. */
+/// @param layer the layer's declaration.
+/// @param seqs the sequences' pools (host array).
+/// @param n_seqs entries in seqs.
+/// @param row_seq per row, its sequence index (host, [n_rows]).
+/// @param row_pos per row, its position (host, [n_rows]).
+/// @param n_rows rows in the call (1 .. 65535).
+/// @param io k, v and the workspace are read.
+/// @param stream the stream the launches go on.
 int pulsar_gqa_store(const pulsar_gqa_layer *layer, const pulsar_gqa_seq *seqs, uint32_t n_seqs,
                      const uint32_t *row_seq, const uint32_t *row_pos, uint32_t n_rows, const pulsar_gqa_io *io,
                      cudaStream_t stream);

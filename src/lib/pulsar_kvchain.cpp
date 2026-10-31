@@ -1,3 +1,5 @@
+/** @file
+ *  The segment-chain persist / restore of a session's KV (pulsar_kvchain.h). */
 /* L264: a session's KV as a segment chain (pulsar_kvchain.h). */
 #include "pulsar_kvchain.h"
 #include "pulsar_kvtext.h"
@@ -7,22 +9,45 @@
 #include <string.h>
 
 namespace {
+/** What kvchain_put hands pulsar_segstore_put as `ud`: the bank and span its write callbacks serialise. */
 struct seg_ctx {
+    /// The session whose bank holds the segment's rows
     pulsar_session *s;
+    /** Token span [G_prev, G) of the segment, as raw positions. */
     int G_prev, G;
+    ///< G: the segment's end (exclusive)
     char key[41];       ///< the key the store will name it by (the same rule, pulsar_segstore_child_key)
+    /// The span's rendered text, NUL-terminated (owned by kvchain_put)
     const char *text;
+    /// The caller's trailer writer; NULL when no trailer is written
     const pulsar_kvchain_trailer *trailer;
 };
+/** pulsar_segstore_write_fn for the payload: the session's segment [G_prev, G) under the segment's key.
+ *  @param fp destination, positioned at the payload
+ *  @param ud the seg_ctx
+ *  @param err receives a message on failure
+ *  @param errlen bytes at err
+ *  @return 0 on success (pulsar_session_save_segment's status) */
 int write_payload(FILE *fp, void *ud, char *err, size_t errlen) {
     const seg_ctx *c = (const seg_ctx *)ud;
     /* L334: the chain keeps its spans raw (the disk chain is a later phase); they enter as positions here */
     return pulsar_session_save_segment(c->s, fp, TokPos{c->G_prev}, TokPos{c->G}, c->key, err, errlen);
 }
+/** pulsar_segstore_write_fn for the trailer: forwards to the caller's pulsar_kvchain_trailer::write.
+ *  @param fp destination, positioned at the trailer
+ *  @param ud the seg_ctx
+ *  @param err receives a message on failure
+ *  @param errlen bytes at err
+ *  @return 0 on success */
 int write_trailer(FILE *fp, void *ud, char *err, size_t errlen) {
     const seg_ctx *c = (const seg_ctx *)ud;
     return c->trailer->write(fp, c->trailer->ud, c->text, err, errlen);
 }
+/** A non-owning pulsar_tokens over t[from, to); its `v` aliases t's storage and must not be freed.
+ *  @param t source tokens
+ *  @param from first index (inclusive)
+ *  @param to end index (exclusive)
+ *  @return the borrowed view */
 pulsar_tokens view(const pulsar_tokens *t, int from, int to) {
     pulsar_tokens v;
     memset(&v, 0, sizeof(v));
@@ -30,11 +55,24 @@ pulsar_tokens view(const pulsar_tokens *t, int from, int to) {
     v.len = v.cap = to - from;
     return v;
 }
+/** Outcome of kvchain_put. */
 enum put_rc { PUT_FAILED, PUT_NO_CUT, PUT_STORED };
 /* Store the bank's segment [G_prev, G) under `parent` (its key into key_out).  PUT_NO_CUT: [G_prev, G) is not a
  * segment span (an image block lies across G); PUT_FAILED: `r->err` says why.  A segment the store holds is not
  * written again -- the same key -- unless the store's copy lacks the state this bank holds at G (pulsar_segstore_put
  * replaces it in place); only a write counts in r. */
+/** Store one segment of the bank (see the comment above).
+ *  @param st the segment store
+ *  @param e the engine, for rendering the span's text
+ *  @param s the session whose bank holds the rows
+ *  @param toks the session's tokens; [G_prev, G) is rendered
+ *  @param parent the parent segment's key ("" for a root)
+ *  @param G_prev span start (token position)
+ *  @param G span end (token position)
+ *  @param trailer optional trailer writer (NULL = none)
+ *  @param r counters updated on a write; `r->err` set on PUT_FAILED
+ *  @param key_out receives the segment's key
+ *  @return PUT_STORED, PUT_NO_CUT or PUT_FAILED */
 put_rc kvchain_put(pulsar_segstore *st, pulsar_engine *e, pulsar_session *s, const pulsar_tokens *toks,
                    const char *parent, int G_prev, int G, const pulsar_kvchain_trailer *trailer,
                    pulsar_kvchain_persist_result *r, char key_out[41]) {
@@ -241,6 +279,16 @@ int pulsar_kvchain_load_slice_with(pulsar_segstore *st, const pulsar_segstore_se
     return 0;
 }
 
+/** The pulsar_kvchain_segment_loader that loads into a session's installed bank (pulsar_session_load_segment).
+ *  @param ud     the pulsar_session
+ *  @param fp     the segment's payload, positioned at its first byte
+ *  @param bytes  the payload's size
+ *  @param last   restore the segment's state too
+ *  @param G      receives the position the bank stands at, or NULL
+ *  @param key    the segment's key
+ *  @param err    receives a reason on failure
+ *  @param errlen size of `err`
+ *  @return pulsar_session_load_segment's status: 0 = loaded */
 static int session_segment_loader(void *ud, FILE *fp, uint64_t bytes, bool last, int *G, const char *key, char *err,
                                   size_t errlen) {
     TokPos at{0};

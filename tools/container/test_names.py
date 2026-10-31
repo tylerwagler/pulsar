@@ -9,10 +9,10 @@ directions; expert `.scale` companions fold into their `.weight`).  Then
 map_hf must know every name of the V4.1 checkpoint and of the MiaAI EXL3
 checkpoint (none returns None).  Exit non-zero on any mismatch.
 
-  SERVED  /mnt/models/DeepSeek-v4-Flash/                       48 shards, pulsar.tensors + pulsar.experts
-  SOURCE  hub/models--deepseek-ai--DeepSeek-V4-Flash-Vision-Exp  model.safetensors.index.json + shard headers
-  V4.1    hub/models--deepseek-ai--DeepSeek-V4.1-Flash
-  EXL3    /mnt/models/mia-v41-exl3/model-000*-of-00039.safetensors
+  SERVED  $PULSAR_SERVED (the served container)                48 shards, pulsar.tensors + pulsar.experts
+  SOURCE  $PULSAR_HF_SNAPSHOT (DeepSeek-V4-Flash-Vision-Exp)    model.safetensors.index.json + shard headers
+  V4.1    $PULSAR_V41_SNAPSHOT (DeepSeek-V4.1-Flash)
+  EXL3    $PULSAR_V41_EXL3 (model-000*-of-00039.safetensors)
 """
 import collections
 import glob
@@ -28,10 +28,19 @@ from policy import PolicyError, declared_shape, layout_for  # noqa: E402
 from producers import NATIVE_LAYOUT as NATIVE  # noqa: E402
 import exl3_rates  # noqa: E402
 
-SERVED = "/mnt/models/DeepSeek-v4-Flash/"
-VEXP = "/mnt/models/hub/models--deepseek-ai--DeepSeek-V4-Flash-Vision-Exp/snapshots/*/"
-V41 = "/mnt/models/hub/models--deepseek-ai--DeepSeek-V4.1-Flash/snapshots/*/"
-EXL3 = "/mnt/models/mia-v41-exl3/model-000*-of-00039.safetensors"
+
+def need(var, what):
+    """An oracle path from the environment (make container-tests passes local.mk's); refuse by name when unset."""
+    v = os.environ.get(var, "")
+    if not v:
+        raise SystemExit(f"{var} is not set: {what} (make container-tests passes it from local.mk)")
+    return v
+
+
+SERVED = need('PULSAR_SERVED', 'the served DeepSeek-v4-Flash container directory')
+VEXP = need('PULSAR_HF_SNAPSHOT', 'the DeepSeek-V4-Flash-Vision-Exp HF snapshot directory (a glob matching one is fine)')
+V41 = need('PULSAR_V41_SNAPSHOT', 'the DeepSeek-V4.1-Flash HF snapshot directory (a glob matching one is fine)')
+EXL3 = need('PULSAR_V41_EXL3', 'a glob of the MiaAI V4.1 EXL3 checkpoint shards, e.g. DIR/model-000*-of-00039.safetensors')
 
 EXPERT_ENTRY = re.compile(r"^(layers|mtp)\.(\d+)\.ffn\.experts\.\d+\.(w[123])\.weight$")
 

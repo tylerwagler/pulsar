@@ -28,6 +28,7 @@ __pycache__/
 /tests/test_q4k_dot
 /tests/cuda_long_context_smoke
 /tests/tp_core_test
+/tests/tp_command_free_test
 /tests/tp_transport_test
 /tests/tp_sched_test
 /tests/tp_mesh_test
@@ -44,6 +45,7 @@ __pycache__/
 /tests/spec_teacher_forced_probe
 /tests/session_contract_gate
 /tests/tp_plan_test
+/tests/tp_plan_build_test
 /tests/qwen_s4_gate
 /tests/router_gate
 /tests/bf16_rows_gate
@@ -187,6 +189,7 @@ tests/dspark_batch_gate
 /tests/mamba2_bench
 /tests/head_gate
 /tests/arch_gate
+/tests/kernel_contract_gate
 /tests/pool_gate
 /tests/f16_rows_gate
 /tests/fmha_gate
@@ -222,3 +225,6 @@ tests/sse-golden/out.txt
 /tests/vision_merge_gate
 /tests/vision_tower_gate
 /tests/tessera_kernel_gate
+
+# Machine-local Makefile settings (model and fixture paths); see the top of the Makefile.
+/local.mk

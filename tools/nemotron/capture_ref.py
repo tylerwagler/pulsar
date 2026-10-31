@@ -2,7 +2,7 @@
 """capture_ref.py -- the fp32 reference forward of the Nemotron mini (L296 N1): transformers (trust_remote_code: the
 checkpoint's own NemotronH_Omni_Reasoning_V3 wrapper around transformers' NemotronHForCausalLM), fp32, eager
 attention, CPU, on the first T tokens of a text.  The format-neutral correctness fixture the pulsar forward (N2-N7)
-grades against, as /mnt/models/inkling-small-mini-ref is Inkling's.  `--dtype bf16` (L296 N7) runs the same capture
+grades against, as the inkling-small-mini-ref capture is Inkling's.  `--dtype bf16` (L296 N7) runs the same capture
 in transformers' own bf16 -- the comparator that puts a bf16 engine's distance to the fp32 reference in context (the
 bf16 rounding floor); its tensors are stored as computed (bf16), the logits as f32.
 

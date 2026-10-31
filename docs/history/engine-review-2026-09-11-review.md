@@ -1,3 +1,5 @@
+> **Historical, not maintained** (moved to docs/history/ on 2026-10-30): the review of the l219-review-fixes branch against the 2026-09-11 review, 2026-09-12 (was docs/engine-review-2026-09-11-review.md). The code at the tip of `dev` is the authority.
+
 # Review of branch `l219-review-fixes` — 2026-09-12
 
 Scope: `dev..l219-review-fixes` (35 commits, 23 code, 33 files, +1597/−285; merge-base
@@ -130,7 +132,7 @@ runtime `nr` bound on the `l` sum.
 ## 7. What the misses have in common
 
 B3's "gate-verified" label, A2's phantom test, and (on the Vision-Exp track, see
-`pulsar-notes/rows/L216.md`) the type-43 expert tensors built for a loader that has accepted
+`<private-notes>/rows/L216.md`) the type-43 expert tensors built for a loader that has accepted
 only type 44 since 2026-09-07: in each case a check that proves the work RAN was recorded as
 a check that proves the work is RIGHT.  The mechanical fix, per item, is to name the gate
 that exercises the failure mode before writing "verified", and to grep for the test before

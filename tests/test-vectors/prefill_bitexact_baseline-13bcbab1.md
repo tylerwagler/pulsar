@@ -15,21 +15,21 @@ the top-level Makefile and `tests/prefill_bitexact_gate.cpp`).
   FP8-KV B300 capture that cannot arbitrate NVFP4 rounding; Tyler accepted it
   (2026-10-13 override, see the Makefile's cuda-reference-gate-budget note and
   ledger L292).
-- **Artifact:** `/srv/models/vexp-safetensors` — the Vision-Exp artifact the
+- **Artifact:** the Vision-Exp container (DeepSeek-V4-Flash Vision-Exp) that the
   battery's `FRONTIER_MODEL` names.  A blob is only meaningful for the artifact
   it was dumped on: the header pins the logits width and the prompt FNV, not the
   weights.
 - **Depths:** 512, 2048, 4096, 4102, 6144, 8196, 16388.  GATE_CTX 16512.
-- **Dumped:** 2026-10-13, on sparky (GB10, sm_120f, CUDA 13.3), by
+- **Dumped:** 2026-10-13, on a GB10 (sm_120f, CUDA 13.3), by
   `make cuda-prefill-gate-baseline PREFILL_BASELINE_REF=13bcbab1
-  FRONTIER_MODEL=/srv/models/vexp-safetensors` (detached worktree at the ref,
+  FRONTIER_MODEL=<the Vision-Exp container>` (detached worktree at the ref,
   this tree's gate source + Makefile copied in), 0 build warnings.
 - **Size / sha256:** 3619928 bytes /
   `209cb5310d7fb32bc279e9b2dd8c2aeafda582999831bd70b36f90f5e666efe2`
 - **Superseded blob:** `prefill_bitexact_baseline-f5bea7aa.bin` (same artifact,
   the fast-divide KV row) is deleted with this re-anchor, as numerics re-anchors
-  do.  `prefill_bitexact_baseline-684fa8d.bin` stays as the deleted 0731
-  artifact's history.
+  do.  `prefill_bitexact_baseline-684fa8d.bin` (the deleted 0731 artifact's)
+  was deleted 2026-10-30; its note is in docs/history/.
 
 Self-describing format (`DS4PFXG1` magic): ref stamp, logits width, depth
 list, FNV-1a of the prompt token ids, then the raw f32 logits per depth.

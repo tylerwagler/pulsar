@@ -1,3 +1,5 @@
+/** @file
+ *  TP gate scheduler: host-side numbering and lockstep of the per-gate exchanges, CUDA steps behind hooks. */
 #ifndef PULSAR_TP_SCHED_H
 #define PULSAR_TP_SCHED_H
 
@@ -22,34 +24,64 @@
  * and stays monotonic across tokens — do NOT pass a token index as `e`.
  */
 
+/** The two CUDA-touching steps of a gate exchange, as host hooks (see the file
+ *  comment above).  Both are required; called on the engine worker thread. */
 typedef struct {
+    /// Hook-set name, for diagnostics only.
     const char *name;   /* hook-set name, diagnostics only */
+    /// Opaque context handed back to both hooks (engine tensors / CUDA state).
     void *ud;           /* opaque context (engine tensors / CUDA state) */
     /* Publish this exchange's f32 partial (vec_bytes) into slab out-slot
      * [layer,gate].  4c's implementation reads the engine's hidden state,
      * and, when a GPU kernel produces it, signals the gate-ready flags. */
+    /** Publish exchange `e`'s f32 partial into slab out-slot [layer, gate].
+     *  @return nonzero on success, 0 fails the step. */
     int (*write_partial)(void *ud, uint32_t layer, uint32_t gate, uint64_t e);
     /* Consume the peer's landed partial from slab in-slot [layer,gate]
      * (e.g. accumulate into the engine's hidden state). */
+    /** Consume the peer's landed partial for exchange `e` from slab in-slot [layer, gate].
+     *  @return nonzero on success, 0 fails the step. */
     int (*read_partial)(void *ud, uint32_t layer, uint32_t gate, uint64_t e);
 } pulsar_tp_sched_hooks;
 
+/// Opaque gate scheduler for one rank (defined in pulsar_tp_sched.cpp).
 typedef struct pulsar_tp_sched pulsar_tp_sched;
 
+/** Create a scheduler over `tp`, copying `hooks` (both hooks required).
+ *  @param tp     the transport (borrowed; must outlive the scheduler)
+ *  @param hooks  the CUDA-side hooks (copied)
+ *  @param err    receives the failure reason (may be NULL)
+ *  @param errlen size of `err`
+ *  @return the scheduler (free with pulsar_tp_sched_free), or NULL on bad arguments / OOM */
 pulsar_tp_sched *pulsar_tp_sched_new(pulsar_tp *tp,
                                      const pulsar_tp_sched_hooks *hooks,
                                      char *err, size_t errlen);
+/** Free a scheduler (not its transport); NULL is a no-op.
+ *  @param s the scheduler */
 void pulsar_tp_sched_free(pulsar_tp_sched *s);
 
 /* Run one full decode step: for every layer, GATE_ATTN then GATE_FFN, one
  * exchange each, in slot order.  Both ranks call this for the same token,
  * strictly in lockstep.  Returns 1 on success, 0 on failure with err set. */
+/// Run one decode token's gate exchanges in lockstep.
+/// @param s      the scheduler
+/// @param err    receives the failure reason (may be NULL)
+/// @param errlen size of `err`
+/// @return 1 on success, 0 on the first failing hook or exchange
 int pulsar_tp_sched_decode_token(pulsar_tp_sched *s, char *err, size_t errlen);
 
 /* Prefill: one big_gate_exchange per layer for a whole chunk.  chunk_out /
  * chunk_in are the caller's per-layer buffers (n_layer * vec_bytes each);
  * this is the amortized gate path (86 exchanges per CHUNK, not per token).
  * Both ranks call it for the same chunk in lockstep. */
+/// Run one prefill chunk's per-layer big-gate exchanges in lockstep.
+/// @param s         the scheduler
+/// @param seq       the chunk's exchange sequence number (identical on both ranks)
+/// @param chunk_out this rank's partials: n_layer * vec_bytes
+/// @param chunk_in  receives the peer's partials: n_layer * vec_bytes
+/// @param err       receives the failure reason (may be NULL)
+/// @param errlen    size of `err`
+/// @return 1 on success, 0 on failure
 int pulsar_tp_sched_prefill_chunk(pulsar_tp_sched *s, uint64_t seq,
                                   const void *chunk_out, void *chunk_in,
                                   char *err, size_t errlen);

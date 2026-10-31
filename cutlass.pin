@@ -3,7 +3,7 @@
 #
 # This was a git SUBMODULE until 2026-08-23 and it cost more than it bought.
 # Nothing used it AS a submodule -- `git worktree add` never populates one, and
-# sparky shares a single clone via a SYMLINK at the submodule path, which git
+# the GB10 shared a single clone via a SYMLINK at the submodule path, which git
 # refuses to tolerate: every `git checkout` either failed with
 #   error: expected submodule path 'cutlass' not to be a symbolic link
 # or silently replaced the symlink with an empty directory.  On 2026-08-23 that
@@ -17,13 +17,13 @@
 #
 # The Makefile checks the headers exist before compiling the CUTLASS TU and
 # WARNS if the clone's HEAD != this sha (that check found the dev box and
-# sparky on different revisions the day it was written).
+# the GB10 on different revisions the day it was written).
 #
 # This sha is v4.8.0 (released 2026-09-22), bumped from v4.7.0 dcf215af on
 # 2026-09-23 (L244; Tyler: "it may have some improvements for us" -- the notes
 # name GeForce/sm_120 blockscaled GEMM, block-32 scale factors and grouped
 # blockscaled GEMM).  The pin was created on 2026-08-23 at v4.7.0 because
-# three machines gave three answers (sparky v4.7.0, the dev box v4.6.1,
+# three machines gave three answers (the GB10 v4.7.0, the dev box v4.6.1,
 # AGENTS.md claiming v4.5.2).
 #
 # POLICY: track the latest CUTLASS *release tag*, not main.  main carries

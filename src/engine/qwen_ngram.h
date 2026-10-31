@@ -1,3 +1,5 @@
+/** @file qwen_ngram.h
+ *  @brief Qwen3.8-Flash-Next PLE n-gram ids and table (L251 S4). */
 /* Qwen3.8-Flash-Next PLE n-gram ids and table (L251 S4).
  *
  * The source is transformers' Qwen4ExpTextNGramEmbedding: per token, the
@@ -48,6 +50,7 @@
 #define PULSAR_QWEN_NGRAM_COLS     ((PULSAR_QWEN_NGRAM_ORDER - 1u) * PULSAR_QWEN_NGRAM_HEADS)   /**< 16 */
 #define PULSAR_QWEN_NGRAM_ROW_BYTES 320u /**< 160 bf16 */
 
+/** The Qwen PLE n-gram hash's parameters as read from a v2 row file: everything the host hashing needs. */
 typedef struct {
     int64_t  mult[PULSAR_QWEN_NGRAM_ORDER];    /**< layer_multipliers (odd) */
     uint64_t prime[PULSAR_QWEN_NGRAM_COLS];    /**< ngram_heads_vocab_sizes */
@@ -59,15 +62,20 @@ typedef struct {
 
 /** The per-sequence state: the last two token ids, oldest first. */
 typedef struct {
+    /// the two previous token ids, prev[0] the older
     int32_t prev[2];
 } pulsar_qwen_ngram_ctx;
 
 /** Checks the layout's invariants (odd multipliers below INT64_MAX / vocab,
  *  every head range inside the table, EOS a token).  1 = usable; 0 with the
  *  broken invariant printed. */
+/// @param L the layout
+/// @return 1 or 0
 int  pulsar_qwen_ngram_layout_check(const pulsar_qwen_ngram_layout *L);
 
+/// The PLE row file's header version this reader takes.
 #define PULSAR_QWEN_NGRAM_FILE_VERSION 2u
+/// The row file's dtype code for bf16 rows (the only one taken).
 #define PULSAR_QWEN_NGRAM_DTYPE_BF16   1u
 
 struct pulsar_engram_table;
@@ -75,15 +83,27 @@ struct pulsar_engram_table;
 /** Open the PLE row file for `layer`, asserting its header against the layout
  *  (rows, record, heads) and its size; one part of the Engram pool's table.
  *  1 = open; 0 with the mismatch printed. */
+/// @param[out] t the table
+/// @param path the row file
+/// @param layer the PLE layer
+/// @param L the layout
+/// @return 1 or 0
 int  pulsar_qwen_ngram_table_open(struct pulsar_engram_table *t, const char *path, uint32_t layer,
                                   const pulsar_qwen_ngram_layout *L);
 
 /** A new sequence: EOS, EOS. */
+/// @param L the layout (its eos)
+/// @param[out] ctx the context
 void pulsar_qwen_ngram_ctx_init(const pulsar_qwen_ngram_layout *L, pulsar_qwen_ngram_ctx *ctx);
 
 /** The table rows of `n` tokens that follow `ctx`: rows[i * 16 + h], head
  *  order; advances ctx past them.  Refuses (dies) on a token outside the
  *  vocab. */
+/// @param L the layout
+/// @param[in,out] ctx the context
+/// @param ids [n] tokens
+/// @param n their count
+/// @param[out] rows [n][16] row ids
 void pulsar_qwen_ngram_rows(const pulsar_qwen_ngram_layout *L, pulsar_qwen_ngram_ctx *ctx,
                             const int32_t *ids, uint32_t n, uint64_t *rows);
 

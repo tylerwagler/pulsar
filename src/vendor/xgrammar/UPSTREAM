@@ -5,7 +5,7 @@ pin:      b319ac9f908e2c7f2bde6086c108c70f82f526c6  (v0.2.8+25, 2026-10-28)
 dlpack:   bbd2f4d32427e548797929af08cfe2a9cbb3cf12  (3rdparty/dlpack/dlpack.h only; Apache-2.0, LICENSE beside it)
 picojson: as carried by xgrammar's 3rdparty/picojson (BSD-2-Clause, in the header)
 
-Copied from the pinned upstream clone (~/Projects/AI/upstream/xgrammar), no edits:
+Copied from the pinned upstream clone, no edits:
   include/                                -> include/
   cpp/*.cc cpp/*.h                        -> cpp/
   cpp/support/                            -> cpp/support/

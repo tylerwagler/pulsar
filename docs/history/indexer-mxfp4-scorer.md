@@ -1,3 +1,5 @@
+> **Historical, not maintained** (moved to docs/history/ on 2026-10-30): the design note and measurements for the block-scaled MXFP4 indexer scorer, 2026-08; since implemented in src/cuda/pulsar_cuda_indexer_mxfp4.cu (was docs/indexer-mxfp4-scorer.md). The code at the tip of `dev` is the authority.
+
 # Indexer scorer: native block-scaled MXFP4 design
 
 Design note, not yet implemented. Target: replace

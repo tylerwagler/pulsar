@@ -1,3 +1,5 @@
+/** @file
+ *  Short convolution block: the standalone launch of the arithmetic in pulsar_cuda_sconv.cuh. */
 /* Short convolution block (L295 E3): the standalone launch of the arithmetic in
  * pulsar_cuda_sconv.cuh.  Contract and state layout in pulsar_cuda_sconv.h.
  *
@@ -17,26 +19,65 @@
 
 namespace {
 
+/// Threads per CTA.
 constexpr int kThreads = 128;           /* per CTA */
+/// Channels per thread: one uint4 of bf16 a row.
 constexpr int kVec = 8;                 /* channels per thread: one uint4 of bf16 */
+/// Channels per CTA (grid.x tiles the widest stream's C by this).
 constexpr int kTile = kThreads * kVec;  /* channels per CTA */
+/// Rows per CTA; >= KMAX - 1, so only a sequence's first row tile reads the slot.
 constexpr int kRows = 16;               /* rows per CTA; >= KMAX - 1, so only tile 0 reads the slot */
 static_assert(kRows >= PULSAR_SCONV_KMAX - 1, "a later row tile must find its whole window in the call's rows");
 
+/// One stream's arguments as the kernel reads them (pulsar_sconv_stream flattened with its declaration).
 struct stream_args {
+    /// Taps, bf16 [C][K].
     const uint16_t *w, *b, *x;
+    /** @var b
+     *  Bias, bf16 [C], or NULL.
+     *  @var x
+     *  Input rows, bf16, row r at x + r * ld_x. */
+    /// Output rows, bf16, row r at y + r * ld_y.
     uint16_t *y, *state, *cap;
+    /** @var state
+     *  The state pool: slot s at state + s * state_stride, its row i at + i * state_ld.
+     *  @var cap
+     *  The capture records (state after call row r at cap + r * cap_stride), or NULL. */
+    /// x's row stride in elements.
     uint64_t ld_x, ld_y, state_ld, state_stride, cap_ld, cap_stride;
+    /** @var ld_y
+     *  y's row stride in elements.
+     *  @var state_ld
+     *  Row stride inside a state slot, in elements.
+     *  @var state_stride
+     *  Slot stride in elements.
+     *  @var cap_ld
+     *  Row stride inside a capture record, in elements.
+     *  @var cap_stride
+     *  Capture record stride in elements. */
+    /// Channels (a multiple of 8).
     uint32_t C;
+    /// 1: y = x + conv(x).
     int residual, silu;
+    /** @var silu
+     *  1: y = silu(conv(x)) (exclusive with residual). */
 };
 
+/// The kernel's arguments, passed by value: every stream plus the shared row descriptors.
 struct call_args {
+    /// The streams; grid.z indexes them.
     stream_args s[PULSAR_SCONV_STREAMS_MAX];
+    /// [n_seqs + 1] first call row of each sequence.
     const int32_t *seq_first, *seq_slot;
+    /** @var seq_slot
+     *  [n_seqs] each sequence's pool slot. */
+    /// Row tiles per sequence in grid.y: ceil(max_seq_rows / kRows).
     uint32_t tiles_per_seq;
 };
 
+/// Widens 8 packed bf16 values to f32.
+/// @param v 8 bf16 values, lowest channel in the low half of v.x.
+/// @param f out: f32 [8].
 __device__ __forceinline__ void unpack8(uint4 v, float *f) {
     const uint32_t u[4] = {v.x, v.y, v.z, v.w};
 #pragma unroll
@@ -47,6 +88,8 @@ __device__ __forceinline__ void unpack8(uint4 v, float *f) {
 }
 
 /* bf16 values held in f32 (exact) back to their bits */
+/// @param f 8 f32 values that are exactly bf16 (no rounding happens).
+/// @return their bf16 bits packed as unpack8 reads them.
 __device__ __forceinline__ uint4 pack8_exact(const float *f) {
     uint32_t u[4];
 #pragma unroll
@@ -55,6 +98,10 @@ __device__ __forceinline__ uint4 pack8_exact(const float *f) {
     return make_uint4(u[0], u[1], u[2], u[3]);
 }
 
+/// The short convolution over one (channel tile, sequence, row tile, stream); thread = 8 channels walking the tile's rows.
+/// Grid (ceil(max C / kTile), n_seqs x tiles_per_seq, n_streams), block kThreads, no smem.
+/// @tparam K taps (2 .. PULSAR_SCONV_KMAX).
+/// @param a the arguments (call_args).
 template <int K>
 __global__ void __launch_bounds__(kThreads) sconv_kernel(const call_args a) {
     const stream_args &S = a.s[blockIdx.z];
@@ -140,24 +187,46 @@ __global__ void __launch_bounds__(kThreads) sconv_kernel(const call_args a) {
     }
 }
 
+/// @param p any pointer.
+/// @return whether it is 16-byte aligned.
 bool aligned16(const void *p) { return ((uintptr_t)p & 15u) == 0; }
 
+/// Names a refused stream contract on stderr.
+/// @param what the broken condition.
+/// @param i    the stream's index.
+/// @return false.
 bool refuse(const char *what, uint32_t i) {
     fprintf(stderr, "pulsar: sconv: stream %u: %s -- refusing\n", i, what);
     return false;
 }
 
 /* [lo, hi) bytes of `rows` rows of `C` bf16 at stride ld */
+/// @param p    first element.
+/// @param ld   row stride in elements.
+/// @param rows rows (>= 1).
+/// @param C    columns used per row.
+/// @param lo   out: first byte address.
+/// @param hi   out: one past the last used byte.
 void span(const uint16_t *p, uint64_t ld, uint32_t rows, uint32_t C, uintptr_t *lo, uintptr_t *hi) {
     *lo = (uintptr_t)p;
     *hi = (uintptr_t)(p + (uint64_t)(rows - 1) * ld + C);
 }
 
 /* a record of K-1 rows of C at row stride ld, records `stride` apart */
+/// @param ld     row stride inside a record, elements.
+/// @param stride record stride, elements.
+/// @param d      the stream's declaration (C, K).
+/// @return whether a (K-1)-row record of C fits: ld >= C, stride >= (K-2) * ld + C, both multiples of 8.
 bool record_ok(uint64_t ld, uint64_t stride, const pulsar_sconv_decl *d) {
     return ld >= d->channels && ld % kVec == 0 && stride % kVec == 0 && stride >= (uint64_t)(d->kernel - 2) * ld + d->channels;
 }
 
+/// Checks one stream of a call against the contract in pulsar_cuda_sconv.h; names the first violation on stderr.
+/// @param s      the stream.
+/// @param i      its index (for the message).
+/// @param n_rows the call's rows (for the overlap check).
+/// @param K0     the first stream's kernel, which every stream must match.
+/// @return true when it may launch.
 bool stream_ok(const pulsar_sconv_stream &s, uint32_t i, uint32_t n_rows, uint32_t K0) {
     const pulsar_sconv_decl *d = s.decl;
     if (!d) return refuse("no declaration", i);
@@ -186,6 +255,11 @@ bool stream_ok(const pulsar_sconv_stream &s, uint32_t i, uint32_t n_rows, uint32
     return true;
 }
 
+/// @tparam K taps.
+/// @param a      the kernel's arguments.
+/// @param grid   the grid (see sconv_kernel).
+/// @param stream the stream to launch on.
+/// @return cudaGetLastError() after the launch.
 template <int K>
 cudaError_t launch(const call_args &a, dim3 grid, cudaStream_t stream) {
     sconv_kernel<K><<<grid, kThreads, 0, stream>>>(a);

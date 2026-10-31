@@ -1,3 +1,5 @@
+/** @file tp_worker.cpp
+ *  @brief The tensor-parallel worker rank: its session registry and the mirrored-frame loop. */
 #include "pulsar_engine_internal.h"
 #include "tp/pulsar_tp.h"
 #include "pulsar_writeback.h"
@@ -31,24 +33,38 @@
  * stream stays aligned with this rank's until STOP arrives.
  * ------------------------------------------------------------------------ */
 
+/** One session the worker rank holds for the leader, keyed by the create ordinal (see above); an entry of
+ *  pulsar_engine::tp_worker_slots. */
 struct pulsar_tp_worker_slot {
+    /// the create ordinal the leader names this session by (pulsar_session::tp_session_id)
     uint64_t id;            /* the create ordinal the leader names */
+    /// the rank's mirror session; owned by the slot
     pulsar_session *s;
     /* Increment 4: one speculative round per bank, created on first use.  The
      * leader keys its rounds by scheduler slot and names the BANK in every
      * round frame; the bank is the identity this rank keys by. */
+    /// [n_rounds] per bank, the speculative round (NULL until first used); owned, freed with the slot
     pulsar_spec_round **rounds;
+    /// entries of `rounds` (grown to cover the highest bank named)
     uint32_t n_rounds;
+    /// scratch for the accept walk's output, [accepted_cap] ints; owned, its contents unread
     int *accepted;          /* the accept walk's output, unread here */
+    /// capacity of `accepted` in ints
     int accepted_cap;
 };
 
+/** The slot holding the leader's session `id`.  @param e the worker engine  @param id the create ordinal
+ *  @return the slot (the engine's array; invalidated by worker_add / worker_drop), or NULL */
 static pulsar_tp_worker_slot *worker_find(pulsar_engine *e, uint64_t id) {
     for (uint32_t i = 0; i < e->tp_worker_n; i++)
         if (e->tp_worker_slots[i].id == id) return &e->tp_worker_slots[i];
     return NULL;
 }
 
+/// Append a slot for a just-created mirror session (the engine's array grows by doubling, from 8).
+/// @param e the worker engine
+/// @param s the session; the slot takes ownership
+/// @return the new slot (invalidated by the next add / drop)
 static pulsar_tp_worker_slot *worker_add(pulsar_engine *e, pulsar_session *s) {
     if (e->tp_worker_n == e->tp_worker_cap) {
         e->tp_worker_cap = e->tp_worker_cap ? e->tp_worker_cap * 2u : 8u;
@@ -62,6 +78,9 @@ static pulsar_tp_worker_slot *worker_add(pulsar_engine *e, pulsar_session *s) {
     return slot;
 }
 
+/** Free the slot's rounds and scratch, destroy its session, and remove it (the last slot moves into its place).
+ *  @param e    the worker engine
+ *  @param slot the slot; invalid after the call */
 static void worker_drop(pulsar_engine *e, pulsar_tp_worker_slot *slot) {
     for (uint32_t b = 0; b < slot->n_rounds; b++) pulsar_spec_round_free(slot->rounds[b]);
     free(slot->rounds);
@@ -72,6 +91,9 @@ static void worker_drop(pulsar_engine *e, pulsar_tp_worker_slot *slot) {
 }
 
 /* The round for `bank` on this rank, created on first use. */
+/// @param slot the session's slot
+/// @param bank the bank the frame names
+/// @return the round (owned by the slot), or NULL for a negative bank
 static pulsar_spec_round *worker_round(pulsar_tp_worker_slot *slot, int bank) {
     if (bank < 0) return NULL;
     if ((uint32_t)bank >= slot->n_rounds) {
@@ -84,6 +106,10 @@ static pulsar_spec_round *worker_round(pulsar_tp_worker_slot *slot, int bank) {
     return slot->rounds[bank];
 }
 
+/** The slot's accept-walk scratch, grown to at least `cap` ints (and at least 1).
+ *  @param slot the session's slot
+ *  @param cap  ints wanted
+ *  @return the scratch (owned by the slot) */
 static int *worker_accepted(pulsar_tp_worker_slot *slot, int cap) {
     if (cap < 1) cap = 1;
     if (cap > slot->accepted_cap) {
@@ -107,6 +133,13 @@ struct pulsar_tp *pulsar_engine_tp(const pulsar_engine *e) {
 
 /* The two refusals every acked frame shares.  Returns 1 when the frame must be
  * refused (err filled), 0 when the body may run. */
+/// @param e      the worker engine
+/// @param c      the frame
+/// @param op     the frame's operation, for the message
+/// @param slot   receives the frame's session slot (NULL when refused for that)
+/// @param err    receives the refusal
+/// @param errlen bytes of `err`
+/// @return 1 = refused (err filled), 0 = the body may run
 static int worker_refused(pulsar_engine *e, const pulsar_tp_command *c, const char *op,
                           pulsar_tp_worker_slot **slot, char *err, size_t errlen) {
     *slot = NULL;
@@ -129,12 +162,22 @@ static int worker_refused(pulsar_engine *e, const pulsar_tp_command *c, const ch
  * aborted -- the leader's stream waits are released and its step refuses at once,
  * instead of waiting out the transport timeout (L241 4g-2).  The pair is
  * failed from here on, which is what a rank leaving lockstep means. */
+/// @param e   the worker engine
+/// @param op  the frame's operation
+/// @param why the reason, carried to the leader
 static void worker_abort_step(pulsar_engine *e, const char *op, const char *why) {
     char msg[200];
     snprintf(msg, sizeof(msg), "the worker could not run %s: %s", op, why);
     pulsar_tp_row_lane_abort(e->tp, msg);
 }
 
+/** Ack an acked frame with its status.
+ *  @param e      the worker engine
+ *  @param sid    the session the frame named
+ *  @param rc     the frame's status (0 = ok)
+ *  @param err    receives the failure
+ *  @param errlen bytes of `err`
+ *  @return 1 (continue the loop) when sent, -1 (err filled) when the control channel is gone */
 static int worker_ack(pulsar_engine *e, uint64_t sid, int rc, char *err, size_t errlen) {
     if (pulsar_tp_send_command_ack(e->tp, sid, rc) != 0) return 1;
     snprintf(err, errlen, "tp: could not ack the leader (control channel gone)");
@@ -144,6 +187,13 @@ static int worker_ack(pulsar_engine *e, uint64_t sid, int rc, char *err, size_t 
 /* The ack of an eval: on success it carries the digest of THIS rank's live row (on the device, L302), which the
  * leader compares against its own (the cross-rank identity check, L243).  A failure acks its status the plain way --
  * there is no row to digest. */
+/// @param e      the worker engine
+/// @param sid    the session the frame named
+/// @param rc     the eval's status (0 = ok)
+/// @param s      the session (its live row is digested)
+/// @param err    receives the failure
+/// @param errlen bytes of `err`
+/// @return 1 when sent, -1 (err filled) when the control channel is gone
 static int worker_ack_live(pulsar_engine *e, uint64_t sid, int rc, pulsar_session *s, char *err, size_t errlen) {
     if (rc != 0) return worker_ack(e, sid, rc, err, errlen);
     uint64_t digest = 0;
@@ -154,12 +204,18 @@ static int worker_ack_live(pulsar_engine *e, uint64_t sid, int rc, pulsar_sessio
 }
 
 /* L264 S4e: this rank's copy of a disk KV segment the leader's store names. */
+/// @param e      the worker engine (its tp_kv_dir)
+/// @param key    the segment key (40 characters)
+/// @param out    receives `<tp_kv_dir>/<key>.tpseg`
+/// @param outlen bytes of `out`
+/// @return false without a kv dir, on a malformed key, or when the path does not fit
 static bool worker_segment_path(pulsar_engine *e, const char *key, char *out, size_t outlen) {
     if (!e->tp_kv_dir || !pulsar_tp_segment_key_ok(key)) return false;
     const int w = snprintf(out, outlen, "%s/%.40s.tpseg", e->tp_kv_dir, key);
     return w > 0 && (size_t)w < outlen;
 }
 
+/** mkdir -p, mode 0755.  @param path the directory  @return true when it exists as a directory afterwards */
 static bool worker_mkdir_p(const char *path) {
     if (!path || !path[0]) return false;
     char buf[4096];
@@ -180,6 +236,13 @@ static bool worker_mkdir_p(const char *path) {
 
 /* The installed bank's segment [G_prev, G), durably: tmp + fsync + rename, and
  * out of the page cache (L261). */
+/// @param s      the session
+/// @param path   the segment's path
+/// @param G_prev the span's start, in tokens
+/// @param G      the span's end, in tokens
+/// @param err    receives the failure
+/// @param errlen bytes of `err`
+/// @return true when the file is in place (the temp file removed otherwise)
 static bool worker_segment_save(pulsar_session *s, const char *path, int G_prev, int G, char *err, size_t errlen) {
     char tmp[4700];
     snprintf(tmp, sizeof(tmp), "%s.tmp.%ld", path, (long)getpid());
@@ -204,6 +267,12 @@ static bool worker_segment_save(pulsar_session *s, const char *path, int G_prev,
 
 /* Load this rank's copy and reach the state the leader states: the same span
  * end and the same history digest. */
+/// @param s      the session
+/// @param path   the segment's path
+/// @param cmd    the leader's segment command (its span end, digest and last flag)
+/// @param err    receives the failure
+/// @param errlen bytes of `err`
+/// @return true when loaded and at the leader's state
 static bool worker_segment_load(pulsar_session *s, const char *path, const pulsar_tp_segment_command *cmd,
                                 char *err, size_t errlen) {
     FILE *fp = fopen(path, "rb");
@@ -229,6 +298,9 @@ static bool worker_segment_load(pulsar_session *s, const char *path, const pulsa
 
 /* Bring-up: copies the leader's store does not name can never be loaded (the
  * leader decides every load) -- reclaim them, and any abandoned temp file. */
+/// @param e      the worker engine (its tp_kv_dir)
+/// @param keys   the leader's keys, n_keys x 40 characters packed
+/// @param n_keys keys in `keys`
 static void worker_segment_reconcile(pulsar_engine *e, const char *keys, uint32_t n_keys) {
     if (!e->tp_kv_dir) return;
     DIR *d = opendir(e->tp_kv_dir);
@@ -254,6 +326,8 @@ static void worker_segment_reconcile(pulsar_engine *e, const char *keys, uint32_
             kept, removed, n_keys);
 }
 
+/** The frame's rows as multiseq requests.  @param c the frame (its n_items items)
+ *  @param rows receives [c->n_items] requests */
 static void worker_rows(const pulsar_tp_command *c, pulsar_multiseq_req *rows) {
     for (uint32_t i = 0; i < c->n_items; i++) {
         rows[i].bank  = (uint32_t)c->items[i].bank;

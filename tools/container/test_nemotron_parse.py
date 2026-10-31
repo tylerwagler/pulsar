@@ -32,8 +32,9 @@ sys.path.insert(0, HERE)
 import nemotron_parse as NP  # noqa: E402
 
 FAILS: list[str] = []
-# sha256 of the plan dump (the source directory as <hf>); fixed when the family landed (L321)
-GOLDEN = {"plan": "62bce3c15d58e7f7d41745e951f7e21e5819f5278f5f1c8631b5d3d0beddaef0"}
+# sha256 of the plan dump (the source directory as <hf>); fixed when the family landed (L321), re-taken at 0.5.0-rc1
+# when nemotron_parse-f16.json's "about" (in the dump) stopped naming a private notes path
+GOLDEN = {"plan": "40032603c159f1f567e4c06466d452e9464c2c04827c7f0f46fb7a280405b36c"}
 RECIPE = os.path.join(HERE, "format-maps", "nemotron_parse-f16.json")
 
 

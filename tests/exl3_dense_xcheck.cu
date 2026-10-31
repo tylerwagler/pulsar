@@ -2,7 +2,7 @@
  * production object) on a REAL weight that exllamav3's quantize_exl3 produced,
  * with activation rows handed over as the A8 slot's bytes, so a driver script
  * can compare it with exllamav3's own forward on the same activations
- * (pulsar-notes research/l251/exl3-dense/xcheck.py).  Not a gate: it needs
+ * (the private notes' research/l251/exl3-dense/xcheck.py).  Not a gate: it needs
  * the files the driver writes.
  *
  *   tests/exl3_dense_xcheck DIR K N k2 M

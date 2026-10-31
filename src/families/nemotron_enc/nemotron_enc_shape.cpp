@@ -6,6 +6,8 @@
  * profile's, a switch other than the value the forward implements, and a key this table does not know are each
  * refused by name; a key with no meaning for the forward is NAMED here with why.  The table is the ONE list of what
  * the family understands: the reader, the pins and the unknown-key check all walk it. */
+/** @file nemotron_enc_shape.cpp
+ *  @brief The Nemotron-3.5 encoders' shape: the container's nemotron_enc.* keys read and pinned, and the layer plan. */
 #include "nemotron_enc.h"
 
 #include <math.h>
@@ -30,6 +32,7 @@ const pulsar_nemotron_enc_shape PULSAR_NEMOTRON_ENC_SHAPE_8B = {
     /* .kind           = */ PULSAR_ENCODER_EMBED,
 };
 
+/// The prefix of every config refusal.
 #define NE "nemotron_enc: "
 
 namespace {
@@ -38,8 +41,10 @@ namespace {
  *  one value the forward implements, or a key (or, ending in '.', a key prefix) named as meaningless to it. */
 enum ne_kind : uint8_t { K_U32, K_F32, K_BOOL, K_STR, K_U32_EQ, K_F32_EQ, K_IGNORED };
 
+/** One entry of the family's key table: which container key, how it is read and checked, and where it lands. */
 struct ne_key {
     const char *key;      ///< the container key (K_IGNORED ending in '.': every key under it)
+    /// How the key is read and checked
     ne_kind kind;
     size_t off;           ///< the shape field (K_U32 / K_F32)
     bool pinned;          ///< the field must equal the profile's
@@ -48,14 +53,23 @@ struct ne_key {
     double want_num;      ///< K_U32_EQ / K_F32_EQ's one value
 };
 
+/// A shape field's byte offset, for k_keys.
 #define F(field) offsetof(pulsar_nemotron_enc_shape, field)
+/// A u32 geometry key, read into `field` and pinned to the profile.
 #define PIN(k, field) {"nemotron_enc." k, K_U32, F(field), true, false, NULL, 0}
+/// An f32 geometry key, read into `field` and pinned to the profile.
 #define PIN_F(k, field) {"nemotron_enc." k, K_F32, F(field), true, false, NULL, 0}
+/// A bool switch that must be `v`.
 #define SW_B(k, v) {"nemotron_enc." k, K_BOOL, 0, false, v, NULL, 0}
+/// A string switch that must be `v`.
 #define SW_S(k, v) {"nemotron_enc." k, K_STR, 0, false, false, v, 0}
+/// An integer switch that must equal `v`.
 #define SW_U(k, v) {"nemotron_enc." k, K_U32_EQ, 0, false, false, NULL, v}
+/// A float switch that must equal `v`.
 #define SW_F(k, v) {"nemotron_enc." k, K_F32_EQ, 0, false, false, NULL, v}
+/// A key (or, ending in '.', a prefix) named as meaningless to the forward, for the reason `why`.
 #define IGN(k, why) {"nemotron_enc." k, K_IGNORED, 0, false, false, why, 0}
+/// The ONE list of keys the family understands; the reader, the profile pins and the unknown-key check walk it.
 const ne_key k_keys[] = {
     /* geometry, pinned */
     PIN("hidden_size", n_embd),
@@ -117,12 +131,21 @@ const ne_key k_keys[] = {
 #undef SW_F
 #undef IGN
 
+/** The container's metadata entry named `key` (linear scan).
+ *  @param m    the container
+ *  @param key  the full key name
+ *  @return the entry, or NULL when absent */
 const pulsar_kv *ne_kv(const pulsar_model *m, const char *key) {
     for (uint64_t i = 0; i < m->n_kv; i++)
         if (pulsar_streq(m->kv[i].key, key)) return &m->kv[i];
     return NULL;
 }
 
+/** Say one config refusal and count it (pulsar_load_refuse).
+ *  @param fmt   a printf format taking two strings: `key`, then `more`
+ *  @param key   the key refused
+ *  @param more  the detail appended to the message
+ *  @return always false */
 bool refuse(const char *fmt, const char *key, const char *more = "") {
     fprintf(stderr, "pulsar: " NE);
     fprintf(stderr, fmt, key, more);
@@ -131,9 +154,14 @@ bool refuse(const char *fmt, const char *key, const char *more = "") {
     return false;
 }
 
+/** @param key  a table key (non-empty)
+ *  @return true when it ends in '.': a prefix entry naming every key under it */
 bool is_prefix(const char *key) { return key[strlen(key) - 1] == '.'; }
 
 /* the key is the table entry's (a prefix entry: the key lies under it) */
+/** @param k  a container key
+ *  @param d  a table entry
+ *  @return true when k is d's key, or lies strictly under d's prefix */
 bool matches(pulsar_str k, const ne_key &d) {
     if (!is_prefix(d.key)) return pulsar_streq(k, d.key);
     const size_t n = strlen(d.key);
@@ -141,6 +169,9 @@ bool matches(pulsar_str k, const ne_key &d) {
 }
 
 /* the builder's facts: the encoder's kind, its pooling and its normalisation (which must be the kind's), no tower */
+/** @param m  the container
+ *  @param s  receives the kind
+ *  @return true = read and consistent; false = refused (said and counted) */
 bool read_facts(const pulsar_model *m, pulsar_nemotron_enc_shape *s) {
     bool ok = true;
     pulsar_str kind = {NULL, 0}, pool = {NULL, 0};
@@ -164,6 +195,9 @@ bool read_facts(const pulsar_model *m, pulsar_nemotron_enc_shape *s) {
 
 }  // namespace
 
+/** @param m  the container
+ *  @param s  receives the shape (the profile's values first, every read field overwritten)
+ *  @return true = read and checked; false = at least one refusal (each said and counted) */
 bool pulsar_nemotron_enc_read_shape(const pulsar_model *m, pulsar_nemotron_enc_shape *s) {
     *s = PULSAR_NEMOTRON_ENC_SHAPE_8B;   /* the name and the profile's values; every read field is overwritten */
     bool ok = read_facts(m, s);
@@ -255,6 +289,8 @@ bool pulsar_nemotron_enc_read_shape(const pulsar_model *m, pulsar_nemotron_enc_s
     return ok;
 }
 
+/** @param s     the checked shape
+ *  @param plan  receives n_layer layer descriptions */
 void pulsar_nemotron_enc_plan(const pulsar_nemotron_enc_shape *s, pulsar_layer_plan *plan) {
     memset(plan, 0, sizeof(*plan));
     plan->n_layer = s->n_layer;

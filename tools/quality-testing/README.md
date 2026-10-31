@@ -1,7 +1,8 @@
 # Official-Continuation Quality Testing
 
-This directory contains the 100 prompts and scripts used to compare local pulsar checkpoints
-variants against official DeepSeek V4 continuations.
+This directory contains the 100 prompts and scripts used to compare local
+DeepSeek V4 checkpoint variants (pulsar containers) against official DeepSeek V4
+API continuations.
 
 The metric is target-token negative log likelihood: collect a deterministic
 official continuation, then ask each local checkpoint how much probability it assigns
@@ -48,25 +49,27 @@ tracked because they are derived from an external API.
 make -C tools/quality-testing
 ```
 
-The scorer links against the DS4 runtime and uses the CUDA backend.
+The scorer links against the engine's objects (its Makefile builds
+`pulsar-bench` at the repo root first, which compiles them) and runs on CUDA.
+`CUDA_ARCH=...` passes an explicit `-arch`.
 
 ## 3. Score checkpoint variants
 
 ```sh
 tools/quality-testing/score_official \
-  /srv/models/OLD-checkpoint \
+  /path/to/OLD-container \
   tools/quality-testing/data/flash/manifest.tsv \
   /tmp/old.tsv \
   4096
 
 tools/quality-testing/score_official \
-  /srv/models/NEW-checkpoint \
+  /path/to/NEW-container \
   tools/quality-testing/data/flash/manifest.tsv \
   /tmp/new.tsv \
   4096
 ```
 
-Use `data/pro/manifest.tsv` for PRO checkpoints.  The scorer and comparator do not
+The last argument is the context size (default 4096).  Use `data/pro/manifest.tsv` for PRO checkpoints.  The scorer and comparator do not
 care which model produced the manifest; the manifest path selects the
 continuation set.
 

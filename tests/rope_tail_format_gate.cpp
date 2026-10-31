@@ -13,7 +13,9 @@
  *     contract: operands widen to f32, one f32 rotation core, only the store narrows) -- within half a unit in the
  *     last place of the format, every element;
  *   - the nope dims [0, head_dim - n_rot) are untouched, bit for bit, in every format;
- *   - a two-byte buffer whose format is not f16 or bf16 (PULSAR_ELT_BYTES) is refused, not guessed at.
+ *   - a two-byte buffer whose format is not f16 or bf16 (PULSAR_ELT_BYTES) is refused, not guessed at;
+ *   - (L335) the per-head rms norm + rope tail runs an f32 and an f16 buffer and refuses bf16 and BYTES -- it used to
+ *     pick f16 from the width alone.
  * Inputs are k * 2^-6 for |k| <= 127, exactly representable in f32, f16 and bf16, so all three runs start from the
  * same values.
  *
@@ -129,6 +131,27 @@ int main(void) {
             if (refused) printf("refusal: a 2-byte buffer of format BYTES is refused\n");
             pulsar_gpu_tensor_free(tx);
         }
+    }
+
+    /* L335: the per-head rms norm + rope tail picks its arm by the declared format too (it keyed on esz == 2 and
+     * would have read a bf16 Q as half): f32 and f16 run, bf16 and BYTES (two bytes each) refuse */
+    {
+        pulsar_gpu_tensor *t[4] = {
+            pulsar_gpu_tensor_alloc_elt(n, 4u, PULSAR_ELT_F32), pulsar_gpu_tensor_alloc_elt(n, 2u, PULSAR_ELT_F16),
+            pulsar_gpu_tensor_alloc_elt(n, 2u, PULSAR_ELT_BF16), pulsar_gpu_tensor_alloc_elt(n, 2u, PULSAR_ELT_BYTES)};
+        static const char *const nm[4] = {"f32", "f16", "bf16", "bytes"};
+        CHECK(t[0] && t[1] && t[2] && t[3], "alloc head-norm operands");
+        const std::vector<uint8_t> zero(n * sizeof(float), 0u);
+        for (int k = 0; k < 4 && t[0] && t[1] && t[2] && t[3]; k++) {
+            CHECK(pulsar_gpu_tensor_write(t[k], 0, zero.data(), n * (k ? 2u : 4u)), "zero %s", nm[k]);
+            const bool ran = pulsar_gpu_head_rms_norm_rope_tail_tensor(t[k], N_TOK, N_HEAD, HEAD_DIM, N_ROT, 0u, 0u,
+                                                                       false, 10000.0f, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f,
+                                                                       1e-6f, NULL) != 0;
+            CHECK(ran == (k < 2), "head rms norm + rope tail on a %s buffer %s", nm[k], ran ? "ran" : "refused");
+        }
+        pulsar_gpu_synchronize();
+        printf("refusal: head rms norm + rope tail runs f32 / f16 and refuses bf16 / bytes\n");
+        for (pulsar_gpu_tensor *k : t) pulsar_gpu_tensor_free(k);
     }
 
     printf("ROPE TAIL FORMAT GATE: %s\n", g_fail ? "FAIL" : "PASS");

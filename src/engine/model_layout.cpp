@@ -1,3 +1,5 @@
+/** @file model_layout.cpp
+ *  @brief Model-layout queries: per-layer attention compression ratios and routed expert counts. */
 #include "pulsar_engine_internal.h"
 
 /* Model-layout queries: per-layer attention compression ratios and routed
@@ -11,6 +13,7 @@ bool pulsar_backend_uses_graph(pulsar_backend backend) {
 
 /* The CSA2 attention layout table.  pulsar_attn_layout_install is its only
  * writer; the two accessors below are its only readers. */
+/// The per-block CSA2 attention layout, written once at load by pulsar_attn_layout_install.
 static pulsar_layer_attn g_pulsar_attn_layout[PULSAR_MAX_LAYER];
 
 
@@ -26,8 +29,11 @@ static pulsar_layer_attn g_pulsar_attn_layout[PULSAR_MAX_LAYER];
  * The full profile is kept so the layout can refuse a block whose source-model
  * cache was dropped, instead of silently re-binding it to an earlier one.  No
  * map -> the identity, and nothing below changes for a served artifact. */
+/// Block il's source-profile layer (valid while g_layer_subset).
 static uint32_t g_layer_source[PULSAR_MAX_LAYER];
+/// The artifact is a layer-subset fixture (g_layer_source maps its blocks); false = the identity.
 static bool g_layer_subset = false;
+/// The full source profile a subset fixture was cut from.
 static pulsar_shape g_source_profile;
 
 
@@ -46,6 +52,10 @@ bool pulsar_layer_subset(void) {
 
 
 /* The block a source layer is in, or PULSAR_NO_LAYER when the fixture drops it. */
+/// @param src a source layer
+/// @param map [n] block -> source layer
+/// @param n blocks
+/// @return the block holding src, or PULSAR_NO_LAYER
 static uint32_t block_of_source(uint32_t src, const uint32_t *map, uint32_t n) {
     for (uint32_t i = 0; i < n; i++)
         if (map[i] == src) return i;
@@ -149,6 +159,8 @@ bool pulsar_engine::is_pruned() const {
  * pulsar_attn_layout_install).  Nothing in the per-layer hot path may branch on
  * the variant -- downstream reads the derived layout table instead.
  * plans/96-SPIKE0-results.md S2. */
+/// @param block an artifact block (asked of its source layer)
+/// @return the expected ratio (0 = window-only); dies on an unknown variant
 static uint32_t expected_layer_compress_ratio(uint32_t block) {
     const uint32_t il = pulsar_layer_source(block);   /* the profile speaks of source layers */
     if (il < 2) return 0;   /* both profiles: the first two layers are window-only */
@@ -173,6 +185,12 @@ static uint32_t expected_layer_compress_ratio(uint32_t block) {
 
 /* The profile's expectation of one source set: the artifact must name exactly
  * these layers, in this order. */
+/// Exit(1), said, unless got equals want and is ascending inside the backbone.
+/// @param what the set's name, for the line
+/// @param got [n_got] the artifact's layers
+/// @param n_got their count
+/// @param want [n_want] the profile's layers
+/// @param n_want their count
 static void expect_source_set(const char *what,
                               const uint32_t *got, uint32_t n_got,
                               const uint32_t *want, uint32_t n_want) {
@@ -200,6 +218,10 @@ static void expect_source_set(const char *what,
 
 /* The most recent source at or below `il`, or PULSAR_NO_LAYER.  This is the
  * reference's rule: a layer reads whatever the last source published. */
+/// @param il a layer
+/// @param sources [n] ascending source layers
+/// @param n their count
+/// @return the last source <= il, or PULSAR_NO_LAYER
 static uint32_t latest_source(uint32_t il, const uint32_t *sources, uint32_t n) {
     uint32_t s = PULSAR_NO_LAYER;
     for (uint32_t i = 0; i < n && sources[i] <= il; i++) s = sources[i];

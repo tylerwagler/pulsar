@@ -7,7 +7,7 @@
  * packer were.
  *
  * This file is a CPU transcription of the SHIPPED reference
- * (/mnt/models/dsv4-flash-0731/inference/model.py, class Compressor) and is
+ * (/path/to/models/dsv4-flash-0731/inference/model.py, class Compressor) and is
  * graded against vectors from gate-baseline/l218-v41/compressor_ref.py.  It is
  * deliberately a transcription rather than a shared fixture: when the device
  * gate lands it must compare the KERNEL against this, and an oracle that shares

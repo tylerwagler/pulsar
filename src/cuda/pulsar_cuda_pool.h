@@ -1,3 +1,5 @@
+/** @file
+ *  Pooling over a sequence's rows contract (the encoders' mean pool). */
 /* Pooling over a sequence's rows (L321: the Nemotron-3.5 encoders' mean pool) -- family-neutral, over bf16 rows.
  *
  * An encoder's output is one vector per input: the mean of its last hidden rows.  The sum is f32 and runs in ROW
@@ -15,6 +17,7 @@
 #ifdef __CUDACC__
 #include <cuda_runtime.h>
 #else
+/// The CUDA runtime's stream handle, declared for CUDA-free includers (same definition as cuda_runtime.h's).
 typedef struct CUstream_st *cudaStream_t;
 #endif
 
@@ -27,6 +30,12 @@ extern "C" {
 
 /** out = the f32 mean of n_rows bf16 rows of `width` (x + t * ld_x), out f32 [width].
  *  @return 0, -1 refused (named on stderr, nothing launched), -3 launch failure. */
+/// @param x      device bf16 rows, 16-byte aligned
+/// @param ld_x   row pitch in elements (a multiple of 8, >= width)
+/// @param n_rows rows to pool (> 0)
+/// @param width  columns (a multiple of 8)
+/// @param out    device f32 [width], 16-byte aligned
+/// @param stream stream to launch on
 int pulsar_rows_mean_f32_launch(const uint16_t *x, uint64_t ld_x, uint32_t n_rows, uint32_t width, float *out,
                                 cudaStream_t stream);
 

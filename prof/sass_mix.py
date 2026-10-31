@@ -1,5 +1,7 @@
 import re, sys, collections
-txt = open('/home/tyler/Projects/AI/temp/wtprof_moe_sass.txt').read()
+if len(sys.argv) != 3:
+    sys.exit('usage: sass_mix.py SASS_DUMP.txt FUNCTION_SUBSTRING (the dump: cuobjdump -sass of the MoE TU)')
+txt = open(sys.argv[1]).read()
 funcs = re.split(r'\n\s*Function : ', txt)
 def classify(op):
     b = op.split('.')[0]
@@ -18,7 +20,7 @@ def classify(op):
     if b in ('BRA','BSSY','BSYNC','EXIT','BAR','NOP','WARPSYNC','CALL','RET','JMP'): return 'ctrl'
     if b in ('MOV','SEL','SHFL','PRMT','R2P','P2R','CS2R','S2R','R2UR','UMOV','ULDC','MOV32I'): return 'mov/misc'
     return 'other'
-want = sys.argv[1]
+want = sys.argv[2]
 for f in funcs:
     name = f.split('\n')[0].strip()
     if want not in name: continue

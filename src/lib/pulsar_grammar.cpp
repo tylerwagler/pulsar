@@ -1,3 +1,5 @@
+/** @file
+ *  The exception boundary between pulsar and the vendored xgrammar core (built with -fexceptions). */
 /* L303: the exception boundary between pulsar and the vendored xgrammar core (pulsar_grammar.h says why it exists
  * and what crosses it).  Built with -fexceptions; every entry catches everything. */
 #include "pulsar_grammar.h"
@@ -18,24 +20,40 @@
 #include <vector>
 
 /* Workers alive (on time or late): the PULSAR_GRAMMAR_COMPILES_MAX cap. */
+/// Compile workers alive, on time or late; capped at PULSAR_GRAMMAR_COMPILES_MAX.
 static std::atomic<int> g_compiles{0};
 
+/** Opaque compiler handle: one xgrammar compiler over one model vocabulary. */
 struct pulsar_grammar_compiler {
+    /// The xgrammar compiler; shared so a late compile worker keeps it alive past destroy
     std::shared_ptr<xgrammar::GrammarCompiler> xc;
+    /// Vocabulary size the compiler was built for (token ids 0..n_vocab-1)
     int n_vocab = 0;
+    /// Per token id: true for the stop tokens given at creation
     std::vector<bool> stop;
 };
 
+/** Opaque compiled grammar, ready to build matchers from. */
 struct pulsar_grammar {
+    /// The xgrammar compiled form
     xgrammar::CompiledGrammar cg;
 };
 
+/** Opaque per-request matcher state over a compiled grammar. */
 struct pulsar_grammar_matcher {
+    /// The xgrammar matcher (accepted-token state)
     xgrammar::GrammarMatcher m;
+    /// Vocabulary size of the grammar's tokenizer info; sizes the token bitmask
     int n_vocab;
+    /// Terminate as soon as the grammar is complete (see pulsar_grammar_matcher_new)
     bool end_at_complete;
 };
 
+/** Write `what` and the exception's message, trimmed of xgrammar's log prefix, as one line into err.
+ *  @param err    the caller's error buffer, or NULL (nothing written)
+ *  @param errlen size of `err`
+ *  @param what   the operation that failed
+ *  @param e      the caught exception, or NULL for a non-std one */
 static void say(char *err, size_t errlen, const char *what, const std::exception *e) {
     if (!err || !errlen) return;
     if (!e) {
@@ -53,6 +71,9 @@ static void say(char *err, size_t errlen, const char *what, const std::exception
         if (*p == '\n') *p = ' ';
 }
 
+/** The catch clauses every entry ends its try block with: any exception becomes `say` + `return fail`.
+ *  @param what the operation, for the message
+ *  @param fail the entry's failure return value */
 #define GRAMMAR_TRY(what, fail)                                                                                        \
     catch (const std::exception &e) {                                                                                  \
         say(err, errlen, what, &e);                                                                                    \
@@ -93,11 +114,17 @@ bool pulsar_grammar_compiler_is_stop(const pulsar_grammar_compiler *c, int t) {
 
 namespace {
 /* One compile, shared by the waiting request and the worker (which may outlive the wait). */
+/** Shared state of one detached grammar compile; held by shared_ptr in both the request and the worker thread. */
 struct compile_job {
+    /// Guards done / out / err
     std::mutex mu;
+    /// Signalled by the worker when done
     std::condition_variable cv;
+    /// Worker finished (success or failure)
     bool done = false;
+    /// The compiled grammar on success
     std::optional<xgrammar::CompiledGrammar> out;
+    /// Failure message when `out` is empty
     std::string err;
 };
 }  // namespace

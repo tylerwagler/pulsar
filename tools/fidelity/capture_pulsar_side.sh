@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Plan 90 A1/A3 — pulsar-side teacher-forced capture (the BASELINE row).
 #
-# RUN THIS ON SPARKY, IN A MAINTENANCE WINDOW. The CLI loads the model itself,
+# RUN THIS ON THE GB10 THAT SERVES, IN A MAINTENANCE WINDOW. The CLI loads the model itself,
 # so pulsar-server must be stopped first ([[ds4-model-load-discipline]]):
 # a second 87G load alongside a live server is how the Xid 31 incident happened.
 #
@@ -10,11 +10,15 @@
 # do not tune anything for it.
 #
 # Usage:
-#   capture_pulsar_side.sh MODEL.gguf [SUITE_DIR] [OUT_DIR]
+#   capture_pulsar_side.sh MODEL_DIR SUITE_DIR [OUT_DIR]
+#
+# MODEL_DIR is the served container (a shard directory or one file), SUITE_DIR the
+# fidelity suite (its *.txt documents and the reference's ref-* directory).  Neither
+# has a default: both live on the operator's model store.
 set -euo pipefail
 
-MODEL="${1:?usage: capture_pulsar_side.sh MODEL.gguf [SUITE_DIR] [OUT_DIR]}"
-SUITE="${2:-/mnt/pve1-models/fidelity/suite-v1}"
+MODEL="${1:?usage: capture_pulsar_side.sh MODEL_DIR SUITE_DIR [OUT_DIR]}"
+SUITE="${2:?usage: capture_pulsar_side.sh MODEL_DIR SUITE_DIR [OUT_DIR]}"
 OUT="${3:-$HOME/fidelity-caps/pulsar-$(git rev-parse --short HEAD 2>/dev/null || echo unknown)}"
 STRIDE="${KL_STRIDE:-4}"
 TOPK="${KL_TOPK:-20}"          # match the reference's cap; higher is wasted
@@ -24,8 +28,8 @@ BIN="${PULSAR_BIN:-./pulsar}"
 TOOLS="$(cd "$(dirname "$0")" && pwd)"
 
 echo "== preflight"
-[ -x "$BIN" ] || { echo "no pulsar CLI at $BIN (build with 'make cuda-spark', NOT plain make)"; exit 1; }
-[ -f "$MODEL" ] || { echo "no model at $MODEL"; exit 1; }
+[ -x "$BIN" ] || { echo "no pulsar CLI at $BIN (build it with 'make pulsar CUDA_ARCH=sm_120f'; 'make cuda-spark' builds only pulsar-server)"; exit 1; }
+[ -e "$MODEL" ] || { echo "no model at $MODEL"; exit 1; }
 [ -d "$SUITE" ] || { echo "no suite at $SUITE"; exit 1; }
 
 if pgrep -x pulsar-server >/dev/null 2>&1; then
@@ -64,9 +68,9 @@ for f in "$SUITE"/*.txt; do
 done
 
 echo
-echo "== done. Build the A3 table against the work-rig reference:"
+echo "== done. Build the A3 table against the reference rig's capture:"
 echo "   python3 $TOOLS/fidelity_compare.py --dir \\"
-echo "       /mnt/pve1-models/fidelity/suite-v1/ref-DeepSeek-V4-Flash-0731 \\"
+echo "       $SUITE/ref-DeepSeek-V4-Flash-0731 \\"
 echo "       $OUT/jsonl"
 echo
 echo "   The 'all' row median/p95 IS the standing divergence budget (plan 90 A2)."

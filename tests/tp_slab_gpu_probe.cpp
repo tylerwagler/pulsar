@@ -1,6 +1,6 @@
 /*
  * TP GPU-slab gate probe (branch tensor_parallel, bring-up step 4 in
- * docs/tensor-parallel-bringup.md).  nvcc-built so it can be run on the pair;
+ * docs/history/tensor-parallel-bringup.md).  nvcc-built so it can be run on the pair;
  * on a GPU-less box it fails LOUDLY at cudaMallocManaged (that is the point —
  * this binary exists to be copied to the DSV4-Flash pair and run there).
  *

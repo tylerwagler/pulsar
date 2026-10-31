@@ -8,7 +8,7 @@
 #
 # Both dirs at the same paths on both nodes, each built (pulsar-server + tests/qwen_generate + tests/tp_plan_test).
 # Reference: eee6d95f (the last commit before P4b).  Without one the A/B legs are skipped and the rest still grades.
-# Run on the HEAD (ca1070wk30008) as the serving user; takes ~45 min with a reference (six model loads), ~25 without.
+# Run on the HEAD (rank 0; WORKER and PEERS name the pair, tools/tp2/lib.sh) as the serving user; takes ~45 min with a reference (six model loads), ~25 without.
 # See tools/tp2-l272/README.md.  The pair plumbing is tools/tp2/lib.sh.
 set -u
 D=${1:?usage: run.sh <new build dir> [<reference build dir>]}

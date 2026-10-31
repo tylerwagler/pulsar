@@ -1,3 +1,5 @@
+/** @file weight_format.cpp
+ *  @brief L272 P4: the weight-format registry, the core's and not a family's. */
 /* weight_format.cpp -- L272 P4: the weight formats are the core's, not a family's.
  *
  * Tyler: "the quantization type should not be tied to the family. It's very possible that I'll want to run a
@@ -23,6 +25,9 @@
 
 #include <string>
 
+/// @param type a tensor type
+/// @param arm an EXL3 arm (EXL3_ARM_*)
+/// @return true when type is EXL3 and the arm has a kernel at its rate
 static bool exl3_arm(uint32_t type, int arm) {
     const int k2 = exl3_type_k2(type);
     return k2 != 0 && exl3_arm_has_rate(arm, k2);
@@ -71,8 +76,10 @@ bool pulsar_format_serves(uint32_t type, pulsar_weight_role role, pulsar_act_for
     return false;
 }
 
+/// Each pulsar_weight_role in words, for refusal lines (indexed by the role).
 static const char *const k_role_name[] = {"a dense linear", "a routed expert's gate / up", "a routed expert's down",
                                           "a fused routed gate_up", "a shared expert"};
+/// Each pulsar_act_format in words, for refusal lines (indexed by the format).
 static const char *const k_act_name[] = {"the MX slot's bf16 plane", "raw bf16 rows", "the MX slot's E4M3",
                                          "raw f16 rows"};
 

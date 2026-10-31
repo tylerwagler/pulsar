@@ -1,3 +1,5 @@
+/** @file gpu_graph_alloc.cpp
+ *  @brief DeepSeek graph allocation helpers: raw-ring spans per batch and env flags. */
 #include "pulsar_engine_internal.h"
 
 
@@ -8,6 +10,11 @@
 
 
 
+/// The raw-window rows a batch attends: its own plus the sliding window, capped by the positions so far and raw_cap.
+/// @param g the graph
+/// @param pos0 the batch's first position
+/// @param n_tokens rows
+/// @return rows (0 with no raw ring or no rows)
 uint32_t gpu_graph_raw_span_for_batch(
         const pulsar_gpu_graph *g,
         uint32_t               pos0,
@@ -28,6 +35,10 @@ uint32_t gpu_graph_raw_span_for_batch(
 
 
 
+/// @param g the graph
+/// @param last_pos the span's last position
+/// @param n_raw its raw rows
+/// @return the ring row of the span's first raw position
 uint32_t gpu_graph_raw_start_for_span(
         const pulsar_gpu_graph *g,
         uint32_t               last_pos,
@@ -52,6 +63,10 @@ uint32_t gpu_graph_raw_start_for_span(
  * header said otherwise until L106 K4.)
  */
 
+/// An environment flag, read once into *cache: set, non-empty and not "0".
+/// @param name the variable
+/// @param cache the caller's cache (-1 = unread)
+/// @return the flag
 bool gpu_graph_env_flag(const char *name, int *cache) {
     if (*cache == -1) {
         const char *env = getenv(name);

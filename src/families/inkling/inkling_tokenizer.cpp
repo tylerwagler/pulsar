@@ -12,6 +12,8 @@
  * renderer's turn piece, the close its <|content_model_end_sampling|> -- so head + turns + sampled turns is the
  * conversation's full render (inkling-chat-gate S1 grades the pieces).  The server renders with the same library
  * behind its family table (src/server/family_inkling.cpp). */
+/** @file inkling_tokenizer.cpp
+ *  @brief Inkling's tokenizer table and chat front: the shared BPE engine (tiktoken o200k) and F5's renderer. */
 #include "inkling.h"
 #include "lib/bpe_tokenizer.h"
 #include "lib/inkling_chat.h"
@@ -24,10 +26,18 @@
 
 namespace {
 
+/// The architecture name refusals are prefixed with.
 const char *const ARCH = PULSAR_INKLING_ARCH;
 
+/** The loaded tokenizer of an Inkling engine (no family check: only this table's hooks call it).
+ *  @param e  an engine this family loaded
+ *  @return the BPE tokenizer pulsar_inkling_load_tokenizer built */
 bpe_tokenizer *TOK(const pulsar_engine *e) { return ((const pulsar_inkling_model *)e->family_state)->tok; }
 
+/** Read a whole file.
+ *  @param path  the file
+ *  @param out   receives its bytes (cleared first)
+ *  @return false when the file cannot be opened or a read fails */
 bool read_text(const std::string &path, std::string *out) {
     FILE *f = fopen(path.c_str(), "rb");
     if (!f) return false;
@@ -43,6 +53,12 @@ bool read_text(const std::string &path, std::string *out) {
 /* `spans` are the client-data ranges where no added token may match.  The entries have no error return; an encode
  * refusal (text that is not UTF-8, or spans out of order -- a renderer defect) is said by name and yields no tokens,
  * never a different tokenization. */
+/** @param e        the engine
+ *  @param text     the UTF-8 text (NULL = empty)
+ *  @param len      text's length in bytes
+ *  @param spans    the client-data byte ranges, ascending (NULL with n_spans 0 = none)
+ *  @param n_spans  the number of spans
+ *  @param out      the ids are appended here */
 void encode_into(const pulsar_engine *e, const char *text, size_t len, const pulsar_text_span *spans, uint32_t n_spans,
                  pulsar_tokens *out) {
     std::vector<int> ids;
@@ -55,11 +71,21 @@ void encode_into(const pulsar_engine *e, const char *text, size_t len, const pul
 }
 
 /* raw text: all of it is client data, so no added token matches */
+/** pulsar_family_tokenizer::encode_text.
+ *  @param e     the engine
+ *  @param text  NUL-terminated UTF-8 (NULL = empty)
+ *  @param out   the ids are appended here */
 void encode_text(pulsar_engine *e, const char *text, pulsar_tokens *out) {
     const pulsar_text_span all = {0u, (uint32_t)(text ? strlen(text) : 0)};
     encode_into(e, text, all.hi, all.hi ? &all : NULL, all.hi ? 1u : 0u, out);
 }
 
+/** pulsar_family_tokenizer::encode_rendered: added tokens match outside `spans`.
+ *  @param e        the engine
+ *  @param text     the rendered chat, NUL-terminated (NULL = empty)
+ *  @param spans    the client-data byte ranges
+ *  @param n_spans  the number of spans
+ *  @param out      the ids are appended here */
 void encode_rendered(pulsar_engine *e, const char *text, const pulsar_text_span *spans, uint32_t n_spans,
                      pulsar_tokens *out) {
     encode_into(e, text, text ? strlen(text) : 0, spans, n_spans, out);
@@ -69,11 +95,18 @@ void encode_rendered(pulsar_engine *e, const char *text, const pulsar_text_span 
  * spans.  The entries have no error return, so a refusal (a think mode the template has no level for, a role it
  * cannot place) ends the process by name. */
 
+/** End the process for a chat-front refusal (the entries have no error return).
+ *  @param op   the public entry that refused
+ *  @param err  the renderer's or the think-mode check's reason */
 [[noreturn]] void chat_refuse(const char *op, const char *err) {
     fprintf(stderr, "pulsar: %s: %s: %s -- exiting\n", ARCH, op, err);
     exit(1);
 }
 
+/** Tokenize one rendered piece with its client spans and append it.
+ *  @param e       the engine
+ *  @param r       the renderer's text and spans
+ *  @param tokens  the ids are appended here */
 void chat_append(const pulsar_engine *e, const inkling_render_out &r, pulsar_tokens *tokens) {
     encode_into(e, r.text.data(), r.text.size(), r.spans.data(), (uint32_t)r.spans.size(), tokens);
 }
@@ -81,6 +114,12 @@ void chat_append(const pulsar_engine *e, const inkling_render_out &r, pulsar_tok
 /* The head: the system message (the trusted text -- another family's tool prompt, text here -- then the client's
  * system text) and the effort line, which the full render writes after the leading system messages: the template's
  * default effort with thinking on, 0 with it off (the renderer's own effort authority, inkling_chat.h). */
+/** pulsar_family_tokenizer::chat_open.
+ *  @param e           the engine
+ *  @param tokens      the head's ids are appended here
+ *  @param trusted     the trusted system prefix (NULL = none)
+ *  @param system      the client's system text (NULL = none)
+ *  @param think_mode  picks the effort line (the default effort, or none); an unsupported mode ends the process */
 void chat_open(pulsar_engine *e, pulsar_tokens *tokens, const char *trusted, const char *system,
                pulsar_think_mode think_mode) {
     char err[256];
@@ -101,6 +140,13 @@ void chat_open(pulsar_engine *e, pulsar_tokens *tokens, const char *trusted, con
 
 /* One turn: the messages as the full render writes them after the head (a system note is a system block, as the
  * template places one anywhere), then the generation prompt.  A tool result has no call to name it here. */
+/** pulsar_family_tokenizer::chat_turn.
+ *  @param e                  the engine
+ *  @param tokens             the turn's ids are appended here
+ *  @param msgs               the turn's messages (a NULL role reads as "user")
+ *  @param n                  the number of messages
+ *  @param generation_prompt  append the assistant's opening after the messages
+ *  @param think_mode         checked against the engine (an unsupported mode ends the process) */
 void chat_turn(pulsar_engine *e, pulsar_tokens *tokens, const pulsar_chat_message *msgs, int n, bool generation_prompt,
                pulsar_think_mode think_mode) {
     char err[256];
@@ -119,6 +165,9 @@ void chat_turn(pulsar_engine *e, pulsar_tokens *tokens, const pulsar_chat_messag
 }
 
 /* the sampled turn's close: its stop token, <|content_model_end_sampling|> (the renderer's close_turn piece) */
+/** pulsar_family_tokenizer::chat_end_assistant.
+ *  @param e       the engine
+ *  @param tokens  the close's ids are appended here */
 void chat_end_assistant(pulsar_engine *e, pulsar_tokens *tokens) {
     inkling_render_out r;
     char err[256];
@@ -127,13 +176,25 @@ void chat_end_assistant(pulsar_engine *e, pulsar_tokens *tokens) {
     chat_append(e, r, tokens);
 }
 
+/** pulsar_family_tokenizer::is_stop.
+ *  @param e      the engine
+ *  @param token  a token id
+ *  @return true when it is one of the tokenizer's stop ids */
 bool is_stop(pulsar_engine *e, int token) {
     for (int id : bpe_tokenizer_stop_ids(TOK(e))) if (id == token) return true;
     return false;
 }
 /* config.json's eos_token_id (Inkling-Small: <|content_model_end_sampling|>, the end of a sampled turn) */
+/** pulsar_family_tokenizer::eos (load checked it equals the shape's eos_id).
+ *  @param e  the engine
+ *  @return the tokenizer's first stop id */
 int eos(pulsar_engine *e) { return bpe_tokenizer_stop_ids(TOK(e)).front(); }
 
+/** pulsar_family_tokenizer::token_text.
+ *  @param e      the engine
+ *  @param token  a token id
+ *  @param len    receives the byte length (NULL = not wanted)
+ *  @return the token's bytes, malloc'd and NUL-terminated (the caller frees); empty outside the table */
 char *token_text(pulsar_engine *e, int token, size_t *len) {
     size_t n = 0;
     const char *b = bpe_tokenizer_token_bytes(TOK(e), token, &n);
@@ -146,11 +207,17 @@ char *token_text(pulsar_engine *e, int token, size_t *len) {
 }
 
 /* Inkling's turns have no think-close token: reasoning is a typed content block (F5's output grammar) */
+/** pulsar_family_tokenizer::think_close.
+ *  @return -1: no think-close token */
 int think_close(pulsar_engine *) { return -1; }
 
 /* The renderer opens every user block with <|message_user|> and every assistant block with <|message_model|>, one
  * added token each; the anchors' rules read the FIRST assistant marker and the LAST user one, which a multi-block
  * turn does not move. */
+/** pulsar_family_tokenizer::turn_markers.
+ *  @param e    the engine
+ *  @param out  receives one user and one assistant marker id
+ *  @return false when either added token is missing (said once per process) */
 bool turn_markers(pulsar_engine *e, pulsar_turn_markers *out) {
     const int user = bpe_tokenizer_added_id(TOK(e), "<|message_user|>");
     const int model = bpe_tokenizer_added_id(TOK(e), "<|message_model|>");
@@ -170,6 +237,10 @@ bool turn_markers(pulsar_engine *e, pulsar_turn_markers *out) {
     return true;
 }
 
+/** pulsar_family_tokenizer::dump (--dump-tokens).
+ *  @param e       the engine
+ *  @param fp      the stream written
+ *  @param tokens  the ids to print */
 void dump(pulsar_engine *e, FILE *fp, const pulsar_tokens *tokens) {
     fprintf(fp, "[");
     for (int i = 0; i < tokens->len; i++) fprintf(fp, "%s%d", i ? ", " : "", tokens->v[i]);
@@ -184,6 +255,9 @@ void dump(pulsar_engine *e, FILE *fp, const pulsar_tokens *tokens) {
     }
 }
 
+/** pulsar_family_tokenizer::n_tokens.
+ *  @param e  the engine
+ *  @return the ids in the tokenizer's table (at most n_vocab_real; the head is wider) */
 int n_tokens(pulsar_engine *e) { return bpe_tokenizer_n_tokens(TOK(e)); }
 
 }  // namespace
@@ -203,6 +277,11 @@ const pulsar_family_tokenizer PULSAR_INKLING_TOKENIZER = {
     /* .n_tokens                 = */ n_tokens,
 };
 
+/** Load the tokenizer from tokenizer.model, tokenizer_config.json and config.json beside the shards, and check its
+ *  first stop id is the shape's eos and its table fits the head's real rows.
+ *  @param w           the family state: its shape is read; tok is written
+ *  @param model_path  the container's directory, or a shard path inside it
+ *  @return true = loaded; false = refused (said) */
 bool pulsar_inkling_load_tokenizer(pulsar_inkling_model *w, const char *model_path) {
     std::string dir = model_path ? model_path : "";
     struct stat st;

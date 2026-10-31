@@ -1,7 +1,14 @@
+/** @file layers.cpp
+ *  @brief The prefill chunk cap for a prompt. */
 #include "pulsar_engine_internal.h"
 
 
 
+/// The prefill chunk for a prompt: the request's, else PULSAR_CUDA_PREFILL_CHUNK, else the default for a long
+/// prompt; never past the prompt.
+/// @param prompt_len the prompt, tokens
+/// @param requested_chunk the caller's chunk (0 = none)
+/// @return rows per chunk, 1 .. prompt_len (1 for an empty prompt)
 uint32_t pulsar_prefill_cap_for_prompt(int prompt_len,
                                            uint32_t requested_chunk) {
     if (prompt_len <= 0) return 1;

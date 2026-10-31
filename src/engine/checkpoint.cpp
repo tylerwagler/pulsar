@@ -1,3 +1,5 @@
+/** @file checkpoint.cpp
+ *  @brief L264 grid checkpoints, the model-neutral half (kv_state.h): per-bank slots, retention and validity. */
 /* L264 grid checkpoints, the model-neutral half (kv_state.h): per bank, a few slots each holding
  * "the state at grid point G" that the bank's append-only pools do not already hold -- what that
  * state IS, and how big, is the model's pulsar_kv_state_ops; here are only the slots, the
@@ -21,6 +23,8 @@
  * are never rewritten while the history reaches T, and a row T leaves open (a part-filled indexer block, the MTP
  * layer's lagging row) is written whole by the token that closes it, from the lanes the walk holds, before any step
  * reads it (qsa_block_keys_kernel). */
+/// @param st the store (bound to its ops)
+/// @return one record slab's bytes: the frontier walk at min_checkpoint, rounded up to 256
 static uint64_t ckpt_end_bytes(const pulsar_ckpt_store *st) {
     uint64_t front = 0;
     (void)st->ops->walk(st->state, -1, true, NULL, 0, st->ops->min_checkpoint(st->state), &front);
@@ -87,6 +91,10 @@ void pulsar_ckpt_release(pulsar_ckpt_store *st) {
  * neighbours, so they thin into a ladder reaching back into the history a client rewrites (L261:
  * tool results 12-20k tokens back).  DeepSeek's 16 keep 8 newest + G and thin 7; Qwen's 2 keep the
  * newest + G, i.e. the previous turn's prompt end survives the next one's. */
+/// @param st   the store
+/// @param bank the bank
+/// @param G    the grid point to capture, in tokens
+/// @return the slot index to write, < ops->ckpt_slots
 static uint32_t ckpt_pick_slot(const pulsar_ckpt_store *st, uint32_t bank, uint32_t G) {
     const uint32_t n = st->ops->ckpt_slots;
     const uint32_t *pos = st->pos[bank];
@@ -111,6 +119,11 @@ static uint32_t ckpt_pick_slot(const pulsar_ckpt_store *st, uint32_t bank, uint3
     return victim;
 }
 
+/** Can `bank`'s slab hold a checkpoint at G: an allocated bank, G on the resume grid and >= min_checkpoint?
+ *  @param st   the store
+ *  @param bank the bank
+ *  @param G    the grid point, in tokens
+ *  @return true when it can */
 static bool ckpt_grid_ok(const pulsar_ckpt_store *st, uint32_t bank, uint32_t G) {
     return bank < PULSAR_MSEQ_MAX && st->slab[bank] && G % st->ops->resume_grid == 0u &&
            G >= st->ops->min_checkpoint(st->state);
@@ -118,6 +131,10 @@ static bool ckpt_grid_ok(const pulsar_ckpt_store *st, uint32_t bank, uint32_t G)
 
 /* Capture the installed `bank`'s state at grid point G (pulsar_ckpt_landed's).  False (said) on a violated
  * precondition. */
+/// @param st   the store
+/// @param bank the installed bank
+/// @param G    the grid point, in tokens
+/// @return true when captured
 static bool ckpt_capture(pulsar_ckpt_store *st, uint32_t bank, uint32_t G) {
     if (!ckpt_grid_ok(st, bank, G)) {
         fprintf(stderr, "pulsar: grid checkpoint at %u on bank %u refused: not a grid point the slab can hold\n",
@@ -154,6 +171,9 @@ bool pulsar_ckpt_landed(pulsar_ckpt_store *st, uint32_t bank, uint32_t T) {
 }
 
 /* The bank's records above `tokens` go (the frontier rule), and with `tokens` 0 every one of the bank's. */
+/// @param st     the store
+/// @param bank   the bank
+/// @param tokens the history length kept, in tokens
 static void ckpt_records_drop_above(pulsar_ckpt_store *st, uint32_t bank, uint32_t tokens) {
     for (uint32_t i = 0; i < st->n_rec; i++)
         if (st->rec[i].T != 0u && st->rec[i].bank == bank && st->rec[i].T > tokens) st->rec[i].T = 0u;
@@ -178,6 +198,8 @@ bool pulsar_ckpt_restore(pulsar_ckpt_store *st, uint32_t bank, uint32_t G) {
 
 /* The record a capture writes (the bank's previous one of its kind already dropped): a free one, else the least
  * recently used. */
+/// @param st the store
+/// @return the record to overwrite (the store's); NULL only when the pool is empty (n_rec 0)
 static pulsar_ckpt_record *ckpt_record_pick(pulsar_ckpt_store *st) {
     pulsar_ckpt_record *lru = NULL;
     for (uint32_t i = 0; i < st->n_rec; i++) {
@@ -255,6 +277,10 @@ const pulsar_ckpt_record *pulsar_ckpt_record_of(const pulsar_ckpt_store *st, uin
 }
 
 /* Are the record's ids tokens[0, T)? */
+/// @param r      the record
+/// @param tokens the prompt's ids
+/// @param len    ids in `tokens`
+/// @return true when the record is live and its T ids are the prompt's first T
 static bool ckpt_record_matches(const pulsar_ckpt_record *r, const int *tokens, uint32_t len) {
     if (r->T == 0u || !tokens || len < r->T) return false;
     for (uint32_t i = 0; i < r->T; i++)
@@ -298,6 +324,7 @@ bool pulsar_ckpt_record_restore(pulsar_ckpt_store *st, uint32_t bank, const puls
 }
 
 /* L313: the most pools any bank has (bank_pools' out) */
+/** The most pools adopt() asks bank_pools for (twice PULSAR_KV_POOLS_MAX). */
 #define CKPT_ADOPT_POOLS (2u * PULSAR_KV_POOLS_MAX)
 
 bool pulsar_ckpt_adopt(pulsar_ckpt_store *st, uint32_t dst, uint32_t src, uint32_t T, const pulsar_ckpt_record *r) {

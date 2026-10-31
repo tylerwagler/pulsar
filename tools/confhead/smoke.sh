@@ -2,7 +2,7 @@
 # Sanity-belt smoke: serve MODEL at conf-sched TAU and run the short
 # tool-eval-bench scenario suite against it (15 scenarios, ~10 min).
 #
-# Usage: tools/confhead/smoke.sh <out_dir> <model.gguf> <tau> [port]
+# Usage: TEB=<tool-eval-bench binary> tools/confhead/smoke.sh <out_dir> <model> <tau> [port]
 set -u
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "$ROOT"
@@ -10,6 +10,7 @@ OUT="${1:?usage: smoke.sh <out_dir> <model> <tau> [port]}"
 MODEL="${2:?}"
 TAU="${3:?}"
 PORT="${4:-8077}"
+TEB="${TEB:?set TEB to the tool-eval-bench binary}"
 mkdir -p "$OUT"
 
 if pgrep -x pulsar-server >/dev/null; then
@@ -56,7 +57,7 @@ if [ "$ready" != 1 ]; then
 fi
 echo "ready after ${i}s"
 
-/home/tyler/.local/bin/tool-eval-bench --short \
+"$TEB" --short \
     --base-url "http://127.0.0.1:$PORT/v1" --model d > "$OUT/smoke.log" 2>&1
 RC=$?
 

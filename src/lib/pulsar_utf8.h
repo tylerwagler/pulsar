@@ -1,6 +1,9 @@
+/** @file
+ *  The one strict UTF-8 well-formedness rule (Unicode 15 Table 3-7) for the engine, CLI, eval TUI and agent. */
 #pragma once
 
 #include <stddef.h>
+#include <stdint.h>
 
 /* The ONE UTF-8 well-formedness rule for the engine, CLI, eval TUI and agent.
  *
@@ -20,6 +23,8 @@
 /** Bytes in the UTF-8 sequence that `lead` begins: 1 for ASCII, 2-4 for a
  * valid multibyte lead, 0 for a byte that cannot start a sequence (a
  * continuation byte, 0xC0, 0xC1 or 0xF5-0xFF). */
+/// @param lead the sequence's first byte
+/// @return the sequence length 1..4, or 0 when `lead` cannot start one
 static inline int utf8_seq_len(unsigned char lead) {
     if (lead < 0x80) return 1;
     if (lead >= 0xc2 && lead <= 0xdf) return 2;
@@ -33,6 +38,9 @@ static inline int utf8_seq_len(unsigned char lead) {
  * continuation byte outside 0x80-0xBF, or a Table 3-7 second-byte
  * violation).  A caller advancing through arbitrary bytes treats 0 as "this
  * one byte is its own unit". */
+/// @param p the bytes
+/// @param n their count
+/// @return the well-formed sequence's length 1..4, or 0
 static inline int utf8_seq_ok(const unsigned char *p, size_t n) {
     if (n == 0) return 0;
     const int len = utf8_seq_len(p[0]);
@@ -47,4 +55,19 @@ static inline int utf8_seq_ok(const unsigned char *p, size_t n) {
         if ((p[i] & 0xc0) != 0x80) return 0;
     }
     return len;
+}
+
+/** The codepoint of a UTF-8 sequence already validated as `n` bytes long (utf8_seq_ok's length): the ONE decoder
+ * of a checked sequence (the tokenizer, the chat renderers and the output-parser kit). */
+/// @param p the sequence's lead byte
+/// @param n its length in bytes (1..4)
+/// @return the codepoint
+static inline uint32_t utf8_cp_at(const unsigned char *p, int n) {
+    switch (n) {
+    case 1: return p[0];
+    case 2: return ((uint32_t)(p[0] & 0x1f) << 6) | (p[1] & 0x3f);
+    case 3: return ((uint32_t)(p[0] & 0x0f) << 12) | ((uint32_t)(p[1] & 0x3f) << 6) | (p[2] & 0x3f);
+    default: return ((uint32_t)(p[0] & 0x07) << 18) | ((uint32_t)(p[1] & 0x3f) << 12) |
+                    ((uint32_t)(p[2] & 0x3f) << 6) | (p[3] & 0x3f);
+    }
 }

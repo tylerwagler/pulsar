@@ -1,8 +1,11 @@
 # Directional Steering
 
-Directional steering is a runtime activation edit for DS4. A steering file is a
-flat `f32` matrix with one normalized 4096-wide direction per layer. During
-inference, pulsar can apply the edit after attention outputs, FFN outputs, or both:
+Directional steering is a runtime activation edit for the **DeepSeek V4**
+family only: every other family (Qwen, Nemotron, Inkling, the encoders) refuses
+a steering file at load.  A steering file is a flat `f32` matrix with one
+normalized `n_embd`-wide direction per layer (DeepSeek V4 Flash: 43 x 4096).
+During inference, pulsar can apply the edit after attention outputs, FFN
+outputs, or both:
 
 ```text
 y = y - scale * direction[layer] * dot(direction[layer], y)
@@ -14,16 +17,22 @@ With no steering file or zero scales, pulsar follows the normal inference path.
 ## Runtime Options
 
 ```text
---dir-steering-file FILE   load a 43 x 4096 f32 direction file
+--dir-steering-file FILE   load an n_layer x n_embd f32 direction file (Flash: 43 x 4096)
 --dir-steering-ffn F       apply steering after FFN outputs; default is 1 when a file is provided
 --dir-steering-attn F      apply steering after attention outputs; default is 0
 ```
+
+`pulsar` (the development CLI, `make pulsar`) and `pulsar-server` both take
+these flags.  A scale without a file refuses.
 
 The FFN output is usually the best first target because it is late enough in
 each layer to represent behavior, style, and topic signals. Attention steering
 is available for experiments, but it can be more fragile.
 
 ## Verbosity Example
+
+The tools assume DeepSeek V4 Flash's shape (`N_LAYER = 43`, `N_EMBD = 4096` in
+`tools/build_direction.py`) and render prompts in its chat format.
 
 The bundled example builds a style direction from 100 paired prompts. Each pair
 asks for the same information in two ways:
@@ -40,7 +49,7 @@ Build the vector:
 ```sh
 python3 dir-steering/tools/build_direction.py \
   --ds4 ./pulsar \
-  --model /srv/models/<checkpoint-dir> \
+  --model /path/to/<container-dir> \
   --good-file dir-steering/examples/succinct.txt \
   --bad-file dir-steering/examples/verbose.txt \
   --out dir-steering/out/verbosity.json \
@@ -58,7 +67,7 @@ dir-steering/out/verbosity.f32
 Try a terse run:
 
 ```sh
-./pulsar -m /srv/models/<checkpoint-dir> --nothink --temp 0 -n 160 \
+./pulsar -m /path/to/<container-dir> --nothink --temp 0 -n 160 \
   --dir-steering-file dir-steering/out/verbosity.f32 \
   --dir-steering-ffn -1 \
   -p "Explain why databases use indexes."
@@ -67,7 +76,7 @@ Try a terse run:
 Try a verbose run:
 
 ```sh
-./pulsar -m /srv/models/<checkpoint-dir> --nothink --temp 0 -n 220 \
+./pulsar -m /path/to/<container-dir> --nothink --temp 0 -n 220 \
   --dir-steering-file dir-steering/out/verbosity.f32 \
   --dir-steering-ffn 2 \
   -p "Explain why databases use indexes."
@@ -86,7 +95,7 @@ Use the sweep helper to test several strengths on a fixed prompt set:
 ```sh
 python3 dir-steering/tools/run_sweep.py \
   --ds4 ./pulsar \
-  --model /srv/models/<checkpoint-dir> \
+  --model /path/to/<container-dir> \
   --direction dir-steering/out/verbosity.f32 \
   --prompts dir-steering/examples/eval_prompts.txt \
   --scales "-1,-0.5,0,0.5,1,2" \
@@ -124,7 +133,9 @@ The extractor compares two prompt sets:
 - `good-file`: target prompts for the direction you want to represent.
 - `bad-file`: contrast prompts that should be separated from the target.
 
-It captures DS4 activations from the same local GPU graph used for inference,
+It captures activations from the same local GPU graph used for inference (the
+`PULSAR_CUDA_GRAPH_DUMP_*` dump hooks, one `-n 1` run of the `pulsar` CLI per
+prompt),
 averages target minus contrast, normalizes one vector per layer, and writes both
 metadata JSON and the runtime `.f32` file.
 

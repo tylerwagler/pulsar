@@ -2,7 +2,7 @@
  "schema": "pulsar.recipe.v1",
  "recipe": "nemotron_parse-f16",
  "model_type": "nemotron_parse",
- "about": "Nemotron-3.5 Parse for the Turing lane (L321): every Linear (the RADIO ViT, the neck's convolutions read as Linears, the decoder) and the tied embedding / head f16 from the F32 checkpoint (fp16 tensor cores; HF's own fp16 run matched fp32 on 27 of 30 pages, retriever/README.md); every norm, bias, class token and the position field f32 as stored.",
+ "about": "Nemotron-3.5 Parse for the Turing lane (L321): every Linear (the RADIO ViT, the neck's convolutions read as Linears, the decoder) and the tied embedding / head f16 from the F32 checkpoint (fp16 tensor cores; HF's own fp16 run matched fp32 on 27 of 30 pages, L321); every norm, bias, class token and the position field f32 as stored.",
  "rows": [
   {
    "role": "dense",

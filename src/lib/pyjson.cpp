@@ -1,3 +1,5 @@
+/** @file
+ *  pyjson's strict parser and Python-compatible serializer. */
 /* pyjson.cpp -- see pyjson.h. */
 #include "pyjson.h"
 
@@ -14,16 +16,27 @@
 
 namespace {
 
+/// Deepest array/object nesting pyjson_parse accepts; deeper input is refused.
 constexpr int kMaxDepth = 256;
 
+/** Recursive-descent parser state over one input span [begin, end). */
 struct parser {
+    /// Start of the input (error offsets are measured from it)
     const char *begin;
+    /// Read cursor
     const char *p;
+    /// One past the input's last byte
     const char *end;
+    /// Caller's error buffer (may be NULL)
     char *err;
+    /// Bytes at err
     size_t errlen;
+    /// A failure was recorded; only the first one writes err
     bool failed = false;
 
+    /** Record a failure (the first one only) as "json: <msg> at byte N".
+     *  @param fmt printf format of the reason
+     *  @return false, for `return fail(...)` */
     bool fail(const char *fmt, ...) {
         if (!failed && err && errlen) {
             va_list ap;
@@ -37,10 +50,13 @@ struct parser {
         return false;
     }
 
+    /** Skip JSON whitespace (space, tab, LF, CR). */
     void ws() {
         while (p < end && (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r')) p++;
     }
 
+    /** @param c a character
+     *  @return its hex digit value, or -1 */
     static int hex(char c) {
         if (c >= '0' && c <= '9') return c - '0';
         if (c >= 'a' && c <= 'f') return c - 'a' + 10;
@@ -48,6 +64,9 @@ struct parser {
         return -1;
     }
 
+    /** Consume one `\uXXXX` escape at p.
+     *  @param out receives the 16-bit code unit
+     *  @return false (consuming nothing) when p does not start a well-formed escape */
     bool u16(uint32_t *out) {
         if (end - p < 6 || p[0] != '\\' || p[1] != 'u') return false;
         uint32_t v = 0;
@@ -61,6 +80,9 @@ struct parser {
         return true;
     }
 
+    /** Append codepoint cp as UTF-8 (the caller has excluded surrogates).
+     *  @param s destination
+     *  @param cp a Unicode scalar value */
     static void put_utf8(std::string *s, uint32_t cp) {
         if (cp < 0x80) {
             s->push_back((char)cp);
@@ -79,6 +101,9 @@ struct parser {
         }
     }
 
+    /** Parse a string literal at p, unescaped, into *out.
+     *  @param out receives the UTF-8 bytes
+     *  @return false on a malformed string (fail() recorded why) */
     bool string(std::string *out) {
         if (p >= end || *p != '"') return fail("expected a string");
         p++;
@@ -125,6 +150,9 @@ struct parser {
         }
     }
 
+    /** Parse a number at p into an INT (digits kept, "-0" as "0") or a FLOAT.
+     *  @param v receives the value
+     *  @return false on a malformed number */
     bool number(pyjson_value *v) {
         const char *s = p;
         if (p < end && *p == '-') p++;
@@ -160,6 +188,9 @@ struct parser {
         return true;
     }
 
+    /** Consume `word` if the input continues with it.
+     *  @param word the literal (true / false / null)
+     *  @return true when consumed */
     bool lit(const char *word) {
         const size_t n = strlen(word);
         if ((size_t)(end - p) < n || memcmp(p, word, n)) return false;
@@ -167,6 +198,10 @@ struct parser {
         return true;
     }
 
+    /** Parse one value (after leading whitespace) at p.
+     *  @param v receives the value
+     *  @param depth nesting level of this value (0 at top), refused past kMaxDepth
+     *  @return false on malformed input */
     bool value(pyjson_value *v, int depth) {
         if (depth > kMaxDepth) return fail("nesting deeper than %d", kMaxDepth);
         ws();
@@ -227,6 +262,9 @@ struct parser {
     }
 };
 
+/** Append Python's repr() of a float (shortest round-trip digits; Infinity / -Infinity).
+ *  @param v the value
+ *  @param out destination */
 void float_repr(double v, std::string *out) {
     if (std::isinf(v)) {
         out->append(v < 0 ? "-Infinity" : "Infinity");
@@ -408,4 +446,37 @@ bool py_isspace(uint32_t cp) {
     if (cp == 0x85 || cp == 0xa0 || cp == 0x1680) return true;
     if (cp >= 0x2000 && cp <= 0x200a) return true;
     return cp == 0x2028 || cp == 0x2029 || cp == 0x202f || cp == 0x205f || cp == 0x3000;
+}
+
+void py_strip_bounds(const char *s, size_t n, size_t *lo_out, size_t *hi_out) {
+    const unsigned char *u = (const unsigned char *)s;
+    size_t lo = 0;
+    while (lo < n) {
+        const int k = utf8_seq_ok(u + lo, n - lo);
+        if (!k || !py_isspace(utf8_cp_at(u + lo, k))) break;
+        lo += (size_t)k;
+    }
+    size_t hi = n;
+    while (hi > lo) {
+        size_t b = hi - 1;
+        while (b > lo && (u[b] & 0xc0) == 0x80 && hi - b < 4) b--;
+        const int k = utf8_seq_ok(u + b, hi - b);
+        if (!k || b + (size_t)k != hi || !py_isspace(utf8_cp_at(u + b, k))) break;
+        hi = b;
+    }
+    *lo_out = lo;
+    *hi_out = hi;
+}
+
+std::string py_strip(const std::string &s) {
+    size_t lo = 0, hi = 0;
+    py_strip_bounds(s.data(), s.size(), &lo, &hi);
+    return s.substr(lo, hi - lo);
+}
+
+std::string py_strip(const char *s) {
+    if (!s) return std::string();
+    size_t lo = 0, hi = 0;
+    py_strip_bounds(s, strlen(s), &lo, &hi);
+    return std::string(s + lo, hi - lo);
 }

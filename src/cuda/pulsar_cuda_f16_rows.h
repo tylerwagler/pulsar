@@ -1,3 +1,5 @@
+/** @file
+ *  The f16 rows arm (L321): an IEEE f16 Linear over raw bf16 rows on the fp16 tensor cores. */
 /* The f16 rows arm (L321): a Linear stored IEEE f16 [out][in] (PULSAR_TENSOR_F16, the Turing lane's dense format)
  * over raw bf16 rows, on the fp16 tensor cores (sm_75+).
  *
@@ -19,15 +21,36 @@
 #include <stdint.h>
 
 /** Workspace bytes pulsar_f16_rows_linear_launch needs for `rows` rows of width `in`. */
+/// @param rows rows.
+/// @param in input width.
+/// @return bytes (the scaled f16 rows, then the per-row inverse scales, each 256-byte padded); 0 for a non-positive shape.
 size_t pulsar_f16_rows_workspace_bytes(int rows, int in);
 
 /** y [rows][out] f32 = the bf16 rows x [rows][in] times the f16 weight w [out][in] (device, 16-byte aligned; in and
  *  out multiples of 8).  @return 0, -1 refused (named on stderr), -3 launch failure. */
+/// @param w the weight, f16 [out][in].
+/// @param x_bf16 the rows, bf16 [rows][in].
+/// @param rows rows.
+/// @param in input width.
+/// @param out output width.
+/// @param y the output, f32 [rows][out].
+/// @param prompt the rows are a prompt chunk (else decode blocks of PULSAR_GPU_MNEUTRAL_ROWS_MAX).
+/// @param ws device workspace.
+/// @param ws_bytes bytes of ws (>= pulsar_f16_rows_workspace_bytes).
+/// @param stream the stream.
 int pulsar_f16_rows_linear_launch(const void *w, const uint16_t *x_bf16, int rows, int in, int out, float *y,
                                   bool prompt, void *ws, size_t ws_bytes, cudaStream_t stream);
 
 /** y [rows][out] f32 = the f16 rows x [rows][in] times the f16 weight w [out][in], on the fixed-algorithm GEMM of the
  *  row kind; no workspace.  @return 0, -1 refused (named on stderr), -3 launch failure. */
+/// @param w the weight, f16 [out][in].
+/// @param x_f16 the rows, f16 [rows][in].
+/// @param rows rows.
+/// @param in input width.
+/// @param out output width.
+/// @param y the output, f32 [rows][out].
+/// @param prompt the rows are a prompt chunk.
+/// @param stream the stream.
 int pulsar_f16_rows_linear_h_launch(const void *w, const uint16_t *x_f16, int rows, int in, int out, float *y,
                                     bool prompt, cudaStream_t stream);
 

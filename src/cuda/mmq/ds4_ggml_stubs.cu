@@ -1,4 +1,6 @@
 // SPDX-License-Identifier: MIT
+/** @file
+ *  Bodies of the ggml-API stubs the vendored llama.cpp mmq kernels link against. */
 // Implementations of the ggml-API stubs declared in ds4_ggml_stubs.h plus
 // the bodies of ggml_backend_cuda_context / ggml_cuda_info /
 // the device-info accessor that ds4_cuda_env.cuh declares without
@@ -28,6 +30,7 @@
 // what was dropped from common.cuh's thirteen fields.
 // ----------------------------------------------------------------------------
 
+/// @return the process's device table (cc, warp_size, smpbo per device), filled once.
 const ggml_cuda_device_info & ggml_cuda_info() {
     static ggml_cuda_device_info info;
     static std::once_flag once;
@@ -58,12 +61,15 @@ const ggml_cuda_device_info & ggml_cuda_info() {
 // ggml_cuda_get_device / ggml_cuda_set_device are declared (not defined) in
 // ds4_cuda_env.cuh. We provide thin wrappers.
 
+/// @return the current CUDA device.
 int ggml_cuda_get_device() {
     int dev = 0;
     cudaGetDevice(&dev);
     return dev;
 }
 
+/// Makes `device` current (aborts on failure).
+/// @param device the CUDA device index.
 void ggml_cuda_set_device(int device) {
     int cur = -1;
     cudaGetDevice(&cur);
@@ -81,6 +87,12 @@ void ggml_cuda_set_device(int device) {
 // declaration there - abort() satisfies that contract.
 // ----------------------------------------------------------------------------
 
+/// CUDA_CHECK's error path: prints the call and the error, then aborts (never returns).
+/// @param stmt the failed call's source text.
+/// @param func the enclosing function.
+/// @param file the source file.
+/// @param line the source line.
+/// @param msg the CUDA error string.
 [[noreturn]] void ggml_cuda_error(const char * stmt, const char * func, const char * file, int line, const char * msg) {
     fprintf(stderr, "CUDA error: %s\n  call: %s\n  in: %s at %s:%d\n", msg, stmt, func, file, line);
     fflush(stderr);

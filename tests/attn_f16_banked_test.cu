@@ -51,6 +51,9 @@
  * drives every indexed case through BOTH paths against the same oracle. */
 static int g_decode_rows = 0;
 int pulsar_gpu_matmul_batch_decode_rows(void) { return g_decode_rows; }
+/* The split-K partials regrow drops the captured segment graphs (pulsar_gpu_seg_note_device_free,
+ * defined in pulsar_cuda_runtime.cu, not linked here); this test captures none. */
+void pulsar_gpu_seg_note_device_free(void) {}
 /* The KV row family is the loaded profile's (pulsar_gpu_kv_row_style, defined in
  * pulsar_cuda_norm_kv.cu, not linked here).  This gate drives V4.1's CSA2 pair;
  * the UNIFIED family V4 uses is driven by attn_f16_kernel_test's `unified`

@@ -1,3 +1,5 @@
+> **Historical, not maintained** (moved to docs/history/ on 2026-10-30): a static engine code review and its follow-up status, 2026-08-13 (was docs/engine-review-2026-08-13.md). The code at the tip of `dev` is the authority.
+
 # Engine code review — 2026-08-13 (static)
 
 > **STATUS (updated 2026-08-13, after the findings were acted on).** This is the
@@ -122,7 +124,7 @@ between calls. And `:461-496` re-hashes the incoming text (SHA1 of up to
 ~100 KB) per CONTINUED entry per eviction pass — invariant across passes.
 Index the directory once; hoist the incoming hash.
 
-## Part B — measurement-gated (sparky; price in one nsys session)
+## Part B — measurement-gated (the dev GB10; price in one nsys session)
 
 ### B1. DSpark seeding copy-storm
 

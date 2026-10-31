@@ -1,3 +1,5 @@
+/** @file
+ *  Host-pinned, GPU-mapped slab allocation for the TP transport (CUDA runtime only, no kernels). */
 #ifndef PULSAR_TP_GPU_H
 #define PULSAR_TP_GPU_H
 
@@ -22,14 +24,27 @@
 
 /* Allocate a host-pinned, GPU-visible slab of `bytes` for the transport.
  * Returns 1 on success (base valid), 0 on failure with err set. */
+/** Allocate a page-aligned slab, page-locked and GPU-mapped (cudaHostRegister + Mapped).
+ *  @param bytes  slab size in bytes
+ *  @param base   receives the host base VA (NULL on failure); free with pulsar_tp_gpu_slab_free_hostpin
+ *  @param err    receives the failure reason (may be NULL)
+ *  @param errlen size of `err`
+ *  @return 1 on success, 0 on failure */
 int pulsar_tp_gpu_slab_alloc_hostpin(size_t bytes, void **base,
                                      char *err, size_t errlen);
 
 /* The slab's device mapping (cudaHostGetDevicePointer on the Mapped
  * registration) -- what the row-lane kernels address.  NULL on failure. */
+/** Device address of a slab from pulsar_tp_gpu_slab_alloc_hostpin.
+ *  @param base   the slab's host base VA
+ *  @param err    receives the failure reason (may be NULL)
+ *  @param errlen size of `err`
+ *  @return the device pointer the row-lane kernels address, or NULL on failure */
 void *pulsar_tp_gpu_slab_device_ptr(void *base, char *err, size_t errlen);
 
 /* Release a host-pinned slab from pulsar_tp_gpu_slab_alloc_hostpin. */
+/** Unregister and free a slab from pulsar_tp_gpu_slab_alloc_hostpin; NULL is a no-op.
+ *  @param base the slab's host base VA */
 void pulsar_tp_gpu_slab_free_hostpin(void *base);
 
 #endif

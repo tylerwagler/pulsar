@@ -1,3 +1,5 @@
+/** @file
+ *  Host-pinned, GPU-mapped slab allocation for the TP transport (cudaHostRegister). */
 /* GPU-side slab support for the two-rank TP port (slice 4b ground work).
  * See pulsar_tp_gpu.h for the slab-class rationale (runbook step 4 verdict).
  */

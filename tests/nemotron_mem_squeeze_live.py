@@ -7,11 +7,11 @@ floor.
         [--banks 16] [--convs 3] [--target 200000] [--turn 15000] [--headroom-gib 3.0] [--slack-gib 0.25]
         [--req-timeout 900] [--timeout 7200] [--log PATH]
 
-The incident (work box, dev 65d463a5, Nemotron 3.5 Super K4 + LiLiCorr, 16 banks at --ctx 1M, opencode): the 2b
+The incident (a production box, dev 65d463a5, Nemotron 3.5 Super K4 + LiLiCorr, 16 banks at --ctx 1M, opencode): the 2b
 guard's ceiling was cut once at warmup and priced all the post-warmup headroom as KV's, so memory nobody accounts for
 took the 4 GiB floor; the box reached the kernel's min watermark, nvidia-uvm failed to allocate a
 uvm_va_block_context_t while servicing a GPU fault on a managed KV pool (dmesg), the GPU never got its page and the
-worker spun in save_segment's device drain for 36 minutes.  Sparky's #490 run of the same shape (no balloon) fell to
+worker spun in save_segment's device drain for 36 minutes.  The GB10 host's #490 run of the same shape (no balloon) fell to
 3.9 GB MemAvailable -- under the floor -- with touched KV still under the guard's budget.
 
   B   a balloon takes all but (the derived floor + --headroom-gib) of the box's memory BEFORE the server starts, so the

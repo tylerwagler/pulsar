@@ -31,7 +31,7 @@
  *   - data codes: e2m1 RNE of src / scale with the GPU's own decoded scale;
  *   - the bf16 rope tail (rtn-even cvt);
  *   - the f32 writeback vs CPU decode of the GPU'S OWN bytes -- this pins the
- *     device decode (attn_kv4_e2m1 bit math + scale decode) against the
+ *     device decode (pulsar_e2m1_times bit math + scale decode) against the
  *     reference value table for every code that occurs.
  * (FTZ: the TU flushes subnormals, the host does not; no quantity here comes
  * near 2^-126 -- the row scale is floored at 1e-4 / 2688.)

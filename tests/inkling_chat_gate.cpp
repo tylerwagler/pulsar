@@ -650,6 +650,10 @@ static void s1_hand(void) {
     noc.raw_calls = raw.c_str();
     CHECK(!inkling_chat_render_assistant_turn(noc, &turn, err, sizeof err) && !strncmp(err, "raw_calls_without_calls", 23),
           "S1: raw calls without calls refuse");
+    inkling_msg_in norole = {};
+    norole.content = "x";
+    CHECK(!inkling_chat_render_turn(&norole, 1, 0, false, false, &turn, err, sizeof err) &&
+              !strncmp(err, "unexpected_role", 15), "S1: a message with no role refuses (unexpected_role)");
     CHECK(!inkling_chat_render_turn(NULL, 0, 0, false, false, &turn, err, sizeof err), "S1: an empty piece refuses");
     CHECK(inkling_chat_render_turn(NULL, 0, 0, true, false, &turn, err, sizeof err) &&
               turn.text == "<|content_model_end_sampling|>", "S1: the close alone");

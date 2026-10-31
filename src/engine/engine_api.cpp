@@ -1,3 +1,5 @@
+/** @file engine_api.cpp
+ *  @brief The public pulsar.h engine / session API: the free-function facade over pulsar_engine and pulsar_session. */
 #include "pulsar_engine_internal.h"
 #include "spec_internal.h"
 #include "spec_block.h"
@@ -9,6 +11,9 @@
 
 
 
+/** Make this process the kernel OOM killer's first choice (oom_score_adj 1000), once per process; Linux only, a
+ *  failure is printed and ignored.
+ *  @param backend the backend, named in the messages */
 void pulsar_linux_graph_backend_set_oom_score(pulsar_backend backend) {
 #if defined(__linux__)
     static bool attempted = false;
@@ -71,11 +76,16 @@ bool pulsar_think_mode_valid(pulsar_think_mode mode) {
  * rest the decimal effort and its rendered line.  Built once, read forever;
  * every caller keeps a const char* into it. */
 namespace {
+/** One reasoning-effort level's strings (an entry of think_effort_table). */
 struct think_effort_row {
+    /// the effort as decimal text, "1".."100"; "" in row 0
     char name[4];      /* "1".."100" */
+    /// the rendered effort line (PULSAR_REASONING_EFFORT_HEAD N PULSAR_REASONING_EFFORT_TAIL); "" in row 0
     char prefix[160];  /* PULSAR_REASONING_EFFORT_HEAD N PULSAR_REASONING_EFFORT_TAIL */
 };
+/** Every effort level's strings, indexed by effort; built once on first use, immutable after. */
 struct think_effort_table {
+    /// [effort] the level's strings; rows below PULSAR_THINK_EFFORT_MIN stay zeroed
     think_effort_row row[PULSAR_THINK_EFFORT_MAX + 1];
     think_effort_table() {
         memset(row, 0, sizeof row);
@@ -87,6 +97,8 @@ struct think_effort_table {
         }
     }
 };
+/** The process-wide effort table (a function-local static: built on first call, thread-safe init).
+ *  @return the table; callers keep pointers into it for the process lifetime */
 const think_effort_table &think_efforts() {
     static const think_effort_table t;
     return t;
@@ -160,6 +172,7 @@ size_t pulsar_think_effort_prefix_len(const char *s) {
 
 
 
+/** Close the process's instance lock file (a no-op when none is held). */
 void pulsar_release_instance_lock(void) {
     if (g_pulsar_lock_fd >= 0) {
         close(g_pulsar_lock_fd);
@@ -243,11 +256,15 @@ void pulsar_acquire_instance_lock(void) {
  * PULSAR_FAMILY_CAP_*) refuses here, by name, before any family state is
  * touched; the caller gets the entry's own failure value.  DeepSeek declares
  * every cap, so on its engines this is one always-taken branch per call. */
+/** Refuse (return `ret`) when session `s`'s family does not declare capability `cap`; `op` names the entry.  A NULL
+ *  session passes through to the entry's own NULL handling. */
 #define PULSAR_FAMILY_REQUIRES_S(s, cap, op, ret) \
     do { if ((s) && !pulsar_family_require((s)->engine, (cap), (op))) return ret; } while (0)
+/** PULSAR_FAMILY_REQUIRES_S for an engine `e`. */
 #define PULSAR_FAMILY_REQUIRES_E(e, cap, op, ret) \
     do { if ((e) && !pulsar_family_require((e), (cap), (op))) return ret; } while (0)
 /* The session's bank pool (family.h pulsar_family_bank_ops): every family has one, DeepSeek's its graph's. */
+/** The session's family bank pool.  @param s the session  @return the family's bank ops */
 static inline const pulsar_family_bank_ops *session_banks(const pulsar_session *s) { return s->engine->family->banks; }
 
 
@@ -273,10 +290,15 @@ pulsar_family_id pulsar_engine_family(const pulsar_engine *e) {
     return e ? e->family->id : PULSAR_FAMILY_ID_DEEPSEEK4;
 }
 pulsar_chat_format pulsar_engine_chat_format(const pulsar_engine *e) {
-    return e ? e->family->chat_format(e) : PULSAR_CHAT_DS4_V41;
+    if (e) return e->family->chat_format(e);
+    /* L335: no engine is no family -- never DeepSeek V4.1 by default (rule 1); a caller rendering without an
+     * engine names its format itself */
+    if (pulsar_refusal_first("pulsar_engine_chat_format"))
+        fprintf(stderr, "pulsar: pulsar_engine_chat_format: no engine, so no chat format -- refusing\n");
+    return PULSAR_CHAT_NONE;
 }
 const char *pulsar_engine_family_name(const pulsar_engine *e) {
-    return e ? e->family->name : PULSAR_FAMILY_DEEPSEEK4.name;
+    return e ? e->family->name : "(no engine)";   /* L335: never DeepSeek's name for no engine */
 }
 
 
@@ -284,6 +306,8 @@ const char *pulsar_engine_family_name(const pulsar_engine *e) {
 /* The think-mode axis (none, 1..100) is DeepSeek's encoder's own; every other family's template renders thinking on
  * at its default effort (PULSAR_THINK_DEFAULT, the enabled marker) or off, its own effort levels being the server's
  * effort map's (L295 E6: Inkling; Qwen since L251). */
+/// @param e the engine, or NULL (the compile-time default profile)
+/// @return true when the family's chat format is DeepSeek V4 / V4.1
 static bool think_axis_is_deepseek(const pulsar_engine *e) {
     if (!e) return true;   /* no engine: the compile-time default profile */
     const pulsar_chat_format f = e->family->chat_format(e);
@@ -344,6 +368,8 @@ bool pulsar_engine_has_vision(const pulsar_engine *e) { return e && e->family->v
 pulsar_drafter_kind pulsar_engine_drafter(pulsar_engine *e) { return e ? e->family->drafter(e) : PULSAR_DRAFTER_NONE; }
 
 /* L321: the encoder entries -- the family's (pulsar_family_encoder), behind PULSAR_FAMILY_CAP_ENCODE */
+/** The family's encoder when the family declares PULSAR_FAMILY_CAP_ENCODE.  @param e the engine, or NULL
+ *  @return the encoder, or NULL */
 static const pulsar_family_encoder *encoder_of(const pulsar_engine *e) {
     return e && (e->family->caps & PULSAR_FAMILY_CAP_ENCODE) ? e->family->encoder : NULL;
 }
@@ -459,12 +485,18 @@ uint64_t pulsar_session_checkpoint_digest(const pulsar_session *s) {
 
 /** The pair this session mirrors onto, or NULL when nothing should be mirrored
  * (pair off, or a session the engine handed out before the transport existed). */
+/// @param s the session
+/// @return the engine's transport, or NULL
 static pulsar_tp *tp_mirror_target(pulsar_session *s) {
     return pulsar_session_is_mirrored(s) ? s->engine->tp : NULL;
 }
 
 /** Refusal shared by the mirrored operations: the pair is armed but its
  * transport is already dead, so no frame can be trusted in either direction. */
+/// @param tp     the transport
+/// @param err    receives the refusal when non-NULL
+/// @param errlen bytes of `err`
+/// @return 1 = refused (the transport failed), 0 = go on
 static int tp_mirror_dead(pulsar_tp *tp, char *err, size_t errlen) {
     if (!pulsar_tp_failed(tp)) return 0;
     if (err) snprintf(err, errlen,
@@ -477,9 +509,20 @@ static int tp_mirror_dead(pulsar_tp *tp, char *err, size_t errlen) {
  * session operation on a worker is the same-driver model this slice retired,
  * and it is refused before any frame moves. */
 /* Defined with the bank wrappers below; shared by every verdict operation. */
+/// @param s             the session
+/// @param tp            the transport
+/// @param operation     names the operation
+/// @param own           the leader's own verdict
+/// @param divergence_rc the result when a peer's verdict differs
+/// @return the agreed verdict, or divergence_rc
 static int tp_mirror_bank_verdict(pulsar_session *s, pulsar_tp *tp, const char *operation,
                                   int own, int divergence_rc);
 
+/// @param tp        the transport
+/// @param operation names the operation
+/// @param err       receives the refusal when non-NULL
+/// @param errlen    bytes of `err`
+/// @return 1 = refused (this rank is a worker), 0 = go on
 static int tp_mirror_worker_drives_nothing(pulsar_tp *tp, const char *operation,
                                            char *err, size_t errlen) {
     PULSAR_NVTX("tp: wait worker verdict");
@@ -493,6 +536,13 @@ static int tp_mirror_worker_drives_nothing(pulsar_tp *tp, const char *operation,
 /** The collector every mirrored operation ends with on the leader: one ack per
  * peer.  It is read even when `body_rc` failed locally, because an unread ack
  * would be consumed by the NEXT operation, shifting every later frame by one. */
+/// @param s         the session
+/// @param tp        the transport
+/// @param operation names the operation
+/// @param body_rc   the leader's own result
+/// @param err       receives a peer's failure when non-NULL
+/// @param errlen    bytes of `err`
+/// @return body_rc when it failed, else 0, or 1 when a peer failed
 static int tp_mirror_leader_ack(pulsar_session *s, pulsar_tp *tp, const char *operation,
                                 int body_rc, char *err, size_t errlen) {
     char peer_err[256];
@@ -514,6 +564,9 @@ static int tp_mirror_leader_ack(pulsar_session *s, pulsar_tp *tp, const char *op
 /** The cross-rank identity digest of a BATCHED step (decode_multiseq / decode_mixed): of the rows it headed, on
  * the device where they stay (L302; pulsar_gpu_rows_digest) -- every rank holds the same rows after the vocab
  * all-gather.  0 when the device digest failed (the ranks then disagree, loudly). */
+/// @param s      the session
+/// @param n_rows rows the step headed (0 digests to a fixed constant)
+/// @return the digest
 uint64_t pulsar_session_batch_digest(pulsar_session *s, uint32_t n_rows) {
     uint64_t d = 0;
     return n_rows == 0 ? 0x9E3779B97F4A7C15ull : s->rows_digest(s->dev.step_rows, 0, n_rows, &d) ? d : 0u;
@@ -527,6 +580,7 @@ uint64_t pulsar_session_fused_digest(pulsar_session *s, uint32_t n_dec, uint32_t
 }
 
 /* The live row's digest (an eval's, a speculative run's last row). */
+/** The digest of the session's live row, on the device.  @param s the session  @return the digest, 0 on failure */
 static uint64_t live_digest(pulsar_session *s) {
     uint64_t d = 0;
     return s->rows_digest(s->dev.live, 0, 1, &d) ? d : 0u;
@@ -537,6 +591,10 @@ static uint64_t live_digest(pulsar_session *s) {
  * before the session ends.  Token decisions (sample, argmax) do not settle --
  * the next eval does, before the token it drew is returned to its caller.
  * With no `err` the refusal is printed.  1 = nothing pending or it matched. */
+/// @param s      the session
+/// @param err    receives the refusal (NULL = printed)
+/// @param errlen bytes of `err`
+/// @return 1 when nothing was pending or it matched, else 0
 static int tp_mirror_settle(pulsar_session *s, char *err, size_t errlen) {
     pulsar_tp *tp = tp_mirror_target(s);
     if (!tp || pulsar_tp_rank(tp) != 0) return 1;
@@ -559,6 +617,14 @@ int pulsar_session_settle(pulsar_session *s, char *err, size_t errlen) {
  * eval pipelines its own check (pulsar_session_eval).  When the leader's own
  * body failed there is nothing to compare; the acks are drained in either shape
  * so the next frame is not shifted, and the local failure is the result. */
+/// @param s         the session
+/// @param tp        the transport
+/// @param operation names the operation
+/// @param body_rc   the leader's own result
+/// @param n_rows    rows the step headed (digested)
+/// @param err       receives a peer's failure when non-NULL
+/// @param errlen    bytes of `err`
+/// @return body_rc when it failed, else 0, or 1 when a peer failed or disagreed
 static int tp_mirror_leader_ack_logits(pulsar_session *s, pulsar_tp *tp, const char *operation,
                                        int body_rc, uint32_t n_rows, char *err, size_t errlen) {
     if (body_rc != 0) {
@@ -582,6 +648,9 @@ static int tp_mirror_leader_ack_logits(pulsar_session *s, pulsar_tp *tp, const c
  * through tp_mirror_dead on the leader, and through the worker loop's failed
  * check on a worker -- and the reason is printed here, named, while it is still
  * the newest line on stderr.  Shared with tp_worker.cpp. */
+/// @param tp        the transport (marked failed)
+/// @param operation names the operation
+/// @param why       the reason (NULL = "no reason given")
 void pulsar_tp_mirror_fail_void(pulsar_tp *tp, const char *operation, const char *why) {
     pulsar_tp_mark_failed(tp);
     fprintf(stderr, "pulsar: tp: the mirrored %s failed (%s); the pair is marked failed\n",
@@ -602,6 +671,12 @@ void pulsar_tp_mirror_fail_void(pulsar_tp *tp, const char *operation, const char
  * and scheduler, whose timing follows LOCAL memory state -- so no ack is
  * collected; the worker loop's checks are the divergence alarm, and the next
  * ACKED operation carries the refusal back. */
+/// @param tp        the transport
+/// @param operation names the operation
+/// @param sent      the send's result (nonzero = shipped)
+/// @param err       receives the refusal (NULL = printed and the pair failed)
+/// @param errlen    bytes of `err`
+/// @return 1 when sent, else 0 (the pair marked failed)
 static int tp_mirror_sent(pulsar_tp *tp, const char *operation, int sent,
                           char *err, size_t errlen) {
     if (sent != 0) return 1;
@@ -684,6 +759,10 @@ void pulsar_session_free(pulsar_session *s) {
 /** The wire rows of a batched step: the engine's own row contract plus the
  * session.  Shared by the batched decode and the mixed step so the two frames
  * cannot encode a row differently. */
+/// @param s    the session (its mirror id)
+/// @param reqs [n] the rows
+/// @param n    rows
+/// @return the wire items, xmalloc'd (the caller frees them)
 static pulsar_tp_batch_item *tp_mirror_rows(const pulsar_session *s, const pulsar_multiseq_req *reqs,
                                             uint32_t n) {
     pulsar_tp_batch_item *items = (pulsar_tp_batch_item *)xmalloc((size_t)n * sizeof(*items));
@@ -1034,7 +1113,7 @@ int pulsar_session_decode_fused(pulsar_session *s, const pulsar_multiseq_req *re
     if (!s) return 1;
     /* a family without the op has no fused step (its prompt rows take the classic sync) */
     if (!pulsar_engine_has_fused_step(s->engine)) {
-        snprintf(err, errlen, "%s: no fused step", s->engine->family->name);
+        if (err) snprintf(err, errlen, "%s: no fused step", s->engine->family->name);
         return 1;
     }
     pulsar_tp *tp = tp_mirror_target(s);
@@ -1103,6 +1182,12 @@ static int tp_mirror_bank_verdict(pulsar_session *s, pulsar_tp *tp, const char *
  * (the cross-rank identity check, L243).  An own verdict of 0 (the run failed
  * here) collects plainly; a peer that ran anyway answers with a digest, which
  * the plain collect refuses as a shape mismatch -- a split either way. */
+/// @param s             the session
+/// @param tp            the transport
+/// @param operation     names the operation
+/// @param own           the leader's own verdict (> 0 carries the live row's digest)
+/// @param divergence_rc the result when the ranks split
+/// @return the agreed verdict, or divergence_rc (the pair marked failed)
 static int tp_mirror_bank_verdict_logits(pulsar_session *s, pulsar_tp *tp, const char *operation,
                                          int own, int divergence_rc) {
     PULSAR_NVTX("tp: wait worker verdict");
@@ -1180,6 +1265,11 @@ bool pulsar_session_bank_state_restore(pulsar_session *s, uint32_t bank) {
 }
 /* ---- The eviction guard's physical-bank pair (increment 6): verdicts, each
  * rank frees or allocates its own replicated bank. */
+/** Free or re-back a bank's physical KV on this rank, mirrored as a verdict on a TP leader.
+ *  @param s       the session
+ *  @param freeing nonzero = free_physical, 0 = alloc_physical
+ *  @param bank    the bank
+ *  @return true when done (on a pair: on every rank) */
 static bool tp_mirror_bank_physical(pulsar_session *s, int freeing, uint32_t bank) {
     const char *operation = freeing ? "bank free physical" : "bank alloc physical";
     const pulsar_family_bank_ops *ops = session_banks(s);
@@ -1287,6 +1377,8 @@ bool pulsar_session_bank_comp_stale(pulsar_session *s, uint32_t bank) {
 const pulsar_tokens *pulsar_session_bank_tokens(pulsar_session *s, uint32_t bank) { PULSAR_FAMILY_REQUIRES_S(s, PULSAR_FAMILY_CAP_BANKS, "per-bank state", NULL); return pulsar_bank_history(s, bank); }
 /* The bank's committed history, the family's reader or DeepSeek's (the prefix readers below are
  * ONE body over it; L272 P0 folded the two copies). */
+/** The bank's committed history (pulsar_bank_history).  @param s the session  @param bank the bank
+ *  @return the tokens, or NULL */
 static const pulsar_tokens *session_bank_history(pulsar_session *s, uint32_t bank) {
     return pulsar_bank_history(s, bank);
 }
@@ -1341,6 +1433,10 @@ void pulsar_session_note_committed_tokens(pulsar_session *s, const int *toks, in
  * identical state -- same logits after the vocab all-gather, same drafts,
  * same rng -- the walk is a deterministic function, so a split verdict is a
  * divergence.  Verdicts that can be -1 ride the wire as value + 1. */
+/** A speculative frame's command for the session and bank, every other field zero.
+ *  @param s    the session (its mirror id)
+ *  @param bank the bank
+ *  @return the command */
 static pulsar_tp_spec_command tp_spec_cmd(const pulsar_session *s, int bank) {
     pulsar_tp_spec_command c;
     memset(&c, 0, sizeof(c));
@@ -1350,11 +1446,18 @@ static pulsar_tp_spec_command tp_spec_cmd(const pulsar_session *s, int bank) {
 }
 /* the bank a mirrored speculative command runs on: the family's live bank (L272 P6: this read DeepSeek's graph,
  * so a Qwen pair's commands named bank 0 whichever bank was live) */
+/** @param s the session  @return the live bank */
 static int tp_spec_live_bank(const pulsar_session *s) {
     return (int)pulsar_session_live_bank(const_cast<pulsar_session *>(s));
 }
 /* Returns 1 when the operation may run locally without mirroring (pair off),
  * 0 when it was refused (err filled), 2 when it must be mirrored. */
+/// @param s         the session
+/// @param operation names the operation
+/// @param tp_out    receives the transport (NULL = pair off)
+/// @param err       receives the refusal
+/// @param errlen    bytes of `err`
+/// @return 1 run locally, 0 refused, 2 mirror it
 static int tp_spec_route(pulsar_session *s, const char *operation, pulsar_tp **tp_out,
                          char *err, size_t errlen) {
     *tp_out = tp_mirror_target(s);
@@ -1532,6 +1635,16 @@ void pulsar_session_spec_redraft_commit(pulsar_session *s, pulsar_spec_round *r)
  * verdict is the phase's outcome fingerprint, so any bank's split -- a
  * status, a base token, a row, an accepted token, a frontier -- is one
  * divergence, refused. */
+/// @param s          the session
+/// @param tp         the transport
+/// @param frame_type the phase's frame type
+/// @param operation  names the phase
+/// @param steps      [n] the per-bank steps
+/// @param n          steps, <= PULSAR_TP_SPEC_STEPS_MAX
+/// @param h1         per-frame header field i1 (the phase's own meaning)
+/// @param h2         per-frame header field i2
+/// @param h3         per-frame header field i3
+/// @return 1 when sent, 0 when refused or not shipped
 static int tp_spec_steps_mirror(pulsar_session *s, pulsar_tp *tp, uint32_t frame_type,
                                 const char *operation, const pulsar_spec_step *steps, int n,
                                 int32_t h1, int32_t h2, int32_t h3) {
@@ -1560,6 +1673,8 @@ static int tp_spec_steps_mirror(pulsar_session *s, pulsar_tp *tp, uint32_t frame
     }
     return tp_mirror_sent(tp, operation, pulsar_tp_send_spec_steps(tp, frame_type, &c, recs), NULL, 0);
 }
+/** Mark every step failed with "the pair refused <operation>".  @param steps [n] the steps  @param n steps
+ *  @param operation names the phase  @return -1, always */
 static int tp_spec_steps_fail(pulsar_spec_step *steps, int n, const char *operation) {
     for (int i = 0; i < n; i++) {
         steps[i].status = PULSAR_SPEC_STEP_FAILED;
@@ -1569,11 +1684,14 @@ static int tp_spec_steps_fail(pulsar_spec_step *steps, int n, const char *operat
 }
 /* L303: token masks do not cross the pair (the frames carry no mask rows), so a constrained step on a pair fails by
  * name rather than letting the ranks draw from different rows. */
+/** Does any step carry a token mask?  @param steps [n] the steps  @param n steps  @return true when one does */
 static bool tp_spec_steps_masked(const pulsar_spec_step *steps, int n) {
     for (int i = 0; i < n; i++)
         if (steps[i].masks) return true;
     return false;
 }
+/** Fail every step: a constrained step does not cross the pair.  @param steps [n] the steps  @param n steps
+ *  @return -1, always */
 static int tp_spec_steps_refuse_masks(pulsar_spec_step *steps, int n) {
     for (int i = 0; i < n; i++) {
         steps[i].status = PULSAR_SPEC_STEP_FAILED;
@@ -1718,9 +1836,6 @@ TokPos pulsar_session_checkpoint_best(pulsar_session *s, TokPos limit) {
     const pulsar_ckpt_store *st = pulsar_session_kv_store(s);
     return TokPos{st && st->ops ? (int)pulsar_ckpt_best(st, pulsar_session_live_bank(s), (uint32_t)limit.raw()) : 0};
 }
-static char *engine_api_token_text(void *ud, int token, size_t *len) {
-    return pulsar_token_text((pulsar_engine *)ud, token, len);
-}
 pulsar_bank_resume pulsar_session_bank_resume_at(pulsar_session *s, uint32_t bank, const pulsar_tokens *prompt) {
     const pulsar_bank_resume none = {TokPos{0}, PromptToks{0}};
     if (!s || !prompt || prompt->len <= 0) return none;
@@ -1742,7 +1857,7 @@ pulsar_bank_resume pulsar_session_bank_resume_at(pulsar_session *s, uint32_t ban
      * request (pulsar_tokens_prompt_held_with) -- G itself when no seam lies below it, fewer when a re-spelled stretch
      * does (G was returned as the prompt-side count unconverted before) */
     if (at < TokPos::after(m.live_cut))
-        return {at, pulsar_tokens_prompt_held_with(engine_api_token_text, s->engine, t->v, at, prompt->v, prompt->len)};
+        return {at, pulsar_tokens_prompt_held_with(pulsar_engine_token_text_fn, s->engine, t->v, at, prompt->v, prompt->len)};
     return {at, m.prompt_cut};
 }
 /* L313: where `src`'s published state serves `prompt` -- the one resume rule (pulsar_session_resume_point, the rule a
@@ -1755,6 +1870,12 @@ pulsar_bank_resume pulsar_session_bank_resume_at(pulsar_session *s, uint32_t ban
  * Claude Code at 178-193k).  The adopted view is src's tokens to T, and the sync re-stitches it against the prompt, so
  * T must be a boundary the two spellings share: a T inside a re-spelled stretch is no adopt point (the stitch would
  * stand short of T, below every checkpoint the adopt leaves, and prefill from 0). */
+/// @param s      the session
+/// @param src    the bank adopted from
+/// @param prompt the request's tokens
+/// @param rec    receives the record at T, or NULL for a grid checkpoint
+/// @param len    receives the prompt's length in src's currency
+/// @return T, the adopt point in tokens, or 0 when none
 static uint32_t bank_adopt_point(pulsar_session *s, uint32_t src, const pulsar_tokens *prompt,
                                  const pulsar_ckpt_record **rec, int *len) {
     *rec = NULL;
@@ -1792,7 +1913,7 @@ PromptToks pulsar_session_bank_prompt_held(pulsar_session *s, uint32_t bank, con
     if (!s || !prompt || at.is_none() || at <= TokPos{0}) return PromptToks{0};
     const pulsar_tokens *h = pulsar_bank_history(s, bank);
     if (!h || at > TokPos{h->len}) return PromptToks{0};
-    return pulsar_tokens_prompt_held_with(engine_api_token_text, s->engine, h->v, at, prompt->v, prompt->len);
+    return pulsar_tokens_prompt_held_with(pulsar_engine_token_text_fn, s->engine, h->v, at, prompt->v, prompt->len);
 }
 
 pulsar_bank_adopt_result pulsar_session_bank_adopt(pulsar_session *s, uint32_t src, const pulsar_tokens *prompt,
@@ -1802,16 +1923,16 @@ pulsar_bank_adopt_result pulsar_session_bank_adopt(pulsar_session *s, uint32_t s
     const pulsar_bank_adopt_result none = {PULSAR_ADOPT_NONE, TokPos{0}};
     PULSAR_FAMILY_REQUIRES_S(s, PULSAR_FAMILY_CAP_BANKS, "bank adopt", refused);
     if (!s || !prompt) {
-        snprintf(err, errlen, "bank adopt: no session or prompt");
+        if (err) snprintf(err, errlen, "bank adopt: no session or prompt");
         return refused;
     }
     if (tp_mirror_target(s)) {
-        snprintf(err, errlen, "bank adopt: a tensor-parallel engine does not mirror it");
+        if (err) snprintf(err, errlen, "bank adopt: a tensor-parallel engine does not mirror it");
         return refused;
     }
     const uint32_t dst = pulsar_session_live_bank(s);
     if (src >= (uint32_t)pulsar_session_bank_count(s) || src == dst) {
-        snprintf(err, errlen, "bank adopt: bank %u is not another bank of the pool", src);
+        if (err) snprintf(err, errlen, "bank adopt: bank %u is not another bank of the pool", src);
         return refused;
     }
     const pulsar_ckpt_record *r = NULL;
@@ -1829,7 +1950,7 @@ pulsar_bank_adopt_result pulsar_session_bank_adopt(pulsar_session *s, uint32_t s
     s->checkpoint_valid = false;   /* the state moves below */
     if (!pulsar_ckpt_adopt(st, dst, src, T, r) || (at_end && !s->live_from_host(s->logits))) {
         pulsar_tokens_free(&view);
-        snprintf(err, errlen, "bank adopt: bank %u's state at %u did not copy into bank %u", src, T, dst);
+        if (err) snprintf(err, errlen, "bank adopt: bank %u's state at %u did not copy into bank %u", src, T, dst);
         return refused;
     }
     s->checkpoint.len = 0;
@@ -1848,7 +1969,7 @@ pulsar_bank_adopt_result pulsar_session_bank_adopt(pulsar_session *s, uint32_t s
 int pulsar_session_restore_checkpoint(pulsar_session *s, TokPos G, char *err, size_t errlen) {
     PULSAR_NVTX_FN();
     if (!s || G.is_none() || G <= TokPos{0}) {
-        snprintf(err, errlen, "restore checkpoint: no session or position %d", G.raw());
+        if (err) snprintf(err, errlen, "restore checkpoint: no session or position %d", G.raw());
         return 1;
     }
     /* L272 B1: a family without a standalone restore restores its grid checkpoints inside sync (the resume,
@@ -1856,16 +1977,16 @@ int pulsar_session_restore_checkpoint(pulsar_session *s, TokPos G, char *err, si
      * checkpoint". */
     const pulsar_family_bank_ops *ops = session_banks(s);
     if (!ops->restore_checkpoint) {
-        snprintf(err, errlen, "restore checkpoint: %s restores a grid checkpoint only as a sync resumes from it",
+        if (err) snprintf(err, errlen, "restore checkpoint: %s restores a grid checkpoint only as a sync resumes from it",
                  s->engine->family->name);
         return 1;
     }
     if (tp_mirror_target(s)) {
-        snprintf(err, errlen, "restore checkpoint: a tensor-parallel engine does not mirror it");
+        if (err) snprintf(err, errlen, "restore checkpoint: a tensor-parallel engine does not mirror it");
         return 1;
     }
     if (!ops->restore_checkpoint(s, (uint32_t)G.raw())) {
-        snprintf(err, errlen, "restore checkpoint: the installed bank holds no checkpoint at %d", G.raw());
+        if (err) snprintf(err, errlen, "restore checkpoint: the installed bank holds no checkpoint at %d", G.raw());
         return 1;
     }
     return 0;
@@ -1906,6 +2027,9 @@ uint64_t pulsar_session_payload_bytes(pulsar_session *s) { PULSAR_FAMILY_REQUIRE
 int pulsar_session_save_payload(pulsar_session *s, FILE *fp, char *err, size_t errlen) { PULSAR_FAMILY_REQUIRES_S(s, PULSAR_FAMILY_CAP_PAYLOAD, "session payloads", 1); return s ? s->save_payload(fp, err, errlen) : 1; }
 int pulsar_session_load_payload(pulsar_session *s, FILE *fp, uint64_t payload_bytes, char *err, size_t errlen) { PULSAR_FAMILY_REQUIRES_S(s, PULSAR_FAMILY_CAP_PAYLOAD, "session payloads", 1); return s ? s->load_payload(fp, payload_bytes, err, errlen) : 1; }
 /* L334: a segment's span [G_prev, G): G_prev a position (none() is none), G past it. */
+/// @param G_prev the span's start
+/// @param G      the span's end
+/// @return true when both are positions and G > G_prev >= 0
 static bool segment_span_ok(TokPos G_prev, TokPos G) {
     return !G_prev.is_none() && !G.is_none() && G_prev >= TokPos{0} && G > G_prev;
 }
@@ -1920,20 +2044,29 @@ uint64_t pulsar_session_segment_bytes(pulsar_session *s, TokPos G_prev, TokPos G
  * mirrored VERDICTS whose disagreement is a MISS on every rank, never a
  * divergence: the pair stays up and the conversation prefills.  Neither may run
  * inside a mirrored prefill -- the workers read only chunk verdicts there. */
+/// @param s         the session
+/// @param tp        the transport
+/// @param operation names the operation
+/// @param key       the leader's store key
+/// @param err       receives the refusal
+/// @param errlen    bytes of `err`
+/// @return 1 = refused, 0 = go on
 static int tp_segment_refused(pulsar_session *s, pulsar_tp *tp, const char *operation, const char *key,
                               char *err, size_t errlen) {
     if (tp_mirror_worker_drives_nothing(tp, operation, err, errlen) || tp_mirror_dead(tp, err, errlen)) return 1;
     if (s->tp_in_sync) {
-        snprintf(err, errlen, "tp: %s inside a mirrored prefill is not mirrored (the workers are inside the "
+        if (err) snprintf(err, errlen, "tp: %s inside a mirrored prefill is not mirrored (the workers are inside the "
                               "prefill)", operation);
         return 1;
     }
     if (!pulsar_tp_segment_key_ok(key)) {
-        snprintf(err, errlen, "tp: %s: '%.40s' is not a segment key", operation, key ? key : "(null)");
+        if (err) snprintf(err, errlen, "tp: %s: '%.40s' is not a segment key", operation, key ? key : "(null)");
         return 1;
     }
     return 0;
 }
+/** A segment frame's command for the session and key, every other field zero.  @param s the session
+ *  @param key the store key (40 characters, copied)  @return the command */
 static pulsar_tp_segment_command tp_segment_command(const pulsar_session *s, const char *key) {
     pulsar_tp_segment_command c;
     memset(&c, 0, sizeof(c));
@@ -1964,7 +2097,7 @@ int pulsar_session_save_segment(pulsar_session *s, FILE *fp, TokPos G_prev, TokP
     PULSAR_NVTX_FN();
     PULSAR_FAMILY_REQUIRES_S(s, PULSAR_FAMILY_CAP_SEGMENTS, "disk KV segments", 1);
     if (!s || !segment_span_ok(G_prev, G)) {
-        snprintf(err, errlen, "save segment: bad span [%d, %d)", G_prev.raw(), G.raw());
+        if (err) snprintf(err, errlen, "save segment: bad span [%d, %d)", G_prev.raw(), G.raw());
         return 1;
     }
     pulsar_tp *tp = tp_mirror_target(s);
@@ -1984,7 +2117,7 @@ int pulsar_session_save_segment(pulsar_session *s, FILE *fp, TokPos G_prev, TokP
     perr[0] = '\0';
     if (!pulsar_tp_wait_command_status(tp, s->tp_session_id, "kv segment save", &peers, perr, sizeof(perr))) {
         pulsar_tp_mirror_fail_void(tp, "kv segment save", perr);
-        snprintf(err, errlen, "tp: kv segment save: the workers' verdict could not be collected: %s", perr);
+        if (err) snprintf(err, errlen, "tp: kv segment save: the workers' verdict could not be collected: %s", perr);
         return 1;
     }
     if (own != 0) {
@@ -1992,7 +2125,7 @@ int pulsar_session_save_segment(pulsar_session *s, FILE *fp, TokPos G_prev, TokP
         return 1;                                                         /* err: this rank's own reason */
     }
     if (peers != 0) {
-        snprintf(err, errlen, "tp: a worker could not store its copy of segment %.40s (its log names the "
+        if (err) snprintf(err, errlen, "tp: a worker could not store its copy of segment %.40s (its log names the "
                               "reason); the segment is skipped on every rank", key);
         return 1;
     }
@@ -2003,7 +2136,10 @@ int pulsar_session_load_segment(pulsar_session *s, FILE *fp, uint64_t bytes, boo
     PULSAR_NVTX_FN();
     PULSAR_FAMILY_REQUIRES_S(s, PULSAR_FAMILY_CAP_SEGMENTS, "disk KV segments", 1);
     if (G_out) *G_out = TokPos{0};
-    if (!s) { snprintf(err, errlen, "load segment: no session"); return 1; }
+    if (!s) {
+        if (err) snprintf(err, errlen, "load segment: no session");
+        return 1;
+    }
     pulsar_tp *tp = tp_mirror_target(s);
     if (tp && tp_segment_refused(s, tp, "kv segment load", key, err, errlen)) return 1;
     uint32_t G = 0;
@@ -2027,14 +2163,14 @@ int pulsar_session_load_segment(pulsar_session *s, FILE *fp, uint64_t bytes, boo
     perr[0] = '\0';
     if (!pulsar_tp_wait_command_status(tp, s->tp_session_id, "kv segment load", &peers, perr, sizeof(perr))) {
         pulsar_tp_mirror_fail_void(tp, "kv segment load", perr);
-        snprintf(err, errlen, "tp: kv segment load: the workers' verdict could not be collected: %s", perr);
+        if (err) snprintf(err, errlen, "tp: kv segment load: the workers' verdict could not be collected: %s", perr);
         return 1;
     }
     if (peers != 0) {
         /* A MISS: the copy is missing or reached another state.  Nothing is
          * computed on it -- the caller invalidates every rank and drops the
          * chain. */
-        snprintf(err, errlen, "tp: a worker has no matching copy of segment %.40s (its log names why) -- "
+        if (err) snprintf(err, errlen, "tp: a worker has no matching copy of segment %.40s (its log names why) -- "
                               "a miss on every rank", key);
         return 1;
     }

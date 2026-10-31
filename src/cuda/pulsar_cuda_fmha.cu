@@ -1,3 +1,5 @@
+/** @file
+ *  Bidirectional fused attention over f16 rows (L321): pulsar's wrapper of CUTLASS example 41. */
 /* Bidirectional fused attention over f16 rows (L321) -- see pulsar_cuda_fmha.h for the contract. */
 #include "pulsar_cuda_fmha.h"
 
@@ -10,9 +12,13 @@ namespace {
 /* the Sm75 instance: 64 queries x 128 keys a block (measured on the RTX 5000 at a Parse page, 12298 rows x 16 heads of
  * 72: 61.8 ms; 32 x 128 63.6, 64 x 64 134.6, 32 x 64 155.2), heads up to 128 kept in registers (one value iteration),
  * no dropout, no bias */
+/// CUTLASS example 41's AttentionKernel: f16, Sm75, aligned, 64 queries x 128 keys a block, head_dim <= 128, no
+/// dropout, no bias.
 using Attention = AttentionKernel<cutlass::half_t, cutlass::arch::Sm75, true, 64, 128, 128, false, false>;
 static_assert(!Attention::kNeedsOutputAccumulatorBuffer, "the output stays in registers");
 
+/// @param p a pointer.
+/// @return true when p is 16-byte aligned.
 bool aligned16(const void *p) { return ((uintptr_t)p & 15u) == 0; }
 
 }  // namespace

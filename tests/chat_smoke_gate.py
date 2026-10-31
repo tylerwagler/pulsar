@@ -30,7 +30,7 @@ the two phases now have independent, measured liveness rules:
     fflush), covering open + prefill.  Liveness is PROGRESS, not a clock: the
     /proc/<pid>/io read_bytes counter is sampled every LOAD_STALL_WINDOW_S and
     the phase continues while at least MIN_LOAD_PROGRESS_BYTES were really
-    fetched from storage.  MEASURED on sparky (2026-09-12, GB10): after
+    fetched from storage.  MEASURED on the GB10 host (2026-09-12, GB10): after
     `sync; echo 3 > /proc/sys/vm/drop_caches`, a cold load runs at ~1.7 GB/s
     and first-token lands at 29.4 s (total 30.7 s), i.e. ~300 MB per 180 s
     window -- 9x the MIN threshold.  The observed flake rate (92.8 GB while
@@ -54,7 +54,7 @@ model = sys.argv[1]
 binary = sys.argv[2] if len(sys.argv) > 2 else "./pulsar"
 
 # Measured, not guessed (see the header): a real cold load of this artifact on
-# sparky is ~30 s at ~1.7 GB/s.  A load is allowed to be arbitrarily slow as
+# the GB10 host is ~30 s at ~1.7 GB/s.  A load is allowed to be arbitrarily slow as
 # long as it keeps fetching bytes; these thresholds only catch a stall.
 LOAD_STALL_WINDOW_S = 180.0
 MIN_LOAD_PROGRESS_BYTES = 32 * 1024 * 1024   # ~0.18 MB/s sustained floor

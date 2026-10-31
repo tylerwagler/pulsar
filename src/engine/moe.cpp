@@ -1,3 +1,5 @@
+/** @file moe.cpp
+ *  @brief L272 P4c: the routed MoE's one front door, for every family. */
 /* moe.cpp -- L272 P4c: the routed MoE's one front door, for every family.
  *
  * The routed part of an MoE block -- the selected experts' gate / up, the SwiGLU, down, the weighted sum -- is a
@@ -57,6 +59,10 @@ pulsar_moe_arm pulsar_moe_arm_up_only(const pulsar_tensor *up, const pulsar_tens
     return exl3 ? PULSAR_MOE_ARM_ROWS_UP : PULSAR_MOE_ARM_NONE;
 }
 
+/// The refusal line for a routed expert pair with no arm at an activation.
+/// @param gate the gate (or gate_up) weight
+/// @param down the down weight
+/// @param against the activation, in words
 static void say_no_arm(const pulsar_tensor *gate, const pulsar_tensor *down, const char *against) {
     fprintf(stderr, "pulsar: routed MoE: %.*s (%s) with %.*s (%s) has no arm against %s -- refusing\n",
             (int)gate->name.len, gate->name.ptr, tensor_type_name(gate->type), (int)down->name.len, down->name.ptr,
@@ -111,12 +117,16 @@ bool pulsar_moe_routed_slot(const pulsar_moe_slot_call *c) {
 }
 
 /* the call's launch stream (L296 dec2) */
+/// @param c the call
+/// @return its stream as the rows launchers take it
 static pulsar_rows_stream rows_stream(const pulsar_moe_rows_call *c) { return (pulsar_rows_stream)c->stream; }
 
 /* L296 N4: the latent wrapper -- x_lat = bf16(latent_in x); the routed experts on x_lat into lat_f (f32, the block's
  * routed sum on the latent); out = latent_out(bf16(lat_f)).  The two bf16 roundings are the producers' (rule 3): the
  * routed experts read bf16 rows (the latent projection emits them, L296 dec2: the front door's bf16 outputs, lat_f
  * its f32 staging), the back projection reads bf16 rows. */
+/// @param c the call (latent_in / latent_out and the lat_* buffers set, no shared expert)
+/// @return false = refused (said)
 static bool latent_rows(const pulsar_moe_rows_call *c) {
     const pulsar_tensor *Li = c->latent_in, *Lo = c->latent_out;
     if (!Li || !Lo || Li->ndim != 2 || Lo->ndim != 2 || Lo->dim[0] != Li->dim[1] || Lo->dim[1] != Li->dim[0] ||

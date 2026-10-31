@@ -1,3 +1,5 @@
+/** @file
+ *  The output-parser kit's implementation and the shared JSON {"name", "args"} call body. */
 /* out_parse_kit.cpp -- the output-parser kit.  See out_parse_kit.h. */
 #include "out_parse_kit.h"
 
@@ -13,6 +15,9 @@ namespace {
 
 /* Length of the longest suffix of s that is a proper prefix of `marker`: the
  * bytes that must wait for the next chunk before they can be called text. */
+/// @param s      the held bytes
+/// @param marker a marker the current state could take
+/// @return the length of the longest suffix of `s` that is a proper prefix of `marker` (0 if none)
 size_t marker_tail(const std::string &s, const std::string &marker) {
     const size_t m = marker.size();
     for (size_t k = std::min(s.size(), m - 1); k > 0; k--)
@@ -20,17 +25,11 @@ size_t marker_tail(const std::string &s, const std::string &marker) {
     return 0;
 }
 
-uint32_t cp_at(const unsigned char *p, int n) {
-    switch (n) {
-    case 1: return p[0];
-    case 2: return ((uint32_t)(p[0] & 0x1f) << 6) | (p[1] & 0x3f);
-    case 3: return ((uint32_t)(p[0] & 0x0f) << 12) | ((uint32_t)(p[1] & 0x3f) << 6) | (p[2] & 0x3f);
-    default: return ((uint32_t)(p[0] & 0x07) << 18) | ((uint32_t)(p[1] & 0x3f) << 12) |
-                    ((uint32_t)(p[2] & 0x3f) << 6) | (p[3] & 0x3f);
-    }
-}
-
 /* The end of the whole UTF-8 sequences in b[lo, hi): hi, or the start of a sequence hi cuts. */
+/// @param b  the bytes
+/// @param lo the start of the range (a lead byte is not looked for before it)
+/// @param hi one past the range's end
+/// @return `hi`, or the offset of the incomplete sequence `hi` cuts
 size_t utf8_whole_end(const std::string &b, size_t lo, size_t hi) {
     size_t k = hi;
     while (k > lo && ((unsigned char)b[k - 1] & 0xc0) == 0x80) k--;
@@ -86,7 +85,7 @@ void out_parser::emit_text(out_state st, const char *p, size_t n, std::vector<ou
     const unsigned char *u = (const unsigned char *)buf.data();
     for (size_t i = 0; i < buf.size();) {
         int k = utf8_seq_ok(u + i, buf.size() - i);
-        bool space = k && py_isspace(cp_at(u + i, k));
+        bool space = k && py_isspace(utf8_cp_at(u + i, k));
         if (!k) {
             /* an incomplete sequence at the end waits; an invalid byte is text */
             const int want = utf8_seq_len(u[i]);

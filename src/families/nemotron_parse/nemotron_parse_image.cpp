@@ -15,6 +15,9 @@
  *   (align_corners False: Pillow's triangle filter with support max(1, scale), here in double), or adaptive average
  *   pooling when either side is one patch -- then grid_sample'd (bilinear, border, align_corners False; f32, as torch
  *   computes it) at each canvas patch's centre clamped to the content, normalised by the content size. */
+/** @file nemotron_parse_image.cpp
+ *  @brief Parse's page front on the host: the processor's pixels (decode, resize, pad, normalise, patch) and the ViT's
+ *  position rows. */
 #include "nemotron_parse.h"
 #include "engine/exl3_trellis.h"   /* exl3_f32_to_f16: the host f32 -> f16 conversion */
 
@@ -24,6 +27,12 @@
 namespace {
 
 /* torch's _compute_weights_aa for one output index: the taps [xmin, xmin + n) and their normalised weights */
+/** @param i     the output index
+ *  @param in    the input length
+ *  @param out   the output length
+ *  @param xmin  receives the first tap's input index
+ *  @param n     receives the tap count
+ *  @param w     receives the n weights (capacity at least the support's span) */
 void aa_taps(int i, int in, int out, int *xmin, int *n, double *w) {
     const double scale = (double)in / (double)out;
     const double support = scale >= 1.0 ? scale : 1.0, invscale = scale >= 1.0 ? 1.0 / scale : 1.0;
@@ -44,6 +53,12 @@ void aa_taps(int i, int in, int out, int *xmin, int *n, double *w) {
 }
 
 /* the field [G][G][C] (row, column, channel) -> [r][c][C] at the content grid */
+/** @param f    the field, [G][G][C]
+ *  @param G    the field's side
+ *  @param C    the channels (vit_width)
+ *  @param r    the content grid's rows
+ *  @param c    the content grid's columns
+ *  @param out  receives [r][c][C] */
 void resample_field(const std::vector<float> &f, int G, int C, int r, int c, std::vector<float> *out) {
     out->assign((size_t)r * c * C, 0.0f);
     if (r == 1 || c == 1) {   /* adaptive_avg_pool2d: start floor(i G / n), end ceil((i + 1) G / n) */
@@ -85,6 +100,11 @@ void resample_field(const std::vector<float> &f, int G, int C, int r, int c, std
 }
 
 /* one axis of the sampling grid: patch i's centre clamped to the content, normalised, as grid_sample's source index */
+/** @param i          the canvas patch index along the axis
+ *  @param patch      the patch side in pixels
+ *  @param content    the content extent in pixels along the axis
+ *  @param n_content  the content grid's size along the axis
+ *  @return the fractional source index into the content grid, clamped to [0, n_content - 1] */
 float grid_index(uint32_t i, uint32_t patch, uint32_t content, uint32_t n_content) {
     const float start = (float)(i * patch);
     float extent = (float)content - start;
@@ -99,6 +119,13 @@ float grid_index(uint32_t i, uint32_t patch, uint32_t content, uint32_t n_conten
 
 }  // namespace
 
+/** @param s       the shape (canvas, alignment, patch, normalisation)
+ *  @param bytes   the PNG or JPEG
+ *  @param len     its length in bytes
+ *  @param page    receives the geometry and the f16 patch rows
+ *  @param err     the refusal text
+ *  @param errlen  err's capacity in bytes
+ *  @return true = prepared; false = refused (err says why) */
 bool pulsar_nemotron_parse_page_prepare(const pulsar_nemotron_parse_shape *s, const uint8_t *bytes, size_t len,
                                         pulsar_nemotron_parse_page *page, char *err, size_t errlen) {
     uint8_t *rgb = NULL;
@@ -160,6 +187,13 @@ bool pulsar_nemotron_parse_page_prepare(const pulsar_nemotron_parse_shape *s, co
     return true;
 }
 
+/** @param s      the shape (patch, pos_grid, vit_width)
+ *  @param field  the position field, f32 [pos_grid][pos_grid][vit_width]
+ *  @param h      the canvas height in pixels
+ *  @param w      the canvas width in pixels
+ *  @param ch     the content height in pixels
+ *  @param cw     the content width in pixels
+ *  @param out    receives f32 [(h / patch) * (w / patch)][vit_width] */
 void pulsar_nemotron_parse_positions(const pulsar_nemotron_parse_shape *s, const std::vector<float> &field, uint32_t h,
                                      uint32_t w, uint32_t ch, uint32_t cw, std::vector<float> *out) {
     const uint32_t P = s->patch, G = s->pos_grid, C = s->vit_width;

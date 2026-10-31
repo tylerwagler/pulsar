@@ -1,3 +1,5 @@
+/** @file
+ *  The one streaming \<think\> / \</think\> tag scanner for the display tools (CLI, eval TUI, agent). */
 #pragma once
 
 #include <assert.h>
@@ -18,6 +20,10 @@
  * not a byte stream) and are not served by this header. */
 
 /** True when `p[0..n)` starts with the whole of `prefix`. */
+/// @param p      the bytes
+/// @param n      their count
+/// @param prefix the NUL-terminated prefix
+/// @return true when the bytes start with all of `prefix`
 static inline bool bytes_has_prefix(const char *p, size_t n, const char *prefix) {
     const size_t plen = strlen(prefix);
     return n >= plen && memcmp(p, prefix, plen) == 0;
@@ -25,6 +31,10 @@ static inline bool bytes_has_prefix(const char *p, size_t n, const char *prefix)
 
 /** True when `p[0..n)` is a proper (shorter) prefix of `prefix`: more bytes
  * could still complete it. */
+/// @param p      the bytes
+/// @param n      their count
+/// @param prefix the NUL-terminated tag
+/// @return true when the bytes are a proper prefix of `prefix`
 static inline bool bytes_is_partial_prefix(const char *p, size_t n, const char *prefix) {
     const size_t plen = strlen(prefix);
     return n < plen && memcmp(prefix, p, n) == 0;
@@ -56,6 +66,13 @@ struct pulsar_think_scanner {
  * writes `blank_lines_after_close` more newlines (CLI: 0, agent: 1).
  * `finish` (end of generation) releases a held prefix as text: an unfinished
  * "<thi" at the very end is prose. */
+/// @tparam Sink the output sink (contract above)
+/// @param s                       the scanner state
+/// @param text                    the model text
+/// @param len                     bytes of `text`
+/// @param finish                  end of generation: release a held prefix as text
+/// @param blank_lines_after_close newlines written after a close tag, past the line start
+/// @param sink                    receives the text, tags and newlines
 template <class Sink>
 static inline void pulsar_think_scan(pulsar_think_scanner *s, const char *text, size_t len,
                                      bool finish, int blank_lines_after_close, Sink &sink) {

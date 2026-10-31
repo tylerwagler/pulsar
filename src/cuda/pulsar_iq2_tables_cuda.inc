@@ -1,3 +1,5 @@
+/** @file
+ *  IQ2 codebook / sign tables in device constant memory (data only). */
 __device__ __constant__ uint8_t cuda_ksigns_iq2xs[128] = {
       0, 129, 130,   3, 132,   5,   6, 135, 136,   9,  10, 139,  12, 141, 142,  15,
     144,  17,  18, 147,  20, 149, 150,  23,  24, 153, 154,  27, 156,  29,  30, 159,

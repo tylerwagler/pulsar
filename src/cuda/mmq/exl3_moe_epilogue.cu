@@ -1,4 +1,6 @@
 // SPDX-License-Identifier: MIT
+/** @file
+ *  The EXL3 routed MoE's epilogues: the fold and the sum, carrying the format's Hadamard rotations. */
 // The EXL3 routed MoE's epilogues (exl3_moe_epilogue.cuh has the contracts): the fold and the sum carry the
 // Hadamard rotations the format puts on both sides of every projection.  The projections themselves are the
 // tensor-core arms' (exl3_moe_prefill.cuh: the decode arm and the prompt-chunk arm), which write UNROTATED z:
@@ -22,6 +24,27 @@ namespace {
  * up-only fold -- no gate projection (gate_z / gate_table unread), the
  * activation relu(y_u)^2 (pulsar_relu2_elem) with the route weight folded in;
  * every other step is the gated fold's, unchanged. */
+/// The fold (ds4_exl3_moe_fold*_launch).  Grid ceil(pairs * mid_dim / 128 / 8), 256 threads: one warp per
+/// (pair, 128-block of mid).
+/// @param gate_z          gate projection's unrotated z, f32 [pairs][z_stride] (unread when UP_ONLY)
+/// @param up_z            up projection's unrotated z, f32 [pairs][z_stride]
+/// @param z_stride        row stride of gate_z / up_z, floats (mid_dim, or 2 mid_dim for a fused gate_up)
+/// @param selected        expert per pair [pairs]; < 0 skips the pair
+/// @param weights         route weight per pair [pairs]
+/// @param gate_table      gate (or fused gate_up) table: exl3_expert_table()'s [trellis, scales] pointer pairs
+/// @param up_table        up table (the gate_up table for a fused slice)
+/// @param up_svh_off      offset of up's svh in its scales, halves (in_dim, or in_dim + mid_dim fused)
+/// @param down_table      down table (its suh is the down input rotation)
+/// @param in_dim          the gate / up input width
+/// @param mid_dim         the mid width, a multiple of 128
+/// @param pairs           tokens x slots
+/// @param clamp           the SwiGLU clamp (pulsar_swiglu_elem); unused when UP_ONLY
+/// @param mid_q           E4M3 mid [pairs][mid_dim], or NULL
+/// @param mid_sf          the mid's per-32 ue8m0 scales (pulsar_mx_sfoff layout), with mid_q
+/// @param mid_bf16        bf16 mid [pairs][mid_dim], or NULL
+/// @param mid_kbp         the scale plane's k-block pitch (pulsar_mx_sfoff)
+/// @param z_splits        K-split partials to add in split order (1: none)
+/// @param z_split_stride  floats between consecutive splits
 template <bool UP_ONLY>
 __global__ void __launch_bounds__(256)
 exl3_moe_fold_kernel(const float *__restrict__ gate_z,
@@ -116,9 +139,15 @@ exl3_moe_fold_kernel(const float *__restrict__ gate_z,
 
 /* The sum's CTA: up to kSumWarpsMax warps (one per slot, at most), the slots staged up to kSumChunk at a time in
  * dynamic shared memory sized by sum_chunk(n_expert) (a 6-slot router's CTA keeps 6 KiB, not 32). */
+/// Warps per sum CTA at most (one per slot).
 constexpr int kSumWarpsMax = 16;
+/// Slots staged in shared memory per pass at most.
 constexpr int kSumChunk = 32;
+/// @param n_expert  slots per token
+/// @return          slots staged per pass: min(n_expert, kSumChunk)
 __host__ __device__ constexpr int sum_chunk(int n_expert) { return n_expert < kSumChunk ? n_expert : kSumChunk; }
+/// @param chunk  slots staged per pass (sum_chunk)
+/// @return       the sum kernel's dynamic smem: z and svh float4 [chunk][32] each, then int live flags [chunk]
 constexpr size_t sum_smem_bytes(int chunk) { return (size_t)chunk * 32 * 2 * sizeof(float4) + (size_t)chunk * sizeof(int); }
 
 /* One CTA per (token, 128-block of out).  Each slot's chain -- selected -> table -> svh, its split partials added in
@@ -126,6 +155,20 @@ constexpr size_t sum_smem_bytes(int chunk) { return (size_t)chunk * 32 * 2 * siz
  * z and svh in shared memory; warp 0 then sums the slots in slot order, the same fma per element in the same order
  * as one warp walking the slots (L296 dec2: that walk, a few warps each loading slot after slot, was 20 us per
  * decode-step layer). */
+/// The sum (ds4_exl3_moe_sum_launch).  Grid tokens x out_dim / 128, min(n_expert, kSumWarpsMax) warps,
+/// sum_smem_bytes(sum_chunk(n_expert)) dynamic smem.
+/// @param out             f32 [tokens][out_dim], written (not accumulated)
+/// @param down_z          the down projection's unrotated z, f32 [pairs][out_dim]
+/// @param selected        expert per pair; < 0 contributes nothing
+/// @param down_table      down table (its svh after mid_dim halves of suh)
+/// @param mid_dim         the down input width
+/// @param out_dim         output width, a multiple of 128
+/// @param n_expert        slots per token
+/// @param nf_flag         device word set (once, by CAS from 0) to nf_code on a non-finite routed sum
+/// @param nf_code         the code recorded
+/// @param shared          riding shared experts added after the routed sum
+/// @param z_splits        K-split partials of down_z (1: none)
+/// @param z_split_stride  floats between consecutive splits
 __global__ void __launch_bounds__(kSumWarpsMax * 32)
 exl3_moe_sum_kernel(float *__restrict__ out,
                     const float *__restrict__ down_z,

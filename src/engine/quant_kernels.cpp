@@ -1,3 +1,5 @@
+/** @file quant_kernels.cpp
+ *  @brief Required-metadata readers for weight binding and model validation. */
 #include "pulsar_engine_internal.h"
 
 

@@ -1,3 +1,5 @@
+/** @file tp_rows.cpp
+ *  @brief The tensor-parallel row all-reduce and vocab gather. */
 /* The tensor-parallel row all-reduce (4g-2 / v14; family-generic since L266): a step's f32 rows
  * [n_rows][n_embd] summed across the group in place, through the row lane (decode / verify widths over
  * RDMA), the bulk lane (prefill chunks over RDMA), or the host big gate (TCP, and any transport without
@@ -143,6 +145,13 @@ bool pulsar_tp_allreduce_rows(const pulsar_tp_rows *g, uint32_t il, uint32_t n_t
  * the assembled full logits land in `out` [n_rows][n_vocab] in rank order -- every rank ends with the same
  * full rows and samples on its own.  A row-lane pair gathers on the stream; any other transport stages
  * through the host.  The lanes' contract in full is gpu_decode.cpp's tp_vocab_split comment. */
+/// The vocab gather's own-slice scratch size for a group: max_rows rows of this rank's widest vocab range
+/// (ceil(n_vocab / n_ranks) floats), rounded up to whole transport messages.
+/// @param n_ranks   ranks in the group
+/// @param vec_bytes the transport's message size in bytes
+/// @param n_vocab   the vocab width
+/// @param max_rows  the most rows one gather carries
+/// @return bytes
 uint64_t pulsar_tp_vocab_own_bytes_for(uint32_t n_ranks, uint64_t vec_bytes, uint32_t n_vocab, uint32_t max_rows) {
     const uint64_t stride = ((uint64_t)n_vocab + n_ranks - 1u) / n_ranks;
     return ((uint64_t)max_rows * stride * sizeof(float) + vec_bytes - 1u) / vec_bytes * vec_bytes;

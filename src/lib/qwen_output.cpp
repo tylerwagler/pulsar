@@ -1,3 +1,5 @@
+/** @file
+ *  The Qwen3.8-Flash-Next output parser: the output-parser kit's Qwen grammar and its XML tool-call body. */
 /* qwen_output.cpp -- the Qwen3.8-Flash-Next output parser: the output-parser kit's Qwen configuration (its
  * grammar) and Qwen's XML tool-call body.  See qwen_chat.h. */
 #include "qwen_chat.h"

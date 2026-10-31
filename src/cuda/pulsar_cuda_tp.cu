@@ -1,3 +1,5 @@
+/** @file
+ *  Tensor-parallel row-lane kernels: the GPU half of the pair's asynchronous exchange over the mapped slab. */
 /* Tensor-parallel row-lane kernels (L241 4g-2): the GPU half of the pair's
  * asynchronous decode/verify exchange.
  *
@@ -35,6 +37,9 @@
 #include <cuda.h>
 #include <stdint.h>
 
+/// st.release.sys of one u64: every earlier write of this thread is visible system-wide before it.
+/// @param p device (slab-mapped) address
+/// @param v the value
 static __device__ __forceinline__ void tp_st_release_sys(uint64_t *p, uint64_t v) {
     asm volatile("st.release.sys.global.u64 [%0], %1;" :: "l"(p), "l"(v) : "memory");
 }
@@ -42,6 +47,8 @@ static __device__ __forceinline__ void tp_st_release_sys(uint64_t *p, uint64_t v
 /* The combines run behind the stream wait; a set error word means the wait
  * was RELEASED by a failed lane, not satisfied by the peer's rows, so the
  * combine leaves its destination alone.  Block-uniform. */
+/// @param err the lane's mapped error word
+/// @return true when the lane failed (the wait was released, not satisfied): leave the destination alone
 static __device__ __forceinline__ bool tp_lane_failed(const uint32_t *err) {
     return *(const volatile uint32_t *)err != 0u;
 }
@@ -59,6 +66,19 @@ static __device__ __forceinline__ bool tp_lane_failed(const uint32_t *err) {
  * stream, and publishes exactly what the old <<<1,1>>> publish kernel did:
  * desc[1], desc[2], then desc[0] = exch with st.release.sys.  The proxy sees
  * the same descriptor sequence over the same slab bytes. */
+/** Stage + publish.  Grid tp_grid(rows * vec_floats), block 256, no smem; grid-stride over the elements.
+ *  @tparam ADD fold `addend` in first (src = src + addend, addend = 0)
+ *  @param src        device f32 rows [rows][vec_floats]; with ADD, rewritten with the staged sum
+ *  @param addend     device f32 rows like src (ADD only), zeroed
+ *  @param slab       device mapping of the slab
+ *  @param out_off    byte offset of the out-slots in the slab
+ *  @param vec_floats floats a message (one row)
+ *  @param first_msg  the first row's message sequence number (slot (seq - 1) % n_slots)
+ *  @param n_slots    the slot ring's size
+ *  @param rows       rows to stage
+ *  @param desc       the descriptor words: [0] exchange id (written last), [1] first_msg, [2] rows
+ *  @param exch       the exchange id (nonzero)
+ *  @param ticket     device u32 last-block ticket, zero on entry and on exit */
 template <bool ADD>
 static __global__ void tp_stage_publish_kernel(float *src, float *addend, uint8_t *slab,
                                                uint64_t out_off, uint64_t vec_floats,
@@ -90,6 +110,16 @@ static __global__ void tp_stage_publish_kernel(float *src, float *addend, uint8_
     tp_st_release_sys(&desc[0], exch);
 }
 
+/** dst[r][j] = dst[r][j] + peer[r][j] (own first).  Grid tp_grid(rows * vec_floats), block 256; runs behind the
+ *  stream wait and does nothing when the lane failed.
+ *  @param dst        device f32 rows [rows][vec_floats], this rank's partial (in / out)
+ *  @param slab       device mapping of the slab
+ *  @param in_off     byte offset of the in-slots in the slab
+ *  @param vec_floats floats a message (one row)
+ *  @param first_msg  the first row's message sequence number
+ *  @param n_slots    the slot ring's size
+ *  @param rows       rows to combine
+ *  @param err        the lane's mapped error word */
 static __global__ void tp_combine_sum_kernel(float *dst, const uint8_t *slab,
                                              uint64_t in_off, uint64_t vec_floats,
                                              uint64_t first_msg, uint32_t n_slots,
@@ -112,6 +142,21 @@ static __global__ void tp_combine_sum_kernel(float *dst, const uint8_t *slab,
  * e / width, column col0 + e % width of the pitched destination; the own
  * slice is scattered the same way with no wait.  Copies only: the assembled
  * rows hold exactly the bytes the heads wrote. */
+/** The vocab gather's peer half: payload element e = elem0 + i of `msgs` messages to dst[e / width][col0 + e %
+ *  width].  Grid tp_grid(msgs * vec_floats), block 256; behind the stream wait; nothing when the lane failed.
+ *  @param dst        device f32 destination rows, pitch `pitch` floats
+ *  @param slab       device mapping of the slab
+ *  @param in_off     byte offset of the in-slots in the slab
+ *  @param vec_floats floats a message
+ *  @param first_msg  the chunk's first message sequence number
+ *  @param n_slots    the slot ring's size
+ *  @param msgs       messages in this chunk
+ *  @param elem0      payload element the chunk starts at
+ *  @param n_elem     payload elements in all (rows * width); the tail of the last message is ignored
+ *  @param width      the peer's columns a row
+ *  @param pitch      destination row pitch, in floats
+ *  @param col0       the peer's first destination column
+ *  @param err        the lane's mapped error word */
 static __global__ void tp_combine_scatter_kernel(float *dst, const uint8_t *slab,
                                                  uint64_t in_off, uint64_t vec_floats,
                                                  uint64_t first_msg, uint32_t n_slots,
@@ -137,14 +182,34 @@ static __global__ void tp_combine_scatter_kernel(float *dst, const uint8_t *slab
  * belongs to the block whose [elem0, elem0 + rows*width) holds it; both the
  * own copy (from the packed own payload) and the peer's (from the in-slot the
  * row lane landed it in) are written to their columns of the full rows. */
+/// The row-split gather's blocks, by value for tp_combine_gather_blocks_kernel (n of PULSAR_TP_GATHER_BLOCKS_MAX).
 typedef struct {
+    /// per block: the full f32 output rows (device)
     float *dst[PULSAR_TP_GATHER_BLOCKS_MAX];
+    /// per block: its first payload element; elem0[n] = the payload's total elements
     uint64_t elem0[PULSAR_TP_GATHER_BLOCKS_MAX + 1];
+    /// per block: columns each rank owns, per row
     uint64_t width[PULSAR_TP_GATHER_BLOCKS_MAX], pitch[PULSAR_TP_GATHER_BLOCKS_MAX];
+    /** @var pitch
+     *  per block: the output row pitch, in floats */
+    /// per block: the column this rank's own columns start at
     uint64_t own_col0[PULSAR_TP_GATHER_BLOCKS_MAX], peer_col0[PULSAR_TP_GATHER_BLOCKS_MAX];
+    /** @var peer_col0
+     *  per block: the column the peer's columns start at */
+    /// blocks in use
     uint32_t n;
 } tp_gather_blocks_t;
 
+/** The row-split gather's combine: both halves of every block into its destination rows.  Grid tp_grid(total
+ *  payload elements), block 256; behind the stream wait; nothing when the lane failed.
+ *  @param B          the blocks (by value)
+ *  @param own        device f32 own packed payload [B.elem0[B.n]]
+ *  @param slab       device mapping of the slab
+ *  @param in_off     byte offset of the in-slots in the slab
+ *  @param vec_floats floats a message
+ *  @param first_msg  the payload's first message sequence number
+ *  @param n_slots    the slot ring's size
+ *  @param err        the lane's mapped error word */
 static __global__ void tp_combine_gather_blocks_kernel(tp_gather_blocks_t B, const float *own,
                                                        const uint8_t *slab, uint64_t in_off,
                                                        uint64_t vec_floats, uint64_t first_msg,
@@ -166,6 +231,13 @@ static __global__ void tp_combine_gather_blocks_kernel(tp_gather_blocks_t B, con
     }
 }
 
+/** The own half of a gather: packed src [rows][width] to dst[r * pitch + col0 + c].  Grid tp_grid(n_elem), block 256.
+ *  @param dst    device f32 destination rows
+ *  @param src    device f32 packed rows
+ *  @param n_elem rows * width
+ *  @param width  columns a row in src
+ *  @param pitch  destination row pitch, in floats
+ *  @param col0   first destination column */
 static __global__ void tp_scatter_cols_kernel(float *dst, const float *src, uint64_t n_elem,
                                               uint64_t width, uint64_t pitch, uint64_t col0) {
     for (uint64_t e = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x; e < n_elem;
@@ -176,6 +248,11 @@ static __global__ void tp_scatter_cols_kernel(float *dst, const float *src, uint
 }
 
 /* The bulk lane's publish: word 1 = bytes, word 2 = flag | receive buffer. */
+/** <<<1, 1>>>: desc[1] = bytes, desc[2] = word2, then desc[0] = exch with st.release.sys after a system fence.
+ *  @param desc  the descriptor words (slab-mapped)
+ *  @param exch  the exchange id (nonzero)
+ *  @param bytes the exchange's payload bytes
+ *  @param word2 the bulk flag | the receive buffer */
 static __global__ void tp_publish_bulk_kernel(uint64_t *desc, uint64_t exch, uint64_t bytes,
                                               uint64_t word2) {
     __threadfence_system();
@@ -190,6 +267,12 @@ static __global__ void tp_publish_bulk_kernel(uint64_t *desc, uint64_t exch, uin
  * lane's stage kernel does.  On GB10 an SM store into the registered buffer
  * runs at device-memory speed (0.31 ms per 32 MiB) where the copy engine took
  * 0.56 ms, and the fold no longer costs an add pass + a fill pass of its own. */
+/** Bulk stage: out[i] = src[i] (+ addend[i], then addend[i] = 0).  Grid tp_bulk_grid(n), block 256.
+ *  @tparam ADD fold the addend in
+ *  @param out    the mapped bulk out-region (f32)
+ *  @param src    device f32 source
+ *  @param addend device f32 addend (ADD only), zeroed
+ *  @param n      elements */
 template <bool ADD>
 static __global__ void tp_bulk_stage_kernel(float *out, const float *src, float *addend, uint64_t n) {
     for (uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x; i < n;
@@ -207,6 +290,13 @@ static __global__ void tp_bulk_stage_kernel(float *out, const float *src, float 
  * the exchange done), own being this rank's staged partial in the out-region --
  * the all-reduce's own + peer, one add per element, bit-identical to the host
  * big gate it replaces (acc[i] += peer[i]). */
+/** Bulk combine: dst[i] = own[i] + peer[i].  Grid tp_bulk_grid(n), block 256; behind the stream wait; nothing when
+ *  the lane failed.
+ *  @param dst  device f32 destination
+ *  @param own  this rank's staged partial (the out-region)
+ *  @param peer the peer's rows (the mapped receive buffer)
+ *  @param n    elements
+ *  @param err  the lane's mapped error word */
 static __global__ void tp_bulk_combine_sum_kernel(float *dst, const float *own, const float *peer,
                                                   uint64_t n, const uint32_t *err) {
     if (tp_lane_failed(err)) return;
@@ -215,11 +305,15 @@ static __global__ void tp_bulk_combine_sum_kernel(float *dst, const float *own, 
         dst[i] = own[i] + __ldcv(peer + i);
 }
 
+/// @param n elements
+/// @return blocks of 256 threads for the bulk kernels: ceil(n / 256), capped at 2048
 static unsigned tp_bulk_grid(uint64_t n) {
     const uint64_t b = (n + 255u) / 256u;
     return (unsigned)(b > 2048u ? 2048u : b);
 }
 
+/// @param n elements
+/// @return blocks of 256 threads for the row-lane kernels: ceil(n / 256) in 1 .. 256
 static unsigned tp_grid(uint64_t n) {
     const uint64_t b = (n + 255u) / 256u;
     return (unsigned)(b > 256u ? 256u : (b ? b : 1u));
@@ -229,8 +323,11 @@ static unsigned tp_grid(uint64_t n) {
  * libcuda).  pulsar_gpu_tp_wait_init runs at the row lane's bring-up and
  * refuses a device without 64-bit stream memory operations; the lane has no
  * other way to wait. */
+/// cuStreamWaitValue64's signature.
 typedef CUresult (*tp_wait_value_fn)(CUstream, CUdeviceptr, cuuint64_t, unsigned int);
+/// cuDeviceGetAttribute's signature.
 typedef CUresult (*tp_dev_attr_fn)(int *, CUdevice_attribute, CUdevice);
+/// cuStreamWaitValue64, resolved by pulsar_gpu_tp_wait_init; NULL until then.
 static tp_wait_value_fn g_tp_wait_value = NULL;
 
 int pulsar_gpu_tp_wait_init(char *err, size_t errlen) {
@@ -257,6 +354,9 @@ int pulsar_gpu_tp_wait_init(char *err, size_t errlen) {
 
 /* Hold this thread's stream until done >= exch (GEQ compares cyclically, as
  * int64(done - exch) >= 0: the release bit a failed lane ORs in satisfies it). */
+/** @param done_dev the lane's device-mapped done word
+ *  @param exch     the exchange id to wait for
+ *  @return 1 the wait was queued on the per-thread stream, 0 refused (named on stderr) */
 static int tp_stream_wait_done(const void *done_dev, uint64_t exch) {
     if (!g_tp_wait_value) {
         fprintf(stderr, "pulsar: tp row lane stream wait used before pulsar_gpu_tp_wait_init -- refusing\n");
@@ -384,7 +484,15 @@ int pulsar_gpu_tp_combine_gather_blocks(const pulsar_tp_gather_block *blocks, ui
     uint64_t e0 = 0;
     for (uint32_t k = 0; k < n_blocks; k++) {
         const pulsar_tp_gather_block *bk = &blocks[k];
-        if (!bk->dst || bk->width == 0 || bk->elem0 != e0 ||
+        /* the kernel finds an element's block by walking elem0 in order: the blocks must tile the payload
+         * contiguously from 0, in order (the contract above) -- asserted here, by name (L335) */
+        if (bk->elem0 != e0) {
+            fprintf(stderr, "pulsar: tp gather: block %u starts at payload element %llu, not %llu -- the blocks must "
+                            "run contiguously from 0, in order -- refusing\n", k, (unsigned long long)bk->elem0,
+                    (unsigned long long)e0);
+            return 0;
+        }
+        if (!bk->dst || bk->width == 0 ||
             bk->own_col0 + bk->width > bk->pitch || bk->peer_col0 + bk->width > bk->pitch ||
             (uint64_t)rows * bk->pitch * sizeof(float) > bk->dst->bytes) return 0;
         B.dst[k] = (float *)bk->dst->ptr;

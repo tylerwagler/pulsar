@@ -1,3 +1,5 @@
+> **Historical, not maintained** (moved to docs/history/ on 2026-10-30): the L266 Qwen3.8-Flash-Next-on-EXL3 TP pair test kit, about 2026-10-05 (was tools/tp2-l266/README.md; the scripts stay there). The code at the tip of `dev` is the authority.
+
 # L266 on the TP2 pair: test kit
 
 L266 serves **Qwen3.8-Flash-Next on turboderp's EXL3 packs** in pulsar, and step 7 splits it across the pair:
@@ -25,13 +27,13 @@ make -C ~/pulsar-l266 -j20 CUDA_ARCH=sm_120f pulsar-server tests/qwen_generate 2
 
 ## 2. The two containers on both nodes, at the same paths
 
-Built on sparky from turboderp's snapshots plus the HF BF16 checkpoint
+Built on the dev GB10 from turboderp's snapshots plus the HF BF16 checkpoint
 (`tools/container/build.py --recipe format-maps/qwen38fn-turboderp-{4.05,6.05}.json`).
 
 | Container | Size | n-gram rows |
 |---|---|---|
-| `/srv/models/qwen38fn-td405` | 67 GB | `ple-l1.rows`, 102 GB |
-| `/srv/models/qwen38fn-td605` | 98 GB | the same file, hard-linked |
+| `/path/to/models/qwen38fn-td405` | 67 GB | `ple-l1.rows`, 102 GB |
+| `/path/to/models/qwen38fn-td605` | 98 GB | the same file, hard-linked |
 
 Copy each container as a whole (`rsync -aH`, so the rows file stays one inode), to `~/models/` on each node, or
 set `Q405` / `Q605`.

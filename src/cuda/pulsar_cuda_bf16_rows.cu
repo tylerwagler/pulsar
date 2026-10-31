@@ -1,4 +1,6 @@
 // SPDX-License-Identifier: MIT
+/** @file
+ *  BF16 weights against raw bf16 rows: the dense Linear and the routed experts (L295 F7). */
 // L295 F7: BF16 weights against raw bf16 rows -- the dense Linear and the routed experts (contract and arms in
 // pulsar_cuda_bf16_rows.cuh).
 //
@@ -31,31 +33,42 @@
 namespace {
 
 constexpr int kWarps = 8;              ///< 16 weight rows each: 128 outputs a CTA
+/// Weight rows (outputs) one CTA owns: 128.
 constexpr int kOutPerCta = 16 * kWarps;
 constexpr int kStageBytes = 32768;     ///< the staged activation chunk, at most (no opt-in shared memory)
 constexpr int kRoutedNT = 8;           ///< the routed arm's n8 tiles: 64 assignments a work item
 constexpr int kMaxE = 1024;            ///< experts the one-block plan kernel scans
 
 /** Elements of K a chunk stages for NT n8 tiles: kStageBytes over 8 NT rows, a multiple of 64. */
+/// @tparam NT n8 activation tiles per CTA (1, 2 or kRoutedNT).
+/// @return K elements per staged chunk.
 template <int NT> __host__ __device__ constexpr int chunk_k() { return kStageBytes / (8 * NT) / 2 / 64 * 64; }
+/// @tparam NT n8 activation tiles per CTA.
+/// @return Bytes between staged activation rows: chunk_k * 2 + 16, i.e. 16 mod 128 (bank-group spread).
 template <int NT> __host__ __device__ constexpr int stage_stride() { return chunk_k<NT>() * 2 + 16; }   /* 16 mod 128 */
+/// @tparam NT n8 activation tiles per CTA.
+/// @return Dynamic shared memory of one CTA's staged chunk: 8 NT rows x stage_stride.
 template <int NT> __host__ __device__ constexpr size_t stage_bytes() { return (size_t)8 * NT * stage_stride<NT>(); }
 static_assert(stage_bytes<1>() <= 48 * 1024 && stage_bytes<2>() <= 48 * 1024 && stage_bytes<kRoutedNT>() <= 48 * 1024,
               "the staged chunk must fit the default dynamic shared memory");
 
-__device__ __forceinline__ void mma_bf16_16816(float (&d)[4], const uint32_t (&a)[4], uint32_t b0, uint32_t b1) {
-#if PULSAR_SM80
-    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
-                 "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
-                 : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
-                 : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
-#else
-    __trap();
-#endif
-}
 
 /** One CTA's 128 outputs [o0, o0 + 128) of W [out][in] for nr <= 8 NT activation rows: row i of the call is
  *  X[xs(i)] (xs = xidx ? xidx[start + i] : start + i) and lands in Y[yd(i)] (yd likewise from yidx), ld out. */
+/// Launch contract: 256 threads (8 warps x 16 weight rows), `hx` = stage_bytes<NT>() of 16-byte-aligned dynamic
+/// shared memory; `in` a multiple of 64 and W / X rows 16-byte aligned.
+/// @tparam NT n8 activation tiles (nr <= 8 NT).
+/// @param W the weight, bf16 row-major [out][in].
+/// @param out weight rows (output width).
+/// @param in the reduction width K.
+/// @param o0 the CTA's first output.
+/// @param X the activation rows, bf16 [*][in].
+/// @param xidx source row map (NULL: identity from `start`).
+/// @param yidx destination row map (NULL: identity from `start`).
+/// @param start the work item's first schedule index.
+/// @param nr rows in the work item.
+/// @param Y the output, f32 [*][out].
+/// @param hx the staged activation chunk (dynamic shared memory).
 template <int NT>
 __device__ __forceinline__ void rows_tile(const __nv_bfloat16 *__restrict__ W, int out, int in, int o0,
                                           const __nv_bfloat16 *__restrict__ X, const int32_t *__restrict__ xidx,
@@ -106,7 +119,7 @@ __device__ __forceinline__ void rows_tile(const __nv_bfloat16 *__restrict__ W, i
                 for (int s = 0; s < 4; ++s) {
                     const uint32_t af[4] = {A0[2 * s], A1[2 * s], A0[2 * s + 1], A1[2 * s + 1]};
                     float d[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-                    mma_bf16_16816(d, af, B[2 * s], B[2 * s + 1]);
+                    pulsar_mma_bf16_16816(d, af, B[2 * s], B[2 * s + 1]);
 #pragma unroll
                     for (int e = 0; e < 4; ++e) acc[j][e] += d[e];
                 }
@@ -127,6 +140,14 @@ __device__ __forceinline__ void rows_tile(const __nv_bfloat16 *__restrict__ W, i
 }
 
 /* The dense Linear: one work item, the call's rows 0 .. nr - 1. */
+/// Grid ceil(out / 128), 256 threads, stage_bytes<NT>() dynamic shared memory: Y [nr][out] f32 = X W^T.
+/// @tparam NT n8 activation tiles (nr <= 8 NT).
+/// @param W the weight, bf16 [out][in].
+/// @param out output width.
+/// @param in input width (a multiple of 64).
+/// @param X the rows, bf16 [nr][in].
+/// @param nr rows.
+/// @param Y the output, f32 [nr][out].
 template <int NT>
 __global__ void __launch_bounds__(32 * kWarps)
 bf16_rows_dense_kernel(const __nv_bfloat16 *__restrict__ W, int out, int in, const __nv_bfloat16 *__restrict__ X,
@@ -215,6 +236,9 @@ bf16_moe_sum_kernel(const float *__restrict__ dz, const int32_t *__restrict__ se
 }
 #endif
 
+/// Checks the last launch, naming a failure on stderr.
+/// @param what the launch's name.
+/// @return true when no error is pending.
 bool launch_ok(const char *what) {
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) {
@@ -224,6 +248,8 @@ bool launch_ok(const char *what) {
     return true;
 }
 
+/// @param p a pointer.
+/// @return true when p is 16-byte aligned.
 bool aligned16(const void *p) { return ((uintptr_t)p & 15u) == 0; }
 
 } // namespace

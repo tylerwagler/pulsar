@@ -1,4 +1,6 @@
 // SPDX-License-Identifier: MIT
+/** @file
+ *  The EXL3 dense-Linear arm's contract: one trellis-coded weight against M bf16 rows, a complete output. */
 // The EXL3 dense-Linear arm (L251): one trellis-coded weight, M activation rows,
 // a COMPLETE output -- y = svh * H128( W_hat^T H128(suh * x) ) per row, the
 // format's whole factorization (src/engine/exl3_trellis.h).
@@ -46,17 +48,26 @@
 
 /** True when `k2` (rate in half-bit units) is a rate the dense arm
  *  instantiates: exl3_arm_has_rate(EXL3_ARM_DENSE), K = 2, 3, 4, 5, 6, 8. */
+/// @param k2 the rate in half-bit units (2 x bits per weight).
+/// @return true when the arm instantiates the rate.
 bool ds4_exl3_dense_rate_supported(int k2);
 
 /** Workspace bytes ds4_exl3_dense_launch needs for (M, K, N): the split
  *  partials (at the stored width) and the prep planes of min(M, 16) rows
  *  (decode rows past 16 reuse them a block at a time; a prompt chunk's prefill
  *  GEMM needs none).  0 for a shape the arm refuses. */
+/// @param M activation rows.
+/// @param K input width (a multiple of 128).
+/// @param N logical output width (a multiple of 4).
+/// @return bytes, or 0 for a refused shape.
 size_t ds4_exl3_dense_workspace_bytes(int M, int K, int N);
 
 /** The number of K splits the arm uses for (K, N) -- a function of the weight's
  *  (stored) shape alone, which is what keeps every row M-independent.  0 on a
  *  refused shape. */
+/// @param K input width (a multiple of 128).
+/// @param N logical output width (a multiple of 4).
+/// @return the split count, or 0 for a refused shape.
 int ds4_exl3_dense_splits(int K, int N);
 
 /** y [M][N] f32 = the complete Linear.  `w` is the [trellis | suh | svh] slice
@@ -69,6 +80,18 @@ int ds4_exl3_dense_splits(int K, int N);
  *  least ds4_exl3_dense_workspace_bytes(M, K, N).  Two kernels on `stream`
  *  (the prep, the GEMV with its epilogue); refuses (returns -1) on any contract violation, -3 on a
  *  launch failure. */
+/// @param w the [trellis | suh | svh] slice, device, 16-byte aligned.
+/// @param k2 the rate in half-bit units (2 x bits per weight).
+/// @param xb the bf16 input rows, [M][K], 8-byte aligned.
+/// @param y out: f32 [M][N].
+/// @param M activation rows.
+/// @param K input width (a multiple of 128).
+/// @param N logical output width (a multiple of 4).
+/// @param workspace device workspace, 16-byte aligned.
+/// @param workspace_bytes bytes of workspace.
+/// @param stream the stream.
+/// @param prompt the rows are a prompt chunk (the prefill GEMM), else decode rows (the GEMV).
+/// @return 0, -1 refused, -3 launch failure.
 int ds4_exl3_dense_launch(
     const void   * w,
     int            k2,
@@ -89,6 +112,16 @@ int ds4_exl3_dense_launch(
  *  (trellis | suh[K] | svh[stored N], exl3_linear_layout); writes y [M][N] finished (output rotation and svh
  *  applied), N the logical width.
  *  ds4_exl3_dense_launch calls it for prompt chunks. */
+/// @param w the [trellis | suh | svh] slice, device, 16-byte aligned.
+/// @param k2 the rate in half-bit units (2 x bits per weight).
+/// @param x_bf16 the bf16 input rows, [M][K].
+/// @param y out: f32 [M][N].
+/// @param M activation rows.
+/// @param K input width (a multiple of 128).
+/// @param N logical output width (a multiple of 4).
+/// @param trellis_bytes bytes of the slice's trellis plane (suh follows it).
+/// @param stream the stream.
+/// @return 0, -1 refused, -3 launch failure.
 int qwen_exl3_dense_prefill_launch(const void *w, int k2, const void *x_bf16, float *y, int M, int K, int N,
                                    uint64_t trellis_bytes, cudaStream_t stream);
 
@@ -100,15 +133,25 @@ int qwen_exl3_dense_prefill_launch(const void *w, int k2, const void *x_bf16, fl
  *  aligned) -- the epilogue emits the bf16 rows the f32 output rounds to (round to nearest even), for a consumer
  *  that reads bf16; a prompt chunk refuses yb. */
 struct ds4_exl3_dense_proj {
+    /// The [trellis | suh | svh] slice, device, 16-byte aligned (exl3_linear_layout).
     const void *w;
+    /// Rate: 2 x bits per weight (4, 6, 8, 10, 12 or 16).
     int         k2;
+    /// Logical output width (a multiple of 4; stored at its 128 multiple).
     int         N;
+    /// f32 output [M][N], 16-byte aligned, or NULL when yb is set.
     float      *y;
+    /// bf16 output [M][N] (decode rows only), 8-byte aligned, or NULL.
     uint16_t   *yb;
 };
 
 /** Workspace bytes ds4_exl3_dense_multi_launch needs for these projections at (M, K): the sum of each one's
  *  ds4_exl3_dense_workspace_bytes(M, K, N).  0 for a set the arm refuses. */
+/// @param p the projections, [n].
+/// @param n projections (1 .. DS4_EXL3_DENSE_MAX_PROJ).
+/// @param M activation rows.
+/// @param K input width (a multiple of 128).
+/// @return bytes, or 0 for a refused set.
 size_t ds4_exl3_dense_multi_workspace_bytes(const ds4_exl3_dense_proj *p, int n, int M, int K);
 
 /** n (1..DS4_EXL3_DENSE_MAX_PROJ) projections of ONE input xb [M][K] bf16 (L288 exl3-dense: a GDN block's
@@ -117,5 +160,15 @@ size_t ds4_exl3_dense_multi_workspace_bytes(const ds4_exl3_dense_proj *p, int n,
  *  it alone.  Prompt chunks take the prefill GEMM, once per projection; decode rows past 16 run 16-row blocks in
  *  turn.  ds4_exl3_dense_launch is the
  *  n = 1 call. */
+/// @param p the projections, [n].
+/// @param n projections (1 .. DS4_EXL3_DENSE_MAX_PROJ).
+/// @param xb the bf16 input rows, [M][K], 8-byte aligned.
+/// @param M activation rows.
+/// @param K input width (a multiple of 128).
+/// @param workspace device workspace, 16-byte aligned.
+/// @param workspace_bytes bytes of workspace.
+/// @param stream the stream.
+/// @param prompt the rows are a prompt chunk (the prefill GEMM), else decode rows (the GEMV).
+/// @return 0, -1 refused, -3 launch failure.
 int ds4_exl3_dense_multi_launch(const ds4_exl3_dense_proj *p, int n, const void *xb, int M, int K, void *workspace,
                                 size_t workspace_bytes, cudaStream_t stream, bool prompt = false);

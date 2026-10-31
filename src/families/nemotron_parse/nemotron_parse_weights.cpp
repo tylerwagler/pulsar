@@ -14,6 +14,8 @@
  * every token's string -- an added token's content or the vocabulary's -- becomes the bytes its characters stand for
  * in the GPT-2 byte map, or, when one character has no byte (a space, a newline), its UTF-8 as is; the bytes of the
  * whole sequence are then read as UTF-8, each maximal invalid subsequence one U+FFFD. */
+/** @file nemotron_parse_weights.cpp
+ *  @brief Parse's weights bound by role, and its decode table read from tokenizer.json. */
 #include "nemotron_parse.h"
 #include "lib/pyjson.h"
 
@@ -22,13 +24,21 @@
 
 namespace {
 
+/// The binder's owner name and every refusal's prefix.
 const char *const OWNER = PULSAR_NEMOTRON_PARSE_ARCH;
 
+/// Read as stored: f32 only (norms, biases, class tokens, the position field).
 const pulsar_role_admit A_F32 = {PULSAR_ROLE_PLAIN(PULSAR_TENSOR_F32), false, PULSAR_ROLE_DENSE, 0};
+/// Read as stored: f16 only (the embedding / tied head).
 const pulsar_role_admit A_F16 = {PULSAR_ROLE_PLAIN(PULSAR_TENSOR_F16), false, PULSAR_ROLE_DENSE, 0};
+/// A dense linear at f16 or bf16 operand rows (the f16 rows arm).
 const pulsar_role_admit A_LINEAR = {0, true, PULSAR_ROLE_DENSE,
                                     PULSAR_ACTS(PULSAR_ACT_ROWS_F16) | PULSAR_ACTS(PULSAR_ACT_ROWS_BF16)};
 
+/** Read a whole file.
+ *  @param path  the file
+ *  @param out   receives its bytes (cleared first)
+ *  @return false when the file cannot be opened or a read fails */
 bool read_text(const std::string &path, std::string *out) {
     FILE *f = fopen(path.c_str(), "rb");
     if (!f) return false;
@@ -42,6 +52,7 @@ bool read_text(const std::string &path, std::string *out) {
 }
 
 /* GPT-2's byte map, reversed: code point -> byte, -1 for a code point that stands for no byte */
+/** @param map  receives, for each code point below 512, the byte it stands for, or -1 */
 void byte_of_cp(int map[512]) {
     for (int i = 0; i < 512; i++) map[i] = -1;
     int n = 0;
@@ -52,6 +63,9 @@ void byte_of_cp(int map[512]) {
 }
 
 /* one UTF-8 code point at s[i..], or -1 */
+/** @param s  the string
+ *  @param i  the byte offset; advanced past the code point on success
+ *  @return the code point, or -1 (a bad lead byte or a truncated sequence; i unchanged) */
 int next_cp(const std::string &s, size_t *i) {
     const unsigned char c = (unsigned char)s[*i];
     int n = c < 0x80 ? 1 : (c >> 5) == 6 ? 2 : (c >> 4) == 14 ? 3 : (c >> 3) == 30 ? 4 : 0;
@@ -63,6 +77,9 @@ int next_cp(const std::string &s, size_t *i) {
 }
 
 /* a token's string through ByteLevel's decode_chain */
+/** @param t    the token's string (UTF-8)
+ *  @param map  byte_of_cp's table
+ *  @return the bytes it stands for, or t itself when any character stands for no byte */
 std::string byte_level(const std::string &t, const int map[512]) {
     std::string out;
     for (size_t i = 0; i < t.size();) {
@@ -144,6 +161,9 @@ bool pulsar_nemotron_parse_bind(const pulsar_model *m, pulsar_nemotron_parse_mod
     return true;
 }
 
+/** @param w           the family state: its shape is read; vocab (owned, deleted by unload) and prompt_ids are written
+ *  @param model_path  the container's directory, or a shard path inside it
+ *  @return true = loaded; false = refused (said) */
 bool pulsar_nemotron_parse_load_vocab(pulsar_nemotron_parse_model *w, const char *model_path) {
     std::string dir = model_path ? model_path : "";
     struct stat st;
@@ -218,6 +238,12 @@ bool pulsar_nemotron_parse_load_vocab(pulsar_nemotron_parse_model *w, const char
     return true;
 }
 
+/** @param v       the decode table (its added tokens)
+ *  @param text    the prompt (NULL = empty, which refuses)
+ *  @param ids     receives the ids, longest added token first at each byte (cleared first)
+ *  @param err     the refusal text
+ *  @param errlen  err's capacity in bytes
+ *  @return true = encoded; false = a byte begins no added token, or the prompt is empty */
 bool pulsar_nemotron_parse_encode_prompt(const pulsar_nemotron_parse_vocab *v, const char *text, std::vector<int> *ids,
                                           char *err, size_t errlen) {
     ids->clear();
@@ -244,6 +270,10 @@ bool pulsar_nemotron_parse_encode_prompt(const pulsar_nemotron_parse_vocab *v, c
     return true;
 }
 
+/** @param v    the decode table
+ *  @param ids  the ids (an id outside the table is skipped)
+ *  @param n    their count
+ *  @return the text, UTF-8 with each maximal invalid subsequence replaced by U+FFFD */
 std::string pulsar_nemotron_parse_decode(const pulsar_nemotron_parse_vocab *v, const int *ids, size_t n) {
     std::string raw;
     for (size_t i = 0; i < n; i++)

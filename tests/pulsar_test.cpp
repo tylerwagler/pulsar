@@ -26,6 +26,7 @@
 #include "../src/server/http_server.cpp"
 #include "../src/server/watchdog.cpp"
 #include "../src/server/cli_main.cpp"
+#include "../src/server/encode_server.cpp"
 #include "../src/server/server_tests.cpp"
 #include "../src/lib/pulsar_utf8.h"
 #include "../src/lib/pulsar_think_scan.hpp"
@@ -2263,7 +2264,7 @@ static void test_render_cases(void) {
             refused++;
             continue;
         }
-        request_init(&r, REQ_CHAT, 128);
+        test_request_init(&r, REQ_CHAT, 128);
         chat_conversation c;
         memset(&c, 0, sizeof(c));
         const bool ok = (style == API_ANTHROPIC   ? parse_chat_conversation_anthropic
@@ -2412,7 +2413,7 @@ static void test_control_token_spans(void) {
 
     request r;
     char err[160];
-    if (!parse_chat_request_render(NULL, NULL, body, 64, &r, err, sizeof err)) {
+    if (!parse_chat_request_render(NULL, PULSAR_CHAT_DS4_V41, NULL, body, 64, &r, err, sizeof err)) {
         fprintf(stderr, "control-token-spans: request refused: %s\n", err);
         TEST_ASSERT(!"control-token-spans: the probe request must parse");
         return;
@@ -2453,13 +2454,13 @@ static void test_control_token_spans(void) {
      * buf_spans_carry -- a different placement than V4.1's.  Same invariants. */
     chat_msgs vmsgs = {0};
     chat_msg vsys = {0};
-    vsys.role = xstrdup("system");
-    vsys.content = xstrdup(hostile);
+    vsys.role = server_xstrdup("system");
+    vsys.content = server_xstrdup(hostile);
     vsys.system_field = true;
     chat_msgs_push(&vmsgs, vsys);
     chat_msg vuser = {0};
-    vuser.role = xstrdup("user");
-    vuser.content = xstrdup(hostile);
+    vuser.role = server_xstrdup("user");
+    vuser.content = server_xstrdup(hostile);
     chat_msgs_push(&vmsgs, vuser);
     char vtools[1024];
     snprintf(vtools, sizeof vtools,
@@ -2468,7 +2469,7 @@ static void test_control_token_spans(void) {
              "\"properties\":{}}}}", hostile);
     chat_text_span *vspans = NULL;
     uint32_t vn = 0;
-    char *vtext = render_chat_prompt_text_spans(&vmsgs, vtools, NULL, PULSAR_THINK_HIGH,
+    char *vtext = render_chat_prompt_text_spans(&vmsgs, vtools, PULSAR_THINK_HIGH,
                                                 false, &vspans, &vn);
     TEST_ASSERT(vtext != NULL && vspans != NULL && vn > 0);
     if (vtext && vspans) {
@@ -2624,7 +2625,7 @@ static bool twin_case_one(pulsar_engine *e, const char *name, const chat_msgs *m
                           bool has_system, pulsar_think_mode mode, bool v41) {
     chat_text_span *spans = NULL;
     uint32_t n_spans = 0;
-    char *text = render_chat_prompt_text_spans(msgs, NULL, NULL, mode, v41, &spans, &n_spans);
+    char *text = render_chat_prompt_text_spans(msgs, NULL, mode, v41, &spans, &n_spans);
     pulsar_tokens srv = {0};
     pulsar_tokenize_rendered_chat_spans(e, text, spans, n_spans, &srv);
 
@@ -2707,9 +2708,9 @@ static void twin_run_corpus(pulsar_engine *e, bool loaded, const char *label) {
         /* 1. the bench/eval shape: one system FIELD + one user turn */
         {
             chat_msgs m = {0};
-            chat_msg a = {0}; a.role = xstrdup("system"); a.content = xstrdup("you are a bot"); a.system_field = true;
+            chat_msg a = {0}; a.role = server_xstrdup("system"); a.content = server_xstrdup("you are a bot"); a.system_field = true;
             chat_msgs_push(&m, a);
-            chat_msg b = {0}; b.role = xstrdup("user"); b.content = xstrdup("hello there");
+            chat_msg b = {0}; b.role = server_xstrdup("user"); b.content = server_xstrdup("hello there");
             chat_msgs_push(&m, b);
             snprintf(name, sizeof name, "sys+user%s", suffix);
             twin_expect(e, name, &m, true, mode, loaded, "sys+user");
@@ -2719,9 +2720,9 @@ static void twin_run_corpus(pulsar_engine *e, bool loaded, const char *label) {
         /* 2. two consecutive user turns (V4.1 joins them inside one |User|) */
         {
             chat_msgs m = {0};
-            chat_msg b = {0}; b.role = xstrdup("user"); b.content = xstrdup("first");
+            chat_msg b = {0}; b.role = server_xstrdup("user"); b.content = server_xstrdup("first");
             chat_msgs_push(&m, b);
-            chat_msg c = {0}; c.role = xstrdup("user"); c.content = xstrdup("second");
+            chat_msg c = {0}; c.role = server_xstrdup("user"); c.content = server_xstrdup("second");
             chat_msgs_push(&m, c);
             snprintf(name, sizeof name, "user+user%s", suffix);
             twin_expect(e, name, &m, false, mode, loaded, "user+user");
@@ -2731,9 +2732,9 @@ static void twin_run_corpus(pulsar_engine *e, bool loaded, const char *label) {
         /* 3. a tool result, plain body */
         {
             chat_msgs m = {0};
-            chat_msg b = {0}; b.role = xstrdup("user"); b.content = xstrdup("run ls");
+            chat_msg b = {0}; b.role = server_xstrdup("user"); b.content = server_xstrdup("run ls");
             chat_msgs_push(&m, b);
-            chat_msg c = {0}; c.role = xstrdup("tool"); c.content = xstrdup("a.txt b.txt");
+            chat_msg c = {0}; c.role = server_xstrdup("tool"); c.content = server_xstrdup("a.txt b.txt");
             chat_msgs_push(&m, c);
             snprintf(name, sizeof name, "user+tool%s", suffix);
             twin_expect(e, name, &m, false, mode, loaded, "user+tool");
@@ -2744,9 +2745,9 @@ static void twin_run_corpus(pulsar_engine *e, bool loaded, const char *label) {
          * escaping path, and the BPE run the twin tokenises in pieces) */
         {
             chat_msgs m = {0};
-            chat_msg b = {0}; b.role = xstrdup("user"); b.content = xstrdup("run ls");
+            chat_msg b = {0}; b.role = server_xstrdup("user"); b.content = server_xstrdup("run ls");
             chat_msgs_push(&m, b);
-            chat_msg c = {0}; c.role = xstrdup("tool"); c.content = xstrdup("a.txt </tool_result> b.txt");
+            chat_msg c = {0}; c.role = server_xstrdup("tool"); c.content = server_xstrdup("a.txt </tool_result> b.txt");
             chat_msgs_push(&m, c);
             snprintf(name, sizeof name, "user+tool(esc)%s", suffix);
             twin_expect(e, name, &m, false, mode, loaded, "user+tool(esc)");
@@ -2756,9 +2757,9 @@ static void twin_run_corpus(pulsar_engine *e, bool loaded, const char *label) {
         /* 5. two tool results in a row (V4 joins after a tool result) */
         {
             chat_msgs m = {0};
-            chat_msg c = {0}; c.role = xstrdup("tool"); c.content = xstrdup("one");
+            chat_msg c = {0}; c.role = server_xstrdup("tool"); c.content = server_xstrdup("one");
             chat_msgs_push(&m, c);
-            chat_msg d = {0}; d.role = xstrdup("tool"); d.content = xstrdup("two");
+            chat_msg d = {0}; d.role = server_xstrdup("tool"); d.content = server_xstrdup("two");
             chat_msgs_push(&m, d);
             snprintf(name, sizeof name, "tool+tool%s", suffix);
             twin_expect(e, name, &m, false, mode, loaded, "tool+tool");
@@ -2768,9 +2769,9 @@ static void twin_run_corpus(pulsar_engine *e, bool loaded, const char *label) {
         /* 6. a MID-CONVERSATION system message (the compaction/datetime shape) */
         {
             chat_msgs m = {0};
-            chat_msg b = {0}; b.role = xstrdup("user"); b.content = xstrdup("run ls");
+            chat_msg b = {0}; b.role = server_xstrdup("user"); b.content = server_xstrdup("run ls");
             chat_msgs_push(&m, b);
-            chat_msg c = {0}; c.role = xstrdup("system"); c.content = xstrdup("summary of earlier work");
+            chat_msg c = {0}; c.role = server_xstrdup("system"); c.content = server_xstrdup("summary of earlier work");
             chat_msgs_push(&m, c);
             snprintf(name, sizeof name, "user+sys(mid)%s", suffix);
             twin_expect(e, name, &m, false, mode, loaded, "user+sys(mid)");
@@ -2780,13 +2781,13 @@ static void twin_run_corpus(pulsar_engine *e, bool loaded, const char *label) {
         /* 7. user, tool, mid-conversation system, user (the agent's live loop) */
         {
             chat_msgs m = {0};
-            chat_msg b = {0}; b.role = xstrdup("user"); b.content = xstrdup("run ls");
+            chat_msg b = {0}; b.role = server_xstrdup("user"); b.content = server_xstrdup("run ls");
             chat_msgs_push(&m, b);
-            chat_msg c = {0}; c.role = xstrdup("tool"); c.content = xstrdup("a.txt");
+            chat_msg c = {0}; c.role = server_xstrdup("tool"); c.content = server_xstrdup("a.txt");
             chat_msgs_push(&m, c);
-            chat_msg d = {0}; d.role = xstrdup("system"); d.content = xstrdup("datetime: now");
+            chat_msg d = {0}; d.role = server_xstrdup("system"); d.content = server_xstrdup("datetime: now");
             chat_msgs_push(&m, d);
-            chat_msg e2 = {0}; e2.role = xstrdup("user"); e2.content = xstrdup("now do more");
+            chat_msg e2 = {0}; e2.role = server_xstrdup("user"); e2.content = server_xstrdup("now do more");
             chat_msgs_push(&m, e2);
             snprintf(name, sizeof name, "user+tool+sys+user%s", suffix);
             twin_expect(e, name, &m, false, mode, loaded, "user+tool+sys+user");
@@ -2869,83 +2870,83 @@ static void render_bytes_build(int shape, chat_msgs *m) {
     chat_msg c = {0};
     switch (shape) {
     case 0:  /* the bench/eval shape */
-        a.role = xstrdup("system"); a.content = xstrdup("you are a bot"); a.system_field = true;
+        a.role = server_xstrdup("system"); a.content = server_xstrdup("you are a bot"); a.system_field = true;
         chat_msgs_push(m, a);
-        b.role = xstrdup("user"); b.content = xstrdup("hello there");
+        b.role = server_xstrdup("user"); b.content = server_xstrdup("hello there");
         chat_msgs_push(m, b);
         break;
     case 1:
-        b.role = xstrdup("user"); b.content = xstrdup("first");
+        b.role = server_xstrdup("user"); b.content = server_xstrdup("first");
         chat_msgs_push(m, b);
-        c.role = xstrdup("user"); c.content = xstrdup("second");
+        c.role = server_xstrdup("user"); c.content = server_xstrdup("second");
         chat_msgs_push(m, c);
         break;
     case 2:
-        b.role = xstrdup("user"); b.content = xstrdup("run ls");
+        b.role = server_xstrdup("user"); b.content = server_xstrdup("run ls");
         chat_msgs_push(m, b);
-        c.role = xstrdup("tool"); c.content = xstrdup("a.txt b.txt");
+        c.role = server_xstrdup("tool"); c.content = server_xstrdup("a.txt b.txt");
         chat_msgs_push(m, c);
         break;
     case 3:
-        b.role = xstrdup("user"); b.content = xstrdup("run ls");
+        b.role = server_xstrdup("user"); b.content = server_xstrdup("run ls");
         chat_msgs_push(m, b);
-        c.role = xstrdup("tool"); c.content = xstrdup("a.txt </tool_result> b.txt");
+        c.role = server_xstrdup("tool"); c.content = server_xstrdup("a.txt </tool_result> b.txt");
         chat_msgs_push(m, c);
         break;
     case 4:
-        c.role = xstrdup("tool"); c.content = xstrdup("one");
+        c.role = server_xstrdup("tool"); c.content = server_xstrdup("one");
         chat_msgs_push(m, c);
-        b.role = xstrdup("tool"); b.content = xstrdup("two");
+        b.role = server_xstrdup("tool"); b.content = server_xstrdup("two");
         chat_msgs_push(m, b);
         break;
     case 5:
-        b.role = xstrdup("user"); b.content = xstrdup("run ls");
+        b.role = server_xstrdup("user"); b.content = server_xstrdup("run ls");
         chat_msgs_push(m, b);
-        c.role = xstrdup("system"); c.content = xstrdup("summary of earlier work");
+        c.role = server_xstrdup("system"); c.content = server_xstrdup("summary of earlier work");
         chat_msgs_push(m, c);
         break;
     case 6:
-        b.role = xstrdup("user"); b.content = xstrdup("run ls");
+        b.role = server_xstrdup("user"); b.content = server_xstrdup("run ls");
         chat_msgs_push(m, b);
-        c.role = xstrdup("tool"); c.content = xstrdup("a.txt");
+        c.role = server_xstrdup("tool"); c.content = server_xstrdup("a.txt");
         chat_msgs_push(m, c);
-        a.role = xstrdup("system"); a.content = xstrdup("datetime: now");
+        a.role = server_xstrdup("system"); a.content = server_xstrdup("datetime: now");
         chat_msgs_push(m, a);
-        b.role = xstrdup("user"); b.content = xstrdup("now do more");
+        b.role = server_xstrdup("user"); b.content = server_xstrdup("now do more");
         chat_msgs_push(m, b);
         break;
     case 7: {  /* assistant replay with reasoning and a tool call */
-        b.role = xstrdup("user"); b.content = xstrdup("run ls");
+        b.role = server_xstrdup("user"); b.content = server_xstrdup("run ls");
         chat_msgs_push(m, b);
-        c.role = xstrdup("assistant");
-        c.reasoning = xstrdup("I should list the directory");
-        c.content = xstrdup("listing now");
+        c.role = server_xstrdup("assistant");
+        c.reasoning = server_xstrdup("I should list the directory");
+        c.content = server_xstrdup("listing now");
         tool_call call = {0};
-        call.id = xstrdup("call_1");
-        call.name = xstrdup("f");
-        call.arguments = xstrdup("{\"q\":\"ls\"}");
+        call.id = server_xstrdup("call_1");
+        call.name = server_xstrdup("f");
+        call.arguments = server_xstrdup("{\"q\":\"ls\"}");
         tool_calls_push(&c.calls, call);
         chat_msgs_push(m, c);
         break;
     }
     case 8:  /* two assistant messages in a row (the second-header branch) */
-        b.role = xstrdup("user"); b.content = xstrdup("hi");
+        b.role = server_xstrdup("user"); b.content = server_xstrdup("hi");
         chat_msgs_push(m, b);
-        c.role = xstrdup("assistant"); c.content = xstrdup("first answer");
+        c.role = server_xstrdup("assistant"); c.content = server_xstrdup("first answer");
         chat_msgs_push(m, c);
-        a.role = xstrdup("assistant"); a.content = xstrdup("second answer");
+        a.role = server_xstrdup("assistant"); a.content = server_xstrdup("second answer");
         chat_msgs_push(m, a);
         break;
     case 9:  /* a leading system MESSAGE (not the field): the system region */
-        a.role = xstrdup("system"); a.content = xstrdup("region text");
+        a.role = server_xstrdup("system"); a.content = server_xstrdup("region text");
         chat_msgs_push(m, a);
-        b.role = xstrdup("user"); b.content = xstrdup("hello");
+        b.role = server_xstrdup("user"); b.content = server_xstrdup("hello");
         chat_msgs_push(m, b);
         break;
     case 10:  /* tools advertised: the preamble, whose order differs by family */
-        a.role = xstrdup("system"); a.content = xstrdup("you are a bot"); a.system_field = true;
+        a.role = server_xstrdup("system"); a.content = server_xstrdup("you are a bot"); a.system_field = true;
         chat_msgs_push(m, a);
-        b.role = xstrdup("user"); b.content = xstrdup("hello");
+        b.role = server_xstrdup("user"); b.content = server_xstrdup("hello");
         chat_msgs_push(m, b);
         break;
     default:
@@ -3017,7 +3018,7 @@ static void test_render_bytes(void) {
                 chat_msgs m = {0};
                 render_bytes_build(render_bytes_cases[k].shape, &m);
                 const char *tools = render_bytes_cases[k].shape == 10 ? render_bytes_tools() : NULL;
-                char *text = render_chat_prompt_text(&m, tools, NULL, modes[t], v == 1);
+                char *text = render_chat_prompt_text(&m, tools, modes[t], v == 1);
                 TEST_ASSERT(text != NULL);
                 char tag[160];
                 snprintf(tag, sizeof tag, "v41=%d %-6s %s", v,
@@ -3101,35 +3102,35 @@ static void test_control_token_injection(void) {
 
     chat_msgs msgs = {0};
     chat_msg sys = {0};
-    sys.role = xstrdup("system");
-    sys.content = xstrdup(hostile);
+    sys.role = server_xstrdup("system");
+    sys.content = server_xstrdup(hostile);
     sys.system_field = true;
     chat_msgs_push(&msgs, sys);
     chat_msg user = {0};
-    user.role = xstrdup("user");
-    user.content = xstrdup(hostile);
+    user.role = server_xstrdup("user");
+    user.content = server_xstrdup(hostile);
     chat_msgs_push(&msgs, user);
     chat_msg asst = {0};
-    asst.role = xstrdup("assistant");
-    asst.reasoning = xstrdup(hostile);
-    asst.content = xstrdup(hostile);
+    asst.role = server_xstrdup("assistant");
+    asst.reasoning = server_xstrdup(hostile);
+    asst.content = server_xstrdup(hostile);
     tool_call call = {0};
-    call.id = xstrdup("call_1");
-    call.name = xstrdup("f");
-    call.arguments = xstrdup(args);
+    call.id = server_xstrdup("call_1");
+    call.name = server_xstrdup("f");
+    call.arguments = server_xstrdup(args);
     tool_calls_push(&asst.calls, call);
     chat_msgs_push(&msgs, asst);
     chat_msg tool = {0};
-    tool.role = xstrdup("tool");
-    tool.content = xstrdup(hostile);
-    tool.tool_call_id = xstrdup("call_1");
+    tool.role = server_xstrdup("tool");
+    tool.content = server_xstrdup(hostile);
+    tool.tool_call_id = server_xstrdup("call_1");
     chat_msgs_push(&msgs, tool);
 
     chat_text_span *spans = NULL;
     uint32_t n_spans = 0;
-    char *text = render_chat_prompt_text_spans(&msgs, tools, NULL, PULSAR_THINK_HIGH, true,
+    char *text = render_chat_prompt_text_spans(&msgs, tools, PULSAR_THINK_HIGH, true,
                                                &spans, &n_spans);
-    char *text_old = render_chat_prompt_text(&msgs, tools, NULL, PULSAR_THINK_HIGH, true);
+    char *text_old = render_chat_prompt_text(&msgs, tools, PULSAR_THINK_HIGH, true);
     TEST_ASSERT(text != NULL && text_old != NULL);
     if (text && text_old) {
         /* The rendered TEXT is unchanged, so the reference encoder's bytes, the
@@ -3198,7 +3199,7 @@ static void test_control_token_injection(void) {
         char rerr[160];
         const bool ok = leg == 2
             ? parse_completion_request(e, cbody, 64, &rr, rerr, sizeof rerr)
-            : parse_chat_request_render(e, NULL, leg == 0 ? rbody : rbody_forced, 64,
+            : parse_chat_request_render(e, pulsar_engine_chat_format(e), NULL, leg == 0 ? rbody : rbody_forced, 64,
                                         &rr, rerr, sizeof rerr);
         if (!ok) {
             fprintf(stderr, "control-token-injection: leg %d refused: %s\n", leg, rerr);
@@ -3275,8 +3276,8 @@ static void test_control_token_suffix(void) {
     {
         chat_msgs msgs = {0};
         chat_msg tool = {0};
-        tool.role = xstrdup("tool");
-        tool.content = xstrdup(hostile);
+        tool.role = server_xstrdup("tool");
+        tool.content = server_xstrdup(hostile);
         chat_msgs_push(&msgs, tool);
         chat_text_span *spans = NULL;
         uint32_t n_spans = 0;
@@ -3307,24 +3308,24 @@ static void test_control_token_suffix(void) {
      * request field the kv_cache continuation sites read */
     {
         request r;
-        request_init(&r, REQ_CHAT, 128);
+        test_request_init(&r, REQ_CHAT, 128);
         r.api = API_RESPONSES;
         r.think_mode = PULSAR_THINK_HIGH;
         r.has_tools = true;
         chat_msgs msgs = {0};
         chat_msg asst = {0};
-        asst.role = xstrdup("assistant");
-        asst.content = xstrdup("calling");
+        asst.role = server_xstrdup("assistant");
+        asst.content = server_xstrdup("calling");
         tool_call call = {0};
-        call.id = xstrdup("call_live");
-        call.name = xstrdup("f");
-        call.arguments = xstrdup("{}");
+        call.id = server_xstrdup("call_live");
+        call.name = server_xstrdup("f");
+        call.arguments = server_xstrdup("{}");
         tool_calls_push(&asst.calls, call);
         chat_msgs_push(&msgs, asst);
         chat_msg tool = {0};
-        tool.role = xstrdup("tool");
-        tool.tool_call_id = xstrdup("call_live");
-        tool.content = xstrdup(hostile);
+        tool.role = server_xstrdup("tool");
+        tool.tool_call_id = server_xstrdup("call_live");
+        tool.content = server_xstrdup(hostile);
         chat_msgs_push(&msgs, tool);
         responses_prepare_live_continuation(&r, &msgs);
         test_suffix_contract(e, "responses live suffix", r.responses_live_suffix_text,
@@ -3349,7 +3350,7 @@ static void test_control_token_suffix(void) {
                  "{\"role\":\"user\",\"content\":\"ask\"}]}", sys_hostile);
         request r;
         char err[160];
-        if (!parse_chat_request_render(NULL, NULL, body, 64, &r, err, sizeof err)) {
+        if (!parse_chat_request_render(NULL, PULSAR_CHAT_DS4_V41, NULL, body, 64, &r, err, sizeof err)) {
             TEST_ASSERT(!"control-token-suffix: the reminder probe must parse");
         } else {
             r.think_mode = PULSAR_THINK_HIGH;
@@ -3373,14 +3374,14 @@ static void test_control_token_suffix(void) {
      * but its DSML framing must stay CONTROL text */
     {
         request r;
-        request_init(&r, REQ_CHAT, 128);
+        test_request_init(&r, REQ_CHAT, 128);
         r.think_mode = PULSAR_THINK_HIGH;
         r.family = server_family_for_format(PULSAR_CHAT_DS4_V41);
         tool_calls calls = {0};
         tool_call call = {0};
-        call.id = xstrdup("call_1");
-        call.name = xstrdup("f");
-        call.arguments = xstrdup("{}");
+        call.id = server_xstrdup("call_1");
+        call.name = server_xstrdup("f");
+        call.arguments = server_xstrdup("{}");
         tool_calls_push(&calls, call);
         chat_text_span *spans = NULL;
         uint32_t n_spans = 0;
@@ -3420,16 +3421,16 @@ static void test_control_token_suffix(void) {
                  hostile);
         request r;
         char err[160];
-        if (!parse_chat_request_render(NULL, NULL, body, 64, &r, err, sizeof err)) {
+        if (!parse_chat_request_render(NULL, PULSAR_CHAT_DS4_V41, NULL, body, 64, &r, err, sizeof err)) {
             TEST_ASSERT(!"control-token-suffix: the composite probe must parse");
         } else {
             r.think_mode = PULSAR_THINK_HIGH;
             r.family = server_family_for_format(PULSAR_CHAT_DS4_V41);
             tool_calls calls = {0};
             tool_call call = {0};
-            call.id = xstrdup("call_1");
-            call.name = xstrdup("f");
-            call.arguments = xstrdup("{}");
+            call.id = server_xstrdup("call_1");
+            call.name = server_xstrdup("f");
+            call.arguments = server_xstrdup("{}");
             tool_calls_push(&calls, call);
             chat_text_span *suf_spans = NULL;
             uint32_t suf_n = 0;
@@ -3848,6 +3849,267 @@ static void test_l308_copy_estimate(void) {
     pulsar_spec_copy_age(&sp, 5u);
     TEST_ASSERT(sp.copy_unseen == UINT32_MAX);
     TEST_ASSERT(pulsar_spec_copy_price(&sp, 0.0f, 8u, conf, &rp) == 8u && !rp && conf[0] == 1.0f);
+}
+
+/* L335: a driver family declaring more scratch arenas than the driver holds is refused at the session's create
+ * (step_driver.cpp), by name -- the create used to cap n_scratch silently, so the arenas past
+ * PULSAR_DRIVER_SCRATCH_MAX were never allocated and the family's ops read NULL.  Host: the refusal comes before
+ * the family's create or any allocation. */
+static bool test_driver_never(const pulsar_driver_step *) { return false; }
+static bool test_driver_head_never(const pulsar_driver_step *, uint32_t, uint32_t, uint32_t) { return false; }
+static void test_driver_scratch_cap(void) {
+    static pulsar_driver_ops ops{};
+    ops.embed = test_driver_never;
+    ops.head = test_driver_head_never;
+    ops.n_scratch = PULSAR_DRIVER_SCRATCH_MAX + 1u;   /* create stays NULL: reaching it would crash the test */
+    static pulsar_family fam{};
+    fam.arch = "l335_driver_test";
+    fam.name = "L335 driver test";
+    fam.driver = &ops;
+    pulsar_engine *e = (pulsar_engine *)xcalloc(1, sizeof(*e));
+    e->family = &fam;   /* plan.n_layer 0: no block is needed */
+    pulsar_session *s = (pulsar_session *)xcalloc(1, sizeof(*s));
+    s->engine = e;
+    TEST_ASSERT(pulsar_driver_session_create(s, 1u) == 1 && s->driver == NULL);
+    free(s);
+    free(e);
+}
+
+/* L335: the safetensors header's integers pass blob_value's exactness check (st_exact_integer: an integer a double
+ * holds exactly) -- a fractional or past-2^53 shape entry used to truncate / round into a wrong integer that parsed.
+ * Host: a one-tensor shard in a scratch directory, the open's stderr read back for the refusal. */
+static std::string test_st_open_log(const char *shape, bool *opened) {
+    char dir[] = "/tmp/pulsar-l335-st-XXXXXX";
+    std::string log;
+    *opened = true;
+    if (!mkdtemp(dir)) return log;
+    const std::string shard = std::string(dir) + "/model-00001-of-00001.safetensors";
+    const std::string hdr = std::string("{\"t\":{\"dtype\":\"F32\",\"shape\":") + shape +
+                            ",\"data_offsets\":[0,4]}}";
+    FILE *f = fopen(shard.c_str(), "wb");
+    if (!f) return log;
+    const uint64_t n = hdr.size();
+    const float zero = 0.0f;
+    fwrite(&n, sizeof n, 1, f);
+    fwrite(hdr.data(), 1, hdr.size(), f);
+    fwrite(&zero, sizeof zero, 1, f);
+    fclose(f);
+    const std::string logp = std::string(dir) + "/stderr.log";
+    fflush(stderr);
+    const int saved = dup(2);
+    FILE *lf = fopen(logp.c_str(), "w");
+    if (saved < 0 || !lf) return log;
+    dup2(fileno(lf), 2);
+    pulsar_model m;
+    memset(&m, 0, sizeof m);
+    *opened = safetensors_open(&m, dir, false);
+    fflush(stderr);
+    dup2(saved, 2);
+    close(saved);
+    fclose(lf);
+    model_close(&m);
+    f = fopen(logp.c_str(), "rb");
+    if (f) {
+        char b[4096];
+        size_t k;
+        while ((k = fread(b, 1, sizeof b, f)) > 0) log.append(b, k);
+        fclose(f);
+    }
+    unlink(logp.c_str());
+    unlink(shard.c_str());
+    rmdir(dir);
+    return log;
+}
+static void test_st_exact_integers(void) {
+    bool opened = true;
+    std::string log = test_st_open_log("[1]", &opened);
+    TEST_ASSERT(log.find("bad shape") == std::string::npos);   /* the control: its shape parses */
+    for (const char *bad : {"[1.5]", "[9007199254740994]", "[-1]"}) {
+        log = test_st_open_log(bad, &opened);
+        TEST_ASSERT(!opened && log.find("t has a bad shape") != std::string::npos);
+        if (log.find("t has a bad shape") == std::string::npos) fprintf(stderr, "  shape %s: %s\n", bad, log.c_str());
+    }
+}
+
+/* L335: a bank carry's restore is all or nothing -- a live row that does not restore (here: a bank past the device
+ * rows, the copy's host-side refusal) leaves the host view exactly as it was; it used to take the bank's checkpoint
+ * first and return false half-restored.  Host only: no device row is touched. */
+static uint32_t test_carry_width(const pulsar_engine *) { return 8u; }
+static void test_bank_carry_restore(void) {
+    static pulsar_family fam{};
+    fam.name = "L335 carry test";
+    fam.logits_width = test_carry_width;
+    pulsar_engine *e = (pulsar_engine *)xcalloc(1, sizeof(*e));
+    e->family = &fam;
+    pulsar_session *s = (pulsar_session *)xcalloc(1, sizeof(*s));
+    s->engine = e;
+    s->bank_carry = (pulsar_bank_carry *)xcalloc(2, sizeof(*s->bank_carry));
+    s->bank_carry_n = 2;
+    pulsar_bank_carry *c = &s->bank_carry[1];
+    c->valid = true;
+    c->checkpoint_valid = true;
+    c->prefill_frontier = 3;
+    for (int t : {1, 2, 3}) token_vec_push(&c->checkpoint, t);
+    token_vec_push(&s->checkpoint, 9);
+    s->checkpoint_valid = false;
+    s->prefill_frontier = 1;
+    s->logits_stale = true;
+    s->dev.n_banks = 0;   /* the live row's copy refuses bank 1 before any device work */
+    TEST_ASSERT(!pulsar_bank_carry_restore_view(s, 1));
+    TEST_ASSERT(s->checkpoint.len == 1 && s->checkpoint.v[0] == 9 && !s->checkpoint_valid && s->prefill_frontier == 1);
+    TEST_ASSERT(!pulsar_bank_carry_restore_view(s, 0));   /* nothing saved: false, nothing said or moved */
+    TEST_ASSERT(s->checkpoint.len == 1 && s->checkpoint.v[0] == 9);
+    pulsar_tokens_free(&c->checkpoint);
+    pulsar_tokens_free(&s->checkpoint);
+    free(s->bank_carry);
+    free(s);
+    free(e);
+}
+
+/* L335: Qwen's eos is the first of the tokenizer's stop ids, and the list it reads is never empty: the loader refuses
+ * an eos config with no id (bpe_tokenizer.cpp finish_table, the one authority) -- what qwen_tok_eos's refusal of an
+ * empty list stands on.  Host: the checkpoint's tokenizer (PULSAR_TEST_QWEN_TOKENIZER). */
+static void test_qwen_eos(void) {
+    const bpe_tokenizer *tok = qwen_test_tokenizer();
+    if (!tok) return;   /* failed by name inside */
+    pulsar_engine *e = (pulsar_engine *)xcalloc(1, sizeof(*e));
+    e->qwen_tok = (bpe_tokenizer *)tok;
+    TEST_ASSERT(!bpe_tokenizer_stop_ids(tok).empty());
+    TEST_ASSERT(k_qwen_tokenizer.eos(e) == bpe_tokenizer_stop_ids(tok).front());
+    e->qwen_tok = NULL;
+    free(e);
+    const char *dir = getenv("PULSAR_TEST_QWEN_TOKENIZER");
+    std::string tj;
+    FILE *f = fopen((std::string(dir) + "/tokenizer.json").c_str(), "rb");
+    TEST_ASSERT(f != NULL);
+    if (!f) return;
+    char b[65536];
+    size_t n;
+    while ((n = fread(b, 1, sizeof b, f)) > 0) tj.append(b, n);
+    fclose(f);
+    for (const char *gen : {"{\"eos_token_id\": []}", "{}"}) {
+        char err[256] = "";
+        bpe_tokenizer *none = bpe_tokenizer_load_hf(tj.data(), tj.size(), gen, strlen(gen), err, sizeof err);
+        TEST_ASSERT(none == NULL && strstr(err, "eos_token_id") != NULL);
+        if (none) bpe_tokenizer_free(none);
+    }
+}
+
+/* L335: the session entries that report through `err` accept err == NULL with a nonzero errlen, as their siblings
+ * do (decode_fused, bank_adopt, restore_checkpoint and the segment save / load wrote through it unchecked).  Each
+ * refuses a NULL session here, so the check needs no engine. */
+static void test_api_err_null(void) {
+    pulsar_tokens prompt = {0};
+    TEST_ASSERT(pulsar_session_restore_checkpoint(NULL, TokPos{0}, NULL, 64) == 1);
+    TEST_ASSERT(pulsar_session_bank_adopt(NULL, 1u, &prompt, NULL, 64).status == PULSAR_ADOPT_REFUSED);
+    TEST_ASSERT(pulsar_session_save_segment(NULL, NULL, TokPos{0}, TokPos{0}, NULL, NULL, 64) == 1);
+    TokPos G = TokPos{7};
+    TEST_ASSERT(pulsar_session_load_segment(NULL, NULL, 0, false, &G, NULL, NULL, 64) == 1 && G == TokPos{0});
+}
+
+/* L335: the one host f32 -> bf16 converter (pulsar_gpu.h pulsar_bf16_from_f32), over every float bit pattern: each
+ * non-NaN value converts exactly as the two vision converters it replaced did (the bare RNE expression), and every
+ * NaN becomes torch's quiet NaN 0x7FC0 (the bare expression turned some into Inf or flipped their sign). */
+static void test_bf16_from_f32(void) {
+    uint64_t mismatches = 0, nan_bad = 0, nans = 0, old_nan_broken = 0;
+    for (uint64_t b = 0; b <= 0xffffffffull; b++) {
+        const uint32_t u = (uint32_t)b;
+        float f;
+        memcpy(&f, &u, sizeof f);
+        const uint16_t got = pulsar_bf16_from_f32(f);
+        const uint16_t old = (uint16_t)((u + 0x7fffu + ((u >> 16) & 1u)) >> 16);
+        if ((u & 0x7fffffffu) > 0x7f800000u) {
+            nans++;
+            nan_bad += got != 0x7fc0u;
+            old_nan_broken += (old & 0x7f80u) != 0x7f80u || (old & 0x007fu) == 0u || (old >> 15) != (u >> 31);
+        } else {
+            mismatches += got != old;
+        }
+    }
+    fprintf(stderr, "  bf16: %llu NaN patterns (the bare expression broke %llu of them), %llu non-NaN mismatches, "
+                    "%llu NaN outputs not 0x7FC0\n", (unsigned long long)nans, (unsigned long long)old_nan_broken,
+            (unsigned long long)mismatches, (unsigned long long)nan_bad);
+    TEST_ASSERT(mismatches == 0 && nan_bad == 0 && nans == 2ull * 0x7fffffull);
+}
+
+/* L335: the tokenizer entries on a family without a tokenizer or chat front (an encoder's) refuse by name and return
+ * their failure values -- never exit the process (they did, tokenizer_require / chat_require).  A host engine with
+ * only its family set: nothing else is read before the refusal. */
+static void test_tokenizer_refusals(void) {
+    static pulsar_family fam{};
+    fam.arch = "l335-test";
+    fam.name = "L335 test (no tokenizer)";
+    pulsar_engine *e = (pulsar_engine *)xcalloc(1, sizeof(*e));
+    e->family = &fam;
+    TEST_ASSERT(!pulsar_engine_has_tokenizer(e));
+    pulsar_tokens out = {0};
+    TEST_ASSERT(!pulsar_tokenize_text(e, "hello", &out) && out.len == 0);
+    TEST_ASSERT(!pulsar_tokenize_rendered_chat(e, "hello", &out) && out.len == 0);
+    TEST_ASSERT(!pulsar_tokenize_rendered_chat_spans(e, "hello", NULL, 0u, &out) && out.len == 0);
+    TEST_ASSERT(!pulsar_chat_open(e, &out, NULL, NULL, PULSAR_THINK_NONE) && out.len == 0);
+    const pulsar_chat_message m = {"user", "hi", false};
+    TEST_ASSERT(!pulsar_chat_append_turn(e, &out, &m, 1, true, PULSAR_THINK_NONE) && out.len == 0);
+    TEST_ASSERT(!pulsar_chat_end_assistant(e, &out) && out.len == 0);
+    TEST_ASSERT(!pulsar_encode_chat_prompt(e, NULL, "hi", PULSAR_THINK_NONE, &out) && out.len == 0);
+    size_t len = 7;
+    TEST_ASSERT(pulsar_token_text(e, 1, &len) == NULL && len == 0);
+    TEST_ASSERT(pulsar_token_eos(e) == -1);
+    TEST_ASSERT(pulsar_token_is_stop(e, 1));   /* fail closed: a generation ends */
+    TEST_ASSERT(pulsar_token_think_close(e) == -1);
+    pulsar_turn_markers tm;
+    TEST_ASSERT(!pulsar_chat_turn_markers(e, &tm) && tm.n_user == 0 && tm.n_assistant == 0);
+    TEST_ASSERT(!pulsar_tokenize_text(e, "again", &out) && out.len == 0);   /* said once: the log has one line */
+    pulsar_tokens_free(&out);
+    free(e);
+}
+
+/* L335: the library's say-once table (family.cpp pulsar_refusal_first) -- an op is said the first time only; past
+ * PULSAR_REFUSAL_OPS_MAX ops every refusal is said (the table never silently drops one), and that fact once. */
+static void test_refusal_once(void) {
+    static char ops[PULSAR_REFUSAL_OPS_MAX + 8u][2];   /* distinct addresses: the table keys on them */
+    const uint32_t n = PULSAR_REFUSAL_OPS_MAX + 8u;
+    for (uint32_t i = 0; i < n; i++) TEST_ASSERT(pulsar_refusal_first(ops[i]));
+    TEST_ASSERT(!pulsar_refusal_first(ops[0]));       /* remembered: said once */
+    TEST_ASSERT(pulsar_refusal_first(ops[n - 1u]));   /* past the table: said again, not dropped */
+}
+
+/* L335: no engine is no family -- the engine facts never answer DeepSeek for NULL (they did: V4.1 and "DeepSeek"),
+ * and a completion parsed without an engine carries no family (the server's enqueue refuses one). */
+static void test_no_engine_no_family(void) {
+    TEST_ASSERT(pulsar_engine_chat_format(NULL) == PULSAR_CHAT_NONE);
+    TEST_ASSERT(!strcmp(pulsar_engine_family_name(NULL), "(no engine)"));
+    request r;
+    char err[256] = "";
+    TEST_ASSERT(parse_completion_request(NULL, "{\"prompt\": \"hi\"}", 16, &r, err, sizeof err));
+    TEST_ASSERT(r.family == NULL);
+    request_free(&r);
+}
+
+/* L335: the state plan's decl table (state_kinds.cpp) filled past PULSAR_STATE_DECLS_MAX -- the add counts the
+ * overflow and returns an id past the table (never UINT32_MAX, which a family shifts by), and the create refuses
+ * the plan by name before it allocates anything.  Host only: the refusal runs before the device. */
+static void test_state_plan_overflow(void) {
+    pulsar_state_plan p{};
+    p.name = "overflow-test";
+    p.resume_grid = 1u;
+    p.ckpt_slots = 1u;
+    p.n_slots = 1u;
+    p.n_trunk = 1u;
+    const pulsar_state_decl d{"fixed", PULSAR_STATE_FIXED, PULSAR_STATE_CAPTURE_NONE, false, false, 0, 16, 0, 0,
+                              NULL, NULL, NULL};
+    for (uint32_t i = 0; i < PULSAR_STATE_DECLS_MAX; i++) {
+        const uint32_t id = pulsar_state_plan_add(&p, d);
+        TEST_ASSERT(id == i);
+        p.slot[0] |= 1u << id;
+    }
+    TEST_ASSERT(p.n_decl == PULSAR_STATE_DECLS_MAX && p.n_overflow == 0u);
+    for (uint32_t i = 0; i < 2u; i++) {
+        const uint32_t id = pulsar_state_plan_add(&p, d);
+        TEST_ASSERT(id == PULSAR_STATE_DECLS_MAX);
+        TEST_ASSERT((1u << id) >> p.n_decl == 1u);   /* the mask a family builds from it names no decl */
+    }
+    TEST_ASSERT(p.n_decl == PULSAR_STATE_DECLS_MAX && p.n_overflow == 2u);
+    TEST_ASSERT(pulsar_state_create(NULL, &p, NULL, 1u, 64u, 0u) == NULL);   /* refused by name, nothing allocated */
 }
 
 /* L301: the verify pick, its online correction and the lockstep chains' continuation (verify_curve.cpp; the
@@ -4700,6 +4962,17 @@ static void test_lib_image_identity(void) {
     /* a family with no image geometry: no id is a sentinel (Qwen's ids above DeepSeek's vocab are text) */
     int qwen_like[] = {248046, 5, 248044};
     TEST_ASSERT(pulsar_image_persist_end(NULL, NULL, qwen_like, 3, &none) == 3);
+    /* L335: a span's blocks are one run of the records (a segment writes them from the first), checked */
+    uint32_t first = 9, nb = 9;
+    TEST_ASSERT(pulsar_image_identity_span(&all, 0, 14, &first, &nb) && first == 0 && nb == 2);
+    TEST_ASSERT(pulsar_image_identity_span(&all, 8, 14, &first, &nb) && first == 1 && nb == 1);
+    TEST_ASSERT(pulsar_image_identity_span(&all, 4, 10, &first, &nb) && nb == 0);   /* both cross an edge */
+    pulsar_image_identity bad = all;
+    std::swap(bad.b[0], bad.b[1]);   /* out of order: refused, not read as a run */
+    TEST_ASSERT(!pulsar_image_identity_span(&bad, 0, 14, &first, &nb));
+    bad = all;
+    bad.b[1].start = 7;              /* overlapping */
+    TEST_ASSERT(!pulsar_image_identity_span(&bad, 0, 14, &first, &nb));
 }
 
 /* L292: the output head's captured graph must not replay one step's arm choice for another.  Every
@@ -4804,6 +5077,16 @@ static const pulsar_test_entry test_entries[] = {
     {"--fused-cost", "fused-cost", "the prompt chunk cost fit (solo + fused, persisted) and the verify curve's round cost, what the round selection and the disk restore price by (L304, L312, L327)", test_fused_cost},
     {"--fused-sched", "fused-sched", "the round selection simulated on L304's logged costs: L304's and L277's cases, the stall, no prompt, the cold fit (L312)", test_fused_sched},
     {"--read-ahead", "read-ahead", "the next-chunk PLE read-ahead: its rule (one chunk ahead, each row once, a changed prompt drops), the pool's background class (bytes unchanged, below every gather, cancel, accounting) (L329 b2)", test_read_ahead},
+    {"--driver-scratch", "driver-scratch", "a driver family past PULSAR_DRIVER_SCRATCH_MAX scratch arenas is refused at the session's create, never capped (L335)", test_driver_scratch_cap},
+    {"--st-integers", "st-integers", "the safetensors header's integers are exact: a fractional or past-2^53 shape is refused (L335)", test_st_exact_integers},
+    {"--bank-carry-restore", "bank-carry-restore", "a bank carry's restore is all or nothing: a live row that fails leaves the host view untouched (L335)", test_bank_carry_restore},
+    {"--qwen-eos", "qwen-eos", "Qwen's eos: the tokenizer's first stop id; a tokenizer with none never loads (L335)", test_qwen_eos},
+    {"--api-err-null", "api-err-null", "the session entries that report through err accept a NULL err (L335)", test_api_err_null},
+    {"--bf16-convert", "bf16-convert", "the host f32 -> bf16 converter over every float bit pattern: finite values as before, NaN stays NaN (L335)", test_bf16_from_f32},
+    {"--tokenizer-refusals", "tokenizer-refusals", "the tokenizer and chat entries refuse a family without them by name and return their failure values, never exit (L335)", test_tokenizer_refusals},
+    {"--refusal-once", "refusal-once", "the library's say-once refusal table: once per op, every refusal said past its bound (L335)", test_refusal_once},
+    {"--no-engine-family", "no-engine-family", "no engine is no family: the engine facts and a no-engine parse never default to DeepSeek (L335)", test_no_engine_no_family},
+    {"--state-plan", "state-plan", "the state plan's decl table: a full table counts the overflow and the create refuses it by name (L335)", test_state_plan_overflow},
     {"--ckpt-records", "ckpt-records", "the record pool (prompt ends, message endpoints: capture, match, LRU, frontier rule) and the endpoint cut (L311)", test_ckpt_records},
     {"--verify-pick", "verify-pick", "the verify pick: the brute-force argmax on a staircase curve, the robust online correction, the lockstep continuation (L301); the copy estimate's re-probe (L308)", test_verify_pick},
     {"--lib-image-rope", "lib-image-rope", "multi-axis rope positions from the image records vs HF get_rope_index (L268)", test_lib_image_rope},

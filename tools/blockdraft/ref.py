@@ -23,9 +23,9 @@ target's input embedding from the PULSAR CONTAINER the engine served (nvfp4 entr
 tools/container/producers.nvfp4_decode; the head's draft-vocabulary rows and ids as stored), so the --dump grade
 isolates the engine's arithmetic from the container's quantisation; the selector's chain is graded too.
 
-    ~/venvs/tf/bin/python tools/blockdraft/ref.py --drafter /mnt/models/nemotron35-super-lilicorr \
-        --target-hf /mnt/models/nemotron35-super-vl-bf16 (--golden F | --dump DIR) [--rounds N] [--device cpu|cuda]
-    ~/venvs/tf/bin/python tools/blockdraft/ref.py --drafter /mnt/models/qwen38fn-dflash2 --container CONTAINER \
+    python3 tools/blockdraft/ref.py --drafter /path/to/nemotron35-super-lilicorr \
+        --target-hf /path/to/nemotron35-super-vl-bf16 (--golden F | --dump DIR) [--rounds N] [--device cpu|cuda]
+    python3 tools/blockdraft/ref.py --drafter /path/to/qwen38fn-dflash2 --container CONTAINER \
         --dump DIR [--rounds N]
 """
 from __future__ import annotations

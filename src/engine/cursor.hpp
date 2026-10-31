@@ -1,3 +1,5 @@
+/** @file cursor.hpp
+ *  @brief pulsar::Cursor, a bounds-checked sequential reader over a metadata value blob. */
 #ifndef PULSAR_CURSOR_HPP
 #define PULSAR_CURSOR_HPP
 
@@ -23,10 +25,12 @@ namespace pulsar {
 class Cursor {
 public:
     /** Wrap an existing cursor. The reference must outlive this view. */
+    /// @param c the cursor state to view; borrowed, must outlive this Cursor
     explicit Cursor(pulsar_cursor &c) : c_(c) {}
 
     /** Record `msg` with the current byte offset, but only if no error has been
      * recorded yet -- the first failure is the informative one. */
+    /// @param msg NUL-terminated message; " at byte <pos>" is appended
     void set_error(const char *msg) {
         if (c_.error[0] == '\0') {
             snprintf(c_.error, sizeof(c_.error), "%s at byte %" PRIu64, msg, c_.pos);
@@ -35,6 +39,8 @@ public:
 
     /** Are `n` more bytes available? Records a truncation error if not.
      * Written to be overflow-safe: `pos > size - n` rather than `pos + n > size`. */
+    /// @param n byte count wanted from the current position
+    /// @return true if `n` bytes remain, false (error recorded) if not
     bool has(uint64_t n) {
         if (n > c_.size || c_.pos > c_.size - n) {
             set_error("truncated metadata value");
@@ -45,6 +51,8 @@ public:
 
     /** Copy `n` bytes to `dst` and advance. @return false if out of range,
      * leaving `pos` unmoved. */
+    /// @param dst destination buffer of at least `n` bytes
+    /// @param n byte count to copy
     bool read(void *dst, uint64_t n) {
         if (!has(n)) return false;
         memcpy(dst, c_.base + c_.pos, (size_t)n);
@@ -53,12 +61,18 @@ public:
     }
 
     /** Read a little-endian uint32. */
+    /// @param v receives the value; untouched on failure
+    /// @return false if fewer than 4 bytes remain
     bool u32(uint32_t *v) { return read(v, sizeof(*v)); }
     /** Read a little-endian uint64. */
+    /// @param v receives the value; untouched on failure
+    /// @return false if fewer than 8 bytes remain
     bool u64(uint64_t *v) { return read(v, sizeof(*v)); }
 
     /** Read a length-prefixed string. `s` is left pointing into the value blob
      * -- borrowed, not copied, and valid only while the blob is. */
+    /// @param s receives the borrowed pointer and byte length (a u64 length prefix, then the bytes)
+    /// @return false if the prefix or the bytes run past the blob
     bool string(pulsar_str *s) {
         uint64_t len;
         if (!u64(&len)) return false;

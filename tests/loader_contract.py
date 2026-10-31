@@ -24,6 +24,10 @@ The mutations are the family-neutral faults every loader must catch:
   native-dtype  a plain tensor is stored in a dtype no reader takes
   format        a routed expert stack's layout is one no arm reads (the format registry's admission, L272 P4)
 
+A family's own metadata faults are `extras` in its row: (name, the pulsar.kv entries the mutant replaces or adds),
+each refused by naming one of those keys.  DeepSeek's (L335): a REAP keep_count and a swiglu_clamp_exp shorter than
+the layer count -- refused by validate_reap_metadata / validate_swiglu_clamp_metadata, which used to exit.
+
 The targets (which tensor, which key, which stack) are the family's row in FAMILIES below -- the only family
 knowledge here.  A family adds a row; a family-only fault (Qwen's PLE row file) is an extra in its row.
 
@@ -46,6 +50,13 @@ FAMILIES = {
         'plain': 'blk.1.ffn_gate_inp.weight',       # a 2-D plain tensor: the router, bf16 [4096, 256]
         'kv': 'deepseek4.block_count',
         'stack': 'blk.3.ffn_gate_exps.weight',
+        'extras': (
+            ('reap-short', ({'key': 'reap.enabled', 'type': 'bool', 'value': True},
+                            {'key': 'reap.layer.keep_count', 'type': 'array',
+                             'value': {'__array__': 'u32', 'n': 1, 'v': [1]}})),
+            ('swiglu-short', ({'key': 'deepseek4.swiglu_clamp_exp', 'type': 'array',
+                               'value': {'__array__': 'f32', 'n': 1, 'v': [10.0]}},)),
+        ),
     },
     'qwen4_exp': {
         'tensor': 'model.language_model.layers.1.linear_attn.in_proj_qkv.weight',
@@ -172,6 +183,20 @@ def mutate(shards, family, row, what):
             return f'{target} transposed', names
         s['header'][cname]['dtype'] = 'F64'
         return f'{target} stored as F64', names
+    extra = dict(row.get('extras', ())).get(what)
+    if extra is not None:
+        keys = {x['key'] for x in extra}
+        home = None
+        for s in shards:
+            for key in ('pulsar.kv', 'pulsar.kv_arch'):
+                if key in s['header'].get('__metadata__', {}):
+                    edit_meta_json(s, key, lambda kv: [x for x in kv if x['key'] not in keys])
+                    if key == 'pulsar.kv' and home is None:
+                        home = s
+        if home is None:
+            sys.exit(f'loader_contract: {family} has no pulsar.kv to carry {what}')
+        edit_meta_json(home, 'pulsar.kv', lambda kv: kv + list(extra))
+        return f'{what}: ' + ', '.join(sorted(keys)), sorted(keys)
     if what == 'format':
         stack = row['stack']
         for s in shards:
@@ -248,7 +273,7 @@ def main():
             fails += 1
             continue
         print(f'  ok    {family} {tag}: the clean header clone opens ({dt:.1f} s)')
-        for what in MUTATIONS:
+        for what in MUTATIONS + tuple(x[0] for x in row.get('extras', ())):
             m = load_container(src)
             desc, names = mutate(m, family, row, what)
             out = os.path.join(a.work, f'{tag}-{what}')

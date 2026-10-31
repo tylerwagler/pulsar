@@ -1,3 +1,5 @@
+/** @file linear.cpp
+ *  @brief L272 P4c: the dense linear's one front door, for every family. */
 /* linear.cpp -- L272 P4c: the dense linear's one front door, for every family.
  *
  * A dense linear is a weight (a model's tensor, or a row range of it) times an activation.  The family names the
@@ -21,6 +23,9 @@
 #include "exl3_trellis.h"
 #include "cuda/pulsar_cuda_qwen.h"
 
+/// The refusal line for a weight format with no dense arm at an activation.
+/// @param w the weight
+/// @param against the activation, in words
 static void say_no_arm(const pulsar_tensor *w, const char *against) {
     fprintf(stderr, "pulsar: linear: %.*s is %s, which has no dense arm against %s -- refusing\n", (int)w->name.len,
             w->name.ptr, tensor_type_name(w->type), against);

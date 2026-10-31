@@ -1,3 +1,5 @@
+/** @file alloc.cpp
+ *  @brief Checked allocators and the decode-phase allocation guard. */
 #include "pulsar_engine_internal.h"
 
 /* Checked allocators and the decode-phase allocation guard. Split out of

@@ -8,7 +8,7 @@
  * tells the two apart before the reference comparison.
  *
  * Self-contained: #includes the shipped TU so it drives the REAL kernel, links
- * nothing else (sparky is aarch64; the dev box has no GPU).  Two sublayer
+ * nothing else (the GB10 host is aarch64; the dev box has no GPU).  Two sublayer
  * calls chained on one carry buffer, each checked against a host oracle of
  * the reference math (hc_split_sinkhorn for the coefficients, hc_pre for the
  * collapse, RMSNorm); the carry after each call must be that call's own pre,

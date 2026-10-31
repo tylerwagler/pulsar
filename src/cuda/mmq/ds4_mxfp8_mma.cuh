@@ -1,4 +1,7 @@
+/** @file
+ *  Block-scaled MXFP8 (e4m3 x e4m3, ue8m0 scales) m16n8k32 MMA for the routed-expert GEMMs. */
 #ifndef DS4_MXFP8_MMA_CUH
+/// Include guard.
 #define DS4_MXFP8_MMA_CUH
 
 #include <cstdint>
@@ -35,8 +38,10 @@
     (defined(__CUDA_ARCH_FAMILY_SPECIFIC__) ||                               \
      defined(__CUDA_ARCH_SPECIFIC__) ||                                      \
      defined(__CUDA_ARCH_FEAT_SM120_ALL))
+/// 1 in a device pass with the sm_12x block-scaled MMA (family- or arch-specific target), else 0.
 #define DS4_MXFP8_MMA 1
 #else
+/// 0: this pass has no block-scaled MMA (the host pass, or an older target); ds4_mma_m16n8k32_e4m3 traps.
 #define DS4_MXFP8_MMA 0
 #endif
 
@@ -51,6 +56,19 @@
  * not separate "=f" outputs plus "f" inputs.  That is not style: declaring them
  * separately lets the compiler allocate two accumulator sets and copy between
  * them on every MMA, which measured as pure register churn in the indexer. */
+/// D += A B with per-32 ue8m0 scales on both operands (traps without DS4_MXFP8_MMA).
+/// @param d0 accumulator 0, in/out.
+/// @param d1 accumulator 1, in/out.
+/// @param d2 accumulator 2, in/out.
+/// @param d3 accumulator 3, in/out.
+/// @param a0 A fragment register 0.
+/// @param a1 A fragment register 1.
+/// @param a2 A fragment register 2.
+/// @param a3 A fragment register 3.
+/// @param b0 B fragment register 0.
+/// @param b1 B fragment register 1.
+/// @param sfa A's ue8m0 scale bytes.
+/// @param sfb B's ue8m0 scale bytes.
 __device__ __forceinline__ static void ds4_mma_m16n8k32_e4m3(
         float &d0, float &d1, float &d2, float &d3,
         uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3,
