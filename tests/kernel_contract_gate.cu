@@ -19,6 +19,8 @@
  *    5. idx-decode-bound pulsar_gpu_indexer_scores_decode_run_tensor over a bank holding ONLY its visible rows, flush
  *                       against the end of an allocation, with a 1024-wide scores row: no read past the visible rows
  *                       (it used to stage the whole 128-row tile), scores equal to a garbage-padded bank's.
+ *    6. ring-store-descr the 0731 ring batch store: no descriptor and a full one run; positions without seq_id
+ *                       refuses (seq_id was dereferenced unchecked).
  *
  *  Prints one line per case and KERNEL CONTRACT GATE PASS / FAIL. */
 #include "pulsar_gpu.h"
@@ -309,6 +311,36 @@ static void case_idx_decode_bound(void) {
     pulsar_gpu_tensor_free(sb);
 }
 
+/* ---- 6. ring-store-descr --------------------------------------------------------------------------------------- */
+
+/// Case 6: the 0731 ring batch store with positions but no seq_id refuses (it dereferenced seq_id unchecked); with no
+/// descriptor, and with a full one, it runs.
+static void case_ring_store_descr(void) {
+    const uint32_t hd = 512u, cap = 8u, n = 2u, banks = 2u;
+    pulsar_gpu_tensor *ring = pulsar_gpu_tensor_alloc((uint64_t)banks * cap * PULSAR_ATTN_PACK_ROWBYTES(hd));
+    pulsar_gpu_tensor *kv = pulsar_gpu_tensor_alloc((uint64_t)n * hd * 4u);
+    pulsar_gpu_tensor *pos = pulsar_gpu_tensor_alloc(n * 4u);
+    pulsar_gpu_tensor *seq = pulsar_gpu_tensor_alloc(n * 4u);
+    const std::vector<float> x((size_t)n * hd, 0.5f);
+    const int32_t p[2] = {3, 4}, q[2] = {0, 1};
+    if (!ring || !kv || !pos || !seq || !pulsar_gpu_tensor_write(kv, 0, x.data(), x.size() * 4u) ||
+        !pulsar_gpu_tensor_write(pos, 0, p, sizeof(p)) || !pulsar_gpu_tensor_write(seq, 0, q, sizeof(q))) {
+        fail("ring-store-descr: alloc / upload");
+    } else {
+        const bool none = pulsar_gpu_attn_pack_ring_store_batch_tensor(ring, kv, cap, 0u, n, hd, NULL, NULL, 1u) != 0;
+        const bool full = pulsar_gpu_attn_pack_ring_store_batch_tensor(ring, kv, cap, 0u, n, hd, pos, seq, banks) != 0;
+        const bool half = pulsar_gpu_attn_pack_ring_store_batch_tensor(ring, kv, cap, 0u, n, hd, pos, NULL, banks) != 0;
+        const bool synced = pulsar_gpu_synchronize() != 0;
+        printf("  6 ring-store-descr: no descriptor %s, full %s, positions without seq_id %s, device %s\n",
+               none ? "ran" : "REFUSED", full ? "ran" : "REFUSED", half ? "RAN" : "refused", synced ? "clean" : "FAULT");
+        if (!none || !full || half || !synced) fail("ring-store-descr: the descriptor contract");
+    }
+    pulsar_gpu_tensor_free(ring);
+    pulsar_gpu_tensor_free(kv);
+    pulsar_gpu_tensor_free(pos);
+    pulsar_gpu_tensor_free(seq);
+}
+
 /// Runs every case on device 0.
 /// @return 0 on PASS, 1 on FAIL
 int main(void) {
@@ -321,6 +353,7 @@ int main(void) {
     case_indexer_topk();
     case_hc_expand_nhc();
     case_idx_decode_bound();
+    case_ring_store_descr();
     puts(g_fail ? "KERNEL CONTRACT GATE FAIL" : "KERNEL CONTRACT GATE PASS");
     return g_fail ? 1 : 0;
 }

@@ -173,11 +173,23 @@ int pulsar_gpu_attn_pack_ring_store_batch_tensor(pulsar_gpu_tensor *raw_cache, c
                                                  uint32_t raw_cap, uint32_t pos0, uint32_t n_tokens,
                                                  uint32_t head_dim, const pulsar_gpu_tensor *positions,
                                                  const pulsar_gpu_tensor *seq_id, uint32_t n_banks) {
-    const bool descr = positions != NULL;
+    /* A descriptor is positions AND seq_id, both n_tokens wide, over nonzero banks: the kernel dereferences both
+     * whenever positions is set (L335: seq_id was dereferenced unchecked).  Same contract as the scatter below. */
+    const bool descr = positions != NULL || seq_id != NULL;
+    if (descr && (!positions || !seq_id || n_banks == 0 ||
+                  positions->bytes < (uint64_t)n_tokens * sizeof(int32_t) ||
+                  seq_id->bytes < (uint64_t)n_tokens * sizeof(int32_t))) {
+        fprintf(stderr, "pulsar: 0731 KV ring store: bad descriptor (positions %s, seq_id %s, n_tokens %u, "
+                        "n_banks %u) -- refusing\n", positions ? "set" : "NULL", seq_id ? "set" : "NULL", n_tokens,
+                n_banks);
+        return 0;
+    }
     if (!raw_cache || !kv || raw_cap == 0 ||
-        head_dim != 512u ||
+        head_dim != 512u ||   /* the shared samax/sscale are sized for 28 blocks */
         raw_cache->bytes < (descr ? n_banks : 1u) * (uint64_t)raw_cap * PULSAR_ATTN_PACK_ROWBYTES(head_dim) ||
         kv->bytes < (uint64_t)n_tokens * head_dim * sizeof(float)) {
+        fprintf(stderr, "pulsar: 0731 KV ring store: bad operands (rows %u, head_dim %u, raw_cap %u) -- refusing\n",
+                n_tokens, head_dim, raw_cap);
         return 0;
     }
     if (n_tokens == 0) return 1;
