@@ -134,18 +134,20 @@ uint64_t trained_context(const pulsar_engine *e) { return model_of(e)->shape.rop
  *  @return PULSAR_DRAFTER_NONE */
 pulsar_drafter_kind drafter(pulsar_engine *) { return PULSAR_DRAFTER_NONE; }
 /* no routed experts: the dense linears' EXL3 tier in EXL3's value space (family.h quant_bits), 0 when BF16 */
-/** pulsar_family::quant_bits: the highest EXL3 rate over the MLP linears (gate / up / down; the attention linears
- *  are not consulted).
+/** pulsar_family::quant_bits: the highest EXL3 rate over every linear (attention q / k / v / o and MLP
+ *  gate / up / down; the score head is BF16 by the binder).
  *  @param e  the engine
- *  @return 20 + K in half bits, or 0 when those linears are BF16 */
+ *  @return 20 + K in half bits, or 0 when every linear is BF16 */
 int quant_bits(pulsar_engine *e) {
     const pulsar_nemotron_enc_model *w = model_of(e);
     int bits = 0;
-    for (uint32_t il = 0; il < w->shape.n_layer; il++)
-        for (const pulsar_tensor *t : {w->layer[il].ffn_gate, w->layer[il].ffn_up, w->layer[il].ffn_down}) {
+    for (uint32_t il = 0; il < w->shape.n_layer; il++) {
+        const pulsar_nemotron_enc_layer &L = w->layer[il];
+        for (const pulsar_tensor *t : {L.attn_q, L.attn_k, L.attn_v, L.attn_o, L.ffn_gate, L.ffn_up, L.ffn_down}) {
             const int k2 = t ? exl3_type_k2(t->type) : 0;
             if (k2 && 20 + k2 > bits) bits = 20 + k2;
         }
+    }
     return bits;
 }
 
