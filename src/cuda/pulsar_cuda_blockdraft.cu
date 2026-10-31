@@ -161,8 +161,11 @@ __global__ void __launch_bounds__(TOPK_THREADS) topk_kernel(const uint16_t *__re
     float m = -INFINITY, s = 0.f;
     for (uint32_t c = tid; c < n; c += TOPK_THREADS) {
         const float v = bf(x[c]);
+        /* A -inf logit (masked) adds exp(-inf) = 0 -- skipped, because while the running max is still -inf the
+         * expression would be exp(-inf - -inf) = NaN (L335).  A finite max makes the skip exact (s + 0 == s); a NaN
+         * logit is not -inf and still poisons the sum. */
         if (v > m) { s = s * expf(m - v) + 1.f; m = v; }
-        else s += expf(v - m);
+        else if (v != -INFINITY) s += expf(v - m);
         float lk = -INFINITY;
         int32_t lik = INT32_MAX;
 #pragma unroll
