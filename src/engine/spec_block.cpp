@@ -21,8 +21,6 @@
 
 namespace {
 
-/// The owner name for this file's messages.  TODO(dox): not referenced anywhere in the file.
-const char *const OWNER = "block drafter";
 /// The bind block of the drafter's own tensors (role names "drafter.*").
 const char *const BLOCK = "drafter";
 
