@@ -200,7 +200,7 @@ uint32_t pulsar_tp_gate_ring_slots(uint32_t n_layer);
 /// @param n_embd  the hidden width (vec_bytes = n_embd * 4)
 /// @param out     receives the layout
 void pulsar_tp_slab_layout_init(uint32_t n_layer, uint32_t n_embd, pulsar_tp_slab *out);
-/// Total slab bytes for a model (the same figure as pulsar_tp_slab_layout_init's slab_bytes).
+/// Total slab bytes for a model: pulsar_tp_slab_layout_init's slab_bytes, read from the layout (one authority).
 /// @param n_layer the model's layer count
 /// @param n_embd  the hidden width
 /// @return the slab size in bytes

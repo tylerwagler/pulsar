@@ -2673,13 +2673,9 @@ void pulsar_tp_slab_layout_init(uint32_t n_layer, uint32_t n_embd, pulsar_tp_sla
 }
 
 uint64_t pulsar_tp_slab_bytes(uint32_t n_layer, uint32_t n_embd) {
-    const uint64_t vec = (uint64_t)n_embd * sizeof(float);
-    const uint64_t slots = pulsar_tp_gate_ring_slots(n_layer);
-    return slots * vec * 2 +    /* out + in vectors */
-           slots * 8 * 2 +      /* in seq flags + out flag staging */
-           16 +                 /* token slot */
-           slots * 4 +          /* GPU-written gate-ready flags */
-           (uint64_t)n_layer * PULSAR_TP_BATCH_MAX_ROWS * vec * 2; /* batch out+in */
+    pulsar_tp_slab s;
+    pulsar_tp_slab_layout_init(n_layer, n_embd, &s);
+    return s.slab_bytes;
 }
 
 /// Slab slot index of gate [layer, gate].
