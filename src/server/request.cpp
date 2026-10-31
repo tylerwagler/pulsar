@@ -1445,12 +1445,6 @@ done:
 
 
 
-/* An Anthropic SERVER tool entry: a tool object typed by a versioned
- * "web_search_YYYYMMDD" string (Claude Code advertises
- * {"type":"web_search_20250305","name":"web_search",...}).  This server does
- * not execute Anthropic server tools -- the router upstream owns web search
- * and injects results into the prompt -- so the entry is recognised only to
- * be dropped.  Only the "type" member is inspected. */
 /* The "type" member of one JSON object (a tool entry or a content block),
  * malloc'd, or NULL when it has none. */
 /// @param raw_tool_json the object's JSON (NULL reads as "")
@@ -1510,6 +1504,12 @@ char *json_object_member_raw(const char *obj, const char *key) {
     return NULL;
 }
 
+/* An Anthropic SERVER tool entry: a tool object typed by a versioned
+ * "web_search_YYYYMMDD" string (Claude Code advertises
+ * {"type":"web_search_20250305","name":"web_search",...}).  This server does
+ * not execute Anthropic server tools -- the router upstream owns web search
+ * and injects results into the prompt -- so the entry is recognised only to
+ * be dropped.  Only the "type" member is inspected. */
 bool anthropic_server_tool_entry(const char *raw_tool_json) {
     char *type = anthropic_type_member(raw_tool_json);
     bool is_server_tool = type && !strncmp(type, "web_search", strlen("web_search"));

@@ -257,7 +257,7 @@ static const char *need_arg(int *i, int argc, char **argv, const char *opt) {
  * VA-only, demand-paged, and NOT charged at admission". This lets a large --ctx
  * (e.g. the 1M default) come up with N>1 banks all 1M-CAPABLE, each paying only
  * for the KV it actually touches. DEFAULT ON as of v0.3.0: the increment-2
- * proactive eviction guard has landed (generate.cpp worker_batched_decode_quantum),
+ * proactive eviction guard has landed (server_sched.cpp worker_batched_decode_quantum),
  * so banks that grow toward 1M are bounded by LRU-idle eviction before the
  * physical budget is breached. PULSAR_OVERCOMMIT=0/off/false reverts to classic
  * full-charge admission; PULSAR_MSEQ_BANKS still pins and bypasses auto-sizing.
@@ -289,7 +289,7 @@ static uint64_t server_kv_budget_bytes(uint64_t weights_resident_bytes) {
 
 /* Admission rule: the already-committed live-session cost plus this request's
  * estimated cost must fit under the budget. Gates the startup session here and
- * every lazy slot provisioning in the scheduler (generate.cpp); an over-budget
+ * every lazy slot provisioning in the scheduler (server_sched.cpp); an over-budget
  * provisioning attempt leaves the job queued until a slot frees (plan Tier 1
  * §1.4). Non-static: the scheduler calls it; unit tests live in this TU. */
 /// @param kv_budget_bytes the admission budget, bytes
@@ -310,7 +310,7 @@ bool server_kv_admits(uint64_t kv_budget_bytes,
  * pulsar_server_internal.h for the 2026-07-15 sizing). avail == 0 means
  * /proc/meminfo was unreadable: fail closed — this guard exists precisely
  * for when other accounting is wrong, so it must not silently disarm
- * itself. Non-static: provision_slot and the eviction precheck (generate.cpp)
+ * itself. Non-static: provision_slot and the eviction precheck (server_sched.cpp)
  * call it; unit tests live in this TU. */
 /// @param avail_bytes MemAvailable in bytes (0 = unreadable: refused)
 /// @param est_bytes the session's estimated cost, bytes

@@ -1062,13 +1062,6 @@ bool server::worker_eviction_could_help(const job *j,
 
 
 
-/* Evict one idle slot (LRU victim): snapshot to the disk kv cache when
- * possible, free the session, release the ledger, and leave the slot entry
- * (provisioned == false) for provision_slot to reuse. Failure honesty: a failed or
- * unavailable snapshot only costs the returning client a re-prefill — the
- * eviction itself proceeds, and the response always belongs to the right
- * conversation because the freed KV can never be read again. Returns false
- * when nothing is evictable. Worker thread only. */
 /* The eviction reset (L179 branch 11): the slot becomes a reusable hole --
  * unprovisioned, SLOT_EVICTED, no gen/job, no ctx, no ledger cost, no
  * scheduler bookkeeping, no continued-store watermark. Only these move: the
@@ -1094,6 +1087,13 @@ static int evict_reset_slot_fields(session_slot *sl) {
     return evicted_ctx;
 }
 
+/* Evict one idle slot (LRU victim): snapshot to the disk kv cache when
+ * possible, free the session, release the ledger, and leave the slot entry
+ * (provisioned == false) for provision_slot to reuse. Failure honesty: a failed or
+ * unavailable snapshot only costs the returning client a re-prefill — the
+ * eviction itself proceeds, and the response always belongs to the right
+ * conversation because the freed KV can never be read again. Returns false
+ * when nothing is evictable. Worker thread only. */
 bool server::worker_evict_one(bool protect[PULSAR_SESSION_POOL_CAP]) {
     PULSAR_NVTX_FN();
     auto *s = this;
@@ -4222,13 +4222,6 @@ bool server::batch_leave(session_slot *sl) {
     return true;
 }
 
-/* plan-34 phase-2 inc 5 — find ONE prefilling slot to FOLD into the fused mixed
- * quantum (P=1). Admissible = main-prefill (not cold), already past its FIRST chunk
- * (bank pos>0, so the driver's pos-0 reject is satisfied — the first chunk stays
- * classic), and with more than one fold-chunk of prompt still left (the FINAL tail
- * <= chunk stays classic; it carries the prefill->decode completion bookkeeping).
- * Its bank is necessarily DISTINCT from every decode bank (different phase). NULL
- * when the flag is off, not in pool mode, or nothing qualifies. */
 /* Deep-concurrent guard (see the enable block in cli_main.cpp): fusing a
  * prefill chunk into a decode quantum whose banks already read a deep
  * aggregate KV working set displaces bandwidth-saturated decode. Blocks while
@@ -4258,6 +4251,13 @@ static bool mixed_deep_guard_blocks(const session_slot *slots, int n_slots, int 
     return n_dec >= 2 && deep > (long)guard_rows;
 }
 
+/* plan-34 phase-2 inc 5 — find ONE prefilling slot to FOLD into the fused mixed
+ * quantum (P=1). Admissible = main-prefill (not cold), already past its FIRST chunk
+ * (bank pos>0, so the driver's pos-0 reject is satisfied — the first chunk stays
+ * classic), and with more than one fold-chunk of prompt still left (the FINAL tail
+ * <= chunk stays classic; it carries the prefill->decode completion bookkeeping).
+ * Its bank is necessarily DISTINCT from every decode bank (different phase). NULL
+ * when the flag is off, not in pool mode, or nothing qualifies. */
 session_slot *server::worker_find_fuse_prefill() {
     PULSAR_NVTX_FN();
     auto *s = this;

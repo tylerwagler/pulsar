@@ -2012,7 +2012,7 @@ struct server {
     double       guard_avail_at;         ///< when it was read (server_now_sec); re-read at most every 0.25 s
     KvBytes      guard_budget_said;      ///< the live budget last logged (a move of 0.5 GiB or more is said)
     /** The stall watchdog (watchdog.cpp).  `stall_s` is written by the watchdog and read by /health (__atomic);
-     *  `worker_tid` / `worker_thread` are set by worker_main for the dump. */
+     *  For the dump, `worker_tid` is set by worker_main and `worker_thread` by cli_main after pthread_create. */
     int          stall_limit_s;          ///< PULSAR_STALL_WATCHDOG_S (0 = off)
     int64_t      stall_s;                ///< seconds the worker has been stalled (0 = progressing)
     int          worker_tid;             ///< the worker's kernel thread id

@@ -393,7 +393,7 @@ bool server::send_root(int fd) {
 /* The phase label set for pulsar:slot_phase. GEN_DECODE_INIT folds into
  * "decode" (it is the transient re-init of a decode attempt, not a state an
  * operator cares to see) and GEN_FINISH/GEN_DONE fold into "finish". Every
- * slot reports all five series with a 0/1 value — the Prometheus state-set
+ * slot reports all six series with a 0/1 value — the Prometheus state-set
  * convention — so the series set is stable and label values never churn. */
 /// The /metrics slot-phase label set, indexed by slot_phase_index().
 static const char *const slot_phase_names[] = {
