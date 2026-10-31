@@ -1,6 +1,18 @@
 /** @file
  *  The DSpark drafter's kernels: Markov steps and chains (single and banked), confidence score, concat seeds. */
 #include "pulsar_cuda_internal.h"
+#include "pulsar_cuda_arch.cuh"   /* pulsar_cuda_smem_opt_in */
+
+/* L335 / L189: every precondition refusal below names its entry and the predicate that failed (they all returned 0
+ * silently, so a refused drafter step was indistinguishable from a launch failure). */
+/// Refuses the enclosing dspark entry (return 0) when `cond` holds, naming the entry and the predicate.
+#define DSPARK_REFUSE_IF(cond)                                                                       \
+    do {                                                                                             \
+        if (cond) {                                                                                  \
+            fprintf(stderr, "pulsar: %s: refused -- %s\n", __func__, #cond);                          \
+            return 0;                                                                                \
+        }                                                                                            \
+    } while (0)
 #include "pulsar_cuda_mx.cuh"   /* L158: pulsar_mx_emit_block for the producer-side E4M3 concat */
 
 
@@ -108,16 +120,18 @@ static uint64_t dspark_markov_w2_bytes(int w2_fmt, uint32_t vocab_size, uint32_t
 /** @def PULSAR_CONF_LAUNCH(A, B)
  *  In pulsar_gpu_dspark_confidence_score_model: launches `dspark_confidence_score_kernel<A, B>`. */
 /** @def PULSAR_MARKOV_BANKS_LAUNCH(A, B)
- *  In dspark_markov_banks_launch: grants `dspark_markov_step_banks_kernel<A, B>` its shared memory once, then
- *  launches it. */
+ *  In dspark_markov_banks_launch: grants `dspark_markov_step_banks_kernel<A, B>` its shared memory (once per device),
+ *  then launches it. */
 
-/// Invokes LAUNCH(A, fmt) for the runtime w2_fmt; returns 0 from the enclosing function on an unknown format.
+/// Invokes LAUNCH(A, fmt) for the runtime w2_fmt; refuses the enclosing function (return 0, said) on an unknown format.
 #define PULSAR_MARKOV_DISPATCH(LAUNCH, A)                                       \
     switch (w2_fmt) {                                                           \
     case PULSAR_MARKOV_W2_F32:   LAUNCH(A, PULSAR_MARKOV_W2_F32);   break;      \
     case PULSAR_MARKOV_W2_BF16:  LAUNCH(A, PULSAR_MARKOV_W2_BF16);  break;      \
     case PULSAR_MARKOV_W2_MXFP8: LAUNCH(A, PULSAR_MARKOV_W2_MXFP8); break;      \
-    default: return 0;                                                          \
+    default:                                                                    \
+        fprintf(stderr, "pulsar: %s: markov w2 format %d has no kernel -- refused\n", __func__, (int)w2_fmt); \
+        return 0;                                                               \
     }
 
 /// One Markov refine step: refined = base + w2 . w1[prev], and each block's argmax.  Grid grid_dim, 256 threads,
@@ -262,7 +276,7 @@ static int dspark_markov_reduce_blocks(const pulsar_gpu_tensor *id_dev,
         (const int32_t *)id_dev->ptr,
         (const float *)val_dev->ptr,
         grid_dim);
-    if (cudaGetLastError() != cudaSuccess) return 0;
+    if (!cuda_ok(cudaGetLastError(), "dspark markov reduce launch")) return 0;
     int32_t out;
     if (!pulsar_gpu_tensor_read(out_dev, 0, &out, sizeof(out))) return 0;
     *refined_id_dst = out;
@@ -283,12 +297,11 @@ int pulsar_gpu_dspark_markov_step_model(
         uint32_t embed_dim,
         int w1_bf16,
         int w2_fmt) {
-    if (!refined_logits || !refined_id_dst || !base_logits || !dspark_model_map)
-        return 0;
-    if (vocab_size == 0 || embed_dim == 0 || embed_dim > 1024) return 0;
-    if (refined_logits->bytes < (uint64_t)vocab_size * sizeof(float)) return 0;
-    if (base_logits->bytes < (uint64_t)vocab_size * sizeof(float)) return 0;
-    if ((uint64_t)prev_token >= vocab_size) return 0;
+    DSPARK_REFUSE_IF(!refined_logits || !refined_id_dst || !base_logits || !dspark_model_map);
+    DSPARK_REFUSE_IF(vocab_size == 0 || embed_dim == 0 || embed_dim > 1024);
+    DSPARK_REFUSE_IF(refined_logits->bytes < (uint64_t)vocab_size * sizeof(float));
+    DSPARK_REFUSE_IF(base_logits->bytes < (uint64_t)vocab_size * sizeof(float));
+    DSPARK_REFUSE_IF((uint64_t)prev_token >= vocab_size);
 
     /* L108 P1: the kernel now takes the previous id by DEVICE pointer (so the
      * chained greedy walk needs no host round-trip). This single-step entry
@@ -296,6 +309,7 @@ int pulsar_gpu_dspark_markov_step_model(
      * stages its host id into a persistent 1-int slot -- one 4-byte H2D per
      * position, noise next to that path's per-position 517 KB qrow read. */
     static thread_local pulsar_gpu_tensor *staged_id = NULL;
+    if (!staged_id && cuda_grow_refused_under_capture("the dspark staged id")) return 0;   /* L335 */
     if (!staged_id) staged_id = pulsar_gpu_tensor_alloc(sizeof(int32_t));
     if (!staged_id) return 0;
     if (!pulsar_gpu_tensor_write(staged_id, 0, &prev_token, sizeof(int32_t)))
@@ -307,11 +321,11 @@ int pulsar_gpu_dspark_markov_step_model(
     const uint64_t w1_bytes =
         (uint64_t)vocab_size * embed_dim * pulsar_w_elt_bytes(w1_bf16);
     const uint64_t w2_bytes = dspark_markov_w2_bytes(w2_fmt, vocab_size, embed_dim);
-    if (!w2_bytes) return 0;
-    if (markov_w1_offset > dspark_model_size ||
-        w1_bytes > dspark_model_size - markov_w1_offset) return 0;
-    if (markov_w2_offset > dspark_model_size ||
-        w2_bytes > dspark_model_size - markov_w2_offset) return 0;
+    DSPARK_REFUSE_IF(!w2_bytes);
+    DSPARK_REFUSE_IF(markov_w1_offset > dspark_model_size ||
+        w1_bytes > dspark_model_size - markov_w1_offset);
+    DSPARK_REFUSE_IF(markov_w2_offset > dspark_model_size ||
+        w2_bytes > dspark_model_size - markov_w2_offset);
 
     const void *w1 = cuda_model_range_ptr(
         dspark_model_map, markov_w1_offset, w1_bytes, "dspark_markov_w1");
@@ -321,9 +335,9 @@ int pulsar_gpu_dspark_markov_step_model(
 
     const uint32_t block_dim = 256;
     /* 4 consecutive v per lane (L213 step 2); the grid covers vocab/4 lanes */
-    if (vocab_size % 4u != 0) return 0;
+    DSPARK_REFUSE_IF(vocab_size % 4u != 0);
     const uint32_t grid_dim = (vocab_size / 4u + block_dim - 1) / block_dim;
-    if (grid_dim > 65535) return 0;
+    DSPARK_REFUSE_IF(grid_dim > 65535);
 
     /* Persistent reduce buffers, grown on demand: grid_dim is fixed for a given
      * vocab, and this runs once per draft position per spec step -- per-call
@@ -359,6 +373,9 @@ int pulsar_gpu_dspark_markov_step_model(
     };
     static thread_local DsparkReduceBufs rb = {};
     if (grid_dim > rb.cap) {
+        /* L335: refused inside a capture; a regrow drops the graphs that baked the old buffers */
+        if (cuda_grow_refused_under_capture("the dspark reduce buffers")) return 0;
+        if (rb.id || rb.val || rb.out) pulsar_gpu_seg_note_device_free();
         pulsar_gpu_tensor_free(rb.id);
         pulsar_gpu_tensor_free(rb.val);
         pulsar_gpu_tensor_free(rb.out);
@@ -446,16 +463,16 @@ int pulsar_gpu_dspark_confidence_score_model(
         uint64_t proj_offset,
         uint32_t n_positions, uint32_t hidden_dim, uint32_t embed_dim, uint32_t vocab_size,
         int w1_bf16, int proj_bf16) {
-    if (!scores || !hidden || !token_ids || !dspark_model_map) return 0;
-    if (n_positions == 0 || hidden_dim == 0 || embed_dim == 0 || vocab_size == 0) return 0;
-    if (scores->bytes < (uint64_t)n_positions * sizeof(float)) return 0;
-    if (hidden->bytes < (uint64_t)n_positions * hidden_dim * sizeof(float)) return 0;
-    if (token_ids->bytes < (uint64_t)n_positions * sizeof(int32_t)) return 0;
+    DSPARK_REFUSE_IF(!scores || !hidden || !token_ids || !dspark_model_map);
+    DSPARK_REFUSE_IF(n_positions == 0 || hidden_dim == 0 || embed_dim == 0 || vocab_size == 0);
+    DSPARK_REFUSE_IF(scores->bytes < (uint64_t)n_positions * sizeof(float));
+    DSPARK_REFUSE_IF(hidden->bytes < (uint64_t)n_positions * hidden_dim * sizeof(float));
+    DSPARK_REFUSE_IF(token_ids->bytes < (uint64_t)n_positions * sizeof(int32_t));
     /* Each sized by its OWN storage width -- w1 and proj are separate tensors. */
     const uint64_t w1_bytes = (uint64_t)vocab_size * embed_dim * pulsar_w_elt_bytes(w1_bf16);
     const uint64_t proj_bytes = (uint64_t)(hidden_dim + embed_dim) * pulsar_w_elt_bytes(proj_bf16);
-    if (markov_w1_offset > dspark_model_size || w1_bytes > dspark_model_size - markov_w1_offset) return 0;
-    if (proj_offset > dspark_model_size || proj_bytes > dspark_model_size - proj_offset) return 0;
+    DSPARK_REFUSE_IF(markov_w1_offset > dspark_model_size || w1_bytes > dspark_model_size - markov_w1_offset);
+    DSPARK_REFUSE_IF(proj_offset > dspark_model_size || proj_bytes > dspark_model_size - proj_offset);
     const void *w1 = cuda_model_range_ptr(dspark_model_map, markov_w1_offset, w1_bytes, "dspark_conf_w1");
     const void *proj = cuda_model_range_ptr(dspark_model_map, proj_offset, proj_bytes, "dspark_conf_proj");
     if (!w1 || !proj) return 0;
@@ -506,9 +523,9 @@ int pulsar_gpu_dspark_hc_mean_reduce_batch(
         uint32_t n_embd,
         uint32_t n_hc,
         uint32_t n_tokens) {
-    if (!out || !hc_batch || n_embd == 0 || n_hc == 0 || n_tokens == 0) return 0;
-    if (out->bytes < (uint64_t)n_tokens * n_embd * sizeof(float)) return 0;
-    if (hc_batch->bytes < (uint64_t)n_tokens * n_hc * n_embd * PULSAR_HC_ELT_SIZE) return 0;   /* carrier */
+    DSPARK_REFUSE_IF(!out || !hc_batch || n_embd == 0 || n_hc == 0 || n_tokens == 0);
+    DSPARK_REFUSE_IF(out->bytes < (uint64_t)n_tokens * n_embd * sizeof(float));
+    DSPARK_REFUSE_IF(hc_batch->bytes < (uint64_t)n_tokens * n_hc * n_embd * PULSAR_HC_ELT_SIZE);   /* carrier */
 
     const uint32_t block_dim = 256;
     dim3 grid((n_embd + block_dim - 1) / block_dim, n_tokens, 1);
@@ -644,13 +661,12 @@ int pulsar_gpu_distill_top64_tensor(
         pulsar_gpu_tensor *tail_lse,
         pulsar_gpu_tensor *inexact,
         uint32_t row0) {
-    if (!logits_rows || !top_ids || !top_vals || !tail_lse || !inexact ||
-        n_rows == 0 || vocab == 0)
-        return 0;
-    if (logits_rows->bytes < (uint64_t)n_rows * vocab * sizeof(float)) return 0;
-    if (top_ids->bytes < (uint64_t)(row0 + n_rows) * 64 * sizeof(int32_t)) return 0;
-    if (top_vals->bytes < (uint64_t)(row0 + n_rows) * 64 * sizeof(uint16_t)) return 0;
-    if (tail_lse->bytes < (uint64_t)(row0 + n_rows) * sizeof(uint16_t)) return 0;
+    DSPARK_REFUSE_IF(!logits_rows || !top_ids || !top_vals || !tail_lse || !inexact ||
+        n_rows == 0 || vocab == 0);
+    DSPARK_REFUSE_IF(logits_rows->bytes < (uint64_t)n_rows * vocab * sizeof(float));
+    DSPARK_REFUSE_IF(top_ids->bytes < (uint64_t)(row0 + n_rows) * 64 * sizeof(int32_t));
+    DSPARK_REFUSE_IF(top_vals->bytes < (uint64_t)(row0 + n_rows) * 64 * sizeof(uint16_t));
+    DSPARK_REFUSE_IF(tail_lse->bytes < (uint64_t)(row0 + n_rows) * sizeof(uint16_t));
     distill_top64_lse_kernel<<<n_rows, 256>>>(
         (const float *)logits_rows->ptr, vocab,
         (int32_t *)top_ids->ptr, (uint16_t *)top_vals->ptr,
@@ -922,11 +938,11 @@ static int dspark_markov_banks_launch(
     const uint64_t w1_bytes =
         (uint64_t)vocab_size * embed_dim * pulsar_w_elt_bytes(w1_bf16);
     const uint64_t w2_bytes = dspark_markov_w2_bytes(w2_fmt, vocab_size, embed_dim);
-    if (!w2_bytes) return 0;
-    if (markov_w1_offset > dspark_model_size ||
-        w1_bytes > dspark_model_size - markov_w1_offset) return 0;
-    if (markov_w2_offset > dspark_model_size ||
-        w2_bytes > dspark_model_size - markov_w2_offset) return 0;
+    DSPARK_REFUSE_IF(!w2_bytes);
+    DSPARK_REFUSE_IF(markov_w1_offset > dspark_model_size ||
+        w1_bytes > dspark_model_size - markov_w1_offset);
+    DSPARK_REFUSE_IF(markov_w2_offset > dspark_model_size ||
+        w2_bytes > dspark_model_size - markov_w2_offset);
     const void *w1 = cuda_model_range_ptr(
         dspark_model_map, markov_w1_offset, w1_bytes, "dspark_markov_w1");
     const void *w2 = cuda_model_range_ptr(
@@ -935,12 +951,15 @@ static int dspark_markov_banks_launch(
 
     const uint32_t block_dim = 256;
     /* 4 consecutive v per lane (L213 step 2); the grid covers vocab/4 lanes */
-    if (vocab_size % 4u != 0) return 0;
+    DSPARK_REFUSE_IF(vocab_size % 4u != 0);
     const uint32_t grid_dim = (vocab_size / 4u + block_dim - 1) / block_dim;
-    if (grid_dim > 65535) return 0;
+    DSPARK_REFUSE_IF(grid_dim > 65535);
     static thread_local DsparkReduceBufsBanks bb = {};
     const uint32_t need = n_banks * grid_dim;
     if (need > bb.cap) {
+        /* L335: refused inside a capture; a regrow drops the graphs that baked the old buffers */
+        if (cuda_grow_refused_under_capture("the dspark banked reduce buffers")) return 0;
+        if (bb.id || bb.val) pulsar_gpu_seg_note_device_free();
         pulsar_gpu_tensor_free(bb.id);
         pulsar_gpu_tensor_free(bb.val);
         const uint32_t cap = PULSAR_DSPARK_BANKS_MAX * grid_dim;
@@ -952,7 +971,7 @@ static int dspark_markov_banks_launch(
 
     int32_t *ids = (int32_t *)ids_dev->ptr;
     /* the banks' w1 rows in shared memory: up to 16 x 1024 f32 = 64 KB, past the
-     * 48 KB default, so the kernel opts in once per instantiation */
+     * 48 KB default, so the kernel opts in once per (instantiation, device) */
     const size_t smem = (size_t)n_banks * embed_dim * sizeof(float);
     const size_t smem_max = (size_t)PULSAR_DSPARK_BANKS_MAX * 1024u * sizeof(float);
     for (uint32_t pos = pos_first; pos < pos_first + pos_count; pos++) {
@@ -960,12 +979,11 @@ static int dspark_markov_banks_launch(
         const uint32_t prev_stride = prev_override ? 1u : ids_stride;
 #define PULSAR_MARKOV_BANKS_LAUNCH(A, B)                                    \
         do {                                                                \
-            static bool smem_set = false;                                   \
-            if (!smem_set) {                                                \
-                if (cudaFuncSetAttribute(dspark_markov_step_banks_kernel<A, B>, \
-                        cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem_max) != cudaSuccess) \
-                    return 0;                                               \
-                smem_set = true;                                            \
+            static int smem_set[PULSAR_CUDA_DEVICE_SLOTS] = {};   /* per device (L335) */ \
+            if (!pulsar_cuda_smem_opt_in((const void *)dspark_markov_step_banks_kernel<A, B>, smem_set, smem_max)) { \
+                fprintf(stderr, "pulsar: dspark banked markov: %zu B of shared memory refused by the device -- " \
+                                "refused\n", smem_max);                     \
+                return 0;                                                   \
             }                                                               \
             dspark_markov_step_banks_kernel<A, B><<<grid_dim, block_dim, smem>>>( \
                 (float *)refined_logits->ptr,                               \
@@ -1012,7 +1030,7 @@ int pulsar_gpu_dspark_markov_step_banks_model(
         uint64_t markov_w1_offset, uint64_t markov_w2_offset,
         uint32_t n_banks, uint32_t pos, uint32_t vocab_size, uint32_t embed_dim,
         int w1_bf16, int w2_fmt) {
-    if (!prev_dev || prev_dev->bytes < (uint64_t)n_banks * sizeof(int32_t)) return 0;
+    DSPARK_REFUSE_IF(!prev_dev || prev_dev->bytes < (uint64_t)n_banks * sizeof(int32_t));
     if (!dspark_markov_banks_args_ok(refined_logits, ids_dev, ids_stride, base_logits,
                                      base_row_stride_bytes, base_row_dev, n_banks, pos + 1,
                                      vocab_size, embed_dim))
@@ -1074,8 +1092,8 @@ int pulsar_gpu_dspark_concat3_e4m3_rows(void *slot_data, void *slot_scale, int s
                                         const pulsar_gpu_tensor *h0, const pulsar_gpu_tensor *h1,
                                         const pulsar_gpu_tensor *h2, const uint32_t *src_rows,
                                         uint32_t n_rows, uint32_t n_embd) {
-    if (!slot_data || !slot_scale || !h0 || !h1 || !h2 || !src_rows || n_rows == 0 ||
-        n_rows > PULSAR_DSPARK_SEED_ROWS || n_embd == 0 || n_embd % 32u != 0) return 0;
+    DSPARK_REFUSE_IF(!slot_data || !slot_scale || !h0 || !h1 || !h2 || !src_rows || n_rows == 0 ||
+        n_rows > PULSAR_DSPARK_SEED_ROWS || n_embd == 0 || n_embd % 32u != 0);
     dspark_concat_rows rows = {};
     uint32_t max_src = 0;
     for (uint32_t i = 0; i < n_rows; i++) {
@@ -1083,7 +1101,7 @@ int pulsar_gpu_dspark_concat3_e4m3_rows(void *slot_data, void *slot_scale, int s
         if (src_rows[i] > max_src) max_src = src_rows[i];
     }
     const uint64_t need = ((uint64_t)max_src + 1u) * n_embd * sizeof(float);
-    if (h0->bytes < need || h1->bytes < need || h2->bytes < need) return 0;
+    DSPARK_REFUSE_IF(h0->bytes < need || h1->bytes < need || h2->bytes < need);
     const uint32_t warps = 3u * n_embd / 32u;
     dspark_concat3_e4m3_kernel<<<dim3((warps * 32u + 255u) / 256u, n_rows), 256>>>(
         (const float *)h0->ptr, (const float *)h1->ptr, (const float *)h2->ptr, n_embd, rows,

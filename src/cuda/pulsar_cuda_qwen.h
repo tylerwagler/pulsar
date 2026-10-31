@@ -145,7 +145,8 @@ typedef struct pulsar_rows_linear {
 /** L251 MTP: the head-side weights of the input combine (the sidecar's tensors). */
 typedef struct {
     const uint16_t *embd;            /**< the trunk's embed_tokens, bf16 [n_vocab][2560] */
-    /// Rows of `embd` (the trunk's vocabulary); mtp_norm_embed_kernel reads row 0 for an id outside [0, n_vocab).
+    /// Rows of `embd` (the trunk's vocabulary).  The kernel indexes it unclamped: the caller refuses an id outside
+    /// [0, n_vocab) on the host before the launch (pulsar_qwen_s4_mtp_combine).
     int n_vocab;
     const uint16_t *norm_embd;       /**< mtp.pre_fc_norm_embedding bf16 [2560] */
     const uint16_t *norm_hidden;     /**< mtp.pre_fc_norm_hidden bf16 [10240] */
@@ -163,7 +164,8 @@ typedef struct {
 size_t pulsar_qwen_mtp_combine_workspace_bytes(void);
 /// @param w           the MTP head-side weights
 /// @param h_streams   device bf16 [T][4][2560] the trunk's pre-mixer streams
-/// @param tokens      device int32 [T] the next tokens
+/// @param tokens      device int32 [T] the next tokens, each in [0, w->n_vocab) -- checked by the caller on the host
+///                    (the kernel indexes the table unclamped)
 /// @param T           rows
 /// @param out_streams device bf16 [T][4][2560] the MTP layer's starting streams
 /// @param ws          device workspace
@@ -261,7 +263,8 @@ const void *const *pulsar_exl3_expert_table(const void *stack, uint32_t n_expert
 /** tokens (device i32 [T]) -> streams bf16 [T][4][2560]: each token's
  *  embed_tokens row (bf16 [n_vocab][2560]) repeated into the 4 streams. */
 /// @param table   device bf16 [n_vocab][2560] embed_tokens
-/// @param tokens  device int32 [T] token ids
+/// @param tokens  device int32 [T] token ids, each in [0, n_vocab) -- checked by the caller on the host
+///                (pulsar_qwen_s4_embed); the kernel indexes the table unclamped
 /// @param T       rows
 /// @param n_vocab rows in the table
 /// @param streams device bf16 [T][4][2560] out

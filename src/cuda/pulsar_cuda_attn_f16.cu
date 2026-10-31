@@ -1434,9 +1434,9 @@ static uint32_t af16_split_target_blocks(void) {
  * slot hands back the SAME bytes (pulsar_cuda_scratch.h) -- so this is
  * dedicated storage, per thread like the CUDA streams, grown on demand and
  * kept.  cudaFree of the outgrown block synchronises the device, so the
- * combine that read it has finished.  (Not capture-safe: a graph-captured
- * step would have to size this before capture.) */
-/// The thread-local split-K partial buffer, grown on demand (not capture-safe).
+ * combine that read it has finished.  It cannot grow inside a graph capture: a captured step refuses (L335) -- the
+ * warmup's eager use of each shape sizes it first. */
+/// The thread-local split-K partial buffer, grown on demand (refused inside a capture).
 /// @param n_dec split-K rows.
 /// @param n_head query heads.
 /// @param n_split splits per (row, head).
@@ -1446,7 +1446,9 @@ static float *af16_partials(uint32_t n_dec, uint32_t n_head, uint32_t n_split) {
     static thread_local uint64_t cap = 0;
     const uint64_t need = (uint64_t)n_dec * n_head * n_split * AF16_PART_STRIDE * sizeof(float);
     if (need > cap) {
-        if (buf) { (void)cudaFree(buf); buf = NULL; cap = 0; }
+        /* L335: refused inside a capture; a regrow drops the graphs that baked the old buffer */
+        if (cuda_grow_refused_under_capture("attn f16 split-K partials")) return NULL;
+        if (buf) { pulsar_gpu_seg_note_device_free(); (void)cudaFree(buf); buf = NULL; cap = 0; }
         void *p = NULL;
         const cudaError_t e = cudaMalloc(&p, (size_t)need);
         if (e != cudaSuccess) {

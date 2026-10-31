@@ -17,7 +17,8 @@ namespace {
  * the source's `inputs_embeds.repeat(1, 1, hc_count)`) */
 /** Token embedding into the HC residual streams.  Grid = T blocks (one per token), block = 256 threads, no smem.
  *  @param table   embed_tokens, bf16 [n_vocab][PULSAR_QWEN_HIDDEN] viewed as uint4 (16 B, 8 bf16) chunks; 16-B aligned
- *  @param tokens  device int32 [T] token ids (not range-checked here)
+ *  @param tokens  device int32 [T] token ids in [0, n_vocab): the host refuses any other before the launch
+ *                 (pulsar_qwen_s4_embed), so the kernel indexes the table unclamped
  *  @param streams out, bf16 [T][PULSAR_QWEN_HC][PULSAR_QWEN_HIDDEN] as uint4 chunks; 16-B aligned */
 __global__ void __launch_bounds__(256)
 qwen_embed_kernel(const uint4 *__restrict__ table, const int32_t *__restrict__ tokens,

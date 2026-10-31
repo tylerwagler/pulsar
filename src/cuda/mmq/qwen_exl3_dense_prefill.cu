@@ -34,6 +34,8 @@
 
 #include <cstdio>
 #include "cuda/pulsar_cuda_lt_fixed.h"
+#include "cuda/pulsar_cuda_arch.cuh"   /* pulsar_cuda_smem_opt_in */
+#include "pulsar_gpu.h"   /* pulsar_gpu_seg_note_device_free */
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 
@@ -154,10 +156,14 @@ dense_epilogue_kernel(float *__restrict__ y, const float *__restrict__ tail, con
         *p = make_float4(z[0] * __low2float(v01), z[1] * __high2float(v01), z[2] * __low2float(v23), z[3] * __high2float(v23));
 }
 
-/// The arm's one device scratch (W_q, the plane, the row scales, the tail), grown to the largest call; never freed.
-uint8_t *g_scratch = nullptr;
-/// Bytes of g_scratch.
-size_t g_scratch_bytes = 0;
+/* The arm's device scratch (W_q, the plane, the row scales, the tail), grown to the largest call; never freed.  ONE
+ * PER DEVICE (L335: it was one process-wide buffer -- a TP rank on device 1 was handed device 0's memory), and a
+ * regrow invalidates the captured graphs (pulsar_gpu_seg_note_device_free: a graph that baked the old pointer would
+ * replay into freed memory) and refuses inside a capture (a free / malloc cannot be recorded). */
+/// Per device: the scratch base.
+uint8_t *g_scratch[PULSAR_CUDA_DEVICE_SLOTS] = {};
+/// Per device: its bytes.
+size_t g_scratch_bytes[PULSAR_CUDA_DEVICE_SLOTS] = {};
 
 /// @param b  bytes
 /// @return   b rounded up to a multiple of 256
@@ -177,20 +183,34 @@ int qwen_exl3_dense_prefill_launch(const void *w, int k2, const void *x_bf16, fl
     const size_t wq_b = up256((size_t)K * N * sizeof(__half)), pl_b = up256((size_t)M * K * sizeof(__half));
     const size_t tail_b = Ny == N ? 0 : up256((size_t)M * 128 * sizeof(float));
     const size_t need = wq_b + pl_b + up256((size_t)M * sizeof(float)) + tail_b;
-    if (need > g_scratch_bytes) {
-        if (g_scratch) cudaFree(g_scratch);
-        g_scratch = nullptr;
-        g_scratch_bytes = 0;
-        if (cudaMalloc(&g_scratch, need) != cudaSuccess) {
+    const int dev = pulsar_cuda_device_slot();
+    if (dev < 0) return -1;
+    if (need > g_scratch_bytes[dev]) {
+        cudaStreamCaptureStatus cs = cudaStreamCaptureStatusNone;
+        if (cudaStreamIsCapturing(stream, &cs) != cudaSuccess || cs != cudaStreamCaptureStatusNone) {
+            (void)cudaGetLastError();
+            fprintf(stderr, "%s: the scratch must grow to %zu bytes inside a graph capture -- refusing\n", tag, need);
+            return -1;
+        }
+        if (g_scratch[dev]) {
+            pulsar_gpu_seg_note_device_free();   /* graphs that baked the old scratch die with it */
+            (void)cudaFree(g_scratch[dev]);
+        }
+        g_scratch[dev] = nullptr;
+        g_scratch_bytes[dev] = 0;
+        if (cudaMalloc(&g_scratch[dev], need) != cudaSuccess) {
+            (void)cudaGetLastError();
+            g_scratch[dev] = nullptr;
             fprintf(stderr, "%s: scratch of %zu bytes refused -- refusing\n", tag, need);
             return -1;
         }
-        g_scratch_bytes = need;
+        g_scratch_bytes[dev] = need;
     }
-    __half *wq = reinterpret_cast<__half *>(g_scratch);
-    __half *xhi = reinterpret_cast<__half *>(g_scratch + wq_b);
-    float *inv = reinterpret_cast<float *>(g_scratch + wq_b + pl_b);
-    float *tail = Ny != N ? reinterpret_cast<float *>(g_scratch + wq_b + pl_b + up256((size_t)M * sizeof(float))) : nullptr;
+    uint8_t *const scr = g_scratch[dev];
+    __half *wq = reinterpret_cast<__half *>(scr);
+    __half *xhi = reinterpret_cast<__half *>(scr + wq_b);
+    float *inv = reinterpret_cast<float *>(scr + wq_b + pl_b);
+    float *tail = Ny != N ? reinterpret_cast<float *>(scr + wq_b + pl_b + up256((size_t)M * sizeof(float))) : nullptr;
     const uint32_t *tr = static_cast<const uint32_t *>(w);
     const __half *suh = reinterpret_cast<const __half *>(static_cast<const uint8_t *>(w) + trellis_bytes);
     const __half *svh = suh + K;
@@ -211,16 +231,11 @@ int qwen_exl3_dense_prefill_launch(const void *w, int k2, const void *x_bf16, fl
     /* the prep holds one row's K f32 in shared memory: past the 48 KiB a launch gets by default (K > 12288 -- L295:
      * Inkling's dense down, K 16384) the kernel opts in once to the larger carve-out.  The arithmetic is unchanged. */
     const size_t prep_smem = (size_t)K * sizeof(float);
-    static size_t prep_smem_set = 48u * 1024u;
-    if (prep_smem > prep_smem_set) {
-        if (cudaFuncSetAttribute(dense_prep_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)prep_smem) !=
-            cudaSuccess) {
-            fprintf(stderr, "%s: the prep's %zu B of shared memory (K=%d) is refused by the device -- refusing\n", tag,
-                    prep_smem, K);
-            (void)cudaGetLastError();
-            return -1;
-        }
-        prep_smem_set = prep_smem;
+    static int prep_smem_set[PULSAR_CUDA_DEVICE_SLOTS] = {};   /* per device (L335: process-wide before) */
+    if (prep_smem > 48u * 1024u && !pulsar_cuda_smem_opt_in((const void *)dense_prep_kernel, prep_smem_set, prep_smem)) {
+        fprintf(stderr, "%s: the prep's %zu B of shared memory (K=%d) is refused by the device -- refusing\n", tag,
+                prep_smem, K);
+        return -1;
     }
     dense_prep_kernel<<<M, 256, prep_smem, stream>>>(static_cast<const __nv_bfloat16 *>(x_bf16), suh, xhi, inv, K);
     /* the whole GEMM, or (a logical width short of the stored one) its 128-multiple head into y and its last stored

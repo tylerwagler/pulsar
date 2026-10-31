@@ -87,8 +87,6 @@ static int g_model_cache_full;
 static int g_model_mapping_failure_notice_printed;
 
 
-/// A prefetch stream, destroyed at cleanup.  TODO(dox): nothing in this file creates or uses it besides the teardown.
-static cudaStream_t g_model_prefetch_stream;
 
 
 /// The non-blocking stream the staged fd route uploads chunks on (created with the staging pool).
@@ -354,24 +352,27 @@ static const char *cuda_model_range_populate_device_copy(const void *model_map,
      * cudaMemcpy from a partially-registered host range fails with
      * cudaErrorInvalidValue -- that is what aborted model load on GB10 (L028).
      * That fallback is gone, so the hazard should be too, but staging is what
-     * the fd path has always done and it costs one pinned chunk. */
+     * the fd path has always done and it costs one pinned chunk.  The bounce is
+     * the ONE route: when it cannot be allocated the range refuses by name
+     * (L335: it used to copy straight from the mapping instead -- rule 1). */
     void *bounce = NULL;
     const uint64_t bounce_bytes = bytes < chunk ? bytes : chunk;
-    if (cudaMallocHost(&bounce, (size_t)bounce_bytes) != cudaSuccess) {
+    err = cudaMallocHost(&bounce, (size_t)bounce_bytes);
+    if (err != cudaSuccess) {
         (void)cudaGetLastError();
-        bounce = NULL;  /* fall back to the direct copy below */
+        fprintf(stderr, "pulsar: CUDA model range staging for %s: the %.2f MiB pinned bounce could not be allocated "
+                        "(%s) -- refusing\n", what ? what : "weights", (double)bounce_bytes / 1048576.0,
+                cudaGetErrorString(err));
+        (void)cudaFree(dev);
+        return NULL;
     }
 
     for (uint64_t done = 0; done < bytes; done += chunk) {
         uint64_t n = bytes - done < chunk ? bytes - done : chunk;
-        const void *csrc = src + done;
-        if (bounce) {
-            memcpy(bounce, src + done, (size_t)n);
-            csrc = bounce;
-        }
-        err = cudaMemcpy((char *)dev + done, csrc, (size_t)n, cudaMemcpyHostToDevice);
+        memcpy(bounce, src + done, (size_t)n);
+        err = cudaMemcpy((char *)dev + done, bounce, (size_t)n, cudaMemcpyHostToDevice);
         if (err != cudaSuccess) {
-            if (bounce) (void)cudaFreeHost(bounce);
+            (void)cudaFreeHost(bounce);
             fprintf(stderr, "pulsar: CUDA model range copy failed for %s at %.2f/%.2f MiB: %s\n",
                     what ? what : "weights",
                     (double)done / 1048576.0,
@@ -382,7 +383,7 @@ static const char *cuda_model_range_populate_device_copy(const void *model_map,
             return NULL;
         }
     }
-    if (bounce) (void)cudaFreeHost(bounce);
+    (void)cudaFreeHost(bounce);
     g_model_ranges.push_back({model_map, offset, bytes, (char *)dev, NULL, NULL, 0, 0, 0});
     g_model_range_by_offset[{model_map, offset}] = g_model_ranges.size() - 1u;
     g_model_range_bytes += bytes;
@@ -544,8 +545,8 @@ const char *cuda_model_range_ptr(const void *model_map, uint64_t offset, uint64_
                 "pulsar: FATAL: no supported route to place model weights on the GPU.\n"
                 "pulsar:   The staged fd path failed for %s (%.2f MiB at offset %llu).\n"
                 "pulsar:   Most likely the weight cache is exhausted: %.2f GiB already\n"
-                "pulsar:   cached against a %.2f GiB limit. Raise\n"
-                "pulsar:   PULSAR_CUDA_WEIGHT_CACHE_LIMIT_GB, or serve a smaller model.\n"
+                "pulsar:   cached against a %.2f GiB limit (the device's memory less its\n"
+                "pulsar:   scratch headroom -- not a setting). Serve a smaller model.\n"
                 "pulsar:   Refusing to start rather than fall back to a path measured at\n"
                 "pulsar:   2x slower prefill and 3x slower decode.\n",
                 what ? what : "weights",
@@ -1009,6 +1010,23 @@ static char *cuda_model_arena_alloc(uint64_t bytes, const char *what) {
     return (char *)dev;
 }
 
+/* L335: a span whose staging failed goes back to its arena.  The fd route allocated the span, then returned NULL on a
+ * failed read / copy / sync and left it allocated -- a hole no range ever used, out of the memory the bank pool is
+ * sized from.  The span is always its arena's last allocation (the load is single-threaded and nothing takes a span
+ * in between), so the bump pointer is rewound over it. */
+/** Returns the arena's last span to it.
+ *  @param span  the span cuda_model_arena_alloc returned
+ *  @param bytes the size it was asked for (rounded as it rounded it) */
+static void cuda_model_arena_unwind(char *span, uint64_t bytes) {
+    const uint64_t aligned = (bytes + 4095u) & ~(uint64_t)4095u;
+    for (cuda_model_arena &a : g_model_arenas) {
+        if (span >= a.device_ptr && span + aligned == a.device_ptr + a.used) {
+            a.used = (uint64_t)(span - a.device_ptr);
+            return;
+        }
+    }
+}
+
 
 
 /* A raw host pointer is safe for kernels only once CUDA has registered the
@@ -1048,6 +1066,14 @@ static const char *cuda_model_range_ptr_from_fd(
     if (!dev) {
         return cuda_model_direct_fallback_ptr(model_map, offset);
     }
+    /* every failure below hands the span back (cuda_model_arena_unwind), after the copies already queued into it
+     * have drained */
+    auto unwind = [dev, bytes]() -> const char * {
+        (void)cudaStreamSynchronize(g_model_upload_stream);
+        (void)cudaGetLastError();
+        cuda_model_arena_unwind(dev, bytes);
+        return NULL;
+    };
     /* PULSAR_VERIFY_RANGES also announces WHERE each span landed: the device
      * alignment of the weights is a performance fact (L239), and the RANGE
      * lines below hash bytes without saying where they live. */
@@ -1059,7 +1085,7 @@ static const char *cuda_model_range_ptr_from_fd(
     const uint64_t chunk = cuda_model_copy_chunk_bytes();
     const uint64_t align = model_fd_max_align();
     const uint64_t stage_bytes = chunk + (align > 1 ? align : 1);
-    if (!cuda_model_stage_pool_alloc(stage_bytes)) return NULL;
+    if (!cuda_model_stage_pool_alloc(stage_bytes)) return unwind();
 
     uint64_t copied = 0;
     uint64_t chunk_idx = 0;
@@ -1071,8 +1097,7 @@ static const char *cuda_model_range_ptr_from_fd(
             if (err != cudaSuccess) {
                 fprintf(stderr, "pulsar: CUDA model staging wait failed for %s: %s\n",
                         what ? what : "weights", cudaGetErrorString(err));
-                (void)cudaGetLastError();
-                return NULL;
+                return unwind();
             }
         }
         const char *payload = NULL;
@@ -1082,7 +1107,7 @@ static const char *cuda_model_range_ptr_from_fd(
                     what ? what : "weights",
                     (double)copied / 1048576.0,
                     strerror(errno));
-            return NULL;
+            return unwind();
         }
         err = cudaMemcpyAsync(dev + copied, payload, (size_t)n,
                               cudaMemcpyHostToDevice, g_model_upload_stream);
@@ -1091,15 +1116,13 @@ static const char *cuda_model_range_ptr_from_fd(
                     what ? what : "weights",
                     (double)copied / 1048576.0,
                     cudaGetErrorString(err));
-            (void)cudaGetLastError();
-            return NULL;
+            return unwind();
         }
         err = cudaEventRecord(g_model_stage_event[bi], g_model_upload_stream);
         if (err != cudaSuccess) {
             fprintf(stderr, "pulsar: CUDA model staging record failed for %s: %s\n",
                     what ? what : "weights", cudaGetErrorString(err));
-            (void)cudaGetLastError();
-            return NULL;
+            return unwind();
         }
         cuda_model_drop_file_pages(model_map, offset + copied, n);
         cuda_model_discard_source_pages(model_map, g_model_registered_size, offset + copied, n);
@@ -1111,8 +1134,7 @@ static const char *cuda_model_range_ptr_from_fd(
     if (err != cudaSuccess) {
         fprintf(stderr, "pulsar: CUDA model range upload sync failed for %s: %s\n",
                 what ? what : "weights", cudaGetErrorString(err));
-        (void)cudaGetLastError();
-        return NULL;
+        return unwind();
     }
 
     g_model_ranges.push_back({model_map, offset, bytes, dev, NULL, NULL, 0, 0, 1});
@@ -1367,7 +1389,11 @@ int pulsar_gpu_init(void) {
     int dev = 0;
     if (!cuda_ok(cudaSetDevice(dev), "set device")) return 0;
     cudaDeviceProp prop;
-    if (cudaGetDeviceProperties(&prop, dev) == cudaSuccess) {
+    /* L335: the device checks below are the gate every lane relies on; a failed property query used to skip them
+     * all and report the backend ready.  It refuses instead. */
+    if (!cuda_ok(cudaGetDeviceProperties(&prop, dev), "device properties (the arch and sm_75 checks need them)"))
+        return 0;
+    {
         fprintf(stderr, "pulsar: CUDA backend initialized on %s (sm_%d%d)\n",
                 prop.name, prop.major, prop.minor);
         if (!cuda_tu_archs_ok(&prop)) return 0;
@@ -1451,10 +1477,6 @@ void pulsar_gpu_cleanup(void) {
     g_model_fd_count = 0;
     g_model_cache_full = 0;
     g_model_mapping_failure_notice_printed = 0;
-    if (g_model_prefetch_stream) {
-        (void)cudaStreamDestroy(g_model_prefetch_stream);
-        g_model_prefetch_stream = NULL;
-    }
 }
 
 
@@ -1950,6 +1972,8 @@ std::list<uint64_t> g_seg_lru;               ///< the live keys, most recently u
 /// A segment capture is open on this process (pulsar_gpu_seg_enter .. exit).
 bool g_seg_capturing = false;
 bool g_seg_reset_pending = false;            ///< a scratch regrow during a capture: drop every exec after it
+/// pulsar_gpu_seg_reset during a capture: the FULL reset (every key, the catalog too) runs at seg_exit
+bool g_seg_full_reset_pending = false;
 bool g_seg_catalog_on = false;               ///< the warmup's declaration window is open
 bool g_seg_catalog_done = false;             ///< a warmup declared a catalog and closed (a regrow after it is news)
 bool g_seg_off = false;                      ///< L296 perf: an instrument's eager reference (never the engine)
@@ -2063,6 +2087,15 @@ void seg_drop_graphs(void) {
     g_seg_reset_pending = false;
 }
 
+/* What a capture that just closed owes: pulsar_gpu_seg_reset asked for during it is the full reset (every key and the
+ * catalog dropped -- a graph teardown), a scratch regrow during it the drop of every exec (the catalog kept).  L335:
+ * both used to set one flag, so a reset under capture came out as the partial drop. */
+/// Runs the reset or the regrow drop a capture deferred (seg_exit, after g_seg_capturing is cleared).
+void seg_settle_pending(void) {
+    if (g_seg_full_reset_pending) pulsar_gpu_seg_reset();
+    else if (g_seg_reset_pending) seg_drop_graphs();
+}
+
 }  // namespace
 
 int pulsar_gpu_seg_enter(uint64_t key) {
@@ -2119,14 +2152,14 @@ int pulsar_gpu_seg_exit(uint64_t key, int body_ok) {
         if (g_seg_catalog_on) g_seg_catalog_refused++;
         if (gr) (void)cudaGraphDestroy(gr);
         (void)cudaGetLastError();
-        if (g_seg_reset_pending) seg_drop_graphs();
+        seg_settle_pending();
         return 0;
     }
     if (rc != cudaSuccess || !gr) {
         if (gr) (void)cudaGraphDestroy(gr);
         seg_kill(key, e, "capture", rc != cudaSuccess ? rc : cudaErrorStreamCaptureInvalidated);
         g_seg_st.refusals++;
-        if (g_seg_reset_pending) seg_drop_graphs();
+        seg_settle_pending();
         return 0;
     }
     cudaGraphExec_t ex = NULL;
@@ -2139,7 +2172,7 @@ int pulsar_gpu_seg_exit(uint64_t key, int body_ok) {
     if (ri != cudaSuccess) {
         seg_kill(key, e, "instantiate", ri);
         g_seg_st.refusals++;
-        if (g_seg_reset_pending) seg_drop_graphs();
+        seg_settle_pending();
         return 0;
     }
     const cudaError_t rl = cudaGraphLaunch(ex, cudaStreamPerThread);
@@ -2147,14 +2180,14 @@ int pulsar_gpu_seg_exit(uint64_t key, int body_ok) {
         (void)cudaGraphExecDestroy(ex);
         seg_kill(key, e, "first launch", rl);
         g_seg_st.refusals++;
-        if (g_seg_reset_pending) seg_drop_graphs();
+        seg_settle_pending();
         return 0;
     }
-    if (g_seg_reset_pending) {
-        /* a scratch regrow DURING this capture: the graph ran (the work is done) but its baked pointers may be stale
-         * for later replays -- drop every exec */
+    if (g_seg_reset_pending || g_seg_full_reset_pending) {
+        /* a scratch regrow (or a reset) DURING this capture: the graph ran (the work is done) but its baked pointers
+         * may be stale for later replays -- drop every exec (a reset: every key too) */
         (void)cudaGraphExecDestroy(ex);
-        seg_drop_graphs();
+        seg_settle_pending();
         return 1;
     }
     e.exec = ex;
@@ -2166,14 +2199,15 @@ int pulsar_gpu_seg_exit(uint64_t key, int body_ok) {
 
 /// Drops every key and exec (deferred to seg_exit while a capture is open).
 void pulsar_gpu_seg_reset(void) {
-    if (g_seg_capturing) {   /* mid-capture: deferred to seg_exit */
-        g_seg_reset_pending = true;
+    if (g_seg_capturing) {   /* mid-capture: deferred to seg_exit -- as the FULL reset (L335: it was the regrow's drop) */
+        g_seg_full_reset_pending = true;
         return;
     }
     for (auto &kv : g_seg) seg_drop_exec(kv.second);
     g_seg.clear();
     g_seg_lru.clear();
     g_seg_reset_pending = false;
+    g_seg_full_reset_pending = false;
 }
 
 /* L296 perf: an instrument runs the same steps with the segment cache off (every segment eager, nothing captured or
@@ -2525,10 +2559,9 @@ int pulsar_gpu_set_model_map(const void *model_map, uint64_t model_size) {
         const uint64_t limit = cuda_model_local_model_limit_bytes();
         if (model_size > limit) {
             fprintf(stderr,
-                    "pulsar: CUDA model %.2f GiB exceeds the default single-GPU "
-                    "startup cache budget %.2f GiB; set "
-                    "PULSAR_CUDA_WEIGHT_CACHE_LIMIT_GB explicitly if the model "
-                    "plus scratch and KV still fit in memory\n",
+                    "pulsar: CUDA model %.2f GiB exceeds the single-GPU startup cache "
+                    "budget %.2f GiB (the device's memory less its scratch headroom; "
+                    "not a setting) -- refusing\n",
                     (double)model_size / 1073741824.0,
                     (double)limit / 1073741824.0);
             return 0;
@@ -2539,12 +2572,6 @@ int pulsar_gpu_set_model_map(const void *model_map, uint64_t model_size) {
 
 
 
-int pulsar_gpu_set_model_map_range(const void *model_map, uint64_t model_size, uint64_t map_offset, uint64_t map_size, uint64_t max_tensor_bytes) {
-    (void)max_tensor_bytes;
-    (void)map_offset;
-    (void)map_size;
-    return pulsar_gpu_set_model_map(model_map, model_size);
-}
 
 
 

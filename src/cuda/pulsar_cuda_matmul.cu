@@ -13,7 +13,10 @@
 /** Token embedding into every hidden carrier: out[t][h][d] = w[tokens[t]][d] for each of the n_hc carriers.  Grid
  *  ceil(n_tokens * n_hc * n_embd / 256); block 256; one element a thread.
  *  @param out      device hc carriers [n_tokens][n_hc][n_embd] (pulsar_hc_t)
- *  @param tokens   device [n_tokens] token ids (out of range reads row 0)
+ *  @param tokens   device [n_tokens] token ids: [0, n_vocab) reads that row; an id at or past n_vocab is an image slot's
+ *                  sentinel (L216: vocab_size + role) and writes a ZERO row, the placeholder the image merge
+ *                  overwrites before layer 0.  The host refuses a negative id and any other before the launch
+ *                  (gpu_graph_upload_prompt_tokens, the drafter's embed), so nothing else reaches the kernel.
  *  @param w        device bf16 embedding table [n_vocab][n_embd]
  *  @param n_vocab  table rows
  *  @param n_tokens token rows
@@ -33,10 +36,8 @@ __global__ static void embed_tokens_hc_kernel(
     uint32_t d = gid % n_embd;
     uint64_t tmp = gid / n_embd;
     uint32_t t = tmp / n_hc;
-    int32_t tok_i = tokens[t];
-    uint32_t tok = tok_i < 0 ? 0u : (uint32_t)tok_i;
-    if (tok >= n_vocab) tok = 0;
-    pulsar_hc_store(out, gid, pulsar_wt_load(w, (uint64_t)tok * n_embd + d));
+    const uint32_t tok = (uint32_t)tokens[t];
+    pulsar_hc_store(out, gid, tok < n_vocab ? pulsar_wt_load(w, (uint64_t)tok * n_embd + d) : 0.0f);
 }
 
 
@@ -102,8 +103,8 @@ __global__ static void matmul_nt_kernel(
      * row (the 1 GB head at NT=16: 129280 rows x 128 KB = 16 GB of L2 traffic
      * per call, +0.5 ms per row in the L151 sweep).  With R rows per block the
      * per-token activation loads are issued once and applied to R weight rows.
-     * R FOLLOWS THE ROW COUNT (nt_rows_per_block: 1 up to 4 rows, 2 above,
-     * capped by out_dim) -- that is allowed because R never changes
+     * R FOLLOWS THE ROW COUNT (nt_rows_per_block: 2 when more than 4 tokens
+     * ride and out_dim >= 8192, else 1) -- that is allowed because R never changes
      * a (row, token) accumulator's sequence: the per-(row, token) FMA
      * sequence and the 256-wide tree reduction below are exactly the R=1
      * kernel's, so every output is bit-identical at every M and every R.
@@ -227,16 +228,14 @@ __device__ __forceinline__ static float bf16_to_f32(uint16_t b) {
 }
 
 
-/** f32 to bf16 bits, round to nearest even.  1-D grid, one thread an element.
+/** f32 to bf16 bits, round to nearest even, NaN kept NaN (pulsar_bf16_from_f32, pulsar_gpu.h).  1-D grid, one thread an
+ *  element.
  *  @param out bf16 [n] out
  *  @param x   f32 [n]
  *  @param n   elements */
 __global__ static void f32_to_bf16_kernel(uint16_t *out, const float *x, uint64_t n) {
     uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) {
-        const uint32_t u = __float_as_uint(x[i]);
-        out[i] = (uint16_t)((u + 0x7fffu + ((u >> 16) & 1u)) >> 16);  ///< round-to-nearest-even
-    }
+    if (i < n) out[i] = pulsar_bf16_from_f32(x[i]);
 }
 
 
@@ -1149,14 +1148,18 @@ struct f32w_key_hash {
 };
 /// bf16 copies of F32-source weights, by f32w_key (device buffers owned here).
 static std::unordered_map<f32w_key, uint16_t *, f32w_key_hash> g_f32w_bf16;
+/// One entry of g_f32w_bf16 (key and copy together; its address is stable until the map is cleared).
+using f32w_node = std::pair<const f32w_key, uint16_t *>;
 /// Slots of the f32w front cache (a power of two).
 constexpr uint32_t F32W_FC = 8u;
+/* L335, the L191 ordering the fp8 front cache got: a slot is ONE atomic pointer to the map's own entry, which
+ * carries the key and the copy together -- published with release, read with acquire -- so a reader can never pair
+ * one weight's key with another's pointer (the slot used to be a plain {key, ptr} written field by field). */
 /// One slot of the f32w front cache g_f32w_fc (direct-mapped by offset, F32W_FC slots).
-struct f32w_fc_entry { f32w_key key; const uint16_t *ptr; };
-/** @var f32w_fc_entry::key
- *  the weight's identity; the slot hits only when it equals the lookup's */
-/** @var f32w_fc_entry::ptr
- *  the device bf16 copy (owned by g_f32w_bf16), or NULL: an empty slot */
+struct f32w_fc_entry {
+    /// the cached g_f32w_bf16 entry, or NULL: an empty slot; hits only when its key equals the lookup's
+    std::atomic<const f32w_node *> node;
+};
 /// The f32w front cache, direct-mapped by offset.
 static f32w_fc_entry g_f32w_fc[F32W_FC];
 
@@ -1666,13 +1669,10 @@ void pulsar_gpu_mxfp8_act_cache_note_f32_skipped(uint32_t keep_from) {
     }
 }
 
-/** L157: the same declaration for a buffer that was never arm()ed -- the
+/* L157: the same declaration for a buffer that was never arm()ed -- the
  * hidden-carrier norm has no E4M3 consumer, so it holds only a bf16 slot and
- * g_act_cur points at whatever was armed last.  Name the slot by its key. */
-/** @param x         the activation tensor
- *  @param n_tok     rows (part of the key)
- *  @param in_dim    width (part of the key)
- *  @param keep_from first row whose f32 store is present */
+ * g_act_cur points at whatever was armed last.  Name the slot by its key.
+ * (Documented at its declaration, src/pulsar_gpu.h.) */
 void pulsar_gpu_act_note_f32_skipped_for(const pulsar_gpu_tensor *x, uint64_t n_tok,
                                          uint64_t in_dim, uint32_t keep_from) {
     mxfp8_act_cache_t *s = x ? act_slot_find(x->ptr, n_tok, in_dim) : NULL;
@@ -2972,7 +2972,7 @@ void cuda_fp8_weight_cache_clear(void) {
      * open in one process served the first model's converted weights. */
     for (auto &kv : g_f32w_bf16) (void)cudaFree(kv.second);
     g_f32w_bf16.clear();
-    for (uint32_t i = 0; i < F32W_FC; i++) { g_f32w_fc[i].key = f32w_key{}; g_f32w_fc[i].ptr = NULL; }
+    for (uint32_t i = 0; i < F32W_FC; i++) g_f32w_fc[i].node.store(NULL, std::memory_order_release);
 }
 
 
@@ -3422,11 +3422,13 @@ static int bf16_lt_matmul(void *out, const uint16_t *w, const uint16_t *xb, cuda
         cublasLtMatrixLayout_t la;
         cublasLtMatmulAlgo_t algo;
     };
-    static thread_local bf16_lt_shape shapes[16];
-    static thread_local int shapes_next;
-    bf16_lt_shape *sh = NULL;
-    for (int i = 0; i < 16; i++)
-        if (shapes[i].valid && shapes[i].in_dim == in_dim && shapes[i].out_dim == out_dim) { sh = &shapes[i]; break; }
+    /* L335, the L306 rule: never evicted.  This was a 16-slot ring (and the per-row-count entries below a 32-slot
+     * one), evicted round-robin: a dropped shape's heuristic, re-run inside a graph capture, finds no kernel -- the
+     * hazard L306 removed from the decode cache (lt_cache_key).  Keys: (in_dim, out_dim) here, + ntok below. */
+    static thread_local std::unordered_map<lt_cache_key, bf16_lt_shape, lt_cache_key_hash> shapes;
+    const lt_cache_key sk = {in_dim, out_dim, 0u, 0u};
+    auto shit = shapes.find(sk);
+    bf16_lt_shape *sh = shit != shapes.end() ? &shit->second : NULL;
     if (!sh) {
         bf16_lt_shape ns = {};
         ns.in_dim = in_dim; ns.out_dim = out_dim;
@@ -3457,10 +3459,7 @@ static int bf16_lt_matmul(void *out, const uint16_t *w, const uint16_t *xb, cuda
         }
         ns.algo = hr.algo;
         ns.valid = 1;
-        sh = &shapes[shapes_next];
-        shapes_next = (shapes_next + 1) & 15;
-        if (sh->valid) { cublasLtMatrixLayoutDestroy(sh->la); cublasLtMatmulDescDestroy(sh->op); }
-        *sh = ns;
+        sh = &shapes.emplace(sk, ns).first->second;
     }
     /* per (shape, ntok): the row-count layouts and the check that the shape's
      * kernel supports this row count */
@@ -3468,12 +3467,11 @@ static int bf16_lt_matmul(void *out, const uint16_t *w, const uint16_t *xb, cuda
         uint64_t in_dim, out_dim; int ntok; int valid;
         cublasLtMatrixLayout_t lb, ld;
     };
-    static thread_local bf16_lt_call calls[32];
-    static thread_local int calls_next;
+    static thread_local std::unordered_map<lt_cache_key, bf16_lt_call, lt_cache_key_hash> calls;
     const int ntok = (int)n_tok;
-    bf16_lt_call *e = NULL;
-    for (int i = 0; i < 32; i++)
-        if (calls[i].valid && calls[i].in_dim == in_dim && calls[i].out_dim == out_dim && calls[i].ntok == ntok) { e = &calls[i]; break; }
+    const lt_cache_key ck = {in_dim, out_dim, n_tok, 0u};
+    auto chit = calls.find(ck);
+    bf16_lt_call *e = chit != calls.end() ? &chit->second : NULL;
     if (!e) {
         bf16_lt_call ne = {};
         ne.in_dim = in_dim; ne.out_dim = out_dim; ne.ntok = ntok;
@@ -3489,10 +3487,7 @@ static int bf16_lt_matmul(void *out, const uint16_t *w, const uint16_t *xb, cuda
             return 0;
         }
         ne.valid = 1;
-        e = &calls[calls_next];
-        calls_next = (calls_next + 1) & 31;
-        if (e->valid) { cublasLtMatrixLayoutDestroy(e->lb); cublasLtMatrixLayoutDestroy(e->ld); }
-        *e = ne;
+        e = &calls.emplace(ck, ne).first->second;
     }
     cuda_arena ar;
     if (!cuda_arena_begin(&ar, wz, "bf16 lt scratch")) return 0;
@@ -3961,10 +3956,11 @@ static const uint16_t *f32_weight_bf16_resolve(const void *model_map,
                                                uint64_t in_dim, uint64_t out_dim) {
     const f32w_key key{model_map, offset, in_dim, out_dim};
     f32w_fc_entry *fc = &g_f32w_fc[(uint32_t)(offset & (F32W_FC - 1u))];
-    if (fc->ptr && fc->key == key) return fc->ptr;
+    const f32w_node *hit = fc->node.load(std::memory_order_acquire);
+    if (hit && hit->first == key) return hit->second;
     auto it = g_f32w_bf16.find(key);
     if (it != g_f32w_bf16.end()) {
-        fc->key = key; fc->ptr = it->second;
+        fc->node.store(&*it, std::memory_order_release);
         return it->second;
     }
     const uint64_t n = in_dim * out_dim;
@@ -3983,8 +3979,8 @@ static const uint16_t *f32_weight_bf16_resolve(const void *model_map,
     }
     f32_to_bf16_kernel<<<(unsigned)((n + 255) / 256), 256>>>(dst, src, n);
     if (!cuda_ok(cudaGetLastError(), "f32->bf16 weight convert launch")) { (void)cudaFree(dst); return NULL; }
-    g_f32w_bf16[key] = dst;
-    fc->key = key; fc->ptr = dst;
+    const auto ins = g_f32w_bf16.emplace(key, dst);
+    fc->node.store(&*ins.first, std::memory_order_release);
     static uint64_t total = 0;
     total += n * 2;
     static int announced = 0;

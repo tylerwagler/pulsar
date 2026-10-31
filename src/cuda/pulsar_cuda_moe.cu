@@ -2,6 +2,7 @@
  *  DeepSeek routed-expert MoE: the expert FFN lanes (MMQ, mixed, CUTLASS MXFP4) and their dispatch. */
 #include "pulsar_cuda_internal.h"
 #include "pulsar_cuda_mx.cuh"
+#include "pulsar_cuda_arch.cuh"   /* pulsar_cuda_device_slot */
 #ifdef PULSAR_HAVE_MMQ
 #include "mmq/ds4_mmq.h"     /* vendored llama.cpp MMQ adapter -- see mmq/VENDOR.md */
 #include "mmq/exl3_moe.cuh"   /* task #44: the one EXL3 routed front door */
@@ -1517,7 +1518,12 @@ static int routed_moe_launch_exl3(
                 expert_in_dim, n_tokens);
         return 0;
     }
-    static uint32_t *nf_flag = NULL;
+    /* per device (L335): a __device__ symbol has one copy per device, so its address cached on the first device
+     * pointed the second device's kernels at memory that is not theirs */
+    static uint32_t *nf_flag_of[PULSAR_CUDA_DEVICE_SLOTS] = {};
+    const int dslot = pulsar_cuda_device_slot();
+    if (dslot < 0) return 0;
+    uint32_t *&nf_flag = nf_flag_of[dslot];
     if (!nf_flag && !cuda_ok(cudaGetSymbolAddress((void **)&nf_flag, g_moe_nonfinite),
                              "routed MoE non-finite flag address")) return 0;
     /* the one EXL3 routed front door (mmq/exl3_moe.cuh): x from the producer's E4M3 slot, the fold's mid

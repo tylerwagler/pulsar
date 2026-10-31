@@ -725,8 +725,15 @@ routed_lane *routed_lane_for(cudaStream_t caller) {
     if (cudaDeviceGetStreamPriorityRange(&least, &greatest) != cudaSuccess ||
         cudaStreamCreateWithPriority(&l.s, cudaStreamNonBlocking, greatest) != cudaSuccess ||
         cudaEventCreateWithFlags(&l.fork, cudaEventDisableTiming) != cudaSuccess ||
-        cudaEventCreateWithFlags(&l.done, cudaEventDisableTiming) != cudaSuccess)
+        cudaEventCreateWithFlags(&l.done, cudaEventDisableTiming) != cudaSuccess) {
+        /* L335: a failure part way releases what was already created (it leaked the stream and the fork event) */
+        if (l.done) (void)cudaEventDestroy(l.done);
+        if (l.fork) (void)cudaEventDestroy(l.fork);
+        if (l.s) (void)cudaStreamDestroy(l.s);
+        (void)cudaGetLastError();
+        fprintf(stderr, "pulsar: MoE routed lane: its stream / events could not be created -- refusing\n");
         return nullptr;
+    }
     t_lanes[t_n] = l;
     static bool announced = false;
     if (!__atomic_exchange_n(&announced, true, __ATOMIC_RELAXED))

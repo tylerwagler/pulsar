@@ -4,8 +4,9 @@
 // ds4_mmq.h - public C ABI for ds4's quantized matmul kernels.
 //
 // All functions are extern "C" so ds4.c / ds4_cuda.cu can call them
-// without C++ compilation. Functions return 0 on success and non-zero on
-// failure (with stderr error message). Device pointers are caller-owned.
+// without C++ compilation. The entries return 0 on success and a negative
+// code on failure (with stderr error message); ds4_mmq_should_use is a 1 / 0
+// oracle. Device pointers are caller-owned.
 //
 // The live surface is four entries: init, the should-use oracle, and the two
 // aligned-SoA IQ2_XXS routed-MoE GEMMs (pair gate/up and single).  The wide
@@ -88,7 +89,7 @@ int ds4_mmq_should_use(uint32_t layout, int64_t ne11, int64_t n_experts);
 //
 // K must be a multiple of 256.  n_expert_used must be one of the values
 // the vendored mm_ids_helper template specialises on: 2, 4, 6, 8, 16, 32
-// (any other value takes the generic MMQ kernel).  For V4
+// (any other value takes the helper's runtime-count instance).  For V4
 // Flash, n_expert_used = 6.
 //
 // Output is NOT nonfinite-sanitized, and nothing downstream sanitizes it
@@ -99,7 +100,7 @@ int ds4_mmq_should_use(uint32_t layout, int64_t ne11, int64_t n_experts);
 // A NaN/Inf here is a defect upstream (activation encoding, scale slab,
 // weight resolution) and is reported, never rewritten.
 //
-// Returns 0 on success, non-zero on validation or launch failure.
+// Returns 0 on success, negative on validation or launch failure.
 
 // Paired gate/up entry: computes gate AND up over the same activation in a
 // single call, so the E4M3 activation staging (and the mm_ids_helper

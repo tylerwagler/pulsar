@@ -165,16 +165,25 @@ __device__ __forceinline__ static void pulsar_mx_emit_block(
  * shared-expert kernel, the CUTLASS grouped/GEMV packers and the routed MoE's
  * gathered and MMQ-fold kernels each carried their own copy, and two forms had
  * already drifted on NaN (fminf/fmaxf returns the finite operand, an if-chain
- * keeps the NaN).  Identical on every finite input to all five copies:
- * clamp g from above and u both ways, s = g / (1 + exp(-g)), s * u * w in that
- * order -- the multiply order is part of the definition. */
+ * keeps the NaN).  The CUTLASS FFN MMA kernel still had its own inline copy
+ * (the if-chain) while this one used fminf / fmaxf -- so a NaN gate came out
+ * NaN there and a clamped finite number here (L335).  Now ONE definition, and
+ * its NaN rule is the if-chain's: a NaN g or u stays NaN through the clamp
+ * (rule 9 -- no clamp turns a NaN into a number), as relu2 below keeps it.
+ * Identical on every finite input to fminf / fmaxf (tests/kernel_contract_gate.cu
+ * sweeps it): clamp g from above and u both ways, s = g / (1 + exp(-g)),
+ * s * u * w in that order -- the multiply order is part of the definition. */
 /// @param g     gate value
 /// @param u     up value
 /// @param wv    the row's routing weight (1 for an unweighted path)
 /// @param clamp clamp bound (<= 1e-6: no clamp)
-/// @return silu(min(g, clamp)) * clamp(u, -clamp, clamp) * wv
+/// @return silu(min(g, clamp)) * clamp(u, -clamp, clamp) * wv; NaN when g or u is NaN
 __device__ __forceinline__ static float pulsar_swiglu_elem(float g, float u, float wv, float clamp) {
-    if (clamp > 1.0e-6f) { g = fminf(g, clamp); u = fminf(fmaxf(u, -clamp), clamp); }
+    if (clamp > 1.0e-6f) {
+        if (g > clamp) g = clamp;
+        if (u > clamp) u = clamp;
+        if (u < -clamp) u = -clamp;
+    }
     const float s = g / (1.0f + expf(-g));
     return s * u * wv;
 }

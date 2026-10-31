@@ -315,34 +315,10 @@ __device__ __forceinline__ static uint64_t pulsar_kv_ring_slot(
     return (uint64_t)(seq_id ? (uint32_t)seq_id[row] * raw_cap : 0u) + pos % raw_cap;
 }
 
-/* The 0731 unified row's E2M1 decoder: one nibble and its block scale.  Codes
- * 0..7 are 0, 0.5, 1, 1.5, 2, 3, 4, 6; codes >= 2 are normals (exponent
- * 126 + c>>1, mantissa bit c&1) and 0 / 0.5 are the format's zero and
- * subnormal.  Nibble bit 3 is the sign. */
-/// @param nib   an E2M1 nibble (bit 3 the sign)
-/// @param scale the block scale
-/// @return the decoded value times scale
-__device__ static inline float attn_kv4_e2m1(uint32_t nib, float scale) {
-    const uint32_t c = nib & 7u;
-    const float v = (c >= 2u) ? __uint_as_float(((126u + (c >> 1)) << 23) | ((c & 1u) << 22))
-                              : (float)c * 0.5f;
-    const float sv = v * scale;
-    return (nib & 8u) ? -sv : sv;
-}
-
 /* 0731's unified NVFP4 row, packed by src/cuda/pulsar_cuda_attnpack.cu.  The
  * contiguous store is declared in pulsar_gpu.h because tests/attn_pack_gate.cpp
  * grades it; the rest are reached only through pulsar_cuda_norm_kv.cu's
  * dispatchers, so no engine caller names a row family. */
-/** Quantises one f32 KV row into ring slot row % raw_cap (pulsar_cuda_attnpack.cu).
- *  @param raw_cache the ring, raw_cap rows of PULSAR_ATTN_PACK_ROWBYTES(head_dim)
- *  @param kv        f32 [head_dim] row
- *  @param raw_cap   ring rows (nonzero)
- *  @param row       the token position
- *  @param head_dim  the row width
- *  @return 1 launched, 0 refused or failed */
-int pulsar_gpu_attn_pack_ring_store_tensor(pulsar_gpu_tensor *raw_cache, const pulsar_gpu_tensor *kv,
-                                           uint32_t raw_cap, uint32_t row, uint32_t head_dim);
 /** Quantises a batch of f32 KV rows into (banked) ring slots: the prefill store.
  *  @param raw_cache the ring (n_banks banks of raw_cap rows with a descriptor, else one)
  *  @param kv        f32 [n_tokens][head_dim] rows
@@ -524,20 +500,37 @@ static inline pulsar_elt_fmt pulsar_tensor_fmt(const pulsar_gpu_tensor *t) {
     return (pulsar_elt_fmt)(t ? t->fmt : (uint32_t)PULSAR_ELT_F32);
 }
 
+/* L335: a grow-on-demand device buffer kept across calls (a static or thread_local cache) must not grow inside a
+ * graph capture -- cudaFree / cudaMalloc are not capturable, and a free mid-capture invalidates it -- and a regrow
+ * outside one must drop the captured graphs that baked the old pointer (pulsar_gpu_seg_note_device_free, L119).
+ * The grow sites call this first. */
+/// @param what the buffer, for the refusal line
+/// @return true when the calling thread's stream is capturing: the caller refuses (said, once per site label)
+static inline bool cuda_grow_refused_under_capture(const char *what) {
+    cudaStreamCaptureStatus cs = cudaStreamCaptureStatusNone;
+    if (cudaStreamIsCapturing(cudaStreamPerThread, &cs) == cudaSuccess && cs == cudaStreamCaptureStatusNone)
+        return false;
+    (void)cudaGetLastError();
+    fprintf(stderr, "pulsar: %s must grow inside a graph capture (a free / malloc is not capturable) -- refusing\n",
+            what);
+    return true;
+}
+
 /* Stack sub-view that INHERITS the base's element size.  The hand-rolled
  * aggregate initialisers this replaces dropped it, which silently retyped a
  * narrowed buffer as f32 halfway through a split. */
 /// @param b     the base tensor
 /// @param off   byte offset of the view
 /// @param bytes the view's size
-/// @return a non-owning view carrying b's element size and format
+/// @return a non-owning view carrying b's element size, format and dry-run placeholder flag
 static inline pulsar_gpu_tensor pulsar_tensor_subview(const pulsar_gpu_tensor *b,
                                                      uint64_t off, uint64_t bytes) {
     pulsar_gpu_tensor t;
     t.ptr = (char *)b->ptr + off;
     t.bytes = bytes;
     t.owner = 0;
-    t.fmt = b ? b->fmt : 0u;
+    t.dry = b->dry;   /* L335: left unset, a view of a real tensor could read as a placeholder (and back) */
+    t.fmt = b->fmt;
     t.esz = b->esz;
     return t;
 }

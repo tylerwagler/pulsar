@@ -66,7 +66,7 @@ size_t ds4_mmq_iq2_xxs_moe_d2r_pair_scratch_bytes(int64_t ncols_max, int n_exper
 /// @param worklist_scratch device scratch for the work list.
 /// @param worklist_scratch_bytes bytes of it (ds4_mmq_iq2_xxs_moe_d2r_pair_scratch_bytes).
 /// @param stream the stream.
-/// @return 0; 1 when the device has no D2R arm; -1 refused; -2 / -3 launch failures.
+/// @return 0; -1 refused (including no D2R arm on this device, said); -2 / -3 launch failures.
 int ds4_mmq_iq2_xxs_moe_d2r_pair_launch(
     const void    * gate_soa,
     const void    * up_soa,
@@ -102,5 +102,5 @@ int ds4_mmq_iq2_xxs_moe_d2r_pair_launch(
 /// @param worklist_scratch device scratch for the work list.
 /// @param worklist_scratch_bytes bytes of it (ds4_mmq_iq2_xxs_moe_d2r_pair_scratch_bytes).
 /// @param stream the stream.
-/// @return 0; -1 refused (including no D2R arm); -2 / -3 launch failures.
+/// @return 0; -1 refused (including no D2R arm on this device, said); -2 / -3 launch failures.
 int ds4_mmq_iq2_xxs_moe_d2r_single_launch(const void *W_soa, int64_t soa_blocks, const void *act, const int32_t *ids_dst, const int32_t *expert_bounds, float *out, int M, int K, int64_t ne_get_rows, int n_experts, void *worklist_scratch, size_t worklist_scratch_bytes, cudaStream_t stream);

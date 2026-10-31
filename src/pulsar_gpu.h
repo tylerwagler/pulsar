@@ -481,14 +481,6 @@ int pulsar_gpu_set_model_map(const void *model_map, uint64_t model_size);
  *  @param model_map the mapping it backs (the key)
  *  @return 1 on success, 0 when the mapping table is full */
 int pulsar_gpu_set_model_fd_for_map(int fd, const void *model_map);
-/** @brief Same as pulsar_gpu_set_model_map; map_offset, map_size and max_tensor_bytes are ignored.
- *  @param model_map        the host mapping
- *  @param model_size       its size in bytes
- *  @param map_offset       unused
- *  @param map_size         unused
- *  @param max_tensor_bytes unused
- *  @return as pulsar_gpu_set_model_map */
-int pulsar_gpu_set_model_map_range(const void *model_map, uint64_t model_size, uint64_t map_offset, uint64_t map_size, uint64_t max_tensor_bytes);
 /** @brief Make one span of the model device-resident now (startup), instead of on first use.
  *  @param model_map  the model mapping (NULL or bytes 0: nothing to do, 1)
  *  @param model_size the mapping's size in bytes
@@ -685,8 +677,8 @@ int pulsar_gpu_indexer_score_one_tensor(
  * (and refuses a span whose runs are not consecutive); the descriptor
  * (positions/seq_id/bank-table) arm this entry once carried, and the generic
  * per-(comp,row) kernel behind it, served no engine shape and are gone
- * (L176).  n_head must be 64 and head_dim 128 -- the tier's shape; anything
- * else is refused by name. */
+ * (L176).  n_head must be 32 (V4.1) or 64 (V4) and head_dim 128 -- the tier's
+ * shapes (pulsar_idx_mxfp4_heads_supported); anything else is refused by name. */
 /** @param scores     f32 [n_tokens][n_comp] out (-inf past each row's reach)
  *  @param q          packed MXFP4 queries, [n_tokens][n_head]
  *  @param weights    f32 [n_tokens][n_head] per-head weights
@@ -721,7 +713,7 @@ int pulsar_gpu_indexer_scores_decode_batch_tensor(
  * of each scores row.  Reassociation-class vs the generic kernel (MMA
  * accumulation): NOT bit-identical, same fidelity class the non-banked
  * prefill spans already ship (suite-v1 KL + top-k overlap evidence).
- * Requires n_head == 64, head_dim == 128.  Returns 0 on refusal/failure. */
+ * Requires n_head 32 or 64 (pulsar_idx_mxfp4_heads_supported), head_dim == 128.  Returns 0 on refusal/failure. */
 /** @param scores          f32 [run_n][n_comp] out
  *  @param q               packed MXFP4 queries, [run_n][n_head]
  *  @param weights         f32 [run_n][n_head]
@@ -1007,7 +999,7 @@ int pulsar_gpu_attention_f16_indexed(
  * Raw pointers, not tensors: it is a leaf kernel behind indexer_scores_launch,
  * which does the tensor-level bounds checking.  Returns 0 on refusal or
  * failure; the caller checks the shape conditions itself so a 0 is always a
- * real failure.  Requires n_head == 64 and head_dim == 128. */
+ * real failure.  Requires n_head 32 or 64 (pulsar_idx_mxfp4_heads_supported) and head_dim == 128. */
 /** @param scores   f32 [n_tokens][n_comp] out
  *  @param q        packed MXFP4 queries, [n_tokens][n_head]
  *  @param weights  f32 [n_tokens][n_head] per-head weights
@@ -1707,7 +1699,11 @@ int pulsar_gpu_rms_norm_plain_rows_tensor(
         int                     skip_f32);
 
 /** L157: declare that rows [keep_from, n_tok) of x's f32 store were skipped,
- * for a buffer that was never arm()ed (bf16 slot only), keyed like the slot. */
+ * for a buffer that was never arm()ed (bf16 slot only), keyed like the slot.
+ *  @param x         the activation tensor
+ *  @param n_tok     rows (part of the key)
+ *  @param in_dim    width (part of the key)
+ *  @param keep_from first row whose f32 store is present */
 void pulsar_gpu_act_note_f32_skipped_for(const pulsar_gpu_tensor *x, uint64_t n_tok,
                                          uint64_t in_dim, uint32_t keep_from);
 
@@ -3358,7 +3354,7 @@ int pulsar_gpu_router_select_batch_tensor(
  *  @param out               f32 [n_tokens][out_dim]
  *  @param up                f32 scratch
  *  @param mid               f32 scratch
- *  @param experts           f32 per-slot down scratch (the definition names it `down`)
+ *  @param down              f32 per-slot down scratch
  *  @param model_map         the model mapping
  *  @param model_size        its size in bytes
  *  @param gate_offset       byte offset of the gate stack
@@ -3387,7 +3383,7 @@ int pulsar_gpu_routed_moe_batch_tensor(
         pulsar_gpu_tensor       *out,
         pulsar_gpu_tensor       *up,
         pulsar_gpu_tensor       *mid,
-        pulsar_gpu_tensor       *experts,
+        pulsar_gpu_tensor       *down,
         const void             *model_map,
         uint64_t                model_size,
         uint64_t                gate_offset,
@@ -4626,7 +4622,9 @@ typedef struct {
  *  First dst column of this rank's half. */
 /** @var pulsar_tp_gather_block::peer_col0
  *  First dst column of the peer's half. */
-/** @param blocks     host [n_blocks]; their elem0 must run contiguously from 0 (each = the previous + rows * width)
+/** @param blocks     host [n_blocks], in payload order: their elem0 must run contiguously from 0 (each = the
+ *                    previous + rows * width) -- the kernel locates an element's block by that order; refused (said)
+ *                    otherwise
  *  @param n_blocks   blocks (1 .. PULSAR_TP_GATHER_BLOCKS_MAX)
  *  @param rows       rows of every block
  *  @param own        f32: this rank's packed payload

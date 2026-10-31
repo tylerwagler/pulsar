@@ -766,12 +766,7 @@ static bool open_map(pulsar_engine *e) {
         }
         /* the fd names its mapping (a group's later member must not re-key the first's) */
         (void)pulsar_gpu_set_model_fd_for_map(e->model.fd, e->model.map);
-        const int model_map_ok =
-            pulsar_gpu_set_model_map_range(e->model.map,
-                                        e->model.size,
-                                        e->model.tensor_data_pos,
-                                        e->model.size - e->model.tensor_data_pos,
-                                        e->model.max_tensor_bytes);
+        const int model_map_ok = pulsar_gpu_set_model_map(e->model.map, e->model.size);
         if (!model_map_ok) {
             fprintf(stderr,
                     "pulsar: %s failed to map model views; aborting startup. "
@@ -780,11 +775,7 @@ static bool open_map(pulsar_engine *e) {
             return false;
         }
         if (e->dspark_ready && e->dspark_external &&
-            !pulsar_gpu_set_model_map_range(e->dspark_model.map,
-                                           e->dspark_model.size,
-                                           e->dspark_model.tensor_data_pos,
-                                           e->dspark_model.size - e->dspark_model.tensor_data_pos,
-                                           e->dspark_model.max_tensor_bytes))
+            !pulsar_gpu_set_model_map(e->dspark_model.map, e->dspark_model.size))
         {
             fprintf(stderr,
                     "pulsar: %s failed to map DSpark model views; aborting startup. "

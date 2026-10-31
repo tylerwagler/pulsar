@@ -91,8 +91,8 @@ __device__ __forceinline__ static bool topk_score_better(float av, uint32_t ai, 
 
 /* Apply one bitonic compare-exchange to a single element.
  *
- * Replicates EXACTLY the shared-memory network in indexer_topk_pow2_kernel:
- * for the pair (low = i, high = i^j) the original writes
+ * Replicates EXACTLY the all-shared-memory bitonic network: for the pair
+ * (low = i, high = i^j) that network writes
  *     swap = desc ? better(b,a) : better(a,b)      (a = low, b = high)
  *     vals[low]  = swap ? b : a
  *     vals[high] = swap ? a : b
@@ -124,8 +124,8 @@ __device__ __forceinline__ static void topk_ce_apply(float &ov, uint32_t &oi,
  * thread, launched with SORT_N/4 threads.  Element i = 4*threadIdx.x + m lives
  * in v[m]/x[m].
  *
- * Same network, same comparator, same pair directions as the all-shared
- * indexer_topk_pow2_kernel loop -- only the data movement changes:
+ * Same network, same comparator, same pair directions as an all-shared-memory
+ * bitonic loop -- only the data movement changes:
  *   j <  4   partner is in the same thread   -> pure registers
  *   j <  128 partner is in the same warp     -> __shfl_xor_sync
  *   j >= 128 partner is in another warp      -> shared memory (vectorised)
@@ -330,133 +330,6 @@ __global__ static void indexer_topk_1024_kernel(
 }
 
 
-/** Top-k by a shared-memory bitonic sort of SORT_N entries, block-strided.  Grid n_tokens; any block size (launched
- *  1024); static smem SORT_N scores + u32 indices.
- *  @tparam SORT_N sort width (a power of two >= n_comp)
- *  @param selected out: [n_tokens][top_k] indices, best first
- *  @param scores   f32 [n_tokens][n_comp]
- *  @param n_comp   compressed rows
- *  @param n_tokens tokens
- *  @param top_k    rows to select */
-template <uint32_t SORT_N>
-__global__ static void indexer_topk_pow2_kernel(
-        uint32_t *selected,
-        const float *scores,
-        uint32_t n_comp,
-        uint32_t n_tokens,
-        uint32_t top_k) {
-    uint32_t t = blockIdx.x;
-    uint32_t tid = threadIdx.x;
-    if (t >= n_tokens) return;
-    __shared__ float vals[SORT_N];
-    __shared__ uint32_t idxs[SORT_N];
-
-    const float *row = scores + (uint64_t)t * n_comp;
-    for (uint32_t i = tid; i < SORT_N; i += blockDim.x) {
-        if (i < n_comp) {
-            vals[i] = row[i];
-            idxs[i] = i;
-        } else {
-            vals[i] = -INFINITY;
-            idxs[i] = UINT32_MAX;
-        }
-    }
-    __syncthreads();
-
-    for (uint32_t k = 2u; k <= SORT_N; k <<= 1u) {
-        for (uint32_t j = k >> 1u; j > 0u; j >>= 1u) {
-            for (uint32_t i = tid; i < SORT_N; i += blockDim.x) {
-                uint32_t other = i ^ j;
-                if (other > i && other < SORT_N) {
-                    const float av = vals[i];
-                    const float bv = vals[other];
-                    const uint32_t ai = idxs[i];
-                    const uint32_t bi = idxs[other];
-                    const bool desc_half = (i & k) == 0u;
-                    const bool swap = desc_half
-                        ? topk_score_better(bv, bi, av, ai)
-                        : topk_score_better(av, ai, bv, bi);
-                    if (swap) {
-                        vals[i] = bv;
-                        idxs[i] = bi;
-                        vals[other] = av;
-                        idxs[other] = ai;
-                    }
-                }
-            }
-            __syncthreads();
-        }
-    }
-
-    for (uint32_t i = tid; i < top_k; i += blockDim.x) {
-        selected[(uint64_t)t * top_k + i] = idxs[i];
-    }
-}
-
-
-/** indexer_topk_pow2_kernel with u16 indices (the 8192 width fits in smem that way).
- *  @tparam SORT_N sort width (a power of two >= n_comp, <= 65535)
- *  @param selected out: [n_tokens][top_k] indices, best first
- *  @param scores   f32 [n_tokens][n_comp]
- *  @param n_comp   compressed rows
- *  @param n_tokens tokens
- *  @param top_k    rows to select */
-template <uint32_t SORT_N>
-__global__ static void indexer_topk_pow2_u16_kernel(
-        uint32_t *selected,
-        const float *scores,
-        uint32_t n_comp,
-        uint32_t n_tokens,
-        uint32_t top_k) {
-    uint32_t t = blockIdx.x;
-    uint32_t tid = threadIdx.x;
-    if (t >= n_tokens) return;
-    __shared__ float vals[SORT_N];
-    __shared__ uint16_t idxs[SORT_N];
-
-    const float *row = scores + (uint64_t)t * n_comp;
-    for (uint32_t i = tid; i < SORT_N; i += blockDim.x) {
-        if (i < n_comp) {
-            vals[i] = row[i];
-            idxs[i] = (uint16_t)i;
-        } else {
-            vals[i] = -INFINITY;
-            idxs[i] = UINT16_MAX;
-        }
-    }
-    __syncthreads();
-
-    for (uint32_t k = 2u; k <= SORT_N; k <<= 1u) {
-        for (uint32_t j = k >> 1u; j > 0u; j >>= 1u) {
-            for (uint32_t i = tid; i < SORT_N; i += blockDim.x) {
-                uint32_t other = i ^ j;
-                if (other > i && other < SORT_N) {
-                    const float av = vals[i];
-                    const float bv = vals[other];
-                    const uint32_t ai = idxs[i];
-                    const uint32_t bi = idxs[other];
-                    const bool desc_half = (i & k) == 0u;
-                    const bool swap = desc_half
-                        ? topk_score_better(bv, bi, av, ai)
-                        : topk_score_better(av, ai, bv, bi);
-                    if (swap) {
-                        vals[i] = bv;
-                        idxs[i] = (uint16_t)bi;
-                        vals[other] = av;
-                        idxs[other] = (uint16_t)ai;
-                    }
-                }
-            }
-            __syncthreads();
-        }
-    }
-
-    for (uint32_t i = tid; i < top_k; i += blockDim.x) {
-        selected[(uint64_t)t * top_k + i] = idxs[i];
-    }
-}
-
-
 /** Tree top-k, stage 1: the top_k of one SORT_N-wide chunk of a row.  Grid (n_tokens, chunks); block SORT_N / 4;
  *  static smem SORT_N scores + indices.
  *  @tparam SORT_N chunk width (2048 or 4096)
@@ -633,8 +506,8 @@ __launch_bounds__(1024) __global__ static void indexer_topk_tree_merge_pow2_kern
  * are process-invariant, so the cudaGetDevice + cudaDeviceGetAttribute +
  * cudaFuncSetAttribute triple must not run per launch (it did, per layer per token
  * at >=16k ctx — squarely on the decode launch floor). Returns the dynamic smem
- * byte count if the cub path is usable on this device, or 0 if the caller must fall
- * back to the pow2 kernel. Decode is single-threaded; a first-call race is benign
+ * byte count if the cub path is usable on this device, or 0 if it is not (the caller
+ * refuses). Decode is single-threaded; a first-call race is benign
  * (cudaFuncSetAttribute is idempotent). */
 /// @return the cub top-k kernel's dynamic smem bytes, or 0 when this device cannot opt in to that much
 static int indexer_topk_cub_smem(void) {
@@ -836,50 +709,24 @@ int pulsar_gpu_indexer_topk_tensor(
                                                      n_comp, n_tokens, top_k);
         return cuda_ok(cudaGetLastError(), "indexer topk 1024 launch");
     }
-    if (top_k == 512u && n_comp <= 2048u) {
-        if (n_comp > 1024u) {
-            const int smem = indexer_topk_cub_smem();
-            if (smem > 0) {
-                indexer_topk_8192_cub_kernel<<<n_tokens, 512, (size_t)smem>>>((uint32_t *)selected->ptr,
-                                                                             (const float *)scores->ptr,
-                                                                             n_comp, n_tokens, top_k);
-                return cuda_ok(cudaGetLastError(), "indexer topk 2048 cub launch");
-            }
-        }
-        indexer_topk_pow2_kernel<2048><<<n_tokens, 1024>>>((uint32_t *)selected->ptr,
-                                                           (const float *)scores->ptr,
-                                                           n_comp, n_tokens, top_k);
-        return cuda_ok(cudaGetLastError(), "indexer topk 2048 launch");
-    }
-    if (top_k == 512u && n_comp <= 4096u) {
-        if (n_comp > 1024u) {
-            const int smem = indexer_topk_cub_smem();
-            if (smem > 0) {
-                indexer_topk_8192_cub_kernel<<<n_tokens, 512, (size_t)smem>>>((uint32_t *)selected->ptr,
-                                                                             (const float *)scores->ptr,
-                                                                             n_comp, n_tokens, top_k);
-                return cuda_ok(cudaGetLastError(), "indexer topk 4096 cub launch");
-            }
-        }
-        indexer_topk_pow2_kernel<4096><<<n_tokens, 1024>>>((uint32_t *)selected->ptr,
-                                                           (const float *)scores->ptr,
-                                                           n_comp, n_tokens, top_k);
-        return cuda_ok(cudaGetLastError(), "indexer topk 4096 launch");
-    }
     if (top_k == 512u && n_comp <= 8192u) {
-        if (n_comp > 4096u) {
-            const int smem = indexer_topk_cub_smem();
-            if (smem > 0) {
-                indexer_topk_8192_cub_kernel<<<n_tokens, 512, (size_t)smem>>>((uint32_t *)selected->ptr,
-                                                                             (const float *)scores->ptr,
-                                                                             n_comp, n_tokens, top_k);
-                return cuda_ok(cudaGetLastError(), "indexer topk 8192 cub launch");
+        /* One cub BlockRadixSort for every row of 1025 .. 8192.  A device that cannot opt in to its shared memory
+         * refuses by name: the shared-memory bitonic kernels that used to run instead (L335) were a second
+         * implementation nothing measured. */
+        const int smem = indexer_topk_cub_smem();
+        if (smem <= 0) {
+            static int said = 0;
+            if (!said) {
+                said = 1;
+                fprintf(stderr, "pulsar: indexer top-k: n_comp %u needs the cub sort's opt-in shared memory, which this "
+                                "device does not grant -- refusing\n", n_comp);
             }
+            return 0;
         }
-        indexer_topk_pow2_u16_kernel<8192><<<n_tokens, 1024>>>((uint32_t *)selected->ptr,
-                                                               (const float *)scores->ptr,
-                                                               n_comp, n_tokens, top_k);
-        return cuda_ok(cudaGetLastError(), "indexer topk 8192 launch");
+        indexer_topk_8192_cub_kernel<<<n_tokens, 512, (size_t)smem>>>((uint32_t *)selected->ptr,
+                                                                     (const float *)scores->ptr,
+                                                                     n_comp, n_tokens, top_k);
+        return cuda_ok(cudaGetLastError(), "indexer topk cub launch");
     }
     if (top_k == 512u) {
         /* Chunk width is chosen by batch shape, and ONLY by batch shape.

@@ -14,6 +14,7 @@
  *   C8  (L299) the CandidateSelector chain head (src/cuda/pulsar_cuda_candsel.h) over 3 banks of 7 slots x 16
  *       candidates, rank 256, ties planted: every score within 1e-5 relative of the host's double transcription of
  *       z-lab's score, the walk (first argmax, slot 0 from the anchor) exactly; a bank's bytes alone == beside others
+ *   C9  (L335) top-k over rows whose first 4096 columns are -inf (masked): no NaN log-prob, the C4 grade over the rest
  *
  *   ./tests/blockdraft_gate */
 #include "pulsar_cuda_blockdraft.h"
@@ -191,6 +192,37 @@ static void topk_case() {
     CHECK(rc7 == 0 && bad7 == 0, "C7 top-k through an id map: %zu of %u (id, log-prob) pairs differ from C4's mapped",
           bad7, R * K);
     cudaFree(dm);
+    /* C9 (L335): masked logits.  The first 4096 columns of every row are -inf, so every thread's first several
+     * strided columns are -inf while its running max still is: the online sum took expf(-inf - -inf) = NaN there,
+     * and the whole row's log-probs came back NaN.  They must match the host's logsumexp over the finite columns. */
+    for (uint32_t r = 0; r < R; r++)
+        for (uint32_t i = 0; i < 4096u; i++) x[r * V + i] = 0xff80u;   /* bf16 -inf */
+    cudaMemcpy(dx, x.data(), x.size() * 2u, cudaMemcpyHostToDevice);
+    const int rc9 = pulsar_rows_topk_logprob_launch(dx, V, R, V, K, nullptr, di, dl, 0);
+    const std::vector<int32_t> ids9 = host(di, R * K);
+    const std::vector<float> lp9 = host(dl, R * K);
+    size_t bad9 = 0, nan9 = 0;
+    double worst9 = 0;
+    for (uint32_t r = 0; r < R; r++) {
+        const uint16_t *row = &x[r * V];
+        std::vector<uint32_t> o(V);
+        for (uint32_t i = 0; i < V; i++) o[i] = i;
+        std::partial_sort(o.begin(), o.begin() + K, o.end(), [&](uint32_t a, uint32_t b) {
+            const float va = bf2f(row[a]), vb = bf2f(row[b]);
+            return va > vb || (va == vb && a < b);
+        });
+        double mx = -1e30, s = 0;
+        for (uint32_t i = 0; i < V; i++) mx = std::max(mx, (double)bf2f(row[i]));
+        for (uint32_t i = 0; i < V; i++) s += exp((double)bf2f(row[i]) - mx);
+        for (uint32_t j = 0; j < K; j++) {
+            bad9 += (uint32_t)ids9[r * K + j] != o[j];
+            nan9 += lp9[r * K + j] != lp9[r * K + j];
+            worst9 = std::max(worst9, fabs((double)lp9[r * K + j] - ((double)bf2f(row[o[j]]) - mx - log(s))));
+        }
+    }
+    CHECK(rc9 == 0 && bad9 == 0 && nan9 == 0 && worst9 < 1e-5,
+          "C9 rows whose first 4096 columns are -inf: %zu ids differ, %zu NaN log-probs, worst %.3g", bad9, nan9,
+          worst9);
     cudaFree(dx); cudaFree(di); cudaFree(dl);
 }
 

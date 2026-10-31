@@ -427,21 +427,6 @@ constexpr int kDnNJ = 10, kDnOut = 8 * kDnNJ;    ///< the read's W_down (NORM): 
 constexpr int kMmaKs  = kMmaStage * 32;          ///< k per stage
 constexpr int kMmaPad = kMmaKs + 8;              ///< smem row stride in bf16: 16-byte rows, conflict-free ldmatrix
 
-/** One mma.sync m16n8k16 bf16 x bf16 -> f32, accumulating into d (sm_80+; traps on older arches).
- *  @param d  the f32 accumulator fragment (in/out)
- *  @param a  the A fragment (4 regs of bf16 pairs)
- *  @param b0 B fragment register 0
- *  @param b1 B fragment register 1 */
-__device__ __forceinline__ void mma_bf16_16816(float (&d)[4], const uint32_t (&a)[4], uint32_t b0, uint32_t b1) {
-#if PULSAR_SM80
-    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
-                 "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
-                 : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
-                 : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
-#else
-    __trap();
-#endif
-}
 
 /** ldmatrix .x4: four 8x8 b16 matrices from shared memory.
  *  @param r out: the four fragment registers
@@ -609,7 +594,7 @@ qwen_w8a16_prefill_kernel(const uint8_t *__restrict__ wq, const uint8_t *__restr
                  * accumulate is not IEEE f32 (measured: 2.9e-04 against double over K = 2560 when
                  * acc rode in the C operand, vs ~1e-6 this way) -- the dense EXL3 arm's pattern */
                 float d[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-                mma_bf16_16816(d, a, bb0, bb1);
+                pulsar_mma_bf16_16816(d, a, bb0, bb1);
 #pragma unroll
                 for (int e = 0; e < 4; ++e) acc[j][e] += d[e];
             }
@@ -1024,12 +1009,19 @@ static int gr_read_kernels(const pulsar_qwen_gr_dev *w, const uint16_t *streams,
         return 0;
     }
     if (W8) {
-        static bool attr = false;                 /* idempotent; set once, not per launch */
-        if (!attr) {
-            cudaFuncSetAttribute(qwen_gr_up_kernel<true, kUpTBDecode>, cudaFuncAttributeMaxDynamicSharedMemorySize, kUpTileBytes);
-            cudaFuncSetAttribute(qwen_gr_up_kernel<true, kUpTBDecode>, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
-            attr = true;
+        /* per device, return codes checked (L335: set once per process, both ignored) */
+        static int smem_set[PULSAR_CUDA_DEVICE_SLOTS] = {};
+        static bool carve_set[PULSAR_CUDA_DEVICE_SLOTS] = {};
+        const int d = pulsar_cuda_device_slot();
+        if (d < 0 || !pulsar_cuda_smem_opt_in((const void *)qwen_gr_up_kernel<true, kUpTBDecode>, smem_set, kUpTileBytes) ||
+            (!carve_set[d] && cudaFuncSetAttribute(qwen_gr_up_kernel<true, kUpTBDecode>,
+                                                   cudaFuncAttributePreferredSharedMemoryCarveout, 100) != cudaSuccess)) {
+            (void)cudaGetLastError();
+            fprintf(stderr, "pulsar: qwen GR up: the decode tile's %d B of shared memory is refused by the device -- "
+                            "refusing\n", (int)kUpTileBytes);
+            return -1;
         }
+        carve_set[d] = true;
     }
     /* W8 is at decode widths here; the BF16 mixer takes the 16-token tile at prefill widths */
     const int tb = !W8 && w->prompt ? kUpTB : kUpTBDecode;
@@ -1336,7 +1328,7 @@ qwen_w8a16_rows_kernel(const uint8_t *__restrict__ wq, const uint8_t *__restrict
                     for (int s = 0; s < 4; ++s) {
                         const uint32_t af[4] = {A0[u][2 * s], A1[u][2 * s], A0[u][2 * s + 1], A1[u][2 * s + 1]};
                         float d[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-                        mma_bf16_16816(d, af, B[2 * s], B[2 * s + 1]);
+                        pulsar_mma_bf16_16816(d, af, B[2 * s], B[2 * s + 1]);
 #pragma unroll
                         for (int e = 0; e < 4; ++e) acc[j][e] += d[e];
                     }
@@ -1372,22 +1364,21 @@ qwen_w8a16_rows_kernel(const uint8_t *__restrict__ wq, const uint8_t *__restrict
 template <int NT>
 int rows_launch(const uint8_t *wq, const uint8_t *sf, const uint16_t *x_bf16, int out, int in, int rows, int n_split,
                 float *y, bool persistent, cudaStream_t stream) {
-    static int sms = 0;
-    static size_t smem_set = 0;                    /* the attribute grows to the widest slice seen */
+    /* per device (L335: process statics, right for the first device only); the attribute grows to the widest slice */
+    static int sms_of[PULSAR_CUDA_DEVICE_SLOTS] = {};
+    static int smem_set[PULSAR_CUDA_DEVICE_SLOTS] = {};
     const size_t smem = (size_t)NT * 8 * (in / n_split * 2 + 16);
-    if (!sms) {
-        int dev = 0;
-        if (cudaGetDevice(&dev) != cudaSuccess || cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev) != cudaSuccess)
-            return -1;
+    const int d = pulsar_cuda_device_slot();
+    if (d < 0) return -1;
+    if (!sms_of[d] && cudaDeviceGetAttribute(&sms_of[d], cudaDevAttrMultiProcessorCount, d) != cudaSuccess) {
+        sms_of[d] = 0;
+        return -1;
     }
-    if (smem > smem_set) {
-        if (cudaFuncSetAttribute(qwen_w8a16_rows_kernel<NT>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem) !=
-            cudaSuccess) {
-            fprintf(stderr, "pulsar: qwen mxfp8 rows: %d rows of a %d-wide slice do not fit an SM -- refusing\n", NT * 8,
-                    in / n_split);
-            return -1;
-        }
-        smem_set = smem;
+    const int sms = sms_of[d];
+    if (!pulsar_cuda_smem_opt_in((const void *)qwen_w8a16_rows_kernel<NT>, smem_set, smem)) {
+        fprintf(stderr, "pulsar: qwen mxfp8 rows: %d rows of a %d-wide slice do not fit an SM -- refusing\n", NT * 8,
+                in / n_split);
+        return -1;
     }
     const int tiles = (out + 15) / 16;
     int gx = (tiles + kHeadWarps - 1) / kHeadWarps;

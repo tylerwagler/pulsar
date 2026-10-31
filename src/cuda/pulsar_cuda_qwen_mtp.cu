@@ -75,17 +75,17 @@ mtp_norm_hidden_kernel(const __nv_bfloat16 *__restrict__ h, const __nv_bfloat16 
 /* ein [T][2560] bf16: the token's embedding row, (1 + w) RMSNorm */
 /** (1 + w) RMSNorm of each next token's embedding row.  Grid = rows, block = kThreads, static smem kThreads / 32 floats.
  *  @param table   bf16 [n_vocab][kH] embed_tokens
- *  @param tokens  device int32 [rows] next-token ids; an id outside [0, n_vocab) reads row 0
- *  @param n_vocab rows in `table`
+ *  @param tokens  device int32 [rows] next-token ids, each in [0, n_vocab): the host refuses any other before the
+ *                 launch (pulsar_qwen_s4_mtp_combine); the kernel does not clamp
  *  @param w       bf16 [kH] mtp.pre_fc_norm_embedding weight
  *  @param ein     out, bf16 [rows][kH] */
 __global__ void __launch_bounds__(kThreads)
-mtp_norm_embed_kernel(const __nv_bfloat16 *__restrict__ table, const int32_t *__restrict__ tokens, int n_vocab,
+mtp_norm_embed_kernel(const __nv_bfloat16 *__restrict__ table, const int32_t *__restrict__ tokens,
                       const __nv_bfloat16 *__restrict__ w, __nv_bfloat16 *__restrict__ ein) {
     __shared__ float red[kThreads / 32];
     const size_t row = blockIdx.x;
     const int tok = tokens[row];
-    const __nv_bfloat16 *x = table + (size_t)(tok >= 0 && tok < n_vocab ? tok : 0) * kH;
+    const __nv_bfloat16 *x = table + (size_t)tok * kH;
     float ss = 0.0f;
     for (int i = threadIdx.x; i < kH; i += kThreads) {
         const float v = __bfloat162float(x[i]);
@@ -348,7 +348,7 @@ extern "C" int pulsar_qwen_mtp_combine_launch(const pulsar_qwen_mtp_dev *w, cons
         const int n = T - t0 < kMtpSlab ? T - t0 : kMtpSlab;
         mtp_norm_hidden_kernel<<<n, kThreads, 0, stream>>>((const __nv_bfloat16 *)h_streams + (size_t)t0 * kHC,
                                                            (const __nv_bfloat16 *)w->norm_hidden, m.hn);
-        mtp_norm_embed_kernel<<<n, kThreads, 0, stream>>>((const __nv_bfloat16 *)w->embd, tokens + t0, w->n_vocab,
+        mtp_norm_embed_kernel<<<n, kThreads, 0, stream>>>((const __nv_bfloat16 *)w->embd, tokens + t0,
                                                           (const __nv_bfloat16 *)w->norm_embd, m.ein);
         if (!launch_ok("norms")) return -3;
         /* hn is [n * 4][2560]: fc_hidden applies to each stream as its own row */

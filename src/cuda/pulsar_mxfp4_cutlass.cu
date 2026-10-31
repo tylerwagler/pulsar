@@ -215,8 +215,10 @@ __global__ void swiglu_pack_e4m3_warp_kernel(uint8_t *A_data, TSFA tSFA,
   mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, 2));
   mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, 4));
 
-  int se=-127; if(mx>0.f){ int e=(int)floorf(log2f(mx)); se=e-7; }
-  if(se<-127)se=-127; if(se>127)se=127;
+  /* The one exponent authority (pulsar_cuda_mx.cuh): frexpf, exact.  This kernel used to spell
+   * floorf(log2f(mx)) itself, which --use_fast_math lowers to lg2.approx -- one binade (a 2x block
+   * scale) too high for an amax just below a power of two (L335). */
+  const int se = pulsar_mx_shared_exp(mx);
   const float inv=exp2f((float)-se);
 
   cutlass::float_e4m3_t ob[4];
@@ -433,11 +435,26 @@ size_t pulsar_cutlass_proj_scratch_bytes(int T, int in_dim, int out_dim){
 // exercises a multi-expert problem list against the same double-precision oracle to catch it.
 // ============================================================================================
 
-/// @return the SM count of device 0 (cached; at least 1)
+/* L335: per device, for the device the call runs on -- this cached DEVICE 0's count for the process, and the
+ * grouped GEMM's hardware info named device 0 whatever the current one was (a TP rank on device 1 sized its
+ * persistent grid and its workspace for device 0). */
+/// @return the current device's SM count (cached per device; at least 1)
 static int grouped_sm_count(){
-  static int sc = -1;
-  if (sc < 0){ int v = 0; cudaDeviceGetAttribute(&v, cudaDevAttrMultiProcessorCount, 0); sc = v > 0 ? v : 1; }
-  return sc;
+  static int sc[PULSAR_CUDA_DEVICE_SLOTS] = {};
+  const int d = pulsar_cuda_device_slot();
+  if (d < 0) return 1;
+  if (sc[d] <= 0){
+    int v = 0;
+    if (cudaDeviceGetAttribute(&v, cudaDevAttrMultiProcessorCount, d) != cudaSuccess) { (void)cudaGetLastError(); v = 0; }
+    sc[d] = v > 0 ? v : 1;
+  }
+  return sc[d];
+}
+
+/// @return the current device's ordinal for the grouped GEMM's KernelHardwareInfo (0 when it cannot be read: said)
+static int grouped_device_id(){
+  const int d = pulsar_cuda_device_slot();
+  return d < 0 ? 0 : d;
 }
 
 // Physical SF-A element count for exactly one 128-row M-tile at inner dim K (host + device).
@@ -563,7 +580,7 @@ static GArrays g_arrays_place(uint8_t *base, int n_total){
  *  @param sm_count SMs the launch uses
  *  @return CUTLASS workspace bytes of the grouped GEMM */
 static size_t grouped_gemm_workspace_bytes(int n_total, int sm_count){
-  cutlass::KernelHardwareInfo hw; hw.device_id = 0; hw.sm_count = sm_count;
+  cutlass::KernelHardwareInfo hw; hw.device_id = grouped_device_id(); hw.sm_count = sm_count;
   typename GGemm::Arguments args{};
   args.mode = cutlass::gemm::GemmUniversalMode::kGrouped;
   args.problem_shape = {n_total, nullptr, nullptr};
@@ -581,7 +598,7 @@ static size_t grouped_gemm_workspace_bytes(int n_total, int sm_count){
  *  @param sm_count  SMs
  *  @return 0, or 1 can_implement / 2 initialize / 3 run / 4 launch error (each named on stderr) */
 static int run_grouped_gemm(int n_total, const GArrays &g, void *workspace, int sm_count){
-  cutlass::KernelHardwareInfo hw; hw.device_id = 0; hw.sm_count = sm_count;
+  cutlass::KernelHardwareInfo hw; hw.device_id = grouped_device_id(); hw.sm_count = sm_count;
   typename GGemm::Arguments args{
     cutlass::gemm::GemmUniversalMode::kGrouped,
     {n_total, g.prob, nullptr},
@@ -1450,14 +1467,9 @@ __global__ static void __launch_bounds__(FFN_MMA_R * 32) ffn_mma_kernel(
         const int col = j * 8 + q * 2 + i;
         if constexpr (NMAT == 2) {
           if (t < m) {
-            /* swiglu_kernel's clamp, then silu(gate) * up * rweight */
-            float gg = acc[0][j][h * 2 + i], uu = acc[1][j][h * 2 + i];
-            if (clampv > 1.0e-6f) {
-              if (gg > clampv) gg = clampv;
-              if (uu > clampv) uu = clampv;
-              if (uu < -clampv) uu = -clampv;
-            }
-            s_v[warp][t][col] = (gg / (1.f + expf(-gg))) * uu * rw[slots[t]];
+            /* THE SwiGLU (pulsar_swiglu_elem, pulsar_cuda_mx.cuh): the clamp, then silu(gate) * up * rweight.  This
+             * was an inline copy whose NaN rule differed from the shared one (L335). */
+            s_v[warp][t][col] = pulsar_swiglu_elem(acc[0][j][h * 2 + i], acc[1][j][h * 2 + i], rw[slots[t]], clampv);
           }
         } else if (t < m) {
           out[(size_t)slots[t] * N + row0 + col] = acc[0][j][h * 2 + i];

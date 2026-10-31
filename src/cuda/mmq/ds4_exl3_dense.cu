@@ -124,9 +124,9 @@ struct Workspace {
     }
 };
 
-/** One projection of a launch: its weight's planes, its workspace, its output, its counters.  A launch runs one
- *  or two (gridDim.z) projections of the same shape and rate over the same rows, each with exactly the
- *  arithmetic it has alone. */
+/** One projection of a launch: its weight's planes, its workspace, its output, its counters.  A launch runs a set
+ *  of up to kMaxProj projections of one rate over the same rows (a flat grid; proj_of names a CTA's projection),
+ *  each with exactly the arithmetic it has alone. */
 struct dense_proj {
     /// The weight's trellis words (the slice's first plane), device.
     const uint32_t *trellis;
@@ -185,21 +185,6 @@ __device__ __forceinline__ const dense_proj &proj_at(const dense_set &P, int j) 
 /// @return   2^e
 __device__ __forceinline__ float pow2f(int e) { return __int_as_float((127 + e) << 23); }   /* e in [-126, 127] */
 
-/// d += A * B on one mma.sync m16n8k16, fp16 operands, f32 accumulate; traps below sm_80 (callers refuse first).
-/// @param d   the f32 C/D fragment, accumulated in place
-/// @param a   the A fragment (four fp16x2 registers)
-/// @param b0  B fragment register 0 (k rows 2c, 2c+1)
-/// @param b1  B fragment register 1 (k rows 2c+8, 2c+9)
-__device__ __forceinline__ void mma_16816(float (&d)[4], const uint32_t (&a)[4], uint32_t b0, uint32_t b1) {
-#if PULSAR_SM80
-    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
-                 "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
-                 : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
-                 : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
-#else
-    __trap();
-#endif
-}
 
 /// Four 8x8 b16 matrices from shared memory into an MMA A fragment (ldmatrix .x4; p is this lane's row address).
 /// @param a  out: the four fragment registers
@@ -303,13 +288,12 @@ exl3_dense_prep_kernel(const dense_set P, const __nv_bfloat16 *__restrict__ xb, 
 /// (32, 8): each CTA 32 outputs x one split's k-range (<= kMaxBlocks Hadamard blocks) x all M <= 16 rows; the last
 /// CTA of a 128-output block (on its counter) sums the splits in order, applies H128 and svh, writes y or yb.
 /// Static smem: 40 KB of A tiles (kWarps x kMaxBlocks x {hi, lo} x 16 x 16 fp16), reused for the reduction.
-/// @param P   the projections of one rate
-/// @param xb  unused here (the prep planes carry the input); kept for the launch shape
+/// @param P   the projections of one rate (the prep planes carry the input)
 /// @param M   rows, 1..16
 /// @param K   input width
 template <int K2>
 __global__ void __launch_bounds__(kOut * kWarps)
-exl3_dense_kernel(const dense_set P, const __nv_bfloat16 *__restrict__ xb, int M, int K) {
+exl3_dense_kernel(const dense_set P, int M, int K) {
     const int c = (int)blockIdx.x, j = proj_of(P, c);
     const dense_proj &p = proj_at(P, j);
     const int cl = c - (j == 0 ? 0 : j == 1 ? P.end[0] : j == 2 ? P.end[1] : P.end[2]);
@@ -413,8 +397,8 @@ exl3_dense_kernel(const dense_set P, const __nv_bfloat16 *__restrict__ xb, int M
                     const uint32_t b0 = exl3dev::mul1_pair(st[0], st[1]);   /* k rows 2c, 2c+1 */
                     const uint32_t b1 = exl3dev::mul1_pair(st[2], st[3]);   /* k rows 2c+8, 2c+9 */
                     float d[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-                    mma_16816(d, ahi, b0, b1);
-                    mma_16816(d, alo, b0, b1);
+                    pulsar_mma_f16_16816(d, ahi, b0, b1);
+                    pulsar_mma_f16_16816(d, alo, b0, b1);
                     acc[j][h][0] = fmaf(d[0], inv_a, acc[j][h][0]);
                     acc[j][h][1] = fmaf(d[1], inv_a, acc[j][h][1]);
                     acc[j][h][2] = fmaf(d[2], inv_b, acc[j][h][2]);
@@ -506,18 +490,16 @@ unsigned *counter_slice(cudaStream_t stream) {
 /// @param block   (kOut, kWarps, 1)
 /// @param stream  the launch stream
 /// @param P       the set's projections, all at rate k2
-/// @param xb      the bf16 input rows
 /// @param M       rows, 1..16
 /// @param K       input width
-void gemv_launch(int k2, const dim3 &grid, const dim3 &block, cudaStream_t stream, const dense_set &P,
-                 const __nv_bfloat16 *xb, int M, int K) {
+void gemv_launch(int k2, const dim3 &grid, const dim3 &block, cudaStream_t stream, const dense_set &P, int M, int K) {
     switch (k2) {
-    case 4:  exl3_dense_kernel<4><<<grid, block, 0, stream>>>(P, xb, M, K); break;
-    case 6:  exl3_dense_kernel<6><<<grid, block, 0, stream>>>(P, xb, M, K); break;
-    case 8:  exl3_dense_kernel<8><<<grid, block, 0, stream>>>(P, xb, M, K); break;
-    case 10: exl3_dense_kernel<10><<<grid, block, 0, stream>>>(P, xb, M, K); break;
-    case 12: exl3_dense_kernel<12><<<grid, block, 0, stream>>>(P, xb, M, K); break;
-    default: exl3_dense_kernel<16><<<grid, block, 0, stream>>>(P, xb, M, K); break;  /* k2 == 16, checked */
+    case 4:  exl3_dense_kernel<4><<<grid, block, 0, stream>>>(P, M, K); break;
+    case 6:  exl3_dense_kernel<6><<<grid, block, 0, stream>>>(P, M, K); break;
+    case 8:  exl3_dense_kernel<8><<<grid, block, 0, stream>>>(P, M, K); break;
+    case 10: exl3_dense_kernel<10><<<grid, block, 0, stream>>>(P, M, K); break;
+    case 12: exl3_dense_kernel<12><<<grid, block, 0, stream>>>(P, M, K); break;
+    default: exl3_dense_kernel<16><<<grid, block, 0, stream>>>(P, M, K); break;  /* k2 == 16, checked */
     }
 }
 
@@ -697,7 +679,7 @@ int ds4_exl3_dense_multi_launch(const ds4_exl3_dense_proj *p, int n, const void 
             g.end[m++] = ctas;
         }
         for (int i = m; i < kMaxProj; ++i) g.end[i] = INT_MAX;
-        gemv_launch(p[j0].k2, dim3((unsigned)ctas), dim3(kOut, kWarps, 1), stream, g, xb16, M, K);
+        gemv_launch(p[j0].k2, dim3((unsigned)ctas), dim3(kOut, kWarps, 1), stream, g, M, K);
     }
     const cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {

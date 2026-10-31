@@ -532,6 +532,14 @@ bool gpu_graph_dspark_draft_forward_banks(
      * was a cudaMalloc + blocking write + cudaFree per drafter forward. */
     pulsar_gpu_tensor *tokens_t = g->dspark_embed_tokens;
     if (!tokens_t) return false;
+    /* L335: the embed kernel does not clamp (an id past the vocabulary is an image slot's sentinel there): a draft id
+     * outside the vocabulary refuses here, by name. */
+    for (uint32_t i = 0; i < n_draft; i++) {
+        if (draft_ids[i] < 0 || draft_ids[i] >= (int32_t)PULSAR_N_VOCAB) {
+            fprintf(stderr, "pulsar: dspark draft token %d at row %u is not a vocab id -- refusing\n", draft_ids[i], i);
+            return false;
+        }
+    }
     if (!pulsar_gpu_tensor_write(tokens_t, 0, draft_ids, (uint64_t)n_draft * sizeof(int32_t)))
         return false;
     bool ok = pulsar_gpu_embed_tokens_hc_tensor(g->batch_cur_hc,

@@ -110,11 +110,19 @@ shared_lane *shared_lane_for(cudaStream_t caller) {
     shared_lane l{};
     l.dev = dev;
     l.caller = caller;
-    if (cudaStreamCreateWithFlags(&l.s, cudaStreamNonBlocking) != cudaSuccess ||
-        cudaEventCreateWithFlags(&l.fork, cudaEventDisableTiming) != cudaSuccess)
+    /* L335: a failure part way releases what was already created (it leaked the stream and the events) */
+    bool made = cudaStreamCreateWithFlags(&l.s, cudaStreamNonBlocking) == cudaSuccess &&
+                cudaEventCreateWithFlags(&l.fork, cudaEventDisableTiming) == cudaSuccess;
+    for (cudaEvent_t &e : l.done) made = made && cudaEventCreateWithFlags(&e, cudaEventDisableTiming) == cudaSuccess;
+    if (!made) {
+        for (cudaEvent_t e : l.done)
+            if (e) (void)cudaEventDestroy(e);
+        if (l.fork) (void)cudaEventDestroy(l.fork);
+        if (l.s) (void)cudaStreamDestroy(l.s);
+        (void)cudaGetLastError();
+        fprintf(stderr, "pulsar: EXL3 shared expert: its stream / events could not be created -- refusing\n");
         return nullptr;
-    for (cudaEvent_t &e : l.done)
-        if (cudaEventCreateWithFlags(&e, cudaEventDisableTiming) != cudaSuccess) return nullptr;
+    }
     t_lanes[t_n] = l;
     static bool announced = false;
     if (!__atomic_exchange_n(&announced, true, __ATOMIC_RELAXED))
@@ -159,8 +167,12 @@ int exl3_moe_shared_fork(const exl3_moe_shared &sh, const exl3_moe_act &x, int T
         fprintf(stderr, "%s: no lane, or %d forks already pending on it -- refusing\n", tag, lane ? lane->n : 0);
         return -1;
     }
-    if (cudaEventRecord(lane->fork, stream) != cudaSuccess || cudaStreamWaitEvent(lane->s, lane->fork, 0) != cudaSuccess)
+    if (cudaEventRecord(lane->fork, stream) != cudaSuccess || cudaStreamWaitEvent(lane->s, lane->fork, 0) != cudaSuccess) {
+        /* the contract's -3 (exl3_moe.cuh): nothing was launched; said, like every other refusal here (L335) */
+        fprintf(stderr, "%s: the fork's event record / wait failed: %s -- refusing\n", tag,
+                cudaGetErrorString(cudaGetLastError()));
         return -3;
+    }
     const ds4_exl3_dense_proj gu[2] = {{sh.gate, sh.k2_gate, sh.mid, sh.yg, nullptr},
                                        {sh.up, sh.k2_up, sh.mid, sh.yu, nullptr}};
     int rc = ds4_exl3_dense_multi_launch(gu, 2, x.x, T, in_dim, sh.ws, sh.ws_bytes, lane->s, prompt);
