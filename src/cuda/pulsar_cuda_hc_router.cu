@@ -112,15 +112,17 @@ __global__ static void hc_weighted_sum_kernel(float *out, const pulsar_hc_t *x, 
 
 
 
-/* NHC: the hidden-carrier count as a COMPILE-TIME value, or 0 to take the
- * runtime loop.  The point is memory-level parallelism, not instruction count.
+/* NHC: the hidden-carrier count as a COMPILE-TIME value (4: every DeepSeek V4
+ * artifact, and the only count the fused HC kernels take; L335 deleted the
+ * runtime-loop arm a different count used to take).  The point is
+ * memory-level parallelism, not instruction count.
  *
  * The 2026-08-24 SOL sweep found this kernel at 87.5% occupancy with ZERO
  * barrier stalls and 31.6M long_scoreboard stalls -- i.e. plenty of warps, all
  * of them waiting on global loads, at only 25.7% of memory throughput.  The
- * cause is visible in the source: `n_hc` arrives as a kernel ARGUMENT, so the
- * src_hc loop cannot be unrolled, and its `residual_hc` loads (each n_embd
- * apart, individually coalesced) issue ONE AT A TIME, each waiting on the last.
+ * cause was in the source: `n_hc` arrived as a kernel ARGUMENT, so the
+ * src_hc loop could not be unrolled, and its `residual_hc` loads (each n_embd
+ * apart, individually coalesced) issued ONE AT A TIME, each waiting on the last.
  * Templating on the count lets all NHC loads be in flight together.
  *
  * L219: the thread mapping is one thread per (t,d), computing ALL NHC
@@ -136,9 +138,8 @@ __global__ static void hc_weighted_sum_kernel(float *out, const pulsar_hc_t *x, 
  * and dedupe change only.  It is graded by the byte-exact prefill gate, not the
  * reference gate. */
 /** HC expand: out[t][dst][d] = block[t][d] * post[t][dst] + sum_src comb[t][dst + src * n_hc] * res[t][src][d], with
- *  block = block_out (+ block_add).  1-D grid: one thread a (t, d) for NHC > 0 (all destinations in registers), one
- *  a (t, dst, d) for NHC == 0.
- *  @tparam NHC the carrier count at compile time, or 0 for the runtime loop
+ *  block = block_out (+ block_add).  1-D grid: one thread a (t, d), all destinations in registers.
+ *  @tparam NHC the carrier count at compile time (4)
  *  @param out_hc      HC carrier out [n_tokens][n_hc][n_embd]
  *  @param block_out   f32 [n_tokens][n_embd] the sublayer's output
  *  @param block_add   f32 [n_tokens][n_embd] added to it when has_add
@@ -146,7 +147,6 @@ __global__ static void hc_weighted_sum_kernel(float *out, const pulsar_hc_t *x, 
  *  @param post        per-token post weights, row t at t * post_stride
  *  @param comb        per-token comb matrices, row t at t * comb_stride
  *  @param n_embd      hidden width
- *  @param n_hc        carriers
  *  @param n_tokens    tokens
  *  @param post_stride floats between tokens' post rows
  *  @param comb_stride floats between tokens' comb rows
@@ -160,13 +160,13 @@ __global__ static void hc_expand_kernel(
         const float *post,
         const float *comb,
         uint32_t n_embd,
-        uint32_t n_hc,
         uint32_t n_tokens,
         uint32_t post_stride,
         uint32_t comb_stride,
         int has_add) {
+    static_assert(NHC > 0, "hc_expand_kernel: a compile-time carrier count");
     const uint64_t gid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
-    if constexpr (NHC > 0) {
+    {
         const uint64_t n_elem = (uint64_t)n_tokens * n_embd;
         if (gid >= n_elem) return;
         const uint32_t d = (uint32_t)(gid % n_embd);
@@ -208,34 +208,16 @@ __global__ static void hc_expand_kernel(
             pulsar_hc_store(out_hc,
                     (uint64_t)t * (uint64_t)NHC * n_embd + (uint64_t)dst * n_embd + d, acc);
         }
-    } else {
-        const uint64_t n_elem = (uint64_t)n_tokens * n_hc * n_embd;
-        if (gid >= n_elem) return;
-        const uint32_t d = (uint32_t)(gid % n_embd);
-        const uint64_t tmp = gid / n_embd;
-        const uint32_t dst_hc = (uint32_t)(tmp % n_hc);
-        const uint32_t t = (uint32_t)(tmp / n_hc);
-
-        float block_v = block_out[(uint64_t)t * n_embd + d];
-        if (has_add) block_v += block_add[(uint64_t)t * n_embd + d];
-        float acc = block_v * post[(uint64_t)t * post_stride + dst_hc];
-        for (uint32_t src_hc = 0; src_hc < n_hc; src_hc++) {
-            float comb_v = comb[(uint64_t)t * comb_stride + dst_hc + (uint64_t)src_hc * n_hc];
-            float res_v = pulsar_hc_load(residual_hc, (uint64_t)t * n_hc * n_embd + (uint64_t)src_hc * n_embd + d);
-            acc += comb_v * res_v;   /* matches the unrolled arm above */
-        }
-        pulsar_hc_store(out_hc, (uint64_t)t * n_hc * n_embd + (uint64_t)dst_hc * n_embd + d, acc);
     }
 }
 
 
 
-/* One dispatch point for the three hc_expand callers.  PULSAR_N_HC is 4 on the
- * shipped artifact; anything else takes the runtime-loop instantiation, so a
- * differently-shaped model still runs (just without the unrolled gather).
- * The grid differs by arm: NHC=4 maps one thread per (t,d), the runtime arm one
- * per (t,dst,d). */
-/** Launches hc_expand_kernel: the NHC = 4 instance when n_hc is 4, else the runtime-loop one.
+/* One dispatch point for the hc_expand callers.  PULSAR_N_HC is 4 on every
+ * DeepSeek V4 artifact, and the fused HC norm / split kernels already take
+ * nothing else; a different count refuses here by name (L335: it used to take
+ * a runtime-loop instantiation no gate ran -- rule 1). */
+/** Launches hc_expand_kernel<4> (refuses n_hc != 4, said once).
  *  @param threads     block size
  *  @param out_hc      HC carrier out
  *  @param block_out   the sublayer's output
@@ -248,25 +230,28 @@ __global__ static void hc_expand_kernel(
  *  @param n_tokens    tokens
  *  @param post_stride floats between tokens' post rows
  *  @param comb_stride floats between tokens' comb rows
- *  @param has_add     nonzero: add block_add */
-static void hc_expand_launch(uint32_t threads,
-                             pulsar_hc_t *out_hc, const float *block_out,
-                             const float *block_add, const pulsar_hc_t *residual_hc,
-                             const float *post, const float *comb,
-                             uint32_t n_embd, uint32_t n_hc, uint32_t n_tokens,
-                             uint32_t post_stride, uint32_t comb_stride, int has_add) {
-    const uint64_t elems = n_hc == 4u ? (uint64_t)n_tokens * n_embd
-                                      : (uint64_t)n_tokens * n_hc * n_embd;
-    const uint32_t blocks = (uint32_t)((elems + threads - 1u) / threads);
-    if (n_hc == 4u) {
-        hc_expand_kernel<4><<<blocks, threads>>>(out_hc, block_out, block_add, residual_hc,
-                                                post, comb, n_embd, n_hc, n_tokens,
-                                                post_stride, comb_stride, has_add);
-    } else {
-        hc_expand_kernel<0><<<blocks, threads>>>(out_hc, block_out, block_add, residual_hc,
-                                                post, comb, n_embd, n_hc, n_tokens,
-                                                post_stride, comb_stride, has_add);
+ *  @param has_add     nonzero: add block_add
+ *  @return 1 launched (the caller checks the launch), 0 refused */
+static int hc_expand_launch(uint32_t threads,
+                            pulsar_hc_t *out_hc, const float *block_out,
+                            const float *block_add, const pulsar_hc_t *residual_hc,
+                            const float *post, const float *comb,
+                            uint32_t n_embd, uint32_t n_hc, uint32_t n_tokens,
+                            uint32_t post_stride, uint32_t comb_stride, int has_add) {
+    if (n_hc != 4u) {
+        static int said = 0;
+        if (!said) {
+            said = 1;
+            fprintf(stderr, "pulsar: hc_expand: n_hc %u -- only 4 carriers have a kernel -- refusing\n", n_hc);
+        }
+        return 0;
     }
+    const uint64_t elems = (uint64_t)n_tokens * n_embd;
+    const uint32_t blocks = (uint32_t)((elems + threads - 1u) / threads);
+    hc_expand_kernel<4><<<blocks, threads>>>(out_hc, block_out, block_add, residual_hc,
+                                            post, comb, n_embd, n_tokens,
+                                            post_stride, comb_stride, has_add);
+    return 1;
 }
 
 
@@ -1124,7 +1109,7 @@ int pulsar_gpu_hc_expand_split_tensor(pulsar_gpu_tensor *out_hc, const pulsar_gp
     uint32_t n_tokens = (uint32_t)(out_hc->bytes / ((uint64_t)n_hc * n_embd * PULSAR_HC_ELT_SIZE));
     uint32_t mix_hc = 2u * n_hc + n_hc * n_hc;
     const float *base = (const float *)split->ptr;
-    hc_expand_launch(256,
+    if (!hc_expand_launch(256,
                       (pulsar_hc_t *)out_hc->ptr,
                                                     (const float *)block_out->ptr,
                                                     (const float *)block_out->ptr,
@@ -1132,7 +1117,7 @@ int pulsar_gpu_hc_expand_split_tensor(pulsar_gpu_tensor *out_hc, const pulsar_gp
                                                     base + n_hc,
                                                     base + 2u * n_hc,
                                                     n_embd, n_hc, n_tokens,
-                                                    mix_hc, mix_hc, 0);
+                                                    mix_hc, mix_hc, 0)) return 0;
     return cuda_ok(cudaGetLastError(), "hc_expand_split launch");
 }
 
@@ -1143,7 +1128,7 @@ int pulsar_gpu_hc_expand_add_split_tensor(pulsar_gpu_tensor *out_hc, const pulsa
     uint32_t n_tokens = (uint32_t)(out_hc->bytes / ((uint64_t)n_hc * n_embd * PULSAR_HC_ELT_SIZE));
     uint32_t mix_hc = 2u * n_hc + n_hc * n_hc;
     const float *base = (const float *)split->ptr;
-    hc_expand_launch(256,
+    if (!hc_expand_launch(256,
                       (pulsar_hc_t *)out_hc->ptr,
                                                     (const float *)block_out->ptr,
                                                     (const float *)block_add->ptr,
@@ -1151,7 +1136,7 @@ int pulsar_gpu_hc_expand_add_split_tensor(pulsar_gpu_tensor *out_hc, const pulsa
                                                     base + n_hc,
                                                     base + 2u * n_hc,
                                                     n_embd, n_hc, n_tokens,
-                                                    mix_hc, mix_hc, 1);
+                                                    mix_hc, mix_hc, 1)) return 0;
     return cuda_ok(cudaGetLastError(), "hc_expand_add_split launch");
 }
 /** @def PULSAR_HCMIX(WT, CAST)

@@ -14,6 +14,8 @@
  *    3. indexer-topk    pulsar_gpu_indexer_topk_tensor, top-512 at n_comp 1500 / 3000 / 6000 / 8192 (the widths that
  *                       took the shared-memory bitonic kernels when the cub sort's smem was refused): the one cub arm
  *                       against the host order, selection for selection.
+ *    4. hc-expand-nhc   pulsar_gpu_hc_expand_split_tensor runs n_hc 4 and refuses 3 and 5 (a runtime-loop arm used to
+ *                       take any other count).
  *
  *  Prints one line per case and KERNEL CONTRACT GATE PASS / FAIL. */
 #include "pulsar_gpu.h"
@@ -204,6 +206,41 @@ static void case_indexer_topk(void) {
     }
 }
 
+/* ---- 4. hc-expand-nhc ------------------------------------------------------------------------------------------ */
+
+/// Case 4: hc_expand runs 4 carriers and refuses any other count (3 and 5 here).
+static void case_hc_expand_nhc(void) {
+    const uint32_t n_embd = 4096u, n_tok = 2u;
+    int bad = 0;
+    for (uint32_t n_hc : {3u, 4u, 5u}) {
+        const uint32_t mix = 2u * n_hc + n_hc * n_hc;
+        pulsar_gpu_tensor *out = pulsar_gpu_tensor_alloc_elt((uint64_t)n_tok * n_hc * n_embd, 2u, PULSAR_HC_ELT_FMT);
+        pulsar_gpu_tensor *res = pulsar_gpu_tensor_alloc_elt((uint64_t)n_tok * n_hc * n_embd, 2u, PULSAR_HC_ELT_FMT);
+        pulsar_gpu_tensor *blk = pulsar_gpu_tensor_alloc((uint64_t)n_tok * n_embd * 4u);
+        pulsar_gpu_tensor *split = pulsar_gpu_tensor_alloc((uint64_t)n_tok * mix * 4u);
+        if (!out || !res || !blk || !split) {
+            fail("hc-expand-nhc: alloc");
+        } else {
+            const std::vector<uint8_t> z((size_t)n_tok * n_hc * n_embd * 4u, 0u);
+            pulsar_gpu_tensor_write(res, 0, z.data(), (uint64_t)n_tok * n_hc * n_embd * 2u);
+            pulsar_gpu_tensor_write(blk, 0, z.data(), (uint64_t)n_tok * n_embd * 4u);
+            pulsar_gpu_tensor_write(split, 0, z.data(), (uint64_t)n_tok * mix * 4u);
+            const bool ran = pulsar_gpu_hc_expand_split_tensor(out, blk, res, split, n_embd, n_hc) != 0 &&
+                             pulsar_gpu_synchronize() != 0;
+            if (ran != (n_hc == 4u)) {
+                fprintf(stderr, "  hc-expand-nhc: n_hc %u %s\n", n_hc, ran ? "ran" : "refused");
+                bad++;
+            }
+        }
+        pulsar_gpu_tensor_free(out);
+        pulsar_gpu_tensor_free(res);
+        pulsar_gpu_tensor_free(blk);
+        pulsar_gpu_tensor_free(split);
+    }
+    printf("  4 hc-expand-nhc: n_hc 4 runs, 3 and 5 refuse: %s\n", bad ? "NO" : "yes");
+    if (bad) fail("hc-expand-nhc: a carrier count other than 4 ran, or 4 refused");
+}
+
 /// Runs every case on device 0.
 /// @return 0 on PASS, 1 on FAIL
 int main(void) {
@@ -214,6 +251,7 @@ int main(void) {
     case_mx_shared_exp();
     case_embed_sentinel();
     case_indexer_topk();
+    case_hc_expand_nhc();
     puts(g_fail ? "KERNEL CONTRACT GATE FAIL" : "KERNEL CONTRACT GATE PASS");
     return g_fail ? 1 : 0;
 }
