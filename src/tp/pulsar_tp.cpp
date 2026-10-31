@@ -4855,27 +4855,18 @@ int pulsar_tp_send_stop(pulsar_tp *tp) {
 
 void pulsar_tp_command_free(pulsar_tp_command *command) {
     if (!command) return;
+    /* Every malloc'd array first, then zero: zeroing first loses the pointers. */
     free(command->tokens);
     free(command->items);
-    memset(command, 0, sizeof(*command));
-    command->type = PULSAR_TP_FRAME_ERROR;
     free(command->logits);
-    command->logits = NULL;
-    command->n_logits = 0;
     free(command->spec_banks);
     free(command->spec_rngs);
-    command->spec_banks = NULL;
-    command->spec_rngs = NULL;
     free(command->spec_steps);
-    command->spec_steps = NULL;
     free(command->images);
     free(command->image_bytes);
-    command->images = NULL;
-    command->image_bytes = NULL;
-    command->n_images = 0;
     free(command->keys);
-    command->keys = NULL;
-    command->n_keys = 0;
+    memset(command, 0, sizeof(*command));
+    command->type = PULSAR_TP_FRAME_ERROR;
 }
 
 /// Decode a token-carrying frame's payload into `command` (session, tokens, value).

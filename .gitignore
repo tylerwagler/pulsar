@@ -28,6 +28,7 @@ __pycache__/
 /tests/test_q4k_dot
 /tests/cuda_long_context_smoke
 /tests/tp_core_test
+/tests/tp_command_free_test
 /tests/tp_transport_test
 /tests/tp_sched_test
 /tests/tp_mesh_test
