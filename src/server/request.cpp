@@ -12,7 +12,7 @@
 
 void random_prefixed_id(char *dst, size_t dstlen, const char *prefix, size_t nbytes) {
     unsigned char bytes[16];
-    if (nbytes > sizeof(bytes)) nbytes = sizeof(bytes);
+    if (nbytes > sizeof(bytes)) pulsar_die("random_prefixed_id: more than 16 random bytes asked");
     size_t pos = snprintf(dst, dstlen, "%s", prefix);
     if (pos >= dstlen) return;
 

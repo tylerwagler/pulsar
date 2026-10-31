@@ -3723,7 +3723,7 @@ void random_tool_id(char *dst, size_t dstlen, api_style api);
 /// @param dst     receives the id (NUL-terminated, truncated to `dstlen`)
 /// @param dstlen  size of `dst`
 /// @param prefix  the id's prefix ("call_", "resp_", ...)
-/// @param nbytes  random bytes, at most 16
+/// @param nbytes  random bytes, at most 16 (L335: more dies; it used to be capped at 16 silently)
 void random_prefixed_id(char *dst, size_t dstlen, const char *prefix, size_t nbytes);
 void tool_calls_free(tool_calls *calls);
 void tool_calls_push(tool_calls *calls, tool_call tc);

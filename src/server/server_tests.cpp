@@ -11904,6 +11904,17 @@ static void test_l335_grammar_compiler_is_write_once(void) {
     }) == 1);
 }
 
+/* L335: an id of more than 16 random bytes dies (it was capped at 16 without a word); 16 is 32 hex digits. */
+static void test_l335_random_id_refuses_more_than_16_bytes(void) {
+    char id[64];
+    random_prefixed_id(id, sizeof id, "x_", 16);
+    TEST_ASSERT(strlen(id) == 2 + 32 && !strncmp(id, "x_", 2));
+    TEST_ASSERT(l335_exit_status([&] {
+        char big[64];
+        random_prefixed_id(big, sizeof big, "x_", 17);
+    }) == 1);
+}
+
 /* L335: request_init sets no family and no model; a request that reaches the worker's queue without either dies by
  * name at server::enqueue (it used to run as DeepSeek V4.1, "deepseek-v4-flash").  With both set it queues. */
 static void test_l335_request_without_family_dies_at_enqueue(void) {
@@ -11996,6 +12007,7 @@ static void pulsar_server_unit_tests_run(void) {
     test_l334_positions_are_ints();
     test_l334_none_fails_closed();
     test_l335_request_without_family_dies_at_enqueue();
+    test_l335_random_id_refuses_more_than_16_bytes();
     test_l335_grammar_compiler_is_write_once();
     test_l334_server_positions();
     test_l334_prompt_held_across_a_seam();
