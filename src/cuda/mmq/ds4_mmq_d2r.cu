@@ -1505,8 +1505,9 @@ int ds4_mmq_iq2_xxs_moe_d2r_pair_launch(const void *gate_soa,
     const char *tag = "ds4_mmq_iq2_xxs_moe_d2r_pair_launch";
     const int dev = ggml_cuda_get_device();
     const int cc = ggml_cuda_info().devices[dev].cc;
-    if (!ds4_mmq_iq2_xxs_moe_d2r_available(cc)) {
-        return 1;
+    if (!ds4_mmq_iq2_xxs_moe_d2r_available(cc)) {   /* -1 like every refusal, as the single launch (L335: it was +1) */
+        fprintf(stderr, "%s: this device (cc %d) has no D2R arm -- refusing\n", tag, cc);
+        return -1;
     }
     if (!gate_soa || !up_soa || !act || !ids_dst || !expert_bounds || !out_gate || !out_up ||
         !worklist_scratch || M <= 0 || K <= 0 || K % 256 != 0 || ne_get_rows <= 0 ||
@@ -1653,6 +1654,7 @@ int ds4_mmq_iq2_xxs_moe_d2r_single_launch(const void *W_soa,
     const int dev = ggml_cuda_get_device();
     const int cc = ggml_cuda_info().devices[dev].cc;
     if (!ds4_mmq_iq2_xxs_moe_d2r_available(cc)) {
+        fprintf(stderr, "%s: this device (cc %d) has no D2R arm -- refusing\n", tag, cc);
         return -1;
     }
     if (!W_soa || !act || !ids_dst || !expert_bounds || !out) {
