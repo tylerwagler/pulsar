@@ -4600,7 +4600,9 @@ typedef struct {
  *  First dst column of this rank's half. */
 /** @var pulsar_tp_gather_block::peer_col0
  *  First dst column of the peer's half. */
-/** @param blocks     host [n_blocks]; their elem0 must run contiguously from 0 (each = the previous + rows * width)
+/** @param blocks     host [n_blocks], in payload order: their elem0 must run contiguously from 0 (each = the
+ *                    previous + rows * width) -- the kernel locates an element's block by that order; refused (said)
+ *                    otherwise
  *  @param n_blocks   blocks (1 .. PULSAR_TP_GATHER_BLOCKS_MAX)
  *  @param rows       rows of every block
  *  @param own        f32: this rank's packed payload

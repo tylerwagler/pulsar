@@ -484,7 +484,15 @@ int pulsar_gpu_tp_combine_gather_blocks(const pulsar_tp_gather_block *blocks, ui
     uint64_t e0 = 0;
     for (uint32_t k = 0; k < n_blocks; k++) {
         const pulsar_tp_gather_block *bk = &blocks[k];
-        if (!bk->dst || bk->width == 0 || bk->elem0 != e0 ||
+        /* the kernel finds an element's block by walking elem0 in order: the blocks must tile the payload
+         * contiguously from 0, in order (the contract above) -- asserted here, by name (L335) */
+        if (bk->elem0 != e0) {
+            fprintf(stderr, "pulsar: tp gather: block %u starts at payload element %llu, not %llu -- the blocks must "
+                            "run contiguously from 0, in order -- refusing\n", k, (unsigned long long)bk->elem0,
+                    (unsigned long long)e0);
+            return 0;
+        }
+        if (!bk->dst || bk->width == 0 ||
             bk->own_col0 + bk->width > bk->pitch || bk->peer_col0 + bk->width > bk->pitch ||
             (uint64_t)rows * bk->pitch * sizeof(float) > bk->dst->bytes) return 0;
         B.dst[k] = (float *)bk->dst->ptr;
