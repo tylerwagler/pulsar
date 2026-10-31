@@ -662,8 +662,6 @@ typedef struct {
     int data_fd;
     /// The peer's ctx_size from its hello.
     uint32_t peer_ctx;
-    /// Set when the legacy pair's link comes up (the mesh path never sets it; nothing reads it).
-    bool connected;
     /* What the peer told us about itself in the NODE frame (protocol v13). */
     /// What the peer said about itself in the NODE frame.
     pulsar_tp_node node;
@@ -3067,7 +3065,6 @@ int pulsar_tp_create(pulsar_tp **out, const pulsar_tp_options *opt,
     tp->peers[0].control_fd = tp->control_fd;
     tp->peers[0].data_fd = tp->data_fd;
     tp->peers[0].peer_ctx = tp->peer_ctx;
-    tp->peers[0].connected = true;
     {
         /* The leader knows its listen port; a dialing worker has none of its own. */
         char addr[PULSAR_TP_NODE_STR];
