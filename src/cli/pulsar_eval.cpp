@@ -2872,7 +2872,8 @@ static void trace_write_case(FILE *trace,
             fprintf(trace, "  %c. %s\n", 'A' + i, tc->choice[i]);
         }
     } else {
-        fprintf(trace, "answer_kind: exact_integer\n");
+        /* COMPSEC answers a line spec ("17-20", "0"), every other open case an integer (build_question_prompt) */
+        fprintf(trace, "answer_kind: %s\n", eval_case_is_compsec(tc) ? "line_spec" : "exact_integer");
     }
     trace_write_block(trace, "SYSTEM_PROMPT", system_prompt);
     trace_write_block(trace, "QUESTION_PROMPT", question_prompt);
