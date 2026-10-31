@@ -97,21 +97,6 @@ struct Smem {
 /// @return   2^e
 __device__ __forceinline__ float pow2f(int e) { return __int_as_float((127 + e) << 23); }   /* e in [-126, 127] */
 
-/// d += A * B on one mma.sync m16n8k16, fp16 operands, f32 accumulate; traps below sm_80 (the launchers refuse first).
-/// @param d   the f32 C/D fragment, accumulated in place
-/// @param a   the A fragment (four fp16x2 registers)
-/// @param b0  B fragment register 0
-/// @param b1  B fragment register 1
-__device__ __forceinline__ void mma_16816(float (&d)[4], const uint32_t (&a)[4], uint32_t b0, uint32_t b1) {
-#if PULSAR_SM80
-    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
-                 "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
-                 : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
-                 : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
-#else
-    __trap();
-#endif
-}
 
 /// Four 8x8 b16 matrices from shared memory into an MMA A fragment (ldmatrix .x4).
 /// @param a  out: the four fragment registers
@@ -420,7 +405,7 @@ exl3_moe_gemm_kernel(const void *__restrict__ table, const __half *__restrict__ 
 #pragma unroll
                     for (int h = 0; h < 2; ++h) {
                         float d[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-                        mma_16816(d, ahi, bw[h].x, bw[h].y);
+                        pulsar_mma_f16_16816(d, ahi, bw[h].x, bw[h].y);
                         float *ac = acc[m][h];
                         ac[0] = fmaf(d[0], ia[m], ac[0]);
                         ac[1] = fmaf(d[1], ia[m], ac[1]);
@@ -637,7 +622,7 @@ exl3_moe_decode_kernel(const dec_mat m0, const dec_mat m1, const int32_t *__rest
 #pragma unroll
             for (int h = 0; h < 2; ++h) {
                 float d[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-                mma_16816(d, c.a, b[h][0], b[h][1]);
+                pulsar_mma_f16_16816(d, c.a, b[h][0], b[h][1]);
                 float *ac = acc[i][h];
                 ac[0] = fmaf(d[0], c.ia, ac[0]);
                 ac[1] = fmaf(d[1], c.ia, ac[1]);

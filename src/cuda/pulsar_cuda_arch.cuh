@@ -47,6 +47,42 @@
 /* Full-warp integer reductions.  sm_80 has them as one instruction (redux.sync); below it the same value comes from a
  * butterfly of shuffles.  Integer min/max/add are exact and order-free, so both bodies return identical bits: these
  * are one function per target, not two answers. */
+/* The m16n8k16 tensor-core MMAs, ONE definition each (L335: the bf16 one was copied into three TUs and the f16 one into
+ * two).  sm_80+; below it the body traps -- the launchers refuse such a device by name first (the tiers above). */
+/** One mma.sync m16n8k16 bf16 x bf16 -> f32, accumulating into d (A row-major 16x16, B col-major 16x8).
+ *  @param d  the thread's four f32 accumulators (in / out)
+ *  @param a  the thread's A fragment, four bf16x2 registers
+ *  @param b0 B fragment register 0 (bf16x2)
+ *  @param b1 B fragment register 1 (bf16x2) */
+__device__ __forceinline__ void pulsar_mma_bf16_16816(float (&d)[4], const uint32_t (&a)[4], uint32_t b0, uint32_t b1) {
+#if PULSAR_SM80
+    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+                 "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+                 : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
+                 : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+#else
+    (void)d; (void)a; (void)b0; (void)b1;
+    __trap();
+#endif
+}
+
+/** One mma.sync m16n8k16 f16 x f16 -> f32, accumulating into d (A row-major 16x16, B col-major 16x8).
+ *  @param d  the thread's four f32 accumulators (in / out)
+ *  @param a  the thread's A fragment, four f16x2 registers
+ *  @param b0 B fragment register 0 (f16x2: k rows 2c, 2c+1)
+ *  @param b1 B fragment register 1 (f16x2: k rows 2c+8, 2c+9) */
+__device__ __forceinline__ void pulsar_mma_f16_16816(float (&d)[4], const uint32_t (&a)[4], uint32_t b0, uint32_t b1) {
+#if PULSAR_SM80
+    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
+                 "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+                 : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
+                 : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+#else
+    (void)d; (void)a; (void)b0; (void)b1;
+    __trap();
+#endif
+}
+
 template <typename T>
 __device__ __forceinline__ T pulsar_warp_add(T v) {
 #if PULSAR_SM80

@@ -52,21 +52,6 @@ template <int NT> __host__ __device__ constexpr size_t stage_bytes() { return (s
 static_assert(stage_bytes<1>() <= 48 * 1024 && stage_bytes<2>() <= 48 * 1024 && stage_bytes<kRoutedNT>() <= 48 * 1024,
               "the staged chunk must fit the default dynamic shared memory");
 
-/// One m16n8k16 bf16 MMA, f32 accumulate, d += A B; traps below sm_80 (the launchers refuse there first).
-/// @param d the accumulator fragment, in/out.
-/// @param a the A (weight) fragment.
-/// @param b0 B (activation) fragment register 0.
-/// @param b1 B fragment register 1.
-__device__ __forceinline__ void mma_bf16_16816(float (&d)[4], const uint32_t (&a)[4], uint32_t b0, uint32_t b1) {
-#if PULSAR_SM80
-    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
-                 "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
-                 : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
-                 : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
-#else
-    __trap();
-#endif
-}
 
 /** One CTA's 128 outputs [o0, o0 + 128) of W [out][in] for nr <= 8 NT activation rows: row i of the call is
  *  X[xs(i)] (xs = xidx ? xidx[start + i] : start + i) and lands in Y[yd(i)] (yd likewise from yidx), ld out. */
@@ -134,7 +119,7 @@ __device__ __forceinline__ void rows_tile(const __nv_bfloat16 *__restrict__ W, i
                 for (int s = 0; s < 4; ++s) {
                     const uint32_t af[4] = {A0[2 * s], A1[2 * s], A0[2 * s + 1], A1[2 * s + 1]};
                     float d[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-                    mma_bf16_16816(d, af, B[2 * s], B[2 * s + 1]);
+                    pulsar_mma_bf16_16816(d, af, B[2 * s], B[2 * s + 1]);
 #pragma unroll
                     for (int e = 0; e < 4; ++e) acc[j][e] += d[e];
                 }

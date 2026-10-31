@@ -32,23 +32,6 @@ constexpr int kWarps = 8;
 constexpr int kTargetCtas = 192;   ///< the K split's goal (pulsar_nvfp4_ksplit): four CTAs a GB10 SM
 constexpr int kBlockRows = 64;     ///< the widest launch: 8 n8 tiles (prompt chunks; the weight read once a 64 rows)
 
-/** One mma.sync m16n8k16 bf16 x bf16 -> f32, accumulating into d (A row-major 16x16, B col-major 16x8); traps
- *  below sm_80.
- *  @param d  the thread's four f32 accumulators (in / out)
- *  @param a  the thread's A fragment, four bf16x2 registers
- *  @param b0 B fragment register 0 (bf16x2)
- *  @param b1 B fragment register 1 (bf16x2) */
-__device__ __forceinline__ void mma_bf16_16816(float (&d)[4], const uint32_t (&a)[4], uint32_t b0, uint32_t b1) {
-#if PULSAR_SM80
-    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
-                 "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
-                 : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
-                 : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
-#else
-    (void)d; (void)a; (void)b0; (void)b1;
-    __trap();
-#endif
-}
 
 /* The decode is the SM12x family's conversions (as FlashInfer's native SM12x bf16 x fp4 kernels decode,
  * flashinfer/gemm/kernels/native_bf16_fp4): cvt.rn.bf16x2.e2m1x2 turns a code byte into its two values (the low
@@ -214,7 +197,7 @@ nvfp4_rows_kernel(const __grid_constant__ nvfp4_set set, size_t scales_at, size_
                     for (int j = 0; j < NT; ++j) {
                         if (j >= nt) break;
                         float d[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-                        mma_bf16_16816(d, af, h ? xq[j].z : xq[j].x, h ? xq[j].w : xq[j].y);
+                        pulsar_mma_bf16_16816(d, af, h ? xq[j].z : xq[j].x, h ? xq[j].w : xq[j].y);
 #pragma unroll
                         for (int e = 0; e < 4; ++e) acc[j][e] += d[e];
                     }

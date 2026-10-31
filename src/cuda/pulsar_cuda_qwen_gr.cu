@@ -427,21 +427,6 @@ constexpr int kDnNJ = 10, kDnOut = 8 * kDnNJ;    ///< the read's W_down (NORM): 
 constexpr int kMmaKs  = kMmaStage * 32;          ///< k per stage
 constexpr int kMmaPad = kMmaKs + 8;              ///< smem row stride in bf16: 16-byte rows, conflict-free ldmatrix
 
-/** One mma.sync m16n8k16 bf16 x bf16 -> f32, accumulating into d (sm_80+; traps on older arches).
- *  @param d  the f32 accumulator fragment (in/out)
- *  @param a  the A fragment (4 regs of bf16 pairs)
- *  @param b0 B fragment register 0
- *  @param b1 B fragment register 1 */
-__device__ __forceinline__ void mma_bf16_16816(float (&d)[4], const uint32_t (&a)[4], uint32_t b0, uint32_t b1) {
-#if PULSAR_SM80
-    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
-                 "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
-                 : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
-                 : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
-#else
-    __trap();
-#endif
-}
 
 /** ldmatrix .x4: four 8x8 b16 matrices from shared memory.
  *  @param r out: the four fragment registers
@@ -609,7 +594,7 @@ qwen_w8a16_prefill_kernel(const uint8_t *__restrict__ wq, const uint8_t *__restr
                  * accumulate is not IEEE f32 (measured: 2.9e-04 against double over K = 2560 when
                  * acc rode in the C operand, vs ~1e-6 this way) -- the dense EXL3 arm's pattern */
                 float d[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-                mma_bf16_16816(d, a, bb0, bb1);
+                pulsar_mma_bf16_16816(d, a, bb0, bb1);
 #pragma unroll
                 for (int e = 0; e < 4; ++e) acc[j][e] += d[e];
             }
@@ -1343,7 +1328,7 @@ qwen_w8a16_rows_kernel(const uint8_t *__restrict__ wq, const uint8_t *__restrict
                     for (int s = 0; s < 4; ++s) {
                         const uint32_t af[4] = {A0[u][2 * s], A1[u][2 * s], A0[u][2 * s + 1], A1[u][2 * s + 1]};
                         float d[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-                        mma_bf16_16816(d, af, B[2 * s], B[2 * s + 1]);
+                        pulsar_mma_bf16_16816(d, af, B[2 * s], B[2 * s + 1]);
 #pragma unroll
                         for (int e = 0; e < 4; ++e) acc[j][e] += d[e];
                     }
