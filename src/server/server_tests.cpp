@@ -9313,6 +9313,20 @@ static void test_l184_every_consumer_loops_the_syntax_table(void) {
         TEST_ASSERT(trim_truncated_dsml_close_tail(cut.ptr, 0, cut.len) == 5);
         buf_free(&cut);
 
+        /* L335: a value streams up to this row's parameter close and no further -- the close whole (the finalize
+         * asks without parsing it first) with bytes after it, or any trailing prefix of it */
+        const size_t pe = strlen(syn->param_end);
+        for (size_t k = 1; k <= pe; k++) {
+            buf v = {0};
+            buf_puts(&v, "value");
+            buf_append(&v, syn->param_end, k);
+            if (k == pe) buf_puts(&v, "\nafter");
+            for (int str = 0; str < 2; str++)
+                TEST_ASSERT(tool_param_value_stream_safe_len(v.ptr, 0, v.len, syn->param_end, str == 1) == 5);
+            buf_free(&v);
+        }
+        TEST_ASSERT(tool_param_value_stream_safe_len("plain", 0, 5, syn->param_end, true) == 5);
+
         free(content);
         free(reasoning);
         tool_calls_free(&calls);

@@ -490,17 +490,33 @@ static size_t dsml_entity_stream_safe_len(const char *raw, size_t start, size_t 
 
 
 
-/// How much of a parameter value may stream: held back are a partial closing tag of any DSML style, a partial
+/// How much of a parameter value may stream: never the active syntax's close (`param_end`, whole or a trailing
+/// prefix of it) or what follows it; held back besides are a partial closing tag of any DSML style, a partial
 /// entity (string values) and a split UTF-8 sequence.
 /// @param raw        the text
 /// @param start      the value's first unreleased byte
 /// @param raw_len    bytes of `raw`
-/// @param param_end  the active syntax's parameter close (unused: every style's close is held)
+/// @param param_end  the active syntax's parameter close (non-empty)
 /// @param is_string  the value is a string
 /// @return the release limit
 size_t tool_param_value_stream_safe_len(const char *raw, size_t start,
                                                size_t raw_len, const char *param_end,
                                                bool is_string) {
+    /* L335: the value ends at the active close.  The update finds a whole close before it asks (and parses
+     * it), but the finalize asks without looking, so a close that arrived in the final bytes was streamed as
+     * value text; and a trailing prefix of the close is held whatever byte it starts on. */
+    const size_t pe = param_end ? strlen(param_end) : 0;
+    if (!pe) pulsar_die("tool_param_value_stream_safe_len: no parameter close for the active syntax");
+    size_t limit = raw_len;
+    if (const char *end = find_lit_bounded(raw + start, raw_len - start, param_end)) {
+        limit = (size_t)(end - raw);
+    } else {
+        for (size_t k = pe - 1 < raw_len - start ? pe - 1 : raw_len - start; k > 0; k--)
+            if (!memcmp(raw + raw_len - k, param_end, k)) {
+                limit = raw_len - k;
+                break;
+            }
+    }
     /* Hold a trailing partial closing tag of ANY DSML style, not only the
      * active one: the model sometimes mixes styles (opens short, closes
      * long), and a mismatched partial close streamed as value bytes is tag
@@ -508,8 +524,7 @@ size_t tool_param_value_stream_safe_len(const char *raw, size_t start,
      * "</｜DSML｜" inside command).  A held tail self-resolves on the next
      * update: either the prefix breaks (real value text, released) or the
      * tag completes (parsed or trimmed at finalize). */
-    (void)param_end;
-    size_t limit = trim_truncated_dsml_close_tail(raw, start, raw_len);
+    limit = trim_truncated_dsml_close_tail(raw, start, limit);
     if (is_string) limit = dsml_entity_stream_safe_len(raw, start, limit);
     return utf8_stream_safe_len(raw, start, limit, false);
 }
