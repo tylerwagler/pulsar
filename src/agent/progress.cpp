@@ -10,11 +10,13 @@
  */
 
 void worker_progress_cb(void *ud, const char *event, int current, int total) {
-    (void)total;
     agent_worker *w = (agent_worker *)ud;
     if (!w || !event) return;
     if (strcmp(event, "prefill_chunk") && strcmp(event, "prefill_display")) return;
     pthread_mutex_lock(&w->mu);
+    /* the session's prompt length is the authority for the bar's end (the worker's pre-sync estimate only
+     * seeds it before the first report) */
+    w->status.prefill_total = total > w->progress_base ? total - w->progress_base : 0;
     int done = current - w->progress_base;
     if (done < 0) done = 0;
     if (done > w->status.prefill_total) done = w->status.prefill_total;

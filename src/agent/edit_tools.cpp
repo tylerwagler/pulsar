@@ -703,7 +703,25 @@ static void test_agent_turn_marks_family_neutral(void) {
     free(title);
 }
 
+/* worker_progress_cb takes the bar's end from the session's `total`, not the worker's pre-sync estimate */
+static void test_worker_progress_uses_session_total(void) {
+    agent_worker w;
+    memset(&w, 0, sizeof(w));
+    pthread_mutex_init(&w.mu, NULL);
+    w.wake_pending = true;   /* no wake pipe: agent_wake_locked writes nothing */
+    w.progress_base = 100;
+    w.status.prefill_total = 5;   /* a stale estimate */
+    worker_progress_cb(&w, "prefill_chunk", 150, 300);
+    AGENT_TEST_ASSERT(w.status.prefill_total == 200 && w.status.prefill_done == 50);
+    worker_progress_cb(&w, "prefill_display", 400, 300);
+    AGENT_TEST_ASSERT(w.status.prefill_total == 200 && w.status.prefill_done == 200);
+    worker_progress_cb(&w, "decode", 500, 900);   /* not a prefill event: ignored */
+    AGENT_TEST_ASSERT(w.status.prefill_total == 200);
+    pthread_mutex_destroy(&w.mu);
+}
+
 static void pulsar_agent_unit_tests_run(void) {
+    test_worker_progress_uses_session_total();
     test_agent_turn_marks_family_neutral();
     test_agent_edit_upto_tail_newline_is_not_part_of_anchor();
     test_agent_edit_upto_requires_tail_after_newline_strip();

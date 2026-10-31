@@ -1138,12 +1138,12 @@ void renderer_plain(agent_token_renderer *r, const char *s, size_t n);
  *  @param len    byte count
  *  @param finish the reply ended: flush held bytes and close any open DSML display */
 void agent_stream_text(agent_stream_renderer *sr, const char *text, size_t len, bool finish);
-/** pulsar_session progress callback: on prefill_chunk / prefill_display events, updates status.prefill_done
- *  (relative to progress_base) and prefill_tps and wakes the UI.  Takes w->mu.
+/** pulsar_session progress callback: on prefill_chunk / prefill_display events, updates status.prefill_total and
+ *  prefill_done (both relative to progress_base) and prefill_tps and wakes the UI.  Takes w->mu.
  *  @param ud      the agent_worker
  *  @param event   the event name
  *  @param current tokens processed so far (absolute position)
- *  @param total   unused */
+ *  @param total   the prompt's tokens (absolute): the bar ends at total - progress_base */
 void worker_progress_cb(void *ud, const char *event, int current, int total);
 /** Whether an interrupt or stop is pending.  Takes w->mu.
  *  @param w the worker
