@@ -87,6 +87,12 @@ int pulsar_driver_session_create(pulsar_session *s, uint32_t n_banks) {
         fprintf(stderr, "pulsar: %s: the family supplies no %s%s -- refusing the session\n", ARCH(e), miss, where);
         return 1;
     }
+    if (ops->n_scratch > PULSAR_DRIVER_SCRATCH_MAX) {   /* L335: refused, never capped (the arenas past it went missing) */
+        fprintf(stderr, "pulsar: %s: the family declares %u scratch arenas, the driver holds %u "
+                        "(PULSAR_DRIVER_SCRATCH_MAX) -- refusing the session\n",
+                ARCH(e), ops->n_scratch, (unsigned)PULSAR_DRIVER_SCRATCH_MAX);
+        return 1;
+    }
     pulsar_driver_state *d = ops->create(s, n_banks);
     if (!d) return 1;
     s->driver = d;
@@ -110,7 +116,7 @@ int pulsar_driver_session_create(pulsar_session *s, uint32_t n_banks) {
     /* the declared state (its verify capture when the session verifies), every bank fresh */
     if (ok) ok = (s->states = pulsar_state_create(e, &e->state_plan, d, n_banks, (uint32_t)s->ctx_size,
                                                   verifies ? PULSAR_STATE_VERIFY_ROWS : 0u)) != NULL;
-    for (uint32_t a = 0; ok && a < ops->n_scratch && a < PULSAR_DRIVER_SCRATCH_MAX; a++) {
+    for (uint32_t a = 0; ok && a < ops->n_scratch; a++) {
         const uint64_t b = ops->scratch_bytes(a, d->max_rows, s->states->ctx);
         if (b) ok = (d->scratch[a] = pulsar_gpu_tensor_alloc(b)) != NULL;
     }

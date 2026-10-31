@@ -3850,6 +3850,30 @@ static void test_l308_copy_estimate(void) {
     TEST_ASSERT(pulsar_spec_copy_price(&sp, 0.0f, 8u, conf, &rp) == 8u && !rp && conf[0] == 1.0f);
 }
 
+/* L335: a driver family declaring more scratch arenas than the driver holds is refused at the session's create
+ * (step_driver.cpp), by name -- the create used to cap n_scratch silently, so the arenas past
+ * PULSAR_DRIVER_SCRATCH_MAX were never allocated and the family's ops read NULL.  Host: the refusal comes before
+ * the family's create or any allocation. */
+static bool test_driver_never(const pulsar_driver_step *) { return false; }
+static bool test_driver_head_never(const pulsar_driver_step *, uint32_t, uint32_t, uint32_t) { return false; }
+static void test_driver_scratch_cap(void) {
+    static pulsar_driver_ops ops{};
+    ops.embed = test_driver_never;
+    ops.head = test_driver_head_never;
+    ops.n_scratch = PULSAR_DRIVER_SCRATCH_MAX + 1u;   /* create stays NULL: reaching it would crash the test */
+    static pulsar_family fam{};
+    fam.arch = "l335_driver_test";
+    fam.name = "L335 driver test";
+    fam.driver = &ops;
+    pulsar_engine *e = (pulsar_engine *)xcalloc(1, sizeof(*e));
+    e->family = &fam;   /* plan.n_layer 0: no block is needed */
+    pulsar_session *s = (pulsar_session *)xcalloc(1, sizeof(*s));
+    s->engine = e;
+    TEST_ASSERT(pulsar_driver_session_create(s, 1u) == 1 && s->driver == NULL);
+    free(s);
+    free(e);
+}
+
 /* L335: the safetensors header's integers pass blob_value's exactness check (st_exact_integer: an integer a double
  * holds exactly) -- a fractional or past-2^53 shape entry used to truncate / round into a wrong integer that parsed.
  * Host: a one-tensor shard in a scratch directory, the open's stderr read back for the refusal. */
@@ -5040,6 +5064,7 @@ static const pulsar_test_entry test_entries[] = {
     {"--fused-cost", "fused-cost", "the prompt chunk cost fit (solo + fused, persisted) and the verify curve's round cost, what the round selection and the disk restore price by (L304, L312, L327)", test_fused_cost},
     {"--fused-sched", "fused-sched", "the round selection simulated on L304's logged costs: L304's and L277's cases, the stall, no prompt, the cold fit (L312)", test_fused_sched},
     {"--read-ahead", "read-ahead", "the next-chunk PLE read-ahead: its rule (one chunk ahead, each row once, a changed prompt drops), the pool's background class (bytes unchanged, below every gather, cancel, accounting) (L329 b2)", test_read_ahead},
+    {"--driver-scratch", "driver-scratch", "a driver family past PULSAR_DRIVER_SCRATCH_MAX scratch arenas is refused at the session's create, never capped (L335)", test_driver_scratch_cap},
     {"--st-integers", "st-integers", "the safetensors header's integers are exact: a fractional or past-2^53 shape is refused (L335)", test_st_exact_integers},
     {"--bank-carry-restore", "bank-carry-restore", "a bank carry's restore is all or nothing: a live row that fails leaves the host view untouched (L335)", test_bank_carry_restore},
     {"--qwen-eos", "qwen-eos", "Qwen's eos: the tokenizer's first stop id; a tokenizer with none never loads (L335)", test_qwen_eos},

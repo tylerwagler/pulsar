@@ -175,6 +175,7 @@ typedef struct pulsar_driver_ops {
     /** Bytes of scratch arena `arena` (< n_scratch) at max_rows rows and a pool capacity of ctx tokens (0 = none). */
     uint64_t (*scratch_bytes)(uint32_t arena, uint32_t max_rows, uint32_t ctx);
     /// scratch arenas the family owns (scratch_bytes is asked for arenas [0, n_scratch)), <= PULSAR_DRIVER_SCRATCH_MAX
+    /// (a family past it is refused at the session's create)
     uint32_t n_scratch;
     /** tokens -> the step's slots */
     bool (*embed)(const pulsar_driver_step *st);
