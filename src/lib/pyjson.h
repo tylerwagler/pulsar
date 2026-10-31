@@ -87,9 +87,11 @@ void pyjson_dump_string(const char *s, size_t n, std::string *out);
 /// @return true on success, false when `v` holds a non-finite float
 bool pyjson_dump_canonical(const pyjson_value &v, std::string *out);
 
-/** Python's truthiness of the value json.loads produced (`x or default`). */
+/** Python's truthiness of the value json.loads produced (`x or default`), with one departure kept as it is: an
+ *  integer is false only when its text is exactly `0`, so `-0` (Python: int 0, false) is true.  A float -0.0 is
+ *  false, as in Python. */
 /// @param v the value
-/// @return false for null, false, 0, 0.0, "", [] and {}; true otherwise
+/// @return false for null, false, 0, 0.0, -0.0, "", [] and {}; true otherwise (`-0` included)
 bool pyjson_truthy(const pyjson_value &v);
 
 /** Python's str.isspace() for one codepoint -- the whitespace str.strip() removes (and Jinja's |trim): the
