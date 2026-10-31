@@ -288,13 +288,12 @@ exl3_dense_prep_kernel(const dense_set P, const __nv_bfloat16 *__restrict__ xb, 
 /// (32, 8): each CTA 32 outputs x one split's k-range (<= kMaxBlocks Hadamard blocks) x all M <= 16 rows; the last
 /// CTA of a 128-output block (on its counter) sums the splits in order, applies H128 and svh, writes y or yb.
 /// Static smem: 40 KB of A tiles (kWarps x kMaxBlocks x {hi, lo} x 16 x 16 fp16), reused for the reduction.
-/// @param P   the projections of one rate
-/// @param xb  unused here (the prep planes carry the input); kept for the launch shape
+/// @param P   the projections of one rate (the prep planes carry the input)
 /// @param M   rows, 1..16
 /// @param K   input width
 template <int K2>
 __global__ void __launch_bounds__(kOut * kWarps)
-exl3_dense_kernel(const dense_set P, const __nv_bfloat16 *__restrict__ xb, int M, int K) {
+exl3_dense_kernel(const dense_set P, int M, int K) {
     const int c = (int)blockIdx.x, j = proj_of(P, c);
     const dense_proj &p = proj_at(P, j);
     const int cl = c - (j == 0 ? 0 : j == 1 ? P.end[0] : j == 2 ? P.end[1] : P.end[2]);
@@ -491,18 +490,16 @@ unsigned *counter_slice(cudaStream_t stream) {
 /// @param block   (kOut, kWarps, 1)
 /// @param stream  the launch stream
 /// @param P       the set's projections, all at rate k2
-/// @param xb      the bf16 input rows
 /// @param M       rows, 1..16
 /// @param K       input width
-void gemv_launch(int k2, const dim3 &grid, const dim3 &block, cudaStream_t stream, const dense_set &P,
-                 const __nv_bfloat16 *xb, int M, int K) {
+void gemv_launch(int k2, const dim3 &grid, const dim3 &block, cudaStream_t stream, const dense_set &P, int M, int K) {
     switch (k2) {
-    case 4:  exl3_dense_kernel<4><<<grid, block, 0, stream>>>(P, xb, M, K); break;
-    case 6:  exl3_dense_kernel<6><<<grid, block, 0, stream>>>(P, xb, M, K); break;
-    case 8:  exl3_dense_kernel<8><<<grid, block, 0, stream>>>(P, xb, M, K); break;
-    case 10: exl3_dense_kernel<10><<<grid, block, 0, stream>>>(P, xb, M, K); break;
-    case 12: exl3_dense_kernel<12><<<grid, block, 0, stream>>>(P, xb, M, K); break;
-    default: exl3_dense_kernel<16><<<grid, block, 0, stream>>>(P, xb, M, K); break;  /* k2 == 16, checked */
+    case 4:  exl3_dense_kernel<4><<<grid, block, 0, stream>>>(P, M, K); break;
+    case 6:  exl3_dense_kernel<6><<<grid, block, 0, stream>>>(P, M, K); break;
+    case 8:  exl3_dense_kernel<8><<<grid, block, 0, stream>>>(P, M, K); break;
+    case 10: exl3_dense_kernel<10><<<grid, block, 0, stream>>>(P, M, K); break;
+    case 12: exl3_dense_kernel<12><<<grid, block, 0, stream>>>(P, M, K); break;
+    default: exl3_dense_kernel<16><<<grid, block, 0, stream>>>(P, M, K); break;  /* k2 == 16, checked */
     }
 }
 
@@ -682,7 +679,7 @@ int ds4_exl3_dense_multi_launch(const ds4_exl3_dense_proj *p, int n, const void 
             g.end[m++] = ctas;
         }
         for (int i = m; i < kMaxProj; ++i) g.end[i] = INT_MAX;
-        gemv_launch(p[j0].k2, dim3((unsigned)ctas), dim3(kOut, kWarps, 1), stream, g, xb16, M, K);
+        gemv_launch(p[j0].k2, dim3((unsigned)ctas), dim3(kOut, kWarps, 1), stream, g, M, K);
     }
     const cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
