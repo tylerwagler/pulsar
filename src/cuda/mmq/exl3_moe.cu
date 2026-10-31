@@ -110,11 +110,19 @@ shared_lane *shared_lane_for(cudaStream_t caller) {
     shared_lane l{};
     l.dev = dev;
     l.caller = caller;
-    if (cudaStreamCreateWithFlags(&l.s, cudaStreamNonBlocking) != cudaSuccess ||
-        cudaEventCreateWithFlags(&l.fork, cudaEventDisableTiming) != cudaSuccess)
+    /* L335: a failure part way releases what was already created (it leaked the stream and the events) */
+    bool made = cudaStreamCreateWithFlags(&l.s, cudaStreamNonBlocking) == cudaSuccess &&
+                cudaEventCreateWithFlags(&l.fork, cudaEventDisableTiming) == cudaSuccess;
+    for (cudaEvent_t &e : l.done) made = made && cudaEventCreateWithFlags(&e, cudaEventDisableTiming) == cudaSuccess;
+    if (!made) {
+        for (cudaEvent_t e : l.done)
+            if (e) (void)cudaEventDestroy(e);
+        if (l.fork) (void)cudaEventDestroy(l.fork);
+        if (l.s) (void)cudaStreamDestroy(l.s);
+        (void)cudaGetLastError();
+        fprintf(stderr, "pulsar: EXL3 shared expert: its stream / events could not be created -- refusing\n");
         return nullptr;
-    for (cudaEvent_t &e : l.done)
-        if (cudaEventCreateWithFlags(&e, cudaEventDisableTiming) != cudaSuccess) return nullptr;
+    }
     t_lanes[t_n] = l;
     static bool announced = false;
     if (!__atomic_exchange_n(&announced, true, __ATOMIC_RELAXED))
