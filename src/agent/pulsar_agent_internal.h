@@ -757,16 +757,6 @@ struct agent_bash_job {
     int newline_count;    ///< newlines seen, for the line count without a rescan
     char last_byte;       ///< last byte captured; tells whether output ends in a newline
 
-    /** @note WRITE-ONLY as of this writing. Both counters are assigned in
-     * agent_bash_job::observation() and read NOWHERE. The intent was clearly an
-     * incremental cursor -- report only output added since the last look -- but
-     * only `observed_once` is actually consumed, and it selects HEAD (first
-     * observation) vs TAIL (every later one). A repeated bash_status therefore
-     * re-shows the same tail rather than just the new bytes. Either wire these
-     * up or delete them; they are not currently load-bearing. */
-    size_t observed_bytes;
-    int observed_display_lines;  ///< @see observed_bytes -- also write-only
-
     bool observed_once;   ///< the job has been observed at least once; switches head display to tail
     int exit_status;      ///< waitpid status once `running` is false
     bool running;         ///< the child has not been reaped yet
