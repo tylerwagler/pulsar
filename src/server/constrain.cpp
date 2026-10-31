@@ -26,6 +26,7 @@
 #include "pulsar_server_internal.h"
 #include "../lib/pulsar_grammar.h"
 
+#include <atomic>
 #include <chrono>
 #include <mutex>
 #include <string>
@@ -146,18 +147,32 @@ void constrain_plan_free(constrain_plan *p) {
     delete p;
 }
 
+/* L335: s->grammar is the publication flag of the pair.  The builder writes s->token_bytes, then stores s->grammar
+ * with release order; a client thread reads s->grammar with acquire order (constrain_compiler_published), so a
+ * non-NULL compiler guarantees its token table is visible.  The worker reads both plainly: it only meets a
+ * constrained request after a client thread planned it and queued it under s->mu. */
+/// @brief The grammar compiler if it has been built (an acquire load: its token table is visible), else NULL.
+/// @param s  the server
+/// @return s->grammar, or NULL before the first constrained request built it
+static pulsar_grammar_compiler *constrain_compiler_published(server *s) {
+    return std::atomic_ref<pulsar_grammar_compiler *>(s->grammar).load(std::memory_order_acquire);
+}
+
 /* The grammar compiler over the loaded vocabulary, built once (the first constrained request pays for it). */
-/// @brief s->grammar, built on first call under a function-local mutex (also sets s->token_bytes); any thread that
-///        renders a constrained request.
+/// @brief s->grammar, built on first call under a function-local mutex (also sets s->token_bytes, published by
+///        the release store of s->grammar); any thread that renders a constrained request.  The pair is write-once:
+///        a token table already present under the lock with no compiler published dies.
 /// @param s       the server
 /// @param e       the engine (its vocabulary and stop tokens)
 /// @param err     receives the failure
 /// @param errlen  size of `err`
 /// @return the compiler, or NULL
 static pulsar_grammar_compiler *constrain_compiler(server *s, pulsar_engine *e, char *err, size_t errlen) {
+    if (pulsar_grammar_compiler *c = constrain_compiler_published(s)) return c;
     static std::mutex mu;
     std::lock_guard<std::mutex> lk(mu);
-    if (s->grammar) return s->grammar;
+    if (pulsar_grammar_compiler *c = constrain_compiler_published(s)) return c;
+    if (s->token_bytes) pulsar_die("constrain_compiler: the token table is already written (write-once, L335)");
     const auto t0 = std::chrono::steady_clock::now();
     const int width = pulsar_engine_logits_width(e);
     auto *bytes = new std::vector<std::string>((size_t)width);
@@ -180,7 +195,7 @@ static pulsar_grammar_compiler *constrain_compiler(server *s, pulsar_engine *e, 
         return NULL;
     }
     s->token_bytes = bytes;
-    s->grammar = c;
+    std::atomic_ref<pulsar_grammar_compiler *>(s->grammar).store(c, std::memory_order_release);
     server_log(PULSAR_LOG_DEFAULT, "pulsar-server: grammar vocabulary: %d tokens, %zu stop, built in %.0f ms (L303)",
                width, stops.size(),
                std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
@@ -367,8 +382,8 @@ bool constrain_plan_build(pulsar_engine *e, server *s, const chat_conversation *
     }
     /* the parse-without-engine shape (the renderer gate) compiles nothing; a server with a compiler but no
      * engine is the unit tests' (a toy vocabulary) */
-    if (!s || (!e && !s->grammar)) return true;
-    pulsar_grammar_compiler *comp = s->grammar ? s->grammar : constrain_compiler(s, e, err, errlen);
+    if (!s || (!e && !constrain_compiler_published(s))) return true;
+    pulsar_grammar_compiler *comp = constrain_compiler(s, e, err, errlen);
     if (!comp) return false;
     auto *plan = new constrain_plan();
     plan->shape = sh;

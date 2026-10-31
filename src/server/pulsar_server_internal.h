@@ -1944,7 +1944,9 @@ struct server {
     pulsar_session *sess;
     /** L303: the grammar compiler over the loaded vocabulary and every token's bytes (pulsar_token_text over
      *  the logits width), built on the first constrained request (constrain.cpp, under its own lock) and
-     *  immutable after; freed at shutdown.  Pointers, so the struct stays memset-clean. */
+     *  immutable after; freed at shutdown.  Pointers, so the struct stays memset-clean.  L335: written once --
+     *  `token_bytes` first, then `grammar` by a release store that publishes both (client threads read it with
+     *  an acquire load, constrain_compiler_published); a second build dies. */
     struct pulsar_grammar_compiler *grammar;
     /// every token's bytes, indexed by token id (built with `grammar`; owned, freed at shutdown)
     std::vector<std::string> *token_bytes;

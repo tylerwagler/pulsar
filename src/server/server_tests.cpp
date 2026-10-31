@@ -11817,6 +11817,25 @@ template <class F> static int l335_exit_status(F op) {
     return WIFEXITED(st) ? WEXITSTATUS(st) : -1;
 }
 
+/* L335: the grammar compiler and its token table are written once.  A published compiler is returned without the
+ * engine (no rebuild); a token table already present with no compiler published -- a second build -- dies. */
+static void test_l335_grammar_compiler_is_write_once(void) {
+    l303_vocab v;
+    server srv;
+    l303_server(&srv, v);
+    char err[200] = "";
+    TEST_ASSERT(constrain_compiler(&srv, NULL, err, sizeof err) == srv.grammar);   /* published: no engine read */
+    TEST_ASSERT(constrain_compiler_published(&srv) == srv.grammar);
+    l303_server_free(&srv);
+    TEST_ASSERT(l335_exit_status([&] {
+        server s;
+        memset(&s, 0, sizeof s);
+        s.token_bytes = new std::vector<std::string>(1);   /* written, never published */
+        char e2[200] = "";
+        constrain_compiler(&s, NULL, e2, sizeof e2);
+    }) == 1);
+}
+
 /* L335: request_init sets no family and no model; a request that reaches the worker's queue without either dies by
  * name at server::enqueue (it used to run as DeepSeek V4.1, "deepseek-v4-flash").  With both set it queues. */
 static void test_l335_request_without_family_dies_at_enqueue(void) {
@@ -11909,6 +11928,7 @@ static void pulsar_server_unit_tests_run(void) {
     test_l334_positions_are_ints();
     test_l334_none_fails_closed();
     test_l335_request_without_family_dies_at_enqueue();
+    test_l335_grammar_compiler_is_write_once();
     test_l334_server_positions();
     test_l334_prompt_held_across_a_seam();
     test_mem_floor_is_derived_from_the_watermarks();
