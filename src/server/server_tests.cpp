@@ -5574,6 +5574,21 @@ static bool prompt_probe(const char **p, char **out) {
     return parse_prompt(p, out, NULL, 0);
 }
 
+/* L335: json_escape_n writes all `n` bytes -- an embedded NUL is \u0000, not the end of the string (it used to copy
+ * through a C string and stop there, dropping the rest of a streamed delta). */
+static void test_json_escape_n_keeps_embedded_nul(void) {
+    buf b = {0};
+    json_escape_n(&b, "a\0b\"c", 4);
+    TEST_ASSERT(b.ptr && !strcmp(b.ptr, "\"a\\u0000b\\\"\""));
+    buf_free(&b);
+    json_escape_n(&b, NULL, 0);
+    TEST_ASSERT(b.ptr && !strcmp(b.ptr, "\"\""));
+    buf_free(&b);
+    json_escape_n(&b, "xyz", 2);
+    TEST_ASSERT(b.ptr && !strcmp(b.ptr, "\"xy\""));
+    buf_free(&b);
+}
+
 static void test_json_value_helpers_null_out_on_failure(void) {
     struct { const char *name; bool (*fn)(const char **, char **); const char *bad; } cases[] = {
         {"json_content",       json_content,       "[}"},
@@ -12100,6 +12115,7 @@ static void pulsar_server_unit_tests_run(void) {
     test_stop_list_streaming_holds_and_trims_stop_text();
     test_json_skip_has_nesting_limit();
     test_json_value_helpers_null_out_on_failure();
+    test_json_escape_n_keeps_embedded_nul();
     test_chat_image_url_content_blocks();
     test_responses_input_image_blocks();
     test_image_placeholder_is_not_client_text();

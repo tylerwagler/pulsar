@@ -278,14 +278,14 @@ void json_escape(buf *b, const char *s) {
 
 
 
-/// @brief Append the first `n` bytes of `s` as a quoted JSON string (stops at an embedded NUL).
+/// @brief Append the first `n` bytes of `s` as a quoted JSON string (an embedded NUL is escaped as \\u0000, L335).
 /// @param b  the buffer
-/// @param s  the bytes (NULL: "")
+/// @param s  the bytes (NULL: "", with n 0)
 /// @param n  bytes at `s`
 void json_escape_n(buf *b, const char *s, size_t n) {
-    char *tmp = xstrndup(s ? s : "", n);
-    json_escape(b, tmp);
-    free(tmp);
+    buf_putc(b, '"');
+    if (s) json_escape_fragment_n(b, s, n);
+    buf_putc(b, '"');
 }
 
 
