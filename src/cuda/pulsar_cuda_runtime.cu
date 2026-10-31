@@ -1012,6 +1012,23 @@ static char *cuda_model_arena_alloc(uint64_t bytes, const char *what) {
     return (char *)dev;
 }
 
+/* L335: a span whose staging failed goes back to its arena.  The fd route allocated the span, then returned NULL on a
+ * failed read / copy / sync and left it allocated -- a hole no range ever used, out of the memory the bank pool is
+ * sized from.  The span is always its arena's last allocation (the load is single-threaded and nothing takes a span
+ * in between), so the bump pointer is rewound over it. */
+/** Returns the arena's last span to it.
+ *  @param span  the span cuda_model_arena_alloc returned
+ *  @param bytes the size it was asked for (rounded as it rounded it) */
+static void cuda_model_arena_unwind(char *span, uint64_t bytes) {
+    const uint64_t aligned = (bytes + 4095u) & ~(uint64_t)4095u;
+    for (cuda_model_arena &a : g_model_arenas) {
+        if (span >= a.device_ptr && span + aligned == a.device_ptr + a.used) {
+            a.used = (uint64_t)(span - a.device_ptr);
+            return;
+        }
+    }
+}
+
 
 
 /* A raw host pointer is safe for kernels only once CUDA has registered the
@@ -1051,6 +1068,14 @@ static const char *cuda_model_range_ptr_from_fd(
     if (!dev) {
         return cuda_model_direct_fallback_ptr(model_map, offset);
     }
+    /* every failure below hands the span back (cuda_model_arena_unwind), after the copies already queued into it
+     * have drained */
+    auto unwind = [dev, bytes]() -> const char * {
+        (void)cudaStreamSynchronize(g_model_upload_stream);
+        (void)cudaGetLastError();
+        cuda_model_arena_unwind(dev, bytes);
+        return NULL;
+    };
     /* PULSAR_VERIFY_RANGES also announces WHERE each span landed: the device
      * alignment of the weights is a performance fact (L239), and the RANGE
      * lines below hash bytes without saying where they live. */
@@ -1062,7 +1087,7 @@ static const char *cuda_model_range_ptr_from_fd(
     const uint64_t chunk = cuda_model_copy_chunk_bytes();
     const uint64_t align = model_fd_max_align();
     const uint64_t stage_bytes = chunk + (align > 1 ? align : 1);
-    if (!cuda_model_stage_pool_alloc(stage_bytes)) return NULL;
+    if (!cuda_model_stage_pool_alloc(stage_bytes)) return unwind();
 
     uint64_t copied = 0;
     uint64_t chunk_idx = 0;
@@ -1074,8 +1099,7 @@ static const char *cuda_model_range_ptr_from_fd(
             if (err != cudaSuccess) {
                 fprintf(stderr, "pulsar: CUDA model staging wait failed for %s: %s\n",
                         what ? what : "weights", cudaGetErrorString(err));
-                (void)cudaGetLastError();
-                return NULL;
+                return unwind();
             }
         }
         const char *payload = NULL;
@@ -1085,7 +1109,7 @@ static const char *cuda_model_range_ptr_from_fd(
                     what ? what : "weights",
                     (double)copied / 1048576.0,
                     strerror(errno));
-            return NULL;
+            return unwind();
         }
         err = cudaMemcpyAsync(dev + copied, payload, (size_t)n,
                               cudaMemcpyHostToDevice, g_model_upload_stream);
@@ -1094,15 +1118,13 @@ static const char *cuda_model_range_ptr_from_fd(
                     what ? what : "weights",
                     (double)copied / 1048576.0,
                     cudaGetErrorString(err));
-            (void)cudaGetLastError();
-            return NULL;
+            return unwind();
         }
         err = cudaEventRecord(g_model_stage_event[bi], g_model_upload_stream);
         if (err != cudaSuccess) {
             fprintf(stderr, "pulsar: CUDA model staging record failed for %s: %s\n",
                     what ? what : "weights", cudaGetErrorString(err));
-            (void)cudaGetLastError();
-            return NULL;
+            return unwind();
         }
         cuda_model_drop_file_pages(model_map, offset + copied, n);
         cuda_model_discard_source_pages(model_map, g_model_registered_size, offset + copied, n);
@@ -1114,8 +1136,7 @@ static const char *cuda_model_range_ptr_from_fd(
     if (err != cudaSuccess) {
         fprintf(stderr, "pulsar: CUDA model range upload sync failed for %s: %s\n",
                 what ? what : "weights", cudaGetErrorString(err));
-        (void)cudaGetLastError();
-        return NULL;
+        return unwind();
     }
 
     g_model_ranges.push_back({model_map, offset, bytes, dev, NULL, NULL, 0, 0, 1});
