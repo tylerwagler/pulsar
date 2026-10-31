@@ -30,6 +30,8 @@
  *   10. subview-dry     pulsar_tensor_subview carries the base's dry flag, format and element size (dry was unset).
  *   11. bf16-nan        pulsar_f32_to_bf16_rne over all 2^32 f32 patterns: every non-NaN keeps the old expression's
  *                       bits, every NaN stays NaN (the old rounding add turned some into Inf and wrapped others to 0).
+ *   12. swiglu-nan      pulsar_swiglu_elem (now also the CUTLASS FFN MMA kernel's) on 2^26 hashed (g, u) pairs x 3
+ *                       clamps: every non-NaN pair keeps the fminf form's bits, a NaN operand stays NaN.
  *
  *  Prints one line per case and KERNEL CONTRACT GATE PASS / FAIL. */
 #include "pulsar_gpu.h"
@@ -573,6 +575,69 @@ static void case_bf16_nan(void) {
     cudaFree(d);
 }
 
+/* ---- 12. swiglu-nan -------------------------------------------------------------------------------------------- */
+
+/// The shared SwiGLU before L335 (fminf / fmaxf), kept HERE only as the sweep's reference for non-NaN inputs.
+/// @param g gate
+/// @param u up
+/// @param wv routing weight
+/// @param clamp clamp bound
+/// @return the old expression's value
+__device__ static float old_swiglu(float g, float u, float wv, float clamp) {
+    if (clamp > 1.0e-6f) { g = fminf(g, clamp); u = fminf(fmaxf(u, -clamp), clamp); }
+    const float s = g / (1.0f + expf(-g));
+    return s * u * wv;
+}
+
+/// One thread a (g, u) pair from 2^26 hashed bit patterns (every class of f32: normals, subnormals, +-0, +-inf, NaN),
+/// at three clamps: [0] non-NaN pairs whose bits moved, [1] pairs with a NaN operand not giving NaN, [2] the pairs the
+/// old expression turned from a NaN operand into a number.
+/// @param cnt the three counters (zeroed)
+__global__ static void swiglu_sweep_kernel(unsigned long long *cnt) {
+    unsigned long long moved = 0, lost = 0, old_lost = 0;
+    const float clamps[3] = {0.0f, 7.0f, 10.0f};
+    for (uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x; i < (1ull << 26);
+         i += (uint64_t)gridDim.x * blockDim.x) {
+        uint64_t h = (i + 1u) * 0x9e3779b97f4a7c15ull;
+        h ^= h >> 31;
+        h *= 0xbf58476d1ce4e5b9ull;
+        h ^= h >> 29;
+        /* half the pairs from raw patterns, half near the clamps (where fminf and the if-chain could differ) */
+        float g = __uint_as_float((uint32_t)h), u = __uint_as_float((uint32_t)(h >> 32));
+        if (i & 1u) {
+            g = ((int)((h >> 8) % 4001u) - 2000) * 0.0078125f;
+            u = ((int)((h >> 40) % 4001u) - 2000) * 0.0078125f;
+        }
+        for (float c : clamps) {
+            const float a = pulsar_swiglu_elem(g, u, 0.375f, c), b = old_swiglu(g, u, 0.375f, c);
+            const bool nan_in = g != g || u != u;
+            if (!nan_in) moved += __float_as_uint(a) != __float_as_uint(b) && !(a != a && b != b);
+            else {
+                lost += a == a;
+                old_lost += b == b;
+            }
+        }
+    }
+    atomicAdd(&cnt[0], moved);
+    atomicAdd(&cnt[1], lost);
+    atomicAdd(&cnt[2], old_lost);
+}
+
+/// Case 12: the one SwiGLU keeps every non-NaN pair's old bits and turns no NaN operand into a number.
+static void case_swiglu_nan(void) {
+    unsigned long long *d = nullptr, h[3] = {0, 0, 0};
+    if (!ok(cudaMalloc(&d, sizeof(h)), "swiglu-nan malloc") || !ok(cudaMemset(d, 0, sizeof(h)), "swiglu-nan memset"))
+        return;
+    swiglu_sweep_kernel<<<1024, 256>>>(d);
+    if (ok(cudaDeviceSynchronize(), "swiglu-nan sweep") && ok(cudaMemcpy(h, d, sizeof(h), cudaMemcpyDeviceToHost),
+                                                             "swiglu-nan download")) {
+        printf("  12 swiglu-nan: 2^26 pairs x 3 clamps: %llu non-NaN moved, %llu NaN operands not kept (the fminf form "
+               "lost %llu)\n", h[0], h[1], h[2]);
+        if (h[0] || h[1]) fail("swiglu-nan: a non-NaN pair changed bits, or a NaN operand became a number");
+    }
+    cudaFree(d);
+}
+
 /// Runs every case on device 0.
 /// @return 0 on PASS, 1 on FAIL
 int main(void) {
@@ -591,6 +656,7 @@ int main(void) {
     case_hc_expand_sizes();
     case_subview_dry();
     case_bf16_nan();
+    case_swiglu_nan();
     puts(g_fail ? "KERNEL CONTRACT GATE FAIL" : "KERNEL CONTRACT GATE PASS");
     return g_fail ? 1 : 0;
 }

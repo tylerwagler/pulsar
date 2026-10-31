@@ -1452,14 +1452,9 @@ __global__ static void __launch_bounds__(FFN_MMA_R * 32) ffn_mma_kernel(
         const int col = j * 8 + q * 2 + i;
         if constexpr (NMAT == 2) {
           if (t < m) {
-            /* swiglu_kernel's clamp, then silu(gate) * up * rweight */
-            float gg = acc[0][j][h * 2 + i], uu = acc[1][j][h * 2 + i];
-            if (clampv > 1.0e-6f) {
-              if (gg > clampv) gg = clampv;
-              if (uu > clampv) uu = clampv;
-              if (uu < -clampv) uu = -clampv;
-            }
-            s_v[warp][t][col] = (gg / (1.f + expf(-gg))) * uu * rw[slots[t]];
+            /* THE SwiGLU (pulsar_swiglu_elem, pulsar_cuda_mx.cuh): the clamp, then silu(gate) * up * rweight.  This
+             * was an inline copy whose NaN rule differed from the shared one (L335). */
+            s_v[warp][t][col] = pulsar_swiglu_elem(acc[0][j][h * 2 + i], acc[1][j][h * 2 + i], rw[slots[t]], clampv);
           }
         } else if (t < m) {
           out[(size_t)slots[t] * N + row0 + col] = acc[0][j][h * 2 + i];
