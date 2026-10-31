@@ -39,8 +39,9 @@ static inline void pulsar_writeback_init(pulsar_writeback *w, FILE *fp) {
     if (w->synced < 0) w->fp = NULL;
 }
 
-/* Push [synced, end) to disk and drop it from the cache.  `wait` blocks until
- * the range is written (required before DONTNEED can drop dirty pages). */
+/* Push [synced, end) to disk and drop it from the cache.  Always waits: the
+ * SYNC_FILE_RANGE_WAIT_* flags block until the range is written, which DONTNEED
+ * needs before it can drop the pages (dirty pages are not dropped). */
 /// Write back and drop [w->synced, end) (see the comment above).
 /// @param w   the writeback state
 /// @param end the file offset to write back to
