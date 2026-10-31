@@ -1117,10 +1117,8 @@ void gpu_graph_bank_counters_capture(pulsar_gpu_graph *g, uint32_t bank) {
 /// @param bank the bank (>= PULSAR_MSEQ_MAX: no-op)
 void gpu_graph_bank_counters_install(pulsar_gpu_graph *g, uint32_t bank) {
     if (!g || bank >= PULSAR_MSEQ_MAX) return;
-    for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
-        /* STAGE 1b: self-copy. gpu_graph_bank_repoint() has already set
-         * cur_bank to `bank`, so this wrote ms_n_comp[bank] onto itself. */
-    }
+    /* STAGE 1b: the frontier is not copied here -- ms_n_comp[bank] IS its storage, and gpu_graph_bank_repoint has
+     * already made `bank` current (the per-layer self-copy this used to run is gone). */
     for (int i = 0; i < 3; i++) g->dspark_n_raw[i] = g->ms_dspark_n_raw[bank][i];
     g->dspark_prompt_n = g->ms_dspark_prompt_n[bank];
     g->dspark_prompt_lo = g->ms_dspark_prompt_lo[bank];
