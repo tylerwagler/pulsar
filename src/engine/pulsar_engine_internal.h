@@ -5297,7 +5297,6 @@ void vision_ds4_args(pulsar_vision_args *a);
 bool vision_ds4_block_rows(const pulsar_vision_weights *w, const pulsar_model *m, const pulsar_image_ref *img,
                            int block_len, const uint16_t *tower, int n_tower, uint16_t **tower_out,
                            int *n_tower_out, uint16_t *out, char *err, size_t errlen);
-void weights_free(pulsar_weights *w);
 /** Dense layers and compressed layers use different RoPE bases. */
 /// @param il a layer
 /// @return its rope frequency base

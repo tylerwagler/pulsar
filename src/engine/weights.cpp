@@ -1572,12 +1572,6 @@ void weights_bind(pulsar_weights *w, const pulsar_model *m) {
 
 
 
-/// Forget the bindings (zeroes `w`; the tensors are the model's and are not freed here).
-/// @param w the weights
-void weights_free(pulsar_weights *w) {
-    memset(w, 0, sizeof(*w));
-}
-
 /// @param w the bound DSpark weights
 static void dspark_weights_validate_layout(const pulsar_dspark_weights *w) {
     const uint32_t E = w->embed_dim;
