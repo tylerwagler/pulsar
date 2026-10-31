@@ -1324,7 +1324,7 @@ static void agent_format_welcome_banner(const agent_config *cfg,
     agent_format_ctx_size(cfg->gen.ctx_size, ctx, sizeof(ctx));
     if (stdout_is_tty()) {
         snprintf(buf, len,
-                 "\x1b[1;97mDwarf\x1b[1;94mStar\x1b[0m 🐋 Agent, context %s tokens\n\n",
+                 "\x1b[1;97mPulsar\x1b[0m \x1b[1;94mAgent\x1b[0m, context %s tokens\n\n",
                  ctx);
     } else {
         snprintf(buf, len, "Pulsar Agent, context %s tokens\n\n", ctx);
