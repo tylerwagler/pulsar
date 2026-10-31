@@ -321,6 +321,12 @@ char *nemotron_tool_error_suffix(const request *r, const thinking_state *, const
 }  // namespace
 
 /* L325: a tool loaded mid-conversation, in place: the tools block's <function> elements inside <tools></tools> (nemotron_chat_tool_defs). */
+/// server_family_ops::tool_defs_text for Nemotron-H.
+/// @param lines   one function schema a line (parse_tools_value)
+/// @param len     bytes at `lines`
+/// @param err     receives the reason on NULL
+/// @param errlen  size of `err`
+/// @return the rendered definitions (malloc'd), or NULL + err when the lines do not convert
 static char *nemotron_tool_defs_text(const char *lines, size_t len, char *err, size_t errlen) {
     char *json = tool_schema_lines_openai_tools(lines, len, err, errlen);
     if (!json) return NULL;

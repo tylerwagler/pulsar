@@ -12,11 +12,17 @@
 
 #include "pulsar_server_internal.h"
 
+/** Where the live tool-stream projection (dsml_tool_stream) stands in a DSML block. */
 typedef enum {
+    /// Between invokes: expecting an invoke tag or the block's close.
     DSML_TOOL_BETWEEN_INVOKES,
+    /// Inside an invoke, between parameters: expecting a parameter tag or the invoke's close.
     DSML_TOOL_BETWEEN_PARAMS,
+    /// Inside a parameter's value, streaming its bytes.
     DSML_TOOL_PARAM_VALUE,
+    /// The block closed (or was finalized): nothing more to project.
     DSML_TOOL_DONE,
+    /// The block is not a call (malformed, undeclared tool): the projection stopped.
     DSML_TOOL_ERROR,
 } dsml_tool_stream_state;
 
@@ -77,19 +83,32 @@ typedef struct {
     dsml_tool_stream tool;       ///< the DSML block being decoded (DS_WALK_TOOL)
 } deepseek_stream_walk;
 
+/** Where the next draw falls relative to a DSML block (dsml_decode_tracker::decode): the sampler draws the
+ *  block's structure greedily and samples only its payloads. */
 typedef enum {
+    /// Outside any tool block.
     DSML_DECODE_OUTSIDE,
+    /// The block's markup (tags, attributes, separators): greedy.
     DSML_DECODE_STRUCTURAL,
+    /// A string parameter's body: sampled.
     DSML_DECODE_STRING_BODY,
+    /// A JSON parameter value, outside its strings: greedy.
     DSML_DECODE_JSON_STRUCTURAL,
+    /// Inside a JSON string of a parameter value: sampled.
     DSML_DECODE_JSON_STRING,
 } dsml_decode_state;
 
+/** What the decode-time tracker is scanning for (dsml_decode_tracker::mode). */
 typedef enum {
+    /// Searching for a tool_calls opener.
     DSML_TRACK_SEARCH,
+    /// Inside the block's markup.
     DSML_TRACK_STRUCTURAL,
+    /// Inside a string parameter's body, watching for its close.
     DSML_TRACK_STRING_BODY,
+    /// Inside a JSON parameter value, watching strings and the close.
     DSML_TRACK_JSON_PARAM,
+    /// The block closed: nothing more is tracked.
     DSML_TRACK_DONE,
 } dsml_track_mode;
 
@@ -169,6 +188,10 @@ bool raw_full_lit(const char *raw, size_t raw_len, size_t pos, const char *lit);
 bool raw_partial_any(const char *raw, size_t raw_len, size_t pos,
                             const char *a, const char *b);
 const char *find_lit_bounded(const char *s, size_t n, const char *lit);
+/// The slow reference recognizer the unit tests check the tracker against (defined only with PULSAR_SERVER_TEST).
+/// @param raw      the generated text (NULL: outside)
+/// @param raw_len  its length
+/// @return the decode state at the end of `raw`
 dsml_decode_state dsml_decode_state_for_text(const char *raw, size_t raw_len);
 bool dsml_decode_state_is_tool(dsml_decode_state state);
 bool dsml_decode_state_uses_payload_sampling(dsml_decode_state state);

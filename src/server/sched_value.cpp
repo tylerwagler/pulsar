@@ -89,6 +89,7 @@ static int sched_cands(const sched_prompt *p, uint32_t room, cand *out, int cap)
     return k;
 }
 
+/** Room for one prompt's candidate chunks (sched_cands' cap). */
 #define SCHED_CANDS_MAX 64
 
 }  // namespace

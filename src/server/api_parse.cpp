@@ -13,6 +13,11 @@
  * by whichever arm a given endpoint's copy-paste happened to include -- every
  * surface accepts temperature/top_p/min_p/top_k/seed identically. logprobs
  * stays endpoint-local (chat only). */
+/// Parse one sampling knob (temperature, top_p, min_p, top_k, seed) shared by every surface.
+/// @param key  the member name just read
+/// @param p    the parse cursor, at the member's value (advanced past it when consumed)
+/// @param r    the request whose sampling fields are set
+/// @return 1 consumed, 0 not a sampling knob, -1 malformed value
 int parse_sampling_key(const char *key, const char **p, request *r) {
     if (!strcmp(key, "temperature")) {
         double v = 0.0;
@@ -92,6 +97,11 @@ int parse_sampling_key(const char *key, const char **p, request *r) {
  * the loaded family's half -- thinking, the prompt, its tokens (L267). */
 
 /* One thinking / effort control, kept as sent for the family (chat_control). */
+/// Keep one thinking / effort control as sent, for the family.
+/// @param p    the parse cursor, at the control's value (advanced past it)
+/// @param c    the conversation the control is kept on
+/// @param key  the control's key (static storage)
+/// @return false when the value is not well-formed JSON
 static bool take_control(const char **p, chat_conversation *c, const char *key) {
     char *raw = NULL;
     if (!json_raw_value(p, &raw)) return false;
@@ -101,6 +111,13 @@ static bool take_control(const char **p, chat_conversation *c, const char *key) 
 
 /* L303: the answer's format from the protocol's object -- OpenAI chat's response_format itself, Responses'
  * text.format (`member` "format" of `text`), Anthropic's output_config.format. */
+/// Read the answer's response format from the protocol's object (L303).
+/// @param p       the parse cursor, at the object (advanced past it)
+/// @param c       the conversation (its response_format is set)
+/// @param member  the member of the object that holds the format (NULL: the object itself); absent = no format
+/// @param err     receives the reason on a malformed format
+/// @param errlen  size of `err`
+/// @return false when the value or the format is malformed
 static bool take_response_format(const char **p, chat_conversation *c, const char *member, char *err, size_t errlen) {
     char *raw = NULL;
     if (!json_raw_value(p, &raw)) return false;
@@ -112,6 +129,12 @@ static bool take_response_format(const char **p, chat_conversation *c, const cha
 }
 
 /* Anthropic's output_config: its effort is a thinking control (kept as sent), its format the answer's (L303). */
+/// Read Anthropic's output_config: its format and, as a control, its effort.
+/// @param p       the parse cursor, at the object (advanced past it)
+/// @param c       the conversation
+/// @param err     receives the reason on a malformed format
+/// @param errlen  size of `err`
+/// @return false when the object or its format is malformed
 static bool take_output_config(const char **p, chat_conversation *c, char *err, size_t errlen) {
     const char *at = *p;
     if (!take_response_format(&at, c, "format", err, errlen)) return false;
@@ -119,6 +142,9 @@ static bool take_output_config(const char **p, chat_conversation *c, char *err, 
 }
 
 /* The controls a chat protocol may carry, by request key; the static spelling is the control's key. */
+/// The thinking / effort controls a chat protocol may carry.
+/// @param key  a request member name
+/// @return the control's static key, or NULL when `key` is not a thinking / effort control
 static const char *chat_control_key(const char *key) {
     static const char *const keys[] = {"thinking", "think", "enable_thinking", "reasoning_effort",
                                        "output_config", "chat_template_kwargs"};
@@ -131,6 +157,14 @@ static const char *chat_control_key(const char *key) {
  * their declared order (parse_tools_value, every protocol's dialect), the deferred
  * ones (defer_loading, L325) apart.  Anthropic's server-tool entries are checked
  * first, with the Messages API's own wording. */
+/// Read the tools array: as sent, as schema lines with their order, the deferred ones apart.
+/// @param p          the parse cursor, at the tools array (advanced past it)
+/// @param c          the conversation (tools_raw, tool_schemas, deferred_tool_schemas replaced)
+/// @param r          the request (its tool_orders)
+/// @param anthropic  the Messages API: check its server-tool entries first
+/// @param err        receives the reason on refusal
+/// @param errlen     size of `err`
+/// @return false when the array is malformed or names an unsupported tool
 static bool take_tools(const char **p, chat_conversation *c, request *r, bool anthropic, char *err,
                        size_t errlen) {
     char *raw = NULL;
@@ -159,6 +193,13 @@ static bool take_tools(const char **p, chat_conversation *c, request *r, bool an
 
 /* OpenAI's tool_choice: "none" | "auto" | "required", or a named function
  * {"type":"function","function":{"name":...}}. */
+/// Read OpenAI's tool_choice.
+/// @param p       the parse cursor, at the value (advanced past it)
+/// @param c       the conversation (tool_choice, tool_choice_wire and the named function set)
+/// @param r       the request
+/// @param err     receives the reason on refusal
+/// @param errlen  size of `err`
+/// @return false when the value is malformed or not one of the accepted forms
 static bool parse_openai_tool_choice(const char **p, chat_conversation *c, request *r, char *err,
                                      size_t errlen) {
     json_ws(p);
@@ -303,6 +344,15 @@ bool parse_chat_conversation_openai(const char *body, chat_conversation *c, requ
 
 /* A protocol half, then the loaded family's: the one shape every chat endpoint
  * takes.  The engine is optional (the renderer gate renders with no model). */
+/// The protocol's parse, then the loaded family's render: every chat endpoint's shape.
+/// @param e         the engine (may be NULL: the renderer gate)
+/// @param s         the server (may be NULL)
+/// @param body      the request body
+/// @param r         the request, initialized by the caller; freed on failure
+/// @param err       receives the reason on failure ("invalid JSON request" when none was named)
+/// @param errlen    size of `err`
+/// @param protocol  the protocol's parser into a chat_conversation
+/// @return false when parsing or rendering failed
 static bool parse_and_render(pulsar_engine *e, server *s, const char *body, request *r, char *err,
                              size_t errlen,
                              bool (*protocol)(const char *, chat_conversation *, request *, char *, size_t)) {
@@ -328,6 +378,15 @@ bool parse_chat_request_render(pulsar_engine *e, server *s, const char *body, in
 
 
 
+/// Parse and render an OpenAI chat completions request (parse_chat_request_render).
+/// @param e           the engine
+/// @param s           the server
+/// @param body        the request body
+/// @param def_tokens  the generation cap when the request sets none
+/// @param r           receives the request (freed on failure)
+/// @param err         receives the reason on failure
+/// @param errlen      size of `err`
+/// @return false on a malformed or refused request
 bool parse_chat_request(pulsar_engine *e, server *s, const char *body, int def_tokens,
                         request *r, char *err, size_t errlen) {
     return parse_chat_request_render(e, s, body, def_tokens, r, err, errlen);
@@ -335,6 +394,13 @@ bool parse_chat_request(pulsar_engine *e, server *s, const char *body, int def_t
 
 
 
+/// Read an Anthropic Messages body into a conversation and the request's protocol fields (api = ANTHROPIC).
+/// @param body    the request body
+/// @param c       receives the conversation
+/// @param r       the request (protocol fields set)
+/// @param err     receives the reason on refusal (cleared first)
+/// @param errlen  size of `err`
+/// @return false on a malformed or refused body
 bool parse_chat_conversation_anthropic(const char *body, chat_conversation *c, request *r, char *err,
                                        size_t errlen) {
     r->api = API_ANTHROPIC;
@@ -455,6 +521,15 @@ bad:
     return false;
 }
 
+/// Parse and render an Anthropic Messages request.
+/// @param e           the engine
+/// @param s           the server
+/// @param body        the request body
+/// @param def_tokens  the generation cap when the request sets none
+/// @param r           receives the request (freed on failure)
+/// @param err         receives the reason on failure
+/// @param errlen      size of `err`
+/// @return false on a malformed or refused request
 bool parse_anthropic_request(pulsar_engine *e, server *s, const char *body, int def_tokens,
                                     request *r, char *err, size_t errlen) {
     request_init(r, REQ_CHAT, def_tokens);
@@ -476,6 +551,13 @@ bool parse_anthropic_request(pulsar_engine *e, server *s, const char *body, int 
  * endpoints.  `msg` is NULL in the two positions where an image is not a thing
  * (a tool output's content, a reasoning summary) and an image there fails
  * closed. */
+/// Read a Responses content value (string, null, or an array of text / image blocks) into text.
+/// @param p       the parse cursor, at the value (advanced past it)
+/// @param out     receives the concatenated text (malloc'd; NULL on failure)
+/// @param msg     the message images attach to (NULL: an image fails)
+/// @param err     receives the reason on refusal
+/// @param errlen  size of `err`
+/// @return false on a malformed value or an unsupported block
 static bool parse_responses_content_array(const char **p, char **out, chat_msg *msg,
                                           char *err, size_t errlen) {
     *out = NULL;  /* reparse-in-place double-free guard, see json_string_n */
@@ -1269,6 +1351,11 @@ fail:
  * (auto/concise/detailed) controls whether the wire emits summary deltas at
  * all -- per the spec, no reasoning summary is surfaced unless the client opts
  * in. */
+/// Read Responses' reasoning object: effort as a control, summary as the opt-in.
+/// @param p                 the parse cursor, at the value (advanced past it)
+/// @param c                 the conversation (the reasoning.effort control)
+/// @param summary_opted_in  set when summary is auto, concise or detailed
+/// @return false on a malformed object
 static bool parse_responses_reasoning(const char **p, chat_conversation *c, bool *summary_opted_in) {
     json_ws(p);
     if (json_lit(p, "null")) return true;
@@ -1317,6 +1404,13 @@ static bool parse_responses_reasoning(const char **p, chat_conversation *c, bool
 
 
 
+/// Read a Responses API body into a conversation and the request's protocol fields (api = RESPONSES).
+/// @param body    the request body
+/// @param c       receives the conversation
+/// @param r       the request (protocol fields set)
+/// @param err     receives the reason on refusal (cleared first)
+/// @param errlen  size of `err`
+/// @return false on a malformed or refused body
 bool parse_chat_conversation_responses(const char *body, chat_conversation *c, request *r, char *err,
                                        size_t errlen) {
     r->api = API_RESPONSES;
@@ -1497,6 +1591,15 @@ bad:
     return false;
 }
 
+/// Parse and render a Responses API request.
+/// @param e           the engine
+/// @param s           the server
+/// @param body        the request body
+/// @param def_tokens  the generation cap when the request sets none
+/// @param r           receives the request (freed on failure)
+/// @param err         receives the reason on failure
+/// @param errlen      size of `err`
+/// @return false on a malformed or refused request
 bool parse_responses_request(pulsar_engine *e, server *s, const char *body, int def_tokens,
                                     request *r, char *err, size_t errlen) {
     request_init(r, REQ_CHAT, def_tokens);
@@ -1505,6 +1608,11 @@ bool parse_responses_request(pulsar_engine *e, server *s, const char *body, int 
 
 
 
+/// Read a completions "prompt": a string, or the first string of an array (later elements skipped); any other
+/// value reads as "".
+/// @param p    the parse cursor, at the value (advanced past it)
+/// @param out  receives the prompt (malloc'd; NULL on failure)
+/// @return false on malformed JSON
 static bool parse_prompt(const char **p, char **out) {
     /* Build into a local and publish to *out only on success, so every
      * failure return leaves *out == NULL (the double-free contract, see
@@ -1543,6 +1651,14 @@ static bool parse_prompt(const char **p, char **out) {
 
 
 
+/// Parse a /v1/completions request: the prompt continues raw (no chat template), thinking controls refused.
+/// @param e           the engine (its family)
+/// @param body        the request body
+/// @param def_tokens  the generation cap when the request sets none
+/// @param r           receives the request (freed on failure)
+/// @param err         receives the reason on failure
+/// @param errlen      size of `err`
+/// @return false on a malformed or refused request
 bool parse_completion_request(pulsar_engine *e, const char *body, int def_tokens,
                                      request *r, char *err, size_t errlen) {
     request_init(r, REQ_COMPLETION, def_tokens);

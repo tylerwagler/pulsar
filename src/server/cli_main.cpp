@@ -50,6 +50,11 @@
  * declared shape whose capture FAILED is not best-effort: it would refuse
  * every live step of that shape, so the server refuses to start (returns
  * false) and the log names the key. */
+/// @brief Warm every graphed shape before the listener opens (the startup warmup the comment above describes).
+/// @param engine the loaded engine
+/// @param session the server's one session
+/// @param ctx_size its context, in tokens (bounds the warmup prompt)
+/// @return false when a declared shape's capture failed: the server refuses to start
 static bool server_warmup_generation(pulsar_engine *engine, pulsar_session *session,
                                      int ctx_size) {
     const double t0 = server_now_sec();
@@ -181,6 +186,10 @@ static bool server_warmup_generation(pulsar_engine *engine, pulsar_session *sess
 
 
 
+/// @brief A strictly positive int option value; exits(2) with a log line on anything else.
+/// @param s the value text
+/// @param opt the option's name, for the message
+/// @return the value
 static int parse_int_arg(const char *s, const char *opt) {
     char *end = NULL;
     long v = strtol(s, &end, 10);
@@ -195,6 +204,9 @@ static int parse_int_arg(const char *s, const char *opt) {
 
 /* Non-negative int: a rank index (0 is the leader), which parse_int_arg's
  * strictly-positive rule would refuse; the engine checks 0 <= R < N at open. */
+/// @param s the value text
+/// @param opt the option's name, for the message
+/// @return the value, >= 0 (exits(2) on anything else)
 static int parse_index_arg(const char *s, const char *opt) {
     char *end = NULL;
     long v = strtol(s, &end, 10);
@@ -205,6 +217,12 @@ static int parse_index_arg(const char *s, const char *opt) {
     return (int)v;
 }
 
+/// @brief A float option value in [minv, maxv]; exits(2) with a log line on anything else.
+/// @param s the value text
+/// @param opt the option's name, for the message
+/// @param minv the least value accepted
+/// @param maxv the greatest value accepted
+/// @return the value
 static float parse_float_arg(const char *s, const char *opt, float minv, float maxv) {
     char *end = NULL;
     float v = strtof(s, &end);
@@ -217,6 +235,12 @@ static float parse_float_arg(const char *s, const char *opt, float minv, float m
 
 
 
+/// @brief The value after option argv[*i]; exits(2) when there is none.
+/// @param i the option's index, advanced to the value's
+/// @param argc argument count
+/// @param argv the arguments
+/// @param opt the option's name, for the message
+/// @return the value (argv storage)
 static const char *need_arg(int *i, int argc, char **argv, const char *opt) {
     if (*i + 1 >= argc) {
         server_log(PULSAR_LOG_DEFAULT, "pulsar-server: missing value for %s", opt);
@@ -238,6 +262,7 @@ static const char *need_arg(int *i, int argc, char **argv, const char *opt) {
  * physical budget is breached. PULSAR_OVERCOMMIT=0/off/false reverts to classic
  * full-charge admission; PULSAR_MSEQ_BANKS still pins and bypasses auto-sizing.
  * Read once at startup, never on a hot path. */
+/// @return false only when PULSAR_OVERCOMMIT is 0 / off / false
 static bool server_overcommit_enabled(void) {
     const char *v = getenv("PULSAR_OVERCOMMIT");
     if (!v || !v[0]) return true; /* default ON (v0.3.0) */
@@ -252,6 +277,8 @@ static bool server_overcommit_enabled(void) {
  * resident weights, a fixed process-overhead reserve, and the free-memory
  * floor (PULSAR_SERVER_MEM_FLOOR_BYTES) — committing the full budget must still
  * leave the floor free. Returns 0 if the reserves already exceed usable. */
+/// @param weights_resident_bytes the resident weights, bytes
+/// @return the session budget in bytes (0 when the reserves exceed PULSAR_SERVER_USABLE_BYTES)
 static uint64_t server_kv_budget_bytes(uint64_t weights_resident_bytes) {
     uint64_t reserved = weights_resident_bytes +
                         PULSAR_SERVER_PROCESS_OVERHEAD_BYTES +
@@ -265,6 +292,10 @@ static uint64_t server_kv_budget_bytes(uint64_t weights_resident_bytes) {
  * every lazy slot provisioning in the scheduler (generate.cpp); an over-budget
  * provisioning attempt leaves the job queued until a slot frees (plan Tier 1
  * §1.4). Non-static: the scheduler calls it; unit tests live in this TU. */
+/// @param kv_budget_bytes the admission budget, bytes
+/// @param committed_bytes the live sessions' committed cost, bytes
+/// @param incoming_bytes the new session's estimated cost, bytes
+/// @return true when committed + incoming fits the budget (overflow-safe)
 bool server_kv_admits(uint64_t kv_budget_bytes,
                              uint64_t committed_bytes,
                              uint64_t incoming_bytes) {
@@ -281,6 +312,9 @@ bool server_kv_admits(uint64_t kv_budget_bytes,
  * for when other accounting is wrong, so it must not silently disarm
  * itself. Non-static: provision_slot and the eviction precheck (generate.cpp)
  * call it; unit tests live in this TU. */
+/// @param avail_bytes MemAvailable in bytes (0 = unreadable: refused)
+/// @param est_bytes the session's estimated cost, bytes
+/// @return server_headroom_admits over the server's floor
 bool server_mem_floor_admits(uint64_t avail_bytes, uint64_t est_bytes) {
     /* the ledger's session estimate and the /proc reading enter the floor's unit here */
     return server_headroom_admits(KvBytes{avail_bytes}, KvBytes{est_bytes}, server_mem_floor());
@@ -293,6 +327,8 @@ bool server_headroom_admits(KvBytes avail, KvBytes need, KvBytes floor) {
 
 /* The one floor (pulsar_server_internal.h, "The memory floor"): set once at startup, before the listener opens and
  * the worker starts, and read-only after that. */
+/// The memory floor in bytes (server_mem_floor / server_mem_floor_init); main thread writes it before any other
+/// thread starts.
 static KvBytes g_server_mem_floor{PULSAR_SERVER_MEM_FLOOR_BYTES};
 
 KvBytes server_mem_floor(void) { return g_server_mem_floor; }
@@ -344,6 +380,11 @@ uint64_t server_persist_host_bytes(int tokens) {
  * --ctx 1M the ceiling was 9.05 GiB against 5.16 GiB of headroom, the guard never spilled, MemAvailable reached
  * zero, and the GPU stalled on unbacked pages (work, 2026-10-22) or earlyoom killed the server (Sparky).  avail 0
  * (/proc/meminfo unreadable) is 0: the caller refuses to start rather than run unguarded. */
+/// @param kv_budget_bytes the ledger's budget
+/// @param eager_bytes the eager floor already resident
+/// @param touched_bytes the KV resident now
+/// @param avail_bytes MemAvailable now (0 = unreadable)
+/// @return the resident-KV budget in bytes; 0 when MemAvailable is at or under the floor
 KvBytes server_guard_touched_budget(KvBytes kv_budget_bytes, KvBytes eager_bytes, KvBytes touched_bytes,
                                     KvBytes avail_bytes) {
     const KvBytes floor = server_mem_floor();
@@ -402,12 +443,16 @@ void server::close_resources() {
 
 
 
+/// @brief Print pulsar-server's help (pulsar_help_print).
+/// @param fp the stream
+/// @param topic a help topic, or NULL for the overview
 void usage(FILE *fp, const char *topic) {
     pulsar_help_print(fp, PULSAR_HELP_SERVER, topic);
 }
 
 
 
+/// @return the backend the server opens by default (CUDA)
 static pulsar_backend default_server_backend(void) {
     return PULSAR_BACKEND_CUDA;
 }
@@ -420,6 +465,10 @@ static pulsar_backend default_server_backend(void) {
  * baked into the binary.  Returns NULL if nothing readable — callers decide
  * whether that is fatal (main model) or a warning (drafter).  Heap results
  * intentionally live for the process lifetime (they become engine paths). */
+/// @brief "dir/name" when that path is readable.
+/// @param dir the directory
+/// @param name the entry
+/// @return a malloc'd path (process lifetime), or NULL
 static const char *resolve_gguf_at(const char *dir, const char *name) {
     size_t n = strlen(dir) + 1 + strlen(name) + 1;
     char *p = (char *)malloc(n);
@@ -440,6 +489,8 @@ static const char *resolve_gguf_at(const char *dir, const char *name) {
  * directory, then in $PULSAR_MODEL_DIR.  The old name is deliberately NOT kept
  * as a fallback: resolving a GGUF would only defer the refusal to the engine,
  * which names the format and what to do about it. */
+/// @return the default model pointer path (./model, ./model.safetensors, then the same under $PULSAR_MODEL_DIR),
+/// or NULL when none is readable
 static const char *resolve_default_model(void) {
     static const char *const pointers[] = { "model", "model.safetensors" };
     const char *dir = getenv("PULSAR_MODEL_DIR");
@@ -475,6 +526,9 @@ static const char *resolve_default_model(void) {
  * them.  The store identity (pulsar_engine_kv_identity) still guards an
  * explicit --kv-disk-dir both name.  Returns a heap path (process lifetime),
  * or NULL when no cache home can be resolved. */
+/// @param model_path the model path (its basename, realpath-resolved, keys the directory)
+/// @param rope_yarn_factor the --rope-yarn factor (non-zero: the key gets a "-rope-yarnF" suffix)
+/// @return the default cache directory (heap, process lifetime), or NULL
 static char *server_default_kv_disk_dir(const char *model_path, double rope_yarn_factor) {
     char resolved[PATH_MAX];
     const char *src = model_path ? model_path : "";
@@ -520,6 +574,7 @@ static char *server_default_kv_disk_dir(const char *model_path, double rope_yarn
  * --no-kv-disk opts out; otherwise the default above is filled in.  An
  * unresolvable or unusable directory must never be fatal — the server runs
  * with the disk cache disabled (kv_cache_open handles the unusable case). */
+/// @param c the parsed config; kv_disk_dir is filled (NULL = disk cache off)
 static void server_resolve_kv_disk_dir(server_config *c) {
     if (c->kv_disk_disable) {
         c->kv_disk_dir = NULL;
@@ -542,6 +597,11 @@ static void server_resolve_kv_disk_dir(server_config *c) {
 
 
 
+/// @brief Parse pulsar-server's command line into a config over the defaults; --help prints usage and exits(0), an
+/// unknown or malformed option exits(2).
+/// @param argc argument count
+/// @param argv the arguments
+/// @return the config (its strings point into argv or static storage)
 static server_config parse_options(int argc, char **argv) {
     server_config c = {
         .engine = {
@@ -670,10 +730,17 @@ static server_config parse_options(int argc, char **argv) {
 #ifndef PULSAR_SERVER_TEST
 
 /* L264 S4e: the segment store's removal hook on a TP leader. */
+/// @param ud the engine
+/// @param key the removed segment's key (40 hex digits + NUL)
 static void kv_segment_removed(void *ud, const char key[41]) {
     pulsar_engine_segment_dropped((pulsar_engine *)ud, key);
 }
 
+/// @brief pulsar-server: parse the options, open the engine (an encoder or parser engine, or several -m, serves through encode_serve), size and warm the pool, open the disk KV cache, run
+/// the listener until a stop signal, drain and close.
+/// @param argc argument count
+/// @param argv the arguments
+/// @return 0 after a clean shutdown, 1 when startup failed
 int main(int argc, char **argv) {
     signal(SIGPIPE, SIG_IGN);
     struct sigaction sa;

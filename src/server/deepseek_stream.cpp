@@ -12,6 +12,10 @@
  */
 #include "deepseek_dsml.h"
 
+/// Start a walk in reasoning when thinking is on, else in text; with tools and thinking, a second reasoning
+/// block is guarded against.
+/// @param w  the walk (zeroed here)
+/// @param r  the request (its think mode and tools)
 void deepseek_stream_walk_init(deepseek_stream_walk *w, const request *r) {
     memset(w, 0, sizeof(*w));
     const bool think = pulsar_think_mode_enabled(r->think_mode);
@@ -19,10 +23,18 @@ void deepseek_stream_walk_init(deepseek_stream_walk *w, const request *r) {
     w->guard_second_reasoning = think && r->has_tools;
 }
 
+/// Free the walk's tool-stream state.
+/// @param w  the walk (NULL: nothing)
 void deepseek_stream_walk_free(deepseek_stream_walk *w) {
     if (w) dsml_tool_stream_free(&w->tool);
 }
 
+/// @param w        the walk
+/// @param k        the request's protocol sink
+/// @param raw      the generated text (NULL: nothing to do)
+/// @param raw_len  bytes of `raw` released so far
+/// @param final    flush what was held back (the finish)
+/// @return false when a client write failed
 bool deepseek_stream_update(deepseek_stream_walk *w, chat_sink *k, const char *raw, size_t raw_len, bool final) {
     if (!raw) return true;
     const request *r = k->r;

@@ -32,12 +32,15 @@
 #include <vector>
 
 /* A compile may take this long before the request is refused (the worker finishes into the cache). */
+/// Seconds a grammar compile may take before the request is refused.
 static constexpr double k_compile_deadline_s = 10.0;
 /* The compiled-grammar cache's cap. */
+/// The compiled-grammar cache's cap, bytes (256 MiB).
 static constexpr int64_t k_grammar_cache_bytes = 256LL << 20;
 /* A run of whitespace inside JSON is capped: a masked model that keeps choosing a newline would otherwise never
  * leave it (xgrammar's max_whitespace_cnt; the Nemotron mini fixture ran tab runs to max_tokens without it).
  * Pretty-printed JSON indents well inside it. */
+/// The longest whitespace run a JSON grammar admits (xgrammar max_whitespace_cnt).
 static constexpr int k_json_ws_max = 16;
 
 /* ==== response formats ==================================================================================== */
@@ -49,6 +52,9 @@ void response_format_free(response_format_spec *f) {
 }
 
 /* Member `key` of `obj` as a string; NULL when absent or not a string. */
+/// @param obj  a JSON object's text
+/// @param key  the member name
+/// @return the member's decoded string (malloc'd), or NULL
 static char *member_string(const char *obj, const char *key) {
     char *raw = json_object_member_raw(obj, key);
     if (!raw) return NULL;
@@ -141,6 +147,13 @@ void constrain_plan_free(constrain_plan *p) {
 }
 
 /* The grammar compiler over the loaded vocabulary, built once (the first constrained request pays for it). */
+/// @brief s->grammar, built on first call under a function-local mutex (also sets s->token_bytes); any thread that
+///        renders a constrained request.
+/// @param s       the server
+/// @param e       the engine (its vocabulary and stop tokens)
+/// @param err     receives the failure
+/// @param errlen  size of `err`
+/// @return the compiler, or NULL
 static pulsar_grammar_compiler *constrain_compiler(server *s, pulsar_engine *e, char *err, size_t errlen) {
     static std::mutex mu;
     std::lock_guard<std::mutex> lk(mu);
@@ -185,6 +198,12 @@ struct constrain_tool {
 
 /* The conversation's declared tools (conversation_declared_tool_schema_lines: one function schema a line, L325: the
  * deferred ones too -- loaded in place, callable).  `any_strict`: some tool says "strict": true. */
+/// @param c           the conversation
+/// @param out         receives every declared tool, in order (a non-strict tool's schema is "true")
+/// @param any_strict  receives whether any tool is strict
+/// @param err         receives the refusal
+/// @param errlen      size of `err`
+/// @return false when a tool has no name
 static bool constrain_tools(const chat_conversation *c, std::vector<constrain_tool> *out, bool *any_strict,
                             char *err, size_t errlen) {
     buf lines = {0};
@@ -219,6 +238,9 @@ static bool constrain_tools(const chat_conversation *c, std::vector<constrain_to
     return ok;
 }
 
+/// @brief Append an xgrammar const_string element.
+/// @param b  the format being built
+/// @param s  the literal
 static void j_const(buf *b, const char *s) {
     buf_puts(b, "{\"type\":\"const_string\",\"value\":");
     json_escape(b, s);
@@ -226,6 +248,9 @@ static void j_const(buf *b, const char *s) {
 }
 
 /* One call region: call_trigger block_head (name_open NAME name_close ARGS call_close)[+] block_tail. */
+/// @param b      the format being built
+/// @param sh     the family's markup
+/// @param tools  the declared tools (each a name alternative with its arguments' schema)
 static void j_call_region(buf *b, const server_grammar_shape *sh, const std::vector<constrain_tool> &tools) {
     buf_puts(b, "{\"type\":\"sequence\",\"elements\":[");
     {
@@ -258,6 +283,9 @@ static void j_call_region(buf *b, const server_grammar_shape *sh, const std::vec
 }
 
 /* The response format as one format object. */
+/// @brief Append the xgrammar element for a response format (dies on NONE).
+/// @param b  the format being built
+/// @param f  the format
 static void j_answer_format(buf *b, const response_format_spec *f) {
     switch (f->kind) {
     case RESPONSE_FORMAT_JSON_OBJECT:
@@ -290,8 +318,16 @@ static void j_answer_format(buf *b, const response_format_spec *f) {
 
 /* Leading whitespace before an answer or a call (Qwen writes "\n\n" after </think>, DeepSeek "\n\n" before its calls),
  * capped for the same reason as k_json_ws_max. */
+/// @param b  the format being built
 static void j_ws(buf *b) { buf_puts(b, "{\"type\":\"regex\",\"pattern\":\"[ \\\\t\\\\r\\\\n]{0,8}\"}"); }
 
+/// @brief Compile `format` wrapped as a structural tag, within k_compile_deadline_s.
+/// @param c       the compiler
+/// @param format  the structural tag's format element
+/// @param what    the label for the error ("response_format", ...)
+/// @param err     receives "what: reason" on failure
+/// @param errlen  size of `err`
+/// @return the grammar (owned by the caller), or NULL
 static pulsar_grammar *constrain_compile(pulsar_grammar_compiler *c, buf *format, const char *what, char *err,
                                          size_t errlen) {
     buf tag = {0};
@@ -417,6 +453,7 @@ struct constrain_kmp {
     }
 };
 
+/// Where the gate stands: inside reasoning, in unconstrained text, or inside a grammar region.
 enum constrain_phase : uint8_t { GATE_THINK, GATE_FREE, GATE_REGION };
 
 /* What one advance changed, to undo it. */
@@ -482,6 +519,14 @@ struct constrain_gate {
 /** @var constrain_gate::kmp_answer
  *  `answer`'s KMP state. */
 
+/// @brief Open a region: a new matcher on `gr` becomes current and takes the region's first bytes.
+/// @param gt               the gate
+/// @param gr               the region's grammar
+/// @param end_at_complete  the matcher terminates when complete (a call region) rather than at a stop
+/// @param bytes            bytes already past the trigger (may be none)
+/// @param n                bytes at `bytes`
+/// @param rec              the advance's record (opened is set)
+/// @return false with gt->err set
 static bool gate_open(constrain_gate *gt, const pulsar_grammar *gr, bool end_at_complete, const char *bytes,
                       size_t n, constrain_rec *rec) {
     pulsar_grammar_matcher *m = pulsar_grammar_matcher_new(gr, end_at_complete, gt->err, sizeof gt->err);
@@ -499,6 +544,7 @@ static bool gate_open(constrain_gate *gt, const pulsar_grammar *gr, bool end_at_
 
 /* A region whose matcher terminated hands the turn back to free text: only a call region can (it ends when
  * complete; the answer ends on a stop token, which never reaches the gate). */
+/// @param gt  the gate
 static void gate_region_done(constrain_gate *gt) {
     if (gt->phase == GATE_REGION && pulsar_grammar_matcher_terminated(gt->matchers[(size_t)gt->cur])) {
         gt->phase = GATE_FREE;
@@ -507,6 +553,11 @@ static void gate_region_done(constrain_gate *gt) {
 }
 
 /* Advance by one token (`token` >= 0) or by raw bytes (the seed, token -1).  false = gt->err. */
+/// @param gt     the gate
+/// @param token  the token id, or -1 for raw bytes
+/// @param b      its bytes
+/// @param n      bytes at `b`
+/// @return false (gate unchanged) when refused
 static bool gate_feed(constrain_gate *gt, int token, const char *b, size_t n) {
     constrain_rec rec = {gt->phase, gt->kmp_think, gt->kmp_call, gt->kmp_answer, gt->cur, 0, -1, false};
     const constrain_plan *p = gt->plan;
@@ -572,6 +623,10 @@ static bool gate_feed(constrain_gate *gt, int token, const char *b, size_t n) {
     return true;
 }
 
+/// @brief Undo the last `n` advances recorded in gt->hist.
+/// @param gt  the gate
+/// @param n  advances to undo (<= hist size)
+/// @return false when a matcher refused its rollback (gt->err)
 static bool gate_rollback(constrain_gate *gt, int n) {
     for (; n > 0; n--) {
         const constrain_rec rec = gt->hist.back();
@@ -593,10 +648,17 @@ static bool gate_rollback(constrain_gate *gt, int n) {
     return true;
 }
 
+/// @brief The current region's token mask.
+/// @param gt  the gate (in a region)
+/// @param row  receives gen_constrain_words words, bit t = token t allowed
+/// @return false with gt->err set
 static bool gate_fill(constrain_gate *gt, uint32_t *row) {
     return pulsar_grammar_matcher_fill(gt->matchers[(size_t)gt->cur], row, gt->err, sizeof gt->err);
 }
 
+/// @brief g->err = "what: <gate error>".
+/// @param g  the generation state
+/// @param what  the label
 static void gate_fail(gen_state *g, const char *what) {
     snprintf(g->err, sizeof g->err, "%s: %s", what, g->gate->err);
 }
@@ -604,6 +666,8 @@ static void gate_fail(gen_state *g, const char *what) {
 /* PULSAR_GRAMMAR_FAIL_AFTER=N (a diagnostic switch for the L303 gate, tests/constrained_live.py): every gate fails
  * by name once a live region has taken N emitted tokens -- at its next round, mask or accept, whichever lane the
  * request is in -- so the live test can show a matcher failure ends only its own request.  Unset: never. */
+/// @param g  the generation state (gate set)
+/// @return true (g->err set) when the injected failure fires
 static bool gate_injected(gen_state *g) {
     static const int after = [] {
         const char *v = getenv("PULSAR_GRAMMAR_FAIL_AFTER");
@@ -649,13 +713,19 @@ bool gen_constrain_begin(server *s, gen_state *g) {
     return true;
 }
 
+/// @brief Free the attempt's gate.
+/// @param g  the generation state
 void gen_constrain_end(gen_state *g) {
     delete g->gate;
     g->gate = NULL;
 }
 
+/// @param g  the generation state
+/// @return true while the decode sits inside a grammar region
 bool gen_constrain_live(const gen_state *g) { return g->gate && g->gate->phase == GATE_REGION; }
 
+/// @param s  the server (grammar built)
+/// @return 32-bit words in one token mask row
 uint32_t gen_constrain_words(const server *s) {
     return pulsar_grammar_mask_words((uint32_t)pulsar_grammar_compiler_vocab(s->grammar));
 }
@@ -692,6 +762,9 @@ const uint32_t *gen_constrain_base_mask(server *s, gen_state *g) {
     return gen_constrain_mask(s, g, gt->one.data()) ? gt->one.data() : NULL;
 }
 
+/// @param row  a mask row
+/// @param t  a token id
+/// @return whether token `t` is allowed
 static bool mask_bit(const uint32_t *row, int t) { return (row[(uint32_t)t >> 5] >> ((uint32_t)t & 31u)) & 1u; }
 
 int gen_constrain_round(server *s, gen_state *g, const int *toks, int n, bool base_emitted, const uint32_t **masks) {

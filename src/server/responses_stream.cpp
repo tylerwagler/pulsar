@@ -11,6 +11,9 @@
  * output_item.added / .done. */
 
 
+/// Reset a Responses stream state: fresh resp_ / rs_ / msg_ ids (24 hex), no items open (indexes -1).
+/// @param r   the request (unused)
+/// @param st  the state, zeroed
 void responses_stream_init(const request *r, responses_stream *st) {
     (void)r;
     memset(st, 0, sizeof(*st));
@@ -23,6 +26,8 @@ void responses_stream_init(const request *r, responses_stream *st) {
 
 
 
+/// Free the accumulated reasoning and message text (the state itself is the caller's).
+/// @param st  the state (NULL: nothing)
 void responses_stream_free(responses_stream *st) {
     if (!st) return;
     buf_free(&st->reasoning_text);
@@ -35,6 +40,11 @@ void responses_stream_free(responses_stream *st) {
  * ordering and reconnect resilience. We inject it after the `{"type":...` head
  * so emitters can stay readable while still producing the wire shape Codex
  * expects. */
+/// Send one Responses SSE event with sequence_number spliced in after its "type" (st->sequence advances).
+/// @param fd    the client socket
+/// @param st    the stream state
+/// @param body  the event's JSON object, starting with {"type":"..."
+/// @return false when the write failed
 static bool responses_sse_emit_event(int fd, responses_stream *st, const char *body) {
     buf b = {0};
     buf_puts(&b, "data: ");
@@ -70,6 +80,12 @@ static bool responses_sse_emit_event(int fd, responses_stream *st, const char *b
 
 
 
+/// Send response.created (status in_progress, empty output).
+/// @param fd          the client socket
+/// @param r           the request (its model)
+/// @param st          the stream state (its response_id)
+/// @param created_at  the response's creation time, Unix seconds
+/// @return false when the write failed
 bool responses_sse_created(int fd, const request *r, responses_stream *st,
                                   long created_at) {
     buf b = {0};
@@ -86,6 +102,10 @@ bool responses_sse_created(int fd, const request *r, responses_stream *st,
 
 
 
+/// Send output_item.added for the reasoning item at st->reasoning_index.
+/// @param fd  the client socket
+/// @param st  the stream state
+/// @return false when the write failed
 static bool responses_sse_reasoning_added(int fd, responses_stream *st) {
     buf b = {0};
     buf_printf(&b,
@@ -100,6 +120,10 @@ static bool responses_sse_reasoning_added(int fd, responses_stream *st) {
 
 
 
+/// Send reasoning_summary_part.added (summary index 0) for the reasoning item.
+/// @param fd  the client socket
+/// @param st  the stream state
+/// @return false when the write failed
 static bool responses_sse_reasoning_summary_part_added(int fd, responses_stream *st) {
     buf b = {0};
     buf_printf(&b,
@@ -114,6 +138,12 @@ static bool responses_sse_reasoning_summary_part_added(int fd, responses_stream 
 
 
 
+/// Send a reasoning_summary_text.delta.
+/// @param fd    the client socket
+/// @param st    the stream state
+/// @param text  the bytes
+/// @param len   bytes at `text` (0: nothing sent)
+/// @return false when the write failed
 static bool responses_sse_reasoning_delta(int fd, responses_stream *st,
                                           const char *text, size_t len) {
     if (len == 0) return true;
@@ -131,6 +161,9 @@ static bool responses_sse_reasoning_delta(int fd, responses_stream *st,
 
 
 
+/// An output item's status for a finish.
+/// @param finish  the finish label (may be NULL)
+/// @return "incomplete" for length / error, else "completed"
 static const char *responses_item_status_for_finish(const char *finish) {
     if (finish && (!strcmp(finish, "length") || !strcmp(finish, "error"))) return "incomplete";
     return "completed";
@@ -138,6 +171,12 @@ static const char *responses_item_status_for_finish(const char *finish) {
 
 
 
+/// Close the reasoning item: summary_text.done, summary_part.done (when one was opened), output_item.done; the
+/// item is completed only when the model closed its reasoning itself.
+/// @param fd      the client socket
+/// @param st      the stream state
+/// @param finish  the finish label (unused: the status follows reasoning_closed_naturally)
+/// @return false when a write failed
 static bool responses_sse_reasoning_done(int fd, responses_stream *st,
                                          const char *finish) {
     /* If the stream terminates before `</think>` was actually observed the
@@ -200,6 +239,10 @@ static bool responses_sse_reasoning_done(int fd, responses_stream *st,
 
 
 
+/// Send output_item.added for the assistant message item at st->message_index.
+/// @param fd  the client socket
+/// @param st  the stream state
+/// @return false when the write failed
 static bool responses_sse_message_added(int fd, responses_stream *st) {
     buf b = {0};
     buf_printf(&b,
@@ -214,6 +257,10 @@ static bool responses_sse_message_added(int fd, responses_stream *st) {
 
 
 
+/// Send content_part.added (an empty output_text part) for the message item.
+/// @param fd  the client socket
+/// @param st  the stream state
+/// @return false when the write failed
 static bool responses_sse_message_text_part_added(int fd, responses_stream *st) {
     buf b = {0};
     buf_printf(&b,
@@ -228,6 +275,12 @@ static bool responses_sse_message_text_part_added(int fd, responses_stream *st) 
 
 
 
+/// Send an output_text.delta for the message item.
+/// @param fd    the client socket
+/// @param st    the stream state
+/// @param text  the bytes
+/// @param len   bytes at `text` (0: nothing sent)
+/// @return false when the write failed
 static bool responses_sse_output_text_delta(int fd, responses_stream *st,
                                             const char *text, size_t len) {
     if (len == 0) return true;
@@ -245,6 +298,11 @@ static bool responses_sse_output_text_delta(int fd, responses_stream *st,
 
 
 
+/// Close the message item: output_text.done, content_part.done, output_item.done with the accumulated text.
+/// @param fd      the client socket
+/// @param st      the stream state
+/// @param finish  the finish label (the item's status)
+/// @return false when a write failed
 static bool responses_sse_message_done(int fd, responses_stream *st,
                                        const char *finish) {
     const char *item_status = responses_item_status_for_finish(finish);
@@ -293,6 +351,10 @@ static bool responses_sse_message_done(int fd, responses_stream *st,
 
 
 
+/// Whether a call is the client-executed tool_search (sent as a tool_search_call item).
+/// @param tc     the call (NULL: false)
+/// @param order  the tool's schema order (NULL: the name alone decides)
+/// @return true for a tool_search call the request declared as Responses tool search
 static bool responses_tool_call_is_tool_search(const tool_call *tc,
                                                const tool_schema_order *order) {
     return tc && tc->name && !strcmp(tc->name, "tool_search") &&
@@ -307,6 +369,11 @@ static bool responses_tool_call_is_tool_search(const tool_call *tc,
  * call_id verbatim and pre-assign a stable fc_id; the discriminator currently
  * defaults to function_call because Codex CLI registers all its tools as
  * function tools. */
+/// Build the per-call Responses item identities: a fresh fc_ id, the call id (or a fresh call_ id), the output
+/// index.
+/// @param out                    receives the malloc'd array (calls->len entries; NULL for no calls); caller frees
+/// @param calls                  the turn's calls (may be NULL)
+/// @param starting_output_index  the output index of the first call
 static void responses_tool_items_build(responses_tool_item **out,
                                        const tool_calls *calls,
                                        int starting_output_index) {
@@ -329,6 +396,13 @@ static void responses_tool_items_build(responses_tool_item **out,
 
 
 
+/// Append one function_call (or custom_tool_call / tool_search_call) output item.
+/// @param b            the JSON being built
+/// @param tc           the call
+/// @param item         its Responses identity (responses_tool_items_build)
+/// @param item_status  the item's status string
+/// @param with_args    include the arguments (false: an empty arguments string, for output_item.added)
+/// @param orders       the request's tool schema orders (wire names, namespaces)
 void responses_append_function_call_item(buf *b, const tool_call *tc,
                                                 const responses_tool_item *item,
                                                 const char *item_status,
@@ -372,6 +446,15 @@ void responses_append_function_call_item(buf *b, const tool_call *tc,
 
 
 
+/// Send output_item.added (in_progress, no arguments) or output_item.done for one call.
+/// @param fd      the client socket
+/// @param st      the stream state
+/// @param tc      the call
+/// @param item    its Responses identity
+/// @param orders  the request's tool schema orders
+/// @param finish  the finish label (the done item's status)
+/// @param done    send .done, else .added
+/// @return false when the write failed
 static bool responses_sse_function_call_event(int fd, responses_stream *st,
                                               const tool_call *tc,
                                               const responses_tool_item *item,
@@ -401,6 +484,13 @@ static bool responses_sse_function_call_event(int fd, responses_stream *st,
  * the whole DSML invoke as one unit before the worker decides which tool was
  * called. Clients that follow the OpenAI Responses lifecycle expect both
  * events between output_item.added (in_progress) and output_item.done. */
+/// Send a function call's arguments as one function_call_arguments.delta and .done.
+/// @param fd      the client socket
+/// @param st      the stream state
+/// @param tc      the call
+/// @param item    its Responses identity (custom calls and tool_search send nothing)
+/// @param orders  the request's tool schema orders
+/// @return false when a write failed
 static bool responses_sse_function_call_arguments_done(int fd, responses_stream *st,
                                                        const tool_call *tc,
                                                        const responses_tool_item *item,
@@ -445,6 +535,9 @@ static bool responses_sse_function_call_arguments_done(int fd, responses_stream 
 
 
 
+/// The response's status for a finish.
+/// @param finish  the finish label (may be NULL)
+/// @return "incomplete" (length), "failed" (error) or "completed"
 static const char *responses_status_for_finish(const char *finish) {
     if (finish && !strcmp(finish, "length")) return "incomplete";
     if (finish && !strcmp(finish, "error")) return "failed";
@@ -453,6 +546,11 @@ static const char *responses_status_for_finish(const char *finish) {
 
 
 
+/// Append the Responses "usage" object (input with the cache split, output, total).
+/// @param b              the JSON being built
+/// @param r              the request (its cache split; NULL: none)
+/// @param input_tokens   the prompt's tokens
+/// @param output_tokens  the tokens generated
 static void append_responses_usage_json(buf *b, const request *r,
                                         int input_tokens, int output_tokens) {
     int cached_tokens = r ? r->cache_read_tokens : 0;
@@ -468,6 +566,18 @@ static void append_responses_usage_json(buf *b, const request *r,
 
 
 
+/// Send the terminal event (response.completed, .incomplete or .failed) with the whole output: the reasoning item,
+/// the message item and the calls.
+/// @param fd                 the client socket
+/// @param r                  the request
+/// @param st                 the stream state
+/// @param calls              the turn's calls (may be NULL)
+/// @param tool_items         their Responses identities (NULL: calls not listed)
+/// @param finish             the finish label
+/// @param prompt_tokens      the prompt's tokens
+/// @param completion_tokens  the tokens generated
+/// @param created_at         the response's creation time, Unix seconds
+/// @return false when the write failed
 bool responses_sse_completed(int fd, const request *r,
                                     responses_stream *st,
                                     const tool_calls *calls,
@@ -554,6 +664,12 @@ bool responses_sse_completed(int fd, const request *r,
  * the first) and one output_text delta into the message item: the two shapes
  * every producer streams -- DeepSeek's text projection below and a family's
  * output parser (responses_sink_text). */
+/// Stream reasoning into the reasoning item, opening it and its summary part on the first delta.
+/// @param fd    the client socket
+/// @param st    the stream state (the text is also accumulated in st->reasoning_text)
+/// @param text  the bytes
+/// @param len   bytes at `text`
+/// @return false when a write failed
 static bool responses_emit_reasoning(int fd, responses_stream *st, const char *text, size_t len) {
     if (!st->reasoning_item_opened) {
         st->reasoning_index = st->next_output_index++;
@@ -570,6 +686,12 @@ static bool responses_emit_reasoning(int fd, responses_stream *st, const char *t
     return true;
 }
 
+/// Stream answer text into the message item, opening it and its text part on the first delta.
+/// @param fd    the client socket
+/// @param st    the stream state (the text is also accumulated in st->message_text)
+/// @param text  the bytes
+/// @param len   bytes at `text`
+/// @return false when a write failed
 static bool responses_emit_text(int fd, responses_stream *st, const char *text, size_t len) {
     if (!st->message_item_opened) {
         st->message_index = st->next_output_index++;
@@ -593,6 +715,12 @@ static bool responses_emit_text(int fd, responses_stream *st, const char *text, 
 /* Reasoning reaches the client only when it opted into a summary
  * (reasoning.summary); tool calls go out with the response's completion
  * (responses_sse_finish), not as they decode. */
+/// chat_sink::text for Responses.
+/// @param k          the sink
+/// @param reasoning  the text is reasoning (sent only with reasoning_summary_emit)
+/// @param text       the bytes
+/// @param len        bytes at `text` (0, or an inactive stream: nothing sent)
+/// @return false when a write failed
 static bool responses_sink_text_cb(chat_sink *k, bool reasoning, const char *text, size_t len, size_t) {
     responses_stream *st = (responses_stream *)k->st;
     if (!st->active || len == 0) return true;
@@ -602,11 +730,22 @@ static bool responses_sink_text_cb(chat_sink *k, bool reasoning, const char *tex
 
 /* A reasoning section that ended at the model's own </think> is a complete
  * reasoning item (not one a stop or an error cut short). */
+/// chat_sink::end for Responses.
+/// @param k             the sink
+/// @param think_closed  the section ended at the model's own reasoning close
+/// @return true
 static bool responses_sink_end_cb(chat_sink *k, bool think_closed) {
     if (think_closed) ((responses_stream *)k->st)->reasoning_closed_naturally = true;
     return true;
 }
 
+/// Build the Responses protocol sink over `st` (no live tool events: calls go out with the finish).
+/// @param k   the sink to fill
+/// @param fd  the client socket
+/// @param s   the server (NULL in unit tests)
+/// @param r   the request
+/// @param id  the response id (borrowed for the sink's life)
+/// @param st  the stream state (responses_stream_init)
 void responses_sink_init(chat_sink *k, int fd, server *s, const request *r, const char *id,
                          responses_stream *st) {
     *k = {fd, s, r, id, st, responses_sink_text_cb, responses_sink_end_cb, NULL, false};
@@ -656,6 +795,17 @@ bool responses_sse_finish(int fd, const request *r, responses_stream *st, const 
 
 
 
+/// Send a non-streamed Responses body (fresh ids; the reasoning item only with reasoning_summary_emit).
+/// @param fd                 the client socket
+/// @param r                  the request
+/// @param id                 the request's response id (unused: the body's ids are drawn here)
+/// @param text               the answer text (may be NULL)
+/// @param reasoning          the reasoning (may be NULL)
+/// @param calls              the turn's calls (may be NULL)
+/// @param finish             the finish label
+/// @param prompt_tokens      the prompt's tokens
+/// @param completion_tokens  the tokens generated
+/// @return false when the write failed
 bool responses_final_response(int fd,
                                      const request *r, const char *id,
                                      const char *text, const char *reasoning,
@@ -732,6 +882,18 @@ bool responses_final_response(int fd,
 
 
 
+/// Send a non-streamed OpenAI chat.completion or text_completion body (usage and timings appended).
+/// @param fd                 the client socket
+/// @param r                  the request (kind, model, tool orders)
+/// @param id                 the response id
+/// @param text               the answer text
+/// @param reasoning          the reasoning (chat: reasoning_content; may be NULL)
+/// @param calls              the turn's calls (chat only; may be NULL)
+/// @param finish             the finish_reason
+/// @param prompt_tokens      the prompt's tokens
+/// @param completion_tokens  the tokens generated
+/// @param lp                 the logprob ledger (chat; NULL or disabled: none)
+/// @return false when the write failed
 bool final_response(int fd,
                            const request *r, const char *id, const char *text,
                            const char *reasoning, const tool_calls *calls, const char *finish,

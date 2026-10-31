@@ -5,6 +5,13 @@
 
 
 
+/// @brief Record the cache decision's token window: the live and prompt ids around the common prefix
+///        (TRACE_CACHE_BEFORE before it to TRACE_CACHE_AFTER after, at most TRACE_CACHE_WINDOW; -1 past an end).
+/// @param d        receives the record (zeroed first; valid set)
+/// @param live     the live session's tokens (may be NULL)
+/// @param prompt   the request's tokens (may be NULL)
+/// @param old_pos  the live position before the request, in tokens
+/// @param common   the tokens live and prompt share from 0
 void trace_cache_capture(
         trace_cache_diag *d,
         const pulsar_tokens *live,
@@ -39,6 +46,9 @@ void trace_cache_capture(
 
 
 
+/// @brief Why the live checkpoint did or did not serve the prompt, as the trace's word.
+/// @param d  the record (NULL or invalid: "unknown")
+/// @return a static string ("no-live-checkpoint", "token-mismatch", ...)
 const char *trace_cache_miss_reason(const trace_cache_diag *d) {
     if (!d || !d->valid) return "unknown";
     if (d->old_pos == 0) return "no-live-checkpoint";
@@ -49,6 +59,10 @@ const char *trace_cache_miss_reason(const trace_cache_diag *d) {
 
 
 
+/// @brief Write bytes as one double-quoted, C-escaped string (control bytes as \\xNN).
+/// @param fp   the trace file
+/// @param p    the bytes
+/// @param len  bytes at `p`
 static void trace_write_escaped_bytes(FILE *fp, const char *p, size_t len) {
     static const char hex[] = "0123456789abcdef";
     fputc('"', fp);
@@ -76,6 +90,10 @@ static void trace_write_escaped_bytes(FILE *fp, const char *p, size_t len) {
 
 
 
+/// @brief Write a token as "<id> \"<escaped text>\"", or "- <none>" for a negative id.
+/// @param fp      the trace file
+/// @param engine  the engine (for the token's text)
+/// @param token   the token id (< 0: none)
 static void trace_write_token(FILE *fp, pulsar_engine *engine, int token) {
     if (token < 0) {
         fputs("- <none>", fp);
@@ -156,6 +174,8 @@ void server::trace_write_cache_diag(
 
 
 
+/// @brief Write the local wall time as "YYYY-MM-DD HH:MM:SS".
+/// @param fp  the trace file
 static void trace_time(FILE *fp) {
     time_t now = time(NULL);
     struct tm tm;
@@ -300,6 +320,11 @@ void server::trace_finish(
 
 
 
+/// @brief The log's context span "cached..prompt:suffix" (suffix = the tokens to prefill, >= 0).
+/// @param buf     receives the text
+/// @param len     size of `buf`
+/// @param cached  tokens served from cache
+/// @param prompt  the prompt's tokens
 void request_ctx_span(char *buf, size_t len, int cached, int prompt) {
     int suffix = prompt - cached;
     if (suffix < 0) suffix = 0;
@@ -308,6 +333,16 @@ void request_ctx_span(char *buf, size_t len, int cached, int prompt) {
 
 
 
+/** @def ADD_FLAG(name)
+ *  Append `name` to log_flags' buffer, space-separated (defined and undefined inside log_flags). */
+/// @brief The log's request flags, space-separated (RESPPROTO TOOLS THINKING DSML_START DSML_END), "" for none.
+/// @param buf                 receives the text (truncated to `len`)
+/// @param len                 size of `buf` (> 0)
+/// @param responses_protocol  a Responses request
+/// @param tools               the request declares tools
+/// @param thinking            thinking is on
+/// @param tool_start          a tool-call block opened
+/// @param tool_end            a tool-call block closed
 void log_flags(char *buf, size_t len, bool responses_protocol,
                       bool tools, bool thinking,
                       bool tool_start, bool tool_end) {
@@ -327,6 +362,18 @@ void log_flags(char *buf, size_t len, bool responses_protocol,
 
 
 
+/// @brief One decode-progress log line: tokens so far, the rate since the last line and on average.
+/// @param kind                the request kind (chat or completion)
+/// @param prompt_tokens       the prompt's tokens
+/// @param completion          tokens generated so far
+/// @param responses_protocol  a Responses request
+/// @param tools               the request declares tools
+/// @param thinking            thinking is on
+/// @param tool_start          a tool-call block opened
+/// @param tool_end            a tool-call block closed
+/// @param decode_t0           when decoding started (server_now_sec)
+/// @param last_t              in: the last line's time; out: now
+/// @param last_completion     in: the last line's count; out: `completion`
 void log_decode_progress(req_kind kind, int prompt_tokens, int completion,
                                 bool responses_protocol,
                                 bool tools, bool thinking,

@@ -71,6 +71,7 @@
 /* Build-time version string (Makefile passes -DPULSAR_VERSION_STR from
  * `git describe`); fall back to "unknown" for non-Makefile/ad-hoc builds. */
 #ifndef PULSAR_VERSION_STR
+/// The build's version string (git describe); "unknown" outside the Makefile.
 #define PULSAR_VERSION_STR "unknown"
 #endif
 
@@ -78,7 +79,9 @@
 
 
 
+/// Client socket send/receive timeout (SO_RCVTIMEO / SO_SNDTIMEO), seconds (configure_client_socket).
 #define PULSAR_SERVER_IO_TIMEOUT_SEC 10
+/// A client write that makes no progress for this long fails the stream, ms (slot_writer, send_all).
 #define PULSAR_SERVER_SEND_STALL_TIMEOUT_MS 2000
 /* Trusted-LAN posture, but a single stuck or hostile peer must not exhaust
  * threads (one thread per connection) or hold a socket open forever while
@@ -86,18 +89,22 @@
  * the read deadline bounds the total time a request may take to ARRIVE
  * (generation time is not counted - streaming responses run as long as the
  * model needs). */
+/// Concurrent client connections (one thread each); also the queue snapshot bound.
 #define PULSAR_SERVER_MAX_CLIENTS 64
+/// Total time a request may take to arrive, seconds (generation not counted).
 #define PULSAR_SERVER_REQUEST_READ_DEADLINE_SEC 30
 
 /* Long-lived /metrics/stream subscribers, capped separately from
  * PULSAR_SERVER_MAX_CLIENTS. A stream holds its connection (and its thread)
  * until the client goes away, so sharing the request budget would let a couple
  * of idle dashboards lock real requests out of the server. */
+/// Concurrent /metrics/stream subscribers; past it a stream is refused 503.
 #define PULSAR_SERVER_MAX_STREAMS 8
 
 /* Silence on the stream for this long means the connection is unverified, so
  * the pump sends an SSE comment. Comfortably inside the idle timeouts of the
  * proxies and NATs this is expected to run behind. */
+/// Silence on /metrics/stream after which the pump sends an SSE comment, ms.
 #define PULSAR_METRICS_STREAM_KEEPALIVE_MS 15000
 
 /* Multi-session serving increment 2: the worker steps each job as a resumable
@@ -109,15 +116,18 @@
  * machinery). With one slot the quanta run back-to-back and behavior is
  * identical to run-to-completion; increment 3 interleaves slots at these
  * boundaries. */
+/// Tokens a decode quantum emits before yielding to the worker loop (a spec burst may overshoot).
 #define PULSAR_SERVER_DECODE_QUANTUM_TOKENS 16
 
 /* OpenAI caps chat-completions top_logprobs at 20; a request above it is a 400,
  * so this also bounds the per-token capture buffer (see logprob_ledger). */
+/// Largest top_logprobs a request may ask for (OpenAI's cap); bounds the capture buffer.
 #define PULSAR_SERVER_MAX_TOP_LOGPROBS 20
 
 /* Ceiling for bytes queued in a slot_writer for a client that stops reading.
  * The stall timeout is the real slow-client guard; this cap only bounds worst
  * case memory if a client keeps draining just enough to defeat it. */
+/// Bytes a slot_writer may queue for a client that stops reading.
 #define PULSAR_SERVER_WRITER_MAX_PENDING_BYTES (64u * 1024u * 1024u)
 
 
@@ -127,6 +137,7 @@
  * the whole C stack before the request is rejected.  The ceiling itself is
  * defined in pulsar_json.h, beside the scanner that enforces it. */
 #ifndef JSON_MAX_NESTING
+/// Nesting ceiling for skipped JSON values (the scanner's, pulsar_json.h, when not already defined).
 #define JSON_MAX_NESTING 256
 #endif
 
@@ -149,7 +160,9 @@
  * state.
  */
 
+/// Tool memory's default entry ceiling (tool_memory::max_entries 0 = this).
 #define PULSAR_TOOL_MEMORY_DEFAULT_MAX_IDS 100000
+/// Tool memory's default byte ceiling (tool_memory::max_bytes 0 = this); also the largest trailer entry loaded.
 #define PULSAR_TOOL_MEMORY_MAX_BYTES (512u * 1024u * 1024u)
 
 
@@ -180,10 +193,15 @@
  * are kept.
  */
 
+/// Tool-map trailer header byte 0 ('K').
 #define KV_TOOL_MAP_MAGIC0 'K'
+/// Tool-map trailer header byte 1 ('T').
 #define KV_TOOL_MAP_MAGIC1 'T'
+/// Tool-map trailer header byte 2 ('M').
 #define KV_TOOL_MAP_MAGIC2 'M'
+/// Tool-map trailer header byte 3: the format version.
 #define KV_TOOL_MAP_VERSION 1u
+/// Tool-map trailer header size, bytes: the magic, the version and a little-endian u32 entry count.
 #define KV_TOOL_MAP_HEADER 8u
 
 
@@ -202,8 +220,11 @@
  * enough data to diagnose tokenizer-boundary and canonicalization problems.
  */
 
+/// Tokens the trace shows before the first live/prompt mismatch.
 #define TRACE_CACHE_BEFORE 8
+/// Tokens the trace shows after it.
 #define TRACE_CACHE_AFTER  8
+/// The trace's mismatch window, tokens (trace_cache_diag's arrays).
 #define TRACE_CACHE_WINDOW (TRACE_CACHE_BEFORE + 1 + TRACE_CACHE_AFTER)
 
 /* ---- shared types ---- */
@@ -239,29 +260,48 @@ typedef struct {
     uint32_t span_lo;              ///< where the outermost open range started
 } buf;
 
+/// Open a client-data range at `b`'s current end (nests: only the outermost range is recorded).
+/// @param b  the buffer (NULL: ignored)
 void buf_text_begin(buf *b);
+/// Close the innermost open range; closing the outermost records [start, len) unless empty.
+/// @param b  the buffer (NULL or none open: ignored)
 void buf_text_end(buf *b);
 /** Move `src`'s ranges into `dst`, shifted by `offset` (the number of bytes `src`
  * will occupy in front of them), and free `src`'s array.  Used when a region is
  * assembled in its own buffer and then concatenated. */
+/// @param dst     the buffer that receives the ranges
+/// @param src     the buffer whose ranges move (its array is freed)
+/// @param offset  bytes to shift each range by
 void buf_spans_carry(buf *dst, buf *src, size_t offset);
 /** Append `text` (whose CLIENT-DATA ranges are `spans`, in `text`'s own
  * coordinates) and shift those ranges into `dst`.  Ranges past the appended
  * bytes are dropped, so the result stays in bounds and ascending. */
+/// @param dst      the buffer appended to
+/// @param text     the NUL-terminated text
+/// @param spans    its client-data ranges, in its own coordinates
+/// @param n_spans  ranges in `spans`
 void buf_puts_spanned(buf *dst, const char *text, const pulsar_text_span *spans,
                       uint32_t n_spans);
 
+/// The request's shape: a chat (messages) or a raw completion (prompt).
 typedef enum {
+    /// chat completions, Anthropic Messages, Responses
     REQ_CHAT,
+    /// /v1/completions (a raw prompt)
     REQ_COMPLETION,
 } req_kind;
 
+/// The wire protocol a request arrived in (and is answered in).
 typedef enum {
+    /// OpenAI chat / completions
     API_OPENAI,
+    /// Anthropic Messages
     API_ANTHROPIC,
+    /// OpenAI Responses
     API_RESPONSES,
 } api_style;
 
+/// The server (struct server, below).
 typedef struct server server;
 
 /** One tool call, as the client sees it. Arguments stay as raw JSON TEXT
@@ -431,6 +471,7 @@ typedef struct {
  * cheap to keep under mu and to zero with the rest of the server struct.
  * Buckets are non-cumulative here; send_metrics accumulates them on the way
  * out, which is the form Prometheus wants. */
+/// Finite buckets per /metrics histogram (pulsar_hist; +Inf is derived from count).
 #define PULSAR_HIST_BUCKETS 14
 /** Fixed-bucket Prometheus histogram instance -- counters only; see the note
  * above for why the bounds live elsewhere. */
@@ -442,11 +483,17 @@ typedef struct {
 
 /* Defined in http_server.cpp, next to the emitter that prints the le= labels
  * so the bounds and their advertised values can never drift apart. */
+/// Upper bounds of the latency histograms' buckets, seconds (http_server.cpp).
 extern const double pulsar_hist_seconds_bounds[PULSAR_HIST_BUCKETS];
+/// Upper bounds of the token-count histograms' buckets, tokens (http_server.cpp).
 extern const double pulsar_hist_tokens_bounds[PULSAR_HIST_BUCKETS];
 
 /* Record one observation. Values above the last bound fall only into +Inf,
  * which the emitter derives from count, so no bucket is touched for them. */
+/// Record one observation (negatives and NaN dropped; above the last bound: only count and sum).
+/// @param h       the histogram (caller holds server::mu)
+/// @param bounds  its family's bucket bounds (pulsar_hist_seconds_bounds / pulsar_hist_tokens_bounds)
+/// @param v       the value, in the bounds' unit
 static inline void pulsar_hist_observe(pulsar_hist *h, const double *bounds, double v) {
     if (!(v >= 0.0)) return;  ///< drops NaN as well as negatives
     int i = 0;
@@ -680,6 +727,8 @@ typedef struct server_output_parser_ops {
 } server_output_parser_ops;
 extern const server_output_parser_ops k_parser_deepseek;
 /** The table for a chat format (every format has one), and for the loaded engine's. */
+/// @param fmt  the chat format
+/// @return its family table (static, never NULL for a known format)
 const server_family_ops *server_family_for_format(pulsar_chat_format fmt);
 const server_family_ops *server_family_for_engine(const pulsar_engine *e);
 /** A family table in its own file (chat_family.cpp's switch names it): Inkling's (family_inkling.cpp). */
@@ -690,14 +739,29 @@ extern const server_family_ops k_family_nemotron_h;
 extern const char *const k_effort_names[CHAT_EFFORT_NAMES];
 /* What every family's render shares (chat_family.cpp), for a table in its own file: */
 /** The tool memory and the protocols' live continuations, between the family's folding and its template. */
+/// @param s  the server (NULL in host-only tests: no tool memory is consulted)
+/// @param c  the conversation; its messages get their remembered tool bytes
+/// @param r  the request; its live-continuation suffixes are prepared for its protocol
 void render_prelude(struct server *s, struct chat_conversation *c, struct request *r);
 /** The tools as OpenAI's array, for a template that takes one: r->tools_json = every DECLARED tool (the output
  *  parser's: conversation_declared_tool_schema_lines), *head_json = the ones the template's tools block renders (L325:
  *  without the deferred tools; malloc'd, NULL = none).  Both NULL for none or tool_choice none; false + err when the
  *  conversation's schema lines do not convert. */
+/// @param c          the conversation
+/// @param r          the request (receives tools_json)
+/// @param head_json  receives the tools the template's tools block renders (malloc'd; NULL = none)
+/// @param err        receives the reason on false
+/// @param errlen     size of `err`
+/// @return false when the schema lines do not convert
 bool chat_openai_tools_json(const struct chat_conversation *c, struct request *r, char **head_json, char *err,
                             size_t errlen);
 /** After tokenising: each image's sentinel block where its placeholder sits (a text-only request untouched). */
+/// @param e       the engine
+/// @param msgs    the conversation (its images, in order)
+/// @param r       the request: r->images is built and placed on r->prompt
+/// @param err     receives the reason on false
+/// @param errlen  size of `err`
+/// @return false for a malformed image request (a placeholder without an image, a bad block)
 bool request_prepare_images(pulsar_engine *e, const chat_msgs *msgs, struct request *r, char *err, size_t errlen);
 
 /* ---- L303: structured outputs (constrain.cpp) ----------------------------------------------------------
@@ -746,14 +810,23 @@ typedef struct {
     response_format_kind kind;
     char *src;   ///< owned; NULL for NONE / JSON_OBJECT
 } response_format_spec;
+/// Free `f`'s source and reset it to RESPONSE_FORMAT_NONE.
+/// @param f  the format
 void response_format_free(response_format_spec *f);
 /** OpenAI chat's response_format object (also Responses' text.format, which is the same object with the
  *  json_schema's members flattened into it, and Anthropic's output_config.format: {type: json_schema,
  *  schema}).  false + err: a malformed or unknown format. */
+/// @param raw     the format object's raw JSON text
+/// @param out     receives the parsed format (release with response_format_free)
+/// @param err     receives the client error on false
+/// @param errlen  size of `err`
+/// @return false for a malformed or unknown format
 bool response_format_parse(const char *raw, response_format_spec *out, char *err, size_t errlen);
 
 /** The grammars one request's turn runs under, built with its render (request::constrain). */
 typedef struct constrain_plan constrain_plan;
+/// Free a plan and its grammars.
+/// @param p  the plan (NULL: nothing)
 void constrain_plan_free(constrain_plan *p);
 
 /** One parsed request, normalised across the three supported APIs.
@@ -891,6 +964,7 @@ typedef struct {
 
 
 
+/// A protocol's live response sink (struct chat_sink, below).
 typedef struct chat_sink chat_sink;
 /** A protocol's emitters for a family's live tool-call events (L272 P3: generic -- the DSML projection
  * and the Qwen output parser both drive them).  Each returns false on a client write failure, which
@@ -1010,6 +1084,7 @@ typedef struct {
     int tools_streamed;  ///< tool_use blocks streamed and stopped
 } anthropic_stream;
 
+/// A queued request (struct job, below).
 typedef struct job job;
 
 /* ---- deferred slot writer (multi-session increment 2) ----
@@ -1047,6 +1122,7 @@ typedef struct {
  * Every quantum boundary the worker asks whether a streaming slot has been
  * silent for PULSAR_SERVER_HEARTBEAT_MS and, if so, emits a keepalive that is
  * a NO-OP at the protocol level for the surface in question. */
+/// Silence on a streaming slot after which the worker sends a protocol no-op keepalive, ms.
 #define PULSAR_SERVER_HEARTBEAT_MS 5000
 /** L313: a bank adopts another bank's published state only when it starts its sync this many tokens deeper than its
  *  own state would: the copy (the shared prefix's pool rows + one checkpoint, ~10-15 ms at a few thousand tokens on
@@ -1057,7 +1133,13 @@ void slot_writer_init(slot_writer *w, int fd);
 void slot_writer_install(slot_writer *w);  ///< thread-local; NULL uninstalls
 /** A prefill chunk is done for the slot whose gen_state is `ud`: progress, SSE keepalive,
  * the prefill log line and the L114 counter (server_jobs.cpp). */
+/// @param ud       the slot's gen_state
+/// @param event    the engine's progress event ("prefill_chunk", ...)
+/// @param current  tokens prefilled so far
+/// @param total    tokens the sync prefills to
 void gen_prefill_progress_cb(void *ud, const char *event, int current, int total);
+/// @param w  the writer
+/// @return false once the writer has failed (a socket error, a stall, an overflow)
 bool slot_writer_flush(slot_writer *w);  ///< non-blocking best effort
 /* True when this writer has an armed clock and has been silent >= interval. */
 bool slot_writer_idle_for(const slot_writer *w, long long now_ms, long long interval_ms);
@@ -1071,6 +1153,7 @@ typedef struct {
     int sys_prefix_margin;   ///< and this far below the chat anchor, clear of preamble jitter
 } kv_cache_options;
 
+/// The segment store (src/lib/pulsar_segstore.h).
 typedef struct pulsar_segstore pulsar_segstore;
 
 /** L310: what a disk hit's restore-vs-recompute decided (after Flare's prefix-cache offload policy, 2.10): a chain
@@ -1093,6 +1176,12 @@ extern const char *const kv_restore_verdict_names[KV_RESTORE_VERDICTS];
 /** The decision, pure: a read for `gained` tokens past what the bank serves, `measured` false = no load has measured
  *  the read yet, else `transfer_ms` its estimate (kv_read_cost_ms); `priced` false = no solo prefill fit, else
  *  `prefill_ms` prices the gain.  A chain that adds nothing (gained 0) is never read. */
+/// @param gained       tokens the chain adds past what the bank serves
+/// @param measured     a load has measured the read rate
+/// @param transfer_ms  the read's estimate, ms (when measured)
+/// @param priced       the engine has a solo prefill fit
+/// @param prefill_ms   the prefill of `gained` tokens, ms (when priced)
+/// @return the verdict
 kv_restore_verdict kv_restore_decide(uint32_t gained, bool measured, double transfer_ms, bool priced,
                                      double prefill_ms);
 
@@ -1122,6 +1211,11 @@ typedef struct {
 #define KV_READ_RIDGE 1e-3
 void kv_read_cost_observe(kv_read_cost *c, uint64_t bytes, uint64_t cached, double ms);
 /** The estimated read of `bytes`, `cached` of them in the page cache; false (and 0) before the first load. */
+/// @param c       the fit
+/// @param bytes   bytes to read
+/// @param cached  of which in the page cache
+/// @param ms      receives the estimate, ms
+/// @return false before the first load
 bool kv_read_cost_ms(const kv_read_cost *c, uint64_t bytes, uint64_t cached, double *ms);
 
 /** L318: where a request's sync resumes -- the DEEPEST valid state among the bank's own (its grid checkpoint, record
@@ -1141,10 +1235,18 @@ extern const char *const resume_pick_names[RESUME_PICKS];
 /** The depth the memory tiers serve: `adopt` (the deepest published checkpoint another bank holds for the prompt, 0
  *  for none) when it starts the sync more than PULSAR_SERVER_ADOPT_MIN_GAIN tokens deeper than `own`, else `own`.
  *  The disk chain is priced past this depth. */
+/// @param own    the depth the bank's own state serves, tokens
+/// @param adopt  the deepest checkpoint another bank publishes for the prompt, tokens (0 = none)
+/// @return the depth, tokens
 int server_resume_memory_depth(int own, int adopt);
 /** The decision, pure: the disk chain to `disk` (0: none) wins when it is deeper than server_resume_memory_depth and
  *  its L310 verdict, priced on the tokens it adds past that depth, is not RECOMPUTE; else the adopt when it counts;
  *  else the bank's own state. */
+/// @param own           the depth the bank's own state serves, tokens
+/// @param adopt         the deepest adoptable checkpoint, tokens (0 = none)
+/// @param disk          the disk chain's end, tokens (0 = none)
+/// @param disk_verdict  the chain's restore verdict
+/// @return the pick
 resume_pick server_resume_pick(int own, int adopt, int disk, kv_restore_verdict disk_verdict);
 
 /** L329 (a): the shared-prefix wait (after TensorFold #1321).  Requests that arrive together on a NEW shared prefix
@@ -1183,6 +1285,14 @@ typedef struct {
  *  that the lead has not reached and that starts the request's sync more than `min_gain` tokens (the adopt's own
  *  threshold, PULSAR_SERVER_ADOPT_MIN_GAIN) deeper than `have`, the deepest state serving it now.  Ties go to the
  *  lead nearest its cut. */
+/// @param have        the deepest state serving the request now, tokens
+/// @param prompt_len  the request's prompt length, tokens
+/// @param grid        the resume grid, tokens (<= 0: no lead)
+/// @param min_gain    the gain a wait must beat, tokens
+/// @param leads       the bound prefills
+/// @param n           entries in `leads`
+/// @param mark        receives the cut, tokens (0 for none)
+/// @return the lead's index, or -1
 int server_prefix_wait_pick(int have, int prompt_len, int grid, int min_gain, const prefix_lead *leads, int n,
                             int *mark);
 
@@ -1197,16 +1307,30 @@ typedef enum {
 /** The outcomes' names: the log word and the /metrics label (one authority). */
 extern const char *const prefix_wait_names[PREFIX_WAIT_OUTCOMES];
 /** The release rule, pure: `live` = the job it waits on still prefills on its bank. */
+/// @param live        the leader still prefills on its bank
+/// @param leader_pos  where its prefill stands, tokens
+/// @param mark        the cut waited for, tokens
+/// @param waited_ms   how long the request has waited, ms
+/// @param bound_ms    the wait's bound, ms
+/// @return the verdict
 prefix_wait_verdict server_prefix_wait_check(bool live, int leader_pos, int mark, double waited_ms, double bound_ms);
 /** The cut a leader's prefill stops at, pure: its pending mark `cur` unless stale (<= `pos`) or deeper than a
  *  waiter's `want` -- the shallowest pending cut first; a deeper waiter re-asserts its own once that one is reached. */
+/// @param cur   the leader's pending cut (0 = none)
+/// @param want  a waiter's cut
+/// @param pos   where the leader's prefill stands
+/// @return the cut the prefill stops at
 int server_prefix_mark_merge(int cur, int want, int pos);
 /** PULSAR_SERVER_PREFIX_WAIT_MS's value, pure: unset or empty = the default, else whole milliseconds (0 = off);
  *  -1 for anything else (the server refuses to start on it). */
+/// @param text  the variable's value (NULL = unset)
+/// @return milliseconds, or -1
 int server_prefix_wait_parse(const char *text);
 /** L330: PULSAR_SERVER_KV_RESTORE_SLICE_MS's value, pure -- a test hook: unset or empty = 0 (a slice is what one
  *  prefill chunk's priced time reads), else whole milliseconds 1..600000 to read per slice instead (the live leg cuts a
  *  chain a few GiB short of production's into many slices); -1 for anything else (the server refuses to start). */
+/// @param text  the variable's value (NULL = unset)
+/// @return milliseconds (0 = the priced slice), or -1
 int server_restore_slice_parse(const char *text);
 
 /** L310: the chain a disk restore would load (pulsar_kvchain_find), nothing loaded yet. */
@@ -1249,6 +1373,7 @@ typedef enum {
     TOOL_MEMORY_DISK = 1,  ///< restored from a KV-file trailer
 } tool_memory_source;
 
+/// One remembered tool call (tool_memory.cpp).
 typedef struct tool_memory_entry tool_memory_entry;
 
 /** One remembered DSML tool-call block, shared by every call inside it.
@@ -1304,6 +1429,7 @@ struct tool_memory_entry {
  * that.  Held by POINTER so tool_memory stays trivially memset-able -- its
  * free() zeroes the whole struct. */
 typedef std::unordered_map<std::string, tool_memory_entry *> tool_memory_id_map;
+/// Tool memory's block-bytes index: a call block's exact bytes -> its block (deduplicated).
 typedef std::unordered_map<std::string, tool_memory_block *> tool_memory_block_map;
 
 /** The tool memory (server::tool_mem): remembered tool-call bodies by call id and by block bytes, in one LRU list
@@ -1435,6 +1561,7 @@ typedef struct {
  * eviction is LRU and cyclic traffic evicts exactly the next returning
  * conversation's bank (domino, everyone cold); warm reuse needs headroom
  * (convs < banks) until the victim policy is smarter than LRU. */
+/// The bank pool's hard bound: slots (banks) per server; sizes every per-slot array.
 #define PULSAR_SESSION_POOL_CAP 16
 /* Auto-sizing cap: raised 8 -> 16 on 2026-09-11 after the re-measure the old
  * comment asked for (L219).  The 2026-08-10 measurement (N=12 aggregate held
@@ -1450,6 +1577,7 @@ typedef struct {
  * 16 is the row-neutral maximum (PULSAR_MSEQ_MAX), so the cap moves there;
  * auto-sizing still fits N to the KV budget below the cap (huge ctx yields
  * fewer banks), and POOL_CAP above remains the hard array bound. */
+/// The most banks auto-sizing picks (the row-neutral maximum, PULSAR_MSEQ_MAX).
 #define PULSAR_SESSION_POOL_AUTO_MAX 16
 
 /* Default context for lazily provisioned secondary slots (plan Tier 1 §1.4:
@@ -1457,6 +1585,7 @@ typedef struct {
  * compressed-KV cost scales with ctx, so concurrency is bounded by the sum of
  * context sizes). A request that needs more than this gets a slot sized to
  * its need (capped at slot 0's ctx), admission permitting. */
+/// Default context of a lazily provisioned secondary slot, tokens (raised to a job's need).
 #define PULSAR_SERVER_EXTRA_SLOT_CTX_TOKENS 65536
 
 /* The rendered-prompt BOS marker. One definition for every render site AND
@@ -1464,13 +1593,18 @@ typedef struct {
  * derived threshold can never silently drift from what rendered prompts
  * actually begin with. (Unit tests keep independent string literals on
  * purpose — they pin the wire bytes, not this macro.) */
+/// The rendered prompt's BOS marker (DeepSeek), one definition for every render site.
 #define PULSAR_SERVER_RENDER_BOS "<｜begin▁of▁sentence｜>"
 /* The chat template's role markers and turn terminator (DeepSeek V4).  Written
  * only by the renderers in prompt_render.cpp; read by the few places that
  * parse a rendered prompt back (generate.cpp rendered_chat_system_region). */
+/// DeepSeek's system role marker.
 #define PULSAR_RENDER_SYSTEM "<｜System｜>"   /* V4.1: leads a thinking conversation or one opening with system text; marks mid-conversation system messages */
+/// DeepSeek's user role marker.
 #define PULSAR_RENDER_USER "<｜User｜>"
+/// DeepSeek's assistant role marker.
 #define PULSAR_RENDER_ASSISTANT "<｜Assistant｜>"
+/// DeepSeek's turn terminator.
 #define PULSAR_RENDER_EOS "<｜end▁of▁sentence｜>"
 
 /* Slot-routing trivial-match allowance (task #30, 2026-07-16). The router's
@@ -1488,6 +1622,7 @@ typedef struct {
  * multi-thousand-token preambles the session pool exists for. Used only by
  * the routing decision (server_slot_match_is_trivial); prefill reuse of a
  * chosen slot still honors arbitrarily short common prefixes. */
+/// Tokens past the template header a slot match may share and still count as trivial (routing only).
 #define PULSAR_SERVER_SLOT_TRIVIAL_ALLOWANCE_TOKENS 64
 
 /* Admission-control budget (Tier 1 §1.4). GB10 unified memory is ~121 GiB
@@ -1521,7 +1656,9 @@ typedef struct {
  *     constants are an upper bound rather than the load-bearing estimate.
  * Re-measure the constants when the measured/static gap logged at startup
  * ("session admission: measured budget") exceeds ~2 GiB. */
+/// The box's usable memory for the static admission formula, bytes (an upper bound after warm-up).
 #define PULSAR_SERVER_USABLE_BYTES          (121ull * 1024ull * 1024ull * 1024ull)
+/// The process's measured steady-state overhead the admission budget reserves, bytes.
 #define PULSAR_SERVER_PROCESS_OVERHEAD_BYTES (18ull * 1024ull * 1024ull * 1024ull)
 
 /* Free-memory floor (2026-07-13 lockup postmortem; re-sized 2026-07-15):
@@ -1556,12 +1693,19 @@ typedef struct {
  * 11.23 GiB avail before either faulted), so the floor bounds intent, not
  * the instantaneous worst case. One /proc/meminfo read per provisioning
  * attempt, never on a hot path. */
+/// The default MemAvailable floor (kernel breathing room), bytes.
 #define PULSAR_SERVER_MEM_FLOOR_BYTES        (4ull * 1024ull * 1024ull * 1024ull)
 
+/// A slot's lifecycle state (session_slot::state).
 typedef enum {
+    /// A slot's lifecycle state (session_slot::state).
+    /// no live job; its KV may be warm and reusable
     SLOT_IDLE = 0,     /* no live job; the slot's KV may be warm and reusable */
+    /// ingesting a prompt (chunked prefill)
     SLOT_PREFILLING,   /* ingesting a prompt (chunked prefill) */
+    /// generating tokens
     SLOT_DECODING,     /* generating tokens */
+    /// freed and released, its KV spilled to the disk cache; the entry is reusable
     SLOT_EVICTED,      /* session freed, ledger released; KV state spilled to
                           the disk kv cache (snapshot-on-evict) so a returning
                           client restores via the normal disk-text path instead
@@ -1573,6 +1717,7 @@ typedef enum {
  * that used to be a local of the run-to-completion generate_job: prompt/cache
  * resolution results, prefill progress, stream writers for all four API
  * surfaces, decode-loop trackers, and the deferred socket writer. */
+/// A job's resumable generation state (struct gen_state, below).
 typedef struct gen_state gen_state;
 
 /* A pool slot is a pure bank descriptor over the server's ONE session
@@ -1645,22 +1790,31 @@ struct trace_cache_diag;
 struct kv_restore;        /* L330 */
 struct gen_resolution;
 struct spilled_history;
+/// Why a slot could not be provisioned (provision_bank / provision_slot).
 typedef enum {
+    /// Why a slot could not be provisioned (provision_bank / provision_slot).
+    /// provisioned (or nothing attempted)
     PROVISION_OK = 0,
+    /// no free slot entry; eviction helps
     PROVISION_REFUSED_POOL_FULL,   /* no free slot entry — eviction helps */
+    /// the ledger is full; eviction helps
     PROVISION_REFUSED_ADMISSION,   /* ledger full — eviction helps */
+    /// MemAvailable is under the floor (or unreadable); eviction helps in pool mode only
     PROVISION_REFUSED_MEM_FLOOR,   /* machine physically tight (incl. an
                                       unreadable /proc/meminfo, fail closed) —
                                       eviction helps in pool mode only (the
                                       evicted bank's resident pages are
                                       reused); see server_refusal_evictable */
+    /// an allocation failed; eviction is unsafe to chain on
     PROVISION_REFUSED_CREATE_FAIL, /* allocation failed — eviction unsafe to
                                       chain on (same physical pressure) */
+    /// the prompt's KV would pass the guard's budget with no idle bank to spill
     PROVISION_REFUSED_KV_TOUCHED,  /* L280: the prompt's KV would take the
                                       resident KV past the guard's budget and
                                       no idle bank can be spilled to make room
                                       -- the head waits for a busy bank (an
                                       eviction frees no pages) */
+    /// array bound for the per-reason counters, not a reason
     PROVISION_REFUSAL_COUNT,       /* sentinel: array bound for the /metrics
                                       per-reason counters, not a reason */
 } provision_refusal;
@@ -1686,6 +1840,11 @@ typedef struct {
 } warn_limiter;
 /** True when the caller should log now; *skipped receives the occurrences
  * suppressed since the previous line (0 on the first). */
+/// @param w           the limiter
+/// @param now_sec     the clock, seconds
+/// @param period_sec  the period, seconds
+/// @param skipped     receives the suppressed count (written only on true)
+/// @return true when a line is due
 bool warn_limiter_due(warn_limiter *w, double now_sec, double period_sec, unsigned *skipped);
 /** Period of the MemAvailable-floor provisioning refusal line. */
 #define PULSAR_SERVER_MEM_FLOOR_WARN_SEC 10.0
@@ -1757,6 +1916,14 @@ struct kv_dup_census {
  *  the common token prefix of slots a and b, read only where hist_len[a] <= hist_len[b] and both are > 0 (the
  *  dominance matrix's fill rule, bank_common_matrix).  `deep[a]` gets a bit b (b > a) for every resident pair whose
  *  shared prefix is at least PULSAR_KV_DUP_DEEP_TOKENS (NULL: not wanted). */
+/// @param n           slots
+/// @param hist_len    per slot: history length, tokens
+/// @param resident    per slot: KV in GPU memory
+/// @param common      the common-prefix matrix, tokens
+/// @param grid        the resume grid (page), tokens (<= 0: an empty census)
+/// @param page_bytes  KV bytes per grid page
+/// @param out         receives the census
+/// @param deep        receives the deep-pair bits per slot (NULL: not wanted)
 void kv_dup_census_core(int n, const int *hist_len, const bool *resident, const int *const *common, int grid,
                         KvBytes page_bytes, kv_dup_census *out, uint32_t *deep);
 
@@ -3246,13 +3413,21 @@ typedef struct thinking_state {
  * the lifecycle, but the scheduler/worker (server_sched.cpp) steps jobs by
  * phase and drives the batched/fused decode lanes through the batch_*
  * fields, so the definition is shared here. */
+/// Where a job's resumable generation stands (gen_state::phase); the scheduler steps it a quantum at a time.
 typedef enum {
+    /// L330: loading a disk segment chain, one slice of segments a quantum
     GEN_RESTORE = 0,      /* L330: loading a disk segment chain, one slice of segments/quantum */
+    /// syncing the cold-store prefix, one chunk a quantum
     GEN_PREFILL_COLD,     /* syncing the cold-store prefix, one chunk/quantum */
+    /// syncing the effective prompt, one chunk a quantum
     GEN_PREFILL_MAIN,     /* syncing the effective prompt, one chunk/quantum */
+    /// (re)initialising a decode attempt
     GEN_DECODE_INIT,      /* (re)initialize a decode attempt (old decode_again) */
+    /// the sampling loop, a quantum of tokens a step
     GEN_DECODE,           /* sampling loop, K tokens per quantum */
+    /// parse, checkpoints, the final response
     GEN_FINISH,           /* parse, checkpoints, final response */
+    /// finished; the slot is released at its next service
     GEN_DONE,
 } gen_phase;
 
@@ -3279,15 +3454,31 @@ struct kit_gen {
 /** The kit's server_output_parser_ops hooks (parser_kit.cpp): a family whose parser is a kit configuration
  *  fills its table with these and its own `create`, which builds the configured parser (per request: its
  *  tools, the state the prompt left the turn in) and returns parser_kit_start(it) -- the kit owns it. */
+/// @param p  the configured parser (ownership taken)
+/// @return the kit state (a kit_gen) for server_output_parser_ops
 void *parser_kit_start(out_parser *p);
 void parser_kit_destroy(void *st);
 void parser_kit_seed(void *st, struct gen_state *g);
 bool parser_kit_feed(void *st, server *s, struct gen_state *g, size_t upto, bool final);
+/// server_output_parser_ops::in_tool_call: inside a call's structure and not its payload.
+/// @param st  the kit state, or a probe (parser_kit_probe_new)
+/// @param g   unused
+/// @return true when the next draw is greedy
 bool parser_kit_in_tool_call(const void *st, const struct gen_state *g);
+/// server_output_parser_ops::turn_complete: a kit turn ends only at the stop token.
+/// @param st  unused
+/// @param g   unused
+/// @return false, always
 bool parser_kit_turn_complete(const void *st, const struct gen_state *g);
 void parser_kit_tool_progress(const void *st, bool *opened, bool *closed);
 bool parser_kit_finish(void *st, server *s, struct session_slot *sl, struct gen_state *g, server_turn *out);
 void *parser_kit_probe_new(const void *st);
+/// server_output_parser_ops::probe_feed: feed the probe the text it has not read, up to `upto`.
+/// @param probe  the probe (parser_kit_probe_new)
+/// @param g      unused
+/// @param text   the generated text with the round's tokens so far
+/// @param len    its length (unused)
+/// @param upto   bytes the stop-string scan released
 void parser_kit_probe_feed(void *probe, const struct gen_state *g, const char *text, size_t len, size_t upto);
 void parser_kit_probe_free(void *probe);
 
@@ -3497,6 +3688,7 @@ void *server_xmalloc(size_t n);
 void *server_xrealloc(void *p, size_t n);
 char *xstrdup(const char *s);
 bool random_bytes(void *dst, size_t len);
+/// @param msg  the message printed before the abort
 void pulsar_die(const char *msg);  ///< engine util.cpp; aborts the process
 char *xstrndup(const char *s, size_t n);
 void buf_append(buf *b, const void *p, size_t n);
@@ -3518,28 +3710,47 @@ char *json_minify_raw_value(const char *json);
  * strings escaped only for backslash, quote and controls (non-ASCII raw),
  * integers verbatim, floats as repr().  Malloc'd; the input verbatim when it
  * does not parse. */
+/// @param json  one JSON value's text
+/// @return malloc'd text
 char *json_python_dumps_raw_value(const char *json);
 bool json_content(const char **p, char **out);
 /** Decode a standard base64 payload (RFC 4648 alphabet, '=' padding, no
  * whitespace).  Returns a malloc'd buffer and sets `*out_len`, or NULL on
  * malformed input.  The server's ONE base64 decoder; used for inline data:
  * image URLs. */
+/// @param in       the payload
+/// @param in_len   its length, bytes
+/// @param out_len  receives the decoded length, bytes
+/// @return the malloc'd bytes, or NULL
 uint8_t *base64_decode(const char *in, size_t in_len, size_t *out_len);
 void random_tool_id(char *dst, size_t dstlen, api_style api);
 /** `prefix` + 2*nbytes lowercase hex from the OS RNG; dies when no RNG is
  * available (ids must never be predictable).  The ONE id generator: tool-call,
  * Responses item and chat/completion ids all come from here (L192 item 7). */
+/// @param dst     receives the id (NUL-terminated, truncated to `dstlen`)
+/// @param dstlen  size of `dst`
+/// @param prefix  the id's prefix ("call_", "resp_", ...)
+/// @param nbytes  random bytes, at most 16
 void random_prefixed_id(char *dst, size_t dstlen, const char *prefix, size_t nbytes);
 void tool_calls_free(tool_calls *calls);
 void tool_calls_push(tool_calls *calls, tool_call tc);
 void chat_msg_add_tool_call_id(chat_msg *m, const char *id);
 /** Attach an encoded image file (`bytes` taken) whose placeholder sits at `placeholder_off` in content. */
+/// @param m                the message (grows its parallel image arrays)
+/// @param bytes            the encoded file, ownership taken
+/// @param len              its length, bytes
+/// @param placeholder_off  the placeholder's byte offset in m->content
 void chat_msg_add_image(chat_msg *m, uint8_t *bytes, size_t len, size_t placeholder_off);
 /** L325: record a tool_reference to `name` at byte `off` of the message's content (chat_msg::tool_ref_off). */
+/// @param m     the message
+/// @param off   the byte offset in m->content
+/// @param name  the tool named (copied; NULL = "")
 void chat_msg_add_tool_ref(chat_msg *m, size_t off, const char *name);
 /** L325: drop the message's tool_reference records (chat_expand_tool_refs has written them). */
+/// @param m  the message
 void chat_msg_clear_tool_refs(chat_msg *m);
 /** Fold each Anthropic message's parts back into the one user turn DeepSeek's template renders. */
+/// @param msgs  the conversation, folded in place
 void anthropic_fold_tool_results(chat_msgs *msgs);
 void chat_msgs_free(chat_msgs *msgs);
 void chat_msgs_push(chat_msgs *msgs, chat_msg msg);
@@ -3547,6 +3758,11 @@ void tool_schema_orders_free(tool_schema_orders *orders);
 const tool_schema_order *tool_schema_orders_find(const tool_schema_orders *orders, const char *name);
 /** Whether a parsed call names a tool the request declared (L272); when it does not, `detail` gets the
  * model-visible tool error: the name and the declared ones. */
+/// @param r           the request (its declared tools)
+/// @param name        the call's tool name
+/// @param detail      receives the tool error when undeclared (may be NULL)
+/// @param detail_len  size of `detail`
+/// @return true when declared
 bool tool_call_declared(const request *r, const char *name, char *detail, size_t detail_len);
 void request_init(request *r, req_kind kind, int max_tokens);
 void request_free(request *r);
@@ -3571,31 +3787,55 @@ bool anthropic_tools_supported(const char *tools_json, char *err, size_t errlen)
 /** The tools array as one function schema a line into `out` and its declared order into `orders`.  L325: with
  *  `deferred`, a tool marked defer_loading: true goes there instead of `out` (still declared in `orders`); without
  *  it every tool goes to `out`. */
+/// @param p         the JSON cursor, at the tools value (null: an empty list); advanced past it
+/// @param out       receives the schema lines (malloc'd)
+/// @param orders    receives each tool's declared argument order
+/// @param deferred  receives the deferred tools' lines (malloc'd; NULL when not wanted)
+/// @return false for a malformed tools value
 bool parse_tools_value(const char **p, char **out, tool_schema_orders *orders, char **deferred = NULL);
 struct chat_conversation;
 /** L284: every tool the conversation offers, one function schema a line -- the tools array (parse_tools_value,
  *  every protocol's dialect: functions, Responses namespaces and tool_search, Anthropic-shaped) without its deferred
  *  tools: the tools block.  Appended to `out`; every family's tools block renders from this.  (L326: a Responses
  *  tool_search_output's loads are deferred tools too, rendered at the item.) */
+/// @param c    the conversation
+/// @param out  the buffer appended to
 void conversation_tool_schema_lines(const struct chat_conversation *c, buf *out);
 /** L325: every tool the request DECLARES -- conversation_tool_schema_lines then the deferred tools (rendered in place
  *  where a tool_reference loads them, not in the tools block): what the output parser and the grammar read. */
+/// @param c    the conversation
+/// @param out  the buffer appended to
 void conversation_declared_tool_schema_lines(const struct chat_conversation *c, buf *out);
 /** L325: every tool_reference of the conversation written into its message (chat_msg::tool_ref_off): a run of
  *  references at one offset naming deferred tools becomes ONE block of their definitions in the family's encoding
  *  (r->family->tool_defs_text), any other name the "[tool available: NAME]" notice; image placeholders after it move
  *  with it.  Run by render_chat_conversation before the family renders, so every render of the messages (the full
  *  prompt, a live tail, a fold) reads the same bytes.  false + err when the family cannot encode them. */
+/// @param c       the conversation, its messages rewritten in place
+/// @param r       the request (its family's tool_defs_text)
+/// @param err     receives the reason on false
+/// @param errlen  size of `err`
+/// @return false when the family cannot encode the definitions
 bool chat_expand_tool_refs(struct chat_conversation *c, const struct request *r, char *err, size_t errlen);
 /** L284: schema lines as an OpenAI tools array ([{"type":"function","function":{name, description, parameters}}]),
  *  for a template that renders OpenAI's shape (Qwen).  A line's parameters are `parameters` or, Anthropic-shaped,
  *  `input_schema`.  malloc'd; NULL + err when a line has no name. */
+/// @param lines   the schema lines
+/// @param len     their length, bytes
+/// @param err     receives the reason on NULL
+/// @param errlen  size of `err`
+/// @return the malloc'd JSON array, or NULL
 char *tool_schema_lines_openai_tools(const char *lines, size_t len, char *err, size_t errlen);
 bool parse_messages(const char **p, chat_msgs *msgs, char *err, size_t errlen);
 bool parse_anthropic_messages(const char **p, chat_msgs *msgs, char *err, size_t errlen);
 /** An inline base64 `data:image/...;base64,` URL -> the encoded file's bytes (malloc'd, `*len_out` set), or NULL +
  *  `err` (a remote URL, another scheme, a malformed payload).  The one reader of inline images: the chat / Responses
  *  image blocks and /v1/parse (L321). */
+/// @param url      the data: URL
+/// @param len_out  receives the decoded length, bytes
+/// @param err      receives the reason on NULL
+/// @param errlen   size of `err`
+/// @return the malloc'd bytes, or NULL
 uint8_t *server_decode_image_data_url(const char *url, size_t *len_out, char *err, size_t errlen);
 /* Attach one inline image block to `msg` and write its placeholder into `out`.
  * The single authority behind the chat `image_url` and Responses `input_image`
@@ -3647,13 +3887,25 @@ void chat_render_init(chat_render *r, const chat_msgs *msgs, bool tools_advertis
 /** Append message `i` of `msgs`, which must not be a system-REGION message
  * (the caller owns that decision; a system message given here renders in
  * place as an environment note). */
+/// @param out   the prompt buffer
+/// @param msgs  the conversation
+/// @param i     the message's index
+/// @param r     the render's state (the open turn, the think mode, ...)
 void append_chat_msg(buf *out, const chat_msgs *msgs, int i, chat_render *r);
 /** The generation prefix: the assistant role marker and the think opener
  * (thinking mode) or the empty think block's close (not). */
+/// @param out    the prompt buffer
+/// @param think  thinking mode
 void append_assistant_open(buf *out, bool think);
 /** An assistant turn after its opener: `reasoning` (when non-NULL -- the
  * replayed block's body), the think close (when `close_think`), the visible
  * content, the DSML tool calls, EOS. */
+/// @param out          the prompt buffer
+/// @param close_think  write the think close
+/// @param reasoning    the replayed reasoning (NULL: none)
+/// @param content      the visible content (may be NULL)
+/// @param calls        the turn's calls (may be NULL)
+/// @param v41  DeepSeek V4.1's template spelling (else V4 / 0731)
 void append_assistant_turn_close(buf *out, bool close_think, const char *reasoning,
                                  const char *content, const tool_calls *calls, bool v41 = true);
 /** The same turn as the model SAMPLED it: a turn that ends in tool calls
@@ -3661,17 +3913,39 @@ void append_assistant_turn_close(buf *out, bool close_think, const char *reasoni
  * a stop turn ends with the EOS it sampled.  This is what a checkpoint key
  * names -- the bytes of the live tokens -- while the replay is
  * append_assistant_turn_close (L196). */
+/// @param out          the prompt buffer
+/// @param close_think  write the think close
+/// @param reasoning    the replayed reasoning (NULL: none)
+/// @param content      the visible content (may be NULL)
+/// @param calls        the turn's calls (may be NULL)
+/// @param v41  DeepSeek V4.1's template spelling (else V4 / 0731)
 void append_assistant_turn_sampled(buf *out, bool close_think, const char *reasoning,
                                    const char *content, const tool_calls *calls, bool v41 = true);
 /** Close a render: an open user-side turn gets the generation prefix. */
+/// @param out  the prompt buffer
+/// @param r    the render's state
 void chat_render_finish(buf *out, const chat_render *r);
 /** The live-KV continuation suffix for msgs[start..): EOS, the new user-side
  * messages, the generation prefix. */
+/// @param msgs              the conversation
+/// @param start             the first new message
+/// @param tools_advertised  the prompt carries a tools block
+/// @param think_mode        the request's think mode
+/// @param v41  DeepSeek V4.1's template spelling (else V4 / 0731)
+/// @return the malloc'd suffix
 char *render_live_tool_tail(const chat_msgs *msgs, int start, bool tools_advertised,
                             pulsar_think_mode think_mode, bool v41 = true);
 /** As above, plus the tail's CLIENT-DATA ranges (L223) -- tool-result bodies and
  * any replayed assistant content; the EOS, the role markers and the generation
  * prefix are the renderer's own text. */
+/// @param msgs              the conversation
+/// @param start             the first new message
+/// @param tools_advertised  the prompt carries a tools block
+/// @param think_mode        the request's think mode
+/// @param v41  DeepSeek V4.1's template spelling (else V4 / 0731)
+/// @param spans_out         receives the client-data ranges (malloc'd)
+/// @param n_spans_out       receives their count
+/// @return the malloc'd suffix
 char *render_live_tool_tail_spans(const chat_msgs *msgs, int start, bool tools_advertised,
                                   pulsar_think_mode think_mode, bool v41,
                                   chat_text_span **spans_out, uint32_t *n_spans_out);
@@ -3679,6 +3953,14 @@ char *render_live_tool_tail_spans(const chat_msgs *msgs, int start, bool tools_a
  * CLIENT-DATA ranges (see buf's span fields) so pulsar_tokenize_rendered_chat_spans
  * can keep a client from injecting a control token.  `spans_out`/`n_spans_out` may
  * be NULL, in which case this is exactly the old entry. */
+/// @param msgs         the conversation
+/// @param tool_schemas  the tools block's schema lines (NULL or empty: none)
+/// @param tool_orders  each tool's declared argument order
+/// @param think_mode   the request's think mode
+/// @param v41  DeepSeek V4.1's template spelling (else V4 / 0731)
+/// @param spans_out    receives the client-data ranges (malloc'd; may be NULL)
+/// @param n_spans_out  receives their count (may be NULL)
+/// @return the malloc'd prompt text
 char *render_chat_prompt_text_spans(const chat_msgs *msgs, const char *tool_schemas,
                                     const tool_schema_orders *tool_orders,
                                     pulsar_think_mode think_mode, bool v41,
@@ -3715,10 +3997,22 @@ typedef struct chat_effort_ask {
 } chat_effort_ask;
 /** Read the controls in arrival order (a later one replaces an earlier one's value).  false + err:
  *  a name outside the table, an integer outside 1..100, a chat_template_kwargs key no template takes. */
+/// @param controls  the request's controls, in arrival order
+/// @param n         how many
+/// @param a         receives the resolved ask
+/// @param err       receives the client error on false
+/// @param errlen    size of `err`
+/// @return false for an invalid control
 bool chat_effort_ask_read(const chat_control *controls, int n, chat_effort_ask *a, char *err, size_t errlen);
 /** Thinking on or off: the explicit switch; else effort "none" is off; else model "deepseek-chat" (the
  *  DeepSeek API's non-thinking name, on any family) is off; else on.  The switch on with effort none
  *  contradicts itself: false + err. */
+/// @param a       the ask
+/// @param model   the request's "model" (may be NULL)
+/// @param on      receives whether thinking is on
+/// @param err     receives the client error on false
+/// @param errlen  size of `err`
+/// @return false for a contradictory ask
 bool chat_effort_ask_thinking(const chat_effort_ask *a, const char *model, bool *on, char *err, size_t errlen);
 
 /** L267: a chat request as its protocol parser read it -- what the client asked for, before any model
@@ -3743,19 +4037,41 @@ typedef struct chat_conversation {
 
 void chat_conversation_free(chat_conversation *c);
 /** The raw JSON text of member `key` of object `obj` (malloc'd), or NULL when absent. */
+/// @param obj  the object's JSON text
+/// @param key  the member name
+/// @return the malloc'd raw value, or NULL
 char *json_object_member_raw(const char *obj, const char *key);
 /** An Anthropic SERVER tool entry (web_search_*): recognised only to be dropped. */
+/// @param raw_tool_json  one tools entry's JSON text
+/// @return true for a server tool (to drop)
 bool anthropic_server_tool_entry(const char *raw_tool_json);
 /** Append one control (`key` static, `raw` taken). */
+/// @param c    the conversation
+/// @param key  the control's name (static storage)
+/// @param raw  its raw JSON value (ownership taken)
 void chat_conversation_control(chat_conversation *c, const char *key, char *raw);
 /** The loaded family's half of a chat request: thinking resolved from the controls, the protocol's
  * tool-result checks, then the prompt -- text, client spans, and with an engine its tokens and images.
  * `fmt` is the loaded model's (pulsar_engine_chat_format); `e` and `s` may be NULL (the
  * parse-without-engine test shape).  false = refused, with `err` naming why ("" = a malformed value). */
+/// @param e       the engine (NULL: text only)
+/// @param fmt     the loaded model's chat format
+/// @param s       the server (may be NULL)
+/// @param c       the parsed conversation
+/// @param r       the request (receives the prompt)
+/// @param err     receives the reason on false
+/// @param errlen  size of `err`
+/// @return false when refused
 bool render_chat_conversation(pulsar_engine *e, pulsar_chat_format fmt, server *s, chat_conversation *c,
                               request *r, char *err, size_t errlen);
 /** The protocol halves: each reads its wire format into `c` and the request's protocol fields.  The
  * request is initialised by the caller.  false = refused (`err` set, or "" for malformed JSON). */
+/// @param body    the request body
+/// @param c       receives the conversation
+/// @param r       the request (its protocol fields)
+/// @param err     receives the reason on false
+/// @param errlen  size of `err`
+/// @return false when refused
 bool parse_chat_conversation_openai(const char *body, chat_conversation *c, request *r, char *err, size_t errlen);
 bool parse_chat_conversation_anthropic(const char *body, chat_conversation *c, request *r, char *err,
                                        size_t errlen);
@@ -3768,6 +4084,14 @@ bool parse_chat_conversation_responses(const char *body, chat_conversation *c, r
  * engine, the reference's order is render, tokenise, then replace each image
  * placeholder with that image's sentinel block (the decoded pixels live in the
  * render's own message list, so that step cannot move out of this function). */
+/// @param e           the engine (NULL: text only)
+/// @param s           the server (may be NULL)
+/// @param body        the request body
+/// @param def_tokens  the generation cap when the request sets none
+/// @param r           the request, filled
+/// @param err         receives the reason on false
+/// @param errlen      size of `err`
+/// @return false when refused
 bool parse_chat_request_render(pulsar_engine *e, server *s, const char *body, int def_tokens,
                                request *r, char *err, size_t errlen);
 bool parse_chat_request(pulsar_engine *e, server *s, const char *body, int def_tokens,
@@ -3776,6 +4100,13 @@ bool parse_anthropic_request(pulsar_engine *e, server *s, const char *body, int 
                                     request *r, char *err, size_t errlen);
 /** Responses `input` items into `msgs`; a tool_search_output's tools appended to `loaded` (one schema a line, the
  *  item's message referencing each: L326, rendered in place) and declared in `orders`. */
+/// @param p       the JSON cursor at `input`; advanced past it
+/// @param msgs    receives the messages
+/// @param loaded  receives loaded tools' schema lines
+/// @param orders  receives their declared argument orders
+/// @param err     receives the reason on false
+/// @param errlen  size of `err`
+/// @return false for malformed input
 bool parse_responses_input(const char **p, chat_msgs *msgs,
                                   buf *loaded,
                                   tool_schema_orders *orders,
@@ -3803,6 +4134,8 @@ void json_escape_n(buf *b, const char *s, size_t n);
 void json_escape_fragment_n(buf *b, const char *s, size_t n);
 /** L284 P4: the rule every family's parser applies to a turn whose tool text is not a valid call
  *  (generate.cpp): retry allowed -- once, non-streaming, a chat with tools, forced or not. */
+/// @param g  the request's generation state
+/// @return true when the model-visible retry may run
 bool turn_tool_retry_allowed(const struct gen_state *g);
 /** The finish every family's parser ends in (generate.cpp), once its own reading filled `out` (content,
  *  reasoning, the calls -- the stream's ids on them, raw_calls when their sampled bytes are the tool memory's
@@ -3813,6 +4146,16 @@ bool turn_tool_retry_allowed(const struct gen_state *g);
  *  tool_calls with calls, else stop).  `broken`: the family's reading found a broken call, `why` its
  *  detail (the retry's tool error); `logged`: the family already logged it (else the finish logs the
  *  detail once).  Returns the retry's result when one ran, else `ok` (the family's stream status). */
+/// @param s  the server
+/// @param sl  the slot
+/// @param g  the request's generation state
+/// @param out  the turn's reading, completed here
+/// @param broken  the family's reading found a broken call
+/// @param why  its detail (the retry's tool error)
+/// @param logged  the family already logged it
+/// @param tail_from  where the stream's unsent tail starts in g->text, bytes
+/// @param ok  the family's stream status
+/// @return the retry's result when one ran, else `ok`
 bool parser_finish_turn(server *s, struct session_slot *sl, struct gen_state *g, server_turn *out, bool broken,
                         const char *why, bool logged, size_t tail_from, bool ok);
 void append_json_object_string(buf *b, const char *json);
@@ -3836,35 +4179,73 @@ bool request_apply_forced_tool_prefill(request *r, char *err, size_t errlen);
  *  grammars in r->constrain (none = NULL, nothing compiled, today's path).  The compile runs here, on the
  *  request's own thread, under a deadline.  false + err = refused: a malformed format or schema, a compile
  *  past its deadline, a family that declares no grammar shape, a pair. */
+/// @param e  the engine
+/// @param s  the server
+/// @param c  the parsed conversation (its response format, tools, tool_choice)
+/// @param r  the rendered request (receives r->constrain)
+/// @param err  receives the reason on false
+/// @param errlen  size of `err`
+/// @return false when refused
 bool constrain_plan_build(pulsar_engine *e, struct server *s, const chat_conversation *c, request *r, char *err,
                           size_t errlen);
 /** The gate for one decode attempt (gen_decode_init), after the parser's seed: the seed's bytes go through it as
  *  if sampled.  false = g->err says why (the request fails). */
+/// @param s  the server
+/// @param g  the request's generation state
+/// @return false when the gate could not start (g->err set)
 bool gen_constrain_begin(struct server *s, struct gen_state *g);
 void gen_constrain_end(struct gen_state *g);
 /** A grammar region is live: the next draw is masked. */
+/// @param g  the request's generation state
+/// @return true when the next draw is masked
 bool gen_constrain_live(const struct gen_state *g);
 /** Mask words per row (the device sampler's mask layout over the logits width, pulsar_row_draw.mask). */
+/// @param s  the server
+/// @return 32-bit words per mask row
 uint32_t gen_constrain_words(const struct server *s);
 /** The next draw's mask into `row` (live only): the plain lanes' pulsar_row_draw.mask -- the mask shapes the
  *  DRAW only; the row stays the target's, which is what logprobs report (vLLM's default raw logprobs).
  *  false = the matcher failed; g->err says why. */
+/// @param s  the server
+/// @param g  the request's generation state
+/// @param row  receives the mask (gen_constrain_words words)
+/// @return false when the matcher failed
 bool gen_constrain_mask(struct server *s, struct gen_state *g, uint32_t *row);
 /** Advance past an emitted token.  false = the grammar refused it or the matcher failed; g->err says why. */
+/// @param s  the server
+/// @param g  the request's generation state
+/// @param token  the emitted token id
+/// @return false when refused or failed
 bool gen_constrain_accept(struct server *s, struct gen_state *g, int token);
 /** A speculative round's masks: `toks` are the round's tokens (the base unless `base_emitted`, then the
  *  drafts), row i the token after the base and drafts 0..i-1, so the gate goes through them and back.  Rows
  *  are written into the gate's own buffer (*masks; valid until the next call on this gate).  Returns the rows
  *  written -- 0 when no row of the round is in a live region (no masks: today's bytes) -- or -1 (g->err). */
+/// @param s  the server
+/// @param g  the request's generation state
+/// @param toks  the round's tokens
+/// @param n  how many
+/// @param base_emitted  the base was already emitted (toks are the drafts)
+/// @param masks  receives the rows (the gate's buffer)
+/// @return rows written, 0, or -1
 int gen_constrain_round(struct server *s, struct gen_state *g, const int *toks, int n, bool base_emitted,
                         const uint32_t **masks);
 /** L309: how many of a pending chain's `n` drafts (after the not yet emitted `base`) can be accepted under the
  *  grammar: the gate goes through the base and the drafts, as gen_constrain_round's walk does, and back; the first
  *  draft it refuses -- which no masked draw can emit -- ends the chain before it is verified, and a stop draft is
  *  its chain's last.  `n` when the request has no gate.  -1 = the gate failed (g->err). */
+/// @param s  the server
+/// @param g  the request's generation state
+/// @param base  the round's base token (not yet emitted)
+/// @param drafts  the pending drafts
+/// @param n  how many
+/// @return the acceptable prefix length, or -1
 int gen_constrain_draft_prefix(struct server *s, struct gen_state *g, int base, const int32_t *drafts, int n);
 /** The base draw's mask for a speculative round's assemble (live only; the gate's buffer, valid until the next
  *  call).  NULL + g->err on failure. */
+/// @param s  the server
+/// @param g  the request's generation state
+/// @return the mask, or NULL
 const uint32_t *gen_constrain_base_mask(struct server *s, struct gen_state *g);
 
 bool request_exceeds_context(const request *r, int ctx_size);
@@ -3927,6 +4308,17 @@ bool responses_sse_completed(int fd, const request *r,
 /** The end of a Responses stream: the reasoning item closed; `recovered_tail` (a tool block the final
  * parse turned back into text, never streamed) as output_text; the message item closed; the
  * function_call items; response.completed. */
+/// @param fd  the client socket
+/// @param r  the request
+/// @param st  the stream state
+/// @param recovered_tail  text the final parse returned to content (may be NULL)
+/// @param tail_len  its length, bytes
+/// @param calls  the turn's calls
+/// @param finish  the finish label
+/// @param prompt_tokens  usage: prompt tokens
+/// @param completion_tokens  usage: completion tokens
+/// @param created_at  the response's creation time, Unix seconds
+/// @return false when a write failed
 bool responses_sse_finish(int fd, const request *r, responses_stream *st, const char *recovered_tail,
                           size_t tail_len, const tool_calls *calls, const char *finish, int prompt_tokens,
                           int completion_tokens, long created_at);
@@ -3966,6 +4358,10 @@ void visible_live_free(visible_live_state *st);
  * (worker thread; used to route a continuation to the session that owns it). */
 kv_cache_options kv_cache_default_options(void);
 void le_put32(uint8_t *p, uint32_t v);
+/// SHA-1 of `len` bytes as 40 lowercase hex digits and a NUL (pulsar_kvtext_sha1_bytes_hex).
+/// @param ptr  the bytes
+/// @param len  bytes at `ptr`
+/// @param out  receives the digest text
 void sha1_bytes_hex(const void *ptr, size_t len, char out[41]);
 bool id_list_contains(const stop_list *ids, const char *id);
 void id_list_push_unique(stop_list *ids, const char *id);
@@ -3988,10 +4384,21 @@ void build_prompt_from_exact_prefix_and_text_suffix(
  *  row when that row is a sampled stop (`live_ends_at_stop`), then `tail`.  Every family's tail opens with
  *  its template's turn close, which the full render writes after the sampled turn; whether the KV already
  *  holds the stop is the decode lane's (kv_cache.cpp).  `out` is overwritten. */
+/// @param live  the live history
+/// @param live_ends_at_stop  its last row is a sampled stop
+/// @param tail  the tail's tokens
+/// @param out  receives the joined tokens
 void join_live_history_and_tail(const pulsar_tokens *live, bool live_ends_at_stop, const pulsar_tokens *tail,
                                 pulsar_tokens *out);
 /** L290: the live session's tokens continued by a family tail's rendered text (join_live_history_and_tail
  *  with the engine's stop set and the rendered-chat tokenizer); returns the tokens `out` shares with `live`. */
+/// @param engine  the engine
+/// @param live  the live session's tokens
+/// @param tail_text  the tail's rendered text
+/// @param spans  its client-data ranges
+/// @param n_spans  ranges in `spans`
+/// @param out  receives the continued prompt
+/// @return tokens shared with `live`
 int build_live_continuation_prompt(pulsar_engine *engine, const pulsar_tokens *live, const char *tail_text,
                                    const pulsar_text_span *spans, uint32_t n_spans, pulsar_tokens *out);
 int kv_cache_sys_prefix_cut(const kv_disk_cache *kc, int anchor);
@@ -4006,9 +4413,17 @@ bool server_slot_match_is_trivial(int common, int slot_pos,
 int server_route_turn_anchor(const pulsar_tokens *bank, int prefilled, const pulsar_turn_markers *m);
 /** L311: the last token of the last assistant marker (the generation header) among the bank's prefilled tokens,
  *  first turn included; a request that matches past it is the conversation's next turn.  -1 when none / unknown. */
+/// @param bank  the bank's tokens
+/// @param prefilled  how many of them are prefilled
+/// @param m  the template's turn markers
+/// @return the anchor position, or -1
 int server_route_header_anchor(const pulsar_tokens *bank, int prefilled, const pulsar_turn_markers *m);
 /** L322: the bank's route anchor -- the SHALLOWER of the two above that exists (each alone says a request matching
  *  past it is this conversation's), -1 when neither does. */
+/// @param bank  the bank's tokens
+/// @param prefilled  how many of them are prefilled
+/// @param m  the template's turn markers
+/// @return the anchor position, or -1
 int server_route_anchor(const pulsar_tokens *bank, int prefilled, const pulsar_turn_markers *m);
 /* L264 S3 + L275: does the best-scoring free bank take the request in place, or
  * is a fresh bank preferred.  `anchor` is server_route_anchor's answer for
@@ -4048,20 +4463,35 @@ KvBytes server_guard_touched_budget(KvBytes kv_budget_bytes, KvBytes eager_bytes
  * bank provisioning, the guard's live budget, each prefill quantum and each disk-KV persist.  Until init runs (a
  * test, a tool) it is the OS margin alone. */
 /** The derived floor (bytes). */
+/// @return the floor, bytes
 KvBytes server_mem_floor(void);
 /** Derive and set the floor: the OS margin + `zone_high_bytes` + `step_bytes`; returns it. */
+/// @param zone_high_bytes  the zones' high watermarks, bytes
+/// @param step_bytes  the largest demand of one worker step, bytes
+/// @return the floor, bytes
 KvBytes server_mem_floor_init(uint64_t zone_high_bytes, KvBytes step_bytes);
 /** Sum of every zone's `high` watermark in a /proc/zoneinfo text, in bytes (pages of `page_bytes`); 0 when none
  *  parses (the caller logs it and the floor keeps the OS margin). */
+/// @param zoneinfo  the file's text
+/// @param page_bytes  the page size, bytes
+/// @return bytes
 uint64_t server_zoneinfo_high_bytes(const char *zoneinfo, uint64_t page_bytes);
 /** /proc/zoneinfo's high watermarks (server_zoneinfo_high_bytes over the live file); 0 when unreadable. */
+/// @return bytes
 uint64_t server_zone_high_watermark_bytes(void);
 /** The host bytes one disk-KV persist of a `tokens`-long history can take beyond the pinned staging buffer: the
  *  writeback window of dirty page cache (PULSAR_WRITEBACK_STEP) and the two renders of the history's text
  *  (pulsar_kvchain_persist), bounded at PERSIST_TEXT_BYTES_PER_TOKEN a token. */
+/// @param tokens  the history's length
+/// @return bytes
 uint64_t server_persist_host_bytes(int tokens);
+/// Rendered-text bytes a token is bounded at for a persist's host demand (server_persist_host_bytes).
 #define PERSIST_TEXT_BYTES_PER_TOKEN 64u
 /** Does MemAvailable `avail` leave `floor` after `need` more bytes?  avail 0 (unreadable) is no. */
+/// @param avail  MemAvailable, bytes (0 = unreadable)
+/// @param need  the bytes about to be taken
+/// @param floor  the floor, bytes
+/// @return true when the floor stays
 bool server_headroom_admits(KvBytes avail, KvBytes need, KvBytes floor);
 /** The per-chunk prefill re-check's next move (server::prefill_headroom_ok): GO when MemAvailable covers the chunk
  *  over the floor; else SPILL while an idle bank can go, else PREEMPT while a decoder can, else REFUSE. */
@@ -4082,12 +4512,23 @@ uint64_t server_mem_available_bytes(void);
  * position, the queue, the KV and MemAvailable figures, the last section entered, every thread's state, the
  * worker's backtrace) and /health reports status "stalled" with "stalled": seconds (503) until a mark lands again.
  * The normal path only marks; nothing else changes. */
+/// PULSAR_STALL_WATCHDOG_S's default, seconds.
 #define PULSAR_STALL_WATCHDOG_DEFAULT_S 120
 /** Parse PULSAR_STALL_WATCHDOG_S (`v` NULL or "" = the default; "0" = off; else whole seconds 1..86400).
  *  false (err says why) on anything else: the server refuses to start. */
+/// @param v  the variable's value
+/// @param limit_s  receives the limit, seconds (0 = off)
+/// @param err  receives the reason on false
+/// @param errlen  size of `err`
+/// @return false for an invalid value
 bool server_stall_limit_parse(const char *v, int *limit_s, char *err, size_t errlen);
 /** How long the worker has been stalled: `now_ms - beat_ms` in whole seconds when `busy` and it is at least
  *  `limit_s` (> 0), else 0. */
+/// @param now_ms  the clock, ms
+/// @param beat_ms  the last mark, ms
+/// @param busy  jobs are queued or running
+/// @param limit_s  the limit, seconds
+/// @return the stall, seconds (0 = none)
 int64_t server_stall_seconds(int64_t now_ms, int64_t beat_ms, bool busy, int limit_s);
 /* Log priced-vs-actual for a freshly created session and return the bytes the
  * ledger commits (the actual); 0 when they differ -- the price is the
@@ -4108,6 +4549,7 @@ uint64_t server_ledger_release(uint64_t committed_total, uint64_t slot_cost);
  *  an empty bank.
  *  @param s the pool session
  *  @param bank the bank */
+/// @return the bank's position (0 for no history)
 inline TokPos server_bank_pos(pulsar_session *s, uint32_t bank) {
     const TokPos p = pulsar_session_bank_pos(s, bank);
     return p.is_none() ? TokPos{0} : p;
@@ -4117,6 +4559,7 @@ inline TokPos server_bank_pos(pulsar_session *s, uint32_t bank) {
  *  longer than the history (`live_pos`) is no prefix of it: fatal (the two currencies parted).
  *  @param common the continuation's kept tokens
  *  @param live_pos the live history's end */
+/// @return where the sync starts
 TokPos server_live_continuation_start(TokCount common, TokPos live_pos);
 /* Tier-2 bank-aware frontier position of `sl`, correct whether or not sl->bank
  * is the currently-installed bank of the shared pool session (a non-live bank
@@ -4163,6 +4606,13 @@ char *build_tool_checkpoint_suffix(const request *r, const char *content,
 /** As above, plus the suffix's CLIENT-DATA ranges (L223): the sampled content
  * and reasoning are client-replayed bytes; the DSML framing is the server's own
  * text and stays control text. */
+/// @param r  the request
+/// @param content  the turn's content (may be NULL)
+/// @param reasoning  the turn's reasoning (may be NULL)
+/// @param calls  the turn's calls
+/// @param spans_out  receives the client-data ranges (malloc'd)
+/// @param n_spans_out  receives their count
+/// @return the malloc'd suffix
 char *build_tool_checkpoint_suffix_spans(const request *r, const char *content,
                                          const char *reasoning, const tool_calls *calls,
                                          chat_text_span **spans_out, uint32_t *n_spans_out);
@@ -4188,16 +4638,42 @@ void gen_resolve_sampling(const request *req, float *temperature,
 /** L296: gen_resolve_sampling_decode's tool-call override at every position of a speculative round (bit i = verify
  *  row i draws greedy; pulsar_spec_step::greedy_rows), read off a scratch copy of the decode-time state.  `toks` (n)
  *  = the round's tokens not yet streamed: the base unless `base_emitted`, then the drafts. */
+/// @param s  the server
+/// @param g  the request's generation state
+/// @param toks  the round's tokens not yet streamed
+/// @param n  how many
+/// @param base_emitted  the base was already emitted
+/// @return the greedy-row bit set
 uint32_t gen_spec_greedy_rows(server *s, const gen_state *g, const int *toks, int n, bool base_emitted);
 /** The same over the tokens' texts (NULL = a stop token): the probe itself, engine-free (server tests). */
+/// @param g  the request's generation state
+/// @param pieces  each token's text (NULL = a stop token)
+/// @param piece_lens  their lengths, bytes
+/// @param n  how many
+/// @param base_emitted  the base was already emitted
+/// @return the greedy-row bit set
 uint32_t gen_spec_greedy_rows_text(const gen_state *g, const char *const *pieces, const size_t *piece_lens, int n,
                                    bool base_emitted);
 /** The emit path's byte release (gen_emit_token's; the probe's on copies): returns the bytes of `text` the
  *  stop-string scan releases after `text` grew by `piece`. */
+/// @param stops  the request's stop strings
+/// @param text  the generated text, `piece` already appended
+/// @param len  its length, bytes
+/// @param piece  the token's bytes
+/// @param piece_len  their length
+/// @param plain_stream_pos  bytes already released
+/// @param thinking  the reasoning tracker, fed `piece`
+/// @param stop_scan_from  the stop scan's resume offset, advanced
+/// @param hit_stop  set when a stop string matched
+/// @param stop_pos  receives its offset
+/// @param stop_len  receives its length
+/// @return how far into `text` the stream may send, bytes (a stop string, a held stop prefix and a split UTF-8 sequence excluded)
 size_t gen_release(const stop_list *stops, const char *text, size_t len, const char *piece, size_t piece_len,
                    size_t plain_stream_pos, thinking_state *thinking, size_t *stop_scan_from,
                    bool *hit_stop, size_t *stop_pos, size_t *stop_len);
 /** The request streams g->text raw as it is released. */
+/// @param g  the request's generation state
+/// @return true for a raw (plain) stream
 bool gen_streams_plain(const gen_state *g);
 /* OpenAI logprobs ledger (generate.cpp).  capture_* records the distribution a
  * token was DRAWN from; logprob_commit binds it to that token as it is emitted
@@ -4219,10 +4695,17 @@ void append_model_json_values(buf *b, const char *id, const char *name,
                                      int ctx, int default_tokens);
 void *client_main(void *arg);
 /** Read one request (headers + body, bounded in size and time) from `fd`; false on a malformed or late one. */
+/// @param fd  the client socket
+/// @param r  receives the request (release with http_request_free)
+/// @return false on a malformed, oversized or late request
 bool read_http_request(int fd, http_request *r);
 void http_request_free(http_request *r);
 /** L321: serve ENCODER engines (pulsar_engine_encoder != NONE; one group, several models) on cfg's host and port until
  *  a stop signal: /v1/embeddings and / or /v1/rerank, /v1/models, /health (encode_server.cpp).  The exit code. */
+/// @param engines  the opened engines
+/// @param n  how many
+/// @param cfg  the server configuration (host, port, ...)
+/// @return the process exit code
 int encode_serve(pulsar_engine *const *engines, int n, const server_config *cfg);
 int listen_on(const char *host, int port);
 void configure_client_socket(int fd);

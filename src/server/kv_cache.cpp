@@ -12,6 +12,8 @@
 
 
 
+/// @brief The default checkpoint policy: min_tokens 512, sys-prefix align 2048 and margin 2048 (tokens).
+/// @return the options
 kv_cache_options kv_cache_default_options(void) {
     kv_cache_options o = {};
     o.min_tokens = 512;
@@ -22,6 +24,9 @@ kv_cache_options kv_cache_default_options(void) {
 
 
 
+/// @brief Store `v` little-endian at `p` (4 bytes).
+/// @param p  the destination
+/// @param v  the value
 void le_put32(uint8_t *p, uint32_t v) {
     pulsar_kvtext_le_put32(p, v);
 }
@@ -29,6 +34,9 @@ void le_put32(uint8_t *p, uint32_t v) {
 
 
 
+/// @brief Load a little-endian 32-bit value.
+/// @param p  the 4 bytes
+/// @return the value
 static uint32_t le_get32(const uint8_t *p) {
     return pulsar_kvtext_le_get32(p);
 }
@@ -38,6 +46,10 @@ static uint32_t le_get32(const uint8_t *p) {
 
 #ifdef PULSAR_SERVER_TEST
 
+/// @brief Test hook: the SHA-1 of `len` bytes as 40 lowercase hex digits + NUL.
+/// @param ptr  the bytes
+/// @param len  bytes at `ptr`
+/// @param out  receives the digest text
 void sha1_bytes_hex(const void *ptr, size_t len, char out[41]) {
     pulsar_kvtext_sha1_bytes_hex(ptr, len, out);
 }
@@ -46,6 +58,10 @@ void sha1_bytes_hex(const void *ptr, size_t len, char out[41]) {
 #endif
 
 
+/// @brief Whether `ids` holds `id` (exact string match).
+/// @param ids  the id list (NULL: false)
+/// @param id   the id (NULL or empty: false)
+/// @return true when present
 bool id_list_contains(const stop_list *ids, const char *id) {
     if (!ids || !id || !id[0]) return false;
     for (int i = 0; i < ids->len; i++) {
@@ -56,6 +72,9 @@ bool id_list_contains(const stop_list *ids, const char *id) {
 
 
 
+/// @brief Append a copy of `id` unless it is empty or already present.
+/// @param ids  the id list (NULL: nothing)
+/// @param id   the id
 void id_list_push_unique(stop_list *ids, const char *id) {
     if (!ids || !id || !id[0] || id_list_contains(ids, id)) return;
     stop_list_push(ids, xstrdup(id));
@@ -63,6 +82,8 @@ void id_list_push_unique(stop_list *ids, const char *id) {
 
 
 
+/// @brief Free every id and the array, and zero the list.
+/// @param ids  the id list
 void id_list_free(stop_list *ids) {
     stop_list_clear(ids);
     free(ids->v);
@@ -71,6 +92,9 @@ void id_list_free(stop_list *ids) {
 
 
 
+/// @brief Every tool-call id the conversation names (tool results' ids and assistant calls' ids), each once.
+/// @param msgs  the conversation (NULL: nothing)
+/// @param ids   receives the ids (appended, owned)
 void collect_tool_call_ids(const chat_msgs *msgs, stop_list *ids) {
     if (!msgs || !ids) return;
     for (int i = 0; i < msgs->len; i++) {
@@ -87,6 +111,10 @@ void collect_tool_call_ids(const chat_msgs *msgs, stop_list *ids) {
 
 
 
+/// @brief `dir` + "/" + `name`.
+/// @param dir  the directory
+/// @param name  the file name
+/// @return malloc'd path
 char *path_join(const char *dir, const char *name) {
     return pulsar_kvtext_path_join(dir, name);
 }
@@ -255,11 +283,21 @@ int server::kv_tool_map_load_from_pos(FILE *fp, const stop_list *wanted) {
  * the stretch it still shares.  A restore loads the deepest chain the request's
  * bytes reproduce, ending live at its last checkpoint. */
 
+/// @brief The segment store's log callback: one KVCACHE line.
+/// @param ud   unused
+/// @param msg  the message
 static void kv_seg_log(void *ud, const char *msg) {
     (void)ud;
     server_log(PULSAR_LOG_KVCACHE, "pulsar-server: kv cache %s", msg);
 }
 
+/// @brief Open the segment store at `dir` and enable the disk cache.
+/// @param kc         the cache (zeroed first)
+/// @param dir        the store directory (copied)
+/// @param budget_mb  the store's byte budget, MiB
+/// @param identity   the model identity segments are keyed to (a different model's segments do not load)
+/// @param opt        the checkpoint policy
+/// @return false when the store would not open (the cache stays disabled)
 bool kv_cache_open(kv_disk_cache *kc, const char *dir, uint64_t budget_mb, uint32_t identity,
                    kv_cache_options opt) {
     memset(kc, 0, sizeof(*kc));
@@ -271,25 +309,50 @@ bool kv_cache_open(kv_disk_cache *kc, const char *dir, uint64_t budget_mb, uint3
     return true;
 }
 
+/// @brief Close the store, free the directory and zero the cache.
+/// @param kc  the cache
 void kv_cache_close(kv_disk_cache *kc) {
     pulsar_segstore_close(kc->st);
     free(kc->dir);
     memset(kc, 0, sizeof(*kc));
 }
 
+/// @brief The tokens' text, concatenated (the chain keys on it).
+/// @param engine   the engine
+/// @param tokens   the tokens
+/// @param out_len  receives the text's length in bytes
+/// @return malloc'd text
 char *render_tokens_text(pulsar_engine *engine, const pulsar_tokens *tokens, size_t *out_len) {
     return pulsar_kvtext_render_tokens_text(engine, tokens, out_len);
 }
 
+/// @brief Whether `prefix` is a byte prefix of `text`.
+/// @param text  the text
+/// @param text_len  bytes at `text`
+/// @param prefix  the prefix
+/// @param prefix_len  bytes at `prefix`
+/// @return true on a match
 static bool byte_prefix_match(const char *text, size_t text_len,
                               const char *prefix, size_t prefix_len) {
     return pulsar_kvtext_byte_prefix_match(text, text_len, prefix, prefix_len);
 }
 
+/// @brief Replace `dst` with the first `n` tokens of `src`.
+/// @param dst  the destination
+/// @param src  the source
+/// @param n  tokens to copy
 void tokens_copy_prefix(pulsar_tokens *dst, const pulsar_tokens *src, int n) {
     pulsar_kvtext_tokens_copy_prefix(dst, src, n);
 }
 
+/// @brief The prompt to sync: `exact_prefix`'s tokens as stored, then `suffix_text` tokenized on its own (never
+///        re-tokenized across the boundary).
+/// @param engine        the engine (its tokenizer)
+/// @param exact_prefix  the restored tokens
+/// @param suffix_text   the text past the prefix
+/// @param spans         the suffix's text spans
+/// @param n_spans       spans in `spans`
+/// @param out           receives the prompt
 void build_prompt_from_exact_prefix_and_text_suffix(
         pulsar_engine *engine,
         const pulsar_tokens *exact_prefix,
@@ -335,6 +398,11 @@ int build_live_continuation_prompt(pulsar_engine *engine, const pulsar_tokens *l
 /* The stable rendered chat prefix is everything before the user message that
  * asks this specific task.  Some clients put stable user-role scaffolding
  * first, so the anchor is the last user marker before the first assistant. */
+/// @param kc      the cache (its min_tokens)
+/// @param prompt  the prompt tokens
+/// @param m       the template's turn markers (none: -1)
+/// @return the position of the last user marker before the first assistant marker, -1 when there is none or it
+///         sits below min_tokens
 int kv_cache_chat_anchor_pos(const kv_disk_cache *kc, const pulsar_tokens *prompt, const pulsar_turn_markers *m) {
     if (!prompt || !m || m->n_user <= 0 || m->n_assistant <= 0) return -1;
     int last_user = -1;
@@ -349,6 +417,9 @@ int kv_cache_chat_anchor_pos(const kv_disk_cache *kc, const pulsar_tokens *promp
 /* Back the anchor cut off below harness-injected preamble jitter and land it on
  * an alignment boundary (a multiple of the resume grid, so the cold prefill that
  * ends there leaves a grid checkpoint).  0 when nothing useful survives. */
+/// @param kc      the cache (its min_tokens, sys_prefix_margin, sys_prefix_align)
+/// @param anchor  the chat anchor (kv_cache_chat_anchor_pos), tokens
+/// @return the cut position in tokens, 0 for none
 int kv_cache_sys_prefix_cut(const kv_disk_cache *kc, int anchor) {
     if (anchor < kc->opt.min_tokens) return 0;
     int cut = anchor - kc->opt.sys_prefix_margin;
@@ -441,9 +512,16 @@ kv_restore_verdict kv_restore_decide(uint32_t gained, bool measured, double tran
     return transfer_ms < 0.5 * prefill_ms ? KV_RESTORE_LOAD : KV_RESTORE_RECOMPUTE;
 }
 
+/// kv_read_cost's per-load decay: each load weighs 1/8.
 #define KV_READ_DECAY (1.0 - 1.0 / 8.0)
+/// Bytes per GiB, the unit of kv_read_cost's sums.
 #define KV_GIB (1024.0 * 1024.0 * 1024.0)
 
+/// @brief Fold one chain load into the read cost and re-solve both rates (ridge least squares, no intercept).
+/// @param c       the cost (kv_restore_meter::read; caller holds server::mu)
+/// @param bytes   bytes the load read (0: ignored)
+/// @param cached  of which in the page cache (clamped to `bytes`)
+/// @param ms      the load's wall time, ms (<= 0: ignored)
 void kv_read_cost_observe(kv_read_cost *c, uint64_t bytes, uint64_t cached, double ms) {
     if (!(ms > 0.0) || bytes == 0u) return;
     if (cached > bytes) cached = bytes;
@@ -572,6 +650,11 @@ kv_restore_verdict server::kv_cache_price(const kv_chain_hit *hit, int base) {
  * within `target_ms` -- one prefill chunk's priced time at the depth the restore stands at, so a restoring job holds
  * the worker no longer than a prefilling one does -- and at least one.  Exactly one while either is unknown: the read
  * meter has measured no load (pred < 0) or the prefill fit has no price (target <= 0). */
+/// @param pred_ms    each segment's predicted read, ms (< 0: unmeasured)
+/// @param next       the first segment not yet read
+/// @param n          segments in the chain
+/// @param target_ms  the slice's time budget, ms (<= 0: unpriced)
+/// @return segments to read (0 when none remain)
 static int server_restore_slice_segments(const double *pred_ms, int next, int n, double target_ms) {
     if (next >= n) return 0;
     if (!(target_ms > 0.0) || !(pred_ms[next] >= 0.0)) return 1;

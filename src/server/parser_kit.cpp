@@ -32,6 +32,9 @@ void *parser_kit_start(out_parser *p) {
 
 /* The forced-call seed (g->text's first bytes) read before the model's first token: the family's "thinking
  * skipped, a call opened", text-free -- a named seed announces its call, which the first feed sends. */
+/// server_output_parser_ops::seed: read the forced-call seed; dies if it is anything but an open call.
+/// @param st  the kit state (a kit_gen, from parser_kit_start)
+/// @param g   the attempt (g->text holds the seed)
 void parser_kit_seed(void *st, gen_state *g) {
     kit_gen *q = (kit_gen *)st;
     q->ev.clear();
@@ -42,9 +45,14 @@ void parser_kit_seed(void *st, gen_state *g) {
     q->pending = q->ev;
 }
 
+/// server_output_parser_ops::destroy: free the kit state.
+/// @param st  the kit state (a kit_gen, from parser_kit_start)
 void parser_kit_destroy(void *st) { delete (kit_gen *)st; }
 
 /* the greedy region (L284 P6): a call's structure; its payload is sampled */
+/// server_output_parser_ops::in_tool_call: inside a call's structure and not its payload.
+/// @param st  the kit state, or a probe (parser_kit_probe_new)
+/// @return true when the next draw is greedy
 bool parser_kit_in_tool_call(const void *st, const gen_state *) {
     const out_parser &p = *((const kit_gen *)st)->parser;
     return p.in_tool_call() && !p.in_payload();
@@ -52,6 +60,9 @@ bool parser_kit_in_tool_call(const void *st, const gen_state *) {
 
 /* L296 toolsample: the probe is a kit_gen around a copy of the parser's reading, at the same fed offset; it is fed
  * what parser_kit_feed would feed it and read only by parser_kit_in_tool_call (no sink, no calls, events dropped). */
+/// server_output_parser_ops::probe_new.
+/// @param st  the kit state (a kit_gen, from parser_kit_start)
+/// @return a new probe (owned by the caller; parser_kit_probe_free)
 void *parser_kit_probe_new(const void *st) {
     const kit_gen *q = (const kit_gen *)st;
     kit_gen *p = new kit_gen();
@@ -60,6 +71,10 @@ void *parser_kit_probe_new(const void *st) {
     return p;
 }
 
+/// server_output_parser_ops::probe_feed: feed the probe text[fed, upto).
+/// @param probe  the probe
+/// @param text   the generated text with the round's tokens so far
+/// @param upto   bytes the stop-string scan released (nothing is fed at or below what the probe already read)
 void parser_kit_probe_feed(void *probe, const gen_state *, const char *text, size_t, size_t upto) {
     kit_gen *p = (kit_gen *)probe;
     if (upto <= p->fed) return;
@@ -68,10 +83,18 @@ void parser_kit_probe_feed(void *probe, const gen_state *, const char *text, siz
     p->fed = upto;
 }
 
+/// server_output_parser_ops::probe_free.
+/// @param probe  the probe (parser_kit_probe_new)
 void parser_kit_probe_free(void *probe) { delete (kit_gen *)probe; }
 
+/// server_output_parser_ops::turn_complete: a kit turn ends only at the stop token.
+/// @return false, always
 bool parser_kit_turn_complete(const void *, const gen_state *) { return false; }
 
+/// server_output_parser_ops::tool_progress (diagnostics).
+/// @param st  the kit state (a kit_gen, from parser_kit_start)
+/// @param opened  set when a call has been read or one is open
+/// @param closed  set when a call has closed (one beyond the open one)
 void parser_kit_tool_progress(const void *st, bool *opened, bool *closed) {
     const kit_gen *q = (const kit_gen *)st;
     *opened = q->calls.len > 0 || q->parser->in_tool_call();
@@ -80,6 +103,9 @@ void parser_kit_tool_progress(const void *st, bool *opened, bool *closed) {
 
 /* The announced open call's close on the stream: the argument object as far as it was sent, then the
  * protocol's end of the call. */
+/// @param q  the kit state with an announced open call (wire_open)
+/// @param g  the attempt (its sink with tool_ops)
+/// @return false when a client write failed
 static bool kit_close_open_call(kit_gen *q, gen_state *g) {
     chat_sink *k = &g->sink;
     return k->tool_ops->args(k, q->wire_open, q->open_args ? "}" : "{}", q->open_args ? 1 : 2) &&
@@ -89,6 +115,13 @@ static bool kit_close_open_call(kit_gen *q, gen_state *g) {
 /* Feed the parser g->text[fed, upto) and, when `final`, end the turn; then turn its events into the
  * response.  Reasoning and content go out as deltas when streaming (the parser keeps both for the
  * final message either way).  false = a client write failed. */
+/// server_output_parser_ops::feed.
+/// @param st  the kit state (a kit_gen, from parser_kit_start)
+/// @param s      the server (call ids, the trace)
+/// @param g      the attempt
+/// @param upto   bytes of g->text released by the stop-string scan
+/// @param final  end the turn after feeding
+/// @return false when a client write failed (sticky: later calls after the finish return it)
 bool parser_kit_feed(void *st, server *s, gen_state *g, size_t upto, bool final) {
     kit_gen *q = (kit_gen *)st;
     job *j = g->j;
@@ -178,6 +211,13 @@ bool parser_kit_feed(void *st, server *s, gen_state *g, size_t upto, bool final)
  * was cut at the match) and the end of the turn; the parser holds reasoning, content and the completed
  * calls in the family's normal form, and the calls' sampled bytes become their tool memory; then the
  * finish every family shares (parser_finish_turn), the broken calls already logged as they streamed. */
+/// server_output_parser_ops::finish.
+/// @param st  the kit state (a kit_gen, from parser_kit_start)
+/// @param s    the server
+/// @param sl   the slot (the retry appends to its live session)
+/// @param g    the attempt
+/// @param out  receives the turn's reading (content, reasoning, calls owned by the caller)
+/// @return false when a client write failed
 bool parser_kit_finish(void *st, server *s, session_slot *sl, gen_state *g, server_turn *out) {
     kit_gen *q = (kit_gen *)st;
     job *j = g->j;

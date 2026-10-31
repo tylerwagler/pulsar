@@ -10,6 +10,8 @@
 
 
 
+/// Free a request's body and zero it.
+/// @param r  the request read by read_http_request
 void http_request_free(http_request *r) {
     free(r->body);
     memset(r, 0, sizeof(*r));
@@ -17,6 +19,10 @@ void http_request_free(http_request *r) {
 
 
 
+/// Find the end of the request head: CRLFCRLF, else a bare LF LF.
+/// @param p  the bytes read so far
+/// @param n  bytes at `p`
+/// @return the offset just past the blank line, or -1 when the head is not complete
 static ssize_t header_end(const char *p, size_t n) {
     for (size_t i = 3; i < n; i++) {
         if (p[i - 3] == '\r' && p[i - 2] == '\n' && p[i - 1] == '\r' && p[i] == '\n') return (ssize_t)(i + 1);
@@ -33,6 +39,10 @@ static ssize_t header_end(const char *p, size_t n) {
  * Content-Length, a non-numeric value, or any Transfer-Encoding header: each
  * connection is Connection: close today so smuggling is only latent, but the
  * framing must stay unambiguous if keep-alive is ever added. */
+/// The body length from the request head; rejects ambiguous framing.
+/// @param h  the request head
+/// @param n  bytes at `h`
+/// @return the body length in bytes (0 when no Content-Length), or -1 to reject
 static long content_length(const char *h, size_t n) {
     const char *p = h, *end = h + n;
     long clen = 0;
@@ -121,6 +131,12 @@ fail:
 
 
 
+/// Append one /v1/models item (vLLM / OpenRouter shape: id, root, name, context, top_provider, parameters).
+/// @param b               the JSON being built
+/// @param id              the model id (also "root")
+/// @param name            the display name
+/// @param ctx             the context length, tokens
+/// @param default_tokens  the generation cap when a request sets none; max_completion_tokens = min(it, ctx)
 void append_model_json_values(buf *b, const char *id, const char *name,
                                      int ctx, int default_tokens) {
     const int max_completion = default_tokens < ctx ? default_tokens : ctx;
@@ -163,6 +179,10 @@ void append_model_json_values(buf *b, const char *id, const char *name,
 
 
 
+/// append_model_json_values for the loaded model (its served name, the session's context, default_tokens).
+/// @param b   the JSON being built
+/// @param s   the server
+/// @param id  the model id to advertise
 static void append_model_json(buf *b, const server *s, const char *id) {
     append_model_json_values(b,
                              id,
@@ -208,6 +228,9 @@ bool server::send_liveness(int fd) {
 }
 
 /* One rank's fixed /health fields, left open for the live `connected`. */
+/// One rank's fixed /health tp fields as a JSON object left open for the live `connected`.
+/// @param n  the rank's node record
+/// @return the fragment (malloc'd, without its closing brace), or NULL on allocation failure
 static char *tp_rank_fragment(const pulsar_tp_node *n) {
     buf b = {0};
     buf_printf(&b, "{\"rank\":%d,\"host\":", n->rank);
@@ -372,6 +395,7 @@ bool server::send_root(int fd) {
  * operator cares to see) and GEN_FINISH/GEN_DONE fold into "finish". Every
  * slot reports all five series with a 0/1 value — the Prometheus state-set
  * convention — so the series set is stable and label values never churn. */
+/// The /metrics slot-phase label set, indexed by slot_phase_index().
 static const char *const slot_phase_names[] = {
     "idle", "prefill_cold", "prefill_main", "decode", "finish", "restore",
 };
@@ -379,6 +403,9 @@ enum { SLOT_PHASE_COUNT = 6 };
 
 /* Map a published m_slot_phase (gen_phase + 1; 0 = no bound job) onto that
  * label set. */
+/// Map a published m_slot_phase (gen_phase + 1; 0 = no job) to its label index.
+/// @param phase_plus_one  a published server::m_slot_phase value
+/// @return an index into slot_phase_names
 static int slot_phase_index(int phase_plus_one) {
     switch (phase_plus_one - 1) {
     case GEN_RESTORE:      return 5;   /* L330: a disk chain restoring, a slice per worker turn */
@@ -397,9 +424,11 @@ static int slot_phase_index(int phase_plus_one) {
  * observer uses and the ones the scrape advertises cannot drift apart.
  * The `extern` is load-bearing: a bare `const` array at namespace scope has
  * internal linkage in C++, which would give every TU its own copy. */
+/// Latency histogram bucket upper bounds, seconds (TTFT, TPOT, end-to-end).
 extern const double pulsar_hist_seconds_bounds[PULSAR_HIST_BUCKETS] = {
     0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 20.0, 40.0, 80.0, 160.0,
 };
+/// Token-count histogram bucket upper bounds, tokens.
 extern const double pulsar_hist_tokens_bounds[PULSAR_HIST_BUCKETS] = {
     16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072,
 };
@@ -407,6 +436,12 @@ extern const double pulsar_hist_tokens_bounds[PULSAR_HIST_BUCKETS] = {
 /* Emit one histogram in Prometheus text form. Buckets are stored
  * non-cumulatively, so they are accumulated on the way out; +Inf is the total
  * count, which also covers observations above the last bound. */
+/// Emit one histogram in Prometheus text form (cumulative buckets, +Inf, sum, count).
+/// @param b       the exposition being built
+/// @param name    the metric's name
+/// @param help    its HELP text
+/// @param h       the histogram (non-cumulative buckets)
+/// @param bounds  its bucket upper bounds (PULSAR_HIST_BUCKETS of them)
 static void emit_histogram(buf *b, const char *name, const char *help,
                            const pulsar_hist *h, const double *bounds) {
     buf_printf(b, "# HELP %s %s\n", name, help);
@@ -425,6 +460,7 @@ static void emit_histogram(buf *b, const char *name, const char *help,
 /* Label for each provisioning refusal, indexed by provision_refusal. Only the
  * first two are relieved by eviction; mem_floor means the box itself is tight,
  * which is a different operator action entirely. */
+/// The /metrics label per provision_refusal.
 static const char *const refusal_names[PROVISION_REFUSAL_COUNT] = {
     "none", "pool_full", "ledger_full", "mem_floor", "create_fail", "kv_touched",
 };
@@ -1078,6 +1114,15 @@ bool server::send_metrics(int fd) {
  * replaces, so the client fetches /metrics itself when the generation moves —
  * once per publish instead of twenty times per publish. */
 
+/// The /metrics/stream loop: one "event: metrics" frame per new generation, an SSE keepalive comment after
+/// `keepalive_ms` without one.  Client thread; waits on `cv` under `mu`, writes with `mu` released.
+/// @param fd            the client socket
+/// @param mu            the mutex guarding `generation` and `stop` (server::mu)
+/// @param cv            broadcast on every publish and at shutdown (server::stream_cv)
+/// @param generation    the publish counter (server::metrics_generation)
+/// @param stop          set at shutdown (server::stopping)
+/// @param keepalive_ms  the idle interval before a keepalive, ms
+/// @return true when `stop` ended the stream, false when a write failed (the client went away)
 bool metrics_stream_pump(int fd, pthread_mutex_t *mu, pthread_cond_t *cv,
                          const unsigned long long *generation, const bool *stop,
                          int keepalive_ms) {
@@ -1191,6 +1236,10 @@ void server::client_done() {
 
 
 
+/// A client connection thread: read one request, route it (health / metrics / models answered here; generation
+/// requests parsed, enqueued for the worker and waited on), close the socket, client_done().
+/// @param arg  a malloc'd client_arg (freed here)
+/// @return NULL
 void *client_main(void *arg) {
     client_arg *ca = (client_arg *)arg;
     server *s = ca->srv;
@@ -1385,6 +1434,10 @@ done:
 
 
 
+/// Open the listening socket (IPv4; "localhost" means 127.0.0.1; SO_REUSEADDR, backlog 128).
+/// @param host  a dotted IPv4 address or "localhost"
+/// @param port  the TCP port
+/// @return the socket, or -1 with errno set
 int listen_on(const char *host, int port) {
     int fd = socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) return -1;
@@ -1414,6 +1467,8 @@ int listen_on(const char *host, int port) {
 
 
 
+/// Bound a client socket's blocking reads and writes by PULSAR_SERVER_IO_TIMEOUT_SEC.
+/// @param fd  the client socket
 void configure_client_socket(int fd) {
     struct timeval tv;
     tv.tv_sec = PULSAR_SERVER_IO_TIMEOUT_SEC;
@@ -1424,6 +1479,8 @@ void configure_client_socket(int fd) {
 
 
 
+/// Make a queued request's socket non-blocking, so the worker's writes never block on a slow client.
+/// @param fd  the client socket
 void set_client_socket_nonblocking(int fd) {
     /* The inference worker writes streaming responses itself.  Once a request is
      * queued, a blocked socket would block every other request too, so slow
