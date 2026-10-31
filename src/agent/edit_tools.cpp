@@ -626,11 +626,34 @@ static void test_agent_session_file_round_trip(void) {
     rmdir(dir);
 }
 
+/* parse_u64 (pulsar_argparse.h, the --seed parser): a value it refuses exits 2, so each refusal runs in a child */
+static int test_parse_u64_exit(const char *s) {
+    fflush(NULL);
+    const pid_t pid = fork();
+    if (pid == 0) {
+        if (!freopen("/dev/null", "w", stderr)) _exit(99);
+        (void)parse_u64(s, "--seed");
+        _exit(0);
+    }
+    int status = 0;
+    if (pid < 0 || waitpid(pid, &status, 0) != pid || !WIFEXITED(status)) return -1;
+    return WEXITSTATUS(status);
+}
+
+static void test_parse_u64_refuses_sign_and_range(void) {
+    AGENT_TEST_ASSERT(parse_u64("7", "--seed") == 7u);
+    AGENT_TEST_ASSERT(parse_u64("18446744073709551615", "--seed") == UINT64_MAX);
+    static const char *const bad_values[] = {"-1", " -1", "-0", "18446744073709551616", "0", "", "1x"};
+    for (const char *bad : bad_values)
+        AGENT_TEST_ASSERT(test_parse_u64_exit(bad) == 2);
+}
+
 static void pulsar_agent_unit_tests_run(void) {
     test_agent_edit_upto_tail_newline_is_not_part_of_anchor();
     test_agent_edit_upto_requires_tail_after_newline_strip();
     test_agent_dsml_parser_recognises_every_syntax();
     test_agent_session_file_round_trip();
+    test_parse_u64_refuses_sign_and_range();
 }
 
 

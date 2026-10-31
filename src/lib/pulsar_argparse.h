@@ -16,6 +16,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 /** The value after option `opt`: advances *i past it, or exits 2 when argv ends first.
  *  @param i    in: the option's index; out: the value's index
@@ -76,14 +77,16 @@ static inline int parse_nonnegative_int(const char *s, const char *opt) {
     return (int)v;
 }
 
-/* Strictly positive uint64. */
+/* Strictly positive uint64.  strtoull negates a '-' value (wrapping "-1" to 2^64-1) and saturates past 2^64-1 with
+ * ERANGE: both refuse. */
 /// @param s   the value's text
 /// @param opt the option's name, for the message
-/// @return the nonzero value; exits 2 on an empty, non-numeric or zero value
+/// @return the nonzero value; exits 2 on an empty, non-numeric, signed-negative, out-of-range or zero value
 static inline uint64_t parse_u64(const char *s, const char *opt) {
     char *end = NULL;
+    errno = 0;
     unsigned long long v = strtoull(s, &end, 10);
-    if (s[0] == '\0' || *end != '\0' || v == 0) {
+    if (s[0] == '\0' || *end != '\0' || v == 0 || errno == ERANGE || strchr(s, '-')) {
         fprintf(stderr, "%s: invalid value for %s: %s\n", program_invocation_short_name, opt, s);
         exit(2);
     }
