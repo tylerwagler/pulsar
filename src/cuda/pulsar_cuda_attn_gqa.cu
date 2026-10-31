@@ -763,7 +763,7 @@ uint32_t gqa_max_chunks(const pulsar_gqa_layer *L, uint32_t max_ctx) {
 gqa_ws gqa_ws_layout(uint8_t *base, const pulsar_gqa_layer *L, uint32_t n_rows, uint32_t max_ctx) {
     gqa_ws w{};
     w.max_chunks = gqa_max_chunks(L, max_ctx);
-    const uint64_t tb = (uint64_t)L->n_kv * 2u * L->head_dim * (L->kv_fmt == PULSAR_GQA_KV_E4M3 ? 1u : 2u);
+    const uint64_t tb = pulsar_gqa_kv_token_bytes(L);   /* the one authority for a token's K + V bytes (L335) */
     const uint64_t part_rows = n_rows < GQA_FOLD_ROWS ? n_rows : 0u;   /* partials: the split schedule only */
     uint64_t off = 0;
     auto take = [&](uint64_t bytes) { uint8_t *p = base ? base + off : nullptr; off += gqa_up(bytes); return p; };
