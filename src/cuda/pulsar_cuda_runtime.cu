@@ -1389,7 +1389,11 @@ int pulsar_gpu_init(void) {
     int dev = 0;
     if (!cuda_ok(cudaSetDevice(dev), "set device")) return 0;
     cudaDeviceProp prop;
-    if (cudaGetDeviceProperties(&prop, dev) == cudaSuccess) {
+    /* L335: the device checks below are the gate every lane relies on; a failed property query used to skip them
+     * all and report the backend ready.  It refuses instead. */
+    if (!cuda_ok(cudaGetDeviceProperties(&prop, dev), "device properties (the arch and sm_75 checks need them)"))
+        return 0;
+    {
         fprintf(stderr, "pulsar: CUDA backend initialized on %s (sm_%d%d)\n",
                 prop.name, prop.major, prop.minor);
         if (!cuda_tu_archs_ok(&prop)) return 0;
