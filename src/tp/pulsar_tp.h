@@ -494,7 +494,9 @@ int pulsar_tp_gate_exchange(pulsar_tp *tp, uint32_t layer, uint32_t gate,
                             uint64_t seq);
 
 /* The ROW LANE (L241 4g-2): the pair's decode and verify exchanges, fully
- * asynchronous.  An exchange swaps `rows` (1..PULSAR_TP_BATCH_MAX_ROWS)
+ * asynchronous.  PAIR-ONLY (n_ranks == 2): an exchange swaps rows with the ONE
+ * peer.  An n > 2 group brings it up OFF (the bring-up line says so) and
+ * pulsar_tp_row_lane_begin refuses by name.  An exchange swaps `rows` (1..PULSAR_TP_BATCH_MAX_ROWS)
  * vectors of vec_bytes with the peer and never makes the engine thread wait:
  *
  *  - the engine thread calls pulsar_tp_row_lane_begin, which numbers the
@@ -566,7 +568,9 @@ int pulsar_tp_row_lane_begin(pulsar_tp *tp, uint32_t rows, uint64_t *first_msg, 
 /// @return 1 when every enqueued exchange completed cleanly, 0 otherwise
 int pulsar_tp_row_lane_check(pulsar_tp *tp);
 
-/* THE BULK LANE (v14): prefill-sized exchanges on the row lane's machinery.
+/* THE BULK LANE (v14): prefill-sized exchanges on the row lane's machinery,
+ * so PAIR-ONLY like it (n_ranks == 2): an n > 2 group brings up no bulk QP and
+ * pulsar_tp_bulk_begin refuses by name.
  * The engine attaches a caller-owned, host-pinned, GPU-mapped buffer BEFORE
  * pulsar_tp_attach_slab (pulsar_tp_set_bulk); attach registers it and brings up
  * a second UC QP whose receive queue holds only zero-length imm receives, so

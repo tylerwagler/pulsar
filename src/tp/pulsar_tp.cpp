@@ -3497,6 +3497,11 @@ void pulsar_tp_bulk_layout(const pulsar_tp *tp, pulsar_tp_bulk_layout_t *out) {
 }
 
 int pulsar_tp_bulk_begin(pulsar_tp *tp, uint64_t bytes, uint64_t *exch, uint32_t *buf) {
+    if (tp && tp->n_ranks != 2) {
+        fprintf(stderr, "pulsar-tp: bulk lane refused: a %d-rank group (the lane is pair-only, n_ranks 2)\n",
+                tp->n_ranks);
+        return 0;
+    }
     if (!pulsar_tp_bulk_lane(tp) || bytes == 0 || bytes > tp->bulk_cap || !exch || !buf) {
         fprintf(stderr, "pulsar-tp: bulk lane refused (%llu bytes, cap %llu; pair+rdma+bulk buffer "
                         "required) -- the caller must pick the lane\n",
@@ -3542,6 +3547,11 @@ void pulsar_tp_row_lane_layout(const pulsar_tp *tp, pulsar_tp_row_lane_layout_t 
 
 
 int pulsar_tp_row_lane_begin(pulsar_tp *tp, uint32_t rows, uint64_t *first_msg, uint64_t *exch) {
+    if (tp && tp->n_ranks != 2) {
+        fprintf(stderr, "pulsar-tp: row lane refused: a %d-rank group (the lane is pair-only, n_ranks 2)\n",
+                tp->n_ranks);
+        return 0;
+    }
     if (!pulsar_tp_row_lane(tp) || !tp->proxy_started || rows == 0 ||
         rows > PULSAR_TP_BATCH_MAX_ROWS || !first_msg || !exch) {
         fprintf(stderr, "pulsar-tp: row lane refused (%u rows; pair+rdma+slab+proxy required, "

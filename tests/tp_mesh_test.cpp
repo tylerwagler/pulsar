@@ -404,6 +404,18 @@ static int run_mesh_rank(int rank, int n, const int *ports) {
         }
     }
 
+    /* The row and bulk lanes are pair-only: at n > 2 numbering an exchange refuses (by name, on stderr) and
+     * hands out no exchange id. */
+    if (n >= 3) {
+        uint64_t first = 0, exch = 0;
+        uint32_t buf = 7;
+        CHECK(!pulsar_tp_row_lane(tp) && !pulsar_tp_bulk_lane(tp), "rank %d: a lane is up at n=%d", rank, n);
+        CHECK(pulsar_tp_row_lane_begin(tp, 1, &first, &exch) == 0 && exch == 0,
+              "rank %d: the row lane numbered an exchange at n=%d", rank, n);
+        CHECK(pulsar_tp_bulk_begin(tp, 64, &exch, &buf) == 0 && exch == 0 && buf == 7,
+              "rank %d: the bulk lane numbered an exchange at n=%d", rank, n);
+    }
+
     /* The leader's verify DECISION (pulsar_tp_verify_leader_round's direction):
      * rank 0 broadcasts VERIFY_COMMIT and every worker reads exactly the
      * leader's.  Before L335 the leader wrote only to its primary link (rank 1)
