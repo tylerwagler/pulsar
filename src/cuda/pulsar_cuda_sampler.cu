@@ -2546,11 +2546,19 @@ struct walk_args {
     pulsar_gpu_spec_walk_out *out;
 };
 
+/// @param n_runs the launch's runs (1 .. PULSAR_GPU_SAMPLE_ROWS_MAX)
+/// @return spec_walk_kernel's block width: one thread a run, rounded up to a warp
+static constexpr uint32_t spec_walk_threads(uint32_t n_runs) {
+    return (n_runs + 31u) / 32u * 32u;
+}
+static_assert(spec_walk_threads(PULSAR_GPU_SAMPLE_ROWS_MAX) <= 1024u, "spec walk: one block holds every run");
+
 /* One thread a run: rows row0 .. row0 + k are the target's draws after the base and after each draft; the walk
  * keeps drafts while the row's draw IS the draft, and the first draw that is not -- or row k's on a full accept --
  * is the carry.  A refused row stops the walk with its status. */
 /**
- * One thread a run walks its drafts against the target's draws.  Launched <<<1, 32>>>.
+ * One thread a run walks its drafts against the target's draws.  Launched <<<1, spec_walk_threads(n_runs)>>>: one
+ * block, n_runs rounded up to a warp (up to PULSAR_GPU_SAMPLE_ROWS_MAX runs, so two warps at the cap).
  * @param a the arguments
  */
 __global__ void spec_walk_kernel(const __grid_constant__ walk_args a) {
@@ -3031,7 +3039,7 @@ int pulsar_gpu_spec_walk(const pulsar_gpu_tensor *rows, uint64_t rows_offset_byt
     a.n_runs = n_runs;
     memcpy(a.run, runs, (size_t)n_runs * sizeof(*runs));
     a.out = (pulsar_gpu_spec_walk_out *)((char *)out->ptr + out_offset_bytes);
-    spec_walk_kernel<<<1, 32>>>(a);
+    spec_walk_kernel<<<1, spec_walk_threads(n_runs)>>>(a);
     return cuda_ok(cudaGetLastError(), "device spec walk");
 }
 
