@@ -11,6 +11,9 @@
  *    2. embed-sentinel  pulsar_gpu_embed_tokens_hc_tensor: an id in [0, n_vocab) copies its row into every carrier; an
  *                       image-slot sentinel id (>= n_vocab) writes a ZERO row (it used to read row 0 -- a real token's
  *                       embedding -- as a silent clamp).
+ *    3. indexer-topk    pulsar_gpu_indexer_topk_tensor, top-512 at n_comp 1500 / 3000 / 6000 / 8192 (the widths that
+ *                       took the shared-memory bitonic kernels when the cub sort's smem was refused): the one cub arm
+ *                       against the host order, selection for selection.
  *
  *  Prints one line per case and KERNEL CONTRACT GATE PASS / FAIL. */
 #include "pulsar_gpu.h"
@@ -22,6 +25,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <algorithm>
 #include <vector>
 
 /// Failures so far (every case adds to it; main returns it as the verdict).
@@ -162,6 +166,44 @@ static void case_embed_sentinel(void) {
     pulsar_gpu_tensor_free(out);
 }
 
+/* ---- 3. indexer-topk ------------------------------------------------------------------------------------------- */
+
+/// Case 3: top-512 of rows in each old width bucket (1025..2048, ..4096, ..8192) through the one cub arm, against the
+/// host order (score descending, index ascending on a tie).
+static void case_indexer_topk(void) {
+    static const uint32_t widths[] = {1500u, 3000u, 6000u, 8192u};
+    const uint32_t top_k = 512u, n_tok = 3u;
+    uint64_t s = 0x2545f4914f6cdd1dull;
+    for (uint32_t n_comp : widths) {
+        std::vector<float> sc((size_t)n_tok * n_comp);
+        for (float &v : sc) {
+            s = s * 6364136223846793005ull + 1442695040888963407ull;
+            v = (float)((int)((s >> 33) % 2001u) - 1000) * 0.125f;   /* coarse: plenty of exact ties */
+        }
+        pulsar_gpu_tensor *dsc = pulsar_gpu_tensor_alloc(sc.size() * sizeof(float));
+        pulsar_gpu_tensor *dsel = pulsar_gpu_tensor_alloc((uint64_t)n_tok * top_k * sizeof(uint32_t));
+        std::vector<uint32_t> got((size_t)n_tok * top_k);
+        if (!dsc || !dsel || !pulsar_gpu_tensor_write(dsc, 0, sc.data(), sc.size() * sizeof(float)) ||
+            !pulsar_gpu_indexer_topk_tensor(dsel, dsc, n_comp, n_tok, top_k) || !pulsar_gpu_synchronize() ||
+            !pulsar_gpu_tensor_read(dsel, 0, got.data(), got.size() * sizeof(uint32_t))) {
+            fail("indexer-topk: alloc / launch / read back");
+        } else {
+            int bad = 0;
+            for (uint32_t t = 0; t < n_tok; t++) {
+                const float *row = &sc[(size_t)t * n_comp];
+                std::vector<uint32_t> ord(n_comp);
+                for (uint32_t i = 0; i < n_comp; i++) ord[i] = i;
+                std::stable_sort(ord.begin(), ord.end(), [row](uint32_t a, uint32_t b) { return row[a] > row[b]; });
+                for (uint32_t i = 0; i < top_k; i++) bad += got[(size_t)t * top_k + i] != ord[i];
+            }
+            printf("  3 indexer-topk: n_comp %u, %u rows, %d selections off\n", n_comp, n_tok, bad);
+            if (bad) fail("indexer-topk: a selection differs from the host order");
+        }
+        pulsar_gpu_tensor_free(dsc);
+        pulsar_gpu_tensor_free(dsel);
+    }
+}
+
 /// Runs every case on device 0.
 /// @return 0 on PASS, 1 on FAIL
 int main(void) {
@@ -171,6 +213,7 @@ int main(void) {
     }
     case_mx_shared_exp();
     case_embed_sentinel();
+    case_indexer_topk();
     puts(g_fail ? "KERNEL CONTRACT GATE FAIL" : "KERNEL CONTRACT GATE PASS");
     return g_fail ? 1 : 0;
 }
