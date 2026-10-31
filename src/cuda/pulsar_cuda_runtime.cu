@@ -354,24 +354,27 @@ static const char *cuda_model_range_populate_device_copy(const void *model_map,
      * cudaMemcpy from a partially-registered host range fails with
      * cudaErrorInvalidValue -- that is what aborted model load on GB10 (L028).
      * That fallback is gone, so the hazard should be too, but staging is what
-     * the fd path has always done and it costs one pinned chunk. */
+     * the fd path has always done and it costs one pinned chunk.  The bounce is
+     * the ONE route: when it cannot be allocated the range refuses by name
+     * (L335: it used to copy straight from the mapping instead -- rule 1). */
     void *bounce = NULL;
     const uint64_t bounce_bytes = bytes < chunk ? bytes : chunk;
-    if (cudaMallocHost(&bounce, (size_t)bounce_bytes) != cudaSuccess) {
+    err = cudaMallocHost(&bounce, (size_t)bounce_bytes);
+    if (err != cudaSuccess) {
         (void)cudaGetLastError();
-        bounce = NULL;  /* fall back to the direct copy below */
+        fprintf(stderr, "pulsar: CUDA model range staging for %s: the %.2f MiB pinned bounce could not be allocated "
+                        "(%s) -- refusing\n", what ? what : "weights", (double)bounce_bytes / 1048576.0,
+                cudaGetErrorString(err));
+        (void)cudaFree(dev);
+        return NULL;
     }
 
     for (uint64_t done = 0; done < bytes; done += chunk) {
         uint64_t n = bytes - done < chunk ? bytes - done : chunk;
-        const void *csrc = src + done;
-        if (bounce) {
-            memcpy(bounce, src + done, (size_t)n);
-            csrc = bounce;
-        }
-        err = cudaMemcpy((char *)dev + done, csrc, (size_t)n, cudaMemcpyHostToDevice);
+        memcpy(bounce, src + done, (size_t)n);
+        err = cudaMemcpy((char *)dev + done, bounce, (size_t)n, cudaMemcpyHostToDevice);
         if (err != cudaSuccess) {
-            if (bounce) (void)cudaFreeHost(bounce);
+            (void)cudaFreeHost(bounce);
             fprintf(stderr, "pulsar: CUDA model range copy failed for %s at %.2f/%.2f MiB: %s\n",
                     what ? what : "weights",
                     (double)done / 1048576.0,
@@ -382,7 +385,7 @@ static const char *cuda_model_range_populate_device_copy(const void *model_map,
             return NULL;
         }
     }
-    if (bounce) (void)cudaFreeHost(bounce);
+    (void)cudaFreeHost(bounce);
     g_model_ranges.push_back({model_map, offset, bytes, (char *)dev, NULL, NULL, 0, 0, 0});
     g_model_range_by_offset[{model_map, offset}] = g_model_ranges.size() - 1u;
     g_model_range_bytes += bytes;
