@@ -290,16 +290,7 @@ static const pulsar_verify_curve *vc_ranked(const pulsar_engine *e) {
 /* The pick over survivals sorted descending: T, the drafts verified beside the n base rows, within cap_rows rows;
  * `extra_ms` is added to every candidate's round (a drafter step still to be paid).  *ratio = the best tokens/ms
  * (0 with no curve). */
-/// The definition of pulsar_engine_internal.h's pulsar_verify_curve_pick (its contract is there).
-/// @param c         the curve, or NULL
-/// @param n         base rows
-/// @param surv      m draft survivals, sorted descending
-/// @param m         drafts offered
-/// @param cap_rows  the row cap
-/// @param extra_ms  ms added to every candidate round
-/// @param ratio     out: the best tokens per ms
-/// @return drafts to verify.
-uint32_t pulsar_verify_curve_pick(const pulsar_verify_curve *c, uint32_t n, const float *surv, uint32_t m,
+uint32_t pulsar_verify_curve_pick(const struct pulsar_verify_curve *c, uint32_t n, const float *surv, uint32_t m,
                                   uint32_t cap_rows, double extra_ms, double *ratio) {
     *ratio = 0.0;
     if (c && cap_rows > c->rows_max) cap_rows = c->rows_max;
@@ -362,19 +353,7 @@ void pulsar_spec_keep_picked(const pulsar_session *s, uint32_t n_chains, spec_re
     for (uint32_t t = 0; t < T; t++) qs[c[t].q]->keep++;
 }
 
-/// The definition of pulsar_engine_internal.h's pulsar_verify_chain_pick (its contract is there).
-/// @param c          the curve
-/// @param step       the drafter's step cost
-/// @param cap        the row cap
-/// @param n_chains   chains
-/// @param drafted    survivals of the drafts already made
-/// @param n_drafted  entries in `drafted`
-/// @param run        each live chain's survival so far
-/// @param n_live     live chains
-/// @param spent_ms   drafting time already spent this round
-/// @param go         out: whether another lockstep step pays
-/// @return the drafts the verify should carry.
-uint32_t pulsar_verify_chain_pick(const pulsar_verify_curve *c, const pulsar_lane_cost *step, uint32_t cap,
+uint32_t pulsar_verify_chain_pick(const struct pulsar_verify_curve *c, const pulsar_lane_cost *step, uint32_t cap,
                                   uint32_t n_chains, const float *drafted, uint32_t n_drafted, const float *run,
                                   uint32_t n_live, double spent_ms, bool *go) {
     const uint32_t budget = cap > n_chains ? cap - n_chains : 0u;
