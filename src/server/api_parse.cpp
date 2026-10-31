@@ -164,7 +164,8 @@ static const char *chat_control_key(const char *key) {
 /// @param anthropic  the Messages API: check its server-tool entries first
 /// @param err        receives the reason on refusal
 /// @param errlen     size of `err`
-/// @return false when the array is malformed or names an unsupported tool
+/// @return false when the array is malformed, names an unsupported tool or holds a function schema that does not
+///         canonicalize (parse_tools_value)
 static bool take_tools(const char **p, chat_conversation *c, request *r, bool anthropic, char *err,
                        size_t errlen) {
     char *raw = NULL;
@@ -178,7 +179,7 @@ static bool take_tools(const char **p, chat_conversation *c, request *r, bool an
     free(c->deferred_tool_schemas);
     c->deferred_tool_schemas = NULL;
     const char *tp = raw;
-    if (!parse_tools_value(&tp, &c->tool_schemas, &r->tool_orders, &c->deferred_tool_schemas)) {
+    if (!parse_tools_value(&tp, &c->tool_schemas, &r->tool_orders, &c->deferred_tool_schemas, err, errlen)) {
         free(raw);
         return false;
     }
@@ -1224,7 +1225,7 @@ item_fail:
             char *schemas = NULL;
             if (!strcmp(t, "tool_search_output") && tools_json) {
                 const char *tools_p = tools_json;
-                if (!parse_tools_value(&tools_p, &schemas, orders)) {
+                if (!parse_tools_value(&tools_p, &schemas, orders, NULL, err, errlen)) {
                     free(schemas);
                     free(type);
                     free(role);

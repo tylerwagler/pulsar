@@ -1002,44 +1002,58 @@ static char *json_prompt_value(const char *json) {
     return buf_take(&out);
 }
 
-/// @brief An OpenAI tool entry's "function" object, canonicalized (json_prompt_value; the raw bytes when that
-/// fails).
-/// @param raw the tool entry's JSON
-/// @return malloc'd schema text, or NULL when the entry has no "function"
-static char *openai_function_schema_from_tool(const char *raw) {
+/// @brief An OpenAI tool entry's "function" object, canonicalized (json_prompt_value).
+/// @param raw     the tool entry's JSON
+/// @param index   the entry's position in the tools array (named in a refusal)
+/// @param out     receives the malloc'd schema text when the entry has a "function"
+/// @param err     receives the reason on a refusal (NULL: none written)
+/// @param errlen  size of `err`
+/// @return 1 with *out set; 0 when the entry has no "function" (another dialect's entry); -1 + err when its
+///         "function" does not canonicalize (L335: refused, never forwarded in the client's spelling -- rule 1)
+static int openai_function_schema_from_tool(const char *raw, int index, char **out, char *err, size_t errlen) {
+    *out = NULL;
     const char *p = raw;
     json_ws(&p);
-    if (*p != '{') return NULL;
+    if (*p != '{') return 0;
     p++;
     json_ws(&p);
     while (*p && *p != '}') {
         char *key = NULL;
         char *value = NULL;
-        if (!json_string(&p, &key)) return NULL;
+        if (!json_string(&p, &key)) return 0;
         json_ws(&p);
         if (*p != ':') {
             free(key);
-            return NULL;
+            return 0;
         }
         p++;
         if (!strcmp(key, "function")) {
             free(key);
-            if (!json_raw_value(&p, &value)) return NULL;
-            /* Canonicalize the schema's JSON spelling; fail OPEN to the
-             * verbatim bytes so a schema the mini-walker cannot round-trip
-             * still reaches the prompt the way it always did. */
+            if (!json_raw_value(&p, &value)) return 0;
+            /* The schema's JSON spelling is canonicalized (the prompt's tokens and the KV keys must not depend
+             * on the client's serializer); a schema the canonicalizer refuses is refused with the request. */
             char *prompt_value = json_prompt_value(value);
-            if (!prompt_value) return value;
+            if (!prompt_value) {
+                char *name = json_object_member_raw(value, "name");
+                if (err && errlen)
+                    snprintf(err, errlen, "tools[%d] (function %.48s): its schema does not canonicalize (a "
+                             "non-finite number, a bad string escape or nesting past %d)", index,
+                             name ? name : "without a name", JSON_MAX_NESTING);
+                free(name);
+                free(value);
+                return -1;
+            }
             free(value);
-            return prompt_value;
+            *out = prompt_value;
+            return 1;
         }
         free(key);
-        if (!json_skip_value(&p)) return NULL;
+        if (!json_skip_value(&p)) return 0;
         json_ws(&p);
         if (*p == ',') p++;
         json_ws(&p);
     }
-    return NULL;
+    return 0;
 }
 
 
@@ -1611,8 +1625,10 @@ static bool tool_entry_deferred(const char *raw) {
     return deferred;
 }
 
-bool parse_tools_value(const char **p, char **out, tool_schema_orders *orders, char **deferred) {
+bool parse_tools_value(const char **p, char **out, tool_schema_orders *orders, char **deferred, char *err,
+                       size_t errlen) {
     if (deferred) *deferred = NULL;
+    int index = 0;
     json_ws(p);
     if (json_lit(p, "null")) {
         *out = xstrdup("");
@@ -1627,6 +1643,7 @@ bool parse_tools_value(const char **p, char **out, tool_schema_orders *orders, c
     while (**p && **p != ']') {
         char *raw = NULL;
         if (!json_raw_value(p, &raw)) goto bad;
+        const int at = index++;   /* the entry's position in the client's array */
         if (anthropic_server_tool_entry(raw)) {
             /* Dropped from the schemas so the model never emits a call nobody
              * here can run; the router upstream performs web search. */
@@ -1642,7 +1659,12 @@ bool parse_tools_value(const char **p, char **out, tool_schema_orders *orders, c
         }
         /* L325: a deferred tool's line goes to `deferred` (the tools block never renders it); one write path below */
         buf &schemas = deferred && tool_entry_deferred(raw) ? deferred_schemas : all_schemas;
-        char *function = openai_function_schema_from_tool(raw);
+        char *function = NULL;
+        const int fn = openai_function_schema_from_tool(raw, at, &function, err, errlen);
+        if (fn < 0) {
+            free(raw);
+            goto bad;
+        }
         if (function) {
             append_raw_json_line(&schemas, function);
             tool_schema_orders_add_json(orders, function);
