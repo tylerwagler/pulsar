@@ -255,7 +255,12 @@ int pulsar_gpu_attn_pack_scatter_tensor(pulsar_gpu_tensor *raw_cache, const puls
         head_dim <= PULSAR_ATTN_PACK_NROT ||
         ((head_dim - PULSAR_ATTN_PACK_NROT) % PULSAR_KV4_NV_BLOCK) != 0 ||
         raw_cache->bytes < kv_banks * raw_cap * rowbytes ||
-        packed->bytes < (uint64_t)n_tokens * rowbytes) return 0;
+        packed->bytes < (uint64_t)n_tokens * rowbytes) {
+        /* L335: this refused silently */
+        fprintf(stderr, "pulsar: 0731 packed raw store: bad operands (rows %u, head_dim %u, raw_cap %u, banks %llu) -- "
+                        "refusing\n", n_tokens, head_dim, raw_cap, (unsigned long long)kv_banks);
+        return 0;
+    }
     if (n_tokens == 0) return 1;
     attn_pack_scatter_kernel<<<n_tokens, 64>>>((const uint8_t *)packed->ptr,
                                                (uint8_t *)raw_cache->ptr,

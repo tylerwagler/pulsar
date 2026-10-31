@@ -563,7 +563,14 @@ int pulsar_gpu_csa2_compressor_update_tensor(
     const uint32_t coff = pulsar_compress_coff(ratio);
     const uint32_t width = coff * head_dim;
     const uint64_t row_bytes = (uint64_t)width * sizeof(float);
-    if (kv_cur->bytes < row_bytes || latent->bytes < (uint64_t)head_dim * sizeof(float)) return 0;
+    if (kv_cur->bytes < row_bytes || latent->bytes < (uint64_t)head_dim * sizeof(float)) {
+        /* L335: this refused silently */
+        fprintf(stderr, "pulsar: csa2 compressor update: refusing -- short buffers (kv source %llu B < %llu, latent "
+                        "%llu B < %llu; ratio %u, head_dim %u)\n", (unsigned long long)kv_cur->bytes,
+                (unsigned long long)row_bytes, (unsigned long long)latent->bytes,
+                (unsigned long long)head_dim * sizeof(float), ratio, head_dim);
+        return 0;
+    }
     if (ratio == 1u) {
         *emitted = 1;
         return csa2_pool_norm_launch((float *)latent->ptr, latent_b, (const float *)kv_cur->ptr, NULL, NULL, NULL, norm_w,

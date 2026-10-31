@@ -36,6 +36,8 @@
  *                       forgotten), not the regrow's partial drop that kept the catalog.
  *   14. grow-under-capture a grow-on-demand cache (an expert address table's first build) refuses inside a graph
  *                       capture and leaves the capture valid; outside, the same table builds.
+ *   15. named-refusals the dspark HC mean over a short carrier and the 0731 packed scatter into a short ring refuse
+ *                       and SAY so on stderr (both returned 0 silently).
  *
  *  Prints one line per case and KERNEL CONTRACT GATE PASS / FAIL. */
 #include "pulsar_gpu.h"
@@ -702,6 +704,27 @@ static void case_grow_under_capture(void) {
     cudaFree(base);
 }
 
+/* ---- 15. named-refusals ---------------------------------------------------------------------------------------- */
+
+/// Case 15: refusals that used to return 0 silently now return 0 AND say why (the lines land in this gate's log):
+/// the dspark HC mean over a short carrier, and the 0731 packed scatter into a short ring.
+static void case_named_refusals(void) {
+    pulsar_gpu_tensor *a = pulsar_gpu_tensor_alloc(4096u), *b = pulsar_gpu_tensor_alloc(64u);
+    if (!a || !b) {
+        fail("named-refusals: alloc");
+    } else {
+        fprintf(stderr, "  15 named-refusals: two refusal lines follow\n");
+        const int r1 = pulsar_gpu_dspark_hc_mean_reduce_batch(a, b, 256u, 4u, 2u);   /* carrier 64 B: short */
+        const int r2 = pulsar_gpu_attn_pack_scatter_tensor(b, a, 8u, 0u, 2u, 512u, NULL, NULL, 1u);   /* ring short */
+        const bool synced = pulsar_gpu_synchronize() != 0;
+        printf("  15 named-refusals: dspark hc mean %s, 0731 scatter %s (each said why on stderr), device %s\n",
+               r1 ? "RAN" : "refused", r2 ? "RAN" : "refused", synced ? "clean" : "FAULT");
+        if (r1 || r2 || !synced) fail("named-refusals: a short operand ran");
+    }
+    pulsar_gpu_tensor_free(a);
+    pulsar_gpu_tensor_free(b);
+}
+
 /// Runs every case on device 0.
 /// @return 0 on PASS, 1 on FAIL
 int main(void) {
@@ -723,6 +746,7 @@ int main(void) {
     case_swiglu_nan();
     case_seg_reset_capture();
     case_grow_under_capture();
+    case_named_refusals();
     puts(g_fail ? "KERNEL CONTRACT GATE FAIL" : "KERNEL CONTRACT GATE PASS");
     return g_fail ? 1 : 0;
 }
