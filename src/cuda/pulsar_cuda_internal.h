@@ -530,6 +530,22 @@ __device__ __forceinline__ static uint16_t pulsar_f32_to_bf16_rne(float f) {
     return (uint16_t)((u + 0x7fffu + ((u >> 16) & 1u)) >> 16);
 }
 
+/* L335: a grow-on-demand device buffer kept across calls (a static or thread_local cache) must not grow inside a
+ * graph capture -- cudaFree / cudaMalloc are not capturable, and a free mid-capture invalidates it -- and a regrow
+ * outside one must drop the captured graphs that baked the old pointer (pulsar_gpu_seg_note_device_free, L119).
+ * The grow sites call this first. */
+/// @param what the buffer, for the refusal line
+/// @return true when the calling thread's stream is capturing: the caller refuses (said, once per site label)
+static inline bool cuda_grow_refused_under_capture(const char *what) {
+    cudaStreamCaptureStatus cs = cudaStreamCaptureStatusNone;
+    if (cudaStreamIsCapturing(cudaStreamPerThread, &cs) == cudaSuccess && cs == cudaStreamCaptureStatusNone)
+        return false;
+    (void)cudaGetLastError();
+    fprintf(stderr, "pulsar: %s must grow inside a graph capture (a free / malloc is not capturable) -- refusing\n",
+            what);
+    return true;
+}
+
 /* Stack sub-view that INHERITS the base's element size.  The hand-rolled
  * aggregate initialisers this replaces dropped it, which silently retyped a
  * narrowed buffer as f32 halfway through a split. */

@@ -296,6 +296,7 @@ int pulsar_gpu_dspark_markov_step_model(
      * stages its host id into a persistent 1-int slot -- one 4-byte H2D per
      * position, noise next to that path's per-position 517 KB qrow read. */
     static thread_local pulsar_gpu_tensor *staged_id = NULL;
+    if (!staged_id && cuda_grow_refused_under_capture("the dspark staged id")) return 0;   /* L335 */
     if (!staged_id) staged_id = pulsar_gpu_tensor_alloc(sizeof(int32_t));
     if (!staged_id) return 0;
     if (!pulsar_gpu_tensor_write(staged_id, 0, &prev_token, sizeof(int32_t)))
@@ -359,6 +360,9 @@ int pulsar_gpu_dspark_markov_step_model(
     };
     static thread_local DsparkReduceBufs rb = {};
     if (grid_dim > rb.cap) {
+        /* L335: refused inside a capture; a regrow drops the graphs that baked the old buffers */
+        if (cuda_grow_refused_under_capture("the dspark reduce buffers")) return 0;
+        if (rb.id || rb.val || rb.out) pulsar_gpu_seg_note_device_free();
         pulsar_gpu_tensor_free(rb.id);
         pulsar_gpu_tensor_free(rb.val);
         pulsar_gpu_tensor_free(rb.out);
@@ -941,6 +945,9 @@ static int dspark_markov_banks_launch(
     static thread_local DsparkReduceBufsBanks bb = {};
     const uint32_t need = n_banks * grid_dim;
     if (need > bb.cap) {
+        /* L335: refused inside a capture; a regrow drops the graphs that baked the old buffers */
+        if (cuda_grow_refused_under_capture("the dspark banked reduce buffers")) return 0;
+        if (bb.id || bb.val) pulsar_gpu_seg_note_device_free();
         pulsar_gpu_tensor_free(bb.id);
         pulsar_gpu_tensor_free(bb.val);
         const uint32_t cap = PULSAR_DSPARK_BANKS_MAX * grid_dim;

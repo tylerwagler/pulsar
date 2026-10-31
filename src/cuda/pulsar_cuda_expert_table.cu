@@ -15,6 +15,8 @@
  */
 #include "pulsar_cuda_internal.h"
 
+#include <mutex>
+
 /* PLAN 94 phase 1 (L217): the per-expert ADDRESS TABLE for a routed type-40
  * (CUTLASS MXFP4) stack.
  *
@@ -58,8 +60,10 @@ struct expert_table {
     struct expert_table *next;
 };
 
-/// Head of the process-wide table cache (host; not thread-safe).
+/// Head of the process-wide table cache (host; every access under g_expert_tables_mu -- L335).
 static struct expert_table *g_expert_tables = NULL;
+/// Guards g_expert_tables: two submitting threads (TP ranks) build and look up tables at once.
+static std::mutex g_expert_tables_mu;
 
 /// entries[e * planes] = base + e * stride0 and, with two planes, entries[e * planes + 1] = base + off1 + e * stride1.
 /// Grid ceil(n_total / 256), 256 threads.
@@ -90,9 +94,12 @@ __global__ static void expert_table_fill_kernel(
 static const void *const *expert_table_get(const void *base, uint32_t n_total, uint32_t planes,
                                            uint64_t stride0, uint64_t off1, uint64_t stride1) {
     if (!base || !n_total || !stride0) return NULL;
+    std::lock_guard<std::mutex> lock(g_expert_tables_mu);
     for (struct expert_table *t = g_expert_tables; t; t = t->next)
         if (t->base == base && t->stride0 == stride0 && t->off1 == off1 && t->stride1 == stride1 &&
             t->n_total == n_total && t->planes == planes) return t->entries;
+    /* a new table allocates: never inside a capture (L335) */
+    if (cuda_grow_refused_under_capture("an expert address table")) return NULL;
     const void **entries = NULL;
     const size_t bytes = (size_t)n_total * planes * sizeof(*entries);
     if (!cuda_ok(cudaMalloc((void **)&entries, bytes), "expert table alloc")) return NULL;
@@ -143,6 +150,7 @@ const void *const *exl3_expert_table(const void *base, uint32_t n_total, uint64_
 
 /// Frees every cached table (all three kinds); backend cleanup calls it.
 void mxfp4_expert_tables_clear(void) {
+    std::lock_guard<std::mutex> lock(g_expert_tables_mu);
     for (struct expert_table *t = g_expert_tables; t; ) {
         struct expert_table *next = t->next;
         (void)cudaFree((void *)t->entries);

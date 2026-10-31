@@ -34,6 +34,8 @@
  *                       clamps: every non-NaN pair keeps the fminf form's bits, a NaN operand stays NaN.
  *   13. seg-reset-capture pulsar_gpu_seg_reset inside a capture is the FULL reset at its close (a catalog key is
  *                       forgotten), not the regrow's partial drop that kept the catalog.
+ *   14. grow-under-capture a grow-on-demand cache (an expert address table's first build) refuses inside a graph
+ *                       capture and leaves the capture valid; outside, the same table builds.
  *
  *  Prints one line per case and KERNEL CONTRACT GATE PASS / FAIL. */
 #include "pulsar_gpu.h"
@@ -673,6 +675,33 @@ static void case_seg_reset_capture(void) {
     cudaFree(d);
 }
 
+/* ---- 14. grow-under-capture ------------------------------------------------------------------------------------ */
+
+/// Case 14: a grow-on-demand cache refuses to allocate inside a graph capture, and the capture survives it.  An
+/// expert address table for a base never seen (its first use allocates) is asked for inside a capture on this
+/// thread's stream: NULL, and the capture still ends cleanly; outside the capture the same table builds.
+static void case_grow_under_capture(void) {
+    unsigned char *base = nullptr;
+    if (!ok(cudaMalloc(&base, 1u << 16), "grow-under-capture malloc")) return;
+    if (!ok(cudaStreamBeginCapture(cudaStreamPerThread, cudaStreamCaptureModeThreadLocal), "grow-under-capture begin")) {
+        cudaFree(base);
+        return;
+    }
+    const uint8_t *const *in_cap = mxfp4_expert_table(base, 4096u, 8u);
+    cudaGraph_t gr = nullptr;
+    const cudaError_t ec = cudaStreamEndCapture(cudaStreamPerThread, &gr);
+    if (gr) cudaGraphDestroy(gr);
+    (void)cudaGetLastError();
+    const uint8_t *const *out_cap = mxfp4_expert_table(base, 4096u, 8u);
+    const bool synced = pulsar_gpu_synchronize() != 0;
+    printf("  14 grow-under-capture: table inside a capture %s, capture end %s; outside %s\n",
+           in_cap ? "BUILT" : "refused", ec == cudaSuccess ? "clean" : cudaGetErrorString(ec),
+           out_cap ? "built" : "REFUSED");
+    if (in_cap || ec != cudaSuccess || !out_cap || !synced) fail("grow-under-capture: an allocation under capture");
+    mxfp4_expert_tables_clear();
+    cudaFree(base);
+}
+
 /// Runs every case on device 0.
 /// @return 0 on PASS, 1 on FAIL
 int main(void) {
@@ -693,6 +722,7 @@ int main(void) {
     case_bf16_nan();
     case_swiglu_nan();
     case_seg_reset_capture();
+    case_grow_under_capture();
     puts(g_fail ? "KERNEL CONTRACT GATE FAIL" : "KERNEL CONTRACT GATE PASS");
     return g_fail ? 1 : 0;
 }
