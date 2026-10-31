@@ -1,4 +1,6 @@
 // SPDX-License-Identifier: MIT
+/** @file
+ *  The EXL3 routed MoE's one front door: sort, gate/up, fold, down, sum (contract in exl3_moe.cuh). */
 // The EXL3 routed MoE's one front door (exl3_moe.cuh has the contract and the dataflow).
 
 #include "exl3_moe.cuh"
@@ -15,8 +17,12 @@
 
 namespace {
 
+/// @param b  bytes
+/// @return   b rounded up to a multiple of 256
 constexpr uint64_t a256(uint64_t b) { return (b + 255u) & ~(uint64_t)255u; }
 
+/// @param a  an activation descriptor
+/// @return   true when it names a known format with its pointers (E4M3: the scale plane and kbp > 0)
 bool act_ok(const exl3_moe_act &a) {
     return a.x && (a.format == EXL3_MOE_ACT_BF16_ROWS ||
                    (a.format == EXL3_MOE_ACT_E4M3_SLOT && a.sf && a.kbp > 0));
@@ -25,6 +31,26 @@ bool act_ok(const exl3_moe_act &a) {
 /* One projection of the schedule, through the arm the rule picks: a prompt chunk's grouped GEMM (once per slice,
  * each rotating its input by its own suh) writes the caller's z; the decode GEMM (a pair's two slices in one
  * launch) leaves split partials in the workspace, which *z points the fold / sum at. */
+/// @param kind      the projection kind (EXL3_ARM_DOWN does not rotate its input; EXL3_ARM_PAIR runs up_table too)
+/// @param table     the (gate, gate_up or down) expert table
+/// @param up_table  the pair's up table, or NULL
+/// @param k2        rate, half-bit units
+/// @param act       the projection's input as its producer emitted it
+/// @param ids_dst   output row per assignment
+/// @param ids_src   input row per assignment
+/// @param bounds    expert_bounds [E + 1]
+/// @param out       prompt: z f32 [rows][M] (decode: unused)
+/// @param out_up    prompt, pair: the up's z (decode: unused)
+/// @param M         output width
+/// @param K         input width
+/// @param pairs     assignments
+/// @param E         experts
+/// @param gemm      true: a prompt chunk (the grouped GEMM); false: decode rows (the decode GEMM)
+/// @param tc_ws     the arm's workspace
+/// @param tc_bytes  its bytes
+/// @param z         out: where the z (or the decode split partials) are
+/// @param stream    the launch stream
+/// @return          0, -1 on a refusal, -3 on a launch failure
 int project(int kind, const void *table, const void *up_table, int k2, const exl3_moe_act &act,
             const int32_t *ids_dst, const int32_t *ids_src, const int32_t *bounds, float *out, float *out_up,
             int M, int K, int64_t pairs, int E, bool gemm, void *tc_ws, size_t tc_bytes, exl3_moe_partials *z,
@@ -51,16 +77,28 @@ int project(int kind, const void *table, const void *up_table, int k2, const exl
  * fold's own expression; the dense arm's epilogue counters are per stream already, counter_slice).  A lane holds
  * up to kLanePending forks the caller has not joined yet (one per shared expert per row-kind segment of a step,
  * each over its own rows' buffers).  The lanes live as long as their thread. */
+/// Forks a lane holds unjoined at most.
 constexpr int kLanePending = 8;
+/// One (host thread, device, caller stream)'s shared-expert lane (see the comment above).
 struct shared_lane {
+    /// The device it was created on.
     int dev;
+    /** @var s
+     *  the lane's own non-blocking stream */
+    /// The caller stream it serves.
     cudaStream_t caller, s;
+    /// Recorded on the caller stream at each fork; the lane waits on it.
     cudaEvent_t fork;
+    /// Each pending fork's completion on the lane, oldest first (rotated on join).
     cudaEvent_t done[kLanePending];
     const float *ys[kLanePending];   ///< the pending forks' outputs, oldest first
+    /// Pending forks.
     int n;
 };
 
+/// The calling thread's lane for (current device, caller), created on first use (at most 8 per thread).
+/// @param caller  the caller's stream
+/// @return        the lane, or nullptr when the thread's 8 are spent or stream / event creation failed
 shared_lane *shared_lane_for(cudaStream_t caller) {
     thread_local shared_lane t_lanes[8];
     thread_local int t_n = 0;
@@ -87,6 +125,11 @@ shared_lane *shared_lane_for(cudaStream_t caller) {
 
 /* The shared expert's SwiGLU rows for its down: h = silu(g) * u, bf16 -- the expression the fold emitted them with
  * (pulsar_swiglu_elem, weight 1, no clamp), now the lane's producer of h. */
+/// Grid ceil(n / 256), 256 threads, one element per thread.
+/// @param g  the gate output f32 [n]
+/// @param u  the up output f32 [n]
+/// @param h  out: silu(g) * u, bf16 [n]
+/// @param n  elements (T x mid)
 __global__ void __launch_bounds__(256)
 exl3_shared_swiglu_kernel(const float *__restrict__ g, const float *__restrict__ u, __nv_bfloat16 *__restrict__ h,
                           int64_t n) {
@@ -142,6 +185,10 @@ int exl3_moe_shared_fork(const exl3_moe_shared &sh, const exl3_moe_act &x, int T
 namespace {
 
 /* The caller's stream waits for the OLDEST pending fork, which must be the one whose output is `ys`. */
+/// @param ys      the output the oldest pending fork must have
+/// @param stream  the caller's stream, made to wait for that fork
+/// @param tag     the caller's name for the refusal message
+/// @return        0, -1 when the oldest fork is not ys (or none is pending), -3 on a CUDA failure
 int shared_join(const float *ys, cudaStream_t stream, const char *tag) {
     shared_lane *lane = shared_lane_for(stream);
     if (!lane || lane->n == 0 || lane->ys[0] != ys) {

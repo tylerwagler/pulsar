@@ -1,4 +1,6 @@
 // SPDX-License-Identifier: MIT
+/** @file
+ *  The D2R IQ2_XXS routed-expert MoE GEMMs (gate/up pair and single) and their E4M3 activation staging. */
 // ds4_mmq_d2r.cu - gated D2R IQ2_XXS MoE GEMM production path.
 
 #include "ds4_mmq_d2r.cuh"
@@ -29,6 +31,10 @@
  * Copying it is what lets this translation unit stop including mmq.cuh, and a
  * copy this small is cheaper than keeping a 1363-line header alive to supply
  * it. */
+/** llama.cpp's unpack_ksigns (vendored vecdotq.cuh, verbatim): expand an IQ2_XXS 7-bit sign field to 8 sign bits
+ *  (the 8th is the parity) broadcast to all four bytes, for selection with 0x08040201 / 0x80402010.
+ *  @param v  the 7-bit ksigns field
+ *  @return the 8 sign bits replicated in each byte */
 static __device__ __forceinline__ uint32_t ds4_unpack_ksigns(const uint8_t v) {
     // v is a 7 bit int, with the 8th sign being encodable as popcnt
     // with xor we can "correct" the bit instead of having to mask
@@ -41,10 +47,15 @@ static __device__ __forceinline__ uint32_t ds4_unpack_ksigns(const uint8_t v) {
 namespace {
 
 
+/// Weight rows (M) per CTA: kWarps warps x 16 rows.
 constexpr int kMTile      = 128;
+/// The wide (prefill) tile's assignment columns (N) per CTA.
 constexpr int kNTile      = 64;
+/// Warps per CTA; the block is dim3(32, kWarps) (d2r_lane / d2r_warp read tid.x / tid.y).
 constexpr int kWarps      = 8;
+/// Threads per CTA (256).
 constexpr int kThreads    = 32 * kWarps;
+/// Activation prefetch distance in k128 iterations.
 constexpr int kStages     = 2;  // act PREFETCH DISTANCE (issue at k for k+2)
 /* Act ring DEPTH.  Depth must EXCEED the prefetch distance or the issue at
  * iter k targets ((k+dist) % depth) == the very slot being read at k -- true
@@ -53,7 +64,9 @@ constexpr int kStages     = 2;  // act PREFETCH DISTANCE (issue at k for k+2)
  * issue (writes).  At depth 3 / distance 2 the write slot (k+2)%3 never
  * aliases the read slot k%3, and the remaining per-iteration barrier bounds
  * warp spread to one iteration so no third slot is ever live (L099). */
+/// Activation ring depth (slots of s_act); must exceed kStages.
 constexpr int kActDepth   = 3;
+/// n8 accumulator fragments of the wide tile.
 constexpr int kNFrag      = kNTile / 8;
 /* L200: the DECODE tile width.  A layer routes a handful of assignment slots
  * across ~200 experts, so at decode a 64-wide tile stages 63 activation columns
@@ -62,6 +75,7 @@ constexpr int kNFrag      = kNTile / 8;
  * independently cap the kernel at 2 blocks/SM (L199).  The width is a
  * PERFORMANCE choice only: it decides which block computes a column, never how,
  * so every width is bit-identical.  See the dispatch for when each is used. */
+/// The narrow (decode-regime) tile's assignment columns per CTA.
 constexpr int kNTileNarrow = 8;
 /* L202: the weights are no longer staged.  Under the k-major artifact layout
  * (type 44) the 16 rows one k step needs are 128 contiguous bytes, so the lane
@@ -73,11 +87,17 @@ constexpr int kNTileNarrow = 8;
  * Cols*9 chunk-issues split over the CTA's 256 threads; a thread's item index
  * splits into (column, chunk) by Shift == log2(Cols).  The helpers below deduce
  * NFRAG from the s_act extent, so one body serves every width (L200). */
+/** Activation staging geometry for a tile of NFRAG n8 fragments: a column is one block_mx_act_mmq (144 B = 9
+ *  16-byte cp.async chunks). */
 template <int NFRAG>
 struct D2RAct {
+    /// assignment columns staged per stage
     static constexpr int Cols  = NFRAG * 8;
+    /// 16-byte cp.async chunks per stage
     static constexpr int Items = Cols * 9;
+    /// issue rounds per thread to cover Items
     static constexpr int Trips = (Items + kThreads - 1) / kThreads;
+    /// log2(Cols): an item index t is (column t & (Cols-1), chunk t >> Shift)
     static constexpr int Shift = (Cols == 8) ? 3 : ((Cols == 16) ? 4 : ((Cols == 32) ? 5 : 6));
     static_assert(Cols == 8 || Cols == 16 || Cols == 32 || Cols == 64,
                   "D2R act staging supports tile widths 8, 16, 32 and 64");
@@ -90,24 +110,39 @@ static_assert(kThreads == 256, "D2R CTA is fixed at 256 threads");
 static_assert(D2RAct<kNFrag>::Trips == 3, "unexpected act issue trip count (wide tile)");
 static_assert(D2RAct<kNTileNarrow / 8>::Trips == 1, "unexpected act issue trip count (narrow tile)");
 
+/// Per-CTA constants of the D2R kernel, written by thread 0 into shared memory before the main loop.
 struct alignas(16) SmemInvariants {
+    /// expert's scale-plane base (same pointer as iq2_dq_base); written, never read
     const char *w_base;
     /* L202: EXPERT-based, not tensor-based -- this block's expert offset is
      * folded in once here so the inner loop indexes with (k256, pair, row)
      * alone.  Layout (type 44): d[(e*nb + k)*M + row],
      * q[((e*nb + k)*8 + pair)*M + row]. */
+    /// this expert's fp16 block scales, d[k256 * M + row]
     const half *iq2_dq_base;
+    /// this expert's IQ2 code words, q[(k256 * 8 + pair) * M + row]
     const uint2 *iq2_qs_base;
+    /// first activation block of this tile's columns (k128 block 0)
     const char *act_tile_base;
+    /// output, f32 out[ids_dst[col] * M + row] (this leg's)
     float *out;
+    /// always 0; written, never read
     uint32_t sc_off_bytes;
+    /// always 0; written, never read
     uint32_t qs_off_bytes;
+    /// bytes between consecutive k128 blocks of the activation: n_assign * sizeof(block_mx_act_mmq)
     uint32_t act_k128_stride_bytes;
+    /// k256 blocks per row (K / 256); written, never read
     int nb;
+    /// main-loop iterations: K / 128
     int k128_iters;
+    /// weight rows (output rows)
     int M;
+    /// this CTA's first weight row
     int cta_row0;
+    /// this tile's first assignment column (expert-sorted)
     int col_lo;
+    /// valid columns in this tile (<= the tile width)
     int col_count;
 };
 
@@ -124,11 +159,16 @@ static_assert(sizeof(SmemInvariants) <= 128, "shared invariant table must stay s
 
 
 
+/** @param dst  16-byte-aligned destination; 16 zero bytes are stored */
 __device__ __forceinline__ void zero_16B(void *dst) {
     int4 z = make_int4(0, 0, 0, 0);
     *reinterpret_cast<int4 *>(dst) = z;
 }
 
+/** One 16-byte cp.async.cg global->shared copy (a plain copy below sm_80), or zero-fill when !pred.
+ *  @param dst   shared destination, 16-byte aligned
+ *  @param src   global source, 16-byte aligned
+ *  @param pred  false: store zeros instead */
 __device__ __forceinline__ void cp_async_16B(void *dst, const void *src, bool pred) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
     if (pred) {
@@ -147,12 +187,14 @@ __device__ __forceinline__ void cp_async_16B(void *dst, const void *src, bool pr
 #endif
 }
 
+/// cp.async.commit_group (no-op below sm_80).
 __device__ __forceinline__ void cp_async_commit() {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
     asm volatile("cp.async.commit_group;");
 #endif
 }
 
+/// cp.async.wait_group KeepGroups: wait until at most KeepGroups committed groups are pending (no-op below sm_80).
 template <int KeepGroups>
 __device__ __forceinline__ void cp_async_wait_group() {
     static_assert(KeepGroups >= 0 && KeepGroups <= 7, "bad cp.async wait_group depth");
@@ -161,6 +203,8 @@ __device__ __forceinline__ void cp_async_wait_group() {
 #endif
 }
 
+/** Runtime-depth cp_async_wait_group.
+ *  @param keep_groups  groups allowed to stay pending (0..3; larger waits with 4) */
 __device__ __forceinline__ void cp_async_wait_keep(int keep_groups) {
     switch (keep_groups) {
         case 0: cp_async_wait_group<0>(); break;
@@ -172,6 +216,7 @@ __device__ __forceinline__ void cp_async_wait_keep(int keep_groups) {
 }
 
 
+/** @return lane in the warp (%tid.x: the block is dim3(32, kWarps)) */
 __device__ __forceinline__ int d2r_lane() {
 #if defined(__CUDA_ARCH__)
     uint32_t lane;
@@ -182,6 +227,7 @@ __device__ __forceinline__ int d2r_lane() {
 #endif
 }
 
+/** @return warp index in the CTA (%tid.y) */
 __device__ __forceinline__ int d2r_warp() {
 #if defined(__CUDA_ARCH__)
     uint32_t warp;
@@ -192,22 +238,33 @@ __device__ __forceinline__ int d2r_warp() {
 #endif
 }
 
+/** @return linear thread index, warp * 32 + lane */
 __device__ __forceinline__ int d2r_tid() {
     return (d2r_warp() << 5) | d2r_lane();
 }
 
+/** @return MMA fragment group of this lane (lane / 4) */
 __device__ __forceinline__ int d2r_group() {
     return d2r_lane() >> 2;
 }
 
+/** @return thread-in-group of this lane (lane % 4) */
 __device__ __forceinline__ int d2r_tig() {
     return d2r_lane() & 3;
 }
 
+/** @param k128_iter  main-loop iteration
+ *  @return the s_act ring slot it uses */
 __device__ __forceinline__ int d2r_act_stage(int k128_iter) {
     return k128_iter % kActDepth;
 }
 
+/** Issue cp.async item t of one activation stage: chunk t >> Shift of column t & (Cols-1).
+ *  @param s_act          the activation ring
+ *  @param act_iter_base  this k128 iteration's first column block (global)
+ *  @param col_count      valid columns (!FullTile: columns past it are skipped, left zero)
+ *  @param stage          ring slot written
+ *  @param t              item index, < D2RAct<NFRAG>::Items */
 template <bool FullTile, int NFRAG>
 __device__ __forceinline__ void issue_act_prefetch_one(
         block_mx_act_mmq (&s_act)[kActDepth][NFRAG][8],
@@ -234,6 +291,12 @@ __device__ __forceinline__ void issue_act_prefetch_one(
     cp_async_16B(dst, src, true);
 }
 
+/** Compile-time-unrolled issue of every item of one stage, round Iter onward (tid + Iter * kThreads).
+ *  @param s_act          the activation ring
+ *  @param act_iter_base  this k128 iteration's first column block (global)
+ *  @param col_count      valid columns
+ *  @param stage          ring slot written
+ *  @param tid            linear thread index */
 template <bool FullTile, int Iter, int NFRAG>
 __device__ __forceinline__ void issue_act_prefetch_unrolled(
         block_mx_act_mmq (&s_act)[kActDepth][NFRAG][8],
@@ -253,6 +316,12 @@ __device__ __forceinline__ void issue_act_prefetch_unrolled(
     }
 }
 
+/** Issue and commit one stage of the activation ring for k128 iteration k128_iter (guarded column count).
+ *  @param s_act      the activation ring
+ *  @param s_inv      the CTA's invariants (act_tile_base, stride, col_count)
+ *  @param stage      ring slot written
+ *  @param k128_iter  iteration whose k128 block is loaded
+ *  @param tid        linear thread index */
 template <bool FullTile, int NFRAG>
 __device__ __forceinline__ void issue_act_prefetch(
         block_mx_act_mmq (&s_act)[kActDepth][NFRAG][8],
@@ -269,6 +338,11 @@ __device__ __forceinline__ void issue_act_prefetch(
     cp_async_commit();
 }
 
+/** issue_act_prefetch_one for a full tile (every column valid, no bound check).
+ *  @param s_act          the activation ring
+ *  @param act_iter_base  this k128 iteration's first column block (global)
+ *  @param stage          ring slot written
+ *  @param t              item index */
 template <int NFRAG>
 __device__ __forceinline__ void issue_act_prefetch_one_fast(
         block_mx_act_mmq (&s_act)[kActDepth][NFRAG][8],
@@ -284,6 +358,11 @@ __device__ __forceinline__ void issue_act_prefetch_one_fast(
     cp_async_16B(dst, src, true);
 }
 
+/** issue_act_prefetch_unrolled for a full tile.
+ *  @param s_act          the activation ring
+ *  @param act_iter_base  this k128 iteration's first column block (global)
+ *  @param stage          ring slot written
+ *  @param tid            linear thread index */
 template <int Iter, int NFRAG>
 __device__ __forceinline__ void issue_act_prefetch_fast_unrolled(
         block_mx_act_mmq (&s_act)[kActDepth][NFRAG][8],
@@ -302,6 +381,11 @@ __device__ __forceinline__ void issue_act_prefetch_fast_unrolled(
     }
 }
 
+/** issue_act_prefetch for a full tile: issue and commit one stage.
+ *  @param s_act      the activation ring
+ *  @param s_inv      the CTA's invariants
+ *  @param stage      ring slot written
+ *  @param k128_iter  iteration whose k128 block is loaded */
 template <int NFRAG>
 __device__ __forceinline__ void issue_act_prefetch_fast(
         block_mx_act_mmq (&s_act)[kActDepth][NFRAG][8],
@@ -325,17 +409,22 @@ __device__ __forceinline__ void issue_act_prefetch_fast(
 
 
 
+/// Shared bytes of one wide-tile activation stage.
 constexpr size_t kSmemActStageBytes = (size_t)kNFrag * 8 * sizeof(block_mx_act_mmq);
+/// Shared bytes of SmemInvariants.
 constexpr size_t kSmemInvBytes = sizeof(SmemInvariants);
+/// Shared bytes of the staged grid selectors (s_gsel: 256 uint2).
 constexpr size_t kSmemIQ2GridBytes = 256u * sizeof(uint2);
 /* kActDepth, not kStages: s_act is declared [kActDepth][...], so the old
  * accounting under-counted the act ring by a whole stage (L200). */
+/// Static shared bytes of the wide-tile kernel (asserted <= 48 KiB).
 constexpr size_t kSmemIQ2StaticBytes = (size_t)kActDepth * kSmemActStageBytes +
                                        kSmemIQ2GridBytes + kSmemInvBytes;
 static_assert(kSmemIQ2StaticBytes <= 48ull * 1024ull,
               "IQ2 D2R static shared memory exceeds 48 KiB");
 /* The narrow tile exists to get under the 3-blocks/SM shared cliff (102.4 KiB
  * per SM), which is the whole point of L200 -- assert it rather than hope. */
+/// Static shared bytes of the narrow-tile kernel (asserted to fit 4 blocks per SM).
 constexpr size_t kSmemIQ2NarrowBytes =
     (size_t)kActDepth * (size_t)(kNTileNarrow / 8) * 8 * sizeof(block_mx_act_mmq) +
     kSmemIQ2GridBytes + kSmemInvBytes;
@@ -356,6 +445,12 @@ static_assert(kSmemIQ2NarrowBytes * 4 <= 102400ull,
 
 
 
+/** ldmatrix one n8 x k32 B fragment (E4M3 bytes) from the staged activation.
+ *  @param B         destination fragment
+ *  @param s_act     the activation ring
+ *  @param stage     ring slot
+ *  @param nf        n8 fragment (columns 8 nf .. 8 nf + 7)
+ *  @param k_in_act  first k value within the k128 block (0, 32, 64, 96) */
 template <int NFrag, typename TileB>
 __device__ __forceinline__ void load_B_tile(
         TileB &B,
@@ -383,16 +478,26 @@ __device__ __forceinline__ void load_B_tile(
  * This replaced, per 16 weights per lane, a 16-step int8->float->fmax scan and
  * 16 int8->float->E4M3 conversions (census L198: 0.27% of the kernel's
  * instructions were the MMA itself). */
+/// One lane's half of an IQ2_XXS grid entry (4 weights) as byte-permute selectors over the row's E4M3 magnitude
+/// triple (iq2_mag_triple_e4m3), plus sign bits and the half's largest magnitude index.
 struct iq2_half_e4m3 {
     uint32_t sel;       ///< four byte-permute nibbles, each 0/1/2, or 3 for zero
     uint32_t sign80;    ///< 0x80 in each byte whose weight is negative
     int       amax_idx; ///< 0..2, or 3 ("no weights here", magnitude 0)
 };
 
+/** @param idx  magnitude index 0..3
+ *  @return the IQ2 grid magnitude 8, 25, 43, or 0 for idx 3 */
 __device__ __forceinline__ static float iq2_mag_value(int idx) {
     return idx == 0 ? 8.0f : (idx == 1 ? 25.0f : (idx == 2 ? 43.0f : 0.0f));
 }
 
+/** Decode one lane's half of an IQ2_XXS grid entry (4 weights) into byte-permute selectors and signs.
+ *  @param code    the (row, k32) code word: x = four 8-bit grid indices, y = four 7-bit sign fields + 4-bit scale
+ *  @param s_gsel  the staged grid selectors (256 entries; low 16 bits selectors, bits 16+ the half's amax index)
+ *  @param chunk   8-value chunk of the k32 tile (0..7): grid entry chunk / 2, half chunk & 1
+ *  @param row_ok  false (row past M): an all-zero half
+ *  @return the half's selectors, sign mask and amax index */
 __device__ __forceinline__ iq2_half_e4m3 iq2_decode_half_e4m3(
         uint2 code, const uint2 * __restrict__ s_gsel, int chunk, bool row_ok) {
     iq2_half_e4m3 h;
@@ -457,6 +562,8 @@ __device__ __forceinline__ iq2_half_e4m3 iq2_decode_half_e4m3(
  * flip of e4m3(x) (the conversion rounds magnitudes symmetrically), so the
  * sign-after-convert order does not change a byte -- including the saturating
  * and signed-zero cases. */
+/** @param scale  the row's effective weight scale divided by its shared exponent
+ *  @return bytes 0..2 = e4m3(8 scale), e4m3(25 scale), e4m3(43 scale); byte 3 = 0 */
 __device__ __forceinline__ static uint32_t iq2_mag_triple_e4m3(float scale) {
     const float mag[3] = {8.0f, 25.0f, 43.0f};
     uint32_t out = 0;
@@ -474,6 +581,17 @@ __device__ __forceinline__ static uint32_t iq2_mag_triple_e4m3(float scale) {
  * broadcasts and the warp's whole request is 128 contiguous bytes.  Same for the
  * block scale at d[k256*M + row].  Measured on the access pattern alone: 88 GB/s
  * reading the old layout this way, 182 staging it, 218 reading this one (L201). */
+/** Build one m16 x k32 MXFP8 A fragment (two rows per lane) and this lane's ue8m0 scale byte from IQ2 codes.
+ *  @param A        destination fragment (four registers of four E4M3 bytes)
+ *  @param sfa      this lane's A scale byte (row group + 8 when tig == 1, else row group)
+ *  @param code0    row group's code word for this k32 tile
+ *  @param code1    row group + 8's code word
+ *  @param d0       row group's fp16 block scale as f32 (0 if out of range)
+ *  @param d1       row group + 8's block scale
+ *  @param s_gsel   the staged grid selectors
+ *  @param row0_ok  row group < M
+ *  @param row1_ok  row group + 8 < M
+ *  @param tig      thread-in-group (lane % 4) */
 template <typename TileA>
 __device__ __forceinline__ void make_iq2_A_tile_e4m3(
         TileA &A, uint32_t &sfa,
@@ -540,6 +658,20 @@ __device__ __forceinline__ void make_iq2_A_tile_e4m3(
  * tile, and out-of-range COLUMNS accumulate values the output store never
  * writes, since it bounds-checks each fragment element.  So no masking fold is
  * needed, unlike the integer path which had to mask after the MMA. */
+/** Two adjacent k32 tiles (T0, T1) of one warp's m16 rows against every live n8 fragment of the tile.
+ *  @param acc          f32 accumulators [NFrag][4], updated in place
+ *  @param c0           row group's four code words of this k128 half-block
+ *  @param c1           row group + 8's four code words
+ *  @param d0           row group's block scale
+ *  @param d1           row group + 8's block scale
+ *  @param s_gsel       the staged grid selectors
+ *  @param s_act        the activation ring
+ *  @param act_stage    ring slot holding this k128 block
+ *  @param raw_row0_ok  row group < M
+ *  @param raw_row1_ok  row group + 8 < M
+ *  @param group        lane / 4
+ *  @param tig          lane % 4
+ *  @param s_inv        the CTA's invariants (col_count when !FullTile) */
 template <bool FullTile, typename TileA, typename TileB, typename TileC,
           int T0, int T1, int NFrag>
 __device__ __forceinline__ void mma_iq2_k32_pair_e4m3(
@@ -593,6 +725,12 @@ __device__ __forceinline__ void mma_iq2_k32_pair_e4m3(
     }
 }
 
+/** One k128 iteration for one warp: fetch its 8 code words and 2 scales from global, then four k32 MMAs.
+ *  @param acc        f32 accumulators [NFrag][4]
+ *  @param s_gsel     the staged grid selectors
+ *  @param s_act      the activation ring
+ *  @param k128_iter  iteration (k256 = k128_iter / 2; its half selects code words 0..3 or 4..7)
+ *  @param s_inv      the CTA's invariants */
 template <bool FullTile, typename TileA, typename TileB, typename TileC,
           int NFrag>
 __device__ __forceinline__ void mma_fold_iq2_k128(
@@ -666,6 +804,12 @@ __device__ __forceinline__ void mma_fold_iq2_k128(
     }
 }
 
+/** The D2R K loop: prologue prefetch of kStages activation stages, then per k128 iteration wait, barrier, MMA,
+ *  prefetch k + kStages.
+ *  @param acc     f32 accumulators [NFrag][4]
+ *  @param s_act   the activation ring (zeroed by the caller)
+ *  @param s_gsel  the staged grid selectors
+ *  @param s_inv   the CTA's invariants */
 template <bool FullTile, typename TileA, typename TileB, typename TileC, int NFrag>
 __device__ __forceinline__ void iq2_d2r_mainloop(
         float (&acc)[NFrag][TileC::ne],
@@ -740,6 +884,12 @@ __device__ __forceinline__ void iq2_d2r_mainloop(
 
 
 
+/** The D2R worklist: one entry (expert << 16 | tile) per TileN-column tile of each non-empty expert, in expert
+ *  order.  Launch: ONE block of kThreads.
+ *  @param expert_bounds  [n_experts + 1] expert-sorted assignment offsets (mm_ids_helper)
+ *  @param work           out: the entries (capacity d2r_work_capacity)
+ *  @param n_items_out    out: entries written
+ *  @param n_experts      experts */
 template <int TileN>
 __global__ __launch_bounds__(kThreads, 2)
 void d2r_build_worklist_kernel(const int32_t * __restrict__ expert_bounds,
@@ -820,6 +970,25 @@ void d2r_build_worklist_kernel(const int32_t * __restrict__ expert_bounds,
  * is the point of the narrow instantiation: with one accumulator fragment
  * instead of eight the compiler can fit 4 blocks/SM in the register file, and
  * the narrow act staging fits them in shared. */
+/** The D2R IQ2_XXS routed-expert GEMM: out[ids_dst[col] * M + row] = sum_k W_e[row][k] * act[col][k] for each
+ *  assignment col of expert e, MXFP8 block-scaled MMA (m16n8k32, E4M3 x E4M3, ue8m0 scales), f32 output.
+ *  Launch: grid (ceil(M / kMTile), worklist capacity, legs), block dim3(32, kWarps); blockIdx.y indexes the
+ *  worklist (entries past *n_items_ptr exit), blockIdx.z the leg (0 gate, 1 up; a single-tensor launch pins 0).
+ *  Static shared memory only (kSmemIQ2StaticBytes / kSmemIQ2NarrowBytes).  Compiles to nothing without
+ *  TURING_MMA_AVAILABLE.
+ *  @param gate_soa       leg 0's per-expert two-plane table: interleaved [d, q] device pointers per expert
+ *  @param up_soa         leg 1's table, same layout
+ *  @param act            the expert-major E4M3 activation, [K / 128][n_assign] block_mx_act_mmq
+ *  @param ids_dst        [n_assign] output column of each expert-sorted assignment
+ *  @param expert_bounds  [E + 1] expert-sorted assignment offsets
+ *  @param work           the worklist (d2r_build_worklist_kernel at tile width NT)
+ *  @param n_items_ptr    worklist entries (device)
+ *  @param out_gate       leg 0's output, f32 column-major [cols][M]
+ *  @param out_up         leg 1's output, same layout
+ *  @param M              weight rows
+ *  @param K              input width (a multiple of 256)
+ *  @param n_assign       assignment slots (tokens x top-k)
+ *  @param E              experts */
 template <int NT>
 __global__ __launch_bounds__(kThreads, NT == 64 ? 2 : 4)
 void gateup_iq2_d2r_pair_kernel(const void * __restrict__ gate_soa,
@@ -989,6 +1158,11 @@ void gateup_iq2_d2r_pair_kernel(const void * __restrict__ gate_soa,
 }
 
 
+/** Work-list length that bounds any routing: every expert's tiles of tile_n columns, at most one partial tile each.
+ *  @param ncols_max  assignment slots the call can hold
+ *  @param n_experts  experts in the stack
+ *  @param tile_n     columns per work item
+ *  @return ceil(ncols_max / tile_n) + n_experts, or 0 on a non-positive argument */
 static int64_t d2r_work_capacity_for_tile(
         int64_t ncols_max, int n_experts, int tile_n) {
     if (ncols_max <= 0 || n_experts <= 0 || tile_n <= 0) {
@@ -1005,8 +1179,11 @@ static int64_t d2r_work_capacity_for_tile(
  * assignment slots (tokens x top-k), so 128 covers the entire decode and
  * speculative-verify regime (<= 16 rows, the M-neutral range) with room to
  * spare, and prefill chunks land far above it. */
+/// Assignment slots at or below which a launch takes the narrow tile (d2r_use_narrow_tile).
 constexpr int64_t kD2RNarrowMaxSlots = 128;
 
+/** @param ne_get_rows  assignment slots in the call (tokens x top-k)
+ *  @return true when the launch uses the kNTileNarrow tile */
 static bool d2r_use_narrow_tile(int64_t ne_get_rows) {
     return ne_get_rows > 0 && ne_get_rows <= kD2RNarrowMaxSlots;
 }
@@ -1014,6 +1191,9 @@ static bool d2r_use_narrow_tile(int64_t ne_get_rows) {
 /* The worklist is one entry per (expert, tile), so the NARROW tile produces the
  * most entries: size every scratch allocation for it, whichever width a given
  * launch then picks (L200). */
+/** @param ncols_max  most assignment slots a call may have
+ *  @param n_experts  experts
+ *  @return worklist entries to reserve (the narrow tile's bound), 0 on a bad argument */
 static int64_t d2r_work_capacity(int64_t ncols_max, int n_experts) {
     return d2r_work_capacity_for_tile(ncols_max, n_experts, kNTileNarrow);
 }
@@ -1027,6 +1207,7 @@ static int64_t d2r_work_capacity(int64_t ncols_max, int n_experts) {
  * itself once rather than trust the comment that named them: a fourth magnitude
  * would otherwise be packed silently as 43.  Refusing here fails the model load
  * closed -- D2R is the only IQ2 arm (VENDOR.md). */
+/// @return true when every byte of the vendored iq2xxs_grid is 8, 25 or 43 (named on stderr otherwise).
 static bool ds4_iq2_grid_magnitudes_ok() {
     uint64_t grid[256];
     if (cudaMemcpyFromSymbol(grid, iq2xxs_grid, sizeof(grid)) != cudaSuccess) {
@@ -1100,6 +1281,8 @@ constexpr int kDecodeGemvRows       = 32;    ///< rows per warp == lanes
 constexpr int kDecodeGemvWarps      = 8;     ///< K split
 constexpr int kDecodeGemvMaxK       = 5120;  ///< widest K the decode tier serves (V4.1 n_embd, L218)
 
+/// @param bits an E4M3 byte.
+/// @return its value, f32 (exact).
 __device__ __forceinline__ static float d2r_e4m3_to_f32(uint8_t bits) {
     return (float)(*reinterpret_cast<const __nv_fp8_e4m3 *>(&bits));
 }
@@ -1128,7 +1311,19 @@ __device__ __forceinline__ static float d2r_e4m3_to_f32(uint8_t bits) {
  * Measured (tests: the expert microbench, census-matched routing, 16 cold
  * routing sets; vs the paired one-assignment kernel): gate+up at 16 tokens
  * 1306 -> 1137 us, down 747 -> 611 us; faster at every width 1..32. */
+/// Assignments of one expert a decode-GEMV block serves together (each weight word decoded once for them).
 constexpr int kDecodeGemvGroup = 2;
+/// The decode tier's GEMV: a warp owns 32 consecutive rows, 8 warps split K.  Grid (ceil(M / 32), n_assign),
+/// block (32, 8); static shared memory only.
+/// @param w_soa the weight, aligned-SoA IQ2_XXS (k-major).
+/// @param act the staged activation (block_mx_act_mmq, expert-major).
+/// @param ids_dst per assignment, its output column.
+/// @param expert_bounds per expert, its first assignment, [n_experts + 1].
+/// @param out out: f32 at out[ids_dst[col] * M + row].
+/// @param M weight rows (output width).
+/// @param K input width (a multiple of 256).
+/// @param n_assign assignments.
+/// @param E experts.
 __global__ void __launch_bounds__(kDecodeGemvRows * kDecodeGemvWarps, 4)
 iq2_decode_gemv_kernel(const void * __restrict__ w_soa,
                        const block_mx_act_mmq * __restrict__ act,
@@ -1273,6 +1468,16 @@ iq2_decode_gemv_kernel(const void * __restrict__ w_soa,
     }
 }
 
+/// @param w_soa the weight, aligned-SoA IQ2_XXS (k-major).
+/// @param act the staged activation (block_mx_act_mmq, expert-major).
+/// @param ids_dst per assignment, its output column.
+/// @param expert_bounds per expert, its first assignment, [n_experts + 1].
+/// @param out out: f32 at out[ids_dst[col] * M + row].
+/// @param M weight rows (output width).
+/// @param K input width (a multiple of 256).
+/// @param n_assign assignments.
+/// @param E experts.
+/// @param stream the stream.
 static void iq2_decode_gemv_launch(const void *w_soa, const void *act, const int32_t *ids_dst,
                                    const int32_t *expert_bounds, float *out, int M, int K, int n_assign,
                                    int E, cudaStream_t stream) {

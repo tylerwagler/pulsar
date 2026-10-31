@@ -1,3 +1,5 @@
+/** @file
+ *  Attention on the tensor cores with fp16 operands and f32 accumulate. */
 /* Attention on the tensor cores, fp16 operands, f32 accumulate.
  *
  * WHY fp16 AND NOT SOMETHING SMALLER.  Measured, not assumed
@@ -77,13 +79,21 @@
 #include <cuda_pipeline.h>
 #include <cuda_fp16.h>
 
+/// M-tiles (16 heads each) per block.
 #define AF16_MT         2u        /* M-tiles per block */
+/// Heads per M-tile (the MMA's M).
 #define AF16_HEADS     16u        /* the MMA's M */
+/// Heads per block (32).
 #define AF16_HPB      (AF16_HEADS * AF16_MT)       /* 32 heads per block */
+/// The only head_dim the kernel is built for.
 #define AF16_DIM      512u        /* head_dim this kernel is specialised for */
+/// KV rows per staged tile.
 #define AF16_ROWS      16u        /* KV rows per tile = the MMA's K in phase 3 */
+/// Warps per block.
 #define AF16_WARPS     16u
+/// Threads per block (512).
 #define AF16_THREADS  (AF16_WARPS * 32u)
+/// Output dims per warp (32).
 #define AF16_DPW      (AF16_DIM / AF16_WARPS)      /* 32 output dims per warp */
 /* THREE row families reach this kernel, and which one is a property of the
  * LOADED PROFILE (pulsar_gpu_kv_row_style), not of the call site:
@@ -100,9 +110,14 @@
  * the two V4.1 families, so a V4 attention staged 384-byte rows at WINDOW's
  * 528-byte stride -- silent, because the launcher's own byte bound was computed
  * from the same wrong constant. */
+/// Staged-row format id: WINDOW row (528 B).
 #define AF16_FMT_WINDOW  0u
+/// Staged-row format id: MAIN row (288 B).
 #define AF16_FMT_MAIN    1u
+/// Staged-row format id: UNIFIED row (384 B).
 #define AF16_FMT_UNIFIED 2u
+/// @param fmt an AF16_FMT_* id.
+/// @return that family's row bytes at head_dim 512.
 __device__ __forceinline__ static uint32_t af16_fmt_rowb(uint32_t fmt) {
     switch (fmt) {
     case AF16_FMT_MAIN:    return (uint32_t)PULSAR_MAINKV_ROWBYTES(AF16_DIM);   /* 288 */
@@ -110,9 +125,13 @@ __device__ __forceinline__ static uint32_t af16_fmt_rowb(uint32_t fmt) {
     default:               return (uint32_t)PULSAR_WINKV_ROWBYTES(AF16_DIM);    /* 528 */
     }
 }
+/// WINDOW row bytes (528).
 #define AF16_WIN_ROWB  (PULSAR_WINKV_ROWBYTES(AF16_DIM))    /* 528 */
+/// MAIN row bytes (288).
 #define AF16_MAIN_ROWB (PULSAR_MAINKV_ROWBYTES(AF16_DIM))   /* 288 */
+/// UNIFIED row bytes (384).
 #define AF16_UNI_ROWB  (PULSAR_ATTN_PACK_ROWBYTES(AF16_DIM))/* 384 */
+/// The tile stage's row pitch: the widest family.
 #define AF16_ROWB      AF16_WIN_ROWB                        /* the stage's row pitch */
 /* The tile stage copies whole 16-byte chunks (cp.async's maximum), so every
  * family's row must be a whole 16-multiple: 528 = 33 chunks, 288 = 18, 384 = 24.
@@ -133,16 +152,20 @@ static_assert(AF16_ROWS == 16u,
 static_assert(AF16_HEADS == 16u,
               "the MMA's M tile is 16 heads; every phase indexes sPart by mt = h/16, hh = h%16");
 /* dynamic smem for the double-buffered raw KV tile stage (L037 lever 1) */
+/// Dynamic shared memory of the double-buffered tile stage.
 #define AF16_DYNSMEM_BYTES (2u * AF16_ROWS * AF16_ROWB)
 
 /* The loaded profile's row family, as the kernel wants it.  The engine pushes
  * the style into this module once at load (pulsar_gpu_set_kv_row_style), which
  * is the same authority the packers and the engine's cache sizing read -- so a
  * profile cannot be UNIFIED for its packs and CSA2 for its attention. */
+/// @return 1 when the loaded profile's KV rows are UNIFIED, else 0.
 static int af16_unified_rows(void) {
     return pulsar_gpu_kv_row_style() == PULSAR_KV_ROWS_UNIFIED ? 1 : 0;
 }
+/// k16 steps over a head (32).
 #define AF16_KSTEPS   (AF16_DIM / 16u)             /* 32 k-steps for the scores */
+/// k16 steps per warp of the 4-way score split (8).
 #define AF16_KPW      (AF16_KSTEPS / 4u)           /* 8 k-steps per warp (4-way) */
 
 /* Capacity of the per-query raw-row scratch (sRawRows).  A sliding-window plan
@@ -153,6 +176,7 @@ static int af16_unified_rows(void) {
  * 2*max_image_tokens + 1 rows.  The scratch must hold whichever is larger; a
  * plan that asked for more would be clipped here, and clipping an image span is
  * exactly the wrong answer this bound exists to make impossible. */
+/// Capacity of the per-query raw-row scratch.
 #define AF16_RAWROWS  (2u * PULSAR_VISION_MAX_N_TOKEN + 1u)
 static_assert(AF16_RAWROWS >= PULSAR_CUDA_ATTENTION_RAW_SCORE_CAP,
               "sRawRows must also cover the dispatcher's raw-window cap");
@@ -173,6 +197,7 @@ static_assert(AF16_RAWROWS >= PULSAR_CUDA_ATTENTION_RAW_SCORE_CAP,
 /* +8 halves of padding: the phase-1 B fragment walks DOWN a column of the tile
  * (fixed dim, varying row), so an unpadded 512-wide row stride would put every
  * lane in the same bank. */
+/// Padded KV tile row stride, halves.
 #define AF16_KVSTRIDE (AF16_DIM + 8u)
 
 /* L210 split-K partial record per (token, head, split): [0] the running max m,
@@ -180,7 +205,9 @@ static_assert(AF16_RAWROWS >= PULSAR_CUDA_ATTENTION_RAW_SCORE_CAP,
  * sums them), [AF16_PART_ACC, +AF16_DIM) the unnormalised value accumulator.
  * An empty split writes m = -INFINITY, l = 0 and no accumulator; the combine
  * folds it with weight zero and never reads the accumulator. */
+/// Offset of a split-K partial record's accumulator (after m, l and padding), floats.
 #define AF16_PART_ACC     4u
+/// Floats per split-K partial record.
 #define AF16_PART_STRIDE  (AF16_PART_ACC + AF16_DIM)
 static_assert(AF16_PART_ACC % 4u == 0u && AF16_PART_STRIDE % 4u == 0u,
               "partial accumulators must stay 16-byte aligned: the epilogue stores float2 pairs");
@@ -207,12 +234,29 @@ static_assert(AF16_PART_ACC % 4u == 0u && AF16_PART_STRIDE % 4u == 0u,
  * at one row (host-bound there, so unseen) and 75 at width; 4 splits model at
  * ~38 at one row and ~35..70 at 6..12 rows, all under the classic 85.  Splits
  * past a row's tile count fold as empty. */
+/// Logical split-K splits per decode row.
 #define AF16_SPLITS       4u
+/// @param partials the partial records.
+/// @param t token row.
+/// @param n_head query heads.
+/// @param h head.
+/// @param n_split splits per (row, head).
+/// @param split the split.
+/// @return the accumulator of (t, h)'s split `split`.
 __device__ __forceinline__ static float *af16_part_acc(float *partials, uint32_t t, uint32_t n_head,
                                                        uint32_t h, uint32_t n_split, uint32_t split) {
     return partials + ((uint64_t)t * n_head + h) * n_split * AF16_PART_STRIDE +
            (uint64_t)split * AF16_PART_STRIDE + AF16_PART_ACC;
 }
+/// Writes a partial record's (m, l).
+/// @param partials the partial records.
+/// @param t token row.
+/// @param n_head query heads.
+/// @param h head.
+/// @param n_split splits per (row, head).
+/// @param split the split.
+/// @param m running max.
+/// @param l running sum.
 __device__ __forceinline__ static void af16_part_header(float *partials, uint32_t t, uint32_t n_head,
                                                         uint32_t h, uint32_t n_split, uint32_t split,
                                                         float m, float l) {
@@ -221,6 +265,17 @@ __device__ __forceinline__ static void af16_part_header(float *partials, uint32_
     rec[1] = l;
 }
 
+/// One m16n8k16 f16 MMA, f32 accumulate (traps below sm_80).
+/// @param d0 accumulator 0, in/out.
+/// @param d1 accumulator 1, in/out.
+/// @param d2 accumulator 2, in/out.
+/// @param d3 accumulator 3, in/out.
+/// @param a0 A fragment register 0.
+/// @param a1 A fragment register 1.
+/// @param a2 A fragment register 2.
+/// @param a3 A fragment register 3.
+/// @param b0 B fragment register 0.
+/// @param b1 B fragment register 1.
 __device__ __forceinline__ static void af16_mma(
         float &d0, float &d1, float &d2, float &d3,
         uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3,
@@ -245,8 +300,15 @@ __device__ __forceinline__ static void af16_mma(
  * existed for the f32-Q instantiation; that instantiation's only reference was
  * a smem grant, both deleted 2026-09-02.  A future Q width change adds its
  * specialization here and the compiler names the site.) */
+/// @tparam QT the stored Q element type.
+/// @param p a Q row.
+/// @param i an even element index.
+/// @return elements i, i + 1 as a packed f16 fragment word.
 template <typename QT>
 __device__ __forceinline__ static uint32_t af16_load_pair(const QT *p, uint32_t i);
+/// @param p a Q row.
+/// @param i an even element index.
+/// @return the two halves as one word.
 template <>
 __device__ __forceinline__ uint32_t af16_load_pair<__half>(const __half *p, uint32_t i) {
     return *(const uint32_t *)(p + i);
@@ -254,6 +316,9 @@ __device__ __forceinline__ uint32_t af16_load_pair<__half>(const __half *p, uint
 
 /* Not under PULSAR_SM80: the fused Q-prep pair builder below (L037)
  * calls af16_pack from outside the MMA-only region. */
+/// @param lo low element.
+/// @param hi high element.
+/// @return the packed f16 pair (round to nearest).
 __device__ __forceinline__ static uint32_t af16_pack(float lo, float hi) {
     return (uint32_t)__half_as_ushort(__float2half(lo)) |
            ((uint32_t)__half_as_ushort(__float2half(hi)) << 16);
@@ -265,6 +330,7 @@ __device__ __forceinline__ static uint32_t af16_pack(float lo, float hi) {
  * concession here, it is the only setting that lets the accumulators live in
  * registers at all. */
 #ifndef AF16_MINBLK
+/// Minimum resident blocks per SM for __launch_bounds__ (1: the accumulators stay in registers).
 #define AF16_MINBLK 1
 #endif
 /* Build one packed f16 pair from RAW q: apply this head's RMS scale when the
@@ -283,6 +349,16 @@ __device__ __forceinline__ static uint32_t af16_pack(float lo, float hi) {
  * head -- nope and rope dims alike, before the rotation -- because that is where
  * the reference's `q *= ...` sits; scaling only the rotated pair would be a
  * different function. */
+/// @tparam QT the stored Q element type.
+/// @param qrow the raw Q row of one head.
+/// @param c0 even element index.
+/// @param scale the head's RMS scale (1 without a Q norm).
+/// @param q_nope dims before the rope tail.
+/// @param qp the fused Q rope descriptor (by value).
+/// @param rope_pos the row's rope position.
+/// @param corr0 YaRN correction dim 0.
+/// @param corr1 YaRN correction dim 1.
+/// @return the packed f16 pair.
 template <typename QT>
 __device__ static inline uint32_t af16_pack_qraw(
         const QT *qrow, uint32_t c0, float scale, uint32_t q_nope,
@@ -317,6 +393,12 @@ __device__ static inline uint32_t af16_pack_qraw(
  * which is exactly the pre-L216 window.  This is the ONE place that min/max
  * lives: the ring plan and the dense plan both call it, so the forward reach
  * cannot be forgotten in one of them. */
+/// @param qpos the query position.
+/// @param window the sliding window, rows (banked mode: 1 .. PULSAR_CUDA_ATTENTION_RAW_SCORE_CAP).
+/// @param vis_l image-span count to the left (0 outside a span).
+/// @param vis_r image-span count to the right.
+/// @param lo_out out: first visible raw position.
+/// @param hi_out out: last visible raw position.
 __device__ __forceinline__ static void af16_vis_bounds(
         uint32_t qpos, uint32_t window, int32_t vis_l, int32_t vis_r,
         uint32_t *lo_out, uint32_t *hi_out) {
@@ -332,6 +414,47 @@ __device__ __forceinline__ static void af16_vis_bounds(
     *hi_out = hi;
 }
 
+/// The fp16 tensor-core attention: grid (n_tokens, ceil(n_head / 32), split blocks), 512 threads,
+/// AF16_DYNSMEM_BYTES dynamic shared memory (granted by af16_dynsmem_ok).
+/// @tparam QT the stored Q element type (__half).
+/// @param heads out: the attention output heads, [n_tokens][n_head][head_dim] (stored heads type).
+/// @param sinks the attention sinks, f32 [n_head], device.
+/// @param q the queries, [n_tokens][n_head][head_dim] (stored Q type; raw when q_prep is non-NULL).
+/// @param raw_kv the raw KV rows (ring, chunk pack buffer or banked pools; the profile's row family).
+/// @param comp_kv the compressed KV rows (MAIN or UNIFIED rows); unused when n_comp == 0.
+/// @param topk per-token top-k compressed row indices, i32 [n_tokens][top_k], or NULL (the visible prefix).
+/// @param n_tokens query rows.
+/// @param n_comp compressed rows (banked mode: the cross-bank superset clamp).
+/// @param window the sliding window, rows (banked mode: 1 .. PULSAR_CUDA_ATTENTION_RAW_SCORE_CAP).
+/// @param ratio compression ratio (positions per compressed row).
+/// @param n_head query heads.
+/// @param pos0 the first row's position (scalar mode).
+/// @param n_raw raw rows visible (scalar mode; ignored in banked mode).
+/// @param raw_cap raw ring capacity per bank, rows.
+/// @param raw_start_in the ring slot of the oldest visible raw row (scalar mode).
+/// @param top_k compressed rows each query selects.
+/// @param positions per-row absolute positions, i32 [n_tokens], or NULL.
+/// @param seq_id per-row bank ids, i32 [n_tokens], or NULL (both or neither with positions).
+/// @param comp_bank_ptrs optional per-bank compressed-pool base table (banked mode), or NULL.
+/// @param comp_cap compressed rows per bank (banked mode).
+/// @param n_banks banks in the pools (banked mode).
+/// @param vis_left image-span visibility to the left, i32 [n_tokens], or NULL (text).
+/// @param vis_right image-span visibility to the right, i32 [n_tokens], or NULL (text).
+/// @param ring nonzero: the ring / descriptor row plan.
+/// @param non_causal nonzero: every ring row up to the last is visible (the drafter's raw-window forward).
+/// @param gact_data grouped E4M3 data slots for the attn-output "a" GEMM, or NULL (no emission).
+/// @param gact_scale the grouped E8M0 scale slab.
+/// @param gact_kbp the scale slab's padded k-block pitch.
+/// @param gact_slab bytes between groups' scale slabs.
+/// @param n_groups output groups of the "a" GEMM.
+/// @param n_nope head dims before the rope tail (the epilogue encodes these).
+/// @param gact_tok0 this launch's first row in the grouped slab.
+/// @param gact_ntok the grouped slab's row count.
+/// @param qp the fused Q rope descriptor (by value).
+/// @param q_raw nonzero: q holds raw projections (rope fused).
+/// @param unified_rows nonzero: raw and comp rows are UNIFIED rows.
+/// @param partials split-K partial records for rows < n_dec, or NULL.
+/// @param n_dec rows that take the split-K walk.
 template <typename QT>
 __global__ __launch_bounds__(AF16_THREADS, AF16_MINBLK)
 static void attn_f16_kernel(
@@ -1155,6 +1278,16 @@ static void attn_f16_kernel(
  * model; the engine passes the same freq/YaRN settings to both), the
  * position is the row's, the direction is inverse -- as the engine's
  * rope_tail call for heads has always been. */
+/// Folds the split-K partials (and the sink) into each decode row's heads.  Grid (n_dec, n_head), 512 threads.
+/// @param heads out: the attention output heads, [n_tokens][n_head][head_dim] (stored heads type).
+/// @param sinks the attention sinks, f32 [n_head], device.
+/// @param partials the split-K partial records.
+/// @param n_head query heads.
+/// @param n_split splits per (row, head).
+/// @param positions per-row absolute positions, i32 [n_tokens], or NULL.
+/// @param pos0 the first row's position (scalar mode).
+/// @param qp the fused Q rope descriptor (by value).
+/// @param fold_rope nonzero: apply the heads' inverse tail rope too.
 __global__ __launch_bounds__(AF16_DIM)
 static void attn_f16_combine_kernel(pulsar_heads_t *__restrict__ heads,
                                     const float *__restrict__ sinks,
@@ -1204,6 +1337,10 @@ static void attn_f16_combine_kernel(pulsar_heads_t *__restrict__ heads,
     }
 }
 
+/** @def AF16_STAGE_TILE(BUF, ROW0)
+ *  attn_f16_kernel's tile stage: cp.async rows ROW0 .. ROW0 + 15 of the query's row plan (raw rows, then
+ *  compressed rows) into stage buffer BUF, each at its own family's byte count, recording its format id. */
+
 /* ---- launcher ----------------------------------------------------------- */
 
 /* PULSAR_SM80 says what the COMPILE target has (pulsar_cuda_arch.cuh) and is
@@ -1214,6 +1351,7 @@ static void attn_f16_combine_kernel(pulsar_heads_t *__restrict__ heads,
  * refuses.  The dispatcher prints a generic "fp16 ... FAILED" after a 0 from
  * here; WHICH check failed was invisible, and that is what cost three days on
  * L032 (the comp_cap check below). */
+/// Refuses the enclosing launcher (return 0) when `cond` is false, naming `what`, the predicate and the values.
 #define AF16_REQUIRE(what, cond, fmt, ...)                                              \
     do {                                                                                \
         if (!(cond)) {                                                                  \
@@ -1223,6 +1361,7 @@ static void attn_f16_combine_kernel(pulsar_heads_t *__restrict__ heads,
         }                                                                               \
     } while (0)
 
+/// @return 1 when the device has the m16n8k16 f16 MMA (sm_80+).
 static int af16_device_supported(void) {
     return pulsar_cuda_device_major() >= 8 ? 1 : 0;   /* mma.m16n8k16.f16 is sm_80+ */
 }
@@ -1245,6 +1384,7 @@ int pulsar_gpu_attention_prefill_reads_packed_comp(void) {
  * capped at 48 KB, so the tile double-buffer's bytes must be granted here.
  * Fail-loud: a refused grant means the launch would silently get 0 dynamic
  * bytes and fault, so the caller refuses instead. */
+/// @return 1 once the dynamic shared-memory grant for attn_f16_kernel succeeded, else 0.
 static int af16_dynsmem_ok(void) {
     static int state = 0;   /* 0 = untried, 1 = ok, -1 = refused */
     if (state == 0) {
@@ -1274,6 +1414,7 @@ static int af16_dynsmem_ok(void) {
  * WAVES, each paying the block's ~18 us fixed cost, and the served-lane census
  * read the split kernel at 75 us against the classic walk's 85 at 6..12 rows
  * (rows/L210.md).  Asked of the device once. */
+/// @return the device's SM count (the split-K block target), cached; 48 if the query fails.
 static uint32_t af16_split_target_blocks(void) {
     static int sms = 0;
     if (sms <= 0) {
@@ -1295,6 +1436,11 @@ static uint32_t af16_split_target_blocks(void) {
  * kept.  cudaFree of the outgrown block synchronises the device, so the
  * combine that read it has finished.  (Not capture-safe: a graph-captured
  * step would have to size this before capture.) */
+/// The thread-local split-K partial buffer, grown on demand (not capture-safe).
+/// @param n_dec split-K rows.
+/// @param n_head query heads.
+/// @param n_split splits per (row, head).
+/// @return the buffer, or NULL on an allocation failure.
 static float *af16_partials(uint32_t n_dec, uint32_t n_head, uint32_t n_split) {
     static thread_local float   *buf = NULL;
     static thread_local uint64_t cap = 0;
@@ -1321,6 +1467,31 @@ int pulsar_gpu_attn_f16_tier_on(void) {
     return af16_device_supported();
 }
 
+/// Dense-mode prefill attention with the optional grouped E4M3 emission.
+/// @param heads_v out: the attention output heads (pulsar_heads_t), [n_tokens][n_head][512].
+/// @param sinks the attention sinks, f32 [n_head], device.
+/// @param q the queries, [n_tokens][n_head][head_dim] (stored Q type; raw when q_prep is non-NULL).
+/// @param raw_kv the raw KV rows (ring, chunk pack buffer or banked pools; the profile's row family).
+/// @param comp_kv the compressed KV rows (MAIN or UNIFIED rows); unused when n_comp == 0.
+/// @param n_tokens query rows.
+/// @param n_comp compressed rows (banked mode: the cross-bank superset clamp).
+/// @param window the sliding window, rows (banked mode: 1 .. PULSAR_CUDA_ATTENTION_RAW_SCORE_CAP).
+/// @param ratio compression ratio (positions per compressed row).
+/// @param n_head query heads.
+/// @param head_dim head width (512).
+/// @param gact_data grouped E4M3 data slots for the attn-output "a" GEMM, or NULL (no emission).
+/// @param gact_scale the grouped E8M0 scale slab.
+/// @param gact_kbp the scale slab's padded k-block pitch.
+/// @param gact_slab bytes between groups' scale slabs.
+/// @param n_groups output groups of the "a" GEMM.
+/// @param n_nope head dims before the rope tail (the epilogue encodes these).
+/// @param gact_tok0 this launch's first row in the grouped slab.
+/// @param gact_ntok the grouped slab's row count.
+/// @param positions per-row absolute positions, i32 [n_tokens], or NULL.
+/// @param q_prep the fused Q rope descriptor, or NULL when q is already roped.
+/// @param vis_left image-span visibility to the left, i32 [n_tokens], or NULL (text).
+/// @param vis_right image-span visibility to the right, i32 [n_tokens], or NULL (text).
+/// @return 1 on success, 0 on a refusal (named on stderr) or a failure.
 int pulsar_gpu_attention_f16_prefill_mx(
         void *heads_v, const float *sinks, const void *q,
         const pulsar_winkv_row_t *raw_kv, const pulsar_mainkv_row_t *comp_kv,
@@ -1430,6 +1601,22 @@ static_assert(std::is_same<
     "pulsar_gpu.h's pulsar_gpu_attention_f16_prefill has drifted from the "
     "definition below; update the header -- do not add an overload");
 
+/// Dense-mode prefill attention without emission (the kernel test's narrow entry).
+/// @param heads_v out: the attention output heads (pulsar_heads_t), [n_tokens][n_head][512].
+/// @param sinks the attention sinks, f32 [n_head], device.
+/// @param q the queries, [n_tokens][n_head][head_dim] (stored Q type; raw when q_prep is non-NULL).
+/// @param raw_kv the raw KV rows (ring, chunk pack buffer or banked pools; the profile's row family).
+/// @param comp_kv the compressed KV rows (MAIN or UNIFIED rows); unused when n_comp == 0.
+/// @param n_tokens query rows.
+/// @param n_comp compressed rows (banked mode: the cross-bank superset clamp).
+/// @param window the sliding window, rows (banked mode: 1 .. PULSAR_CUDA_ATTENTION_RAW_SCORE_CAP).
+/// @param ratio compression ratio (positions per compressed row).
+/// @param n_head query heads.
+/// @param head_dim head width (512).
+/// @param q_prep the fused Q rope descriptor, or NULL when q is already roped.
+/// @param vis_left image-span visibility to the left, i32 [n_tokens], or NULL (text).
+/// @param vis_right image-span visibility to the right, i32 [n_tokens], or NULL (text).
+/// @return 1 on success, 0 on a refusal (named on stderr) or a failure.
 int pulsar_gpu_attention_f16_prefill(
         void *heads_v, const float *sinks, const void *q,
         const pulsar_winkv_row_t *raw_kv, const pulsar_mainkv_row_t *comp_kv,

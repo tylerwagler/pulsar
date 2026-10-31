@@ -1,3 +1,5 @@
+/** @file
+ *  The unified NVFP4 attention KV row: its packer and the ring scatter. */
 /* 0731's unified NVFP4 attention KV row: the packer and the ring scatter.
  *
  * WHY A SEPARATE TU.  The two-profile engine stores two different KV row
@@ -29,11 +31,15 @@
  * zero mismatches, every RNE tie and the subnormal range); the ctor IS the
  * cvt.rn.satfinite encoding, so the byte pattern and the round-trip agree by
  * construction.  Static: this TU is their only caller. */
+/// @param x a value.
+/// @return its E4M3FN byte, round to nearest even, saturating.
 __device__ static uint8_t dsv4_e4m3fn_encode_dev(float x) {
     __nv_fp8_e4m3 f(x);
     return *(const uint8_t *)&f;
 }
 
+/// @param x a value.
+/// @return x rounded through E4M3FN and back to f32.
 __device__ static float dsv4_e4m3fn_dequant_dev(float x) {
     return (float)__nv_fp8_e4m3(x);
 }
@@ -47,6 +53,18 @@ __device__ static float dsv4_e4m3fn_dequant_dev(float x) {
  * 64 threads per row.  The per-16 amax is an atomicMax on the int view --
  * non-negative floats order-match their bit patterns, and max is
  * order-independent, so the result is deterministic. */
+/// Grid n_rows, 64 threads (static shared memory sized for head_dim 512).
+/// @param x out: the decoded row values, f32 [n_rows][head_dim], or NULL.
+/// @param src the rows, f32 [n_rows][head_dim].
+/// @param out the packed rows (contiguous run or ring).
+/// @param out_row0 the first destination row / position.
+/// @param n_rows rows.
+/// @param head_dim head width.
+/// @param n_rot rope tail width (stored bf16).
+/// @param positions per-row positions, or NULL.
+/// @param seq_id per-row bank ids, or NULL.
+/// @param n_banks banks.
+/// @param raw_cap ring slots per bank; 0 = contiguous run.
 __global__ static void attn_pack_store_kernel(float *x, const float *src, uint8_t *out,
                                               uint32_t out_row0, uint32_t n_rows,
                                               uint32_t head_dim, uint32_t n_rot,
@@ -152,6 +170,12 @@ int pulsar_gpu_attn_pack_store_tensor(pulsar_gpu_tensor *x, const pulsar_gpu_ten
 
 /* Quantise + store one row into a ring slot (raw_cap != 0): the single-row
  * decode store.  seq_id/positions are NULL -- the slot is `row % raw_cap`. */
+/// @param raw_cache the ring of packed rows.
+/// @param kv the row, f32 [head_dim].
+/// @param raw_cap ring slots.
+/// @param row the row's position (slot row % raw_cap).
+/// @param head_dim head width.
+/// @return 1 on success, 0 on bad operands or a launch failure.
 int pulsar_gpu_attn_pack_ring_store_tensor(pulsar_gpu_tensor *raw_cache, const pulsar_gpu_tensor *kv,
                                            uint32_t raw_cap, uint32_t row, uint32_t head_dim) {
     if (!raw_cache || !kv || raw_cap == 0 ||
@@ -169,6 +193,16 @@ int pulsar_gpu_attn_pack_ring_store_tensor(pulsar_gpu_tensor *raw_cache, const p
 }
 
 /* Quantise + store a batch into banked ring slots: the prefill store. */
+/// @param raw_cache the banked ring of packed rows.
+/// @param kv the rows, f32 [n_tokens][head_dim].
+/// @param raw_cap ring slots per bank.
+/// @param pos0 the first token's position (slot rule when positions is NULL).
+/// @param n_tokens rows.
+/// @param head_dim head width (512).
+/// @param positions per-row positions, or NULL.
+/// @param seq_id per-row bank ids (with positions), or NULL.
+/// @param n_banks banks in raw_cache.
+/// @return 1 on success (or no tokens), 0 on bad operands or a launch failure.
 int pulsar_gpu_attn_pack_ring_store_batch_tensor(pulsar_gpu_tensor *raw_cache, const pulsar_gpu_tensor *kv,
                                                  uint32_t raw_cap, uint32_t pos0, uint32_t n_tokens,
                                                  uint32_t head_dim, const pulsar_gpu_tensor *positions,
@@ -194,6 +228,16 @@ int pulsar_gpu_attn_pack_ring_store_batch_tensor(pulsar_gpu_tensor *raw_cache, c
  * pulsar_kv_ring_slot with attn_pack_store_kernel, so the destination rule
  * cannot drift between the two.  Copying bytes (rather than re-quantising) is
  * what makes the ring hold exactly what attention read. */
+/// Grid n_rows, 64 threads, a byte copy per row.
+/// @param src packed rows, [n_rows][rowbytes].
+/// @param out the ring.
+/// @param out_row0 the first row's position.
+/// @param n_rows rows.
+/// @param head_dim head width.
+/// @param positions per-row positions, or NULL.
+/// @param seq_id per-row bank ids, or NULL.
+/// @param n_banks banks.
+/// @param raw_cap ring slots per bank.
 __global__ static void attn_pack_scatter_kernel(const uint8_t *__restrict__ src, uint8_t *out,
                                                 uint32_t out_row0, uint32_t n_rows,
                                                 uint32_t head_dim,
@@ -211,6 +255,17 @@ __global__ static void attn_pack_scatter_kernel(const uint8_t *__restrict__ src,
     for (uint32_t b = threadIdx.x; b < (uint32_t)rowbytes; b += blockDim.x) dr[b] = sr[b];
 }
 
+/// Scatters already-packed rows into the (banked) ring.
+/// @param raw_cache the ring.
+/// @param packed the packed rows, [n_tokens][rowbytes].
+/// @param raw_cap ring slots per bank.
+/// @param pos0 the first token's position (slot rule when positions is NULL).
+/// @param n_tokens rows.
+/// @param head_dim head width (512).
+/// @param positions per-row positions, or NULL.
+/// @param seq_id per-row bank ids (with positions), or NULL.
+/// @param n_banks banks in raw_cache.
+/// @return 1 on success (or no tokens), 0 on bad operands or a launch failure.
 int pulsar_gpu_attn_pack_scatter_tensor(pulsar_gpu_tensor *raw_cache, const pulsar_gpu_tensor *packed,
                                         uint32_t raw_cap, uint32_t pos0, uint32_t n_tokens,
                                         uint32_t head_dim, const pulsar_gpu_tensor *positions,

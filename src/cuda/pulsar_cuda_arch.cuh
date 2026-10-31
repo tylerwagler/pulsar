@@ -1,3 +1,5 @@
+/** @file
+ *  Device-pass capability tiers (PULSAR_SM80 / SM89 / SM90): the one place a kernel asks what its target has. */
 #pragma once
 
 #include <cuda_runtime.h>
@@ -19,18 +21,21 @@
  * Family-specific (sm_120f) instructions keep their own __CUDA_ARCH_FAMILY_SPECIFIC__ tests beside their asm. */
 
 #if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800
+/// 1 when the device pass targets sm_80+ (and in the host pass): m16n8k16 f16/bf16 MMA, cp.async, __reduce_*_sync.
 #define PULSAR_SM80 1
 #else
 #define PULSAR_SM80 0
 #endif
 
 #if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 890
+/// 1 when the device pass targets sm_89+ (and in the host pass): e4m3 MMA operands, cvt e4m3x2.
 #define PULSAR_SM89 1
 #else
 #define PULSAR_SM89 0
 #endif
 
 #if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 900
+/// 1 when the device pass targets sm_90+ (and in the host pass): thread-block clusters.
 #define PULSAR_SM90 1
 #else
 #define PULSAR_SM90 0
@@ -82,6 +87,7 @@ __device__ __forceinline__ T pulsar_warp_max(T v) {
 /* The current device's compute capability as major * 10 + minor (75 Turing, 89 Ada, 121 GB10), asked once per process;
  * 0 if unknown.  Inline (one cache per program) so a model-free gate that links a single kernel object needs no
  * runtime object for it. */
+/// @return the current device's compute capability, major * 10 + minor, cached on first call; 0 if unknown.
 inline int pulsar_cuda_device_cc(void) {
     static int cc = -1;
     if (cc < 0) {
@@ -92,10 +98,12 @@ inline int pulsar_cuda_device_cc(void) {
     }
     return cc;
 }
+/// @return the current device's compute-capability major (0 if unknown).
 inline int pulsar_cuda_device_major(void) { return pulsar_cuda_device_cc() / 10; }
 
 /* A lane whose kernels need compute capability `cc` (major * 10 + minor) refuses on a lesser device -- on the host, by
  * name, once per call site -- returning `ret`; its kernels' trapping arms (the tiers above) then never run.  (L321) */
+/// Refuses the enclosing function (`return ret`) on a device below compute capability `cc`, naming `lane` once.
 #define PULSAR_REQUIRE_CC(cc, lane, ret)                                                                          \
     do {                                                                                                         \
         if (pulsar_cuda_device_cc() < (cc)) {                                                                     \
@@ -110,4 +118,6 @@ inline int pulsar_cuda_device_major(void) { return pulsar_cuda_device_cc() / 10;
     } while (0)
 
 /* mma.sync.kind::mxf8f6f4.block_scale (MXFP8 experts, MXFP4 indexer): the sm_12x family only. */
+/// @param major a compute-capability major.
+/// @return true when it has mma.sync kind::mxf8f6f4.block_scale (the sm_12x family).
 static inline bool pulsar_cuda_block_scale_mma(int major) { return major == 12; }

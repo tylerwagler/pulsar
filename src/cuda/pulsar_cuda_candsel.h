@@ -1,3 +1,5 @@
+/** @file
+ *  The CandidateSelector chain head (L299): re-scores a block draft's candidates and walks one chain. */
 /* CandidateSelector chain head (L299) -- a block drafter's last stage, family-neutral: the second chain-head kind of
  * the block lane (spec_block.h), beside the LiLiCorr candidate head (pulsar_cuda_lilicorr.h).
  *
@@ -33,6 +35,7 @@
 #ifdef __CUDACC__
 #include <cuda_runtime.h>
 #else
+/// Host-pass stand-in for the CUDA runtime's stream handle (C and non-nvcc includers).
 typedef struct CUstream_st *cudaStream_t;
 #endif
 
@@ -55,6 +58,23 @@ extern "C" {
  *  Device outputs: scores [n_banks][slots][k][k] f32, chain_ids / chain_rows [n_banks][slots] i32 (the header).
  *  1 <= k <= PULSAR_CANDSEL_TOPK_MAX, 1 <= rank <= PULSAR_CANDSEL_RANK_MAX, 1 <= slots <= PULSAR_CANDSEL_SLOTS_MAX.
  *  @return 0, -1 refused (named on stderr, nothing launched), -3 launch failure. */
+/// @param n_banks banks (<= 65535).
+/// @param slots slots per bank.
+/// @param k candidates per slot.
+/// @param rank codebook width.
+/// @param vocab codebook rows (>= 1).
+/// @param cand candidate ids.
+/// @param unary candidate scores.
+/// @param hp projected pass rows.
+/// @param hp_bank hp's bank stride, rows (>= slots).
+/// @param hp_ld hp's row stride, elements (>= rank).
+/// @param anchor each bank's carry.
+/// @param pred predecessor codebook.
+/// @param succ successor codebook.
+/// @param scores out: the score table.
+/// @param chain_ids out: the chosen ids.
+/// @param chain_rows out: the chosen candidate indices.
+/// @param stream the stream.
 int pulsar_candsel_launch(uint32_t n_banks, uint32_t slots, uint32_t k, uint32_t rank, uint32_t vocab,
                           const int32_t *cand, const float *unary, const uint16_t *hp, uint64_t hp_bank,
                           uint64_t hp_ld, const int32_t *anchor, const uint16_t *pred, const uint16_t *succ,

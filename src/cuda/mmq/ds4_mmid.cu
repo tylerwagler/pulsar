@@ -1,3 +1,5 @@
+/** @file
+ *  pulsar's mm_ids_helper launcher over the vendored mmid.cu: the n_expert_used == 1 and large-n paths. */
 // ds4-owned companion to the vendored mmid.cu (L008, 2026-08-14).
 //
 // WHY THIS FILE INCLUDES A .cu: upstream's launch_mm_ids_helper<N> is file-static
@@ -31,6 +33,17 @@
 // ~190 KB and L2-resident across all expert blocks.  Like the smem kernel,
 // behavior is undefined if one token lists the same expert in multiple slots
 // (the router's top-k is without replacement, so this cannot occur).
+/// Grid n_experts, one warp per block.
+/// @tparam n_expert_used_template experts per token, or 0 for the runtime value.
+/// @param ids the routes, i32 [n_tokens][n_expert_used].
+/// @param ids_src1 out: per sorted assignment, its source activation row.
+/// @param ids_dst out: per sorted assignment, its output column (token * n_expert_used + slot).
+/// @param expert_bounds out: per expert, its first sorted assignment, [n_experts + 1].
+/// @param n_tokens tokens.
+/// @param n_expert_used_var experts per token when the template argument is 0.
+/// @param nchannels_y activation channels per token (the source row is token * sis1 + slot % nchannels_y).
+/// @param si1 ids row stride, elements.
+/// @param sis1 activation token stride, rows.
 template <int n_expert_used_template>
 __launch_bounds__(ggml_cuda_get_physical_warp_size(), 1)
 static __global__ void mm_ids_helper_global(

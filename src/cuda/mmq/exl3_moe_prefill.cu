@@ -1,4 +1,6 @@
 // SPDX-License-Identifier: MIT
+/** @file
+ *  The EXL3 routed-expert projections on fp16 tensor cores: the prompt-chunk grouped GEMM and the decode split-K GEMM. */
 // The EXL3 routed-expert projections on fp16 tensor cores, every family: the arm for PROMPT CHUNKS
 // (L251 Qwen; L287 DeepSeek) and, below it, the arm for DECODE rows (task #46).  Both run over the
 // expert-sorted schedule (mm_ids_helper's ids_src1 / ids_dst / expert_bounds) and write the UNROTATED
@@ -71,6 +73,10 @@ constexpr int kMaxE    = 1024;        ///< experts the one-block plan kernel sca
 /* The tensor-core arms (prefill and decode) read exactly the rates the routed projection kinds admit
  * (exl3_arm_has_rate is the one table): a projection never meets a rate no arm serves, and the arms
  * instantiate nothing no kind admits. */
+/// Whether EXL3_ARM_MOE_PREFILL admits exactly the rates the routed kinds (DOWN, PAIR, GATE_UP_FUSED) admit,
+/// for every rate from k2 to 16 (a compile-time recursion).
+/// @param k2  the first rate checked
+/// @return    true when the tables agree
 constexpr bool covers_routed_rates(int k2 = 0) {
     return k2 > 16 || (exl3_arm_has_rate(EXL3_ARM_MOE_PREFILL, k2) ==
                            (exl3_arm_has_rate(EXL3_ARM_DOWN, k2) || exl3_arm_has_rate(EXL3_ARM_PAIR, k2) ||
@@ -79,13 +85,23 @@ constexpr bool covers_routed_rates(int k2 = 0) {
 }
 static_assert(covers_routed_rates(), "EXL3_ARM_MOE_PREFILL's rates must be the routed projection kinds' rates");
 
+/// The prefill GEMM's dynamic shared memory: the double-buffered A tiles and their inverse prescales (~35 KB).
 struct Smem {
     __half a_hi[2][kBM][kApad];       ///< A of block b in buffer b & 1: block b + 1 loads while b computes
+    /// The staged block's inverse prescales per assignment row, double-buffered like a_hi.
     float  inv[2][kBM];
 };
 
+/// 2^e as an f32 built from its exponent bits.
+/// @param e  the exponent, in [-126, 127]
+/// @return   2^e
 __device__ __forceinline__ float pow2f(int e) { return __int_as_float((127 + e) << 23); }   /* e in [-126, 127] */
 
+/// d += A * B on one mma.sync m16n8k16, fp16 operands, f32 accumulate; traps below sm_80 (the launchers refuse first).
+/// @param d   the f32 C/D fragment, accumulated in place
+/// @param a   the A fragment (four fp16x2 registers)
+/// @param b0  B fragment register 0
+/// @param b1  B fragment register 1
 __device__ __forceinline__ void mma_16816(float (&d)[4], const uint32_t (&a)[4], uint32_t b0, uint32_t b1) {
 #if PULSAR_SM80
     asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
@@ -97,12 +113,19 @@ __device__ __forceinline__ void mma_16816(float (&d)[4], const uint32_t (&a)[4],
 #endif
 }
 
+/// Four 8x8 b16 matrices from shared memory into an MMA A fragment (ldmatrix .x4).
+/// @param a  out: the four fragment registers
+/// @param p  this lane's 16-byte row address in shared memory
 __device__ __forceinline__ void ldmatrix_x4(uint32_t (&a)[4], const __half *p) {
     const uint32_t s = (uint32_t)__cvta_generic_to_shared(p);
     asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
                  : "=r"(a[0]), "=r"(a[1]), "=r"(a[2]), "=r"(a[3]) : "r"(s));
 }
 
+/// 16 bytes global -> shared, asynchronously (cp.async.cg); traps below sm_80.
+/// @param smem       16-byte aligned shared destination
+/// @param gmem       16-byte aligned global source
+/// @param src_bytes  bytes read (16, or 0 to zero-fill)
 __device__ __forceinline__ void cp_async16(void *smem, const void *gmem, int src_bytes) {
     const uint32_t s = (uint32_t)__cvta_generic_to_shared(smem);
 #if PULSAR_SM80
@@ -116,6 +139,12 @@ __device__ __forceinline__ void cp_async16(void *smem, const void *gmem, int src
  * blocks of kBM, in expert order.  One block of E threads, an inclusive
  * Hillis-Steele scan over the per-expert block counts.  `cap` is the list's
  * length (the launch sizes it to n_assign / kBM + E + 1, which no routing exceeds). */
+/// The prefill GEMM's work list.  Grid 1, block the next power of two >= max(E, 32) threads (<= kMaxE).
+/// @param bounds  expert_bounds [E + 1], ascending
+/// @param E       experts
+/// @param work    out: items (expert, first assignment), in expert order
+/// @param n_work  out: the item count, clamped to cap
+/// @param cap     the list's length
 __global__ void exl3_moe_plan_kernel(const int32_t *__restrict__ bounds, int E, int2 *__restrict__ work,
                                      int *__restrict__ n_work, int cap) {
     __shared__ int s[kMaxE];
@@ -139,9 +168,13 @@ __global__ void exl3_moe_plan_kernel(const int32_t *__restrict__ bounds, int E, 
 
 /* One projection's operand: the expert table whose suh rotates the input (ROT), the fp16 plane [n_assign][K] and
  * the inverse prescales [n_assign][K / 128] the PREP writes for it. */
+/// One projection's operand as the PREP writes it.
 struct prep_out {
+    /// The projection's expert table (exl3_expert_table()'s pairs): its suh rotates the input when ROT.
     const void *table;
+    /// The fp16 operand plane [n_assign][K].
     __half *phi;
+    /// Inverse prescales f32 [n_assign][K / 128].
     float *pinv;
 };
 
@@ -150,13 +183,19 @@ constexpr int kDecRows = 16;   ///< the decode GEMM's tile: up to 16 consecutive
 /* The decode GEMM's tile list (L297): tile t = (expert, its first assignment), every expert's assignments cut into
  * kDecRows-row tiles, in expert order -- the tiles the decode grid used to find by a binary search per CTA, its
  * idle CTAs included.  NULL tiles: no plan (the prefill arm plans its own work list). */
+/// The decode GEMM's planned tile list (device), or both NULL for none.
 struct dec_plan {
     int2 *tiles;    ///< [<= n_assign]: a tile holds >= 1 assignment
+    /// The tile count, written by the plan.
     int  *n_tiles;
 };
 
 /* The plan, by one 256-thread CTA: thread t counts the tiles of experts [t per, (t + 1) per), an inclusive scan
  * over the counts, then each thread writes its experts' tiles from its offset. */
+/// Writes the decode tile list; called by one whole 256-thread CTA (the prep grid's last).
+/// @param bounds  expert_bounds [E + 1]
+/// @param E       experts
+/// @param p       where the tiles and their count go
 __device__ void plan_decode_tiles(const int32_t *__restrict__ bounds, int E, const dec_plan &p) {
     __shared__ int s[256];
     const int t = threadIdx.x, per = (E + 255) / 256, e0 = min(E, t * per), e1 = min(E, e0 + per);
@@ -180,6 +219,18 @@ __device__ void plan_decode_tiles(const int32_t *__restrict__ bounds, int E, con
  * producer's activation format (exl3_moe_act_format): the row is read as given, never re-encoded.
  * blockIdx.y picks the projection (a decode gate + up pair preps both in one launch).  With a plan (a decode
  * launch), the grid's last CTA of projection 0 writes the decode GEMM's tile list instead. */
+/// PREP (launch_prep).  Grid (ceil(n_assign * K/128 / 8) [+ 1 with a plan], n_proj), 256 threads.
+/// @param o0        projection 0's operand
+/// @param o1        projection 1's operand (blockIdx.y == 1; o0 again when n_proj == 1)
+/// @param xv        the activation: bf16 or E4M3 [rows][K]
+/// @param xsf       E4M3: the ue8m0 plane (pulsar_mx_sfoff); bf16: unread
+/// @param kbp       E4M3: the plane's blocks per row
+/// @param ids_src   source row per assignment
+/// @param bounds    expert_bounds [E + 1]
+/// @param E         experts
+/// @param n_assign  assignments
+/// @param K         input width, a multiple of 128
+/// @param plan      the decode tile list to write, or none
 template <int FMT, bool ROT>
 __global__ void __launch_bounds__(256)
 exl3_moe_prep_kernel(const prep_out o0, const prep_out o1, const void *__restrict__ xv, const uint8_t *__restrict__ xsf,
@@ -255,6 +306,18 @@ exl3_moe_prep_kernel(const prep_out o0, const prep_out o1, const void *__restric
  * at 4096 rows an expert averages ~80 assignments, so fixed 64-row tiles ran ~1.6x the MMAs.  The
  * per-(row, column) arithmetic is the 4 x 2 warp layout's exactly (a fresh fragment per k-tile,
  * scaled into the accumulator, blocks and k-tiles in order). */
+/// The prefill grouped GEMM at rate K2.  Grid (M / 128, the work list's capacity), 256 threads, sizeof(Smem)
+/// dynamic smem; CTAs past *n_work exit.
+/// @param table    the expert table
+/// @param phi      the PREP's fp16 plane [n_assign][K]
+/// @param pinv     its inverse prescales [n_assign][K / 128]
+/// @param ids_dst  output row per assignment
+/// @param bounds   expert_bounds
+/// @param work     the plan's items (expert, first assignment)
+/// @param n_work   the item count
+/// @param out      f32 [rows][M]: each assignment's unrotated z at row ids_dst
+/// @param M        output width, a multiple of 128
+/// @param K        input width, a multiple of 128
 template <int K2>
 __global__ void __launch_bounds__(kThreads, 2)
 exl3_moe_gemm_kernel(const void *__restrict__ table, const __half *__restrict__ phi,
@@ -395,6 +458,7 @@ exl3_moe_gemm_kernel(const void *__restrict__ table, const __half *__restrict__ 
 
 constexpr int kDecWarps = 4;                  ///< the CTA's k-range split four ways, summed in warp order
 constexpr int kDecNT    = 4;                  ///< n16 tiles per warp: every warp covers the CTA's 64 outputs
+/// Outputs per decode CTA (64).
 constexpr int kDecBN    = kDecNT * 16;
 constexpr int kDecMinWarpTiles = 16;          ///< k-tiles a warp runs at least: the split count's floor
 constexpr int kDecMinCtas = 4;                ///< CTAs per SM the register budget is held to (128, no spill)
@@ -409,6 +473,8 @@ constexpr int kDecMinCtas = 4;                ///< CTAs per SM the register budg
 /* The K splits of a K-wide projection: as many as keep every warp at >= kDecMinWarpTiles k-tiles, dividing
  * the k-tiles evenly.  A function of K ALONE -- never of the row count -- so a row's bits do not depend on
  * how many rows ride with it. */
+/// @param K  input width, a multiple of 128
+/// @return   the split count SK, >= 1
 int decode_splits(int K) {
     const int q = (K >> 4) / kDecWarps;       /* k-tiles per warp unsplit; K % 128 makes it whole */
     int best = 1;
@@ -419,10 +485,15 @@ int decode_splits(int K) {
 
 /* One projection of a decode launch: its expert table, the PREP's operand for it, its split partials
  * z [splits][rows][M] (rows = the schedule's ids_dst). */
+/// One projection of a decode launch.
 struct dec_mat {
+    /// The expert table.
     const void *table;
+    /// The PREP's fp16 plane [n_assign][K].
     const __half *phi;
+    /// Its inverse prescales [n_assign][K / 128].
     const float *pinv;
+    /// The split partials f32 [SK][rows][M].
     float *z;
 };
 
@@ -431,14 +502,20 @@ struct dec_mat {
  * shuffle (TensorFold's experts_grouped.cuh load).  Where it takes two windows (K5, K6: 40 / 48-word tiles, two
  * words a lane) the four shuffles of each tile_word pair cost more than they save: the lane loads its four
  * window words itself (L1 hits on the tile its warp reads) -- measured on Qwen's K5 down, 640 -> 2560. */
+/// The decode kernel's per-rate tile geometry (see the comment above).
 template <int K2> struct DecGeo {
+    /// uint32 words per tile.
     static constexpr int W32 = exl3dev::Rate<K2>::words32;
+    /// Words per lane when a warp loads a tile coalesced, ceil(W32 / 32).
     static constexpr int LW = (W32 + 31) / 32;
     static constexpr bool R8 = exl3dev::run8_slack(K2) >= 0;   ///< one window per lane per tile, else two
     static constexpr int SW = R8 ? 1 : 4;                       ///< words a lane holds per tile
     static_assert(!R8 || LW == 1, "a run8 rate's tile is one word per lane");
 };
 /* word idx of a tile whose lane l holds word l (a run8 rate's tile is at most 32 words: DecGeo static_assert) */
+/// @param w    this lane's word of the tile
+/// @param idx  the word wanted, 0..31
+/// @return     word idx of the tile, from lane idx
 __device__ __forceinline__ uint32_t tile_word(uint32_t w, int idx) { return __shfl_sync(0xffffffffu, w, idx); }
 
 /* CTA = (64 outputs, tile blockIdx.y of the plan -- an m16 tile of one expert's assignments --, one K split of
@@ -450,6 +527,17 @@ __device__ __forceinline__ uint32_t tile_word(uint32_t w, int idx) { return __sh
  * per-k-tile arithmetic.  The next k-tile's words, A and prescales load while this one computes.  The four
  * warps' partials are summed in warp order and written to the split's plane; the consumer (fold / sum) adds
  * the splits in split order. */
+/// The decode split-K GEMM at rate K2.  Grid (M / 64, n_assign, SK x n_proj), 128 threads, 8 KB static smem (the warp reduction).
+/// @param m0       projection 0
+/// @param m1       projection 1 (blockIdx.z / SK == 1)
+/// @param ids_dst  output row per assignment
+/// @param bounds   expert_bounds
+/// @param tiles    the plan's tiles (expert, first assignment)
+/// @param n_tiles  the tile count
+/// @param M        output width, a multiple of 64
+/// @param K        input width, a multiple of 128
+/// @param SK       splits (decode_splits(K))
+/// @param z_split  floats between consecutive splits' planes
 template <int K2>
 __global__ void __launch_bounds__(kDecWarps * 32, kDecMinCtas)
 exl3_moe_decode_kernel(const dec_mat m0, const dec_mat m1, const int32_t *__restrict__ ids_dst,
@@ -585,6 +673,19 @@ exl3_moe_decode_kernel(const dec_mat m0, const dec_mat m1, const int32_t *__rest
     }
 }
 
+/// Launch exl3_moe_decode_kernel<K2>; the arguments are the kernel's.
+/// @param grid     (M / 64, n_assign, SK x n_proj)
+/// @param stream   the launch stream
+/// @param m0       projection 0
+/// @param m1       projection 1
+/// @param ids_dst  output row per assignment
+/// @param bounds   expert_bounds
+/// @param plan     the tile list the PREP wrote
+/// @param M        output width
+/// @param K        input width
+/// @param SK       splits
+/// @param z_split  floats between splits
+/// @return         true
 template <int K2>
 bool launch_decode(const dim3 &grid, cudaStream_t stream, const dec_mat &m0, const dec_mat &m1, const int32_t *ids_dst,
                    const int32_t *bounds, const dec_plan &plan, int M, int K, int SK, int64_t z_split) {
@@ -593,6 +694,20 @@ bool launch_decode(const dim3 &grid, cudaStream_t stream, const dec_mat &m0, con
     return true;
 }
 
+/// Launch exl3_moe_gemm_kernel<K2>, opting it into sizeof(Smem) dynamic smem on first use.
+/// @param grid     (M / 128, the work list's capacity)
+/// @param stream   the launch stream
+/// @param table    the expert table
+/// @param phi      the PREP's plane
+/// @param pinv     its inverse prescales
+/// @param ids_dst  output row per assignment
+/// @param bounds   expert_bounds
+/// @param work     the work list
+/// @param n_work   its count
+/// @param out      f32 [rows][M]
+/// @param M        output width
+/// @param K        input width
+/// @return         false when the smem attribute is refused
 template <int K2>
 bool launch_gemm(const dim3 &grid, cudaStream_t stream, const void *table, const __half *phi,
                  const float *pinv, const int32_t *ids_dst, const int32_t *bounds, const int2 *work,
@@ -610,6 +725,18 @@ bool launch_gemm(const dim3 &grid, cudaStream_t stream, const void *table, const
 
 /* The PREP of n_proj (1 or 2) projections over n_assign assignments, in the activation's own format; with a plan
  * (plan.tiles: a decode launch) one more CTA writes the decode GEMM's tile list. */
+/// @param rotate    the projection rotates its input (x * suh, H128)
+/// @param stream    the launch stream
+/// @param o0        projection 0's operand
+/// @param o1        projection 1's operand (o0 again when n_proj == 1)
+/// @param n_proj    1 or 2
+/// @param act       the activation as its producer emitted it
+/// @param ids_src   source row per assignment
+/// @param bounds    expert_bounds
+/// @param E         experts
+/// @param n_assign  assignments
+/// @param K         input width
+/// @param plan      the decode tile list to write, or none
 void launch_prep(bool rotate, cudaStream_t stream, const prep_out &o0, const prep_out &o1, int n_proj,
                  const exl3_moe_act &act, const int32_t *ids_src, const int32_t *bounds, int E, int n_assign, int K,
                  const dec_plan &plan) {
@@ -631,13 +758,28 @@ void launch_prep(bool rotate, cudaStream_t stream, const prep_out &o0, const pre
                                                                                      ids_src, bounds, E, n_assign, K, plan);
 }
 
+/// @param b  bytes
+/// @return   b rounded up to a multiple of 256
 size_t up256(size_t b) { return (b + 255u) & ~(size_t)255u; }
 
 /* The workspace's three slices, in order: the fp16 plane, the inverse prescales, the work list + its count. */
+/// The prefill workspace's byte offsets.
 struct ws_layout {
+    /** @var inv
+     *  offset of the inverse prescales f32 [n_assign][K / 128] */
+    /** @var work
+     *  offset of the work list int2 [cap], then its int count */
+    /** @var total
+     *  the workspace's bytes */
+    /// Offset of the fp16 plane [n_assign][K] (0).
     size_t plane, inv, work, total;
+    /// The work list's capacity: n_assign / 64 + n_experts + 1.
     int64_t cap;
 };
+/// @param n_assign   assignments
+/// @param K          input width
+/// @param n_experts  experts
+/// @return           the layout, each slice 256-aligned
 ws_layout layout_for(int64_t n_assign, int K, int n_experts) {
     ws_layout l;
     l.cap = n_assign / kBM + n_experts + 1;
@@ -727,9 +869,21 @@ int exl3_moe_prefill_launch(const void *table, int k2, bool rotate_input, const 
 namespace {
 
 /* One decode projection's workspace: the PREP's fp16 plane and inverse prescales, then the split partials. */
+/// One decode projection's workspace byte offsets.
 struct dec_layout {
+    /** @var inv
+     *  offset of the inverse prescales f32 [n_assign][K / 128] */
+    /** @var part
+     *  offset of the split partials f32 [SK][n_assign][M] */
+    /** @var one
+     *  the projection's bytes */
+    /// Offset of the fp16 plane [n_assign][K] (0).
     size_t plane, inv, part, one;
 };
+/// @param n_assign  assignments
+/// @param K         input width
+/// @param M         output width
+/// @return          the layout, each slice 256-aligned
 dec_layout dec_layout_for(int64_t n_assign, int K, int M) {
     dec_layout l;
     l.plane = up256((size_t)n_assign * (size_t)K * sizeof(__half));
@@ -742,6 +896,8 @@ dec_layout dec_layout_for(int64_t n_assign, int K, int M) {
 } // namespace
 
 /* The decode tile list (dec_plan) after the projections' slices: n_assign tiles at most, then the count. */
+/// @param n_assign assignments.
+/// @return bytes, 256-padded.
 size_t dec_plan_bytes(int64_t n_assign) { return up256((size_t)n_assign * sizeof(int2) + sizeof(int)); }
 
 size_t exl3_moe_decode_ws_bytes(int n_proj, int64_t n_assign, int K, int M) {

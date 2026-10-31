@@ -1,4 +1,6 @@
 // SPDX-License-Identifier: MIT
+/** @file
+ *  Public C ABI of the quantized MoE matmul kernels (ds4_mmq_*). */
 // ds4_mmq.h - public C ABI for ds4's quantized matmul kernels.
 //
 // All functions are extern "C" so ds4.c / ds4_cuda.cu can call them
@@ -28,6 +30,8 @@ extern "C" {
 //
 //   device: CUDA device ordinal (0 for the primary GPU).
 // Returns 0 on success.
+/// @param device the CUDA device ordinal.
+/// @return 0 on success, -1 on a bad or missing device.
 int ds4_mmq_init(int device);
 
 // Query whether ds4_mmq is willing to handle a given matmul. Returns
@@ -42,6 +46,10 @@ int ds4_mmq_init(int device);
 //              was something else entirely.
 //   ne11:      batch dimension (number of activation columns / tokens).
 //   n_experts: 0 for dense matmul, >0 for MoE (e.g. 256 for V4 Flash).
+/// @param layout a PULSAR_TENSOR_* id (only PULSAR_TENSOR_IQ2_XXS_MMQ_K is served).
+/// @param ne11 activation columns (tokens).
+/// @param n_experts experts in the stack (0 for a dense matmul).
+/// @return 1 when the adapter serves the call, else 0.
 int ds4_mmq_should_use(uint32_t layout, int64_t ne11, int64_t n_experts);
 
 // Routed-MoE contract shared by both entries below.  For each (token,
@@ -98,6 +106,21 @@ int ds4_mmq_should_use(uint32_t layout, int64_t ne11, int64_t n_experts);
 // bookkeeping) happens once instead of twice.  Both weights must be the same
 // quant type and shape (M, K, n_experts); out_a / out_b each have the single-
 // entry output layout.  On error neither output is guaranteed valid.
+/// @param Wa_soa the first (gate) weight, aligned-SoA IQ2_XXS.
+/// @param Wb_soa the second (up) weight, same shape.
+/// @param ids the routes, i32 [n_tokens][n_expert_used].
+/// @param out_a out: the first weight's output, column-major [cols][M] f32.
+/// @param out_b out: the second weight's output, same layout.
+/// @param M weight rows (output width).
+/// @param K input width (a multiple of 256).
+/// @param n_tokens tokens.
+/// @param n_experts experts in the stack (0 for a dense matmul).
+/// @param n_expert_used experts per token.
+/// @param stream the stream.
+/// @param act_q the producer's E4M3 activation, [n_tokens][K].
+/// @param act_sf its ue8m0 plane (pulsar_mx_sfoff).
+/// @param act_kbp the plane's blocks per row.
+/// @return 0 on success, nonzero on a refusal or launch failure.
 int ds4_mmq_iq2_xxs_moe_pair_soa(
     const void    * Wa_soa,
     const void    * Wb_soa,
@@ -120,6 +143,19 @@ int ds4_mmq_iq2_xxs_moe_pair_soa(
  * Upstream shipped a pair entry but no IQ2 SINGLE soa entry, which is what a
  * routed DOWN needs when the down tensor is IQ2 rather than Q2_K (our v5mx).
  * Same contract as the pair entry at one weight/one output. */
+/// @param W_soa the weight, aligned-SoA IQ2_XXS.
+/// @param ids the routes, i32 [n_tokens][n_expert_used].
+/// @param out_f32 out: column-major [cols][M] f32.
+/// @param M weight rows (output width).
+/// @param K input width (a multiple of 256).
+/// @param n_tokens tokens.
+/// @param n_experts experts in the stack (0 for a dense matmul).
+/// @param n_expert_used experts per token.
+/// @param stream the stream.
+/// @param act_q the producer's E4M3 activation, [n_tokens][K].
+/// @param act_sf its ue8m0 plane (pulsar_mx_sfoff).
+/// @param act_kbp the plane's blocks per row.
+/// @return 0 on success, nonzero on a refusal or launch failure.
 int ds4_mmq_iq2_xxs_moe_soa(
     const void    * W_soa,
     const int32_t * ids,

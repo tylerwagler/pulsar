@@ -1,3 +1,5 @@
+/** @file
+ *  CSA2 candidate pool (L218, DeepSeek-V4.1): level one of the two-level top-k. */
 /* CSA2 candidate pool (L218, DeepSeek-V4.1): the reference's
  * select_candidate_blocks, level one of the two-level top-k.
  *
@@ -24,6 +26,8 @@
 #include "pulsar_cuda_internal.h"
 
 /* Monotone f32 -> u32 key: larger float, larger key (sign folded). */
+/// @param f a score.
+/// @return its order-preserving u32 key.
 __device__ __forceinline__ static uint32_t cand_key(float f) {
     const uint32_t u = __float_as_uint(f);
     return (u & 0x80000000u) ? ~u : (u | 0x80000000u);
@@ -32,6 +36,15 @@ __device__ __forceinline__ static uint32_t cand_key(float f) {
 /* Per (row, block): the block's max score, the query's newest block pinned to
  * +inf.  scores are [n_rows][n_comp] with -inf already at positions the query
  * cannot reach; vis = the row's reachable count, (pos + 1) / ratio. */
+/// Grid (ceil(n_blocks / 256), n_rows), 256 threads, one thread per (row, block).
+/// @param bscore out: per-row block maxima, f32 [n_rows][n_blocks].
+/// @param scores the indexer scores, f32 [n_rows][n_comp].
+/// @param n_comp compressed positions per row.
+/// @param n_blocks blocks per row, ceil(n_comp / block_size).
+/// @param block_size positions per block.
+/// @param pos0 the first row's position (when positions is NULL).
+/// @param ratio the compression ratio.
+/// @param positions per-row positions, or NULL for pos0 + row.
 __global__ static void cand_block_max_kernel(float *bscore, const float *scores,
                                              uint32_t n_comp, uint32_t n_blocks, uint32_t block_size,
                                              uint32_t pos0, uint32_t ratio,
@@ -53,6 +66,12 @@ __global__ static void cand_block_max_kernel(float *bscore, const float *scores,
 /* One 256-thread block per row: radix-select the k-th largest block score,
  * then emit the mask.  bscore is that row's [n_blocks]; mask is [mask_words]
  * u32, bit b set when block b is a candidate. */
+/// Grid n_rows, 256 threads (the scans assume exactly 256).
+/// @param mask out: per-row candidate bitmask, u32 [n_rows][mask_words].
+/// @param bscore the block maxima, f32 [n_rows][n_blocks].
+/// @param n_blocks blocks per row.
+/// @param mask_words mask words per row.
+/// @param k blocks to keep (clamped to n_blocks).
 __global__ static void cand_select_kernel(uint32_t *mask, const float *bscore,
                                           uint32_t n_blocks, uint32_t mask_words, uint32_t k) {
     const uint32_t row = blockIdx.x;
@@ -140,6 +159,12 @@ __global__ static void cand_select_kernel(uint32_t *mask, const float *bscore,
 }
 
 /* scores[row][c] = -inf where block c / block_size is outside the row's mask */
+/// Grid (ceil(n_comp / 256), n_rows), 256 threads.
+/// @param scores a source's scores, f32 [n_rows][n_comp], masked in place.
+/// @param mask the candidate bitmask, [n_rows][mask_words].
+/// @param n_comp compressed positions per row.
+/// @param mask_words mask words per row.
+/// @param block_size positions per block.
 __global__ static void cand_mask_scores_kernel(float *scores, const uint32_t *mask,
                                                uint32_t n_comp, uint32_t mask_words, uint32_t block_size) {
     const uint32_t row = blockIdx.y;
@@ -156,6 +181,19 @@ uint32_t pulsar_gpu_candidate_mask_words(uint32_t n_comp_cap, uint32_t block_siz
     return (n_blocks + 31u) / 32u;
 }
 
+/// Builds each row's candidate-block mask: the topk_blocks best blocks, the newest pinned, unreachable ones dropped.
+/// @param mask out: u32 [n_rows][mask_words].
+/// @param bscore_scratch f32 [n_rows][n_blocks] scratch.
+/// @param scores the candidate source's scores, f32 [n_rows][n_comp].
+/// @param n_comp compressed positions per row.
+/// @param n_rows query rows.
+/// @param mask_words mask words per row (>= ceil(n_blocks / 32)).
+/// @param block_size positions per block.
+/// @param topk_blocks blocks kept per row.
+/// @param pos0 the first row's position (when positions is NULL).
+/// @param ratio the compression ratio.
+/// @param positions per-row positions, or NULL.
+/// @return 1 on success, 0 on a refusal or launch failure.
 int pulsar_gpu_candidate_blocks_tensor(pulsar_gpu_tensor *mask, pulsar_gpu_tensor *bscore_scratch,
                                        const pulsar_gpu_tensor *scores,
                                        uint32_t n_comp, uint32_t n_rows, uint32_t mask_words,

@@ -1,3 +1,5 @@
+/** @file
+ *  The f16 rows arm (L321): prep, fixed-algorithm cuBLASLt GEMM, unscale. */
 /* The f16 rows arm (L321) -- see pulsar_cuda_f16_rows.h for the contract and the arithmetic. */
 #include "pulsar_cuda_f16_rows.h"
 #include "pulsar_cuda_lt_fixed.h"
@@ -10,14 +12,25 @@
 
 namespace {
 
+/// Threads per CTA of both kernels.
 constexpr int kThreads = 256;
 constexpr int kHiExp = 14;   ///< the row's largest |value| lands just under 2^14 (the EXL3 prompt arm's prescale)
 
+/// @param b a byte count.
+/// @return b rounded up to a multiple of 256.
 size_t up256(size_t b) { return (b + 255u) & ~(size_t)255u; }
 
+/// @param p an exponent, -126 .. 127 (callers clamp to +-100).
+/// @return 2^p, built from the exponent bits.
 __device__ __forceinline__ float pow2(int p) { return __int_as_float((p + 127) << 23); }
 
 /* one CTA per row: the row's amax, then the scaled f16 plane and the row's inverse scale */
+/// Grid M (one CTA per row), kThreads threads: xh[m] = f16(x[m] * 2^p), p putting the row's largest |value| just
+/// under 2^kHiExp; inv[m] = 2^-p.
+/// @param x the rows, bf16 [M][K].
+/// @param xh out: the scaled rows, f16 [M][K].
+/// @param inv out: each row's inverse scale, f32 [M].
+/// @param K row width.
 __global__ void __launch_bounds__(kThreads)
 prep_kernel(const __nv_bfloat16 *__restrict__ x, __half *__restrict__ xh, float *__restrict__ inv, int K) {
     __shared__ float s_amax[kThreads / 32];
@@ -41,6 +54,11 @@ prep_kernel(const __nv_bfloat16 *__restrict__ x, __half *__restrict__ xh, float 
 }
 
 /* y[m][n] *= inv[m] (an exact power of two) */
+/// Grid ceil(M N / kThreads), kThreads threads.
+/// @param y the GEMM output, f32 [M][N], scaled in place.
+/// @param inv each row's inverse scale, [M].
+/// @param M rows.
+/// @param N columns.
 __global__ void __launch_bounds__(kThreads)
 unscale_kernel(float *__restrict__ y, const float *__restrict__ inv, int M, int N) {
     const size_t i = (size_t)blockIdx.x * kThreads + threadIdx.x;

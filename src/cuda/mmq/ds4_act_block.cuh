@@ -1,4 +1,6 @@
 // SPDX-License-Identifier: MIT
+/** @file
+ *  The MMQ activation staging block (E4M3 values, one ue8m0 scale per 32), pulsar-owned. */
 // ds4_act_block.cuh - the MMQ activation staging block, owned by us.
 //
 // WHAT IT HOLDS.  E4M3 values with one ue8m0 scale per 32, which is what every
@@ -33,7 +35,9 @@
 #include <stdint.h>
 
 // One MX scale block is 32 values; a staging block carries four of them.
+/// Values per MX scale block.
 static constexpr int DS4_ACT_BLOCK_QK   = 32;
+/// Values per staging block (four scale blocks).
 static constexpr int DS4_ACT_BLOCK_VALS = 4 * DS4_ACT_BLOCK_QK;   // 128
 
 /** The MMQ activation staging block.
@@ -65,5 +69,6 @@ static_assert(sizeof(block_mx_act_mmq) == 144,
 // CUDA_QUANTIZE_BLOCK_SIZE_MMQ in quantize.cuh; it is the only thing the live
 // E4M3 staging still needed from that header, and keeping a vendored file alive
 // to supply one integer is the wrong trade.
+/// Threads per block of the staging kernels.
 static constexpr int DS4_ACT_QUANT_BLOCK = 128;
 
