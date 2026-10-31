@@ -87,8 +87,6 @@ static int g_model_cache_full;
 static int g_model_mapping_failure_notice_printed;
 
 
-/// A prefetch stream, destroyed at cleanup.  TODO(dox): nothing in this file creates or uses it besides the teardown.
-static cudaStream_t g_model_prefetch_stream;
 
 
 /// The non-blocking stream the staged fd route uploads chunks on (created with the staging pool).
@@ -1475,10 +1473,6 @@ void pulsar_gpu_cleanup(void) {
     g_model_fd_count = 0;
     g_model_cache_full = 0;
     g_model_mapping_failure_notice_printed = 0;
-    if (g_model_prefetch_stream) {
-        (void)cudaStreamDestroy(g_model_prefetch_stream);
-        g_model_prefetch_stream = NULL;
-    }
 }
 
 
