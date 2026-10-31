@@ -330,10 +330,6 @@ typedef CUresult (*tp_dev_attr_fn)(int *, CUdevice_attribute, CUdevice);
 /// cuStreamWaitValue64, resolved by pulsar_gpu_tp_wait_init; NULL until then.
 static tp_wait_value_fn g_tp_wait_value = NULL;
 
-/** Resolves cuStreamWaitValue64 through the runtime and checks the device has 64-bit stream memory operations.
- *  @param err    out: the reason, on refusal
- *  @param errlen bytes at err
- *  @return 1 ready (also when already resolved), 0 the lane cannot run here */
 int pulsar_gpu_tp_wait_init(char *err, size_t errlen) {
     if (g_tp_wait_value) return 1;
     void *wv = NULL, *ga = NULL;
@@ -376,19 +372,6 @@ static int tp_stream_wait_done(const void *done_dev, uint64_t exch) {
     return 1;
 }
 
-/** Stage + publish one row-lane exchange (contract in pulsar_gpu.h).
- *  @param src       f32 rows [rows][vec_bytes / 4] (rewritten with the sum when addend is set)
- *  @param addend    f32 rows folded in first and zeroed, or NULL
- *  @param slab_dev  device mapping of the slab
- *  @param out_off   byte offset of the out-slots
- *  @param vec_bytes bytes a message (one row)
- *  @param first_msg the first row's message sequence number
- *  @param n_slots   the slot ring's size
- *  @param rows      rows to stage
- *  @param desc_dev  the descriptor words
- *  @param exch      the exchange id (nonzero)
- *  @param ticket    a zeroed device u32, one per stream
- *  @return 1 launched, 0 refused or failed */
 int pulsar_gpu_tp_stage_publish(pulsar_gpu_tensor *src, pulsar_gpu_tensor *addend,
                                 void *slab_dev, uint64_t out_off, uint64_t vec_bytes,
                                 uint64_t first_msg, uint32_t n_slots, uint32_t rows,
@@ -410,18 +393,6 @@ int pulsar_gpu_tp_stage_publish(pulsar_gpu_tensor *src, pulsar_gpu_tensor *adden
     return cuda_ok(cudaGetLastError(), "tp stage+publish launch");
 }
 
-/** Waits for done >= exch on the stream, then dst += peer rows.
- *  @param dst       f32 rows [rows][vec_bytes / 4]
- *  @param slab_dev  device mapping of the slab
- *  @param in_off    byte offset of the in-slots
- *  @param vec_bytes bytes a message
- *  @param first_msg the first row's message sequence number
- *  @param n_slots   the slot ring's size
- *  @param rows      rows to combine
- *  @param done_dev  the device-mapped done word
- *  @param exch      the exchange id
- *  @param err_dev   the device-mapped error word
- *  @return 1 launched, 0 refused or failed */
 int pulsar_gpu_tp_combine_sum(pulsar_gpu_tensor *dst, const void *slab_dev,
                               uint64_t in_off, uint64_t vec_bytes, uint64_t first_msg,
                               uint32_t n_slots, uint32_t rows, const void *done_dev,
@@ -436,23 +407,6 @@ int pulsar_gpu_tp_combine_sum(pulsar_gpu_tensor *dst, const void *slab_dev,
     return cuda_ok(cudaGetLastError(), "tp combine sum launch");
 }
 
-/** Waits for done >= exch, then scatters this chunk of the peer's packed [rows][width] slice into dst.
- *  @param dst       f32 destination [rows][pitch]
- *  @param slab_dev  device mapping of the slab
- *  @param in_off    byte offset of the in-slots
- *  @param vec_bytes bytes a message
- *  @param first_msg the chunk's first message sequence number
- *  @param n_slots   the slot ring's size
- *  @param msgs      messages in the chunk
- *  @param elem0     payload element the chunk starts at (< rows * width)
- *  @param rows      payload rows
- *  @param width     the peer's columns a row
- *  @param pitch     destination row pitch, in floats
- *  @param col0      the peer's first destination column (col0 + width <= pitch)
- *  @param done_dev  the device-mapped done word
- *  @param exch      the exchange id
- *  @param err_dev   the device-mapped error word
- *  @return 1 launched, 0 refused or failed */
 int pulsar_gpu_tp_combine_scatter(pulsar_gpu_tensor *dst, const void *slab_dev,
                                   uint64_t in_off, uint64_t vec_bytes, uint64_t first_msg,
                                   uint32_t n_slots, uint32_t msgs, uint64_t elem0,
@@ -470,14 +424,6 @@ int pulsar_gpu_tp_combine_scatter(pulsar_gpu_tensor *dst, const void *slab_dev,
     return cuda_ok(cudaGetLastError(), "tp combine scatter launch");
 }
 
-/** The own half: packed src [rows][width] to dst[r * pitch + col0 + c], no wait.
- *  @param dst   f32 destination [rows][pitch]
- *  @param src   f32 packed rows
- *  @param rows  rows
- *  @param width columns a row
- *  @param pitch destination row pitch, in floats
- *  @param col0  first destination column (col0 + width <= pitch)
- *  @return 1 launched, 0 refused or failed */
 int pulsar_gpu_tp_scatter_cols(pulsar_gpu_tensor *dst, const pulsar_gpu_tensor *src,
                                uint32_t rows, uint64_t width, uint64_t pitch, uint64_t col0) {
     const uint64_t n_elem = (uint64_t)rows * width;
@@ -489,13 +435,6 @@ int pulsar_gpu_tp_scatter_cols(pulsar_gpu_tensor *dst, const pulsar_gpu_tensor *
     return cuda_ok(cudaGetLastError(), "tp scatter cols launch");
 }
 
-/** Bulk stage: `bytes` of src (+ addend, then zeroed) at byte offset `off` into the mapped out-region.
- *  @param src     f32 source tensor
- *  @param addend  f32 addend tensor read at the same offset, or NULL
- *  @param off     byte offset into src / addend (a multiple of 4)
- *  @param out_dev the mapped bulk out-region
- *  @param bytes   bytes to stage (a nonzero multiple of 4)
- *  @return 1 launched, 0 refused or failed */
 int pulsar_gpu_tp_bulk_stage(const pulsar_gpu_tensor *src, pulsar_gpu_tensor *addend, uint64_t off,
                              void *out_dev, uint64_t bytes) {
     if (!src || !out_dev || bytes == 0 || bytes % sizeof(float) != 0 || off % sizeof(float) != 0 ||
@@ -511,28 +450,12 @@ int pulsar_gpu_tp_bulk_stage(const pulsar_gpu_tensor *src, pulsar_gpu_tensor *ad
     return cuda_ok(cudaGetLastError(), "tp bulk stage launch");
 }
 
-/** Publishes the bulk descriptor {exch, bytes, word2}.
- *  @param desc_dev the descriptor words
- *  @param exch     the exchange id (nonzero)
- *  @param bytes    the payload bytes (nonzero)
- *  @param word2    the bulk flag | the receive buffer
- *  @return 1 launched, 0 refused or failed */
 int pulsar_gpu_tp_publish_bulk(void *desc_dev, uint64_t exch, uint64_t bytes, uint64_t word2) {
     if (!desc_dev || exch == 0 || bytes == 0) return 0;
     tp_publish_bulk_kernel<<<1, 1>>>((uint64_t *)desc_dev, exch, bytes, word2);
     return cuda_ok(cudaGetLastError(), "tp publish bulk launch");
 }
 
-/** Waits for done >= exch, then dst[dst_off..] = own + peer.
- *  @param dst      f32 destination tensor
- *  @param dst_off  byte offset into dst (a multiple of 4)
- *  @param own_dev  this rank's staged partial (the out-region)
- *  @param peer_dev the peer's rows (the mapped receive buffer)
- *  @param bytes    bytes to combine (a nonzero multiple of 4)
- *  @param done_dev the device-mapped done word
- *  @param exch     the exchange id
- *  @param err_dev  the device-mapped error word
- *  @return 1 launched, 0 refused or failed */
 int pulsar_gpu_tp_bulk_combine_sum(pulsar_gpu_tensor *dst, uint64_t dst_off, const void *own_dev,
                                    const void *peer_dev, uint64_t bytes, const void *done_dev,
                                    uint64_t exch, const void *err_dev) {
@@ -548,20 +471,6 @@ int pulsar_gpu_tp_bulk_combine_sum(pulsar_gpu_tensor *dst, uint64_t dst_off, con
     return cuda_ok(cudaGetLastError(), "tp bulk combine sum launch");
 }
 
-/** Waits for done >= exch, then scatters both halves of every gather block into its destination rows.
- *  @param blocks    the blocks (contiguous payload: block k's elem0 = the sum of the earlier rows * width)
- *  @param n_blocks  blocks, 1 .. PULSAR_TP_GATHER_BLOCKS_MAX
- *  @param rows      rows of every block
- *  @param own       f32 own packed payload
- *  @param slab_dev  device mapping of the slab
- *  @param in_off    byte offset of the in-slots
- *  @param vec_bytes bytes a message
- *  @param first_msg the payload's first message sequence number
- *  @param n_slots   the slot ring's size
- *  @param done_dev  the device-mapped done word
- *  @param exch      the exchange id
- *  @param err_dev   the device-mapped error word
- *  @return 1 launched, 0 refused or failed */
 int pulsar_gpu_tp_combine_gather_blocks(const pulsar_tp_gather_block *blocks, uint32_t n_blocks,
                                         uint32_t rows, const pulsar_gpu_tensor *own,
                                         const void *slab_dev, uint64_t in_off, uint64_t vec_bytes,

@@ -170,12 +170,6 @@ int pulsar_gpu_attn_pack_store_tensor(pulsar_gpu_tensor *x, const pulsar_gpu_ten
 
 /* Quantise + store one row into a ring slot (raw_cap != 0): the single-row
  * decode store.  seq_id/positions are NULL -- the slot is `row % raw_cap`. */
-/// @param raw_cache the ring of packed rows.
-/// @param kv the row, f32 [head_dim].
-/// @param raw_cap ring slots.
-/// @param row the row's position (slot row % raw_cap).
-/// @param head_dim head width.
-/// @return 1 on success, 0 on bad operands or a launch failure.
 int pulsar_gpu_attn_pack_ring_store_tensor(pulsar_gpu_tensor *raw_cache, const pulsar_gpu_tensor *kv,
                                            uint32_t raw_cap, uint32_t row, uint32_t head_dim) {
     if (!raw_cache || !kv || raw_cap == 0 ||
@@ -193,16 +187,6 @@ int pulsar_gpu_attn_pack_ring_store_tensor(pulsar_gpu_tensor *raw_cache, const p
 }
 
 /* Quantise + store a batch into banked ring slots: the prefill store. */
-/// @param raw_cache the banked ring of packed rows.
-/// @param kv the rows, f32 [n_tokens][head_dim].
-/// @param raw_cap ring slots per bank.
-/// @param pos0 the first token's position (slot rule when positions is NULL).
-/// @param n_tokens rows.
-/// @param head_dim head width (512).
-/// @param positions per-row positions, or NULL.
-/// @param seq_id per-row bank ids (with positions), or NULL.
-/// @param n_banks banks in raw_cache.
-/// @return 1 on success (or no tokens), 0 on bad operands or a launch failure.
 int pulsar_gpu_attn_pack_ring_store_batch_tensor(pulsar_gpu_tensor *raw_cache, const pulsar_gpu_tensor *kv,
                                                  uint32_t raw_cap, uint32_t pos0, uint32_t n_tokens,
                                                  uint32_t head_dim, const pulsar_gpu_tensor *positions,
@@ -255,17 +239,6 @@ __global__ static void attn_pack_scatter_kernel(const uint8_t *__restrict__ src,
     for (uint32_t b = threadIdx.x; b < (uint32_t)rowbytes; b += blockDim.x) dr[b] = sr[b];
 }
 
-/// Scatters already-packed rows into the (banked) ring.
-/// @param raw_cache the ring.
-/// @param packed the packed rows, [n_tokens][rowbytes].
-/// @param raw_cap ring slots per bank.
-/// @param pos0 the first token's position (slot rule when positions is NULL).
-/// @param n_tokens rows.
-/// @param head_dim head width (512).
-/// @param positions per-row positions, or NULL.
-/// @param seq_id per-row bank ids (with positions), or NULL.
-/// @param n_banks banks in raw_cache.
-/// @return 1 on success (or no tokens), 0 on bad operands or a launch failure.
 int pulsar_gpu_attn_pack_scatter_tensor(pulsar_gpu_tensor *raw_cache, const pulsar_gpu_tensor *packed,
                                         uint32_t raw_cap, uint32_t pos0, uint32_t n_tokens,
                                         uint32_t head_dim, const pulsar_gpu_tensor *positions,

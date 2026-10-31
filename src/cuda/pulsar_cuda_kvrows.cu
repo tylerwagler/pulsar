@@ -112,17 +112,6 @@ static bool kvrow_shape_ok(uint32_t head_dim) {
     return head_dim == 512u;   /* one block of 512 threads per row; the graph alloc refuses other shapes */
 }
 
-/// @param x         dequantised f32 rows out, or NULL
-/// @param src       f32 [n_rows][head_dim] rows to pack
-/// @param packed    the WINDOW row buffer
-/// @param out_row0  first destination row without a ring
-/// @param n_rows    rows to pack
-/// @param head_dim  dims per row (512)
-/// @param positions [n_rows] token positions, or NULL
-/// @param seq_id    [n_rows] bank ids, or NULL
-/// @param n_banks   banks in the ring pool
-/// @param raw_cap   ring rows per bank, or 0
-/// @return nonzero on success, 0 on a bad shape or a failed launch
 int pulsar_gpu_winkv_pack_tensor(pulsar_gpu_tensor *x, const pulsar_gpu_tensor *src, pulsar_gpu_tensor *packed,
                                  uint32_t out_row0, uint32_t n_rows, uint32_t head_dim,
                                  const pulsar_gpu_tensor *positions, const pulsar_gpu_tensor *seq_id,
@@ -149,13 +138,6 @@ int pulsar_gpu_winkv_pack_tensor(pulsar_gpu_tensor *x, const pulsar_gpu_tensor *
     return cuda_ok(cudaGetLastError(), "window KV pack launch");
 }
 
-/// @param x        dequantised f32 rows out, or NULL
-/// @param src      f32 [n_rows][head_dim] rows to pack
-/// @param packed   the MAIN row buffer
-/// @param out_row0 first destination row
-/// @param n_rows   rows to pack
-/// @param head_dim dims per row (512)
-/// @return nonzero on success, 0 on a bad shape or a failed launch
 int pulsar_gpu_mainkv_pack_tensor(pulsar_gpu_tensor *x, const pulsar_gpu_tensor *src, pulsar_gpu_tensor *packed,
                                   uint32_t out_row0, uint32_t n_rows, uint32_t head_dim) {
     if (!src || !packed || n_rows == 0 || !kvrow_shape_ok(head_dim) ||

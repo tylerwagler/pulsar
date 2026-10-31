@@ -1690,10 +1690,6 @@ int pulsar_gpu_rms_norm_plain_rows_tensor(
 
 /** L157: declare that rows [keep_from, n_tok) of x's f32 store were skipped,
  * for a buffer that was never arm()ed (bf16 slot only), keyed like the slot. */
-/** @param x         the buffer
- *  @param n_tok     its rows
- *  @param in_dim    its row width
- *  @param keep_from first row whose f32 store was kept */
 void pulsar_gpu_act_note_f32_skipped_for(const pulsar_gpu_tensor *x, uint64_t n_tok,
                                          uint64_t in_dim, uint32_t keep_from);
 

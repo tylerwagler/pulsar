@@ -39,13 +39,16 @@ EXCLUDE                = src/vendor \
                          src/cuda/mmq/ggml.h \
                          src/cuda/mmq/ggml-impl.h \
                          src/cuda/mmq/ggml-cuda.h \
-                         src/cuda/mmq/ds4_cuda_env.cuh
+                         src/cuda/mmq/ds4_cuda_env.cuh \
+                         src/cuda/mmq/tessera_routed_fused_window.cuh
 EXCLUDE_PATTERNS       = */build/* */cutlass/* */vendors/*
 USE_MDFILE_AS_MAINPAGE = docs/DESIGN.md
 
-# The engine's real content is in static functions and struct internals;
-# without these the output documents almost nothing useful.
-EXTRACT_ALL            = YES
+# EXTRACT_ALL = NO: an entity without a doc block is a warning, so an empty
+# warnings log means every file (@file), function, type and member is
+# documented.  The engine's real content is in static functions and struct
+# internals, so those are extracted too.
+EXTRACT_ALL            = NO
 EXTRACT_STATIC         = YES
 # L298: anonymous-namespace members are extracted like statics.  Left at NO, doxygen numbers anonymous namespaces
 # across the whole input and, as files are added, mis-pairs a file's members with another's (`@31::...` "was not
@@ -72,7 +75,9 @@ PREDEFINED             = __global__= \
                          __host__= \
                          __shared__= \
                          __restrict__= \
-                         __launch_bounds__(x)= \
+                         __launch_bounds__(...)= \
+                         __attribute__(x)= \
+                         GDN_CLUSTER_DIMS= \
                          PULSAR_DOXYGEN=1
 EXTENSION_MAPPING      = cu=C++ cuh=C++
 

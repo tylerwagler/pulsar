@@ -602,9 +602,7 @@ static int cuda_model_range_is_cached(const void *model_map, uint64_t offset, ui
 
 
 
-/** See the declaration in pulsar_cuda_internal.h.  Doxygen 1.9.8 applies
- *  \hidecallergraph per entity, so the definition carries it too.
- *  \hidecallergraph */
+/** \hidecallergraph */
 int cuda_ok(cudaError_t err, const char *what) {
     if (err == cudaSuccess) return 1;
     fprintf(stderr, "pulsar: CUDA %s failed: %s\n", what, cudaGetErrorString(err));
@@ -1213,22 +1211,6 @@ static int cuda_register_expert_half(const void *key_map, uint64_t key_offset, c
  * destination layout is exactly cutlass_mxfp4_expert_layout of the half shape;
  * the caller passes both geometries so this file needs no byte model of its
  * own. */
-/** Registers a rank's half of a CUTLASS MXFP4 expert stack: output rows (gate / up) or input columns (down) [lo, hi).
- *  @param key_map    the mapping the half is registered under
- *  @param key_offset the offset it is registered under
- *  @param model_map  the stack's source mapping
- *  @param src_offset the stack's byte offset in the source
- *  @param n_expert   experts
- *  @param k          input width of an expert
- *  @param n          output rows of an expert
- *  @param k_half     nonzero: split K (input columns), else output rows
- *  @param lo         first kept row / column (a multiple of 128)
- *  @param hi         end of the kept range (a multiple of 128)
- *  @param src_stride source bytes an expert
- *  @param src_data   source data bytes an expert (the scale plane follows)
- *  @param dst_stride half bytes an expert
- *  @param dst_data   half data bytes an expert
- *  @return 1 registered, 0 refused or failed */
 int pulsar_gpu_register_mxfp4_expert_half(const void *key_map, uint64_t key_offset,
                                           const void *model_map, uint64_t src_offset,
                                           uint32_t n_expert, uint64_t k, uint64_t n, int k_half,
@@ -1275,19 +1257,6 @@ int pulsar_gpu_register_mxfp4_expert_half(const void *key_map, uint64_t key_offs
  * trellis run(s), suh and svh, three strided copies -- and the destination is
  * exl3_expert_layout of the half shape, which the EXL3 arms read unchanged at
  * expert_mid_dim = hi - lo. */
-/** Registers a rank's half of an EXL3 expert stack (exl3_expert_cut is the byte model).
- *  @param key_map    the mapping the half is registered under
- *  @param key_offset the offset it is registered under
- *  @param model_map  the stack's source mapping
- *  @param src_offset the stack's byte offset in the source
- *  @param n_expert   experts
- *  @param k          input width of an expert
- *  @param n          output width of an expert
- *  @param k2         twice the EXL3 bit rate K
- *  @param k_half     nonzero: split the input rows, else the output columns
- *  @param lo         first kept index (128-aligned)
- *  @param hi         end of the kept range
- *  @return 1 registered, 0 refused or failed */
 int pulsar_gpu_register_exl3_expert_half(const void *key_map, uint64_t key_offset,
                                          const void *model_map, uint64_t src_offset,
                                          uint32_t n_expert, uint64_t k, uint64_t n, int k2, int k_half,
@@ -1372,9 +1341,6 @@ static int cuda_tu_archs_ok(const cudaDeviceProp *prop) {
 
 
 
-/// @param layout a PULSAR_TENSOR_* weight layout
-/// @param need   out: the arch the layout needs, for a refusal message (may be NULL)
-/// @return 1 when this device runs the layout's lanes, else 0
 int pulsar_gpu_layout_supported(uint32_t layout, const char **need) {
     const int cc = pulsar_cuda_device_cc();
     int ok = 1;
@@ -1532,9 +1498,6 @@ void pulsar_gpu_tensor_dry_begin(void) {
     g_dry.cursor = 4096;
 }
 
-/// Ends this thread's dry run.
-/// @param bytes         out: bytes every dry allocation asked for (may be NULL)
-/// @param managed_bytes out: the managed subset (may be NULL)
 void pulsar_gpu_tensor_dry_end(uint64_t *bytes, uint64_t *managed_bytes) {
     if (bytes) *bytes = g_dry.bytes;
     if (managed_bytes) *managed_bytes = g_dry.managed_bytes;
@@ -1567,10 +1530,6 @@ static pulsar_gpu_tensor *dry_alloc(uint64_t bytes, int managed) {
  * type separately -- and so a widening reader can refuse what it cannot widen
  * instead of decoding f16 bits as bf16.  The fmt/esz pair is checked here:
  * a caller stating a 2-byte f32 or a 4-byte f16 is lying to one authority. */
-/// @param n_elems elements
-/// @param esz     bytes an element (0 means 4); must agree with fmt (F32 4, F16 / BF16 2)
-/// @param fmt     the element format
-/// @return an owning device tensor recording esz and fmt, or NULL (refused or failed)
 pulsar_gpu_tensor *pulsar_gpu_tensor_alloc_elt(uint64_t n_elems, uint32_t esz,
                                                pulsar_elt_fmt fmt) {
     if (esz == 0) esz = 4u;
@@ -1587,8 +1546,6 @@ pulsar_gpu_tensor *pulsar_gpu_tensor_alloc_elt(uint64_t n_elems, uint32_t esz,
     return t;
 }
 
-/// @param bytes bytes (0 allocates 1)
-/// @return an owning device tensor (f32 by default), a dry placeholder in a dry run, or NULL
 pulsar_gpu_tensor *pulsar_gpu_tensor_alloc(uint64_t bytes) {
     if (bytes == 0) bytes = 1;
     if (g_dry.active) return dry_alloc(bytes, 0);
@@ -1606,8 +1563,6 @@ pulsar_gpu_tensor *pulsar_gpu_tensor_alloc(uint64_t bytes) {
 
 
 
-/// @param bytes bytes (0 allocates 1)
-/// @return an owning managed-memory tensor, a dry placeholder in a dry run, or NULL
 pulsar_gpu_tensor *pulsar_gpu_tensor_alloc_managed(uint64_t bytes) {
     if (bytes == 0) bytes = 1;
     if (g_dry.active) return dry_alloc(bytes, 1);
@@ -1638,9 +1593,6 @@ static uint64_t cuda_managed_kv_reserve_bytes(uint64_t total_bytes) {
 
 
 
-/// @param kv_cache_bytes the KV cache's size
-/// @param context_bytes  the session's context allocation size
-/// @return 1 when the KV cache should be managed memory (8 GiB or more, or a large context that would cut into the reserve)
 int pulsar_gpu_should_use_managed_kv_cache(uint64_t kv_cache_bytes, uint64_t context_bytes) {
     if (kv_cache_bytes == 0) return 0;
 
@@ -1670,10 +1622,6 @@ int pulsar_gpu_should_use_managed_kv_cache(uint64_t kv_cache_bytes, uint64_t con
 
 
 
-/// @param base   the tensor viewed
-/// @param offset byte offset of the view
-/// @param bytes  the view's size
-/// @return a heap-allocated non-owning view inheriting dry, esz and fmt, or NULL when out of bounds
 pulsar_gpu_tensor *pulsar_gpu_tensor_view(const pulsar_gpu_tensor *base, uint64_t offset, uint64_t bytes) {
     if (!base || offset > base->bytes || bytes > base->bytes - offset) return NULL;
     pulsar_gpu_tensor *t = (pulsar_gpu_tensor *)calloc(1, sizeof(*t));
@@ -1689,8 +1637,6 @@ pulsar_gpu_tensor *pulsar_gpu_tensor_view(const pulsar_gpu_tensor *base, uint64_
 
 
 
-/// Frees the tensor struct, and its device memory when it owns it (not a view, not dry).
-/// @param tensor the tensor, or NULL
 void pulsar_gpu_tensor_free(pulsar_gpu_tensor *tensor) {
     if (!tensor) return;
     if (tensor->owner && tensor->ptr && !tensor->dry) {
@@ -1702,8 +1648,6 @@ void pulsar_gpu_tensor_free(pulsar_gpu_tensor *tensor) {
 
 
 
-/// @param tensor the tensor, or NULL
-/// @return its size in bytes (0 for NULL)
 uint64_t pulsar_gpu_tensor_bytes(const pulsar_gpu_tensor *tensor) {
     return tensor ? tensor->bytes : 0;
 }
@@ -1716,18 +1660,12 @@ uint64_t pulsar_gpu_tensor_bytes(const pulsar_gpu_tensor *tensor) {
  * what pulsar_gpu_tensor_read is for. (There was a tensor_contents() here that
  * synchronised the whole device and returned the pointer; nothing had called it
  * in a long time, so it was a device-wide stall waiting for a first user.) */
-/// @param tensor the tensor, or NULL
-/// @return its device pointer (no synchronisation), or NULL
 void *pulsar_gpu_tensor_device_ptr(const pulsar_gpu_tensor *tensor) {
     return tensor ? tensor->ptr : NULL;
 }
 
 
 
-/// @param tensor the tensor
-/// @param value  the fill value
-/// @param count  f32 elements to fill from the start
-/// @return 1 launched (or nothing to do), 0 refused or failed
 int pulsar_gpu_tensor_fill_f32(pulsar_gpu_tensor *tensor, float value, uint64_t count) {
     if (!tensor || count > tensor->bytes / sizeof(float)) return 0;
     if (count == 0 || tensor->dry) return 1;
@@ -1753,7 +1691,6 @@ void pulsar_cuda_sync_note(int kind, uint64_t bytes) {
     }
 }
 
-/// @param out the counters, copied out
 void pulsar_gpu_sync_stats_get(pulsar_gpu_sync_stats *out) {
     out->stream_syncs = __atomic_load_n(&g_sync_stats.stream_syncs, __ATOMIC_RELAXED);
     out->device_syncs = __atomic_load_n(&g_sync_stats.device_syncs, __ATOMIC_RELAXED);
@@ -1762,12 +1699,6 @@ void pulsar_gpu_sync_stats_get(pulsar_gpu_sync_stats *out) {
     out->h2d = __atomic_load_n(&g_sync_stats.h2d, __ATOMIC_RELAXED);
 }
 
-/// Blocking host-to-device write.
-/// @param tensor the destination
-/// @param offset byte offset in it
-/// @param data   host source
-/// @param bytes  bytes
-/// @return 1 written (or dry), 0 refused or failed
 int pulsar_gpu_tensor_write(pulsar_gpu_tensor *tensor, uint64_t offset, const void *data, uint64_t bytes) {
     if (!tensor || !data || offset > tensor->bytes || bytes > tensor->bytes - offset) return 0;
     if (tensor->dry) return 1;
@@ -1777,12 +1708,6 @@ int pulsar_gpu_tensor_write(pulsar_gpu_tensor *tensor, uint64_t offset, const vo
 
 
 
-/// Host-to-device write on the per-thread stream (data must stay valid until it runs).
-/// @param tensor the destination
-/// @param offset byte offset in it
-/// @param data   host source
-/// @param bytes  bytes
-/// @return 1 queued (or nothing to do), 0 refused or failed
 int pulsar_gpu_tensor_write_async(pulsar_gpu_tensor *tensor, uint64_t offset, const void *data, uint64_t bytes) {
     if (!tensor || !data || offset > tensor->bytes || bytes > tensor->bytes - offset) return 0;
     if (tensor->dry || bytes == 0) return 1;
@@ -1790,15 +1715,12 @@ int pulsar_gpu_tensor_write_async(pulsar_gpu_tensor *tensor, uint64_t offset, co
                                    cudaStreamPerThread), "tensor write async");
 }
 
-/// @param bytes bytes (nonzero)
-/// @return pinned host memory, or NULL
 void *pulsar_gpu_host_alloc(uint64_t bytes) {
     void *p = NULL;
     if (bytes == 0 || !cuda_ok(cudaMallocHost(&p, (size_t)bytes), "pinned host alloc")) return NULL;
     return p;
 }
 
-/// @param p pinned host memory from pulsar_gpu_host_alloc, or NULL
 void pulsar_gpu_host_free(void *p) {
     if (p) (void)cudaFreeHost(p);
 }
@@ -1808,11 +1730,6 @@ void pulsar_gpu_host_free(void *p) {
 /* The write counterpart of pulsar_read_q_f32: host f32 in, stored Q element
  * type out.  Exists so host code -- tests, tools -- can fill a Q buffer
  * without a second copy of the conversion living outside this file. */
-/// @param tensor    a Q buffer (pulsar_q_t elements)
-/// @param off_elems element offset
-/// @param src       host f32 values
-/// @param n         elements
-/// @return 1 written, 0 refused or failed
 int pulsar_gpu_tensor_write_q_f32(pulsar_gpu_tensor *tensor, uint64_t off_elems,
                                   const float *src, uint64_t n) {
     if (!tensor || !src) return 0;
@@ -1829,12 +1746,6 @@ int pulsar_gpu_tensor_write_q_f32(pulsar_gpu_tensor *tensor, uint64_t off_elems,
     return rc;
 }
 
-/// Blocking device-to-host read.
-/// @param tensor the source
-/// @param offset byte offset in it
-/// @param data   host destination
-/// @param bytes  bytes
-/// @return 1 read (or dry), 0 refused or failed
 int pulsar_gpu_tensor_read(const pulsar_gpu_tensor *tensor, uint64_t offset, void *data, uint64_t bytes) {
     if (!tensor || !data || offset > tensor->bytes || bytes > tensor->bytes - offset) return 0;
     if (tensor->dry) return 1;
@@ -1845,11 +1756,6 @@ int pulsar_gpu_tensor_read(const pulsar_gpu_tensor *tensor, uint64_t offset, voi
 
 
 
-/// Blocking read of raw device memory.
-/// @param device device source
-/// @param host   host destination
-/// @param bytes  bytes
-/// @return 1 read, 0 refused or failed
 int pulsar_gpu_device_read(const void *device, void *host, uint64_t bytes) {
     if (!device || !host) return 0;
     pulsar_cuda_sync_note(2, bytes);
@@ -1859,13 +1765,6 @@ int pulsar_gpu_device_read(const void *device, void *host, uint64_t bytes) {
 
 
 
-/// Blocking device-to-device copy.
-/// @param dst        destination tensor
-/// @param dst_offset byte offset in dst
-/// @param src        source tensor
-/// @param src_offset byte offset in src
-/// @param bytes      bytes
-/// @return 1 copied (or nothing to do / dry), 0 refused or failed
 int pulsar_gpu_tensor_copy(pulsar_gpu_tensor *dst, uint64_t dst_offset,
                                      const pulsar_gpu_tensor *src, uint64_t src_offset,
                                      uint64_t bytes) {
@@ -1894,12 +1793,6 @@ int pulsar_gpu_tensor_copy(pulsar_gpu_tensor *dst, uint64_t dst_offset,
  * NOT a drop-in for every call site: the ordering guarantee is per-stream, so
  * a destination handed to another stream, or to the allocator, still needs the
  * blocking version or an explicit sync. */
-/// @param dst        destination tensor
-/// @param dst_offset byte offset in dst
-/// @param src        source tensor
-/// @param src_offset byte offset in src
-/// @param bytes      bytes
-/// @return 1 queued (or nothing to do / dry), 0 refused or failed
 int pulsar_gpu_tensor_copy_async(pulsar_gpu_tensor *dst, uint64_t dst_offset,
                                  const pulsar_gpu_tensor *src, uint64_t src_offset,
                                  uint64_t bytes) {
@@ -1948,12 +1841,6 @@ __global__ static void batched_copy_kernel(const pulsar_copy_desc *descs, uint32
     }
 }
 
-/** Builds a device descriptor table for a fixed set of copies.
- *  @param dst   destination tensors [n]
- *  @param src   source tensors [n]
- *  @param bytes bytes a copy [n] (nonzero multiples of 16, within both tensors)
- *  @param n     copies
- *  @return the table handle (free with pulsar_gpu_batched_copy_free), or NULL */
 void *pulsar_gpu_batched_copy_prepare(
         pulsar_gpu_tensor **dst,
         pulsar_gpu_tensor **src,
@@ -1985,15 +1872,10 @@ void *pulsar_gpu_batched_copy_prepare(
     return d;
 }
 
-/// @param handle a table from pulsar_gpu_batched_copy_prepare, or NULL
 void pulsar_gpu_batched_copy_free(void *handle) {
     if (handle) cudaFree(handle);
 }
 
-/// @param handle    the table
-/// @param n_descs   its descriptors
-/// @param max_bytes the largest copy's bytes (sizes the grid's x, 1 .. 64 blocks)
-/// @return 1 launched, 0 refused or failed
 int pulsar_gpu_batched_copy_run(void *handle, uint32_t n_descs, uint64_t max_bytes) {
     if (!handle || n_descs == 0) return 0;
     uint32_t chunks = (uint32_t)(((max_bytes >> 4) + 255) / 256);
@@ -2183,8 +2065,6 @@ void seg_drop_graphs(void) {
 
 }  // namespace
 
-/// @param key the stretch's key (0: the caller's own eager lane)
-/// @return 2 replayed, 1 capture armed, 0 run eagerly, -1 refused (see the block above)
 int pulsar_gpu_seg_enter(uint64_t key) {
     if (g_seg_capturing || key == 0 || g_seg_off) return 0;
     seg_ent &e = seg_lookup(key);
@@ -2228,9 +2108,6 @@ int pulsar_gpu_seg_enter(uint64_t key) {
     return 1;
 }
 
-/// @param key     the key seg_enter armed
-/// @param body_ok the body ran (was recorded) without refusing
-/// @return 1 captured and launched, 0 nothing ran (see the block above)
 int pulsar_gpu_seg_exit(uint64_t key, int body_ok) {
     cudaGraph_t gr = NULL;
     g_seg_capturing = false;
@@ -2301,8 +2178,6 @@ void pulsar_gpu_seg_reset(void) {
 
 /* L296 perf: an instrument runs the same steps with the segment cache off (every segment eager, nothing captured or
  * replayed) to compare the graphed lane against; returns the previous setting.  Turning it off drops the cache. */
-/// @param on nonzero enables the segment cache
-/// @return the previous setting
 int pulsar_gpu_seg_set_enabled(int on) {
     const int was = !g_seg_off;
     g_seg_off = !on;
@@ -2311,14 +2186,11 @@ int pulsar_gpu_seg_set_enabled(int on) {
 }
 
 /* L292: the counters an instrument reads to prove which lane it ran (replays served, captures begun since start). */
-/// @param replays  out: replays served (may be NULL)
-/// @param captures out: captures begun (may be NULL)
 void pulsar_gpu_seg_counts(uint64_t *replays, uint64_t *captures) {
     if (replays) *replays = g_seg_st.replays;
     if (captures) *captures = g_seg_st.captures;
 }
 
-/// @param out the segment graphs' counters, copied out
 void pulsar_gpu_seg_stats_get(pulsar_gpu_seg_stats *out) { *out = g_seg_st; }
 
 /// Opens the warmup's declaration window: keys first seen now are catalog keys.
@@ -2405,18 +2277,12 @@ bool poison_armed(void) {
 }
 }  // namespace
 
-/// @param on nonzero arms scratch poisoning
-/// @return the previous setting
 int pulsar_gpu_scratch_poison_set(int on) {
     const int was = poison_armed() ? 1 : 0;
     g_poison = on ? 1 : 0;
     return was;
 }
 
-/// Fills this thread's scratch slots and the named regions with the step's pattern byte, on the per-thread stream.
-/// @param regions the step's own scratch tensors [n] (NULL entries skipped)
-/// @param n       regions
-/// @return 1 done (or unarmed), 0 refused inside a capture or failed
 int pulsar_gpu_scratch_poison_step(pulsar_gpu_tensor *const *regions, uint32_t n) {
     if (!poison_armed()) return 1;
     if (g_seg_capturing) {
@@ -2441,8 +2307,6 @@ int pulsar_gpu_scratch_poison_step(pulsar_gpu_tensor *const *regions, uint32_t n
     return cuda_ok(rc, "L307 scratch poison");
 }
 
-/// @param steps out: steps poisoned (may be NULL)
-/// @param bytes out: bytes filled (may be NULL)
 void pulsar_gpu_scratch_poison_counts(uint64_t *steps, uint64_t *bytes) {
     if (steps) *steps = g_poison_steps;
     if (bytes) *bytes = g_poison_bytes;
@@ -2455,7 +2319,6 @@ void pulsar_gpu_scratch_poison_counts(uint64_t *steps, uint64_t *bytes) {
 /// The TP row lane's error word (host view), or NULL when no lane is armed.
 static const volatile uint32_t *g_tp_err_word = NULL;
 
-/// @param word the row lane's error word, or NULL to disarm
 void pulsar_gpu_tp_err_word_set(const volatile uint32_t *word) { g_tp_err_word = word; }
 
 /// @return 1 when no lane is armed or its error word is clear, else 0 (named on stderr)
@@ -2573,8 +2436,6 @@ int pulsar_gpu_marker_record(void) {
     return (int)i;
 }
 
-/// @param marker a handle from pulsar_gpu_marker_record
-/// @return 1 completed (or an invalid / broken marker), 0 not yet
 int pulsar_gpu_marker_done(int marker) {
     if (marker < 0 || (uint32_t)marker >= PULSAR_GPU_MARKERS || !g_marker[marker]) return 1;
     const cudaError_t err = cudaEventQuery(g_marker[marker]);
@@ -2616,10 +2477,6 @@ static int cuda_model_set_host_map(const void *model_map, uint64_t model_size) {
 
 
 
-/// Sets the model mapping and registers it for device access on an integrated GPU (else spans are staged).
-/// @param model_map  the host mapping base
-/// @param model_size its size
-/// @return 1 ready, 0 refused (bad mapping, or an unregistered model over the cache budget)
 int pulsar_gpu_set_model_map(const void *model_map, uint64_t model_size) {
     if (!cuda_model_set_host_map(model_map, model_size)) return 0;
 
@@ -2682,13 +2539,6 @@ int pulsar_gpu_set_model_map(const void *model_map, uint64_t model_size) {
 
 
 
-/// pulsar_gpu_set_model_map; the range arguments are ignored.
-/// @param model_map        the host mapping base
-/// @param model_size       its size
-/// @param map_offset       ignored
-/// @param map_size         ignored
-/// @param max_tensor_bytes ignored
-/// @return pulsar_gpu_set_model_map's result
 int pulsar_gpu_set_model_map_range(const void *model_map, uint64_t model_size, uint64_t map_offset, uint64_t map_size, uint64_t max_tensor_bytes) {
     (void)max_tensor_bytes;
     (void)map_offset;
@@ -2699,10 +2549,6 @@ int pulsar_gpu_set_model_map_range(const void *model_map, uint64_t model_size, u
 
 
 
-/// Records the fd backing a mapping (and opens its O_DIRECT twin when the filesystem allows).
-/// @param fd        the buffered fd (the caller keeps it open), or -1
-/// @param model_map the mapping it backs
-/// @return 1 recorded, 0 the table is full
 int pulsar_gpu_set_model_fd_for_map(int fd, const void *model_map) {
     model_fd_entry *e = NULL;
     for (int i = 0; i < g_model_fd_count; i++) {
@@ -2757,13 +2603,6 @@ int pulsar_gpu_set_model_fd_for_map(int fd, const void *model_map) {
 
 
 
-/// Places a model range on the device now (startup), unless it is already resident.
-/// @param model_map  the host mapping base
-/// @param model_size its size
-/// @param offset     byte offset of the range
-/// @param bytes      range length (0: nothing to do)
-/// @param label      caller label for the diagnostics
-/// @return 1 resident, 0 out of bounds or not placed
 int pulsar_gpu_cache_model_range(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes, const char *label) {
     if (!model_map || bytes == 0) return 1;
     if (offset > model_size || bytes > model_size - offset) return 0;
@@ -2789,12 +2628,6 @@ int pulsar_gpu_cache_model_range(const void *model_map, uint64_t model_size, uin
  * fd through a pinned staging buffer, then registered in g_model_ranges under
  * the overlay's host map so cuda_model_range_ptr resolves them like any other
  * cached range. Runs at startup only (synchronous). */
-/// @param host_base_key the key mapping the range is registered under
-/// @param fd            the overlay file
-/// @param offset        file byte offset (also the registered offset)
-/// @param bytes         range length
-/// @param label         caller label for the diagnostics
-/// @return 1 uploaded and registered, 0 refused or failed
 int pulsar_gpu_cache_external_range(const void *host_base_key, int fd,
                                             uint64_t offset, uint64_t bytes,
                                             const char *label) {
@@ -2879,8 +2712,6 @@ int pulsar_gpu_cache_external_range(const void *host_base_key, int fd,
 
 
 
-/// @param free_out  out: free device bytes (may be NULL)
-/// @param total_out out: total device bytes (may be NULL)
 void pulsar_gpu_mem_info(uint64_t *free_out, uint64_t *total_out) {
     size_t free_b = 0, total_b = 0;
     (void)cudaMemGetInfo(&free_b, &total_b);
@@ -2890,7 +2721,6 @@ void pulsar_gpu_mem_info(uint64_t *free_out, uint64_t *total_out) {
 
 
 
-/// @param label a label for the stderr line, or NULL
 void pulsar_gpu_print_memory_report(const char *label) {
     size_t free_b = 0, total_b = 0;
     (void)cudaMemGetInfo(&free_b, &total_b);

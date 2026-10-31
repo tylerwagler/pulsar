@@ -114,11 +114,6 @@ static const void *const *expert_table_get(const void *base, uint32_t n_total, u
     return entries;
 }
 
-/// The type-40 (CUTLASS MXFP4) stack's table: one pointer per expert.
-/// @param base the stack's base.
-/// @param stride per-expert stride, bytes.
-/// @param n_total experts.
-/// @return the device table [n_total], or NULL.
 const uint8_t *const *mxfp4_expert_table(const void *base, uint64_t stride, uint32_t n_total) {
     return (const uint8_t *const *)expert_table_get(base, n_total, 1, stride, 0, 0);
 }

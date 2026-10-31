@@ -1413,6 +1413,15 @@ static bool tp_attn_input_split(pulsar_gpu_graph *g, const pulsar_model *model,
     return ok;
 }
 
+/* Encode one layer's attention half for a prefill batch: the hyper-connection pre-mix, the q/kv projections and
+ * norms, the compressor and indexer, attention over the window and compressed rows, and the output projection. */
+/// @param g the graph
+/// @param model the model
+/// @param layer the layer's weights
+/// @param il the layer
+/// @param pos0 the batch's first position
+/// @param n_tokens rows
+/// @return false = failed
 bool gpu_graph_encode_layer_attention_batch(
         pulsar_gpu_graph  *g,
         const pulsar_model        *model,
@@ -2718,6 +2727,15 @@ bool gpu_graph_tp_allreduce_rows(pulsar_gpu_graph *g, uint32_t il, uint32_t n_to
 /** @def PULSAR_CUDA_ENCODE_PREFILL_SHARED_EXPERT
  *  Local to gpu_graph_encode_layer_ffn_batch (defined and undefined in its body): the prefill FFN's shared
  *  expert over the rank's owned range of its intermediate width. */
+/* Encode one layer's FFN half for a prefill batch: the hyper-connection pre-mix, the router, the routed and the
+ * shared experts, and the post-mix into the next layer's carrier. */
+/// @param g the graph
+/// @param model the model
+/// @param layer the layer's weights
+/// @param il the layer
+/// @param pos0 the batch's first position
+/// @param n_tokens rows
+/// @return false = failed
 bool gpu_graph_encode_layer_ffn_batch(
         pulsar_gpu_graph  *g,
         const pulsar_model        *model,

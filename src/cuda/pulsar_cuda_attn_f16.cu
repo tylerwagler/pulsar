@@ -1467,31 +1467,6 @@ int pulsar_gpu_attn_f16_tier_on(void) {
     return af16_device_supported();
 }
 
-/// Dense-mode prefill attention with the optional grouped E4M3 emission.
-/// @param heads_v out: the attention output heads (pulsar_heads_t), [n_tokens][n_head][512].
-/// @param sinks the attention sinks, f32 [n_head], device.
-/// @param q the queries, [n_tokens][n_head][head_dim] (stored Q type; raw when q_prep is non-NULL).
-/// @param raw_kv the raw KV rows (ring, chunk pack buffer or banked pools; the profile's row family).
-/// @param comp_kv the compressed KV rows (MAIN or UNIFIED rows); unused when n_comp == 0.
-/// @param n_tokens query rows.
-/// @param n_comp compressed rows (banked mode: the cross-bank superset clamp).
-/// @param window the sliding window, rows (banked mode: 1 .. PULSAR_CUDA_ATTENTION_RAW_SCORE_CAP).
-/// @param ratio compression ratio (positions per compressed row).
-/// @param n_head query heads.
-/// @param head_dim head width (512).
-/// @param gact_data grouped E4M3 data slots for the attn-output "a" GEMM, or NULL (no emission).
-/// @param gact_scale the grouped E8M0 scale slab.
-/// @param gact_kbp the scale slab's padded k-block pitch.
-/// @param gact_slab bytes between groups' scale slabs.
-/// @param n_groups output groups of the "a" GEMM.
-/// @param n_nope head dims before the rope tail (the epilogue encodes these).
-/// @param gact_tok0 this launch's first row in the grouped slab.
-/// @param gact_ntok the grouped slab's row count.
-/// @param positions per-row absolute positions, i32 [n_tokens], or NULL.
-/// @param q_prep the fused Q rope descriptor, or NULL when q is already roped.
-/// @param vis_left image-span visibility to the left, i32 [n_tokens], or NULL (text).
-/// @param vis_right image-span visibility to the right, i32 [n_tokens], or NULL (text).
-/// @return 1 on success, 0 on a refusal (named on stderr) or a failure.
 int pulsar_gpu_attention_f16_prefill_mx(
         void *heads_v, const float *sinks, const void *q,
         const pulsar_winkv_row_t *raw_kv, const pulsar_mainkv_row_t *comp_kv,
@@ -1601,22 +1576,6 @@ static_assert(std::is_same<
     "pulsar_gpu.h's pulsar_gpu_attention_f16_prefill has drifted from the "
     "definition below; update the header -- do not add an overload");
 
-/// Dense-mode prefill attention without emission (the kernel test's narrow entry).
-/// @param heads_v out: the attention output heads (pulsar_heads_t), [n_tokens][n_head][512].
-/// @param sinks the attention sinks, f32 [n_head], device.
-/// @param q the queries, [n_tokens][n_head][head_dim] (stored Q type; raw when q_prep is non-NULL).
-/// @param raw_kv the raw KV rows (ring, chunk pack buffer or banked pools; the profile's row family).
-/// @param comp_kv the compressed KV rows (MAIN or UNIFIED rows); unused when n_comp == 0.
-/// @param n_tokens query rows.
-/// @param n_comp compressed rows (banked mode: the cross-bank superset clamp).
-/// @param window the sliding window, rows (banked mode: 1 .. PULSAR_CUDA_ATTENTION_RAW_SCORE_CAP).
-/// @param ratio compression ratio (positions per compressed row).
-/// @param n_head query heads.
-/// @param head_dim head width (512).
-/// @param q_prep the fused Q rope descriptor, or NULL when q is already roped.
-/// @param vis_left image-span visibility to the left, i32 [n_tokens], or NULL (text).
-/// @param vis_right image-span visibility to the right, i32 [n_tokens], or NULL (text).
-/// @return 1 on success, 0 on a refusal (named on stderr) or a failure.
 int pulsar_gpu_attention_f16_prefill(
         void *heads_v, const float *sinks, const void *q,
         const pulsar_winkv_row_t *raw_kv, const pulsar_mainkv_row_t *comp_kv,

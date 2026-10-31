@@ -520,19 +520,6 @@ static void idx_scores_mxfp4_kernel(
 
 /* No extern "C": pulsar_gpu.h declares the whole backend seam with plain
  * linkage, and mismatching it here is a hard error once the header is in. */
-/** @param scores   device f32 out [n_tokens][n_comp]
- *  @param q        device packed MXKV-FP4 Q rows [n_tokens][n_head]
- *  @param weights  device f32 [n_tokens][n_head]
- *  @param comp     device packed MXKV-FP4 compressed rows [n_comp]
- *  @param n_comp   compressed rows
- *  @param n_tokens query tokens
- *  @param pos0     position of token 0
- *  @param n_head   indexer heads (PULSAR_IDX_MXFP4_HEADS_V41 or _V4)
- *  @param head_dim head width (128)
- *  @param ratio    compression ratio
- *  @param scale    score scale
- *  @param causal   nonzero: mask columns not yet visible
- *  @return nonzero on success, 0 on a refusal (unsupported shape or device) or a launch failure */
 int pulsar_gpu_indexer_scores_mxfp4(
         float *scores, const pulsar_mxkv_pack_t *q, const float *weights,
         const pulsar_mxkv_pack_t *comp,

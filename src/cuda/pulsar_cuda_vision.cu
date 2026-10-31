@@ -417,18 +417,6 @@ static size_t vattention_entries(int n_tok) {
     return full < cap ? full : cap;
 }
 
-/** @param o          the tower's tensor offsets in the mapped model (n_layers must be PULSAR_VISION_LAYERS)
- *  @param map        host base of the mapped model
- *  @param map_size   bytes mapped (unused)
- *  @param patches_host host bf16 (n_h * n_w, 3, PATCH, PATCH) patches
- *  @param n_h        patch grid rows
- *  @param n_w        patch grid columns
- *  @param out_host   host bf16 output, (out_rows, text_dim)
- *  @param out_cap    rows out_host holds
- *  @param out_rows   out: rows written
- *  @param dbg        host stage dump, or NULL
- *  @param dbg_blocks blocks dumped into dbg
- *  @return 1 on success, 0 on any refusal */
 int pulsar_cuda_vision_forward(const pulsar_vision_offsets *o,
                                const void *map, uint64_t map_size,
                                const uint16_t *patches_host, int n_h, int n_w,
@@ -596,16 +584,6 @@ done:
  * LayerNorm -> fc1 -> tanh-GELU -> fc2 -> residual] -> merger [LayerNorm per patch -> 4 patches (one 2x2 block)
  * concatenated -> fc1 -> erf-GELU -> fc2].  Same correctness-first kernels as DeepSeek's tower, graded the same way
  * (tests/vision_qwen_tower_gate.cpp, the reference's own bf16-vs-fp32 floor). */
-/** @param w               the tower's device weights
- *  @param patches_host    host bf16 [n_tok][PATCH_IN] patches, 2x2 merge-block order
- *  @param pos_host        host [n_tok][2] int32 patch (row, col)
- *  @param interp_idx_host host [n_tok][4] int32 learned-position taps
- *  @param interp_w_host   host [n_tok][4] f32 tap weights
- *  @param n_tok           patches (a positive multiple of 4)
- *  @param out_host        host bf16 [n_tok / 4][OUT] output
- *  @param out_cap         rows out_host holds
- *  @param dbg             host stage dump (3 x n_tok x DIM bf16), or NULL
- *  @return 1 on success, 0 on any refusal */
 int pulsar_cuda_qwen_vision_forward(const pulsar_qwen_vision_weights_dev *w, const uint16_t *patches_host,
                                     const int32_t *pos_host, const int32_t *interp_idx_host,
                                     const float *interp_w_host, int n_tok, uint16_t *out_host, int out_cap,

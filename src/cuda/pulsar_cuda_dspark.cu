@@ -500,13 +500,6 @@ __global__ static void dspark_hc_mean_reduce_batch_kernel(
 }
 
 
-/// out[p] = the mean of row p's n_hc copies, for every row of a verify batch.
-/// @param out out: f32 [n_tokens][n_embd].
-/// @param hc_batch the HC residual rows, [n_tokens][n_hc][n_embd] (pulsar_hc_t).
-/// @param n_embd model width.
-/// @param n_hc hyper-connection copies.
-/// @param n_tokens rows.
-/// @return 1 on success, 0 on a refusal or launch failure.
 int pulsar_gpu_dspark_hc_mean_reduce_batch(
         pulsar_gpu_tensor *out,
         const pulsar_gpu_tensor *hc_batch,
@@ -642,16 +635,6 @@ __global__ static void distill_top64_lse_kernel(
     }
 }
 
-/// Per teacher row: the top-64 (ids, f16 values) and the tail logsumexp (plan 92 P0).
-/// @param logits_rows the teacher logits, f32 [n_rows][vocab].
-/// @param n_rows rows.
-/// @param vocab vocabulary width.
-/// @param top_ids out: top-64 ids, i32 [cap][64], written at row0 + row.
-/// @param top_vals out: top-64 logits as f16 bits, [cap][64].
-/// @param tail_lse out: the non-top-64 logsumexp as f16 bits, [cap].
-/// @param inexact out: incremented when a row's selection may have dropped a top-64 value.
-/// @param row0 the first output row.
-/// @return 1 on success, 0 on a refusal or launch failure.
 int pulsar_gpu_distill_top64_tensor(
         const pulsar_gpu_tensor *logits_rows,
         uint32_t n_rows,
@@ -1002,24 +985,6 @@ static int dspark_markov_banks_launch(
     return cudaGetLastError() == cudaSuccess;
 }
 
-/// Runs the whole n_draft-step Markov chain for every bank.
-/// @param refined_logits out: base + the Markov refinement, f32 [n_banks][vocab_size] (one bank: [vocab_size]).
-/// @param ids_dev the chain's ids, i32 [n_banks][ids_stride]: position p + 1's winner written at column p + 1.
-/// @param ids_stride ids_dev row stride, elements.
-/// @param base_logits the drafter's base logits, f32.
-/// @param base_row_stride_bytes base_logits row stride, bytes.
-/// @param base_row_dev per-bank base-logits row, i32 [n_banks].
-/// @param dspark_model_map the drafter model mapping.
-/// @param dspark_model_size its bytes.
-/// @param markov_w1_offset markov_w1's offset in the mapping.
-/// @param markov_w2_offset markov_w2's offset in the mapping.
-/// @param n_banks banks (<= PULSAR_DSPARK_BANKS_MAX).
-/// @param n_draft draft positions.
-/// @param vocab_size vocabulary rows (a multiple of 4; of 32 for MXFP8 w2).
-/// @param embed_dim the Markov embedding width.
-/// @param w1_bf16 markov_w1 is bf16 (else f32).
-/// @param w2_fmt a PULSAR_MARKOV_W2_* storage.
-/// @return 1 on success, 0 on a refusal or launch failure.
 int pulsar_gpu_dspark_markov_chain_banks_model(
         pulsar_gpu_tensor *refined_logits, pulsar_gpu_tensor *ids_dev, uint32_t ids_stride,
         const pulsar_gpu_tensor *base_logits, uint64_t base_row_stride_bytes,
@@ -1039,25 +1004,6 @@ int pulsar_gpu_dspark_markov_chain_banks_model(
                                       w1_bf16, w2_fmt);
 }
 
-/// Runs one banked Markov step at position pos from prev_dev.
-/// @param refined_logits out: base + the Markov refinement, f32 [n_banks][vocab_size] (one bank: [vocab_size]).
-/// @param ids_dev the chain's ids, i32 [n_banks][ids_stride]: position p + 1's winner written at column p + 1.
-/// @param ids_stride ids_dev row stride, elements.
-/// @param base_logits the drafter's base logits, f32.
-/// @param base_row_stride_bytes base_logits row stride, bytes.
-/// @param base_row_dev per-bank base-logits row, i32 [n_banks].
-/// @param prev_dev per-bank previous tokens, i32 [n_banks].
-/// @param dspark_model_map the drafter model mapping.
-/// @param dspark_model_size its bytes.
-/// @param markov_w1_offset markov_w1's offset in the mapping.
-/// @param markov_w2_offset markov_w2's offset in the mapping.
-/// @param n_banks banks (<= PULSAR_DSPARK_BANKS_MAX).
-/// @param pos the draft position.
-/// @param vocab_size vocabulary rows (a multiple of 4; of 32 for MXFP8 w2).
-/// @param embed_dim the Markov embedding width.
-/// @param w1_bf16 markov_w1 is bf16 (else f32).
-/// @param w2_fmt a PULSAR_MARKOV_W2_* storage.
-/// @return 1 on success, 0 on a refusal or launch failure.
 int pulsar_gpu_dspark_markov_step_banks_model(
         pulsar_gpu_tensor *refined_logits, pulsar_gpu_tensor *ids_dev, uint32_t ids_stride,
         const pulsar_gpu_tensor *base_logits, uint64_t base_row_stride_bytes,

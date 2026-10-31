@@ -32,11 +32,6 @@ const pulsar_tokens *pulsar_session::tokens() {
 
 
 
-/** Tokenize `text` as a rendered chat with a model's tokenizer and print the tokens (no weights loaded).
- *  @param model_path the model artifact
- *  @param text       the rendered chat text (NULL = "")
- *  @param fp         the output stream (NULL = stdout)
- *  @return 0, or 1 when the model does not open */
 int pulsar_dump_text_tokenization(const char *model_path, const char *text, FILE *fp) {
     pulsar_model model;
     pulsar_vocab vocab;
@@ -1526,13 +1521,6 @@ static char *prefix_walk_engine_text(void *ud, int token, size_t *len) {
     return pulsar_token_text((pulsar_engine *)ud, token, len);
 }
 
-/** The seam walk (pulsar_tokens_prefix_match_with) over the engine's tokenizer; a NULL engine matches nothing.
- *  @param e     the engine
- *  @param a     the live side's tokens
- *  @param a_len tokens in `a`
- *  @param b     the request prompt's tokens
- *  @param b_len tokens in `b`
- *  @param out   receives the match */
 void pulsar_tokens_prefix_match(pulsar_engine *e,
                                 const int *a, int a_len,
                                 const int *b, int b_len,

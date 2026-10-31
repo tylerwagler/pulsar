@@ -59,8 +59,6 @@ void pulsar_linux_graph_backend_set_oom_score(pulsar_backend backend) {
 
 
 
-/** Does the mode think at all (anything but PULSAR_THINK_NONE)?  @param mode the think mode
- *  @return true when thinking is on */
 bool pulsar_think_mode_enabled(pulsar_think_mode mode) {
     return mode != PULSAR_THINK_NONE;
 }
@@ -270,19 +268,14 @@ void pulsar_acquire_instance_lock(void) {
 static inline const pulsar_family_bank_ops *session_banks(const pulsar_session *s) { return s->engine->family->banks; }
 
 
-/** Open an engine (pulsar_engine::open).  @param out receives the engine  @param opt the options
- *  @return 0, or nonzero on a refusal */
 int pulsar_engine_open(pulsar_engine **out, const pulsar_engine_options *opt) { return pulsar_engine::open(out, opt); }
 int pulsar_engine_open_group(pulsar_engine **out, const pulsar_engine_options *opts, uint32_t n) {
     return pulsar_engine::open_group(out, opts, n);
 }
-/** Close an engine and free everything it owns.  @param e the engine, or NULL */
 void pulsar_engine_close(pulsar_engine *e) { if (e) e->destroy(); }
-/** Print the engine's model summary to stderr.  @param e the engine */
 void pulsar_engine_summary(pulsar_engine *e) { e->summary(); }
 int pulsar_engine_vocab_size(pulsar_engine *e) { return e ? e->vocab_size() : 0; }
 int pulsar_engine_logits_width(const pulsar_engine *e) { return e ? e->logits_width() : 0; }
-/** The model name from the artifact's metadata.  @param e the engine  @return the name (the engine's) */
 const char *pulsar_engine_model_name(pulsar_engine *e) { return e->model_name(); }
 const char *pulsar_engine_served_model_id(const pulsar_engine *e) { return e->family->served_model_id(e); }
 /* The loaded shape IS the authority (pulsar_select_shape_from_metadata sets it
@@ -335,39 +328,22 @@ bool pulsar_engine_think_mode_supported(const pulsar_engine *e, pulsar_think_mod
     if (why) snprintf(why, n, "the V4 (0731) encoder has three levels -- low, high, max");
     return false;
 }
-/** Copy out the engine-cumulative speculative-decode counters (zeroed for a NULL engine).
- *  @param e   the engine, or NULL
- *  @param out receives the counters */
 void pulsar_engine_spec_metrics(pulsar_engine *e, pulsar_spec_metrics *out) { if (e) { e->spec_metrics(out); } else if (out) { memset(out, 0, sizeof(*out)); } }
 int pulsar_engine_model_id(pulsar_engine *e) { return e ? e->model_id() : (int)PULSAR_MODEL_VARIANT; }
 bool pulsar_engine_is_pruned(pulsar_engine *e) { return e ? e->is_pruned() : false; }
 uint64_t pulsar_engine_session_cost_bytes(pulsar_engine *e, int ctx_size) { return e ? e->session_cost_bytes(ctx_size) : 0; }
 uint64_t pulsar_engine_session_cost_bytes_banked(pulsar_engine *e, int ctx_size, int n_banks) { return e ? e->session_cost_bytes_banked(ctx_size, n_banks) : 0; }
 uint32_t pulsar_engine_bank_pool(int *pinned_by_env) { if (pinned_by_env) *pinned_by_env = gpu_graph_bank_pool_env_pinned(); return gpu_graph_bank_pool_n(); }
-/** Set the bank pool size the next session create uses (gpu_graph_bank_pool_set).  @param n_banks banks */
 void pulsar_engine_set_bank_pool(uint32_t n_banks) { gpu_graph_bank_pool_set(n_banks); }
 KvBytes pulsar_engine_demand_paged_bytes_per_bank(pulsar_engine *e, int ctx_size) { PULSAR_FAMILY_REQUIRES_E(e, PULSAR_FAMILY_CAP_BANKS, "the demand-paged bank price", KvBytes{}); return e ? e->family->banks->demand_paged_bytes(e, ctx_size) : KvBytes{}; }
 uint64_t pulsar_engine_weights_resident_bytes(pulsar_engine *e) { return e ? e->weights_resident_bytes() : 0; }
-/** Collect an importance matrix over a dataset (pulsar_engine::collect_imatrix; PULSAR_FAMILY_CAP_IMATRIX).
- *  @param e            the engine
- *  @param dataset_path the prompt dataset
- *  @param output_path  the imatrix file written
- *  @param ctx_size     the collection session's context, in tokens
- *  @param max_prompts  prompts to run
- *  @param max_tokens   tokens to run
- *  @return 0, or 1 on failure */
 int pulsar_engine_collect_imatrix(pulsar_engine *e,
                                const char *dataset_path,
                                const char *output_path,
                                int ctx_size,
                                int max_prompts,
                                int max_tokens) { PULSAR_FAMILY_REQUIRES_E(e, PULSAR_FAMILY_CAP_IMATRIX, "imatrix collection", 1); return e ? e->collect_imatrix(dataset_path, output_path, ctx_size, max_prompts, max_tokens) : 1; }
-/** Print tokens with their text to stdout through the family's tokenizer (PULSAR_FAMILY_CAP_CHAT).
- *  @param e      the engine
- *  @param tokens the tokens */
 void pulsar_engine_dump_tokens(pulsar_engine *e, const pulsar_tokens *tokens) { PULSAR_FAMILY_REQUIRES_E(e, PULSAR_FAMILY_CAP_CHAT, "token dumps (no tokenizer)", (void)0); if (e->family->tokenizer) e->family->tokenizer->dump(e, stdout, tokens); }
-/** The routed experts' quantisation bits (a cache-identity fact).  @param e the engine, or NULL
- *  @return the bits, 0 for a NULL engine */
 int pulsar_engine_routed_quant_bits(pulsar_engine *e) { return e ? e->routed_quant_bits() : 0; }
 uint32_t pulsar_engine_kv_identity(pulsar_engine *e) {
     return pulsar_segstore_identity((uint32_t)pulsar_engine_model_id(e), (uint32_t)pulsar_engine_routed_quant_bits(e),
@@ -435,8 +411,6 @@ int pulsar_engine_encode(pulsar_engine *e, const pulsar_tokens *inputs, uint32_t
     return e->family->encoder->encode(e, inputs, n, out, err, errlen);
 }
 
-/** Install the session's durable progress callback.  @param s the session, or NULL  @param fn the callback
- *  @param ud its user data */
 void pulsar_session_set_progress(pulsar_session *s, pulsar_session_progress_fn fn, void *ud) { if (s) s->set_progress(fn, ud); }
 void pulsar_session_set_display_progress(pulsar_session *s, pulsar_session_progress_fn fn, void *ud) { if (s) s->set_display_progress(fn, ud); }
 void pulsar_session_set_cancel(pulsar_session *s, pulsar_session_cancel_fn fn, void *ud) { if (s) s->set_cancel(fn, ud); }
@@ -462,11 +436,7 @@ KvBytes pulsar_session_touched_kv_bytes(const pulsar_session *s) {
     for (int b = 0, n = ops->count(ms); b < n; b++) bytes += ops->touched_kv_bytes(ms, (uint32_t)b);
     return bytes;
 }
-/** Is the bank's physical KV evicted (PULSAR_FAMILY_CAP_BANKS)?  @param s the session  @param bank the bank
- *  @return true while evicted */
 bool pulsar_session_bank_is_evicted(const pulsar_session *s, uint32_t bank) { PULSAR_FAMILY_REQUIRES_S(s, PULSAR_FAMILY_CAP_BANKS, "bank residency", false); return s ? session_banks(s)->is_evicted(s, bank) : false; }
-/** The KV bytes the bank has touched (PULSAR_FAMILY_CAP_BANKS).  @param s the session  @param bank the bank
- *  @return bytes */
 KvBytes pulsar_session_bank_touched_kv_bytes(pulsar_session *s, uint32_t bank) { PULSAR_FAMILY_REQUIRES_S(s, PULSAR_FAMILY_CAP_BANKS, "the touched-KV count", KvBytes{}); return s ? session_banks(s)->touched_kv_bytes(s, bank) : KvBytes{}; }
 KvBytes pulsar_session_quantum_growth_bytes_per_bank(pulsar_session *s, KvRows q) { PULSAR_FAMILY_REQUIRES_S(s, PULSAR_FAMILY_CAP_BANKS, "the bank growth price", KvBytes{}); return session_banks(s)->growth_bytes(s, q); }
 /* The bank wrappers are defined with the mirror below (increment 2). */
@@ -715,12 +685,6 @@ static int tp_mirror_sent(pulsar_tp *tp, const char *operation, int sent,
     return 0;
 }
 
-/** Create a session on the engine (refused on a TP worker rank and past the trained context); on a TP leader the
- *  create is mirrored and the workers' agreement awaited.
- *  @param out      receives the session (NULL on failure)
- *  @param e        the engine
- *  @param ctx_size the context, in tokens
- *  @return 0, or nonzero on failure (said) */
 int pulsar_session_create(pulsar_session **out, pulsar_engine *e, int ctx_size) {
     PULSAR_NVTX_FN();
     /* A worker rank creates sessions only from the leader's frames (the loop
@@ -773,8 +737,6 @@ int pulsar_session_create(pulsar_session **out, pulsar_engine *e, int ctx_size) 
     return 0;
 }
 
-/** Free a session (on a TP leader: the pending identity check settled and the destroy mirrored).
- *  @param s the session, or NULL */
 void pulsar_session_free(pulsar_session *s) {
     PULSAR_NVTX_FN();
     if (!s) return;
@@ -1010,11 +972,6 @@ int pulsar_expand_image_placeholders(pulsar_engine *e, const pulsar_tokens *prom
     return ok ? 1 : 0;
 }
 TokCount pulsar_session_common_prefix(pulsar_session *s, const pulsar_tokens *prompt) { return TokCount{s->common_prefix(prompt)}; }
-/** The prefix-reuse verdict of `prompt` against the session's history (pulsar_session::prefix_match); a NULL session
- *  matches nothing.
- *  @param s      the session, or NULL
- *  @param prompt the request's tokens
- *  @param out    receives the match */
 void pulsar_session_prefix_match(pulsar_session *s, const pulsar_tokens *prompt, pulsar_prefix_match *out) { if (s) { s->prefix_match(prompt, out); } else if (out) { out->live_cut = TokCount{0}; out->prompt_cut = PromptToks{0}; out->seamed = false; } }
 int pulsar_session_argmax(pulsar_session *s) { return s->argmax(); }
 int pulsar_session_argmax_excluding(pulsar_session *s, int excluded_id) { return s ? s->argmax_excluding(excluded_id) : -1; }
@@ -1030,29 +987,9 @@ int pulsar_session_step_row_logprobs(pulsar_session *s, uint32_t row, int token,
                                      int *have_chosen, pulsar_token_score *top, int k, int *n_top) {
     return s && chosen && have_chosen && n_top && (top || k == 0) ? s->step_row_logprobs(row, token, chosen, have_chosen, top, k, n_top) : 1;
 }
-/** The k highest-logprob candidates of the live row, after the pending TP identity check settles.
- *  @param s   the session
- *  @param out receives up to k entries
- *  @param k   candidates wanted
- *  @return entries written; 0 for a NULL session or a failed settle */
 int pulsar_session_top_logprobs(pulsar_session *s, pulsar_token_score *out, int k) { return s && tp_mirror_settle(s, NULL, 0) ? s->top_logprobs(out, k) : 0; }
-/** Score one token of the live row, after the pending TP identity check settles.
- *  @param s     the session
- *  @param token the token
- *  @param out   receives the score
- *  @return 1 when scored, else 0 */
 int pulsar_session_token_logprob(pulsar_session *s, int token, pulsar_token_score *out) { return s && tp_mirror_settle(s, NULL, 0) ? s->token_logprob(token, out) : 0; }
-/** Copy the live logits row out, after the pending TP identity check settles.
- *  @param s   the session
- *  @param out destination
- *  @param cap its capacity in floats (size it with pulsar_engine_logits_width)
- *  @return floats written, 0 on a short `cap`, a failed readback or a failed settle */
 int pulsar_session_copy_logits(pulsar_session *s, float *out, int cap) { return s && tp_mirror_settle(s, NULL, 0) ? s->copy_logits(out, cap) : 0; }
-/** Overwrite the session's logits row (on a TP leader the row is mirrored and the ranks' verdicts compared).
- *  @param s      the session
- *  @param logits the new row
- *  @param n      its length, the logits width
- *  @return 0, or 1 on failure */
 int pulsar_session_set_logits(pulsar_session *s, const float *logits, int n) {
     PULSAR_NVTX_FN();
     if (!s) return 1;
@@ -1073,13 +1010,6 @@ int pulsar_session_set_logits(pulsar_session *s, const float *logits, int n) {
                         NULL, 0)) return 1;
     return tp_mirror_bank_verdict(s, tp, "set logits", s->set_logits(logits, n) != 0 ? 1 : 0, 1);
 }
-/** Decode one token at the session's frontier (pulsar_session_family_eval).  On a TP leader the eval is mirrored
- *  and its cross-rank identity check deferred to the next eval / logits read (see the body).
- *  @param s      the session
- *  @param token  the token
- *  @param err    receives the failure
- *  @param errlen bytes of `err`
- *  @return 0, or nonzero on failure */
 int pulsar_session_eval(pulsar_session *s, int token, char *err, size_t errlen) {
     PULSAR_NVTX_FN();
     if (!s) return 1;
@@ -1124,15 +1054,6 @@ int pulsar_session_eval(pulsar_session *s, int token, char *err, size_t errlen) 
     }
     return 0;
 }
-/** The batched decode (see the contract above), mirrored on a TP leader with the step's digest compared.
- *  @param s          the session
- *  @param reqs       [n] the rows, one per bank
- *  @param n          rows
- *  @param logits     receives one row per request, in `reqs` order
- *  @param logits_cap the TOTAL float capacity of `logits` (pulsar.h), >= n x the logits width
- *  @param err        receives the failure
- *  @param errlen     bytes of `err`
- *  @return 0, 1 (rejected, nothing changed) or -1 (fatal) */
 int pulsar_session_decode_multiseq(pulsar_session *s, const pulsar_multiseq_req *reqs, uint32_t n, float *logits, int logits_cap, char *err, size_t errlen) {
     PULSAR_NVTX_FN();
     if (!s) return 1;
@@ -1152,17 +1073,6 @@ int pulsar_session_decode_multiseq(pulsar_session *s, const pulsar_multiseq_req 
                                        s->engine->family->session->decode_multiseq(s, reqs, n, logits, logits_cap, err, errlen),
                                        n, err, errlen);
 }
-/** The mixed batched step (see the contract above), mirrored on a TP leader with the headed rows' digest compared.
- *  @param s             the session
- *  @param reqs          [n_rows] the rows
- *  @param n_rows        rows
- *  @param logits        receives the headed rows
- *  @param logits_cap    the TOTAL float capacity of `logits` (pulsar.h)
- *  @param out_n_rows    receives the headed row count (may be NULL)
- *  @param max_head_runs runs to head (0 = all, PULSAR_MSEQ_HEAD_ALL_ROWS = every row)
- *  @param err           receives the failure
- *  @param errlen        bytes of `err`
- *  @return 0, 1 or -1 as decode_multiseq */
 int pulsar_session_decode_mixed(pulsar_session *s, const pulsar_multiseq_req *reqs, uint32_t n_rows, float *logits, int logits_cap, uint32_t *out_n_rows, uint32_t max_head_runs, char *err, size_t errlen) {
     PULSAR_NVTX_FN();
     if (!s) return 1;
@@ -1191,17 +1101,6 @@ int pulsar_session_decode_mixed(pulsar_session *s, const pulsar_multiseq_req *re
                                         rows_out, max_head_runs, err, errlen);
     return tp_mirror_leader_ack_logits(s, tp, "mixed batch", body_rc, *rows_out, err, errlen);
 }
-/** The fused step (see the contract above), mirrored on a TP leader.
- *  @param s          the session
- *  @param reqs       [n_rows] the rows: n_dec decode / verify rows, then the prefill runs
- *  @param n_rows     rows
- *  @param shape      the step's shape (n_dec, n_pf, head_last)
- *  @param logits     receives the headed rows
- *  @param logits_cap the TOTAL float capacity of `logits` (pulsar.h)
- *  @param out_n_rows receives n_dec + the headed runs
- *  @param err        receives the failure (written unchecked: must be non-NULL)
- *  @param errlen     bytes of `err`
- *  @return 0, or nonzero on failure */
 int pulsar_session_decode_fused(pulsar_session *s, const pulsar_multiseq_req *reqs, uint32_t n_rows,
                                 const pulsar_fused_shape *shape, float *logits, int logits_cap,
                                 uint32_t *out_n_rows, char *err, size_t errlen) {
@@ -1304,11 +1203,6 @@ static int tp_mirror_bank_verdict_logits(pulsar_session *s, pulsar_tp *tp, const
     }
     return own;
 }
-/** Point the session's device views at `bank` (PULSAR_FAMILY_CAP_BANKS; a family without a repoint restores the
- *  bank instead), mirrored on a TP leader.
- *  @param s    the session
- *  @param bank the bank
- *  @return 0, or 1 on failure */
 int pulsar_session_bank_repoint(pulsar_session *s, uint32_t bank) {
     PULSAR_NVTX_FN();
     PULSAR_FAMILY_REQUIRES_S(s, PULSAR_FAMILY_CAP_BANKS, "bank repoint", 1);
@@ -1327,10 +1221,6 @@ int pulsar_session_bank_repoint(pulsar_session *s, uint32_t bank) {
                         NULL, 0)) return 1;
     return tp_mirror_bank_verdict(s, tp, "bank repoint", ops->repoint(s, bank), 1);
 }
-/** Save the installed host view into `bank`'s carry (PULSAR_FAMILY_CAP_BANKS), mirrored fire-and-forget on a TP
- *  leader.
- *  @param s    the session, or NULL
- *  @param bank the bank */
 void pulsar_session_bank_state_save(pulsar_session *s, uint32_t bank) {
     PULSAR_NVTX_FN();
     PULSAR_FAMILY_REQUIRES_S(s, PULSAR_FAMILY_CAP_BANKS, "bank state save", (void)0);
@@ -1349,10 +1239,6 @@ void pulsar_session_bank_state_save(pulsar_session *s, uint32_t bank) {
                         pulsar_tp_send_bank_state_save(tp, s->tp_session_id, bank), NULL, 0)) return;
     local();
 }
-/** Install `bank` and its saved host view (PULSAR_FAMILY_CAP_BANKS), mirrored on a TP leader.
- *  @param s    the session
- *  @param bank the bank
- *  @return true when installed (on a pair: on every rank) */
 bool pulsar_session_bank_state_restore(pulsar_session *s, uint32_t bank) {
     PULSAR_NVTX_FN();
     PULSAR_FAMILY_REQUIRES_S(s, PULSAR_FAMILY_CAP_BANKS, "bank state restore", false);
@@ -1401,8 +1287,6 @@ bool pulsar_session_bank_free_physical(pulsar_session *s, uint32_t bank) {
     PULSAR_FAMILY_REQUIRES_S(s, PULSAR_FAMILY_CAP_BANKS, "bank residency", false);
     return s ? tp_mirror_bank_physical(s, 1, bank) : false;
 }
-/** Re-back an evicted bank's physical KV (PULSAR_FAMILY_CAP_BANKS).  @param s the session  @param bank the bank
- *  @return true when done */
 bool pulsar_session_bank_alloc_physical(pulsar_session *s, uint32_t bank) {
     PULSAR_NVTX_FN();
     PULSAR_FAMILY_REQUIRES_S(s, PULSAR_FAMILY_CAP_BANKS, "bank residency", false);
@@ -1485,10 +1369,6 @@ bool pulsar_session_bank_comp_stale(pulsar_session *s, uint32_t bank) {
     const pulsar_ckpt_store *st = pulsar_session_kv_store(s);
     return st && st->ops && st->ops->stale(st->state, bank);
 }
-/** The bank's committed history (PULSAR_FAMILY_CAP_BANKS): the live view for the live bank, else its carry.
- *  @param s    the session
- *  @param bank the bank
- *  @return the tokens (the session's; borrowed), or NULL when the bank holds no valid history */
 const pulsar_tokens *pulsar_session_bank_tokens(pulsar_session *s, uint32_t bank) { PULSAR_FAMILY_REQUIRES_S(s, PULSAR_FAMILY_CAP_BANKS, "per-bank state", NULL); return pulsar_bank_history(s, bank); }
 /* The bank's committed history, the family's reader or DeepSeek's (the prefix readers below are
  * ONE body over it; L272 P0 folded the two copies). */
@@ -1497,18 +1377,9 @@ const pulsar_tokens *pulsar_session_bank_tokens(pulsar_session *s, uint32_t bank
 static const pulsar_tokens *session_bank_history(pulsar_session *s, uint32_t bank) {
     return pulsar_bank_history(s, bank);
 }
-/** The longest common token prefix of `bank`'s history and `prompt` (PULSAR_FAMILY_CAP_BANKS).
- *  @param s      the session
- *  @param bank   the bank
- *  @param prompt the request's tokens
- *  @return the shared length, in tokens */
 TokCount pulsar_session_bank_common_prefix(pulsar_session *s, uint32_t bank, const pulsar_tokens *prompt) { PULSAR_FAMILY_REQUIRES_S(s, PULSAR_FAMILY_CAP_BANKS, "per-bank state", TokCount{0});
     return TokCount{pulsar_tokens_common_prefix(session_bank_history(s, bank), prompt)}; }
 /* L115: the prefix-reuse authority against one bank's committed history. */
-/// @param s      the session
-/// @param bank   the bank
-/// @param prompt the request's tokens
-/// @param out    receives the match (nothing matched without a history or the cap)
 void pulsar_session_bank_prefix_match(pulsar_session *s, uint32_t bank, const pulsar_tokens *prompt, pulsar_prefix_match *out) { if (s && !pulsar_family_require(s->engine, PULSAR_FAMILY_CAP_BANKS, "per-bank state")) s = NULL;
     if (!out) return;
     out->live_cut = TokCount{0}; out->prompt_cut = PromptToks{0}; out->seamed = false;
@@ -1635,19 +1506,6 @@ int pulsar_session_spec_next_base(pulsar_session *s, float temperature, int top_
     const int agreed = tp_mirror_bank_verdict(s, tp, "spec_next_base", own + 1, -1);
     return agreed < 0 ? -1 : own;
 }
-/** Begin a speculative round on the live bank (PULSAR_FAMILY_CAP_SPEC; mirrored as a verdict on a TP leader).
- *  @param s            the session
- *  @param r            the round (the caller's, pulsar_spec_round_new)
- *  @param first_token  the base token
- *  @param max_tokens   the request's remaining token budget
- *  @param accepted_cap capacity of the caller's accepted[] for the round's end
- *  @param temperature  sampling temperature
- *  @param top_k        top-k cutoff
- *  @param top_p        nucleus cutoff
- *  @param min_p        relative probability floor
- *  @param err          receives the failure
- *  @param errlen       bytes of `err`
- *  @return the local result (0 = begun), or -1 on a refusal or a split verdict */
 int pulsar_session_spec_round_begin(pulsar_session *s, pulsar_spec_round *r, int first_token, int max_tokens, int accepted_cap, float temperature, int top_k, float top_p, float min_p, char *err, size_t errlen) {
     PULSAR_NVTX_FN();
     PULSAR_FAMILY_REQUIRES_S(s, PULSAR_FAMILY_CAP_SPEC, "speculative decoding", -1);
@@ -1684,9 +1542,6 @@ int pulsar_session_spec_round_end(pulsar_session *s, pulsar_spec_round *r, int f
     const int agreed = tp_mirror_bank_verdict(s, tp, "spec_round_end", own + 1, -1);
     return agreed < 0 ? -1 : own;
 }
-/** Abort a begun round whose forward failed (PULSAR_FAMILY_CAP_SPEC; mirrored fire-and-forget on a TP leader).
- *  @param s the session, or NULL
- *  @param r the round */
 void pulsar_session_spec_round_abort(pulsar_session *s, pulsar_spec_round *r) {
     PULSAR_NVTX_FN();
     PULSAR_FAMILY_REQUIRES_S(s, PULSAR_FAMILY_CAP_SPEC, "speculative decoding", (void)0);
@@ -1755,9 +1610,6 @@ int pulsar_session_spec_redraft_batch(pulsar_session *s, pulsar_spec_round **rou
     if (own != 0) pulsar_tp_own_step_failed(tp, "spec_redraft_batch");
     return tp_mirror_bank_verdict(s, tp, "spec_redraft_batch", own == 0 ? 0 : 1, -1) < 0 ? -1 : own;
 }
-/** Stamp the live bank's shadow with the round's deferred draft (PULSAR_FAMILY_CAP_SPEC; mirrored fire-and-forget).
- *  @param s the session, or NULL
- *  @param r the round */
 void pulsar_session_spec_redraft_commit(pulsar_session *s, pulsar_spec_round *r) {
     PULSAR_NVTX_FN();
     PULSAR_FAMILY_REQUIRES_S(s, PULSAR_FAMILY_CAP_SPEC, "speculative decoding", (void)0);
@@ -1911,18 +1763,7 @@ int pulsar_session_spec_redraft_commit_batch(pulsar_session *s, pulsar_spec_step
     const int own = pulsar_spec_steps_verdict(PULSAR_SPEC_PHASE_REDRAFT_COMMIT, steps, n, 0u);
     return tp_mirror_bank_verdict(s, tp, operation, own, -1) < 0 ? tp_spec_steps_fail(steps, n, operation) : 0;
 }
-/** The fused speculative loop's block (pulsar_session::eval_speculative_block; PULSAR_FAMILY_CAP_SPEC).
- *  @param s            the session
- *  @param first_token  the block's first token
- *  @param max_tokens   tokens to run at most
- *  @param accepted     receives the accepted tokens
- *  @param accepted_cap capacity of `accepted`
- *  @param err          receives the failure
- *  @param errlen       bytes of `err`
- *  @return the member's result; 0 for a NULL session, -1 without the cap */
 int pulsar_session_eval_speculative_block(pulsar_session *s, int first_token, int max_tokens, int *accepted, int accepted_cap, char *err, size_t errlen) { PULSAR_FAMILY_REQUIRES_S(s, PULSAR_FAMILY_CAP_SPEC, "speculative decoding", -1); return s ? s->eval_speculative_block(first_token, max_tokens, accepted, accepted_cap, err, errlen) : 0; }
-/** Forget the session's history (pulsar_session_family_invalidate), mirrored fire-and-forget on a TP leader.
- *  @param s the session */
 void pulsar_session_invalidate(pulsar_session *s) {
     PULSAR_NVTX_FN();
     /* The pair-off shape is untouched: one call, no TP code on the live path. */
@@ -1959,8 +1800,6 @@ void pulsar_engine_lane_cost_observe(pulsar_engine *e, pulsar_decode_lane lane, 
                 (double)f->row_us / 1000.0, f->n, first ? "" : ", moved");
     }
 }
-/** The lane's measured step-cost fit.  @param e the engine  @param lane the decode lane
- *  @return the fit's view, zeroed for a NULL engine or an unknown lane */
 pulsar_lane_cost pulsar_engine_lane_cost(const pulsar_engine *e, pulsar_decode_lane lane) {
     if (!e || (unsigned)lane >= (unsigned)PULSAR_LANE_COUNT) {
         pulsar_lane_cost c;
@@ -1969,8 +1808,6 @@ pulsar_lane_cost pulsar_engine_lane_cost(const pulsar_engine *e, pulsar_decode_l
     }
     return lane_cost_fit_view(&e->lane_cost[lane]);
 }
-/** Copy out the engine's speculative calibration (zeroed for a NULL engine).  @param e the engine, or NULL
- *  @param out receives it (non-NULL) */
 void pulsar_engine_spec_calibration(const pulsar_engine *e, pulsar_spec_calibration *out) {
     if (e) *out = e->spec_calibration;
     else memset(out, 0, sizeof *out);
@@ -2079,14 +1916,6 @@ PromptToks pulsar_session_bank_prompt_held(pulsar_session *s, uint32_t bank, con
     return pulsar_tokens_prompt_held_with(engine_api_token_text, s->engine, h->v, at, prompt->v, prompt->len);
 }
 
-/** Put the live bank at bank `src`'s state at its adopt point for `prompt` (see bank_adopt_point;
- *  PULSAR_FAMILY_CAP_BANKS; refused on a TP engine).
- *  @param s      the session
- *  @param src    another bank of the pool
- *  @param prompt the request's tokens
- *  @param err    receives the refusal (written unchecked: must be non-NULL)
- *  @param errlen bytes of `err`
- *  @return ADOPTED with T, NONE (no adopt point), or REFUSED (err filled) */
 pulsar_bank_adopt_result pulsar_session_bank_adopt(pulsar_session *s, uint32_t src, const pulsar_tokens *prompt,
                                                    char *err, size_t errlen) {
     PULSAR_NVTX_FN();
@@ -2137,12 +1966,6 @@ pulsar_bank_adopt_result pulsar_session_bank_adopt(pulsar_session *s, uint32_t s
     return {PULSAR_ADOPT_ADOPTED, TokPos{(int)T}};
 }
 
-/** Restore the live bank to its grid checkpoint at G.
- *  @param s      the session
- *  @param G      the position, > 0
- *  @param err    receives the failure (written unchecked: must be non-NULL)
- *  @param errlen bytes of `err`
- *  @return 0, or 1 on failure */
 int pulsar_session_restore_checkpoint(pulsar_session *s, TokPos G, char *err, size_t errlen) {
     PULSAR_NVTX_FN();
     if (!s || G.is_none() || G <= TokPos{0}) {
@@ -2199,17 +2022,9 @@ uint32_t pulsar_session_prefill_quantum_min_suffix(const pulsar_session *s) {
     s->engine->family->session->sync->prefill_shape(const_cast<pulsar_session *>(s), &sh);
     return sh.cap != 0u && sh.align != 0u && sh.cap <= sh.resumed_cap && sh.cap % sh.align == 0u ? 1u : 0u;
 }
-/** The session's committed history.  @param s the session, or NULL  @return the tokens (borrowed), or NULL */
 const pulsar_tokens *pulsar_session_tokens(pulsar_session *s) { return s ? s->tokens() : NULL; }
-/** The bytes pulsar_session_save_payload would write (PULSAR_FAMILY_CAP_PAYLOAD).  @param s the session
- *  @return bytes, 0 when the session cannot be saved */
 uint64_t pulsar_session_payload_bytes(pulsar_session *s) { PULSAR_FAMILY_REQUIRES_S(s, PULSAR_FAMILY_CAP_PAYLOAD, "session payloads", 0); return s ? s->payload_bytes() : 0; }
-/** Write the session's kv-state payload (PULSAR_FAMILY_CAP_PAYLOAD).  @param s the session  @param fp the stream
- *  @param err receives the failure  @param errlen bytes of `err`  @return 0, or 1 on failure */
 int pulsar_session_save_payload(pulsar_session *s, FILE *fp, char *err, size_t errlen) { PULSAR_FAMILY_REQUIRES_S(s, PULSAR_FAMILY_CAP_PAYLOAD, "session payloads", 1); return s ? s->save_payload(fp, err, errlen) : 1; }
-/** Load a kv-state payload into the session (PULSAR_FAMILY_CAP_PAYLOAD).  @param s the session  @param fp the stream
- *  @param payload_bytes the payload's size in bytes  @param err receives the failure  @param errlen bytes of `err`
- *  @return 0, or 1 on failure */
 int pulsar_session_load_payload(pulsar_session *s, FILE *fp, uint64_t payload_bytes, char *err, size_t errlen) { PULSAR_FAMILY_REQUIRES_S(s, PULSAR_FAMILY_CAP_PAYLOAD, "session payloads", 1); return s ? s->load_payload(fp, payload_bytes, err, errlen) : 1; }
 /* L334: a segment's span [G_prev, G): G_prev a position (none() is none), G past it. */
 /// @param G_prev the span's start
@@ -2316,17 +2131,6 @@ int pulsar_session_save_segment(pulsar_session *s, FILE *fp, TokPos G_prev, TokP
     }
     return 0;
 }
-/** Load one disk KV segment into the session (PULSAR_FAMILY_CAP_SEGMENTS); on a TP leader the workers load their own
- *  copies and must reach the same state, else it is a miss on every rank.
- *  @param s      the session
- *  @param fp     the segment's stream
- *  @param bytes  its size in bytes
- *  @param last   the chain's last segment (its state is loaded)
- *  @param G_out  receives the span's end (0 on failure)
- *  @param key    the store key (TP only)
- *  @param err    receives the failure (written unchecked: must be non-NULL)
- *  @param errlen bytes of `err`
- *  @return 0, or 1 on failure / a miss */
 int pulsar_session_load_segment(pulsar_session *s, FILE *fp, uint64_t bytes, bool last, TokPos *G_out,
                                 const char *key, char *err, size_t errlen) {
     PULSAR_NVTX_FN();
@@ -2370,12 +2174,6 @@ int pulsar_session_load_segment(pulsar_session *s, FILE *fp, uint64_t bytes, boo
     if (G_out) *G_out = TokPos{(int)G};
     return 0;
 }
-/** Save the session into an in-memory snapshot (PULSAR_FAMILY_CAP_PAYLOAD).  @param s the session
- *  @param snap receives the owned blob (pulsar_session_snapshot_free)  @param err receives the failure
- *  @param errlen bytes of `err`  @return 0, or 1 on failure */
 int pulsar_session_save_snapshot(pulsar_session *s, pulsar_session_snapshot *snap, char *err, size_t errlen) { PULSAR_FAMILY_REQUIRES_S(s, PULSAR_FAMILY_CAP_PAYLOAD, "session snapshots", 1); return s ? s->save_snapshot(snap, err, errlen) : 1; }
-/** Load an in-memory snapshot into the session (PULSAR_FAMILY_CAP_PAYLOAD).  @param s the session
- *  @param snap the snapshot  @param err receives the failure  @param errlen bytes of `err`
- *  @return 0, or 1 on failure */
 int pulsar_session_load_snapshot(pulsar_session *s, const pulsar_session_snapshot *snap, char *err, size_t errlen) { PULSAR_FAMILY_REQUIRES_S(s, PULSAR_FAMILY_CAP_PAYLOAD, "session snapshots", 1); return s ? s->load_snapshot(snap, err, errlen) : 1; }
 

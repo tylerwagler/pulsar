@@ -67,9 +67,6 @@ void *server_xrealloc(void *p, size_t n) {
 
 
 
-/// @brief strdup that dies on failure.
-/// @param s a NUL-terminated string (not NULL)
-/// @return the malloc'd copy
 char *xstrdup(const char *s) {
     size_t n = strlen(s);
     char *p = (char *)server_xmalloc(n + 1);
@@ -113,10 +110,6 @@ bool random_bytes(void *dst, size_t len) {
 
 
 
-/// @brief Copy the first `n` bytes of `s` into a NUL-terminated malloc'd string (dies on failure).
-/// @param s the bytes (n of them must be readable)
-/// @param n bytes to copy
-/// @return the copy
 char *xstrndup(const char *s, size_t n) {
     char *p = (char *)server_xmalloc(n + 1);
     memcpy(p, s, n);

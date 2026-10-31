@@ -465,9 +465,6 @@ void pulsar_engine_verify_curve_observe(pulsar_engine *e, uint32_t n_seqs, uint3
     }
 }
 
-/// A snapshot of the engine's verify curve for metrics (pulsar.h).
-/// @param e the engine (NULL allowed)
-/// @param out receives the view; zeroed when there is no curve
 void pulsar_engine_verify_curve_view(const pulsar_engine *e, pulsar_verify_curve_view *out) {
     memset(out, 0, sizeof *out);
     const pulsar_verify_curve *c = e ? e->verify_curve : NULL;
@@ -1029,13 +1026,6 @@ static double pf_rows_ms(const pulsar_prefill_cost_fit *f, uint32_t q, uint32_t 
     return f->alpha_ms * (double)q + f->beta_ms * (double)q * ((double)c + 0.5 * (double)q);
 }
 
-/// What n_runs prompt runs add to a round's verify forward (pulsar.h).
-/// @param e the engine
-/// @param n_runs runs
-/// @param q [n_runs] each run's rows (tokens)
-/// @param c [n_runs] each run's context before it (tokens)
-/// @param ms receives the ms (0 when unpriced)
-/// @return false until the fused terms are measured
 bool pulsar_engine_fused_prompt_ms(const pulsar_engine *e, uint32_t n_runs, const uint32_t *q, const uint32_t *c,
                                    double *ms) {
     const pulsar_prefill_cost_fit *f = e ? &e->prefill_cost : NULL;

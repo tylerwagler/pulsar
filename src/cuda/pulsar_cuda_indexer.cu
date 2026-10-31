@@ -743,16 +743,6 @@ static int indexer_scores_launch(
 }
 
 
-/** One token's scores, not causal.
- *  @param scores     f32 out [n_comp]
- *  @param q          packed Q rows [n_head]
- *  @param weights    f32 [n_head]
- *  @param index_comp packed compressed rows [n_comp]
- *  @param n_comp     compressed rows
- *  @param n_head     indexer heads
- *  @param head_dim   head width (128)
- *  @param scale      score scale
- *  @return nonzero on success, 0 refused or a launch failure */
 int pulsar_gpu_indexer_score_one_tensor(
         pulsar_gpu_tensor       *scores,
         const pulsar_gpu_tensor *q,
@@ -767,19 +757,6 @@ int pulsar_gpu_indexer_score_one_tensor(
 }
 
 
-/** n_tokens consecutive tokens' causal scores against one compressed cache.
- *  @param scores     f32 out [n_tokens][n_comp]
- *  @param q          packed Q rows [n_tokens][n_head]
- *  @param weights    f32 [n_tokens][n_head]
- *  @param index_comp packed compressed rows [n_comp]
- *  @param n_comp     compressed rows
- *  @param n_tokens   tokens
- *  @param pos0       position of token 0
- *  @param n_head     indexer heads
- *  @param head_dim   head width (128)
- *  @param ratio      compression ratio
- *  @param scale      score scale
- *  @return nonzero on success, 0 refused or a launch failure */
 int pulsar_gpu_indexer_scores_decode_batch_tensor(
         pulsar_gpu_tensor       *scores,
         const pulsar_gpu_tensor *q,
@@ -797,19 +774,6 @@ int pulsar_gpu_indexer_scores_decode_batch_tensor(
 }
 
 
-/** One same-bank run of consecutive positions, causal, against that bank's compressed cache.
- *  @param scores          f32 out [run_n][n_comp]
- *  @param q               packed Q rows [run_n][n_head]
- *  @param weights         f32 [run_n][n_head]
- *  @param bank_index_comp the bank's packed compressed rows (at least (run_pos0 + run_n) / ratio)
- *  @param n_comp          scores row stride / scan bound
- *  @param run_n           tokens in the run
- *  @param run_pos0        position of the run's first token
- *  @param n_head          indexer heads
- *  @param head_dim        head width (128)
- *  @param ratio           compression ratio (> 0)
- *  @param scale           score scale
- *  @return nonzero on success, 0 refused or a launch failure */
 int pulsar_gpu_indexer_scores_decode_run_tensor(
         pulsar_gpu_tensor       *scores,
         const pulsar_gpu_tensor *q,
@@ -850,14 +814,6 @@ int pulsar_gpu_indexer_scores_decode_run_tensor(
 }
 
 
-/** Each token's top_k compressed rows by score, best first (one sort kernel chosen by shape; the tree for
- *  n_comp > 8192).
- *  @param selected u32 out [n_tokens][top_k]
- *  @param scores   f32 [n_tokens][n_comp]
- *  @param n_comp   compressed rows
- *  @param n_tokens tokens
- *  @param top_k    rows to select (<= n_comp)
- *  @return nonzero on success, 0 refused (said), a scratch refusal or a launch failure */
 int pulsar_gpu_indexer_topk_tensor(
         pulsar_gpu_tensor       *selected,
         const pulsar_gpu_tensor *scores,
@@ -1040,11 +996,6 @@ int pulsar_gpu_indexer_topk_tensor(
 }
 
 
-/** Argmax of one f32 row.
- *  @param out_idx int32 out
- *  @param logits  f32 [n_vocab]
- *  @param n_vocab row width
- *  @return nonzero on success, 0 on a bad operand or a launch failure */
 int pulsar_gpu_argmax_tensor(
         pulsar_gpu_tensor       *out_idx,
         const pulsar_gpu_tensor *logits,

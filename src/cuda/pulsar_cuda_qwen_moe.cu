@@ -404,12 +404,7 @@ extern "C" int pulsar_rows_linear_multi_bf16_launch(const pulsar_rows_linear *co
 
 /* The MX slab geometry, for the engine TUs that cannot include pulsar_cuda_mx.cuh
  * (g++ does not know __host__/__device__).  One authority: these delegate. */
-/// @param in_dim an MX row's input width
-/// @return pulsar_mx_kbp(in_dim)
 int pulsar_gpu_mx_kbp(int in_dim) { return pulsar_mx_kbp(in_dim); }
-/// @param rows rows of the slab
-/// @param kbp  the row's padded block count (pulsar_gpu_mx_kbp)
-/// @return pulsar_mx_sf_slab_bytes(rows, kbp)
 size_t pulsar_gpu_mx_sf_slab_bytes(int rows, int kbp) { return pulsar_mx_sf_slab_bytes(rows, kbp); }
 
 extern "C" size_t pulsar_moe_block_workspace_bytes(const pulsar_moe_block_shape *s, int T) {

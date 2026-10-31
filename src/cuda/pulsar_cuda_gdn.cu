@@ -316,8 +316,7 @@ struct gdn_no_cluster {
  *  @param out_bf16   out bf16 [rows][Sh::VDIM], or NULL.
  *  @param out_q      out MX E4M3 data [rows][Sh::VDIM], or NULL.
  *  @param out_s      out_q's ue8m0 block scales.
- *  @param kbp        out_q's scale row pitch, pulsar_mx_kbp(Sh::VDIM).
- *  @return nothing (a kernel; doxygen reads GDN_CLUSTER_DIMS as part of the return type). */
+ *  @param kbp        out_q's scale row pitch, pulsar_mx_kbp(Sh::VDIM). */
 template <int TP>
 __global__ void GDN_CLUSTER_DIMS __launch_bounds__(256)
 gdn_recur_norm_kernel(const float *__restrict__ qkvn,

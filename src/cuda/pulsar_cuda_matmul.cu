@@ -872,17 +872,6 @@ static int fp8mx_mma_launch(OT *out, const fp8_mx_weight *w, int KBp,
 
 
 
-/** Token embedding into the hidden carriers (embed_tokens_hc_kernel), table read from the model mapping.
- *  @param out_hc        hc carriers [n_tokens][n_hc][n_embd]
- *  @param tokens_t      device int32 [n_tokens]
- *  @param model_map     host base of the model mapping
- *  @param model_size    bytes of the mapping
- *  @param weight_offset byte offset of the bf16 table [n_vocab][n_embd]
- *  @param n_vocab       table rows
- *  @param n_tokens      token rows
- *  @param n_embd        embedding width
- *  @param n_hc          carriers per token
- *  @return 1 on success, 0 refused / launch failed */
 int pulsar_gpu_embed_tokens_hc_tensor(
         pulsar_gpu_tensor       *out_hc,
         const pulsar_gpu_tensor *tokens_t,
@@ -1594,10 +1583,6 @@ static mxfp8_act_cache_t *act_slot_acquire(const void *ptr, uint64_t n_tok, uint
     return s;
 }
 
-/** Arms (acquires, validity reset) the slot for x and makes it the current one.
- *  @param x      the activation tensor
- *  @param n_tok  rows
- *  @param in_dim width */
 void pulsar_gpu_mxfp8_act_cache_arm(const pulsar_gpu_tensor *x, uint64_t n_tok, uint64_t in_dim) {
     g_act_cur = x ? act_slot_acquire(x->ptr, n_tok, in_dim) : NULL;
 }
@@ -1674,8 +1659,6 @@ static int act_f32_absent_hazard(const void *ptr, uint64_t n_tok, uint64_t in_di
 }
 
 
-/** Marks the current slot's f32 store as skipped for rows below keep_from.
- *  @param keep_from first row whose f32 store is present */
 void pulsar_gpu_mxfp8_act_cache_note_f32_skipped(uint32_t keep_from) {
     if (g_act_cur) {
         g_act_cur->f32_absent    = 1;
@@ -1730,13 +1713,6 @@ static int mxfp8_act_cache_reserve(void **buf, size_t *cap, size_t need, const c
  * The quantize pass this replaces is not moved, it is eliminated: the producer
  * already holds the value in a register, and its warp already spans exactly one
  * 32-element MX block, so the block max is a shuffle it can do for free. */
-/** @param x         the activation tensor (the key)
- *  @param n_tok     rows
- *  @param in_dim    width (a multiple of 32)
- *  @param data_out  out: device E4M3 [n_tok][in_dim]
- *  @param scale_out out: device E8M0 slab, zeroed (pulsar_mx_sfoff)
- *  @param sf_pitch  out: the slab's padded blocks per row
- *  @return 1, or 0 refused (named on stderr) */
 int pulsar_gpu_mxfp8_act_cache_e4m3_slot(const pulsar_gpu_tensor *x,
                                          uint64_t n_tok, uint64_t in_dim,
                                          void **data_out, void **scale_out,
@@ -1791,11 +1767,6 @@ int pulsar_gpu_mxfp8_act_cache_e4m3_slot(const pulsar_gpu_tensor *x,
  * runs for buffers whose producer emits.  The note takes the explicit key
  * rather than riding g_act_cur: arm/disarm pairing is delicate (L035) and
  * this file should not grow a second dependent on it. */
-/** @param x      the activation tensor (the key)
- *  @param n_tok  rows
- *  @param in_dim width
- *  @param xb_out out: device bf16 [n_tok][in_dim] the producer fills
- *  @return 1, or 0 refused */
 int pulsar_gpu_bf16_act_slot(const pulsar_gpu_tensor *x,
                              uint64_t n_tok, uint64_t in_dim, void **xb_out) {
     if (!x || n_tok == 0 || in_dim == 0 || !xb_out) return 0;
@@ -1810,10 +1781,6 @@ int pulsar_gpu_bf16_act_slot(const pulsar_gpu_tensor *x,
     return 1;
 }
 
-/** Declares the bf16 plane of x's slot current.
- *  @param x      the activation tensor
- *  @param n_tok  rows
- *  @param in_dim width */
 void pulsar_gpu_bf16_act_note(const pulsar_gpu_tensor *x,
                               uint64_t n_tok, uint64_t in_dim) {
     mxfp8_act_cache_t *s = x ? act_slot_find(x->ptr, n_tok, in_dim) : NULL;
@@ -1824,7 +1791,6 @@ void pulsar_gpu_bf16_act_note(const pulsar_gpu_tensor *x,
  * per-call scratch tensor (the verify heads' output_norm) can be re-allocated
  * at the same address for a different buffer; a valid_b left behind would
  * then satisfy a window lookup with last call's rows. */
-/** @param x the buffer about to be freed (every slot keyed on it is cleared) */
 void pulsar_gpu_act_slot_drop(const pulsar_gpu_tensor *x) {
     if (!x || !x->ptr) return;
     for (int i = 0; i < PULSAR_ACT_SLOTS; i++) {
@@ -1917,16 +1883,6 @@ __global__ static void mx_scale_rebase_kernel(unsigned char *dst, const unsigned
         src[(size_t)g * src_slab + pulsar_mx_sfoff(row0 + r, kb, KBp)];
 }
 
-/** Reserves the grouped activation slot for heads and hands it to the producer.
- *  @param heads      the attention output heads (the key)
- *  @param n_tokens   rows
- *  @param n_groups   groups
- *  @param group_dim  group width (a multiple of 32)
- *  @param data_out   out: device E4M3, group-major [g][n_tokens][group_dim]
- *  @param scale_out  out: device E8M0 slabs, zeroed
- *  @param sf_pitch   out: padded blocks per row
- *  @param scale_slab out: bytes between groups' slabs
- *  @return 1, or 0 refused */
 int pulsar_gpu_mxfp8_gact_slot(const pulsar_gpu_tensor *heads, uint32_t n_tokens,
                                uint32_t n_groups, uint64_t group_dim,
                                void **data_out, void **scale_out,
@@ -1986,12 +1942,6 @@ void pulsar_gpu_mxfp8_gact_disarm(void) {
  * VEC32 slab (a re-layout, not a quantise; the bytes are the producer's).
  * Consumers then find the view's encoding by their ordinary lookup.  Refuses
  * when the full activation carries no valid encoding. */
-/** @param x_full the full activation (its slot must be valid)
- *  @param row0   first row of the view
- *  @param rows   rows of the view
- *  @param in_dim width (a multiple of 32)
- *  @param x_view the view tensor (keys the new slot)
- *  @return 1, or 0 refused */
 int pulsar_gpu_mxfp8_act_cache_window(const pulsar_gpu_tensor *x_full, uint64_t row0, uint64_t rows,
                                       uint64_t in_dim, const pulsar_gpu_tensor *x_view) {
     if (!x_full || !x_view || rows == 0 || in_dim % 32 != 0) return 0;
@@ -2021,10 +1971,6 @@ int pulsar_gpu_mxfp8_act_cache_window(const pulsar_gpu_tensor *x_full, uint64_t 
  * kernel has no epilogue (the MoE's SwiGLU output).  Epilogue producers emit
  * directly and do not call this.  Arms the slot, encodes with the one
  * standalone encoder, notes it. */
-/** @param x      the f32 activation [n_tok][in_dim]
- *  @param n_tok  rows
- *  @param in_dim width (a multiple of 32)
- *  @return 1 armed, encoded and noted; 0 refused / failed */
 int pulsar_gpu_mxfp8_act_cache_encode_f32(const pulsar_gpu_tensor *x, uint64_t n_tok, uint64_t in_dim) {
     void *q = NULL, *sf = NULL; int kbp = 0;
     if (!x || n_tok == 0 || in_dim % 32 != 0) return 0;
@@ -2039,12 +1985,6 @@ int pulsar_gpu_mxfp8_act_cache_encode_f32(const pulsar_gpu_tensor *x, uint64_t n
     return 1;
 }
 
-/** Decodes x's armed E4M3 slot into dst (f32 [n_tok][in_dim]); the imatrix collector's path only.
- *  @param x      the activation (the key)
- *  @param n_tok  rows
- *  @param in_dim width
- *  @param dst    f32 destination
- *  @return 1, or 0 refused / failed */
 int pulsar_gpu_mxfp8_act_cache_decode_f32(const pulsar_gpu_tensor *x, uint64_t n_tok, uint64_t in_dim,
                                           pulsar_gpu_tensor *dst) {
     const void *q = NULL, *sf = NULL; int kbp = 0;
@@ -2065,11 +2005,6 @@ int pulsar_gpu_mxfp8_act_cache_decode_f32(const pulsar_gpu_tensor *x, uint64_t n
  * producer whose attention kernel has no E4M3 epilogue (today: the drafter's
  * raw batch attention).  Run right after the inverse rope tail, before the
  * attn-out projection; disarm with pulsar_gpu_mxfp8_gact_disarm after it. */
-/** @param heads     the heads [n_tokens][n_groups][group_dim]
- *  @param n_tokens  rows
- *  @param n_groups  groups
- *  @param group_dim group width
- *  @return 1 encoded and noted, 0 refused / failed */
 int pulsar_gpu_mxfp8_gact_emit_heads(const pulsar_gpu_tensor *heads, uint32_t n_tokens,
                                      uint32_t n_groups, uint64_t group_dim) {
     void *q = NULL, *sf = NULL; int kbp = 0; uint64_t slab = 0;
@@ -2083,14 +2018,6 @@ int pulsar_gpu_mxfp8_gact_emit_heads(const pulsar_gpu_tensor *heads, uint32_t n_
     return 1;
 }
 
-/** Encodes rows [row0, row0 + n_rows) of the heads into the already armed grouped slot (no note).
- *  @param heads     the heads (must key the armed slot)
- *  @param n_tokens  the slot's rows
- *  @param row0      first row
- *  @param n_rows    rows to encode
- *  @param n_groups  groups
- *  @param group_dim group width
- *  @return 1, or 0 refused / failed */
 int pulsar_gpu_mxfp8_gact_emit_heads_rows(const pulsar_gpu_tensor *heads, uint32_t n_tokens,
                                           uint32_t row0, uint32_t n_rows,
                                           uint32_t n_groups, uint64_t group_dim) {
@@ -2120,13 +2047,6 @@ void pulsar_gpu_mxfp8_act_cache_note_mxfp8(void) {
  * skip its own quantize pass.  Returns 0 when there is no valid encoding for
  * this exact (ptr, n_tok, in_dim), which the caller must treat as "encode it
  * yourself" -- never as an error. */
-/** @param ptr    activation buffer
- *  @param n_tok  rows (a prefix of the armed block is accepted)
- *  @param in_dim width
- *  @param data   out: E4M3 rows
- *  @param scale  out: E8M0 slab
- *  @param kbp    out: padded blocks per row
- *  @return 1 when a valid encoding covers the rows, else 0 */
 int pulsar_gpu_mxfp8_act_cache_get_e4m3_ptr(const void *ptr,
                                             uint64_t n_tok,
                                             uint64_t in_dim,
@@ -2149,14 +2069,6 @@ int pulsar_gpu_mxfp8_act_cache_get_e4m3_ptr(const void *ptr,
     return 1;
 }
 
-/** pulsar_gpu_mxfp8_act_cache_get_e4m3_ptr on x's buffer.
- *  @param x      the activation tensor
- *  @param n_tok  rows
- *  @param in_dim width
- *  @param data   out: E4M3 rows
- *  @param scale  out: E8M0 slab
- *  @param kbp    out: padded blocks per row
- *  @return 1 when a valid encoding covers the rows, else 0 */
 int pulsar_gpu_mxfp8_act_cache_get_e4m3(const pulsar_gpu_tensor *x,
                                         uint64_t n_tok,
                                         uint64_t in_dim,
@@ -2839,17 +2751,11 @@ __global__ static void mxfp8_mmvq_deint_nt_a8_kernel(OT *out, const __nv_fp8_e4m
 std::unordered_set<map_offset_key, map_offset_key_hash> g_fp8_offsets;
 
 
-/** Registers (mapping, offset) as an MXFP8 weight every FP8 arm may take.
- *  @param model_map     host base of the mapping
- *  @param weight_offset the weight's offset */
 void pulsar_gpu_register_fp8_weight(const void *model_map, uint64_t weight_offset) {
     g_fp8_offsets.insert({model_map, weight_offset});
 }
 
 
-/** Registers (mapping, offset) as pre-stored in the device MXFP8_LT layout.
- *  @param model_map     host base of the mapping
- *  @param weight_offset the weight's offset */
 void pulsar_gpu_register_fp8_lt_weight(const void *model_map, uint64_t weight_offset) {
     g_mxfp8_lt_offsets.insert({model_map, weight_offset});
 }
@@ -2860,13 +2766,6 @@ void pulsar_gpu_register_fp8_lt_weight(const void *model_map, uint64_t weight_of
  * GEMM arm finds it by offset exactly like a staged model tensor.  map_key is
  * any pointer unique to the caller's weight set; the caller passes the same key
  * and a model_size covering [offset, offset + data + scale) to the GEMM. */
-/** @param map_key  the caller's unique key for its weight set
- *  @param offset   the weight's key offset
- *  @param in_dim   input width (a multiple of 32)
- *  @param out_dim  output rows
- *  @param data     device E4M3 data [out_dim][in_dim]
- *  @param scale    device E8M0 scale plane (rows padded to 128)
- *  @return 1, or 0 refused */
 int pulsar_gpu_register_fp8_lt_weight_resident(const void *map_key, uint64_t offset,
                                                uint64_t in_dim, uint64_t out_dim,
                                                const pulsar_gpu_tensor *data,
@@ -2887,14 +2786,6 @@ int pulsar_gpu_register_fp8_lt_weight_resident(const void *map_key, uint64_t off
     return 1;
 }
 
-/** Registers output rows [row_lo, row_hi) of a pre-stored MXFP8_LT weight as a slice (see above).
- *  @param model_map     host base of the mapping
- *  @param parent_offset the whole tensor's offset
- *  @param in_dim        input width
- *  @param out_full      the whole tensor's output rows
- *  @param row_lo        first owned row (a multiple of 128)
- *  @param row_hi        one past the last owned row
- *  @return 1, or 0 refused */
 int pulsar_gpu_register_fp8_lt_row_slice(const void *model_map, uint64_t parent_offset,
                                          uint64_t in_dim, uint64_t out_full,
                                          uint64_t row_lo, uint64_t row_hi) {
@@ -2997,16 +2888,6 @@ __global__ static void mxfp8_lt_kslice_scale_kernel(unsigned char *dst, const un
     }
 }
 
-/** Repacks input columns [k_lo, k_hi) of a pre-stored MXFP8_LT weight and registers it (see above).
- *  @param model_map     host base of the mapping
- *  @param parent_offset the whole tensor's offset
- *  @param in_full       its input width
- *  @param out_dim       output rows
- *  @param k_lo          first column (a multiple of 128)
- *  @param k_hi          one past the last column (a multiple of 128)
- *  @param key_map       the key the repacked weight is registered under
- *  @param key_offset    its key offset
- *  @return 1, or 0 refused / failed */
 int pulsar_gpu_register_fp8_lt_kslice(const void *model_map, uint64_t parent_offset,
                                       uint64_t in_full, uint64_t out_dim,
                                       uint64_t k_lo, uint64_t k_hi,
@@ -3134,9 +3015,6 @@ void cuda_fp8_weight_cache_clear(void) {
  * (pulsar_decode_rows_scope). */
 /// Leading decode rows of the batch being encoded (this thread's; see above).
 static thread_local int g_batch_decode_rows = 0;
-/** @param n   decode rows (<= 0: none)
- *  @param cap the lane's row cap
- *  @return 1, or 0 refused (n > cap) */
 int pulsar_gpu_matmul_set_batch_decode_rows_capped(int n, int cap) {
     /* Refuse, do not warn: a lane declares at most its own cap.  The engine
      * static_asserts PULSAR_MSEQ_MAX against the M-neutral cap, so the batched
@@ -3148,8 +3026,6 @@ int pulsar_gpu_matmul_set_batch_decode_rows_capped(int n, int cap) {
     g_batch_decode_rows = (n > 0) ? n : 0;
     return 1;
 }
-/** @param n decode rows
- *  @return pulsar_gpu_matmul_set_batch_decode_rows_capped at PULSAR_GPU_MNEUTRAL_ROWS_MAX */
 int pulsar_gpu_matmul_set_batch_decode_rows(int n) {
     return pulsar_gpu_matmul_set_batch_decode_rows_capped(n, (int)PULSAR_GPU_MNEUTRAL_ROWS_MAX);
 }
@@ -3158,8 +3034,6 @@ int pulsar_gpu_matmul_set_batch_decode_rows(int n) {
  * slot, so the skips apply only when no decode prefix is in flight). */
 /// @return this thread's declared decode rows
 int pulsar_gpu_matmul_batch_decode_rows(void) { return g_batch_decode_rows; }
-/** @param n_tok the call's rows
- *  @return the decode prefix inside them, min(decode rows, n_tok) */
 uint32_t pulsar_gpu_matmul_decode_prefix(uint32_t n_tok) {
     return (uint32_t)g_batch_decode_rows < n_tok ? (uint32_t)g_batch_decode_rows : n_tok;
 }
@@ -3636,14 +3510,6 @@ static int bf16_lt_matmul(void *out, const uint16_t *w, const uint16_t *xb, cuda
 
 /* L295 F7: the BF16-weight dense arm over raw bf16 ROWS (pulsar_cuda_bf16_rows.cuh) takes this GEMM for prompt
  * chunks and past the M-independent width: the bf16 row pointer is the producer's emission, read as given. */
-/** @param y       f32 [rows][out_dim]
- *  @param w       bf16 weight [out_dim][in_dim]
- *  @param x_bf16  bf16 rows [rows][in_dim]
- *  @param in_dim  input width
- *  @param out_dim output rows
- *  @param rows    rows
- *  @param stream  stream
- *  @return 1 on success, 0 refused / failed */
 int pulsar_gpu_bf16_rows_gemm(float *y, const uint16_t *w, const uint16_t *x_bf16, uint64_t in_dim, uint64_t out_dim,
                               uint64_t rows, cudaStream_t stream) {
     if (!y || !w || !x_bf16 || in_dim == 0 || out_dim == 0 || rows == 0) return 0;
@@ -3655,17 +3521,6 @@ int pulsar_gpu_bf16_rows_gemm(float *y, const uint16_t *w, const uint16_t *x_bf1
  * else [k x n] (ldb).  f32 accumulate (CUBLAS_COMPUTE_32F: f32 means f32), the heuristic's first pick per call: a
  * tower runs once per image, so it owes no row-count neutrality.  Row-major C is column-major C^T = op(B)^T . A^T,
  * which is what the descriptors below say. */
-/** @param c       f32 C [m][n] (row-major)
- *  @param ldc     C row pitch
- *  @param a       bf16 A [m][k]
- *  @param lda     A row pitch
- *  @param b       bf16 B, [n][k] when b_trans else [k][n]
- *  @param ldb     B row pitch
- *  @param b_trans nonzero: op(B) = B^T
- *  @param m       rows of C
- *  @param n       columns of C
- *  @param k       reduction depth
- *  @return 1 on success, 0 failed (named) */
 int pulsar_cuda_vision_gemm(float *c, int ldc, const uint16_t *a, int lda, const uint16_t *b, int ldb,
                                        int b_trans, int m, int n, int k) {
     if (!cublaslt_ensure()) {
@@ -3719,22 +3574,6 @@ int pulsar_cuda_vision_gemm(float *c, int ldc, const uint16_t *a, int lda, const
  * workspace-free kernel) and the descriptors and algorithm are cached per call shape, so a launch after the first
  * allocates nothing and captures into a graph.  The algorithm is the heuristic's first pick for the shape: a shape's
  * bytes are fixed. */
-/** @param c        f32 C_i [m][n]
- *  @param ldc      C row pitch
- *  @param stride_c elements between C_i
- *  @param a        bf16 A_i [m][k]
- *  @param lda      A row pitch
- *  @param stride_a elements between A_i
- *  @param b        bf16 B_i, [n][k] when b_trans else [k][n]
- *  @param ldb      B row pitch
- *  @param stride_b elements between B_i
- *  @param b_trans  nonzero: op(B) = B^T
- *  @param m        rows of C
- *  @param n        columns of C
- *  @param k        reduction depth
- *  @param batch    batch count
- *  @param stream   stream
- *  @return 1 on success, 0 refused / failed */
 int pulsar_gpu_bf16_batched_gemm(float *c, int ldc, int64_t stride_c, const uint16_t *a, int lda, int64_t stride_a,
                                  const uint16_t *b, int ldb, int64_t stride_b, int b_trans, int m, int n, int k,
                                  int batch, cudaStream_t stream) {
@@ -4081,16 +3920,6 @@ static int matmul_bf16_wptr(pulsar_gpu_tensor *out, const uint16_t *w,
 }
 
 
-/** bf16-storage weight GEMM (matmul_bf16_wptr over the mapping).
- *  @param out           f32 [n_tok][out_dim]
- *  @param model_map     host base of the mapping
- *  @param model_size    bytes of the mapping
- *  @param weight_offset the weight's offset
- *  @param in_dim        input width
- *  @param out_dim       output rows
- *  @param x             the activation
- *  @param n_tok         rows
- *  @return 1 on success, 0 refused / failed */
 int pulsar_gpu_matmul_bf16_tensor(pulsar_gpu_tensor *out, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim, const pulsar_gpu_tensor *x, uint64_t n_tok) {
     if (!out || !x || !model_map || in_dim == 0 || out_dim == 0 || n_tok == 0) return 0;
     if (weight_offset > model_size || out_dim > UINT64_MAX / in_dim) return 0;
@@ -4172,16 +4001,6 @@ static const uint16_t *f32_weight_bf16_resolve(const void *model_map,
 
 
 
-/** F32-storage weight GEMM: matmul_bf16_wptr over the once-converted bf16 copy.
- *  @param out           f32 [n_tok][out_dim]
- *  @param model_map     host base of the mapping
- *  @param model_size    bytes of the mapping
- *  @param weight_offset the weight's offset
- *  @param in_dim        input width
- *  @param out_dim       output rows
- *  @param x             the activation
- *  @param n_tok         rows
- *  @return 1 on success, 0 refused / failed */
 int pulsar_gpu_matmul_f32_tensor(pulsar_gpu_tensor *out, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim, const pulsar_gpu_tensor *x, uint64_t n_tok) {
     if (!out || !x || !model_map || in_dim == 0 || out_dim == 0 || n_tok == 0) return 0;
     if (out_dim > UINT64_MAX / in_dim) return 0;
@@ -4341,10 +4160,6 @@ static int launch_grouped_fp8mx_a(float *low, const void *model_map, uint64_t ou
  * a pass after "a" rather than in "a"'s epilogue because the warp that reduces
  * a row does not hold that row's block neighbours.  A slot failure is an ERROR
  * now (L158): "b" has no f32 arm to fall back to. */
-/** @param x        f32 activation [n_tokens][dim]
- *  @param n_tokens rows
- *  @param dim      width (a multiple of 256)
- *  @return 1 encoded, armed and noted; 0 refused / failed */
 int pulsar_gpu_mxfp8_act_emit_f32(pulsar_gpu_tensor *x, uint32_t n_tokens, uint64_t dim) {
     if (!x || n_tokens == 0 || dim % 256 != 0) {
         fprintf(stderr, "pulsar: an f32 activation of dim %llu cannot carry an E4M3 encoding (needs a "
@@ -4380,16 +4195,6 @@ static int emit_low_e4m3(pulsar_gpu_tensor *low, uint32_t n_tokens, uint64_t low
  * before the split: decode rows take the warp8/nt A8 GEMV (one launch for all
  * groups, each row bit-identical to the n == 1 kernel), prefill rows the
  * tensor-core MX GEMMs; a mixed batch runs each range in its pure regime. */
-/** @param low          f32 [n_tokens][n_groups * rank] output
- *  @param model_map    host base of the mapping
- *  @param model_size   bytes of the mapping
- *  @param out_a_offset the 'a' weight's offset (a TP rank's row slice)
- *  @param group_dim    group width
- *  @param rank         rows per group
- *  @param n_groups     groups (owned)
- *  @param heads        the attention heads
- *  @param n_tokens     rows
- *  @return 1 on success, 0 refused / failed */
 int pulsar_gpu_attention_output_a_tensor(
         pulsar_gpu_tensor       *low,
         const void             *model_map,
@@ -4463,15 +4268,6 @@ int pulsar_gpu_attention_output_a_tensor(
  * that row's block neighbours), then the MXFP8 GEMM, which arms by row kind
  * itself.  A mixed batch emits and multiplies each range in its pure regime,
  * exactly as the single entry did, so every row's bytes are unchanged. */
-/** @param out          output [n_tokens][out_dim]
- *  @param model_map    host base of the mapping
- *  @param model_size   bytes of the mapping
- *  @param out_b_offset the 'b' weight's offset
- *  @param low_dim      input width (every group's rows)
- *  @param out_dim      output rows
- *  @param low          the gathered 'a' output (its E4M3 is emitted here)
- *  @param n_tokens     rows
- *  @return 1 on success, 0 refused / failed */
 int pulsar_gpu_attention_output_b_tensor(
         pulsar_gpu_tensor       *out,
         const void             *model_map,

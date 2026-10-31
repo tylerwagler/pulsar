@@ -528,23 +528,6 @@ int pulsar_gpu_csa2_compressor_prefill_tensor(
                                  norm_type == PULSAR_TENSOR_BF16, head_dim, ratio, coff, n_groups, CSA2_SRC_ROWS, pos0, rms_eps);
 }
 
-/// The decode step's compressor update: store the token, and at a group's last position pool it into one latent row.
-/// @param latent out: the emitted latent row, f32 [head_dim].
-/// @param latent_b out: its bf16 copy, or NULL.
-/// @param kv_cur the token's kv row, f32 [coff * head_dim].
-/// @param sc_cur the token's score row, same width.
-/// @param state_kv the state lane's kv rows.
-/// @param state_score the state lane's score rows.
-/// @param model_map the model mapping.
-/// @param model_size its bytes.
-/// @param norm_offset the compressor norm's offset.
-/// @param norm_type the norm's tensor type (F32 or BF16).
-/// @param head_dim latent width.
-/// @param ratio rows per group (1: every token emits).
-/// @param pos the token's position.
-/// @param rms_eps RMS epsilon.
-/// @param emitted out: 1 when a latent row was emitted.
-/// @return 1 on success, 0 on a refusal or CUDA failure.
 int pulsar_gpu_csa2_compressor_update_tensor(
         pulsar_gpu_tensor       *latent,
         void                    *latent_b,

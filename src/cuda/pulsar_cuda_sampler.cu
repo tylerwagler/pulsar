@@ -2803,28 +2803,10 @@ static uint64_t sample_sr_off(uint32_t n_vocab) {
            ~255ull;
 }
 
-/// @param n_vocab row width
-/// @return sampler scratch bytes
 uint64_t pulsar_gpu_sample_scratch_bytes(uint32_t n_vocab) {
     return sample_sr_off(n_vocab) + sr_scratch_bytes(n_vocab);
 }
 
-/** @param logits              the logits tensor
- *  @param logits_offset_bytes byte offset of row 0
- *  @param row_stride          row pitch in floats (>= n_vocab)
- *  @param n_vocab             row width
- *  @param logits_rows         rows reqs may name
- *  @param n_rows              draws, 1 .. PULSAR_GPU_SAMPLE_ROWS_MAX
- *  @param reqs                [n_rows] host requests
- *  @param mask                uint32 token mask rows, or NULL
- *  @param mask_words          words per mask row (>= ceil(n_vocab / 32))
- *  @param id_map              int32 [n_vocab] row index to token id, or NULL (identity)
- *  @param scratch             >= pulsar_gpu_sample_scratch_bytes(n_vocab)
- *  @param out                 receives n_rows pulsar_gpu_sample_out
- *  @param out_offset_bytes    byte offset in out
- *  @param dist                emitted distributions for the equality gate, or NULL
- *  @param dist_cap            entries per row in dist
- *  @return 1 enqueued, 0 refused or a launch failed (said) */
 int pulsar_gpu_sample_rows(const pulsar_gpu_tensor *logits, uint64_t logits_offset_bytes, uint32_t row_stride,
                            uint32_t n_vocab, uint32_t logits_rows, uint32_t n_rows, const pulsar_gpu_sample_req *reqs,
                            const pulsar_gpu_tensor *mask, uint32_t mask_words, const pulsar_gpu_tensor *id_map,
@@ -2977,27 +2959,10 @@ static uint64_t lp_tk_off(uint32_t n_vocab) { return (lp_sr_off(n_vocab) + sr_sc
 static constexpr uint64_t LP_TK_BYTES =
     (uint64_t)LP_GROUP * LP_TK_CHUNKS * (PULSAR_GPU_LOGPROB_TOPK_MAX * sizeof(uint64_t) + 2u * sizeof(uint32_t));
 
-/// @param n_vocab row width
-/// @return logprob scratch bytes (any row count)
 uint64_t pulsar_gpu_logprobs_scratch_bytes(uint32_t n_vocab) {
     return lp_tk_off(n_vocab) + LP_TK_BYTES;
 }
 
-/** @param logits              the logits tensor
- *  @param logits_offset_bytes byte offset of row 0
- *  @param row_stride          row pitch in floats
- *  @param n_vocab             row width
- *  @param n_rows              rows to score
- *  @param mask                uint32 token mask rows, or NULL
- *  @param mask_words          words per mask row
- *  @param mask_rows           host [n_rows] mask row of each row, or NULL (unmasked)
- *  @param tokens              int32 scored tokens, or NULL
- *  @param tokens_offset_bytes byte offset of row 0's token
- *  @param token_stride        int32s between rows' tokens
- *  @param top_k               best entries reported, <= PULSAR_GPU_LOGPROB_TOPK_MAX
- *  @param scratch             >= pulsar_gpu_logprobs_scratch_bytes(n_vocab)
- *  @param out                 receives n_rows pulsar_gpu_logprob_row
- *  @return 1 enqueued, 0 refused or a launch failed (said) */
 int pulsar_gpu_logprobs_rows(const pulsar_gpu_tensor *logits, uint64_t logits_offset_bytes, uint32_t row_stride,
                              uint32_t n_vocab, uint32_t n_rows, const pulsar_gpu_tensor *mask, uint32_t mask_words,
                              const uint32_t *mask_rows, const pulsar_gpu_tensor *tokens, uint64_t tokens_offset_bytes,
@@ -3049,14 +3014,6 @@ int pulsar_gpu_logprobs_rows(const pulsar_gpu_tensor *logits, uint64_t logits_of
     return 1;
 }
 
-/** @param rows              the sampler launch's out tensor
- *  @param rows_offset_bytes byte offset of its first pulsar_gpu_sample_out
- *  @param n_rows            sampler rows there
- *  @param runs              [n_runs] host verify runs (k <= 16, rows inside n_rows)
- *  @param n_runs            runs (1 .. PULSAR_GPU_SAMPLE_ROWS_MAX; the kernel walks one per thread of 32)
- *  @param out               receives n_runs pulsar_gpu_spec_walk_out
- *  @param out_offset_bytes  byte offset in out
- *  @return nonzero enqueued, 0 refused or a launch failed (said) */
 int pulsar_gpu_spec_walk(const pulsar_gpu_tensor *rows, uint64_t rows_offset_bytes, uint32_t n_rows,
                          const pulsar_gpu_spec_run *runs, uint32_t n_runs, pulsar_gpu_tensor *out,
                          uint64_t out_offset_bytes) {
@@ -3105,13 +3062,6 @@ __global__ static void __launch_bounds__(256) rows_digest_kernel(const uint64_t 
     }
 }
 
-/** @param rows             the f32 rows tensor
- *  @param offset_bytes     byte offset of row 0 (8-byte aligned)
- *  @param n_rows           rows
- *  @param width            floats per row (n_rows * width * 4 a multiple of 8)
- *  @param out              receives the u64 digest
- *  @param out_offset_bytes byte offset in out (8-byte aligned)
- *  @return nonzero enqueued, 0 refused or a launch failed (said) */
 int pulsar_gpu_rows_digest(const pulsar_gpu_tensor *rows, uint64_t offset_bytes, uint32_t n_rows, uint32_t width,
                            pulsar_gpu_tensor *out, uint64_t out_offset_bytes) {
     const uint64_t bytes = (uint64_t)n_rows * width * sizeof(float);
@@ -3125,18 +3075,6 @@ int pulsar_gpu_rows_digest(const pulsar_gpu_tensor *rows, uint64_t offset_bytes,
     return cuda_ok(cudaGetLastError(), "rows digest");
 }
 
-/** @param cand                int32 [chains][slots][topk] candidate ids
- *  @param cand_offset_bytes   byte offset in cand
- *  @param scores              f32 [chains][slots][topk][topk] candidate scores by previous pick
- *  @param scores_offset_bytes byte offset in scores
- *  @param slots               slots per chain, 1 .. PULSAR_GPU_CHAIN_SLOTS_MAX
- *  @param topk                candidates per slot, 1 .. PULSAR_GPU_CHAIN_TOPK_MAX
- *  @param vocab               the sparse rows' vocabulary
- *  @param reqs                [n_chains] host chain requests
- *  @param n_chains            chains, 1 .. PULSAR_GPU_CHAINS_MAX
- *  @param out                 receives int32 [n_chains][slots] tokens
- *  @param out_offset_bytes    byte offset in out
- *  @return nonzero enqueued, 0 refused or a launch failed (said) */
 int pulsar_gpu_sample_chains(const pulsar_gpu_tensor *cand, uint64_t cand_offset_bytes, const pulsar_gpu_tensor *scores,
                              uint64_t scores_offset_bytes, uint32_t slots, uint32_t topk, uint32_t vocab,
                              const pulsar_gpu_chain_req *reqs, uint32_t n_chains, pulsar_gpu_tensor *out,

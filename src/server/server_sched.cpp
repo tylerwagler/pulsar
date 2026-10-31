@@ -4621,10 +4621,6 @@ static bool slot_steppable_beside_fused(const session_slot *c) {
     return slot_steppable_beside_decode(c) && !slot_fusable_prefill(c);
 }
 
-/// @brief The single GPU worker thread: binds queued jobs, readmits preempted decoders, and steps the slots (the
-/// decode lanes, prefill chunks, restores, finishes) until the queue is empty and the server is stopping.
-/// @param arg the server
-/// @return NULL
 void *worker_main(void *arg) {
     server *s = (server *)arg;
     __atomic_store_n(&s->worker_tid, (int)syscall(SYS_gettid), __ATOMIC_RELAXED);   /* the stall dump's /proc */

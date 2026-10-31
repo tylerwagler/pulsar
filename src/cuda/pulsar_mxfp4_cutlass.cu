@@ -410,10 +410,6 @@ static size_t proj_scratch_layout(int T, int in_dim, int out_dim,
   *ws_off=off; off=align_up_bytes(off+(*ws_bytes), a);
   return off;
 }
-/** @param T       rows
- *  @param in_dim  input width
- *  @param out_dim output width
- *  @return scratch bytes of a single W4A8 projection (proj_scratch_layout) */
 size_t pulsar_cutlass_proj_scratch_bytes(int T, int in_dim, int out_dim){
   size_t a,b,c,d,e; return proj_scratch_layout(T,in_dim,out_dim,&a,&b,&c,&d,&e);
 }
@@ -675,12 +671,6 @@ static pulsar_grouped_scratch_layout grouped_scratch_layout(int padded_total, in
   return L;
 }
 
-/** @param padded_total   padded rows
- *  @param n_total_expert experts
- *  @param in_dim         input width
- *  @param mid_dim        intermediate width
- *  @param out_dim        output width
- *  @return scratch bytes pulsar_cutlass_grouped_moe needs */
 size_t pulsar_cutlass_grouped_moe_scratch_bytes(
     int padded_total, int n_total_expert, int in_dim, int mid_dim, int out_dim){
   return grouped_scratch_layout(padded_total, n_total_expert, in_dim, mid_dim, out_dim).total_bytes;
@@ -689,30 +679,6 @@ size_t pulsar_cutlass_grouped_moe_scratch_bytes(
 // Grouped MXFP4 FFN. x_gathered/w_gathered are the per-slot activations gathered to 128-padded
 // row offsets (padding rows must be pre-zeroed by the caller). Writes ffn_out[padded_total,out_dim]
 // (the caller scatters the real rows into the flat down buffer, then moe_sum reduces). No host sync.
-/** Grouped MXFP4 FFN (contract at the pulsar_gpu.h declaration): gate, up (grouped GEMMs), SwiGLU + E4M3 pack, down.
- *  @param ffn_out         f32 [padded_total][out_dim] pre-weighted output per padded row
- *  @param x_gathered      unused (the activation arrives as producer E4M3)
- *  @param w_gathered      f32 [padded_total] routing weight per padded row
- *  @param gate_tab        [n_total_expert] gate weight pointers
- *  @param up_tab          [n_total_expert] up weight pointers
- *  @param down_tab        [n_total_expert] down weight pointers
- *  @param gate_data_bytes gate / up data-plane bytes per expert
- *  @param down_data_bytes down data-plane bytes per expert
- *  @param clamp           SwiGLU clamp
- *  @param n_total_expert  experts
- *  @param in_dim          input width
- *  @param mid_dim         intermediate width (a multiple of 128)
- *  @param out_dim         output width
- *  @param counts          [n_total_expert] rows per expert
- *  @param padded_offsets  [n_total_expert] 128-padded row bases
- *  @param padded_total    padded rows (host upper bound, a multiple of 128)
- *  @param scratch         device scratch
- *  @param scratch_bytes   its bytes (>= pulsar_cutlass_grouped_moe_scratch_bytes)
- *  @param act_q           producer E4M3 rows of x
- *  @param act_sf          producer E8M0 plane (pulsar_mx_sfoff layout)
- *  @param act_kbp         its padded blocks per row
- *  @param row_src_tok     [padded_total] source token per padded row (< 0: padding)
- *  @return 0 on success, -1 scratch too small, -2 no producer E4M3, 3 a launch / GEMM failed */
 int pulsar_cutlass_grouped_moe(
     float *ffn_out, const float *x_gathered, const float *w_gathered,
     const uint8_t *const *gate_tab, const uint8_t *const *up_tab, const uint8_t *const *down_tab,
@@ -810,34 +776,10 @@ static size_t grouped_proj_layout(int padded_total, int n_total_expert, int in_d
   *ws_off = off;  off = align_up_bytes(off + *ws_bytes, a);
   return off;
 }
-/** @param padded_total   padded rows
- *  @param n_total_expert experts
- *  @param in_dim         input width
- *  @param out_dim        unused (the D buffer is the caller's)
- *  @return scratch bytes pulsar_cutlass_grouped_proj needs */
 size_t pulsar_cutlass_grouped_proj_scratch_bytes(int padded_total, int n_total_expert, int in_dim, int out_dim){
   (void)out_dim;   /* grouped WS is shape-independent; D buffer is caller-owned */
   size_t a,b,c,d,e,f; return grouped_proj_layout(padded_total, n_total_expert, in_dim, &a,&b,&c,&d,&e,&f);
 }
-/** Grouped single-projection W4A8 GEMM (contract at the pulsar_gpu.h declaration).
- *  @param out            f32 [padded_total][out_dim]
- *  @param x_gathered     unused (the activation arrives as producer E4M3)
- *  @param W_tab          [n_total_expert] weight pointers
- *  @param W_data_bytes   data-plane bytes per expert
- *  @param n_total_expert experts
- *  @param in_dim         input width
- *  @param out_dim        output width
- *  @param counts         [n_total_expert] rows per expert
- *  @param padded_offsets [n_total_expert] 128-padded row bases
- *  @param padded_total   padded rows
- *  @param scratch        device scratch
- *  @param scratch_bytes  its bytes
- *  @param reuse_packed_a nonzero: reuse the previous call's packed A in this scratch
- *  @param act_q          producer E4M3 rows
- *  @param act_sf         producer E8M0 plane
- *  @param act_kbp        its padded blocks per row
- *  @param row_src_tok    [padded_total] source token per padded row (< 0: padding)
- *  @return 0 on success, -1 scratch too small, -2 no producer E4M3, 3 a launch / GEMM failed */
 int pulsar_cutlass_grouped_proj(
     float *out, const float *x_gathered,
     const uint8_t *const *W_tab, uint64_t W_data_bytes,
@@ -1553,29 +1495,6 @@ static thread_local size_t g_fp4_gemv_actbuf_floats = 0;
 // gate/up GEMV emits mid as E4M3 + ue8m0 from its epilogue; the down GEMV reads that
 // pair.  down_out gets one pre-weighted FFN result per (token, slot); the caller sums
 // the n_expert slices per token (moe_sum_kernel).
-/** Small-batch rich-expert FFN (contract at the pulsar_gpu.h declaration): GEMV arm, or the E4M3 MMA arm for decode
- *  rows past pulsar_gpu_matmul_decode_exact_rows().
- *  @param down_out        f32 [n_tokens * n_expert][out_dim] pre-weighted slot outputs
- *  @param selected        [n_tokens][n_expert] expert ids
- *  @param rweights        [n_tokens][n_expert] routing weights
- *  @param gate_tab        [n_total_expert] gate weight pointers
- *  @param up_tab          [n_total_expert] up weight pointers
- *  @param down_tab        [n_total_expert] down weight pointers
- *  @param gate_stride     bytes per gate / up expert
- *  @param gate_data_bytes gate / up data-plane bytes per expert
- *  @param down_stride     bytes per down expert
- *  @param down_data_bytes down data-plane bytes per expert
- *  @param clamp           SwiGLU clamp
- *  @param n_tokens        token rows
- *  @param n_expert        slots per token
- *  @param n_total_expert  experts
- *  @param in_dim          input width (a multiple of 256)
- *  @param mid_dim         intermediate width (a multiple of 128, <= GEMV_DOWN_MAX_K)
- *  @param out_dim         output width (a multiple of 8)
- *  @param act_q           producer E4M3 rows of x
- *  @param act_sf          producer E8M0 plane (pulsar_mx_sfoff)
- *  @param act_kbp         its padded blocks per row (must equal the call's)
- *  @return 0 on success, 1 refused, 2 a launch failed */
 int pulsar_cutlass_expert_ffn_gemv_small(
     float *down_out,
     const int32_t *selected, const float *rweights,
@@ -1747,27 +1666,6 @@ int pulsar_cutlass_expert_ffn_gemv_small(
  * small-batch FFN path uses -- and `mid` is not written.  The caller (mixed
  * case A at decode) then hands those bytes to the MMQ down, exactly like the
  * fold-emitted slot the other arms produce. */
-/** Gate / up W4A8 GEMV + SwiGLU (contract at the pulsar_gpu.h declaration).
- *  @param mid             f32 [n_slots][mid_dim] (no emit)
- *  @param selected        [n_tokens][n_expert] expert ids
- *  @param rweights        [n_tokens][n_expert] routing weights
- *  @param gate_tab        [n_total_expert] gate weight pointers
- *  @param up_tab          [n_total_expert] up weight pointers
- *  @param gate_stride     bytes per expert
- *  @param gate_data_bytes data-plane bytes per expert
- *  @param clamp           SwiGLU clamp
- *  @param n_tokens        token rows
- *  @param n_expert        slots per token
- *  @param n_total_expert  experts
- *  @param in_dim          input width
- *  @param mid_dim         intermediate width
- *  @param act_q           producer E4M3 rows
- *  @param act_sf          producer E8M0 plane
- *  @param act_kbp         its padded blocks per row
- *  @param emit_q          E4M3 mid out, or NULL: write f32 mid
- *  @param emit_sf         its E8M0 plane
- *  @param emit_kbp        its padded blocks per row
- *  @return 0 on success, 1 refused (shape), 2 launch failed, 3 no producer E4M3 */
 int pulsar_cutlass_gemv_gateup(
     float *mid, const int32_t *selected, const float *rweights,
     const uint8_t *const *gate_tab, const uint8_t *const *up_tab, uint64_t gate_stride, uint64_t gate_data_bytes,
@@ -1811,21 +1709,6 @@ int pulsar_cutlass_gemv_gateup(
   return cudaGetLastError() == cudaSuccess ? 0 : 2;
 }
 /* down W4A8 GEMV -> down_out[n_slots,out_dim] (pair layout, NO routing weight -- applied at gate/up). */
-/** Down W4A8 GEMV (contract at the pulsar_gpu.h declaration).
- *  @param down_out        f32 [n_slots][out_dim] (no routing weight)
- *  @param selected        [n_tokens][n_expert] expert ids
- *  @param down_tab        [n_total_expert] down weight pointers
- *  @param down_stride     bytes per expert
- *  @param down_data_bytes data-plane bytes per expert
- *  @param n_tokens        token rows
- *  @param n_expert        slots per token
- *  @param n_total_expert  experts
- *  @param mid_dim         mid width (a multiple of 128, <= GEMV_DOWN_MAX_K)
- *  @param out_dim         output width
- *  @param mid_q           E4M3 mid rows
- *  @param mid_sf          its E8M0 plane
- *  @param mid_kbp         its padded blocks per row
- *  @return 0 on success, 1 refused, 2 launch failed */
 int pulsar_cutlass_gemv_down(
     float *down_out, const int32_t *selected,
     const uint8_t *const *down_tab, uint64_t down_stride, uint64_t down_data_bytes,

@@ -589,18 +589,6 @@ __global__ static void directional_steering_project_kernel(
 }
 
 
-/** @param out      f32 [n] (sized even when skipped)
- *  @param gate     gate activations [n] (f32 or f16, the same as up)
- *  @param up       up activations [n]
- *  @param n        elements (a multiple of 32 with out_q)
- *  @param clamp    the activation clamp, or <= 1e-6 for none
- *  @param weight   scale on every output
- *  @param out_q    E4M3 slot data, or NULL
- *  @param out_sf   its ue8m0 scales
- *  @param out_kbp  its scale row pitch
- *  @param mid_dim  slot row width (a multiple of 32 with out_q)
- *  @param skip_f32 nonzero: do not store f32 (requires out_q)
- *  @return nonzero on success, 0 refused or a launch failure */
 int pulsar_gpu_swiglu_mx_tensor(pulsar_gpu_tensor *out, const pulsar_gpu_tensor *gate, const pulsar_gpu_tensor *up,
                                 uint32_t n, float clamp, float weight,
                                 void *out_q, void *out_sf, int out_kbp, uint32_t mid_dim,
@@ -682,11 +670,6 @@ int pulsar_gpu_swiglu_mx_tensor(pulsar_gpu_tensor *out, const pulsar_gpu_tensor 
 
 
 
-/** @param out f32 [n] = a + b
- *  @param a   f32 [n]
- *  @param b   f32 [n]
- *  @param n   elements
- *  @return nonzero on success, 0 on a bad operand or a launch failure */
 int pulsar_gpu_add_tensor(pulsar_gpu_tensor *out, const pulsar_gpu_tensor *a, const pulsar_gpu_tensor *b, uint32_t n) {
     if (!out || !a || !b ||
         out->bytes < (uint64_t)n * sizeof(float) ||
@@ -697,13 +680,6 @@ int pulsar_gpu_add_tensor(pulsar_gpu_tensor *out, const pulsar_gpu_tensor *a, co
 }
 
 
-/** @param x          f32 [rows][width], steered in place
- *  @param directions f32 [layers][width]
- *  @param layer      the direction row to use
- *  @param width      row width
- *  @param rows       rows
- *  @param scale      projection strength (0 refused)
- *  @return nonzero on success, 0 on a bad operand or a launch failure */
 int pulsar_gpu_directional_steering_project_tensor(
         pulsar_gpu_tensor       *x,
         const pulsar_gpu_tensor *directions,
@@ -754,26 +730,6 @@ static pulsar_router_cfg ds4_router_cfg(uint32_t n_expert, uint32_t n_expert_use
     return c;
 }
 
-/** DeepSeek's routing for n_tokens rows through the shared router (pulsar_router_select_launch).
- *  @param selected            int32 out [n_tokens][n_expert_used]
- *  @param weights             f32 out [n_tokens][n_expert_used]
- *  @param probs               f32 out [n_tokens][n_expert] unbiased scores, or NULL
- *  @param model_map           host base of the mapped model
- *  @param model_size          bytes mapped
- *  @param bias_offset         the correction bias's byte offset (read with has_bias)
- *  @param has_bias            the layer has a correction bias
- *  @param tid2eid_offset      the hash table's byte offset (read when tid2eid_rows > 0)
- *  @param tid2eid_rows        hash table rows, or 0: a top-k layer
- *  @param logits              f32 [n_tokens][n_expert]
- *  @param tokens              int32 [n_tokens] token ids (required for a hash layer), or NULL
- *  @param n_expert            routed experts
- *  @param n_expert_used       picks per token
- *  @param expert_weight_scale the route scale
- *  @param n_tokens            rows
- *  @param vl_bias_offset      the image-slot bias's byte offset (read with has_vl_bias)
- *  @param n_vocab             text vocabulary: token ids >= it are image slots
- *  @param has_vl_bias         the layer has an image-slot bias
- *  @return nonzero on success, 0 refused or a launch failure */
 int pulsar_gpu_router_select_batch_tensor(
         pulsar_gpu_tensor *selected, pulsar_gpu_tensor *weights, pulsar_gpu_tensor *probs,
         const void *model_map, uint64_t model_size,
@@ -957,15 +913,6 @@ __global__ static void hc_norm_mix_kernel(
 
 /* The sigmoid step: out = sigmoid(pre * scale + base[h]) + eps.  `scale` is a
  * single f32 (a per-ROW scale, not per-stream), `base` is n_hc wide. */
-/** @param out          f32 [n_tokens][n_hc] (n_tokens = its size / row bytes)
- *  @param pre          f32 mix outputs, at least out's size
- *  @param model_map    host base of the mapped model
- *  @param model_size   bytes mapped
- *  @param scale_offset the f32 row scale's byte offset
- *  @param base_offset  the f32 [n_hc] bias's byte offset
- *  @param n_hc         carriers
- *  @param eps          added after the sigmoid
- *  @return nonzero on success, 0 on a bad operand or a launch failure */
 int pulsar_gpu_output_hc_weights_tensor(
         pulsar_gpu_tensor       *out,
         const pulsar_gpu_tensor *pre,
@@ -997,16 +944,6 @@ int pulsar_gpu_output_hc_weights_tensor(
  * on STORAGE rather than gated on one type: it used to be F16-only, which made
  * the fusion silently unreachable the moment hc_*_fn moved storage.  Anything
  * else REFUSES rather than falling through to an f16 read at the wrong width. */
-/** @param out           f32 [out_dim]
- *  @param model_map     host base of the mapped model
- *  @param model_size    bytes mapped
- *  @param weight_offset the mix weight's byte offset
- *  @param in_dim        input width
- *  @param out_dim       output rows
- *  @param x             HC carrier row [in_dim]
- *  @param eps           the norm's epsilon
- *  @param w_type        the weight's ds4 tensor type (PULSAR_TENSOR_BF16 or PULSAR_TENSOR_F32)
- *  @return nonzero on success, 0 refused or a launch failure */
 int pulsar_gpu_hc_norm_mix_tensor(
         pulsar_gpu_tensor       *out,
         const void             *model_map,
@@ -1042,12 +979,6 @@ int pulsar_gpu_hc_norm_mix_tensor(
 }
 
 
-/** @param out         f32 [n_tokens][n_embd] (n_tokens = its size / row bytes)
- *  @param residual_hc HC carrier [n_tokens][n_hc][n_embd]
- *  @param weights     f32 [n_tokens][n_hc]
- *  @param n_embd      hidden width
- *  @param n_hc        carriers
- *  @return nonzero on success, 0 on a bad operand or a launch failure */
 int pulsar_gpu_hc_weighted_sum_tensor(pulsar_gpu_tensor *out, const pulsar_gpu_tensor *residual_hc, const pulsar_gpu_tensor *weights, uint32_t n_embd, uint32_t n_hc) {
     if (!out || !residual_hc || !weights || n_embd == 0 || n_hc == 0) return 0;
     uint32_t n_tokens = (uint32_t)(out->bytes / ((uint64_t)n_embd * sizeof(float)));
@@ -1179,10 +1110,6 @@ int pulsar_gpu_hc_split_weighted_sum_norm_f16_tensor(
 
 
 
-/** @param pre    f32 out [n_rows][n_hc]: the one-hot pre handed to layer 0
- *  @param n_rows rows
- *  @param n_hc   carriers
- *  @return nonzero on success, 0 on a bad operand or a launch failure */
 int pulsar_gpu_hc_pre_identity_tensor(pulsar_gpu_tensor *pre, uint32_t n_rows, uint32_t n_hc) {
     if (!pre || n_rows == 0 || n_hc == 0 || pre->bytes < (uint64_t)n_rows * n_hc * sizeof(float)) return 0;
     const uint32_t n = n_rows * n_hc;
@@ -1192,14 +1119,6 @@ int pulsar_gpu_hc_pre_identity_tensor(pulsar_gpu_tensor *pre, uint32_t n_rows, u
 
 
 
-/** HC expand with the split's post / comb (no add).
- *  @param out_hc      HC carrier out [n_tokens][n_hc][n_embd] (n_tokens = its size / row bytes)
- *  @param block_out   f32 [n_tokens][n_embd] the sublayer's output
- *  @param residual_hc HC carrier [n_tokens][n_hc][n_embd]
- *  @param split       f32 [n_tokens][2 n_hc + n_hc^2] split coefficients
- *  @param n_embd      hidden width
- *  @param n_hc        carriers
- *  @return nonzero on success, 0 on a bad operand or a launch failure */
 int pulsar_gpu_hc_expand_split_tensor(pulsar_gpu_tensor *out_hc, const pulsar_gpu_tensor *block_out, const pulsar_gpu_tensor *residual_hc, const pulsar_gpu_tensor *split, uint32_t n_embd, uint32_t n_hc) {
     if (!out_hc || !block_out || !residual_hc || !split || n_embd == 0 || n_hc == 0) return 0;
     uint32_t n_tokens = (uint32_t)(out_hc->bytes / ((uint64_t)n_hc * n_embd * PULSAR_HC_ELT_SIZE));
@@ -1219,15 +1138,6 @@ int pulsar_gpu_hc_expand_split_tensor(pulsar_gpu_tensor *out_hc, const pulsar_gp
 
 
 
-/** HC expand of block_out + block_add with the split's post / comb.
- *  @param out_hc      HC carrier out [n_tokens][n_hc][n_embd] (n_tokens = its size / row bytes)
- *  @param block_out   f32 [n_tokens][n_embd]
- *  @param block_add   f32 [n_tokens][n_embd] added to block_out
- *  @param residual_hc HC carrier [n_tokens][n_hc][n_embd]
- *  @param split       f32 [n_tokens][2 n_hc + n_hc^2] split coefficients
- *  @param n_embd      hidden width
- *  @param n_hc        carriers
- *  @return nonzero on success, 0 on a bad operand or a launch failure */
 int pulsar_gpu_hc_expand_add_split_tensor(pulsar_gpu_tensor *out_hc, const pulsar_gpu_tensor *block_out, const pulsar_gpu_tensor *block_add, const pulsar_gpu_tensor *residual_hc, const pulsar_gpu_tensor *split, uint32_t n_embd, uint32_t n_hc) {
     if (!out_hc || !block_out || !block_add || !residual_hc || !split || n_embd == 0 || n_hc == 0) return 0;
     uint32_t n_tokens = (uint32_t)(out_hc->bytes / ((uint64_t)n_hc * n_embd * PULSAR_HC_ELT_SIZE));

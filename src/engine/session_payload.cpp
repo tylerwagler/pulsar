@@ -1224,7 +1224,6 @@ int pulsar_session::load_snapshot(const pulsar_session_snapshot *snap, char *err
 
 
 
-/** Free a snapshot's blob and zero it.  @param snap the snapshot, or NULL */
 void pulsar_session_snapshot_free(pulsar_session_snapshot *snap) {
     if (!snap) return;
     free(snap->ptr);

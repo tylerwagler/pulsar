@@ -183,6 +183,29 @@ touches a served kernel.  Squash to one commit whose message says what was
 deleted as clearly as what was added.  Delete the topic branch when it lands;
 park a branch only with a row that says why and for how long.
 
+**Doxygen clean means fully documented (0.5.0).**  `docs/Doxyfile` runs with
+`EXTRACT_ALL = NO` and every file in scope carries `@file`, so an undocumented
+file, function, type, member or macro is a warning, and the gate is an EMPTY
+`docs/api/doxygen-warnings.log` from `doxygen docs/Doxyfile` at the engine
+root.  Vendored mirrors stay out through the Doxyfile's `EXCLUDE` list, not
+through comments.  For contributors:
+
+- `@file` on every new file, with a line saying what it holds.
+- Measure with `GENERATE_HTML = YES` (the Doxyfile's setting): doxygen 1.9.8
+  skips the `@param` checks when no output is generated, so a run with HTML
+  off reads clean when it is not.
+- A macro defined inside a function body is documented with an `@def NAME`
+  block in front of the function; doxygen attaches a doc comment inside a body
+  to the function, not to the macro.
+- Literal tags in prose go in backticks (`` `<think>` ``): doxygen reads a bare
+  `<tag>` as HTML and warns or swallows it.
+- One doc location per function: the declaration when it carries the full
+  docs, else the definition, and the other location carries no doc comment.
+  Doxygen merges the two, so `@param` in both is a "multiple @param
+  documentation sections" warning, and a brief-only block at one of them can
+  read as an undocumented parameter list, depending on which file it parses
+  first.
+
 **The tier follows the paths (2026-09-23, Tyler: "we spend way too much time
 on batteries").**  ONE full battery per landing SERIES, on the last sha whose
 numeric paths changed -- not one per increment, and not again for a delta

@@ -716,15 +716,6 @@ __global__ static void indexer_rope_hadamard_fp4_pack_q_kernel(
 }
 
 
-/** Plain RMSNorm of HC carrier rows (rms_norm_plain_kernel, 256 threads, unroll 8).
- *  @param out      f32 [rows][n] (sized even when skipped)
- *  @param out_b    device bf16 [rows][n] copy, or NULL
- *  @param x        HC carrier rows [rows][n]
- *  @param n        row width
- *  @param rows     rows
- *  @param eps      the norm's epsilon
- *  @param skip_f32 nonzero: do not store the f32 rows (requires out_b)
- *  @return nonzero on success, 0 on a bad operand or a launch failure */
 int pulsar_gpu_rms_norm_plain_rows_tensor(pulsar_gpu_tensor *out, void *out_b, const pulsar_gpu_tensor *x, uint32_t n, uint32_t rows, float eps,
                                           int skip_f32) {
     if (!out || !x || out->bytes < (uint64_t)n * rows * sizeof(float) ||
@@ -778,33 +769,11 @@ int pulsar_gpu_rms_norm_weight_mx_tensor(pulsar_gpu_tensor *out, const pulsar_gp
     return cuda_ok(cudaGetLastError(), "rms_norm_weight launch");
 }
 
-/** pulsar_gpu_rms_norm_weight_mx_tensor with the f32 output only.
- *  @param out           f32 [n] out
- *  @param x             f32 [n]
- *  @param model_map     host base of the mapped model
- *  @param model_size    bytes mapped
- *  @param weight_offset the weight's byte offset
- *  @param n             row width
- *  @param eps           the norm's epsilon
- *  @param w_bf16        nonzero: the weight is stored bf16
- *  @return nonzero on success, 0 refused or a launch failure */
 int pulsar_gpu_rms_norm_weight_tensor(pulsar_gpu_tensor *out, const pulsar_gpu_tensor *x, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint32_t n, float eps, int w_bf16) {
     return pulsar_gpu_rms_norm_weight_mx_tensor(out, x, model_map, model_size, weight_offset, n, eps, NULL, NULL, 0, NULL, w_bf16);
 }
 
 
-/** rows rows' weighted RMSNorm (f32, optional bf16 copy).
- *  @param out           f32 [rows][n] out
- *  @param x             f32 [rows][n]
- *  @param model_map     host base of the mapped model
- *  @param model_size    bytes mapped
- *  @param weight_offset the weight's byte offset
- *  @param n             row width
- *  @param rows          rows
- *  @param eps           the norm's epsilon
- *  @param out_b         device bf16 [rows][n] out, or NULL
- *  @param w_bf16        nonzero: the weight is stored bf16
- *  @return nonzero on success, 0 refused or a launch failure */
 int pulsar_gpu_rms_norm_weight_rows_tensor(pulsar_gpu_tensor *out, const pulsar_gpu_tensor *x, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint32_t n, uint32_t rows, float eps, void *out_b, int w_bf16) {
     const uint64_t w_bytes = (uint64_t)n * pulsar_w_elt_bytes(w_bf16);
     if (!out || !x || !model_map || weight_offset > model_size ||
@@ -822,20 +791,6 @@ int pulsar_gpu_rms_norm_weight_rows_tensor(pulsar_gpu_tensor *out, const pulsar_
     return cuda_ok(cudaGetLastError(), "rms_norm_weight launch");
 }
 
-/** @param out           f32 [rows][n] out, or NULL when out_q or out_b is set
- *  @param x             f32 [rows][n]
- *  @param model_map     host base of the mapped model
- *  @param model_size    bytes mapped
- *  @param weight_offset the weight's byte offset
- *  @param n             row width (a multiple of 256 with out_q)
- *  @param rows          rows (> 0)
- *  @param eps           the norm's epsilon
- *  @param out_q         E4M3 slot data, or NULL
- *  @param out_sf        the slot's ue8m0 scales
- *  @param out_kbp       the slot's scale row pitch
- *  @param out_b         device bf16 [rows][n] out, or NULL
- *  @param w_bf16        nonzero: the weight is stored bf16
- *  @return nonzero on success, 0 refused or a launch failure */
 int pulsar_gpu_rms_norm_weight_rows_mx_tensor(pulsar_gpu_tensor *out, const pulsar_gpu_tensor *x,
                                               const void *model_map, uint64_t model_size,
                                               uint64_t weight_offset, uint32_t n, uint32_t rows, float eps,
@@ -961,23 +916,6 @@ int pulsar_gpu_dsv4_qkv_rms_norm_rows_mx_tensor(
  * `packed`.  There is no dequantized output: the packed rows are the ONLY Q
  * the scorers see, so the quantized values cannot fork from what a second
  * encode would produce -- the encode happens once, here. n_rows = n_tok * n_head. */
-/** @param x           f32 rows [n_tok * n_head][128], roped in place
- *  @param packed      packed MXKV-FP4 rows out [n_tok * n_head]
- *  @param n_tok       tokens
- *  @param n_head      heads per token
- *  @param head_dim    head width (128)
- *  @param n_rot       rotated tail dims (even)
- *  @param pos0        position of token 0 (without positions)
- *  @param n_ctx_orig  the model's original context (YaRN)
- *  @param inverse     rotate by -theta
- *  @param freq_base   rope base
- *  @param freq_scale  YaRN frequency scale
- *  @param ext_factor  YaRN extrapolation mix
- *  @param attn_factor magnitude scale
- *  @param beta_fast   YaRN beta_fast
- *  @param beta_slow   YaRN beta_slow
- *  @param positions   [n_tok] positions, or NULL
- *  @return nonzero on success, 0 on a bad operand or a launch failure */
 int pulsar_gpu_indexer_rope_fp4_pack_tensor(pulsar_gpu_tensor *x,
         pulsar_gpu_tensor *packed,
         uint32_t n_tok, uint32_t n_head, uint32_t head_dim, uint32_t n_rot,
@@ -1025,13 +963,6 @@ int pulsar_gpu_indexer_fp4_pack_tensor(pulsar_gpu_tensor *x,
  * storing MXKV FP4 rows into `packed` at [out_row0, out_row0 + n_rows).  The
  * rotate half of the reference's `rotate=True` compressor
  * (Compressor.forward: kv = rotate_activation(kv); fp4_act_quant(kv, ...)). */
-/** @param x        f32 rows [n_rows][128]
- *  @param packed   packed MXKV-FP4 rows; rows [out_row0, out_row0 + n_rows) written
- *  @param out_row0 first destination row
- *  @param n_rows   rows
- *  @param head_dim head width (128)
- *  @param keep_f32 write the dequantised values back into x
- *  @return nonzero on success, 0 refused (said) or a launch failure */
 int pulsar_gpu_dsv4_indexer_qat_pack_tensor(pulsar_gpu_tensor *x,
                                             pulsar_gpu_tensor *packed,
                                             uint32_t out_row0,
@@ -1058,23 +989,6 @@ int pulsar_gpu_dsv4_indexer_qat_pack_tensor(pulsar_gpu_tensor *x,
 
 /* V4's indexer q: rope the tail, Hadamard-rotate, fp4-pack -- in one launch,
  * because `rotate=True`'s q is not a consumer-visible f32 tensor. */
-/** @param x           f32 rows [n_tok * n_head][128], roped and rotated in place
- *  @param packed      packed MXKV-FP4 rows out [n_tok * n_head]
- *  @param n_tok       tokens
- *  @param n_head      heads per token
- *  @param head_dim    head width (128)
- *  @param n_rot       rotated tail dims (even)
- *  @param pos0        position of token 0 (without positions)
- *  @param n_ctx_orig  the model's original context (YaRN)
- *  @param inverse     rotate by -theta
- *  @param freq_base   rope base
- *  @param freq_scale  YaRN frequency scale
- *  @param ext_factor  YaRN extrapolation mix
- *  @param attn_factor magnitude scale
- *  @param beta_fast   YaRN beta_fast
- *  @param beta_slow   YaRN beta_slow
- *  @param positions   [n_tok] positions, or NULL
- *  @return nonzero on success, 0 on a bad operand or a launch failure */
 int pulsar_gpu_dsv4_indexer_rope_qat_tensor(
         pulsar_gpu_tensor *x,
         pulsar_gpu_tensor *packed,
@@ -1116,33 +1030,6 @@ int pulsar_gpu_dsv4_indexer_rope_qat_tensor(
  *
  * Unreachable for a V4.1 artifact: V4.1's index key is a projection of the kv
  * source's latent, with no rotation and no second compressor. */
-/** @param packed      the layer's index-K pool (MXKV-FP4 rows); rows [out_row0, out_row0 + groups) written
- *  @param latent      f32 scratch [n_tokens / ratio][head_dim]
- *  @param state_kv    the indexer compressor's own kv state lane
- *  @param state_score its score state lane
- *  @param sc          f32 [n_tokens][coff * head_dim] scores (ape folded in place)
- *  @param kv          f32 [n_tokens][coff * head_dim]
- *  @param model_map   host base of the mapped model
- *  @param model_size  bytes mapped
- *  @param ape_offset  the ape table's byte offset
- *  @param ape_type    its storage type
- *  @param norm_offset the pooled-row norm weight's byte offset
- *  @param norm_type   its storage type
- *  @param out_row0    first pool row written
- *  @param head_dim    index head width
- *  @param ratio       compression ratio (> 0)
- *  @param pos0        position of token 0
- *  @param n_tokens    tokens in the batch
- *  @param n_rot       rotated tail dims
- *  @param n_ctx_orig  the model's original context (YaRN)
- *  @param freq_base   rope base
- *  @param freq_scale  YaRN frequency scale
- *  @param ext_factor  YaRN extrapolation mix
- *  @param attn_factor magnitude scale
- *  @param beta_fast   YaRN beta_fast
- *  @param beta_slow   YaRN beta_slow
- *  @param rms_eps     the pooled-row norm's epsilon
- *  @return nonzero on success (also when no group closes), 0 refused or a failed step */
 int pulsar_gpu_indexer_compressor_prefill_tensor(
         pulsar_gpu_tensor       *packed,       /* the layer's index-K pool, MXKV FP4 rows */
         pulsar_gpu_tensor       *latent,       /* scratch: [n_groups][index_head_dim] f32 */
@@ -1217,35 +1104,6 @@ int pulsar_gpu_indexer_compressor_prefill_tensor(
 }
 
 
-/** The decode twin of pulsar_gpu_indexer_compressor_prefill_tensor: one token into the indexer compressor, and the
- *  pooled row packed when this token closes a group.
- *  @param packed      the layer's index-K pool
- *  @param latent      f32 scratch [head_dim]
- *  @param state_kv    the compressor's kv state lane
- *  @param state_score its score state lane
- *  @param sc          f32 [coff * head_dim] this token's scores (required when ratio > 1)
- *  @param kv          f32 [coff * head_dim] this token's kv
- *  @param model_map   host base of the mapped model
- *  @param model_size  bytes mapped
- *  @param ape_offset  the ape table's byte offset
- *  @param ape_type    its storage type
- *  @param norm_offset the norm weight's byte offset
- *  @param norm_type   its storage type
- *  @param out_row     pool row to write when a group closes
- *  @param head_dim    index head width (128)
- *  @param ratio       compression ratio (> 0)
- *  @param pos         this token's position
- *  @param n_rot       rotated tail dims
- *  @param n_ctx_orig  the model's original context (YaRN)
- *  @param freq_base   rope base
- *  @param freq_scale  YaRN frequency scale
- *  @param ext_factor  YaRN extrapolation mix
- *  @param attn_factor magnitude scale
- *  @param beta_fast   YaRN beta_fast
- *  @param beta_slow   YaRN beta_slow
- *  @param rms_eps     the norm's epsilon
- *  @param emitted     out: 1 when a row was packed, else 0
- *  @return nonzero on success, 0 refused or a failed step */
 int pulsar_gpu_indexer_compressor_update_tensor(
         pulsar_gpu_tensor       *packed,
         pulsar_gpu_tensor       *latent,
@@ -1316,31 +1174,6 @@ int pulsar_gpu_indexer_compressor_update_tensor(
 }
 
 
-/** Tail RoPE in place (rope_tail_kernel, instantiated by the buffer's stored format), with the optional grouped
- *  E4M3 epilogue.
- *  @param x           rows [n_tok][n_head][head_dim] (f32, f16 or bf16)
- *  @param n_tok       tokens
- *  @param n_head      heads per token
- *  @param head_dim    head width
- *  @param n_rot       rotated tail dims (even; 64 with gact_data)
- *  @param pos0        position of token 0 (without positions)
- *  @param n_ctx_orig  the model's original context (YaRN)
- *  @param inverse     rotate by -theta
- *  @param freq_base   rope base
- *  @param freq_scale  YaRN frequency scale
- *  @param ext_factor  YaRN extrapolation mix
- *  @param attn_factor magnitude scale
- *  @param beta_fast   YaRN beta_fast
- *  @param beta_slow   YaRN beta_slow
- *  @param positions   [n_tok] positions, or NULL
- *  @param gact_data   grouped E4M3 slab, or NULL
- *  @param gact_scale  its ue8m0 scales
- *  @param gact_kbp    its scale row pitch
- *  @param gact_slab   scale bytes per group
- *  @param n_groups    head groups
- *  @param gact_tok0   this launch's first slab row
- *  @param gact_ntok   the slab's rows
- *  @return nonzero on success, 0 refused or a launch failure */
 int pulsar_gpu_rope_tail_mx_tensor(pulsar_gpu_tensor *x, uint32_t n_tok, uint32_t n_head, uint32_t head_dim, uint32_t n_rot, uint32_t pos0, uint32_t n_ctx_orig, bool inverse, float freq_base, float freq_scale, float ext_factor, float attn_factor, float beta_fast, float beta_slow, const pulsar_gpu_tensor *positions,
         void *gact_data, void *gact_scale, int gact_kbp, uint32_t gact_slab, uint32_t n_groups,
         uint32_t gact_tok0, uint32_t gact_ntok) {
@@ -1503,23 +1336,6 @@ __global__ static void head_rms_norm_rope_tail_kernel(
 }
 
 
-/** @param x           rows [n_tok][n_head][head_dim] (f32 or f16, picked by element size)
- *  @param n_tok       tokens
- *  @param n_head      heads per token
- *  @param head_dim    head width
- *  @param n_rot       rotated tail dims (even, > 0)
- *  @param pos0        position of token 0 (without positions)
- *  @param n_ctx_orig  the model's original context (YaRN)
- *  @param inverse     rotate by -theta
- *  @param freq_base   rope base
- *  @param freq_scale  YaRN frequency scale
- *  @param ext_factor  YaRN extrapolation mix
- *  @param attn_factor magnitude scale
- *  @param beta_fast   YaRN beta_fast
- *  @param beta_slow   YaRN beta_slow
- *  @param eps         the norm's epsilon
- *  @param positions   [n_tok] positions, or NULL
- *  @return nonzero on success, 0 refused (said) or a launch failure */
 int pulsar_gpu_head_rms_norm_rope_tail_tensor(pulsar_gpu_tensor *x, uint32_t n_tok, uint32_t n_head, uint32_t head_dim, uint32_t n_rot, uint32_t pos0, uint32_t n_ctx_orig, bool inverse, float freq_base, float freq_scale, float ext_factor, float attn_factor, float beta_fast, float beta_slow, float eps, const pulsar_gpu_tensor *positions) {
     /* Derived from the buffer, never passed in.  Passing it was how decode
      * came to hand an f16 Q to the f32 kernel. */
@@ -1543,23 +1359,6 @@ int pulsar_gpu_head_rms_norm_rope_tail_tensor(pulsar_gpu_tensor *x, uint32_t n_t
 }
 
 
-/** pulsar_gpu_rope_tail_mx_tensor without the E4M3 epilogue.
- *  @param x           rows [n_tok][n_head][head_dim]
- *  @param n_tok       tokens
- *  @param n_head      heads per token
- *  @param head_dim    head width
- *  @param n_rot       rotated tail dims
- *  @param pos0        position of token 0 (without positions)
- *  @param n_ctx_orig  the model's original context (YaRN)
- *  @param inverse     rotate by -theta
- *  @param freq_base   rope base
- *  @param freq_scale  YaRN frequency scale
- *  @param ext_factor  YaRN extrapolation mix
- *  @param attn_factor magnitude scale
- *  @param beta_fast   YaRN beta_fast
- *  @param beta_slow   YaRN beta_slow
- *  @param positions   [n_tok] positions, or NULL
- *  @return nonzero on success, 0 refused or a launch failure */
 int pulsar_gpu_rope_tail_tensor(pulsar_gpu_tensor *x, uint32_t n_tok, uint32_t n_head, uint32_t head_dim, uint32_t n_rot, uint32_t pos0, uint32_t n_ctx_orig, bool inverse, float freq_base, float freq_scale, float ext_factor, float attn_factor, float beta_fast, float beta_slow, const pulsar_gpu_tensor *positions) {
     return pulsar_gpu_rope_tail_mx_tensor(x, n_tok, n_head, head_dim, n_rot, pos0, n_ctx_orig, inverse,
                                           freq_base, freq_scale, ext_factor, attn_factor,
@@ -1571,20 +1370,6 @@ int pulsar_gpu_rope_tail_tensor(pulsar_gpu_tensor *x, uint32_t n_tok, uint32_t n
  * `pos_stride` -- the compressed rows of a kv source, where row k stands for
  * the first token of its group at position pos0 + k * ratio (the reference:
  * `freqs_cis[: seqlen - seqlen % ratio : ratio]`). */
-/** @param x           f32 rows [n_rows][head_dim], roped in place
- *  @param n_rows      rows
- *  @param head_dim    head width
- *  @param n_rot       rotated tail dims (even, > 0)
- *  @param pos0        position of row 0
- *  @param pos_stride  position step between rows (> 0; the compression ratio)
- *  @param n_ctx_orig  the model's original context (YaRN)
- *  @param freq_base   rope base
- *  @param freq_scale  YaRN frequency scale
- *  @param ext_factor  YaRN extrapolation mix
- *  @param attn_factor magnitude scale
- *  @param beta_fast   YaRN beta_fast
- *  @param beta_slow   YaRN beta_slow
- *  @return nonzero on success, 0 refused (said) or a launch failure */
 int pulsar_gpu_rope_tail_strided_tensor(pulsar_gpu_tensor *x, uint32_t n_rows, uint32_t head_dim, uint32_t n_rot,
                                         uint32_t pos0, uint32_t pos_stride, uint32_t n_ctx_orig,
                                         float freq_base, float freq_scale, float ext_factor, float attn_factor,
@@ -1614,15 +1399,10 @@ int pulsar_gpu_rope_tail_strided_tensor(pulsar_gpu_tensor *x, uint32_t n_rows, u
 /// The loaded profile's KV row family, pushed by the engine at load (the seam's copy).
 static pulsar_kv_row_style g_kv_row_style = PULSAR_KV_ROWS_CSA2;
 
-/// Sets the loaded profile's KV row family.
-/// @param style the profile's pulsar_kv_row_style
 void pulsar_gpu_set_kv_row_style(pulsar_kv_row_style style) { g_kv_row_style = style; }
 /// @return the KV row family the packers use
 pulsar_kv_row_style pulsar_gpu_kv_row_style(void) { return g_kv_row_style; }
 
-/** @param kind     RING or COMP (INDEX is refused: not packed here)
- *  @param head_dim head width
- *  @return bytes of one packed row of that kind in the loaded family, or 0 refused */
 uint64_t pulsar_gpu_kv_row_bytes(pulsar_kv_row_kind kind, uint32_t head_dim) {
     if (kind == PULSAR_KV_ROW_INDEX) {
         fprintf(stderr, "pulsar: the index-K row is not packed by this module -- refusing\n");
@@ -1639,12 +1419,6 @@ uint64_t pulsar_gpu_kv_row_bytes(pulsar_kv_row_kind kind, uint32_t head_dim) {
  * size check asks by KIND and the pack goes through the dispatcher below --
  * neither this function nor its caller names a family.  Destination slot = the
  * shared pulsar_kv_ring_slot rule. */
-/** @param raw_cache the ring, raw_cap rows of the loaded family's RING format
- *  @param kv        f32 [head_dim] row
- *  @param raw_cap   ring rows
- *  @param row       ring slot (position) to write, < raw_cap
- *  @param head_dim  head width
- *  @return nonzero on success, 0 on a bad operand or a failed pack */
 int pulsar_gpu_store_raw_kv_tensor(pulsar_gpu_tensor *raw_cache, const pulsar_gpu_tensor *kv, uint32_t raw_cap, uint32_t row, uint32_t head_dim) {
     if (!raw_cache || !kv || raw_cap == 0 || row >= raw_cap ||
         raw_cache->bytes < (uint64_t)raw_cap * pulsar_gpu_kv_row_bytes(PULSAR_KV_ROW_RING, head_dim) ||
@@ -1665,14 +1439,6 @@ int pulsar_gpu_store_raw_kv_tensor(pulsar_gpu_tensor *raw_cache, const pulsar_gp
  * mis-sizes a buffer instead of failing loudly.
  *
  * plans/96-two-profiles-one-engine.md s12. */
-/** Packs n_rows f32 rows into COMP rows of the loaded family (MAIN rows, or the unified NVFP4 row).
- *  @param x        dequantised f32 rows out, or NULL
- *  @param src      f32 [n_rows][head_dim]
- *  @param packed   destination rows; [out_row0, out_row0 + n_rows) written
- *  @param out_row0 first destination row
- *  @param n_rows   rows
- *  @param head_dim head width
- *  @return nonzero on success, 0 refused or a launch failure */
 int pulsar_gpu_kv_comp_pack_tensor(pulsar_gpu_tensor *x, const pulsar_gpu_tensor *src, pulsar_gpu_tensor *packed,
                                    uint32_t out_row0, uint32_t n_rows, uint32_t head_dim) {
     if (g_kv_row_style == PULSAR_KV_ROWS_UNIFIED) {
@@ -1681,18 +1447,6 @@ int pulsar_gpu_kv_comp_pack_tensor(pulsar_gpu_tensor *x, const pulsar_gpu_tensor
     return pulsar_gpu_mainkv_pack_tensor(x, src, packed, out_row0, n_rows, head_dim);
 }
 
-/** Packs n_rows f32 rows into RING rows of the loaded family (ring placement by pulsar_kv_ring_slot).
- *  @param x         dequantised f32 rows out, or NULL (refused for the unified ring)
- *  @param src       f32 [n_rows][head_dim]
- *  @param packed    the ring (or a contiguous pack buffer when raw_cap is 0)
- *  @param out_row0  first row / position
- *  @param n_rows    rows
- *  @param head_dim  head width
- *  @param positions [n_rows] positions, or NULL
- *  @param seq_id    [n_rows] bank ids, or NULL
- *  @param n_banks   banks in the ring pool
- *  @param raw_cap   ring rows per bank, or 0
- *  @return nonzero on success, 0 refused or a launch failure */
 int pulsar_gpu_kv_ring_pack_tensor(pulsar_gpu_tensor *x, const pulsar_gpu_tensor *src, pulsar_gpu_tensor *packed,
                                    uint32_t out_row0, uint32_t n_rows, uint32_t head_dim,
                                    const pulsar_gpu_tensor *positions, const pulsar_gpu_tensor *seq_id,
@@ -1779,17 +1533,6 @@ static bool raw_store_descr_ok(const pulsar_gpu_tensor *positions, const pulsar_
     return true;
 }
 
-/** Scatters n_tokens already packed ring rows into the ring (winkv_scatter_kernel): never a second quantise.
- *  @param raw_cache the ring pool ([banks][raw_cap] rows)
- *  @param packed    packed rows [n_tokens]
- *  @param raw_cap   ring rows per bank
- *  @param pos0      position of row 0 (without positions)
- *  @param n_tokens  rows
- *  @param head_dim  head width
- *  @param positions [n_tokens] positions, or NULL
- *  @param seq_id    [n_tokens] bank ids, or NULL
- *  @param n_banks   banks (with positions)
- *  @return nonzero on success (1 for no rows), 0 refused or a launch failure */
 int pulsar_gpu_store_raw_kv_batch_packed_tensor(pulsar_gpu_tensor *raw_cache, const pulsar_gpu_tensor *packed,
                                                 uint32_t raw_cap, uint32_t pos0, uint32_t n_tokens, uint32_t head_dim,
                                                 const pulsar_gpu_tensor *positions, const pulsar_gpu_tensor *seq_id,
@@ -1818,17 +1561,6 @@ int pulsar_gpu_store_raw_kv_batch_packed_tensor(pulsar_gpu_tensor *raw_cache, co
     return cuda_ok(cudaGetLastError(), "window row scatter launch");
 }
 
-/** Packs and stores n_tokens f32 rows into the ring (pulsar_gpu_kv_ring_pack_tensor).
- *  @param raw_cache the ring pool
- *  @param kv        f32 [n_tokens][head_dim]
- *  @param raw_cap   ring rows per bank
- *  @param pos0      position of row 0 (without positions)
- *  @param n_tokens  rows
- *  @param head_dim  head width
- *  @param positions [n_tokens] positions, or NULL
- *  @param seq_id    [n_tokens] bank ids, or NULL
- *  @param n_banks   banks (with positions)
- *  @return nonzero on success (1 for no rows), 0 refused or a failed pack */
 int pulsar_gpu_store_raw_kv_batch_tensor(pulsar_gpu_tensor *raw_cache, const pulsar_gpu_tensor *kv, uint32_t raw_cap, uint32_t pos0, uint32_t n_tokens, uint32_t head_dim,
                                          const pulsar_gpu_tensor *positions, const pulsar_gpu_tensor *seq_id, uint32_t n_banks) {
     if (!raw_store_descr_ok(positions, seq_id, n_tokens, n_banks, raw_cap, "banked raw store")) return 0;
@@ -1847,11 +1579,6 @@ int pulsar_gpu_store_raw_kv_batch_tensor(pulsar_gpu_tensor *raw_cache, const pul
  * widening from the tensor's stored format (f32 / f16 / bf16).  A BYTES tensor
  * is refused: a narrowed buffer reinterpreted as f32 is plausible wrong
  * numbers, and this reader is the last stop before a human looks at them. */
-/** @param t        the tensor (f32, f16 or bf16; BYTES refused)
- *  @param elem_off first element
- *  @param out      host f32 [n_elems] out
- *  @param n_elems  elements to read
- *  @return 1 on success, 0 refused or a failed read */
 int pulsar_gpu_tensor_read_f32(const pulsar_gpu_tensor *t, uint64_t elem_off,
                                float *out, uint64_t n_elems) {
     if (!t || !t->ptr || !out || n_elems == 0) return 0;

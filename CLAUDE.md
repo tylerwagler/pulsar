@@ -11,7 +11,7 @@ Read `docs/ENGINEERING-RULES.md` before changing engine code. The short form:
 7. **Bit-exact by default; fidelity graded against the B300 reference, never argued.**
 8. **Measure at the shape production runs**, with the production activation format armed.
 9. **Fail closed, loudly, once.**
-10. **Landing discipline:** the gate tier the paths call for, at an asserted sha, zero warnings, doxygen clean, ledger updated, one squashed commit, topic branch deleted.
+10. **Landing discipline:** the gate tier the paths call for, at an asserted sha, zero warnings, doxygen clean (an empty warnings log with `EXTRACT_ALL = NO` and `@file` on every file: everything documented, once), ledger updated, one squashed commit, topic branch deleted.
 
 Two tiers, chosen by the paths (ENGINEERING-RULES §10): `make gates` is the full battery (every release-blocking gate; its wall time and the levers: docs/QA_BEFORE_RELEASES.md, "Battery wall time") and runs ONCE per landing series, on the last sha whose numeric paths (`src/engine`, `src/families`, `src/cuda`, `src/server`, `src/tp`) changed. `make gates-dev` is the iteration tier — a fast subset selected from the touched paths — and it is the landing tier for everything after that battery that cannot move a number (refusal paths, tests, tools, docs, Makefile recipes). A measurement someone is waiting on goes ahead of a battery in the GPU queue.
 

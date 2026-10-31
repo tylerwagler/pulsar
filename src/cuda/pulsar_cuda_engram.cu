@@ -68,11 +68,6 @@ __global__ static void engram_rows_emit_kernel(const unsigned char *rows, uint32
     scale[pulsar_mx_sfoff((int)tok, (int)kb, KBp)] = row[ENGRAM_DIM + j];
 }
 
-/// Emits the gathered rows as the E4M3 activation slot keyed by x_key (the f32 plane noted skipped).
-/// @param x_key the activation whose slot is written (>= n_tok * 6144 f32 bytes).
-/// @param rows the gathered records, [n_tok][24][264 B].
-/// @param n_tok tokens.
-/// @return 1 on success, 0 on a refusal (named on stderr) or launch failure.
 int pulsar_gpu_engram_rows_emit(const pulsar_gpu_tensor *x_key, const pulsar_gpu_tensor *rows,
                                 uint32_t n_tok) {
     if (!x_key || !rows || n_tok == 0) return 0;
@@ -156,16 +151,6 @@ __global__ static void engram_gate_add_kernel(pulsar_hc_t *hc, const float *kv, 
     }
 }
 
-/// h += sigmoid-gate * value on every live token's hyper-connection copies (the reference's gate in f32).
-/// @param hc the residual copies, [n_tok][n_hc][dim].
-/// @param kv the keys and value, f32 [n_tok][n_hc + 1][dim].
-/// @param qk_weight f32 [n_hc][dim].
-/// @param dead per-token dead flags (bytes), or NULL.
-/// @param n_tok tokens.
-/// @param n_hc copies.
-/// @param dim width (multiple of 32).
-/// @param eps RMS epsilon.
-/// @return 1 on success, 0 on a refusal or launch failure.
 int pulsar_gpu_engram_gate_add(pulsar_gpu_tensor *hc, const pulsar_gpu_tensor *kv,
                                const pulsar_gpu_tensor *qk_weight, const pulsar_gpu_tensor *dead,
                                uint32_t n_tok, uint32_t n_hc, uint32_t dim, float eps) {

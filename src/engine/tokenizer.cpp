@@ -101,22 +101,18 @@ void token_vec_free(token_vec *tv) {
 
 
 
-/** Append a token.  @param tv the token list  @param token the token id */
 void pulsar_tokens_push(pulsar_tokens *tv, int token) {
     token_vec_push(tv, token);
 }
 
 
 
-/** Free the list's storage and zero it.  @param tv the token list */
 void pulsar_tokens_free(pulsar_tokens *tv) {
     token_vec_free(tv);
 }
 
 
 
-/** Make `dst` a copy of `src`, reusing dst's storage when it is large enough.  @param dst the destination
- *  @param src the source */
 void pulsar_tokens_copy(pulsar_tokens *dst, const pulsar_tokens *src) {
     /* Reserve once and memcpy: the push loop this replaced called xrealloc O(n)
      * times on the first copy into an empty vector, and the spec bank carry
@@ -134,8 +130,6 @@ void pulsar_tokens_copy(pulsar_tokens *dst, const pulsar_tokens *src) {
 
 
 
-/** Does `tokens` begin with `prefix`?  @param tokens the list  @param prefix the prefix
- *  @return true when it does (an empty prefix always) */
 bool pulsar_tokens_starts_with(const pulsar_tokens *tokens, const pulsar_tokens *prefix) {
     if (prefix->len > tokens->len) return false;
     for (int i = 0; i < prefix->len; i++) {
@@ -874,10 +868,6 @@ bool pulsar_token_is_stop(pulsar_engine *e, int token) {
 
 
 
-/** Tokenize plain text (no chat rendering) through the family's tokenizer (exits without one).
- *  @param e    the engine
- *  @param text the text
- *  @param out  receives the tokens (appended) */
 void pulsar_tokenize_text(pulsar_engine *e, const char *text, pulsar_tokens *out) {
     tokenizer_require(e, "pulsar_tokenize_text")->encode_text(e, text, out);
 }
@@ -994,11 +984,6 @@ void pulsar_vocab::tokenize_rendered_chat_spans_vocab(const char *text,
     vocab->tokenize_span(span, (size_t)(p - span), out);
 }
 
-/** Tokenize text that is already a rendered chat (its marker strings become marker ids) through the family's
- *  tokenizer (exits without one).
- *  @param e    the engine
- *  @param text the rendered text
- *  @param out  receives the tokens (appended) */
 void pulsar_tokenize_rendered_chat(pulsar_engine *e, const char *text, pulsar_tokens *out) {
     tokenizer_require(e, "pulsar_tokenize_rendered_chat")->encode_rendered(e, text, NULL, 0u, out);
 }
@@ -1315,11 +1300,6 @@ static bool vocab_token_is_literal_special(pulsar_str s) {
 
 
 
-/** A token's text through the family's tokenizer (exits without one).
- *  @param e     the engine
- *  @param token the token id
- *  @param len   receives the length in bytes (0 bytes = a control token)
- *  @return a malloc'd NUL-terminated copy (the caller frees it) */
 char *pulsar_token_text(pulsar_engine *e, int token, size_t *len) {
     return tokenizer_require(e, "pulsar_token_text")->token_text(e, token, len);
 }
@@ -1357,7 +1337,6 @@ char *vocab_token_text(const pulsar_vocab *vocab, int token, size_t *len) {
 
 
 
-/** The family's end-of-sequence id (exits without a tokenizer).  @param e the engine  @return the id */
 int pulsar_token_eos(pulsar_engine *e) {
     return tokenizer_require(e, "pulsar_token_eos")->eos(e);
 }
@@ -1368,9 +1347,6 @@ int pulsar_token_eos(pulsar_engine *e) {
  * special token; Qwen's template spells it as <|im_start|> plus the role word, which the checkpoint's
  * BPE holds as one token (Qwen3.8-Flash-Next: "user", "assistant").  A tokenizer that splits either
  * word leaves the anchors off, said once -- never a marker that matches at the wrong place. */
-/// @param e   the engine
-/// @param out receives the markers (zeroed first)
-/// @return false when the family's tokenizer cannot name both markers (the anchors stay off)
 bool pulsar_chat_turn_markers(pulsar_engine *e, pulsar_turn_markers *out) {
     const pulsar_family_tokenizer *t = tokenizer_require(e, "pulsar_chat_turn_markers");
     memset(out, 0, sizeof(*out));
@@ -1434,7 +1410,6 @@ void pulsar_sample_advance(uint64_t *rng, uint32_t n) {
  * to the CLI and server.
  */
 
-/** The backend's name for messages.  @param backend the backend  @return "cuda", or "unknown" */
 const char *pulsar_backend_name(pulsar_backend backend) {
     switch (backend) {
     case PULSAR_BACKEND_CUDA:  return "cuda";

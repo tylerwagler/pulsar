@@ -1988,35 +1988,6 @@ static int routed_moe_batch_impl(pulsar_gpu_tensor *out, pulsar_gpu_tensor *up, 
                              layer_index, n_tokens);
 }
 
-/** Routed MoE entry point: checks the lane's f32 tensors and the expert-TP formats, then routed_moe_batch_impl.
- *  @param out               device f32 [n_tokens][out_dim] block output (the per-token sum over its n_expert slots)
- *  @param up                device f32 scratch [n_tokens * n_expert][expert_mid_dim] (gate / up partials, by arm)
- *  @param mid               device f32 [n_tokens * n_expert][expert_mid_dim] mid tensor (its E4M3 activation slot carries the encoded mid)
- *  @param down              device f32 [n_tokens * n_expert][out_dim] per-slot pre-weighted FFN outputs (the flat down buffer)
- *  @param model_map         host base of the model mapping the expert stacks live in
- *  @param model_size        bytes of that mapping (offsets are bounds-checked against it)
- *  @param gate_offset       byte offset of the gate stack (n_total_expert experts back to back)
- *  @param up_offset         byte offset of the up stack
- *  @param down_offset       byte offset of the down stack
- *  @param gate_type         pulsar_tensor_type of the gate / up stacks
- *  @param down_type         pulsar_tensor_type of the down stack
- *  @param gate_expert_bytes bytes per gate / up expert (the stack stride)
- *  @param gate_row_bytes    gate / up per-expert row bytes; for CUTLASS MXFP4 the data-plane bytes before the scale plane
- *  @param down_expert_bytes bytes per down expert (the stack stride)
- *  @param down_row_bytes    down per-expert row bytes; for CUTLASS MXFP4 the data-plane bytes before the scale plane
- *  @param expert_in_dim     expert input width (the hidden size)
- *  @param expert_mid_dim    expert intermediate width (under expert TP, this rank's half)
- *  @param out_dim           expert output width
- *  @param selected          device int32 [n_tokens][n_expert] routed expert ids
- *  @param weights           device f32 [n_tokens][n_expert] routing weights
- *  @param n_total_expert    experts present in the stacks
- *  @param n_expert          routed slots per token (top-k)
- *  @param clamp             SwiGLU clamp (<= 1e-6: none)
- *  @param x                 device f32 [n_tokens][expert_in_dim] input; its producer E4M3 slot is what the GEMMs read
- *  @param layer_index       layer, for the non-finite / route-bounds flags
- *  @param n_tokens          token rows
- *  @param expert_split      nonzero: the stacks are this rank's halves of every expert (expert tensor-parallel)
- *  @return 1 on success, 0 refused / failed */
 int pulsar_gpu_routed_moe_batch_tensor(pulsar_gpu_tensor *out, pulsar_gpu_tensor *up, pulsar_gpu_tensor *mid, pulsar_gpu_tensor *down, const void *model_map, uint64_t model_size, uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset, uint32_t gate_type, uint32_t down_type, uint64_t gate_expert_bytes, uint64_t gate_row_bytes, uint64_t down_expert_bytes, uint64_t down_row_bytes, uint32_t expert_in_dim, uint32_t expert_mid_dim, uint32_t out_dim, const pulsar_gpu_tensor *selected, const pulsar_gpu_tensor *weights, uint32_t n_total_expert, uint32_t n_expert, float clamp, const pulsar_gpu_tensor *x, uint32_t layer_index, uint32_t n_tokens, uint32_t expert_split) {
     /* Nothing below this line consults esz: every scratch/output cast in the
      * MoE lane is (float *) over a tensor the graph allocates f32.  That was

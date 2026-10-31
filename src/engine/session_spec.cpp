@@ -1221,8 +1221,6 @@ pulsar_spec_round *pulsar_spec_round_new(void) {
     return r;
 }
 
-/// Free a round and its target snapshot handle.
-/// @param r the round (NULL: no-op)
 void pulsar_spec_round_free(pulsar_spec_round *r) {
     if (!r) return;
     free(r->snap);            /* the target's snapshot handle */

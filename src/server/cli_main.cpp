@@ -443,9 +443,6 @@ void server::close_resources() {
 
 
 
-/// @brief Print pulsar-server's help (pulsar_help_print).
-/// @param fp the stream
-/// @param topic a help topic, or NULL for the overview
 void usage(FILE *fp, const char *topic) {
     pulsar_help_print(fp, PULSAR_HELP_SERVER, topic);
 }

@@ -44,8 +44,6 @@ static const char *pulsar_log_color_code(pulsar_log_type type) {
 
 
 
-/// @param fp a stream
-/// @return true when it is a terminal
 bool pulsar_log_is_tty(FILE *fp) {
     int fd = fileno(fp);
     return fd >= 0 && isatty(fd) != 0;
@@ -67,10 +65,6 @@ static void pulsar_vlog(FILE *fp, pulsar_log_type type, const char *fmt, va_list
 
 
 
-/// printf to fp, colored by type when fp is a terminal.
-/// @param fp the stream
-/// @param type the line's type
-/// @param fmt printf format
 void pulsar_log(FILE *fp, pulsar_log_type type, const char *fmt, ...) {
     va_list ap;
     va_start(ap, fmt);

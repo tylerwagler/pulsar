@@ -961,8 +961,6 @@ static pulsar_shape_once g_qsa_announce;
 
 }  // namespace
 
-/// @param tp_ranks tensor-parallel degree (2 = one rank's heads, anything else = the whole layer)
-/// @return KV-cache bytes per token for one rank
 uint32_t pulsar_qsa_kv_token_bytes(int tp_ranks) {
     return tp_ranks == 2 ? qsa_shape<2>::KV_TOKEN_BYTES : qsa_shape<1>::KV_TOKEN_BYTES;
 }
@@ -971,9 +969,6 @@ uint32_t pulsar_qsa_kv_token_bytes(int tp_ranks) {
  * pos_freqs = theta^(2i/64); extrapolation = 1 / pos_freqs; interpolation = 1 / (factor * pos_freqs); blended by
  * each pair's extrapolation weight; attention factor 1 + 0.1 ln(factor).  Host code of a .cu TU: IEEE (nvcc's
  * --use_fast_math is the device's), so pow and log are libm's double functions. */
-/// @param out  out: the rope table (inv_freq per pair, mscale)
-/// @param yarn the YaRN scaling, or NULL for the native rope
-/// @return 1 on success, 0 refused (said)
 int pulsar_qsa_rope_init(pulsar_qsa_rope *out, const pulsar_qsa_yarn *yarn) {
     if (!out) return qsa_refuse("pulsar_qsa_rope_init: no output");
     constexpr uint32_t D = PULSAR_QSA_ROT_DIM;
@@ -998,9 +993,6 @@ int pulsar_qsa_rope_init(pulsar_qsa_rope *out, const pulsar_qsa_yarn *yarn) {
     return 1;
 }
 
-/// @param n_rows the most rows a call will carry
-/// @param max_ctx the longest context a call will attend
-/// @return workspace bytes for every call of at most n_rows rows
 uint64_t pulsar_gpu_qsa_workspace_bytes(uint32_t n_rows, uint32_t max_ctx) {
     /* Sized for EVERY call of at most n_rows rows, not only an n_rows one: a call of fewer than
      * QSA_FOLD_ROWS rows takes the split schedule and needs its partials, which an n_rows >=
@@ -1012,15 +1004,6 @@ uint64_t pulsar_gpu_qsa_workspace_bytes(uint32_t n_rows, uint32_t max_ctx) {
     return at_max > split ? at_max : split;
 }
 
-/// @param layer     the layer's weights and caches
-/// @param seqs      [n_seqs] the call's sequences
-/// @param n_seqs    sequences
-/// @param row_seq   [n_rows] each row's sequence
-/// @param row_pos   [n_rows] each row's position
-/// @param n_rows    rows, 1 .. 65535
-/// @param io        the call's inputs, outputs and rope
-/// @param workspace >= pulsar_gpu_qsa_workspace_bytes
-/// @return 1 on success, 0 refused (said)
 int pulsar_gpu_qsa_forward(const pulsar_qsa_layer *layer,
                            const pulsar_qsa_seq *seqs, uint32_t n_seqs,
                            const uint32_t *row_seq, const uint32_t *row_pos, uint32_t n_rows,

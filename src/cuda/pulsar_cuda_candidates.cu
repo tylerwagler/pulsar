@@ -181,19 +181,6 @@ uint32_t pulsar_gpu_candidate_mask_words(uint32_t n_comp_cap, uint32_t block_siz
     return (n_blocks + 31u) / 32u;
 }
 
-/// Builds each row's candidate-block mask: the topk_blocks best blocks, the newest pinned, unreachable ones dropped.
-/// @param mask out: u32 [n_rows][mask_words].
-/// @param bscore_scratch f32 [n_rows][n_blocks] scratch.
-/// @param scores the candidate source's scores, f32 [n_rows][n_comp].
-/// @param n_comp compressed positions per row.
-/// @param n_rows query rows.
-/// @param mask_words mask words per row (>= ceil(n_blocks / 32)).
-/// @param block_size positions per block.
-/// @param topk_blocks blocks kept per row.
-/// @param pos0 the first row's position (when positions is NULL).
-/// @param ratio the compression ratio.
-/// @param positions per-row positions, or NULL.
-/// @return 1 on success, 0 on a refusal or launch failure.
 int pulsar_gpu_candidate_blocks_tensor(pulsar_gpu_tensor *mask, pulsar_gpu_tensor *bscore_scratch,
                                        const pulsar_gpu_tensor *scores,
                                        uint32_t n_comp, uint32_t n_rows, uint32_t mask_words,
