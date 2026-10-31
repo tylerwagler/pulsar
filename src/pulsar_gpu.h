@@ -609,6 +609,24 @@ enum {
 
 #endif
 
+/** float32 -> bfloat16 bits, round to nearest even, as torch's `.to(torch.bfloat16)` (c10's
+ *  round_to_nearest_even): a NaN becomes the quiet NaN 0x7FC0 -- the bare rounding add would carry a NaN whose
+ *  payload sits in the low half into an Inf, or a negative one across the sign -- and every other value (finite or
+ *  infinite) rounds exactly as `(u + 0x7fff + ((u >> 16) & 1)) >> 16`.  The ONE f32 -> bf16 converter the host code
+ *  calls (the vision preprocessors, L335); PULSAR_GPU_HD so a kernel can call the same one.
+ *  @param f the value
+ *  @return its bf16 bits */
+static inline PULSAR_GPU_HD uint16_t pulsar_bf16_from_f32(float f) {
+#if defined(__CUDA_ARCH__)
+    const uint32_t u = __float_as_uint(f);
+#else
+    uint32_t u;
+    __builtin_memcpy(&u, &f, sizeof u);
+#endif
+    if ((u & 0x7fffffffu) > 0x7f800000u) return (uint16_t)0x7fc0u;   /* NaN: torch's quiet NaN */
+    return (uint16_t)((u + 0x7fffu + ((u >> 16) & 1u)) >> 16);
+}
+
 /** @brief Seed the HC residual: each token's bf16 embedding row, copied into all n_hc streams.
  *  @param out_hc        [n_tokens][n_hc][n_embd] HC residual (PULSAR_HC_ELT_SIZE elements)
  *  @param tokens        int32 [n_tokens] token ids
