@@ -84,20 +84,6 @@ void byte_level_map(uint32_t cp_of[256]) {
     }
 }
 
-/// Decode one UTF-8 sequence already validated as `n` bytes long.
-/// @param p the sequence's lead byte
-/// @param n its length in bytes (1..4)
-/// @return the codepoint
-uint32_t utf8_decode(const unsigned char *p, int n) {
-    switch (n) {
-    case 1: return p[0];
-    case 2: return ((uint32_t)(p[0] & 0x1f) << 6) | (p[1] & 0x3f);
-    case 3: return ((uint32_t)(p[0] & 0x0f) << 12) | ((uint32_t)(p[1] & 0x3f) << 6) | (p[2] & 0x3f);
-    default: return ((uint32_t)(p[0] & 0x07) << 18) | ((uint32_t)(p[1] & 0x3f) << 12) |
-                    ((uint32_t)(p[2] & 0x3f) << 6) | (p[3] & 0x3f);
-    }
-}
-
 /// Append `cp`'s UTF-8 encoding to `s` (no validation: `cp` is a scalar value from a decode).
 /// @param s  the string appended to
 /// @param cp the codepoint
@@ -587,7 +573,7 @@ void encode_run(const bpe_tokenizer *t, const char *text, size_t len, std::vecto
     cps.reserve(len);
     for (size_t i = 0; i < len;) {
         const int k = utf8_seq_ok((const unsigned char *)text + i, len - i);   /* validated by the caller */
-        cps.push_back(utf8_decode((const unsigned char *)text + i, k));
+        cps.push_back(utf8_cp_at((const unsigned char *)text + i, k));
         i += (size_t)k;
     }
     if (t->nfc) nfc(&cps);
@@ -871,7 +857,7 @@ bpe_tokenizer *bpe_tokenizer_load_hf(const char *tokenizer_json, size_t tokenize
         const unsigned char *s = (const unsigned char *)kv.first.data();
         for (size_t i = 0; i < kv.first.size();) {
             const int k = utf8_seq_ok(s + i, kv.first.size() - i);
-            auto it = k ? byte_of_cp.find(utf8_decode(s + i, k)) : byte_of_cp.end();
+            auto it = k ? byte_of_cp.find(utf8_cp_at(s + i, k)) : byte_of_cp.end();
             if (it == byte_of_cp.end()) {
                 refuse(err, errlen, "vocab token %d is not byte-level text", id);
                 delete t;

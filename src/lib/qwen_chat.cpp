@@ -96,20 +96,6 @@ static const char kToolsTail[] =
 
 namespace {
 
-/// Decode one UTF-8 sequence already validated as `n` bytes long.
-/// @param p the sequence's lead byte
-/// @param n its length in bytes (1..4)
-/// @return the codepoint
-uint32_t cp_at(const unsigned char *p, int n) {
-    switch (n) {
-    case 1: return p[0];
-    case 2: return ((uint32_t)(p[0] & 0x1f) << 6) | (p[1] & 0x3f);
-    case 3: return ((uint32_t)(p[0] & 0x0f) << 12) | ((uint32_t)(p[1] & 0x3f) << 6) | (p[2] & 0x3f);
-    default: return ((uint32_t)(p[0] & 0x07) << 18) | ((uint32_t)(p[1] & 0x3f) << 12) |
-                    ((uint32_t)(p[2] & 0x3f) << 6) | (p[3] & 0x3f);
-    }
-}
-
 /* Jinja |trim on UTF-8 bytes -- the kept range [*lo, *hi) of s[0, n); invalid bytes are never whitespace. */
 /// @param s      the bytes
 /// @param n      their count
@@ -120,7 +106,7 @@ void py_strip_bounds(const char *s, size_t n, size_t *lo_out, size_t *hi_out) {
     size_t lo = 0;
     while (lo < n) {
         const int k = utf8_seq_ok(u + lo, n - lo);
-        if (!k || !py_isspace(cp_at(u + lo, k))) break;
+        if (!k || !py_isspace(utf8_cp_at(u + lo, k))) break;
         lo += (size_t)k;
     }
     size_t hi = n;
@@ -128,7 +114,7 @@ void py_strip_bounds(const char *s, size_t n, size_t *lo_out, size_t *hi_out) {
         size_t b = hi - 1;
         while (b > lo && (u[b] & 0xc0) == 0x80 && hi - b < 4) b--;
         const int k = utf8_seq_ok(u + b, hi - b);
-        if (!k || b + (size_t)k != hi || !py_isspace(cp_at(u + b, k))) break;
+        if (!k || b + (size_t)k != hi || !py_isspace(utf8_cp_at(u + b, k))) break;
         hi = b;
     }
     *lo_out = lo;

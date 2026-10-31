@@ -3,6 +3,7 @@
 #pragma once
 
 #include <stddef.h>
+#include <stdint.h>
 
 /* The ONE UTF-8 well-formedness rule for the engine, CLI, eval TUI and agent.
  *
@@ -54,4 +55,19 @@ static inline int utf8_seq_ok(const unsigned char *p, size_t n) {
         if ((p[i] & 0xc0) != 0x80) return 0;
     }
     return len;
+}
+
+/** The codepoint of a UTF-8 sequence already validated as `n` bytes long (utf8_seq_ok's length): the ONE decoder
+ * of a checked sequence (the tokenizer, the chat renderers and the output-parser kit). */
+/// @param p the sequence's lead byte
+/// @param n its length in bytes (1..4)
+/// @return the codepoint
+static inline uint32_t utf8_cp_at(const unsigned char *p, int n) {
+    switch (n) {
+    case 1: return p[0];
+    case 2: return ((uint32_t)(p[0] & 0x1f) << 6) | (p[1] & 0x3f);
+    case 3: return ((uint32_t)(p[0] & 0x0f) << 12) | ((uint32_t)(p[1] & 0x3f) << 6) | (p[2] & 0x3f);
+    default: return ((uint32_t)(p[0] & 0x07) << 18) | ((uint32_t)(p[1] & 0x3f) << 12) |
+                    ((uint32_t)(p[2] & 0x3f) << 6) | (p[3] & 0x3f);
+    }
 }
