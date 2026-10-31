@@ -712,11 +712,11 @@ template <int K2>
 bool launch_gemm(const dim3 &grid, cudaStream_t stream, const void *table, const __half *phi,
                  const float *pinv, const int32_t *ids_dst, const int32_t *bounds, const int2 *work,
                  const int *n_work, float *out, int M, int K) {
-    static bool attr = false;
-    if (!attr) {
-        if (cudaFuncSetAttribute(exl3_moe_gemm_kernel<K2>, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                 (int)sizeof(Smem)) != cudaSuccess) return false;
-        attr = true;
+    static int smem_set[PULSAR_CUDA_DEVICE_SLOTS] = {};   /* per device (L335: it was set on the first one only) */
+    if (!pulsar_cuda_smem_opt_in((const void *)exl3_moe_gemm_kernel<K2>, smem_set, sizeof(Smem))) {
+        fprintf(stderr, "exl3_moe_prefill: the GEMM's %zu B of shared memory is refused by the device -- refusing\n",
+                sizeof(Smem));
+        return false;
     }
     exl3_moe_gemm_kernel<K2><<<grid, kThreads, sizeof(Smem), stream>>>(table, phi, pinv, ids_dst, bounds, work,
                                                                        n_work, out, M, K);

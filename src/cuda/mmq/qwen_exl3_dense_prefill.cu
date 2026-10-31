@@ -34,6 +34,7 @@
 
 #include <cstdio>
 #include "cuda/pulsar_cuda_lt_fixed.h"
+#include "cuda/pulsar_cuda_arch.cuh"   /* pulsar_cuda_smem_opt_in */
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 
@@ -211,16 +212,11 @@ int qwen_exl3_dense_prefill_launch(const void *w, int k2, const void *x_bf16, fl
     /* the prep holds one row's K f32 in shared memory: past the 48 KiB a launch gets by default (K > 12288 -- L295:
      * Inkling's dense down, K 16384) the kernel opts in once to the larger carve-out.  The arithmetic is unchanged. */
     const size_t prep_smem = (size_t)K * sizeof(float);
-    static size_t prep_smem_set = 48u * 1024u;
-    if (prep_smem > prep_smem_set) {
-        if (cudaFuncSetAttribute(dense_prep_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)prep_smem) !=
-            cudaSuccess) {
-            fprintf(stderr, "%s: the prep's %zu B of shared memory (K=%d) is refused by the device -- refusing\n", tag,
-                    prep_smem, K);
-            (void)cudaGetLastError();
-            return -1;
-        }
-        prep_smem_set = prep_smem;
+    static int prep_smem_set[PULSAR_CUDA_DEVICE_SLOTS] = {};   /* per device (L335: process-wide before) */
+    if (prep_smem > 48u * 1024u && !pulsar_cuda_smem_opt_in((const void *)dense_prep_kernel, prep_smem_set, prep_smem)) {
+        fprintf(stderr, "%s: the prep's %zu B of shared memory (K=%d) is refused by the device -- refusing\n", tag,
+                prep_smem, K);
+        return -1;
     }
     dense_prep_kernel<<<M, 256, prep_smem, stream>>>(static_cast<const __nv_bfloat16 *>(x_bf16), suh, xhi, inv, K);
     /* the whole GEMM, or (a logical width short of the stored one) its 128-multiple head into y and its last stored

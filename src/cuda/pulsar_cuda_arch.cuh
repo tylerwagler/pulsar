@@ -101,6 +101,50 @@ inline int pulsar_cuda_device_cc(void) {
 /// @return the current device's compute-capability major (0 if unknown).
 inline int pulsar_cuda_device_major(void) { return pulsar_cuda_device_cc() / 10; }
 
+/* Per-device host state (L335): a process static caching a DEVICE answer -- a function attribute, an SM count, a
+ * device symbol's address -- is right for the first device that asks and wrong on the next one a TP rank or a second
+ * engine runs on.  Such a cache is an array indexed by the calling thread's current device. */
+/** Devices a per-device host cache (pulsar_cuda_device_slot) holds. */
+#define PULSAR_CUDA_DEVICE_SLOTS 16
+/// @return the calling thread's current device, 0 .. PULSAR_CUDA_DEVICE_SLOTS - 1; -1 when it cannot be read or is
+///         past the caches (said once)
+inline int pulsar_cuda_device_slot(void) {
+    int dev = -1;
+    if (cudaGetDevice(&dev) != cudaSuccess) {
+        (void)cudaGetLastError();
+        dev = -1;
+    }
+    if (dev < 0 || dev >= PULSAR_CUDA_DEVICE_SLOTS) {
+        static bool said = false;
+        if (!said) {
+            said = true;
+            fprintf(stderr, "pulsar: device %d is past the %d per-device host caches -- refusing\n", dev,
+                    PULSAR_CUDA_DEVICE_SLOTS);
+        }
+        return -1;
+    }
+    return dev;
+}
+
+/* A kernel's dynamic-shared-memory opt-in, per device (L335): every launcher that opted in "once" through a function
+ * static set the attribute on the first device only -- and two ignored the return code. */
+/** Opts `func` in to `bytes` of dynamic shared memory on the current device, once per (device, larger size).
+ *  @param func  the kernel
+ *  @param set   the caller's per-device record of the bytes each device was given (static, zero-initialised)
+ *  @param bytes the launch's dynamic shared memory
+ *  @return true when the device grants it (now or before); false refused (the caller says why) */
+inline bool pulsar_cuda_smem_opt_in(const void *func, int (&set)[PULSAR_CUDA_DEVICE_SLOTS], size_t bytes) {
+    const int d = pulsar_cuda_device_slot();
+    if (d < 0) return false;
+    if ((size_t)set[d] >= bytes) return true;
+    if (cudaFuncSetAttribute(func, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)bytes) != cudaSuccess) {
+        (void)cudaGetLastError();
+        return false;
+    }
+    set[d] = (int)bytes;
+    return true;
+}
+
 /* A lane whose kernels need compute capability `cc` (major * 10 + minor) refuses on a lesser device -- on the host, by
  * name, once per call site -- returning `ret`; its kernels' trapping arms (the tiers above) then never run.  (L321) */
 /// Refuses the enclosing function (`return ret`) on a device below compute capability `cc`, naming `lane` once.

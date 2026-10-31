@@ -1024,12 +1024,19 @@ static int gr_read_kernels(const pulsar_qwen_gr_dev *w, const uint16_t *streams,
         return 0;
     }
     if (W8) {
-        static bool attr = false;                 /* idempotent; set once, not per launch */
-        if (!attr) {
-            cudaFuncSetAttribute(qwen_gr_up_kernel<true, kUpTBDecode>, cudaFuncAttributeMaxDynamicSharedMemorySize, kUpTileBytes);
-            cudaFuncSetAttribute(qwen_gr_up_kernel<true, kUpTBDecode>, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
-            attr = true;
+        /* per device, return codes checked (L335: set once per process, both ignored) */
+        static int smem_set[PULSAR_CUDA_DEVICE_SLOTS] = {};
+        static bool carve_set[PULSAR_CUDA_DEVICE_SLOTS] = {};
+        const int d = pulsar_cuda_device_slot();
+        if (d < 0 || !pulsar_cuda_smem_opt_in((const void *)qwen_gr_up_kernel<true, kUpTBDecode>, smem_set, kUpTileBytes) ||
+            (!carve_set[d] && cudaFuncSetAttribute(qwen_gr_up_kernel<true, kUpTBDecode>,
+                                                   cudaFuncAttributePreferredSharedMemoryCarveout, 100) != cudaSuccess)) {
+            (void)cudaGetLastError();
+            fprintf(stderr, "pulsar: qwen GR up: the decode tile's %d B of shared memory is refused by the device -- "
+                            "refusing\n", (int)kUpTileBytes);
+            return -1;
         }
+        carve_set[d] = true;
     }
     /* W8 is at decode widths here; the BF16 mixer takes the 16-token tile at prefill widths */
     const int tb = !W8 && w->prompt ? kUpTB : kUpTBDecode;
@@ -1372,22 +1379,21 @@ qwen_w8a16_rows_kernel(const uint8_t *__restrict__ wq, const uint8_t *__restrict
 template <int NT>
 int rows_launch(const uint8_t *wq, const uint8_t *sf, const uint16_t *x_bf16, int out, int in, int rows, int n_split,
                 float *y, bool persistent, cudaStream_t stream) {
-    static int sms = 0;
-    static size_t smem_set = 0;                    /* the attribute grows to the widest slice seen */
+    /* per device (L335: process statics, right for the first device only); the attribute grows to the widest slice */
+    static int sms_of[PULSAR_CUDA_DEVICE_SLOTS] = {};
+    static int smem_set[PULSAR_CUDA_DEVICE_SLOTS] = {};
     const size_t smem = (size_t)NT * 8 * (in / n_split * 2 + 16);
-    if (!sms) {
-        int dev = 0;
-        if (cudaGetDevice(&dev) != cudaSuccess || cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev) != cudaSuccess)
-            return -1;
+    const int d = pulsar_cuda_device_slot();
+    if (d < 0) return -1;
+    if (!sms_of[d] && cudaDeviceGetAttribute(&sms_of[d], cudaDevAttrMultiProcessorCount, d) != cudaSuccess) {
+        sms_of[d] = 0;
+        return -1;
     }
-    if (smem > smem_set) {
-        if (cudaFuncSetAttribute(qwen_w8a16_rows_kernel<NT>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem) !=
-            cudaSuccess) {
-            fprintf(stderr, "pulsar: qwen mxfp8 rows: %d rows of a %d-wide slice do not fit an SM -- refusing\n", NT * 8,
-                    in / n_split);
-            return -1;
-        }
-        smem_set = smem;
+    const int sms = sms_of[d];
+    if (!pulsar_cuda_smem_opt_in((const void *)qwen_w8a16_rows_kernel<NT>, smem_set, smem)) {
+        fprintf(stderr, "pulsar: qwen mxfp8 rows: %d rows of a %d-wide slice do not fit an SM -- refusing\n", NT * 8,
+                in / n_split);
+        return -1;
     }
     const int tiles = (out + 15) / 16;
     int gx = (tiles + kHeadWarps - 1) / kHeadWarps;
