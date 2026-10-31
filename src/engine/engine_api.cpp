@@ -1108,7 +1108,7 @@ int pulsar_session_decode_fused(pulsar_session *s, const pulsar_multiseq_req *re
     if (!s) return 1;
     /* a family without the op has no fused step (its prompt rows take the classic sync) */
     if (!pulsar_engine_has_fused_step(s->engine)) {
-        snprintf(err, errlen, "%s: no fused step", s->engine->family->name);
+        if (err) snprintf(err, errlen, "%s: no fused step", s->engine->family->name);
         return 1;
     }
     pulsar_tp *tp = tp_mirror_target(s);
@@ -1923,16 +1923,16 @@ pulsar_bank_adopt_result pulsar_session_bank_adopt(pulsar_session *s, uint32_t s
     const pulsar_bank_adopt_result none = {PULSAR_ADOPT_NONE, TokPos{0}};
     PULSAR_FAMILY_REQUIRES_S(s, PULSAR_FAMILY_CAP_BANKS, "bank adopt", refused);
     if (!s || !prompt) {
-        snprintf(err, errlen, "bank adopt: no session or prompt");
+        if (err) snprintf(err, errlen, "bank adopt: no session or prompt");
         return refused;
     }
     if (tp_mirror_target(s)) {
-        snprintf(err, errlen, "bank adopt: a tensor-parallel engine does not mirror it");
+        if (err) snprintf(err, errlen, "bank adopt: a tensor-parallel engine does not mirror it");
         return refused;
     }
     const uint32_t dst = pulsar_session_live_bank(s);
     if (src >= (uint32_t)pulsar_session_bank_count(s) || src == dst) {
-        snprintf(err, errlen, "bank adopt: bank %u is not another bank of the pool", src);
+        if (err) snprintf(err, errlen, "bank adopt: bank %u is not another bank of the pool", src);
         return refused;
     }
     const pulsar_ckpt_record *r = NULL;
@@ -1950,7 +1950,7 @@ pulsar_bank_adopt_result pulsar_session_bank_adopt(pulsar_session *s, uint32_t s
     s->checkpoint_valid = false;   /* the state moves below */
     if (!pulsar_ckpt_adopt(st, dst, src, T, r) || (at_end && !s->live_from_host(s->logits))) {
         pulsar_tokens_free(&view);
-        snprintf(err, errlen, "bank adopt: bank %u's state at %u did not copy into bank %u", src, T, dst);
+        if (err) snprintf(err, errlen, "bank adopt: bank %u's state at %u did not copy into bank %u", src, T, dst);
         return refused;
     }
     s->checkpoint.len = 0;
@@ -1969,7 +1969,7 @@ pulsar_bank_adopt_result pulsar_session_bank_adopt(pulsar_session *s, uint32_t s
 int pulsar_session_restore_checkpoint(pulsar_session *s, TokPos G, char *err, size_t errlen) {
     PULSAR_NVTX_FN();
     if (!s || G.is_none() || G <= TokPos{0}) {
-        snprintf(err, errlen, "restore checkpoint: no session or position %d", G.raw());
+        if (err) snprintf(err, errlen, "restore checkpoint: no session or position %d", G.raw());
         return 1;
     }
     /* L272 B1: a family without a standalone restore restores its grid checkpoints inside sync (the resume,
@@ -1977,16 +1977,16 @@ int pulsar_session_restore_checkpoint(pulsar_session *s, TokPos G, char *err, si
      * checkpoint". */
     const pulsar_family_bank_ops *ops = session_banks(s);
     if (!ops->restore_checkpoint) {
-        snprintf(err, errlen, "restore checkpoint: %s restores a grid checkpoint only as a sync resumes from it",
+        if (err) snprintf(err, errlen, "restore checkpoint: %s restores a grid checkpoint only as a sync resumes from it",
                  s->engine->family->name);
         return 1;
     }
     if (tp_mirror_target(s)) {
-        snprintf(err, errlen, "restore checkpoint: a tensor-parallel engine does not mirror it");
+        if (err) snprintf(err, errlen, "restore checkpoint: a tensor-parallel engine does not mirror it");
         return 1;
     }
     if (!ops->restore_checkpoint(s, (uint32_t)G.raw())) {
-        snprintf(err, errlen, "restore checkpoint: the installed bank holds no checkpoint at %d", G.raw());
+        if (err) snprintf(err, errlen, "restore checkpoint: the installed bank holds no checkpoint at %d", G.raw());
         return 1;
     }
     return 0;
@@ -2055,12 +2055,12 @@ static int tp_segment_refused(pulsar_session *s, pulsar_tp *tp, const char *oper
                               char *err, size_t errlen) {
     if (tp_mirror_worker_drives_nothing(tp, operation, err, errlen) || tp_mirror_dead(tp, err, errlen)) return 1;
     if (s->tp_in_sync) {
-        snprintf(err, errlen, "tp: %s inside a mirrored prefill is not mirrored (the workers are inside the "
+        if (err) snprintf(err, errlen, "tp: %s inside a mirrored prefill is not mirrored (the workers are inside the "
                               "prefill)", operation);
         return 1;
     }
     if (!pulsar_tp_segment_key_ok(key)) {
-        snprintf(err, errlen, "tp: %s: '%.40s' is not a segment key", operation, key ? key : "(null)");
+        if (err) snprintf(err, errlen, "tp: %s: '%.40s' is not a segment key", operation, key ? key : "(null)");
         return 1;
     }
     return 0;
@@ -2097,7 +2097,7 @@ int pulsar_session_save_segment(pulsar_session *s, FILE *fp, TokPos G_prev, TokP
     PULSAR_NVTX_FN();
     PULSAR_FAMILY_REQUIRES_S(s, PULSAR_FAMILY_CAP_SEGMENTS, "disk KV segments", 1);
     if (!s || !segment_span_ok(G_prev, G)) {
-        snprintf(err, errlen, "save segment: bad span [%d, %d)", G_prev.raw(), G.raw());
+        if (err) snprintf(err, errlen, "save segment: bad span [%d, %d)", G_prev.raw(), G.raw());
         return 1;
     }
     pulsar_tp *tp = tp_mirror_target(s);
@@ -2117,7 +2117,7 @@ int pulsar_session_save_segment(pulsar_session *s, FILE *fp, TokPos G_prev, TokP
     perr[0] = '\0';
     if (!pulsar_tp_wait_command_status(tp, s->tp_session_id, "kv segment save", &peers, perr, sizeof(perr))) {
         pulsar_tp_mirror_fail_void(tp, "kv segment save", perr);
-        snprintf(err, errlen, "tp: kv segment save: the workers' verdict could not be collected: %s", perr);
+        if (err) snprintf(err, errlen, "tp: kv segment save: the workers' verdict could not be collected: %s", perr);
         return 1;
     }
     if (own != 0) {
@@ -2125,7 +2125,7 @@ int pulsar_session_save_segment(pulsar_session *s, FILE *fp, TokPos G_prev, TokP
         return 1;                                                         /* err: this rank's own reason */
     }
     if (peers != 0) {
-        snprintf(err, errlen, "tp: a worker could not store its copy of segment %.40s (its log names the "
+        if (err) snprintf(err, errlen, "tp: a worker could not store its copy of segment %.40s (its log names the "
                               "reason); the segment is skipped on every rank", key);
         return 1;
     }
@@ -2136,7 +2136,10 @@ int pulsar_session_load_segment(pulsar_session *s, FILE *fp, uint64_t bytes, boo
     PULSAR_NVTX_FN();
     PULSAR_FAMILY_REQUIRES_S(s, PULSAR_FAMILY_CAP_SEGMENTS, "disk KV segments", 1);
     if (G_out) *G_out = TokPos{0};
-    if (!s) { snprintf(err, errlen, "load segment: no session"); return 1; }
+    if (!s) {
+        if (err) snprintf(err, errlen, "load segment: no session");
+        return 1;
+    }
     pulsar_tp *tp = tp_mirror_target(s);
     if (tp && tp_segment_refused(s, tp, "kv segment load", key, err, errlen)) return 1;
     uint32_t G = 0;
@@ -2160,14 +2163,14 @@ int pulsar_session_load_segment(pulsar_session *s, FILE *fp, uint64_t bytes, boo
     perr[0] = '\0';
     if (!pulsar_tp_wait_command_status(tp, s->tp_session_id, "kv segment load", &peers, perr, sizeof(perr))) {
         pulsar_tp_mirror_fail_void(tp, "kv segment load", perr);
-        snprintf(err, errlen, "tp: kv segment load: the workers' verdict could not be collected: %s", perr);
+        if (err) snprintf(err, errlen, "tp: kv segment load: the workers' verdict could not be collected: %s", perr);
         return 1;
     }
     if (peers != 0) {
         /* A MISS: the copy is missing or reached another state.  Nothing is
          * computed on it -- the caller invalidates every rank and drops the
          * chain. */
-        snprintf(err, errlen, "tp: a worker has no matching copy of segment %.40s (its log names why) -- "
+        if (err) snprintf(err, errlen, "tp: a worker has no matching copy of segment %.40s (its log names why) -- "
                               "a miss on every rank", key);
         return 1;
     }

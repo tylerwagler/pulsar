@@ -3879,6 +3879,18 @@ static void test_qwen_eos(void) {
     }
 }
 
+/* L335: the session entries that report through `err` accept err == NULL with a nonzero errlen, as their siblings
+ * do (decode_fused, bank_adopt, restore_checkpoint and the segment save / load wrote through it unchecked).  Each
+ * refuses a NULL session here, so the check needs no engine. */
+static void test_api_err_null(void) {
+    pulsar_tokens prompt = {0};
+    TEST_ASSERT(pulsar_session_restore_checkpoint(NULL, TokPos{0}, NULL, 64) == 1);
+    TEST_ASSERT(pulsar_session_bank_adopt(NULL, 1u, &prompt, NULL, 64).status == PULSAR_ADOPT_REFUSED);
+    TEST_ASSERT(pulsar_session_save_segment(NULL, NULL, TokPos{0}, TokPos{0}, NULL, NULL, 64) == 1);
+    TokPos G = TokPos{7};
+    TEST_ASSERT(pulsar_session_load_segment(NULL, NULL, 0, false, &G, NULL, NULL, 64) == 1 && G == TokPos{0});
+}
+
 /* L335: the one host f32 -> bf16 converter (pulsar_gpu.h pulsar_bf16_from_f32), over every float bit pattern: each
  * non-NaN value converts exactly as the two vision converters it replaced did (the bare RNE expression), and every
  * NaN becomes torch's quiet NaN 0x7FC0 (the bare expression turned some into Inf or flipped their sign). */
@@ -4927,6 +4939,7 @@ static const pulsar_test_entry test_entries[] = {
     {"--fused-sched", "fused-sched", "the round selection simulated on L304's logged costs: L304's and L277's cases, the stall, no prompt, the cold fit (L312)", test_fused_sched},
     {"--read-ahead", "read-ahead", "the next-chunk PLE read-ahead: its rule (one chunk ahead, each row once, a changed prompt drops), the pool's background class (bytes unchanged, below every gather, cancel, accounting) (L329 b2)", test_read_ahead},
     {"--qwen-eos", "qwen-eos", "Qwen's eos: the tokenizer's first stop id; a tokenizer with none never loads (L335)", test_qwen_eos},
+    {"--api-err-null", "api-err-null", "the session entries that report through err accept a NULL err (L335)", test_api_err_null},
     {"--bf16-convert", "bf16-convert", "the host f32 -> bf16 converter over every float bit pattern: finite values as before, NaN stays NaN (L335)", test_bf16_from_f32},
     {"--tokenizer-refusals", "tokenizer-refusals", "the tokenizer and chat entries refuse a family without them by name and return their failure values, never exit (L335)", test_tokenizer_refusals},
     {"--refusal-once", "refusal-once", "the library's say-once refusal table: once per op, every refusal said past its bound (L335)", test_refusal_once},
