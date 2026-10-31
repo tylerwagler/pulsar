@@ -112,8 +112,6 @@ static_assert(D2RAct<kNTileNarrow / 8>::Trips == 1, "unexpected act issue trip c
 
 /// Per-CTA constants of the D2R kernel, written by thread 0 into shared memory before the main loop.
 struct alignas(16) SmemInvariants {
-    /// expert's scale-plane base (same pointer as iq2_dq_base); written, never read
-    const char *w_base;
     /* L202: EXPERT-based, not tensor-based -- this block's expert offset is
      * folded in once here so the inner loop indexes with (k256, pair, row)
      * alone.  Layout (type 44): d[(e*nb + k)*M + row],
@@ -126,14 +124,8 @@ struct alignas(16) SmemInvariants {
     const char *act_tile_base;
     /// output, f32 out[ids_dst[col] * M + row] (this leg's)
     float *out;
-    /// always 0; written, never read
-    uint32_t sc_off_bytes;
-    /// always 0; written, never read
-    uint32_t qs_off_bytes;
     /// bytes between consecutive k128 blocks of the activation: n_assign * sizeof(block_mx_act_mmq)
     uint32_t act_k128_stride_bytes;
-    /// k256 blocks per row (K / 256); written, never read
-    int nb;
     /// main-loop iterations: K / 128
     int k128_iters;
     /// weight rows (output rows)
@@ -1048,7 +1040,6 @@ void gateup_iq2_d2r_pair_kernel(const void * __restrict__ gate_soa,
     float *out = leg == 0 ? out_gate : out_up;
     const int cta_row0 = (int)blockIdx.x * kMTile;
     const int warp_row0 = cta_row0 + d2r_warp() * 16;
-    const int nb = K >> 8;
 
     const bool full_warp_tile = (warp_row0 + 15 < M) && (col_lo + NT <= col_hi_full);
 
@@ -1090,22 +1081,16 @@ void gateup_iq2_d2r_pair_kernel(const void * __restrict__ gate_soa,
          * layout is unchanged -- d[(e*nb+k)*M+row], q[((e*nb+k)*8+pair)*M+row]
          * -- only where the two plane bases come from. */
         const void *const *pair = reinterpret_cast<const void *const *>(W_soa);
-        s_inv.w_base = reinterpret_cast<const char *>(pair[2 * (size_t)expert]);
         s_inv.iq2_dq_base = reinterpret_cast<const half *>(pair[2 * (size_t)expert]);
         s_inv.iq2_qs_base = reinterpret_cast<const uint2 *>(pair[2 * (size_t)expert + 1]);
         s_inv.act_tile_base = reinterpret_cast<const char *>(act) + (uint64_t)col_lo * sizeof(block_mx_act_mmq);
         s_inv.out = out;
-        s_inv.sc_off_bytes = 0;
-        s_inv.qs_off_bytes = 0;
         s_inv.act_k128_stride_bytes = (uint32_t)((uint64_t)n_assign * sizeof(block_mx_act_mmq));
-        s_inv.nb = nb;
         s_inv.k128_iters = K >> 7;
         s_inv.M = M;
         s_inv.cta_row0 = cta_row0;
         s_inv.col_lo = col_lo;
         s_inv.col_count = col_tile_hi - col_lo;
-    }
-    if (d2r_lane() == 0) {
     }
     if (d2r_tid() < col_tile_hi - col_lo) {
         s_out_cols[d2r_tid()] = ids_dst[col_lo + d2r_tid()];
