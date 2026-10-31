@@ -521,14 +521,15 @@ static inline pulsar_elt_fmt pulsar_tensor_fmt(const pulsar_gpu_tensor *t) {
 /// @param b     the base tensor
 /// @param off   byte offset of the view
 /// @param bytes the view's size
-/// @return a non-owning view carrying b's element size and format
+/// @return a non-owning view carrying b's element size, format and dry-run placeholder flag
 static inline pulsar_gpu_tensor pulsar_tensor_subview(const pulsar_gpu_tensor *b,
                                                      uint64_t off, uint64_t bytes) {
     pulsar_gpu_tensor t;
     t.ptr = (char *)b->ptr + off;
     t.bytes = bytes;
     t.owner = 0;
-    t.fmt = b ? b->fmt : 0u;
+    t.dry = b->dry;   /* L335: left unset, a view of a real tensor could read as a placeholder (and back) */
+    t.fmt = b->fmt;
     t.esz = b->esz;
     return t;
 }

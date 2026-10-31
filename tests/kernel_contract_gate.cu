@@ -27,6 +27,7 @@
  *                       streams and conv state come back byte-identical (the gate / conv kernels used to run first).
  *    9. hc-expand-sizes the split expands refuse a block / add / residual / split operand one row short of out_hc's
  *                       rows (no operand was checked); full operands run.
+ *   10. subview-dry     pulsar_tensor_subview carries the base's dry flag, format and element size (dry was unset).
  *
  *  Prints one line per case and KERNEL CONTRACT GATE PASS / FAIL. */
 #include "pulsar_gpu.h"
@@ -496,6 +497,32 @@ static void case_hc_expand_sizes(void) {
     pulsar_gpu_tensor_free(split);
 }
 
+/* ---- 10. subview-dry ------------------------------------------------------------------------------------------- */
+
+/// Case 10: pulsar_tensor_subview carries the base's dry flag, format and element size (dry was left unset -- stack
+/// garbage).  The views are built over a stack poisoned with 0xff first.
+static void case_subview_dry(void) {
+    pulsar_gpu_tensor *real = pulsar_gpu_tensor_alloc_elt(64u, 2u, PULSAR_ELT_BF16);
+    if (!real) {
+        fail("subview-dry: alloc");
+        return;
+    }
+    pulsar_gpu_tensor dry = *real;
+    dry.dry = 1;
+    int bad = 0;
+    for (int k = 0; k < 2; k++) {
+        volatile unsigned char poison[256];
+        for (int i = 0; i < 256; i++) poison[i] = 0xffu;
+        const pulsar_gpu_tensor *b = k ? &dry : real;
+        const pulsar_gpu_tensor v = pulsar_tensor_subview(b, 16u, 32u);
+        bad += v.dry != b->dry || v.fmt != b->fmt || v.esz != b->esz || v.owner != 0 || v.bytes != 32u ||
+               (const char *)v.ptr != (const char *)b->ptr + 16;
+    }
+    printf("  10 subview-dry: views of a real and a dry tensor carry dry / fmt / esz: %s\n", bad ? "NO" : "yes");
+    if (bad) fail("subview-dry: a view lost its base's dry flag, format or element size");
+    pulsar_gpu_tensor_free(real);
+}
+
 /// Runs every case on device 0.
 /// @return 0 on PASS, 1 on FAIL
 int main(void) {
@@ -512,6 +539,7 @@ int main(void) {
     case_hc_fused_width();
     case_ple_order();
     case_hc_expand_sizes();
+    case_subview_dry();
     puts(g_fail ? "KERNEL CONTRACT GATE FAIL" : "KERNEL CONTRACT GATE PASS");
     return g_fail ? 1 : 0;
 }
