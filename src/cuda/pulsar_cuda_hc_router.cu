@@ -1107,10 +1107,38 @@ int pulsar_gpu_hc_pre_identity_tensor(pulsar_gpu_tensor *pre, uint32_t n_rows, u
 
 
 
+/* The split expands' operand sizes (L335: they read n_tokens rows of each operand, n_tokens taken from out_hc's
+ * size alone, and checked none of them).  Every operand must cover those rows; out_hc must hold at least one. */
+/** @param what        the entry, for the refusal line
+ *  @param n_tokens    rows (from out_hc's size)
+ *  @param block_out   f32 [n_tokens][n_embd]
+ *  @param block_add   f32 [n_tokens][n_embd], or NULL
+ *  @param residual_hc HC carrier [n_tokens][n_hc][n_embd]
+ *  @param split       f32 [n_tokens][2 n_hc + n_hc^2]
+ *  @param n_embd      hidden width
+ *  @param n_hc        carriers
+ *  @return true when every operand covers n_tokens rows (n_tokens > 0); false refused (said) */
+static bool hc_expand_split_sizes_ok(const char *what, uint32_t n_tokens, const pulsar_gpu_tensor *block_out,
+                                     const pulsar_gpu_tensor *block_add, const pulsar_gpu_tensor *residual_hc,
+                                     const pulsar_gpu_tensor *split, uint32_t n_embd, uint32_t n_hc) {
+    const uint64_t row = (uint64_t)n_tokens * n_embd * sizeof(float);
+    const uint64_t mix = (uint64_t)n_tokens * (2u * n_hc + n_hc * n_hc) * sizeof(float);
+    if (n_tokens == 0 || block_out->bytes < row || (block_add && block_add->bytes < row) ||
+        residual_hc->bytes < (uint64_t)n_tokens * n_hc * n_embd * PULSAR_HC_ELT_SIZE || split->bytes < mix) {
+        fprintf(stderr, "pulsar: %s: operands short of %u rows (block %llu B, residual %llu B, split %llu B; "
+                        "n_embd %u, n_hc %u) -- refusing\n", what, n_tokens, (unsigned long long)block_out->bytes,
+                (unsigned long long)residual_hc->bytes, (unsigned long long)split->bytes, n_embd, n_hc);
+        return false;
+    }
+    return true;
+}
+
 int pulsar_gpu_hc_expand_split_tensor(pulsar_gpu_tensor *out_hc, const pulsar_gpu_tensor *block_out, const pulsar_gpu_tensor *residual_hc, const pulsar_gpu_tensor *split, uint32_t n_embd, uint32_t n_hc) {
     if (!out_hc || !block_out || !residual_hc || !split || n_embd == 0 || n_hc == 0) return 0;
     uint32_t n_tokens = (uint32_t)(out_hc->bytes / ((uint64_t)n_hc * n_embd * PULSAR_HC_ELT_SIZE));
     uint32_t mix_hc = 2u * n_hc + n_hc * n_hc;
+    if (!hc_expand_split_sizes_ok("hc_expand_split", n_tokens, block_out, NULL, residual_hc, split, n_embd, n_hc))
+        return 0;
     const float *base = (const float *)split->ptr;
     if (!hc_expand_launch(256,
                       (pulsar_hc_t *)out_hc->ptr,
@@ -1130,6 +1158,9 @@ int pulsar_gpu_hc_expand_add_split_tensor(pulsar_gpu_tensor *out_hc, const pulsa
     if (!out_hc || !block_out || !block_add || !residual_hc || !split || n_embd == 0 || n_hc == 0) return 0;
     uint32_t n_tokens = (uint32_t)(out_hc->bytes / ((uint64_t)n_hc * n_embd * PULSAR_HC_ELT_SIZE));
     uint32_t mix_hc = 2u * n_hc + n_hc * n_hc;
+    if (!hc_expand_split_sizes_ok("hc_expand_add_split", n_tokens, block_out, block_add, residual_hc, split, n_embd,
+                                  n_hc))
+        return 0;
     const float *base = (const float *)split->ptr;
     if (!hc_expand_launch(256,
                       (pulsar_hc_t *)out_hc->ptr,

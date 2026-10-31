@@ -25,6 +25,8 @@
  *                       to launch the 5120 unroll with dead groups).
  *    8. ple-order       the Qwen PLE launcher refuses a verify capture wider than its batch BEFORE queuing a kernel:
  *                       streams and conv state come back byte-identical (the gate / conv kernels used to run first).
+ *    9. hc-expand-sizes the split expands refuse a block / add / residual / split operand one row short of out_hc's
+ *                       rows (no operand was checked); full operands run.
  *
  *  Prints one line per case and KERNEL CONTRACT GATE PASS / FAIL. */
 #include "pulsar_gpu.h"
@@ -448,6 +450,52 @@ static void case_ple_order(void) {
     pulsar_gpu_tensor_free(ws);
 }
 
+/* ---- 9. hc-expand-sizes ---------------------------------------------------------------------------------------- */
+
+/// Case 9: the split expands refuse an operand short of out_hc's rows (they checked none): a block_out, block_add,
+/// residual or split one row short each refuses; full operands run.
+static void case_hc_expand_sizes(void) {
+    const uint32_t n_embd = 4096u, n_tok = 3u, n_hc = 4u, mix = 2u * n_hc + n_hc * n_hc;
+    const uint64_t hc_row = (uint64_t)n_hc * n_embd * 2u, f_row = (uint64_t)n_embd * 4u, m_row = mix * 4u;
+    pulsar_gpu_tensor *out = pulsar_gpu_tensor_alloc_elt((uint64_t)n_tok * n_hc * n_embd, 2u, PULSAR_HC_ELT_FMT);
+    pulsar_gpu_tensor *res = pulsar_gpu_tensor_alloc_elt((uint64_t)n_tok * n_hc * n_embd, 2u, PULSAR_HC_ELT_FMT);
+    pulsar_gpu_tensor *blk = pulsar_gpu_tensor_alloc(n_tok * f_row);
+    pulsar_gpu_tensor *add = pulsar_gpu_tensor_alloc(n_tok * f_row);
+    pulsar_gpu_tensor *split = pulsar_gpu_tensor_alloc(n_tok * m_row);
+    if (!out || !res || !blk || !add || !split) {
+        fail("hc-expand-sizes: alloc");
+    } else {
+        const std::vector<uint8_t> z((size_t)n_tok * hc_row, 0u);
+        pulsar_gpu_tensor_write(res, 0, z.data(), n_tok * hc_row);
+        pulsar_gpu_tensor_write(blk, 0, z.data(), n_tok * f_row);
+        pulsar_gpu_tensor_write(add, 0, z.data(), n_tok * f_row);
+        pulsar_gpu_tensor_write(split, 0, z.data(), n_tok * m_row);
+        pulsar_gpu_tensor *sb = pulsar_gpu_tensor_view(blk, 0, (n_tok - 1u) * f_row);
+        pulsar_gpu_tensor *sa = pulsar_gpu_tensor_view(add, 0, (n_tok - 1u) * f_row);
+        pulsar_gpu_tensor *sr = pulsar_gpu_tensor_view(res, 0, (n_tok - 1u) * hc_row);
+        pulsar_gpu_tensor *ss = pulsar_gpu_tensor_view(split, 0, (n_tok - 1u) * m_row);
+        const bool full = pulsar_gpu_hc_expand_split_tensor(out, blk, res, split, n_embd, n_hc) &&
+                          pulsar_gpu_hc_expand_add_split_tensor(out, blk, add, res, split, n_embd, n_hc);
+        const bool any_short = pulsar_gpu_hc_expand_split_tensor(out, sb, res, split, n_embd, n_hc) ||
+                               pulsar_gpu_hc_expand_split_tensor(out, blk, sr, split, n_embd, n_hc) ||
+                               pulsar_gpu_hc_expand_split_tensor(out, blk, res, ss, n_embd, n_hc) ||
+                               pulsar_gpu_hc_expand_add_split_tensor(out, blk, sa, res, split, n_embd, n_hc);
+        const bool synced = pulsar_gpu_synchronize() != 0;
+        printf("  9 hc-expand-sizes: full operands %s, a short operand %s, device %s\n", full ? "ran" : "REFUSED",
+               any_short ? "RAN" : "refused", synced ? "clean" : "FAULT");
+        if (!full || any_short || !synced) fail("hc-expand-sizes: the operand size checks");
+        pulsar_gpu_tensor_free(sb);
+        pulsar_gpu_tensor_free(sa);
+        pulsar_gpu_tensor_free(sr);
+        pulsar_gpu_tensor_free(ss);
+    }
+    pulsar_gpu_tensor_free(out);
+    pulsar_gpu_tensor_free(res);
+    pulsar_gpu_tensor_free(blk);
+    pulsar_gpu_tensor_free(add);
+    pulsar_gpu_tensor_free(split);
+}
+
 /// Runs every case on device 0.
 /// @return 0 on PASS, 1 on FAIL
 int main(void) {
@@ -463,6 +511,7 @@ int main(void) {
     case_ring_store_descr();
     case_hc_fused_width();
     case_ple_order();
+    case_hc_expand_sizes();
     puts(g_fail ? "KERNEL CONTRACT GATE FAIL" : "KERNEL CONTRACT GATE PASS");
     return g_fail ? 1 : 0;
 }
