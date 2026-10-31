@@ -475,7 +475,9 @@ bool agent_worker_save_session_now(agent_worker *w, char sha_out[41],
     if (!w->session_title) {
         size_t text_len = 0;
         char *text = pulsar_kvtext_render_tokens_text(w->engine, &w->transcript, &text_len);
-        w->session_title = agent_session_title_from_text(text ? text : "", text ? text_len : 0, 0);
+        agent_turn_marks marks;
+        agent_turn_marks_init(w->engine, &marks);
+        w->session_title = agent_session_title_from_text(&marks, text ? text : "", text ? text_len : 0, 0);
         free(text);
     }
     if (w->session_created_at == 0)

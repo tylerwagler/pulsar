@@ -670,6 +670,20 @@ typedef enum {
     AGENT_HISTORY_MARK_EOS,       ///< end-of-turn boundary
 } agent_history_mark;
 
+/** The loaded family's turn markers as they appear in rendered transcript text (pulsar_kvtext_render_tokens_text):
+ * what the session title and /history scan for, so every family's transcript reads the same way (DeepSeek:
+ * `<｜User｜>`, `<｜Assistant｜>`, `<｜end▁of▁sentence｜>`; Qwen: `<|im_start|>user`, `<|im_start|>assistant`,
+ * `<|im_end|>`).  Built by agent_turn_marks_init; a marker the family does not spell is empty (len 0) and matches
+ * nowhere. */
+typedef struct {
+    char user[64];            ///< the user-turn marker's text (pulsar_chat_turn_markers' user tokens)
+    size_t user_len;          ///< bytes in `user`; 0 = not spelled
+    char assistant[64];       ///< the assistant-turn marker's text (its assistant tokens)
+    size_t assistant_len;     ///< bytes in `assistant`; 0 = not spelled
+    char end[64];             ///< a closed assistant turn's end (pulsar_chat_end_assistant), whitespace trimmed
+    size_t end_len;           ///< bytes in `end`; 0 = not spelled
+} agent_turn_marks;
+
 /** Rendered history as borrowed line pointers plus a parallel marker array.
  * Pointers are NOT owned -- they alias the rendered buffer. */
 typedef struct {
@@ -1339,13 +1353,20 @@ bool agent_worker_save_session(agent_worker *w, char *err, size_t err_len);
  *  @return the title ("(empty user prompt)" for an empty one), malloc'd; caller frees */
 char *agent_session_title_from_prompt(const char *prompt,
                                              size_t max_bytes);
-/** A session title from the first user turn of a rendered transcript.
+/** The loaded family's turn markers as rendered text (agent_turn_marks), from the renderer's family-neutral API:
+ *  pulsar_chat_turn_markers' tokens and pulsar_chat_end_assistant's, each rendered by pulsar_token_text.
+ *  @param e the engine (its tokenizer)
+ *  @param m receives the markers; one the family does not spell (or longer than its buffer) is left empty */
+void agent_turn_marks_init(pulsar_engine *e, agent_turn_marks *m);
+/** A session title from the first user turn of a rendered transcript: the text after the first user marker, up to
+ *  the next assistant, user or end marker.
+ *  @param marks     the loaded family's markers (agent_turn_marks_init)
  *  @param text      the rendered transcript
  *  @param text_len  byte count
  *  @param max_bytes display budget; 0 = the full normalised title
  *  @return the title ("(no user prompt)" when none is found), malloc'd; caller frees */
-char *agent_session_title_from_text(const char *text, size_t text_len,
-                                           size_t max_bytes);
+char *agent_session_title_from_text(const agent_turn_marks *marks, const char *text, size_t text_len,
+                                    size_t max_bytes);
 /** Print the live session's recent turns without touching the session.
  *  @param w          the worker (must be idle)
  *  @param user_turns user turns to show

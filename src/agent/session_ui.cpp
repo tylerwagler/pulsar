@@ -77,21 +77,97 @@ char *agent_session_title_from_prompt(const char *prompt,
 
 
 
+/** @brief The text of `n` token ids, concatenated, into out[0..cap) (NUL-terminated); empty when it does not fit.
+ *  @param e    the engine
+ *  @param ids  the ids
+ *  @param n    their count
+ *  @param out  receives the text
+ *  @param cap  out's size in bytes
+ *  @param trim drop leading and trailing isspace() bytes
+ *  @return the text's length in bytes (0 = empty) */
+static size_t agent_turn_mark_text(pulsar_engine *e, const int *ids, int n, char *out, size_t cap, bool trim) {
+    size_t len = 0;
+    out[0] = '\0';
+    for (int i = 0; i < n; i++) {
+        size_t k = 0;
+        char *t = pulsar_token_text(e, ids[i], &k);
+        const bool fits = t && len + k < cap;
+        if (fits) memcpy(out + len, t, k);
+        free(t);
+        if (!fits) {
+            out[0] = '\0';
+            return 0;
+        }
+        len += k;
+    }
+    size_t lo = 0;
+    if (trim) {
+        while (lo < len && isspace((unsigned char)out[lo])) lo++;
+        while (len > lo && isspace((unsigned char)out[len - 1])) len--;
+        memmove(out, out + lo, len - lo);
+        len -= lo;
+    }
+    out[len] = '\0';
+    return len;
+}
+
+void agent_turn_marks_init(pulsar_engine *e, agent_turn_marks *m) {
+    memset(m, 0, sizeof(*m));
+    pulsar_turn_markers tm;
+    if (pulsar_chat_turn_markers(e, &tm)) {
+        m->user_len = agent_turn_mark_text(e, tm.user, tm.n_user, m->user, sizeof m->user, false);
+        m->assistant_len = agent_turn_mark_text(e, tm.assistant, tm.n_assistant, m->assistant, sizeof m->assistant,
+                                                false);
+    }
+    pulsar_tokens end = {0};
+    pulsar_chat_end_assistant(e, &end);
+    m->end_len = agent_turn_mark_text(e, end.v, end.len, m->end, sizeof m->end, true);
+    pulsar_tokens_free(&end);
+}
+
+/** @brief Find the first occurrence of `needle` in `hay` (bytes).
+ *  @param hay        the haystack
+ *  @param hay_len    bytes at `hay`
+ *  @param needle     the needle
+ *  @param needle_len bytes at `needle`; 0 matches at `hay`
+ *  @return a pointer into `hay`, or NULL */
+static const char *agent_memmem(const char *hay, size_t hay_len,
+                                const char *needle, size_t needle_len) {
+    if (!needle_len) return hay;
+    if (needle_len > hay_len) return NULL;
+    const char first = needle[0];
+    const char *end = hay + hay_len - needle_len + 1;
+    for (const char *p = hay; p < end; p++) {
+        if (*p == first && memcmp(p, needle, needle_len) == 0) return p;
+    }
+    return NULL;
+}
+
+/** @brief The first occurrence of a turn marker in [p, end); a marker the family does not spell (len 0) is never
+ *  found.
+ *  @param p   scan start
+ *  @param end scan end (exclusive)
+ *  @param s   the marker's text
+ *  @param n   its length in bytes
+ *  @return its position, or NULL */
+static const char *agent_turn_mark_find(const char *p, const char *end, const char *s, size_t n) {
+    return n ? agent_memmem(p, (size_t)(end - p), s, n) : NULL;
+}
+
 /* Extract a human-readable title from the first user turn stored in the
  * rendered transcript.  max_bytes==0 means "full normalized title"; callers
  * that render to the terminal pass an explicit display budget. */
-char *agent_session_title_from_text(const char *text, size_t text_len,
-                                           size_t max_bytes) {
-    static const char user_mark[] = "<｜User｜>";
-    static const char assistant_mark[] = "<｜Assistant｜>";
-    const char *p = text ? strstr(text, user_mark) : NULL;
+char *agent_session_title_from_text(const agent_turn_marks *marks, const char *text, size_t text_len,
+                                    size_t max_bytes) {
+    const char *end = text ? text + text_len : NULL;
+    const char *p = text ? agent_turn_mark_find(text, end, marks->user, marks->user_len) : NULL;
     if (!p) return xstrdup("(no user prompt)");
-    p += strlen(user_mark);
-    const char *end = text + text_len;
-    const char *assistant = strstr(p, assistant_mark);
-    const char *next_user = strstr(p, user_mark);
-    if (assistant && assistant < end) end = assistant;
-    if (next_user && next_user < end) end = next_user;
+    p += marks->user_len;
+    const char *bounds[] = {agent_turn_mark_find(p, end, marks->assistant, marks->assistant_len),
+                            agent_turn_mark_find(p, end, marks->user, marks->user_len),
+                            agent_turn_mark_find(p, end, marks->end, marks->end_len)};
+    for (const char *m : bounds)
+        if (m && m < end) end = m;
     return agent_session_title_from_span(p, end, max_bytes,
                                          "(empty user prompt)");
 }
@@ -133,58 +209,33 @@ static void agent_history_ptrs_push(agent_history_ptrs *p, const char *s,
 
 
 
-/** @brief Find the first occurrence of `needle` in `hay` (bytes).
- *  @param hay        the haystack
- *  @param hay_len    bytes at `hay`
- *  @param needle     the needle
- *  @param needle_len bytes at `needle`; 0 matches at `hay`
- *  @return a pointer into `hay`, or NULL */
-static const char *agent_memmem(const char *hay, size_t hay_len,
-                                const char *needle, size_t needle_len) {
-    if (!needle_len) return hay;
-    if (needle_len > hay_len) return NULL;
-    const char first = needle[0];
-    const char *end = hay + hay_len - needle_len + 1;
-    for (const char *p = hay; p < end; p++) {
-        if (*p == first && memcmp(p, needle, needle_len) == 0) return p;
-    }
-    return NULL;
-}
-
-
-
-/** @brief The next turn marker in rendered history: DeepSeek's User, Assistant or end-of-sentence token text,
- *  whichever comes first.
+/** @brief The next turn marker in rendered history: the loaded family's user, assistant or end-of-turn marker
+ *  (agent_turn_marks), whichever comes first.
+ *  @param marks    the family's markers
  *  @param p        scan start
  *  @param end      scan end (exclusive)
  *  @param mark     receives its kind; may be NULL
  *  @param mark_len receives its length, bytes; may be NULL
  *  @return the marker's position, or NULL when none remains */
-static const char *agent_history_next_marker(const char *p, const char *end,
+static const char *agent_history_next_marker(const agent_turn_marks *marks, const char *p, const char *end,
                                              agent_history_mark *mark,
                                              size_t *mark_len) {
-    static const char user_mark[] = "<｜User｜>";
-    static const char assistant_mark[] = "<｜Assistant｜>";
-    static const char eos_mark[] = "<｜end▁of▁sentence｜>";
-    const char *u = agent_memmem(p, (size_t)(end - p),
-                                 user_mark, sizeof(user_mark) - 1);
-    const char *a = agent_memmem(p, (size_t)(end - p),
-                                 assistant_mark, sizeof(assistant_mark) - 1);
-    const char *e = agent_memmem(p, (size_t)(end - p),
-                                 eos_mark, sizeof(eos_mark) - 1);
+    const char *u = agent_turn_mark_find(p, end, marks->user, marks->user_len);
+    const char *a = agent_turn_mark_find(p, end, marks->assistant, marks->assistant_len);
+    const char *e = agent_turn_mark_find(p, end, marks->end, marks->end_len);
     if (!u && !a && !e) return NULL;
     if (u && (!a || u < a) && (!e || u < e)) {
         if (mark) *mark = AGENT_HISTORY_MARK_USER;
-        if (mark_len) *mark_len = sizeof(user_mark) - 1;
+        if (mark_len) *mark_len = marks->user_len;
         return u;
     }
     if (a && (!e || a < e)) {
         if (mark) *mark = AGENT_HISTORY_MARK_ASSISTANT;
-        if (mark_len) *mark_len = sizeof(assistant_mark) - 1;
+        if (mark_len) *mark_len = marks->assistant_len;
         return a;
     }
     if (mark) *mark = AGENT_HISTORY_MARK_EOS;
-    if (mark_len) *mark_len = sizeof(eos_mark) - 1;
+    if (mark_len) *mark_len = marks->end_len;
     return e;
 }
 
@@ -274,12 +325,13 @@ static void agent_history_ptrs_free(agent_history_ptrs *p) {
  * fall back to recent tool/assistant events instead of showing an empty
  * history. */
 /// @brief Where /history starts to show the last `user_turns` human turns (see above).
+/// @param tm         the loaded family's turn markers
 /// @param text       the rendered history
 /// @param len        bytes at `text`
 /// @param user_turns human turns to show
 /// @param tool_only  receives true when only tool/assistant events could be shown
 /// @return a position in `text`; text + len when there is nothing to show
-static const char *agent_history_start_for_turns(const char *text, size_t len,
+static const char *agent_history_start_for_turns(const agent_turn_marks *tm, const char *text, size_t len,
                                                  int user_turns,
                                                  bool *tool_only) {
     const char *end = text + len;
@@ -290,13 +342,13 @@ static const char *agent_history_start_for_turns(const char *text, size_t len,
     while (p < end) {
         agent_history_mark mark = AGENT_HISTORY_MARK_NONE;
         size_t mark_len = 0;
-        const char *m = agent_history_next_marker(p, end, &mark, &mark_len);
+        const char *m = agent_history_next_marker(tm, p, end, &mark, &mark_len);
         if (!m) break;
         agent_history_ptrs_push(&marks, m, mark);
         const char *content = m + mark_len;
         agent_history_mark next_mark = AGENT_HISTORY_MARK_NONE;
         size_t next_len = 0;
-        const char *next = agent_history_next_marker(content, end,
+        const char *next = agent_history_next_marker(tm, content, end,
                                                      &next_mark, &next_len);
         const char *content_end = next ? next : end;
         if (mark == AGENT_HISTORY_MARK_USER) {
@@ -556,7 +608,7 @@ static void agent_history_render_assistant(agent_worker *w,
  * uses the same assistant/token renderer as live output, so restored history
  * looks like the original terminal stream instead of raw rendered-chat text. */
 /// @brief Replay the last `user_turns` turns of saved history (see above).
-/// @param w          the worker whose UI receives it
+/// @param w          the worker whose UI receives it (its engine's turn markers are scanned for)
 /// @param text       the rendered history
 /// @param len        bytes at `text`
 /// @param user_turns human turns to show (capped at AGENT_HISTORY_MAX_TURNS); <= 0 shows nothing
@@ -569,8 +621,11 @@ static void agent_history_render_text(agent_worker *w, const char *text,
     const char *end = text + len;
     agent_history_render_compaction_summary(w, text, len);
 
+    agent_turn_marks tm_s;
+    agent_turn_marks_init(w->engine, &tm_s);
+    const agent_turn_marks *tm = &tm_s;
     bool tool_only = false;
-    const char *p = agent_history_start_for_turns(text, len, user_turns,
+    const char *p = agent_history_start_for_turns(tm, text, len, user_turns,
                                                   &tool_only);
     if (p >= end) {
         agent_publish(w, "\n(no user history)\n", strlen("\n(no user history)\n"));
@@ -591,12 +646,12 @@ static void agent_history_render_text(agent_worker *w, const char *text,
     while (p < end) {
         agent_history_mark mark = AGENT_HISTORY_MARK_NONE;
         size_t mark_len = 0;
-        const char *m = agent_history_next_marker(p, end, &mark, &mark_len);
+        const char *m = agent_history_next_marker(tm, p, end, &mark, &mark_len);
         if (!m) break;
         const char *content = m + mark_len;
         agent_history_mark next_mark = AGENT_HISTORY_MARK_NONE;
         size_t next_len = 0;
-        const char *next = agent_history_next_marker(content, end,
+        const char *next = agent_history_next_marker(tm, content, end,
                                                      &next_mark, &next_len);
         const char *content_end = next ? next : end;
         const char *tp = content, *te = content_end;
