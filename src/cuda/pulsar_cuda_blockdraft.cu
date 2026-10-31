@@ -1,3 +1,5 @@
+/** @file
+ *  The block drafter's small ops: grouped conv, swiglu, row copy, stream mean, top-k log-probs (L298). */
 /* The block drafter's small ops (L298).  The contract is pulsar_cuda_blockdraft.h. */
 #include "pulsar_cuda_blockdraft.h"
 
@@ -8,16 +10,26 @@
 
 namespace {
 
+/// @param b bf16 bits.
+/// @return the value as f32 (exact).
 __device__ __forceinline__ float bf(uint16_t b) { return __uint_as_float((uint32_t)b << 16); }
+/// @param x an f32 value.
+/// @return its bf16 bits, round to nearest even.
 __device__ __forceinline__ uint16_t to_bf(float x) {
     const __nv_bfloat16 h = __float2bfloat16_rn(x);
     return *reinterpret_cast<const uint16_t *>(&h);
 }
 
+/// Names a refused contract on stderr.
+/// @param what the reason.
+/// @return -1.
 int refuse(const char *what) {
     fprintf(stderr, "pulsar: block drafter op refused: %s\n", what);
     return -1;
 }
+/// Checks the last launch, naming a failure on stderr.
+/// @param what the op's name.
+/// @return 0, or -3 on a launch failure.
 int launched(const char *what) {
     const cudaError_t e = cudaGetLastError();
     if (e == cudaSuccess) return 0;
@@ -26,6 +38,18 @@ int launched(const char *what) {
 }
 
 /* one thread per (row, channel) */
+/// The grouped conv (contract: pulsar_blockdraft_conv_launch).  Grid (ceil(width / 256), n_rows), 256 threads.
+/// @param x input rows, bf16.
+/// @param ld_x x row stride, elements.
+/// @param delta per-row tap deltas, bf16 [taps][width / group] per row.
+/// @param ld_delta delta row stride, elements.
+/// @param base the base kernel, bf16 [taps][width].
+/// @param taps taps (tap t reads row r - t).
+/// @param group channels per delta group.
+/// @param block rows per block (the convolution never crosses one).
+/// @param width channels.
+/// @param out output rows, bf16.
+/// @param ld_out out row stride, elements.
 __global__ void conv_kernel(const uint16_t *__restrict__ x, uint64_t ld_x, const uint16_t *__restrict__ delta,
                             uint64_t ld_delta, const uint16_t *__restrict__ base, uint32_t taps, uint32_t group,
                             uint32_t block, uint32_t width, uint16_t *__restrict__ out, uint64_t ld_out) {
@@ -39,6 +63,14 @@ __global__ void conv_kernel(const uint16_t *__restrict__ x, uint64_t ld_x, const
     out[(uint64_t)r * ld_out + c] = to_bf(acc);
 }
 
+/// h = bf16(silu(g) * u).  Grid (ceil(width / 256), n_rows), 256 threads, one thread per (row, column).
+/// @param g gate rows, bf16.
+/// @param ld_g g row stride, elements.
+/// @param u up rows, bf16.
+/// @param ld_u u row stride, elements.
+/// @param width columns.
+/// @param h output rows, bf16.
+/// @param ld_h h row stride, elements.
 __global__ void swiglu_kernel(const uint16_t *__restrict__ g, uint64_t ld_g, const uint16_t *__restrict__ u,
                               uint64_t ld_u, uint32_t width, uint16_t *__restrict__ h, uint64_t ld_h) {
     const uint32_t r = blockIdx.y, c = blockIdx.x * blockDim.x + threadIdx.x;
@@ -48,6 +80,12 @@ __global__ void swiglu_kernel(const uint16_t *__restrict__ g, uint64_t ld_g, con
     h[(uint64_t)r * ld_h + c] = to_bf(s * bf(u[(uint64_t)r * ld_u + c]));
 }
 
+/// Row copy in uint4 units.  Grid (ceil(width8 / 128), n_rows), 128 threads.
+/// @param src source rows, bf16, 16-byte aligned.
+/// @param ld_src src row stride, elements (multiple of 8).
+/// @param width8 the row's width in 8-element units.
+/// @param dst destination rows, bf16, 16-byte aligned.
+/// @param ld_dst dst row stride, elements (multiple of 8).
 __global__ void rows_copy_kernel(const uint16_t *__restrict__ src, uint64_t ld_src, uint32_t width8,
                                  uint16_t *__restrict__ dst, uint64_t ld_dst) {
     const uint32_t r = blockIdx.y, i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -56,6 +94,14 @@ __global__ void rows_copy_kernel(const uint16_t *__restrict__ src, uint64_t ld_s
 }
 
 /* one thread per 8 columns of a row: the streams summed in order, then the mean */
+/// Grid (ceil(width8 / 128), n_rows), 128 threads.
+/// @param src rows of n_streams streams, stream i at src + r * ld_src + i * width, bf16.
+/// @param ld_src src row stride, elements.
+/// @param n_streams streams per row.
+/// @param width8 width / 8.
+/// @param width one stream's width, elements.
+/// @param dst output rows, bf16.
+/// @param ld_dst dst row stride, elements.
 __global__ void stream_mean_kernel(const uint16_t *__restrict__ src, uint64_t ld_src, uint32_t n_streams,
                                    uint32_t width8, uint32_t width, uint16_t *__restrict__ dst, uint64_t ld_dst) {
     const uint32_t r = blockIdx.y, i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -75,15 +121,29 @@ __global__ void stream_mean_kernel(const uint16_t *__restrict__ src, uint64_t ld
     reinterpret_cast<uint4 *>(dst + (uint64_t)r * ld_dst)[i] = make_uint4(o[0], o[1], o[2], o[3]);
 }
 
+/// Threads per top-k CTA (one CTA per row).
 constexpr int TOPK_THREADS = 256;
 
 /* a > b in the selection order: the larger value, ties to the lower id */
+/// @param va first value.
+/// @param ia first column.
+/// @param vb second value.
+/// @param ib second column.
+/// @return true when (va, ia) ranks ahead of (vb, ib).
 __device__ __forceinline__ bool before(float va, int32_t ia, float vb, int32_t ib) {
     return va > vb || (va == vb && ia < ib);
 }
 
 /* one CTA per row: each thread a sorted local top-k of its strided columns and an online (max, sum exp); the CTA's
  * logsumexp, then k rounds of a CTA argmax over the threads' list heads */
+/// Grid n_rows, TOPK_THREADS threads, static shared memory only (contract: pulsar_rows_topk_logprob_launch).
+/// @tparam KM k, 1 .. PULSAR_BLOCKDRAFT_TOPK_MAX (one instantiation per k).
+/// @param logits bf16 rows.
+/// @param ld logits row stride, elements.
+/// @param n columns per row.
+/// @param id_map column -> id, or NULL (the column is the id).
+/// @param ids out: [row][k] ids, descending.
+/// @param lp out: [row][k] log-softmax values, f32.
 template <int KM>
 __global__ void __launch_bounds__(TOPK_THREADS) topk_kernel(const uint16_t *__restrict__ logits, uint64_t ld,
                                                            uint32_t n, const int32_t *__restrict__ id_map,
@@ -205,6 +265,9 @@ int pulsar_blockdraft_stream_mean_launch(const uint16_t *src, uint64_t ld_src, u
                                                                              ld_dst);
     return launched("stream mean");
 }
+
+/** @def PULSAR_TOPK_CASE(K)
+ *  One arm of pulsar_rows_topk_logprob_launch's switch: k == K launches topk_kernel<K>. */
 
 int pulsar_rows_topk_logprob_launch(const uint16_t *logits, uint64_t ld, uint32_t n_rows, uint32_t n, uint32_t k,
                                     const int32_t *id_map, int32_t *ids, float *lp, cudaStream_t stream) {

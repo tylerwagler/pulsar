@@ -1,3 +1,5 @@
+/** @file
+ *  Engram device path (L242, V4.1): gathered table rows as the wkv GEMM's E4M3 activation, and the gate. */
 /* Engram device path (L242, V4.1): the gathered table rows become the `wkv` GEMM's
  * activation AS THE E4M3 + E8M0 THEY ALREADY ARE, and the gate writes the value into
  * every hyper-connection copy.
@@ -29,13 +31,24 @@
 #include "pulsar_cuda_internal.h"
 #include "pulsar_cuda_mx.cuh"
 
+/// Values per table-row column (one record's E4M3 bytes).
 #define ENGRAM_DIM       256u
+/// E8M0 scales per record: one per 32 values.
 #define ENGRAM_N_SCALE   8u
+/// Bytes of one record: 256 E4M3 values then 8 E8M0 scales (264, 8-byte aligned).
 #define ENGRAM_ROW_BYTES (ENGRAM_DIM + ENGRAM_N_SCALE)
+/// Records (columns) per token.
 #define ENGRAM_N_COLS    24u
+/// The wkv GEMM's input width per token: 24 x 256 = 6144.
 #define ENGRAM_IN        (ENGRAM_N_COLS * ENGRAM_DIM)   /* 6144 */
 
 /* one thread per (token, column, 32-block): 32 data bytes and one scale byte */
+/// Copies the records into the MXFP8 activation slot.  Grid ceil(n_tok * 192 / 256), 256 threads.
+/// @param rows the gathered records, [n_tok][24][264 B], 8-byte aligned.
+/// @param n_tok tokens.
+/// @param KBp the slot's padded k-block count (pulsar_mx_sfoff).
+/// @param data out: the slot's E4M3 plane, [n_tok][6144].
+/// @param scale out: the slot's E8M0 plane, pulsar_mx_sfoff swizzle.
 __global__ static void engram_rows_emit_kernel(const unsigned char *rows, uint32_t n_tok, int KBp,
                                                __nv_fp8_e4m3 *data, unsigned char *scale) {
     const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -55,6 +68,11 @@ __global__ static void engram_rows_emit_kernel(const unsigned char *rows, uint32
     scale[pulsar_mx_sfoff((int)tok, (int)kb, KBp)] = row[ENGRAM_DIM + j];
 }
 
+/// Emits the gathered rows as the E4M3 activation slot keyed by x_key (the f32 plane noted skipped).
+/// @param x_key the activation whose slot is written (>= n_tok * 6144 f32 bytes).
+/// @param rows the gathered records, [n_tok][24][264 B].
+/// @param n_tok tokens.
+/// @return 1 on success, 0 on a refusal (named on stderr) or launch failure.
 int pulsar_gpu_engram_rows_emit(const pulsar_gpu_tensor *x_key, const pulsar_gpu_tensor *rows,
                                 uint32_t n_tok) {
     if (!x_key || !rows || n_tok == 0) return 0;
@@ -88,6 +106,15 @@ int pulsar_gpu_engram_rows_emit(const pulsar_gpu_tensor *x_key, const pulsar_gpu
 }
 
 /* one block per (token, hc copy); the three reductions in one pass, then the update */
+/// The gate per (token, hc copy).  Grid n_tok * n_hc, blockDim a multiple of 32 up to 1024 (launched at 256).
+/// @param hc the residual copies, [n_tok][n_hc][dim], updated in place.
+/// @param kv per token: n_hc keys then one value, f32 [n_tok][n_hc + 1][dim].
+/// @param w the q * k weight, f32 [n_hc][dim].
+/// @param dead per token, nonzero = leave untouched; NULL = none.
+/// @param n_hc hyper-connection copies.
+/// @param dim width (multiple of 32).
+/// @param eps RMS epsilon.
+/// @param clamp the floor under |dot| before the sqrt.
 __global__ static void engram_gate_add_kernel(pulsar_hc_t *hc, const float *kv, const float *w,
                                               const unsigned char *dead, uint32_t n_hc, uint32_t dim,
                                               float eps, float clamp) {
@@ -129,6 +156,16 @@ __global__ static void engram_gate_add_kernel(pulsar_hc_t *hc, const float *kv, 
     }
 }
 
+/// h += sigmoid-gate * value on every live token's hyper-connection copies (the reference's gate in f32).
+/// @param hc the residual copies, [n_tok][n_hc][dim].
+/// @param kv the keys and value, f32 [n_tok][n_hc + 1][dim].
+/// @param qk_weight f32 [n_hc][dim].
+/// @param dead per-token dead flags (bytes), or NULL.
+/// @param n_tok tokens.
+/// @param n_hc copies.
+/// @param dim width (multiple of 32).
+/// @param eps RMS epsilon.
+/// @return 1 on success, 0 on a refusal or launch failure.
 int pulsar_gpu_engram_gate_add(pulsar_gpu_tensor *hc, const pulsar_gpu_tensor *kv,
                                const pulsar_gpu_tensor *qk_weight, const pulsar_gpu_tensor *dead,
                                uint32_t n_tok, uint32_t n_hc, uint32_t dim, float eps) {

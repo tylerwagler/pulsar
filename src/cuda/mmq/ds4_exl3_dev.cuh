@@ -1,4 +1,6 @@
 // SPDX-License-Identifier: MIT
+/** @file
+ *  EXL3 device arithmetic shared by every EXL3 kernel: tile geometry, run window, codebook decode, H128. */
 // The EXL3 device arithmetic shared by every EXL3 kernel (L245 routed experts,
 // L251 dense Linears): the per-rate tile geometry, the four-state run window,
 // the mul1 codebook decode, and the 128-block Hadamard over one warp.
@@ -21,6 +23,7 @@
 
 namespace exl3dev {
 
+/// 1 / sqrt(128): the Hadamard's normalisation.
 constexpr float kInvSqrt128 = 0.08838834764831845f;
 
 /** The fewest bits a run's 64-bit window has to spare at rate K2: over every
@@ -30,6 +33,8 @@ constexpr float kInvSqrt128 = 0.08838834764831845f;
  *  the run's span (3K + 16) bounds nothing: K6 spares 6 bits and K8 24, while
  *  K6.5 (-2), K7 (-1) and K7.5 (-5) do not fit (L266; TensorFold's
  *  experts_grouped.cuh window table agrees). */
+/// @param K2 the rate in half-bit units (2 x bits per weight).
+/// @return the least spare bits over every run start (< 0: some run does not fit).
 __host__ __device__ constexpr int run4_slack(int K2) {
     int least = 64;
     for (int p0 = 0; p0 < 256; p0 += 4) {
@@ -44,7 +49,9 @@ __host__ __device__ constexpr int run4_slack(int K2) {
  *  of four consecutive positions, each run from ONE 64-bit window of two
  *  consecutive uint32 words (run4_window); run4_slack checks the run fits. */
 template <int K2> struct Rate {
+    /// uint16 words per 16 x 16 tile: 256 weights x K2 / 2 bits / 16.
     static constexpr int words16 = 16 * (K2 >> 1) + ((K2 & 1) ? 8 : 0);
+    /// uint32 words per tile.
     static constexpr int words32 = words16 / 2;
     static_assert(words16 % 2 == 0, "a tile is whole uint32 words");
     static_assert(run4_slack(K2) >= 0, "a run of this rate does not fit the 64-bit run window");
@@ -53,6 +60,8 @@ template <int K2> struct Rate {
 /** exllamav3's mul1 codebook, the device form: x * 0x83DCD12D, a dp4a byte
  *  sum onto 0x6400 (= fp16 1024 + bytesum, exact), one hfma.  Bit-identical to
  *  the host exl3_mul1_decode (both graded against the extension's table). */
+/// @param x a 16-bit trellis state (in the low bits).
+/// @return the codebook value, f32.
 __device__ __forceinline__ float mul1(uint32_t x) {
     x *= EXL3_MUL1_MULTIPLIER;
     const uint32_t s = __dp4a(x, 0x01010101u, 0x6400u);
@@ -65,6 +74,9 @@ __device__ __forceinline__ float mul1(uint32_t x) {
  *  bit-identical to mul1's fp16 before its f32 conversion (exllamav3's
  *  decode_3inst<2> pairs them the same way).  The pair is an mma.m16n8k16 B
  *  register as it stands. */
+/// @param x0 the first state.
+/// @param x1 the second state.
+/// @return the two values as fp16x2 (x0 low).
 __device__ __forceinline__ uint32_t mul1_pair(uint32_t x0, uint32_t x1) {
     const uint32_t s0 = __dp4a(x0 * EXL3_MUL1_MULTIPLIER, 0x01010101u, 0x6400u);
     const uint32_t s1 = __dp4a(x1 * EXL3_MUL1_MULTIPLIER, 0x01010101u, 0x6400u);
@@ -80,6 +92,11 @@ __device__ __forceinline__ uint32_t mul1_pair(uint32_t x0, uint32_t x1) {
  *  the window starts before the tile -- the tail-biting ring) and the right
  *  shift that puts the fourth state's end at bit 0.  Depends on p0 only, so a
  *  kernel computes it once per lane and reuses it for every tile. */
+/// @tparam K2 the rate in half-bit units (2 x bits per weight).
+/// @param p0 the run's first position in the tile (a multiple of 4; of 8 for run8).
+/// @param lo out: the window's first word index.
+/// @param hi out: the window's second word index.
+/// @param sh out: the right shift.
 template <int K2>
 __device__ __forceinline__ void run4_window(int p0, int &lo, int &hi, int &sh) {
     constexpr int nw = Rate<K2>::words32;
@@ -93,6 +110,10 @@ __device__ __forceinline__ void run4_window(int p0, int &lo, int &hi, int &sh) {
  *  joined and shifted, EXL3_RUN4_JOIN: bit 0 is the fourth state's last stream bit;
  *  stream bit s is in word s/32 at bit 31 - s%32, the layout the header
  *  documents). */
+/// @tparam K2 the rate in half-bit units (2 x bits per weight).
+/// @param v the window value (EXL3_RUN4_JOIN).
+/// @param p0 the run's first position in the tile (a multiple of 4; of 8 for run8).
+/// @param st out: the run's states.
 template <int K2>
 __device__ __forceinline__ void run4_split(uint64_t v, int p0, uint32_t st[4]) {
     const int e3 = exl3_state_end_bit(K2, p0 + 3);
@@ -113,6 +134,8 @@ __device__ __forceinline__ void run4_split(uint64_t v, int p0, uint32_t st[4]) {
  *  B fragment (positions 8t..8t+7) -- from ONE 64-bit window: >= 0 when every such run fits (K2 <= 6 and
  *  K2 == 8; TensorFold's experts_grouped.cuh window table agrees), < 0 when it does not (the run then takes
  *  two run4 windows). */
+/// @param K2 the rate in half-bit units (2 x bits per weight).
+/// @return the least spare bits over every eight-position run start.
 __host__ __device__ constexpr int run8_slack(int K2) {
     int least = 64;
     for (int p0 = 0; p0 < 256; p0 += 8) {
@@ -124,6 +147,11 @@ __host__ __device__ constexpr int run8_slack(int K2) {
 }
 
 /** run4_window for the eight-position run at p0 (p0 % 8 == 0; run8_slack(K2) >= 0). */
+/// @tparam K2 the rate in half-bit units (2 x bits per weight).
+/// @param p0 the run's first position in the tile (a multiple of 4; of 8 for run8).
+/// @param lo out: the window's first word index.
+/// @param hi out: the window's second word index.
+/// @param sh out: the right shift.
 template <int K2>
 __device__ __forceinline__ void run8_window(int p0, int &lo, int &hi, int &sh) {
     static_assert(run8_slack(K2) >= 0, "an eight-position run of this rate does not fit one 64-bit window");
@@ -135,6 +163,10 @@ __device__ __forceinline__ void run8_window(int p0, int &lo, int &hi, int &sh) {
 }
 
 /** The eight states of the run at p0 from its window value (EXL3_RUN4_JOIN with run8_window's shift). */
+/// @tparam K2 the rate in half-bit units (2 x bits per weight).
+/// @param v the window value (EXL3_RUN4_JOIN).
+/// @param p0 the run's first position in the tile (a multiple of 4; of 8 for run8).
+/// @param st out: the run's states.
 template <int K2>
 __device__ __forceinline__ void run8_split(uint64_t v, int p0, uint32_t st[8]) {
     const int e7 = exl3_state_end_bit(K2, p0 + 7);
@@ -143,6 +175,10 @@ __device__ __forceinline__ void run8_split(uint64_t v, int p0, uint32_t st[8]) {
 }
 
 /** The four states of positions p0..p0+3 of one tile, `w` = the tile's words. */
+/// @tparam K2 the rate in half-bit units (2 x bits per weight).
+/// @param w the tile's uint32 words.
+/// @param p0 the run's first position in the tile (a multiple of 4; of 8 for run8).
+/// @param st out: the run's states.
 template <int K2>
 __device__ __forceinline__ void run4(const uint32_t *__restrict__ w, int p0, uint32_t st[4]) {
     int lo, hi, sh;
@@ -154,6 +190,7 @@ __device__ __forceinline__ void run4(const uint32_t *__restrict__ w, int p0, uin
  *  as four consecutive values per lane (lane l holds elements 4l..4l+3): two
  *  in-lane stages, then five xor-shuffle stages (the lane with the bit set
  *  takes a - b, the other a + b).  Full warp required. */
+/// @param v this lane's four values, transformed in place.
 __device__ __forceinline__ void had128(float v[4]) {
     float a, b;
     a = v[0]; b = v[1]; v[0] = a + b; v[1] = a - b;
@@ -174,6 +211,8 @@ __device__ __forceinline__ void had128(float v[4]) {
     for (int j = 0; j < 4; ++j) v[j] *= kInvSqrt128;
 }
 
+/// @param bits an E4M3 byte.
+/// @return its value, f32 (exact).
 __device__ __forceinline__ float e4m3_to_f32(uint8_t bits) {
     return (float)(*reinterpret_cast<const __nv_fp8_e4m3 *>(&bits));
 }

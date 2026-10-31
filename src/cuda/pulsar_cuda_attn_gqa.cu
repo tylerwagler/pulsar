@@ -1,3 +1,5 @@
+/** @file
+ *  The GQA attention block's one implementation: prep, attention, combine, commit (L295 F1). */
 /* GQA attention block (L295 F1).  The contract, the KV row layout and the
  * arithmetic live in pulsar_cuda_attn_gqa.h; this file is the one
  * implementation.  Kernels, in launch order, per call:
@@ -38,71 +40,137 @@
 
 namespace {
 
+/// Keys per split: one 64-key QK / PV tile of the attention kernel.
 constexpr uint32_t GQA_SPLIT        = 64u;    /* keys per split: one QK / PV tile */
+/// Splits per chunk, the unit one partial (m, l, acc) covers.
 constexpr uint32_t GQA_CHUNK_SPLITS = 4u;
+/// Keys per chunk (256), cut at absolute positions: chunk c holds keys [256 c, 256 c + 256).
 constexpr uint32_t GQA_CHUNK        = GQA_SPLIT * GQA_CHUNK_SPLITS;   /* keys per partial */
+/// Warps per attention CTA (128 threads), each owning 16 MMA rows.
 constexpr uint32_t GQA_WARPS        = 4u;
+/// MMA rows per attention CTA: (row, query head) pairs = tile rows x G.
 constexpr uint32_t GQA_MROWS        = 16u * GQA_WARPS;   /* (row, head) pairs per CTA */
+/// Row count at and above which a call takes the folded schedule (no partials, no combine).
 constexpr uint32_t GQA_FOLD_ROWS    = 64u;    /* calls at least this wide fold in the CTA */
+/// Bias distances per warp tile: 64 keys + 15 further rows = 79, rounded up to 10 n8 tiles.
 constexpr uint32_t GQA_BIAS_W       = 80u;    /* distances a warp's bias tile spans: 64 keys + 15 rows */
+/// Widest query group G = n_q / n_kv: one CTA's MMA rows.
 constexpr uint32_t GQA_MAX_GROUP    = GQA_MROWS;
+/// The only built relative-bias r width per head: one m16n8k16 k-step.
 constexpr uint32_t GQA_REL_DIM      = 16u;   /* r width per head: one MMA k-step */
+/// log2(e): logits are scaled into base-2 units so the online softmax runs on exp2f.
 constexpr float    GQA_LOG2E        = 1.4426950408889634f;
 
 static_assert(GQA_SPLIT == 64u, "the warp layout tiles 64 keys: 8 QK n-tiles, 4 PV k-steps");
 
 /* One row of the call. */
+/// One row's device descriptor (48 B), filled by pulsar_gqa_plan; positions are absolute token positions.
 struct gqa_row {
+    /// Device base of the sequence's KV pool (slot = pos, or pos % cap on a ring); NULL for a poolless block run.
     uint8_t *cache;     /* the sequence's pool */
+    /// Absolute position of the row's token.
     uint32_t pos;       /* this row's position */
+    /// First key position attended (0, or pos + 1 - window on a WINDOW span).
     uint32_t lo;        /* the first key it attends */
+    /// Position of the sequence's first row in this call; keys >= p0 come from the fresh rows.
     uint32_t p0;        /* the sequence's first position in this call */
+    /// Call row index holding p0 (key x's fresh row is fresh0 + x - p0).
     uint32_t fresh0;    /* the call row holding p0 */
+    /// Position of the sequence's last row in this call.
     uint32_t p_last;    /* the sequence's last position in this call */
+    /// Pool slots: FULL token capacity, WINDOW ring size.
     uint32_t cap;       /* pool slots */
+    /// 1 on a WINDOW span (slot = pos % cap), else 0.
     uint32_t ring;      /* 1: slot = position % cap */
+    /// The row's first chunk index, lo / GQA_CHUNK.
     uint32_t chunk0;    /* lo / GQA_CHUNK */
+    /// Log-length temperature at pos (gqa_tau), applied to the stored q.
     float    tau;       /* the log-length temperature (1 when the layer declares none) */
+    /// Last key position attended (inclusive).
     uint32_t hi;        /* the last key it attends: its own position, or (a block) its run's last */
 };
 static_assert(sizeof(gqa_row) == 48, "row descriptor");
 
 /* Up to 64 / G consecutive rows of one sequence. */
+/// A query tile: rows row0 .. row0 + n - 1, consecutive rows of one sequence, n <= GQA_MROWS / G.
 struct gqa_tile { uint32_t row0, n; };
+/** @var gqa_tile::row0
+ *  First call row of the tile.
+ *  @var gqa_tile::n
+ *  Rows in the tile. */
 
+/// The attention and combine kernels' argument block (device pointers; strides in elements).
 struct gqa_args {
+    /// Row descriptors, [n_rows].
     const gqa_row        *rows;
+    /// Tile descriptors, [n_tiles]; blockIdx.z indexes them.
     const gqa_tile       *tiles;
+    /// The prepped q (normed, roped, times tau), bf16.
     const __nv_bfloat16  *q;        /* workspace [rows][n_q][HD] */
+    /// The call's own KV rows in the layer's row format; keys at positions >= p0 are read here.
     const uint8_t        *fresh;    /* workspace [rows][token_bytes] */
+    /// Relative-bias r input, element (row, h, i) at r[row * ld_r + h * r_hs + i]; NULL without a bias.
     const __nv_bfloat16  *r;
+    /// r row stride, elements.
     uint64_t              ld_r;
+    /// r head stride, elements.
     uint32_t              r_hs;
+    /// The layer's relative-bias table P, bf16.
     const __nv_bfloat16  *proj;     /* [rel_dim][extent] */
+    /// Bias distances 0 .. extent - 1 (0 beyond); 0 = no bias.
     uint32_t              extent;
+    /// Softmax scale on q . k.
     float                 scale;
+    /// Query heads, KV heads, group G = n_q / n_kv, KV row bytes per token, and the partials' chunk stride.
     uint32_t              n_q, n_kv, G, token_bytes, max_chunks;
+    /// Split schedule: per-chunk unnormalised accumulators, f32 (unused when folding).
     float                *part;     /* split schedule: [rows][n_q][max_chunks][HD] */
+    /// Split schedule: per-chunk (running max in log2 units, softmax denominator).
     float2               *ml;       /*                 [rows][n_q][max_chunks] */
+    /// Output gate input (y *= sigmoid(gate)), element (row, h, d) at gate[row * ld_gate + h * gate_hs + d]; NULL = none.
     const __nv_bfloat16  *gate;
+    /// gate row stride, elements.
     uint64_t              ld_gate;
+    /// gate head stride, elements.
     uint32_t              gate_hs;
+    /// Output bf16, head h of row r at out[r * ld_out + h * HD ..].
     __nv_bfloat16        *out;
+    /// out row stride, elements.
     uint64_t              ld_out;
+    /// Optional f32 copy of the output, [rows][n_q * HD]; NULL in the lane.
     float                *tap;
 };
+
+/** @var gqa_args::n_kv
+ *  KV heads.
+ *  @var gqa_args::G
+ *  Query group width n_q / n_kv.
+ *  @var gqa_args::token_bytes
+ *  KV row bytes per token.
+ *  @var gqa_args::max_chunks
+ *  Chunk stride of part / ml (gqa_max_chunks at the call's context). */
 
 #if !PULSAR_SM80
 /* A packed bf16 pair as the packed fp16 pair of the SAME values: a bf16 has 8 significant bits and fp16 11, so the
  * widening is exact for every value inside fp16's normal range (|x| in [2^-14, 65504]).  The attention's operands sit
  * far inside it (q / k / v peak ~32 in the Nemotron-3.5 encoders, retriever/README.md; P and its lo part are in
  * [0, 1]), and a P lo term small enough to land in fp16's subnormals carries at most 2^-8 of a weight already < 2^-14. */
+/// @param w a packed bf16x2 word.
+/// @return the same two values as a packed fp16x2 word (sm_75 only).
 __device__ __forceinline__ uint32_t gqa_bf2h(uint32_t w) {
     const __half2 h = __floats2half2_rn(__uint_as_float(w << 16), __uint_as_float(w & 0xffff0000u));
     return *reinterpret_cast<const uint32_t *>(&h);
 }
 #endif
 
+/// One m16n8k16 bf16 MMA with f32 accumulate, d += A B (on sm_75 two fp16 m16n8k8 MMAs, exact widening).
+/// @param d the accumulator fragment, updated in place.
+/// @param a0 A fragment register 0.
+/// @param a1 A fragment register 1.
+/// @param a2 A fragment register 2.
+/// @param a3 A fragment register 3.
+/// @param b0 B fragment register 0.
+/// @param b1 B fragment register 1.
 __device__ __forceinline__ void gqa_mma(float (&d)[4], uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3,
                                         uint32_t b0, uint32_t b1) {
 #if PULSAR_SM80
@@ -126,25 +194,42 @@ __device__ __forceinline__ void gqa_mma(float (&d)[4], uint32_t a0, uint32_t a1,
                  : "r"(A2), "r"(A3), "r"(B1));
 #endif
 }
+/// ldmatrix .x4 of four 8x8 b16 tiles from shared memory.
+/// @param r the four fragment registers.
+/// @param p this lane's 16-byte-aligned shared row address.
 __device__ __forceinline__ void gqa_ldsm4(uint32_t (&r)[4], const void *p) {
     const uint32_t a = (uint32_t)__cvta_generic_to_shared(p);
     asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
                  : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(a));
 }
+/// ldmatrix .x4 .trans: as gqa_ldsm4, each 8x8 tile transposed.
+/// @param r the four fragment registers.
+/// @param p this lane's 16-byte-aligned shared row address.
 __device__ __forceinline__ void gqa_ldsm4t(uint32_t (&r)[4], const void *p) {
     const uint32_t a = (uint32_t)__cvta_generic_to_shared(p);
     asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];\n"
                  : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(a));
 }
 /* bf16 bits -> f32 is a left shift */
+/// @param b bf16 bits.
+/// @return the value as f32.
 __device__ __forceinline__ float gqa_bf(uint16_t b) { return __uint_as_float((uint32_t)b << 16); }
+/// @param x an f32 value.
+/// @return x rounded to bf16 (round to nearest even), as f32.
 __device__ __forceinline__ float gqa_round(float x) { return __bfloat162float(__float2bfloat16_rn(x)); }
 /* f32 pair -> packed bf16x2 (first element in the low half) */
+/// @param x0 first value (low half).
+/// @param x1 second value (high half).
+/// @return the bf16x2 word, each rounded to nearest even.
 __device__ __forceinline__ uint32_t gqa_pack(float x0, float x1) {
     const __nv_bfloat162 h = __floats2bfloat162_rn(x0, x1);
     return *reinterpret_cast<const uint32_t *>(&h);
 }
 /* f32 pair -> (hi, lo) bf16x2 words: hi = bf16(x), lo = bf16(x - hi) */
+/// @param x0 first value.
+/// @param x1 second value.
+/// @param hi out: bf16x2 of the rounded values.
+/// @param lo out: bf16x2 of the residuals x - hi.
 __device__ __forceinline__ void gqa_split2(float x0, float x1, uint32_t &hi, uint32_t &lo) {
     const float h0 = gqa_round(x0), h1 = gqa_round(x1);
     hi = gqa_pack(h0, h1);
@@ -152,6 +237,13 @@ __device__ __forceinline__ void gqa_split2(float x0, float x1, uint32_t &hi, uin
 }
 
 /* THE recurrence: fold a reduced block (m, l, a) into a running (M, L, A). */
+/// Online-softmax merge in base 2: M = max(M, m); L and A rescaled by exp2 of the max shifts, then summed.
+/// @param M running max (log2 units), in/out.
+/// @param L running denominator, in/out.
+/// @param A running unnormalised accumulator, in/out.
+/// @param m the block's max.
+/// @param l the block's denominator.
+/// @param a the block's accumulator.
 __device__ __forceinline__ void gqa_fold(float &M, float &L, float &A, float m, float l, float a) {
     const float mn = fmaxf(M, m);
     const float c1 = exp2f(__fsub_rn(M, mn)), c2 = exp2f(__fsub_rn(m, mn));
@@ -160,6 +252,10 @@ __device__ __forceinline__ void gqa_fold(float &M, float &L, float &A, float m, 
     M = mn;
 }
 /* THE epilogue: normalise, times the optional sigmoid gate. */
+/// @param A the folded accumulator.
+/// @param L the folded denominator.
+/// @param gate the (row, head, dim) gate element, or NULL for no gate.
+/// @return A / L, times sigmoid(gate) when gated.
 __device__ __forceinline__ float gqa_epilogue(float A, float L, const __nv_bfloat16 *gate) {
     const float y = __fdiv_rn(A, L);
     if (!gate) return y;
@@ -167,6 +263,9 @@ __device__ __forceinline__ float gqa_epilogue(float A, float L, const __nv_bfloa
     return __fmul_rn(y, __fdiv_rn(1.0f, __fadd_rn(1.0f, __expf(-g))));
 }
 
+/// Butterfly sum over a full warp in a fixed order (every lane gets the same bits).
+/// @param v this lane's value.
+/// @return the warp's sum.
 __device__ __forceinline__ float gqa_warp_sum(float v) {
     #pragma unroll
     for (int o = 16; o > 0; o >>= 1) v = __fadd_rn(v, __shfl_xor_sync(0xffffffffu, v, o));
@@ -174,27 +273,65 @@ __device__ __forceinline__ float gqa_warp_sum(float v) {
 }
 
 /* ---- prep: one warp per head vector ------------------------------------------ */
+/// The prep kernel's argument block (device pointers; strides in elements).
 struct gqa_prep_args {
+    /// Row descriptors (pos and tau are read).
     const gqa_row        *rows;
+    /// The q / k / v projection outputs, bf16 (pulsar_gqa_in.ptr).
     const __nv_bfloat16  *qin, *kin, *vin;
+    /// Row strides of qin / kin / vin, elements.
     uint64_t              ld_q, ld_k, ld_v;
+    /// Head strides of qin / kin / vin, elements.
     uint32_t              hs_q, hs_k, hs_v;
+    /// q and k RMSNorm weights, bf16 [HD].
     const uint16_t       *qw, *kw;    /* NULL: no norm */
+    /// RMSNorm epsilon.
     float                 eps;
+    /// Query heads, KV heads, KV row bytes per token.
     uint32_t              n_q, n_kv, token_bytes;
+    /// Rope base; 0 = no rope.
     float                 rope_theta; /* > 0: the NeoX rotation of q and k at the row's position */
+    /// KV row element format flag.
     uint32_t              e4m3;       /* 1: the KV rows are E4M3 bytes (PULSAR_GQA_KV_E4M3), else bf16 */
+    /// Out: prepped q, bf16 [rows][n_q][HD].
     __nv_bfloat16        *q;          /* workspace */
+    /// Out: the call's KV rows, [rows][token_bytes].
     uint8_t              *fresh;      /* workspace */
 };
+/** @var gqa_prep_args::kin
+ *  The k projection output, bf16.
+ *  @var gqa_prep_args::vin
+ *  The v projection output, bf16.
+ *  @var gqa_prep_args::ld_k
+ *  Row stride, elements.
+ *  @var gqa_prep_args::ld_v
+ *  Row stride, elements.
+ *  @var gqa_prep_args::hs_k
+ *  Head stride, elements.
+ *  @var gqa_prep_args::hs_v
+ *  Head stride, elements.
+ *  @var gqa_prep_args::kw
+ *  k RMSNorm weight, bf16 [HD].
+ *  @var gqa_prep_args::n_kv
+ *  KV heads.
+ *  @var gqa_prep_args::token_bytes
+ *  KV row bytes per token. */
+
 /* L321: a scaled rope's (YaRN) per-pair inverse frequencies ride a DERIVED argument block, so the plain kernel's
  * parameters -- and its code -- are exactly what they were */
+/// gqa_prep_args plus a scaled rope's per-pair inverse frequency table.
 struct gqa_prep_table_args : gqa_prep_args {
+    /// Device f32 [HD / 2]: pair p's inverse frequency (pulsar_gqa_layer::rope_inv_freq).
     const float *rope_inv;
 };
 
 /* A = gqa_prep_args (the plain rope: 1 / theta^(2p/d)) or gqa_prep_table_args (the frequencies from a.rope_inv).
  * A template, not a branch: the plain instantiation is the kernel it was. */
+/// Per row, one warp per head vector: q heads (norm, rope, times tau) into a.q, K heads (norm, rope) and V heads into
+/// the fresh KV rows in the row format.  Grid (n_rows, ceil((n_q + 2 n_kv) / 8)), 256 threads (8 warps = 8 jobs).
+/// @tparam HD head_dim (64 or 128); lane l holds elements l + 32 j.
+/// @tparam A gqa_prep_args or gqa_prep_table_args.
+/// @param a the arguments.
 template <int HD, class A>
 __global__ void __launch_bounds__(256) gqa_prep_kernel(const A a) {
     constexpr bool TABLE = std::is_same<A, gqa_prep_table_args>::value;
@@ -264,6 +401,8 @@ __global__ void __launch_bounds__(256) gqa_prep_kernel(const A a) {
 }
 
 /* 8 E4M3 bytes -> 8 bf16 (exact: an E4M3 value is a half and a bf16 value) as one 16-byte word */
+/// @param v eight E4M3 bytes, element 0 in the low byte of v.x.
+/// @return the eight values as bf16, packed in order.
 __device__ __forceinline__ uint4 gqa_e4m3x8_to_bf16(uint2 v) {
     const uint32_t w[2] = {v.x, v.y};
     uint32_t o[4];
@@ -279,6 +418,15 @@ __device__ __forceinline__ uint4 gqa_e4m3x8_to_bf16(uint2 v) {
 }
 
 /* ---- attention ------------------------------------------------------------------ */
+/// The attention over one tile x KV head g: 64 MMA rows (tile rows x G heads; 4 warps x m16), keys in 64-key splits
+/// staged in static shared memory (K and V, pitch HD + 8 bf16; plus the bias tile when BIAS).  Grid (FOLD ? 1 :
+/// grid_chunks, n_kv, n_tiles), 128 threads.  FOLD: the CTA walks its tile's chunks, folds in registers and writes
+/// out / tap; else CTA x reduces chunk chunk0 + x and writes its (m, l) and accumulator to ml / part.
+/// @tparam HD head_dim (64 or 128).
+/// @tparam BIAS the relative bias is applied.
+/// @tparam FOLD the folded schedule.
+/// @tparam E4 the KV rows are E4M3 (widened to bf16 in the tile loader).
+/// @param a the arguments.
 template <int HD, bool BIAS, bool FOLD, bool E4>
 __global__ void __launch_bounds__(128) gqa_attn_kernel(const gqa_args a) {
     constexpr int P = HD + 8;      /* bf16 smem pitch: 16-byte rows, conflict-free ldmatrix */
@@ -536,6 +684,9 @@ __global__ void __launch_bounds__(128) gqa_attn_kernel(const gqa_args a) {
 }
 
 /* ---- the split schedule's fold: grid (row, query head), thread = dim ------------ */
+/// Folds each (row, query head)'s chunk partials in chunk order and runs the epilogue.  Grid (n_rows, n_q), HD threads.
+/// @tparam HD head_dim; thread d owns output dim d.
+/// @param a the arguments (part, ml, gate, out, tap).
 template <int HD>
 __global__ void __launch_bounds__(HD) gqa_combine_kernel(const gqa_args a) {
     const uint32_t row = blockIdx.x, h = blockIdx.y, d = threadIdx.x;
@@ -554,6 +705,11 @@ __global__ void __launch_bounds__(HD) gqa_combine_kernel(const gqa_args a) {
 }
 
 /* ---- the call's KV rows into the pools ------------------------------------------- */
+/// Copies each fresh KV row to its pool slot (ring: pos % cap; a ring slot a later row of the call takes is skipped).
+/// Grid n_rows, 128 threads, uint4 copies: token_bytes is a multiple of 16 and pools are 16-byte aligned.
+/// @param rows the row descriptors.
+/// @param fresh the call's KV rows, [n_rows][token_bytes].
+/// @param token_bytes bytes per KV row.
 __global__ void __launch_bounds__(128) gqa_commit_kernel(const gqa_row *rows, const uint8_t *fresh, uint32_t token_bytes) {
     const gqa_row R = rows[blockIdx.x];
     if (R.ring && R.pos + R.cap <= R.p_last) return;   /* a later row of this call takes the slot */
@@ -563,19 +719,33 @@ __global__ void __launch_bounds__(128) gqa_commit_kernel(const gqa_row *rows, co
 }
 
 /* ---- workspace geometry: ONE function sizes it and carves it ---------------------- */
+/// The workspace carve (gqa_ws_layout); every region 256-byte aligned.
 struct gqa_ws {
+    /// Row descriptors (pulsar_gqa_launch points this at desc_dev instead).
     gqa_row       *rows;
+    /// Tile descriptors (pulsar_gqa_launch points this at desc_dev instead).
     gqa_tile      *tiles;
+    /// Prepped q, bf16 [n_rows][n_q][head_dim].
     __nv_bfloat16 *q;
+    /// The call's KV rows, [n_rows][token_bytes].
     uint8_t       *fresh;
+    /// Split-schedule accumulators, f32 [n_rows][n_q][max_chunks][head_dim] (empty at >= GQA_FOLD_ROWS rows).
     float         *part;
+    /// Split-schedule (max, denominator), [n_rows][n_q][max_chunks].
     float2        *ml;
+    /// Chunks a row can span at the layout's context (gqa_max_chunks).
     uint32_t       max_chunks;
+    /// Total bytes carved.
     uint64_t       bytes;
 };
 
+/// @param x a byte count.
+/// @return x rounded up to a multiple of 256.
 uint64_t gqa_up(uint64_t x) { return (x + 255u) & ~255ull; }
 
+/// @param L the layer.
+/// @param max_ctx a bound on the call's positions (all < max_ctx).
+/// @return the most chunks one row's key range can touch.
 uint32_t gqa_max_chunks(const pulsar_gqa_layer *L, uint32_t max_ctx) {
     const uint32_t full = (max_ctx + GQA_CHUNK - 1u) / GQA_CHUNK;
     if (L->span != PULSAR_GQA_WINDOW) return full;
@@ -584,6 +754,12 @@ uint32_t gqa_max_chunks(const pulsar_gqa_layer *L, uint32_t max_ctx) {
     return std::min(full, (L->window - 1u + ahead + GQA_CHUNK - 1u) / GQA_CHUNK + 1u);
 }
 
+/// The ONE workspace sizer and carver.
+/// @param base workspace base (256-byte aligned), or NULL to size only (pointers come back NULL).
+/// @param L the layer.
+/// @param n_rows the call's rows (partials are carved only below GQA_FOLD_ROWS).
+/// @param max_ctx the context bound.
+/// @return the carve.
 gqa_ws gqa_ws_layout(uint8_t *base, const pulsar_gqa_layer *L, uint32_t n_rows, uint32_t max_ctx) {
     gqa_ws w{};
     w.max_chunks = gqa_max_chunks(L, max_ctx);
@@ -601,6 +777,9 @@ gqa_ws gqa_ws_layout(uint8_t *base, const pulsar_gqa_layer *L, uint32_t n_rows, 
     return w;
 }
 
+/// Names a refused contract on stderr.
+/// @param why the reason.
+/// @return -1.
 int gqa_refuse(const char *why) {
     fprintf(stderr, "pulsar: gqa attention refused: %s\n", why);
     return -1;
@@ -610,6 +789,9 @@ int gqa_refuse(const char *why) {
  * 1 + alpha * log(max(1, f32(pos + 1) / floor)); the log is taken in double and
  * rounded once (torch's f32 log is within an ulp of it); volatile keeps the
  * product and the sum two roundings. */
+/// @param L the layer (temp_floor, temp_alpha).
+/// @param pos the row's position.
+/// @return the log-length temperature, 1 when the layer declares none.
 float gqa_tau(const pulsar_gqa_layer *L, uint32_t pos) {
     if (L->temp_floor <= 0.f) return 1.0f;
     volatile float ratio = (float)(pos + 1u) / L->temp_floor;
@@ -618,8 +800,21 @@ float gqa_tau(const pulsar_gqa_layer *L, uint32_t pos) {
     return 1.0f + prod;
 }
 
+/// Announces each new launch shape once (rule 5).
 pulsar_shape_once g_gqa_announce;
 
+/// Launches a planned call's kernels on `st`: prep, attention (split or folded), combine (split only), commit (not for a block).
+/// @tparam HD head_dim.
+/// @param L the layer.
+/// @param pa the prep arguments.
+/// @param aa the attention arguments.
+/// @param n_rows rows in the call.
+/// @param n_tiles query tiles.
+/// @param grid_chunks the split schedule's chunk CTAs per (KV head, tile).
+/// @param fold the folded schedule.
+/// @param st the stream.
+/// @param ws the workspace carve (rows, fresh).
+/// @return 0, or -3 on a launch failure.
 template <int HD>
 int gqa_launch(const pulsar_gqa_layer *L, const gqa_prep_args &pa, const gqa_args &aa, uint32_t n_rows,
                uint32_t n_tiles, uint32_t grid_chunks, bool fold, cudaStream_t st, const gqa_ws &ws) {
@@ -655,6 +850,10 @@ int gqa_launch(const pulsar_gqa_layer *L, const gqa_prep_args &pa, const gqa_arg
     return 0;
 }
 
+/// @param in a strided input.
+/// @param heads its head count.
+/// @param width elements per head.
+/// @return true when non-NULL with head and row strides that keep the heads from overlapping.
 bool gqa_in_ok(const pulsar_gqa_in &in, uint32_t heads, uint32_t width) {
     return in.ptr && in.head_stride >= width && in.ld >= (uint64_t)(heads - 1u) * in.head_stride + width;
 }
@@ -679,6 +878,8 @@ uint64_t pulsar_gqa_desc_bytes(uint32_t n_rows) {
 }
 
 /* The layer's declaration, checked by a plan and a launch alike. */
+/// @param L the layer's declaration.
+/// @return 0 when every built tile covers it, else -1 (named on stderr).
 static int gqa_layer_refusal(const pulsar_gqa_layer *L) {
     if (L->n_q == 0 || L->n_kv == 0 || L->n_q % L->n_kv) return gqa_refuse("n_q is not a positive multiple of n_kv");
     if (L->n_q / L->n_kv > GQA_MAX_GROUP) return gqa_refuse("the query group n_q / n_kv is wider than 64 (one CTA's MMA rows)");

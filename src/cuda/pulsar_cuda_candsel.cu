@@ -1,3 +1,5 @@
+/** @file
+ *  The CandidateSelector chain head's kernels: score table and walk (L299). */
 /* CandidateSelector chain head (L299).  The contract is pulsar_cuda_candsel.h. */
 #include "pulsar_cuda_candsel.h"
 
@@ -6,13 +8,29 @@
 
 namespace {
 
+/// @param b bf16 bits.
+/// @return the value as f32 (exact).
 __device__ __forceinline__ float bf(uint16_t b) { return __uint_as_float((uint32_t)b << 16); }
 
+/// Threads per score-table CTA.
 constexpr uint32_t kThreads = 256;
 
 /* The score table: one CTA a (slot, bank) -- the slot's predecessor rows q[i] = pred[p_i] * hp (f32) and its
  * candidates' successor rows (bf16) in shared memory, then every (predecessor, candidate) score.  The slots are
  * independent (slot s's predecessors are slot s - 1's candidates, all of them), so they run side by side. */
+/// Grid (slots, n_banks), kThreads threads, k * rank * 6 B dynamic shared memory (q f32 then su bf16, each [k][rank]).
+/// @param slots slots per bank.
+/// @param k candidates per slot.
+/// @param rank codebook width R.
+/// @param cand candidate ids, [n_banks][slots][k].
+/// @param unary candidate scores, f32 [n_banks][slots][k].
+/// @param hp projected pass rows, bf16 [rank] at hp + (b * hp_bank + s) * hp_ld.
+/// @param hp_bank hp's bank stride, rows.
+/// @param hp_ld hp's row stride, elements.
+/// @param anchor each bank's carry id, [n_banks].
+/// @param pred predecessor codebook, bf16 [vocab][rank].
+/// @param succ successor codebook, bf16 [vocab][rank].
+/// @param scores out: f32 [n_banks][slots][k][k].
 __global__ void __launch_bounds__(kThreads) candsel_scores_kernel(uint32_t slots, uint32_t k, uint32_t rank,
                                                                   const int32_t *__restrict__ cand,
                                                                   const float *__restrict__ unary,
@@ -46,6 +64,14 @@ __global__ void __launch_bounds__(kThreads) candsel_scores_kernel(uint32_t slots
 }
 
 /* The walk: one thread a bank, slot by slot the first maximum of the row the previous slot chose. */
+/// Grid ceil(n_banks / 32), 32 threads, one thread per bank.
+/// @param n_banks banks.
+/// @param slots slots per bank.
+/// @param k candidates per slot.
+/// @param cand candidate ids, [n_banks][slots][k].
+/// @param scores the score table, f32 [n_banks][slots][k][k].
+/// @param chain_ids out: the chosen ids, [n_banks][slots].
+/// @param chain_rows out: the chosen candidate indices, [n_banks][slots].
 __global__ void candsel_walk_kernel(uint32_t n_banks, uint32_t slots, uint32_t k, const int32_t *__restrict__ cand,
                                     const float *__restrict__ scores, int32_t *chain_ids, int32_t *chain_rows) {
     const uint32_t b = blockIdx.x * blockDim.x + threadIdx.x;

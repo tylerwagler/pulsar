@@ -1,3 +1,5 @@
+/** @file
+ *  CSA2 compressor kernels (L218, DeepSeek-V4.1). */
 /* CSA2 compressor kernels (L218, DeepSeek-V4.1).  Their own translation unit so
  * the kernel unit test (tests/csa2_compressor_kernel_test.cu) can #include the
  * shipped code and drive the REAL kernels against a CPU oracle with two runtime
@@ -36,6 +38,8 @@
  * ============================================================================ */
 enum { CSA2_SRC_ROWS = 0, CSA2_SRC_STATE = 1 };
 
+/// @param v a value.
+/// @return v rounded to bf16 (RNE), as f32.
 __device__ __forceinline__ static float csa2_bf16_round(float v) {
     /* RNE, the reference's `.to(bf16)`.  Used ONLY by the ratio-1 projection
      * below, which really is a bf16 Linear in the reference; the pooled path
@@ -43,6 +47,23 @@ __device__ __forceinline__ static float csa2_bf16_round(float v) {
     return __bfloat162float(__float2bfloat16(v));
 }
 
+/// Pools one group's ratio rows (softmax over the scores, per element) into a latent row and RMS-normalises it.
+/// Grid n_groups, 256 threads (head_dim <= 1024).
+/// @tparam NORM_BF16 the norm weight is bf16 (else f32).
+/// @param latent out: f32 [n_groups][head_dim].
+/// @param latent_b out: the same rows as bf16, or NULL.
+/// @param kv SRC_ROWS: the kv rows.
+/// @param sc SRC_ROWS: the score rows (NULL at ratio 1).
+/// @param state_kv SRC_STATE / overlap: the state lane's kv rows.
+/// @param state_sc SRC_STATE / overlap: the state lane's score rows.
+/// @param norm_w the compressor norm weight, [head_dim].
+/// @param head_dim latent width.
+/// @param ratio rows per group.
+/// @param coff 1 (V4.1) or 2 (V4, overlapping groups).
+/// @param n_groups groups emitted.
+/// @param src CSA2_SRC_ROWS or CSA2_SRC_STATE.
+/// @param pos0 SRC_ROWS: the batch's first position.
+/// @param eps RMS epsilon.
 template <bool NORM_BF16>
 __global__ static void csa2_compressor_pool_norm_kernel(
         float *latent,            /* [n_groups][head_dim] out */
@@ -180,6 +201,14 @@ __global__ static void csa2_compressor_pool_norm_kernel(
  * of a parameter they would each have to apply in the same way.
  *
  * Width is coff * head_dim: the ape is as wide as the projection it biases. */
+/// sc[t][d] += ape[(pos0 + t) % ratio][d].  Grid ceil(n_tokens * width / blockDim), any blockDim.
+/// @tparam APE_BF16 the ape is bf16 (else f32).
+/// @param sc the score rows, f32 [n_tokens][width], updated in place.
+/// @param ape the absolute position embedding, [ratio][width].
+/// @param width coff * head_dim.
+/// @param ratio rows per group.
+/// @param pos0 the first token's position.
+/// @param n_tokens rows.
 template <bool APE_BF16>
 __global__ static void csa2_comp_ape_add_kernel(
         float *sc, const void *ape, uint32_t width, uint32_t ratio, uint32_t pos0, uint32_t n_tokens) {
@@ -202,6 +231,18 @@ __global__ static void csa2_comp_ape_add_kernel(
  *                  so a running token stores at slot_base = ratio and the
  *                  prefill's carry stores at slot_base = 0, both of which the
  *                  caller names explicitly rather than the kernel inferring. */
+/// Grid ceil(n_tokens * coff * head_dim / 256), 256 threads, one thread per element.
+/// @param state_kv out: the state lane's kv rows.
+/// @param state_sc out: the state lane's score rows.
+/// @param kv source kv rows, f32 [*][coff * head_dim].
+/// @param sc source score rows, same layout.
+/// @param head_dim head width.
+/// @param ratio rows per group.
+/// @param coff 1 or 2.
+/// @param slot_base the lane's first slot for this store (0, or ratio for coff 2's current half).
+/// @param pos0 the first token's position.
+/// @param src_row0 the first source row.
+/// @param n_tokens rows stored.
 __global__ static void csa2_compressor_store_kernel(
         float *state_kv, float *state_sc,
         const float *kv, const float *sc,
@@ -218,6 +259,15 @@ __global__ static void csa2_compressor_store_kernel(
     state_sc[(uint64_t)slot * width + d] = sc[(uint64_t)(src_row0 + t) * width + d];
 }
 
+/// Checks the compressor norm's declaration and resolves its device bytes.
+/// @param model_map the model mapping.
+/// @param model_size its bytes.
+/// @param norm_offset the norm's offset in it.
+/// @param norm_type PULSAR_TENSOR_F32 or PULSAR_TENSOR_BF16.
+/// @param head_dim the norm's width (1 .. 1024).
+/// @param norm_w out: the norm's device pointer.
+/// @param why out: the refusal's reason, or untouched.
+/// @return true when usable.
 static bool csa2_norm_args_ok(const void *model_map, uint64_t model_size, uint64_t norm_offset,
                               uint32_t norm_type, uint32_t head_dim, const void **norm_w,
                               const char **why) {
@@ -242,6 +292,23 @@ static bool csa2_norm_args_ok(const void *model_map, uint64_t model_size, uint64
     return true;
 }
 
+/// Launches csa2_compressor_pool_norm_kernel at the norm's format (parameters as the kernel's).
+/// @param latent see the kernel.
+/// @param latent_b see the kernel.
+/// @param kv see the kernel.
+/// @param sc see the kernel.
+/// @param state_kv see the kernel.
+/// @param state_sc see the kernel.
+/// @param norm_w see the kernel.
+/// @param norm_bf16 the norm weight is bf16.
+/// @param head_dim see the kernel.
+/// @param ratio see the kernel.
+/// @param coff see the kernel.
+/// @param n_groups see the kernel (0: nothing launched).
+/// @param src see the kernel.
+/// @param pos0 see the kernel.
+/// @param eps see the kernel.
+/// @return 1 on success, 0 on a launch failure.
 static int csa2_pool_norm_launch(float *latent, void *latent_b, const float *kv, const float *sc,
                                  const float *state_kv, const float *state_sc, const void *norm_w,
                                  int norm_bf16, uint32_t head_dim, uint32_t ratio, uint32_t coff,
@@ -264,6 +331,11 @@ static int csa2_pool_norm_launch(float *latent, void *latent_b, const float *kv,
  * plane and no kernel. */
 static int csa2_lane_clear_current(float *state_kv, float *state_sc, uint32_t head_dim, uint32_t ratio);
 
+/// @param state_kv the overlap lane's kv rows, [2 ratio][2 head_dim].
+/// @param state_sc the lane's score rows, same layout.
+/// @param head_dim head width.
+/// @param ratio rows per group.
+/// @return 1 on success, 0 on a CUDA failure.
 static int csa2_overlap_shift(float *state_kv, float *state_sc, uint32_t head_dim, uint32_t ratio) {
     const uint32_t width = 2u * head_dim;
     const size_t bytes = (size_t)ratio * width * sizeof(float);
@@ -284,6 +356,11 @@ static int csa2_overlap_shift(float *state_kv, float *state_sc, uint32_t head_di
 
 /* Reset the overlap lane's CURRENT half (rows ratio..2ratio-1) to the empty
  * value.  The carry half is untouched. */
+/// @param state_kv the overlap lane's kv rows.
+/// @param state_sc the lane's score rows.
+/// @param head_dim head width.
+/// @param ratio rows per group.
+/// @return 1 on success, 0 on a CUDA failure.
 static int csa2_lane_clear_current(float *state_kv, float *state_sc, uint32_t head_dim, uint32_t ratio) {
     const uint32_t width = 2u * head_dim;
     const uint64_t cur_floats = (uint64_t)ratio * width;
@@ -451,6 +528,23 @@ int pulsar_gpu_csa2_compressor_prefill_tensor(
                                  norm_type == PULSAR_TENSOR_BF16, head_dim, ratio, coff, n_groups, CSA2_SRC_ROWS, pos0, rms_eps);
 }
 
+/// The decode step's compressor update: store the token, and at a group's last position pool it into one latent row.
+/// @param latent out: the emitted latent row, f32 [head_dim].
+/// @param latent_b out: its bf16 copy, or NULL.
+/// @param kv_cur the token's kv row, f32 [coff * head_dim].
+/// @param sc_cur the token's score row, same width.
+/// @param state_kv the state lane's kv rows.
+/// @param state_score the state lane's score rows.
+/// @param model_map the model mapping.
+/// @param model_size its bytes.
+/// @param norm_offset the compressor norm's offset.
+/// @param norm_type the norm's tensor type (F32 or BF16).
+/// @param head_dim latent width.
+/// @param ratio rows per group (1: every token emits).
+/// @param pos the token's position.
+/// @param rms_eps RMS epsilon.
+/// @param emitted out: 1 when a latent row was emitted.
+/// @return 1 on success, 0 on a refusal or CUDA failure.
 int pulsar_gpu_csa2_compressor_update_tensor(
         pulsar_gpu_tensor       *latent,
         void                    *latent_b,

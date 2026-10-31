@@ -1,3 +1,5 @@
+/** @file
+ *  MMQ activation staging: gathers the producer's E4M3 rows and ue8m0 scales into block_mx_act_mmq (no encode). */
 /* MMQ activation staging in E4M3 + ue8m0.
  *
  * The routed-expert MMQ GEMMs read block_mx_act_mmq: qs[] holds E4M3 bit
@@ -22,6 +24,21 @@
  * assume.  The only thing that changes between source and destination is WHERE
  * the scale byte lives: the cache keeps it in the pulsar_mx_sfoff swizzle, this
  * container wants it widened into d4[] as a float. */
+/// Grid (ne1, ceil(ne0 / 512), ne2 ne3), DS4_ACT_QUANT_BLOCK threads; one thread per four values.
+/// @tparam scatter one source row per token written to each of its n_expert_used slots (else a gather by ids).
+/// @param src_q the cache's E4M3 rows, [rows][ne00].
+/// @param src_sf their ue8m0 plane (pulsar_mx_sfoff).
+/// @param src_kbp the plane's blocks per row.
+/// @param ids the routes, i32 [n_tokens][n_expert_used].
+/// @param vy out: the block_mx_act_mmq staging.
+/// @param ne00 source row width (a multiple of 4).
+/// @param s01 unused (upstream stride).
+/// @param s02 unused (upstream stride).
+/// @param s03 unused (upstream stride).
+/// @param ne0 staged row width (a multiple of 128; zero-filled past ne00).
+/// @param ne1 staged columns.
+/// @param ne2 unused.
+/// @param n_expert_used experts per token.
 template <bool scatter>
 static __global__ void ds4_gather_mmq_e4m3(
         const uint8_t * __restrict__ src_q, const uint8_t * __restrict__ src_sf,

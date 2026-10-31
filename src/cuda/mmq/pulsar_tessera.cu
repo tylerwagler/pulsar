@@ -1,3 +1,5 @@
+/** @file
+ *  Host side of Tessera's vendored fused window kernel, value (BF16, folded) family (L255). */
 /* pulsar_tessera.cu -- the host side of Tessera's fused window kernel, value (BF16, folded) family (L255).
  *
  * Made with Tessera by Robert Tand - https://github.com/RobTand/tessera
@@ -14,14 +16,27 @@
 
 namespace {
 
+/// Sticky failure flag of the current launch call: cleared by pulsar_tessera_moe_launch, set by the host hooks
+/// below (TESSERA_HOST_CUDA / _CHECK / _REFUSE_PAIR) when the vendored header reports a CUDA error or a refusal.
 bool g_host_failed = false;   // set by the vendored header's host hooks during one launch call
 
+/** TESSERA_HOST_CUDA's body (replaces upstream's C10_CUDA_CHECK): names a failed CUDA call on stderr and sets
+ *  g_host_failed.
+ *  @param e     the call's result (cudaSuccess is a no-op)
+ *  @param what  the call's source text, for the message */
 void tessera_host_cuda(cudaError_t e, const char *what) {
     if (e == cudaSuccess) return;
     fprintf(stderr, "pulsar: tessera: %s: %s\n", what, cudaGetErrorString(e));
     g_host_failed = true;
 }
 
+/** TESSERA_HOST_REFUSE_PAIR's body (replaces upstream's final TORCH_CHECK(false) in launch): the launch's
+ *  template instance does not decode the run pair the weight's tile_words fixes; names it and sets g_host_failed.
+ *  @param mode        launch mode (2 = down / dense, else gate / up)
+ *  @param r_lo        the lower run rate of the pair
+ *  @param two         true: two runs, false: one run
+ *  @param tile_words  the weight's 32-bit words per tile
+ *  @param K           the projection's input width */
 void tessera_host_refuse_pair(int mode, int r_lo, bool two, int tile_words, int K) {
     fprintf(stderr, "pulsar: tessera: the %s launch does not decode the run pair (r_lo %d, %s) that tile_words %d "
                     "fixes at K %d -- refusing\n",
@@ -31,6 +46,9 @@ void tessera_host_refuse_pair(int mode, int r_lo, bool two, int tile_words, int 
 
 /* upstream's TORCH_CHECK(cond, msg) in launch (the piece-major guards, 37742e0f): a false condition refuses the
  * launch the same way -- the value family never sets piece_major, so these never fire here */
+/** TESSERA_HOST_CHECK's body: refuse (message on stderr, g_host_failed set) when `ok` is false.
+ *  @param ok   the checked condition
+ *  @param msg  upstream's TORCH_CHECK message */
 void tessera_host_check(bool ok, const char *msg) {
     if (ok) return;
     fprintf(stderr, "pulsar: tessera: %s -- refusing\n", msg);
@@ -39,9 +57,13 @@ void tessera_host_check(bool ok, const char *msg) {
 
 } // namespace
 
+/// Builds the vendored header's value (BF16) family only: no E4M3 family (the Qwen lane's activations are BF16).
 #define TESSERA_ROUTED_FUSED_FP8 0
+/// The vendored header's CUDA-check hook (upstream C10_CUDA_CHECK): tessera_host_cuda.
 #define TESSERA_HOST_CUDA(expr) tessera_host_cuda((expr), #expr)
+/// The vendored header's TORCH_CHECK hook: tessera_host_check.
 #define TESSERA_HOST_CHECK(cond, msg) tessera_host_check((cond), (msg))
+/// The vendored header's run-pair refusal hook: tessera_host_refuse_pair.
 #define TESSERA_HOST_REFUSE_PAIR(mode, r_lo, two, tile_words, K) tessera_host_refuse_pair((mode), (r_lo), (two), (tile_words), (K))
 /* nvcc #549-D "cm_nxt is used before its value is set" fires inside the vendored header (upstream 37742e0f
  * routed_fused_window.cu, the producer loop's advance_micro; present since 1381c3b7): the last chunk's advance
@@ -56,9 +78,13 @@ void tessera_host_check(bool ok, const char *msg) {
 
 namespace {
 
+/// Threads per block of route_count_kernel and route_place_kernel.
 constexpr int kRouteThreads = 256;
+/// Threads of route_scan_kernel's single block; also the largest expert count E the MoE launch accepts.
 constexpr int kScanThreads = 1024;   // one block scans every expert: E <= kScanThreads
 
+/** The current device's SM count, queried once and cached (the persistent grid size the launches pass).
+ *  @return SMs, or 0 if the query failed */
 int sm_count() {
     static int sms = 0;
     if (!sms) {
@@ -70,6 +96,8 @@ int sm_count() {
     return sms;
 }
 
+/** The current device's opt-in dynamic shared-memory limit (vendored max_dynamic_smem_bytes), cached.
+ *  @return bytes, or 0 if the device query failed */
 int max_smem() {
     static int v = -1;
     if (v < 0) {
@@ -79,10 +107,16 @@ int max_smem() {
     return v;
 }
 
+/** @param p  a pointer
+ *  @return true when p is 16-byte aligned */
 bool aligned16(const void *p) { return ((uintptr_t)p & 15u) == 0; }
 
 /* The checks upstream's host entries make on one projection (``check_words``, ``check_run_tables``, the
  * tile_words range, ``check_slot``), plus the tile geometry the kernel assumes (N a multiple of BN). */
+/** @param w     the projection's planes and geometry
+ *  @param mode  launch mode the projection runs in (0 gate / up, 2 down / dense): picks the smem_bytes size checked
+ *  @param name  the projection's name for the refusal message
+ *  @return true when every check passes; false after naming the first failure on stderr */
 bool proj_ok(const pulsar_tessera_proj *w, int mode, const char *name) {
     const char *why = nullptr;
     if (!w || !w->words || !w->table || !w->init || !w->has_init || !w->wscale || !w->runs || !w->bdesc)
@@ -107,15 +141,43 @@ bool proj_ok(const pulsar_tessera_proj *w, int mode, const char *name) {
     return false;
 }
 
+/** @param v  a byte offset
+ *  @return v rounded up to a multiple of 256 */
 size_t align256(size_t v) { return (v + 255) & ~(size_t)255; }
 
 /* The layout of one call's workspace; ``base`` null sizes it. */
+/// Device pointers into one MoE call's workspace (moe_ws_layout), each region 256-byte aligned.
+/// E = experts, P = T * top_k routes, I = intermediate width, H = hidden width.
 struct MoeWs {
+    /** @var MoeWs::counts
+     *  [E] routes per expert */
+    /** @var MoeWs::offsets
+     *  [E + 1] exclusive prefix of counts */
+    /** @var MoeWs::item_off
+     *  [E + 1] exclusive prefix of ceil(counts / BM): BM-route superblocks per expert */
+    /** @var MoeWs::flat_sorted
+     *  [P] route indices sorted by expert, stable */
+    /** @var MoeWs::counters
+     *  [2] the kernel's work-claim counters (slot 0 gate / up, slot 1 down), zeroed per call */
     int32_t *counts, *offsets, *item_off, *flat_sorted, *counters;
+    /// [P] route weights in flat_sorted order
     float *rw_sorted;
+    /** @var MoeWs::act
+     *  [P][I] bf16 SwiGLU output, route-sorted (the down's input) */
+    /** @var MoeWs::routed
+     *  [P][H] bf16 weighted down output in route order (token t's top_k rows from t * top_k),
+     *  summed by token_sum_kernel */
     uint16_t *act, *routed;
 };
 
+/** Lay out (or, with base null, size) one MoE call's workspace.
+ *  @param base  workspace start (device), or null to size only
+ *  @param E     experts
+ *  @param P     routes (T * top_k)
+ *  @param I     intermediate width (gate / up N)
+ *  @param H     hidden width (gate K, down N)
+ *  @param o     receives the region pointers (null when base is null), may be null
+ *  @return bytes used */
 size_t moe_ws_layout(uint8_t *base, int E, long P, int I, int H, MoeWs *o) {
     size_t used = 0;
     auto take = [&](size_t bytes) -> void * {
@@ -137,6 +199,11 @@ size_t moe_ws_layout(uint8_t *base, int E, long P, int I, int H, MoeWs *o) {
 }
 
 /* counts[e] = routes to expert e.  An id outside [0, E) is an impossible router output: trap. */
+/** @param ids     [P] expert ids (device)
+ *  @param P       routes
+ *  @param E       experts
+ *  @param counts  [E] zeroed by the caller; incremented atomically
+ *  Launch: ceil(P / kRouteThreads) blocks of kRouteThreads. */
 __global__ void route_count_kernel(const int32_t *__restrict__ ids, long P, int E, int32_t *__restrict__ counts) {
     const long p = (long)blockIdx.x * blockDim.x + threadIdx.x;
     if (p >= P) return;
@@ -147,6 +214,11 @@ __global__ void route_count_kernel(const int32_t *__restrict__ ids, long P, int 
 
 /* offsets = exclusive prefix of counts, item_off = exclusive prefix of ceil(counts / BM) -- upstream's two
  * cumsums (``_routing``).  One block; each thread owns one expert (E <= kScanThreads). */
+/** @param counts    [E] routes per expert
+ *  @param E         experts (<= kScanThreads)
+ *  @param offsets   [E + 1] out
+ *  @param item_off  [E + 1] out
+ *  Launch: 1 block of kScanThreads. */
 __global__ void __launch_bounds__(kScanThreads) route_scan_kernel(const int32_t *__restrict__ counts, int E,
                                                                    int32_t *__restrict__ offsets,
                                                                    int32_t *__restrict__ item_off) {
@@ -184,6 +256,13 @@ __global__ void __launch_bounds__(kScanThreads) route_scan_kernel(const int32_t 
 /* The stable argsort of the flattened ids (``torch.argsort(ids, stable=True)``): expert e's routes land at
  * offsets[e] .. offsets[e + 1] in route order.  One block per expert walks every route in order, ranking its
  * own with warp ballots, so the order is exactly upstream's.  rw_sorted follows (``weights[order]``). */
+/** @param ids          [P] expert ids
+ *  @param weights      [P] route weights
+ *  @param P            routes
+ *  @param offsets      [E + 1] from route_scan_kernel
+ *  @param flat_sorted  [P] out: route index p at its sorted slot
+ *  @param rw_sorted    [P] out: weights[p] at the same slot
+ *  Launch: E blocks (one per expert) of kRouteThreads. */
 __global__ void __launch_bounds__(kRouteThreads) route_place_kernel(const int32_t *__restrict__ ids,
                                                                      const float *__restrict__ weights, long P,
                                                                      const int32_t *__restrict__ offsets,
@@ -215,6 +294,13 @@ __global__ void __launch_bounds__(kRouteThreads) route_place_kernel(const int32_
     }
 }
 
+/** Rule-5 announcement of the lane, printed once per entry point on its first call.
+ *  @param what     "dense" or "moe"
+ *  @param N        output width (moe: H)
+ *  @param K        input width (moe: I)
+ *  @param E        experts (dense: 1)
+ *  @param extra_a  dense: M rows; moe: T tokens
+ *  @param extra_b  dense: the split-K count; moe: top_k */
 void announce(const char *what, int N, int K, int E, int extra_a, int extra_b) {
     fprintf(stderr, "pulsar: L255 tessera %s = Tessera fused window kernel (value family, folded bf16), "
                     "N %d K %d E %d (%d, %d)\n", what, N, K, E, extra_a, extra_b);

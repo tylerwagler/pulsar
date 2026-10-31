@@ -1,9 +1,12 @@
+/** @file
+ *  DeepSeek attention front doors: prefill, decode and indexed (sparse) attention over the raw / mixed KV rows. */
 #include "pulsar_cuda_internal.h"
 
 /* L189: every precondition refusal names the predicate that failed and the
  * values it saw.  The bounds checks below used to be one compound `if (... ||
  * ...) return 0;` -- a 0 the driver reads as a generic launch failure, which
  * is the class that cost three days on L032 (attn_f16.cu, the comp_cap check). */
+/// Refuses the enclosing launcher (return 0) when `cond` is false, naming `what`, the predicate and the values.
 #define ATTN_REQUIRE(what, cond, fmt, ...)                                              \
     do {                                                                                \
         if (!(cond)) {                                                                  \
@@ -59,6 +62,10 @@
  * co-schedule.  positions == NULL && seq_id == NULL degenerates to the
  * classic single-cache scalar path bit-exactly. */
 
+/// Sorts each token's 512 top-k indices ascending (bitonic).  Grid n_tokens, 512 threads.
+/// @param dst out: sorted indices, i32 [n_tokens][512].
+/// @param src the top-k indices, i32 [n_tokens][512].
+/// @param n_tokens query rows.
 __global__ static void indexed_topk_sort_512_asc_kernel(
         int32_t *dst,
         const int32_t *src,
@@ -185,6 +192,40 @@ int pulsar_gpu_attention_prefill_raw_heads_mx_tensor(pulsar_gpu_tensor *heads, c
     return 0;
 }
 
+/// The batched decode / indexed launcher's checks and dispatch to the fp16 kernel (scalar or banked mode).
+/// @param heads out: the attention output heads, [n_tokens][n_head][head_dim] (stored heads type).
+/// @param model_map the model mapping (sinks are read from it).
+/// @param model_size bytes of model_map.
+/// @param sinks_offset offset of the layer's f32 attention sinks [n_head] in the mapping.
+/// @param q the queries, [n_tokens][n_head][head_dim] (stored Q type; raw when q_prep is non-NULL).
+/// @param raw_kv the raw KV rows (ring, chunk pack buffer or banked pools; the profile's row family).
+/// @param comp_kv the compressed KV rows (MAIN or UNIFIED rows); unused when n_comp == 0.
+/// @param non_causal nonzero: every ring row up to the last is visible (the drafter's raw-window forward).
+/// @param n_tokens query rows.
+/// @param pos0 the first row's position (scalar mode).
+/// @param n_raw raw rows visible (scalar mode; ignored in banked mode).
+/// @param raw_cap raw ring capacity per bank, rows.
+/// @param raw_start the ring slot of the oldest visible raw row (scalar mode; ignored in banked mode).
+/// @param n_comp compressed rows (banked mode: the cross-bank superset clamp).
+/// @param window the sliding window, rows (banked mode: 1 .. PULSAR_CUDA_ATTENTION_RAW_SCORE_CAP).
+/// @param ratio compression ratio (positions per compressed row).
+/// @param n_head query heads.
+/// @param head_dim head width (512).
+/// @param positions per-row absolute positions, i32 [n_tokens], or NULL.
+/// @param seq_id per-row bank ids, i32 [n_tokens], or NULL (both or neither with positions).
+/// @param comp_bank_ptrs optional per-bank compressed-pool base table (banked mode), or NULL.
+/// @param comp_cap compressed rows per bank (banked mode).
+/// @param n_banks banks in the pools (banked mode).
+/// @param q_prep the fused Q rope descriptor, or NULL when q is already roped.
+/// @param vis_left image-span visibility to the left, i32 [n_tokens], or NULL (text).
+/// @param vis_right image-span visibility to the right, i32 [n_tokens], or NULL (text).
+/// @param gact_data grouped E4M3 data slots for the attn-output "a" GEMM, or NULL (no emission).
+/// @param gact_scale the grouped E8M0 scale slab.
+/// @param gact_kbp the scale slab's padded k-block pitch.
+/// @param gact_slab bytes between groups' scale slabs.
+/// @param n_groups output groups of the "a" GEMM.
+/// @param n_nope head dims before the rope tail (the epilogue encodes these).
+/// @return 1 on success, 0 on a refusal (named on stderr) or a failure.
 static int attention_decode_batch_launch(
         pulsar_gpu_tensor       *heads,
         const void             *model_map,
@@ -360,6 +401,22 @@ static int attention_decode_batch_launch(
     return 0;
 }
 
+/// Prefill attention over the chunk's raw window (no emission).
+/// @param heads out: the attention output heads, [n_tokens][n_head][head_dim] (stored heads type).
+/// @param model_map the model mapping (sinks are read from it).
+/// @param model_size bytes of model_map.
+/// @param sinks_offset offset of the layer's f32 attention sinks [n_head] in the mapping.
+/// @param q the queries, [n_tokens][n_head][head_dim] (stored Q type; raw when q_prep is non-NULL).
+/// @param raw_kv the raw KV rows (ring, chunk pack buffer or banked pools; the profile's row family).
+/// @param n_tokens query rows.
+/// @param window the sliding window, rows (banked mode: 1 .. PULSAR_CUDA_ATTENTION_RAW_SCORE_CAP).
+/// @param n_head query heads.
+/// @param head_dim head width (512).
+/// @param positions per-row absolute positions, i32 [n_tokens], or NULL.
+/// @param q_prep the fused Q rope descriptor, or NULL when q is already roped.
+/// @param vis_left image-span visibility to the left, i32 [n_tokens], or NULL (text).
+/// @param vis_right image-span visibility to the right, i32 [n_tokens], or NULL (text).
+/// @return 1 on success, 0 on a refusal (named on stderr) or a failure.
 int pulsar_gpu_attention_prefill_raw_heads_tensor(pulsar_gpu_tensor *heads, const void *model_map, uint64_t model_size, uint64_t sinks_offset, const pulsar_gpu_tensor *q, const pulsar_gpu_tensor *raw_kv, uint32_t n_tokens, uint32_t window, uint32_t n_head, uint32_t head_dim,
         const pulsar_gpu_tensor *positions, const pulsar_gpu_q_prep *q_prep,
         const pulsar_gpu_tensor *vis_left, const pulsar_gpu_tensor *vis_right) {
@@ -399,6 +456,32 @@ int pulsar_gpu_attention_decode_raw_batch_heads_tensor(
                                       q_prep, vis_left, vis_right, NULL, NULL, 0, 0u, 0u, 0u);
 }
 
+/// Batched decode attention over raw and compressed rows (the visible compressed prefix).
+/// @param heads out: the attention output heads, [n_tokens][n_head][head_dim] (stored heads type).
+/// @param model_map the model mapping (sinks are read from it).
+/// @param model_size bytes of model_map.
+/// @param sinks_offset offset of the layer's f32 attention sinks [n_head] in the mapping.
+/// @param q the queries, [n_tokens][n_head][head_dim] (stored Q type; raw when q_prep is non-NULL).
+/// @param raw_kv the raw KV rows (ring, chunk pack buffer or banked pools; the profile's row family).
+/// @param comp_kv the compressed KV rows (MAIN or UNIFIED rows); unused when n_comp == 0.
+/// @param n_tokens query rows.
+/// @param pos0 the first row's position (scalar mode).
+/// @param n_raw raw rows visible (scalar mode; ignored in banked mode).
+/// @param raw_cap raw ring capacity per bank, rows.
+/// @param raw_start the ring slot of the oldest visible raw row (scalar mode; ignored in banked mode).
+/// @param n_comp compressed rows (banked mode: the cross-bank superset clamp).
+/// @param window the sliding window, rows (banked mode: 1 .. PULSAR_CUDA_ATTENTION_RAW_SCORE_CAP).
+/// @param ratio compression ratio (positions per compressed row).
+/// @param n_head query heads.
+/// @param head_dim head width (512).
+/// @param non_causal nonzero: every ring row up to the last is visible (the drafter's raw-window forward).
+/// @param positions per-row absolute positions, i32 [n_tokens], or NULL.
+/// @param seq_id per-row bank ids, i32 [n_tokens], or NULL (both or neither with positions).
+/// @param comp_bank_ptrs optional per-bank compressed-pool base table (banked mode), or NULL.
+/// @param comp_cap compressed rows per bank (banked mode).
+/// @param n_banks banks in the pools (banked mode).
+/// @param q_prep the fused Q rope descriptor, or NULL when q is already roped.
+/// @return 1 on success, 0 on a refusal (named on stderr) or a failure.
 int pulsar_gpu_attention_decode_mixed_batch_heads_tensor(
         pulsar_gpu_tensor       *heads,
         const void             *model_map,
@@ -469,6 +552,35 @@ int pulsar_gpu_attention_decode_mixed_batch_heads_mx_tensor(
                                       n_groups, n_nope);
 }
 
+/// Batched attention over raw rows and each query's top-k compressed rows.
+/// @param heads out: the attention output heads, [n_tokens][n_head][head_dim] (stored heads type).
+/// @param model_map the model mapping (sinks are read from it).
+/// @param model_size bytes of model_map.
+/// @param sinks_offset offset of the layer's f32 attention sinks [n_head] in the mapping.
+/// @param q the queries, [n_tokens][n_head][head_dim] (stored Q type; raw when q_prep is non-NULL).
+/// @param raw_kv the raw KV rows (ring, chunk pack buffer or banked pools; the profile's row family).
+/// @param comp_kv the compressed KV rows (MAIN or UNIFIED rows); unused when n_comp == 0.
+/// @param topk per-token top-k compressed row indices, i32 [n_tokens][top_k], or NULL (the visible prefix).
+/// @param n_tokens query rows.
+/// @param pos0 the first row's position (scalar mode).
+/// @param n_raw raw rows visible (scalar mode; ignored in banked mode).
+/// @param raw_cap raw ring capacity per bank, rows.
+/// @param raw_start the ring slot of the oldest visible raw row (scalar mode; ignored in banked mode).
+/// @param n_comp compressed rows (banked mode: the cross-bank superset clamp).
+/// @param top_k compressed rows each query selects.
+/// @param window the sliding window, rows (banked mode: 1 .. PULSAR_CUDA_ATTENTION_RAW_SCORE_CAP).
+/// @param ratio compression ratio (positions per compressed row).
+/// @param n_head query heads.
+/// @param head_dim head width (512).
+/// @param positions per-row absolute positions, i32 [n_tokens], or NULL.
+/// @param seq_id per-row bank ids, i32 [n_tokens], or NULL (both or neither with positions).
+/// @param comp_bank_ptrs optional per-bank compressed-pool base table (banked mode), or NULL.
+/// @param comp_cap compressed rows per bank (banked mode).
+/// @param n_banks banks in the pools (banked mode).
+/// @param q_prep the fused Q rope descriptor, or NULL when q is already roped.
+/// @param vis_left image-span visibility to the left, i32 [n_tokens], or NULL (text).
+/// @param vis_right image-span visibility to the right, i32 [n_tokens], or NULL (text).
+/// @return 1 on success, 0 on a refusal (named on stderr) or a failure.
 int pulsar_gpu_attention_indexed_mixed_batch_heads_tensor(
         pulsar_gpu_tensor       *heads,
         const void             *model_map,
@@ -690,6 +802,31 @@ int pulsar_gpu_attention_indexed_mixed_batch_heads_mx_tensor(
     return 0;
 }
 
+/// The static-mixed prefill launcher's checks and dispatch to the fp16 kernel.
+/// @param heads out: the attention output heads, [n_tokens][n_head][head_dim] (stored heads type).
+/// @param model_map the model mapping (sinks are read from it).
+/// @param model_size bytes of model_map.
+/// @param sinks_offset offset of the layer's f32 attention sinks [n_head] in the mapping.
+/// @param q the queries, [n_tokens][n_head][head_dim] (stored Q type; raw when q_prep is non-NULL).
+/// @param raw_kv the raw KV rows (ring, chunk pack buffer or banked pools; the profile's row family).
+/// @param comp_kv the compressed KV rows (MAIN or UNIFIED rows); unused when n_comp == 0.
+/// @param gact_data grouped E4M3 data slots for the attn-output "a" GEMM, or NULL (no emission).
+/// @param gact_scale the grouped E8M0 scale slab.
+/// @param gact_kbp the scale slab's padded k-block pitch.
+/// @param gact_slab bytes between groups' scale slabs.
+/// @param n_groups output groups of the "a" GEMM.
+/// @param n_nope head dims before the rope tail (the epilogue encodes these).
+/// @param mx_out out: 1 when the grouped E4M3 encoding was written, else 0 (may be NULL).
+/// @param n_tokens query rows.
+/// @param n_comp compressed rows (banked mode: the cross-bank superset clamp).
+/// @param window the sliding window, rows (banked mode: 1 .. PULSAR_CUDA_ATTENTION_RAW_SCORE_CAP).
+/// @param ratio compression ratio (positions per compressed row).
+/// @param n_head query heads.
+/// @param head_dim head width (512).
+/// @param q_prep the fused Q rope descriptor, or NULL when q is already roped.
+/// @param vis_left image-span visibility to the left, i32 [n_tokens], or NULL (text).
+/// @param vis_right image-span visibility to the right, i32 [n_tokens], or NULL (text).
+/// @return 1 on success, 0 on a refusal (named on stderr) or a failure.
 static int attention_prefill_mixed_launch(
         pulsar_gpu_tensor       *heads,
         const void             *model_map,
@@ -804,6 +941,31 @@ static int attention_prefill_mixed_launch(
     return 0;
 }
 
+/// Prefill attention over the raw window and every visible compressed row.
+/// @param heads out: the attention output heads, [n_tokens][n_head][head_dim] (stored heads type).
+/// @param model_map the model mapping (sinks are read from it).
+/// @param model_size bytes of model_map.
+/// @param sinks_offset offset of the layer's f32 attention sinks [n_head] in the mapping.
+/// @param q the queries, [n_tokens][n_head][head_dim] (stored Q type; raw when q_prep is non-NULL).
+/// @param raw_kv the raw KV rows (ring, chunk pack buffer or banked pools; the profile's row family).
+/// @param comp_kv the compressed KV rows (MAIN or UNIFIED rows); unused when n_comp == 0.
+/// @param gact_data grouped E4M3 data slots for the attn-output "a" GEMM, or NULL (no emission).
+/// @param gact_scale the grouped E8M0 scale slab.
+/// @param gact_kbp the scale slab's padded k-block pitch.
+/// @param gact_slab bytes between groups' scale slabs.
+/// @param n_groups output groups of the "a" GEMM.
+/// @param n_nope head dims before the rope tail (the epilogue encodes these).
+/// @param mx_out out: 1 when the grouped E4M3 encoding was written, else 0 (may be NULL).
+/// @param n_tokens query rows.
+/// @param n_comp compressed rows (banked mode: the cross-bank superset clamp).
+/// @param window the sliding window, rows (banked mode: 1 .. PULSAR_CUDA_ATTENTION_RAW_SCORE_CAP).
+/// @param ratio compression ratio (positions per compressed row).
+/// @param n_head query heads.
+/// @param head_dim head width (512).
+/// @param q_prep the fused Q rope descriptor, or NULL when q is already roped.
+/// @param vis_left image-span visibility to the left, i32 [n_tokens], or NULL (text).
+/// @param vis_right image-span visibility to the right, i32 [n_tokens], or NULL (text).
+/// @return 1 on success, 0 on a refusal (named on stderr) or a failure.
 int pulsar_gpu_attention_prefill_static_mixed_heads_tensor(
         pulsar_gpu_tensor       *heads,
         const void             *model_map,

@@ -1,3 +1,5 @@
+/** @file
+ *  The DSpark drafter's kernels: Markov steps and chains (single and banked), confidence score, concat seeds. */
 #include "pulsar_cuda_internal.h"
 #include "pulsar_cuda_mx.cuh"   /* L158: pulsar_mx_emit_block for the producer-side E4M3 concat */
 
@@ -37,11 +39,24 @@
 /* (value, id) argmax merge: the lower id wins an exact tie.  Used at EVERY level
  * -- per thread, the in-block tree, the cross-block reduce -- so the result is
  * the sequential "first maximum" for any thread -> vocab mapping. */
+/// Merges (v, id) into the running argmax; the lower id wins an exact tie.
+/// @param best_val the running best value, in/out.
+/// @param best_id the running best id, in/out.
+/// @param v a candidate value.
+/// @param id its id.
 __device__ static inline void dspark_argmax_merge(float *best_val, int32_t *best_id,
                                                   float v, int32_t id) {
     if (v > *best_val || (v == *best_val && id < *best_id)) { *best_val = v; *best_id = id; }
 }
 
+/// Loads markov_w2[i][v0 .. v0 + 3] as f32.
+/// @tparam W2FMT markov_w2's PULSAR_MARKOV_W2_* storage.
+/// @param w2 markov_w2 (k-major).
+/// @param vocab_size vocabulary rows (a multiple of 4; of 32 for MXFP8 w2).
+/// @param embed_dim the Markov embedding width.
+/// @param i the embedding index.
+/// @param v0 the first of four consecutive vocab ids (4-aligned).
+/// @param out out: the four values.
 template <int W2FMT>
 __device__ __forceinline__ static void dspark_w2_load4(const void *w2, uint32_t vocab_size, uint32_t embed_dim,
                                                        uint32_t i, uint32_t v0, float out[4]) {
@@ -75,6 +90,10 @@ __device__ __forceinline__ static void dspark_w2_load4(const void *w2, uint32_t 
     }
 }
 /* Bytes of a markov_w2 blob in each storage; 0 = unknown format (refuse). */
+/// @param w2_fmt a PULSAR_MARKOV_W2_* storage.
+/// @param vocab_size vocabulary rows (a multiple of 4; of 32 for MXFP8 w2).
+/// @param embed_dim the Markov embedding width.
+/// @return the blob's bytes, or 0 for an unknown format (MXFP8 also needs vocab_size % 32 == 0).
 static uint64_t dspark_markov_w2_bytes(int w2_fmt, uint32_t vocab_size, uint32_t embed_dim) {
     const uint64_t n = (uint64_t)vocab_size * embed_dim;
     switch (w2_fmt) {
@@ -84,6 +103,15 @@ static uint64_t dspark_markov_w2_bytes(int w2_fmt, uint32_t vocab_size, uint32_t
     default: return 0;
     }
 }
+/** @def PULSAR_MARKOV_LAUNCH(A, B)
+ *  In the single-bank step: launches `dspark_markov_step_kernel<A, B>` over its operands. */
+/** @def PULSAR_CONF_LAUNCH(A, B)
+ *  In pulsar_gpu_dspark_confidence_score_model: launches `dspark_confidence_score_kernel<A, B>`. */
+/** @def PULSAR_MARKOV_BANKS_LAUNCH(A, B)
+ *  In dspark_markov_banks_launch: grants `dspark_markov_step_banks_kernel<A, B>` its shared memory once, then
+ *  launches it. */
+
+/// Invokes LAUNCH(A, fmt) for the runtime w2_fmt; returns 0 from the enclosing function on an unknown format.
 #define PULSAR_MARKOV_DISPATCH(LAUNCH, A)                                       \
     switch (w2_fmt) {                                                           \
     case PULSAR_MARKOV_W2_F32:   LAUNCH(A, PULSAR_MARKOV_W2_F32);   break;      \
@@ -92,6 +120,19 @@ static uint64_t dspark_markov_w2_bytes(int w2_fmt, uint32_t vocab_size, uint32_t
     default: return 0;                                                          \
     }
 
+/// One Markov refine step: refined = base + w2 . w1[prev], and each block's argmax.  Grid grid_dim, 256 threads,
+/// four vocab ids per thread per stride.
+/// @tparam W1BF16 markov_w1 is bf16 (else f32).
+/// @tparam W2FMT markov_w2's PULSAR_MARKOV_W2_* storage.
+/// @param refined_logits out: base + the Markov refinement, f32 [n_banks][vocab_size] (one bank: [vocab_size]).
+/// @param block_best_id out: each block's argmax id (banked: [n_banks][gridDim.x]).
+/// @param block_best_val out: each block's argmax value, same layout.
+/// @param base_logits the drafter's base logits, f32.
+/// @param markov_w1 markov_w1, v-major [vocab][embed_dim], f32 or bf16 (W1BF16).
+/// @param markov_w2 markov_w2, k-major [embed_dim][vocab], in the W2FMT storage.
+/// @param prev_token_ptr device: the previous token (out-of-range reads as 0).
+/// @param vocab_size vocabulary rows (a multiple of 4; of 32 for MXFP8 w2).
+/// @param embed_dim the Markov embedding width.
 template <bool W1BF16, int W2FMT>
 __global__ static void dspark_markov_step_kernel(
         float *refined_logits,
@@ -172,6 +213,11 @@ __global__ static void dspark_markov_step_kernel(
  * so it never wins a tie.
  */
 
+/// Merges the step's per-block partials into the winner.  Grid 1, 256 threads.
+/// @param dst out: the winner id.
+/// @param ids per-block ids, [n_blocks].
+/// @param vals per-block values, [n_blocks].
+/// @param n_blocks partials.
 __global__ static void dspark_markov_reduce_kernel(
         int32_t *dst,               /* winner id (L108 P1: points into the
                                      * chain's device id array, so the next
@@ -199,6 +245,13 @@ __global__ static void dspark_markov_reduce_kernel(
     if (tid == 0) *dst = best_ids[0];
 }
 
+/// Launches the reduce and, when asked, copies the winner to the host.
+/// @param id_dev the step kernel's per-block ids.
+/// @param val_dev the step kernel's per-block values.
+/// @param out_dev device scratch for the winner, one i32.
+/// @param grid_dim partials (the step kernel's grid).
+/// @param refined_id_dst out: the winner id on the host, or NULL.
+/// @return 1 on success, 0 on a CUDA failure.
 static int dspark_markov_reduce_blocks(const pulsar_gpu_tensor *id_dev,
                                         const pulsar_gpu_tensor *val_dev,
                                         pulsar_gpu_tensor *out_dev, /* 1 x int32 */
@@ -340,6 +393,18 @@ int pulsar_gpu_dspark_markov_step_model(
  * hidden is the post-hc_head drafter hidden and markov_embed is a row of markov_w1
  * gathered by token id. Used to size the verify budget (confidence-scheduled
  * verification) -- higher confidence => the draft is more likely accepted. */
+/// Grid n_positions, 256 threads (the tree assumes 256).
+/// @tparam W1BF16 markov_w1 is bf16 (else f32).
+/// @tparam PROJBF16 proj is bf16 (else f32).
+/// @param scores out: per-position confidence, f32 [n_positions].
+/// @param hidden the drafter hidden rows, f32 [n_positions][hidden_dim].
+/// @param token_ids per-position token ids, i32 [n_positions].
+/// @param markov_w1 markov_w1, v-major [vocab][embed_dim], f32 or bf16 (W1BF16).
+/// @param proj the confidence projection, [hidden_dim + embed_dim], f32 or bf16.
+/// @param n_positions block positions.
+/// @param hidden_dim hidden width.
+/// @param embed_dim the Markov embedding width.
+/// @param vocab_size vocabulary rows (a multiple of 4; of 32 for MXFP8 w2).
 template <bool W1BF16, bool PROJBF16>
 __global__ static void dspark_confidence_score_kernel(
         float *scores,
@@ -412,6 +477,11 @@ int pulsar_gpu_dspark_confidence_score_model(
  * hc of in[p]. Captures the drafter's anchor-layer hidden for EVERY position of
  * a spec verify batch, so the fused loop can pick the last-accepted position's
  * hidden without replaying. */
+/// Grid (ceil(n_embd / 256), n_tokens), 256 threads.
+/// @param out out: per-row mean over the copies, f32 [n_tokens][n_embd].
+/// @param hc_batch the HC residual rows, [n_tokens][n_hc][n_embd] (pulsar_hc_t).
+/// @param n_embd model width.
+/// @param n_hc hyper-connection copies.
 __global__ static void dspark_hc_mean_reduce_batch_kernel(
         float *out,
         const pulsar_hc_t *hc_batch,   /* HC residual carrier (BF16); task #62 */
@@ -430,6 +500,13 @@ __global__ static void dspark_hc_mean_reduce_batch_kernel(
 }
 
 
+/// out[p] = the mean of row p's n_hc copies, for every row of a verify batch.
+/// @param out out: f32 [n_tokens][n_embd].
+/// @param hc_batch the HC residual rows, [n_tokens][n_hc][n_embd] (pulsar_hc_t).
+/// @param n_embd model width.
+/// @param n_hc hyper-connection copies.
+/// @param n_tokens rows.
+/// @return 1 on success, 0 on a refusal or launch failure.
 int pulsar_gpu_dspark_hc_mean_reduce_batch(
         pulsar_gpu_tensor *out,
         const pulsar_gpu_tensor *hc_batch,
@@ -460,6 +537,14 @@ int pulsar_gpu_dspark_hc_mean_reduce_batch(
  * tail_lse = log(sumexp(all) - sumexp(top64)) + max, so the training loss can
  * renormalize the non-top mass exactly. Collection-rate code: clarity over
  * throughput. */
+/// Grid n_rows, 256 threads.
+/// @param logits the teacher logits, f32 [n_rows][vocab].
+/// @param vocab vocabulary width.
+/// @param top_ids out: top-64 ids, i32 [cap][64], written at row0 + row.
+/// @param top_vals out: top-64 logits as f16 bits, [cap][64].
+/// @param tail_lse out: the non-top-64 logsumexp as f16 bits, [cap].
+/// @param inexact out: incremented when a row's selection may have dropped a top-64 value.
+/// @param row0 the first output row.
 __global__ static void distill_top64_lse_kernel(
         const float *logits,      /* [n_rows, vocab] */
         uint32_t vocab,
@@ -557,6 +642,16 @@ __global__ static void distill_top64_lse_kernel(
     }
 }
 
+/// Per teacher row: the top-64 (ids, f16 values) and the tail logsumexp (plan 92 P0).
+/// @param logits_rows the teacher logits, f32 [n_rows][vocab].
+/// @param n_rows rows.
+/// @param vocab vocabulary width.
+/// @param top_ids out: top-64 ids, i32 [cap][64], written at row0 + row.
+/// @param top_vals out: top-64 logits as f16 bits, [cap][64].
+/// @param tail_lse out: the non-top-64 logsumexp as f16 bits, [cap].
+/// @param inexact out: incremented when a row's selection may have dropped a top-64 value.
+/// @param row0 the first output row.
+/// @return 1 on success, 0 on a refusal or launch failure.
 int pulsar_gpu_distill_top64_tensor(
         const pulsar_gpu_tensor *logits_rows,
         uint32_t n_rows,
@@ -611,6 +706,24 @@ int pulsar_gpu_distill_top64_tensor(
  * [n_banks][gridDim.x]; the bank's base row is base_logits[(base_row[b] +
  * base_row_add) * base_row_stride]; the previous token for bank b is
  * prev[b * prev_stride]. n_banks <= PULSAR_DSPARK_BANKS_MAX. */
+/// The banked Markov step: one w2 stream serves every bank.  Grid grid_dim, 256 threads, n_banks * embed_dim * 4 B
+/// dynamic shared memory (the banks' w1 rows).
+/// @tparam W1BF16 markov_w1 is bf16 (else f32).
+/// @tparam W2FMT markov_w2's PULSAR_MARKOV_W2_* storage.
+/// @param refined_logits out: base + the Markov refinement, f32 [n_banks][vocab_size] (one bank: [vocab_size]).
+/// @param block_best_id out: each block's argmax id (banked: [n_banks][gridDim.x]).
+/// @param block_best_val out: each block's argmax value, same layout.
+/// @param base_logits the drafter's base logits, f32.
+/// @param base_row per-bank base-logits row, i32 [n_banks].
+/// @param base_row_add added to every bank's base row (the draft position).
+/// @param base_row_stride base_logits row stride, floats.
+/// @param markov_w1 markov_w1, v-major [vocab][embed_dim], f32 or bf16 (W1BF16).
+/// @param markov_w2 markov_w2, k-major [embed_dim][vocab], in the W2FMT storage.
+/// @param prev per-bank previous token, read at prev[b * prev_stride].
+/// @param prev_stride stride of prev, elements.
+/// @param n_banks banks (<= PULSAR_DSPARK_BANKS_MAX).
+/// @param vocab_size vocabulary rows (a multiple of 4; of 32 for MXFP8 w2).
+/// @param embed_dim the Markov embedding width.
 template <bool W1BF16, int W2FMT>
 __global__ static void __launch_bounds__(256) dspark_markov_step_banks_kernel(
         float *__restrict__ refined_logits,
@@ -716,6 +829,12 @@ __global__ static void __launch_bounds__(256) dspark_markov_step_banks_kernel(
 
 /* One block per bank: the same (value, id) merge as dspark_markov_reduce_kernel
  * over that bank's partials, the winner written to dst[b * dst_stride]. */
+/// Grid n_banks, 256 threads.
+/// @param dst out: the winner id.
+/// @param dst_stride stride of dst between banks, elements.
+/// @param ids per-bank per-block ids, [n_banks][n_blocks].
+/// @param vals per-bank per-block values, [n_banks][n_blocks].
+/// @param n_blocks partials per bank.
 __global__ static void dspark_markov_reduce_banks_kernel(
         int32_t *__restrict__ dst,
         uint32_t dst_stride,
@@ -745,11 +864,29 @@ __global__ static void dspark_markov_reduce_banks_kernel(
 
 /* Per-bank partials for the banked kernels; grown on demand, thread_local for
  * the same reasons as DsparkReduceBufs above. */
+/// Per-bank argmax partials of the banked Markov step: one (id, value) slot per (bank, grid CTA), device.
 struct DsparkReduceBufsBanks {
     pulsar_gpu_tensor *id, *val;
+    /// Slots allocated (PULSAR_DSPARK_BANKS_MAX x the grid it was sized for); 0 after a failed allocation.
     uint32_t cap;   /* n_banks * grid_dim slots */
 };
 
+/** @var DsparkReduceBufsBanks::id
+ *  Device partial ids, i32 [cap].
+ *  @var DsparkReduceBufsBanks::val
+ *  Device partial values, f32 [cap]. */
+
+/// @param refined_logits the refined logits.
+/// @param ids_dev the chain's ids, i32 [n_banks][ids_stride]: position p + 1's winner written at column p + 1.
+/// @param ids_stride ids_dev row stride, elements.
+/// @param base_logits the base logits.
+/// @param base_row_stride_bytes base_logits row stride, bytes.
+/// @param base_row_dev per-bank base-logits row, i32 [n_banks].
+/// @param n_banks banks (<= PULSAR_DSPARK_BANKS_MAX).
+/// @param n_draft positions the chain will write (ids columns needed: n_draft + 1).
+/// @param vocab_size vocabulary rows (a multiple of 4; of 32 for MXFP8 w2).
+/// @param embed_dim the Markov embedding width.
+/// @return true when the banked operands are present and large enough.
 static bool dspark_markov_banks_args_ok(
         const pulsar_gpu_tensor *refined_logits, const pulsar_gpu_tensor *ids_dev,
         uint32_t ids_stride,
@@ -771,6 +908,26 @@ static bool dspark_markov_banks_args_ok(
     return true;
 }
 
+/// Runs pos_count banked steps (step, reduce) from pos_first, chaining through ids_dev.
+/// @param refined_logits out: base + the Markov refinement, f32 [n_banks][vocab_size] (one bank: [vocab_size]).
+/// @param ids_dev the chain's ids, i32 [n_banks][ids_stride]: position p + 1's winner written at column p + 1.
+/// @param ids_stride ids_dev row stride, elements.
+/// @param base_logits the drafter's base logits, f32.
+/// @param base_row_stride_bytes base_logits row stride, bytes.
+/// @param base_row_dev per-bank base-logits row, i32 [n_banks].
+/// @param dspark_model_map the drafter model mapping.
+/// @param dspark_model_size its bytes.
+/// @param markov_w1_offset markov_w1's offset in the mapping.
+/// @param markov_w2_offset markov_w2's offset in the mapping.
+/// @param n_banks banks (<= PULSAR_DSPARK_BANKS_MAX).
+/// @param pos_first first draft position.
+/// @param pos_count draft positions run.
+/// @param prev_override per-bank previous tokens for the first step, or NULL (read from ids_dev).
+/// @param vocab_size vocabulary rows (a multiple of 4; of 32 for MXFP8 w2).
+/// @param embed_dim the Markov embedding width.
+/// @param w1_bf16 markov_w1 is bf16 (else f32).
+/// @param w2_fmt a PULSAR_MARKOV_W2_* storage.
+/// @return 1 on success, 0 on a refusal or launch failure.
 static int dspark_markov_banks_launch(
         pulsar_gpu_tensor *refined_logits, pulsar_gpu_tensor *ids_dev,
         uint32_t ids_stride, const pulsar_gpu_tensor *base_logits, uint64_t base_row_stride_bytes,
@@ -845,6 +1002,24 @@ static int dspark_markov_banks_launch(
     return cudaGetLastError() == cudaSuccess;
 }
 
+/// Runs the whole n_draft-step Markov chain for every bank.
+/// @param refined_logits out: base + the Markov refinement, f32 [n_banks][vocab_size] (one bank: [vocab_size]).
+/// @param ids_dev the chain's ids, i32 [n_banks][ids_stride]: position p + 1's winner written at column p + 1.
+/// @param ids_stride ids_dev row stride, elements.
+/// @param base_logits the drafter's base logits, f32.
+/// @param base_row_stride_bytes base_logits row stride, bytes.
+/// @param base_row_dev per-bank base-logits row, i32 [n_banks].
+/// @param dspark_model_map the drafter model mapping.
+/// @param dspark_model_size its bytes.
+/// @param markov_w1_offset markov_w1's offset in the mapping.
+/// @param markov_w2_offset markov_w2's offset in the mapping.
+/// @param n_banks banks (<= PULSAR_DSPARK_BANKS_MAX).
+/// @param n_draft draft positions.
+/// @param vocab_size vocabulary rows (a multiple of 4; of 32 for MXFP8 w2).
+/// @param embed_dim the Markov embedding width.
+/// @param w1_bf16 markov_w1 is bf16 (else f32).
+/// @param w2_fmt a PULSAR_MARKOV_W2_* storage.
+/// @return 1 on success, 0 on a refusal or launch failure.
 int pulsar_gpu_dspark_markov_chain_banks_model(
         pulsar_gpu_tensor *refined_logits, pulsar_gpu_tensor *ids_dev, uint32_t ids_stride,
         const pulsar_gpu_tensor *base_logits, uint64_t base_row_stride_bytes,
@@ -864,6 +1039,25 @@ int pulsar_gpu_dspark_markov_chain_banks_model(
                                       w1_bf16, w2_fmt);
 }
 
+/// Runs one banked Markov step at position pos from prev_dev.
+/// @param refined_logits out: base + the Markov refinement, f32 [n_banks][vocab_size] (one bank: [vocab_size]).
+/// @param ids_dev the chain's ids, i32 [n_banks][ids_stride]: position p + 1's winner written at column p + 1.
+/// @param ids_stride ids_dev row stride, elements.
+/// @param base_logits the drafter's base logits, f32.
+/// @param base_row_stride_bytes base_logits row stride, bytes.
+/// @param base_row_dev per-bank base-logits row, i32 [n_banks].
+/// @param prev_dev per-bank previous tokens, i32 [n_banks].
+/// @param dspark_model_map the drafter model mapping.
+/// @param dspark_model_size its bytes.
+/// @param markov_w1_offset markov_w1's offset in the mapping.
+/// @param markov_w2_offset markov_w2's offset in the mapping.
+/// @param n_banks banks (<= PULSAR_DSPARK_BANKS_MAX).
+/// @param pos the draft position.
+/// @param vocab_size vocabulary rows (a multiple of 4; of 32 for MXFP8 w2).
+/// @param embed_dim the Markov embedding width.
+/// @param w1_bf16 markov_w1 is bf16 (else f32).
+/// @param w2_fmt a PULSAR_MARKOV_W2_* storage.
+/// @return 1 on success, 0 on a refusal or launch failure.
 int pulsar_gpu_dspark_markov_step_banks_model(
         pulsar_gpu_tensor *refined_logits, pulsar_gpu_tensor *ids_dev, uint32_t ids_stride,
         const pulsar_gpu_tensor *base_logits, uint64_t base_row_stride_bytes,
@@ -901,7 +1095,20 @@ int pulsar_gpu_dspark_markov_step_banks_model(
 /* Row r of the slot is the concat of source row src.r[r] of each of h0/h1/h2
  * (L260: the batched drafter seed gathers the committed rows of every bank
  * from the verify capture in one launch; the one-row entry is src {0}). */
+/// The seed slot's source rows, passed by value (kernel parameter space).
 struct dspark_concat_rows { uint32_t r[PULSAR_DSPARK_SEED_ROWS]; };
+/** @var dspark_concat_rows::r
+ *  r[i]: the source row of h0 / h1 / h2 that slot row i gathers. */
+
+/// Emits [h0 | h1 | h2] rows as the E4M3 activation slot, one warp per 32-block.  Grid (ceil(3 E / 256), rows), 256 threads.
+/// @param h0 first source hidden rows, f32.
+/// @param h1 second source hidden rows, f32.
+/// @param h2 third source hidden rows, f32.
+/// @param E n_embd (a multiple of 32).
+/// @param src_rows per slot row, its source row.
+/// @param data out: the activation slot's E4M3 plane, [rows][3 E].
+/// @param scale out: its E8M0 plane (pulsar_mx_sfoff).
+/// @param KBp the slot's padded k-block pitch.
 __global__ static void dspark_concat3_e4m3_kernel(const float *h0, const float *h1, const float *h2,
                                                   uint32_t E, dspark_concat_rows src_rows,
                                                   __nv_fp8_e4m3 *data,
