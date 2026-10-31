@@ -1105,16 +1105,10 @@ static int run_generation(pulsar_engine *engine, const cli_config *cfg) {
         return rc;
     }
 
-    const bool diagnostic = cfg->gen.dump_tokens;
     if (cfg->gen.dump_tokens) {
         pulsar_engine_dump_tokens(engine, &prompt);
-    }
-
-    if (diagnostic) {
-        if (rc == 0) {
-            fprintf(stderr, "pulsar: diagnostic run completed on the native %s path.\n",
-                    pulsar_backend_name(cfg->engine.backend));
-        }
+        fprintf(stderr, "pulsar: diagnostic run completed on the native %s path.\n",
+                pulsar_backend_name(cfg->engine.backend));
     } else {
         /* Every generation rides the session lane -- greedy (temperature 0), sampled, drafted and
          * tensor-parallel alike, on every family (L284 P15: the session-less whole-graph argmax path
