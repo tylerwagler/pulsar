@@ -3294,10 +3294,13 @@ bool gpu_graph_encode_layer_batch(
 /// @param what the kernel
 /// @return false, always
 static bool rollforward_fail(uint32_t il, uint32_t pos, const char *what) {
-    fprintf(stderr, "pulsar: compressor rollforward FAILED at layer %u pos %u (%s) -- layers 0..%u are "
+    char done[48];
+    if (il == 0u) snprintf(done, sizeof done, "no layer is");
+    else snprintf(done, sizeof done, "layers 0..%u are", il - 1u);
+    fprintf(stderr, "pulsar: compressor rollforward FAILED at layer %u pos %u (%s) -- %s "
                     "advanced to the committed frontier, layers %u.. are not: the pool state is "
                     "half-advanced and the caller must invalidate the checkpoint (it does)\n",
-            il, pos, what, il == 0u ? 0u : il - 1u, il);
+            il, pos, what, done, il);
     return false;
 }
 
