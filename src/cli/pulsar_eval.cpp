@@ -2872,12 +2872,6 @@ static void trace_write_case(FILE *trace,
     fflush(trace);
 }
 
-/* The LAST "Answer:" marker in `visible` (case-insensitive, optional space
- * before the colon, word-bounded), or NULL.  There is no looser form: the
- * grading contract (grade_model_output) requires this marker on the last
- * line, so an extractor is only ever handed text that carries it.  The old
- * bare-"answer" fallback was reachable from nothing but its own self-tests
- * (L192). */
 /// @brief Whether the characters on both sides of a span are non-letters (a word boundary).
 /// @param before the character before the span
 /// @param after  the character after it
@@ -2886,7 +2880,13 @@ static bool is_letter_boundary(char before, char after) {
     return !isalpha((unsigned char)before) && !isalpha((unsigned char)after);
 }
 
-/** @brief The last "Answer:" marker in visible (the rule in the comment above is_letter_boundary).
+/* The LAST "Answer:" marker in `visible` (case-insensitive, optional space
+ * before the colon, word-bounded), or NULL.  There is no looser form: the
+ * grading contract (grade_model_output) requires this marker on the last
+ * line, so an extractor is only ever handed text that carries it.  The old
+ * bare-"answer" fallback was reachable from nothing but its own self-tests
+ * (L192). */
+/** @brief The last "Answer:" marker in visible (the rule in the comment above).
  *  @param visible the text to search
  *  @return a pointer to the marker's "a" inside visible, or NULL */
 static char *find_last_answer_marker(const char *visible) {
