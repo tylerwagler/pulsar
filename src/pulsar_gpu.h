@@ -3332,7 +3332,7 @@ int pulsar_gpu_router_select_batch_tensor(
  *  @param out               f32 [n_tokens][out_dim]
  *  @param up                f32 scratch
  *  @param mid               f32 scratch
- *  @param experts           f32 per-slot down scratch (the definition names it `down`)
+ *  @param down              f32 per-slot down scratch
  *  @param model_map         the model mapping
  *  @param model_size        its size in bytes
  *  @param gate_offset       byte offset of the gate stack
@@ -3361,7 +3361,7 @@ int pulsar_gpu_routed_moe_batch_tensor(
         pulsar_gpu_tensor       *out,
         pulsar_gpu_tensor       *up,
         pulsar_gpu_tensor       *mid,
-        pulsar_gpu_tensor       *experts,
+        pulsar_gpu_tensor       *down,
         const void             *model_map,
         uint64_t                model_size,
         uint64_t                gate_offset,
