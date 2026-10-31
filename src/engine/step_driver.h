@@ -229,7 +229,8 @@ typedef struct pulsar_driver_ops {
 } pulsar_driver_ops;
 
 /** The first thing a forward over `plan` would need that `ops` lacks -- "embed", the block of a layer kind (its
- *  layer in *at_layer), "head" -- or NULL when nothing is missing.  The driver refuses a session with exactly this. */
+ *  layer in *at_layer), "read_ahead_pool" (read_ahead without its pool or the reverse), "head" -- or NULL when
+ *  nothing is missing.  The driver refuses a session with exactly this. */
 /// @param ops      the family's driver ops
 /// @param plan     the layer plan
 /// @param at_layer receives the layer whose block is missing, else UINT32_MAX
