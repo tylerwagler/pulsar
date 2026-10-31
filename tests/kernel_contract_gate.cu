@@ -8,6 +8,9 @@
  *    1. mx-shared-exp   pulsar_mx_shared_exp == the exact floor(log2(amax)) - 7 (double, on the host) on every binade
  *                       edge of the normal f32 range; prints how many the old fast-math floorf(log2f()) got wrong
  *                       (the expression swiglu_pack_e4m3_warp_kernel carried until L335).
+ *    2. embed-sentinel  pulsar_gpu_embed_tokens_hc_tensor: an id in [0, n_vocab) copies its row into every carrier; an
+ *                       image-slot sentinel id (>= n_vocab) writes a ZERO row (it used to read row 0 -- a real token's
+ *                       embedding -- as a silent clamp).
  *
  *  Prints one line per case and KERNEL CONTRACT GATE PASS / FAIL. */
 #include "pulsar_gpu.h"
@@ -121,14 +124,53 @@ static void case_mx_shared_exp(void) {
     cudaFree(dold);
 }
 
+/* ---- 2. embed-sentinel ----------------------------------------------------------------------------------------- */
+
+/// Case 2: a small synthetic table (a host mapping with no fd: the runtime copies it to the device).
+static void case_embed_sentinel(void) {
+    const uint32_t n_vocab = 5u, n_embd = 64u, n_hc = 4u;
+    static uint16_t table[5 * 64];
+    for (uint32_t r = 0; r < n_vocab; r++)
+        for (uint32_t d = 0; d < n_embd; d++) table[r * n_embd + d] = (uint16_t)(0x3f80u + r * 64u + d);   /* bf16 */
+    const int32_t ids[4] = {3, 0, (int32_t)n_vocab, 4};   /* ids[2]: an image slot's sentinel (vocab + role 0) */
+    const uint32_t n_tok = 4u;
+    pulsar_gpu_tensor *tok = pulsar_gpu_tensor_alloc(sizeof(ids));
+    pulsar_gpu_tensor *out = pulsar_gpu_tensor_alloc((uint64_t)n_tok * n_hc * n_embd * 2u);
+    if (!tok || !out || !pulsar_gpu_tensor_write(tok, 0, ids, sizeof(ids))) {
+        fail("embed-sentinel: alloc / upload");
+    } else if (!pulsar_gpu_embed_tokens_hc_tensor(out, tok, table, sizeof(table), 0, n_vocab, n_tok, n_embd, n_hc) ||
+               !pulsar_gpu_synchronize()) {
+        fail("embed-sentinel: launch");
+    } else {
+        std::vector<uint16_t> got((size_t)n_tok * n_hc * n_embd);
+        if (!pulsar_gpu_tensor_read(out, 0, got.data(), got.size() * 2u)) {
+            fail("embed-sentinel: read back");
+        } else {
+            int bad = 0;
+            for (uint32_t t = 0; t < n_tok; t++)
+                for (uint32_t h = 0; h < n_hc; h++)
+                    for (uint32_t d = 0; d < n_embd; d++) {
+                        const uint16_t want = (uint32_t)ids[t] < n_vocab ? table[(uint32_t)ids[t] * n_embd + d] : 0u;
+                        bad += got[((size_t)t * n_hc + h) * n_embd + d] != want;
+                    }
+            printf("  2 embed-sentinel: %u tokens x %u carriers, %d elements off (the sentinel row must be zero)\n",
+                   n_tok, n_hc, bad);
+            if (bad) fail("embed-sentinel: a row is not its token's embedding, or the sentinel row is not zero");
+        }
+    }
+    pulsar_gpu_tensor_free(tok);
+    pulsar_gpu_tensor_free(out);
+}
+
 /// Runs every case on device 0.
 /// @return 0 on PASS, 1 on FAIL
 int main(void) {
-    if (cudaSetDevice(0) != cudaSuccess) {
+    if (!pulsar_gpu_init()) {
         fprintf(stderr, "KERNEL CONTRACT FAIL: no GPU\n");
         return 1;
     }
     case_mx_shared_exp();
+    case_embed_sentinel();
     puts(g_fail ? "KERNEL CONTRACT GATE FAIL" : "KERNEL CONTRACT GATE PASS");
     return g_fail ? 1 : 0;
 }

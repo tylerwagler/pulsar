@@ -13,7 +13,10 @@
 /** Token embedding into every hidden carrier: out[t][h][d] = w[tokens[t]][d] for each of the n_hc carriers.  Grid
  *  ceil(n_tokens * n_hc * n_embd / 256); block 256; one element a thread.
  *  @param out      device hc carriers [n_tokens][n_hc][n_embd] (pulsar_hc_t)
- *  @param tokens   device [n_tokens] token ids (out of range reads row 0)
+ *  @param tokens   device [n_tokens] token ids: [0, n_vocab) reads that row; an id at or past n_vocab is an image slot's
+ *                  sentinel (L216: vocab_size + role) and writes a ZERO row, the placeholder the image merge
+ *                  overwrites before layer 0.  The host refuses a negative id and any other before the launch
+ *                  (gpu_graph_upload_prompt_tokens, the drafter's embed), so nothing else reaches the kernel.
  *  @param w        device bf16 embedding table [n_vocab][n_embd]
  *  @param n_vocab  table rows
  *  @param n_tokens token rows
@@ -33,10 +36,8 @@ __global__ static void embed_tokens_hc_kernel(
     uint32_t d = gid % n_embd;
     uint64_t tmp = gid / n_embd;
     uint32_t t = tmp / n_hc;
-    int32_t tok_i = tokens[t];
-    uint32_t tok = tok_i < 0 ? 0u : (uint32_t)tok_i;
-    if (tok >= n_vocab) tok = 0;
-    pulsar_hc_store(out, gid, pulsar_wt_load(w, (uint64_t)tok * n_embd + d));
+    const uint32_t tok = (uint32_t)tokens[t];
+    pulsar_hc_store(out, gid, tok < n_vocab ? pulsar_wt_load(w, (uint64_t)tok * n_embd + d) : 0.0f);
 }
 
 
