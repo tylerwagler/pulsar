@@ -510,6 +510,7 @@ struct constrain_gate {
         for (auto *m : matchers) pulsar_grammar_matcher_free(m);
     }
 };
+
 /** @var constrain_gate::call
  *  Matches the family's call trigger in free text (opens a call region). */
 /** @var constrain_gate::answer
