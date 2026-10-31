@@ -3850,6 +3850,35 @@ static void test_l308_copy_estimate(void) {
     TEST_ASSERT(pulsar_spec_copy_price(&sp, 0.0f, 8u, conf, &rp) == 8u && !rp && conf[0] == 1.0f);
 }
 
+/* L335: Qwen's eos is the first of the tokenizer's stop ids, and the list it reads is never empty: the loader refuses
+ * an eos config with no id (bpe_tokenizer.cpp finish_table, the one authority) -- what qwen_tok_eos's refusal of an
+ * empty list stands on.  Host: the checkpoint's tokenizer (PULSAR_TEST_QWEN_TOKENIZER). */
+static void test_qwen_eos(void) {
+    const bpe_tokenizer *tok = qwen_test_tokenizer();
+    if (!tok) return;   /* failed by name inside */
+    pulsar_engine *e = (pulsar_engine *)xcalloc(1, sizeof(*e));
+    e->qwen_tok = (bpe_tokenizer *)tok;
+    TEST_ASSERT(!bpe_tokenizer_stop_ids(tok).empty());
+    TEST_ASSERT(k_qwen_tokenizer.eos(e) == bpe_tokenizer_stop_ids(tok).front());
+    e->qwen_tok = NULL;
+    free(e);
+    const char *dir = getenv("PULSAR_TEST_QWEN_TOKENIZER");
+    std::string tj;
+    FILE *f = fopen((std::string(dir) + "/tokenizer.json").c_str(), "rb");
+    TEST_ASSERT(f != NULL);
+    if (!f) return;
+    char b[65536];
+    size_t n;
+    while ((n = fread(b, 1, sizeof b, f)) > 0) tj.append(b, n);
+    fclose(f);
+    for (const char *gen : {"{\"eos_token_id\": []}", "{}"}) {
+        char err[256] = "";
+        bpe_tokenizer *none = bpe_tokenizer_load_hf(tj.data(), tj.size(), gen, strlen(gen), err, sizeof err);
+        TEST_ASSERT(none == NULL && strstr(err, "eos_token_id") != NULL);
+        if (none) bpe_tokenizer_free(none);
+    }
+}
+
 /* L335: the one host f32 -> bf16 converter (pulsar_gpu.h pulsar_bf16_from_f32), over every float bit pattern: each
  * non-NaN value converts exactly as the two vision converters it replaced did (the bare RNE expression), and every
  * NaN becomes torch's quiet NaN 0x7FC0 (the bare expression turned some into Inf or flipped their sign). */
@@ -4897,6 +4926,7 @@ static const pulsar_test_entry test_entries[] = {
     {"--fused-cost", "fused-cost", "the prompt chunk cost fit (solo + fused, persisted) and the verify curve's round cost, what the round selection and the disk restore price by (L304, L312, L327)", test_fused_cost},
     {"--fused-sched", "fused-sched", "the round selection simulated on L304's logged costs: L304's and L277's cases, the stall, no prompt, the cold fit (L312)", test_fused_sched},
     {"--read-ahead", "read-ahead", "the next-chunk PLE read-ahead: its rule (one chunk ahead, each row once, a changed prompt drops), the pool's background class (bytes unchanged, below every gather, cancel, accounting) (L329 b2)", test_read_ahead},
+    {"--qwen-eos", "qwen-eos", "Qwen's eos: the tokenizer's first stop id; a tokenizer with none never loads (L335)", test_qwen_eos},
     {"--bf16-convert", "bf16-convert", "the host f32 -> bf16 converter over every float bit pattern: finite values as before, NaN stays NaN (L335)", test_bf16_from_f32},
     {"--tokenizer-refusals", "tokenizer-refusals", "the tokenizer and chat entries refuse a family without them by name and return their failure values, never exit (L335)", test_tokenizer_refusals},
     {"--refusal-once", "refusal-once", "the library's say-once refusal table: once per op, every refusal said past its bound (L335)", test_refusal_once},

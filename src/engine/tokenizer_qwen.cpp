@@ -150,10 +150,18 @@ static bool qwen_tok_is_stop(pulsar_engine *e, int token) {
 }
 
 /* the FIRST of generation_config's stop ids (<|im_end|>); a caller that ends generation must test the
- * whole set with pulsar_token_is_stop */
+ * whole set with pulsar_token_is_stop.  The loader refuses an eos config without one (bpe_tokenizer.cpp
+ * finish_table), so the list is never empty on a loaded tokenizer; an empty one refuses here, by name, rather
+ * than read past the list. */
 /// @param e the engine
-/// @return the first stop id
-static int qwen_tok_eos(pulsar_engine *e) { return bpe_tokenizer_stop_ids(e->qwen_tok).front(); }
+/// @return the first stop id; -1 (said once) when the tokenizer has none
+static int qwen_tok_eos(pulsar_engine *e) {
+    const std::vector<int> &stop = bpe_tokenizer_stop_ids(e->qwen_tok);
+    if (!stop.empty()) return stop.front();
+    if (pulsar_refusal_first("qwen eos"))
+        fprintf(stderr, "pulsar: %s: the tokenizer has no stop id -- refusing the eos\n", PULSAR_QWEN_ARCH);
+    return -1;
+}
 
 /// @param e the engine
 /// @param token an id
