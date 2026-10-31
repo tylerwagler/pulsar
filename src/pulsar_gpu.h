@@ -481,14 +481,6 @@ int pulsar_gpu_set_model_map(const void *model_map, uint64_t model_size);
  *  @param model_map the mapping it backs (the key)
  *  @return 1 on success, 0 when the mapping table is full */
 int pulsar_gpu_set_model_fd_for_map(int fd, const void *model_map);
-/** @brief Same as pulsar_gpu_set_model_map; map_offset, map_size and max_tensor_bytes are ignored.
- *  @param model_map        the host mapping
- *  @param model_size       its size in bytes
- *  @param map_offset       unused
- *  @param map_size         unused
- *  @param max_tensor_bytes unused
- *  @return as pulsar_gpu_set_model_map */
-int pulsar_gpu_set_model_map_range(const void *model_map, uint64_t model_size, uint64_t map_offset, uint64_t map_size, uint64_t max_tensor_bytes);
 /** @brief Make one span of the model device-resident now (startup), instead of on first use.
  *  @param model_map  the model mapping (NULL or bytes 0: nothing to do, 1)
  *  @param model_size the mapping's size in bytes
