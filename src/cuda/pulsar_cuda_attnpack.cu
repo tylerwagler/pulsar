@@ -131,8 +131,8 @@ __global__ static void attn_pack_store_kernel(float *x, const float *src, uint8_
         const uint32_t v1 = s1 > 0.0f ? pulsar_e2m1_quant_dev(sr[d0 + 1u], s1) : 0u;
         outr[i] = (uint8_t)(v0 | (v1 << 4));
         if (xr) {
-            xr[d0]      = attn_kv4_e2m1(v0, s0);
-            xr[d0 + 1u] = attn_kv4_e2m1(v1, s1);
+            xr[d0]      = pulsar_e2m1_times(v0, s0);
+            xr[d0 + 1u] = pulsar_e2m1_times(v1, s1);
         }
     }
     /* bf16 rope tail, roundtripped in place so the f32 staging keeps holding

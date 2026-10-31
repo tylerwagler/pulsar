@@ -315,21 +315,6 @@ __device__ __forceinline__ static uint64_t pulsar_kv_ring_slot(
     return (uint64_t)(seq_id ? (uint32_t)seq_id[row] * raw_cap : 0u) + pos % raw_cap;
 }
 
-/* The 0731 unified row's E2M1 decoder: one nibble and its block scale.  Codes
- * 0..7 are 0, 0.5, 1, 1.5, 2, 3, 4, 6; codes >= 2 are normals (exponent
- * 126 + c>>1, mantissa bit c&1) and 0 / 0.5 are the format's zero and
- * subnormal.  Nibble bit 3 is the sign. */
-/// @param nib   an E2M1 nibble (bit 3 the sign)
-/// @param scale the block scale
-/// @return the decoded value times scale
-__device__ static inline float attn_kv4_e2m1(uint32_t nib, float scale) {
-    const uint32_t c = nib & 7u;
-    const float v = (c >= 2u) ? __uint_as_float(((126u + (c >> 1)) << 23) | ((c & 1u) << 22))
-                              : (float)c * 0.5f;
-    const float sv = v * scale;
-    return (nib & 8u) ? -sv : sv;
-}
-
 /* 0731's unified NVFP4 row, packed by src/cuda/pulsar_cuda_attnpack.cu.  The
  * contiguous store is declared in pulsar_gpu.h because tests/attn_pack_gate.cpp
  * grades it; the rest are reached only through pulsar_cuda_norm_kv.cu's
