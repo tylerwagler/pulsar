@@ -35,8 +35,10 @@ int gpu_graph_spec_dump_active(void) {
  * and pre-markov base logits (spec_logits row 0) so an off-box reference forward
  * can be diffed against ds4 to localize acceptance loss. Enabled by
  * PULSAR_DSPARK_DUMP=<path>; caps at PULSAR_DSPARK_DUMP_STEPS (default 8) records.
- * Record layout (little-endian): pos i32, first_token i32, then f32 arrays
- * target_h[0..2] (PULSAR_N_EMBD each), main_x (PULSAR_N_EMBD), base0 (PULSAR_N_VOCAB). */
+ * Record layout (little-endian): i32 pos, first_token, n_draft; i32 refined_ids[n_draft + 1]; then f32 arrays
+ * target_h[0..2] (PULSAR_N_EMBD each), main_x (PULSAR_N_EMBD), base0 (PULSAR_N_VOCAB), and the HC carrier
+ * (PULSAR_N_HC x PULSAR_N_EMBD) of each of the n_draft block positions.  PULSAR_DSPARK_DUMP_LEAN=1 writes the
+ * same header and ids, then only each position's post-hc_head hidden row (PULSAR_N_EMBD). */
 /// @param g the session's graph
 /// @param pos the step's position
 /// @param first_token the base token
