@@ -1,3 +1,5 @@
+/** @file
+ *  A JSON document with Python's json.loads / json.dumps semantics, for byte-exact chat templates. */
 /* pyjson.h -- a JSON document with PYTHON's semantics, for the Qwen chat
  * template (L251 S5).
  *
@@ -36,9 +38,13 @@
 #include <utility>
 #include <vector>
 
+/** One JSON value as json.loads would build it; only the field(s) of `kind` are meaningful. */
 struct pyjson_value {
+    /** The value's type: null, bool, Python int, float, string, array, object. */
     enum kind_t { NUL, BOOL, INT, FLOAT, STR, ARR, OBJ };
+    /// Which field holds the value
     kind_t kind = NUL;
+    /// BOOL
     bool b = false;
     std::string num;   ///< INT: the canonical decimal digits
     double f = 0.0;    ///< FLOAT
@@ -47,27 +53,47 @@ struct pyjson_value {
     std::vector<std::pair<std::string, pyjson_value>> o;  ///< OBJ, document order
 
     /** Object member by key, or NULL (also NULL when this is not an object). */
+    /// @param key NUL-terminated member name, compared bytewise
+    /// @return the member's value (owned by this object), or NULL
     const pyjson_value *get(const char *key) const;
 };
 
 /** Parse exactly one JSON value spanning `text[0..n)` (surrounding whitespace
  * allowed).  On failure returns false and writes a one-line reason. */
+/// @param text   the JSON text (need not be NUL-terminated)
+/// @param n      its length in bytes
+/// @param out    receives the parsed value
+/// @param err    receives the one-line reason on failure (may be NULL)
+/// @param errlen size of `err`
+/// @return true on success
 bool pyjson_parse(const char *text, size_t n, pyjson_value *out, char *err, size_t errlen);
 
 /** Append `json.dumps(v, ensure_ascii=False)` to `out`. */
+/// @param v   the value
+/// @param out the serialization is appended here
 void pyjson_dump(const pyjson_value &v, std::string *out);
 
 /** Append a JSON string literal for the UTF-8 bytes s[0..n), Python-escaped. */
+/// @param s   the UTF-8 bytes
+/// @param n   their count
+/// @param out the literal (with its quotes) is appended here
 void pyjson_dump_string(const char *s, size_t n, std::string *out);
 
 /** Append `json.dumps(sort(v), ensure_ascii=False, separators=(",", ":"), allow_nan=False)` -- every
  * object's keys sorted, recursively (the canonical JSON vLLM's Inkling renderer writes).  false = a
  * non-finite float (Python raises). */
+/// @param v   the value
+/// @param out the canonical serialization is appended here
+/// @return true on success, false when `v` holds a non-finite float
 bool pyjson_dump_canonical(const pyjson_value &v, std::string *out);
 
 /** Python's truthiness of the value json.loads produced (`x or default`). */
+/// @param v the value
+/// @return false for null, false, 0, 0.0, "", [] and {}; true otherwise
 bool pyjson_truthy(const pyjson_value &v);
 
 /** Python's str.isspace() for one codepoint -- the whitespace str.strip() removes (and Jinja's |trim): the
  * one definition the renderers and the output parsers share. */
+/// @param cp the codepoint
+/// @return true when Python's str.isspace() holds for it
 bool py_isspace(uint32_t cp);

@@ -1,3 +1,5 @@
+/** @file
+ *  Page-cache-neutral streaming writes (L261): header-only, shared by the payload writer and the segment store. */
 /* Page-cache-neutral streaming writes (L261).
  *
  * A disk-KV snapshot is ~800 MB for a 300k-token conversation, written once as
@@ -17,13 +19,20 @@
 #include <sys/types.h>
 #include <unistd.h>
 
+/// Bytes written between two writebacks: 64 MiB.
 #define PULSAR_WRITEBACK_STEP (UINT64_C(64) << 20)
 
+/** Writeback state of one output stream (pulsar_writeback_init sets it up). */
 typedef struct {
+    /// The stream being written; NULL disables writeback.
     FILE *fp;        /* NULL: writeback off (a read stream, or not a regular file) */
+    /// File offset up to which bytes have been written back and dropped from the page cache.
     off_t synced;    /* bytes already pushed to disk and dropped from the cache */
 } pulsar_writeback;
 
+/** Start writeback for `fp` from its current offset; a stream without an offset (ftello fails) disables it.
+ *  @param w  the state to set up
+ *  @param fp the output stream, or NULL (writeback off) */
 static inline void pulsar_writeback_init(pulsar_writeback *w, FILE *fp) {
     w->fp = fp;
     w->synced = fp ? ftello(fp) : 0;
@@ -32,6 +41,9 @@ static inline void pulsar_writeback_init(pulsar_writeback *w, FILE *fp) {
 
 /* Push [synced, end) to disk and drop it from the cache.  `wait` blocks until
  * the range is written (required before DONTNEED can drop dirty pages). */
+/// Write back and drop [w->synced, end) (see the comment above).
+/// @param w   the writeback state
+/// @param end the file offset to write back to
 static inline void pulsar_writeback_range(pulsar_writeback *w, off_t end) {
     if (!w->fp || end <= w->synced) return;
     const int fd = fileno(w->fp);
@@ -44,6 +56,8 @@ static inline void pulsar_writeback_range(pulsar_writeback *w, off_t end) {
 
 /* Call after writing: once a step's worth has accumulated, flush stdio and
  * write it back. */
+/// Write back once PULSAR_WRITEBACK_STEP bytes have accumulated past w->synced (see the comment above).
+/// @param w the writeback state
 static inline void pulsar_writeback_step(pulsar_writeback *w) {
     if (!w->fp) return;
     const off_t pos = ftello(w->fp);
@@ -53,6 +67,8 @@ static inline void pulsar_writeback_step(pulsar_writeback *w) {
 }
 
 /* Write back and drop everything written so far (the caller still fsyncs). */
+/// Flush stdio and write back everything written so far (see the comment above).
+/// @param w the writeback state
 static inline void pulsar_writeback_finish(pulsar_writeback *w) {
     if (!w->fp) return;
     if (fflush(w->fp) != 0) return;
@@ -61,6 +77,8 @@ static inline void pulsar_writeback_finish(pulsar_writeback *w) {
 }
 
 /* Drop a whole file's cached pages after its fsync. */
+/// Drop all of `fp`'s cached pages (see the comment above).
+/// @param fp the file, or NULL (no-op)
 static inline void pulsar_writeback_drop_file(FILE *fp) {
     if (fp) (void)posix_fadvise(fileno(fp), 0, 0, POSIX_FADV_DONTNEED);
 }

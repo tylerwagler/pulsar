@@ -1,3 +1,5 @@
+/** @file
+ *  The help text and its TTY-aware printers for every pulsar binary. */
 #include "pulsar_help.h"
 
 #include <stdbool.h>
@@ -21,6 +23,9 @@ typedef struct {
     const char *bright;  ///< emphasis
 } help_colors;
 
+/// The colour set for `fp`: real SGR sequences on a TTY, all-NULL fields otherwise (printers treat NULL as "").
+/// @param fp the sink help is printed to
+/// @return the colour set
 static help_colors help_make_colors(FILE *fp) {
     bool color = isatty(fileno(fp));
     help_colors c = {0};
@@ -36,14 +41,25 @@ static help_colors help_make_colors(FILE *fp) {
     return c;
 }
 
+/// Print a section heading.
+/// @param fp the sink
+/// @param c  the colour set
+/// @param s  the heading text
 static void title(FILE *fp, const help_colors *c, const char *s) {
     fprintf(fp, "%s%s%s\n", c->title ? c->title : "", s, c->off ? c->off : "");
 }
 
+/// Print a heading in the warning colour.
+/// @param fp the sink
+/// @param c  the colour set
+/// @param s  the heading text
 static void title_red(FILE *fp, const help_colors *c, const char *s) {
     fprintf(fp, "%s%s%s\n", c->red ? c->red : "", s, c->off ? c->off : "");
 }
 
+/// Does some word of an option's name start with '-' or '/' (a switch, not a bare command)?
+/// @param name the option's display name
+/// @return true when a word starts with '-' or '/'
 static bool option_name_has_switch(const char *name) {
     bool word_start = true;
     while (*name) {
@@ -54,6 +70,10 @@ static bool option_name_has_switch(const char *name) {
     return false;
 }
 
+/// Print an option's name word by word: switches (and the first word) in the option colour, placeholders bright.
+/// @param fp   the sink
+/// @param c    the colour set (cyan non-NULL)
+/// @param name the option's display name
 static void print_colored_option_name(FILE *fp, const help_colors *c, const char *name) {
     bool has_switch = option_name_has_switch(name);
     bool word_start = true;
@@ -73,6 +93,11 @@ static void print_colored_option_name(FILE *fp, const help_colors *c, const char
     }
 }
 
+/// Print one option row: name and description (a "|" separator with colour, a 30-column table without).
+/// @param fp   the sink
+/// @param c    the colour set
+/// @param name the option's display name ("" for a continuation row)
+/// @param desc its description
 static void opt(FILE *fp, const help_colors *c, const char *name, const char *desc) {
     if (c->cyan) {
         fputs("  ", fp);
@@ -92,19 +117,31 @@ static void opt(FILE *fp, const help_colors *c, const char *name, const char *de
     }
 }
 
+/// Print a paragraph line in the placeholder colour.
+/// @param fp the sink
+/// @param c  the colour set
+/// @param s  the line
 static void para(FILE *fp, const help_colors *c, const char *s) {
     fprintf(fp, "%s%s%s\n",
             c->yellow ? c->yellow : "", s, c->yellow ? c->off : "");
 }
 
+/// @param a a string, or NULL
+/// @param b a string, or NULL
+/// @return true when both are non-NULL and equal
 static bool streq(const char *a, const char *b) {
     return a && b && strcmp(a, b) == 0;
 }
 
+/// @param topic the requested topic, or NULL
+/// @param name  a topic name
+/// @return true when `topic` is non-NULL and equals `name`
 static bool topic_is(const char *topic, const char *name) {
     return topic && strcmp(topic, name) == 0;
 }
 
+/// @param tool the binary
+/// @return its program name ("pulsar", "pulsar-server", ...)
 static const char *tool_name(pulsar_help_tool tool) {
     switch (tool) {
     case PULSAR_HELP_DS4: return "pulsar";
@@ -116,6 +153,8 @@ static const char *tool_name(pulsar_help_tool tool) {
     return "pulsar";
 }
 
+/// @param tool the binary
+/// @return its one-line usage synopsis
 static const char *tool_usage(pulsar_help_tool tool) {
     switch (tool) {
     case PULSAR_HELP_DS4:
@@ -132,6 +171,8 @@ static const char *tool_usage(pulsar_help_tool tool) {
     return "Usage: pulsar [options]";
 }
 
+/// @param tool the binary
+/// @return its one-sentence summary
 static const char *tool_summary(pulsar_help_tool tool) {
     switch (tool) {
     case PULSAR_HELP_DS4:
@@ -148,6 +189,11 @@ static const char *tool_summary(pulsar_help_tool tool) {
     return "";
 }
 
+/// Print the "Model And Runtime" section (the options shared by every binary, per binary).
+/// @param fp   the sink
+/// @param c    the colour set
+/// @param tool the binary
+/// @param full also print the speculative-decoding tuning options
 static void print_model_runtime(FILE *fp, const help_colors *c,
                                 pulsar_help_tool tool, bool full) {
     title(fp, c, "Model And Runtime");
@@ -180,6 +226,10 @@ static void print_model_runtime(FILE *fp, const help_colors *c,
     fputc('\n', fp);
 }
 
+/// Print the "Prompt And Sampling" section.
+/// @param fp   the sink
+/// @param c    the colour set
+/// @param full also print the system-prompt and prompt-input options
 static void print_sampling(FILE *fp, const help_colors *c, bool full) {
     title(fp, c, "Prompt And Sampling");
     opt(fp, c, "-n, --tokens N", "Maximum generated tokens.");
@@ -199,6 +249,9 @@ static void print_sampling(FILE *fp, const help_colors *c, bool full) {
     fputc('\n', fp);
 }
 
+/// Print the "Directional Steering" section.
+/// @param fp the sink
+/// @param c  the colour set
 static void print_steering(FILE *fp, const help_colors *c) {
     title(fp, c, "Directional Steering");
     opt(fp, c, "--dir-steering-file FILE", "Load one f32 direction vector per layer.");
@@ -209,6 +262,10 @@ static void print_steering(FILE *fp, const help_colors *c) {
 
 static void print_cli_diagnostics(FILE *fp, const help_colors *c);
 
+/// Print the CLI's "CLI Modes" section.
+/// @param fp   the sink
+/// @param c    the colour set
+/// @param full also print the diagnostics section
 static void print_cli_specific(FILE *fp, const help_colors *c, bool full) {
     title(fp, c, "CLI Modes");
     opt(fp, c, "pulsar", "Start the interactive prompt.");
@@ -220,6 +277,9 @@ static void print_cli_specific(FILE *fp, const help_colors *c, bool full) {
     }
 }
 
+/// Print the CLI's "Diagnostics And Data Collection" section.
+/// @param fp the sink
+/// @param c  the colour set
 static void print_cli_diagnostics(FILE *fp, const help_colors *c) {
     title(fp, c, "Diagnostics And Data Collection");
     opt(fp, c, "--inspect", "Load the model and print a summary only.");
@@ -235,6 +295,9 @@ static void print_cli_diagnostics(FILE *fp, const help_colors *c) {
     fputc('\n', fp);
 }
 
+/// Print the CLI's interactive commands.
+/// @param fp the sink
+/// @param c  the colour set
 static void print_cli_commands(FILE *fp, const help_colors *c) {
     title_red(fp, c, "Interactive Commands");
     opt(fp, c, "/help", "Show interactive commands.");
@@ -246,6 +309,9 @@ static void print_cli_commands(FILE *fp, const help_colors *c) {
     fputc('\n', fp);
 }
 
+/// Print the agent's "Agent Options" section.
+/// @param fp the sink
+/// @param c  the colour set
 static void print_agent_specific(FILE *fp, const help_colors *c) {
     title(fp, c, "Agent Options");
     opt(fp, c, "-p, --prompt TEXT", "Submit an initial prompt after startup.");
@@ -256,6 +322,9 @@ static void print_agent_specific(FILE *fp, const help_colors *c) {
     fputc('\n', fp);
 }
 
+/// Print the agent's "Agent Runtime Commands" section.
+/// @param fp the sink
+/// @param c  the colour set
 static void print_agent_sessions(FILE *fp, const help_colors *c) {
     title(fp, c, "Agent Runtime Commands");
     opt(fp, c, "/save", "Save the current session in ~/.ds4/kvcache.");
@@ -270,6 +339,9 @@ static void print_agent_sessions(FILE *fp, const help_colors *c) {
     fputc('\n', fp);
 }
 
+/// Print the server's "HTTP API" section.
+/// @param fp the sink
+/// @param c  the colour set
 static void print_server_api(FILE *fp, const help_colors *c) {
     title(fp, c, "HTTP API");
     opt(fp, c, "--host HOST", "Bind address. Default: 0.0.0.0 (all interfaces; use 127.0.0.1 for loopback-only)");
@@ -281,6 +353,9 @@ static void print_server_api(FILE *fp, const help_colors *c) {
     fputc('\n', fp);
 }
 
+/// Print the server's "Server Thinking Defaults" section.
+/// @param fp the sink
+/// @param c  the colour set
 static void print_server_thinking(FILE *fp, const help_colors *c) {
     title(fp, c, "Server Thinking Defaults");
     para(fp, c, "Chat requests think by default, at the loaded family's default effort.");
@@ -291,6 +366,9 @@ static void print_server_thinking(FILE *fp, const help_colors *c) {
     fputc('\n', fp);
 }
 
+/// Print the server's "Disk KV Cache" section.
+/// @param fp the sink
+/// @param c  the colour set
 static void print_kv_cache(FILE *fp, const help_colors *c) {
     title(fp, c, "Disk KV Cache");
     opt(fp, c, "--kv-disk-dir DIR", "Disk KV checkpoint dir. Default (on): $XDG_CACHE_HOME/pulsar/kv-<model>, else ~/.cache/pulsar/kv-<model>. \"\" disables.");
@@ -299,6 +377,9 @@ static void print_kv_cache(FILE *fp, const help_colors *c) {
     fputc('\n', fp);
 }
 
+/// Print the bench's "Benchmark Input" and "Benchmark Sweep" sections.
+/// @param fp the sink
+/// @param c  the colour set
 static void print_bench_specific(FILE *fp, const help_colors *c) {
     title(fp, c, "Benchmark Input");
     opt(fp, c, "--prompt-file FILE", "Raw benchmark text; token sequence is sliced at each frontier.");
@@ -317,6 +398,9 @@ static void print_bench_specific(FILE *fp, const help_colors *c) {
     fputc('\n', fp);
 }
 
+/// Print the eval's "Evaluation" section.
+/// @param fp the sink
+/// @param c  the colour set
 static void print_eval_specific(FILE *fp, const help_colors *c) {
     title(fp, c, "Evaluation");
     opt(fp, c, "-n, --tokens N", "Max generated tokens per question. Default: 16000");
@@ -334,6 +418,9 @@ static void print_eval_specific(FILE *fp, const help_colors *c) {
     fputc('\n', fp);
 }
 
+/// @param tool  the binary
+/// @param topic the requested topic, or NULL
+/// @return true when `tool`'s help has `topic` (NULL, "all" and "runtime" always do)
 static bool tool_has_topic(pulsar_help_tool tool, const char *topic) {
     if (!topic) return true;
     if (streq(topic, "all")) return true;
@@ -357,6 +444,11 @@ static bool tool_has_topic(pulsar_help_tool tool, const char *topic) {
     return false;
 }
 
+/// Print one "More Info" row, cycling through the accent colours on a TTY.
+/// @param fp    the sink
+/// @param c     the colour set
+/// @param label the row's label
+/// @param topic the topic its `--help TOPIC` names
 static void more_line(FILE *fp, const help_colors *c, const char *label, const char *topic) {
     static const char *colors[] = {
         "\x1b[38;5;81m", "\x1b[38;5;114m", "\x1b[38;5;179m",
@@ -369,6 +461,10 @@ static void more_line(FILE *fp, const help_colors *c, const char *label, const c
     fprintf(fp, "    %s%-26s%s --help %s\n", on, label, off, topic);
 }
 
+/// Print the "More Info" section: the topics `tool`'s help offers.
+/// @param fp   the sink
+/// @param c    the colour set
+/// @param tool the binary
 static void print_more_info(FILE *fp, const help_colors *c, pulsar_help_tool tool) {
     title(fp, c, "More Info");
     more_line(fp, c, "Runtime full info:", "runtime");
@@ -395,6 +491,11 @@ static void print_more_info(FILE *fp, const help_colors *c, pulsar_help_tool too
     fputc('\n', fp);
 }
 
+/// Print the "Examples" section for `tool` and `topic`.
+/// @param fp    the sink
+/// @param c     the colour set
+/// @param tool  the binary
+/// @param topic the requested topic, or NULL
 static void print_examples(FILE *fp, const help_colors *c, pulsar_help_tool tool, const char *topic) {
     title(fp, c, "Examples");
     if (topic_is(topic, "runtime")) {
@@ -431,6 +532,11 @@ static void print_examples(FILE *fp, const help_colors *c, pulsar_help_tool tool
     fputc('\n', fp);
 }
 
+/// Print the sections of one topic ("all" prints every section `tool` has).
+/// @param fp    the sink
+/// @param c     the colour set
+/// @param tool  the binary
+/// @param topic a topic tool_has_topic accepted
 static void print_topic(FILE *fp, const help_colors *c, pulsar_help_tool tool, const char *topic) {
     if (streq(topic, "all")) {
         print_model_runtime(fp, c, tool, true);
@@ -474,6 +580,10 @@ static void print_topic(FILE *fp, const help_colors *c, pulsar_help_tool tool, c
     else if (tool == PULSAR_HELP_EVAL && streq(topic, "evaluation")) print_eval_specific(fp, c);
 }
 
+/// Print the default help (no topic): the runtime options and `tool`'s main sections.
+/// @param fp   the sink
+/// @param c    the colour set
+/// @param tool the binary
 static void print_default(FILE *fp, const help_colors *c, pulsar_help_tool tool) {
     print_model_runtime(fp, c, tool, false);
 

@@ -1,3 +1,5 @@
+/** @file
+ *  The one "context buffers" line every front end prints after the engine opens. */
 #ifndef PULSAR_CTXMEM_H
 #define PULSAR_CTXMEM_H
 

@@ -1,3 +1,5 @@
+/** @file
+ *  The content-addressed segment store's implementation (pulsar_segstore.h). */
 /* L264 S4: the content-addressed segment store (pulsar_segstore.h). */
 #include "pulsar_segstore.h"
 #include "pulsar_writeback.h"
@@ -25,13 +27,20 @@ namespace {
  *   96 G_prev, 100 G, 104 text_len u64, 112 payload_bytes u64,
  *   120 trailer_bytes u64, 128 hits u32, 132 pad, 136 created u64,
  *   144 last_used u64, 152 state_bytes u64 (v2, L323)  -> 160 bytes. */
+/// Bytes of the fixed .seg header (layout above); the text starts at this offset.
 constexpr size_t HDR = 160;
 
+/** Store v little-endian at p[0..4). @param p destination @param v value */
 void put32(uint8_t *p, uint32_t v) { for (int i = 0; i < 4; i++) p[i] = (uint8_t)(v >> (8 * i)); }
+/** Store v little-endian at p[0..8). @param p destination @param v value */
 void put64(uint8_t *p, uint64_t v) { for (int i = 0; i < 8; i++) p[i] = (uint8_t)(v >> (8 * i)); }
+/** @param p 4 little-endian bytes @return their value */
 uint32_t get32(const uint8_t *p) { uint32_t v = 0; for (int i = 3; i >= 0; i--) v = (v << 8) | p[i]; return v; }
+/** @param p 8 little-endian bytes @return their value */
 uint64_t get64(const uint8_t *p) { uint64_t v = 0; for (int i = 7; i >= 0; i--) v = (v << 8) | p[i]; return v; }
 
+/** @param s at least 40 chars
+ *  @return true when s[0..40) is all lowercase hex (a well-formed key) */
 bool hex40(const char *s) {
     for (int i = 0; i < 40; i++) {
         const char c = s[i];
@@ -42,18 +51,30 @@ bool hex40(const char *s) {
 
 }  // namespace
 
+/** The open store: its directory and the in-memory index of every segment in it (keys, parents, lengths; no text). */
 struct pulsar_segstore {
+    /// The store's directory; segments are `<dir>/<key>.seg`
     std::string dir;
+    /// Bytes of .seg files the store may hold (0 = unbounded)
     uint64_t budget = 0;
+    /// The store identity (pulsar_segstore_identity) a header must carry
     uint32_t model_id = 0;
+    /// Log sink (NULL = silent)
     pulsar_segstore_log_fn log = nullptr;
+    /// Context for `log`
     void *log_ud = nullptr;
+    /// Called with every key removed (pulsar_segstore_set_removed_hook)
     pulsar_segstore_removed_fn removed = nullptr;
+    /// Context for `removed`
     void *removed_ud = nullptr;
+    /// Key -> index entry, every stored segment
     std::unordered_map<std::string, pulsar_segstore_seg> segs;
     std::unordered_map<std::string, std::vector<std::string>> children;   ///< parent key ("" = roots) -> child keys
+    /// Sum of file_bytes over segs: what the budget is checked against
     uint64_t used = 0;
 
+    /** printf-style message to `log` (truncated to 511 bytes); no-op without a sink.
+     *  @param fmt printf format */
     void logf(const char *fmt, ...) __attribute__((format(printf, 2, 3))) {
         if (!log) return;
         char msg[512];
@@ -63,8 +84,16 @@ struct pulsar_segstore {
         va_end(ap);
         log(log_ud, msg);
     }
+    /** @param key a segment key
+     *  @return the segment's file path, `<dir>/<key>.seg` */
     std::string path(const char *key) const { return dir + "/" + key + ".seg"; }
 
+    /** Read and validate a .seg header from fp's current position into *e (file_bytes, text_end and dominated are
+     *  left 0; the caller derives them).
+     *  @param fp stream at the header
+     *  @param e receives the index entry
+     *  @param flags receives the header flags (PULSAR_SEGSTORE_FLAG_*)
+     *  @return false on a short read, another magic / version / identity, a malformed key, or an empty span */
     bool read_header(FILE *fp, pulsar_segstore_seg *e, uint32_t *flags) const {
         uint8_t h[HDR];
         if (fread(h, 1, HDR, fp) != HDR) return false;
@@ -87,11 +116,16 @@ struct pulsar_segstore {
         return e->G > e->G_prev && e->state_bytes <= e->payload_bytes;
     }
 
+    /** Add e to the index: segs, its parent's children, used. Does not refresh dominance.
+     *  @param e the entry (file_bytes set) */
     void link(const pulsar_segstore_seg &e) {
         segs[e.key] = e;
         children[e.parent].push_back(e.key);
         used += e.file_bytes;
     }
+    /** Remove key from the index (not from disk): fires the removed hook, drops it from its parent's children, and
+     *  re-derives the siblings' dominance.  A no-op for a key not stored.
+     *  @param key the segment */
     void unlink_index(const std::string &key) {
         auto it = segs.find(key);
         if (it == segs.end()) return;
@@ -105,6 +139,10 @@ struct pulsar_segstore {
         segs.erase(it);
         if (parent.empty() || segs.count(parent)) refresh_dominated(parent);
     }
+    /** Read a stored segment's own text from its file.
+     *  @param key the segment
+     *  @param out receives text_len bytes
+     *  @return false when the key is not stored or the read fails */
     bool read_text(const std::string &key, std::string *out) const {
         auto it = segs.find(key);
         if (it == segs.end()) return false;
@@ -120,6 +158,8 @@ struct pulsar_segstore {
      * sibling's: the conversation went on past it under the same parent (a later tail, or the grid segment that
      * covers it), so every request it serves to its end a sibling serves too -- only one that diverges inside the
      * sibling's stretch past it resumes deeper from it.  Re-derived whenever the parent's children change. */
+    /** Recompute `dominated` for every child of parent (reads the children's texts from disk).
+     *  @param parent the parent key ("" = the roots) */
     void refresh_dominated(const std::string &parent) {
         auto ch = children.find(parent);
         if (ch == children.end()) return;
@@ -137,6 +177,7 @@ struct pulsar_segstore {
         }
     }
     /* A segment whose parent is gone cannot be reached by any lookup. */
+    /** Delete (file and index) every segment whose parent is not stored, until none is left. */
     void prune_orphans() {
         bool changed = true;
         while (changed) {
@@ -154,6 +195,7 @@ struct pulsar_segstore {
         }
     }
     /* The chain text lengths are a property of the chain, derived once. */
+    /** Set every reachable segment's text_end by walking down from the roots. */
     void derive_text_ends() {
         std::vector<std::string> stack;
         for (auto &k : children[""]) { segs[k].text_end = segs[k].text_len; stack.push_back(k); }
@@ -168,6 +210,10 @@ struct pulsar_segstore {
     }
     /* A leaf, never `keep` or `keep2`: a dominated one first (L323), else the least recently used.  false when none
      * can go. */
+    /** Evict one leaf (file and index) by the rule above.
+     *  @param keep a key to spare (NULL = none)
+     *  @param keep2 a second key to spare (NULL = none)
+     *  @return false when no leaf may go */
     bool evict_one(const char *keep, const char *keep2) {
         const pulsar_segstore_seg *victim = nullptr;
         for (auto &kv : segs) {
@@ -322,6 +368,11 @@ bool pulsar_segstore_get(pulsar_segstore *st, const char key[41], pulsar_segstor
     return true;
 }
 
+/** Write all `n` bytes of `p` to `fp`.
+ *  @param fp the open file
+ *  @param p  the bytes
+ *  @param n  their count
+ *  @return 0 when every byte was written, 1 on a short write */
 static int write_all(FILE *fp, const void *p, size_t n) { return fwrite(p, 1, n, fp) == n ? 0 : 1; }
 
 bool pulsar_segstore_put(pulsar_segstore *st, const char *parent, uint32_t G_prev, uint32_t G,
@@ -477,6 +528,11 @@ FILE *pulsar_segstore_open_trailer(pulsar_segstore *st, const char key[41], uint
 
 /* The bytes of [off, off + len) of an open file that sit in the page cache, by mincore over a read-only mapping of
  * the pages that span it (pages straddling the range's ends count by their overlap). */
+/// Page-cache residency of a byte range of an open file (see the comment above).
+/// @param fd  the open file
+/// @param off the range's first byte
+/// @param len the range's length in bytes
+/// @return bytes of the range resident in the page cache; 0 when the mapping fails
 static uint64_t segstore_resident(int fd, uint64_t off, uint64_t len) {
     if (len == 0u) return 0u;
     const long pg_l = sysconf(_SC_PAGESIZE);

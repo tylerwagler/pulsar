@@ -1,3 +1,5 @@
+/** @file
+ *  The Nemotron-H renderer, effort authority and output grammar (the checkpoint's chat_template.jinja). */
 /* nemotron_chat.cpp -- the Nemotron-H renderer, effort authority and output-parser configuration.  See
  * nemotron_chat.h.  Every literal below is the checkpoint's chat_template.jinja (Nemotron 3.5 Super VL, sha256
  * in tests/test-vectors/nemotron_h/meta.json), in the template's order. */
@@ -40,8 +42,11 @@ const char *nemotron_generation_prompt(nemotron_effort effort) {
 
 namespace {
 
+/// The suffix medium effort appends to the last user message.
 const char kMediumSuffix[] = "\n\n{reasoning effort: efficient}";
+/// The tools block's opening, before the function elements.
 const char kToolsHead[] = "# Tools\n\nYou have access to the following functions:\n\n<tools>";
+/// The tools block's close: "</tools>", the call-format instructions and the reminder.
 const char kToolsTail[] =
     "\n</tools>"
     "\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n"
@@ -57,6 +62,12 @@ const char kToolsTail[] =
     "do not tell the user about function calls\n"
     "</IMPORTANT>";
 
+/// Write "<key>: <fmt...>" into `err` (when given) and fail.
+/// @param err    the caller's error buffer, or NULL
+/// @param errlen its size in bytes
+/// @param key    the refusal's name (no_messages, tools_not_array, ...)
+/// @param fmt    printf format of the detail
+/// @return false, always
 bool refuse(char *err, size_t errlen, const char *key, const char *fmt, ...) {
     if (err && errlen) {
         char msg[300];
@@ -69,6 +80,10 @@ bool refuse(char *err, size_t errlen, const char *key, const char *fmt, ...) {
     return false;
 }
 
+/// Decode one UTF-8 sequence already validated as `n` bytes long.
+/// @param p the sequence's lead byte
+/// @param n its length in bytes (1..4)
+/// @return the codepoint
 uint32_t cp_at(const unsigned char *p, int n) {
     switch (n) {
     case 1: return p[0];
@@ -80,6 +95,10 @@ uint32_t cp_at(const unsigned char *p, int n) {
 }
 
 /* Jinja |trim (Python str.strip) on UTF-8 bytes: the kept range [*lo, *hi) of s[0, n). */
+/// @param s      the bytes
+/// @param n      their count
+/// @param lo_out receives the first kept byte
+/// @param hi_out receives one past the last kept byte
 void strip_bounds(const char *s, size_t n, size_t *lo_out, size_t *hi_out) {
     const unsigned char *u = (const unsigned char *)s;
     size_t lo = 0;
@@ -100,6 +119,8 @@ void strip_bounds(const char *s, size_t n, size_t *lo_out, size_t *hi_out) {
     *hi_out = hi;
 }
 
+/// @param s the text
+/// @return `s` with leading and trailing Unicode whitespace removed (Python str.strip())
 std::string py_strip(const std::string &s) {
     size_t lo = 0, hi = 0;
     strip_bounds(s.data(), s.size(), &lo, &hi);
@@ -108,22 +129,34 @@ std::string py_strip(const std::string &s) {
 
 /* A piece of text with the client-data ranges inside it (offsets into `s`): what the template's string operations
  * (concatenation, split, trim) act on, carrying the spans along. */
+/// Text plus the client-data spans inside it (see the comment above).
 struct piece {
+    /// The text.
     std::string s;
+    /// Client-data ranges in `s`, ascending, disjoint.
     std::vector<pulsar_text_span> spans;
 
+    /// Append template text.
+    /// @param t the literal
     void lit(const std::string &t) { s += t; }
+    /// Append client data, recording its span.
+    /// @param t the client's text (nothing is recorded when empty)
     void client(const std::string &t) {
         if (t.empty()) return;
         spans.push_back({(uint32_t)s.size(), (uint32_t)(s.size() + t.size())});
         s += t;
     }
+    /// Append another piece, its spans rebased.
+    /// @param p the piece
     void add(const piece &p) {
         const uint32_t base = (uint32_t)s.size();
         for (const pulsar_text_span &sp : p.spans) spans.push_back({base + sp.lo, base + sp.hi});
         s += p.s;
     }
     /* [lo, hi) of this piece, its spans clipped */
+    /// @param lo the first byte kept
+    /// @param hi one past the last byte kept
+    /// @return the sub-piece
     piece sub(size_t lo, size_t hi) const {
         piece out;
         out.s = s.substr(lo, hi - lo);
@@ -133,18 +166,29 @@ struct piece {
         }
         return out;
     }
+    /// @return the piece with Python str.strip() whitespace removed from both ends, spans clipped
     piece trimmed() const {
         size_t lo = 0, hi = 0;
         strip_bounds(s.data(), s.size(), &lo, &hi);
         return sub(lo, hi);
     }
+    /// @param t a NUL-terminated substring
+    /// @return true when the text contains `t`
     bool contains(const char *t) const { return s.find(t) != std::string::npos; }
 };
 
+/// Appends to a render's output, recording client-data spans as it goes.
 struct writer {
+    /// The output being written (not owned).
     nemotron_render_out *out;
+    /// Append template text.
+    /// @param t the literal
     void lit(const char *t) { out->text += t; }
+    /// Append template text.
+    /// @param t the literal
     void lit(const std::string &t) { out->text += t; }
+    /// Append client data, recording its span.
+    /// @param t the client's text (nothing is recorded when empty)
     void client(const std::string &t) {
         if (t.empty()) return;
         const uint32_t lo = (uint32_t)out->text.size();
@@ -152,6 +196,7 @@ struct writer {
         out->spans.push_back({lo, (uint32_t)out->text.size()});
     }
     /* a piece, its spans merged with an abutting previous one (the spans stay ascending and disjoint) */
+    /// @param p the piece
     void add(const piece &p) {
         const uint32_t base = (uint32_t)out->text.size();
         for (const pulsar_text_span &sp : p.spans) {
@@ -163,6 +208,11 @@ struct writer {
     }
 };
 
+/// Refuse a render too large for the 32-bit span map.
+/// @param out    the finished render
+/// @param err    the error buffer
+/// @param errlen its size
+/// @return true when the text fits (<= UINT32_MAX bytes)
 bool finish(const nemotron_render_out *out, char *err, size_t errlen) {
     if (out->text.size() > UINT32_MAX)
         return refuse(err, errlen, "prompt_too_large", "%zu bytes do not fit the 32-bit span map", out->text.size());
@@ -173,6 +223,9 @@ bool finish(const nemotron_render_out *out, char *err, size_t errlen) {
 
 void py_repr(const pyjson_value &v, std::string *out);
 
+/// Python's repr() of a str: single quotes unless the text has a ' and no ", escapes as CPython writes them.
+/// @param s   the string (UTF-8; an invalid byte is copied as is)
+/// @param out receives the repr
 void py_repr_str(const std::string &s, std::string *out) {
     const bool dq = s.find('\'') != std::string::npos && s.find('"') == std::string::npos;
     const char q = dq ? '"' : '\'';
@@ -195,6 +248,9 @@ void py_repr_str(const std::string &s, std::string *out) {
     out->push_back(q);
 }
 
+/// Python's repr() of a float.
+/// @param f   the value
+/// @param out receives the repr ("inf" / "-inf", else the shortest round-trip digits)
 void py_float(double f, std::string *out) {
     if (isinf(f)) {
         out->append(f > 0 ? "inf" : "-inf");
@@ -206,6 +262,9 @@ void py_float(double f, std::string *out) {
     pyjson_dump(v, out);   /* repr(): the shortest round-trip digits, Python's notation */
 }
 
+/// Python's repr() of a json.loads value: None, True/False, numbers, quoted strings, [..], {..}.
+/// @param v   the value
+/// @param out receives the repr
 void py_repr(const pyjson_value &v, std::string *out) {
     switch (v.kind) {
     case pyjson_value::NUL: out->append("None"); return;
@@ -235,6 +294,8 @@ void py_repr(const pyjson_value &v, std::string *out) {
 }
 
 /* `x | string`: a string as itself, anything else its repr (str() of a number, bool, None, list, dict). */
+/// @param v the value
+/// @return Python's str(v)
 std::string py_str(const pyjson_value &v) {
     if (v.kind == pyjson_value::STR) return v.s;
     std::string out;
@@ -242,6 +303,8 @@ std::string py_str(const pyjson_value &v) {
     return out;
 }
 
+/// @param v the value
+/// @return the template's `| tojson`: pyjson_dump of `v`
 std::string tojson(const pyjson_value &v) {
     std::string out;
     pyjson_dump(v, &out);
@@ -250,6 +313,9 @@ std::string tojson(const pyjson_value &v) {
 
 /* the template's render_extra_keys: every key of a mapping not in `handled`, as \n<key>value</key> -- a mapping or
  * a list as tojson, anything else as `| string`.  Keys and values are the client's. */
+/// @param w       the output
+/// @param d       the mapping, or NULL (a non-mapping writes nothing)
+/// @param handled the keys the caller already wrote
 void extra_keys(writer &w, const pyjson_value *d, std::initializer_list<const char *> handled) {
     if (!d || d->kind != pyjson_value::OBJ) return;
     for (const auto &kv : d->o) {
@@ -269,6 +335,8 @@ void extra_keys(writer &w, const pyjson_value *d, std::initializer_list<const ch
 
 /* One <function> element per tool, the template's XML, its tool data client text throughout -- the one encoding of a
  * tool definition, in the tools block and (L325) in place where a deferred tool is loaded. */
+/// @param w     the output
+/// @param tools the OpenAI tools array (each entry its "function" object, or the entry itself)
 void write_tool_functions(writer &w, const pyjson_value &tools) {
     for (const pyjson_value &t : tools.a) {
         const pyjson_value *fn = t.get("function");
@@ -323,6 +391,8 @@ void write_tool_functions(writer &w, const pyjson_value &tools) {
 }
 
 /* The tools block: the template's head, the functions, its tail (the call format and the reminder). */
+/// @param w     the output
+/// @param tools the OpenAI tools array
 void write_tools(writer &w, const pyjson_value &tools) {
     w.lit(kToolsHead);
     write_tool_functions(w, tools);
@@ -331,6 +401,12 @@ void write_tools(writer &w, const pyjson_value &tools) {
 
 /* One call: <tool_call>\n<function=NAME>\n, each argument <parameter=KEY>\nVALUE\n</parameter>\n (a string as itself,
  * a mapping or a list as tojson, anything else as `| string`), </function>\n</tool_call>\n. */
+/// @param w      the output
+/// @param m      the assistant message whose calls are written
+/// @param i      the message's index, for refusals
+/// @param err    the error buffer
+/// @param errlen its size
+/// @return false on tool_name_missing, tool_arguments_not_json or tool_arguments_not_object
 bool write_calls(writer &w, const nemotron_msg_in &m, int i, char *err, size_t errlen) {
     for (int c = 0; c < m.n_calls; c++) {
         const nemotron_tool_call_in &tc = m.calls[c];
@@ -366,6 +442,8 @@ bool write_calls(writer &w, const nemotron_msg_in &m, int i, char *err, size_t e
 
 /* The assistant's content as the template builds it: "<think>\n" + reasoning + "</think>" + content when the
  * reasoning has non-space text, else "<think></think>" + content unless the content spells a think tag itself. */
+/// @param m the assistant message
+/// @return the content piece, reasoning and content as client spans
 piece assistant_content(const nemotron_msg_in &m) {
     piece c;
     const std::string reasoning = m.reasoning ? m.reasoning : "";
@@ -384,6 +462,13 @@ piece assistant_content(const nemotron_msg_in &m) {
 }
 
 /* An assistant turn.  `truncate`: the turn is before the last user message (truncate_history_thinking). */
+/// @param w        the output
+/// @param m        the assistant message
+/// @param truncate drop the turn's reasoning (it precedes the last user message)
+/// @param i        the message's index, for refusals
+/// @param err      the error buffer
+/// @param errlen   its size
+/// @return false on raw_calls_without_calls or a call refusal
 bool write_assistant(writer &w, const nemotron_msg_in &m, bool truncate, int i, char *err, size_t errlen) {
     const piece content = assistant_content(m);
     if (m.n_calls > 0 || (m.raw_calls && m.raw_calls[0])) {
@@ -440,6 +525,15 @@ bool write_assistant(writer &w, const nemotron_msg_in &m, bool truncate, int i, 
 /* The loop body over `msgs`: `prev` = the role before msgs[0] (NULL: the conversation's first), `last_user` the
  * index in msgs of the last user message (-1: none), `after` the role after the last one (NULL: the conversation
  * ends there). */
+/// @param w         the output
+/// @param msgs      the messages to write
+/// @param n         their count
+/// @param prev      the role of the message before msgs[0], or NULL
+/// @param last_user index in `msgs` of the last user message, or -1
+/// @param effort    the effort (medium appends its suffix to msgs[last_user])
+/// @param err       the error buffer
+/// @param errlen    its size
+/// @return false on a refusal from an assistant turn
 bool write_messages(writer &w, const nemotron_msg_in *msgs, int n, const char *prev, int last_user,
                     nemotron_effort effort, char *err, size_t errlen) {
     for (int i = 0; i < n; i++) {
@@ -474,6 +568,9 @@ bool write_messages(writer &w, const nemotron_msg_in *msgs, int n, const char *p
     return true;
 }
 
+/// @param msgs the messages
+/// @param n    their count
+/// @return the index of the last message with role "user", or -1
 int last_user_of(const nemotron_msg_in *msgs, int n) {
     int last = -1;
     for (int i = 0; i < n; i++)

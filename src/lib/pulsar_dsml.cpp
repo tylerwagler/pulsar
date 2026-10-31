@@ -1,3 +1,5 @@
+/** @file
+ *  The DSML syntax table and the entity and attribute helpers pulsar_dsml.h declares. */
 #include "pulsar_dsml.h"
 
 #include <stdio.h>
@@ -6,6 +8,7 @@
 
 
 
+/// The parser's spelling table (declared in pulsar_dsml.h): V4.1, V4.1 short, V4, V4 short.
 const pulsar_dsml_syntax pulsar_dsml_syntaxes[PULSAR_DSML_SYNTAXES] = {
     {
         PULSAR_TOOL_CALLS_START, PULSAR_TOOL_CALLS_END,
@@ -38,6 +41,7 @@ const pulsar_dsml_syntax *pulsar_dsml_canonical(bool v41) {
 
 /* The entity table: one row per entity the decoder knows.  `encode` marks
  * the rows the attribute encoder writes; the rest are decode-only. */
+/// The entity table (see the comment above): entity text, its character, and whether the encoder writes it.
 static const struct {
     const char *entity;
     char ch;
@@ -55,12 +59,19 @@ static const struct {
 /* Minimal growable byte builder; malloc-backed, aborts on OOM like the
  * server's and agent's own x-allocators (an out-of-memory tool name is not a
  * condition either program recovers from). */
+/** Growable NUL-terminated byte buffer used to build DSML output. */
 typedef struct {
+    /// Malloc'd bytes, NUL-terminated once written; NULL before the first reserve
     char *ptr;
+    /// Bytes written, excluding the NUL
     size_t len;
+    /// Bytes allocated at `ptr`
     size_t cap;
 } dsml_buf;
 
+/** Grow `b` so `extra` more bytes and a NUL fit; aborts on out-of-memory.
+ *  @param b     the buffer
+ *  @param extra bytes about to be appended */
 static void dsml_buf_reserve(dsml_buf *b, size_t extra) {
     if (b->len + extra + 1 <= b->cap) return;
     size_t cap = b->cap ? b->cap : 64;
@@ -74,6 +85,10 @@ static void dsml_buf_reserve(dsml_buf *b, size_t extra) {
     b->cap = cap;
 }
 
+/** Append `n` bytes of `s` to `b` and keep it NUL-terminated.
+ *  @param b the buffer
+ *  @param s the bytes
+ *  @param n their count */
 static void dsml_buf_append(dsml_buf *b, const char *s, size_t n) {
     dsml_buf_reserve(b, n);
     memcpy(b->ptr + b->len, s, n);
@@ -81,6 +96,9 @@ static void dsml_buf_append(dsml_buf *b, const char *s, size_t n) {
     b->ptr[b->len] = '\0';
 }
 
+/** Hand `b`'s allocation to the caller, NUL-terminated even when empty.
+ *  @param b the buffer (its pointer now belongs to the caller)
+ *  @return the malloc'd string */
 static char *dsml_buf_take(dsml_buf *b) {
     dsml_buf_reserve(b, 0);   /* an empty result is still a NUL-terminated allocation */
     b->ptr[b->len] = '\0';

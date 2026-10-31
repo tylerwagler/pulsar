@@ -1,3 +1,5 @@
+/** @file
+ *  The Qwen3.8-Flash-Next renderer and reasoning-effort authority (the checkpoint's chat_template.jinja). */
 /* qwen_chat.cpp -- the Qwen3.8-Flash-Next renderer and effort authority.
  * See qwen_chat.h.  Every literal below is the checkpoint's
  * chat_template.jinja (sha256 c3cf9e34...), and the order of the checks is the
@@ -53,6 +55,8 @@ bool qwen_effort_resolve(const char *name, int thinking, qwen_effort *out, char 
 }
 
 /* The template's reasoning_instructions for each effort ("" = none). */
+/// @param e the effort
+/// @return the instruction line the system block carries for `e` (static), "" for none
 static const char *effort_line(qwen_effort e) {
     switch (e) {
     case QWEN_EFFORT_XHIGH:
@@ -69,7 +73,9 @@ static const char *effort_line(qwen_effort e) {
     return "";
 }
 
+/// The tools block's head, up to its "<tools>" (the template's literal).
 static const char kToolsHead[] = "# Tools\n\nYou have access to the following functions:\n\n<tools>";
+/// The tools block's tail from "\n</tools>": the call-format instructions (the template's literal).
 static const char kToolsTail[] =
     "\n</tools>"
     "\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n"
@@ -90,6 +96,10 @@ static const char kToolsTail[] =
 
 namespace {
 
+/// Decode one UTF-8 sequence already validated as `n` bytes long.
+/// @param p the sequence's lead byte
+/// @param n its length in bytes (1..4)
+/// @return the codepoint
 uint32_t cp_at(const unsigned char *p, int n) {
     switch (n) {
     case 1: return p[0];
@@ -101,6 +111,10 @@ uint32_t cp_at(const unsigned char *p, int n) {
 }
 
 /* Jinja |trim on UTF-8 bytes -- the kept range [*lo, *hi) of s[0, n); invalid bytes are never whitespace. */
+/// @param s      the bytes
+/// @param n      their count
+/// @param lo_out receives the first kept byte
+/// @param hi_out receives one past the last kept byte
 void py_strip_bounds(const char *s, size_t n, size_t *lo_out, size_t *hi_out) {
     const unsigned char *u = (const unsigned char *)s;
     size_t lo = 0;
@@ -121,6 +135,8 @@ void py_strip_bounds(const char *s, size_t n, size_t *lo_out, size_t *hi_out) {
     *hi_out = hi;
 }
 
+/// @param s a NUL-terminated string, or NULL (= "")
+/// @return `s` with leading and trailing Unicode whitespace removed (Python str.strip())
 std::string py_strip(const char *s) {
     if (!s) return std::string();
     size_t lo = 0, hi = 0;
@@ -128,6 +144,12 @@ std::string py_strip(const char *s) {
     return std::string(s + lo, hi - lo);
 }
 
+/// Write "<key>: <fmt...>" into `err` (when given) and fail.
+/// @param err    the caller's error buffer, or NULL
+/// @param errlen its size in bytes
+/// @param key    the refusal's name
+/// @param fmt    printf format of the detail
+/// @return false, always
 bool refuse(char *err, size_t errlen, const char *key, const char *fmt, ...) {
     if (err && errlen) {
         char msg[300];
@@ -140,11 +162,18 @@ bool refuse(char *err, size_t errlen, const char *key, const char *fmt, ...) {
     return false;
 }
 
+/// Appends to a render's output, recording client-data spans.
 struct writer {
+    /// The output being written (not owned).
     qwen_render_out *out;
+    /// Append template text.
+    /// @param s the literal
     void lit(const char *s) { out->text += s; }
+    /// Append template text.
+    /// @param s the literal
     void lit(const std::string &s) { out->text += s; }
     /* client data: recorded so the tokenizer keeps markers out of it */
+    /// @param s the client's text (nothing is recorded when empty)
     void client(const std::string &s) {
         if (s.empty()) return;
         const uint32_t lo = (uint32_t)out->text.size();
@@ -153,18 +182,30 @@ struct writer {
     }
 };
 
+/// @param s the text
+/// @param p a NUL-terminated prefix
+/// @return true when `s` begins with `p`
 bool starts_with(const std::string &s, const char *p) { return s.compare(0, strlen(p), p) == 0; }
+/// @param s the text
+/// @param p a NUL-terminated suffix
+/// @return true when `s` ends with `p`
 bool ends_with(const std::string &s, const char *p) {
     const size_t n = strlen(p);
     return s.size() >= n && s.compare(s.size() - n, n, p) == 0;
 }
 
+/// @param effort the turn's effort
+/// @return the generation prompt: an empty closed think block for QWEN_EFFORT_NONE, an open one otherwise
 const char *generation_prompt_text(qwen_effort effort) {
     return effort == QWEN_EFFORT_NONE ? "<|im_start|>assistant\n<think>\n\n</think>\n\n"
                                       : "<|im_start|>assistant\n<think>\n";
 }
 
 /* The text fits the 32-bit span map, or the render is refused. */
+/// @param out    the finished render
+/// @param err    the error buffer
+/// @param errlen its size
+/// @return false (prompt_too_large) when the text passes UINT32_MAX bytes
 bool finish(const qwen_render_out *out, char *err, size_t errlen) {
     if (out->text.size() > UINT32_MAX)
         return refuse(err, errlen, "prompt_too_large", "%zu bytes do not fit the 32-bit span map", out->text.size());
@@ -174,6 +215,13 @@ bool finish(const qwen_render_out *out, char *err, size_t errlen) {
 /* An assistant turn's calls after its content: the template's separator before the first ("\n\n",
  * nothing when the content is empty), "\n" between them -- or, with raw_calls, the sampled bytes
  * verbatim after that separator (they are the model's own text, never client data). */
+/// @param w             the output
+/// @param m             the assistant message
+/// @param content_empty its stripped content is empty (no separator before the first call)
+/// @param i             the message's index, for refusals
+/// @param err           the error buffer
+/// @param errlen        its size
+/// @return false on raw_calls_without_calls, tool_name_missing or tool_arguments_*
 bool render_calls(writer &w, const qwen_msg_in &m, bool content_empty, int i, char *err, size_t errlen) {
     if (m.raw_calls && m.raw_calls[0]) {
         if (m.n_calls <= 0)
@@ -229,8 +277,11 @@ bool render_calls(writer &w, const qwen_msg_in &m, bool content_empty, int i, ch
  * each image the template's vision literal (no `Picture N: ` prefix: add_vision_id is off) -- then |trim over the
  * whole rendered content, as the template trims it.  The literal has no whitespace at either end, so the trim can
  * only reach text. */
+/// The bytes one image renders as (template text, not client data).
 const char kVisionLiteral[] = "<|vision_start|><|image_pad|><|vision_end|>";
 
+/// @param w the output
+/// @param m the message (content plus image_at offsets)
 void content_with_images(writer &w, const qwen_msg_in &m) {
     const char *c = m.content ? m.content : "";
     const size_t n = strlen(c);
@@ -260,6 +311,15 @@ void content_with_images(writer &w, const qwen_msg_in &m) {
  * roles (NULL at either end): a tool result opens the user turn after a non-tool message and closes
  * it before one.  `first`: the conversation's first message -- the only place a system message may
  * stand.  `i` names the message in a refusal. */
+/// @param w      the output
+/// @param m      the message
+/// @param prev   the role before it, or NULL
+/// @param next   the role after it, or NULL
+/// @param first  it is the conversation's first message
+/// @param i      its index, for refusals
+/// @param err    the error buffer
+/// @param errlen its size
+/// @return false on image_position, system_not_first, unexpected_role or a call refusal
 bool render_msg(writer &w, const qwen_msg_in &m, const char *prev, const char *next, bool first, int i, char *err,
                 size_t errlen) {
     const char *role = m.role ? m.role : "";
@@ -300,6 +360,8 @@ bool render_msg(writer &w, const qwen_msg_in &m, const char *prev, const char *n
  * there is no effort line, no tools and no system text. */
 /* The tools block's entries: each tool on its own line, tojson -- the one encoding of a tool definition, in the head
  * and (L325) in place where a deferred tool is loaded. */
+/// @param w     the output
+/// @param tools the OpenAI tools array
 void write_tool_entries(writer &w, const pyjson_value &tools) {
     for (const pyjson_value &tool : tools.a) {
         w.lit("\n");
@@ -309,6 +371,11 @@ void write_tool_entries(writer &w, const pyjson_value &tools) {
     }
 }
 
+/// Write the head (see the comment above write_tool_entries).
+/// @param w      the output
+/// @param tools  the tools array, or NULL
+/// @param system the system message's content, or NULL
+/// @param effort the effort (its effort line, if any)
 void write_head(writer &w, const pyjson_value *tools, const char *system, qwen_effort effort) {
     const std::string instructions = effort_line(effort);
     const std::string content = py_strip(system);
@@ -336,6 +403,15 @@ void write_head(writer &w, const pyjson_value *tools, const char *system, qwen_e
 /* `n` messages that follow a message of role `prev` (never the conversation's first), then the generation
  * prompt for `effort` when asked -- the full render's loop body, so a turn rendered here is the bytes the full
  * render writes for it. */
+/// @param w                 the output
+/// @param msgs              the messages
+/// @param n                 their count
+/// @param prev              the role of the message before msgs[0]
+/// @param effort            the effort, for the generation prompt
+/// @param generation_prompt end with the generation prompt
+/// @param err               the error buffer
+/// @param errlen            its size
+/// @return false on a refusal from render_msg
 bool write_turn(writer &w, const qwen_msg_in *msgs, int n, const char *prev, qwen_effort effort,
                 bool generation_prompt, char *err, size_t errlen) {
     for (int k = 0; k < n; k++)

@@ -1,3 +1,5 @@
+/** @file
+ *  The output-parser kit's implementation and the shared JSON {"name", "args"} call body. */
 /* out_parse_kit.cpp -- the output-parser kit.  See out_parse_kit.h. */
 #include "out_parse_kit.h"
 
@@ -13,6 +15,9 @@ namespace {
 
 /* Length of the longest suffix of s that is a proper prefix of `marker`: the
  * bytes that must wait for the next chunk before they can be called text. */
+/// @param s      the held bytes
+/// @param marker a marker the current state could take
+/// @return the length of the longest suffix of `s` that is a proper prefix of `marker` (0 if none)
 size_t marker_tail(const std::string &s, const std::string &marker) {
     const size_t m = marker.size();
     for (size_t k = std::min(s.size(), m - 1); k > 0; k--)
@@ -20,6 +25,10 @@ size_t marker_tail(const std::string &s, const std::string &marker) {
     return 0;
 }
 
+/// Decode one UTF-8 sequence already validated as `n` bytes long.
+/// @param p the sequence's lead byte
+/// @param n its length in bytes (1..4)
+/// @return the codepoint
 uint32_t cp_at(const unsigned char *p, int n) {
     switch (n) {
     case 1: return p[0];
@@ -31,6 +40,10 @@ uint32_t cp_at(const unsigned char *p, int n) {
 }
 
 /* The end of the whole UTF-8 sequences in b[lo, hi): hi, or the start of a sequence hi cuts. */
+/// @param b  the bytes
+/// @param lo the start of the range (a lead byte is not looked for before it)
+/// @param hi one past the range's end
+/// @return `hi`, or the offset of the incomplete sequence `hi` cuts
 size_t utf8_whole_end(const std::string &b, size_t lo, size_t hi) {
     size_t k = hi;
     while (k > lo && ((unsigned char)b[k - 1] & 0xc0) == 0x80) k--;

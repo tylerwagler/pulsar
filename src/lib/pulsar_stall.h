@@ -1,3 +1,5 @@
+/** @file
+ *  The worker's process-global progress marks, the stall watchdog's input (src/server/watchdog.cpp). */
 /* The worker's progress marks (the stall watchdog's input; src/server/watchdog.cpp).
  *
  * A production server hung under memory pressure 2026-10-29 (Nemotron 3.5 Super, 16 banks, ~190k context): the worker spun inside libcuda for 36
@@ -16,14 +18,18 @@
 #include <stdint.h>
 #include <time.h>
 
+/** The process-global progress marks (one instance, g_pulsar_stall); written by pulsar_stall_mark, read by the watchdog. */
 struct pulsar_stall_marks {
     std::atomic<uint64_t> beats{0};            ///< every mark bumps it: the heartbeat
     std::atomic<const char *> where{nullptr};  ///< the section last entered (a string literal)
     std::atomic<int64_t> where_ms{0};          ///< CLOCK_MONOTONIC ms when it was entered
 };
 
+/// The process's one set of marks (C++17 inline variable: one instance across every TU).
 inline pulsar_stall_marks g_pulsar_stall;
 
+/** The CLOCK_MONOTONIC time in milliseconds, the clock the marks are stamped with.
+ *  @return milliseconds since an arbitrary fixed point */
 static inline int64_t pulsar_stall_now_ms(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -31,6 +37,7 @@ static inline int64_t pulsar_stall_now_ms(void) {
 }
 
 /** Enter a section: publish its name and the time, and beat. */
+/// @param where the section's name; must be a string literal (its pointer is published)
 static inline void pulsar_stall_mark(const char *where) {
     g_pulsar_stall.where.store(where, std::memory_order_relaxed);
     g_pulsar_stall.where_ms.store(pulsar_stall_now_ms(), std::memory_order_relaxed);

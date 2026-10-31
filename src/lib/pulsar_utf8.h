@@ -1,3 +1,5 @@
+/** @file
+ *  The one strict UTF-8 well-formedness rule (Unicode 15 Table 3-7) for the engine, CLI, eval TUI and agent. */
 #pragma once
 
 #include <stddef.h>
@@ -20,6 +22,8 @@
 /** Bytes in the UTF-8 sequence that `lead` begins: 1 for ASCII, 2-4 for a
  * valid multibyte lead, 0 for a byte that cannot start a sequence (a
  * continuation byte, 0xC0, 0xC1 or 0xF5-0xFF). */
+/// @param lead the sequence's first byte
+/// @return the sequence length 1..4, or 0 when `lead` cannot start one
 static inline int utf8_seq_len(unsigned char lead) {
     if (lead < 0x80) return 1;
     if (lead >= 0xc2 && lead <= 0xdf) return 2;
@@ -33,6 +37,9 @@ static inline int utf8_seq_len(unsigned char lead) {
  * continuation byte outside 0x80-0xBF, or a Table 3-7 second-byte
  * violation).  A caller advancing through arbitrary bytes treats 0 as "this
  * one byte is its own unit". */
+/// @param p the bytes
+/// @param n their count
+/// @return the well-formed sequence's length 1..4, or 0
 static inline int utf8_seq_ok(const unsigned char *p, size_t n) {
     if (n == 0) return 0;
     const int len = utf8_seq_len(p[0]);
