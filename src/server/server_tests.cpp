@@ -458,6 +458,75 @@ static char *read_socket_text(int fd) {
 
 
 
+static int count_substr(const char *s, const char *needle) {
+    int n = 0;
+    size_t nl = strlen(needle);
+    for (const char *q = s; q && (q = strstr(q, needle)) != NULL; q += nl) n++;
+    return n;
+}
+
+
+
+/* L335: an OpenAI stream that streamed SOME of the turn's calls live (call 0 went out as start + argument
+ * deltas) must deliver the rest (calls 1 and 2) in the finish, each exactly once under its own index -- the
+ * finish used to send the calls only when NO call had streamed, so calls 1 and 2 were lost. */
+static void test_openai_sse_finish_sends_calls_past_streamed(void) {
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] < 0 || sv[1] < 0) return;
+
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    r.api = API_OPENAI;
+    r.stream = true;
+    r.has_tools = true;
+
+    openai_stream st;
+    openai_stream_start(&r, &st);
+    chat_sink k;
+    openai_sink_init(&k, sv[0], NULL, &r, "chatcmpl_test", &st);
+    const char *args0 = "{\"command\":\"echo zero\"}";
+    TEST_ASSERT(k.tool_ops->begin(&k, 0, "call_zero", "bash"));
+    TEST_ASSERT(k.tool_ops->args(&k, 0, args0, strlen(args0)));
+    TEST_ASSERT(k.tool_ops->end(&k, 0));
+    TEST_ASSERT(st.tools_streamed == 1);
+
+    tool_calls calls = {0};
+    const char *names[3] = {"call_zero", "call_one", "call_two"};
+    const char *cmds[3] = {"{\"command\":\"echo zero\"}", "{\"command\":\"echo one\"}",
+                           "{\"command\":\"echo two\"}"};
+    for (int i = 0; i < 3; i++) {
+        tool_call tc = {0};
+        tc.id = xstrdup(names[i]);
+        tc.name = xstrdup("bash");
+        tc.arguments = xstrdup(cmds[i]);
+        tool_calls_push(&calls, tc);
+    }
+    TEST_ASSERT(openai_sse_finish(&k, &calls, "tool_calls", 10, 8));
+    shutdown(sv[0], SHUT_WR);
+    char *out = read_socket_text(sv[1]);
+
+    TEST_ASSERT(count_substr(out, "\"id\":\"call_zero\"") == 1);   /* the live start delta only */
+    TEST_ASSERT(count_substr(out, "\"id\":\"call_one\"") == 1);
+    TEST_ASSERT(count_substr(out, "\"id\":\"call_two\"") == 1);
+    TEST_ASSERT(count_substr(out, "{\"index\":0,\"id\"") == 1);
+    TEST_ASSERT(count_substr(out, "{\"index\":1,\"id\":\"call_one\"") == 1);
+    TEST_ASSERT(count_substr(out, "{\"index\":2,\"id\":\"call_two\"") == 1);
+    TEST_ASSERT(count_substr(out, "echo one") == 1);
+    TEST_ASSERT(count_substr(out, "echo two") == 1);
+    const char *one = strstr(out, "\"id\":\"call_one\"");
+    const char *finish = strstr(out, "\"finish_reason\":\"tool_calls\"");
+    TEST_ASSERT(one && finish && one < finish);
+
+    free(out);
+    tool_calls_free(&calls);
+    request_free(&r);
+    close(sv[0]);
+    close(sv[1]);
+}
+
+
+
 static void test_context_length_error_uses_protocol_standard_shape(void) {
     request r;
     request_init(&r, REQ_CHAT, 128);
@@ -11693,6 +11762,7 @@ static void pulsar_server_unit_tests_run(void) {
     test_anthropic_usage_reports_cache_details();
     test_anthropic_tool_stream_sends_live_tool_use();
     test_openai_tool_stream_sends_incremental_text();
+    test_openai_sse_finish_sends_calls_past_streamed();
     test_openai_tool_stream_truncated_call_closes_args();
     test_openai_stream_usage_reports_cache_details();
     test_responses_usage_reports_cache_details();

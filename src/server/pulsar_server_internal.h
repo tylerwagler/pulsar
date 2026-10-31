@@ -4152,7 +4152,7 @@ bool parser_finish_turn(server *s, struct session_slot *sl, struct gen_state *g,
 void append_json_object_string(buf *b, const char *json);
 void append_tool_calls_json(buf *b, const tool_calls *calls, const char *id_prefix,
                                    const tool_schema_orders *orders);
-void append_tool_call_deltas_json(buf *b, const tool_calls *calls, const char *id_prefix,
+void append_tool_call_deltas_json(buf *b, const tool_calls *calls, int first, const char *id_prefix,
                                          const tool_schema_orders *orders);
 bool http_response(int fd, int code, const char *type, const char *body);
 bool http_error(int fd, int code, const char *msg);

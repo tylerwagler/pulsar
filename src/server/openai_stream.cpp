@@ -753,10 +753,12 @@ static bool openai_sse_send_final(int fd, const request *r, const char *id, long
 
 
 /* The end of the stream: the calls no delta carried yet (a block the final
- * parse recovered), then the closing chunk, usage and [DONE]. */
+ * parse recovered, or the calls after the ones streamed live), then the closing
+ * chunk, usage and [DONE]. */
 /// End an OpenAI chat stream: calls no delta carried, the closing chunk, usage and [DONE].
 /// @param k                  the OpenAI sink
-/// @param calls              the turn's calls (sent whole only when no call was streamed live)
+/// @param calls              the turn's calls: those past openai_stream::tools_streamed are sent whole, each once,
+///                           under its own index (as the Anthropic finish sends the calls past its count)
 /// @param finish             the finish_reason
 /// @param prompt_tokens      the prompt's tokens
 /// @param completion_tokens  the tokens generated
@@ -766,11 +768,11 @@ bool openai_sse_finish(chat_sink *k, const tool_calls *calls, const char *finish
     const openai_stream *st = (const openai_stream *)k->st;
     buf b = {0};
     long now = (long)time(NULL);
-    if (calls && calls->len && !st->tools_streamed) {
+    if (calls && calls->len > st->tools_streamed) {
         buf_printf(&b, "data: {\"id\":\"%s\",\"object\":\"chat.completion.chunk\",\"created\":%ld,\"model\":", k->id, now);
         json_escape(&b, k->r->model);
         buf_puts(&b, ",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":");
-        append_tool_call_deltas_json(&b, calls, k->id, &k->r->tool_orders);
+        append_tool_call_deltas_json(&b, calls, st->tools_streamed, k->id, &k->r->tool_orders);
         buf_puts(&b, "},\"finish_reason\":null}]}\n\n");
     }
     return openai_sse_send_final(k->fd, k->r, k->id, now, &b, st->lp, finish, prompt_tokens, completion_tokens);
