@@ -94,23 +94,46 @@ void thread_wchan(int tid, char *out, size_t outlen) {
     out[n] = '\0';
 }
 
-/** @param key a /proc/meminfo field with its colon ("SwapTotal:")
- *  @return the field's value in KiB; 0 when absent or unreadable */
-uint64_t meminfo_kib(const char *key) {
-    FILE *fp = fopen("/proc/meminfo", "r");
-    if (!fp) return 0;
+/** What meminfo_kib found (L335: a missing key and an unreadable file are told apart). */
+enum meminfo_read {
+    MEMINFO_FOUND,       ///< the field was read
+    MEMINFO_MISSING,     ///< the file has no such field
+    MEMINFO_UNREADABLE,  ///< the file would not open
+};
+
+/** @param path the meminfo file ("/proc/meminfo"; a test passes its own)
+ *  @param key a field with its colon ("SwapTotal:")
+ *  @param kib receives the field's value in KiB (0 unless found)
+ *  @return MEMINFO_FOUND, MEMINFO_MISSING (the file has no such field) or MEMINFO_UNREADABLE (it would not open) */
+meminfo_read meminfo_kib(const char *path, const char *key, uint64_t *kib) {
+    *kib = 0;
+    FILE *fp = fopen(path, "r");
+    if (!fp) return MEMINFO_UNREADABLE;
     char line[256];
     unsigned long long v = 0;
     const size_t kl = strlen(key);
+    meminfo_read r = MEMINFO_MISSING;
     while (fgets(line, sizeof line, fp))
-        if (!strncmp(line, key, kl) && sscanf(line + kl, " %llu", &v) == 1) break;
+        if (!strncmp(line, key, kl) && sscanf(line + kl, " %llu", &v) == 1) {
+            r = MEMINFO_FOUND;
+            *kib = v;
+            break;
+        }
     fclose(fp);
-    return v;
+    return r;
 }
 
-/** The names of server::m_slot_phase's values 0..7, for the stall dump. */
+/** The names of server::m_slot_phase's values (gen_phase + 1; 0 = no bound job), for the stall dump. */
 const char *const k_phase_names[] = {"idle", "restore", "prefill-cold", "prefill", "decode-init", "decode", "finish",
                                      "done"};
+static_assert(sizeof(k_phase_names) / sizeof(k_phase_names[0]) == GEN_DONE + 2,
+              "k_phase_names: one name per gen_phase, plus idle");
+
+/** @param ph a published server::m_slot_phase value
+ *  @return its name, or "?" outside k_phase_names */
+const char *phase_name(int ph) {
+    return ph >= 0 && (size_t)ph < sizeof(k_phase_names) / sizeof(k_phase_names[0]) ? k_phase_names[ph] : "?";
+}
 
 /** The watchdog thread: once a second, compare the worker's mark count (g_pulsar_stall.beats) with the last seen;
  *  with jobs queued or running (read under server::mu by trylock: a held mu keeps the last answer) and no mark
@@ -197,7 +220,17 @@ void server::watchdog_dump(int64_t stalled_s) {
                (unsigned long long)g_pulsar_stall.beats.load(std::memory_order_relaxed));
     /* memory: what MemAvailable, swap and the KV figures read now */
     const uint64_t avail = server_mem_available_bytes();
-    const uint64_t swap_total = meminfo_kib("SwapTotal:"), swap_free = meminfo_kib("SwapFree:");
+    uint64_t swap_total = 0, swap_free = 0;
+    const meminfo_read rt = meminfo_kib("/proc/meminfo", "SwapTotal:", &swap_total);
+    const meminfo_read rf = meminfo_kib("/proc/meminfo", "SwapFree:", &swap_free);
+    char swap[96];
+    if (rt == MEMINFO_FOUND && rf == MEMINFO_FOUND)
+        snprintf(swap, sizeof swap, "swap used %.2f of %.2f GiB", (double)(swap_total - swap_free) / (1024.0 * 1024.0),
+                 (double)swap_total / (1024.0 * 1024.0));
+    else
+        snprintf(swap, sizeof swap, "swap unknown (%s)",
+                 rt == MEMINFO_UNREADABLE || rf == MEMINFO_UNREADABLE ? "/proc/meminfo unreadable"
+                 : rt == MEMINFO_MISSING ? "no SwapTotal: in /proc/meminfo" : "no SwapFree: in /proc/meminfo");
     /* the worker's published snapshot (under mu; trylock for up to ~1 s -- the dump never blocks on a held lock) */
     bool locked = false;
     for (int i = 0; i < 100 && !locked; i++) {
@@ -209,19 +242,17 @@ void server::watchdog_dump(int64_t stalled_s) {
     } else {
         server_log(PULSAR_LOG_DEFAULT,
                    "pulsar-server: STALL:   queue %d waiting, %d running; KV touched %.2f GiB, reserved %.2f GiB, "
-                   "guard budget %.2f GiB (ceiling %.2f); MemAvailable %.2f GiB, floor %.2f GiB, swap used %.2f of "
-                   "%.2f GiB",
+                   "guard budget %.2f GiB (ceiling %.2f); MemAvailable %.2f GiB, floor %.2f GiB, %s",
                    s->n_queued, s->n_generating, (double)s->m_kv_touched.raw() / gib,
                    (double)s->m_kv_reserved.raw() / gib, (double)s->m_kv_budget.raw() / gib,
                    (double)s->guard_touched_ceiling.raw() / gib, (double)avail / gib,
-                   (double)server_mem_floor().raw() / gib, (double)(swap_total - swap_free) / (1024.0 * 1024.0),
-                   (double)swap_total / (1024.0 * 1024.0));
+                   (double)server_mem_floor().raw() / gib, swap);
         for (int i = 0; i < s->n_slots; i++) {
             const int ph = s->m_slot_phase[i];
             if (ph == 0 && s->m_slot_pos[i] == 0) continue;   /* idle and empty */
             server_log(PULSAR_LOG_DEFAULT,
                        "pulsar-server: STALL:   slot %d bank %d: %s, position %d of %d, prefill %d/%d%s%s", i,
-                       s->slots[i].bank, ph >= 0 && ph < 8 ? k_phase_names[ph] : "?", s->m_slot_pos[i],
+                       s->slots[i].bank, phase_name(ph), s->m_slot_pos[i],
                        s->m_slot_ctx[i], s->m_slot_prefill_done[i], s->m_slot_prefill_total[i],
                        s->slots[i].spilled ? ", spilled" : "", s->slots[i].preempted ? ", preempted" : "");
         }

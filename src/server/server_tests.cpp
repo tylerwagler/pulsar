@@ -11453,6 +11453,27 @@ static void test_prefill_mem_step_tries_remedies_first(void) {
     TEST_ASSERT(!strcmp(prefill_mem_step_names[PREFILL_MEM_REFUSE], "refuse"));
 }
 
+/* L335: the stall dump's meminfo reader tells a missing field from an unreadable file (both read 0 before), and its
+ * phase names are bounded by the table, which has one name per gen_phase plus idle. */
+static void test_stall_dump_meminfo_and_phase_names(void) {
+    char path[] = "/tmp/pulsar-l335-meminfo-XXXXXX";
+    const int fd = mkstemp(path);
+    TEST_ASSERT(fd >= 0);
+    if (fd < 0) return;
+    const char text[] = "MemTotal:       131072 kB\nSwapTotal:        8192 kB\n";
+    TEST_ASSERT(write(fd, text, sizeof text - 1) == (ssize_t)(sizeof text - 1));
+    close(fd);
+    uint64_t v = 7;
+    TEST_ASSERT(meminfo_kib(path, "SwapTotal:", &v) == MEMINFO_FOUND && v == 8192);
+    TEST_ASSERT(meminfo_kib(path, "SwapFree:", &v) == MEMINFO_MISSING && v == 0);
+    unlink(path);
+    TEST_ASSERT(meminfo_kib(path, "SwapTotal:", &v) == MEMINFO_UNREADABLE && v == 0);
+    TEST_ASSERT(!strcmp(phase_name(0), "idle"));
+    TEST_ASSERT(!strcmp(phase_name(GEN_DONE + 1), "done"));
+    TEST_ASSERT(!strcmp(phase_name(GEN_DONE + 2), "?"));
+    TEST_ASSERT(!strcmp(phase_name(-1), "?"));
+}
+
 /* The stall watchdog's two rules: the env value (malformed refuses to start), and when a quiet worker is a stall. */
 static void test_stall_watchdog_rules(void) {
     char err[256];
@@ -11936,6 +11957,7 @@ static void pulsar_server_unit_tests_run(void) {
     test_persist_skipped_under_the_floor();
     test_prefill_mem_step_tries_remedies_first();
     test_stall_watchdog_rules();
+    test_stall_dump_meminfo_and_phase_names();
     test_health_reports_a_stall();
     test_stall_marks_beat();
     test_logprob_token_json_sanitizes_ill_formed_utf8();
