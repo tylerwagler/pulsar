@@ -175,7 +175,7 @@ static void test_openai_tool_schema_that_does_not_canonicalize_refuses(void) {
                        tools + "}";
     request r;
     char rerr[200] = {0};
-    TEST_ASSERT(!parse_chat_request_render(NULL, NULL, body.c_str(), 128, &r, rerr, sizeof rerr));
+    TEST_ASSERT(!parse_chat_request_render(NULL, PULSAR_CHAT_DS4_V41, NULL, body.c_str(), 128, &r, rerr, sizeof rerr));
     TEST_ASSERT(strstr(rerr, "tools[1] (function \"huge\")") != NULL);
 }
 
