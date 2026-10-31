@@ -459,8 +459,8 @@ bool write_assistant(writer &w, const nemotron_msg_in &m, bool truncate, int i, 
 }
 
 /* The loop body over `msgs`: `prev` = the role before msgs[0] (NULL: the conversation's first), `last_user` the
- * index in msgs of the last user message (-1: none), `after` the role after the last one (NULL: the conversation
- * ends there). */
+ * index in msgs of the last user message (-1: none).  A tool run at the end of `msgs` closes its user turn there:
+ * nothing after msgs[n - 1] is consulted. */
 /// @param w         the output
 /// @param msgs      the messages to write
 /// @param n         their count
