@@ -7,10 +7,20 @@
  * on (server_family_ops::find_call_block) and the model-visible tool error (server_family_ops::tool_error_suffix).
  * Until L295 these bodies sat in openai_stream.cpp, genmsg.cpp, anthropic_stream.cpp, kv_cache.cpp,
  * tool_memory.cpp, server_jobs.cpp and generate.cpp. */
+/** @file
+ *  DeepSeek's DSML machinery (L295 F5): the decode-time tracker, the live tool-stream projection, the final
+ *  parse, the call-block finder and the model-visible tool error.
+ */
 #include "deepseek_dsml.h"
 
 /* ---- the raw-text helpers and the decode-time tracker ------------------------------------------------ */
 
+/// Does `raw` hold all of `lit` at `pos`?
+/// @param raw      the text
+/// @param raw_len  bytes of `raw` available
+/// @param pos      the offset to test
+/// @param lit      the literal (NUL-terminated)
+/// @return true when the whole literal is there
 bool raw_full_lit(const char *raw, size_t raw_len, size_t pos, const char *lit) {
     size_t n = strlen(lit);
     return pos <= raw_len && raw_len - pos >= n && !memcmp(raw + pos, lit, n);
@@ -18,6 +28,12 @@ bool raw_full_lit(const char *raw, size_t raw_len, size_t pos, const char *lit) 
 
 
 
+/// Does `raw` end, at `pos`, with a proper prefix of `lit` (the literal may still be arriving)?
+/// @param raw      the text
+/// @param raw_len  bytes of `raw` available
+/// @param pos      the offset to test
+/// @param lit      the literal
+/// @return true for a proper, possibly empty, prefix that reaches the end of `raw`
 static bool raw_partial_lit(const char *raw, size_t raw_len, size_t pos, const char *lit) {
     size_t n = strlen(lit);
     if (pos > raw_len || raw_len - pos >= n) return false;
@@ -26,6 +42,13 @@ static bool raw_partial_lit(const char *raw, size_t raw_len, size_t pos, const c
 
 
 
+/// raw_partial_lit for either of two literals.
+/// @param raw      the text
+/// @param raw_len  bytes of `raw` available
+/// @param pos      the offset to test
+/// @param a        one literal
+/// @param b        the other
+/// @return true when either may still be arriving at `pos`
 bool raw_partial_any(const char *raw, size_t raw_len, size_t pos,
                             const char *a, const char *b) {
     return raw_partial_lit(raw, raw_len, pos, a) || raw_partial_lit(raw, raw_len, pos, b);
@@ -33,6 +56,11 @@ bool raw_partial_any(const char *raw, size_t raw_len, size_t pos,
 
 
 
+/// strstr over `n` bytes (no NUL needed).
+/// @param s    the bytes
+/// @param n    how many
+/// @param lit  the literal (empty: `s`)
+/// @return the first occurrence, or NULL
 const char *find_lit_bounded(const char *s, size_t n, const char *lit) {
     size_t m = strlen(lit);
     if (m == 0) return s;
@@ -45,6 +73,13 @@ const char *find_lit_bounded(const char *s, size_t n, const char *lit) {
 
 
 
+/// raw_partial_lit, but only for a prefix of at least `min_len` bytes.
+/// @param raw      the text
+/// @param raw_len  bytes of `raw` available
+/// @param pos      the offset to test
+/// @param lit      the literal
+/// @param min_len  the shortest prefix that counts
+/// @return true for such a prefix
 static bool raw_partial_lit_min(const char *raw, size_t raw_len, size_t pos,
                                 const char *lit, size_t min_len) {
     size_t lit_len = strlen(lit);
@@ -55,6 +90,7 @@ static bool raw_partial_lit_min(const char *raw, size_t raw_len, size_t pos,
 
 
 
+/// @return the longest tool_calls opener of every DSML syntax, bytes (the tracker's search hold)
 static size_t dsml_max_tool_start_len(void) {
     size_t max = 0;
     for (size_t i = 0; i < PULSAR_DSML_SYNTAXES; i++) {
@@ -66,6 +102,12 @@ static size_t dsml_max_tool_start_len(void) {
 
 
 
+/// The earliest tool_calls opener of any syntax in `raw`.
+/// @param raw      the text
+/// @param raw_len  bytes of `raw` available
+/// @param pos_out  receives the offset just past the opener
+/// @param syn_out  receives its syntax
+/// @return false when there is none
 static bool dsml_find_tool_start(const char *raw, size_t raw_len,
                                  size_t *pos_out,
                                  const pulsar_dsml_syntax **syn_out) {
@@ -86,6 +128,13 @@ static bool dsml_find_tool_start(const char *raw, size_t raw_len,
 
 
 
+/// dsml_find_tool_start from offset `start`.
+/// @param raw      the text
+/// @param raw_len  bytes of `raw` available
+/// @param start    where the search starts (past raw_len: none)
+/// @param pos_out  receives the absolute offset just past the opener
+/// @param syn_out  receives its syntax
+/// @return false when there is none
 static bool dsml_find_tool_start_from(const char *raw, size_t raw_len,
                                       size_t start,
                                       size_t *pos_out,
@@ -101,6 +150,11 @@ static bool dsml_find_tool_start_from(const char *raw, size_t raw_len,
 
 
 
+/// @param raw        the text
+/// @param raw_len    bytes of `raw`
+/// @param tag_start  the parameter tag's first byte
+/// @param tag_end    one past its '>'
+/// @return true when the tag says string="true"
 static bool dsml_attr_is_string_true(const char *raw, size_t raw_len,
                                      size_t tag_start, size_t tag_end) {
     if (tag_end <= tag_start || tag_end > raw_len) return false;
@@ -236,18 +290,24 @@ dsml_decode_state dsml_decode_state_for_text(const char *raw, size_t raw_len) {
 #endif
 
 
+/// @param state  a decode state
+/// @return true anywhere inside a tool block
 bool dsml_decode_state_is_tool(dsml_decode_state state) {
     return state != DSML_DECODE_OUTSIDE;
 }
 
 
 
+/// @param state  a decode state
+/// @return true inside a string payload (a string parameter's body or a JSON string): the draw is sampled
 bool dsml_decode_state_uses_payload_sampling(dsml_decode_state state) {
     return state == DSML_DECODE_STRING_BODY || state == DSML_DECODE_JSON_STRING;
 }
 
 
 
+/// Reset the tracker to searching, outside any block.
+/// @param dt  the tracker
 void dsml_decode_tracker_init(dsml_decode_tracker *dt) {
     memset(dt, 0, sizeof(*dt));
     dt->mode = DSML_TRACK_SEARCH;
@@ -260,6 +320,9 @@ void dsml_decode_tracker_init(dsml_decode_tracker *dt) {
  * forgiving recognizer, not a validator: malformed DSML still gets parsed later
  * by the normal tool-call parser.  Here we only need enough state to decide
  * whether the next token belongs to protocol syntax or arbitrary payload. */
+/// @param dt       the tracker (NULL: nothing)
+/// @param raw      the whole generated text so far (NULL: nothing)
+/// @param raw_len  its length; the tracker resumes from dt->pos
 void dsml_decode_tracker_update(dsml_decode_tracker *dt,
                                        const char *raw, size_t raw_len) {
     if (!dt || !raw) return;
@@ -403,6 +466,11 @@ structural:
 
 
 
+/// Hold back a trailing partial XML entity ("&am") of a string value.
+/// @param raw    the text
+/// @param start  the value's first byte
+/// @param limit  the end of what could be released
+/// @return the release limit (the partial entity's '&', or `limit`)
 static size_t dsml_entity_stream_safe_len(const char *raw, size_t start, size_t limit) {
     static const char *ents[] = {"&amp;", "&lt;", "&gt;", "&quot;", "&apos;"};
     const size_t max_ent = 6;
@@ -422,6 +490,14 @@ static size_t dsml_entity_stream_safe_len(const char *raw, size_t start, size_t 
 
 
 
+/// How much of a parameter value may stream: held back are a partial closing tag of any DSML style, a partial
+/// entity (string values) and a split UTF-8 sequence.
+/// @param raw        the text
+/// @param start      the value's first unreleased byte
+/// @param raw_len    bytes of `raw`
+/// @param param_end  the active syntax's parameter close (unused: every style's close is held)
+/// @param is_string  the value is a string
+/// @return the release limit
 size_t tool_param_value_stream_safe_len(const char *raw, size_t start,
                                                size_t raw_len, const char *param_end,
                                                bool is_string) {
@@ -449,6 +525,10 @@ size_t tool_param_value_stream_safe_len(const char *raw, size_t start,
  * suffix beginning at a '<' that is a prefix of ANY known closing form is
  * tag debris, never value content.  Returns len unchanged when the tail is
  * not tag-shaped. */
+/// @param raw    the text
+/// @param start  the range's first byte
+/// @param len    one past its last
+/// @return where the tag debris starts, or `len`
 size_t trim_truncated_dsml_close_tail(const char *raw, size_t start, size_t len) {
     /* Every closing literal of every syntax in the table. */
     const char *ends[PULSAR_DSML_SYNTAXES * 3];
@@ -477,6 +557,8 @@ size_t trim_truncated_dsml_close_tail(const char *raw, size_t start, size_t len)
 }
 
 /* The EARLIEST occurrence of any syntax's tool_calls opener (closer) in s. */
+/// @param s  the text (NUL-terminated)
+/// @return the earliest opener, or NULL
 const char *find_any_tool_start(const char *s) {
     const char *best = NULL;
     for (size_t i = 0; i < PULSAR_DSML_SYNTAXES; i++) {
@@ -488,6 +570,9 @@ const char *find_any_tool_start(const char *s) {
 
 
 
+/// The EARLIEST occurrence of any syntax's tool_calls closer in `s`.
+/// @param s  the text (NUL-terminated)
+/// @return the earliest closer, or NULL
 const char *find_any_tool_end(const char *s) {
     const char *best = NULL;
     for (size_t i = 0; i < PULSAR_DSML_SYNTAXES; i++) {
@@ -499,6 +584,12 @@ const char *find_any_tool_end(const char *s) {
 
 
 
+/// The marker scan: set the flags for the tool_calls opener / closer found in `scan`; a closer only counts after
+/// an opener (earlier or in `scan`), else it is an orphan.
+/// @param scan        the text to scan (NULL: nothing)
+/// @param saw_start   in/out: an opener has been seen
+/// @param saw_end     in/out: a closer after an opener has been seen
+/// @param orphan_end  set when only a closer appears (may be NULL)
 void observe_tool_markers(const char *scan, bool *saw_start,
                                  bool *saw_end, bool *orphan_end) {
     if (!scan) return;
@@ -517,6 +608,10 @@ void observe_tool_markers(const char *scan, bool *saw_start,
 
 
 
+/// @param raw    the text
+/// @param start  the lowest the limit may go
+/// @param limit  the end before the trim
+/// @return `limit` with trailing whitespace above `start` removed
 size_t trim_tool_separator_ws(const char *raw, size_t start, size_t limit) {
     while (limit > start && isspace((unsigned char)raw[limit - 1])) limit--;
     return limit;
@@ -524,6 +619,8 @@ size_t trim_tool_separator_ws(const char *raw, size_t start, size_t limit) {
 
 
 
+/// @param p  a NUL-terminated string
+/// @return the first non-whitespace byte
 static const char *skip_ascii_ws(const char *p) {
     while (*p && isspace((unsigned char)*p)) p++;
     return p;
@@ -531,6 +628,9 @@ static const char *skip_ascii_ws(const char *p) {
 
 
 
+/// @param s       the text (NULL: none)
+/// @param needle  the substring (NULL or empty: none)
+/// @return its last occurrence, or NULL
 const char *find_last_substr(const char *s, const char *needle) {
     if (!s || !needle || !needle[0]) return NULL;
     const char *last = NULL;
@@ -544,6 +644,11 @@ const char *find_last_substr(const char *s, const char *needle) {
 
 
 
+/// Append one "name": value member to a JSON arguments body (no braces).
+/// @param args       the members so far (", " is added between them)
+/// @param name       the parameter name
+/// @param value      its value (NULL: "" or null)
+/// @param is_string  "true": `value` is quoted as a string; else it is minified raw JSON (null when empty)
 static void tool_call_json_args_add(buf *args, const char *name, const char *value, const char *is_string) {
     if (args->len) buf_puts(args, ", ");
     json_escape(args, name ? name : "");
@@ -571,6 +676,12 @@ static void tool_call_json_args_add(buf *args, const char *name, const char *val
  * reject or repair the call, which is much better than aborting the assistant
  * turn and losing the whole sampled continuation.
  */
+/// One flat parameter at *p_in as a JSON member appended to `out`.
+/// @param p_in         the cursor, advanced past the parameter on success
+/// @param param_start  the syntax's parameter opener
+/// @param param_end    its closer
+/// @param out          the members being built
+/// @return false when the text at *p_in is not a complete named parameter
 static bool dsml_parse_leaf_param_json(const char **p_in, const char *param_start,
                                        const char *param_end, buf *out) {
     const char *p = *p_in;
@@ -611,6 +722,12 @@ static bool dsml_parse_leaf_param_json(const char **p_in, const char *param_star
 
 
 
+/// A run of child parameters as one JSON object appended to `out` (the drifted nested shape above).
+/// @param p_in         the cursor, advanced past the run on success
+/// @param param_start  the syntax's parameter opener
+/// @param param_end    its closer
+/// @param out          receives "{...}"
+/// @return false when there is no child or one is malformed
 static bool dsml_parse_nested_params_object(const char **p_in,
                                             const char *param_start,
                                             const char *param_end,
@@ -643,6 +760,11 @@ static bool dsml_parse_nested_params_object(const char **p_in,
 
 
 
+/// Split `text[0, n)` at the first `</think>` into reasoning and content (no `</think>` after a `<think>` opener: all reasoning).
+/// @param text           the text (NULL: "")
+/// @param n              bytes to read
+/// @param content_out    receives the content (malloc'd)
+/// @param reasoning_out  receives the reasoning (malloc'd, or NULL for none)
 static void split_reasoning_content(const char *text, size_t n, char **content_out, char **reasoning_out) {
     char *s = xstrndup(text ? text : "", n);
     char *body = s;
@@ -673,6 +795,10 @@ static void split_reasoning_content(const char *text, size_t n, char **content_o
 
 /* The prefix before a tool call recovered from UNCLOSED reasoning is
  * reasoning, not content (upstream ds4 51a1c14). */
+/// @param text           the text
+/// @param prefix_len     bytes before the recovered block (a leading `<think>` dropped)
+/// @param content_out    receives the content (malloc'd)
+/// @param reasoning_out  receives the prefix as reasoning (malloc'd)
 static void unterminated_reasoning_before_tool(const char *text,
                                                size_t prefix_len,
                                                char **content_out,
@@ -687,6 +813,14 @@ static void unterminated_reasoning_before_tool(const char *text,
     *content_out = xstrdup("");
 }
 
+/// The final DSML parse of a generated turn: content, reasoning and the tool calls of the first DSML block (its raw
+/// bytes into calls->raw_calls), with the think gate and the complete-block recovery described inside.
+/// @param text                     the generated text (NULL: "")
+/// @param require_thinking_closed  thinking is on: DSML counts only after `</think>` (or as a complete block)
+/// @param content_out    receives the content (malloc'd)
+/// @param reasoning_out  receives the reasoning (malloc'd, or NULL for none)
+/// @param calls                    receives the parsed calls
+/// @return false when the block is malformed (the caller frees what was filled)
 bool parse_generated_message_ex(const char *text, bool require_thinking_closed,
                                        char **content_out, char **reasoning_out,
                                        tool_calls *calls) {
@@ -877,6 +1011,10 @@ bool parse_generated_message_ex(const char *text, bool require_thinking_closed,
  * turn without it). Keep a short overlap until the opening appears, then wait
  * for its matching end — a lone "<" or partial marker keeps decoding
  * untouched. */
+/// @param text       the generated text
+/// @param len        its length
+/// @param scan_from  in/out: where the scan resumes
+/// @return true when a complete tool block sits at or after the scan point
 bool complete_tool_call_inside_thinking(const char *text, size_t len,
                                         size_t *scan_from) {
     if (!text || !scan_from) return false;
@@ -895,6 +1033,14 @@ bool complete_tool_call_inside_thinking(const char *text, size_t len,
 
 /* ---- the text a stream may release before a tool marker ---------------------------------------------- */
 
+/// How much answer text may stream: with tools, up to (not including) a tool marker and its leading whitespace,
+/// holding trailing whitespace and a possible partial marker until proven text; always whole UTF-8 sequences.
+/// @param raw        the text
+/// @param start      the first unreleased byte
+/// @param raw_len    bytes of `raw`
+/// @param has_tools  the request declares tools
+/// @param final      the finish: release what was held (except a found marker)
+/// @return the release limit
 size_t text_stream_safe_limit(const char *raw, size_t start,
                                      size_t raw_len, bool has_tools,
                                      bool final) {
@@ -945,6 +1091,8 @@ size_t text_stream_safe_limit(const char *raw, size_t start,
  * streamers (L184).  See ::dsml_tool_stream in the header for the contract.
  * ========================================================================= */
 
+/// Free the generated ids (the projection itself is caller-owned).
+/// @param ts  the tool-stream projection (NULL: nothing)
 void dsml_tool_stream_free(dsml_tool_stream *ts) {
     if (!ts) return;
     for (int i = 0; i < ts->ids_cap; i++) free(ts->ids[i]);
@@ -957,6 +1105,12 @@ void dsml_tool_stream_free(dsml_tool_stream *ts) {
 
 /* Which syntax opens the block at `pos` decides every literal the projection
  * matches from here on. */
+/// Start projecting the block whose opener sits at `pos` (any previous state freed).
+/// @param ts  the tool-stream projection
+/// @param raw      the text
+/// @param raw_len  bytes of `raw` available
+/// @param pos      the opener's offset
+/// @return false when no syntax's opener is there (the projection is then inactive, in error)
 bool dsml_tool_stream_init(dsml_tool_stream *ts, const char *raw, size_t raw_len, size_t pos) {
     dsml_tool_stream_free(ts);
     memset(ts, 0, sizeof(*ts));
@@ -977,6 +1131,10 @@ bool dsml_tool_stream_init(dsml_tool_stream *ts, const char *raw, size_t raw_len
 
 
 
+/// @param ts  the tool-stream projection (NULL: none)
+/// @param id    the id
+/// @param upto  only indices below this are compared
+/// @return true when an earlier invocation already has `id`
 static bool dsml_tool_stream_has_id(const dsml_tool_stream *ts, const char *id, int upto) {
     if (!ts || !id || !id[0]) return false;
     if (upto > ts->ids_cap) upto = ts->ids_cap;
@@ -991,6 +1149,11 @@ static bool dsml_tool_stream_has_id(const dsml_tool_stream *ts, const char *id, 
 /* Free function (NOT a server:: method): legitimately called with a null
  * server (the unit tests project without a bound server).  As a member the
  * `!s` guard would be elided under -O3 (this assumed non-null). */
+/// @param s      the server whose tool memory is also checked (NULL: no such check)
+/// @param ts  the tool-stream projection
+/// @param index  the invocation index (< 0: "")
+/// @param api    the protocol whose id style is used
+/// @return the id (owned by the projection)
 const char *dsml_tool_stream_id(server *s, dsml_tool_stream *ts, int index, api_style api) {
     if (!ts || index < 0) return "";
     if (index >= ts->ids_cap) {
@@ -1019,6 +1182,9 @@ static bool dsml_tool_close_invoke(dsml_tool_stream *ts, chat_sink *k);
 
 /* The block is not a call (the finish reads it as text, L284 P4): the projection stops, and a call it
  * already announced is closed on the stream as sent -- the rule every family's stream keeps. */
+/// @param ts  the tool-stream projection
+/// @param k   the protocol sink (its tool_ops)
+/// @return false when a client write failed
 static bool dsml_tool_stream_fail(dsml_tool_stream *ts, chat_sink *k) {
     const bool ok = !ts->args_open || dsml_tool_close_invoke(ts, k);
     ts->active = false;
@@ -1030,6 +1196,11 @@ static bool dsml_tool_stream_fail(dsml_tool_stream *ts, chat_sink *k) {
 
 /* A string parameter's value bytes: DSML entities undone, then JSON-string
  * escaped, as a fragment inside the already-open quotes. */
+/// @param ts  the tool-stream projection
+/// @param k   the protocol sink (its tool_ops)
+/// @param text  the value bytes
+/// @param len   how many (0: nothing)
+/// @return false when a client write failed
 static bool dsml_tool_emit_string_value(dsml_tool_stream *ts, chat_sink *k, const char *text, size_t len) {
     if (len == 0) return true;
     char *raw = xstrndup(text, len);
@@ -1045,6 +1216,12 @@ static bool dsml_tool_emit_string_value(dsml_tool_stream *ts, chat_sink *k, cons
 
 
 
+/// A parameter's `,"name":` (and the opening quote of a string value).
+/// @param ts  the tool-stream projection
+/// @param k   the protocol sink (its tool_ops)
+/// @param name       the parameter name
+/// @param is_string  open a string value
+/// @return false when a client write failed
 static bool dsml_tool_emit_param_prefix(dsml_tool_stream *ts, chat_sink *k, const char *name, bool is_string) {
     buf frag = {0};
     if (ts->first_param) ts->first_param = false;
@@ -1059,6 +1236,12 @@ static bool dsml_tool_emit_param_prefix(dsml_tool_stream *ts, chat_sink *k, cons
 
 
 
+/// An invoke tag at parse_pos: announce the call (begin + "{"), or fail the block for a nameless or undeclared one.
+/// @param ts  the tool-stream projection
+/// @param k   the protocol sink (its tool_ops)
+/// @param raw      the text
+/// @param raw_len  bytes of `raw` available
+/// @return false when a client write failed (true while the tag is incomplete)
 static bool dsml_tool_start_invoke(dsml_tool_stream *ts, chat_sink *k, const char *raw, size_t raw_len) {
     const char *tag_end = (const char *)memchr(raw + ts->parse_pos, '>', raw_len - ts->parse_pos);
     if (!tag_end) return true;
@@ -1091,6 +1274,12 @@ static bool dsml_tool_start_invoke(dsml_tool_stream *ts, chat_sink *k, const cha
 
 
 
+/// A parameter tag at parse_pos: emit its prefix and enter its value, or fail the block without name / string.
+/// @param ts  the tool-stream projection
+/// @param k   the protocol sink (its tool_ops)
+/// @param raw      the text
+/// @param raw_len  bytes of `raw` available
+/// @return false when a client write failed (true while the tag is incomplete)
 static bool dsml_tool_start_param(dsml_tool_stream *ts, chat_sink *k, const char *raw, size_t raw_len) {
     const char *tag_end = (const char *)memchr(raw + ts->parse_pos, '>', raw_len - ts->parse_pos);
     if (!tag_end) return true;
@@ -1117,6 +1306,12 @@ static bool dsml_tool_start_param(dsml_tool_stream *ts, chat_sink *k, const char
 
 
 
+/// Emit the current value's bytes [parse_pos, value_end).
+/// @param ts  the tool-stream projection
+/// @param k   the protocol sink (its tool_ops)
+/// @param raw        the text
+/// @param value_end  one past the last byte to emit
+/// @return false when a client write failed
 static bool dsml_tool_emit_value(dsml_tool_stream *ts, chat_sink *k, const char *raw, size_t value_end) {
     if (value_end <= ts->parse_pos) return true;
     return ts->param_is_string ?
@@ -1126,6 +1321,12 @@ static bool dsml_tool_emit_value(dsml_tool_stream *ts, chat_sink *k, const char 
 
 
 
+/// The value up to its closing tag, its closing quote, then back between parameters.
+/// @param ts  the tool-stream projection
+/// @param k   the protocol sink (its tool_ops)
+/// @param raw        the text
+/// @param value_end  where the closing tag starts
+/// @return false when a client write failed
 static bool dsml_tool_finish_param(dsml_tool_stream *ts, chat_sink *k, const char *raw, size_t value_end) {
     if (!dsml_tool_emit_value(ts, k, raw, value_end)) return false;
     if (ts->param_is_string && !k->tool_ops->args(k, ts->index, "\"", 1)) return false;
@@ -1137,6 +1338,9 @@ static bool dsml_tool_finish_param(dsml_tool_stream *ts, chat_sink *k, const cha
 
 
 /* The invocation's "}" and the protocol's block stop, then the next index. */
+/// @param ts  the tool-stream projection
+/// @param k   the protocol sink (its tool_ops)
+/// @return false when a client write failed
 static bool dsml_tool_close_invoke(dsml_tool_stream *ts, chat_sink *k) {
     if (ts->args_open && !k->tool_ops->args(k, ts->index, "}", 1)) return false;
     ts->args_open = false;
@@ -1155,6 +1359,11 @@ static bool dsml_tool_close_invoke(dsml_tool_stream *ts, chat_sink *k) {
  * stop the block -- so the wire JSON is well-formed; the finish reason
  * (length) says the turn was cut, and the final reading returns no call
  * (the turn is text: no tag repair). */
+/// @param ts  the tool-stream projection
+/// @param k   the protocol sink (its tool_ops)
+/// @param raw      the text
+/// @param raw_len  bytes of `raw` available
+/// @return false when a client write failed
 bool dsml_tool_stream_finalize(dsml_tool_stream *ts, chat_sink *k,
                                const char *raw, size_t raw_len) {
     if (!ts->active) return true;
@@ -1180,6 +1389,12 @@ bool dsml_tool_stream_finalize(dsml_tool_stream *ts, chat_sink *k,
 
 
 
+/// Advance the projection over the newly released text, emitting events as markers complete.
+/// @param ts  the tool-stream projection
+/// @param k   the protocol sink (its tool_ops)
+/// @param raw      the text
+/// @param raw_len  bytes released so far
+/// @return false when a client write failed
 bool dsml_tool_stream_update(dsml_tool_stream *ts, chat_sink *k,
                              const char *raw, size_t raw_len) {
     const pulsar_dsml_syntax *syn = ts->syn;
@@ -1247,6 +1462,8 @@ bool dsml_tool_stream_update(dsml_tool_stream *ts, chat_sink *k,
 
 /* ---- the stream's call ids onto the parsed calls ----------------------------------------------------- */
 
+/// @param calls  the parsed calls (NULL: nothing)
+/// @param ts     the stream's projection (NULL: nothing)
 void apply_stream_tool_ids(tool_calls *calls, const dsml_tool_stream *ts) {
     if (!calls || !ts) return;
     /* The SSE stream may have exposed tool ids before final DSML parsing.  The
@@ -1264,6 +1481,9 @@ void apply_stream_tool_ids(tool_calls *calls, const dsml_tool_stream *ts) {
 
 /* ---- the call-block finder (tool memory's key) ------------------------------------------------------- */
 
+/// @param p        where to search
+/// @param end_out  receives one past the block's closer (NULL when none); may be NULL
+/// @return the earliest complete block's start (its "\n\n" separator included when present), or NULL
 const char *find_next_dsml_tool_block(const char *p, const char **end_out) {
     struct block_form {
         const char *start;
@@ -1302,6 +1522,10 @@ const char *find_next_dsml_tool_block(const char *p, const char **end_out) {
 
 /* ---- the model-visible tool error -------------------------------------------------------------------- */
 
+/// The client's system region of a rendered DeepSeek prompt: after the BOS, the System token and the effort line,
+/// up to the first user or assistant token, whitespace trimmed.
+/// @param prompt_text  the rendered prompt (NULL: "")
+/// @return the region (malloc'd)
 static char *rendered_chat_system_region(const char *prompt_text) {
     if (!prompt_text) return xstrdup("");
     const char *p = prompt_text;
@@ -1331,6 +1555,12 @@ static char *rendered_chat_system_region(const char *prompt_text) {
  * open think block, then exactly what the replay path renders for ONE tool
  * message after the assistant's call turn -- EOS, the tool_result, the
  * generation prefix (render_live_tool_tail) -- or next-turn prefix reuse dies. */
+/// @param r            the request (think mode, tools, variant; NULL: V4.1, no thinking)
+/// @param thinking     where the decode stands (inside reasoning: "</think>" first)
+/// @param result_text  the tool result's body (NULL: "")
+/// @param spans_out    receives the client-data ranges (malloc'd); may be NULL
+/// @param n_spans_out  receives how many; may be NULL
+/// @return the suffix (malloc'd)
 static char *build_live_tool_result_suffix_spans(const request *r,
                                                  const thinking_state *thinking,
                                                  const char *result_text,
@@ -1369,6 +1599,12 @@ static char *build_live_tool_result_suffix_spans(const request *r,
 
 
 
+/// @param r            the request (its prompt_text supplies the system reminder)
+/// @param thinking     where the decode stands relative to reasoning
+/// @param detail       what was wrong (may be NULL or empty)
+/// @param spans_out    see above
+/// @param n_spans_out  see above
+/// @return the suffix (malloc'd)
 char *build_invalid_dsml_tool_error_suffix_spans(const request *r,
                                                  const thinking_state *thinking,
                                                  const char *detail,
@@ -1400,6 +1636,11 @@ char *build_invalid_dsml_tool_error_suffix_spans(const request *r,
 
 
 
+/// The model-visible DSML tool error as one tool result appended mid-turn, with the system region reminded.
+/// @param r         the request
+/// @param thinking  where the decode stands relative to reasoning
+/// @param detail    what was wrong (may be NULL or empty)
+/// @return the suffix (malloc'd)
 char *build_invalid_dsml_tool_error_suffix(const request *r,
                                                   const thinking_state *thinking,
                                                   const char *detail) {

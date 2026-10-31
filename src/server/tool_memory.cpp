@@ -1,8 +1,14 @@
+/** @file
+ *  Tool memory (call bodies by id and block bytes, LRU) and the protocols' live tool-state bindings; also
+ *  server_now_sec and server_log.
+ */
 #include "pulsar_server_internal.h"
 #include "pulsar_lock.hpp"
 
 
 
+/// @brief The monotonic clock (CLOCK_MONOTONIC), in seconds; for intervals, not wall time.
+/// @return seconds since an arbitrary fixed point
 double server_now_sec(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -11,6 +17,9 @@ double server_now_sec(void) {
 
 
 
+/// @brief One timestamped ("MMDD HH:MM:SS") log line to stderr, through pulsar_log's type filter; any thread.
+/// @param type  the log category (pulsar_log decides whether it prints)
+/// @param fmt   printf format, then its arguments; the newline is added
 void server_log(pulsar_log_type type, const char *fmt, ...) {
     time_t now = time(NULL);
     struct tm tm;
@@ -45,18 +54,26 @@ void server_log(pulsar_log_type type, const char *fmt, ...) {
 void id_list_push_unique(stop_list *ids, const char *id);
 
 
+/// @brief The entry ceiling: m->max_entries, or PULSAR_TOOL_MEMORY_DEFAULT_MAX_IDS when unset (<= 0).
+/// @param m  the tool memory (NULL: the default)
+/// @return the maximum number of entries
 int tool_memory_max_entries(const tool_memory *m) {
     return m && m->max_entries > 0 ? m->max_entries : PULSAR_TOOL_MEMORY_DEFAULT_MAX_IDS;
 }
 
 
 
+/// @brief The byte ceiling: m->max_bytes, or PULSAR_TOOL_MEMORY_MAX_BYTES when unset (0).
+/// @param m  the tool memory (NULL: the default)
+/// @return the maximum accounted bytes
 static size_t tool_memory_max_bytes(const tool_memory *m) {
     return m && m->max_bytes > 0 ? m->max_bytes : PULSAR_TOOL_MEMORY_MAX_BYTES;
 }
 
 
 
+/// @brief Allocate the two index maps on first use (dies on allocation failure).  Caller holds server::tool_mu.
+/// @param m  the tool memory
 static void tool_memory_init_locked(tool_memory *m) {
     if (m->by_id && m->by_block) return;
     /* nothrow, because the established contract here is die() on allocation
@@ -68,6 +85,9 @@ static void tool_memory_init_locked(tool_memory *m) {
 
 
 
+/// @brief Link `e` at the LRU list's head (most recently used).  Caller holds server::tool_mu.
+/// @param m  the tool memory
+/// @param e  an entry not on the list
 static void tool_memory_link_head(tool_memory *m, tool_memory_entry *e) {
     e->prev = NULL;
     e->next = m->head;
@@ -78,6 +98,9 @@ static void tool_memory_link_head(tool_memory *m, tool_memory_entry *e) {
 
 
 
+/// @brief Unlink `e` from the LRU list.  Caller holds server::tool_mu.
+/// @param m  the tool memory
+/// @param e  an entry on the list
 static void tool_memory_unlink(tool_memory *m, tool_memory_entry *e) {
     if (e->prev) e->prev->next = e->next;
     else m->head = e->next;
@@ -88,6 +111,9 @@ static void tool_memory_unlink(tool_memory *m, tool_memory_entry *e) {
 
 
 
+/// @brief Mark `e` used: stamp it with the next clock value and move it to the LRU head.  Caller holds server::tool_mu.
+/// @param m  the tool memory
+/// @param e  an entry on the list
 static void tool_memory_touch(tool_memory *m, tool_memory_entry *e) {
     e->stamp = ++m->clock;
     if (m->head == e) return;
@@ -97,6 +123,9 @@ static void tool_memory_touch(tool_memory *m, tool_memory_entry *e) {
 
 
 
+/// @brief Remove `e` from the block's list of entries sharing it (no refcount change).
+/// @param b  the block
+/// @param e  the entry (absent: nothing happens)
 static void tool_block_unlink_entry(tool_memory_block *b, tool_memory_entry *e) {
     tool_memory_entry **p = &b->entries;
     while (*p) {
@@ -111,6 +140,11 @@ static void tool_block_unlink_entry(tool_memory_block *b, tool_memory_entry *e) 
 
 
 
+/// @brief The block with exactly these bytes, if remembered.  Caller holds server::tool_mu.
+/// @param m    the tool memory
+/// @param raw  the block bytes
+/// @param len  bytes at `raw` (0: none)
+/// @return the block, or NULL
 tool_memory_block *tool_memory_find_block_locked(tool_memory *m,
                                                         const char *raw,
                                                         size_t len) {
@@ -121,6 +155,11 @@ tool_memory_block *tool_memory_find_block_locked(tool_memory *m,
 
 
 
+/// @brief The block with these bytes, created (refs 0, its bytes charged) when absent.  Caller holds server::tool_mu.
+/// @param m    the tool memory (maps initialised)
+/// @param raw  the block bytes
+/// @param len  bytes at `raw`
+/// @return the block (never NULL: dies on allocation failure)
 static tool_memory_block *tool_memory_get_block_locked(tool_memory *m,
                                                        const char *raw,
                                                        size_t len) {
@@ -143,6 +182,9 @@ static tool_memory_block *tool_memory_get_block_locked(tool_memory *m,
 
 
 
+/// @brief Drop one reference to `b`; at zero it is unindexed, uncharged and freed.  Caller holds server::tool_mu.
+/// @param m  the tool memory
+/// @param b  the block (NULL: nothing)
 static void tool_memory_release_block_locked(tool_memory *m, tool_memory_block *b) {
     if (!b) return;
     if (--b->refs > 0) return;
@@ -155,6 +197,9 @@ static void tool_memory_release_block_locked(tool_memory *m, tool_memory_block *
 
 
 
+/// @brief Remove and free one entry: unindex, unlink, uncharge, release its block.  Caller holds server::tool_mu.
+/// @param m  the tool memory
+/// @param e  the entry (NULL: nothing)
 static void tool_memory_remove_entry_locked(tool_memory *m, tool_memory_entry *e) {
     if (!e) return;
     if (m->by_id && e->id) m->by_id->erase(std::string(e->id));
@@ -170,6 +215,8 @@ static void tool_memory_remove_entry_locked(tool_memory *m, tool_memory_entry *e
 
 
 
+/// @brief Evict least-recently-used entries until both ceilings hold.  Caller holds server::tool_mu.
+/// @param m  the tool memory
 static void tool_memory_prune_locked(tool_memory *m) {
     while ((m->entries > tool_memory_max_entries(m) ||
             m->bytes > tool_memory_max_bytes(m)) && m->tail)
@@ -180,6 +227,10 @@ static void tool_memory_prune_locked(tool_memory *m) {
 
 
 
+/// @brief The entry for call id `id` (no LRU touch).  Caller holds server::tool_mu.
+/// @param m   the tool memory
+/// @param id  the call id (NULL or empty: none)
+/// @return the entry, or NULL
 static tool_memory_entry *tool_memory_find_entry_locked(tool_memory *m,
                                                         const char *id) {
     if (!m->by_id || !id || !id[0]) return NULL;
@@ -189,6 +240,12 @@ static tool_memory_entry *tool_memory_find_entry_locked(tool_memory *m,
 
 
 
+/// @brief Remember `raw` as call `id`'s block: an identical entry is only touched (and upgraded to RAM when
+///        `source` is), a different one replaced; then prune.  Caller holds server::tool_mu.
+/// @param m       the tool memory
+/// @param id      the call id (NULL or empty: ignored)
+/// @param raw     the block's exact bytes, NUL-terminated (NULL or empty: ignored)
+/// @param source  where the entry came from
 static void tool_memory_put_locked(tool_memory *m, const char *id,
                                    const char *raw, tool_memory_source source) {
     if (!id || !id[0] || !raw || !raw[0]) return;
@@ -233,6 +290,8 @@ static void tool_memory_put_locked(tool_memory *m, const char *id,
 
 
 
+/// @brief Free every entry, block and index, and zero the struct.  Shutdown (or tests): no lock taken.
+/// @param m  the tool memory
 void tool_memory_free(tool_memory *m) {
     while (m->tail) tool_memory_remove_entry_locked(m, m->tail);
     delete m->by_id;
@@ -252,6 +311,9 @@ void tool_memory_free(tool_memory *m) {
  * live on the session_slot (they describe that session, and move with it);
  * server.tool_mu guards them all because request parsing reads call-ids on
  * client threads before a job is bound to a slot. */
+/// @brief Invalidate a binding: drop its ids and visible text (the id array's storage is kept).  Caller holds
+///        server::tool_mu.
+/// @param st  the binding (NULL: nothing)
 static void live_tool_state_clear_locked(live_tool_state *st) {
     if (!st) return;
     stop_list_clear(&st->call_ids);
@@ -264,6 +326,8 @@ static void live_tool_state_clear_locked(live_tool_state *st) {
 
 
 
+/// @brief Free a binding's storage and zero it.
+/// @param st  the binding (NULL: nothing)
 void live_tool_state_free(live_tool_state *st) {
     if (!st) return;
     live_tool_state_clear_locked(st);
@@ -273,6 +337,8 @@ void live_tool_state_free(live_tool_state *st) {
 
 
 
+/// @brief Invalidate a visible-transcript binding and free its text.  Caller holds server::tool_mu.
+/// @param st  the binding (NULL: nothing)
 static void visible_live_clear_locked(visible_live_state *st) {
     if (!st) return;
     free(st->visible_text);
@@ -284,6 +350,8 @@ static void visible_live_clear_locked(visible_live_state *st) {
 
 
 
+/// @brief Free a visible-transcript binding's storage and zero it.
+/// @param st  the binding (NULL: nothing)
 void visible_live_free(visible_live_state *st) {
     if (!st) return;
     visible_live_clear_locked(st);
@@ -387,6 +455,12 @@ bool server::anthropic_live_has_call_id(const char *id) {
 
 
 
+/// @brief A binding matches when it is valid, stands at `live_tokens` and holds exactly the set `ids`.  Caller
+///        holds server::tool_mu.
+/// @param st           the binding
+/// @param ids          the request's ids
+/// @param live_tokens  the frontier, in tokens, it must stand at (-1: never matches a valid binding at >= 0)
+/// @return true on a match
 static bool live_state_matches_ids_locked(const live_tool_state *st,
                                           const stop_list *ids,
                                           int live_tokens) {
@@ -476,6 +550,12 @@ bool server::tool_memory_has_id(const char *id) {
 
 
 
+/// @brief Call `id`'s remembered block bytes, touching the entry.  Caller holds server::tool_mu.
+/// @param m       the tool memory
+/// @param id      the call id
+/// @param source  receives where the entry came from (may be NULL)
+/// @param block   receives the block (may be NULL)
+/// @return the block bytes (owned by the memory; valid while tool_mu is held), or NULL
 static const char *tool_memory_lookup_locked(tool_memory *m, const char *id,
                                              tool_memory_source *source,
                                              tool_memory_block **block) {
@@ -582,6 +662,11 @@ void server::tool_memory_attach_to_messages(chat_msgs *msgs,
 
 
 
+/// @brief Whether one of the first `upto` calls already carries id `id`.
+/// @param calls  the calls
+/// @param id     the id (NULL or empty: false)
+/// @param upto   how many leading calls to check (capped at calls->len)
+/// @return true when found
 static bool tool_calls_contains_id(const tool_calls *calls, const char *id, int upto) {
     if (!calls || !id || !id[0]) return false;
     if (upto > calls->len) upto = calls->len;

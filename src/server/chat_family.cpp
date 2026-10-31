@@ -10,6 +10,10 @@
  * step 4), and refuses by name what that template cannot express.  A new family adds one table -- in its own
  * file (Inkling: family_inkling.cpp, over F5's src/lib/inkling_chat) -- and one case in
  * server_family_for_format; a new protocol adds one parser and no arm. */
+/** @file
+ *  The model-family half of a chat request (L267): render_chat_conversation, the family tables and their
+ *  shared helpers (DeepSeek's and Qwen's tables live here).
+ */
 #include "pulsar_server_internal.h"
 #include "deepseek_dsml.h"
 #include "../lib/qwen_chat.h"
@@ -19,6 +23,8 @@
 #include <string>
 #include <vector>
 
+/// Free everything a parsed conversation owns and zero it.
+/// @param c  the conversation (NULL: nothing)
 void chat_conversation_free(chat_conversation *c) {
     if (!c) return;
     chat_msgs_free(&c->msgs);
@@ -112,6 +118,7 @@ void render_prelude(server *s, chat_conversation *c, request *r) {
  * output_config.effort, chat_template_kwargs.reasoning_effort.  What each means is the loaded family's
  * effort map (server_effort_map, one row per family, declared with its other hooks below); "none" is
  * thinking off on every family. */
+/** Every effort name any protocol sends, in server_effort_map::named's column order. */
 extern const char *const k_effort_names[CHAT_EFFORT_NAMES] = {"none", "minimal", "low", "medium", "high", "xhigh",
                                                                 "max"};
 static_assert(sizeof k_effort_names / sizeof k_effort_names[0] == CHAT_EFFORT_NAMES,
@@ -119,6 +126,8 @@ static_assert(sizeof k_effort_names / sizeof k_effort_names[0] == CHAT_EFFORT_NA
 /* the rows the integer axis and the thinking rule name */
 enum { k_effort_row_none = 0, k_effort_row_low = 2, k_effort_row_high = 4, k_effort_row_max = 6 };
 
+/// @param name  an effort name
+/// @return its column in k_effort_names, or -1 when it is not one
 static int effort_row(const char *name) {
     for (int i = 0; i < CHAT_EFFORT_NAMES; i++)
         if (!strcmp(name, k_effort_names[i])) return i;
@@ -127,11 +136,19 @@ static int effort_row(const char *name) {
 
 /* An integer effort on a template without integer levels: the row of the nearest reference preset
  * (low 50, high 75, max 100). */
+/// @param value  an integer effort 1..100
+/// @return the column of low, high or max
 static int effort_row_nearest(int value) {
     return value < 63 ? k_effort_row_low : value < 88 ? k_effort_row_high : k_effort_row_max;
 }
 
 /* One effort value: null (not sent), a name of k_effort_names, or an integer 1..100. */
+/// @param p    the JSON cursor, advanced past the value
+/// @param key  the control's name, for the error
+/// @param a    receives level (a column, -1 for none / an integer) and value (the integer, 0 for none)
+/// @param err     receives the reason on false
+/// @param errlen  size of `err`
+/// @return false on a malformed value (err set, except on a JSON syntax error)
 static bool effort_value(const char **p, const char *key, chat_effort_ask *a, char *err, size_t errlen) {
     json_ws(p);
     if (json_lit(p, "null")) {
@@ -163,6 +180,10 @@ static bool effort_value(const char **p, const char *key, chat_effort_ask *a, ch
     return true;
 }
 
+/// One boolean thinking switch: null (not sent) or true / false.
+/// @param p  the JSON cursor, advanced past the value
+/// @param a  receives thinking (1 / 0) when one was sent
+/// @return false on a value that is neither null nor a bool
 static bool thinking_bool(const char **p, chat_effort_ask *a) {
     json_ws(p);
     if (json_lit(p, "null")) return true;
@@ -247,6 +268,12 @@ bool chat_effort_ask_thinking(const chat_effort_ask *a, const char *model, bool 
 /* Thinking by the one rule, then the level the loaded family's effort map gives: a name is its column, an
  * integer the map's integer reading (or the nearest preset's column), nothing sent the template's default;
  * thinking off is the "none" column. */
+/// @param e  the engine (the template default's source)
+/// @param c  the conversation (its thinking / effort controls)
+/// @param r  the request: receives think_mode and family_effort
+/// @param err     receives the reason on false
+/// @param errlen  size of `err`
+/// @return false + err on a malformed or contradictory control
 static bool chat_resolve_thinking(pulsar_engine *e, const chat_conversation *c, request *r, char *err,
                                   size_t errlen) {
     chat_effort_ask a;
@@ -271,17 +298,34 @@ static bool chat_resolve_thinking(pulsar_engine *e, const chat_conversation *c, 
 /* DeepSeek's efforts are the reference encoder's presets on its 1..100 axis (low 50, high 75, max 100) --
  * think modes; an integer is itself on V4.1 (every 1..100 renders), the nearest preset on V4 (0731: low,
  * high, max); nothing sent is the loaded encoder's default (V4.1 high; 0731 low, L239). */
+/// server_effort_map::integer for V4.1: every 1..100 is its own think mode.
+/// @param value  the integer effort
+/// @return `value`
 static int deepseek_effort_integer_v41(int value) { return value; }
+/// server_effort_map::default_level: the loaded encoder's default think mode.
+/// @param e  the engine
+/// @return the think mode
 static int deepseek_effort_default(pulsar_engine *e) { return (int)pulsar_engine_think_default(e); }
+/** DeepSeek's think mode per effort name (k_effort_names' order), shared by both variants' maps. */
 #define DEEPSEEK_EFFORT_NAMED                                                                       \
     {PULSAR_THINK_NONE, PULSAR_THINK_LOW, PULSAR_THINK_LOW, PULSAR_THINK_LOW, PULSAR_THINK_HIGH,    \
      PULSAR_THINK_MAX, PULSAR_THINK_MAX}
+/** V4.1's effort map: integers render as themselves. */
 static const server_effort_map k_effort_deepseek_v41 = {
     DEEPSEEK_EFFORT_NAMED, deepseek_effort_integer_v41, deepseek_effort_default, /*think_mode_level=*/true};
+/** V4 (0731)'s effort map: an integer is the nearest preset. */
 static const server_effort_map k_effort_deepseek_v4 = {
     DEEPSEEK_EFFORT_NAMED, NULL, deepseek_effort_default, /*think_mode_level=*/true};
 #undef DEEPSEEK_EFFORT_NAMED
 
+/// server_family_ops::render for both DeepSeek variants: the DSML template (prompt_render.cpp).
+/// @param e       the engine (NULL: render the text only, no tokens -- the renderer gate)
+/// @param s       the server (NULL: no tool memory, no live continuations)
+/// @param c       the parsed conversation (its messages are folded / annotated in place)
+/// @param r       the request: receives prompt_text, prompt_spans, prompt and the forced-call flags
+/// @param err     receives the reason on false
+/// @param errlen  size of `err`
+/// @return false + err when the conversation cannot be rendered
 static bool deepseek_render(pulsar_engine *e, server *s, chat_conversation *c, request *r, char *err,
                             size_t errlen) {
     /* the tools block's schemas (deferred tools and tool_search loads render in place, chat_expand_tool_refs) */
@@ -329,7 +373,10 @@ static bool deepseek_render(pulsar_engine *e, server *s, chat_conversation *c, r
  * enable_thinking=false); an integer is the nearest preset's; nothing sent is the template's default (xhigh).
  * Downstream reads only whether a think block is open, so think_mode carries PULSAR_THINK_DEFAULT (the
  * enabled marker, not a DeepSeek effort); the render reads family_effort. */
+/// server_effort_map::default_level for Qwen.
+/// @return the template's default qwen_effort
 static int qwen_effort_default_level(pulsar_engine *) { return (int)qwen_effort_default(); }
+/** Qwen's effort map (levels are qwen_effort values). */
 static const server_effort_map k_effort_qwen = {
     {QWEN_EFFORT_NONE, QWEN_EFFORT_LOW, QWEN_EFFORT_LOW, QWEN_EFFORT_MEDIUM, QWEN_EFFORT_XHIGH, QWEN_EFFORT_XHIGH,
      QWEN_EFFORT_XHIGH},
@@ -338,11 +385,19 @@ static const server_effort_map k_effort_qwen = {
 
 /* L268: a message's content without the parser's image markers (PULSAR_IMAGE_PLACEHOLDER at image_ph_off -- the
  * offsets, not the spelling, are the authority) and where each image sits in what is left. */
+/** One message's text with its image placeholders removed (qwen_strip_image_markers). */
 struct qwen_msg_images {
+    /** The content without the placeholders. */
     std::string content;
+    /** Per image, in order: its byte offset into `content`. */
     std::vector<uint32_t> at;
 };
 
+/// @param m    the message (its content and image_ph_off)
+/// @param out  receives the stripped content and the images' offsets
+/// @param err     receives the reason on false
+/// @param errlen  size of `err`
+/// @return false + err when an image's placeholder is not at its recorded offset
 static bool qwen_strip_image_markers(const chat_msg *m, qwen_msg_images *out, char *err, size_t errlen) {
     const char *c = m->content ? m->content : "";
     const size_t n = strlen(c), ph = strlen(PULSAR_IMAGE_PLACEHOLDER);
@@ -367,6 +422,16 @@ static bool qwen_strip_image_markers(const chat_msg *m, qwen_msg_images *out, ch
  * turn; `notes` owns that text); a replayed call carries its sampled bytes when tool memory found them.
  * `tail`: a continuation tail -- no entry is the conversation's first, and the system field is not
  * part of one.  false + err: an image whose parser marker is not at its offset. */
+/// @param msgs   the conversation
+/// @param start  the first message to convert
+/// @param tail   convert a continuation tail
+/// @param qm     receives the renderer's messages
+/// @param qc     per message, the calls the renderer's messages point into (owned here)
+/// @param notes  per message, the system-reminder text a message points into
+/// @param imgs   per message, the stripped content and image offsets a message points into
+/// @param err     receives the reason on false
+/// @param errlen  size of `err`
+/// @return false + err on a misplaced image marker
 static bool qwen_messages(const chat_msgs *msgs, int start, bool tail, std::vector<qwen_msg_in> *qm,
                           std::vector<std::vector<qwen_tool_call_in>> *qc, std::vector<std::string> *notes,
                           std::vector<qwen_msg_images> *imgs, char *err, size_t errlen) {
@@ -399,6 +464,10 @@ static bool qwen_messages(const chat_msgs *msgs, int start, bool tail, std::vect
 
 /* A render's text and client-data ranges as the request owns them (malloc'd; the ranges NULL when
  * none). */
+/// @param out          the render (its text and spans are copied)
+/// @param spans_out    receives the ranges (malloc'd, NULL when none); NULL: not wanted
+/// @param n_spans_out  receives how many (written only with spans_out)
+/// @return the text (malloc'd)
 static char *qwen_take_render(qwen_render_out *out, chat_text_span **spans_out, uint32_t *n_spans_out) {
     if (spans_out) {
         *spans_out = NULL;
@@ -415,6 +484,12 @@ static char *qwen_take_render(qwen_render_out *out, chat_text_span **spans_out, 
  * OpenAI request's array as sent (HF's / vLLM's input); else the conversation's schema lines -- every protocol's
  * kinds, as for DeepSeek (L284; deferred tools and tool_search's loads declared, not in the head) -- in OpenAI's
  * shape.  r->tools_json stays NULL when there are none; false + err when the lines do not convert. */
+/// @param c          the conversation
+/// @param r          the request: receives tools_json (malloc'd, every declared tool; NULL for none)
+/// @param head_json  receives the tools the template's tools block renders (malloc'd, NULL for none)
+/// @param err     receives the reason on false
+/// @param errlen  size of `err`
+/// @return false + err when the schema lines do not convert
 bool chat_openai_tools_json(const chat_conversation *c, request *r, char **head_json, char *err, size_t errlen) {
     *head_json = NULL;
     if (c->tool_choice == CHAT_TOOL_CHOICE_NONE) return true;
@@ -440,9 +515,19 @@ bool chat_openai_tools_json(const chat_conversation *c, request *r, char **head_
 
 /* DeepSeek's tools block lists the schema lines themselves (append_tools_prompt_text, "### Available Tool Schemas"):
  * a loaded tool is its line. */
+/// server_family_ops::tool_defs_text for DeepSeek.
+/// @param lines   one function schema a line (parse_tools_value)
+/// @param len     bytes at `lines`
+/// @return a copy of the lines (malloc'd); never fails
 static char *deepseek_tool_defs_text(const char *lines, size_t len, char *, size_t) { return xstrndup(lines, len); }
 
 /* Qwen's: the tools block's entries inside <tools></tools> (qwen_chat_tool_defs). */
+/// server_family_ops::tool_defs_text for Qwen.
+/// @param lines   one function schema a line (parse_tools_value)
+/// @param len     bytes at `lines`
+/// @param err     receives the reason on NULL
+/// @param errlen  size of `err`
+/// @return the definitions (malloc'd), or NULL + err
 static char *qwen_tool_defs_text(const char *lines, size_t len, char *err, size_t errlen) {
     char *json = tool_schema_lines_openai_tools(lines, len, err, errlen);
     if (!json) return NULL;
@@ -453,6 +538,9 @@ static char *qwen_tool_defs_text(const char *lines, size_t len, char *err, size_
 }
 
 /* The deferred tool `name`'s schema line (malloc'd), or NULL when the request defers no tool of that name. */
+/// @param c     the conversation (its deferred_tool_schemas, one line a tool)
+/// @param name  the tool name
+/// @return see above
 static char *deferred_tool_line(const chat_conversation *c, const char *name) {
     for (const char *at = c->deferred_tool_schemas ? c->deferred_tool_schemas : ""; *at;) {
         const char *nl = strchr(at, '\n');
@@ -471,6 +559,12 @@ static char *deferred_tool_line(const chat_conversation *c, const char *name) {
 }
 
 /* The pending definitions `lines` written to `out` in the family's encoding (nothing when there are none). */
+/// @param out    the content being rebuilt
+/// @param lines  the pending schema lines (freed)
+/// @param r      the request (its family's tool_defs_text)
+/// @param err     receives the reason on false
+/// @param errlen  size of `err`
+/// @return false + err when the family cannot encode them
 static bool flush_tool_defs(buf *out, buf *lines, const request *r, char *err, size_t errlen) {
     if (!lines->len) return true;
     char *text = r->family->tool_defs_text(lines->ptr, lines->len, err, errlen);
@@ -481,6 +575,14 @@ static bool flush_tool_defs(buf *out, buf *lines, const request *r, char *err, s
     return true;
 }
 
+/// L325: write each message's tool_reference blocks into its content in place: a run of deferred tools as their
+/// definitions in the family's encoding, any other name as a "[tool available: NAME]" notice; image placeholder
+/// offsets move with the text, and the references are cleared.
+/// @param c  the conversation (its messages are rewritten)
+/// @param r  the request (its family)
+/// @param err     receives the reason on false
+/// @param errlen  size of `err`
+/// @return false + err when the family cannot encode a definition
 bool chat_expand_tool_refs(chat_conversation *c, const request *r, char *err, size_t errlen) {
     for (int i = 0; i < c->msgs.len; i++) {
         chat_msg *m = &c->msgs.v[i];
@@ -537,6 +639,14 @@ bool chat_expand_tool_refs(chat_conversation *c, const request *r, char *err, si
  * literal in place (L268), expanded by the core's walk.  The tools are the conversation's schema lines -- every
  * protocol's kinds and tool_search's loads, as for DeepSeek (L284) -- in OpenAI's shape; an OpenAI request's
  * array goes to the template as sent (HF's input). */
+/// server_family_ops::render for Qwen.
+/// @param e       the engine (NULL: render the text only, no tokens -- the renderer gate)
+/// @param s       the server (NULL: no tool memory, no live continuations)
+/// @param c       the parsed conversation (its messages are folded / annotated in place)
+/// @param r       the request: receives prompt_text, prompt_spans, prompt and the forced-call flags
+/// @param err     receives the reason on false
+/// @param errlen  size of `err`
+/// @return false + err when the conversation cannot be rendered
 static bool qwen_render(pulsar_engine *e, server *s, chat_conversation *c, request *r, char *err, size_t errlen) {
     const qwen_effort qe = (qwen_effort)r->family_effort;
     char *head_raw = NULL;
@@ -575,6 +685,14 @@ static bool qwen_render(pulsar_engine *e, server *s, chat_conversation *c, reque
  *      qwen_chat_render's own writer (src/lib/qwen_chat.cpp), so prefix + hook = the full render by
  *      construction (test_qwen_hooks_compose_to_the_full_render). ---------------------------------- */
 
+/// server_family_ops::assistant_turn_sampled for Qwen.
+/// @param think      the turn had thinking on
+/// @param reasoning  the replayed reasoning (NULL: none)
+/// @param content    the turn's content
+/// @param calls      its calls (may be NULL)
+/// @param spans_out    receives the suffix's client-data ranges (malloc'd, NULL when none); may be NULL
+/// @param n_spans_out  receives how many
+/// @return the bytes (malloc'd), or NULL when the template refuses the turn (logged)
 static char *qwen_assistant_turn_sampled(const request *, bool think, const char *reasoning, const char *content,
                                          const tool_calls *calls, chat_text_span **spans_out, uint32_t *n_spans_out) {
     std::vector<qwen_tool_call_in> qc;
@@ -591,6 +709,13 @@ static char *qwen_assistant_turn_sampled(const request *, bool think, const char
     return qwen_take_render(&out, spans_out, n_spans_out);
 }
 
+/// server_family_ops::tool_result_tail for Qwen.
+/// @param r      the request (its effort)
+/// @param msgs   the conversation
+/// @param start  the first new user-side message
+/// @param spans_out    receives the suffix's client-data ranges (malloc'd, NULL when none); may be NULL
+/// @param n_spans_out  receives how many
+/// @return the tail (malloc'd), or NULL when it cannot be rendered
 static char *qwen_tool_result_tail(const request *r, const chat_msgs *msgs, int start, chat_text_span **spans_out,
                                    uint32_t *n_spans_out) {
     if (spans_out) { *spans_out = NULL; *n_spans_out = 0; }
@@ -608,6 +733,8 @@ static char *qwen_tool_result_tail(const request *r, const chat_msgs *msgs, int 
 
 /* The system turn's body in a rendered Qwen prompt (the tools block and the client's system text), or
  * NULL when the prompt has none: the reminder a tool error carries. */
+/// @param prompt  the rendered prompt (NULL: none)
+/// @return the region (malloc'd, trailing whitespace trimmed), or NULL
 static char *qwen_rendered_system_region(const char *prompt) {
     static const char open[] = "<|im_start|>system\n";
     if (!prompt || strncmp(prompt, open, sizeof open - 1)) return NULL;
@@ -618,6 +745,12 @@ static char *qwen_rendered_system_region(const char *prompt) {
     return xstrndup(p, (size_t)(end - p));
 }
 
+/// server_family_ops::tool_error_suffix for Qwen: one tool result naming the error, with the system region reminded.
+/// @param r       the request (its prompt_text and effort)
+/// @param detail  what was wrong (may be NULL or empty)
+/// @param spans_out    receives the suffix's client-data ranges (malloc'd, NULL when none); may be NULL
+/// @param n_spans_out  receives how many
+/// @return the suffix (malloc'd), or NULL when it cannot be rendered
 static char *qwen_tool_error_suffix(const request *r, const thinking_state *, const char *detail,
                                     chat_text_span **spans_out, uint32_t *n_spans_out) {
     /* the turn ended at the stop token whatever its think state: the tail closes it */
@@ -648,6 +781,8 @@ static char *qwen_tool_error_suffix(const request *r, const thinking_state *, co
 /* "Thinking skipped, a call opened" in the template's spelling: with thinking on the generation prompt
  * opened "<think>\n", so the seed closes the empty block the way the template renders one and opens the
  * call; with thinking off the prompt already closed it. */
+/// @param r    the request (its effort and forced_tool_name)
+/// @param out  the seed is appended here
 static void qwen_forced_call_seed(const request *r, buf *out) {
     if ((qwen_effort)r->family_effort != QWEN_EFFORT_NONE) buf_puts(out, "\n</think>\n\n");
     /* unnamed: stop before the name's opener -- the model samples "=name>" under the call grammar (L303), as
@@ -660,12 +795,19 @@ static void qwen_forced_call_seed(const request *r, buf *out) {
     }
 }
 
+/// server_family_ops::forced_call_prefill for Qwen: the prompt is kept whole and the seed appended.
+/// @param r       the request
+/// @param append  receives the seed
 static void qwen_forced_call_prefill(const request *r, const char *, size_t *, buf *append) {
     qwen_forced_call_seed(r, append);   /* the prompt keeps its generation prompt whole */
 }
 
 /* The run of consecutive <tool_call> blocks (whitespace between them) at or after `p`: one turn's calls,
  * the bytes the parser recorded as the turn's raw_calls. */
+/// server_family_ops::find_call_block for Qwen.
+/// @param p    where to search
+/// @param end  receives one past the run
+/// @return the run's start, or NULL (none, or an unclosed block)
 static const char *qwen_find_call_block(const char *p, const char **end) {
     static const char open[] = "<tool_call>", close[] = "</tool_call>";
     const char *start = strstr(p, open);
@@ -687,6 +829,10 @@ static const char *qwen_find_call_block(const char *p, const char **end) {
 /* Qwen's output parser: the kit in Qwen's configuration (qwen_output_parser), typed by the tools the prompt
  * rendered, starting in reasoning exactly when the generation prompt opened "<think>\n"; every other hook
  * is the kit's (parser_kit.cpp). */
+/// @param g       the attempt (its request's think mode and tools_json)
+/// @param err     receives the reason on NULL
+/// @param errlen  size of `err`
+/// @return the kit state (parser_kit_start), or NULL + err when the parser cannot be configured
 static void *qwen_parser_create(server *, gen_state *g, char *err, size_t errlen) {
     qwen_output_parser *p = new qwen_output_parser();
     char perr[200];
@@ -698,6 +844,7 @@ static void *qwen_parser_create(server *, gen_state *g, char *err, size_t errlen
     return parser_kit_start(p);
 }
 
+/** Qwen's output parser table: qwen_parser_create and the kit's shared hooks. */
 static const server_output_parser_ops k_parser_qwen = {
     /* .create        = */ qwen_parser_create,
     /* .destroy       = */ parser_kit_destroy,
@@ -717,6 +864,8 @@ static const server_output_parser_ops k_parser_qwen = {
  * the longest effort preamble the loaded encoder renders (V4.1 renders the numeric line, 0731 its
  * high / max texts; measured before this lived here, the header was built from DeepSeek's BOS on a
  * Qwen engine too).  Qwen: the system turn's opener -- no BOS, no effort line. */
+/// @param e  the engine (tokenizer)
+/// @return tokens in the system turn's opener
 static int qwen_trivial_header_tokens(pulsar_engine *e) {
     pulsar_tokens t = {0};
     pulsar_tokenize_rendered_chat(e, "<|im_start|>system\n", &t);
@@ -725,6 +874,8 @@ static int qwen_trivial_header_tokens(pulsar_engine *e) {
     return hdr_len;
 }
 
+/// @param e  the engine (tokenizer, template variant)
+/// @return tokens in the BOS plus the longest effort preamble
 static int deepseek_trivial_header_tokens(pulsar_engine *e) {
     int hdr_len = 0;
     const pulsar_think_mode prefixed_modes[] = {PULSAR_THINK_HIGH, PULSAR_THINK_MAX};
@@ -744,6 +895,15 @@ static int deepseek_trivial_header_tokens(pulsar_engine *e) {
 /* ---- step 4: DeepSeek's suffix hooks -- its template's bytes for one turn, one tail, one tool error,
  *      one forced call, and where a DSML block sits in a transcript ------------------------------------ */
 
+/// server_family_ops::assistant_turn_sampled for DeepSeek (append_assistant_turn_sampled).
+/// @param r          the request (its template variant)
+/// @param think      the turn had thinking on
+/// @param reasoning  the replayed reasoning (NULL: none)
+/// @param content    the turn's content
+/// @param calls      its calls (may be NULL)
+/// @param spans_out    receives the suffix's client-data ranges (malloc'd, NULL when none); may be NULL
+/// @param n_spans_out  receives how many
+/// @return the bytes (malloc'd)
 static char *deepseek_assistant_turn_sampled(const request *r, bool think, const char *reasoning, const char *content,
                                              const tool_calls *calls, chat_text_span **spans_out,
                                              uint32_t *n_spans_out) {
@@ -758,6 +918,13 @@ static char *deepseek_assistant_turn_sampled(const request *r, bool think, const
     return buf_take(&suffix);
 }
 
+/// server_family_ops::tool_result_tail for DeepSeek (render_live_tool_tail_spans).
+/// @param r      the request (tools, think mode, variant)
+/// @param msgs   the conversation
+/// @param start  the first new user-side message
+/// @param spans_out    receives the suffix's client-data ranges (malloc'd, NULL when none); may be NULL
+/// @param n_spans_out  receives how many
+/// @return the tail (malloc'd)
 static char *deepseek_tool_result_tail(const request *r, const chat_msgs *msgs, int start, chat_text_span **spans_out,
                                        uint32_t *n_spans_out) {
     /* the loaded template's rules (a 0731 model merges tool results its own way); this used to be
@@ -766,6 +933,13 @@ static char *deepseek_tool_result_tail(const request *r, const chat_msgs *msgs, 
                                        n_spans_out);
 }
 
+/// server_family_ops::tool_error_suffix for DeepSeek (build_invalid_dsml_tool_error_suffix_spans).
+/// @param r         the request
+/// @param thinking  where the decode stands relative to reasoning
+/// @param detail    what was wrong
+/// @param spans_out    receives the suffix's client-data ranges (malloc'd, NULL when none); may be NULL
+/// @param n_spans_out  receives how many
+/// @return the suffix (malloc'd)
 static char *deepseek_tool_error_suffix(const request *r, const thinking_state *thinking, const char *detail,
                                         chat_text_span **spans_out, uint32_t *n_spans_out) {
     return build_invalid_dsml_tool_error_suffix_spans(r, thinking, detail, spans_out, n_spans_out);
@@ -774,6 +948,8 @@ static char *deepseek_tool_error_suffix(const request *r, const thinking_state *
 /* The exact bytes a forced tool call is seeded with: close thinking, open the tool_calls block and the
  * invoke tag (named when a specific tool was requested, else up to its name).  The prompt rewrite drops the render's
  * trailing "<think>" opener and skips the seed's close when the render already ended with one. */
+/// @param r    the request (its variant and forced_tool_name)
+/// @param out  the seed is appended here
 static void deepseek_forced_call_seed(const request *r, buf *out) {
     const pulsar_dsml_syntax *d = pulsar_dsml_canonical(r->family->v41);
     buf_puts(out, "</think>\n\n");
@@ -789,6 +965,11 @@ static void deepseek_forced_call_seed(const request *r, buf *out) {
     }
 }
 
+/// server_family_ops::forced_call_prefill for DeepSeek.
+/// @param r       the request
+/// @param prompt  the rendered prompt
+/// @param keep    in: the prompt's length; out: lowered past a trailing "<think>"
+/// @param append  receives the seed (without its "</think>" when the kept prompt already ends with one)
 static void deepseek_forced_call_prefill(const request *r, const char *prompt, size_t *keep, buf *append) {
     size_t blen = *keep;
     if (blen >= 7 && !memcmp(prompt + blen - 7, "<think>", 7)) blen -= 7;
@@ -805,6 +986,7 @@ static void deepseek_forced_call_prefill(const request *r, const char *prompt, s
 /* DeepSeek: after reasoning the answer; the calls are ONE DSML block of invokes (append_dsml_tool_calls_text's
  * bytes: the block tag and a newline, each invoke's tag line, its parameters, its close and a newline, the block
  * close), the parameters in xgrammar's DSML style for the template's spelling. */
+/** V4.1's grammar shape. */
 static const server_grammar_shape k_grammar_deepseek_v41 = {
     /* .answer_open           = */ "</think>",
     /* .answer_at_think_close = */ true,
@@ -818,6 +1000,7 @@ static const server_grammar_shape k_grammar_deepseek_v41 = {
     /* .repeat                = */ true,
     /* .block_tail            = */ PULSAR_TOOL_CALLS_END,
 };
+/** V4 (0731)'s grammar shape: the same shape in V4's tag spelling. */
 static const server_grammar_shape k_grammar_deepseek_v4 = {
     /* .answer_open           = */ "</think>",
     /* .answer_at_think_close = */ true,
@@ -849,6 +1032,7 @@ const server_grammar_shape k_grammar_qwen_xml = {
 
 /* ---- the tables and the dispatch ------------------------------------------------------------------- */
 
+/** DeepSeek V4.1's family table. */
 static const server_family_ops k_family_deepseek_v41 = {
     /* .name                  = */ "DeepSeek V4.1",
     /* .format                = */ PULSAR_CHAT_DS4_V41,
@@ -866,6 +1050,7 @@ static const server_family_ops k_family_deepseek_v41 = {
     /* .find_call_block       = */ find_next_dsml_tool_block,
     /* .tool_defs_text        = */ deepseek_tool_defs_text,
 };
+/** DeepSeek V4 (0731)'s family table. */
 static const server_family_ops k_family_deepseek_v4 = {
     /* .name                  = */ "DeepSeek V4 (0731)",
     /* .format                = */ PULSAR_CHAT_DS4_V4,
@@ -883,6 +1068,7 @@ static const server_family_ops k_family_deepseek_v4 = {
     /* .find_call_block       = */ find_next_dsml_tool_block,
     /* .tool_defs_text        = */ deepseek_tool_defs_text,
 };
+/** Qwen's family table. */
 static const server_family_ops k_family_qwen = {
     /* .name                  = */ "Qwen",
     /* .format                = */ PULSAR_CHAT_QWEN,
@@ -914,6 +1100,8 @@ const server_family_ops *server_family_for_format(pulsar_chat_format fmt) {
     return NULL;   /* unreachable: pulsar_die exits */
 }
 
+/// @param e  the loaded engine
+/// @return the family table of its chat format (dies for an engine without one)
 const server_family_ops *server_family_for_engine(const pulsar_engine *e) {
     return server_family_for_format(pulsar_engine_chat_format(e));
 }

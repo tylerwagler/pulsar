@@ -4,16 +4,25 @@
  * and DeepSeek's hooks in chat_family.cpp) plus the unit tests; the shared server reaches all of it through
  * server_output_parser_ops and server_family_ops.  The tag literals and the syntax table are src/lib/pulsar_dsml.h;
  * the renderer that WRITES DSML is prompt_render.cpp. */
+/** @file
+ *  Declarations of DeepSeek's DSML machinery (deepseek_dsml.cpp, deepseek_stream.cpp, parser_deepseek.cpp).
+ */
 #ifndef PULSAR_SERVER_DEEPSEEK_DSML_H
 #define PULSAR_SERVER_DEEPSEEK_DSML_H
 
 #include "pulsar_server_internal.h"
 
+/** Where the live tool-stream projection (dsml_tool_stream) stands in a DSML block. */
 typedef enum {
+    /// Between invokes: expecting an invoke tag or the block's close.
     DSML_TOOL_BETWEEN_INVOKES,
+    /// Inside an invoke, between parameters: expecting a parameter tag or the invoke's close.
     DSML_TOOL_BETWEEN_PARAMS,
+    /// Inside a parameter's value, streaming its bytes.
     DSML_TOOL_PARAM_VALUE,
+    /// The block closed (or was finalized): nothing more to project.
     DSML_TOOL_DONE,
+    /// The block is not a call (malformed, undeclared tool): the projection stopped.
     DSML_TOOL_ERROR,
 } dsml_tool_stream_state;
 
@@ -36,6 +45,7 @@ typedef enum {
  * return a different tool-call reading than the final parse on one protocol
  * but not the other. */
 typedef struct dsml_tool_stream dsml_tool_stream;
+/** One DSML tool block's live projection into protocol tool-call events (dsml_tool_stream_update). */
 struct dsml_tool_stream {
     dsml_tool_stream_state state;  ///< where the projection is in the block
     const pulsar_dsml_syntax *syn; ///< the marker literals this block opened with; borrowed
@@ -59,7 +69,10 @@ typedef enum {
     DS_WALK_SUPPRESS,   ///< nothing more goes out live (a block the finish sends, or the end)
 } deepseek_walk_mode;
 
+/** The one live walk over DeepSeek's generated text (deepseek_stream_update): one per streamed decode attempt,
+ *  worker thread only. */
 typedef struct {
+    /** Where the walk is: reasoning, answer, a DSML block, or suppressed. */
     deepseek_walk_mode mode;
     size_t emit_pos;             ///< bytes of generated text already turned into events
     bool checked_think_prefix;   ///< the leading `<think>` check has been done once
@@ -70,19 +83,32 @@ typedef struct {
     dsml_tool_stream tool;       ///< the DSML block being decoded (DS_WALK_TOOL)
 } deepseek_stream_walk;
 
+/** Where the next draw falls relative to a DSML block (dsml_decode_tracker::decode): the sampler draws the
+ *  block's structure greedily and samples only its payloads. */
 typedef enum {
+    /// Outside any tool block.
     DSML_DECODE_OUTSIDE,
+    /// The block's markup (tags, attributes, separators): greedy.
     DSML_DECODE_STRUCTURAL,
+    /// A string parameter's body: sampled.
     DSML_DECODE_STRING_BODY,
+    /// A JSON parameter value, outside its strings: greedy.
     DSML_DECODE_JSON_STRUCTURAL,
+    /// Inside a JSON string of a parameter value: sampled.
     DSML_DECODE_JSON_STRING,
 } dsml_decode_state;
 
+/** What the decode-time tracker is scanning for (dsml_decode_tracker::mode). */
 typedef enum {
+    /// Searching for a tool_calls opener.
     DSML_TRACK_SEARCH,
+    /// Inside the block's markup.
     DSML_TRACK_STRUCTURAL,
+    /// Inside a string parameter's body, watching for its close.
     DSML_TRACK_STRING_BODY,
+    /// Inside a JSON parameter value, watching strings and the close.
     DSML_TRACK_JSON_PARAM,
+    /// The block closed: nothing more is tracked.
     DSML_TRACK_DONE,
 } dsml_track_mode;
 
@@ -105,6 +131,7 @@ typedef struct {
 /** L272 P3: DeepSeek's output-parser state for one decode attempt (parser_deepseek.cpp). */
 typedef struct {
     deepseek_stream_walk walk;        ///< the live projection into the sink (walk_on: a streamed chat)
+    /** `walk` is initialised and fed: the attempt has a streaming text sink (g->sink.text). */
     bool walk_on;
     dsml_decode_tracker tracker;      ///< decode-time DSML marker tracking: the greedy region of a call
     bool saw_tool_start;              ///< a tool-call opening marker has appeared
@@ -161,6 +188,10 @@ bool raw_full_lit(const char *raw, size_t raw_len, size_t pos, const char *lit);
 bool raw_partial_any(const char *raw, size_t raw_len, size_t pos,
                             const char *a, const char *b);
 const char *find_lit_bounded(const char *s, size_t n, const char *lit);
+/// The slow reference recognizer the unit tests check the tracker against (defined only with PULSAR_SERVER_TEST).
+/// @param raw      the generated text (NULL: outside)
+/// @param raw_len  its length
+/// @return the decode state at the end of `raw`
 dsml_decode_state dsml_decode_state_for_text(const char *raw, size_t raw_len);
 bool dsml_decode_state_is_tool(dsml_decode_state state);
 bool dsml_decode_state_uses_payload_sampling(dsml_decode_state state);

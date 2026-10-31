@@ -6,6 +6,10 @@
  * (server_sched.cpp). gen_state/gen_phase live in pulsar_server_internal.h
  * because the scheduler TU steps jobs by phase and drives the batched
  * lanes through the batch_* fields. */
+/** @file
+ *  The job lifecycle around one request: the resumable gen_state machine (prefill, decode, finish) and the
+ *  generate_job_* driver the scheduler steps.
+ */
 #include "pulsar_server_internal.h"
 #include "pulsar_lock.hpp"
 
@@ -98,6 +102,10 @@ bool server::continue_after_tool_error(session_slot *sl,
 
 
 
+/// @brief One TOOL log line naming a turn's calls (ids, names, whether their raw bytes were kept).
+/// @param ctx                 the context-span label
+/// @param calls               the calls (none: no line)
+/// @param responses_protocol  a Responses request (its flag)
 static void log_tool_calls_summary(const char *ctx, const tool_calls *calls,
                                    bool responses_protocol) {
     if (!calls || calls->len == 0) return;
@@ -126,6 +134,13 @@ static void log_tool_calls_summary(const char *ctx, const tool_calls *calls,
 
 
 
+/// @brief The session's prefill progress callback (worker thread, inside the sync): SSE headers and a ": prefill"
+///        keepalive every 5 s for a streaming client; on a repeated position a "continued" disk store; otherwise
+///        the prefill progress log and display.
+/// @param ud       the job's server_prefill_progress
+/// @param event    "prefill_chunk" or "prefill_display" (others ignored)
+/// @param current  the prefill position reached, tokens
+/// @param total    the prefill's target, tokens
 static void server_progress_cb(void *ud, const char *event, int current, int total) {
     server_prefill_progress *p = (server_prefill_progress *)ud;
     if (!p || !event) return;
@@ -475,6 +490,8 @@ void gen_prefill_progress_cb(void *ud, const char *event, int current, int total
  * in production servers — but PULSAR_ABORT_ON_DISCONNECT=0 restores the old
  * run-to-completion behavior without a rebuild if some client ever misbehaves.
  * The env is read ONCE (project rule: no per-token getenv). */
+/// @param fd  the client socket (< 0: never disconnected)
+/// @return true when the peer has closed or half-closed (POLLRDHUP) or the socket errored; a non-blocking poll
 bool gen_client_disconnected(int fd) {
     if (fd < 0) return false;
     struct pollfd p;
@@ -486,6 +503,10 @@ bool gen_client_disconnected(int fd) {
 }
 
 
+/// @brief The session's cancel callback, polled between prefill chunks: stop on a gone client, or (with
+///        prefill_min_suffix set) once a chunk is done and at least that many prompt tokens remain, to yield the worker.
+/// @param ud  the job's gen_state
+/// @return true to stop the prefill after this chunk
 static bool gen_prefill_cancel_cb(void *ud) {
     const gen_state *g = (const gen_state *)ud;
     /* A client that cancelled or hung up during a long prefill must stop the
@@ -506,6 +527,8 @@ static bool gen_prefill_cancel_cb(void *ud) {
  * next request, never counted a chunk, and the cancel callback never yielded
  * -- a 202k prompt held another slot's decode for 214 s (L260).  Called
  * before every sync this slot issues. */
+/// @param sess  the pool session
+/// @param g     the slot's generation state the callbacks read
 static void gen_arm_prefill_callbacks(pulsar_session *sess, gen_state *g) {
     pulsar_session_set_progress(sess, gen_prefill_progress_cb, g);
     pulsar_session_set_display_progress(sess, server_progress_cb, &g->progress);
@@ -583,6 +606,14 @@ void server::gen_prefill_abandon(session_slot *sl) {
  * that does not parse, more blocks than images, a placeholder count that does
  * not match) is refused by name; the engine's fingerprint check then decides
  * whether the held images are really the live ones. */
+/// @param e         the engine
+/// @param eff       the effective prompt; replaced with the placeholders expanded
+/// @param live_len  tokens of `eff` that are the live history
+/// @param images    the request's images in prompt order; their start_pos is set
+/// @param n_images  images in `images`
+/// @param why       receives the refusal
+/// @param whylen    size of `why`
+/// @return false on any disagreement between the live blocks, the images and the placeholders
 static bool image_continuation_place(pulsar_engine *e, pulsar_tokens *eff, int live_len,
                                      pulsar_image_ref *images, int n_images,
                                      char *why, size_t whylen) {
@@ -604,6 +635,12 @@ static bool image_continuation_place(pulsar_engine *e, pulsar_tokens *eff, int l
 
 
 
+/// @brief The cold-store cut for an image request: none (0) when an image starts below it, else `cut` unchanged.
+/// @param cut       the proposed cut, tokens
+/// @param images    the request's images (start_pos placed)
+/// @param n_images  images in `images`
+/// @param inside    receives the first image starting below the cut, -1 for none
+/// @return the cut to use, 0 for none
 int server_image_cold_cut(int cut, const pulsar_image_ref *images, int n_images, int *inside) {
     *inside = -1;
     for (int i = 0; cut > 0 && i < n_images; i++)
@@ -627,6 +664,9 @@ int server_image_cold_cut(int cut, const pulsar_image_ref *images, int n_images,
  * one-shot load leaves -- and the plan continues from that, as it does after a failed load: the sync recomputes the
  * prompt (and for a client that has gone, the prefill's own disconnect check abandons it). */
 
+/// @brief Put the slot's job into GEN_RESTORE on `gr` (ownership passes to the gen_state) and log the chain.
+/// @param sl  the slot
+/// @param gr  the restore, already begun (kv_restore_begin)
 static void gen_restore_start(session_slot *sl, gen_restore *gr) {
     gen_state *g = sl->gen;
     g->restore = gr;
@@ -643,6 +683,10 @@ static void gen_restore_start(session_slot *sl, gen_restore *gr) {
 /* The spilled bank's own history: the deepest stored chain it reproduces, when L310 prices its read under the prefill
  * it saves -- what bank_switch read at once before L330.  false: nothing to restore (the bank stays empty, its job
  * resolves cold). */
+/// @param s    the server
+/// @param sl   the slot bound to the spilled bank
+/// @param was  the bank's history as spilled; its text moves into the restore on success
+/// @return true when a sliced restore started
 static bool gen_restore_spilled_start(server *s, session_slot *sl, spilled_history *was) {
     gen_restore *gr = (gen_restore *)server_xmalloc(sizeof(gen_restore));
     memset(gr, 0, sizeof(*gr));
@@ -1494,6 +1538,11 @@ void server::gen_decode_init(session_slot *sl) {
  * rule serves both. Tool-call payload forcing (temperature=0 while
  * decoding structured tool output, in gen_resolve_sampling_decode) is a separate,
  * deliberate override applied on top of this. */
+/// @param req          the request
+/// @param temperature  receives the temperature
+/// @param top_k        receives top-k (0 = off)
+/// @param top_p        receives top-p
+/// @param min_p        receives min-p
 void gen_resolve_sampling(const request *req, float *temperature,
                                  int *top_k, float *top_p, float *min_p) {
     *temperature = req->temperature;
@@ -1522,6 +1571,11 @@ void gen_resolve_sampling(const request *req, float *temperature,
  * (gen_spec_greedy_rows; L296 toolsample -- it was once per round, so a round
  * that crossed from a call's structure into its payload drew the payload's
  * first tokens greedy, and spec != plain at T > 0). */
+/// @param g            the generation state (its request and output parser)
+/// @param temperature  receives the temperature (0 on a tool call's structure)
+/// @param top_k        receives top-k
+/// @param top_p        receives top-p
+/// @param min_p        receives min-p
 void gen_resolve_sampling_decode(const gen_state *g, float *temperature,
                                  int *top_k, float *top_p, float *min_p) {
     const request *req = &g->j->req;
@@ -1582,6 +1636,10 @@ bool gen_streams_plain(const gen_state *g) {
  * tokens before it are emitted.  Past a token that ends the stream (a stop token, a stop sequence) nothing is
  * emitted: those bits repeat the last, and the server never streams the rows they govern.  0 for a request the
  * override never touches (not a chat with tools) or that is greedy throughout. */
+/// @brief Whether the tool-call greedy override can change a draw: a chat with tools, a parser, temperature > 0.
+///        (The block comment above describes gen_spec_greedy_rows_text, which this gates.)
+/// @param g  the generation state
+/// @return true when the per-position override must be computed
 static bool gen_tool_override_varies(const gen_state *g) {
     const request *req = &g->j->req;
     float temperature, top_p, min_p;

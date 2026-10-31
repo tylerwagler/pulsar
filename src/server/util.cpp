@@ -1,3 +1,7 @@
+/** @file
+ *  Small server utilities: allocation that dies on failure, the growable buffer, JSON helpers, random ids and
+ *  the stop signal.
+ */
 #include "pulsar_server_internal.h"
 #include "pulsar_json.h"
 
@@ -7,12 +11,17 @@
 #include <sys/random.h>
 
 
+/// Set by stop_signal_handler on the first SIGINT / SIGTERM: the server drains and stops (read by every thread).
 volatile sig_atomic_t g_stop_requested = 0;
 
 
+/// The listening socket for stop_signal_handler to close (-1: none, or already closed).
 volatile sig_atomic_t g_listen_fd = -1;
 
 
+/// @brief SIGINT / SIGTERM handler: the first signal sets g_stop_requested and closes the listener; a second exits
+/// at once (status 130).  Async-signal-safe.
+/// @param sig the signal (unused)
 void stop_signal_handler(int sig) {
     (void)sig;
     if (g_stop_requested) _exit(130);
@@ -26,6 +35,8 @@ void stop_signal_handler(int sig) {
 
 
 
+/// @brief Print "pulsar-server: msg" to stderr and exit(1).
+/// @param msg the reason
 void die(const char *msg) {
     fprintf(stderr, "pulsar-server: %s\n", msg);
     exit(1);
@@ -33,6 +44,9 @@ void die(const char *msg) {
 
 
 
+/// @brief malloc that dies on failure ("out of memory"); n == 0 allocates 1 byte.
+/// @param n bytes
+/// @return the block (never NULL; free() it)
 void *server_xmalloc(size_t n) {
     void *p = (void *)malloc(n ? n : 1);
     if (!p) die("out of memory");
@@ -41,6 +55,10 @@ void *server_xmalloc(size_t n) {
 
 
 
+/// @brief realloc that dies on failure; n == 0 reallocates to 1 byte.
+/// @param p the block (may be NULL)
+/// @param n the new size in bytes
+/// @return the block (never NULL)
 void *server_xrealloc(void *p, size_t n) {
     p = realloc(p, n ? n : 1);
     if (!p) die("out of memory");
@@ -49,6 +67,9 @@ void *server_xrealloc(void *p, size_t n) {
 
 
 
+/// @brief strdup that dies on failure.
+/// @param s a NUL-terminated string (not NULL)
+/// @return the malloc'd copy
 char *xstrdup(const char *s) {
     size_t n = strlen(s);
     char *p = (char *)server_xmalloc(n + 1);
@@ -58,6 +79,10 @@ char *xstrdup(const char *s) {
 
 
 
+/// @brief Fill `dst` with cryptographic randomness: getrandom(), falling back to /dev/urandom.
+/// @param dst the buffer
+/// @param len bytes to fill
+/// @return false when neither source delivered all `len` bytes
 bool random_bytes(void *dst, size_t len) {
     unsigned char *p = (unsigned char *)dst;
     /* getrandom() has no fd/chroot failure modes; /dev/urandom stays as the
@@ -88,6 +113,10 @@ bool random_bytes(void *dst, size_t len) {
 
 
 
+/// @brief Copy the first `n` bytes of `s` into a NUL-terminated malloc'd string (dies on failure).
+/// @param s the bytes (n of them must be readable)
+/// @param n bytes to copy
+/// @return the copy
 char *xstrndup(const char *s, size_t n) {
     char *p = (char *)server_xmalloc(n + 1);
     memcpy(p, s, n);
@@ -97,6 +126,9 @@ char *xstrndup(const char *s, size_t n) {
 
 
 
+/// @brief Grow `b` (doubling, from 256) so `add` more bytes plus the NUL fit; dies on overflow.
+/// @param b the buffer
+/// @param add bytes about to be appended
 static void buf_reserve(buf *b, size_t add) {
     if (add > SIZE_MAX - b->len - 1) die("buffer overflow");
     size_t need = b->len + add + 1;
@@ -115,6 +147,10 @@ static void buf_reserve(buf *b, size_t add) {
 
 
 
+/// @brief Append `n` bytes and keep the buffer NUL-terminated.
+/// @param b the buffer
+/// @param p the bytes
+/// @param n how many
 void buf_append(buf *b, const void *p, size_t n) {
     buf_reserve(b, n);
     memcpy(b->ptr + b->len, p, n);
@@ -124,6 +160,9 @@ void buf_append(buf *b, const void *p, size_t n) {
 
 
 
+/// @brief Append one byte.
+/// @param b the buffer
+/// @param c the byte
 void buf_putc(buf *b, char c) {
     buf_append(b, &c, 1);
 }
@@ -132,12 +171,17 @@ void buf_putc(buf *b, char c) {
 
 /** See the declaration in pulsar_server_internal.h; doxygen applies \hidecallergraph per entity.
  *  \hidecallergraph */
+/// @param b the buffer
+/// @param s a NUL-terminated string, appended without its NUL
 void buf_puts(buf *b, const char *s) {
     buf_append(b, s, strlen(s));
 }
 
 
 
+/// @brief Append printf-formatted text (dies when vsnprintf fails).
+/// @param b the buffer
+/// @param fmt the format, then its arguments
 void buf_printf(buf *b, const char *fmt, ...) {
     va_list ap;
     va_start(ap, fmt);
@@ -154,6 +198,9 @@ void buf_printf(buf *b, const char *fmt, ...) {
 
 
 
+/// @brief Take the bytes out of `b` and reset it; the span records are dropped (copy them out first).
+/// @param b the buffer (zeroed afterwards)
+/// @return the NUL-terminated text, owned by the caller ("" malloc'd for an empty buffer)
 char *buf_take(buf *b) {
     /* L223: the client-data ranges are useless without the bytes they describe,
      * so taking the bytes drops them.  A caller that needs them (the chat
@@ -167,6 +214,8 @@ char *buf_take(buf *b) {
 
 
 
+/// @brief Free the bytes and the span records, and zero `b`.
+/// @param b the buffer
 void buf_free(buf *b) {
     free(b->ptr);
     free(b->spans);
@@ -183,6 +232,9 @@ void buf_free(buf *b) {
  * tracking, so the shared version uses a local growable buffer. */
 
 
+/// @brief One JSON value with every whitespace byte outside strings removed.
+/// @param json the value's text (NULL reads as "null")
+/// @return malloc'd text; a copy of the input when it does not scan as a value
 char *json_minify_raw_value(const char *json) {
     const char *p = json ? json : "null";
     json_ws(&p);
@@ -223,6 +275,10 @@ char *json_minify_raw_value(const char *json) {
  * \u00XX otherwise; non-ASCII raw), integer literals verbatim, floats as
  * repr(): shortest round-trip digits, fixed notation for decimal exponents in
  * (-4, 16], ".0" appended to an integral value, else "d.ddde+XX". */
+/// @brief Append `n` bytes as a JSON string the way Python's json.dumps(ensure_ascii=False) spells it.
+/// @param b the buffer
+/// @param s the string's bytes (UTF-8, unescaped)
+/// @param n bytes at `s`
 static void py_json_string(buf *b, const char *s, size_t n) {
     buf_putc(b, '"');
     for (size_t i = 0; i < n; i++) {
@@ -243,6 +299,9 @@ static void py_json_string(buf *b, const char *s, size_t n) {
     buf_putc(b, '"');
 }
 
+/// @brief Append a double as Python's repr() spells it (shortest round-trip digits).
+/// @param b the buffer
+/// @param v the value
 static void py_float_repr(buf *b, double v) {
     if (v == 0.0) {
         buf_puts(b, std::signbit(v) ? "-0.0" : "0.0");
@@ -285,6 +344,10 @@ static void py_float_repr(buf *b, double v) {
     }
 }
 
+/// @brief Re-spell one JSON value at *p as Python's json.dumps would, appending it to `b`.
+/// @param p the cursor; advanced past the value on success
+/// @param b the buffer
+/// @return false on malformed JSON
 static bool py_json_value(const char **p, buf *b) {
     json_ws(p);
     const char c = **p;
@@ -383,6 +446,11 @@ char *json_python_dumps_raw_value(const char *json) {
 
 
 
+/// @brief Read a message's "content": a string, null (""), an array of strings and {"text": ...} parts
+/// (concatenated, other members and parts skipped), or any other value skipped as "".
+/// @param p the cursor; advanced past the value
+/// @param out receives the malloc'd text (NULL until it succeeds)
+/// @return false on malformed JSON
 bool json_content(const char **p, char **out) {
     /* Null *out up front (see json_string_n): a reparse-in-place caller must
      * not double-free when a duplicate key's second value fails to parse. */
@@ -458,6 +526,9 @@ fail:
 
 
 /* RFC 4648 standard-alphabet value, or -1. */
+/// @brief The 6-bit value of a standard-alphabet base64 character.
+/// @param c the character
+/// @return 0..63, or -1 for any other byte ('=' included)
 static int base64_value(unsigned char c) {
     if (c >= 'A' && c <= 'Z') return c - 'A';
     if (c >= 'a' && c <= 'z') return c - 'a' + 26;

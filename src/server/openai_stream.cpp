@@ -1,9 +1,19 @@
+/** @file
+ *  HTTP response writers and the OpenAI chat / completions SSE stream and protocol sink.
+ */
 #include "pulsar_server_internal.h"
 
 
 
 /* Writes one complete response.  `extra` is NULL or pre-formatted
  * "Name: value\r\n" lines, placed before Connection. */
+/// Write one complete HTTP response with optional extra header lines (Connection: close).
+/// @param fd     the client socket
+/// @param code   the HTTP status (the reason phrase covers 200/204/400/404/409/500; anything else says "Error")
+/// @param type   the Content-Type (NULL or empty: none)
+/// @param body   the body, NUL-terminated (NULL: empty)
+/// @param extra  extra header lines, or NULL
+/// @return false when a write failed
 static bool http_write(int fd, int code, const char *type, const char *body,
                        const char *extra) {
     const char *reason = code == 200 ? "OK" :
@@ -31,6 +41,12 @@ static bool http_write(int fd, int code, const char *type, const char *body,
     return ok;
 }
 
+/// Write one complete HTTP response (Connection: close).
+/// @param fd    the client socket
+/// @param code  the HTTP status
+/// @param type  the Content-Type (NULL or empty: none)
+/// @param body  the body, NUL-terminated (NULL: empty)
+/// @return false when a write failed
 bool http_response(int fd, int code, const char *type, const char *body) {
     return http_write(fd, code, type, body, NULL);
 }
@@ -39,6 +55,13 @@ bool http_response(int fd, int code, const char *type, const char *body) {
  * whole seconds (never an HTTP date; Claude Code reads integers and stops
  * retrying above 60) and X-Should-Retry: true.  Permanent failures carry
  * neither, so a client never backs off to retry something that cannot work. */
+/// Write a retryable HTTP response: Retry-After (whole seconds) and X-Should-Retry: true.
+/// @param fd             the client socket
+/// @param code           the HTTP status
+/// @param type           the Content-Type
+/// @param body           the body (NULL: empty)
+/// @param retry_after_s  the Retry-After value, whole seconds
+/// @return false when a write failed
 bool http_response_retry(int fd, int code, const char *type, const char *body,
                          int retry_after_s) {
     char extra[96];
@@ -47,12 +70,20 @@ bool http_response_retry(int fd, int code, const char *type, const char *body,
     return http_write(fd, code, type, body, extra);
 }
 
+/// Append OpenAI's error envelope ({"error":{"message":...,"type":"invalid_request_error"}}).
+/// @param b    the buffer appended to
+/// @param msg  the message
 static void openai_error_body(buf *b, const char *msg) {
     buf_puts(b, "{\"error\":{\"message\":");
     json_escape(b, msg);
     buf_puts(b, ",\"type\":\"invalid_request_error\"}}\n");
 }
 
+/// Send an OpenAI-shaped error response.
+/// @param fd    the client socket
+/// @param code  the HTTP status
+/// @param msg   the message
+/// @return false when a write failed
 bool http_error(int fd, int code, const char *msg) {
     buf b = {0};
     openai_error_body(&b, msg);
@@ -61,6 +92,12 @@ bool http_error(int fd, int code, const char *msg) {
     return ok;
 }
 
+/// Send an OpenAI-shaped retryable error (http_response_retry's headers).
+/// @param fd             the client socket
+/// @param code           the HTTP status
+/// @param msg            the message
+/// @param retry_after_s  the Retry-After value, whole seconds
+/// @return false when a write failed
 bool http_error_retry(int fd, int code, const char *msg, int retry_after_s) {
     buf b = {0};
     openai_error_body(&b, msg);
@@ -75,6 +112,11 @@ bool http_error_retry(int fd, int code, const char *msg, int retry_after_s) {
  * unknown APIError instead of a typed InvalidRequestError. The
  * context-length path already emits this shape; every other 4xx on the
  * /v1/messages surface must too. */
+/// Send an error in Anthropic's envelope ({"type":"error","error":{...}}).
+/// @param fd    the client socket
+/// @param code  the HTTP status
+/// @param msg   the message
+/// @return false when a write failed
 bool http_error_anthropic(int fd, int code, const char *msg) {
     buf b = {0};
     buf_puts(&b, "{\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":");
@@ -87,6 +129,9 @@ bool http_error_anthropic(int fd, int code, const char *msg) {
 
 
 
+/// The OpenAI error's "param" for a context overflow: the field that carried the prompt.
+/// @param r  the request (NULL: "prompt")
+/// @return "input" (Responses), "messages" (chat) or "prompt" (completions)
 static const char *context_length_error_param(const request *r) {
     if (!r) return "prompt";
     if (r->api == API_RESPONSES) return "input";
@@ -95,6 +140,10 @@ static const char *context_length_error_param(const request *r) {
 
 
 
+/// Whether the prompt leaves no room to generate.
+/// @param r         the request (NULL: false)
+/// @param ctx_size  the context size, tokens
+/// @return true when the prompt's tokens reach `ctx_size`
 bool request_exceeds_context(const request *r, int ctx_size) {
     /* pulsar_session_sync() rejects prompt->len >= ctx_size because generation
      * needs at least one free context slot.  Catch the same boundary here so
@@ -104,6 +153,13 @@ bool request_exceeds_context(const request *r, int ctx_size) {
 
 
 
+/// Send the 400 context_length_exceeded error in the request's protocol shape (Anthropic's envelope or OpenAI's,
+/// with n_prompt_tokens and n_ctx).
+/// @param fd               the client socket
+/// @param r                the request (selects the shape; NULL: OpenAI's)
+/// @param n_prompt_tokens  the prompt's tokens
+/// @param ctx_size         the context size, tokens
+/// @return false when a write failed
 bool http_error_context_length_exceeded(int fd,
                                                const request *r,
                                                int n_prompt_tokens,
@@ -143,6 +199,9 @@ bool http_error_context_length_exceeded(int fd,
 /* Streaming is a translation state machine over the raw DS4 text.  The model
  * may produce <think> and DSML tool blocks; clients should receive those as
  * protocol-native reasoning/tool deltas, never as visible assistant text. */
+/// Write the 200 text/event-stream response head that opens every SSE stream.
+/// @param fd  the client socket
+/// @return false when the write failed
 bool sse_headers(int fd) {
     buf h = {0};
     buf_puts(&h,
@@ -157,6 +216,11 @@ bool sse_headers(int fd) {
 
 
 
+/// Send an error event in an open SSE stream (Anthropic's api_error envelope or OpenAI's server_error).
+/// @param fd   the client socket
+/// @param r    the request (selects the shape; may be NULL)
+/// @param msg  the message (NULL or empty: "internal server error")
+/// @return false when the write failed
 bool sse_error_event(int fd, const request *r, const char *msg) {
     const char *message = msg && msg[0] ? msg : "internal server error";
     buf b = {0};
@@ -176,6 +240,13 @@ bool sse_error_event(int fd, const request *r, const char *msg) {
 
 
 
+/// Send one plain-stream chunk: a chat.completion.chunk content delta, or a text_completion chunk.
+/// @param fd      the client socket
+/// @param r       the request (kind and model)
+/// @param id      the response id
+/// @param text    the text (NULL: a role delta, or an empty delta with `finish`)
+/// @param finish  the finish_reason, or NULL while streaming
+/// @return false when the write failed
 bool sse_chunk(int fd, const request *r, const char *id, const char *text, const char *finish) {
     buf b = {0};
     long now = (long)time(NULL);
@@ -209,6 +280,10 @@ bool sse_chunk(int fd, const request *r, const char *id, const char *text, const
 
 
 
+/// Clamp a reported token count to [0, max].
+/// @param value  the count
+/// @param max    the upper bound (negative: none)
+/// @return the clamped count
 int clamp_usage_tokens(int value, int max) {
     if (value < 0) return 0;
     if (max >= 0 && value > max) return max;
@@ -219,6 +294,10 @@ int clamp_usage_tokens(int value, int max) {
  * prompt size, write at what read leaves. Single-sourced so all three
  * protocol usage emitters (OpenAI/Anthropic/Responses) apply the same policy
  * -- the order (read before write) is a contract they must not drift on. */
+/// Clamp the reported cache split: read to the prompt, write to what read leaves.
+/// @param cache_read   in/out: the cache-read tokens, clamped to [0, total]
+/// @param cache_write  in/out: the cache-write tokens, clamped to [0, total - read]
+/// @param total        the prompt's tokens
 void resolve_cache_split(int *cache_read, int *cache_write, int total) {
     *cache_read = clamp_usage_tokens(*cache_read, total);
     *cache_write = clamp_usage_tokens(*cache_write, total - *cache_read);
@@ -226,6 +305,11 @@ void resolve_cache_split(int *cache_read, int *cache_write, int total) {
 
 
 
+/// Append OpenAI's "usage" object (with prompt_tokens_details: cached_tokens and the cache_write_tokens extension).
+/// @param b                  the JSON being built
+/// @param r                  the request (its cache split; NULL: none)
+/// @param prompt_tokens      the prompt's tokens
+/// @param completion_tokens  the tokens generated
 void append_openai_usage_json(buf *b, const request *r,
                                      int prompt_tokens, int completion_tokens) {
     int cached_tokens = r ? r->cache_read_tokens : 0;
@@ -249,6 +333,10 @@ void append_openai_usage_json(buf *b, const request *r,
  * "bytes" carries the exact bytes and is the authoritative form; "token"
  * substitutes U+FFFD for anything that is not a well-formed sequence, which is
  * what the OpenAI API does with the same problem. */
+/// Append a token piece as a JSON string, ill-formed UTF-8 replaced by U+FFFD.
+/// @param b      the JSON being built
+/// @param piece  the token's bytes
+/// @param len    bytes at `piece`
 static void append_logprob_text_json(buf *b, const char *piece, size_t len) {
     buf clean = {0};
     size_t i = 0;
@@ -276,6 +364,9 @@ static void append_logprob_text_json(buf *b, const char *piece, size_t len) {
 /* JSON has no -Infinity.  A degenerate row (every logit non-finite) is the only
  * way to produce one, and `null` is how the engine's --dump-logits reports the
  * same condition — an unmistakable hole beats a fabricated finite number. */
+/// Append a logprob as a JSON number, or null when it is not finite.
+/// @param b  the JSON being built
+/// @param v  the logprob (non-finite: null)
 static void append_logprob_number_json(buf *b, float v) {
     if (isfinite(v)) buf_printf(b, "%.9g", (double)v);
     else buf_puts(b, "null");
@@ -286,6 +377,9 @@ static void append_logprob_number_json(buf *b, float v) {
 /* {"token":...,"logprob":...,"bytes":[...]  — the whole of an alternative's
  * entry and the head of a chosen token's, whose "top_logprobs" array follows.
  * Left OPEN for that reason; both callers close the object. */
+/// Append a logprob entry's token, logprob and bytes, leaving the object open.
+/// @param b  the JSON being built
+/// @param t  the token entry
 static void append_logprob_token_open_json(buf *b, const logprob_token *t) {
     buf_puts(b, "{\"token\":");
     append_logprob_text_json(b, t->piece, t->piece_len);
@@ -309,6 +403,11 @@ static void append_logprob_token_open_json(buf *b, const logprob_token *t) {
  * The array is named `content` because that is the field name in the OpenAI
  * schema; see logprob_ledger for what it actually spans (every generated token,
  * not only the visible content substring). */
+/// Append ",\"logprobs\":{...}" for ledger entries [from, to) when the client asked for logprobs.
+/// @param b     the JSON being built
+/// @param lg    the request's ledger (NULL or disabled: nothing written)
+/// @param from  the first entry (clamped at 0)
+/// @param to    one past the last entry (clamped to the ledger's length)
 void append_openai_logprobs_json(buf *b, const logprob_ledger *lg, int from, int to) {
     if (!lg || !lg->enabled) return;
     if (from < 0) from = 0;
@@ -335,6 +434,10 @@ void append_openai_logprobs_json(buf *b, const logprob_ledger *lg, int from, int
  * (piece ending at or before the watermark; SIZE_MAX on the final chunk) and
  * mark them streamed, so the entries concatenated over a stream reproduce the
  * non-streaming array exactly once. */
+/// Append the logprob entries a chunk releases and mark them streamed.
+/// @param b             the chunk being built
+/// @param lp            the ledger (NULL or disabled: nothing); lp->streamed advances
+/// @param release_upto  the byte offset in the completion the chunk releases (SIZE_MAX: everything left)
 static void append_openai_logprobs_delta(buf *b, logprob_ledger *lp, size_t release_upto) {
     if (!lp || !lp->enabled) return;
     const int to = logprob_stream_ready(lp, release_upto);
@@ -350,6 +453,9 @@ static void append_openai_logprobs_delta(buf *b, logprob_ledger *lp, size_t rele
  * Pure metadata: every value comes from counters the worker already kept, and
  * the rates are derived here with guarded divisions (a zero denominator omits
  * the rate rather than emitting a non-finite number). Never affects sampling. */
+/// Append the ",\"timings\":{...}" block from the request's timings.
+/// @param b  the JSON being built
+/// @param r  the request (its timings; NULL or not valid: nothing written)
 void append_openai_timings_json(buf *b, const request *r) {
     const req_timings *t = r ? &r->timings : NULL;
     if (!t || !t->valid) return;
@@ -387,6 +493,13 @@ void append_openai_timings_json(buf *b, const request *r) {
 
 
 
+/// Send the usage chunk (usage + timings, empty choices) when the client asked for stream_options.include_usage.
+/// @param fd                 the client socket
+/// @param r                  the request
+/// @param id                 the response id
+/// @param prompt_tokens      the prompt's tokens
+/// @param completion_tokens  the tokens generated
+/// @return false when the write failed (true when not asked for)
 static bool sse_usage_chunk(int fd, const request *r, const char *id,
                             int prompt_tokens, int completion_tokens) {
     if (!r->stream_include_usage) return true;
@@ -413,6 +526,13 @@ static bool sse_usage_chunk(int fd, const request *r, const char *id,
 
 
 
+/// End an OpenAI stream: the usage chunk (when asked for), then "data: [DONE]".
+/// @param fd                 the client socket
+/// @param r                  the request
+/// @param id                 the response id
+/// @param prompt_tokens      the prompt's tokens
+/// @param completion_tokens  the tokens generated
+/// @return false when a write failed
 bool sse_done(int fd, const request *r, const char *id,
                      int prompt_tokens, int completion_tokens) {
     return sse_usage_chunk(fd, r, id, prompt_tokens, completion_tokens) &&
@@ -424,6 +544,9 @@ bool sse_done(int fd, const request *r, const char *id,
 
 
 
+/// Reset an OpenAI live-stream state and mark it active.
+/// @param r   the request (unused)
+/// @param st  the state, zeroed
 void openai_stream_start(const request *r, openai_stream *st) {
     (void)r;
     memset(st, 0, sizeof(*st));
@@ -434,6 +557,16 @@ void openai_stream_start(const request *r, openai_stream *st) {
 
 /* `release_upto` is the absolute offset in the raw completion that this delta
  * carries the client up to; the logprob entries it covers ride along. */
+/// Send one chat.completion.chunk delta carrying `field` (content or reasoning_content), with its logprobs.
+/// @param fd            the client socket
+/// @param r             the request
+/// @param id            the response id
+/// @param field         the delta member's name
+/// @param text          the bytes
+/// @param len           bytes at `text` (0: nothing sent)
+/// @param lp            the logprob ledger (may be NULL)
+/// @param release_upto  the completion byte offset the delta releases
+/// @return false when the write failed
 static bool sse_chat_delta_n(int fd, const request *r, const char *id,
                              const char *field, const char *text, size_t len,
                              logprob_ledger *lp, size_t release_upto) {
@@ -460,6 +593,14 @@ static bool sse_chat_delta_n(int fd, const request *r, const char *id,
  * fragments: a family's output parser announces each call once its name is
  * known (the header below), then sends the argument object's text as it reads
  * it (the args delta after it) -- the generic tool events of sink_tool_ops. */
+/// Send the tool_calls start delta for call `index` (id, name, empty arguments).
+/// @param fd       the client socket
+/// @param r        the request
+/// @param id       the response id
+/// @param index    the call's index in tool_calls
+/// @param tool_id  the call id (NULL: empty)
+/// @param name     the function's name (NULL: empty)
+/// @return false when the write failed
 static bool sse_chat_tool_call_start_delta(int fd, const request *r, const char *id,
                                            int index, const char *tool_id,
                                            const char *name) {
@@ -481,6 +622,14 @@ static bool sse_chat_tool_call_start_delta(int fd, const request *r, const char 
 
 
 
+/// Send a fragment of call `index`'s arguments JSON text as a function.arguments delta.
+/// @param fd     the client socket
+/// @param r      the request
+/// @param id     the response id
+/// @param index  the call's index
+/// @param text   the fragment
+/// @param len    bytes at `text` (0: nothing sent)
+/// @return false when the write failed
 static bool sse_chat_tool_call_args_delta_n(int fd, const request *r, const char *id,
                                             int index, const char *text, size_t len) {
     if (len == 0) return true;
@@ -502,6 +651,13 @@ static bool sse_chat_tool_call_args_delta_n(int fd, const request *r, const char
 
 /* ---- L267: the OpenAI sink (chat_sink) --------------------------------------- */
 
+/// chat_sink::text for OpenAI chat: a content or reasoning_content delta (an inactive stream sends nothing).
+/// @param k             the sink
+/// @param reasoning     the text is reasoning
+/// @param text          the bytes
+/// @param len           bytes at `text`
+/// @param release_upto  the completion byte offset the delta releases
+/// @return false when the write failed
 static bool openai_sink_text_cb(chat_sink *k, bool reasoning, const char *text, size_t len, size_t release_upto) {
     openai_stream *st = (openai_stream *)k->st;
     if (!st->active) return true;
@@ -511,23 +667,47 @@ static bool openai_sink_text_cb(chat_sink *k, bool reasoning, const char *text, 
     return true;
 }
 
+/// chat_sink::end for OpenAI: nothing to send.
+/// @return true
 static bool openai_sink_end_cb(chat_sink *, bool) { return true; }
 
 /* A tool call as it decodes (a family's live tool events): the tool_call start delta (id + name),
  * then its argument object's JSON in fragments. */
+/// sink_tool_ops::begin for OpenAI: the call's start delta.
+/// @param k      the OpenAI sink (openai_stream::tools_streamed counts the call)
+/// @param index  the call's index
+/// @param id     the call id
+/// @param name   the function's name
+/// @return false when the write failed
 static bool openai_tool_begin(chat_sink *k, int index, const char *id, const char *name) {
     ((openai_stream *)k->st)->tools_streamed++;
     return sse_chat_tool_call_start_delta(k->fd, k->r, k->id, index, id, name);
 }
 
+/// sink_tool_ops::args for OpenAI.
+/// @param k      the OpenAI sink
+/// @param index  the call's index
+/// @param text   the fragment
+/// @param len    bytes at `text`
+/// @return false when the write failed
 static bool openai_tool_args(chat_sink *k, int index, const char *text, size_t len) {
     return sse_chat_tool_call_args_delta_n(k->fd, k->r, k->id, index, text, len);
 }
 
+/// sink_tool_ops::end for OpenAI: nothing to send.
+/// @return true
 static bool openai_tool_end(chat_sink *, int) { return true; }
 
+/// The OpenAI sink's live tool-call events.
 static const sink_tool_ops openai_tool_ops = {openai_tool_begin, openai_tool_args, openai_tool_end};
 
+/// Build the OpenAI chat protocol sink over `st` (live tool events on; worker thread).
+/// @param k   the sink to fill
+/// @param fd  the client socket
+/// @param s   the server (NULL in unit tests)
+/// @param r   the request
+/// @param id  the response id (borrowed for the sink's life)
+/// @param st  the stream state (openai_stream_start)
 void openai_sink_init(chat_sink *k, int fd, server *s, const request *r, const char *id, openai_stream *st) {
     *k = {fd, s, r, id, st, openai_sink_text_cb, openai_sink_end_cb, &openai_tool_ops, true};
 }
@@ -538,6 +718,17 @@ void openai_sink_init(chat_sink *k, int fd, server *s, const request *r, const c
 
 /* Append the closing chat chunk (empty delta, the remaining logprob entries,
  * finish_reason) to `b`, send `b`, then the usage chunk and [DONE]; frees `b`. */
+/// Send the closing chat chunk (remaining logprobs, finish_reason), then usage and [DONE].
+/// @param fd                 the client socket
+/// @param r                  the request
+/// @param id                 the response id
+/// @param now                the chunk's created time (time(NULL))
+/// @param b                  bytes already queued to send first (freed here)
+/// @param lp                 the logprob ledger (may be NULL)
+/// @param finish             the finish_reason
+/// @param prompt_tokens      the prompt's tokens
+/// @param completion_tokens  the tokens generated
+/// @return false when a write failed
 static bool openai_sse_send_final(int fd, const request *r, const char *id, long now, buf *b,
                                   logprob_ledger *lp, const char *finish,
                                   int prompt_tokens, int completion_tokens) {
@@ -563,6 +754,13 @@ static bool openai_sse_send_final(int fd, const request *r, const char *id, long
 
 /* The end of the stream: the calls no delta carried yet (a block the final
  * parse recovered), then the closing chunk, usage and [DONE]. */
+/// End an OpenAI chat stream: calls no delta carried, the closing chunk, usage and [DONE].
+/// @param k                  the OpenAI sink
+/// @param calls              the turn's calls (sent whole only when no call was streamed live)
+/// @param finish             the finish_reason
+/// @param prompt_tokens      the prompt's tokens
+/// @param completion_tokens  the tokens generated
+/// @return false when a write failed
 bool openai_sse_finish(chat_sink *k, const tool_calls *calls, const char *finish, int prompt_tokens,
                        int completion_tokens) {
     const openai_stream *st = (const openai_stream *)k->st;
@@ -580,18 +778,24 @@ bool openai_sse_finish(chat_sink *k, const tool_calls *calls, const char *finish
 
 
 
+/// @param r  the request
+/// @return true for a streamed OpenAI chat request (its output goes through the OpenAI sink)
 bool request_uses_openai_live_stream(const request *r) {
     return r->stream && r->api == API_OPENAI && r->kind == REQ_CHAT;
 }
 
 
 
+/// @param r  the request
+/// @return true for a streamed Responses request
 bool request_uses_responses_live_stream(const request *r) {
     return r->stream && r->api == API_RESPONSES && r->kind == REQ_CHAT;
 }
 
 
 
+/// @param r  the request
+/// @return true when the stream is a protocol projection (Anthropic, Responses or OpenAI chat), not plain chunks
 bool request_uses_structured_stream(const request *r) {
     return r->stream && (r->api == API_ANTHROPIC ||
                          r->api == API_RESPONSES ||

@@ -3,6 +3,9 @@
  * A selection layer only: it reads the engine's two measured cost authorities (the L304 / L327 prompt chunk cost fit,
  * the L301 verify curve) and the riders' service prices, and says which prompt chunks the next spec round carries.  It knows
  * nothing of slots, banks or routing; server_sched.cpp's spec quantum gathers its inputs and applies its choice. */
+/** @file
+ *  The fused lane's value-per-time round selection (L312), the interface server_sched.cpp calls.
+ */
 #ifndef PULSAR_SCHED_VALUE_H
 #define PULSAR_SCHED_VALUE_H
 
@@ -47,6 +50,7 @@ typedef struct {
     double age_ms;        ///< the decoders' summed time since their last output
 } sched_round;
 
+/** One round's selection (sched_choose's output), indexed like its `pr` array. */
 typedef struct {
     uint32_t q[SCHED_PROMPTS_MAX];   ///< rows each prompt rides (0: it waits)
     bool fin[SCHED_PROMPTS_MAX];     ///< its chunk finishes it (a head row)
@@ -55,22 +59,47 @@ typedef struct {
     double t_dec_ms;                 ///< the decode-only round's predicted wall
     double score, score_dec;         ///< their value per time, net of the decoders' waiting
 } sched_choice;
+/** @var sched_choice::score
+ *  The chosen round's score (value in prompt tokens per ms of wall, net of the decoders' waiting); 0 unpriced. */
 
 /** The choice for one round.  room_rows bounds the round's prompt rows (the fused step's widest run);
  *  first_full_round: this is the first round of a full decode quantum (the unpriced rule's only use of it);
  *  probe_rows: the continuation size while the costs are unmeasured. */
+/// @param e                 the engine (its verify curve and prompt chunk cost fit price the candidates)
+/// @param p                 the preferences maximised
+/// @param r                 the round's decode side
+/// @param pr                the prefilling prompts (at most SCHED_PROMPTS_MAX are read)
+/// @param n                 how many in `pr`
+/// @param room_rows         see above
+/// @param first_full_round  see above
+/// @param probe_rows        see above
+/// @param out               receives the choice, indexed like `pr` (zeroed first)
 void sched_choose(const pulsar_engine *e, const sched_prefs *p, const sched_round *r, const sched_prompt *pr,
                   int n, uint32_t room_rows, bool first_full_round, uint32_t probe_rows, sched_choice *out);
 
 /** A prompt's individually feasible service rate, tokens per ms: its widest chunk alone on the measured costs
  *  (0: unmeasured).  What its price adapts against. */
+/// @param e          the engine
+/// @param r          the round's decode side (the chunk rides beside it)
+/// @param pr         the prompt
+/// @param room_rows  the round's prompt-row bound
+/// @return tokens per ms; 0 when unmeasured or the prompt has no candidate chunk
 double sched_prompt_rate_max(const pulsar_engine *e, const sched_round *r, const sched_prompt *pr,
                              uint32_t room_rows);
 /** A decoder's: `tokens` expected from a round of its own `rows` rows on the verify curve (0: no curve). */
+/// @param e       the engine
+/// @param tokens  the decoder's expected tokens from such a round
+/// @param rows    the round's verify rows
+/// @return tokens per ms; 0 when there is no verify curve
 double sched_decode_rate_max(const pulsar_engine *e, double tokens, uint32_t rows);
 
 /** Flare's service price, held over one round of `t_ms` in which the request received `tokens` (0: none) of the
  *  `max_rate` it could have: dp/dt = (f - p y) / (m tau) integrated exactly for the held action (inv = p / f). */
+/// @param inv_ms    the request's service price over f, ms per token, updated in place (<= 0: unpriced, left alone)
+/// @param t_ms      the round's wall, ms
+/// @param tokens    tokens the request received in it
+/// @param max_rate  its individually feasible rate, tokens per ms (<= 0: no update)
+/// @param adapt_ms  tau, ms (<= 0: no update)
 void sched_service_observe(double *inv_ms, double t_ms, double tokens, double max_rate, double adapt_ms);
 
 #endif

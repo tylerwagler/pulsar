@@ -13,6 +13,9 @@
  *     the server reads enable_thinking and reasoning_effort only; "medium" is the medium_effort level.
  * Departures from vLLM: client text spelling a marker stays text (L223); a call the turn ends inside is broken
  * (L272); a message's text parts arrive joined. */
+/** @file
+ *  The Nemotron-H family's server table (server_family_ops) over src/lib/nemotron_chat.
+ */
 #include "pulsar_server_internal.h"
 #include "../lib/nemotron_chat.h"
 
@@ -24,9 +27,12 @@ namespace {
 
 /* ---- the effort map: the template's three levels ------------------------------------------------------------ */
 
+/** server_effort_map::default_level for Nemotron-H.
+ *  @return the template's default level (a nemotron_effort) */
 int nemotron_effort_default_level(pulsar_engine *) { return (int)nemotron_effort_default(); }
 
 /* none -> thinking off; minimal, low, medium -> medium_effort; high, xhigh, max -> the template's default */
+/** Nemotron-H's effort map (server_family_ops::effort); levels are nemotron_effort values, no integer map. */
 const server_effort_map k_effort_nemotron_h = {
     {NEMOTRON_EFFORT_NONE, NEMOTRON_EFFORT_MEDIUM, NEMOTRON_EFFORT_MEDIUM, NEMOTRON_EFFORT_MEDIUM, NEMOTRON_EFFORT_HIGH,
      NEMOTRON_EFFORT_HIGH, NEMOTRON_EFFORT_HIGH},
@@ -37,11 +43,22 @@ const server_effort_map k_effort_nemotron_h = {
 /* The parsed messages as the renderer's, borrowing `msgs`: the request's system FIELD first (the protocol parsers
  * append it to the array), then the messages in order -- or, for a TAIL, the messages from `start`, the system field
  * not among them.  false + err: an image (N11's front is not wired). */
+/** The renderer's message list built by nemotron_messages; its strings borrow the chat_msgs it was built from. */
 struct nemotron_msgs {
+    /// The messages in render order.
     std::vector<nemotron_msg_in> m;
+    /// Per SOURCE message index: its calls (`m` points in).
     std::vector<std::vector<nemotron_tool_call_in>> calls;
 };
 
+/** Build `out` from `msgs` (the rule above).
+ *  @param msgs the parsed messages (borrowed: must outlive `out`)
+ *  @param start a tail's first message index (read only when `tail`)
+ *  @param tail build the messages from `start` instead of the whole conversation
+ *  @param out the result
+ *  @param err the refusal (an image)
+ *  @param errlen bytes at `err`
+ *  @return false + err when a message carries an image */
 bool nemotron_messages(const chat_msgs *msgs, int start, bool tail, nemotron_msgs *out, char *err, size_t errlen) {
     out->m.clear();
     out->calls.assign((size_t)msgs->len, {});
@@ -76,6 +93,10 @@ bool nemotron_messages(const chat_msgs *msgs, int start, bool tail, nemotron_msg
 }
 
 /* A render's text and client-data ranges as the request owns them (malloc'd; the ranges NULL when none). */
+/** @param out the renderer's output
+ *  @param spans_out the client-data spans (malloc'd; NULL when none); NULL = not wanted
+ *  @param n_spans_out the span count
+ *  @return the rendered text, malloc'd */
 char *nemotron_take_render(const nemotron_render_out &out, chat_text_span **spans_out, uint32_t *n_spans_out) {
     if (spans_out) {
         *spans_out = NULL;
@@ -95,6 +116,9 @@ char *nemotron_take_render(const nemotron_render_out &out, chat_text_span **span
  * prefill drops it) and "<think></think>" with thinking off.  The seed is what the output parser reads before the
  * model's first token; an UNNAMED seed stops before the name's opener "=" (token healing, as Qwen: the opener,
  * a declared name and the arguments are the call grammar's, L303). */
+/** Write the call opener: "<tool_call>\n<function", then "=NAME>\n" when the choice names a function.
+ *  @param r the request (forced_tool_name)
+ *  @param out appended to */
 void nemotron_forced_call_open(const request *r, buf *out) {
     buf_puts(out, "<tool_call>\n<function");
     if (r->forced_tool_name && r->forced_tool_name[0]) {
@@ -104,12 +128,21 @@ void nemotron_forced_call_open(const request *r, buf *out) {
     }
 }
 
+/** server_family_ops::forced_call_seed for Nemotron-H.
+ *  @param r the request (family_effort: thinking on or off; forced_tool_name)
+ *  @param out appended to: the seed bytes */
 void nemotron_forced_call_seed(const request *r, buf *out) {
     /* thinking on: the turn is in reasoning, the seed closes the empty block; off: the prompt already closed it */
     buf_puts(out, (nemotron_effort)r->family_effort != NEMOTRON_EFFORT_NONE ? "</think>\n" : "\n");
     nemotron_forced_call_open(r, out);
 }
 
+/** server_family_ops::forced_call_prefill for Nemotron-H: with thinking on, drop the generation prompt's trailing
+ *  "\n" after "<think>"; append the seed.
+ *  @param r the request
+ *  @param prompt the rendered prompt
+ *  @param keep in: the prompt's length in bytes; out: the bytes kept
+ *  @param append the bytes appended after the kept prompt */
 void nemotron_forced_call_prefill(const request *r, const char *prompt, size_t *keep, buf *append) {
     if ((nemotron_effort)r->family_effort != NEMOTRON_EFFORT_NONE) {
         /* the generation prompt's "<think>\n": keep "<think>", the call turn's render continues "</think>\n" */
@@ -118,6 +151,14 @@ void nemotron_forced_call_prefill(const request *r, const char *prompt, size_t *
     nemotron_forced_call_seed(r, append);
 }
 
+/** server_family_ops::render for Nemotron-H; a required / named tool_choice with tools prefills an open call.
+ *  @param e the engine (NULL = render only: no tokenisation, no images)
+ *  @param s the server
+ *  @param c the parsed conversation
+ *  @param r the request: prompt_text / prompt_spans / prompt, has_tools, force_tool_call written
+ *  @param err the refusal
+ *  @param errlen bytes at `err`
+ *  @return false + err for an image, a render the renderer refuses, or a failed forced prefill */
 bool nemotron_render(pulsar_engine *e, server *s, chat_conversation *c, request *r, char *err, size_t errlen) {
     char *head_raw = NULL;
     if (!chat_openai_tools_json(c, r, &head_raw, err, errlen)) return false;
@@ -152,6 +193,9 @@ bool nemotron_render(pulsar_engine *e, server *s, chat_conversation *c, request 
 
 /* L272 B6: the longest prefix two UNRELATED prompts share by template construction: the system turn's opener (every
  * Nemotron prompt opens with it, empty or not). */
+/** server_family_ops::trivial_header_tokens for Nemotron-H.
+ *  @param e the engine (its tokenizer)
+ *  @return the tokens of "<|im_start|>system\n" */
 int nemotron_trivial_header_tokens(pulsar_engine *e) {
     pulsar_tokens t = {0};
     pulsar_tokenize_rendered_chat(e, "<|im_start|>system\n", &t);
@@ -163,6 +207,12 @@ int nemotron_trivial_header_tokens(pulsar_engine *e) {
 /* ---- the output parser: the kit in Nemotron's configuration, typed by the tools the prompt rendered, starting in
  *      reasoning exactly when the generation prompt opened "<think>\n" -------------------------------------------- */
 
+/** server_output_parser_ops::create for Nemotron-H: the parser kit, typed by the request's tools_json, starting in
+ *  reasoning when thinking is on.
+ *  @param g the decode attempt (its job's request)
+ *  @param err the failure
+ *  @param errlen bytes at `err`
+ *  @return the parser state (parser_kit_destroy frees it), or NULL + err */
 void *nemotron_parser_create(server *, gen_state *g, char *err, size_t errlen) {
     nemotron_output_parser *p = new nemotron_output_parser();
     char perr[200];
@@ -174,6 +224,7 @@ void *nemotron_parser_create(server *, gen_state *g, char *err, size_t errlen) {
     return parser_kit_start(p);
 }
 
+/** Nemotron-H's output parser table: the parser kit's hooks. */
 const server_output_parser_ops k_parser_nemotron_h = {
     /* .create        = */ nemotron_parser_create,
     /* .destroy       = */ parser_kit_destroy,
@@ -190,6 +241,14 @@ const server_output_parser_ops k_parser_nemotron_h = {
 
 /* ---- step 4: the suffix hooks, each one of the renderer's pieces --------------------------------------------- */
 
+/** server_family_ops::assistant_turn_sampled for Nemotron-H.
+ *  @param think the turn ran with thinking on (the template's think-block spelling)
+ *  @param reasoning the reasoning to replay; NULL = none
+ *  @param content the content text
+ *  @param calls the turn's calls; NULL = none
+ *  @param spans_out the client-data spans (malloc'd; NULL when none); NULL = not wanted
+ *  @param n_spans_out the span count
+ *  @return the turn's text (malloc'd), or NULL when the renderer refused it (logged) */
 char *nemotron_assistant_turn_sampled(const request *, bool think, const char *reasoning, const char *content,
                                       const tool_calls *calls, chat_text_span **spans_out, uint32_t *n_spans_out) {
     std::vector<nemotron_tool_call_in> k;
@@ -211,6 +270,13 @@ char *nemotron_assistant_turn_sampled(const request *, bool think, const char *r
     return nemotron_take_render(out, spans_out, n_spans_out);
 }
 
+/** server_family_ops::tool_result_tail for Nemotron-H.
+ *  @param r the request (family_effort: the generation prompt's think opener)
+ *  @param msgs the conversation's messages
+ *  @param start the first new user-side message
+ *  @param spans_out the client-data spans (malloc'd; NULL when none); NULL = not wanted
+ *  @param n_spans_out the span count
+ *  @return the tail's text (malloc'd), or NULL when refused (logged) */
 char *nemotron_tool_result_tail(const request *r, const chat_msgs *msgs, int start, chat_text_span **spans_out,
                                 uint32_t *n_spans_out) {
     if (spans_out) { *spans_out = NULL; *n_spans_out = 0; }
@@ -228,6 +294,12 @@ char *nemotron_tool_result_tail(const request *r, const chat_msgs *msgs, int sta
 
 /* The model-visible retry, as on every family: the malformed turn ended at its stop token, and the error -- with the
  * system turn reminded (the tools block and the system text) -- is ONE tool result, then the generation prompt. */
+/** server_family_ops::tool_error_suffix for Nemotron-H.
+ *  @param r the request (its prompt_text supplies the system reminder)
+ *  @param detail what was malformed; NULL or empty = no detail
+ *  @param spans_out the client-data spans (malloc'd; NULL when none); NULL = not wanted
+ *  @param n_spans_out the span count
+ *  @return the suffix's text (malloc'd), or NULL when refused */
 char *nemotron_tool_error_suffix(const request *r, const thinking_state *, const char *detail, chat_text_span **spans_out,
                                  uint32_t *n_spans_out) {
     std::string text = "Tool error: malformed tool call";
@@ -249,6 +321,12 @@ char *nemotron_tool_error_suffix(const request *r, const thinking_state *, const
 }  // namespace
 
 /* L325: a tool loaded mid-conversation, in place: the tools block's <function> elements inside <tools></tools> (nemotron_chat_tool_defs). */
+/// server_family_ops::tool_defs_text for Nemotron-H.
+/// @param lines   one function schema a line (parse_tools_value)
+/// @param len     bytes at `lines`
+/// @param err     receives the reason on NULL
+/// @param errlen  size of `err`
+/// @return the rendered definitions (malloc'd), or NULL + err when the lines do not convert
 static char *nemotron_tool_defs_text(const char *lines, size_t len, char *err, size_t errlen) {
     char *json = tool_schema_lines_openai_tools(lines, len, err, errlen);
     if (!json) return NULL;

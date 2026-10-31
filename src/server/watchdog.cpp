@@ -5,6 +5,9 @@
  * prefill chunk.  This thread turns that into one loud dump and a /health verdict.  It never touches the engine or a
  * worker-owned structure: it reads the worker's marks (pulsar_stall.h), the snapshot the worker publishes under mu
  * (publish_metrics_snapshot), /proc, and -- once per stall -- asks the worker for its own backtrace by signal. */
+/** @file
+ *  The stall watchdog thread and its one dump per stall.
+ */
 #include "pulsar_server_internal.h"
 
 #include <dirent.h>
@@ -34,6 +37,8 @@ namespace {
 
 /* The worker's backtrace, written by the worker itself from the signal (backtrace_symbols_fd allocates nothing).
  * backtrace() is warmed at start so its first call (which loads the unwinder) never runs inside the handler. */
+/** SIGUSR2 handler (installed by server::watchdog_start): writes the receiving thread's backtrace to stderr.
+ *  Async-signal-safe: no allocation, only write(2) and backtrace_symbols_fd. */
 void stall_backtrace_handler(int) {
     void *frames[64];
     const int n = backtrace(frames, 64);
@@ -43,6 +48,13 @@ void stall_backtrace_handler(int) {
 }
 
 /* "/proc/self/task/<tid>/stat": the name, the state and the user / system CPU ticks of one thread */
+/** @param tid the thread id (a /proc/self/task entry)
+ *  @param comm the thread's name (NUL-terminated, truncated to `commlen`)
+ *  @param commlen bytes at `comm`
+ *  @param state the one-letter scheduler state (R, S, D, ...)
+ *  @param utime user CPU time, in clock ticks (sysconf(_SC_CLK_TCK))
+ *  @param stime system CPU time, in clock ticks
+ *  @return false when the file cannot be read or parsed (the outputs are then unspecified) */
 bool thread_stat(int tid, char *comm, size_t commlen, char *state, unsigned long long *utime,
                  unsigned long long *stime) {
     char path[64], buf[1024];
@@ -67,6 +79,10 @@ bool thread_stat(int tid, char *comm, size_t commlen, char *state, unsigned long
     return true;
 }
 
+/** "/proc/self/task/<tid>/wchan": the kernel function a sleeping thread waits in.
+ *  @param tid the thread id
+ *  @param out the symbol, NUL-terminated; empty when unreadable (or "0" when running)
+ *  @param outlen bytes at `out` (at least 1) */
 void thread_wchan(int tid, char *out, size_t outlen) {
     char path[64];
     snprintf(path, sizeof path, "/proc/self/task/%d/wchan", tid);
@@ -78,6 +94,8 @@ void thread_wchan(int tid, char *out, size_t outlen) {
     out[n] = '\0';
 }
 
+/** @param key a /proc/meminfo field with its colon ("SwapTotal:")
+ *  @return the field's value in KiB; 0 when absent or unreadable */
 uint64_t meminfo_kib(const char *key) {
     FILE *fp = fopen("/proc/meminfo", "r");
     if (!fp) return 0;
@@ -90,9 +108,16 @@ uint64_t meminfo_kib(const char *key) {
     return v;
 }
 
+/** The names of server::m_slot_phase's values 0..7, for the stall dump. */
 const char *const k_phase_names[] = {"idle", "restore", "prefill-cold", "prefill", "decode-init", "decode", "finish",
                                      "done"};
 
+/** The watchdog thread: once a second, compare the worker's mark count (g_pulsar_stall.beats) with the last seen;
+ *  with jobs queued or running (read under server::mu by trylock: a held mu keeps the last answer) and no mark
+ *  for server::stall_limit_s seconds, publish server::stall_s and dump once (server::watchdog_dump) until a mark
+ *  clears it.  Runs until server::watchdog_quit.
+ *  @param arg the server
+ *  @return NULL */
 void *watchdog_main(void *arg) {
     server *s = (server *)arg;
     uint64_t seen = g_pulsar_stall.beats.load(std::memory_order_relaxed);

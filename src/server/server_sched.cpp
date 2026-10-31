@@ -4,6 +4,10 @@
  * admission/ledger/mem-floor helpers, LRU eviction and the warm
  * make-room path, the proactive spill/restore guard, Tier-2 bank
  * switching, and the frontier/committed-pos readers. */
+/** @file
+ *  The scheduler / worker: worker_main and its lanes, job-to-slot routing, provisioning, admission, eviction,
+ *  the spill / preempt guard and bank switching.
+ */
 #include "pulsar_server_internal.h"
 #include "pulsar_nvtx.h"
 #include "pulsar_lock.hpp"
@@ -44,6 +48,9 @@ bool server::enqueue(job *j) {
 }
 
 /* L329 (a): a waiter is passed over, so the job the worker binds or drops need not be the head (mu held) */
+/// @brief Unlink `j` wherever it stands in the queue (a job not queued: no-op).  Caller holds s->mu.
+/// @param s the server
+/// @param j the job
 static void queue_unlink_locked(server *s, job *j) {
     job *prev = NULL, *q = s->head;
     for (; q && q != j; q = q->next) prev = q;
@@ -98,6 +105,11 @@ int server::job_needed_ctx(const job *j) const {
  * tensor primitives -- an accounting hole the ledger must not paper over.
  * Returns the bytes to commit (the actual), 0 on a mismatch: the caller
  * refuses to start. */
+/// @param slot_idx the slot, for the log line
+/// @param ctx its context in tokens, for the log line
+/// @param est_bytes the price admission charged, bytes
+/// @param actual_bytes the bytes the allocator committed
+/// @return actual_bytes, or 0 on a mismatch (or 0 actual)
 uint64_t server_reconciled_session_cost(int slot_idx, int ctx,
                                         uint64_t est_bytes,
                                         uint64_t actual_bytes) {
@@ -124,6 +136,7 @@ uint64_t server_reconciled_session_cost(int slot_idx, int ctx,
  * UVM accounting lags MemAvailable, and under UVM pressure MemTotal itself
  * shrinks, so this is a belt-and-suspenders floor check on top of the
  * ledger, not a precise gauge. */
+/// @return MemAvailable in bytes; 0 when /proc/meminfo is unreadable or has no such line
 uint64_t server_mem_available_bytes(void) {
     FILE *fp = fopen("/proc/meminfo", "r");
     if (!fp) return 0;
@@ -280,6 +293,11 @@ void server::slot_prefix_match(const session_slot *sl, const pulsar_tokens *prom
  * live bank's.  Refusing it was the 2026-09-29 pair's serialized c2: the pool
  * was full, LRU eviction freed a bank, and the floor then refused to hand that
  * same bank to the queued job. */
+/// @param n_provisioned banks provisioned already (the first is exempt)
+/// @param pages_resident the bank's pages are already resident
+/// @param avail MemAvailable in bytes (0 = unreadable)
+/// @param marginal the bank's ledger marginal in bytes
+/// @return true when the floor refuses the provision
 static bool server_bank_floor_refuses(int n_provisioned, bool pages_resident,
                                       uint64_t avail, uint64_t marginal) {
     return n_provisioned > 0 && !pages_resident &&
@@ -290,6 +308,10 @@ static bool server_bank_floor_refuses(int n_provisioned, bool pages_resident,
  * high-water bytes), lowest index on a tie, so a tight box reuses what it has
  * already paged in before touching a bank that never was.  resident[i] is
  * read only where provisioned[i] is false.  -1 when every bank is provisioned. */
+/// @param provisioned per bank: provisioned already
+/// @param resident per bank: its resident pages in bytes (read only where not provisioned)
+/// @param n banks
+/// @return the bank index, or -1
 static int server_pick_free_bank(const bool *provisioned, const KvBytes *resident, int n) {
     int best = -1;
     for (int i = 0; i < n; i++) {
@@ -304,6 +326,9 @@ static int server_pick_free_bank(const bool *provisioned, const KvBytes *residen
  * its pages and provision_bank reuses that resident hole without paging in
  * anything (server_pick_free_bank prefers it, server_bank_floor_refuses admits
  * it).  In classic mode an eviction frees nothing the floor can see. */
+/// @param r the refusal
+/// @param pool_mode the bank pool is active
+/// @return true when evicting an idle bank can relieve it
 static bool server_refusal_evictable(provision_refusal r, bool pool_mode) {
     return r == PROVISION_REFUSED_POOL_FULL || r == PROVISION_REFUSED_ADMISSION ||
            (pool_mode && r == PROVISION_REFUSED_MEM_FLOOR);
@@ -487,6 +512,11 @@ int server::provision_ctx_for_job(const job *j) const {
  * holding only a sub-threshold warm tail past the match is now reused
  * (clobbered) rather than protected by a fresh provisioning — protecting
  * <threshold tokens of KV is never worth seconds of session create. */
+/// @param common tokens the job shares with the slot
+/// @param slot_pos the slot's frontier position
+/// @param share_ceiling the trivial-match threshold (the template header plus allowance, lifted per job)
+/// @param protect_floor the warm tail past the match that is worth protecting, tokens
+/// @return true when the match is trivial and the slot holds a warm tail worth protecting
 bool server_slot_match_is_trivial(int common, int slot_pos,
                                   int share_ceiling, int protect_floor) {
     return common < share_ceiling && slot_pos - common >= protect_floor;
@@ -510,6 +540,10 @@ bool server_slot_match_is_trivial(int common, int slot_pos,
  * first-turn bank: two unrelated conversations behind one system prompt share
  * the marker position and part of the first message, the 2026-10-04 clobber), or
  * when there is no user marker at all. */
+/// @param bank the bank's history tokens
+/// @param prefilled tokens of it that were prefilled (clamped to its length)
+/// @param m the template's turn markers
+/// @return the anchor position, or -1
 int server_route_turn_anchor(const pulsar_tokens *bank, int prefilled, const pulsar_turn_markers *m) {
     if (!bank || !bank->v || !m || m->n_user <= 0 || m->n_assistant <= 0) return -1;
     if (prefilled > bank->len) prefilled = bank->len;
@@ -566,6 +600,13 @@ int server_route_anchor(const pulsar_tokens *bank, int prefilled, const pulsar_t
  * every turn) -- diverges INSIDE the bank's first user turn, before any anchor,
  * so it takes a fresh bank, which restores the shared prefix from the disk
  * chain. */
+/// @param common tokens the job shares with the bank
+/// @param score where the sync would resume (the deepest grid checkpoint within the match)
+/// @param frontier the bank's frontier position
+/// @param prefilled tokens the bank prefilled
+/// @param protect_floor the discard under which in-place reuse is always allowed, tokens
+/// @param anchor the bank's last-turn anchor (server_route_turn_anchor; -1: none)
+/// @return true when the job continues on the bank in place
 bool server_route_in_place(int common, int score, int frontier, int prefilled, int protect_floor,
                            int anchor) {
     return common >= prefilled || (anchor >= 0 && common > anchor) || frontier - score < protect_floor;
@@ -827,6 +868,10 @@ session_slot *server::choose_slot_for_job(job *j, int *reject_ctx,
  * and only when the alternative is queueing forever.
  * ========================================================================= */
 
+/// @brief The ledger after releasing a slot's cost; an underflow is logged and clamps to 0.
+/// @param committed_total the committed bytes
+/// @param slot_cost the released slot's cost in bytes
+/// @return the new committed total
 uint64_t server_ledger_release(uint64_t committed_total, uint64_t slot_cost) {
     if (slot_cost > committed_total) {
         server_log(PULSAR_LOG_WARNING,
@@ -843,6 +888,14 @@ uint64_t server_ledger_release(uint64_t committed_total, uint64_t slot_cost) {
 
 
 
+/// @brief The eviction victim: a provisioned idle slot, not protected; dominated first, then least recently
+/// serviced, then the smaller cost.
+/// @param slots the slot array
+/// @param n_slots its length
+/// @param protect per slot: never evicted (NULL: none)
+/// @param allow_slot0 slot 0 may be picked (pool mode)
+/// @param dominated per slot: dominated (NULL: none)
+/// @return the slot index, or -1
 int server_evict_pick_victim(const session_slot *slots, int n_slots,
                              const bool *protect, bool allow_slot0, const bool *dominated) {
     int victim = -1;
@@ -1021,6 +1074,8 @@ bool server::worker_eviction_could_help(const job *j,
  * zeroes it on reuse), and the protocol live bindings are the caller's to
  * clear AFTER the snapshot store (their keying reads them). Returns the ctx
  * the slot was admitted for, for the caller's log line. */
+/// @param sl the evicted slot
+/// @return the ctx it was admitted for
 static int evict_reset_slot_fields(session_slot *sl) {
     const int evicted_ctx = sl->ctx_size;
     sl->provisioned = false;
@@ -1134,6 +1189,11 @@ bool server::worker_evict_one(bool protect[PULSAR_SESSION_POOL_CAP]) {
  * caller fills it there).  Before L323 this was plan-33 inc D's "LRU-superseded" pick, consulted by fresh_make_room
  * alone and over resident banks only; the guard spilled by LRU and kept dominated copies resident (2026-10-24: 9 of
  * 16 banks at 150-205k, mostly copies of one conversation). */
+/// @param a the slot asked about
+/// @param n_slots slots
+/// @param hist_len per slot: its history length in tokens (0 = none)
+/// @param common common[a][k]: the common prefix of a and k (bank_common_matrix)
+/// @return true when slot a is dominated
 static bool bank_dominated_core(int a, int n_slots, const int *hist_len, const int *const *common) {
     if (hist_len[a] <= 0) return false;
     for (int k = 0; k < n_slots; k++) {
@@ -1148,6 +1208,9 @@ static bool bank_dominated_core(int a, int n_slots, const int *hist_len, const i
  * hist_len[k] >= hist_len[i] (k != i), common_rows[i][k] = their common token prefix; -1 elsewhere.  Host-carry
  * prefix reads (the same reads routing does on idle banks; no CUDA), only where a reader looks: two conversations
  * part within a few thousand tokens, so a compare runs long only between copies of one. */
+/// @param s the server (worker thread)
+/// @param hist_len receives each slot's history length in tokens
+/// @param common_rows receives the matrix (-1 where not filled)
 static void bank_common_matrix(server *s, int hist_len[PULSAR_SESSION_POOL_CAP],
                                int common_rows[PULSAR_SESSION_POOL_CAP][PULSAR_SESSION_POOL_CAP]) {
     pulsar_session *pool = s->sess;
@@ -1176,6 +1239,11 @@ void server::dominated_slots(bool dominated[PULSAR_SESSION_POOL_CAP]) {
 }
 
 /* L324: the common prefix of slots a and b from the matrix (read in the direction bank_common_matrix fills). */
+/// @param a a slot
+/// @param b another slot
+/// @param hist_len per slot: history length
+/// @param common the matrix
+/// @return their common prefix in tokens
 static int dup_pair_common(int a, int b, const int *hist_len, const int *const *common) {
     return hist_len[a] <= hist_len[b] ? common[a][b] : common[b][a];
 }
@@ -1766,6 +1834,15 @@ void server::worker_service_slot(session_slot *sl) {
 /* A slot's draw request (THE sampler, L302) -- L303: through the grammar's mask while a region is live; the row
  * itself stays the target distribution the logprob capture reads.  *mask is the caller's storage; the draw request
  * reads it.  false with g->err set: the grammar failed (the request fails). */
+/// @param s the server
+/// @param g the slot's generation
+/// @param temp temperature
+/// @param top_k top-k (0: off)
+/// @param top_p top-p
+/// @param min_p min-p
+/// @param mask the grammar mask's storage (resized and filled while a region is live)
+/// @param d receives the draw request
+/// @return false when the grammar failed (g->err set)
 static bool gen_draw_req(server *s, gen_state *g, float temp, int top_k, float top_p, float min_p,
                          std::vector<uint32_t> *mask, pulsar_row_draw *d) {
     const bool live = gen_constrain_live(g);
@@ -1779,6 +1856,14 @@ static bool gen_draw_req(server *s, gen_state *g, float temp, int top_k, float t
 
 /* the slot's draw from the pool session's live row.  -1 with g->err set: the sampler refused the row, or the
  * grammar failed. */
+/// @param s the server
+/// @param g the slot's generation
+/// @param pool the pool session (the slot's bank installed)
+/// @param temp temperature
+/// @param top_k top-k (0: off)
+/// @param top_p top-p
+/// @param min_p min-p
+/// @return the token, or -1
 static int gen_sample_pool(server *s, gen_state *g, pulsar_session *pool, float temp, int top_k, float top_p,
                            float min_p) {
     std::vector<uint32_t> mask;
@@ -1804,6 +1889,8 @@ static int gen_sample_pool(server *s, gen_state *g, pulsar_session *pool, float 
  * for explicit temp-0 requests (characterized 2026-07-22); output remains
  * valid and self-consistent with the bank's KV.
  * Prefill/init/finish slots are serviced per-slot as usual. */
+/// @param sl the slot
+/// @return true when it holds a job in GEN_DECODE that is not preempted
 static bool slot_is_batchable_decode(const session_slot *sl) {
     const gen_state *g = sl->gen;
     return sl->active_job && !sl->preempted && g && g->phase == GEN_DECODE;   /* L314: a parked decoder is not */
@@ -1826,6 +1913,11 @@ static bool slot_is_batchable_decode(const session_slot *sl) {
  * no more than one verify forward carries, and each speculates (the lane pick's own conditions, batch membership
  * aside: a decoder in the plain batch leaves it when the price picks spec, so a leave is never undone by the next
  * pick).  L303: a constrained decoder speculates too -- the round's rows carry its masks. */
+/// @param spec_rounds the engine runs a drafter behind the round API
+/// @param verify_rows base rows one verify forward carries
+/// @param dec the decoders
+/// @param n_dec how many
+/// @return true when the spec lane could take every decoder
 static bool server_spec_lane_carries(bool spec_rounds, uint32_t verify_rows, session_slot *const *dec, int n_dec) {
     if (!spec_rounds || n_dec <= 0 || (uint32_t)n_dec > verify_rows) return false;
     for (int i = 0; i < n_dec; i++) {
@@ -1876,12 +1968,19 @@ static bool server_spec_lane_carries(bool spec_rounds, uint32_t verify_rows, ses
  *     against 80 measured -- and the clearance is 25%: a cleared prediction does not hide a faster lane.)  (L288, Qwen one stream: spec 51-78 tok/s against
  *     plain 33.8-36.1 measured, and the 512-step clock re-probed plain 13 times in 48 requests at ~0.67 s each,
  *     ~9% of a probed request; the plain price it re-measured moved 7% end to end.) */
+/// How much faster (fraction) the other lane must price before a probe or a switch.
 #define LANE_PRICE_MARGIN        0.04
+/// Steps the lane in force runs after it is chosen or weighed before a probe or a switch.
 #define LANE_PRICE_HOLD_STEPS    32u
+/// Steps a probe runs on the other lane (and the steps a measured price needs).
 #define LANE_PRICE_PROBE_STEPS   32u
+/// Steps of the lane in force after which the other lane is probed again.
 #define LANE_PRICE_REPROBE_STEPS 512u
+/// The ratio by which a measured lane clears the other's price to defer the scheduled re-measure.
 #define LANE_PRICE_CLEAR         1.25   /* six margins: past the 7% the plain price drifted over L288's whole run */
+/// How many re-probe periods a cleared lane defers the re-measure.
 #define LANE_PRICE_CLEAR_SPAN    8u     /* 4096 steps: ~16k tokens of one Qwen stream before the price is re-taken */
+/// The exponential weight of each new step in the measured prices and the spec yield.
 #define LANE_PRICE_ALPHA         0.0625f   /* the measured prices' and yield's EW weight: a probe's 32 steps
                                               carry ~7/8 of the price it ends on */
 
@@ -1889,6 +1988,11 @@ const char *const server_round_phase_name[SERVER_ROUND_PHASE_COUNT] = {"plan", "
                                                                        "draft", "commit"};
 
 /* One decode step on lane `li` (PULSAR_LANE_PLAIN / _SPEC) by `n` decoders: `tokens` committed in `ms`. */
+/// @param lp the lane prices (worker thread)
+/// @param li the lane (PULSAR_LANE_PLAIN / PULSAR_LANE_SPEC)
+/// @param n decoders (a new count resets the measurements)
+/// @param tokens tokens committed
+/// @param ms the step's wall time, ms
 static void lane_price_measure(lane_price *lp, int li, int n, int tokens, double ms) {
     if (n <= 0 || tokens < 0 || !(ms > 0.0)) return;
     if (n != lp->meas_n) {   /* another decoder count: what was measured prices it no longer */
@@ -1904,11 +2008,20 @@ static void lane_price_measure(lane_price *lp, int li, int n, int tokens, double
 }
 
 /* One plain decode step: `n` decoders committed a token each in `ms`. */
+/// @param lp the lane prices
+/// @param n decoders
+/// @param ms the step's wall time, ms
 static void lane_price_observe_plain(lane_price *lp, int n, double ms) {
     lane_price_measure(lp, PULSAR_LANE_PLAIN, n, n, ms);
 }
 
 /* One spec decode round: `tokens` committed by `banks` banks over `rows` verify rows in `ms`. */
+/// @brief Also folds the round's yield per bank (tau, rho) into the EW averages.
+/// @param lp the lane prices
+/// @param tokens tokens committed
+/// @param rows verify rows
+/// @param banks banks in the round
+/// @param ms the round's wall time, ms
 static void lane_price_observe_spec(lane_price *lp, int tokens, int rows, int banks, double ms) {
     if (banks <= 0 || rows <= 0 || tokens < 0) return;
     lane_price_measure(lp, PULSAR_LANE_SPEC, banks, tokens, ms);
@@ -1923,10 +2036,20 @@ static void lane_price_observe_spec(lane_price *lp, int tokens, int rows, int ba
 }
 
 /* The lanes' predicted prices for `n` decoders, tokens/s (0: no number). */
+/// @param c the plain lane's cost fit
+/// @param n decoders
+/// @return tokens/s, 0 without a fit
 static double lane_price_plain(const pulsar_lane_cost *c, int n) {
     const double ms = pulsar_lane_cost_ms(c, (double)n);
     return ms > 0.0 ? 1000.0 * (double)n / ms : 0.0;
 }
+/// @brief The spec lane's predicted price, tokens/s: n * tau over the cost of n * rho rows, the drafts prorated
+/// past the verify width; 0 before the yield is measured or without a fit.
+/// @param c the spec lane's cost fit
+/// @param lp the lane prices (tau, rho)
+/// @param n decoders
+/// @param verify_rows the verify width
+/// @return tokens/s
 static double lane_price_spec(const pulsar_lane_cost *c, const lane_price *lp, int n, uint32_t verify_rows) {
     if (!(lp->tau > 0.0f) || !(lp->rho >= 1.0f)) return 0.0;
     double rows = (double)n * lp->rho, toks = (double)n * lp->tau;
@@ -1939,6 +2062,10 @@ static double lane_price_spec(const pulsar_lane_cost *c, const lane_price *lp, i
     return ms > 0.0 ? 1000.0 * toks / ms : 0.0;
 }
 /* Lane `li`'s measured price at `n` decoders, tokens/s (0: not measured there). */
+/// @param lp the lane prices
+/// @param li the lane
+/// @param n decoders
+/// @return tokens/s
 static double lane_price_measured(const lane_price *lp, int li, int n) {
     if (lp->meas_n != n || lp->meas_steps[li] < LANE_PRICE_PROBE_STEPS || !(lp->meas_ms[li] > 0.0)) return 0.0;
     return 1000.0 * lp->meas_tok[li] / lp->meas_ms[li];
@@ -1946,6 +2073,12 @@ static double lane_price_measured(const lane_price *lp, int li, int n) {
 
 /* The priced lane (2 plain, 3 spec) for `n` decoders the spec lane could carry; called once a quantum.  The
  * fits' step counts (pulsar_lane_cost::n) time the hold and the probes.  Updates lp's prices and reason. */
+/// @param lp the lane prices (updated)
+/// @param plain the plain lane's cost fit
+/// @param spec the spec lane's cost fit
+/// @param n decoders
+/// @param verify_rows the verify width
+/// @return the lane: 2 plain or 3 spec
 static int lane_price_pick(lane_price *lp, const pulsar_lane_cost *plain, const pulsar_lane_cost *spec, int n,
                            uint32_t verify_rows) {
     if (lp->lane == 0) {   /* the spec lane until a price says otherwise */
@@ -2028,6 +2161,15 @@ static int lane_price_pick(lane_price *lp, const pulsar_lane_cost *plain, const 
     return inc;
 }
 
+/// @brief The decode lane for this sweep (the rule above): 0 idle, 2 batched, 3 spec-batched (1, the retired
+/// classic spec lane, only off the bank pool).
+/// @param pool_banks the pool's banks (0: classic mode)
+/// @param spec_rounds the engine runs a drafter behind the round API
+/// @param verify_rows base rows one verify forward carries
+/// @param dec the decoders
+/// @param n_dec how many
+/// @param n_batched decoders in the plain multiseq batch
+/// @return the lane
 static int server_pick_decode_lane(int pool_banks, bool spec_rounds, uint32_t verify_rows,
                                    session_slot *const *dec, int n_dec, int n_batched) {
     bool all_spec = spec_rounds && n_dec >= 1 && (uint32_t)n_dec <= verify_rows && n_batched == 0;
@@ -2182,6 +2324,11 @@ static prompt_kv_verdict server_prompt_kv_verdict(KvBytes touched, KvBytes delta
  * a bank already past its prompt adds nothing).  Admitting a prompt touches none of its KV until its prefill runs,
  * so `touched` alone let L314's readmission retake, in the same worker turn, the room a preemption had just made
  * for that prompt (gpuq #472: PREEMPTED, READMITTED 0.0 s later, the guard over budget with no victim). */
+/// @param touched the pool's touched KV now
+/// @param want per bound job: its bank's KV at its prompt's length
+/// @param have per bound job: what its bank holds
+/// @param n bound jobs
+/// @return the reserved base in bytes
 static KvBytes server_kv_reserved(KvBytes touched, const KvBytes *want, const KvBytes *have, int n) {
     KvBytes r = touched;
     for (int i = 0; i < n; i++)
@@ -2194,6 +2341,8 @@ static KvBytes server_kv_reserved(KvBytes touched, const KvBytes *want, const Kv
  * decoder holds nothing until its readmission (that decision's own subject); a decoder's bank holds its prompt -- and
  * its per-bank figure can lag the pool's while it decodes in a batch (gpuq #473: a decoding A read 0.02 GiB short of
  * its prompt, which kept the preemption B needed from fitting, and B ended up on bank 0). */
+/// @param c the slot
+/// @return true when its job still owes its bank the prompt's KV
 static bool server_slot_reserves(const session_slot *c) {
     if (!c->active_job || c->preempted) return false;
     return !c->gen || c->gen->phase == GEN_RESTORE || c->gen->phase == GEN_PREFILL_COLD ||
@@ -2206,6 +2355,10 @@ static bool server_slot_reserves(const session_slot *c) {
  * resident bank serves: parking installs its views and carry and nothing reads it until the next switch, and
  * DeepSeek's batched launches name a resident bank's slab as their nominal operand
  * (gpu_graph_bank_attn_comp_pool), reading every bank through the base-pointer table. */
+/// @param resident per bank: resident
+/// @param n banks
+/// @param except the bank being freed
+/// @return the bank to park on, or -1
 static int server_park_pick(const bool *resident, int n, int except) {
     if (n > 0 && resident[0] && except != 0) return 0;
     for (int b = 1; b < n; b++)
@@ -2217,6 +2370,12 @@ static int server_park_pick(const bool *resident, int n, int except) {
  * base, once the idle banks (`idle`, their bytes summed) are spilled too: the re-check after the preemption spills
  * them (PROMPT_KV_SPILL).  Before bank 0 could be spilled, an idle bank 0 holding the warmup's high-water was no
  * victim, and this fit ignored every idle bank (gpuq #474: 0.12 GiB resident against W + A's 0.10). */
+/// @param reserved the reserved base (kv_reserved_bytes)
+/// @param freed the preempted decoder's KV
+/// @param idle the idle banks' KV, summed
+/// @param need the prompt's growth
+/// @param budget the guard's budget
+/// @return true when the prompt fits after the preemption and the idle spills
 static bool server_preempt_fits(KvBytes reserved, KvBytes freed, KvBytes idle, KvBytes need, KvBytes budget) {
     const KvBytes gone = freed + idle;
     return (reserved > gone ? reserved - gone : KvBytes{}) + need <= budget;
@@ -2226,6 +2385,10 @@ static bool server_preempt_fits(KvBytes reserved, KvBytes freed, KvBytes idle, K
  * every decoder that steps once it is back (n_decoding running + itself).  Without the growth a decoder the guard
  * preempted because the decoders' next quantum did not fit was readmitted at once -- its KV alone fits -- and the
  * guard preempted it again the next quantum. */
+/// @param bytes the parked decoder's KV
+/// @param n_decoding decoders running now
+/// @param growth one decode quantum's growth per bank
+/// @return the bytes a readmission must fit
 static KvBytes server_readmit_need(KvBytes bytes, int n_decoding, KvBytes growth) {
     return bytes + growth.times((uint64_t)(n_decoding + 1));
 }
@@ -2234,6 +2397,9 @@ static KvBytes server_readmit_need(KvBytes bytes, int n_decoding, KvBytes growth
  * reserved room (a prompt prefilling or a chain restoring, whose end frees it).  A lone decoder with nothing bound
  * beside it would only come straight back -- nothing it waits on ever ends -- so it proceeds (back-pressure, the
  * MemAvailable floor the backstop). */
+/// @param n_decoding decoders running
+/// @param reserving some bound job holds reserved room
+/// @return true when preempting makes progress
 static bool server_guard_may_preempt(int n_decoding, bool reserving) {
     return n_decoding > 1 || reserving;
 }
@@ -2469,6 +2635,12 @@ int server::guard_pick_victim(session_slot **dec, int n, const bool *dominated) 
  * n_victims -- the count it CAN do; the caller spills those and then
  * back-pressures (proceeds and lets the MemAvailable floor guard), so with no
  * victims at all it returns 0 and spills nothing. */
+/// @param touched the pool's touched KV
+/// @param delta the projected growth
+/// @param bound the guard's budget
+/// @param per_victim_drop per victim, in spill order: the bytes its spill frees
+/// @param n_victims victims
+/// @return how many to spill
 static int guard_spill_plan(KvBytes touched, KvBytes delta, KvBytes bound,
                             const KvBytes *per_victim_drop, int n_victims) {
     int k = 0;
@@ -2483,6 +2655,12 @@ static int guard_spill_plan(KvBytes touched, KvBytes delta, KvBytes bound,
  * for the filter and the LRU key; the slots already ordered are appended to
  * its live-exclusion set so each call yields the next. At most n_slots
  * entries. */
+/// @param s the server (worker thread)
+/// @param dec slots never picked (the live decode set)
+/// @param n how many
+/// @param order receives the victims' slot indexes, in pick order
+/// @param dominated_out receives the dominance facts per slot (may be NULL)
+/// @return victims written
 static int guard_victim_order(server *s, session_slot **dec, int n, int *order, bool *dominated_out) {
     session_slot *excl[2 * PULSAR_SESSION_POOL_CAP];
     for (int i = 0; i < n; i++) excl[i] = dec[i];
@@ -2509,6 +2687,14 @@ static int guard_victim_order(server *s, session_slot **dec, int n, int *order, 
  * ends (busy_may_free), else REFUSE.  A prompt whose growth alone is past the bound is REFUSE at once: no spill or
  * wait ever makes it fit.  Spilling is never planned when it cannot make the prompt fit (a spill that does not
  * clear the breach only churns the disk). */
+/// @param touched the reserved base
+/// @param delta the prompt's growth
+/// @param bound the guard's budget
+/// @param drop per idle victim, in spill order: its resident bytes
+/// @param n_victims victims
+/// @param busy_may_free a busy bank will become a victim when its job ends
+/// @param n_spill receives the spills a SPILL verdict plans
+/// @return the verdict
 static prompt_kv_verdict server_prompt_kv_verdict(KvBytes touched, KvBytes delta, KvBytes bound,
                                                   const KvBytes *drop, int n_victims, bool busy_may_free,
                                                   int *n_spill) {
@@ -2619,8 +2805,16 @@ bool server::prompt_kv_admit(session_slot *sl, job *j, bool *refused) {
  * and only then is the request refused (503, retry): never proceed.  Nothing is invalidated on a refusal: the bank
  * keeps every chunk it computed.  A fused / mixed rider is not refused there (a remedy would move banks under the
  * step being assembled): it leaves the fused lane, and its classic quantum runs this whole rule. */
+/// The log words of prefill_mem_step's values.
 const char *const prefill_mem_step_names[PREFILL_MEM_STEPS] = { "go", "spill", "preempt", "refuse" };
 
+/// @brief The per-chunk re-check's next step, pure: go, else spill, else preempt, else refuse.
+/// @param avail MemAvailable now
+/// @param need one chunk's new KV
+/// @param floor the memory floor
+/// @param n_idle_victims idle banks whose spill frees something
+/// @param preemptible a decoder may be preempted
+/// @return the step
 prefill_mem_step server_prefill_mem_step(KvBytes avail, KvBytes need, KvBytes floor, int n_idle_victims,
                                          bool preemptible) {
     if (server_headroom_admits(avail, need, floor)) return PREFILL_MEM_GO;
@@ -2805,6 +2999,12 @@ int server::guard_maybe_evict(session_slot *const *dec, int n, session_slot **ke
  * clients (rows/L148.md). Saving it here, while its checkpoint is still valid,
  * is what bank_switch does on every hand-off; this is the hand-off the
  * batched quanta skipped. */
+/// @param live_bank the bank installed now (-1: none)
+/// @param pool_banks the pool's banks
+/// @param dec the quantum's decoders
+/// @param n how many
+/// @param extra a prefilling slot folded into the quantum (may be NULL)
+/// @return true when the live bank is in none of them and must be saved first
 static bool park_live_bank_needed(int live_bank, int pool_banks, session_slot *const *dec, int n,
                                   const session_slot *extra) {
     if (live_bank < 0 || live_bank >= pool_banks) return false;
@@ -2814,6 +3014,11 @@ static bool park_live_bank_needed(int live_bank, int pool_banks, session_slot *c
     return true;
 }
 
+/// @brief Save the installed bank's checkpoint to its carry when the batched quantum does not include it.
+/// @param s the server (worker thread)
+/// @param dec the quantum's decoders
+/// @param n how many
+/// @param extra a prefilling slot folded into the quantum (may be NULL)
 static void park_live_bank(server *s, session_slot **dec, int n, const session_slot *extra) {
     if (!park_live_bank_needed(s->live_bank, s->pool_banks, dec, n, extra)) return;
     s->slots[s->live_bank].committed_pos = pulsar_session_pos(s->sess);
@@ -2825,6 +3030,8 @@ static void park_live_bank(server *s, session_slot **dec, int n, const session_s
  * caps the accepted run at the remaining budget), and a decoder leaving the plain batch for the spec lane.  The leave
  * committed the batch's sampled token without it: a plain quantum whose last step emitted the budget's last token
  * left the slot in GEN_DECODE with the next token sampled, and a switch to the spec lane emitted it -- 65 for 64. */
+/// @param g the slot's generation
+/// @return true when its max_tokens are emitted or the server is stopping
 static bool gen_budget_spent(const gen_state *g) {
     return g_stop_requested || g->completion >= g->max_tokens;
 }
@@ -2842,6 +3049,10 @@ static bool gen_budget_spent(const gen_state *g) {
  * it, so the pending commit is dropped exactly once); the spec lane does not
  * (its per-slot epilogue finishes a dead client through the normal path).
  * The asymmetry is the caller's, stated at each call. */
+/// @param g the slot's generation (NULL: false)
+/// @param require_batch_feed only abandon with a valid batch_feed (the plain and mixed lanes)
+/// @param fd the client socket
+/// @return true when the slot is to be abandoned
 static bool lane_should_abandon(const gen_state *g, bool require_batch_feed, int fd) {
     if (!g || g->phase != GEN_DECODE) return false;
     if (require_batch_feed && !g->batch_feed_valid) return false;
@@ -2851,6 +3062,8 @@ static bool lane_should_abandon(const gen_state *g, bool require_batch_feed, int
 
 /* The abandon itself, shared by the three lanes: name the signal, stop the
  * slot (drop_feed on the lanes whose pending commit must be dropped once). */
+/// @param g the slot's generation (phase set to GEN_FINISH)
+/// @param drop_feed also drop its pending batch_feed commit
 static void lane_abandon(gen_state *g, bool drop_feed) {
     server_log(PULSAR_LOG_DEFAULT,
                "pulsar-server: %s, abandoning generation after %d tokens",
@@ -2864,6 +3077,11 @@ static void lane_abandon(gen_state *g, bool drop_feed) {
  * the slots that go on drawn in ONE device launch (THE sampler over the step's headed rows: row q is dec[live_idx[q]]'s,
  * each at its own stream's key, a live grammar region through its mask -- L302, L303), and each draw's logprobs captured
  * from the same row.  A slot that stopped draws nothing (its stream is not stepped). */
+/// @param s the server (worker thread)
+/// @param dec the quantum's decoders
+/// @param live_idx the decoders this step stepped, as indexes into `dec`; row q of the step is dec[live_idx[q]]'s
+/// @param m how many
+/// @param pool the pool session
 static void lane_emit_and_draw(server *s, session_slot **dec, const int *live_idx, int m, pulsar_session *pool) {
     uint32_t rows[PULSAR_SESSION_POOL_CAP];
     pulsar_row_draw d[PULSAR_SESSION_POOL_CAP];
@@ -3053,6 +3271,16 @@ void server::worker_batched_decode_quantum(session_slot **dec, int n, int quantu
  * k_alloc[i] = bank i's share; tokens[i] (when given) = the survivals of its verified drafts (L312: its expected
  * tokens past the base, what the round selection values its decode by).  Returns the pending drafts left unverified;
  * *overflow = the demand passed the budget. */
+/// @param e the engine (its verify curve)
+/// @param surv per bank, per pending position: its survival
+/// @param npend per bank: its pending drafts
+/// @param n banks
+/// @param n_live decoding banks
+/// @param row_budget rows the round may carry
+/// @param k_alloc receives each bank's verified drafts
+/// @param overflow set when the demand passed the budget
+/// @param tokens receives each bank's expected tokens past the base (may be NULL)
+/// @return the pending drafts left unverified
 static int spec_pick_rows(const pulsar_engine *e, const float surv[][16], const uint32_t *npend, int n, int n_live,
                           int row_budget, int *k_alloc, bool *overflow, double *tokens = NULL) {
     struct cand { float surv; int i; uint32_t j; };
@@ -3099,6 +3327,7 @@ static_assert(SCHED_PROMPTS_MAX == PULSAR_SESSION_POOL_CAP, "the round selection
  * 0.99; L304's budget: the prompt never finished while the streams ran (gap p99 0.97 s / max 1.89 s).
  * PULSAR_SERVER_SCHED="out=..,fair=..,prompts=..,age=..,adapt=.." (read once, announced) moves them for a
  * measurement sweep; a malformed value refuses to start the lane. */
+/// @return the round selection's preferences (static; read from PULSAR_SERVER_SCHED once, exits(2) on a malformed one)
 static const sched_prefs *server_sched_prefs() {
     static sched_prefs v;
     static bool init = false;
@@ -3133,12 +3362,16 @@ static const sched_prefs *server_sched_prefs() {
     return &v;
 }
 
+/// @param c the slot
+/// @return true when its job is in a cold or main prefill phase and not preempted
 static bool slot_prefilling(const session_slot *c) {
     /* L314: a parked (preempted) bank is never a rider -- its physical is freed until its readmission */
     return c->active_job && !c->preempted && c->gen &&
            (c->gen->phase == GEN_PREFILL_COLD || c->gen->phase == GEN_PREFILL_MAIN);
 }
 
+/// @param c the slot
+/// @return true when its main prefill may ride the fused lane (no no_fuse, no images, a prompt to sync)
 static bool slot_fusable_prefill(const session_slot *c) {
     const gen_state *g = c->gen;
     return c->active_job && g && g->phase == GEN_PREFILL_MAIN && !g->no_fuse &&
@@ -3998,6 +4231,12 @@ bool server::batch_leave(session_slot *sl) {
  * two or more active decoders' summed committed depth exceeds guard_rows;
  * guard_rows <= 0 is the guard off. n_dec/deep are reported for the caller's
  * log line (L179 branch 12). */
+/// @param slots the slot array
+/// @param n_slots its length
+/// @param guard_rows the summed-depth threshold, rows (<= 0: off)
+/// @param n_dec_out receives the decoders counted (may be NULL)
+/// @param deep_out receives their summed committed depth (may be NULL)
+/// @return true when the guard blocks fusion
 static bool mixed_deep_guard_blocks(const session_slot *slots, int n_slots, int guard_rows,
                                     int *n_dec_out, long *deep_out) {
     if (guard_rows <= 0) return false;
@@ -4072,6 +4311,11 @@ session_slot *server::worker_find_fuse_prefill() {
  * prefill head). On the FINAL sub-chunk (pos_now + kthis == len), a pure-decode
  * step (kthis == 0) or a prefill-only step (m == 0) the cap is 0 = every run
  * (the prefill head IS consumed). */
+/// @param kthis prefill rows this step folds
+/// @param m decode runs in the step
+/// @param pos_now the prefill's position before the step
+/// @param len the prompt's length
+/// @return the head cap (0 = every run)
 static uint32_t mixed_head_cap(int kthis, int m, int pos_now, int len) {
     return (kthis > 0 && m > 0 && pos_now + kthis < len) ? (uint32_t)m : 0u;
 }
@@ -4085,8 +4329,13 @@ static uint32_t mixed_head_cap(int kthis, int m, int pos_now, int len) {
  * quantum STOPS (only the prefill was in it). rc == 0, a hard failure, and a
  * recoverable reject on a pure-decode step (kthis == 0) all PROCEED to the
  * caller's normal rc handling. */
+/// mixed_prefill_giveup's verdict: proceed, retry the step decode-only, or stop the quantum.
 enum mixed_step_verdict { MIXED_PROCEED, MIXED_GIVEUP_RETRY_DECODE, MIXED_GIVEUP_STOP };
 
+/// @param rc the fused step's return code (1: recoverable reject)
+/// @param kthis prefill rows the step folded
+/// @param m decode runs in the step
+/// @return a mixed_step_verdict
 static int mixed_prefill_giveup(int rc, int kthis, int m) {
     if (rc != 1 || kthis <= 0) return MIXED_PROCEED;
     return m > 0 ? MIXED_GIVEUP_RETRY_DECODE : MIXED_GIVEUP_STOP;
@@ -4313,6 +4562,8 @@ void server::worker_mixed_batch_quantum(session_slot **dec, int n, session_slot 
  * -- what a chunked-prefill step with decode rows riding along gives them --
  * and a long multi-chunk prompt still alternates with full quanta, so it
  * cannot starve decode (the 214 s stall). */
+/// @param s the server (worker thread)
+/// @return tokens of decode this iteration: 1 while a prompt is within one chunk of its end, else a full quantum
 static int worker_decode_budget(server *s) {
     const int cap = pulsar_session_prefill_cap(s->sess).raw();
     for (int i = 0; i < s->n_slots; i++) {
@@ -4332,6 +4583,11 @@ static int worker_decode_budget(server *s) {
  * step is cheap, and round-robin alone made a prompt that had just finished
  * prefill wait for every other queued prompt before its first token (one
  * Spark, 10 x 1.8k prompts: TTFT min 14.2 s where 1.6 s is possible). */
+/// @param s the server (worker thread)
+/// @param rr the round-robin cursor (advanced past the pick)
+/// @param skip a slot not to pick (may be NULL)
+/// @param eligible the slot filter
+/// @return the slot, or NULL
 static session_slot *worker_pick_step(server *s, int *rr, const session_slot *skip,
                                       bool (*eligible)(const session_slot *)) {
     for (int pass = 0; pass < 2; pass++) {
@@ -4347,18 +4603,28 @@ static session_slot *worker_pick_step(server *s, int *rr, const session_slot *sk
     return NULL;
 }
 
+/// @param c the slot
+/// @return true when it has a job that is not in the batched decode (nor preempted)
 static bool slot_steppable_beside_decode(const session_slot *c) {
     return c->active_job && !c->preempted && !slot_is_batchable_decode(c) && !(c->gen && c->gen->batch_active);
 }
 
+/// @param c the slot
+/// @return true when it holds a job that is not preempted
 static bool slot_active(const session_slot *c) { return c->active_job != NULL && !c->preempted; }
 
 /* L260 fusion: beside a spec quantum a riding prompt advances inside the
  * quantum's forwards, so the iteration's classic step leaves it alone. */
+/// @param c the slot
+/// @return slot_steppable_beside_decode, except a fusable prefill (it rides the quantum)
 static bool slot_steppable_beside_fused(const session_slot *c) {
     return slot_steppable_beside_decode(c) && !slot_fusable_prefill(c);
 }
 
+/// @brief The single GPU worker thread: binds queued jobs, readmits preempted decoders, and steps the slots (the
+/// decode lanes, prefill chunks, restores, finishes) until the queue is empty and the server is stopping.
+/// @param arg the server
+/// @return NULL
 void *worker_main(void *arg) {
     server *s = (server *)arg;
     __atomic_store_n(&s->worker_tid, (int)syscall(SYS_gettid), __ATOMIC_RELAXED);   /* the stall dump's /proc */

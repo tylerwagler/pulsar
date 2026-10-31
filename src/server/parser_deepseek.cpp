@@ -7,8 +7,15 @@
  * projection into the protocol sink (deepseek_stream.cpp's one walk), and the finish -- the final DSML
  * parse, the shared rule for a broken call (L284 P4: retry or text, never a repaired tag), the stream's
  * ids onto the parsed calls, tool memory.  Nothing here is reached except through k_parser_deepseek. */
+/** @file
+ *  DeepSeek's output parser behind server_output_parser_ops (k_parser_deepseek).
+ */
 #include "deepseek_dsml.h"
 
+/// server_output_parser_ops::create: a zeroed deepseek_parser with its decode tracker, the live walk when the
+/// attempt streams text (g->sink.text), and the think gate on the marker scan when thinking is on.
+/// @param g  the attempt (its sink is set up)
+/// @return the state (owned by the attempt; ds_parser_destroy); never NULL
 static void *ds_parser_create(server *, gen_state *g, char *, size_t) {
     job *j = g->j;
     deepseek_parser *ps = (deepseek_parser *)server_xmalloc(sizeof *ps);
@@ -25,6 +32,8 @@ static void *ds_parser_create(server *, gen_state *g, char *, size_t) {
     return ps;
 }
 
+/// server_output_parser_ops::destroy.
+/// @param st  the parser state (a deepseek_parser, from ds_parser_create) (NULL: nothing)
 static void ds_parser_destroy(void *st) {
     deepseek_parser *ps = (deepseek_parser *)st;
     if (!ps) return;
@@ -36,6 +45,8 @@ static void ds_parser_destroy(void *st) {
  * seeded with that exact prefix (including the closing </think>, so the thinking-mode parser sees
  * reasoning end and a complete tool block); the trackers start "inside tool call" -- the model now
  * generates only the invoke body. */
+/// @param st  the parser state (a deepseek_parser, from ds_parser_create)
+/// @param g   the attempt (g->text holds the seed)
 static void ds_parser_seed(void *st, gen_state *g) {
     deepseek_parser *ps = (deepseek_parser *)st;
     ps->saw_tool_start = true;
@@ -44,6 +55,9 @@ static void ds_parser_seed(void *st, gen_state *g) {
     ps->tool_scan_from = g->text.len;
 }
 
+/// server_output_parser_ops::in_tool_call: the decode tracker is in a tool block's structure, not a sampled payload.
+/// @param st  the parser state, or a probe
+/// @return true when the next draw is greedy
 static bool ds_parser_in_tool_call(const void *st, const gen_state *) {
     const deepseek_parser *ps = (const deepseek_parser *)st;
     const dsml_decode_state d = ps->tracker.decode;
@@ -52,6 +66,9 @@ static bool ds_parser_in_tool_call(const void *st, const gen_state *) {
 
 /* L296 toolsample: the probe is a parser state holding only a copy of the decode tracker -- all ds_parser_in_tool_call
  * reads -- advanced as ds_parser_feed advances it (over the whole text, not the released bytes). */
+/// server_output_parser_ops::probe_new.
+/// @param st  the parser state (a deepseek_parser, from ds_parser_create)
+/// @return a probe holding a copy of the decode tracker (owned by the caller; ds_parser_probe_free)
 static void *ds_parser_probe_new(const void *st) {
     deepseek_parser *p = (deepseek_parser *)server_xmalloc(sizeof *p);
     memset(p, 0, sizeof *p);
@@ -59,18 +76,31 @@ static void *ds_parser_probe_new(const void *st) {
     return p;
 }
 
+/// server_output_parser_ops::probe_feed: re-track the whole text (chat requests with tools only).
+/// @param probe  the probe
+/// @param g      the attempt (its request)
+/// @param text   the generated text with the round's tokens so far
+/// @param len    bytes at `text`
 static void ds_parser_probe_feed(void *probe, const gen_state *g, const char *text, size_t len, size_t) {
     if (g->j->req.kind == REQ_CHAT && g->j->req.has_tools)
         dsml_decode_tracker_update(&((deepseek_parser *)probe)->tracker, text, len);
 }
 
+/// server_output_parser_ops::probe_free.
+/// @param probe  the probe
 static void ds_parser_probe_free(void *probe) { free(probe); }
 
 /* A closed DSML block ends the turn (finish "tool_calls"). */
+/// @param st  the parser state (a deepseek_parser, from ds_parser_create)
+/// @return true once a DSML block has closed
 static bool ds_parser_turn_complete(const void *st, const gen_state *) {
     return ((const deepseek_parser *)st)->saw_tool_end;
 }
 
+/// server_output_parser_ops::tool_progress.
+/// @param st  the parser state (a deepseek_parser, from ds_parser_create)
+/// @param opened  set when a tool-call block has opened
+/// @param closed  set when one has closed
 static void ds_parser_tool_progress(const void *st, bool *opened, bool *closed) {
     const deepseek_parser *ps = (const deepseek_parser *)st;
     *opened = ps->saw_tool_start;
@@ -79,6 +109,12 @@ static void ds_parser_tool_progress(const void *st, bool *opened, bool *closed) 
 
 /* Per emitted token (upto = the bytes of g->text the stop-string scan released): the decode tracker,
  * the live projection, then the marker scan.  `final` is the stream's last flush at the finish. */
+/// @param st  the parser state (a deepseek_parser, from ds_parser_create)
+/// @param s      the server (the trace)
+/// @param g      the attempt
+/// @param upto   bytes of g->text the stop-string scan released
+/// @param final  the finish's last flush (only the walk runs)
+/// @return false when a client write failed
 static bool ds_parser_feed(void *st, server *s, gen_state *g, size_t upto, bool final) {
     deepseek_parser *ps = (deepseek_parser *)st;
     job *j = g->j;
@@ -163,6 +199,12 @@ static bool ds_parser_feed(void *st, server *s, gen_state *g, size_t upto, bool 
  * DSML parse of the block (an unterminated one -- the cap cut it -- is not parsed and never repaired), the
  * stream's ids onto the parsed calls; then the finish every family shares (parser_finish_turn: the
  * undeclared-call drop, the retry or text, tool memory, the finish label). */
+/// @param st  the parser state (a deepseek_parser, from ds_parser_create)
+/// @param s    the server
+/// @param sl   the slot (the retry appends to its live session)
+/// @param g    the attempt
+/// @param out  receives the turn's reading (owned by the caller)
+/// @return false when a client write failed
 static bool ds_parser_finish(void *st, server *s, session_slot *sl, gen_state *g, server_turn *out) {
     deepseek_parser *ps = (deepseek_parser *)st;
     job *j = g->j;
@@ -189,6 +231,7 @@ static bool ds_parser_finish(void *st, server *s, session_slot *sl, gen_state *g
     return parser_finish_turn(s, sl, g, out, broken, why, /*logged=*/false, tail_from, true);
 }
 
+/** DeepSeek's output parser table (server_family_ops::output of both DeepSeek variants). */
 const server_output_parser_ops k_parser_deepseek = {
     /* .create        = */ ds_parser_create,
     /* .destroy       = */ ds_parser_destroy,

@@ -1,3 +1,7 @@
+/** @file
+ *  Generation helpers shared by every lane: the OpenAI logprobs ledger, the reasoning tracker
+ *  (thinking_state) and the turn-finish rules.
+ */
 #include "pulsar_server_internal.h"
 
 
@@ -19,6 +23,8 @@
  * distribution instead would be a silently wrong number, so a request that asks
  * for logprobs decodes with speculation OFF (see gen_decode_init) and pays the
  * throughput instead. */
+/// @brief Drop every entry (and its owned pieces) and the pending capture; keeps the array and `enabled`.
+/// @param lg the ledger (NULL: no-op)
 void logprob_ledger_reset(logprob_ledger *lg) {
     if (!lg) return;
     for (int i = 0; i < lg->len; i++) {
@@ -33,6 +39,8 @@ void logprob_ledger_reset(logprob_ledger *lg) {
 
 
 
+/// @brief Reset, then free the entry array.
+/// @param lg the ledger (NULL: no-op)
 void logprob_ledger_free(logprob_ledger *lg) {
     if (!lg) return;
     logprob_ledger_reset(lg);
@@ -46,6 +54,9 @@ void logprob_ledger_free(logprob_ledger *lg) {
 /* pulsar_*_top_logprobs pads its output to k and marks the unused tail with
  * id < 0 (a vocabulary smaller than k, or an all-non-finite row).  Only the
  * filled prefix is meaningful. */
+/// @param top the padded top-k output
+/// @param n its length
+/// @return the length of the filled prefix (entries before the first id < 0)
 static int logprob_trim(const pulsar_token_score *top, int n) {
     int i = 0;
     while (i < n && top[i].id >= 0) i++;
@@ -57,6 +68,10 @@ static int logprob_trim(const pulsar_token_score *top, int n) {
 /* Capture from the session's own logits row — the classic single-slot lane,
  * where pulsar_session_sample() drew from exactly this distribution and the
  * session has not been advanced yet. */
+/// @brief Capture the drawn token's logprob and the top-k from the session's live logits row.
+/// @param lg the request's ledger (no-op unless enabled)
+/// @param sess the session whose live row the draw read
+/// @param token the drawn token
 void logprob_capture_session(logprob_ledger *lg, pulsar_session *sess, int token) {
     if (!lg || !lg->enabled) return;
     pulsar_token_score chosen;
@@ -74,6 +89,12 @@ void logprob_capture_session(logprob_ledger *lg, pulsar_session *sess, int token
 
 /* Capture from ONE row of a batched decode step: its headed row `row`, on the device (L302).  Those entries leave
  * the session's live row untouched by contract, so the row the draw read is the only correct source here. */
+/// @brief Capture the drawn token's logprob and the top-k from a batched step's headed row; a failed read
+/// records -INFINITY and no alternatives.
+/// @param lg the request's ledger (no-op unless enabled)
+/// @param sess the pool session
+/// @param row the step's headed row the draw read
+/// @param token the drawn token
 void logprob_capture_row(logprob_ledger *lg, pulsar_session *sess, uint32_t row, int token) {
     if (!lg || !lg->enabled) return;
     pulsar_token_score chosen;
@@ -99,6 +120,14 @@ void logprob_capture_row(logprob_ledger *lg, pulsar_session *sess, uint32_t row,
  * position: the whole request's logprobs are dropped, because a ledger with a
  * hole in it is not something a client can align to its tokens.  Returns false
  * exactly then, so the caller can say so in the log. */
+/// @brief Commit the pending capture as the entry for `token`.
+/// @param lg the request's ledger (no-op unless enabled)
+/// @param engine the engine, to detokenize the alternatives
+/// @param token the emitted token
+/// @param piece the token's text (copied; NULL reads as "")
+/// @param piece_len bytes at `piece`
+/// @param end_off byte offset in the generated text where the token's piece ends (the release watermark it rides)
+/// @return false when no capture was pending: the ledger is then disabled for the request
 bool logprob_commit(logprob_ledger *lg, pulsar_engine *engine, int token,
                     const char *piece, size_t piece_len, size_t end_off) {
     if (!lg || !lg->enabled) return true;
@@ -139,6 +168,9 @@ bool logprob_commit(logprob_ledger *lg, pulsar_engine *engine, int token,
 /* How many not-yet-streamed entries are fully covered by a release watermark:
  * the count of leading unstreamed entries whose piece ends at or before `upto`.
  * SIZE_MAX is the final flush (everything still held). */
+/// @param lg the ledger (disabled or NULL: 0)
+/// @param upto the release watermark in bytes; SIZE_MAX = the final flush
+/// @return the entry index the stream may send up to (exclusive): streamed + the newly covered count
 int logprob_stream_ready(const logprob_ledger *lg, size_t upto) {
     if (!lg || !lg->enabled) return 0;
     int n = lg->streamed;
@@ -172,6 +204,10 @@ void thinking_state::feed(const char *p, size_t len) {
 
 
 
+/// @brief The reasoning tracker at the start of generation: fed the rendered prompt text (its generation prefix
+/// opens or closes \<think\>), or, with no text, inside reasoning when the think mode is on.
+/// @param r the request (NULL: outside reasoning)
+/// @return the tracker
 thinking_state thinking_state_from_prompt(const request *r) {
     thinking_state st = {0};
     if (r && r->prompt_text) {
@@ -195,11 +231,22 @@ thinking_state thinking_state_from_prompt(const request *r) {
  * model-visible tool error -- non-streaming (a stream already carried the text), a chat with tools,
  * forced or not (the retry re-opens a forced call: continue_after_tool_error) -- otherwise the turn
  * is TEXT (turn_as_text) with a truthful finish (turn_finish).  parser_finish_turn applies it. */
+/// @param g the decode attempt
+/// @return true when the turn may take the one model-visible retry: a non-streaming chat with tools, no retry yet,
+/// not already failed
 bool turn_tool_retry_allowed(const gen_state *g) {
     const request *r = &g->j->req;
     return r->kind == REQ_CHAT && r->has_tools && !r->stream && !g->recovery_attempted && strcmp(g->finish, "error");
 }
 
+/// @brief Run the model-visible retry: append the family's tool-error suffix to the live session and mark the
+/// turn for another decode attempt (out->retry).
+/// @param s the server
+/// @param sl the slot (its bank installed)
+/// @param g the decode attempt
+/// @param detail what was wrong with the call, shown to the model
+/// @param out the turn; its calls are freed, and on failure its finish is "error"
+/// @return false when the suffix could not be appended (g->err says why)
 static bool turn_tool_retry(server *s, session_slot *sl, gen_state *g, const char *detail, server_turn *out) {
     int recovery_tokens = 0;
     char recovery_err[160] = {0};
@@ -222,11 +269,18 @@ static bool turn_tool_retry(server *s, session_slot *sl, gen_state *g, const cha
     return true;
 }
 
+/// @param g the decode attempt
+/// @param n_calls the calls the reading kept
+/// @return "error" / "length" when the attempt ended so, else "tool_calls" with calls, else "stop"
 static const char *turn_finish(const gen_state *g, int n_calls) {
     if (!strcmp(g->finish, "error") || !strcmp(g->finish, "length")) return g->finish;
     return n_calls ? "tool_calls" : "stop";
 }
 
+/// @brief Read the turn as plain text (a broken call with no retry): the reasoning up to \</think\> when thinking
+/// is on, the rest as content, no calls, parse_failed set.
+/// @param g the decode attempt
+/// @param out the turn, filled (content and reasoning malloc'd)
 static void turn_as_text(const gen_state *g, server_turn *out) {
     const char *t = g->text.ptr ? g->text.ptr : "";
     const char *close = pulsar_think_mode_enabled(g->j->req.think_mode) ? strstr(t, "</think>") : NULL;
@@ -322,6 +376,12 @@ char *build_tool_checkpoint_suffix_spans(const request *r, const char *content,
                                              spans_out, n_spans_out);
 }
 
+/// @brief build_tool_checkpoint_suffix_spans without the span output.
+/// @param r the request
+/// @param content the turn's content (may be NULL)
+/// @param reasoning the turn's reasoning (may be NULL)
+/// @param calls the turn's calls
+/// @return malloc'd text, or NULL when the family has no sampled-turn render
 char *build_tool_checkpoint_suffix(const request *r, const char *content,
                                           const char *reasoning, const tool_calls *calls) {
     return build_tool_checkpoint_suffix_spans(r, content, reasoning, calls, NULL, NULL);
@@ -329,6 +389,15 @@ char *build_tool_checkpoint_suffix(const request *r, const char *content,
 
 
 
+/// @brief The assistant turn as a Responses client can replay it, through the family's assistant_turn_sampled:
+/// reasoning only for a tool-call turn whose request emits reasoning summaries.
+/// @param r the request
+/// @param content the turn's content (may be NULL)
+/// @param reasoning the turn's reasoning (may be NULL)
+/// @param calls the turn's calls (may be NULL)
+/// @param spans_out receives the text's span records (owned; may be NULL)
+/// @param n_spans_out receives their count (may be NULL)
+/// @return malloc'd text, or NULL when the family has no sampled-turn render
 char *build_responses_visible_assistant_suffix_spans(const request *r,
                                                      const char *content,
                                                      const char *reasoning,
@@ -352,6 +421,12 @@ char *build_responses_visible_assistant_suffix_spans(const request *r,
                                              spans_out, n_spans_out);
 }
 
+/// @brief build_responses_visible_assistant_suffix_spans without the span output.
+/// @param r the request
+/// @param content the turn's content (may be NULL)
+/// @param reasoning the turn's reasoning (may be NULL)
+/// @param calls the turn's calls (may be NULL)
+/// @return malloc'd text, or NULL when the family has no sampled-turn render
 char *build_responses_visible_assistant_suffix(const request *r,
                                                       const char *content,
                                                       const char *reasoning,
