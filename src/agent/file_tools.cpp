@@ -177,16 +177,6 @@ bool agent_old_new_line_effect(const char *old_data, size_t old_len,
 
 
 
-/// @cond AGENT_REDECLARATIONS (redeclares functions documented in pulsar_agent_internal.h)
-void agent_edit_result_append_context(agent_buf *b,
-                                             const char *path,
-                                             const char *data, size_t len,
-                                             int anchor_start,
-                                             int anchor_end);
-/// @endcond
-
-
-
 char *agent_edit_result(const char *path,
                                        int start_line, int end_line, int delta,
                                        const char *new_data, size_t new_len,

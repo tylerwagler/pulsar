@@ -395,12 +395,6 @@ void agent_publishf(agent_worker *w, const char *fmt, ...) {
 
 
 
-/// @cond AGENT_REDECLARATIONS (redeclares functions documented in pulsar_agent_internal.h)
-bool worker_is_idle(agent_worker *w);
-/// @endcond
-
-
-
 void agent_set_status(agent_worker *w, agent_worker_state state) {
     pthread_mutex_lock(&w->mu);
     w->status.state = state;
