@@ -1953,6 +1953,8 @@ std::list<uint64_t> g_seg_lru;               ///< the live keys, most recently u
 /// A segment capture is open on this process (pulsar_gpu_seg_enter .. exit).
 bool g_seg_capturing = false;
 bool g_seg_reset_pending = false;            ///< a scratch regrow during a capture: drop every exec after it
+/// pulsar_gpu_seg_reset during a capture: the FULL reset (every key, the catalog too) runs at seg_exit
+bool g_seg_full_reset_pending = false;
 bool g_seg_catalog_on = false;               ///< the warmup's declaration window is open
 bool g_seg_catalog_done = false;             ///< a warmup declared a catalog and closed (a regrow after it is news)
 bool g_seg_off = false;                      ///< L296 perf: an instrument's eager reference (never the engine)
@@ -2066,6 +2068,15 @@ void seg_drop_graphs(void) {
     g_seg_reset_pending = false;
 }
 
+/* What a capture that just closed owes: pulsar_gpu_seg_reset asked for during it is the full reset (every key and the
+ * catalog dropped -- a graph teardown), a scratch regrow during it the drop of every exec (the catalog kept).  L335:
+ * both used to set one flag, so a reset under capture came out as the partial drop. */
+/// Runs the reset or the regrow drop a capture deferred (seg_exit, after g_seg_capturing is cleared).
+void seg_settle_pending(void) {
+    if (g_seg_full_reset_pending) pulsar_gpu_seg_reset();
+    else if (g_seg_reset_pending) seg_drop_graphs();
+}
+
 }  // namespace
 
 int pulsar_gpu_seg_enter(uint64_t key) {
@@ -2122,14 +2133,14 @@ int pulsar_gpu_seg_exit(uint64_t key, int body_ok) {
         if (g_seg_catalog_on) g_seg_catalog_refused++;
         if (gr) (void)cudaGraphDestroy(gr);
         (void)cudaGetLastError();
-        if (g_seg_reset_pending) seg_drop_graphs();
+        seg_settle_pending();
         return 0;
     }
     if (rc != cudaSuccess || !gr) {
         if (gr) (void)cudaGraphDestroy(gr);
         seg_kill(key, e, "capture", rc != cudaSuccess ? rc : cudaErrorStreamCaptureInvalidated);
         g_seg_st.refusals++;
-        if (g_seg_reset_pending) seg_drop_graphs();
+        seg_settle_pending();
         return 0;
     }
     cudaGraphExec_t ex = NULL;
@@ -2142,7 +2153,7 @@ int pulsar_gpu_seg_exit(uint64_t key, int body_ok) {
     if (ri != cudaSuccess) {
         seg_kill(key, e, "instantiate", ri);
         g_seg_st.refusals++;
-        if (g_seg_reset_pending) seg_drop_graphs();
+        seg_settle_pending();
         return 0;
     }
     const cudaError_t rl = cudaGraphLaunch(ex, cudaStreamPerThread);
@@ -2150,14 +2161,14 @@ int pulsar_gpu_seg_exit(uint64_t key, int body_ok) {
         (void)cudaGraphExecDestroy(ex);
         seg_kill(key, e, "first launch", rl);
         g_seg_st.refusals++;
-        if (g_seg_reset_pending) seg_drop_graphs();
+        seg_settle_pending();
         return 0;
     }
-    if (g_seg_reset_pending) {
-        /* a scratch regrow DURING this capture: the graph ran (the work is done) but its baked pointers may be stale
-         * for later replays -- drop every exec */
+    if (g_seg_reset_pending || g_seg_full_reset_pending) {
+        /* a scratch regrow (or a reset) DURING this capture: the graph ran (the work is done) but its baked pointers
+         * may be stale for later replays -- drop every exec (a reset: every key too) */
         (void)cudaGraphExecDestroy(ex);
-        seg_drop_graphs();
+        seg_settle_pending();
         return 1;
     }
     e.exec = ex;
@@ -2169,14 +2180,15 @@ int pulsar_gpu_seg_exit(uint64_t key, int body_ok) {
 
 /// Drops every key and exec (deferred to seg_exit while a capture is open).
 void pulsar_gpu_seg_reset(void) {
-    if (g_seg_capturing) {   /* mid-capture: deferred to seg_exit */
-        g_seg_reset_pending = true;
+    if (g_seg_capturing) {   /* mid-capture: deferred to seg_exit -- as the FULL reset (L335: it was the regrow's drop) */
+        g_seg_full_reset_pending = true;
         return;
     }
     for (auto &kv : g_seg) seg_drop_exec(kv.second);
     g_seg.clear();
     g_seg_lru.clear();
     g_seg_reset_pending = false;
+    g_seg_full_reset_pending = false;
 }
 
 /* L296 perf: an instrument runs the same steps with the segment cache off (every segment eager, nothing captured or

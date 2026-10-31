@@ -32,6 +32,8 @@
  *                       bits, every NaN stays NaN (the old rounding add turned some into Inf and wrapped others to 0).
  *   12. swiglu-nan      pulsar_swiglu_elem (now also the CUTLASS FFN MMA kernel's) on 2^26 hashed (g, u) pairs x 3
  *                       clamps: every non-NaN pair keeps the fminf form's bits, a NaN operand stays NaN.
+ *   13. seg-reset-capture pulsar_gpu_seg_reset inside a capture is the FULL reset at its close (a catalog key is
+ *                       forgotten), not the regrow's partial drop that kept the catalog.
  *
  *  Prints one line per case and KERNEL CONTRACT GATE PASS / FAIL. */
 #include "pulsar_gpu.h"
@@ -638,6 +640,39 @@ static void case_swiglu_nan(void) {
     cudaFree(d);
 }
 
+/* ---- 13. seg-reset-capture ------------------------------------------------------------------------------------- */
+
+/// Case 13: pulsar_gpu_seg_reset during a capture is the FULL reset at the capture's close.  A catalog key (declared in
+/// the warmup window) is captured with a reset requested inside; afterwards, outside the window, its second use must
+/// NOT begin a capture: the key is gone and comes back a live key (12 uses to a capture).  Under the old partial drop
+/// the catalog key survived, and its second use captured.
+static void case_seg_reset_capture(void) {
+    const uint64_t key = 0x4c33355345471337ull;
+    unsigned char *d = nullptr;
+    if (!ok(cudaMalloc(&d, 256), "seg-reset-capture malloc")) return;
+    pulsar_gpu_seg_reset();
+    pulsar_gpu_seg_catalog_open();
+    int r0 = pulsar_gpu_seg_enter(key);   /* catalog warm use: 0 */
+    if (r0 == 0) r0 = pulsar_gpu_seg_enter(key);   /* the capture begins: 1 */
+    int rx = -9;
+    if (r0 == 1) {
+        (void)cudaMemsetAsync(d, 0, 256, cudaStreamPerThread);
+        pulsar_gpu_seg_reset();   /* inside the capture: deferred */
+        rx = pulsar_gpu_seg_exit(key, 1);
+    }
+    (void)pulsar_gpu_seg_catalog_close();
+    const int r3 = pulsar_gpu_seg_enter(key);   /* a fresh live key: 0 (the old drop: the catalog key warms, 0) */
+    const int r4 = r3 == 0 ? pulsar_gpu_seg_enter(key) : -9;   /* live: 0; the surviving catalog key: 1 */
+    if (r4 == 1) (void)pulsar_gpu_seg_exit(key, 1);
+    const bool synced = pulsar_gpu_synchronize() != 0;
+    pulsar_gpu_seg_reset();
+    printf("  13 seg-reset-capture: capture %d -> exit %d; after the window: %d, %d (want 0, 0), device %s\n", r0, rx,
+           r3, r4, synced ? "clean" : "FAULT");
+    if (r0 != 1 || rx < 0 || r3 != 0 || r4 != 0 || !synced)
+        fail("seg-reset-capture: a reset under capture did not drop every key");
+    cudaFree(d);
+}
+
 /// Runs every case on device 0.
 /// @return 0 on PASS, 1 on FAIL
 int main(void) {
@@ -657,6 +692,7 @@ int main(void) {
     case_subview_dry();
     case_bf16_nan();
     case_swiglu_nan();
+    case_seg_reset_capture();
     puts(g_fail ? "KERNEL CONTRACT GATE FAIL" : "KERNEL CONTRACT GATE PASS");
     return g_fail ? 1 : 0;
 }
