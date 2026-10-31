@@ -121,6 +121,41 @@ static void test_openai_tool_schema_json_spelling_is_canonical(void) {
 
 /* L335: an OpenAI function schema the canonicalizer refuses (here a number that overflows to infinity) refuses the
  * request, naming the entry -- it used to go into the prompt in the client's own spelling (rule 1). */
+/* L335: the same for an Anthropic-shaped entry ({name, input_schema}, Claude Code's surface): refused by name,
+ * through parse_tools_value and the whole Messages parse; it used to go into the prompt in the client's spelling. */
+static void test_anthropic_tool_schema_that_does_not_canonicalize_refuses(void) {
+    const char *tools =
+        "[{\"name\":\"Bash\",\"input_schema\":{\"type\":\"object\"}},"
+        "{\"name\":\"Huge\",\"input_schema\":{\"type\":\"object\",\"properties\":{\"n\":{\"type\":\"number\","
+        "\"maximum\":-1e999}}}}]";
+    char *out = NULL;
+    tool_schema_orders orders = {0};
+    char err[200] = {0};
+    const char *p = tools;
+    TEST_ASSERT(!parse_tools_value(&p, &out, &orders, NULL, err, sizeof err));
+    TEST_ASSERT(strstr(err, "tools[1] (tool \"Huge\")") != NULL);
+    TEST_ASSERT(strstr(err, "does not canonicalize") != NULL);
+    free(out);
+    tool_schema_orders_free(&orders);
+
+    std::string body = std::string("{\"model\":\"m\",\"max_tokens\":8,\"messages\":[{\"role\":\"user\",\"content\":"
+                                   "\"hi\"}],\"tools\":") + tools + "}";
+    request r;
+    char rerr[200] = {0};
+    TEST_ASSERT(!parse_anthropic_request(NULL, NULL, body.c_str(), 128, &r, rerr, sizeof rerr));
+    TEST_ASSERT(strstr(rerr, "tools[1] (tool \"Huge\")") != NULL);
+
+    /* a well-formed Anthropic entry still canonicalizes (the spelling test's premise) */
+    const char *good = "[{\"name\":\"Bash\",\"input_schema\":{\"type\":\"object\"}}]";
+    p = good;
+    tool_schema_orders o2 = {0};
+    char *out2 = NULL;
+    TEST_ASSERT(parse_tools_value(&p, &out2, &o2, NULL, err, sizeof err));
+    TEST_ASSERT(out2 && strstr(out2, "\"name\": \"Bash\""));
+    free(out2);
+    tool_schema_orders_free(&o2);
+}
+
 static void test_openai_tool_schema_that_does_not_canonicalize_refuses(void) {
     const char *tools =
         "[{\"type\":\"function\",\"function\":{\"name\":\"bash\",\"parameters\":{\"type\":\"object\"}}},"
@@ -12084,6 +12119,7 @@ static void pulsar_server_unit_tests_run(void) {
     test_tool_schema_order_from_openai_tools();
     test_openai_tool_schema_json_spelling_is_canonical();
     test_openai_tool_schema_that_does_not_canonicalize_refuses();
+    test_anthropic_tool_schema_that_does_not_canonicalize_refuses();
     test_anthropic_tool_schema_json_spelling_is_canonical();
     test_tool_schema_order_from_responses_tool_search();
     test_responses_function_named_tool_search_stays_function_call();

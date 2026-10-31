@@ -1685,12 +1685,24 @@ bool parse_tools_value(const char **p, char **out, tool_schema_orders *orders, c
                  * into the prompt with the CALLER's JSON spelling.  That is
                  * Claude Code's surface.  Canonicalize here for the same
                  * reasons (reference tokenization + warm-bank prefix
-                 * stability), failing OPEN to the verbatim bytes.  Schemas we
-                 * synthesize ourselves (responses namespaces) are already
-                 * deterministic and need no canonicalization — only
-                 * CLIENT-supplied spelling can vary. */
+                 * stability).  L335: an entry the canonicalizer refuses is
+                 * refused with the request, never forwarded in the client's
+                 * spelling (rule 1).  Schemas we synthesize ourselves
+                 * (responses namespaces) are already deterministic and need no
+                 * canonicalization — only CLIENT-supplied spelling can vary. */
                 char *canon = json_prompt_value(raw);
-                append_raw_json_line(&schemas, canon ? canon : raw);
+                if (!canon) {
+                    char *name = json_object_member_raw(raw, "name");
+                    if (err && errlen)
+                        snprintf(err, errlen, "tools[%d] (tool %.48s): its schema does not canonicalize (a "
+                                 "non-finite number, a bad string escape or nesting past %d)", at,
+                                 name ? name : "without a name", JSON_MAX_NESTING);
+                    free(name);
+                    free(special);
+                    free(raw);
+                    goto bad;
+                }
+                append_raw_json_line(&schemas, canon);
                 tool_schema_orders_add_json(orders, raw);
                 free(canon);
             }

@@ -3790,9 +3790,10 @@ bool anthropic_tools_supported(const char *tools_json, char *err, size_t errlen)
 /// @param out       receives the schema lines (malloc'd)
 /// @param orders    receives each tool's declared argument order
 /// @param deferred  receives the deferred tools' lines (malloc'd; NULL when not wanted)
-/// @param err       receives the reason when a tool's function schema does not canonicalize (NULL: not written)
+/// @param err       receives the reason when a tool's schema does not canonicalize (NULL: not written)
 /// @param errlen    size of `err`
-/// @return false for a malformed tools value, or (+ err) an OpenAI function schema the canonicalizer refuses
+/// @return false for a malformed tools value, or (+ err) a schema the canonicalizer refuses (an OpenAI "function"
+///         or an Anthropic-shaped entry)
 bool parse_tools_value(const char **p, char **out, tool_schema_orders *orders, char **deferred = NULL,
                        char *err = NULL, size_t errlen = 0);
 struct chat_conversation;
