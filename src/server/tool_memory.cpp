@@ -168,7 +168,7 @@ static tool_memory_block *tool_memory_get_block_locked(tool_memory *m,
 
     b = (tool_memory_block *)server_xmalloc(sizeof(*b));
     memset(b, 0, sizeof(*b));
-    b->raw = xstrndup(raw, len);
+    b->raw = server_xstrndup(raw, len);
     b->len = len;
     b->bytes = len + 1 + sizeof(*b);
     if (!m->by_block->emplace(std::string(b->raw, b->len), b).second) {
@@ -266,7 +266,7 @@ static void tool_memory_put_locked(tool_memory *m, const char *id,
     tool_memory_block *b = tool_memory_get_block_locked(m, raw, raw_len);
     tool_memory_entry *e = (tool_memory_entry *)server_xmalloc(sizeof(*e));
     memset(e, 0, sizeof(*e));
-    e->id = xstrdup(id);
+    e->id = server_xstrdup(id);
     e->block = b;
     e->bytes = strlen(id) + 1 + sizeof(*e);
     e->stamp = ++m->clock;
@@ -366,7 +366,7 @@ void server::responses_live_remember(session_slot *sl, const char *visible_text,
     if (!s || !sl || !visible_text || !visible_text[0]) return;
     pulsar::ScopedLock lk(&s->tool_mu);
     live_tool_state_clear_locked(&sl->responses_live);
-    sl->responses_live.visible_text = xstrdup(visible_text);
+    sl->responses_live.visible_text = server_xstrdup(visible_text);
     sl->responses_live.visible_len = strlen(visible_text);
     if (calls) {
         for (int i = 0; i < calls->len; i++) {
@@ -647,7 +647,7 @@ void server::tool_memory_attach_to_messages(chat_msgs *msgs,
             if (source == TOOL_MEMORY_RAM) matched_source = TOOL_MEMORY_RAM;
         }
         if (exact && matched) {
-            calls->raw_calls = xstrdup(matched->raw);
+            calls->raw_calls = server_xstrdup(matched->raw);
             if (stats) {
                 if (matched_source == TOOL_MEMORY_RAM) stats->mem++;
                 else stats->disk++;
@@ -688,7 +688,7 @@ void server::assign_tool_call_ids(tool_calls *calls, api_style api) {
             random_tool_id(id, sizeof(id), api);
             if (!tool_calls_contains_id(calls, id, i) && !s->tool_memory_has_id(id)) break;
         }
-        calls->v[i].id = xstrdup(id);
+        calls->v[i].id = server_xstrdup(id);
     }
 }
 

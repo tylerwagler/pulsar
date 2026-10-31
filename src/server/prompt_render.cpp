@@ -1062,7 +1062,7 @@ void anthropic_fold_tool_results(chat_msgs *msgs) {
         for (int k = i; k < end; k++) {
             chat_msg *m = &msgs->v[k];
             const bool result = !strcmp(m->role, "tool");
-            if (!f.role && !result) f.role = xstrdup(m->role);
+            if (!f.role && !result) f.role = server_xstrdup(m->role);
             const char *c = m->content ? m->content : "";
             if (result) {
                 chat_msg_add_tool_call_id(&f, m->tool_call_id);
@@ -1072,7 +1072,7 @@ void anthropic_fold_tool_results(chat_msgs *msgs) {
             size_t at = 0;
             for (int im = 0; im <= m->images_len; im++) {
                 const size_t ph = im < m->images_len ? m->image_ph_off[im] : strlen(c);
-                char *run = xstrndup(c + at, ph - at);
+                char *run = server_xstrndup(c + at, ph - at);
                 if (result) append_tool_result_text(&content, run);
                 else buf_puts(&content, run);
                 free(run);
@@ -1097,9 +1097,9 @@ void anthropic_fold_tool_results(chat_msgs *msgs) {
                 f.reasoning = buf_take(&r);
             }
         }
-        if (!f.role) f.role = xstrdup("user");
+        if (!f.role) f.role = server_xstrdup("user");
         f.content = buf_take(&content);
-        if (!f.content) f.content = xstrdup("");
+        if (!f.content) f.content = server_xstrdup("");
         chat_msgs_push(&out, f);
         i = end;
     }

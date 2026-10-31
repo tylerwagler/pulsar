@@ -158,7 +158,7 @@ static bool dsml_find_tool_start_from(const char *raw, size_t raw_len,
 static bool dsml_attr_is_string_true(const char *raw, size_t raw_len,
                                      size_t tag_start, size_t tag_end) {
     if (tag_end <= tag_start || tag_end > raw_len) return false;
-    char *tag = xstrndup(raw + tag_start, tag_end - tag_start);
+    char *tag = server_xstrndup(raw + tag_start, tag_end - tag_start);
     char *is_string = pulsar_dsml_attr(tag, "string");
     bool result = is_string && !strcmp(is_string, "true");
     free(is_string);
@@ -704,7 +704,7 @@ static bool dsml_parse_leaf_param_json(const char **p_in, const char *param_star
     const char *tag_end = strchr(p, '>');
     if (!tag_end) return false;
 
-    char *tag = xstrndup(p, (size_t)(tag_end - p + 1));
+    char *tag = server_xstrndup(p, (size_t)(tag_end - p + 1));
     char *name = pulsar_dsml_attr(tag, "name");
     char *is_string = pulsar_dsml_attr(tag, "string");
     free(tag);
@@ -721,10 +721,10 @@ static bool dsml_parse_leaf_param_json(const char **p_in, const char *param_star
         return false;
     }
 
-    char *raw_value = xstrndup(value_start, (size_t)(value_end - value_start));
+    char *raw_value = server_xstrndup(value_start, (size_t)(value_end - value_start));
     const char *type = is_string ? is_string : "true";
     char *value = !strcmp(type, "true") ?
-        pulsar_dsml_unescape(raw_value) : xstrdup(raw_value);
+        pulsar_dsml_unescape(raw_value) : server_xstrdup(raw_value);
     tool_call_json_args_add(out, name, value, type);
 
     free(name);
@@ -781,7 +781,7 @@ static bool dsml_parse_nested_params_object(const char **p_in,
 /// @param content_out    receives the content (malloc'd)
 /// @param reasoning_out  receives the reasoning (malloc'd, or NULL for none)
 static void split_reasoning_content(const char *text, size_t n, char **content_out, char **reasoning_out) {
-    char *s = xstrndup(text ? text : "", n);
+    char *s = server_xstrndup(text ? text : "", n);
     char *body = s;
     const bool opened_think = !strncmp(body, "<think>", 7);
     if (opened_think) body += 7;
@@ -789,19 +789,19 @@ static void split_reasoning_content(const char *text, size_t n, char **content_o
     char *think_end = strstr(body, "</think>");
     if (think_end) {
         *think_end = '\0';
-        *reasoning_out = xstrdup(body);
-        *content_out = xstrdup(think_end + 8);
+        *reasoning_out = server_xstrdup(body);
+        *content_out = server_xstrdup(think_end + 8);
     } else if (opened_think) {
         /* Generation ended inside the think block (token cap / stop). The
          * partial reasoning is still reasoning: surfacing it as content
          * hands raw chain-of-thought to clients that score or display the
          * answer channel (the streaming path already promises reasoning is
          * never visible assistant text). */
-        *reasoning_out = xstrdup(body);
-        *content_out = xstrdup("");
+        *reasoning_out = server_xstrdup(body);
+        *content_out = server_xstrdup("");
     } else {
         *reasoning_out = NULL;
-        *content_out = xstrdup(s);
+        *content_out = server_xstrdup(s);
     }
     free(s);
 }
@@ -824,8 +824,8 @@ static void unterminated_reasoning_before_tool(const char *text,
         body += 7;
         prefix_len -= 7;
     }
-    *reasoning_out = xstrndup(body, prefix_len);
-    *content_out = xstrdup("");
+    *reasoning_out = server_xstrndup(body, prefix_len);
+    *content_out = server_xstrdup("");
 }
 
 /// The final DSML parse of a generated turn: content, reasoning and the tool calls of the first DSML block (its raw
@@ -864,8 +864,8 @@ bool parse_generated_message_ex(const char *text, bool require_thinking_closed,
                 server_log(PULSAR_LOG_TOOL,
                            "thinking not closed, ignoring incomplete DSML in reasoning");
                 const char *body = !strncmp(text, "<think>", 7) ? text + 7 : text;
-                *reasoning_out = xstrdup(body);
-                *content_out = xstrdup("");
+                *reasoning_out = server_xstrdup(body);
+                *content_out = server_xstrdup("");
                 return true;
             }
             tool_search = candidate;
@@ -911,7 +911,7 @@ bool parse_generated_message_ex(const char *text, bool require_thinking_closed,
         if (!strncmp(p, tool_calls_end, strlen(tool_calls_end))) {
             const char *raw_block_end = p + strlen(tool_calls_end);
             free(calls->raw_calls);
-            calls->raw_calls = xstrndup(raw_block_start, (size_t)(raw_block_end - raw_block_start));
+            calls->raw_calls = server_xstrndup(raw_block_start, (size_t)(raw_block_end - raw_block_start));
             if (recovered_unclosed_tool) {
                 unterminated_reasoning_before_tool(text, content_len,
                                                    content_out, reasoning_out);
@@ -923,7 +923,7 @@ bool parse_generated_message_ex(const char *text, bool require_thinking_closed,
         if (strncmp(p, invoke_start, strlen(invoke_start)) != 0) return false;
         const char *tag_end = strchr(p, '>');
         if (!tag_end) return false;
-        char *tag = xstrndup(p, (size_t)(tag_end - p + 1));
+        char *tag = server_xstrndup(p, (size_t)(tag_end - p + 1));
         char *name = pulsar_dsml_attr(tag, "name");
         free(tag);
         if (!name) return false;
@@ -947,7 +947,7 @@ bool parse_generated_message_ex(const char *text, bool require_thinking_closed,
                 buf_free(&args);
                 return false;
             }
-            tag = xstrndup(p, (size_t)(tag_end - p + 1));
+            tag = server_xstrndup(p, (size_t)(tag_end - p + 1));
             char *param_name = pulsar_dsml_attr(tag, "name");
             char *param_is_string = pulsar_dsml_attr(tag, "string");
             free(tag);
@@ -991,10 +991,10 @@ bool parse_generated_message_ex(const char *text, bool require_thinking_closed,
                 buf_free(&args);
                 return false;
             }
-            char *raw_value = xstrndup(value_start, (size_t)(value_end - value_start));
+            char *raw_value = server_xstrndup(value_start, (size_t)(value_end - value_start));
             const char *type = param_is_string ? param_is_string : "true";
             char *value = !strcmp(type, "true") ?
-                pulsar_dsml_unescape(raw_value) : xstrdup(raw_value);
+                pulsar_dsml_unescape(raw_value) : server_xstrdup(raw_value);
             tool_call_json_args_add(&args, param_name, value, type);
             free(param_name);
             free(param_is_string);
@@ -1186,7 +1186,7 @@ const char *dsml_tool_stream_id(server *s, dsml_tool_stream *ts, int index, api_
             if (!dsml_tool_stream_has_id(ts, id, index) &&
                 (!s || !s->tool_memory_has_id(id))) break;  /* null s (no bound server) => no dedup */
         }
-        ts->ids[index] = xstrdup(id);
+        ts->ids[index] = server_xstrdup(id);
     }
     return ts->ids[index];
 }
@@ -1218,7 +1218,7 @@ static bool dsml_tool_stream_fail(dsml_tool_stream *ts, chat_sink *k) {
 /// @return false when a client write failed
 static bool dsml_tool_emit_string_value(dsml_tool_stream *ts, chat_sink *k, const char *text, size_t len) {
     if (len == 0) return true;
-    char *raw = xstrndup(text, len);
+    char *raw = server_xstrndup(text, len);
     char *unescaped = pulsar_dsml_unescape(raw);
     buf frag = {0};
     json_escape_fragment_n(&frag, unescaped, strlen(unescaped));
@@ -1260,7 +1260,7 @@ static bool dsml_tool_emit_param_prefix(dsml_tool_stream *ts, chat_sink *k, cons
 static bool dsml_tool_start_invoke(dsml_tool_stream *ts, chat_sink *k, const char *raw, size_t raw_len) {
     const char *tag_end = (const char *)memchr(raw + ts->parse_pos, '>', raw_len - ts->parse_pos);
     if (!tag_end) return true;
-    char *tag = xstrndup(raw + ts->parse_pos, (size_t)(tag_end - (raw + ts->parse_pos) + 1));
+    char *tag = server_xstrndup(raw + ts->parse_pos, (size_t)(tag_end - (raw + ts->parse_pos) + 1));
     char *name = pulsar_dsml_attr(tag, "name");
     free(tag);
     if (!name) return dsml_tool_stream_fail(ts, k);
@@ -1298,7 +1298,7 @@ static bool dsml_tool_start_invoke(dsml_tool_stream *ts, chat_sink *k, const cha
 static bool dsml_tool_start_param(dsml_tool_stream *ts, chat_sink *k, const char *raw, size_t raw_len) {
     const char *tag_end = (const char *)memchr(raw + ts->parse_pos, '>', raw_len - ts->parse_pos);
     if (!tag_end) return true;
-    char *tag = xstrndup(raw + ts->parse_pos, (size_t)(tag_end - (raw + ts->parse_pos) + 1));
+    char *tag = server_xstrndup(raw + ts->parse_pos, (size_t)(tag_end - (raw + ts->parse_pos) + 1));
     char *name = pulsar_dsml_attr(tag, "name");
     char *is_string = pulsar_dsml_attr(tag, "string");
     free(tag);
@@ -1488,7 +1488,7 @@ void apply_stream_tool_ids(tool_calls *calls, const dsml_tool_stream *ts) {
     int n = calls->len < ts->ids_cap ? calls->len : ts->ids_cap;
     for (int i = 0; i < n; i++) {
         if (calls->v[i].id && calls->v[i].id[0]) continue;
-        if (ts->ids[i] && ts->ids[i][0]) calls->v[i].id = xstrdup(ts->ids[i]);
+        if (ts->ids[i] && ts->ids[i][0]) calls->v[i].id = server_xstrdup(ts->ids[i]);
     }
 }
 
@@ -1542,7 +1542,7 @@ const char *find_next_dsml_tool_block(const char *p, const char **end_out) {
 /// @param prompt_text  the rendered prompt (NULL: "")
 /// @return the region (malloc'd)
 static char *rendered_chat_system_region(const char *prompt_text) {
-    if (!prompt_text) return xstrdup("");
+    if (!prompt_text) return server_xstrdup("");
     const char *p = prompt_text;
     const char *bos = PULSAR_SERVER_RENDER_BOS;
     const size_t bos_len = strlen(bos);
@@ -1561,7 +1561,7 @@ static char *rendered_chat_system_region(const char *prompt_text) {
     else end = user ? user : assistant;
     if (!end) end = p + strlen(p);
     while (end > p && isspace((unsigned char)end[-1])) end--;
-    return xstrndup(p, (size_t)(end - p));
+    return server_xstrndup(p, (size_t)(end - p));
 }
 
 
@@ -1590,8 +1590,8 @@ static char *build_live_tool_result_suffix_spans(const request *r,
     }
     chat_msgs msgs = {0};
     chat_msg result = {0};
-    result.role = xstrdup("tool");
-    result.content = xstrdup(result_text ? result_text : "");
+    result.role = server_xstrdup("tool");
+    result.content = server_xstrdup(result_text ? result_text : "");
     chat_msgs_push(&msgs, result);
     /* The tool body is CLIENT data (L223): the tail marks it, and the ranges ride
      * along so the caller tokenises those bytes as plain text. */

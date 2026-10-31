@@ -1,11 +1,11 @@
-/* Scheduler/worker (split move-only from generate.cpp): worker_main and its
+/* Scheduler/worker (split move-only from generate.cpp): server_worker_main and its
  * quantum loop (classic / batched / fused mixed-batch lanes), job->slot
  * routing (choose_slot_for_job) and enqueue, lazy provisioning + the
  * admission/ledger/mem-floor helpers, LRU eviction and the warm
  * make-room path, the proactive spill/restore guard, Tier-2 bank
  * switching, and the frontier/committed-pos readers. */
 /** @file
- *  The scheduler / worker: worker_main and its lanes, job-to-slot routing, provisioning, admission, eviction,
+ *  The scheduler / worker: server_worker_main and its lanes, job-to-slot routing, provisioning, admission, eviction,
  *  the spill / preempt guard and bank switching.
  */
 #include "pulsar_server_internal.h"
@@ -373,7 +373,7 @@ session_slot *server::provision_bank(provision_refusal *refusal) {
      * demand-page as it fills.
      * The FIRST bank is exempt: before the 2026-08-10 slot-0 rework it was
      * boot-provisioned and never floor-gated, and an empty-pool floor refusal
-     * is a hang — worker_main's wait predicate stays false (head queued,
+     * is a hang — server_worker_main's wait predicate stays false (head queued,
      * nothing active), so the worker hard-spins re-reading /proc/meminfo and
      * the first request never completes.  One bank's eager floor is small;
      * admission pressure on a tight box belongs to the SECOND bank onward. */
@@ -1620,7 +1620,7 @@ bool server::worker_try_bind() {
     if (!sl && refusal == PROVISION_REFUSED_CREATE_FAIL) {
         /* The bank the pool offered could not be installed (provision_bank:
          * state restore refused).  Eviction does not relieve it and retrying
-         * every quantum would hard-spin on an empty pool (worker_main's wait
+         * every quantum would hard-spin on an empty pool (server_worker_main's wait
          * predicate), so answer the client with a 500 and pop the job, the
          * way the context-length reject above does. */
         s->note_provision_refusal(j, refusal);
@@ -4625,7 +4625,12 @@ static bool slot_steppable_beside_fused(const session_slot *c) {
     return slot_steppable_beside_decode(c) && !slot_fusable_prefill(c);
 }
 
-void *worker_main(void *arg) {
+/// @brief The worker thread: the one thread that drives the engine -- it binds queued jobs to slots and steps
+///        their generations a quantum at a time until the server stops (pulsar_server_internal.h, the CUDA-state
+///        audit).
+/// @param arg the server
+/// @return NULL
+void *server_worker_main(void *arg) {
     server *s = (server *)arg;
     __atomic_store_n(&s->worker_tid, (int)syscall(SYS_gettid), __ATOMIC_RELAXED);   /* the stall dump's /proc */
     int rr = 0; /* round-robin cursor: first slot index to consider next */

@@ -155,7 +155,7 @@ bool parser_kit_feed(void *st, server *s, gen_state *g, size_t upto, bool final)
                 break;
             }
             tool_call tc = {0};
-            tc.name = xstrdup(e.name.c_str());
+            tc.name = server_xstrdup(e.name.c_str());
             tool_calls_push(&q->calls, tc);
             s->assign_tool_call_ids(&q->calls, j->req.api);   /* the id the stream shows is the call's */
             q->open = true;
@@ -182,7 +182,7 @@ bool parser_kit_feed(void *st, server *s, gen_state *g, size_t upto, bool final)
                 q->undeclared++;
                 break;
             }
-            q->calls.v[q->calls.len - 1].arguments = xstrdup(e.arguments.c_str());
+            q->calls.v[q->calls.len - 1].arguments = server_xstrdup(e.arguments.c_str());
             if (live && !kit_close_open_call(q, g)) return q->stream_ok = false;
             q->open = false;
             break;
@@ -226,8 +226,8 @@ bool parser_kit_finish(void *st, server *s, session_slot *sl, gen_state *g, serv
     bool ok = true;
     if (strcmp(g->finish, "error") != 0) ok = parser_kit_feed(q, s, g, g->text.len, true);
     const out_parser &p = *q->parser;
-    out->content = xstrdup(p.content().c_str());
-    out->reasoning = p.reasoning().empty() ? NULL : xstrdup(p.reasoning().c_str());
+    out->content = server_xstrdup(p.content().c_str());
+    out->reasoning = p.reasoning().empty() ? NULL : server_xstrdup(p.reasoning().c_str());
     out->calls = q->calls;
     memset(&q->calls, 0, sizeof(q->calls));
     size_t raw_lo = 0, raw_hi = 0;
@@ -235,7 +235,7 @@ bool parser_kit_finish(void *st, server *s, session_slot *sl, gen_state *g, serv
      * undeclared call is in them, so that turn re-renders canonically (a prefix miss, never a wrong prompt) */
     if (out->calls.len && q->undeclared == 0 && p.raw_span(&raw_lo, &raw_hi)) {
         if (raw_hi > g->text.len || raw_lo >= raw_hi) pulsar_die("output parser: raw span outside the turn's text");
-        out->calls.raw_calls = xstrndup(g->text.ptr + raw_lo, raw_hi - raw_lo);
+        out->calls.raw_calls = server_xstrndup(g->text.ptr + raw_lo, raw_hi - raw_lo);
     }
     /* as text, the stream stopped at the call: the rest goes out at the finish */
     const char *t = g->text.ptr ? g->text.ptr : "";

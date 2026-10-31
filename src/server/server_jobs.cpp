@@ -1755,7 +1755,7 @@ bool server::gen_emit_token(session_slot *sl, int token) {
                                           &hit_stop, &stop_pos, &stop_len);
 
     if (gen_streams_plain(g) && stream_len > g->plain_stream_pos) {
-        char *delta = xstrndup(g->text.ptr + g->plain_stream_pos, stream_len - g->plain_stream_pos);
+        char *delta = server_xstrndup(g->text.ptr + g->plain_stream_pos, stream_len - g->plain_stream_pos);
         bool ok = sse_chunk(j->fd, &j->req, g->id, delta, NULL);
         free(delta);
         if (!ok) {
@@ -1792,7 +1792,7 @@ bool server::gen_emit_token(session_slot *sl, int token) {
 
     if (hit_stop) {
         free(g->stop_sequence);
-        g->stop_sequence = xstrndup(g->text.ptr + stop_pos, stop_len);
+        g->stop_sequence = server_xstrndup(g->text.ptr + stop_pos, stop_len);
         g->finish = "stop";
         g->text.len = stop_pos;
         g->text.ptr[g->text.len] = '\0';
@@ -1869,7 +1869,7 @@ void server::gen_step_finish(session_slot *sl) {
     }
 
     if (j->req.stream && !g->structured_stream && g->text.len > g->plain_stream_pos) {
-        char *tail = xstrndup(g->text.ptr + g->plain_stream_pos, g->text.len - g->plain_stream_pos);
+        char *tail = server_xstrndup(g->text.ptr + g->plain_stream_pos, g->text.len - g->plain_stream_pos);
         if (!sse_chunk(j->fd, &j->req, g->id, tail, NULL)) g->finish = "error";
         free(tail);
     }

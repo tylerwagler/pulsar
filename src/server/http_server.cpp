@@ -1361,7 +1361,7 @@ void *client_main(void *arg) {
         http_request_free(&hr);
         goto done;
     }
-    if (ok) req.raw_body = xstrndup(hr.body, hr.body_len);
+    if (ok) req.raw_body = server_xstrndup(hr.body, hr.body_len);
     if (ok && s->capture) {
         /* L216 --capture-requests: the accepted body verbatim, one JSON line. */
         pthread_mutex_lock(&s->capture_mu);
@@ -1378,7 +1378,7 @@ void *client_main(void *arg) {
     }
     if (!req.model_from_request) {
         free(req.model);
-        req.model = xstrdup(server_served_model_id(s));
+        req.model = server_xstrdup(server_served_model_id(s));
     }
     int ctx_size;
     ctx_size = pulsar_session_ctx(s->sess).raw();

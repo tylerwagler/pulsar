@@ -1490,13 +1490,13 @@ typedef struct {
  * PROCESS-GLOBAL CUDA STATE AUDIT (Tier 1 §1.5 — must-do, read before growing
  * the pool or adding GPU threads).
  *
- * All GPU work in this server runs on the SINGLE worker thread (worker_main in
+ * All GPU work in this server runs on the SINGLE worker thread (server_worker_main in
  * generate.cpp). Client threads only parse HTTP and block on a per-job condvar
  * until the worker finishes (http_server.cpp handle path); they never touch a
  * pulsar_session_* or pulsar_gpu_* entry point. Verified by grepping every
  * pulsar_session_/pulsar_gpu_ call site under src/server: all of them are reached
  * only from the generation state machine (gen_* in generate.cpp) driven by
- * worker_main (or from cli_main startup/shutdown, before the worker starts and
+ * server_worker_main (or from cli_main startup/shutdown, before the worker starts and
  * after it joins) — with two deliberate exceptions, both plain loads of data
  * immutable after startup (no CUDA behind them): http_server.cpp reads
  * pulsar_session_ctx(server.sess) on client threads, and client paths read the
@@ -2012,7 +2012,7 @@ struct server {
     double       guard_avail_at;         ///< when it was read (server_now_sec); re-read at most every 0.25 s
     KvBytes      guard_budget_said;      ///< the live budget last logged (a move of 0.5 GiB or more is said)
     /** The stall watchdog (watchdog.cpp).  `stall_s` is written by the watchdog and read by /health (__atomic);
-     *  For the dump, `worker_tid` is set by worker_main and `worker_thread` by cli_main after pthread_create. */
+     *  For the dump, `worker_tid` is set by server_worker_main and `worker_thread` by cli_main after pthread_create. */
     int          stall_limit_s;          ///< PULSAR_STALL_WATCHDOG_S (0 = off)
     int64_t      stall_s;                ///< seconds the worker has been stalled (0 = progressing)
     int          worker_tid;             ///< the worker's kernel thread id
@@ -3680,10 +3680,10 @@ void stop_signal_handler(int sig);
 void die(const char *msg);
 void *server_xmalloc(size_t n);
 void *server_xrealloc(void *p, size_t n);
-char *xstrdup(const char *s);
+char *server_xstrdup(const char *s);
 bool random_bytes(void *dst, size_t len);
 void pulsar_die(const char *msg);  ///< engine util.cpp; aborts the process
-char *xstrndup(const char *s, size_t n);
+char *server_xstrndup(const char *s, size_t n);
 void buf_append(buf *b, const void *p, size_t n);
 void buf_putc(buf *b, char c);
 /** Append a NUL-terminated string.  Nearly every renderer and emitter calls it, so its caller graph is
@@ -4623,7 +4623,7 @@ char *build_responses_visible_assistant_suffix_spans(const request *r,
                                                      const tool_calls *calls,
                                                      chat_text_span **spans_out,
                                                      uint32_t *n_spans_out);
-void *worker_main(void *arg);
+void *server_worker_main(void *arg);
 /* Job-lifecycle entry points (server_jobs.cpp), driven by the scheduler/
  * worker (server_sched.cpp): bind/step/unbind plus the three per-token
  * helpers the batched and fused mixed-batch quanta share with the classic
@@ -4707,7 +4707,6 @@ int encode_serve(pulsar_engine *const *engines, int n, const server_config *cfg)
 int listen_on(const char *host, int port);
 void configure_client_socket(int fd);
 void set_client_socket_nonblocking(int fd);
-void usage(FILE *fp, const char *topic);
 
 /* ---- shared inline helpers ---- */
 

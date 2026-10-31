@@ -142,7 +142,7 @@ bool logprob_commit(logprob_ledger *lg, pulsar_engine *engine, int token,
     }
     logprob_entry *e = &lg->v[lg->len++];
     e->tok.token = token;
-    e->tok.piece = xstrndup(piece ? piece : "", piece_len);
+    e->tok.piece = server_xstrndup(piece ? piece : "", piece_len);
     e->tok.piece_len = piece_len;
     e->tok.logprob = lg->pending_logprob;
     e->end_off = end_off;
@@ -154,7 +154,7 @@ bool logprob_commit(logprob_ledger *lg, pulsar_engine *engine, int token,
             size_t n = 0;
             char *text = pulsar_token_text(engine, lg->pending_top[i].id, &n);
             e->top[i].token = lg->pending_top[i].id;
-            e->top[i].piece = text ? text : xstrndup("", 0);
+            e->top[i].piece = text ? text : server_xstrndup("", 0);
             e->top[i].piece_len = text ? n : 0;
             e->top[i].logprob = lg->pending_top[i].logprob;
         }
@@ -287,10 +287,10 @@ static void turn_as_text(const gen_state *g, server_turn *out) {
     size_t answer = 0;
     if (close) {
         const size_t lo = strncmp(t, "<think>", 7) ? 0 : 7;
-        if ((size_t)(close - t) > lo) out->reasoning = xstrndup(t + lo, (size_t)(close - t) - lo);
+        if ((size_t)(close - t) > lo) out->reasoning = server_xstrndup(t + lo, (size_t)(close - t) - lo);
         answer = (size_t)(close - t) + strlen("</think>");
     }
-    out->content = xstrndup(t + answer, g->text.len - answer);
+    out->content = server_xstrndup(t + answer, g->text.len - answer);
     out->calls.len = 0;
     out->parse_failed = true;
     out->finish = turn_finish(g, 0);

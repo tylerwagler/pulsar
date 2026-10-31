@@ -443,7 +443,10 @@ void server::close_resources() {
 
 
 
-void usage(FILE *fp, const char *topic) {
+/// @brief Print pulsar-server's help (PULSAR_HELP_SERVER), or one topic of it.
+/// @param fp    the stream (stdout for --help, stderr after a bad option)
+/// @param topic the topic asked (NULL: the whole help)
+static void usage(FILE *fp, const char *topic) {
     pulsar_help_print(fp, PULSAR_HELP_SERVER, topic);
 }
 
@@ -1460,7 +1463,7 @@ int main(int argc, char **argv) {
     s.build_tp_health();
 
     pthread_t worker;
-    if (pthread_create(&worker, NULL, worker_main, &s) != 0) die("failed to start worker");
+    if (pthread_create(&worker, NULL, server_worker_main, &s) != 0) die("failed to start worker");
     s.worker_thread = worker;
     s.stall_limit_s = stall_limit_s;
     if (!s.watchdog_start()) die("failed to start the stall watchdog");

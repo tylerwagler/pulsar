@@ -198,7 +198,7 @@ static std::string run_family(const gcase &c, proto p, size_t piece, pulsar_chat
     request *r = &j.req;
     request_init(r, REQ_CHAT, 256);
     free(r->model);
-    r->model = xstrdup("m");
+    r->model = server_xstrdup("m");
     r->api = p == P_OPENAI ? API_OPENAI : p == P_ANTHROPIC ? API_ANTHROPIC : API_RESPONSES;
     r->reasoning_summary_emit = p == P_RESPONSES_SUMMARY;
     const bool deepseek = fmt == PULSAR_CHAT_DS4_V4 || fmt == PULSAR_CHAT_DS4_V41;
@@ -217,16 +217,16 @@ static std::string run_family(const gcase &c, proto p, size_t piece, pulsar_chat
      * against */
     chat_conversation conv = {};
     chat_msg u = {0};
-    u.role = xstrdup("user");
-    u.content = xstrdup("Go.");
+    u.role = server_xstrdup("user");
+    u.content = server_xstrdup("Go.");
     chat_msgs_push(&conv.msgs, u);
     if (!deepseek && c.tools) {
-        conv.tools_raw = xstrdup(qtools_for(p));
+        conv.tools_raw = server_xstrdup(qtools_for(p));
         tool_schema_orders_add_json(&r->tool_orders,
             "{\"name\":\"bash\",\"parameters\":{\"type\":\"object\",\"properties\":{"
             "\"command\":{\"type\":\"string\"},\"description\":{\"type\":\"string\"}}}}");
     }
-    if (!c.think) chat_conversation_control(&conv, "enable_thinking", xstrdup("false"));
+    if (!c.think) chat_conversation_control(&conv, "enable_thinking", server_xstrdup("false"));
     char err[256] = "";
     if (!deepseek && !render_chat_conversation(NULL, fmt, NULL, &conv, r, err, sizeof err)) {
         chat_conversation_free(&conv);

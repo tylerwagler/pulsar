@@ -485,7 +485,7 @@ static char *qwen_take_render(qwen_render_out *out, chat_text_span **spans_out, 
             memcpy(*spans_out, out->spans.data(), out->spans.size() * sizeof(chat_text_span));
         }
     }
-    return xstrndup(out->text.data(), out->text.size());
+    return server_xstrndup(out->text.data(), out->text.size());
 }
 
 /* The tools of a family whose template takes OpenAI's tools array (Qwen, Inkling): none with tool_choice none; an
@@ -504,8 +504,8 @@ bool chat_openai_tools_json(const chat_conversation *c, request *r, char **head_
     const bool deferred = c->deferred_tool_schemas && c->deferred_tool_schemas[0];
     /* HF's input as sent -- unless some tool is deferred (L325), which only the schema lines separate */
     if (r->api == API_OPENAI && c->tools_raw && !deferred) {
-        r->tools_json = xstrdup(c->tools_raw);
-        *head_json = xstrdup(c->tools_raw);
+        r->tools_json = server_xstrdup(c->tools_raw);
+        *head_json = server_xstrdup(c->tools_raw);
         return true;
     }
     buf head = {0}, all = {0};
@@ -527,7 +527,7 @@ bool chat_openai_tools_json(const chat_conversation *c, request *r, char **head_
 /// @param lines   one function schema a line (parse_tools_value)
 /// @param len     bytes at `lines`
 /// @return a copy of the lines (malloc'd); never fails
-static char *deepseek_tool_defs_text(const char *lines, size_t len, char *, size_t) { return xstrndup(lines, len); }
+static char *deepseek_tool_defs_text(const char *lines, size_t len, char *, size_t) { return server_xstrndup(lines, len); }
 
 /* Qwen's: the tools block's entries inside <tools></tools> (qwen_chat_tool_defs). */
 /// server_family_ops::tool_defs_text for Qwen.
@@ -542,7 +542,7 @@ static char *qwen_tool_defs_text(const char *lines, size_t len, char *err, size_
     qwen_render_out out;
     const bool ok = qwen_chat_tool_defs(json, &out, err, errlen);
     free(json);
-    return ok ? xstrndup(out.text.data(), out.text.size()) : NULL;
+    return ok ? server_xstrndup(out.text.data(), out.text.size()) : NULL;
 }
 
 /* The deferred tool `name`'s schema line (malloc'd), or NULL when the request defers no tool of that name. */
@@ -561,7 +561,7 @@ static char *deferred_tool_line(const chat_conversation *c, const char *name) {
         const bool hit = rp && json_string(&rp, &got) && !strcmp(got, name);
         free(got);
         free(raw);
-        if (hit) return xstrdup(line.c_str());
+        if (hit) return server_xstrdup(line.c_str());
     }
     return NULL;
 }
@@ -634,7 +634,7 @@ bool chat_expand_tool_refs(chat_conversation *c, const request *r, char *err, si
         for (int q = 0; q < m->images_len; q++) m->image_ph_off[q] = moved[(size_t)q];
         free(m->content);
         m->content = buf_take(&out);
-        if (!m->content) m->content = xstrdup("");
+        if (!m->content) m->content = server_xstrdup("");
         chat_msg_clear_tool_refs(m);
     }
     return true;
@@ -750,7 +750,7 @@ static char *qwen_rendered_system_region(const char *prompt) {
     const char *end = strstr(p, "<|im_end|>");
     if (!end) return NULL;
     while (end > p && isspace((unsigned char)end[-1])) end--;
-    return xstrndup(p, (size_t)(end - p));
+    return server_xstrndup(p, (size_t)(end - p));
 }
 
 /// server_family_ops::tool_error_suffix for Qwen: one tool result naming the error, with the system region reminded.
@@ -777,7 +777,7 @@ static char *qwen_tool_error_suffix(const request *r, const thinking_state *, co
     }
     chat_msgs msgs = {0};
     chat_msg result = {0};
-    result.role = xstrdup("tool");
+    result.role = server_xstrdup("tool");
     result.content = buf_take(&text);
     chat_msgs_push(&msgs, result);
     char *suffix = qwen_tool_result_tail(r, &msgs, 0, spans_out, n_spans_out);

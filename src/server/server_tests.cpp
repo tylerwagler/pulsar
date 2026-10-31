@@ -40,7 +40,7 @@ static void test_assert(bool cond, const char *file, int line, const char *expr)
 static void test_request_init(request *r, req_kind kind, int max_tokens) {
     request_init(r, kind, max_tokens);
     r->family = server_family_for_format(PULSAR_CHAT_DS4_V41);
-    r->model = xstrdup("deepseek-v4-flash");
+    r->model = server_xstrdup("deepseek-v4-flash");
 }
 
 
@@ -216,9 +216,9 @@ static void test_responses_function_named_tool_search_stays_function_call(void) 
 
     tool_calls calls = {0};
     tool_call tc = {0};
-    tc.id = xstrdup("call_user_tool_search");
-    tc.name = xstrdup("tool_search");
-    tc.arguments = xstrdup("{\"query\":\"plain function\"}");
+    tc.id = server_xstrdup("call_user_tool_search");
+    tc.name = server_xstrdup("tool_search");
+    tc.arguments = server_xstrdup("{\"query\":\"plain function\"}");
     tool_calls_push(&calls, tc);
     responses_tool_item item = {
         .fc_id = "fc_user_tool_search",
@@ -266,9 +266,9 @@ static void test_responses_namespace_tool_schemas_restore_wire_namespace(void) {
 
     tool_calls calls = {0};
     tool_call tc = {0};
-    tc.id = xstrdup("call_ns");
-    tc.name = xstrdup("mcp__perplexity__perplexity_search");
-    tc.arguments = xstrdup("{\"query\":\"deepseek\",\"recency\":7}");
+    tc.id = server_xstrdup("call_ns");
+    tc.name = server_xstrdup("mcp__perplexity__perplexity_search");
+    tc.arguments = server_xstrdup("{\"query\":\"deepseek\",\"recency\":7}");
     tool_calls_push(&calls, tc);
     responses_tool_item item = {
         .fc_id = "fc_ns",
@@ -387,9 +387,9 @@ static void test_responses_input_function_call_namespace_round_trips_to_dsml(voi
 static void test_responses_output_sends_tool_search_call_item(void) {
     tool_calls calls = {0};
     tool_call tc = {0};
-    tc.id = xstrdup("call_search");
-    tc.name = xstrdup("tool_search");
-    tc.arguments = xstrdup("{\"limit\":3,\"query\":\"perplexity\"}");
+    tc.id = server_xstrdup("call_search");
+    tc.name = server_xstrdup("tool_search");
+    tc.arguments = server_xstrdup("{\"limit\":3,\"query\":\"perplexity\"}");
     tool_calls_push(&calls, tc);
     const char *tools_json =
         "[{\"type\":\"tool_search\",\"execution\":\"client\","
@@ -426,8 +426,8 @@ static void test_responses_output_sends_tool_search_call_item(void) {
 static tool_calls make_swapped_bash_call(void) {
     tool_calls calls = {0};
     tool_call tc = {0};
-    tc.name = xstrdup("bash");
-    tc.arguments = xstrdup("{\"description\":\"list files\",\"command\":\"ls -la\",\"timeout\":10}");
+    tc.name = server_xstrdup("bash");
+    tc.arguments = server_xstrdup("{\"description\":\"list files\",\"command\":\"ls -la\",\"timeout\":10}");
     tool_calls_push(&calls, tc);
     return calls;
 }
@@ -532,9 +532,9 @@ static void test_openai_sse_finish_sends_calls_past_streamed(void) {
                            "{\"command\":\"echo two\"}"};
     for (int i = 0; i < 3; i++) {
         tool_call tc = {0};
-        tc.id = xstrdup(names[i]);
-        tc.name = xstrdup("bash");
-        tc.arguments = xstrdup(cmds[i]);
+        tc.id = server_xstrdup(names[i]);
+        tc.name = server_xstrdup("bash");
+        tc.arguments = server_xstrdup(cmds[i]);
         tool_calls_push(&calls, tc);
     }
     TEST_ASSERT(openai_sse_finish(&k, &calls, "tool_calls", 10, 8));
@@ -2037,7 +2037,7 @@ static void greedy_rows_run(const greedy_rows_case &c, bool with_stop) {
     j.req.has_temperature = true;
     j.req.has_tools = true;
     j.req.stream = with_stop;
-    if (with_stop) stop_list_push(&j.req.stops, xstrdup("QQQQ"));
+    if (with_stop) stop_list_push(&j.req.stops, server_xstrdup("QQQQ"));
     std::vector<std::string> pieces;
     for (size_t i = 0, n = strlen(c.text); i < n; i += 3) pieces.push_back(std::string(c.text + i, std::min<size_t>(3, n - i)));
     const int np = (int)pieces.size();
@@ -2287,7 +2287,7 @@ static void test_api_thinking_controls_parse(void) {
     TEST_ASSERT(parse_thinking_control_value(&thinking, &enabled));
     TEST_ASSERT(enabled);
 
-    chat_control oc = {"output_config", xstrdup("{\"effort\":\"max\",\"other\":true}")};
+    chat_control oc = {"output_config", server_xstrdup("{\"effort\":\"max\",\"other\":true}")};
     chat_effort_ask a;
     char err[160];
     TEST_ASSERT(chat_effort_ask_read(&oc, 1, &a, err, sizeof err));
@@ -2307,7 +2307,7 @@ static void test_effort_controls_name_their_error(void) {
          "chat_template_kwargs.enable_thinking: must be true, false or null"},
     };
     for (const auto &c : k) {
-        chat_control ctl = {c.key, xstrdup(c.raw)};
+        chat_control ctl = {c.key, server_xstrdup(c.raw)};
         chat_effort_ask a;
         char err[160] = "";
         TEST_ASSERT(!chat_effort_ask_read(&ctl, 1, &a, err, sizeof err));
@@ -2322,12 +2322,12 @@ static void test_effort_controls_name_their_error(void) {
 static void test_render_think_max_prompt_prefix(void) {
     chat_msgs msgs = {0};
     chat_msg sys = {0};
-    sys.role = xstrdup("system");
-    sys.content = xstrdup("You are terse.");
+    sys.role = server_xstrdup("system");
+    sys.content = server_xstrdup("You are terse.");
     chat_msgs_push(&msgs, sys);
     chat_msg user = {0};
-    user.role = xstrdup("user");
-    user.content = xstrdup("Hello");
+    user.role = server_xstrdup("user");
+    user.content = server_xstrdup("Hello");
     chat_msgs_push(&msgs, user);
 
     char *prompt = render_chat_prompt_text(&msgs, NULL, PULSAR_THINK_MAX);
@@ -2387,8 +2387,8 @@ static void test_inline_system_message_placement(void) {
     /* The top-level system FIELD is appended to the array by the parser --
      * trailing position, but system_field=true keeps it in the region. */
     chat_msg field = {0};
-    field.role = xstrdup("system");
-    field.content = xstrdup("Field prompt.");
+    field.role = server_xstrdup("system");
+    field.content = server_xstrdup("Field prompt.");
     field.system_field = true;
     chat_msgs_push(&msgs, field);
     prompt = render_chat_prompt_text(&msgs, NULL, PULSAR_THINK_LOW);
@@ -2408,12 +2408,12 @@ static void test_inline_system_message_placement(void) {
 static void test_appended_system_message_keeps_prefix(void) {
     chat_msgs msgs = {0};
     chat_msg m0 = {0};
-    m0.role = xstrdup("user");
-    m0.content = xstrdup("First question");
+    m0.role = server_xstrdup("user");
+    m0.content = server_xstrdup("First question");
     chat_msgs_push(&msgs, m0);
     chat_msg m1 = {0};
-    m1.role = xstrdup("assistant");
-    m1.content = xstrdup("First answer");
+    m1.role = server_xstrdup("assistant");
+    m1.content = server_xstrdup("First answer");
     chat_msgs_push(&msgs, m1);
 
     /* Tool context, like the agent clients this pins: without it the
@@ -2425,12 +2425,12 @@ static void test_appended_system_message_keeps_prefix(void) {
     TEST_ASSERT(before != NULL);
 
     chat_msg nudge = {0};
-    nudge.role = xstrdup("system");
-    nudge.content = xstrdup("The task tools haven't been used recently.");
+    nudge.role = server_xstrdup("system");
+    nudge.content = server_xstrdup("The task tools haven't been used recently.");
     chat_msgs_push(&msgs, nudge);
     chat_msg m2 = {0};
-    m2.role = xstrdup("user");
-    m2.content = xstrdup("Second question");
+    m2.role = server_xstrdup("user");
+    m2.content = server_xstrdup("Second question");
     chat_msgs_push(&msgs, m2);
 
     char *after = render_chat_prompt_text(&msgs, schemas, PULSAR_THINK_LOW);
@@ -2460,8 +2460,8 @@ static void test_appended_system_message_keeps_prefix(void) {
 static void test_render_think_effort_prefixes(void) {
     chat_msgs msgs = {0};
     chat_msg user = {0};
-    user.role = xstrdup("user");
-    user.content = xstrdup("Hello");
+    user.role = server_xstrdup("user");
+    user.content = server_xstrdup("Hello");
     chat_msgs_push(&msgs, user);
 
     char *prompt = render_chat_prompt_text(&msgs, NULL, PULSAR_THINK_HIGH);
@@ -2494,8 +2494,8 @@ static void test_render_think_effort_prefixes(void) {
 static void test_render_non_thinking_prompt_closes_think(void) {
     chat_msgs msgs = {0};
     chat_msg user = {0};
-    user.role = xstrdup("user");
-    user.content = xstrdup("Hello");
+    user.role = server_xstrdup("user");
+    user.content = server_xstrdup("Hello");
     chat_msgs_push(&msgs, user);
 
     char *prompt = render_chat_prompt_text(&msgs, NULL, PULSAR_THINK_NONE);
@@ -2511,17 +2511,17 @@ static void test_render_non_thinking_prompt_closes_think(void) {
 static void test_render_drops_old_reasoning_without_tools(void) {
     chat_msgs msgs = {0};
     chat_msg user1 = {0};
-    user1.role = xstrdup("user");
-    user1.content = xstrdup("first");
+    user1.role = server_xstrdup("user");
+    user1.content = server_xstrdup("first");
     chat_msgs_push(&msgs, user1);
     chat_msg assistant = {0};
-    assistant.role = xstrdup("assistant");
-    assistant.reasoning = xstrdup("old hidden reasoning");
-    assistant.content = xstrdup("first answer");
+    assistant.role = server_xstrdup("assistant");
+    assistant.reasoning = server_xstrdup("old hidden reasoning");
+    assistant.content = server_xstrdup("first answer");
     chat_msgs_push(&msgs, assistant);
     chat_msg user2 = {0};
-    user2.role = xstrdup("user");
-    user2.content = xstrdup("second");
+    user2.role = server_xstrdup("user");
+    user2.content = server_xstrdup("second");
     chat_msgs_push(&msgs, user2);
 
     char *prompt = render_chat_prompt_text(&msgs, NULL, PULSAR_THINK_HIGH);
@@ -2539,21 +2539,21 @@ static void test_render_drops_old_reasoning_without_tools(void) {
 static void test_render_preserves_reasoning_with_tools(void) {
     chat_msgs msgs = {0};
     chat_msg user1 = {0};
-    user1.role = xstrdup("user");
-    user1.content = xstrdup("first");
+    user1.role = server_xstrdup("user");
+    user1.content = server_xstrdup("first");
     chat_msgs_push(&msgs, user1);
     chat_msg assistant = {0};
-    assistant.role = xstrdup("assistant");
-    assistant.reasoning = xstrdup("tool reasoning");
-    assistant.content = xstrdup("");
+    assistant.role = server_xstrdup("assistant");
+    assistant.reasoning = server_xstrdup("tool reasoning");
+    assistant.content = server_xstrdup("");
     tool_call tc = {0};
-    tc.name = xstrdup("bash");
-    tc.arguments = xstrdup("{\"command\":\"pwd\"}");
+    tc.name = server_xstrdup("bash");
+    tc.arguments = server_xstrdup("{\"command\":\"pwd\"}");
     tool_calls_push(&assistant.calls, tc);
     chat_msgs_push(&msgs, assistant);
     chat_msg tool = {0};
-    tool.role = xstrdup("tool");
-    tool.content = xstrdup("/tmp");
+    tool.role = server_xstrdup("tool");
+    tool.content = server_xstrdup("/tmp");
     chat_msgs_push(&msgs, tool);
 
     char *prompt = render_chat_prompt_text(&msgs, "{}", PULSAR_THINK_HIGH);
@@ -2580,12 +2580,12 @@ static void test_render_chat_prompt_text_renders_tools_after_system(void) {
      * optimisation, retired with V4 (L218). */
     chat_msgs msgs = {0};
     chat_msg sys = {0};
-    sys.role = xstrdup("system");
-    sys.content = xstrdup("CLIENT_SYSTEM_MARKER");
+    sys.role = server_xstrdup("system");
+    sys.content = server_xstrdup("CLIENT_SYSTEM_MARKER");
     chat_msgs_push(&msgs, sys);
     chat_msg user = {0};
-    user.role = xstrdup("user");
-    user.content = xstrdup("hello");
+    user.role = server_xstrdup("user");
+    user.content = server_xstrdup("hello");
     chat_msgs_push(&msgs, user);
 
     char *prompt = render_chat_prompt_text(&msgs, "TOOL_SCHEMA_MARKER",
@@ -2688,9 +2688,9 @@ static void test_checkpoint_key_ends_where_sampled_tokens_end(void) {
     r.tool_orders = make_bash_order();
     tool_calls calls = {0};
     tool_call tc = {0};
-    tc.id = xstrdup("call_1");
-    tc.name = xstrdup("bash");
-    tc.arguments = xstrdup("{\"command\":\"ls\"}");
+    tc.id = server_xstrdup("call_1");
+    tc.name = server_xstrdup("bash");
+    tc.arguments = server_xstrdup("{\"command\":\"ls\"}");
     tool_calls_push(&calls, tc);
     /* a tool-call turn: no EOS in the key, the replay has one */
     char *key = build_tool_checkpoint_suffix(&r, "", "need ls", &calls);
@@ -2836,7 +2836,7 @@ static void test_broken_call_one_rule_every_family(void) {
         r->stream = true;   /* a stream: no retry, the turn is text */
         r->tool_orders = make_bash_order();
         if (c.fmt == PULSAR_CHAT_QWEN)
-            r->tools_json = xstrdup("[{\"type\":\"function\",\"function\":{\"name\":\"bash\",\"parameters\":"
+            r->tools_json = server_xstrdup("[{\"type\":\"function\",\"function\":{\"name\":\"bash\",\"parameters\":"
                                          "{\"type\":\"object\",\"properties\":{\"command\":{\"type\":\"string\"}}}}}]");
         gen_state g;
         memset(&g, 0, sizeof g);
@@ -2896,7 +2896,7 @@ static void test_invalid_dsml_tool_error_suffix_includes_system_prompt(void) {
     request r = {};
     r.family = server_family_for_format(PULSAR_CHAT_DS4_V41);   /* a request always names its family (L272 P3) */
     r.think_mode = PULSAR_THINK_HIGH;
-    r.prompt_text = xstrdup(
+    r.prompt_text = server_xstrdup(
         "<｜begin▁of▁sentence｜>"
         "## Tools\nschema\n\nSystem rule\n\n"
         "<｜User｜>Hi<｜Assistant｜><think>");
@@ -2978,8 +2978,8 @@ static void test_tool_checkpoint_suffix_is_future_prompt_canonical(void) {
 
     chat_msgs prefix_msgs = {0};
     chat_msg user = {0};
-    user.role = xstrdup("user");
-    user.content = xstrdup("inspect");
+    user.role = server_xstrdup("user");
+    user.content = server_xstrdup("inspect");
     chat_msgs_push(&prefix_msgs, user);
     char *prompt_text = render_chat_prompt_text(&prefix_msgs, tool_schemas, PULSAR_THINK_HIGH);
 
@@ -3014,13 +3014,13 @@ static void test_tool_checkpoint_suffix_is_future_prompt_canonical(void) {
 
     chat_msgs history_msgs = {0};
     chat_msg user2 = {0};
-    user2.role = xstrdup("user");
-    user2.content = xstrdup("inspect");
+    user2.role = server_xstrdup("user");
+    user2.content = server_xstrdup("inspect");
     chat_msgs_push(&history_msgs, user2);
     chat_msg assistant = {0};
-    assistant.role = xstrdup("assistant");
-    assistant.reasoning = xstrdup(reasoning ? reasoning : "");
-    assistant.content = xstrdup(content ? content : "");
+    assistant.role = server_xstrdup("assistant");
+    assistant.reasoning = server_xstrdup(reasoning ? reasoning : "");
+    assistant.content = server_xstrdup(content ? content : "");
     assistant.calls = calls;
     memset(&calls, 0, sizeof(calls));
     chat_msgs_push(&history_msgs, assistant);
@@ -3054,8 +3054,8 @@ static void test_tool_checkpoint_minifies_json_parameters(void) {
 
     chat_msgs prefix_msgs = {0};
     chat_msg user = {0};
-    user.role = xstrdup("user");
-    user.content = xstrdup("edit");
+    user.role = server_xstrdup("user");
+    user.content = server_xstrdup("edit");
     chat_msgs_push(&prefix_msgs, user);
     char *prompt_text = render_chat_prompt_text(&prefix_msgs, tool_schemas, PULSAR_THINK_HIGH);
 
@@ -3088,13 +3088,13 @@ static void test_tool_checkpoint_minifies_json_parameters(void) {
 
     chat_msgs history_msgs = {0};
     chat_msg user2 = {0};
-    user2.role = xstrdup("user");
-    user2.content = xstrdup("edit");
+    user2.role = server_xstrdup("user");
+    user2.content = server_xstrdup("edit");
     chat_msgs_push(&history_msgs, user2);
     chat_msg assistant = {0};
-    assistant.role = xstrdup("assistant");
-    assistant.reasoning = xstrdup(reasoning ? reasoning : "");
-    assistant.content = xstrdup(content ? content : "");
+    assistant.role = server_xstrdup("assistant");
+    assistant.reasoning = server_xstrdup(reasoning ? reasoning : "");
+    assistant.content = server_xstrdup(content ? content : "");
     assistant.calls = calls;
     memset(&calls, 0, sizeof(calls));
     chat_msgs_push(&history_msgs, assistant);
@@ -3144,13 +3144,13 @@ static void test_tool_memory_replays_sampled_dsml(void) {
 
     chat_msgs msgs = {0};
     chat_msg assistant = {0};
-    assistant.role = xstrdup("assistant");
-    assistant.reasoning = xstrdup(reasoning ? reasoning : "");
-    assistant.content = xstrdup(content ? content : "");
+    assistant.role = server_xstrdup("assistant");
+    assistant.reasoning = server_xstrdup(reasoning ? reasoning : "");
+    assistant.content = server_xstrdup(content ? content : "");
     tool_call tc = {0};
-    tc.id = xstrdup(sampled.v[0].id);
-    tc.name = xstrdup("bash");
-    tc.arguments = xstrdup("{\"description\":\"list files\",\"command\":\"ls -la\",\"timeout\":10}");
+    tc.id = server_xstrdup(sampled.v[0].id);
+    tc.name = server_xstrdup("bash");
+    tc.arguments = server_xstrdup("{\"description\":\"list files\",\"command\":\"ls -la\",\"timeout\":10}");
     tool_calls_push(&assistant.calls, tc);
     chat_msgs_push(&msgs, assistant);
 
@@ -3246,17 +3246,17 @@ static void test_anthropic_live_tail_renders_tool_results_only(void) {
 
     chat_msgs msgs = {0};
     chat_msg assistant = {0};
-    assistant.role = xstrdup("assistant");
+    assistant.role = server_xstrdup("assistant");
     tool_call tc = {0};
-    tc.id = xstrdup("toolu_live");
-    tc.name = xstrdup("Bash");
-    tc.arguments = xstrdup("{\"command\":\"pwd\"}");
+    tc.id = server_xstrdup("toolu_live");
+    tc.name = server_xstrdup("Bash");
+    tc.arguments = server_xstrdup("{\"command\":\"pwd\"}");
     tool_calls_push(&assistant.calls, tc);
     chat_msgs_push(&msgs, assistant);
 
     chat_msg user = {0};
-    user.role = xstrdup("user");
-    user.content = xstrdup("<tool_result>/tmp</tool_result>");
+    user.role = server_xstrdup("user");
+    user.content = server_xstrdup("<tool_result>/tmp</tool_result>");
     chat_msg_add_tool_call_id(&user, "toolu_live");
     chat_msgs_push(&msgs, user);
 
@@ -3264,8 +3264,8 @@ static void test_anthropic_live_tail_renders_tool_results_only(void) {
      * rendering.  The live-tail finder must ignore it when locating the final
      * tool_result run. */
     chat_msg system = {0};
-    system.role = xstrdup("system");
-    system.content = xstrdup("You are terse.");
+    system.role = server_xstrdup("system");
+    system.content = server_xstrdup("You are terse.");
     chat_msgs_push(&msgs, system);
 
     anthropic_prepare_live_continuation(&r, &msgs);
@@ -3291,8 +3291,8 @@ static void test_anthropic_tool_result_id_validation(void) {
 
     chat_msgs msgs = {0};
     chat_msg user = {0};
-    user.role = xstrdup("user");
-    user.content = xstrdup("<tool_result>out</tool_result>");
+    user.role = server_xstrdup("user");
+    user.content = server_xstrdup("<tool_result>out</tool_result>");
     chat_msg_add_tool_call_id(&user, "toolu_missing");
     chat_msgs_push(&msgs, user);
 
@@ -3325,16 +3325,16 @@ static void test_anthropic_tool_result_id_validation(void) {
 
 static chat_msg qwen_test_msg(const char *role, const char *content) {
     chat_msg m = {0};
-    m.role = xstrdup(role);
-    if (content) m.content = xstrdup(content);
+    m.role = server_xstrdup(role);
+    if (content) m.content = server_xstrdup(content);
     return m;
 }
 
 static void qwen_test_call(chat_msg *m, const char *id, const char *name, const char *args) {
     tool_call tc = {0};
-    tc.id = xstrdup(id);
-    tc.name = xstrdup(name);
-    tc.arguments = xstrdup(args);
+    tc.id = server_xstrdup(id);
+    tc.name = server_xstrdup(name);
+    tc.arguments = server_xstrdup(args);
     tool_calls_push(&m->calls, tc);
 }
 
@@ -3345,7 +3345,7 @@ static char *qwen_test_full_render(chat_msgs *msgs, bool thinking_off, std::vect
     c.msgs = *msgs;
     memset(msgs, 0, sizeof(*msgs));
     c.tool_choice = CHAT_TOOL_CHOICE_AUTO;
-    if (thinking_off) chat_conversation_control(&c, "enable_thinking", xstrdup("false"));
+    if (thinking_off) chat_conversation_control(&c, "enable_thinking", server_xstrdup("false"));
     request r;
     test_request_init(&r, REQ_CHAT, 128);
     r.api = API_OPENAI;
@@ -3353,7 +3353,7 @@ static char *qwen_test_full_render(chat_msgs *msgs, bool thinking_off, std::vect
     const bool ok = render_chat_conversation(NULL, PULSAR_CHAT_QWEN, NULL, &c, &r, err, sizeof err);
     if (!ok) fprintf(stderr, "qwen render refused: %s\n", err);
     TEST_ASSERT(ok);
-    char *text = xstrdup(r.prompt_text);
+    char *text = server_xstrdup(r.prompt_text);
     if (spans) spans->assign(r.prompt_spans, r.prompt_spans + r.prompt_n_spans);
     request_free(&r);
     chat_conversation_free(&c);
@@ -3373,14 +3373,14 @@ static void test_qwen_hooks_compose_to_the_full_render(void) {
         chat_msgs_push(&full, qwen_test_msg("system", "Be terse."));
         chat_msgs_push(&full, qwen_test_msg("user", "Weather in Paris and Rome?"));
         chat_msg a = qwen_test_msg("assistant", "Checking.\n");
-        if (reasoning) a.reasoning = xstrdup(reasoning);
+        if (reasoning) a.reasoning = server_xstrdup(reasoning);
         qwen_test_call(&a, "call_1", "get_weather", "{\"city\":\"Paris\",\"n\":2}");
         qwen_test_call(&a, "call_2", "get_weather", "{\"city\":\"Rome\"}");
         chat_msgs_push(&full, a);
         chat_msgs_push(&full, qwen_test_msg("tool", "18C"));
-        full.v[2].tool_call_id = xstrdup("call_1");
+        full.v[2].tool_call_id = server_xstrdup("call_1");
         chat_msgs_push(&full, qwen_test_msg("tool", "  22C\n"));
-        full.v[3].tool_call_id = xstrdup("call_2");
+        full.v[3].tool_call_id = server_xstrdup("call_2");
         /* a mid-loop system message renders as a user system-reminder in both */
         chat_msgs_push(&full, qwen_test_msg("system", "Hurry."));
 
@@ -3455,11 +3455,11 @@ static void test_qwen_tail_carries_a_tool_result_image(void) {
     chat_msgs_push(&prefix, qwen_test_msg("user", "Screenshot the build page."));
     chat_msgs_push(&full, qwen_test_msg("user", "Screenshot the build page."));
     chat_msg a = qwen_test_msg("assistant", "");
-    a.reasoning = xstrdup("Take it.\n");
+    a.reasoning = server_xstrdup("Take it.\n");
     qwen_test_call(&a, "call_1", "screenshot", "{}");
     chat_msgs_push(&full, a);
     chat_msgs_push(&full, qwen_test_image_msg("tool", "Captured: ", " (1920x1080)"));
-    full.v[2].tool_call_id = xstrdup("call_1");
+    full.v[2].tool_call_id = server_xstrdup("call_1");
 
     request r;
     test_request_init(&r, REQ_CHAT, 128);
@@ -3562,14 +3562,14 @@ static void test_qwen_raw_calls_replay_verbatim(void) {
     TEST_ASSERT(qwen->find_call_block("x<tool_call>\n<function=a>", &end) == NULL);   /* unclosed: no key */
 
     /* a replay with the raw bytes renders them where the calls go, verbatim */
-    char *raw = xstrndup(sampled + lo, hi - lo);
+    char *raw = server_xstrndup(sampled + lo, hi - lo);
     chat_msgs msgs = {0};
     chat_msgs_push(&msgs, qwen_test_msg("user", "List."));
     chat_msg a = qwen_test_msg("assistant", "On it.");
-    a.reasoning = xstrdup("I will.");
+    a.reasoning = server_xstrdup("I will.");
     qwen_test_call(&a, "call_1", "bash", "{\"cmd\":\"pwd\"}");
     qwen_test_call(&a, "call_2", "bash", "{\"n\":\"007\"}");
-    a.calls.raw_calls = xstrdup(raw);
+    a.calls.raw_calls = server_xstrdup(raw);
     chat_msgs_push(&msgs, a);
     chat_msgs_push(&msgs, qwen_test_msg("tool", "ok"));
     char *text = qwen_test_full_render(&msgs, false);
@@ -3586,7 +3586,7 @@ static void test_qwen_raw_calls_replay_verbatim(void) {
     chat_msg k = qwen_test_msg("assistant", NULL);
     qwen_test_call(&k, "call_1", "bash", "{\"cmd\":\"pwd\"}");
     qwen_test_call(&k, "call_2", "bash", "{\"n\":\"007\"}");
-    k.calls.raw_calls = xstrdup(raw);
+    k.calls.raw_calls = server_xstrdup(raw);
     char *turn = r.family->assistant_turn_sampled(&r, true, "I will.", "On it.", &k.calls, NULL, NULL);
     TEST_ASSERT(turn && !strcmp(turn, sampled));
     free(turn);
@@ -3602,14 +3602,14 @@ static void test_qwen_forced_call_prefill_and_seed(void) {
         const bool thinking_off = off == 1;
         chat_conversation c = {};
         chat_msgs_push(&c.msgs, qwen_test_msg("user", "Search for pulsars."));
-        c.tools_raw = xstrdup("[{\"type\":\"function\",\"function\":{\"name\":\"search\",\"parameters\":{\"type\":\"object\","
+        c.tools_raw = server_xstrdup("[{\"type\":\"function\",\"function\":{\"name\":\"search\",\"parameters\":{\"type\":\"object\","
                               "\"properties\":{\"q\":{\"type\":\"string\"}}}}}]");
         c.tool_choice = CHAT_TOOL_CHOICE_NAMED;
-        if (thinking_off) chat_conversation_control(&c, "enable_thinking", xstrdup("false"));
+        if (thinking_off) chat_conversation_control(&c, "enable_thinking", server_xstrdup("false"));
         request r;
         test_request_init(&r, REQ_CHAT, 128);
         r.api = API_OPENAI;
-        r.forced_tool_name = xstrdup("search");
+        r.forced_tool_name = server_xstrdup("search");
         tool_schema_orders_add_json(&r.tool_orders, "{\"name\":\"search\",\"parameters\":{\"type\":\"object\","
                                                     "\"properties\":{\"q\":{\"type\":\"string\"}}}}");
         char err[200] = {0};
@@ -4195,7 +4195,7 @@ static void test_qwen_tool_error_suffix_reminds_the_system_turn(void) {
     test_request_init(&r, REQ_CHAT, 128);
     r.family = server_family_for_format(PULSAR_CHAT_QWEN);
     r.family_effort = QWEN_EFFORT_XHIGH;
-    r.prompt_text = xstrdup("<|im_start|>system\nRules here.  \n<|im_end|>\n<|im_start|>user\nHi<|im_end|>\n"
+    r.prompt_text = server_xstrdup("<|im_start|>system\nRules here.  \n<|im_end|>\n<|im_start|>user\nHi<|im_end|>\n"
                             "<|im_start|>assistant\n<think>\n");
     thinking_state st = {.inside = true};
     chat_text_span *spans = NULL;
@@ -4225,7 +4225,7 @@ static char *inkling_test_full_render(chat_msgs *msgs, const char *tools, reques
     c.msgs = *msgs;
     memset(msgs, 0, sizeof(*msgs));
     c.tool_choice = CHAT_TOOL_CHOICE_AUTO;
-    if (tools) c.tools_raw = xstrdup(tools);
+    if (tools) c.tools_raw = server_xstrdup(tools);
     request r;
     test_request_init(&r, REQ_CHAT, 128);
     r.api = API_OPENAI;
@@ -4233,7 +4233,7 @@ static char *inkling_test_full_render(chat_msgs *msgs, const char *tools, reques
     const bool ok = render_chat_conversation(NULL, PULSAR_CHAT_INKLING, NULL, &c, &r, err, sizeof err);
     if (!ok) fprintf(stderr, "inkling render refused: %s\n", err);
     TEST_ASSERT(ok);
-    char *text = xstrdup(r.prompt_text ? r.prompt_text : "");
+    char *text = server_xstrdup(r.prompt_text ? r.prompt_text : "");
     if (keep) *keep = r;
     else request_free(&r);
     chat_conversation_free(&c);
@@ -4284,14 +4284,14 @@ static void test_inkling_hooks_compose_to_the_full_render(void) {
         chat_msgs_push(m, qwen_test_msg("user", "Weather in Paris and Rome?"));
     }
     chat_msg a = qwen_test_msg("assistant", "Checking.\n");
-    a.reasoning = xstrdup(reasoning);
+    a.reasoning = server_xstrdup(reasoning);
     qwen_test_call(&a, "call_1", "get_weather", "{\"n\":2,\"city\":\"Paris\"}");
     qwen_test_call(&a, "call_2", "get_weather", "{\"city\":\"Rome\"}");
     chat_msgs_push(&full, a);
     chat_msgs_push(&full, qwen_test_msg("tool", "18C"));
-    full.v[3].tool_call_id = xstrdup("call_1");
+    full.v[3].tool_call_id = server_xstrdup("call_1");
     chat_msgs_push(&full, qwen_test_msg("tool", "  22C\n"));
-    full.v[4].tool_call_id = xstrdup("call_2");
+    full.v[4].tool_call_id = server_xstrdup("call_2");
     chat_msgs_push(&full, qwen_test_msg("system", "Hurry."));   /* a mid-loop system message: a system block */
 
     request r;
@@ -4372,10 +4372,10 @@ static void test_inkling_raw_calls_replay_and_key(void) {
     chat_msg a = qwen_test_msg("assistant", "On it.");
     qwen_test_call(&a, "call_1", "bash", "{\"cmd\":\"ls   -la\"}");
     qwen_test_call(&a, "call_2", "bash", "{\"n\":\"007\"}");
-    a.calls.raw_calls = xstrdup(sampled);
+    a.calls.raw_calls = server_xstrdup(sampled);
     chat_msgs_push(&msgs, a);
     chat_msgs_push(&msgs, qwen_test_msg("tool", "ok"));
-    msgs.v[2].tool_call_id = xstrdup("call_2");
+    msgs.v[2].tool_call_id = server_xstrdup("call_2");
     char *text = inkling_test_full_render(&msgs, NULL);
     const std::string expect = std::string("<|message_model|><|content_text|>On it.<|end_message|><|message_model|>") +
                                sampled + "<|content_model_end_sampling|><|message_tool|>bash<|content_text|>ok";
@@ -4391,7 +4391,7 @@ static void test_inkling_raw_calls_replay_and_key(void) {
     chat_msg t = qwen_test_msg("assistant", NULL);
     qwen_test_call(&t, "call_1", "bash", "{\"cmd\":\"ls   -la\"}");
     qwen_test_call(&t, "call_2", "bash", "{\"n\":\"007\"}");
-    t.calls.raw_calls = xstrdup(sampled);
+    t.calls.raw_calls = server_xstrdup(sampled);
     char *turn = r.family->assistant_turn_sampled(&r, true, NULL, "", &t.calls, NULL, NULL);
     TEST_ASSERT(turn && !strcmp(turn, sampled));
     free(turn);
@@ -4470,7 +4470,7 @@ static char *nemotron_test_full_render(chat_msgs *msgs, const char *tools, reque
     c.msgs = *msgs;
     memset(msgs, 0, sizeof(*msgs));
     c.tool_choice = CHAT_TOOL_CHOICE_AUTO;
-    if (tools) c.tools_raw = xstrdup(tools);
+    if (tools) c.tools_raw = server_xstrdup(tools);
     request r;
     test_request_init(&r, REQ_CHAT, 128);
     r.api = API_OPENAI;
@@ -4478,7 +4478,7 @@ static char *nemotron_test_full_render(chat_msgs *msgs, const char *tools, reque
     const bool ok = render_chat_conversation(NULL, PULSAR_CHAT_NEMOTRON_H, NULL, &c, &r, err, sizeof err);
     if (!ok) fprintf(stderr, "nemotron render refused: %s\n", err);
     TEST_ASSERT(ok);
-    char *text = xstrdup(r.prompt_text ? r.prompt_text : "");
+    char *text = server_xstrdup(r.prompt_text ? r.prompt_text : "");
     if (keep) *keep = r;
     else request_free(&r);
     chat_conversation_free(&c);
@@ -4536,14 +4536,14 @@ static void test_nemotron_hooks_compose_to_the_full_render(void) {
         chat_msgs_push(m, qwen_test_msg("user", "Weather in Paris and Rome?"));
     }
     chat_msg a = qwen_test_msg("assistant", "Checking.\n");
-    a.reasoning = xstrdup(reasoning);
+    a.reasoning = server_xstrdup(reasoning);
     qwen_test_call(&a, "call_1", "get_weather", "{\"n\":2,\"city\":\"Paris\"}");
     qwen_test_call(&a, "call_2", "get_weather", "{\"city\":\"Rome\"}");
     chat_msgs_push(&full, a);
     chat_msgs_push(&full, qwen_test_msg("tool", "18C"));
-    full.v[3].tool_call_id = xstrdup("call_1");
+    full.v[3].tool_call_id = server_xstrdup("call_1");
     chat_msgs_push(&full, qwen_test_msg("tool", "  22C\n"));
-    full.v[4].tool_call_id = xstrdup("call_2");
+    full.v[4].tool_call_id = server_xstrdup("call_2");
     chat_msgs_push(&full, qwen_test_msg("system", "Hurry."));   /* a mid-loop system message: a system turn in place */
 
     request r;
@@ -4618,10 +4618,10 @@ static void test_nemotron_raw_calls_replay_and_key(void) {
     chat_msgs msgs = {0};
     chat_msgs_push(&msgs, qwen_test_msg("user", "List."));
     chat_msg a = qwen_test_msg("assistant", "On it.");
-    a.reasoning = xstrdup("Plan it.");
+    a.reasoning = server_xstrdup("Plan it.");
     qwen_test_call(&a, "call_1", "bash", "{\"cmd\":\"ls   -la\"}");
     qwen_test_call(&a, "call_2", "bash", "{\"n\":\"007\"}");
-    a.calls.raw_calls = xstrdup(calls);
+    a.calls.raw_calls = server_xstrdup(calls);
     chat_msgs_push(&msgs, a);
     chat_msgs_push(&msgs, qwen_test_msg("tool", "ok"));
     char *text = nemotron_test_full_render(&msgs, NULL);
@@ -4643,14 +4643,14 @@ static void test_nemotron_forced_call_prefill_and_seed(void) {
         const bool thinking_off = off == 1;
         chat_conversation c = {};
         chat_msgs_push(&c.msgs, qwen_test_msg("user", "Search for pulsars."));
-        c.tools_raw = xstrdup("[{\"type\":\"function\",\"function\":{\"name\":\"search\",\"parameters\":{\"type\":\"object\","
+        c.tools_raw = server_xstrdup("[{\"type\":\"function\",\"function\":{\"name\":\"search\",\"parameters\":{\"type\":\"object\","
                               "\"properties\":{\"q\":{\"type\":\"string\"}}}}}]");
         c.tool_choice = CHAT_TOOL_CHOICE_NAMED;
-        if (thinking_off) chat_conversation_control(&c, "enable_thinking", xstrdup("false"));
+        if (thinking_off) chat_conversation_control(&c, "enable_thinking", server_xstrdup("false"));
         request r;
         test_request_init(&r, REQ_CHAT, 128);
         r.api = API_OPENAI;
-        r.forced_tool_name = xstrdup("search");
+        r.forced_tool_name = server_xstrdup("search");
         tool_schema_orders_add_json(&r.tool_orders, "{\"name\":\"search\",\"parameters\":{\"type\":\"object\","
                                                     "\"properties\":{\"q\":{\"type\":\"string\"}}}}");
         char err[200] = {0};
@@ -4797,7 +4797,7 @@ static char *anthropic_test_render(const char *body, pulsar_chat_format fmt, std
                     render_chat_conversation(NULL, fmt, NULL, &c, &r, err, sizeof err);
     if (!ok) fprintf(stderr, "anthropic render refused: %s\n", err);
     TEST_ASSERT(ok);
-    char *text = ok ? xstrdup(r.prompt_text) : NULL;
+    char *text = ok ? server_xstrdup(r.prompt_text) : NULL;
     if (ok && spans) spans->assign(r.prompt_spans, r.prompt_spans + r.prompt_n_spans);
     chat_conversation_free(&c);
     request_free(&r);
@@ -4865,11 +4865,11 @@ static void test_live_tail_joins_before_a_committed_stop(void) {
     chat_msgs_push(&full, qwen_test_msg("system", "Be terse."));
     chat_msgs_push(&full, qwen_test_msg("user", "List the files."));
     chat_msg a = qwen_test_msg("assistant", "Listing.");
-    a.reasoning = xstrdup("Use ls.");
+    a.reasoning = server_xstrdup("Use ls.");
     qwen_test_call(&a, "toolu_1", "bash", "{\"command\":\"ls\"}");
     chat_msgs_push(&full, a);
     chat_msgs_push(&full, qwen_test_msg("tool", "a.txt\nb.txt"));
-    full.v[3].tool_call_id = xstrdup("toolu_1");
+    full.v[3].tool_call_id = server_xstrdup("toolu_1");
 
     request r;
     test_request_init(&r, REQ_CHAT, 128);
@@ -4934,17 +4934,17 @@ static void test_anthropic_full_replay_allows_unknown_live_id(void) {
 
     chat_msgs msgs = {0};
     chat_msg assistant = {0};
-    assistant.role = xstrdup("assistant");
+    assistant.role = server_xstrdup("assistant");
     tool_call tc = {0};
-    tc.id = xstrdup("toolu_replay");
-    tc.name = xstrdup("Bash");
-    tc.arguments = xstrdup("{\"command\":\"pwd\"}");
+    tc.id = server_xstrdup("toolu_replay");
+    tc.name = server_xstrdup("Bash");
+    tc.arguments = server_xstrdup("{\"command\":\"pwd\"}");
     tool_calls_push(&assistant.calls, tc);
     chat_msgs_push(&msgs, assistant);
 
     chat_msg user = {0};
-    user.role = xstrdup("user");
-    user.content = xstrdup("<tool_result>/tmp</tool_result>");
+    user.role = server_xstrdup("user");
+    user.content = server_xstrdup("<tool_result>/tmp</tool_result>");
     chat_msg_add_tool_call_id(&user, "toolu_replay");
     chat_msgs_push(&msgs, user);
 
@@ -5016,11 +5016,11 @@ static void test_tool_checkpoint_canonicalization_gate_exact_replay(void) {
 
     tool_calls calls = {0};
     tool_call tc = {0};
-    tc.id = xstrdup("call_exact");
-    tc.name = xstrdup("bash");
-    tc.arguments = xstrdup("{}");
+    tc.id = server_xstrdup("call_exact");
+    tc.name = server_xstrdup("bash");
+    tc.arguments = server_xstrdup("{}");
     tool_calls_push(&calls, tc);
-    calls.raw_calls = xstrdup(
+    calls.raw_calls = server_xstrdup(
         "\n\n" PULSAR_TOOL_CALLS_START "\n"
         "<｜DSML｜ invoke name=\"bash\">\n"
         "</｜DSML｜ invoke>\n"
@@ -5045,18 +5045,18 @@ static void test_responses_live_tail_renders_tool_outputs_only(void) {
 
     chat_msgs msgs = {0};
     chat_msg assistant = {0};
-    assistant.role = xstrdup("assistant");
+    assistant.role = server_xstrdup("assistant");
     tool_call tc = {0};
-    tc.id = xstrdup("call_live");
-    tc.name = xstrdup("exec_command");
-    tc.arguments = xstrdup("{\"cmd\":\"pwd\"}");
+    tc.id = server_xstrdup("call_live");
+    tc.name = server_xstrdup("exec_command");
+    tc.arguments = server_xstrdup("{\"cmd\":\"pwd\"}");
     tool_calls_push(&assistant.calls, tc);
     chat_msgs_push(&msgs, assistant);
 
     chat_msg tool = {0};
-    tool.role = xstrdup("tool");
-    tool.tool_call_id = xstrdup("call_live");
-    tool.content = xstrdup("/tmp");
+    tool.role = server_xstrdup("tool");
+    tool.tool_call_id = server_xstrdup("call_live");
+    tool.content = server_xstrdup("/tmp");
     chat_msgs_push(&msgs, tool);
 
     responses_prepare_live_continuation(&r, &msgs);
@@ -5082,9 +5082,9 @@ static void test_responses_tool_output_id_validation(void) {
 
     chat_msgs msgs = {0};
     chat_msg tool = {0};
-    tool.role = xstrdup("tool");
-    tool.tool_call_id = xstrdup("call_missing");
-    tool.content = xstrdup("out");
+    tool.role = server_xstrdup("tool");
+    tool.tool_call_id = server_xstrdup("call_missing");
+    tool.content = server_xstrdup("out");
     chat_msgs_push(&msgs, tool);
 
     char err[160] = {0};
@@ -5118,18 +5118,18 @@ static void test_responses_stateless_tool_replay_requires_reasoning(void) {
 
     chat_msgs msgs = {0};
     chat_msg assistant = {0};
-    assistant.role = xstrdup("assistant");
+    assistant.role = server_xstrdup("assistant");
     tool_call tc = {0};
-    tc.id = xstrdup("call_replay");
-    tc.name = xstrdup("exec_command");
-    tc.arguments = xstrdup("{\"cmd\":\"pwd\"}");
+    tc.id = server_xstrdup("call_replay");
+    tc.name = server_xstrdup("exec_command");
+    tc.arguments = server_xstrdup("{\"cmd\":\"pwd\"}");
     tool_calls_push(&assistant.calls, tc);
     chat_msgs_push(&msgs, assistant);
 
     chat_msg tool = {0};
-    tool.role = xstrdup("tool");
-    tool.tool_call_id = xstrdup("call_replay");
-    tool.content = xstrdup("/tmp");
+    tool.role = server_xstrdup("tool");
+    tool.tool_call_id = server_xstrdup("call_replay");
+    tool.content = server_xstrdup("/tmp");
     chat_msgs_push(&msgs, tool);
 
     char err[160] = {0};
@@ -5159,7 +5159,7 @@ static void test_responses_stateless_tool_replay_requires_reasoning(void) {
     TEST_ASSERT(needs_live_reasoning);
 
     free(msgs.v[0].reasoning);
-    msgs.v[0].reasoning = xstrdup("replayed hidden reasoning");
+    msgs.v[0].reasoning = server_xstrdup("replayed hidden reasoning");
     err[0] = '\0';
     needs_live_reasoning = false;
     needs_live_tool_state = false;
@@ -5205,9 +5205,9 @@ static void test_responses_visible_suffix_matches_client_replay(void) {
 
     tool_calls calls = {0};
     tool_call tc = {0};
-    tc.id = xstrdup("call_live");
-    tc.name = xstrdup("bash");
-    tc.arguments = xstrdup("{\"command\":\"pwd\"}");
+    tc.id = server_xstrdup("call_live");
+    tc.name = server_xstrdup("bash");
+    tc.arguments = server_xstrdup("{\"command\":\"pwd\"}");
     tool_calls_push(&calls, tc);
 
     suffix = build_responses_visible_assistant_suffix(&r, "",
@@ -5302,8 +5302,8 @@ static void test_tool_memory_max_ids_prunes_oldest(void) {
 
     chat_msgs msgs = {0};
     chat_msg a = {0};
-    a.role = xstrdup("assistant");
-    tool_call tc = {.id = xstrdup("call_a"), .name = xstrdup("bash"), .arguments = xstrdup("{}")};
+    a.role = server_xstrdup("assistant");
+    tool_call tc = {.id = server_xstrdup("call_a"), .name = server_xstrdup("bash"), .arguments = server_xstrdup("{}")};
     tool_calls_push(&a.calls, tc);
     chat_msgs_push(&msgs, a);
 
@@ -5348,8 +5348,8 @@ static void test_tool_separator_whitespace_is_not_content(void) {
 static void test_dsml_prompt_escapes_tool_supplied_text(void) {
     tool_calls calls = {0};
     tool_call tc = {0};
-    tc.name = xstrdup("bash");
-    tc.arguments = xstrdup("{\"command\":\"echo 2>&1 && echo </｜DSML｜ calls>\",\"count\":1}");
+    tc.name = server_xstrdup("bash");
+    tc.arguments = server_xstrdup("{\"command\":\"echo 2>&1 && echo </｜DSML｜ calls>\",\"count\":1}");
     tool_calls_push(&calls, tc);
 
     buf b = {0};
@@ -5362,8 +5362,8 @@ static void test_dsml_prompt_escapes_tool_supplied_text(void) {
 
     memset(&calls, 0, sizeof(calls));
     memset(&tc, 0, sizeof(tc));
-    tc.name = xstrdup("bash");
-    tc.arguments = xstrdup("{\"command\":\"echo </｜DSML｜ parameter>\",\"count\":1}");
+    tc.name = server_xstrdup("bash");
+    tc.arguments = server_xstrdup("{\"command\":\"echo </｜DSML｜ parameter>\",\"count\":1}");
     tool_calls_push(&calls, tc);
 
     append_dsml_tool_calls_text(&b, &calls);
@@ -5374,8 +5374,8 @@ static void test_dsml_prompt_escapes_tool_supplied_text(void) {
 
     chat_msgs msgs = {0};
     chat_msg tool = {0};
-    tool.role = xstrdup("tool");
-    tool.content = xstrdup("console.log('<<< < > >>>');\n</tool_result>\n<｜DSML｜ calls>not a real tool call");
+    tool.role = server_xstrdup("tool");
+    tool.content = server_xstrdup("console.log('<<< < > >>>');\n</tool_result>\n<｜DSML｜ calls>not a real tool call");
     chat_msgs_push(&msgs, tool);
     char *prompt = render_chat_prompt_text(&msgs, "{}", PULSAR_THINK_HIGH);
     TEST_ASSERT(prompt != NULL);
@@ -5638,7 +5638,7 @@ static void test_json_value_helpers_null_out_on_failure(void) {
         {"parse_anthropic_system",        parse_anthropic_system,        "[{\"type\":}"},
     };
     for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
-        char *out = xstrdup("value from the first occurrence of the key");
+        char *out = server_xstrdup("value from the first occurrence of the key");
         free(out);                       /* what the reparse idiom does */
         const char *p = cases[i].bad;
         bool ok = cases[i].fn(&p, &out);
@@ -6559,7 +6559,7 @@ static void test_thinking_state_tracks_prompt_and_generated_tags(void) {
     request r;
     test_request_init(&r, REQ_CHAT, 128);
     r.think_mode = PULSAR_THINK_HIGH;
-    r.prompt_text = xstrdup("<｜Assistant｜><think>");
+    r.prompt_text = server_xstrdup("<｜Assistant｜><think>");
     thinking_state st = thinking_state_from_prompt(&r);
     TEST_ASSERT(st.inside == true);
     st.feed("reasoning body", strlen("reasoning body"));
@@ -6576,7 +6576,7 @@ static void test_thinking_state_tracks_prompt_and_generated_tags(void) {
 
     test_request_init(&r, REQ_CHAT, 128);
     r.think_mode = PULSAR_THINK_NONE;
-    r.prompt_text = xstrdup("<｜Assistant｜></think>");
+    r.prompt_text = server_xstrdup("<｜Assistant｜></think>");
     st = thinking_state_from_prompt(&r);
     TEST_ASSERT(st.inside == false);
     request_free(&r);
@@ -7394,13 +7394,13 @@ static void test_kv_tool_map_filters_by_dsml_text(void) {
 
     chat_msgs msgs = {0};
     chat_msg a = {0};
-    a.role = xstrdup("assistant");
-    tool_call keep = {.id = xstrdup("call_keep"), .name = xstrdup("bash"), .arguments = xstrdup("{}")};
+    a.role = server_xstrdup("assistant");
+    tool_call keep = {.id = server_xstrdup("call_keep"), .name = server_xstrdup("bash"), .arguments = server_xstrdup("{}")};
     tool_calls_push(&a.calls, keep);
     chat_msgs_push(&msgs, a);
     chat_msg b = {0};
-    b.role = xstrdup("assistant");
-    tool_call drop = {.id = xstrdup("call_drop"), .name = xstrdup("bash"), .arguments = xstrdup("{}")};
+    b.role = server_xstrdup("assistant");
+    tool_call drop = {.id = server_xstrdup("call_drop"), .name = server_xstrdup("bash"), .arguments = server_xstrdup("{}")};
     tool_calls_push(&b.calls, drop);
     chat_msgs_push(&msgs, b);
     tool_replay_stats stats = {0};
@@ -7466,11 +7466,11 @@ static void test_kv_tool_map_restores_before_prompt_render(void) {
 
     chat_msgs msgs = {0};
     chat_msg a = {0};
-    a.role = xstrdup("assistant");
+    a.role = server_xstrdup("assistant");
     tool_call tc = {0};
-    tc.id = xstrdup("call_disk");
-    tc.name = xstrdup("bash");
-    tc.arguments = xstrdup("{\"command\":\"echo canonical\"}");
+    tc.id = server_xstrdup("call_disk");
+    tc.name = server_xstrdup("bash");
+    tc.arguments = server_xstrdup("{\"command\":\"echo canonical\"}");
     tool_calls_push(&a.calls, tc);
     chat_msgs_push(&msgs, a);
 
@@ -7544,8 +7544,8 @@ static void test_thinking_canonical_empty_content(void) {
      * still be valid: prompt_text[:-7] + "</think><|eos|>" */
     chat_msgs msgs = {0};
     chat_msg user = {0};
-    user.role = xstrdup("user");
-    user.content = xstrdup("Think about life");
+    user.role = server_xstrdup("user");
+    user.content = server_xstrdup("Think about life");
     chat_msgs_push(&msgs, user);
 
     char *prompt_text = render_chat_prompt_text(&msgs, NULL, PULSAR_THINK_HIGH);
@@ -7561,17 +7561,17 @@ static void test_thinking_canonical_empty_content(void) {
     /* Future prompt with empty content assistant message */
     chat_msgs history = {0};
     chat_msg h_u = {0};
-    h_u.role = xstrdup("user");
-    h_u.content = xstrdup("Think about life");
+    h_u.role = server_xstrdup("user");
+    h_u.content = server_xstrdup("Think about life");
     chat_msgs_push(&history, h_u);
     chat_msg h_a = {0};
-    h_a.role = xstrdup("assistant");
-    h_a.reasoning = xstrdup("Deep thoughts about existence...");
-    h_a.content = xstrdup("");
+    h_a.role = server_xstrdup("assistant");
+    h_a.reasoning = server_xstrdup("Deep thoughts about existence...");
+    h_a.content = server_xstrdup("");
     chat_msgs_push(&history, h_a);
     chat_msg h_u2 = {0};
-    h_u2.role = xstrdup("user");
-    h_u2.content = xstrdup("Continue");
+    h_u2.role = server_xstrdup("user");
+    h_u2.content = server_xstrdup("Continue");
     chat_msgs_push(&history, h_u2);
 
     char *future = render_chat_prompt_text(&history, NULL, PULSAR_THINK_HIGH);
@@ -7596,17 +7596,17 @@ static void test_thinking_canonical_multi_turn(void) {
      * matches the start of a 3rd-turn future prompt. */
     chat_msgs turn2_prefix = {0};
     chat_msg u1 = {0};
-    u1.role = xstrdup("user");
-    u1.content = xstrdup("Hello");
+    u1.role = server_xstrdup("user");
+    u1.content = server_xstrdup("Hello");
     chat_msgs_push(&turn2_prefix, u1);
     chat_msg a1 = {0};
-    a1.role = xstrdup("assistant");
-    a1.reasoning = xstrdup("first reasoning");
-    a1.content = xstrdup("Hi there");
+    a1.role = server_xstrdup("assistant");
+    a1.reasoning = server_xstrdup("first reasoning");
+    a1.content = server_xstrdup("Hi there");
     chat_msgs_push(&turn2_prefix, a1);
     chat_msg u2 = {0};
-    u2.role = xstrdup("user");
-    u2.content = xstrdup("How are you?");
+    u2.role = server_xstrdup("user");
+    u2.content = server_xstrdup("How are you?");
     chat_msgs_push(&turn2_prefix, u2);
 
     /* prompt_text for the 2nd generation (includes 1st assistant turn) */
@@ -7628,19 +7628,19 @@ static void test_thinking_canonical_multi_turn(void) {
 
     /* Future: 3rd user message arrives */
     chat_msgs future_msgs = {0};
-    chat_msg fu1 = {0}; fu1.role = xstrdup("user"); fu1.content = xstrdup("Hello");
+    chat_msg fu1 = {0}; fu1.role = server_xstrdup("user"); fu1.content = server_xstrdup("Hello");
     chat_msgs_push(&future_msgs, fu1);
-    chat_msg fa1 = {0}; fa1.role = xstrdup("assistant");
-    fa1.reasoning = xstrdup("first reasoning");
-    fa1.content = xstrdup("Hi there");
+    chat_msg fa1 = {0}; fa1.role = server_xstrdup("assistant");
+    fa1.reasoning = server_xstrdup("first reasoning");
+    fa1.content = server_xstrdup("Hi there");
     chat_msgs_push(&future_msgs, fa1);
-    chat_msg fu2 = {0}; fu2.role = xstrdup("user"); fu2.content = xstrdup("How are you?");
+    chat_msg fu2 = {0}; fu2.role = server_xstrdup("user"); fu2.content = server_xstrdup("How are you?");
     chat_msgs_push(&future_msgs, fu2);
-    chat_msg fa2 = {0}; fa2.role = xstrdup("assistant");
-    fa2.reasoning = xstrdup("second reasoning");
-    fa2.content = xstrdup(content2);
+    chat_msg fa2 = {0}; fa2.role = server_xstrdup("assistant");
+    fa2.reasoning = server_xstrdup("second reasoning");
+    fa2.content = server_xstrdup(content2);
     chat_msgs_push(&future_msgs, fa2);
-    chat_msg fu3 = {0}; fu3.role = xstrdup("user"); fu3.content = xstrdup("Great");
+    chat_msg fu3 = {0}; fu3.role = server_xstrdup("user"); fu3.content = server_xstrdup("Great");
     chat_msgs_push(&future_msgs, fu3);
 
     char *future = render_chat_prompt_text(&future_msgs, NULL, PULSAR_THINK_HIGH);
@@ -7669,8 +7669,8 @@ static void test_thinking_canonical_with_tools_preserves_reasoning(void) {
 
     chat_msgs msgs = {0};
     chat_msg u = {0};
-    u.role = xstrdup("user");
-    u.content = xstrdup("run ls");
+    u.role = server_xstrdup("user");
+    u.content = server_xstrdup("run ls");
     chat_msgs_push(&msgs, u);
 
     char *prompt_text = render_chat_prompt_text(&msgs, tool_schemas, PULSAR_THINK_HIGH);
@@ -7679,13 +7679,13 @@ static void test_thinking_canonical_with_tools_preserves_reasoning(void) {
 
     /* With tools, next render KEEPS reasoning */
     chat_msgs history = {0};
-    chat_msg hu = {0}; hu.role = xstrdup("user"); hu.content = xstrdup("run ls");
+    chat_msg hu = {0}; hu.role = server_xstrdup("user"); hu.content = server_xstrdup("run ls");
     chat_msgs_push(&history, hu);
-    chat_msg ha = {0}; ha.role = xstrdup("assistant");
-    ha.reasoning = xstrdup("I should run bash");
-    ha.content = xstrdup("Here you go");
+    chat_msg ha = {0}; ha.role = server_xstrdup("assistant");
+    ha.reasoning = server_xstrdup("I should run bash");
+    ha.content = server_xstrdup("Here you go");
     chat_msgs_push(&history, ha);
-    chat_msg hu2 = {0}; hu2.role = xstrdup("user"); hu2.content = xstrdup("thanks");
+    chat_msg hu2 = {0}; hu2.role = server_xstrdup("user"); hu2.content = server_xstrdup("thanks");
     chat_msgs_push(&history, hu2);
 
     char *future = render_chat_prompt_text(&history, tool_schemas, PULSAR_THINK_HIGH);
@@ -7707,8 +7707,8 @@ static void test_thinking_canonical_non_thinking_mode_noop(void) {
      * (early return on memcmp check). */
     chat_msgs msgs = {0};
     chat_msg u = {0};
-    u.role = xstrdup("user");
-    u.content = xstrdup("Hello");
+    u.role = server_xstrdup("user");
+    u.content = server_xstrdup("Hello");
     chat_msgs_push(&msgs, u);
 
     char *prompt_text = render_chat_prompt_text(&msgs, NULL, PULSAR_THINK_NONE);
@@ -8155,7 +8155,7 @@ static void test_l325_deferred_tool_in_place(void) {
             if (!ok) fprintf(stderr, "l325 fmt %d body %d: %s\n", (int)fmt, k, err);
             TEST_ASSERT(ok);
             if (ok) {
-                text[k] = xstrdup(r.prompt_text);
+                text[k] = server_xstrdup(r.prompt_text);
                 TEST_ASSERT(tool_call_declared(&r, "TaskStop", NULL, 0) == (k == 1));
                 if (fmt != PULSAR_CHAT_DS4_V41) TEST_ASSERT(k == 0 || (r.tools_json && strstr(r.tools_json, "TaskStop")));
             }
@@ -8217,7 +8217,7 @@ static void test_l326_responses_tool_search_in_place(void) {
             if (!ok) fprintf(stderr, "l326 fmt %d body %d: %s\n", (int)fmt, k, err);
             TEST_ASSERT(ok);
             if (ok) {
-                text[k] = xstrdup(r.prompt_text);
+                text[k] = server_xstrdup(r.prompt_text);
                 TEST_ASSERT(tool_call_declared(&r, "get_weather", NULL, 0) == (k == 1));
                 TEST_ASSERT(tool_call_declared(&r, "bash", NULL, 0));
             }
@@ -8479,7 +8479,7 @@ static void test_slot_writer_stall_times_out(void) {
 
 static char *test_env_save(const char *name) {
     const char *v = getenv(name);
-    return v ? xstrdup(v) : NULL;
+    return v ? server_xstrdup(v) : NULL;
 }
 
 static void test_env_restore(const char *name, char *saved) {
@@ -8931,7 +8931,7 @@ static void test_l179_park_live_bank_only_when_not_in_quantum(void) {
     TEST_ASSERT(!park_live_bank_needed(3, pool, holey, 2, NULL));
 }
 
-/* L179 branch 2 -- worker_main's lane select (w_decode_lane). Invariant:
+/* L179 branch 2 -- server_worker_main's lane select (w_decode_lane). Invariant:
  * lane 0 with no decoders; lane 3 (spec-batched) iff the drafter is loaded,
  * no decoder has joined a plain batch (n_batched == 0) and EVERY decoder has
  * spec enabled; lane 2 (plain batched) otherwise, including the L118 batch of
@@ -8988,7 +8988,7 @@ static void test_l179_lane_select_spec_needs_every_decoder(void) {
 }
 
 
-/* L284 -- worker_main's spec-lane eligibility (server_spec_lane_carries), the gate on the priced choice and the
+/* L284 -- server_worker_main's spec-lane eligibility (server_spec_lane_carries), the gate on the priced choice and the
  * batch leave. Invariant: the spec lane could carry the decoders exactly when the lane pick would then take lane 3
  * once they leave the plain batch -- the drafter runs, they number no more than the family's verify rows (one base
  * row each), and each speculates -- so decoders a wider load pushed to the plain batch may rejoin speculation once
@@ -9527,17 +9527,17 @@ static void test_l184_dsml_entity_pair_round_trips(void) {
 
 static chat_msg l185_msg(const char *role, const char *content, const char *reasoning) {
     chat_msg m = {0};
-    m.role = xstrdup(role);
-    m.content = content ? xstrdup(content) : NULL;
-    m.reasoning = reasoning ? xstrdup(reasoning) : NULL;
+    m.role = server_xstrdup(role);
+    m.content = content ? server_xstrdup(content) : NULL;
+    m.reasoning = reasoning ? server_xstrdup(reasoning) : NULL;
     return m;
 }
 
 static void l185_add_call(chat_msg *m, const char *id, const char *name, const char *args) {
     tool_call tc = {0};
-    tc.id = xstrdup(id);
-    tc.name = xstrdup(name);
-    tc.arguments = xstrdup(args);
+    tc.id = server_xstrdup(id);
+    tc.name = server_xstrdup(name);
+    tc.arguments = server_xstrdup(args);
     tool_calls_push(&m->calls, tc);
 }
 
@@ -9570,7 +9570,7 @@ static void test_l185_every_renderer_produces_the_authority_bytes(void) {
     l185_add_call(&call, "call_1", "bash", "{\"command\":\"ls /tmp\"}");
     chat_msgs_push(&msgs, call);
     chat_msg result = l185_msg("tool", "a.txt\nb.txt", NULL);                /* 5 */
-    result.tool_call_id = xstrdup("call_1");
+    result.tool_call_id = server_xstrdup("call_1");
     chat_msgs_push(&msgs, result);
     chat_msgs_push(&msgs, l185_msg("assistant", "two files", "read it"));    /* 6 */
     chat_msgs_push(&msgs, l185_msg("user", "thanks", NULL));                 /* 7 */
@@ -9783,16 +9783,16 @@ static void test_l192_tool_history_validation_is_nearest_preceding(void) {
     l185_add_call(&a0, "call_a", "bash", "{}");
     chat_msgs_push(&msgs, a0);                                   /* 0: declares call_a WITH reasoning */
     chat_msg t1 = l185_msg("tool", "out", NULL);
-    t1.tool_call_id = xstrdup("call_a");
+    t1.tool_call_id = server_xstrdup("call_a");
     chat_msgs_push(&msgs, t1);                                   /* 1 */
     chat_msg a2 = l185_msg("assistant", "", NULL);
     l185_add_call(&a2, "call_a", "bash", "{}");
     chat_msgs_push(&msgs, a2);                                   /* 2: re-declares call_a WITHOUT reasoning */
     chat_msg t3 = l185_msg("tool", "out2", NULL);
-    t3.tool_call_id = xstrdup("call_a");
+    t3.tool_call_id = server_xstrdup("call_a");
     chat_msgs_push(&msgs, t3);                                   /* 3: nearest preceding is 2 */
     chat_msg t4 = l185_msg("tool", "out3", NULL);
-    t4.tool_call_id = xstrdup("call_b");
+    t4.tool_call_id = server_xstrdup("call_b");
     chat_msgs_push(&msgs, t4);                                   /* 4: call_b is declared only later */
     chat_msg a5 = l185_msg("assistant", "", NULL);
     l185_add_call(&a5, "call_b", "bash", "{}");
@@ -11954,7 +11954,7 @@ static void test_l335_request_without_family_dies_at_enqueue(void) {
             memset(&j, 0, sizeof j);
             request_init(&j.req, REQ_CHAT, 16);
             if (c == 1) j.req.family = server_family_for_format(PULSAR_CHAT_QWEN);       /* no model */
-            if (c == 2) j.req.model = xstrdup("m");                                     /* no family */
+            if (c == 2) j.req.model = server_xstrdup("m");                                     /* no family */
             s.enqueue(&j);
         }) == 1);
     }
@@ -11977,7 +11977,7 @@ enum { L334_CTL, L334_X, L334_A, L334_B, L334_C, L334_D, L334_AB, L334_ABC, L334
 static char *l334_text(void *, int token, size_t *len) {
     const char *t = token == L334_CTL ? "" : l334_vocab[token];
     *len = strlen(t);
-    return xstrdup(t);
+    return server_xstrdup(t);
 }
 
 /* L334 fix: what a state at live position G serves of the request across a token seam -- the conversion both the

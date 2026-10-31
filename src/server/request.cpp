@@ -59,7 +59,7 @@ bool request_apply_forced_tool_prefill(request *r, char *err, size_t errlen) {
         }
     } else if (r->tool_orders.len == 1 && r->tool_orders.v[0].name) {
         free(r->forced_tool_name);
-        r->forced_tool_name = xstrdup(r->tool_orders.v[0].name);
+        r->forced_tool_name = server_xstrdup(r->tool_orders.v[0].name);
     }
     buf pt = {0};
     const char *base = r->prompt_text;
@@ -152,7 +152,7 @@ void tool_calls_push(tool_calls *calls, tool_call tc) {
 /// @param id the id (NULL or empty: no-op)
 void chat_msg_add_tool_call_id(chat_msg *m, const char *id) {
     if (!m || !id || !id[0]) return;
-    if (!m->tool_call_id) m->tool_call_id = xstrdup(id);
+    if (!m->tool_call_id) m->tool_call_id = server_xstrdup(id);
     for (int i = 0; i < m->tool_call_ids_len; i++) {
         if (m->tool_call_ids[i] && !strcmp(m->tool_call_ids[i], id)) return;
     }
@@ -161,7 +161,7 @@ void chat_msg_add_tool_call_id(chat_msg *m, const char *id) {
         m->tool_call_ids = (char **)server_xrealloc(m->tool_call_ids,
             (size_t)m->tool_call_ids_cap * sizeof(m->tool_call_ids[0]));
     }
-    m->tool_call_ids[m->tool_call_ids_len++] = xstrdup(id);
+    m->tool_call_ids[m->tool_call_ids_len++] = server_xstrdup(id);
 }
 
 
@@ -236,7 +236,7 @@ void chat_msg_add_tool_ref(chat_msg *m, size_t off, const char *name) {
         m->tool_ref_name = (char **)server_xrealloc(m->tool_ref_name, (size_t)m->tool_refs_cap * sizeof(char *));
     }
     m->tool_ref_off[m->tool_refs_len] = off;
-    m->tool_ref_name[m->tool_refs_len] = xstrdup(name ? name : "");
+    m->tool_ref_name[m->tool_refs_len] = server_xstrdup(name ? name : "");
     m->tool_refs_len++;
 }
 
@@ -1212,7 +1212,7 @@ static char *responses_namespace_function_schema_from_tool(const char *raw,
                  "{\"type\":\"object\",\"properties\":{}}");
         buf_putc(&b, '}');
         out = buf_take(&b);
-        if (wire_name) *wire_name = xstrdup(name);
+        if (wire_name) *wire_name = server_xstrdup(name);
         buf_free(&prompt_name);
     }
 
@@ -1332,8 +1332,8 @@ static void tool_schema_orders_add_json_wire(tool_schema_orders *orders,
         json_ws(&p);
     }
     if (order.name) {
-        if (tool_namespace && tool_namespace[0]) order.tool_namespace = xstrdup(tool_namespace);
-        if (wire_name && wire_name[0]) order.wire_name = xstrdup(wire_name);
+        if (tool_namespace && tool_namespace[0]) order.tool_namespace = server_xstrdup(tool_namespace);
+        if (wire_name && wire_name[0]) order.wire_name = server_xstrdup(wire_name);
         order.responses_tool_search = responses_tool_search;
         tool_schema_orders_push(orders, order);
         memset(&order, 0, sizeof(order));
@@ -1635,7 +1635,7 @@ bool parse_tools_value(const char **p, char **out, tool_schema_orders *orders, c
     int index = 0;
     json_ws(p);
     if (json_lit(p, "null")) {
-        *out = xstrdup("");
+        *out = server_xstrdup("");
         return true;
     }
     if (**p != '[') return false;
@@ -1826,7 +1826,7 @@ static bool parse_chat_content(const char **p, chat_msg *msg, char *err, size_t 
     }
     if (json_lit(p, "null")) {
         free(msg->content);
-        msg->content = xstrdup("");
+        msg->content = server_xstrdup("");
         return true;
     }
     if (**p != '[') {
@@ -1869,7 +1869,7 @@ static bool parse_chat_content(const char **p, chat_msg *msg, char *err, size_t 
                     free(text);
                     json_ws(p);
                     if (json_lit(p, "null")) {
-                        text = xstrdup("");
+                        text = server_xstrdup("");
                     } else if (!json_string(p, &text)) {
                         free(key);
                         goto block_fail;
@@ -2046,8 +2046,8 @@ bool parse_messages(const char **p, chat_msgs *msgs, char *err, size_t errlen) {
         }
         if (**p != '}') goto fail;
         (*p)++;
-        if (!msg.role) msg.role = xstrdup("user");
-        if (!msg.content) msg.content = xstrdup("");
+        if (!msg.role) msg.role = server_xstrdup("user");
+        if (!msg.content) msg.content = server_xstrdup("");
         chat_msgs_push(msgs, msg);
         memset(&msg, 0, sizeof(msg));
         json_ws(p);
@@ -2162,7 +2162,7 @@ static bool anthropic_tool_result_read(chat_msg *part, const char *content_raw, 
     }
     free(part->content);
     part->content = buf_take(&out);
-    if (!part->content) part->content = xstrdup("");
+    if (!part->content) part->content = server_xstrdup("");
     return true;
 fail:
     buf_free(&out);
@@ -2365,7 +2365,7 @@ static bool parse_anthropic_content_block(const char **p, chat_msgs *parts, chat
             goto bad;
         }
         chat_msg part = {0};
-        part.role = xstrdup("tool");
+        part.role = server_xstrdup("tool");
         part.anthropic_continues = parts->len > 0;
         chat_msg_add_tool_call_id(&part, id);
         if (!anthropic_tool_result_read(&part, content_raw, err, errlen)) {
@@ -2375,9 +2375,9 @@ static bool parse_anthropic_content_block(const char **p, chat_msgs *parts, chat
         chat_msgs_push(parts, part);
     } else if (type && !strcmp(type, "tool_use")) {
         tool_call tc = {0};
-        tc.id = id ? xstrdup(id) : NULL;
-        tc.name = name ? xstrdup(name) : xstrdup("");
-        tc.arguments = input ? xstrdup(input) : xstrdup("{}");
+        tc.id = id ? server_xstrdup(id) : NULL;
+        tc.name = name ? server_xstrdup(name) : server_xstrdup("");
+        tc.arguments = input ? server_xstrdup(input) : server_xstrdup("{}");
         tool_calls_push(&msg->calls, tc);
     } else if (type && !strcmp(type, "image")) {
         if (!source_type) {
@@ -2457,7 +2457,7 @@ static bool parse_anthropic_content_block(const char **p, chat_msgs *parts, chat
     } else if (type && !strcmp(type, "tool_reference")) {
         /* Tool search loaded this tool.  L325: only its position is read here (the tools array may follow the
          * messages); chat_expand_tool_refs writes the definition, or a notice, there before the family renders. */
-        if (!msg->content) msg->content = xstrdup("");
+        if (!msg->content) msg->content = server_xstrdup("");
         chat_msg_add_tool_ref(msg, strlen(msg->content), tool_name ? tool_name : "(unnamed)");
     } else if (type && !strcmp(type, "redacted_thinking")) {
         /* Encrypted reasoning only Anthropic's API can read.  It arrives only
@@ -2605,8 +2605,8 @@ bool parse_anthropic_messages(const char **p, chat_msgs *msgs, char *err, size_t
         if (parts.len == 0) anthropic_text_part(&parts);
         for (int i = 0; i < parts.len; i++) {
             chat_msg *m = &parts.v[i];
-            if (!m->role) m->role = xstrdup(role ? role : "user");
-            if (!m->content) m->content = xstrdup("");
+            if (!m->role) m->role = server_xstrdup(role ? role : "user");
+            if (!m->content) m->content = server_xstrdup("");
             chat_msgs_push(msgs, *m);
         }
         free(parts.v);
@@ -2705,12 +2705,12 @@ bool parse_anthropic_system(const char **p, char **out) {
         return true;
     }
     if (json_lit(p, "null")) {
-        *out = xstrdup("");
+        *out = server_xstrdup("");
         return true;
     }
     if (**p != '[') {
         if (!json_skip_value(p)) return false;
-        *out = xstrdup("");
+        *out = server_xstrdup("");
         return true;
     }
     (*p)++;
