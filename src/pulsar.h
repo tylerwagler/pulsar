@@ -1384,7 +1384,7 @@ typedef struct {
  *  @param reqs n rows, one per bank
  *  @param n the row count
  *  @param logits receives n rows of pulsar_engine_logits_width floats
- *  @param logits_cap floats at logits
+ *  @param logits_cap the TOTAL float capacity of logits (all rows, not one row)
  *  @param err receives the failure
  *  @param errlen bytes at err
  *  @return 0, 1 (rejected, nothing mutated) or -1 (fatal; tear the session down) */
@@ -1425,7 +1425,7 @@ int pulsar_session_decode_multiseq(pulsar_session *s, const pulsar_multiseq_req 
  *  @param reqs n_rows rows, each bank's rows contiguous
  *  @param n_rows the row count
  *  @param logits receives the headed rows
- *  @param logits_cap floats at logits
+ *  @param logits_cap the TOTAL float capacity of logits (all rows, not one row)
  *  @param out_n_rows receives the rows written; may be NULL
  *  @param max_head_runs runs to head (0 = all; PULSAR_MSEQ_HEAD_ALL_ROWS = every row)
  *  @param err receives the failure
@@ -1464,7 +1464,7 @@ typedef struct {
  *  @param n_rows the row count
  *  @param shape the decode / prefill split and the head flags
  *  @param logits receives the headed rows
- *  @param logits_cap floats at logits
+ *  @param logits_cap the TOTAL float capacity of logits (all rows, not one row)
  *  @param out_n_rows receives n_dec + the headed runs
  *  @param err receives the failure
  *  @param errlen bytes at err

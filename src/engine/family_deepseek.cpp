@@ -217,7 +217,7 @@ static int ds4_eval_row(pulsar_session *s, int token, char *err, size_t errlen) 
 /// @param reqs [n] requests
 /// @param n rows
 /// @param[out] logits rows
-/// @param logits_cap capacity
+/// @param logits_cap the TOTAL float capacity of `logits` (all rows, not one row)
 /// @param err message buffer
 /// @param errlen its size
 /// @return the session method's
@@ -231,7 +231,7 @@ static int ds4_decode_multiseq(pulsar_session *s, const pulsar_multiseq_req *req
 /// @param reqs requests
 /// @param n_rows rows
 /// @param[out] logits rows
-/// @param logits_cap capacity
+/// @param logits_cap the TOTAL float capacity of `logits` (all rows, not one row)
 /// @param[out] out_n_rows rows headed
 /// @param max_head_runs prompt runs headed at most
 /// @param err message buffer
@@ -254,7 +254,7 @@ static void ds4_invalidate(pulsar_session *s) { s->rewind(0); }
 /// @param n_rows rows
 /// @param shape the step's shape
 /// @param[out] logits rows
-/// @param logits_cap capacity
+/// @param logits_cap the TOTAL float capacity of `logits` (all rows, not one row)
 /// @param[out] out_n_rows rows headed
 /// @param err message buffer
 /// @param errlen its size

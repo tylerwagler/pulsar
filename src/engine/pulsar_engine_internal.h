@@ -3413,7 +3413,7 @@ struct pulsar_session {
      * @param reqs        one entry per participating bank
      * @param n           entries in `reqs`
      * @param logits      receives one row per request, in `reqs` order
-     * @param logits_cap  floats per row
+     * @param logits_cap  the TOTAL float capacity of `logits` (all rows: >= n x the logits width)
      * @param err         failure message buffer
      * @param errlen      its size
      * @return 0 on success. */
@@ -3425,7 +3425,7 @@ struct pulsar_session {
      * @param reqs           the rows to evaluate, any mix of banks and lengths
      * @param n_rows         entries in `reqs`
      * @param logits         receives the output-head rows
-     * @param logits_cap     floats per row
+     * @param logits_cap     the TOTAL float capacity of `logits` (all rows: >= the headed rows x the logits width)
      * @param out_n_rows     rows actually produced
      * @param max_head_runs  caps how many separate output-head runs the step performs
      * @param err            failure message buffer
@@ -3439,7 +3439,7 @@ struct pulsar_session {
     /// @param n_rows      entries in `reqs`, <= the session's prefill_cap
     /// @param shape       decode rows, prefill runs and which runs are headed
     /// @param logits      receives (n_dec + headed runs) rows, or NULL
-    /// @param logits_cap  its capacity, in floats
+    /// @param logits_cap  the TOTAL float capacity of `logits` (all rows: >= (n_dec + headed runs) x the logits width)
     /// @param out_n_rows  out: rows produced
     /// @param err         failure message buffer
     /// @param errlen      its size
@@ -6147,7 +6147,7 @@ static inline uint32_t pulsar_fused_shape_heads(const pulsar_fused_shape *sh) {
 /// @param n_rows rows
 /// @param shape the step's shape
 /// @param[out] logits the headed rows
-/// @param logits_cap rows logits holds
+/// @param logits_cap the TOTAL float capacity of `logits` (all rows: >= the headed rows x the logits width)
 /// @param[out] out_n_rows rows headed
 /// @param err message buffer
 /// @param errlen its size

@@ -220,10 +220,11 @@ typedef struct {
      *  s->logits -- the family's forward only: the core's eval (pulsar_session_family_eval) checks the context, the
      *  id and the state's agreement with the view before, and records the token after.  0 = decoded. */
     int (*eval_row)(pulsar_session *s, int token, char *err, size_t errlen);
-    /** One decode row per request (each on its own bank). */
+    /** One decode row per request (each on its own bank).  `logits_cap` (here and in decode_mixed / decode_fused)
+     *  is the TOTAL float capacity of `logits` -- every row the step heads -- as pulsar.h's entries say. */
     int (*decode_multiseq)(pulsar_session *s, const pulsar_multiseq_req *reqs, uint32_t n,
                            float *logits, int logits_cap, char *err, size_t errlen);
-    /** Decode rows and prefill runs in one step. */
+    /** Decode rows and prefill runs in one step (`logits_cap`: the TOTAL float capacity of `logits`). */
     int (*decode_mixed)(pulsar_session *s, const pulsar_multiseq_req *reqs, uint32_t n_rows,
                         float *logits, int logits_cap, uint32_t *out_n_rows,
                         uint32_t max_head_runs, char *err, size_t errlen);

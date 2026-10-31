@@ -542,7 +542,7 @@ int pulsar_driver_eval_row(pulsar_session *s, int token, char *err, size_t errle
  *  @param reqs       [n] the rows
  *  @param n          rows, <= PULSAR_DRIVER_HEADS_MAX and the driver's max_rows
  *  @param logits     receives n rows of the logits width, or NULL (the rows stay on the device)
- *  @param logits_cap capacity of `logits` in floats, >= n x the logits width
+ *  @param logits_cap the TOTAL float capacity of `logits` (all rows: >= n x the logits width)
  *  @param err        receives the failure when non-NULL
  *  @param errlen     bytes of `err`
  *  @return 0, or 1 when refused */
@@ -630,7 +630,7 @@ static bool driver_verify_rows(pulsar_session *s, const pulsar_multiseq_req *req
 /// @param reqs          [n_rows] the rows
 /// @param n_rows        rows
 /// @param logits        receives the headed rows, or NULL
-/// @param logits_cap    capacity of `logits` in floats
+/// @param logits_cap    the TOTAL float capacity of `logits` (all rows: >= n_rows x the logits width)
 /// @param out_n_rows    receives the headed row count (may be NULL)
 /// @param max_head_runs 0 = one row per bank (the batched decode), PULSAR_MSEQ_HEAD_ALL_ROWS = the verify
 /// @param err           receives the failure when non-NULL
@@ -690,7 +690,7 @@ int pulsar_driver_decode_mixed(pulsar_session *s, const pulsar_multiseq_req *req
 /// @param n_rows     rows, <= the driver's max_rows
 /// @param shape      the step's shape
 /// @param logits     receives the headed rows, or NULL
-/// @param logits_cap capacity of `logits` in floats
+/// @param logits_cap the TOTAL float capacity of `logits` (all rows: >= (n_dec + headed runs) x the logits width)
 /// @param out_n_rows receives n_dec + the headed runs (may be NULL)
 /// @param err        receives the failure when non-NULL
 /// @param errlen     bytes of `err`
