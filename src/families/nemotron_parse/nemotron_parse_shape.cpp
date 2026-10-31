@@ -12,7 +12,7 @@ const pulsar_nemotron_parse_shape PULSAR_NEMOTRON_PARSE_SHAPE = {
     /* vit  */ 1152, 27, 16, 72, 4304, 16, 10, 128, 1e-6f,
     /* neck */ 1024, 4, 1e-6f,
     /* dec  */ 1024, 10, 16, 8, 4096, 72512, 1e-5f, 32.0f,
-    /* ids  */ 16384, 0, 2, 1,
+    /* ids  */ 16384, 2,
     /* page */ 2048, 1664, 16, 64,
     /* mean */ {0.48145466f, 0.4578275f, 0.40821073f},
     /* std  */ {0.26862954f, 0.26130258f, 0.27577711f},
@@ -25,22 +25,27 @@ const pulsar_nemotron_parse_shape PULSAR_NEMOTRON_PARSE_SHAPE = {
 
 namespace {
 
-/** How a fact is read: an unsigned integer, a float, or a string (the prompt). */
-enum np_kind : uint8_t { K_U32, K_F32, K_STR };
+/** How a fact is read: an unsigned integer, a float, a string (the prompt), or an unsigned integer checked against
+ *  the table's pin and not stored (a fact the container carries that nothing reads: bos, pad). */
+enum np_kind : uint8_t { K_U32, K_F32, K_STR, K_PIN };
 /** One fact of the table: the container key, its kind, and its field in the shape. */
 struct np_key {
     /// the container key
     const char *key;
     /// how it is read
     np_kind kind;
-    /// the field's offset in pulsar_nemotron_parse_shape
+    /// the field's offset in pulsar_nemotron_parse_shape (K_PIN: none, 0)
     size_t off;
+    /// K_PIN: the value the container must carry
+    uint32_t pin;
 };
 
 /// A u32 fact read into field `f`.
 #define U(k, f) {"nemotron_parse." k, K_U32, offsetof(pulsar_nemotron_parse_shape, f)}
 /// An f32 fact read into field `f`.
 #define F(k, f) {"nemotron_parse." k, K_F32, offsetof(pulsar_nemotron_parse_shape, f)}
+/// A u32 fact pinned to `v` and not stored.
+#define PIN(k, v) {"nemotron_parse." k, K_PIN, 0, v}
 /// The ONE list of facts the family reads; every one is required and pinned to the profile.
 const np_key k_keys[] = {
     U("vit.width", vit_width), U("vit.depth", vit_depth), U("vit.heads", vit_heads), U("vit.head_dim", vit_head_dim),
@@ -49,7 +54,9 @@ const np_key k_keys[] = {
     U("neck.width", neck_width), U("neck.merge", merge), F("neck.norm_eps", neck_eps),
     U("dec.width", width), U("dec.layers", n_layer), U("dec.heads", heads), U("dec.kv_heads", kv_heads),
     U("dec.ffn", ffn), U("dec.vocab", vocab), F("dec.norm_eps", eps), F("dec.embed_scale", embed_scale),
-    U("max_sequence", max_seq), U("bos", bos), U("eos", eos), U("pad", pad),
+    /* bos (0) and pad (1) are pinned and not stored: the default prompt spells its own `<s>`, and nothing pads (one
+     * page per call) */
+    U("max_sequence", max_seq), PIN("bos", 0), U("eos", eos), PIN("pad", 1),
     U("image.canvas_h", canvas_h), U("image.canvas_w", canvas_w), U("image.align_h", align_h),
     U("image.align_w", align_w),
     F("image.mean.0", mean[0]), F("image.mean.1", mean[1]), F("image.mean.2", mean[2]),
@@ -59,6 +66,7 @@ const np_key k_keys[] = {
 };
 #undef U
 #undef F
+#undef PIN
 
 /** Say one fact refusal and count it (pulsar_load_refuse).
  *  @param fmt   a printf format taking two strings: `key`, then `more`
@@ -97,17 +105,19 @@ bool pulsar_nemotron_parse_read_shape(const pulsar_model *m, pulsar_nemotron_par
         const uint8_t *want = (const uint8_t *)&PULSAR_NEMOTRON_PARSE_SHAPE + d.off;
         char why[200] = "";
         switch (d.kind) {
-        case K_U32: {
+        case K_U32:
+        case K_PIN: {
             uint64_t v = 0;
             if (!model_get_u64_compat(m, d.key, &v)) {
                 ok = refuse("required key %s is missing or not an integer%s", d.key);
                 break;
             }
-            if (v != *(const uint32_t *)want) {
-                snprintf(why, sizeof why, " = %llu; the profile has %u", (unsigned long long)v, *(const uint32_t *)want);
+            const uint32_t pinned = d.kind == K_PIN ? d.pin : *(const uint32_t *)want;
+            if (v != pinned) {
+                snprintf(why, sizeof why, " = %llu; the profile has %u", (unsigned long long)v, pinned);
                 ok = refuse("%s%s", d.key, why);
             }
-            *(uint32_t *)field = (uint32_t)v;
+            if (d.kind == K_U32) *(uint32_t *)field = (uint32_t)v;
             break;
         }
         case K_F32: {

@@ -10,6 +10,7 @@
 #include <stdio.h>
 #include <string.h>
 
+#include "chat_refuse.h"
 #include "pulsar_utf8.h"
 
 /* ---- effort ---------------------------------------------------------------- */
@@ -62,71 +63,6 @@ const char kToolsTail[] =
     "do not tell the user about function calls\n"
     "</IMPORTANT>";
 
-/// Write "<key>: <fmt...>" into `err` (when given) and fail.
-/// @param err    the caller's error buffer, or NULL
-/// @param errlen its size in bytes
-/// @param key    the refusal's name (no_messages, tools_not_array, ...)
-/// @param fmt    printf format of the detail
-/// @return false, always
-bool refuse(char *err, size_t errlen, const char *key, const char *fmt, ...) {
-    if (err && errlen) {
-        char msg[300];
-        va_list ap;
-        va_start(ap, fmt);
-        vsnprintf(msg, sizeof msg, fmt, ap);
-        va_end(ap);
-        snprintf(err, errlen, "%s: %s", key, msg);
-    }
-    return false;
-}
-
-/// Decode one UTF-8 sequence already validated as `n` bytes long.
-/// @param p the sequence's lead byte
-/// @param n its length in bytes (1..4)
-/// @return the codepoint
-uint32_t cp_at(const unsigned char *p, int n) {
-    switch (n) {
-    case 1: return p[0];
-    case 2: return ((uint32_t)(p[0] & 0x1f) << 6) | (p[1] & 0x3f);
-    case 3: return ((uint32_t)(p[0] & 0x0f) << 12) | ((uint32_t)(p[1] & 0x3f) << 6) | (p[2] & 0x3f);
-    default: return ((uint32_t)(p[0] & 0x07) << 18) | ((uint32_t)(p[1] & 0x3f) << 12) |
-                    ((uint32_t)(p[2] & 0x3f) << 6) | (p[3] & 0x3f);
-    }
-}
-
-/* Jinja |trim (Python str.strip) on UTF-8 bytes: the kept range [*lo, *hi) of s[0, n). */
-/// @param s      the bytes
-/// @param n      their count
-/// @param lo_out receives the first kept byte
-/// @param hi_out receives one past the last kept byte
-void strip_bounds(const char *s, size_t n, size_t *lo_out, size_t *hi_out) {
-    const unsigned char *u = (const unsigned char *)s;
-    size_t lo = 0;
-    while (lo < n) {
-        const int k = utf8_seq_ok(u + lo, n - lo);
-        if (!k || !py_isspace(cp_at(u + lo, k))) break;
-        lo += (size_t)k;
-    }
-    size_t hi = n;
-    while (hi > lo) {
-        size_t b = hi - 1;
-        while (b > lo && (u[b] & 0xc0) == 0x80 && hi - b < 4) b--;
-        const int k = utf8_seq_ok(u + b, hi - b);
-        if (!k || b + (size_t)k != hi || !py_isspace(cp_at(u + b, k))) break;
-        hi = b;
-    }
-    *lo_out = lo;
-    *hi_out = hi;
-}
-
-/// @param s the text
-/// @return `s` with leading and trailing Unicode whitespace removed (Python str.strip())
-std::string py_strip(const std::string &s) {
-    size_t lo = 0, hi = 0;
-    strip_bounds(s.data(), s.size(), &lo, &hi);
-    return s.substr(lo, hi - lo);
-}
-
 /* A piece of text with the client-data ranges inside it (offsets into `s`): what the template's string operations
  * (concatenation, split, trim) act on, carrying the spans along. */
 /// Text plus the client-data spans inside it (see the comment above).
@@ -169,7 +105,7 @@ struct piece {
     /// @return the piece with Python str.strip() whitespace removed from both ends, spans clipped
     piece trimmed() const {
         size_t lo = 0, hi = 0;
-        strip_bounds(s.data(), s.size(), &lo, &hi);
+        py_strip_bounds(s.data(), s.size(), &lo, &hi);
         return sub(lo, hi);
     }
     /// @param t a NUL-terminated substring
@@ -215,7 +151,7 @@ struct writer {
 /// @return true when the text fits (<= UINT32_MAX bytes)
 bool finish(const nemotron_render_out *out, char *err, size_t errlen) {
     if (out->text.size() > UINT32_MAX)
-        return refuse(err, errlen, "prompt_too_large", "%zu bytes do not fit the 32-bit span map", out->text.size());
+        return chat_refuse(err, errlen, "prompt_too_large", "%zu bytes do not fit the 32-bit span map", out->text.size());
     return true;
 }
 
@@ -233,7 +169,7 @@ void py_repr_str(const std::string &s, std::string *out) {
     const unsigned char *u = (const unsigned char *)s.data();
     for (size_t i = 0; i < s.size();) {
         const int k = utf8_seq_ok(u + i, s.size() - i);
-        const uint32_t cp = k ? cp_at(u + i, k) : u[i];
+        const uint32_t cp = k ? utf8_cp_at(u + i, k) : u[i];
         char esc[16] = "";
         if (cp == '\\') snprintf(esc, sizeof esc, "\\\\");
         else if (cp == (uint32_t)q) snprintf(esc, sizeof esc, "\\%c", q);
@@ -411,7 +347,7 @@ bool write_calls(writer &w, const nemotron_msg_in &m, int i, char *err, size_t e
     for (int c = 0; c < m.n_calls; c++) {
         const nemotron_tool_call_in &tc = m.calls[c];
         if (!tc.name || !tc.name[0])
-            return refuse(err, errlen, "tool_name_missing", "message %d call %d has no function name", i, c);
+            return chat_refuse(err, errlen, "tool_name_missing", "message %d call %d has no function name", i, c);
         w.lit("<tool_call>\n<function=");
         w.client(tc.name);
         w.lit(">\n");
@@ -419,9 +355,9 @@ bool write_calls(writer &w, const nemotron_msg_in &m, int i, char *err, size_t e
             pyjson_value args;
             char jerr[160];
             if (!pyjson_parse(tc.arguments, strlen(tc.arguments), &args, jerr, sizeof jerr))
-                return refuse(err, errlen, "tool_arguments_not_json", "message %d call %d: arguments: %s", i, c, jerr);
+                return chat_refuse(err, errlen, "tool_arguments_not_json", "message %d call %d: arguments: %s", i, c, jerr);
             if (args.kind != pyjson_value::OBJ)
-                return refuse(err, errlen, "tool_arguments_not_object",
+                return chat_refuse(err, errlen, "tool_arguments_not_object",
                               "message %d call %d: arguments decode to a JSON %s, not an object (the template "
                               "renders an object's items)", i, c,
                               args.kind == pyjson_value::STR ? "string" : args.kind == pyjson_value::ARR ? "array"
@@ -473,7 +409,7 @@ bool write_assistant(writer &w, const nemotron_msg_in &m, bool truncate, int i, 
     const piece content = assistant_content(m);
     if (m.n_calls > 0 || (m.raw_calls && m.raw_calls[0])) {
         if (m.n_calls <= 0)
-            return refuse(err, errlen, "raw_calls_without_calls", "message %d carries sampled call bytes but no call", i);
+            return chat_refuse(err, errlen, "raw_calls_without_calls", "message %d carries sampled call bytes but no call", i);
         w.lit("<|im_start|>assistant\n");
         if (!truncate) {
             w.add(content.trimmed());   /* never empty: it opens with a think tag or holds non-space text */
@@ -523,8 +459,8 @@ bool write_assistant(writer &w, const nemotron_msg_in &m, bool truncate, int i, 
 }
 
 /* The loop body over `msgs`: `prev` = the role before msgs[0] (NULL: the conversation's first), `last_user` the
- * index in msgs of the last user message (-1: none), `after` the role after the last one (NULL: the conversation
- * ends there). */
+ * index in msgs of the last user message (-1: none).  A tool run at the end of `msgs` closes its user turn there:
+ * nothing after msgs[n - 1] is consulted. */
 /// @param w         the output
 /// @param msgs      the messages to write
 /// @param n         their count
@@ -584,13 +520,13 @@ bool nemotron_chat_render(const nemotron_render_in &in, nemotron_render_out *out
     out->text.clear();
     out->spans.clear();
     writer w{out};
-    if (in.n_msgs <= 0) return refuse(err, errlen, "no_messages", "No messages provided.");
+    if (in.n_msgs <= 0) return chat_refuse(err, errlen, "no_messages", "No messages provided.");
     pyjson_value tools;
     if (in.tools_json) {
         char jerr[160];
         if (!pyjson_parse(in.tools_json, strlen(in.tools_json), &tools, jerr, sizeof jerr))
-            return refuse(err, errlen, "tools_not_array", "tools: %s", jerr);
-        if (tools.kind != pyjson_value::ARR) return refuse(err, errlen, "tools_not_array", "tools is not a JSON array");
+            return chat_refuse(err, errlen, "tools_not_array", "tools: %s", jerr);
+        if (tools.kind != pyjson_value::ARR) return chat_refuse(err, errlen, "tools_not_array", "tools is not a JSON array");
     }
     const bool first_system = in.msgs[0].role && !strcmp(in.msgs[0].role, "system");
     const std::string system = first_system && in.msgs[0].content ? in.msgs[0].content : "";
@@ -616,15 +552,15 @@ bool nemotron_chat_render_assistant_turn(const nemotron_msg_in &m, bool thinking
     const std::string reasoning = m.reasoning ? m.reasoning : "";
     const bool has_reasoning = !py_strip(reasoning).empty();
     if (!thinking && has_reasoning)
-        return refuse(err, errlen, "reasoning_without_thinking",
+        return chat_refuse(err, errlen, "reasoning_without_thinking",
                       "a thinking-off turn cannot carry reasoning (the generation prompt closed its think block empty)");
     if (thinking && !has_reasoning)
-        return refuse(err, errlen, "reasoning_missing",
+        return chat_refuse(err, errlen, "reasoning_missing",
                       "a thinking-on turn without reasoning replays as <think></think>, not as a continuation of the "
                       "generation prompt's <think>\\n");
     const std::string content = m.content ? m.content : "";
     if (!thinking && (content.find("<think>") != std::string::npos || content.find("</think>") != std::string::npos))
-        return refuse(err, errlen, "think_tag_in_content",
+        return chat_refuse(err, errlen, "think_tag_in_content",
                       "a thinking-off turn whose content spells a think tag replays without the empty think block");
     /* the full render's trimmed "<think>\n" R "</think>" C (or "<think></think>" C) minus the prompt's opening */
     const piece full = assistant_content(m).trimmed();
@@ -632,7 +568,7 @@ bool nemotron_chat_render_assistant_turn(const nemotron_msg_in &m, bool thinking
     w.add(full.sub(skip, full.s.size()));
     if (m.n_calls > 0 || (m.raw_calls && m.raw_calls[0])) {
         if (m.n_calls <= 0)
-            return refuse(err, errlen, "raw_calls_without_calls", "the turn carries sampled call bytes but no call");
+            return chat_refuse(err, errlen, "raw_calls_without_calls", "the turn carries sampled call bytes but no call");
         w.lit("\n");
         if (m.raw_calls && m.raw_calls[0]) {
             w.lit(m.raw_calls);
@@ -651,7 +587,7 @@ bool nemotron_chat_render_tail(const nemotron_msg_in *msgs, int n, nemotron_effo
     out->text.clear();
     out->spans.clear();
     writer w{out};
-    if (n <= 0) return refuse(err, errlen, "no_messages", "No messages provided.");
+    if (n <= 0) return chat_refuse(err, errlen, "no_messages", "No messages provided.");
     w.lit("<|im_end|>\n");
     if (!write_messages(w, msgs, n, "assistant", last_user_of(msgs, n), effort, err, errlen)) return false;
     w.lit(nemotron_generation_prompt(effort));
@@ -665,8 +601,8 @@ bool nemotron_chat_tool_defs(const char *tools_json, nemotron_render_out *out, c
     pyjson_value tools;
     char jerr[160];
     if (!tools_json || !pyjson_parse(tools_json, strlen(tools_json), &tools, jerr, sizeof jerr))
-        return refuse(err, errlen, "tools_not_array", "tools: %s", tools_json ? jerr : "none");
-    if (tools.kind != pyjson_value::ARR) return refuse(err, errlen, "tools_not_array", "tools is not a JSON array");
+        return chat_refuse(err, errlen, "tools_not_array", "tools: %s", tools_json ? jerr : "none");
+    if (tools.kind != pyjson_value::ARR) return chat_refuse(err, errlen, "tools_not_array", "tools is not a JSON array");
     w.lit("<tools>");
     write_tool_functions(w, tools);
     w.lit("\n</tools>");
@@ -688,7 +624,7 @@ bool nemotron_chat_render_turn(const nemotron_msg_in *msgs, int n, nemotron_effo
     out->text.clear();
     out->spans.clear();
     writer w{out};
-    if (n <= 0 && !generation_prompt) return refuse(err, errlen, "no_messages", "No messages provided.");
+    if (n <= 0 && !generation_prompt) return chat_refuse(err, errlen, "no_messages", "No messages provided.");
     if (!write_messages(w, msgs, n, "assistant", last_user_of(msgs, n), effort, err, errlen)) return false;
     if (generation_prompt) w.lit(nemotron_generation_prompt(effort));
     return finish(out, err, errlen);

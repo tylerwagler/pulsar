@@ -512,7 +512,7 @@ static void json_write_token(FILE *fp, pulsar_engine *engine, int token) {
  *  @param engine the loaded engine
  *  @param cfg    the configuration
  *  @param prompt the prompt tokens
- *  @return 0, or 1 on failure (said on stderr) */
+ *  @return 0, or 1 on failure (said on stderr; a row with no finite logit has no argmax and refuses) */
 static int run_logits_dump(pulsar_engine *engine, const cli_config *cfg, const pulsar_tokens *prompt) {
     pulsar_session *session = NULL;
     if (pulsar_session_create(&session, engine, cfg->gen.ctx_size) != 0) {
@@ -553,6 +553,13 @@ static int run_logits_dump(pulsar_engine *engine, const cli_config *cfg, const p
         return 1;
     }
 
+    const int argmax = pulsar_session_argmax(session);
+    if (argmax < 0) {   /* -1: no finite logit -- there is no argmax to write (and logits[-1] is out of bounds) */
+        fprintf(stderr, "pulsar: --dump-logits: no finite logit at the prompt's end; refusing the dump\n");
+        free(logits);
+        pulsar_session_free(session);
+        return 1;
+    }
     FILE *fp = fopen(cfg->gen.dump_logits_path, "wb");
     if (!fp) {
         fprintf(stderr, "pulsar: failed to open --dump-logits file: %s\n", cfg->gen.dump_logits_path);
@@ -571,7 +578,6 @@ static int run_logits_dump(pulsar_engine *engine, const cli_config *cfg, const p
             prompt->len,
             cfg->gen.ctx_size,
             vocab);
-    const int argmax = pulsar_session_argmax(session);
     fputs("  \"argmax_token\":", fp);
     json_write_token(fp, engine, argmax);
     fprintf(fp, ",\n  \"argmax_logit\":%.9g,\n  \"logits\":[", logits[argmax]);
@@ -1099,16 +1105,10 @@ static int run_generation(pulsar_engine *engine, const cli_config *cfg) {
         return rc;
     }
 
-    const bool diagnostic = cfg->gen.dump_tokens;
     if (cfg->gen.dump_tokens) {
         pulsar_engine_dump_tokens(engine, &prompt);
-    }
-
-    if (diagnostic) {
-        if (rc == 0) {
-            fprintf(stderr, "pulsar: diagnostic run completed on the native %s path.\n",
-                    pulsar_backend_name(cfg->engine.backend));
-        }
+        fprintf(stderr, "pulsar: diagnostic run completed on the native %s path.\n",
+                pulsar_backend_name(cfg->engine.backend));
     } else {
         /* Every generation rides the session lane -- greedy (temperature 0), sampled, drafted and
          * tensor-parallel alike, on every family (L284 P15: the session-less whole-graph argmax path

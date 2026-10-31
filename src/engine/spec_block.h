@@ -168,7 +168,8 @@ typedef struct {
 } pulsar_block_selector;
 
 /** The loaded block drafter (pulsar_engine::block_drafter): its declaration, the family's tap points, its weights,
- *  its state ids. */
+ *  its state ids.  A plain record that owns nothing: the tensors are the model's, `kind` is static and the per-session
+ *  buffers are the lane's (pulsar_block_lane_free), so the family that allocated it frees it with free(). */
 typedef struct pulsar_block_drafter {
     const char *kind;            ///< the container's pulsar.drafter ("lilicorr", "dflash2")
     /// The chain head the kind ends in (the kind table's).

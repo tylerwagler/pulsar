@@ -233,7 +233,7 @@ static void json_write_string(FILE *fp, const char *s) {
  *  @param session  the session at the frontier
  *  @param frontier the frontier, tokens
  *  @param previous the previous frontier, tokens (prefill_tokens = frontier - previous)
- *  @return 0, or 1 on failure (said on stderr) */
+ *  @return 0, or 1 on failure (said on stderr; a row with no finite logit has no argmax and refuses) */
 static int write_frontier_logits_json(
         const bench_config *cfg,
         pulsar_engine         *engine,
@@ -266,6 +266,12 @@ static int write_frontier_logits_json(
         return 1;
     }
 
+    const int argmax = pulsar_session_argmax(session);
+    if (argmax < 0) {   /* -1: no finite logit -- there is no argmax to write (and logits[-1] is out of bounds) */
+        fprintf(stderr, "pulsar-bench: no finite logit at frontier %d; refusing its logits dump\n", frontier);
+        free(logits);
+        return 1;
+    }
     FILE *fp = fopen(path, "wb");
     if (!fp) {
         fprintf(stderr, "pulsar-bench: failed to open %s: %s\n", path, strerror(errno));
@@ -273,7 +279,6 @@ static int write_frontier_logits_json(
         return 1;
     }
 
-    const int argmax = pulsar_session_argmax(session);
     fprintf(fp, "{\n  \"source\":\"pulsar-bench\",\n  \"model\":");
     json_write_string(fp, cfg->model_path);
     fprintf(fp,

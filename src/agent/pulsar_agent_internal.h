@@ -670,6 +670,20 @@ typedef enum {
     AGENT_HISTORY_MARK_EOS,       ///< end-of-turn boundary
 } agent_history_mark;
 
+/** The loaded family's turn markers as they appear in rendered transcript text (pulsar_kvtext_render_tokens_text):
+ * what the session title and /history scan for, so every family's transcript reads the same way (DeepSeek:
+ * `<｜User｜>`, `<｜Assistant｜>`, `<｜end▁of▁sentence｜>`; Qwen: `<|im_start|>user`, `<|im_start|>assistant`,
+ * `<|im_end|>`).  Built by agent_turn_marks_init; a marker the family does not spell is empty (len 0) and matches
+ * nowhere. */
+typedef struct {
+    char user[64];            ///< the user-turn marker's text (pulsar_chat_turn_markers' user tokens)
+    size_t user_len;          ///< bytes in `user`; 0 = not spelled
+    char assistant[64];       ///< the assistant-turn marker's text (its assistant tokens)
+    size_t assistant_len;     ///< bytes in `assistant`; 0 = not spelled
+    char end[64];             ///< a closed assistant turn's end (pulsar_chat_end_assistant), whitespace trimmed
+    size_t end_len;           ///< bytes in `end`; 0 = not spelled
+} agent_turn_marks;
+
 /** Rendered history as borrowed line pointers plus a parallel marker array.
  * Pointers are NOT owned -- they alias the rendered buffer. */
 typedef struct {
@@ -743,16 +757,6 @@ struct agent_bash_job {
     int newline_count;    ///< newlines seen, for the line count without a rescan
     char last_byte;       ///< last byte captured; tells whether output ends in a newline
 
-    /** @note WRITE-ONLY as of this writing. Both counters are assigned in
-     * agent_bash_job::observation() and read NOWHERE. The intent was clearly an
-     * incremental cursor -- report only output added since the last look -- but
-     * only `observed_once` is actually consumed, and it selects HEAD (first
-     * observation) vs TAIL (every later one). A repeated bash_status therefore
-     * re-shows the same tail rather than just the new bytes. Either wire these
-     * up or delete them; they are not currently load-bearing. */
-    size_t observed_bytes;
-    int observed_display_lines;  ///< @see observed_bytes -- also write-only
-
     bool observed_once;   ///< the job has been observed at least once; switches head display to tail
     int exit_status;      ///< waitpid status once `running` is false
     bool running;         ///< the child has not been reaped yet
@@ -805,7 +809,9 @@ struct agent_bash_job {
 };
 
 /** Prompts typed while the model was busy, drained in order at the next safe
- * point. Guarded by agent_worker::mu. */
+ * point. A local of the UI loop (runtime.cpp), touched by that thread only, so
+ * it takes no lock: the worker receives its contents as text the UI thread
+ * takes out and hands over under agent_worker::mu (worker_answer_queued_user_drain). */
 typedef struct {
     char **v;    ///< queued prompt strings, owned
     size_t len;  ///< prompts queued
@@ -1132,12 +1138,12 @@ void renderer_plain(agent_token_renderer *r, const char *s, size_t n);
  *  @param len    byte count
  *  @param finish the reply ended: flush held bytes and close any open DSML display */
 void agent_stream_text(agent_stream_renderer *sr, const char *text, size_t len, bool finish);
-/** pulsar_session progress callback: on prefill_chunk / prefill_display events, updates status.prefill_done
- *  (relative to progress_base) and prefill_tps and wakes the UI.  Takes w->mu.
+/** pulsar_session progress callback: on prefill_chunk / prefill_display events, updates status.prefill_total and
+ *  prefill_done (both relative to progress_base) and prefill_tps and wakes the UI.  Takes w->mu.
  *  @param ud      the agent_worker
  *  @param event   the event name
  *  @param current tokens processed so far (absolute position)
- *  @param total   unused */
+ *  @param total   the prompt's tokens (absolute): the bar ends at total - progress_base */
 void worker_progress_cb(void *ud, const char *event, int current, int total);
 /** Whether an interrupt or stop is pending.  Takes w->mu.
  *  @param w the worker
@@ -1339,13 +1345,20 @@ bool agent_worker_save_session(agent_worker *w, char *err, size_t err_len);
  *  @return the title ("(empty user prompt)" for an empty one), malloc'd; caller frees */
 char *agent_session_title_from_prompt(const char *prompt,
                                              size_t max_bytes);
-/** A session title from the first user turn of a rendered transcript.
+/** The loaded family's turn markers as rendered text (agent_turn_marks), from the renderer's family-neutral API:
+ *  pulsar_chat_turn_markers' tokens and pulsar_chat_end_assistant's, each rendered by pulsar_token_text.
+ *  @param e the engine (its tokenizer)
+ *  @param m receives the markers; one the family does not spell (or longer than its buffer) is left empty */
+void agent_turn_marks_init(pulsar_engine *e, agent_turn_marks *m);
+/** A session title from the first user turn of a rendered transcript: the text after the first user marker, up to
+ *  the next assistant, user or end marker.
+ *  @param marks     the loaded family's markers (agent_turn_marks_init)
  *  @param text      the rendered transcript
  *  @param text_len  byte count
  *  @param max_bytes display budget; 0 = the full normalised title
  *  @return the title ("(no user prompt)" when none is found), malloc'd; caller frees */
-char *agent_session_title_from_text(const char *text, size_t text_len,
-                                           size_t max_bytes);
+char *agent_session_title_from_text(const agent_turn_marks *marks, const char *text, size_t text_len,
+                                    size_t max_bytes);
 /** Print the live session's recent turns without touching the session.
  *  @param w          the worker (must be idle)
  *  @param user_turns user turns to show
@@ -1354,8 +1367,9 @@ char *agent_session_title_from_text(const char *text, size_t text_len,
  *  @return true on success */
 bool agent_worker_show_history(agent_worker *w, int user_turns,
                                       char *err, size_t err_len);
-/** Print resumable sessions from ~/.ds4/kvcache.  sysprompt.kv is intentionally
- * ignored because it is an implementation cache, not a user session.
+/** Print this model's resumable sessions: the `<sha>.session` files in the cache directory (~/.ds4/kvcache).  The
+ * segment store beside them (`segments/`, the system prompt's chain included) holds KV, not sessions, and is not
+ * listed.
  */
 /** @param w the worker (its cache_dir is scanned) */
 void agent_worker_list_sessions(agent_worker *w);
@@ -1830,8 +1844,8 @@ void editor_write_welcome_banner(agent_editor *editor,
                                         const agent_config *cfg,
                                         const char *prompt,
                                         const char *statusline);
-/** Initialize the worker, cache directory, sysprompt checkpoint path, trace file,
- * and model thread.  After this returns, all DS4 session mutation happens on
+/** Initialize the worker, cache directory, segment store (agent_kv_open), trace file,
+ * and model thread.  After this returns, all session mutation happens on
  * the worker thread.
  */
 /** @param w      the worker (zeroed here)

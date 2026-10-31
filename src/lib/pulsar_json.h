@@ -1,5 +1,13 @@
 /** @file
- *  The one JSON scanner, shared by the server's API parsing and the engine's safetensors reader. */
+ *  The one JSON scanner, shared by the server's API parsing and the engine's safetensors reader.
+ *
+ *  It accepts more than RFC 8259, on purpose: what clients send today keeps parsing.
+ *  - Whitespace is isspace(): vertical tab and form feed too, not only space, tab, LF and CR.
+ *  - Numbers are strtod()'s: a leading plus, leading zeros, hex floats, inf, nan and a bare .5 or 5. are taken
+ *    (json_int folds NaN and negatives to 0 and clamps at INT_MAX).
+ *  - A string may hold raw control characters (U+0001 .. U+001F unescaped), copied through as bytes.
+ *
+ *  The strict parser is pyjson (pyjson.h), for where a renderer needs Python's json.loads exactly. */
 /* pulsar_json.h -- the ONE JSON scanner, shared by the server's API parsing and
  * by the engine's safetensors reader.
  *

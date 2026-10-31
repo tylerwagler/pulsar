@@ -304,7 +304,7 @@ private:
     int arg_n_ = 0;            ///< parameters streamed for the open call
     bool arg_stop_ = false;    ///< the open call stopped streaming: its next bytes are not a parameter
     /// The incremental payload scanner's state for the open call.
-    struct payload_scan {      ///< where the open block's decode is (in_payload), scanned incrementally
+    struct payload_scan {
         size_t pos = 0;        ///< bytes of the body classified
         bool value = false;    ///< inside a parameter value
         size_t vstart = 0;     ///< where its text starts (past the tag)

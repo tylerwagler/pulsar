@@ -1292,7 +1292,7 @@ QWEN_RENDER_CASES ?= $(call need_path,QWEN_RENDER_CASES)
 QWEN_CALIB ?= $(call need_path,QWEN_CALIB)
 QWEN_CHAT_SRCS = src/lib/bpe_tokenizer.cpp src/lib/pyjson.cpp src/lib/qwen_chat.cpp src/lib/qwen_output.cpp src/lib/out_parse_kit.cpp
 tests/qwen_chat_gate: tests/qwen_chat_gate.cpp tests/bpe_gate_util.h $(QWEN_CHAT_SRCS) src/lib/bpe_tokenizer.h \
-                      src/lib/bpe_unicode_tables.inc src/lib/pyjson.h src/lib/qwen_chat.h src/lib/out_parse_kit.h src/lib/pulsar_utf8.h \
+                      src/lib/bpe_unicode_tables.inc src/lib/pyjson.h src/lib/qwen_chat.h src/lib/out_parse_kit.h src/lib/pulsar_utf8.h src/lib/chat_refuse.h \
                       src/lib/sha1.hpp Makefile
 	$(CXX) $(CXXFLAGS) -Isrc -Isrc/lib -o $@ tests/qwen_chat_gate.cpp $(QWEN_CHAT_SRCS)
 .PHONY: qwen-chat-gate
@@ -1307,7 +1307,7 @@ qwen-chat-gate: tests/qwen_chat_gate
 INKLING_TOK_DIR ?= $(call need_path,INKLING_TOK_DIR)
 INKLING_CHAT_SRCS = src/lib/bpe_tokenizer.cpp src/lib/pyjson.cpp src/lib/inkling_chat.cpp src/lib/out_parse_kit.cpp
 tests/inkling_chat_gate: tests/inkling_chat_gate.cpp tests/bpe_gate_util.h $(INKLING_CHAT_SRCS) src/lib/bpe_tokenizer.h \
-                         src/lib/bpe_unicode_tables.inc src/lib/pyjson.h src/lib/inkling_chat.h src/lib/out_parse_kit.h \
+                         src/lib/bpe_unicode_tables.inc src/lib/pyjson.h src/lib/inkling_chat.h src/lib/out_parse_kit.h src/lib/chat_refuse.h \
                          src/lib/pulsar_utf8.h src/lib/sha1.hpp Makefile
 	$(CXX) $(CXXFLAGS) -Isrc -Isrc/lib -o $@ tests/inkling_chat_gate.cpp $(INKLING_CHAT_SRCS)
 .PHONY: inkling-chat-gate
@@ -1325,7 +1325,7 @@ NEMOTRON_CHAT_SRCS = src/lib/bpe_tokenizer.cpp src/lib/pyjson.cpp src/lib/nemotr
                      src/lib/out_parse_kit.cpp
 tests/nemotron_chat_gate: tests/nemotron_chat_gate.cpp tests/bpe_gate_util.h $(NEMOTRON_CHAT_SRCS) src/lib/bpe_tokenizer.h \
                           src/lib/bpe_unicode_tables.inc src/lib/pyjson.h src/lib/nemotron_chat.h src/lib/qwen_chat.h \
-                          src/lib/out_parse_kit.h src/lib/pulsar_utf8.h src/lib/sha1.hpp Makefile
+                          src/lib/out_parse_kit.h src/lib/pulsar_utf8.h src/lib/chat_refuse.h src/lib/sha1.hpp Makefile
 	$(CXX) $(CXXFLAGS) -Isrc -Isrc/lib -o $@ tests/nemotron_chat_gate.cpp $(NEMOTRON_CHAT_SRCS)
 .PHONY: nemotron-chat-gate
 nemotron-chat-gate: tests/nemotron_chat_gate

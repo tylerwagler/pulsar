@@ -828,7 +828,11 @@ bool stage(const pulsar_driver_step *st0, uint64_t *graph_key) {
         if (st->tokens[r] < 0 || (uint32_t)st->tokens[r] >= s.n_vocab) return fail("a token id outside the vocabulary");
     uint32_t bound = 0;
     if (!build_tables(st) || !plan_attention(st, &bound)) return false;
-    uint64_t key = 0x4E480000ull | ((uint64_t)bound << 20) | 1u;
+    /* the key's fields, packed without overlap: the "NH" tag in bits 48..63, the bound in bits 1..32, bit 0 set (a
+     * key is nonzero).  The bound is attn_bound's: 0 (no attention layer) or at most the pools' context. */
+    static_assert(sizeof(bound) * 8 + 1 <= 48, "the attention bound's field overlaps the key's tag");
+    if (bound > st->states->ctx) return fail("an attention bound past the pools' context");
+    uint64_t key = (0x4E48ull << 48) | ((uint64_t)bound << 1) | 1u;
     /* L296 fullspec: a verify step's launches also read its run structure -- the row-kind cut, the Mamba-2 calls'
      * sequence counts, row splits and longest runs, and every attention call's shape -- so they are its key too (a
      * decode step's follow from its row count: one sequence a row) */

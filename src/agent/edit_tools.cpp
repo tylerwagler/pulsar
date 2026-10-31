@@ -626,11 +626,108 @@ static void test_agent_session_file_round_trip(void) {
     rmdir(dir);
 }
 
+/* parse_u64 (pulsar_argparse.h, the --seed parser): a value it refuses exits 2, so each refusal runs in a child */
+static int test_parse_u64_exit(const char *s) {
+    fflush(NULL);
+    const pid_t pid = fork();
+    if (pid == 0) {
+        if (!freopen("/dev/null", "w", stderr)) _exit(99);
+        (void)parse_u64(s, "--seed");
+        _exit(0);
+    }
+    int status = 0;
+    if (pid < 0 || waitpid(pid, &status, 0) != pid || !WIFEXITED(status)) return -1;
+    return WEXITSTATUS(status);
+}
+
+static void test_parse_u64_refuses_sign_and_range(void) {
+    AGENT_TEST_ASSERT(parse_u64("7", "--seed") == 7u);
+    AGENT_TEST_ASSERT(parse_u64("18446744073709551615", "--seed") == UINT64_MAX);
+    static const char *const bad_values[] = {"-1", " -1", "-0", "18446744073709551616", "0", "", "1x"};
+    for (const char *bad : bad_values)
+        AGENT_TEST_ASSERT(test_parse_u64_exit(bad) == 2);
+}
+
+/* The session title and /history scan the loaded family's turn markers (agent_turn_marks), not DeepSeek's: a
+ * Qwen transcript (ChatML) and a DeepSeek one read the same way.  The markers are what agent_turn_marks_init
+ * builds from each family's renderer (pulsar_chat_turn_markers + pulsar_chat_end_assistant, rendered as text). */
+static agent_turn_marks test_turn_marks(const char *user, const char *assistant, const char *end) {
+    agent_turn_marks m;
+    memset(&m, 0, sizeof(m));
+    snprintf(m.user, sizeof m.user, "%s", user);
+    m.user_len = strlen(m.user);
+    snprintf(m.assistant, sizeof m.assistant, "%s", assistant);
+    m.assistant_len = strlen(m.assistant);
+    snprintf(m.end, sizeof m.end, "%s", end);
+    m.end_len = strlen(m.end);
+    return m;
+}
+
+static void test_agent_turn_marks_family_neutral(void) {
+    const agent_turn_marks qwen = test_turn_marks("<|im_start|>user", "<|im_start|>assistant", "<|im_end|>");
+    const agent_turn_marks ds = test_turn_marks("<｜User｜>", "<｜Assistant｜>", "<｜end▁of▁sentence｜>");
+    const char *qt =
+        "<|im_start|>system\nYou are a coding agent.<|im_end|>\n"
+        "<|im_start|>user\nFix the build<|im_end|>\n"
+        "<|im_start|>assistant\n<think>\nlook\n</think>\n\nDone.<|im_end|>\n"
+        "<|im_start|>user\nthanks<|im_end|>\n"
+        "<|im_start|>assistant\n";
+    const char *dt =
+        "<｜begin▁of▁sentence｜>You are a coding agent.<｜User｜>Fix the build<｜Assistant｜></think>Done."
+        "<｜end▁of▁sentence｜><｜User｜>thanks<｜Assistant｜>";
+    for (int leg = 0; leg < 2; leg++) {
+        const agent_turn_marks *m = leg ? &ds : &qwen;
+        const char *t = leg ? dt : qt;
+        char *title = agent_session_title_from_text(m, t, strlen(t), 0);
+        AGENT_TEST_ASSERT(!strcmp(title, "Fix the build"));
+        free(title);
+        /* the walk: user and assistant turns in order, each bounded by the next marker */
+        int users = 0, assistants = 0;
+        const char *p = t, *end = t + strlen(t);
+        agent_history_mark kind = AGENT_HISTORY_MARK_NONE;
+        size_t len = 0;
+        for (const char *at; (at = agent_history_next_marker(m, p, end, &kind, &len)) != NULL; p = at + len) {
+            users += kind == AGENT_HISTORY_MARK_USER;
+            assistants += kind == AGENT_HISTORY_MARK_ASSISTANT;
+        }
+        AGENT_TEST_ASSERT(users == 2 && assistants == 2);
+        /* /history's last user turn starts at the second user marker */
+        bool tool_only = true;
+        const char *start = agent_history_start_for_turns(m, t, strlen(t), 1, &tool_only);
+        AGENT_TEST_ASSERT(!tool_only && start == strstr(strstr(t, m->user) + 1, m->user));
+    }
+    /* a family that spells no markers finds no prompt (never DeepSeek's) */
+    const agent_turn_marks none = test_turn_marks("", "", "");
+    char *title = agent_session_title_from_text(&none, dt, strlen(dt), 0);
+    AGENT_TEST_ASSERT(!strcmp(title, "(no user prompt)"));
+    free(title);
+}
+
+/* worker_progress_cb takes the bar's end from the session's `total`, not the worker's pre-sync estimate */
+static void test_worker_progress_uses_session_total(void) {
+    agent_worker w;
+    memset(&w, 0, sizeof(w));
+    pthread_mutex_init(&w.mu, NULL);
+    w.wake_pending = true;   /* no wake pipe: agent_wake_locked writes nothing */
+    w.progress_base = 100;
+    w.status.prefill_total = 5;   /* a stale estimate */
+    worker_progress_cb(&w, "prefill_chunk", 150, 300);
+    AGENT_TEST_ASSERT(w.status.prefill_total == 200 && w.status.prefill_done == 50);
+    worker_progress_cb(&w, "prefill_display", 400, 300);
+    AGENT_TEST_ASSERT(w.status.prefill_total == 200 && w.status.prefill_done == 200);
+    worker_progress_cb(&w, "decode", 500, 900);   /* not a prefill event: ignored */
+    AGENT_TEST_ASSERT(w.status.prefill_total == 200);
+    pthread_mutex_destroy(&w.mu);
+}
+
 static void pulsar_agent_unit_tests_run(void) {
+    test_worker_progress_uses_session_total();
+    test_agent_turn_marks_family_neutral();
     test_agent_edit_upto_tail_newline_is_not_part_of_anchor();
     test_agent_edit_upto_requires_tail_after_newline_strip();
     test_agent_dsml_parser_recognises_every_syntax();
     test_agent_session_file_round_trip();
+    test_parse_u64_refuses_sign_and_range();
 }
 
 

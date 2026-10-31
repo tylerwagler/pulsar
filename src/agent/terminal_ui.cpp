@@ -935,8 +935,13 @@ static bool editor_configure_scroll_region(agent_editor *ed) {
     ed->reserved_rows = 0;
     ed->output_cursor_saved = false;
     ed->output_at_scroll_boundary = false;
+    /* editor_set_scroll_layout acts only with the flag up; a failed layout installs nothing, so the flag comes
+     * down again (else the next call returns "configured" for a region that was never set) */
     ed->scroll_region = true;
-    if (!editor_set_scroll_layout(ed, 2, true, false)) return false;
+    if (!editor_set_scroll_layout(ed, 2, true, false)) {
+        ed->scroll_region = false;
+        return false;
+    }
 
     /* The agent prints backend startup lines before the editor exists.  Once
      * the scroll region is installed, create an append line at the bottom of
@@ -1319,7 +1324,7 @@ static void agent_format_welcome_banner(const agent_config *cfg,
     agent_format_ctx_size(cfg->gen.ctx_size, ctx, sizeof(ctx));
     if (stdout_is_tty()) {
         snprintf(buf, len,
-                 "\x1b[1;97mDwarf\x1b[1;94mStar\x1b[0m 🐋 Agent, context %s tokens\n\n",
+                 "\x1b[1;97mPulsar\x1b[0m \x1b[1;94mAgent\x1b[0m, context %s tokens\n\n",
                  ctx);
     } else {
         snprintf(buf, len, "Pulsar Agent, context %s tokens\n\n", ctx);
@@ -1339,8 +1344,8 @@ void editor_write_welcome_banner(agent_editor *editor,
 
 
 
-/* Initialize the worker, cache directory, sysprompt checkpoint path, trace file,
- * and model thread.  After this returns, all DS4 session mutation happens on
+/* Initialize the worker, cache directory, segment store (agent_kv_open), trace file,
+ * and model thread.  After this returns, all session mutation happens on
  * the worker thread. */
 int agent_worker_init(agent_worker *w, pulsar_engine *engine, agent_config *cfg) {
     memset(w, 0, sizeof(*w));

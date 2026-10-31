@@ -12,8 +12,9 @@ namespace {
 /// The architecture name every refusal and announce line is prefixed with.
 const char *const ARCH = PULSAR_NEMOTRON_H_ARCH;
 
-/** pulsar_family::unload: free the tokenizer, the block drafter's record and the family state, and clear the engine's
- *  block-drafter pointer (safe after a partial load).
+/** pulsar_family::unload: free the tokenizer, the block drafter's record (a plain record that owns nothing,
+ *  pulsar_block_drafter: free() is its teardown) and the family state, and clear the engine's block-drafter pointer
+ *  (safe after a partial load).
  *  @param e  the engine; its family_state is freed and set to NULL */
 void unload(pulsar_engine *e) {
     if (e->family_state) {

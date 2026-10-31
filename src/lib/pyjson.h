@@ -87,9 +87,11 @@ void pyjson_dump_string(const char *s, size_t n, std::string *out);
 /// @return true on success, false when `v` holds a non-finite float
 bool pyjson_dump_canonical(const pyjson_value &v, std::string *out);
 
-/** Python's truthiness of the value json.loads produced (`x or default`). */
+/** Python's truthiness of the value json.loads produced (`x or default`), with one departure kept as it is: an
+ *  integer is false only when its text is exactly `0`, so `-0` (Python: int 0, false) is true.  A float -0.0 is
+ *  false, as in Python. */
 /// @param v the value
-/// @return false for null, false, 0, 0.0, "", [] and {}; true otherwise
+/// @return false for null, false, 0, 0.0, -0.0, "", [] and {}; true otherwise (`-0` included)
 bool pyjson_truthy(const pyjson_value &v);
 
 /** Python's str.isspace() for one codepoint -- the whitespace str.strip() removes (and Jinja's |trim): the
@@ -97,3 +99,20 @@ bool pyjson_truthy(const pyjson_value &v);
 /// @param cp the codepoint
 /// @return true when Python's str.isspace() holds for it
 bool py_isspace(uint32_t cp);
+
+/** Python str.strip() (Jinja's |trim) on UTF-8 bytes: the kept range [*lo_out, *hi_out) of s[0, n), py_isspace
+ *  codepoints removed from both ends; bytes that are not a well-formed sequence are never whitespace.  The one
+ *  strip the chat renderers share. */
+/// @param s      the bytes
+/// @param n      their count
+/// @param lo_out receives the first kept byte
+/// @param hi_out receives one past the last kept byte
+void py_strip_bounds(const char *s, size_t n, size_t *lo_out, size_t *hi_out);
+/// py_strip_bounds over a string.
+/// @param s the text
+/// @return `s` with leading and trailing Unicode whitespace removed
+std::string py_strip(const std::string &s);
+/// py_strip_bounds over a NUL-terminated string.
+/// @param s the text, or NULL (= "")
+/// @return `s` with leading and trailing Unicode whitespace removed
+std::string py_strip(const char *s);

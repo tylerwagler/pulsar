@@ -1432,13 +1432,19 @@ typedef struct {
 /** The run's UI, for tui_restore (atexit) and the signal handler's terminal repair; NULL until tui_start. */
 static eval_ui *global_ui;
 
-static double run_clock_sec(void);
+/** @brief Monotonic wall clock: the run clock's and every phase timer's one time source.
+ *  @return seconds since an arbitrary epoch (CLOCK_MONOTONIC) */
+static double now_sec(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec + (double)ts.tv_nsec / 1000000000.0;
+}
 
 /** @brief Fold the time since the last tick into run_elapsed_sec (only while the clock runs).
  *  @param ui the UI; NULL is a no-op */
 static void tui_run_clock_tick(eval_ui *ui) {
     if (!ui || !ui->run_clock_active) return;
-    double now = run_clock_sec();
+    double now = now_sec();
     double delta = now - ui->run_last_sec;
     if (delta > 0.0) ui->run_elapsed_sec += delta;
     ui->run_last_sec = now;
@@ -1448,7 +1454,7 @@ static void tui_run_clock_tick(eval_ui *ui) {
  *  @param ui the UI; NULL is a no-op */
 static void tui_run_clock_start(eval_ui *ui) {
     if (!ui || ui->run_clock_active) return;
-    ui->run_last_sec = run_clock_sec();
+    ui->run_last_sec = now_sec();
     ui->run_clock_active = true;
 }
 
@@ -1467,7 +1473,7 @@ static double tui_run_clock_visible_sec(const eval_ui *ui) {
     if (!ui) return 0.0;
     double elapsed = ui->run_elapsed_sec;
     if (ui->run_clock_active) {
-        double delta = run_clock_sec() - ui->run_last_sec;
+        double delta = now_sec() - ui->run_last_sec;
         if (delta > 0.0) elapsed += delta;
     }
     return elapsed;
@@ -1613,22 +1619,6 @@ static void buf_free(byte_buf *b) {
 static void style_free(style_buf *b) {
     free(b->v);
     memset(b, 0, sizeof(*b));
-}
-
-/** @brief Monotonic wall clock.
- *  @return seconds since an arbitrary epoch (CLOCK_MONOTONIC) */
-static double now_sec(void) {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (double)ts.tv_sec + (double)ts.tv_nsec / 1000000000.0;
-}
-
-/** @brief The run clock's time source (the same clock as now_sec).
- *  @return seconds since an arbitrary epoch (CLOCK_MONOTONIC) */
-static double run_clock_sec(void) {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (double)ts.tv_sec + (double)ts.tv_nsec / 1000000000.0;
 }
 
 /** @brief The backend selected when none is given.
@@ -2443,7 +2433,7 @@ static void tui_start(eval_ui *ui, const eval_case *cases, int ncases, int max_t
     ui->requested_case = -1;
     ui->quit_requested = false;
     ui->status = (eval_status *)calloc((size_t)ncases, sizeof(*ui->status));
-    ui->guess = (char (*)[32])calloc((size_t)ncases, sizeof(*ui->guess));
+    ui->guess = (char (*)[EVAL_ANSWER_MAX])calloc((size_t)ncases, sizeof(*ui->guess));
     ui->prompt_tokens = (int *)calloc((size_t)ncases, sizeof(*ui->prompt_tokens));
     ui->generated_tokens = (int *)calloc((size_t)ncases, sizeof(*ui->generated_tokens));
     if (!ui->status || !ui->guess || !ui->prompt_tokens || !ui->generated_tokens) {
@@ -2872,7 +2862,8 @@ static void trace_write_case(FILE *trace,
             fprintf(trace, "  %c. %s\n", 'A' + i, tc->choice[i]);
         }
     } else {
-        fprintf(trace, "answer_kind: exact_integer\n");
+        /* COMPSEC answers a line spec ("17-20", "0"), every other open case an integer (build_question_prompt) */
+        fprintf(trace, "answer_kind: %s\n", eval_case_is_compsec(tc) ? "line_spec" : "exact_integer");
     }
     trace_write_block(trace, "SYSTEM_PROMPT", system_prompt);
     trace_write_block(trace, "QUESTION_PROMPT", question_prompt);
@@ -2881,12 +2872,6 @@ static void trace_write_case(FILE *trace,
     fflush(trace);
 }
 
-/* The LAST "Answer:" marker in `visible` (case-insensitive, optional space
- * before the colon, word-bounded), or NULL.  There is no looser form: the
- * grading contract (grade_model_output) requires this marker on the last
- * line, so an extractor is only ever handed text that carries it.  The old
- * bare-"answer" fallback was reachable from nothing but its own self-tests
- * (L192). */
 /// @brief Whether the characters on both sides of a span are non-letters (a word boundary).
 /// @param before the character before the span
 /// @param after  the character after it
@@ -2895,7 +2880,13 @@ static bool is_letter_boundary(char before, char after) {
     return !isalpha((unsigned char)before) && !isalpha((unsigned char)after);
 }
 
-/** @brief The last "Answer:" marker in visible (the rule in the comment above is_letter_boundary).
+/* The LAST "Answer:" marker in `visible` (case-insensitive, optional space
+ * before the colon, word-bounded), or NULL.  There is no looser form: the
+ * grading contract (grade_model_output) requires this marker on the last
+ * line, so an extractor is only ever handed text that carries it.  The old
+ * bare-"answer" fallback was reachable from nothing but its own self-tests
+ * (L192). */
+/** @brief The last "Answer:" marker in visible (the rule in the comment above).
  *  @param visible the text to search
  *  @return a pointer to the marker's "a" inside visible, or NULL */
 static char *find_last_answer_marker(const char *visible) {
@@ -3409,9 +3400,7 @@ static const char *trace_skip_counted_block(const char *line,
                                             const char *end) {
     /*
      * Trace regrading must scan metadata lines without being confused by model
-     * output.  Prefer the byte count written by trace_write_block(); the older
-     * delimiter-only parser is still accepted in trace_copy_model_output for
-     * compatibility with existing trace files.
+     * output: the byte count trace_write_block() writes is what bounds a block.
      */
     const char *begin = bounded_strstr(line, line_end, "_BEGIN bytes=");
     if (!begin || begin == line) return NULL;
@@ -3540,8 +3529,8 @@ static const eval_case *find_eval_case_by_source_id(const char *source,
     return NULL;
 }
 
-/** @brief Copy a trace case's MODEL_OUTPUT block: by its byte count, or up to "MODEL_OUTPUT_END" for traces
- *  written before counted blocks.
+/** @brief Copy a trace case's MODEL_OUTPUT block by its byte count ("MODEL_OUTPUT_BEGIN bytes=N"; a block without
+ *  the count, from before counted blocks, is malformed).
  *  @param case_start the case's start
  *  @param case_end   its end
  *  @return a malloc'd copy (caller frees), or NULL when the block is missing or malformed */
@@ -3552,25 +3541,19 @@ static char *trace_copy_model_output(const char *case_start, const char *case_en
     if (!line_end) return NULL;
     const char *content = line_end + 1;
 
-    size_t len = 0;
     const char *bytes = bounded_strstr(begin, line_end, "bytes=");
-    if (bytes) {
-        char *endptr = NULL;
-        unsigned long long declared = strtoull(bytes + 6, &endptr, 10);
-        if (endptr == bytes + 6 || endptr > line_end ||
-            declared > (unsigned long long)(case_end - content))
-            return NULL;
-        len = (size_t)declared;
-        const char *marker = content + len;
-        if (marker < case_end && *marker == '\n') marker++;
-        if ((size_t)(case_end - marker) < strlen("MODEL_OUTPUT_END") ||
-            memcmp(marker, "MODEL_OUTPUT_END", strlen("MODEL_OUTPUT_END")) != 0)
-            return NULL;
-    } else {
-        const char *finish = bounded_strstr(content, case_end, "\nMODEL_OUTPUT_END");
-        if (!finish) return NULL;
-        len = (size_t)(finish - content);
-    }
+    if (!bytes) return NULL;
+    char *endptr = NULL;
+    unsigned long long declared = strtoull(bytes + 6, &endptr, 10);
+    if (endptr == bytes + 6 || endptr > line_end ||
+        declared > (unsigned long long)(case_end - content))
+        return NULL;
+    const size_t len = (size_t)declared;
+    const char *marker = content + len;
+    if (marker < case_end && *marker == '\n') marker++;
+    if ((size_t)(case_end - marker) < strlen("MODEL_OUTPUT_END") ||
+        memcmp(marker, "MODEL_OUTPUT_END", strlen("MODEL_OUTPUT_END")) != 0)
+        return NULL;
 
     char *out = (char *)malloc(len + 1);
     if (!out) {
@@ -3667,7 +3650,7 @@ static int regrade_trace_file(const char *path) {
 
         char *model_output = trace_copy_model_output(case_start, case_end);
         if (!model_output) {
-            fprintf(stderr, "pulsar-eval: trace case %d is missing MODEL_OUTPUT block: %s/%s\n",
+            fprintf(stderr, "pulsar-eval: trace case %d has no counted MODEL_OUTPUT block (bytes=N): %s/%s\n",
                     total, source, id);
             parse_errors++;
             continue;
