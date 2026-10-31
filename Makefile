@@ -575,9 +575,9 @@ exl3-moe-epilogue-gate: tests/exl3_moe_epilogue_gate
 # host authority in double; M-neutrality bit-exact; mutations; refusals.
 # Links the PRODUCTION object (the MMQ rule, the engine's NVCCFLAGS), so pass
 # the served arch: make exl3-dense-gate CUDA_ARCH=sm_120f.  Model-free.
-tests/exl3_dense_gate: tests/exl3_dense_gate.cu tests/exl3_dense_ref.h src/cuda/mmq/ds4_exl3_dense.o src/cuda/mmq/qwen_exl3_dense_prefill.o src/cuda/pulsar_cuda_lt_fixed.o Makefile \
+tests/exl3_dense_gate: tests/exl3_dense_gate.cu tests/exl3_dense_ref.h $(CUDA_OBJS) $(CUTLASS_CUDA_OBJS) $(MMQ_OBJS) Makefile \
                        src/cuda/mmq/ds4_exl3_dense.cuh src/cuda/pulsar_cuda_mx.cuh src/engine/exl3_trellis.h
-	$(NVCC) $(NVCCFLAGS) -std=c++17 -Isrc -Isrc/cuda -o $@ tests/exl3_dense_gate.cu src/cuda/mmq/ds4_exl3_dense.o src/cuda/mmq/qwen_exl3_dense_prefill.o src/cuda/pulsar_cuda_lt_fixed.o -lcublasLt
+	$(NVCC) $(NVCCFLAGS) -std=c++17 -Isrc -Isrc/cuda -o $@ tests/exl3_dense_gate.cu $(CUDA_OBJS) $(CUTLASS_CUDA_OBJS) $(MMQ_OBJS) $(CUDA_LDLIBS)
 
 .PHONY: exl3-dense-gate
 exl3-dense-gate: tests/exl3_dense_gate
@@ -627,9 +627,9 @@ tests/exl3_moe_decode_bench: tests/exl3_moe_decode_bench.cu $(CUDA_OBJS) $(CUTLA
 # L251: the dense arm on a REAL exllamav3-quantized weight, driven by
 # the private notes' research/l251/exl3-dense/xcheck.py (which compares it with
 # exllamav3's own forward on the same activations).  Not a gate.
-tests/exl3_dense_xcheck: tests/exl3_dense_xcheck.cu tests/exl3_dense_ref.h src/cuda/mmq/ds4_exl3_dense.o src/cuda/mmq/qwen_exl3_dense_prefill.o src/cuda/pulsar_cuda_lt_fixed.o Makefile \
+tests/exl3_dense_xcheck: tests/exl3_dense_xcheck.cu tests/exl3_dense_ref.h $(CUDA_OBJS) $(CUTLASS_CUDA_OBJS) $(MMQ_OBJS) Makefile \
                          src/cuda/mmq/ds4_exl3_dense.cuh src/cuda/pulsar_cuda_mx.cuh src/engine/exl3_trellis.h
-	$(NVCC) $(NVCCFLAGS) -std=c++17 -Isrc -Isrc/cuda -o $@ tests/exl3_dense_xcheck.cu src/cuda/mmq/ds4_exl3_dense.o src/cuda/mmq/qwen_exl3_dense_prefill.o src/cuda/pulsar_cuda_lt_fixed.o -lcublasLt
+	$(NVCC) $(NVCCFLAGS) -std=c++17 -Isrc -Isrc/cuda -o $@ tests/exl3_dense_xcheck.cu $(CUDA_OBJS) $(CUTLASS_CUDA_OBJS) $(MMQ_OBJS) $(CUDA_LDLIBS)
 
 # L251: the dense arm's microbenchmark -- EXL3 K=2..5 vs the engine's MXFP8
 # decode GEMV (the production wrapper, decode rows declared, the A8 slot armed)
