@@ -5490,6 +5490,42 @@ static void test_parse_completion_request_refuses_logprobs(void) {
     }
 }
 
+/* L335: /v1/completions takes ONE text prompt -- a string or an array of one string.  A batch (an array of more than
+ * one prompt), token ids, an empty array or a non-string refuse by name; they used to read as their first element
+ * (the rest of the batch dropped) or as "". */
+static void test_parse_completion_prompt_shapes(void) {
+    static const char *const ok[][2] = {{"\"hi\"", "hi"}, {"[\"hi\"]", "hi"}, {" [ \"x y\" ] ", "x y"}};
+    for (const auto &c : ok) {
+        const char *p = c[0];
+        char *out = NULL;
+        char err[200] = "";
+        TEST_ASSERT(parse_prompt(&p, &out, err, sizeof err));
+        TEST_ASSERT(out && !strcmp(out, c[1]));
+        free(out);
+    }
+    static const char *const refused[][2] = {
+        {"{\"prompt\": [\"a\", \"b\"]}", "batch completions are not supported"},
+        {"{\"prompt\": [\"a\", 7]}", "batch completions are not supported"},
+        {"{\"prompt\": [1, 2, 3]}", "token-id prompts are not supported"},
+        {"{\"prompt\": [[1, 2]]}", "token-id prompts are not supported"},
+        {"{\"prompt\": []}", "prompt is an empty array"},
+        {"{\"prompt\": 42}", "prompt must be a string"},
+        {"{\"prompt\": null}", "prompt must be a string"},
+        {"{\"prompt\": {\"text\": \"hi\"}}", "prompt must be a string"},
+    };
+    for (const auto &c : refused) {
+        request r;
+        char err[256] = "";
+        TEST_ASSERT(!parse_completion_request(NULL, c[0], 16, &r, err, sizeof err));
+        if (!strstr(err, c[1])) fprintf(stderr, "prompt shape %s: refused with \"%s\"\n", c[0], err);
+        TEST_ASSERT(strstr(err, c[1]) != NULL);
+    }
+    request r;
+    char err[256] = "";
+    TEST_ASSERT(!parse_completion_request(NULL, "{\"prompt\": [\"a\"", 16, &r, err, sizeof err));
+    TEST_ASSERT(!strcmp(err, "invalid JSON request"));   /* malformed JSON keeps the generic reason */
+}
+
 /* The string-valued JSON helpers must null *out on FAILURE, so the parsers'
  * duplicate-key idiom `free(x); if (!helper(&p, &x)) goto fail;` cannot
  * double-free x (the fail label frees it again).  A malformed second value on
@@ -5508,11 +5544,15 @@ static bool responses_content_probe(const char **p, char **out) {
     return parse_responses_content_array(p, out, NULL, NULL, 0);
 }
 
+static bool prompt_probe(const char **p, char **out) {
+    return parse_prompt(p, out, NULL, 0);
+}
+
 static void test_json_value_helpers_null_out_on_failure(void) {
     struct { const char *name; bool (*fn)(const char **, char **); const char *bad; } cases[] = {
         {"json_content",       json_content,       "[}"},
         {"json_raw_value",     json_raw_value,     "tru"},
-        {"parse_prompt",       parse_prompt,       "[42, "},
+        {"parse_prompt",       prompt_probe,       "[\"a\" "},
         {"parse_responses_content_array", responses_content_probe, "[{"},
         {"parse_anthropic_system",        parse_anthropic_system,        "[{\"type\":}"},
     };
@@ -12003,6 +12043,7 @@ static void pulsar_server_unit_tests_run(void) {
     test_anthropic_tool_result_image();
     test_parse_sampling_key_contract();
     test_parse_completion_request_refuses_logprobs();
+    test_parse_completion_prompt_shapes();
     test_json_parser_handles_tool_heavy_requests();
     test_json_string_handles_surrogates();
     test_model_metadata_clamps_completion_to_context();

@@ -1609,12 +1609,17 @@ bool parse_responses_request(pulsar_engine *e, server *s, const char *body, int 
 
 
 
-/// Read a completions "prompt": a string, or the first string of an array (later elements skipped); any other
-/// value reads as "".
-/// @param p    the parse cursor, at the value (advanced past it)
-/// @param out  receives the prompt (malloc'd; NULL on failure)
-/// @return false on malformed JSON
-static bool parse_prompt(const char **p, char **out) {
+/* L335: the OpenAI completions "prompt" is a string, an array of strings (a BATCH: one choice per prompt), or
+ * token ids (an array of integers, or of integer arrays).  This server answers one prompt, as text: a string, or an
+ * array holding exactly one string.  Every other shape refuses by name -- it used to read as "" (a non-string) or as
+ * its first element (the rest of a batch dropped). */
+/// Read a completions "prompt": a string, or an array of exactly one string.
+/// @param p       the parse cursor, at the value (advanced past it)
+/// @param out     receives the prompt (malloc'd; NULL on failure)
+/// @param err     receives the reason for a refused shape (NULL: not written; left as is on malformed JSON)
+/// @param errlen  size of `err`
+/// @return false on malformed JSON, or (+ err) a prompt that is not one string
+static bool parse_prompt(const char **p, char **out, char *err, size_t errlen) {
     /* Build into a local and publish to *out only on success, so every
      * failure return leaves *out == NULL (the double-free contract, see
      * json_string_n) rather than a partially-parsed heap value. */
@@ -1622,27 +1627,26 @@ static bool parse_prompt(const char **p, char **out) {
     json_ws(p);
     if (**p == '"') return json_string(p, out);
     if (**p != '[') {
-        if (!json_skip_value(p)) return false;
-        *out = xstrdup("");
-        return true;
+        if (err && errlen) snprintf(err, errlen, "prompt must be a string (or an array of one string)");
+        return false;
     }
     (*p)++;
     json_ws(p);
-    char *s = NULL;
-    if (**p == '"') {
-        if (!json_string(p, &s)) return false;
-    } else {
-        s = xstrdup("");
-        if (**p && **p != ']' && !json_skip_value(p)) { free(s); return false; }
+    if (**p != '"') {
+        if (err && errlen)
+            snprintf(err, errlen, **p == ']' ? "prompt is an empty array: send one string"
+                                             : "prompt: token-id prompts are not supported; send the text as a string");
+        return false;
     }
-    while (**p && **p != ']') {
-        json_ws(p);
-        if (**p == ',') {
-            (*p)++;
-            if (!json_skip_value(p)) { free(s); return false; }
-        } else {
-            break;
-        }
+    char *s = NULL;
+    if (!json_string(p, &s)) return false;
+    json_ws(p);
+    if (**p == ',') {
+        if (err && errlen)
+            snprintf(err, errlen, "prompt: an array of more than one prompt is a batch, and batch completions are not "
+                     "supported (send one request per prompt)");
+        free(s);
+        return false;
     }
     if (**p != ']') { free(s); return false; }
     (*p)++;
@@ -1664,6 +1668,7 @@ bool parse_completion_request(pulsar_engine *e, const char *body, int def_tokens
                                      request *r, char *err, size_t errlen) {
     request_init(r, REQ_COMPLETION, def_tokens);
     r->family = server_family_for_engine(e);
+    if (errlen) err[0] = '\0';
     const char *p = body;
     char *prompt = NULL;
     int skr = 0;
@@ -1687,7 +1692,7 @@ bool parse_completion_request(pulsar_engine *e, const char *body, int def_tokens
         p++;
         if (!strcmp(key, "prompt")) {
             free(prompt);
-            if (!parse_prompt(&p, &prompt)) {
+            if (!parse_prompt(&p, &prompt, err, errlen)) {
                 free(key);
                 goto bad;
             }
@@ -1807,7 +1812,7 @@ bool parse_completion_request(pulsar_engine *e, const char *body, int def_tokens
 bad:
     for (int i = 0; i < n_controls; i++) free(controls[i].raw);
     free(prompt);
-    snprintf(err, errlen, "invalid JSON request");
+    if (!err[0]) snprintf(err, errlen, "invalid JSON request");   /* a refusal that named its reason keeps it */
     request_free(r);
     return false;
 }
