@@ -457,10 +457,17 @@ const pulsar_family *pulsar_family_for_model(const pulsar_model *m);
 /// @return 0
 uint64_t pulsar_family_rope_fixed(const pulsar_engine *e);
 
+/** The ops pulsar_refusal_first remembers; past them a refusal is said every time (and that fact once). */
+#define PULSAR_REFUSAL_OPS_MAX 64u
+/** Rule 9's "once" for the library's named refusals: true the first time `op` is asked about (the caller says its
+ *  refusal now), false after.  Shared by pulsar_family_require and the tokenizer entries (tokenizer.cpp). */
+/// @param op the operation's name (a string literal: its address identifies it)
+/// @return true when the caller should say the refusal
+bool pulsar_refusal_first(const char *op);
 /** True when the engine's family declares `cap`.  Otherwise prints, once per
- * (op) call site, "<family> does not implement <op>" and returns false: the
- * caller refuses with its own error value.  A NULL engine passes (the caller's
- * own NULL check decides). */
+ * (op) call site (pulsar_refusal_first), "<family> does not implement <op>" and
+ * returns false: the caller refuses with its own error value.  A NULL engine
+ * passes (the caller's own NULL check decides). */
 /// @param e the engine, or NULL
 /// @param cap the PULSAR_FAMILY_CAP_* bits required
 /// @param op the operation's name (a string literal: its address dedups the message)

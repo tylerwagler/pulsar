@@ -3850,6 +3850,16 @@ static void test_l308_copy_estimate(void) {
     TEST_ASSERT(pulsar_spec_copy_price(&sp, 0.0f, 8u, conf, &rp) == 8u && !rp && conf[0] == 1.0f);
 }
 
+/* L335: the library's say-once table (family.cpp pulsar_refusal_first) -- an op is said the first time only; past
+ * PULSAR_REFUSAL_OPS_MAX ops every refusal is said (the table never silently drops one), and that fact once. */
+static void test_refusal_once(void) {
+    static char ops[PULSAR_REFUSAL_OPS_MAX + 8u][2];   /* distinct addresses: the table keys on them */
+    const uint32_t n = PULSAR_REFUSAL_OPS_MAX + 8u;
+    for (uint32_t i = 0; i < n; i++) TEST_ASSERT(pulsar_refusal_first(ops[i]));
+    TEST_ASSERT(!pulsar_refusal_first(ops[0]));       /* remembered: said once */
+    TEST_ASSERT(pulsar_refusal_first(ops[n - 1u]));   /* past the table: said again, not dropped */
+}
+
 /* L335: the state plan's decl table (state_kinds.cpp) filled past PULSAR_STATE_DECLS_MAX -- the add counts the
  * overflow and returns an id past the table (never UINT32_MAX, which a family shifts by), and the create refuses
  * the plan by name before it allocates anything.  Host only: the refusal runs before the device. */
@@ -4831,6 +4841,7 @@ static const pulsar_test_entry test_entries[] = {
     {"--fused-cost", "fused-cost", "the prompt chunk cost fit (solo + fused, persisted) and the verify curve's round cost, what the round selection and the disk restore price by (L304, L312, L327)", test_fused_cost},
     {"--fused-sched", "fused-sched", "the round selection simulated on L304's logged costs: L304's and L277's cases, the stall, no prompt, the cold fit (L312)", test_fused_sched},
     {"--read-ahead", "read-ahead", "the next-chunk PLE read-ahead: its rule (one chunk ahead, each row once, a changed prompt drops), the pool's background class (bytes unchanged, below every gather, cancel, accounting) (L329 b2)", test_read_ahead},
+    {"--refusal-once", "refusal-once", "the library's say-once refusal table: once per op, every refusal said past its bound (L335)", test_refusal_once},
     {"--state-plan", "state-plan", "the state plan's decl table: a full table counts the overflow and the create refuses it by name (L335)", test_state_plan_overflow},
     {"--ckpt-records", "ckpt-records", "the record pool (prompt ends, message endpoints: capture, match, LRU, frontier rule) and the endpoint cut (L311)", test_ckpt_records},
     {"--verify-pick", "verify-pick", "the verify pick: the brute-force argmax on a staircase curve, the robust online correction, the lockstep continuation (L301); the copy estimate's re-probe (L308)", test_verify_pick},
