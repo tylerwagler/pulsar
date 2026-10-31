@@ -169,7 +169,7 @@ bool refuse(const char *fmt, const char *key, const char *more = "") {
     return false;
 }
 
-/* A string array of block kinds: each one of `allowed` (ascending index = HF block). */
+/* A string array of block kinds: each "mamba", "attention" or "moe" (ascending index = HF block). */
 /** @param m      the container
  *  @param key    the array key (layers_block_type or mtp_layers_block_type)
  *  @param kinds  receives each entry, NUL-terminated: "mamba", "attention" or "moe"
