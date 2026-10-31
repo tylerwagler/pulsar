@@ -951,7 +951,7 @@ bool gpu_graph_encode_output_head(
     /* The collapse is SHARED; only the coefficient source differs.  0731 binds
      * output_hc_* and computes its own; V4.1 binds none and collapses with the
      * pre its last FFN handed on.  The bind is the fact -- a 0731 artifact
-     * missing the group dies at load (weights_bind_output). */
+     * missing the group is refused at load (weights_bind_output). */
     if (weights->output_hc_fn) {
         if (!weights->output_hc_scale || !weights->output_hc_base) {
             fprintf(stderr, "pulsar: output_hc_fn is bound without scale/base -- refusing\n");

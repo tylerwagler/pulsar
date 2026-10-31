@@ -387,13 +387,6 @@ bool weights_have_output_head(const pulsar_weights *w) {
 
 
 
-/// @param w the weights, or NULL
-/// @return true when output_norm or output is bound
-static bool weights_have_partial_output_head(const pulsar_weights *w) {
-    return w && (w->output_norm || w->output);
-}
-
-
 
 /// @param l the layer's tensors, or NULL
 /// @param il the layer
@@ -499,7 +492,6 @@ static void weights_validate_layout(
 
     const bool have_output = weights_have_output_head(w);
     if (require_output && !have_output) pulsar_die("required output head tensors are missing");
-    if (weights_have_partial_output_head(w) && !have_output) pulsar_die("partial output head in the checkpoint");
     if (have_output) {
         tensor_expect_f32_or_bf16(w->output_norm,  1, PULSAR_N_EMBD, 0, 0);
         /* Output head is BF16 (source format, kept lossless by a dedicated BF16
@@ -766,8 +758,9 @@ static void pulsar_select_shape_from_metadata(
 
 
 /* Read an int32/uint32 array key into `out` (capacity `cap`), returning its
- * length.  Dies when the key is missing, the wrong type, longer than `cap`, or
- * carries a negative value. */
+ * length.  A key that is missing, the wrong type or longer than `cap` is refused
+ * (said, counted: pulsar_load_refuse) and reads as length 0; a short read or a
+ * negative value dies. */
 /// @param m the model
 /// @param key an int32 / uint32 array key
 /// @param[out] out [cap] values
@@ -884,21 +877,33 @@ static void validate_reap_metadata(const pulsar_model *m) {
     pulsar_array_ref arr;
     if (!model_get_array(m, key, &arr) ||
         (arr.type != PULSAR_META_UINT32 && arr.type != PULSAR_META_INT32)) {
-        pulsar_die("reap.enabled is set but reap.layer.keep_count is missing or not an int32/uint32 array");
+        fprintf(stderr, "pulsar: reap.enabled is set but %s is missing or not an int32/uint32 array -- refusing\n", key);
+        pulsar_load_refuse();
+        return;
     }
     if (arr.len < PULSAR_N_LAYER) {
-        pulsar_die("reap.layer.keep_count is shorter than the layer count");
+        fprintf(stderr, "pulsar: %s has %llu entries, not one per layer (%u) -- refusing\n", key,
+                (unsigned long long)arr.len, PULSAR_N_LAYER);
+        pulsar_load_refuse();
+        return;
     }
 
     pulsar_cursor c = cursor_at(m, arr.data_pos);
     for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
         uint32_t got = 0;
-        if (arr.type == PULSAR_META_UINT32) {
-            if (!cursor_u32(&c, &got)) pulsar_die(c.error);
-        } else {
-            int32_t v = 0;
-            if (!cursor_read(&c, &v, sizeof(v))) pulsar_die(c.error);
-            if (v < 0) pulsar_die("reap.layer.keep_count contains a negative value");
+        int32_t v = 0;
+        const bool read = arr.type == PULSAR_META_UINT32 ? cursor_u32(&c, &got) : cursor_read(&c, &v, sizeof(v));
+        if (!read) {
+            fprintf(stderr, "pulsar: %s[%u]: %s -- refusing\n", key, il, c.error);
+            pulsar_load_refuse();
+            return;
+        }
+        if (arr.type == PULSAR_META_INT32) {
+            if (v < 0) {
+                fprintf(stderr, "pulsar: %s[%u]=%d is negative -- refusing\n", key, il, v);
+                pulsar_load_refuse();
+                return;
+            }
             got = (uint32_t)v;
         }
         if (got == 0 || got > PULSAR_N_EXPERT) {
@@ -926,19 +931,24 @@ static void validate_swiglu_clamp_metadata(const pulsar_model *m) {
         return;
     }
     if (arr.len < PULSAR_N_LAYER) {
-        pulsar_die("deepseek4.swiglu_clamp_exp is shorter than the layer count");
+        fprintf(stderr, "pulsar: %s has %llu entries, not one per layer (%u) -- refusing\n", key,
+                (unsigned long long)arr.len, PULSAR_N_LAYER);
+        pulsar_load_refuse();
+        return;
     }
 
     pulsar_cursor c = cursor_at(m, arr.data_pos);
     for (uint32_t i = 0; i < PULSAR_N_LAYER; i++) {
         float got = 0.0f;
-        if (arr.type == PULSAR_META_FLOAT32) {
-            if (!cursor_read(&c, &got, sizeof(got))) pulsar_die(c.error);
-        } else {
-            double v = 0.0;
-            if (!cursor_read(&c, &v, sizeof(v))) pulsar_die(c.error);
-            got = (float)v;
+        double v = 0.0;
+        const bool read = arr.type == PULSAR_META_FLOAT32 ? cursor_read(&c, &got, sizeof(got))
+                                                          : cursor_read(&c, &v, sizeof(v));
+        if (!read) {
+            fprintf(stderr, "pulsar: %s[%u]: %s -- refusing\n", key, i, c.error);
+            pulsar_load_refuse();
+            return;
         }
+        if (arr.type == PULSAR_META_FLOAT64) got = (float)v;
         config_expect_f32("swiglu_clamp_exp", got, PULSAR_SWIGLU_CLAMP_EXP);
     }
 }
@@ -1387,12 +1397,10 @@ void weights_reject_bad_e8m0(const pulsar_model *m) {
 
 
 
-/// Bind the output head (and 0731's HC head mix).
+/// Bind the output head (and 0731's HC head mix), every tensor required (a missing one is refused by name).
 /// @param[out] w the weights
 /// @param m the model
-/// @param required bind output_norm / output as required
-/// @param optional when not required: bind them if present (a partial head dies)
-static void weights_bind_output(pulsar_weights *w, const pulsar_model *m, bool required, bool optional) {
+static void weights_bind_output(pulsar_weights *w, const pulsar_model *m) {
     /* 0731's HC head mix.  REQUIRED where the profile says the head computes its
      * own coefficients: a 0731 artifact missing the group would otherwise
      * collapse with V4.1's carried pre -- the wrong arithmetic for the model,
@@ -1402,18 +1410,8 @@ static void weights_bind_output(pulsar_weights *w, const pulsar_model *m, bool r
         w->output_hc_scale = required_tensor(m, "output_hc_scale.weight");
         w->output_hc_base  = required_tensor(m, "output_hc_base.weight");
     }
-    if (required) {
-        w->output_norm      = required_tensor(m, "output_norm.weight");
-        w->output           = required_tensor(m, "output.weight");
-        return;
-    }
-    if (!optional) return;
-
-    w->output_norm      = model_find_tensor(m, "output_norm.weight");
-    w->output           = model_find_tensor(m, "output.weight");
-    if (weights_have_partial_output_head(w) && !weights_have_output_head(w)) {
-        pulsar_die("partial output head in the checkpoint");
-    }
+    w->output_norm      = required_tensor(m, "output_norm.weight");
+    w->output           = required_tensor(m, "output.weight");
 }
 
 
@@ -1561,7 +1559,7 @@ void weights_bind(pulsar_weights *w, const pulsar_model *m) {
     weights_reject_bad_e8m0(m);
 
     w->token_embd = required_tensor(m, "token_embd.weight");
-    weights_bind_output(w, m, true, false);
+    weights_bind_output(w, m);
 
     for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
         weights_bind_layer(&w->layer[il], m, il);
