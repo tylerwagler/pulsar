@@ -1,3 +1,5 @@
+/** @file gpu_decode.cpp
+ *  @brief DeepSeek graph decode: HC / Q readers, the DSpark drafter's forward and seeding, and the output head. */
 #include "pulsar_engine_internal.h"
 #include "pulsar_nvtx.h"
 #include "tp/pulsar_tp.h"
@@ -8,6 +10,11 @@
  * the stored 16 bits are the high half of the f32). Used ONLY by the dev-only
  * layer-0 parity self-test (since removed) and the env-gated DSpark
  * dumps — never the production decode path. n is a sample count. */
+/// @param t the carrier tensor
+/// @param off_elems the first sample, in samples
+/// @param out [n] receives f32 samples (untouched on failure)
+/// @param n samples
+/// @return nonzero on success, 0 on a failed read
 int pulsar_read_hc_carrier_f32(const pulsar_gpu_tensor *t, uint64_t off_elems,
                             float *out, uint64_t n) {
     uint16_t *tmp = (uint16_t *)xmalloc((size_t)n * sizeof(uint16_t));
@@ -73,6 +80,11 @@ uint32_t gpu_graph_prefill_slice(void) {
 
 
 
+/// The drafter's conditioning: its projection of the three captured target hiddens (dspark_target_h) into main_x.
+/// @param g the graph
+/// @param dspark_model the drafter's model
+/// @param w its weights
+/// @return false = an input is missing or a launch failed
 bool gpu_graph_dspark_project_main_x(
         pulsar_gpu_graph          *g,
         const pulsar_model         *dspark_model,
@@ -384,6 +396,16 @@ bool gpu_graph_dspark_seed_rows_banked(
     return true;
 }
 
+/// The single-bank drafter forward (gpu_graph_dspark_draft_forward_banks at one bank).
+/// @param g the graph
+/// @param base_model the target model
+/// @param base_weights its weights
+/// @param dspark_model the drafter's model
+/// @param w its weights
+/// @param base_logits_out receives the base logits rows
+/// @param draft_ids the block's input ids
+/// @param n_draft rows
+/// @return false = failed
 bool gpu_graph_dspark_draft_forward(
         pulsar_gpu_graph          *g,
         const pulsar_model         *base_model,
@@ -876,6 +898,13 @@ bool gpu_graph_dspark_draft_forward_banks(
  * kernel with a 64 KB f32 scratch round trip between them.  Anything that is
  * not a storage the fused kernel reads REFUSES rather than being read at the
  * wrong width.  plans/96-two-profiles-one-engine.md s17. */
+/// @param model the model
+/// @param w the HC mix weight (BF16 or F32)
+/// @param hc_dim the HC row width
+/// @param out_dim the mix's output width
+/// @param src_hc the HC row
+/// @param out receives the mix
+/// @return false = refused (said) or failed
 static bool gpu_graph_norm_mix_plain(
         const pulsar_model      *model,
         const pulsar_tensor     *w,
@@ -1059,6 +1088,17 @@ uint64_t gpu_graph_output_head_seg_key(bool hc_parity, uint32_t n_tokens, uint32
            (0xFFull << 16) | (2ull << 8) | (uint64_t)(n_tokens & 0xFFu);
 }
 
+/// The output head over batch rows [row0, row0 + n_tokens), vocab columns [vocab_lo, vocab_lo + vocab_dim)
+/// (a full-range head at row 0 runs as a captured segment).
+/// @param g the graph
+/// @param model the model
+/// @param weights its device weights
+/// @param row0 the first batch row
+/// @param n_tokens rows
+/// @param vocab_lo the first column
+/// @param vocab_dim columns
+/// @param out receives the logits rows
+/// @return false = failed
 bool gpu_graph_encode_output_head_batch(
         pulsar_gpu_graph *g,
         const pulsar_model       *model,
@@ -1119,6 +1159,12 @@ bool gpu_graph_encode_output_head_batch(
  *    a stride-wide row, and the stride is rounded up so the group exchange can
  *    carry one byte count per round.
  * ------------------------------------------------------------------------- */
+/// @tparam Head callable bool(uint32_t lo, uint32_t width, pulsar_gpu_tensor *dst): the head over vocab [lo, lo + width)
+/// @param g the graph (its TP group)
+/// @param n_rows rows
+/// @param head writes the rank's vocab slice
+/// @param out receives the full rows
+/// @return false = failed
 template <class Head>
 static bool tp_vocab_split(pulsar_gpu_graph *g, uint32_t n_rows, Head head,
                            pulsar_gpu_tensor *out) {
@@ -1142,6 +1188,14 @@ bool gpu_graph_encode_output_head_row_tp(
     }, out);
 }
 
+/// gpu_graph_encode_output_head_batch over the full vocab; on a TP group each rank's slice, gathered.
+/// @param g the graph
+/// @param model the model
+/// @param weights its device weights
+/// @param row0 the first batch row
+/// @param n_tokens rows
+/// @param out receives the full logits rows
+/// @return false = failed
 bool gpu_graph_encode_output_head_batch_tp(
         pulsar_gpu_graph *g,
         const pulsar_model       *model,
@@ -1157,6 +1211,16 @@ bool gpu_graph_encode_output_head_batch_tp(
     }, out);
 }
 
+/// The output head over batch rows [row0, row0 + n_tokens), vocab columns [vocab_lo, vocab_lo + vocab_dim).
+/// @param g the graph
+/// @param model the model
+/// @param weights its device weights
+/// @param row0 the first batch row
+/// @param n_tokens rows
+/// @param vocab_lo the first vocab column
+/// @param vocab_dim columns
+/// @param out receives the logits rows
+/// @return false = refused or failed
 static bool gpu_graph_encode_output_head_batch_impl(
         pulsar_gpu_graph *g,
         const pulsar_model       *model,
@@ -1303,6 +1367,14 @@ static bool gpu_graph_encode_output_head_batch_impl(
  * with the SHARED main output head (self.head).  The main model's
  * output_norm is the wrong norm for the drafter -- using it corrupted the
  * draft base logits (base0_hit was ~29%). */
+/// @param g the graph
+/// @param dspark_model the drafter's model
+/// @param dw its weights (its own norm)
+/// @param base_model the target model
+/// @param bw its weights (the shared output head)
+/// @param n_tokens rows (<= PULSAR_DSPARK_DRAFT_ROWS_MAX)
+/// @param vocab_dim logits columns (the full vocab on a TP group)
+/// @return false = refused or failed
 bool gpu_graph_encode_dspark_output_head_batch(
         pulsar_gpu_graph            *g,
         const pulsar_model          *dspark_model,

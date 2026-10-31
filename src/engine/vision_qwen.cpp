@@ -1,3 +1,5 @@
+/** @file vision_qwen.cpp
+ *  @brief L268: Qwen3.8-Flash-Next's own part of the image path. */
 /* vision_qwen.cpp -- L268: Qwen3.8-Flash-Next's own part of the image path.
  *
  * Everything an image shares with DeepSeek's lives elsewhere once: the codec and Pillow's resize (vision.cpp), the
@@ -46,6 +48,8 @@ bool qwen_vision_smart_resize(int h, int w, int *h_out, int *w_out, char *err, s
     return true;
 }
 
+/// Free a pixel buffer's values and zero it.
+/// @param p the buffer (NULL is a no-op)
 void qwen_vision_pixels_free(qwen_vision_pixels *p) {
     if (!p) return;
     free(p->values);
@@ -114,6 +118,12 @@ bool qwen_vision_preprocess(const uint8_t *bytes, size_t len, qwen_vision_pixels
 /* ---- the tower (L268 S3) ------------------------------------------------------------------------------------- */
 
 /* A bf16 tower tensor with exactly these dims (fastest-varying first), as a pointer into the mapping. */
+/// @param m the model
+/// @param[in,out] ok cleared on a refusal
+/// @param name the tensor name
+/// @param nd dims
+/// @param dims [nd] the required dims
+/// @return the mapped bytes, or NULL
 static const void *qv_bind(const pulsar_model *m, bool *ok, const char *name, uint32_t nd, const uint64_t *dims) {
     const pulsar_tensor *t = pulsar_tensor_bind(m, PULSAR_QWEN_ARCH, name);
     if (!t) { *ok = false; return NULL; }
@@ -127,6 +137,14 @@ static const void *qv_bind(const pulsar_model *m, bool *ok, const char *name, ui
     return (const char *)tensor_map_base(m, t) + t->abs_offset;
 }
 
+/** @def QV1(field, nm, n0)
+ *  qwen_vision_bind: bind 1-D bf16 tensor `nm` of [n0] into `field`. */
+/** @def QV2(field, nm, n0, n1)
+ *  qwen_vision_bind: bind 2-D bf16 tensor `nm` of [n0][n1] (fastest first) into `field`. */
+/** @def QVB1(field, suffix, n0)
+ *  qwen_vision_bind: QV1 on block l's tensor `model.visual.blocks.<l>.<suffix>`. */
+/** @def QVB2(field, suffix, n0, n1)
+ *  qwen_vision_bind: QV2 on block l's tensor `model.visual.blocks.<l>.<suffix>`. */
 bool qwen_vision_bind(const pulsar_model *m, pulsar_qwen_vision_weights_dev *w, bool *present) {
     *present = model_find_tensor(m, "model.visual.patch_embed.proj.weight") != NULL;
     if (!*present) return true;   /* a text-only artifact: images are refused by name */
@@ -176,6 +194,12 @@ bool qwen_vision_bind(const pulsar_model *m, pulsar_qwen_vision_weights_dev *w, 
 
 /* HF get_vision_interpolation_indices_and_weights (bilinear, align_corners) for one axis: the two taps into the
  * 48-wide table and their weights, in float32 as the reference computes them. */
+/// @param index the grid index on this axis
+/// @param size the grid's extent on this axis
+/// @param[out] t0 first tap
+/// @param[out] t1 second tap
+/// @param[out] w0 its weight
+/// @param[out] w1 its weight
 static void qv_axis_taps(int index, int size, int *t0, int *t1, float *w0, float *w1) {
     const int side = (int)PULSAR_QWEN_VISION_POS_SIDE;
     const float src = (float)index * (float)(side - 1) / (float)(size - 1 > 1 ? size - 1 : 1);
@@ -189,6 +213,8 @@ static void qv_axis_taps(int index, int size, int *t0, int *t1, float *w0, float
 }
 
 /* float32 -> bfloat16, round to nearest even (torch's .to(bfloat16)). */
+/// @param f a value
+/// @return its bf16 bits
 static uint16_t qv_f32_to_bf16(float f) {
     uint32_t u;
     memcpy(&u, &f, sizeof u);
@@ -255,15 +281,28 @@ bool qwen_vision_encode(const pulsar_qwen_vision_weights_dev *w, const uint8_t *
  * HF's get_rope_index has them); the pads' rows are the merger's output, row-major over the merged grid
  * (h' = grid_h / 2, w' = grid_w / 2), which is also the grid their multi-axis rope positions follow. */
 
+/// @param e the engine
+/// @return the image pad id, or -1 without a tower
 static int32_t qwen_pad_id(const pulsar_engine *e) {
     return e && e->qwen_weights ? e->qwen_weights->vision_pad_id : -1;
 }
 
+/// pulsar_family_vision::is_sentinel.
+/// @param e the engine
+/// @param id a token id
+/// @return id is the pad id
 static bool qwen_image_is_sentinel(const pulsar_engine *e, int32_t id) {
     const int32_t pad = qwen_pad_id(e);
     return pad >= 0 && id == pad;
 }
 
+/// pulsar_family_vision::block_extent.
+/// @param e the engine
+/// @param ids the sequence
+/// @param n its length
+/// @param start where to look
+/// @param[out] len the run of pads at start
+/// @return true when ids[start] is a pad
 static bool qwen_image_block_extent(const pulsar_engine *e, const int32_t *ids, int n, int start, int *len) {
     const int32_t pad = qwen_pad_id(e);
     if (pad < 0 || !ids || start < 0 || start >= n || ids[start] != pad || (start > 0 && ids[start - 1] == pad))
@@ -274,14 +313,34 @@ static bool qwen_image_block_extent(const pulsar_engine *e, const int32_t *ids, 
     return true;
 }
 
+/// pulsar_family_vision::placeholder_id.
+/// @param e the engine
+/// @return the pad id, or -1
 static int qwen_image_placeholder_id(const pulsar_engine *e) { return qwen_pad_id(e); }
 
 /* The merged grid of an image -- smart_resize's patch grid over the merge -- decoded once per image per process
  * (keyed by content: the licence, the identity and the expansion all ask). */
+/** One cached merged grid. */
 struct qwen_grid_entry { uint64_t key; size_t len; uint32_t h, w; };
+/** @var qwen_grid_entry::key
+ *  pulsar_image_content_hash of the image */
+/** @var qwen_grid_entry::len
+ *  the image's byte length, checked with the key */
+/** @var qwen_grid_entry::h
+ *  merged grid height: resized pixels / (patch x merge) */
+/** @var qwen_grid_entry::w
+ *  merged grid width: resized pixels / (patch x merge) */
+/// The merged-grid cache, 16 entries, FIFO-replaced; process-global, unlocked.
 static qwen_grid_entry g_qwen_grid[16];
+/// Entries used (<= 16).
 static int g_qwen_grid_n = 0, g_qwen_grid_next = 0;
+                                                ///< replacements made once full (slot = next % 16)
 
+/// pulsar_family_vision::grid.
+/// @param img the image
+/// @param[out] h merged grid height
+/// @param[out] w merged grid width
+/// @return false when it does not decode or resize
 static bool qwen_image_grid(const pulsar_engine *, const pulsar_image_ref *img, uint32_t *h, uint32_t *w) {
     const uint64_t key = pulsar_image_content_hash(img);
     for (int i = 0; i < g_qwen_grid_n; i++)
@@ -308,6 +367,13 @@ static bool qwen_image_grid(const pulsar_engine *, const pulsar_image_ref *img, 
     return true;
 }
 
+/// pulsar_family_vision::expand: h x w pads for one image.
+/// @param e the engine
+/// @param img the image
+/// @param[in,out] out ids appended
+/// @param err message buffer
+/// @param errlen its size
+/// @return false + err when it does not decode
 static bool qwen_image_expand(const pulsar_engine *e, const pulsar_image_ref *img, pulsar_tokens *out, char *err,
                               size_t errlen) {
     uint32_t h = 0, w = 0;
@@ -319,8 +385,22 @@ static bool qwen_image_expand(const pulsar_engine *e, const pulsar_image_ref *im
     return true;
 }
 
+/// pulsar_family_vision::row_width.
+/// @return PULSAR_QWEN_VISION_OUT
 static uint32_t qwen_image_row_width(const pulsar_engine *) { return PULSAR_QWEN_VISION_OUT; }
 
+/// pulsar_family_vision::block_rows: the block's rows, from the cached tower output or a fresh encode.
+/// @param e the engine
+/// @param img the image
+/// @param block_len the block's pads
+/// @param tower cached tower rows, or NULL
+/// @param n_tower their count
+/// @param[out] tower_out a fresh encode's rows (caller owns), when tower is NULL
+/// @param[out] n_tower_out their count
+/// @param[out] out [block_len][PULSAR_QWEN_VISION_OUT] bf16
+/// @param err message buffer
+/// @param errlen its size
+/// @return false + err on a failed encode or a row count that is not the block's
 static bool qwen_image_block_rows(const pulsar_engine *e, const pulsar_image_ref *img, const int32_t *, int block_len,
                                   const uint16_t *tower, int n_tower, uint16_t **tower_out, int *n_tower_out,
                                   uint16_t *out, char *err, size_t errlen) {

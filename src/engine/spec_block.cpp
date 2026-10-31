@@ -1,3 +1,5 @@
+/** @file spec_block.cpp
+ *  @brief The block drafter (spec_block.h): binding, state, context absorb, block forward and chain. */
 /* spec_block.cpp -- the block drafter (spec_block.h; L298): its declaration and binding from the container, its
  * declared state, the context absorb, the block forward and the chain, behind the speculation round API
  * (session_spec.cpp) and the core driver's verify target (step_driver.cpp PULSAR_DRIVER_SPEC_TARGET). */
@@ -19,9 +21,16 @@
 
 namespace {
 
+/// The owner name for this file's messages.  TODO(dox): not referenced anywhere in the file.
 const char *const OWNER = "block drafter";
+/// The bind block of the drafter's own tensors (role names "drafter.*").
 const char *const BLOCK = "drafter";
 
+/// A load-time refusal: one "pulsar: block drafter: ... -- refusing" line, counted (pulsar_load_refuse).
+/// @param fmt printf format; it must consume both %s (pass "%s" / "%s%s" tails where a or b is unused)
+/// @param a first string argument
+/// @param b second string argument
+/// @return false, always
 bool refuse(const char *fmt, const char *a = "", const char *b = "") {
     fprintf(stderr, "pulsar: block drafter: ");
     fprintf(stderr, fmt, a, b);
@@ -29,27 +38,51 @@ bool refuse(const char *fmt, const char *a = "", const char *b = "") {
     pulsar_load_refuse();
     return false;
 }
+/// A step-time refusal: one "-- refusing the step" line, not counted.
+/// @param what what refused
+/// @return false, always
 bool fail(const char *what) {
     fprintf(stderr, "pulsar: block drafter: %s -- refusing the step\n", what);
     return false;
 }
+/// @param x a byte count
+/// @return x rounded up to a multiple of 256 bytes
 uint64_t a256(uint64_t x) { return (x + 255u) & ~(uint64_t)255u; }
+/// @param t a device tensor
+/// @return its device pointer
 void *dptr(pulsar_gpu_tensor *t) { return pulsar_gpu_tensor_device_ptr(t); }
 
+/// @param e the engine
+/// @return its loaded block drafter (pulsar_engine::block_drafter), or NULL when it has none
 const pulsar_block_drafter *DR(const pulsar_engine *e) { return e->block_drafter; }
 
 /* ---- the declaration ------------------------------------------------------------------------------------------- */
 
+/// Read a required unsigned key that fits 32 bits; refuses (counted) otherwise.
+/// @param m the container
+/// @param key the full metadata key
+/// @param out receives the value
+/// @return false = refused
 bool get_u32(const pulsar_model *m, const char *key, uint32_t *out) {
     uint64_t v = 0;
     if (!model_get_u64_compat(m, key, &v) || v > 0xffffffffull) return refuse("%s is missing or not an unsigned integer%s", key);
     *out = (uint32_t)v;
     return true;
 }
+/// Read a required finite float key; refuses (counted) otherwise.
+/// @param m the container
+/// @param key the full metadata key
+/// @param out receives the value
+/// @return false = refused
 bool get_f32(const pulsar_model *m, const char *key, float *out) {
     if (!model_get_f32_compat(m, key, out) || !isfinite(*out)) return refuse("%s is missing or not a finite number%s", key);
     return true;
 }
+/// Require a bool key to be present and hold `want` (the value the lane implements).
+/// @param m the container
+/// @param key the full metadata key
+/// @param want the required value
+/// @return false = refused (counted)
 bool want_bool(const pulsar_model *m, const char *key, bool want) {
     bool v = !want;
     if (!model_get_bool(m, key, &v)) return refuse("%s is missing or not a bool%s", key);
@@ -60,6 +93,9 @@ bool want_bool(const pulsar_model *m, const char *key, bool want) {
 /* L280: the GQA block runs the native NeoX rope at the drafter's own base (rope_theta), at the target's absolute
  * positions -- the HF reference's rope.  A config that declares another rope type (YaRN, linear, ...) under `key`
  * describes a rope that would not run, so it refuses; an absent key is the native rope. */
+/// @param m the container
+/// @param key the full key of the rope type
+/// @return true when absent or "default"; false = refused (counted)
 bool want_native_rope(const pulsar_model *m, const char *key) {
     bool present = false;
     for (uint64_t i = 0; i < m->n_kv && !present; i++) present = pulsar_streq(m->kv[i].key, key);
@@ -76,6 +112,13 @@ bool want_native_rope(const pulsar_model *m, const char *key) {
 }
 
 /* an array of unsigned block ids */
+/// Read a required integer array of block ids (each 0 .. 0xffff).
+/// @param m the container
+/// @param key the full metadata key
+/// @param out receives the ids, [cap]
+/// @param cap the most entries accepted
+/// @param n receives the entry count (1 .. cap)
+/// @return false = refused (counted)
 bool get_ids(const pulsar_model *m, const char *key, uint32_t *out, uint32_t cap, uint32_t *n) {
     pulsar_array_ref arr;
     if (!model_get_array(m, key, &arr) ||
@@ -108,14 +151,51 @@ namespace {
 
 /* THE KIND TABLE (spec_block.h THE DECLARATION): per kind, where its config keeps each number (keys under
  * "<kind>."), the chain head it ends in and its stop rule's tau. */
+/// One drafter kind's row of the kind table: its config key names (relative to "<kind>."), chain head and tau.
 struct kind_decl {
+    /// The kind, as pulsar.drafter names it ("lilicorr", "dflash2").
     const char *kind;
+    /// The chain head the kind ends in.
     pulsar_block_head_kind head;
+    /// The stop rule's tau for the kind (measured; see k_kinds).
     float tau;
+    /** @var kind_decl::n_layer
+     *  Config key of pulsar_block_drafter::n_layer. */
+    /** @var kind_decl::n_head
+     *  Config key of pulsar_block_drafter::n_head. */
+    /** @var kind_decl::n_kv
+     *  Config key of pulsar_block_drafter::n_kv. */
+    /** @var kind_decl::head_dim
+     *  Config key of pulsar_block_drafter::head_dim. */
+    /** @var kind_decl::ff
+     *  Config key of pulsar_block_drafter::ff. */
+    /** @var kind_decl::vocab
+     *  Config key of pulsar_block_drafter::vocab. */
+    /** @var kind_decl::block
+     *  Config key of pulsar_block_drafter::block. */
+    /** @var kind_decl::eps
+     *  Config key of pulsar_block_drafter::eps. */
+    /** @var kind_decl::rope_theta
+     *  Config key of pulsar_block_drafter::rope_theta. */
+    /// Config key of pulsar_block_drafter::hidden.
     const char *hidden, *n_layer, *n_head, *n_kv, *head_dim, *ff, *vocab, *block, *eps, *rope_theta;
+    /** @var kind_decl::conv_taps
+     *  Config key of pulsar_block_drafter::conv_taps. */
+    /** @var kind_decl::conv_group
+     *  Config key of pulsar_block_drafter::conv_group. */
+    /** @var kind_decl::window
+     *  Config key of pulsar_block_drafter::window. */
+    /** @var kind_decl::topk
+     *  Config key of pulsar_block_drafter::topk. */
+    /** @var kind_decl::taps
+     *  Config key of the tapped target block ids (pulsar_block_drafter::tap_block). */
+    /// Config key of pulsar_block_drafter::mask_id.
     const char *mask, *conv_taps, *conv_group, *window, *topk, *taps;
+    /// Config key of the causal flag, required false.
     const char *non_causal;   /* a bool key that must be false: bidirectional inside the block */
+    /// Config key of the sliding-window flag, required true.
     const char *swa;          /* a bool key that must be true: every layer windowed over the context */
+    /// Config key of the rope type, required absent or "default".
     const char *rope_type;    /* L280: where the config names its rope type; absent or "default" = the native rope */
 };
 
@@ -126,6 +206,7 @@ struct kind_decl {
  * 122.2 / 81.2 / 108.5 / 128.6 / 171.9, 0.5 121.6 / 83.1 / 107.2 / 129.3 / 175.7, 0.7 117.1 / 81.8 / 106.1 / 127.9
  * / 174.3.  Its slot confidence is calibrated (the served-round replay, quintiles conf -> accept: prose 0.44 -> 0.30,
  * 0.73 -> 0.54, 0.93 -> 0.79, 0.99 -> 0.97; code 0.68 -> 0.60, 0.97 -> 0.93, 1.00 -> 0.99): no rescale. */
+/// THE KIND TABLE: one row per drafter kind the lane implements.
 const kind_decl k_kinds[] = {
     {"lilicorr", PULSAR_BLOCK_HEAD_LILICORR, 0.5f, "hidden_size", "num_hidden_layers",
      "num_attention_heads", "num_key_value_heads", "head_dim", "intermediate_size", "vocab_size", "block_size",
@@ -139,6 +220,8 @@ const kind_decl k_kinds[] = {
      "dflash_config.selector_top_k", "dflash_config.target_layer_ids", "is_causal", "use_sliding_window",
      "rope_parameters.rope_type"},
 };
+/// @param kind a kind name
+/// @return its k_kinds row, or NULL for a kind the lane does not implement
 const kind_decl *kind_find(const char *kind) {
     for (const kind_decl &k : k_kinds)
         if (!strcmp(k.kind, kind)) return &k;
@@ -146,9 +229,14 @@ const kind_decl *kind_find(const char *kind) {
 }
 
 /* "<kind>.<key>" */
+/// The full metadata key "<kind>.<key>", built on the stack (truncated past 159 chars).
 struct kkey {
+    /// The NUL-terminated key.
     char buf[160];
+    /// @param kind the kind prefix
+    /// @param key the key under it
     kkey(const char *kind, const char *key) { snprintf(buf, sizeof buf, "%s.%s", kind, key); }
+    /// @return the key, valid while this object lives
     operator const char *() const { return buf; }
 };
 
@@ -368,6 +456,11 @@ namespace {
 /* the GQA block's declaration of drafter layer l: n_head / n_kv / head_dim, the window, 1/sqrt(head_dim), the per-head
  * q / k RMSNorm with the layer's weights, the NeoX rope; `block` for the query block (bidirectional, never stored), 0
  * for the context store */
+/// @param d the drafter
+/// @param qn device q_norm weight of the layer (NULL when only sizing)
+/// @param kn device k_norm weight of the layer (NULL when only sizing)
+/// @param block true: the query block (bidirectional, not stored); false: the context store
+/// @return the GQA layer declaration (E4M3 K / V rows, windowed)
 pulsar_gqa_layer gqa_decl(const pulsar_block_drafter *d, const uint16_t *qn, const uint16_t *kn, bool block) {
     pulsar_gqa_layer L{};
     L.n_q = d->n_head;
@@ -436,22 +529,119 @@ namespace {
 /* Rows one absorb pass carries (a prompt chunk is taken in passes of this many: every Linear's prompt arm is one
  * fixed-order kernel per shape, so a row's bytes do not depend on the pass) and the rows one draft pass carries
  * (PULSAR_DRIVER_HEADS_MAX: four banks of an 8-row block). */
+/// Rows one absorb pass carries.
 constexpr uint32_t kAbsorbRows = 512u;
+/// Rows one draft pass carries (kDraftRows / block banks).
 constexpr uint32_t kDraftRows = PULSAR_DRIVER_HEADS_MAX;
 
 /* the absorb's region */
+/** @var absorb_layout::c
+ *  bf16 [kAbsorbRows][hidden]: the fc output (the context rows). */
+/** @var absorb_layout::cn
+ *  bf16 [kAbsorbRows][hidden]: rmsnorm(c) * hidden_norm. */
+/** @var absorb_layout::stage
+ *  f32 staging of the Linears, [kAbsorbRows][max(hidden, 2 n_kv head_dim)]. */
+/** @var absorb_layout::kb
+ *  bf16 [kAbsorbRows][n_kv head_dim]: the rows' K before the store. */
+/** @var absorb_layout::vb
+ *  bf16 [kAbsorbRows][n_kv head_dim]: the rows' V before the store. */
+/** @var absorb_layout::ws
+ *  The rows front door's workspace. */
+/** @var absorb_layout::ws_bytes
+ *  Its size, bytes. */
+/** @var absorb_layout::gqa
+ *  The GQA context store's workspace. */
+/** @var absorb_layout::gqa_bytes
+ *  Its size, bytes. */
+/** @var absorb_layout::total
+ *  Bytes of the whole region. */
+/// The absorb's region of the lane arena: byte offsets, each 256-aligned (absorb_of).
 struct absorb_layout { uint64_t c, cn, stage, kb, vb, ws, ws_bytes, gqa, gqa_bytes, total; };
 /* the draft's region */
+/// The draft pass's region of the lane arena: byte offsets, each 256-aligned (draft_of); R = kDraftRows rows,
+/// nb = R / block banks, SL = block - 1 slots.
 struct draft_layout {
+    /** @var draft_layout::h
+     *  bf16 [R][hidden]: the residual stream. */
+    /** @var draft_layout::x
+     *  bf16 [R][hidden]: the current norm output (finally the head's input o). */
+    /** @var draft_layout::cx
+     *  bf16 [R][hidden]: the conv-prepared sublayer input. */
+    /** @var draft_layout::t
+     *  bf16 [R][hidden]: a sublayer's output after the conv finish (added into h). */
+    /** @var draft_layout::ob
+     *  bf16 [R][hidden]: o_proj / down output before the conv finish. */
+    /** @var draft_layout::coef
+     *  bf16 [R][2 x taps x groups]: the conv's per-token taps. */
+    /** @var draft_layout::q
+     *  bf16 [R][n_head head_dim]. */
+    /** @var draft_layout::k
+     *  bf16 [R][n_kv head_dim]. */
+    /** @var draft_layout::v
+     *  bf16 [R][n_kv head_dim]. */
+    /** @var draft_layout::a
+     *  bf16 [R][n_head head_dim]: the attention output. */
+    /** @var draft_layout::g
+     *  bf16 [R][ff]: the gate projection. */
+    /** @var draft_layout::u
+     *  bf16 [R][ff]: the up projection. */
+    /** @var draft_layout::m
+     *  bf16 [R][ff]: SwiGLU(g, u). */
+    /** @var draft_layout::stage
+     *  f32 staging of the Linears, sized for the widest call. */
+    /** @var draft_layout::ws
+     *  The rows front door's workspace. */
+    /** @var draft_layout::ws_bytes
+     *  Its size, bytes. */
+    /** @var draft_layout::gqa
+     *  The block attention's workspace. */
+    /** @var draft_layout::gqa_bytes
+     *  Its size, bytes. */
+    /** @var draft_layout::logits
+     *  bf16 [R][head_rows]: the drafter head's rows. */
+    /// i32 [R]: the rows' input ids (carry, then mask tokens).
     uint64_t ids, h, x, cx, t, ob, coef, q, k, v, a, g, u, m, stage, ws, ws_bytes, gqa, gqa_bytes, logits;
+    /** @var draft_layout::desc_stride
+     *  Bytes of one layer's descriptors. */
+    /// Every layer's attention descriptors, n_layer x desc_stride bytes.
     uint64_t desc, desc_stride;   /* every layer's attention descriptors (pulsar_gqa_plan), desc_stride apart */
     /* the chain head's inputs and outputs, [bank][slot]...: the candidates and their log-probs, the scores, the walk
      * (both kinds); LILICORR's pass rows, anchor rows and validity and its workspace (pulsar_cuda_lilicorr.h);
      * SELECTOR's projected rows and anchor ids (pulsar_cuda_candsel.h) */
+    /** @var draft_layout::cand_lp
+     *  f32 [nb][SL][topk]: their log-probs. */
+    /** @var draft_layout::pass
+     *  LILICORR: bf16 [nb][SL][hidden], the slot rows' final-norm output. */
+    /** @var draft_layout::anchor
+     *  LILICORR: bf16 [nb][hidden], each bank's anchor row. */
+    /** @var draft_layout::valid
+     *  LILICORR: u8 [nb], anchor validity. */
+    /** @var draft_layout::scores
+     *  f32 [nb][SL][topk][topk]: the [prev][candidate] score tables. */
+    /** @var draft_layout::chain_ids
+     *  i32 [nb][SL]: the head's greedy walk, ids. */
+    /** @var draft_layout::chain_rows
+     *  i32 [nb][SL]: the walk's candidate index per slot. */
+    /** @var draft_layout::head_ws
+     *  LILICORR: the candidate head's workspace. */
+    /** @var draft_layout::head_ws_bytes
+     *  Its size, bytes. */
+    /// i32 [nb][SL][topk]: each slot's candidate ids.
     uint64_t cand_id, cand_lp, pass, anchor, valid, scores, chain_ids, chain_rows, head_ws, head_ws_bytes;
+    /** @var draft_layout::anchor_ids
+     *  SELECTOR: i32 [nb], each bank's carry (slot 0's predecessor). */
+    /** @var draft_layout::total
+     *  Bytes of the whole region. */
+    /// SELECTOR: bf16 [R][rank], the selector's projected rows.
     uint64_t hp, anchor_ids, total;
 };
 
+/// The rows front door's workspace for one multi-Linear call.
+/// @param in the shared input width
+/// @param outs [n] each Linear's output width
+/// @param n Linears, 1 .. 4
+/// @param rows the call's rows
+/// @return bytes, 256-aligned
 uint64_t multi_ws(int in, const int *outs, int n, uint32_t rows) {
     pulsar_rows_linear l[4] = {};
     const pulsar_rows_linear *lp[4];
@@ -463,6 +653,8 @@ uint64_t multi_ws(int in, const int *outs, int n, uint32_t rows) {
     return a256(pulsar_rows_linear_multi_workspace_bytes(lp, n, (int)rows));
 }
 
+/// @param d the drafter
+/// @return the absorb region's layout
 absorb_layout absorb_of(const pulsar_block_drafter *d) {
     const uint64_t R = kAbsorbRows, E = d->hidden, KV = (uint64_t)d->n_kv * d->head_dim;
     absorb_layout L{};
@@ -481,6 +673,8 @@ absorb_layout absorb_of(const pulsar_block_drafter *d) {
     return L;
 }
 
+/// @param d the drafter
+/// @return the draft pass region's layout
 draft_layout draft_of(const pulsar_block_drafter *d) {
     const uint64_t R = kDraftRows, E = d->hidden, Q = (uint64_t)d->n_head * d->head_dim,
                    KV = (uint64_t)d->n_kv * d->head_dim, F = d->ff, CP = 2ull * d->conv_taps * (E / d->conv_group);
@@ -541,6 +735,10 @@ draft_layout draft_of(const pulsar_block_drafter *d) {
 
 /* The candidate head's device weights: each Linear the rows front door's reference (decode rows: a bank's bytes never
  * depend on the banks beside it) and its bias, each vector its device pointer. */
+/// @param s the session (its engine's model resolves the weights)
+/// @param d the drafter (head_kind LILICORR)
+/// @param w receives the head's device weights
+/// @return false (said) when any weight did not resolve
 bool head_weights(const pulsar_session *s, const pulsar_block_drafter *d, pulsar_lilicorr_head *w) {
     const pulsar_model *m = &s->engine->model;
     const pulsar_block_head &H = d->head_lc;
@@ -593,27 +791,57 @@ bool head_weights(const pulsar_session *s, const pulsar_block_drafter *d, pulsar
 
 }  // namespace
 
+/// The block lane's per-session buffers (pulsar_driver_state::block): pulsar_block_lane_create /
+/// pulsar_block_lane_free.  Session-stream only.
 struct pulsar_block_lane {
+    /// The engine's drafter (not owned).
     const pulsar_block_drafter *d;
+    /** @var pulsar_block_lane::max_rows
+     *  Rows the tap buffer holds: the widest trunk step. */
+    /// Banks the session holds.
     uint32_t n_banks, max_rows;
+    /// Elements in one tap row (n_taps x hidden).
     uint64_t tap_width;            /* n_taps x hidden */
+    /// The tap rows, bf16 [max_rows][tap_width] (owned).
     pulsar_gpu_tensor *taps;       /* [max_rows][tap_width] bf16: the last trunk step's tapped rows */
+    /// The scratch arena, max(al.total, dl.total) bytes (owned).
     pulsar_gpu_tensor *arena;      /* the absorb's or the draft's region (never both at once) */
+    /// The absorb's region of the arena.
     absorb_layout al;
+    /// The draft pass's region of the arena.
     draft_layout dl;
     /* host staging */
+    /** @var pulsar_block_lane::row_pos
+     *  Per row of a pass: its position. */
+    /** @var pulsar_block_lane::seq_bank
+     *  Per sequence of an absorb pass: its bank. */
+    /// Per row of a pass: its sequence index.
     std::vector<uint32_t> row_seq, row_pos, seq_bank;
+    /// Per sequence: its bank's ring as a GQA sequence.
     std::vector<pulsar_gqa_seq> seqs;
     /* the last draft pass's head outputs, read back: [bank][slot][...] */
+    /** @var pulsar_block_lane::chain_ids
+     *  Read back: [bank][slot] the head's greedy walk. */
+    /// Read back: [bank][slot][topk] candidate ids.
     std::vector<int32_t> cand_id, chain_ids;
+    /** @var pulsar_block_lane::scores
+     *  Read back: [bank][slot][topk][topk] score tables. */
+    /// Read back: [bank][slot][topk] candidate log-probs.
     std::vector<float> cand_lp, scores;
+    /// LILICORR: the candidate head's device weights.
     pulsar_lilicorr_head head;   /* LILICORR: the candidate head's device weights (fixed for the lane's life) */
     /* the draft pass's host half (pinned: its uploads read them after the call returns) */
+    /// Pinned [kDraftRows]: the draft rows' input ids.
     int32_t *h_tok;
+    /// Pinned [kDraftRows]: each bank's carry.
     int32_t *h_anchor;           /* SELECTOR: each bank's carry, slot 0's predecessor */
+    /// Pinned [kDraftRows]: each bank's anchor validity (LILICORR).
     uint8_t *h_valid;
+    /// Pinned [n_layer][desc_stride]: the attention descriptors, staged for upload.
     uint8_t *h_desc;
+    /// Each layer's planned attention call (pulsar_gqa_plan).
     pulsar_gqa_call call[PULSAR_BLOCK_MAX_LAYERS];
+    /// The draft pass's rule-5 line was printed.
     bool announced;
 };
 
@@ -693,6 +921,8 @@ bool pulsar_block_tap(pulsar_driver_state *ds, uint32_t il, uint32_t sub, const 
 
 namespace {
 
+/// @param s the session
+/// @return its block lane, or NULL (no driver or no lane)
 pulsar_block_lane *LANE(const pulsar_session *s) { return s->driver ? s->driver->block : NULL; }
 
 /* ---- the reference grade's dump (diagnostic: PULSAR_BLOCK_DUMP=<dir>, read once) ------------------------------------
@@ -703,6 +933,7 @@ pulsar_block_lane *LANE(const pulsar_session *s) { return s->driver ? s->driver-
  *   draft  u32 nb, u32 block, u32 hidden, u32 topk, i32 bank[nb], i32 carry[nb], i32 P[nb],
  *          bf16 o[nb block][hidden], i32 cand[nb][block - 1][topk], f32 lp[nb][block - 1][topk],
  *          f32 scores[nb][block - 1][topk][topk], i32 chain[nb][block - 1] */
+/// @return PULSAR_BLOCK_DUMP's directory (read once; announced), or NULL when unset or empty
 const char *dump_dir() {
     static const char *dir = NULL;
     static bool read = false;
@@ -714,12 +945,20 @@ const char *dump_dir() {
     }
     return dir;
 }
+/// @param name the file under dump_dir()
+/// @return it opened for append, or NULL; caller fcloses
 FILE *dump_open(const char *name) {
     char p[1024];
     snprintf(p, sizeof p, "%s/%s", dump_dir(), name);
     return fopen(p, "ab");
 }
 
+/// Append absorbed rows to ctx.bin (no-op unless dumping).
+/// @param l the lane
+/// @param row0 the first tap row
+/// @param pos [n] positions
+/// @param bank [n] banks
+/// @param n rows
 void dump_ctx(pulsar_block_lane *l, uint32_t row0, const int32_t *pos, const int32_t *bank, uint32_t n) {
     if (!dump_dir() || n == 0) return;
     std::vector<uint16_t> taps((size_t)n * l->tap_width);
@@ -735,12 +974,30 @@ void dump_ctx(pulsar_block_lane *l, uint32_t row0, const int32_t *pos, const int
     fclose(f);
 }
 
+/// @param s the session
+/// @param t a weight tensor
+/// @param what its name, for the refusal line
+/// @return its device pointer, or NULL (said)
 const void *wp(const pulsar_session *s, const pulsar_tensor *t, const char *what) {
     return pulsar_weight_device_ptr(&s->engine->model, t, what);
 }
 
 /* n Linears of one bf16 input -> their bf16 rows (the producer's one rounding; the nvfp4 arm's global scale in its
  * epilogue), the front door's arm by each weight's format and the row kind */
+/// @param s the session
+/// @param n Linears, 1 .. 4
+/// @param t [n] weights
+/// @param in the input width
+/// @param out [n] output widths
+/// @param what the call's name, for refusal lines
+/// @param x bf16 [rows][in] input
+/// @param rows rows
+/// @param prompt the prompt arms (else the decode arms)
+/// @param stage f32 staging, rows x sum(out) floats
+/// @param yb [n] bf16 outputs, [rows][out[j]] each
+/// @param ws front door workspace
+/// @param ws_bytes its size
+/// @return false = refused (said)
 bool linears(pulsar_session *s, int n, const pulsar_tensor *const *t, int in, const int *out, const char *what,
              const uint16_t *x, uint32_t rows, bool prompt, float *stage, uint16_t *const *yb, void *ws,
              uint64_t ws_bytes) {
@@ -758,6 +1015,11 @@ bool linears(pulsar_session *s, int n, const pulsar_tensor *const *t, int in, co
 }
 
 /* bank b's ring of drafter layer l, as a GQA sequence */
+/// @param s the session
+/// @param d the drafter
+/// @param l drafter layer
+/// @param b bank
+/// @return the ring (zeroed when its state tensor is missing)
 pulsar_gqa_seq ring_of(const pulsar_session *s, const pulsar_block_drafter *d, uint32_t l, uint32_t b) {
     const pulsar_state_set *ss = s->states;
     pulsar_gpu_tensor *t = pulsar_state_tensor(ss, ss->plan->n_trunk + l, d->decl_kv);
@@ -774,6 +1036,13 @@ pulsar_gqa_seq ring_of(const pulsar_session *s, const pulsar_block_drafter *d, u
 /* The context absorb: rows [row0, row0 + n) of the last trunk step (their taps), at positions pos[i] of banks bank[i]
  * -- each bank's rows one run of consecutive positions -- into every drafter layer's ring, and each bank's last row's
  * cn into its anchor.  `prompt`: the prompt arms (a prompt chunk's rows), else the decode arms. */
+/// @param s the session (must have a block lane)
+/// @param row0 first step row
+/// @param pos [n] positions
+/// @param bank [n] banks
+/// @param n rows
+/// @param prompt the prompt arms
+/// @return false = refused (said)
 bool absorb_rows(pulsar_session *s, uint32_t row0, const int32_t *pos, const int32_t *bank, uint32_t n, bool prompt) {
     pulsar_block_lane *l = LANE(s);
     const pulsar_block_drafter *d = l->d;
@@ -856,6 +1125,12 @@ bool absorb_rows(pulsar_session *s, uint32_t row0, const int32_t *pos, const int
  * so it runs as ONE captured CUDA graph per (lane, banks, bound) (the L119 segment cache: captured on a key's warm use,
  * replayed after; eager while the reference dump reads the pass).  pos[i] is bank i's position P_i: its frontier, or
  * (L306) the warmup sweep's stand-in for a deeper one -- a pass writes nothing but the lane's arena. */
+/// @param s the session (must have a block lane)
+/// @param banks [nb] banks (read only)
+/// @param pos [nb] each bank's P
+/// @param carry [nb] each bank's carry token, in [0, vocab)
+/// @param nb banks, 1 .. kDraftRows / block
+/// @return false = refused (said)
 bool draft_pass(pulsar_session *s, const uint32_t *banks, const uint32_t *pos, const int32_t *carry, uint32_t nb) {
     pulsar_block_lane *l = LANE(s);
     const pulsar_block_drafter *d = l->d;
@@ -1117,6 +1392,14 @@ bool draft_pass(pulsar_session *s, const uint32_t *banks, const uint32_t *pos, c
  * into the record -- slot j's top-1 (greedy) or a draw from slot j's row under the request's params at the draft's
  * key (sampled).  A copy chain's record (pulsar_spec_draft_req_init) is left as it is.  Each bank's rows are a block
  * of their own (one sequence, the decode arms: a bank's draft does not depend on the banks beside it). */
+/// @param s the session
+/// @param banks [n] each record's bank
+/// @param rngs [n] each request's stream (read, never advanced; required when sampled)
+/// @param reqs [n] the records, filled in place
+/// @param n records
+/// @param err receives the reason on failure
+/// @param errlen its size
+/// @return false = refused
 bool draft_chains(pulsar_session *s, const uint32_t *banks, uint64_t *const *rngs, spec_redraft_req *const *reqs,
                   uint32_t n, char *err, size_t errlen) {
     pulsar_block_lane *l = LANE(s);
@@ -1268,6 +1551,12 @@ bool draft_chains(pulsar_session *s, const uint32_t *banks, uint64_t *const *rng
 
 /* The committed rows of the last verify, any number of banks (each bank's rows one run, in the step's row order):
  * their context, on the decode arms (they are verify rows). */
+/// pulsar_drafter_ops::absorb_banked.
+/// @param s the session
+/// @param rows [n] step rows
+/// @param banks [n] their banks
+/// @param n rows (<= PULSAR_DRIVER_HEADS_MAX)
+/// @return false = refused (said)
 bool block_absorb_banked(pulsar_session *s, const uint32_t *rows, const uint32_t *banks, const int32_t *, uint32_t n) {
     const pulsar_state_set *ss = s->states;
     if (!LANE(s)) return fail("an absorb with no block lane");
@@ -1293,6 +1582,15 @@ bool block_absorb_banked(pulsar_session *s, const uint32_t *rows, const uint32_t
     return true;
 }
 
+/// pulsar_drafter_ops::draft for the installed bank.
+/// @param s the session
+/// @param next_base the carry
+/// @param temperature request temperature
+/// @param top_k request top-k
+/// @param top_p request top-p
+/// @param min_p request min-p
+/// @param rng the request's stream
+/// @return drafts kept, or PULSAR_DRAFT_REFUSED
 uint32_t block_draft(pulsar_session *s, int next_base, bool, float temperature, int top_k, float top_p, float min_p,
                      uint64_t *rng) {
     spec_redraft_req rec;
@@ -1311,6 +1609,15 @@ uint32_t block_draft(pulsar_session *s, int next_base, bool, float temperature, 
     return rec.keep;
 }
 
+/// pulsar_drafter_ops::draft_batch: every valid record in one call.
+/// @param s the session
+/// @param rounds [n] the rounds
+/// @param banks [n] their banks
+/// @param rngs [n] their streams
+/// @param n rounds
+/// @param err receives the reason
+/// @param errlen its size
+/// @return 0, or -1 refused
 int block_draft_batch(pulsar_session *s, pulsar_spec_round **rounds, const uint32_t *banks, uint64_t **rngs, int n,
                       char *err, size_t errlen) {
     std::vector<uint32_t> b;
@@ -1339,6 +1646,11 @@ int block_draft_batch(pulsar_session *s, pulsar_spec_round **rounds, const uint3
  * bank (repeated for the bank counts: a pass reads each bank's ring and anchor, never writes them) at a stand-in
  * position per bound: a pass writes only the lane's arena, so a deeper position than the bank holds reads its ring
  * (position-addressed, modulo its window) without touching any state. */
+/// pulsar_drafter_ops::warm.
+/// @param s the session
+/// @param err receives the reason
+/// @param errlen its size
+/// @return 0, or -1 refused
 int block_warm(pulsar_session *s, char *err, size_t errlen) {
     pulsar_block_lane *l = LANE(s);
     if (!l || dump_dir()) return 0;   /* no lane; or the dump's eager passes: nothing is captured */

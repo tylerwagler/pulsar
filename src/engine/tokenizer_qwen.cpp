@@ -1,3 +1,5 @@
+/** @file tokenizer_qwen.cpp
+ *  @brief The Qwen4-exp family's tokenizer table. */
 /* tokenizer_qwen.cpp -- the Qwen4-exp family's tokenizer table (family.h pulsar_family_tokenizer, L272 P2).
  *
  * A Qwen engine tokenizes with src/lib/bpe_tokenizer -- the shared engine in its HF configuration, byte-exact
@@ -14,6 +16,11 @@
 /* `spans` are the client-data ranges where no added token may match.  The entries have no error return;
  * an encode refusal (text that is not UTF-8 -- HF cannot take it either -- or spans out of order, a
  * renderer defect) is reported by name and yields no tokens, never a different tokenization. */
+/// @param e the engine
+/// @param text NUL-terminated text (NULL = empty)
+/// @param spans client-data byte ranges
+/// @param n_spans their count
+/// @param[in,out] out ids appended
 static void qwen_encode_into(const pulsar_engine *e, const char *text, const pulsar_text_span *spans,
                              uint32_t n_spans, pulsar_tokens *out) {
     std::vector<int> ids;
@@ -27,11 +34,21 @@ static void qwen_encode_into(const pulsar_engine *e, const char *text, const pul
 }
 
 /* raw text: all of it is client data, so no added token matches */
+/// pulsar_family_tokenizer::encode_text.
+/// @param e the engine
+/// @param text the text
+/// @param[in,out] out ids appended
 static void qwen_tok_encode_text(pulsar_engine *e, const char *text, pulsar_tokens *out) {
     const pulsar_text_span all = {0u, (uint32_t)(text ? strlen(text) : 0)};
     qwen_encode_into(e, text, all.hi ? &all : NULL, all.hi ? 1u : 0u, out);
 }
 
+/// pulsar_family_tokenizer::encode_rendered: rendered text, added tokens matched outside `spans`.
+/// @param e the engine
+/// @param text the text
+/// @param spans client-data ranges
+/// @param n_spans their count
+/// @param[in,out] out ids appended
 static void qwen_tok_encode_rendered(pulsar_engine *e, const char *text, const pulsar_text_span *spans,
                                      uint32_t n_spans, pulsar_tokens *out) {
     qwen_encode_into(e, text, spans, n_spans, out);
@@ -41,12 +58,19 @@ static void qwen_tok_encode_rendered(pulsar_engine *e, const char *text, const p
  * pieces the full render is made of, tokenized with their client spans.  The entries have no error return, so
  * a refusal (an effort the template has no level for, a role it cannot place) ends the process by name. */
 
+/// Print the refusal and exit(1).
+/// @param op the entry
+/// @param err the reason
 static void qwen_chat_refuse(const char *op, const char *err) {
     fprintf(stderr, "pulsar: %s: %s -- exiting\n", op, err);
     exit(1);
 }
 
 /* the template's effort for a think mode: on (its default effort) or off -- no other level */
+/// @param e the engine
+/// @param think_mode the request's mode
+/// @param op the entry, for the refusal
+/// @return the effort (exits on an unsupported mode)
 static qwen_effort qwen_chat_effort(const pulsar_engine *e, pulsar_think_mode think_mode, const char *op) {
     char err[256];
     qwen_effort qe = QWEN_EFFORT_NONE;
@@ -56,12 +80,21 @@ static qwen_effort qwen_chat_effort(const pulsar_engine *e, pulsar_think_mode th
     return qe;
 }
 
+/// Tokenize a render with its client spans.
+/// @param e the engine
+/// @param r the render
+/// @param[in,out] tokens ids appended
 static void qwen_chat_append(const pulsar_engine *e, const qwen_render_out &r, pulsar_tokens *tokens) {
     qwen_encode_into(e, r.text.c_str(), r.spans.data(), (uint32_t)r.spans.size(), tokens);
 }
 
 /* The system block: trusted text (the agent's DSML spells no marker of this family's) and the system text, as
  * the system message's content -- client data both. */
+/// @param e the engine
+/// @param[in,out] tokens ids appended
+/// @param trusted trusted text, or NULL
+/// @param system system text, or NULL
+/// @param think_mode the mode
 static void qwen_chat_open(pulsar_engine *e, pulsar_tokens *tokens, const char *trusted, const char *system,
                            pulsar_think_mode think_mode) {
     const qwen_effort qe = qwen_chat_effort(e, think_mode, "pulsar_chat_open");
@@ -74,6 +107,12 @@ static void qwen_chat_open(pulsar_engine *e, pulsar_tokens *tokens, const char *
 
 /* A mid-conversation system message is the user turn of its reminder (qwen_system_reminder), as the server
  * renders it. */
+/// @param e the engine
+/// @param[in,out] tokens ids appended
+/// @param msgs the messages
+/// @param n their count
+/// @param generation_prompt append the assistant prompt
+/// @param think_mode the mode
 static void qwen_chat_turn(pulsar_engine *e, pulsar_tokens *tokens, const pulsar_chat_message *msgs, int n,
                            bool generation_prompt, pulsar_think_mode think_mode) {
     const qwen_effort qe = qwen_chat_effort(e, think_mode, "pulsar_chat_append_turn");
@@ -96,10 +135,15 @@ static void qwen_chat_turn(pulsar_engine *e, pulsar_tokens *tokens, const pulsar
 }
 
 /* the turn's end the template writes after a sampled turn (qwen_chat_render_tail's first bytes) */
+/// @param e the engine
+/// @param[in,out] tokens ids appended
 static void qwen_chat_end_assistant(pulsar_engine *e, pulsar_tokens *tokens) {
     qwen_encode_into(e, "<|im_end|>\n", NULL, 0u, tokens);
 }
 
+/// @param e the engine
+/// @param token an id
+/// @return true for any generation_config stop id
 static bool qwen_tok_is_stop(pulsar_engine *e, int token) {
     for (int id : bpe_tokenizer_stop_ids(e->qwen_tok)) if (id == token) return true;
     return false;
@@ -107,8 +151,14 @@ static bool qwen_tok_is_stop(pulsar_engine *e, int token) {
 
 /* the FIRST of generation_config's stop ids (<|im_end|>); a caller that ends generation must test the
  * whole set with pulsar_token_is_stop */
+/// @param e the engine
+/// @return the first stop id
 static int qwen_tok_eos(pulsar_engine *e) { return bpe_tokenizer_stop_ids(e->qwen_tok).front(); }
 
+/// @param e the engine
+/// @param token an id
+/// @param[out] len its byte length, or NULL
+/// @return its bytes, malloc'd, NUL-terminated (empty out of range)
 static char *qwen_tok_token_text(pulsar_engine *e, int token, size_t *len) {
     size_t n = 0;
     const char *b = bpe_tokenizer_token_bytes(e->qwen_tok, token, &n);
@@ -120,11 +170,16 @@ static char *qwen_tok_token_text(pulsar_engine *e, int token, size_t *len) {
     return out;
 }
 
+/// @param e the engine
+/// @return the `</think>` id, or -1
 static int qwen_tok_think_close(pulsar_engine *e) { return bpe_tokenizer_added_id(e->qwen_tok, "</think>"); }
 
 /* L272 B5: Qwen's template spells a turn as <|im_start|> plus the role word, which the checkpoint's BPE
  * holds as one token (Qwen3.8-Flash-Next: "user", "assistant").  A tokenizer that splits either word
  * leaves the anchors off, said once -- never a marker that matches at the wrong place. */
+/// @param e the engine
+/// @param[out] out the user / assistant markers
+/// @return false when the tokenizer splits a role word
 static bool qwen_tok_turn_markers(pulsar_engine *e, pulsar_turn_markers *out) {
     const int start = bpe_tokenizer_added_id(e->qwen_tok, "<|im_start|>");
     pulsar_tokens user = {0}, assistant = {0};
@@ -154,6 +209,9 @@ static bool qwen_tok_turn_markers(pulsar_engine *e, pulsar_turn_markers *out) {
 
 /* --dump-tokens: the ids, then one line per token with its bytes (the HF tokenizer has no separate raw
  * vocab string to print beside them) */
+/// @param e the engine
+/// @param fp output
+/// @param tokens the ids
 static void qwen_tok_dump(pulsar_engine *e, FILE *fp, const pulsar_tokens *tokens) {
     fprintf(fp, "[");
     for (int i = 0; i < tokens->len; i++) fprintf(fp, "%s%d", i ? ", " : "", tokens->v[i]);
@@ -169,6 +227,8 @@ static void qwen_tok_dump(pulsar_engine *e, FILE *fp, const pulsar_tokens *token
 }
 
 /* the checkpoint's table (L272 B3: Qwen never loads e->vocab) */
+/// @param e the engine
+/// @return ids in the tokenizer's table
 static int qwen_tok_n_tokens(pulsar_engine *e) { return bpe_tokenizer_n_tokens(e->qwen_tok); }
 
 const pulsar_family_tokenizer k_qwen_tokenizer = {

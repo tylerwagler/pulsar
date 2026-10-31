@@ -1,3 +1,5 @@
+/** @file session_sampler.cpp
+ *  @brief A session's draws and logprobs, on the device (L302). */
 /* session_sampler.cpp -- a session's draws, on the device (L302).
  *
  * The logits a session produces stay where its forward wrote them: the live row (the distribution of the token
@@ -11,9 +13,12 @@
  * (session_spec.cpp).  So a seeded request is one text whichever lane decodes which token (L288 sdet). */
 #include "pulsar_engine_internal.h"
 
+/// @param s the session
+/// @return 32-bit words in one grammar mask row (logits width / 32, rounded up)
 static uint32_t mask_words(const pulsar_session *s) { return ((uint32_t)s->engine->logits_width() + 31u) / 32u; }
 
 /* dev.out: the sample outs, the walk outs, then a digest word */
+/// @return the byte offset of dev.out's digest word (8-aligned)
 static uint64_t dev_digest_off() {
     return ((uint64_t)PULSAR_GPU_SAMPLE_ROWS_MAX * (sizeof(pulsar_gpu_sample_out) + sizeof(pulsar_gpu_spec_walk_out)) +
             7u) & ~7ull;
@@ -112,6 +117,15 @@ bool pulsar_session::live_restore_bank(uint32_t bank) {
 /* THE launch every draw goes through: n draws over `rows` (draw k reads row row_index[k], W wide) by reqs, the masks
  * (per draw, NULL = none) uploaded first; the outs land in dev.out.  false (said) on a bad launch -- a refused ROW is
  * its out's token -1 with its status, not a failure. */
+/// @param s the session
+/// @param rows the logits rows
+/// @param W floats per row (<= the logits width)
+/// @param id_map int32 [W] token id per row index, or NULL (the index is the id)
+/// @param row_index [n] the row each draw reads
+/// @param n draws (<= PULSAR_GPU_SAMPLE_ROWS_MAX)
+/// @param reqs [n] the draw requests
+/// @param masks [n] grammar mask rows (entries NULL = none), or NULL
+/// @return false (said) on a bad launch
 static bool draw_launch(pulsar_session *s, const pulsar_gpu_tensor *rows, uint32_t W, const pulsar_gpu_tensor *id_map,
                         const uint32_t *row_index, uint32_t n, pulsar_gpu_sample_req *reqs,
                         const uint32_t *const *masks) {
@@ -182,6 +196,9 @@ bool pulsar_session::draw_chains(const pulsar_gpu_tensor *cand, uint64_t cand_of
            pulsar_gpu_tensor_read(dev.chain_out, 0, tokens, (uint64_t)n * slots * sizeof(int32_t));
 }
 
+/// A draw request from a row draw: its params, the key at its stream's next index (0 with no stream).
+/// @param d the row draw
+/// @param q receives the request
 static void draw_req(const pulsar_row_draw *d, pulsar_gpu_sample_req *q) {
     memset(q, 0, sizeof(*q));
     q->temperature = d->temperature;
@@ -194,6 +211,13 @@ static void draw_req(const pulsar_row_draw *d, pulsar_gpu_sample_req *q) {
 }
 
 /* rows k of the step (or the live row): each draw reads its stream's next key and steps it past the token */
+/// @param s the session
+/// @param rows the logits rows
+/// @param row_index [n] the row each draw reads
+/// @param d [n] the draws (their streams advanced past each drawn token)
+/// @param n draws, 1 .. PULSAR_GPU_SAMPLE_ROWS_MAX
+/// @param tokens [n] receives the tokens (negative = refused row)
+/// @return 0, or 1 refused (bad n, a sampled draw with no stream, a failed launch)
 static int session_draw(pulsar_session *s, const pulsar_gpu_tensor *rows, const uint32_t *row_index,
                         const pulsar_row_draw *d, uint32_t n, int *tokens) {
     pulsar_gpu_sample_req reqs[PULSAR_GPU_SAMPLE_ROWS_MAX];
@@ -252,6 +276,13 @@ int pulsar_session::draw_step_rows(const uint32_t *rows, const pulsar_row_draw *
 /* ---- logprobs ----------------------------------------------------------------------------------------------- */
 
 /* One row's logprobs (the scored token when token >= 0, the top k): the host scorers' bytes (pulsar_cuda_sampler.cu). */
+/// @param s the session
+/// @param rows the logits rows
+/// @param row the row
+/// @param token the scored token, or -1
+/// @param k top entries wanted
+/// @param L receives the row's logprobs
+/// @return false (said) on failure
 static bool session_logprobs(pulsar_session *s, const pulsar_gpu_tensor *rows, uint32_t row, int token, int k,
                              pulsar_gpu_logprob_row *L) {
     const uint32_t W = (uint32_t)s->engine->logits_width();
@@ -268,11 +299,18 @@ static bool session_logprobs(pulsar_session *s, const pulsar_gpu_tensor *rows, u
     return true;
 }
 
+/// @param k requested top-k
+/// @return k clamped to [0, PULSAR_GPU_LOGPROB_TOPK_MAX]
 static int clip_k(int k) { return k < 0 ? 0 : k > (int)PULSAR_GPU_LOGPROB_TOPK_MAX ? (int)PULSAR_GPU_LOGPROB_TOPK_MAX : k; }
+/// @param t a device token score
+/// @return it as the public pulsar_token_score
 static pulsar_token_score score(const pulsar_gpu_token_score &t) { return pulsar_token_score{t.id, t.logit, t.logprob}; }
 
 /* the host scorers' contracts: top fills k entries (k clipped to the width; -1 / NEG_INF past the finite ones) and
  * returns that count, 0 for a row with no finite value; the token's 1, or 0 with `out` untouched */
+/// @param L the row's logprobs
+/// @param top [k] receives the entries
+/// @param k entries (already clipped)
 static void fill_top(const pulsar_gpu_logprob_row &L, pulsar_token_score *top, int k) {
     for (int i = 0; i < k; i++)
         top[i] = (uint32_t)i < L.n_top ? score(L.top[i]) : pulsar_token_score{-1, PULSAR_NEG_INF, PULSAR_NEG_INF};

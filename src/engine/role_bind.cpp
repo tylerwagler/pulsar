@@ -1,3 +1,5 @@
+/** @file role_bind.cpp
+ *  @brief The role-driven binder (role_bind.h). */
 /* role_bind.cpp -- the role-driven binder (L295 E1).  The contract is role_bind.h. */
 #include "pulsar_engine_internal.h"
 #include "role_bind.h"
@@ -7,14 +9,28 @@
 #include <unordered_map>
 #include <vector>
 
+/** The role binder (role_bind.h): one model directory indexed by bind record, what has been bound from it and
+ *  the per-role price.  Made by pulsar_role_binder_open / _open_blocks, freed by its close. */
 struct pulsar_role_binder {
+    /// the model whose directory is indexed; borrowed
     const pulsar_model *m;
+    /// the family's name, printed in every message; borrowed
     const char *owner;
     std::unordered_map<std::string, uint64_t> by_key;   ///< key -> directory index
     std::vector<uint8_t> bound;                          ///< per directory entry: 1 bound, 2 unloaded, 3 not in scope
     std::map<std::string, std::pair<uint64_t, uint64_t>> price;   ///< role -> (tensors, bytes), printed in role order
 };
 
+/** The binder's map key of a bind record: role, block, layer and index joined by 0x1f (an absent part empty).
+ *  @param role      the role word
+ *  @param role_len  its bytes
+ *  @param block     the block name, or NULL
+ *  @param block_len its bytes
+ *  @param has_layer a layer is present
+ *  @param layer     the layer
+ *  @param has_index an index is present
+ *  @param index     the index
+ *  @return the key */
 static std::string role_key_str(const char *role, uint64_t role_len, const char *block, uint64_t block_len,
                                 bool has_layer, int32_t layer, bool has_index, int32_t index) {
     std::string k(role, role_len);
@@ -25,17 +41,24 @@ static std::string role_key_str(const char *role, uint64_t role_len, const char 
     return k;
 }
 
+/** The map key of a family's declared key (a negative layer / index = absent).  @param k the key  @return the key string */
 static std::string key_of(const pulsar_role_key &k) {
     return role_key_str(k.role, strlen(k.role), k.block, k.block ? strlen(k.block) : 0, k.layer >= 0, k.layer,
                         k.index >= 0, k.index);
 }
 
+/** The map key of a directory entry's bind record.  @param t the entry  @return the key string */
 static std::string key_of(const pulsar_tensor &t) {
     return role_key_str(t.bind_role.ptr, t.bind_role.len, t.bind_block.ptr, t.bind_block.len, t.has_bind_layer,
                         t.bind_layer, t.has_bind_index, t.bind_index);
 }
 
 /* "role r, block b, layer l, index i" -- the parts present */
+/// @param role  the role word
+/// @param block the block name, or NULL
+/// @param layer the layer, -1 = none
+/// @param index the index, -1 = none
+/// @return the description
 static std::string describe(const char *role, const char *block, int32_t layer, int32_t index) {
     std::string s = std::string("role ") + role;
     if (block) s += std::string(", block ") + block;
@@ -44,6 +67,7 @@ static std::string describe(const char *role, const char *block, int32_t layer, 
     return s;
 }
 
+/** describe() of a directory entry's bind record.  @param t the entry  @return the description */
 static std::string describe(const pulsar_tensor &t) {
     const std::string role(t.bind_role.ptr ? t.bind_role.ptr : "", t.bind_role.len);
     const std::string block(t.bind_block.ptr ? t.bind_block.ptr : "", t.bind_block.len);
@@ -52,6 +76,11 @@ static std::string describe(const pulsar_tensor &t) {
 }
 
 /* the binder over the entries `in_scope` admits (the whole directory, or a set of blocks) */
+/// @tparam Scope    a predicate on a pulsar_tensor: is the entry this binder's
+/// @param  m        the model; borrowed
+/// @param  owner    the family's name for messages; borrowed
+/// @param  in_scope the scope predicate
+/// @return the binder (heap; never NULL)
 template <class Scope> static pulsar_role_binder *binder_open(const pulsar_model *m, const char *owner, Scope in_scope) {
     pulsar_role_binder *b = new pulsar_role_binder();
     b->m = m;
@@ -97,6 +126,12 @@ const pulsar_tensor *pulsar_role_binder_find(const pulsar_role_binder *b, pulsar
     return it == b->by_key.end() ? NULL : &b->m->tensors[it->second];
 }
 
+/** Is the bound tensor's format one `a` admits (a plain type bit, else the format registry when linear)?  Refusals
+ *  are said by pulsar_tensor_admit / _admit_role.
+ *  @param b the binder (its owner names the messages)
+ *  @param t the tensor
+ *  @param a the formats admitted
+ *  @return true when admitted */
 static bool role_admit(const pulsar_role_binder *b, const pulsar_tensor *t, const pulsar_role_admit &a) {
     if (t->type < 32u && (a.plain >> t->type & 1u)) return true;
     if (a.linear) return pulsar_tensor_admit_role(t, b->owner, a.wrole, a.acts);

@@ -1,3 +1,5 @@
+/** @file log.cpp
+ *  @brief Fatal-exit and colorized logging. */
 #include "pulsar_engine_internal.h"
 
 /* Fatal-exit and colorized logging. Split out of util.cpp in the C++ port:
@@ -17,6 +19,8 @@ void pulsar_die_errno(const char *what, const char *path) {
 
 
 
+/// @param type the log line's type
+/// @return its ANSI color escape ("" for none)
 static const char *pulsar_log_color_code(pulsar_log_type type) {
     switch (type) {
     case PULSAR_LOG_PREFILL:
@@ -40,6 +44,8 @@ static const char *pulsar_log_color_code(pulsar_log_type type) {
 
 
 
+/// @param fp a stream
+/// @return true when it is a terminal
 bool pulsar_log_is_tty(FILE *fp) {
     int fd = fileno(fp);
     return fd >= 0 && isatty(fd) != 0;
@@ -47,6 +53,11 @@ bool pulsar_log_is_tty(FILE *fp) {
 
 
 
+/// vfprintf, colored by type when fp is a terminal (PULSAR_LOG_DEFAULT: never).
+/// @param fp the stream
+/// @param type the line's type
+/// @param fmt printf format
+/// @param ap its arguments
 static void pulsar_vlog(FILE *fp, pulsar_log_type type, const char *fmt, va_list ap) {
     const bool colorize = type != PULSAR_LOG_DEFAULT && pulsar_log_is_tty(fp);
     if (colorize) fputs(pulsar_log_color_code(type), fp);
@@ -56,6 +67,10 @@ static void pulsar_vlog(FILE *fp, pulsar_log_type type, const char *fmt, va_list
 
 
 
+/// printf to fp, colored by type when fp is a terminal.
+/// @param fp the stream
+/// @param type the line's type
+/// @param fmt printf format
 void pulsar_log(FILE *fp, pulsar_log_type type, const char *fmt, ...) {
     va_list ap;
     va_start(ap, fmt);

@@ -1,8 +1,12 @@
+/** @file session_payload.cpp
+ *  @brief Session payloads, disk segments and snapshots: serialisation of a session's KV and state. */
 #include "pulsar_engine_internal.h"
 
 /* L281: one image block record in a payload or a segment -- u32 start, u32 end, u64 content as two u32, and
  * (L268) the block's 2D grid, u32 rows and u32 columns */
+/** u32 words of one image block record (see above). */
 #define SEGMENT_IMAGE_U32 6u
+/** Pack an image block into its record.  @param b the block  @param rec receives the record */
 static void image_rec_pack(const pulsar_image_block *b, uint32_t (&rec)[SEGMENT_IMAGE_U32]) {
     rec[0] = b->start;
     rec[1] = b->end;
@@ -11,6 +15,7 @@ static void image_rec_pack(const pulsar_image_block *b, uint32_t (&rec)[SEGMENT_
     rec[4] = b->grid_h;
     rec[5] = b->grid_w;
 }
+/** Unpack an image block record.  @param rec the record  @return the block */
 static pulsar_image_block image_rec_unpack(const uint32_t (&rec)[SEGMENT_IMAGE_U32]) {
     return (pulsar_image_block){ rec[0], rec[1], (uint64_t)rec[2] | (uint64_t)rec[3] << 32, rec[4], rec[5] };
 }
@@ -23,6 +28,7 @@ void payload_set_err(char *err, size_t errlen, const char *msg) {
 
 
 
+/** Store `v` little-endian.  @param out receives 4 bytes  @param v the value */
 static void payload_put_u32(uint8_t out[4], uint32_t v) {
     out[0] = (uint8_t)(v);
     out[1] = (uint8_t)(v >> 8);
@@ -32,6 +38,7 @@ static void payload_put_u32(uint8_t out[4], uint32_t v) {
 
 
 
+/** Load a little-endian u32.  @param in 4 bytes  @return the value */
 static uint32_t payload_get_u32(const uint8_t in[4]) {
     return (uint32_t)in[0] |
            ((uint32_t)in[1] << 8) |
@@ -54,24 +61,30 @@ static uint32_t payload_get_u32(const uint8_t in[4]) {
  * word carried in `tail`, so a writer that hashes one 64 MB buffer and a reader
  * that hashes it in ten pieces compute the same digest.  Not cryptographic --
  * integrity against corruption, not tampering. */
+/** The payload's chunk-independent 64-bit rolling digest (see above); init / update / final below. */
 typedef struct {
     uint64_t h;      ///< running digest
     uint64_t tail;   ///< pending bytes, first-arrived at the low end
     uint32_t ntail;  ///< 0..7 pending bytes
 } payload_digest;
 
+/** Start a digest.  @param d the digest to reset */
 static void payload_digest_init(payload_digest *d) {
     d->h = UINT64_C(1469598103934665603);
     d->tail = 0;
     d->ntail = 0;
 }
 
+/** Fold one 64-bit word into the digest state.  @param h the state  @param w the word  @return the new state */
 static uint64_t payload_digest_mix(uint64_t h, uint64_t w) {
     h ^= w;
     h *= UINT64_C(0x9E3779B97F4A7C15);
     return (h << 31) | (h >> 33);
 }
 
+/// @param d     the digest
+/// @param ptr   the bytes
+/// @param bytes how many
 static void payload_digest_update(payload_digest *d, const void *ptr, uint64_t bytes) {
     const uint8_t *p = (const uint8_t *)ptr;
     while (d->ntail != 0 && bytes != 0) {
@@ -98,6 +111,8 @@ static void payload_digest_update(payload_digest *d, const void *ptr, uint64_t b
     }
 }
 
+/** The digest's value: the state with any pending tail folded (the digest itself is not changed).
+ *  @param d the digest  @return the digest value */
 static uint64_t payload_digest_final(const payload_digest *d) {
     uint64_t h = d->h;
     if (d->ntail != 0) h = payload_digest_mix(h, d->tail);
@@ -110,12 +125,22 @@ static uint64_t payload_digest_final(const payload_digest *d) {
  * written through it.  A private type so the file and its digest cannot drift
  * apart: only these helpers touch the stream, and every one of them folds the
  * bytes it moved. */
+/** One payload stream: the file and the digest of every byte moved through it (see above). */
 typedef struct {
+    /// the payload file; borrowed (the caller opened it and closes it)
     FILE *fp;
+    /// digest of every byte read or written through this stream so far
     payload_digest digest;
     pulsar_writeback wb;   ///< write side only: written pages go to disk and leave the cache as they stream (L261)
 } payload_io;
 
+/** Write bytes through the stream, folding them into its digest, then advance its writeback.
+ *  @param io     the stream
+ *  @param ptr    the bytes
+ *  @param bytes  how many
+ *  @param err    receives the failure
+ *  @param errlen bytes of `err`
+ *  @return 0, or 1 on a short write */
 static int payload_write_bytes(payload_io *io, const void *ptr, uint64_t bytes, char *err, size_t errlen) {
     const uint8_t *p = (const uint8_t *)ptr;
     while (bytes != 0) {
@@ -134,6 +159,14 @@ static int payload_write_bytes(payload_io *io, const void *ptr, uint64_t bytes, 
 
 
 
+/** Read bytes through the stream, folding them into its digest.
+ *  @param io        the stream
+ *  @param ptr       receives the bytes
+ *  @param bytes     how many
+ *  @param remaining the payload bytes left, decremented (NULL = unbounded)
+ *  @param err       receives the failure
+ *  @param errlen    bytes of `err`
+ *  @return 0, or 1 when truncated or on a short read */
 static int payload_read_bytes(payload_io *io, void *ptr, uint64_t bytes, uint64_t *remaining, char *err, size_t errlen) {
     if (remaining && *remaining < bytes) {
         payload_set_err(err, errlen, "truncated session payload");
@@ -157,6 +190,8 @@ static int payload_read_bytes(payload_io *io, void *ptr, uint64_t bytes, uint64_
 
 
 
+/** Write a little-endian u32 through the stream.  @param io the stream  @param v the value
+ *  @param err receives the failure  @param errlen bytes of `err`  @return 0, or 1 on failure */
 static int payload_write_u32(payload_io *io, uint32_t v, char *err, size_t errlen) {
     uint8_t b[4];
     payload_put_u32(b, v);
@@ -165,6 +200,9 @@ static int payload_write_u32(payload_io *io, uint32_t v, char *err, size_t errle
 
 
 
+/** Read a little-endian u32 through the stream.  @param io the stream  @param v receives the value
+ *  @param remaining payload bytes left (NULL = unbounded)  @param err receives the failure
+ *  @param errlen bytes of `err`  @return 0, or 1 on failure */
 static int payload_read_u32(payload_io *io, uint32_t *v, uint64_t *remaining, char *err, size_t errlen) {
     uint8_t b[4];
     if (payload_read_bytes(io, b, sizeof(b), remaining, err, errlen) != 0) return 1;
@@ -173,6 +211,12 @@ static int payload_read_u32(payload_io *io, uint32_t *v, uint64_t *remaining, ch
 }
 
 /* L281: an image section -- the count, then each block's record (payload, segment and kv-state payload) */
+/// @param io     the stream
+/// @param b      [n] the blocks
+/// @param n      blocks
+/// @param err    receives the failure
+/// @param errlen bytes of `err`
+/// @return 0, or 1 on failure
 static int payload_write_images(payload_io *io, const pulsar_image_block *b, uint32_t n, char *err, size_t errlen) {
     if (payload_write_u32(io, n, err, errlen) != 0) return 1;
     for (uint32_t i = 0; i < n; i++) {
@@ -189,6 +233,15 @@ static int payload_write_images(payload_io *io, const pulsar_image_block *b, uin
 /* Accelerator tensors are copied through a fixed-size CPU buffer.  We do not mmap the
  * cache file and we do not allocate a second graph-sized blob just to serialize
  * it; both would be poor fits for this very large model. */
+/// @param io     the stream
+/// @param tensor the device tensor read from
+/// @param offset the span's byte offset in it
+/// @param bytes  the span's length in bytes
+/// @param buf    the staging buffer
+/// @param cap    bytes of `buf`
+/// @param err    receives the failure
+/// @param errlen bytes of `err`
+/// @return 0, or 1 when the span is out of range or a copy failed
 static int payload_write_tensor_span(payload_io *io, const pulsar_gpu_tensor *tensor,
                                      uint64_t offset, uint64_t bytes,
                                      uint8_t *buf, size_t cap, char *err, size_t errlen) {
@@ -221,6 +274,17 @@ static int payload_write_tensor_span(payload_io *io, const pulsar_gpu_tensor *te
 
 
 
+/** Read a span from the stream into a device tensor through a host staging buffer.
+ *  @param io        the stream
+ *  @param tensor    the device tensor written
+ *  @param offset    the span's byte offset in it
+ *  @param bytes     the span's length in bytes
+ *  @param buf       the staging buffer
+ *  @param cap       bytes of `buf`
+ *  @param remaining payload bytes left (NULL = unbounded)
+ *  @param err       receives the failure
+ *  @param errlen    bytes of `err`
+ *  @return 0, or 1 when the span is out of range or a copy failed */
 static int payload_read_tensor_span(payload_io *io, pulsar_gpu_tensor *tensor,
                                     uint64_t offset, uint64_t bytes,
                                     uint8_t *buf, size_t cap, uint64_t *remaining,
@@ -267,7 +331,9 @@ static int payload_read_tensor_span(payload_io *io, pulsar_gpu_tensor *tensor,
  * its last one only (pulsar_session_load_segment's `last`): restoring a point
  * needs ONE state, the nearest stored one at or below it, and a recurrent
  * family's state is ~133 MiB against ~13 KiB a token of rows (Qwen3.8 FN, L320). */
+/** u32 words of a segment's header. */
 #define SEGMENT_U32_FIELDS 9u
+/** Header flag (word 8): the segment carries the state at G. */
 #define SEGMENT_FLAG_STATE 1u
 /* L281 (v3): after the span's tokens, the image blocks lying wholly inside the span -- a u32 count, then per block
  * u32 start, u32 end, u64 content (two u32) -- so a chain carries rows past an image together with WHICH image they
@@ -276,6 +342,11 @@ static int payload_read_tensor_span(payload_io *io, pulsar_gpu_tensor *tensor,
  * identity as the leader's. */
 
 /* the session's records of the blocks inside [G_prev, G) */
+/// @param s      the session (its live image identity)
+/// @param G_prev the span's start
+/// @param G      the span's end
+/// @param first  receives the first such record (borrowed), NULL when none
+/// @return how many records lie wholly inside the span
 static uint32_t segment_images(const pulsar_session *s, uint32_t G_prev, uint32_t G, const pulsar_image_block **first) {
     uint32_t n = 0;
     *first = NULL;
@@ -293,17 +364,26 @@ static uint32_t segment_images(const pulsar_session *s, uint32_t G_prev, uint32_
  * session's invalidate forgets the view (a family whose invalidate leaves the device state alone has its
  * lanes written by the chain's last restore and its counters by set_frontier_stale), and the bank's
  * checkpoints go with the history they described. */
+/// @param s    the session
+/// @param st   its checkpoint store
+/// @param bank the installed bank
 static void segment_clear(pulsar_session *s, pulsar_ckpt_store *st, uint32_t bank) {
     s->live_images.n = 0;   /* L281: the bank holds no block */
     pulsar_session_family_invalidate(s);
     pulsar_ckpt_drop_bank(st, bank);
 }
 
+/** The installed bank's pools.  @param st the store  @param pools receives up to PULSAR_KV_POOLS_MAX pools
+ *  @return the count, 0 when the model has more than PULSAR_KV_POOLS_MAX */
 static uint32_t segment_pools(pulsar_ckpt_store *st, pulsar_kv_pool *pools) {
     const uint32_t n = st->ops->pools(st->state, pools, PULSAR_KV_POOLS_MAX);
     return n <= PULSAR_KV_POOLS_MAX ? n : 0u;   /* a model past the bound refuses every segment */
 }
 
+/** FNV-1a over what makes a segment's bytes readable: the state model's name, the artifact (when set), the grid,
+ *  the slot size and every pool's tokens per row and row bytes.
+ *  @param st the store
+ *  @return the digest */
 static uint64_t segment_layout_digest(pulsar_ckpt_store *st) {
     pulsar_kv_pool pools[PULSAR_KV_POOLS_MAX];
     const uint32_t n = segment_pools(st, pools);
@@ -321,16 +401,35 @@ static uint64_t segment_layout_digest(pulsar_ckpt_store *st) {
 /* Pool rows [t0 / tokens_per_row, end(t1)) of every pool: a segment's span (grid points, whole rows) or a
  * kv-state payload's [0, frontier) -- its open row too, unless the pool writes whole rows only (kv_state.h).
  * The one sizing and the one copy of pool rows either carries. */
+/** The row a span ending at t ends on: floor for a whole-rows pool, else ceil (the open row carried).
+ *  @param p the pool  @param t the position, in tokens  @return the row index (exclusive end) */
 static uint32_t pool_row(const pulsar_kv_pool &p, uint32_t t) {
     return (t + (p.whole_rows ? 0u : p.tokens_per_row - 1u)) / p.tokens_per_row;
 }
 
+/// @param pools [n] the pools
+/// @param n     pools
+/// @param t0    the span's start, in tokens
+/// @param t1    the span's end, in tokens
+/// @return the bytes of every pool's rows in the span
 static uint64_t pools_span_bytes(const pulsar_kv_pool *pools, uint32_t n, uint32_t t0, uint32_t t1) {
     uint64_t bytes = 0;
     for (uint32_t i = 0; i < n; i++) bytes += (uint64_t)(pool_row(pools[i], t1) - t0 / pools[i].tokens_per_row) * pools[i].row_bytes;
     return bytes;
 }
 
+/** Write (or read) every pool's rows of the span [t0, t1) through the stream.
+ *  @param io        the stream
+ *  @param pools     [n] the pools
+ *  @param n         pools
+ *  @param t0        the span's start, in tokens
+ *  @param t1        the span's end, in tokens
+ *  @param write     write (else read into the pools)
+ *  @param buf       a PULSAR_SESSION_IO_CHUNK staging buffer
+ *  @param remaining payload bytes left on a read (NULL = unbounded)
+ *  @param err       receives the failure
+ *  @param errlen    bytes of `err`
+ *  @return 0, or 1 on failure (an evicted pool included) */
 static int pools_span_io(payload_io *io, const pulsar_kv_pool *pools, uint32_t n, uint32_t t0, uint32_t t1, bool write,
                          uint8_t *buf, uint64_t *remaining, char *err, size_t errlen) {
     int rc = 0;
@@ -349,6 +448,8 @@ static int pools_span_io(payload_io *io, const pulsar_kv_pool *pools, uint32_t n
     return rc;
 }
 
+/** Is [G_prev, G) a segment span: non-empty, both ends on the resume grid?
+ *  @param st the store (its grid)  @param G_prev the start  @param G the end  @return true when it is */
 static bool segment_span_ok(const pulsar_ckpt_store *st, uint32_t G_prev, uint32_t G) {
     const uint32_t grid = st->ops->resume_grid;
     return G > G_prev && G_prev % grid == 0u && G % grid == 0u;
@@ -356,6 +457,9 @@ static bool segment_span_ok(const pulsar_ckpt_store *st, uint32_t G_prev, uint32
 
 /* L323: a segment may END at G only where no image block of the history lies across it (a checkpoint never does;
  * a rows-only grid cut must check) -- every block a chain holds is then inside exactly one segment */
+/// @param s the session (its live image identity)
+/// @param G the cut, in tokens
+/// @return false when an image block straddles G
 static bool segment_cut_ok(const pulsar_session *s, uint32_t G) {
     for (uint32_t i = 0; i < s->live_images.n; i++)
         if (s->live_images.b[i].start < G && G < s->live_images.b[i].end) return false;
@@ -364,6 +468,10 @@ static bool segment_cut_ok(const pulsar_session *s, uint32_t G) {
 
 /* L323: does a segment ending at G carry the state there?  The ONE predicate a save, its size and the store's
  * pricing read: the installed bank holds its grid checkpoint at G. */
+/// @param st   the store
+/// @param bank the installed bank
+/// @param G    the segment's end, in tokens
+/// @return true when the bank holds a grid checkpoint at G
 static bool segment_has_state(pulsar_ckpt_store *st, uint32_t bank, uint32_t G) {
     pulsar_gpu_tensor *slab = NULL;
     uint64_t off = 0;
@@ -371,6 +479,9 @@ static bool segment_has_state(pulsar_ckpt_store *st, uint32_t bank, uint32_t G) 
 }
 
 /* The state part of a segment: the slot and its digest (0 for a rows-only segment). */
+/// @param st    the store (its slot size)
+/// @param state the segment carries the state
+/// @return bytes
 static uint64_t segment_state_bytes_for(const pulsar_ckpt_store *st, bool state) {
     return state ? st->slot_bytes + sizeof(uint64_t) : 0u;
 }
@@ -378,6 +489,12 @@ static uint64_t segment_state_bytes_for(const pulsar_ckpt_store *st, bool state)
 /* the bytes of a segment over [G_prev, G) carrying `n_images` image records, and the state at G when `state`.  Only
  * the current version loads: older segments are refused and the chain rewrites itself (on-disk KV carries no
  * back-compat, Tyler 2026-10-13). */
+/// @param st       the store
+/// @param G_prev   the span's start
+/// @param G        the span's end
+/// @param n_images image records carried
+/// @param state    the state at G carried
+/// @return the segment's size in bytes
 static uint64_t segment_bytes_for(pulsar_ckpt_store *st, uint32_t G_prev, uint32_t G, uint32_t n_images, bool state) {
     pulsar_kv_pool pools[PULSAR_KV_POOLS_MAX];
     const uint32_t n = segment_pools(st, pools);
@@ -647,8 +764,10 @@ int pulsar_session::load_segment(FILE *fp, uint64_t bytes, bool last, uint32_t *
  * reader does not already validate.  What it adds over a segment is the frontier: the state model's FRONTIER
  * walk at T (not a grid point's), the pools' open rows (where a pool has them) and the trailing pools, the
  * logits, the prefill frontier, and the resume checkpoint a sync that does not extend T restores. */
+/** u32 words of a kv-state payload's header. */
 #define KVP_U32_FIELDS 8u
 /* L284: DeepSeek's retired graph-format payload (v3..v15, "DSV4"), refused by name */
+/** The retired "DSV4" payload magic (little-endian), refused by name. */
 #define KVP_RETIRED_DSV4_MAGIC UINT32_C(0x34565344)
 
 /* The session's draft-depth controller (spec_depth.h) -- the speculation state a frontier carries, every family's
@@ -661,7 +780,9 @@ int pulsar_session::load_segment(FILE *fp, uint64_t bytes, bool last, uint32_t *
  * boundary does (spec_lookahead_reset), and a live session voids it on its next plain step, so neither side
  * holds it at the frontier's next round.  Format v3; the copy acceptance v5; its age (copy_unseen, L308: a stale
  * estimate's next copy chain is a probe) v6. */
+/** u32 words of the speculation record (see above). */
 #define KVP_SPEC_U32 6u
+/** Pack the speculation state a frontier carries.  @param sp the carry state  @param rec receives the record */
 static void kvp_spec_pack(const pulsar_spec_carry_state *sp, uint32_t (&rec)[KVP_SPEC_U32]) {
     rec[0] = (uint32_t)sp->spec_adaptive_depth;
     rec[1] = sp->spec_depth_down_forgiven ? 1u : 0u;
@@ -672,11 +793,15 @@ static void kvp_spec_pack(const pulsar_spec_carry_state *sp, uint32_t (&rec)[KVP
 }
 /* false = the record holds no state a session could (0 = not yet moved; a depth is 1..16; an acceptance is a rate
  * in [0, 1], 0 = not measured; its age is any count) */
+/// @param rec the record
+/// @return true when every field is in range
 static bool kvp_spec_valid(const uint32_t (&rec)[KVP_SPEC_U32]) {
     float c;
     memcpy(&c, &rec[4], sizeof c);
     return rec[0] <= 16u && rec[1] <= 1u && rec[2] <= 255u && rec[3] <= 255u && c >= 0.0f && c <= 1.0f;
 }
+/** Unpack a speculation record into the carry state (its other fields untouched).  @param rec the record
+ *  @param sp receives the fields */
 static void kvp_spec_unpack(const uint32_t (&rec)[KVP_SPEC_U32], pulsar_spec_carry_state *sp) {
     sp->spec_adaptive_depth = (int)rec[0];
     sp->spec_depth_down_forgiven = rec[1] != 0u;
@@ -687,6 +812,8 @@ static void kvp_spec_unpack(const uint32_t (&rec)[KVP_SPEC_U32], pulsar_spec_car
 }
 
 /* the frontier slot's size: the state model's frontier walk, aligned as a grid slot is (checkpoint.cpp) */
+/// @param st the store
+/// @return bytes
 static uint64_t kvp_frontier_bytes(const pulsar_ckpt_store *st) {
     uint64_t bytes = 0;
     (void)st->ops->walk(st->state, -1, true, NULL, 0, st->ops->min_checkpoint(st->state), &bytes);
@@ -694,6 +821,10 @@ static uint64_t kvp_frontier_bytes(const pulsar_ckpt_store *st) {
 }
 
 /* every pool, then every trailing pool; false past the bound */
+/// @param st  the store
+/// @param out receives the pools (PULSAR_KV_POOLS_MAX entries)
+/// @param n   receives the count
+/// @return false past the bound
 static bool kvp_pools(pulsar_ckpt_store *st, pulsar_kv_pool *out, uint32_t *n) {
     const uint32_t a = st->ops->pools(st->state, out, PULSAR_KV_POOLS_MAX);
     if (a > PULSAR_KV_POOLS_MAX) return false;
@@ -705,6 +836,11 @@ static bool kvp_pools(pulsar_ckpt_store *st, pulsar_kv_pool *out, uint32_t *n) {
 
 /* the segment's layout digest, extended by every pool the payload carries (whole-row or open), the frontier
  * slot's size and the logits width */
+/// @param st    the store
+/// @param pools [n] the payload's pools
+/// @param n     pools
+/// @param width the logits width
+/// @return the digest
 static uint64_t kvp_layout_digest(pulsar_ckpt_store *st, const pulsar_kv_pool *pools, uint32_t n, uint32_t width) {
     uint64_t h = segment_layout_digest(st);
     auto mix = [&h](uint64_t v) { for (int i = 0; i < 8; i++) { h ^= (uint8_t)(v >> (8 * i)); h *= 1099511628211ull; } };
@@ -715,6 +851,15 @@ static uint64_t kvp_layout_digest(pulsar_ckpt_store *st, const pulsar_kv_pool *p
     return h;
 }
 
+/** A kv-state payload's size in bytes (the trailing digest included).
+ *  @param st    the store
+ *  @param pools [n] the pools carried
+ *  @param n     pools
+ *  @param T     the frontier, in tokens
+ *  @param G     the resume checkpoint, 0 = none
+ *  @param n_img image records carried
+ *  @param width the logits width, in floats
+ *  @return bytes */
 static uint64_t kvp_bytes_for(const pulsar_ckpt_store *st, const pulsar_kv_pool *pools, uint32_t n, uint32_t T,
                               uint32_t G, uint32_t n_img, uint32_t width) {
     uint64_t bytes = (uint64_t)KVP_U32_FIELDS * sizeof(uint32_t);
@@ -728,13 +873,34 @@ static uint64_t kvp_bytes_for(const pulsar_ckpt_store *st, const pulsar_kv_pool 
 }
 
 /* What a save of the session writes, decided once: payload_bytes and the save read the same plan. */
+/** A session save's plan (see above): filled by kvp_plan_save, read by payload_bytes and save_payload. */
 struct kvp_plan {
+    /// the session's kv store (pulsar_session_kv_store); borrowed
     pulsar_ckpt_store *st;
+    /** @var kvp_plan::T
+     *  the frontier saved, in tokens: the session's checkpoint length */
+    /** @var kvp_plan::PF
+     *  the bank's prefill frontier (tokens), <= T */
+    /** @var kvp_plan::G
+     *  the resume checkpoint's grid point (tokens): the deepest checkpoint at or below PF's grid floor; 0 = none */
+    /** @var kvp_plan::width
+     *  the logits row width in floats (pulsar_engine_logits_width) */
+    /** @var kvp_plan::n_pools
+     *  entries of pools[] in use */
+    /// the live bank saved
     uint32_t bank, T, PF, G, width, n_pools;
+    /// [n_pools] the append-only pools the payload carries: pools() then trailing_pools() (kvp_pools)
     pulsar_kv_pool pools[PULSAR_KV_POOLS_MAX];
+    /// the payload's total size in bytes, the trailing digest included (kvp_bytes_for)
     uint64_t bytes;
 };
 
+/** Plan a save of the session's live bank (see kvp_plan); every check is made here.
+ *  @param s      the session
+ *  @param p      receives the plan
+ *  @param err    receives the refusal
+ *  @param errlen bytes of `err`
+ *  @return false (err filled) when the session cannot be saved */
 static bool kvp_plan_save(pulsar_session *s, kvp_plan *p, char *err, size_t errlen) {
     p->st = pulsar_session_kv_store(s);
     p->bank = pulsar_session_live_bank(s);
@@ -1058,6 +1224,7 @@ int pulsar_session::load_snapshot(const pulsar_session_snapshot *snap, char *err
 
 
 
+/** Free a snapshot's blob and zero it.  @param snap the snapshot, or NULL */
 void pulsar_session_snapshot_free(pulsar_session_snapshot *snap) {
     if (!snap) return;
     free(snap->ptr);

@@ -1,3 +1,5 @@
+/** @file session_spec.cpp
+ *  @brief The speculation round API: draft schedule, copy drafts, rounds, absorb and commit, for every drafter. */
 #include "pulsar_engine_internal.h"
 #include "pulsar_nvtx.h"
 #include "spec_depth.h"
@@ -25,6 +27,9 @@ float pulsar_spec_tau(const pulsar_engine *e) {
 }
 
 /* A shadow's depth: the controller's when it has moved it, else the start. */
+/// @param s the session
+/// @param sp a speculative shadow
+/// @return its depth, 1 .. 16
 static uint32_t spec_shadow_depth(const pulsar_session *s, const pulsar_spec_carry_state *sp) {
     const int d = sp->spec_adaptive_depth;
     return d > 0 ? (uint32_t)(d > 16 ? 16 : d) : pulsar_spec_depth_start(s->engine);
@@ -176,6 +181,8 @@ void pulsar_spec_draft_req_init(pulsar_session *s, spec_redraft_req *q, int next
 }
 
 /* The target's undo of a round: the snapshot back on the installed bank, then released. */
+/// @param s the session
+/// @param r the round (its snapshot is released)
 static void spec_round_undo(pulsar_session *s, pulsar_spec_round *r) {
     if (spec_target(s)->restore) (void)spec_target(s)->restore(s, r);
     if (spec_target(s)->release) spec_target(s)->release(s, r);
@@ -183,6 +190,10 @@ static void spec_round_undo(pulsar_session *s, pulsar_spec_round *r) {
 
 /* The drafter's context advances by a committed verify row -- now, or in the batched lane's ONE pass
  * after every bank's walk (seed_defer, L260: the row is recorded against the installed bank). */
+/// @param s the session
+/// @param row the committed verify row
+/// @param next the token after it
+/// @return false when seed_defer is full (PULSAR_SPEC_LOGITS_ROWS + 1 rows)
 static bool spec_absorb_defer(pulsar_session *s, uint32_t row, int32_t next) {
     if (s->seed_defer.n >= PULSAR_SPEC_LOGITS_ROWS + 1) return false;
     s->seed_defer.src_row[s->seed_defer.n] = row;
@@ -195,6 +206,11 @@ static bool spec_absorb_defer(pulsar_session *s, uint32_t row, int32_t next) {
 /* The round's committed rows [row0, row0 + n) go to the drafter: recorded for the batched lane's one
  * pass after every bank's walk (seed_defer, L260), else row by row (a drafter with a per-row absorb,
  * DSpark), else as one call (a drafter that pairs rows with their successors, Qwen's MTP). */
+/// @param s the session
+/// @param row0 the first committed row
+/// @param next [n] the token after each row
+/// @param n rows
+/// @return false = the drafter refused (or seed_defer is full)
 static bool spec_absorb_rows(pulsar_session *s, uint32_t row0, const int32_t *next, uint32_t n) {
     bool ok = true;
     if (s->seed_defer.active) {
@@ -299,14 +315,22 @@ static bool spec_absorb_rows(pulsar_session *s, uint32_t row0, const int32_t *ne
  * exact target distribution, so only speed is at stake.  The remaining
  * constants are the controller's own (EWMA weight, warm-up, minimum
  * evidence, budget), not a deployment's. */
+/// The quench controller's EWMA weight.
 #define PULSAR_QUENCH_ALPHA      0.125f   /* EWMA weight (Entrpi default) */
+/// Ramp steps charged to no one.
 #define PULSAR_QUENCH_WARMUP     3u      /* ramp steps charged to no one (below) */
+/// The fewest spec steps before a quench.
 #define PULSAR_QUENCH_MINEV      8u      /* min spec steps before quench */
+/// The quench budget, in plain-token equivalents.
 #define PULSAR_QUENCH_BUDGET     4.0f    /* plain-token equivalents */
 
 /* The break-even yield for a bank with `n_batch` rows in a round shared by
  * `banks` banks (see above).  Integer microseconds in, so every rank of a TP
  * group computes the same value from the same wire terms. */
+/// @param c the lane cost fit (flat_us, row_us)
+/// @param banks banks sharing the round
+/// @param n_batch the bank's rows
+/// @return the break-even yield, tokens per round (>= 1)
 static float spec_quench_guard(const pulsar_lane_cost_fit *c, int banks, uint32_t n_batch) {
     const float share = (float)c->flat_us / (float)(banks > 0 ? banks : 1);
     const float row = (float)c->row_us;
@@ -320,8 +344,11 @@ static float spec_quench_guard(const pulsar_lane_cost_fit *c, int banks, uint32_
  * 2026-10-05); valid once 16 steps are in, the row counts have spread (an EW
  * variance of at least 1/4: adaptive depth and concurrency move them every few
  * rounds) and both terms are positive -- anything else is noise, not a price. */
+/// The lane cost fit's per-observation decay (a ~256-step window).
 #define SPEC_COST_DECAY   (1.0 - 1.0 / 256.0)
+/// Observations (decayed weight) before the fit is valid.
 #define SPEC_COST_MIN_OBS 16u
+/// The least EW variance of the row counts for a valid fit.
 #define SPEC_COST_MIN_VAR 0.25
 void lane_cost_fit_observe(pulsar_lane_cost_fit *f, uint32_t rows, double ms) {
     if (!f || rows == 0 || !(ms > 0.0)) return;
@@ -429,25 +456,48 @@ void spec_lookahead_reset(pulsar_session *s) {
  * greedy or its bit in `greedy_rows` is set: the server's tool-call override (a call's structure greedy, its payload
  * sampled) evaluated at that position (gen_spec_greedy_rows), so a round that crosses between the two draws each
  * token as plain decoding draws it.  0 = the request's params at every row. */
+/// @param temperature request temperature
+/// @param greedy_rows per-row greedy override bits
+/// @param row the round row (0 = after the base)
+/// @return true when the row draws greedy
 static bool spec_row_greedy(float temperature, uint32_t greedy_rows, uint32_t row) {
     return temperature <= 0.0f || (row < 32u && ((greedy_rows >> row) & 1u) != 0u);
 }
 
 /* One round's part of a walk: its rows [row0, row0 + K] of the step, its params, its stream at the base and its
  * masks (pulsar_spec_step.masks). */
+/// One round's slice of a batched walk (spec_walk_rounds): which step rows it owns and how each row draws.
 struct spec_walk_round {
+    /// The round (its K drafts and their ids); borrowed.
     const pulsar_spec_round *r;
+    /// The step row of the round's base: its rows are [row0, row0 + K] of the session's step rows.
     uint32_t row0;
+    /// The request's temperature (<= 0: every row greedy).
     float temperature;
+    /// The request's top-k filter.
     int top_k;
+    /** @var spec_walk_round::min_p
+     *  The request's min-p filter. */
+    /// The request's top-p filter.
     float top_p, min_p;
+    /// Per-row greedy override bits: bit j set = row j draws greedy (spec_row_greedy; rows >= 32 never).
     uint32_t greedy_rows;
+    /// The request's sampling stream at the base: row j draws at pulsar_sample_key(rng, j + 1).
     uint64_t rng;
+    /// Grammar mask rows, (logits width + 31) / 32 words each; row j uses mask row j while j < mask_rows.
     const uint32_t *masks;   /* L303: row j of the round draws through mask row j (j < mask_rows); NULL = none */
+    /// Mask rows masks holds.
     uint32_t mask_rows;
 };
 
 /* The walks of n rounds over the session's step rows: one sampler launch, one walk launch, the verdicts back. */
+/// @param s the session
+/// @param w [n] the rounds' slices of the step
+/// @param n rounds
+/// @param out [n] receives each round's verdict
+/// @param err receives the reason on failure
+/// @param errlen its size
+/// @return false = refused or failed
 static bool spec_walk_rounds(pulsar_session *s, const spec_walk_round *w, uint32_t n, pulsar_gpu_spec_walk_out *out,
                              char *err, size_t errlen) {
     pulsar_gpu_sample_req reqs[PULSAR_GPU_SAMPLE_ROWS_MAX];
@@ -508,6 +558,7 @@ static bool spec_walk_rounds(pulsar_session *s, const spec_walk_round *w, uint32
  * the batched lane), and round_end (walk, state, emit, redraft). */
 /* L108 P2: a deferred device draft is finished into the installed bank's pendings before anything reads
  * them (round_begin, the bank save, the conf peek); the drafter's business, a no-op without one. */
+/// @param s the session
 void pulsar_session_spec_chain_harvest(pulsar_session *s) {
     if (spec_drafter(s) && spec_drafter(s)->harvest) spec_drafter(s)->harvest(s);
 }
@@ -518,6 +569,18 @@ void pulsar_session_spec_chain_harvest(pulsar_session *s) {
  * now reference-bound round fields so the batched lane can run one round
  * per bank around a shared forward. Returns 0 or -1 (snapshot failure,
  * session poisoned) exactly as before. */
+/// @param s the session
+/// @param first_token the round's base token
+/// @param max_tokens the most tokens the round may emit (caps K at max_tokens - 1)
+/// @param accepted_cap the caller's accepted[] size (caps K at accepted_cap - 1)
+/// @param temperature request temperature (<= 0: greedy)
+/// @param top_k request top-k
+/// @param top_p request top-p
+/// @param min_p request min-p
+/// @param r the round, filled
+/// @param err receives the reason on failure
+/// @param errlen its size
+/// @return 0, or -1
 static int spec_round_begin(pulsar_session *s, int first_token,
                             int max_tokens, int accepted_cap,
                             float temperature, int top_k, float top_p, float min_p,
@@ -607,6 +670,27 @@ static int spec_round_begin(pulsar_session *s, int first_token,
  * offset), and `row0` is this round's first row in the forward's
  * capture/comp-save buffers (classic: 0). Owns r->frontier's lifetime on
  * every path. Returns tokens emitted, or -1 (session poisoned). */
+/// @param s the session
+/// @param r the round
+/// @param first_token the round's base token
+/// @param temperature request temperature (<= 0: greedy)
+/// @param top_k request top-k
+/// @param top_p request top-p
+/// @param min_p request min-p
+/// @param greedy_rows per-row greedy override bits
+/// @param masks grammar mask rows (NULL = none)
+/// @param mask_rows rows in masks
+/// @param rng the request's stream (advanced past the emitted tokens; NULL greedy)
+/// @param wv the round's walk verdict
+/// @param row0 the round's first row in the forward's capture
+/// @param defer_redraft record the redraft for the batched pass
+/// @param t0 the step's start (now_sec), 0 when the forward ran outside the round
+/// @param forced_truth [K + 1] the true continuation for a teacher-forced end, else NULL
+/// @param accepted [accepted_cap] receives the emitted tokens
+/// @param accepted_cap its size
+/// @param err receives the reason on failure
+/// @param errlen its size
+/// @return tokens emitted, or -1 (session poisoned)
 static int spec_round_end(pulsar_session *s, pulsar_spec_round *r,
                           int first_token,
                           float temperature, int top_k, float top_p, float min_p,
@@ -932,6 +1016,19 @@ static int spec_round_end(pulsar_session *s, pulsar_spec_round *r,
 
 /* The single lane (the classic API: CLI, eval, warmup): begin, the target's own verify forward over
  * the round's rows, end -- the batched lane runs the same begin and end around a shared forward. */
+/// @param s the session
+/// @param first_token the base token
+/// @param max_tokens the most tokens to emit
+/// @param temperature request temperature (<= 0: greedy)
+/// @param top_k request top-k
+/// @param top_p request top-p
+/// @param min_p request min-p
+/// @param rng the request's stream
+/// @param accepted [accepted_cap] receives the emitted tokens
+/// @param accepted_cap its size
+/// @param err receives the reason on failure
+/// @param errlen its size
+/// @return tokens emitted, or -1
 static int spec_single_round(pulsar_session *s, int first_token,
                              int max_tokens,
                              float temperature, int top_k,
@@ -993,6 +1090,14 @@ static int spec_single_round(pulsar_session *s, int first_token,
 
 /* The base draw: the live row at the stream's next undrawn key, read without consuming it -- the round that emits
  * the base advances past it (L288 sdet).  Greedy never reads the key, and a greedy caller may pass no stream. */
+/// @param s the session
+/// @param temperature request temperature (<= 0: greedy)
+/// @param top_k request top-k
+/// @param top_p request top-p
+/// @param min_p request min-p
+/// @param mask the grammar mask row (NULL = none)
+/// @param rng the request's stream (read, not advanced; may be NULL when greedy)
+/// @return the token, or PULSAR_SAMPLE_REFUSED
 static int spec_base_draw(pulsar_session *s, float temperature, int top_k, float top_p, float min_p,
                           const uint32_t *mask, const uint64_t *rng) {
     if (temperature > 0.0f && !rng) return PULSAR_SAMPLE_REFUSED;
@@ -1108,12 +1213,16 @@ int pulsar_session::eval_speculative_block(int first_token,
 
 /* ---- plan-34 inc 6: the batched-lane round API (pulsar.h) --------------- */
 
+/// Allocate a zeroed round (pulsar.h; the batched lane's per-bank record).
+/// @return the round, freed with pulsar_spec_round_free (xmalloc: dies on OOM)
 pulsar_spec_round *pulsar_spec_round_new(void) {
     pulsar_spec_round *r = (pulsar_spec_round *)xmalloc(sizeof(pulsar_spec_round));
     memset(r, 0, sizeof(*r));
     return r;
 }
 
+/// Free a round and its target snapshot handle.
+/// @param r the round (NULL: no-op)
 void pulsar_spec_round_free(pulsar_spec_round *r) {
     if (!r) return;
     free(r->snap);            /* the target's snapshot handle */
@@ -1164,6 +1273,25 @@ uint32_t pulsar_spec_round_fill_reqs(const pulsar_spec_round *r, uint32_t bank, 
 
 /* The batched lane's round end: the round's verdict from the step's walk (spec_walk_rounds), then the one
  * round_end. */
+/// @param s the session
+/// @param r the round
+/// @param first_token the base token
+/// @param temperature request temperature (<= 0: greedy)
+/// @param top_k request top-k
+/// @param top_p request top-p
+/// @param min_p request min-p
+/// @param greedy_rows per-row greedy override bits
+/// @param masks grammar mask rows (NULL = none)
+/// @param mask_rows rows in masks
+/// @param rng the request's stream
+/// @param wv the walk verdict (NULL only on a teacher-forced end)
+/// @param row0 the round's first step row
+/// @param forced_truth teacher-forced continuation, or NULL
+/// @param accepted [accepted_cap] receives the emitted tokens
+/// @param accepted_cap its size
+/// @param err receives the reason on failure
+/// @param errlen its size
+/// @return tokens emitted, or -1
 static int spec_round_end_walked(pulsar_session *s, pulsar_spec_round *r,
                                  int first_token,
                                  float temperature, int top_k, float top_p,
@@ -1286,6 +1414,8 @@ void pulsar_spec_redraft_stamp(pulsar_session *s, spec_redraft_req *q) {
  * Each is the per-bank sequence the server ran, in the same order on the same
  * state: restore, the phase, save.  The public wrappers (engine_api.cpp) send
  * ONE frame per phase and collect ONE verdict, pulsar_spec_steps_verdict. */
+/// Reset a step's verdict fields (status OK, nothing accepted, no error).
+/// @param st the step
 static void spec_step_reset(pulsar_spec_step *st) {
     st->status = PULSAR_SPEC_STEP_OK;
     st->n_accepted = 0;
@@ -1429,6 +1559,9 @@ void pulsar_session_spec_redraft_commit_batch_local(pulsar_session *s, pulsar_sp
 }
 
 /* FNV-1a over 32-bit words. */
+/// @param h the running hash
+/// @param v the next word (hashed low byte first)
+/// @return the updated hash
 static uint32_t spec_fp(uint32_t h, uint32_t v) {
     for (int b = 0; b < 4; b++) h = (h ^ ((v >> (8 * b)) & 0xffu)) * 16777619u;
     return h;

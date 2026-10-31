@@ -1,3 +1,5 @@
+/** @file imatrix_qwen.cpp
+ *  @brief The Qwen4-exp family's importance-matrix collection. */
 /* imatrix_qwen.cpp -- the Qwen4-exp family's importance-matrix collection (L284 P15; family.h pulsar_family_imatrix).
  *
  * The dataset walk, the caps and the llama.cpp `.dat` frame are the core's (session.cpp, imatrix.cpp).  What this
@@ -19,22 +21,37 @@
 #include <string>
 #include <vector>
 
+/** One tensor's accumulated statistics: sum(x[col]^2) per expert per input column. */
 struct imatrix_acc {
+    /// the checkpoint's tensor name
     std::string name;
+    /// expert slices (1 for a dense tensor)
     uint32_t n_expert, n_col;
+                                   ///< input columns per slice
     std::vector<double> sum2;      ///< [n_expert][n_col]
     std::vector<uint32_t> count;   ///< [n_expert]
 };
 
+/** The Qwen imatrix observer the trunk's ops note into (pulsar_engine::imatrix_tap while a collection runs). */
 struct pulsar_imatrix_tap {
+    /// one accumulator per observed tensor, in first-seen order (the .dat file's order)
     std::vector<imatrix_acc> accs;
+    /// tensor name -> its index in accs
     std::map<std::string, size_t> index;
     uint64_t routes = 0;           ///< (token, expert) routing decisions observed
+    /// host staging for the device bf16 input rows of the current note
     std::vector<uint16_t> row_buf;
+    /// host staging for the device expert picks [rows][k] of the current note
     std::vector<int32_t> sel_buf;
     bool failed = false;           ///< a device read failed: the collection is not to be written
 };
 
+/// The accumulator of `w`, created on first sight; dies when one tensor is seen at two shapes.
+/// @param t the tap
+/// @param w the tensor (its name keys it)
+/// @param n_expert expert slices
+/// @param n_col input columns
+/// @return the accumulator (owned by t)
 static imatrix_acc *tap_acc(pulsar_imatrix_tap *t, const pulsar_tensor *w, uint32_t n_expert, uint32_t n_col) {
     const std::string name(w->name.ptr, w->name.len);
     auto it = t->index.find(name);
@@ -51,6 +68,8 @@ static imatrix_acc *tap_acc(pulsar_imatrix_tap *t, const pulsar_tensor *w, uint3
     return a;
 }
 
+/// @param b bf16 bits
+/// @return the value, exact
 static float bf16_f32(uint16_t b) {
     const uint32_t u = (uint32_t)b << 16;
     float f;
@@ -58,12 +77,22 @@ static float bf16_f32(uint16_t b) {
     return f;
 }
 
+/// Read device bytes into host; a failure marks the tap failed.
+/// @param t the tap
+/// @param dev device source
+/// @param[out] host destination
+/// @param bytes length
+/// @return false on a failed read
 static bool tap_read(pulsar_imatrix_tap *t, const void *dev, void *host, uint64_t bytes) {
     if (pulsar_gpu_device_read(dev, host, bytes)) return true;
     t->failed = true;
     return false;
 }
 
+/// Add one row's squares to an expert slice and count it.
+/// @param a the accumulator
+/// @param expert the slice
+/// @param row n_col bf16 values
 static void add_row_sq(imatrix_acc *a, uint32_t expert, const uint16_t *row) {
     double *dst = a->sum2.data() + (size_t)expert * a->n_col;
     for (uint32_t i = 0; i < a->n_col; i++) {
@@ -122,13 +151,23 @@ void pulsar_imatrix_note_routed_mid(pulsar_imatrix_tap *tap, const pulsar_tensor
 
 /* ---- the family's collection ----------------------------------------------------------------------------- */
 
+/** Qwen's imatrix collection in progress: begin's handle, freed by end. */
 struct qwen_imatrix_run {
+    /// the observer, installed as the engine's imatrix_tap until end
     pulsar_imatrix_tap tap;
+    /// the one session every prompt is synced through (owned)
     pulsar_session *session;
+    /// the dataset path, recorded in the .dat trailer
     std::string dataset;
+    /// prompts run so far
     uint32_t prompts;
 };
 
+/// pulsar_family_imatrix::begin.
+/// @param e the engine (one rank only)
+/// @param dataset_path the dataset
+/// @param ctx_size the session's context, in tokens
+/// @return a qwen_imatrix_run, or NULL (printed)
 static void *qwen_imatrix_begin(pulsar_engine *e, const char *dataset_path, int ctx_size) {
     if (e->tp) {
         fprintf(stderr, "pulsar: imatrix collection on %s runs on one rank; this engine is tensor-parallel -- refusing\n",
@@ -150,6 +189,10 @@ static void *qwen_imatrix_begin(pulsar_engine *e, const char *dataset_path, int 
     return r;
 }
 
+/// pulsar_family_imatrix::prompt: run one prompt whole.
+/// @param c the run
+/// @param tokens the prompt
+/// @return false on a failed sync or device read
 static bool qwen_imatrix_prompt(pulsar_engine *, void *c, const pulsar_tokens *tokens) {
     qwen_imatrix_run *r = (qwen_imatrix_run *)c;
     char err[256] = "";
@@ -162,8 +205,14 @@ static bool qwen_imatrix_prompt(pulsar_engine *, void *c, const pulsar_tokens *t
     return !r->tap.failed;
 }
 
+/// @param c the run
+/// @return routing decisions observed
 static uint64_t qwen_imatrix_routes(const void *c) { return ((const qwen_imatrix_run *)c)->tap.routes; }
 
+/// pulsar_family_imatrix::save: write the .dat file.
+/// @param c the run
+/// @param path output path
+/// @return false (printed) after a failed read or a write error
 static bool qwen_imatrix_save(pulsar_engine *, void *c, const char *path) {
     qwen_imatrix_run *r = (qwen_imatrix_run *)c;
     if (r->tap.failed) {
@@ -179,6 +228,9 @@ static bool qwen_imatrix_save(pulsar_engine *, void *c, const char *path) {
     return imatrix_dat_close(fp, path, (int32_t)r->prompts, r->dataset.c_str());
 }
 
+/// pulsar_family_imatrix::end: uninstall the tap and free the run.
+/// @param e the engine
+/// @param c the run
 static void qwen_imatrix_end(pulsar_engine *e, void *c) {
     qwen_imatrix_run *r = (qwen_imatrix_run *)c;
     e->imatrix_tap = NULL;

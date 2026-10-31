@@ -1,3 +1,5 @@
+/** @file step_driver.cpp
+ *  @brief The core row-step driver (step_driver.h). */
 /* step_driver.cpp -- the core row-step driver (step_driver.h, L295 F4).
  *
  * Lifted from Qwen's step driver (family_qwen.cpp, L251 .. L289), where it was generic in shape and Qwen's only by
@@ -10,7 +12,9 @@
 #include "spec_block.h"
 #include "tp/pulsar_tp.h"
 
+/** The engine's family driver ops.  @param e the engine  @return pulsar_family::driver */
 static const pulsar_driver_ops *DOPS(const pulsar_engine *e) { return e->family->driver; }
+/** The engine's family arch name, for messages.  @param e the engine  @return pulsar_family::arch */
 static const char *ARCH(const pulsar_engine *e) { return e->family->arch; }
 
 pulsar_driver_heads pulsar_driver_heads_span(uint32_t row0, uint32_t n) {
@@ -49,6 +53,8 @@ bool pulsar_driver_tp_allreduce(const pulsar_driver_step *st, uint32_t slot, pul
 
 /* ---- the session ---------------------------------------------------------------------------------------------- */
 
+/** Free the driver's own buffers and drafter lanes (the declared state and the family's part are freed elsewhere).
+ *  @param d the driver state; its pointers freed (mtp / block NULLed), the struct itself kept */
 static void driver_bufs_free(pulsar_driver_state *d) {
     pulsar_gpu_tensor_free(d->logits);
     pulsar_gpu_tensor_free(d->row_pos);
@@ -66,6 +72,10 @@ static void driver_bufs_free(pulsar_driver_state *d) {
 /* The family's state, the driver's buffers and the declared state, built into a session the core allocated (L272
  * P2: the core sets ctx_size, the prefill cap and the logits row, and measures the bytes this allocates).  The same
  * code prices it: the core runs the create under pulsar_gpu_tensor_dry_begin (session_cost_bytes_banked). */
+/// pulsar_family_session_ops::create for a driver family.
+/// @param s       the session the core allocated
+/// @param n_banks banks to build
+/// @return 0, or 1 (said) on a refusal or a failed allocation (the session's driver part torn down)
 int pulsar_driver_session_create(pulsar_session *s, uint32_t n_banks) {
     pulsar_engine *e = s->engine;
     const pulsar_driver_ops *ops = DOPS(e);
@@ -145,6 +155,9 @@ int pulsar_driver_session_create(pulsar_session *s, uint32_t n_banks) {
     return 0;
 }
 
+/** pulsar_family_session_ops::destroy for a driver family: the step graphs dropped (unless pricing), the declared
+ *  state, the driver's buffers and the family's part freed.
+ *  @param s the session */
 void pulsar_driver_session_destroy(pulsar_session *s) {
     /* L296 perf: a captured decode step bakes this session's buffers (its key names them): drop every graph before
      * they are freed and another allocation can take their addresses.  L306: a priced (dry) session never ran and
@@ -160,11 +173,22 @@ void pulsar_driver_session_destroy(pulsar_session *s) {
 
 /* ---- the forward ---------------------------------------------------------------------------------------------- */
 
+/** driver_image_rows' user data: the family's ops and the step its image_rows hook writes into (both borrowed,
+ *  on the forward's stack). */
 struct driver_image_ud {
+    /// the family's driver ops (image_rows is called)
     const pulsar_driver_ops *ops;
+    /// the step being run
     const pulsar_driver_step *st;
 };
 
+/// pulsar_image_rows callback: hand the merged image rows to the family's image_rows hook.
+/// @param ud       a driver_image_ud
+/// @param rows     the image's rows
+/// @param n_rows   rows in `rows`
+/// @param row0     the first step row they land on
+/// @param n_tokens the step's token rows
+/// @return the hook's verdict
 static bool driver_image_rows(void *ud, const uint16_t *rows, uint32_t n_rows, uint32_t row0, uint32_t n_tokens) {
     const driver_image_ud *u = (const driver_image_ud *)ud;
     return u->ops->image_rows(u->st, rows, n_rows, row0, n_tokens);
@@ -175,6 +199,12 @@ static bool driver_image_rows(void *ud, const uint16_t *rows, uint32_t n_rows, u
  * or a pure verify), the row count, the head list, and the family's own key (pulsar_driver_ops::stage).  Tagged in the
  * top bits so it never meets the output head segment's structured keys (gpu_graph_output_head_seg_key) in the one
  * segment table. */
+/// @param d          the session's driver state (its address is part of the key)
+/// @param verify     a verify step (else decode)
+/// @param n_rows     the step's rows
+/// @param heads      the step's head list
+/// @param family_key the family's own key (pulsar_driver_ops::stage)
+/// @return the segment key, top nibble 0xD
 static uint64_t driver_graph_key(const pulsar_driver_state *d, bool verify, uint32_t n_rows,
                                  const pulsar_driver_heads &heads, uint64_t family_key) {
     auto mix = [](uint64_t h, uint64_t v) {
@@ -194,6 +224,9 @@ static uint64_t driver_graph_key(const pulsar_driver_state *d, bool verify, uint
 
 /* rule 5: each graphed lane (the decode step, the verify step) says once that it ran (the counters are
  * pulsar_gpu_seg_counts) */
+/// @param arch   the family arch, for the message
+/// @param verify the verify lane (else decode)
+/// @param what   "captured" or "replayed"
 static void driver_graph_announce(const char *arch, bool verify, const char *what) {
     static bool seen_[2][2] = {};
     bool &seen = seen_[verify ? 1 : 0][what[0] == 'c' ? 0 : 1];
@@ -208,6 +241,16 @@ static void driver_graph_announce(const char *arch, bool verify, const char *wha
  * (d->logits, the logits width a row), which becomes the session's step rows (L302: draws read them there); a
  * caller that wants them on the host too passes `logits_out`.  n_verify > 0 arms the declared state's verify capture
  * over the verify rows. */
+/// @param s          the session
+/// @param mode       the step's layout
+/// @param tokens     [n_rows] host token ids
+/// @param pos        [n_rows] host positions
+/// @param bank       [n_rows] host bank ids
+/// @param n_rows     the step's rows, 1 .. the driver's max_rows
+/// @param heads      the step rows to head, <= PULSAR_DRIVER_HEADS_MAX
+/// @param logits_out receives heads.n x the logits width floats when non-NULL
+/// @param n_verify   the PREFILL step's leading verify rows (0 = none)
+/// @return false (said) when the step was refused or failed
 static bool driver_forward(pulsar_session *s, pulsar_step_mode mode, const int32_t *tokens, const int32_t *pos,
                            const int32_t *bank, uint32_t n_rows, const pulsar_driver_heads &heads, float *logits_out,
                            uint32_t n_verify = 0) {
@@ -383,12 +426,26 @@ static bool driver_forward(pulsar_session *s, pulsar_step_mode mode, const int32
 /* One prefill chunk of the live bank (pulsar_prefill_chunk_fn): rows [pos0, pos0 + rows) of the prompt through the
  * forward (the drafter's lane absorbs them too), the bank's position advanced, and -- while the prefill CONTINUES the
  * bank's prefill-only history (L266 step 5) -- that history extended. */
+/** driver_prefill_chunk's user data (see above); filled by pulsar_driver_prefill, which owns the two arrays. */
 struct driver_prefill_ctx {
+    /** @var driver_prefill_ctx::bank
+     *  [prefill_cap] host bank id of each chunk row, all the live bank; xmalloc'd, freed by pulsar_driver_prefill */
+    /// [prefill_cap] host position of each chunk row, rewritten per chunk; xmalloc'd, freed by pulsar_driver_prefill
     int32_t *pos, *bank;
+    /// the live bank prefilled
     uint32_t live;
+    /// the prefill continues the bank's prefill-only history (it starts at prefill_pos and the bank is not stale), so
+    /// each chunk extends pulsar_state_set::prefill_pos
     bool canonical;
 };
 
+/// @param s      the session
+/// @param prompt the prompt
+/// @param pos0   the chunk's first position
+/// @param rows   the chunk's rows
+/// @param last   the prompt's final chunk (its last row is headed)
+/// @param ud     a driver_prefill_ctx
+/// @return false when the forward, the drafter's absorb or the state update failed
 static bool driver_prefill_chunk(pulsar_session *s, const pulsar_tokens *prompt, uint32_t pos0, uint32_t rows,
                                  bool last, void *ud) {
     driver_prefill_ctx *c = (driver_prefill_ctx *)ud;
@@ -410,6 +467,10 @@ static bool driver_prefill_chunk(pulsar_session *s, const pulsar_tokens *prompt,
  * grid point).  A cut changes no byte on a split-invariant family (every prompt chunk takes the prefill arms,
  * session_contract_gate C1), which is also why an interrupted sync resumes exactly.  Returns the loop's 0 /
  * PULSAR_SESSION_SYNC_INTERRUPTED / 1. */
+/// @param s      the session
+/// @param prompt the prompt
+/// @param start  the position the prefill starts from
+/// @return 0, PULSAR_SESSION_SYNC_INTERRUPTED, or 1
 int pulsar_driver_prefill(pulsar_session *s, const pulsar_tokens *prompt, uint32_t start) {
     pulsar_state_set *ss = s->states;
     driver_prefill_ctx c;
@@ -427,14 +488,20 @@ int pulsar_driver_prefill(pulsar_session *s, const pulsar_tokens *prompt, uint32
 /* The family's sync is the core's (sync_driver.cpp, L272 P2) over these: the bank's position is the declared state's
  * authority, a reset clears the bank's state, the prefill is pulsar_driver_prefill, and the shape is the session's
  * cap with no alignment (a cut anywhere is the cold bytes: the plan's split_invariant). */
+/** The sync's agreement test: the live bank's declared position is the view's length.  @param s the session
+ *  @return true when they agree */
 bool pulsar_driver_sync_state_agrees(pulsar_session *s) {
     return s->states->bank_pos[s->states->live_bank] == (uint32_t)s->checkpoint.len;
 }
 
+/** The sync's bank reset: the live bank's declared state starts over.  @param s the session
+ *  @return false when a device clear failed */
 bool pulsar_driver_sync_reset_bank(pulsar_session *s) {
     return pulsar_state_reset_bank(s->states, s->states->live_bank);
 }
 
+/** The sync's prefill shape: the session's prefill cap, resumed or not, no alignment.  @param s the session
+ *  @param out receives the shape */
 void pulsar_driver_prefill_shape(pulsar_session *s, pulsar_prefill_shape *out) {
     out->cap = s->prefill_cap;
     out->resumed_cap = s->prefill_cap;
@@ -445,6 +512,11 @@ void pulsar_driver_prefill_shape(pulsar_session *s, pulsar_prefill_shape *out) {
 
 /* The row (the core's eval checked the context, the id, and the bank standing at the view's end): the trunk's decode
  * step, the drafter lane's absorb, and the bank's position advanced. */
+/// @param s      the session
+/// @param token  the token decoded at the view's end
+/// @param err    receives the failure when non-NULL
+/// @param errlen bytes of `err`
+/// @return 0, or 1 when the forward or the drafter's step refused
 int pulsar_driver_eval_row(pulsar_session *s, int token, char *err, size_t errlen) {
     const pulsar_driver_ops *ops = DOPS(s->engine);
     const uint32_t live = s->states->live_bank;
@@ -464,6 +536,16 @@ int pulsar_driver_eval_row(pulsar_session *s, int token, char *err, size_t errle
 
 /* L334 P2a: a request row's position is typed at the API (pulsar_multiseq_req.pos, TokPos); the driver bodies below
  * read it raw (.raw()) into their int32 rows until P2b types them. */
+/** pulsar_family_session_ops::decode_multiseq for a driver family: one row per bank, each at its bank's next
+ *  position, every row headed.
+ *  @param s          the session
+ *  @param reqs       [n] the rows
+ *  @param n          rows, <= PULSAR_DRIVER_HEADS_MAX and the driver's max_rows
+ *  @param logits     receives n rows of the logits width, or NULL (the rows stay on the device)
+ *  @param logits_cap capacity of `logits` in floats, >= n x the logits width
+ *  @param err        receives the failure when non-NULL
+ *  @param errlen     bytes of `err`
+ *  @return 0, or 1 when refused */
 int pulsar_driver_decode_multiseq(pulsar_session *s, const pulsar_multiseq_req *reqs, uint32_t n, float *logits,
                                   int logits_cap, char *err, size_t errlen) {
     pulsar_engine *e = s->engine;
@@ -512,6 +594,15 @@ int pulsar_driver_decode_multiseq(pulsar_session *s, const pulsar_multiseq_req *
 /* A verify's rows reqs[0, n): one run a bank, each run starting at its bank's next position and each further row
  * following the one before -- the speculation lane's verify, alone (decode_mixed) or in front of a fused step's
  * prompt run.  Fills tok / pos / bk; false (nothing moved) names the first row that is not. */
+/// @param s      the session
+/// @param reqs   [n] the verify rows
+/// @param n      rows
+/// @param tok    receives [n] token ids
+/// @param pos    receives [n] positions
+/// @param bk     receives [n] bank ids
+/// @param err    receives the refusal when non-NULL
+/// @param errlen bytes of `err`
+/// @return true when every row is its run's next position
 static bool driver_verify_rows(pulsar_session *s, const pulsar_multiseq_req *reqs, uint32_t n, int32_t *tok,
                                int32_t *pos, int32_t *bk, char *err, size_t errlen) {
     const pulsar_state_set *ss = s->states;
@@ -535,6 +626,16 @@ static bool driver_verify_rows(pulsar_session *s, const pulsar_multiseq_req *req
  * (max_head_runs 0), which is exactly the batched decode.  A step that carries a PREFILL run (a bank with more than
  * one row) is refused before anything moves: a driver family declares no PULSAR_FAMILY_CAP_MIXED_PREFILL, so the
  * server's mixed lane never sends one -- its prompts ride the fused step or the sync. */
+/// @param s             the session
+/// @param reqs          [n_rows] the rows
+/// @param n_rows        rows
+/// @param logits        receives the headed rows, or NULL
+/// @param logits_cap    capacity of `logits` in floats
+/// @param out_n_rows    receives the headed row count (may be NULL)
+/// @param max_head_runs 0 = one row per bank (the batched decode), PULSAR_MSEQ_HEAD_ALL_ROWS = the verify
+/// @param err           receives the failure when non-NULL
+/// @param errlen        bytes of `err`
+/// @return 0, 1 (refused before anything moved) or -1
 int pulsar_driver_decode_mixed(pulsar_session *s, const pulsar_multiseq_req *reqs, uint32_t n_rows, float *logits,
                                int logits_cap, uint32_t *out_n_rows, uint32_t max_head_runs, char *err,
                                size_t errlen) {
@@ -584,6 +685,16 @@ int pulsar_driver_decode_mixed(pulsar_session *s, const pulsar_multiseq_req *req
  * last row headed into the next logits row after the verify's, in run order.  The record of each chunk in its bank's
  * history is the core's pulsar_session_note_prefilled.  1 = refused before anything moved, -1 = the step failed with
  * state moved (its banks' state is fatal). */
+/// @param s          the session
+/// @param reqs       [n_rows] the rows: n_dec verify rows, then the prompt runs
+/// @param n_rows     rows, <= the driver's max_rows
+/// @param shape      the step's shape
+/// @param logits     receives the headed rows, or NULL
+/// @param logits_cap capacity of `logits` in floats
+/// @param out_n_rows receives n_dec + the headed runs (may be NULL)
+/// @param err        receives the failure when non-NULL
+/// @param errlen     bytes of `err`
+/// @return 0, 1 (refused before anything moved) or -1 (state moved: fatal)
 int pulsar_driver_decode_fused(pulsar_session *s, const pulsar_multiseq_req *reqs, uint32_t n_rows,
                                const pulsar_fused_shape *shape, float *logits, int logits_cap, uint32_t *out_n_rows,
                                char *err, size_t errlen) {
@@ -709,6 +820,12 @@ int pulsar_driver_decode_fused(pulsar_session *s, const pulsar_multiseq_req *req
 
 /* The single lane's verify: the trunk over the round's rows, every row headed into the driver's slab (the session's
  * step rows: the walk reads them on the device, L302). */
+/// pulsar_spec_target_ops::verify_single.
+/// @param s      the session
+/// @param r      the round (n_batch rows on the live bank)
+/// @param err    receives the refusal
+/// @param errlen bytes of `err`
+/// @return true when the verify step ran
 static bool driver_verify_single(pulsar_session *s, pulsar_spec_round *r, char *err, size_t errlen) {
     const uint32_t R = r->n_batch;
     if (R > PULSAR_DRIVER_HEADS_MAX) {
@@ -725,6 +842,11 @@ static bool driver_verify_single(pulsar_session *s, pulsar_spec_round *r, char *
 /* The walk kept `commit` drafts: the installed bank's run of the last verify back to its last kept row (rows
  * 1 + commit .. of the run undone; the commit finds the bank's run in the capture, wherever it sat in the step),
  * the bank's position counter there, the kept row's logits fresh. */
+/// pulsar_spec_target_ops::commit.
+/// @param s      the session
+/// @param r      the round
+/// @param commit drafts kept (the run keeps 1 + commit rows)
+/// @return false when the rows or the state commit are refused
 static bool driver_spec_commit(pulsar_session *s, pulsar_spec_round *r, uint32_t commit, uint32_t) {
     pulsar_state_set *ss = s->states;
     pulsar_multiseq_req reqs[PULSAR_DRIVER_HEADS_MAX];
@@ -739,6 +861,9 @@ static bool driver_spec_commit(pulsar_session *s, pulsar_spec_round *r, uint32_t
     return true;
 }
 
+/** pulsar_spec_target_ops::cut: invalidate the session's view (the cut position is unused); the next sync
+ *  prefills.
+ *  @param s the session */
 static void driver_spec_cut(pulsar_session *s, int) {
     s->checkpoint_valid = false;
     s->checkpoint.len = 0;

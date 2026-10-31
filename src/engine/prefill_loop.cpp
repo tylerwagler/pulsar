@@ -1,3 +1,5 @@
+/** @file prefill_loop.cpp
+ *  @brief L272 P2: the family-neutral prefill loop (cut rule, chunk walk, read-ahead). */
 /* prefill_loop.cpp -- L272 P2: the family-neutral prefill loop.
  *
  * A sync's prefill is the same walk for every family: ONE cut rule (pulsar_prefill_plan_next_end), a grid
@@ -40,6 +42,11 @@ uint32_t pulsar_prompt_endpoint(pulsar_engine *e, const pulsar_ckpt_store *store
 
 /* L268: the image block a cut at `cut` would split -- [bs, be) with bs < cut < be -- or false.  The FIRST such
  * block in request order (the cut rule adjusts block by block in that order). */
+/// @param p   the plan (its prompt and image refs)
+/// @param cut the cut position, in tokens
+/// @param bs  receives the block's start
+/// @param be  receives the block's end (exclusive)
+/// @return true when an image block straddles `cut`
 static bool prefill_plan_block_across(const pulsar_prefill_plan *p, uint32_t cut, uint32_t *bs, uint32_t *be) {
     for (int i = 0; i < p->n_images; i++) {
         int len = 0;
@@ -140,6 +147,12 @@ int pulsar_prefill_walk_run(const pulsar_prefill_walk *w, uint32_t start, uint32
  * the CLI, imatrix -- ever reads ahead), the pool holds at most PULSAR_ENGRAM_AHEAD_PENDING_MAX unread rows (~1 GiB of
  * cache), and an arm is skipped while MemAvailable is under PULSAR_READ_AHEAD_MEM_HEADROOM plus that cap. */
 
+/** FNV-1a of the prompt ids [from - 2, to) (the two before `from` too: the n-gram context its rows hash), mixed with
+ *  the range: a read-ahead mark's identity.
+ *  @param v    the prompt ids
+ *  @param from the range's first position
+ *  @param to   one past its last
+ *  @return the hash */
 static uint64_t read_ahead_hash(const int *v, uint32_t from, uint32_t to) {
     uint64_t h = 1469598103934665603ull;
     for (uint32_t i = from >= 2u ? from - 2u : 0u; i < to; i++) {
@@ -187,6 +200,10 @@ uint64_t pulsar_read_ahead_mem_available(void) {
     return (uint64_t)kib * 1024ull;
 }
 
+/** The engram pool tag of a session's bank: its read-ahead rows are queued and cancelled under it.
+ *  @param s    the session (its address)
+ *  @param bank the bank, < 2^16
+ *  @return the tag */
 static uint64_t read_ahead_tag(const pulsar_session *s, uint32_t bank) {
     return ((uint64_t)(uintptr_t)s << 16) ^ bank;   /* banks < 2^16; one tag per session and bank */
 }
@@ -235,6 +252,9 @@ uint32_t pulsar_session_read_ahead(pulsar_session *s, uint32_t bank, const pulsa
     return to - from;
 }
 
+/** Cancel the bank's queued read-ahead rows and clear its mark (nothing to do when none are queued).
+ *  @param s    the session, or NULL
+ *  @param bank the bank */
 void pulsar_session_read_ahead_cancel(pulsar_session *s, uint32_t bank) {
     const pulsar_driver_ops *ops = s ? s->engine->family->driver : NULL;
     if (!ops || !ops->read_ahead || bank >= s->n_ahead || s->ahead[bank].from == s->ahead[bank].to) return;
@@ -242,6 +262,10 @@ void pulsar_session_read_ahead_cancel(pulsar_session *s, uint32_t bank) {
     s->ahead[bank] = {};
 }
 
+/** Report prefill progress to the session's progress and display-progress hooks (each when set).
+ *  @param s       the session
+ *  @param current tokens prefilled so far
+ *  @param total   the prompt's tokens */
 static void prefill_loop_progress(pulsar_session *s, int current, int total) {
     if (s->progress) s->progress(s->progress_ud, "prefill_chunk", current, total);
     if (s->display_progress) s->display_progress(s->display_progress_ud, "prefill_display", current, total);
@@ -249,12 +273,20 @@ static void prefill_loop_progress(pulsar_session *s, int current, int total) {
 
 /* The session loop's hooks over the walk: the view advanced and the shared capture rule applied as each chunk
  * lands, the session's cancel hook as the stop -- polled only where a resume is exact. */
+/** The walk's user data for prefill_loop_chunk / _landed / _stop: one pulsar_prefill_loop call's state, on its
+ *  stack. */
 struct prefill_loop_ctx {
+    /// the session prefilling; borrowed
     pulsar_session *s;
+    /// the whole prompt (token ids); borrowed
     const pulsar_tokens *prompt;
+    /// the live bank the walk prefills (pulsar_session_live_bank at the loop's start)
     uint32_t bank;
+    /// the session's checkpoint store the landed hook captures into; borrowed
     pulsar_ckpt_store *ckpt;
+    /// the family's chunk forward, called once per chunk
     pulsar_prefill_chunk_fn chunk;
+    /// the caller's user data, passed through to `chunk`
     void *ud;
     uint32_t endpoint;   ///< L311: the plan's message endpoint the walk records (0 = none)
     /** L281 (b): the walk stands where a resume is exact -- its start, or a chunk end the model's prefill
@@ -268,6 +300,12 @@ struct prefill_loop_ctx {
  * drained first by the step's own drain (end_commands: a no-op wait where the family's chunk already ended in one, as
  * the step driver's does; a flag it reads fails the chunk, as at any step's end) -- not a chunk of a sync that merges
  * images, whose encoder the fit does not model. */
+/// pulsar_prefill_walk chunk hook: read the next chunk's rows ahead, run the family's chunk, observe its cost.
+/// @param ud   a prefill_loop_ctx
+/// @param pos0 the chunk's first position
+/// @param rows the chunk's rows
+/// @param last the prompt's final chunk
+/// @return false when the chunk or its end-of-step drain failed
 static bool prefill_loop_chunk(void *ud, uint32_t pos0, uint32_t rows, bool last) {
     const prefill_loop_ctx *c = (const prefill_loop_ctx *)ud;
     /* L329 (b2): the next chunk's rows, read while this one computes (queued first; this chunk's own gather, issued
@@ -282,6 +320,10 @@ static bool prefill_loop_chunk(void *ud, uint32_t pos0, uint32_t rows, bool last
     return true;
 }
 
+/// pulsar_prefill_walk landed hook: the session's view to `chunk_end`, the capture rule, the endpoint record, progress.
+/// @param ud        a prefill_loop_ctx
+/// @param chunk_end the walk's position after the chunk, in tokens
+/// @return false when pulsar_ckpt_landed refused
 static bool prefill_loop_landed(void *ud, uint32_t chunk_end) {
     prefill_loop_ctx *c = (prefill_loop_ctx *)ud;
     pulsar_session *s = c->s;
@@ -296,6 +338,9 @@ static bool prefill_loop_landed(void *ud, uint32_t chunk_end) {
     return true;
 }
 
+/** pulsar_prefill_walk stop hook: the session's cancel, honoured only at a resume point.
+ *  @param ud a prefill_loop_ctx
+ *  @return true to stop the walk */
 static bool prefill_loop_stop(void *ud) {
     const prefill_loop_ctx *c = (const prefill_loop_ctx *)ud;
     return c->at_resume_point && pulsar_session_cancelled(c->s);

@@ -1,3 +1,5 @@
+/** @file gpu_prefill.cpp
+ *  @brief DeepSeek graph batched forward: row views, prompt and image upload, CSA2 compression and indexing, the layer attention and FFN batches. */
 #include "pulsar_engine_internal.h"
 #include "tp/pulsar_tp.h"
 #include "lib/pulsar_yarn.h"
@@ -7,6 +9,11 @@
 
 
 
+/// A view of one f32 row.
+/// @param base the f32 rows
+/// @param row the row
+/// @param row_values floats per row
+/// @return a fresh view (the caller frees it), or NULL
 pulsar_gpu_tensor *gpu_graph_tensor_row_view(
         pulsar_gpu_tensor *base,
         uint32_t          row,
@@ -49,6 +56,10 @@ pulsar_gpu_tensor *gpu_graph_heads_row_view(
 /* Row view into an HC residual CARRIER buffer (BF16 storage; task #62). Same as
  * gpu_graph_tensor_row_view but strides by PULSAR_HC_ELT_SIZE, not sizeof(float) —
  * use this (not the generic helper) for cur_hc/next_hc/after_*_hc bases. */
+/// @param base the carrier rows
+/// @param row the row
+/// @param row_values samples per row
+/// @return a fresh view (the caller frees it), or NULL
 pulsar_gpu_tensor *gpu_graph_hc_row_view(
         pulsar_gpu_tensor *base,
         uint32_t          row,
@@ -61,6 +72,11 @@ pulsar_gpu_tensor *gpu_graph_hc_row_view(
 
 
 /* Upload prompt token ids for kernels that need token-aware hash routing. */
+/// @param out_tokens the device int32 buffer
+/// @param prompt the prompt
+/// @param pos0 the first position
+/// @param n_tokens ids to upload
+/// @return false on a range outside the prompt or a failed write
 bool gpu_graph_upload_prompt_tokens(
         pulsar_gpu_tensor *out_tokens,
         const token_vec  *prompt,
@@ -119,6 +135,17 @@ bool gpu_graph_upload_prompt_tokens(
  * under a multiseq step (the caller resolved it from the row's seq_id); the
  * single-session graph is bank 0 == the installed views.
  * ============================================================================ */
+/// @param g the graph
+/// @param model the model
+/// @param layer the source layer's weights
+/// @param il the source layer
+/// @param banked address the bank's pool (multiseq), else the installed views
+/// @param bank the bank
+/// @param n_rows rows staged at attn_comp_stage[0, n_rows)
+/// @param cache_row0 the pool row the first lands at
+/// @param pos_first the first row's group position
+/// @param ratio the compression ratio
+/// @return false = refused (said) or failed
 static bool gpu_graph_csa2_emit_rows(
         pulsar_gpu_graph           *g,
         const pulsar_model         *model,
@@ -236,6 +263,22 @@ static bool gpu_graph_csa2_emit_rows(
  * weights -- that is the whole difference, and it is why the pair can share a
  * frontier without either being derived from the other.
  * ------------------------------------------------------------------------ */
+/// @param g the graph
+/// @param model the model
+/// @param layer the source layer's weights
+/// @param il the source layer
+/// @param banked address the bank's pool
+/// @param bank the bank
+/// @param row0 the run's first batch row
+/// @param n_tokens the run's rows (whole groups)
+/// @param out_row0 the index pool row the first group lands at
+/// @param pos0 the run's first position
+/// @param ratio the compression ratio
+/// @param freq_base rope base
+/// @param freq_scale rope frequency scale
+/// @param ext_factor YaRN extrapolation factor
+/// @param attn_factor YaRN attention factor
+/// @return false = failed
 static bool gpu_graph_index_comp_prefill(
         pulsar_gpu_graph           *g,
         const pulsar_model         *model,
@@ -308,6 +351,22 @@ static bool gpu_graph_index_comp_prefill(
  * is 1 exactly when this token closed a group and the row was packed at
  * `out_row`; the caller advances the shared frontier on that, not on the return
  * value. */
+/// @param g the graph
+/// @param model the model
+/// @param layer the source layer's weights
+/// @param il the source layer
+/// @param banked address the bank's pool
+/// @param bank the row's bank
+/// @param row the batch row
+/// @param pos its position
+/// @param out_row the index pool row a closed group lands at
+/// @param ratio the compression ratio
+/// @param freq_base rope base
+/// @param freq_scale rope frequency scale
+/// @param ext_factor YaRN extrapolation factor
+/// @param attn_factor YaRN attention factor
+/// @param emitted receives 1 when the row closed a group, else 0
+/// @return false = failed
 static bool gpu_graph_index_comp_update(
         pulsar_gpu_graph           *g,
         const pulsar_model         *model,
@@ -376,6 +435,14 @@ static bool gpu_graph_index_comp_update(
  * arms go through here so the batch path and the per-row path fold the same ape
  * the same way; the reference's two branches agree and so must ours, or a chunk
  * boundary would change the answer. */
+/// @param model the model
+/// @param layer the layer's weights (its attn_compressor_ape)
+/// @param sc the score rows, [n_tokens][width]
+/// @param width the score row width
+/// @param ratio the compression ratio
+/// @param pos0 the first row's position
+/// @param n_tokens rows
+/// @return true with no ape in the shape; false = refused (said) or failed
 static bool gpu_graph_comp_ape_fold(
         const pulsar_model         *model,
         const pulsar_layer_weights *layer,
@@ -412,6 +479,10 @@ static bool gpu_graph_comp_ape_fold(
  * tensor in the container -- whose GEMM reads the bf16 plane and refuses a buffer no producer emitted (L159).  0731's
  * indexer compresses its own key and reads no latent, so nothing is reserved there; nor for a batch that closes no
  * group.  true with *out NULL = nothing to emit. */
+/// @param latent the f32 latent rows
+/// @param n_rows rows
+/// @param out receives the bf16 plane (or NULL)
+/// @return false = refused (said)
 static bool csa2_latent_bf16_slot(const pulsar_gpu_tensor *latent, uint32_t n_rows, void **out) {
     *out = NULL;
     if (g_pulsar_shape.indexer_own_compressor || n_rows == 0) return true;
@@ -420,6 +491,16 @@ static bool csa2_latent_bf16_slot(const pulsar_gpu_tensor *latent, uint32_t n_ro
     return false;
 }
 
+/// Kv source il's compressor over the batch (see the block above csa2_latent_bf16_slot).
+/// @param g the graph
+/// @param model the model
+/// @param layer the layer's weights
+/// @param il the layer
+/// @param pos0 the batch's first position
+/// @param n_tokens rows
+/// @param mseq a multiseq step (per-row banks and positions)
+/// @param comp_counts [n_tokens] receives each row's visible compressed rows
+/// @return false = failed
 static bool gpu_graph_csa2_produce(
         pulsar_gpu_graph           *g,
         const pulsar_model         *model,
@@ -730,6 +811,13 @@ bool gpu_graph_write_vision_span(
  * prompt is a refusal rather than a silently misplaced block.  The reference does exactly this merge between
  * `h = self.embed(input_ids)` and the first layer, which is why the caller runs it right after the embedding
  * gather. */
+/// pulsar_image_merge_chunk's row writer for DeepSeek (ud = the HC carrier tensor).
+/// @param ud the carrier
+/// @param rows bf16 image rows
+/// @param n_rows rows
+/// @param row0 the chunk row of the first
+/// @param n_tokens the chunk's rows
+/// @return false = refused
 static bool ds4_write_vision_rows(void *ud, const uint16_t *rows, uint32_t n_rows, uint32_t row0, uint32_t n_tokens) {
     return gpu_graph_write_vision_span((pulsar_gpu_tensor *)ud, rows, n_rows, row0, n_tokens);
 }
@@ -818,6 +906,12 @@ bool gpu_graph_upload_vision_visible(pulsar_gpu_graph *g, const int32_t *ids,
 }
 
 
+/// Run the first batched projection once on scratch (process-wide, once) so the measured prefill does not pay it.
+/// @param g the graph
+/// @param model the model
+/// @param weights its device weights
+/// @param n_tokens rows to warm at
+/// @return false = failed
 bool gpu_graph_warmup_prefill_kernels(
         pulsar_gpu_graph   *g,
         const pulsar_model   *model,
@@ -878,6 +972,16 @@ bool gpu_graph_warmup_prefill_kernels(
  * [0, n): the candidate source publishes the block mask for those rows (from
  * its unmasked scores), a later index source scores only inside the published
  * mask.  `positions` (mseq) or pos0 + row give each row's reach. */
+/// @param g the graph
+/// @param attn the layer's attention layout
+/// @param il the layer
+/// @param row0 the first batch row
+/// @param n rows
+/// @param n_comp compressed rows visible
+/// @param ratio the compression ratio
+/// @param pos0 the first row's position (no positions)
+/// @param positions per-row positions (mseq), or NULL
+/// @return true when the layer neither publishes nor reads candidates; false = failed
 static bool gpu_graph_csa2_candidates(pulsar_gpu_graph *g, const pulsar_layer_attn *attn, uint32_t il,
                                       uint32_t row0, uint32_t n, uint32_t n_comp, uint32_t ratio,
                                       uint32_t pos0, const pulsar_gpu_tensor *positions) {
@@ -921,15 +1025,41 @@ struct gpu_graph_span_ops {
     /* L260: the grouped E4M3 slot the attention epilogue fills (data NULL =
      * none), and the batch row count it spans -- a span writes its rows at
      * their batch row. */
+    /// the grouped E4M3 slot's data (pulsar_gpu_mxfp8_gact_slot); NULL = no grouped slot armed
     void                    *gact_data;
+    /// the slot's per-group swizzled E8M0 scale slab
     void                    *gact_scale;
+    /// MX scale blocks per row, padded to 4 (pulsar_gpu_mx_kbp)
     int                      gact_kbp;
+    /// the per-group scale-slab stride the producers index with (the slot's `scale_slab`)
     uint32_t                 gact_slab;
+    /// output groups of the attn-output "a" projection
     uint32_t                 gact_n_groups;
+    /// the no-rope part of a head (PULSAR_N_HEAD_DIM - PULSAR_N_ROT)
     uint32_t                 gact_n_nope;
+    /// the batch's row count (tokens) the slot spans; a span writes its rows at their batch row
     uint32_t                 gact_ntok;
 };
 
+/// Indexer score -> top-k -> indexed attention over batch rows [s0, s0 + sn).
+/// @param g the graph
+/// @param model the model
+/// @param layer the layer's weights
+/// @param il the layer
+/// @param attn its attention layout
+/// @param s0 the span's first batch row
+/// @param sn its rows
+/// @param spos0 its first position
+/// @param q_dim the query row width
+/// @param n_head the owned heads
+/// @param sinks_off the first owned head's sink offset
+/// @param n_comp the source's compressed frontier
+/// @param ratio the compression ratio
+/// @param index_scale the indexer score scale
+/// @param n_raw raw-window rows (0 under mseq)
+/// @param raw_start the raw window's first row (0 under mseq)
+/// @param op the span's operands
+/// @return false = failed
 static bool gpu_graph_indexed_attention_span(
         pulsar_gpu_graph           *g,
         const pulsar_model         *model,
@@ -1183,6 +1313,15 @@ static bool gpu_graph_indexed_attention_span(
  * Decode/verify widths only (<= PULSAR_TP_BATCH_MAX_ROWS rows, the row lane);
  * prefill keeps the duplicated GEMMs -- an extra bulk exchange per layer would
  * cost more than the halves save there. */
+/// @param g the graph
+/// @param model the model
+/// @param layer the layer's weights
+/// @param il the layer
+/// @param n_tokens rows (<= PULSAR_TP_BATCH_MAX_ROWS)
+/// @param q_rank the q low-rank width
+/// @param ratio the compression ratio
+/// @param attn its attention layout
+/// @return false = refused (said) or failed
 static bool tp_attn_input_split(pulsar_gpu_graph *g, const pulsar_model *model,
                                 const pulsar_layer_weights *layer, uint32_t il, uint32_t n_tokens, uint64_t q_rank, uint32_t ratio,
                                 const pulsar_layer_attn *attn) {
@@ -2560,6 +2699,13 @@ bool gpu_graph_encode_layer_attention_batch(
  * only when g->tp is armed; returns 0 (fail loud) on any tensor/transport
  * failure.  Host staging is a transient cost on this first wiring; the D2H/H2D
  * can move onto the registerable GB10 slab later. */
+/// @param g the graph (its TP group)
+/// @param il the layer
+/// @param n_tokens rows
+/// @param t the rows, summed in place
+/// @param addend added to the sum (NULL = none)
+/// @param what the call's name, for refusal lines
+/// @return false = failed (said)
 bool gpu_graph_tp_allreduce_rows(pulsar_gpu_graph *g, uint32_t il, uint32_t n_tokens,
                               pulsar_gpu_tensor *t, pulsar_gpu_tensor *addend,
                               const char *what) {
@@ -2569,6 +2715,9 @@ bool gpu_graph_tp_allreduce_rows(pulsar_gpu_graph *g, uint32_t il, uint32_t n_to
     return pulsar_tp_allreduce_rows(&x, il, n_tokens, t, addend, what);
 }
 
+/** @def PULSAR_CUDA_ENCODE_PREFILL_SHARED_EXPERT
+ *  Local to gpu_graph_encode_layer_ffn_batch (defined and undefined in its body): the prefill FFN's shared
+ *  expert over the rank's owned range of its intermediate width. */
 bool gpu_graph_encode_layer_ffn_batch(
         pulsar_gpu_graph  *g,
         const pulsar_model        *model,
@@ -2994,6 +3143,10 @@ bool gpu_graph_encode_layer_ffn_batch(
  * breaking with ok untouched let the round seed from STALE rows and lose
  * acceptance silently -- the class gpu_decode.cpp's KV seed documents (L190 D2).
  * Returns false, having captured nothing further, if any armed capture fails. */
+/// @param g the graph
+/// @param il the layer
+/// @param n_tokens the step's rows
+/// @return false = an armed capture failed
 static bool dspark_capture_anchors(pulsar_gpu_graph *g, uint32_t il, uint32_t n_tokens) {
     /* row0: the anchor capture reads the step's leading (verify) rows; the bulk
      * capture reads from dspark_bulk_row0 -- 0 for a classic chunk, the decode-row
@@ -3038,6 +3191,13 @@ static bool dspark_capture_anchors(pulsar_gpu_graph *g, uint32_t il, uint32_t n_
 }
 
 /* Encode one complete layer for prefill by chaining attention and FFN batches. */
+/// @param g the graph
+/// @param model the model
+/// @param layer the layer's weights
+/// @param il the layer
+/// @param pos0 the batch's first position
+/// @param n_tokens rows
+/// @return false = failed
 bool gpu_graph_encode_layer_batch(
         pulsar_gpu_graph  *g,
         const pulsar_model        *model,
@@ -3111,6 +3271,10 @@ bool gpu_graph_encode_layer_batch(
  * layer, position and kernel, and says so; the caller (session_spec.cpp,
  * "DSpark fused state update failed") invalidates the checkpoint, which is
  * what makes the half-advanced state unreachable. */
+/// @param il the layer that failed
+/// @param pos the position
+/// @param what the kernel
+/// @return false, always
 static bool rollforward_fail(uint32_t il, uint32_t pos, const char *what) {
     fprintf(stderr, "pulsar: compressor rollforward FAILED at layer %u pos %u (%s) -- layers 0..%u are "
                     "advanced to the committed frontier, layers %u.. are not: the pool state is "
