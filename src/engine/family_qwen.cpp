@@ -444,19 +444,16 @@ static bool qwen_read_ple_tables(const pulsar_model *m, const pulsar_qwen_shape 
     return ok;
 }
 
-/* One layer's tensors under `lp` (the layer's name prefix, ending in '.'): the trunk's
- * "model.language_model.layers.<il>." or the MTP layer's "mtp.layers.0.".  `split` binds the
- * routed experts as separate gate / up stacks (the MTP layer) instead of the fused gate_up. */
-/* L255: one layer's routed experts in Tessera's value family -- every plane of gate, up and down
- * (family_qwen.h PULSAR_QWEN_TESS_*), dims in ne order against the stack.  The words' per-expert stride is the
- * encoder's (it follows the column rates), so only their expert count is checked; the launcher checks the rest
- * of the geometry at every call. */
 /// The Tessera projection names, by PULSAR_QWEN_TESS_GATE / _UP / _DOWN.
 static const char *const kTessProj[PULSAR_QWEN_TESS_PROJS] = {"gate", "up", "down"};
 /// The Tessera plane names, by PULSAR_QWEN_TESS_* plane id.
 static const char *const kTessPlane[PULSAR_QWEN_TESS_PLANES] = {"words", "table", "init",  "has_init",
                                                                 "wscale", "runs", "bdesc", "geom"};
 
+/* L255: one layer's routed experts in Tessera's value family -- every plane of gate, up and down
+ * (family_qwen.h PULSAR_QWEN_TESS_*), dims in ne order against the stack.  The words' per-expert stride is the
+ * encoder's (it follows the column rates), so only their expert count is checked; the launcher checks the rest
+ * of the geometry at every call. */
 /// @param m the opened model
 /// @param[in,out] ok cleared on any refusal (never set)
 /// @param s the shape
@@ -491,7 +488,8 @@ static void qwen_bind_tessera(const pulsar_model *m, bool *ok, const pulsar_qwen
     }
 }
 
-/// Bind one layer's tensors under `lp` ("model.language_model.layers.<il>." or the MTP layer's "mtp.layers.0.").
+/// Bind one layer's tensors under `lp` ("model.language_model.layers.<il>." or the MTP layer's "mtp.layers.0.");
+/// `split` binds the routed experts as separate gate / up stacks (the MTP layer) instead of the fused gate_up.
 /// @param m the opened model
 /// @param[in,out] ok cleared on any refusal (never set)
 /// @param s the shape
@@ -1073,12 +1071,11 @@ static pulsar_chat_format qwen_chat_format(const pulsar_engine *) { return PULSA
 /// pulsar_family::model_id.
 /// @return 2
 static int qwen_model_id(const pulsar_engine *) { return 2; }
-/* The trained positions, or YaRN's original context x factor (L280) */
 /* L280: the rope's identity (qwen_read_rope): 0 native, a digest of the YaRN numbers */
 /// pulsar_family::rope_id.
 /// @return g_qwen_shape.rope_id
 static uint64_t qwen_rope_id(const pulsar_engine *) { return g_qwen_shape.rope_id; }
-/// pulsar_family::trained_context: max_position, or YaRN's original context x factor.
+/// pulsar_family::trained_context: the trained positions (max_position), or YaRN's original context x factor (L280).
 /// @return tokens
 static uint64_t qwen_trained_context(const pulsar_engine *) {
     const pulsar_qsa_yarn &y = g_qwen_shape.yarn;
@@ -1644,7 +1641,7 @@ static_assert(PULSAR_QWEN_HEAD_ROWS_MAX == PULSAR_DRIVER_HEADS_MAX, "the lane's 
 /* The MTP drafter's numbers (the functions are the chained-MTP lane's).  Swept on the GB10 host over three code prompts
  * (2026-09-29, L270): depth 4 with a confidence stop at 0.7 gave 58.7 / 58.9 / 59.2 tok/s vs 53.4 for a fixed 3;
  * TensorFold's own 6 / 0.6 was 53.6 here -- a verify row costs more on this engine (4 rows read up to 40 distinct
- * experts).  The adaptive depth controller (spec_depth.h) LOST to the fixed depth (52-59 vs 59.5-60.4 tok/s at tau
+ * experts).  At L270 the adaptive depth controller (spec_depth.h) LOST to the fixed depth (52-59 vs 59.5-60.4 tok/s at tau
  * 0.6-0.8): the in-round stop already adapts inside every round, and the rule's down-signal fires on chains that stopped
  * early by design.  L284: dropping the stopping draft instead of verifying it cost 4-11% here (code greedy / chat
  * greedy / chat T0.7, 3 reps median: 49.1 / 49.8 / 45.6 tok/s at 0.7, 50.9 / 50.6 / 47.4 at 0.5, vs 54.9 / 52.2 / 50.6
@@ -1667,8 +1664,9 @@ static_assert(PULSAR_QWEN_HEAD_ROWS_MAX == PULSAR_DRIVER_HEADS_MAX, "the lane's 
  * 99.0 vs 99.8 and 75.3 vs 74.6; the confidence is miscalibrated early in a reply (drafts at 0.999 rejected) and no
  * survival price separates those rounds, a depth earned by full rounds does.  The L270 loss above was the
  * controller at a fixed 4 with a 2.7 ms draft step.  A copy chain (a repeat of the bank's history) runs to
- * depth_max, the verify capture, and does not move the depth.  A session starts at 4 (7: the L288 sweep's best code
- * cell, 97.5 tok/s against 96.2 at 8 and 94.5 at 6). */
+ * depth_max, the verify capture, and does not move the depth.  A session starts at the drafter's depth 4
+ * (PULSAR_MTP_DRAFTER_OPS below); the controller's ceiling 7 is the L288 sweep's best code cell (97.5 tok/s against
+ * 96.2 at 8 and 94.5 at 6). */
 /// The MTP drafter's depth policy (see above).
 static const pulsar_spec_depth_policy k_mtp_depth = {4, 7, 0.0f, 0, 0.0f, 0u, 0u, 1u};
 const pulsar_drafter_ops PULSAR_QWEN_MTP_DRAFTER =

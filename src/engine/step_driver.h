@@ -175,6 +175,7 @@ typedef struct pulsar_driver_ops {
     /** Bytes of scratch arena `arena` (< n_scratch) at max_rows rows and a pool capacity of ctx tokens (0 = none). */
     uint64_t (*scratch_bytes)(uint32_t arena, uint32_t max_rows, uint32_t ctx);
     /// scratch arenas the family owns (scratch_bytes is asked for arenas [0, n_scratch)), <= PULSAR_DRIVER_SCRATCH_MAX
+    /// (a family past it is refused at the session's create)
     uint32_t n_scratch;
     /** tokens -> the step's slots */
     bool (*embed)(const pulsar_driver_step *st);
@@ -228,7 +229,8 @@ typedef struct pulsar_driver_ops {
 } pulsar_driver_ops;
 
 /** The first thing a forward over `plan` would need that `ops` lacks -- "embed", the block of a layer kind (its
- *  layer in *at_layer), "head" -- or NULL when nothing is missing.  The driver refuses a session with exactly this. */
+ *  layer in *at_layer), "read_ahead_pool" (read_ahead without its pool or the reverse), "head" -- or NULL when
+ *  nothing is missing.  The driver refuses a session with exactly this. */
 /// @param ops      the family's driver ops
 /// @param plan     the layer plan
 /// @param at_layer receives the layer whose block is missing, else UINT32_MAX

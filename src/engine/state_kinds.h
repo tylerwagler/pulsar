@@ -108,6 +108,8 @@ typedef struct pulsar_state_plan {
     pulsar_state_decl decl[PULSAR_STATE_DECLS_MAX];
     /// entries of decl[] in use (<= PULSAR_STATE_DECLS_MAX)
     uint32_t n_decl;
+    /// decls pulsar_state_plan_add refused because the table was full; nonzero = the create refuses the plan by name
+    uint32_t n_overflow;
     uint32_t n_slots;              ///< [0, n_trunk) the trunk's layers, [n_trunk, n_slots) a drafter's
     /// layer slots belonging to the trunk; slots [n_trunk, n_slots) are a drafter's
     uint32_t n_trunk;
@@ -126,11 +128,14 @@ typedef struct pulsar_state_plan {
 /// @param d the decl (not POOL)
 /// @return bytes of one bank's state for `d`
 uint64_t pulsar_state_decl_bank_bytes(const pulsar_state_decl *d);
-/** Declare decl `id` (returns it): the table's next entry. */
+/** Declare decl `id` (returns it): the table's next entry.  A full table counts the decl in n_overflow instead, and
+ *  the create refuses the plan by name. */
 /// @param p the plan being built
 /// @param d the decl, copied into the table
-/// @return the new decl's id, or UINT32_MAX when the table is full (the create then refuses the plan)
+/// @return the new decl's id; PULSAR_STATE_DECLS_MAX when the table is full -- an id past the table, so a mask built
+///         from it names no decl (a shift by it is defined: the static_assert below), and the plan never runs
 uint32_t pulsar_state_plan_add(pulsar_state_plan *p, const pulsar_state_decl &d);
+static_assert(PULSAR_STATE_DECLS_MAX < 32u, "decl ids are bits of a uint32_t mask, PULSAR_STATE_DECLS_MAX included");
 
 /** A session's declared state (the plan's instance for n_banks banks). */
 typedef struct pulsar_state_set {

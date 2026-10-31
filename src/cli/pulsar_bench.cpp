@@ -344,6 +344,13 @@ int main(int argc, char **argv) {
     };
     pulsar_engine *engine = NULL;
     if (pulsar_engine_open(&engine, &opt) != 0) return 1;
+    /* the bench tokenizes its prompt: a family whose tokenizer this build lacks is refused here, by name */
+    if (!pulsar_engine_has_tokenizer(engine)) {
+        fprintf(stderr, "pulsar-bench: the %s family has no tokenizer or chat renderer in this build -- refusing\n",
+                pulsar_engine_family_name(engine));
+        pulsar_engine_close(engine);
+        return 1;
+    }
     char ctxmem_line[256];
     fprintf(stderr, "%s\n",
             pulsar_context_memory_line(ctxmem_line, sizeof ctxmem_line, "pulsar-bench",

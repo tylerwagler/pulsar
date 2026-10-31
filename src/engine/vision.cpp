@@ -571,17 +571,6 @@ static int py_round(double v) {
     return (int)r;
 }
 
-/* float32 -> bfloat16, round-to-nearest-even, as torch's .to(bfloat16) does. */
-/// @param f a value
-/// @return its bf16 bits (NaN not special-cased)
-static uint16_t f32_to_bf16_bits(float f) {
-    uint32_t u;
-    memcpy(&u, &f, sizeof u);
-    const uint32_t lsb = (u >> 16) & 1u;
-    u += 0x7fffu + lsb;
-    return (uint16_t)(u >> 16);
-}
-
 /* The ONE place load_image's geometry is computed: the max_wh_ratio clamp and
  * the min_pixels upscale act on local variables only (the decoded image is
  * untouched), then safe_resize fits the grid to the token budget.  Split out of
@@ -703,7 +692,7 @@ int vision_preprocess_rgb(const uint8_t *rgb, int width, int height,
                         const float x = (float)byte / 255.0f;
                         const float n = (x - 0.5f) / 0.5f;
                         dst[((size_t)c * (size_t)p + (size_t)py) * (size_t)p + (size_t)px] =
-                            f32_to_bf16_bits(n);
+                            pulsar_bf16_from_f32(n);
                     }
                 }
             }
@@ -863,7 +852,10 @@ static int vision_decode_jpeg(const uint8_t *bytes, size_t len,
 
 /* Formats the server accepts today: PNG and JPEG.  A GIF/WebP/... payload is
  * refused by name rather than mis-parsed. */
-/// Decode PNG or JPEG bytes to RGB8 (anything else, and CMYK / YCCK JPEG, refused).
+/** Decode PNG or JPEG bytes to RGB8 (anything else, and CMYK / YCCK JPEG, refused).  PNG through libpng, JPEG
+ *  through libjpeg-turbo with Pillow's settings (libjpeg's defaults); the caller fails loudly on 0 rather than
+ *  guessing at a format.  CMYK / YCCK JPEG is refused because Pillow keeps those in CMYK and its own
+ *  .convert("RGB") is a different transform from libjpeg's. */
 /// @param bytes the encoded image
 /// @param len its length
 /// @param[out] rgb_out RGB8 pixels, malloc'd (caller frees)

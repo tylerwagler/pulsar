@@ -4659,6 +4659,15 @@ int main(int argc, char **argv) {
         free(case_sequence);
         return 1;
     }
+    /* the eval renders chats: a family whose tokenizer and chat front this build lacks is refused here, by name */
+    if (!pulsar_engine_has_tokenizer(engine)) {
+        fprintf(stderr, "pulsar-eval: the %s family has no tokenizer or chat renderer in this build -- refusing\n",
+                pulsar_engine_family_name(engine));
+        pulsar_engine_close(engine);
+        if (trace) fclose(trace);
+        free(case_sequence);
+        return 1;
+    }
 
     /* The default effort is the loaded family's (L239); an effort the 0731
      * encoder cannot spell is refused by name. */

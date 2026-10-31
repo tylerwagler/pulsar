@@ -498,17 +498,17 @@ uint32_t pulsar_mtp_draft(pulsar_session *s, int next_base, bool, float temperat
     memset(&rec, 0, sizeof rec);
     pulsar_spec_draft_req_init(s, &rec, next_base, temperature, top_k, top_p, min_p);
     char err[200];
-    uint32_t keep = 0;
     spec_redraft_req *req = &rec;
     const uint32_t b = s->states->live_bank;
-    if (mtp_draft_chains(s, &b, &rng, &req, 1, err, sizeof err)) {
-        pulsar_spec_redraft_stamp(s, &rec);
-        keep = rec.keep;
-    } else {
-        fprintf(stderr, "pulsar: %s (the round takes a plain step next)\n", err);
+    if (!mtp_draft_chains(s, &b, &rng, &req, 1, err, sizeof err)) {
+        /* L306 (the block drafter's rule, block_draft): the round refuses, as the batched lane's does
+         * (pulsar_mtp_draft_batch) -- no plain round */
+        fprintf(stderr, "pulsar: %s -- the round refuses\n", err);
         pulsar_spec_drop_pendings(&s->spec);
+        return PULSAR_DRAFT_REFUSED;
     }
-    return keep;
+    pulsar_spec_redraft_stamp(s, &rec);
+    return rec.keep;
 }
 
 /* The batched lane's draft: every bank's chain in lockstep (mtp_draft_chains), PULSAR_DRIVER_HEADS_MAX banks at a

@@ -731,6 +731,11 @@ extern const server_output_parser_ops k_parser_deepseek;
 /// @return its family table (static, never NULL for a known format)
 const server_family_ops *server_family_for_format(pulsar_chat_format fmt);
 const server_family_ops *server_family_for_engine(const pulsar_engine *e);
+/** The family a server's tool memory is scanned in: its engine's, or for a server without one (the unit tests)
+ *  the family it names (server::family_no_engine); neither dies by name (L335: never DeepSeek by default). */
+/// @param s the server
+/// @return the family table
+const server_family_ops *server_tool_family(const server *s);
 /** A family table in its own file (chat_family.cpp's switch names it): Inkling's (family_inkling.cpp). */
 extern const server_family_ops k_family_inkling;
 /** Nemotron-H's (family_nemotron_h.cpp). */
@@ -1937,6 +1942,9 @@ void kv_dup_census_core(int n, const int *hist_len, const bool *resident, const 
  */
 struct server {
     pulsar_engine *engine;  ///< the loaded model; worker thread only
+    /** L335: the family a server WITHOUT an engine scans its tool memory in -- the unit tests name it; NULL with
+     *  an engine (the engine's family is the one authority, server_tool_family).  Never a default family. */
+    const struct server_family_ops *family_no_engine;
     /** The ONE session (created at startup, freed once at shutdown): classic
      * mode == 1 bank-less slot (slot 0), pool mode == pool_banks banks over
      * it. Slots are pure bank descriptors; all engine work goes through this
@@ -4086,6 +4094,8 @@ bool parse_chat_conversation_responses(const char *body, chat_conversation *c, r
  * placeholder with that image's sentinel block (the decoded pixels live in the
  * render's own message list, so that step cannot move out of this function). */
 /// @param e           the engine (NULL: text only)
+/// @param fmt         the chat format to render in -- the engine's (pulsar_engine_chat_format), named by the
+///                    caller so a no-engine render says which family it is (L335: none is assumed)
 /// @param s           the server (may be NULL)
 /// @param body        the request body
 /// @param def_tokens  the generation cap when the request sets none
@@ -4093,7 +4103,7 @@ bool parse_chat_conversation_responses(const char *body, chat_conversation *c, r
 /// @param err         receives the reason on false
 /// @param errlen      size of `err`
 /// @return false when refused
-bool parse_chat_request_render(pulsar_engine *e, server *s, const char *body, int def_tokens,
+bool parse_chat_request_render(pulsar_engine *e, pulsar_chat_format fmt, server *s, const char *body, int def_tokens,
                                request *r, char *err, size_t errlen);
 bool parse_chat_request(pulsar_engine *e, server *s, const char *body, int def_tokens,
                                request *r, char *err, size_t errlen);

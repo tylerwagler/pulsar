@@ -347,6 +347,7 @@ bool parse_chat_conversation_openai(const char *body, chat_conversation *c, requ
  * takes.  The engine is optional (the renderer gate renders with no model). */
 /// The protocol's parse, then the loaded family's render: every chat endpoint's shape.
 /// @param e         the engine (may be NULL: the renderer gate)
+/// @param fmt       the chat format to render in (the engine's, or the one a no-engine caller names)
 /// @param s         the server (may be NULL)
 /// @param body      the request body
 /// @param r         the request, initialized by the caller; freed on failure
@@ -354,13 +355,13 @@ bool parse_chat_conversation_openai(const char *body, chat_conversation *c, requ
 /// @param errlen    size of `err`
 /// @param protocol  the protocol's parser into a chat_conversation
 /// @return false when parsing or rendering failed
-static bool parse_and_render(pulsar_engine *e, server *s, const char *body, request *r, char *err,
-                             size_t errlen,
+static bool parse_and_render(pulsar_engine *e, pulsar_chat_format fmt, server *s, const char *body, request *r,
+                             char *err, size_t errlen,
                              bool (*protocol)(const char *, chat_conversation *, request *, char *, size_t)) {
     chat_conversation c;
     memset(&c, 0, sizeof(c));
     const bool ok = protocol(body, &c, r, err, errlen) &&
-                    render_chat_conversation(e, pulsar_engine_chat_format(e), s, &c, r, err, errlen);
+                    render_chat_conversation(e, fmt, s, &c, r, err, errlen);
     chat_conversation_free(&c);
     if (!ok) {
         /* A refusal that named its reason keeps it; only a plain shape error
@@ -371,10 +372,18 @@ static bool parse_and_render(pulsar_engine *e, server *s, const char *body, requ
     return ok;
 }
 
-bool parse_chat_request_render(pulsar_engine *e, server *s, const char *body, int def_tokens,
+bool parse_chat_request_render(pulsar_engine *e, pulsar_chat_format fmt, server *s, const char *body, int def_tokens,
                                request *r, char *err, size_t errlen) {
     request_init(r, REQ_CHAT, def_tokens);
-    return parse_and_render(e, s, body, r, err, errlen, parse_chat_conversation_openai);
+    return parse_and_render(e, fmt, s, body, r, err, errlen, parse_chat_conversation_openai);
+}
+
+/* L335: the format a request through the engine renders in -- the engine's; no engine is no family
+ * (PULSAR_CHAT_NONE: a render refuses it), never DeepSeek by default */
+/// @param e the engine, or NULL
+/// @return its chat format, or PULSAR_CHAT_NONE
+static pulsar_chat_format engine_chat_format(const pulsar_engine *e) {
+    return e ? pulsar_engine_chat_format(e) : PULSAR_CHAT_NONE;
 }
 
 
@@ -390,7 +399,7 @@ bool parse_chat_request_render(pulsar_engine *e, server *s, const char *body, in
 /// @return false on a malformed or refused request
 bool parse_chat_request(pulsar_engine *e, server *s, const char *body, int def_tokens,
                         request *r, char *err, size_t errlen) {
-    return parse_chat_request_render(e, s, body, def_tokens, r, err, errlen);
+    return parse_chat_request_render(e, engine_chat_format(e), s, body, def_tokens, r, err, errlen);
 }
 
 
@@ -534,7 +543,7 @@ bad:
 bool parse_anthropic_request(pulsar_engine *e, server *s, const char *body, int def_tokens,
                                     request *r, char *err, size_t errlen) {
     request_init(r, REQ_CHAT, def_tokens);
-    return parse_and_render(e, s, body, r, err, errlen, parse_chat_conversation_anthropic);
+    return parse_and_render(e, engine_chat_format(e), s, body, r, err, errlen, parse_chat_conversation_anthropic);
 }
 
 
@@ -1604,7 +1613,7 @@ bad:
 bool parse_responses_request(pulsar_engine *e, server *s, const char *body, int def_tokens,
                                     request *r, char *err, size_t errlen) {
     request_init(r, REQ_CHAT, def_tokens);
-    return parse_and_render(e, s, body, r, err, errlen, parse_chat_conversation_responses);
+    return parse_and_render(e, engine_chat_format(e), s, body, r, err, errlen, parse_chat_conversation_responses);
 }
 
 
@@ -1667,7 +1676,7 @@ static bool parse_prompt(const char **p, char **out, char *err, size_t errlen) {
 bool parse_completion_request(pulsar_engine *e, const char *body, int def_tokens,
                                      request *r, char *err, size_t errlen) {
     request_init(r, REQ_COMPLETION, def_tokens);
-    r->family = server_family_for_engine(e);
+    r->family = e ? server_family_for_engine(e) : NULL;   /* L335: no engine, no family (never DeepSeek's) */
     if (errlen) err[0] = '\0';
     const char *p = body;
     char *prompt = NULL;

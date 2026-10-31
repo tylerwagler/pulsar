@@ -189,12 +189,21 @@ static bool st_obj_key(const char **p, const char *key) {
     }
 }
 
-/// Parse a JSON array of non-negative numbers. TODO(dox): values pass through a double without the 2^53 / integer check blob_value applies
+/* A JSON number goes through a double: an integer past 2^53 would arrive rounded -- a wrong integer that still
+ * parses -- and a fraction would truncate.  The ONE check every integer the header carries passes (L335: the shape /
+ * offset arrays, an expert stack's count and stride, a metadata array's length; blob_value's integers). */
+/// @param v the parsed number
+/// @return true when v is an integer a double holds exactly (|v| <= 2^53)
+static bool st_exact_integer(double v) {
+    return fabs(v) <= 9007199254740992.0 && v == floor(v);
+}
+
+/// Parse a JSON array of non-negative integers (each exact: st_exact_integer).
 /// @param[in,out] p at the array; past it on success
 /// @param[out] out [max] values
 /// @param[out] n_out elements
 /// @param max capacity
-/// @return false when malformed or longer than max
+/// @return false when malformed, longer than max, or holding a negative or inexact value
 static bool st_u64_array(const char **p, uint64_t *out, uint32_t *n_out, uint32_t max) {
     const char *q = *p;
     json_ws(&q);
@@ -206,7 +215,7 @@ static bool st_u64_array(const char **p, uint64_t *out, uint32_t *n_out, uint32_
     for (;;) {
         double v = 0.0;
         if (!json_number(&q, &v)) return false;
-        if (v < 0) return false;
+        if (v < 0 || !st_exact_integer(v)) return false;
         if (n < max) out[n] = (uint64_t)v;
         n++;
         json_ws(&q);
@@ -319,6 +328,7 @@ static void blob_array(st_blob *b, const char **p) {
     if (!st_obj_key(&q, "n")) st_die("safetensors: metadata array has no n");
     double dn = 0.0;
     if (!json_number(&q, &dn)) st_die("safetensors: metadata array n is not a number");
+    if (dn < 0 || !st_exact_integer(dn)) st_die("safetensors: metadata array n %.17g is not a non-negative integer", dn);
     uint64_t n = (uint64_t)dn;
     blob_le(b, n, 8);
     q = obj;
@@ -387,10 +397,7 @@ static void blob_value(st_blob *b, const char **p, uint32_t type) {
     case PULSAR_META_INT64: {   /* i64: the Engram hash multipliers (tools/container kv.py) */
         double v = 0.0;
         if (!json_number(&q, &v)) st_die("safetensors: metadata integer did not parse");
-        /* the number goes through a double: a 64-bit value past 2^53 would arrive rounded, a wrong
-         * integer that still parses -- refused instead */
-        if (fabs(v) > 9007199254740992.0 || v != floor(v))
-            st_die("safetensors: metadata integer %.17g is not exactly representable", v);
+        if (!st_exact_integer(v)) st_die("safetensors: metadata integer %.17g is not exactly representable", v);
         int w = (type == PULSAR_META_UINT8 || type == PULSAR_META_INT8) ? 1
               : (type == PULSAR_META_UINT16 || type == PULSAR_META_INT16) ? 2
               : (type == PULSAR_META_UINT32 || type == PULSAR_META_INT32) ? 4 : 8;
@@ -793,6 +800,10 @@ static void st_add_expert_stacks(st_dir *d, st_shard *s) {
         q = p;
         if (!st_obj_key(&q, "dims_per_expert_ne") || !st_u64_array(&q, dim2, &nd2, 2) || nd2 != 2) {
             st_die("safetensors: expert entry has no dims_per_expert_ne");
+        }
+        if (dn < 0 || !st_exact_integer(dn) || db < 0 || !st_exact_integer(db)) {
+            st_die("safetensors: expert entry '%s': n_experts %.17g / expert_bytes %.17g are not non-negative integers",
+                   gguf_name, dn, db);
         }
         uint64_t n_experts = (uint64_t)dn;
         uint64_t expert_bytes = (uint64_t)db;

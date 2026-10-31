@@ -951,7 +951,7 @@ bool gpu_graph_encode_output_head(
     /* The collapse is SHARED; only the coefficient source differs.  0731 binds
      * output_hc_* and computes its own; V4.1 binds none and collapses with the
      * pre its last FFN handed on.  The bind is the fact -- a 0731 artifact
-     * missing the group dies at load (weights_bind_output). */
+     * missing the group is refused at load (weights_bind_output). */
     if (weights->output_hc_fn) {
         if (!weights->output_hc_scale || !weights->output_hc_base) {
             fprintf(stderr, "pulsar: output_hc_fn is bound without scale/base -- refusing\n");
@@ -1088,8 +1088,9 @@ uint64_t gpu_graph_output_head_seg_key(bool hc_parity, uint32_t n_tokens, uint32
            (0xFFull << 16) | (2ull << 8) | (uint64_t)(n_tokens & 0xFFu);
 }
 
-/// The output head over batch rows [row0, row0 + n_tokens), vocab columns [vocab_lo, vocab_lo + vocab_dim)
-/// (a full-range head at row 0 runs as a captured segment).
+/// The output head over batch rows [row0, row0 + n_tokens) of the sweep-final stream into `out` rows
+/// [0, n_tokens), vocab columns [vocab_lo, vocab_lo + vocab_dim) (a full-range head at row 0 runs as a captured
+/// segment; the single-box caller passes 0, N_VOCAB and g->spec_logits).
 /// @param g the graph
 /// @param model the model
 /// @param weights its device weights

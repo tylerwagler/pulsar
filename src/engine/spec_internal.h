@@ -17,10 +17,6 @@ typedef struct {
     bool     valid;         ///< round_end reached the drafting point with the drafter's features ready
     int32_t  next_base;     ///< the carry: batch position 0 of the next round
     uint32_t n_draft;       ///< the bank's depth at round_end (pulsar_spec_cur_depth), <= 16
-    /// The rows the round that recorded this verified (pulsar_spec_round::n_batch).  Recorded, not read today.
-    uint32_t n_batch;
-    /// The drafts that round committed.  Recorded, not read today.
-    int      commit;
     /** @var spec_redraft_req::top_p
      *  The request's top-p filter for sampled drafts. */
     /** @var spec_redraft_req::min_p

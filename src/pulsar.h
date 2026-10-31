@@ -335,15 +335,17 @@ pulsar_family_id pulsar_engine_family(const pulsar_engine *e);
 /** The loaded model's conversation format (the family's answer; for DeepSeek
  * it follows the shape profile exactly like pulsar_engine_chat_v41). */
 /** @param e the engine
- *  @return the format the front end must render */
+ *  @return the format the front end must render; PULSAR_CHAT_NONE (said once) for NULL -- no engine has no
+ *          family, and a caller that renders without one names its format itself */
 pulsar_chat_format pulsar_engine_chat_format(const pulsar_engine *e);
 /** Printable family name ("DeepSeek V4", "Qwen4-exp"). */
 /** @param e the engine
- *  @return a static string */
+ *  @return a static string; "(no engine)" for NULL (never a family's name) */
 const char *pulsar_engine_family_name(const pulsar_engine *e);
 /** Does the loaded family carry a tokenizer and chat renderer in this build?
  * A front end that takes text refuses an engine without one at startup; the
- * tokenizer entries themselves end the process by name if reached anyway. */
+ * tokenizer entries themselves refuse by name (once per entry) and return their
+ * failure value if reached anyway. */
 /** @param e the engine
  *  @return true when text entry points are usable */
 bool pulsar_engine_has_tokenizer(const pulsar_engine *e);
@@ -738,18 +740,18 @@ void pulsar_tokens_copy(pulsar_tokens *dst, const pulsar_tokens *src);
  *  @return true when it is (an empty prefix always is) */
 bool pulsar_tokens_starts_with(const pulsar_tokens *tokens, const pulsar_tokens *prefix);
 
-/** Tokenize plain text (no special-token matching), appending to `out`.  Ends the process by name when the
- *  family has no tokenizer.
+/** Tokenize plain text (no special-token matching), appending to `out`.
  *  @param e the engine
  *  @param text NUL-terminated UTF-8
- *  @param out the tokens are appended here */
-void pulsar_tokenize_text(pulsar_engine *e, const char *text, pulsar_tokens *out);
-/** Tokenize a rendered chat prompt: its special-token spellings become control tokens.  Appends to `out`; ends
- *  the process by name when the family has no tokenizer.
+ *  @param out the tokens are appended here
+ *  @return false, `out` untouched, when the family has no tokenizer (said once) */
+bool pulsar_tokenize_text(pulsar_engine *e, const char *text, pulsar_tokens *out);
+/** Tokenize a rendered chat prompt: its special-token spellings become control tokens.  Appends to `out`.
  *  @param e the engine
  *  @param text the rendered prompt
- *  @param out the tokens are appended here */
-void pulsar_tokenize_rendered_chat(pulsar_engine *e, const char *text, pulsar_tokens *out);
+ *  @param out the tokens are appended here
+ *  @return false, `out` untouched, when the family has no tokenizer (said once) */
+bool pulsar_tokenize_rendered_chat(pulsar_engine *e, const char *text, pulsar_tokens *out);
 /** A half-open [lo, hi) byte range of CLIENT-supplied text in a rendered prompt.
  * The renderer produces these; the tokeniser treats them as plain text. */
 typedef struct {
@@ -767,8 +769,9 @@ typedef struct {
  *  @param text the rendered prompt
  *  @param spans client-data byte ranges of text
  *  @param n_spans their count
- *  @param out the tokens are appended here */
-void pulsar_tokenize_rendered_chat_spans(pulsar_engine *e, const char *text,
+ *  @param out the tokens are appended here
+ *  @return false, `out` untouched, when the family has no tokenizer (said once) */
+bool pulsar_tokenize_rendered_chat_spans(pulsar_engine *e, const char *text,
                                          const pulsar_text_span *spans, uint32_t n_spans,
                                          pulsar_tokens *out);
 
@@ -817,7 +820,8 @@ typedef struct {
  * these on every family, each piece rendered WHOLE by the family's own renderer (DeepSeek's marker template;
  * Qwen's qwen_chat, HF's template byte for byte) -- head + turns + sampled assistant turns is the
  * conversation's full render, so a transcript's KV continues across turns.  The think mode is the family's
- * (pulsar_engine_think_mode_supported); any other ends the process, never a neighbouring effort.
+ * (pulsar_engine_think_mode_supported); any other ends the process, never a neighbouring effort.  Each returns
+ * false, `tokens` untouched, when the family has no chat front (said once per entry).
  *
  * pulsar_chat_open: the HEAD, everything before the first turn -- DeepSeek's BOS and lead-in, Qwen's system
  * block with its effort line -- carrying `trusted` (pulsar_chat_message::trusted; NULL = none) then the
@@ -826,8 +830,9 @@ typedef struct {
  *  @param tokens the transcript (start empty); the head is appended
  *  @param trusted front-end control text, or NULL
  *  @param system client system text, or NULL
- *  @param think_mode the family's think mode */
-void pulsar_chat_open(pulsar_engine *e, pulsar_tokens *tokens, const char *trusted, const char *system,
+ *  @param think_mode the family's think mode
+ *  @return false when refused (no chat front) */
+bool pulsar_chat_open(pulsar_engine *e, pulsar_tokens *tokens, const char *trusted, const char *system,
                       pulsar_think_mode think_mode);
 /** One TURN appended to a transcript that ends with its head or a closed assistant turn: the messages, then,
  * with `generation_prompt`, the assistant turn opened for `think_mode`. */
@@ -836,21 +841,24 @@ void pulsar_chat_open(pulsar_engine *e, pulsar_tokens *tokens, const char *trust
  *  @param msgs the turn's messages
  *  @param n their count
  *  @param generation_prompt also open the assistant turn
- *  @param think_mode the mode the assistant turn opens for */
-void pulsar_chat_append_turn(pulsar_engine *e, pulsar_tokens *tokens, const pulsar_chat_message *msgs, int n,
+ *  @param think_mode the mode the assistant turn opens for
+ *  @return false when refused (no chat front) */
+bool pulsar_chat_append_turn(pulsar_engine *e, pulsar_tokens *tokens, const pulsar_chat_message *msgs, int n,
                              bool generation_prompt, pulsar_think_mode think_mode);
 /** Close the sampled assistant turn the transcript ends with (sampled up to, not including, its stop token):
  * what the turn's end is in the family's template (DeepSeek: EOS; Qwen: "<|im_end|>\n"). */
 /** @param e the engine
- *  @param tokens the transcript, appended to */
-void pulsar_chat_end_assistant(pulsar_engine *e, pulsar_tokens *tokens);
+ *  @param tokens the transcript, appended to
+ *  @return false when refused (no chat front) */
+bool pulsar_chat_end_assistant(pulsar_engine *e, pulsar_tokens *tokens);
 /** The one-shot prompt: pulsar_chat_open(system) + a turn of one user message with the generation prompt. */
 /** @param e the engine
  *  @param system the system text, or NULL
  *  @param prompt the user message
  *  @param think_mode the think mode
- *  @param out the prompt's tokens are appended here */
-void pulsar_encode_chat_prompt(
+ *  @param out the prompt's tokens are appended here
+ *  @return false when refused (no chat front: nothing appended) */
+bool pulsar_encode_chat_prompt(
         pulsar_engine *e,
         const char *system,
         const char *prompt,
@@ -858,20 +866,21 @@ void pulsar_encode_chat_prompt(
         pulsar_tokens *out);
 
 /** A token's text as bytes (byte-level BPE decoded; a special token's literal spelling).
- *  @param e the engine (ends the process by name without a tokenizer)
+ *  @param e the engine
  *  @param token the id; an out-of-range id gives ""
- *  @param len receives the byte count; may be NULL
- *  @return a malloc'd NUL-terminated copy; caller frees */
+ *  @param len receives the byte count (0 when refused); may be NULL
+ *  @return a malloc'd NUL-terminated copy (caller frees); NULL when the family has no tokenizer (said once) */
 char *pulsar_token_text(pulsar_engine *e, int token, size_t *len);
 /** The family's end-of-sequence id (one id; the whole stop set is pulsar_token_is_stop's).
- *  @param e the engine (ends the process by name without a tokenizer)
- *  @return the id */
+ *  @param e the engine
+ *  @return the id; -1 when the family has no tokenizer (said once) */
 int pulsar_token_eos(pulsar_engine *e);
 /** L251: whether `token` ends generation -- the family's whole stop set (Qwen: <|im_end|> and
  * <|endoftext|>, generation_config.json); DeepSeek: its one eos id. */
 /** @param e the engine
  *  @param token the id
- *  @return true when token is in the stop set */
+ *  @return true when token is in the stop set; true for every token when the family has no tokenizer (said once:
+ *          a generation ends at once, fail closed) */
 bool pulsar_token_is_stop(pulsar_engine *e, int token);
 /** The chat template's TURN MARKERS as token sequences (L272 B5): the tokens that open a user turn
  * and an assistant turn in a rendered prompt.  DeepSeek names each with one special token
@@ -891,7 +900,7 @@ typedef struct {
 /** Fill `out` with the loaded tokenizer's turn markers (pulsar_turn_markers above).
  *  @param e the engine
  *  @param out receives the markers; zeroed when they are not spelled
- *  @return true when both markers are spelled */
+ *  @return true when both markers are spelled; false when the family has no tokenizer (said once) */
 bool pulsar_chat_turn_markers(pulsar_engine *e, pulsar_turn_markers *out);
 /** The role whose marker begins at v[i] of v[0..n): 1 = user, 2 = assistant, 0 = none.  A marker
  * whose tokens run past n does not match.  Pure host code. */
@@ -905,7 +914,7 @@ int pulsar_turn_marker_at(const pulsar_turn_markers *m, const int *v, int n, int
  * (DeepSeek's special, Qwen's added token); -1 when it has none.  A front end that forces the
  * close feeds this id, never the text re-tokenized (L272 B11: BPE pieces on Qwen). */
 /** @param e the engine
- *  @return the id, or -1 */
+ *  @return the id, or -1 (also when the family has no tokenizer: said once) */
 int pulsar_token_think_close(pulsar_engine *e);
 
 /** Create a session on `e` with a `ctx_size`-token context (the bank pool sized by pulsar_engine_bank_pool).
@@ -1384,7 +1393,7 @@ typedef struct {
  *  @param reqs n rows, one per bank
  *  @param n the row count
  *  @param logits receives n rows of pulsar_engine_logits_width floats
- *  @param logits_cap floats at logits
+ *  @param logits_cap the TOTAL float capacity of logits (all rows, not one row)
  *  @param err receives the failure
  *  @param errlen bytes at err
  *  @return 0, 1 (rejected, nothing mutated) or -1 (fatal; tear the session down) */
@@ -1425,7 +1434,7 @@ int pulsar_session_decode_multiseq(pulsar_session *s, const pulsar_multiseq_req 
  *  @param reqs n_rows rows, each bank's rows contiguous
  *  @param n_rows the row count
  *  @param logits receives the headed rows
- *  @param logits_cap floats at logits
+ *  @param logits_cap the TOTAL float capacity of logits (all rows, not one row)
  *  @param out_n_rows receives the rows written; may be NULL
  *  @param max_head_runs runs to head (0 = all; PULSAR_MSEQ_HEAD_ALL_ROWS = every row)
  *  @param err receives the failure
@@ -1464,7 +1473,7 @@ typedef struct {
  *  @param n_rows the row count
  *  @param shape the decode / prefill split and the head flags
  *  @param logits receives the headed rows
- *  @param logits_cap floats at logits
+ *  @param logits_cap the TOTAL float capacity of logits (all rows, not one row)
  *  @param out_n_rows receives n_dec + the headed runs
  *  @param err receives the failure
  *  @param errlen bytes at err

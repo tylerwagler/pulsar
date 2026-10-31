@@ -101,18 +101,30 @@ const pulsar_family *pulsar_family_for_model(const pulsar_model *m) {
 /* L280: the rope_id of a family whose model id fixes its rope (family.h) */
 uint64_t pulsar_family_rope_fixed(const pulsar_engine *) { return 0; }
 
-bool pulsar_family_require(const pulsar_engine *e, uint32_t cap, const char *op) {
-    if (!e || (e->family->caps & cap) == cap) return true;
-    /* Once per op name (rule 9): a caller that keeps asking gets its refusal
-     * value every time, and the log gets the reason once.  The op names are
-     * string literals, so their addresses identify them. */
-    static const char *said[64];
+bool pulsar_refusal_first(const char *op) {
+    /* Once per op name (rule 9): a caller that keeps asking gets its refusal value every time, and the log gets the
+     * reason once.  The op names are string literals, so their addresses identify them.  The table is a bound, not a
+     * count of the source's ops (some arrive through a caller's own name): past it every refusal is said each time,
+     * and that is said once. */
+    static const char *said[PULSAR_REFUSAL_OPS_MAX];
     static uint32_t n_said = 0;
+    static bool full_said = false;
     for (uint32_t i = 0; i < n_said; i++)
         if (said[i] == op) return false;
-    if (n_said < sizeof(said) / sizeof(said[0])) said[n_said++] = op;
-    fprintf(stderr, "pulsar: the %s family does not implement %s -- refusing\n",
-            e->family->name, op);
+    if (n_said < PULSAR_REFUSAL_OPS_MAX) {
+        said[n_said++] = op;
+    } else if (!full_said) {
+        full_said = true;
+        fprintf(stderr, "pulsar: the refusal table is full (%u ops): a refusal of an op past them is said each time\n",
+                (unsigned)PULSAR_REFUSAL_OPS_MAX);
+    }
+    return true;
+}
+
+bool pulsar_family_require(const pulsar_engine *e, uint32_t cap, const char *op) {
+    if (!e || (e->family->caps & cap) == cap) return true;
+    if (pulsar_refusal_first(op))
+        fprintf(stderr, "pulsar: the %s family does not implement %s -- refusing\n", e->family->name, op);
     return false;
 }
 

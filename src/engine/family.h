@@ -220,10 +220,11 @@ typedef struct {
      *  s->logits -- the family's forward only: the core's eval (pulsar_session_family_eval) checks the context, the
      *  id and the state's agreement with the view before, and records the token after.  0 = decoded. */
     int (*eval_row)(pulsar_session *s, int token, char *err, size_t errlen);
-    /** One decode row per request (each on its own bank). */
+    /** One decode row per request (each on its own bank).  `logits_cap` (here and in decode_mixed / decode_fused)
+     *  is the TOTAL float capacity of `logits` -- every row the step heads -- as pulsar.h's entries say. */
     int (*decode_multiseq)(pulsar_session *s, const pulsar_multiseq_req *reqs, uint32_t n,
                            float *logits, int logits_cap, char *err, size_t errlen);
-    /** Decode rows and prefill runs in one step. */
+    /** Decode rows and prefill runs in one step (`logits_cap`: the TOTAL float capacity of `logits`). */
     int (*decode_mixed)(pulsar_session *s, const pulsar_multiseq_req *reqs, uint32_t n_rows,
                         float *logits, int logits_cap, uint32_t *out_n_rows,
                         uint32_t max_head_runs, char *err, size_t errlen);
@@ -456,10 +457,17 @@ const pulsar_family *pulsar_family_for_model(const pulsar_model *m);
 /// @return 0
 uint64_t pulsar_family_rope_fixed(const pulsar_engine *e);
 
+/** The ops pulsar_refusal_first remembers; past them a refusal is said every time (and that fact once). */
+#define PULSAR_REFUSAL_OPS_MAX 64u
+/** Rule 9's "once" for the library's named refusals: true the first time `op` is asked about (the caller says its
+ *  refusal now), false after.  Shared by pulsar_family_require and the tokenizer entries (tokenizer.cpp). */
+/// @param op the operation's name (a string literal: its address identifies it)
+/// @return true when the caller should say the refusal
+bool pulsar_refusal_first(const char *op);
 /** True when the engine's family declares `cap`.  Otherwise prints, once per
- * (op) call site, "<family> does not implement <op>" and returns false: the
- * caller refuses with its own error value.  A NULL engine passes (the caller's
- * own NULL check decides). */
+ * (op) call site (pulsar_refusal_first), "<family> does not implement <op>" and
+ * returns false: the caller refuses with its own error value.  A NULL engine
+ * passes (the caller's own NULL check decides). */
 /// @param e the engine, or NULL
 /// @param cap the PULSAR_FAMILY_CAP_* bits required
 /// @param op the operation's name (a string literal: its address dedups the message)

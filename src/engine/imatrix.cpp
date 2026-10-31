@@ -135,7 +135,7 @@ static bool imatrix_collect_layer_batch(
 /// Write one little-endian int32 to the .dat; dies on a short write.
 /// @param fp the file
 /// @param v the value
-void imatrix_write_i32(FILE *fp, int32_t v) {
+static void imatrix_write_i32(FILE *fp, int32_t v) {
     if (fwrite(&v, sizeof(v), 1, fp) != 1) pulsar_die("failed to write imatrix");
 }
 
@@ -278,8 +278,6 @@ bool gpu_graph_reset_prefill_state(pulsar_gpu_graph *g) {
 
 
 
-/* Execute graph-backend prefill in layer-major order so intermediate
- * activations stay on the GPU and cache state is built exactly once. */
 /// Report a chunk's progress as tokens, interpolated by layers done.
 /// @param display_progress the callback (NULL: nothing)
 /// @param display_progress_ud its user data
@@ -525,6 +523,8 @@ static bool gpu_graph_prefill_layer_major_inner(
         pulsar_session_progress_fn display_progress,
         void                  *display_progress_ud);
 
+/* Execute graph-backend prefill in layer-major order so intermediate
+ * activations stay on the GPU and cache state is built exactly once. */
 /// One prefill chunk, layer-major, with the imatrix funnel's counters and the drafter's anchor drain around it.
 /// @param g the graph
 /// @param model the model

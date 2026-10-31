@@ -168,8 +168,13 @@ void pulsar_bank_carry_fresh_view(pulsar_session *s) {
 bool pulsar_bank_carry_restore_view(pulsar_session *s, uint32_t bank) {
     if (!s || !s->bank_carry || bank >= s->bank_carry_n || !s->bank_carry[bank].valid) return false;
     const pulsar_bank_carry *c = &s->bank_carry[bank];
+    /* All or nothing (L335): the one step that can fail -- the live row's device copy -- goes first, so a failure
+     * leaves the host view exactly as it was (it used to take the checkpoint first and return half-restored). */
+    if (!s->live_restore_bank(bank)) {
+        fprintf(stderr, "pulsar: bank %u: its live row could not be restored -- the view is not installed\n", bank);
+        return false;
+    }
     pulsar_tokens_copy(&s->checkpoint, &c->checkpoint);
-    if (!s->live_restore_bank(bank)) return false;
     s->checkpoint_valid       = c->checkpoint_valid;
     s->logits_stale           = c->logits_stale;
     s->prefill_frontier       = c->prefill_frontier;   /* L195 */

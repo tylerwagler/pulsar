@@ -463,17 +463,6 @@ static bool gpu_graph_comp_ape_fold(
 }
 
 
-/* Run kv source `il`'s compressor over this batch's rows (batch_comp_kv/sc
- * hold the kv / score projections of every row) and emit what completes.
- * Two arms, bit-equivalent by construction:
- *   - batched: a run of one bank starting on a group boundary -- one pool over
- *     the run, the trailing partial group left in the state;
- *   - per row: store each row, emit at each boundary.
- * A single-bank aligned batch is one batched run; a mixed multiseq step runs its
- * decode/verify rows per row and each prompt run per row up to its first group
- * boundary, batched from there.
- * A zero-prefix chunk is the aligned run at row 0.  comp_counts[t] receives
- * the compressed rows visible to row t after its own emit, (pos+1)/ratio. */
 /* The latent's bf16 plane, reserved for the compressor kernel to write beside its f32 rows (rule 3: the producer
  * emits).  Its one consumer is V4.1's index-key projection -- `indexer.wk`, a bf16 Linear in the reference and a bf16
  * tensor in the container -- whose GEMM reads the bf16 plane and refuses a buffer no producer emitted (L159).  0731's
@@ -491,7 +480,18 @@ static bool csa2_latent_bf16_slot(const pulsar_gpu_tensor *latent, uint32_t n_ro
     return false;
 }
 
-/// Kv source il's compressor over the batch (see the block above csa2_latent_bf16_slot).
+/* Run kv source `il`'s compressor over this batch's rows (batch_comp_kv/sc
+ * hold the kv / score projections of every row) and emit what completes.
+ * Two arms, bit-equivalent by construction:
+ *   - batched: a run of one bank starting on a group boundary -- one pool over
+ *     the run, the trailing partial group left in the state;
+ *   - per row: store each row, emit at each boundary.
+ * A single-bank aligned batch is one batched run; a mixed multiseq step runs its
+ * decode/verify rows per row and each prompt run per row up to its first group
+ * boundary, batched from there.
+ * A zero-prefix chunk is the aligned run at row 0.  comp_counts[t] receives
+ * the compressed rows visible to row t after its own emit, (pos+1)/ratio. */
+/// Kv source il's compressor over the batch (the block above).
 /// @param g the graph
 /// @param model the model
 /// @param layer the layer's weights
@@ -3294,10 +3294,13 @@ bool gpu_graph_encode_layer_batch(
 /// @param what the kernel
 /// @return false, always
 static bool rollforward_fail(uint32_t il, uint32_t pos, const char *what) {
-    fprintf(stderr, "pulsar: compressor rollforward FAILED at layer %u pos %u (%s) -- layers 0..%u are "
+    char done[48];
+    if (il == 0u) snprintf(done, sizeof done, "no layer is");
+    else snprintf(done, sizeof done, "layers 0..%u are", il - 1u);
+    fprintf(stderr, "pulsar: compressor rollforward FAILED at layer %u pos %u (%s) -- %s "
                     "advanced to the committed frontier, layers %u.. are not: the pool state is "
                     "half-advanced and the caller must invalidate the checkpoint (it does)\n",
-            il, pos, what, il == 0u ? 0u : il - 1u, il);
+            il, pos, what, done, il);
     return false;
 }
 

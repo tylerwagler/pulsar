@@ -112,6 +112,22 @@ uint32_t pulsar_image_identity_end(const pulsar_image_identity *id) {
     return id->n ? id->b[id->n - 1].end : 0u;
 }
 
+bool pulsar_image_identity_span(const pulsar_image_identity *id, uint32_t lo, uint32_t hi, uint32_t *first,
+                                uint32_t *n) {
+    *first = 0;
+    *n = 0;
+    for (uint32_t i = 0; i < id->n; i++) {
+        const pulsar_image_block &b = id->b[i];
+        /* position order, disjoint, each block non-empty: what makes the blocks inside a span one run of b[] */
+        if (b.start >= b.end || (i > 0 && b.start < id->b[i - 1].end)) return false;
+        if (b.start >= lo && b.end <= hi) {
+            if (*n == 0) *first = i;
+            (*n)++;
+        }
+    }
+    return true;
+}
+
 /* L268: interleaved multi-axis rope positions (HF get_rope_index), a pure function of the KV row and the blocks
  * before it.  Text advances every axis by one per row; a block with a 2D grid (h x w rows, raster) at text position
  * p puts row (r, c) at (p, p + r, p + c) and moves the text position on by max(h, w) rather than by its h * w rows;

@@ -35,8 +35,10 @@ int gpu_graph_spec_dump_active(void) {
  * and pre-markov base logits (spec_logits row 0) so an off-box reference forward
  * can be diffed against ds4 to localize acceptance loss. Enabled by
  * PULSAR_DSPARK_DUMP=<path>; caps at PULSAR_DSPARK_DUMP_STEPS (default 8) records.
- * Record layout (little-endian): pos i32, first_token i32, then f32 arrays
- * target_h[0..2] (PULSAR_N_EMBD each), main_x (PULSAR_N_EMBD), base0 (PULSAR_N_VOCAB). */
+ * Record layout (little-endian): i32 pos, first_token, n_draft; i32 refined_ids[n_draft + 1]; then f32 arrays
+ * target_h[0..2] (PULSAR_N_EMBD each), main_x (PULSAR_N_EMBD), base0 (PULSAR_N_VOCAB), and the HC carrier
+ * (PULSAR_N_HC x PULSAR_N_EMBD) of each of the n_draft block positions.  PULSAR_DSPARK_DUMP_LEAN=1 writes the
+ * same header and ids, then only each position's post-hc_head hidden row (PULSAR_N_EMBD). */
 /// @param g the session's graph
 /// @param pos the step's position
 /// @param first_token the base token
@@ -121,13 +123,6 @@ static void dspark_dump_step(pulsar_gpu_graph *g, int pos, int first_token,
     free(emb); free(voc); free(hc);
 }
 
-/// Clear a frontier snapshot (zeroes it; frees nothing -- the round frees the allocation).
-/// @param f the snapshot (NULL: no-op)
-static void spec_frontier_free(pulsar_spec_frontier *f) {
-    if (!f) return;
-    memset(f, 0, sizeof(*f));
-}
-
 /* Build the batched-copy descriptor tables for the frontier snapshot/restore
  * copy sets. All source/destination tensors are fixed allocations, so the
  * tables are built once and replayed with one kernel launch per direction
@@ -208,7 +203,7 @@ static bool spec_frontier_copy_tables_init(pulsar_gpu_graph *g) {
 /// Snapshot the installed bank's recurrent frontier state into f (one batched copy).
 /// @param f receives the snapshot
 /// @param s the session
-/// @return false = failed (f cleared)
+/// @return false = failed
 static bool spec_frontier_snapshot(pulsar_spec_frontier *f, pulsar_session *s) {
     memset(f, 0, sizeof(*f));
     pulsar_gpu_graph *g = s->graph;
@@ -224,10 +219,7 @@ static bool spec_frontier_snapshot(pulsar_spec_frontier *f, pulsar_session *s) {
                                       g->spec_frontier_copy_max_bytes) != 0;
     if (ok) ok = pulsar_gpu_end_commands() != 0;
     else (void)pulsar_gpu_synchronize();
-    if (ok) return true;
-
-    spec_frontier_free(f);
-    return false;
+    return ok;
 }
 
 /// Put a frontier snapshot back on the installed bank (one batched copy).
@@ -824,12 +816,6 @@ static bool ds4_spec_restore(pulsar_session *s, pulsar_spec_round *r) {
     return r->snap && spec_frontier_restore((pulsar_spec_frontier *)r->snap, s);
 }
 
-/// pulsar_spec_target_ops::release.
-/// @param r the round
-static void ds4_spec_release(pulsar_session *, pulsar_spec_round *r) {
-    if (r->snap) spec_frontier_free((pulsar_spec_frontier *)r->snap);
-}
-
 /* A partial accept: restore the pre-verify frontier, then Stage B -- roll only the recurrent
  * compressor / indexer pool state forward through the committed prefix from the projections saved
  * during the verify batch (bit-identical: same update kernels, same rows, same order).  Raw KV and
@@ -860,7 +846,7 @@ static void ds4_cut(pulsar_session *s, int pos) { s->rewind(pos); }
 const pulsar_spec_target_ops k_ds4_spec_target = {
     /* .snapshot      = */ ds4_spec_snapshot,
     /* .restore       = */ ds4_spec_restore,
-    /* .release       = */ ds4_spec_release,
+    /* .release       = */ NULL,   /* the snapshot is the round's allocation, freed with it: nothing to release */
     /* .arm_verify    = */ ds4_arm_verify,
     /* .verify_single = */ ds4_verify_single,
     /* .commit        = */ ds4_commit,

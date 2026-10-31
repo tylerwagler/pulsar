@@ -611,6 +611,13 @@ int main(int argc, char **argv) {
     }
     pulsar_engine *engine = NULL;
     if (pulsar_engine_open(&engine, &cfg.engine) != 0) return 1;
+    /* the agent takes text: a family whose tokenizer and chat front this build lacks is refused here, by name */
+    if (!pulsar_engine_has_tokenizer(engine)) {
+        fprintf(stderr, "pulsar-agent: the %s family has no tokenizer or chat renderer in this build -- refusing\n",
+                pulsar_engine_family_name(engine));
+        pulsar_engine_close(engine);
+        return 1;
+    }
     /* The think mode is the loaded family's, the rule pulsar applies (L284 P14): an unset mode is the family's
      * default; an effort its template cannot spell is refused here by name rather than rendered. */
     if (!cfg.gen.think_mode_set) cfg.gen.think_mode = pulsar_engine_think_default(engine);

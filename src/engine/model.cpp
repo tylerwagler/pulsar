@@ -773,13 +773,6 @@ bool accelerator_prepare_expert_overlay(pulsar_backend backend,
 
 
 
-/* Swap routed-expert tensor entries in the base model for same-named entries
- * from an overlay model (--expert-overlay PATH:PREFIX). Only 3D `*_exps.*`
- * tensors whose name starts with the prefix are swapped, so the overlay never
- * touches FP8-registered dense weights or streaming offset tables. A swapped
- * entry keeps the overlay file's abs_offset and records the overlay mapping in
- * ext_map/ext_size; consumers resolve the payload via tensor_data()/
- * tensor_map_base(). Returns the number of tensors swapped. */
 /// @param s a string (not NUL-terminated)
 /// @param len its length
 /// @param needle NUL-terminated
@@ -793,6 +786,13 @@ static bool str_span_contains(const char *s, size_t len, const char *needle) {
     return false;
 }
 
+/* Swap routed-expert tensor entries in the base model for same-named entries
+ * from an overlay model (--expert-overlay PATH:PREFIX). Only 3D `*_exps.*`
+ * tensors whose name starts with the prefix are swapped, so the overlay never
+ * touches FP8-registered dense weights or streaming offset tables. A swapped
+ * entry keeps the overlay file's abs_offset and records the overlay mapping in
+ * ext_map/ext_size; consumers resolve the payload via tensor_data()/
+ * tensor_map_base(). Returns the number of tensors swapped. */
 uint32_t model_apply_expert_overlay(pulsar_model *base, const pulsar_model *overlay,
                                     const char *prefix) {
     const size_t plen = strlen(prefix);

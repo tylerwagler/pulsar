@@ -350,6 +350,14 @@ bool pulsar_ds4_family_load(pulsar_engine *e, const pulsar_engine_options *opt) 
     if (!ds4_load_stage_ok("the tokenizer")) return false;
     config_validate_model(&e->model);
     if (!ds4_load_stage_ok("the configuration")) return false;
+    /* L335: the V4.1 template writes the System marker (chat_tmpl_push_system_marker), so the V4.1 profile needs
+     * it in the vocab; 0731's does not (its pre-V4.1 artifacts lack it).  Refused here, once the profile is
+     * known, instead of exiting the process at the first prompt that renders it. */
+    if (!opt->inspect_only && PULSAR_CHAT_SYSTEM_MARKER && e->vocab.system_id < 0) {
+        fprintf(stderr, "pulsar: deepseek4: the vocabulary has no <｜System｜> marker, which the V4.1 chat template "
+                        "requires -- refusing\n");
+        return false;
+    }
     /* L280: DeepSeek's container declares its YaRN (validated above); the option may only restate it */
     if (opt->rope_yarn_factor != 0.0 && opt->rope_yarn_factor != (double)PULSAR_ROPE_SCALE_FACTOR) {
         fprintf(stderr, "pulsar: --rope-yarn %g contradicts the container's YaRN factor %g -- refusing\n",
@@ -1146,7 +1154,6 @@ void pulsar_engine::destroy() {
     }
     if (e->family && e->family->unload) e->family->unload(e);   /* L295: the family's opaque state */
     engram_model_free(&e->weights);
-    weights_free(&e->weights);
     pulsar_tp_plan_free(e);   /* the rank's built slices, before the device goes */
     if (e->qwen_weights) pulsar_qwen_s4_unload(e->qwen_weights);
     if (e->qwen_tok) bpe_tokenizer_free(e->qwen_tok);
@@ -1512,12 +1519,7 @@ done:
 }
 
 /* The engine's vocabulary for the seam walks. */
-/** pulsar_token_text_fn over the engine's tokenizer.
- *  @param ud    the engine
- *  @param token the token id
- *  @param len   receives the text's length in bytes
- *  @return a malloc'd copy of the token's text (the caller frees it), or NULL */
-static char *prefix_walk_engine_text(void *ud, int token, size_t *len) {
+char *pulsar_engine_token_text_fn(void *ud, int token, size_t *len) {
     return pulsar_token_text((pulsar_engine *)ud, token, len);
 }
 
@@ -1531,7 +1533,7 @@ void pulsar_tokens_prefix_match(pulsar_engine *e,
         out->seamed = false;
         return;
     }
-    pulsar_tokens_prefix_match_with(prefix_walk_engine_text, e, a, a_len, b, b_len, out);
+    pulsar_tokens_prefix_match_with(pulsar_engine_token_text_fn, e, a, a_len, b, b_len, out);
 }
 
 /* L334: the walk of live[0, at) against the prompt stops at the deepest boundary both spellings share at or below

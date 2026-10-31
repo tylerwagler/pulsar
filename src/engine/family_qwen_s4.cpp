@@ -449,13 +449,12 @@ uint64_t multi_lin_ws(int in, int n, const int *out, int out_in, int out_out, ui
 }
 
 /* L251 S2: the Gated DeltaNet op's scratch.  qkv/z/a/b hold the four f32
- * projections; `ws` is pulsar_gdn_forward's own scratch; a8/a8_sf are the A8
- * output slot the kernel emits and out_proj then reads -- sized with the
- * host-side geometry helpers, because pulsar_cuda_mx.cuh cannot be included
- * here (g++ does not know __host__/__device__).  `lin_ws` is ONE dense-arm
- * workspace shared by the five launches (they serialize on the stream). */
+ * projections; `ws` is pulsar_gdn_forward's own scratch; obf16 is the bf16
+ * output the kernel emits and out_proj then reads (ac69748f; the A8 slot it
+ * replaced is gone, L335).  `lin_ws` is ONE dense-arm workspace shared by the
+ * five launches (they serialize on the stream). */
 /** The GDN op's scratch layout (gdn_layout): byte offsets into scratch[PULSAR_QWEN_OP_GDN]. */
-struct gdn_scratch { uint64_t qkv, z, a, b, ws, ws_bytes, a8, a8_sf, obf16, lin_ws, lin_ws_bytes, total; };
+struct gdn_scratch { uint64_t qkv, z, a, b, ws, ws_bytes, obf16, lin_ws, lin_ws_bytes, total; };
 
 /** @var gdn_scratch::qkv
  *  byte offset in the op's scratch tensor: in_proj_qkv output, [rows][conv_dim] f32 */
@@ -469,10 +468,6 @@ struct gdn_scratch { uint64_t qkv, z, a, b, ws, ws_bytes, a8, a8_sf, obf16, lin_
  *  byte offset in the op's scratch tensor: pulsar_gdn_forward's scratch */
 /** @var gdn_scratch::ws_bytes
  *  bytes of ws */
-/** @var gdn_scratch::a8
- *  byte offset in the op's scratch tensor: [rows][v_total] E4M3 codes. TODO(dox): carved but read and written by no op here since the bf16 output (obf16, ac69748f) */
-/** @var gdn_scratch::a8_sf
- *  byte offset in the op's scratch tensor: the A8 slot's scale-factor slab. TODO(dox): carved, unused by the GDN op since ac69748f */
 /** @var gdn_scratch::obf16
  *  byte offset in the op's scratch tensor: the GDN output, [rows][v_total] bf16 -- what out_proj reads */
 /** @var gdn_scratch::lin_ws
@@ -503,11 +498,8 @@ gdn_scratch gdn_layout(const pulsar_qwen_shape *s, uint32_t rows) {
     g.a   = o; o += a256((uint64_t)rows * NV * sizeof(float));
     g.b   = o; o += a256((uint64_t)rows * NV * sizeof(float));
     g.ws  = o; g.ws_bytes = a256((uint64_t)pulsar_gdn_scratch_bytes((int)rows)); o += g.ws_bytes;
-    g.a8    = o; o += a256((uint64_t)rows * VT);                                          /* E4M3 codes */
-    g.a8_sf = o; o += a256(pulsar_gpu_mx_sf_slab_bytes((int)rows, pulsar_gpu_mx_kbp((int)VT)));
     g.lin_ws = o; g.lin_ws_bytes = gdn_lin_ws(s, rows); o += g.lin_ws_bytes;
-        /* L251 / ac69748f: the GDN output's bf16 row -- what the out_proj reads.  bf16 is 2 bytes
-     * per element where the A8 slot was 1, so this take is twice the width of a8. */
+    /* L251 / ac69748f: the GDN output's bf16 row -- what the out_proj reads */
     g.obf16 = o; o += a256((uint64_t)rows * VT * sizeof(uint16_t));
 g.total = o;
     return g;
@@ -515,10 +507,11 @@ g.total = o;
 
 /* L251 S3: the QSA op's scratch.  qg/k/v/idx hold the four f32 projections (the
  * op hands the kernel VIEWS of them, because pulsar_qsa_io wants tensors and the
- * scratch IS one); a8/a8_sf are the o_proj A8 slot the kernel emits; ws is
- * pulsar_gpu_qsa_forward's workspace; lin_ws is the shared dense workspace. */
+ * scratch IS one); obf16 is the bf16 output the o_proj reads (ac69748f) and a8_sf
+ * the scale slab the kernel is handed beside it; ws is pulsar_gpu_qsa_forward's
+ * workspace; lin_ws is the shared dense workspace. */
 /** The QSA op's scratch layout (qsa_layout): byte offsets into scratch[PULSAR_QWEN_OP_QSA]. */
-struct qsa_scratch { uint64_t qg, k, v, idx, a8, a8_sf, obf16, ws, ws_bytes, lin_ws, lin_ws_bytes, total; };
+struct qsa_scratch { uint64_t qg, k, v, idx, a8_sf, obf16, ws, ws_bytes, lin_ws, lin_ws_bytes, total; };
 
 /** @var qsa_scratch::qg
  *  byte offset in the op's scratch tensor: q_proj output (query | gate), [rows][q_in] f32 */
@@ -528,8 +521,6 @@ struct qsa_scratch { uint64_t qg, k, v, idx, a8, a8_sf, obf16, ws, ws_bytes, lin
  *  byte offset in the op's scratch tensor: v_proj output, [rows][kv_in] f32 */
 /** @var qsa_scratch::idx
  *  byte offset in the op's scratch tensor: indexer index_qk output, [rows][PULSAR_QSA_IDX_IN] f32 */
-/** @var qsa_scratch::a8
- *  byte offset in the op's scratch tensor: [rows][out_dim] E4M3 codes. TODO(dox): carved but unused (the op passes out_e4m3 = NULL since ac69748f) */
 /** @var qsa_scratch::a8_sf
  *  byte offset in the op's scratch tensor: the scale-factor slab passed as pulsar_qsa_io::out_scale (with out_e4m3 NULL) */
 /** @var qsa_scratch::obf16
@@ -565,12 +556,10 @@ qsa_scratch qsa_layout(const pulsar_qwen_shape *s, uint32_t rows, uint32_t ctx) 
     g.k   = o; o += a256((uint64_t)rows * pulsar_qwen_qsa_kv_in(s) * sizeof(float));
     g.v   = o; o += a256((uint64_t)rows * pulsar_qwen_qsa_kv_in(s) * sizeof(float));
     g.idx = o; o += a256((uint64_t)rows * PULSAR_QSA_IDX_IN * sizeof(float));
-    g.a8    = o; o += a256((uint64_t)rows * pulsar_qwen_qsa_out_dim(s));
     g.a8_sf = o; o += a256(pulsar_gpu_mx_sf_slab_bytes((int)rows, pulsar_gpu_mx_kbp(pulsar_qwen_qsa_out_dim(s))));
     g.ws = o; g.ws_bytes = a256((uint64_t)pulsar_gpu_qsa_workspace_bytes(rows, ctx)); o += g.ws_bytes;
     g.lin_ws = o; g.lin_ws_bytes = qsa_lin_ws(s, rows); o += g.lin_ws_bytes;
-        /* L251 / ac69748f: the o_proj's bf16 row.  bf16 is 2 bytes where the A8 slot is 1, so this
-     * take is twice the width of a8. */
+    /* L251 / ac69748f: the o_proj's bf16 row */
     g.obf16 = o; o += a256((uint64_t)rows * pulsar_qwen_qsa_out_dim(s) * sizeof(uint16_t));
 g.total = o;
     (void)s;

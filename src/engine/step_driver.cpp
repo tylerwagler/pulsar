@@ -87,6 +87,12 @@ int pulsar_driver_session_create(pulsar_session *s, uint32_t n_banks) {
         fprintf(stderr, "pulsar: %s: the family supplies no %s%s -- refusing the session\n", ARCH(e), miss, where);
         return 1;
     }
+    if (ops->n_scratch > PULSAR_DRIVER_SCRATCH_MAX) {   /* L335: refused, never capped (the arenas past it went missing) */
+        fprintf(stderr, "pulsar: %s: the family declares %u scratch arenas, the driver holds %u "
+                        "(PULSAR_DRIVER_SCRATCH_MAX) -- refusing the session\n",
+                ARCH(e), ops->n_scratch, (unsigned)PULSAR_DRIVER_SCRATCH_MAX);
+        return 1;
+    }
     pulsar_driver_state *d = ops->create(s, n_banks);
     if (!d) return 1;
     s->driver = d;
@@ -110,7 +116,7 @@ int pulsar_driver_session_create(pulsar_session *s, uint32_t n_banks) {
     /* the declared state (its verify capture when the session verifies), every bank fresh */
     if (ok) ok = (s->states = pulsar_state_create(e, &e->state_plan, d, n_banks, (uint32_t)s->ctx_size,
                                                   verifies ? PULSAR_STATE_VERIFY_ROWS : 0u)) != NULL;
-    for (uint32_t a = 0; ok && a < ops->n_scratch && a < PULSAR_DRIVER_SCRATCH_MAX; a++) {
+    for (uint32_t a = 0; ok && a < ops->n_scratch; a++) {
         const uint64_t b = ops->scratch_bytes(a, d->max_rows, s->states->ctx);
         if (b) ok = (d->scratch[a] = pulsar_gpu_tensor_alloc(b)) != NULL;
     }
@@ -542,7 +548,7 @@ int pulsar_driver_eval_row(pulsar_session *s, int token, char *err, size_t errle
  *  @param reqs       [n] the rows
  *  @param n          rows, <= PULSAR_DRIVER_HEADS_MAX and the driver's max_rows
  *  @param logits     receives n rows of the logits width, or NULL (the rows stay on the device)
- *  @param logits_cap capacity of `logits` in floats, >= n x the logits width
+ *  @param logits_cap the TOTAL float capacity of `logits` (all rows: >= n x the logits width)
  *  @param err        receives the failure when non-NULL
  *  @param errlen     bytes of `err`
  *  @return 0, or 1 when refused */
@@ -630,7 +636,7 @@ static bool driver_verify_rows(pulsar_session *s, const pulsar_multiseq_req *req
 /// @param reqs          [n_rows] the rows
 /// @param n_rows        rows
 /// @param logits        receives the headed rows, or NULL
-/// @param logits_cap    capacity of `logits` in floats
+/// @param logits_cap    the TOTAL float capacity of `logits` (all rows: >= n_rows x the logits width)
 /// @param out_n_rows    receives the headed row count (may be NULL)
 /// @param max_head_runs 0 = one row per bank (the batched decode), PULSAR_MSEQ_HEAD_ALL_ROWS = the verify
 /// @param err           receives the failure when non-NULL
@@ -690,7 +696,7 @@ int pulsar_driver_decode_mixed(pulsar_session *s, const pulsar_multiseq_req *req
 /// @param n_rows     rows, <= the driver's max_rows
 /// @param shape      the step's shape
 /// @param logits     receives the headed rows, or NULL
-/// @param logits_cap capacity of `logits` in floats
+/// @param logits_cap the TOTAL float capacity of `logits` (all rows: >= (n_dec + headed runs) x the logits width)
 /// @param out_n_rows receives n_dec + the headed runs (may be NULL)
 /// @param err        receives the failure when non-NULL
 /// @param errlen     bytes of `err`

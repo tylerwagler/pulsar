@@ -212,16 +212,6 @@ static void qv_axis_taps(int index, int size, int *t0, int *t1, float *w0, float
     *w1 = 1.0f - d1 > 0.0f ? 1.0f - d1 : 0.0f;
 }
 
-/* float32 -> bfloat16, round to nearest even (torch's .to(bfloat16)). */
-/// @param f a value
-/// @return its bf16 bits
-static uint16_t qv_f32_to_bf16(float f) {
-    uint32_t u;
-    memcpy(&u, &f, sizeof u);
-    u += 0x7fffu + ((u >> 16) & 1u);
-    return (uint16_t)(u >> 16);
-}
-
 bool qwen_vision_encode(const pulsar_qwen_vision_weights_dev *w, const uint8_t *bytes, size_t len, uint16_t **rows,
                         int *n_rows, uint16_t **dbg, int *n_patches, char *err, size_t errlen) {
     *rows = NULL;
@@ -240,7 +230,7 @@ bool qwen_vision_encode(const pulsar_qwen_vision_weights_dev *w, const uint8_t *
     bool ok = patches && pos && idx && wt && out && (!dbg || d);
     if (ok) {
         /* the model casts pixel_values to the tower's dtype */
-        for (size_t i = 0; i < (size_t)n * px.cols; i++) patches[i] = qv_f32_to_bf16(px.values[i]);
+        for (size_t i = 0; i < (size_t)n * px.cols; i++) patches[i] = pulsar_bf16_from_f32(px.values[i]);
         /* each patch's (row, col) from its merge-block position -- the rope's and the learned table's */
         const int side = (int)PULSAR_QWEN_VISION_POS_SIDE;
         for (int i = 0; i < n; i++) {

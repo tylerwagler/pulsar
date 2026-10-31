@@ -34,7 +34,10 @@ uint64_t pulsar_state_decl_bank_bytes(const pulsar_state_decl *d) {
 }
 
 uint32_t pulsar_state_plan_add(pulsar_state_plan *p, const pulsar_state_decl &d) {
-    if (p->n_decl >= PULSAR_STATE_DECLS_MAX) return UINT32_MAX;   /* the create refuses the plan by name */
+    if (p->n_decl >= PULSAR_STATE_DECLS_MAX) {   /* counted: the create refuses the plan by name (plan_refusal) */
+        p->n_overflow++;
+        return PULSAR_STATE_DECLS_MAX;
+    }
     p->decl[p->n_decl] = d;
     return p->n_decl++;
 }
@@ -51,6 +54,11 @@ static uint64_t capture_row_bytes(const pulsar_state_decl *d) {
 /// @return NULL when the plan is runnable, else the first violation (a static buffer, overwritten by the next call)
 static const char *plan_refusal(const pulsar_state_plan *p) {
     static char why[200];
+    if (p->n_overflow) {
+        snprintf(why, sizeof why, "the decl table is full: %u decl(s) past its PULSAR_STATE_DECLS_MAX (%u) entries",
+                 p->n_overflow, (unsigned)PULSAR_STATE_DECLS_MAX);
+        return why;
+    }
     if (p->n_decl > PULSAR_STATE_DECLS_MAX || p->n_slots > PULSAR_STATE_SLOTS_MAX || p->n_trunk > p->n_slots)
         return "the table or the slots are past the core's bounds";
     if (p->resume_grid == 0u || p->ckpt_slots < 1u || p->ckpt_slots > PULSAR_CKPT_SLOTS_MAX)

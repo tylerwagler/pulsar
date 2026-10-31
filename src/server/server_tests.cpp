@@ -7411,6 +7411,7 @@ static void test_kv_tool_map_filters_by_dsml_text(void) {
         "</｜DSML｜ calls>";
 
     server src = {0}, dst = {0};
+    src.family_no_engine = dst.family_no_engine = server_family_for_format(PULSAR_CHAT_DS4_V41);   /* DSML: named */
     pthread_mutex_init(&src.tool_mu, NULL);
     pthread_mutex_init(&dst.tool_mu, NULL);
     src.tool_memory_put("call_keep", dsml_keep);
@@ -7472,6 +7473,7 @@ static void test_kv_tool_map_restores_before_prompt_render(void) {
         "</｜DSML｜ calls>";
 
     server src = {0};
+    src.family_no_engine = server_family_for_format(PULSAR_CHAT_DS4_V41);   /* DSML: named, no engine */
     pthread_mutex_init(&src.tool_mu, NULL);
     src.tool_memory_put("call_disk", dsml);
 
@@ -7496,6 +7498,7 @@ static void test_kv_tool_map_restores_before_prompt_render(void) {
     }
 
     server dst = {0};
+    dst.family_no_engine = server_family_for_format(PULSAR_CHAT_DS4_V41);
     pthread_mutex_init(&dst.tool_mu, NULL);
     TEST_ASSERT(kv_cache_open(&dst.kv, dir, 0, 0, kv_cache_default_options()));
 
