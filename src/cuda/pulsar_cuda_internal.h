@@ -500,21 +500,6 @@ static inline pulsar_elt_fmt pulsar_tensor_fmt(const pulsar_gpu_tensor *t) {
     return (pulsar_elt_fmt)(t ? t->fmt : (uint32_t)PULSAR_ELT_F32);
 }
 
-/* THE f32 -> bf16 narrowing (round to nearest even) every hand-written bf16 store shares: f32_to_bf16_kernel
- * (pulsar_cuda_matmul.cu) and the norm epilogue that replaces its output for the same values
- * (pulsar_cuda_norm_kv.cu) must agree bit for bit, so there is one copy (L335: there were two).  Written out rather
- * than __float2bfloat16(): "the intrinsic is also RNE" is an assumption where the expression is a guarantee.  A NaN
- * stays NaN, as torch narrows it (c10::BFloat16: 0x7fc0): the rounding add carried a NaN's payload into the
- * exponent, so some NaNs came out Inf and others wrapped to +-0.  Every non-NaN input (finite and +-inf) keeps its
- * old bits -- tests/kernel_contract_gate.cu sweeps all 2^32 patterns. */
-/// @param f the value
-/// @return its bf16 bits, round to nearest even; any NaN -> 0x7fc0
-__device__ __forceinline__ static uint16_t pulsar_f32_to_bf16_rne(float f) {
-    const uint32_t u = __float_as_uint(f);
-    if ((u & 0x7fffffffu) > 0x7f800000u) return (uint16_t)0x7fc0u;
-    return (uint16_t)((u + 0x7fffu + ((u >> 16) & 1u)) >> 16);
-}
-
 /* L335: a grow-on-demand device buffer kept across calls (a static or thread_local cache) must not grow inside a
  * graph capture -- cudaFree / cudaMalloc are not capturable, and a free mid-capture invalidates it -- and a regrow
  * outside one must drop the captured graphs that baked the old pointer (pulsar_gpu_seg_note_device_free, L119).

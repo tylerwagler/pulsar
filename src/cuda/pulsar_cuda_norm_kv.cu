@@ -82,13 +82,13 @@ __global__ static void rms_norm_plain_kernel(float *out, uint16_t *out_b,
         for (uint32_t u = 0; u < UNROLL; u++) {
             const float o = v[u] * scale;
             if (orow) orow[i + u * BLK] = o;
-            if (brow) brow[i + u * BLK] = pulsar_f32_to_bf16_rne(o);
+            if (brow) brow[i + u * BLK] = pulsar_bf16_from_f32(o);
         }
     }
     for (; i < n; i += BLK) {
         const float o = pulsar_hc_load(xr, i) * scale;
         if (orow) orow[i] = o;
-        if (brow) brow[i] = pulsar_f32_to_bf16_rne(o);
+        if (brow) brow[i] = pulsar_bf16_from_f32(o);
     }
 }
 

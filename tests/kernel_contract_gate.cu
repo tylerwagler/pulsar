@@ -28,7 +28,7 @@
  *    9. hc-expand-sizes the split expands refuse a block / add / residual / split operand one row short of out_hc's
  *                       rows (no operand was checked); full operands run.
  *   10. subview-dry     pulsar_tensor_subview carries the base's dry flag, format and element size (dry was unset).
- *   11. bf16-nan        pulsar_f32_to_bf16_rne over all 2^32 f32 patterns: every non-NaN keeps the old expression's
+ *   11. bf16-nan        pulsar_bf16_from_f32 (on the device) over all 2^32 f32 patterns: every non-NaN keeps the old expression's
  *                       bits, every NaN stays NaN (the old rounding add turned some into Inf and wrapped others to 0).
  *   12. swiglu-nan      pulsar_swiglu_elem (now also the CUTLASS FFN MMA kernel's) on 2^26 hashed (g, u) pairs x 3
  *                       clamps: every non-NaN pair keeps the fminf form's bits, a NaN operand stays NaN.
@@ -552,7 +552,7 @@ __global__ static void bf16_sweep_kernel(unsigned long long *cnt) {
          i += (uint64_t)gridDim.x * blockDim.x) {
         const uint32_t u = (uint32_t)i;
         const float f = __uint_as_float(u);
-        const uint16_t b = pulsar_f32_to_bf16_rne(f), o = old_bf16_rne(f);
+        const uint16_t b = pulsar_bf16_from_f32(f), o = old_bf16_rne(f);
         const bool nan_in = (u & 0x7fffffffu) > 0x7f800000u;
         const bool nan_b = (b & 0x7fffu) > 0x7f80u, nan_o = (o & 0x7fffu) > 0x7f80u;
         if (!nan_in) moved += b != o;
@@ -566,7 +566,7 @@ __global__ static void bf16_sweep_kernel(unsigned long long *cnt) {
     atomicAdd(&cnt[2], old_lost);
 }
 
-/// Case 11: pulsar_f32_to_bf16_rne over all 2^32 patterns: every non-NaN keeps its old bits, every NaN stays NaN.
+/// Case 11: pulsar_bf16_from_f32 on the device over all 2^32 patterns: every non-NaN keeps its old bits, every NaN stays NaN.
 static void case_bf16_nan(void) {
     unsigned long long *d = nullptr, h[3] = {0, 0, 0};
     if (!ok(cudaMalloc(&d, sizeof(h)), "bf16-nan malloc") || !ok(cudaMemset(d, 0, sizeof(h)), "bf16-nan memset"))
