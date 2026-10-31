@@ -111,29 +111,28 @@ static void buf_puts_content(buf *b, const char *s) {
  * from, never from what the text looks like: a client who types the placeholder
  * spelling has it inside its span and it stays ordinary text.
  *
- * An offset list that does not fit the content (a parser bug, not a client's)
- * falls back to the whole content as one client span: the prompt then carries no
- * image token and the engine refuses the request loudly, which is the failure we
- * want -- never a prompt that silently lost the image. */
+ * The offsets were checked before the render (chat_msg_image_offsets_check, from
+ * deepseek_render: the request refuses by name); an offset list that fails the
+ * check here is a caller that skipped it, and dies loudly (L335: the old
+ * whole-content fallback never advanced its order check, so an out-of-order list
+ * passed and the copy's `off - pos` underflowed). */
 /// Write message content as client text with each parser-inserted image placeholder outside the range.
 /// @param b  the prompt buffer
-/// @param m  the message (its content, images_len and image_ph_off)
+/// @param m  the message (its content, images_len and image_ph_off; chat_msg_image_offsets_check holds)
 static void buf_puts_content_images(buf *b, const chat_msg *m) {
     const char *s = m->content;
     const size_t len = s ? strlen(s) : 0;
     const size_t ph = strlen(PULSAR_IMAGE_PLACEHOLDER);
-    if (m->images_len <= 0 || !m->image_ph_off || !len) {
+    if (m->images_len <= 0) {
         buf_puts_content(b, s);
         return;
     }
-    size_t pos = 0;
-    for (int i = 0; i < m->images_len; i++) {
-        const size_t off = m->image_ph_off[i];
-        if (off < pos || off + ph > len || strncmp(s + off, PULSAR_IMAGE_PLACEHOLDER, ph) != 0) {
-            buf_puts_content(b, s);   /* mismatch: no image tokens, engine refuses */
-            return;
-        }
+    char err[160];
+    if (!chat_msg_image_offsets_check(m, err, sizeof(err))) {
+        fprintf(stderr, "pulsar-server: render: %s (the offsets were not checked before the render)\n", err);
+        pulsar_die("buf_puts_content_images: an unchecked image offset list");
     }
+    size_t pos = 0;
     for (int i = 0; i < m->images_len; i++) {
         const size_t off = m->image_ph_off[i];
         buf_puts_content_n(b, s + pos, off - pos);

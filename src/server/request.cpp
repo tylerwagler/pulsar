@@ -201,6 +201,31 @@ void chat_msg_add_image(chat_msg *m, uint8_t *bytes, size_t len, size_t placehol
     m->images_len++;
 }
 
+/* L335: the one check of a message's image offsets.  Each placeholder must sit inside the content at
+ * its recorded offset, and the offsets must ascend without overlap (each starts at or after the previous
+ * placeholder's end) -- the renderers walk them in order and copy the text between two of them, so an
+ * offset behind the previous end would underflow that length. */
+bool chat_msg_image_offsets_check(const chat_msg *m, char *err, size_t errlen) {
+    if (m->images_len <= 0) return true;
+    const char *c = m->content ? m->content : "";
+    const size_t n = strlen(c), ph = strlen(PULSAR_IMAGE_PLACEHOLDER);
+    size_t at = 0;
+    for (int k = 0; k < m->images_len; k++) {
+        const size_t off = m->image_ph_off ? m->image_ph_off[k] : SIZE_MAX;
+        if (off == SIZE_MAX || off > n || n - off < ph || memcmp(c + off, PULSAR_IMAGE_PLACEHOLDER, ph)) {
+            snprintf(err, errlen, "image %d of a message has no placeholder at its offset", k);
+            return false;
+        }
+        if (off < at) {
+            snprintf(err, errlen, "image %d of a message: its placeholder offset %zu is before the previous "
+                     "image's end %zu (offsets out of order or overlapping)", k, off, at);
+            return false;
+        }
+        at = off + ph;
+    }
+    return true;
+}
+
 
 
 /* L325: one tool_reference at byte `off` of the message's content (chat_msg::tool_ref_off). */

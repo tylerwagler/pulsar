@@ -3732,6 +3732,12 @@ void chat_msg_add_tool_call_id(chat_msg *m, const char *id);
 /// @param len              its length, bytes
 /// @param placeholder_off  the placeholder's byte offset in m->content
 void chat_msg_add_image(chat_msg *m, uint8_t *bytes, size_t len, size_t placeholder_off);
+/** L335: every image's placeholder sits at its recorded offset, the offsets ascending without overlap. */
+/// @param m       the message (its content, images_len and image_ph_off)
+/// @param err     receives the reason on false
+/// @param errlen  size of `err`
+/// @return false + err when an offset misses its placeholder or is behind the previous placeholder's end
+bool chat_msg_image_offsets_check(const chat_msg *m, char *err, size_t errlen);
 /** L325: record a tool_reference to `name` at byte `off` of the message's content (chat_msg::tool_ref_off). */
 /// @param m     the message
 /// @param off   the byte offset in m->content

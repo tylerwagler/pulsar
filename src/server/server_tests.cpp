@@ -3389,6 +3389,41 @@ static void test_qwen_tail_carries_a_tool_result_image(void) {
     request_free(&r);
 }
 
+/* L335: a message whose image offsets are out of order or overlap is refused by name on every chat
+ * family that renders images (DeepSeek used to let the order check pass -- it never advanced -- and the
+ * write's `off - pos` underflowed); the same message with ascending offsets renders. */
+static void test_image_offsets_out_of_order_refuse(void) {
+    const char *before = "first ", *mid = " then ", *after = " end";
+    std::string text = std::string(before) + PULSAR_IMAGE_PLACEHOLDER + mid + PULSAR_IMAGE_PLACEHOLDER + after;
+    const size_t a = strlen(before), b = a + strlen(PULSAR_IMAGE_PLACEHOLDER) + strlen(mid);
+    const size_t orders[3][2] = {{a, b}, {b, a}, {a, a}};   /* ascending, out of order, overlapping */
+    const pulsar_chat_format fmts[3] = {PULSAR_CHAT_DS4_V4, PULSAR_CHAT_DS4_V41, PULSAR_CHAT_QWEN};
+    for (int f = 0; f < 3; f++) {
+        for (int o = 0; o < 3; o++) {
+            chat_conversation c = {};
+            chat_msg m = qwen_test_msg("user", text.c_str());
+            chat_msg_add_image(&m, NULL, 0, orders[o][0]);
+            chat_msg_add_image(&m, NULL, 0, orders[o][1]);
+            chat_msgs_push(&c.msgs, m);
+            c.tool_choice = CHAT_TOOL_CHOICE_AUTO;
+            request r;
+            request_init(&r, REQ_CHAT, 128);
+            r.api = API_OPENAI;
+            char err[200] = {0};
+            const bool ok = render_chat_conversation(NULL, fmts[f], NULL, &c, &r, err, sizeof err);
+            if (o == 0) {
+                TEST_ASSERT(ok);
+            } else {
+                TEST_ASSERT(!ok);
+                TEST_ASSERT(strstr(err, "image 1 of a message") != NULL);
+                TEST_ASSERT(strstr(err, "out of order or overlapping") != NULL);
+            }
+            request_free(&r);
+            chat_conversation_free(&c);
+        }
+    }
+}
+
 /* Tool memory on Qwen: the parser records the turn's calls as sampled (whitespace and spelling the
  * template would normalise), the renderer replays them verbatim, and the block finder keys the run. */
 static void test_qwen_raw_calls_replay_verbatim(void) {
@@ -11791,6 +11826,7 @@ static void pulsar_server_unit_tests_run(void) {
     test_anthropic_live_tail_renders_tool_results_only();
     test_qwen_hooks_compose_to_the_full_render();
     test_qwen_tail_carries_a_tool_result_image();
+    test_image_offsets_out_of_order_refuse();
     test_qwen_raw_calls_replay_verbatim();
     test_qwen_forced_call_prefill_and_seed();
     test_forced_call_names_a_declared_tool();

@@ -328,6 +328,9 @@ static const server_effort_map k_effort_deepseek_v4 = {
 /// @return false + err when the conversation cannot be rendered
 static bool deepseek_render(pulsar_engine *e, server *s, chat_conversation *c, request *r, char *err,
                             size_t errlen) {
+    /* L335: the image offsets the Anthropic fold and the renderer walk, checked once before either reads them */
+    for (int i = 0; i < c->msgs.len; i++)
+        if (!chat_msg_image_offsets_check(&c->msgs.v[i], err, errlen)) return false;
     /* the tools block's schemas (deferred tools and tool_search loads render in place, chat_expand_tool_refs) */
     buf schemas = {0};
     conversation_tool_schema_lines(c, &schemas);
@@ -397,17 +400,14 @@ struct qwen_msg_images {
 /// @param out  receives the stripped content and the images' offsets
 /// @param err     receives the reason on false
 /// @param errlen  size of `err`
-/// @return false + err when an image's placeholder is not at its recorded offset
+/// @return false + err when an image's offset fails chat_msg_image_offsets_check
 static bool qwen_strip_image_markers(const chat_msg *m, qwen_msg_images *out, char *err, size_t errlen) {
+    if (!chat_msg_image_offsets_check(m, err, errlen)) return false;
     const char *c = m->content ? m->content : "";
     const size_t n = strlen(c), ph = strlen(PULSAR_IMAGE_PLACEHOLDER);
     size_t at = 0;
     for (int k = 0; k < m->images_len; k++) {
-        const size_t off = m->image_ph_off ? m->image_ph_off[k] : SIZE_MAX;
-        if (off < at || off > n || n - off < ph || memcmp(c + off, PULSAR_IMAGE_PLACEHOLDER, ph)) {
-            snprintf(err, errlen, "image %d of a message has no placeholder at its offset", k);
-            return false;
-        }
+        const size_t off = m->image_ph_off[k];
         out->content.append(c + at, off - at);
         out->at.push_back((uint32_t)out->content.size());
         at = off + ph;
