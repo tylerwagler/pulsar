@@ -1,6 +1,7 @@
 /** @file
  *  The DSpark drafter's kernels: Markov steps and chains (single and banked), confidence score, concat seeds. */
 #include "pulsar_cuda_internal.h"
+#include "pulsar_cuda_arch.cuh"   /* pulsar_cuda_smem_opt_in */
 
 /* L335 / L189: every precondition refusal below names its entry and the predicate that failed (they all returned 0
  * silently, so a refused drafter step was indistinguishable from a launch failure). */
@@ -119,8 +120,8 @@ static uint64_t dspark_markov_w2_bytes(int w2_fmt, uint32_t vocab_size, uint32_t
 /** @def PULSAR_CONF_LAUNCH(A, B)
  *  In pulsar_gpu_dspark_confidence_score_model: launches `dspark_confidence_score_kernel<A, B>`. */
 /** @def PULSAR_MARKOV_BANKS_LAUNCH(A, B)
- *  In dspark_markov_banks_launch: grants `dspark_markov_step_banks_kernel<A, B>` its shared memory once, then
- *  launches it. */
+ *  In dspark_markov_banks_launch: grants `dspark_markov_step_banks_kernel<A, B>` its shared memory (once per device),
+ *  then launches it. */
 
 /// Invokes LAUNCH(A, fmt) for the runtime w2_fmt; refuses the enclosing function (return 0, said) on an unknown format.
 #define PULSAR_MARKOV_DISPATCH(LAUNCH, A)                                       \
@@ -970,7 +971,7 @@ static int dspark_markov_banks_launch(
 
     int32_t *ids = (int32_t *)ids_dev->ptr;
     /* the banks' w1 rows in shared memory: up to 16 x 1024 f32 = 64 KB, past the
-     * 48 KB default, so the kernel opts in once per instantiation */
+     * 48 KB default, so the kernel opts in once per (instantiation, device) */
     const size_t smem = (size_t)n_banks * embed_dim * sizeof(float);
     const size_t smem_max = (size_t)PULSAR_DSPARK_BANKS_MAX * 1024u * sizeof(float);
     for (uint32_t pos = pos_first; pos < pos_first + pos_count; pos++) {
@@ -978,12 +979,11 @@ static int dspark_markov_banks_launch(
         const uint32_t prev_stride = prev_override ? 1u : ids_stride;
 #define PULSAR_MARKOV_BANKS_LAUNCH(A, B)                                    \
         do {                                                                \
-            static bool smem_set = false;                                   \
-            if (!smem_set) {                                                \
-                if (cudaFuncSetAttribute(dspark_markov_step_banks_kernel<A, B>, \
-                        cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem_max) != cudaSuccess) \
-                    return 0;                                               \
-                smem_set = true;                                            \
+            static int smem_set[PULSAR_CUDA_DEVICE_SLOTS] = {};   /* per device (L335) */ \
+            if (!pulsar_cuda_smem_opt_in((const void *)dspark_markov_step_banks_kernel<A, B>, smem_set, smem_max)) { \
+                fprintf(stderr, "pulsar: dspark banked markov: %zu B of shared memory refused by the device -- " \
+                                "refused\n", smem_max);                     \
+                return 0;                                                   \
             }                                                               \
             dspark_markov_step_banks_kernel<A, B><<<grid_dim, block_dim, smem>>>( \
                 (float *)refined_logits->ptr,                               \
