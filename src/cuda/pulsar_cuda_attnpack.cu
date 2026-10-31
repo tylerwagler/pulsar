@@ -168,24 +168,6 @@ int pulsar_gpu_attn_pack_store_tensor(pulsar_gpu_tensor *x, const pulsar_gpu_ten
     return cuda_ok(cudaGetLastError(), "0731 KV pack launch");
 }
 
-/* Quantise + store one row into a ring slot (raw_cap != 0): the single-row
- * decode store.  seq_id/positions are NULL -- the slot is `row % raw_cap`. */
-int pulsar_gpu_attn_pack_ring_store_tensor(pulsar_gpu_tensor *raw_cache, const pulsar_gpu_tensor *kv,
-                                           uint32_t raw_cap, uint32_t row, uint32_t head_dim) {
-    if (!raw_cache || !kv || raw_cap == 0 ||
-        raw_cache->bytes < (uint64_t)raw_cap * PULSAR_ATTN_PACK_ROWBYTES(head_dim) ||
-        kv->bytes < (uint64_t)head_dim * sizeof(float)) {
-        return 0;
-    }
-    /* x = NULL: kv is const here, so the row is packed WITHOUT the in-place
-     * round-trip the decode store does. */
-    attn_pack_store_kernel<<<1, 64>>>(NULL, (const float *)kv->ptr,
-                                      (uint8_t *)raw_cache->ptr,
-                                      row, 1u, head_dim, PULSAR_ATTN_PACK_NROT,
-                                      NULL, NULL, 1u, raw_cap);
-    return cuda_ok(cudaGetLastError(), "0731 raw pack store launch");
-}
-
 /* Quantise + store a batch into banked ring slots: the prefill store. */
 int pulsar_gpu_attn_pack_ring_store_batch_tensor(pulsar_gpu_tensor *raw_cache, const pulsar_gpu_tensor *kv,
                                                  uint32_t raw_cap, uint32_t pos0, uint32_t n_tokens,

@@ -334,15 +334,6 @@ __device__ static inline float attn_kv4_e2m1(uint32_t nib, float scale) {
  * contiguous store is declared in pulsar_gpu.h because tests/attn_pack_gate.cpp
  * grades it; the rest are reached only through pulsar_cuda_norm_kv.cu's
  * dispatchers, so no engine caller names a row family. */
-/** Quantises one f32 KV row into ring slot row % raw_cap (pulsar_cuda_attnpack.cu).
- *  @param raw_cache the ring, raw_cap rows of PULSAR_ATTN_PACK_ROWBYTES(head_dim)
- *  @param kv        f32 [head_dim] row
- *  @param raw_cap   ring rows (nonzero)
- *  @param row       the token position
- *  @param head_dim  the row width
- *  @return 1 launched, 0 refused or failed */
-int pulsar_gpu_attn_pack_ring_store_tensor(pulsar_gpu_tensor *raw_cache, const pulsar_gpu_tensor *kv,
-                                           uint32_t raw_cap, uint32_t row, uint32_t head_dim);
 /** Quantises a batch of f32 KV rows into (banked) ring slots: the prefill store.
  *  @param raw_cache the ring (n_banks banks of raw_cap rows with a descriptor, else one)
  *  @param kv        f32 [n_tokens][head_dim] rows
