@@ -79,23 +79,17 @@ static bool jb_putc(json_buf *b, char c) {
 /// Append `cp` as UTF-8; a surrogate or a value past U+10FFFF is written as U+FFFD.
 /// @param b  the buffer
 /// @param cp the codepoint
-static void utf8_put(json_buf *b, uint32_t cp) {
+/// @return false on allocation failure (the buffer then holds a partial sequence; the caller fails the string)
+static bool utf8_put(json_buf *b, uint32_t cp) {
     if (cp > 0x10ffff || (cp >= 0xd800 && cp <= 0xdfff)) cp = 0xfffd;
-    if (cp <= 0x7f) {
-        (void)jb_putc(b, (char)cp);
-    } else if (cp <= 0x7ff) {
-        (void)jb_putc(b, (char)(0xc0 | (cp >> 6)));
-        (void)jb_putc(b, (char)(0x80 | (cp & 0x3f)));
-    } else if (cp <= 0xffff) {
-        (void)jb_putc(b, (char)(0xe0 | (cp >> 12)));
-        (void)jb_putc(b, (char)(0x80 | ((cp >> 6) & 0x3f)));
-        (void)jb_putc(b, (char)(0x80 | (cp & 0x3f)));
-    } else {
-        (void)jb_putc(b, (char)(0xf0 | (cp >> 18)));
-        (void)jb_putc(b, (char)(0x80 | ((cp >> 12) & 0x3f)));
-        (void)jb_putc(b, (char)(0x80 | ((cp >> 6) & 0x3f)));
-        (void)jb_putc(b, (char)(0x80 | (cp & 0x3f)));
-    }
+    if (cp <= 0x7f) return jb_putc(b, (char)cp);
+    if (cp <= 0x7ff)
+        return jb_putc(b, (char)(0xc0 | (cp >> 6))) && jb_putc(b, (char)(0x80 | (cp & 0x3f)));
+    if (cp <= 0xffff)
+        return jb_putc(b, (char)(0xe0 | (cp >> 12))) && jb_putc(b, (char)(0x80 | ((cp >> 6) & 0x3f))) &&
+               jb_putc(b, (char)(0x80 | (cp & 0x3f)));
+    return jb_putc(b, (char)(0xf0 | (cp >> 18))) && jb_putc(b, (char)(0x80 | ((cp >> 12) & 0x3f))) &&
+           jb_putc(b, (char)(0x80 | ((cp >> 6) & 0x3f))) && jb_putc(b, (char)(0x80 | (cp & 0x3f)));
 }
 
 /// Read one `\uXXXX` escape at `*p`.
@@ -154,7 +148,7 @@ bool json_string_n(const char **p, char **out, size_t *out_len) {
                     cp = 0xfffd;
                 }
             }
-            utf8_put(&b, cp);
+            if (!utf8_put(&b, cp)) goto fail;
             break;
         }
         default:
