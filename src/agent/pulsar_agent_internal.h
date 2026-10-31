@@ -1365,8 +1365,9 @@ char *agent_session_title_from_text(const agent_turn_marks *marks, const char *t
  *  @return true on success */
 bool agent_worker_show_history(agent_worker *w, int user_turns,
                                       char *err, size_t err_len);
-/** Print resumable sessions from ~/.ds4/kvcache.  sysprompt.kv is intentionally
- * ignored because it is an implementation cache, not a user session.
+/** Print this model's resumable sessions: the `<sha>.session` files in the cache directory (~/.ds4/kvcache).  The
+ * segment store beside them (`segments/`, the system prompt's chain included) holds KV, not sessions, and is not
+ * listed.
  */
 /** @param w the worker (its cache_dir is scanned) */
 void agent_worker_list_sessions(agent_worker *w);
@@ -1841,8 +1842,8 @@ void editor_write_welcome_banner(agent_editor *editor,
                                         const agent_config *cfg,
                                         const char *prompt,
                                         const char *statusline);
-/** Initialize the worker, cache directory, sysprompt checkpoint path, trace file,
- * and model thread.  After this returns, all DS4 session mutation happens on
+/** Initialize the worker, cache directory, segment store (agent_kv_open), trace file,
+ * and model thread.  After this returns, all session mutation happens on
  * the worker thread.
  */
 /** @param w      the worker (zeroed here)

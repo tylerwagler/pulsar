@@ -1339,8 +1339,8 @@ void editor_write_welcome_banner(agent_editor *editor,
 
 
 
-/* Initialize the worker, cache directory, sysprompt checkpoint path, trace file,
- * and model thread.  After this returns, all DS4 session mutation happens on
+/* Initialize the worker, cache directory, segment store (agent_kv_open), trace file,
+ * and model thread.  After this returns, all session mutation happens on
  * the worker thread. */
 int agent_worker_init(agent_worker *w, pulsar_engine *engine, agent_config *cfg) {
     memset(w, 0, sizeof(*w));
