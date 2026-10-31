@@ -724,10 +724,8 @@ void chat_render_finish(buf *out, const chat_render *r) {
  * side channel, not a change to the prompt -- which is what keeps the renderer
  * gate, the KV keys and every persisted session valid. */
 char *render_chat_prompt_text_spans(const chat_msgs *msgs, const char *tool_schemas,
-                                    const tool_schema_orders *tool_orders,
                                     pulsar_think_mode think_mode, bool v41,
                                     chat_text_span **spans_out, uint32_t *n_spans_out) {
-    (void)tool_orders;
     if (spans_out) *spans_out = NULL;
     if (n_spans_out) *n_spans_out = 0;
     chat_render r;
@@ -810,14 +808,12 @@ char *render_chat_prompt_text_spans(const chat_msgs *msgs, const char *tool_sche
 /// render_chat_prompt_text_spans without the client-text ranges.
 /// @param msgs         the conversation
 /// @param tool_schemas the tool schema lines (may be NULL)
-/// @param tool_orders  the tools' schema property orders
 /// @param think_mode   the resolved think mode
 /// @param v41          the template variant
 /// @return the prompt text (malloc'd)
 char *render_chat_prompt_text(const chat_msgs *msgs, const char *tool_schemas,
-                              const tool_schema_orders *tool_orders,
                               pulsar_think_mode think_mode, bool v41) {
-    return render_chat_prompt_text_spans(msgs, tool_schemas, tool_orders, think_mode, v41, NULL, NULL);
+    return render_chat_prompt_text_spans(msgs, tool_schemas, think_mode, v41, NULL, NULL);
 }
 
 

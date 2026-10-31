@@ -791,7 +791,7 @@ bool openai_sse_finish(chat_sink *k, const tool_calls *calls, const char *finish
         buf_printf(&b, "data: {\"id\":\"%s\",\"object\":\"chat.completion.chunk\",\"created\":%ld,\"model\":", k->id, now);
         json_escape(&b, k->r->model);
         buf_puts(&b, ",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":");
-        append_tool_call_deltas_json(&b, calls, st->tools_streamed, k->id, &k->r->tool_orders);
+        append_tool_call_deltas_json(&b, calls, st->tools_streamed, k->id);
         buf_puts(&b, "},\"finish_reason\":null}]}\n\n");
     }
     return openai_sse_send_final(k->fd, k->r, k->id, now, &b, st->lp, finish, prompt_tokens, completion_tokens);

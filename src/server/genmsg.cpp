@@ -336,10 +336,7 @@ void append_json_object_string(buf *b, const char *json) {
 /// @param b          the buffer
 /// @param calls      the calls
 /// @param id_prefix  the id base for a call without one ("<prefix>_tool_<i>")
-/// @param orders     unused (kept for the signature)
-void append_tool_calls_json(buf *b, const tool_calls *calls, const char *id_prefix,
-                                   const tool_schema_orders *orders) {
-    (void)orders;
+void append_tool_calls_json(buf *b, const tool_calls *calls, const char *id_prefix) {
     buf_putc(b, '[');
     for (int i = 0; i < calls->len; i++) {
         const tool_call *tc = &calls->v[i];
@@ -364,10 +361,7 @@ void append_tool_calls_json(buf *b, const tool_calls *calls, const char *id_pref
 /// @param calls      the calls
 /// @param first      the first call to send (the ones before it went out as live deltas)
 /// @param id_prefix  the id base for a call without one ("<prefix>_tool_<i>")
-/// @param orders     unused (kept for the signature)
-void append_tool_call_deltas_json(buf *b, const tool_calls *calls, int first, const char *id_prefix,
-                                         const tool_schema_orders *orders) {
-    (void)orders;
+void append_tool_call_deltas_json(buf *b, const tool_calls *calls, int first, const char *id_prefix) {
     buf_putc(b, '[');
     for (int i = first; i < calls->len; i++) {
         const tool_call *tc = &calls->v[i];

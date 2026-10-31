@@ -2469,7 +2469,7 @@ static void test_control_token_spans(void) {
              "\"properties\":{}}}}", hostile);
     chat_text_span *vspans = NULL;
     uint32_t vn = 0;
-    char *vtext = render_chat_prompt_text_spans(&vmsgs, vtools, NULL, PULSAR_THINK_HIGH,
+    char *vtext = render_chat_prompt_text_spans(&vmsgs, vtools, PULSAR_THINK_HIGH,
                                                 false, &vspans, &vn);
     TEST_ASSERT(vtext != NULL && vspans != NULL && vn > 0);
     if (vtext && vspans) {
@@ -2625,7 +2625,7 @@ static bool twin_case_one(pulsar_engine *e, const char *name, const chat_msgs *m
                           bool has_system, pulsar_think_mode mode, bool v41) {
     chat_text_span *spans = NULL;
     uint32_t n_spans = 0;
-    char *text = render_chat_prompt_text_spans(msgs, NULL, NULL, mode, v41, &spans, &n_spans);
+    char *text = render_chat_prompt_text_spans(msgs, NULL, mode, v41, &spans, &n_spans);
     pulsar_tokens srv = {0};
     pulsar_tokenize_rendered_chat_spans(e, text, spans, n_spans, &srv);
 
@@ -3018,7 +3018,7 @@ static void test_render_bytes(void) {
                 chat_msgs m = {0};
                 render_bytes_build(render_bytes_cases[k].shape, &m);
                 const char *tools = render_bytes_cases[k].shape == 10 ? render_bytes_tools() : NULL;
-                char *text = render_chat_prompt_text(&m, tools, NULL, modes[t], v == 1);
+                char *text = render_chat_prompt_text(&m, tools, modes[t], v == 1);
                 TEST_ASSERT(text != NULL);
                 char tag[160];
                 snprintf(tag, sizeof tag, "v41=%d %-6s %s", v,
@@ -3128,9 +3128,9 @@ static void test_control_token_injection(void) {
 
     chat_text_span *spans = NULL;
     uint32_t n_spans = 0;
-    char *text = render_chat_prompt_text_spans(&msgs, tools, NULL, PULSAR_THINK_HIGH, true,
+    char *text = render_chat_prompt_text_spans(&msgs, tools, PULSAR_THINK_HIGH, true,
                                                &spans, &n_spans);
-    char *text_old = render_chat_prompt_text(&msgs, tools, NULL, PULSAR_THINK_HIGH, true);
+    char *text_old = render_chat_prompt_text(&msgs, tools, PULSAR_THINK_HIGH, true);
     TEST_ASSERT(text != NULL && text_old != NULL);
     if (text && text_old) {
         /* The rendered TEXT is unchanged, so the reference encoder's bytes, the

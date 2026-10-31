@@ -912,7 +912,7 @@ bool final_response(int fd,
         }
         if (calls && calls->len) {
             buf_puts(&b, ",\"tool_calls\":");
-            append_tool_calls_json(&b, calls, id, &r->tool_orders);
+            append_tool_calls_json(&b, calls, id);
         }
         buf_putc(&b, '}');
         /* Sibling of message/finish_reason inside the choice, as in the OpenAI

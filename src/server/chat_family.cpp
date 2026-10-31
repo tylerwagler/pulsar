@@ -342,9 +342,8 @@ static bool deepseek_render(pulsar_engine *e, server *s, chat_conversation *c, r
     free(r->prompt_spans);
     r->prompt_spans = NULL;
     r->prompt_n_spans = 0;
-    r->prompt_text = render_chat_prompt_text_spans(&c->msgs, r->has_tools ? schemas.ptr : NULL,
-                                                   &r->tool_orders, r->think_mode, r->family->v41,
-                                                   &r->prompt_spans, &r->prompt_n_spans);
+    r->prompt_text = render_chat_prompt_text_spans(&c->msgs, r->has_tools ? schemas.ptr : NULL, r->think_mode,
+                                                   r->family->v41, &r->prompt_spans, &r->prompt_n_spans);
     buf_free(&schemas);
     /* A required call (OpenAI "required" or a named function, Anthropic "any" or
      * "tool"): prefill the assistant turn into an open DSML tool_calls block --

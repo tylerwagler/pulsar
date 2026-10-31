@@ -3957,18 +3957,15 @@ char *render_live_tool_tail_spans(const chat_msgs *msgs, int start, bool tools_a
  * be NULL, in which case this is exactly the old entry. */
 /// @param msgs         the conversation
 /// @param tool_schemas  the tools block's schema lines (NULL or empty: none)
-/// @param tool_orders  each tool's declared argument order
 /// @param think_mode   the request's think mode
 /// @param v41  DeepSeek V4.1's template spelling (else V4 / 0731)
 /// @param spans_out    receives the client-data ranges (malloc'd; may be NULL)
 /// @param n_spans_out  receives their count (may be NULL)
 /// @return the malloc'd prompt text
 char *render_chat_prompt_text_spans(const chat_msgs *msgs, const char *tool_schemas,
-                                    const tool_schema_orders *tool_orders,
                                     pulsar_think_mode think_mode, bool v41,
                                     chat_text_span **spans_out, uint32_t *n_spans_out);
 char *render_chat_prompt_text(const chat_msgs *msgs, const char *tool_schemas,
-                                     const tool_schema_orders *tool_orders,
                                      pulsar_think_mode think_mode, bool v41 = true);
 void responses_prepare_live_continuation(request *r,
                                                 const chat_msgs *msgs);
@@ -4161,10 +4158,8 @@ bool turn_tool_retry_allowed(const struct gen_state *g);
 bool parser_finish_turn(server *s, struct session_slot *sl, struct gen_state *g, server_turn *out, bool broken,
                         const char *why, bool logged, size_t tail_from, bool ok);
 void append_json_object_string(buf *b, const char *json);
-void append_tool_calls_json(buf *b, const tool_calls *calls, const char *id_prefix,
-                                   const tool_schema_orders *orders);
-void append_tool_call_deltas_json(buf *b, const tool_calls *calls, int first, const char *id_prefix,
-                                         const tool_schema_orders *orders);
+void append_tool_calls_json(buf *b, const tool_calls *calls, const char *id_prefix);
+void append_tool_call_deltas_json(buf *b, const tool_calls *calls, int first, const char *id_prefix);
 bool http_response(int fd, int code, const char *type, const char *body);
 bool http_error(int fd, int code, const char *msg);
 /* Retry-After for a retryable 503, by cause: the box is going away
