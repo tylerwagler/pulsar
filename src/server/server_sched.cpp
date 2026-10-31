@@ -1,11 +1,11 @@
-/* Scheduler/worker (split move-only from generate.cpp): worker_main and its
+/* Scheduler/worker (split move-only from generate.cpp): server_worker_main and its
  * quantum loop (classic / batched / fused mixed-batch lanes), job->slot
  * routing (choose_slot_for_job) and enqueue, lazy provisioning + the
  * admission/ledger/mem-floor helpers, LRU eviction and the warm
  * make-room path, the proactive spill/restore guard, Tier-2 bank
  * switching, and the frontier/committed-pos readers. */
 /** @file
- *  The scheduler / worker: worker_main and its lanes, job-to-slot routing, provisioning, admission, eviction,
+ *  The scheduler / worker: server_worker_main and its lanes, job-to-slot routing, provisioning, admission, eviction,
  *  the spill / preempt guard and bank switching.
  */
 #include "pulsar_server_internal.h"
@@ -33,6 +33,10 @@
 
 bool server::enqueue(job *j) {
     auto *s = this;
+    /* L335: the family is the loaded engine's and the model the client's or the served id; request_init sets
+     * neither, so a path that skipped setting them dies here, by name, instead of running as some default */
+    if (!j->req.family) pulsar_die("server::enqueue: a request without its family (the parse never set it)");
+    if (!j->req.model) pulsar_die("server::enqueue: a request without its model id (never set from the engine)");
     pthread_mutex_lock(&s->mu);
     if (s->stopping) {
         pthread_mutex_unlock(&s->mu);
@@ -369,7 +373,7 @@ session_slot *server::provision_bank(provision_refusal *refusal) {
      * demand-page as it fills.
      * The FIRST bank is exempt: before the 2026-08-10 slot-0 rework it was
      * boot-provisioned and never floor-gated, and an empty-pool floor refusal
-     * is a hang — worker_main's wait predicate stays false (head queued,
+     * is a hang — server_worker_main's wait predicate stays false (head queued,
      * nothing active), so the worker hard-spins re-reading /proc/meminfo and
      * the first request never completes.  One bank's eager floor is small;
      * admission pressure on a tight box belongs to the SECOND bank onward. */
@@ -1058,13 +1062,6 @@ bool server::worker_eviction_could_help(const job *j,
 
 
 
-/* Evict one idle slot (LRU victim): snapshot to the disk kv cache when
- * possible, free the session, release the ledger, and leave the slot entry
- * (provisioned == false) for provision_slot to reuse. Failure honesty: a failed or
- * unavailable snapshot only costs the returning client a re-prefill — the
- * eviction itself proceeds, and the response always belongs to the right
- * conversation because the freed KV can never be read again. Returns false
- * when nothing is evictable. Worker thread only. */
 /* The eviction reset (L179 branch 11): the slot becomes a reusable hole --
  * unprovisioned, SLOT_EVICTED, no gen/job, no ctx, no ledger cost, no
  * scheduler bookkeeping, no continued-store watermark. Only these move: the
@@ -1090,6 +1087,13 @@ static int evict_reset_slot_fields(session_slot *sl) {
     return evicted_ctx;
 }
 
+/* Evict one idle slot (LRU victim): snapshot to the disk kv cache when
+ * possible, free the session, release the ledger, and leave the slot entry
+ * (provisioned == false) for provision_slot to reuse. Failure honesty: a failed or
+ * unavailable snapshot only costs the returning client a re-prefill — the
+ * eviction itself proceeds, and the response always belongs to the right
+ * conversation because the freed KV can never be read again. Returns false
+ * when nothing is evictable. Worker thread only. */
 bool server::worker_evict_one(bool protect[PULSAR_SESSION_POOL_CAP]) {
     PULSAR_NVTX_FN();
     auto *s = this;
@@ -1616,7 +1620,7 @@ bool server::worker_try_bind() {
     if (!sl && refusal == PROVISION_REFUSED_CREATE_FAIL) {
         /* The bank the pool offered could not be installed (provision_bank:
          * state restore refused).  Eviction does not relieve it and retrying
-         * every quantum would hard-spin on an empty pool (worker_main's wait
+         * every quantum would hard-spin on an empty pool (server_worker_main's wait
          * predicate), so answer the client with a 500 and pop the job, the
          * way the context-length reject above does. */
         s->note_provision_refusal(j, refusal);
@@ -4218,13 +4222,6 @@ bool server::batch_leave(session_slot *sl) {
     return true;
 }
 
-/* plan-34 phase-2 inc 5 — find ONE prefilling slot to FOLD into the fused mixed
- * quantum (P=1). Admissible = main-prefill (not cold), already past its FIRST chunk
- * (bank pos>0, so the driver's pos-0 reject is satisfied — the first chunk stays
- * classic), and with more than one fold-chunk of prompt still left (the FINAL tail
- * <= chunk stays classic; it carries the prefill->decode completion bookkeeping).
- * Its bank is necessarily DISTINCT from every decode bank (different phase). NULL
- * when the flag is off, not in pool mode, or nothing qualifies. */
 /* Deep-concurrent guard (see the enable block in cli_main.cpp): fusing a
  * prefill chunk into a decode quantum whose banks already read a deep
  * aggregate KV working set displaces bandwidth-saturated decode. Blocks while
@@ -4254,6 +4251,13 @@ static bool mixed_deep_guard_blocks(const session_slot *slots, int n_slots, int 
     return n_dec >= 2 && deep > (long)guard_rows;
 }
 
+/* plan-34 phase-2 inc 5 — find ONE prefilling slot to FOLD into the fused mixed
+ * quantum (P=1). Admissible = main-prefill (not cold), already past its FIRST chunk
+ * (bank pos>0, so the driver's pos-0 reject is satisfied — the first chunk stays
+ * classic), and with more than one fold-chunk of prompt still left (the FINAL tail
+ * <= chunk stays classic; it carries the prefill->decode completion bookkeeping).
+ * Its bank is necessarily DISTINCT from every decode bank (different phase). NULL
+ * when the flag is off, not in pool mode, or nothing qualifies. */
 session_slot *server::worker_find_fuse_prefill() {
     PULSAR_NVTX_FN();
     auto *s = this;
@@ -4621,7 +4625,12 @@ static bool slot_steppable_beside_fused(const session_slot *c) {
     return slot_steppable_beside_decode(c) && !slot_fusable_prefill(c);
 }
 
-void *worker_main(void *arg) {
+/// @brief The worker thread: the one thread that drives the engine -- it binds queued jobs to slots and steps
+///        their generations a quantum at a time until the server stops (pulsar_server_internal.h, the CUDA-state
+///        audit).
+/// @param arg the server
+/// @return NULL
+void *server_worker_main(void *arg) {
     server *s = (server *)arg;
     __atomic_store_n(&s->worker_tid, (int)syscall(SYS_gettid), __ATOMIC_RELAXED);   /* the stall dump's /proc */
     int rr = 0; /* round-robin cursor: first slot index to consider next */

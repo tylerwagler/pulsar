@@ -1624,6 +1624,17 @@ bool gen_streams_plain(const gen_state *g) {
     return g->j->req.stream && !g->structured_stream;
 }
 
+/// @brief Whether the tool-call greedy override can change a draw: a chat with tools, a parser, temperature > 0.
+/// @param g  the generation state
+/// @return true when the per-position override must be computed (gen_spec_greedy_rows_text)
+static bool gen_tool_override_varies(const gen_state *g) {
+    const request *req = &g->j->req;
+    float temperature, top_p, min_p;
+    int top_k;
+    gen_resolve_sampling(req, &temperature, &top_k, &top_p, &min_p);
+    return req->kind == REQ_CHAT && req->has_tools && g->parser_st && temperature > 0.0f;
+}
+
 /* L296 toolsample: gen_resolve_sampling_decode's tool-call override at EVERY position of a speculative round, as the
  * plain lane evaluates it token by token (emit a token, resolve, draw the next).  pieces[0..n) are the texts of the
  * round's tokens the stream has not taken yet, in order -- the base unless it was streamed before the forward
@@ -1636,18 +1647,6 @@ bool gen_streams_plain(const gen_state *g) {
  * tokens before it are emitted.  Past a token that ends the stream (a stop token, a stop sequence) nothing is
  * emitted: those bits repeat the last, and the server never streams the rows they govern.  0 for a request the
  * override never touches (not a chat with tools) or that is greedy throughout. */
-/// @brief Whether the tool-call greedy override can change a draw: a chat with tools, a parser, temperature > 0.
-///        (The block comment above describes gen_spec_greedy_rows_text, which this gates.)
-/// @param g  the generation state
-/// @return true when the per-position override must be computed
-static bool gen_tool_override_varies(const gen_state *g) {
-    const request *req = &g->j->req;
-    float temperature, top_p, min_p;
-    int top_k;
-    gen_resolve_sampling(req, &temperature, &top_k, &top_p, &min_p);
-    return req->kind == REQ_CHAT && req->has_tools && g->parser_st && temperature > 0.0f;
-}
-
 uint32_t gen_spec_greedy_rows_text(const gen_state *g, const char *const *pieces, const size_t *piece_lens, int n,
                                    bool base_emitted) {
     if (!gen_tool_override_varies(g)) return 0u;
@@ -1756,7 +1755,7 @@ bool server::gen_emit_token(session_slot *sl, int token) {
                                           &hit_stop, &stop_pos, &stop_len);
 
     if (gen_streams_plain(g) && stream_len > g->plain_stream_pos) {
-        char *delta = xstrndup(g->text.ptr + g->plain_stream_pos, stream_len - g->plain_stream_pos);
+        char *delta = server_xstrndup(g->text.ptr + g->plain_stream_pos, stream_len - g->plain_stream_pos);
         bool ok = sse_chunk(j->fd, &j->req, g->id, delta, NULL);
         free(delta);
         if (!ok) {
@@ -1793,7 +1792,7 @@ bool server::gen_emit_token(session_slot *sl, int token) {
 
     if (hit_stop) {
         free(g->stop_sequence);
-        g->stop_sequence = xstrndup(g->text.ptr + stop_pos, stop_len);
+        g->stop_sequence = server_xstrndup(g->text.ptr + stop_pos, stop_len);
         g->finish = "stop";
         g->text.len = stop_pos;
         g->text.ptr[g->text.len] = '\0';
@@ -1870,7 +1869,7 @@ void server::gen_step_finish(session_slot *sl) {
     }
 
     if (j->req.stream && !g->structured_stream && g->text.len > g->plain_stream_pos) {
-        char *tail = xstrndup(g->text.ptr + g->plain_stream_pos, g->text.len - g->plain_stream_pos);
+        char *tail = server_xstrndup(g->text.ptr + g->plain_stream_pos, g->text.len - g->plain_stream_pos);
         if (!sse_chunk(j->fd, &j->req, g->id, tail, NULL)) g->finish = "error";
         free(tail);
     }

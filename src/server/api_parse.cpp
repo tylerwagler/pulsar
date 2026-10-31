@@ -164,7 +164,8 @@ static const char *chat_control_key(const char *key) {
 /// @param anthropic  the Messages API: check its server-tool entries first
 /// @param err        receives the reason on refusal
 /// @param errlen     size of `err`
-/// @return false when the array is malformed or names an unsupported tool
+/// @return false when the array is malformed, names an unsupported tool or holds a function schema that does not
+///         canonicalize (parse_tools_value)
 static bool take_tools(const char **p, chat_conversation *c, request *r, bool anthropic, char *err,
                        size_t errlen) {
     char *raw = NULL;
@@ -178,7 +179,7 @@ static bool take_tools(const char **p, chat_conversation *c, request *r, bool an
     free(c->deferred_tool_schemas);
     c->deferred_tool_schemas = NULL;
     const char *tp = raw;
-    if (!parse_tools_value(&tp, &c->tool_schemas, &r->tool_orders, &c->deferred_tool_schemas)) {
+    if (!parse_tools_value(&tp, &c->tool_schemas, &r->tool_orders, &c->deferred_tool_schemas, err, errlen)) {
         free(raw);
         return false;
     }
@@ -508,7 +509,7 @@ bool parse_chat_conversation_anthropic(const char *body, chat_conversation *c, r
     /* The system FIELD renders in the system region (chat_msg::system_field). */
     if (system && system[0]) {
         chat_msg msg = {0};
-        msg.role = xstrdup("system");
+        msg.role = server_xstrdup("system");
         msg.content = system;
         msg.system_field = true;
         system = NULL;
@@ -564,7 +565,7 @@ static bool parse_responses_content_array(const char **p, char **out, chat_msg *
     json_ws(p);
     if (**p == '"') return json_string(p, out);
     if (json_lit(p, "null")) {
-        *out = xstrdup("");
+        *out = server_xstrdup("");
         return true;
     }
     if (**p != '[') {
@@ -621,7 +622,7 @@ static bool parse_responses_content_array(const char **p, char **out, chat_msg *
                      * upstream serializers that emit null for empty blocks. */
                     json_ws(p);
                     if (json_lit(p, "null")) {
-                        text = xstrdup("");
+                        text = server_xstrdup("");
                     } else if (!json_string(p, &text)) {
                         free(key);
                         free(type);
@@ -1093,15 +1094,15 @@ item_fail:
             !strcmp(t, "compaction") || !strcmp(t, "context_compaction");
         if (!consumes_reasoning && !is_bookkeeping && pending_reasoning.len) {
             chat_msg flush_msg = {0};
-            flush_msg.role = xstrdup("assistant");
-            flush_msg.content = xstrdup("");
+            flush_msg.role = server_xstrdup("assistant");
+            flush_msg.content = server_xstrdup("");
             flush_msg.reasoning = buf_take(&pending_reasoning);
             chat_msgs_push(msgs, flush_msg);
         }
         if (!strcmp(t, "message")) {
             chat_msg msg = {0};
-            msg.role = xstrdup(role ? role : "user");
-            msg.content = content ? content : xstrdup("");
+            msg.role = server_xstrdup(role ? role : "user");
+            msg.content = content ? content : server_xstrdup("");
             content = NULL;
             /* Adopt the item's images: they belong to this message, and each
              * block's placeholder already sits in `content` at its position.
@@ -1122,14 +1123,14 @@ item_fail:
             chat_msgs_push(msgs, msg);
         } else if (!strcmp(t, "function_call") || !strcmp(t, "custom_tool_call")) {
             tool_call tc = {0};
-            tc.id = xstrdup(call_id ? call_id : item_id ? item_id : "");
+            tc.id = server_xstrdup(call_id ? call_id : item_id ? item_id : "");
             /* function_call uses `arguments` (JSON string); custom_tool_call uses
              * `input` (free text). Treat both as the same on-wire argument blob —
              * append_dsml_arguments_from_json will fall back to a single text param
              * if the value isn't a JSON object. */
             const char *args_src = arguments ? arguments :
                                    input_str ? input_str : "{}";
-            tc.arguments = xstrdup(args_src);
+            tc.arguments = server_xstrdup(args_src);
             if (strcmp(t, "custom_tool_call") && tool_namespace && tool_namespace[0] &&
                 name && name[0])
             {
@@ -1138,7 +1139,7 @@ item_fail:
                 buf_puts(&qualified, name);
                 tc.name = buf_take(&qualified);
             } else {
-                tc.name = xstrdup(name ? name : "");
+                tc.name = server_xstrdup(name ? name : "");
             }
             /* A Responses turn that has both message text and tool calls splits
              * them across separate output items; the chat template renders the
@@ -1154,16 +1155,16 @@ item_fail:
                 tool_calls_push(&last->calls, tc);
             } else {
                 chat_msg msg = {0};
-                msg.role = xstrdup("assistant");
-                msg.content = xstrdup("");
+                msg.role = server_xstrdup("assistant");
+                msg.content = server_xstrdup("");
                 if (pending_reasoning.len) msg.reasoning = buf_take(&pending_reasoning);
                 tool_calls_push(&msg.calls, tc);
                 chat_msgs_push(msgs, msg);
             }
         } else if (!strcmp(t, "function_call_output") || !strcmp(t, "custom_tool_call_output")) {
             chat_msg msg = {0};
-            msg.role = xstrdup("tool");
-            msg.content = output ? output : xstrdup("");
+            msg.role = server_xstrdup("tool");
+            msg.content = output ? output : server_xstrdup("");
             output = NULL;
             if (call_id || item_id) {
                 chat_msg_add_tool_call_id(&msg, call_id ? call_id : item_id);
@@ -1188,18 +1189,18 @@ item_fail:
              * model used them in a prior turn. Surface them as function_call
              * shaped history so the next prompt retains the action that ran. */
             tool_call tc = {0};
-            tc.id = xstrdup(call_id ? call_id : item_id ? item_id : "");
+            tc.id = server_xstrdup(call_id ? call_id : item_id ? item_id : "");
             if (!strcmp(t, "tool_search_call")) {
-                tc.name = xstrdup("tool_search");
+                tc.name = server_xstrdup("tool_search");
             } else if (!strcmp(t, "local_shell_call")) {
-                tc.name = xstrdup("local_shell");
+                tc.name = server_xstrdup("local_shell");
             } else {
-                tc.name = xstrdup(t);
+                tc.name = server_xstrdup(t);
             }
             const char *args_src = action ? action :
                                    arguments ? arguments :
                                    input_str ? input_str : "{}";
-            tc.arguments = xstrdup(args_src);
+            tc.arguments = server_xstrdup(args_src);
             chat_msg *last = msgs->len ? &msgs->v[msgs->len - 1] : NULL;
             if (last && !strcmp(last->role, "assistant")) {
                 if (pending_reasoning.len && (!last->reasoning || !last->reasoning[0])) {
@@ -1209,8 +1210,8 @@ item_fail:
                 tool_calls_push(&last->calls, tc);
             } else {
                 chat_msg msg = {0};
-                msg.role = xstrdup("assistant");
-                msg.content = xstrdup("");
+                msg.role = server_xstrdup("assistant");
+                msg.content = server_xstrdup("");
                 if (pending_reasoning.len) msg.reasoning = buf_take(&pending_reasoning);
                 tool_calls_push(&msg.calls, tc);
                 chat_msgs_push(msgs, msg);
@@ -1224,7 +1225,7 @@ item_fail:
             char *schemas = NULL;
             if (!strcmp(t, "tool_search_output") && tools_json) {
                 const char *tools_p = tools_json;
-                if (!parse_tools_value(&tools_p, &schemas, orders)) {
+                if (!parse_tools_value(&tools_p, &schemas, orders, NULL, err, errlen)) {
                     free(schemas);
                     free(type);
                     free(role);
@@ -1250,16 +1251,16 @@ item_fail:
                 }
             }
             chat_msg msg = {0};
-            msg.role = xstrdup("tool");
+            msg.role = server_xstrdup("tool");
             /* a tool_search_output's tools are its loads (above): their definitions render at its references */
             const char *body = output ? output :
                                result ? result :
                                tools_json && !schemas ? tools_json : "";
-            msg.content = xstrdup(body);
+            msg.content = server_xstrdup(body);
             for (const char *at = schemas ? schemas : ""; *at;) {
                 const char *nl = strchr(at, '\n');
                 const size_t len = nl ? (size_t)(nl - at) : strlen(at);
-                char *line = xstrndup(at, len);
+                char *line = server_xstrndup(at, len);
                 at += len + (nl ? 1 : 0);
                 char *raw = json_object_member_raw(line, "name");
                 const char *rp = raw;
@@ -1330,8 +1331,8 @@ item_fail:
      * a reasoning-only incomplete turn and the client replays the history. */
     if (pending_reasoning.len) {
         chat_msg msg = {0};
-        msg.role = xstrdup("assistant");
-        msg.content = xstrdup("");
+        msg.role = server_xstrdup("assistant");
+        msg.content = server_xstrdup("");
         msg.reasoning = buf_take(&pending_reasoning);
         chat_msgs_push(msgs, msg);
     }
@@ -1447,7 +1448,7 @@ bool parse_chat_conversation_responses(const char *body, chat_conversation *c, r
                 ok = json_string(&p, &plain);
                 if (ok) {
                     chat_msg msg = {0};
-                    msg.role = xstrdup("user");
+                    msg.role = server_xstrdup("user");
                     msg.content = plain;
                     chat_msgs_push(&c->msgs, msg);
                 }
@@ -1459,7 +1460,7 @@ bool parse_chat_conversation_responses(const char *body, chat_conversation *c, r
             free(instructions);
             instructions = NULL;
             json_ws(&p);
-            if (json_lit(&p, "null")) instructions = xstrdup("");
+            if (json_lit(&p, "null")) instructions = server_xstrdup("");
             else ok = json_string(&p, &instructions);
         } else if (!strcmp(key, "tools")) {
             ok = take_tools(&p, c, r, false, err, errlen);
@@ -1561,7 +1562,7 @@ bool parse_chat_conversation_responses(const char *body, chat_conversation *c, r
      * FIELD, so render produces a standard system+chat layout. */
     if (instructions && instructions[0]) {
         chat_msg msg = {0};
-        msg.role = xstrdup("system");
+        msg.role = server_xstrdup("system");
         msg.content = instructions;
         msg.system_field = true;
         instructions = NULL;
@@ -1608,12 +1609,17 @@ bool parse_responses_request(pulsar_engine *e, server *s, const char *body, int 
 
 
 
-/// Read a completions "prompt": a string, or the first string of an array (later elements skipped); any other
-/// value reads as "".
-/// @param p    the parse cursor, at the value (advanced past it)
-/// @param out  receives the prompt (malloc'd; NULL on failure)
-/// @return false on malformed JSON
-static bool parse_prompt(const char **p, char **out) {
+/* L335: the OpenAI completions "prompt" is a string, an array of strings (a BATCH: one choice per prompt), or
+ * token ids (an array of integers, or of integer arrays).  This server answers one prompt, as text: a string, or an
+ * array holding exactly one string.  Every other shape refuses by name -- it used to read as "" (a non-string) or as
+ * its first element (the rest of a batch dropped). */
+/// Read a completions "prompt": a string, or an array of exactly one string.
+/// @param p       the parse cursor, at the value (advanced past it)
+/// @param out     receives the prompt (malloc'd; NULL on failure)
+/// @param err     receives the reason for a refused shape (NULL: not written; left as is on malformed JSON)
+/// @param errlen  size of `err`
+/// @return false on malformed JSON, or (+ err) a prompt that is not one string
+static bool parse_prompt(const char **p, char **out, char *err, size_t errlen) {
     /* Build into a local and publish to *out only on success, so every
      * failure return leaves *out == NULL (the double-free contract, see
      * json_string_n) rather than a partially-parsed heap value. */
@@ -1621,27 +1627,26 @@ static bool parse_prompt(const char **p, char **out) {
     json_ws(p);
     if (**p == '"') return json_string(p, out);
     if (**p != '[') {
-        if (!json_skip_value(p)) return false;
-        *out = xstrdup("");
-        return true;
+        if (err && errlen) snprintf(err, errlen, "prompt must be a string (or an array of one string)");
+        return false;
     }
     (*p)++;
     json_ws(p);
-    char *s = NULL;
-    if (**p == '"') {
-        if (!json_string(p, &s)) return false;
-    } else {
-        s = xstrdup("");
-        if (**p && **p != ']' && !json_skip_value(p)) { free(s); return false; }
+    if (**p != '"') {
+        if (err && errlen)
+            snprintf(err, errlen, **p == ']' ? "prompt is an empty array: send one string"
+                                             : "prompt: token-id prompts are not supported; send the text as a string");
+        return false;
     }
-    while (**p && **p != ']') {
-        json_ws(p);
-        if (**p == ',') {
-            (*p)++;
-            if (!json_skip_value(p)) { free(s); return false; }
-        } else {
-            break;
-        }
+    char *s = NULL;
+    if (!json_string(p, &s)) return false;
+    json_ws(p);
+    if (**p == ',') {
+        if (err && errlen)
+            snprintf(err, errlen, "prompt: an array of more than one prompt is a batch, and batch completions are not "
+                     "supported (send one request per prompt)");
+        free(s);
+        return false;
     }
     if (**p != ']') { free(s); return false; }
     (*p)++;
@@ -1663,6 +1668,7 @@ bool parse_completion_request(pulsar_engine *e, const char *body, int def_tokens
                                      request *r, char *err, size_t errlen) {
     request_init(r, REQ_COMPLETION, def_tokens);
     r->family = server_family_for_engine(e);
+    if (errlen) err[0] = '\0';
     const char *p = body;
     char *prompt = NULL;
     int skr = 0;
@@ -1686,7 +1692,7 @@ bool parse_completion_request(pulsar_engine *e, const char *body, int def_tokens
         p++;
         if (!strcmp(key, "prompt")) {
             free(prompt);
-            if (!parse_prompt(&p, &prompt)) {
+            if (!parse_prompt(&p, &prompt, err, errlen)) {
                 free(key);
                 goto bad;
             }
@@ -1806,7 +1812,7 @@ bool parse_completion_request(pulsar_engine *e, const char *body, int def_tokens
 bad:
     for (int i = 0; i < n_controls; i++) free(controls[i].raw);
     free(prompt);
-    snprintf(err, errlen, "invalid JSON request");
+    if (!err[0]) snprintf(err, errlen, "invalid JSON request");   /* a refusal that named its reason keeps it */
     request_free(r);
     return false;
 }

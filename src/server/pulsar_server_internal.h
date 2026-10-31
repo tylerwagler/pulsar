@@ -846,7 +846,7 @@ typedef struct request {
      * keeps pulsar_session_sync() as its exact path.  `bytes` are owned. */
     pulsar_image_ref *images;  ///< owned, `n_images` entries
     int n_images;              ///< images in the request
-    char *model;               ///< model name to serve, owned
+    char *model;               ///< model name to serve, owned (NULL until the parse or http_server sets it)
     bool model_from_request;   ///< the client named the model (vs the server default)
     stop_list stops;           ///< client-supplied stop sequences
     char *raw_body;            ///< the original request body, owned; kept for tracing and replay
@@ -927,8 +927,8 @@ typedef struct request {
     tool_replay_stats tool_replay;            ///< what the replay matched, for logging and metrics
     /** L272 P3: the loaded model's template family -- the server's per-family table (server_family_ops,
      *  chat_family.cpp).  Every per-family branch reads one of its fields; a parser that holds the engine
-     *  sets it from the engine (server_family_for_engine), request_init defaults it to the compile-time
-     *  profile's (DeepSeek V4.1) so hand-built requests keep that profile's bytes.  Never NULL. */
+     *  sets it from the engine (render_chat_conversation, server_family_for_engine).  request_init leaves it
+     *  NULL (L335: no DeepSeek default); server::enqueue dies on a request that reaches the queue without it. */
     const struct server_family_ops *family;
     /** The family's level from its effort map (L295 F5: Qwen's qwen_effort, Inkling's hundredths; a DeepSeek
      *  level is its think_mode); written by chat_resolve_thinking, read by family->render. */
@@ -1490,13 +1490,13 @@ typedef struct {
  * PROCESS-GLOBAL CUDA STATE AUDIT (Tier 1 §1.5 — must-do, read before growing
  * the pool or adding GPU threads).
  *
- * All GPU work in this server runs on the SINGLE worker thread (worker_main in
+ * All GPU work in this server runs on the SINGLE worker thread (server_worker_main in
  * generate.cpp). Client threads only parse HTTP and block on a per-job condvar
  * until the worker finishes (http_server.cpp handle path); they never touch a
  * pulsar_session_* or pulsar_gpu_* entry point. Verified by grepping every
  * pulsar_session_/pulsar_gpu_ call site under src/server: all of them are reached
  * only from the generation state machine (gen_* in generate.cpp) driven by
- * worker_main (or from cli_main startup/shutdown, before the worker starts and
+ * server_worker_main (or from cli_main startup/shutdown, before the worker starts and
  * after it joins) — with two deliberate exceptions, both plain loads of data
  * immutable after startup (no CUDA behind them): http_server.cpp reads
  * pulsar_session_ctx(server.sess) on client threads, and client paths read the
@@ -1944,7 +1944,9 @@ struct server {
     pulsar_session *sess;
     /** L303: the grammar compiler over the loaded vocabulary and every token's bytes (pulsar_token_text over
      *  the logits width), built on the first constrained request (constrain.cpp, under its own lock) and
-     *  immutable after; freed at shutdown.  Pointers, so the struct stays memset-clean. */
+     *  immutable after; freed at shutdown.  Pointers, so the struct stays memset-clean.  L335: written once --
+     *  `token_bytes` first, then `grammar` by a release store that publishes both (client threads read it with
+     *  an acquire load, constrain_compiler_published); a second build dies. */
     struct pulsar_grammar_compiler *grammar;
     /// every token's bytes, indexed by token id (built with `grammar`; owned, freed at shutdown)
     std::vector<std::string> *token_bytes;
@@ -2010,7 +2012,7 @@ struct server {
     double       guard_avail_at;         ///< when it was read (server_now_sec); re-read at most every 0.25 s
     KvBytes      guard_budget_said;      ///< the live budget last logged (a move of 0.5 GiB or more is said)
     /** The stall watchdog (watchdog.cpp).  `stall_s` is written by the watchdog and read by /health (__atomic);
-     *  `worker_tid` / `worker_thread` are set by worker_main for the dump. */
+     *  For the dump, `worker_tid` is set by server_worker_main and `worker_thread` by cli_main after pthread_create. */
     int          stall_limit_s;          ///< PULSAR_STALL_WATCHDOG_S (0 = off)
     int64_t      stall_s;                ///< seconds the worker has been stalled (0 = progressing)
     int          worker_tid;             ///< the worker's kernel thread id
@@ -3678,10 +3680,10 @@ void stop_signal_handler(int sig);
 void die(const char *msg);
 void *server_xmalloc(size_t n);
 void *server_xrealloc(void *p, size_t n);
-char *xstrdup(const char *s);
+char *server_xstrdup(const char *s);
 bool random_bytes(void *dst, size_t len);
 void pulsar_die(const char *msg);  ///< engine util.cpp; aborts the process
-char *xstrndup(const char *s, size_t n);
+char *server_xstrndup(const char *s, size_t n);
 void buf_append(buf *b, const void *p, size_t n);
 void buf_putc(buf *b, char c);
 /** Append a NUL-terminated string.  Nearly every renderer and emitter calls it, so its caller graph is
@@ -3718,10 +3720,11 @@ void random_tool_id(char *dst, size_t dstlen, api_style api);
 /** `prefix` + 2*nbytes lowercase hex from the OS RNG; dies when no RNG is
  * available (ids must never be predictable).  The ONE id generator: tool-call,
  * Responses item and chat/completion ids all come from here (L192 item 7). */
-/// @param dst     receives the id (NUL-terminated, truncated to `dstlen`)
-/// @param dstlen  size of `dst`
+/// @param dst     receives the id (NUL-terminated)
+/// @param dstlen  size of `dst`: at least strlen(prefix) + 2 * nbytes + 1 (L335: smaller dies; the id used to be
+///                shortened silently)
 /// @param prefix  the id's prefix ("call_", "resp_", ...)
-/// @param nbytes  random bytes, at most 16
+/// @param nbytes  random bytes, at most 16 (L335: more dies; it used to be capped at 16 silently)
 void random_prefixed_id(char *dst, size_t dstlen, const char *prefix, size_t nbytes);
 void tool_calls_free(tool_calls *calls);
 void tool_calls_push(tool_calls *calls, tool_call tc);
@@ -3732,6 +3735,12 @@ void chat_msg_add_tool_call_id(chat_msg *m, const char *id);
 /// @param len              its length, bytes
 /// @param placeholder_off  the placeholder's byte offset in m->content
 void chat_msg_add_image(chat_msg *m, uint8_t *bytes, size_t len, size_t placeholder_off);
+/** L335: every image's placeholder sits at its recorded offset, the offsets ascending without overlap. */
+/// @param m       the message (its content, images_len and image_ph_off)
+/// @param err     receives the reason on false
+/// @param errlen  size of `err`
+/// @return false + err when an offset misses its placeholder or is behind the previous placeholder's end
+bool chat_msg_image_offsets_check(const chat_msg *m, char *err, size_t errlen);
 /** L325: record a tool_reference to `name` at byte `off` of the message's content (chat_msg::tool_ref_off). */
 /// @param m     the message
 /// @param off   the byte offset in m->content
@@ -3782,8 +3791,12 @@ bool anthropic_tools_supported(const char *tools_json, char *err, size_t errlen)
 /// @param out       receives the schema lines (malloc'd)
 /// @param orders    receives each tool's declared argument order
 /// @param deferred  receives the deferred tools' lines (malloc'd; NULL when not wanted)
-/// @return false for a malformed tools value
-bool parse_tools_value(const char **p, char **out, tool_schema_orders *orders, char **deferred = NULL);
+/// @param err       receives the reason when a tool's schema does not canonicalize (NULL: not written)
+/// @param errlen    size of `err`
+/// @return false for a malformed tools value, or (+ err) a schema the canonicalizer refuses (an OpenAI "function"
+///         or an Anthropic-shaped entry)
+bool parse_tools_value(const char **p, char **out, tool_schema_orders *orders, char **deferred = NULL,
+                       char *err = NULL, size_t errlen = 0);
 struct chat_conversation;
 /** L284: every tool the conversation offers, one function schema a line -- the tools array (parse_tools_value,
  *  every protocol's dialect: functions, Responses namespaces and tool_search, Anthropic-shaped) without its deferred
@@ -3946,18 +3959,15 @@ char *render_live_tool_tail_spans(const chat_msgs *msgs, int start, bool tools_a
  * be NULL, in which case this is exactly the old entry. */
 /// @param msgs         the conversation
 /// @param tool_schemas  the tools block's schema lines (NULL or empty: none)
-/// @param tool_orders  each tool's declared argument order
 /// @param think_mode   the request's think mode
 /// @param v41  DeepSeek V4.1's template spelling (else V4 / 0731)
 /// @param spans_out    receives the client-data ranges (malloc'd; may be NULL)
 /// @param n_spans_out  receives their count (may be NULL)
 /// @return the malloc'd prompt text
 char *render_chat_prompt_text_spans(const chat_msgs *msgs, const char *tool_schemas,
-                                    const tool_schema_orders *tool_orders,
                                     pulsar_think_mode think_mode, bool v41,
                                     chat_text_span **spans_out, uint32_t *n_spans_out);
 char *render_chat_prompt_text(const chat_msgs *msgs, const char *tool_schemas,
-                                     const tool_schema_orders *tool_orders,
                                      pulsar_think_mode think_mode, bool v41 = true);
 void responses_prepare_live_continuation(request *r,
                                                 const chat_msgs *msgs);
@@ -4150,10 +4160,8 @@ bool turn_tool_retry_allowed(const struct gen_state *g);
 bool parser_finish_turn(server *s, struct session_slot *sl, struct gen_state *g, server_turn *out, bool broken,
                         const char *why, bool logged, size_t tail_from, bool ok);
 void append_json_object_string(buf *b, const char *json);
-void append_tool_calls_json(buf *b, const tool_calls *calls, const char *id_prefix,
-                                   const tool_schema_orders *orders);
-void append_tool_call_deltas_json(buf *b, const tool_calls *calls, const char *id_prefix,
-                                         const tool_schema_orders *orders);
+void append_tool_calls_json(buf *b, const tool_calls *calls, const char *id_prefix);
+void append_tool_call_deltas_json(buf *b, const tool_calls *calls, int first, const char *id_prefix);
 bool http_response(int fd, int code, const char *type, const char *body);
 bool http_error(int fd, int code, const char *msg);
 /* Retry-After for a retryable 503, by cause: the box is going away
@@ -4617,7 +4625,7 @@ char *build_responses_visible_assistant_suffix_spans(const request *r,
                                                      const tool_calls *calls,
                                                      chat_text_span **spans_out,
                                                      uint32_t *n_spans_out);
-void *worker_main(void *arg);
+void *server_worker_main(void *arg);
 /* Job-lifecycle entry points (server_jobs.cpp), driven by the scheduler/
  * worker (server_sched.cpp): bind/step/unbind plus the three per-token
  * helpers the batched and fused mixed-batch quanta share with the classic
@@ -4701,7 +4709,6 @@ int encode_serve(pulsar_engine *const *engines, int n, const server_config *cfg)
 int listen_on(const char *host, int port);
 void configure_client_socket(int fd);
 void set_client_socket_nonblocking(int fd);
-void usage(FILE *fp, const char *topic);
 
 /* ---- shared inline helpers ---- */
 

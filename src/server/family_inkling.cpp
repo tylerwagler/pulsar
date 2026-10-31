@@ -127,7 +127,7 @@ char *inkling_take_render(const inkling_render_out &out, chat_text_span **spans_
             memcpy(*spans_out, out.spans.data(), out.spans.size() * sizeof(chat_text_span));
         }
     }
-    return xstrndup(out.text.data(), out.text.size());
+    return server_xstrndup(out.text.data(), out.text.size());
 }
 
 /* vLLM's render_inkling_messages over the request: the tools (OpenAI's array) declared in the leading system block,
@@ -301,8 +301,8 @@ char *inkling_tool_error_suffix(const request *r, const thinking_state *, const 
     if (!system.empty()) text += "\n\nSystem prompt reminder:\n" + system;
     chat_msgs msgs = {0};
     chat_msg result = {0};
-    result.role = xstrdup("tool");
-    result.content = xstrdup(text.c_str());
+    result.role = server_xstrdup("tool");
+    result.content = server_xstrdup(text.c_str());
     chat_msgs_push(&msgs, result);
     char *suffix = inkling_tool_result_tail(r, &msgs, 0, spans_out, n_spans_out);
     chat_msgs_free(&msgs);
@@ -341,7 +341,7 @@ static char *inkling_tool_defs_text(const char *lines, size_t len, char *err, si
     inkling_render_out out;
     const bool ok = inkling_chat_tool_defs(json, &out, err, errlen);
     free(json);
-    return ok ? xstrndup(out.text.data(), out.text.size()) : NULL;
+    return ok ? server_xstrndup(out.text.data(), out.text.size()) : NULL;
 }
 
 const server_family_ops k_family_inkling = {

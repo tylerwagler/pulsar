@@ -106,7 +106,7 @@ char *nemotron_take_render(const nemotron_render_out &out, chat_text_span **span
             memcpy(*spans_out, out.spans.data(), out.spans.size() * sizeof(chat_text_span));
         }
     }
-    return xstrndup(out.text.data(), out.text.size());
+    return server_xstrndup(out.text.data(), out.text.size());
 }
 
 /* ---- a forced tool_choice: "thinking skipped, a call opened" in the template's spelling ------------------------
@@ -310,8 +310,8 @@ char *nemotron_tool_error_suffix(const request *r, const thinking_state *, const
     if (!system.empty()) text += "\n\nSystem prompt reminder:\n" + system;
     chat_msgs msgs = {0};
     chat_msg result = {0};
-    result.role = xstrdup("tool");
-    result.content = xstrdup(text.c_str());
+    result.role = server_xstrdup("tool");
+    result.content = server_xstrdup(text.c_str());
     chat_msgs_push(&msgs, result);
     char *suffix = nemotron_tool_result_tail(r, &msgs, 0, spans_out, n_spans_out);
     chat_msgs_free(&msgs);
@@ -333,7 +333,7 @@ static char *nemotron_tool_defs_text(const char *lines, size_t len, char *err, s
     nemotron_render_out out;
     const bool ok = nemotron_chat_tool_defs(json, &out, err, errlen);
     free(json);
-    return ok ? xstrndup(out.text.data(), out.text.size()) : NULL;
+    return ok ? server_xstrndup(out.text.data(), out.text.size()) : NULL;
 }
 
 const server_family_ops k_family_nemotron_h = {

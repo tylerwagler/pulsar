@@ -148,7 +148,7 @@ static int effort_row_nearest(int value) {
 /// @param a    receives level (a column, -1 for none / an integer) and value (the integer, 0 for none)
 /// @param err     receives the reason on false
 /// @param errlen  size of `err`
-/// @return false on a malformed value (err set, except on a JSON syntax error)
+/// @return false + err on a malformed value (a JSON syntax error included, L335)
 static bool effort_value(const char **p, const char *key, chat_effort_ask *a, char *err, size_t errlen) {
     json_ws(p);
     if (json_lit(p, "null")) {
@@ -158,7 +158,10 @@ static bool effort_value(const char **p, const char *key, chat_effort_ask *a, ch
     }
     if (**p == '"') {
         char *name = NULL;
-        if (!json_string(p, &name)) return false;
+        if (!json_string(p, &name)) {
+            snprintf(err, errlen, "%s: a malformed JSON string", key);
+            return false;
+        }
         const int row = effort_row(name);
         if (row < 0)
             snprintf(err, errlen, "%s: \"%.40s\" is not an effort -- send none, minimal, low, medium, high, xhigh, "
@@ -181,14 +184,20 @@ static bool effort_value(const char **p, const char *key, chat_effort_ask *a, ch
 }
 
 /// One boolean thinking switch: null (not sent) or true / false.
-/// @param p  the JSON cursor, advanced past the value
-/// @param a  receives thinking (1 / 0) when one was sent
-/// @return false on a value that is neither null nor a bool
-static bool thinking_bool(const char **p, chat_effort_ask *a) {
+/// @param p       the JSON cursor, advanced past the value
+/// @param key     the control's name, for the error
+/// @param a       receives thinking (1 / 0) when one was sent
+/// @param err     receives the reason on false (L335: it used to be left empty)
+/// @param errlen  size of `err`
+/// @return false + err on a value that is neither null nor a bool
+static bool thinking_bool(const char **p, const char *key, chat_effort_ask *a, char *err, size_t errlen) {
     json_ws(p);
     if (json_lit(p, "null")) return true;
     bool on = true;
-    if (!json_bool(p, &on)) return false;
+    if (!json_bool(p, &on)) {
+        snprintf(err, errlen, "%s: must be true, false or null", key);
+        return false;
+    }
     a->thinking = on ? 1 : 0;
     return true;
 }
@@ -210,7 +219,7 @@ bool chat_effort_ask_read(const chat_control *controls, int n, chat_effort_ask *
                 a->thinking = on ? 1 : 0;
             }
         } else if (!strcmp(k, "think") || !strcmp(k, "enable_thinking")) {
-            ok = thinking_bool(&q, a);
+            ok = thinking_bool(&q, k, a, err, errlen);
         } else if (!strcmp(k, "reasoning_effort") || !strcmp(k, "reasoning.effort")) {
             ok = effort_value(&q, k, a, err, errlen);
         } else if (!strcmp(k, "output_config")) {
@@ -231,7 +240,7 @@ bool chat_effort_ask_read(const chat_control *controls, int n, chat_effort_ask *
                     ok = ok && *q == ':';
                     if (ok) q++;
                     if (ok && !strcmp(kk, "enable_thinking")) {
-                        ok = thinking_bool(&q, a);
+                        ok = thinking_bool(&q, "chat_template_kwargs.enable_thinking", a, err, errlen);
                     } else if (ok && !strcmp(kk, "reasoning_effort")) {
                         ok = effort_value(&q, "chat_template_kwargs.reasoning_effort", a, err, errlen);
                     } else if (ok) {
@@ -328,6 +337,9 @@ static const server_effort_map k_effort_deepseek_v4 = {
 /// @return false + err when the conversation cannot be rendered
 static bool deepseek_render(pulsar_engine *e, server *s, chat_conversation *c, request *r, char *err,
                             size_t errlen) {
+    /* L335: the image offsets the Anthropic fold and the renderer walk, checked once before either reads them */
+    for (int i = 0; i < c->msgs.len; i++)
+        if (!chat_msg_image_offsets_check(&c->msgs.v[i], err, errlen)) return false;
     /* the tools block's schemas (deferred tools and tool_search loads render in place, chat_expand_tool_refs) */
     buf schemas = {0};
     conversation_tool_schema_lines(c, &schemas);
@@ -339,9 +351,8 @@ static bool deepseek_render(pulsar_engine *e, server *s, chat_conversation *c, r
     free(r->prompt_spans);
     r->prompt_spans = NULL;
     r->prompt_n_spans = 0;
-    r->prompt_text = render_chat_prompt_text_spans(&c->msgs, r->has_tools ? schemas.ptr : NULL,
-                                                   &r->tool_orders, r->think_mode, r->family->v41,
-                                                   &r->prompt_spans, &r->prompt_n_spans);
+    r->prompt_text = render_chat_prompt_text_spans(&c->msgs, r->has_tools ? schemas.ptr : NULL, r->think_mode,
+                                                   r->family->v41, &r->prompt_spans, &r->prompt_n_spans);
     buf_free(&schemas);
     /* A required call (OpenAI "required" or a named function, Anthropic "any" or
      * "tool"): prefill the assistant turn into an open DSML tool_calls block --
@@ -397,17 +408,14 @@ struct qwen_msg_images {
 /// @param out  receives the stripped content and the images' offsets
 /// @param err     receives the reason on false
 /// @param errlen  size of `err`
-/// @return false + err when an image's placeholder is not at its recorded offset
+/// @return false + err when an image's offset fails chat_msg_image_offsets_check
 static bool qwen_strip_image_markers(const chat_msg *m, qwen_msg_images *out, char *err, size_t errlen) {
+    if (!chat_msg_image_offsets_check(m, err, errlen)) return false;
     const char *c = m->content ? m->content : "";
     const size_t n = strlen(c), ph = strlen(PULSAR_IMAGE_PLACEHOLDER);
     size_t at = 0;
     for (int k = 0; k < m->images_len; k++) {
-        const size_t off = m->image_ph_off ? m->image_ph_off[k] : SIZE_MAX;
-        if (off < at || off > n || n - off < ph || memcmp(c + off, PULSAR_IMAGE_PLACEHOLDER, ph)) {
-            snprintf(err, errlen, "image %d of a message has no placeholder at its offset", k);
-            return false;
-        }
+        const size_t off = m->image_ph_off[k];
         out->content.append(c + at, off - at);
         out->at.push_back((uint32_t)out->content.size());
         at = off + ph;
@@ -477,7 +485,7 @@ static char *qwen_take_render(qwen_render_out *out, chat_text_span **spans_out, 
             memcpy(*spans_out, out->spans.data(), out->spans.size() * sizeof(chat_text_span));
         }
     }
-    return xstrndup(out->text.data(), out->text.size());
+    return server_xstrndup(out->text.data(), out->text.size());
 }
 
 /* The tools of a family whose template takes OpenAI's tools array (Qwen, Inkling): none with tool_choice none; an
@@ -496,8 +504,8 @@ bool chat_openai_tools_json(const chat_conversation *c, request *r, char **head_
     const bool deferred = c->deferred_tool_schemas && c->deferred_tool_schemas[0];
     /* HF's input as sent -- unless some tool is deferred (L325), which only the schema lines separate */
     if (r->api == API_OPENAI && c->tools_raw && !deferred) {
-        r->tools_json = xstrdup(c->tools_raw);
-        *head_json = xstrdup(c->tools_raw);
+        r->tools_json = server_xstrdup(c->tools_raw);
+        *head_json = server_xstrdup(c->tools_raw);
         return true;
     }
     buf head = {0}, all = {0};
@@ -519,7 +527,7 @@ bool chat_openai_tools_json(const chat_conversation *c, request *r, char **head_
 /// @param lines   one function schema a line (parse_tools_value)
 /// @param len     bytes at `lines`
 /// @return a copy of the lines (malloc'd); never fails
-static char *deepseek_tool_defs_text(const char *lines, size_t len, char *, size_t) { return xstrndup(lines, len); }
+static char *deepseek_tool_defs_text(const char *lines, size_t len, char *, size_t) { return server_xstrndup(lines, len); }
 
 /* Qwen's: the tools block's entries inside <tools></tools> (qwen_chat_tool_defs). */
 /// server_family_ops::tool_defs_text for Qwen.
@@ -534,7 +542,7 @@ static char *qwen_tool_defs_text(const char *lines, size_t len, char *err, size_
     qwen_render_out out;
     const bool ok = qwen_chat_tool_defs(json, &out, err, errlen);
     free(json);
-    return ok ? xstrndup(out.text.data(), out.text.size()) : NULL;
+    return ok ? server_xstrndup(out.text.data(), out.text.size()) : NULL;
 }
 
 /* The deferred tool `name`'s schema line (malloc'd), or NULL when the request defers no tool of that name. */
@@ -553,7 +561,7 @@ static char *deferred_tool_line(const chat_conversation *c, const char *name) {
         const bool hit = rp && json_string(&rp, &got) && !strcmp(got, name);
         free(got);
         free(raw);
-        if (hit) return xstrdup(line.c_str());
+        if (hit) return server_xstrdup(line.c_str());
     }
     return NULL;
 }
@@ -626,7 +634,7 @@ bool chat_expand_tool_refs(chat_conversation *c, const request *r, char *err, si
         for (int q = 0; q < m->images_len; q++) m->image_ph_off[q] = moved[(size_t)q];
         free(m->content);
         m->content = buf_take(&out);
-        if (!m->content) m->content = xstrdup("");
+        if (!m->content) m->content = server_xstrdup("");
         chat_msg_clear_tool_refs(m);
     }
     return true;
@@ -742,7 +750,7 @@ static char *qwen_rendered_system_region(const char *prompt) {
     const char *end = strstr(p, "<|im_end|>");
     if (!end) return NULL;
     while (end > p && isspace((unsigned char)end[-1])) end--;
-    return xstrndup(p, (size_t)(end - p));
+    return server_xstrndup(p, (size_t)(end - p));
 }
 
 /// server_family_ops::tool_error_suffix for Qwen: one tool result naming the error, with the system region reminded.
@@ -769,7 +777,7 @@ static char *qwen_tool_error_suffix(const request *r, const thinking_state *, co
     }
     chat_msgs msgs = {0};
     chat_msg result = {0};
-    result.role = xstrdup("tool");
+    result.role = server_xstrdup("tool");
     result.content = buf_take(&text);
     chat_msgs_push(&msgs, result);
     char *suffix = qwen_tool_result_tail(r, &msgs, 0, spans_out, n_spans_out);

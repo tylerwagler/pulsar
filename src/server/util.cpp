@@ -67,7 +67,10 @@ void *server_xrealloc(void *p, size_t n) {
 
 
 
-char *xstrdup(const char *s) {
+/// @brief A malloc'd copy of a C string (dies on out of memory, like server_xmalloc).
+/// @param s the string (not NULL)
+/// @return the copy (never NULL)
+char *server_xstrdup(const char *s) {
     size_t n = strlen(s);
     char *p = (char *)server_xmalloc(n + 1);
     memcpy(p, s, n + 1);
@@ -110,7 +113,11 @@ bool random_bytes(void *dst, size_t len) {
 
 
 
-char *xstrndup(const char *s, size_t n) {
+/// @brief A malloc'd, NUL-terminated copy of the first `n` bytes of `s` (dies on out of memory).
+/// @param s the bytes (at least `n`)
+/// @param n bytes to copy
+/// @return the copy (never NULL)
+char *server_xstrndup(const char *s, size_t n) {
     char *p = (char *)server_xmalloc(n + 1);
     memcpy(p, s, n);
     p[n] = '\0';
@@ -199,7 +206,7 @@ char *buf_take(buf *b) {
      * so taking the bytes drops them.  A caller that needs them (the chat
      * renderer) copies them out BEFORE this call. */
     free(b->spans);
-    if (!b->ptr) { memset(b, 0, sizeof(*b)); return xstrdup(""); }
+    if (!b->ptr) { memset(b, 0, sizeof(*b)); return server_xstrdup(""); }
     char *p = b->ptr;
     memset(b, 0, sizeof(*b));
     return p;
@@ -232,7 +239,7 @@ char *json_minify_raw_value(const char *json) {
     const char *p = json ? json : "null";
     json_ws(&p);
     const char *start = p;
-    if (!json_skip_value(&p)) return xstrdup(json ? json : "null");
+    if (!json_skip_value(&p)) return server_xstrdup(json ? json : "null");
     const char *end = p;
 
     buf b = {0};
@@ -427,12 +434,12 @@ char *json_python_dumps_raw_value(const char *json) {
     buf b = {0};
     if (!py_json_value(&p, &b)) {
         buf_free(&b);
-        return xstrdup(json ? json : "null");
+        return server_xstrdup(json ? json : "null");
     }
     json_ws(&p);
     if (*p) {
         buf_free(&b);
-        return xstrdup(json);
+        return server_xstrdup(json);
     }
     return buf_take(&b);
 }
@@ -451,12 +458,12 @@ bool json_content(const char **p, char **out) {
     json_ws(p);
     if (**p == '"') return json_string(p, out);
     if (json_lit(p, "null")) {
-        *out = xstrdup("");
+        *out = server_xstrdup("");
         return true;
     }
     if (**p != '[') {
         if (!json_skip_value(p)) return false;
-        *out = xstrdup("");
+        *out = server_xstrdup("");
         return true;
     }
 

@@ -5,23 +5,42 @@
 
 
 
+/* L335: the reason phrase of every status the server sends (200, 204, 400, 404, 409, 429, 500, 503 --
+ * 429 is in the table for the admission paths that may send it, no path does today).  A status outside
+ * the table is a server bug, not a client's: http_write dies on it rather than send "<code> Error". */
+/// The RFC 9110 reason phrase of an HTTP status the server sends.
+/// @param code  the HTTP status
+/// @return the phrase, or NULL for a status outside the server's table
+static const char *http_reason(int code) {
+    switch (code) {
+    case 200: return "OK";
+    case 204: return "No Content";
+    case 400: return "Bad Request";
+    case 404: return "Not Found";
+    case 409: return "Conflict";
+    case 429: return "Too Many Requests";
+    case 500: return "Internal Server Error";
+    case 503: return "Service Unavailable";
+    default: return NULL;
+    }
+}
+
 /* Writes one complete response.  `extra` is NULL or pre-formatted
  * "Name: value\r\n" lines, placed before Connection. */
 /// Write one complete HTTP response with optional extra header lines (Connection: close).
 /// @param fd     the client socket
-/// @param code   the HTTP status (the reason phrase covers 200/204/400/404/409/500; anything else says "Error")
+/// @param code   the HTTP status (one http_reason knows; any other dies)
 /// @param type   the Content-Type (NULL or empty: none)
 /// @param body   the body, NUL-terminated (NULL: empty)
 /// @param extra  extra header lines, or NULL
 /// @return false when a write failed
 static bool http_write(int fd, int code, const char *type, const char *body,
                        const char *extra) {
-    const char *reason = code == 200 ? "OK" :
-                         code == 204 ? "No Content" :
-                         code == 400 ? "Bad Request" :
-                         code == 404 ? "Not Found" :
-                         code == 409 ? "Conflict" :
-                         code == 500 ? "Internal Server Error" : "Error";
+    const char *reason = http_reason(code);
+    if (!reason) {
+        fprintf(stderr, "pulsar-server: http_write: status %d has no reason phrase in http_reason\n", code);
+        pulsar_die("http_write: a status outside the server's table");
+    }
     const size_t body_len = body ? strlen(body) : 0;
     buf h = {0};
     buf_printf(&h,
@@ -753,10 +772,12 @@ static bool openai_sse_send_final(int fd, const request *r, const char *id, long
 
 
 /* The end of the stream: the calls no delta carried yet (a block the final
- * parse recovered), then the closing chunk, usage and [DONE]. */
+ * parse recovered, or the calls after the ones streamed live), then the closing
+ * chunk, usage and [DONE]. */
 /// End an OpenAI chat stream: calls no delta carried, the closing chunk, usage and [DONE].
 /// @param k                  the OpenAI sink
-/// @param calls              the turn's calls (sent whole only when no call was streamed live)
+/// @param calls              the turn's calls: those past openai_stream::tools_streamed are sent whole, each once,
+///                           under its own index (as the Anthropic finish sends the calls past its count)
 /// @param finish             the finish_reason
 /// @param prompt_tokens      the prompt's tokens
 /// @param completion_tokens  the tokens generated
@@ -766,11 +787,11 @@ bool openai_sse_finish(chat_sink *k, const tool_calls *calls, const char *finish
     const openai_stream *st = (const openai_stream *)k->st;
     buf b = {0};
     long now = (long)time(NULL);
-    if (calls && calls->len && !st->tools_streamed) {
+    if (calls && calls->len > st->tools_streamed) {
         buf_printf(&b, "data: {\"id\":\"%s\",\"object\":\"chat.completion.chunk\",\"created\":%ld,\"model\":", k->id, now);
         json_escape(&b, k->r->model);
         buf_puts(&b, ",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":");
-        append_tool_call_deltas_json(&b, calls, k->id, &k->r->tool_orders);
+        append_tool_call_deltas_json(&b, calls, st->tools_streamed, k->id);
         buf_puts(&b, "},\"finish_reason\":null}]}\n\n");
     }
     return openai_sse_send_final(k->fd, k->r, k->id, now, &b, st->lp, finish, prompt_tokens, completion_tokens);

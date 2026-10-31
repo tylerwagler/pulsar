@@ -77,7 +77,7 @@ bool id_list_contains(const stop_list *ids, const char *id) {
 /// @param id   the id
 void id_list_push_unique(stop_list *ids, const char *id) {
     if (!ids || !id || !id[0] || id_list_contains(ids, id)) return;
-    stop_list_push(ids, xstrdup(id));
+    stop_list_push(ids, server_xstrdup(id));
 }
 
 
@@ -304,7 +304,7 @@ bool kv_cache_open(kv_disk_cache *kc, const char *dir, uint64_t budget_mb, uint3
     kc->opt = opt;
     kc->st = pulsar_segstore_open(dir, budget_mb << 20, identity, kv_seg_log, NULL);
     if (!kc->st) return false;
-    kc->dir = xstrdup(dir);
+    kc->dir = server_xstrdup(dir);
     kc->enabled = true;
     return true;
 }
@@ -766,7 +766,7 @@ int server::kv_restore_finish(kv_restore *r, const char *text, const pulsar_text
                                                        effective_prompt);
         free(tail);
     }
-    if (loaded_key_out) *loaded_key_out = xstrdup(chain[n - 1].key);
+    if (loaded_key_out) *loaded_key_out = server_xstrdup(chain[n - 1].key);
     server_log(PULSAR_LOG_KVCACHE,
                "pulsar-server: kv cache hit%s chain of %d to %u (text %llu of %zu bytes) load=%.1f ms in %d slice%s "
                "(longest %.1f ms)",

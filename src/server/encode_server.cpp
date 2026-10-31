@@ -122,6 +122,29 @@ bool opt_str(const pyjson_value &o, const char *key, const std::string **out) {
     return !v || v->kind == pyjson_value::STR;
 }
 
+/* L335: the request's "dimensions", compared as a NUMBER: 1024 and 1024.0 are the same request (a JSON serializer
+ * may spell an integral float either way); a non-integral or non-numeric value is refused as such, and an integral
+ * one other than the model's width as that. */
+/** @param d   the "dimensions" member (NULL: absent, accepted)
+ *  @param dim the model's embedding width
+ *  @param err the 400 message on failure
+ *  @return false when present and not the integer `dim` */
+bool read_dimensions(const pyjson_value *d, uint32_t dim, std::string *err) {
+    if (!d) return true;
+    const bool integral = d->kind == pyjson_value::INT ||
+                          (d->kind == pyjson_value::FLOAT && isfinite(d->f) && d->f == floor(d->f));
+    if (!integral) {
+        *err = "\"dimensions\" must be an integer";
+        return false;
+    }
+    const bool same = d->kind == pyjson_value::INT ? d->num == std::to_string(dim) : d->f == (double)dim;
+    if (!same) {
+        *err = "\"dimensions\": this model returns " + std::to_string(dim) + " only";
+        return false;
+    }
+    return true;
+}
+
 /* the request's truncate: NONE (refuse an over-long input) or END (keep its first cap tokens) */
 /** @param o the request object
  *  @param cut set true for END
@@ -198,8 +221,8 @@ void embeddings(const enc_ctx *c, int fd, const pyjson_value &o) {
         http_error(fd, 400, "\"encoding_format\" must be \"float\" or \"base64\"");
         return;
     }
-    if (const pyjson_value *d = o.get("dimensions"); d && !(d->kind == pyjson_value::INT && d->num == std::to_string(c->dim))) {
-        http_error(fd, 400, ("\"dimensions\": this model returns " + std::to_string(c->dim) + " only").c_str());
+    if (!read_dimensions(o.get("dimensions"), c->dim, &err)) {
+        http_error(fd, 400, err.c_str());
         return;
     }
     if (!read_truncate(o, &cut, &err)) {
