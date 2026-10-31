@@ -447,15 +447,15 @@ static bool tool_has_topic(pulsar_help_tool tool, const char *topic) {
 /// Print one "More Info" row, cycling through the accent colours on a TTY.
 /// @param fp    the sink
 /// @param c     the colour set
+/// @param row   in: the row's index in its section (0 = the first), which picks the colour; out: the next row's
 /// @param label the row's label
 /// @param topic the topic its `--help TOPIC` names
-static void more_line(FILE *fp, const help_colors *c, const char *label, const char *topic) {
+static void more_line(FILE *fp, const help_colors *c, size_t *row, const char *label, const char *topic) {
     static const char *colors[] = {
         "\x1b[38;5;81m", "\x1b[38;5;114m", "\x1b[38;5;179m",
         "\x1b[38;5;141m", "\x1b[38;5;147m"
     };
-    static size_t idx;
-    const char *on = c->cyan ? colors[idx++ % (sizeof(colors) / sizeof(colors[0]))] : "";
+    const char *on = c->cyan ? colors[(*row)++ % (sizeof(colors) / sizeof(colors[0]))] : "";
     if (streq(label, "Interactive commands:") && c->red) on = c->red;
     const char *off = c->off ? c->off : "";
     fprintf(fp, "    %s%-26s%s --help %s\n", on, label, off, topic);
@@ -467,25 +467,26 @@ static void more_line(FILE *fp, const help_colors *c, const char *label, const c
 /// @param tool the binary
 static void print_more_info(FILE *fp, const help_colors *c, pulsar_help_tool tool) {
     title(fp, c, "More Info");
-    more_line(fp, c, "Runtime full info:", "runtime");
+    size_t row = 0;
+    more_line(fp, c, &row, "Runtime full info:", "runtime");
     if (tool_has_topic(tool, "sampling"))
-        more_line(fp, c, "Sampling full info:", "sampling");
+        more_line(fp, c, &row, "Sampling full info:", "sampling");
     if (tool_has_topic(tool, "steering"))
-        more_line(fp, c, "Steering full info:", "steering");
+        more_line(fp, c, &row, "Steering full info:", "steering");
     if (tool == PULSAR_HELP_DS4) {
-        more_line(fp, c, "Interactive commands:", "commands");
-        more_line(fp, c, "Diagnostics:", "diagnostics");
+        more_line(fp, c, &row, "Interactive commands:", "commands");
+        more_line(fp, c, &row, "Diagnostics:", "diagnostics");
     } else if (tool == PULSAR_HELP_SERVER) {
-        more_line(fp, c, "HTTP API:", "api");
-        more_line(fp, c, "Disk KV cache:", "kv-cache");
-        more_line(fp, c, "Thinking behavior:", "thinking");
+        more_line(fp, c, &row, "HTTP API:", "api");
+        more_line(fp, c, &row, "Disk KV cache:", "kv-cache");
+        more_line(fp, c, &row, "Thinking behavior:", "thinking");
     } else if (tool == PULSAR_HELP_AGENT) {
-        more_line(fp, c, "Agent sessions & commands:", "commands");
-        more_line(fp, c, "Agent tool system:", "tools");
+        more_line(fp, c, &row, "Agent sessions & commands:", "commands");
+        more_line(fp, c, &row, "Agent tool system:", "tools");
     } else if (tool == PULSAR_HELP_BENCH) {
-        more_line(fp, c, "Benchmark sweep:", "benchmark");
+        more_line(fp, c, &row, "Benchmark sweep:", "benchmark");
     } else if (tool == PULSAR_HELP_EVAL) {
-        more_line(fp, c, "Evaluation options:", "evaluation");
+        more_line(fp, c, &row, "Evaluation options:", "evaluation");
     }
     fputc('\n', fp);
 }
