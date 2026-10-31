@@ -2412,7 +2412,7 @@ static void test_control_token_spans(void) {
 
     request r;
     char err[160];
-    if (!parse_chat_request_render(NULL, NULL, body, 64, &r, err, sizeof err)) {
+    if (!parse_chat_request_render(NULL, PULSAR_CHAT_DS4_V41, NULL, body, 64, &r, err, sizeof err)) {
         fprintf(stderr, "control-token-spans: request refused: %s\n", err);
         TEST_ASSERT(!"control-token-spans: the probe request must parse");
         return;
@@ -3198,7 +3198,7 @@ static void test_control_token_injection(void) {
         char rerr[160];
         const bool ok = leg == 2
             ? parse_completion_request(e, cbody, 64, &rr, rerr, sizeof rerr)
-            : parse_chat_request_render(e, NULL, leg == 0 ? rbody : rbody_forced, 64,
+            : parse_chat_request_render(e, pulsar_engine_chat_format(e), NULL, leg == 0 ? rbody : rbody_forced, 64,
                                         &rr, rerr, sizeof rerr);
         if (!ok) {
             fprintf(stderr, "control-token-injection: leg %d refused: %s\n", leg, rerr);
@@ -3349,7 +3349,7 @@ static void test_control_token_suffix(void) {
                  "{\"role\":\"user\",\"content\":\"ask\"}]}", sys_hostile);
         request r;
         char err[160];
-        if (!parse_chat_request_render(NULL, NULL, body, 64, &r, err, sizeof err)) {
+        if (!parse_chat_request_render(NULL, PULSAR_CHAT_DS4_V41, NULL, body, 64, &r, err, sizeof err)) {
             TEST_ASSERT(!"control-token-suffix: the reminder probe must parse");
         } else {
             r.think_mode = PULSAR_THINK_HIGH;
@@ -3420,7 +3420,7 @@ static void test_control_token_suffix(void) {
                  hostile);
         request r;
         char err[160];
-        if (!parse_chat_request_render(NULL, NULL, body, 64, &r, err, sizeof err)) {
+        if (!parse_chat_request_render(NULL, PULSAR_CHAT_DS4_V41, NULL, body, 64, &r, err, sizeof err)) {
             TEST_ASSERT(!"control-token-suffix: the composite probe must parse");
         } else {
             r.think_mode = PULSAR_THINK_HIGH;
@@ -4070,6 +4070,18 @@ static void test_refusal_once(void) {
     for (uint32_t i = 0; i < n; i++) TEST_ASSERT(pulsar_refusal_first(ops[i]));
     TEST_ASSERT(!pulsar_refusal_first(ops[0]));       /* remembered: said once */
     TEST_ASSERT(pulsar_refusal_first(ops[n - 1u]));   /* past the table: said again, not dropped */
+}
+
+/* L335: no engine is no family -- the engine facts never answer DeepSeek for NULL (they did: V4.1 and "DeepSeek"),
+ * and a completion parsed without an engine carries no family (the server's enqueue refuses one). */
+static void test_no_engine_no_family(void) {
+    TEST_ASSERT(pulsar_engine_chat_format(NULL) == PULSAR_CHAT_NONE);
+    TEST_ASSERT(!strcmp(pulsar_engine_family_name(NULL), "(no engine)"));
+    request r;
+    char err[256] = "";
+    TEST_ASSERT(parse_completion_request(NULL, "{\"prompt\": \"hi\"}", 16, &r, err, sizeof err));
+    TEST_ASSERT(r.family == NULL);
+    request_free(&r);
 }
 
 /* L335: the state plan's decl table (state_kinds.cpp) filled past PULSAR_STATE_DECLS_MAX -- the add counts the
@@ -5072,6 +5084,7 @@ static const pulsar_test_entry test_entries[] = {
     {"--bf16-convert", "bf16-convert", "the host f32 -> bf16 converter over every float bit pattern: finite values as before, NaN stays NaN (L335)", test_bf16_from_f32},
     {"--tokenizer-refusals", "tokenizer-refusals", "the tokenizer and chat entries refuse a family without them by name and return their failure values, never exit (L335)", test_tokenizer_refusals},
     {"--refusal-once", "refusal-once", "the library's say-once refusal table: once per op, every refusal said past its bound (L335)", test_refusal_once},
+    {"--no-engine-family", "no-engine-family", "no engine is no family: the engine facts and a no-engine parse never default to DeepSeek (L335)", test_no_engine_no_family},
     {"--state-plan", "state-plan", "the state plan's decl table: a full table counts the overflow and the create refuses it by name (L335)", test_state_plan_overflow},
     {"--ckpt-records", "ckpt-records", "the record pool (prompt ends, message endpoints: capture, match, LRU, frontier rule) and the endpoint cut (L311)", test_ckpt_records},
     {"--verify-pick", "verify-pick", "the verify pick: the brute-force argmax on a staircase curve, the robust online correction, the lockstep continuation (L301); the copy estimate's re-probe (L308)", test_verify_pick},

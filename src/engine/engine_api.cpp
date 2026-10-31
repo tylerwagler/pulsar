@@ -290,10 +290,15 @@ pulsar_family_id pulsar_engine_family(const pulsar_engine *e) {
     return e ? e->family->id : PULSAR_FAMILY_ID_DEEPSEEK4;
 }
 pulsar_chat_format pulsar_engine_chat_format(const pulsar_engine *e) {
-    return e ? e->family->chat_format(e) : PULSAR_CHAT_DS4_V41;
+    if (e) return e->family->chat_format(e);
+    /* L335: no engine is no family -- never DeepSeek V4.1 by default (rule 1); a caller rendering without an
+     * engine names its format itself */
+    if (pulsar_refusal_first("pulsar_engine_chat_format"))
+        fprintf(stderr, "pulsar: pulsar_engine_chat_format: no engine, so no chat format -- refusing\n");
+    return PULSAR_CHAT_NONE;
 }
 const char *pulsar_engine_family_name(const pulsar_engine *e) {
-    return e ? e->family->name : PULSAR_FAMILY_DEEPSEEK4.name;
+    return e ? e->family->name : "(no engine)";   /* L335: never DeepSeek's name for no engine */
 }
 
 

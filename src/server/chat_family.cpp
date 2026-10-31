@@ -1106,6 +1106,12 @@ const server_family_ops *server_family_for_engine(const pulsar_engine *e) {
     return server_family_for_format(pulsar_engine_chat_format(e));
 }
 
+const server_family_ops *server_tool_family(const server *s) {
+    if (s->engine) return server_family_for_engine(s->engine);
+    if (!s->family_no_engine) pulsar_die("server_tool_family: a server with no engine names no family");
+    return s->family_no_engine;
+}
+
 /* The loaded family's resolve and render around the protocol's tool-result checks (which read the
  * resolved mode).  The family follows the LOADED model (L218 s123): the renderer, the forced-prefill and
  * the KV-key suffix builders all read it from the request, so a 0731 artifact cannot be primed with

@@ -335,11 +335,12 @@ pulsar_family_id pulsar_engine_family(const pulsar_engine *e);
 /** The loaded model's conversation format (the family's answer; for DeepSeek
  * it follows the shape profile exactly like pulsar_engine_chat_v41). */
 /** @param e the engine
- *  @return the format the front end must render */
+ *  @return the format the front end must render; PULSAR_CHAT_NONE (said once) for NULL -- no engine has no
+ *          family, and a caller that renders without one names its format itself */
 pulsar_chat_format pulsar_engine_chat_format(const pulsar_engine *e);
 /** Printable family name ("DeepSeek V4", "Qwen4-exp"). */
 /** @param e the engine
- *  @return a static string */
+ *  @return a static string; "(no engine)" for NULL (never a family's name) */
 const char *pulsar_engine_family_name(const pulsar_engine *e);
 /** Does the loaded family carry a tokenizer and chat renderer in this build?
  * A front end that takes text refuses an engine without one at startup; the
