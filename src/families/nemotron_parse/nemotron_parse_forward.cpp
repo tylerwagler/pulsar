@@ -33,6 +33,8 @@
  *
  * PULSAR_PARSE_DUMP=DIR writes the stages the reference records (vit_in, vit_mid, vit_out, prefix, emb, hidden,
  * logits0 -- f32 little-endian, row-major) for the stage grade; nothing else reads them. */
+/** @file nemotron_parse_forward.cpp
+ *  @brief Parse's forward (ViT tower, neck, mBART decoder) and its greedy generation: the parser entry. */
 #include "nemotron_parse.h"
 #include "engine/exl3_trellis.h"   /* exl3_f16_to_f32: the f16 stage dump */
 #include "cuda/pulsar_cuda_attn_gqa.h"
@@ -49,17 +51,24 @@
 
 namespace {
 
+/// The architecture name every refusal is prefixed with.
 const char *const ARCH = PULSAR_NEMOTRON_PARSE_ARCH;
+/// Rows a prompt-arm linear launch carries (the f32 stage and the MLP buffer are sized by it).
 constexpr uint32_t NP_CHUNK = 2048;
+/// The longest prompt in tokens (the decoder's prefill rows and the ids buffer are sized by it).
 constexpr uint32_t NP_PROMPT_MAX = 64;
+/// The f16 operand rows every Linear but the decoder's Wo reads.
 constexpr pulsar_rows_out F16 = PULSAR_ROWS_OUT_F16;
 
+/** @return CLOCK_MONOTONIC in milliseconds (the stats' stage timings) */
 double now_ms(void) {
     struct timespec t;
     clock_gettime(CLOCK_MONOTONIC, &t);
     return 1e3 * (double)t.tv_sec + 1e-6 * (double)t.tv_nsec;
 }
 
+/** The run's device buffers, an index into pulsar_nemotron_parse_run::t / ::bytes (sizes in run_create); B_COUNT
+ *  counts them. */
 enum np_buf {
     B_PATCH, B_RES, B_XN, B_QKV, B_ATT, B_MLP, B_STAGE, B_LWS,                    /* the tower (B_RES f32) */
     B_EMB, B_H, B_DXN, B_Q, B_K, B_V, B_DATT, B_DAWS, B_IDS, B_LOGITS, B_POOLS,   /* the decoder (B_EMB, B_H f32) */
@@ -68,14 +77,25 @@ enum np_buf {
 
 }  // namespace
 
+/** The forward's device state (one per Parse engine): the decoder's attention declaration, the buffers, the cached
+ *  position rows and the page lock. */
 struct pulsar_nemotron_parse_run {
+    /// The decoder's attention: heads / kv_heads of width / heads, causal over the whole sequence, bf16 KV, no rope.
     pulsar_gqa_layer dec;
     uint32_t n_max;            ///< the tower's rows at the largest page: class tokens + patches
     uint32_t s_max;            ///< the decoder's prefill rows at the largest page: prefix + a prompt of NP_PROMPT_MAX
+    /// The device buffers, indexed by np_buf.
     pulsar_gpu_tensor *t[B_COUNT];
+    /// Each buffer's size in bytes.
     uint64_t bytes[B_COUNT];
     uint64_t pool_bytes;       ///< one layer's KV pool: max_seq tokens
     const float *cls_rows;     ///< f32 [n_cls][vit_width] (the mapping's)
+    /** @var pulsar_nemotron_parse_run::pos_h
+     *  the cached position rows' canvas height (pixels; 0 = none cached)
+     *  @var pulsar_nemotron_parse_run::pos_w
+     *  the cached position rows' canvas width
+     *  @var pulsar_nemotron_parse_run::pos_ch
+     *  the cached position rows' content height */
     uint32_t pos_h, pos_w, pos_ch, pos_cw;   ///< the cached position rows' geometry
     std::vector<float> pos_rows;             ///< f32 [patches][vit_width]
     pthread_mutex_t mu;                      ///< one page at a time on this engine (its KV spans the steps)
@@ -83,15 +103,31 @@ struct pulsar_nemotron_parse_run {
 
 namespace {
 
+/** The engine's family state as Parse's (no family check: only this family's hooks call it).
+ *  @param e  an engine this family loaded
+ *  @return its pulsar_nemotron_parse_model */
 pulsar_nemotron_parse_model *W(const pulsar_engine *e) { return (pulsar_nemotron_parse_model *)e->family_state; }
+/** A device tensor's base pointer, typed.
+ *  @tparam T  the element type
+ *  @param t   the tensor
+ *  @return its device address as T* */
 template <class T = void>
 T *dp(const pulsar_gpu_tensor *t) { return (T *)pulsar_gpu_tensor_device_ptr(t); }
 
+/** Say a forward or entry refusal into `err`.
+ *  @param err     receives "<arch>: <what>" when non-NULL
+ *  @param errlen  err's capacity in bytes
+ *  @param what    the reason
+ *  @return always false */
 bool fail(char *err, size_t errlen, const char *what) {
     if (err) snprintf(err, errlen, "%s: %s", ARCH, what);
     return false;
 }
 
+/** Write one stage dump, DIR/NAME.f32 (raw little-endian f32); a file that cannot be opened is skipped silently.
+ *  @param dir   the PULSAR_PARSE_DUMP directory
+ *  @param name  the stage name
+ *  @param v     the values */
 void write_f32(const char *dir, const char *name, const std::vector<float> &v) {
     char path[1024];
     snprintf(path, sizeof path, "%s/%s.f32", dir, name);
@@ -101,23 +137,53 @@ void write_f32(const char *dir, const char *name, const std::vector<float> &v) {
     }
 }
 
+/** One page's call context: the engine, its state and run, the dump directory and the caller's error buffer. */
 struct ctx {
+    /// the engine
     pulsar_engine *e;
+    /// the engine's family state
     pulsar_nemotron_parse_model *w;
+    /// the engine's run (its buffers)
     pulsar_nemotron_parse_run *r;
+    /// PULSAR_PARSE_DUMP's directory, or NULL = no stage dumps
     const char *dump;
+    /// the caller's refusal buffer (may be NULL)
     char *err;
+    /// err's capacity in bytes
     size_t errlen;
+    /** @param t     a weight
+     *  @param what  its name, for a refusal
+     *  @return its device copy, or NULL */
     const void *wp(const pulsar_tensor *t, const char *what) { return pulsar_weight_device_ptr(&e->model, t, what); }
+    /** @param t     an f32 weight (a norm or a bias)
+     *  @param what  its name, for a refusal
+     *  @return its device copy as f32, or NULL */
     const float *fp(const pulsar_tensor *t, const char *what) { return (const float *)wp(t, what); }
+    /** @return the f32 stage every Linear writes (B_STAGE, [NP_CHUNK][the widest out]) */
     float *stage() { return dp<float>(r->t[B_STAGE]); }
     /* the stage [rows][out] f32 = x [rows][in] times t: f16 operand rows (the f16 arm as they are) */
+    /** @param t       the weight
+     *  @param in      the input width
+     *  @param out     the output width
+     *  @param x_f16   the f16 operand rows, [rows][in]
+     *  @param rows    the row count (at most NP_CHUNK)
+     *  @param prompt  the prompt arm; false = the decode arm (one row)
+     *  @param what    the name a refusal reports
+     *  @return true = launched; false = refused (err says what) */
     bool lin(const pulsar_tensor *t, int in, int out, const uint16_t *x_f16, uint32_t rows, bool prompt, const char *what) {
         pulsar_rows_linear l;
         if (!pulsar_linear_rows_ref(&e->model, t, in, out, prompt, what, &l)) return fail(err, errlen, what);
         return pulsar_rows_linear_f16_launch(&l, x_f16, (int)rows, stage(), 0) == 0 || fail(err, errlen, what);
     }
     /* the same over bf16 operand rows (the f16 arm's exact prescale) -- the decoder attention's output */
+    /** @param t       the weight
+     *  @param in      the input width
+     *  @param out     the output width
+     *  @param x_bf16  the bf16 operand rows, [rows][in]
+     *  @param rows    the row count (at most NP_CHUNK)
+     *  @param prompt  the prompt arm; false = the decode arm (one row)
+     *  @param what    the name a refusal reports
+     *  @return true = launched; false = refused (err says what) */
     bool lin_bf16(const pulsar_tensor *t, int in, int out, const uint16_t *x_bf16, uint32_t rows, bool prompt,
                   const char *what) {
         pulsar_rows_linear l;
@@ -126,6 +192,10 @@ struct ctx {
                fail(err, errlen, what);
     }
     /* a stage for the grade: f32 rows of a buffer */
+    /** @param name   the stage name
+     *  @param t      the f32 buffer
+     *  @param rows   the rows to write
+     *  @param width  the values per row */
     void put(const char *name, const pulsar_gpu_tensor *t, uint64_t rows, uint32_t width) {
         if (!dump) return;
         std::vector<float> out(rows * width);
@@ -133,6 +203,10 @@ struct ctx {
         write_f32(dump, name, out);
     }
     /* the same of f16 rows, widened */
+    /** @param name   the stage name
+     *  @param t      the f16 buffer
+     *  @param rows   the rows to write
+     *  @param width  the values per row */
     void put16(const char *name, const pulsar_gpu_tensor *t, uint64_t rows, uint32_t width) {
         if (!dump) return;
         std::vector<uint16_t> h(rows * width);
@@ -144,6 +218,10 @@ struct ctx {
 };
 
 /* the tower over a prepared page: res holds the ViT's output (f32), xn its f16 rows, n = class tokens + patches */
+/** @param c        the call context
+ *  @param pg       the prepared page (its patches and geometry)
+ *  @param n_patch  the page's patch count, (h / patch) * (w / patch)
+ *  @return true = done; false = refused (c.err says why) */
 bool tower(ctx &c, const pulsar_nemotron_parse_page &pg, uint32_t n_patch) {
     pulsar_nemotron_parse_run *r = c.r;
     const pulsar_nemotron_parse_model *w = c.w;
@@ -222,6 +300,10 @@ bool tower(ctx &c, const pulsar_nemotron_parse_page &pg, uint32_t n_patch) {
 }
 
 /* the neck: the prefix rows into emb [0, n_prefix) (f32) */
+/** @param c         the call context (the tower's f16 output in B_XN)
+ *  @param n_patch   the page's patch count (a multiple of merge)
+ *  @param n_prefix  receives the prefix rows: n_patch / merge merged rows + the summary row
+ *  @return true = done; false = refused (c.err says why) */
 bool neck(ctx &c, uint32_t n_patch, uint32_t *n_prefix) {
     pulsar_nemotron_parse_run *r = c.r;
     const pulsar_nemotron_parse_model *w = c.w;
@@ -261,6 +343,11 @@ bool neck(ctx &c, uint32_t n_patch, uint32_t *n_prefix) {
 
 /* the decoder over rows [pos0, pos0 + n) whose embeddings are emb [0, n): the KV pools extended, logits of the last
  * row into r->t[B_LOGITS] */
+/** @param c       the call context
+ *  @param pos0    the first row's position in the sequence
+ *  @param n       the rows (embeddings in B_EMB [0, n))
+ *  @param prompt  the prefill (prompt arms); false = a one-row decode step
+ *  @return true = done; false = refused (c.err says why) */
 bool decoder(ctx &c, uint32_t pos0, uint32_t n, bool prompt) {
     pulsar_nemotron_parse_run *r = c.r;
     const pulsar_nemotron_parse_model *w = c.w;
@@ -339,6 +426,11 @@ bool decoder(ctx &c, uint32_t pos0, uint32_t n, bool prompt) {
 }
 
 /* the embedding rows of `ids` (x the scale, f32) into emb at row `at` */
+/** @param c    the call context
+ *  @param ids  the token ids
+ *  @param n    the id count (at most NP_PROMPT_MAX)
+ *  @param at   the first B_EMB row written
+ *  @return true = done; false = refused (c.err says why) */
 bool gather(ctx &c, const int *ids, uint32_t n, uint32_t at) {
     pulsar_nemotron_parse_run *r = c.r;
     const pulsar_nemotron_parse_shape &s = c.w->shape;
@@ -351,6 +443,11 @@ bool gather(ctx &c, const int *ids, uint32_t n, uint32_t at) {
 }
 
 /* greedy after the repetition penalty: transformers' RepetitionPenaltyLogitsProcessor then argmax (the first max) */
+/** @param logits   the vocab's logits; penalised in place
+ *  @param seq      the sequence so far (prompt + generated); each id is marked seen
+ *  @param penalty  the repetition penalty (> 1)
+ *  @param seen     per-id flags, vocab long, kept across steps
+ *  @return the chosen id: the first maximum */
 int pick(std::vector<float> &logits, const std::vector<int> &seq, float penalty, std::vector<uint8_t> *seen) {
     for (int id : seq) (*seen)[(size_t)id] = 1;
     for (size_t i = 0; i < logits.size(); i++)
@@ -361,6 +458,18 @@ int pick(std::vector<float> &logits, const std::vector<int> &seq, float penalty,
     return (int)best;
 }
 
+/** pulsar_family_parser::parse: one page, prepared on the host, then tower, neck, prefill and greedy decode under the
+ *  engine's page lock.
+ *  @param e        the engine
+ *  @param image    the page's PNG or JPEG bytes
+ *  @param len      their length in bytes
+ *  @param opt      the prompt (added tokens only; NULL = the default) and the new-token cap (0 = max_new); NULL = defaults
+ *  @param ids_out  receives the prompt and generated ids
+ *  @param text     receives their decoded text, malloc'd and NUL-terminated (the caller frees)
+ *  @param stats    receives the call's counts and stage timings (NULL = not wanted)
+ *  @param err      the refusal text
+ *  @param errlen   err's capacity in bytes
+ *  @return 0 = parsed; -2 = the input refused (prompt or image); -1 = the forward refused */
 int parse(pulsar_engine *e, const uint8_t *image, size_t len, const pulsar_parse_options *opt, pulsar_tokens *ids_out,
           char **text, pulsar_parse_stats *stats, char *err, size_t errlen) {
     pulsar_nemotron_parse_model *w = W(e);
@@ -442,6 +551,8 @@ const pulsar_family_parser PULSAR_NEMOTRON_PARSE_PARSER = {
     /* .parse = */ parse,
 };
 
+/** Free the run's buffers and lock.  Safe on a NULL `w` or a NULL run.
+ *  @param w  the family state; its run is set to NULL */
 void pulsar_nemotron_parse_run_free(pulsar_nemotron_parse_model *w) {
     pulsar_nemotron_parse_run *r = w ? w->run : NULL;
     if (!r) return;
@@ -451,6 +562,9 @@ void pulsar_nemotron_parse_run_free(pulsar_nemotron_parse_model *w) {
     w->run = NULL;
 }
 
+/** Build the run: the decoder's attention, every buffer at the largest page and prompt, the per-layer KV pools.
+ *  @param e  the engine
+ *  @return true = built; false = refused (said); the partial run stays for unload */
 bool pulsar_nemotron_parse_run_create(pulsar_engine *e) {
     pulsar_nemotron_parse_model *w = W(e);
     const pulsar_nemotron_parse_shape &s = w->shape;

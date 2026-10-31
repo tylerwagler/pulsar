@@ -6,6 +6,9 @@
  * with no meaning for the forward (an initialiser, a dropout, a generation default) is NAMED here with why, so a new
  * key is never silently taken as one of them.  The table below is the ONE list of what the family understands: the
  * reader, the pins and the unknown-key check all walk it. */
+/** @file nemotron_h_shape.cpp
+ *  @brief Nemotron-H's shape: the container's nemotron_h.* keys read and pinned, the HF blocks grouped into layers, and
+ *  the plan. */
 #include "nemotron_h.h"
 
 #include <math.h>
@@ -35,6 +38,7 @@ const pulsar_nemotron_h_shape PULSAR_NEMOTRON_H_SHAPE_SUPER = {
     /* .eos_id         = */ 11,
 };
 
+/// The prefix of every config refusal.
 #define NH "nemotron_h: "
 
 namespace {
@@ -44,8 +48,10 @@ namespace {
  *  meaningless to the forward (with why). */
 enum nh_kind : uint8_t { K_U32, K_U64, K_F32, K_BOOL, K_STR, K_U32_EQ, K_F32_EQ, K_KINDS, K_MTP_KINDS, K_ABSENT, K_IGNORED };
 
+/** One entry of the family's key table: which container key, how it is read and checked, and where it lands. */
 struct nh_key {
     const char *key;      ///< the container key
+    /// How the key is read and checked
     nh_kind kind;
     size_t off;           ///< the shape field (K_U32 / K_U64 / K_F32)
     bool pinned;          ///< the field must equal the profile's
@@ -54,12 +60,19 @@ struct nh_key {
     double want_num;      ///< K_U32_EQ / K_F32_EQ's one value
 };
 
+/// A shape field's byte offset, for k_keys.
 #define F(field) offsetof(pulsar_nemotron_h_shape, field)
+/// A u32 geometry key, read into `field` and pinned to the profile.
 #define PIN(k, field) {"nemotron_h." k, K_U32, F(field), true, false, NULL, 0}
+/// A bool switch that must be `v`.
 #define SW_B(k, v) {"nemotron_h." k, K_BOOL, 0, false, v, NULL, 0}
+/// A string switch that must be `v`.
 #define SW_S(k, v) {"nemotron_h." k, K_STR, 0, false, false, v, 0}
+/// An integer switch that must equal `v`.
 #define SW_U(k, v) {"nemotron_h." k, K_U32_EQ, 0, false, false, NULL, v}
+/// A key named as meaningless to the forward, for the reason `why`.
 #define IGN(k, why) {"nemotron_h." k, K_IGNORED, 0, false, false, why, 0}
+/// The ONE list of keys the family understands; the reader, the profile pins and the unknown-key check walk it.
 const nh_key k_keys[] = {
     /* geometry, pinned */
     PIN("hidden_size", n_embd),
@@ -133,12 +146,21 @@ const nh_key k_keys[] = {
 #undef SW_U
 #undef IGN
 
+/** The container's metadata entry named `key` (linear scan).
+ *  @param m    the container
+ *  @param key  the full key name
+ *  @return the entry, or NULL when absent */
 const pulsar_kv *nh_kv(const pulsar_model *m, const char *key) {
     for (uint64_t i = 0; i < m->n_kv; i++)
         if (pulsar_streq(m->kv[i].key, key)) return &m->kv[i];
     return NULL;
 }
 
+/** Say one config refusal and count it (pulsar_load_refuse).
+ *  @param fmt   a printf format taking two strings: `key`, then `more`
+ *  @param key   the key refused
+ *  @param more  the detail appended to the message
+ *  @return always false */
 bool refuse(const char *fmt, const char *key, const char *more = "") {
     fprintf(stderr, "pulsar: " NH);
     fprintf(stderr, fmt, key, more);
@@ -148,6 +170,12 @@ bool refuse(const char *fmt, const char *key, const char *more = "") {
 }
 
 /* A string array of block kinds: each one of `allowed` (ascending index = HF block). */
+/** @param m      the container
+ *  @param key    the array key (layers_block_type or mtp_layers_block_type)
+ *  @param kinds  receives each entry, NUL-terminated: "mamba", "attention" or "moe"
+ *  @param max    kinds' capacity in entries
+ *  @param n      receives the entry count (0 on refusal)
+ *  @return true = read; false = refused (said and counted) */
 bool read_kinds(const pulsar_model *m, const char *key, char kinds[][12], uint32_t max, uint32_t *n) {
     pulsar_array_ref arr;
     *n = 0;
@@ -177,6 +205,15 @@ bool read_kinds(const pulsar_model *m, const char *key, char kinds[][12], uint32
 /* HF blocks -> pulsar layers: a mixer opens a layer, a moe closes the open one.  The same grouping as the builder's
  * (tools/container/nemotron_h.py group_layers); the bind records carry its result, and the binder proves the two
  * agree tensor by tensor. */
+/** @param kinds        the HF block kinds
+ *  @param n            their count
+ *  @param key          the key they came from, for a refusal
+ *  @param n_layer      receives the grouped layer count
+ *  @param mamba        receives bit il for each layer whose mixer is Mamba-2
+ *  @param moe          receives bit il for each layer with a MoE
+ *  @param block_layer  when non-NULL, receives each block's layer (needs block_sub too)
+ *  @param block_sub    when non-NULL, receives each block's half (PULSAR_BLOCK_TAP_MIXER / _FFN)
+ *  @return true = grouped; false = refused (a leading moe, or more than PULSAR_FAMILY_MAX_LAYER layers) */
 bool group(const char kinds[][12], uint32_t n, const char *key, uint32_t *n_layer, uint64_t *mamba, uint64_t *moe,
            uint8_t *block_layer = NULL, uint8_t *block_sub = NULL) {
     *n_layer = 0;
@@ -215,6 +252,9 @@ bool group(const char kinds[][12], uint32_t n, const char *key, uint32_t *n_laye
 
 }  // namespace
 
+/** @param m  the container
+ *  @param s  receives the shape (the profile's values first, every read field overwritten)
+ *  @return true = read and checked; false = at least one refusal (each said and counted) */
 bool pulsar_nemotron_h_read_shape(const pulsar_model *m, pulsar_nemotron_h_shape *s) {
     *s = PULSAR_NEMOTRON_H_SHAPE_SUPER;   /* the name and the profile's values; every read field is overwritten */
     bool ok = true;
@@ -357,6 +397,8 @@ bool pulsar_nemotron_h_read_shape(const pulsar_model *m, pulsar_nemotron_h_shape
     return ok;
 }
 
+/** @param s     the checked shape
+ *  @param plan  receives the n_layer grouped layer descriptions */
 void pulsar_nemotron_h_plan(const pulsar_nemotron_h_shape *s, pulsar_layer_plan *plan) {
     memset(plan, 0, sizeof(*plan));
     plan->n_layer = s->n_layer;

@@ -5,6 +5,8 @@
  * other than the value the blocks implement, and a key this table does not know are each refused by name.  The
  * table below is the ONE list of what the family understands: the reader, the pins and the unknown-key check all
  * walk it. */
+/** @file inkling_shape.cpp
+ *  @brief Inkling's shape: the container's inkling.* keys read, checked against the profile, and the layer plan. */
 #include "inkling.h"
 
 #include <math.h>
@@ -46,6 +48,7 @@ const pulsar_inkling_shape PULSAR_INKLING_SHAPE_SMALL = {
     /* .n_mtp_max       = */ 8,
 };
 
+/// The prefix of every config refusal.
 #define INK "inkling: "
 
 namespace {
@@ -56,9 +59,12 @@ enum ink_kind : uint8_t { K_U32, K_U64, K_F32, K_BOOL, K_STR, K_LIST, K_ABSENT, 
 /** Which block of keys: the text config (always), the tower's (when written), the drafter's (when present). */
 enum ink_group : uint8_t { G_TEXT, G_VISION, G_MTP };
 
+/** One entry of the family's key table: which container key, how it is read and checked, and where it lands. */
 struct ink_key {
     const char *key;      ///< the container key
+    /// How the key is read and checked
     ink_kind kind;
+    /// Which config block the key belongs to (read only when that block is present)
     ink_group group;
     size_t off;           ///< the shape field (K_U32 / K_U64 / K_F32)
     bool pinned;          ///< the field must equal the profile's
@@ -66,7 +72,9 @@ struct ink_key {
     const char *want_str; ///< K_STR's one value
 };
 
+/// A shape field's byte offset, for k_keys.
 #define F(field) offsetof(pulsar_inkling_shape, field)
+/// The ONE list of keys the family understands; the reader, the profile pins and the unknown-key check walk it.
 const ink_key k_keys[] = {
     /* geometry, pinned */
     {"inkling.hidden_size", K_U32, G_TEXT, F(n_embd), true, false, NULL},
@@ -126,12 +134,21 @@ const ink_key k_keys[] = {
 };
 #undef F
 
+/** The container's metadata entry named `key` (linear scan).
+ *  @param m    the container
+ *  @param key  the full key name
+ *  @return the entry, or NULL when absent */
 const pulsar_kv *ink_kv(const pulsar_model *m, const char *key) {
     for (uint64_t i = 0; i < m->n_kv; i++)
         if (pulsar_streq(m->kv[i].key, key)) return &m->kv[i];
     return NULL;
 }
 
+/** Say one config refusal and count it (pulsar_load_refuse).
+ *  @param fmt   a printf format taking two strings: `key`, then `more`
+ *  @param key   the key refused
+ *  @param more  the detail appended to the message
+ *  @return always false, so callers can `return refuse(...)` */
 bool refuse(const char *fmt, const char *key, const char *more = "") {
     fprintf(stderr, "pulsar: " INK);
     fprintf(stderr, fmt, key, more);
@@ -141,6 +158,11 @@ bool refuse(const char *fmt, const char *key, const char *more = "") {
 }
 
 /* An array of ascending distinct layer ids, each below n, as a bitmask. */
+/** @param m     the container
+ *  @param key   the array key (e.g. inkling.local_layer_ids)
+ *  @param n     the exclusive bound on each id (the layer count); ids must also be below 64
+ *  @param mask  receives bit v for each id v; 0 on refusal
+ *  @return true = read; false = refused (said and counted) */
 bool read_ids(const pulsar_model *m, const char *key, uint32_t n, uint64_t *mask) {
     pulsar_array_ref arr;
     *mask = 0;
@@ -165,6 +187,9 @@ bool read_ids(const pulsar_model *m, const char *key, uint32_t n, uint64_t *mask
 
 }  // namespace
 
+/** @param m  the container
+ *  @param s  receives the shape (the profile's values first, every read field overwritten)
+ *  @return true = read and checked; false = at least one refusal (each said and counted) */
 bool pulsar_inkling_read_shape(const pulsar_model *m, pulsar_inkling_shape *s) {
     *s = PULSAR_INKLING_SHAPE_SMALL;   /* the name and the profile's values; every read field is overwritten */
     s->n_mtp = 0;
@@ -286,6 +311,8 @@ bool pulsar_inkling_read_shape(const pulsar_model *m, pulsar_inkling_shape *s) {
     return ok;
 }
 
+/** @param s     the checked shape
+ *  @param plan  receives the trunk's n_layer layer descriptions */
 void pulsar_inkling_plan(const pulsar_inkling_shape *s, pulsar_layer_plan *plan) {
     memset(plan, 0, sizeof(*plan));
     plan->n_layer = s->n_layer;

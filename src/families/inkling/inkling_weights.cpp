@@ -11,24 +11,43 @@
  * 201088 wide for its 201024 logits (exl3_linear_layout: the arm writes the logical columns).  Norms, short convs,
  * the relative bases, the router and the tower are read as stored: bf16, the router's selection bias and output
  * scale f32. */
+/** @file inkling_weights.cpp
+ *  @brief Inkling's weights: every tensor bound by role, its format admitted and priced. */
 #include "inkling.h"
 
 namespace {
 
+/// The binder's and the format checks' owner name.
 const char *const OWNER = PULSAR_INKLING_ARCH;
+/// The trunk layers' block name in role keys.
 const char *const LAYERS = "layers";
+/// The drafter layers' block name in role keys.
 const char *const MTP = "mtp";
 
+/// Read as stored: bf16 only (norms, convs, relative bases, router, tower).
 const pulsar_role_admit A_BF16 = {PULSAR_ROLE_PLAIN(PULSAR_TENSOR_BF16), false, PULSAR_ROLE_DENSE, 0};
+/// Read as stored: f32 only (the router's selection bias and output scale).
 const pulsar_role_admit A_F32 = {PULSAR_ROLE_PLAIN(PULSAR_TENSOR_F32), false, PULSAR_ROLE_DENSE, 0};
+/// A dense linear: whatever the registry serves at bf16 rows.
 const pulsar_role_admit A_LINEAR = {0, true, PULSAR_ROLE_DENSE, PULSAR_ACTS(PULSAR_ACT_ROWS_BF16)};
+/// The head: bf16 as stored, or a dense-arm format at bf16 rows.
 const pulsar_role_admit A_HEAD = {PULSAR_ROLE_PLAIN(PULSAR_TENSOR_BF16), true, PULSAR_ROLE_DENSE,
                                   PULSAR_ACTS(PULSAR_ACT_ROWS_BF16)};
+/// A shared expert's linear at bf16 rows.
 const pulsar_role_admit A_SHARED = {0, true, PULSAR_ROLE_SHARED_EXPERT, PULSAR_ACTS(PULSAR_ACT_ROWS_BF16)};
+/// A routed gate or up stack at bf16 rows.
 const pulsar_role_admit A_EXP_GATE_UP = {0, true, PULSAR_ROLE_EXPERT_GATE_UP, PULSAR_ACTS(PULSAR_ACT_ROWS_BF16)};
+/// A routed down stack at bf16 rows.
 const pulsar_role_admit A_EXP_DOWN = {0, true, PULSAR_ROLE_EXPERT_DOWN, PULSAR_ACTS(PULSAR_ACT_ROWS_BF16)};
 
 /* One transformer block: a trunk layer (`layers`, il) or a drafter layer (`mtp`, n).  window / moe from the plan. */
+/** @param b       the open binder
+ *  @param s       the shape (widths)
+ *  @param block   the role block name (LAYERS or MTP)
+ *  @param il      the layer index within that block
+ *  @param window  a window layer: the swa_* head counts and `window` as the relative extent
+ *  @param moe     bind the router and experts; false = the dense MLP
+ *  @param L       receives the block's tensors */
 void bind_block(pulsar_role_binder *b, const pulsar_inkling_shape *s, const char *block, int32_t il, bool window,
                 bool moe, pulsar_inkling_block *L) {
     const uint64_t E = s->n_embd;
@@ -75,6 +94,9 @@ void bind_block(pulsar_role_binder *b, const pulsar_inkling_shape *s, const char
 
 /* The hmlp tower: linear i at the profile's widths (pulsar_inkling_shape::vis_in / vis_mid, the last writing n_embd),
  * an RMSNorm after each but the last, a final norm on the n_embd output. */
+/** @param b  the open binder
+ *  @param s  the shape (the tower's widths)
+ *  @param w  receives vis_linear, vis_norm and vis_final_norm */
 void bind_tower(pulsar_role_binder *b, const pulsar_inkling_shape *s, pulsar_inkling_model *w) {
     for (uint32_t i = 0; i < s->vis_layers; i++) {
         const bool last = i + 1 == s->vis_layers;
@@ -87,6 +109,9 @@ void bind_tower(pulsar_role_binder *b, const pulsar_inkling_shape *s, pulsar_ink
 
 }  // namespace
 
+/** @param m  the container
+ *  @param w  the family state: its shape is read; every tensor pointer and the census are written
+ *  @return true = bound; false = refused (said) */
 bool pulsar_inkling_bind(const pulsar_model *m, pulsar_inkling_model *w) {
     const pulsar_inkling_shape *s = &w->shape;
     pulsar_role_binder *b = pulsar_role_binder_open(m, OWNER);

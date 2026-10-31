@@ -1,6 +1,8 @@
 /* nemotron_parse_shape.cpp -- Parse's shape: the container's nemotron_parse.* facts (the builder pins every config
  * value they come from) read and pinned again against the profile (nemotron_parse.h section 1).  Every key is one of
  * the table's; every value the profile's -- a second geometry is a second profile, added on purpose. */
+/** @file nemotron_parse_shape.cpp
+ *  @brief Parse's shape: the container's nemotron_parse.* facts read and pinned against the profile. */
 #include "nemotron_parse.h"
 
 #include <math.h>
@@ -18,19 +20,28 @@ const pulsar_nemotron_parse_shape PULSAR_NEMOTRON_PARSE_SHAPE = {
     /* prompt */ "</s><s><predict_bbox><predict_classes><output_markdown><predict_text_in_pic>",
 };
 
+/// The prefix of every fact refusal.
 #define NP "nemotron_parse: "
 
 namespace {
 
+/** How a fact is read: an unsigned integer, a float, or a string (the prompt). */
 enum np_kind : uint8_t { K_U32, K_F32, K_STR };
+/** One fact of the table: the container key, its kind, and its field in the shape. */
 struct np_key {
+    /// the container key
     const char *key;
+    /// how it is read
     np_kind kind;
+    /// the field's offset in pulsar_nemotron_parse_shape
     size_t off;
 };
 
+/// A u32 fact read into field `f`.
 #define U(k, f) {"nemotron_parse." k, K_U32, offsetof(pulsar_nemotron_parse_shape, f)}
+/// An f32 fact read into field `f`.
 #define F(k, f) {"nemotron_parse." k, K_F32, offsetof(pulsar_nemotron_parse_shape, f)}
+/// The ONE list of facts the family reads; every one is required and pinned to the profile.
 const np_key k_keys[] = {
     U("vit.width", vit_width), U("vit.depth", vit_depth), U("vit.heads", vit_heads), U("vit.head_dim", vit_head_dim),
     U("vit.mlp", vit_mlp), U("vit.patch", patch), U("vit.n_cls", n_cls),
@@ -49,6 +60,11 @@ const np_key k_keys[] = {
 #undef U
 #undef F
 
+/** Say one fact refusal and count it (pulsar_load_refuse).
+ *  @param fmt   a printf format taking two strings: `key`, then `more`
+ *  @param key   the key refused
+ *  @param more  the detail appended to the message
+ *  @return always false */
 bool refuse(const char *fmt, const char *key, const char *more = "") {
     fprintf(stderr, "pulsar: " NP);
     fprintf(stderr, fmt, key, more);
@@ -59,6 +75,9 @@ bool refuse(const char *fmt, const char *key, const char *more = "") {
 
 }  // namespace
 
+/** @param m  the container
+ *  @param s  receives the shape (the profile's values first, every read fact overwritten)
+ *  @return true = read and every fact the profile's; false = at least one refusal (each said and counted) */
 bool pulsar_nemotron_parse_read_shape(const pulsar_model *m, pulsar_nemotron_parse_shape *s) {
     *s = PULSAR_NEMOTRON_PARSE_SHAPE;
     bool ok = true;
