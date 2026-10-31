@@ -562,6 +562,28 @@ static void test_openai_sse_finish_sends_calls_past_streamed(void) {
 
 
 
+/* L335: a completion with no text answers "text":"" as the chat branch answers "content":"" (it passed NULL to
+ * json_escape, a crash). */
+static void test_final_response_completion_null_text(void) {
+    for (int k = 0; k < 2; k++) {
+        int sv[2];
+        TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+        if (sv[0] < 0 || sv[1] < 0) return;
+        request r;
+        test_request_init(&r, k ? REQ_COMPLETION : REQ_CHAT, 16);
+        TEST_ASSERT(final_response(sv[0], &r, "cmpl_test", NULL, NULL, NULL, "stop", 3, 0, NULL));
+        shutdown(sv[0], SHUT_WR);
+        char *out = read_socket_text(sv[1]);
+        TEST_ASSERT(strstr(out, k ? "\"text\":\"\"" : "\"content\":\"\"") != NULL);
+        free(out);
+        request_free(&r);
+        close(sv[0]);
+        close(sv[1]);
+    }
+}
+
+
+
 static void test_context_length_error_uses_protocol_standard_shape(void) {
     request r;
     test_request_init(&r, REQ_CHAT, 128);
@@ -12085,6 +12107,7 @@ static void pulsar_server_unit_tests_run(void) {
     test_anthropic_tool_stream_sends_live_tool_use();
     test_openai_tool_stream_sends_incremental_text();
     test_openai_sse_finish_sends_calls_past_streamed();
+    test_final_response_completion_null_text();
     test_openai_tool_stream_truncated_call_closes_args();
     test_openai_stream_usage_reports_cache_details();
     test_responses_usage_reports_cache_details();

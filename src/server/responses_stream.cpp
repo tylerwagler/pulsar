@@ -886,7 +886,7 @@ bool responses_final_response(int fd,
 /// @param fd                 the client socket
 /// @param r                  the request (kind, model, tool orders)
 /// @param id                 the response id
-/// @param text               the answer text
+/// @param text               the answer text (NULL: empty)
 /// @param reasoning          the reasoning (chat: reasoning_content; may be NULL)
 /// @param calls              the turn's calls (chat only; may be NULL)
 /// @param finish             the finish_reason
@@ -925,7 +925,7 @@ bool final_response(int fd,
         buf_printf(&b, "{\"id\":\"%s\",\"object\":\"text_completion\",\"created\":%ld,\"model\":", id, now);
         json_escape(&b, r->model);
         buf_puts(&b, ",\"choices\":[{\"text\":");
-        json_escape(&b, text);
+        json_escape(&b, text ? text : "");   /* L335: the chat branch's NULL guard (NULL: no text) */
         buf_puts(&b, ",\"index\":0,\"finish_reason\":");
         json_escape(&b, finish);
         buf_puts(&b, "}],\"usage\":");
