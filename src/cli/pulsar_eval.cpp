@@ -3400,9 +3400,7 @@ static const char *trace_skip_counted_block(const char *line,
                                             const char *end) {
     /*
      * Trace regrading must scan metadata lines without being confused by model
-     * output.  Prefer the byte count written by trace_write_block(); the older
-     * delimiter-only parser is still accepted in trace_copy_model_output for
-     * compatibility with existing trace files.
+     * output: the byte count trace_write_block() writes is what bounds a block.
      */
     const char *begin = bounded_strstr(line, line_end, "_BEGIN bytes=");
     if (!begin || begin == line) return NULL;
@@ -3531,8 +3529,8 @@ static const eval_case *find_eval_case_by_source_id(const char *source,
     return NULL;
 }
 
-/** @brief Copy a trace case's MODEL_OUTPUT block: by its byte count, or up to "MODEL_OUTPUT_END" for traces
- *  written before counted blocks.
+/** @brief Copy a trace case's MODEL_OUTPUT block by its byte count ("MODEL_OUTPUT_BEGIN bytes=N"; a block without
+ *  the count, from before counted blocks, is malformed).
  *  @param case_start the case's start
  *  @param case_end   its end
  *  @return a malloc'd copy (caller frees), or NULL when the block is missing or malformed */
@@ -3543,25 +3541,19 @@ static char *trace_copy_model_output(const char *case_start, const char *case_en
     if (!line_end) return NULL;
     const char *content = line_end + 1;
 
-    size_t len = 0;
     const char *bytes = bounded_strstr(begin, line_end, "bytes=");
-    if (bytes) {
-        char *endptr = NULL;
-        unsigned long long declared = strtoull(bytes + 6, &endptr, 10);
-        if (endptr == bytes + 6 || endptr > line_end ||
-            declared > (unsigned long long)(case_end - content))
-            return NULL;
-        len = (size_t)declared;
-        const char *marker = content + len;
-        if (marker < case_end && *marker == '\n') marker++;
-        if ((size_t)(case_end - marker) < strlen("MODEL_OUTPUT_END") ||
-            memcmp(marker, "MODEL_OUTPUT_END", strlen("MODEL_OUTPUT_END")) != 0)
-            return NULL;
-    } else {
-        const char *finish = bounded_strstr(content, case_end, "\nMODEL_OUTPUT_END");
-        if (!finish) return NULL;
-        len = (size_t)(finish - content);
-    }
+    if (!bytes) return NULL;
+    char *endptr = NULL;
+    unsigned long long declared = strtoull(bytes + 6, &endptr, 10);
+    if (endptr == bytes + 6 || endptr > line_end ||
+        declared > (unsigned long long)(case_end - content))
+        return NULL;
+    const size_t len = (size_t)declared;
+    const char *marker = content + len;
+    if (marker < case_end && *marker == '\n') marker++;
+    if ((size_t)(case_end - marker) < strlen("MODEL_OUTPUT_END") ||
+        memcmp(marker, "MODEL_OUTPUT_END", strlen("MODEL_OUTPUT_END")) != 0)
+        return NULL;
 
     char *out = (char *)malloc(len + 1);
     if (!out) {
@@ -3658,7 +3650,7 @@ static int regrade_trace_file(const char *path) {
 
         char *model_output = trace_copy_model_output(case_start, case_end);
         if (!model_output) {
-            fprintf(stderr, "pulsar-eval: trace case %d is missing MODEL_OUTPUT block: %s/%s\n",
+            fprintf(stderr, "pulsar-eval: trace case %d has no counted MODEL_OUTPUT block (bytes=N): %s/%s\n",
                     total, source, id);
             parse_errors++;
             continue;
