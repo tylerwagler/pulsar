@@ -228,16 +228,14 @@ __device__ __forceinline__ static float bf16_to_f32(uint16_t b) {
 }
 
 
-/** f32 to bf16 bits, round to nearest even.  1-D grid, one thread an element.
+/** f32 to bf16 bits, round to nearest even, NaN kept NaN (pulsar_f32_to_bf16_rne).  1-D grid, one thread an
+ *  element.
  *  @param out bf16 [n] out
  *  @param x   f32 [n]
  *  @param n   elements */
 __global__ static void f32_to_bf16_kernel(uint16_t *out, const float *x, uint64_t n) {
     uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) {
-        const uint32_t u = __float_as_uint(x[i]);
-        out[i] = (uint16_t)((u + 0x7fffu + ((u >> 16) & 1u)) >> 16);  ///< round-to-nearest-even
-    }
+    if (i < n) out[i] = pulsar_f32_to_bf16_rne(x[i]);
 }
 
 

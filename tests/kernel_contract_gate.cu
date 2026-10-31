@@ -28,6 +28,8 @@
  *    9. hc-expand-sizes the split expands refuse a block / add / residual / split operand one row short of out_hc's
  *                       rows (no operand was checked); full operands run.
  *   10. subview-dry     pulsar_tensor_subview carries the base's dry flag, format and element size (dry was unset).
+ *   11. bf16-nan        pulsar_f32_to_bf16_rne over all 2^32 f32 patterns: every non-NaN keeps the old expression's
+ *                       bits, every NaN stays NaN (the old rounding add turned some into Inf and wrapped others to 0).
  *
  *  Prints one line per case and KERNEL CONTRACT GATE PASS / FAIL. */
 #include "pulsar_gpu.h"
@@ -523,6 +525,54 @@ static void case_subview_dry(void) {
     pulsar_gpu_tensor_free(real);
 }
 
+/* ---- 11. bf16-nan ---------------------------------------------------------------------------------------------- */
+
+/// The narrowing before L335, kept HERE only as the sweep's reference for every non-NaN input.
+/// @param f the value
+/// @return (u + 0x7fff + lsb) >> 16
+__device__ static uint16_t old_bf16_rne(float f) {
+    const uint32_t u = __float_as_uint(f);
+    return (uint16_t)((u + 0x7fffu + ((u >> 16) & 1u)) >> 16);
+}
+
+/// Every f32 bit pattern: [0] non-NaN inputs whose bits moved, [1] NaN inputs not narrowed to NaN, [2] NaN inputs the
+/// old expression narrowed to a non-NaN.
+/// @param cnt the three counters (zeroed)
+__global__ static void bf16_sweep_kernel(unsigned long long *cnt) {
+    unsigned long long moved = 0, lost = 0, old_lost = 0;
+    for (uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x; i < (1ull << 32);
+         i += (uint64_t)gridDim.x * blockDim.x) {
+        const uint32_t u = (uint32_t)i;
+        const float f = __uint_as_float(u);
+        const uint16_t b = pulsar_f32_to_bf16_rne(f), o = old_bf16_rne(f);
+        const bool nan_in = (u & 0x7fffffffu) > 0x7f800000u;
+        const bool nan_b = (b & 0x7fffu) > 0x7f80u, nan_o = (o & 0x7fffu) > 0x7f80u;
+        if (!nan_in) moved += b != o;
+        else {
+            lost += !nan_b;
+            old_lost += !nan_o;
+        }
+    }
+    atomicAdd(&cnt[0], moved);
+    atomicAdd(&cnt[1], lost);
+    atomicAdd(&cnt[2], old_lost);
+}
+
+/// Case 11: pulsar_f32_to_bf16_rne over all 2^32 patterns: every non-NaN keeps its old bits, every NaN stays NaN.
+static void case_bf16_nan(void) {
+    unsigned long long *d = nullptr, h[3] = {0, 0, 0};
+    if (!ok(cudaMalloc(&d, sizeof(h)), "bf16-nan malloc") || !ok(cudaMemset(d, 0, sizeof(h)), "bf16-nan memset"))
+        return;
+    bf16_sweep_kernel<<<1024, 256>>>(d);
+    if (ok(cudaDeviceSynchronize(), "bf16-nan sweep") && ok(cudaMemcpy(h, d, sizeof(h), cudaMemcpyDeviceToHost),
+                                                           "bf16-nan download")) {
+        printf("  11 bf16-nan: 2^32 patterns: %llu non-NaN moved, %llu NaN not kept (the old expression lost %llu)\n",
+               h[0], h[1], h[2]);
+        if (h[0] || h[1]) fail("bf16-nan: a non-NaN changed bits, or a NaN narrowed to a number");
+    }
+    cudaFree(d);
+}
+
 /// Runs every case on device 0.
 /// @return 0 on PASS, 1 on FAIL
 int main(void) {
@@ -540,6 +590,7 @@ int main(void) {
     case_ple_order();
     case_hc_expand_sizes();
     case_subview_dry();
+    case_bf16_nan();
     puts(g_fail ? "KERNEL CONTRACT GATE FAIL" : "KERNEL CONTRACT GATE PASS");
     return g_fail ? 1 : 0;
 }

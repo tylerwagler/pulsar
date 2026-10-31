@@ -25,17 +25,6 @@
  * never the adds.  The shared-memory pairwise tree is byte-for-byte the old one
  * (no warp shuffles, no split-K): every float op happens in the same sequence,
  * so this is bit-exact by construction, not by measurement. */
-/* BF16 narrowing, byte-for-byte the expression f32_to_bf16_kernel uses in
- * pulsar_cuda_matmul.cu.  Written out rather than calling __float2bfloat16():
- * this epilogue REPLACES that kernel's output for the same values, so the two
- * must agree bit-for-bit, and "the intrinsic is also round-to-nearest-even"
- * is an assumption where copying the expression is a guarantee. */
-/// @param f the value
-/// @return its bf16 bits, round to nearest even (the expression f32_to_bf16_kernel uses)
-__device__ __forceinline__ static uint16_t pulsar_f32_to_bf16_rne(float f) {
-    const uint32_t u = __float_as_uint(f);
-    return (uint16_t)((u + 0x7fffu + ((u >> 16) & 1u)) >> 16);   ///< round-to-nearest-even
-}
 
 /** Plain RMSNorm of HC residual-carrier rows.  Grid rows; block BLK; static smem BLK floats (the pairwise tree).
  *  @tparam BLK    block size (a power of two)
