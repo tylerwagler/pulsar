@@ -11928,12 +11928,17 @@ static void test_l334_server_positions(void) {
     TEST_ASSERT(l334_aborts([&] { l334_sink = server_live_continuation_start(TokCount{-1}, TokPos{390}).raw(); }));
 }
 
+/** An exit() in the l335_exit_status child leaves with its status before the handlers it inherited run. */
+static void l335_exit_now(int status, void *) { _exit(status); }
+
 /** Run `op` in a child with stderr closed; its exit status (1: pulsar_die; 0: `op` returned), -1 if it did not
- *  exit. */
+ *  exit.  The child registers l335_exit_now first (exit handlers run last-registered first): the parent's -- the
+ *  CUDA runtime's teardown, once a gate before this one loaded a model -- must not run in a forked child. */
 template <class F> static int l335_exit_status(F op) {
     fflush(NULL);
     const pid_t pid = fork();
     if (pid == 0) {
+        on_exit(l335_exit_now, NULL);
         const int devnull = open("/dev/null", O_WRONLY);
         if (devnull >= 0) dup2(devnull, 2);
         op();
