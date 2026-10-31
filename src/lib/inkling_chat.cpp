@@ -12,6 +12,7 @@
 
 #include <map>
 
+#include "chat_refuse.h"
 #include "pulsar_utf8.h"
 #include "pyjson.h"
 
@@ -70,24 +71,6 @@ const char kContentInvokeToolText[] = "<|content_invoke_tool_text|>";
 const char kContentToolError[] = "<|content_tool_error|>";
 /// Closes every message block.
 const char kEndMessage[] = "<|end_message|>";
-
-/// Write "<key>: <fmt...>" into `err` (when given) and fail.
-/// @param err    the caller's error buffer, or NULL
-/// @param errlen its size in bytes
-/// @param key    the refusal's name
-/// @param fmt    printf format of the detail
-/// @return false, always
-bool refuse(char *err, size_t errlen, const char *key, const char *fmt, ...) {
-    if (err && errlen) {
-        char msg[300];
-        va_list ap;
-        va_start(ap, fmt);
-        vsnprintf(msg, sizeof msg, fmt, ap);
-        va_end(ap);
-        snprintf(err, errlen, "%s: %s", key, msg);
-    }
-    return false;
-}
 
 /* role -> its message marker (developer folds into system); NULL for a role vLLM does not take */
 /// @param role the message's role, or NULL
@@ -164,12 +147,12 @@ bool tool_declare_json(const char *tools_json, std::string *out, char *err, size
     pyjson_value tools;
     char jerr[160];
     if (!pyjson_parse(tools_json, strlen(tools_json), &tools, jerr, sizeof jerr) || tools.kind != pyjson_value::ARR)
-        return refuse(err, errlen, "tools_not_array", "%s", jerr);
+        return chat_refuse(err, errlen, "tools_not_array", "%s", jerr);
     pyjson_value specs;
     specs.kind = pyjson_value::ARR;
     for (size_t i = 0; i < tools.a.size(); i++) {
         const pyjson_value &tool = tools.a[i];
-        if (tool.kind != pyjson_value::OBJ) return refuse(err, errlen, "tool_spec_invalid", "tool %zu is not an object", i);
+        if (tool.kind != pyjson_value::OBJ) return chat_refuse(err, errlen, "tool_spec_invalid", "tool %zu is not an object", i);
         const pyjson_value *fn = tool.get("function");
         static const pyjson_value empty_obj = [] {
             pyjson_value v;
@@ -177,9 +160,9 @@ bool tool_declare_json(const char *tools_json, std::string *out, char *err, size
             return v;
         }();
         const pyjson_value &f = fn ? *fn : empty_obj;
-        if (f.kind != pyjson_value::OBJ) return refuse(err, errlen, "tool_spec_invalid", "tool %zu: function is not an object", i);
+        if (f.kind != pyjson_value::OBJ) return chat_refuse(err, errlen, "tool_spec_invalid", "tool %zu: function is not an object", i);
         const pyjson_value *name = f.get("name");
-        if (!name) return refuse(err, errlen, "tool_spec_invalid", "tool %zu has no function.name", i);
+        if (!name) return chat_refuse(err, errlen, "tool_spec_invalid", "tool %zu has no function.name", i);
         pyjson_value spec;
         spec.kind = pyjson_value::OBJ;
         const pyjson_value *desc = f.get("description");
@@ -196,7 +179,7 @@ bool tool_declare_json(const char *tools_json, std::string *out, char *err, size
         spec.o.emplace_back("type", type ? *type : function_str);   /* tool.get("type", "function") */
         specs.a.push_back(std::move(spec));
     }
-    if (!pyjson_dump_canonical(specs, out)) return refuse(err, errlen, "json_not_finite", "a tool holds NaN or Infinity");
+    if (!pyjson_dump_canonical(specs, out)) return chat_refuse(err, errlen, "json_not_finite", "a tool holds NaN or Infinity");
     return true;
 }
 
@@ -207,7 +190,7 @@ bool tool_declare_json(const char *tools_json, std::string *out, char *err, size
 /// @param errlen its size
 /// @return false on tool_name_missing, tool_arguments_not_json, tool_arguments_not_object or json_not_finite
 bool tool_call_json(const inkling_tool_call_in &c, std::string *out, char *err, size_t errlen) {
-    if (!c.name) return refuse(err, errlen, "tool_name_missing", "a tool call's function name is not a string");
+    if (!c.name) return chat_refuse(err, errlen, "tool_name_missing", "a tool call's function name is not a string");
     pyjson_value args;
     const char *raw = c.arguments ? c.arguments : "";
     if (py_blank(raw)) {   /* `json.loads(raw_args) if raw_args.strip() else {}` */
@@ -215,14 +198,14 @@ bool tool_call_json(const inkling_tool_call_in &c, std::string *out, char *err, 
     } else {
         char jerr[160];
         if (!pyjson_parse(raw, strlen(raw), &args, jerr, sizeof jerr))
-            return refuse(err, errlen, "tool_arguments_not_json", "%s", jerr);
+            return chat_refuse(err, errlen, "tool_arguments_not_json", "%s", jerr);
         if (args.kind != pyjson_value::OBJ)
-            return refuse(err, errlen, "tool_arguments_not_object", "a call's arguments decode to a non-object");
+            return chat_refuse(err, errlen, "tool_arguments_not_object", "a call's arguments decode to a non-object");
     }
     out->append("{\"name\":");
     pyjson_dump_string(c.name, strlen(c.name), out);
     out->append(",\"args\":");
-    if (!pyjson_dump_canonical(args, out)) return refuse(err, errlen, "json_not_finite", "a call's arguments hold NaN or Infinity");
+    if (!pyjson_dump_canonical(args, out)) return chat_refuse(err, errlen, "json_not_finite", "a call's arguments hold NaN or Infinity");
     out->push_back('}');
     return true;
 }
@@ -234,7 +217,7 @@ bool tool_call_json(const inkling_tool_call_in &c, std::string *out, char *err, 
 /// @return false (unexpected_role) when the role has no message marker (a NULL role included)
 bool check_role(const inkling_msg_in &m, int i, char *err, size_t errlen) {
     if (role_marker(m.role)) return true;
-    return refuse(err, errlen, "unexpected_role", "message %d has role %s", i, m.role ? m.role : "(none)");
+    return chat_refuse(err, errlen, "unexpected_role", "message %d has role %s", i, m.role ? m.role : "(none)");
 }
 
 /* One message as render_inkling_messages writes it (its loop body after the effort block), with the
@@ -276,7 +259,7 @@ struct message_writer {
                 text.clear();
                 for (int k = 0; k < m.n_parts; k++) {
                     if (m.parts[k].image)
-                        return refuse(err, errlen, "tool_result_not_text", "a tool result holds an image");
+                        return chat_refuse(err, errlen, "tool_result_not_text", "a tool result holds an image");
                     text += m.parts[k].text ? m.parts[k].text : "";
                 }
             }
@@ -309,7 +292,7 @@ struct message_writer {
         }
         const size_t raw_len = m.raw_calls ? strlen(m.raw_calls) : 0;
         if (raw_len && m.n_calls <= 0)
-            return refuse(err, errlen, "raw_calls_without_calls", "message %d carries sampled call bytes but no call", i);
+            return chat_refuse(err, errlen, "raw_calls_without_calls", "message %d carries sampled call bytes but no call", i);
         const char *end = NULL;
         if (raw_len && inkling_find_call_block(m.raw_calls, &end) == m.raw_calls && end == m.raw_calls + raw_len) {
             /* the calls as sampled (the model's own bytes, never client data), after the role marker the
@@ -332,7 +315,7 @@ struct message_writer {
 /// @param errlen its size
 /// @return false (prompt_too_large) when the text passes the 32-bit span map
 bool fits(const inkling_render_out *out, char *err, size_t errlen) {
-    if (out->text.size() > UINT32_MAX) return refuse(err, errlen, "prompt_too_large", "the render passes 4 GiB");
+    if (out->text.size() > UINT32_MAX) return chat_refuse(err, errlen, "prompt_too_large", "the render passes 4 GiB");
     return true;
 }
 
@@ -376,7 +359,7 @@ const char *inkling_find_call_block(const char *p, const char **end) {
 bool inkling_chat_tool_defs(const char *tools_json, inkling_render_out *out, char *err, size_t errlen) {
     out->text.clear();
     out->spans.clear();
-    if (!tools_json) return refuse(err, errlen, "tools_not_array", "none");
+    if (!tools_json) return chat_refuse(err, errlen, "tools_not_array", "none");
     std::string declare;
     if (!tool_declare_json(tools_json, &declare, err, errlen)) return false;
     out->text = declare;
@@ -391,7 +374,7 @@ bool inkling_chat_render(const inkling_render_in &in, inkling_render_out *out, c
     writer &w = mw.w;
     std::string effort_text;
     if (!inkling_effort_text(in.effort, &effort_text))
-        return refuse(err, errlen, "effort_out_of_range", "reasoning_effort must be in [0.0, 0.99]");
+        return chat_refuse(err, errlen, "effort_out_of_range", "reasoning_effort must be in [0.0, 0.99]");
     bool effort_pending = true;
 
     if (in.tools_json) {
@@ -425,7 +408,7 @@ bool inkling_chat_render_turn(const inkling_msg_in *msgs, int n, int from, bool 
     out->text.clear();
     out->spans.clear();
     if (from < 0 || from > n || (from == n && !close_turn && !add_generation_prompt))
-        return refuse(err, errlen, "no_messages", "the turn starts at message %d of %d", from, n);
+        return chat_refuse(err, errlen, "no_messages", "the turn starts at message %d of %d", from, n);
     message_writer mw{writer{out}, {}};
     for (int i = 0; i < from; i++) mw.note_calls(msgs[i]);
     if (close_turn) mw.w.put(kContentModelEndSampling);
@@ -461,13 +444,13 @@ bool inkling_chat_render_assistant_turn(const inkling_msg_in &m, inkling_render_
     out->text.clear();
     out->spans.clear();
     if (!m.role || strcmp(m.role, "assistant"))
-        return refuse(err, errlen, "unexpected_role", "a sampled turn is the assistant's");
+        return chat_refuse(err, errlen, "unexpected_role", "a sampled turn is the assistant's");
     message_writer mw{writer{out}, {}};
     if (!mw.message(m, 0, m.n_calls <= 0, err, errlen)) return false;
     /* the full render's first block opens with the role marker the generation prompt already wrote */
     static const size_t lm = sizeof kMessageModel - 1;
     if (out->text.compare(0, lm, kMessageModel) != 0)
-        return refuse(err, errlen, "empty_turn", "a turn with no reasoning, content or call renders no block, so "
+        return chat_refuse(err, errlen, "empty_turn", "a turn with no reasoning, content or call renders no block, so "
                       "the generation prompt's <|message_model|> has no replay");
     out->text.erase(0, lm);
     for (pulsar_text_span &s : out->spans) {
