@@ -23,12 +23,15 @@
  *                       refuses (seq_id was dereferenced unchecked).
  *    7. hc-fused-width  the fused HC split + norm runs n_embd 4096 and 5120 and refuses 4352 (a width between them used
  *                       to launch the 5120 unroll with dead groups).
+ *    8. ple-order       the Qwen PLE launcher refuses a verify capture wider than its batch BEFORE queuing a kernel:
+ *                       streams and conv state come back byte-identical (the gate / conv kernels used to run first).
  *
  *  Prints one line per case and KERNEL CONTRACT GATE PASS / FAIL. */
 #include "pulsar_gpu.h"
 #include "cuda/pulsar_cuda_arch.cuh"
 #include "cuda/pulsar_cuda_internal.h"   /* PULSAR_IDX_MXFP4_HEADS_V4 */
 #include "cuda/pulsar_cuda_mx.cuh"
+#include "cuda/pulsar_cuda_qwen.h"
 
 #include <cuda_runtime.h>
 
@@ -385,6 +388,66 @@ static void case_hc_fused_width(void) {
     if (bad) fail("hc-fused-width: a width other than 4096 / 5120 ran, or one of them refused");
 }
 
+/* ---- 8. ple-order ---------------------------------------------------------------------------------------------- */
+
+/// Case 8: the Qwen PLE launcher with a verify capture wider than its batch refuses BEFORE queuing anything: the
+/// streams (the conv kernel's output) and the conv state come back byte-identical.
+static void case_ple_order(void) {
+    const int T = 2;
+    const uint64_t big = 1ull << 20;
+    pulsar_gpu_tensor *wt = pulsar_gpu_tensor_alloc(4 * big);   /* the four bf16 weights, 1 MiB apiece */
+    pulsar_gpu_tensor *kv = pulsar_gpu_tensor_alloc(2 * big);   /* key, value */
+    pulsar_gpu_tensor *st = pulsar_gpu_tensor_alloc((uint64_t)T * PULSAR_QWEN_HC_HIDDEN * 2u);
+    pulsar_gpu_tensor *cs = pulsar_gpu_tensor_alloc((uint64_t)PULSAR_QWEN_PLE_STATE * PULSAR_QWEN_HC_HIDDEN * 4u);
+    pulsar_gpu_tensor *sr = pulsar_gpu_tensor_alloc(4 * big);
+    pulsar_gpu_tensor *ri = pulsar_gpu_tensor_alloc(64);
+    const size_t wsb = pulsar_qwen_ple_workspace_bytes(T);
+    pulsar_gpu_tensor *ws = pulsar_gpu_tensor_alloc(wsb);
+    const int32_t idx[8] = {0, 0, /* row_seq */ 0, 1, /* row_j */ 0, /* seq_first */ 2, /* seq_rows */ 0 /* seq_bank */};
+    if (!wt || !kv || !st || !cs || !sr || !ri || !ws || !pulsar_gpu_tensor_write(ri, 0, idx, sizeof(idx))) {
+        fail("ple-order: alloc");
+    } else {
+        std::vector<uint8_t> pat_s((size_t)st->bytes), pat_c((size_t)cs->bytes), back;
+        for (size_t i = 0; i < pat_s.size(); i++) pat_s[i] = (uint8_t)(i * 7u + 1u);
+        for (size_t i = 0; i < pat_c.size(); i++) pat_c[i] = (uint8_t)(i * 13u + 5u);
+        const std::vector<uint8_t> z(4 * big, 0u);
+        pulsar_gpu_tensor_write(wt, 0, z.data(), z.size());
+        pulsar_gpu_tensor_write(kv, 0, z.data(), 2 * big);
+        pulsar_gpu_tensor_write(st, 0, pat_s.data(), pat_s.size());
+        pulsar_gpu_tensor_write(cs, 0, pat_c.data(), pat_c.size());
+        const char *W = (const char *)wt->ptr;
+        const int32_t *R = (const int32_t *)ri->ptr;
+        pulsar_qwen_ple_dev w{(const uint16_t *)W, (const uint16_t *)(W + big), (const uint16_t *)(W + 2 * big),
+                              (const uint16_t *)(W + 3 * big)};
+        pulsar_qwen_rows rows{};
+        rows.row_seq = R;
+        rows.row_j = R + 2;
+        rows.seq_first = R + 4;
+        rows.seq_rows = R + 5;
+        rows.seq_bank = R + 6;
+        rows.n_seq = 1;
+        rows.state_rows = (float *)sr->ptr;
+        rows.n_state_rows = T + 1;   /* wider than the batch: refused */
+        const int rc = pulsar_qwen_ple_launch(&w, (const float *)kv->ptr, (const float *)((const char *)kv->ptr + big),
+                                              (uint16_t *)st->ptr, T, &rows, (float *)cs->ptr, ws->ptr, wsb, 0);
+        const bool synced = pulsar_gpu_synchronize() != 0;
+        back.resize(pat_s.size());
+        const bool s_same = pulsar_gpu_tensor_read(st, 0, back.data(), back.size()) && back == pat_s;
+        back.resize(pat_c.size());
+        const bool c_same = pulsar_gpu_tensor_read(cs, 0, back.data(), back.size()) && back == pat_c;
+        printf("  8 ple-order: capture %d rows of %d -> rc %d, streams %s, conv state %s\n", rows.n_state_rows, T, rc,
+               s_same ? "untouched" : "WRITTEN", c_same ? "untouched" : "WRITTEN");
+        if (rc == 0 || !synced || !s_same || !c_same) fail("ple-order: the refusal queued work first");
+    }
+    pulsar_gpu_tensor_free(wt);
+    pulsar_gpu_tensor_free(kv);
+    pulsar_gpu_tensor_free(st);
+    pulsar_gpu_tensor_free(cs);
+    pulsar_gpu_tensor_free(sr);
+    pulsar_gpu_tensor_free(ri);
+    pulsar_gpu_tensor_free(ws);
+}
+
 /// Runs every case on device 0.
 /// @return 0 on PASS, 1 on FAIL
 int main(void) {
@@ -399,6 +462,7 @@ int main(void) {
     case_idx_decode_bound();
     case_ring_store_descr();
     case_hc_fused_width();
+    case_ple_order();
     puts(g_fail ? "KERNEL CONTRACT GATE FAIL" : "KERNEL CONTRACT GATE PASS");
     return g_fail ? 1 : 0;
 }
