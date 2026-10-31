@@ -1831,11 +1831,6 @@ TokPos pulsar_session_checkpoint_best(pulsar_session *s, TokPos limit) {
     const pulsar_ckpt_store *st = pulsar_session_kv_store(s);
     return TokPos{st && st->ops ? (int)pulsar_ckpt_best(st, pulsar_session_live_bank(s), (uint32_t)limit.raw()) : 0};
 }
-/** pulsar_token_text_fn over the engine's tokenizer.  @param ud the engine  @param token the token id
- *  @param len receives the text's length in bytes  @return a malloc'd copy (the caller frees it), or NULL */
-static char *engine_api_token_text(void *ud, int token, size_t *len) {
-    return pulsar_token_text((pulsar_engine *)ud, token, len);
-}
 pulsar_bank_resume pulsar_session_bank_resume_at(pulsar_session *s, uint32_t bank, const pulsar_tokens *prompt) {
     const pulsar_bank_resume none = {TokPos{0}, PromptToks{0}};
     if (!s || !prompt || prompt->len <= 0) return none;
@@ -1857,7 +1852,7 @@ pulsar_bank_resume pulsar_session_bank_resume_at(pulsar_session *s, uint32_t ban
      * request (pulsar_tokens_prompt_held_with) -- G itself when no seam lies below it, fewer when a re-spelled stretch
      * does (G was returned as the prompt-side count unconverted before) */
     if (at < TokPos::after(m.live_cut))
-        return {at, pulsar_tokens_prompt_held_with(engine_api_token_text, s->engine, t->v, at, prompt->v, prompt->len)};
+        return {at, pulsar_tokens_prompt_held_with(pulsar_engine_token_text_fn, s->engine, t->v, at, prompt->v, prompt->len)};
     return {at, m.prompt_cut};
 }
 /* L313: where `src`'s published state serves `prompt` -- the one resume rule (pulsar_session_resume_point, the rule a
@@ -1913,7 +1908,7 @@ PromptToks pulsar_session_bank_prompt_held(pulsar_session *s, uint32_t bank, con
     if (!s || !prompt || at.is_none() || at <= TokPos{0}) return PromptToks{0};
     const pulsar_tokens *h = pulsar_bank_history(s, bank);
     if (!h || at > TokPos{h->len}) return PromptToks{0};
-    return pulsar_tokens_prompt_held_with(engine_api_token_text, s->engine, h->v, at, prompt->v, prompt->len);
+    return pulsar_tokens_prompt_held_with(pulsar_engine_token_text_fn, s->engine, h->v, at, prompt->v, prompt->len);
 }
 
 pulsar_bank_adopt_result pulsar_session_bank_adopt(pulsar_session *s, uint32_t src, const pulsar_tokens *prompt,

@@ -4658,6 +4658,13 @@ bool pulsar_tensor_admit(const pulsar_tensor *t, const char *owner, bool ok, con
 /// @param s     the session
 /// @param bank  the bank whose carry receives the view
 void pulsar_bank_carry_save_view(pulsar_session *s, uint32_t bank);
+/** pulsar_token_text_fn over the engine's tokenizer -- the seam walks' vocabulary (session.cpp's prefix match,
+ *  engine_api.cpp's prompt-held reads): one function for both. */
+/// @param ud    the engine (pulsar_engine *)
+/// @param token the token id
+/// @param len   receives the text's length in bytes
+/// @return a malloc'd copy of the token's text (the caller frees it), or NULL (no tokenizer: pulsar_token_text)
+char *pulsar_engine_token_text_fn(void *ud, int token, size_t *len);
 /** Bring `bank`'s saved view back into the host view, all or nothing.  false = nothing valid was saved, or the
  *  bank's live row did not restore (said) -- either way the host view is untouched, and the family decides what a
  *  bank with no carry means. */

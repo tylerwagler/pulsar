@@ -1520,12 +1520,7 @@ done:
 }
 
 /* The engine's vocabulary for the seam walks. */
-/** pulsar_token_text_fn over the engine's tokenizer.
- *  @param ud    the engine
- *  @param token the token id
- *  @param len   receives the text's length in bytes
- *  @return a malloc'd copy of the token's text (the caller frees it), or NULL */
-static char *prefix_walk_engine_text(void *ud, int token, size_t *len) {
+char *pulsar_engine_token_text_fn(void *ud, int token, size_t *len) {
     return pulsar_token_text((pulsar_engine *)ud, token, len);
 }
 
@@ -1539,7 +1534,7 @@ void pulsar_tokens_prefix_match(pulsar_engine *e,
         out->seamed = false;
         return;
     }
-    pulsar_tokens_prefix_match_with(prefix_walk_engine_text, e, a, a_len, b, b_len, out);
+    pulsar_tokens_prefix_match_with(pulsar_engine_token_text_fn, e, a, a_len, b, b_len, out);
 }
 
 /* L334: the walk of live[0, at) against the prompt stops at the deepest boundary both spellings share at or below
