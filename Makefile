@@ -3356,6 +3356,15 @@ tests/tp_plan_test.o: tests/tp_plan_test.cpp
 	$(CXX) $(CXXFLAGS) -Isrc -Isrc/engine -c -o $@ $<
 tests/tp_plan_test: tests/tp_plan_test.o src/lib/pulsar_help.o $(CORE_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
+# L335: a refused pulsar_tp_plan_build attaches nothing and a second call refuses again (tests/tp_plan_build_test.cpp:
+# a fabricated engine and test families, no model, no GPU work).
+tests/tp_plan_build_test.o: tests/tp_plan_build_test.cpp src/engine/pulsar_engine_internal.h src/engine/family.h
+	$(CXX) $(CXXFLAGS) -Isrc -Isrc/engine -c -o $@ $<
+tests/tp_plan_build_test: tests/tp_plan_build_test.o $(CORE_OBJS)
+	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
+.PHONY: tp-plan-build-test
+tp-plan-build-test: tests/tp_plan_build_test
+	./tests/tp_plan_build_test
 # L296 N9: the chained-MTP drafter on a container (tests/mtp_spec_gate.cpp; reads the drafter's numbers and the state)
 tests/mtp_spec_gate.o: tests/mtp_spec_gate.cpp tests/gate_entry.h tests/gate_util.h src/pulsar.h src/engine/spec_mtp.h
 	$(CXX) $(CXXFLAGS) -Isrc -Isrc/engine -c -o $@ $<

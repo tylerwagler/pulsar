@@ -45,6 +45,7 @@ __pycache__/
 /tests/spec_teacher_forced_probe
 /tests/session_contract_gate
 /tests/tp_plan_test
+/tests/tp_plan_build_test
 /tests/qwen_s4_gate
 /tests/router_gate
 /tests/bf16_rows_gate
