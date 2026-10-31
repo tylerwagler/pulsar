@@ -898,7 +898,7 @@ dec_layout dec_layout_for(int64_t n_assign, int K, int M) {
 /* The decode tile list (dec_plan) after the projections' slices: n_assign tiles at most, then the count. */
 /// @param n_assign assignments.
 /// @return bytes, 256-padded.
-size_t dec_plan_bytes(int64_t n_assign) { return up256((size_t)n_assign * sizeof(int2) + sizeof(int)); }
+static size_t dec_plan_bytes(int64_t n_assign) { return up256((size_t)n_assign * sizeof(int2) + sizeof(int)); }
 
 size_t exl3_moe_decode_ws_bytes(int n_proj, int64_t n_assign, int K, int M) {
     if (n_proj < 1 || n_proj > 2 || n_assign <= 0 || K <= 0 || M <= 0 || K % EXL3_HAD_BLOCK) return 0;
