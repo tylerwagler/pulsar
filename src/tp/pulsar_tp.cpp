@@ -4149,9 +4149,9 @@ typedef struct {
 /* Broadcast ONE frame to every peer's control socket.  The command plane is
  * leader -> workers, so an n-rank group must reach all n_ranks-1 of them; for
  * the pair this is exactly the old single send, because control_fd IS
- * peers[0].  Worker -> leader frames (ack, logits half, verify) do NOT come
- * through here: a worker has one peer, the leader, so its control_fd is already
- * that link. */
+ * peers[0].  Worker -> leader frames (acks, a worker's verify commit) do NOT
+ * come through here: they go to the leader's link alone (in a mesh a worker's
+ * other peers are workers). */
 /// Send one control frame to every peer.
 /// @param tp      the transport (leader)
 /// @param type    the frame type
@@ -5161,23 +5161,34 @@ int pulsar_tp_send_verify(pulsar_tp *tp, uint64_t session_id,
 }
 
 int pulsar_tp_send_verify_commit(pulsar_tp *tp, int32_t full_accept, int32_t replay_n) {
-    /* Worker -> leader: a worker has ONE peer (the leader), so its control_fd is
-     * that link at any n -- nothing to loop. */
+    /* The leader broadcasts its decision to EVERY peer (at n > 2 the primary
+     * control_fd is only rank 1); a worker sends its verdict to the leader
+     * alone -- in a mesh its other peers are workers, which never read one. */
+    if (!tp) return 0;
     struct { int32_t full; int32_t replay; } msg = { full_accept, replay_n };
-    return tp_send_frame(tp->control_fd, PULSAR_TP_FRAME_VERIFY_COMMIT,
-                         &msg, sizeof(msg));
+    if (tp->rank == 0)
+        return tp_send_frame_to_peers(tp, PULSAR_TP_FRAME_VERIFY_COMMIT, &msg, sizeof(msg));
+    const pulsar_tp_peer *leader = tp_peer_by_rank(tp, 0);
+    if (!leader || leader->control_fd < 0) return 0;
+    return tp_send_frame(leader->control_fd, PULSAR_TP_FRAME_VERIFY_COMMIT, &msg, sizeof(msg));
 }
 
 int pulsar_tp_recv_verify_commit(pulsar_tp *tp, int32_t *full_accept, int32_t *replay_n) {
-    /* One commit per PEER, and every one must AGREE.  Every rank verifies
-     * against the same assembled logits (the vocab split all-gathers them), so a
-     * split verdict means the ranks disagree about the same computation -- a
-     * real bug, and this REFUSES rather than silently taking one worker's word.
-     * n=2 is the one-peer case and behaves exactly as before. */
+    /* The leader collects one commit per PEER, and every one must AGREE.  Every
+     * rank verifies against the same assembled logits (the vocab split
+     * all-gathers them), so a split verdict means the ranks disagree about the
+     * same computation -- a real bug, and this REFUSES rather than silently
+     * taking one worker's word.  A worker reads the leader's ONE commit: its
+     * other mesh peers are workers and send it none.  n=2 is the one-peer case
+     * either way. */
     if (!tp || tp->n_peers < 1 || !full_accept || !replay_n) return 0;
+    pulsar_tp_peer *const leader = tp->rank == 0 ? NULL : tp_peer_by_rank(tp, 0);
+    if (tp->rank != 0 && !leader) return 0;
+    pulsar_tp_peer *const from = leader ? leader : tp->peers;
+    const int n_from = leader ? 1 : tp->n_peers;
     int32_t first_full = 0, first_replay = 0;
-    for (int i = 0; i < tp->n_peers; i++) {
-        const int pfd = tp->peers[i].control_fd;
+    for (int i = 0; i < n_from; i++) {
+        const int pfd = from[i].control_fd;
         uint32_t type = 0, bytes = 0;
         struct { int32_t full; int32_t replay; } msg;
         if (pfd < 0 || !tp_read_frame_header(pfd, &type, &bytes) ||
@@ -5185,7 +5196,7 @@ int pulsar_tp_recv_verify_commit(pulsar_tp *tp, int32_t *full_accept, int32_t *r
             !tp_read_full(pfd, &msg, sizeof(msg))) {
             fprintf(stderr,
                     "pulsar-tp: bad verify-commit frame from rank %d (type %u bytes %u)\n",
-                    tp->peers[i].rank, type, bytes);
+                    from[i].rank, type, bytes);
             return 0;
         }
         if (i == 0) {
@@ -5195,8 +5206,8 @@ int pulsar_tp_recv_verify_commit(pulsar_tp *tp, int32_t *full_accept, int32_t *r
             fprintf(stderr,
                     "pulsar-tp: verify-commit SPLIT: rank %d says (%d,%d), rank %d says "
                     "(%d,%d) -- refusing\n",
-                    tp->peers[0].rank, first_full, first_replay,
-                    tp->peers[i].rank, msg.full, msg.replay);
+                    from[0].rank, first_full, first_replay,
+                    from[i].rank, msg.full, msg.replay);
             return 0;
         }
     }

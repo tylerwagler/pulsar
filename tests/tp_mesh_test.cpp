@@ -404,6 +404,29 @@ static int run_mesh_rank(int rank, int n, const int *ports) {
         }
     }
 
+    /* The leader's verify DECISION (pulsar_tp_verify_leader_round's direction):
+     * rank 0 broadcasts VERIFY_COMMIT and every worker reads exactly the
+     * leader's.  Before L335 the leader wrote only to its primary link (rank 1)
+     * and a worker read one commit per mesh peer, so at n > 2 a worker blocked
+     * for ever -- the alarm turns that hang into a failure.  Two rounds with
+     * distinct verdicts: a stray frame left queued would surface in the second. */
+    for (int round = 0; round < 2; round++) {
+        const int32_t want_full = round, want_replay = 5 + round;
+        if (rank == 0) {
+            CHECK(pulsar_tp_send_verify_commit(tp, want_full, want_replay),
+                  "rank 0 verify-commit broadcast round %d failed", round);
+        } else {
+            int32_t fa = -1, rn = -1;
+            alarm(30);
+            const int ok = pulsar_tp_recv_verify_commit(tp, &fa, &rn);
+            alarm(0);
+            CHECK(ok, "rank %d recv of the leader's verify commit (round %d) failed", rank, round);
+            CHECK(!ok || (fa == want_full && rn == want_replay),
+                  "rank %d got the leader's commit (%d,%d), expected (%d,%d)", rank, (int)fa, (int)rn,
+                  (int)want_full, (int)want_replay);
+        }
+    }
+
     /* Session-command plane across the mesh (n>2): rank 0 broadcasts ONE
      * command and collects one ack PER PEER; every other rank receives it and
      * acks.  This is the control path an n-rank session mirror rides, so it

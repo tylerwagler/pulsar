@@ -1334,14 +1334,14 @@ void pulsar_tp_command_free(pulsar_tp_command *command);
 /// @return 1 when sent to every peer, 0 on failure
 int pulsar_tp_send_verify(pulsar_tp *tp, uint64_t session_id,
                           const int *drafts, uint32_t n);
-/// Send the verify decision on the primary control link.
+/// Send a verify decision: the leader broadcasts it to every peer; a worker sends it to the leader alone.
 /// @param tp          the transport
 /// @param full_accept 1 when every draft matched
 /// @param replay_n    accepted rows
-/// @return 1 when sent, 0 on failure
+/// @return 1 when sent to every recipient, 0 on failure
 int pulsar_tp_send_verify_commit(pulsar_tp *tp, int32_t full_accept,
                                  int32_t replay_n);
-/// Collect one verify commit per peer; all must agree.
+/// Receive a verify decision: the leader collects one per peer and all must agree; a worker reads the leader's.
 /// @param tp          the transport
 /// @param full_accept receives the agreed full_accept
 /// @param replay_n    receives the agreed replay_n
