@@ -480,8 +480,7 @@ static void print_more_info(FILE *fp, const help_colors *c, pulsar_help_tool too
         more_line(fp, c, "Disk KV cache:", "kv-cache");
         more_line(fp, c, "Thinking behavior:", "thinking");
     } else if (tool == PULSAR_HELP_AGENT) {
-        more_line(fp, c, "Agent sessions:", "sessions");
-        more_line(fp, c, "Agent commands:", "commands");
+        more_line(fp, c, "Agent sessions & commands:", "commands");
         more_line(fp, c, "Agent tool system:", "tools");
     } else if (tool == PULSAR_HELP_BENCH) {
         more_line(fp, c, "Benchmark sweep:", "benchmark");
@@ -568,8 +567,9 @@ static void print_topic(FILE *fp, const help_colors *c, pulsar_help_tool tool, c
     else if (tool == PULSAR_HELP_SERVER && streq(topic, "api")) print_server_api(fp, c);
     else if (tool == PULSAR_HELP_SERVER && streq(topic, "kv-cache")) print_kv_cache(fp, c);
     else if (tool == PULSAR_HELP_SERVER && streq(topic, "thinking")) print_server_thinking(fp, c);
-    else if (tool == PULSAR_HELP_AGENT && streq(topic, "sessions")) print_agent_sessions(fp, c);
-    else if (tool == PULSAR_HELP_AGENT && streq(topic, "commands")) print_agent_sessions(fp, c);
+    /* the agent's session commands ARE its runtime commands: one section, `sessions` its alias */
+    else if (tool == PULSAR_HELP_AGENT && (streq(topic, "commands") || streq(topic, "sessions")))
+        print_agent_sessions(fp, c);
     else if (tool == PULSAR_HELP_AGENT && streq(topic, "tools")) {
         title(fp, c, "Agent Tool System");
         para(fp, c, "The agent can read, search, write, edit files, and run bash commands.");
