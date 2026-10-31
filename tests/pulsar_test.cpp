@@ -3850,6 +3850,31 @@ static void test_l308_copy_estimate(void) {
     TEST_ASSERT(pulsar_spec_copy_price(&sp, 0.0f, 8u, conf, &rp) == 8u && !rp && conf[0] == 1.0f);
 }
 
+/* L335: the one host f32 -> bf16 converter (pulsar_gpu.h pulsar_bf16_from_f32), over every float bit pattern: each
+ * non-NaN value converts exactly as the two vision converters it replaced did (the bare RNE expression), and every
+ * NaN becomes torch's quiet NaN 0x7FC0 (the bare expression turned some into Inf or flipped their sign). */
+static void test_bf16_from_f32(void) {
+    uint64_t mismatches = 0, nan_bad = 0, nans = 0, old_nan_broken = 0;
+    for (uint64_t b = 0; b <= 0xffffffffull; b++) {
+        const uint32_t u = (uint32_t)b;
+        float f;
+        memcpy(&f, &u, sizeof f);
+        const uint16_t got = pulsar_bf16_from_f32(f);
+        const uint16_t old = (uint16_t)((u + 0x7fffu + ((u >> 16) & 1u)) >> 16);
+        if ((u & 0x7fffffffu) > 0x7f800000u) {
+            nans++;
+            nan_bad += got != 0x7fc0u;
+            old_nan_broken += (old & 0x7f80u) != 0x7f80u || (old & 0x007fu) == 0u || (old >> 15) != (u >> 31);
+        } else {
+            mismatches += got != old;
+        }
+    }
+    fprintf(stderr, "  bf16: %llu NaN patterns (the bare expression broke %llu of them), %llu non-NaN mismatches, "
+                    "%llu NaN outputs not 0x7FC0\n", (unsigned long long)nans, (unsigned long long)old_nan_broken,
+            (unsigned long long)mismatches, (unsigned long long)nan_bad);
+    TEST_ASSERT(mismatches == 0 && nan_bad == 0 && nans == 2ull * 0x7fffffull);
+}
+
 /* L335: the tokenizer entries on a family without a tokenizer or chat front (an encoder's) refuse by name and return
  * their failure values -- never exit the process (they did, tokenizer_require / chat_require).  A host engine with
  * only its family set: nothing else is read before the refusal. */
@@ -4872,6 +4897,7 @@ static const pulsar_test_entry test_entries[] = {
     {"--fused-cost", "fused-cost", "the prompt chunk cost fit (solo + fused, persisted) and the verify curve's round cost, what the round selection and the disk restore price by (L304, L312, L327)", test_fused_cost},
     {"--fused-sched", "fused-sched", "the round selection simulated on L304's logged costs: L304's and L277's cases, the stall, no prompt, the cold fit (L312)", test_fused_sched},
     {"--read-ahead", "read-ahead", "the next-chunk PLE read-ahead: its rule (one chunk ahead, each row once, a changed prompt drops), the pool's background class (bytes unchanged, below every gather, cancel, accounting) (L329 b2)", test_read_ahead},
+    {"--bf16-convert", "bf16-convert", "the host f32 -> bf16 converter over every float bit pattern: finite values as before, NaN stays NaN (L335)", test_bf16_from_f32},
     {"--tokenizer-refusals", "tokenizer-refusals", "the tokenizer and chat entries refuse a family without them by name and return their failure values, never exit (L335)", test_tokenizer_refusals},
     {"--refusal-once", "refusal-once", "the library's say-once refusal table: once per op, every refusal said past its bound (L335)", test_refusal_once},
     {"--state-plan", "state-plan", "the state plan's decl table: a full table counts the overflow and the create refuses it by name (L335)", test_state_plan_overflow},
