@@ -1,3 +1,5 @@
+/** @file
+ *  Pooling over a sequence's rows: the row-order f32 mean of bf16 rows. */
 /* Pooling over a sequence's rows (L321) -- see pulsar_cuda_pool.h for the contract and the arithmetic. */
 #include "pulsar_cuda_pool.h"
 
@@ -6,10 +8,18 @@
 
 namespace {
 
+/// Block size of rows_mean_kernel (one thread a column).
 constexpr int kThreads = 256;
 
 /* one thread per column: the rows in order, one IEEE f32 add each (the engine builds with --use_fast_math, so the add
  * and the divide are the _rn intrinsics -- no contraction, no approximate reciprocal) */
+/** Column mean over n bf16 rows: out[c] = (sum_t x[t][c]) / n, the adds in row order.  Grid ceil(width / kThreads);
+ *  block kThreads; no smem.
+ *  @param x     device bf16 rows, row t at x + t * ld
+ *  @param ld    row pitch in elements
+ *  @param n     rows to pool (> 0)
+ *  @param width columns
+ *  @param out   device f32 [width] */
 __global__ void __launch_bounds__(kThreads)
 rows_mean_kernel(const uint16_t *__restrict__ x, uint64_t ld, uint32_t n, uint32_t width, float *__restrict__ out) {
     const uint32_t c = blockIdx.x * kThreads + threadIdx.x;
@@ -19,6 +29,8 @@ rows_mean_kernel(const uint16_t *__restrict__ x, uint64_t ld, uint32_t n, uint32
     out[c] = __fdiv_rn(acc, (float)n);
 }
 
+/// @param p a pointer
+/// @return true when p is 16-byte aligned
 bool aligned16(const void *p) { return ((uintptr_t)p & 15u) == 0; }
 
 }  // namespace

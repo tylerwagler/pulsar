@@ -1,3 +1,5 @@
+/** @file
+ *  CUDA runtime glue: model mappings and staged reads, device memory, streams, segment graphs, scratch poisoning. */
 #include "pulsar_cuda_internal.h"
 #include "pulsar_cuda_arch.cuh"   /* pulsar_cuda_device_cc: the layout / startup checks (L321) */
 #include "engine/exl3_trellis.h" /* L269 W1: exl3_expert_cut, the EXL3 expert half */
@@ -5,15 +7,19 @@
 #include <list>
 
 
+/// Host base of the model mapping set by pulsar_gpu_set_model_map (the one cuda_model_ptr translates).
 static const void *g_model_host_base;
 
 
+/// Address kernels use for g_model_host_base's first byte: the registered device pointer, else the host address itself.
 static const char *g_model_device_base;
 
 
+/// Size in bytes of the mapping at g_model_host_base.
 static uint64_t g_model_registered_size;
 
 
+/// Nonzero when the whole mapping is device-addressable: every range resolves to g_model_device_base + offset.
 static int g_model_registered;
 
 
@@ -31,18 +37,29 @@ static int g_model_registered;
  * lookup names the map it wants.  Keying by offset instead would collide: each
  * shard's offsets restart near zero, so two layers' identical-position tensors
  * would share a key. */
+/// One opened model container's staged-read fds, keyed by its mapping base (MODEL_FD_MAX entries in g_model_fds).
 typedef struct {
+    /// the mapping this fd backs; the key
     const void *map;        /* the mapping this fd backs; the key */
+    /// buffered read fd
     int fd;                 /* buffered read fd */
+    /// O_DIRECT twin, when the filesystem gave one
     int direct_fd;          /* O_DIRECT twin, when the filesystem gave us one */
+    /// alignment the direct fd requires, in bytes
     uint64_t direct_align;  /* alignment the direct fd requires */
+    /// size of that file in bytes, for the O_DIRECT bounds checks
     uint64_t file_size;     /* size of that file, for O_DIRECT bounds checks */
 } model_fd_entry;
 
+/// Capacity of the per-container fd table (g_model_fds).
 #define MODEL_FD_MAX 64
+/// The opened containers' fds, one entry per mapping base.
 static model_fd_entry g_model_fds[MODEL_FD_MAX];
+/// Entries in use in g_model_fds.
 static int g_model_fd_count;
 
+/// @param model_map a mapping base
+/// @return its fd entry, or NULL when no fd backs it
 static const model_fd_entry *model_fd_for(const void *model_map) {
     for (int i = 0; i < g_model_fd_count; i++) {
         if (g_model_fds[i].map == model_map) return &g_model_fds[i];
@@ -52,6 +69,7 @@ static const model_fd_entry *model_fd_for(const void *model_map) {
 
 /* The pinned staging pool is process-global and shared by every mapping, so it
  * must be allocated with the strongest alignment any entry requires. */
+/// @return the largest O_DIRECT alignment any open entry needs (1 when none)
 static uint64_t model_fd_max_align(void) {
     uint64_t a = 1;
     for (int i = 0; i < g_model_fd_count; i++) {
@@ -61,15 +79,19 @@ static uint64_t model_fd_max_align(void) {
 }
 
 
+/// Latched when a model arena chunk allocation failed: later arena allocations refuse at once.
 static int g_model_cache_full;
 
 
+/// The one-time "range could not be cached" notice of pulsar_gpu_cache_model_range has been printed.
 static int g_model_mapping_failure_notice_printed;
 
 
+/// A prefetch stream, destroyed at cleanup.  TODO(dox): nothing in this file creates or uses it besides the teardown.
 static cudaStream_t g_model_prefetch_stream;
 
 
+/// The non-blocking stream the staged fd route uploads chunks on (created with the staging pool).
 static cudaStream_t g_model_upload_stream;
 
 
@@ -84,9 +106,11 @@ static cudaStream_t g_model_upload_stream;
 
 
 
+/// Every model range placed on the device (arena copies, owned copies, registered spans).
 static std::vector<cuda_model_range> g_model_ranges;
 
 
+/// The model-weight arena chunks (device), bump-allocated by cuda_model_arena_alloc.
 static std::vector<cuda_model_arena> g_model_arenas;
 
 
@@ -94,29 +118,37 @@ static std::vector<cuda_model_arena> g_model_arenas;
  * registries had.  Every shard's offsets restart near zero, so an offset-only
  * key collides across layers: the fast path then fails its host_base check and
  * the lookup falls through to the O(ranges) scan, once per weight per step. */
+/// Exact-start index into g_model_ranges by (mapping, offset).
 static std::unordered_map<map_offset_key, size_t, map_offset_key_hash> g_model_range_by_offset;
 
 
 
 
+/// Bytes of model ranges cached on the device so far (counted against cuda_model_cache_limit_bytes).
 static uint64_t g_model_range_bytes;
 
 
+/// The cached-bytes mark at which the next load-progress line is due (0: not started).
 static uint64_t g_model_load_progress_next;
 
 
+/// Cached bytes at the last progress line.
 static uint64_t g_model_load_progress_last_bytes = UINT64_MAX;
 
 
+/// The last progress line's value in hundredths of a GiB (a repeat of it is not printed).
 static uint64_t g_model_load_progress_last_cgib = UINT64_MAX;
 
 
+/// Monotonic time of the last progress line, in seconds (0: none yet).
 static double g_model_load_progress_last;
 
 
+/// A progress line has been printed since the last finish.
 static int g_model_load_progress_started;
 
 
+/// The progress lines go to a tty (rewritten in place, newline at finish).
 static int g_model_load_progress_tty;
 
 
@@ -126,21 +158,27 @@ static int g_model_load_progress_tty;
  * decode thread needs its own arena (concurrent submits cannot share one
  * bump buffer); teardown then frees the calling thread's slots, and a
  * worker's arena is reclaimed at process exit. Matches g_act_slots. */
+/// This thread's scratch reservation per slot (device).
 static thread_local void *g_cuda_tmp[CUDA_SCRATCH_SLOTS];
 
 
+/// Bytes of each of this thread's scratch reservations.
 static thread_local uint64_t g_cuda_tmp_bytes[CUDA_SCRATCH_SLOTS];
 
 
+/// The four pinned staging buffers as allocated (cudaMallocHost).
 static void *g_model_stage_raw[4];
 
 
+/// The staging buffers aligned up to model_fd_max_align() (the O_DIRECT reads' targets).
 static void *g_model_stage[4];
 
 
+/// Per staging buffer: recorded after its upload, waited on before the buffer is refilled.
 static cudaEvent_t g_model_stage_event[4];
 
 
+/// Bytes of each staging buffer as allocated (0: no pool).
 static uint64_t g_model_stage_bytes;
 
 
@@ -235,6 +273,11 @@ void *cuda_tmp_alloc(uint64_t bytes, const char *what) {
     return cuda_tmp_reserve_slot(CUDA_SCRATCH_MAIN, bytes, what);
 }
 
+/** Reserves `bytes` on a scratch slot: the existing block when it is large enough, else a new one (the old freed).
+ *  @param slot  CUDA_SCRATCH_MAIN or CUDA_SCRATCH_MMQ
+ *  @param bytes bytes wanted (0 returns NULL)
+ *  @param what  caller label for the failure message
+ *  @return the slot's block, or NULL */
 static void *cuda_tmp_reserve_slot(int slot, uint64_t bytes, const char *what) {
     if (bytes == 0) return NULL;
     if (slot < 0 || slot >= CUDA_SCRATCH_SLOTS) return NULL;
@@ -267,6 +310,9 @@ static void *cuda_tmp_reserve_slot(int slot, uint64_t bytes, const char *what) {
 
 
 
+/// @param model_map a mapping base
+/// @param offset    byte offset in it
+/// @return the device address when the mapping is the registered one, else the host address (model_map + offset)
 static const char *cuda_model_ptr(const void *model_map, uint64_t offset) {
     if (model_map == g_model_host_base && g_model_device_base) return g_model_device_base + offset;
     return (const char *)model_map + offset;
@@ -274,6 +320,13 @@ static const char *cuda_model_ptr(const void *model_map, uint64_t offset) {
 
 
 
+/** Copies a model range into its own device allocation (bounced through a pinned chunk) and records it: the route
+ *  for a mapping with no fd behind it.
+ *  @param model_map the host mapping base
+ *  @param offset    byte offset in it
+ *  @param bytes     range length
+ *  @param what      caller label for the diagnostics
+ *  @return the device copy, or NULL (over the cache limit, or a failed alloc / copy) */
 static const char *cuda_model_range_populate_device_copy(const void *model_map,
                                                           uint64_t offset,
                                                           uint64_t bytes,
@@ -349,6 +402,12 @@ static const char *cuda_model_range_populate_device_copy(const void *model_map,
  * right for one block and wrong afterwards passes the hash check.  Each
  * distinct (map, offset, bytes) is compared once, so a run costs one pass over
  * the model. */
+/** PULSAR_VERIFY_RANGES instrument (see above): prints a RANGE (head hash) or DEEP (whole-range compare) line.
+ *  @param dev       the resolved device pointer
+ *  @param model_map the host mapping base
+ *  @param offset    byte offset in it
+ *  @param bytes     range length
+ *  @param branch    which resolution branch produced dev */
 static void verify_resolved_range(const char *dev, const void *model_map,
                                   uint64_t offset, uint64_t bytes, const char *branch) {
     static int enabled = -1;
@@ -500,6 +559,7 @@ const char *cuda_model_range_ptr(const void *model_map, uint64_t offset, uint64_
 
 
 
+/// @return 1 when any model range is read through registered host pages (the whole mapping or a span), else 0
 int pulsar_gpu_model_reads_host_pages(void) {
     if (g_model_registered) return 1;
     for (const cuda_model_range &r : g_model_ranges)
@@ -507,6 +567,10 @@ int pulsar_gpu_model_reads_host_pages(void) {
     return 0;
 }
 
+/// @param model_map the host mapping base
+/// @param offset    byte offset in it
+/// @param bytes     range length
+/// @return 1 when the range is already device-resident or device-addressable, else 0
 static int cuda_model_range_is_cached(const void *model_map, uint64_t offset, uint64_t bytes) {
     if (bytes == 0) return 1;
     if (g_model_registered) return 1;
@@ -549,6 +613,7 @@ int cuda_ok(cudaError_t err, const char *what) {
 
 
 
+/// @return CLOCK_MONOTONIC time in seconds
 static double cuda_wall_sec(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -557,12 +622,14 @@ static double cuda_wall_sec(void) {
 
 
 
+/// @return 1: the load-progress lines are always on
 static int cuda_model_load_progress_enabled(void) {
     return 1;
 }
 
 
 
+/// Resets the load-progress state (engine cleanup).
 static void cuda_model_load_progress_reset(void) {
     g_model_load_progress_next = 0;
     g_model_load_progress_last_bytes = UINT64_MAX;
@@ -574,6 +641,7 @@ static void cuda_model_load_progress_reset(void) {
 
 
 
+/// Ends a load-progress run (a newline after the in-place tty line).
 static void cuda_model_load_progress_finish(void) {
     if (!g_model_load_progress_started) return;
     if (g_model_load_progress_tty) {
@@ -585,6 +653,8 @@ static void cuda_model_load_progress_finish(void) {
 
 
 
+/// Prints a load-progress line when due (every 2 GiB / 2 s on a tty, 16 GiB / 10 s otherwise).
+/// @param cached_bytes bytes cached on the device so far
 static void cuda_model_load_progress_note(uint64_t cached_bytes) {
     if (!cuda_model_load_progress_enabled()) return;
 
@@ -634,12 +704,18 @@ static void cuda_model_load_progress_note(uint64_t cached_bytes) {
 
 
 
+/// @return the staged route's chunk size (64 MiB)
 static uint64_t cuda_model_copy_chunk_bytes(void) {
     return 64ull * 1048576ull;   /* the env knob had no caller (L159 inc 4) */
 }
 
 
 
+/// posix_madvise(DONTNEED) over the host pages of a range just uploaded (clamped to the mapping).
+/// @param model_map  the host mapping base
+/// @param model_size the mapping's size
+/// @param offset     byte offset of the range
+/// @param bytes      range length
 static void cuda_model_discard_source_pages(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes) {
 #if defined(POSIX_MADV_DONTNEED)
     if (!model_map || bytes == 0 || offset > model_size) return;
@@ -661,6 +737,10 @@ static void cuda_model_discard_source_pages(const void *model_map, uint64_t mode
 
 
 
+/// posix_fadvise(DONTNEED) over a range of the mapping's file (drops it from the page cache).
+/// @param model_map the host mapping base (picks the fd)
+/// @param offset    file byte offset
+/// @param bytes     range length
 static void cuda_model_drop_file_pages(const void *model_map, uint64_t offset, uint64_t bytes) {
 #if defined(POSIX_FADV_DONTNEED)
     const model_fd_entry *e = model_fd_for(model_map);
@@ -674,6 +754,9 @@ static void cuda_model_drop_file_pages(const void *model_map, uint64_t offset, u
 
 
 
+/// @param v     a value
+/// @param align the alignment (0 or 1: none)
+/// @return v rounded down to a multiple of align
 static uint64_t cuda_round_down(uint64_t v, uint64_t align) {
     if (align <= 1) return v;
     return (v / align) * align;
@@ -681,6 +764,9 @@ static uint64_t cuda_round_down(uint64_t v, uint64_t align) {
 
 
 
+/// @param v     a value
+/// @param align the alignment (0 or 1: none)
+/// @return v rounded up to a multiple of align
 static uint64_t cuda_round_up(uint64_t v, uint64_t align) {
     if (align <= 1) return v;
     const uint64_t rem = v % align;
@@ -689,6 +775,9 @@ static uint64_t cuda_round_up(uint64_t v, uint64_t align) {
 
 
 
+/// @param ptr   a pointer
+/// @param align the alignment (0 or 1: none)
+/// @return ptr rounded up to a multiple of align
 static void *cuda_align_ptr(void *ptr, uint64_t align) {
     if (align <= 1) return ptr;
     uintptr_t p = (uintptr_t)ptr;
@@ -698,6 +787,9 @@ static void *cuda_align_ptr(void *ptr, uint64_t align) {
 
 
 
+/** Ensures the four pinned staging buffers (and the upload stream) hold at least `bytes` each, reallocating them.
+ *  @param bytes bytes a buffer
+ *  @return 1 ready, 0 an allocation failed (named on stderr) */
 static int cuda_model_stage_pool_alloc(uint64_t bytes) {
     if (g_model_stage_bytes >= bytes) return 1;
     for (size_t i = 0; i < 4; i++) {
@@ -741,6 +833,11 @@ static int cuda_model_stage_pool_alloc(uint64_t bytes) {
 
 
 
+/// @param fd     the file
+/// @param buf    destination
+/// @param bytes  bytes to read
+/// @param offset file offset
+/// @return 1 when all bytes were read (EINTR retried), 0 on an error or end of file
 static int cuda_pread_full(int fd, void *buf, uint64_t bytes, uint64_t offset) {
     uint64_t done = 0;
     while (done < bytes) {
@@ -758,6 +855,15 @@ static int cuda_pread_full(int fd, void *buf, uint64_t bytes, uint64_t offset) {
 
 
 
+/** Reads a file range into a staging buffer: the O_DIRECT twin when it can (aligned read, the payload offset into
+ *  the buffer), else the buffered fd; a direct fd the filesystem rejects is dropped for this shard.
+ *  @param e           the container's fd entry
+ *  @param stage       the staging buffer (aligned for O_DIRECT)
+ *  @param stage_bytes its size
+ *  @param offset      file byte offset
+ *  @param bytes       bytes wanted
+ *  @param payload     out: where the wanted bytes start in stage
+ *  @return 1 read, 0 failed (errno set) */
 static int cuda_model_stage_read(const model_fd_entry *e, void *stage,
                                  uint64_t stage_bytes, uint64_t offset,
                                  uint64_t bytes, const char **payload) {
@@ -797,6 +903,7 @@ static int cuda_model_stage_read(const model_fd_entry *e, void *stage,
 
 
 
+/// @return the device weight-cache budget in bytes: 96 GiB integrated, else total memory less max(2 GiB, a fifth)
 static uint64_t cuda_model_cache_limit_bytes(void) {
     /* One Spark can run the IQ2 model (~81 GiB) and larger mixed models
      * (~91 GiB) via the startup tensor cache.  Keep enough headroom for
@@ -824,6 +931,7 @@ static uint64_t cuda_model_cache_limit_bytes(void) {
 
 
 
+/// @return the local-model limit (the cache limit)
 static uint64_t cuda_model_local_model_limit_bytes(void) {
     return cuda_model_cache_limit_bytes();
 }
@@ -833,6 +941,8 @@ static uint64_t cuda_model_local_model_limit_bytes(void) {
 
 
 
+/// @param need bytes the allocation needs
+/// @return the arena chunk to allocate: 1792 MiB, or need rounded to 64 MiB when need is over half of that
 static uint64_t cuda_model_arena_chunk_bytes(uint64_t need) {
     uint64_t bytes = 1792ull * 1048576ull;   /* the env knob had no caller (L159 inc 4) */
     if (need > bytes / 2u) {
@@ -848,6 +958,10 @@ static uint64_t cuda_model_arena_chunk_bytes(uint64_t need) {
 
 
 
+/** Bump-allocates a 4 KiB-aligned span from the model arenas, adding a chunk when none fits.
+ *  @param bytes span size (rounded up to 4 KiB)
+ *  @param what  caller label for the diagnostics
+ *  @return the device span, or NULL (zero bytes, over the cache limit, or a failed chunk: latches g_model_cache_full) */
 static char *cuda_model_arena_alloc(uint64_t bytes, const char *what) {
     if (bytes == 0) return NULL;
     if (g_model_cache_full) return NULL;
@@ -904,6 +1018,9 @@ static char *cuda_model_arena_alloc(uint64_t bytes, const char *what) {
  * kernel an address it cannot read and surfacing an async illegal access
  * later.  On GB10 registration is unsupported, so this returns NULL and the
  * staged fd path is the only route -- see cuda_model_range_ptr (L028/L030). */
+/// @param model_map the host mapping base
+/// @param offset    byte offset in it
+/// @return the device-addressable pointer when the whole mapping is registered, else NULL
 static const char *cuda_model_direct_fallback_ptr(const void *model_map, uint64_t offset) {
     if (g_model_registered) return cuda_model_ptr(model_map, offset);
     return NULL;
@@ -911,6 +1028,12 @@ static const char *cuda_model_direct_fallback_ptr(const void *model_map, uint64_
 
 
 
+/** The staged fd route: reads the range through the pinned four-buffer pipeline into an arena span and records it.
+ *  @param model_map the host mapping base (picks the fd)
+ *  @param offset    byte offset in it
+ *  @param bytes     range length
+ *  @param what      caller label for the diagnostics
+ *  @return the device span, or NULL (no fd, over budget without a registered mapping, or a failed read / copy) */
 static const char *cuda_model_range_ptr_from_fd(
         const void *model_map,
         uint64_t offset,
@@ -1015,6 +1138,17 @@ static const char *cuda_model_range_ptr_from_fd(
  * (key_map, key_offset), so every arm resolves it through cuda_model_range_ptr
  * exactly like a staged stack.  The buffer is owned by the range table (freed
  * at release). */
+/** Builds a rank's half of every expert of one routed stack (see above) and registers it as a model range.
+ *  @tparam Cut  callable cudaError_t(const uint8_t *staged, uint8_t *dst, uint32_t n_experts): the format's cut
+ *  @param key_map    the mapping the half is registered under
+ *  @param key_offset the offset it is registered under
+ *  @param model_map  the stack's source mapping (its fd is read)
+ *  @param src_offset the stack's byte offset in the source
+ *  @param n_expert   experts in the stack
+ *  @param src_stride source bytes an expert
+ *  @param dst_stride half bytes an expert
+ *  @param cut        the format's cut
+ *  @return 1 registered, 0 refused or failed */
 template <typename Cut>
 static int cuda_register_expert_half(const void *key_map, uint64_t key_offset, const void *model_map,
                                      uint64_t src_offset, uint32_t n_expert, uint64_t src_stride,
@@ -1079,6 +1213,22 @@ static int cuda_register_expert_half(const void *key_map, uint64_t key_offset, c
  * destination layout is exactly cutlass_mxfp4_expert_layout of the half shape;
  * the caller passes both geometries so this file needs no byte model of its
  * own. */
+/** Registers a rank's half of a CUTLASS MXFP4 expert stack: output rows (gate / up) or input columns (down) [lo, hi).
+ *  @param key_map    the mapping the half is registered under
+ *  @param key_offset the offset it is registered under
+ *  @param model_map  the stack's source mapping
+ *  @param src_offset the stack's byte offset in the source
+ *  @param n_expert   experts
+ *  @param k          input width of an expert
+ *  @param n          output rows of an expert
+ *  @param k_half     nonzero: split K (input columns), else output rows
+ *  @param lo         first kept row / column (a multiple of 128)
+ *  @param hi         end of the kept range (a multiple of 128)
+ *  @param src_stride source bytes an expert
+ *  @param src_data   source data bytes an expert (the scale plane follows)
+ *  @param dst_stride half bytes an expert
+ *  @param dst_data   half data bytes an expert
+ *  @return 1 registered, 0 refused or failed */
 int pulsar_gpu_register_mxfp4_expert_half(const void *key_map, uint64_t key_offset,
                                           const void *model_map, uint64_t src_offset,
                                           uint32_t n_expert, uint64_t k, uint64_t n, int k_half,
@@ -1125,6 +1275,19 @@ int pulsar_gpu_register_mxfp4_expert_half(const void *key_map, uint64_t key_offs
  * trellis run(s), suh and svh, three strided copies -- and the destination is
  * exl3_expert_layout of the half shape, which the EXL3 arms read unchanged at
  * expert_mid_dim = hi - lo. */
+/** Registers a rank's half of an EXL3 expert stack (exl3_expert_cut is the byte model).
+ *  @param key_map    the mapping the half is registered under
+ *  @param key_offset the offset it is registered under
+ *  @param model_map  the stack's source mapping
+ *  @param src_offset the stack's byte offset in the source
+ *  @param n_expert   experts
+ *  @param k          input width of an expert
+ *  @param n          output width of an expert
+ *  @param k2         twice the EXL3 bit rate K
+ *  @param k_half     nonzero: split the input rows, else the output columns
+ *  @param lo         first kept index (128-aligned)
+ *  @param hi         end of the kept range
+ *  @return 1 registered, 0 refused or failed */
 int pulsar_gpu_register_exl3_expert_half(const void *key_map, uint64_t key_offset,
                                          const void *model_map, uint64_t src_offset,
                                          uint32_t n_expert, uint64_t k, uint64_t n, int k2, int k_half,
@@ -1150,6 +1313,7 @@ int pulsar_gpu_register_exl3_expert_half(const void *key_map, uint64_t key_offse
     });
 }
 
+/// Frees every model range, arena chunk and registration, and resets the range table and its byte count.
 static void cuda_model_range_release_all(void) {
     cuda_model_load_progress_finish();
     for (const cuda_model_range &r : g_model_ranges) {
@@ -1182,6 +1346,8 @@ static void cuda_model_range_release_all(void) {
  * cannot false-positive on the correct GB10 build).  Walk the registered TUs
  * BEFORE any kernel can launch and fail startup with the rebuild command
  * instead of dying mid-run in an opaque device assert. */
+/// @param prop the device's properties
+/// @return 1 when every registered TU carries code for this SM major, else 0 (named on stderr)
 static int cuda_tu_archs_ok(const cudaDeviceProp *prop) {
 #ifdef __CUDA_ARCH_LIST__
     for (const pulsar_tu_archs *r = pulsar_tu_archs_head; r; r = r->next) {
@@ -1206,6 +1372,9 @@ static int cuda_tu_archs_ok(const cudaDeviceProp *prop) {
 
 
 
+/// @param layout a PULSAR_TENSOR_* weight layout
+/// @param need   out: the arch the layout needs, for a refusal message (may be NULL)
+/// @return 1 when this device runs the layout's lanes, else 0
 int pulsar_gpu_layout_supported(uint32_t layout, const char **need) {
     const int cc = pulsar_cuda_device_cc();
     int ok = 1;
@@ -1226,6 +1395,8 @@ int pulsar_gpu_layout_supported(uint32_t layout, const char **need) {
     return ok;
 }
 
+/// Selects device 0 and checks it (TU archs, sm_75 floor).
+/// @return 1 ready, 0 refused
 int pulsar_gpu_init(void) {
     int dev = 0;
     if (!cuda_ok(cudaSetDevice(dev), "set device")) return 0;
@@ -1257,6 +1428,7 @@ int pulsar_gpu_init(void) {
 
 
 
+/// Tears the backend down: clears the process flags and weight caches, frees model ranges, scratch and staging.
 void pulsar_gpu_cleanup(void) {
     (void)cudaDeviceSynchronize();
     {   /* L188: the flag is process state; a later engine open must start clear.
@@ -1330,8 +1502,10 @@ void pulsar_gpu_cleanup(void) {
  * number to its memory ledger.  Atomic because drafter conf/token staging
  * tensors are allocated per spec step; one relaxed add is noise next to the
  * cudaMalloc it accompanies. */
+/// Live bytes of owning pulsar_gpu_tensor allocations (views and dry placeholders excluded), atomically updated.
 static uint64_t g_tensor_alloc_bytes;
 
+/// @return the live owning tensor bytes (g_tensor_alloc_bytes)
 uint64_t pulsar_gpu_tensor_alloc_bytes_current(void) {
     return __atomic_load_n(&g_tensor_alloc_bytes, __ATOMIC_RELAXED);
 }
@@ -1342,6 +1516,7 @@ uint64_t pulsar_gpu_tensor_alloc_bytes_current(void) {
  * allocation, the true byte count so view bounds hold) and total the bytes
  * asked for instead of calling cudaMalloc.  The session pricer runs the real
  * allocation code this way: the price and the allocation are one function. */
+/// This thread's dry-run allocation state (see above): active flag, requested and managed byte totals, fake cursor.
 static thread_local struct {
     int      active;
     uint64_t bytes;          /* every dry allocation, requested bytes */
@@ -1349,6 +1524,7 @@ static thread_local struct {
     uintptr_t cursor;        /* fake address space so placeholders are distinct */
 } g_dry;
 
+/// Starts a dry run on this thread: allocations hand out placeholders and total their bytes.
 void pulsar_gpu_tensor_dry_begin(void) {
     g_dry.active = 1;
     g_dry.bytes = 0;
@@ -1356,16 +1532,23 @@ void pulsar_gpu_tensor_dry_begin(void) {
     g_dry.cursor = 4096;
 }
 
+/// Ends this thread's dry run.
+/// @param bytes         out: bytes every dry allocation asked for (may be NULL)
+/// @param managed_bytes out: the managed subset (may be NULL)
 void pulsar_gpu_tensor_dry_end(uint64_t *bytes, uint64_t *managed_bytes) {
     if (bytes) *bytes = g_dry.bytes;
     if (managed_bytes) *managed_bytes = g_dry.managed_bytes;
     g_dry.active = 0;
 }
 
+/// @return nonzero while this thread is in a dry run
 int pulsar_gpu_tensor_dry_active(void) {
     return g_dry.active;
 }
 
+/// @param bytes   bytes asked for
+/// @param managed nonzero for a managed allocation
+/// @return a placeholder tensor (dry set, a distinct fake pointer, the true byte count), or NULL
 static pulsar_gpu_tensor *dry_alloc(uint64_t bytes, int managed) {
     pulsar_gpu_tensor *t = (pulsar_gpu_tensor *)calloc(1, sizeof(*t));
     if (!t) return NULL;
@@ -1384,6 +1567,10 @@ static pulsar_gpu_tensor *dry_alloc(uint64_t bytes, int managed) {
  * type separately -- and so a widening reader can refuse what it cannot widen
  * instead of decoding f16 bits as bf16.  The fmt/esz pair is checked here:
  * a caller stating a 2-byte f32 or a 4-byte f16 is lying to one authority. */
+/// @param n_elems elements
+/// @param esz     bytes an element (0 means 4); must agree with fmt (F32 4, F16 / BF16 2)
+/// @param fmt     the element format
+/// @return an owning device tensor recording esz and fmt, or NULL (refused or failed)
 pulsar_gpu_tensor *pulsar_gpu_tensor_alloc_elt(uint64_t n_elems, uint32_t esz,
                                                pulsar_elt_fmt fmt) {
     if (esz == 0) esz = 4u;
@@ -1400,6 +1587,8 @@ pulsar_gpu_tensor *pulsar_gpu_tensor_alloc_elt(uint64_t n_elems, uint32_t esz,
     return t;
 }
 
+/// @param bytes bytes (0 allocates 1)
+/// @return an owning device tensor (f32 by default), a dry placeholder in a dry run, or NULL
 pulsar_gpu_tensor *pulsar_gpu_tensor_alloc(uint64_t bytes) {
     if (bytes == 0) bytes = 1;
     if (g_dry.active) return dry_alloc(bytes, 0);
@@ -1417,6 +1606,8 @@ pulsar_gpu_tensor *pulsar_gpu_tensor_alloc(uint64_t bytes) {
 
 
 
+/// @param bytes bytes (0 allocates 1)
+/// @return an owning managed-memory tensor, a dry placeholder in a dry run, or NULL
 pulsar_gpu_tensor *pulsar_gpu_tensor_alloc_managed(uint64_t bytes) {
     if (bytes == 0) bytes = 1;
     if (g_dry.active) return dry_alloc(bytes, 1);
@@ -1434,6 +1625,8 @@ pulsar_gpu_tensor *pulsar_gpu_tensor_alloc_managed(uint64_t bytes) {
 
 
 
+/// @param total_bytes the device's total memory
+/// @return the free-memory reserve a non-managed KV cache must leave: a quarter of total, clamped to 8 .. 40 GiB
 static uint64_t cuda_managed_kv_reserve_bytes(uint64_t total_bytes) {
     const uint64_t min_reserve = 8ull * 1073741824ull;
     const uint64_t max_reserve = 40ull * 1073741824ull;
@@ -1445,6 +1638,9 @@ static uint64_t cuda_managed_kv_reserve_bytes(uint64_t total_bytes) {
 
 
 
+/// @param kv_cache_bytes the KV cache's size
+/// @param context_bytes  the session's context allocation size
+/// @return 1 when the KV cache should be managed memory (8 GiB or more, or a large context that would cut into the reserve)
 int pulsar_gpu_should_use_managed_kv_cache(uint64_t kv_cache_bytes, uint64_t context_bytes) {
     if (kv_cache_bytes == 0) return 0;
 
@@ -1474,6 +1670,10 @@ int pulsar_gpu_should_use_managed_kv_cache(uint64_t kv_cache_bytes, uint64_t con
 
 
 
+/// @param base   the tensor viewed
+/// @param offset byte offset of the view
+/// @param bytes  the view's size
+/// @return a heap-allocated non-owning view inheriting dry, esz and fmt, or NULL when out of bounds
 pulsar_gpu_tensor *pulsar_gpu_tensor_view(const pulsar_gpu_tensor *base, uint64_t offset, uint64_t bytes) {
     if (!base || offset > base->bytes || bytes > base->bytes - offset) return NULL;
     pulsar_gpu_tensor *t = (pulsar_gpu_tensor *)calloc(1, sizeof(*t));
@@ -1489,6 +1689,8 @@ pulsar_gpu_tensor *pulsar_gpu_tensor_view(const pulsar_gpu_tensor *base, uint64_
 
 
 
+/// Frees the tensor struct, and its device memory when it owns it (not a view, not dry).
+/// @param tensor the tensor, or NULL
 void pulsar_gpu_tensor_free(pulsar_gpu_tensor *tensor) {
     if (!tensor) return;
     if (tensor->owner && tensor->ptr && !tensor->dry) {
@@ -1500,6 +1702,8 @@ void pulsar_gpu_tensor_free(pulsar_gpu_tensor *tensor) {
 
 
 
+/// @param tensor the tensor, or NULL
+/// @return its size in bytes (0 for NULL)
 uint64_t pulsar_gpu_tensor_bytes(const pulsar_gpu_tensor *tensor) {
     return tensor ? tensor->bytes : 0;
 }
@@ -1512,12 +1716,18 @@ uint64_t pulsar_gpu_tensor_bytes(const pulsar_gpu_tensor *tensor) {
  * what pulsar_gpu_tensor_read is for. (There was a tensor_contents() here that
  * synchronised the whole device and returned the pointer; nothing had called it
  * in a long time, so it was a device-wide stall waiting for a first user.) */
+/// @param tensor the tensor, or NULL
+/// @return its device pointer (no synchronisation), or NULL
 void *pulsar_gpu_tensor_device_ptr(const pulsar_gpu_tensor *tensor) {
     return tensor ? tensor->ptr : NULL;
 }
 
 
 
+/// @param tensor the tensor
+/// @param value  the fill value
+/// @param count  f32 elements to fill from the start
+/// @return 1 launched (or nothing to do), 0 refused or failed
 int pulsar_gpu_tensor_fill_f32(pulsar_gpu_tensor *tensor, float value, uint64_t count) {
     if (!tensor || count > tensor->bytes / sizeof(float)) return 0;
     if (count == 0 || tensor->dry) return 1;
@@ -1528,6 +1738,7 @@ int pulsar_gpu_tensor_fill_f32(pulsar_gpu_tensor *tensor, float value, uint64_t 
 
 
 /* L302: the process's host<->device synchronisations (pulsar_gpu_sync_stats) */
+/// The process's host-device synchronisation counters, atomically updated.
 static pulsar_gpu_sync_stats g_sync_stats;
 
 void pulsar_cuda_sync_note(int kind, uint64_t bytes) {
@@ -1542,6 +1753,7 @@ void pulsar_cuda_sync_note(int kind, uint64_t bytes) {
     }
 }
 
+/// @param out the counters, copied out
 void pulsar_gpu_sync_stats_get(pulsar_gpu_sync_stats *out) {
     out->stream_syncs = __atomic_load_n(&g_sync_stats.stream_syncs, __ATOMIC_RELAXED);
     out->device_syncs = __atomic_load_n(&g_sync_stats.device_syncs, __ATOMIC_RELAXED);
@@ -1550,6 +1762,12 @@ void pulsar_gpu_sync_stats_get(pulsar_gpu_sync_stats *out) {
     out->h2d = __atomic_load_n(&g_sync_stats.h2d, __ATOMIC_RELAXED);
 }
 
+/// Blocking host-to-device write.
+/// @param tensor the destination
+/// @param offset byte offset in it
+/// @param data   host source
+/// @param bytes  bytes
+/// @return 1 written (or dry), 0 refused or failed
 int pulsar_gpu_tensor_write(pulsar_gpu_tensor *tensor, uint64_t offset, const void *data, uint64_t bytes) {
     if (!tensor || !data || offset > tensor->bytes || bytes > tensor->bytes - offset) return 0;
     if (tensor->dry) return 1;
@@ -1559,6 +1777,12 @@ int pulsar_gpu_tensor_write(pulsar_gpu_tensor *tensor, uint64_t offset, const vo
 
 
 
+/// Host-to-device write on the per-thread stream (data must stay valid until it runs).
+/// @param tensor the destination
+/// @param offset byte offset in it
+/// @param data   host source
+/// @param bytes  bytes
+/// @return 1 queued (or nothing to do), 0 refused or failed
 int pulsar_gpu_tensor_write_async(pulsar_gpu_tensor *tensor, uint64_t offset, const void *data, uint64_t bytes) {
     if (!tensor || !data || offset > tensor->bytes || bytes > tensor->bytes - offset) return 0;
     if (tensor->dry || bytes == 0) return 1;
@@ -1566,12 +1790,15 @@ int pulsar_gpu_tensor_write_async(pulsar_gpu_tensor *tensor, uint64_t offset, co
                                    cudaStreamPerThread), "tensor write async");
 }
 
+/// @param bytes bytes (nonzero)
+/// @return pinned host memory, or NULL
 void *pulsar_gpu_host_alloc(uint64_t bytes) {
     void *p = NULL;
     if (bytes == 0 || !cuda_ok(cudaMallocHost(&p, (size_t)bytes), "pinned host alloc")) return NULL;
     return p;
 }
 
+/// @param p pinned host memory from pulsar_gpu_host_alloc, or NULL
 void pulsar_gpu_host_free(void *p) {
     if (p) (void)cudaFreeHost(p);
 }
@@ -1581,6 +1808,11 @@ void pulsar_gpu_host_free(void *p) {
 /* The write counterpart of pulsar_read_q_f32: host f32 in, stored Q element
  * type out.  Exists so host code -- tests, tools -- can fill a Q buffer
  * without a second copy of the conversion living outside this file. */
+/// @param tensor    a Q buffer (pulsar_q_t elements)
+/// @param off_elems element offset
+/// @param src       host f32 values
+/// @param n         elements
+/// @return 1 written, 0 refused or failed
 int pulsar_gpu_tensor_write_q_f32(pulsar_gpu_tensor *tensor, uint64_t off_elems,
                                   const float *src, uint64_t n) {
     if (!tensor || !src) return 0;
@@ -1597,6 +1829,12 @@ int pulsar_gpu_tensor_write_q_f32(pulsar_gpu_tensor *tensor, uint64_t off_elems,
     return rc;
 }
 
+/// Blocking device-to-host read.
+/// @param tensor the source
+/// @param offset byte offset in it
+/// @param data   host destination
+/// @param bytes  bytes
+/// @return 1 read (or dry), 0 refused or failed
 int pulsar_gpu_tensor_read(const pulsar_gpu_tensor *tensor, uint64_t offset, void *data, uint64_t bytes) {
     if (!tensor || !data || offset > tensor->bytes || bytes > tensor->bytes - offset) return 0;
     if (tensor->dry) return 1;
@@ -1607,6 +1845,11 @@ int pulsar_gpu_tensor_read(const pulsar_gpu_tensor *tensor, uint64_t offset, voi
 
 
 
+/// Blocking read of raw device memory.
+/// @param device device source
+/// @param host   host destination
+/// @param bytes  bytes
+/// @return 1 read, 0 refused or failed
 int pulsar_gpu_device_read(const void *device, void *host, uint64_t bytes) {
     if (!device || !host) return 0;
     pulsar_cuda_sync_note(2, bytes);
@@ -1616,6 +1859,13 @@ int pulsar_gpu_device_read(const void *device, void *host, uint64_t bytes) {
 
 
 
+/// Blocking device-to-device copy.
+/// @param dst        destination tensor
+/// @param dst_offset byte offset in dst
+/// @param src        source tensor
+/// @param src_offset byte offset in src
+/// @param bytes      bytes
+/// @return 1 copied (or nothing to do / dry), 0 refused or failed
 int pulsar_gpu_tensor_copy(pulsar_gpu_tensor *dst, uint64_t dst_offset,
                                      const pulsar_gpu_tensor *src, uint64_t src_offset,
                                      uint64_t bytes) {
@@ -1644,6 +1894,12 @@ int pulsar_gpu_tensor_copy(pulsar_gpu_tensor *dst, uint64_t dst_offset,
  * NOT a drop-in for every call site: the ordering guarantee is per-stream, so
  * a destination handed to another stream, or to the allocator, still needs the
  * blocking version or an explicit sync. */
+/// @param dst        destination tensor
+/// @param dst_offset byte offset in dst
+/// @param src        source tensor
+/// @param src_offset byte offset in src
+/// @param bytes      bytes
+/// @return 1 queued (or nothing to do / dry), 0 refused or failed
 int pulsar_gpu_tensor_copy_async(pulsar_gpu_tensor *dst, uint64_t dst_offset,
                                  const pulsar_gpu_tensor *src, uint64_t src_offset,
                                  uint64_t bytes) {
@@ -1676,6 +1932,10 @@ typedef struct {
     uint64_t bytes;   ///< byte count; prepare rejects anything not a multiple of 16
 } pulsar_copy_desc;
 
+/** One launch over a descriptor table: blockIdx.y picks the copy, a grid-stride over its 16-byte words.  Grid
+ *  (chunks, n_descs), block 256.
+ *  @param descs   device descriptor table
+ *  @param n_descs descriptors */
 __global__ static void batched_copy_kernel(const pulsar_copy_desc *descs, uint32_t n_descs) {
     const uint32_t d = blockIdx.y;
     if (d >= n_descs) return;
@@ -1688,6 +1948,12 @@ __global__ static void batched_copy_kernel(const pulsar_copy_desc *descs, uint32
     }
 }
 
+/** Builds a device descriptor table for a fixed set of copies.
+ *  @param dst   destination tensors [n]
+ *  @param src   source tensors [n]
+ *  @param bytes bytes a copy [n] (nonzero multiples of 16, within both tensors)
+ *  @param n     copies
+ *  @return the table handle (free with pulsar_gpu_batched_copy_free), or NULL */
 void *pulsar_gpu_batched_copy_prepare(
         pulsar_gpu_tensor **dst,
         pulsar_gpu_tensor **src,
@@ -1719,10 +1985,15 @@ void *pulsar_gpu_batched_copy_prepare(
     return d;
 }
 
+/// @param handle a table from pulsar_gpu_batched_copy_prepare, or NULL
 void pulsar_gpu_batched_copy_free(void *handle) {
     if (handle) cudaFree(handle);
 }
 
+/// @param handle    the table
+/// @param n_descs   its descriptors
+/// @param max_bytes the largest copy's bytes (sizes the grid's x, 1 .. 64 blocks)
+/// @return 1 launched, 0 refused or failed
 int pulsar_gpu_batched_copy_run(void *handle, uint32_t n_descs, uint64_t max_bytes) {
     if (!handle || n_descs == 0) return 0;
     uint32_t chunks = (uint32_t)(((max_bytes >> 4) + 255) / 256);
@@ -1735,6 +2006,7 @@ int pulsar_gpu_batched_copy_run(void *handle, uint32_t n_descs, uint64_t max_byt
 
 
 
+/// @return 1 (nothing to do: the per-thread stream needs no begin)
 int pulsar_gpu_begin_commands(void) { return 1; }
 
 
@@ -1790,23 +2062,29 @@ constexpr uint32_t SEG_LIVE_WARM = 11u;      ///< a live key's eager uses before
 constexpr uint32_t SEG_CATALOG_WARM = 1u;    ///< a catalog key's: one warms its scratch, the second captures
 constexpr size_t SEG_LIVE_MAX = 1024u;       ///< live keys held; past it the least recently used is dropped
 
+/// Segment-graph table: every key seen (live, catalog or dead) and its entry.
 std::unordered_map<uint64_t, seg_ent> g_seg;
 std::list<uint64_t> g_seg_lru;               ///< the live keys, most recently used first
+/// A segment capture is open on this process (pulsar_gpu_seg_enter .. exit).
 bool g_seg_capturing = false;
 bool g_seg_reset_pending = false;            ///< a scratch regrow during a capture: drop every exec after it
 bool g_seg_catalog_on = false;               ///< the warmup's declaration window is open
 bool g_seg_catalog_done = false;             ///< a warmup declared a catalog and closed (a regrow after it is news)
 bool g_seg_off = false;                      ///< L296 perf: an instrument's eager reference (never the engine)
+/// seg_now() at the warmup's catalog window opening, for its closing line's elapsed seconds.
 double g_seg_catalog_t0 = 0.0;
 uint64_t g_seg_catalog_refused = 0;          ///< bodies that refused under a capture inside the window
+/// The segment graphs' running counters (pulsar_gpu_seg_stats).
 pulsar_gpu_seg_stats g_seg_st;
 
+/// @return CLOCK_MONOTONIC time in seconds
 double seg_now(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (double)ts.tv_sec + 1e-9 * (double)ts.tv_nsec;
 }
 
+/// @return the device's free memory in bytes (cudaMemGetInfo), or 0 when the query fails
 uint64_t seg_free_bytes(void) {
     size_t fr = 0, tot = 0;
     if (cudaMemGetInfo(&fr, &tot) != cudaSuccess) {
@@ -1816,6 +2094,8 @@ uint64_t seg_free_bytes(void) {
     return (uint64_t)fr;
 }
 
+/// Destroys a key's graph exec, if it has one, and takes it off the counters (graphs, graph_bytes).
+/// @param e the key's entry
 void seg_drop_exec(seg_ent &e) {
     if (!e.exec) return;
     (void)cudaGraphExecDestroy(e.exec);
@@ -1826,6 +2106,10 @@ void seg_drop_exec(seg_ent &e) {
 }
 
 /* A key's capture or replay failed: it refuses from now on.  One line per key (rule 9: loudly, once). */
+/// @param key  the segment key
+/// @param e    its entry (marked dead, exec dropped, out of the LRU)
+/// @param what the failed step for the message ("replay", "capture begin", "capture", "instantiate", "first launch")
+/// @param rc   the CUDA error that killed it
 void seg_kill(uint64_t key, seg_ent &e, const char *what, cudaError_t rc) {
     (void)cudaGetLastError();
     seg_drop_exec(e);
@@ -1839,6 +2123,8 @@ void seg_kill(uint64_t key, seg_ent &e, const char *what, cudaError_t rc) {
 
 /* The key's entry, made on first sight -- a catalog key while the warmup's window is open, else a live one (the least
  * recently used live key dropped when the table holds SEG_LIVE_MAX). */
+/// @param key the segment key
+/// @return the key's entry (created, promoted to catalog, or moved to the LRU front as above)
 seg_ent &seg_lookup(uint64_t key) {
     auto it = g_seg.find(key);
     if (it == g_seg.end()) {
@@ -1879,6 +2165,7 @@ seg_ent &seg_lookup(uint64_t key) {
 
 /* A scratch regrow (or the instrument's switch): every exec dropped, every key's warm-up started over; the catalog
  * keys stay declared, the live ones are forgotten, a dead key stays dead. */
+/// Drops every exec and restarts every warm-up (see above); clears the LRU and the pending reset.
 void seg_drop_graphs(void) {
     for (auto it = g_seg.begin(); it != g_seg.end();) {
         seg_ent &e = it->second;
@@ -1896,6 +2183,8 @@ void seg_drop_graphs(void) {
 
 }  // namespace
 
+/// @param key the stretch's key (0: the caller's own eager lane)
+/// @return 2 replayed, 1 capture armed, 0 run eagerly, -1 refused (see the block above)
 int pulsar_gpu_seg_enter(uint64_t key) {
     if (g_seg_capturing || key == 0 || g_seg_off) return 0;
     seg_ent &e = seg_lookup(key);
@@ -1939,6 +2228,9 @@ int pulsar_gpu_seg_enter(uint64_t key) {
     return 1;
 }
 
+/// @param key     the key seg_enter armed
+/// @param body_ok the body ran (was recorded) without refusing
+/// @return 1 captured and launched, 0 nothing ran (see the block above)
 int pulsar_gpu_seg_exit(uint64_t key, int body_ok) {
     cudaGraph_t gr = NULL;
     g_seg_capturing = false;
@@ -1995,6 +2287,7 @@ int pulsar_gpu_seg_exit(uint64_t key, int body_ok) {
     return 1;
 }
 
+/// Drops every key and exec (deferred to seg_exit while a capture is open).
 void pulsar_gpu_seg_reset(void) {
     if (g_seg_capturing) {   /* mid-capture: deferred to seg_exit */
         g_seg_reset_pending = true;
@@ -2008,6 +2301,8 @@ void pulsar_gpu_seg_reset(void) {
 
 /* L296 perf: an instrument runs the same steps with the segment cache off (every segment eager, nothing captured or
  * replayed) to compare the graphed lane against; returns the previous setting.  Turning it off drops the cache. */
+/// @param on nonzero enables the segment cache
+/// @return the previous setting
 int pulsar_gpu_seg_set_enabled(int on) {
     const int was = !g_seg_off;
     g_seg_off = !on;
@@ -2016,19 +2311,25 @@ int pulsar_gpu_seg_set_enabled(int on) {
 }
 
 /* L292: the counters an instrument reads to prove which lane it ran (replays served, captures begun since start). */
+/// @param replays  out: replays served (may be NULL)
+/// @param captures out: captures begun (may be NULL)
 void pulsar_gpu_seg_counts(uint64_t *replays, uint64_t *captures) {
     if (replays) *replays = g_seg_st.replays;
     if (captures) *captures = g_seg_st.captures;
 }
 
+/// @param out the segment graphs' counters, copied out
 void pulsar_gpu_seg_stats_get(pulsar_gpu_seg_stats *out) { *out = g_seg_st; }
 
+/// Opens the warmup's declaration window: keys first seen now are catalog keys.
 void pulsar_gpu_seg_catalog_open(void) {
     g_seg_catalog_on = true;
     g_seg_catalog_refused = 0;
     g_seg_catalog_t0 = seg_now();
 }
 
+/// Closes the warmup's window and prints the catalog line.
+/// @return the catalog keys that failed plus the bodies that refused under capture (0 = all good)
 uint64_t pulsar_gpu_seg_catalog_close(void) {
     if (!g_seg_catalog_on) return 0;
     g_seg_catalog_on = false;
@@ -2056,6 +2357,7 @@ uint64_t pulsar_gpu_seg_catalog_close(void) {
  * 2026-08-27, rows/L119.md).  Growth sites call this; a sync at the free site prevents the race but NOT the staleness
  * -- only invalidation does.  L306: the catalog stays declared and recaptures on its next uses; a regrow after the
  * warmup is announced once and counted. */
+/// Scratch-regrow hook: drops every exec (keeps the catalog), deferred while a capture is open.
 void pulsar_gpu_seg_note_device_free(void) {
     if (g_seg_capturing) {
         g_seg_reset_pending = true;
@@ -2083,9 +2385,14 @@ void pulsar_gpu_seg_note_device_free(void) {
  * capture: the fill would be recorded into the graph. */
 namespace {
 int g_poison = -1;   ///< -1: PULSAR_SCRATCH_POISON not read yet
+/// Steps poisoned so far (picks the next pattern byte).
 uint64_t g_poison_steps, g_poison_bytes;
+/** @var g_poison_bytes
+ *  scratch bytes filled so far, over every step */
+/// The fill bytes cycled step by step: 0xFF (NaN / -1), 0x00, 0x7F (huge finite values).
 const unsigned char kPoison[3] = {0xFFu, 0x00u, 0x7Fu};
 
+/// @return true when scratch poisoning is armed (reads PULSAR_SCRATCH_POISON on the first call)
 bool poison_armed(void) {
     if (g_poison < 0) {
         const char *v = getenv("PULSAR_SCRATCH_POISON");
@@ -2098,12 +2405,18 @@ bool poison_armed(void) {
 }
 }  // namespace
 
+/// @param on nonzero arms scratch poisoning
+/// @return the previous setting
 int pulsar_gpu_scratch_poison_set(int on) {
     const int was = poison_armed() ? 1 : 0;
     g_poison = on ? 1 : 0;
     return was;
 }
 
+/// Fills this thread's scratch slots and the named regions with the step's pattern byte, on the per-thread stream.
+/// @param regions the step's own scratch tensors [n] (NULL entries skipped)
+/// @param n       regions
+/// @return 1 done (or unarmed), 0 refused inside a capture or failed
 int pulsar_gpu_scratch_poison_step(pulsar_gpu_tensor *const *regions, uint32_t n) {
     if (!poison_armed()) return 1;
     if (g_seg_capturing) {
@@ -2128,6 +2441,8 @@ int pulsar_gpu_scratch_poison_step(pulsar_gpu_tensor *const *regions, uint32_t n
     return cuda_ok(rc, "L307 scratch poison");
 }
 
+/// @param steps out: steps poisoned (may be NULL)
+/// @param bytes out: bytes filled (may be NULL)
 void pulsar_gpu_scratch_poison_counts(uint64_t *steps, uint64_t *bytes) {
     if (steps) *steps = g_poison_steps;
     if (bytes) *bytes = g_poison_bytes;
@@ -2137,10 +2452,13 @@ void pulsar_gpu_scratch_poison_counts(uint64_t *steps, uint64_t *bytes) {
 /* The TP row lane's error word (pulsar_gpu_tp_err_word_set): 1 = the proxy
  * failed an exchange (transport timeout or error), 2 = the lane was aborted (pulsar_tp_row_lane_abort).  Latched:
  * once set the lane is dead, so every later drain refuses too. */
+/// The TP row lane's error word (host view), or NULL when no lane is armed.
 static const volatile uint32_t *g_tp_err_word = NULL;
 
+/// @param word the row lane's error word, or NULL to disarm
 void pulsar_gpu_tp_err_word_set(const volatile uint32_t *word) { g_tp_err_word = word; }
 
+/// @return 1 when no lane is armed or its error word is clear, else 0 (named on stderr)
 static int tp_err_word_ok(void) {
     if (!g_tp_err_word || *g_tp_err_word == 0u) return 1;
     fprintf(stderr, "pulsar: a tensor-parallel row-lane exchange %s -- refusing the step "
@@ -2150,6 +2468,8 @@ static int tp_err_word_ok(void) {
     return 0;
 }
 
+/// Drains the per-thread stream and checks the TP error word and the routed-expert flags.
+/// @return 1 the step's work is good, 0 the step refuses (named on stderr)
 int pulsar_gpu_end_commands(void) {
     cuda_model_load_progress_finish();
     pulsar_cuda_sync_note(0, 0);
@@ -2189,6 +2509,8 @@ int pulsar_gpu_end_commands(void) {
 }
 
 
+/// Drains the device and clears the routed-expert flags a step that did not complete may have left.
+/// @return 1 drained, 0 a CUDA error, a flag read error or a failed TP lane
 int pulsar_gpu_synchronize(void) {
     cuda_model_load_progress_finish();
     pulsar_cuda_sync_note(1, 0);
@@ -2228,10 +2550,14 @@ int pulsar_gpu_synchronize(void) {
  * polls within one chunk, 43 layers, well inside).  A reused slot can only
  * delay a report, never advance it.  Worker-thread only, like every other
  * per-thread-stream entry point here. */
+/// Completion markers in the ring.
 #define PULSAR_GPU_MARKERS 64u
+/// The marker ring's events (created on first use).
 static cudaEvent_t g_marker[PULSAR_GPU_MARKERS];
+/// Markers recorded so far (the next slot is g_marker_next % PULSAR_GPU_MARKERS).
 static uint32_t g_marker_next = 0;
 
+/// @return a marker handle recorded on the per-thread stream, or -1 on failure
 int pulsar_gpu_marker_record(void) {
     const uint32_t i = g_marker_next % PULSAR_GPU_MARKERS;
     if (!g_marker[i] &&
@@ -2247,6 +2573,8 @@ int pulsar_gpu_marker_record(void) {
     return (int)i;
 }
 
+/// @param marker a handle from pulsar_gpu_marker_record
+/// @return 1 completed (or an invalid / broken marker), 0 not yet
 int pulsar_gpu_marker_done(int marker) {
     if (marker < 0 || (uint32_t)marker >= PULSAR_GPU_MARKERS || !g_marker[marker]) return 1;
     const cudaError_t err = cudaEventQuery(g_marker[marker]);
@@ -2257,6 +2585,10 @@ int pulsar_gpu_marker_done(int marker) {
 
 
 
+/// Makes model_map the model mapping: releases every cached range (resetting progress for a new mapping).
+/// @param model_map the host mapping base
+/// @param model_size its size
+/// @return 1 set, 0 refused (NULL or empty)
 static int cuda_model_set_host_map(const void *model_map, uint64_t model_size) {
     if (!model_map || model_size == 0) return 0;
     const int same_backing_model =
@@ -2284,6 +2616,10 @@ static int cuda_model_set_host_map(const void *model_map, uint64_t model_size) {
 
 
 
+/// Sets the model mapping and registers it for device access on an integrated GPU (else spans are staged).
+/// @param model_map  the host mapping base
+/// @param model_size its size
+/// @return 1 ready, 0 refused (bad mapping, or an unregistered model over the cache budget)
 int pulsar_gpu_set_model_map(const void *model_map, uint64_t model_size) {
     if (!cuda_model_set_host_map(model_map, model_size)) return 0;
 
@@ -2346,6 +2682,13 @@ int pulsar_gpu_set_model_map(const void *model_map, uint64_t model_size) {
 
 
 
+/// pulsar_gpu_set_model_map; the range arguments are ignored.
+/// @param model_map        the host mapping base
+/// @param model_size       its size
+/// @param map_offset       ignored
+/// @param map_size         ignored
+/// @param max_tensor_bytes ignored
+/// @return pulsar_gpu_set_model_map's result
 int pulsar_gpu_set_model_map_range(const void *model_map, uint64_t model_size, uint64_t map_offset, uint64_t map_size, uint64_t max_tensor_bytes) {
     (void)max_tensor_bytes;
     (void)map_offset;
@@ -2356,6 +2699,10 @@ int pulsar_gpu_set_model_map_range(const void *model_map, uint64_t model_size, u
 
 
 
+/// Records the fd backing a mapping (and opens its O_DIRECT twin when the filesystem allows).
+/// @param fd        the buffered fd (the caller keeps it open), or -1
+/// @param model_map the mapping it backs
+/// @return 1 recorded, 0 the table is full
 int pulsar_gpu_set_model_fd_for_map(int fd, const void *model_map) {
     model_fd_entry *e = NULL;
     for (int i = 0; i < g_model_fd_count; i++) {
@@ -2410,6 +2757,13 @@ int pulsar_gpu_set_model_fd_for_map(int fd, const void *model_map) {
 
 
 
+/// Places a model range on the device now (startup), unless it is already resident.
+/// @param model_map  the host mapping base
+/// @param model_size its size
+/// @param offset     byte offset of the range
+/// @param bytes      range length (0: nothing to do)
+/// @param label      caller label for the diagnostics
+/// @return 1 resident, 0 out of bounds or not placed
 int pulsar_gpu_cache_model_range(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes, const char *label) {
     if (!model_map || bytes == 0) return 1;
     if (offset > model_size || bytes > model_size - offset) return 0;
@@ -2435,6 +2789,12 @@ int pulsar_gpu_cache_model_range(const void *model_map, uint64_t model_size, uin
  * fd through a pinned staging buffer, then registered in g_model_ranges under
  * the overlay's host map so cuda_model_range_ptr resolves them like any other
  * cached range. Runs at startup only (synchronous). */
+/// @param host_base_key the key mapping the range is registered under
+/// @param fd            the overlay file
+/// @param offset        file byte offset (also the registered offset)
+/// @param bytes         range length
+/// @param label         caller label for the diagnostics
+/// @return 1 uploaded and registered, 0 refused or failed
 int pulsar_gpu_cache_external_range(const void *host_base_key, int fd,
                                             uint64_t offset, uint64_t bytes,
                                             const char *label) {
@@ -2519,6 +2879,8 @@ int pulsar_gpu_cache_external_range(const void *host_base_key, int fd,
 
 
 
+/// @param free_out  out: free device bytes (may be NULL)
+/// @param total_out out: total device bytes (may be NULL)
 void pulsar_gpu_mem_info(uint64_t *free_out, uint64_t *total_out) {
     size_t free_b = 0, total_b = 0;
     (void)cudaMemGetInfo(&free_b, &total_b);
@@ -2528,6 +2890,7 @@ void pulsar_gpu_mem_info(uint64_t *free_out, uint64_t *total_out) {
 
 
 
+/// @param label a label for the stderr line, or NULL
 void pulsar_gpu_print_memory_report(const char *label) {
     size_t free_b = 0, total_b = 0;
     (void)cudaMemGetInfo(&free_b, &total_b);

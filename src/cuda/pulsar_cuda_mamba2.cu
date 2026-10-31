@@ -1,3 +1,5 @@
+/** @file
+ *  Mamba-2 (SSD) mixer block kernels: conv, the selective scan and the gated norm. */
 /* Mamba-2 (SSD) mixer block (L296 N2) -- the contract, the math and the state
  * layout are in pulsar_cuda_mamba2.h.
  *
@@ -27,21 +29,39 @@
 
 namespace {
 
+/// head_dim P of the built instance (64).
 constexpr int P = 64;            /* head_dim (the built instance) */
+/// d_state N of the built instance (128).
 constexpr int N = 128;           /* d_state */
+/// Column quarters of a state row: a scan thread holds N / NQ columns of one p row.
 constexpr int NQ = 4;            /* column quarters: a thread's state is one p row's N / NQ columns */
+/// State floats a scan thread holds in registers (32).
 constexpr int NPT = N / NQ;      /* 32 floats of state a thread */
+/// Scan CTAs per head (each takes half of its P rows).
 constexpr int PS = 2;            /* CTAs a head (halves of its p rows) */
+/// p rows per scan CTA (32).
 constexpr int PC = P / PS;       /* p rows a CTA */
+/// Threads per scan / commit CTA (128): warp q owns column quarter q of the CTA's PC rows.
 constexpr int NT = PC * NQ;      /* 128 threads: warp q owns column quarter q of all PC rows */
+/// Rows staged in shared memory per scan tile; a run longer than this takes the separate dt launch.
 constexpr int TT = 16;           /* rows a tile */
 static_assert(PC == 32, "a warp is one column quarter of the CTA's p rows");
 static_assert(NPT % 8 == 0, "the y share is four chains of NPT / 4");
 
+/// @param b bf16 bits.
+/// @return the value widened to f32 (pulsar_sconv_bf2f).
 __device__ __forceinline__ float bf2f(uint16_t b) { return pulsar_sconv_bf2f(b); }
+/// @param f f32 value.
+/// @return its bf16 bits, round to nearest even (pulsar_sconv_f2bf).
 __device__ __forceinline__ uint16_t f2bf(float f) { return pulsar_sconv_f2bf(f); }
 
 /* ---- dt and dA of (row, head), double: softplus(dt_raw + dt_bias) and exp(dt * A), A = -exp(A_log) ------ */
+/// dt = softplus(dt_raw + dt_bias) (torch threshold 20) and dA = exp(dt * -exp(A_log)), the transcendentals in double.
+/// @param dt_raw  the row's raw dt for the head, bf16 bits.
+/// @param dt_bias the head's dt bias, bf16 bits.
+/// @param A_log   the head's A_log, bf16 bits.
+/// @param dt_out  out: dt (f32).
+/// @param dA_out  out: dA (f32).
 __device__ __forceinline__ void mamba2_dt(uint16_t dt_raw, uint16_t dt_bias, uint16_t A_log, float *dt_out,
                                           float *dA_out) {
     const float s = __fadd_rn(bf2f(dt_raw), bf2f(dt_bias));
@@ -51,9 +71,19 @@ __device__ __forceinline__ void mamba2_dt(uint16_t dt_raw, uint16_t dt_bias, uin
     *dA_out = (float)exp((double)dt * A);
 }
 
+/// Threads per block of mamba2_dt_kernel.
 constexpr int DT_THREADS = 256;
 
 /* ---- 2. dt and dA per (row, head) into the scratch (a call with a run longer than a tile) --------------- */
+/// Launch 2: dt and dA for every (row, head), thread = one pair.  Grid ceil(rows * H / DT_THREADS), block DT_THREADS.
+/// @param dt_raw  raw dt, bf16 [rows][ld_dt].
+/// @param ld_dt   dt_raw's row stride in elements.
+/// @param dt_bias bf16 [H].
+/// @param A_log   bf16 [H].
+/// @param H       heads.
+/// @param rows    call rows.
+/// @param dt_out  out: f32 [rows][H].
+/// @param dA_out  out: f32 [rows][H].
 __global__ void __launch_bounds__(DT_THREADS)
 mamba2_dt_kernel(const uint16_t *__restrict__ dt_raw, uint64_t ld_dt, const uint16_t *__restrict__ dt_bias,
                  const uint16_t *__restrict__ A_log, uint32_t H, uint32_t rows, float *__restrict__ dt_out,
@@ -65,20 +95,47 @@ mamba2_dt_kernel(const uint16_t *__restrict__ dt_raw, uint64_t ld_dt, const uint
 }
 
 /* ---- 3. the scan ------------------------------------------------------------------------------------- */
+/// The scan kernel's arguments (passed by value).
 struct scan_args {
+    /// The conv output x | B | C, bf16 [rows][CC] (SiLU applied).
     const uint16_t *conv_out;      /* [rows][CC] */
+    /// dt from launch 2, f32 [rows][H], or NULL: the scan computes dt and dA itself.
     const float *dt, *dA;          /* [rows][H] from launch 2, or NULL: the scan stages them itself */
+    /** @var dA
+     *  dA from launch 2, f32 [rows][H], or NULL with dt. */
+    /// Raw dt, bf16, row r's head h at dt_raw[r * ld_dt + h] (read when dt is NULL).
     const uint16_t *dt_raw;        /* row r's head h at dt_raw[r * ld_dt + h] */
+    /// dt_raw's row stride in elements.
     uint64_t ld_dt;
+    /// dt bias, bf16 [H].
     const uint16_t *dt_bias, *A_log;
+    /** @var A_log
+     *  A_log, bf16 [H]. */
+    /// The skip weight D, bf16 [H]: y += D[h] * x.
     const uint16_t *D;
+    /// [n_seqs + 1] first call row of each sequence.
     const int32_t *seq_first, *seq_slot;
+    /** @var seq_slot
+     *  [n_seqs] each sequence's pool slot. */
+    /// SSM state pool, f32 [slots][H][P][N].
     float *ssm;                    /* pool */
+    /// The verify's DELTA records, f32 [rows][upd] = x [H*P], dt*B [G*N], dt [H], dA [H]; or NULL (then the state is written back).
     float *cap;                    /* DELTA records, or NULL */
+    /// Out: the scan output y, bf16 [rows][H*P].
     uint16_t *y;                   /* [rows][H*P] */
+    /// Heads.
     uint32_t H, G, CC, upd;
+    /** @var G
+     *  B / C groups (H / G heads share one).
+     *  @var CC
+     *  conv_out's row width, H*P + 2*G*N.
+     *  @var upd
+     *  Floats per DELTA record (pulsar_mamba2_upd_floats). */
 };
 
+/// Launch 3: the selective scan of one sequence for half of one head's p rows; the state stays in registers.
+/// Grid (n_seqs, H, PS), block NT, ~29 KB static smem.
+/// @param a the arguments (scan_args).
 __global__ void __launch_bounds__(NT) mamba2_scan_kernel(const scan_args a) {
     __shared__ __align__(16) float sdb[TT][N];   /* dt * B, per row of the tile */
     __shared__ __align__(16) float sc[TT][N];    /* C */
@@ -196,6 +253,14 @@ __global__ void __launch_bounds__(NT) mamba2_scan_kernel(const scan_args a) {
 }
 
 /* ---- the DELTA commit: the scan's own update on the recorded values, row by row ----------------------- */
+/// The DELTA commit: advance one slot's SSM state by the first `keep` DELTA records, the scan's own arithmetic.
+/// Grid (H, PS), block NT.
+/// @param ssm        the slot's state, f32 [H][P][N], 16-byte aligned; updated in place.
+/// @param upd        the sequence's first DELTA record, f32 [keep][upd_floats].
+/// @param keep       records to apply, in row order.
+/// @param H          heads.
+/// @param G          B / C groups.
+/// @param upd_floats floats per record.
 __global__ void __launch_bounds__(NT)
 mamba2_commit_kernel(float *__restrict__ ssm, const float *__restrict__ upd, uint32_t keep, uint32_t H, uint32_t G,
                      uint32_t upd_floats) {
@@ -229,6 +294,17 @@ mamba2_commit_kernel(float *__restrict__ ssm, const float *__restrict__ upd, uin
 }
 
 /* ---- 4. the gated grouped RMSNorm: one CTA per (row, group), 8 channels a thread ---------------------- */
+/// Launch 4: out = rmsnorm_group(y * silu(z)) * w per norm group, bf16 rounding where torch rounds.
+/// Grid (rows, H*P / ng), block ng / 8 (8 channels a thread, <= 1024).
+/// @param y      the scan output, bf16 [rows][HP].
+/// @param HP     H * P (y's row width).
+/// @param z      the gate, bf16 [rows][ld_z].
+/// @param ld_z   z's row stride in elements.
+/// @param w      the norm weight, bf16 [H*P].
+/// @param ng     channels per norm group.
+/// @param eps    the norm's epsilon.
+/// @param out    out: bf16 [rows][ld_out].
+/// @param ld_out out's row stride in elements.
 __global__ void __launch_bounds__(1024)
 mamba2_norm_kernel(const uint16_t *__restrict__ y, uint32_t HP, const uint16_t *__restrict__ z, uint64_t ld_z,
                    const uint16_t *__restrict__ w, uint32_t ng, float eps, uint16_t *__restrict__ out, uint64_t ld_out) {
@@ -269,16 +345,25 @@ mamba2_norm_kernel(const uint16_t *__restrict__ y, uint32_t HP, const uint16_t *
     *reinterpret_cast<uint4 *>(out + row * ld_out + c0) = make_uint4(o[0], o[1], o[2], o[3]);
 }
 
+/// Names a refused contract on stderr.
+/// @param what the broken condition.
+/// @return -1.
 int refuse(const char *what) {
     fprintf(stderr, "pulsar: mamba2: refused -- %s\n", what);
     return -1;
 }
 
+/// @param p any pointer.
+/// @return whether it is 16-byte aligned.
 bool aligned16(const void *p) { return ((uintptr_t)p & 15u) == 0; }
 
+/// @param b a byte count.
+/// @return b rounded up to a multiple of 16.
 size_t round16(size_t b) { return (b + 15u) & ~(size_t)15u; }
 
 /* the geometry the built kernels run, or the reason it is refused */
+/// @param g the geometry.
+/// @return NULL when the built kernels run it, else the reason it is refused.
 const char *geom_refusal(const pulsar_mamba2_geom *g) {
     if (!g) return "no geometry";
     if (g->head_dim != (uint32_t)P || g->d_state != (uint32_t)N)
@@ -294,6 +379,13 @@ const char *geom_refusal(const pulsar_mamba2_geom *g) {
 }
 
 /* [lo, hi) bytes of `rows` rows of `C` bf16 at stride ld */
+/// The byte range a strided bf16 matrix covers.
+/// @param p    first element.
+/// @param ld   row stride in elements.
+/// @param rows rows (>= 1).
+/// @param C    columns used per row.
+/// @param lo   out: first byte address.
+/// @param hi   out: one past the last used byte.
 void span(const uint16_t *p, uint64_t ld, uint32_t rows, uint64_t C, uintptr_t *lo, uintptr_t *hi) {
     *lo = (uintptr_t)p;
     *hi = (uintptr_t)(p + (uint64_t)(rows - 1) * ld + C);

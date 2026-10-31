@@ -1,3 +1,5 @@
+/** @file
+ *  CUTLASS MXFP4 tensor-core expert FFN for the DeepSeek MoE (sm_120f, W4A8). */
 // pulsar_mxfp4_cutlass.cu — CUTLASS MXFP4 tensor-core expert FFN for the ds4 MoE (sm_120f).
 // Weights arrive pre-packed in CUTLASS B layout (from the offline converter); activations are
 // E4M3 (+ue8m0 block scales) -- W4A8, matching the source model's activation format.
@@ -29,17 +31,31 @@ using namespace cute;
 // The weight-side SF (SFB) swizzle is BYTE-IDENTICAL to the former all-fp4 (mxf4nvf4) config
 // (verified: same tile_atom_to_shape_SFB shape/stride/size), so the type-40 weight repack and the
 // shipped blk 0-2 stay valid unchanged; only the activation element (fp4->fp8) and its packer change. ----
+/// A operand: MX E4M3 activations (UE8M0 per-32 block scales).
 using ElementA   = cutlass::mx_float8_t<cutlass::float_e4m3_t>;
+/// B operand: MX E2M1 weights (UE8M0 per-32 block scales).
 using ElementB   = cutlass::mx_float4_t<cutlass::float_e2m1_t>;
+/// D (output) element: f32.
 using ElementD   = float;
+/// C element: f32 (beta = 0, unused).
 using ElementC   = float;
+/// Accumulator element: f32.
 using ElementAcc = float;
+/// A is row-major [M][K].
 using LayoutA    = cutlass::layout::RowMajor;
+/// B is column-major [K][N], i.e. weight rows [N][K] K-contiguous.
 using LayoutB    = cutlass::layout::ColumnMajor;
+/// C is row-major [M][N].
 using LayoutC    = cutlass::layout::RowMajor;
+/// D is row-major [M][N].
 using LayoutD    = cutlass::layout::RowMajor;
+/// A alignment in elements (32 E4M3 = 32 B).
 constexpr int AlignA = 32, AlignB = 32;
+/** @var AlignB
+ *  B alignment in elements (32 E2M1 = 16 B) */
+/// C alignment in elements (one 128-bit access).
 constexpr int AlignC = 128 / cutlass::sizeof_bits<ElementC>::value;
+/// D alignment in elements (one 128-bit access).
 constexpr int AlignD = 128 / cutlass::sizeof_bits<ElementD>::value;
 /* Occupancy sweep knob (2026-08-07).  ncu says both CUTLASS MXFP4 kernels run
  * 168 registers x 384 threads = 64512 regs/block against 65536 per SM, i.e.
@@ -51,33 +67,44 @@ constexpr int AlignD = 128 / cutlass::sizeof_bits<ElementD>::value;
  * re-reads) for residency, so it must be MEASURED, not assumed.
  * Override: -DPULSAR_MXFP4_TILE_M=64 etc. */
 #ifndef PULSAR_MXFP4_TILE_M
+/// CTA tile M (rows of A / D); override at build time for occupancy sweeps.
 #define PULSAR_MXFP4_TILE_M 128
 #endif
 #ifndef PULSAR_MXFP4_TILE_N
+/// CTA tile N (output columns).
 #define PULSAR_MXFP4_TILE_N 128
 #endif
 #ifndef PULSAR_MXFP4_TILE_K
+/// CTA tile K (reduction depth).
 #define PULSAR_MXFP4_TILE_K 128
 #endif
+/// The CTA tile (M, N, K).
 using TileShape    = Shape<cute::Int<PULSAR_MXFP4_TILE_M>,
                            cute::Int<PULSAR_MXFP4_TILE_N>,
                            cute::Int<PULSAR_MXFP4_TILE_K>>;
+/// No clusters (1 x 1 x 1).
 using ClusterShape = Shape<_1,_1,_1>;
 
+/// The SM120 block-scaled epilogue for the single-GEMM kernel (f32 D, alpha 1, beta 0).
 using CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
     cutlass::arch::Sm120, cutlass::arch::OpClassBlockScaledTensorOp,
     TileShape, ClusterShape, cutlass::epilogue::collective::EpilogueTileAuto,
     ElementAcc, ElementAcc, ElementC, LayoutC, AlignC, ElementD, LayoutD, AlignD,
     cutlass::epilogue::collective::EpilogueScheduleAuto>::CollectiveOp;
+/// The SM120 block-scaled mainloop (kind::f8f6f4, E4M3 x E2M1), stages auto-carved around the epilogue.
 using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder<
     cutlass::arch::Sm120, cutlass::arch::OpClassBlockScaledTensorOp,
     ElementA, LayoutA, AlignA, ElementB, LayoutB, AlignB, ElementAcc,
     TileShape, ClusterShape,
     cutlass::gemm::collective::StageCountAutoCarveout<static_cast<int>(sizeof(typename CollectiveEpilogue::SharedStorage))>,
     cutlass::gemm::collective::KernelScheduleAuto>::CollectiveOp;
+/// The single (non-grouped) block-scaled GEMM kernel, problem shape (M, N, K, L).
 using GemmKernel = cutlass::gemm::kernel::GemmUniversal<Shape<int,int,int,int>, CollectiveMainloop, CollectiveEpilogue, void>;
+/// Device adapter of GemmKernel.
 using Gemm = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
+/// Scale-factor tile-atom layout helper of the single GEMM (tile_atom_to_shape_SFA / SFB).
 using Sm1xxBlkScaledConfig = typename GemmKernel::CollectiveMainloop::Sm1xxBlkScaledConfig;
+/// Scale-factor element: UE8M0.
 using ElementSF = cutlass::float_ue8m0_t;
 
 // ---- GROUPED (ptr-array) MXFP4 GEMM: one launch runs every active expert's GEMM. ----
@@ -87,33 +114,51 @@ using ElementSF = cutlass::float_ue8m0_t;
 // for grouped; verified accepted by sm120_blockscaled_mma_builder.inl:226-230). Per-group
 // {M,N,K}, A/B/D + SFA/SFB pointer arrays, and per-group strides/SF-layouts are all built on
 // DEVICE from the sorted-pairs/offsets buffers -- no host readback, zero host sync.
+/// Grouped problem shape: per-group (M, N, K).
 using GProblemShape = cutlass::gemm::GroupProblemShape<Shape<int,int,int>>;
+/// The grouped (ptr-array) epilogue.
 using GCollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
     cutlass::arch::Sm120, cutlass::arch::OpClassBlockScaledTensorOp,
     TileShape, ClusterShape, cutlass::epilogue::collective::EpilogueTileAuto,
     ElementAcc, ElementAcc, ElementC, LayoutC*, AlignC, ElementD, LayoutD*, AlignD,
     cutlass::epilogue::collective::EpilogueScheduleAuto>::CollectiveOp;
+/// The grouped (ptr-array) block-scaled mainloop.
 using GCollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder<
     cutlass::arch::Sm120, cutlass::arch::OpClassBlockScaledTensorOp,
     ElementA, LayoutA*, AlignA, ElementB, LayoutB*, AlignB, ElementAcc,
     TileShape, ClusterShape,
     cutlass::gemm::collective::StageCountAutoCarveout<static_cast<int>(sizeof(typename GCollectiveEpilogue::SharedStorage))>,
     cutlass::gemm::collective::KernelScheduleAuto>::CollectiveOp;
+/// The grouped block-scaled GEMM kernel.
 using GGemmKernel = cutlass::gemm::kernel::GemmUniversal<GProblemShape, GCollectiveMainloop, GCollectiveEpilogue>;
+/// Device adapter of GGemmKernel.
 using GGemm = cutlass::gemm::device::GemmUniversalAdapter<GGemmKernel>;
 
+/// One group's problem shape, Shape of (M, N, K).
 using GProbElem  = typename GProblemShape::UnderlyingProblemShape;   // Shape<int,int,int>
+/// Per-group A stride.
 using GStrideA   = typename GGemmKernel::InternalStrideA;
+/// Per-group B stride.
 using GStrideB   = typename GGemmKernel::InternalStrideB;
+/// Per-group C stride.
 using GStrideC   = typename GGemmKernel::InternalStrideC;
+/// Per-group D stride.
 using GStrideD   = typename GGemmKernel::InternalStrideD;
+/// Per-group A scale-factor layout.
 using GLayoutSFA = typename GGemmKernel::CollectiveMainloop::InternalLayoutSFA;
+/// Per-group B scale-factor layout.
 using GLayoutSFB = typename GGemmKernel::CollectiveMainloop::InternalLayoutSFB;
+/// Scale-factor tile-atom layout helper of the grouped GEMM.
 using GSm1xxBlkScaledConfig = typename GGemmKernel::CollectiveMainloop::Sm1xxBlkScaledConfig;
+/// Grouped A element (E4M3 data type).
 using GElemA  = typename GGemm::ElementA;
+/// Grouped B element (E2M1 data type).
 using GElemB  = typename GGemm::ElementB;
+/// Grouped scale-factor element (UE8M0).
 using GElemSF = typename GGemmKernel::CollectiveMainloop::ElementSF;
+/// Grouped C element (f32).
 using GElemC  = typename GGemm::ElementC;
+/// Grouped D element (f32).
 using GElemD  = typename GGemm::EpilogueOutputOp::ElementOutput;
 
 // ---- device activation packer: f32 [M,K] RowMajor -> A data (E4M3, 1 byte/elem) + SF (swizzled UE8M0).
@@ -131,6 +176,18 @@ using GElemD  = typename GGemm::EpilogueOutputOp::ElementOutput;
  * GEMM's A operand (data + tile-atom SFA).  `mid` never touches memory as f32.
  * Same per-block amax, same shared exponent and the same
  * cutlass::float_e4m3_t(v*inv) encode as the other E4M3 producers. */
+/** SwiGLU + E4M3 pack into the down GEMM's A operand: one warp = 4 consecutive 32-blocks of one row.  Grid
+ *  ceil(M * K / 32 / 4 * 32 / 128); block 128 (from swiglu_pack_activation); no smem.  Needs K % 128 == 0 and
+ *  16-byte aligned gate / up rows.
+ *  @tparam TSFA the cute tensor type of the A scale-factor view
+ *  @param A_data E4M3 [M][K] output
+ *  @param tSFA   A scale-factor tensor (CUTLASS tile-atom SFA layout), written by lanes 0, 8, 16, 24
+ *  @param gate   f32 [M][K] gate GEMM output
+ *  @param up     f32 [M][K] up GEMM output
+ *  @param w      f32 [M] routing weight per row
+ *  @param clamp  SwiGLU clamp
+ *  @param M      rows (padded)
+ *  @param K      row width (mid_dim) */
 template<class TSFA>
 __global__ void swiglu_pack_e4m3_warp_kernel(uint8_t *A_data, TSFA tSFA,
                                              const float *gate, const float *up,
@@ -174,6 +231,16 @@ __global__ void swiglu_pack_e4m3_warp_kernel(uint8_t *A_data, TSFA tSFA,
 /* SwiGLU straight into the E4M3 staging the down GEMM reads.  The warp packer
  * needs K a 128-multiple and 16-byte-aligned gate/up rows; any other shape is
  * refused -- there is no unfused pair behind it. */
+/** Launches swiglu_pack_e4m3_warp_kernel (refuses K % 128 != 0 or unaligned gate / up).
+ *  @param A_data E4M3 [M][K] output
+ *  @param A_sf   A scale factors (tile-atom SFA layout, zeroed by the caller)
+ *  @param gate   f32 [M][K]
+ *  @param up     f32 [M][K]
+ *  @param w      f32 [M] routing weights
+ *  @param clamp  SwiGLU clamp
+ *  @param M      rows
+ *  @param K      row width
+ *  @return 0 on success, 1 refused / launch failed */
 static int swiglu_pack_activation(uint8_t *A_data, ElementSF *A_sf,
                                   const float *gate, const float *up, const float *w,
                                   float clamp, int M, int K){
@@ -219,6 +286,17 @@ static int swiglu_pack_activation(uint8_t *A_data, ElementSF *A_sf,
  *
  * Padding rows carry row_src < 0 and get zero payload and a zero scale, which is
  * what the f32 path produced from its pre-zeroed rows. */
+/** Copies producer E4M3 codes into the grouped A operand, re-addressing each scale byte.  Grid
+ *  ceil(M * K / 32 / 128); block 128; one 32-element block a thread.
+ *  @tparam TSFA the cute tensor type of the A scale-factor view
+ *  @param A_data  E4M3 [M][K] A operand
+ *  @param tSFA    A scale-factor tensor (tile-atom SFA layout)
+ *  @param src_q   producer E4M3 rows [tokens][K]
+ *  @param src_sf  producer E8M0 plane (pulsar_mx_sfoff layout)
+ *  @param src_kbp its padded blocks per row
+ *  @param row_src [M] source token per row, < 0 a padding row (zero payload and scale)
+ *  @param M       rows (padded)
+ *  @param K       row width (a multiple of 32) */
 template<class TSFA>
 __global__ void gather_act_e4m3_kernel(uint8_t *A_data, TSFA tSFA,
                                        const uint8_t *src_q, const uint8_t *src_sf, int src_kbp,
@@ -241,6 +319,15 @@ __global__ void gather_act_e4m3_kernel(uint8_t *A_data, TSFA tSFA,
 }
 
 /* Returns 0 on success, 1 when the gather launch failed (named; L189). */
+/** @param A_data  E4M3 [M][K] A operand
+ *  @param A_sf    A scale factors (tile-atom SFA layout)
+ *  @param src_q   producer E4M3 rows
+ *  @param src_sf  producer E8M0 plane (pulsar_mx_sfoff layout)
+ *  @param src_kbp its padded blocks per row
+ *  @param row_src [M] source token per row (< 0: padding)
+ *  @param M       rows
+ *  @param K       row width
+ *  @return 0 on success, 1 when the launch failed */
 static int gather_activation_e4m3(uint8_t *A_data, ElementSF *A_sf,
                                   const void *src_q, const void *src_sf, int src_kbp,
                                   const int32_t *row_src, int M, int K){
@@ -252,6 +339,16 @@ static int gather_activation_e4m3(uint8_t *A_data, ElementSF *A_sf,
   return cuda_ok(cudaGetLastError(), "grouped MoE E4M3 activation gather launch") ? 0 : 1;
 }
 
+/** Arguments of the single block-scaled GEMM D[M][N] = A[M][K] . B[N][K]^T (alpha 1, beta 0, C = D).
+ *  @param D      f32 [M][N] output
+ *  @param A_data E4M3 [M][K]
+ *  @param A_sf   A scale factors (tile-atom SFA)
+ *  @param B_data E2M1 weight data
+ *  @param B_sf   B scale factors (tile-atom SFB)
+ *  @param M      rows
+ *  @param N      output columns
+ *  @param K      reduction depth
+ *  @return the Gemm::Arguments */
 static typename Gemm::Arguments make_gemm_args(float *D, const uint8_t *A_data, const ElementSF *A_sf,
                     const uint8_t *B_data, const ElementSF *B_sf, int M, int N, int K){
   auto strideA = cutlass::make_cute_packed_stride(typename GemmKernel::StrideA{}, {M,K,1});
@@ -271,12 +368,19 @@ static typename Gemm::Arguments make_gemm_args(float *D, const uint8_t *A_data, 
 // Workspace bytes CUTLASS needs for a GEMM of this shape (queried once per distinct
 // (M,N,K) at scratch-sizing time; NOT malloc'd here -- caller folds this into one
 // scratch allocation so the hot path never touches the CUDA allocator).
+/** @param M rows
+ *  @param N output columns
+ *  @param K reduction depth
+ *  @return CUTLASS workspace bytes the single GEMM needs at that shape */
 static size_t gemm_workspace_bytes(int M, int N, int K){
   auto args = make_gemm_args(nullptr,nullptr,nullptr,nullptr,nullptr,M,N,K);
   return Gemm::get_workspace_size(args);
 }
 
 
+/** @param n bytes
+ *  @param a alignment (> 0)
+ *  @return n rounded up to a multiple of a */
 static size_t align_up_bytes(size_t n, size_t a){ return (n + a - 1) / a * a; }
 
 // ---- Single-projection W4A8 GEMM (for MIXED type-40 + iq2 layers). One logical matmul:
@@ -286,6 +390,16 @@ static size_t align_up_bytes(size_t n, size_t a){ return (n + a - 1) / a * a; }
 // E4M3 (dynamic UE8M0) exactly as the full FFN's projections -- so this projection is bit-for-bit
 // the same function the uniform grouped path computes for a single GEMM. No allocation, no sync;
 // launches into the caller's current stream. SF pointer typed as raw bytes at the boundary. ----
+/** Carves the single-projection scratch: E4M3 activations, their SF, the GEMM workspace (256-byte aligned).
+ *  @param T        rows
+ *  @param in_dim   input width
+ *  @param out_dim  output width
+ *  @param xA_off   out: offset of the E4M3 activations
+ *  @param xSF_off  out: offset of their scale factors
+ *  @param xSF_n    out: scale-factor elements (rows padded to 128, blocks to 4)
+ *  @param ws_off   out: offset of the workspace
+ *  @param ws_bytes out: workspace bytes
+ *  @return total scratch bytes */
 static size_t proj_scratch_layout(int T, int in_dim, int out_dim,
                                   size_t *xA_off, size_t *xSF_off, size_t *xSF_n, size_t *ws_off, size_t *ws_bytes){
   const size_t a=256; size_t off=0;
@@ -296,6 +410,10 @@ static size_t proj_scratch_layout(int T, int in_dim, int out_dim,
   *ws_off=off; off=align_up_bytes(off+(*ws_bytes), a);
   return off;
 }
+/** @param T       rows
+ *  @param in_dim  input width
+ *  @param out_dim output width
+ *  @return scratch bytes of a single W4A8 projection (proj_scratch_layout) */
 size_t pulsar_cutlass_proj_scratch_bytes(int T, int in_dim, int out_dim){
   size_t a,b,c,d,e; return proj_scratch_layout(T,in_dim,out_dim,&a,&b,&c,&d,&e);
 }
@@ -319,6 +437,7 @@ size_t pulsar_cutlass_proj_scratch_bytes(int T, int in_dim, int out_dim){
 // exercises a multi-expert problem list against the same double-precision oracle to catch it.
 // ============================================================================================
 
+/// @return the SM count of device 0 (cached; at least 1)
 static int grouped_sm_count(){
   static int sc = -1;
   if (sc < 0){ int v = 0; cudaDeviceGetAttribute(&v, cudaDevAttrMultiProcessorCount, 0); sc = v > 0 ? v : 1; }
@@ -326,6 +445,8 @@ static int grouped_sm_count(){
 }
 
 // Physical SF-A element count for exactly one 128-row M-tile at inner dim K (host + device).
+/** @param K inner dimension
+ *  @return physical SF-A elements of one 128-row M-tile */
 static __host__ __device__ long grouped_per_mtile_sfA(int K){
   return (long)cute::size(cute::filter_zeros(GSm1xxBlkScaledConfig::tile_atom_to_shape_SFA(make_shape(128, 0, K, 1))));
 }
@@ -334,6 +455,32 @@ static __host__ __device__ long grouped_per_mtile_sfA(int K){
 // ONE logical matmul of constant (N,K) across groups (M_g = counts[e]). ptr_A/ptr_SFA index the
 // shared packed-activation buffer at the group's 128-padded row; ptr_B/ptr_SFB index the model
 // weight block for expert e; ptr_D indexes the padded output at the same padded row.
+/** Builds one grouped GEMM's per-group arrays for constant (N, K), group e = expert e with M = counts[e].  Grid
+ *  ceil(n_total / 128); block 128 (one thread per expert).
+ *  @param prob          out: per-group (M, N, K)
+ *  @param ptrA          out: A at the group's padded row
+ *  @param dA            out: A strides
+ *  @param ptrSFA        out: A scale factors at the group's 128-row M-tile
+ *  @param lSFA          out: A scale-factor layouts
+ *  @param ptrB          out: B = the expert's weight data
+ *  @param dB            out: B strides
+ *  @param ptrSFB        out: B scale factors (at data + B_data_bytes)
+ *  @param lSFB          out: B scale-factor layouts
+ *  @param ptrC          out: C (NULL: beta 0)
+ *  @param dC            out: C strides
+ *  @param ptrD          out: D at the group's padded row
+ *  @param dD            out: D strides
+ *  @param counts        [n_total] rows per expert
+ *  @param padded_off    [n_total] 128-padded row base per expert
+ *  @param A_data        packed E4M3 activations [padded][K]
+ *  @param A_sf          their scale factors (one SFA layout over the padded rows)
+ *  @param per_mtile_sfA SF elements per 128-row M-tile (grouped_per_mtile_sfA)
+ *  @param B_tab         [n_total] per-expert weight pointers
+ *  @param B_data_bytes  data-plane bytes per expert (the SF follows)
+ *  @param D_base        f32 output [padded][N]
+ *  @param N             output columns
+ *  @param K             reduction depth
+ *  @param n_total       experts (groups) */
 __global__ static void g_build_arrays(
     GProbElem *prob,
     const GElemA **ptrA, GStrideA *dA, const GElemSF **ptrSFA, GLayoutSFA *lSFA,
@@ -385,6 +532,8 @@ struct GArrays {
   GStrideD *dD;           ///< per-group D stride
 };
 
+/** @param n_total groups
+ *  @return bytes of one GArrays table (13 arrays, 256-byte aligned each) */
 static size_t g_arrays_bytes(int n_total){
   size_t a = 256, off = 0;
   auto add = [&](size_t n){ size_t r = off; off = align_up_bytes(off + n, a); (void)r; return r; };
@@ -398,6 +547,9 @@ static size_t g_arrays_bytes(int n_total){
   return off;
 }
 
+/** @param base    the table's scratch base
+ *  @param n_total groups
+ *  @return the GArrays pointers carved from base (same order as g_arrays_bytes) */
 static GArrays g_arrays_place(uint8_t *base, int n_total){
   GArrays g{}; size_t a = 256, off = 0;
   auto add = [&](size_t n)->uint8_t*{ uint8_t *p = base + off; off = align_up_bytes(off + n, a); return p; };
@@ -411,6 +563,9 @@ static GArrays g_arrays_place(uint8_t *base, int n_total){
   return g;
 }
 
+/** @param n_total  groups
+ *  @param sm_count SMs the launch uses
+ *  @return CUTLASS workspace bytes of the grouped GEMM */
 static size_t grouped_gemm_workspace_bytes(int n_total, int sm_count){
   cutlass::KernelHardwareInfo hw; hw.device_id = 0; hw.sm_count = sm_count;
   typename GGemm::Arguments args{};
@@ -424,6 +579,11 @@ static size_t grouped_gemm_workspace_bytes(int n_total, int sm_count){
 
 // Launch one grouped blockscaled MXFP4 GEMM over n_total groups (inactive experts carry M=0 and
 // contribute zero M-tiles). Deterministic per problem list; caller owns ordering.
+/** @param n_total   groups
+ *  @param g         the device-built per-group arrays
+ *  @param workspace CUTLASS workspace (grouped_gemm_workspace_bytes)
+ *  @param sm_count  SMs
+ *  @return 0, or 1 can_implement / 2 initialize / 3 run / 4 launch error (each named on stderr) */
 static int run_grouped_gemm(int n_total, const GArrays &g, void *workspace, int sm_count){
   cutlass::KernelHardwareInfo hw; hw.device_id = 0; hw.sm_count = sm_count;
   typename GGemm::Arguments args{
@@ -486,6 +646,12 @@ struct pulsar_grouped_scratch_layout {
          total_bytes;  ///< allocation size the whole layout requires
 };
 
+/** @param padded_total padded rows (a multiple of 128)
+ *  @param n_total      experts
+ *  @param in_dim       input width
+ *  @param mid_dim      intermediate width
+ *  @param out_dim      output width (unused: the caller owns ffn_out)
+ *  @return the grouped FFN's scratch layout */
 static pulsar_grouped_scratch_layout grouped_scratch_layout(int padded_total, int n_total,
                                                          int in_dim, int mid_dim, int out_dim){
   pulsar_grouped_scratch_layout L{};
@@ -509,6 +675,12 @@ static pulsar_grouped_scratch_layout grouped_scratch_layout(int padded_total, in
   return L;
 }
 
+/** @param padded_total   padded rows
+ *  @param n_total_expert experts
+ *  @param in_dim         input width
+ *  @param mid_dim        intermediate width
+ *  @param out_dim        output width
+ *  @return scratch bytes pulsar_cutlass_grouped_moe needs */
 size_t pulsar_cutlass_grouped_moe_scratch_bytes(
     int padded_total, int n_total_expert, int in_dim, int mid_dim, int out_dim){
   return grouped_scratch_layout(padded_total, n_total_expert, in_dim, mid_dim, out_dim).total_bytes;
@@ -517,6 +689,30 @@ size_t pulsar_cutlass_grouped_moe_scratch_bytes(
 // Grouped MXFP4 FFN. x_gathered/w_gathered are the per-slot activations gathered to 128-padded
 // row offsets (padding rows must be pre-zeroed by the caller). Writes ffn_out[padded_total,out_dim]
 // (the caller scatters the real rows into the flat down buffer, then moe_sum reduces). No host sync.
+/** Grouped MXFP4 FFN (contract at the pulsar_gpu.h declaration): gate, up (grouped GEMMs), SwiGLU + E4M3 pack, down.
+ *  @param ffn_out         f32 [padded_total][out_dim] pre-weighted output per padded row
+ *  @param x_gathered      unused (the activation arrives as producer E4M3)
+ *  @param w_gathered      f32 [padded_total] routing weight per padded row
+ *  @param gate_tab        [n_total_expert] gate weight pointers
+ *  @param up_tab          [n_total_expert] up weight pointers
+ *  @param down_tab        [n_total_expert] down weight pointers
+ *  @param gate_data_bytes gate / up data-plane bytes per expert
+ *  @param down_data_bytes down data-plane bytes per expert
+ *  @param clamp           SwiGLU clamp
+ *  @param n_total_expert  experts
+ *  @param in_dim          input width
+ *  @param mid_dim         intermediate width (a multiple of 128)
+ *  @param out_dim         output width
+ *  @param counts          [n_total_expert] rows per expert
+ *  @param padded_offsets  [n_total_expert] 128-padded row bases
+ *  @param padded_total    padded rows (host upper bound, a multiple of 128)
+ *  @param scratch         device scratch
+ *  @param scratch_bytes   its bytes (>= pulsar_cutlass_grouped_moe_scratch_bytes)
+ *  @param act_q           producer E4M3 rows of x
+ *  @param act_sf          producer E8M0 plane (pulsar_mx_sfoff layout)
+ *  @param act_kbp         its padded blocks per row
+ *  @param row_src_tok     [padded_total] source token per padded row (< 0: padding)
+ *  @return 0 on success, -1 scratch too small, -2 no producer E4M3, 3 a launch / GEMM failed */
 int pulsar_cutlass_grouped_moe(
     float *ffn_out, const float *x_gathered, const float *w_gathered,
     const uint8_t *const *gate_tab, const uint8_t *const *up_tab, const uint8_t *const *down_tab,
@@ -591,6 +787,16 @@ int pulsar_cutlass_grouped_moe(
 // run_grouped_gemm, so it is bit-identical to the per-expert single-projection path it replaces,
 // with NO host readback and NO per-expert sync. Padding rows (padded_offsets leave <128-row gaps)
 // must be pre-zeroed by the caller. `ws` is folded into scratch (shape-independent grouped WS). ----
+/** @param padded_total   padded rows
+ *  @param n_total_expert experts
+ *  @param in_dim         input width
+ *  @param xA_off         out: offset of the E4M3 activations
+ *  @param xSF_off        out: offset of their scale factors
+ *  @param xSF_bytes      out: scale-factor bytes
+ *  @param arr_off        out: offset of the GArrays table
+ *  @param ws_off         out: offset of the workspace
+ *  @param ws_bytes       out: workspace bytes
+ *  @return total scratch bytes */
 static size_t grouped_proj_layout(int padded_total, int n_total_expert, int in_dim,
                                   size_t *xA_off, size_t *xSF_off, size_t *xSF_bytes,
                                   size_t *arr_off, size_t *ws_off, size_t *ws_bytes) {
@@ -604,10 +810,34 @@ static size_t grouped_proj_layout(int padded_total, int n_total_expert, int in_d
   *ws_off = off;  off = align_up_bytes(off + *ws_bytes, a);
   return off;
 }
+/** @param padded_total   padded rows
+ *  @param n_total_expert experts
+ *  @param in_dim         input width
+ *  @param out_dim        unused (the D buffer is the caller's)
+ *  @return scratch bytes pulsar_cutlass_grouped_proj needs */
 size_t pulsar_cutlass_grouped_proj_scratch_bytes(int padded_total, int n_total_expert, int in_dim, int out_dim){
   (void)out_dim;   /* grouped WS is shape-independent; D buffer is caller-owned */
   size_t a,b,c,d,e,f; return grouped_proj_layout(padded_total, n_total_expert, in_dim, &a,&b,&c,&d,&e,&f);
 }
+/** Grouped single-projection W4A8 GEMM (contract at the pulsar_gpu.h declaration).
+ *  @param out            f32 [padded_total][out_dim]
+ *  @param x_gathered     unused (the activation arrives as producer E4M3)
+ *  @param W_tab          [n_total_expert] weight pointers
+ *  @param W_data_bytes   data-plane bytes per expert
+ *  @param n_total_expert experts
+ *  @param in_dim         input width
+ *  @param out_dim        output width
+ *  @param counts         [n_total_expert] rows per expert
+ *  @param padded_offsets [n_total_expert] 128-padded row bases
+ *  @param padded_total   padded rows
+ *  @param scratch        device scratch
+ *  @param scratch_bytes  its bytes
+ *  @param reuse_packed_a nonzero: reuse the previous call's packed A in this scratch
+ *  @param act_q          producer E4M3 rows
+ *  @param act_sf         producer E8M0 plane
+ *  @param act_kbp        its padded blocks per row
+ *  @param row_src_tok    [padded_total] source token per padded row (< 0: padding)
+ *  @return 0 on success, -1 scratch too small, -2 no producer E4M3, 3 a launch / GEMM failed */
 int pulsar_cutlass_grouped_proj(
     float *out, const float *x_gathered,
     const uint8_t *const *W_tab, uint64_t W_data_bytes,
@@ -668,10 +898,13 @@ int pulsar_cutlass_grouped_proj(
 // coalesced. SF is the swizzled tile-atom layout, indexed with the same layout object
 // the packers use (callable on device).
 
+/// E2M1 code -> value (codes 8..15 negative), for the GEMV / MMA decoders.
 __device__ __constant__ static float kE2M1_GEMV[16] =
     {0.f, 0.5f, 1.f, 1.5f, 2.f, 3.f, 4.f, 6.f,
      -0.f, -0.5f, -1.f, -1.5f, -2.f, -3.f, -4.f, -6.f};
 
+/** @param b an E8M0 scale byte
+ *  @return 2^(b - 127) */
 __device__ __forceinline__ static float gemv_sf_val(uint8_t b) {
   return __int_as_float((uint32_t)b << 23);   /* 2^(e-127) */
 }
@@ -728,6 +961,13 @@ enum { GEMV_DEDUPE_MAX = 8 };
 enum { GEMV_PREFETCH = 4 };
 enum { GEMV_DOWN_TILE_N = 64 };      /* down GEMV: outputs per CTA (8 warps x 8) */
 enum { GEMV_DOWN_MAX_K  = 2304 };    /* down GEMV: mid rows staged in shared memory, K <= this (expert_mid_dim; V4.1 2304 = 9 x 256, L218) */
+/** @param sel     [n_slots] expert ids
+ *  @param n_slots slots
+ *  @param slot    this CTA's slot
+ *  @param e       its expert
+ *  @param valid   e is in range
+ *  @param owned   out: the slots this CTA serves
+ *  @return the owned count (0: another CTA owns this expert's slots) */
 __device__ __forceinline__ static int gemv_dedupe_owned(const int32_t *sel, unsigned n_slots, int slot,
                                                         int e, bool valid, int owned[GEMV_DEDUPE_MAX]) {
   if (!valid) { owned[0] = slot; return 1; }   /* an invalid expert is its own slot's business */
@@ -747,6 +987,30 @@ __device__ __forceinline__ static int gemv_dedupe_owned(const int32_t *sel, unsi
  * per-row accumulators is fewer registers, more CTAs per SM; the one-row
  * instance also prefetches its activation.  Arithmetic is identical for every
  * r either way. */
+/** Gate + up GEMV + SwiGLU for one (slot, 32 mid columns).  Grid (ceil(N / 32), n_slots); block 256 (8 warps);
+ *  static smem lut[16] + vblk[MAXR][32] f32.
+ *  @tparam SFL       the cute SFB layout type
+ *  @tparam EMIT_E4M3 write E4M3 + E8M0 (else f32 mid)
+ *  @tparam MAXR      the most deduplicated rows a CTA carries (traps when exceeded)
+ *  @param mid        f32 [n_slots][N] (!EMIT_E4M3)
+ *  @param midq       E4M3 [n_slots][N] (EMIT_E4M3)
+ *  @param midsf      E8M0 plane, pulsar_mx_sfoff (EMIT_E4M3)
+ *  @param mid_kbp    its padded blocks per row
+ *  @param xq8        E4M3 activations [n_tokens][K]
+ *  @param xsf        their E8M0 plane (pulsar_mx_sfoff)
+ *  @param xkbp       its padded blocks per row
+ *  @param sel        [n_slots] expert ids
+ *  @param rw         [n_slots] routing weights
+ *  @param gate_tab   [n_total] gate weight pointers
+ *  @param up_tab     [n_total] up weight pointers
+ *  @param data_bytes data-plane bytes per expert (the SF follows)
+ *  @param sfl        the SFB layout object
+ *  @param clampv     SwiGLU clamp
+ *  @param n_expert   slots per token (slot / n_expert = the token row)
+ *  @param n_total    experts
+ *  @param n_slots    slots
+ *  @param K          input width
+ *  @param N          mid width */
 template <class SFL, bool EMIT_E4M3, int MAXR = GEMV_DEDUPE_MAX>
 __global__ static void expert_gemv_gu_swiglu_kernel(
     float *mid,               // [n_slots, N] f32 out            (!EMIT_E4M3)
@@ -890,6 +1154,22 @@ __global__ static void expert_gemv_gu_swiglu_kernel(
 /* Reads mid as the E4M3 + swizzled-E8M0 pair the SwiGLU stage emitted
  * (pulsar_gpu_mxfp8_act_cache_encode_f32 in the MoE, or the gate/up epilogue
  * above in the small FFN): 1 byte read per element, the source's own format. */
+/** Down GEMV for one expert-owner slot and GEMV_DOWN_TILE_N outputs.  Grid (ceil(N / GEMV_DOWN_TILE_N), n_slots);
+ *  block 256; static smem MAXR x (GEMV_DOWN_MAX_K bytes + GEMV_DOWN_MAX_K / 32 floats) + lut.
+ *  @tparam SFL  the cute SFB layout type
+ *  @tparam MAXR the most deduplicated rows a CTA carries
+ *  @param down_out   f32 [n_slots][N]
+ *  @param midq8      E4M3 mid [n_slots][K]
+ *  @param midsf      its E8M0 plane (pulsar_mx_sfoff)
+ *  @param xkbp       its padded blocks per row
+ *  @param sel        [n_slots] expert ids
+ *  @param down_tab   [n_total] down weight pointers
+ *  @param data_bytes data-plane bytes per expert
+ *  @param sfl        the SFB layout object
+ *  @param n_total    experts
+ *  @param n_slots    slots
+ *  @param K          mid width (<= GEMV_DOWN_MAX_K)
+ *  @param N          output width */
 template <class SFL, int MAXR = GEMV_DEDUPE_MAX>
 __global__ static void expert_gemv_down_kernel(
     float *down_out,          // [n_slots, N]
@@ -1008,6 +1288,13 @@ enum { FFN_MMA_GROUP = 16, FFN_MMA_R = 4, FFN_MMA_U = 4 };
 
 /* One block: sel[n_slots] -> groups {expert or -1, m, first index into list, 0},
  * list[n_slots] (slots in group order), *n_groups.  smem: n_slots + 2 (n_total + 1) ints. */
+/** Groups the slots by expert (see above).  Grid 1; block 256; dynamic smem (n_slots + 2 (n_total + 1)) ints.
+ *  @param sel      [n_slots] expert ids
+ *  @param n_slots  slots
+ *  @param n_total  experts (an id outside [0, n_total) is the invalid bucket)
+ *  @param groups   out: [n_slots] {expert or -1, rows, first list index, 0}
+ *  @param list     out: [n_slots] slots in group order
+ *  @param n_groups out: groups written */
 __global__ static void ffn_group_slots_kernel(const int32_t *sel, unsigned n_slots, unsigned n_total,
                                               int4 *groups, int32_t *list, int32_t *n_groups) {
   extern __shared__ int32_t g_sm[];
@@ -1048,6 +1335,14 @@ __global__ static void ffn_group_slots_kernel(const int32_t *sel, unsigned n_slo
   }
 }
 
+/** One mma.sync m16n8k32 e4m3 x e4m3 -> f32 with C = 0 (d is overwritten); traps below sm_89.
+ *  @param d  out: the thread's four f32 results
+ *  @param a0 A fragment register 0
+ *  @param a1 A fragment register 1
+ *  @param a2 A fragment register 2
+ *  @param a3 A fragment register 3
+ *  @param b0 B fragment register 0
+ *  @param b1 B fragment register 1 */
 __device__ __forceinline__ static void ffn_mma_e4m3(float d[4], uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3,
                                                     uint32_t b0, uint32_t b1) {
 #if PULSAR_SM89
@@ -1061,16 +1356,25 @@ __device__ __forceinline__ static void ffn_mma_e4m3(float d[4], uint32_t a0, uin
 }
 /* 4 e2m1 nibbles (low 16 bits, nibble j = value j) -> 4 e4m3 bytes, exact:
  * magnitudes {0,.5,1,1.5,2,3,4,6} = e4m3 0x00 0x30 0x38 0x3C 0x40 0x44 0x48 0x4C. */
+/** @param w four E2M1 nibbles in the low 16 bits
+ *  @return the four values as E4M3 bytes (exact) */
 __device__ __forceinline__ static uint32_t ffn_e2m1x4_to_e4m3(uint32_t w) {
   const uint32_t mag = __byte_perm(0x3C383000u, 0x4C484440u, w & 0x7777u);
   const uint32_t s = w & 0x8888u;
   return mag | ((s & 0x8u) << 4) | ((s & 0x80u) << 8) | ((s & 0x800u) << 12) | ((s & 0x8000u) << 16);
 }
+/** @param v four words
+ *  @param i which (0..3)
+ *  @return word i of v */
 __device__ __forceinline__ static uint32_t ffn_sel4(uint4 v, int i) {
   return i == 0 ? v.x : i == 1 ? v.y : i == 2 ? v.z : v.w;
 }
 /* The quad rotation: lane q holds block (4*kb4 + q) of its row as 16 B; afterwards
  * w[b] is word q of block b -- the 8 values the m16n8k32 fragment wants. */
+/** @param W    this lane's 16-byte block
+ *  @param lane the lane
+ *  @param q    lane within its quad
+ *  @param w    out: word q of each of the quad's four blocks */
 __device__ __forceinline__ static void ffn_quad_rotate(uint4 W, int lane, int q, uint32_t w[4]) {
   uint32_t r[4];
 #pragma unroll
@@ -1083,6 +1387,29 @@ __device__ __forceinline__ static void ffn_quad_rotate(uint4 W, int lane, int q,
 
 /* NMAT 2: gate + up -> SwiGLU -> E4M3 mid.  NMAT 1: down -> f32 out.  xrow_div maps a
  * slot to its activation row (n_expert for gate/up: the token; 1 for down: the slot). */
+/** E4M3 MMA FFN over expert groups.  Grid (N / (32 * FFN_MMA_R), n_slots) (blockIdx.y = group; past n_groups
+ *  exits); block FFN_MMA_R * 32; static smem s_v[FFN_MMA_R][FFN_MMA_GROUP][32] f32.
+ *  @tparam SFL  the cute SFB layout type
+ *  @tparam NMAT 2: gate + up -> SwiGLU -> E4M3 mid; 1: down -> f32 out
+ *  @param groups     [n_slots] groups from ffn_group_slots_kernel
+ *  @param list       [n_slots] slots in group order
+ *  @param n_groups   groups in use (device)
+ *  @param xq8        E4M3 activation rows
+ *  @param xsf        their E8M0 plane (pulsar_mx_sfoff)
+ *  @param xkbp       its padded blocks per row
+ *  @param xrow_div   slot to activation row divisor (n_expert for gate/up, 1 for down)
+ *  @param tab0       [n_total] gate (or down) weight pointers
+ *  @param tab1       [n_total] up weight pointers (NMAT 2)
+ *  @param data_bytes data-plane bytes per expert
+ *  @param sfl        the SFB layout object
+ *  @param rw         [n_slots] routing weights (NMAT 2)
+ *  @param clampv     SwiGLU clamp (NMAT 2)
+ *  @param midq       E4M3 mid out (NMAT 2)
+ *  @param midsf      its E8M0 plane (NMAT 2)
+ *  @param mid_kbp    its padded blocks per row (NMAT 2)
+ *  @param out        f32 [n_slots][N] (NMAT 1)
+ *  @param K          input width
+ *  @param N          output width */
 template <class SFL, int NMAT>
 __global__ static void __launch_bounds__(FFN_MMA_R * 32) ffn_mma_kernel(
     const int4 *groups, const int32_t *list, const int32_t *n_groups,
@@ -1204,7 +1531,9 @@ __global__ static void __launch_bounds__(FFN_MMA_R * 32) ffn_mma_kernel(
 }
 
 /* Grouping scratch: [n_slots] int4 groups, [n_slots] list, one count. */
+/// The MMA arm's grouping scratch (this thread's; grown on demand).
 static thread_local void *g_ffn_grp = nullptr;
+/// Its bytes.
 static thread_local size_t g_ffn_grp_bytes = 0;
 
 
@@ -1215,13 +1544,38 @@ static thread_local size_t g_ffn_grp_bytes = 0;
 /* thread_local: one GPU-submitting thread owns its own scratch; a second
  * decode thread must not share this grow/free/realloc buffer (double-free +
  * silent overwrite). Matches the g_act_slots / DsparkReduceBufs convention. */
+/// The small FFN's E4M3 mid staging (payload + E8M0 plane), this thread's.
 static thread_local float *g_fp4_gemv_actbuf = nullptr;
+/// Its size, in floats.
 static thread_local size_t g_fp4_gemv_actbuf_floats = 0;
 
 // Small-batch (n_tokens 2..4) rich-expert FFN over the packed CUTLASS weights.
 // gate/up GEMV emits mid as E4M3 + ue8m0 from its epilogue; the down GEMV reads that
 // pair.  down_out gets one pre-weighted FFN result per (token, slot); the caller sums
 // the n_expert slices per token (moe_sum_kernel).
+/** Small-batch rich-expert FFN (contract at the pulsar_gpu.h declaration): GEMV arm, or the E4M3 MMA arm for decode
+ *  rows past pulsar_gpu_matmul_decode_exact_rows().
+ *  @param down_out        f32 [n_tokens * n_expert][out_dim] pre-weighted slot outputs
+ *  @param selected        [n_tokens][n_expert] expert ids
+ *  @param rweights        [n_tokens][n_expert] routing weights
+ *  @param gate_tab        [n_total_expert] gate weight pointers
+ *  @param up_tab          [n_total_expert] up weight pointers
+ *  @param down_tab        [n_total_expert] down weight pointers
+ *  @param gate_stride     bytes per gate / up expert
+ *  @param gate_data_bytes gate / up data-plane bytes per expert
+ *  @param down_stride     bytes per down expert
+ *  @param down_data_bytes down data-plane bytes per expert
+ *  @param clamp           SwiGLU clamp
+ *  @param n_tokens        token rows
+ *  @param n_expert        slots per token
+ *  @param n_total_expert  experts
+ *  @param in_dim          input width (a multiple of 256)
+ *  @param mid_dim         intermediate width (a multiple of 128, <= GEMV_DOWN_MAX_K)
+ *  @param out_dim         output width (a multiple of 8)
+ *  @param act_q           producer E4M3 rows of x
+ *  @param act_sf          producer E8M0 plane (pulsar_mx_sfoff)
+ *  @param act_kbp         its padded blocks per row (must equal the call's)
+ *  @return 0 on success, 1 refused, 2 a launch failed */
 int pulsar_cutlass_expert_ffn_gemv_small(
     float *down_out,
     const int32_t *selected, const float *rweights,
@@ -1393,6 +1747,27 @@ int pulsar_cutlass_expert_ffn_gemv_small(
  * small-batch FFN path uses -- and `mid` is not written.  The caller (mixed
  * case A at decode) then hands those bytes to the MMQ down, exactly like the
  * fold-emitted slot the other arms produce. */
+/** Gate / up W4A8 GEMV + SwiGLU (contract at the pulsar_gpu.h declaration).
+ *  @param mid             f32 [n_slots][mid_dim] (no emit)
+ *  @param selected        [n_tokens][n_expert] expert ids
+ *  @param rweights        [n_tokens][n_expert] routing weights
+ *  @param gate_tab        [n_total_expert] gate weight pointers
+ *  @param up_tab          [n_total_expert] up weight pointers
+ *  @param gate_stride     bytes per expert
+ *  @param gate_data_bytes data-plane bytes per expert
+ *  @param clamp           SwiGLU clamp
+ *  @param n_tokens        token rows
+ *  @param n_expert        slots per token
+ *  @param n_total_expert  experts
+ *  @param in_dim          input width
+ *  @param mid_dim         intermediate width
+ *  @param act_q           producer E4M3 rows
+ *  @param act_sf          producer E8M0 plane
+ *  @param act_kbp         its padded blocks per row
+ *  @param emit_q          E4M3 mid out, or NULL: write f32 mid
+ *  @param emit_sf         its E8M0 plane
+ *  @param emit_kbp        its padded blocks per row
+ *  @return 0 on success, 1 refused (shape), 2 launch failed, 3 no producer E4M3 */
 int pulsar_cutlass_gemv_gateup(
     float *mid, const int32_t *selected, const float *rweights,
     const uint8_t *const *gate_tab, const uint8_t *const *up_tab, uint64_t gate_stride, uint64_t gate_data_bytes,
@@ -1436,6 +1811,21 @@ int pulsar_cutlass_gemv_gateup(
   return cudaGetLastError() == cudaSuccess ? 0 : 2;
 }
 /* down W4A8 GEMV -> down_out[n_slots,out_dim] (pair layout, NO routing weight -- applied at gate/up). */
+/** Down W4A8 GEMV (contract at the pulsar_gpu.h declaration).
+ *  @param down_out        f32 [n_slots][out_dim] (no routing weight)
+ *  @param selected        [n_tokens][n_expert] expert ids
+ *  @param down_tab        [n_total_expert] down weight pointers
+ *  @param down_stride     bytes per expert
+ *  @param down_data_bytes data-plane bytes per expert
+ *  @param n_tokens        token rows
+ *  @param n_expert        slots per token
+ *  @param n_total_expert  experts
+ *  @param mid_dim         mid width (a multiple of 128, <= GEMV_DOWN_MAX_K)
+ *  @param out_dim         output width
+ *  @param mid_q           E4M3 mid rows
+ *  @param mid_sf          its E8M0 plane
+ *  @param mid_kbp         its padded blocks per row
+ *  @return 0 on success, 1 refused, 2 launch failed */
 int pulsar_cutlass_gemv_down(
     float *down_out, const int32_t *selected,
     const uint8_t *const *down_tab, uint64_t down_stride, uint64_t down_data_bytes,

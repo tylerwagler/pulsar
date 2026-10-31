@@ -1,3 +1,5 @@
+/** @file
+ *  Vision towers: the DeepSeek-V4-Flash-Vision-Exp ViT + aligner and the Qwen3.8 tower + merger forwards. */
 /* L216 -- DeepSeek-V4-Flash-Vision-Exp ViT + aligner forward; L268 -- Qwen3.8-Flash-Next's tower + merger over
  * the same kernels (pulsar_cuda_qwen_vision_forward, below).  The two towers share every primitive their
  * architectures share -- linear + bias, residual add, the q|k|v split, the NeoX-halves 2D RoPE (per-token positions:
@@ -38,12 +40,24 @@
 #include <cuda_bf16.h>
 #include <math.h>
 
+/// The towers' storage type: bf16 activations and weights.
 typedef __nv_bfloat16 bf16;
 
+/// @param v a bf16 value
+/// @return it as f32
 static __device__ __forceinline__ float b2f(bf16 v) { return __bfloat162float(v); }
+/// @param v an f32 value
+/// @return it rounded to bf16 (nearest even)
 static __device__ __forceinline__ bf16 f2b(float v) { return __float2bfloat16_rn(v); }
 
 /* rows x dim, one block per row, block-wide reduction of the sum of squares. */
+/** RMSNorm of bf16 rows: y = bf16(w * (x * rstd)).  Grid rows (one block a row); block a power of two (VK_THREADS);
+ *  dynamic smem blockDim floats (the sum-of-squares tree).
+ *  @param x   bf16 [rows][dim]
+ *  @param w   bf16 [dim] weight
+ *  @param y   bf16 [rows][dim] output
+ *  @param dim row width
+ *  @param eps the norm's epsilon */
 __global__ static void vk_rmsnorm(const bf16 *__restrict__ x, const bf16 *__restrict__ w,
                                   bf16 *__restrict__ y, int dim, float eps) {
     extern __shared__ float ssum[];
@@ -68,6 +82,11 @@ __global__ static void vk_rmsnorm(const bf16 *__restrict__ x, const bf16 *__rest
 
 
 /* SwiGLU over a fused [gate | up] row of width 2*inter. */
+/** SwiGLU: y[m][i] = bf16(silu(gate) * up) from a fused [gate | up] row.  Grid (ceil(inter / blockDim), rows); one
+ *  thread an output element.
+ *  @param gu    bf16 [rows][2 * inter] fused gate|up rows
+ *  @param y     bf16 [rows][inter] output
+ *  @param inter the MLP's inner width */
 __global__ static void vk_silu_mul(const bf16 *__restrict__ gu, bf16 *__restrict__ y,
                                    int inter) {
     const int m = blockIdx.y;
@@ -79,6 +98,10 @@ __global__ static void vk_silu_mul(const bf16 *__restrict__ gu, bf16 *__restrict
 }
 
 /* a += b, in f32 then rounded (torch's bf16 add). */
+/** Element-wise a += b (f32 add, one bf16 rounding).  1-D grid, one thread an element.
+ *  @param a bf16 [n], updated in place
+ *  @param b bf16 [n]
+ *  @param n elements */
 __global__ static void vk_add(bf16 *__restrict__ a, const bf16 *__restrict__ b, size_t n) {
     const size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) a[i] = f2b(b2f(a[i]) + b2f(b[i]));
@@ -89,6 +112,13 @@ __global__ static void vk_add(bf16 *__restrict__ a, const bf16 *__restrict__ b, 
  * values at t*3D + 2D.  Rope and attention want three planes, and reading the
  * buffer as planes is what made block0 grossly wrong (patch_embed was exact, so
  * the weights were fine; the very first thing after them was not). */
+/** Splits the token-interleaved q|k|v rows into three planes.  1-D grid over n = n_tok * D elements.
+ *  @param qkv bf16 [n_tok][3 D]
+ *  @param q   bf16 [n_tok][D] out
+ *  @param k   bf16 [n_tok][D] out
+ *  @param v   bf16 [n_tok][D] out
+ *  @param D   model width (heads x head_dim)
+ *  @param n   n_tok * D */
 __global__ static void vk_split_qkv(const bf16 *__restrict__ qkv,
                                     bf16 *__restrict__ q, bf16 *__restrict__ k,
                                     bf16 *__restrict__ v, int D, size_t n) {
@@ -106,6 +136,14 @@ __global__ static void vk_split_qkv(const bf16 *__restrict__ qkv,
  * pairs take the token's ROW, the rest its COLUMN, frequency index i mod
  * rope_dim / 2 -- DeepSeek's layout and Qwen's (cat(f_h, f_w) twice) alike.
  * `pos` is (row, col) per token: the caller's patch order decides them. */
+/** 2D RoPE on q and k in place.  Grid (n_tok, n_heads); block rope_dim threads, one a pair.
+ *  @param q        bf16 [n_tok][n_heads][head_dim], rotated in place
+ *  @param k        bf16 [n_tok][n_heads][head_dim], rotated in place
+ *  @param n_heads  heads
+ *  @param head_dim per-head width (= 2 * rope_dim)
+ *  @param pos2     [n_tok] (row, col) patch positions
+ *  @param rope_dim width of each rotated half
+ *  @param theta    rope base */
 __global__ static void vk_rope2d(bf16 *__restrict__ q, bf16 *__restrict__ k,
                                  int n_heads, int head_dim, const int2 *__restrict__ pos2,
                                  int rope_dim, float theta) {
@@ -133,6 +171,13 @@ __global__ static void vk_rope2d(bf16 *__restrict__ q, bf16 *__restrict__ k,
 /* LayerNorm with bias (torch's, eps given): mean and biased variance in f32 over
  * the row, y = (x - mean) * rstd * w + b in f32, rounded once.  One block per
  * row, block-wide reductions (blockDim a power of two). */
+/** LayerNorm with bias of bf16 rows.  Grid rows; block a power of two; dynamic smem blockDim floats.
+ *  @param x   bf16 [rows][dim]
+ *  @param w   bf16 [dim] weight
+ *  @param b   bf16 [dim] bias
+ *  @param y   bf16 [rows][dim] output
+ *  @param dim row width
+ *  @param eps the norm's epsilon */
 __global__ static void vk_layernorm(const bf16 *__restrict__ x, const bf16 *__restrict__ w,
                                     const bf16 *__restrict__ b, bf16 *__restrict__ y, int dim, float eps) {
     extern __shared__ float red[];
@@ -166,6 +211,9 @@ __global__ static void vk_layernorm(const bf16 *__restrict__ x, const bf16 *__re
 }
 
 /* GELU, tanh approximation (gelu_pytorch_tanh) -- in f32 then rounded. */
+/** tanh-approximate GELU in place.  1-D grid, one thread an element.
+ *  @param y bf16 [n], in place
+ *  @param n elements */
 __global__ static void vk_gelu_tanh(bf16 *__restrict__ y, size_t n) {
     const size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) {
@@ -179,6 +227,13 @@ __global__ static void vk_gelu_tanh(bf16 *__restrict__ y, size_t n) {
  * table rows at its 4 bilinear taps times their f32 weights, summed in f32 (tap
  * order), rounded to bf16 and added to the patch embedding (a bf16 add).  The
  * taps and weights are the host's (HF's formula, align_corners). */
+/** Adds the bilinearly resampled learned positions to the patch embeddings.  1-D grid over n = rows * dim.
+ *  @param x     bf16 [rows][dim] patch embeddings, updated in place
+ *  @param table bf16 [table rows][dim] learned positions
+ *  @param idx   [rows][4] table rows of each patch's taps
+ *  @param wt    [rows][4] f32 tap weights
+ *  @param dim   embedding width
+ *  @param n     rows * dim */
 __global__ static void vk_pos_embed_add(bf16 *__restrict__ x, const bf16 *__restrict__ table,
                                         const int32_t *__restrict__ idx, const float *__restrict__ wt,
                                         int dim, size_t n) {
@@ -193,6 +248,13 @@ __global__ static void vk_pos_embed_add(bf16 *__restrict__ x, const bf16 *__rest
 /* Aligner gather: zero-pad the (n_h, n_w) grid up to a multiple of r and unfold
  * r x r blocks with the channel outermost -- F.unfold's layout.  One thread per
  * element of (n_llm_rows, dim*r*r). */
+/** The aligner's unfold (zero-padded r x r blocks, channel outermost).  1-D grid over n_llm_rows * dim * r * r.
+ *  @param x   bf16 [n_h * n_w][dim] tower output, row-major over the patch grid
+ *  @param out bf16 [ceil(n_h / r) * ceil(n_w / r)][dim * r * r]
+ *  @param n_h patch grid rows
+ *  @param n_w patch grid columns
+ *  @param dim tower width
+ *  @param r   downsample ratio */
 __global__ static void vk_aligner_gather(const bf16 *__restrict__ x, bf16 *__restrict__ out,
                                          int n_h, int n_w, int dim, int r) {
     const int blocks_w = (n_w + r - 1) / r;
@@ -211,6 +273,9 @@ __global__ static void vk_aligner_gather(const bf16 *__restrict__ x, bf16 *__res
 }
 
 /* GELU, exact (erf) form -- F.gelu's default -- in f32 then rounded. */
+/** Exact (erf) GELU in place.  1-D grid, one thread an element.
+ *  @param y bf16 [n], in place
+ *  @param n elements */
 __global__ static void vk_gelu(bf16 *__restrict__ y, size_t n) {
     const size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) {
@@ -219,17 +284,34 @@ __global__ static void vk_gelu(bf16 *__restrict__ y, size_t n) {
     }
 }
 
+/// Block size of the towers' element-wise and per-row kernels (a power of two: the reductions are trees).
 #define VK_THREADS 256
 
 /* L268 (both towers): y bf16 [rows x N] = x bf16 [rows x K] . W^T (+ bias) -- the GEMM accumulates in f32
  * (pulsar_cuda_vision_gemm, cuBLASLt), then one kernel adds the bias in f32 and rounds once to bf16: what every
  * reference Linear does.  `f32` is the caller's scratch of at least rows x N floats. */
+/** y = bf16(acc + bias): the Linear's f32 GEMM output rounded once.  1-D grid over n = rows * N.
+ *  @param acc  f32 [rows][N] GEMM output
+ *  @param bias bf16 [N], or NULL
+ *  @param y    bf16 [rows][N] output
+ *  @param N    output width
+ *  @param n    rows * N */
 __global__ static void vk_bias_round(const float *__restrict__ acc, const bf16 *__restrict__ bias,
                                      bf16 *__restrict__ y, int N, size_t n) {
     const size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) y[i] = f2b(acc[i] + (bias ? b2f(bias[i % (size_t)N]) : 0.0f));
 }
 
+/** One tower Linear: y = x . W^T (+ bias) via pulsar_cuda_vision_gemm, then vk_bias_round.
+ *  @param x    device bf16 [rows][K]
+ *  @param W    device bf16 [N][K]
+ *  @param bias device bf16 [N], or NULL
+ *  @param y    device bf16 [rows][N] output
+ *  @param K    input width
+ *  @param N    output width
+ *  @param rows activation rows
+ *  @param f32  device f32 scratch, at least rows * N floats
+ *  @return true on success (a refusal or launch failure is said) */
 static bool vlinear(const void *x, const void *W, const void *bias, void *y, int K, int N, int rows, float *f32) {
     if (!pulsar_cuda_vision_gemm(f32, N, (const uint16_t *)x, K, (const uint16_t *)W, K, 1, rows, N, K)) return false;
     const size_t n = (size_t)rows * N;
@@ -240,6 +322,11 @@ static bool vlinear(const void *x, const void *W, const void *bias, void *y, int
 
 /* Softmax over each row of `s` (f32 [rows x n] scores) after scaling, written as bf16 probabilities (the second
  * GEMM's operand, as flash attention rounds them).  One block per row. */
+/** Scaled row softmax to bf16 probabilities.  Grid rows; block a power of two (VK_THREADS); dynamic smem blockDim floats.
+ *  @param s     f32 [rows][n] scores
+ *  @param p     bf16 [rows][n] probabilities out
+ *  @param n     scores per row
+ *  @param scale multiplies every score first */
 __global__ static void vk_softmax_rows(const float *__restrict__ s, bf16 *__restrict__ p, int n, float scale) {
     extern __shared__ float red[];
     const float *sr = s + (size_t)blockIdx.x * n;
@@ -267,6 +354,14 @@ __global__ static void vk_softmax_rows(const float *__restrict__ s, bf16 *__rest
 }
 
 /* One head's f32 output rows [rows x hd] into the attention output (bf16 [n_tok][heads][hd]) at row0. */
+/** Writes one head's f32 output chunk into the bf16 attention output.  1-D grid over rows * hd.
+ *  @param o     f32 [rows][hd] the head's chunk
+ *  @param out   bf16 [n_tok][heads][hd] attention output
+ *  @param row0  the chunk's first token
+ *  @param rows  tokens in the chunk
+ *  @param heads heads
+ *  @param head  this head
+ *  @param hd    head width */
 __global__ static void vk_store_head(const float *__restrict__ o, bf16 *__restrict__ out, int row0, int rows,
                                      int heads, int head, int hd) {
     const size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
@@ -278,6 +373,18 @@ __global__ static void vk_store_head(const float *__restrict__ o, bf16 *__restri
 /* Bidirectional attention over one image (q, k, v, out: bf16 [n_tok][heads][hd]), per head and per query chunk:
  * S = Q K^T in f32 on the GEMM, a scaled row softmax to bf16 P, O = P V in f32, rounded once.  The chunk keeps the
  * score block within `s_bytes` (`s` f32 and `p` bf16 scratch of that many score entries; `o` f32 chunk x hd). */
+/** @param q         device bf16 [n_tok][heads][hd]
+ *  @param k         device bf16 [n_tok][heads][hd]
+ *  @param v         device bf16 [n_tok][heads][hd]
+ *  @param out       device bf16 [n_tok][heads][hd] output
+ *  @param n_tok     tokens (patches) in the image
+ *  @param heads     heads
+ *  @param hd        head width
+ *  @param s         device f32 score scratch, s_entries entries
+ *  @param p         device bf16 probability scratch, s_entries entries
+ *  @param o         device f32 output chunk scratch, chunk x hd
+ *  @param s_entries score entries the scratch holds (a chunk of s_entries / n_tok query rows)
+ *  @return true on success, false on a GEMM refusal / launch failure (said) or a scratch below one row */
 static bool vattention(const void *q, const void *k, const void *v, void *out, int n_tok, int heads, int hd,
                        float *s, bf16 *p, float *o, size_t s_entries) {
     const int ld = heads * hd;
@@ -303,11 +410,25 @@ static bool vattention(const void *q, const void *k, const void *v, void *out, i
 }
 
 /* The attention scratch: score entries per chunk (f32 S + bf16 P), at most 256 Mi entries (1 GiB of f32). */
+/// @param n_tok tokens in the image
+/// @return score entries per chunk: n_tok^2, capped at 256 Mi
 static size_t vattention_entries(int n_tok) {
     const size_t cap = (size_t)256 << 20, full = (size_t)n_tok * n_tok;
     return full < cap ? full : cap;
 }
 
+/** @param o          the tower's tensor offsets in the mapped model (n_layers must be PULSAR_VISION_LAYERS)
+ *  @param map        host base of the mapped model
+ *  @param map_size   bytes mapped (unused)
+ *  @param patches_host host bf16 (n_h * n_w, 3, PATCH, PATCH) patches
+ *  @param n_h        patch grid rows
+ *  @param n_w        patch grid columns
+ *  @param out_host   host bf16 output, (out_rows, text_dim)
+ *  @param out_cap    rows out_host holds
+ *  @param out_rows   out: rows written
+ *  @param dbg        host stage dump, or NULL
+ *  @param dbg_blocks blocks dumped into dbg
+ *  @return 1 on success, 0 on any refusal */
 int pulsar_cuda_vision_forward(const pulsar_vision_offsets *o,
                                const void *map, uint64_t map_size,
                                const uint16_t *patches_host, int n_h, int n_w,
@@ -464,6 +585,10 @@ done:
 #undef CUDA_ALLOC
 #undef WT
 }
+/** @def WT(off)
+ *  Inside pulsar_cuda_vision_forward: the bf16 tensor at byte offset `off` of the mapped model. */
+/** @def DUMP_STAGE(row, src)
+ *  Inside pulsar_cuda_vision_forward: copies a stage (n_tok x D bf16) to dbg row `row` when dbg is set. */
 
 /* L268: Qwen3.8-Flash-Next's tower + merger over ONE image (HF Qwen4ExpVisionModel, the Qwen3-VL tower without
  * deepstack): patch embed (the Conv3d as a linear over the 1536 patch vector) -> + interpolated learned positions
@@ -471,6 +596,16 @@ done:
  * LayerNorm -> fc1 -> tanh-GELU -> fc2 -> residual] -> merger [LayerNorm per patch -> 4 patches (one 2x2 block)
  * concatenated -> fc1 -> erf-GELU -> fc2].  Same correctness-first kernels as DeepSeek's tower, graded the same way
  * (tests/vision_qwen_tower_gate.cpp, the reference's own bf16-vs-fp32 floor). */
+/** @param w               the tower's device weights
+ *  @param patches_host    host bf16 [n_tok][PATCH_IN] patches, 2x2 merge-block order
+ *  @param pos_host        host [n_tok][2] int32 patch (row, col)
+ *  @param interp_idx_host host [n_tok][4] int32 learned-position taps
+ *  @param interp_w_host   host [n_tok][4] f32 tap weights
+ *  @param n_tok           patches (a positive multiple of 4)
+ *  @param out_host        host bf16 [n_tok / 4][OUT] output
+ *  @param out_cap         rows out_host holds
+ *  @param dbg             host stage dump (3 x n_tok x DIM bf16), or NULL
+ *  @return 1 on success, 0 on any refusal */
 int pulsar_cuda_qwen_vision_forward(const pulsar_qwen_vision_weights_dev *w, const uint16_t *patches_host,
                                     const int32_t *pos_host, const int32_t *interp_idx_host,
                                     const float *interp_w_host, int n_tok, uint16_t *out_host, int out_cap,
@@ -592,3 +727,15 @@ done:
 #undef CUDA_ALLOC
 #undef WP
 }
+/** @def CUDA_ALLOC(p, bytes)
+ *  Inside the two tower forwards: cudaMalloc or jump to the cleanup. */
+/** @def CUDA_LAUNCH(what)
+ *  Inside the two tower forwards: checks the last launch or jumps to the cleanup. */
+/** @def CUDA_UP(dst, src, bytes)
+ *  Inside pulsar_cuda_qwen_vision_forward: host-to-device copy or jump to the cleanup. */
+/** @def WP(p)
+ *  Inside pulsar_cuda_qwen_vision_forward: a weight pointer as bf16. */
+/** @def LINEAR(x, W, B, y, k, n, rows)
+ *  Inside pulsar_cuda_qwen_vision_forward: vlinear on the f32 scratch or jump to the cleanup. */
+/** @def DUMP(slot, src)
+ *  Inside pulsar_cuda_qwen_vision_forward: copies a stage to dbg slot `slot` when dbg is set. */

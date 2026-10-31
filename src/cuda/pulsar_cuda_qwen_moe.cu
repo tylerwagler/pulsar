@@ -1,3 +1,5 @@
+/** @file
+ *  The rows MoE block over bf16 rows: routed experts through the format front doors, shared experts, workspace. */
 /* The rows MoE block's pieces over bf16 rows (L251 S4, family-neutral since L272 P4c / L295 F2): the routed experts
  * through the EXL3 front door (or Tessera), N shared experts, and the block's one carved workspace.  The engine
  * composes the block (Qwen: family_qwen_s4.cpp pulsar_qwen_s4_moe) as
@@ -40,6 +42,13 @@ namespace {
  * the shared down projection reads a bf16 row, so the producer emits bf16 -- and bf16 carries its own
  * exponent, so there is no per-32 block and no scale slab any more. */
 /* L296 N4: the same producer for the non-gated activation (pulsar_ffn_act RELU2): relu(u)^2, g unread. */
+/** The shared expert's activation, emitted bf16: SwiGLU silu(g) * u, or (act RELU2) relu(u)^2 with g unread.
+ *  Grid = T blocks (one per row), block = 256 threads striding the D channels.
+ *  @param g   f32 [T][D] gate projection (unread under RELU2)
+ *  @param u   f32 [T][D] up projection
+ *  @param D   the expert's intermediate width
+ *  @param act a pulsar_ffn_act value
+ *  @param xb  out, bf16 [T][D] the down projection's input */
 __global__ void __launch_bounds__(256)
 rows_act_emit_kernel(const float *__restrict__ g, const float *__restrict__ u, int D, int act,
                      __nv_bfloat16 *__restrict__ xb) {
@@ -56,6 +65,12 @@ rows_act_emit_kernel(const float *__restrict__ g, const float *__restrict__ u, i
 
 /* L266 EP: a pick of expert e becomes this rank's local index e - base, or -1 when another rank owns it
  * (the routed arms drop -1, mm_ids_helper by range and the fold / sum explicitly). */
+/** Expert parallelism: map each pick to this rank's local index in place.  One thread per pick, any 1-D grid
+ *  covering n.
+ *  @param sel     int32 [n] picks (global expert ids in, local ids or -1 out)
+ *  @param n       picks (T * top_k)
+ *  @param base    first expert this rank holds (ex_lo)
+ *  @param n_local experts this rank holds */
 __global__ void qwen_ep_localize_kernel(int32_t *__restrict__ sel, int n, int base, int n_local) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
@@ -64,6 +79,12 @@ __global__ void qwen_ep_localize_kernel(int32_t *__restrict__ sel, int n, int ba
 }
 
 /* out = out + scale * shared (scale 1 when the expert has no gate), added after the routed sum. */
+/** out += scale[t] * ys elementwise.  One thread per element, grid = ceil(T * H / 256), block = 256.
+ *  @param out   f32 [T][H] the routed sum, updated in place
+ *  @param ys    f32 [T][H] the shared expert's down output
+ *  @param scale f32 [T] the shared expert's gate (router gamma), or NULL for 1
+ *  @param T     rows
+ *  @param H     hidden width */
 __global__ void rows_shared_add_kernel(float *__restrict__ out, const float *__restrict__ ys,
                                        const float *__restrict__ scale, int T, int H) {
     const size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
@@ -73,10 +94,20 @@ __global__ void rows_shared_add_kernel(float *__restrict__ out, const float *__r
 }
 
 /* A bump allocator over the caller's workspace (256-byte aligned slices). */
+/// A bump allocator over the caller's workspace: 256-byte aligned slices; base NULL only sizes.
 struct ws_bump {
+    /// Workspace start, or NULL to size only.
     uint8_t *base;
+    /** @var cap
+     *  Workspace bytes ((size_t)-1 when sizing).
+     *  @var used
+     *  Bytes handed out so far (end of the last slice). */
     size_t cap, used;
+    /// A take() overran cap; every later take() fails too.
     bool failed;
+    /** Take the next 256-B aligned slice.
+     *  @param bytes slice size
+     *  @return the slice, or nullptr when sizing or on overflow (then `failed` is set) */
     void *take(size_t bytes) {
         const size_t off = (used + 255) & ~(size_t)255;
         if (failed || off + bytes > cap) { failed = true; return nullptr; }
@@ -87,10 +118,25 @@ struct ws_bump {
 
 /* L272 P4c: the routed part's workspace (pulsar_rows_moe_routed_launch): the gate / up outputs, the fold's bf16
  * rows, the down outputs -- a function of the rows and the routing shape alone (the model's, not a family's). */
+/// The routed part's workspace pieces, carved by routed_ws_layout.
 struct routed_ws {
+    /** @var gu_z
+     *  f32 [T * top_k][2 * mid] the gate / up outputs.
+     *  @var down_z
+     *  f32 [T * top_k][out_dim] the down outputs. */
     float *gu_z, *down_z;
+    /// bf16 [T * top_k][mid] the routed fold's rows (the down projection's input).
     uint8_t *mid_x;                 /* the routed fold's bf16 rows (ac69748f) */
 };
+/** Lay the routed part's workspace out (sizing and carving are the same walk).
+ *  @param T       rows
+ *  @param top_k   picks per row
+ *  @param mid     expert intermediate width
+ *  @param out_dim expert output width
+ *  @param base    workspace start, or nullptr to size only
+ *  @param cap     workspace bytes (checked when base is non-null)
+ *  @param o       out: the pieces, or nullptr
+ *  @return bytes used, 0 when they exceed cap */
 static size_t routed_ws_layout(int T, int top_k, int mid, int out_dim, void *base, size_t cap, routed_ws *o) {
     ws_bump b{(uint8_t *)base, base ? cap : (size_t)-1, 0, false};
     const size_t pairs = (size_t)T * (size_t)top_k;
@@ -105,6 +151,13 @@ static size_t routed_ws_layout(int T, int top_k, int mid, int out_dim, void *bas
 /* L255: the Tessera routed launch's bf16 [T][H] output -- the weighted, fixed-order sum over the top-k, exactly
  * Tessera's token_sum -- is the block's routed term in f32, exactly; a non-finite value records nf_code (first
  * writer wins), as the EXL3 sum does. */
+/** Widen Tessera's bf16 routed sum to the block's f32 term and flag non-finite values.  One thread per element,
+ *  grid = ceil(n / 256), block = 256.
+ *  @param out     f32 [n] the routed term
+ *  @param routed  bf16 [n] Tessera's token_sum output ([T][H])
+ *  @param n       elements (T * H)
+ *  @param nf_flag device flag: nf_code is CAS'd in on the first non-finite value
+ *  @param nf_code the code to record */
 __global__ static void qwen_tessera_routed_kernel(float *__restrict__ out, const uint16_t *__restrict__ routed, size_t n,
                                                   uint32_t *__restrict__ nf_flag, uint32_t nf_code) {
     const size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
@@ -114,6 +167,13 @@ __global__ static void qwen_tessera_routed_kernel(float *__restrict__ out, const
     if (!isfinite(v)) atomicCAS(nf_flag, 0u, nf_code);
 }
 
+/** @param ws       the routed workspace the last pulsar_rows_moe_routed_launch used
+ *  @param ws_bytes its bytes
+ *  @param T        rows of that launch
+ *  @param top_k    picks per row
+ *  @param mid      expert intermediate width
+ *  @param out_dim  expert output width
+ *  @return the bf16 [T * top_k][mid] fold rows, or nullptr when ws is NULL or too small */
 extern "C" const uint16_t *pulsar_rows_moe_routed_mid(void *ws, size_t ws_bytes, int T, int top_k, int mid, int out_dim) {
     routed_ws m;
     return ws && routed_ws_layout(T, top_k, mid, out_dim, ws, ws_bytes, &m) != 0 ? (const uint16_t *)m.mid_x : nullptr;
@@ -122,6 +182,12 @@ extern "C" const uint16_t *pulsar_rows_moe_routed_mid(void *ws, size_t ws_bytes,
 /* The one layout of a rows MoE block's workspace (the router's outputs, the routed region, the shared experts):
  * sizing and carving are the same walk.  Each shared expert has its own rows (a pending fork's buffers); the
  * dense arm's workspace is one, shared. */
+/** @param s    the block's shape
+ *  @param T    rows
+ *  @param base workspace start, or nullptr to size only
+ *  @param cap  workspace bytes (checked when base is non-null)
+ *  @param o    out: the carved parts, or nullptr
+ *  @return bytes used, 0 when they exceed cap */
 static size_t moe_ws_layout(const pulsar_moe_block_shape *s, int T, void *base, size_t cap,
                             pulsar_moe_block_parts *o) {
     ws_bump b{(uint8_t *)base, base ? cap : (size_t)-1, 0, false};
@@ -161,12 +227,18 @@ static size_t moe_ws_layout(const pulsar_moe_block_shape *s, int T, void *base, 
     return b.failed ? 0 : b.used;
 }
 
+/** Validate a block shape (counts positive, n_shared in 0..PULSAR_ROUTER_SHARED_MAX, logit rows cover the experts).
+ *  @param s the shape, may be NULL
+ *  @return true when the shape is usable */
 static bool block_shape_ok(const pulsar_moe_block_shape *s) {
     return s && s->n_expert > 0 && s->top_k > 0 && s->n_logit_rows >= s->n_expert && s->hidden > 0 &&
            s->expert_mid > 0 && s->n_shared >= 0 && s->n_shared <= PULSAR_ROUTER_SHARED_MAX &&
            (s->n_shared == 0 || s->shared_mid > 0) && s->latent >= 0;
 }
 
+/** Check the last launch; prints the failure with `what` and returns false on error.
+ *  @param what step name for the message
+ *  @return true when no launch error is pending */
 static bool launch_ok(const char *what) {
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) {
@@ -253,6 +325,16 @@ extern "C" size_t pulsar_rows_linear_multi_workspace_bytes(const pulsar_rows_lin
 
 /* The multi launch, f32 outputs y (yb NULL) or bf16 rows yb with y[j] the f32 staging of the arms that have no bf16
  * epilogue (L296 dec2): the EXL3 decode GEMV emits yb itself; every other arm writes y[j] and the front door emits. */
+/** @param ls       [n] the Linears
+ *  @param n        Linears, 1 .. DS4_EXL3_DENSE_MAX_PROJ
+ *  @param x_bf16   device bf16 [rows][in] shared input
+ *  @param rows     activation rows
+ *  @param y        [n] device f32 outputs, or (with yb) the f32 staging
+ *  @param yb       [n] device bf16 outputs, or NULL
+ *  @param ws       device workspace
+ *  @param ws_bytes bytes at ws
+ *  @param stream   stream to launch on
+ *  @return 0 on success, negative on a refusal (said) or a launch failure */
 static int rows_multi(const pulsar_rows_linear *const *ls, int n, const uint16_t *x_bf16, int rows, float *const *y,
                       uint16_t *const *yb, void *ws, size_t ws_bytes, cudaStream_t stream) {
     if (!ls || n < 1 || n > DS4_EXL3_DENSE_MAX_PROJ || !y || !x_bf16 || rows <= 0) {
@@ -322,7 +404,12 @@ extern "C" int pulsar_rows_linear_multi_bf16_launch(const pulsar_rows_linear *co
 
 /* The MX slab geometry, for the engine TUs that cannot include pulsar_cuda_mx.cuh
  * (g++ does not know __host__/__device__).  One authority: these delegate. */
+/// @param in_dim an MX row's input width
+/// @return pulsar_mx_kbp(in_dim)
 int pulsar_gpu_mx_kbp(int in_dim) { return pulsar_mx_kbp(in_dim); }
+/// @param rows rows of the slab
+/// @param kbp  the row's padded block count (pulsar_gpu_mx_kbp)
+/// @return pulsar_mx_sf_slab_bytes(rows, kbp)
 size_t pulsar_gpu_mx_sf_slab_bytes(int rows, int kbp) { return pulsar_mx_sf_slab_bytes(rows, kbp); }
 
 extern "C" size_t pulsar_moe_block_workspace_bytes(const pulsar_moe_block_shape *s, int T) {
@@ -348,6 +435,10 @@ extern "C" size_t pulsar_rows_moe_routed_workspace_bytes(int T, int top_k, int m
 }
 
 /* A riding shared expert's descriptor in the front door's terms: three EXL3 slices hidden -> mid -> hidden. */
+/// @param q  the shared expert
+/// @param H  the block's hidden width
+/// @param sh out: the EXL3 front door's descriptor
+/// @return true when q can ride (SwiGLU, three EXL3 slices H -> mid -> H); false said
 static bool rows_moe_shared(const pulsar_rows_moe_shared *q, int H, exl3_moe_shared *sh) {
     const int smid = q->gate.out;
     if (q->act != PULSAR_FFN_ACT_SWIGLU) {
@@ -533,6 +624,9 @@ extern "C" int pulsar_rows_moe_routed_launch(const pulsar_rows_moe *w, int32_t *
 }
 
 /* A non-riding shared expert's descriptor, checked (the launch, the fork and the join take the same one). */
+/// @param q    the shared expert
+/// @param what the caller's name for the message
+/// @return true when the descriptor and its buffers are consistent; false said
 static bool shared_ok(const pulsar_rows_moe_shared *q, const char *what) {
     const bool gated = q && q->act == PULSAR_FFN_ACT_SWIGLU;
     const int smid = q ? q->up.out : 0, H = q ? q->up.in : 0;
@@ -548,6 +642,11 @@ static bool shared_ok(const pulsar_rows_moe_shared *q, const char *what) {
 }
 
 /* [gate +] up on the same row, the activation's producer, down: ys = down(act(gate x, up x)) */
+/// @param q      the shared expert
+/// @param x_bf16 device bf16 [T][in]
+/// @param T      rows
+/// @param stream stream to launch on
+/// @return 0 on success, negative on a refusal or a launch failure
 static int shared_ys(const pulsar_rows_moe_shared *q, const uint16_t *x_bf16, int T, cudaStream_t stream) {
     int rc = q->act == PULSAR_FFN_ACT_SWIGLU ? pulsar_rows_linear_launch(&q->gate, x_bf16, T, q->yg, q->ws, q->ws_bytes,
                                                                          stream) : 0;
@@ -559,6 +658,11 @@ static int shared_ys(const pulsar_rows_moe_shared *q, const uint16_t *x_bf16, in
 }
 
 /* out += scale * ys */
+/// @param q      the shared expert (its ys and scale)
+/// @param T      rows
+/// @param out    device f32 [T][H] accumulated into
+/// @param stream stream to launch on
+/// @return 0, or -3 on a launch failure
 static int shared_add(const pulsar_rows_moe_shared *q, int T, float *out, cudaStream_t stream) {
     const int H = q->down.out;
     const size_t n = (size_t)T * H;
@@ -590,13 +694,27 @@ namespace {
  * latency-bound launches take the SMs ahead of the bandwidth-bound shared expert left on the caller (in a captured
  * step the nodes keep it: kernel nodes copy their stream's priority, and the segment cache instantiates with
  * cudaGraphInstantiateFlagUseNodePriority) -- with the fork and join events.  One fork pending at a time. */
+/// L296 dec2: one (thread, device, caller stream)'s priority stream for the routed chain, with its fork / join events.
 struct routed_lane {
+    /// CUDA device the lane belongs to.
     int dev;
+    /** @var caller
+     *  The caller stream the lane is keyed on.
+     *  @var s
+     *  The lane's own non-blocking stream at the device's greatest priority. */
     cudaStream_t caller, s;
+    /** @var fork
+     *  Recorded on caller at the fork; s waits on it.
+     *  @var done
+     *  Recorded on s at the join; caller waits on it. */
     cudaEvent_t fork, done;
+    /// A fork is outstanding (one at a time).
     bool pending;
 };
 
+/** The calling thread's lane for (current device, caller), created on first use (at most 8 per thread).
+ *  @param caller the caller stream
+ *  @return the lane, or nullptr when the device query or stream / event creation fails or the 8 slots are used */
 routed_lane *routed_lane_for(cudaStream_t caller) {
     thread_local routed_lane t_lanes[8];
     thread_local int t_n = 0;

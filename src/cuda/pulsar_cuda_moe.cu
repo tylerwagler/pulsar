@@ -1,3 +1,5 @@
+/** @file
+ *  DeepSeek routed-expert MoE: the expert FFN lanes (MMQ, mixed, CUTLASS MXFP4) and their dispatch. */
 #include "pulsar_cuda_internal.h"
 #include "pulsar_cuda_mx.cuh"
 #ifdef PULSAR_HAVE_MMQ
@@ -94,8 +96,10 @@
  * already a synchronisation point, so the decode lane pays no extra sync.
  *
  * Code layout: bits 0..7 = layer_index + 1 (0 means "clear"), bits 8..15 = arm. */
+/// Device non-finite flag: 0 = clear, else the first (layer, arm) code whose MoE sum was not finite.
 __device__ static uint32_t g_moe_nonfinite = 0u;
 
+/// The MoE down arm a non-finite flag names (bits 8..15 of the code).
 enum moe_nonfinite_arm {
     MOE_NF_ARM_MMQ_DOWN     = 1,   ///< IQ2_XXS MMQ down (routed_moe_launch)
     MOE_NF_ARM_GROUPED_DOWN = 2,   ///< grouped CUTLASS MXFP4 down (routed_moe_launch_cutlass_grouped)
@@ -105,11 +109,16 @@ enum moe_nonfinite_arm {
 };
 
 /** The flag value moe_sum stores for a non-finite sum at (layer_index, arm). */
+/** @param layer_index the layer
+ *  @param arm         a moe_nonfinite_arm value
+ *  @return the flag code (arm << 8 | (layer_index + 1) & 0xff) */
 static __host__ __device__ __forceinline__ uint32_t moe_nonfinite_code(uint32_t layer_index, uint32_t arm) {
     return (arm << 8) | ((layer_index + 1u) & 0xffu);
 }
 
 /** Record `nf_code` in the flag if `acc` is not finite (first writer wins). */
+/** @param acc     a summed output element
+ *  @param nf_code the code to record when it is not finite */
 __device__ static __forceinline__ void moe_flag_nonfinite(float acc, uint32_t nf_code) {
     if (!isfinite(acc)) atomicCAS(&g_moe_nonfinite, 0u, nf_code);
 }
@@ -136,6 +145,14 @@ int pulsar_gpu_routed_moe_nonfinite_take(uint32_t *layer_index, const char **arm
     return 1;
 }
 
+/** Per-token MoE sum: out[t][r] = sum over slots e (ascending) of down[t * n_expert + e][r]; flags a non-finite
+ *  result.  Grid ceil(n_tokens * out_dim / 256); block 256.
+ *  @param out      device f32 [n_tokens][out_dim]
+ *  @param down     device f32 [n_tokens * n_expert][out_dim] pre-weighted slot outputs
+ *  @param out_dim  output width
+ *  @param n_expert slots per token
+ *  @param n_tokens token rows
+ *  @param nf_code  non-finite flag code for this layer and arm */
 __global__ static void moe_sum_kernel(float *out, const float *down, uint32_t out_dim, uint32_t n_expert, uint32_t n_tokens,
                                       uint32_t nf_code) {
     uint64_t gid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
@@ -176,6 +193,9 @@ __global__ static void moe_sum_kernel(float *out, const float *down, uint32_t ou
 
 
 
+/// @param n bytes
+/// @param a alignment (> 0)
+/// @return n rounded up to a multiple of a
 static uint64_t cutlass_moe_align_up(uint64_t n, uint64_t a) { return (n + a - 1) / a * a; }
 
 
@@ -187,6 +207,10 @@ static uint64_t cutlass_moe_align_up(uint64_t n, uint64_t a) { return (n + a - 1
  * group's block-scaled SF starts on a 128-row atom boundary (see pulsar_cutlass_grouped_moe). ---- */
 
 /* padded_offsets[e] = sum_{e'<e} ceil(counts[e']/128)*128 (per-group 128-row-padded row base). */
+/** Serial 128-row-padded group bases.  Grid 1; block 1 (only thread 0 works).
+ *  @param padded_off device [n_total] padded row base of each expert's group
+ *  @param counts     device [n_total] rows routed to each expert
+ *  @param n_total    experts */
 __global__ static void moe_padded_offsets_kernel(uint32_t *padded_off, const uint32_t *counts, uint32_t n_total) {
     if (threadIdx.x != 0 || blockIdx.x != 0) return;
     uint32_t run = 0;
@@ -205,6 +229,22 @@ __global__ static void moe_padded_offsets_kernel(uint32_t *padded_off, const uin
  * has that token encoded (the CUTLASS path reads the activation cache's E4M3)
  * can gather the codes itself.  When it does, x_gathered is NULL and the f32 row
  * copy below -- the expensive half of this kernel -- is skipped entirely. */
+/** Places each sorted pair at its expert's padded row (see above).  Grid pair_count (one block per sorted slot);
+ *  block 256 (the row copy); no smem.
+ *  @param x_gathered  device f32 [padded][in_dim] gathered rows, or NULL: skip the f32 copy
+ *  @param w_gathered  device f32 [padded] routing weight per padded row
+ *  @param padded_pair device int32 [padded] originating pair per padded row (padding stays -1)
+ *  @param row_src_tok device int32 [padded] source token per padded row, or NULL
+ *  @param pair_slot   device int32 [pair_count] inverse map pair -> padded row, or NULL
+ *  @param x           device f32 [tokens][in_dim] input rows (read only with x_gathered)
+ *  @param weights     device f32 [pair_count] routing weights
+ *  @param sorted_pairs device [pair_count] pair indices, expert-major
+ *  @param offsets     device [n_total + 1] exclusive pair offsets per expert
+ *  @param padded_off  device [n_total] padded row bases per expert
+ *  @param pair_count  pairs (tokens x slots)
+ *  @param n_total     experts
+ *  @param n_expert    slots per token (pair = token * n_expert + slot)
+ *  @param in_dim      row width */
 __global__ static void moe_padded_gather_kernel(
         float *x_gathered, float *w_gathered, int32_t *padded_pair, int32_t *row_src_tok,
         int32_t *pair_slot,
@@ -244,6 +284,15 @@ __global__ static void moe_padded_gather_kernel(
  * round trip of the flat down buffer (a write + re-read of
  * n_tokens*n_expert*out_dim f32 per layer). Rows a pair never claimed carry
  * -1, matching the padded_pair<0 convention, and contribute nothing. */
+/** Per-token MoE sum straight from the padded grouped output (see above).  Grid ceil(n_tokens * out_dim / 256);
+ *  block 256.
+ *  @param out       device f32 [n_tokens][out_dim]
+ *  @param ffn_out   device f32 [padded][out_dim] pre-weighted grouped GEMM output
+ *  @param pair_slot device int32 [n_tokens * n_expert] pair -> padded row (-1: none)
+ *  @param out_dim   output width
+ *  @param n_expert  slots per token
+ *  @param n_tokens  token rows
+ *  @param nf_code   non-finite flag code */
 __global__ static void moe_sum_padded_kernel(
         float *out, const float *ffn_out, const int32_t *pair_slot,
         uint32_t out_dim, uint32_t n_expert, uint32_t n_tokens, uint32_t nf_code) {
@@ -269,6 +318,17 @@ __global__ static void moe_sum_padded_kernel(
  * One block owns one padded row and warp w covers columns [k0 + 32w, ...),
  * an aligned 32-block per step, so the block amax is a full-warp shuffle; the
  * destination row is the PAIR row, which is the activation slot's row. */
+/** Padded row -> pair row scatter (see above).  Grid padded_total (one block per padded row); block a multiple
+ *  of 32 (256 at the call sites); EMIT needs whole warps over aligned 32-column blocks.
+ *  @tparam EMIT true: write E4M3 + E8M0 into the pair-row slot instead of the f32 row
+ *  @param down_flat    device f32 [pairs][out_dim] destination (EMIT false)
+ *  @param ffn_out      device f32 [padded_total][out_dim] source rows
+ *  @param padded_pair  device int32 [padded_total] pair per padded row (< 0: padding, skipped)
+ *  @param padded_total padded rows
+ *  @param out_dim      row width
+ *  @param eq           E4M3 destination rows [pairs][out_dim] (EMIT true)
+ *  @param esf          E8M0 scale slab, pulsar_mx_sfoff layout (EMIT true)
+ *  @param ekbp         the slab's padded blocks per row */
 template <bool EMIT>
 __global__ static void moe_padded_scatter_kernel(
         float *down_flat, const float *ffn_out, const int32_t *padded_pair,
@@ -304,6 +364,12 @@ __global__ static void moe_padded_scatter_kernel(
  * `expert_bytes` each, back to back from `stack_offset`.  Every rank holds
  * every expert (under TP, its half of each -- L241 4g-2), so the whole stack
  * is the one request. */
+/** @param model_map    host base of the mapping
+ *  @param stack_offset byte offset of the stack
+ *  @param expert_bytes bytes per expert
+ *  @param n_total      experts in the stack
+ *  @param what         label for the range request
+ *  @return the device pointer to the whole stack, or NULL (empty stack or an unresolvable range) */
 static const char *routed_expert_stack_ptr(const void *model_map, uint64_t stack_offset,
                                            uint64_t expert_bytes, uint32_t n_total,
                                            const char *what) {
@@ -311,6 +377,31 @@ static const char *routed_expert_stack_ptr(const void *model_map, uint64_t stack
     return cuda_model_range_ptr(model_map, stack_offset, (uint64_t)n_total * expert_bytes, what);
 }
 
+/** Uniform CUTLASS MXFP4 (type 40) routed MoE: sorted pairs, 128-row-padded gather, one grouped GEMM per
+ *  projection, the padded sum into out.  Needs the producer E4M3 of x (refuses without).  No host sync.
+ *  @param out             device f32 [n_tokens][out_dim] block output (the per-token sum over its n_expert slots)
+ *  @param down            device f32 [n_tokens * n_expert][out_dim] per-slot pre-weighted FFN outputs (the flat down buffer)
+ *  @param model_map       host base of the model mapping the expert stacks live in
+ *  @param model_size      bytes of that mapping (offsets are bounds-checked against it)
+ *  @param gate_offset     byte offset of the gate stack (n_total_expert experts back to back)
+ *  @param up_offset       byte offset of the up stack
+ *  @param down_offset     byte offset of the down stack
+ *  @param gate_stride     bytes per gate / up expert (the stack stride)
+ *  @param gate_data_bytes gate / up data-plane bytes per expert (the scale plane follows)
+ *  @param down_stride     bytes per down expert
+ *  @param down_data_bytes down data-plane bytes per expert
+ *  @param expert_in_dim   expert input width (the hidden size)
+ *  @param expert_mid_dim  expert intermediate width (under expert TP, this rank's half)
+ *  @param out_dim         expert output width
+ *  @param selected        device int32 [n_tokens][n_expert] routed expert ids
+ *  @param weights         device f32 [n_tokens][n_expert] routing weights
+ *  @param n_total_expert  experts present in the stacks
+ *  @param n_expert        routed slots per token (top-k)
+ *  @param clamp           SwiGLU clamp (<= 1e-6: none)
+ *  @param x               device f32 [n_tokens][expert_in_dim] input; its producer E4M3 slot is what the GEMMs read
+ *  @param layer_index     layer, for the non-finite / route-bounds flags
+ *  @param n_tokens        token rows
+ *  @return 1 on success, 0 refused / failed */
 static int routed_moe_launch_cutlass_grouped(
         pulsar_gpu_tensor *out,
         pulsar_gpu_tensor *down,
@@ -499,6 +590,30 @@ static int routed_moe_launch_cutlass_grouped(
 }
 
 /* Grouped single-launch path; a failed grouped call is a failed MoE step. */
+/** Calls routed_moe_launch_cutlass_grouped and names a failure once on stderr (no fallback).
+ *  @param out             device f32 [n_tokens][out_dim] block output (the per-token sum over its n_expert slots)
+ *  @param down            device f32 [n_tokens * n_expert][out_dim] per-slot pre-weighted FFN outputs (the flat down buffer)
+ *  @param model_map       host base of the model mapping the expert stacks live in
+ *  @param model_size      bytes of that mapping (offsets are bounds-checked against it)
+ *  @param gate_offset     byte offset of the gate stack (n_total_expert experts back to back)
+ *  @param up_offset       byte offset of the up stack
+ *  @param down_offset     byte offset of the down stack
+ *  @param gate_stride     bytes per gate / up expert (the stack stride)
+ *  @param gate_data_bytes gate / up data-plane bytes per expert (the scale plane follows)
+ *  @param down_stride     bytes per down expert
+ *  @param down_data_bytes down data-plane bytes per expert
+ *  @param expert_in_dim   expert input width (the hidden size)
+ *  @param expert_mid_dim  expert intermediate width (under expert TP, this rank's half)
+ *  @param out_dim         expert output width
+ *  @param selected        device int32 [n_tokens][n_expert] routed expert ids
+ *  @param weights         device f32 [n_tokens][n_expert] routing weights
+ *  @param n_total_expert  experts present in the stacks
+ *  @param n_expert        routed slots per token (top-k)
+ *  @param clamp           SwiGLU clamp (<= 1e-6: none)
+ *  @param x               device f32 [n_tokens][expert_in_dim] input; its producer E4M3 slot is what the GEMMs read
+ *  @param layer_index     layer, for the non-finite / route-bounds flags
+ *  @param n_tokens        token rows
+ *  @return 1 on success, 0 on failure */
 static int routed_moe_launch_cutlass_dispatch(
         pulsar_gpu_tensor *out, pulsar_gpu_tensor *down, const void *model_map, uint64_t model_size,
         uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset,
@@ -542,6 +657,15 @@ static int routed_moe_launch_cutlass_dispatch(
  * each projection reads only its own weight/SF and its own activation quant.
  *
  * Both MMQ arms fail closed if MMQ declines; no other reader understands the aligned layout. */
+/** mid_g = swiglu(gate_g, up_g) * w over gathered rows.  Grid ceil(n_rows * mid_dim / 256); block 256;
+ *  one element a thread.
+ *  @param mid_g   device f32 [n_rows][mid_dim] output
+ *  @param gate_g  device f32 [n_rows][mid_dim] gate
+ *  @param up_g    device f32 [n_rows][mid_dim] up
+ *  @param w_g     device f32 [n_rows] routing weight per row
+ *  @param clamp   SwiGLU clamp
+ *  @param mid_dim row width
+ *  @param n_rows  rows */
 __global__ static void moe_swiglu_gathered_kernel(
         float *mid_g, const float *gate_g, const float *up_g, const float *w_g,
         float clamp, uint32_t mid_dim, uint32_t n_rows) {
@@ -568,6 +692,34 @@ static int routed_moe_try_mmq_down(float *down_out,
                                    uint64_t pairs, const void *mid_q, const void *mid_sf, int mid_kbp);
 #endif
 
+/** Mixed layer: one side CUTLASS MXFP4 (type 40), the other IQ2_XXS MMQ (cases A / B above); fail-closed.
+ *  @param out               device f32 [n_tokens][out_dim] block output (the per-token sum over its n_expert slots)
+ *  @param up                device f32 scratch [n_tokens * n_expert][expert_mid_dim] (gate / up partials, by arm)
+ *  @param mid               device f32 [n_tokens * n_expert][expert_mid_dim] mid tensor (its E4M3 activation slot carries the encoded mid)
+ *  @param down              device f32 [n_tokens * n_expert][out_dim] per-slot pre-weighted FFN outputs (the flat down buffer)
+ *  @param model_map         host base of the model mapping the expert stacks live in
+ *  @param model_size        bytes of that mapping (offsets are bounds-checked against it)
+ *  @param gate_offset       byte offset of the gate stack (n_total_expert experts back to back)
+ *  @param up_offset         byte offset of the up stack
+ *  @param down_offset       byte offset of the down stack
+ *  @param gate_type         pulsar_tensor_type of the gate / up stacks
+ *  @param down_type         pulsar_tensor_type of the down stack
+ *  @param gate_expert_bytes bytes per gate / up expert (the stack stride)
+ *  @param gate_row_bytes    gate / up per-expert row bytes; for CUTLASS MXFP4 the data-plane bytes before the scale plane
+ *  @param down_expert_bytes bytes per down expert (the stack stride)
+ *  @param down_row_bytes    down per-expert row bytes; for CUTLASS MXFP4 the data-plane bytes before the scale plane
+ *  @param expert_in_dim     expert input width (the hidden size)
+ *  @param expert_mid_dim    expert intermediate width (under expert TP, this rank's half)
+ *  @param out_dim           expert output width
+ *  @param selected          device int32 [n_tokens][n_expert] routed expert ids
+ *  @param weights           device f32 [n_tokens][n_expert] routing weights
+ *  @param n_total_expert    experts present in the stacks
+ *  @param n_expert          routed slots per token (top-k)
+ *  @param clamp             SwiGLU clamp (<= 1e-6: none)
+ *  @param x                 device f32 [n_tokens][expert_in_dim] input; its producer E4M3 slot is what the GEMMs read
+ *  @param layer_index       layer, for the non-finite / route-bounds flags
+ *  @param n_tokens          token rows
+ *  @return 1 on success, 0 refused / failed */
 static int routed_moe_launch_mixed40(
         pulsar_gpu_tensor *out, pulsar_gpu_tensor *up,
         pulsar_gpu_tensor *mid, pulsar_gpu_tensor *down,
@@ -1240,6 +1392,34 @@ static int routed_moe_try_mmq_down(
  * rank's halves (pulsar_gpu_register_exl3_expert_half) and expert_mid_dim is
  * the half width: nothing here is tied to the full width, and the mid granule
  * is the 128 Hadamard block (V4.1's 2304 halves to 1152 = 9 x 128). */
+/** EXL3 routed arm (see above): the EXL3 front door over the E4M3 slots, prompt / decode GEMM by the row kind.
+ *  @param out               device f32 [n_tokens][out_dim] block output (the per-token sum over its n_expert slots)
+ *  @param up                device f32 scratch [n_tokens * n_expert][expert_mid_dim] (gate / up partials, by arm)
+ *  @param mid               device f32 [n_tokens * n_expert][expert_mid_dim] mid tensor (its E4M3 activation slot carries the encoded mid)
+ *  @param down              device f32 [n_tokens * n_expert][out_dim] per-slot pre-weighted FFN outputs (the flat down buffer)
+ *  @param model_map         host base of the model mapping the expert stacks live in
+ *  @param model_size        bytes of that mapping (offsets are bounds-checked against it)
+ *  @param gate_offset       byte offset of the gate stack (n_total_expert experts back to back)
+ *  @param up_offset         byte offset of the up stack
+ *  @param down_offset       byte offset of the down stack
+ *  @param gate_type         pulsar_tensor_type of the gate / up stacks
+ *  @param down_type         pulsar_tensor_type of the down stack
+ *  @param gate_expert_bytes bytes per gate / up expert (the stack stride)
+ *  @param gate_row_bytes    gate / up per-expert row bytes; for CUTLASS MXFP4 the data-plane bytes before the scale plane
+ *  @param down_expert_bytes bytes per down expert (the stack stride)
+ *  @param down_row_bytes    down per-expert row bytes; for CUTLASS MXFP4 the data-plane bytes before the scale plane
+ *  @param expert_in_dim     expert input width (the hidden size)
+ *  @param expert_mid_dim    expert intermediate width (under expert TP, this rank's half)
+ *  @param out_dim           expert output width
+ *  @param selected          device int32 [n_tokens][n_expert] routed expert ids
+ *  @param weights           device f32 [n_tokens][n_expert] routing weights
+ *  @param n_total_expert    experts present in the stacks
+ *  @param n_expert          routed slots per token (top-k)
+ *  @param clamp             SwiGLU clamp (<= 1e-6: none)
+ *  @param x                 device f32 [n_tokens][expert_in_dim] input; its producer E4M3 slot is what the GEMMs read
+ *  @param layer_index       layer, for the non-finite / route-bounds flags
+ *  @param n_tokens          token rows
+ *  @return 1 on success, 0 refused / failed */
 static int routed_moe_launch_exl3(
         pulsar_gpu_tensor *out,
         pulsar_gpu_tensor *up,
@@ -1358,6 +1538,35 @@ static int routed_moe_launch_exl3(
 #endif
 }
 
+/** IQ2_XXS MMQ on both sides (the only remaining non-CUTLASS, non-EXL3 arm): MMQ gate/up + fold, MMQ down,
+ *  moe_sum.  Refuses any other type and in a build without MMQ.
+ *  @param out               device f32 [n_tokens][out_dim] block output (the per-token sum over its n_expert slots)
+ *  @param up                device f32 scratch [n_tokens * n_expert][expert_mid_dim] (gate / up partials, by arm)
+ *  @param mid               device f32 [n_tokens * n_expert][expert_mid_dim] mid tensor (its E4M3 activation slot carries the encoded mid)
+ *  @param down              device f32 [n_tokens * n_expert][out_dim] per-slot pre-weighted FFN outputs (the flat down buffer)
+ *  @param model_map         host base of the model mapping the expert stacks live in
+ *  @param model_size        bytes of that mapping (offsets are bounds-checked against it)
+ *  @param gate_offset       byte offset of the gate stack (n_total_expert experts back to back)
+ *  @param up_offset         byte offset of the up stack
+ *  @param down_offset       byte offset of the down stack
+ *  @param gate_type         pulsar_tensor_type of the gate / up stacks
+ *  @param down_type         pulsar_tensor_type of the down stack
+ *  @param gate_expert_bytes bytes per gate / up expert (the stack stride)
+ *  @param gate_row_bytes    gate / up per-expert row bytes; for CUTLASS MXFP4 the data-plane bytes before the scale plane
+ *  @param down_expert_bytes bytes per down expert (the stack stride)
+ *  @param down_row_bytes    down per-expert row bytes; for CUTLASS MXFP4 the data-plane bytes before the scale plane
+ *  @param expert_in_dim     expert input width (the hidden size)
+ *  @param expert_mid_dim    expert intermediate width (under expert TP, this rank's half)
+ *  @param out_dim           expert output width
+ *  @param selected          device int32 [n_tokens][n_expert] routed expert ids
+ *  @param weights           device f32 [n_tokens][n_expert] routing weights
+ *  @param n_total_expert    experts present in the stacks
+ *  @param n_expert          routed slots per token (top-k)
+ *  @param clamp             SwiGLU clamp (<= 1e-6: none)
+ *  @param x                 device f32 [n_tokens][expert_in_dim] input; its producer E4M3 slot is what the GEMMs read
+ *  @param layer_index       layer, for the non-finite / route-bounds flags
+ *  @param n_tokens          token rows
+ *  @return 1 on success, 0 refused / failed */
 static int routed_moe_launch(
         pulsar_gpu_tensor *out,
         pulsar_gpu_tensor *up,
@@ -1560,6 +1769,9 @@ static int routed_moe_launch(
 /* plan-34 inc 4: row-offset sub-view of a per-token MoE tensor for the two-pass
  * split (byte offset into a row-major [n_tokens x stride] buffer). Reads ptr/bytes
  * only; owner=0 (never freed). NULL/empty tensors pass through as empty. */
+/** @param t         the tensor (may be NULL)
+ *  @param off_bytes byte offset of the sub-view
+ *  @return a non-owning view from off_bytes to the end (empty for a NULL / empty tensor) */
 static inline pulsar_gpu_tensor moe_subrow(const pulsar_gpu_tensor *t, uint64_t off_bytes) {
     pulsar_gpu_tensor s; s.ptr = NULL; s.bytes = 0; s.owner = 0;
     if (t && t->ptr) {
@@ -1569,6 +1781,35 @@ static inline pulsar_gpu_tensor moe_subrow(const pulsar_gpu_tensor *t, uint64_t 
     return s;
 }
 
+/** Routed MoE dispatch: splits a mixed decode + prefill step in two passes (see the comment inside), then
+ *  routes by the stacks' types to the EXL3, small-batch GEMV, grouped CUTLASS, mixed or MMQ arm.
+ *  @param out               device f32 [n_tokens][out_dim] block output (the per-token sum over its n_expert slots)
+ *  @param up                device f32 scratch [n_tokens * n_expert][expert_mid_dim] (gate / up partials, by arm)
+ *  @param mid               device f32 [n_tokens * n_expert][expert_mid_dim] mid tensor (its E4M3 activation slot carries the encoded mid)
+ *  @param down              device f32 [n_tokens * n_expert][out_dim] per-slot pre-weighted FFN outputs (the flat down buffer)
+ *  @param model_map         host base of the model mapping the expert stacks live in
+ *  @param model_size        bytes of that mapping (offsets are bounds-checked against it)
+ *  @param gate_offset       byte offset of the gate stack (n_total_expert experts back to back)
+ *  @param up_offset         byte offset of the up stack
+ *  @param down_offset       byte offset of the down stack
+ *  @param gate_type         pulsar_tensor_type of the gate / up stacks
+ *  @param down_type         pulsar_tensor_type of the down stack
+ *  @param gate_expert_bytes bytes per gate / up expert (the stack stride)
+ *  @param gate_row_bytes    gate / up per-expert row bytes; for CUTLASS MXFP4 the data-plane bytes before the scale plane
+ *  @param down_expert_bytes bytes per down expert (the stack stride)
+ *  @param down_row_bytes    down per-expert row bytes; for CUTLASS MXFP4 the data-plane bytes before the scale plane
+ *  @param expert_in_dim     expert input width (the hidden size)
+ *  @param expert_mid_dim    expert intermediate width (under expert TP, this rank's half)
+ *  @param out_dim           expert output width
+ *  @param selected          device int32 [n_tokens][n_expert] routed expert ids
+ *  @param weights           device f32 [n_tokens][n_expert] routing weights
+ *  @param n_total_expert    experts present in the stacks
+ *  @param n_expert          routed slots per token (top-k)
+ *  @param clamp             SwiGLU clamp (<= 1e-6: none)
+ *  @param x                 device f32 [n_tokens][expert_in_dim] input; its producer E4M3 slot is what the GEMMs read
+ *  @param layer_index       layer, for the non-finite / route-bounds flags
+ *  @param n_tokens          token rows
+ *  @return 1 on success, 0 refused / failed */
 static int routed_moe_batch_impl(pulsar_gpu_tensor *out, pulsar_gpu_tensor *up, pulsar_gpu_tensor *mid, pulsar_gpu_tensor *down, const void *model_map, uint64_t model_size, uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset, uint32_t gate_type, uint32_t down_type, uint64_t gate_expert_bytes, uint64_t gate_row_bytes, uint64_t down_expert_bytes, uint64_t down_row_bytes, uint32_t expert_in_dim, uint32_t expert_mid_dim, uint32_t out_dim, const pulsar_gpu_tensor *selected, const pulsar_gpu_tensor *weights, uint32_t n_total_expert, uint32_t n_expert, float clamp, const pulsar_gpu_tensor *x, uint32_t layer_index, uint32_t n_tokens) {
     /* plan-34 inc 4 — MoE TWO-PASS split of a fused mixed step. Row layout is
      * [decode rows 0..n_dec) then one K-row prefill run [n_dec..n_tokens). The MoE
@@ -1747,6 +1988,35 @@ static int routed_moe_batch_impl(pulsar_gpu_tensor *out, pulsar_gpu_tensor *up, 
                              layer_index, n_tokens);
 }
 
+/** Routed MoE entry point: checks the lane's f32 tensors and the expert-TP formats, then routed_moe_batch_impl.
+ *  @param out               device f32 [n_tokens][out_dim] block output (the per-token sum over its n_expert slots)
+ *  @param up                device f32 scratch [n_tokens * n_expert][expert_mid_dim] (gate / up partials, by arm)
+ *  @param mid               device f32 [n_tokens * n_expert][expert_mid_dim] mid tensor (its E4M3 activation slot carries the encoded mid)
+ *  @param down              device f32 [n_tokens * n_expert][out_dim] per-slot pre-weighted FFN outputs (the flat down buffer)
+ *  @param model_map         host base of the model mapping the expert stacks live in
+ *  @param model_size        bytes of that mapping (offsets are bounds-checked against it)
+ *  @param gate_offset       byte offset of the gate stack (n_total_expert experts back to back)
+ *  @param up_offset         byte offset of the up stack
+ *  @param down_offset       byte offset of the down stack
+ *  @param gate_type         pulsar_tensor_type of the gate / up stacks
+ *  @param down_type         pulsar_tensor_type of the down stack
+ *  @param gate_expert_bytes bytes per gate / up expert (the stack stride)
+ *  @param gate_row_bytes    gate / up per-expert row bytes; for CUTLASS MXFP4 the data-plane bytes before the scale plane
+ *  @param down_expert_bytes bytes per down expert (the stack stride)
+ *  @param down_row_bytes    down per-expert row bytes; for CUTLASS MXFP4 the data-plane bytes before the scale plane
+ *  @param expert_in_dim     expert input width (the hidden size)
+ *  @param expert_mid_dim    expert intermediate width (under expert TP, this rank's half)
+ *  @param out_dim           expert output width
+ *  @param selected          device int32 [n_tokens][n_expert] routed expert ids
+ *  @param weights           device f32 [n_tokens][n_expert] routing weights
+ *  @param n_total_expert    experts present in the stacks
+ *  @param n_expert          routed slots per token (top-k)
+ *  @param clamp             SwiGLU clamp (<= 1e-6: none)
+ *  @param x                 device f32 [n_tokens][expert_in_dim] input; its producer E4M3 slot is what the GEMMs read
+ *  @param layer_index       layer, for the non-finite / route-bounds flags
+ *  @param n_tokens          token rows
+ *  @param expert_split      nonzero: the stacks are this rank's halves of every expert (expert tensor-parallel)
+ *  @return 1 on success, 0 refused / failed */
 int pulsar_gpu_routed_moe_batch_tensor(pulsar_gpu_tensor *out, pulsar_gpu_tensor *up, pulsar_gpu_tensor *mid, pulsar_gpu_tensor *down, const void *model_map, uint64_t model_size, uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset, uint32_t gate_type, uint32_t down_type, uint64_t gate_expert_bytes, uint64_t gate_row_bytes, uint64_t down_expert_bytes, uint64_t down_row_bytes, uint32_t expert_in_dim, uint32_t expert_mid_dim, uint32_t out_dim, const pulsar_gpu_tensor *selected, const pulsar_gpu_tensor *weights, uint32_t n_total_expert, uint32_t n_expert, float clamp, const pulsar_gpu_tensor *x, uint32_t layer_index, uint32_t n_tokens, uint32_t expert_split) {
     /* Nothing below this line consults esz: every scratch/output cast in the
      * MoE lane is (float *) over a tensor the graph allocates f32.  That was

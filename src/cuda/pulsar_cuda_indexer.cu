@@ -1,3 +1,5 @@
+/** @file
+ *  Sparse-attention indexer: scores over the MXKV-FP4 compressed cache, the top-k selections and argmax. */
 #include "pulsar_cuda_internal.h"
 
 /* The indexer compressed cache is always MXKV-FP4-packed
@@ -6,6 +8,11 @@
  * else.  head_dim must be 128. */
 
 
+/** Argmax of one f32 row (ties to the lower index; an all -inf / NaN row gives 0).  Grid 1; block 1024; static smem
+ *  1024 values + 1024 indices.
+ *  @param out_idx device int32 out: the argmax
+ *  @param logits  device f32 [n_vocab]
+ *  @param n_vocab row width */
 __global__ static void argmax_kernel(int32_t *out_idx, const float *logits, uint32_t n_vocab) {
     enum { THREADS = 1024 };
     __shared__ float sm_val[THREADS];
@@ -45,6 +52,13 @@ __global__ static void argmax_kernel(int32_t *out_idx, const float *logits, uint
 }
 
 
+/** Serial insertion top-k (the shapes without a sort kernel: top_k != 512).  Grid n_tokens; one working thread a
+ *  block (the others return).  Descending by score, an earlier index first on ties.
+ *  @param selected out: [n_tokens][top_k] compressed-row indices
+ *  @param scores   f32 [n_tokens][n_comp]
+ *  @param n_comp   compressed rows per token
+ *  @param n_tokens tokens
+ *  @param top_k    rows to select (<= n_comp) */
 __global__ static void indexer_topk_kernel(uint32_t *selected, const float *scores, uint32_t n_comp, uint32_t n_tokens, uint32_t top_k) {
     uint32_t t = blockIdx.x;
     if (t >= n_tokens || threadIdx.x != 0) return;
@@ -64,6 +78,12 @@ __global__ static void indexer_topk_kernel(uint32_t *selected, const float *scor
 }
 
 
+/// The top-k order: a higher score first, the lower index on equal scores.
+/// @param av score a
+/// @param ai index a
+/// @param bv score b
+/// @param bi index b
+/// @return true when (av, ai) ranks before (bv, bi)
 __device__ __forceinline__ static bool topk_score_better(float av, uint32_t ai, float bv, uint32_t bi) {
     return av > bv || (av == bv && ai < bi);
 }
@@ -82,6 +102,12 @@ __device__ __forceinline__ static bool topk_score_better(float av, uint32_t ai, 
  * (j < k), so `desc` can be computed from either index.  No comparison
  * result is reinterpreted, so this is bit-identical for every input,
  * including NaN and +-0. */
+/// @param ov     this element's score (in / out)
+/// @param oi     this element's index (in / out)
+/// @param pv     the partner's score
+/// @param pi     the partner's index
+/// @param desc   the pair sorts descending (the k bit of the index is 0)
+/// @param is_low this element is the pair's lower index
 __device__ __forceinline__ static void topk_ce_apply(float &ov, uint32_t &oi,
                                                      float pv, uint32_t pi,
                                                      bool desc, bool is_low) {
@@ -109,6 +135,11 @@ __device__ __forceinline__ static void topk_ce_apply(float &ov, uint32_t &oi,
  *
  * On entry the input must already be in sv[]/sx[]; on exit the sorted result
  * is in the registers (shared memory contents are stale). */
+/** @tparam SORT_N elements sorted (a power of two; the block has SORT_N / 4 threads)
+ *  @param sv shared f32 [SORT_N] scores (input; scratch for the cross-warp stages)
+ *  @param sx shared u32 [SORT_N] indices (input; scratch)
+ *  @param v  out: this thread's four sorted scores (elements 4 tid .. 4 tid + 3)
+ *  @param x  out: their indices */
 template <uint32_t SORT_N>
 __device__ __forceinline__ static void topk_bitonic_sort_regs4(
         float *sv, uint32_t *sx, float (&v)[4], uint32_t (&x)[4]) {
@@ -168,6 +199,8 @@ __device__ __forceinline__ static void topk_bitonic_sort_regs4(
 }
 
 
+/// @param v a float
+/// @return an unsigned key whose integer order is v's float order
 __device__ __forceinline__ static uint32_t topk_float_ordered_key(float v) {
     const uint32_t u = __float_as_uint(v);
     return (u & 0x80000000u) ? ~u : (u ^ 0x80000000u);
@@ -184,12 +217,22 @@ __device__ __forceinline__ static uint32_t topk_float_ordered_key(float v) {
  * whole zero class to +0.0 before packing; `v == 0.0f` is true for -0.0 and,
  * under FTZ, for every denormal.  NaN cannot be ordered by either relation and
  * is not a score any scorer emits; it keeps the key's deterministic rank. */
+/// @param v   the score (the zero class canonicalised to +0)
+/// @param idx its index
+/// @return a 64-bit key: score order in the high word, the lower index ranking higher in the low word
 __device__ __forceinline__ static uint64_t topk_pack_key(float v, uint32_t idx) {
     if (v == 0.0f) v = 0.0f;
     return ((uint64_t)topk_float_ordered_key(v) << 32u) | (uint64_t)(0xffffffffu - idx);
 }
 
 
+/** Top-k by one cub BlockRadixSort of packed (score, index) keys, n_comp <= 8192.  Grid n_tokens; block 512 (16
+ *  keys a thread); dynamic smem = the sort's TempStorage (indexer_topk_cub_smem()).
+ *  @param selected out: [n_tokens][top_k] indices, best first
+ *  @param scores   f32 [n_tokens][n_comp]
+ *  @param n_comp   compressed rows (<= 8192)
+ *  @param n_tokens tokens
+ *  @param top_k    rows to select */
 __global__ static void indexer_topk_8192_cub_kernel(
         uint32_t *selected,
         const float *scores,
@@ -231,6 +274,13 @@ __global__ static void indexer_topk_8192_cub_kernel(
 }
 
 
+/** Top-k by a shared-memory bitonic sort of 1024 entries (n_comp <= 1024).  Grid n_tokens; block 1024; static smem
+ *  1024 scores + indices.
+ *  @param selected out: [n_tokens][top_k] indices, best first
+ *  @param scores   f32 [n_tokens][n_comp]
+ *  @param n_comp   compressed rows (<= 1024)
+ *  @param n_tokens tokens
+ *  @param top_k    rows to select */
 __global__ static void indexer_topk_1024_kernel(
         uint32_t *selected,
         const float *scores,
@@ -280,6 +330,14 @@ __global__ static void indexer_topk_1024_kernel(
 }
 
 
+/** Top-k by a shared-memory bitonic sort of SORT_N entries, block-strided.  Grid n_tokens; any block size (launched
+ *  1024); static smem SORT_N scores + u32 indices.
+ *  @tparam SORT_N sort width (a power of two >= n_comp)
+ *  @param selected out: [n_tokens][top_k] indices, best first
+ *  @param scores   f32 [n_tokens][n_comp]
+ *  @param n_comp   compressed rows
+ *  @param n_tokens tokens
+ *  @param top_k    rows to select */
 template <uint32_t SORT_N>
 __global__ static void indexer_topk_pow2_kernel(
         uint32_t *selected,
@@ -336,6 +394,13 @@ __global__ static void indexer_topk_pow2_kernel(
 }
 
 
+/** indexer_topk_pow2_kernel with u16 indices (the 8192 width fits in smem that way).
+ *  @tparam SORT_N sort width (a power of two >= n_comp, <= 65535)
+ *  @param selected out: [n_tokens][top_k] indices, best first
+ *  @param scores   f32 [n_tokens][n_comp]
+ *  @param n_comp   compressed rows
+ *  @param n_tokens tokens
+ *  @param top_k    rows to select */
 template <uint32_t SORT_N>
 __global__ static void indexer_topk_pow2_u16_kernel(
         uint32_t *selected,
@@ -392,6 +457,15 @@ __global__ static void indexer_topk_pow2_u16_kernel(
 }
 
 
+/** Tree top-k, stage 1: the top_k of one SORT_N-wide chunk of a row.  Grid (n_tokens, chunks); block SORT_N / 4;
+ *  static smem SORT_N scores + indices.
+ *  @tparam SORT_N chunk width (2048 or 4096)
+ *  @param candidates       out: per token, chunk c's top_k indices at c * top_k
+ *  @param scores           f32 [n_tokens][n_comp]
+ *  @param n_comp           compressed rows
+ *  @param n_tokens         tokens
+ *  @param top_k            rows kept per chunk
+ *  @param candidate_stride u32s between tokens in candidates */
 template <uint32_t SORT_N>
 __launch_bounds__(1024) __global__ static void indexer_topk_chunk_pow2_kernel(
         uint32_t *candidates,
@@ -436,6 +510,16 @@ __launch_bounds__(1024) __global__ static void indexer_topk_chunk_pow2_kernel(
 }
 
 
+/** Tree top-k, final stage: the top_k of a token's remaining candidate indices.  Grid n_tokens; block SORT_N / 4.
+ *  @tparam SORT_N merge width (>= candidate_count)
+ *  @param selected         out: [n_tokens][top_k] indices, best first
+ *  @param candidates       per token, candidate_count indices (an index >= n_comp scores -inf)
+ *  @param scores           f32 [n_tokens][n_comp]
+ *  @param n_comp           compressed rows
+ *  @param n_tokens         tokens
+ *  @param top_k            rows to select
+ *  @param candidate_count  candidates per token
+ *  @param candidate_stride u32s between tokens in candidates */
 template <uint32_t SORT_N>
 __launch_bounds__(1024) __global__ static void indexer_topk_merge_pow2_kernel(
         uint32_t *selected,
@@ -478,6 +562,19 @@ __launch_bounds__(1024) __global__ static void indexer_topk_merge_pow2_kernel(
 }
 
 
+/** Tree top-k, intermediate stage: merges groups of merge_group candidate sets into one set of top_k.  Grid
+ *  (n_tokens, ceil(n_sets / merge_group)); block SORT_N / 4.
+ *  @tparam SORT_N merge width (>= merge_group * top_k)
+ *  @param out              out: per token, group g's top_k at g * top_k
+ *  @param candidates       per token, n_sets sets of top_k indices
+ *  @param scores           f32 [n_tokens][n_comp]
+ *  @param n_comp           compressed rows
+ *  @param n_tokens         tokens
+ *  @param top_k            indices per set
+ *  @param n_sets           input sets per token
+ *  @param merge_group      sets merged per output set
+ *  @param candidate_stride u32s between tokens in candidates
+ *  @param out_stride       u32s between tokens in out */
 template <uint32_t SORT_N>
 __launch_bounds__(1024) __global__ static void indexer_topk_tree_merge_pow2_kernel(
         uint32_t *out,
@@ -539,6 +636,7 @@ __launch_bounds__(1024) __global__ static void indexer_topk_tree_merge_pow2_kern
  * byte count if the cub path is usable on this device, or 0 if the caller must fall
  * back to the pow2 kernel. Decode is single-threaded; a first-call race is benign
  * (cudaFuncSetAttribute is idempotent). */
+/// @return the cub top-k kernel's dynamic smem bytes, or 0 when this device cannot opt in to that much
 static int indexer_topk_cub_smem(void) {
     static int cached = -1; /* -1 uninit, 0 unavailable, >0 smem bytes */
     if (cached >= 0) return cached;
@@ -559,6 +657,20 @@ static int indexer_topk_cub_smem(void) {
 }
 
 
+/** Validates an indexer score call and runs the MXFP4 tier (pulsar_gpu_indexer_scores_mxfp4).
+ *  @param scores     f32 out [n_tokens][n_comp]
+ *  @param q          packed MXKV-FP4 Q rows [n_tokens][n_head]
+ *  @param weights    f32 [n_tokens][n_head] head weights
+ *  @param index_comp packed MXKV-FP4 compressed rows [n_comp]
+ *  @param n_comp     compressed rows
+ *  @param n_tokens   tokens
+ *  @param pos0       position of token 0
+ *  @param n_head     indexer heads
+ *  @param head_dim   head width (128)
+ *  @param ratio      compression ratio (nonzero when causal)
+ *  @param scale      score scale
+ *  @param causal     nonzero: mask the rows a token cannot see yet
+ *  @return nonzero on success, 0 refused (said) or a launch failure */
 static int indexer_scores_launch(
         pulsar_gpu_tensor       *scores,
         const pulsar_gpu_tensor *q,
@@ -631,6 +743,16 @@ static int indexer_scores_launch(
 }
 
 
+/** One token's scores, not causal.
+ *  @param scores     f32 out [n_comp]
+ *  @param q          packed Q rows [n_head]
+ *  @param weights    f32 [n_head]
+ *  @param index_comp packed compressed rows [n_comp]
+ *  @param n_comp     compressed rows
+ *  @param n_head     indexer heads
+ *  @param head_dim   head width (128)
+ *  @param scale      score scale
+ *  @return nonzero on success, 0 refused or a launch failure */
 int pulsar_gpu_indexer_score_one_tensor(
         pulsar_gpu_tensor       *scores,
         const pulsar_gpu_tensor *q,
@@ -645,6 +767,19 @@ int pulsar_gpu_indexer_score_one_tensor(
 }
 
 
+/** n_tokens consecutive tokens' causal scores against one compressed cache.
+ *  @param scores     f32 out [n_tokens][n_comp]
+ *  @param q          packed Q rows [n_tokens][n_head]
+ *  @param weights    f32 [n_tokens][n_head]
+ *  @param index_comp packed compressed rows [n_comp]
+ *  @param n_comp     compressed rows
+ *  @param n_tokens   tokens
+ *  @param pos0       position of token 0
+ *  @param n_head     indexer heads
+ *  @param head_dim   head width (128)
+ *  @param ratio      compression ratio
+ *  @param scale      score scale
+ *  @return nonzero on success, 0 refused or a launch failure */
 int pulsar_gpu_indexer_scores_decode_batch_tensor(
         pulsar_gpu_tensor       *scores,
         const pulsar_gpu_tensor *q,
@@ -662,6 +797,19 @@ int pulsar_gpu_indexer_scores_decode_batch_tensor(
 }
 
 
+/** One same-bank run of consecutive positions, causal, against that bank's compressed cache.
+ *  @param scores          f32 out [run_n][n_comp]
+ *  @param q               packed Q rows [run_n][n_head]
+ *  @param weights         f32 [run_n][n_head]
+ *  @param bank_index_comp the bank's packed compressed rows (at least (run_pos0 + run_n) / ratio)
+ *  @param n_comp          scores row stride / scan bound
+ *  @param run_n           tokens in the run
+ *  @param run_pos0        position of the run's first token
+ *  @param n_head          indexer heads
+ *  @param head_dim        head width (128)
+ *  @param ratio           compression ratio (> 0)
+ *  @param scale           score scale
+ *  @return nonzero on success, 0 refused or a launch failure */
 int pulsar_gpu_indexer_scores_decode_run_tensor(
         pulsar_gpu_tensor       *scores,
         const pulsar_gpu_tensor *q,
@@ -702,6 +850,14 @@ int pulsar_gpu_indexer_scores_decode_run_tensor(
 }
 
 
+/** Each token's top_k compressed rows by score, best first (one sort kernel chosen by shape; the tree for
+ *  n_comp > 8192).
+ *  @param selected u32 out [n_tokens][top_k]
+ *  @param scores   f32 [n_tokens][n_comp]
+ *  @param n_comp   compressed rows
+ *  @param n_tokens tokens
+ *  @param top_k    rows to select (<= n_comp)
+ *  @return nonzero on success, 0 refused (said), a scratch refusal or a launch failure */
 int pulsar_gpu_indexer_topk_tensor(
         pulsar_gpu_tensor       *selected,
         const pulsar_gpu_tensor *scores,
@@ -884,6 +1040,11 @@ int pulsar_gpu_indexer_topk_tensor(
 }
 
 
+/** Argmax of one f32 row.
+ *  @param out_idx int32 out
+ *  @param logits  f32 [n_vocab]
+ *  @param n_vocab row width
+ *  @return nonzero on success, 0 on a bad operand or a launch failure */
 int pulsar_gpu_argmax_tensor(
         pulsar_gpu_tensor       *out_idx,
         const pulsar_gpu_tensor *logits,

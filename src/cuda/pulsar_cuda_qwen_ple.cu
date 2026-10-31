@@ -1,3 +1,5 @@
+/** @file
+ *  Qwen3.8-Flash-Next per-layer-embedding (PLE) injection at layer index 1. */
 /* Qwen3.8-Flash-Next PLE injection at layer index 1 (L251 S4).  Source:
  * transformers' Qwen4ExpTextPLELayer; contracts in pulsar_cuda_qwen.h.  The
  * table rows arrive gathered (src/engine/qwen_ngram.cpp hashes the ids on the
@@ -24,21 +26,38 @@
 
 namespace {
 
+/// Hidden width of one residual stream (2560).
 constexpr int kH = PULSAR_QWEN_HIDDEN;
+/// Residual streams per token (4).
 constexpr int kS = PULSAR_QWEN_HC;
+/// Channels across all streams, kS * kH (10240): the gate and conv width.
 constexpr int kHC = PULSAR_QWEN_HC_HIDDEN;
+/// Conv taps (4).
 constexpr int kTaps = PULSAR_QWEN_PLE_TAPS;
+/// Conv dilation in tokens (3).
 constexpr int kDil = PULSAR_QWEN_PLE_DIL;
+/// Conv state length in tokens, (kTaps - 1) * kDil (9).
 constexpr int kState = PULSAR_QWEN_PLE_STATE;
+/// RMSNorm epsilon of the three (1 + w) norms.
 constexpr float kEps = 1e-6f;
+/// Block size of every PLE kernel.
 constexpr int kThreads = 256;
+/// Channels of one stream each gate-kernel thread holds in registers (10).
 constexpr int kPer = kH / kThreads;
 static_assert(PULSAR_QWEN_PLE_HEADS * PULSAR_QWEN_PLE_ROW == kH, "16 rows of 160 are the embedding");
 static_assert(PULSAR_QWEN_PLE_ROW % 32 == 0, "a table row is whole MX groups");
 static_assert(kHC % kThreads == 0, "the conv grid covers the channels in whole blocks");
 
+/** bf16 to f32.
+ *  @param v the bf16 value
+ *  @return v widened to f32 (exact) */
 __device__ __forceinline__ float bf2f(__nv_bfloat16 v) { return __bfloat162float(v); }
 
+/** Block-wide f32 sum: warp shuffles, then every thread adds the per-warp partials in warp order (all threads
+ *  return the same value).  Syncs the block; blockDim.x a multiple of 32.
+ *  @param v   this thread's partial
+ *  @param red shared scratch, blockDim.x / 32 floats
+ *  @return the block's sum */
 __device__ __forceinline__ float block_sum(float v, float *red) {
 #pragma unroll
     for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
@@ -52,6 +71,17 @@ __device__ __forceinline__ float block_sum(float v, float *red) {
 }
 
 
+/** The stream gate: per (stream s, token t) normalize key and query (each a (1 + w) RMSNorm over the stream's kH
+ *  channels), g = signed-sqrt(<k_s, q_s> / sqrt(kH)), gv = sigmoid(g) v, gvn = norm_conv(gv).
+ *  Grid = (kS, T), block = kThreads, static smem kThreads / 32 floats.
+ *  @param key     f32 [T][kHC] key_proj rows
+ *  @param value   f32 [T][kH] value_proj rows (shared by the four streams)
+ *  @param streams bf16 [T][kS][kH] residual streams (the query; read only here)
+ *  @param nk      bf16 [kHC] norm_key weight
+ *  @param nq      bf16 [kHC] norm_query weight
+ *  @param nc      bf16 [kHC] norm_conv weight
+ *  @param gvn     out, f32 [T][kHC] the conv input
+ *  @param sig     out, f32 [T][kS] sigmoid(g) per stream */
 __global__ void __launch_bounds__(kThreads)
 qwen_ple_gate_kernel(const float *__restrict__ key, const float *__restrict__ value,
                      const __nv_bfloat16 *__restrict__ streams, const __nv_bfloat16 *__restrict__ nk,
@@ -98,6 +128,18 @@ qwen_ple_gate_kernel(const float *__restrict__ key, const float *__restrict__ va
     if (tid == 0) sig[t * kS + s] = sg;
 }
 
+/** The dilated causal conv and the residual add: per channel ch and row t,
+ *  y = sum_m conv_w[ch][m] * gvn[t - (kTaps - 1 - m) * kDil] (taps before the sequence's first batch row read its
+ *  conv state), stream += sig * value + silu(y), one bf16 rounding.  Grid = (kHC / kThreads, T), block = kThreads.
+ *  @param gvn      f32 [T][kHC] from the gate kernel
+ *  @param value    f32 [T][kH] value_proj rows
+ *  @param sig      f32 [T][kS] from the gate kernel
+ *  @param conv_w   bf16 [kHC][kTaps] conv weight
+ *  @param state    f32 [banks][kState][kHC] conv state, oldest first (read only here)
+ *  @param row_seq  device int32 [T] each row's sequence
+ *  @param row_j    device int32 [T] each row's index within its sequence's batch rows
+ *  @param seq_bank device int32 [n_seq] each sequence's conv-state slot
+ *  @param streams  bf16 [T][kS][kH] residual streams, updated in place */
 __global__ void __launch_bounds__(kThreads)
 qwen_ple_conv_kernel(const float *__restrict__ gvn, const float *__restrict__ value, const float *__restrict__ sig,
                      const __nv_bfloat16 *__restrict__ conv_w, const float *__restrict__ state,
@@ -119,6 +161,14 @@ qwen_ple_conv_kernel(const float *__restrict__ gvn, const float *__restrict__ va
     streams[i] = __float2bfloat16(bf2f(streams[i]) + out);
 }
 
+/** Advance each sequence's conv state: its new kState entries are the last kState gvn rows of the sequence's
+ *  history (batch rows, then the old state for the part before them).  Each thread owns one channel, so the
+ *  in-place update is race-free.  Grid = (kHC / kThreads, n_seq), block = kThreads.
+ *  @param gvn       f32 [T][kHC] from the gate kernel
+ *  @param seq_first device int32 [n_seq] each sequence's first batch row
+ *  @param seq_rows  device int32 [n_seq] its batch rows
+ *  @param seq_bank  device int32 [n_seq] its conv-state slot
+ *  @param state     f32 [banks][kState][kHC] conv state, updated in place */
 __global__ void __launch_bounds__(kThreads)
 qwen_ple_state_kernel(const float *__restrict__ gvn, const int32_t *__restrict__ seq_first,
                       const int32_t *__restrict__ seq_rows, const int32_t *__restrict__ seq_bank,
@@ -138,6 +188,14 @@ qwen_ple_state_kernel(const float *__restrict__ gvn, const int32_t *__restrict__
 /* the verify capture: the conv state after each row of a sequence but its last -- the state kernel's
  * rule with the sequence cut after that row -- at the row's batch index (L272 P1 S4: any number of
  * sequences, one per bank).  Launched before it, so the old state is intact.  grid (channels, T). */
+/** @param gvn        f32 [T][kHC] from the gate kernel
+ *  @param row_seq    device int32 [T] each row's sequence
+ *  @param row_j      device int32 [T] each row's index within its sequence's batch rows
+ *  @param seq_first  device int32 [n_seq] each sequence's first batch row
+ *  @param seq_rows   device int32 [n_seq] its batch rows
+ *  @param seq_bank   device int32 [n_seq] its conv-state slot
+ *  @param state      f32 [banks][kState][kHC] the conv state before this batch (read only)
+ *  @param state_rows out, f32 [rows][kState][kHC] the state after each captured row (a sequence's last row: untouched) */
 __global__ void __launch_bounds__(kThreads)
 qwen_ple_state_rows_kernel(const float *__restrict__ gvn, const int32_t *__restrict__ row_seq,
                            const int32_t *__restrict__ row_j, const int32_t *__restrict__ seq_first,
@@ -155,10 +213,21 @@ qwen_ple_state_rows_kernel(const float *__restrict__ gvn, const int32_t *__restr
     }
 }
 
+/// The PLE launch's device scratch, carved by ple_ws_layout.
 struct ple_ws {
+    /** @var gvn
+     *  f32 [T][kHC] gated, normed conv input.
+     *  @var sig
+     *  f32 [T][kS] sigmoid(gate) per stream. */
     float *gvn, *sig;
 };
 
+/** Lay the PLE workspace out for T rows, each piece 256-B aligned.
+ *  @param T    batch rows
+ *  @param base workspace start, or nullptr to only size it
+ *  @param cap  workspace bytes (checked when base is non-null)
+ *  @param o    out: the pieces' pointers, or nullptr
+ *  @return bytes used, 0 when they exceed cap */
 static size_t ple_ws_layout(int T, void *base, size_t cap, ple_ws *o) {
     size_t used = 0;
     bool failed = false;
@@ -175,6 +244,9 @@ static size_t ple_ws_layout(int T, void *base, size_t cap, ple_ws *o) {
     return failed ? 0 : used;
 }
 
+/** Check the last launch; prints the failure with `what` and returns false on error.
+ *  @param what step name for the message
+ *  @return true when no launch error is pending */
 static bool launch_ok(const char *what) {
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) {

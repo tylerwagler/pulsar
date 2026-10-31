@@ -1,3 +1,5 @@
+/** @file
+ *  LiLiCorr candidate-lattice head + path selector contract (the block drafter's last stage). */
 /* LiLiCorr candidate-lattice head + path selector (L298) -- the block drafter's last stage, family-neutral.
  *
  * A block drafter (DFlash-style: one pass drafts a block of 1 anchor + 7 mask rows) ends in a candidate head: the top 8
@@ -47,6 +49,7 @@
 #ifdef __CUDACC__
 #include <cuda_runtime.h>
 #else
+/// The CUDA runtime's stream handle, declared for CUDA-free includers (same definition as cuda_runtime.h's).
 typedef struct CUstream_st *cudaStream_t;
 #endif
 
@@ -63,15 +66,19 @@ extern "C" {
 #define PULSAR_LILICORR_HIDDEN 1024u   /**< the head's width */
 #define PULSAR_LILICORR_HEADS 8u       /**< lattice attention heads (x 128) */
 #define PULSAR_LILICORR_MODEL 4096u    /**< the drafter's / target's hidden width (token, pass and anchor inputs) */
+/// lattice (attention + MLP) layers in the head
 #define PULSAR_LILICORR_LAYERS 2u
 #define PULSAR_LILICORR_BANKS_MAX 16u  /**< banks one launch takes */
 
 /** One Linear: the front door's reference and its bf16 bias [out] (every head Linear has one). */
 typedef struct {
+    /** The rows front door's reference to the weight (in / out widths, `nvfp4` or `bf16` storage). */
     pulsar_rows_linear l;
+    /** The bias, bf16 [out]. */
     const uint16_t *b;
 } pulsar_lilicorr_linear;
 
+/** One lattice layer's weights (checkpoint prefix `lilicorr.layers.i.`): attention then MLP, each pre-normed. */
 typedef struct {
     const uint16_t *lat_attn_norm;         /**< [1024] */
     pulsar_lilicorr_linear lat_attn_in;    /**< in_proj: 1024 -> 3072 (q, k, v rows), BF16 */
@@ -96,6 +103,7 @@ typedef struct {
     const uint16_t *rank_embedding;        /**< [8][1024] */
     const uint16_t *relative_slot_bias;    /**< [8 heads][15] */
     const uint16_t *same_slot_bias;        /**< [8 heads] */
+    /** The PULSAR_LILICORR_LAYERS lattice layers, in order. */
     pulsar_lilicorr_layer layers[PULSAR_LILICORR_LAYERS];
     const uint16_t *output_norm;           /**< [1024] */
     const uint16_t *anchor_norm;           /**< [1024] */
@@ -108,6 +116,8 @@ typedef struct {
 } pulsar_lilicorr_head;
 
 /** Device workspace bytes of one launch over n_banks banks (0 when n_banks is 0 or past PULSAR_LILICORR_BANKS_MAX). */
+/// @param n_banks banks the launch will take
+/// @return workspace bytes, or 0 when n_banks is out of range
 uint64_t pulsar_lilicorr_head_ws_bytes(uint32_t n_banks);
 
 /** The head and the greedy walk for n_banks banks (1 .. PULSAR_LILICORR_BANKS_MAX).  Device inputs:
@@ -124,6 +134,20 @@ uint64_t pulsar_lilicorr_head_ws_bytes(uint32_t n_banks);
  *                                        realized row, row 0 for s = 0)
  *  ws: pulsar_lilicorr_head_ws_bytes(n_banks) device bytes, 256-byte aligned (the head's Linears need none of their
  *  own).  @return 0, -1 refused (named on stderr, nothing launched), -3 a launch failed. */
+/// @param w             the head's weights (device pointers)
+/// @param n_banks       banks in the launch
+/// @param cand_ids      device [n_banks][7][8] i32 candidate ids per slot
+/// @param cand_logprob  device [n_banks][7][8] f32 their full-vocabulary log-probs
+/// @param embed_table   device [vocab][4096] bf16 target input embedding
+/// @param pass_hidden   device [n_banks][7][4096] bf16 drafter final-norm rows
+/// @param anchor_hidden device [n_banks][4096] bf16 anchor rows
+/// @param anchor_valid  device [n_banks] u8, 0 zeroes the anchor term
+/// @param scores        out: device [n_banks][7][8][8] f32 logits
+/// @param chain_ids     out: device [n_banks][7] i32 walk tokens
+/// @param chain_rows    out: device [n_banks][7] i32 chosen candidate per slot
+/// @param ws            device workspace, 256-byte aligned
+/// @param ws_bytes      bytes at ws (>= pulsar_lilicorr_head_ws_bytes(n_banks))
+/// @param stream        stream to launch on
 int pulsar_lilicorr_head_launch(const pulsar_lilicorr_head *w, uint32_t n_banks, const int32_t *cand_ids,
                                 const float *cand_logprob, const uint16_t *embed_table, const uint16_t *pass_hidden,
                                 const uint16_t *anchor_hidden, const uint8_t *anchor_valid, float *scores,

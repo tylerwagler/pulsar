@@ -1,3 +1,5 @@
+/** @file
+ *  The host libm's expf, exp and log, bit for bit, on the device (for the device sampler). */
 /* pulsar_cuda_libm.cuh -- the host libm's expf, exp and log, bit for bit, on the device (L302).
  *
  * The device sampler (pulsar_cuda_sampler.cu) must produce the bytes the host sampler produced -- every probability,
@@ -21,11 +23,18 @@
 
 #include "pulsar_cuda_libm_tables.inc"
 
+/// @param b IEEE binary64 bits
+/// @return the double with those bits
 __device__ __forceinline__ double plm_d(uint64_t b) { return __longlong_as_double((long long)b); }
+/// @param d a double
+/// @return its IEEE binary64 bits
 __device__ __forceinline__ uint64_t plm_u(double d) { return (uint64_t)__double_as_longlong(d); }
 
 /* expf (glibc sysdeps/ieee754/flt-32/e_expf.c): x * 32/ln2 split into k + r in double, 2^(k/32) from the table, a
  * cubic in r.  aarch64: frinta (round half away) and fcvtas for k; three fmas. */
+/// glibc's expf, bit for bit (see above).
+/// @param x the argument
+/// @return expf(x) as the host libm returns it
 __device__ __forceinline__ float plm_expf(float x) {
     const uint32_t ix = __float_as_uint(x);
     const uint32_t abstop = (ix >> 20) & 0x7ffu;
@@ -53,6 +62,9 @@ __device__ __forceinline__ float plm_expf(float x) {
 
 /* log (glibc sysdeps/ieee754/dbl-64/e_log.c): near 1 a degree-11 polynomial with a split r; elsewhere a 128-entry
  * (invc, logc) table and a quintic.  Subnormal and special inputs as glibc (the sampler never sends them). */
+/// glibc's log, bit for bit (see above).
+/// @param x the argument
+/// @return log(x) as the host libm returns it
 __device__ __forceinline__ double plm_log(double x) {
     uint64_t ix = plm_u(x);
     if (ix - 0x3fee000000000000ull <= 0x000308ffffffffffull) {   /* |x - 1| < ~0x1.09p-4 */
@@ -116,6 +128,9 @@ __device__ __forceinline__ double plm_log(double x) {
 
 /* exp (glibc sysdeps/ieee754/dbl-64/e_exp.c): k = round(x * 128/ln2), r = x - k ln2/128 in two fmas, a quintic, the
  * scale from the table; |x| >= 512 through the subnormal-safe special case. */
+/// glibc's exp, bit for bit (see above).
+/// @param x the argument
+/// @return exp(x) as the host libm returns it
 __device__ __forceinline__ double plm_exp(double x) {
     const uint64_t ux = plm_u(x);
     uint32_t abstop = (uint32_t)(ux >> 52) & 0x7ffu;

@@ -1,3 +1,5 @@
+/** @file
+ *  Routed-expert sorted-pair builders: per-expert counts, the prefix sum and the scatter. */
 /* The routed-expert SORTED-PAIR builders: one pass counting the slots each
  * expert was routed, an exclusive prefix sum turning those counts into pair-slot
  * offsets, and one pass scattering each pair index into its expert's run.  The
@@ -41,15 +43,20 @@
  * the step is REFUSED by name -- no sanitizer, no silent clamp-and-continue.
  *
  * Code layout: bits 0..7 = layer_index + 1 (0 means "clear"), bits 8..15 = arm. */
+/// Device route-bounds flag: 0 = clear, else the first violation's code (layer_index + 1 | arm << 8).
 __device__ static uint32_t g_moe_route_oob = 0u;
 
 /** Record `code` in the route-bounds flag (first writer wins). */
+/** @param code the violation's code (bits 0..7 layer_index + 1, bits 8..15 the arm) */
 __device__ static __forceinline__ void moe_flag_route_oob(uint32_t code) {
     atomicCAS(&g_moe_route_oob, 0u, code);
 }
 
 /** Clamp `expert_i` into [0, n_total), flagging an upper-bound violation.
  *  `expert_i` is an lvalue so both builders share one authority for the rule. */
+/** @param expert_i the routed expert id (in / out)
+ *  @param n_total  experts present in the stacks (the maps' size)
+ *  @param oob_code the code recorded on an upper-bound violation */
 __device__ static __forceinline__ void moe_clamp_expert_id(int32_t &expert_i, uint32_t n_total, uint32_t oob_code) {
     if (expert_i < 0) {
         expert_i = 0;                       /* the router's NaN path: by design, not a violation */
@@ -80,6 +87,13 @@ int pulsar_gpu_routed_moe_route_oob_take(uint32_t *layer_index, const char **arm
     return 1;
 }
 
+/** Per-expert routed-slot counts: counts[e] += 1 for each pair routed to e (counts zeroed by the caller).  Grid
+ *  ceil(pair_count / 256); block 256; no smem.
+ *  @param counts     device [n_total] counts (atomic adds)
+ *  @param selected   device [pair_count] expert ids, one per (token, slot)
+ *  @param pair_count pairs (tokens x slots)
+ *  @param n_total    experts present
+ *  @param oob_code   the route-bounds code for this arm and layer */
 __global__ void moe_count_sorted_pairs_kernel(
         uint32_t *counts,
         const int32_t *selected,
@@ -105,6 +119,12 @@ __global__ void moe_count_sorted_pairs_kernel(
  *
  * Chunked so expert_count > blockDim still works; the model's 256 fits one
  * pass. */
+/** Exclusive prefix sum of the counts into offsets (and the scatter's cursors).  Grid 1; block exactly 256 (the
+ *  scan is sized for it); static smem 257 words.
+ *  @param offsets      device [expert_count + 1]: offsets[e] = pairs before expert e, offsets[expert_count] = total
+ *  @param cursors      device [expert_count]: a copy of offsets[0..expert_count) for the scatter
+ *  @param counts       device [expert_count] per-expert counts
+ *  @param expert_count experts */
 __global__ void moe_prefix_sorted_pairs_kernel(
         uint32_t *offsets,
         uint32_t *cursors,
@@ -139,6 +159,14 @@ __global__ void moe_prefix_sorted_pairs_kernel(
     if (tid == 0) offsets[expert_count] = base;
 }
 
+/** Scatters each pair index into its expert's run: sorted_pairs[cursors[e]++] = pair.  Order within a run follows
+ *  the atomics (not deterministic).  Grid ceil(pair_count / 256); block 256.
+ *  @param sorted_pairs device [pair_count] pair indices, expert-major
+ *  @param cursors      device [n_total] run cursors (from the prefix kernel; advanced atomically)
+ *  @param selected     device [pair_count] expert ids
+ *  @param pair_count   pairs
+ *  @param n_total      experts present
+ *  @param oob_code     the route-bounds code for this arm and layer */
 __global__ void moe_scatter_sorted_pairs_kernel(
         uint32_t *sorted_pairs,
         uint32_t *cursors,

@@ -1,3 +1,5 @@
+/** @file
+ *  Row operations between a layer plan's blocks: residual add, RMSNorm, LayerNorm, emits and gathers. */
 /* Row operations between a layer plan's blocks (L295): contracts in pulsar_cuda_rowops.h. */
 #include "pulsar_cuda_rowops.h"
 
@@ -9,16 +11,35 @@
 
 namespace {
 
+/// Block size of the one-CTA-a-row kernels (rows_norm_kernel, rows_ln32_kernel; 8 warps).
 constexpr int kNormThreads = 256;
+/// Block size of the element-wise emit / gather kernels.
 constexpr int kEmitThreads = 256;
 
+/// bf16 bits (low 16 of b) -> f32.
+/// @param b bf16 bits in the low half (high half zero)
+/// @return the value as f32
 __device__ __forceinline__ float bf2f(uint32_t b) { return __uint_as_float(b << 16); }
+/// f32 -> bf16 bits, round to nearest even.
+/// @param f the value
+/// @return its bf16 bits in the low half
 __device__ __forceinline__ uint32_t f2bf(float f) { return (uint32_t)__bfloat16_as_ushort(__float2bfloat16_rn(f)); }
 
 /* One CTA a row.  Thread i owns the 8-element chunks i, i + 256, ... of the row.  With a delta, the thread first
  * writes its chunks' rounded sums back to the residual (and reads them from registers for the squares, so the norm
  * is of the stored bytes); its squares are an f32 fma chain over its chunks in order, the warps fold by
  * xor-shuffle, warp 0 adds the eight warp sums in order. */
+/** Optional residual add then optional RMS norm, bf16.  Grid n_rows (blockIdx.x = row); block kNormThreads; static
+ *  smem only.  With delta: res[t] = bf16(res[t] + delta[t]) stored.  With w: y[t] = bf16((res[t] * rstd) * w).
+ *  @param res      device bf16 rows (the residual; updated in place with delta), 16-byte aligned
+ *  @param ld_res   res row pitch in elements (a multiple of 8)
+ *  @param delta    device bf16 rows to add, or NULL
+ *  @param ld_delta delta row pitch in elements
+ *  @param width    row width (a multiple of 8)
+ *  @param w        device bf16 [width] norm weight as uint4 chunks, or NULL: the add alone
+ *  @param eps      the norm's epsilon
+ *  @param y        device bf16 output rows (read only with w)
+ *  @param ld_y     y row pitch in elements */
 __global__ void __launch_bounds__(kNormThreads)
 rows_norm_kernel(uint16_t *__restrict__ res, uint64_t ld_res, const uint16_t *__restrict__ delta, uint64_t ld_delta,
                  uint32_t width, const uint4 *__restrict__ w, float eps, uint16_t *__restrict__ y, uint64_t ld_y) {
@@ -81,6 +102,15 @@ rows_norm_kernel(uint16_t *__restrict__ res, uint64_t ld_res, const uint16_t *__
 }
 
 /* Four elements a thread: x f32 -> bf16, times the scalar when there is one. */
+/** f32 rows -> bf16, times an optional device scalar.  Grid (ceil(width / (4 * kEmitThreads)), rows); block
+ *  kEmitThreads; four columns a thread (width a multiple of 4, 16-byte aligned f32 rows).
+ *  @param x     device f32 rows, row t at x + t * ld_x
+ *  @param ld_x  x row pitch in elements
+ *  @param width columns
+ *  @param scale device pointer to one scalar stored as `kind`, or NULL with PULSAR_ROWS_SCALE_NONE
+ *  @param kind  pulsar_rows_scale value
+ *  @param y     device bf16 output rows
+ *  @param ld_y  y row pitch in elements */
 __global__ void __launch_bounds__(kEmitThreads)
 rows_emit_kernel(const float *__restrict__ x, uint64_t ld_x, uint32_t width, const void *__restrict__ scale, int kind,
                  uint16_t *__restrict__ y, uint64_t ld_y) {
@@ -99,6 +129,12 @@ rows_emit_kernel(const float *__restrict__ x, uint64_t ld_x, uint32_t width, con
 }
 
 /* L321: a block-wide f32 sum -- the warps fold by xor-shuffle, warp 0 adds the warp sums in order. */
+/** Block-wide f32 sum over kNormThreads threads (xor-shuffle per warp, warp 0 adds the warp sums in order).
+ *  Every thread of the block must call it (it syncs twice).
+ *  @param v      this thread's partial
+ *  @param warp_s shared scratch [kNormThreads / 32]
+ *  @param out    shared slot the total is published through
+ *  @return the block total, in every thread */
 __device__ float ln_block_sum(float v, float *warp_s, float *out) {
 #pragma unroll
     for (int o = 16; o > 0; o >>= 1) v = __fadd_rn(v, __shfl_xor_sync(0xffffffffu, v, o));
@@ -114,11 +150,25 @@ __device__ float ln_block_sum(float v, float *warp_s, float *out) {
 }
 
 /* the 16-bit row element: bf16 or f16 (pulsar_rows_out), round to nearest even */
+/// f32 -> the 16-bit output element (round to nearest even).
+/// @param f   the value
+/// @param f16 nonzero: f16, else bf16
+/// @return the element bits in the low half
 __device__ __forceinline__ uint32_t f2out(float f, int f16) {
     return f16 ? (uint32_t)__half_as_ushort(__float2half_rn(f)) : f2bf(f);
 }
 
 /* Four elements a thread: act(x + bias) as bf16 / f16. */
+/** act(x + bias) f32 -> bf16 / f16.  Grid (ceil(width / (4 * kEmitThreads)), rows); block kEmitThreads; four columns
+ *  a thread.
+ *  @param x     device f32 rows, row t at x + t * ld_x
+ *  @param ld_x  x row pitch in elements
+ *  @param width columns
+ *  @param bias  device f32 [width], or NULL
+ *  @param act   pulsar_rows_act value (NONE or exact-erf GELU)
+ *  @param y     device 16-bit output rows
+ *  @param ld_y  y row pitch in elements
+ *  @param f16   nonzero: f16 output, else bf16 */
 __global__ void __launch_bounds__(kEmitThreads)
 rows_bias_emit_kernel(const float *__restrict__ x, uint64_t ld_x, uint32_t width, const float *__restrict__ bias,
                       int act, uint16_t *__restrict__ y, uint64_t ld_y, int f16) {
@@ -141,6 +191,24 @@ rows_bias_emit_kernel(const float *__restrict__ x, uint64_t ld_x, uint32_t width
  * x, res += x + bias first (f32, stored); without x, an f32 row read plus `bias` (not stored: a linear's output and its
  * bias); then the sum, the mean, the centred squares -- f32 chains per thread in column order, folded as ln_block_sum
  * -- and the outputs (bf16 / f16 and / or f32). */
+/** LayerNorm with an f32 residual stream (or a bf16 input row).  Grid n_rows; block kNormThreads; static smem only.
+ *  IN_F32 with x: res += x + bias, stored; IN_F32 without x: the row read plus bias, not stored; !IN_F32: the bf16 row
+ *  as is.  Then, when w is set, out = (u - mean) * rstd * w + b to y (16-bit) and / or yf (f32).
+ *  @tparam IN_F32 res_ holds f32 rows (else bf16)
+ *  @param res_   device residual rows (f32 or bf16 by IN_F32)
+ *  @param ld_res res_ row pitch in elements
+ *  @param x      device f32 rows added to the residual, or NULL
+ *  @param ld_x   x row pitch in elements
+ *  @param bias   device f32 [width], or NULL
+ *  @param width  columns
+ *  @param w      device f32 [width] LayerNorm weight, or NULL: the add alone
+ *  @param b      device f32 [width] LayerNorm bias (read with w)
+ *  @param eps    the norm's epsilon
+ *  @param y      device 16-bit output rows, or NULL
+ *  @param ld_y   y row pitch in elements
+ *  @param f16    nonzero: y is f16, else bf16
+ *  @param yf     device f32 output rows, or NULL
+ *  @param ld_yf  yf row pitch in elements */
 template <bool IN_F32>
 __global__ void __launch_bounds__(kNormThreads)
 rows_ln32_kernel(void *__restrict__ res_, uint64_t ld_res, const float *__restrict__ x, uint64_t ld_x,
@@ -186,6 +254,15 @@ rows_ln32_kernel(void *__restrict__ res_, uint64_t ld_res, const float *__restri
 }
 
 /* Eight elements a thread: one f16 table row, scaled, as f32 (a NaN row for an id outside the table). */
+/** Embedding gather from an f16 table, scaled, to f32.  Grid (ceil(width / (8 * kEmitThreads)), rows); block
+ *  kEmitThreads; eight columns a thread.  An id outside [0, n_vocab) writes a NaN row.
+ *  @param table   device f16 [n_vocab][width] as uint4 chunks
+ *  @param n_vocab rows in the table
+ *  @param width   row width (a multiple of 8)
+ *  @param ids     device token ids, one per output row
+ *  @param scale   multiplies every element
+ *  @param y       device f32 output rows (16-byte aligned)
+ *  @param ld_y    y row pitch in elements */
 __global__ void __launch_bounds__(kEmitThreads)
 rows_gather_f16_kernel(const uint4 *__restrict__ table, uint32_t n_vocab, uint32_t width, const int32_t *__restrict__ ids,
                        float scale, float *__restrict__ y, uint64_t ld_y) {
@@ -211,6 +288,9 @@ rows_gather_f16_kernel(const uint4 *__restrict__ table, uint32_t n_vocab, uint32
     y4[1] = make_float4(o[4], o[5], o[6], o[7]);
 }
 
+/** Checks the last launch.
+ *  @param who the launch's name for the message
+ *  @return 0, or -3 after naming the CUDA error on stderr */
 int launched(const char *who) {
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) {
@@ -220,9 +300,24 @@ int launched(const char *who) {
     return 0;
 }
 
+/// @param p a pointer
+/// @return true when p is 16-byte aligned
 bool aligned16(const void *p) { return ((uintptr_t)p & 15u) == 0; }
 
 /* the shared contract of the norm and the add: widths and strides in 8s, aligned rows, a grid of n_rows CTAs */
+/** Validates the norm / add contract (rows in 1 .. 2^31 - 1, width and pitches multiples of 8, 16-byte aligned
+ *  rows; y required with w); names the refusal on stderr.
+ *  @param who      the caller's name for the message
+ *  @param res      residual / input rows
+ *  @param ld_res   its pitch in elements
+ *  @param delta    rows to add, or NULL
+ *  @param ld_delta its pitch in elements
+ *  @param n_rows   rows (the grid)
+ *  @param width    row width
+ *  @param w        norm weight, or NULL
+ *  @param y        output rows (required with w)
+ *  @param ld_y     its pitch in elements
+ *  @return true when the arguments meet the contract */
 bool norm_args_ok(const char *who, const void *res, uint64_t ld_res, const void *delta, uint64_t ld_delta,
                   uint32_t n_rows, uint32_t width, const void *w, const void *y, uint64_t ld_y) {
     const bool ok = res && n_rows > 0 && n_rows <= 0x7fffffffu && width > 0 && width % 8 == 0 && ld_res >= width &&

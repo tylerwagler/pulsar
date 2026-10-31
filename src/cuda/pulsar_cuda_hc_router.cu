@@ -1,3 +1,5 @@
+/** @file
+ *  DeepSeek hidden-carrier (hc) kernels (weighted sum, expand, norm-mix, output weights), SwiGLU / add / steering, and the DS4 router front. */
 #include "pulsar_cuda_internal.h"
 #include "pulsar_cuda_mx.cuh"
 #include "pulsar_cuda_router.h"
@@ -16,6 +18,17 @@
  * This removes the ~1k-cycle single-thread critical section (24 expf + 20
  * Sinkhorn iterations) that ran while 255 threads idled, x2 per layer per
  * decode token. c is a per-block shared[16] scratch. */
+/** The 4-carrier mHC split of one row by warp 0: out[0..3] = sigmoid(pre) + eps, out[4..7] = 2 sigmoid(post),
+ *  out[8..23] = the Sinkhorn-normalised 4x4 comb (softmax rows + eps, then alternating column / row
+ *  normalisations).  All 32 lanes must enter.
+ *  @param out            out: the row's 24 split coefficients
+ *  @param mix            the row's 24 mix logits
+ *  @param scale          [3] pre / post / comb scales
+ *  @param base           [24] biases
+ *  @param sinkhorn_iters Sinkhorn iterations (the first column pass included)
+ *  @param epsv           epsilon added to pre, the comb entries and each normaliser
+ *  @param lane           this lane (0..31)
+ *  @param c              shared [16] comb scratch */
 __device__ static void hc4_split_par(float *out, const float *mix, const float *scale,
                                      const float *base, uint32_t sinkhorn_iters, float epsv,
                                      uint32_t lane, float *c) {
@@ -75,6 +88,14 @@ __device__ static void hc4_split_par(float *out, const float *mix, const float *
 
 
 
+/** HC collapse: out[t][d] = sum_h x[t][h][d] * w[t][h].  1-D grid over n_embd * n_tokens, one thread an output.
+ *  @param out               f32 [n_tokens][n_embd]
+ *  @param x                 HC carrier [n_tokens][n_hc][n_embd]
+ *  @param w                 f32 per-token weights, row t at t * weight_stride_f32
+ *  @param n_embd            hidden width
+ *  @param n_hc              carriers
+ *  @param n_tokens          tokens
+ *  @param weight_stride_f32 floats between tokens' weights */
 __global__ static void hc_weighted_sum_kernel(float *out, const pulsar_hc_t *x, const float *w, uint32_t n_embd, uint32_t n_hc, uint32_t n_tokens, uint32_t weight_stride_f32) {
     uint64_t gid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
     uint64_t n = (uint64_t)n_embd * n_tokens;
@@ -114,6 +135,22 @@ __global__ static void hc_weighted_sum_kernel(float *out, const pulsar_hc_t *x, 
  * block_v*post[dst], then src_hc 0..NHC-1 in order), so this is an issue-order
  * and dedupe change only.  It is graded by the byte-exact prefill gate, not the
  * reference gate. */
+/** HC expand: out[t][dst][d] = block[t][d] * post[t][dst] + sum_src comb[t][dst + src * n_hc] * res[t][src][d], with
+ *  block = block_out (+ block_add).  1-D grid: one thread a (t, d) for NHC > 0 (all destinations in registers), one
+ *  a (t, dst, d) for NHC == 0.
+ *  @tparam NHC the carrier count at compile time, or 0 for the runtime loop
+ *  @param out_hc      HC carrier out [n_tokens][n_hc][n_embd]
+ *  @param block_out   f32 [n_tokens][n_embd] the sublayer's output
+ *  @param block_add   f32 [n_tokens][n_embd] added to it when has_add
+ *  @param residual_hc HC carrier [n_tokens][n_hc][n_embd]
+ *  @param post        per-token post weights, row t at t * post_stride
+ *  @param comb        per-token comb matrices, row t at t * comb_stride
+ *  @param n_embd      hidden width
+ *  @param n_hc        carriers
+ *  @param n_tokens    tokens
+ *  @param post_stride floats between tokens' post rows
+ *  @param comb_stride floats between tokens' comb rows
+ *  @param has_add     nonzero: add block_add */
 template <int NHC>
 __global__ static void hc_expand_kernel(
         pulsar_hc_t *out_hc,
@@ -198,6 +235,20 @@ __global__ static void hc_expand_kernel(
  * differently-shaped model still runs (just without the unrolled gather).
  * The grid differs by arm: NHC=4 maps one thread per (t,d), the runtime arm one
  * per (t,dst,d). */
+/** Launches hc_expand_kernel: the NHC = 4 instance when n_hc is 4, else the runtime-loop one.
+ *  @param threads     block size
+ *  @param out_hc      HC carrier out
+ *  @param block_out   the sublayer's output
+ *  @param block_add   added when has_add
+ *  @param residual_hc the residual carrier
+ *  @param post        post weights
+ *  @param comb        comb matrices
+ *  @param n_embd      hidden width
+ *  @param n_hc        carriers
+ *  @param n_tokens    tokens
+ *  @param post_stride floats between tokens' post rows
+ *  @param comb_stride floats between tokens' comb rows
+ *  @param has_add     nonzero: add block_add */
 static void hc_expand_launch(uint32_t threads,
                              pulsar_hc_t *out_hc, const float *block_out,
                              const float *block_add, const pulsar_hc_t *residual_hc,
@@ -261,6 +312,7 @@ static void hc_expand_launch(uint32_t threads,
  * reason: it is a property of the loaded profile, not of the call.  It reaches
  * the kernel as a LAUNCH ARGUMENT rather than a __device__ symbol because the
  * setter runs during weight binding, before the graph's first command batch. */
+/// The collapse takes this sublayer's own split (0731) rather than the handed-on pre (V4.1); set once at load.
 static bool g_hc_head_mix = false;
 void pulsar_gpu_set_hc_head_mix(bool on) { g_hc_head_mix = on; }
 
@@ -275,6 +327,33 @@ void pulsar_gpu_set_hc_head_mix(bool on) { g_hc_head_mix = on; }
  * order (the collapsed values meet in shared memory first), then the same
  * 256-partial pairwise tree; a warp still spans 32 consecutive columns of one
  * u, so every MX emit block is the same 32 values. */
+/** Fused mHC split + collapse + RMSNorm of one row, with E4M3 / bf16 epilogues.  Grid n_rows; block BLK * Q; static
+ *  smem VEC x BLK collapsed values + BLK partials + the split scratch.  n_hc must be 4.
+ *  @tparam BLK    columns a thread group spans per step (a multiple of 32)
+ *  @tparam VEC    column steps per row (n_embd <= BLK * VEC)
+ *  @tparam NWBF16 norm_w is stored bf16
+ *  @tparam Q      column quarters (the block is BLK * Q threads)
+ *  @param out                f32 [n_rows][n_embd] pre-norm collapse, or NULL
+ *  @param norm_out           f32 [n_rows][n_embd] normed rows (rows >= norm_f32_keep_from stored)
+ *  @param norm_out_q         E4M3 slot data, or NULL
+ *  @param norm_out_sf        its ue8m0 scales
+ *  @param norm_out_kbp       its scale row pitch
+ *  @param norm_out_b         bf16 [n_rows][n_embd] copy, or NULL
+ *  @param norm_f32_keep_from first row whose f32 normed row is stored
+ *  @param split              out: [n_rows][24] this sublayer's split coefficients
+ *  @param pre_carry          [n_rows][4] the pre handed in; overwritten with this sublayer's
+ *  @param mix                [n_rows][24] mix logits
+ *  @param residual_hc        HC carrier [n_rows][4][n_embd]
+ *  @param scale              [3] split scales
+ *  @param base               [24] split biases
+ *  @param norm_w             norm weight [n_embd]
+ *  @param n_embd             hidden width
+ *  @param n_hc               carriers (4)
+ *  @param n_rows             rows
+ *  @param sinkhorn_iters     Sinkhorn iterations
+ *  @param epsv               split epsilon
+ *  @param norm_eps           RMSNorm epsilon
+ *  @param head_mix           nonzero: collapse with the own split (0731), else with the handed-on pre */
 template <uint32_t BLK, uint32_t VEC, bool NWBF16, uint32_t Q>
 __global__ static void __launch_bounds__(BLK * Q) hc_split_weighted_sum_norm_fused_kernel(
         float *out,
@@ -404,19 +483,41 @@ __global__ static void __launch_bounds__(BLK * Q) hc_split_weighted_sum_norm_fus
 
 /* make_identity_pre_mix: the pre handed to layer 0's attention -- copy 0
  * with weight 1, the rest 0 -- one row per token of the sweep. */
+/** @param pre    out: [n_rows][n_hc] one-hot pre (carrier 0 weight 1)
+ *  @param n_rows rows
+ *  @param n_hc   carriers */
 __global__ static void hc_pre_identity_kernel(float *pre, uint32_t n_rows, uint32_t n_hc) {
     const uint32_t gid = blockIdx.x * blockDim.x + threadIdx.x;
     if (gid >= n_rows * n_hc) return;
     pre[gid] = (gid % n_hc) == 0u ? 1.0f : 0.0f;
 }
 
+/// @param p f32 activations
+/// @param i element
+/// @return p[i]
 __device__ static inline float swiglu_act_load(const float *p, uint32_t i) { return p[i]; }
+/// @param p f16 activations
+/// @param i element
+/// @return p[i] widened, an f16 infinity clamped to +-65504
 __device__ static inline float swiglu_act_load(const __half *p, uint32_t i) {
     float v = __half2float(p[i]);
     if (isinf(v)) v = copysignf(65504.0f, v);
     return v;
 }
 
+/** SwiGLU: out = silu(min(g, clamp)) * clamp(u, +-clamp) * weight (no clamp when clamp <= 1e-6), with an optional
+ *  E4M3 epilogue.  1-D grid, block 256, one thread an element.
+ *  @tparam AT the gate / up element type (float or __half)
+ *  @param out     f32 [n] out, or NULL (the E4M3 slot replaces it)
+ *  @param gate    gate activations [n]
+ *  @param up      up activations [n]
+ *  @param n       elements (rows * mid_dim)
+ *  @param clamp   the activation clamp, or <= 1e-6 for none
+ *  @param weight  scale on every output
+ *  @param out_q   E4M3 slot data, or NULL
+ *  @param out_sf  its ue8m0 scales
+ *  @param out_kbp its scale row pitch
+ *  @param mid_dim row width of the slot (a multiple of 32) */
 template <typename AT>
 __global__ static void swiglu_kernel(float *out, const AT *gate, const AT *up, uint32_t n, float clamp, float weight,
                                      __nv_fp8_e4m3 *out_q, unsigned char *out_sf, int out_kbp, uint32_t mid_dim) {
@@ -435,6 +536,11 @@ __global__ static void swiglu_kernel(float *out, const AT *gate, const AT *up, u
 
 
 
+/** out = a + b element-wise, f32.  1-D grid.
+ *  @param out f32 [n]
+ *  @param a   f32 [n]
+ *  @param b   f32 [n]
+ *  @param n   elements */
 __global__ static void add_kernel(float *out, const float *a, const float *b, uint32_t n) {
     uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
@@ -443,6 +549,14 @@ __global__ static void add_kernel(float *out, const float *a, const float *b, ui
 
 
 
+/** Directional steering: x[row] -= scale * (x[row] . dir) * dir, dir = directions[layer].  Grid rows; block a power
+ *  of two, at most 256.
+ *  @param x          f32 [rows][width], updated in place
+ *  @param directions f32 [layers][width] unit directions
+ *  @param layer      the layer's direction row
+ *  @param width      row width
+ *  @param rows       rows
+ *  @param scale      projection strength */
 __global__ static void directional_steering_project_kernel(
         float       *x,
         const float *directions,
@@ -475,6 +589,18 @@ __global__ static void directional_steering_project_kernel(
 }
 
 
+/** @param out      f32 [n] (sized even when skipped)
+ *  @param gate     gate activations [n] (f32 or f16, the same as up)
+ *  @param up       up activations [n]
+ *  @param n        elements (a multiple of 32 with out_q)
+ *  @param clamp    the activation clamp, or <= 1e-6 for none
+ *  @param weight   scale on every output
+ *  @param out_q    E4M3 slot data, or NULL
+ *  @param out_sf   its ue8m0 scales
+ *  @param out_kbp  its scale row pitch
+ *  @param mid_dim  slot row width (a multiple of 32 with out_q)
+ *  @param skip_f32 nonzero: do not store f32 (requires out_q)
+ *  @return nonzero on success, 0 refused or a launch failure */
 int pulsar_gpu_swiglu_mx_tensor(pulsar_gpu_tensor *out, const pulsar_gpu_tensor *gate, const pulsar_gpu_tensor *up,
                                 uint32_t n, float clamp, float weight,
                                 void *out_q, void *out_sf, int out_kbp, uint32_t mid_dim,
@@ -556,6 +682,11 @@ int pulsar_gpu_swiglu_mx_tensor(pulsar_gpu_tensor *out, const pulsar_gpu_tensor 
 
 
 
+/** @param out f32 [n] = a + b
+ *  @param a   f32 [n]
+ *  @param b   f32 [n]
+ *  @param n   elements
+ *  @return nonzero on success, 0 on a bad operand or a launch failure */
 int pulsar_gpu_add_tensor(pulsar_gpu_tensor *out, const pulsar_gpu_tensor *a, const pulsar_gpu_tensor *b, uint32_t n) {
     if (!out || !a || !b ||
         out->bytes < (uint64_t)n * sizeof(float) ||
@@ -566,6 +697,13 @@ int pulsar_gpu_add_tensor(pulsar_gpu_tensor *out, const pulsar_gpu_tensor *a, co
 }
 
 
+/** @param x          f32 [rows][width], steered in place
+ *  @param directions f32 [layers][width]
+ *  @param layer      the direction row to use
+ *  @param width      row width
+ *  @param rows       rows
+ *  @param scale      projection strength (0 refused)
+ *  @return nonzero on success, 0 on a bad operand or a launch failure */
 int pulsar_gpu_directional_steering_project_tensor(
         pulsar_gpu_tensor       *x,
         const pulsar_gpu_tensor *directions,
@@ -597,6 +735,10 @@ int pulsar_gpu_directional_steering_project_tensor(
  * leading layers are hash-routed: the token-id table (tid2eid) names the experts, the weights are still their
  * unbiased scores, and an image slot escapes the table (it has no row) into the vl-biased top-k.  The shared
  * expert is ungated and runs outside the router. */
+/** @param n_expert            routed experts
+ *  @param n_expert_used       picks per token
+ *  @param expert_weight_scale the route scale
+ *  @return DeepSeek's router declaration (sqrt-softplus scores, sum renorm with a 2^-14 floor, no shared gate) */
 static pulsar_router_cfg ds4_router_cfg(uint32_t n_expert, uint32_t n_expert_used, float expert_weight_scale) {
     pulsar_router_cfg c{};
     c.n_expert = (int)n_expert;
@@ -612,6 +754,26 @@ static pulsar_router_cfg ds4_router_cfg(uint32_t n_expert, uint32_t n_expert_use
     return c;
 }
 
+/** DeepSeek's routing for n_tokens rows through the shared router (pulsar_router_select_launch).
+ *  @param selected            int32 out [n_tokens][n_expert_used]
+ *  @param weights             f32 out [n_tokens][n_expert_used]
+ *  @param probs               f32 out [n_tokens][n_expert] unbiased scores, or NULL
+ *  @param model_map           host base of the mapped model
+ *  @param model_size          bytes mapped
+ *  @param bias_offset         the correction bias's byte offset (read with has_bias)
+ *  @param has_bias            the layer has a correction bias
+ *  @param tid2eid_offset      the hash table's byte offset (read when tid2eid_rows > 0)
+ *  @param tid2eid_rows        hash table rows, or 0: a top-k layer
+ *  @param logits              f32 [n_tokens][n_expert]
+ *  @param tokens              int32 [n_tokens] token ids (required for a hash layer), or NULL
+ *  @param n_expert            routed experts
+ *  @param n_expert_used       picks per token
+ *  @param expert_weight_scale the route scale
+ *  @param n_tokens            rows
+ *  @param vl_bias_offset      the image-slot bias's byte offset (read with has_vl_bias)
+ *  @param n_vocab             text vocabulary: token ids >= it are image slots
+ *  @param has_vl_bias         the layer has an image-slot bias
+ *  @return nonzero on success, 0 refused or a launch failure */
 int pulsar_gpu_router_select_batch_tensor(
         pulsar_gpu_tensor *selected, pulsar_gpu_tensor *weights, pulsar_gpu_tensor *probs,
         const void *model_map, uint64_t model_size,
@@ -686,6 +848,14 @@ int pulsar_gpu_router_select_batch_tensor(
  * Reachable only when the artifact bound output_hc_* / dspark.2.hc_head_*, so
  * V4.1 never runs them. */
 
+/** out = sigmoid(pre * scale + base[h]) + eps per (token, carrier).  1-D grid over n_tokens * n_hc.
+ *  @param out      f32 [n_tokens][n_hc]
+ *  @param pre      f32 [n_tokens][n_hc] mix outputs
+ *  @param scale    [1] row scale
+ *  @param base     [n_hc] per-carrier bias
+ *  @param n_hc     carriers
+ *  @param n_tokens tokens
+ *  @param epsv     added after the sigmoid */
 __global__ static void output_hc_weights_kernel(
         float *out,
         const float *pre,
@@ -712,6 +882,17 @@ __global__ static void output_hc_weights_kernel(
  * reproduces the f32 that rms_norm_plain stored, and __fmaf_rn reproduces the
  * generic GEMV's contracted `sum += w * x`.  Do not "tidy" these into plain
  * operators. */
+/** Fused plain RMSNorm of one HC carrier row and the mix GEMV: out[row] = w[row] . (x * rstd).  Grid out_dim (each
+ *  block recomputes the norm); block BLK; static smem BLK partials.
+ *  @tparam BLK    block size (a power of two)
+ *  @tparam UNROLL loads batched per thread
+ *  @tparam WT     weight element type (float or __nv_bfloat16)
+ *  @param out     f32 [out_dim]
+ *  @param w       weight [out_dim][n]
+ *  @param x       HC carrier row [n]
+ *  @param n       input width
+ *  @param out_dim output rows
+ *  @param eps     the norm's epsilon */
 template <uint32_t BLK, uint32_t UNROLL, typename WT>
 __global__ static void hc_norm_mix_kernel(
         float *out,
@@ -776,6 +957,15 @@ __global__ static void hc_norm_mix_kernel(
 
 /* The sigmoid step: out = sigmoid(pre * scale + base[h]) + eps.  `scale` is a
  * single f32 (a per-ROW scale, not per-stream), `base` is n_hc wide. */
+/** @param out          f32 [n_tokens][n_hc] (n_tokens = its size / row bytes)
+ *  @param pre          f32 mix outputs, at least out's size
+ *  @param model_map    host base of the mapped model
+ *  @param model_size   bytes mapped
+ *  @param scale_offset the f32 row scale's byte offset
+ *  @param base_offset  the f32 [n_hc] bias's byte offset
+ *  @param n_hc         carriers
+ *  @param eps          added after the sigmoid
+ *  @return nonzero on success, 0 on a bad operand or a launch failure */
 int pulsar_gpu_output_hc_weights_tensor(
         pulsar_gpu_tensor       *out,
         const pulsar_gpu_tensor *pre,
@@ -807,6 +997,16 @@ int pulsar_gpu_output_hc_weights_tensor(
  * on STORAGE rather than gated on one type: it used to be F16-only, which made
  * the fusion silently unreachable the moment hc_*_fn moved storage.  Anything
  * else REFUSES rather than falling through to an f16 read at the wrong width. */
+/** @param out           f32 [out_dim]
+ *  @param model_map     host base of the mapped model
+ *  @param model_size    bytes mapped
+ *  @param weight_offset the mix weight's byte offset
+ *  @param in_dim        input width
+ *  @param out_dim       output rows
+ *  @param x             HC carrier row [in_dim]
+ *  @param eps           the norm's epsilon
+ *  @param w_type        the weight's ds4 tensor type (PULSAR_TENSOR_BF16 or PULSAR_TENSOR_F32)
+ *  @return nonzero on success, 0 refused or a launch failure */
 int pulsar_gpu_hc_norm_mix_tensor(
         pulsar_gpu_tensor       *out,
         const void             *model_map,
@@ -842,6 +1042,12 @@ int pulsar_gpu_hc_norm_mix_tensor(
 }
 
 
+/** @param out         f32 [n_tokens][n_embd] (n_tokens = its size / row bytes)
+ *  @param residual_hc HC carrier [n_tokens][n_hc][n_embd]
+ *  @param weights     f32 [n_tokens][n_hc]
+ *  @param n_embd      hidden width
+ *  @param n_hc        carriers
+ *  @return nonzero on success, 0 on a bad operand or a launch failure */
 int pulsar_gpu_hc_weighted_sum_tensor(pulsar_gpu_tensor *out, const pulsar_gpu_tensor *residual_hc, const pulsar_gpu_tensor *weights, uint32_t n_embd, uint32_t n_hc) {
     if (!out || !residual_hc || !weights || n_embd == 0 || n_hc == 0) return 0;
     uint32_t n_tokens = (uint32_t)(out->bytes / ((uint64_t)n_embd * sizeof(float)));
@@ -973,6 +1179,10 @@ int pulsar_gpu_hc_split_weighted_sum_norm_f16_tensor(
 
 
 
+/** @param pre    f32 out [n_rows][n_hc]: the one-hot pre handed to layer 0
+ *  @param n_rows rows
+ *  @param n_hc   carriers
+ *  @return nonzero on success, 0 on a bad operand or a launch failure */
 int pulsar_gpu_hc_pre_identity_tensor(pulsar_gpu_tensor *pre, uint32_t n_rows, uint32_t n_hc) {
     if (!pre || n_rows == 0 || n_hc == 0 || pre->bytes < (uint64_t)n_rows * n_hc * sizeof(float)) return 0;
     const uint32_t n = n_rows * n_hc;
@@ -982,6 +1192,14 @@ int pulsar_gpu_hc_pre_identity_tensor(pulsar_gpu_tensor *pre, uint32_t n_rows, u
 
 
 
+/** HC expand with the split's post / comb (no add).
+ *  @param out_hc      HC carrier out [n_tokens][n_hc][n_embd] (n_tokens = its size / row bytes)
+ *  @param block_out   f32 [n_tokens][n_embd] the sublayer's output
+ *  @param residual_hc HC carrier [n_tokens][n_hc][n_embd]
+ *  @param split       f32 [n_tokens][2 n_hc + n_hc^2] split coefficients
+ *  @param n_embd      hidden width
+ *  @param n_hc        carriers
+ *  @return nonzero on success, 0 on a bad operand or a launch failure */
 int pulsar_gpu_hc_expand_split_tensor(pulsar_gpu_tensor *out_hc, const pulsar_gpu_tensor *block_out, const pulsar_gpu_tensor *residual_hc, const pulsar_gpu_tensor *split, uint32_t n_embd, uint32_t n_hc) {
     if (!out_hc || !block_out || !residual_hc || !split || n_embd == 0 || n_hc == 0) return 0;
     uint32_t n_tokens = (uint32_t)(out_hc->bytes / ((uint64_t)n_hc * n_embd * PULSAR_HC_ELT_SIZE));
@@ -1001,6 +1219,15 @@ int pulsar_gpu_hc_expand_split_tensor(pulsar_gpu_tensor *out_hc, const pulsar_gp
 
 
 
+/** HC expand of block_out + block_add with the split's post / comb.
+ *  @param out_hc      HC carrier out [n_tokens][n_hc][n_embd] (n_tokens = its size / row bytes)
+ *  @param block_out   f32 [n_tokens][n_embd]
+ *  @param block_add   f32 [n_tokens][n_embd] added to block_out
+ *  @param residual_hc HC carrier [n_tokens][n_hc][n_embd]
+ *  @param split       f32 [n_tokens][2 n_hc + n_hc^2] split coefficients
+ *  @param n_embd      hidden width
+ *  @param n_hc        carriers
+ *  @return nonzero on success, 0 on a bad operand or a launch failure */
 int pulsar_gpu_hc_expand_add_split_tensor(pulsar_gpu_tensor *out_hc, const pulsar_gpu_tensor *block_out, const pulsar_gpu_tensor *block_add, const pulsar_gpu_tensor *residual_hc, const pulsar_gpu_tensor *split, uint32_t n_embd, uint32_t n_hc) {
     if (!out_hc || !block_out || !block_add || !residual_hc || !split || n_embd == 0 || n_hc == 0) return 0;
     uint32_t n_tokens = (uint32_t)(out_hc->bytes / ((uint64_t)n_hc * n_embd * PULSAR_HC_ELT_SIZE));
@@ -1017,3 +1244,17 @@ int pulsar_gpu_hc_expand_add_split_tensor(pulsar_gpu_tensor *out_hc, const pulsa
                                                     mix_hc, mix_hc, 1);
     return cuda_ok(cudaGetLastError(), "hc_expand_add_split launch");
 }
+/** @def PULSAR_HCMIX(WT, CAST)
+ *  Inside pulsar_gpu_hc_norm_mix_tensor: launches hc_norm_mix_kernel (256 threads, unroll 8) for weight type WT. */
+/** @def PULSAR_HCFUSED_BLK
+ *  Inside pulsar_gpu_hc_split_weighted_sum_norm_f16_tensor: the fused kernel's BLK. */
+/** @def PULSAR_HCFUSED_Q
+ *  Inside pulsar_gpu_hc_split_weighted_sum_norm_f16_tensor: the fused kernel's column quarters. */
+/** @def PULSAR_HCFUSED_VEC_4096
+ *  The fused kernel's VEC for n_embd up to 4096 (256 x 16). */
+/** @def PULSAR_HCFUSED_VEC_5120
+ *  The fused kernel's VEC for n_embd up to 5120 (256 x 20). */
+/** @def PULSAR_HCFUSED_LAUNCH(VEC, NW)
+ *  Inside pulsar_gpu_hc_split_weighted_sum_norm_f16_tensor: launches the fused kernel instance (VEC, NW). */
+/** @def PULSAR_HCFUSED_LAUNCH_NW(VEC)
+ *  Inside pulsar_gpu_hc_split_weighted_sum_norm_f16_tensor: PULSAR_HCFUSED_LAUNCH for the norm weight's storage. */

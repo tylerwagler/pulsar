@@ -1,3 +1,5 @@
+/** @file
+ *  Model-head family options: the embedding gather + norm and the logits finish (scale, padding mask). */
 /* The model head's family options (L295 E5): the embedding norm and the logits
  * finish (scale + padding mask).  Contracts in pulsar_cuda_head.h. */
 #include "pulsar_cuda_head.h"
@@ -9,14 +11,33 @@
 
 namespace {
 
+/// Block size of head_embed_kernel (8 warps; one CTA a token row).
 constexpr int kEmbedThreads = 256;
+/// Block size of head_finish_kernel.
 constexpr int kFinishThreads = 256;
 
+/// bf16 bits -> f32 (exact widening).
+/// @param b bf16 bits
+/// @return the value as f32
 __device__ __forceinline__ float bf2f(uint16_t b) { return __uint_as_float((uint32_t)b << 16); }
+/// f32 -> bf16 bits, round to nearest even.
+/// @param f the value
+/// @return its bf16 bits
 __device__ __forceinline__ uint16_t f2bf(float f) { return __bfloat16_as_ushort(__float2bfloat16_rn(f)); }
 
 /* One CTA a row.  Thread i owns the 8-element chunks i, i + 256, ...; its squares are an f32 fma chain over its
  * chunks in order, the warp folds by xor-shuffle, warp 0 adds the eight warp sums in order. */
+/** Embedding gather + optional RMS norm.  Grid: n token rows (blockIdx.x = row t); block kEmbedThreads; no
+ *  dynamic smem.  out[t] = table[ids[t]] * rsqrt(mean(x^2) + eps) * norm_w (no 1 + w), or the row copied as is
+ *  when norm_w is NULL; an id outside [0, n_vocab) writes a bf16 NaN row.
+ *  @param table   device bf16 [n_vocab][n_embd] viewed as uint4 (8 bf16 a chunk), 16-byte aligned
+ *  @param n_vocab rows in `table`
+ *  @param ids     device [n] token ids
+ *  @param n_embd  row width in elements (a multiple of 8)
+ *  @param norm_w  device bf16 [n_embd] norm weight as uint4, or NULL: no norm
+ *  @param eps     the norm's epsilon (added to the mean square)
+ *  @param out     device bf16 output rows, row t at out + t * ld_out (16-byte aligned)
+ *  @param ld_out  output row pitch in elements (a multiple of 8) */
 __global__ void __launch_bounds__(kEmbedThreads)
 head_embed_kernel(const uint4 *__restrict__ table, uint32_t n_vocab, const int32_t *__restrict__ ids, uint32_t n_embd,
                   const uint4 *__restrict__ norm_w, float eps, uint16_t *__restrict__ out, uint64_t ld_out) {
@@ -71,6 +92,13 @@ head_embed_kernel(const uint4 *__restrict__ table, uint32_t n_vocab, const int32
     }
 }
 
+/** Logits finish in place: columns < n_real are multiplied by `scale`, padding columns [n_real, n_logits) are set
+ *  to -inf.  Grid (ceil(n_logits / (kFinishThreads * 8)), n rows); block kFinishThreads; grid-stride over columns.
+ *  @param logits  device f32 rows, row r at logits + r * ld
+ *  @param ld      row pitch in elements
+ *  @param n_logits columns to touch (the padded vocab)
+ *  @param n_real  real-id columns (ids >= n_real are padding)
+ *  @param scale   the family's logit scale */
 __global__ void __launch_bounds__(kFinishThreads)
 head_finish_kernel(float *__restrict__ logits, uint64_t ld, uint32_t n_logits, uint32_t n_real, float scale) {
     float *row = logits + (uint64_t)blockIdx.y * ld;
@@ -78,6 +106,11 @@ head_finish_kernel(float *__restrict__ logits, uint64_t ld, uint32_t n_logits, u
         row[c] = c < n_real ? __fmul_rn(row[c], scale) : -INFINITY;
 }
 
+/** Validates a head declaration (width a positive multiple of 8, 1 <= n_real <= n_logits, finite nonzero scale,
+ *  16-byte aligned norm weight with eps >= 0); names the refusal on stderr.
+ *  @param h   the declaration (may be NULL: refused)
+ *  @param who the caller's name for the message
+ *  @return true when the declaration is usable */
 bool decl_ok(const pulsar_head_decl *h, const char *who) {
     if (!h || h->n_embd == 0 || h->n_embd % 8 || h->n_logits == 0 || h->n_real == 0 || h->n_real > h->n_logits ||
         !isfinite(h->logit_scale) || h->logit_scale == 0.0f || (h->embed_norm_w && !(h->embed_norm_eps >= 0.0f)) ||
@@ -90,6 +123,9 @@ bool decl_ok(const pulsar_head_decl *h, const char *who) {
     return true;
 }
 
+/** Checks the last launch.
+ *  @param who the launch's name for the message
+ *  @return 0, or -3 after naming the CUDA error on stderr */
 int launched(const char *who) {
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) {
