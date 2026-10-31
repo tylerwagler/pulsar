@@ -9,9 +9,10 @@
  * through a registered slab (RDMA SEND/RECV when verbs are available,
  * full-duplex TCP otherwise).
  *
- * Wire format is byte-identical to upstream (magic 0x44533454, protocol
- * version 7, the pulsar_tp_hello_fixed frame and the ds4_tp.h frame-type
- * numbers).  The control socket is a plain blocking TCP stream carrying
+ * The wire format began as upstream's (magic 0x44533454, the
+ * pulsar_tp_hello_fixed frame and the ds4_tp.h frame-type numbers) and has
+ * since moved on: the version is PULSAR_TP_PROTOCOL_VERSION (pulsar_tp.h, its
+ * history beside it).  The control socket is a plain blocking TCP stream carrying
  * framed commands; gate traffic rides a dedicated full-duplex TCP socket (or
  * RDMA) so control frames never interleave with gate payloads.
  *
@@ -690,7 +691,7 @@ struct pulsar_tp {
     /// The options this rank was created with (pointers are the caller's).
     pulsar_tp_options opt;
     /// This rank's index in the group (legacy pair: 0 leader, 1 worker).
-    int rank;                   /* 0 leader, 1 worker */
+    int rank;                   /* 0 leader, 1..n_ranks-1 workers */
     /// Ranks in the TP group (2 for the pair).
     int n_ranks;                /* ranks in this TP group (2 for the pair) */
     /// Connected peers: n_ranks - 1.

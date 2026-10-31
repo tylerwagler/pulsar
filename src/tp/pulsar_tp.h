@@ -272,9 +272,10 @@ void pulsar_tp_identity_init_defaults(pulsar_tp_identity *id,
 /* ------------------------------------------------------------------------
  * Transport (slice 3).  Public surface of the ported upstream ds4_tp.c: the
  * connection/lockstep transport that runs the slice-1 slab contract.  The
- * wire format is byte-identical to upstream antirez/ds4 (magic 0x44533454,
- * protocol version 7, the hello frame above, and the ds4_tp.h frame type
- * numbers).  Functions return 1 on success / 0 on failure and snprintf into
+ * wire format began as upstream antirez/ds4's (magic 0x44533454, the hello
+ * frame above, the ds4_tp.h frame type numbers) and has since moved on: the
+ * version is PULSAR_TP_PROTOCOL_VERSION, its history beside the constant, and
+ * both ends must speak the same one.  Functions return 1 on success / 0 on failure and snprintf into
  * (err, errlen) when err is non-NULL, matching the tree convention.
  * ---------------------------------------------------------------------- */
 
@@ -308,8 +309,8 @@ int pulsar_tp_create(pulsar_tp **out, const pulsar_tp_options *opt,
 void pulsar_tp_free(pulsar_tp *tp);
 /// This rank's index in the group.
 /// @param tp the transport
-/// @return the rank (legacy pair: 0 leader, 1 worker)
-int pulsar_tp_rank(const pulsar_tp *tp);            /* 0 leader, 1 worker */
+/// @return the rank: 0 the leader, 1..n_ranks-1 the workers (the pair: 1 its one worker)
+int pulsar_tp_rank(const pulsar_tp *tp);
 /// Ranks in this TP group.
 /// @param tp the transport
 /// @return the group size
@@ -1266,7 +1267,7 @@ typedef struct {
     /// MIXED_BATCH head_runs, NOTE_PREFILLED headed run (-1 none), SYNC_CHECK the leader's cached position.
     int value;
     /// Token array (malloc'd) for SYNC, SYNC_MM, VERIFY, NOTE_COMMITTED and NOTE_PREFILLED; n_tokens entries.
-    int *tokens;          /* malloc'd for FRAME_SYNC/VERIFY/MIXED_BATCH */
+    int *tokens;
     /// Entries in `tokens`.
     uint32_t n_tokens;
     /// Batch rows (malloc'd) for EVAL_BATCH / MIXED_BATCH / FUSED_BATCH; n_items entries.
