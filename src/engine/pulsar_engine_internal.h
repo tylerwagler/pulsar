@@ -2659,6 +2659,16 @@ bool pulsar_image_identity_equal(const pulsar_image_identity *a, const pulsar_im
 /// @param id  the records
 /// @return the exclusive end, in KV rows.
 uint32_t pulsar_image_identity_end(const pulsar_image_identity *id);
+/** L335: the blocks lying wholly inside rows [lo, hi): b[first, first + n) -- one run of the array, because the
+ *  records are in position order and disjoint, which this checks (a segment's save writes the run as it stands). */
+/// @param id     the records
+/// @param lo     the span's first row
+/// @param hi     one past its last row
+/// @param first  receives the first such block's index (0 when none)
+/// @param n      receives how many there are
+/// @return false when the records are not in position order, overlap, or hold an empty block.
+bool pulsar_image_identity_span(const pulsar_image_identity *id, uint32_t lo, uint32_t hi, uint32_t *first,
+                                uint32_t *n);
 /** L268: the interleaved multi-axis rope position (T, H, W) of KV row `row` after the blocks `id` records (HF
  *  get_rope_index; a block without a grid is text).  Text rows have T = H = W; with no gridded block before them
  *  that is the row itself. */

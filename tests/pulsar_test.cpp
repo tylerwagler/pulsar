@@ -4869,6 +4869,17 @@ static void test_lib_image_identity(void) {
     /* a family with no image geometry: no id is a sentinel (Qwen's ids above DeepSeek's vocab are text) */
     int qwen_like[] = {248046, 5, 248044};
     TEST_ASSERT(pulsar_image_persist_end(NULL, NULL, qwen_like, 3, &none) == 3);
+    /* L335: a span's blocks are one run of the records (a segment writes them from the first), checked */
+    uint32_t first = 9, nb = 9;
+    TEST_ASSERT(pulsar_image_identity_span(&all, 0, 14, &first, &nb) && first == 0 && nb == 2);
+    TEST_ASSERT(pulsar_image_identity_span(&all, 8, 14, &first, &nb) && first == 1 && nb == 1);
+    TEST_ASSERT(pulsar_image_identity_span(&all, 4, 10, &first, &nb) && nb == 0);   /* both cross an edge */
+    pulsar_image_identity bad = all;
+    std::swap(bad.b[0], bad.b[1]);   /* out of order: refused, not read as a run */
+    TEST_ASSERT(!pulsar_image_identity_span(&bad, 0, 14, &first, &nb));
+    bad = all;
+    bad.b[1].start = 7;              /* overlapping */
+    TEST_ASSERT(!pulsar_image_identity_span(&bad, 0, 14, &first, &nb));
 }
 
 /* L292: the output head's captured graph must not replay one step's arm choice for another.  Every

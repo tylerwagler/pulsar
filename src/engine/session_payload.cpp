@@ -341,23 +341,28 @@ static int payload_read_tensor_span(payload_io *io, pulsar_gpu_tensor *tensor,
  * every block a chain holds is in exactly one segment.  Each rank's copy carries them: a worker's load sets the same
  * identity as the leader's. */
 
-/* the session's records of the blocks inside [G_prev, G) */
+/* the session's records of the blocks inside [G_prev, G): one run of the records (pulsar_image_identity_span), or
+ * refused when the records are out of order -- the save writes the run from *first as it stands.  Said once a
+ * process (the chain asks the size of every span it persists; a refused size is its "no cut") */
 /// @param s      the session (its live image identity)
 /// @param G_prev the span's start
 /// @param G      the span's end
 /// @param first  receives the first such record (borrowed), NULL when none
-/// @return how many records lie wholly inside the span
-static uint32_t segment_images(const pulsar_session *s, uint32_t G_prev, uint32_t G, const pulsar_image_block **first) {
-    uint32_t n = 0;
+/// @param n      receives how many records lie wholly inside the span
+/// @return false (said once) when the records are not in position order
+static bool segment_images(const pulsar_session *s, uint32_t G_prev, uint32_t G, const pulsar_image_block **first,
+                           uint32_t *n) {
+    uint32_t at = 0;
     *first = NULL;
-    for (uint32_t i = 0; i < s->live_images.n; i++) {
-        const pulsar_image_block *b = &s->live_images.b[i];
-        if (b->start >= G_prev && b->end <= G) {
-            if (!n) *first = b;
-            n++;
-        }
+    if (!pulsar_image_identity_span(&s->live_images, G_prev, G, &at, n)) {
+        *n = 0;
+        if (pulsar_refusal_first("segment image records"))
+            fprintf(stderr, "pulsar: segment [%u, %u): the session's %u image records are not in position order -- "
+                            "refusing the segment\n", G_prev, G, s->live_images.n);
+        return false;
     }
-    return n;
+    if (*n) *first = &s->live_images.b[at];
+    return true;
 }
 
 /* The bank holds nothing: a chain's root replaces its history, a failed load leaves it empty.  The
@@ -534,7 +539,9 @@ uint64_t pulsar_session::segment_bytes(uint32_t G_prev, uint32_t G, uint64_t *st
     const bool state = segment_has_state(st, pulsar_session_live_bank(this), G);
     if (state_bytes) *state_bytes = segment_state_bytes_for(st, state);
     const pulsar_image_block *first = NULL;
-    return segment_bytes_for(st, G_prev, G, segment_images(this, G_prev, G, &first), state);
+    uint32_t n_img = 0;
+    if (!segment_images(this, G_prev, G, &first, &n_img)) return 0;
+    return segment_bytes_for(st, G_prev, G, n_img, state);
 }
 
 int pulsar_session::save_segment(FILE *fp, uint32_t G_prev, uint32_t G, char *err, size_t errlen) {
@@ -578,7 +585,11 @@ int pulsar_session::save_segment(FILE *fp, uint32_t G_prev, uint32_t G, char *er
         if (payload_write_u32(&io, (uint32_t)s->checkpoint.v[p], err, errlen) != 0) return 1;
     {
         const pulsar_image_block *b = NULL;
-        const uint32_t n_img = segment_images(s, G_prev, G, &b);
+        uint32_t n_img = 0;
+        if (!segment_images(s, G_prev, G, &b, &n_img)) {
+            payload_set_err(err, errlen, "save segment: the image records are not in position order");
+            return 1;
+        }
         if (payload_write_images(&io, b, n_img, err, errlen) != 0) return 1;
     }
     uint8_t *buf = s->io_buf;   /* pinned once at create (pulsar_session::io_buf) */
