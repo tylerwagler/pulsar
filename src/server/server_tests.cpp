@@ -765,6 +765,38 @@ static void test_retry_hints_on_retryable_failures(void) {
 
 
 
+/* L335: every status the server sends carries its own reason phrase (a 503 used to go out as
+ * "HTTP/1.1 503 Error"); a status outside the table has none (http_write dies on it). */
+static void test_http_status_lines_name_their_reason(void) {
+    static const struct { int code; const char *line; } k[] = {
+        {200, "HTTP/1.1 200 OK\r\n"},
+        {204, "HTTP/1.1 204 No Content\r\n"},
+        {400, "HTTP/1.1 400 Bad Request\r\n"},
+        {404, "HTTP/1.1 404 Not Found\r\n"},
+        {409, "HTTP/1.1 409 Conflict\r\n"},
+        {429, "HTTP/1.1 429 Too Many Requests\r\n"},
+        {500, "HTTP/1.1 500 Internal Server Error\r\n"},
+        {503, "HTTP/1.1 503 Service Unavailable\r\n"},
+    };
+    for (size_t i = 0; i < sizeof(k) / sizeof(k[0]); i++) {
+        int sv[2];
+        TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+        if (sv[0] < 0 || sv[1] < 0) continue;
+        TEST_ASSERT(k[i].code == 503 ? http_error_retry(sv[0], 503, "busy", HTTP_RETRY_GOING_AWAY_S)
+                                     : http_error(sv[0], k[i].code, "x"));
+        shutdown(sv[0], SHUT_WR);
+        char *out = read_socket_text(sv[1]);
+        TEST_ASSERT(!strncmp(out, k[i].line, strlen(k[i].line)));
+        free(out);
+        close(sv[0]);
+        close(sv[1]);
+    }
+    TEST_ASSERT(http_reason(418) == NULL);
+    TEST_ASSERT(http_reason(502) == NULL);
+}
+
+
+
 static void test_anthropic_live_stream_sends_incremental_blocks(void) {
     int sv[2];
     TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
@@ -11792,6 +11824,7 @@ static void pulsar_server_unit_tests_run(void) {
     test_anthropic_unsupported_tool_types_are_refused();
     test_anthropic_stop_sequence_is_reported();
     test_retry_hints_on_retryable_failures();
+    test_http_status_lines_name_their_reason();
     test_logprob_stream_ready_watermark();
     test_anthropic_live_stream_sends_incremental_blocks();
     test_anthropic_usage_reports_cache_details();
