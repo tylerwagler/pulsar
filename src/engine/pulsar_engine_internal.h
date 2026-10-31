@@ -4648,11 +4648,12 @@ bool pulsar_tensor_admit(const pulsar_tensor *t, const char *owner, bool ok, con
 /// @param s     the session
 /// @param bank  the bank whose carry receives the view
 void pulsar_bank_carry_save_view(pulsar_session *s, uint32_t bank);
-/** Bring `bank`'s saved view back into the host view.  false = nothing valid was saved (the family
- *  decides what a bank with no carry means). */
+/** Bring `bank`'s saved view back into the host view, all or nothing.  false = nothing valid was saved, or the
+ *  bank's live row did not restore (said) -- either way the host view is untouched, and the family decides what a
+ *  bank with no carry means. */
 /// @param s     the session
 /// @param bank  the bank
-/// @return true when a saved view was installed.
+/// @return true when the whole saved view was installed.
 bool pulsar_bank_carry_restore_view(pulsar_session *s, uint32_t bank);
 /** L322: the host view of a bank nothing was saved for -- empty and INVALID, so its first sync resets the bank and
  *  prefills cold (never continues another bank's history: the host view the caller held describes the bank it was

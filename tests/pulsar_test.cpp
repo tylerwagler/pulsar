@@ -3850,6 +3850,41 @@ static void test_l308_copy_estimate(void) {
     TEST_ASSERT(pulsar_spec_copy_price(&sp, 0.0f, 8u, conf, &rp) == 8u && !rp && conf[0] == 1.0f);
 }
 
+/* L335: a bank carry's restore is all or nothing -- a live row that does not restore (here: a bank past the device
+ * rows, the copy's host-side refusal) leaves the host view exactly as it was; it used to take the bank's checkpoint
+ * first and return false half-restored.  Host only: no device row is touched. */
+static uint32_t test_carry_width(const pulsar_engine *) { return 8u; }
+static void test_bank_carry_restore(void) {
+    static pulsar_family fam{};
+    fam.name = "L335 carry test";
+    fam.logits_width = test_carry_width;
+    pulsar_engine *e = (pulsar_engine *)xcalloc(1, sizeof(*e));
+    e->family = &fam;
+    pulsar_session *s = (pulsar_session *)xcalloc(1, sizeof(*s));
+    s->engine = e;
+    s->bank_carry = (pulsar_bank_carry *)xcalloc(2, sizeof(*s->bank_carry));
+    s->bank_carry_n = 2;
+    pulsar_bank_carry *c = &s->bank_carry[1];
+    c->valid = true;
+    c->checkpoint_valid = true;
+    c->prefill_frontier = 3;
+    for (int t : {1, 2, 3}) token_vec_push(&c->checkpoint, t);
+    token_vec_push(&s->checkpoint, 9);
+    s->checkpoint_valid = false;
+    s->prefill_frontier = 1;
+    s->logits_stale = true;
+    s->dev.n_banks = 0;   /* the live row's copy refuses bank 1 before any device work */
+    TEST_ASSERT(!pulsar_bank_carry_restore_view(s, 1));
+    TEST_ASSERT(s->checkpoint.len == 1 && s->checkpoint.v[0] == 9 && !s->checkpoint_valid && s->prefill_frontier == 1);
+    TEST_ASSERT(!pulsar_bank_carry_restore_view(s, 0));   /* nothing saved: false, nothing said or moved */
+    TEST_ASSERT(s->checkpoint.len == 1 && s->checkpoint.v[0] == 9);
+    pulsar_tokens_free(&c->checkpoint);
+    pulsar_tokens_free(&s->checkpoint);
+    free(s->bank_carry);
+    free(s);
+    free(e);
+}
+
 /* L335: Qwen's eos is the first of the tokenizer's stop ids, and the list it reads is never empty: the loader refuses
  * an eos config with no id (bpe_tokenizer.cpp finish_table, the one authority) -- what qwen_tok_eos's refusal of an
  * empty list stands on.  Host: the checkpoint's tokenizer (PULSAR_TEST_QWEN_TOKENIZER). */
@@ -4938,6 +4973,7 @@ static const pulsar_test_entry test_entries[] = {
     {"--fused-cost", "fused-cost", "the prompt chunk cost fit (solo + fused, persisted) and the verify curve's round cost, what the round selection and the disk restore price by (L304, L312, L327)", test_fused_cost},
     {"--fused-sched", "fused-sched", "the round selection simulated on L304's logged costs: L304's and L277's cases, the stall, no prompt, the cold fit (L312)", test_fused_sched},
     {"--read-ahead", "read-ahead", "the next-chunk PLE read-ahead: its rule (one chunk ahead, each row once, a changed prompt drops), the pool's background class (bytes unchanged, below every gather, cancel, accounting) (L329 b2)", test_read_ahead},
+    {"--bank-carry-restore", "bank-carry-restore", "a bank carry's restore is all or nothing: a live row that fails leaves the host view untouched (L335)", test_bank_carry_restore},
     {"--qwen-eos", "qwen-eos", "Qwen's eos: the tokenizer's first stop id; a tokenizer with none never loads (L335)", test_qwen_eos},
     {"--api-err-null", "api-err-null", "the session entries that report through err accept a NULL err (L335)", test_api_err_null},
     {"--bf16-convert", "bf16-convert", "the host f32 -> bf16 converter over every float bit pattern: finite values as before, NaN stays NaN (L335)", test_bf16_from_f32},
