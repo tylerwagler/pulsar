@@ -35,6 +35,14 @@ static void test_assert(bool cond, const char *file, int line, const char *expr)
 
 #define TEST_ASSERT(expr) test_assert((expr), __FILE__, __LINE__, #expr)
 
+/* L335: request_init sets no family and no model (the loaded engine's, in the server).  A hand-built test request
+ * says which it is: the DeepSeek V4.1 family and its served id, unless the test sets another. */
+static void test_request_init(request *r, req_kind kind, int max_tokens) {
+    request_init(r, kind, max_tokens);
+    r->family = server_family_for_format(PULSAR_CHAT_DS4_V41);
+    r->model = xstrdup("deepseek-v4-flash");
+}
+
 
 static void test_tool_schema_order_from_anthropic_schema(void) {
     tool_schema_orders orders = {0};
@@ -503,7 +511,7 @@ static void test_openai_sse_finish_sends_calls_past_streamed(void) {
     if (sv[0] < 0 || sv[1] < 0) return;
 
     request r;
-    request_init(&r, REQ_CHAT, 128);
+    test_request_init(&r, REQ_CHAT, 128);
     r.api = API_OPENAI;
     r.stream = true;
     r.has_tools = true;
@@ -556,7 +564,7 @@ static void test_openai_sse_finish_sends_calls_past_streamed(void) {
 
 static void test_context_length_error_uses_protocol_standard_shape(void) {
     request r;
-    request_init(&r, REQ_CHAT, 128);
+    test_request_init(&r, REQ_CHAT, 128);
     r.api = API_OPENAI;
     r.prompt.len = 16;
     TEST_ASSERT(request_exceeds_context(&r, 16));
@@ -581,7 +589,7 @@ static void test_context_length_error_uses_protocol_standard_shape(void) {
     request_free(&r);
 
     request a;
-    request_init(&a, REQ_CHAT, 128);
+    test_request_init(&a, REQ_CHAT, 128);
     a.api = API_ANTHROPIC;
 
     TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
@@ -702,7 +710,7 @@ static void test_anthropic_unsupported_tool_types_are_refused(void) {
  * sequence itself, buffered and streamed; tool calls still win. */
 static void test_anthropic_stop_sequence_is_reported(void) {
     request r;
-    request_init(&r, REQ_CHAT, 128);
+    test_request_init(&r, REQ_CHAT, 128);
     r.api = API_ANTHROPIC;
     struct { const char *finish; const char *seq; const char *want; } cases[] = {
         {"stop", "END", "\"stop_reason\":\"stop_sequence\",\"stop_sequence\":\"END\""},
@@ -830,7 +838,7 @@ static void test_anthropic_live_stream_sends_incremental_blocks(void) {
     if (sv[0] < 0 || sv[1] < 0) return;
 
     request r;
-    request_init(&r, REQ_CHAT, 128);
+    test_request_init(&r, REQ_CHAT, 128);
     r.api = API_ANTHROPIC;
     r.stream = true;
     r.think_mode = PULSAR_THINK_HIGH;
@@ -893,7 +901,7 @@ static void test_anthropic_tool_stream_sends_live_tool_use(void) {
     if (sv[0] < 0 || sv[1] < 0) return;
 
     request r;
-    request_init(&r, REQ_CHAT, 128);
+    test_request_init(&r, REQ_CHAT, 128);
     r.api = API_ANTHROPIC;
     r.stream = true;
     r.think_mode = PULSAR_THINK_NONE;
@@ -978,7 +986,7 @@ static void test_anthropic_tool_stream_sends_live_tool_use(void) {
 
 static void test_anthropic_usage_reports_cache_details(void) {
     request r;
-    request_init(&r, REQ_CHAT, 128);
+    test_request_init(&r, REQ_CHAT, 128);
     r.api = API_ANTHROPIC;
     r.cache_read_tokens = 7;
     r.cache_write_tokens = 3;
@@ -1034,7 +1042,7 @@ static void test_openai_tool_stream_sends_incremental_text(void) {
     if (sv[0] < 0 || sv[1] < 0) return;
 
     request r;
-    request_init(&r, REQ_CHAT, 128);
+    test_request_init(&r, REQ_CHAT, 128);
     r.api = API_OPENAI;
     r.stream = true;
     r.think_mode = PULSAR_THINK_HIGH;
@@ -1104,7 +1112,7 @@ static void test_openai_tool_stream_truncated_call_closes_args(void) {
     if (sv[0] < 0 || sv[1] < 0) return;
 
     request r;
-    request_init(&r, REQ_CHAT, 128);
+    test_request_init(&r, REQ_CHAT, 128);
     r.api = API_OPENAI;
     r.stream = true;
     r.think_mode = PULSAR_THINK_HIGH;
@@ -1155,7 +1163,7 @@ static void test_openai_stream_usage_reports_cache_details(void) {
     if (sv[0] < 0 || sv[1] < 0) return;
 
     request r;
-    request_init(&r, REQ_CHAT, 128);
+    test_request_init(&r, REQ_CHAT, 128);
     r.api = API_OPENAI;
     r.stream = true;
     r.stream_include_usage = true;
@@ -1184,7 +1192,7 @@ static void test_openai_stream_usage_reports_cache_details(void) {
 
 static void test_responses_usage_reports_cache_details(void) {
     request r;
-    request_init(&r, REQ_CHAT, 128);
+    test_request_init(&r, REQ_CHAT, 128);
     r.api = API_RESPONSES;
     r.cache_read_tokens = 7;
     r.cache_write_tokens = 3;
@@ -1248,7 +1256,7 @@ static void test_openai_chat_stream_splits_reasoning_without_tools(void) {
     if (sv[0] < 0 || sv[1] < 0) return;
 
     request r;
-    request_init(&r, REQ_CHAT, 128);
+    test_request_init(&r, REQ_CHAT, 128);
     r.api = API_OPENAI;
     r.stream = true;
     r.think_mode = PULSAR_THINK_HIGH;
@@ -1306,7 +1314,7 @@ static void test_openai_tool_stream_sends_partial_arguments(void) {
     if (sv[0] < 0 || sv[1] < 0) return;
 
     request r;
-    request_init(&r, REQ_CHAT, 128);
+    test_request_init(&r, REQ_CHAT, 128);
     r.api = API_OPENAI;
     r.stream = true;
     r.think_mode = PULSAR_THINK_NONE;
@@ -1396,7 +1404,7 @@ static void test_openai_stream_keeps_text_when_tool_straddles_think_close(void) 
     if (sv[0] < 0 || sv[1] < 0) return;
 
     request r;
-    request_init(&r, REQ_CHAT, 128);
+    test_request_init(&r, REQ_CHAT, 128);
     r.api = API_OPENAI;
     r.stream = true;
     r.think_mode = PULSAR_THINK_HIGH;
@@ -1516,7 +1524,7 @@ static void test_openai_tool_stream_waits_for_incomplete_tool_tags(void) {
     if (sv[0] < 0 || sv[1] < 0) return;
 
     request r;
-    request_init(&r, REQ_CHAT, 128);
+    test_request_init(&r, REQ_CHAT, 128);
     declare_stream_test_tools(&r);
     r.api = API_OPENAI;
     r.stream = true;
@@ -1562,7 +1570,7 @@ static void test_openai_tool_stream_sends_partial_raw_arguments(void) {
     if (sv[0] < 0 || sv[1] < 0) return;
 
     request r;
-    request_init(&r, REQ_CHAT, 128);
+    test_request_init(&r, REQ_CHAT, 128);
     declare_stream_test_tools(&r);
     r.api = API_OPENAI;
     r.stream = true;
@@ -1603,7 +1611,7 @@ static void test_openai_tool_stream_holds_partial_dsml_entities(void) {
     if (sv[0] < 0 || sv[1] < 0) return;
 
     request r;
-    request_init(&r, REQ_CHAT, 128);
+    test_request_init(&r, REQ_CHAT, 128);
     declare_stream_test_tools(&r);
     r.api = API_OPENAI;
     r.stream = true;
@@ -1652,7 +1660,7 @@ static void test_openai_tool_stream_holds_partial_utf8_arguments(void) {
     if (sv[0] < 0 || sv[1] < 0) return;
 
     request r;
-    request_init(&r, REQ_CHAT, 128);
+    test_request_init(&r, REQ_CHAT, 128);
     declare_stream_test_tools(&r);
     r.api = API_OPENAI;
     r.stream = true;
@@ -1712,7 +1720,7 @@ static void test_openai_tool_stream_handles_multiple_calls(void) {
     if (sv[0] < 0 || sv[1] < 0) return;
 
     request r;
-    request_init(&r, REQ_CHAT, 128);
+    test_request_init(&r, REQ_CHAT, 128);
     declare_stream_test_tools(&r);
     r.api = API_OPENAI;
     r.stream = true;
@@ -1787,7 +1795,7 @@ static void test_streaming_holds_partial_utf8(void) {
     if (sv[0] < 0 || sv[1] < 0) return;
 
     request r;
-    request_init(&r, REQ_CHAT, 128);
+    test_request_init(&r, REQ_CHAT, 128);
     r.api = API_OPENAI;
     r.stream = true;
     r.think_mode = PULSAR_THINK_NONE;
@@ -1818,7 +1826,7 @@ static void test_streaming_holds_partial_utf8(void) {
 
 static void test_request_defaults_use_min_p_filtering(void) {
     request r;
-    request_init(&r, REQ_CHAT, 128);
+    test_request_init(&r, REQ_CHAT, 128);
     TEST_ASSERT(r.think_mode == PULSAR_THINK_DEFAULT);
     TEST_ASSERT(r.temperature == PULSAR_DEFAULT_TEMPERATURE);
     TEST_ASSERT(r.top_p == PULSAR_DEFAULT_TOP_P);
@@ -1859,7 +1867,7 @@ static void test_think_sampling_respects_explicit_params(void) {
             for (int st = 0; st < 3; st++) { /* 0 absent, 1 explicit-nondefault,
                                               * 2 explicit-equal-to-default */
                 request r;
-                request_init(&r, REQ_CHAT, 128);
+                test_request_init(&r, REQ_CHAT, 128);
                 r.think_mode = modes[m];
                 float want_temp = PULSAR_DEFAULT_TEMPERATURE;
                 int want_top_k = 0;
@@ -1900,7 +1908,7 @@ static void test_think_sampling_respects_explicit_params(void) {
          * express — with thinking on it clobbered all four; the explicit
          * knobs must survive. */
         request r;
-        request_init(&r, REQ_CHAT, 128);
+        test_request_init(&r, REQ_CHAT, 128);
         r.think_mode = modes[m];
         r.temperature = PULSAR_DEFAULT_TEMPERATURE;
         r.has_temperature = true;
@@ -1915,7 +1923,7 @@ static void test_think_sampling_respects_explicit_params(void) {
         /* Explicit temperature==0 (others absent): greedy decode must reach
          * the sampler so DSpark speculative decode can engage. */
         request greedy;
-        request_init(&greedy, REQ_CHAT, 128);
+        test_request_init(&greedy, REQ_CHAT, 128);
         greedy.think_mode = modes[m];
         greedy.temperature = 0.0f;
         greedy.has_temperature = true;
@@ -1937,7 +1945,7 @@ static void test_think_sampling_respects_explicit_params(void) {
 static void test_decode_sampling_tool_payload_forcing(void) {
     job j;
     memset(&j, 0, sizeof j);
-    request_init(&j.req, REQ_CHAT, 128);
+    test_request_init(&j.req, REQ_CHAT, 128);
     j.req.think_mode = PULSAR_THINK_NONE;
     j.req.temperature = 0.8f;
     j.req.has_temperature = true;
@@ -2001,7 +2009,7 @@ static void *greedy_rows_deepseek_fresh(void) {
 static void greedy_rows_run(const greedy_rows_case &c, bool with_stop) {
     job j;
     memset(&j, 0, sizeof j);
-    request_init(&j.req, REQ_CHAT, 128);
+    test_request_init(&j.req, REQ_CHAT, 128);
     j.req.think_mode = PULSAR_THINK_NONE;
     j.req.temperature = 0.7f;
     j.req.has_temperature = true;
@@ -2173,7 +2181,7 @@ static void test_reasoning_effort_mapping(void) {
 /* L284 P3: one chat request through the protocol parser and the loaded family's resolve + render, as the
  * server does it (no engine: the renderer gate's shape) */
 static bool effort_case(pulsar_chat_format fmt, const char *body, request *r, char *err, size_t errlen) {
-    request_init(r, REQ_CHAT, 16);
+    test_request_init(r, REQ_CHAT, 16);
     chat_conversation c;
     memset(&c, 0, sizeof c);
     err[0] = 0;
@@ -2572,7 +2580,7 @@ static void test_dsml_tool_args_preserve_call_order(void) {
 
 static void test_openai_tool_args_preserve_call_order(void) {
     request r;
-    request_init(&r, REQ_CHAT, 128);
+    test_request_init(&r, REQ_CHAT, 128);
     r.tool_orders = make_bash_order();
     tool_calls calls = make_swapped_bash_call();
     buf b = {0};
@@ -2594,7 +2602,7 @@ static void test_openai_tool_args_preserve_call_order(void) {
 
 static void test_anthropic_thinking_and_tool_args_preserve_call_order(void) {
     request r;
-    request_init(&r, REQ_CHAT, 128);
+    test_request_init(&r, REQ_CHAT, 128);
     r.tool_orders = make_bash_order();
     tool_calls calls = make_swapped_bash_call();
     buf b = {0};
@@ -2631,7 +2639,7 @@ static void assert_replay_is_key_plus_eos(const char *key, const char *replay) {
 
 static void test_checkpoint_key_ends_where_sampled_tokens_end(void) {
     request r;
-    request_init(&r, REQ_CHAT, 128);
+    test_request_init(&r, REQ_CHAT, 128);
     r.think_mode = PULSAR_THINK_HIGH;
     r.tool_orders = make_bash_order();
     tool_calls calls = {0};
@@ -2678,7 +2686,7 @@ static void test_parse_short_dsml_and_canonical_suffix(void) {
     TEST_ASSERT(calls.len == 1);
 
     request r;
-    request_init(&r, REQ_CHAT, 128);
+    test_request_init(&r, REQ_CHAT, 128);
     r.think_mode = PULSAR_THINK_HIGH;
     r.tool_orders = make_bash_order();
     char *suffix = build_tool_checkpoint_suffix(&r, content, reasoning, &calls);
@@ -2777,7 +2785,7 @@ static void test_broken_call_one_rule_every_family(void) {
         job j;
         memset(&j, 0, sizeof j);
         request *r = &j.req;
-        request_init(r, REQ_CHAT, 64);
+        test_request_init(r, REQ_CHAT, 64);
         r->family = server_family_for_format(c.fmt);
         r->think_mode = PULSAR_THINK_DEFAULT;
         r->has_tools = true;
@@ -2822,7 +2830,7 @@ static void test_broken_call_one_rule_every_family(void) {
     /* the retry rule: once, non-streaming, a chat with tools -- a forced call too */
     job j;
     memset(&j, 0, sizeof j);
-    request_init(&j.req, REQ_CHAT, 16);
+    test_request_init(&j.req, REQ_CHAT, 16);
     j.req.has_tools = true;
     j.req.force_tool_call = true;
     gen_state g;
@@ -2949,7 +2957,7 @@ static void test_tool_checkpoint_suffix_is_future_prompt_canonical(void) {
     TEST_ASSERT(strstr(calls.v[0].arguments, "&amp;&amp;") == NULL);
 
     request r;
-    request_init(&r, REQ_CHAT, 128);
+    test_request_init(&r, REQ_CHAT, 128);
     r.think_mode = PULSAR_THINK_HIGH;
     r.tool_orders = orders;
     memset(&orders, 0, sizeof(orders));
@@ -3028,7 +3036,7 @@ static void test_tool_checkpoint_minifies_json_parameters(void) {
     TEST_ASSERT(calls.len == 1);
 
     request r;
-    request_init(&r, REQ_CHAT, 128);
+    test_request_init(&r, REQ_CHAT, 128);
     r.think_mode = PULSAR_THINK_HIGH;
     r.tool_orders = orders;
     memset(&orders, 0, sizeof(orders));
@@ -3192,7 +3200,7 @@ static void test_anthropic_tool_memory_replays_sampled_dsml(void) {
 
 static void test_anthropic_live_tail_renders_tool_results_only(void) {
     request r;
-    request_init(&r, REQ_CHAT, 128);
+    test_request_init(&r, REQ_CHAT, 128);
     r.api = API_ANTHROPIC;
     r.think_mode = PULSAR_THINK_HIGH;
 
@@ -3299,7 +3307,7 @@ static char *qwen_test_full_render(chat_msgs *msgs, bool thinking_off, std::vect
     c.tool_choice = CHAT_TOOL_CHOICE_AUTO;
     if (thinking_off) chat_conversation_control(&c, "enable_thinking", xstrdup("false"));
     request r;
-    request_init(&r, REQ_CHAT, 128);
+    test_request_init(&r, REQ_CHAT, 128);
     r.api = API_OPENAI;
     char err[200] = {0};
     const bool ok = render_chat_conversation(NULL, PULSAR_CHAT_QWEN, NULL, &c, &r, err, sizeof err);
@@ -3337,7 +3345,7 @@ static void test_qwen_hooks_compose_to_the_full_render(void) {
         chat_msgs_push(&full, qwen_test_msg("system", "Hurry."));
 
         request r;
-        request_init(&r, REQ_CHAT, 128);
+        test_request_init(&r, REQ_CHAT, 128);
         r.api = API_OPENAI;
         r.family = server_family_for_format(PULSAR_CHAT_QWEN);
         r.family_effort = thinking_off ? QWEN_EFFORT_NONE : QWEN_EFFORT_XHIGH;
@@ -3414,7 +3422,7 @@ static void test_qwen_tail_carries_a_tool_result_image(void) {
     full.v[2].tool_call_id = xstrdup("call_1");
 
     request r;
-    request_init(&r, REQ_CHAT, 128);
+    test_request_init(&r, REQ_CHAT, 128);
     r.api = API_OPENAI;
     r.family = server_family_for_format(PULSAR_CHAT_QWEN);
     r.family_effort = QWEN_EFFORT_XHIGH;
@@ -3466,7 +3474,7 @@ static void test_image_offsets_out_of_order_refuse(void) {
             chat_msgs_push(&c.msgs, m);
             c.tool_choice = CHAT_TOOL_CHOICE_AUTO;
             request r;
-            request_init(&r, REQ_CHAT, 128);
+            test_request_init(&r, REQ_CHAT, 128);
             r.api = API_OPENAI;
             char err[200] = {0};
             const bool ok = render_chat_conversation(NULL, fmts[f], NULL, &c, &r, err, sizeof err);
@@ -3532,7 +3540,7 @@ static void test_qwen_raw_calls_replay_verbatim(void) {
     TEST_ASSERT(strstr(text, expect.ptr) != NULL);
     /* and the sampled turn with those bytes is prefix-exact with the KV that produced them */
     request r;
-    request_init(&r, REQ_CHAT, 128);
+    test_request_init(&r, REQ_CHAT, 128);
     r.family = qwen;
     r.family_effort = QWEN_EFFORT_XHIGH;
     chat_msg k = qwen_test_msg("assistant", NULL);
@@ -3559,7 +3567,7 @@ static void test_qwen_forced_call_prefill_and_seed(void) {
         c.tool_choice = CHAT_TOOL_CHOICE_NAMED;
         if (thinking_off) chat_conversation_control(&c, "enable_thinking", xstrdup("false"));
         request r;
-        request_init(&r, REQ_CHAT, 128);
+        test_request_init(&r, REQ_CHAT, 128);
         r.api = API_OPENAI;
         r.forced_tool_name = xstrdup("search");
         tool_schema_orders_add_json(&r.tool_orders, "{\"name\":\"search\",\"parameters\":{\"type\":\"object\","
@@ -3629,7 +3637,7 @@ static void test_forced_call_names_a_declared_tool(void) {
                                                      : ",\"tool_choice\":\"required\"}");
             chat_conversation c = {};
             request r;
-            request_init(&r, REQ_CHAT, 128);
+            test_request_init(&r, REQ_CHAT, 128);
             r.api = API_OPENAI;
             char err[200] = {0};
             TEST_ASSERT(parse_chat_conversation_openai(body.c_str(), &c, &r, err, sizeof err));
@@ -3651,7 +3659,7 @@ static void test_forced_call_names_a_declared_tool(void) {
     }
     /* the check itself: a declared name passes; any other writes the name and the declared ones */
     request r;
-    request_init(&r, REQ_CHAT, 128);
+    test_request_init(&r, REQ_CHAT, 128);
     tool_schema_orders_add_json(&r.tool_orders, "{\"name\":\"get_weather\",\"parameters\":{}}");
     tool_schema_orders_add_json(&r.tool_orders, "{\"name\":\"search\",\"parameters\":{}}");
     char detail[200] = "";
@@ -3746,7 +3754,7 @@ static void l303_server_free(server *srv) {
 /* A request through a protocol parser and the family's render, with the toy compiler: the plan is built. */
 static bool l303_request(server *srv, pulsar_chat_format fmt, api_style api, const char *body, request *r, char *err,
                          size_t errlen) {
-    request_init(r, REQ_CHAT, 64);
+    test_request_init(r, REQ_CHAT, 64);
     r->api = api;
     chat_conversation c;
     memset(&c, 0, sizeof c);
@@ -4144,7 +4152,7 @@ static void test_l303_protocol_fields(void) {
 
 static void test_qwen_tool_error_suffix_reminds_the_system_turn(void) {
     request r;
-    request_init(&r, REQ_CHAT, 128);
+    test_request_init(&r, REQ_CHAT, 128);
     r.family = server_family_for_format(PULSAR_CHAT_QWEN);
     r.family_effort = QWEN_EFFORT_XHIGH;
     r.prompt_text = xstrdup("<|im_start|>system\nRules here.  \n<|im_end|>\n<|im_start|>user\nHi<|im_end|>\n"
@@ -4179,7 +4187,7 @@ static char *inkling_test_full_render(chat_msgs *msgs, const char *tools, reques
     c.tool_choice = CHAT_TOOL_CHOICE_AUTO;
     if (tools) c.tools_raw = xstrdup(tools);
     request r;
-    request_init(&r, REQ_CHAT, 128);
+    test_request_init(&r, REQ_CHAT, 128);
     r.api = API_OPENAI;
     char err[200] = {0};
     const bool ok = render_chat_conversation(NULL, PULSAR_CHAT_INKLING, NULL, &c, &r, err, sizeof err);
@@ -4247,7 +4255,7 @@ static void test_inkling_hooks_compose_to_the_full_render(void) {
     chat_msgs_push(&full, qwen_test_msg("system", "Hurry."));   /* a mid-loop system message: a system block */
 
     request r;
-    request_init(&r, REQ_CHAT, 128);
+    test_request_init(&r, REQ_CHAT, 128);
     r.api = API_OPENAI;
     r.family = server_family_for_format(PULSAR_CHAT_INKLING);
     r.family_effort = 90;
@@ -4337,7 +4345,7 @@ static void test_inkling_raw_calls_replay_and_key(void) {
     TEST_ASSERT(ink->find_call_block(end, &end) == NULL);
     /* and the sampled turn with those bytes is the KV that produced them */
     request r;
-    request_init(&r, REQ_CHAT, 128);
+    test_request_init(&r, REQ_CHAT, 128);
     r.family = ink;
     r.family_effort = 90;
     chat_msg t = qwen_test_msg("assistant", NULL);
@@ -4380,7 +4388,7 @@ static void test_inkling_refusals(void) {
     chat_msgs_push(&msgs, qwen_test_image_msg("user", "Look: ", ""));
     chat_conversation c = {};
     c.msgs = msgs;
-    request_init(&r, REQ_CHAT, 16);
+    test_request_init(&r, REQ_CHAT, 16);
     TEST_ASSERT(!render_chat_conversation(NULL, PULSAR_CHAT_INKLING, NULL, &c, &r, err, sizeof err));
     TEST_ASSERT(strstr(err, "image front (E9)") != NULL);
     request_free(&r);
@@ -4424,7 +4432,7 @@ static char *nemotron_test_full_render(chat_msgs *msgs, const char *tools, reque
     c.tool_choice = CHAT_TOOL_CHOICE_AUTO;
     if (tools) c.tools_raw = xstrdup(tools);
     request r;
-    request_init(&r, REQ_CHAT, 128);
+    test_request_init(&r, REQ_CHAT, 128);
     r.api = API_OPENAI;
     char err[200] = {0};
     const bool ok = render_chat_conversation(NULL, PULSAR_CHAT_NEMOTRON_H, NULL, &c, &r, err, sizeof err);
@@ -4499,7 +4507,7 @@ static void test_nemotron_hooks_compose_to_the_full_render(void) {
     chat_msgs_push(&full, qwen_test_msg("system", "Hurry."));   /* a mid-loop system message: a system turn in place */
 
     request r;
-    request_init(&r, REQ_CHAT, 128);
+    test_request_init(&r, REQ_CHAT, 128);
     r.api = API_OPENAI;
     r.family = server_family_for_format(PULSAR_CHAT_NEMOTRON_H);
     r.family_effort = NEMOTRON_EFFORT_HIGH;
@@ -4600,7 +4608,7 @@ static void test_nemotron_forced_call_prefill_and_seed(void) {
         c.tool_choice = CHAT_TOOL_CHOICE_NAMED;
         if (thinking_off) chat_conversation_control(&c, "enable_thinking", xstrdup("false"));
         request r;
-        request_init(&r, REQ_CHAT, 128);
+        test_request_init(&r, REQ_CHAT, 128);
         r.api = API_OPENAI;
         r.forced_tool_name = xstrdup("search");
         tool_schema_orders_add_json(&r.tool_orders, "{\"name\":\"search\",\"parameters\":{\"type\":\"object\","
@@ -4661,7 +4669,7 @@ static void test_nemotron_refusals(void) {
     chat_msgs_push(&msgs, qwen_test_image_msg("user", "Look: ", ""));
     chat_conversation c = {};
     c.msgs = msgs;
-    request_init(&r, REQ_CHAT, 16);
+    test_request_init(&r, REQ_CHAT, 16);
     TEST_ASSERT(!render_chat_conversation(NULL, PULSAR_CHAT_NEMOTRON_H, NULL, &c, &r, err, sizeof err));
     TEST_ASSERT(strstr(err, "vision front (N11)") != NULL);
     request_free(&r);
@@ -4742,7 +4750,7 @@ static std::vector<int> qwen_test_encode(const bpe_tokenizer *tok, const char *t
 /* One Anthropic body through the server's parse and the family's render, with no server state. */
 static char *anthropic_test_render(const char *body, pulsar_chat_format fmt, std::vector<chat_text_span> *spans) {
     request r;
-    request_init(&r, REQ_CHAT, 256);
+    test_request_init(&r, REQ_CHAT, 256);
     chat_conversation c = {};
     char err[300] = "";
     const bool ok = parse_chat_conversation_anthropic(body, &c, &r, err, sizeof err) &&
@@ -4824,7 +4832,7 @@ static void test_live_tail_joins_before_a_committed_stop(void) {
     full.v[3].tool_call_id = xstrdup("toolu_1");
 
     request r;
-    request_init(&r, REQ_CHAT, 128);
+    test_request_init(&r, REQ_CHAT, 128);
     r.api = API_ANTHROPIC;
     r.family = server_family_for_format(PULSAR_CHAT_QWEN);
     r.family_effort = QWEN_EFFORT_XHIGH;
@@ -4991,7 +4999,7 @@ static void test_tool_checkpoint_canonicalization_gate_exact_replay(void) {
 
 static void test_responses_live_tail_renders_tool_outputs_only(void) {
     request r;
-    request_init(&r, REQ_CHAT, 128);
+    test_request_init(&r, REQ_CHAT, 128);
     r.api = API_RESPONSES;
     r.think_mode = PULSAR_THINK_HIGH;
 
@@ -5143,7 +5151,7 @@ static void test_responses_stateless_tool_replay_requires_reasoning(void) {
 
 static void test_responses_visible_suffix_matches_client_replay(void) {
     request r;
-    request_init(&r, REQ_CHAT, 128);
+    test_request_init(&r, REQ_CHAT, 128);
     r.api = API_RESPONSES;
     r.think_mode = PULSAR_THINK_HIGH;
     r.reasoning_summary_emit = true;
@@ -5410,7 +5418,7 @@ static void test_json_skip_has_nesting_limit(void) {
  * calls out: NaN and non-positive -> 0, >= 2^64 -> UINT64_MAX (not UB). */
 static void test_parse_sampling_key_contract(void) {
     request r;
-    request_init(&r, REQ_CHAT, 128);
+    test_request_init(&r, REQ_CHAT, 128);
     const char *p;
 
     p = "42,";
@@ -6154,7 +6162,7 @@ static void test_expand_tool_refs(chat_msgs *msgs) {
     chat_conversation c = {};
     c.msgs = *msgs;
     request r;
-    request_init(&r, REQ_CHAT, 16);
+    test_request_init(&r, REQ_CHAT, 16);
     char err[160] = {0};
     TEST_ASSERT(chat_expand_tool_refs(&c, &r, err, sizeof err));
     *msgs = c.msgs;
@@ -6428,7 +6436,7 @@ static void test_client_socket_nonblocking_flag(void) {
 
 static void test_thinking_state_tracks_prompt_and_generated_tags(void) {
     request r;
-    request_init(&r, REQ_CHAT, 128);
+    test_request_init(&r, REQ_CHAT, 128);
     r.think_mode = PULSAR_THINK_HIGH;
     r.prompt_text = xstrdup("<｜Assistant｜><think>");
     thinking_state st = thinking_state_from_prompt(&r);
@@ -6445,7 +6453,7 @@ static void test_thinking_state_tracks_prompt_and_generated_tags(void) {
     TEST_ASSERT(st.inside == true);
     request_free(&r);
 
-    request_init(&r, REQ_CHAT, 128);
+    test_request_init(&r, REQ_CHAT, 128);
     r.think_mode = PULSAR_THINK_NONE;
     r.prompt_text = xstrdup("<｜Assistant｜></think>");
     st = thinking_state_from_prompt(&r);
@@ -8019,7 +8027,7 @@ static void test_l325_deferred_tool_in_place(void) {
         for (int k = 0; k < 2; k++) {
             chat_conversation c = {};
             request r;
-            request_init(&r, REQ_CHAT, 128);
+            test_request_init(&r, REQ_CHAT, 128);
             char err[200] = {0};
             TEST_ASSERT(parse_chat_conversation_anthropic((k ? after : before).c_str(), &c, &r, err, sizeof err));
             const bool ok = render_chat_conversation(NULL, fmt, NULL, &c, &r, err, sizeof err);
@@ -8080,7 +8088,7 @@ static void test_l326_responses_tool_search_in_place(void) {
         for (int k = 0; k < 2; k++) {
             chat_conversation c = {};
             request r;
-            request_init(&r, REQ_CHAT, 128);
+            test_request_init(&r, REQ_CHAT, 128);
             r.api = API_RESPONSES;
             char err[200] = {0};
             TEST_ASSERT(parse_chat_conversation_responses((k ? after : before).c_str(), &c, &r, err, sizeof err));
@@ -9286,7 +9294,7 @@ static void test_dsml_stream_never_announces_an_undeclared_tool(void) {
         PULSAR_TOOL_CALLS_END;
     const size_t n = strlen(raw);
     request r;
-    request_init(&r, REQ_CHAT, 128);
+    test_request_init(&r, REQ_CHAT, 128);
     declare_stream_test_tools(&r);
     capture_tool_ctx c;
     memset(&c, 0, sizeof c);
@@ -9317,7 +9325,7 @@ static void test_l184_shared_tool_stream_drives_protocol_emitters(void) {
     const size_t n = strlen(raw);
 
     request r;
-    request_init(&r, REQ_CHAT, 128);
+    test_request_init(&r, REQ_CHAT, 128);
     declare_stream_test_tools(&r);
     capture_tool_ctx c;
     memset(&c, 0, sizeof c);
@@ -9463,7 +9471,7 @@ static void test_l185_every_renderer_produces_the_authority_bytes(void) {
         TEST_ASSERT(!strcmp(glued.ptr, full_cont));
         /* ...and the production entry hands out the same bytes */
         request r;
-        request_init(&r, REQ_CHAT, 128);
+        test_request_init(&r, REQ_CHAT, 128);
         r.api = API_RESPONSES;
         r.think_mode = PULSAR_THINK_HIGH;
         r.has_tools = true;
@@ -9492,7 +9500,7 @@ static void test_l185_every_renderer_produces_the_authority_bytes(void) {
         char *full_anth = render_chat_prompt_text(&anth, schemas, NULL, PULSAR_THINK_HIGH);
         char *prefix = l185_render_prefix_sans_eos(&anth, 5, schemas);
         request r;
-        request_init(&r, REQ_CHAT, 128);
+        test_request_init(&r, REQ_CHAT, 128);
         r.api = API_ANTHROPIC;
         r.think_mode = PULSAR_THINK_HIGH;
         r.has_tools = true;
@@ -9520,7 +9528,7 @@ static void test_l185_every_renderer_produces_the_authority_bytes(void) {
         with_call.len = 5;
         char *replay = render_chat_prompt_text(&with_call, schemas, NULL, PULSAR_THINK_HIGH);
         request r;
-        request_init(&r, REQ_CHAT, 128);
+        test_request_init(&r, REQ_CHAT, 128);
         r.think_mode = PULSAR_THINK_HIGH;
         r.has_tools = true;
         r.reasoning_summary_emit = true;
@@ -9585,7 +9593,7 @@ static void test_l185_every_renderer_produces_the_authority_bytes(void) {
     /* 7. a server-side tool result suffix == the live tail of one tool message */
     {
         request r;
-        request_init(&r, REQ_CHAT, 128);
+        test_request_init(&r, REQ_CHAT, 128);
         r.think_mode = PULSAR_THINK_HIGH;
         r.has_tools = true;
         thinking_state th;
@@ -11727,6 +11735,55 @@ static void test_l334_server_positions(void) {
     TEST_ASSERT(l334_aborts([&] { l334_sink = server_live_continuation_start(TokCount{-1}, TokPos{390}).raw(); }));
 }
 
+/** Run `op` in a child with stderr closed; its exit status (1: pulsar_die; 0: `op` returned), -1 if it did not
+ *  exit. */
+template <class F> static int l335_exit_status(F op) {
+    fflush(NULL);
+    const pid_t pid = fork();
+    if (pid == 0) {
+        const int devnull = open("/dev/null", O_WRONLY);
+        if (devnull >= 0) dup2(devnull, 2);
+        op();
+        _exit(0);
+    }
+    int st = 0;
+    if (pid < 0 || waitpid(pid, &st, 0) != pid) return -1;
+    return WIFEXITED(st) ? WEXITSTATUS(st) : -1;
+}
+
+/* L335: request_init sets no family and no model; a request that reaches the worker's queue without either dies by
+ * name at server::enqueue (it used to run as DeepSeek V4.1, "deepseek-v4-flash").  With both set it queues. */
+static void test_l335_request_without_family_dies_at_enqueue(void) {
+    request r;
+    request_init(&r, REQ_CHAT, 16);
+    TEST_ASSERT(r.family == NULL && r.model == NULL);
+    request_free(&r);
+    for (int c = 0; c < 3; c++) {
+        TEST_ASSERT(l335_exit_status([&] {
+            server s;
+            memset(&s, 0, sizeof s);
+            pthread_mutex_init(&s.mu, NULL);
+            pthread_cond_init(&s.cv, NULL);
+            job j;
+            memset(&j, 0, sizeof j);
+            request_init(&j.req, REQ_CHAT, 16);
+            if (c == 1) j.req.family = server_family_for_format(PULSAR_CHAT_QWEN);       /* no model */
+            if (c == 2) j.req.model = xstrdup("m");                                     /* no family */
+            s.enqueue(&j);
+        }) == 1);
+    }
+    TEST_ASSERT(l335_exit_status([&] {
+        server s;
+        memset(&s, 0, sizeof s);
+        pthread_mutex_init(&s.mu, NULL);
+        pthread_cond_init(&s.cv, NULL);
+        job j;
+        memset(&j, 0, sizeof j);
+        test_request_init(&j.req, REQ_CHAT, 16);
+        if (!s.enqueue(&j)) _exit(2);
+    }) == 0);
+}
+
 /* L334 fix: a toy vocabulary for the seam walks -- id i spells l334_vocab[i] ("" = a control token). */
 static const char *const l334_vocab[] = {"<ctl>", "X", "a", "b", "c", "d", "ab", "abc", "bc", "cd", "bcd", "Y", "Z"};
 enum { L334_CTL, L334_X, L334_A, L334_B, L334_C, L334_D, L334_AB, L334_ABC, L334_BC, L334_CD, L334_BCD, L334_Y,
@@ -11785,6 +11842,7 @@ static void pulsar_server_unit_tests_run(void) {
     test_l334_seam_currencies();
     test_l334_positions_are_ints();
     test_l334_none_fails_closed();
+    test_l335_request_without_family_dies_at_enqueue();
     test_l334_server_positions();
     test_l334_prompt_held_across_a_seam();
     test_mem_floor_is_derived_from_the_watermarks();

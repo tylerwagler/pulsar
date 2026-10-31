@@ -846,7 +846,7 @@ typedef struct request {
      * keeps pulsar_session_sync() as its exact path.  `bytes` are owned. */
     pulsar_image_ref *images;  ///< owned, `n_images` entries
     int n_images;              ///< images in the request
-    char *model;               ///< model name to serve, owned
+    char *model;               ///< model name to serve, owned (NULL until the parse or http_server sets it)
     bool model_from_request;   ///< the client named the model (vs the server default)
     stop_list stops;           ///< client-supplied stop sequences
     char *raw_body;            ///< the original request body, owned; kept for tracing and replay
@@ -927,8 +927,8 @@ typedef struct request {
     tool_replay_stats tool_replay;            ///< what the replay matched, for logging and metrics
     /** L272 P3: the loaded model's template family -- the server's per-family table (server_family_ops,
      *  chat_family.cpp).  Every per-family branch reads one of its fields; a parser that holds the engine
-     *  sets it from the engine (server_family_for_engine), request_init defaults it to the compile-time
-     *  profile's (DeepSeek V4.1) so hand-built requests keep that profile's bytes.  Never NULL. */
+     *  sets it from the engine (render_chat_conversation, server_family_for_engine).  request_init leaves it
+     *  NULL (L335: no DeepSeek default); server::enqueue dies on a request that reaches the queue without it. */
     const struct server_family_ops *family;
     /** The family's level from its effort map (L295 F5: Qwen's qwen_effort, Inkling's hundredths; a DeepSeek
      *  level is its think_mode); written by chat_resolve_thinking, read by family->render. */

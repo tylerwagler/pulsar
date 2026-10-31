@@ -33,6 +33,10 @@
 
 bool server::enqueue(job *j) {
     auto *s = this;
+    /* L335: the family is the loaded engine's and the model the client's or the served id; request_init sets
+     * neither, so a path that skipped setting them dies here, by name, instead of running as some default */
+    if (!j->req.family) pulsar_die("server::enqueue: a request without its family (the parse never set it)");
+    if (!j->req.model) pulsar_die("server::enqueue: a request without its model id (never set from the engine)");
     pthread_mutex_lock(&s->mu);
     if (s->stopping) {
         pthread_mutex_unlock(&s->mu);

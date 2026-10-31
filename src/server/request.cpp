@@ -388,7 +388,9 @@ bool tool_call_declared(const request *r, const char *name, char *detail, size_t
 
 
 
-/// @brief Zero a request and set its defaults: OpenAI protocol, the default sampling knobs, DeepSeek V4.1's family.
+/// @brief Zero a request and set its defaults: OpenAI protocol, the default sampling knobs.  No model and no
+///        family: the family is the loaded engine's (the render or the completions parse sets it), the model the
+///        client's or the served id (http_server); server::enqueue dies on a request without either (L335).
 /// @param r the request
 /// @param kind chat or completion
 /// @param max_tokens the generation cap
@@ -396,17 +398,12 @@ void request_init(request *r, req_kind kind, int max_tokens) {
     memset(r, 0, sizeof(*r));
     r->kind = kind;
     r->api = API_OPENAI;
-    r->model = xstrdup("deepseek-v4-flash");
     r->max_tokens = max_tokens;
     r->top_k = 0;
     r->temperature = PULSAR_DEFAULT_TEMPERATURE;
     r->top_p = PULSAR_DEFAULT_TOP_P;
     r->min_p = PULSAR_DEFAULT_MIN_P;
     r->think_mode = PULSAR_THINK_DEFAULT;
-    /* The template family, defaulted to the compile-time default PROFILE
-     * (V4.1); a parser that holds the engine overwrites it from the engine
-     * (server_family_for_engine). */
-    r->family = server_family_for_format(PULSAR_CHAT_DS4_V41);
 }
 
 
@@ -492,12 +489,19 @@ bool parse_thinking_control_value(const char **p, bool *thinking_enabled) {
 
 
 
-/// @param engine the engine (NULL: the host-only harnesses)
-/// @return the served model id (static storage; "deepseek-v4-flash" with no engine)
+/// @param engine the loaded engine (NULL dies in the server: there is no served model without one, L335; the
+///               host-only test harnesses, built PULSAR_SERVER_TEST, have none and get "(no engine)")
+/// @return the served model id (static storage)
 const char *server_model_id_from_engine(pulsar_engine *engine) {
-    /* the family's answer, fixed at load: a plain read of immutable engine state on the client threads.  No engine
-     * is the host-only harnesses (unit tests, api/sse goldens), which record the default id as before L284. */
-    return engine ? pulsar_engine_served_model_id(engine) : "deepseek-v4-flash";
+    /* the family's answer, fixed at load: a plain read of immutable engine state on the client threads */
+    if (!engine) {
+#ifdef PULSAR_SERVER_TEST
+        return "(no engine)";
+#else
+        pulsar_die("server_model_id_from_engine: no engine, so no served model id");
+#endif
+    }
+    return pulsar_engine_served_model_id(engine);
 }
 
 /// @param s the server

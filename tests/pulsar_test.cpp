@@ -2263,7 +2263,7 @@ static void test_render_cases(void) {
             refused++;
             continue;
         }
-        request_init(&r, REQ_CHAT, 128);
+        test_request_init(&r, REQ_CHAT, 128);
         chat_conversation c;
         memset(&c, 0, sizeof(c));
         const bool ok = (style == API_ANTHROPIC   ? parse_chat_conversation_anthropic
@@ -3307,7 +3307,7 @@ static void test_control_token_suffix(void) {
      * request field the kv_cache continuation sites read */
     {
         request r;
-        request_init(&r, REQ_CHAT, 128);
+        test_request_init(&r, REQ_CHAT, 128);
         r.api = API_RESPONSES;
         r.think_mode = PULSAR_THINK_HIGH;
         r.has_tools = true;
@@ -3373,7 +3373,7 @@ static void test_control_token_suffix(void) {
      * but its DSML framing must stay CONTROL text */
     {
         request r;
-        request_init(&r, REQ_CHAT, 128);
+        test_request_init(&r, REQ_CHAT, 128);
         r.think_mode = PULSAR_THINK_HIGH;
         r.family = server_family_for_format(PULSAR_CHAT_DS4_V41);
         tool_calls calls = {0};
