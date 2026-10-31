@@ -135,7 +135,7 @@ static bool imatrix_collect_layer_batch(
 /// Write one little-endian int32 to the .dat; dies on a short write.
 /// @param fp the file
 /// @param v the value
-void imatrix_write_i32(FILE *fp, int32_t v) {
+static void imatrix_write_i32(FILE *fp, int32_t v) {
     if (fwrite(&v, sizeof(v), 1, fp) != 1) pulsar_die("failed to write imatrix");
 }
 
