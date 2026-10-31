@@ -2128,7 +2128,9 @@ struct pulsar_vocab {
     void vocab_load(const pulsar_model *model);
     /** Release the vocabulary's owned tables. */
     void vocab_free();
-    /** Longest special-token match at `p`. @return true and set token/len on a hit. */
+    /** The special token spelled at `p`: the first of the table (tokenizer.cpp) in its order -- no special's
+     *  spelling is a prefix of another's, so the first match is the only one. @return true and set token/len on
+     *  a hit. */
     /// @param p      NUL-terminated text to match at
     /// @param token  out: the special token's id, on a hit
     /// @param len    out: bytes the match covers, on a hit
