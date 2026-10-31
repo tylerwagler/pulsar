@@ -1,3 +1,5 @@
+/** @file sync_driver.cpp
+ *  @brief L272 P2: the core's sync, the one every family runs by supplying its sync ops. */
 /* sync_driver.cpp -- L272 P2: the core's sync, the one every family runs (L284) by supplying its sync ops.
  *
  * A sync makes the live bank hold exactly `prompt`.  For a family whose state is restored from grid
@@ -37,6 +39,11 @@
 /* The records of `images` whose blocks end at or below `limit` -- the KV's image identity after a prefill
  * stood at `limit`.  A request without images keeps the records below the start (a text extension keeps its
  * prefix's blocks). */
+/// @param s        the session (its live_images rewritten)
+/// @param prompt   the request's prompt
+/// @param images   [n_images] the request's image refs
+/// @param n_images image refs; <= 0 = a text request
+/// @param limit    the position the prefill stood at, in tokens
 static void sync_note_images(pulsar_session *s, const pulsar_tokens *prompt, const pulsar_image_ref *images,
                              int n_images, uint32_t limit) {
     if (n_images <= 0) {
@@ -49,6 +56,12 @@ static void sync_note_images(pulsar_session *s, const pulsar_tokens *prompt, con
 }
 
 /* Does the KV below `G` hold exactly the request's images there -- and is G outside every block? */
+/// @param s        the session
+/// @param prompt   the request's prompt
+/// @param images   [n_images] the request's image refs
+/// @param n_images image refs
+/// @param G        the resume point, in tokens
+/// @return true when the held image identity below G is the request's and no block straddles G
 static bool sync_images_hold_below(const pulsar_session *s, const pulsar_tokens *prompt,
                                    const pulsar_image_ref *images, int n_images, uint32_t G) {
     for (int i = 0; i < n_images; i++) {

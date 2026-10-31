@@ -1,3 +1,5 @@
+/** @file step_driver.h
+ *  @brief The core row-step driver: a family supplies its blocks, the core runs every step. */
 /* step_driver.h -- the core row-step driver (L295 F4): a family supplies its blocks, the core runs every step.
  *
  * What a session operation does to the rows of a step is family-neutral: build the rows (one a bank for a decode,
@@ -48,10 +50,16 @@ typedef enum {
 /** The step rows a forward heads, in logits-row order: logits row i is step row row[i] (L284 #2: a fused step heads
  *  its verify rows, then its prompt runs' last rows).  n > PULSAR_DRIVER_HEADS_MAX is refused. */
 struct pulsar_driver_heads {
+    /// rows headed, <= PULSAR_DRIVER_HEADS_MAX
     uint32_t n = 0;
+    /// [n] step-row index of each logits row, in logits-row order
     uint32_t row[PULSAR_DRIVER_HEADS_MAX] = {};
 };
 /** Step rows [row0, row0 + n). */
+/// @param row0 the first step row headed
+/// @param n    rows headed (n > PULSAR_DRIVER_HEADS_MAX keeps n but fills only the first PULSAR_DRIVER_HEADS_MAX;
+///             the forward refuses it)
+/// @return the head list
 pulsar_driver_heads pulsar_driver_heads_span(uint32_t row0, uint32_t n);
 
 struct pulsar_state_set;
@@ -73,11 +81,19 @@ struct pulsar_driver_state {
     /* L266 step 7: the session's share of the engine's tensor-parallel transport (NULL tp = one GPU): the row
      * all-reduce's stage ticket and the exchange seq, advanced identically on every rank; the vocab gather's own
      * slice. */
+    /// the engine's TP transport, borrowed (NULL = one GPU)
     struct pulsar_tp *tp;
+    /** @var pulsar_driver_state::tp_bulk_dev
+     *  the bulk lane's buffer, device mapping, borrowed from the engine (pulsar_engine::tp_bulk_dev); NULL off TP */
+    /// the registered slab's device mapping, borrowed from the engine (pulsar_engine::tp_slab_dev); NULL off TP
     void *tp_slab_dev, *tp_bulk_dev;
+    /// the row all-reduce's stage ticket: one device u32, the session's own (priced with it), zeroed at create
     pulsar_gpu_tensor *tp_ticket;
+    /// the row all-reduce's exchange seq, advanced in lockstep on every rank
     uint64_t tp_seq;
+    /// the vocab gather's own-slice scratch (pulsar_tp_vocab_own_bytes_for at PULSAR_DRIVER_HEADS_MAX rows), owned
     pulsar_gpu_tensor *tp_vocab_own;
+    /// the vocab gather's seq, advanced in lockstep on every rank
     uint64_t tp_vocab_seq;
     /** L296 N9: the chained-MTP drafter's lane (spec_mtp.h) when the family's ops declare modules, else NULL */
     struct pulsar_mtp_lane *mtp;
@@ -90,10 +106,13 @@ struct pulsar_driver_state {
  *  the ops (the tensors' CONTENTS are what ops write). */
 struct pulsar_driver_step {
     const pulsar_model *model;            ///< tensor_map_base() for the weights
+    /// the family's layer plan (kind[il] / desc[il] per layer): the block dispatch key
     const pulsar_layer_plan *plan;
     struct pulsar_state_set *states;      ///< the session's declared state (state_kinds.h)
     pulsar_driver_state *buf;             ///< the session's driver buffers
+    /// how the step's rows are laid out
     pulsar_step_mode mode;
+    /// rows the step carries, <= pulsar_driver_state::max_rows
     uint32_t n_rows;
     const int32_t *tokens;                ///< [n_rows] host token ids
     const int32_t *pos;                   ///< [n_rows] host positions
@@ -108,6 +127,7 @@ struct pulsar_driver_step {
      *  positions: the verify's runs (one a bank) first, then (L284 #2) the fused step's prompt runs from row n_dec.
      *  n_runs 1 = the classic one-bank chunk, or a one-bank verify; 0 on a DECODE step. */
     uint32_t n_runs;
+    /// [n_runs + 1] row offsets of the runs (see n_runs); not read on a DECODE step (n_runs 0)
     const uint32_t *run_first;
     /** L284 #2: the row-kind boundary.  Rows [0, n_dec) take the decode arms (what decode / verify rows are graded
      *  against), rows [n_dec, n_rows) the prompt arms (the same bytes at every row count, L266). */
@@ -119,10 +139,16 @@ struct pulsar_driver_step {
 /** L284 #2: n_dec for a step -- a DECODE step is all decode rows; a PREFILL step's decode rows are its verify rows
  *  [0, n_verify) and the rest are prompt rows, so a prompt cut anywhere (or behind a verify, the fused step) is
  *  byte-identical to one prefilled whole. */
+/// @param mode     the step's layout
+/// @param n_verify the PREFILL step's verify rows (ignored on DECODE)
+/// @param n_rows   the step's rows
+/// @return the decode-row count, n_dec
 static inline uint32_t pulsar_step_n_dec(pulsar_step_mode mode, uint32_t n_verify, uint32_t n_rows) {
     return mode == PULSAR_STEP_PREFILL ? n_verify : n_rows;
 }
 /** L284 #2: the verify runs of a PREFILL step -- its runs that start before n_dec (each lies wholly inside). */
+/// @param st the step (PREFILL; a DECODE step has n_runs 0)
+/// @return how many of its leading runs are verify runs
 static inline uint32_t pulsar_step_verify_runs(const pulsar_driver_step *st) {
     uint32_t k = 0;
     while (k < st->n_runs && st->run_first[k] < st->n_dec) k++;
@@ -148,6 +174,7 @@ typedef struct pulsar_driver_ops {
     pulsar_driver_step *(*trunk)(pulsar_session *s);
     /** Bytes of scratch arena `arena` (< n_scratch) at max_rows rows and a pool capacity of ctx tokens (0 = none). */
     uint64_t (*scratch_bytes)(uint32_t arena, uint32_t max_rows, uint32_t ctx);
+    /// scratch arenas the family owns (scratch_bytes is asked for arenas [0, n_scratch)), <= PULSAR_DRIVER_SCRATCH_MAX
     uint32_t n_scratch;
     /** tokens -> the step's slots */
     bool (*embed)(const pulsar_driver_step *st);
@@ -202,10 +229,21 @@ typedef struct pulsar_driver_ops {
 
 /** The first thing a forward over `plan` would need that `ops` lacks -- "embed", the block of a layer kind (its
  *  layer in *at_layer), "head" -- or NULL when nothing is missing.  The driver refuses a session with exactly this. */
+/// @param ops      the family's driver ops
+/// @param plan     the layer plan
+/// @param at_layer receives the layer whose block is missing, else UINT32_MAX
+/// @return the missing piece's name ("embed", "block", "head", or "read_ahead_pool" when read_ahead and
+///         read_ahead_pool are not both set or both NULL), or NULL
 const char *pulsar_driver_first_missing(const pulsar_driver_ops *ops, const pulsar_layer_plan *plan,
                                         uint32_t *at_layer);
 /** L266 step 7: a block's tensor-parallel exchange -- the group's sum of the step's partial output rows `y` (f32
  *  [n_rows][width]) in exchange slot `slot` (the layer's; a drafter layer's after the trunk's).  One GPU: nothing. */
+/// @param st    the step (its n_rows rows; its driver buffers carry the transport)
+/// @param slot  the exchange slot
+/// @param y     the partial output, at least n_rows x width f32, summed in place
+/// @param width the row width in floats
+/// @param what  names the exchange in refusals
+/// @return false (said) when the exchange failed; true with no transport
 bool pulsar_driver_tp_allreduce(const pulsar_driver_step *st, uint32_t slot, pulsar_gpu_tensor *y, uint32_t width,
                                 const char *what);
 /** The speculation round's verify target for a driver family (spec_ops.h): the verify is a heads-on-every-row

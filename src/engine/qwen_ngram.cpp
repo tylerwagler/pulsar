@@ -1,3 +1,5 @@
+/** @file qwen_ngram.cpp
+ *  @brief Qwen3.8-Flash-Next PLE n-gram ids (qwen_ngram.h). */
 /* Qwen3.8-Flash-Next PLE n-gram ids (L251 S4) -- see qwen_ngram.h for the
  * definition and why it is exact.  tests/qwen_ngram_test.cpp holds it equal to
  * the source module's `ngram_ids` on the calibration corpus. */

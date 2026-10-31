@@ -1,3 +1,5 @@
+/** @file family_qwen.cpp
+ *  @brief The Qwen4-exp family: config validation, layer plan, weight binding and session state declaration. */
 /* family_qwen.cpp -- the Qwen4-exp family (Qwen3.8-Flash-Next), L251 S1.
  *
  * What is here: config validation against the known shape, the layer plan from
@@ -62,8 +64,14 @@ pulsar_qwen_shape g_qwen_shape = PULSAR_QWEN_SHAPE_FLASH_NEXT;
 
 /* ---- load: config ---------------------------------------------------------- */
 
+/// The config key `k` under the Qwen arch prefix ("qwen4_exp." k), a string literal.
 #define QWEN_KEY(k) PULSAR_QWEN_ARCH "." k
 
+/// Read a required unsigned config key; prints and fails when missing.
+/// @param m the opened model
+/// @param key the full key
+/// @param[out] out the value
+/// @return false when absent or not an unsigned integer
 static bool qcfg_u64(const pulsar_model *m, const char *key, uint64_t *out) {
     if (model_get_u64_compat(m, key, out)) return true;
     fprintf(stderr, "pulsar: %s: required config key %s is missing or not an unsigned integer\n",
@@ -71,6 +79,11 @@ static bool qcfg_u64(const pulsar_model *m, const char *key, uint64_t *out) {
     return false;
 }
 
+/// qcfg_u64, refusing a value past 32 bits.
+/// @param m the opened model
+/// @param key the full key
+/// @param[out] out the value
+/// @return false when absent, not unsigned, or too wide
 static bool qcfg_u32(const pulsar_model *m, const char *key, uint32_t *out) {
     uint64_t v = 0;
     if (!qcfg_u64(m, key, &v)) return false;
@@ -83,6 +96,11 @@ static bool qcfg_u32(const pulsar_model *m, const char *key, uint32_t *out) {
     return true;
 }
 
+/// Read a required numeric config key.
+/// @param m the opened model
+/// @param key the full key
+/// @param[out] out the value
+/// @return false when absent or not a number
 static bool qcfg_f32(const pulsar_model *m, const char *key, float *out) {
     if (model_get_f32_compat(m, key, out)) return true;
     fprintf(stderr, "pulsar: %s: required config key %s is missing or not a number\n",
@@ -91,6 +109,11 @@ static bool qcfg_f32(const pulsar_model *m, const char *key, float *out) {
 }
 
 /* An unsigned-integer array key of exactly n entries (u32 or u64 elements). */
+/// @param m the opened model
+/// @param key the full key
+/// @param[out] out [n] the elements
+/// @param n the required length
+/// @return false when absent, of another type or length, or unreadable
 static bool qcfg_u64_array(const pulsar_model *m, const char *key, uint64_t *out, uint32_t n) {
     pulsar_array_ref arr;
     if (!model_get_array(m, key, &arr) ||
@@ -112,7 +135,14 @@ static bool qcfg_u64_array(const pulsar_model *m, const char *key, uint64_t *out
     return true;
 }
 
+/** @def QCHK_U(field)
+ *  qwen_shape_check: compare one integer field, print and clear `ok` on a mismatch. */
+/** @def QCHK_F(field)
+ *  qwen_shape_check: compare one float field to 1e-6 relative, print and clear `ok` on a mismatch. */
 /* Every field of the loaded shape against the known one, by name. */
+/// @param got the shape read from the artifact
+/// @param want the known profile
+/// @return false (each mismatch printed) when any field differs
 static bool qwen_shape_check(const pulsar_qwen_shape *got, const pulsar_qwen_shape *want) {
     bool ok = true;
 #define QCHK_U(field) do { if (got->field != want->field) { \
@@ -139,6 +169,10 @@ static bool qwen_shape_check(const pulsar_qwen_shape *got, const pulsar_qwen_sha
     return ok;
 }
 
+/// Read every shape field from the artifact's config (the name is the profile's).
+/// @param m the opened model
+/// @param[out] s the shape
+/// @return false (printed) when any required key is missing or invalid
 static bool qwen_read_shape(const pulsar_model *m, pulsar_qwen_shape *s) {
     *s = PULSAR_QWEN_SHAPE_FLASH_NEXT;   /* the name; every number is overwritten below */
     bool ok = true;
@@ -198,6 +232,9 @@ static bool qwen_read_shape(const pulsar_model *m, pulsar_qwen_shape *s) {
 
 /* Any value at all under `key` (number, bool, string): a key this engine does not implement is refused by name,
  * whatever its type. */
+/// @param m the opened model
+/// @param key the full key
+/// @return true when the key holds a value of any type
 static bool qcfg_present(const pulsar_model *m, const char *key) {
     float f;
     uint64_t u;
@@ -215,6 +252,10 @@ static bool qcfg_present(const pulsar_model *m, const char *key) {
  * Anything else refuses: another rope type, and the YaRN keys this engine does not implement (attention_factor,
  * mscale, mscale_all_dim, truncate false) -- a rope the container describes is the rope that runs, or nothing does.
  * Fills s->yarn and the table every QSA call passes (s->qsa_rope). */
+/// @param m the opened model
+/// @param opt the open options (rope_yarn_factor)
+/// @param[in,out] s the shape: yarn, qsa_rope and rope_id are written
+/// @return false (printed) on a rope this engine does not implement
 static bool qwen_read_rope(const pulsar_model *m, const pulsar_engine_options *opt, pulsar_qwen_shape *s) {
     const char *tkey = QWEN_KEY("rope_parameters.rope_type");
     pulsar_str type = {NULL, 0};
@@ -300,6 +341,10 @@ static bool qwen_read_rope(const pulsar_model *m, const pulsar_engine_options *o
 
 /* The plan from `layer_types`, HF's own strings: "linear_attention" is a GDN
  * layer, "full_attention" a QSA layer, anything else is refused. */
+/// @param m the opened model
+/// @param n_layer the shape's layer count
+/// @param[out] plan the layer plan
+/// @return false (printed) on a missing or unknown layer type
 static bool qwen_read_plan(const pulsar_model *m, uint32_t n_layer, pulsar_layer_plan *plan) {
     const char *key = QWEN_KEY("layer_types");
     pulsar_array_ref arr;
@@ -336,10 +381,19 @@ static bool qwen_read_plan(const pulsar_model *m, uint32_t n_layer, pulsar_layer
 
 /* ---- load: weights ---------------------------------------------------------- */
 
+/// The HF name prefix of the text trunk's tensors.
 #define QWEN_TEXT "model.language_model."
 
 /* Bind one tensor by its HF name, checking its logical dims in ne order
  * (the HF shape reversed).  nd dims are checked; missing -> refused. */
+/// @param m the opened model
+/// @param[in,out] ok cleared on any refusal (never set)
+/// @param name the HF tensor name
+/// @param nd dims checked
+/// @param d0 ne[0]
+/// @param d1 ne[1] (when nd >= 2)
+/// @param d2 ne[2] (when nd == 3)
+/// @return the tensor, or NULL when missing
 static pulsar_tensor *qbind(const pulsar_model *m, bool *ok, const char *name,
                             uint32_t nd, uint64_t d0, uint64_t d1 = 0, uint64_t d2 = 0) {
     pulsar_tensor *t = pulsar_tensor_bind(m, PULSAR_QWEN_ARCH, name);   /* L272 P4a: the core's mechanics */
@@ -347,6 +401,13 @@ static pulsar_tensor *qbind(const pulsar_model *m, bool *ok, const char *name,
     return t;
 }
 
+/// Bind one gated-residual unit's tensors under `prefix`.
+/// @param m the opened model
+/// @param[in,out] ok cleared on any refusal (never set)
+/// @param s the shape
+/// @param prefix the unit's name prefix, ending in '.'
+/// @param[out] gr the unit
+/// @param with_inject bind block_inject_weight too (false: the mixers)
 static void qwen_bind_gr(const pulsar_model *m, bool *ok, const pulsar_qwen_shape *s,
                          const char *prefix, pulsar_qwen_gr_weights *gr, bool with_inject) {
     const uint64_t hc = pulsar_qwen_hc_dim(s);
@@ -366,6 +427,10 @@ static void qwen_bind_gr(const pulsar_model *m, bool *ok, const pulsar_qwen_shap
 /* The PLE side tables that HF keeps as int64 buffers: the hash multipliers,
  * and each n-gram head's table size and row offset.  They are config, not
  * weights -- the container carries them as u64 arrays (family_qwen.h s2). */
+/// @param m the opened model
+/// @param s the shape
+/// @param[out] w ple_multipliers / ple_head_vocab / ple_head_offset
+/// @return false (printed) on missing tables or sizes past the engine's caps
 static bool qwen_read_ple_tables(const pulsar_model *m, const pulsar_qwen_shape *s, pulsar_qwen_weights *w) {
     const uint32_t n_heads = (s->ngram_size - 1u) * s->ngram_heads;
     if (s->ngram_size > PULSAR_QWEN_MAX_NGRAM || n_heads > PULSAR_QWEN_MAX_NGRAM_HEADS) {
@@ -386,10 +451,17 @@ static bool qwen_read_ple_tables(const pulsar_model *m, const pulsar_qwen_shape 
  * (family_qwen.h PULSAR_QWEN_TESS_*), dims in ne order against the stack.  The words' per-expert stride is the
  * encoder's (it follows the column rates), so only their expert count is checked; the launcher checks the rest
  * of the geometry at every call. */
+/// The Tessera projection names, by PULSAR_QWEN_TESS_GATE / _UP / _DOWN.
 static const char *const kTessProj[PULSAR_QWEN_TESS_PROJS] = {"gate", "up", "down"};
+/// The Tessera plane names, by PULSAR_QWEN_TESS_* plane id.
 static const char *const kTessPlane[PULSAR_QWEN_TESS_PLANES] = {"words", "table", "init",  "has_init",
                                                                 "wscale", "runs", "bdesc", "geom"};
 
+/// @param m the opened model
+/// @param[in,out] ok cleared on any refusal (never set)
+/// @param s the shape
+/// @param lp the layer's name prefix
+/// @param[out] L moe_tess is filled
 static void qwen_bind_tessera(const pulsar_model *m, bool *ok, const pulsar_qwen_shape *s, const char *lp,
                               pulsar_qwen_layer_weights *L) {
     const uint64_t nE = s->n_expert;
@@ -419,6 +491,15 @@ static void qwen_bind_tessera(const pulsar_model *m, bool *ok, const pulsar_qwen
     }
 }
 
+/// Bind one layer's tensors under `lp` ("model.language_model.layers.<il>." or the MTP layer's "mtp.layers.0.").
+/// @param m the opened model
+/// @param[in,out] ok cleared on any refusal (never set)
+/// @param s the shape
+/// @param kind the layer's kind (GDN or QSA)
+/// @param lp the name prefix, ending in '.'
+/// @param ple bind the PLE tensors (the PLE layer)
+/// @param split bind the routed experts as separate gate / up stacks
+/// @param[out] L the layer
 static void qwen_bind_layer(const pulsar_model *m, bool *ok, const pulsar_qwen_shape *s, pulsar_layer_kind kind,
                             const char *lp, bool ple, bool split, pulsar_qwen_layer_weights *L) {
     const uint64_t E = s->n_embd, hc = pulsar_qwen_hc_dim(s);
@@ -489,6 +570,12 @@ static void qwen_bind_layer(const pulsar_model *m, bool *ok, const pulsar_qwen_s
 /* L251 MTP: the sidecar shard's layer and head-side tensors, bound when the artifact carries
  * mtp.fc_hidden.weight -- then ALL of them or the load refuses (a partial MTP is a broken artifact,
  * not a reason to run without one).  The layer goes to slot n_layer (family_qwen.h). */
+/// @param m the opened model
+/// @param s the shape
+/// @param plan the layer plan (the MTP layer goes to slot n_layer)
+/// @param[in,out] w mtp and layer[n_layer]
+/// @param selected the open selected the MTP drafter
+/// @return false (printed) on a partial or malformed MTP
 static bool qwen_bind_mtp(const pulsar_model *m, const pulsar_qwen_shape *s, const pulsar_layer_plan *plan,
                           pulsar_qwen_weights *w, bool selected) {
     w->mtp.present = selected && model_find_tensor(m, "mtp.fc_hidden.weight") != NULL;
@@ -531,6 +618,13 @@ static bool qwen_bind_mtp(const pulsar_model *m, const pulsar_qwen_shape *s, con
     return true;
 }
 
+/// Bind the trunk (embed, lm_head, the mixer, every layer: experts fused or split per pulsar.expert_gate_up), the PLE tables and the MTP.
+/// @param m the opened model
+/// @param s the shape
+/// @param plan the layer plan
+/// @param[out] w the weights
+/// @param mtp_selected the open selected the MTP drafter (passed to qwen_bind_mtp)
+/// @return false (printed) on any refusal
 static bool qwen_bind_weights(const pulsar_model *m, const pulsar_qwen_shape *s,
                               const pulsar_layer_plan *plan, pulsar_qwen_weights *w, bool mtp_selected) {
     bool ok = true;
@@ -567,6 +661,11 @@ static bool qwen_bind_weights(const pulsar_model *m, const pulsar_qwen_shape *s,
  * unloaded (never staged; its memory stays the KV pool's).  --no-dspark loads neither.  Without --drafter a container
  * holding both runs the block drafter (Tyler 2026-10-20, "dflash2 should be default": it won every width of the L299
  * scoreboard), one holding one runs that one; --drafter mtp | <kind> picks. */
+/// @param e the engine
+/// @param opt the open options (drafter, dspark_disable)
+/// @param[out] use_mtp load the MTP module
+/// @param[out] use_block load the block drafter
+/// @return false (printed) on a selection the container cannot serve
 static bool qwen_select_drafter(pulsar_engine *e, const pulsar_engine_options *opt, bool *use_mtp, bool *use_block) {
     pulsar_model *m = &e->model;
     const char *bk = pulsar_block_drafter_kind_of(m);
@@ -607,6 +706,10 @@ static bool qwen_select_drafter(pulsar_engine *e, const pulsar_engine_options *o
 
 /* L299: the block drafter's declaration and taps (the HC-mean of the streams after each tapped layer's MLP write,
  * qwen_layer), when selected */
+/// @param e the engine
+/// @param s the shape
+/// @param[in,out] w block is allocated and read
+/// @return false (printed) on a declaration that does not fit the target
 static bool qwen_block_read(pulsar_engine *e, const pulsar_qwen_shape *s, pulsar_qwen_weights *w) {
     w->block = (pulsar_block_drafter *)xcalloc(1, sizeof(*w->block));
     pulsar_block_drafter *d = w->block;
@@ -630,6 +733,9 @@ static bool qwen_block_read(pulsar_engine *e, const pulsar_qwen_shape *s, pulsar
 
 /* L299: the block drafter's tensors (role-recorded blocks; the rest of the container binds by name) bound when
  * selected, else declared unloaded */
+/// @param e the engine
+/// @param w the weights (block NULL: unload the drafter's tensors)
+/// @return false on a binding refusal
 static bool qwen_block_bind(pulsar_engine *e, pulsar_qwen_weights *w) {
     const char *kind = pulsar_block_drafter_kind_of(&e->model);
     if (!kind || !kind[0]) return kind != NULL;
@@ -649,6 +755,9 @@ static bool qwen_block_bind(pulsar_engine *e, pulsar_qwen_weights *w) {
 /* The checkpoint's tokenizer.json / generation_config.json, read verbatim from the container
  * directory (L251 S5).  The tokenizer's loader is graded against HF on exactly these files
  * (make qwen-chat-gate), so the family takes them as shipped rather than a re-encoding. */
+/// @param path the file
+/// @param[out] out its bytes
+/// @return false when it cannot be opened or read
 static bool qwen_read_text(const std::string &path, std::string *out) {
     FILE *f = fopen(path.c_str(), "rb");
     if (!f) return false;
@@ -661,6 +770,10 @@ static bool qwen_read_text(const std::string &path, std::string *out) {
     return ok;
 }
 
+/// Load the BPE tokenizer from the container directory's tokenizer.json + generation_config.json.
+/// @param e the engine
+/// @param model_path the container directory, or a file inside it
+/// @return false (printed) when the files are missing or refused
 static bool qwen_load_tokenizer(pulsar_engine *e, const char *model_path) {
     std::string dir = model_path ? model_path : "";
     struct stat st;
@@ -697,6 +810,8 @@ static bool qwen_load_tokenizer(pulsar_engine *e, const char *model_path) {
  * ids' token bytes is recomputed here and a mismatch refuses (it would rank another tokenizer's tokens).  The head
  * itself is gathered on the device at the first MTP head (family_qwen_s4.cpp), or (L288 qwen-exl3-head) is the
  * artifact's mtp.draft_head, whose row count fixes `extra` and whose stated ids must be these. */
+/// @param e the engine
+/// @return false (printed) on a digest mismatch or draft-head ids that disagree
 static bool qwen_draft_vocab(pulsar_engine *e) {
     const pulsar_qwen_shape *s = &g_qwen_shape;
     pulsar_qwen_weights *w = e->qwen_weights;
@@ -765,6 +880,10 @@ static bool qwen_draft_vocab(pulsar_engine *e) {
     return true;
 }
 
+/// The family's load (pulsar_family::load): options, shape, rope, plan, drafter selection, weights, tokenizer, TP.
+/// @param e the engine
+/// @param opt the open options
+/// @return false (printed) on any refusal
 static bool qwen_family_load(pulsar_engine *e, const pulsar_engine_options *opt) {
     /* The options that name a DeepSeek-only feature refuse here, by name,
      * rather than being ignored. */
@@ -898,6 +1017,8 @@ bool pulsar_qwen_tp_load(pulsar_engine *e) {
 
 /* The lane, announced once at open (rule 5): the core driver over Qwen's blocks, and what its table lacks for the
  * plan (a session refuses with exactly that). */
+/// @param e the engine
+/// @return true
 static bool qwen_family_after_gpu(pulsar_engine *e) {
     uint32_t at = 0;
     const char *miss = pulsar_driver_first_missing(e->family->driver, &e->plan, &at);
@@ -912,8 +1033,12 @@ static bool qwen_family_after_gpu(pulsar_engine *e) {
 
 /* ---- engine facts ------------------------------------------------------------- */
 
+/// pulsar_family::logits_width.
+/// @return n_vocab
 static uint32_t qwen_logits_width(const pulsar_engine *) { return g_qwen_shape.n_vocab; }
 /* L272 B15: the drafter the open selected -- the MTP layer, or (L299) the block drafter. */
+/// @param e the engine
+/// @return MTP, BLOCK or NONE
 static pulsar_drafter_kind qwen_drafter(pulsar_engine *e) {
     return e->qwen_weights && e->qwen_weights->mtp.present ? PULSAR_DRAFTER_MTP
            : e->block_drafter                              ? PULSAR_DRAFTER_BLOCK
@@ -921,6 +1046,8 @@ static pulsar_drafter_kind qwen_drafter(pulsar_engine *e) {
 }
 /* The routed experts' precision tier in EXL3's value space (family.h quant_bits): 20 + the highest
  * rate present in half bits.  Qwen admits EXL3 experts only, so the tier is never 2 or 4. */
+/// @param e the engine
+/// @return 20 + the highest half-bit rate, or 0 without EXL3 experts
 static int qwen_quant_bits(pulsar_engine *e) {
     int bits = 0;
     if (!e->qwen_weights) return 0;
@@ -933,14 +1060,26 @@ static int qwen_quant_bits(pulsar_engine *e) {
     }
     return bits;
 }
+/// pulsar_family::model_name.
+/// @return the shape profile's name
 static const char *qwen_model_name(const pulsar_engine *) { return g_qwen_shape.name; }
+/// pulsar_family::served_model_id.
+/// @return "qwen3.8-flash-next"
 static const char *qwen_served_model_id(const pulsar_engine *) { return "qwen3.8-flash-next"; }
+/// pulsar_family::chat_format.
+/// @return PULSAR_CHAT_QWEN
 static pulsar_chat_format qwen_chat_format(const pulsar_engine *) { return PULSAR_CHAT_QWEN; }
 /* Disk-KV compatibility id: 0 and 1 are DeepSeek's two profiles. */
+/// pulsar_family::model_id.
+/// @return 2
 static int qwen_model_id(const pulsar_engine *) { return 2; }
 /* The trained positions, or YaRN's original context x factor (L280) */
 /* L280: the rope's identity (qwen_read_rope): 0 native, a digest of the YaRN numbers */
+/// pulsar_family::rope_id.
+/// @return g_qwen_shape.rope_id
 static uint64_t qwen_rope_id(const pulsar_engine *) { return g_qwen_shape.rope_id; }
+/// pulsar_family::trained_context: max_position, or YaRN's original context x factor.
+/// @return tokens
 static uint64_t qwen_trained_context(const pulsar_engine *) {
     const pulsar_qsa_yarn &y = g_qwen_shape.yarn;
     return y.factor != 0.0 ? (uint64_t)((double)y.orig_ctx * y.factor) : g_qwen_shape.max_position;
@@ -972,12 +1111,19 @@ static uint64_t qwen_trained_context(const pulsar_engine *) {
  * THE PREFILL FRONTIER: a checkpoint is the cold prefill of its tokens only if every row below it was prefilled
  * (decode rows are the decode arms'); the core's prefill_pos[bank] ends the bank's prefill-only history, decode
  * never advances it, and a capture requires bank_pos == G == prefill_pos. */
+/// The resume grid, in tokens (see above).
 #define QWEN_RESUME_GRID 128u
 /* ~118 MB a slot (the GDN recurrent state), so 4 -- not DeepSeek's 16 x ~3.8 MB, which here would be ~1.9 GB a bank
  * (Tyler 2026-10-08: "4"); an edit up to 2 turns back resumes from a slot, not from 0 (the ladder is checkpoint.cpp's). */
+/// Checkpoint slots per bank.
 #define QWEN_CKPT_SLOTS 4u
 
 /* DELTA (L288): apply the kept rows' recurrent updates -- the verify left the state as it found it. */
+/// @param state the layer's recurrent state (all banks)
+/// @param bank the bank
+/// @param rows the verify rows' recorded updates
+/// @param keep rows kept
+/// @return false on a failed launch
 static bool qwen_gdn_commit(void *state, uint32_t bank, const void *rows, uint32_t keep) {
     return pulsar_gdn_commit((float *)state, (int)bank, (const float *)rows, (int)keep,
                              (int)pulsar_qwen_tp(&g_qwen_shape), 0) == 0;
@@ -985,11 +1131,17 @@ static bool qwen_gdn_commit(void *state, uint32_t bank, const void *rows, uint32
 
 /* The n-gram context: a fresh bank's is the reset token (HF resets it at EOS, and a sequence start is a reset); a
  * verify's commit replays the kept tokens over the bank's context before the step. */
+/// @param state the bank's context, ngram_size - 1 ids
 static void qwen_ngram_init(const void *, void *state) {
     int32_t *ctx = (int32_t *)state;
     for (uint32_t i = 0; i + 1u < g_qwen_shape.ngram_size; i++) ctx[i] = (int32_t)g_qwen_shape.eos_id;
 }
 
+/// @param e the engine
+/// @param state the bank's context
+/// @param tokens the kept tokens
+/// @param keep their count
+/// @return pulsar_qwen_s4_ngram_replay's
 static bool qwen_ngram_replay(const void *e, void *state, const int32_t *tokens, uint32_t keep) {
     return pulsar_qwen_s4_ngram_replay(((const pulsar_engine *)e)->qwen_weights, (int32_t *)state, tokens, keep);
 }
@@ -1046,8 +1198,12 @@ void qwen_state_plan(pulsar_engine *e) {
 }
 
 /* A Qwen session's state: the driver's buffers are its base (L295 F4). */
+/// @param s the session
+/// @return its Qwen state
 static pulsar_qwen_state *qwen_st(const pulsar_session *s) { return static_cast<pulsar_qwen_state *>(s->driver); }
 
+/// Free a Qwen session state and its tensors.
+/// @param st the state (NULL is a no-op)
 static void qwen_state_free(pulsar_qwen_state *st) {
     if (!st) return;
     pulsar_gpu_tensor_free(st->streams);
@@ -1066,6 +1222,9 @@ static void qwen_state_free(pulsar_qwen_state *st) {
 /* The family's own session state (the driver's create, step_driver.h; the driver then builds its buffers and the
  * declared state): the step's activation slots, the trunk's step object, and the MTP lane.  Allocates only through
  * the tensor allocators -- the create is also the session's price (session_cost_bytes_banked). */
+/// @param s the session
+/// @param n_banks the bank pool
+/// @return the state, or NULL (printed) on an allocation failure
 static pulsar_driver_state *qwen_create(pulsar_session *s, uint32_t n_banks) {
     pulsar_engine *e = s->engine;
     const pulsar_qwen_shape *sh = &g_qwen_shape;
@@ -1104,13 +1263,20 @@ static pulsar_driver_state *qwen_create(pulsar_session *s, uint32_t n_banks) {
     return st;
 }
 
+/// pulsar_driver_ops::destroy.
+/// @param s the session
 static void qwen_destroy(pulsar_session *s) { qwen_state_free(qwen_st(s)); }
 
 /* the declared state's verify capture exists with a drafter (the MTP layer, or L299 the block drafter) */
+/// @param s the session
+/// @return whether a drafter is loaded
 static bool qwen_verifies(const pulsar_session *s) {
     return s->engine->qwen_weights->mtp.present || s->engine->block_drafter;
 }
 
+/// pulsar_driver_ops::trunk.
+/// @param s the session
+/// @return the trunk's step object
 static pulsar_driver_step *qwen_trunk(pulsar_session *s) { return qwen_st(s)->trunk; }
 
 /* ---- the blocks on the core driver (step_driver.h, L295 F4) ------------------------------------------------------
@@ -1118,6 +1284,8 @@ static pulsar_driver_step *qwen_trunk(pulsar_session *s) { return qwen_st(s)->tr
  * The core driver runs every step (embed, the plan block by block, the head, the drafter's absorb, the banks'
  * positions); Qwen supplies its ops, one block for each of its layer kinds, and its MTP lane. */
 
+/// @param st a core step that is a pulsar_qwen_step
+/// @return it, as one
 static const pulsar_qwen_step *QS(const pulsar_driver_step *st) { return static_cast<const pulsar_qwen_step *>(st); }
 
 /* One layer of THE FORWARD (family_qwen.h): the PLE injection on its layer, the attention side's gated-residual
@@ -1125,6 +1293,10 @@ static const pulsar_qwen_step *QS(const pulsar_driver_step *st) { return static_
  * write.  L266 step 7: under TP a rank's mixer (its heads) and MoE (its experts, rank 0's shared expert) leave a
  * PARTIAL block output in y; the group's sum is the block's -- one exchange each in the layer's slot (the MTP
  * layer's after the trunk's). */
+/// @param st the step
+/// @param il the layer
+/// @param mixer the layer kind's mixer op
+/// @return false at the first op that fails
 static bool qwen_layer(const pulsar_qwen_step *st, uint32_t il, pulsar_qwen_layer_fn mixer) {
     const bool mtp = st->draft_head;   /* the MTP layer's lane */
     bool ok = true;
@@ -1150,16 +1322,45 @@ static bool qwen_layer(const pulsar_qwen_step *st, uint32_t il, pulsar_qwen_laye
     return ok;
 }
 
+/// The GDN layer block.
+/// @param st the core driver's step (a pulsar_qwen_step)
+/// @param il the layer
+/// @return qwen_layer's
 static bool qwen_block_gdn(const pulsar_driver_step *st, uint32_t il) { return qwen_layer(QS(st), il, pulsar_qwen_s2_gdn); }
+/// The QSA layer block.
+/// @param st the core driver's step (a pulsar_qwen_step)
+/// @param il the layer
+/// @return qwen_layer's
 static bool qwen_block_qsa(const pulsar_driver_step *st, uint32_t il) { return qwen_layer(QS(st), il, pulsar_qwen_s3_qsa); }
+/// pulsar_driver_ops::embed.
+/// @param st the core driver's step (a pulsar_qwen_step)
+/// @return pulsar_qwen_s4_embed's
 static bool qwen_embed(const pulsar_driver_step *st) { return pulsar_qwen_s4_embed(QS(st)); }
+/// pulsar_driver_ops::head.
+/// @param st the core driver's step (a pulsar_qwen_step)
+/// @param row0 first step row
+/// @param n rows
+/// @param out0 first logits row
+/// @return pulsar_qwen_s4_head's
 static bool qwen_head(const pulsar_driver_step *st, uint32_t row0, uint32_t n, uint32_t out0) {
     return pulsar_qwen_s4_head(QS(st), row0, n, out0);
 }
+/// pulsar_driver_ops::step_end.
+/// @param st the core driver's step (a pulsar_qwen_step)
+/// @param ok whether the forward completed
+/// @return pulsar_qwen_s4_step_end's
 static bool qwen_step_end(const pulsar_driver_step *st, bool ok) { return pulsar_qwen_s4_step_end(QS(st), ok); }
+/// pulsar_driver_ops::scratch_bytes.
+/// @param arena a pulsar_qwen_op_id
+/// @param max_rows the most rows a step carries
+/// @param ctx the session's context, in tokens
+/// @return bytes
 static uint64_t qwen_scratch_bytes(uint32_t arena, uint32_t max_rows, uint32_t ctx) {
     return pulsar_qwen_s4_scratch_bytes((pulsar_qwen_op_id)arena, &g_qwen_shape, max_rows, ctx);
 }
+/// pulsar_driver_ops::artifact.
+/// @param e the engine
+/// @return the artifact digest
 static uint64_t qwen_artifact(const pulsar_engine *e) { return e->qwen_weights->artifact_digest; }
 
 /* Diagnostic tap: the HC streams after layer il -- `n_hc` x n_embd f32 per row, the same quantity the streamed
@@ -1168,6 +1369,8 @@ static uint64_t qwen_artifact(const pulsar_engine *e) { return e->qwen_weights->
  * layer-correctness test feeds the engine's stream at layer L into the REFERENCE's layer L+1 and compares with the
  * engine's L+1, which isolates a layer's own arithmetic from the error it inherited.  Volume is the caller's problem
  * -- filter with PULSAR_CUDA_GRAPH_DUMP_LAYER/_POS, since the dump helper synchronizes mid-graph. */
+/// @param st the core driver's step (a pulsar_qwen_step)
+/// @param il the layer just run
 static void qwen_dump(const pulsar_driver_step *st, uint32_t il) {
     gpu_graph_debug_dump_hc_tensor("qwen_h", QS(st)->streams, (uint64_t)st->n_rows * pulsar_qwen_hc_dim(&g_qwen_shape),
                                    il, (uint32_t)st->pos[st->n_rows - 1]);
@@ -1176,6 +1379,12 @@ static void qwen_dump(const pulsar_driver_step *st, uint32_t il) {
 /* L268: the step's multi-axis rope positions (pulsar_image_rope3 over each row's bank's image records) -- NULL when
  * no row's bank holds a gridded image block: text positions, the bytes a text step always ran.  Per row, its own
  * (T, H, W) and its indexer block's first token's (pos - 3), which may be an earlier step's. */
+/// @param s the session
+/// @param pos [n] each row's position
+/// @param bank [n] each row's bank
+/// @param n rows
+/// @param[out] out storage, [n][6]
+/// @return out's data, or NULL for text positions
 static const uint32_t *qwen_rope_table(const pulsar_session *s, const int32_t *pos, const int32_t *bank, uint32_t n,
                                        std::vector<uint32_t> *out) {
     bool any = false;
@@ -1195,6 +1404,12 @@ static const uint32_t *qwen_rope_table(const pulsar_session *s, const int32_t *p
 }
 
 /* L268: image rows into the step's streams -- each row in all of them (the expansion follows the substitution) */
+/// @param st the core driver's step (a pulsar_qwen_step)
+/// @param rows the image rows, bf16 [n_rows][n_embd]
+/// @param n_rows rows given
+/// @param row0 first step row they land at
+/// @param n_tokens the step's rows
+/// @return false on a bad range or failed write
 static bool qwen_image_rows(const pulsar_driver_step *st, const uint16_t *rows, uint32_t n_rows, uint32_t row0,
                             uint32_t n_tokens) {
     return pulsar_image_write_stream_rows(QS(st)->streams, rows, n_rows, row0, n_tokens, g_qwen_shape.n_embd,
@@ -1210,8 +1425,11 @@ static bool qwen_image_rows(const pulsar_driver_step *st, const uint16_t *rows, 
 
 /* A draft row's greedy pick (L289): the vocabulary id of the draft head's first maximum and its softmax probability
  * over the draft head. */
+/** A draft row's greedy pick: the draft head's argmax and its softmax confidence. */
 struct qwen_mtp_pick {
+    /// the picked token's vocabulary id; -1 = no pick
     int32_t id = -1;
+    /// the pick's softmax probability over the draft head, in [0, 1]
     float conf = 0.0f;
 };
 
@@ -1220,6 +1438,19 @@ struct qwen_mtp_pick {
  * `decode_rows` (PREFILL only, L288): the rows are runs of any number of banks (one run a bank, consecutive positions)
  * taken as decode rows -- the decode arms, the verify's row kind -- the speculation's absorb of every bank's kept rows
  * in one step; without it a PREFILL step is one bank's prompt rows (a sync chunk's). */
+/// @param s the session
+/// @param mode DECODE or PREFILL
+/// @param cond the conditioning rows
+/// @param tokens [n_rows] x_{p+1}
+/// @param pos [n_rows] positions
+/// @param bank [n_rows] banks
+/// @param n_rows rows
+/// @param head_row0 first headed row
+/// @param head_n headed rows
+/// @param[out] logits_out [head_n][n_draft] f32, or NULL
+/// @param[out] pick [head_n] greedy picks, or NULL
+/// @param decode_rows PREFILL rows taken as decode rows (the absorb)
+/// @return false (printed) on a refusal or failed step
 static bool qwen_mtp_forward(pulsar_session *s, pulsar_step_mode mode, const pulsar_gpu_tensor *cond,
                              const int32_t *tokens, const int32_t *pos, const int32_t *bank, uint32_t n_rows,
                              uint32_t head_row0, uint32_t head_n, float *logits_out, qwen_mtp_pick *pick,
@@ -1298,20 +1529,38 @@ static bool qwen_mtp_forward(pulsar_session *s, pulsar_step_mode mode, const pul
 
 /* ---- the module, declared to the lane (pulsar_mtp_ops) ---- */
 
+/// @param e the engine
+/// @return 1 with the MTP layer loaded, else 0
 static uint32_t qwen_mtp_modules(const pulsar_engine *e) { return e->qwen_weights->mtp.present ? 1u : 0u; }
+/// @return bytes of one conditioning row: n_hc x n_embd bf16
 static uint64_t qwen_mtp_cond_bytes(const pulsar_engine *) {
     return pulsar_qwen_hc_dim(&g_qwen_shape) * PULSAR_QWEN_STREAM_ELT_SIZE;
 }
+/// @param e the engine
+/// @return logits per MTP row (n_draft)
 static uint32_t qwen_mtp_head_width(const pulsar_engine *e) { return e->qwen_weights->n_draft; }
 
 /* the last trunk step's stacks [row0, row0 + n) into dst at off */
+/// @param s the session
+/// @param row0 first row
+/// @param n rows
+/// @param dst destination tensor
+/// @param off byte offset in dst
+/// @return false on a failed copy
 static bool qwen_mtp_trunk_rows(pulsar_session *s, uint32_t row0, uint32_t n, pulsar_gpu_tensor *dst, uint64_t off) {
     const uint64_t hc = qwen_mtp_cond_bytes(s->engine);
     return pulsar_gpu_tensor_copy_async(dst, off, qwen_st(s)->streams, (uint64_t)row0 * hc, (uint64_t)n * hc) != 0;
 }
 
+/// pulsar_mtp_ops::out_rows.
+/// @param s the session
+/// @return the MTP layer's streams
 static pulsar_gpu_tensor *qwen_mtp_out_rows(pulsar_session *s) { return qwen_st(s)->mtp_streams; }
 
+/// pulsar_mtp_ops::forward.
+/// @param s the session
+/// @param m the step's request
+/// @return false (printed) on a refusal or failed step
 static bool qwen_mtp_step(pulsar_session *s, const pulsar_mtp_step *m) {
     if (m->module != 0) {
         fprintf(stderr, "pulsar: %s: MTP module %u of one -- refusing\n", PULSAR_QWEN_ARCH, m->module);
@@ -1327,18 +1576,28 @@ static bool qwen_mtp_step(pulsar_session *s, const pulsar_mtp_step *m) {
 
 /* L270: the MTP's sampled q: its headed rows over the draft vocabulary, each row index mapped to its token id (L302:
  * the device sampler draws from them there). */
+/// @param s the session
+/// @param[out] id_map row index -> token id (draft_ids_dev)
+/// @return the headed logits
 static const pulsar_gpu_tensor *qwen_mtp_q_rows(pulsar_session *s, const pulsar_gpu_tensor **id_map) {
     *id_map = s->engine->qwen_weights->draft_ids_dev;
     return qwen_st(s)->logits;
 }
 
 /* L272 P1: the MTP layer's index stage after the bank's last TRUE row, kept while a chain writes draft rows into it */
+/// @param s the session
+/// @param bank the bank
+/// @return false on a failed copy
 static bool qwen_mtp_stage_save(pulsar_session *s, uint32_t bank) {
     const uint64_t itb = pulsar_qwen_index_tail_bytes(&g_qwen_shape);
     return pulsar_gpu_tensor_copy_async(qwen_st(s)->mtp_stage, (uint64_t)bank * itb,
                                         pulsar_state_tensor(s->states, s->engine->plan.n_layer, PULSAR_QWEN_STATE_IDX_TAIL),
                                         (uint64_t)bank * itb, itb) != 0;
 }
+/// Restore what qwen_mtp_stage_save kept.
+/// @param s the session
+/// @param bank the bank
+/// @return false on a failed copy
 static bool qwen_mtp_stage_restore(pulsar_session *s, uint32_t bank) {
     const uint64_t itb = pulsar_qwen_index_tail_bytes(&g_qwen_shape);
     return pulsar_gpu_tensor_copy_async(pulsar_state_tensor(s->states, s->engine->plan.n_layer, PULSAR_QWEN_STATE_IDX_TAIL),
@@ -1347,6 +1606,11 @@ static bool qwen_mtp_stage_restore(pulsar_session *s, uint32_t bank) {
 
 /* L289: the verify will embed [x, d_1 ..] after the bank's n-gram context: their PLE rows are read into the page cache
  * while the chain runs (each as it is known), so the verify's gather finds them there */
+/// @param s the session
+/// @param bank the bank
+/// @param ids the tokens now known
+/// @param n their count
+/// @param chain_start reset the prefetch context to the bank's n-gram state first
 static void qwen_mtp_prefetch(pulsar_session *s, uint32_t bank, const int32_t *ids, uint32_t n, bool chain_start) {
     int32_t *ctx = qwen_st(s)->mtp_pctx + 2u * bank;
     if (chain_start) {
@@ -1357,6 +1621,7 @@ static void qwen_mtp_prefetch(pulsar_session *s, uint32_t bank, const int32_t *i
     pulsar_qwen_s4_ple_prefetch(s->engine->qwen_weights, ctx, ids, n);
 }
 
+/// The Qwen MTP module, declared to the chained-MTP lane.
 static const pulsar_mtp_ops k_qwen_mtp = {
     /* .pend_decl     = */ PULSAR_QWEN_STATE_MTP_PEND,
     /* .modules       = */ qwen_mtp_modules,
@@ -1404,13 +1669,25 @@ static_assert(PULSAR_QWEN_HEAD_ROWS_MAX == PULSAR_DRIVER_HEADS_MAX, "the lane's 
  * controller at a fixed 4 with a 2.7 ms draft step.  A copy chain (a repeat of the bank's history) runs to
  * depth_max, the verify capture, and does not move the depth.  A session starts at 4 (7: the L288 sweep's best code
  * cell, 97.5 tok/s against 96.2 at 8 and 94.5 at 6). */
+/// The MTP drafter's depth policy (see above).
 static const pulsar_spec_depth_policy k_mtp_depth = {4, 7, 0.0f, 0, 0.0f, 0u, 0u, 1u};
 const pulsar_drafter_ops PULSAR_QWEN_MTP_DRAFTER =
     PULSAR_MTP_DRAFTER_OPS("MTP", 4u, PULSAR_MTP_DRAFT_MAX, 0.7f, &k_mtp_depth);
+/// pulsar_driver_ops::read_ahead.
+/// @param e the engine
+/// @param tag the issuer
+/// @param prompt the prompt's ids
+/// @param from first token
+/// @param to one past the last
+/// @return rows queued
 static uint32_t qwen_read_ahead(const pulsar_engine *e, uint64_t tag, const int32_t *prompt, uint32_t from, uint32_t to) {
     return pulsar_qwen_s4_ple_read_ahead(e->qwen_weights, tag, prompt, from, to);
 }
+/// pulsar_driver_ops::read_ahead_pool.
+/// @param e the engine
+/// @return the PLE pool, or NULL
 static pulsar_engram_io *qwen_read_ahead_pool(const pulsar_engine *e) { return pulsar_qwen_s4_ple_pool(e->qwen_weights); }
+/// Qwen's ops on the core step driver.
 static const pulsar_driver_ops k_qwen_driver = {
     /* .create        = */ qwen_create,
     /* .destroy       = */ qwen_destroy,
@@ -1434,9 +1711,11 @@ static const pulsar_driver_ops k_qwen_driver = {
 };
 static_assert(PULSAR_LAYER_QWEN_GDN == 2 && PULSAR_LAYER_QWEN_QSA == 3, "the block table's slots are the kinds' values");
 
+/// The core sync driver, as Qwen's.
 static const pulsar_sync_ops k_qwen_sync = PULSAR_DRIVER_SYNC_OPS(PULSAR_QWEN_ARCH);
 
 /* L299: the family's own state beside qwen_weights (which the engine's close frees): the block drafter */
+/// @param e the engine
 static void qwen_unload(pulsar_engine *e) {
     if (e->qwen_weights) {
         free(e->qwen_weights->block);
@@ -1444,15 +1723,21 @@ static void qwen_unload(pulsar_engine *e) {
     }
     e->block_drafter = NULL;
 }
+/// Qwen's session forward: the core driver's.
 static const pulsar_family_session_ops k_qwen_session_ops = PULSAR_DRIVER_SESSION_OPS(&k_qwen_sync);
 
 /* The trunk's layers and the MTP layer each take an exchange slot (L266 step 7). */
+/// @param e the engine
+/// @param[out] n_layer exchange slots (trunk + MTP)
+/// @param[out] n_embd all-reduce row width
+/// @param[out] n_vocab vocab
 static void qwen_tp_shape(const pulsar_engine *e, uint32_t *n_layer, uint32_t *n_embd, uint32_t *n_vocab) {
     *n_layer = e->plan.n_layer + (e->qwen_weights && e->qwen_weights->mtp.present ? 1u : 0u);
     *n_embd = g_qwen_shape.n_embd;
     *n_vocab = g_qwen_shape.n_vocab;
 }
 
+/// The Qwen4-exp family.
 const pulsar_family PULSAR_FAMILY_QWEN4_EXP = {
     /* .id           = */ PULSAR_FAMILY_ID_QWEN4_EXP,
     /* .arch         = */ PULSAR_QWEN_ARCH,

@@ -1,3 +1,5 @@
+/** @file spec_mtp.cpp
+ *  @brief The chained-MTP drafter (spec_mtp.h). */
 /* spec_mtp.cpp -- the chained-MTP drafter (spec_mtp.h; L295 F6, L296 N9): the lane a family's declared MTP modules run
  * on -- the lockstep with the trunk, the absorb of a round's kept rows, the draft chains in lockstep, the drafter hooks
  * of the declared state -- behind the speculation round API (session_spec.cpp) and the core driver's verify target
@@ -13,13 +15,24 @@
 
 namespace {
 
+/// @param s the session
+/// @return its MTP lane (pulsar_driver_state::mtp), or NULL when it has no driver or no lane
 pulsar_mtp_lane *LANE(const pulsar_session *s) { return s->driver ? s->driver->mtp : NULL; }
+/// @param s the session
+/// @return its family's arch string, for log lines
 const char *ARCH(const pulsar_session *s) { return s->engine->family->arch; }
 
 /* the module step j of a chain (1-based) runs: one module recursively, N modules each its own step, the last again */
+/// The module a chain's step j runs.
+/// @param l the lane (l->modules >= 1)
+/// @param j the chain step, 1-based
+/// @return the module index, 0-based: j - 1, capped at the last module
 uint32_t chain_module(const pulsar_mtp_lane *l, uint32_t j) { return (j < l->modules ? j : l->modules) - 1u; }
 
 /* the parked rows of every bank (drafter slot n_trunk, the family's pending decl) */
+/// The tensor holding every bank's parked conditioning row.
+/// @param s the session (must have a lane)
+/// @return the state tensor of the family's pend_decl on drafter slot n_trunk (owned by the state set)
 pulsar_gpu_tensor *pend_tensor(const pulsar_session *s) {
     const pulsar_state_set *ss = s->states;
     return pulsar_state_tensor(ss, ss->plan->n_trunk, LANE(s)->ops->pend_decl);
@@ -27,6 +40,10 @@ pulsar_gpu_tensor *pend_tensor(const pulsar_session *s) {
 
 /* One module step; on a failure its rows' banks lose their parked row (their module state has a hole the chain must
  * not read past). */
+/// Run one module step through the family's forward.
+/// @param s the session (must have a lane)
+/// @param m the step
+/// @return true on success; false (said on stderr) after dropping the parked row of every bank in m
 bool step(pulsar_session *s, const pulsar_mtp_step &m) {
     pulsar_mtp_lane *l = LANE(s);
     if (l->ops->forward(s, &m)) return true;
@@ -36,6 +53,16 @@ bool step(pulsar_session *s, const pulsar_mtp_step &m) {
     return false;
 }
 
+/// Build a module step with no headed rows (head_n = 0, pick / logits NULL).
+/// @param module the module to run (< the lane's modules)
+/// @param mode DECODE or PREFILL (pulsar_mtp_step::mode)
+/// @param decode_rows PREFILL rows taken as DECODE rows (pulsar_mtp_step::decode_rows)
+/// @param tok [n] the module's input token per row
+/// @param pos [n] the position each row writes
+/// @param bank [n] the bank of each row
+/// @param n rows in the step
+/// @param cond the conditioning rows, row i at i * cond_bytes
+/// @return the step; the arrays are borrowed, not copied
 pulsar_mtp_step step_of(uint32_t module, pulsar_step_mode mode, bool decode_rows, const int32_t *tok,
                         const int32_t *pos, const int32_t *bank, uint32_t n, const pulsar_gpu_tensor *cond) {
     pulsar_mtp_step m{};
@@ -260,6 +287,14 @@ bool pulsar_mtp_absorb_banked(pulsar_session *s, const uint32_t *rows, const uin
  * draft whose confidence is under tau is its chain's last, so no module step is spent past it.  A row's bytes do not
  * depend on the rows beside it (one row a bank, the decode arms, a per-row pick), so each chain is the one its bank
  * drafts alone. */
+/// @param s the session
+/// @param banks [n] each record's bank
+/// @param rngs [n] each request's stream (read, never advanced)
+/// @param reqs [n] the records, filled in place
+/// @param n records
+/// @param err receives the reason
+/// @param errlen its size
+/// @return false = failed
 static bool mtp_draft_chains(pulsar_session *s, const uint32_t *banks, uint64_t *const *rngs,
                              spec_redraft_req *const *reqs, uint32_t n, char *err, size_t errlen) {
     pulsar_engine *e = s->engine;

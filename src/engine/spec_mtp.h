@@ -1,3 +1,5 @@
+/** @file spec_mtp.h
+ *  @brief The chained-MTP drafter: one drafter plugin for every family whose artifact carries MTP modules. */
 /* spec_mtp.h -- the chained-MTP drafter (L295 F6, L296 N9): one drafter plugin for every family whose artifact carries
  * multi-token-prediction modules, on the core row-step driver (step_driver.h).
  *
@@ -43,7 +45,9 @@ static_assert(PULSAR_MTP_DRAFT_MAX + 1u <= PULSAR_DRIVER_HEADS_MAX, "a bank's ve
 /** One headed row's greedy pick: the vocabulary id of the head's first maximum and its softmax probability (the
  *  draft's confidence). */
 typedef struct {
+    /// The vocabulary id of the head row's first maximum.
     int32_t id;
+    /// Its softmax probability, in [0, 1].
     float conf;
 } pulsar_mtp_pick;
 
@@ -59,6 +63,7 @@ typedef struct {
     const int32_t *tokens;      ///< [n] the token after each conditioning row's: the module's input token
     const int32_t *pos;         ///< [n] the position the row writes (its conditioning row's)
     const int32_t *bank;        ///< [n]
+    /// Rows in the step (the length of tokens / pos / bank).
     uint32_t n;
     const pulsar_gpu_tensor *cond;   ///< the conditioning rows: row i at i * cond_bytes (the lane's)
     uint32_t head_n;            ///< rows [0, head_n) are headed (0 = none)
@@ -92,6 +97,7 @@ typedef struct pulsar_mtp_ops {
     /** Optional.  A chain is about to write draft rows on `bank`'s drafter slot into state position addressing cannot
      *  undo: keep it (Qwen: the index stage); stage_restore puts it back before the bank's next true rows. */
     bool (*stage_save)(pulsar_session *s, uint32_t bank);
+    /** Optional, paired with stage_save: put `bank`'s saved stage back before its next true rows. */
     bool (*stage_restore)(pulsar_session *s, uint32_t bank);
     /** Optional, a hint: ids the next verify of `bank` will embed, in order, as the chain drafts them -- the first
      *  call of a chain (`chain_start`) the carry (and a copy chain's drafts), then each draft (Qwen: the PLE rows'
@@ -110,21 +116,30 @@ typedef struct pulsar_mtp_ops {
 typedef struct {
     float *logits;      ///< host [cap][head_width]
     int32_t *pos;       ///< host [cap]: the position each row wrote (its conditioning row's)
+    /** @var pulsar_mtp_probe::n
+     *  Rows appended so far (<= cap). */
+    /// Rows the logits / pos buffers hold.
     uint32_t cap, n;
 } pulsar_mtp_probe;
 
 /** The lane's per-session state (pulsar_driver_state::mtp; the driver builds it when the family's ops declare
  *  modules). */
 struct pulsar_mtp_lane {
+    /// The family's MTP ops (static; not owned).
     const pulsar_mtp_ops *ops;
+    /// ops->modules(e) at build: the module count the lane drafts with (> 0).
     uint32_t modules;
+    /// Banks the session holds: the length of pend_pos / stage_dirty.
     uint32_t n_banks;
+    /// ops->cond_bytes(e): bytes of one conditioning row.
     uint64_t cond_bytes;
+    /// ops->head_width(e): floats in one headed row's logits.
     uint32_t head_width;
     pulsar_gpu_tensor *cond;    ///< [max_rows] the conditioning rows a module step reads
     uint32_t *pend_pos;         ///< [n_banks] the parked row's position; UINT32_MAX = none
     bool *stage_dirty;          ///< [n_banks] a chain wrote draft rows into the saved stage (stage_save)
     int32_t vtok[PULSAR_DRIVER_HEADS_MAX];   ///< the last verify step's tokens, by step row (pulsar_mtp_note_verify)
+    /// Valid entries of vtok (<= PULSAR_DRIVER_HEADS_MAX).
     uint32_t n_vtok;
     pulsar_mtp_probe *probe;    ///< NULL = off
 };
@@ -132,29 +147,84 @@ struct pulsar_mtp_lane {
 /** The driver's verify step over rows [0, n) is about to run with these tokens (step_driver.cpp): the absorb after
  *  its commit pairs a bank whose row is still parked -- no chain consumed it: the round's first after a sync, or one
  *  whose drafter did not run -- with its run's base token, so the module's state has no hole there. */
+/// @param l the lane
+/// @param tokens [n] the verify step's tokens, by step row
+/// @param n rows (only the first PULSAR_DRIVER_HEADS_MAX are kept)
 static inline void pulsar_mtp_note_verify(pulsar_mtp_lane *l, const int32_t *tokens, uint32_t n) {
     l->n_vtok = n < PULSAR_DRIVER_HEADS_MAX ? n : PULSAR_DRIVER_HEADS_MAX;
     for (uint32_t r = 0; r < l->n_vtok; r++) l->vtok[r] = tokens[r];
 }
 
 /** Build / free the lane (the driver's session create / destroy). */
+/// @param s the session
+/// @param ops the family's MTP ops (static)
+/// @param n_banks banks the session holds
+/// @param max_rows the widest step's rows (the conditioning staging)
+/// @return the lane, freed with pulsar_mtp_lane_free; NULL (said) when the plan's MTP declaration is inconsistent or allocation failed
 pulsar_mtp_lane *pulsar_mtp_lane_create(pulsar_session *s, const pulsar_mtp_ops *ops, uint32_t n_banks,
                                         uint32_t max_rows);
+/// Free a lane from pulsar_mtp_lane_create (NULL: no-op).
+/// @param l the lane
 void pulsar_mtp_lane_free(pulsar_mtp_lane *l);
 
 /** The driver's absorb op (pulsar_driver_ops::absorb) for a family that drafts with its MTP module(s). */
+/// @param s the session
+/// @param mode PREFILL: one bank's run; DECODE: one row a bank
+/// @param tokens [n] the step's tokens
+/// @param pos [n] their positions
+/// @param bank [n] their banks
+/// @param n rows
+/// @param row0 the step row of the first
+/// @param eval the single-row eval (unused here)
+/// @return false = refused or failed (said); true with no lane
 bool pulsar_mtp_absorb(pulsar_session *s, pulsar_step_mode mode, const int32_t *tokens, const int32_t *pos,
                        const int32_t *bank, uint32_t n, uint32_t row0, bool eval);
 
 /** The plan's drafter hooks (pulsar_state_plan::drafter_at / drafter_frontier; ud = the driver state). */
+/// @param ud the driver state
+/// @param bank the bank
+/// @param T the bank's new frontier (tokens)
 void pulsar_mtp_drafter_at(void *ud, uint32_t bank, uint32_t T);
+/// Check that a bank's lane state is at frontier T (not mid-draft), before a payload walks it.
+/// @param ud the driver state
+/// @param bank the bank
+/// @param T the frontier
+/// @param why receives the reason when not
+/// @param whylen its size
+/// @return true when at T (or no lane)
 bool pulsar_mtp_drafter_frontier(void *ud, uint32_t bank, uint32_t T, char *why, size_t whylen);
 
 /** The drafter's functions (PULSAR_MTP_DRAFTER_OPS). */
+/// pulsar_drafter_ops::absorb_banked: the kept rows of the last verify, every bank.
+/// @param s the session
+/// @param rows [n] step rows
+/// @param banks [n] their banks
+/// @param next [n] the token after each
+/// @param n rows
+/// @return false = refused or failed (said)
 bool pulsar_mtp_absorb_banked(pulsar_session *s, const uint32_t *rows, const uint32_t *banks, const int32_t *next,
                               uint32_t n);
+/// pulsar_drafter_ops::draft for the installed bank.
+/// @param s the session
+/// @param next_base the carry
+/// @param features_ready unused by this lane
+/// @param temperature request temperature
+/// @param top_k request top-k
+/// @param top_p request top-p
+/// @param min_p request min-p
+/// @param rng the request's stream
+/// @return drafts kept; 0 on failure (said; the pendings dropped)
 uint32_t pulsar_mtp_draft(pulsar_session *s, int next_base, bool features_ready, float temperature, int top_k,
                           float top_p, float min_p, uint64_t *rng);
+/// pulsar_drafter_ops::draft_batch.
+/// @param s the session
+/// @param rounds [n] the rounds
+/// @param banks [n] their banks
+/// @param rngs [n] their streams
+/// @param n rounds
+/// @param err receives the reason
+/// @param errlen its size
+/// @return 0, or -1 refused
 int pulsar_mtp_draft_batch(pulsar_session *s, pulsar_spec_round **rounds, const uint32_t *banks, uint64_t **rngs,
                            int n, char *err, size_t errlen);
 

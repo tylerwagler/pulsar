@@ -1,3 +1,5 @@
+/** @file model.cpp
+ *  @brief The model container: tensor layout names, the GGUF directory and its metadata readers, mappings. */
 #include "pulsar_engine_internal.h"
 #include "tp/pulsar_tp.h"
 
@@ -14,6 +16,7 @@
  * cutlass_mxfp4_expert_layout for the block-scaled one).  The names are the
  * strings a checkpoint declares, and the native layouts carry their dtype's
  * name because that is what a histogram of a checkpoint should print. */
+/// Tensor layout names <-> PULSAR_TENSOR_* ids (tensor_type_name and its inverse).
 static const struct { const char *name; uint32_t id; } pulsar_layout_names[] = {
     {"f32",            PULSAR_TENSOR_F32},
     {"i32",            PULSAR_TENSOR_I32},
@@ -89,6 +92,9 @@ pulsar_cursor cursor_at(const pulsar_model *m, uint64_t pos) {
 
 
 
+/// @param m the model
+/// @param key a metadata key
+/// @return its entry, or NULL
 static pulsar_kv *model_find_kv(const pulsar_model *m, const char *key) {
     for (uint64_t i = 0; i < m->n_kv; i++) {
         if (pulsar_streq(m->kv[i].key, key)) return &m->kv[i];
@@ -116,6 +122,10 @@ bool model_get_u32(const pulsar_model *m, const char *key, uint32_t *out) {
 
 
 
+/// @param m the model
+/// @param key a UINT64 key
+/// @param[out] out the value
+/// @return false when absent or of another type
 static bool model_get_u64(const pulsar_model *m, const char *key, uint64_t *out) {
     pulsar_kv *kv = model_find_kv(m, key);
     if (!kv || kv->type != PULSAR_META_UINT64) return false;
@@ -200,6 +210,9 @@ bool model_get_array(const pulsar_model *m, const char *key, pulsar_array_ref *o
 
 /* Resident bytes of one read-only mapping (mincore), counted before a release
  * so the engine can say what it gave back. */
+/// @param map the mapping, or NULL
+/// @param size its length
+/// @return resident bytes (0 when unknown)
 static uint64_t model_mapping_resident_bytes(const void *map, uint64_t size) {
     if (!map || size == 0) return 0;
     const long pg = sysconf(_SC_PAGESIZE);
@@ -213,6 +226,10 @@ static uint64_t model_mapping_resident_bytes(const void *map, uint64_t size) {
     return resident * (uint64_t)pg;
 }
 
+/// Drop a mapping's resident pages and the file's page cache (it stays mapped).
+/// @param map the mapping, or NULL
+/// @param size its length
+/// @param fd the file, or -1
 static void model_release_mapping(const void *map, uint64_t size, int fd) {
     if (map && size) (void)madvise((void *)map, (size_t)size, MADV_DONTNEED);
     if (fd >= 0) (void)posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED);
@@ -308,6 +325,8 @@ bool model_open(pulsar_model *m, const char *path, bool gpu_mapping) {
 
 
 
+/// Print `bytes` to stdout as GiB.
+/// @param bytes the size
 static void print_size(uint64_t bytes) {
     const double gib = 1024.0 * 1024.0 * 1024.0;
     printf("%.2f GiB", (double)bytes / gib);
@@ -420,6 +439,10 @@ pulsar_tensor *model_find_tensor(const pulsar_model *m, const char *name) {
 
 
 
+/// qsort order of accelerator_tensor_span: by base, offset, end.
+/// @param a a span
+/// @param b a span
+/// @return <0, 0, >0
 static int accelerator_tensor_span_cmp(const void *a, const void *b) {
     const accelerator_tensor_span *sa = (const accelerator_tensor_span *)a;
     const accelerator_tensor_span *sb = (const accelerator_tensor_span *)b;
@@ -434,6 +457,7 @@ static int accelerator_tensor_span_cmp(const void *a, const void *b) {
 
 
 
+/// @return the widest merged staging span (1 GiB)
 static uint64_t accelerator_cuda_preload_span_bytes(void) {
     /* 1 GiB spans; the env override had no caller (L159 inc 4). */
     return 1024ull * 1048576ull;
@@ -441,6 +465,12 @@ static uint64_t accelerator_cuda_preload_span_bytes(void) {
 
 
 
+/// @param off byte offset
+/// @param bytes length
+/// @param span_offsets [span_count] filter starts
+/// @param span_sizes [span_count] filter lengths
+/// @param span_count filter spans (0 = no filter)
+/// @return true when [off, off + bytes) lies inside one filter span (or no filter / empty range)
 static bool accelerator_span_filter_contains(uint64_t off,
                                              uint64_t bytes,
                                              const uint64_t *span_offsets,
@@ -462,10 +492,16 @@ static bool accelerator_span_filter_contains(uint64_t off,
 
 /* Under TP a rank never stages a stored tensor its plan replaces -- a slice built at open, a routed stack's
  * half, the other rank's experts (tp_slice.cpp marks them; L272 P4b).  One box stages every tensor. */
+/// @param m the model
+/// @param t one of its tensors
+/// @return true when this TP rank's plan replaces it
 static bool model_tensor_unstaged(const pulsar_model *m, const pulsar_tensor *t) {
     return m->tp_n_ranks > 1 && m->tp_unstaged && m->tp_unstaged[t - m->tensors] != 0;
 }
 /* L298: a tensor the open did not select (a drafter the engine does not run) is never staged. */
+/// @param m the model
+/// @param t one of its tensors
+/// @return true when the open did not select it
 static bool model_tensor_unloaded(const pulsar_model *m, const pulsar_tensor *t) {
     return m->unloaded && m->unloaded[t - m->tensors] != 0;
 }
@@ -493,6 +529,14 @@ uint64_t pulsar_model_unstaged_expert_bytes(const pulsar_model *m) {
     return unstaged;
 }
 
+/// Stage the model's tensors to the device as merged spans of the mapping.
+/// @param m the model
+/// @param span_offsets [span_count] filter starts
+/// @param span_sizes [span_count] filter lengths
+/// @param span_count filter spans (0 = every tensor)
+/// @param skip_prefix tensors with this name prefix are skipped, or NULL
+/// @param[out] prepared_out bytes staged, or NULL
+/// @return false (printed) on an out-of-range tensor or a failed device copy
 static bool accelerator_prepare_model_tensor_spans(const pulsar_model *m,
                                                    const uint64_t *span_offsets,
                                                    const uint64_t *span_sizes,
@@ -736,6 +780,10 @@ bool accelerator_prepare_expert_overlay(pulsar_backend backend,
  * entry keeps the overlay file's abs_offset and records the overlay mapping in
  * ext_map/ext_size; consumers resolve the payload via tensor_data()/
  * tensor_map_base(). Returns the number of tensors swapped. */
+/// @param s a string (not NUL-terminated)
+/// @param len its length
+/// @param needle NUL-terminated
+/// @return true when needle occurs in s[0, len)
 static bool str_span_contains(const char *s, size_t len, const char *needle) {
     const size_t nlen = strlen(needle);
     if (len < nlen) return false;

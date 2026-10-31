@@ -1,3 +1,5 @@
+/** @file shape_profiles.cpp
+ *  @brief The DeepSeek V4 shape profiles (0731, V4.1) the loader selects from. */
 #include "pulsar_engine_internal.h"
 
 

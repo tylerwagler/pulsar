@@ -1,3 +1,5 @@
+/** @file spec_dspark.cpp
+ *  @brief DeepSeek V4's verify hooks and the DSpark drafter behind the speculation round API. */
 /* spec_dspark.cpp -- DeepSeek V4's verify hooks and the DSpark drafter behind the speculation round
  * API (L272 P1 S2).  The bodies are session_spec.cpp's as they stood at 8e89f5b0, moved here verbatim
  * behind pulsar_spec_target_ops / pulsar_drafter_ops (spec_ops.h): the frontier snapshot and restore,
@@ -35,6 +37,11 @@ int gpu_graph_spec_dump_active(void) {
  * PULSAR_DSPARK_DUMP=<path>; caps at PULSAR_DSPARK_DUMP_STEPS (default 8) records.
  * Record layout (little-endian): pos i32, first_token i32, then f32 arrays
  * target_h[0..2] (PULSAR_N_EMBD each), main_x (PULSAR_N_EMBD), base0 (PULSAR_N_VOCAB). */
+/// @param g the session's graph
+/// @param pos the step's position
+/// @param first_token the base token
+/// @param refined_ids [n_draft + 1] the chain (carry, then drafts), written after the header
+/// @param n_draft drafts in the step
 static void dspark_dump_step(pulsar_gpu_graph *g, int pos, int first_token,
                              const int32_t *refined_ids, int n_draft) {
     /* Read once (no-hot-path-flags): this is called every spec step, and both
@@ -114,6 +121,8 @@ static void dspark_dump_step(pulsar_gpu_graph *g, int pos, int first_token,
     free(emb); free(voc); free(hc);
 }
 
+/// Clear a frontier snapshot (zeroes it; frees nothing -- the round frees the allocation).
+/// @param f the snapshot (NULL: no-op)
 static void spec_frontier_free(pulsar_spec_frontier *f) {
     if (!f) return;
     memset(f, 0, sizeof(*f));
@@ -137,6 +146,8 @@ static void spec_frontier_free(pulsar_spec_frontier *f) {
  * either prepare() below was attempted, so a single transient failure latched
  * the degraded state forever with nothing logged and no way back.  prepare()
  * only builds descriptor tables, so retrying is cheap. */
+/// @param g the session's graph
+/// @return false (flag left clear, retried next snapshot) on failure
 static bool spec_frontier_copy_tables_init(pulsar_gpu_graph *g) {
     if (g->spec_frontier_copy_init) return true;
     pulsar_gpu_tensor *dst[PULSAR_MAX_LAYER * 4];
@@ -194,6 +205,10 @@ static bool spec_frontier_copy_tables_init(pulsar_gpu_graph *g) {
     return true;
 }
 
+/// Snapshot the installed bank's recurrent frontier state into f (one batched copy).
+/// @param f receives the snapshot
+/// @param s the session
+/// @return false = failed (f cleared)
 static bool spec_frontier_snapshot(pulsar_spec_frontier *f, pulsar_session *s) {
     memset(f, 0, sizeof(*f));
     pulsar_gpu_graph *g = s->graph;
@@ -215,6 +230,10 @@ static bool spec_frontier_snapshot(pulsar_spec_frontier *f, pulsar_session *s) {
     return false;
 }
 
+/// Put a frontier snapshot back on the installed bank (one batched copy).
+/// @param f the snapshot
+/// @param s the session
+/// @return false = failed
 static bool spec_frontier_restore(pulsar_spec_frontier *f, pulsar_session *s) {
     pulsar_gpu_graph *g = s->graph;
     /* The tables cache the CURRENT bank's state pointers and
@@ -242,6 +261,10 @@ static bool spec_frontier_restore(pulsar_spec_frontier *f, pulsar_session *s) {
 /* Fused-loop helper: make batch row `row`'s captured anchor hidden the current
  * drafter conditioning (target_h -> main_x) and seed one drafter-KV row from it.
  * Mirrors the reference invariant "drafter KV row j = f(hidden at position j)". */
+/// pulsar_drafter_ops::absorb.
+/// @param s the session
+/// @param row the committed batch row
+/// @return false = refused
 static bool dspark_absorb(pulsar_session *s, uint32_t row, int32_t /*next: DSpark conditions on the row's hidden alone*/) {
     pulsar_gpu_graph *g = s->graph;
     pulsar_engine *e = s->engine;
@@ -266,10 +289,16 @@ static bool dspark_absorb(pulsar_session *s, uint32_t row, int32_t /*next: DSpar
  * the TARGET's first shard, because the drafter is aliased to the target by
  * value) resolves every drafter weight against the wrong bytes.  Each tensor
  * names its own mapping, exactly as in the target. */
+/// @param e the engine
+/// @param t a drafter tensor
+/// @return the base of the mapping holding it
 static inline const void *dspark_map(const pulsar_engine *e, const pulsar_tensor *t) {
     return tensor_map_base(&e->dspark_model, t);
 }
 
+/// @param e the engine
+/// @param t a drafter tensor
+/// @return the size of that mapping, bytes
 static inline uint64_t dspark_map_size(const pulsar_engine *e, const pulsar_tensor *t) {
     return tensor_map_size(&e->dspark_model, t);
 }
@@ -286,6 +315,15 @@ static inline uint64_t dspark_map_size(const pulsar_engine *e, const pulsar_tens
  * confidence scoring and DO NOT read them back -- dspark_harvest reads them at the next consumer, so the
  * caller's token emission overlaps the drafter's GPU time; the record then carries no ids, no confidences
  * and keep = n_draft. */
+/// @param s the session
+/// @param qs [n_sel] the records, greedy first; filled in place
+/// @param banks [n_sel] each record's bank, or NULL for the installed bank's classic forward
+/// @param rngs [n_sel] each request's stream
+/// @param n_sel records
+/// @param defer launch without reading back (dspark_harvest reads)
+/// @param err receives the reason on failure
+/// @param errlen its size
+/// @return 0, or -1
 static int dspark_draft_group(pulsar_session *s, spec_redraft_req *const *qs, const uint32_t *banks,
                               uint64_t *const *rngs, int n_sel, bool defer, char *err, size_t errlen) {
     PULSAR_NVTX("redraft group");
@@ -517,6 +555,15 @@ static int dspark_draft_group(pulsar_session *s, spec_redraft_req *const *qs, co
 
 /* The single lane's draft: one record through the drafting pass, stamped into the installed bank's
  * pendings -- or, deferred (L108 P2), the in-flight chain marked for dspark_harvest. */
+/// pulsar_drafter_ops::draft.
+/// @param s the session
+/// @param next_base the carry
+/// @param temperature request temperature
+/// @param top_k request top-k
+/// @param top_p request top-p
+/// @param min_p request min-p
+/// @param rng the request's stream
+/// @return drafts kept
 static uint32_t dspark_draft(pulsar_session *s, int next_base, bool, float temperature, int top_k, float top_p,
                              float min_p, uint64_t *rng) {
     spec_redraft_req rec;
@@ -551,6 +598,8 @@ static uint32_t dspark_draft(pulsar_session *s, int next_base, bool, float tempe
 /* L108 P2: lazy completion of a deferred greedy chain: the ids and the confidences read back, the stop rule
  * applied.  A failed readback drops the chain (0 pendings, the next step is a plain forward) and says so --
  * never an untrimmed keep with -1 conf fed to the controller (L190 D4). */
+/// pulsar_drafter_ops::harvest.
+/// @param s the session
 static void dspark_harvest(pulsar_session *s) {
     if (!s->spec.dspark_chain_unharvested) return;
     s->spec.dspark_chain_unharvested = false;
@@ -586,6 +635,9 @@ static void dspark_harvest(pulsar_session *s) {
 }
 
 /* The shared verify keeps each row's drafter anchor and Stage-B state inputs (0 = disarm after it). */
+/// pulsar_spec_target_ops::arm_verify.
+/// @param s the session
+/// @param n_rows rows to keep (0 = disarm)
 static void ds4_arm_verify(pulsar_session *s, uint32_t n_rows) {
     pulsar_gpu_graph *g = s->graph;
     g->dspark_capture_batch_n = n_rows;
@@ -595,6 +647,12 @@ static void ds4_arm_verify(pulsar_session *s, uint32_t n_rows) {
 /* The single lane's verify: ONE batched target forward over the round's rows with the drafter's anchor capture and
  * the Stage-B state saves armed, every row headed into spec_logits -- the session's step rows, which the walk reads on
  * the device (L302). */
+/// pulsar_spec_target_ops::verify_single.
+/// @param s the session
+/// @param r the round
+/// @param err receives the reason on failure
+/// @param errlen its size
+/// @return false = failed
 static bool ds4_verify_single(pulsar_session *s, pulsar_spec_round *r, char *err, size_t errlen) {
     pulsar_engine *e = s->engine;
     pulsar_gpu_graph *g = s->graph;
@@ -619,6 +677,11 @@ static bool ds4_verify_single(pulsar_session *s, pulsar_spec_round *r, char *err
  * Without this the window starts empty (or, before the invalidate fix,
  * stale from the previous request), and the drafter is near-useless
  * without a valid window (masked-window eval: 4.7% vs 86% top-1). */
+/// pulsar_drafter_ops::prime.
+/// @param s the session
+/// @param err receives the reason on failure
+/// @param errlen its size
+/// @return 0, or -1 refused
 static int dspark_prime(pulsar_session *s, char *err, size_t errlen) {
     pulsar_engine *e = s->engine;
     pulsar_gpu_graph *g = s->graph;
@@ -660,6 +723,15 @@ static int dspark_prime(pulsar_session *s, char *err, size_t errlen) {
 }
 
 
+/// pulsar_drafter_ops::draft_batch.
+/// @param s the session
+/// @param rounds [n] the rounds
+/// @param banks [n] their banks
+/// @param rngs [n] their streams
+/// @param n rounds
+/// @param err receives the reason on failure
+/// @param errlen its size
+/// @return 0, or -1
 static int dspark_draft_batch(pulsar_session *s, pulsar_spec_round **rounds,
                                       const uint32_t *banks, uint64_t **rngs, int n,
                                       char *err, size_t errlen) {
@@ -729,6 +801,12 @@ static int dspark_draft_batch(pulsar_session *s, pulsar_spec_round **rounds,
 
 /* ---- the target hooks ------------------------------------------------------------------------- */
 
+/// pulsar_spec_target_ops::snapshot (r->snap allocated on first use).
+/// @param s the session
+/// @param r the round
+/// @param err receives the reason on failure
+/// @param errlen its size
+/// @return false = failed
 static bool ds4_spec_snapshot(pulsar_session *s, pulsar_spec_round *r, char *err, size_t errlen) {
     pulsar_spec_frontier *f = (pulsar_spec_frontier *)r->snap;
     if (!f) f = (pulsar_spec_frontier *)xmalloc(sizeof *f);
@@ -738,10 +816,16 @@ static bool ds4_spec_snapshot(pulsar_session *s, pulsar_spec_round *r, char *err
     return false;
 }
 
+/// pulsar_spec_target_ops::restore.
+/// @param s the session
+/// @param r the round
+/// @return false = no snapshot or failed
 static bool ds4_spec_restore(pulsar_session *s, pulsar_spec_round *r) {
     return r->snap && spec_frontier_restore((pulsar_spec_frontier *)r->snap, s);
 }
 
+/// pulsar_spec_target_ops::release.
+/// @param r the round
 static void ds4_spec_release(pulsar_session *, pulsar_spec_round *r) {
     if (r->snap) spec_frontier_free((pulsar_spec_frontier *)r->snap);
 }
@@ -751,6 +835,12 @@ static void ds4_spec_release(pulsar_session *, pulsar_spec_round *r) {
  * during the verify batch (bit-identical: same update kernels, same rows, same order).  Raw KV and
  * comp-cache rows are position-addressed and already correct; counters are set by formula; the
  * drafter's rows absorb from the batch capture afterwards (the core). */
+/// pulsar_spec_target_ops::commit.
+/// @param s the session
+/// @param r the round
+/// @param commit drafts committed
+/// @param row0 the round's first row in the verify capture
+/// @return false = failed
 static bool ds4_commit(pulsar_session *s, pulsar_spec_round *r, uint32_t commit, uint32_t row0) {
     pulsar_engine *e = s->engine;
     /* a full accept: the verify advanced the target state by exactly the committed tokens */
@@ -762,6 +852,9 @@ static bool ds4_commit(pulsar_session *s, pulsar_spec_round *r, uint32_t commit,
 
 /* The L155 trim: rewind() clamps the compressor frontier and drops the carry and the drafter window
  * (the carry was conditioned on positions that no longer exist). */
+/// pulsar_spec_target_ops::cut.
+/// @param s the session
+/// @param pos the position to rewind to
 static void ds4_cut(pulsar_session *s, int pos) { s->rewind(pos); }
 
 const pulsar_spec_target_ops k_ds4_spec_target = {
@@ -776,6 +869,12 @@ const pulsar_spec_target_ops k_ds4_spec_target = {
 
 /* ---- the DSpark drafter -------------------------------------------------------------------------- */
 
+/// pulsar_drafter_ops::absorb_banked.
+/// @param s the session
+/// @param rows [n] committed rows
+/// @param banks [n] their banks
+/// @param n rows
+/// @return false = refused
 static bool dspark_absorb_banked(pulsar_session *s, const uint32_t *rows, const uint32_t *banks, const int32_t *,
                                  uint32_t n) {
     pulsar_engine *e = s->engine;
@@ -788,6 +887,7 @@ static bool dspark_absorb_banked(pulsar_session *s, const uint32_t *rows, const 
  * even transient excursions there are purchased losses; re-tune only with a drafter retrained at a wider block
  * (L092).  UP needs a tail confidence >= 0.70 (calibrated >= 0.82 accept); the v3 veto
  * only at depth 5 with a >= 0.90 tail; the v4/v5 8-round cooldown after a down within 2 rounds of an up. */
+/// DSpark's adaptive depth policy (pulsar_drafter_ops::adapt).
 static const pulsar_spec_depth_policy k_dspark_depth = {2, 5, 0.70f, 5, 0.90f, 8u, 2u, 0u};
 
 /* DSpark's numbers.

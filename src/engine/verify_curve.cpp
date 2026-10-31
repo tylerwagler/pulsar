@@ -1,3 +1,5 @@
+/** @file verify_curve.cpp
+ *  @brief L301: the spec lane's verify pick, the verify cost curve and the prompt-chunk cost fit. */
 /* L301 -- the spec lane's verify pick: ONE rule for how many draft rows a round verifies, every drafter.
  *
  * After DeepInfer's MTPVarlen (csrc/engine/mtp_varlen.hpp, Apache-2.0), ported in design, not in code.  A round
@@ -74,8 +76,13 @@ namespace {
 
 /* A median over a multiset that changes one sample at a time: the smaller half in `lo`, the larger in `hi`,
  * |lo| == |hi| or |lo| == |hi| + 1. */
+/// A running median over a multiset changed one sample at a time (two balanced halves).
 struct median_set {
+    /** @var median_set::hi
+     *  The larger half. */
+    /// lo: the smaller half (it holds the median when the count is odd).
     std::multiset<double> lo, hi;
+    /// Restore |lo| == |hi| or |lo| == |hi| + 1 by moving one sample across.
     void rebalance() {
         if (lo.size() > hi.size() + 1) {
             hi.insert(*lo.rbegin());
@@ -85,28 +92,45 @@ struct median_set {
             hi.erase(hi.begin());
         }
     }
+    /// Add one sample.
+    /// @param v the sample
     void insert(double v) {
         if (lo.empty() || v <= *lo.rbegin()) lo.insert(v);
         else hi.insert(v);
         rebalance();
     }
+    /// Remove one copy of a sample previously inserted (no-op if absent).
+    /// @param v the sample
     void erase(double v) {
         auto it = lo.find(v);
         if (it != lo.end()) lo.erase(it);
         else if ((it = hi.find(v)) != hi.end()) hi.erase(it);
         rebalance();
     }
+    /// @return the number of samples held
     size_t size() const { return lo.size() + hi.size(); }
+    /// The median; the set must be non-empty.
+    /// @return the middle sample, or the mean of the two middle ones for an even count
     double get() const { return lo.size() == hi.size() ? 0.5 * (*lo.rbegin() + *hi.begin()) : *lo.rbegin(); }
 };
 
 /* The median of the last VC_RECENT observations, a number from VC_RECENT_MIN of them. */
+/// Observations a recent_median holds.
 #define VC_RECENT 9u
+/// Observations before a recent_median has a value.
 #define VC_RECENT_MIN 5u
+/// The median of the last VC_RECENT observations; valid from VC_RECENT_MIN.
 struct recent_median {
+    /// Ring of the last VC_RECENT observations (ms).
     double v[VC_RECENT];
+    /** @var recent_median::next
+     *  The ring slot the next observation overwrites. */
+    /// n: observations held (<= VC_RECENT).
     uint32_t n, next;
+    /// The median of the held observations, recomputed on every add().
     double med;
+    /// Record one observation and recompute the median.
+    /// @param x the observation (ms)
     void add(double x) {
         v[next] = x;
         next = (next + 1u) % VC_RECENT;
@@ -119,6 +143,8 @@ struct recent_median {
         }
         med = n % 2u ? s[n / 2u] : 0.5 * (s[n / 2u - 1u] + s[n / 2u]);
     }
+    /// @param out receives the median when there is one
+    /// @return false (out untouched) with fewer than VC_RECENT_MIN observations
     bool get(double *out) const {
         if (n < VC_RECENT_MIN) return false;
         *out = med;
@@ -128,12 +154,22 @@ struct recent_median {
 
 /* The residual per row of the forward against the profile: the median per row count over a window of rounds, then
  * the median of those (counts with VC_SLOPE_MIN samples or more, each count one vote). */
+/// Rounds in the residual slope's window.
 #define VC_SLOPE_WINDOW 5000u
+/// Samples a row count needs to vote in the slope.
 #define VC_SLOPE_MIN 10u
+/// The forward's residual per row against the profile: median of per-row-count medians over a sliding window.
 struct residual_slope {
+    /// The window: (row count, residual ms per row) of the last VC_SLOPE_WINDOW rounds, oldest first.
     std::deque<std::pair<uint32_t, double>> win;
+    /// The window's residuals by verify row count.
     std::map<uint32_t, median_set> by_rows;
+    /// The per-row-count medians of the counts with >= VC_SLOPE_MIN samples, one vote each.
     median_set medians;
+    /// Add or remove one residual of a row count, keeping `medians` in step with its count's median.
+    /// @param rows the round's verify row count
+    /// @param v the residual (ms per row)
+    /// @param insert true to add the sample, false to remove it
     void update(uint32_t rows, double v, bool insert) {
         median_set &m = by_rows[rows];
         if (m.size() >= VC_SLOPE_MIN) medians.erase(m.get());
@@ -142,6 +178,9 @@ struct residual_slope {
         if (m.size() >= VC_SLOPE_MIN) medians.insert(m.get());
         else if (m.size() == 0) by_rows.erase(rows);
     }
+    /// Push one round's residual, evicting the oldest once the window is full.
+    /// @param rows the round's verify row count
+    /// @param v the residual (ms per row)
     void add(uint32_t rows, double v) {
         if (win.size() == VC_SLOPE_WINDOW) {
             update(win.front().first, win.front().second, false);
@@ -150,6 +189,8 @@ struct residual_slope {
         win.emplace_back(rows, v);
         update(rows, v, true);
     }
+    /// @param out receives the median of the per-row-count medians
+    /// @return false (out untouched) while no row count has VC_SLOPE_MIN samples
     bool get(double *out) const {
         if (medians.size() == 0) return false;
         *out = medians.get();
@@ -160,16 +201,26 @@ struct residual_slope {
 }  // namespace
 
 /* The engine's verify curve (pulsar_engine::verify_curve; NULL = none). */
+/// The measured verify cost curve round_ms(n, r) = base[r] + max(0, slope) * r + host(n) + draft(n) (file comment).
+/// Built by pulsar_verify_curve_new, freed by pulsar_verify_curve_free; held by the engine (NULL = no curve).
 struct pulsar_verify_curve {
     uint32_t rows_max;                              ///< the widest verify step (the family's fused_heads_max)
     double base_ms[PULSAR_SPEC_LOGITS_ROWS + 1];    ///< [r]: the profiled r-row verify forward, ms ([0] unused)
     uint64_t key;                                   ///< the cache key it was profiled / loaded under
     bool cached;                                    ///< loaded from the cache (else profiled this process)
+    /// The online residual per row of the served forwards against base_ms (applied as max(0, slope)).
     residual_slope slope;
+    /** @var pulsar_verify_curve::host_any
+     *  host(n) at any bank count (the fallback while host[n] has too few). */
+    /// host[n]: the round's host wall outside the forward (planning, walk, emission), ms, at n banks.
     recent_median host[PULSAR_SPEC_LOGITS_ROWS + 1], host_any;
+    /** @var pulsar_verify_curve::draft_any
+     *  draft(n) at any bank count (the fallback while draft[n] has too few). */
+    /// draft[n]: the next round's drafting wall, ms, at n banks.
     recent_median draft[PULSAR_SPEC_LOGITS_ROWS + 1], draft_any;
     uint64_t observed;                              ///< rounds observed
     double ann_slope;                               ///< the residual last announced (rule 5)
+    /// ann_slope holds an announced value.
     bool ann_slope_valid;
     uint64_t ann_at;                                ///< `observed` at that announcement
 };
@@ -184,36 +235,54 @@ pulsar_verify_curve *pulsar_verify_curve_new(uint32_t rows_max, const double *ba
 
 void pulsar_verify_curve_free(pulsar_verify_curve *c) { delete c; }
 
+/// The median of a wall outside the forward at n banks, else at any n.
+/// @param by_n [PULSAR_SPEC_LOGITS_ROWS + 1] the per-bank-count medians
+/// @param any the any-count median
+/// @param n banks
+/// @return ms; 0 while neither has enough observations
 static double vc_recent(const recent_median *by_n, const recent_median *any, uint32_t n) {
     double v = 0.0;
     if (n <= PULSAR_SPEC_LOGITS_ROWS && by_n[n].get(&v)) return v;
     return any->get(&v) ? v : 0.0;
 }
 
+/// @param c the curve
+/// @return the residual slope in force, ms per row: max(0, slope), 0 while unmeasured
 static double vc_slope(const pulsar_verify_curve *c) {
     double v = 0.0;
     return c->slope.get(&v) && v > 0.0 ? v : 0.0;
 }
 
 /* The verify forward of `rows` rows: the profile + the correction (rows past the profile clamp to its widest). */
+/// @param c the curve
+/// @param rows verify rows (>= 1)
+/// @return ms
 static double vc_forward_ms(const pulsar_verify_curve *c, uint32_t rows) {
     if (rows > c->rows_max) rows = c->rows_max;
     return c->base_ms[rows] + vc_slope(c) * (double)rows;
 }
 
 /* round_ms(n, rows): see the head of the file.  rows in [1, rows_max]. */
+/// @param c the curve
+/// @param n banks (base rows)
+/// @param rows verify rows
+/// @return ms
 static double vc_round_ms(const pulsar_verify_curve *c, uint32_t n, uint32_t rows) {
     return vc_forward_ms(c, rows) + vc_recent(c->host, &c->host_any, n) + vc_recent(c->draft, &c->draft_any, n);
 }
 
 /* The curve the server's pick reads: the engine's -- on a tensor-parallel group only the leader holds one, and its
  * choice crosses the wire (L315). */
+/// @param e the engine (NULL allowed)
+/// @return its curve, or NULL
 static const pulsar_verify_curve *vc_leader(const pulsar_engine *e) {
     return e ? e->verify_curve : NULL;
 }
 
 /* The curve a pick every rank makes for itself may read (a drafter's keep, the lockstep continuation): none on a
  * tensor-parallel group, whose ranks must draft alike and only one of which holds a curve. */
+/// @param e the engine (NULL allowed)
+/// @return its curve, or NULL on a TP group or with none
 static const pulsar_verify_curve *vc_ranked(const pulsar_engine *e) {
     return e && !e->tp ? e->verify_curve : NULL;
 }
@@ -221,6 +290,15 @@ static const pulsar_verify_curve *vc_ranked(const pulsar_engine *e) {
 /* The pick over survivals sorted descending: T, the drafts verified beside the n base rows, within cap_rows rows;
  * `extra_ms` is added to every candidate's round (a drafter step still to be paid).  *ratio = the best tokens/ms
  * (0 with no curve). */
+/// The definition of pulsar_engine_internal.h's pulsar_verify_curve_pick (its contract is there).
+/// @param c         the curve, or NULL
+/// @param n         base rows
+/// @param surv      m draft survivals, sorted descending
+/// @param m         drafts offered
+/// @param cap_rows  the row cap
+/// @param extra_ms  ms added to every candidate round
+/// @param ratio     out: the best tokens per ms
+/// @return drafts to verify.
 uint32_t pulsar_verify_curve_pick(const pulsar_verify_curve *c, uint32_t n, const float *surv, uint32_t m,
                                   uint32_t cap_rows, double extra_ms, double *ratio) {
     *ratio = 0.0;
@@ -259,6 +337,8 @@ double pulsar_engine_verify_round_ms(const pulsar_engine *e, uint32_t n_seqs, ui
 
 /* A draft's survival from its chain's confidences: a confidence below 0 is none (a drafter without a head, the
  * stop rule off) and counts as 1 -- the draft is ranked as sure, as DeepInfer pads a chain with no rates. */
+/// @param c a draft confidence (negative = none)
+/// @return c, or 1 for none
 static inline float vc_conf(float c) { return c < 0.0f ? 1.0f : c; }
 
 void pulsar_spec_keep_picked(const pulsar_session *s, uint32_t n_chains, spec_redraft_req *const *qs, uint32_t nq) {
@@ -282,6 +362,18 @@ void pulsar_spec_keep_picked(const pulsar_session *s, uint32_t n_chains, spec_re
     for (uint32_t t = 0; t < T; t++) qs[c[t].q]->keep++;
 }
 
+/// The definition of pulsar_engine_internal.h's pulsar_verify_chain_pick (its contract is there).
+/// @param c          the curve
+/// @param step       the drafter's step cost
+/// @param cap        the row cap
+/// @param n_chains   chains
+/// @param drafted    survivals of the drafts already made
+/// @param n_drafted  entries in `drafted`
+/// @param run        each live chain's survival so far
+/// @param n_live     live chains
+/// @param spent_ms   drafting time already spent this round
+/// @param go         out: whether another lockstep step pays
+/// @return the drafts the verify should carry.
 uint32_t pulsar_verify_chain_pick(const pulsar_verify_curve *c, const pulsar_lane_cost *step, uint32_t cap,
                                   uint32_t n_chains, const float *drafted, uint32_t n_drafted, const float *run,
                                   uint32_t n_live, double spent_ms, bool *go) {
@@ -373,6 +465,9 @@ void pulsar_engine_verify_curve_observe(pulsar_engine *e, uint32_t n_seqs, uint3
     }
 }
 
+/// A snapshot of the engine's verify curve for metrics (pulsar.h).
+/// @param e the engine (NULL allowed)
+/// @param out receives the view; zeroed when there is no curve
 void pulsar_engine_verify_curve_view(const pulsar_engine *e, pulsar_verify_curve_view *out) {
     memset(out, 0, sizeof *out);
     const pulsar_verify_curve *c = e ? e->verify_curve : NULL;
@@ -396,6 +491,9 @@ static void pf_announce(const pulsar_prefill_cost_fit *f, const char *why);   /*
 
 /* What a profile depends on: the container (and an external drafter's), the drafter, the widest step, the bank pool
  * and context the session was built with, and the build that runs the kernels. */
+/// @param s the session
+/// @param build_id the build's id string (NULL = "")
+/// @return the FNV-1a cache key
 static uint64_t vc_key(const pulsar_session *s, const char *build_id) {
     const pulsar_engine *e = s->engine;
     uint64_t h = 0xcbf29ce484222325ull;
@@ -433,8 +531,15 @@ static uint64_t vc_key(const pulsar_session *s, const char *build_id) {
 }
 
 /* A cached curve older than this is profiled again (a driver or clock change the key cannot see). */
+/// A cached curve's lifetime, seconds (7 days).
 #define VC_CACHE_TTL_S (7 * 24 * 3600)
 
+/// Read a cached curve; any mismatch (TTL, version, key, row count, a bad value) is a miss.
+/// @param path the cache file
+/// @param key the expected key
+/// @param rows_max the expected widest step
+/// @param base [rows_max + 1] receives base_ms[1..rows_max] (partially written on a miss)
+/// @return true on a hit
 static bool vc_cache_read(const char *path, uint64_t key, uint32_t rows_max, double *base) {
     struct stat st;
     if (stat(path, &st) != 0 || time(NULL) - st.st_mtime > VC_CACHE_TTL_S) return false;
@@ -454,6 +559,11 @@ static bool vc_cache_read(const char *path, uint64_t key, uint32_t rows_max, dou
     return ok;
 }
 
+/// Write a curve atomically (tmp file, fsync, rename); a failure is said, not fatal.
+/// @param path the cache file
+/// @param key the key
+/// @param rows_max the widest step
+/// @param base [rows_max + 1] base_ms
 static void vc_cache_write(const char *path, uint64_t key, uint32_t rows_max, const double *base) {
     char tmp[4200];
     if (snprintf(tmp, sizeof tmp, "%s.%d.tmp", path, (int)getpid()) >= (int)sizeof tmp) return;
@@ -495,8 +605,11 @@ static void vc_cache_write(const char *path, uint64_t key, uint32_t rows_max, co
  * and a worker declares no catalog (its keys are live) -- so a pair takes a fixed schedule: VC_PAIR_WARM untimed reps
  * per width (the catalog's four uses), then VC_PROFILE_REPS timed when `base` is non-NULL (the frame carries which,
  * i1).  A timed rep that still missed the graph cache says so (rule 5). */
+/// Timed reps per profiled width.
 #define VC_PROFILE_REPS 5u
+/// Untimed reps after which a width that still misses the graph cache is declared warm and timed as it runs (said).
 #define VC_WARM_MAX 8u
+/// Untimed reps per width on a TP pair (its fixed schedule).
 #define VC_PAIR_WARM 4u
 bool pulsar_session_verify_profile_local(pulsar_session *s, uint32_t rows_max, double *base, char *err,
                                          size_t errlen) {
@@ -699,14 +812,24 @@ void pulsar_spec_calibration_note(pulsar_engine *e, bool copy, const float *conf
  * The fit persists beside the verify curve (pulsar_session_verify_curve_open), under the curve's key -- the
  * container, drafter, pool, context and build -- and only with it: a curve profiled again (a new build, the TTL)
  * starts a fresh fit.  Written every FC_SAVE_EVERY chunks and when a kind arms. */
+/// The prefill fit's per-chunk decay (a ~64-chunk window).
 #define FC_DECAY (1.0 - 1.0 / 64.0)
+/// Chunks before any kind is priced.
 #define FC_MIN_OBS 8u
+/// A kind's own chunks before it is priced.
 #define FC_KIND_MIN 4u
+/// Chunks between cache writes.
 #define FC_SAVE_EVERY 16u
+/// The smallest pivot pf_solve accepts.
 #define FC_PIVOT_MIN 1e-7   /* of the scaled normal matrix (unit diagonal): a column that the others all but span */
 
 /* The normal equations over the columns `cols`, scaled to a unit diagonal, by elimination with partial pivoting;
  * false when a column is (all but) spanned by the others. */
+/// @param f the fit (its normal sums m, v)
+/// @param cols [k] the columns solved for
+/// @param k columns
+/// @param out [k] receives the coefficients
+/// @return false when singular
 static bool pf_solve(const pulsar_prefill_cost_fit *f, const int *cols, int k, double *out) {
     double a[PULSAR_PREFILL_FIT_DIM][PULSAR_PREFILL_FIT_DIM + 1], d[PULSAR_PREFILL_FIT_DIM];
     for (int i = 0; i < k; i++) {
@@ -740,6 +863,7 @@ static bool pf_solve(const pulsar_prefill_cost_fit *f, const int *cols, int k, d
 
 /* The terms from the sums: every kind seen, the rows, the pairs -- or without the pairs when their term comes out
  * negative (or they cannot be told from the rows). */
+/// @param f the fit; its terms and valid[] are recomputed
 static void pf_refit(pulsar_prefill_cost_fit *f) {
     f->valid[PULSAR_CHUNK_SOLO] = f->valid[PULSAR_CHUNK_FUSED] = false;
     if (f->n < FC_MIN_OBS) return;
@@ -771,6 +895,7 @@ bool pulsar_prefill_fit_path(const char *cache_dir, uint64_t key, char *out, siz
     return n > 0 && (size_t)n < cap;
 }
 
+/// The prefill fit cache file's format version.
 #define PF_CACHE_VERSION 1u
 
 bool pulsar_prefill_fit_read(const char *path, uint64_t key, pulsar_prefill_cost_fit *f) {
@@ -821,6 +946,9 @@ bool pulsar_prefill_fit_write(const char *path, uint64_t key, const pulsar_prefi
     return ok;
 }
 
+/// The fit's rule-5 line.
+/// @param f the fit
+/// @param why "measured" or "moved"
 static void pf_announce(const pulsar_prefill_cost_fit *f, const char *why) {
     char t[2][32];
     for (int kind = 0; kind < PULSAR_CHUNK_KINDS; kind++) {
@@ -833,6 +961,13 @@ static void pf_announce(const pulsar_prefill_cost_fit *f, const char *why) {
             f->n_kind[PULSAR_CHUNK_SOLO], f->n_kind[PULSAR_CHUNK_FUSED]);
 }
 
+/// One prompt chunk's forward into the fit: the sums, the refit, the announce, the cache write.
+/// @param e the engine (its prefill_cost)
+/// @param kind PULSAR_CHUNK_SOLO or PULSAR_CHUNK_FUSED
+/// @param n_runs prompt runs in the chunk
+/// @param q [n_runs] each run's rows (tokens)
+/// @param c [n_runs] each run's context before it (tokens)
+/// @param y the chunk's ms
 static void pf_observe(pulsar_engine *e, int kind, uint32_t n_runs, const uint32_t *q, const uint32_t *c, double y) {
     double x[PULSAR_PREFILL_FIT_DIM] = {kind == PULSAR_CHUNK_SOLO ? 1.0 : 0.0, kind == PULSAR_CHUNK_FUSED ? 1.0 : 0.0,
                                         0.0, 0.0};
@@ -886,10 +1021,21 @@ void pulsar_engine_prefill_chunk_observe(pulsar_engine *e, uint32_t q, uint32_t 
     pf_observe(e, PULSAR_CHUNK_SOLO, 1u, &q, &c, ms);
 }
 
+/// @param f the fit
+/// @param q a run's rows (tokens)
+/// @param c its context before it (tokens)
+/// @return the run's ms beyond the fixed term
 static double pf_rows_ms(const pulsar_prefill_cost_fit *f, uint32_t q, uint32_t c) {
     return f->alpha_ms * (double)q + f->beta_ms * (double)q * ((double)c + 0.5 * (double)q);
 }
 
+/// What n_runs prompt runs add to a round's verify forward (pulsar.h).
+/// @param e the engine
+/// @param n_runs runs
+/// @param q [n_runs] each run's rows (tokens)
+/// @param c [n_runs] each run's context before it (tokens)
+/// @param ms receives the ms (0 when unpriced)
+/// @return false until the fused terms are measured
 bool pulsar_engine_fused_prompt_ms(const pulsar_engine *e, uint32_t n_runs, const uint32_t *q, const uint32_t *c,
                                    double *ms) {
     const pulsar_prefill_cost_fit *f = e ? &e->prefill_cost : NULL;

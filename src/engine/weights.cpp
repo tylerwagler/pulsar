@@ -1,8 +1,13 @@
+/** @file weights.cpp
+ *  @brief DeepSeek V4 weight binding: required / optional tensor lookups and their shape and format checks. */
 #include "pulsar_engine_internal.h"
 #include "exl3_trellis.h"
 
 
 
+/// @param m the model
+/// @param key a numeric key
+/// @return its value; 0 and a counted refusal when absent
 static float required_f32(const pulsar_model *m, const char *key) {
     float v = 0.0f;
     if (!model_get_f32_compat(m, key, &v)) {
@@ -15,6 +20,9 @@ static float required_f32(const pulsar_model *m, const char *key) {
 
 
 
+/// @param m the model
+/// @param key a bool key
+/// @return its value; false and a counted refusal when absent
 static bool required_bool(const pulsar_model *m, const char *key) {
     bool v = false;
     if (!model_get_bool(m, key, &v)) {
@@ -29,11 +37,16 @@ static bool required_bool(const pulsar_model *m, const char *key) {
 
 /* The family's binders stop at the first refusal (L272 P4a: the find / dims / format mechanics are the
  * core's, tensor_bind.cpp). */
+/// The owner name the core's bind / admit messages carry.
 static const char *const DS4_OWNER = "deepseek4";
 /* L272: a missing required tensor binds to this inert, zeroed tensor (refused once, where it was looked
  * up), so the binder finishes and reports every problem; the load fails at its stage boundary. */
+/// The inert tensor a missing required one binds to (see above).
 static pulsar_tensor g_ds4_absent;
 
+/// @param m the model
+/// @param name the tensor name
+/// @return the tensor, or &g_ds4_absent (refused)
 static pulsar_tensor *required_tensor(const pulsar_model *m, const char *name) {
     pulsar_tensor *t = pulsar_tensor_bind(m, DS4_OWNER, name);
     if (!t) { pulsar_load_refuse(); return &g_ds4_absent; }   /* inert: the checks after it skip it */
@@ -42,6 +55,11 @@ static pulsar_tensor *required_tensor(const pulsar_model *m, const char *name) {
 
 
 
+/// required_tensor by a printf name.
+/// @param m the model
+/// @param fmt name format with one %u
+/// @param layer its value
+/// @return the tensor, or &g_ds4_absent
 static pulsar_tensor *required_tensorf(const pulsar_model *m, const char *fmt, uint32_t layer) {
     char name[128];
     int n = snprintf(name, sizeof(name), fmt, layer);
@@ -56,6 +74,10 @@ static pulsar_tensor *required_tensorf(const pulsar_model *m, const char *fmt, u
  * correction bias is the one that bit (see the binding site).  The caller is
  * responsible for the "absent" arm; a silent NULL reaching a deref is the
  * failure this naming is meant to make visible. */
+/// @param m the model
+/// @param fmt name format with one %u
+/// @param layer its value
+/// @return the tensor, or NULL
 static pulsar_tensor *optional_tensorf(const pulsar_model *m, const char *fmt, uint32_t layer) {
     char name[128];
     int n = snprintf(name, sizeof(name), fmt, layer);
@@ -69,6 +91,11 @@ static pulsar_tensor *optional_tensorf(const pulsar_model *m, const char *fmt, u
  * way and then need exactly this; keeping one copy stops the two drifting, which
  * is a live failure mode in this file (two banked emit blocks had silently
  * stopped emitting dumps their classic twins still emitted). */
+/// @param t the tensor (g_ds4_absent: skipped, refused where bound)
+/// @param ndim dims expected
+/// @param d0 ne[0]
+/// @param d1 ne[1] (when ndim >= 2)
+/// @param d2 ne[2] (when ndim == 3)
 static void tensor_expect_dims(
         const pulsar_tensor *t,
         uint32_t          ndim,
@@ -80,6 +107,13 @@ static void tensor_expect_dims(
 }
 
 
+/// Refuse unless t is exactly `type` with these dims.
+/// @param t the tensor (NULL dies; g_ds4_absent skipped)
+/// @param type the PULSAR_TENSOR_* id
+/// @param ndim dims expected
+/// @param d0 ne[0]
+/// @param d1 ne[1] (when ndim >= 2)
+/// @param d2 ne[2] (when ndim == 3)
 static void tensor_expect_layout(
         const pulsar_tensor *t,
         uint32_t          type,
@@ -98,6 +132,12 @@ static void tensor_expect_layout(
 /* Layout check for a tensor the artifact may legitimately omit: absent is fine,
  * present must be right.  (dev's L216 helper; the merge lost it while keeping
  * its three callers -- the branch's side had reformatted this spot.) */
+/// @param t the tensor, or NULL (accepted)
+/// @param type the PULSAR_TENSOR_* id
+/// @param ndim dims expected
+/// @param d0 ne[0]
+/// @param d1 ne[1] (when ndim >= 2)
+/// @param d2 ne[2] (when ndim == 3)
 static void tensor_expect_optional(
         const pulsar_tensor *t,
         uint32_t          type,
@@ -114,6 +154,11 @@ static void tensor_expect_optional(
  * The legacy interleaved form is refused by NAME when the checkpoint is read
  * (st_layout_type), so there is no second storage to accept here; the FP8
  * matmul resolver dispatches on the registered offset. */
+/// @param t the tensor (NULL dies; g_ds4_absent skipped)
+/// @param ndim dims expected
+/// @param d0 ne[0]
+/// @param d1 ne[1] (when ndim >= 2)
+/// @param d2 ne[2] (when ndim == 3)
 static void tensor_expect_mxfp8(
         const pulsar_tensor *t,
         uint32_t          ndim,
@@ -128,6 +173,12 @@ static void tensor_expect_mxfp8(
     else
         pulsar_load_refuse();
 }
+/// Refuse unless the registry has a dense arm for t at the slot's bf16 or E4M3 activations.
+/// @param t the tensor (NULL dies; g_ds4_absent skipped)
+/// @param ndim dims expected
+/// @param d0 ne[0]
+/// @param d1 ne[1] (when ndim >= 2)
+/// @param d2 ne[2] (when ndim == 3)
 static void tensor_expect_plain_or_mxfp8(
         const pulsar_tensor *t,
         uint32_t          ndim,
@@ -159,6 +210,11 @@ static void tensor_expect_plain_or_mxfp8(
  * Accepting both keeps one binary able to load an artifact from either side of
  * that change; every caller must pass the tensor's actual type down to the
  * kernel, never assume. */
+/// @param t the tensor (NULL dies)
+/// @param ndim dims expected
+/// @param d0 ne[0]
+/// @param d1 ne[1] (when ndim >= 2)
+/// @param d2 ne[2] (when ndim == 3)
 static void tensor_expect_f32_or_bf16(
         const pulsar_tensor *t,
         uint32_t          ndim,
@@ -172,6 +228,12 @@ static void tensor_expect_f32_or_bf16(
         tensor_expect_layout(t, PULSAR_TENSOR_F32, ndim, d0, d1, d2);
 }
 
+/// Refuse unless t is F32 or BF16 with these dims.
+/// @param t the tensor
+/// @param ndim dims expected
+/// @param d0 ne[0]
+/// @param d1 ne[1] (when ndim >= 2)
+/// @param d2 ne[2] (when ndim == 3)
 static void tensor_expect_plain_layout(
         const pulsar_tensor *t,
         uint32_t          ndim,
@@ -202,6 +264,8 @@ static void tensor_expect_plain_layout(
 
 
 
+/// @param type a routed-expert block type
+/// @return bytes per 256-weight block; dies on another type
 static PULSAR_MAYBE_UNUSED uint64_t routed_expert_block_bytes(uint32_t type) {
     switch (type) {
     /* IQ2_XXS_MMQ_K (44) is a pure permutation of the raw IQ2_XXS blocks (L202)
@@ -273,6 +337,9 @@ bool routed_expert_side_layout(uint32_t type, uint64_t k, uint64_t n,
  * requires cutlass down (and vice versa). Reject anything else at load with
  * one clear error instead of a silent kernel-dispatch failure at the first
  * MoE layer. */
+/// @param gate the gate stack
+/// @param up the up stack
+/// @param down the down stack
 static void tensor_expect_routed_expert_combo(
         const pulsar_tensor *gate,
         const pulsar_tensor *up,
@@ -287,6 +354,12 @@ static void tensor_expect_routed_expert_combo(
 
 
 
+/// @param t the stack (NULL dies; g_ds4_absent skipped)
+/// @param role its weight role
+/// @param ndim dims expected
+/// @param d0 ne[0]
+/// @param d1 ne[1] (when ndim >= 2)
+/// @param d2 ne[2] (when ndim == 3)
 static void tensor_expect_routed_expert(
         const pulsar_tensor *t,
         pulsar_weight_role role,
@@ -314,12 +387,17 @@ bool weights_have_output_head(const pulsar_weights *w) {
 
 
 
+/// @param w the weights, or NULL
+/// @return true when output_norm or output is bound
 static bool weights_have_partial_output_head(const pulsar_weights *w) {
     return w && (w->output_norm || w->output);
 }
 
 
 
+/// @param l the layer's tensors, or NULL
+/// @param il the layer
+/// @return true when every tensor the layer's attention mode and routing need is bound
 static bool weights_layer_has_required(const pulsar_layer_weights *l, uint32_t il) {
     if (!l) return false;
     if (!l->hc_attn_fn ||
@@ -386,6 +464,11 @@ const pulsar_layer_weights *weights_first_bound_layer(const pulsar_weights *w) {
 
 /* Verify every tensor type and dimension used by the specialized pipeline.
  * Token embedding and output head are validated when present. */
+/// @param w the weights
+/// @param layer_start first layer
+/// @param layer_end last layer, inclusive (UINT32_MAX = the last)
+/// @param require_token_embd die without token_embd
+/// @param require_output die without the output head
 static void weights_validate_layout(
         const pulsar_weights *w,
         uint32_t           layer_start,
@@ -519,6 +602,29 @@ static void weights_validate_layout(
 
 
 
+/// @param s a profile
+/// @param n_layer layers
+/// @param n_embd hidden width
+/// @param n_vocab vocab
+/// @param n_head attention heads
+/// @param n_head_kv KV heads
+/// @param n_head_dim head width
+/// @param n_value_dim value width
+/// @param n_rot rotary dims
+/// @param n_lora_q q LoRA rank
+/// @param n_lora_o output LoRA rank
+/// @param n_out_group output groups
+/// @param n_expert routed experts
+/// @param n_expert_used experts per token
+/// @param n_ff_exp expert FFN width
+/// @param n_expert_shared shared experts
+/// @param n_swa sliding window
+/// @param n_indexer_head indexer heads
+/// @param n_indexer_head_dim indexer head width
+/// @param n_indexer_top_k indexer top-k
+/// @param n_hc residual streams
+/// @param n_hc_sinkhorn_iter Sinkhorn iterations
+/// @return true when every field equals the profile's
 static bool pulsar_shape_matches_metadata(
         const pulsar_shape *s,
         uint32_t n_layer,
@@ -567,6 +673,29 @@ static bool pulsar_shape_matches_metadata(
 
 
 
+/// Install the profile (g_pulsar_shape) the metadata matches, or refuse.
+/// @param layer_subset a layer-subset fixture: the block count is not compared
+/// @param n_layer layers
+/// @param n_embd hidden width
+/// @param n_vocab vocab
+/// @param n_head attention heads
+/// @param n_head_kv KV heads
+/// @param n_head_dim head width
+/// @param n_value_dim value width
+/// @param n_rot rotary dims
+/// @param n_lora_q q LoRA rank
+/// @param n_lora_o output LoRA rank
+/// @param n_out_group output groups
+/// @param n_expert routed experts
+/// @param n_expert_used experts per token
+/// @param n_ff_exp expert FFN width
+/// @param n_expert_shared shared experts
+/// @param n_swa sliding window
+/// @param n_indexer_head indexer heads
+/// @param n_indexer_head_dim indexer head width
+/// @param n_indexer_top_k indexer top-k
+/// @param n_hc residual streams
+/// @param n_hc_sinkhorn_iter Sinkhorn iterations
 static void pulsar_select_shape_from_metadata(
         bool layer_subset,
         uint32_t n_layer,
@@ -639,6 +768,11 @@ static void pulsar_select_shape_from_metadata(
 /* Read an int32/uint32 array key into `out` (capacity `cap`), returning its
  * length.  Dies when the key is missing, the wrong type, longer than `cap`, or
  * carries a negative value. */
+/// @param m the model
+/// @param key an int32 / uint32 array key
+/// @param[out] out [cap] values
+/// @param cap capacity
+/// @return its length; 0 and a counted refusal when missing, mistyped or too long (a negative value dies)
 static uint32_t model_read_u32_array(const pulsar_model *m, const char *key, uint32_t *out, uint32_t cap) {
     pulsar_array_ref arr;
     if (!model_get_array(m, key, &arr) ||
@@ -678,6 +812,7 @@ static uint32_t model_read_u32_array(const pulsar_model *m, const char *key, uin
  * hash_layer_count.  When a key IS present it must agree with the profile --
  * pulsar_attn_layout_install enforces that against g_pulsar_shape.
  * plans/96-SPIKE0-results.md S2. */
+/// @param m the model
 static void validate_attention_layout_metadata(const pulsar_model *m) {
     uint32_t ratios[PULSAR_MAX_LAYER];
     const uint32_t n_ratio = model_read_u32_array(m, "deepseek4.attention.compress_ratios", ratios, PULSAR_MAX_LAYER);
@@ -738,6 +873,7 @@ static void config_expect_f32(const char *name, float got, float expected);
  * falls back to the full n_expert). When present, each entry must be in
  * [1, n_expert]; the router/bias tensors stay padded to n_expert and only the
  * expert weight tensors are dense-trimmed to keep_count. */
+/// @param m the model
 static void validate_reap_metadata(const pulsar_model *m) {
     memset(g_pulsar_layer_expert_count, 0, sizeof(g_pulsar_layer_expert_count));
 
@@ -778,6 +914,8 @@ static void validate_reap_metadata(const pulsar_model *m) {
 
 
 
+/// Refuse unless every layer's swiglu_clamp_exp is the profile's.
+/// @param m the model
 static void validate_swiglu_clamp_metadata(const pulsar_model *m) {
     const char *key = "deepseek4.swiglu_clamp_exp";
     pulsar_array_ref arr;
@@ -807,6 +945,10 @@ static void validate_swiglu_clamp_metadata(const pulsar_model *m) {
 
 
 
+/// Refuse (counted, printed) when got != expected.
+/// @param name the field
+/// @param got the artifact's
+/// @param expected the profile's
 static void config_expect_u32(const char *name, uint32_t got, uint32_t expected) {
     if (got == expected) return;
     fprintf(stderr, "pulsar: expected %s=%u for %s, got %u\n",
@@ -820,6 +962,9 @@ static void config_expect_u32(const char *name, uint32_t got, uint32_t expected)
 /* Relative tolerance: the old absolute 1e-6 floor let an artifact's rms eps of
  * 1e-20 pass against a 1e-6 profile (and vice versa) without a word -- every
  * RMSNorm wrong, no message (L218 audit risk #1).  A value of 0 must match 0. */
+/// @param name the field
+/// @param got the artifact's
+/// @param expected the profile's
 static void config_expect_f32(const char *name, float got, float expected) {
     const float tol = fabsf(expected) * 1.0e-6f;
     if (fabsf(got - expected) <= tol) return;
@@ -831,6 +976,10 @@ static void config_expect_f32(const char *name, float got, float expected) {
 
 
 
+/// Refuse (counted, printed) when got != expected.
+/// @param name the field
+/// @param got the artifact's
+/// @param expected the profile's
 static void config_expect_bool(const char *name, bool got, bool expected) {
     if (got == expected) return;
     fprintf(stderr, "pulsar: expected %s=%s for %s, got %s\n",
@@ -841,6 +990,8 @@ static void config_expect_bool(const char *name, bool got, bool expected) {
 
 
 
+/// Check the artifact's fixed config against the profile.
+/// @param n_layer the artifact's block count
 static void config_validate_fixed_shape(uint32_t n_layer) {
     config_expect_u32("block_count",                  n_layer,                 PULSAR_N_LAYER);
 }
@@ -1027,6 +1178,8 @@ void config_validate_model(const pulsar_model *m) {
  * are bf16 or f32 upstream are stored bf16 instead of f16 -- f16 was deleting
  * ~11% of the small weights in some of them -- and because the output head goes
  * back to bf16 to match source.  Both need this type accepted. */
+/// @param type a PULSAR_TENSOR_* id
+/// @return true for a storage type the DeepSeek pipeline reads
 static bool weights_tensor_type_supported(uint32_t type) {
     switch (type) {
     case PULSAR_TENSOR_F32:
@@ -1112,6 +1265,13 @@ void weights_reject_unsupported_types(const pulsar_model *m) {
  * is one block.  Sizing that does not match the type's layout is left to the
  * consumers' own refusals -- this pass must never be the thing that rejects a
  * shape the engine would otherwise read. */
+/// @param m the model
+/// @param t the tensor
+/// @param off first block's byte offset in t
+/// @param block_len bytes per block
+/// @param stride bytes between blocks
+/// @param nblocks blocks
+/// @param what the format, for the message
 static void e8m0_scan_blocks(
         const pulsar_model *m,
         const pulsar_tensor *t,
@@ -1154,6 +1314,8 @@ static void e8m0_scan_blocks(
  * its row or column -- the same "one bad byte, fluent nonsense" class as an
  * E8M0 0xFF, and just as absent from a producer's output.  Trellis words have
  * no invalid encoding and are not scanned. */
+/// @param m the model
+/// @param t an EXL3 tensor
 static void exl3_scan_scales(const pulsar_model *m, const pulsar_tensor *t) {
     uint64_t trellis = 0, scales = 0, stride = 0;
     const int k2 = exl3_type_k2(t->type);
@@ -1225,6 +1387,11 @@ void weights_reject_bad_e8m0(const pulsar_model *m) {
 
 
 
+/// Bind the output head (and 0731's HC head mix).
+/// @param[out] w the weights
+/// @param m the model
+/// @param required bind output_norm / output as required
+/// @param optional when not required: bind them if present (a partial head dies)
 static void weights_bind_output(pulsar_weights *w, const pulsar_model *m, bool required, bool optional) {
     /* 0731's HC head mix.  REQUIRED where the profile says the head computes its
      * own coefficients: a 0731 artifact missing the group would otherwise
@@ -1251,6 +1418,10 @@ static void weights_bind_output(pulsar_weights *w, const pulsar_model *m, bool r
 
 
 
+/// Bind layer il's tensors.
+/// @param[out] l the layer
+/// @param m the model
+/// @param il the layer
 static void weights_bind_layer(pulsar_layer_weights *l, const pulsar_model *m, uint32_t il) {
     const pulsar_layer_attn *attn = pulsar_layer_attn_layout(il);
     l->n_expert = PULSAR_N_EXPERT;
@@ -1403,10 +1574,13 @@ void weights_bind(pulsar_weights *w, const pulsar_model *m) {
 
 
 
+/// Forget the bindings (zeroes `w`; the tensors are the model's and are not freed here).
+/// @param w the weights
 void weights_free(pulsar_weights *w) {
     memset(w, 0, sizeof(*w));
 }
 
+/// @param w the bound DSpark weights
 static void dspark_weights_validate_layout(const pulsar_dspark_weights *w) {
     const uint32_t E = w->embed_dim;
     const uint32_t V = w->vocab_size;

@@ -1,3 +1,5 @@
+/** @file family.cpp
+ *  @brief The model-family registry and the capability check (family.h). */
 /* family.cpp -- the family registry and the capability check (L251 S1).
  * See family.h for the contract. */
 #include "pulsar_engine_internal.h"
@@ -43,13 +45,18 @@ const char *pulsar_layer_plan_check(const pulsar_layer_plan *p, uint32_t *at_lay
 }
 
 /* A family module under src/families/<name>/ (L295) declares its descriptor here, beside its registry row. */
+/// The Inkling family (src/families/inkling).
 extern const pulsar_family PULSAR_FAMILY_INKLING;
+/// The Nemotron-H decoder family (src/families/nemotron_h).
 extern const pulsar_family PULSAR_FAMILY_NEMOTRON_H;
+/// The Nemotron embed / rerank encoder family.
 extern const pulsar_family PULSAR_FAMILY_NEMOTRON_ENC;
+/// The Nemotron Parse page-parser family.
 extern const pulsar_family PULSAR_FAMILY_NEMOTRON_PARSE;
 
 /* Every family the engine serves.  The ONE place an architecture string is
  * mapped to code. */
+/// The registry pulsar_family_for_model searches, by `arch`.
 static const pulsar_family *const k_families[] = {
     &PULSAR_FAMILY_DEEPSEEK4,
     &PULSAR_FAMILY_QWEN4_EXP,
@@ -114,6 +121,7 @@ bool pulsar_family_require(const pulsar_engine *e, uint32_t cap, const char *op)
  * here; the stage that found it finishes (so one load reports every problem it can see), and the family's
  * load fails at its next stage boundary -- pulsar_engine_open returns an error, the process never exits on
  * a bad artifact.  Loads run one at a time (engine open is not concurrent). */
+/// Refusals counted since the last reset (pulsar_load_refuse); single-threaded, loads are serial.
 static uint32_t g_load_refusals;
 void pulsar_load_refuse(void) { g_load_refusals++; }
 uint32_t pulsar_load_refusals(void) { return g_load_refusals; }

@@ -1,3 +1,5 @@
+/** @file tensor_bind.cpp
+ *  @brief L272 P4a: the mechanics every family's weight binder shares. */
 /* tensor_bind.cpp -- L272 P4a: the mechanics every family's weight binder shares.
  *
  * Which tensors a family's layers hold, and which formats each role admits, is the family's knowledge

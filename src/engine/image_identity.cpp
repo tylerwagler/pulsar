@@ -1,3 +1,5 @@
+/** @file image_identity.cpp
+ *  @brief L281: which images a session's KV holds, block by block, for every family. */
 /* image_identity.cpp -- L281: which images a session's KV holds, block by block, for every family.
  *
  * A family's image blocks are runs of sentinel ids whose VALUES only geometry decides (DeepSeek: vocab_size + role),
@@ -18,6 +20,9 @@
  * position is); a family with no images has no hook and no id is a sentinel.  Everything else is here, once. */
 #include "pulsar_engine_internal.h"
 
+/// @param h the running FNV-1a hash
+/// @param v eight bytes to mix, little-endian
+/// @return the hash
 static uint64_t fnv_u64(uint64_t h, uint64_t v) {
     for (int b = 0; b < 8; b++) { h ^= (v >> (8 * b)) & 0xffu; h *= 1099511628211ull; }
     return h;
@@ -30,9 +35,20 @@ uint64_t pulsar_image_content_hash(const pulsar_image_ref *img) {
     return h ? h : 1u;
 }
 
+/// @param v the image front, or NULL
+/// @param e the engine
+/// @param id a token id
+/// @return false without a front
 static bool is_sentinel(const pulsar_family_vision *v, const pulsar_engine *e, int32_t id) {
     return v && v->is_sentinel(e, id);
 }
+/// @param v the image front, or NULL
+/// @param e the engine
+/// @param ids the sequence
+/// @param n its length
+/// @param start where to look
+/// @param[out] len the block's length (0 when none)
+/// @return true when a non-empty block starts at start
 static bool block_extent(const pulsar_family_vision *v, const pulsar_engine *e, const int32_t *ids, int n, int start,
                          int *len) {
     *len = 0;

@@ -1,9 +1,12 @@
+/** @file tokenizer.cpp
+ *  @brief DeepSeek's byte-level BPE tokenizer: vocabulary tables, BPE merge and chat tokenization. */
 #include "pulsar_engine_internal.h"
 #include "pulsar_utf8.h"
 #include <string>
 
 
 
+/** The smallest power of two >= n (1 for n <= 1).  @param n the value  @return the power of two */
 static uint64_t next_pow2(uint64_t n) {
     uint64_t p = 1;
     while (p < n) p <<= 1;
@@ -12,6 +15,9 @@ static uint64_t next_pow2(uint64_t n) {
 
 
 
+/** Allocate an empty open-addressing table sized for `expected` entries (capacity a power of two >= 2x + 16).
+ *  @param t        the table
+ *  @param expected entries it will hold */
 static void table_init(str_i32_table *t, uint64_t expected) {
     t->cap = next_pow2(expected * 2 + 16);
     t->used = 0;
@@ -20,6 +26,7 @@ static void table_init(str_i32_table *t, uint64_t expected) {
 
 
 
+/** Free a table's entries and zero it (keys are borrowed, not freed).  @param t the table */
 static void table_free(str_i32_table *t) {
     free(t->entry);
     memset(t, 0, sizeof(*t));
@@ -27,6 +34,10 @@ static void table_free(str_i32_table *t) {
 
 
 
+/** Insert or overwrite `key` (linear probing; the table never grows, so it must be sized for every key).
+ *  @param t     the table
+ *  @param key   the key; borrowed, must outlive the table
+ *  @param value the value */
 static void table_put(str_i32_table *t, pulsar_str key, int value) {
     uint64_t mask = t->cap - 1;
     uint64_t i = hash_bytes(key.ptr, key.len) & mask;
@@ -47,6 +58,11 @@ static void table_put(str_i32_table *t, pulsar_str key, int value) {
 
 
 
+/// @param t     the table
+/// @param ptr   the key's bytes
+/// @param len   their count
+/// @param value receives the value when found
+/// @return true when found
 static bool table_get(const str_i32_table *t, const char *ptr, uint64_t len, int *value) {
     if (t->cap == 0) return false;
 
@@ -66,6 +82,7 @@ static bool table_get(const str_i32_table *t, const char *ptr, uint64_t len, int
 
 
 
+/** Append a token, growing the vector by doubling (from 64).  @param tv the vector  @param token the token id */
 void token_vec_push(token_vec *tv, int token) {
     if (tv->len == tv->cap) {
         tv->cap = tv->cap ? tv->cap * 2 : 64;
@@ -76,6 +93,7 @@ void token_vec_push(token_vec *tv, int token) {
 
 
 
+/** Free the vector's storage and zero it.  @param tv the vector */
 void token_vec_free(token_vec *tv) {
     free(tv->v);
     memset(tv, 0, sizeof(*tv));
@@ -83,18 +101,22 @@ void token_vec_free(token_vec *tv) {
 
 
 
+/** Append a token.  @param tv the token list  @param token the token id */
 void pulsar_tokens_push(pulsar_tokens *tv, int token) {
     token_vec_push(tv, token);
 }
 
 
 
+/** Free the list's storage and zero it.  @param tv the token list */
 void pulsar_tokens_free(pulsar_tokens *tv) {
     token_vec_free(tv);
 }
 
 
 
+/** Make `dst` a copy of `src`, reusing dst's storage when it is large enough.  @param dst the destination
+ *  @param src the source */
 void pulsar_tokens_copy(pulsar_tokens *dst, const pulsar_tokens *src) {
     /* Reserve once and memcpy: the push loop this replaced called xrealloc O(n)
      * times on the first copy into an empty vector, and the spec bank carry
@@ -112,6 +134,8 @@ void pulsar_tokens_copy(pulsar_tokens *dst, const pulsar_tokens *src) {
 
 
 
+/** Does `tokens` begin with `prefix`?  @param tokens the list  @param prefix the prefix
+ *  @return true when it does (an empty prefix always) */
 bool pulsar_tokens_starts_with(const pulsar_tokens *tokens, const pulsar_tokens *prefix) {
     if (prefix->len > tokens->len) return false;
     for (int i = 0; i < prefix->len; i++) {
@@ -131,6 +155,8 @@ bool pulsar_tokens_starts_with(const pulsar_tokens *tokens, const pulsar_tokens 
 
 
 
+/** Write `cp` as UTF-8 at *p and advance *p (1-4 bytes; no validation).  @param p the write cursor
+ *  @param cp the codepoint */
 static void utf8_put(char **p, uint32_t cp) {
     if (cp <= 0x7f) {
         *(*p)++ = (char)cp;
@@ -151,6 +177,8 @@ static void utf8_put(char **p, uint32_t cp) {
 
 
 
+/** GPT-2's byte-to-unicode map: printable bytes map to themselves, the rest to 256 + their rank.
+ *  @param b the byte  @return the codepoint */
 static uint32_t gpt2_byte_to_codepoint(uint8_t b) {
     if ((b >= 33 && b <= 126) || (b >= 161 && b <= 172) || (b >= 174)) {
         return b;
@@ -171,6 +199,9 @@ static uint32_t gpt2_byte_to_codepoint(uint8_t b) {
 
 /* GPT-2 byte-level BPE first maps raw bytes to printable Unicode codepoints
  * so merges can operate on UTF-8 strings without losing byte identity. */
+/// @param in      the raw bytes
+/// @param out_len receives the encoded length in bytes
+/// @return the NUL-terminated encoding, xmalloc'd (the caller frees it)
 static char *byte_encode(pulsar_str in, uint64_t *out_len) {
     char *out = (char *)xmalloc((size_t)in.len * 4 + 1);
     char *p = out;
@@ -189,6 +220,11 @@ static char *byte_encode(pulsar_str in, uint64_t *out_len) {
  * ill-formed byte -- bad lead, bad or truncated continuation, Table 3-7
  * violation -- is its own one-byte unit and decodes to its byte value.  Sets
  * *next just past the consumed bytes. */
+/// @param s    the text
+/// @param len  its length in bytes
+/// @param pos  the position decoded, < len
+/// @param next receives the position after the unit
+/// @return the codepoint (an ill-formed byte's value)
 static uint32_t utf8_decode_at(const char *s, uint64_t len, uint64_t pos, uint64_t *next) {
     const unsigned char *p = (const unsigned char *)s + pos;
     const int n = utf8_seq_ok(p, (size_t)(len - pos));
@@ -204,6 +240,8 @@ static uint32_t utf8_decode_at(const char *s, uint64_t len, uint64_t pos, uint64
 
 
 
+/** A heap copy of [ptr, ptr + len) (not NUL-terminated).  @param ptr the bytes  @param len their count
+ *  @return the copy (its ptr xmalloc'd; the owner frees it) */
 static owned_str owned_copy(const char *ptr, uint64_t len) {
     owned_str s;
     s.ptr = (char *)xmalloc((size_t)len);
@@ -305,6 +343,8 @@ void pulsar_vocab::bpe_emit_piece(pulsar_str raw_piece, token_vec *out) const {
 
 
 
+/** The position after the UTF-8 unit at pos (an ill-formed byte is one unit).  @param s the text
+ *  @param len its length  @param pos the position, < len  @return the next position */
 static uint64_t next_utf8_char(const char *s, uint64_t len, uint64_t pos) {
     const int n = utf8_seq_ok((const unsigned char *)s + pos, (size_t)(len - pos));
     return pos + (uint64_t)(n ? n : 1);
@@ -312,18 +352,21 @@ static uint64_t next_utf8_char(const char *s, uint64_t len, uint64_t pos) {
 
 
 
+/** ASCII A-Z / a-z.  @param c the byte  @return true for a letter */
 static bool ascii_alpha(uint8_t c) {
     return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z');
 }
 
 
 
+/** ASCII 0-9.  @param c the byte  @return true for a digit */
 static bool ascii_digit(uint8_t c) {
     return c >= '0' && c <= '9';
 }
 
 
 
+/** ASCII space, \\t, \\n, \\r, \\v, \\f.  @param c the byte  @return true for whitespace */
 static bool ascii_space(uint8_t c) {
     return c == ' ' || c == '\t' || c == '\n' || c == '\r' ||
            c == '\v' || c == '\f';
@@ -331,12 +374,14 @@ static bool ascii_space(uint8_t c) {
 
 
 
+/** \\n or \\r.  @param c the byte  @return true for a newline byte */
 static bool ascii_newline(uint8_t c) {
     return c == '\n' || c == '\r';
 }
 
 
 
+/** The JoyAI pre-tokenizer's ASCII punctuation / symbol class.  @param c the byte  @return true when in it */
 static bool joyai_ascii_punct_symbol(uint8_t c) {
     return (c >= '!' && c <= '/') ||
            (c >= ':' && c <= '@') ||
@@ -346,6 +391,8 @@ static bool joyai_ascii_punct_symbol(uint8_t c) {
 
 
 
+/** CJK unified ideographs (U+4E00-U+9FA5), hiragana or katakana.  @param cp the codepoint
+ *  @return true when in those ranges */
 static bool utf8_is_cjk_hira_kata(uint32_t cp) {
     return (cp >= 0x4e00 && cp <= 0x9fa5) ||
            (cp >= 0x3040 && cp <= 0x309f) ||
@@ -354,6 +401,8 @@ static bool utf8_is_cjk_hira_kata(uint32_t cp) {
 
 
 
+/** Does a "letter" start at pos (an ASCII letter, or any non-ASCII byte; see below)?  @param s the text
+ *  @param len its length (unused)  @param pos the position  @return true for a letter-like unit */
 static bool joyai_letter_like_at(const char *s, uint64_t len, uint64_t pos) {
     (void)len;
     uint8_t c = (uint8_t)s[pos];
@@ -372,6 +421,8 @@ static bool joyai_letter_like_at(const char *s, uint64_t len, uint64_t pos) {
 
 
 
+/** Skip a run of letter-like units.  @param s the text  @param len its length  @param pos the run's start
+ *  @return the position after the run */
 static uint64_t joyai_consume_letters(const char *s, uint64_t len, uint64_t pos) {
     while (pos < len && joyai_letter_like_at(s, len, pos)) {
         pos = next_utf8_char(s, len, pos);
@@ -381,6 +432,8 @@ static uint64_t joyai_consume_letters(const char *s, uint64_t len, uint64_t pos)
 
 
 
+/** Does a CJK / kana character start at pos?  @param s the text  @param len its length  @param pos the position
+ *  @return true when it does */
 static bool joyai_cjk_at(const char *s, uint64_t len, uint64_t pos) {
     if ((uint8_t)s[pos] < 128) return false;
     uint64_t next = pos;
@@ -603,18 +656,24 @@ void pulsar_vocab::vocab_free() {
  * that prefix sees a shorter common prefix and re-prefills from there. */
 
 /** The ids that bound a text run: every marker this template emits. */
+/// @param v  the vocab
+/// @param id the token id
+/// @return true for a BOS / EOS / role / think marker
 static bool chat_tmpl_marker(const pulsar_vocab *v, int id) {
     return id == v->bos_id || id == v->eos_id || id == v->system_id ||
            id == v->user_id || id == v->assistant_id ||
            id == v->think_start_id || id == v->think_end_id;
 }
 
+/** Where the open text run starts: just after the last marker.  @param v the vocab  @param t the tokens
+ *  @return the run's first index (0 when no marker) */
 static int chat_tmpl_run_start(const pulsar_vocab *v, const pulsar_tokens *t) {
     for (int i = t->len - 1; i >= 0; i--)
         if (chat_tmpl_marker(v, t->v[i])) return i + 1;
     return 0;
 }
 
+/** The last marker's id.  @param v the vocab  @param t the tokens  @return the id, -1 when none */
 static int chat_tmpl_last_marker(const pulsar_vocab *v, const pulsar_tokens *t) {
     for (int i = t->len - 1; i >= 0; i--)
         if (chat_tmpl_marker(v, t->v[i])) return t->v[i];
@@ -624,12 +683,18 @@ static int chat_tmpl_last_marker(const pulsar_vocab *v, const pulsar_tokens *t) 
 /** Has a user or assistant message been appended yet?  A system message before
  * one is the LEADING system region (plain content); after one it is a
  * mid-conversation note (the wrapper rule applies). */
+/// @param v the vocab
+/// @param t the tokens
+/// @return true once a user or assistant marker is present
 static bool chat_tmpl_saw_turn(const pulsar_vocab *v, const pulsar_tokens *t) {
     for (int i = 0; i < t->len; i++)
         if (t->v[i] == v->user_id || t->v[i] == v->assistant_id) return true;
     return false;
 }
 
+/** The text of tokens [start, len), recovered from the vocab.  @param v the vocab  @param t the tokens
+ *  @param start the first index  @param n_out receives the byte length (may be NULL)
+ *  @return the NUL-terminated text, xmalloc'd (the caller frees it) */
 static char *chat_tmpl_run_text(const pulsar_vocab *v, const pulsar_tokens *t,
                                 int start, size_t *n_out) {
     size_t n = 0;
@@ -653,6 +718,7 @@ static char *chat_tmpl_run_text(const pulsar_vocab *v, const pulsar_tokens *t,
     return out;
 }
 
+/** Append a marker id.  @param t the tokens  @param id the marker */
 static void chat_tmpl_push_marker(pulsar_tokens *t, int id) {
     token_vec_push((token_vec *)t, id);
 }
@@ -673,6 +739,8 @@ static void chat_tmpl_push_marker(pulsar_tokens *t, int id) {
  * prompt rendered against a vocab without the marker would silently drop it --
  * exactly the silent-template-drift class the render-bytes gate exists for --
  * so it refuses by name instead. */
+/// @param v the vocab
+/// @param t the tokens (the marker appended; exits the process when the vocab has none)
 static void chat_tmpl_push_system_marker(const pulsar_vocab *v, pulsar_tokens *t) {
     if (v->system_id < 0) {
         fprintf(stderr, "pulsar: this artifact's vocabulary has no System marker, which the V4.1 chat "
@@ -684,6 +752,9 @@ static void chat_tmpl_push_system_marker(const pulsar_vocab *v, pulsar_tokens *t
 
 /** Append TEXT to the open run and re-tokenise the run -- the one primitive that
  * makes the twin's BPE boundary the renderer's. */
+/// @param v    the vocab
+/// @param t    the tokens
+/// @param text NUL-terminated text (NULL or empty: nothing)
 static void chat_tmpl_append_text(const pulsar_vocab *v, pulsar_tokens *t, const char *text) {
     if (!text || !text[0]) return;
     const int start = chat_tmpl_run_start(v, t);
@@ -699,11 +770,16 @@ static void chat_tmpl_append_text(const pulsar_vocab *v, pulsar_tokens *t, const
     free(joined);
 }
 
+/** chat_tmpl_escape_emit's user data: where the escaped tool-result pieces are appended (both borrowed). */
 struct chat_tmpl_escape_sink {
+    /// the vocab that tokenises each piece
     const pulsar_vocab *vocab;
+    /// the token run the pieces are appended to (its open run, re-tokenised joined)
     pulsar_tokens *tokens;
 };
 
+/** pulsar_tool_result_escape's sink: append one escaped piece to the open run.  @param ud a chat_tmpl_escape_sink
+ *  @param bytes the piece  @param n its length */
 static void chat_tmpl_escape_emit(void *ud, const char *bytes, size_t n) {
     auto *sink = (chat_tmpl_escape_sink *)ud;
     char *piece = (char *)xmalloc(n + 1);
@@ -715,6 +791,9 @@ static void chat_tmpl_escape_emit(void *ud, const char *bytes, size_t n) {
 
 /** Append a tool-result body with the sentinel escaped (pulsar_tool_result_escape
  * is the ONE authority for that rule), into the open run. */
+/// @param v       the vocab
+/// @param t       the tokens
+/// @param content the tool result's body
 static void chat_tmpl_append_tool_body(const pulsar_vocab *v, pulsar_tokens *t,
                                        const char *content) {
     chat_tmpl_escape_sink sink = { v, t };
@@ -723,6 +802,9 @@ static void chat_tmpl_append_tool_body(const pulsar_vocab *v, pulsar_tokens *t,
 
 /** Does the open run end with the tool-result wrapper's close?  That is the
  * renderer's `pending_tool_result` fact, derived instead of stored. */
+/// @param v the vocab
+/// @param t the tokens
+/// @return true when the open run's text ends with "</tool_result>"
 static bool chat_tmpl_run_ends_tool_result(const pulsar_vocab *v, const pulsar_tokens *t) {
     static const char end[] = "</tool_result>";
     const size_t endlen = sizeof(end) - 1;
@@ -735,6 +817,12 @@ static bool chat_tmpl_run_ends_tool_result(const pulsar_vocab *v, const pulsar_t
 }
 
 
+/** The chat's lead-in: the System marker (V4.1, when there is an effort line or a system message) and the effort
+ *  line's text in the open run.
+ *  @param vocab      the vocab
+ *  @param has_system a system message follows
+ *  @param think_mode the reasoning effort
+ *  @param out        the tokens appended to */
 static void encode_chat_lead_in(const pulsar_vocab *vocab, bool has_system,
                                 pulsar_think_mode think_mode, token_vec *out) {
     /* The effort line is the FAMILY's spelling (the same fact as the marker
@@ -761,11 +849,15 @@ static void encode_chat_lead_in(const pulsar_vocab *vocab, bool has_system,
  * text in and out without the turn-by-turn chat front).  These entries return no error, so a family without
  * what they need ends the process here, by name, instead of tokenizing with an empty vocabulary; the front ends
  * refuse such an engine at startup (pulsar_engine_has_tokenizer, which asks for both) before they can reach this. */
+/** The engine's tokenizer, or exit(1) by name when its family has none.  @param e the engine
+ *  @param op names the entry  @return the tokenizer ops */
 static const pulsar_family_tokenizer *tokenizer_require(const pulsar_engine *e, const char *op) {
     if (e && e->family->tokenizer) return e->family->tokenizer;
     fprintf(stderr, "pulsar: %s has no tokenizer table (%s) -- exiting\n", e ? e->family->name : "(no engine)", op);
     exit(1);
 }
+/** The engine's tokenizer for a chat entry, or exit(1) when the family has no chat front.  @param e the engine
+ *  @param op names the entry  @return the tokenizer ops */
 static const pulsar_family_tokenizer *chat_require(const pulsar_engine *e, const char *op) {
     if (e && pulsar_family_require(e, PULSAR_FAMILY_CAP_CHAT, op)) return tokenizer_require(e, op);
     fprintf(stderr, "pulsar: %s has no chat front in this build -- exiting\n", e ? e->family->name : "(no engine)");
@@ -782,6 +874,10 @@ bool pulsar_token_is_stop(pulsar_engine *e, int token) {
 
 
 
+/** Tokenize plain text (no chat rendering) through the family's tokenizer (exits without one).
+ *  @param e    the engine
+ *  @param text the text
+ *  @param out  receives the tokens (appended) */
 void pulsar_tokenize_text(pulsar_engine *e, const char *text, pulsar_tokens *out) {
     tokenizer_require(e, "pulsar_tokenize_text")->encode_text(e, text, out);
 }
@@ -898,6 +994,11 @@ void pulsar_vocab::tokenize_rendered_chat_spans_vocab(const char *text,
     vocab->tokenize_span(span, (size_t)(p - span), out);
 }
 
+/** Tokenize text that is already a rendered chat (its marker strings become marker ids) through the family's
+ *  tokenizer (exits without one).
+ *  @param e    the engine
+ *  @param text the rendered text
+ *  @param out  receives the tokens (appended) */
 void pulsar_tokenize_rendered_chat(pulsar_engine *e, const char *text, pulsar_tokens *out) {
     tokenizer_require(e, "pulsar_tokenize_rendered_chat")->encode_rendered(e, text, NULL, 0u, out);
 }
@@ -994,11 +1095,19 @@ size_t pulsar_tool_result_escape(const char *s,
 
 /* Front-end control text in DeepSeek's markers (pulsar_chat_message::trusted), tokenised as rendered chat into a
  * piece of its own: joining it to the open run would re-tokenise its markers (the DSML ids) as plain text. */
+/// @param vocab  the vocab
+/// @param tokens the tokens appended to
+/// @param text   the trusted control text, tokenised as rendered chat
 static void ds4_chat_append_trusted(pulsar_vocab *vocab, pulsar_tokens *tokens, const char *text) {
     vocab->tokenize_rendered_chat_vocab(text, (token_vec *)tokens);
 }
 
 /* One message of a DeepSeek turn: the renderer's rules, appended to the run they join. */
+/// @param e       the engine
+/// @param tokens  the tokens appended to
+/// @param role    the message's role ("system", "user", "assistant", "tool", ...)
+/// @param content the message's text
+/// @param trusted the content is front-end control text in DeepSeek's markers
 static void ds4_chat_append_message(pulsar_engine *e, pulsar_tokens *tokens, const char *role, const char *content,
                                     bool trusted) {
     pulsar_vocab *vocab = &e->vocab;
@@ -1065,6 +1174,12 @@ static void ds4_chat_append_message(pulsar_engine *e, pulsar_tokens *tokens, con
 /* BOS, the lead-in (the System marker and effort line), then the leading system region: trusted control text
  * as a rendered piece of its own, and client text joining the open run (the effort line's, when there is no
  * trusted text -- as the renderer writes it). */
+/// pulsar_family_tokenizer::chat_open for DeepSeek.
+/// @param e          the engine
+/// @param tokens     the tokens appended to
+/// @param trusted    trusted control text for the system region, or NULL
+/// @param system     the client's system message, or NULL
+/// @param think_mode the reasoning effort
 static void ds4_chat_open(pulsar_engine *e, pulsar_tokens *tokens, const char *trusted, const char *system,
                           pulsar_think_mode think_mode) {
     pulsar_vocab *vocab = &e->vocab;
@@ -1077,6 +1192,14 @@ static void ds4_chat_open(pulsar_engine *e, pulsar_tokens *tokens, const char *t
     else chat_tmpl_append_text(vocab, tokens, system);
 }
 
+/** pulsar_family_tokenizer::chat_turn for DeepSeek: the messages, then (generation_prompt) the assistant marker and
+ *  the think open / close marker.
+ *  @param e                 the engine
+ *  @param tokens            the tokens appended to
+ *  @param msgs              [n] the messages
+ *  @param n                 messages
+ *  @param generation_prompt open the assistant's turn
+ *  @param think_mode        the reasoning effort (on: the think-start marker, off: the think-end marker) */
 static void ds4_chat_turn(pulsar_engine *e, pulsar_tokens *tokens, const pulsar_chat_message *msgs, int n,
                           bool generation_prompt, pulsar_think_mode think_mode) {
     for (int i = 0; i < n; i++) ds4_chat_append_message(e, tokens, msgs[i].role, msgs[i].content, msgs[i].trusted);
@@ -1087,6 +1210,9 @@ static void ds4_chat_turn(pulsar_engine *e, pulsar_tokens *tokens, const pulsar_
 }
 
 /* the sampled turn's stop token is the template's turn end */
+/// pulsar_family_tokenizer::chat_end_assistant for DeepSeek.
+/// @param e      the engine
+/// @param tokens the tokens appended to (EOS)
 static void ds4_chat_end_assistant(pulsar_engine *e, pulsar_tokens *tokens) {
     chat_tmpl_push_marker(tokens, e->vocab.eos_id);
 }
@@ -1126,6 +1252,9 @@ void pulsar_dump_piece_quoted(FILE *fp, const char *s, size_t n) {
  * pulsar_token_text hands the server and the CLI) followed by the raw GPT-2
  * byte-encoded vocab string, so a tokenization mismatch can be read against
  * either form. */
+/// @param fp     the output stream
+/// @param vocab  the vocab
+/// @param tokens the tokens (ids outside the vocab are listed but get no line)
 void dump_tokens_fp(FILE *fp, const pulsar_vocab *vocab, const token_vec *tokens) {
     fprintf(fp, "[");
     for (int i = 0; i < tokens->len; i++) {
@@ -1154,6 +1283,7 @@ void dump_tokens_fp(FILE *fp, const pulsar_vocab *vocab, const token_vec *tokens
 
 
 
+/** The inverse of gpt2_byte_to_codepoint.  @param cp the codepoint  @return the byte, -1 when cp is no byte's */
 static int gpt2_codepoint_to_byte(uint32_t cp) {
     if ((cp >= 33 && cp <= 126) || (cp >= 161 && cp <= 172) || (cp >= 174 && cp <= 255)) {
         return (int)cp;
@@ -1172,6 +1302,8 @@ static int gpt2_codepoint_to_byte(uint32_t cp) {
 
 
 
+/** Is the vocab string a literal special token (it contains U+FF5C, the fullwidth bar DeepSeek's markers use), whose
+ *  text is its own bytes rather than GPT-2 byte-encoded?  @param s the vocab string  @return true when it is */
 static bool vocab_token_is_literal_special(pulsar_str s) {
     const unsigned char bar[] = {0xef, 0xbd, 0x9c}; /* U+FF5C fullwidth vertical bar. */
     if (s.len < sizeof(bar)) return false;
@@ -1183,6 +1315,11 @@ static bool vocab_token_is_literal_special(pulsar_str s) {
 
 
 
+/** A token's text through the family's tokenizer (exits without one).
+ *  @param e     the engine
+ *  @param token the token id
+ *  @param len   receives the length in bytes (0 bytes = a control token)
+ *  @return a malloc'd NUL-terminated copy (the caller frees it) */
 char *pulsar_token_text(pulsar_engine *e, int token, size_t *len) {
     return tokenizer_require(e, "pulsar_token_text")->token_text(e, token, len);
 }
@@ -1220,6 +1357,7 @@ char *vocab_token_text(const pulsar_vocab *vocab, int token, size_t *len) {
 
 
 
+/** The family's end-of-sequence id (exits without a tokenizer).  @param e the engine  @return the id */
 int pulsar_token_eos(pulsar_engine *e) {
     return tokenizer_require(e, "pulsar_token_eos")->eos(e);
 }
@@ -1230,6 +1368,9 @@ int pulsar_token_eos(pulsar_engine *e) {
  * special token; Qwen's template spells it as <|im_start|> plus the role word, which the checkpoint's
  * BPE holds as one token (Qwen3.8-Flash-Next: "user", "assistant").  A tokenizer that splits either
  * word leaves the anchors off, said once -- never a marker that matches at the wrong place. */
+/// @param e   the engine
+/// @param out receives the markers (zeroed first)
+/// @return false when the family's tokenizer cannot name both markers (the anchors stay off)
 bool pulsar_chat_turn_markers(pulsar_engine *e, pulsar_turn_markers *out) {
     const pulsar_family_tokenizer *t = tokenizer_require(e, "pulsar_chat_turn_markers");
     memset(out, 0, sizeof(*out));
@@ -1264,8 +1405,10 @@ int pulsar_token_think_close(pulsar_engine *e) {
  * trajectories gamma * (t + 1), which made trajectory t's token i + 1 draw at trajectory t + 1's token i key and
  * inflated its chi-squares with correlated samples.  An arbitrary odd constant puts any seed family nobody builds
  * from it ~2^63 steps apart. */
+/** The sampler stream's Weyl step (see above). */
 #define SAMPLE_STREAM_STEP 0xa0761d6478bd642fULL
 
+/** SplitMix64's output mix.  @param z the state  @return the mixed value */
 static uint64_t sample_mix64(uint64_t z) {
     z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ULL;
     z = (z ^ (z >> 27)) * 0x94d049bb133111ebULL;
@@ -1291,6 +1434,7 @@ void pulsar_sample_advance(uint64_t *rng, uint32_t n) {
  * to the CLI and server.
  */
 
+/** The backend's name for messages.  @param backend the backend  @return "cuda", or "unknown" */
 const char *pulsar_backend_name(pulsar_backend backend) {
     switch (backend) {
     case PULSAR_BACKEND_CUDA:  return "cuda";
@@ -1302,22 +1446,37 @@ const char *pulsar_backend_name(pulsar_backend backend) {
 
 /* ---- the DeepSeek family's tokenizer table (family.h pulsar_family_tokenizer, L272 P2) ---------------- */
 
+/** pulsar_family_tokenizer::encode_text for DeepSeek: plain BPE.  @param e the engine  @param text the text
+ *  (NULL = "")  @param out receives the tokens */
 static void ds4_tok_encode_text(pulsar_engine *e, const char *text, pulsar_tokens *out) {
     e->vocab.bpe_tokenize_text(text ? text : "", out);
 }
 
+/// pulsar_family_tokenizer::encode_rendered for DeepSeek.
+/// @param e       the engine
+/// @param text    the rendered text
+/// @param spans   [n_spans] the trusted spans, or NULL (the whole text is rendered chat)
+/// @param n_spans spans
+/// @param out     receives the tokens
 static void ds4_tok_encode_rendered(pulsar_engine *e, const char *text, const pulsar_text_span *spans,
                                     uint32_t n_spans, pulsar_tokens *out) {
     if (!spans || !n_spans) e->vocab.tokenize_rendered_chat_vocab(text, out);
     else e->vocab.tokenize_rendered_chat_spans_vocab(text, spans, n_spans, out);
 }
 
+/** pulsar_family_tokenizer::is_stop: EOS only.  @param e the engine  @param token the id  @return true for EOS */
 static bool ds4_tok_is_stop(pulsar_engine *e, int token) { return token == e->vocab.eos_id; }
+/** pulsar_family_tokenizer::eos.  @param e the engine  @return the EOS id */
 static int ds4_tok_eos(pulsar_engine *e) { return e->vocab.eos_id; }
+/** pulsar_family_tokenizer::token_text (vocab_token_text).  @param e the engine  @param token the id
+ *  @param len receives the length  @return the malloc'd text */
 static char *ds4_tok_token_text(pulsar_engine *e, int token, size_t *len) { return vocab_token_text(&e->vocab, token, len); }
+/** pulsar_family_tokenizer::think_close.  @param e the engine  @return the think-end marker id */
 static int ds4_tok_think_close(pulsar_engine *e) { return e->vocab.think_end_id; }
 
 /* DeepSeek names a turn with one special token */
+/** pulsar_family_tokenizer::turn_markers: one special token each.  @param e the engine
+ *  @param out receives the markers  @return true, always */
 static bool ds4_tok_turn_markers(pulsar_engine *e, pulsar_turn_markers *out) {
     out->user[0] = e->vocab.user_id;
     out->n_user = 1;
@@ -1326,8 +1485,11 @@ static bool ds4_tok_turn_markers(pulsar_engine *e, pulsar_turn_markers *out) {
     return true;
 }
 
+/** pulsar_family_tokenizer::dump (dump_tokens_fp).  @param e the engine  @param fp the stream
+ *  @param tokens the tokens */
 static void ds4_tok_dump(pulsar_engine *e, FILE *fp, const pulsar_tokens *tokens) { dump_tokens_fp(fp, &e->vocab, tokens); }
 
+/** pulsar_family_tokenizer::n_tokens.  @param e the engine  @return the vocab size */
 static int ds4_tok_n_tokens(pulsar_engine *e) { return e->vocab.n_vocab; }
 
 const pulsar_family_tokenizer k_ds4_tokenizer = {

@@ -1,3 +1,5 @@
+/** @file session.cpp
+ *  @brief Engine open / close, session create / destroy, imatrix collection and the group GPU lock. */
 #include "pulsar_engine_internal.h"
 #include "exl3_trellis.h"
 #include "spec_internal.h"
@@ -30,6 +32,11 @@ const pulsar_tokens *pulsar_session::tokens() {
 
 
 
+/** Tokenize `text` as a rendered chat with a model's tokenizer and print the tokens (no weights loaded).
+ *  @param model_path the model artifact
+ *  @param text       the rendered chat text (NULL = "")
+ *  @param fp         the output stream (NULL = stdout)
+ *  @return 0, or 1 when the model does not open */
 int pulsar_dump_text_tokenization(const char *model_path, const char *text, FILE *fp) {
     pulsar_model model;
     pulsar_vocab vocab;
@@ -51,6 +58,11 @@ int pulsar_dump_text_tokenization(const char *model_path, const char *text, FILE
 }
 
 
+/** Read a whole imatrix dataset file into a NUL-terminated heap buffer.
+ *  @param path    the file
+ *  @param out     receives the buffer (the caller frees it), NULL on failure
+ *  @param len_out receives its length in bytes, without the NUL
+ *  @return false (said) on a stat / open / read / close failure or an oversized file */
 static bool imatrix_read_text_file(const char *path, char **out, size_t *len_out) {
     *out = NULL;
     *len_out = 0;
@@ -88,6 +100,10 @@ static bool imatrix_read_text_file(const char *path, char **out, size_t *len_out
 }
 
 
+/** Trim whitespace from both ends of [p, end), in place (writes the NUL at the new end).
+ *  @param p   the block's start
+ *  @param end the block's end (writable)
+ *  @return the trimmed block's start */
 static char *imatrix_trim_block(char *p, char *end) {
     while (p < end && isspace((unsigned char)*p)) p++;
     while (end > p && isspace((unsigned char)end[-1])) end--;
@@ -99,6 +115,10 @@ static char *imatrix_trim_block(char *p, char *end) {
 /* The prompt delimiter is a LINE: it matches only at the start of the dataset
  * or right after a '\n', so a prompt that quotes the marker mid-line is not
  * split there (upstream antirez/ds4 0a62b396). */
+/// @param dataset the dataset's start (a match there counts as line start)
+/// @param cursor  where the search starts
+/// @param marker  the delimiter line's text
+/// @return the marker's position, or NULL when none remains
 static char *imatrix_find_marker(char *dataset, char *cursor, const char *marker) {
     const size_t marker_len = strlen(marker);
     char *p = cursor;
@@ -212,13 +232,20 @@ int pulsar_engine::collect_imatrix(const char *dataset_path,
 /* L321: engines live in this process (pulsar_engine_open_group).  The instance lock, the GPU runtime and every
  * model's mapping live until the LAST one closes: an earlier close defers its unmaps to then (the runtime's caches are
  * keyed by mapping, and a reused address must never meet a stale entry). */
+/** Engines open in this process; the instance lock, GPU runtime and mappings go when it returns to 0. */
 static uint32_t g_live_engines;
+/** Models whose unmap an earlier close deferred until the last engine closes. */
 static std::vector<pulsar_model> g_deferred_models;
 
 /* the group's GPU phase lock (pulsar_engine_internal.h): a ticket lock, FIFO -- a phase that lets go and asks again
  * queues behind the phases already waiting, so a parse's next step never starves an encode */
+/** Guards the group GPU phase ticket lock's counters. */
 static pthread_mutex_t g_group_gpu_mu = PTHREAD_MUTEX_INITIALIZER;
+/** Signalled when the ticket being served advances. */
 static pthread_cond_t g_group_gpu_turn = PTHREAD_COND_INITIALIZER;
+/** @var g_group_gpu_serving
+ *  the ticket now holding the GPU phase; advanced by pulsar_group_gpu_unlock */
+/** The next ticket pulsar_group_gpu_lock hands out. */
 static uint64_t g_group_gpu_next, g_group_gpu_serving;
 void pulsar_group_gpu_lock(void) {
     pthread_mutex_lock(&g_group_gpu_mu);
@@ -226,6 +253,7 @@ void pulsar_group_gpu_lock(void) {
     while (g_group_gpu_serving != me) pthread_cond_wait(&g_group_gpu_turn, &g_group_gpu_mu);
     pthread_mutex_unlock(&g_group_gpu_mu);
 }
+/** Release the group GPU phase lock: the next ticket is served (FIFO). */
 void pulsar_group_gpu_unlock(void) {
     pthread_mutex_lock(&g_group_gpu_mu);
     g_group_gpu_serving++;
@@ -238,6 +266,7 @@ void pulsar_group_gpu_unlock(void) {
  * GB10.  A GGUF has one mapping; a safetensors checkpoint has one per layer, and
  * the route is per-mapping, so registering only the first shard would leave 47
  * layers unreadable. */
+/** @param m the model (its shard mappings, or its one mapping) */
 static void register_model_fds(const pulsar_model *m) {
     if (m->n_shards) {
         for (uint64_t i = 0; i < m->n_shards; i++) {
@@ -254,6 +283,12 @@ static void register_model_fds(const pulsar_model *m) {
  * do identical work (every selected expert, half width), so there is no skew by construction.  How a half is
  * built is the format's (tp_slice.cpp: a CUTLASS MXFP4 or an EXL3 stack's half -- L269 W1; another format refuses
  * there by name). */
+/// @param p    the rank's TP plan
+/// @param m    the model holding the layer
+/// @param L    the layer's weights
+/// @param rank this rank
+/// @param nr   ranks in the group
+/// @return true (nothing declared) without routed stacks; false (said) when the intermediate does not split
 static bool tp_declare_expert_half(pulsar_tp_plan *p, pulsar_model *m, const pulsar_layer_weights *L, int rank,
                                    uint32_t nr) {
     if (!L->ffn_gate_exps || !L->ffn_up_exps || !L->ffn_down_exps) return true;   /* no routed experts */
@@ -276,6 +311,12 @@ static bool tp_declare_expert_half(pulsar_tp_plan *p, pulsar_model *m, const pul
  * the shared width).  For the target's layers and the drafter's.  (An MXFP8 down's K-half is keyed by the engine
  * and the tensor OBJECT, never its abs_offset: a safetensors checkpoint is one shard per layer with identical
  * layouts, so every layer's down projection sits at the SAME offset -- tp_slice.cpp.) */
+/// @param p    the rank's TP plan
+/// @param m    the model holding the layer
+/// @param L    the layer's weights
+/// @param rank this rank
+/// @param nr   ranks in the group
+/// @return false without a shared expert, when the rank owns no range, or when a slice is refused
 static bool tp_declare_shared_split(pulsar_tp_plan *p, pulsar_model *m, const pulsar_layer_weights *L, int rank,
                                     uint32_t nr) {
     if (!L->ffn_gate_shexp || !L->ffn_up_shexp || !L->ffn_down_shexp) return false;
@@ -294,6 +335,8 @@ static bool tp_declare_shared_split(pulsar_tp_plan *p, pulsar_model *m, const pu
 /* L272: the loader's one failure policy -- each stage below reports every refusal it finds
  * (pulsar_load_refuse) and the load stops at the stage's end, so a bad artifact fails
  * pulsar_engine_open instead of exiting the process. */
+/// @param stage the stage's name, for the message
+/// @return true when the stage counted no refusal
 static bool ds4_load_stage_ok(const char *stage) {
     const uint32_t n = pulsar_load_refusals();
     if (n == 0) return true;
@@ -418,6 +461,8 @@ bool pulsar_ds4_family_load(pulsar_engine *e, const pulsar_engine_options *opt) 
  * The unit is the group (8 heads and one LoRA-down block each), never the head: a rank's heads are whole groups,
  * so its attn_q_b rows and its attn_output_a rows are contiguous and 128-row aligned.  One box: [0, n).  The rank
  * is the model's (set at open from the options; the transport asserts the same), so record mode reads it too. */
+/// @param e the engine (its model's TP rank sets tp_group_lo / tp_group_hi)
+/// @return false (said) when the rank owns no output group
 static bool ds4_tp_groups(pulsar_engine *e) {
     const int tp_rk = e->model.tp_rank;
     const uint32_t tp_nr = e->model.tp_n_ranks ? e->model.tp_n_ranks : 1u;
@@ -548,6 +593,9 @@ bool pulsar_ds4_family_after_gpu(pulsar_engine *e) {
 }
 
 /* Phase 1: options, the instance, the artifact, the family's load (and the inspect-only exit). */
+/// @param out receives the engine (NULL on failure, the partial engine destroyed)
+/// @param opt the open's options
+/// @return 0, or 1 on a refusal (said)
 static int open_load(pulsar_engine **out, const pulsar_engine_options *opt) {
     pulsar_engine *e = (pulsar_engine *)xcalloc(1, sizeof(*e));
     e->model.fd = -1;
@@ -682,6 +730,8 @@ static int open_load(pulsar_engine **out, const pulsar_engine_options *opt) {
 
 /* Phase 2: the device, the layouts it can run, every mapping set (no weight staged yet: setting a mapping drops what
  * was staged, so a group sets all of its members' before any member stages). */
+/// @param e the engine
+/// @return false (said) when the device or a mapping could not be set up
 static bool open_map(pulsar_engine *e) {
     const bool graph_backend = pulsar_backend_uses_graph(e->backend);
     if (graph_backend) {
@@ -744,6 +794,8 @@ static bool open_map(pulsar_engine *e) {
 }
 
 /* Phase 3: the weights staged into the device cache. */
+/// @param e the engine
+/// @return false (said) when staging failed
 static bool open_stage(pulsar_engine *e) {
     if (pulsar_backend_uses_graph(e->backend)) {
         register_model_fds(&e->model);
@@ -785,6 +837,9 @@ static bool open_stage(pulsar_engine *e) {
 }
 
 /* Phase 4: the TP transport, the family's device-side registrations, the host pages released. */
+/// @param e   the engine
+/// @param opt the open's options
+/// @return false (said) on a failure
 static bool open_finish(pulsar_engine *e, const pulsar_engine_options *opt) {
     const bool graph_backend = pulsar_backend_uses_graph(e->backend);
     /* Two-rank TP (slice 4b, prefill big-gate arm).  Built here, after the
@@ -1130,6 +1185,9 @@ void pulsar_engine::destroy() {
  * lane's stage+publish ticket (tp_stage_ticket, zeroed).  Part of the create,
  * so the admission price (session_cost_bytes_banked: the create run dry)
  * carries it.  Nothing on a box with no row-lane pair. */
+/// @param g  the session's graph
+/// @param tp the engine's transport (NULL = one GPU)
+/// @return false (said) when an allocation failed; true with nothing to do
 static bool session_alloc_tp_scratch(pulsar_gpu_graph *g, pulsar_tp *tp) {
     if (!tp || !pulsar_tp_row_lane(tp)) return true;
     const uint64_t vb = pulsar_tp_vec_bytes(tp);
@@ -1159,6 +1217,10 @@ static bool session_alloc_tp_scratch(pulsar_gpu_graph *g, pulsar_tp *tp) {
 /* Every session is created by its engine's family (family.h).  The ONE build both the create and the price
  * run: the core allocates the session and its own state (the prefill cap, the logits row at the family's
  * width), the family builds its state for n_banks into it.  NULL when the family refused. */
+/// @param e        the engine
+/// @param ctx_size the context, in tokens
+/// @param n_banks  banks to build
+/// @return the session (the caller destroys it), or NULL
 static pulsar_session *session_build(pulsar_engine *e, int ctx_size, uint32_t n_banks) {
     pulsar_session *s = (pulsar_session *)xcalloc(1, sizeof(*s));
     s->engine = e;
@@ -1455,10 +1517,22 @@ done:
 }
 
 /* The engine's vocabulary for the seam walks. */
+/** pulsar_token_text_fn over the engine's tokenizer.
+ *  @param ud    the engine
+ *  @param token the token id
+ *  @param len   receives the text's length in bytes
+ *  @return a malloc'd copy of the token's text (the caller frees it), or NULL */
 static char *prefix_walk_engine_text(void *ud, int token, size_t *len) {
     return pulsar_token_text((pulsar_engine *)ud, token, len);
 }
 
+/** The seam walk (pulsar_tokens_prefix_match_with) over the engine's tokenizer; a NULL engine matches nothing.
+ *  @param e     the engine
+ *  @param a     the live side's tokens
+ *  @param a_len tokens in `a`
+ *  @param b     the request prompt's tokens
+ *  @param b_len tokens in `b`
+ *  @param out   receives the match */
 void pulsar_tokens_prefix_match(pulsar_engine *e,
                                 const int *a, int a_len,
                                 const int *b, int b_len,

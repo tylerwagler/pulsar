@@ -1,3 +1,5 @@
+/** @file vision.cpp
+ *  @brief DeepSeek Vision-Exp image layout math, the shared image codec and Pillow-exact resize. */
 /* L216 -- DeepSeek-V4-Flash-Vision-Exp image LAYOUT math.
  *
  * A faithful port of the checkpoint's own inference/image_processor.py: the
@@ -37,15 +39,26 @@
 /* The reference's IMAGE_START, IMAGE_PAD, IMAGE, IMAGE_NEW_LINE, IMAGE_END.
  * The values are the shared authority (PULSAR_VISION_ROLE_*) because the prefill
  * token upload has to know which out-of-vocab ids are legal sentinels. */
+/// Span type: the image's opening sentinel.
 #define VISION_T_IMAGE_START    PULSAR_VISION_ROLE_IMAGE_START
+/// Span type: a padding slot.
 #define VISION_T_IMAGE_PAD      PULSAR_VISION_ROLE_IMAGE_PAD
+/// Span type: an image row (an aligner output).
 #define VISION_T_IMAGE          PULSAR_VISION_ROLE_IMAGE
+/// Span type: the end of one grid row.
 #define VISION_T_IMAGE_NEWLINE  PULSAR_VISION_ROLE_NEWLINE
+/// Span type: the image's closing sentinel.
 #define VISION_T_IMAGE_END      PULSAR_VISION_ROLE_IMAGE_END
+/// A span is padded to a multiple of this many tokens (the compressor's alignment).
 #define VISION_COMPRESS_PAD_TO  4
 
 /* image_processor.grid_tokens(): the LLM-token grid the aligner occupies,
  * including the row padding and the compressor-alignment pad. */
+/// @param best_height canvas height, in pixels
+/// @param best_width canvas width, in pixels
+/// @param patch_size ViT patch side
+/// @param downsample_ratio the aligner's merge factor
+/// @return the text grid and the sentinel block's length
 pulsar_vision_grid vision_grid_tokens(int best_height, int best_width,
                                       int patch_size, int downsample_ratio) {
     pulsar_vision_grid g;
@@ -60,6 +73,12 @@ pulsar_vision_grid vision_grid_tokens(int best_height, int best_width,
 
 /* image_processor.solve_resize_ratio(): the largest patch-aligned size whose
  * grid fits `max_n_token`.  float64 throughout, like the reference. */
+/// @param height source height
+/// @param width source width
+/// @param patch_size ViT patch side
+/// @param downsample_ratio the aligner's merge factor
+/// @param max_n_token the block's token budget
+/// @return the fitted size and its grid
 pulsar_vision_resize vision_solve_resize_ratio(int height, int width,
                                                int patch_size, int downsample_ratio,
                                                int max_n_token) {
@@ -356,14 +375,20 @@ void vision_window_topk_visible(int window_size, int n, const int32_t *left,
  * without -ffast-math (see the Makefile) for the same reason the layout math is.
  * ------------------------------------------------------------------------- */
 
+/// Pillow's fixed-point coefficient precision (Q22).
 #define PIL_PRECISION_BITS 22   /* (32 - 8 - 2): 8 bits of result, 2 of overflow */
 
 /* Pillow's bilinear (triangle) filter, support 1.0 (L321: Nemotron Parse's resize). */
+/// @param x distance from the center, in source pixels / filterscale
+/// @return the weight
 static double pil_bilinear_filter(double x) {
     if (x < 0.0) x = -x;
     return x < 1.0 ? 1.0 - x : 0.0;
 }
 
+/// Pillow's bicubic filter (a = -0.5), support 2.0.
+/// @param x distance from the center
+/// @return the weight
 static double pil_bicubic_filter(double x) {
     const double a = -0.5;
     if (x < 0.0) x = -x;
@@ -375,6 +400,8 @@ static double pil_bicubic_filter(double x) {
 /* Pillow's clip8(): the lookup table maps (v >> 22) in [-640, 639] to [0,255],
  * negative to 0 and >255 to 255.  Clamping the index keeps the same answers
  * without relying on the filter never overshooting the table. */
+/// @param in a Q22 accumulator
+/// @return the clamped 8-bit value
 static inline uint8_t pil_clip8(int32_t in) {
     int32_t v = in >> PIL_PRECISION_BITS;
     if (v < -640) v = -640;
@@ -385,6 +412,14 @@ static inline uint8_t pil_clip8(int32_t in) {
 }
 
 /* Pillow's precompute_coeffs() for BICUBIC (support 2.0) or BILINEAR (support 1.0), double coefficients. */
+/// @param in_size source extent
+/// @param in0 box start
+/// @param in1 box end
+/// @param out_size destination extent
+/// @param filter BILINEAR or BICUBIC
+/// @param[out] bounds_out [out_size][2] (first tap, tap count), malloc'd
+/// @param[out] kk_out [out_size][ksize] weights, calloc'd
+/// @return ksize, or 0 on an allocation failure
 static int pil_precompute_coeffs(int in_size, float in0, float in1, int out_size, pulsar_pil_filter filter,
                                  int **bounds_out, double **kk_out) {
     double scale = (double)(in1 - in0) / (double)out_size;
@@ -422,6 +457,9 @@ static int pil_precompute_coeffs(int in_size, float in0, float in1, int out_size
 
 /* Pillow's normalize_coeffs_8bpc(): double -> Q22, round-half-away-from-zero
  * (add +/-0.5 then truncate toward zero). */
+/// @param n coefficients
+/// @param pre [n] double weights
+/// @param[out] kk [n] Q22 weights
 static void pil_normalize_coeffs(int n, const double *pre, int32_t *kk) {
     const double one = (double)(1 << PIL_PRECISION_BITS);
     for (int i = 0; i < n; i++)
@@ -432,6 +470,16 @@ static void pil_normalize_coeffs(int n, const double *pre, int32_t *kk) {
 /* One axis of Pillow's two-pass 8bpc resample for 3 bands.  `vert` selects
  * whether the filter runs down the source rows or across the source columns;
  * the arithmetic (and the 1<<21 rounding seed) is identical either way. */
+/// @param[out] dst RGB8 [dst_h][dst_w]
+/// @param dst_w destination width
+/// @param dst_h destination height
+/// @param src RGB8 [src_h][src_w]
+/// @param src_w source width
+/// @param src_h source height (unused)
+/// @param ksize taps per output
+/// @param bounds the axis's bounds (pil_precompute_coeffs)
+/// @param kk the axis's Q22 weights
+/// @param vert nonzero: filter down rows; zero: across columns
 static void pil_resample_axis(uint8_t *dst, int dst_w, int dst_h,
                               const uint8_t *src, int src_w, int src_h,
                               int ksize, const int *bounds, const int32_t *kk,
@@ -516,12 +564,16 @@ uint8_t *vision_pil_resize_rgb(const uint8_t *src, int src_w, int src_h,
 
 /* Python's round(): ties-to-even, which is what ImageOps.pad uses for the paste
  * offset and ImageOps.contain for the contained size. */
+/// @param v a value
+/// @return round-half-to-even
 static int py_round(double v) {
     double r = nearbyint(v);   /* default FE_TONEAREST == half to even */
     return (int)r;
 }
 
 /* float32 -> bfloat16, round-to-nearest-even, as torch's .to(bfloat16) does. */
+/// @param f a value
+/// @return its bf16 bits (NaN not special-cased)
 static uint16_t f32_to_bf16_bits(float f) {
     uint32_t u;
     memcpy(&u, &f, sizeof u);
@@ -536,6 +588,15 @@ static uint16_t f32_to_bf16_bits(float f) {
  * vision_preprocess_rgb so a caller can size its patch buffer BEFORE paying for
  * the pixels -- the canvas can be LARGER than the input (min_pixels upscales),
  * so sizing from the input under-allocates. */
+/// @param width source width
+/// @param height source height
+/// @param args the processor's arguments
+/// @param[out] best_w_out canvas width
+/// @param[out] best_h_out canvas height
+/// @param[out] n_vit_h_out ViT patches down
+/// @param[out] n_vit_w_out ViT patches across
+/// @param[out] sr_out the resize decision
+/// @return 1, or 0 when no grid fits the token budget
 static int vision_geometry(int width, int height, const pulsar_vision_args *args,
                            int *best_w_out, int *best_h_out,
                            int *n_vit_h_out, int *n_vit_w_out,
@@ -675,6 +736,13 @@ int vision_preprocess_rgb(const uint8_t *rgb, int width, int height,
  * by the dispatcher -- the caller fails loudly, it does not guess.
  * ------------------------------------------------------------------------- */
 
+/// Decode a PNG to RGB8, alpha dropped (Pillow's convert("RGB")).
+/// @param bytes the encoded image
+/// @param len its length
+/// @param[out] rgb_out RGB8 pixels, malloc'd (caller frees)
+/// @param[out] w_out width
+/// @param[out] h_out height
+/// @return 1, or 0 when it does not decode or is refused
 static int vision_decode_png(const uint8_t *bytes, size_t len,
                              uint8_t **rgb_out, int *w_out, int *h_out) {
     png_image image;
@@ -716,17 +784,31 @@ static int vision_decode_png(const uint8_t *bytes, size_t len,
     return 1;
 }
 
+/** libjpeg's error manager extended with a jump back into vision_decode_jpeg (a decode error longjmps, never exits). */
 struct vision_jpeg_error {
+    /// the libjpeg manager (first, so cinfo->err casts back to this)
     struct jpeg_error_mgr pub;
+    /// where vision_jpeg_error_exit returns to
     jmp_buf jb;
 };
 
+/// libjpeg error_exit: longjmp back to vision_decode_jpeg.
+/// @param cinfo the decompressor (its err is a vision_jpeg_error)
 static void vision_jpeg_error_exit(j_common_ptr cinfo) {
     struct vision_jpeg_error *e = (struct vision_jpeg_error *)cinfo->err;
     longjmp(e->jb, 1);
 }
+/// libjpeg output_message: silenced.
+/// @param cinfo unused
 static void vision_jpeg_output_message(j_common_ptr cinfo) { (void)cinfo; }
 
+/// Decode a JPEG to RGB8 (CMYK / YCCK refused).
+/// @param bytes the encoded image
+/// @param len its length
+/// @param[out] rgb_out RGB8 pixels, malloc'd (caller frees)
+/// @param[out] w_out width
+/// @param[out] h_out height
+/// @return 1, or 0 when it does not decode or is refused
 static int vision_decode_jpeg(const uint8_t *bytes, size_t len,
                               uint8_t **rgb_out, int *w_out, int *h_out) {
     struct jpeg_decompress_struct cinfo;
@@ -781,6 +863,13 @@ static int vision_decode_jpeg(const uint8_t *bytes, size_t len,
 
 /* Formats the server accepts today: PNG and JPEG.  A GIF/WebP/... payload is
  * refused by name rather than mis-parsed. */
+/// Decode PNG or JPEG bytes to RGB8 (anything else, and CMYK / YCCK JPEG, refused).
+/// @param bytes the encoded image
+/// @param len its length
+/// @param[out] rgb_out RGB8 pixels, malloc'd (caller frees)
+/// @param[out] w_out width
+/// @param[out] h_out height
+/// @return 1, or 0 when refused or undecodable
 int vision_decode_rgb(const uint8_t *bytes, size_t len,
                       uint8_t **rgb_out, int *w_out, int *h_out) {
     if (!bytes || len < 8) return 0;
@@ -896,6 +985,8 @@ fail_tmp:
     return 0;
 }
 
+/// Free a prepared image's buffers and zero it.
+/// @param p the image (NULL is a no-op)
 void vision_prepared_free(pulsar_vision_prepared *p) {
     if (!p) return;
     free(p->patches);
@@ -918,6 +1009,15 @@ void vision_prepared_free(pulsar_vision_prepared *p) {
  * embedding.  Split out of vision_merge_span so vision_ds4_block_rows (the shared
  * front, over the core's tower-output cache) produces exactly the same bytes as
  * the encoding path -- one assembler, two sources. */
+/// @param w the vision weights (the sentinel embeddings)
+/// @param m the model (their mapping)
+/// @param prep the image's prepared span (types, perm)
+/// @param aligner [rows][PULSAR_N_EMBD] bf16 aligner rows
+/// @param rows their count
+/// @param[out] out [span_len][PULSAR_N_EMBD] bf16
+/// @param out_cap capacity of out, in elements
+/// @param[out] out_len span_len
+/// @return 1, or 0 on a span that does not fit or an index out of range
 static int vision_span_assemble(const pulsar_vision_weights *w, const pulsar_model *m,
                                 const pulsar_vision_prepared *prep,
                                 const uint16_t *aligner, int rows,

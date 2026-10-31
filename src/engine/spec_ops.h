@@ -1,3 +1,5 @@
+/** @file spec_ops.h
+ *  @brief The speculation seam: what a target family and a drafter each provide to the round API. */
 /* spec_ops.h -- the speculation seam (L272 P1 S2): what a TARGET family provides so any drafter can run
  * against its forward, and what a DRAFTER provides -- two plugins, one round API (session_spec.cpp) and
  * one server lane between them.
@@ -84,7 +86,10 @@ typedef struct pulsar_spec_target_ops {
 /** pulsar_drafter_ops::draft's refusal (L306): no chain, and the round that asked for it refuses. */
 #define PULSAR_DRAFT_REFUSED UINT32_MAX
 
+/** A drafter's implementation behind the round API: static constants and hooks, one table per drafter kind
+ *  (DSpark, MTP, the block drafter), selected at load; never freed. */
 typedef struct pulsar_drafter_ops {
+    /// The drafter's name, for log lines and announcements (static string).
     const char *name;
     uint32_t depth;       ///< the depth a fresh session drafts at (the adaptive controller moves it from here)
     uint32_t depth_max;   ///< the deepest chain the drafter can draft (<= 16); a configured depth is clamped to it

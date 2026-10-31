@@ -1,3 +1,5 @@
+/** @file family.h
+ *  @brief The model-family interface: what a family supplies for the engine to serve it end to end. */
 /* family.h -- the model-family interface (L251 S1).
  *
  * A FAMILY is one model architecture the engine serves end to end: DeepSeek V4
@@ -59,6 +61,8 @@ typedef enum : uint8_t {
 } pulsar_layer_kind;
 
 /** Printable name of a layer kind ("ds4_block", "qwen_gdn", "qwen_qsa", "blocks"). */
+/// @param k a kind
+/// @return its name (static)
 const char *pulsar_layer_kind_name(pulsar_layer_kind k);
 
 /** L295 E1: the token mixer of a PULSAR_LAYER_BLOCKS layer -- which shared block it runs (F1's GQA block over every
@@ -82,7 +86,9 @@ typedef enum : uint8_t {
  *  pulsar_driver_ops::block); for a PULSAR_LAYER_BLOCKS layer that op composes the layer from desc[il].  Any other kind
  *  carries a zero desc.  pulsar_layer_plan_check asserts both, once, after the family's load. */
 typedef struct {
+    /// the layer's token mixer (attention variant or recurrent block)
     pulsar_mixer_kind mixer;
+    /// the layer's feed-forward block, or PULSAR_FFN_NONE
     pulsar_ffn_kind ffn;
     uint32_t window;   ///< keys a PULSAR_MIXER_ATTN_WINDOW layer attends to; 0 otherwise
 } pulsar_layer_desc;
@@ -102,6 +108,8 @@ typedef struct pulsar_tp_plan pulsar_tp_plan;
  *  family that serves no images: no id is a sentinel and an image request is refused by name.  Whether the loaded
  *  artifact carries a bound tower is `pulsar_engine::vision_ready`, set by the family's load. */
 typedef struct pulsar_family_vision {
+    /** true when `id` is the family's image-block sentinel (Qwen: the vision pad id; false for every id when the
+     *  artifact has none) */
     bool (*is_sentinel)(const pulsar_engine *e, int32_t id);
     /** true and *len = the block's length when `ids[start..]` begins an image block */
     bool (*block_extent)(const pulsar_engine *e, const int32_t *ids, int n, int start, int *len);
@@ -152,18 +160,26 @@ typedef struct {
 /** The layer plan: built once by the family's load from the artifact, then
  * read-only.  kind[il] for il < n_layer is never PULSAR_LAYER_NONE. */
 typedef struct {
+    /// layers the loaded model runs (<= PULSAR_FAMILY_MAX_LAYER)
     uint32_t n_layer;
+    /// kind[il]: which block op runs layer il; only [0, n_layer) is meaningful
     pulsar_layer_kind kind[PULSAR_FAMILY_MAX_LAYER];
     /** desc[il] is the layer's blocks when kind[il] is PULSAR_LAYER_BLOCKS, zero otherwise. */
     pulsar_layer_desc desc[PULSAR_FAMILY_MAX_LAYER];
 } pulsar_layer_plan;
 
 /** Count the layers of one kind. */
+/// @param p the plan
+/// @param k the kind
+/// @return layers of that kind
 uint32_t pulsar_layer_plan_count(const pulsar_layer_plan *p, pulsar_layer_kind k);
 /** The plan's invariants (L295: one layer-description authority): every layer il < n_layer has a kind
  *  (not NONE, below PULSAR_LAYER_KIND_COUNT); desc[il] is non-zero exactly on a PULSAR_LAYER_BLOCKS layer, whose
  *  mixer is set (its FFN may be NONE) and whose window is non-zero exactly on PULSAR_MIXER_ATTN_WINDOW.  NULL when it holds, else
  *  what broke, with the layer in *at_layer.  The engine refuses a load whose plan fails it. */
+/// @param p the plan
+/// @param[out] at_layer the failing layer (UINT32_MAX when it holds)
+/// @return NULL, or the broken invariant
 const char *pulsar_layer_plan_check(const pulsar_layer_plan *p, uint32_t *at_layer);
 
 /** Session features beyond the core forward.  A C API entry point whose
@@ -243,14 +259,18 @@ typedef struct pulsar_family_tokenizer {
      *  turn rendered whole, the close of a sampled assistant turn -- each the family's own template. */
     void (*chat_open)(pulsar_engine *e, pulsar_tokens *tokens, const char *trusted, const char *system,
                       pulsar_think_mode think_mode);
+    /** Append `n` messages rendered whole, then the assistant generation prompt when `generation_prompt`. */
     void (*chat_turn)(pulsar_engine *e, pulsar_tokens *tokens, const pulsar_chat_message *msgs, int n,
                       bool generation_prompt, pulsar_think_mode think_mode);
+    /** Append the close of a sampled assistant turn. */
     void (*chat_end_assistant)(pulsar_engine *e, pulsar_tokens *tokens);
+    /** true when `token` is any of the tokenizer's stop ids. */
     bool (*is_stop)(pulsar_engine *e, int token);
     /** The stop id a caller that needs ONE uses (pulsar_token_is_stop tests them all). */
     int (*eos)(pulsar_engine *e);
     /** `token`'s bytes, malloc'd and NUL-terminated (empty for an id outside the table). */
     char *(*token_text)(pulsar_engine *e, int token, size_t *len);
+    /** The token id that closes a thinking span, or -1 when the tokenizer has none. */
     int (*think_close)(pulsar_engine *e);
     /** The turn markers the server's prefix anchors scan for; false = unknown (said once). */
     bool (*turn_markers)(pulsar_engine *e, pulsar_turn_markers *out);
@@ -270,6 +290,7 @@ typedef struct pulsar_family_tokenizer {
  * touched share, the 2b guard keeps touched KV under budget by spilling a bank to
  * its segment chain and freeing its physical; the always-resident state stays). */
 typedef struct {
+    /** Banks in the session's pool (pulsar_session_bank_count). */
     int (*count)(pulsar_session *s);
     /** The live host view into bank's carry -- the core's pulsar_bank_carry_save_view (L272 P2) plus any
      *  device side of the family's own; the history readers are the core's (pulsar_bank_history). */
@@ -319,16 +340,23 @@ typedef struct {
 /** L321: an encoder family's entries (pulsar.h pulsar_engine_encode*): the C API checks PULSAR_FAMILY_CAP_ENCODE and
  *  calls these.  Present exactly when the family declares the cap (pulsar_family_for_model asserts it). */
 typedef struct pulsar_family_encoder {
+    /** What the loaded encoder is (pulsar_engine_encoder). */
     pulsar_encoder_kind (*kind)(const pulsar_engine *e);
+    /** Floats per encoded input (pulsar_engine_encode_dim). */
     uint32_t (*dim)(const pulsar_engine *e);
+    /** The longest rendered input, in tokens, encode accepts (pulsar_engine_encode_max_tokens). */
     uint32_t (*max_tokens)(const pulsar_engine *e);
+    /** Render `text` (and `doc` for a PAIR) as the encoder's input for `role` into `out`; false + `err` on a refused
+     *  role or text (pulsar_engine_encode_render). */
     bool (*render)(pulsar_engine *e, pulsar_encode_role role, const char *text, const char *doc, pulsar_tokens *out,
                    char *err, size_t errlen);
+    /** Encode `n` rendered inputs into out[n][dim]; 0, or -1 + `err` (pulsar_engine_encode). */
     int (*encode)(pulsar_engine *e, const pulsar_tokens *inputs, uint32_t n, float *out, char *err, size_t errlen);
 } pulsar_family_encoder;
 
 /** L321: a page-parser family's entry (pulsar.h pulsar_engine_parse_page), behind PULSAR_FAMILY_CAP_PARSE. */
 typedef struct pulsar_family_parser {
+    /** Parse one page image (pulsar_engine_parse_page): 0; -2 + `err` refused request; -1 + `err` engine failure. */
     int (*parse)(pulsar_engine *e, const uint8_t *image, size_t len, const pulsar_parse_options *opt, pulsar_tokens *ids,
                  char **text, pulsar_parse_stats *stats, char *err, size_t errlen);
 } pulsar_family_parser;
@@ -336,6 +364,7 @@ typedef struct pulsar_family_parser {
 /** One model family.  Instances are static and const; pulsar_engine::family
  * points at one for the engine's lifetime. */
 struct pulsar_family {
+    /// which family this is (pulsar.h pulsar_family_id)
     pulsar_family_id id;
     const char *arch;              ///< the artifact's `general.architecture` value this family claims
     const char *name;              ///< human-readable family name
@@ -349,10 +378,13 @@ struct pulsar_family {
     bool (*after_gpu)(pulsar_engine *e);
     /** Engine facts that depend on the loaded shape. */
     uint32_t (*logits_width)(const pulsar_engine *e);
+    /// the model's display name (pulsar_engine::model_name)
     const char *(*model_name)(const pulsar_engine *e);
     /** The id the API serves the model as (`model` in responses and /v1/models). */
     const char *(*served_model_id)(const pulsar_engine *e);
+    /// the chat template family the server renders with
     pulsar_chat_format (*chat_format)(const pulsar_engine *e);
+    /// stable model id for cache keys and identities (pulsar_engine::model_id)
     int (*model_id)(const pulsar_engine *e);
     /** The longest context the loaded model's positions were trained for, with whatever position scaling the
      *  family implements (DeepSeek: YaRN's original context x factor; Qwen: max_position_embeddings, or YaRN's
@@ -379,6 +411,7 @@ struct pulsar_family {
     /** The family's verify hooks for the speculation round API (spec_ops.h), or NULL = no drafter can
      *  run against this family's forward (L272 P1; a family without them does not declare CAP_SPEC). */
     const pulsar_spec_target_ops *spec;
+    /// the family's session forward (state sync, eval, multi-seq / mixed / fused decode)
     const pulsar_family_session_ops *session;
     /** The tokenizer and chat front (L272 P2), or NULL = none. */
     const pulsar_family_tokenizer *tokenizer;
@@ -407,21 +440,30 @@ struct pulsar_family {
     const pulsar_family_parser *parser;
 };
 
+/// The DeepSeek V4 family (family_deepseek.cpp).
 extern const pulsar_family PULSAR_FAMILY_DEEPSEEK4;
 extern const pulsar_family PULSAR_FAMILY_QWEN4_EXP;
 
 /** The family that claims the model's `general.architecture`.  Prints the
  * architecture and the known ones and returns NULL when none does; a missing
  * key is refused the same way. */
+/// @param m the opened model
+/// @return the family, or NULL (printed); also NULL when the family's ops are out of step with its caps
 const pulsar_family *pulsar_family_for_model(const pulsar_model *m);
 
 /** L280: the rope_id of every family whose model id already fixes its rope -- 0. */
+/// @param e the engine
+/// @return 0
 uint64_t pulsar_family_rope_fixed(const pulsar_engine *e);
 
 /** True when the engine's family declares `cap`.  Otherwise prints, once per
  * (op) call site, "<family> does not implement <op>" and returns false: the
  * caller refuses with its own error value.  A NULL engine passes (the caller's
  * own NULL check decides). */
+/// @param e the engine, or NULL
+/// @param cap the PULSAR_FAMILY_CAP_* bits required
+/// @param op the operation's name (a string literal: its address dedups the message)
+/// @return whether the family declares every bit
 bool pulsar_family_require(const pulsar_engine *e, uint32_t cap, const char *op);
 
 #endif /* PULSAR_FAMILY_H */

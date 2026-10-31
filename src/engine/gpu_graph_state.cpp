@@ -1,3 +1,5 @@
+/** @file gpu_graph_state.cpp
+ *  @brief DeepSeek graph teardown and release, and directional-steering vector loading. */
 #include "pulsar_engine_internal.h"
 
 
@@ -15,6 +17,7 @@ void gpu_graph_free(pulsar_gpu_graph *g) {
  * the allocator's own failure paths and the dry-run pricer use this -- a graph
  * that never ran has baked no segment graph, and a pricing run must not reset
  * the live session's. */
+/// @param g the graph; zeroed after
 void gpu_graph_release(pulsar_gpu_graph *g) {
     gpu_graph_engram_release(g);
     pulsar_ckpt_release(&g->ckpt);
@@ -197,6 +200,10 @@ void gpu_graph_release(pulsar_gpu_graph *g) {
 
 
 
+/// @param t the tensor
+/// @param v the value
+/// @param n f32 elements to fill
+/// @return false = the fill failed
 bool gpu_tensor_fill_f32(pulsar_gpu_tensor *t, float v, uint64_t n) {
     return pulsar_gpu_tensor_fill_f32(t, v, n) != 0;
 }
@@ -218,6 +225,12 @@ bool gpu_tensor_fill_f32(pulsar_gpu_tensor *t, float v, uint64_t n) {
  * the normal inference path.
  */
 
+/// Load the per-layer steering directions and scales (both scales 0: nothing loaded).
+/// @param g the graph
+/// @param path the direction file, PULSAR_N_LAYER x PULSAR_N_EMBD f32
+/// @param attn_scale the attention outputs' scale
+/// @param ffn_scale the FFN outputs' scale
+/// @return false (said) on a missing path or a bad file
 bool gpu_graph_load_directional_steering(
         pulsar_gpu_graph *g,
         const char      *path,

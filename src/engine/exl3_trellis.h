@@ -40,8 +40,10 @@
  * dequant and the transcoder; nothing about the layout is restated in a
  * kernel. */
 #ifdef __CUDACC__
+/** `__host__ __device__` under nvcc, nothing in a host TU: marks the layout helpers callable from both. */
 #define EXL3_HD __host__ __device__
 #else
+/** Host-only build: EXL3_HD expands to nothing. */
 #define EXL3_HD
 #endif
 
@@ -51,6 +53,8 @@
  * exllamav3's own codebook values, all 65536 of them. */
 
 /** IEEE binary16 bits -> float, exact (subnormals, Inf, NaN included). */
+/// @param h binary16 bit pattern
+/// @return the same value as a float
 static inline float exl3_f16_to_f32(uint16_t h) {
     const uint32_t sign = (uint32_t)(h & 0x8000u) << 16;
     uint32_t exp = (h >> 10) & 0x1fu, mant = h & 0x3ffu, bits;
@@ -75,6 +79,8 @@ static inline float exl3_f16_to_f32(uint16_t h) {
 
 /** float -> IEEE binary16 bits, round to nearest even (the rounding every
  *  fp16 instruction applies), overflow to Inf, subnormals exact. */
+/// @param f value to convert
+/// @return its binary16 bit pattern (NaN stays a quiet NaN, sign kept)
 static inline uint16_t exl3_f32_to_f16(float f) {
     uint32_t x;
     memcpy(&x, &f, sizeof x);
@@ -112,6 +118,8 @@ static inline uint16_t exl3_f32_to_f16(float f) {
  * Bit rate in half-bit units: k2 = 2K for an integer K in 1..8, 2K+1 for the
  * half-integer rates 1.5, 2.5, 3.5.  Anything else is not an EXL3 rate.
  */
+/// @param k2 candidate rate in half-bit units
+/// @return true for k2 in {2,4,..,16} or {3,5,7}
 EXL3_HD static inline bool exl3_k2_valid(int k2) {
     const int bits = k2 >> 1;
     if (k2 & 1) return bits >= 1 && bits <= 3;
@@ -119,6 +127,8 @@ EXL3_HD static inline bool exl3_k2_valid(int k2) {
 }
 
 /** uint16 words per 256-weight tile: 16K, or 16K + 8 for a half-integer K. */
+/// @param k2 rate in half-bit units (exl3_k2_valid)
+/// @return uint16 words in one tile's stream
 EXL3_HD static inline int exl3_words_per_tile(int k2) {
     return 16 * (k2 >> 1) + ((k2 & 1) ? 8 : 0);
 }
@@ -129,6 +139,8 @@ EXL3_HD static inline int exl3_words_per_tile(int k2) {
  * checkpoint records it.  (16K + 8 for K=2 is 40 = 16 * 2.5: the half-integer
  * widths collide with nothing because 16K + 8 is never a multiple of 16.)
  */
+/// @param words the trellis' last dimension: uint16 words per tile
+/// @return the rate in half-bit units, or 0 if no valid rate stores `words`
 EXL3_HD static inline int exl3_k2_from_words(int words) {
     if (words <= 0 || words % 8) return 0;
     const int k2 = (words % 16 == 0) ? 2 * (words / 16) : 2 * (words / 16) + 1;
@@ -136,6 +148,8 @@ EXL3_HD static inline int exl3_k2_from_words(int words) {
 }
 
 /** Stream bits per tile. */
+/// @param k2 rate in half-bit units
+/// @return bits in one tile's stream (16 * exl3_words_per_tile)
 EXL3_HD static inline int exl3_stream_bits(int k2) {
     return 16 * exl3_words_per_tile(k2);
 }
@@ -146,6 +160,9 @@ EXL3_HD static inline int exl3_stream_bits(int k2) {
  * even position ends K bits in, the odd one at the pair's end
  * (`dq8_half`: w6 = w7 >> (K+1), w5 = w6 >> K).
  */
+/// @param k2 rate in half-bit units
+/// @param p tile position, 0..255 (tensor-core order)
+/// @return the exclusive end bit, not yet wrapped mod exl3_stream_bits
 EXL3_HD static constexpr inline int exl3_state_end_bit(int k2, int p) {
     const int bits = k2 >> 1;
     if (!(k2 & 1)) return (p + 1) * bits;
@@ -158,6 +175,10 @@ EXL3_HD static constexpr inline int exl3_state_end_bit(int k2, int p) {
  * words as stored (uint16, little-endian, halves of each uint32 swapped by the
  * packer -- reading the pair as one little-endian uint32 undoes the swap).
  */
+/// @param tile the tile's exl3_words_per_tile(k2) words
+/// @param k2 rate in half-bit units
+/// @param p tile position, 0..255
+/// @return the state, in the low 16 bits
 static inline uint32_t exl3_tile_state(const uint16_t *tile, int k2, int p) {
     const int total = exl3_stream_bits(k2);
     const int end = exl3_state_end_bit(k2, p);
@@ -181,6 +202,8 @@ static inline uint32_t exl3_tile_state(const uint16_t *tile, int k2, int p) {
  * fp32 and the single rounding is the final conversion.  Range +-3.45,
  * quantum 0.00677.
  */
+/// @param state trellis state (only the low 16 bits are read)
+/// @return the weight's fp16 bit pattern
 static inline uint16_t exl3_mul1_decode(uint32_t state) {
     const uint32_t y = (state & 0xffffu) * EXL3_MUL1_MULTIPLIER;
     const uint32_t s = 0x6400u + (y & 0xffu) + ((y >> 8) & 0xffu) + ((y >> 16) & 0xffu) + (y >> 24);
@@ -194,6 +217,9 @@ static inline uint16_t exl3_mul1_decode(uint32_t state) {
  * 16x16 tile, row along `in`, col along `out`.  Lane t = p >> 3, i = p & 7:
  * row = (t % 4) * 2 + {0, 1, 8, 9}[i & 3], col = t / 4 + 8 * (i >> 2).
  */
+/// @param p tile position, 0..255
+/// @param[out] row 0..15, along `in`
+/// @param[out] col 0..15, along `out`
 EXL3_HD static inline void exl3_tile_position(int p, int *row, int *col) {
     const int t = p >> 3, i = p & 7;
     *row = (t % 4) * 2 + (i & 1) + 8 * ((i >> 1) & 1); /* {0, 1, 8, 9}[i & 3] */
@@ -204,6 +230,9 @@ EXL3_HD static inline void exl3_tile_position(int p, int *row, int *col) {
  * Dequantize one tile to its 256 fp16 weights (bits), row-major 16x16 in the
  * rotated basis (W_hat).  Byte-exact with exllamav3's `reconstruct`.
  */
+/// @param tile the tile's words as stored
+/// @param k2 rate in half-bit units
+/// @param[out] out 256 fp16 bit patterns, out[row * 16 + col]
 static inline void exl3_tile_dequant(const uint16_t *tile, int k2, uint16_t out[EXL3_TILE_WEIGHTS]) {
     for (int p = 0; p < EXL3_TILE_WEIGHTS; p++) {
         int r, c;
@@ -217,6 +246,8 @@ static inline void exl3_tile_dequant(const uint16_t *tile, int k2, uint16_t out[
  * is not an EXL3 layout.  One id per rate because the rate is not recoverable
  * from a stack's dims; `m` in the names pins the mul1 codebook.
  */
+/// @param type a PULSAR_TENSOR_* id
+/// @return the rate in half-bit units, or 0 for a non-EXL3 type
 EXL3_HD static inline int exl3_type_k2(uint32_t type) {
     switch (type) {
     case PULSAR_TENSOR_EXL3M_K2:  return 4;
@@ -250,6 +281,10 @@ EXL3_HD static inline int exl3_type_k2(uint32_t type) {
  */
 enum { EXL3_ARM_DOWN = 0, EXL3_ARM_PAIR = 1, EXL3_ARM_GATE_UP_FUSED = 2, EXL3_ARM_DENSE = 3,
        EXL3_ARM_MOE_PREFILL = 4 };
+/** Whether EXL3 arm `arm` reads rate `k2` (the table above).
+ * @param arm one of the EXL3_ARM_* ids
+ * @param k2 rate in half-bit units
+ * @return false for an unknown arm or a rate the arm does not instantiate */
 EXL3_HD static constexpr inline bool exl3_arm_has_rate(int arm, int k2) {
     switch (arm) {
     case EXL3_ARM_DOWN:          return k2 == 4 || k2 == 5 || k2 == 6 || k2 == 8 || k2 == 10 || k2 == 12;
@@ -272,6 +307,13 @@ EXL3_HD static constexpr inline bool exl3_arm_has_rate(int arm, int k2) {
  * precondition, and what keeps every plane 128-byte aligned; anything else is
  * refused (returns false), never padded.
  */
+/// @param k input width (multiple of EXL3_HAD_BLOCK)
+/// @param n output width (multiple of EXL3_HAD_BLOCK)
+/// @param k2 rate in half-bit units
+/// @param[out] trellis_bytes bytes of the trellis plane
+/// @param[out] scale_bytes bytes of the suh | svh plane, (k + n) * 2
+/// @param[out] stride bytes of one expert's whole slice
+/// @return false (outputs untouched) on an invalid rate or a dim off the block
 EXL3_HD static inline bool exl3_expert_layout(uint64_t k, uint64_t n, int k2,
                                       uint64_t *trellis_bytes, uint64_t *scale_bytes,
                                       uint64_t *stride) {
@@ -291,6 +333,8 @@ EXL3_HD static inline bool exl3_expert_layout(uint64_t k, uint64_t n, int k2,
  * leaves the arm (L295 F7).  The input width carries no pad: a Linear's input
  * is the previous layer's output, a multiple of 128 by construction.
  */
+/// @param n logical output width
+/// @return the stored width, n rounded up to a multiple of EXL3_HAD_BLOCK
 EXL3_HD static inline uint64_t exl3_out_stored(uint64_t n) {
     return (n + EXL3_HAD_BLOCK - 1) / EXL3_HAD_BLOCK * EXL3_HAD_BLOCK;
 }
@@ -302,6 +346,13 @@ EXL3_HD static inline uint64_t exl3_out_stored(uint64_t n) {
  * exl3_expert_layout's 128-multiples (its slices are cut and addressed by the
  * MoE arms at the stored widths); this is the 2-D tensor's model.
  */
+/// @param k input width (multiple of EXL3_HAD_BLOCK)
+/// @param n logical output width (>= 1)
+/// @param k2 rate in half-bit units
+/// @param[out] trellis_bytes bytes of the trellis plane
+/// @param[out] scale_bytes bytes of suh[k] | svh[stored]
+/// @param[out] stride bytes of the whole tensor
+/// @return false on n == 0 or whatever exl3_expert_layout refuses
 EXL3_HD static inline bool exl3_linear_layout(uint64_t k, uint64_t n, int k2, uint64_t *trellis_bytes,
                                               uint64_t *scale_bytes, uint64_t *stride) {
     return n != 0 && exl3_expert_layout(k, exl3_out_stored(n), k2, trellis_bytes, scale_bytes, stride);
@@ -310,13 +361,25 @@ EXL3_HD static inline bool exl3_linear_layout(uint64_t k, uint64_t n, int k2, ui
 /** One strided byte copy: `height` runs of `width` bytes, run i from src + i * src_pitch to dst + i * dst_pitch
  *  (cudaMemcpy2D's shape; a single run when height == 1). */
 typedef struct {
+    /// byte offset of the first run in the source
     uint64_t src, src_pitch, dst, dst_pitch, width, height;
+             ///< runs (1 for a single contiguous copy)
 } exl3_copy2d;
+/** @var exl3_copy2d::src_pitch
+ *  bytes between consecutive runs in the source (0 when height == 1) */
+/** @var exl3_copy2d::dst
+ *  byte offset of the first run in the destination */
+/** @var exl3_copy2d::dst_pitch
+ *  bytes between consecutive runs in the destination (0 when height == 1) */
+/** @var exl3_copy2d::width
+ *  bytes per run */
 
 /** A tensor-parallel cut of one expert-projection (exl3_expert_cut): the source and destination layouts and the
  *  three copies that move the bytes -- the trellis, suh, svh. */
 typedef struct {
+    /// source expert slice bytes (stride); src_trellis is its trellis-plane bytes
     uint64_t src_stride, src_trellis;   ///< exl3_expert_layout of the whole (k, n)
+    /// destination expert slice bytes (stride); dst_trellis is its trellis-plane bytes
     uint64_t dst_stride, dst_trellis;   ///< exl3_expert_layout of the destination shape
     exl3_copy2d copy[3];                ///< trellis, suh, svh
 } exl3_cut;
@@ -334,6 +397,16 @@ typedef struct {
  * destination's matmul is exactly the whole's columns / its rows' partial.  Returns false (refuses) on an invalid
  * rate, a dim off the 128 block, or a range unaligned, empty or out of bounds.
  */
+/// @param k source input width
+/// @param n source output width
+/// @param k2 rate in half-bit units
+/// @param in_axis true: cut input rows (IN); false: output columns (OUT)
+/// @param lo first index of the range (128-aligned)
+/// @param hi one past the last index (128-aligned, <= the axis extent)
+/// @param at where the range lands in the destination along the axis (128-aligned)
+/// @param ext destination extent along the axis (128-aligned, >= at + hi - lo)
+/// @param[out] c the layouts and copies; partially written on refusal
+/// @return true when the cut is valid
 static inline bool exl3_expert_cut(uint64_t k, uint64_t n, int k2, bool in_axis, uint64_t lo, uint64_t hi,
                                    uint64_t at, uint64_t ext, exl3_cut *c) {
     uint64_t ss = 0, ds = 0;
@@ -359,6 +432,9 @@ static inline bool exl3_expert_cut(uint64_t k, uint64_t n, int k2, bool in_axis,
 }
 
 /** Run a cut on the host: one expert's bytes from `src` (the whole's layout) into `dst` (the destination's). */
+/// @param c a cut built by exl3_expert_cut
+/// @param src one whole expert slice (c->src_stride bytes)
+/// @param[out] dst the destination expert slice (c->dst_stride bytes); only the cut bytes are written
 static inline void exl3_expert_cut_apply(const exl3_cut *c, const uint8_t *src, uint8_t *dst) {
     for (int i = 0; i < 3; i++) {
         const exl3_copy2d *p = &c->copy[i];
@@ -373,6 +449,7 @@ static inline void exl3_expert_cut_apply(const exl3_cut *c, const uint8_t *src, 
  * fp32 reference in its `tests/test_reconstruct_had.py`).  Double precision:
  * this is the reference the device rotations are graded against.
  */
+/// @param[in,out] v the 128-vector, rotated in place
 static inline void exl3_had128(double v[EXL3_HAD_BLOCK]) {
     for (int h = 1; h < EXL3_HAD_BLOCK; h <<= 1) {
         for (int i = 0; i < EXL3_HAD_BLOCK; i += 2 * h) {

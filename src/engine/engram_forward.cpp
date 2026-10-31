@@ -1,3 +1,5 @@
+/** @file engram_forward.cpp
+ *  @brief Engram on the DeepSeek forward: the load-time bind and the graph's per-step staging and layer op. */
 /* Engram on the DeepSeek forward (L242 slice 5, L269 W2): the load-time bind of the
  * artifact's Engram layers and the graph's per-step staging and layer op.  The host
  * half it builds on -- the hash, the row tables and the pread pool -- is engram.cpp,
@@ -16,9 +18,13 @@
  * so a block is found under its SOURCE layer (pulsar_layer_source) -- the same
  * index the row table's header and the hash multipliers were built for. */
 
+/// Width of one Engram n-gram head's row.
 #define ENGRAM_HEAD_DIM 256u
+/// Width of the `wkv` input: every head's row.
 #define ENGRAM_IN       (PULSAR_ENGRAM_N_COLS * ENGRAM_HEAD_DIM)   /* 24 x 256 = 6144: the `wkv` input */
 
+/// @param what the reason, printed
+/// @return false
 static bool engram_refuse(const char *what) {
     fprintf(stderr, "pulsar: engram: %s -- refusing\n", what);
     return false;
@@ -26,6 +32,11 @@ static bool engram_refuse(const char *what) {
 
 /* An integer array key of exactly `n` entries into `out` (as int64; the element
  * type is any of the integer codes the container writes). */
+/// @param m the model
+/// @param key the array key
+/// @param[out] out [n] values
+/// @param n the required length
+/// @return false (printed) on a missing, short or non-integer array
 static bool engram_int_array(const pulsar_model *m, const char *key, int64_t *out, uint64_t n) {
     pulsar_array_ref arr;
     if (!model_get_array(m, key, &arr) || arr.len != n) {
@@ -48,11 +59,19 @@ static bool engram_int_array(const pulsar_model *m, const char *key, int64_t *ou
     return true;
 }
 
+/// @param m the model
+/// @param key an array key
+/// @return its length, 0 when absent
 static uint64_t engram_meta_len(const pulsar_model *m, const char *key) {
     pulsar_array_ref arr;
     return model_get_array(m, key, &arr) ? arr.len : 0;
 }
 
+/// Element i of an F32 or BF16 tensor as float.
+/// @param t the tensor (its type)
+/// @param p its bytes
+/// @param i the element
+/// @return the value
 static float engram_elt_f32(const pulsar_tensor *t, const unsigned char *p, uint64_t i) {
     if (t->type == PULSAR_TENSOR_F32) { float v; memcpy(&v, p + i * 4, 4); return v; }
     uint16_t b; memcpy(&b, p + i * 2, 2);
@@ -245,6 +264,8 @@ bool gpu_graph_engram_alloc(pulsar_gpu_graph *g, const pulsar_weights *w, uint32
     return g->engram.rows && g->engram.x_key && g->engram.kv;
 }
 
+/// Wait out every pending per-layer gather.
+/// @param g the graph
 static void engram_drain(pulsar_gpu_graph *g) {
     for (uint32_t l = 0; l < PULSAR_ENGRAM_MAX_LAYERS; l++) {
         if (g->engram.pending[l]) (void)pulsar_engram_gather_wait(g->engram.pending[l]);
@@ -272,6 +293,11 @@ void gpu_graph_engram_forget(pulsar_gpu_graph *g, uint32_t bank) {
     for (uint32_t i = 0; i < PULSAR_ENGRAM_RING; i++) g->engram.ring_pos[(size_t)bank * PULSAR_ENGRAM_RING + i] = UINT32_MAX;
 }
 
+/// Record token `tok` at `pos` in the bank's token ring.
+/// @param g the graph
+/// @param bank the bank
+/// @param pos the position
+/// @param tok the token
 static void engram_ring_put(pulsar_gpu_graph *g, uint32_t bank, uint32_t pos, int32_t tok) {
     const size_t i = (size_t)bank * PULSAR_ENGRAM_RING + (pos & (PULSAR_ENGRAM_RING - 1u));
     g->engram.ring_tok[i] = tok;

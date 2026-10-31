@@ -1,3 +1,5 @@
+/** @file cursor.cpp
+ *  @brief C facade over pulsar::Cursor, the bounds-checked metadata value reader. */
 #include "cursor.hpp"
 
 /* C facade over pulsar::Cursor.  The cursor reads the metadata VALUES the
