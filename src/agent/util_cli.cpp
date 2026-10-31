@@ -147,7 +147,10 @@ double agent_now_sec(void) {
 
 
 
-void usage(FILE *fp, const char *topic) {
+/// @brief Print pulsar-agent's help (PULSAR_HELP_AGENT), or one topic of it.
+/// @param fp    the stream (stdout for --help, stderr after a bad option)
+/// @param topic the topic asked (NULL: the overview)
+static void usage(FILE *fp, const char *topic) {
     pulsar_help_print(fp, PULSAR_HELP_AGENT, topic);
 }
 

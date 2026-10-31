@@ -954,10 +954,6 @@ bool agent_slash_command_known(const char *cmd);
 /** Monotonic clock (CLOCK_MONOTONIC).
  *  @return seconds, with nanosecond resolution */
 double agent_now_sec(void);
-/** Print pulsar-agent's help (pulsar_help_print, PULSAR_HELP_AGENT).
- *  @param fp    the stream
- *  @param topic a help topic, or NULL for the overview */
-void usage(FILE *fp, const char *topic);
 /** Parse pulsar-agent's command line over the agent's defaults (the merged drafter disabled, 100000-token
  *  context, 50000-token turn cap); exits with usage on a bad option.
  *  @param argc argument count
