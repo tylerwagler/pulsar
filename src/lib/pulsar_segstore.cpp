@@ -23,7 +23,7 @@
 namespace {
 
 /* Fixed header, little-endian:
- *   0 magic, 4 version, 8 model_id, 12 flags, 16 key[40], 56 parent[40],
+ *   0 magic, 4 version, 8 identity, 12 flags, 16 key[40], 56 parent[40],
  *   96 G_prev, 100 G, 104 text_len u64, 112 payload_bytes u64,
  *   120 trailer_bytes u64, 128 hits u32, 132 pad, 136 created u64,
  *   144 last_used u64, 152 state_bytes u64 (v2, L323)  -> 160 bytes. */
@@ -58,7 +58,7 @@ struct pulsar_segstore {
     /// Bytes of .seg files the store may hold (0 = unbounded)
     uint64_t budget = 0;
     /// The store identity (pulsar_segstore_identity) a header must carry
-    uint32_t model_id = 0;
+    uint32_t identity = 0;
     /// Log sink (NULL = silent)
     pulsar_segstore_log_fn log = nullptr;
     /// Context for `log`
@@ -98,7 +98,7 @@ struct pulsar_segstore {
         uint8_t h[HDR];
         if (fread(h, 1, HDR, fp) != HDR) return false;
         if (get32(h) != PULSAR_SEGSTORE_MAGIC || get32(h + 4) != PULSAR_SEGSTORE_VERSION) return false;
-        if (get32(h + 8) != model_id) return false;
+        if (get32(h + 8) != identity) return false;
         memset(e, 0, sizeof *e);
         *flags = get32(h + 12);
         memcpy(e->key, h + 16, 40);
@@ -234,7 +234,7 @@ struct pulsar_segstore {
     }
 };
 
-pulsar_segstore *pulsar_segstore_open(const char *dir, uint64_t budget_bytes, uint32_t model_id,
+pulsar_segstore *pulsar_segstore_open(const char *dir, uint64_t budget_bytes, uint32_t identity,
                                       pulsar_segstore_log_fn log, void *log_ud) {
     if (!dir || !dir[0]) return nullptr;
     if (mkdir(dir, 0700) != 0 && errno != EEXIST) return nullptr;
@@ -251,7 +251,7 @@ pulsar_segstore *pulsar_segstore_open(const char *dir, uint64_t budget_bytes, ui
     auto *st = new pulsar_segstore();
     st->dir = dir;
     st->budget = budget_bytes;
-    st->model_id = model_id;
+    st->identity = identity;
     st->log = log;
     st->log_ud = log_ud;
     DIR *d = opendir(dir);
@@ -423,7 +423,7 @@ bool pulsar_segstore_put(pulsar_segstore *st, const char *parent, uint32_t G_pre
     const uint64_t now = (uint64_t)time(nullptr);
     put32(h, PULSAR_SEGSTORE_MAGIC);
     put32(h + 4, PULSAR_SEGSTORE_VERSION);
-    put32(h + 8, st->model_id);
+    put32(h + 8, st->identity);
     put32(h + 12, write_trailer ? PULSAR_SEGSTORE_FLAG_TRAILER : 0u);
     memcpy(h + 16, key, 40);
     if (parent && parent[0]) memcpy(h + 56, parent, 40);
