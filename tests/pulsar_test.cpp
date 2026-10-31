@@ -3850,6 +3850,62 @@ static void test_l308_copy_estimate(void) {
     TEST_ASSERT(pulsar_spec_copy_price(&sp, 0.0f, 8u, conf, &rp) == 8u && !rp && conf[0] == 1.0f);
 }
 
+/* L335: the safetensors header's integers pass blob_value's exactness check (st_exact_integer: an integer a double
+ * holds exactly) -- a fractional or past-2^53 shape entry used to truncate / round into a wrong integer that parsed.
+ * Host: a one-tensor shard in a scratch directory, the open's stderr read back for the refusal. */
+static std::string test_st_open_log(const char *shape, bool *opened) {
+    char dir[] = "/tmp/pulsar-l335-st-XXXXXX";
+    std::string log;
+    *opened = true;
+    if (!mkdtemp(dir)) return log;
+    const std::string shard = std::string(dir) + "/model-00001-of-00001.safetensors";
+    const std::string hdr = std::string("{\"t\":{\"dtype\":\"F32\",\"shape\":") + shape +
+                            ",\"data_offsets\":[0,4]}}";
+    FILE *f = fopen(shard.c_str(), "wb");
+    if (!f) return log;
+    const uint64_t n = hdr.size();
+    const float zero = 0.0f;
+    fwrite(&n, sizeof n, 1, f);
+    fwrite(hdr.data(), 1, hdr.size(), f);
+    fwrite(&zero, sizeof zero, 1, f);
+    fclose(f);
+    const std::string logp = std::string(dir) + "/stderr.log";
+    fflush(stderr);
+    const int saved = dup(2);
+    FILE *lf = fopen(logp.c_str(), "w");
+    if (saved < 0 || !lf) return log;
+    dup2(fileno(lf), 2);
+    pulsar_model m;
+    memset(&m, 0, sizeof m);
+    *opened = safetensors_open(&m, dir, false);
+    fflush(stderr);
+    dup2(saved, 2);
+    close(saved);
+    fclose(lf);
+    model_close(&m);
+    f = fopen(logp.c_str(), "rb");
+    if (f) {
+        char b[4096];
+        size_t k;
+        while ((k = fread(b, 1, sizeof b, f)) > 0) log.append(b, k);
+        fclose(f);
+    }
+    unlink(logp.c_str());
+    unlink(shard.c_str());
+    rmdir(dir);
+    return log;
+}
+static void test_st_exact_integers(void) {
+    bool opened = true;
+    std::string log = test_st_open_log("[1]", &opened);
+    TEST_ASSERT(log.find("bad shape") == std::string::npos);   /* the control: its shape parses */
+    for (const char *bad : {"[1.5]", "[9007199254740994]", "[-1]"}) {
+        log = test_st_open_log(bad, &opened);
+        TEST_ASSERT(!opened && log.find("t has a bad shape") != std::string::npos);
+        if (log.find("t has a bad shape") == std::string::npos) fprintf(stderr, "  shape %s: %s\n", bad, log.c_str());
+    }
+}
+
 /* L335: a bank carry's restore is all or nothing -- a live row that does not restore (here: a bank past the device
  * rows, the copy's host-side refusal) leaves the host view exactly as it was; it used to take the bank's checkpoint
  * first and return false half-restored.  Host only: no device row is touched. */
@@ -4984,6 +5040,7 @@ static const pulsar_test_entry test_entries[] = {
     {"--fused-cost", "fused-cost", "the prompt chunk cost fit (solo + fused, persisted) and the verify curve's round cost, what the round selection and the disk restore price by (L304, L312, L327)", test_fused_cost},
     {"--fused-sched", "fused-sched", "the round selection simulated on L304's logged costs: L304's and L277's cases, the stall, no prompt, the cold fit (L312)", test_fused_sched},
     {"--read-ahead", "read-ahead", "the next-chunk PLE read-ahead: its rule (one chunk ahead, each row once, a changed prompt drops), the pool's background class (bytes unchanged, below every gather, cancel, accounting) (L329 b2)", test_read_ahead},
+    {"--st-integers", "st-integers", "the safetensors header's integers are exact: a fractional or past-2^53 shape is refused (L335)", test_st_exact_integers},
     {"--bank-carry-restore", "bank-carry-restore", "a bank carry's restore is all or nothing: a live row that fails leaves the host view untouched (L335)", test_bank_carry_restore},
     {"--qwen-eos", "qwen-eos", "Qwen's eos: the tokenizer's first stop id; a tokenizer with none never loads (L335)", test_qwen_eos},
     {"--api-err-null", "api-err-null", "the session entries that report through err accept a NULL err (L335)", test_api_err_null},
