@@ -1432,13 +1432,19 @@ typedef struct {
 /** The run's UI, for tui_restore (atexit) and the signal handler's terminal repair; NULL until tui_start. */
 static eval_ui *global_ui;
 
-static double run_clock_sec(void);
+/** @brief Monotonic wall clock: the run clock's and every phase timer's one time source.
+ *  @return seconds since an arbitrary epoch (CLOCK_MONOTONIC) */
+static double now_sec(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec + (double)ts.tv_nsec / 1000000000.0;
+}
 
 /** @brief Fold the time since the last tick into run_elapsed_sec (only while the clock runs).
  *  @param ui the UI; NULL is a no-op */
 static void tui_run_clock_tick(eval_ui *ui) {
     if (!ui || !ui->run_clock_active) return;
-    double now = run_clock_sec();
+    double now = now_sec();
     double delta = now - ui->run_last_sec;
     if (delta > 0.0) ui->run_elapsed_sec += delta;
     ui->run_last_sec = now;
@@ -1448,7 +1454,7 @@ static void tui_run_clock_tick(eval_ui *ui) {
  *  @param ui the UI; NULL is a no-op */
 static void tui_run_clock_start(eval_ui *ui) {
     if (!ui || ui->run_clock_active) return;
-    ui->run_last_sec = run_clock_sec();
+    ui->run_last_sec = now_sec();
     ui->run_clock_active = true;
 }
 
@@ -1467,7 +1473,7 @@ static double tui_run_clock_visible_sec(const eval_ui *ui) {
     if (!ui) return 0.0;
     double elapsed = ui->run_elapsed_sec;
     if (ui->run_clock_active) {
-        double delta = run_clock_sec() - ui->run_last_sec;
+        double delta = now_sec() - ui->run_last_sec;
         if (delta > 0.0) elapsed += delta;
     }
     return elapsed;
@@ -1613,22 +1619,6 @@ static void buf_free(byte_buf *b) {
 static void style_free(style_buf *b) {
     free(b->v);
     memset(b, 0, sizeof(*b));
-}
-
-/** @brief Monotonic wall clock.
- *  @return seconds since an arbitrary epoch (CLOCK_MONOTONIC) */
-static double now_sec(void) {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (double)ts.tv_sec + (double)ts.tv_nsec / 1000000000.0;
-}
-
-/** @brief The run clock's time source (the same clock as now_sec).
- *  @return seconds since an arbitrary epoch (CLOCK_MONOTONIC) */
-static double run_clock_sec(void) {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (double)ts.tv_sec + (double)ts.tv_nsec / 1000000000.0;
 }
 
 /** @brief The backend selected when none is given.
