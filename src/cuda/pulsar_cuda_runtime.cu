@@ -545,8 +545,8 @@ const char *cuda_model_range_ptr(const void *model_map, uint64_t offset, uint64_
                 "pulsar: FATAL: no supported route to place model weights on the GPU.\n"
                 "pulsar:   The staged fd path failed for %s (%.2f MiB at offset %llu).\n"
                 "pulsar:   Most likely the weight cache is exhausted: %.2f GiB already\n"
-                "pulsar:   cached against a %.2f GiB limit. Raise\n"
-                "pulsar:   PULSAR_CUDA_WEIGHT_CACHE_LIMIT_GB, or serve a smaller model.\n"
+                "pulsar:   cached against a %.2f GiB limit (the device's memory less its\n"
+                "pulsar:   scratch headroom -- not a setting). Serve a smaller model.\n"
                 "pulsar:   Refusing to start rather than fall back to a path measured at\n"
                 "pulsar:   2x slower prefill and 3x slower decode.\n",
                 what ? what : "weights",
@@ -2555,10 +2555,9 @@ int pulsar_gpu_set_model_map(const void *model_map, uint64_t model_size) {
         const uint64_t limit = cuda_model_local_model_limit_bytes();
         if (model_size > limit) {
             fprintf(stderr,
-                    "pulsar: CUDA model %.2f GiB exceeds the default single-GPU "
-                    "startup cache budget %.2f GiB; set "
-                    "PULSAR_CUDA_WEIGHT_CACHE_LIMIT_GB explicitly if the model "
-                    "plus scratch and KV still fit in memory\n",
+                    "pulsar: CUDA model %.2f GiB exceeds the single-GPU startup cache "
+                    "budget %.2f GiB (the device's memory less its scratch headroom; "
+                    "not a setting) -- refusing\n",
                     (double)model_size / 1073741824.0,
                     (double)limit / 1073741824.0);
             return 0;
